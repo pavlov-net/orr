@@ -27,11 +27,6 @@ float3x3 linear_part(SceneRoot* s, uint group, uint index)
     return float3x3(m[0].xyz, m[1].xyz, m[2].xyz);
 }
 
-float3 radiance(MaterialGpu* m)
-{
-    return (m.flags & MATERIAL_EMISSIVE) != 0 ? m.emission_color * m.emission_luminance : float3(0.0);
-}
-
 // One thread per instance span entry. Area scales by |det|^(2/3), exact under uniform
 // scale.
 [shader("compute")]
@@ -57,7 +52,7 @@ void instances(uint3 id: SV_DispatchThreadID)
             : s.material_sets[inst.material_base + variant_set * e.sections + e.section];
         float3x3 m = linear_part(s, inst.group, inst.group_index);
         area = e.model_area * pow(abs(determinant(m)), 2.0 / 3.0);
-        power = radiance(s.materials + material) * area;
+        power = material_emission(s.materials + material) * area;
     }
     e.power = power;
     e.area = area;
@@ -89,16 +84,14 @@ void producers(uint3 entry: SV_GroupID, uint3 thread: SV_GroupThreadID)
         ProducerClusterGpu k = b.clusters[c];
         if (k.material >= p.material_count)
             continue;
-        float3 l = radiance(s.materials + p.materials[k.material]);
+        float3 l = material_emission(s.materials + p.materials[k.material]);
         if (all(l == 0.0))
             continue;
         float a = 0.0;
         for (uint i = 0; i < k.tri_count; i++)
         {
-            uint8_t* tri = k.triangles + 3 * i;
-            float3 p0 = b.positions[k.first_vertex + tri[0]];
-            float3 p1 = b.positions[k.first_vertex + tri[1]];
-            float3 p2 = b.positions[k.first_vertex + tri[2]];
+            float3 p0, p1, p2;
+            cluster_triangle(b, k, i, p0, p1, p2);
             a += 0.5 * length(cross(mul(m, p1 - p0), mul(m, p2 - p0)));
         }
         sum += float4(l * a, a);

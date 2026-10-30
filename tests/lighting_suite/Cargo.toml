@@ -11,6 +11,7 @@ publish = false
 orr_gpu.workspace = true
 orr_shaders.workspace = true
 orr_lighting = { path = "../../crates/orr_lighting" }
+orr_scene.workspace = true
 orr_pack.workspace = true
 gpu_suite = { path = "../gpu_suite" }
 shader_math = { path = "../shader_math" }

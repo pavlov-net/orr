@@ -112,3 +112,13 @@ public uint emit_direct_cluster(ProducerBatch b, uint tri_count, uint vertex_cou
     c._pad1 = 0;
     return emit(b, c);
 }
+
+// Corners of triangle `i` of cluster `k` of batch `b`, relative to the entry's transform.
+public void cluster_triangle(ProducerBatch b, ProducerClusterGpu k, uint i, out float3 p0,
+                             out float3 p1, out float3 p2)
+{
+    uint8_t* tri = k.triangles + 3 * i;
+    p0 = b.positions[k.first_vertex + tri[0]];
+    p1 = b.positions[k.first_vertex + tri[1]];
+    p2 = b.positions[k.first_vertex + tri[2]];
+}

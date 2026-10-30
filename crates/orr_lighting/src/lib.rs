@@ -1,26 +1,28 @@
 //! Light transport for orr.
 //!
-//! Each frame, before a scene's first view, [`SceneLighting::record`] bakes the scene's linked
-//! environment at the scene focus into an equal-area octahedral map with an importance
-//! pyramid, derives every directional light's state, and writes the scene's [`SkyStats`].
-//! Kernels reach the results through [`SceneLighting::environment`],
-//! [`SceneLighting::directional_states`] and [`SceneLighting::sky_stats`], and the Slang
-//! modules `environment`, `light_sampling` and `media` under this crate's shader root
-//! (`DEP_ORR_LIGHTING_SHADER_DIRS`).
+//! Each frame, after a scene's update and before its first view, [`SceneLighting::record`]
+//! bakes the scene's linked environment at the scene focus into an equal-area octahedral map
+//! with an importance pyramid, derives every directional light's state, builds the selection
+//! over the scene's sphere, rect and emissive lights and the environment, presamples the
+//! light tiles, and writes the scene's `SkyStats`. Kernels reach the result through
+//! [`SceneLighting::light_set`] and the Slang modules `light_sampling`, `environment` and
+//! `media` under this crate's shader root (`DEP_ORR_LIGHTING_SHADER_DIRS`).
 
 mod environment;
-mod light_sampling;
 mod scene;
 
 pub use environment::{ENVIRONMENT_SIZE, EnvironmentMapGpu};
-pub use light_sampling::{DirectionalLight, DiscProfile};
-pub use orr_gpu::KernelSet;
+pub use orr_scene::orr_gpu::KernelSet;
+pub use orr_scene::{Cone, DirectionalLight, DiscProfile, Light, LightId};
 pub use scene::{
-    FRAME_SLOTS, LightingStats, SceneLighting, SceneLightingSettings, ScenePass, WorldCacheSettings,
+    FRAME_SLOTS, LIGHT_TILE_SIZE, LIGHT_TILES, LightingStats, SceneLighting, SceneLightingSettings,
+    ScenePass, WorldCacheSettings,
 };
-pub use shaders::types::{DirectionalLightGpu, DirectionalState, EnvironmentGpu, SkyStats};
+pub use shaders::types::{
+    DirectionalState, EmissiveSelection, EnvironmentGpu, LightSample, LightSetGpu, LightSetStats,
+};
 
-use orr_gpu::{ComputePipeline, Device, ShaderModule, ShaderStage, SpecData};
+use orr_scene::orr_gpu::{ComputePipeline, Device, ShaderModule, ShaderStage, SpecData};
 
 /// Generated kernel modules and the Rust types of the crate's Slang structs.
 pub mod shaders {
@@ -31,7 +33,7 @@ pub mod shaders {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
-    Gpu(#[from] orr_gpu::Error),
+    Gpu(#[from] orr_scene::orr_gpu::Error),
     /// A replacement kernel does not match the module it replaces.
     #[error("kernel {kernel}: {reason}")]
     Kernel {

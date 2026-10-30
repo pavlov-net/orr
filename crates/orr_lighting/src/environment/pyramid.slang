@@ -1,4 +1,4 @@
-// The baked environment's mean, dome statistics and importance pyramid.
+// The baked environment's mean and importance pyramid.
 #include "orr/root.h"
 import orr.color;
 import environment;
@@ -8,18 +8,19 @@ struct Root
     float4* partials;
     float* pyramid;
     EnvironmentGpu* environment;
-    SkyStats* sky;
     uint partial_count;
     uint size;
     // The level `build` writes, from 1.
     uint level;
-    uint _pad;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
 }
 ORR_ROOT(Root);
 
 static groupshared float3 sums[256];
 
-// Sums the bake's partials: the mean radiance, its luminance and chromaticity.
+// Sums the bake's partials into the mean radiance and its luminance.
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void mean(uint lane: SV_GroupIndex)
@@ -38,12 +39,7 @@ void mean(uint lane: SV_GroupIndex)
     if (lane != 0)
         return;
     float3 m = sums[0] / float(root.size * root.size);
-    float y = luminance_rec2020(m);
-    root.environment.mean = float4(m, y);
-    float3 xyz = mul(REC2020_TO_XYZ, m);
-    float sum = xyz.x + xyz.y + xyz.z;
-    root.sky.dome_luminance = y;
-    root.sky.dome_xy = sum > 0.0 ? xyz.xy / sum : float2(0.3127, 0.3290);
+    root.environment.mean = float4(m, luminance_rec2020(m));
 }
 
 // Level `level` of the pyramid from the one below. Building level 1 first turns level 0

@@ -85,3 +85,10 @@ public struct MaterialGpu
     public float transmission_dispersion_scale;
     public float transmission_dispersion_abbe_number;
 }
+
+// Emitted radiance of `m` in nits: `emission_color x emission_luminance` with
+// MATERIAL_EMISSIVE, else 0.
+public float3 material_emission(MaterialGpu* m)
+{
+    return (m.flags & MATERIAL_EMISSIVE) != 0 ? m.emission_color * m.emission_luminance : float3(0.0);
+}
