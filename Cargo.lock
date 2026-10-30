@@ -1093,6 +1093,7 @@ name = "openpbr-ref"
 version = "0.0.1"
 dependencies = [
  "cc",
+ "log",
  "orr-gpu",
  "orr-shaders",
  "shader-maths",
@@ -1174,6 +1175,7 @@ dependencies = [
  "bytemuck",
  "log",
  "orr-shaders",
+ "raw-window-handle",
  "thiserror",
 ]
 

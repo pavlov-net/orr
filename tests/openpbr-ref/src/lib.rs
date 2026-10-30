@@ -1,17 +1,24 @@
-//! The OpenPBR 1.1.1 reference BSDF on the CPU and the harness that checks a BSDF with it.
+//! The OpenPBR 1.1.1 reference BSDF on the CPU and GPU and the harness that checks a BSDF
+//! with it.
 //!
-//! Two builds of adobe/openpbr-bsdf implement [`Bsdf`]: [`Reference`], its own C++ with
-//! GLM, and [`SlangCpu`], `orr.openpbr` through Slang's C++ target with the tables compiled
-//! in. [`harness`] holds the checks that hold for any correct BSDF (energy, sampling against
-//! the density, reciprocity) and the comparison of two BSDFs; [`report`] runs them over
-//! [`materials::grid`] and writes the tables. A real-time approximation joins the harness by
-//! implementing [`Bsdf`].
+//! Builds of adobe/openpbr-bsdf implement [`Bsdf`]: [`Reference`], its own C++ with GLM;
+//! [`SlangCpu`], `orr.openpbr` through Slang's C++ target with the tables compiled in; and
+//! with feature `gpu`, `SlangGpu`, `orr.openpbr` in a Vulkan compute kernel reading the
+//! tables from the descriptor heap. [`harness`] holds the checks that hold for any correct
+//! BSDF (energy, sampling against the density, reciprocity) and the comparison of two
+//! BSDFs; [`report`] runs them over [`materials::grid`] and writes the tables. A real-time
+//! approximation joins the harness by implementing [`Bsdf`].
 //!
 //! Directions are unit vectors in the shading frame: the normal is +z and the tangent +x.
 
 pub mod harness;
 pub mod materials;
 pub mod report;
+#[cfg(feature = "gpu")]
+mod slang_gpu;
+
+#[cfg(feature = "gpu")]
+pub use slang_gpu::{Luts, SlangGpu, log_to_stderr};
 
 /// `gpu/` compiled to SPIR-V: `openpbr_cases` runs the same calls with heap LUTs.
 pub mod gpu {
@@ -135,6 +142,9 @@ impl Lobe {
 
 /// A BSDF the harness can drive: prepared once per material and view, then evaluated,
 /// sampled and asked for densities.
+///
+/// The harness calls the `_all` forms and [`Bsdf::eval_pairs`]; their defaults loop over the
+/// single calls, and a BSDF that runs many calls at once overrides them.
 pub trait Bsdf {
     /// Prepares `inputs` seen from `view` (unit, toward the viewer).
     fn prepare(&mut self, inputs: &Inputs, view: V3);
@@ -142,6 +152,30 @@ pub trait Bsdf {
     fn pdf(&self, wi: V3) -> f32;
     /// `None` when the BSDF produces no direction for `u`.
     fn sample(&self, u: V3) -> Option<Sample>;
+
+    fn eval_all(&self, wi: &[V3]) -> Vec<Eval> {
+        wi.iter().map(|&d| self.eval(d)).collect()
+    }
+
+    fn pdf_all(&self, wi: &[V3]) -> Vec<f32> {
+        wi.iter().map(|&d| self.pdf(d)).collect()
+    }
+
+    fn sample_all(&self, u: &[V3]) -> Vec<Option<Sample>> {
+        u.iter().map(|&u| self.sample(u)).collect()
+    }
+
+    /// For each `[view, wi]`, `eval(wi)` of `inputs` prepared from `view`. The BSDF is left
+    /// prepared for an unspecified view.
+    fn eval_pairs(&mut self, inputs: &Inputs, pairs: &[[V3; 2]]) -> Vec<Eval> {
+        pairs
+            .iter()
+            .map(|&[view, wi]| {
+                self.prepare(inputs, view);
+                self.eval(wi)
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

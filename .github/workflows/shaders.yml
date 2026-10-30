@@ -45,5 +45,6 @@ jobs:
           cargo test -p shader-link
           cargo test -p shader-maths
           cargo test -p openpbr-ref
+          cargo build -p openpbr-ref --features gpu --all-targets
           cargo test -p lighting-maths
           cargo test -p output-maths

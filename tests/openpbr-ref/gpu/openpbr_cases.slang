@@ -1,5 +1,6 @@
-// `orr.openpbr` with heap LUTs on the GPU: prepare, eval, pdf and one sample per case, the
-// same calls as the CPU entry points in slang/openpbr_cpu.slang.
+// `orr.openpbr` with heap LUTs on the GPU: prepare, eval, pdf, one sample, the interior
+// medium and the emission per case, the same calls as the CPU entry points in
+// slang/openpbr_cpu.slang.
 #include "orr/root.h"
 import orr.openpbr;
 import openpbr_inputs;
@@ -21,6 +22,10 @@ struct CaseResult
     float3 sample_weight;
     float sample_pdf;
     uint sample_lobe;
+    float3 extinction;
+    float3 albedo;
+    float anisotropy;
+    float3 emission;
 }
 
 struct Root
@@ -52,5 +57,9 @@ void main(uint3 id: SV_DispatchThreadID)
     OpenPBR_DiffuseSpecular w;
     openpbr_sample(p, c.u, r.sample_wi, w, r.sample_pdf, r.sample_lobe);
     r.sample_weight = w.diffuse + w.specular;
+    r.extinction = p.volume.extinction_coefficient;
+    r.albedo = p.volume.albedo;
+    r.anisotropy = p.volume.anisotropy;
+    r.emission = p.emission;
     root.results[id.x] = r;
 }
