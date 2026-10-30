@@ -1,7 +1,7 @@
 //! Textures: images that stay in `GENERAL`, with dedicated, placed or sparse memory, and host
 //! copies.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ash::vk;
 use ash::vk::TaggedStructure as _;
@@ -49,6 +49,8 @@ pub struct Texture {
     /// The view rendering writes through: mip 0, layer 0. Null without `COLOR` or `DEPTH`
     /// usage.
     attachment: vk::ImageView,
+    /// Every mip and layer; made by the first `vulkan::image_handles`.
+    pub(crate) full_view: OnceLock<vk::ImageView>,
     desc: TextureDesc,
     /// False for a swapchain image: the swapchain owns it and drops this texture once its
     /// presents have completed.
@@ -61,6 +63,17 @@ pub struct Texture {
 impl Texture {
     pub fn desc(&self) -> &TextureDesc {
         &self.desc
+    }
+
+    pub(crate) fn shared(&self) -> &Shared {
+        &self.shared
+    }
+
+    fn views(&self) -> [vk::ImageView; 2] {
+        [
+            self.attachment,
+            self.full_view.get().copied().unwrap_or_default(),
+        ]
     }
 
     /// How tiles and mip tails bind, for a texture created with [`TextureMemory::Sparse`].
@@ -144,6 +157,7 @@ impl Texture {
             image,
             memory: None,
             attachment: vk::ImageView::null(),
+            full_view: OnceLock::new(),
             desc: *desc,
             owns_image: false,
             sparse: None,
@@ -181,14 +195,16 @@ impl Texture {
 impl Drop for Texture {
     fn drop(&mut self) {
         if !self.owns_image {
-            // SAFETY: the swapchain drops its textures once no work uses them.
-            unsafe { self.shared.device.destroy_image_view(self.attachment, None) };
+            for v in self.views() {
+                // SAFETY: the swapchain drops its textures once no work uses them.
+                unsafe { self.shared.device.destroy_image_view(v, None) };
+            }
             return;
         }
         self.shared.defer_after_submitted(Item::Image {
             image: self.image,
             memory: self.memory,
-            view: self.attachment,
+            views: self.views(),
         });
     }
 }
@@ -530,6 +546,7 @@ impl Device {
             image,
             memory: own,
             attachment: vk::ImageView::null(),
+            full_view: OnceLock::new(),
             desc: *desc,
             owns_image: true,
             sparse,
@@ -604,7 +621,7 @@ impl Device {
         let item = Item::Image {
             image: t.image,
             memory: t.memory,
-            view: t.attachment,
+            views: t.views(),
         };
         // SAFETY: `t` is never used or dropped again; its Arc is released exactly once.
         unsafe { std::ptr::drop_in_place(&mut t.shared) };

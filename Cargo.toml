@@ -12,6 +12,7 @@ repository = "https://github.com/pavlov-net/orr"
 [workspace.dependencies]
 orr = { path = "crates/orr" }
 orr_atmosphere = { path = "crates/orr_atmosphere" }
+orr_color = { path = "crates/orr_color", version = "0.0.1" }
 orr_gpu = { path = "crates/orr_gpu" }
 orr_lighting = { path = "crates/orr_lighting" }
 orr_pack = { path = "crates/orr_pack" }

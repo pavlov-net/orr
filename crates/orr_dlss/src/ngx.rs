@@ -525,14 +525,16 @@ impl Rr {
             if let Some(preset) = preset {
                 ui(preset_key(quality), preset);
             }
-            NVSDK_NGX_VULKAN_CreateFeature(
+            // Names the device: NGX refuses to guess once several devices have it running.
+            NVSDK_NGX_VULKAN_CreateFeature1(
+                ngx.device.as_raw() as usize as VkDevice,
                 cmd.as_raw() as usize as VkCommandBuffer,
                 NVSDK_NGX_Feature_NVSDK_NGX_Feature_RayReconstruction,
                 params,
                 &mut handle,
             )
         };
-        if let Err(e) = check("NVSDK_NGX_VULKAN_CreateFeature", r) {
+        if let Err(e) = check("NVSDK_NGX_VULKAN_CreateFeature1", r) {
             // SAFETY: allocated above and not shared.
             unsafe { NVSDK_NGX_VULKAN_DestroyParameters(params) };
             return Err(e);

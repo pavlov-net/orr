@@ -71,6 +71,8 @@ pub struct CommandList<'q> {
     /// Rendering extent while between `begin_rendering` and `end_rendering`.
     rendering: Option<[u32; 2]>,
     bound: vk::Pipeline,
+    /// Raw commands ran since the heaps were last bound.
+    rebind_heaps: bool,
     keep: Vec<Item>,
     /// Compacted-size queries recorded so far.
     pub(crate) compact_queries: u32,
@@ -85,6 +87,7 @@ impl<'q> CommandList<'q> {
             open: false,
             rendering: None,
             bound: vk::Pipeline::null(),
+            rebind_heaps: false,
             keep: Vec::new(),
             compact_queries: 0,
         }
@@ -92,6 +95,17 @@ impl<'q> CommandList<'q> {
 
     pub(crate) fn queue(&self) -> &'q Queue {
         self.queue
+    }
+
+    pub(crate) fn in_rendering(&self) -> bool {
+        self.rendering.is_some()
+    }
+
+    /// Raw commands may have bound anything: the next heap-mode command rebinds the heaps,
+    /// its pipeline and its root.
+    pub(crate) fn raw_recorded(&mut self) {
+        self.rebind_heaps = true;
+        self.bound = vk::Pipeline::null();
     }
 
     pub(crate) fn cmd(&self) -> vk::CommandBuffer {
@@ -253,6 +267,13 @@ impl<'q> CommandList<'q> {
 
     fn bind(&mut self, point: vk::PipelineBindPoint, pipeline: vk::Pipeline, root: u64) {
         let cmd = self.cmd();
+        if self.rebind_heaps {
+            self.queue
+                .shared
+                .heaps()
+                .bind(&self.queue.shared.heap_fn, cmd);
+            self.rebind_heaps = false;
+        }
         if self.bound != pipeline {
             // SAFETY: recording on a compute-capable queue.
             unsafe { self.device().cmd_bind_pipeline(cmd, point, pipeline) };

@@ -1,11 +1,13 @@
 //! The required device features and extensions (contracts.md 7) and the optional ones that
 //! become `Caps` flags.
 
+use std::any::Any;
 use std::ffi::{CStr, c_void};
 
 use ash::vk;
 
 use super::diagnostics::Diagnostics;
+use super::interop::{DeviceHooks, Features};
 use crate::Error;
 
 const REQUIRED_EXTENSIONS: &[&CStr] = &[
@@ -94,7 +96,7 @@ pub(crate) const RAY_TRACING_VALIDATION: &CStr = c"VK_NV_ray_tracing_validation"
 
 /// Every feature struct orr reads or enables, chained through raw pointers.
 #[derive(Default)]
-pub(crate) struct Features {
+pub(crate) struct FeatureChain {
     pub core: vk::PhysicalDeviceFeatures2<'static>,
     pub v11: vk::PhysicalDeviceVulkan11Features<'static>,
     pub v12: vk::PhysicalDeviceVulkan12Features<'static>,
@@ -135,7 +137,7 @@ pub(crate) struct Features {
     pub diagnostics_config: vk::DeviceDiagnosticsConfigCreateInfoNV<'static>,
 }
 
-impl Features {
+impl FeatureChain {
     /// Links the structs the device supports into one chain headed by `core`; `create` adds
     /// the device-creation-only structs. The chain points into `self`, so `self` must not
     /// move while it is in use.
@@ -235,14 +237,78 @@ impl Features {
     pub(crate) fn head(&mut self) -> *mut c_void {
         std::ptr::from_mut(&mut self.core).cast()
     }
+
+    /// The structs of the chain, in order.
+    ///
+    /// # Safety
+    ///
+    /// The chain is linked and its pointers are live.
+    unsafe fn links(&mut self) -> Vec<*mut vk::BaseOutStructure<'static>> {
+        let mut out = Vec::new();
+        let mut p = self.head().cast::<vk::BaseOutStructure<'static>>();
+        while !p.is_null() {
+            out.push(p);
+            // SAFETY: forwarded from the caller.
+            p = unsafe { (*p).p_next };
+        }
+        out
+    }
+
+    /// Lets `hooks` set feature bits and add structs, which are chained after orr's. The
+    /// returned boxes hold the added structs and must outlive device creation.
+    pub(crate) fn hook(
+        &mut self,
+        hooks: &dyn DeviceHooks,
+        adapter: vk::PhysicalDevice,
+    ) -> Vec<Box<dyn Any>> {
+        // SAFETY: `select` linked the chain.
+        let links = unsafe { self.links() };
+        let chained = links
+            .iter()
+            // SAFETY: every link is a live struct of the chain.
+            .map(|&p| unsafe { (*p).s_type })
+            .collect();
+        let mut features = Features {
+            core: &mut self.core.features,
+            vulkan_1_1: &mut self.v11,
+            vulkan_1_2: &mut self.v12,
+            vulkan_1_3: &mut self.v13,
+            vulkan_1_4: &mut self.v14,
+            chained,
+            extra: Vec::new(),
+        };
+        hooks.device_features(adapter, &mut features);
+        let mut extra = features.extra;
+        // SAFETY: as above; hooks leave `p_next` alone (`DeviceHooks::device_features`).
+        let mut tail = *unsafe { self.links() }.last().unwrap();
+        for b in &mut extra {
+            let s = std::ptr::from_mut::<dyn Any>(&mut **b).cast::<vk::BaseOutStructure<'static>>();
+            // SAFETY: `tail` is the chain's last struct and `s` a pushed struct, whose type
+            // `Features::push` bounds to device-creation structs with a Vulkan header.
+            unsafe {
+                (*s).p_next = std::ptr::null_mut();
+                (*tail).p_next = s;
+            }
+            tail = s;
+        }
+        extra
+    }
 }
 
 /// What a physical device offers orr: the extensions to enable and the features to turn on.
 pub(crate) struct Selection {
     pub extensions: Vec<&'static CStr>,
+    /// Every extension the device offers.
+    offered: Vec<vk::ExtensionProperties>,
     pub optional: Optional,
     /// Boxed so the chain's pointers stay valid.
-    pub enable: Box<Features>,
+    pub enable: Box<FeatureChain>,
+}
+
+impl Selection {
+    pub(crate) fn offers(&self, name: &CStr) -> bool {
+        has(&self.offered, name).is_some()
+    }
 }
 
 fn has(list: &[vk::ExtensionProperties], name: &CStr) -> Option<u32> {
@@ -337,7 +403,7 @@ pub(crate) fn select(
         hdr_metadata: surface && present(ash::ext::hdr_metadata::NAME),
     };
 
-    let mut q = Box::<Features>::default();
+    let mut q = Box::<FeatureChain>::default();
     q.link(&opt, false);
     // SAFETY: the chain holds only structs of extensions the device lists.
     unsafe {
@@ -450,7 +516,7 @@ pub(crate) fn select(
     opt.shader_abort &= opt.device_fault;
     opt.device_fault_ext &= q.fault_ext.device_fault != 0;
 
-    let mut e = Box::<Features>::default();
+    let mut e = Box::<FeatureChain>::default();
     e.core.features = vk::PhysicalDeviceFeatures {
         shader_int64: 1,
         geometry_shader: 1,
@@ -615,6 +681,7 @@ pub(crate) fn select(
     add(opt.present_timing, &[ash::ext::present_timing::NAME]);
     Ok(Selection {
         extensions,
+        offered: list,
         optional: opt,
         enable: e,
     })
