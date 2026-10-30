@@ -943,6 +943,7 @@ dependencies = [
  "orr_gpu",
  "orr_lighting",
  "orr_pack",
+ "orr_scene",
  "orr_shaders",
  "shader_math",
 ]
@@ -1092,6 +1093,7 @@ name = "openpbr_ref"
 version = "0.0.1"
 dependencies = [
  "cc",
+ "orr_gpu",
  "orr_shaders",
  "shader_math",
 ]

@@ -3,9 +3,9 @@
 
 use half::f16;
 use orr_output::{
-    ComposePass, DisplayInfo, DisplayRequest, Gt7Curve, Gt7Params, OutputFormat, OutputKernels,
-    OutputRoots, ResolvedDisplay, TonemapPass, ViewOutput, exposure_from_ev100, pq_decode,
-    pq_encode, srgb_decode,
+    ComposePass, ComposeRoot, ComposeSource, DisplayInfo, DisplayRequest, Gt7Curve, Gt7Params,
+    OutputFormat, OutputKernels, OutputRoots, ResolvedDisplay, TonemapPass, ViewOutput,
+    exposure_from_ev100, pq_decode, pq_encode, srgb_decode,
 };
 use orr_scene::orr_gpu::{
     Format, Hazards, MemoryKind, QueueKind, Stages, TextureDesc, TextureMemory, TextureRegion,
@@ -106,6 +106,7 @@ fn run(display: &ResolvedDisplay, format: Format) -> Vec<u8> {
 
     let kernels = OutputKernels::new(gpu).unwrap();
     let mut roots = OutputRoots::new(gpu).unwrap();
+    let mut compose_root = ComposeRoot::new(gpu).unwrap();
     let extent = [WIDTH, height];
     let queue = gpu.queue(QueueKind::Render).unwrap();
     let mut list = queue.command_list().unwrap();
@@ -130,9 +131,10 @@ fn run(display: &ResolvedDisplay, format: Format) -> Vec<u8> {
     list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
     kernels.compose(
         &mut list,
-        &mut roots,
+        &mut compose_root,
         &ComposePass {
-            source: linear_index,
+            source: ComposeSource::Linear(linear_index),
+            ui: None,
             target: backbuffer_store,
             extent,
             display,

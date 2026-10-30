@@ -1,5 +1,5 @@
 //! Output's compute passes, recorded into a command list: exposure (meter and adapt),
-//! tonemap and compose.
+//! tonemap, compose and compose-UI.
 
 use std::ops::RangeInclusive;
 
@@ -35,11 +35,10 @@ const HISTOGRAM_WORDS: u64 = 3 * HISTOGRAM_BINS as u64;
 /// alignment.
 const TONEMAP_ROOT: u64 = 0;
 const TONEMAP_CONSTANTS: u64 = 256;
-const COMPOSE_ROOT: u64 = 512;
-const METER_ROOT: u64 = 768;
-const ADAPT_ROOT: u64 = 1024;
-const ADAPT_PARAMS: u64 = 1280;
-const COMPENSATION: u64 = 1536;
+const METER_ROOT: u64 = 512;
+const ADAPT_ROOT: u64 = 768;
+const ADAPT_PARAMS: u64 = 1024;
+const COMPENSATION: u64 = 1280;
 const ZEROS: u64 = COMPENSATION + 4 * COMPENSATION_ENTRIES as u64;
 const UPLOAD_BYTES: u64 = ZEROS + 4 * HISTOGRAM_WORDS;
 
@@ -159,15 +158,49 @@ pub struct TonemapPass<'a> {
     pub output: &'a ViewOutput,
 }
 
-/// Encoding display-linear Rec.709 for the display.
+/// What compose reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComposeSource {
+    /// Display-linear Rec.709, 1.0 = paper white, as tonemap writes it.
+    Linear(TextureIndex),
+    /// An image already in the display's encoding: the UI-free backbuffer or an interpolated
+    /// frame. Texels with no UI over them are copied unchanged.
+    Encoded(TextureIndex),
+    /// Black, for a frame that renders no view.
+    Black,
+}
+
+/// Encoding an image for the display, with the UI layer blended over it in extended sRGB
+/// relative to paper white: `ui + (1 - ui.a) * srgb_encode(linear)`. SDR is exactly egui's
+/// gamma blending; HDR keeps the UI's SDR look at paper white.
+///
+/// Compose writes the UI-free backbuffer from tonemap's output (`ui: None`); compose-UI
+/// blends the frame's UI layer over each presented image (`Encoded`), or over black for a
+/// UI-only frame.
 #[derive(Clone, Copy, Debug)]
 pub struct ComposePass<'a> {
-    /// The tonemapped image.
-    pub source: TextureIndex,
-    /// The backbuffer, in the format of `display.encoding`.
+    pub source: ComposeSource,
+    /// The UI layer ([`crate::UiLayer::index`]).
+    pub ui: Option<TextureIndex>,
+    /// The output image, in the format of `display.encoding`.
     pub target: StorageImageIndex,
     pub extent: [u32; 2],
     pub display: &'a ResolvedDisplay,
+}
+
+/// Upload memory for one compose pass's root. Recording writes it, so reuse it only once
+/// the list that last recorded with it has completed: a display keeps one per presented
+/// image and frame in flight.
+pub struct ComposeRoot {
+    upload: Allocation<compose::Root>,
+}
+
+impl ComposeRoot {
+    pub fn new(gpu: &Device) -> Result<Self> {
+        Ok(Self {
+            upload: gpu.gpu_malloc(MemoryKind::Upload, 1, "compose root")?,
+        })
+    }
 }
 
 impl OutputKernels {
@@ -303,11 +336,13 @@ impl OutputKernels {
         list.end_pass();
     }
 
-    /// Records the compose pass. Order its source's writes before it with a barrier.
+    /// Records a compose pass, named `compose`, or `compose_ui` when it blends a UI layer
+    /// over an encoded or black image. Order the writes of its source and UI layer before it
+    /// with a barrier.
     pub fn compose(
         &self,
         list: &mut CommandList<'_>,
-        roots: &mut OutputRoots,
+        root: &mut ComposeRoot,
         pass: &ComposePass<'_>,
     ) {
         // ENCODING_* in display.slang.
@@ -316,19 +351,28 @@ impl OutputKernels {
             OutputFormat::Hdr10Pq => 1,
             OutputFormat::ScRgb => 2,
         };
-        let root = compose::Root {
-            source: pass.source,
+        // SOURCE_* in compose.slang.
+        let (source, source_kind) = match pass.source {
+            ComposeSource::Linear(t) => (t, 0),
+            ComposeSource::Encoded(t) => (t, 1),
+            ComposeSource::Black => (TextureIndex::NONE, 2),
+        };
+        root.upload.as_mut_slice().expect("upload memory")[0] = compose::Root {
+            source,
+            ui: pass.ui.unwrap_or(TextureIndex::NONE),
             target: pass.target,
             width: pass.extent[0],
             height: pass.extent[1],
+            source_kind,
             encoding,
             paper_white_nits: pass.display.paper_white_nits,
-            _pad0: 0,
-            _pad1: 0,
         };
-        let root = roots.put(COMPOSE_ROOT, &root);
-        list.begin_pass("compose", false);
-        list.dispatch(&self.compose, root, groups(pass.extent, 8));
+        let name = match pass.source {
+            ComposeSource::Linear(_) => "compose",
+            _ => "compose_ui",
+        };
+        list.begin_pass(name, false);
+        list.dispatch(&self.compose, root.upload.gpu, groups(pass.extent, 8));
         list.end_pass();
     }
 }
