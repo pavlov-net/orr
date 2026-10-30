@@ -164,6 +164,7 @@ fn texture_set_cooks() {
     orr_cook::cook(&Manifest {
         archives: vec![ArchiveSpec {
             output: Target::File(out.clone()),
+            cell_log2: ArchiveSpec::DEFAULT_CELL_LOG2,
             assets,
         }],
     })
@@ -264,6 +265,7 @@ fn hdr_set_round_trips() {
         let cooked = orr_cook::cook(&Manifest {
             archives: vec![ArchiveSpec {
                 output: Target::Memory,
+                cell_log2: ArchiveSpec::DEFAULT_CELL_LOG2,
                 assets: vec![AssetSpec {
                     name: "env".into(),
                     source: Source::Texture {

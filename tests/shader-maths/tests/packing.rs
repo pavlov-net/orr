@@ -377,26 +377,9 @@ fn packed_float_colour_round_trips() {
     );
 }
 
-const RANGE: f64 = std::f64::consts::FRAC_1_SQRT_2;
-
-/// Smallest-three encoding of a unit quaternion (x, y, z, w), as `orr.packing` decodes it.
-fn encode_rotation(q: [f64; 4]) -> u32 {
-    let largest = (0..4)
-        .max_by(|&a, &b| q[a].abs().total_cmp(&q[b].abs()))
-        .unwrap();
-    let sign = if q[largest] < 0.0 { -1.0 } else { 1.0 };
-    let mut code = (largest as u32) << 30;
-    for (slot, i) in (0..4).filter(|&i| i != largest).enumerate() {
-        let v = ((q[i] * sign / RANGE * 0.5 + 0.5).clamp(0.0, 1.0) * 1023.0).round() as u32;
-        code |= v << (10 * slot);
-    }
-    code
-}
-
 #[test]
-fn rotations_round_trip_within_their_step() {
+fn rotations_decode_like_orr_pack() {
     let mut rng = Rng::new(6);
-    let half_step = RANGE / 1023.0;
     for _ in 0..200_000 {
         let q = loop {
             let v = [0; 4].map(|_: u8| f64::from(rng.range(-1.0, 1.0)));
@@ -405,21 +388,19 @@ fn rotations_round_trip_within_their_step() {
                 break v.map(|c| c / l);
             }
         };
-        let code = encode_rotation(q);
-        let d = decode_rotation(code).map(f64::from);
-        let largest = (code >> 30) as usize;
-        let sign = if q[largest] < 0.0 { -1.0 } else { 1.0 };
+        let code = orr_pack::instance::encode_rotation(q.map(|c| c as f32));
+        let d = decode_rotation(code);
+        let reference = orr_pack::instance::decode_rotation(code);
         for i in 0..4 {
-            let err = (d[i] - q[i] * sign).abs();
-            // Stored components within half a step. The dropped one is at least 1/2, so
-            // their errors move it by at most sqrt(3) half steps over 1/2.
-            let bound = if i == largest {
-                3f64.sqrt() * half_step / 0.5
-            } else {
-                half_step
-            };
-            assert!(err <= bound * (1.0 + 1e-4) + 1e-6, "{q:?} -> {d:?}");
+            assert!(
+                (d[i] - reference[i]).abs() <= 1e-7,
+                "{code:#x}: {d:?} {reference:?}"
+            );
         }
+        let d = d.map(f64::from);
+        let dot: f64 = (0..4).map(|i| q[i] * d[i]).sum();
+        let angle = 2.0 * dot.abs().min(1.0).acos().to_degrees();
+        assert!(angle <= 0.17, "{q:?} -> {d:?}: {angle} deg");
         let m = instance_rotation(code, false);
         let r = glam::DMat3::from_quat(glam::DQuat::from_array(d));
         for i in 0..3 {
@@ -435,6 +416,10 @@ fn exact_axis_rotations_are_the_24_proper_rotations() {
     let mut seen = Vec::new();
     for index in 0..24 {
         let m = instance_rotation(index, true);
+        assert_eq!(
+            m,
+            bytemuck::cast::<[[f32; 3]; 3], [f32; 9]>(orr_pack::instance::axis_rotation(index))
+        );
         assert!(
             m.iter().all(|&v| v == 0.0 || v == 1.0 || v == -1.0),
             "{index}: {m:?}"

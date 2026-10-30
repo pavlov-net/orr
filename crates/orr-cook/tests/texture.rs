@@ -22,6 +22,7 @@ fn cook(assets: Vec<AssetSpec>) -> Archive {
     let cooked = orr_cook::cook(&Manifest {
         archives: vec![ArchiveSpec {
             output: Target::Memory,
+            cell_log2: ArchiveSpec::DEFAULT_CELL_LOG2,
             assets,
         }],
     })
