@@ -1,5 +1,17 @@
 [package]
 name = "orr-pack"
+description = "Cooked asset archives for orr: container, asset formats and CPU readers."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+
+[dependencies]
+blake3.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true
+zstd.workspace = true
+
+[lints]
+workspace = true
