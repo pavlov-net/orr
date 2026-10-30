@@ -14,5 +14,14 @@ orr-lighting.workspace = true
 orr-output = { path = "../orr-output" }
 thiserror.workspace = true
 
+[dev-dependencies]
+orr-scene = { workspace = true, features = ["testing"] }
+orr-egui = { path = "../orr-egui" }
+egui = { version = "0.37", default-features = false, features = ["monochrome_emoji_fonts"] }
+log.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+gpu-suite = { path = "../../tests/gpu-suite" }
+
 [lints]
 workspace = true

@@ -14,11 +14,15 @@
 //!
 //! There is no scheduler, render graph or per-frame extraction: each step records directly
 //! into the frame's command list. A frame may list no scenes and render no view;
-//! [`Frame::ui_only`] then presents its UI alone.
+//! [`Frame::ui_only`] then presents its UI alone, over black or over a calibration pattern
+//! from [`Frame::pattern`].
 
+#[cfg(windows)]
+pub use orr_output::DisplayWatch;
 pub use orr_output::{self, Error as OutputError};
 pub use orr_output::{
-    Display, DisplayFeed, DisplayInfo, DisplayRequest, Presented, ResolvedDisplay, UiPass,
+    CalibrationPattern, Display, DisplayFeed, DisplayInfo, DisplayRequest, Presented,
+    ResolvedDisplay, UiPass,
 };
 pub use orr_scene::Error as SceneError;
 pub use orr_scene::{
@@ -31,7 +35,13 @@ pub use orr_scene::{
     ViewHistoryId, ViewTarget, WorldPos, abi, material_flags, orr_gpu, orr_pack,
 };
 
-use orr_gpu::{Device, ShaderModule, TimelinePoint};
+use orr_gpu::{
+    CommandList, Device, Format, GpuPtr, Hazards, ShaderModule, Stages, TextureIndex, TimelinePoint,
+};
+use orr_output::{
+    ComposePass, ComposeRoot, ComposeSource, Image, OutputDebug, OutputKernels, OutputView,
+    TonemapPass, ViewOutput,
+};
 use orr_scene::Scenes;
 
 /// A scene or output failure.
@@ -65,6 +75,48 @@ pub struct FrameDesc<'a> {
 /// The renderer: scenes, their views' histories and the frame.
 pub struct Renderer {
     scenes: Scenes,
+    output: Output,
+}
+
+/// orr-output's kernels and the state of frames that render no view.
+struct Output {
+    device: Device,
+    kernels: OutputKernels,
+    /// Tonemap roots per frame in flight.
+    roots: OutputView,
+    /// Compose roots per frame in flight.
+    compose: Vec<ComposeRoot>,
+    /// The display-linear image [`Frame::pattern`] draws into, at the display's extent.
+    linear: Option<Image>,
+}
+
+impl Output {
+    fn new(gpu: &Device, frames_in_flight: u32) -> Result<Self> {
+        Ok(Self {
+            device: gpu.clone(),
+            kernels: OutputKernels::new(gpu)?,
+            roots: OutputView::new(gpu, frames_in_flight)?,
+            compose: (0..frames_in_flight.max(1))
+                .map(|_| ComposeRoot::new(gpu))
+                .collect::<Result<_, _>>()?,
+            linear: None,
+        })
+    }
+
+    /// The display-linear image at `extent`, recreated (and its discard recorded into
+    /// `list`) when the extent changes.
+    fn linear(&mut self, list: &mut CommandList<'_>, extent: [u32; 2]) -> Result<&Image> {
+        if self
+            .linear
+            .as_ref()
+            .is_none_or(|l| l.texture().desc().extent[..2] != extent)
+        {
+            let image = Image::new(&self.device, Format::Rgba16Float, extent, "display linear")?;
+            list.discard(image.texture());
+            self.linear = Some(image);
+        }
+        Ok(self.linear.as_ref().expect("linear image"))
+    }
 }
 
 /// Every kernel module compiled into orr.
@@ -85,6 +137,7 @@ impl Renderer {
             .map_err(SceneError::from)?;
         Ok(Self {
             scenes: Scenes::new(gpu, &desc)?,
+            output: Output::new(gpu, desc.frames_in_flight)?,
         })
     }
 
@@ -122,7 +175,11 @@ impl Renderer {
         if let Some(d) = display.as_deref_mut() {
             d.begin_frame(scenes.id())?;
         }
-        Ok(Frame { scenes, display })
+        Ok(Frame {
+            scenes,
+            display,
+            output: &mut self.output,
+        })
     }
 
     /// Figures of the last frame whose GPU work has completed.
@@ -135,12 +192,20 @@ impl Renderer {
 pub struct Frame<'a> {
     scenes: orr_scene::Frame<'a>,
     display: Option<&'a mut Display>,
+    output: &'a mut Output,
 }
 
 impl<'a> Frame<'a> {
     /// orr's frame id: strictly increasing from 1.
     pub fn id(&self) -> u64 {
         self.scenes.id()
+    }
+
+    /// What the frame's display encodes for, and its extent; `None` without a display or
+    /// while its window has no area.
+    pub fn display(&mut self) -> Option<(ResolvedDisplay, [u32; 2])> {
+        let f = self.display.as_deref_mut()?.frame()?;
+        Some((f.display, f.extent))
     }
 
     /// Step 2: the writer of a scene listed in this frame. One per scene at a time; Send.
@@ -174,8 +239,9 @@ impl<'a> Frame<'a> {
     }
 
     /// A frame that renders no view into the display (menus, loading screens): runs `ui`
-    /// into the display's UI layer, which the present thread composes over black. Does
-    /// nothing without a display or while its window has no area.
+    /// into the display's UI layer, which the present thread composes over black, or over
+    /// the frame's [`Frame::pattern`]. Does nothing without a display or while its window
+    /// has no area.
     pub fn ui_only(&mut self, ui: &mut dyn FnMut(&mut UiPass<'_, '_>)) -> Result<()> {
         let Some(display) = self.display.as_deref_mut() else {
             return Ok(());
@@ -191,6 +257,57 @@ impl<'a> Frame<'a> {
             presented: 0,
             time_offset: 0.0,
         });
+        Ok(())
+    }
+
+    /// A frame that renders no view into the display (calibration screens): fills the
+    /// display with `pattern`, encoded at the frame's resolved display without
+    /// tonemapping, so each level reaches the display at its stated luminance. The patch
+    /// is a centred square half the window's height across. Does nothing without a display
+    /// or while its window has no area.
+    pub fn pattern(&mut self, pattern: CalibrationPattern) -> Result<()> {
+        let Some(display) = self.display.as_deref_mut() else {
+            return Ok(());
+        };
+        let id = self.scenes.id();
+        let list = self.scenes.list()?;
+        let Some(mut frame) = display.frame() else {
+            return Ok(());
+        };
+        let output = &mut *self.output;
+        let linear = output.linear(list, frame.extent)?;
+        let (sampled, storage) = (linear.sampled, linear.storage);
+        let view_output = ViewOutput {
+            debug: OutputDebug::Pattern(pattern),
+            ..ViewOutput::default()
+        };
+        output.kernels.tonemap(
+            list,
+            output.roots.roots(id),
+            &TonemapPass {
+                source: TextureIndex::NONE,
+                target: storage,
+                extent: frame.extent,
+                view: GpuPtr::NULL,
+                display: &frame.display,
+                output: &view_output,
+                hook_source: None,
+            },
+        );
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        let target = frame.backbuffer(list);
+        let n = output.compose.len() as u64;
+        output.kernels.compose(
+            list,
+            &mut output.compose[(id % n) as usize],
+            &ComposePass {
+                source: ComposeSource::Linear(sampled),
+                ui: None,
+                target,
+                extent: frame.extent,
+                display: &frame.display,
+            },
+        );
         Ok(())
     }
 

@@ -10,9 +10,9 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, IDC_ARROW, LoadCursorW, MSG, PM_REMOVE, PeekMessageW, RegisterClassW, SW_SHOW,
-    SWP_NOMOVE, SWP_NOZORDER, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
-    WM_CLOSE, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    GetClientRect, IDC_ARROW, LoadCursorW, MSG, PM_REMOVE, PeekMessageW, RegisterClassW,
+    SW_SHOWNOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetWindowPos, ShowWindow, TranslateMessage,
+    WINDOW_EX_STYLE, WM_CLOSE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::w;
 
@@ -27,7 +27,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
     unsafe { DefWindowProcW(hwnd, msg, w, l) }
 }
 
-/// A captioned, resizable window.
+/// A captioned, resizable window, shown without taking focus.
 pub struct Window {
     hwnd: HWND,
     hinstance: isize,
@@ -55,7 +55,7 @@ impl Window {
                 WINDOW_EX_STYLE(0),
                 class,
                 windows::core::PCWSTR(title.as_ptr()),
-                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                WS_OVERLAPPEDWINDOW,
                 100,
                 100,
                 width,
@@ -66,7 +66,7 @@ impl Window {
                 None,
             )
             .expect("CreateWindowExW");
-            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let mut w = Window {
                 hwnd,
                 hinstance: hinstance.0 as isize,
