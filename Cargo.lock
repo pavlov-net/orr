@@ -733,6 +733,8 @@ dependencies = [
  "log",
  "orr-gpu",
  "orr-shaders",
+ "raw-window-handle",
+ "windows",
 ]
 
 [[package]]
@@ -1741,6 +1743,9 @@ dependencies = [
 name = "shader-link"
 version = "0.0.1"
 dependencies = [
+ "orr",
+ "orr-gpu",
+ "orr-scene",
  "orr-shaders",
 ]
 

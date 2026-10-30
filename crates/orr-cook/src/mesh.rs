@@ -26,6 +26,10 @@ pub struct MeshSettings {
     /// Finest grid step, log2 of metres. A mesh too large to span 16 bits per axis at this
     /// step gets the smallest coarser step that does.
     pub position_step_log2: i8,
+    /// Metres a skinned vertex may move from its rest position, for every cluster of a
+    /// skinned mesh (the bound GPU skinning builds cluster templates with); ignored without
+    /// a skin.
+    pub deformation_bound: f32,
 }
 
 impl Default for MeshSettings {
@@ -35,6 +39,7 @@ impl Default for MeshSettings {
             max_vertices_foliage: 256,
             max_triangles: 128,
             position_step_log2: -11,
+            deformation_bound: 0.0,
         }
     }
 }
@@ -47,6 +52,13 @@ pub(crate) struct MeshData {
     pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
     pub sections: Vec<SectionData>,
+    pub skin: Option<Skin>,
+}
+
+/// Per vertex: four skeleton joints and their unorm8 weights, summing to 255.
+pub(crate) struct Skin {
+    pub joints: Vec<[u8; 4]>,
+    pub weights: Vec<[u8; 4]>,
 }
 
 pub(crate) struct SectionData {
@@ -70,6 +82,15 @@ pub(crate) fn cook(asset: &str, m: &MeshData, s: &MeshSettings) -> Result<Cooked
     let grid = Grid::new(&m.positions, s.position_step_log2).map_err(fail)?;
     let attributes = if m.tangents.is_some() {
         MeshHeader::TANGENT
+    } else {
+        0
+    } | if m.skin.is_some() {
+        MeshHeader::SKIN
+    } else {
+        0
+    };
+    let deformation_bound = if m.skin.is_some() {
+        f16_up(s.deformation_bound)
     } else {
         0
     };
@@ -106,14 +127,9 @@ pub(crate) fn cook(asset: &str, m: &MeshData, s: &MeshSettings) -> Result<Cooked
                 3,
             );
             let bounds = meshopt::compute_meshlet_bounds(ml.get(i), &adapter);
-            clusters.push(build_cluster(
-                m,
-                &grid,
-                ml.get(i),
-                &bounds,
-                si as u8,
-                sec.flags,
-            ));
+            let mut c = build_cluster(m, &grid, ml.get(i), &bounds, si as u8, sec.flags);
+            c.record.deformation_bound = deformation_bound;
+            clusters.push(c);
         }
     }
 
@@ -205,9 +221,20 @@ fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
             return Err(format!("cluster vertex limit {v} is outside 3..=256"));
         }
     }
-    if m.normals.len() != n || m.uvs.len() != n || m.tangents.as_ref().is_some_and(|t| t.len() != n)
+    if m.normals.len() != n
+        || m.uvs.len() != n
+        || m.tangents.as_ref().is_some_and(|t| t.len() != n)
+        || m.skin
+            .as_ref()
+            .is_some_and(|k| k.joints.len() != n || k.weights.len() != n)
     {
         return Err("vertex attribute counts differ".into());
+    }
+    if !(0.0..=65504.0).contains(&s.deformation_bound) {
+        return Err(format!(
+            "deformation_bound {} m is outside 0..=65504",
+            s.deformation_bound
+        ));
     }
     if m.sections.is_empty() || m.sections.len() > 256 {
         return Err(format!("{} sections, expected 1 to 256", m.sections.len()));
@@ -230,6 +257,16 @@ fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
         return Err("non-finite vertex attribute".into());
     }
     Ok(())
+}
+
+/// f16 bits of the smallest half at or above `v`.
+fn f16_up(v: f32) -> u16 {
+    let h = half::f16::from_f32(v);
+    if h.to_f32() < v {
+        h.to_bits() + 1
+    } else {
+        h.to_bits()
+    }
 }
 
 /// The mesh grid: every position as an integer multiple of `2^k` metres.
@@ -348,6 +385,10 @@ fn build_cluster(
         }
         let uv = m.uvs[v];
         attrs.push(unorm(uv[0], uv_lo[0], uv_scale[0]) | unorm(uv[1], uv_lo[1], uv_scale[1]) << 16);
+        if let Some(k) = &m.skin {
+            attrs.push(u32::from_le_bytes(k.joints[v]));
+            attrs.push(u32::from_le_bytes(k.weights[v]));
+        }
     }
 
     let tris = ml.triangles.to_vec();
@@ -486,6 +527,10 @@ impl MeshData {
             part(&(s.indices.start as u64).to_le_bytes());
             part(&(s.indices.end as u64).to_le_bytes());
             part(&[s.flags]);
+        }
+        if let Some(k) = &self.skin {
+            part(bytemuck::cast_slice(&k.joints));
+            part(bytemuck::cast_slice(&k.weights));
         }
         orr_pack::Hash32(*h.finalize().as_bytes())
     }

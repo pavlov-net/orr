@@ -3,8 +3,10 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use orr_cook::{CookOptions, Manifest, Outcome};
+use orr_pack::clip::ClipHeader;
 use orr_pack::instance::{InstancePageInfo, InstanceRecord};
 use orr_pack::raster::{RasterLayer, RasterSetInfo};
+use orr_pack::skeleton::{NO_PARENT, SkeletonInfo};
 use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, Class, Codec, Entry};
 
@@ -155,6 +157,10 @@ fn inspect(args: &[String]) -> Result<bool> {
                 instance_line(&a, e, &mut out)?;
             } else if e.class == Class::RasterSet as u16 {
                 raster_lines(&a, e, &mut out)?;
+            } else if e.class == Class::Skeleton as u16 {
+                skeleton_line(&a, e, &mut out)?;
+            } else if e.class == Class::Clip as u16 {
+                clip_line(&a, e, &mut out)?;
             }
         }
         if name.is_some() {
@@ -176,11 +182,16 @@ fn inspect(args: &[String]) -> Result<bool> {
     Ok(true)
 }
 
-/// Format, size, mips and the bytes of the mip tail, which stays resident from mount.
-fn texture_line(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
+fn mount_blob(a: &Archive, e: &Entry) -> Result<Vec<u8>> {
     let b = &a.blobs(e)[0];
     let mut head = vec![0; b.raw_len as usize];
     a.read(b, &mut head)?;
+    Ok(head)
+}
+
+/// Format, size, mips and the bytes of the mip tail, which stays resident from mount.
+fn texture_line(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
+    let head = mount_blob(a, e)?;
     let info = TextureInfo::parse(&head)?;
     let h = info.header;
     let tail = if h.tail_first_mip < h.mip_count {
@@ -204,9 +215,7 @@ fn texture_line(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
 
 /// Cell, records, prototypes, partitions and the scale range of an instance page.
 fn instance_line(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
-    let b = &a.blobs(e)[0];
-    let mut head = vec![0; b.raw_len as usize];
-    a.read(b, &mut head)?;
+    let head = mount_blob(a, e)?;
     let info = InstancePageInfo::parse(&head)?;
     let h = info.header;
     writeln!(
@@ -228,8 +237,7 @@ fn instance_line(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
 /// range and stored bytes.
 fn raster_lines(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
     let blobs = a.blobs(e);
-    let mut head = vec![0; blobs[0].raw_len as usize];
-    a.read(&blobs[0], &mut head)?;
+    let head = mount_blob(a, e)?;
     let info = RasterSetInfo::parse(&head)?;
     let h = info.header;
     writeln!(
@@ -268,6 +276,33 @@ fn raster_lines(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
             l.value_range,
         )?;
     }
+    Ok(())
+}
+
+/// Joints and the names of the roots.
+fn skeleton_line(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
+    let head = mount_blob(a, e)?;
+    let info = SkeletonInfo::parse(&head)?;
+    let roots: Vec<&str> = (0..info.joint_count())
+        .filter(|&j| info.parents[j] == NO_PARENT)
+        .map(|j| info.names[j].as_str())
+        .collect();
+    writeln!(out, "    {} joints, roots {roots:?}", info.joint_count())?;
+    Ok(())
+}
+
+/// Joints, frames, rate, duration and the skeleton.
+fn clip_line(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
+    let head = mount_blob(a, e)?;
+    let h: ClipHeader = bytemuck::pod_read_unaligned(
+        head.get(..size_of::<ClipHeader>())
+            .ok_or("clip header is short")?,
+    );
+    writeln!(
+        out,
+        "    {} joints, {} frames at {:.3} Hz ({:.3} s), skeleton {}",
+        h.joint_count, h.frame_count, h.sample_rate, h.duration, h.skeleton
+    )?;
     Ok(())
 }
 

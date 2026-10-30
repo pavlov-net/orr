@@ -6,6 +6,8 @@
 //! between CPUs and platforms.
 
 mod common;
+#[path = "common/skinned.rs"]
+mod common_skinned;
 
 use glam::{DVec3, Quat, Vec3};
 use orr_cook::{
@@ -21,18 +23,18 @@ const USER: u16 = Class::USER_FIRST + 1;
 const GOLDEN: &[(u16, u32, &str)] = &[
     (
         Class::Mesh as u16,
-        1,
-        "c4a5bf69abadcfa8e8c64d5bbc8495a72896e86c28619f26cdaf20266cf769fb",
+        2,
+        "02fec79d3438a494991b4cc6b673cfdc9a83354a0fb1a996dbdb769e9f77ab0f",
     ),
     (
         Class::Material as u16,
         1,
-        "d371e265b6acd6338980e7b2ea5ed66950f8ff6679f4fe7053d9e4ee5b667846",
+        "c28ff4998367def1d6bb8da7e624c5627c9671962dd04df2b9eed0f895aaeff4",
     ),
     (
         Class::Model as u16,
-        1,
-        "d8b1f18f6c0f4b480415597df31be497f2f1611be06c4f711bb3db3b8b0ea56a",
+        2,
+        "ec5cfcf2cb99fe13a2f9c217c5b77507f8f55aa0a18d1834e54fe4e66a8f61d6",
     ),
     (
         Class::Texture as u16,
@@ -48,6 +50,16 @@ const GOLDEN: &[(u16, u32, &str)] = &[
         Class::RasterSet as u16,
         1,
         "552868a7a913b6a2812e5d834cbba45fb4613839e85d744cfdc358ab53dba9be",
+    ),
+    (
+        Class::Skeleton as u16,
+        1,
+        "04c4a01f5c1b0373b9ea75d8b848be7697eda558e82adb029a9efe011f8aebc1",
+    ),
+    (
+        Class::Clip as u16,
+        1,
+        "517b3a610d36451309d0b6313cbda0b2339f05b2b247c3bcbfa0fd7880a15c44",
     ),
     (
         USER,
@@ -92,6 +104,13 @@ fn cooked_bytes_match_their_cook_versions() {
                     name: "block".into(),
                     source: Source::Gltf {
                         path: common::block_glb(),
+                        settings: GltfSettings::default(),
+                    },
+                },
+                AssetSpec {
+                    name: "rig".into(),
+                    source: Source::Gltf {
+                        path: common_skinned::skinned_glb("golden-skinned", false),
                         settings: GltfSettings::default(),
                     },
                 },

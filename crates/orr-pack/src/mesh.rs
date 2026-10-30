@@ -20,7 +20,7 @@
 use bytemuck::{Pod, Zeroable};
 
 use crate::blob::{put_table, read, table};
-use crate::{Aabb, Error, Result, Span, Sphere};
+use crate::{Aabb, Affine3, Error, Result, Span, Sphere};
 
 pub const SCHEMA: u16 = 1;
 
@@ -357,6 +357,7 @@ pub struct PageView<'a> {
     header: PageHeader,
     step: f32,
     tangent: bool,
+    skin: bool,
 }
 
 impl<'a> PageView<'a> {
@@ -371,6 +372,7 @@ impl<'a> PageView<'a> {
             header,
             step: mesh.step(),
             tangent: mesh.attributes & MeshHeader::TANGENT != 0,
+            skin: mesh.attributes & MeshHeader::SKIN != 0,
         })
     }
 
@@ -417,6 +419,24 @@ impl<'a> PageView<'a> {
         [0, 1].map(|a| c.uv_offset[a] + q[a] as f32 / 65535.0 * c.uv_scale[a])
     }
 
+    /// Skeleton joints of a vertex, when the mesh has [`MeshHeader::SKIN`].
+    pub fn joints(&self, c: &Cluster, v: u32) -> Option<[u8; 4]> {
+        self.skin
+            .then(|| self.attr(c, v, self.skin_at()).to_le_bytes())
+    }
+
+    /// Weights of [`Self::joints`], summing to 1.
+    pub fn weights(&self, c: &Cluster, v: u32) -> Option<[f32; 4]> {
+        self.skin.then(|| {
+            let w = self.attr(c, v, self.skin_at() + 4).to_le_bytes();
+            w.map(|q| f32::from(q) / 255.0)
+        })
+    }
+
+    fn skin_at(&self) -> u32 {
+        if self.tangent { 12 } else { 8 }
+    }
+
     pub fn triangle(&self, c: &Cluster, t: u32) -> [u8; 3] {
         assert!(t < u32::from(c.tri_count));
         let at = (self.header.tris_offset + c.tri_first + t * 3) as usize;
@@ -431,6 +451,29 @@ impl<'a> PageView<'a> {
     fn vertex<T: Pod>(&self, base: u32, stride: u32, c: &Cluster, v: u32) -> T {
         assert!(v < u32::from(c.vertex_count));
         read(self.page, (base + (c.vertex_first + v) * stride) as usize).unwrap()
+    }
+}
+
+/// Linear blend skinning of a cluster's vertices: vertex `i` lands in `out[i]` at
+/// `sum_k weight_k x (palette[joint_k] x position)`, in mesh space. `palette` holds the
+/// skinning matrices ([`crate::skeleton::SkeletonInfo::palette`]).
+///
+/// Panics if the mesh has no [`MeshHeader::SKIN`], a vertex names a joint past `palette`,
+/// or `out` is shorter than the cluster's vertices.
+pub fn skin(view: &PageView<'_>, c: &Cluster, palette: &[Affine3], out: &mut [[f32; 3]]) {
+    assert!(view.skin, "the mesh has no skin");
+    let n = usize::from(c.vertex_count);
+    for (v, o) in (0..).zip(&mut out[..n]) {
+        let p = view.position(c, v);
+        let joints = view.joints(c, v).unwrap();
+        let weights = view.weights(c, v).unwrap();
+        *o = [0.0; 3];
+        for (j, w) in joints.into_iter().zip(weights) {
+            if w > 0.0 {
+                let q = palette[usize::from(j)].transform_point(p);
+                (0..3).for_each(|a| o[a] += w * q[a]);
+            }
+        }
     }
 }
 
