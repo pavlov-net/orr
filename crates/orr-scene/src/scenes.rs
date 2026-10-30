@@ -652,6 +652,13 @@ impl<'a> Frame<'a> {
         Ok(())
     }
 
+    /// The frame's command list, for the steps after `update_scenes` (views, output, UI);
+    /// runs `update_scenes` first when the consumer did not.
+    pub fn list(&mut self) -> Result<&mut CommandList<'a>> {
+        self.ensure_updated()?;
+        Ok(self.list.as_mut().expect("frame list"))
+    }
+
     /// Step 4, the raster half of a view: writes its `ViewConstants` and moves its history
     /// on.
     pub fn raster_view(&mut self, view: &ViewDesc<'_>) -> Result<RasterView> {

@@ -49,6 +49,16 @@ void write(uint2 id, float3 linear)
         root.target.get<RWTexture2D<float4>>()[id.xy] = float4(signal, 1.0);
 }
 
+// On the frame a window resizes, the source and UI layer can differ in size from the
+// target; their edge texels fill the difference.
+float4 load_clamped(TextureIndex t, uint2 p)
+{
+    Texture2D<float4> tex = t.get<Texture2D<float4>>();
+    uint w, h;
+    tex.GetDimensions(w, h);
+    return tex.Load(int3(min(p, uint2(w, h) - 1), 0));
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint3 id: SV_DispatchThreadID)
@@ -57,11 +67,11 @@ void main(uint3 id: SV_DispatchThreadID)
         return;
     float4 ui = 0.0;
     if (root.ui.index != NO_TEXTURE)
-        ui = root.ui.get<Texture2D<float4>>().Load(int3(id.xy, 0));
+        ui = load_clamped(root.ui, id.xy);
     float3 linear = 0.0;
     if (root.source_kind != SOURCE_BLACK)
     {
-        float4 texel = root.source.get<Texture2D<float4>>().Load(int3(id.xy, 0));
+        float4 texel = load_clamped(root.source, id.xy);
         // Without UI an encoded image passes through unchanged.
         if (root.source_kind == SOURCE_ENCODED && all(ui == 0.0) && root.capture == nullptr)
         {

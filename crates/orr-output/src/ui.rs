@@ -7,6 +7,20 @@ use orr_scene::orr_gpu::{
 
 use crate::Result;
 
+/// What a UI hook draws with: the frame's command list and the UI layer, already cleared,
+/// to draw into as a colour attachment.
+pub struct UiPass<'a, 'q> {
+    pub cmd: &'a mut CommandList<'q>,
+    /// RGBA8 UNORM at the display's extent, premultiplied, sRGB-encoded.
+    pub layer: &'a Texture,
+    /// The presented image within the frame the UI is for: 0 unless the UI is drawn per
+    /// presented image.
+    pub presented: u32,
+    /// Seconds from the frame's own image to that presented image; 0 unless the UI is drawn
+    /// per presented image.
+    pub time_offset: f32,
+}
+
 /// A UI layer: RGBA8 UNORM at output resolution, holding premultiplied, sRGB-encoded colour
 /// (egui's reference blending). A display keeps one per frame in flight.
 pub struct UiLayer {

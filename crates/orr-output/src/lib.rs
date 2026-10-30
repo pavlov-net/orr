@@ -39,7 +39,7 @@ pub use passes::{
 };
 pub use present::{Display, DisplayFrame, Presented};
 pub use screenshot::{Primaries, Screenshot, ScreenshotRequest};
-pub use ui::UiLayer;
+pub use ui::{UiLayer, UiPass};
 pub use view::{OutputDebug, ViewOutput};
 pub use white_balance::{
     AutoWhiteBalance, D65_XY, WHITE_BALANCE_CCT, WHITE_BALANCE_DUV, cct_duv_from_xy,

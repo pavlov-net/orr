@@ -11,6 +11,8 @@ links = "orr"
 [dependencies]
 orr-scene.workspace = true
 orr-lighting.workspace = true
+orr-output = { path = "../orr-output" }
+thiserror.workspace = true
 
 [lints]
 workspace = true
