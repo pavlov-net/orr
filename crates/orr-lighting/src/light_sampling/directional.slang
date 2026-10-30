@@ -1,5 +1,5 @@
-// The scene pass over directional lights: states, `Textured` disc integrals and the summed
-// focus illuminance.
+// The scene pass over directional lights: their states, `Textured` disc integrals, LightIds
+// and summed focus illuminance.
 #include "orr/root.h"
 import media;
 import light_sampling;

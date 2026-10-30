@@ -5,18 +5,19 @@ use std::f64::consts::PI;
 use glam::{DVec3, Mat3, Vec3};
 use lighting_suite::shaders::{
     disc_probe, env_probe, fog_probe, glint, octahedral as mapping, procedural_bake,
-    slab_directional,
+    slab_directional, textured_probe,
 };
 use lighting_suite::{
-    TestTexture, assert_clean, copy_back, device, kernels, linear_clamp, pipeline, readback,
-    render, run, texture, upload,
+    TestScene, TestTexture, assert_clean, compute_barrier, copy_back, finish, kernels,
+    linear_clamp, pipeline, read, readback, render, texture, upload,
 };
-use orr_gpu::{GpuAddress, GpuPtr, Hazards, KernelSet, Stages, TextureIndex};
+use orr_gpu::{GpuAddress, KernelSet, TextureIndex};
 use orr_lighting::{
-    DirectionalLight, DirectionalLightGpu, DirectionalState, DiscProfile, EnvironmentMapGpu,
-    SceneLighting, ScenePass,
+    DirectionalLight, DirectionalState, DiscProfile, EnvironmentMapGpu, Light, LightId,
+    SceneLighting,
 };
 use orr_pack::texture::octahedral;
+use orr_scene::{LightGpu, SceneDesc};
 use shader_maths::stats::{Rng, chi_square_p};
 
 const BAKE: &str = "environment/bake";
@@ -35,37 +36,21 @@ const REC2020_TO_XYZ: [[f64; 3]; 3] = [
 
 const SUN_RADIUS: f32 = 4.65e-3;
 
-fn scene(kernels: &KernelSet, capacity: u32) -> SceneLighting {
-    SceneLighting::new(device(), kernels, &Default::default(), capacity).unwrap()
-}
-
-fn pass(
-    focus: [f32; 3],
-    environment: GpuAddress,
-    lights: GpuPtr<DirectionalLightGpu>,
-    count: u32,
-) -> ScenePass {
-    ScenePass {
-        frame: 0,
-        focus,
-        environment,
-        medium: GpuAddress(0),
-        lights,
-        light_count: count,
-    }
-}
-
-fn after_scene_pass(list: &mut orr_gpu::CommandList<'_>) {
-    list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-}
-
-fn finish(mut list: orr_gpu::CommandList<'_>) {
-    list.barrier(
-        Stages::COMPUTE | Stages::TRANSFER,
-        Stages::HOST,
-        Hazards::empty(),
-    );
-    run(list);
+/// A scene holding `lights` from LightId 0 and the environment `environment`, after one
+/// frame.
+fn scene_with(lights: &[DirectionalLight], environment: GpuAddress) -> TestScene {
+    let mut scene = TestScene::new(SceneDesc {
+        light_capacity: 8,
+        ..SceneDesc::default()
+    });
+    scene.write(|w, _| {
+        for (i, l) in lights.iter().enumerate() {
+            w.set_light(LightId(i as u32), Some(&Light::Directional(*l)))
+                .unwrap();
+        }
+        w.set_environment(environment);
+    });
+    scene
 }
 
 fn v3(a: [f32; 3]) -> DVec3 {
@@ -105,7 +90,7 @@ fn textured(
         disc: DiscProfile::Textured {
             albedo,
             up: Vec3::Y,
-            lit_by: [Some(0), None, None, None],
+            lit_by: [LightId(0), LightId::NONE, LightId::NONE, LightId::NONE],
         },
     }
 }
@@ -186,7 +171,7 @@ fn equal_area_mapping_matches_the_cook() {
 
 /// Samples the scene's baked environment 2^20 times into equal-area latitude-longitude bins
 /// and compares the counts with the bins' probabilities integrated from its density.
-fn sampling_matches_density(lighting: &mut SceneLighting, environment: GpuAddress) {
+fn sampling_matches_density(scene: &TestScene, lighting: &mut SceneLighting) {
     let bins = 32 * 16u64;
     let threads = 1u32 << 14;
     let per_thread = 64u32;
@@ -209,8 +194,8 @@ fn sampling_matches_density(lighting: &mut SceneLighting, environment: GpuAddres
         "env probe root",
     );
     let mut list = render().command_list().unwrap();
-    lighting.record(&mut list, &pass([0.0; 3], environment, GpuPtr::NULL, 0));
-    after_scene_pass(&mut list);
+    lighting.record(&mut list, &scene.pass([0.0; 3]));
+    compute_barrier(&mut list);
     list.dispatch(
         &pipeline(&env_probe::MODULE, "sample"),
         root.gpu,
@@ -290,16 +275,17 @@ fn hdr_map_sampling_matches_its_density() {
         }],
         "hdr map data",
     );
-    let mut lighting = scene(&KernelSet::default(), 1);
-    sampling_matches_density(&mut lighting, data.gpu.address());
+    let scene = scene_with(&[], data.gpu.address());
+    let mut lighting = scene.lighting(&KernelSet::default());
+    sampling_matches_density(&scene, &mut lighting);
     assert_clean();
 }
 
 #[test]
 fn procedural_sky_sampling_matches_its_density() {
-    let set = kernels(&[(&procedural_bake::MODULE, BAKE)]);
-    let mut lighting = scene(&set, 1);
-    sampling_matches_density(&mut lighting, GpuAddress(0));
+    let scene = scene_with(&[], GpuAddress(0));
+    let mut lighting = scene.lighting(&kernels(&[(&procedural_bake::MODULE, BAKE)]));
+    sampling_matches_density(&scene, &mut lighting);
     assert_clean();
 }
 
@@ -333,44 +319,49 @@ fn sky_stats_match_a_uniform_environment_and_a_slab() {
             0.01,
             TextureIndex::NONE,
         ),
-    ]
-    .map(|l| l.gpu());
-    let table = upload(&lights, "lights");
-    let set = kernels(&[(&slab_directional::MODULE, DIRECTIONAL)]);
-    let mut lighting = scene(&set, 4);
+    ];
+    let scene = scene_with(&lights, data.gpu.address());
+    let mut lighting = scene.lighting(&kernels(&[(&slab_directional::MODULE, DIRECTIONAL)]));
     let focus = [10.0, 100.0, -5.0];
     let mut list = render().command_list().unwrap();
-    lighting.record(&mut list, &pass(focus, data.gpu.address(), table.gpu, 3));
+    lighting.record(&mut list, &scene.pass(focus));
     finish(list);
-    let stats = lighting.stats(0).expect("frame 0 statistics").sky;
-    assert!(lighting.stats(1).is_none());
+    let stats = lighting
+        .stats(scene.frame)
+        .expect("this frame's statistics");
+    assert!(lighting.stats(scene.frame + 1).is_none());
+    assert_eq!(stats.directional_lights, 3);
+    let sky = read(scene.root_value().sky_stats, 1)[0];
+    assert_eq!(
+        bytemuck::bytes_of(&sky),
+        bytemuck::bytes_of(&stats.sky),
+        "the scene's SkyStats differ from the statistics read back"
+    );
 
     let c = v3(c);
     let xyz = DVec3::from_array(REC2020_TO_XYZ.map(|row| DVec3::from_array(row).dot(c)));
     let xy = [xyz.x / xyz.element_sum(), xyz.y / xyz.element_sum()];
     assert!(
-        (f64::from(stats.dome_luminance) / xyz.y - 1.0).abs() < 1e-5,
+        (f64::from(sky.dome_luminance) / xyz.y - 1.0).abs() < 1e-5,
         "dome luminance {} against {}",
-        stats.dome_luminance,
+        sky.dome_luminance,
         xyz.y
     );
     for k in 0..2 {
         assert!(
-            (f64::from(stats.dome_xy[k]) - xy[k]).abs() < 1e-5,
+            (f64::from(sky.dome_xy[k]) - xy[k]).abs() < 1e-5,
             "dome xy {:?} against {xy:?}",
-            stats.dome_xy
+            sky.dome_xy
         );
     }
-    let expected: DVec3 = lights
+    let expected: DVec3 = scene.lights()[..3]
         .iter()
-        .map(|l| {
-            v3(l.illuminance) * slab_transmittance(f64::from(focus[1]), v3(l.direction_to_light))
-        })
+        .map(|l| v3(l.color) * slab_transmittance(f64::from(focus[1]), v3(l.direction)))
         .sum();
     let got = DVec3::new(
-        f64::from(stats.directional[0]),
-        f64::from(stats.directional[1]),
-        f64::from(stats.directional[2]),
+        f64::from(sky.directional[0]),
+        f64::from(sky.directional[1]),
+        f64::from(sky.directional[2]),
     );
     assert!(
         rel(got, expected) < 1e-4,
@@ -379,47 +370,63 @@ fn sky_stats_match_a_uniform_environment_and_a_slab() {
     assert_clean();
 }
 
-/// Lights of `table` with their states from a default scene pass at `focus`, and per light
-/// the cosine-weighted integral of `directional_disc` through the slab over its cone, and
-/// `textured_disc_integral` from a scene compute kernel.
+/// Lights of `lights` (LightIds from 0) as the scene stores them, their states from a
+/// default scene pass at `focus`, per light the cosine-weighted integral of
+/// `directional_disc` through the slab over its cone, and `textured_disc_integral` from a
+/// scene compute kernel.
 struct Discs {
+    table: Vec<LightGpu>,
     states: Vec<DirectionalState>,
     integrals: Vec<DVec3>,
     textured: Vec<[f32; 4]>,
 }
 
-fn discs(table: &[DirectionalLightGpu], focus: [f32; 3]) -> Discs {
-    let count = table.len() as u32;
-    let lights = upload(table, "lights");
-    let mut lighting = scene(&KernelSet::default(), count);
-    let integrals = readback::<[f32; 4]>(u64::from(count), "disc integrals");
+fn discs(lights: &[DirectionalLight], focus: [f32; 3]) -> Discs {
+    let count = lights.len() as u32;
+    let mut scene = TestScene::new(SceneDesc {
+        light_capacity: count,
+        ..SceneDesc::default()
+    });
     let textured = readback::<[f32; 4]>(u64::from(count), "textured integrals");
+    let probe = pipeline(&textured_probe::MODULE, "main");
+    scene.frame(
+        |w, _| {
+            for (i, l) in lights.iter().enumerate() {
+                w.set_light(LightId(i as u32), Some(&Light::Directional(*l)))
+                    .unwrap();
+            }
+        },
+        |c| {
+            let root = c
+                .put_root(&textured_probe::Root {
+                    scene: c.root,
+                    integrals: textured.gpu,
+                })
+                .unwrap();
+            c.cmd.dispatch(&probe, root, [1, 1, 1]);
+        },
+    );
+    let mut lighting = scene.lighting(&KernelSet::default());
+    let integrals = readback::<[f32; 4]>(u64::from(count), "disc integrals");
     let root = upload(
         &[disc_probe::Root {
-            lights: lights.gpu,
-            states: lighting.directional_states(),
+            set: lighting.light_set(),
             integrals: integrals.gpu,
-            textured: textured.gpu,
             eye: [focus[0], focus[1], focus[2], 0.0],
-            count,
             resolution: 1024,
             _pad0: 0,
             _pad1: 0,
+            _pad2: 0,
         }],
         "disc probe root",
     );
     let mut list = render().command_list().unwrap();
-    lighting.record(&mut list, &pass(focus, GpuAddress(0), lights.gpu, count));
-    after_scene_pass(&mut list);
+    lighting.record(&mut list, &scene.pass(focus));
+    compute_barrier(&mut list);
     list.dispatch(
         &pipeline(&disc_probe::MODULE, "integrate"),
         root.gpu,
         [count, 1, 1],
-    );
-    list.dispatch(
-        &pipeline(&disc_probe::MODULE, "textured"),
-        root.gpu,
-        [1, 1, 1],
     );
     let states = copy_back(
         &mut list,
@@ -429,6 +436,7 @@ fn discs(table: &[DirectionalLightGpu], focus: [f32; 3]) -> Discs {
     );
     finish(list);
     Discs {
+        table: scene.lights(),
         states: states.as_slice().unwrap().to_vec(),
         integrals: integrals
             .as_slice()
@@ -454,12 +462,11 @@ fn disc_integrals_equal_illuminance_times_transmittance() {
             ..uniform_sun(Vec3::new(-0.5, 0.6, 0.1), Vec3::new(5.0e4, 5.0e4, 4.0e4))
         },
         textured(moon, Vec3::new(0.3, 0.25, 0.2), 0.02, albedo.index),
-    ]
-    .map(|l| l.gpu());
+    ];
     let focus = [0.0, 100.0, 0.0];
     let d = discs(&table, focus);
-    for (i, l) in table.iter().enumerate() {
-        let expected = v3(l.illuminance) * slab_transmittance(100.0, v3(l.direction_to_light));
+    for (i, l) in d.table.iter().enumerate() {
+        let expected = v3(l.color) * slab_transmittance(100.0, v3(l.direction));
         let e = rel(d.integrals[i], expected);
         assert!(
             e < 5e-3,
@@ -476,17 +483,22 @@ fn textured_disc_follows_the_lambert_phase_curve() {
     let sun = Vec3::new(0.2, 0.7, 0.3).normalize();
     let side = sun.cross(Vec3::Z).normalize();
     let phases = [0.0f32, 45.0, 90.0, 135.0];
-    let mut table = vec![uniform_sun(sun, Vec3::ONE).gpu()];
+    let mut table = vec![uniform_sun(sun, Vec3::ONE)];
     for a in phases {
         // The angle between the sunlight's travel and the view toward the disc is `a`.
         let toward_disc = -(Mat3::from_axis_angle(side, a.to_radians()) * sun);
-        table.push(textured(toward_disc, Vec3::ZERO, SUN_RADIUS, TextureIndex::NONE).gpu());
+        table.push(textured(
+            toward_disc,
+            Vec3::ZERO,
+            SUN_RADIUS,
+            TextureIndex::NONE,
+        ));
     }
     let d = discs(&table, [0.0; 3]);
     let integral = |i: usize| f64::from(d.states[i].integral[1]);
     let full = integral(1);
     let sin2 = f64::from(SUN_RADIUS).sin().powi(2);
-    let lambert_full = sin2 * 2.0 / 3.0 * f64::from(table[0].illuminance[1]);
+    let lambert_full = sin2 * 2.0 / 3.0 * f64::from(d.table[0].color[1]);
     assert!(
         (full / lambert_full - 1.0).abs() < 5e-3,
         "full disc {full} against {lambert_full}"
@@ -529,10 +541,9 @@ fn glint_converges_to_the_same_value_from_nee_and_bsdf_sampling() {
             0.03,
             albedo.index,
         ),
-    ]
-    .map(|l| l.gpu());
-    let lights = upload(&table, "lights");
-    let mut lighting = scene(&KernelSet::default(), 3);
+    ];
+    let scene = scene_with(&table, GpuAddress(0));
+    let mut lighting = scene.lighting(&KernelSet::default());
     let threads = 1u32 << 16;
     let per_thread = 1024;
     let sums: Vec<_> = (0..table.len())
@@ -543,14 +554,12 @@ fn glint_converges_to_the_same_value_from_nee_and_bsdf_sampling() {
         .zip(&sums)
         .enumerate()
         .map(|(i, (l, s))| {
-            let a = l.direction_to_light;
+            let a = l.direction_to_light.normalize();
             upload(
                 &[glint::Root {
-                    lights: lights.gpu,
-                    states: lighting.directional_states(),
+                    set: lighting.light_set(),
                     sums: s.gpu,
-                    _pad: 0,
-                    wo: [-a[0], a[1], -a[2], 0.0],
+                    wo: [-a.x, a.y, -a.z, 0.0],
                     light: i as u32,
                     samples_per_thread: per_thread,
                     alpha: 0.1,
@@ -561,8 +570,8 @@ fn glint_converges_to_the_same_value_from_nee_and_bsdf_sampling() {
         })
         .collect();
     let mut list = render().command_list().unwrap();
-    lighting.record(&mut list, &pass([0.0; 3], GpuAddress(0), lights.gpu, 3));
-    after_scene_pass(&mut list);
+    lighting.record(&mut list, &scene.pass([0.0; 3]));
+    compute_barrier(&mut list);
     let p = pipeline(&glint::MODULE, "main");
     for root in &roots {
         list.dispatch(&p, root.gpu, [threads / 64, 1, 1]);

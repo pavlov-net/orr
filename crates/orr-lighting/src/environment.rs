@@ -1,16 +1,17 @@
 //! The baked environment: each frame the linked environment is evaluated at the scene focus
-//! into an equal-area octahedral map, then reduced to its mean, the dome statistics and an
-//! importance pyramid for sampling.
+//! into an equal-area octahedral map, then reduced to its mean and an importance pyramid for
+//! sampling.
 
 use bytemuck::{Pod, Zeroable};
-use orr_gpu::{
+use orr_scene::SceneRoot;
+use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, Format, GpuPtr, Hazards, MemoryKind,
     SamplerIndex, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
     TextureUsage, TimelinePoint, ViewDesc,
 };
 
 use crate::shaders::environment::{bake, pyramid};
-use crate::shaders::types::{EnvironmentGpu, SkyStats};
+use crate::shaders::types::EnvironmentGpu;
 use crate::{Error, KernelSet, pipeline};
 
 /// Texels per side of the baked map.
@@ -53,11 +54,7 @@ pub(crate) struct EnvironmentBake {
 }
 
 impl EnvironmentBake {
-    pub(crate) fn new(
-        device: &Device,
-        kernels: &KernelSet,
-        sky: GpuPtr<SkyStats>,
-    ) -> Result<Self, Error> {
+    pub(crate) fn new(device: &Device, kernels: &KernelSet) -> Result<Self, Error> {
         let desc = TextureDesc::d2(
             Format::Rgba16Float,
             ENVIRONMENT_SIZE,
@@ -96,11 +93,12 @@ impl EnvironmentBake {
                 partials: partials.gpu,
                 pyramid: pyramid.gpu,
                 environment: record.gpu,
-                sky,
                 partial_count: GROUPS * GROUPS,
                 size: ENVIRONMENT_SIZE,
                 level: level as u32,
-                _pad: 0,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
             };
         }
         Ok(Self {
@@ -119,9 +117,9 @@ impl EnvironmentBake {
     }
 
     /// The bake root for one frame.
-    pub(crate) fn root(&self, environment: u64, focus: [f32; 3]) -> bake::Root {
+    pub(crate) fn root(&self, scene: GpuPtr<SceneRoot>, focus: [f32; 3]) -> bake::Root {
         bake::Root {
-            environment,
+            scene,
             partials: self.partials.gpu,
             luminance: self.pyramid.gpu,
             map: self.storage,
@@ -138,7 +136,7 @@ impl EnvironmentBake {
         list.dispatch(&self.bake, root, [GROUPS, GROUPS, 1]);
     }
 
-    /// The mean, dome statistics and pyramid; after the bake's writes are visible.
+    /// The mean and pyramid; after the bake's writes are visible.
     pub(crate) fn record_reduce(&self, list: &mut CommandList<'_>) {
         list.dispatch(&self.mean, self.pyramid_roots.gpu, [1, 1, 1]);
         for level in 1..=LEVELS {

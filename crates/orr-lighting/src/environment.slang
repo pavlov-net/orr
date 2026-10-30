@@ -7,6 +7,7 @@ import orr.abi;
 import orr.math;
 import orr.color;
 import orr.sampling;
+import tables;
 
 // An environment linked into orr's kernels. `data` is the address the scene was given for
 // it. Radiance in nits, linear Rec.2020, without directional light discs.
@@ -127,19 +128,6 @@ public struct EnvironmentGpu
     public uint size;
 }
 
-// Per-scene sky statistics written by lighting's scene pass.
-public struct SkyStats
-{
-    // Mean luminance of the baked environment over the sphere, nits.
-    public float dome_luminance;
-    // CIE 1931 xy of that mean.
-    public float2 dome_xy;
-    public float _pad;
-    // rgb: illuminance at the scene focus summed over every directional light, after the
-    // medium; a unused.
-    public float4 directional;
-}
-
 // Offset of `level` in a pyramid over an n x n map (n a power of two).
 public uint pyramid_offset(uint n, uint level)
 {
@@ -250,8 +238,8 @@ public float3 bake_texel<E : IEnvironment>(uint64_t data, float3 focus, uint2 te
 // Root of the bake kernel.
 public struct BakeRoot
 {
-    // The linked environment's data.
-    public uint64_t environment;
+    // The scene; its `environment` is the linked environment's data.
+    public SceneRoot* scene;
     // One rgb sum per 8 x 8 workgroup.
     public float4* partials;
     // Level 0 of the pyramid; the bake writes luminance there.
@@ -268,7 +256,7 @@ static groupshared float3 bake_sums[64];
 // the workgroup's rgb sum.
 public void bake_environment<E : IEnvironment>(BakeRoot r, uint2 texel, uint lane, uint group)
 {
-    float3 c = bake_texel<E>(r.environment, r.focus.xyz, texel, r.size);
+    float3 c = bake_texel<E>(r.scene.environment, r.focus.xyz, texel, r.size);
     r.map.get<RWTexture2D<float4>>()[texel] = float4(c, 1.0);
     r.luminance[texel.y * r.size + texel.x] = luminance_rec2020(c);
     bake_sums[lane] = c;

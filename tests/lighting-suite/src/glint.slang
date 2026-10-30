@@ -10,11 +10,9 @@ import light_sampling;
 
 struct Root
 {
-    DirectionalLightGpu* lights;
-    DirectionalState* states;
+    LightSetGpu* set;
     // Per thread: NEE sum, NEE sum of squares, BSDF sum, BSDF sum of squares.
     float4* sums;
-    uint64_t _pad;
     // Unit direction toward the viewer; the surface normal is +y.
     float4 wo;
     uint light;
@@ -56,8 +54,8 @@ void main(uint3 id: SV_DispatchThreadID)
         float4 u = float4(h >> 8) * (1.0 / 16777216.0);
 
         float pdf;
-        float3 d = directional_sample(root.lights, root.light, u.xy, pdf);
-        float3 l = directional_disc<NoMedium>(0, root.lights, root.states, root.light, float3(0.0), d);
+        float3 d = directional_sample(root.set.scene.lights[root.light], u.xy, pdf);
+        float3 l = directional_disc<NoMedium>(root.set, root.light, float3(0.0), d);
         float nee = luminance_rec2020(l) * bsdf_cos(wo, to_local(d, t, b, n), root.alpha) / pdf;
 
         float3 wi = sample_ggx_vndf_bounded(wo, alpha, u.zw);
@@ -65,7 +63,7 @@ void main(uint3 id: SV_DispatchThreadID)
         if (wi.z > 0.0)
         {
             float3 dw = from_local(wi, t, b, n);
-            l = directional_disc<NoMedium>(0, root.lights, root.states, root.light, float3(0.0), dw);
+            l = directional_disc<NoMedium>(root.set, root.light, float3(0.0), dw);
             bsdf = luminance_rec2020(l) * bsdf_cos(wo, wi, root.alpha) / ggx_vndf_bounded_pdf(wo, wi, alpha);
         }
         acc += float4(nee, nee * nee, bsdf, bsdf * bsdf);

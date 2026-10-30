@@ -1,6 +1,6 @@
 [package]
 name = "orr-lighting"
-description = "Light transport for orr: the baked environment and its importance sampling, media, directional light discs."
+description = "Light transport for orr: light selection and presampled light tiles, the baked environment and its importance sampling, media, directional light discs."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,7 @@ repository.workspace = true
 links = "orr_lighting"
 
 [dependencies]
-orr-gpu.workspace = true
+orr-scene.workspace = true
 orr-shaders.workspace = true
 glam.workspace = true
 bytemuck.workspace = true
