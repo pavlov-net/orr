@@ -251,6 +251,7 @@ fn malloc<T: Pod>(device: &Device, kind: MemoryKind, count: usize, name: &str) -
 pub struct Luts {
     /// The value of specialisation constant `openpbr_lut_slot`.
     pub first_slot: u32,
+    device: Device,
     _textures: Vec<Texture>,
 }
 
@@ -302,7 +303,16 @@ impl Luts {
             .expect("LUT upload");
         Self {
             first_slot,
+            device: device.clone(),
             _textures: textures,
+        }
+    }
+}
+
+impl Drop for Luts {
+    fn drop(&mut self) {
+        for slot in self.first_slot..self.first_slot + LUTS.len() as u32 {
+            self.device.free_image_slot_after_submitted(slot);
         }
     }
 }
