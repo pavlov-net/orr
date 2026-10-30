@@ -17,6 +17,7 @@ mod ray;
 mod rtas;
 mod sparse;
 mod spirv;
+mod swapchain;
 mod texture;
 
 pub use accel::{
@@ -32,4 +33,5 @@ pub use pipeline::{ComputePipeline, ShaderStage};
 pub use queue::{PassResult, PipelineStats, Queue, QueueKind, QueueRequest};
 pub use ray::RayDispatchPipeline;
 pub use sparse::{PageBind, SparseAllocation};
+pub use swapchain::{LowLatency, Swapchain, SwapchainFrame};
 pub use texture::{Texture, TextureMemory};

@@ -32,3 +32,70 @@ pub enum PresentMode {
     /// `IMMEDIATE`: presents without waiting, tearing allowed.
     Immediate,
 }
+
+/// How to create a [`crate::Swapchain`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SwapchainDesc {
+    /// At least the largest metered batch plus one; raised to the surface's minimum.
+    pub min_images: u32,
+    pub format: OutputFormat,
+    /// For `Hdr10Pq` and `ScRgb`; ignored for `Sdr`.
+    pub hdr: Option<HdrMetadata>,
+    pub present_mode: PresentMode,
+    /// Used only when the surface leaves the extent to the swapchain.
+    pub extent: [u32; 2],
+}
+
+impl Default for SwapchainDesc {
+    fn default() -> Self {
+        Self {
+            min_images: 5,
+            format: OutputFormat::Sdr,
+            hdr: None,
+            present_mode: PresentMode::Fifo,
+            extent: [1280, 720],
+        }
+    }
+}
+
+/// The display's refresh as the swapchain reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Refresh {
+    /// The shortest time between two refreshes; `None` when unknown.
+    pub interval: Option<std::time::Duration>,
+    /// Variable refresh rate. False when unknown.
+    pub variable: bool,
+}
+
+/// A Reflex latency marker (`VkLatencyMarkerNV`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LatencyMarker {
+    SimulationStart,
+    SimulationEnd,
+    RenderSubmitStart,
+    RenderSubmitEnd,
+    PresentStart,
+    PresentEnd,
+    InputSample,
+}
+
+/// One frame's latency report (`VkLatencyTimingsFrameReportNV`): times in microseconds on
+/// the driver's clock, 0 where nothing was recorded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LatencyTimings {
+    /// The frame id the markers carried.
+    pub frame_id: u64,
+    pub input_sample: u64,
+    pub simulation_start: u64,
+    pub simulation_end: u64,
+    pub render_submit_start: u64,
+    pub render_submit_end: u64,
+    pub present_start: u64,
+    pub present_end: u64,
+    pub driver_start: u64,
+    pub driver_end: u64,
+    pub os_render_queue_start: u64,
+    pub os_render_queue_end: u64,
+    pub gpu_render_start: u64,
+    pub gpu_render_end: u64,
+}

@@ -11,10 +11,19 @@ use ash::vk::TaggedStructure as _;
 use super::command::{CommandList, Finished, PassRecord};
 use super::device::{Device, Shared};
 use super::garbage::{After, MAX_TIMELINES};
+use super::swapchain::SwapchainFrame;
 use crate::{Error, TimelinePoint};
 
 /// Passes one command list can time.
 pub(crate) const MAX_PASSES: u32 = 256;
+
+/// The stages that may write an acquired swapchain image; the acquire wait blocks them.
+pub(crate) const SWAPCHAIN_WRITE_STAGES: vk::PipelineStageFlags2 =
+    vk::PipelineStageFlags2::from_raw(
+        vk::PipelineStageFlags2::COMPUTE_SHADER.as_raw()
+            | vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT.as_raw()
+            | vk::PipelineStageFlags2::ALL_TRANSFER.as_raw(),
+    );
 
 /// Which queue. Each has one owner thread that submits it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -316,6 +325,48 @@ impl Queue {
         lists: Vec<CommandList<'_>>,
         wait: &[TimelinePoint],
     ) -> Result<TimelinePoint, Error> {
+        self.submit_with(lists, wait, None)
+    }
+
+    /// Submits `lists`, which write `frame`'s image, as [`Queue::submit`] does; then `frame`
+    /// can be presented. The lists run once `frame` is acquired; the image's contents are
+    /// undefined until they write it. Present queue only.
+    pub fn submit_present(
+        &self,
+        lists: Vec<CommandList<'_>>,
+        wait: &[TimelinePoint],
+        frame: &SwapchainFrame,
+    ) -> Result<TimelinePoint, Error> {
+        assert_eq!(
+            self.kind,
+            QueueKind::Present,
+            "swapchain frames are submitted on the Present queue"
+        );
+        assert!(
+            !frame.submitted.get(),
+            "a swapchain frame is submitted once"
+        );
+        let mut acquire = self.command_list()?;
+        acquire.swapchain_barrier(frame.texture(), true);
+        let mut release = self.command_list()?;
+        release.swapchain_barrier(frame.texture(), false);
+        let mut all = Vec::with_capacity(lists.len() + 2);
+        all.push(acquire);
+        all.extend(lists);
+        all.push(release);
+        let point = self.submit_with(all, wait, Some((frame.acquire, frame.present)))?;
+        frame.submitted.set(true);
+        Ok(point)
+    }
+
+    /// `binary`: a semaphore the submit waits before it writes swapchain images, and one it
+    /// signals for the present.
+    fn submit_with(
+        &self,
+        lists: Vec<CommandList<'_>>,
+        wait: &[TimelinePoint],
+        binary: Option<(vk::Semaphore, vk::Semaphore)>,
+    ) -> Result<TimelinePoint, Error> {
         let mut finished: Vec<Finished> = Vec::with_capacity(lists.len());
         for list in lists {
             assert!(
@@ -354,10 +405,24 @@ impl Queue {
                     .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
             );
         }
-        let signal = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(timeline.semaphore)
-            .value(value)
-            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let mut signal = vec![
+            vk::SemaphoreSubmitInfo::default()
+                .semaphore(timeline.semaphore)
+                .value(value)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
+        ];
+        if let Some((acquired, present)) = binary {
+            waits.push(
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(acquired)
+                    .stage_mask(SWAPCHAIN_WRITE_STAGES),
+            );
+            signal.push(
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(present)
+                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
+            );
+        }
         let submit = vk::SubmitInfo2::default()
             .wait_semaphore_infos(&waits)
             .command_buffer_infos(&cmds)
@@ -387,6 +452,12 @@ impl Queue {
             });
         }
         Ok(self.point(value))
+    }
+
+    /// Runs `f` with the raw queue while no other operation uses it.
+    pub(crate) fn with_raw<R>(&self, f: impl FnOnce(vk::Queue) -> R) -> R {
+        let _guard = self.submit_lock.lock().unwrap();
+        f(self.raw)
     }
 
     /// Takes back the resources of lists that were not submitted.

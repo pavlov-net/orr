@@ -65,6 +65,7 @@ dependencies = [
  "glam",
  "orr",
  "orr-atmosphere",
+ "orr-lighting",
  "orr-scene",
  "orr-shaders",
 ]
@@ -931,6 +932,8 @@ name = "lighting-maths"
 version = "0.0.1"
 dependencies = [
  "openpbr-ref",
+ "orr-gpu",
+ "orr-lighting",
  "orr-shaders",
  "shader-maths",
 ]
@@ -1729,6 +1732,9 @@ dependencies = [
 name = "shader-abi"
 version = "0.0.1"
 dependencies = [
+ "gpu-suite",
+ "log",
+ "orr-gpu",
  "orr-shaders",
 ]
 

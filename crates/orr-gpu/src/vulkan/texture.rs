@@ -38,6 +38,9 @@ pub struct Texture {
     /// usage.
     attachment: vk::ImageView,
     desc: TextureDesc,
+    /// False for a swapchain image: the swapchain owns it and drops this texture once its
+    /// presents have completed.
+    owns_image: bool,
     shared: Arc<Shared>,
 }
 
@@ -110,10 +113,58 @@ impl Texture {
                     .layer_count(layers),
             )
     }
+
+    /// A swapchain image as a texture; the swapchain keeps the image.
+    pub(crate) fn swapchain_image(
+        shared: &Arc<Shared>,
+        image: vk::Image,
+        desc: &TextureDesc,
+        name: &str,
+    ) -> Result<Texture, Error> {
+        let mut t = Texture {
+            image,
+            memory: None,
+            attachment: vk::ImageView::null(),
+            desc: *desc,
+            owns_image: false,
+            shared: Arc::clone(shared),
+        };
+        t.create_attachment(name)?;
+        Ok(t)
+    }
+
+    /// Creates the view rendering writes through, for colour and depth targets.
+    fn create_attachment(&mut self, name: &str) -> Result<(), Error> {
+        if !self
+            .desc
+            .usage
+            .intersects(TextureUsage::COLOR | TextureUsage::DEPTH)
+        {
+            return Ok(());
+        }
+        let mut info = self.view_info(&ViewDesc {
+            kind: Some(ViewKind::D2),
+            mips: 1,
+            layers: 1,
+            ..ViewDesc::default()
+        });
+        info.subresource_range.aspect_mask = aspect(self.desc.format);
+        // SAFETY: the image is live and bound to memory. On failure dropping the texture
+        // frees it.
+        self.attachment = unsafe { self.shared.device.create_image_view(&info, None) }
+            .map_err(Error::vk("vkCreateImageView"))?;
+        name_object(&self.shared.debug_fn, self.attachment, name);
+        Ok(())
+    }
 }
 
 impl Drop for Texture {
     fn drop(&mut self) {
+        if !self.owns_image {
+            // SAFETY: the swapchain drops its textures once no work uses them.
+            unsafe { self.shared.device.destroy_image_view(self.attachment, None) };
+            return;
+        }
         self.shared.defer_after_submitted(Item::Image {
             image: self.image,
             memory: self.memory,
@@ -301,29 +352,16 @@ impl Device {
             memory: own,
             attachment: vk::ImageView::null(),
             desc: *desc,
+            owns_image: true,
             shared: Arc::clone(shared),
         };
-        if desc
-            .usage
-            .intersects(TextureUsage::COLOR | TextureUsage::DEPTH)
-        {
-            let mut info = t.view_info(&ViewDesc {
-                kind: Some(ViewKind::D2),
-                mips: 1,
-                layers: 1,
-                ..ViewDesc::default()
-            });
-            info.subresource_range.aspect_mask = aspect(desc.format);
-            // SAFETY: the image is live and bound to memory. On failure dropping `t` frees it.
-            t.attachment = unsafe { d.create_image_view(&info, None) }
-                .map_err(Error::vk("vkCreateImageView"))?;
-            name_object(&shared.debug_fn, t.attachment, name);
-        }
+        t.create_attachment(name)?;
         Ok(t)
     }
 
     /// Destroys `t` once `after` has completed.
     pub fn free_texture(&self, t: Texture, after: TimelinePoint) {
+        assert!(t.owns_image, "a swapchain image is not freed by its user");
         let mut t = std::mem::ManuallyDrop::new(t);
         let item = Item::Image {
             image: t.image,

@@ -53,6 +53,19 @@ pub struct Caps {
     /// `VK_NV_ray_tracing_validation` checks acceleration-structure builds and traces;
     /// debug builds only.
     pub ray_tracing_validation: bool,
+    /// Present ids and waits (`VK_KHR_present_id2`, `VK_KHR_present_wait2`):
+    /// [`crate::Swapchain::wait_presented`] works. Devices without the Present queue have
+    /// none of the present items.
+    pub present_wait: bool,
+    /// Reflex (`VK_NV_low_latency2`): [`crate::Swapchain::latency`] returns a handle.
+    pub low_latency: bool,
+    /// Metered present batches (`VK_NV_present_metering`).
+    pub present_metering: bool,
+    /// Swapchain refresh timing (`VK_EXT_present_timing`): [`crate::Swapchain::refresh`]
+    /// can report a variable refresh rate.
+    pub present_timing: bool,
+    /// HDR mastering metadata (`VK_EXT_hdr_metadata`).
+    pub hdr_metadata: bool,
     pub cluster: crate::ClusterCaps,
     pub limits: Limits,
 }

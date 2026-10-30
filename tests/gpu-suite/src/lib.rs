@@ -1,5 +1,5 @@
-//! Headless GPU tests of orr-gpu. Every test runs on one shared device with validation on
-//! and fails if the layer reports anything.
+//! GPU tests of orr-gpu. Every test runs on one shared device with validation on and fails
+//! if the layer reports anything.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -7,12 +7,14 @@ use std::time::Duration;
 use orr_gpu::{
     Allocation, ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance,
     ClassicKind, CommandList, ComputePipeline, Device, DeviceDesc, GpuPtr, InstanceFlags,
-    MemoryKind, Queue, QueueKind, QueueRequest, RtasFlags, ShaderModule, ShaderStage, SpecData,
-    TimelinePoint,
+    MemoryKind, OutputFormat, Queue, QueueKind, QueueRequest, RtasFlags, ShaderModule, ShaderStage,
+    SpecData, SwapchainFrame, TimelinePoint,
 };
 use orr_shaders::bytemuck::Pod;
 
 pub mod clusters;
+#[cfg(windows)]
+pub mod window;
 
 pub mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
@@ -198,4 +200,36 @@ pub fn triangle_scene() -> Scene {
         _blas: blas,
         _blocks: vec![blas_block, tlas_block],
     }
+}
+
+/// Records the swapchain test card into `frame`'s image. Keep the root until the list is
+/// submitted.
+pub fn fill_frame<'q>(
+    queue: &'q Queue,
+    fill: &ComputePipeline,
+    frame: &SwapchainFrame,
+    frame_no: u32,
+) -> (CommandList<'q>, Allocation<shaders::swapchain_fill::Root>) {
+    let [width, height] = frame.extent();
+    let encoding = match frame.format() {
+        OutputFormat::Sdr => 0,
+        OutputFormat::Hdr10Pq => 1,
+        OutputFormat::ScRgb => 2,
+    };
+    let root = upload(
+        &[shaders::swapchain_fill::Root {
+            target: frame.storage(),
+            width,
+            height,
+            encoding,
+            frame: frame_no,
+            paper_white_nits: 200.0,
+            pad0: 0,
+            pad1: 0,
+        }],
+        "swapchain fill root",
+    );
+    let mut list = queue.command_list().unwrap();
+    list.dispatch(fill, root.gpu, [width.div_ceil(8), height.div_ceil(8), 1]);
+    (list, root)
 }
