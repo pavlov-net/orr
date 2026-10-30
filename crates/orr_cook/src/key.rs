@@ -12,7 +12,7 @@ pub(crate) const ZSTD_LEVEL: i32 = 19;
 /// Cook version per class. Bump a class's version whenever the cook writes different bytes
 /// for the same inputs; the golden test fails until it is bumped.
 pub(crate) const VERSIONS: &[(Class, u32)] = &[
-    (Class::Mesh, 4),
+    (Class::Mesh, 5),
     (Class::Texture, 1),
     (Class::Material, 1),
     (Class::Model, 2),

@@ -673,12 +673,17 @@ fn micromap_states_never_contradict_the_alpha_test() {
         target_edge: 0.0,
         cluster_bytes_max: 1024,
     };
-    for omm in [defaults, capped.clone()] {
+    let discrete = LodMode::Discrete {
+        errors: vec![0.01, 0.05],
+    };
+    for (lod, omm) in [
+        (discrete.clone(), defaults.clone()),
+        (discrete, capped.clone()),
+        (LodMode::Dag, defaults),
+    ] {
         let settings = GltfSettings {
             mesh: MeshSettings {
-                lod: LodMode::Discrete {
-                    errors: vec![0.01, 0.05],
-                },
+                lod,
                 omm: Some(omm.clone()),
                 ..Default::default()
             },
@@ -1015,4 +1020,112 @@ fn material_textures_bind_their_slots() {
     assert_eq!((m.coat_weight, m.transmission_weight), (1.0, 1.0));
     let coat = texture_mip(&a, "g/texture/0/coat", 0);
     assert!(coat.texels.iter().all(|&t| t <= 0.5 + 1.0 / 255.0));
+}
+
+/// A scene with a plain node and an instanced one: node `tree` carries
+/// `EXT_mesh_gpu_instancing` (required) and a translation of its own.
+fn instanced(path: &Path, instances: &[([f32; 3], [f32; 4], [f32; 3])]) {
+    let mut g = Glb::default();
+    let quad = [
+        [0.0f32, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 1.0],
+    ];
+    let pa = g.floats(&quad, "VEC3");
+    let ia = g.indices(&[0, 2, 1, 1, 2, 3]);
+    let t = g.floats(&instances.iter().map(|i| i.0).collect::<Vec<_>>(), "VEC3");
+    let r = g.floats(&instances.iter().map(|i| i.1).collect::<Vec<_>>(), "VEC4");
+    let s = g.floats(&instances.iter().map(|i| i.2).collect::<Vec<_>>(), "VEC3");
+    g.write(
+        path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,1]}}],
+"extensionsUsed":["EXT_mesh_gpu_instancing"],"extensionsRequired":["EXT_mesh_gpu_instancing"],
+"nodes":[{{"name":"ground","mesh":0,"scale":[8,1,8]}},
+ {{"name":"tree","mesh":0,"translation":[10,0,0],"extensions":{{"EXT_mesh_gpu_instancing":{{"attributes":{{"TRANSLATION":{t},"ROTATION":{r},"SCALE":{s}}}}}}}}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa}}},"indices":{ia}}}]}}]"#
+        ),
+    );
+}
+
+#[test]
+fn gpu_instancing_becomes_instance_pages() {
+    let d = dir("gltf-instancing");
+    let path = d.join("forest.glb");
+    let q = glam::Quat::from_rotation_y(0.7).to_array();
+    let instances = [
+        ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0]),
+        ([3.0, 0.5, -2.0], q, [2.0, 2.0, 2.0]),
+        ([300.0, 0.0, 40.0], q, [1.0, 1.5, 1.0]),
+    ];
+    instanced(&path, &instances);
+    let (a, _) = cook(&path, GltfSettings::default()).unwrap();
+
+    // The instanced node is a model in its mesh's space; the scene model keeps the rest.
+    let mesh = mesh_of(&a, "g/tree/mesh");
+    assert_eq!(mesh.info.header.bounds.max, [1.0, 0.0, 1.0]);
+    assert_eq!(
+        mesh_of(&a, "g/mesh").info.header.bounds.max,
+        [8.0, 0.0, 8.0]
+    );
+    let model = AssetId::from_name("g/tree");
+    let pages: Vec<&orr_pack::Entry> = a
+        .entries()
+        .iter()
+        .filter(|e| e.class == Class::InstancePage as u16)
+        .collect();
+    assert_eq!(pages.len(), 3, "one page per cell");
+    let mut placed = Vec::new();
+    for e in pages {
+        assert!(a.name(e).starts_with("g/instances/"));
+        let blobs = a.blobs(e);
+        let head = read(&a, &blobs[0]);
+        let info = orr_pack::instance::InstancePageInfo::parse(&head).unwrap();
+        assert_eq!(info.prototypes[0].model, model);
+        let bytes = read(&a, &blobs[1]);
+        let (cell, records) = orr_pack::instance::decode(&head, &bytes).unwrap();
+        let edge = 256.0;
+        for (_, m) in records {
+            let p = [0, 1, 2].map(|k| m.rows[k][3] + cell[k] as f32 * edge);
+            let x = [0, 1, 2].map(|k| m.rows[k][0]);
+            placed.push((p, x));
+        }
+    }
+    placed.sort_by(|a, b| a.0[0].total_cmp(&b.0[0]));
+    for ((p, x), (t, r, s)) in placed.iter().zip(&instances) {
+        let r = glam::Quat::from_array(*r);
+        let want_p = glam::Vec3::from(*t) + glam::Vec3::new(10.0, 0.0, 0.0);
+        let want_x = r * glam::Vec3::X * s[0];
+        assert!(
+            (glam::Vec3::from(*p) - want_p).abs().max_element() < 0.01,
+            "{p:?} {want_p}"
+        );
+        assert!(
+            (glam::Vec3::from(*x) - want_x).abs().max_element() < 0.01,
+            "{x:?} {want_x}"
+        );
+    }
+
+    // An unchanged rebuild links the pages with the rest.
+    let file = d.join("forest.orr");
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(
+            Target::File(file.clone()),
+            vec![AssetSpec {
+                name: "g".into(),
+                source: Source::Gltf {
+                    path: path.clone(),
+                    settings: GltfSettings::default(),
+                },
+            }],
+        )],
+    };
+    let first = orr_cook::cook(&manifest, &Default::default()).unwrap();
+    let bytes = std::fs::read(&file).unwrap();
+    let again = orr_cook::cook(&manifest, &Default::default()).unwrap();
+    assert!(!again.report.archives[0].written);
+    assert_eq!(std::fs::read(&file).unwrap(), bytes);
+    let count = |c: &orr_cook::Cooked| c.report.assets[0].entries.len();
+    assert_eq!(count(&again), count(&first));
 }

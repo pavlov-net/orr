@@ -11,9 +11,9 @@ mod common_skinned;
 
 use glam::{DVec3, Quat, Vec3};
 use orr_cook::{
-    ArchiveSpec, AssetSpec, DataFormat, GltfSettings, Instances, Manifest, MipFilter, Placement,
-    PrototypeSpec, RasterInput, RasterLayerSpec, RasterSet, Reduction, Source, TextureSettings,
-    Usage,
+    ArchiveSpec, AssetSpec, DataFormat, GltfSettings, Instances, LodMode, Manifest, MeshSettings,
+    MipFilter, Placement, PrototypeSpec, RasterInput, RasterLayerSpec, RasterSet, Reduction,
+    Source, TextureSettings, Usage,
 };
 use orr_pack::{Archive, Class, Target};
 
@@ -23,18 +23,18 @@ const USER: u16 = Class::USER_FIRST + 1;
 const GOLDEN: &[(u16, u32, &str)] = &[
     (
         Class::Mesh as u16,
-        4,
-        "ff0448c5971a9607f611740025ea6e856849f771bcf61e027500fc6842663340",
+        5,
+        "a1562f19e331661eac71746507990b636868211e008b5b74e9713c095f03c871",
     ),
     (
         Class::Material as u16,
         1,
-        "c28ff4998367def1d6bb8da7e624c5627c9671962dd04df2b9eed0f895aaeff4",
+        "b3daf76e851eda198a25e9f55d102fb1f6b63c16beb9ce685ce77dfabf1c2984",
     ),
     (
         Class::Model as u16,
         2,
-        "ec5cfcf2cb99fe13a2f9c217c5b77507f8f55aa0a18d1834e54fe4e66a8f61d6",
+        "4dd1af8fae291797d78c5caa5d5af27bddb995855cb408d5cba3f004ec6baa62",
     ),
     (
         Class::Texture as u16,
@@ -105,6 +105,19 @@ fn cooked_bytes_match_their_cook_versions() {
                     source: Source::Gltf {
                         path: common::block_glb(),
                         settings: GltfSettings::default(),
+                    },
+                },
+                AssetSpec {
+                    name: "block-dag".into(),
+                    source: Source::Gltf {
+                        path: common::block_glb(),
+                        settings: GltfSettings {
+                            mesh: MeshSettings {
+                                lod: LodMode::Dag,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
                     },
                 },
                 AssetSpec {

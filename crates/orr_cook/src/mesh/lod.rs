@@ -1,13 +1,13 @@
 //! Welding, part assignment and the discrete levels of a mesh.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use meshopt::{SimplifyOptions, SimplifyVertex, VertexDataAdapter, VertexStream};
 use orr_pack::Aabb;
 use orr_pack::mesh::Part;
 
 use super::maps::Displacement;
-use super::{Grid, LodMode, MeshData, MeshSettings, Pivots, Skin};
+use super::{Grid, MeshData, MeshSettings, Pivots, Skin};
 
 /// The mesh with identical vertices merged; sections keep their index ranges.
 pub(crate) struct Welded {
@@ -196,32 +196,20 @@ pub(crate) fn levels(
     grid: &Grid,
     parts: &Parts,
     s: &MeshSettings,
+    errors: &[f32],
     sections: usize,
 ) -> Vec<LevelGeometry> {
     let adapter = VertexDataAdapter::new(bytemuck::cast_slice(&grid.floats), 12, 0)
         .expect("positions are 12-byte vertices");
-    let mut groups: std::collections::BTreeMap<(u8, u8), Vec<u32>> = Default::default();
-    for sec in 0..sections {
-        let r = w.sections[sec].clone();
-        for t in r.start / 3..r.end / 3 {
-            groups
-                .entry((parts.of_triangle[t], sec as u8))
-                .or_default()
-                .extend_from_slice(&w.indices[3 * t..3 * t + 3]);
-        }
-    }
-    let pieces = groups
+    let pieces = pieces(w, parts)
         .into_iter()
-        .map(|((part, section), indices)| Piece {
-            part,
-            section,
-            merged: false,
-            indices: meshopt::spatial_sort_triangles(&indices, &adapter),
+        .map(|p| Piece {
+            indices: meshopt::spatial_sort_triangles(&p.indices, &adapter),
+            ..p
         })
         .collect();
     let mut out = vec![LevelGeometry { error: 0.0, pieces }];
-    let LodMode::Discrete { errors } = &s.lod;
-    let protect = seams(w, grid);
+    let seams = seam_cells(w, w.indices.iter().map(|&v| (v, grid.cells[v as usize])));
     let mergeable = parts.table.len() > 1;
     for (i, &target) in errors.iter().enumerate() {
         let level = i + 1;
@@ -247,12 +235,16 @@ pub(crate) fn levels(
         } else {
             prev.pieces.clone()
         };
-        let shared = shared_cells(&input, grid);
+        let shared = shared_cells(
+            input
+                .iter()
+                .map(|p| p.indices.iter().map(|&v| grid.cells[v as usize])),
+        );
         let mut step_error = 0f32;
         let pieces = input
             .into_iter()
             .map(|p| {
-                let (indices, e) = simplify(&p.indices, w, grid, &shared, &protect, target);
+                let (indices, e) = simplify(&p.indices, w, grid, &shared, &seams, target, true);
                 step_error = step_error.max(e);
                 Piece { indices, ..p }
             })
@@ -263,40 +255,87 @@ pub(crate) fn levels(
     out
 }
 
-/// Vertices whose grid position another vertex shares with a different uv.
-fn seams(w: &Welded, grid: &Grid) -> Vec<bool> {
-    let mut first: HashMap<[i32; 3], (u32, bool)> = HashMap::new();
-    for (v, &cell) in grid.cells.iter().enumerate() {
-        let e = first.entry(cell).or_insert((v as u32, false));
-        if w.uvs[e.0 as usize] != w.uvs[v] {
-            e.1 = true;
+/// The triangles of each (part, section), sorted by part, then section.
+pub(crate) fn pieces(w: &Welded, parts: &Parts) -> Vec<Piece> {
+    let mut by_key: std::collections::BTreeMap<(u8, u8), Vec<u32>> = Default::default();
+    for (sec, r) in w.sections.iter().enumerate() {
+        for t in r.start / 3..r.end / 3 {
+            by_key
+                .entry((parts.of_triangle[t], sec as u8))
+                .or_default()
+                .extend_from_slice(&w.indices[3 * t..3 * t + 3]);
         }
     }
-    grid.cells.iter().map(|c| first[c].1).collect()
+    by_key
+        .into_iter()
+        .map(|((part, section), indices)| Piece {
+            part,
+            section,
+            merged: false,
+            indices,
+        })
+        .collect()
+}
+
+/// Grid positions where corners (welded vertex, grid position) with different uvs meet.
+pub(crate) fn seam_cells(
+    w: &Welded,
+    corners: impl IntoIterator<Item = (u32, [i32; 3])>,
+) -> HashSet<[i32; 3]> {
+    let mut first: HashMap<[i32; 3], u32> = HashMap::new();
+    let mut seams = HashSet::new();
+    for (v, cell) in corners {
+        let f = *first.entry(cell).or_insert(v);
+        if w.uvs[f as usize] != w.uvs[v as usize] {
+            seams.insert(cell);
+        }
+    }
+    seams
 }
 
 /// Grid positions used by more than one piece: part and section borders.
-fn shared_cells(pieces: &[Piece], grid: &Grid) -> HashMap<[i32; 3], bool> {
-    let mut owner: HashMap<[i32; 3], (usize, bool)> = HashMap::new();
-    for (pi, p) in pieces.iter().enumerate() {
-        for &v in &p.indices {
-            let e = owner.entry(grid.cells[v as usize]).or_insert((pi, false));
-            if e.0 != pi {
-                e.1 = true;
+pub(crate) fn shared_cells<P: IntoIterator<Item = [i32; 3]>>(
+    pieces: impl IntoIterator<Item = P>,
+) -> HashSet<[i32; 3]> {
+    let mut owner: HashMap<[i32; 3], usize> = HashMap::new();
+    let mut shared = HashSet::new();
+    for (pi, cells) in pieces.into_iter().enumerate() {
+        for c in cells {
+            if *owner.entry(c).or_insert(pi) != pi {
+                shared.insert(c);
             }
         }
     }
-    owner.into_iter().map(|(c, (_, s))| (c, s)).collect()
+    shared
 }
 
-/// Simplifies one piece to an absolute error; returns its indices and the error reached.
-fn simplify(
+/// Simplifier flags of a vertex at `cell`: locked on a shared position, protected on a
+/// seam.
+pub(crate) fn vertex_flags(
+    cell: [i32; 3],
+    shared: &HashSet<[i32; 3]>,
+    seams: &HashSet<[i32; 3]>,
+) -> SimplifyVertex {
+    let mut f = SimplifyVertex::None;
+    if shared.contains(&cell) {
+        f |= SimplifyVertex::Lock;
+    }
+    if seams.contains(&cell) {
+        f |= SimplifyVertex::Protect;
+    }
+    f
+}
+
+/// Simplifies one piece to an absolute error, with sloppy simplification where permissive
+/// keeps more than three quarters when `sloppy`; returns its indices and the error reached.
+pub(crate) fn simplify(
     indices: &[u32],
     w: &Welded,
     grid: &Grid,
-    shared: &HashMap<[i32; 3], bool>,
-    protect: &[bool],
+    shared: &HashSet<[i32; 3]>,
+    seams: &HashSet<[i32; 3]>,
     target: f32,
+    sloppy: bool,
 ) -> (Vec<u32>, f32) {
     // A compact vertex buffer of the piece, so the simplifier's work follows its size.
     let mut local_of: HashMap<u32, u32> = HashMap::new();
@@ -314,16 +353,7 @@ fn simplify(
     let normals: Vec<f32> = global.iter().flat_map(|&v| w.normals[v as usize]).collect();
     let locks: Vec<SimplifyVertex> = global
         .iter()
-        .map(|&v| {
-            let mut f = SimplifyVertex::None;
-            if shared[&grid.cells[v as usize]] {
-                f |= SimplifyVertex::Lock;
-            }
-            if protect[v as usize] {
-                f |= SimplifyVertex::Protect;
-            }
-            f
-        })
+        .map(|&v| vertex_flags(grid.cells[v as usize], shared, seams))
         .collect();
     let adapter = VertexDataAdapter::new(bytemuck::cast_slice(&positions), 12, 0)
         .expect("positions are 12-byte vertices");
@@ -342,7 +372,7 @@ fn simplify(
             | SimplifyOptions::ErrorClamped,
         Some(&mut error),
     );
-    if out.len() * 4 > local.len() * 3 {
+    if sloppy && out.len() * 4 > local.len() * 3 {
         let scale = meshopt::simplify_scale(&adapter);
         let lock: Vec<bool> = locks
             .iter()
