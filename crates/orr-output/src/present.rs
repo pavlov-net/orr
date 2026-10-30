@@ -266,7 +266,8 @@ impl Display {
     pub fn begin_frame(&mut self, frame: u64) -> Result<Option<DisplayFrame<'_>>> {
         self.begun = None;
         let slot = (frame % self.slots.len() as u64) as usize;
-        let (wait, supported) = {
+        let info = self.feed.as_ref().map(|f| f.latest().1);
+        let (wait, display) = {
             let mut state = self.shared.lock();
             while state.pending[slot] {
                 state = self
@@ -278,13 +279,12 @@ impl Display {
             if let Some(e) = state.error.take() {
                 return Err(e.into());
             }
-            (state.released[slot], state.supported.clone())
+            let display = self.request.resolve(&state.supported, info.as_ref(), false);
+            (state.released[slot], display)
         };
         let Some(extent) = client_extent(self.window).filter(|e| !e.contains(&0)) else {
             return Ok(None);
         };
-        let info = self.feed.as_ref().map(|f| f.latest().1);
-        let display = self.request.resolve(&supported, info.as_ref(), false);
 
         let s = &mut self.slots[slot];
         let fits = |b: &Backbuffer| {
@@ -447,7 +447,10 @@ impl Presenter {
                 }
                 Err(e) => state.error = Some(e),
             }
-            state.supported = self.swapchain.supported_formats().to_vec();
+            let supported = self.swapchain.supported_formats();
+            if state.supported != supported {
+                state.supported = supported.to_vec();
+            }
             drop(state);
             shared.changed.notify_all();
         }
@@ -455,16 +458,16 @@ impl Presenter {
 
     /// The present path of one frame, bracketed by `PresentStart` and `PresentEnd`.
     fn present(&mut self, job: &Job) -> Result<(Presented, Option<TimelinePoint>), orr_gpu::Error> {
-        let latency = self.latency.clone();
-        let mark = |m| {
-            if let Some(l) = &latency {
-                l.marker(job.frame, m);
-            }
-        };
-        mark(LatencyMarker::PresentStart);
+        self.mark(job.frame, LatencyMarker::PresentStart);
         let result = self.compose_and_present(job);
-        mark(LatencyMarker::PresentEnd);
+        self.mark(job.frame, LatencyMarker::PresentEnd);
         result
+    }
+
+    fn mark(&self, frame: u64, marker: LatencyMarker) {
+        if let Some(l) = &self.latency {
+            l.marker(frame, marker);
+        }
     }
 
     fn compose_and_present(
