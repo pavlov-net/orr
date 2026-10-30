@@ -316,9 +316,11 @@ fn compare(compute: &Run, raygen: &Run) -> Diff {
 }
 
 /// The raygen entry (reordering at the coherence point) and the compute entry of one body
-/// trace the same paths. Camera rays hit the same triangles in every pixel; the rest agrees
-/// up to the floating-point differences the two stages keep under `-fp-mode precise`
-/// (measured.md DEV-19), so a few shadow rays and bounces flip near edges.
+/// trace the same paths. Camera rays hit the same triangles in every pixel. The rest agrees
+/// up to the floating-point differences left between the two stages under `-fp-mode
+/// precise`: Slang leaves `lerp`, `dot`, `cross`, `normalize` and matrix products
+/// undecorated, and the driver evaluates some product chains differently per stage, so a
+/// few shadow rays and bounces flip near edges.
 #[test]
 fn raygen_and_compute_entries_trace_the_same_paths() {
     let d = device();
