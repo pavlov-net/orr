@@ -16,7 +16,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use crate::harness::{self, Albedo, Comparison, HISTOGRAM_BINS};
+use crate::harness::{self, Albedo, Comparison, Estimate, HISTOGRAM_BINS};
 use crate::materials::{Material, VIEW_COSINES, grid, view};
 use crate::{Bsdf, Lobe};
 
@@ -176,11 +176,14 @@ pub fn energy_excess(candidate: &Albedo, reference: &Albedo) -> f64 {
         .chain([(&candidate.total, reference.total)])
         .flat_map(|(c, r)| {
             (0..3).map(move |i| {
-                let se = (c.se[i] * c.se[i] + r.se[i] * r.se[i]).sqrt();
-                c.mean[i] - r.mean[i].max(1.0) - 3.0 * se - TABLE_TOLERANCE
+                c.mean[i] - r.mean[i].max(1.0) - 3.0 * combined_se(c, &r, i) - TABLE_TOLERANCE
             })
         })
         .fold(f64::NEG_INFINITY, f64::max)
+}
+
+fn combined_se(a: &Estimate, b: &Estimate, channel: usize) -> f64 {
+    a.se[channel].hypot(b.se[channel])
 }
 
 impl Results {
@@ -338,11 +341,9 @@ impl Results {
                     .zip(&m.reference_albedo)
                     .map(|(a, r)| {
                         let (a, r) = (pick(a), pick(r));
-                        let differs = (0..3).any(|c| {
-                            (a.mean[c] - r.mean[c]).abs()
-                                > 3.0 * (a.se[c] * a.se[c] + r.se[c] * r.se[c]).sqrt()
-                        });
-                        let rgb = |e: &harness::Estimate| {
+                        let differs = (0..3)
+                            .any(|c| (a.mean[c] - r.mean[c]).abs() > 3.0 * combined_se(&a, &r, c));
+                        let rgb = |e: &Estimate| {
                             format!("{:.3} {:.3} {:.3}", e.mean[0], e.mean[1], e.mean[2])
                         };
                         if differs {

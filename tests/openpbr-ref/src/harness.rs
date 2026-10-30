@@ -310,11 +310,8 @@ pub fn compare(
     candidate.prepare(inputs, view);
     reference.prepare(inputs, view);
     let mut rng = Rng::new(seed);
-    let (mut wi, mut u) = (Vec::with_capacity(cases), Vec::with_capacity(cases));
-    for _ in 0..cases {
-        wi.push(rng.unit());
-        u.push([rng.f32(), rng.f32(), rng.f32()]);
-    }
+    let wi: Vec<V3> = (0..cases).map(|_| rng.unit()).collect();
+    let u = uniforms(&mut rng, cases);
     let mut out = Comparison {
         samples: cases,
         ..Comparison::default()
