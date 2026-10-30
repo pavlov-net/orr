@@ -16,7 +16,9 @@ orr_shaders.workspace = true
 [dev-dependencies]
 bytemuck.workspace = true
 glam.workspace = true
+gpu_suite = { path = "../gpu_suite" }
 orr_cook = { path = "../../crates/orr_cook" }
+png = "0.18"
 
 [build-dependencies]
 orr_shaders = { workspace = true, features = ["build"] }

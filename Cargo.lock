@@ -1313,11 +1313,13 @@ version = "0.0.1"
 dependencies = [
  "bytemuck",
  "glam",
+ "gpu_suite",
  "orr_cook",
  "orr_gpu",
  "orr_pack",
  "orr_scene",
  "orr_shaders",
+ "png 0.18.1",
 ]
 
 [[package]]
