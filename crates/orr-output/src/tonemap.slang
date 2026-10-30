@@ -12,6 +12,8 @@ static const uint DEBUG_LINEAR = 1;
 static const uint DEBUG_PATTERN = 2;
 static const uint DEBUG_EXPOSURE_HEATMAP = 3;
 
+static const uint NO_IMAGE = 0xffffffff;
+
 public struct TonemapConstants
 {
     public Gt7Curve curve;
@@ -37,8 +39,13 @@ struct Root
     ViewConstants* view;
     TextureIndex source;
     StorageImageIndex target;
+    // The `display_linear` hook's source, written with the same result; NONE without one.
+    StorageImageIndex hook_source;
     uint width;
     uint height;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
 }
 ORR_ROOT(Root);
 
@@ -97,4 +104,6 @@ void main(uint3 id: SV_DispatchThreadID)
             c = gt7_display_linear(graded, k.curve, k.sdr != 0);
     }
     root.target.get<RWTexture2D<float4>>()[id.xy] = float4(c, 1.0);
+    if (root.hook_source.index != NO_IMAGE)
+        root.hook_source.get<RWTexture2D<float4>>()[id.xy] = float4(c, 1.0);
 }

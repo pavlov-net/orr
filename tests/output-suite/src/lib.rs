@@ -187,6 +187,7 @@ impl Harness {
                     view,
                     display,
                     output,
+                    hook_source: None,
                 },
             );
         }
