@@ -1,6 +1,8 @@
 //! Builds the renderer fixture as a renderer crate would, then three consumer builds against
 //! it: one linking every point, one linking nothing, and one against a copy of the renderer
-//! whose resolve root has an extra field. The CPU library calls the same linked types.
+//! whose resolve root has an extra field. The CPU library calls the same linked types. Two
+//! more consumer builds link into orr's own kernels: one against orr as it is, one against a
+//! copy of orr-lighting's shader root whose environment-bake root has an extra field.
 
 use std::env;
 use std::fs;
@@ -33,40 +35,119 @@ const LINKS: [(LinkPoint, &str, &str, &str); 5] = [
     (LinkPoint::Medium, "air", "consumer/air.slang", "Air"),
 ];
 
+/// The points orr's own kernels declare.
+const ORR_LINKS: [(LinkPoint, &str, &str, &str); 2] = [
+    (
+        LinkPoint::Environment,
+        "dome",
+        "consumer/dome.slang",
+        "Dome",
+    ),
+    (LinkPoint::Medium, "air", "consumer/air.slang", "Air"),
+];
+
+/// orr-scene's Slang structs orr-lighting's build maps.
+const SCENE_TYPES: &[&str] = &[
+    "SceneRoot",
+    "InstanceGpu",
+    "SlotStateGpu",
+    "GroupGpu",
+    "MaterialGpu",
+    "LightGpu",
+    "EmissiveGpu",
+    "ProducerGpu",
+    "ProducerBatch",
+    "ProducerClusterGpu",
+    "TopologyGpu",
+    "SkyStats",
+    "ViewConstants",
+    "ExposureState",
+];
+
 fn renderer(src: &Path, out: &Path) -> Result<Output, Error> {
     Build::new()?.kernels(src).out_dir(out).compile()
 }
 
-fn consumer(renderer: &Output, out: &Path, link: bool) -> Result<Output, Error> {
-    let b = Build::new()?
-        .roots(&renderer.shader_dirs)
-        .link_points(&renderer.link_points.display().to_string())
-        .out_dir(out);
-    let b = if link {
-        LINKS.iter().fold(b, |b, (point, name, module, ty)| {
-            b.link(*point, name, module, ty)
-        })
-    } else {
-        b
+fn consumer(
+    roots: &str,
+    link_points: &str,
+    out: &Path,
+    links: &[(LinkPoint, &str, &str, &str)],
+) -> Result<Output, Error> {
+    links
+        .iter()
+        .fold(
+            Build::new()?
+                .roots(roots)
+                .link_points(link_points)
+                .out_dir(out),
+            |b, (point, name, module, ty)| b.link(*point, name, module, ty),
+        )
+        .compile()
+}
+
+fn fixture_consumer(renderer: &Output, out: &Path, link: bool) -> Result<Output, Error> {
+    let links: &[_] = if link { &LINKS } else { &[] };
+    consumer(
+        &renderer.shader_dirs,
+        &renderer.link_points.display().to_string(),
+        out,
+        links,
+    )
+}
+
+/// Builds a copy of orr-lighting's shader root whose environment-bake root has one more
+/// field, as orr-lighting's build does.
+fn edited_orr(roots: &str, src: &Path, out: &Path) -> Result<Output, Error> {
+    let (lighting, others): (Vec<&str>, Vec<&str>) = roots
+        .split(';')
+        .partition(|r| Path::new(r).join("environment/bake.slang").is_file());
+    let [lighting] = lighting[..] else {
+        panic!("one orr root holds the environment bake: {roots}");
     };
+    copy_slang(Path::new(lighting), src, &|name, text| {
+        if name == "environment.slang" {
+            let edited = text.replace(
+                "public float4 focus;",
+                "public float4 focus;
+    public float4 tint;",
+            );
+            assert_ne!(edited, text, "BakeRoot moved");
+            edited
+        } else {
+            text
+        }
+    });
+    let mut b = Build::new()?
+        .kernels(src)
+        .roots(&others.join(";"))
+        .out_dir(out);
+    for t in SCENE_TYPES {
+        b = b.extern_type(t, &format!("::orr_scene::{t}"));
+    }
     b.compile()
 }
 
-/// Copies the renderer fixture with one more field in the resolve root.
-fn edited_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let path = entry?.path();
-        let mut text = fs::read_to_string(&path)?;
-        if path.file_name().is_some_and(|n| n == "resolve.slang") {
-            text = text.replace("uint pad2;", "uint pad2;\n    float4 tint;");
-        }
-        let target = dst.join(path.file_name().expect("a file"));
-        if fs::read_to_string(&target).ok().as_deref() != Some(text.as_str()) {
-            fs::write(target, text)?;
+/// Copies every `.slang` file under `src` to `dst` through `edit`, writing only what changed.
+fn copy_slang(src: &Path, dst: &Path, edit: &dyn Fn(&str, String) -> String) {
+    for entry in fs::read_dir(src).expect("a shader root") {
+        let path = entry.expect("a shader root").path();
+        let name = path
+            .file_name()
+            .expect("a file")
+            .to_string_lossy()
+            .into_owned();
+        let target = dst.join(&name);
+        if path.is_dir() {
+            copy_slang(&path, &target, edit);
+        } else if name.ends_with(".slang") {
+            let text = edit(&name, fs::read_to_string(&path).expect("a shader file"));
+            fs::create_dir_all(dst).expect("the copied root");
+            if fs::read_to_string(&target).ok().as_deref() != Some(text.as_str()) {
+                fs::write(&target, text).expect("the copied root");
+            }
         }
     }
-    Ok(())
 }
 
 fn main() {
@@ -74,18 +155,43 @@ fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let src = manifest.join("renderer");
     let edited_src = out.join("edited-renderer-src");
-    edited_copy(&src, &edited_src).unwrap_or_else(|e| panic!("{}: {e}", edited_src.display()));
+    copy_slang(&src, &edited_src, &|name, text| {
+        if name == "resolve.slang" {
+            text.replace(
+                "uint pad2;",
+                "uint pad2;
+    float4 tint;",
+            )
+        } else {
+            text
+        }
+    });
     println!(
         "cargo:rerun-if-changed={}",
         manifest.join("consumer").display()
     );
 
+    let orr_roots = env::var("DEP_ORR_SHADER_DIRS").expect("orr's shader roots");
+    let orr_points = env::var("DEP_ORR_LINK_POINTS").expect("orr's link points");
+
     let result = (|| {
         let r = renderer(&src, &out.join("renderer"))?;
-        consumer(&r, &out.join("linked"), true)?;
-        consumer(&r, &out.join("unlinked"), false)?;
+        fixture_consumer(&r, &out.join("linked"), true)?;
+        fixture_consumer(&r, &out.join("unlinked"), false)?;
         let edited = renderer(&edited_src, &out.join("edited-renderer"))?;
-        consumer(&edited, &out.join("edited"), true)?;
+        fixture_consumer(&edited, &out.join("edited"), true)?;
+        consumer(&orr_roots, &orr_points, &out.join("orr"), &ORR_LINKS)?;
+        let edited = edited_orr(
+            &orr_roots,
+            &out.join("edited-orr-src"),
+            &out.join("edited-orr-renderer"),
+        )?;
+        consumer(
+            &edited.shader_dirs,
+            &edited.link_points.display().to_string(),
+            &out.join("edited-orr"),
+            &ORR_LINKS[..1],
+        )?;
         LINKS
             .iter()
             .fold(

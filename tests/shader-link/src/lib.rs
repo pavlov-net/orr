@@ -1,7 +1,8 @@
 //! Link points through `orr_shaders::build`. `renderer/` stands in for a renderer crate:
 //! its kernels declare every link point. The build links two surfaces (one overriding
 //! `coverage`, one omitting it), a displacement, an environment and a medium into them, and
-//! `cpu/calls.slang` calls the same linked types on the CPU.
+//! `cpu/calls.slang` calls the same linked types on the CPU. The same environment and medium
+//! also link into orr's own kernels.
 
 /// The renderer fixture's own build.
 pub mod renderer {
@@ -23,13 +24,16 @@ pub mod edited {
     include!(concat!(env!("OUT_DIR"), "/edited/orr_kernels.rs"));
 }
 
-/// The renderer's kernels, as a renderer checks a kernel set against them.
-pub static RENDERER: [&orr_shaders::ShaderModule; 4] = [
-    &renderer::plain::MODULE,
-    &renderer::resolve::MODULE,
-    &renderer::sky::MODULE,
-    &renderer::tessellate::MODULE,
-];
+/// The environment and medium linked into orr's kernels.
+pub mod orr_linked {
+    include!(concat!(env!("OUT_DIR"), "/orr/orr_kernels.rs"));
+}
+
+/// The environment linked into a copy of orr's environment bake whose root has one more
+/// field.
+pub mod orr_edited {
+    include!(concat!(env!("OUT_DIR"), "/edited-orr/orr_kernels.rs"));
+}
 
 /// What a surface returned through the switch.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -92,6 +96,11 @@ pub struct AirData {
     pub anisotropy: f32,
     pub pad: [f32; 3],
 }
+
+// SAFETY: eight f32 fields, no padding.
+unsafe impl orr_shaders::bytemuck::Zeroable for AirData {}
+// SAFETY: as above; every bit pattern is a valid f32.
+unsafe impl orr_shaders::bytemuck::Pod for AirData {}
 
 /// The linked medium sampled with `data`'s address: sigma_s, sigma_t, the phase parameter
 /// and the transmittance over `t` metres.

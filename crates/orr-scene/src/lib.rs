@@ -46,6 +46,9 @@ pub use view::{
 };
 pub use world::{REBASE_GRID_LOG2, WorldPos};
 
+/// orr-scene's compiled-in kernel modules.
+pub use shaders::MODULES;
+
 /// orr-scene's compiled kernels and the Rust types of its Slang structs.
 mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
@@ -65,6 +68,8 @@ pub enum Error {
     UnknownViewHistory(ViewHistoryId),
     #[error("{what}: all {capacity} entries are in use")]
     Capacity { what: &'static str, capacity: u32 },
+    #[error(transparent)]
+    Kernels(#[from] orr_shaders::KernelMismatch),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
