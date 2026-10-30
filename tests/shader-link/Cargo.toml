@@ -13,6 +13,7 @@ orr-shaders.workspace = true
 
 [dev-dependencies]
 orr-scene = { workspace = true, features = ["testing"] }
+orr-shaders = { workspace = true, features = ["hot-reload"] }
 orr-gpu.workspace = true
 
 [build-dependencies]

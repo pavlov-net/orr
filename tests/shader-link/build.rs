@@ -2,7 +2,9 @@
 //! it: one linking every point, one linking nothing, and one against a copy of the renderer
 //! whose resolve root has an extra field. The CPU library calls the same linked types. Two
 //! more consumer builds link into orr's own kernels: one against orr as it is, one against a
-//! copy of orr-lighting's shader root whose environment-bake root has an extra field.
+//! copy of orr-lighting's shader root whose environment-bake root has an extra field. The
+//! renderer is linked once more with copies of the consumer modules in `OUT_DIR`, which the
+//! hot reload tests edit.
 
 use std::env;
 use std::fs;
@@ -54,6 +56,7 @@ const SCENE_TYPES: &[&str] = &[
     "GroupGpu",
     "ModelGpu",
     "MeshGpu",
+    "MeshLevel",
     "MaterialGpu",
     "LightGpu",
     "EmissiveGpu",
@@ -176,8 +179,29 @@ fn main() {
     let orr_roots = env::var("DEP_ORR_SHADER_DIRS").expect("orr's shader roots");
     let orr_points = env::var("DEP_ORR_LINK_POINTS").expect("orr's link points");
 
+    let hot_consumer = out.join("hot-consumer");
+    copy_slang(&manifest.join("consumer"), &hot_consumer, &|_, text| text);
+    let hot_modules: Vec<String> = LINKS
+        .iter()
+        .map(|(_, _, module, _)| {
+            let file = Path::new(module).file_name().expect("a module file");
+            hot_consumer.join(file).display().to_string()
+        })
+        .collect();
+    let hot_links: Vec<_> = LINKS
+        .iter()
+        .zip(&hot_modules)
+        .map(|((point, name, _, ty), module)| (*point, *name, module.as_str(), *ty))
+        .collect();
+
     let result = (|| {
         let r = renderer(&src, &out.join("renderer"))?;
+        consumer(
+            &r.shader_dirs,
+            &r.link_points.display().to_string(),
+            &out.join("hot-linked"),
+            &hot_links,
+        )?;
         fixture_consumer(&r, &out.join("linked"), true)?;
         fixture_consumer(&r, &out.join("unlinked"), false)?;
         let edited = renderer(&edited_src, &out.join("edited-renderer"))?;

@@ -104,3 +104,72 @@ fn a_set_built_against_an_edited_root_is_rejected() {
     assert_eq!(e.kernel, "resolve");
     assert!(matches!(e.reason, Mismatch::Interface { .. }), "{e}");
 }
+
+mod hot_reload {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use orr_shaders::{Reload, Watcher};
+    use shader_link::{HOT_CONSUMER, hot_linked};
+
+    /// An edit of a consumer module copy, undone when dropped.
+    struct Edit {
+        path: PathBuf,
+        original: String,
+    }
+
+    impl Edit {
+        fn new(file: &str, from: &str, to: &str) -> Self {
+            let path = Path::new(HOT_CONSUMER).join(file);
+            let original = fs::read_to_string(&path).unwrap();
+            let edited = original.replace(from, to);
+            assert_ne!(edited, original, "{file} has no {from:?}");
+            fs::write(&path, edited).unwrap();
+            Self { path, original }
+        }
+    }
+
+    impl Drop for Edit {
+        fn drop(&mut self) {
+            fs::write(&self.path, &self.original).unwrap();
+        }
+    }
+
+    fn reloaded(w: &mut Watcher) -> Vec<&'static str> {
+        let mut names: Vec<_> = w
+            .scan()
+            .into_iter()
+            .map(|r| match r {
+                Reload::Module { module, .. } => module.name,
+                Reload::Rejected { module, reason } => panic!("{}: {reason}", module.name),
+            })
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    #[test]
+    fn editing_a_linked_consumer_module_reloads_the_kernels_it_links_into() {
+        let mut w = Watcher::new();
+        for m in hot_linked::KERNELS.modules {
+            w.watch(m).unwrap();
+        }
+        assert!(reloaded(&mut w).is_empty());
+        {
+            let _ground = Edit::new(
+                "ground.slang",
+                "depth_offset = 0.125;",
+                "depth_offset = 0.25;",
+            );
+            assert_eq!(reloaded(&mut w), ["resolve"]);
+            assert!(reloaded(&mut w).is_empty());
+        }
+        assert_eq!(reloaded(&mut w), ["resolve"]);
+        let _air = Edit::new(
+            "air.slang",
+            "float3(0.25 / 3.14159265)",
+            "float3(0.5 / 3.14159265)",
+        );
+        assert_eq!(reloaded(&mut w), ["sky"]);
+    }
+}

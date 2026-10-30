@@ -287,10 +287,10 @@ impl Build {
         // The listed kernels compiled once more with the linked types.
         let mut linked_modules = BTreeMap::new();
         let mut lint_roots = roots.clone();
+        let mut linked_dirs = include_dirs.clone();
         if !links.is_empty() {
             let jobs = linked_jobs(&links, &listed, &out_dir)?;
             let module_dirs = link::module_dirs(&links);
-            let mut linked_dirs = include_dirs.clone();
             let kernel_roots = listed.kernels.iter().map(|k| &k.root);
             for dir in module_dirs.iter().chain(kernel_roots) {
                 if !linked_dirs.contains(dir) {
@@ -436,7 +436,8 @@ impl Build {
                 omm: record.omm.as_deref(),
                 debug_info: record.debug_info.as_deref(),
                 hash: record.hash,
-                interface: interface_hash(model),
+                // From the module's own model, as a reload of the module alone computes it.
+                interface: interface_hash(&record.model),
                 model,
                 owners: &owners[name],
                 plans: &plans[name],
@@ -465,23 +466,26 @@ impl Build {
         write(&out_dir.join("orr_kernels.rs"), rust.as_bytes())?;
 
         let manifest = Manifest {
-            slang: SLANG_VERSION,
-            options: &self.options(&include_dirs),
+            slang: SLANG_VERSION.to_owned(),
+            library: self.lib.path.clone(),
+            options: self.options(&include_dirs),
+            linked_options: self.options(&linked_dirs),
             asserts: self.asserts,
             modules: modules
                 .iter()
                 .map(|(name, r)| (name, r, false))
                 .chain(linked_modules.iter().map(|(name, r)| (name, r, true)))
                 .map(|(name, r, linked)| ManifestModule {
-                    name,
-                    kernel: &r.kernel,
+                    name: name.clone(),
+                    kernel: r.kernel.clone(),
                     linked,
-                    spv: &r.spv,
-                    omm: r.omm.as_deref(),
-                    debug_info: r.debug_info.as_deref(),
+                    spv: r.spv.clone(),
+                    omm: r.omm.clone(),
+                    debug_info: r.debug_info.clone(),
                     hash: r.hash,
-                    inputs: &r.inputs,
-                    precompiled: &r.precompiled,
+                    inputs: r.inputs.clone(),
+                    links: r.links.clone(),
+                    precompiled: r.precompiled.clone(),
                 })
                 .collect(),
         };
@@ -680,28 +684,44 @@ fn plan(name: &str, model: &Model) -> Result<HashMap<String, Plan>, Error> {
         })
 }
 
-#[derive(Serialize)]
-struct Manifest<'a> {
-    slang: &'a str,
-    options: &'a [String],
-    asserts: bool,
-    modules: Vec<ManifestModule<'a>>,
+/// `shaders.manifest.json`: every module of a build with what compiling it again from
+/// source takes.
+#[derive(Serialize, Deserialize)]
+pub(super) struct Manifest {
+    pub(super) slang: String,
+    /// The Slang library the build loaded.
+    pub(super) library: PathBuf,
+    /// The source options of the crate's own kernels.
+    pub(super) options: Vec<String>,
+    /// The source options of the linked kernels.
+    pub(super) linked_options: Vec<String>,
+    pub(super) asserts: bool,
+    pub(super) modules: Vec<ManifestModule>,
 }
 
-#[derive(Serialize)]
-struct ManifestModule<'a> {
-    name: &'a str,
-    kernel: &'a Path,
+#[derive(Serialize, Deserialize)]
+pub(super) struct ManifestModule {
+    pub(super) name: String,
+    pub(super) kernel: PathBuf,
     /// Compiled with this build's linked types; goes into `KERNELS`.
-    linked: bool,
-    spv: &'a Path,
-    omm: Option<&'a Path>,
+    pub(super) linked: bool,
+    pub(super) spv: PathBuf,
+    pub(super) omm: Option<PathBuf>,
     /// The separated debug info of `spv`.
-    debug_info: Option<&'a Path>,
-    hash: u64,
-    inputs: &'a [PathBuf],
+    pub(super) debug_info: Option<PathBuf>,
+    pub(super) hash: u64,
+    pub(super) inputs: Vec<PathBuf>,
+    /// The generated link modules composed with the kernel.
+    pub(super) links: Vec<LinkFile>,
     /// The library modules the compile loaded precompiled, by import name.
-    precompiled: &'a [String],
+    pub(super) precompiled: Vec<String>,
+}
+
+/// A generated link module as the manifest lists it.
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct LinkFile {
+    pub(super) module: String,
+    pub(super) path: PathBuf,
 }
 
 /// One compiled module as the build remembers it between runs.
@@ -714,6 +734,7 @@ struct Record {
     omm: Option<PathBuf>,
     debug_info: Option<PathBuf>,
     hash: u64,
+    links: Vec<LinkFile>,
     precompiled: Vec<String>,
     model: Model,
     /// MSL check failures; empty when the check passed or did not run.
@@ -728,18 +749,18 @@ struct Run {
 }
 
 /// What every module of one build is compiled with.
-struct Settings<'a> {
+pub(super) struct Settings<'a> {
     /// A hash of the running build script, so a changed build invalidates every record.
-    tool: &'a str,
+    pub(super) tool: &'a str,
     /// The kernel session's options, led by the precompiled modules' directory when there
     /// is one.
-    options: &'a [String],
+    pub(super) options: &'a [String],
     /// The Metal session's options when the MSL check runs.
-    metal: Option<&'a [String]>,
-    asserts: bool,
+    pub(super) metal: Option<&'a [String]>,
+    pub(super) asserts: bool,
     /// `options` hold `-separate-debug-info`.
-    separate_debug: bool,
-    precompiled: &'a Precompiled,
+    pub(super) separate_debug: bool,
+    pub(super) precompiled: &'a Precompiled,
 }
 
 impl Settings<'_> {
@@ -963,68 +984,33 @@ fn compile_one(
     }
     let global = global.as_ref().expect("created above");
     let session = global.session(settings.options).map_err(slang_err)?;
-    let source = fs::read_to_string(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let compile_err = |diagnostics: String| Error::Compile {
-        module: name.to_owned(),
-        diagnostics,
+    let source = read(path)?;
+    let unit = Unit {
+        name,
+        path,
+        source: &source,
+        links: &job.links,
     };
-    let module = session
-        .load(&name.replace('/', "."), path, &source)
-        .map_err(compile_err)?;
-    let extra = link_modules(&session, settings, &job.links).map_err(compile_err)?;
-    let program = session
-        .link(&module, &extra, |_| true)
-        .map_err(compile_err)?;
-    // A stripped module has no names, which the model reads; the sidecar is the whole
-    // module.
-    let (words, full, debug_info) = if settings.separate_debug {
-        let (stripped, debug) = program.spirv_separated().map_err(compile_err)?;
-        let path = job.spv.with_extension("dbg.spv");
-        write(&path, &words_to_bytes(&debug))?;
-        (
-            spirv::restore_strings(stripped, &debug),
-            Some(debug),
-            Some(path),
-        )
-    } else {
-        (program.spirv().map_err(compile_err)?, None, None)
+    let compiled = compile_kernel(&session, settings, &unit)?;
+    let debug_info = match &compiled.debug {
+        Some(debug) => {
+            let path = job.spv.with_extension("dbg.spv");
+            write(&path, &words_to_bytes(debug))?;
+            Some(path)
+        }
+        None => None,
     };
-    write(&job.spv, &words_to_bytes(&words))?;
-    let layout = program.layout().map_err(compile_err)?;
-    let named = full.as_deref().unwrap_or(&words);
-    let model =
-        model::extract(&session, layout, named, settings.precompiled).map_err(|message| {
-            Error::Reflection {
-                module: name.to_owned(),
-                message,
-            }
-        })?;
-
-    let mut inputs: Vec<PathBuf> = module
-        .dependencies()
-        .into_iter()
-        // The job's link modules close `extra`; their files are inputs too.
-        .chain(
-            extra[extra.len() - job.links.len()..]
-                .iter()
-                .flat_map(super::slang::Module::dependencies),
-        )
-        .map(|p| canonical_lossy(&p))
-        .collect();
-    inputs.sort();
-    inputs.dedup();
-    let precompiled = settings.precompiled.used(&session);
+    let words = compiled.words;
+    let bytes = words_to_bytes(&words);
+    write(&job.spv, &bytes)?;
     let metal = match settings.metal {
         Some(metal_options) => {
             let session = global.session(metal_options).map_err(slang_err)?;
-            metal_issues(&session, settings, &model, job, &source)?
+            metal_issues(&session, settings, &compiled.model, job, &source)?
         }
         None => Vec::new(),
     };
-    let key = cache_key(settings, job, &inputs).ok_or_else(|| Error::Io {
+    let key = cache_key(settings, job, &compiled.inputs).ok_or_else(|| Error::Io {
         path: path.to_path_buf(),
         source: std::io::Error::other("an input vanished during the build"),
     })?;
@@ -1040,14 +1026,100 @@ fn compile_one(
     Ok(Record {
         key,
         kernel: path.to_path_buf(),
-        inputs,
+        inputs: compiled.inputs,
         spv: job.spv.clone(),
         omm,
         debug_info,
-        hash: hash64(&words_to_bytes(&words)),
-        precompiled,
-        model,
+        hash: hash64(&bytes),
+        links: job
+            .links
+            .iter()
+            .map(|l| LinkFile {
+                module: l.module.clone(),
+                path: l.path.clone(),
+            })
+            .collect(),
+        precompiled: compiled.precompiled,
+        model: compiled.model,
         metal,
+    })
+}
+
+/// One kernel file to compile: its source and the link modules composed with it.
+pub(super) struct Unit<'a> {
+    pub(super) name: &'a str,
+    pub(super) path: &'a Path,
+    pub(super) source: &'a str,
+    pub(super) links: &'a [LinkModule],
+}
+
+/// A compiled kernel, before anything is written.
+pub(super) struct Compiled {
+    /// With separated debug info: stripped, its strings restored.
+    pub(super) words: Vec<u32>,
+    /// The separated debug info, when `settings.separate_debug` is set.
+    pub(super) debug: Option<Vec<u32>>,
+    pub(super) model: Model,
+    /// Every file the kernel and its link modules read.
+    pub(super) inputs: Vec<PathBuf>,
+    /// The library modules loaded precompiled.
+    pub(super) precompiled: Vec<String>,
+}
+
+/// Compiles `unit` in `session`, which holds `settings.options`, and reads its model.
+pub(super) fn compile_kernel(
+    session: &Session,
+    settings: &Settings<'_>,
+    unit: &Unit<'_>,
+) -> Result<Compiled, Error> {
+    let compile_err = |diagnostics: String| Error::Compile {
+        module: unit.name.to_owned(),
+        diagnostics,
+    };
+    let module = session
+        .load(&unit.name.replace('/', "."), unit.path, unit.source)
+        .map_err(compile_err)?;
+    let extra = link_modules(session, settings, unit.links).map_err(compile_err)?;
+    let program = session
+        .link(&module, &extra, |_| true)
+        .map_err(compile_err)?;
+    // A stripped module has no names, which the model reads; the sidecar is the whole
+    // module.
+    let (words, debug) = if settings.separate_debug {
+        let (stripped, debug) = program.spirv_separated().map_err(compile_err)?;
+        (spirv::restore_strings(stripped, &debug), Some(debug))
+    } else {
+        (program.spirv().map_err(compile_err)?, None)
+    };
+    let layout = program.layout().map_err(compile_err)?;
+    let named = debug.as_deref().unwrap_or(&words);
+    let model =
+        model::extract(session, layout, named, settings.precompiled).map_err(|message| {
+            Error::Reflection {
+                module: unit.name.to_owned(),
+                message,
+            }
+        })?;
+
+    let mut inputs: Vec<PathBuf> = module
+        .dependencies()
+        .into_iter()
+        // The unit's link modules close `extra`; their files are inputs too.
+        .chain(
+            extra[extra.len() - unit.links.len()..]
+                .iter()
+                .flat_map(super::slang::Module::dependencies),
+        )
+        .map(|p| canonical_lossy(&p))
+        .collect();
+    inputs.sort();
+    inputs.dedup();
+    Ok(Compiled {
+        words,
+        debug,
+        model,
+        inputs,
+        precompiled: settings.precompiled.used(session),
     })
 }
 
@@ -1112,7 +1184,7 @@ fn metal_issues(
 
 /// The interface of a module's entry points: the root's layout, through pointees, and the
 /// specialisation constants' ids and types. Names do not count.
-fn interface_hash(model: &Model) -> u64 {
+pub(super) fn interface_hash(model: &Model) -> u64 {
     fn walk(ty: &Ty, model: &Model, seen: &mut Vec<String>, out: &mut String) {
         match ty {
             Ty::Struct(name) => {
@@ -1154,12 +1226,12 @@ fn interface_hash(model: &Model) -> u64 {
     hash64(text.as_bytes())
 }
 
-fn hash64(bytes: &[u8]) -> u64 {
+pub(super) fn hash64(bytes: &[u8]) -> u64 {
     let h = blake3::hash(bytes);
     u64::from_le_bytes(h.as_bytes()[..8].try_into().expect("8 bytes"))
 }
 
-fn words_to_bytes(words: &[u32]) -> Vec<u8> {
+pub(super) fn words_to_bytes(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 

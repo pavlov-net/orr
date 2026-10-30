@@ -5,7 +5,9 @@
 //! compiles a crate's Slang kernels in process with the pinned Slang release, checks their
 //! layout and ABI rules, and generates Rust for their roots, records and modules. The
 //! `openpbr` feature adds [`openpbr`]: the lookup tables and specialisation constants of
-//! `orr.openpbr`, derived from adobe/openpbr-bsdf under the Apache License 2.0.
+//! `orr.openpbr`, derived from adobe/openpbr-bsdf under the Apache License 2.0. The
+//! `hot-reload` feature adds [`Watcher`], which recompiles compiled-in modules from their
+//! sources at run time.
 
 pub mod abi;
 mod alias;
@@ -16,6 +18,8 @@ mod module;
 pub mod openpbr;
 
 pub use alias::AliasEntry;
+#[cfg(feature = "hot-reload")]
+pub use build::{Reload, Watcher};
 pub use module::{EntryPoint, KernelMismatch, KernelSet, Mismatch, ShaderModule, Stage};
 
 /// The directory of orr's shared Slang libraries, imported as `orr.<name>`.
