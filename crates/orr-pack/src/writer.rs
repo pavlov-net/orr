@@ -111,10 +111,6 @@ impl EncodedBlob<'_> {
         self.stored.len()
     }
 
-    pub fn codec(&self) -> Codec {
-        self.rec.codec()
-    }
-
     pub fn filter(&self) -> Filter {
         self.rec.filter()
     }

@@ -292,6 +292,13 @@ struct Layer<'p> {
     levels: Vec<Level>,
 }
 
+impl Layer<'_> {
+    /// Lossless layers of multi-byte texels try `Filter::BytePlanes4` per tile.
+    fn tries_byte_planes(&self) -> bool {
+        self.record.lossless == 1 && self.format.stored().bytes() > 1
+    }
+}
+
 /// Cooks a planned raster set into `w` as one entry.
 pub(crate) fn cook(
     w: &mut ArchiveWriter,
@@ -460,7 +467,7 @@ pub(crate) fn cook(
             raw: 0,
             stored: 0,
             zstd: 0,
-            byte_planes: (l.record.lossless == 1 && l.format.stored().bytes() > 1).then_some(0),
+            byte_planes: l.tries_byte_planes().then_some(0),
             byte_plane_tiles: 0,
         })
         .collect();
@@ -560,7 +567,7 @@ struct Encoded<'a> {
 fn encode<'a>(raw: &'a [u8], l: &Layer) -> Result<Encoded<'a>> {
     let plain = BlobIn::new(raw).encode(ZSTD_LEVEL)?;
     let zstd = plain.stored_len();
-    if l.record.lossless == 0 || l.format.stored().bytes() == 1 {
+    if !l.tries_byte_planes() {
         return Ok(Encoded {
             best: plain,
             zstd,
