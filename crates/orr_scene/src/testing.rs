@@ -67,6 +67,16 @@ pub fn wait(point: TimelinePoint) {
     render.wait(point, Duration::from_secs(10)).expect("wait");
 }
 
+/// Sets what copies of `model` add to the emissive list, as model loading does when the
+/// model becomes resident.
+pub fn set_model_emission(
+    scenes: &mut crate::Scenes,
+    model: crate::ModelId,
+    emission: Option<crate::ModelEmission>,
+) {
+    scenes.set_model_emission(model, emission);
+}
+
 /// Copies `count` values at `src` back to the CPU, after all work submitted so far.
 pub fn read_buffer<T: Pod>(src: GpuPtr<T>, count: u64) -> Vec<T> {
     let d = device();

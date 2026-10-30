@@ -8,9 +8,11 @@
 //! write with one scatter dispatch; orr keeps no CPU copy of GPU tables. Every pass reads
 //! a scene through its [`SceneRoot`].
 
+mod emissive;
 mod lights;
 mod material;
 pub mod memory;
+mod producer;
 mod scene;
 mod scenes;
 #[cfg(feature = "testing")]
@@ -24,15 +26,18 @@ pub use orr_gpu;
 pub use orr_pack;
 pub use orr_shaders::abi;
 
+pub use emissive::{EmissiveSpan, ModelEmission, emissive_spans};
 pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId};
 pub use material::{MaterialId, MaterialWriter, material_flags};
+pub use producer::{ClusterTopology, ProducerDesc, ProducerId, ProducerUpdate};
 pub use scene::{
     Affine3, CopyVariant, GroupWriter, InstanceFlags, InstanceRange, InstancesDesc, ModelId, Pose,
     SceneDesc, SceneId, SceneWriter, TransformGroupDesc, TransformGroupId,
 };
 pub use scenes::{Budgets, Frame, FrameDesc, FrameStats, RendererDesc, SceneCompute, Scenes};
 pub use shaders::types::{
-    GroupGpu, InstanceGpu, LightGpu, MaterialGpu, SceneRoot, SkyStats, SlotStateGpu,
+    EmissiveGpu, GroupGpu, InstanceGpu, LightGpu, MaterialGpu, ProducerBatch, ProducerClusterGpu,
+    ProducerGpu, SceneRoot, SkyStats, SlotStateGpu, TopologyGpu,
 };
 pub use time::FrameTime;
 pub use view::{

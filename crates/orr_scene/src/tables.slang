@@ -4,6 +4,7 @@ module tables;
 import orr.abi;
 import material;
 import lights;
+import producer;
 import view;
 
 // `InstanceGpu.flags`.
@@ -75,6 +76,9 @@ public struct SceneRoot
     public MaterialGpu* materials;   // global
     public uint* material_sets;      // MaterialId per model section per set
     public LightGpu* lights;
+    public EmissiveGpu* emissive;    // producer_capacity + emissive_capacity entries
+    public ProducerGpu* producers;   // by ProducerId
+    public ProducerBatch* batches;   // by ProducerId
     public SkyStats* sky_stats;
     public uint64_t environment;     // consumer data for the linked environment
     public uint64_t medium;          // consumer data for the linked medium
@@ -86,6 +90,8 @@ public struct SceneRoot
     public uint group_capacity;
     public uint light_capacity;
     public uint material_set_capacity;
+    public uint producer_capacity;
+    public uint emissive_capacity;   // instance span entries, after the producer entries
     public float near_range;         // m
     public uint _pad;
 }
