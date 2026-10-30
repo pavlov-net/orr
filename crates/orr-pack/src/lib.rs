@@ -11,6 +11,7 @@ mod format;
 pub mod material;
 pub mod mesh;
 pub mod model;
+pub mod texture;
 mod writer;
 
 use std::fmt;
@@ -130,6 +131,7 @@ const SCHEMAS: &[(Class, u16)] = &[
     (Class::Mesh, mesh::SCHEMA),
     (Class::Material, material::SCHEMA),
     (Class::Model, model::SCHEMA),
+    (Class::Texture, texture::SCHEMA),
 ];
 
 impl Class {

@@ -9,7 +9,10 @@
 //! - `alphaMode`: `OPAQUE`; `MASK` with `alphaCutoff`; `BLEND`. Base alpha -> `geometry_opacity`
 //!   under `MASK` and `BLEND`.
 //! - `doubleSided` -> `double_sided`.
-//! - Texture references are not bound.
+//! - Textures: base colour, metallic-roughness, normal (with its scale), occlusion (with its
+//!   strength) and emissive, cooked as the material's canonical channel set
+//!   ([`crate::texture::material`]). `texCoord` 0 or 1 becomes the binding's uv set; the
+//!   sampler's wrap modes set the mip filter's edges.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -17,19 +20,24 @@ use std::path::Path;
 use base64::Engine;
 use glam::{Mat3, Mat4, Vec3};
 use gltf::buffer::Source as BufferSource;
+use gltf::image::Source as ImageSource;
 use gltf::material::AlphaMode;
 use gltf::mesh::Mode;
+use gltf::texture::WrappingMode;
 use orr_pack::Hash32;
 use orr_pack::material::Material;
 use orr_pack::mesh::Section;
 
 use crate::mesh::{MeshData, SectionData};
+use crate::texture::Wrap;
+use crate::texture::material::{ImageFile, MaterialTextures, TexRef};
 use crate::{Error, Result};
 
 pub(crate) struct Imported {
     pub mesh: MeshData,
-    /// Name suffix and material per mesh section.
-    pub materials: Vec<(String, Material)>,
+    /// Name suffix, material and its images per mesh section.
+    pub materials: Vec<(String, Material, MaterialTextures)>,
+    pub images: Vec<ImageFile>,
     /// blake3 of the document and every buffer it reads.
     pub input_hash: Hash32,
 }
@@ -58,6 +66,22 @@ pub(crate) fn import(asset: &str, path: &Path) -> Result<Imported> {
         gltf::Gltf::from_slice(&bytes).map_err(|e| fail(format!("{}: {e}", path.display())))?;
     let mut hash = blake3::Hasher::new();
     hash.update(&bytes);
+    // A data URI's bytes, or a file next to the document, which enters the input hash.
+    let mut load_uri = |uri: &str, what: String| match uri.strip_prefix("data:") {
+        Some(data) => {
+            let (_, b64) = data
+                .split_once(";base64,")
+                .ok_or_else(|| fail(format!("{what}: data URI is not base64")))?;
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| fail(format!("{what}: {e}")))
+        }
+        None => {
+            let data = read(&path.parent().unwrap_or(Path::new("")).join(uri))?;
+            hash.update(&data);
+            Ok(data)
+        }
+    };
 
     let mut buffers = Vec::new();
     for b in doc.buffers() {
@@ -66,21 +90,7 @@ pub(crate) fn import(asset: &str, path: &Path) -> Result<Imported> {
                 .blob
                 .clone()
                 .ok_or_else(|| fail("GLB binary chunk missing".into()))?,
-            BufferSource::Uri(uri) => match uri.strip_prefix("data:") {
-                Some(data) => {
-                    let (_, b64) = data.split_once(";base64,").ok_or_else(|| {
-                        fail(format!("buffer {}: data URI is not base64", b.index()))
-                    })?;
-                    base64::engine::general_purpose::STANDARD
-                        .decode(b64)
-                        .map_err(|e| fail(format!("buffer {}: {e}", b.index())))?
-                }
-                None => {
-                    let data = read(&path.parent().unwrap_or(Path::new("")).join(uri))?;
-                    hash.update(&data);
-                    data
-                }
-            },
+            BufferSource::Uri(uri) => load_uri(uri, format!("buffer {}", b.index()))?,
         };
         if data.len() < b.length() {
             return Err(fail(format!(
@@ -93,14 +103,37 @@ pub(crate) fn import(asset: &str, path: &Path) -> Result<Imported> {
         buffers.push(data);
     }
 
+    let mut images = Vec::new();
+    for img in doc.images() {
+        let (name, bytes) = match img.source() {
+            ImageSource::View { view, .. } => {
+                let data = &buffers[view.buffer().index()];
+                let bytes = data
+                    .get(view.offset()..view.offset() + view.length())
+                    .ok_or_else(|| fail(format!("image {}: view outside its buffer", img.index())))?
+                    .to_vec();
+                (format!("image {}", img.index()), bytes)
+            }
+            ImageSource::Uri { uri, .. } => (
+                uri.to_string(),
+                load_uri(uri, format!("image {}", img.index()))?,
+            ),
+        };
+        images.push(ImageFile {
+            name: img.name().map_or(name, str::to_string),
+            bytes,
+        });
+    }
+
     let scene = doc
         .default_scene()
         .or_else(|| doc.scenes().next())
         .ok_or_else(|| fail("no scene".into()))?;
     let mut v = Vertices::default();
     let mut all_tangents = true;
-    // Material and triangles per glTF material index; usize::MAX is the default material.
-    let mut groups: BTreeMap<usize, (Material, Vec<u32>)> = BTreeMap::new();
+    // Material, its images and triangles per glTF material index; usize::MAX is the default
+    // material.
+    let mut groups: BTreeMap<usize, (Material, MaterialTextures, Vec<u32>)> = BTreeMap::new();
     let mut stack: Vec<_> = scene.nodes().map(|n| (n, Mat4::IDENTITY)).collect();
     while let Some((node, parent)) = stack.pop() {
         let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
@@ -161,9 +194,12 @@ pub(crate) fn import(asset: &str, path: &Path) -> Result<Imported> {
 
             let base = v.positions.len() as u32;
             let mat = prim.material();
-            let (_, tris) = groups
-                .entry(mat.index().unwrap_or(usize::MAX))
-                .or_insert_with(|| (material(&mat), Vec::new()));
+            let index = mat.index().unwrap_or(usize::MAX);
+            if let std::collections::btree_map::Entry::Vacant(e) = groups.entry(index) {
+                let t = textures(&mat).map_err(|m| fail(format!("material {index}: {m}")))?;
+                e.insert((material(&mat), t, Vec::new()));
+            }
+            let (_, _, tris) = groups.get_mut(&index).expect("inserted");
             match normals {
                 Some(normals) => {
                     v.positions.extend(positions);
@@ -189,14 +225,14 @@ pub(crate) fn import(asset: &str, path: &Path) -> Result<Imported> {
             }
         }
     }
-    if groups.values().all(|(_, t)| t.is_empty()) {
+    if groups.values().all(|(_, _, t)| t.is_empty()) {
         return Err(fail("the scene has no triangles".into()));
     }
 
     let mut indices = Vec::new();
     let mut sections = Vec::new();
     let mut materials = Vec::new();
-    for (index, (m, tris)) in groups {
+    for (index, (m, t, tris)) in groups {
         if tris.is_empty() {
             continue;
         }
@@ -218,7 +254,7 @@ pub(crate) fn import(asset: &str, path: &Path) -> Result<Imported> {
             flags,
         });
         indices.extend(tris);
-        materials.push((suffix, m));
+        materials.push((suffix, m, t));
     }
 
     Ok(Imported {
@@ -231,6 +267,7 @@ pub(crate) fn import(asset: &str, path: &Path) -> Result<Imported> {
             sections,
         },
         materials,
+        images,
         input_hash: Hash32(*hash.finalize().as_bytes()),
     })
 }
@@ -261,4 +298,46 @@ fn material(m: &gltf::Material<'_>) -> Material {
         double_sided: m.double_sided().into(),
         ..Material::default()
     }
+}
+
+fn textures(m: &gltf::Material<'_>) -> Result<MaterialTextures, String> {
+    let tex = |t: gltf::Texture<'_>, coord: u32| -> Result<TexRef, String> {
+        if coord > 1 {
+            return Err(format!("texCoord {coord}: only uv sets 0 and 1 exist"));
+        }
+        let wrap = |w: WrappingMode| match w {
+            WrappingMode::Repeat => Wrap::Repeat,
+            WrappingMode::ClampToEdge => Wrap::Clamp,
+            WrappingMode::MirroredRepeat => Wrap::Mirror,
+        };
+        let s = t.sampler();
+        Ok(TexRef {
+            image: t.source().index(),
+            uv_set: coord as u8,
+            wrap: [wrap(s.wrap_s()), wrap(s.wrap_t())],
+        })
+    };
+    let pbr = m.pbr_metallic_roughness();
+    Ok(MaterialTextures {
+        base_color: pbr
+            .base_color_texture()
+            .map(|i| tex(i.texture(), i.tex_coord()))
+            .transpose()?,
+        metal_rough: pbr
+            .metallic_roughness_texture()
+            .map(|i| tex(i.texture(), i.tex_coord()))
+            .transpose()?,
+        normal: m
+            .normal_texture()
+            .map(|i| Ok::<_, String>((tex(i.texture(), i.tex_coord())?, i.scale())))
+            .transpose()?,
+        occlusion: m
+            .occlusion_texture()
+            .map(|i| Ok::<_, String>((tex(i.texture(), i.tex_coord())?, i.strength())))
+            .transpose()?,
+        emissive: m
+            .emissive_texture()
+            .map(|i| tex(i.texture(), i.tex_coord()))
+            .transpose()?,
+    })
 }

@@ -2,6 +2,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
+use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, Class, Codec, Entry};
 
 const USAGE: &str = "usage:
@@ -92,6 +93,9 @@ fn inspect(args: &[String]) -> Result<bool> {
             stored,
             a.name(e)
         )?;
+        if e.class == Class::Texture as u16 && (name.is_some() || class.is_some()) {
+            texture_line(&a, e, &mut out)?;
+        }
         if name.is_some() {
             for (i, b) in blobs.iter().enumerate() {
                 writeln!(
@@ -109,6 +113,32 @@ fn inspect(args: &[String]) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+/// Format, size, mips and the bytes of the mip tail, which stays resident from mount.
+fn texture_line(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
+    let b = &a.blobs(e)[0];
+    let mut head = vec![0; b.raw_len as usize];
+    a.read(b, &mut head)?;
+    let info = TextureInfo::parse(&head)?;
+    let h = info.header;
+    let tail = if h.tail_first_mip < h.mip_count {
+        a.blobs(e).last().map_or(0, |b| b.raw_len)
+    } else {
+        0
+    };
+    writeln!(
+        out,
+        "    vk format {} {}x{} x{} layers, {} mips, tail from mip {} ({tail} B), {} lights",
+        h.vk_format,
+        h.width,
+        h.height,
+        h.layers,
+        h.mip_count,
+        h.tail_first_mip,
+        info.lights.len()
+    )?;
+    Ok(())
 }
 
 fn verify(args: &[String]) -> Result<bool> {
