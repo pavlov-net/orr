@@ -1,15 +1,30 @@
 //! Planetary sky and atmosphere: Rayleigh, aerosol and ozone over a planet, with an
 //! optional height-fog layer.
 //!
-//! [`Atmosphere`] describes the medium. [`spectrum`] holds its build-time spectral
-//! coefficients and [`reference`](mod@reference) an f64 spectral integrator that the GPU
-//! passes are checked against.
+//! [`Atmosphere`] describes the medium. [`AtmosphereState`] holds one atmosphere's GPU
+//! state: its LUTs, recorded at the scene compute point, and the [`AtmosphereGpu`] block
+//! the Slang module `atmosphere` reads (`DEP_ORR_ATMOSPHERE_SHADER_DIRS`). [`spectrum`]
+//! holds the build-time spectral coefficients and [`reference`](mod@reference) an f64
+//! spectral integrator that the GPU passes are checked against.
 
+mod block;
 pub mod colour;
+mod luts;
 pub mod reference;
 pub mod spectrum;
 
+pub use luts::{AtmosphereState, MULTIPLE_SCATTERING_SIZE, SKY_VIEW_SIZE, TRANSMITTANCE_SIZE};
+pub use shaders::types::{AtmosphereGpu, AtmosphereGroups, FoldGpu};
+
 use glam::{DVec3, Vec3};
+
+/// Generated kernel modules and the Rust types of the crate's Slang structs.
+pub mod shaders {
+    include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
+}
+
+/// Molecules per m^2 in one Dobson unit.
+pub(crate) const DOBSON_UNIT: f64 = 2.687e20;
 
 /// Directional lights a sky can choose its folded lights from.
 pub const MAX_SKY_LIGHTS: usize = 16;

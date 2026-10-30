@@ -24,12 +24,10 @@ use glam::DVec3;
 
 use self::medium::{COMPONENTS, Columns, Densities, Leg, Profile, Ray};
 use self::phase::{FogPhase, Rng};
-use crate::Atmosphere;
 use crate::colour::{REC709_TO_REC2020, REC2020_TO_XYZ, mul};
 use crate::spectrum::{self, Bands, rgb_at};
+use crate::{Atmosphere, DOBSON_UNIT};
 
-/// Molecules per m^2 in one Dobson unit.
-const DOBSON_UNIT: f64 = 2.687e20;
 /// Interactions after which a path ends.
 const MAX_INTERACTIONS: u32 = 256;
 /// Paths between precision checks.
@@ -451,7 +449,8 @@ impl Run<'_> {
                 break;
             }
         }
-        let m = f64::from(samples);
+        // With no paths, single scattering alone.
+        let m = f64::from(samples.max(1));
         let values: Vec<f64> = single
             .iter()
             .zip(&sum)
@@ -566,6 +565,19 @@ impl Run<'_> {
     ) -> Option<(DVec3, DVec3)> {
         let p = &self.reference.profile;
         let range = (leg.start, leg.end);
+        // An empty leg that ends on the ground can only reflect.
+        if leg.segments.is_empty() {
+            if !ground {
+                return None;
+            }
+            for (b, ch) in throughput.iter_mut().zip(&self.chans) {
+                *b *= ch.ground_albedo;
+            }
+            return Some((
+                ray.at(range.1),
+                phase::cosine_direction(ray.up(range.1), rng),
+            ));
+        }
         let tau: Vec<f64> = self
             .chans
             .iter()

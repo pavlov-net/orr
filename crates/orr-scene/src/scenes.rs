@@ -175,25 +175,28 @@ fn insert<T>(slots: &mut Vec<Option<T>>, value: T) -> u32 {
 
 fn pipeline(
     device: &Device,
-    module: &'static orr_gpu::ShaderModule,
+    kernels: &KernelSet,
+    own: &'static orr_gpu::ShaderModule,
     entry: &str,
 ) -> Result<ComputePipeline> {
+    let module = kernels.module(own)?;
     let stage = ShaderStage::new(module, entry, SpecData::default())?;
     Ok(device.create_compute_pipeline(&stage, module.name)?)
 }
 
 impl Scenes {
-    /// Compiles orr-scene's pipelines on the calling thread.
+    /// Compiles orr-scene's pipelines on the calling thread, from `desc.kernels`' module
+    /// wherever it holds one for an orr-scene kernel.
     pub fn new(device: &Device, desc: &RendererDesc) -> Result<Self> {
         assert!(desc.frames_in_flight >= 1, "frames_in_flight is at least 1");
         assert!(desc.cell_log2 <= 16, "cells of 2^{} m", desc.cell_log2);
         Ok(Self {
             device: device.clone(),
             pipelines: Pipelines {
-                scatter: pipeline(device, &upload::MODULE, "scatter")?,
-                rebase: pipeline(device, &world_kernel::MODULE, "rebase_lights")?,
-                emissive_instances: pipeline(device, &emissive::MODULE, "instances")?,
-                emissive_producers: pipeline(device, &emissive::MODULE, "producers")?,
+                scatter: pipeline(device, desc.kernels, &upload::MODULE, "scatter")?,
+                rebase: pipeline(device, desc.kernels, &world_kernel::MODULE, "rebase_lights")?,
+                emissive_instances: pipeline(device, desc.kernels, &emissive::MODULE, "instances")?,
+                emissive_producers: pipeline(device, desc.kernels, &emissive::MODULE, "producers")?,
             },
             core: Core {
                 fif: desc.frames_in_flight,

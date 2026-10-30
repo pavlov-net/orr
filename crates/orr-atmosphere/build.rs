@@ -1,6 +1,6 @@
 //! Derives the spectral, group and Rec.2020 band coefficients from the pinned ASTM G173
 //! solar spectrum, ozone cross sections and CIE 1931 2-deg tables, into
-//! `OUT_DIR/spectrum.rs`.
+//! `OUT_DIR/spectrum.rs`; compiles the crate's kernels and publishes its shader root.
 
 use std::env;
 use std::fmt::Write as _;
@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 mod colour;
 
 use colour::{LUMINOUS_EFFICACY, XYZ_TO_REC2020};
+use orr_shaders::build::Build;
 
 /// Wavelength groups in the LUT passes; each is `BINS / SPECTRAL_GROUPS` adjacent 10 nm bins.
 /// 24 is the finer alternative.
@@ -33,6 +34,11 @@ fn main() {
         BINS % SPECTRAL_GROUPS,
         0,
         "groups must split the bins evenly"
+    );
+    assert_eq!(
+        SPECTRAL_GROUPS % 3,
+        0,
+        "the LUT passes run three groups at a time"
     );
 
     let root = data_dir();
@@ -164,6 +170,18 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     fs::write(out_dir.join("spectrum.rs"), out).unwrap();
+
+    compile_kernels();
+}
+
+fn compile_kernels() {
+    let src = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("src");
+    let roots = env::var("DEP_ORR_SHADER_DIRS").expect("orr's shader roots");
+    let out = Build::new().and_then(|b| b.kernels(&src).roots(&roots).compile());
+    match out {
+        Ok(out) => println!("cargo:shader_dirs={}", out.shader_dirs),
+        Err(e) => panic!("{e}"),
+    }
 }
 
 struct BandRow {

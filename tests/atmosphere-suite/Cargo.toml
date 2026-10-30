@@ -1,0 +1,21 @@
+[package]
+name = "atmosphere-suite"
+description = "Headless GPU tests of orr-atmosphere's LUT passes against its f64 reference, run with the validation layer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+orr.workspace = true
+orr-atmosphere.workspace = true
+orr-scene = { workspace = true, features = ["testing"] }
+orr-shaders.workspace = true
+glam.workspace = true
+
+[build-dependencies]
+orr-shaders = { workspace = true, features = ["build"] }
+
+[lints]
+workspace = true
