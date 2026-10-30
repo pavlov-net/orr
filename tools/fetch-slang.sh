@@ -3,6 +3,11 @@
 #   slang-2026.20/   Slang release for the host, checked against its sha256
 #   openpbr-bsdf/    adobe/openpbr-bsdf at a pinned commit
 #   glm/             GLM 1.0.1 at its tag commit
+#   precomputed_atmospheric_scattering/
+#                    ebruneton/precomputed_atmospheric_scattering at a pinned commit: ASTM G173
+#                    solar spectrum, ozone cross sections and CIE 1931 2-deg tables
+#   display/gt7/     Polyphony Digital's GT7 tone-mapping sample (MIT), checked against its
+#                    sha256
 # Build scripts never download; run this once after cloning and after a pin changes.
 #
 # SLANG_ASSET=glibc-2.28 selects the Linux build for glibc older than 2.34.
@@ -13,6 +18,8 @@ set -euo pipefail
 slang_version=2026.20
 openpbr_commit=c91aad1d1ce1693e803f039d7c92c2965c4eb013
 glm_commit=0af55ccecd98d4e5a8d1fad7de25ba429d60e863
+sky_commit=34f14e745cff948f4ca3157d1b62a445ffa7286f
+gt7_sum=94df7e7e310b9423ebb5aaaa29416f376ebbae66e0948fb259f8688314b29822
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 tools="${ORR_TOOLS:-$root/.tools}"
@@ -75,3 +82,16 @@ fetch_commit() {
 
 fetch_commit https://github.com/adobe/openpbr-bsdf "$openpbr_commit" "$tools/openpbr-bsdf"
 fetch_commit https://github.com/g-truc/glm "$glm_commit" "$tools/glm"
+fetch_commit https://github.com/ebruneton/precomputed_atmospheric_scattering "$sky_commit" \
+  "$tools/precomputed_atmospheric_scattering"
+
+gt7="$tools/display/gt7/gt7_tone_mapping.cpp"
+if echo "$gt7_sum  $gt7" | sha256sum -c --quiet - 2>/dev/null; then
+  echo "gt7 sample already in $gt7"
+else
+  mkdir -p "$(dirname "$gt7")"
+  curl -fsSL --retry 3 -o "$gt7.part" https://blog.selfshadow.com/publications/s2025-shading-course/pdi/supplemental/gt7_tone_mapping.cpp
+  echo "$gt7_sum  $gt7.part" | sha256sum -c --quiet -
+  mv "$gt7.part" "$gt7"
+  echo "gt7 sample in $gt7"
+fi
