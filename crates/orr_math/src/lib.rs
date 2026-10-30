@@ -8,6 +8,6 @@
 
 pub use glam;
 pub use glam::{
-    Affine3A, DAffine3, DMat3, DMat4, DQuat, DVec2, DVec3, DVec4, IVec2, IVec3, IVec4, Mat3, Mat4,
-    Quat, UVec2, UVec3, UVec4, Vec2, Vec3, Vec4,
+    Affine3A, DMat3, DMat4, DQuat, DVec2, DVec3, DVec4, IVec2, IVec3, IVec4, Mat3, Mat4, Quat,
+    UVec2, UVec3, UVec4, Vec2, Vec3, Vec4,
 };
