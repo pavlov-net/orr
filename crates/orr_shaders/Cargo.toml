@@ -8,13 +8,21 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-build = ["dep:thiserror"]
+build = ["dep:thiserror", "dep:libloading", "dep:serde", "dep:serde_json", "dep:blake3", "dep:bindgen"]
 
 [dependencies]
+bytemuck.workspace = true
 thiserror = { workspace = true, optional = true }
+libloading = { version = "0.8", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+blake3 = { workspace = true, optional = true }
+
+[build-dependencies]
+bindgen = { version = "0.72.1", default-features = false, features = ["runtime"], optional = true }
 
 [[test]]
-name = "toolchain"
+name = "build"
 required-features = ["build"]
 
 [lints]

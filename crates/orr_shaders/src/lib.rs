@@ -1,7 +1,19 @@
 //! Slang shaders for orr.
 //!
-//! The `build` feature is for `build.rs`: it locates and version-checks the pinned Slang
-//! compiler and holds the one compiler option set.
+//! The default feature holds the types shared by Rust and Slang ([`abi`]) and the compiled
+//! module types that generated code fills in. The `build` feature is for `build.rs`: it
+//! compiles a crate's Slang kernels in process with the pinned Slang release, checks their
+//! layout and ABI rules, and generates Rust for their roots, records and modules.
 
+pub mod abi;
 #[cfg(feature = "build")]
 pub mod build;
+mod module;
+
+pub use module::{EntryPoint, KernelSet, ShaderModule, Stage};
+
+/// The directory of orr's shared Slang libraries, imported as `orr.<name>`.
+pub const LIB_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders");
+
+#[doc(hidden)]
+pub use bytemuck;
