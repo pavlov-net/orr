@@ -1,0 +1,81 @@
+name: Release Drafter
+
+# Every crate in the workspace shares one version (`workspace.package.version`)
+# and is released together.
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# One run at a time, so a queued run sees the previous run's version-bump commit.
+concurrency:
+  group: release-drafter
+  cancel-in-progress: false
+
+jobs:
+  release-drafter:
+    name: Release Drafter
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    environment: release-drafter
+    steps:
+      - uses: release-drafter/release-drafter@978bb0b30c5ee8cdd332ced253758157150d43f0 # v7
+        id: drafter
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04
+        with:
+          toolchain: stable
+
+      - name: Install cargo-edit
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        env:
+          # There is no prebuilt cargo-edit; it is built from source with stable.
+          RUSTUP_TOOLCHAIN: stable
+        with:
+          tool: cargo-edit
+
+      - name: Bump version
+        env:
+          VERSION: ${{ steps.drafter.outputs.resolved_version }}
+        # `cargo set-version` needs network access (it runs `cargo metadata`).
+        # It is skipped when the resolved version is lower than the workspace's;
+        # release.yml still rejects a tag that doesn't match the crates.
+        run: |
+          current=$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[] | select(.publish == null)][0].version')
+          if [ "$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | head -n1)" = "$VERSION" ] \
+             && [ "$current" != "$VERSION" ]; then
+            echo "::warning::Resolved $VERSION is lower than the workspace's $current; not bumping."
+          else
+            cargo set-version --workspace "$VERSION"
+          fi
+
+      - uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        id: app-token
+        with:
+          client-id: ${{ vars.RELEASE_DRAFTER_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_DRAFTER_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Commit changes
+        env:
+          PUSH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ steps.drafter.outputs.resolved_version }}
+        run: |
+          if ! git diff --quiet -- '*Cargo.toml' Cargo.lock; then
+            git config --global user.name "pavlov-net-release-drafter[bot]"
+            git config --global user.email "349057244+pavlov-net-release-drafter[bot]@users.noreply.github.com"
+            git add -u -- '*Cargo.toml' Cargo.lock
+            git commit -m "Bump version to ${VERSION} [skip ci]"
+            # Hand the app token to git only for this push.
+            git -c credential.helper= -c credential.https://github.com.helper= \
+                -c credential.helper='!f() { echo username=x-access-token; echo "password=$PUSH_TOKEN"; }; f' push
+          fi
