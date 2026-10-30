@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use orr_pack::mesh::MeshInfo;
+use orr_pack::mesh::{MeshHeader, MeshInfo, PageView, Section, decode_page};
 use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, Class, Entry};
 use serde::Serialize;
@@ -55,6 +55,10 @@ pub struct EntryReport {
     pub texture: Option<TextureReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raster: Option<RasterReport>,
+    /// Content the cook accepted but flags: displacement that differs across uv seams,
+    /// subsurface materials on open meshes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// How an entry was obtained.
@@ -68,18 +72,38 @@ pub enum Outcome {
     Archive,
 }
 
+/// Sizes are statistics, never caps.
 #[derive(Clone, Debug, Serialize)]
 pub struct MeshReport {
     pub position_exponent: i8,
     pub clas_truncate_bits: u8,
     pub sections: usize,
     pub parts: usize,
-    pub levels: usize,
     pub pages: usize,
     pub pinned_pages: u32,
     pub clusters: u32,
-    /// Stored bytes per source triangle.
+    /// First merged level, if any.
+    pub merge_level: Option<u8>,
+    /// Stored bytes of the whole entry per source triangle.
     pub bytes_per_triangle: f64,
+    /// Mean triangles per cluster on alpha-tested or double-sided sections, if any.
+    pub foliage_cluster_fill: Option<f64>,
+    /// Finest first.
+    pub levels: Vec<LevelReport>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LevelReport {
+    /// Simplification error from the source, metres.
+    pub error: f32,
+    pub triangles: u64,
+    pub clusters: u32,
+    pub pages: usize,
+    /// Page bytes as stored and as resident.
+    pub stored: u64,
+    pub resident: u64,
+    pub stored_per_triangle: f64,
+    pub resident_per_triangle: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -114,20 +138,7 @@ pub(crate) fn entry(
         .then(head)
         .flatten()
         .and_then(|b| MeshInfo::parse(&b).ok())
-        .map(|m| {
-            let clusters: u32 = m.pages.iter().map(|p| u32::from(p.cluster_count)).sum();
-            MeshReport {
-                position_exponent: m.header.position_exponent,
-                clas_truncate_bits: m.header.clas_truncate_bits,
-                sections: m.sections.len(),
-                parts: m.parts.len(),
-                levels: m.levels.len(),
-                pages: m.pages.len(),
-                pinned_pages: m.header.pinned_pages,
-                clusters,
-                bytes_per_triangle: stored as f64 / triangles.max(1) as f64,
-            }
-        });
+        .and_then(|m| mesh_report(a, e, &m, stored, triangles));
     let texture = (detail && e.class == Class::Texture as u16)
         .then(head)
         .flatten()
@@ -154,5 +165,77 @@ pub(crate) fn entry(
         mesh,
         texture,
         raster: None,
+        warnings: Vec::new(),
     }
+}
+
+/// Per level: triangles, clusters and page bytes, from the decoded pages.
+fn mesh_report(
+    a: &Archive,
+    e: &Entry,
+    m: &MeshInfo,
+    stored: u64,
+    triangles: u64,
+) -> Option<MeshReport> {
+    let blobs = a.blobs(e);
+    let mut levels: Vec<LevelReport> = m
+        .levels
+        .iter()
+        .map(|l| LevelReport {
+            error: l.error,
+            triangles: 0,
+            clusters: l.clusters.count,
+            pages: 0,
+            stored: 0,
+            resident: 0,
+            stored_per_triangle: 0.0,
+            resident_per_triangle: 0.0,
+        })
+        .collect();
+    let (mut foliage_tris, mut foliage_clusters) = (0u64, 0u64);
+    let mut first = 0u32;
+    for p in &m.pages {
+        let b = blobs.get(p.blob as usize)?;
+        let level = m.levels.iter().position(|l| {
+            (l.clusters.first..l.clusters.first + l.clusters.count).contains(&first)
+        })?;
+        let mut raw = vec![0; b.raw_len as usize];
+        a.read(b, &mut raw).ok()?;
+        let mut page = vec![0; p.resident_len as usize];
+        decode_page(&raw, &mut page).ok()?;
+        let view = PageView::new(&page, &m.header).ok()?;
+        let r = &mut levels[level];
+        for i in 0..view.cluster_count() {
+            let c = view.cluster(i);
+            r.triangles += u64::from(c.tri_count);
+            let foliage = Section::ALPHA_TESTED | Section::DOUBLE_SIDED;
+            if m.sections.get(usize::from(c.section))?.flags & foliage != 0 {
+                foliage_tris += u64::from(c.tri_count);
+                foliage_clusters += 1;
+            }
+        }
+        r.pages += 1;
+        r.stored += u64::from(b.stored_len);
+        r.resident += u64::from(p.resident_len);
+        first += u32::from(p.cluster_count);
+    }
+    for l in &mut levels {
+        l.stored_per_triangle = l.stored as f64 / l.triangles.max(1) as f64;
+        l.resident_per_triangle = l.resident as f64 / l.triangles.max(1) as f64;
+    }
+    Some(MeshReport {
+        position_exponent: m.header.position_exponent,
+        clas_truncate_bits: m.header.clas_truncate_bits,
+        sections: m.sections.len(),
+        parts: m.parts.len(),
+        pages: m.pages.len(),
+        pinned_pages: m.header.pinned_pages,
+        clusters: m.pages.iter().map(|p| u32::from(p.cluster_count)).sum(),
+        merge_level: (m.header.merge_level != MeshHeader::NO_MERGE_LEVEL)
+            .then_some(m.header.merge_level),
+        bytes_per_triangle: stored as f64 / triangles.max(1) as f64,
+        foliage_cluster_fill: (foliage_clusters > 0)
+            .then(|| foliage_tris as f64 / foliage_clusters as f64),
+        levels,
+    })
 }

@@ -1178,6 +1178,7 @@ dependencies = [
  "bitflags 2.13.2",
  "blake3",
  "bytemuck",
+ "libloading",
  "log",
  "orr-shaders",
  "raw-window-handle",
@@ -1200,9 +1201,12 @@ name = "orr-output"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
+ "exr",
  "log",
+ "moxcms",
  "orr-scene",
  "orr-shaders",
+ "png 0.18.1",
  "raw-window-handle",
  "thiserror",
  "windows",

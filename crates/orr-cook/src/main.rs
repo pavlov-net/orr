@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use orr_cook::{CookOptions, Manifest, Outcome};
 use orr_pack::clip::ClipHeader;
 use orr_pack::instance::{InstancePageInfo, InstanceRecord};
+use orr_pack::mesh::{MeshHeader, MeshInfo};
 use orr_pack::raster::{RasterLayer, RasterSetInfo};
 use orr_pack::skeleton::{NO_PARENT, SkeletonInfo};
 use orr_pack::texture::TextureInfo;
@@ -14,7 +15,8 @@ const USAGE: &str = "usage:
   orr-cook build <manifest.toml> [--jobs N] [--force] [--cache DIR] [--cache-cap BYTES]
                  [--working-set BYTES] [--report r.json]
   orr-cook inspect <archive> [--class C] [--name N]
-  orr-cook verify <archive>";
+  orr-cook verify <archive>
+  orr-cook bench-decode <archive>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -22,6 +24,7 @@ fn main() -> ExitCode {
         Some("build") => build(&args[1..]),
         Some("inspect") => inspect(&args[1..]),
         Some("verify") => verify(&args[1..]),
+        Some("bench-decode") => bench_decode(&args[1..]),
         _ => Err(USAGE.into()),
     };
     match result {
@@ -161,6 +164,8 @@ fn inspect(args: &[String]) -> Result<bool> {
                 skeleton_line(&a, e, &mut out)?;
             } else if e.class == Class::Clip as u16 {
                 clip_line(&a, e, &mut out)?;
+            } else if e.class == Class::Mesh as u16 {
+                mesh_lines(&a, e, &mut out)?;
             }
         }
         if name.is_some() {
@@ -304,6 +309,101 @@ fn clip_line(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
         h.joint_count, h.frame_count, h.sample_rate, h.duration, h.skeleton
     )?;
     Ok(())
+}
+
+/// Grid, sections, parts and pages of a mesh, then per level its error, clusters and bytes.
+fn mesh_lines(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
+    let head = mount_blob(a, e)?;
+    let info = MeshInfo::parse(&head)?;
+    let h = info.header;
+    writeln!(
+        out,
+        "    grid 2^{} m, clas truncate {} bits, {} sections, {} parts, {} pages ({} pinned){}",
+        h.position_exponent,
+        h.clas_truncate_bits,
+        info.sections.len(),
+        info.parts.len(),
+        info.pages.len(),
+        h.pinned_pages,
+        if h.merge_level == MeshHeader::NO_MERGE_LEVEL {
+            String::new()
+        } else {
+            format!(", merged from level {}", h.merge_level)
+        }
+    )?;
+    let blobs = a.blobs(e);
+    for (i, l) in info.levels.iter().enumerate() {
+        let range = l.clusters.first..l.clusters.first + l.clusters.count;
+        let (mut first, mut stored, mut resident) = (0, 0u64, 0u64);
+        for p in &info.pages {
+            if range.contains(&first) {
+                stored += u64::from(blobs[p.blob as usize].stored_len);
+                resident += u64::from(p.resident_len);
+            }
+            first += u32::from(p.cluster_count);
+        }
+        writeln!(
+            out,
+            "    level {i}: error {} m, {} clusters, stored {stored} B, resident {resident} B",
+            l.error, l.clusters.count
+        )?;
+    }
+    Ok(())
+}
+
+/// Decode throughput per class on one thread: stored bytes to resident output, mesh pages
+/// through `decode_page`. Blobs already in memory are read first, so only decode is timed.
+fn bench_decode(args: &[String]) -> Result<bool> {
+    let [path] = args else {
+        return Err(USAGE.into());
+    };
+    let a = Archive::open(Path::new(path))?;
+    let mut by_class: std::collections::BTreeMap<u16, (u64, f64)> = Default::default();
+    let mut scratch = Vec::new();
+    let mut page = Vec::new();
+    for e in a.entries() {
+        let blobs = a.blobs(e);
+        if blobs.iter().any(|b| b.codec() == Codec::GDeflate) {
+            continue;
+        }
+        let mesh = (e.class == Class::Mesh as u16)
+            .then(|| MeshInfo::parse(&mount_blob(&a, e).ok()?).ok())
+            .flatten();
+        for (i, b) in blobs.iter().enumerate() {
+            let mut stored = vec![0; b.stored_len as usize];
+            a.read_stored(b, &mut stored)?;
+            scratch.resize(b.raw_len as usize, 0);
+            let resident = mesh
+                .as_ref()
+                .and_then(|m| m.pages.iter().find(|p| p.blob as usize == i))
+                .map(|p| p.resident_len as usize);
+            let start = std::time::Instant::now();
+            a.decode(b, None, &stored, &mut scratch)?;
+            let bytes = match resident {
+                Some(len) => {
+                    page.resize(len, 0);
+                    orr_pack::mesh::decode_page(&scratch, &mut page)?;
+                    len
+                }
+                None => scratch.len(),
+            };
+            let t = start.elapsed().as_secs_f64();
+            let c = by_class.entry(e.class).or_default();
+            c.0 += bytes as u64;
+            c.1 += t;
+        }
+    }
+    let mut out = io::stdout().lock();
+    for (class, (bytes, seconds)) in by_class {
+        writeln!(
+            out,
+            "{:<20} {:>14} B  {:>8.3} GB/s",
+            class_name(class),
+            bytes,
+            bytes as f64 / seconds.max(1e-9) / 1e9
+        )?;
+    }
+    Ok(true)
 }
 
 fn verify(args: &[String]) -> Result<bool> {

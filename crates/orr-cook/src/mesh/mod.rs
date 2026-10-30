@@ -1,22 +1,39 @@
-//! Level-0 mesh cook: grid quantisation, spatial clusters, resident pages.
+//! Mesh cook: welding, rigid parts, discrete levels, grid quantisation, spatial clusters and
+//! the stored pages.
+//!
+//! Per (part, section) the cook welds, reindexes and spatially sorts the triangles. Level 0
+//! is the source; level `i` simplifies level `i - 1` to an absolute error of
+//! `errors[i - 1]` (permissive simplification that keeps uv seams, with part and section
+//! borders locked), falling back to sloppy simplification when that keeps more than three
+//! quarters of its input. From `merge_level` on, the parts of a section simplify together
+//! into the body (part 0, [`Cluster::MERGED`]). Each piece of each level is cut into spatial
+//! clusters; alpha-tested clusters put opaque triangles first. Pages hold whole clusters of
+//! one level, coarsest level first, and the coarsest level's pages are pinned.
+
+mod lod;
+pub(crate) mod maps;
 
 use std::ops::Range;
 
 use glam::{Vec2, Vec3};
 use meshopt::VertexDataAdapter;
+use orr_pack::material::Material;
 use orr_pack::mesh::{
     Cluster, Level, MeshHeader, MeshInfo, PAGE_MAX, PageHeader, PageInfo, Part, PartLevel, Section,
     oct_encode,
 };
-use orr_pack::{Aabb, Span, Sphere};
+use orr_pack::{Aabb, Hash32, Span, Sphere};
 use serde::Deserialize;
 
+use crate::texture::Wrap;
 use crate::{Error, Result};
+use maps::{Displacement, Opacity};
 
-/// How meshes are clustered and quantised.
+/// How meshes are simplified, clustered and quantised.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MeshSettings {
+    pub lod: LodMode,
     /// Cluster vertex limit on solid sections.
     pub max_vertices: u16,
     /// Cluster vertex limit on alpha-tested or double-sided sections.
@@ -27,21 +44,69 @@ pub struct MeshSettings {
     /// step gets the smallest coarser step that does.
     pub position_step_log2: i8,
     /// Metres a skinned vertex may move from its rest position, for every cluster of a
-    /// skinned mesh (the bound GPU skinning builds cluster templates with); ignored without
-    /// a skin.
+    /// skinned mesh outside animated parts (the bound GPU skinning builds cluster templates
+    /// with); ignored without a skin.
     pub deformation_bound: f32,
+    /// First discrete level whose parts merge into the body; `None` keeps parts at every
+    /// level. Ignored on meshes without parts.
+    pub merge_level: Option<u8>,
 }
 
 impl Default for MeshSettings {
     fn default() -> Self {
         Self {
+            lod: LodMode::default(),
             max_vertices: 128,
             max_vertices_foliage: 256,
             max_triangles: 128,
             position_step_log2: -11,
             deformation_bound: 0.0,
+            merge_level: None,
         }
     }
+}
+
+/// Level of detail representation.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum LodMode {
+    /// Discrete levels: level 0 is the source and level `i` simplifies level `i - 1` to an
+    /// absolute error of `errors[i - 1]` metres. Empty gives one level.
+    Discrete { errors: Vec<f32> },
+}
+
+impl Default for LodMode {
+    fn default() -> Self {
+        Self::Discrete { errors: Vec::new() }
+    }
+}
+
+/// A mesh built by a library caller ([`crate::Source::Mesh`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MeshInput {
+    pub positions: Vec<Vec3>,
+    pub normals: Vec<Vec3>,
+    /// xyz and bitangent sign.
+    pub tangents: Option<Vec<glam::Vec4>>,
+    pub uvs: Option<Vec<Vec2>>,
+    pub indices: Vec<u32>,
+    /// Index ranges, one per material.
+    pub sections: Vec<Span>,
+    pub parts: Option<MeshParts>,
+}
+
+/// Rigid parts of a [`MeshInput`], as `parts_from_attribute` reads them from glTF.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MeshParts {
+    /// Per vertex: the part value.
+    pub values: Vec<u16>,
+    /// Declared value count; every value is below it.
+    pub count: u16,
+    /// One part per (value, section): part = value x sections + section.
+    pub by_section: bool,
+    /// Per vertex: the pivot of its part, alike for every vertex of a part within one grid
+    /// step. Without it pivots are the model origin.
+    pub pivots: Option<Vec<Vec3>>,
 }
 
 /// A mesh ready to cook: one vertex array, index ranges per section.
@@ -53,6 +118,9 @@ pub(crate) struct MeshData {
     pub indices: Vec<u32>,
     pub sections: Vec<SectionData>,
     pub skin: Option<Skin>,
+    pub parts: Option<PartData>,
+    /// The grid step may not be finer than `2^min_exponent` m (models joined crack-free).
+    pub min_exponent: Option<i8>,
 }
 
 /// Per vertex: four skeleton joints and their unorm8 weights, summing to 255.
@@ -61,25 +129,166 @@ pub(crate) struct Skin {
     pub weights: Vec<[u8; 4]>,
 }
 
+/// Rigid parts from a per-vertex value.
+pub(crate) struct PartData {
+    pub values: Vec<u16>,
+    pub count: u16,
+    pub by_section: bool,
+    pub pivots: Pivots,
+    /// `Part::joint` per value; the value itself without it.
+    pub joints: Option<Vec<u16>>,
+}
+
+pub(crate) enum Pivots {
+    PerValue(Vec<[f32; 3]>),
+    PerVertex(Vec<[f32; 3]>),
+    Origin,
+}
+
 pub(crate) struct SectionData {
     pub indices: Range<usize>,
     /// [`Section`] flags.
     pub flags: u8,
+    /// The material scatters below the surface (not thin-walled, no transmission).
+    pub subsurface: bool,
+    pub maps: MapSpec,
+}
+
+impl SectionData {
+    /// A section of `indices` drawn with material `m`.
+    pub(crate) fn new(indices: Range<usize>, m: &Material, maps: MapSpec) -> Self {
+        let mut flags = 0;
+        if m.alpha_mode == Material::MASK {
+            flags |= Section::ALPHA_TESTED;
+        }
+        if m.double_sided != 0 {
+            flags |= Section::DOUBLE_SIDED;
+        }
+        if m.emits() {
+            flags |= Section::EMISSIVE;
+        }
+        Self {
+            indices,
+            flags,
+            subsurface: m.subsurface_weight > 0.0
+                && m.thin_walled == 0
+                && m.transmission_weight == 0.0,
+            maps,
+        }
+    }
+}
+
+/// The cooked textures a section's clusters depend on.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MapSpec {
+    pub opacity: OpacitySpec,
+    pub displacement: Option<DisplacementSpec>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) enum OpacitySpec {
+    /// Not alpha-tested.
+    #[default]
+    None,
+    Constant(bool),
+    /// The cooked opacity texture of this unit.
+    Texture {
+        unit: String,
+        key: Hash32,
+        cutoff: f32,
+        wrap: [Wrap; 2],
+    },
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DisplacementSpec {
+    pub scale: f32,
+    pub offset: f32,
+    pub min: f32,
+    pub max: f32,
+    /// The cooked displacement texture's unit, key and edge modes.
+    pub texture: Option<(String, Hash32, [Wrap; 2])>,
+}
+
+impl MapSpec {
+    /// The texture units the spec reads.
+    pub(crate) fn units(&self) -> impl Iterator<Item = &str> {
+        let opacity = match &self.opacity {
+            OpacitySpec::Texture { unit, .. } => Some(unit.as_str()),
+            _ => None,
+        };
+        let displacement = self
+            .displacement
+            .as_ref()
+            .and_then(|d| d.texture.as_ref().map(|t| t.0.as_str()));
+        opacity.into_iter().chain(displacement)
+    }
+
+    /// Everything of the spec that shapes the cooked mesh: values and texture keys.
+    fn fingerprint(&self) -> String {
+        let opacity = match &self.opacity {
+            OpacitySpec::Texture {
+                key, cutoff, wrap, ..
+            } => format!("texture {key:?} {cutoff:?} {wrap:?}"),
+            o => format!("{o:?}"),
+        };
+        let displacement = self.displacement.as_ref().map(|d| {
+            (
+                [d.scale, d.offset, d.min, d.max],
+                d.texture.as_ref().map(|t| (t.1, t.2)),
+            )
+        });
+        format!("{opacity} {displacement:?}")
+    }
+}
+
+/// What a section's cluster build reads, resolved from its [`MapSpec`].
+#[derive(Default)]
+pub(crate) struct SectionMaps {
+    pub opacity: Option<Opacity>,
+    pub displacement: Option<Displacement>,
 }
 
 pub(crate) struct CookedMesh {
     pub info: MeshInfo,
     /// Stored page blobs, in [`MeshInfo::pages`] order.
     pub pages: Vec<Vec<u8>>,
+    pub warnings: Vec<String>,
 }
 
-pub(crate) fn cook(asset: &str, m: &MeshData, s: &MeshSettings) -> Result<CookedMesh> {
+pub(crate) fn cook(
+    asset: &str,
+    m: &MeshData,
+    s: &MeshSettings,
+    maps: &[SectionMaps],
+) -> Result<CookedMesh> {
     let fail = |message: String| Error::Mesh {
         asset: asset.into(),
         message,
     };
     check(m, s).map_err(fail)?;
-    let grid = Grid::new(&m.positions, s.position_step_log2).map_err(fail)?;
+    let mut warnings = Vec::new();
+    let w = lod::Welded::new(m);
+    let grid = Grid::new(&w.positions, s.position_step_log2, m.min_exponent).map_err(fail)?;
+    let parts = lod::Parts::new(&w, m, &grid).map_err(fail)?;
+    for (si, sec) in m.sections.iter().enumerate() {
+        if let Some(d) = &maps[si].displacement {
+            d.check_range()
+                .map_err(|e| fail(format!("section {si}: {e}")))?;
+            warnings.extend(lod::displacement_seams(&w, &grid, si, d));
+        }
+        if sec.subsurface {
+            let n = lod::border_edges(&w, &grid, si);
+            if n > 0 {
+                warnings.push(format!(
+                    "section {si}: subsurface material on {n} border edges; the subsurface walk leaks through them"
+                ));
+            }
+        }
+    }
+    let levels = lod::levels(&w, &grid, &parts, s, m.sections.len());
+
     let attributes = if m.tangents.is_some() {
         MeshHeader::TANGENT
     } else {
@@ -95,45 +304,124 @@ pub(crate) fn cook(asset: &str, m: &MeshData, s: &MeshSettings) -> Result<Cooked
         0
     };
     let stride = orr_pack::mesh::attr_stride(attributes) as usize;
-
     let adapter = VertexDataAdapter::new(bytemuck::cast_slice(&grid.floats), 12, 0)
         .expect("positions are 12-byte vertices");
-    let mut clusters = Vec::new();
+
+    // Clusters per level, part-major within a level so each part's clusters are contiguous.
+    let level_count = levels.len();
+    let part_count = parts.table.len();
     let mut max_vertices = 0;
-    for (si, sec) in m.sections.iter().enumerate() {
-        let foliage = sec.flags & (Section::ALPHA_TESTED | Section::DOUBLE_SIDED) != 0;
-        let maxv = if foliage {
-            s.max_vertices_foliage
-        } else {
-            s.max_vertices
-        };
-        max_vertices = max_vertices.max(maxv);
-        let maxt = usize::from(s.max_triangles);
-        let mut ml = meshopt::build_meshlets_spatial(
-            &m.indices[sec.indices.clone()],
-            &adapter,
-            usize::from(maxv),
-            maxt / 4,
-            maxt,
-            0.5,
-        );
-        for i in 0..ml.len() {
-            let r = ml.meshlets[i];
-            let (vo, vc) = (r.vertex_offset as usize, r.vertex_count as usize);
-            let (to, tc) = (r.triangle_offset as usize, r.triangle_count as usize);
-            meshopt::optimize_meshlet_level(
-                &mut ml.vertices[vo..vo + vc],
-                &mut ml.triangles[to..to + tc * 3],
-                3,
+    let mut by_level: Vec<Vec<ClusterData>> = Vec::with_capacity(level_count);
+    for (li, level) in levels.iter().enumerate() {
+        let parent_error = levels.get(li + 1).map_or(f32::INFINITY, |l| l.error);
+        let mut clusters = Vec::new();
+        for piece in &level.pieces {
+            let sec = &m.sections[usize::from(piece.section)];
+            let foliage = sec.flags & (Section::ALPHA_TESTED | Section::DOUBLE_SIDED) != 0;
+            let maxv = if foliage {
+                s.max_vertices_foliage
+            } else {
+                s.max_vertices
+            };
+            max_vertices = max_vertices.max(maxv);
+            let maxt = usize::from(s.max_triangles);
+            let mut ml = meshopt::build_meshlets_spatial(
+                &piece.indices,
+                &adapter,
+                usize::from(maxv),
+                maxt / 4,
+                maxt,
+                0.5,
             );
-            let bounds = meshopt::compute_meshlet_bounds(ml.get(i), &adapter);
-            let mut c = build_cluster(m, &grid, ml.get(i), &bounds, si as u8, sec.flags);
-            c.record.deformation_bound = deformation_bound;
-            clusters.push(c);
+            let section_maps = &maps[usize::from(piece.section)];
+            let animated = parts.animated[usize::from(piece.part)] && !piece.merged;
+            for i in 0..ml.len() {
+                let r = ml.meshlets[i];
+                let (vo, vc) = (r.vertex_offset as usize, r.vertex_count as usize);
+                let (to, tc) = (r.triangle_offset as usize, r.triangle_count as usize);
+                meshopt::optimize_meshlet_level(
+                    &mut ml.vertices[vo..vo + vc],
+                    &mut ml.triangles[to..to + tc * 3],
+                    3,
+                );
+                let verts = &ml.vertices[vo..vo + vc];
+                let tris = &mut ml.triangles[to..to + tc * 3];
+                let opaque = partition_opaque(&w, verts, tris, section_maps.opacity.as_ref());
+                let meshlet = meshopt::Meshlet {
+                    vertices: verts,
+                    triangles: tris,
+                };
+                let bounds = meshopt::compute_meshlet_bounds(meshlet, &adapter);
+                let mut c = build_cluster(&w, &grid, verts, tris, &bounds, sec.flags);
+                c.record.section = piece.section;
+                c.record.part = piece.part;
+                c.record.alpha_first = opaque;
+                c.record.self_error = level.error;
+                c.record.parent_error = parent_error;
+                if piece.merged {
+                    c.record.flags |= Cluster::MERGED;
+                }
+                if animated {
+                    c.record.flags |= Cluster::ANIMATED_PART;
+                } else {
+                    c.record.deformation_bound = deformation_bound;
+                }
+                if let Some(d) = &section_maps.displacement {
+                    let uv = |i: u8| w.uvs[verts[usize::from(i)] as usize];
+                    let [lo, hi] = d.bounds(tris.as_chunks::<3>().0.iter().map(|t| t.map(uv)));
+                    c.record.displacement_min = f16_down(lo);
+                    c.record.displacement_max = f16_up(hi);
+                }
+                clusters.push(c);
+            }
         }
+        by_level.push(clusters);
     }
 
-    let pages = paginate(&clusters, stride);
+    // Pages, coarsest level first; mesh cluster indices count in page order.
+    let mut pages = Vec::new();
+    let mut page_info = Vec::new();
+    let mut level_spans = vec![Span::default(); level_count];
+    let mut part_level_spans = vec![Span::default(); part_count * level_count];
+    let mut part_bounds = vec![Aabb::EMPTY; part_count];
+    let mut next = 0u32;
+    let mut pinned_pages = 0;
+    for li in (0..level_count).rev() {
+        let clusters = &by_level[li];
+        level_spans[li] = Span {
+            first: next,
+            count: clusters.len() as u32,
+        };
+        for p in 0..part_count {
+            part_level_spans[p * level_count + li].first = next;
+        }
+        for (i, c) in clusters.iter().enumerate() {
+            let span = &mut part_level_spans[usize::from(c.record.part) * level_count + li];
+            if span.count == 0 {
+                span.first = next + i as u32;
+            }
+            span.count += 1;
+            if c.record.flags & Cluster::MERGED == 0 {
+                c.extend(&mut part_bounds[usize::from(c.record.part)], &grid);
+            }
+        }
+        for (bytes, n) in paginate(clusters, stride) {
+            let stored = orr_pack::mesh::encode_page(&bytes)?;
+            page_info.push(PageInfo {
+                blob: pages.len() as u32 + 1,
+                resident_len: bytes.len() as u32,
+                cluster_count: n as u16,
+                _pad: 0,
+                deps: Span::default(),
+            });
+            pages.push(stored);
+        }
+        if li + 1 == level_count {
+            pinned_pages = pages.len() as u32;
+        }
+        next += clusters.len() as u32;
+    }
+
     let mut bounds = Aabb::EMPTY;
     grid.floats.iter().for_each(|&p| bounds.extend(p));
     let sphere = meshopt::compute_sphere_bounds(
@@ -145,10 +433,10 @@ pub(crate) fn cook(asset: &str, m: &MeshData, s: &MeshSettings) -> Result<Cooked
         },
         None,
     );
-    let all = Span {
-        first: 0,
-        count: clusters.len() as u32,
-    };
+    let merge_level = levels
+        .iter()
+        .position(|l| l.pieces.iter().any(|p| p.merged))
+        .map_or(MeshHeader::NO_MERGE_LEVEL, |l| l as u8);
     let info = MeshInfo {
         header: MeshHeader {
             bounds,
@@ -162,10 +450,9 @@ pub(crate) fn cook(asset: &str, m: &MeshData, s: &MeshSettings) -> Result<Cooked
             attributes,
             max_vertices,
             max_triangles: s.max_triangles,
-            merge_level: MeshHeader::NO_MERGE_LEVEL,
+            merge_level,
             merge_error: f32::INFINITY,
-            // A single level is the coarsest, so every page is pinned.
-            pinned_pages: pages.len() as u32,
+            pinned_pages,
             ..bytemuck::Zeroable::zeroed()
         },
         sections: m
@@ -178,33 +465,31 @@ pub(crate) fn cook(asset: &str, m: &MeshData, s: &MeshSettings) -> Result<Cooked
                 _pad: 0,
             })
             .collect(),
-        parts: vec![Part {
-            bounds,
-            pivot: [0.0; 3],
-            joint: 0,
-            _pad: 0,
-        }],
-        part_levels: vec![PartLevel { clusters: all }],
-        levels: vec![Level {
-            error: 0.0,
-            clusters: all,
-        }],
-        roots: Vec::new(),
-        pages: pages
+        parts: parts
+            .table
             .iter()
-            .enumerate()
-            .map(|(i, (bytes, n))| PageInfo {
-                blob: i as u32 + 1,
-                resident_len: bytes.len() as u32,
-                cluster_count: *n as u16,
-                _pad: 0,
-                deps: Span::default(),
+            .zip(part_bounds)
+            .map(|(p, bounds)| Part { bounds, ..*p })
+            .collect(),
+        part_levels: part_level_spans
+            .into_iter()
+            .map(|clusters| PartLevel { clusters })
+            .collect(),
+        levels: levels
+            .iter()
+            .zip(level_spans)
+            .map(|(l, clusters)| Level {
+                error: l.error,
+                clusters,
             })
             .collect(),
+        roots: Vec::new(),
+        pages: page_info,
     };
     Ok(CookedMesh {
         info,
-        pages: pages.into_iter().map(|(p, _)| p).collect(),
+        pages,
+        warnings,
     })
 }
 
@@ -221,12 +506,32 @@ fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
             return Err(format!("cluster vertex limit {v} is outside 3..=256"));
         }
     }
+    let LodMode::Discrete { errors } = &s.lod;
+    if errors.len() > 254 {
+        return Err(format!("{} levels; at most 255", errors.len() + 1));
+    }
+    if errors.iter().any(|e| !(e.is_finite() && *e > 0.0)) || !errors.is_sorted() {
+        return Err(format!(
+            "level errors {errors:?} are not positive, finite and ascending"
+        ));
+    }
+    if let Some(l) = s.merge_level
+        && (l == 0 || usize::from(l) > errors.len())
+    {
+        return Err(format!(
+            "merge_level {l} is not a level after the first of {}",
+            errors.len() + 1
+        ));
+    }
     if m.normals.len() != n
         || m.uvs.len() != n
         || m.tangents.as_ref().is_some_and(|t| t.len() != n)
         || m.skin
             .as_ref()
             .is_some_and(|k| k.joints.len() != n || k.weights.len() != n)
+        || m.parts.as_ref().is_some_and(|p| {
+            p.values.len() != n || matches!(&p.pivots, Pivots::PerVertex(v) if v.len() != n)
+        })
     {
         return Err("vertex attribute counts differ".into());
     }
@@ -259,36 +564,92 @@ fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
     Ok(())
 }
 
+/// Stable partition of a cluster's triangles: opaque ones first. Returns their count.
+fn partition_opaque(
+    w: &lod::Welded,
+    verts: &[u32],
+    tris: &mut [u8],
+    opacity: Option<&Opacity>,
+) -> u8 {
+    let n = tris.len() / 3;
+    let Some(opacity) = opacity else {
+        return n as u8;
+    };
+    let (mut opaque, mut tested) = (Vec::with_capacity(n * 3), Vec::with_capacity(n * 3));
+    for t in tris.as_chunks::<3>().0 {
+        let uv = t.map(|i| w.uvs[verts[usize::from(i)] as usize]);
+        if opacity.opaque(uv) {
+            opaque.extend_from_slice(t);
+        } else {
+            tested.extend_from_slice(t);
+        }
+    }
+    let first = opaque.len() / 3;
+    opaque.extend_from_slice(&tested);
+    tris.copy_from_slice(&opaque);
+    first as u8
+}
+
 /// f16 bits of the smallest half at or above `v`.
 fn f16_up(v: f32) -> u16 {
     let h = half::f16::from_f32(v);
     if h.to_f32() < v {
-        h.to_bits() + 1
+        f16_next(h, true)
     } else {
         h.to_bits()
     }
 }
 
+/// f16 bits of the largest half at or below `v`.
+fn f16_down(v: f32) -> u16 {
+    let h = half::f16::from_f32(v);
+    if h.to_f32() > v {
+        f16_next(h, false)
+    } else {
+        h.to_bits()
+    }
+}
+
+/// Bits of the neighbouring finite half above or below `h`.
+fn f16_next(h: half::f16, up: bool) -> u16 {
+    let b = h.to_bits();
+    if h.to_f32() == 0.0 {
+        return if up { 0x0001 } else { 0x8001 };
+    }
+    if (b & 0x8000 == 0) == up {
+        b + 1
+    } else {
+        b - 1
+    }
+}
+
+/// The grid exponent `k` of positions: `max(step_log2, ceil(log2(extent / 65535)))`,
+/// computed without log2 rounding.
+pub(crate) fn grid_exponent(positions: &[[f32; 3]], step_log2: i8) -> i8 {
+    let mut b = Aabb::EMPTY;
+    positions.iter().for_each(|&p| b.extend(p));
+    let extent = (0..3)
+        .map(|a| f64::from(b.max[a]) - f64::from(b.min[a]))
+        .fold(0.0, f64::max);
+    let mut k = i32::from(step_log2);
+    while extent > 65535.0 * 2f64.powi(k) {
+        k += 1;
+    }
+    k as i8
+}
+
 /// The mesh grid: every position as an integer multiple of `2^k` metres.
-struct Grid {
-    k: i8,
+pub(crate) struct Grid {
+    pub k: i8,
     truncate_bits: u8,
-    cells: Vec<[i32; 3]>,
-    floats: Vec<[f32; 3]>,
+    pub cells: Vec<[i32; 3]>,
+    pub floats: Vec<[f32; 3]>,
 }
 
 impl Grid {
-    fn new(positions: &[[f32; 3]], step_log2: i8) -> Result<Self, String> {
-        let mut b = Aabb::EMPTY;
-        positions.iter().for_each(|&p| b.extend(p));
-        let extent = (0..3)
-            .map(|a| f64::from(b.max[a]) - f64::from(b.min[a]))
-            .fold(0.0, f64::max);
-        // k = max(step, ceil(log2(extent / 65535))), without log2 rounding.
-        let mut k = i32::from(step_log2);
-        while extent > 65535.0 * 2f64.powi(k) {
-            k += 1;
-        }
+    fn new(positions: &[[f32; 3]], step_log2: i8, min: Option<i8>) -> Result<Self, String> {
+        let own = grid_exponent(positions, step_log2);
+        let k = i32::from(own.max(min.unwrap_or(i8::MIN)));
         let step = 2f64.powi(k);
         let mut max_abs = 0;
         let mut cells = Vec::with_capacity(positions.len());
@@ -303,19 +664,28 @@ impl Grid {
             max_abs = g.iter().fold(max_abs, |m, v| m.max(v.unsigned_abs()));
             cells.push(g);
         }
-        let k8 = k as i8;
         let floats = cells
             .iter()
             .map(|g| g.map(|v| (f64::from(v) * step) as f32))
             .collect();
+        let mut b = Aabb::EMPTY;
+        positions.iter().for_each(|&p| b.extend(p));
         let m = meshopt::compute_position_exponent(b.min, b.max, step_log2.into(), 16);
-        assert!(m == k || m == k + 1, "grid exponent {k}, meshoptimizer {m}");
+        let own = i32::from(own);
+        assert!(
+            m == own || m == own + 1,
+            "grid exponent {own}, meshoptimizer {m}"
+        );
         Ok(Self {
-            k: k8,
+            k: k as i8,
             truncate_bits: (24 - (32 - max_abs.leading_zeros())) as u8,
             cells,
             floats,
         })
+    }
+
+    pub(crate) fn step(&self) -> f64 {
+        2f64.powi(i32::from(self.k))
     }
 }
 
@@ -330,17 +700,27 @@ impl ClusterData {
     fn slots(&self) -> usize {
         self.local.len().next_multiple_of(2)
     }
+
+    /// Extends `b` by the cluster's rest AABB.
+    fn extend(&self, b: &mut Aabb, grid: &Grid) {
+        let corner = |l: [u16; 3]| {
+            [0, 1, 2].map(|a| {
+                ((f64::from(self.record.anchor[a]) + f64::from(l[a])) * grid.step()) as f32
+            })
+        };
+        b.extend(corner([0; 3]));
+        b.extend(corner(self.record.local_max));
+    }
 }
 
 fn build_cluster(
-    m: &MeshData,
+    w: &lod::Welded,
     grid: &Grid,
-    ml: meshopt::Meshlet<'_>,
+    verts: &[u32],
+    tris: &[u8],
     bounds: &meshopt::Bounds,
-    section: u8,
     flags: u8,
 ) -> ClusterData {
-    let verts = ml.vertices;
     let anchor = [0, 1, 2].map(|a| {
         verts
             .iter()
@@ -360,7 +740,7 @@ fn build_cluster(
     let (uv_lo, uv_hi) = verts
         .iter()
         .fold((Vec2::INFINITY, Vec2::NEG_INFINITY), |(lo, hi), &v| {
-            let uv = Vec2::from(m.uvs[v as usize]);
+            let uv = Vec2::from(w.uvs[v as usize]);
             (lo.min(uv), hi.max(uv))
         });
     let (uv_lo, uv_hi) = (uv_lo.to_array(), uv_hi.to_array());
@@ -376,22 +756,21 @@ fn build_cluster(
     for &v in verts {
         let v = v as usize;
         attrs.push(oct_encode(
-            Vec3::from(m.normals[v]).normalize_or(Vec3::Z).to_array(),
+            Vec3::from(w.normals[v]).normalize_or(Vec3::Z).to_array(),
         ));
-        if let Some(t) = &m.tangents {
-            let [x, y, z, w] = t[v];
+        if let Some(t) = &w.tangents {
+            let [x, y, z, s] = t[v];
             let e = oct_encode(Vec3::new(x, y, z).normalize_or(Vec3::X).to_array());
-            attrs.push(e & !(1 << 16) | u32::from(w < 0.0) << 16);
+            attrs.push(e & !(1 << 16) | u32::from(s < 0.0) << 16);
         }
-        let uv = m.uvs[v];
+        let uv = w.uvs[v];
         attrs.push(unorm(uv[0], uv_lo[0], uv_scale[0]) | unorm(uv[1], uv_lo[1], uv_scale[1]) << 16);
-        if let Some(k) = &m.skin {
+        if let Some(k) = &w.skin {
             attrs.push(u32::from_le_bytes(k.joints[v]));
             attrs.push(u32::from_le_bytes(k.weights[v]));
         }
     }
 
-    let tris = ml.triangles.to_vec();
     let area: f64 = tris
         .as_chunks::<3>()
         .0
@@ -408,9 +787,7 @@ fn build_cluster(
     };
     let record = Cluster {
         self_sphere: sphere,
-        self_error: 0.0,
         parent_sphere: sphere,
-        parent_error: f32::INFINITY,
         cull_sphere: sphere,
         cone: [
             bounds.cone_axis_s8[0],
@@ -421,12 +798,7 @@ fn build_cluster(
         anchor,
         vertex_count: verts.len() as u16,
         tri_count,
-        alpha_first: if flags & Section::ALPHA_TESTED != 0 {
-            0
-        } else {
-            tri_count
-        },
-        section,
+        alpha_first: tri_count,
         kind: Cluster::TRIANGLES,
         flags: if flags & Section::EMISSIVE != 0 {
             Cluster::EMISSIVE
@@ -444,12 +816,12 @@ fn build_cluster(
         record,
         local,
         attrs,
-        tris,
+        tris: tris.to_vec(),
     }
 }
 
-/// Packs clusters in order into pages of at most [`PAGE_MAX`] bytes; returns each page and
-/// its cluster count.
+/// Packs clusters in order into resident pages of at most [`PAGE_MAX`] bytes; returns each
+/// page and its cluster count.
 fn paginate(clusters: &[ClusterData], stride: usize) -> Vec<(Vec<u8>, usize)> {
     let cost = |c: &ClusterData| {
         size_of::<Cluster>() + c.slots() * (6 + stride) + (c.tris.len()).next_multiple_of(4)
@@ -511,8 +883,9 @@ fn write_page(clusters: &[ClusterData], stride: usize) -> Vec<u8> {
 }
 
 impl MeshData {
-    /// Hash of everything the mesh cook reads.
-    pub(crate) fn hash(&self) -> orr_pack::Hash32 {
+    /// Hash of everything the mesh cook reads but its settings and the cooked textures,
+    /// which enter through their keys.
+    pub(crate) fn hash(&self) -> Hash32 {
         let mut h = blake3::Hasher::new();
         let mut part = |b: &[u8]| {
             h.update(&(b.len() as u64).to_le_bytes());
@@ -526,13 +899,32 @@ impl MeshData {
         for s in &self.sections {
             part(&(s.indices.start as u64).to_le_bytes());
             part(&(s.indices.end as u64).to_le_bytes());
-            part(&[s.flags]);
+            part(&[s.flags, s.subsurface.into()]);
+            part(s.maps.fingerprint().as_bytes());
         }
         if let Some(k) = &self.skin {
             part(bytemuck::cast_slice(&k.joints));
             part(bytemuck::cast_slice(&k.weights));
         }
-        orr_pack::Hash32(*h.finalize().as_bytes())
+        if let Some(p) = &self.parts {
+            part(bytemuck::cast_slice(&p.values));
+            part(&p.count.to_le_bytes());
+            part(&[p.by_section.into()]);
+            match &p.pivots {
+                Pivots::PerValue(v) => {
+                    part(b"value");
+                    part(bytemuck::cast_slice(v));
+                }
+                Pivots::PerVertex(v) => {
+                    part(b"vertex");
+                    part(bytemuck::cast_slice(v));
+                }
+                Pivots::Origin => part(b"origin"),
+            }
+            part(p.joints.as_deref().map_or(&[], bytemuck::cast_slice));
+        }
+        part(format!("{:?}", self.min_exponent).as_bytes());
+        Hash32(*h.finalize().as_bytes())
     }
 
     pub(crate) fn triangles(&self) -> u64 {

@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 blake3.workspace = true
 bytemuck.workspace = true
+meshopt = "=0.7.0"
 thiserror.workspace = true
 zstd.workspace = true
 

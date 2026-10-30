@@ -23,9 +23,9 @@
 //! ] }
 //! ```
 //!
-//! Each asset names exactly one source: `gltf`, `texture`, `instances`, `raster` or `user`,
-//! with the fields of the matching [`Source`] variant. Settings fields left out take their
-//! defaults.
+//! Each asset names exactly one source: `gltf`, `texture`, `instances`, `raster`, `material`
+//! or `user`, with the fields of the matching [`Source`] variant (`Source::Mesh` is for
+//! library callers). Settings fields left out take their defaults.
 
 use std::path::{Path, PathBuf};
 
@@ -66,7 +66,10 @@ impl Manifest {
                             }
                         }
                     }
-                    Source::Instances(_) | Source::User { .. } => {}
+                    Source::Instances(_)
+                    | Source::User { .. }
+                    | Source::Mesh { .. }
+                    | Source::Material(_) => {}
                 }
             }
         }

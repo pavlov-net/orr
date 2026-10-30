@@ -9,7 +9,12 @@
 //!   Factors are folded into these texels and the material's factors set to 1.
 //! - Roughness takes the normal map's variance per mip (Toksvig), so a material with a normal
 //!   map gets a roughness texture even when its roughness is constant.
-//! - Emission: BC7 sRGB.
+//! - Emission and subsurface colour: BC7 sRGB.
+//! - Specular weight (the specular texture's alpha), coat and transmission weights (red):
+//!   BC4 each. Coat and transmission factors are folded into their texels and set to 1;
+//!   the specular weight texture multiplies `specular_weight`.
+//! - Displacement: R16 unorm from red, never collapsed; displacement is
+//!   `displacement_scale x texel + displacement_offset`.
 //! - An image whose texels all lie within 1/255 of one value collapses into the material's
 //!   factor; a constant normal or occlusion image, which has no factor, cooks at 4x4.
 //!
@@ -25,7 +30,9 @@ use serde::Deserialize;
 
 use super::load::{self, Source};
 use super::mips::{MipSpec, Toksvig};
-use super::{Built, Encoding, Img, MipFilter, Plan, Primaries, Quality, Wrap, srgb_to_linear};
+use super::{
+    Built, DataFormat, Encoding, Img, MipFilter, Plan, Primaries, Quality, Wrap, srgb_to_linear,
+};
 use crate::key::Key;
 use crate::{Error, Result};
 
@@ -69,6 +76,35 @@ pub(crate) struct MaterialTextures {
     /// With its strength.
     pub occlusion: Option<(TexRef, f32)>,
     pub emissive: Option<TexRef>,
+    /// Specular weight in A.
+    pub specular: Option<TexRef>,
+    /// Coat weight in R.
+    pub coat: Option<TexRef>,
+    /// Transmission weight in R.
+    pub transmission: Option<TexRef>,
+    pub subsurface_color: Option<TexRef>,
+    /// Displacement in R.
+    pub displacement: Option<TexRef>,
+}
+
+impl MaterialTextures {
+    /// Every image reference.
+    pub(crate) fn refs(&self) -> impl Iterator<Item = &TexRef> {
+        [
+            self.base_color.as_ref(),
+            self.metal_rough.as_ref(),
+            self.normal.as_ref().map(|n| &n.0),
+            self.occlusion.as_ref().map(|o| &o.0),
+            self.emissive.as_ref(),
+            self.specular.as_ref(),
+            self.coat.as_ref(),
+            self.transmission.as_ref(),
+            self.subsurface_color.as_ref(),
+            self.displacement.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+    }
 }
 
 pub(crate) struct ImageFile {
@@ -198,6 +234,15 @@ pub(crate) struct TextureJob {
     filter: MipFilter,
 }
 
+fn bind(m: &mut Material, s: usize, id: AssetId, channel: u8, r: &TexRef) {
+    m.textures[s] = TextureBinding {
+        texture: id,
+        channels: channel,
+        uv_set: r.uv_set,
+        _pad: [0; 2],
+    };
+}
+
 impl<'a> Packer<'a> {
     pub(crate) fn new(
         asset: &'a str,
@@ -231,15 +276,6 @@ impl<'a> Packer<'a> {
         m: &mut Material,
         t: &MaterialTextures,
     ) -> Result<()> {
-        let bind = |m: &mut Material, s: usize, id: AssetId, channel: u8, r: &TexRef| {
-            m.textures[s] = TextureBinding {
-                texture: id,
-                channels: channel,
-                uv_set: r.uv_set,
-                _pad: [0; 2],
-            };
-        };
-
         if let Some(r) = &t.base_color {
             let srgb = self.image(r.image).srgb;
             let rgb: Vec<Option<f32>> = (0..3).map(|c| self.constant(r.image, c)).collect();
@@ -458,38 +494,146 @@ impl<'a> Packer<'a> {
         }
 
         if let Some(r) = &t.emissive {
-            let srgb = self.image(r.image).srgb;
-            let rgb: Vec<Option<f32>> = (0..3).map(|c| self.constant(r.image, c)).collect();
-            if rgb.iter().all(Option::is_some) {
-                for (c, v) in rgb.into_iter().enumerate() {
-                    let v = v.expect("constant");
-                    m.emission_color[c] *= if srgb { srgb_to_linear(v) } else { v };
+            self.colour(suffix, m, r, "emission", slot::EMISSION, |m| {
+                &mut m.emission_color
+            })?;
+        }
+        if let Some(r) = &t.subsurface_color {
+            self.colour(
+                suffix,
+                m,
+                r,
+                "subsurface_color",
+                slot::SUBSURFACE_COLOR,
+                |m| &mut m.subsurface_color,
+            )?;
+        }
+        if let Some(r) = &t.specular {
+            match self.constant(r.image, 3) {
+                Some(v) => m.specular_weight *= v,
+                None => {
+                    let id = self.single(suffix, r, 3, 1.0, "specular_weight")?;
+                    bind(m, slot::SPECULAR_WEIGHT, id, 0, r);
                 }
-            } else {
-                let image = |channel| Channel::Image {
-                    image: r.image,
-                    channel,
-                    srgb,
-                    a: 0.0,
-                    b: 1.0,
-                };
-                let id = self.make(
-                    suffix,
-                    Pack {
-                        role: "emission",
-                        encoding: Encoding::Bc7Srgb,
-                        channels: vec![image(0), image(1), image(2), Channel::Constant(1.0)],
-                        refs: vec![*r],
-                        coverage: None,
-                        toksvig: None,
-                        normal: false,
-                        shrink: false,
-                    },
-                )?;
-                bind(m, slot::EMISSION, id, 0, r);
             }
         }
+        type Weight = fn(&mut Material) -> &mut f32;
+        let weights: [(_, _, _, Weight); 2] = [
+            (&t.coat, "coat", slot::COAT, |m| &mut m.coat_weight),
+            (&t.transmission, "transmission", slot::TRANSMISSION, |m| {
+                &mut m.transmission_weight
+            }),
+        ];
+        for (r, role, s, weight) in weights {
+            let Some(r) = r else { continue };
+            let factor = *weight(m);
+            *weight(m) = match self.constant(r.image, 0) {
+                Some(v) => factor * v,
+                None => {
+                    let id = self.single(suffix, r, 0, factor, role)?;
+                    bind(m, s, id, 0, r);
+                    1.0
+                }
+            };
+        }
+        if let Some(r) = &t.displacement {
+            let id = self.make(
+                suffix,
+                Pack {
+                    role: "displacement",
+                    encoding: Encoding::Raw(DataFormat::R16),
+                    channels: vec![Channel::Image {
+                        image: r.image,
+                        channel: 0,
+                        srgb: false,
+                        a: 0.0,
+                        b: 1.0,
+                    }],
+                    refs: vec![*r],
+                    coverage: None,
+                    toksvig: None,
+                    normal: false,
+                    shrink: self.constant(r.image, 0).is_some(),
+                },
+            )?;
+            bind(m, slot::DISPLACEMENT, id, 0, r);
+        }
         Ok(())
+    }
+
+    /// A colour texture whose value multiplies the material colour of slot `s`; a constant
+    /// image folds into that colour.
+    fn colour(
+        &mut self,
+        suffix: &str,
+        m: &mut Material,
+        r: &TexRef,
+        role: &'static str,
+        s: usize,
+        colour: fn(&mut Material) -> &mut [f32; 3],
+    ) -> Result<()> {
+        let srgb = self.image(r.image).srgb;
+        let rgb: Vec<Option<f32>> = (0..3).map(|c| self.constant(r.image, c)).collect();
+        if rgb.iter().all(Option::is_some) {
+            let target = colour(m);
+            for (c, v) in rgb.into_iter().enumerate() {
+                let v = v.expect("constant");
+                target[c] *= if srgb { srgb_to_linear(v) } else { v };
+            }
+            return Ok(());
+        }
+        let image = |channel| Channel::Image {
+            image: r.image,
+            channel,
+            srgb,
+            a: 0.0,
+            b: 1.0,
+        };
+        let id = self.make(
+            suffix,
+            Pack {
+                role,
+                encoding: Encoding::Bc7Srgb,
+                channels: vec![image(0), image(1), image(2), Channel::Constant(1.0)],
+                refs: vec![*r],
+                coverage: None,
+                toksvig: None,
+                normal: false,
+                shrink: false,
+            },
+        )?;
+        bind(m, s, id, 0, r);
+        Ok(())
+    }
+
+    /// A BC4 texture of one source channel times `scale`.
+    fn single(
+        &mut self,
+        suffix: &str,
+        r: &TexRef,
+        channel: usize,
+        scale: f32,
+        role: &'static str,
+    ) -> Result<AssetId> {
+        self.make(
+            suffix,
+            Pack {
+                role,
+                encoding: Encoding::Bc4,
+                channels: vec![Channel::Image {
+                    image: r.image,
+                    channel,
+                    srgb: false,
+                    a: 0.0,
+                    b: scale,
+                }],
+                refs: vec![*r],
+                coverage: None,
+                toksvig: None,
+                normal: false,
+                shrink: false,
+            },
+        )
     }
 
     /// Plans one pack, or returns the id of an identical one planned before.
