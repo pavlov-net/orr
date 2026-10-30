@@ -141,9 +141,8 @@ struct Lights
 // Radiance of one pass's three groups arriving at distance t0 along unit `dir` from a LUT
 // eye at altitude h0, from the medium over [t0, t1] and, with `ground`, the ground at t1.
 // Multiple scattering, and the sky's light on the ground, are scaled by `multiple`.
-// `transmittance` returns the transmittance over [t0, t1].
 float3 march(AtmosphereGpu* a, uint pass, float h0, float3 dir, float t0, float t1, bool ground,
-             uint steps, Lights lights, float multiple, out float3 transmittance)
+             uint steps, Lights lights, float multiple)
 {
     AtmosphereGroups g = a.groups[pass];
     float3 up = a.up.xyz;
@@ -158,7 +157,7 @@ float3 march(AtmosphereGpu* a, uint pass, float h0, float3 dir, float t0, float 
                           fog ? fog_phase(a.fog_diameter, c) : 0.0);
     }
     float3 radiance = float3(0.0);
-    transmittance = float3(1.0);
+    float3 transmittance = float3(1.0);
     for (uint i = 0; i < steps; ++i)
     {
         float2 s = step_at(t0, t1, i, steps);
@@ -292,7 +291,7 @@ void multiple_scattering(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
         GroupMemoryBarrierWithGroupSync();
     }
     if (lane == 0)
-        lut[uint3(group.xy, a.group_passes)] = float4(rgb, 1.0);
+        lut[uint3(group.xy, a.group_passes)] = float4(rgb / a.solar_colour.xyz, 1.0);
 }
 
 static groupshared float3 irradiance[64];
@@ -319,9 +318,8 @@ void ground_irradiance(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
         for (uint k = lane; k < DIRECTIONS; k += 64)
         {
             float3 dir = fibonacci(k, true, x, y, up);
-            float3 t;
             float3 l = march(a, p, 0.0, dir, 0.0, atmosphere_distance_to_top(a, 0.0, dot(dir, up)),
-                             false, GROUND_STEPS, lights, 1.0, t);
+                             false, GROUND_STEPS, lights, 1.0);
             e += l * dot(dir, up);
         }
         irradiance[lane] = e;
@@ -424,9 +422,8 @@ void sky_view(uint3 id: SV_DispatchThreadID)
         AtmosphereGroups g = a.groups[p];
         for (uint l = 0; l < lights.count; ++l)
             lights.groups[l] = light_groups(g, colour[l]);
-        float3 t;
         rgb += to_rec2020(g, march(a, p, h0, dir, start, end, ground, SKY_VIEW_STEPS, lights,
-                                   a.multiple_scattering_scale, t));
+                                   a.multiple_scattering_scale));
     }
     root.output.get<RWTexture2D<float4>>()[id.xy] = float4(rgb, 1.0);
 }
