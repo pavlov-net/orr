@@ -1678,6 +1678,7 @@ version = "0.0.1"
 dependencies = [
  "glam",
  "gpu_suite",
+ "log",
  "orr",
  "orr_gpu",
  "orr_scene",

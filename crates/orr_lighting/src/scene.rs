@@ -2,7 +2,6 @@
 
 use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, GpuPtr, Hazards, MemoryKind, Stages,
-    TimelinePoint,
 };
 use orr_scene::{SceneDesc, SceneRoot, SkyStats};
 
@@ -315,11 +314,5 @@ impl SceneLighting {
     /// Per directional light, by LightId, its state for the last recorded frame.
     pub fn directional_states(&self) -> GpuPtr<DirectionalState> {
         self.states.gpu
-    }
-
-    /// Frees the heap slots of the baked map once `after` has completed; the rest is freed
-    /// when dropped.
-    pub fn free(self, device: &Device, after: TimelinePoint) {
-        self.environment.free(device, after);
     }
 }
