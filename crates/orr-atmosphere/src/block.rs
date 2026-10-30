@@ -4,7 +4,7 @@
 use glam::{DVec3, Vec3};
 use orr::WorldPos;
 
-use crate::colour::{REC709_TO_REC2020, REC2020_LUMINANCE, mul};
+use crate::colour::{REC709_TO_REC2020, luminance, mul};
 use crate::shaders::types::{AtmosphereGpu, AtmosphereGroups};
 use crate::spectrum::{GROUPS, RGB, SOLAR_COLOUR, SPECTRAL_GROUPS, rgb_at};
 use crate::{Atmosphere, DOBSON_UNIT};
@@ -59,7 +59,7 @@ fn zenith_transmittance(a: &Atmosphere) -> [f64; 3] {
 /// [`NIGHT_ZENITH`] at the ground under the Earth defaults.
 fn night_zenith() -> f64 {
     let t = zenith_transmittance(&Atmosphere::earth(DVec3::ZERO, Vec3::Y));
-    NIGHT_ZENITH / (0..3).map(|c| REC2020_LUMINANCE[c] * t[c]).sum::<f64>()
+    NIGHT_ZENITH / luminance(t)
 }
 
 /// Each group's coefficients, three groups per pass.

@@ -4,7 +4,7 @@
 
 use atmosphere_suite::{Probe, Rig, dir, probe, solar_rec2020};
 use glam::{DVec3, Vec3};
-use orr_atmosphere::colour::REC2020_LUMINANCE;
+use orr_atmosphere::colour::luminance;
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference};
 use orr_atmosphere::spectrum::{SOLAR_ILLUMINANCE, SPECTRAL_GROUPS};
 use orr_atmosphere::{Atmosphere, HeightFog, SKY_VIEW_SIZE, TRANSMITTANCE_SIZE};
@@ -30,10 +30,6 @@ fn foggy() -> Atmosphere {
         }),
         ..earth()
     }
-}
-
-fn luminance(c: [f64; 3]) -> f64 {
-    (0..3).map(|i| REC2020_LUMINANCE[i] * c[i]).sum()
 }
 
 #[test]

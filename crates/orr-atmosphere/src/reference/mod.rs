@@ -65,8 +65,9 @@ pub enum Channels {
 pub struct Light {
     /// Unit direction toward the light.
     pub direction: DVec3,
-    /// Linear Rec.2020 colour relative to the solar colour; (1, 1, 1) is sunlight.
-    pub colour: [f64; 3],
+    /// The light's spectrum over the solar spectrum at a wavelength in nm, up to a constant.
+    /// A group or band takes it at its centre wavelength.
+    pub tint: fn(f64) -> f64,
 }
 
 impl Light {
@@ -74,7 +75,7 @@ impl Light {
     pub fn solar(direction: DVec3) -> Self {
         Light {
             direction: direction.normalize(),
-            colour: [1.0; 3],
+            tint: |_| 1.0,
         }
     }
 }
@@ -325,7 +326,7 @@ impl Run<'_> {
     fn tint(&self, light: &Light) -> Vec<f64> {
         self.chans
             .iter()
-            .map(|ch| rgb_at(ch.wavelength, light.colour))
+            .map(|ch| (light.tint)(ch.wavelength))
             .collect()
     }
 

@@ -8,7 +8,7 @@ use atmosphere_suite::{Probe, Rig, SUN, dir, probe, sky_radiance};
 use glam::{DVec3, Vec3};
 use orr::abi::TextureIndex;
 use orr::{DirectionalLight, DiscProfile, LightId};
-use orr_atmosphere::colour::{REC2020_LUMINANCE, REC2020_TO_REC709, mul};
+use orr_atmosphere::colour::{REC2020_TO_REC709, luminance, mul};
 use orr_atmosphere::presets::solar_disc;
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference};
 use orr_atmosphere::spectrum::{SOLAR_COLOUR, SOLAR_ILLUMINANCE};
@@ -35,10 +35,6 @@ fn foggy() -> Atmosphere {
         }),
         ..earth()
     }
-}
-
-fn luminance(c: [f64; 3]) -> f64 {
-    (0..3).map(|i| REC2020_LUMINANCE[i] * c[i]).sum()
 }
 
 fn rgb(c: [f32; 4]) -> [f64; 3] {

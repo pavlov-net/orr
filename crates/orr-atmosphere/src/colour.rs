@@ -34,6 +34,11 @@ pub const REC2020_LUMINANCE: [f64; 3] = [0.262_700_212_0, 0.677_998_071_5, 0.059
 /// Luminous efficacy of the CIE photopic curve's peak, lm/W.
 pub const LUMINOUS_EFFICACY: f64 = 683.0;
 
+/// Luminance of a linear Rec.2020 colour.
+pub fn luminance(rec2020: [f64; 3]) -> f64 {
+    (0..3).map(|i| REC2020_LUMINANCE[i] * rec2020[i]).sum()
+}
+
 /// `m` times `v`.
 pub fn mul(m: &[[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
     [0, 1, 2].map(|i| m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2])
