@@ -7,10 +7,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CStr, c_char};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::precompile::Precompiled;
 use super::slang::{Session, blob_text};
 use super::spirv::{self, Type, decoration};
 use super::sys;
@@ -245,9 +246,10 @@ pub(crate) fn extract(
     session: &Session,
     layout: *mut sys::SlangReflection,
     words: &[u32],
+    precompiled: &Precompiled,
 ) -> Result<Model, String> {
     let spv = spirv::Module::parse(words)?;
-    let decls = declarations(session);
+    let decls = declarations(session, precompiled);
     let api = &session.lib.api;
     let mut x = Extract {
         api,
@@ -261,20 +263,23 @@ pub(crate) fn extract(
 }
 
 /// Every struct and module-scope variable declared in a module loaded into the session.
-fn declarations(session: &Session) -> Decls {
+/// Declarations of a precompiled module have no location; they take the module's source.
+fn declarations(session: &Session, precompiled: &Precompiled) -> Decls {
     use sys::SlangDeclKind as K;
     let api = &session.lib.api;
     let mut out = Decls::default();
-    let mut stack: Vec<(*mut sys::SlangReflectionDecl, bool)> = session
+    let mut stack: Vec<(*mut sys::SlangReflectionDecl, bool, Option<&Path>)> = session
         .loaded_modules()
         .iter()
-        .map(super::slang::Module::reflection)
-        .filter(|d| !d.is_null())
-        .map(|d| (d, true))
+        .map(|m| {
+            let file = m.file().and_then(|f| precompiled.source(&f));
+            (m.reflection(), true, file)
+        })
+        .filter(|(d, _, _)| !d.is_null())
         .collect();
     // SAFETY: decls come from modules owned by the live session.
     unsafe {
-        while let Some((decl, module_scope)) = stack.pop() {
+        while let Some((decl, module_scope, module_file)) = stack.pop() {
             for i in 0..api.spReflectionDecl_getChildrenCount(decl) {
                 let child = api.spReflectionDecl_getChild(decl, i);
                 if child.is_null() {
@@ -287,13 +292,16 @@ fn declarations(session: &Session) -> Decls {
                     _ => None,
                 };
                 if let Some(map) = map
-                    && let Some((file, _)) = session.decl_location(child)
+                    && let Some(file) = session
+                        .decl_location(child)
+                        .map(|(f, _)| f)
+                        .or_else(|| module_file.map(Path::to_path_buf))
                 {
                     map.entry(text(api.spReflectionDecl_getName(child)))
                         .or_insert(file);
                 }
                 if kind != K::SLANG_DECL_KIND_FUNC {
-                    stack.push((child, false));
+                    stack.push((child, false, module_file));
                 }
             }
         }

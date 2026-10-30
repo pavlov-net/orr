@@ -483,3 +483,190 @@ fn link_calls_are_checked() {
     let name = consumer(&dir, &renderer).link(LinkPoint::Surface, "Ground", &ground, "Ground");
     assert!(message(name).contains("lower-case"));
 }
+
+/// Every `.spv` under `dir` by its path below it.
+fn spirv_files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for path in fs::read_dir(&d).unwrap().map(|e| e.unwrap().path()) {
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "spv") {
+                out.push((
+                    path.strip_prefix(dir).unwrap().to_path_buf(),
+                    fs::read(&path).unwrap(),
+                ));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The `precompiled` lists of a build manifest's modules.
+fn precompiled(out: &Output) -> Vec<(String, Vec<String>)> {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&out.manifest).unwrap()).unwrap();
+    manifest["modules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            let names = m["precompiled"].as_array().unwrap();
+            (
+                m["name"].as_str().unwrap().to_owned(),
+                names
+                    .iter()
+                    .map(|n| n.as_str().unwrap().to_owned())
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn precompiled_modules_give_the_same_spirv_and_rust() {
+    let shared = |scale: &str| {
+        format!(
+            "import orr.math;\npublic float3 lit(float3 n) {{ return safe_normalize(n) * {scale}; }}\n"
+        )
+    };
+    let a = format!(
+        "import orr.color;\nimport shared;\n{}",
+        kernel("root.out[id.x] = float4(srgb_encode(lit(float3(root.count))), 1);")
+    );
+    let b = format!(
+        "import orr.coherence;\nimport shared;\n{}",
+        kernel(
+            "root.out[id.x] = float4(lit(float3(1)), float(coherence_key(true, 1, root.count)));"
+        )
+    );
+    let dir = fixture(
+        "precompiled",
+        &[
+            ("src/a.slang", &a),
+            ("src/b.slang", &b),
+            ("src/shared.slang", &shared("2")),
+        ],
+    );
+    let both = || {
+        let [on, off] = [true, false].map(|on| {
+            let out = dir.join(if on { "on" } else { "off" });
+            let built = build(&dir)
+                .debug_info(false)
+                .asserts(true)
+                .precompile(on)
+                .out_dir(&out)
+                .compile()
+                .unwrap_or_else(|e| panic!("{e}"));
+            let rust = fs::read_to_string(out.join("orr_shaders.rs"))
+                .unwrap()
+                .replace(
+                    format!("{:?}", out.display().to_string()).trim_matches('"'),
+                    "OUT",
+                )
+                .replace(&out.display().to_string(), "OUT");
+            (built, spirv_files(&out), rust)
+        });
+        assert_eq!(on.1, off.1);
+        assert_eq!(on.2, off.2);
+        (on.0, off.0)
+    };
+    let (on, off) = both();
+    assert_eq!(
+        precompiled(&on),
+        [
+            (
+                "a".to_owned(),
+                vec![
+                    "orr.color".to_owned(),
+                    "orr.math".to_owned(),
+                    "shared".to_owned()
+                ]
+            ),
+            (
+                "b".to_owned(),
+                vec![
+                    "orr.coherence".to_owned(),
+                    "orr.math".to_owned(),
+                    "shared".to_owned()
+                ]
+            ),
+        ]
+    );
+    assert!(precompiled(&off).iter().all(|(_, p)| p.is_empty()));
+
+    // An edited library is compiled again before its importers use it.
+    fs::write(dir.join("src/shared.slang"), shared("3")).unwrap();
+    let (on, _) = both();
+    assert_eq!(on.compiled, ["a", "b"]);
+}
+
+#[test]
+fn linked_kernels_load_precompiled_consumer_modules() {
+    let (dir, renderer) = link_fixture("link-precompiled");
+    let [on, off] = [true, false].map(|on| {
+        let out = dir.join(if on { "linked-on" } else { "linked-off" });
+        let built = consumer(&dir, &renderer)
+            .link(
+                LinkPoint::Surface,
+                "ground",
+                dir.join("consumer/ground.slang"),
+                "Ground",
+            )
+            .link(
+                LinkPoint::Surface,
+                "grass",
+                dir.join("consumer/grass.slang"),
+                "Grass",
+            )
+            .link(
+                LinkPoint::Medium,
+                "air",
+                dir.join("consumer/air.slang"),
+                "Air",
+            )
+            .debug_info(false)
+            .precompile(on)
+            .out_dir(&out)
+            .compile()
+            .unwrap_or_else(|e| panic!("{e}"));
+        (built, spirv_files(&out))
+    });
+    assert_eq!(on.1, off.1);
+    let used = precompiled(&on.0);
+    let resolve = &used.iter().find(|(n, _)| n == "resolve").unwrap().1;
+    assert_eq!(resolve, &["grass", "ground", "surface"]);
+}
+
+#[test]
+fn cooperative_vectors_stay_out_of_records() {
+    // SPIR-V allows cooperative vectors only in function and private storage, so a root or
+    // record holding one, directly or through a pointer, fails validation; weights go
+    // behind an address instead.
+    let cases = [
+        (
+            "struct W { CoopVec<half, 16> v; float s; }\nstruct Root { W* w; float* out; }\n",
+            "root.out[id.x] = float(root.w[id.x].v[3]) * root.w[id.x].s;",
+        ),
+        (
+            "struct Root { CoopVec<float, 4>* p; float* out; }\n",
+            "root.out[id.x] = root.p[id.x][1];",
+        ),
+    ];
+    for (i, (types, body)) in cases.into_iter().enumerate() {
+        let src = format!(
+            "{types}[[vk::binding(0, 0)]] ConstantBuffer<Root> root;\n\
+             [shader(\"compute\")] [numthreads(32, 1, 1)] void main(uint3 id: SV_DispatchThreadID) {{ {body} }}\n"
+        );
+        let dir = fixture(&format!("coopvec-{i}"), &[("src/k.slang", &src)]);
+        match build(&dir).allow(Lint::CoopVec).compile() {
+            Err(Error::Compile { diagnostics, .. }) => assert!(
+                diagnostics.contains("Validation of generated SPIR-V failed"),
+                "{diagnostics}"
+            ),
+            other => panic!("a cooperative vector in memory compiled: {other:?}"),
+        }
+    }
+}

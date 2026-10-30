@@ -11,6 +11,7 @@ use super::layout::{Plan, Planner};
 use super::link::{self, KernelPoints, Link, LinkModule, LinkPoint, LinkPoints};
 use super::lint::{self, Lint, LintError};
 use super::model::{self, Model, StructDef, Ty};
+use super::precompile::{self, Precompiled};
 use super::slang::{GlobalSession, Library, Session};
 use super::{Error, SLANG_VERSION, SLANGC_OPTIONS, metal, spirv};
 
@@ -35,6 +36,7 @@ pub struct Build {
     fp_precise: bool,
     asserts: bool,
     metal_check: bool,
+    precompile: bool,
     allowed: BTreeSet<Lint>,
     out_dir: Option<PathBuf>,
     link_points: Vec<PathBuf>,
@@ -76,6 +78,7 @@ impl Build {
             fp_precise: false,
             asserts: false,
             metal_check: env::var_os("ORR_METAL_CHECK").is_some_and(|v| v == "1"),
+            precompile: env::var_os("ORR_SHADER_PRECOMPILE").is_none_or(|v| v != "0"),
             allowed: BTreeSet::new(),
             out_dir: None,
             link_points: Vec::new(),
@@ -168,6 +171,14 @@ impl Build {
         self
     }
 
+    /// Compiles the library modules that kernels import once per build into
+    /// `.slang-module` files, which every kernel then loads instead of the source. The
+    /// SPIR-V is the same either way. On unless `ORR_SHADER_PRECOMPILE=0`.
+    pub fn precompile(mut self, on: bool) -> Self {
+        self.precompile = on;
+        self
+    }
+
     /// Turns a lint off for this build.
     pub fn allow(mut self, lint: Lint) -> Self {
         self.allowed.insert(lint);
@@ -232,16 +243,7 @@ impl Build {
             }
         }
 
-        let options = self.options(&include_dirs);
-        let metal_options = self
-            .metal_check
-            .then(|| metal_session_options(&include_dirs));
-        let settings = Settings {
-            tool: tool_hash(),
-            options: &options,
-            metal: metal_options.as_deref(),
-            asserts: self.asserts,
-        };
+        let tool = tool_hash();
         let records = out_dir.join("orr-shaders");
         let jobs = kernels
             .into_iter()
@@ -253,7 +255,10 @@ impl Build {
                 links: Vec::new(),
             })
             .collect();
-        let (modules, mut compiled) = run(&self.lib, &settings, jobs)?;
+        let Run {
+            modules,
+            mut compiled,
+        } = self.run(&tool, &include_dirs, &records, jobs)?;
 
         // The listed kernels compiled once more with the linked types.
         let mut linked_modules = BTreeMap::new();
@@ -269,19 +274,9 @@ impl Build {
                 }
             }
             lint_roots.extend(module_dirs);
-            let options = self.options(&linked_dirs);
-            let metal_options = self
-                .metal_check
-                .then(|| metal_session_options(&linked_dirs));
-            let settings = Settings {
-                tool: settings.tool.clone(),
-                options: &options,
-                metal: metal_options.as_deref(),
-                asserts: self.asserts,
-            };
-            let (fresh, names) = run(&self.lib, &settings, jobs)?;
-            linked_modules = fresh;
-            compiled.extend(names.into_iter().map(|n| format!("linked/{n}")));
+            let run = self.run(&tool, &linked_dirs, &records, jobs)?;
+            linked_modules = run.modules;
+            compiled.extend(run.compiled.into_iter().map(|n| format!("linked/{n}")));
         }
 
         let mut lints = lint::duplicate_imports(&lint_roots);
@@ -441,7 +436,7 @@ impl Build {
 
         let manifest = Manifest {
             slang: SLANG_VERSION,
-            options: &options,
+            options: &self.options(&include_dirs),
             asserts: self.asserts,
             modules: modules
                 .iter()
@@ -455,6 +450,7 @@ impl Build {
                     omm: r.omm.as_deref(),
                     hash: r.hash,
                     inputs: &r.inputs,
+                    precompiled: &r.precompiled,
                 })
                 .collect(),
         };
@@ -499,6 +495,66 @@ impl Build {
             manifest: manifest_path,
             link_points: link_points_path,
         })
+    }
+
+    /// Precompiles the libraries the jobs import, loads up-to-date records and compiles the
+    /// rest.
+    fn run(
+        &self,
+        tool: &str,
+        include_dirs: &[PathBuf],
+        records: &Path,
+        jobs: Vec<Job>,
+    ) -> Result<Run, Error> {
+        let options = self.options(include_dirs);
+        let (precompiled, kernel_options) = if self.precompile && !jobs.is_empty() {
+            let dir = records
+                .join("modules")
+                .join(format!("{:016x}", hash64(options.join("\n").as_bytes())));
+            let mut key_parts = vec![tool];
+            key_parts.extend(options.iter().map(String::as_str));
+            let mut sources = Vec::new();
+            for job in &jobs {
+                sources.push((job.path.clone(), read(&job.path)?));
+                sources.extend(job.links.iter().map(|l| (l.path.clone(), l.source.clone())));
+            }
+            let precompiled = precompile::precompile(
+                &self.lib,
+                &options,
+                &key_parts,
+                include_dirs,
+                &sources,
+                &dir,
+            )?;
+            let mut dirs = vec![canonical_lossy(&dir)];
+            dirs.extend(include_dirs.iter().cloned());
+            (precompiled, self.options(&dirs))
+        } else {
+            (Precompiled::default(), options)
+        };
+        let metal_options = self
+            .metal_check
+            .then(|| metal_session_options(include_dirs));
+        let settings = Settings {
+            tool,
+            options: &kernel_options,
+            metal: metal_options.as_deref(),
+            asserts: self.asserts,
+            precompiled: &precompiled,
+        };
+        let mut modules = BTreeMap::new();
+        let mut todo = Vec::new();
+        for job in jobs {
+            match load_record(&settings, &job) {
+                Some(record) => {
+                    modules.insert(job.name, record);
+                }
+                None => todo.push(job),
+            }
+        }
+        let compiled = todo.iter().map(|j| j.name.clone()).collect();
+        modules.extend(compile_all(&self.lib, &settings, todo)?);
+        Ok(Run { modules, compiled })
     }
 
     /// The session options for kernels that import from `include_dirs`.
@@ -588,28 +644,6 @@ fn plan(name: &str, model: &Model) -> Result<HashMap<String, Plan>, Error> {
         })
 }
 
-/// Loads up-to-date records and compiles the rest. Returns every module and the names of
-/// those compiled.
-fn run(
-    lib: &Arc<Library>,
-    settings: &Settings<'_>,
-    jobs: Vec<Job>,
-) -> Result<(BTreeMap<String, Record>, Vec<String>), Error> {
-    let mut modules = BTreeMap::new();
-    let mut todo = Vec::new();
-    for job in jobs {
-        match load_record(settings, &job) {
-            Some(record) => {
-                modules.insert(job.name, record);
-            }
-            None => todo.push(job),
-        }
-    }
-    let compiled = todo.iter().map(|j| j.name.clone()).collect();
-    modules.extend(compile_all(lib, settings, todo)?);
-    Ok((modules, compiled))
-}
-
 #[derive(Serialize)]
 struct Manifest<'a> {
     slang: &'a str,
@@ -628,6 +662,8 @@ struct ManifestModule<'a> {
     omm: Option<&'a Path>,
     hash: u64,
     inputs: &'a [PathBuf],
+    /// The library modules the compile loaded precompiled, by import name.
+    precompiled: &'a [String],
 }
 
 /// One compiled module as the build remembers it between runs.
@@ -639,25 +675,36 @@ struct Record {
     spv: PathBuf,
     omm: Option<PathBuf>,
     hash: u64,
+    precompiled: Vec<String>,
     model: Model,
     /// MSL check failures; empty when the check passed or did not run.
     metal: Vec<String>,
 }
 
+/// The modules of one option set.
+struct Run {
+    modules: BTreeMap<String, Record>,
+    /// The names of those compiled by this run; the others were up to date.
+    compiled: Vec<String>,
+}
+
 /// What every module of one build is compiled with.
 struct Settings<'a> {
     /// A hash of the running build script, so a changed build invalidates every record.
-    tool: String,
+    tool: &'a str,
+    /// The kernel session's options, led by the precompiled modules' directory when there
+    /// is one.
     options: &'a [String],
     /// The Metal session's options when the MSL check runs.
     metal: Option<&'a [String]>,
     asserts: bool,
+    precompiled: &'a Precompiled,
 }
 
 impl Settings<'_> {
     /// Everything besides the inputs that changes a module's outputs.
     fn key_parts(&self) -> Vec<&str> {
-        let mut parts = vec![self.tool.as_str()];
+        let mut parts = vec![self.tool];
         parts.extend(self.options.iter().map(String::as_str));
         if self.asserts {
             parts.push("+asserts");
@@ -699,6 +746,7 @@ fn print_cargo<'a>(
             "ORR_SLANGC",
             "ORR_OPENPBR_BSDF",
             "ORR_METAL_CHECK",
+            "ORR_SHADER_PRECOMPILE",
             "ORR_SHADER_TIMINGS",
         ] {
             println!("cargo:rerun-if-env-changed={var}");
@@ -884,10 +932,13 @@ fn compile_one(
     let words = program.spirv().map_err(compile_err)?;
     write(&job.spv, &words_to_bytes(&words))?;
     let layout = program.layout().map_err(compile_err)?;
-    let model = model::extract(&session, layout, &words).map_err(|message| Error::Reflection {
-        module: name.to_owned(),
-        message,
-    })?;
+    let model =
+        model::extract(&session, layout, &words, settings.precompiled).map_err(|message| {
+            Error::Reflection {
+                module: name.to_owned(),
+                message,
+            }
+        })?;
 
     let mut inputs: Vec<PathBuf> = module
         .dependencies()
@@ -902,6 +953,7 @@ fn compile_one(
         .collect();
     inputs.sort();
     inputs.dedup();
+    let precompiled = settings.precompiled.used(&session);
     let metal = match settings.metal {
         Some(metal_options) => {
             let session = global.session(metal_options).map_err(slang_err)?;
@@ -929,6 +981,7 @@ fn compile_one(
         spv: job.spv.clone(),
         omm,
         hash: hash64(&words_to_bytes(&words)),
+        precompiled,
         model,
         metal,
     })
@@ -1086,7 +1139,7 @@ pub(super) fn read(path: &Path) -> Result<String, Error> {
     })
 }
 
-fn canonical_lossy(path: &Path) -> PathBuf {
+pub(super) fn canonical_lossy(path: &Path) -> PathBuf {
     path.canonicalize()
         .map(strip_verbatim)
         .unwrap_or_else(|_| path.to_path_buf())

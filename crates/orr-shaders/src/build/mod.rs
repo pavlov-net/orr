@@ -10,6 +10,7 @@ mod lint;
 mod locate;
 mod metal;
 mod model;
+mod precompile;
 mod slang;
 mod spirv;
 mod sys;
