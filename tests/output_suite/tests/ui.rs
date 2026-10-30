@@ -1,6 +1,7 @@
 //! The egui painter, the UI layer and compose-UI: reference images of egui frames presented
 //! as UI-only frames, the painter's textures, clips and large meshes against expected
-//! pixels, and compose-UI's blend against an f64 model for every encoding.
+//! pixels, and compose-UI's blend and display screenshots with UI against an f64 model for
+//! every encoding.
 
 use std::path::PathBuf;
 
@@ -12,8 +13,9 @@ use egui::{
 use half::f16;
 use orr_egui::Painter;
 use orr_output::{
-    ComposePass, ComposeRoot, ComposeSource, DisplayRequest, OutputFormat, OutputKernels,
-    ResolvedDisplay, UiLayer, pq_decode, pq_encode, srgb_decode, srgb_encode,
+    CapturePass, ComposePass, ComposeRoot, ComposeSource, DisplayRequest, OutputFormat,
+    OutputKernels, OutputView, ResolvedDisplay, UiLayer, pq_decode, pq_encode, srgb_decode,
+    srgb_encode,
 };
 use orr_scene::orr_gpu::{
     Allocation, Format, Hazards, MemoryKind, QueueKind, Stages, StorageImageIndex, Texture,
@@ -592,6 +594,14 @@ fn painter_draws_textures_clips_and_split_meshes() {
     assert_clean();
 }
 
+/// Whether a capture's display-linear `got` matches `want`: within 1e-3 of the texel's
+/// brightest channel, as `matches`. `orr.color`'s f32 PQ signal is within 1.3e-5 of ST 2084,
+/// about 1.5e-4 in nits, and a capture over a PQ backbuffer decodes, encodes and decodes.
+fn capture_matches(got: &[f32], want: [f64; 3]) -> bool {
+    let brightest = want.iter().fold(0.0, |m: f64, v| m.max(v.abs()));
+    (0..3).all(|c| (f64::from(got[c]) - want[c]).abs() <= 1e-3 * brightest + 1e-6)
+}
+
 #[test]
 fn compose_ui_matches_model() {
     let gpu = device();
@@ -645,6 +655,7 @@ fn compose_ui_matches_model() {
         let presented = Target::new(format, extent, "presented");
         let black = Target::new(format, extent, "ui only");
         let mut roots: Vec<ComposeRoot> = (0..3).map(|_| ComposeRoot::new(gpu).unwrap()).collect();
+        let mut view = OutputView::new(gpu, 3).unwrap();
         let queue = gpu.queue(QueueKind::Render).unwrap();
         let mut list = queue.command_list().unwrap();
         list.discard(layer.texture());
@@ -680,7 +691,28 @@ fn compose_ui_matches_model() {
             &mut roots[2],
             &pass(ComposeSource::Black, ui_index, &black),
         );
+        // Display screenshots with UI: over tonemap's output, over the backbuffer (frame 1)
+        // and over black (frame 2).
+        for (frame, source) in [
+            ComposeSource::Linear(source.sampled),
+            ComposeSource::Encoded(backbuffer.sampled),
+            ComposeSource::Black,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let capture = CapturePass {
+                source,
+                ui: ui_index,
+                extent,
+                display: &display,
+                frame: frame as u64,
+            };
+            kernels.capture(&mut list, &mut view, &capture).unwrap();
+        }
         wait(queue.submit(vec![list], &[]).unwrap());
+        let shots = view.screenshots(2);
+        assert_eq!(shots.iter().map(|s| s.frame).collect::<Vec<_>>(), [0, 1, 2]);
 
         let (bb_bytes, presented_bytes) = (backbuffer.read(), presented.read());
         let bb = signals(&bb_bytes, format);
@@ -710,7 +742,35 @@ fn compose_ui_matches_model() {
                     display.encoding
                 );
             }
+            let under = linear[i].map(|v| f16::from_bits(v).to_f64());
+            let want = decode(over([under[0], under[1], under[2]]), &display);
+            let g = &shots[0].rgba[4 * i..4 * i + 4];
+            assert!(
+                capture_matches(g, want),
+                "{:?} capture texel {i}: {g:?} against {want:?}",
+                display.encoding
+            );
+            let want = decode(
+                if ui[i] == [0; 4] {
+                    [bb[i][0], bb[i][1], bb[i][2]]
+                } else {
+                    over(decode([bb[i][0], bb[i][1], bb[i][2]], &display))
+                },
+                &display,
+            );
+            let g = &shots[1].rgba[4 * i..4 * i + 4];
+            assert!(
+                capture_matches(g, want),
+                "{:?} backbuffer capture texel {i}: {g:?} against {want:?}",
+                display.encoding
+            );
             let want = over([0.0; 3]);
+            let g = &shots[2].rgba[4 * i..4 * i + 4];
+            assert!(
+                capture_matches(g, decode(want, &display)),
+                "{:?} UI-only capture texel {i}: {g:?}",
+                display.encoding
+            );
             let g = [got_black[i][0], got_black[i][1], got_black[i][2]];
             assert!(
                 matches(g, want, &display),
