@@ -16,6 +16,7 @@ orr-atmosphere = { path = "crates/orr-atmosphere" }
 orr-color = { path = "crates/orr-color", version = "0.0.1" }
 orr-gpu = { path = "crates/orr-gpu" }
 orr-lighting = { path = "crates/orr-lighting" }
+orr-math = { path = "crates/orr-math", version = "0.0.1" }
 orr-pack = { path = "crates/orr-pack" }
 orr-scene = { path = "crates/orr-scene" }
 orr-shaders = { path = "crates/orr-shaders" }

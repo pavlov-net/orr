@@ -681,6 +681,8 @@ version = "0.34.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc148d4ddd3930c52f9e5ae79b89805c6f07e9ff417e7b083e0348cea60a5aba"
 dependencies = [
+ "bytemuck",
+ "mint",
  "serde_core",
 ]
 
@@ -1045,6 +1047,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "mint"
+version = "0.5.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e53debba6bda7a793e5f99b8dacf19e626084f525f7829104ba9898f367d85ff"
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1225,6 +1233,13 @@ dependencies = [
  "orr-scene",
  "orr-shaders",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "orr-math"
+version = "0.0.1"
+dependencies = [
+ "glam",
 ]
 
 [[package]]

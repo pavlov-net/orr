@@ -1,0 +1,19 @@
+[package]
+name = "orr-math"
+description = "CPU-side vector, matrix and quaternion types for orr, re-exported from glam."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+serde = ["glam/serde"]
+bytemuck = ["glam/bytemuck"]
+mint = ["glam/mint-05"]
+
+[dependencies]
+glam.workspace = true
+
+[lints]
+workspace = true
