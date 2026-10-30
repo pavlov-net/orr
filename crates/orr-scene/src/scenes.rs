@@ -1,19 +1,26 @@
 //! `Scenes`, the frame and its fixed order.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use glam::DVec3;
 use orr_gpu::{
     CommandList, ComputePipeline, Device, GpuPtr, Hazards, KernelSet, LatencyMarker, LowLatency,
-    MemoryKind, PassResult, QueueKind, ShaderStage, SpecData, Stages, TimelinePoint,
+    MemoryKind, PassResult, QueueKind, SamplerDesc, SamplerIndex, ShaderStage, SpecData, Stages,
+    TextureIndex, TimelinePoint,
 };
+use orr_pack::AssetId;
 
 use crate::emissive::ModelEmission;
-use crate::material::{MaterialTable, MaterialWriter};
+use crate::loading::{self, Loading, Msg};
+use crate::material::{MaterialId, MaterialTable, MaterialWriter};
 use crate::memory::UploadWindow;
+use crate::mount::{
+    Apply, InstancePage, LoadState, MountId, MountTask, Mounts, PackSource, PageId, TableSizes,
+};
 use crate::producer::ProducerUpdate;
 use crate::scene::{GroupWriter, ModelId, Scene, SceneDesc, SceneId, SceneWriter};
 use crate::shaders::{emissive, upload, world as world_kernel};
@@ -30,6 +37,14 @@ pub struct Budgets {
     pub upload_block: u64,
     /// Entries in the global material table.
     pub materials: u32,
+    /// Entries in the global model table: [`ModelId`]s of mounted packs.
+    pub models: u32,
+    /// Entries in the global mesh table.
+    pub meshes: u32,
+    /// Section materials of every resident model.
+    pub model_materials: u32,
+    /// Page and node page addresses of every resident mesh.
+    pub mesh_pages: u32,
 }
 
 impl Default for Budgets {
@@ -37,6 +52,10 @@ impl Default for Budgets {
         Self {
             upload_block: 16 << 20,
             materials: 65_536,
+            models: 65_536,
+            meshes: 65_536,
+            model_materials: 262_144,
+            mesh_pages: 1 << 20,
         }
     }
 }
@@ -52,6 +71,8 @@ pub struct RendererDesc {
     pub kernels: &'static KernelSet,
     /// World cells are 2^cell_log2 m on a side.
     pub cell_log2: u32,
+    /// Archive reads are positioned reads on workers even where IoRing is available.
+    pub positioned_reads: bool,
 }
 
 impl Default for RendererDesc {
@@ -61,6 +82,7 @@ impl Default for RendererDesc {
             frames_in_flight: 2,
             kernels: &NO_KERNELS,
             cell_log2: 8,
+            positioned_reads: false,
         }
     }
 }
@@ -161,13 +183,17 @@ struct Core {
     in_flight: VecDeque<InFlight>,
     stats: FrameStats,
     high_water: u64,
+    mounts: Mounts,
 }
 
-/// Global scene state and every resident scene. Render thread only.
+/// Global scene state, mounted packs and every resident scene. Render thread only.
 pub struct Scenes {
     device: Device,
     pipelines: Pipelines,
     core: Core,
+    loading: Arc<Loading>,
+    loading_thread: Option<JoinHandle<()>>,
+    sampler: SamplerIndex,
 }
 
 /// Puts `value` in the first free entry of `slots` and returns its index.
@@ -197,11 +223,35 @@ fn pipeline(
 
 impl Scenes {
     /// Compiles orr-scene's pipelines on the calling thread, from `desc.kernels`' module
-    /// wherever it holds one for an orr-scene kernel.
+    /// wherever it holds one for an orr-scene kernel, and starts the loading thread.
     pub fn new(device: &Device, desc: &RendererDesc) -> Result<Self> {
         assert!(desc.frames_in_flight >= 1, "frames_in_flight is at least 1");
         assert!(desc.cell_log2 <= 16, "cells of 2^{} m", desc.cell_log2);
+        let b = &desc.budgets;
+        let mounts = Mounts::new(
+            device,
+            TableSizes {
+                models: b.models,
+                meshes: b.meshes,
+                model_materials: b.model_materials,
+                page_table: b.mesh_pages,
+            },
+        )?;
+        let sampler = device.sampler(&SamplerDesc {
+            max_anisotropy: 16.0,
+            ..SamplerDesc::default()
+        })?;
+        let loading = Arc::new(Loading::new(desc.positioned_reads));
+        let thread = {
+            let (l, d) = (Arc::clone(&loading), device.clone());
+            std::thread::Builder::new()
+                .name("orr loading".into())
+                .spawn(move || loading::thread(l, d))?
+        };
         Ok(Self {
+            loading,
+            loading_thread: Some(thread),
+            sampler,
             device: device.clone(),
             pipelines: Pipelines {
                 scatter: pipeline(device, desc.kernels, &upload::MODULE, "scatter")?,
@@ -226,8 +276,78 @@ impl Scenes {
                 in_flight: VecDeque::new(),
                 stats: FrameStats::default(),
                 high_water: 0,
+                mounts,
             },
         })
+    }
+
+    /// The loading side's job queue, for the threads the consumer lends to it.
+    pub fn loading(&self) -> Arc<Loading> {
+        Arc::clone(&self.loading)
+    }
+
+    /// Mounts a pack. Returns at once: its index and every asset load on the loading side,
+    /// and lookups fail with [`Error::NotReady`] until [`Scenes::mount_state`] is `Ready`.
+    pub fn mount(&mut self, source: PackSource) -> MountId {
+        let (id, cancel) = self.core.mounts.add();
+        let task = MountTask::new(id, &self.loading, &self.device, self.sampler, cancel);
+        self.loading.send(Msg::Mount(Arc::new(task), source));
+        id
+    }
+
+    /// The progress of mount `m`; `Failed` with [`Error::UnknownMount`] once unmounted.
+    pub fn mount_state(&self, m: MountId) -> LoadState {
+        self.core.mounts.state(m)
+    }
+
+    /// Unmounts a pack. A pending mount stops loading; a ready one's memory is freed once
+    /// every frame submitted so far has completed.
+    pub fn unmount(&mut self, m: MountId) {
+        let frame = self.core.next_frame - 1;
+        let core = &mut self.core;
+        core.mounts.unmount(m, frame, &mut core.models);
+    }
+
+    /// The model `id` of mount `m`.
+    pub fn model(&self, m: MountId, id: AssetId) -> Result<ModelId> {
+        self.core.mounts.lookup(m, id, |r| &r.models)
+    }
+
+    /// The instance page `id` of mount `m`.
+    pub fn instance_page(&self, m: MountId, id: AssetId) -> Result<PageId> {
+        self.core.mounts.lookup(m, id, |r| &r.pages)
+    }
+
+    /// The cooked texture `id` of mount `m`, for consumer data that samples it.
+    pub fn texture(&self, m: MountId, id: AssetId) -> Result<TextureIndex> {
+        self.core.mounts.lookup(m, id, |r| &r.textures)
+    }
+
+    /// The cooked material `id` of mount `m`, for consumer data and [`MaterialWriter`] edits.
+    pub fn material(&self, m: MountId, id: AssetId) -> Result<MaterialId> {
+        self.core.mounts.lookup(m, id, |r| &r.materials)
+    }
+
+    /// A resident instance page.
+    pub fn page(&self, id: PageId) -> Option<&InstancePage> {
+        self.core.mounts.pages.get(id.0 as usize)?.as_ref()
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn texture_object(&self, m: MountId, id: AssetId) -> Option<Arc<orr_gpu::Texture>> {
+        self.core.mounts.texture_object(m, id)
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn tables(
+        &self,
+    ) -> (
+        GpuPtr<crate::ModelGpu>,
+        GpuPtr<crate::MeshGpu>,
+        GpuPtr<crate::MaterialGpu>,
+    ) {
+        let m = &self.core.mounts;
+        (m.models.gpu, m.meshes.gpu, self.core.materials.table.gpu)
     }
 
     pub fn device(&self) -> &Device {
@@ -252,7 +372,8 @@ impl Scenes {
     }
 
     /// What copies of `model` add to the emissive list from now on; copies added before
-    /// keep their entries. Model loading sets it when a model becomes resident.
+    /// keep their entries. Mounting sets it for models of packs.
+    #[cfg(feature = "testing")]
     pub(crate) fn set_model_emission(&mut self, model: ModelId, emission: Option<ModelEmission>) {
         let i = model.0 as usize;
         if self.core.models.len() <= i {
@@ -361,9 +482,23 @@ impl Scenes {
             });
             cpu.retired.retain(|(frame, _)| *frame > completed);
         }
+        core.mounts.retire(completed, &self.device, &core.materials);
         self.device.collect_garbage();
         let slot = (frame % u64::from(core.fif)) as usize;
         core.windows[slot].reset();
+        let mut loading_points = Vec::new();
+        for batch in self.loading.take_batches(&self.device) {
+            loading_points.extend(batch.point.map(|(_, p)| p));
+            let mut apply = Apply {
+                device: &self.device,
+                window: &core.windows[slot],
+                seq: &core.seq,
+                records: core.global.get_mut().unwrap(),
+                materials: &core.materials,
+                emission: &mut core.models,
+            };
+            core.mounts.apply(batch, &mut apply);
+        }
         let mut list = render.command_list()?;
         // Work from earlier frames on this queue finishes before this frame's writes.
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
@@ -382,6 +517,7 @@ impl Scenes {
             step_start: now,
             scatter: Default::default(),
             latency: desc.low_latency.cloned(),
+            loading: loading_points,
         })
     }
 }
@@ -415,6 +551,8 @@ pub struct Frame<'a> {
     step_start: Instant,
     scatter: crate::upload::ScatterTotals,
     latency: Option<LowLatency>,
+    /// Loading batches taken at step 1; the frame's submit waits them.
+    loading: Vec<TimelinePoint>,
 }
 
 impl<'a> Frame<'a> {
@@ -550,6 +688,8 @@ impl<'a> Frame<'a> {
                 instances: t.instances.gpu,
                 slot_state: t.slot_state.gpu,
                 groups: t.groups.gpu,
+                models: core.mounts.models.gpu,
+                meshes: core.mounts.meshes.gpu,
                 materials: core.materials.table.gpu,
                 material_sets: t.material_sets.gpu.cast(),
                 lights: t.lights.gpu,
@@ -694,7 +834,9 @@ impl<'a> Frame<'a> {
         self.ensure_updated()?;
         let render = self.device.queue(QueueKind::Render).expect("render queue");
         let list = self.list.take().expect("frame list");
-        let point = render.submit(vec![list], wait)?;
+        let mut waits = wait.to_vec();
+        waits.append(&mut self.loading);
+        let point = render.submit(vec![list], &waits)?;
         self.marker(LatencyMarker::RenderSubmitEnd);
         render.mark_frame_end(self.id)?;
         self.step("end");
@@ -717,5 +859,16 @@ impl<'a> Frame<'a> {
             stats,
         });
         Ok(point)
+    }
+}
+
+impl Drop for Scenes {
+    fn drop(&mut self) {
+        self.loading.send(Msg::Stop);
+        self.loading.stop_workers();
+        if let Some(t) = self.loading_thread.take() {
+            let _ = t.join();
+        }
+        self.core.mounts.clear(&self.device, &self.core.materials);
     }
 }

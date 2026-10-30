@@ -14,6 +14,12 @@ orr-gpu.workspace = true
 orr-shaders.workspace = true
 glam.workspace = true
 
+[dev-dependencies]
+bytemuck.workspace = true
+orr-cook = { path = "../../crates/orr-cook" }
+orr-pack.workspace = true
+png = "0.18"
+
 [target.'cfg(windows)'.dev-dependencies]
 gpu-suite = { path = "../gpu-suite" }
 log.workspace = true

@@ -7,11 +7,17 @@
 //! Writers put data straight into mapped upload memory and `update_scenes` applies every
 //! write with one scatter dispatch; orr keeps no CPU copy of GPU tables. Every pass reads
 //! a scene through its [`SceneRoot`].
+//!
+//! Packs mount from a file or from memory ([`Scenes::mount`]). Their reads, decodes and
+//! copies run on the loading side ([`Loading`]): orr's loading thread and the threads the
+//! consumer lends to [`Loading::run_worker`]. The render thread only polls.
 
 mod emissive;
 mod lights;
+mod loading;
 mod material;
 pub mod memory;
+mod mount;
 mod producer;
 mod scene;
 mod scenes;
@@ -28,7 +34,9 @@ pub use orr_shaders::abi;
 
 pub use emissive::{EmissiveSpan, ModelEmission, emissive_spans};
 pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId};
-pub use material::{MaterialId, MaterialWriter, material_flags};
+pub use loading::Loading;
+pub use material::{BoundTexture, MaterialId, MaterialWriter, material_flags};
+pub use mount::{InstancePage, LoadState, MountId, PackSource, PageId};
 pub use producer::{ClusterTopology, ProducerDesc, ProducerId, ProducerUpdate};
 pub use scene::{
     Affine3, CopyVariant, GroupWriter, InstanceFlags, InstanceRange, InstancesDesc, ModelId, Pose,
@@ -38,8 +46,8 @@ pub use scenes::{
     Budgets, ConsumerMarker, Frame, FrameDesc, FrameStats, RendererDesc, SceneCompute, Scenes,
 };
 pub use shaders::types::{
-    EmissiveGpu, GroupGpu, InstanceGpu, LightGpu, MaterialGpu, ProducerBatch, ProducerClusterGpu,
-    ProducerGpu, SceneRoot, SkyStats, SlotStateGpu, TopologyGpu,
+    EmissiveGpu, GroupGpu, InstanceGpu, LightGpu, MaterialGpu, MeshGpu, ModelGpu, ProducerBatch,
+    ProducerClusterGpu, ProducerGpu, SceneRoot, SkyStats, SlotStateGpu, TopologyGpu,
 };
 pub use time::FrameTime;
 pub use view::{
@@ -72,6 +80,25 @@ pub enum Error {
     Capacity { what: &'static str, capacity: u32 },
     #[error(transparent)]
     Kernels(#[from] orr_shaders::KernelMismatch),
+    #[error(transparent)]
+    Pack(#[from] orr_pack::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("{0:?} does not exist")]
+    UnknownMount(MountId),
+    #[error("{0:?} is still loading")]
+    NotReady(MountId),
+    #[error("{0:?} failed to load")]
+    MountFailed(MountId),
+    #[error("{0:?} was unmounted while loading")]
+    Unmounted(MountId),
+    #[error("{asset} is not an asset of this class in {mount:?}")]
+    Missing {
+        mount: MountId,
+        asset: orr_pack::AssetId,
+    },
+    #[error("texture format {0} has no GPU format")]
+    TextureFormat(u32),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

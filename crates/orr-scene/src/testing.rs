@@ -79,7 +79,11 @@ pub fn set_model_emission(
 
 /// Copies `count` values at `src` back to the CPU, after all work submitted so far.
 pub fn read_buffer<T: Pod>(src: GpuPtr<T>, count: u64) -> Vec<T> {
-    let d = device();
+    read_buffer_on(device(), src, count)
+}
+
+/// [`read_buffer`] on device `d`.
+pub fn read_buffer_on<T: Pod>(d: &Device, src: GpuPtr<T>, count: u64) -> Vec<T> {
     let out = d
         .gpu_malloc::<T>(MemoryKind::Readback, count, "test readback")
         .unwrap();
@@ -88,13 +92,18 @@ pub fn read_buffer<T: Pod>(src: GpuPtr<T>, count: u64) -> Vec<T> {
     list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
     list.copy(out.gpu.cast(), src.cast(), out.size);
     list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
-    wait(render.submit(vec![list], &[]).unwrap());
+    let point = render.submit(vec![list], &[]).unwrap();
+    render.wait(point, Duration::from_secs(10)).expect("wait");
     out.as_slice().unwrap().to_vec()
 }
 
 /// Copies `region` of `t` back to the CPU, tightly packed, after all work submitted so far.
 pub fn read_texture(t: &Texture, region: &TextureRegion) -> Vec<u8> {
-    let d = device();
+    read_texture_on(device(), t, region)
+}
+
+/// [`read_texture`] on device `d`.
+pub fn read_texture_on(d: &Device, t: &Texture, region: &TextureRegion) -> Vec<u8> {
     let bytes = region.bytes(t.desc().format);
     let out = d
         .gpu_malloc::<u8>(MemoryKind::Readback, bytes, "test readback")
@@ -104,7 +113,8 @@ pub fn read_texture(t: &Texture, region: &TextureRegion) -> Vec<u8> {
     list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
     list.copy_from_texture(out.gpu, t, region);
     list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
-    wait(render.submit(vec![list], &[]).unwrap());
+    let point = render.submit(vec![list], &[]).unwrap();
+    render.wait(point, Duration::from_secs(10)).expect("wait");
     out.as_slice().unwrap().to_vec()
 }
 
@@ -277,6 +287,26 @@ pub fn check(reference: &Path, image: &Image, tolerance: Tolerance) {
             actual.display()
         );
     }
+}
+
+/// The global model, mesh and material tables.
+pub fn global_tables(
+    scenes: &crate::Scenes,
+) -> (
+    GpuPtr<crate::ModelGpu>,
+    GpuPtr<crate::MeshGpu>,
+    GpuPtr<crate::MaterialGpu>,
+) {
+    scenes.tables()
+}
+
+/// The texture of cooked texture `id` in a ready mount.
+pub fn mounted_texture(
+    scenes: &crate::Scenes,
+    m: crate::MountId,
+    id: orr_pack::AssetId,
+) -> Option<std::sync::Arc<Texture>> {
+    scenes.texture_object(m, id)
 }
 
 #[cfg(test)]

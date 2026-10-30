@@ -52,6 +52,8 @@ const SCENE_TYPES: &[&str] = &[
     "InstanceGpu",
     "SlotStateGpu",
     "GroupGpu",
+    "ModelGpu",
+    "MeshGpu",
     "MaterialGpu",
     "LightGpu",
     "EmissiveGpu",

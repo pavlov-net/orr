@@ -99,5 +99,5 @@ fn removed_slots_wait_for_their_frame() {
 }
 
 fn is_empty(i: &orr_scene::InstanceGpu) -> bool {
-    orr_shaders::bytemuck::bytes_of(i).iter().all(|&b| b == 0)
+    bytemuck::bytes_of(i).iter().all(|&b| b == 0)
 }

@@ -26,10 +26,11 @@ pub use orr_output::{
 };
 pub use orr_scene::Error as SceneError;
 pub use orr_scene::{
-    Affine3, Budgets, Cone, ConsumerMarker, CopyVariant, DepthOfField, DirectionalLight,
-    DiscProfile, ExposureState, Focus, FrameStats, FrameTime, Glare, GroupGpu, GroupWriter,
-    InstanceFlags, InstanceGpu, InstanceRange, InstancesDesc, Lens, LensDistortion, Light,
-    LightGpu, LightId, MaterialGpu, MaterialId, MaterialWriter, ModelId, Pose, Projection,
+    Affine3, BoundTexture, Budgets, Cone, ConsumerMarker, CopyVariant, DepthOfField,
+    DirectionalLight, DiscProfile, ExposureState, Focus, FrameStats, FrameTime, Glare, GroupGpu,
+    GroupWriter, InstanceFlags, InstanceGpu, InstancePage, InstanceRange, InstancesDesc, Lens,
+    LensDistortion, Light, LightGpu, LightId, LoadState, Loading, MaterialGpu, MaterialId,
+    MaterialWriter, MeshGpu, ModelGpu, ModelId, MountId, PackSource, PageId, Pose, Projection,
     REBASE_GRID_LOG2, RendererDesc, SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter,
     SkyStats, SlotStateGpu, TransformGroupDesc, TransformGroupId, ViewConstants, ViewDesc,
     ViewHistoryId, ViewTarget, WorldPos, abi, material_flags, orr_gpu, orr_pack,
@@ -161,6 +162,45 @@ impl Renderer {
 
     pub fn destroy_view_history(&mut self, id: ViewHistoryId) {
         self.scenes.destroy_view_history(id);
+    }
+
+    /// The loading side's job queue, for the threads the consumer lends to it.
+    pub fn loading(&self) -> std::sync::Arc<Loading> {
+        self.scenes.loading()
+    }
+
+    /// Mounts a pack; returns at once and loads on the loading side.
+    pub fn mount(&mut self, source: PackSource) -> MountId {
+        self.scenes.mount(source)
+    }
+
+    pub fn mount_state(&self, m: MountId) -> LoadState {
+        self.scenes.mount_state(m)
+    }
+
+    /// Unmounts a pack; its memory is freed once every submitted frame has completed.
+    pub fn unmount(&mut self, m: MountId) {
+        self.scenes.unmount(m);
+    }
+
+    pub fn model(&self, m: MountId, id: orr_pack::AssetId) -> Result<ModelId> {
+        Ok(self.scenes.model(m, id)?)
+    }
+
+    pub fn instance_page(&self, m: MountId, id: orr_pack::AssetId) -> Result<PageId> {
+        Ok(self.scenes.instance_page(m, id)?)
+    }
+
+    pub fn page(&self, id: PageId) -> Option<&InstancePage> {
+        self.scenes.page(id)
+    }
+
+    pub fn texture(&self, m: MountId, id: orr_pack::AssetId) -> Result<TextureIndex> {
+        Ok(self.scenes.texture(m, id)?)
+    }
+
+    pub fn material(&self, m: MountId, id: orr_pack::AssetId) -> Result<MaterialId> {
+        Ok(self.scenes.material(m, id)?)
     }
 
     /// Step 1: waits until the frame `frames_in_flight` back has completed, sleeps on the
