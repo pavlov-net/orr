@@ -3,13 +3,16 @@
 //!
 //! [`Atmosphere`] describes the medium. [`AtmosphereState`] holds one atmosphere's GPU
 //! state: its LUTs, recorded at the scene compute point, and the [`AtmosphereGpu`] block
-//! the Slang module `atmosphere` reads (`DEP_ORR_ATMOSPHERE_SHADER_DIRS`). [`spectrum`]
-//! holds the build-time spectral coefficients and [`reference`](mod@reference) an f64
-//! spectral integrator that the GPU passes are checked against.
+//! the Slang module `atmosphere` reads (`DEP_ORR_ATMOSPHERE_SHADER_DIRS`), whose
+//! `AtmosphereSky` links into orr's kernels as the environment. [`presets`] holds example
+//! lights, [`spectrum`] the build-time spectral coefficients and
+//! [`reference`](mod@reference) an f64 spectral integrator that the GPU passes are checked
+//! against.
 
 mod block;
 pub mod colour;
 mod luts;
+pub mod presets;
 pub mod reference;
 pub mod spectrum;
 
@@ -53,7 +56,8 @@ pub struct Atmosphere {
     pub aerosol: Aerosol,
     pub ozone: Ozone,
     pub height_fog: Option<HeightFog>,
-    /// Airglow, zodiacal light and starlight in the sky.
+    /// Airglow, zodiacal light and starlight in the sky: 2e-4 cd/m^2 at the ground zenith with
+    /// the Earth defaults, dimmer through a denser medium.
     pub night_background: bool,
     /// Lights folded into the sky-view LUT, `1..=MAX_FOLDED_LIGHTS`.
     pub sky_lights: u32,

@@ -8,6 +8,7 @@ import orr.color;
 import tables;
 import lights;
 import media;
+import light_sampling;
 import atmosphere;
 
 struct Root
@@ -340,26 +341,30 @@ void ground_irradiance(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
 
 // Fold membership: the `sky_lights` brightest eligible candidates, ties to the earlier one.
 // A candidate is eligible when it names a directional light with some illuminance no more
-// than 18 deg below the focus horizon.
+// than 18 deg below the focus horizon. Writes each candidate's illuminance.
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void fold(uint3 id: SV_DispatchThreadID)
 {
     AtmosphereGpu* a = root.atmosphere;
     SceneRoot* scene = atmosphere_scene(a);
+    FoldGpu* f = a.fold;
     float luminance[MAX_SKY_LIGHTS];
     for (uint i = 0; i < MAX_SKY_LIGHTS; ++i)
     {
         luminance[i] = 0.0;
+        f.illuminance[i] = float4(0.0);
         uint index = a.candidates[i];
         if (i >= a.candidate_count || index >= scene.light_capacity)
             continue;
         LightGpu l = scene.lights[index];
         if (l.kind != LIGHT_DIRECTIONAL || dot(normalize(l.direction), a.up.xyz) < FOLD_HORIZON)
             continue;
-        luminance[i] = max(luminance_rec2020(l.color), 0.0);
+        float3 e = l.disc == DISC_TEXTURED && all(l.color == 0.0)
+            ? textured_disc_integral(scene, index) : l.color;
+        f.illuminance[i] = float4(e, 0.0);
+        luminance[i] = max(luminance_rec2020(e), 0.0);
     }
-    FoldGpu* f = a.fold;
     for (uint i = 0; i < MAX_SKY_LIGHTS; ++i)
     {
         uint brighter = 0;
@@ -410,9 +415,8 @@ void sky_view(uint3 id: SV_DispatchThreadID)
     for (uint l = 0; l < lights.count; ++l)
     {
         uint slot = f.folded[l];
-        LightGpu light = scene.lights[a.candidates[slot]];
-        lights.direction[l] = normalize(light.direction);
-        colour[l] = light.color * f.weight[slot];
+        lights.direction[l] = normalize(scene.lights[a.candidates[slot]].direction);
+        colour[l] = f.illuminance[slot].rgb * f.weight[slot];
     }
     float3 rgb = float3(0.0);
     for (uint p = 0; p < a.group_passes; ++p)

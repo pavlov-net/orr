@@ -1,7 +1,13 @@
-// Probes of the atmosphere module: LUT parameterisation round trips, altitudes, LUT texels
-// and the sky-view LUT integrated over the upper hemisphere.
+// Probes of the atmosphere module: LUT parameterisation round trips, altitudes, LUT texels,
+// the sky-view LUT integrated over the upper hemisphere, `AtmosphereSky` directly and as
+// lighting bakes it, the night background, and a light's disc seen through the atmosphere.
 #include "orr/root.h"
 import orr.math;
+import orr.color;
+import lights;
+import media;
+import environment;
+import light_sampling;
 import atmosphere;
 
 struct Root
@@ -16,6 +22,9 @@ struct Root
     float4 light;
     // The light's Rec.2020 illuminance.
     float4 colour;
+    // Lighting's `LightSetGpu`, for `disc`.
+    uint64_t set;
+    uint64_t _pad0;
 }
 ORR_ROOT(Root);
 
@@ -108,6 +117,20 @@ void sky_view_lut(uint3 id: SV_DispatchThreadID)
 
 static groupshared float3 sums[64];
 
+// The sum of `e` over the 64 lanes of the group.
+float3 group_sum(uint lane, float3 e)
+{
+    sums[lane] = e;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint w = 32; w > 0; w >>= 1)
+    {
+        if (lane < w)
+            sums[lane] += sums[lane + w];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    return sums[0];
+}
+
 // Irradiance on a horizontal surface at the eye `input[0]` (render space): output 0 is the
 // sky-view LUT over the upper hemisphere (`count` directions), output 1 the light `colour`
 // through the atmosphere; both Rec.2020 lux.
@@ -129,19 +152,107 @@ void irradiance(uint lane: SV_GroupIndex)
         float3 dir = s * cos(phi) * x + s * sin(phi) * y + c * up;
         e += atmosphere_sky_view(a, dir, eye) * c;
     }
-    sums[lane] = e;
-    GroupMemoryBarrierWithGroupSync();
-    for (uint w = 32; w > 0; w >>= 1)
-    {
-        if (lane < w)
-            sums[lane] += sums[lane + w];
-        GroupMemoryBarrierWithGroupSync();
-    }
+    e = group_sum(lane, e);
     if (lane != 0)
         return;
     float mu = dot(root.light.xyz, up);
     float h = atmosphere_spherical_altitude(a, eye);
-    root.output[0] = float4(sums[0] * (TWO_PI / float(root.count)), 0.0);
+    root.output[0] = float4(e * (TWO_PI / float(root.count)), 0.0);
     root.output[1] =
         float4(root.colour.rgb * atmosphere_transmittance_to_space(a, h, mu) * max(mu, 0.0), 0.0);
+}
+
+// `AtmosphereSky.radiance` along each direction `input[i]` from the eye `light.xyz` (render
+// space).
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void sky_radiance(uint3 id: SV_DispatchThreadID)
+{
+    if (id.x < root.count)
+        root.output[id.x] = float4(AtmosphereSky.radiance((uint64_t)root.atmosphere,
+                                                          root.input[id.x].xyz, root.light.xyz), 0.0);
+}
+
+// The night background before extinction from altitude `light.w` at zenith cosine
+// `input[i].x`.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void night_background(uint3 id: SV_DispatchThreadID)
+{
+    if (id.x < root.count)
+        root.output[id.x] =
+            float4(atmosphere_night_background(root.atmosphere, root.light.w, root.input[id.x].x));
+}
+
+// Output 0: the mean over the texels of a `count` x `count` equal-area map of what lighting's
+// bake puts in each for `AtmosphereSky` seen from the eye `light.xyz`, luminance in w.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void bake_mean(uint lane: SV_GroupIndex)
+{
+    uint n = root.count;
+    float3 e = float3(0.0);
+    for (uint k = lane; k < n * n; k += 64)
+        e += bake_texel<AtmosphereSky>((uint64_t)root.atmosphere, root.light.xyz, uint2(k % n, k / n), n);
+    e = group_sum(lane, e);
+    if (lane == 0)
+    {
+        float3 m = e / float(n * n);
+        root.output[0] = float4(m, luminance_rec2020(m));
+    }
+}
+
+// The atmosphere's transmittance to space as a medium with no scattering; `data` is the block.
+struct SkyTransmittance : IMedium
+{
+    static MediumPoint sample(uint64_t data, float3 p_render)
+    {
+        return NoMedium.sample(data, p_render);
+    }
+
+    static float3 phase(uint64_t data, MediumPoint m, float cos_theta)
+    {
+        return float3(0.0);
+    }
+
+    static float3 multiple_scattering(uint64_t data, float3 p_render, float3 dir_to_light)
+    {
+        return float3(0.0);
+    }
+
+    static float3 transmittance(uint64_t data, float3 origin, float3 dir, float t)
+    {
+        AtmosphereGpu* a = (AtmosphereGpu*)data;
+        return atmosphere_transmittance_to_space(a, atmosphere_altitude(a, origin), dot(dir, a.up.xyz));
+    }
+}
+
+// Light `layer`'s disc seen from the eye `light.xyz` through the atmosphere: output 0 its
+// radiance integrated over the cone, weighted by the cosine to the axis (`count` rings of 64
+// directions, equal in solid angle); output 1 its illuminance times the transmittance along
+// the axis.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void disc(uint lane: SV_GroupIndex)
+{
+    LightSetGpu* set = (LightSetGpu*)root.set;
+    LightGpu l = set.scene.lights[root.layer];
+    float3 eye = root.light.xyz;
+    float3 t, b;
+    orthonormal_basis(l.direction, t, b);
+    float sin_max = sin(l.radius);
+    float phi = TWO_PI * (float(lane) + 0.5) / 64.0;
+    float3 e = float3(0.0);
+    for (uint k = 0; k < root.count; k++)
+    {
+        float s = sin_max * sqrt((float(k) + 0.5) / float(root.count));
+        float3 dir = sqrt(1.0 - s * s) * l.direction + s * (cos(phi) * t + sin(phi) * b);
+        e += directional_disc<SkyTransmittance>(set, root.layer, eye, dir);
+    }
+    e = group_sum(lane, e);
+    if (lane != 0)
+        return;
+    root.output[0] = float4(e * (PI * sin_max * sin_max / (64.0 * float(root.count))), 0.0);
+    root.output[1] = float4(l.color * SkyTransmittance.transmittance(set.scene.medium, eye,
+                                                                     l.direction, positive_infinity()), 0.0);
 }

@@ -273,7 +273,11 @@ impl Build {
                     linked_dirs.push(dir.clone());
                 }
             }
-            lint_roots.extend(module_dirs);
+            for dir in module_dirs {
+                if !lint_roots.contains(&dir) {
+                    lint_roots.push(dir);
+                }
+            }
             let run = self.run(&tool, &linked_dirs, &records, jobs)?;
             linked_modules = run.modules;
             compiled.extend(run.compiled.into_iter().map(|n| format!("linked/{n}")));

@@ -1,10 +1,10 @@
 //! An [`Atmosphere`] as the GPU reads it: the medium fields of [`AtmosphereGpu`] and the
 //! per-group coefficients of the LUT passes.
 
-use glam::Vec3;
+use glam::{DVec3, Vec3};
 use orr::WorldPos;
 
-use crate::colour::{REC709_TO_REC2020, mul};
+use crate::colour::{REC709_TO_REC2020, REC2020_LUMINANCE, mul};
 use crate::shaders::types::{AtmosphereGpu, AtmosphereGroups};
 use crate::spectrum::{GROUPS, RGB, SOLAR_COLOUR, SPECTRAL_GROUPS, rgb_at};
 use crate::{Atmosphere, DOBSON_UNIT};
@@ -20,9 +20,45 @@ fn xyz(v: [f64; 3]) -> [f32; 4] {
     [v[0] as f32, v[1] as f32, v[2] as f32, 0.0]
 }
 
+/// Night background luminance at the ground zenith with the Earth defaults, cd/m^2.
+const NIGHT_ZENITH: f64 = 2e-4;
+
 /// Ozone molecules per m^3 at the tent's peak.
 fn ozone_peak(a: &Atmosphere) -> f64 {
     f64::from(a.ozone.column) * DOBSON_UNIT / f64::from(a.ozone.half_width)
+}
+
+/// Transmittance from the ground to space straight up, per Rec.2020 channel of sunlight, as
+/// the transmittance LUT's Rec.2020 layer holds it. Fog is left out.
+fn zenith_transmittance(a: &Atmosphere) -> [f64; 3] {
+    let thickness = f64::from(a.top_radius - a.planet_radius);
+    let column = |scale: f32| {
+        let h = f64::from(scale);
+        h * (1.0 - (-thickness / h).exp())
+    };
+    let rayleigh = f64::from(a.rayleigh.density) * column(a.rayleigh.scale_height);
+    let aerosol = f64::from(a.aerosol.optical_depth_550) * column(a.aerosol.scale_height)
+        / f64::from(a.aerosol.scale_height);
+    let ozone = f64::from(a.ozone.column) * DOBSON_UNIT;
+    let alpha = f64::from(a.aerosol.angstrom_exponent);
+    std::array::from_fn(|c| {
+        (0..SPECTRAL_GROUPS)
+            .map(|k| {
+                let depth = GROUPS.rayleigh[k] * rayleigh
+                    + GROUPS.aerosol_factor(k, alpha) * aerosol
+                    + GROUPS.ozone_cross_section[k] * ozone;
+                GROUPS.rec2020[k][c] * (-depth).exp()
+            })
+            .sum::<f64>()
+            / SOLAR_COLOUR[c]
+    })
+}
+
+/// Zenith radiance of the night background before extinction, nits: the value that gives
+/// [`NIGHT_ZENITH`] at the ground under the Earth defaults.
+fn night_zenith() -> f64 {
+    let t = zenith_transmittance(&Atmosphere::earth(DVec3::ZERO, Vec3::Y));
+    NIGHT_ZENITH / (0..3).map(|c| REC2020_LUMINANCE[c] * t[c]).sum::<f64>()
 }
 
 /// Each group's coefficients, three groups per pass.
@@ -83,7 +119,11 @@ pub(crate) fn medium(a: &Atmosphere, out: &mut AtmosphereGpu) {
     out.aerosol_asymmetry = a.aerosol.asymmetry;
     out.ozone_peak = a.ozone.peak_altitude;
     out.ozone_half_width = a.ozone.half_width;
-    out.night_background = if a.night_background { 1.0 } else { 0.0 };
+    out.night_background = if a.night_background {
+        night_zenith() as f32
+    } else {
+        0.0
+    };
     let fog = a.height_fog.filter(|f| f.density > 0.0);
     out.fog_density = fog.map_or(0.0, |f| f.density);
     out.fog_base = fog.map_or(0.0, |f| f.base_height);

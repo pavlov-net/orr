@@ -3,23 +3,29 @@
 
 use std::sync::OnceLock;
 
-use glam::{DVec3, Vec3};
+use glam::DVec3;
 use orr::abi::{GpuPtr, SamplerIndex};
 use orr::orr_gpu::{
     ComputePipeline, Hazards, MemoryKind, QueueKind, ShaderStage, SpecData, Stages,
 };
 use orr::{
-    DirectionalLight, DiscProfile, FrameDesc, FrameTime, Light, LightId, Renderer, RendererDesc,
-    SceneDesc, SceneId, SceneRoot,
+    DirectionalLight, FrameDesc, FrameTime, Light, LightId, Renderer, RendererDesc, SceneDesc,
+    SceneId, SceneRoot,
 };
-use orr_atmosphere::colour::REC709_TO_REC2020;
+use orr_atmosphere::presets::solar_disc;
 use orr_atmosphere::spectrum::{SOLAR_COLOUR, SOLAR_ILLUMINANCE};
 use orr_atmosphere::{Atmosphere, AtmosphereGpu, AtmosphereState};
+use orr_lighting::{LightingStats, SceneLighting, SceneLightingSettings, ScenePass};
 use orr_scene::testing::{device, read_buffer, wait};
 
 /// Generated kernel modules and types of the suite's Slang.
 pub mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
+}
+
+/// orr's kernels with `AtmosphereSky` linked as the environment.
+pub mod linked {
+    include!(concat!(env!("OUT_DIR"), "/linked/orr_kernels.rs"));
 }
 
 use shaders::probe::{MODULE, Root};
@@ -37,37 +43,25 @@ pub fn solar_rec2020() -> [f64; 3] {
     SOLAR_COLOUR.map(|c| c * SOLAR_ILLUMINANCE)
 }
 
-/// Rec.709 illuminance that the light table converts to [`solar_rec2020`].
-fn solar_rec709() -> Vec3 {
-    let m = REC709_TO_REC2020;
-    let det = |m: [[f64; 3]; 3]| {
-        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
-    };
-    let target = solar_rec2020();
-    // Cramer's rule for m x = target.
-    let x: [f64; 3] = std::array::from_fn(|c| {
-        let mut mc = m;
-        for (row, t) in mc.iter_mut().zip(target) {
-            row[c] = t;
-        }
-        det(mc) / det(m)
-    });
-    Vec3::new(x[0] as f32, x[1] as f32, x[2] as f32)
-}
-
-/// A renderer with one scene and one atmosphere whose candidate is [`SUN`].
+/// A renderer with orr's kernels linked to the sky, one scene and one atmosphere whose
+/// candidate is [`SUN`], and optionally lighting's scene pass after the atmosphere's.
 pub struct Rig {
     pub renderer: Renderer,
     pub scene: SceneId,
     pub sky: AtmosphereState,
+    pub lighting: Option<SceneLighting>,
     frames: u32,
+    frame_id: u64,
+    lights: Vec<LightId>,
 }
 
 impl Rig {
     pub fn new(atmosphere: &Atmosphere) -> Self {
-        let mut renderer = Renderer::new(device(), RendererDesc::default()).unwrap();
+        let desc = RendererDesc {
+            kernels: &linked::KERNELS,
+            ..RendererDesc::default()
+        };
+        let mut renderer = Renderer::new(device(), desc).unwrap();
         let scene = renderer.create_scene(&SceneDesc::default()).unwrap();
         let mut sky = AtmosphereState::new(device(), atmosphere, SamplerIndex(7)).unwrap();
         sky.set_lights(&[SUN]);
@@ -75,13 +69,45 @@ impl Rig {
             renderer,
             scene,
             sky,
+            lighting: None,
             frames: 0,
+            frame_id: 0,
+            lights: Vec::new(),
+        }
+    }
+
+    /// The same, with lighting's scene pass baking the linked sky every frame.
+    pub fn with_lighting(atmosphere: &Atmosphere) -> Self {
+        let lighting = SceneLighting::new(
+            device(),
+            &linked::KERNELS,
+            &SceneDesc::default(),
+            &SceneLightingSettings::default(),
+        )
+        .unwrap();
+        Self {
+            lighting: Some(lighting),
+            ..Self::new(atmosphere)
         }
     }
 
     /// One frame with sunlight from `sun` (none: no light) and the focus at `focus`; waits
     /// for it and returns the scene root.
     pub fn frame(&mut self, sun: Option<DVec3>, focus: DVec3) -> GpuPtr<SceneRoot> {
+        let lights: Vec<_> = sun
+            .map(|d| (SUN, solar_disc(d.as_vec3())))
+            .into_iter()
+            .collect();
+        self.frame_lights(&lights, focus)
+    }
+
+    /// One frame with exactly `lights` in the light table and the focus at `focus`; waits
+    /// for it and returns the scene root.
+    pub fn frame_lights(
+        &mut self,
+        lights: &[(LightId, DirectionalLight)],
+        focus: DVec3,
+    ) -> GpuPtr<SceneRoot> {
         self.frames += 1;
         let listed = [self.scene];
         let mut f = self
@@ -94,26 +120,33 @@ impl Rig {
                 scenes: &listed,
             })
             .unwrap();
+        self.frame_id = f.id();
         {
             let mut w = f.scene(self.scene).unwrap();
-            let light = sun.map(|d| {
-                Light::Directional(DirectionalLight {
-                    direction_to_light: d.as_vec3(),
-                    illuminance: solar_rec709(),
-                    angular_radius: 4.652e-3,
-                    disc: DiscProfile::LimbDarkened,
-                })
-            });
-            w.set_light(SUN, light.as_ref()).unwrap();
+            for id in self.lights.drain(..) {
+                w.set_light(id, None).unwrap();
+            }
+            for (id, l) in lights {
+                w.set_light(*id, Some(&Light::Directional(*l))).unwrap();
+                self.lights.push(*id);
+            }
             w.set_focus(focus, 1000.0);
             w.set_environment(self.sky.data());
             w.set_medium(self.sky.data());
         }
         let mut root = None;
-        let sky = &mut self.sky;
+        let (sky, lighting, frame) = (&mut self.sky, &mut self.lighting, self.frame_id);
         f.update_scenes(&mut |cx| {
             root = Some(cx.root);
             sky.record(cx).unwrap();
+            if let Some(lighting) = lighting.as_mut() {
+                let pass = ScenePass {
+                    frame,
+                    scene: cx.root,
+                    focus: focus.as_vec3().to_array(),
+                };
+                lighting.record(cx.cmd, &pass);
+            }
         })
         .unwrap();
         wait(f.end().unwrap());
@@ -123,6 +156,12 @@ impl Rig {
     pub fn block(&self) -> GpuPtr<AtmosphereGpu> {
         // SAFETY: `data` is the address of an `AtmosphereGpu`.
         unsafe { GpuPtr::from_address(self.sky.data()) }
+    }
+
+    /// Lighting's statistics of the last frame.
+    pub fn lighting_stats(&self) -> LightingStats {
+        let lighting = self.lighting.as_ref().expect("a rig with lighting");
+        lighting.stats(self.frame_id).unwrap()
     }
 }
 
@@ -153,6 +192,8 @@ pub struct Probe<'a> {
     pub layer: u32,
     pub light: [f32; 4],
     pub colour: [f32; 4],
+    /// Lighting's light set.
+    pub set: u64,
 }
 
 /// Runs probe kernel `entry` and returns its first `outputs` values.
@@ -185,6 +226,8 @@ pub fn probe(
         layer: p.layer,
         light: p.light,
         colour: p.colour,
+        set: p.set,
+        _pad0: 0,
     };
     let render = d.queue(QueueKind::Render).unwrap();
     let mut list = render.command_list().unwrap();
