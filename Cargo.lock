@@ -138,6 +138,9 @@ version = "0.0.1"
 [[package]]
 name = "orr_cook"
 version = "0.0.1"
+dependencies = [
+ "orr_pack",
+]
 
 [[package]]
 name = "orr_dlss"
