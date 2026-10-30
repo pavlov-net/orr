@@ -1,0 +1,24 @@
+[package]
+name = "lighting_suite"
+description = "Headless GPU tests of orr_lighting, run with the validation layer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+orr_gpu.workspace = true
+orr_shaders.workspace = true
+orr_lighting = { path = "../../crates/orr_lighting" }
+orr_pack.workspace = true
+gpu_suite = { path = "../gpu_suite" }
+shader_math = { path = "../shader_math" }
+glam.workspace = true
+bytemuck.workspace = true
+
+[build-dependencies]
+orr_shaders = { workspace = true, features = ["build"] }
+
+[lints]
+workspace = true
