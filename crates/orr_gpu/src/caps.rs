@@ -15,6 +15,14 @@ pub struct Caps {
     pub host_image_copy: bool,
     /// GDeflate 1.0 memory decompression.
     pub memory_decompression: bool,
+    /// Ray-dispatch pipelines (`VK_KHR_ray_tracing_pipeline` with invocation reordering):
+    /// [`crate::Device::create_ray_dispatch_pipeline`] and
+    /// [`crate::CommandList::dispatch_rays`].
+    pub ray_dispatch: bool,
+    /// The device reorders invocations at coherence points in hardware. Without it
+    /// reordering is a no-op and kernels run their compute entry. False without
+    /// `ray_dispatch`.
+    pub reorder: bool,
     /// Opacity micromaps (`VK_KHR_opacity_micromap` with device address commands); kernels
     /// that trace OMM geometry load their `spirv_omm` variant.
     pub omm: bool,
@@ -60,6 +68,9 @@ pub struct Limits {
     pub max_image_extent_2d: u32,
     pub max_image_extent_3d: u32,
     pub max_image_layers: u32,
+    /// Invocations one [`crate::CommandList::dispatch_rays`] may launch; 0 without
+    /// `Caps::ray_dispatch`.
+    pub max_ray_dispatch_invocations: u32,
     /// Size of the device-local heap.
     pub device_local_bytes: u64,
     /// Size of the heap behind [`crate::MemoryKind::Upload`].

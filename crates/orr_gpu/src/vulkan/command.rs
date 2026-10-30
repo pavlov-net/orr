@@ -7,6 +7,7 @@ use bytemuck::{Pod, Zeroable};
 
 use super::pipeline::ComputePipeline;
 use super::queue::{ListResources, MAX_PASSES, Queue};
+use super::ray::RayDispatchPipeline;
 use super::texture::Texture;
 use crate::{Error, GpuPtr, Hazards, Stages, TextureRegion};
 
@@ -76,10 +77,12 @@ impl<'q> CommandList<'q> {
         Ok((res, std::mem::take(&mut self.passes)))
     }
 
-    /// Makes writes in `before` stages visible to `after` stages.
+    /// Makes writes in `before` stages visible to `after` stages. [`Stages::RAY`] is
+    /// ignored without `Caps::ray_dispatch`, since no ray-dispatch work can run then.
     pub fn barrier(&mut self, before: Stages, after: Stages, hazards: Hazards) {
-        let mut src = vk_stages(before);
-        let mut dst = vk_stages(after);
+        let ray = self.queue.shared.caps.ray_dispatch;
+        let mut src = vk_stages(before, ray);
+        let mut dst = vk_stages(after, ray);
         let mut src_access = vk::AccessFlags2::MEMORY_WRITE;
         let mut dst_access = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
         if hazards.contains(Hazards::DRAW_ARGUMENTS) {
@@ -136,15 +139,12 @@ impl<'q> CommandList<'q> {
         }
     }
 
-    fn bind_compute(&mut self, p: &ComputePipeline, root: u64) {
+    fn bind(&mut self, point: vk::PipelineBindPoint, pipeline: vk::Pipeline, root: u64) {
         let cmd = self.cmd();
-        if self.bound != p.raw {
+        if self.bound != pipeline {
             // SAFETY: recording on a compute-capable queue.
-            unsafe {
-                self.device()
-                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, p.raw);
-            };
-            self.bound = p.raw;
+            unsafe { self.device().cmd_bind_pipeline(cmd, point, pipeline) };
+            self.bound = pipeline;
         }
         let data = root.to_le_bytes();
         let push = vk::PushDataInfoEXT {
@@ -158,11 +158,41 @@ impl<'q> CommandList<'q> {
 
     /// Runs `p` over `groups` workgroups with `root` as its root pointer.
     pub fn dispatch<R>(&mut self, p: &ComputePipeline, root: GpuPtr<R>, groups: [u32; 3]) {
-        self.bind_compute(p, root.address().0);
+        self.bind(vk::PipelineBindPoint::COMPUTE, p.raw, root.address().0);
         // SAFETY: recording with a compute pipeline bound.
         unsafe {
             self.device()
                 .cmd_dispatch(self.cmd(), groups[0], groups[1], groups[2]);
+        };
+    }
+
+    /// Runs `p`'s raygen entry once per element of `extent` with `root` as its root pointer.
+    pub fn dispatch_rays<R>(&mut self, p: &RayDispatchPipeline, root: GpuPtr<R>, extent: [u32; 3]) {
+        self.bind(
+            vk::PipelineBindPoint::RAY_TRACING_KHR,
+            p.raw,
+            root.address().0,
+        );
+        let rt = self
+            .queue
+            .shared
+            .rt_fn
+            .as_ref()
+            .expect("a ray-dispatch pipeline exists");
+        let empty = vk::StridedDeviceAddressRegionKHR::default();
+        // SAFETY: recording with a ray-tracing pipeline bound; its raygen record is live
+        // while the pipeline is.
+        unsafe {
+            rt.cmd_trace_rays(
+                self.cmd(),
+                &p.raygen,
+                &empty,
+                &empty,
+                &empty,
+                extent[0],
+                extent[1],
+                extent[2],
+            );
         };
     }
 
@@ -173,7 +203,7 @@ impl<'q> CommandList<'q> {
         root: GpuPtr<R>,
         args: GpuPtr<DispatchArgs>,
     ) {
-        self.bind_compute(p, root.address().0);
+        self.bind(vk::PipelineBindPoint::COMPUTE, p.raw, root.address().0);
         let (buffer, offset) = self
             .queue
             .shared
@@ -324,7 +354,7 @@ impl Drop for CommandList<'_> {
     }
 }
 
-fn vk_stages(s: Stages) -> vk::PipelineStageFlags2 {
+fn vk_stages(s: Stages, ray: bool) -> vk::PipelineStageFlags2 {
     use vk::PipelineStageFlags2 as P;
     if s.contains(Stages::ALL) {
         return P::ALL_COMMANDS;
@@ -336,7 +366,14 @@ fn vk_stages(s: Stages) -> vk::PipelineStageFlags2 {
         (Stages::TASK, P::TASK_SHADER_EXT),
         (Stages::MESH, P::MESH_SHADER_EXT),
         (Stages::PIXEL, P::FRAGMENT_SHADER),
-        (Stages::RAY, P::RAY_TRACING_SHADER_KHR),
+        (
+            Stages::RAY,
+            if ray {
+                P::RAY_TRACING_SHADER_KHR
+            } else {
+                P::NONE
+            },
+        ),
         (Stages::COLOR_OUT, P::COLOR_ATTACHMENT_OUTPUT),
         (
             Stages::DEPTH,

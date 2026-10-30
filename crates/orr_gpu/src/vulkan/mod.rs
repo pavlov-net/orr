@@ -11,6 +11,7 @@ mod heap;
 mod memory;
 mod pipeline;
 mod queue;
+mod ray;
 mod texture;
 
 pub use accel::{
@@ -22,4 +23,5 @@ pub use device::{Device, DeviceDesc};
 pub use memory::{Allocation, HeapReport, MemoryKind, MemoryReport, MemoryUsage};
 pub use pipeline::{ComputePipeline, ShaderStage};
 pub use queue::{PassResult, PipelineStats, Queue, QueueKind, QueueRequest};
+pub use ray::RayDispatchPipeline;
 pub use texture::{Texture, TextureMemory};
