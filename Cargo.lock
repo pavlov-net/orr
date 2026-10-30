@@ -299,7 +299,7 @@ dependencies = [
  "miniz_oxide 0.9.1",
  "profiling",
  "rayon",
- "thiserror 2.0.21",
+ "thiserror",
  "zstd",
 ]
 
@@ -557,7 +557,7 @@ dependencies = [
  "cfg-if",
  "document-features",
  "num-traits",
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
@@ -632,25 +632,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "835ae9d781464a79026cde387f9cbc650c9a4909d7cf7e658b127e3c35d2f35d"
 dependencies = [
  "bytemuck",
-]
-
-[[package]]
-name = "gdeflate"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3592607e4bf12b707c22523c1ee82b1b6c7b7aac8d24bc055afe62e41734fa2d"
-dependencies = [
- "gdeflate-sys",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "gdeflate-sys"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57d037ff28c21adce29618dbe9271e8b5a7ed121efe8482b43182db9649797d0"
-dependencies = [
- "cc",
 ]
 
 [[package]]
@@ -748,7 +729,6 @@ version = "0.0.1"
 dependencies = [
  "ash",
  "blake3",
- "gdeflate",
  "glam",
  "half",
  "log",
@@ -1015,7 +995,7 @@ dependencies = [
  "bitflags 2.13.2",
  "cc",
  "float-cmp 0.10.0",
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
@@ -1128,14 +1108,10 @@ dependencies = [
 name = "orr"
 version = "0.0.1"
 dependencies = [
- "egui",
- "gpu-suite",
- "log",
- "orr-egui",
  "orr-lighting",
  "orr-output",
  "orr-scene",
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
@@ -1167,7 +1143,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
- "thiserror 2.0.21",
+ "thiserror",
  "tiff",
  "toml",
  "windows",
@@ -1182,7 +1158,7 @@ dependencies = [
  "bindgen",
  "half",
  "log",
- "thiserror 2.0.21",
+ "thiserror",
  "uuid",
 ]
 
@@ -1208,7 +1184,7 @@ dependencies = [
  "log",
  "orr-shaders",
  "raw-window-handle",
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
@@ -1219,7 +1195,7 @@ dependencies = [
  "glam",
  "orr-scene",
  "orr-shaders",
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
@@ -1234,7 +1210,7 @@ dependencies = [
  "orr-shaders",
  "png 0.18.1",
  "raw-window-handle",
- "thiserror 2.0.21",
+ "thiserror",
  "windows",
  "windows-core",
 ]
@@ -1246,7 +1222,7 @@ dependencies = [
  "blake3",
  "bytemuck",
  "meshopt",
- "thiserror 2.0.21",
+ "thiserror",
  "zstd",
 ]
 
@@ -1263,7 +1239,7 @@ dependencies = [
  "orr-gpu",
  "orr-pack",
  "orr-shaders",
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
@@ -1277,7 +1253,7 @@ dependencies = [
  "libloading",
  "serde",
  "serde_json",
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
@@ -1906,31 +1882,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
 version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.21",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
+ "thiserror-impl",
 ]
 
 [[package]]
@@ -2107,7 +2063,7 @@ dependencies = [
  "log",
  "peniko",
  "smallvec",
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
