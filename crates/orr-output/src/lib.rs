@@ -1,4 +1,5 @@
-//! Display output for orr: exposure, tonemapping, the display target and presentation.
+//! Display output for orr: exposure, white balance, tonemapping, the display target and
+//! presentation.
 
 mod display;
 #[cfg(windows)]
@@ -10,6 +11,7 @@ mod hooks;
 mod passes;
 mod ui;
 mod view;
+mod white_balance;
 
 mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
@@ -35,6 +37,10 @@ pub use passes::{
 };
 pub use ui::UiLayer;
 pub use view::{OutputDebug, ViewOutput};
+pub use white_balance::{
+    AutoWhiteBalance, D65_XY, WHITE_BALANCE_CCT, WHITE_BALANCE_DUV, cct_duv_from_xy,
+    xy_from_cct_duv,
+};
 
 /// Errors from orr-output.
 #[derive(Debug, thiserror::Error)]

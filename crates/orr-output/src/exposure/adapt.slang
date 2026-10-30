@@ -1,6 +1,6 @@
-// Turns the meter's histogram and the scene's sky statistics into this render's exposure:
-// reads the view's current exposure slot, writes the next one and the telemetry, and clears
-// the histogram for the next frame.
+// Turns the meter's histogram and the scene's sky statistics into this render's exposure and
+// white point: reads the view's current exposure slot, writes the next one, the white
+// balance matrix and the telemetry, and clears the histogram for the next frame.
 #include "orr/root.h"
 import orr.abi;
 import orr.color;
@@ -21,6 +21,10 @@ static const float SEARCH_STOPS = 8.0;
 static const uint STATE_UNSET = 0;
 static const uint STATE_SNAPPED = 1;
 static const uint STATE_ADAPTING = 2;
+// The white point's range: correlated colour temperature and distance from the locus.
+static const float CCT_MIN = 2500.0;
+static const float CCT_MAX = 7000.0;
+static const float DUV_LIMIT = 0.05;
 
 public struct AdaptParams
 {
@@ -49,6 +53,16 @@ public struct AdaptParams
     public float long_speed_darken;
     public float bound_brighten;
     public float bound_darken;
+    // Auto white balance, with `white_balance`: its speed (per second), the D65 light added
+    // to the mix (cd/m2) and the reference weights.
+    public uint white_balance;
+    public float white_speed;
+    public float virtual_light_nits;
+    public float white_histogram;
+    public float white_dome;
+    public float white_directional;
+    public uint _pad0;
+    public uint _pad1;
 }
 
 // What adapt read and wrote for one render, read back by the CPU.
@@ -60,6 +74,7 @@ public struct ExposureTelemetryGpu
     // The histogram mean, scene EV100; valid when `metered` is 1.
     public float metered_ev100;
     public float2 white_point_xy;
+    public float2 white_target_xy;
     // The next render's pre-exposure.
     public float pre_exposure;
     public uint metered;
@@ -76,11 +91,20 @@ struct Root
     // Null without a scene.
     SkyStats* sky;
     ExposureTelemetryGpu* telemetry;
+    // Rows of the white balance matrix on linear Rec.2020, which tonemap applies.
+    float4* white_balance;
+    uint _pad0;
+    uint _pad1;
 }
 ORR_ROOT(Root);
 
-static const float2 D65_XY = float2(0.3127, 0.3290);
 static const float PI = 3.14159265358979;
+
+// The 64-bit sum whose low word is at `low`.
+float wide(uint* low)
+{
+    return float(*(low + 1)) * 4294967296.0 + float(*low);
+}
 
 float compensation(AdaptParams* p, float ev100)
 {
@@ -98,10 +122,23 @@ float keyed(AdaptParams* p, float metered_ev100)
     return clamp(ev, p.clamp_min, p.clamp_max);
 }
 
-// The mean EV100 of the histogram between the filter percentiles; false when it is empty.
-bool histogram_mean(AdaptParams* p, out float mean)
+// The histogram between the filter percentiles.
+struct Metered
 {
-    mean = 0.0;
+    // The mean EV100.
+    float ev100;
+    // The mean luminance, and the luminance-weighted mean chromaticity when the meter summed
+    // it.
+    float luminance;
+    float2 xy;
+}
+
+// False when the histogram is empty.
+bool histogram_mean(AdaptParams* p, out Metered m)
+{
+    m.ev100 = 0.0;
+    m.luminance = 0.0;
+    m.xy = D65_XY;
     float total = 0.0;
     for (uint b = 0; b < HISTOGRAM_BINS; b++)
         total += float(*(root.histogram + HISTOGRAM_WORDS * b));
@@ -112,6 +149,7 @@ bool histogram_mean(AdaptParams* p, out float mean)
     float below = 0.0;
     float sum = 0.0;
     float weight = 0.0;
+    float3 yxy = 0.0;
     for (uint b = 0; b < HISTOGRAM_BINS; b++)
     {
         uint* bin = root.histogram + HISTOGRAM_WORDS * b;
@@ -122,14 +160,17 @@ bool histogram_mean(AdaptParams* p, out float mean)
         below += count;
         if (w <= 0.0)
             continue;
-        float offsets = float(*(bin + 2)) * 4294967296.0 + float(*(bin + 1));
-        float ev = p.ev_min + (float(b) + (offsets / count + 0.5) / BIN_OFFSET_STEPS) * p.bin_ev;
+        float ev = p.ev_min + (float(b) + (wide(bin + 1) / count + 0.5) / BIN_OFFSET_STEPS) * p.bin_ev;
         sum += w * ev;
         weight += w;
+        float2 xy = float2(wide(bin + 3), wide(bin + 5)) / (count * CHROMA_STEPS);
+        yxy += w * luminance_from_ev100(ev) * float3(xy, 1.0);
     }
     if (weight <= 0.0)
         return false;
-    mean = sum / weight;
+    m.ev100 = sum / weight;
+    m.luminance = yxy.z / weight;
+    m.xy = yxy.xy / yxy.z;
     return true;
 }
 
@@ -152,6 +193,32 @@ float reference_mix(AdaptParams* p, float metered, SkyStats sky)
     return weight > 0.0 ? sum / weight : metered;
 }
 
+// `xy` moved onto the nearest point inside the white point's range, by CCT and Duv.
+float2 white_in_range(float2 xy)
+{
+    float cct = cct_from_xy(xy);
+    float duv = duv_from_xy(xy, cct);
+    float c = clamp(cct, CCT_MIN, CCT_MAX);
+    float d = clamp(duv, -DUV_LIMIT, DUV_LIMIT);
+    return c == cct && d == duv ? xy : xy_from_cct_duv(c, d);
+}
+
+// The scene's white point: the histogram and the sky references averaged in Yxy, weighted by
+// luminance times their weights, with the virtual D65 light at its own luminance.
+float2 white_target(AdaptParams* p, Metered m, SkyStats sky)
+{
+    float3 sum = p.virtual_light_nits * float3(D65_XY, 1.0);
+    sum += p.white_histogram * m.luminance * float3(m.xy, 1.0);
+    if (sky.dome_luminance > 0.0)
+        sum += p.white_dome * sky.dome_luminance * float3(sky.dome_xy, 1.0);
+    float3 e = mul(REC2020_TO_XYZ, sky.directional.rgb);
+    if (e.y > 0.0)
+        sum += p.white_directional * MID_GREY * e.y / PI * float3(xy_from_xyz(e), 1.0);
+    if (!(sum.z > 0.0))
+        return D65_XY;
+    return white_in_range(sum.xy / sum.z);
+}
+
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void main()
@@ -169,12 +236,16 @@ void main()
         sky = *root.sky;
     bool cut = p.cut != 0;
 
-    float metered_ev100 = 0.0;
-    bool metered = p.mode == MODE_AUTO && histogram_mean(p, metered_ev100);
+    bool white = p.white_balance != 0;
+    Metered m = { 0.0, 0.0, D65_XY };
+    bool histogram = false;
+    if (p.mode == MODE_AUTO || white)
+        histogram = histogram_mean(p, m);
+    bool metered = p.mode == MODE_AUTO && histogram;
+    float metered_ev100 = m.ev100;
 
     ExposureState next = cur;
     next.prev_pre_exposure = cur.pre_exposure;
-    next.white_point_xy = D65_XY;
     bool snap = cut || cur.initialized != STATE_ADAPTING;
     bool hold = false;
     if (p.mode == MODE_MANUAL)
@@ -215,7 +286,6 @@ void main()
         // and search upward with the pre-exposure, no further than the exposure that keys
         // the bottom of the histogram.
         hold = true;
-        next.white_point_xy = cur.white_point_xy;
         if (cut)
             next.initialized = STATE_UNSET;
         float highest = exposure_from_ev100(keyed(p, p.ev_min));
@@ -231,6 +301,27 @@ void main()
         else if (abs(stops) > 1.0)
             next.pre_exposure = cur.pre_exposure * exp2(round(stops));
     }
+
+    // White point: (0, 0) is unset and snaps at the next frame with light.
+    bool white_set = cur.white_point_xy.y > 0.0;
+    float2 white_target_xy = white && white_set ? cur.white_point_xy : D65_XY;
+    if (!white)
+        next.white_point_xy = D65_XY;
+    else if (histogram)
+    {
+        white_target_xy = white_target(p, m, sky);
+        next.white_point_xy = snap || !white_set
+            ? white_target_xy
+            : xy_from_uv(lerp(uv_from_xy(cur.white_point_xy), uv_from_xy(white_target_xy),
+                              1.0 - exp(-p.white_speed * dt)));
+    }
+    else if (cut)
+        next.white_point_xy = float2(0.0);
+    bool balanced = next.white_point_xy.y > 0.0;
+    float3x3 balance = balanced ? cat16_rec2020(next.white_point_xy, D65_XY)
+                                : float3x3(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+    for (uint r = 0; r < 3; r++)
+        *(root.white_balance + r) = float4(balance[r], 0.0);
     *(view.exposure + (view.exposure_slot ^ 1)) = next;
 
     ExposureTelemetryGpu t;
@@ -238,7 +329,8 @@ void main()
     t.target_ev100 = next.target_ev100;
     t.long_term_ev100 = next.long_term_ev100;
     t.metered_ev100 = metered_ev100;
-    t.white_point_xy = next.white_point_xy;
+    t.white_point_xy = balanced ? next.white_point_xy : D65_XY;
+    t.white_target_xy = white_target_xy;
     t.pre_exposure = next.pre_exposure;
     t.metered = metered ? 1 : 0;
     t.sky = sky;

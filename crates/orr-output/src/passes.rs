@@ -1,5 +1,5 @@
-//! Output's compute passes, recorded into a command list: hook inputs, exposure (meter and
-//! adapt), tonemap, compose and compose-UI.
+//! Output's compute passes, recorded into a command list: hook inputs, exposure and white
+//! balance (meter and adapt), tonemap, compose and compose-UI.
 
 use std::ops::RangeInclusive;
 
@@ -10,7 +10,7 @@ use orr_scene::orr_gpu::{
 };
 use orr_scene::{SkyStats, ViewConstants};
 
-use crate::exposure::{COMPENSATION_ENTRIES, HISTOGRAM_BINS};
+use crate::exposure::{COMPENSATION_ENTRIES, HISTOGRAM_BINS, HISTOGRAM_WORDS_PER_BIN};
 use crate::hooks::HookTargets;
 use crate::shaders::compose;
 use crate::shaders::exposure::adapt::{self, AdaptParams, ExposureTelemetryGpu};
@@ -33,7 +33,7 @@ pub struct OutputKernels {
 }
 
 /// Words of the meter's histogram (`exposure.slang`).
-const HISTOGRAM_WORDS: u64 = 3 * HISTOGRAM_BINS as u64;
+const HISTOGRAM_WORDS: u64 = HISTOGRAM_WORDS_PER_BIN * HISTOGRAM_BINS as u64;
 
 /// Byte offsets in `OutputRoots::upload`. Roots sit at 256 B, the uniform-buffer offset
 /// alignment.
@@ -56,6 +56,7 @@ pub struct OutputRoots {
     histogram_cleared: bool,
     telemetry: Allocation<ExposureTelemetryGpu>,
     telemetry_frame: Option<u64>,
+    white_balance: Allocation<[f32; 4]>,
     compensation: Option<(CompensationCurve, RangeInclusive<f32>)>,
 }
 
@@ -69,6 +70,7 @@ impl OutputRoots {
             histogram_cleared: false,
             telemetry: gpu.gpu_malloc(MemoryKind::Readback, 1, "exposure telemetry")?,
             telemetry_frame: None,
+            white_balance: gpu.gpu_malloc(MemoryKind::DeviceLocal, 3, "white balance")?,
             compensation: None,
         })
     }
@@ -131,6 +133,7 @@ impl OutputView {
             metered_ev100: (t.metered != 0).then_some(t.metered_ev100),
             pre_exposure: t.pre_exposure,
             white_point_xy: t.white_point_xy,
+            white_target_xy: t.white_target_xy,
             sky: SkyTelemetry {
                 dome_luminance: t.sky.dome_luminance,
                 dome_xy: t.sky.dome_xy,
@@ -180,7 +183,8 @@ pub struct HookInputsPass {
 }
 
 /// Tonemapping one image: pre-exposed linear Rec.2020 radiance in, display-linear Rec.709
-/// (1.0 = paper white) out, at the exposure the view's adapt pass wrote.
+/// (1.0 = paper white) out, at the exposure and white balance the view's adapt pass wrote
+/// with the same [`OutputRoots`].
 #[derive(Clone, Copy, Debug)]
 pub struct TonemapPass<'a> {
     /// Radiance, read at each output texel.
@@ -328,9 +332,10 @@ impl OutputKernels {
         Ok(Some(inputs))
     }
 
-    /// Records `meter` (auto exposure only) and `adapt`, which writes the view's next
-    /// exposure slot and the telemetry. Order the source's writes before it with a barrier;
-    /// it ends with a barrier, so tonemap may follow directly.
+    /// Records `meter` (with auto exposure or auto white balance) and `adapt`, which writes
+    /// the view's next exposure slot, the white balance tonemap applies and the telemetry.
+    /// Order the source's writes before it with a barrier; it ends with a barrier, so tonemap
+    /// may follow directly.
     pub fn exposure(
         &self,
         list: &mut CommandList<'_>,
@@ -343,32 +348,18 @@ impl OutputKernels {
             list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
             roots.histogram_cleared = true;
         }
-        let params = match &pass.output.exposure {
-            Exposure::Manual { ev100 } => AdaptParams {
-                mode: 0,
-                manual_ev100: *ev100,
-                cut: u32::from(pass.output.cut),
-                ..bytemuck::Zeroable::zeroed()
-            },
-            Exposure::Auto(auto) => {
-                let params = adapt_params(auto, pass.output.cut);
-                let root = meter::Root {
-                    histogram: roots.histogram.gpu,
-                    view: pass.view,
-                    source: pass.source,
-                    mask: auto.metering_mask.unwrap_or(TextureIndex::NONE),
-                    width: pass.extent[0],
-                    height: pass.extent[1],
-                    ev_min: params.ev_min,
-                    bins_per_ev: 1.0 / params.bin_ev,
-                    _pad0: 0,
-                    _pad1: 0,
+        let output = pass.output;
+        let default_meter = AutoExposure::default();
+        let (mut params, meter) = match &output.exposure {
+            Exposure::Manual { ev100 } => {
+                let params = AdaptParams {
+                    mode: 0,
+                    manual_ev100: *ev100,
+                    ..adapt_params(&default_meter, output.cut)
                 };
-                let root = roots.put(METER_ROOT, &root);
-                list.begin_pass("meter", false);
-                list.dispatch(&self.meter, root, groups(pass.extent, 16));
-                list.end_pass();
-                list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+                (params, output.white_balance.map(|_| &default_meter))
+            }
+            Exposure::Auto(auto) => {
                 let stale = roots.compensation.as_ref().is_none_or(|(curve, range)| {
                     *curve != auto.compensation || *range != auto.range_ev100
                 });
@@ -378,9 +369,37 @@ impl OutputKernels {
                     roots.compensation =
                         Some((auto.compensation.clone(), auto.range_ev100.clone()));
                 }
-                params
+                (adapt_params(auto, output.cut), Some(auto))
             }
         };
+        if let Some(white) = &output.white_balance {
+            let weights = white.references.unwrap_or(HISTOGRAM_ONLY);
+            params.white_balance = 1;
+            params.white_speed = white.speed;
+            params.virtual_light_nits = white.virtual_light_nits;
+            params.white_histogram = weights.histogram;
+            params.white_dome = weights.dome;
+            params.white_directional = weights.directional;
+        }
+        if let Some(auto) = meter {
+            let root = meter::Root {
+                histogram: roots.histogram.gpu,
+                view: pass.view,
+                source: pass.source,
+                mask: auto.metering_mask.unwrap_or(TextureIndex::NONE),
+                width: pass.extent[0],
+                height: pass.extent[1],
+                ev_min: params.ev_min,
+                bins_per_ev: 1.0 / params.bin_ev,
+                chroma: params.white_balance,
+                _pad: 0,
+            };
+            let root = roots.put(METER_ROOT, &root);
+            list.begin_pass("meter", false);
+            list.dispatch(&self.meter, root, groups(pass.extent, 16));
+            list.end_pass();
+            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        }
         let root = adapt::Root {
             params: roots.put(ADAPT_PARAMS, &params),
             compensation: roots.upload.gpu.offset(COMPENSATION).cast(),
@@ -388,6 +407,9 @@ impl OutputKernels {
             view: pass.view,
             sky: pass.sky,
             telemetry: roots.telemetry.gpu,
+            white_balance: roots.white_balance.gpu.cast(),
+            _pad0: 0,
+            _pad1: 0,
         };
         let root = roots.put(ADAPT_ROOT, &root);
         list.begin_pass("adapt", false);
@@ -429,21 +451,20 @@ impl OutputKernels {
             debug,
             pattern_patch: pattern.map_or(0.0, |p| p.patch),
             pattern_surround: pattern.map_or(0.0, |p| p.surround),
-            _pad0: 0,
+            white_balance: u32::from(o.white_balance.is_some()),
             _pad1: 0,
             _pad2: 0,
         };
         let root = tonemap::Root {
             constants: roots.put(TONEMAP_CONSTANTS, &constants),
             view: pass.view,
+            white_balance: roots.white_balance.gpu.cast(),
             source: pass.source,
             target: pass.target,
             hook_source: pass.hook_source.unwrap_or(StorageImageIndex::NONE),
             width: pass.extent[0],
             height: pass.extent[1],
-            _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
+            _pad: 0,
         };
         let root = roots.put(TONEMAP_ROOT, &root);
         list.begin_pass("tonemap", false);
@@ -492,13 +513,15 @@ impl OutputKernels {
     }
 }
 
+const HISTOGRAM_ONLY: MeterWeights = MeterWeights {
+    histogram: 1.0,
+    dome: 0.0,
+    directional: 0.0,
+};
+
 fn adapt_params(auto: &AutoExposure, cut: bool) -> AdaptParams {
     let range = &auto.range_ev100;
-    let weights = auto.references.unwrap_or(MeterWeights {
-        histogram: 1.0,
-        dome: 0.0,
-        directional: 0.0,
-    });
+    let weights = auto.references.unwrap_or(HISTOGRAM_ONLY);
     let long = auto.physiological.unwrap_or_default();
     AdaptParams {
         mode: 1,
@@ -521,6 +544,7 @@ fn adapt_params(auto: &AutoExposure, cut: bool) -> AdaptParams {
         long_speed_darken: long.speed_darken,
         bound_brighten: long.bound_brighten,
         bound_darken: long.bound_darken,
+        ..bytemuck::Zeroable::zeroed()
     }
 }
 

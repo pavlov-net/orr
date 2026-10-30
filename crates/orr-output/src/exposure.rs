@@ -12,6 +12,9 @@ pub const MID_GREY: f32 = 0.18;
 /// Bins of the meter's histogram over [`AutoExposure::range_ev100`].
 pub(crate) const HISTOGRAM_BINS: u32 = 128;
 
+/// Words per histogram bin (`exposure.slang`).
+pub(crate) const HISTOGRAM_WORDS_PER_BIN: u64 = 7;
+
 /// `log2(luminance) + 3`.
 pub fn ev100_from_luminance(luminance: f32) -> f32 {
     luminance.log2() + 3.0
@@ -213,7 +216,11 @@ pub struct ExposureTelemetry {
     pub metered_ev100: Option<f32>,
     /// The pre-exposure the view's next render is lit with.
     pub pre_exposure: f32,
+    /// The white point the view is balanced from, CIE 1931 xy; D65 without auto white
+    /// balance.
     pub white_point_xy: [f32; 2],
+    /// The white point auto white balance moves toward, held in range.
+    pub white_target_xy: [f32; 2],
     pub sky: SkyTelemetry,
 }
 

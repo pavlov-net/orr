@@ -5,11 +5,14 @@ module exposure;
 
 public static const float MID_GREY = 0.18;
 
-// The meter's histogram: per bin, the pixel weight, then the sum of weight times each
-// pixel's offset inside the bin in 1/256 of a bin, as two words, low first.
+// The meter's histogram: per bin, the pixel weight, then sums of weight times each pixel's
+// offset inside the bin in 1/256 of a bin, its CIE x and its CIE y, both in 1/65536, each
+// sum as two words, low first. The chromaticity sums are 0 unless the meter is asked for
+// them.
 public static const uint HISTOGRAM_BINS = 128;
-public static const uint HISTOGRAM_WORDS = 3;
+public static const uint HISTOGRAM_WORDS = 7;
 public static const float BIN_OFFSET_STEPS = 256.0;
+public static const float CHROMA_STEPS = 65536.0;
 
 // Entries of the compensation curve's table, spread evenly over the histogram's range.
 public static const uint COMPENSATION_ENTRIES = 256;

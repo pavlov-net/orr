@@ -1,17 +1,20 @@
 //! What output does with one view each frame.
 
-use crate::{CalibrationPattern, Exposure, Grade, Gt7Params};
+use crate::{AutoWhiteBalance, CalibrationPattern, Exposure, Grade, Gt7Params};
 
 /// Output's settings for one view, passed with each render of it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ViewOutput {
     pub exposure: Exposure,
+    /// Off by default.
+    pub white_balance: Option<AutoWhiteBalance>,
     pub grade: Grade,
     pub gt7: Gt7Params,
     /// A hook warps the image: the view's hooks get the display's distortion field, which
     /// frame generation reads.
     pub distortion_field: bool,
-    /// A camera cut: auto exposure snaps to the target and resets its long-term stage.
+    /// A camera cut: auto exposure snaps to the target and resets its long-term stage, and
+    /// auto white balance snaps to its target.
     pub cut: bool,
     pub debug: OutputDebug,
 }

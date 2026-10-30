@@ -1,5 +1,5 @@
 // Pre-exposed linear Rec.2020 radiance to display-linear Rec.709: the view's adapted
-// exposure, the grade, then GT7, or one of the debug views.
+// exposure, its white balance, the grade, then GT7, or one of the debug views.
 #include "orr/root.h"
 import orr.abi;
 import orr.color;
@@ -28,7 +28,8 @@ public struct TonemapConstants
     // Calibration pattern levels, display-linear.
     public float pattern_patch;
     public float pattern_surround;
-    public uint _pad0;
+    // 1 applies the white balance matrix adapt wrote.
+    public uint white_balance;
     public uint _pad1;
     public uint _pad2;
 }
@@ -37,15 +38,15 @@ struct Root
 {
     TonemapConstants* constants;
     ViewConstants* view;
+    // Rows of adapt's white balance matrix.
+    float4* white_balance;
     TextureIndex source;
     StorageImageIndex target;
     // The `display_linear` hook's source, written with the same result; NONE without one.
     StorageImageIndex hook_source;
     uint width;
     uint height;
-    uint _pad0;
-    uint _pad1;
-    uint _pad2;
+    uint _pad;
 }
 ORR_ROOT(Root);
 
@@ -89,9 +90,15 @@ void main(uint3 id: SV_DispatchThreadID)
         float scale = exposure_from_ev100(next.adapted_ev100) / cur.pre_exposure;
         float3 radiance = root.source.get<Texture2D<float4>>().Load(int3(id.xy, 0)).rgb;
         float3 exposed = radiance * scale;
-        float3 graded = k.grade_scale * float3(dot(k.grade_r.xyz, exposed),
-                                               dot(k.grade_g.xyz, exposed),
-                                               dot(k.grade_b.xyz, exposed));
+        float3 balanced = exposed;
+        if (k.white_balance != 0)
+        {
+            float4* m = root.white_balance;
+            balanced = float3(dot(m[0].xyz, exposed), dot(m[1].xyz, exposed), dot(m[2].xyz, exposed));
+        }
+        float3 graded = k.grade_scale * float3(dot(k.grade_r.xyz, balanced),
+                                               dot(k.grade_g.xyz, balanced),
+                                               dot(k.grade_b.xyz, balanced));
         if (k.debug == DEBUG_EXPOSURE_HEATMAP)
             c = heatmap(luminance_rec2020(exposed));
         else if (k.debug == DEBUG_LINEAR)
