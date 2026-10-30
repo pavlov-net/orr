@@ -38,7 +38,8 @@ impl<const N: usize> Bands<N> {
 }
 
 /// A Rec.2020 color's value at wavelength `lambda` (nm): linear between the [`RGB`]
-/// bands' center wavelengths, constant beyond the outer two.
+/// bands' center wavelengths, constant beyond the outer two. At a band's center it is that
+/// channel's value.
 ///
 /// Colors given per channel (an albedo, or a light's color relative to
 /// [`SOLAR_COLOR`]) enter a group or spectral run through this.
