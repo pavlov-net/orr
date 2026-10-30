@@ -120,8 +120,14 @@ struct ModuleVtbl {
     get_defined_entry_point_count: unsafe extern "system" fn(*mut c_void) -> i32,
     get_defined_entry_point:
         unsafe extern "system" fn(*mut c_void, i32, *mut *mut c_void) -> Result_,
-    // serialize, writeToFile, getName, getFilePath, getUniqueIdentity, findAndCheckEntryPoint
-    _unused1: [usize; 6],
+    // serialize
+    _unused1: usize,
+    write_to_file: unsafe extern "system" fn(*mut c_void, *const c_char) -> Result_,
+    // getName
+    _unused2: usize,
+    get_file_path: unsafe extern "system" fn(*mut c_void) -> *const c_char,
+    // getUniqueIdentity, findAndCheckEntryPoint
+    _unused3: [usize; 2],
     get_dependency_file_count: unsafe extern "system" fn(*mut c_void) -> i32,
     get_dependency_file_path: unsafe extern "system" fn(*mut c_void, i32) -> *const c_char,
     get_module_reflection: unsafe extern "system" fn(*mut c_void) -> *mut sys::SlangReflectionDecl,
@@ -488,9 +494,33 @@ impl Module {
         }
     }
 
+    /// Writes the module as a precompiled `.slang-module` file.
+    pub(crate) fn write(&self, path: &Path) -> Result<(), String> {
+        let c = CString::new(path.to_string_lossy().as_bytes()).expect("path has no nul");
+        // SAFETY: the vtable is IModule's; the path outlives the call.
+        let r =
+            unsafe { (self.com.vtbl::<ModuleVtbl>().write_to_file)(self.com.as_ptr(), c.as_ptr()) };
+        if failed(r) {
+            Err(format!("writing {} failed: {r:#x}", path.display()))
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) fn reflection(&self) -> *mut sys::SlangReflectionDecl {
         // SAFETY: the vtable is IModule's.
         unsafe { (self.com.vtbl::<ModuleVtbl>().get_module_reflection)(self.com.as_ptr()) }
+    }
+
+    /// The file the module was loaded from: its source, or its `.slang-module`.
+    pub(crate) fn file(&self) -> Option<PathBuf> {
+        // SAFETY: the vtable is IModule's; the path lives as long as the module.
+        unsafe {
+            c_str((self.com.vtbl::<ModuleVtbl>().get_file_path)(
+                self.com.as_ptr(),
+            ))
+        }
+        .map(PathBuf::from)
     }
 }
 
