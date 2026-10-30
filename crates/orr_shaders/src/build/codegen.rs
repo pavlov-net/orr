@@ -68,6 +68,16 @@ pub(crate) fn generate(kernels: &[Kernel<'_>], shared: &Shared<'_>, manifest: &P
         out.push_str("};\n\n");
     }
 
+    let _ = write!(
+        out,
+        "/// Every kernel module of this build, for `KernelSet::check`.\n{ALLOW}\npub static MODULES: &[&::orr_shaders::ShaderModule] = &["
+    );
+    for k in kernels {
+        let path: Vec<String> = k.name.split('/').map(ident).collect();
+        let _ = write!(out, "&{}::MODULE, ", path.join("::"));
+    }
+    out.push_str("];\n\n");
+
     // Kernels nest by path: "a/b" is `pub mod a { pub mod b { .. } }`.
     let mut tree = Tree::default();
     for k in kernels {

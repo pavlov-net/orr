@@ -1,5 +1,6 @@
 use orr_shaders::{KernelSet, Mismatch};
-use shader_link::{AirData, RENDERER, edited, linked, unlinked};
+use shader_link::renderer::MODULES as RENDERER;
+use shader_link::{AirData, edited, linked, unlinked};
 
 const PRIMARY: u32 = 0;
 const SECONDARY: u32 = 1;
@@ -76,9 +77,9 @@ fn kernel_set_holds_the_kernels_that_declare_a_linked_point() {
     kernels.sort_unstable();
     assert_eq!(kernels, ["resolve", "sky", "tessellate"]);
     linked::KERNELS
-        .check(&RENDERER)
+        .check(RENDERER)
         .unwrap_or_else(|e| panic!("{e}"));
-    for own in RENDERER {
+    for &own in RENDERER {
         let m = linked::KERNELS.module(own).unwrap();
         if own.kernel == "plain" {
             assert!(core::ptr::eq(m, own));
@@ -91,15 +92,15 @@ fn kernel_set_holds_the_kernels_that_declare_a_linked_point() {
 #[test]
 fn nothing_linked_keeps_the_renderer_defaults() {
     assert!(unlinked::KERNELS.modules.is_empty());
-    for own in RENDERER {
+    for &own in RENDERER {
         assert!(core::ptr::eq(unlinked::KERNELS.module(own).unwrap(), own));
     }
-    assert!(KernelSet::default().check(&RENDERER).is_ok());
+    assert!(KernelSet::default().check(RENDERER).is_ok());
 }
 
 #[test]
 fn a_set_built_against_an_edited_root_is_rejected() {
-    let e = edited::KERNELS.check(&RENDERER).unwrap_err();
+    let e = edited::KERNELS.check(RENDERER).unwrap_err();
     assert_eq!(e.kernel, "resolve");
     assert!(matches!(e.reason, Mismatch::Interface { .. }), "{e}");
 }

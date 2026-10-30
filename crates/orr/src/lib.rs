@@ -25,7 +25,7 @@ pub use orr_scene::{
     ViewDesc, ViewHistoryId, ViewTarget, WorldPos, abi, material_flags, orr_gpu, orr_pack,
 };
 
-use orr_gpu::{Device, TimelinePoint};
+use orr_gpu::{Device, ShaderModule, TimelinePoint};
 use orr_scene::Scenes;
 
 /// The renderer: scenes, their views' histories and the frame.
@@ -33,9 +33,20 @@ pub struct Renderer {
     scenes: Scenes,
 }
 
+/// Every kernel module compiled into orr.
+fn builtin_modules() -> Vec<&'static ShaderModule> {
+    orr_scene::MODULES
+        .iter()
+        .chain(orr_lighting::shaders::MODULES)
+        .copied()
+        .collect()
+}
+
 impl Renderer {
-    /// Compiles the renderer's pipelines on the calling thread.
+    /// Checks `desc.kernels` against orr's compiled-in kernels, then compiles the renderer's
+    /// pipelines on the calling thread.
     pub fn new(gpu: &Device, desc: RendererDesc) -> Result<Self> {
+        desc.kernels.check(&builtin_modules())?;
         Ok(Self {
             scenes: Scenes::new(gpu, &desc)?,
         })
