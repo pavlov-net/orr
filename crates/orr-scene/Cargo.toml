@@ -3,3 +3,11 @@ name = "orr-scene"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+orr-gpu.workspace = true
+
+[lints]
+workspace = true

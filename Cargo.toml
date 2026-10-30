@@ -14,6 +14,7 @@ repository = "https://github.com/pavlov-net/orr"
 orr = { path = "crates/orr" }
 orr-gpu = { path = "crates/orr-gpu" }
 orr-pack = { path = "crates/orr-pack" }
+orr-scene = { path = "crates/orr-scene" }
 orr-shaders = { path = "crates/orr-shaders" }
 # crates.io ash is stuck on Vulkan 1.3.281; master carries 1.4 headers
 # with descriptor heap, cluster acceleration structures and cooperative
@@ -22,6 +23,11 @@ ash = { git = "https://github.com/ash-rs/ash", rev = "8844f6b4eefb16d08cd73c8f3d
 raw-window-handle = "0.6"
 thiserror = "2"
 log = "0.4"
+glam = "0.34"
+blake3 = "1"
+bytemuck = { version = "1", features = ["derive"] }
+# 0.14 is the version ctt uses, so one zstd-sys builds.
+zstd = "0.14"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -43,4 +49,8 @@ print_stdout = "warn"
 print_stderr = "warn"
 
 [profile.dev.package."*"]
+opt-level = 3
+
+# The spectral reference integrator runs in tests.
+[profile.dev.package.orr-atmosphere]
 opt-level = 3
