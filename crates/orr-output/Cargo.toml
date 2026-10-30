@@ -17,13 +17,13 @@ thiserror.workspace = true
 log.workspace = true
 png = "0.18"
 exr = { version = "1.74", default-features = false }
-moxcms = "0.8"
+moxcms = "0.9"
 
 [build-dependencies]
 orr-shaders = { workspace = true, features = ["build"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-core = "0.62.2"
+windows-core = "0.100.0"
 windows = { version = "0.62.2", features = [
   "Foundation",
   "Graphics_Display",

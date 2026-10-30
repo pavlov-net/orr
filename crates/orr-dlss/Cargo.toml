@@ -23,7 +23,7 @@ thiserror.workspace = true
 uuid = { version = "1", default-features = false }
 
 [build-dependencies]
-bindgen = "0.72.1"
+bindgen = "0.73.2"
 
 [dev-dependencies]
 half = "2.7"
