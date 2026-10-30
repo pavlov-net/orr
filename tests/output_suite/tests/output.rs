@@ -126,6 +126,7 @@ fn run(display: &ResolvedDisplay, format: Format) -> Vec<u8> {
             view: constants.gpu,
             display,
             output: &ViewOutput::default(),
+            hook_source: None,
         },
     );
     list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());

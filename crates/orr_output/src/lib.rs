@@ -6,6 +6,7 @@ mod display_watch;
 mod encode;
 mod exposure;
 mod gt7;
+mod hooks;
 mod passes;
 mod ui;
 mod view;
@@ -26,10 +27,11 @@ pub use exposure::{
     keyed_ev100, luminance_from_ev100,
 };
 pub use gt7::{GT7_REFERENCE_NITS, GT7_SDR_NITS, Gt7Curve, Gt7Params};
+pub use hooks::{ChainImages, DistortionField, HookInputs, HookPass, HookPoint, Hooks};
 pub use orr_scene::orr_gpu::{HdrMetadata, OutputFormat, PresentMode};
 pub use passes::{
-    ComposePass, ComposeRoot, ComposeSource, ExposurePass, OutputKernels, OutputRoots, OutputView,
-    TonemapPass,
+    ComposePass, ComposeRoot, ComposeSource, ExposurePass, HookInputsPass, OutputKernels,
+    OutputRoots, OutputView, TonemapPass,
 };
 pub use ui::UiLayer;
 pub use view::{OutputDebug, ViewOutput};

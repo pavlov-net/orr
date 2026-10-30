@@ -8,6 +8,9 @@ pub struct ViewOutput {
     pub exposure: Exposure,
     pub grade: Grade,
     pub gt7: Gt7Params,
+    /// A hook warps the image: the view's hooks get the display's distortion field, which
+    /// frame generation reads.
+    pub distortion_field: bool,
     /// A camera cut: auto exposure snaps to the target and resets its long-term stage.
     pub cut: bool,
     pub debug: OutputDebug,

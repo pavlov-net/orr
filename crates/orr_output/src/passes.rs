@@ -1,5 +1,5 @@
-//! Output's compute passes, recorded into a command list: exposure (meter and adapt),
-//! tonemap, compose and compose-UI.
+//! Output's compute passes, recorded into a command list: hook inputs, exposure (meter and
+//! adapt), tonemap, compose and compose-UI.
 
 use std::ops::RangeInclusive;
 
@@ -11,17 +11,21 @@ use orr_scene::orr_gpu::{
 use orr_scene::{SkyStats, ViewConstants};
 
 use crate::exposure::{COMPENSATION_ENTRIES, HISTOGRAM_BINS};
+use crate::hooks::HookTargets;
 use crate::shaders::compose;
 use crate::shaders::exposure::adapt::{self, AdaptParams, ExposureTelemetryGpu};
 use crate::shaders::exposure::meter;
+use crate::shaders::hook_inputs;
 use crate::shaders::tonemap::{self, TonemapConstants};
 use crate::{
-    AutoExposure, CompensationCurve, Exposure, ExposureTelemetry, Gt7Curve, MeterWeights,
-    OutputDebug, ResolvedDisplay, Result, SkyTelemetry, ViewOutput,
+    AutoExposure, ChainImages, CompensationCurve, DistortionField, Exposure, ExposureTelemetry,
+    Gt7Curve, HookInputs, Hooks, MeterWeights, OutputDebug, ResolvedDisplay, Result, SkyTelemetry,
+    ViewOutput,
 };
 
 /// Output's compute pipelines on one device.
 pub struct OutputKernels {
+    hook_inputs: ComputePipeline,
     meter: ComputePipeline,
     adapt: ComputePipeline,
     tonemap: ComputePipeline,
@@ -38,7 +42,8 @@ const TONEMAP_CONSTANTS: u64 = 256;
 const METER_ROOT: u64 = 512;
 const ADAPT_ROOT: u64 = 768;
 const ADAPT_PARAMS: u64 = 1024;
-const COMPENSATION: u64 = 1280;
+const HOOK_ROOT: u64 = 1280;
+const COMPENSATION: u64 = 1536;
 const ZEROS: u64 = COMPENSATION + 4 * COMPENSATION_ENTRIES as u64;
 const UPLOAD_BYTES: u64 = ZEROS + 4 * HISTOGRAM_WORDS;
 
@@ -77,10 +82,12 @@ impl OutputRoots {
     }
 }
 
-/// Output's state for one view history: its [`OutputRoots`] per frame in flight and the
-/// exposure telemetry they read back.
+/// Output's state for one view history: its [`OutputRoots`] per frame in flight, the
+/// exposure telemetry they read back and, while the view sets a hook, the hook inputs.
 pub struct OutputView {
     frames: Vec<OutputRoots>,
+    hooks: Option<HookTargets>,
+    device: Device,
 }
 
 impl OutputView {
@@ -88,7 +95,16 @@ impl OutputView {
         let frames = (0..frames_in_flight.max(1))
             .map(|_| OutputRoots::new(gpu))
             .collect::<Result<_>>()?;
-        Ok(Self { frames })
+        Ok(Self {
+            frames,
+            hooks: None,
+            device: gpu.clone(),
+        })
+    }
+
+    /// Bytes of the hook inputs held for the view: 0 unless its last frame set a hook.
+    pub fn hook_input_bytes(&self) -> u64 {
+        self.hooks.as_ref().map_or(0, HookTargets::bytes)
     }
 
     /// The roots frame `frame` records with. Its slot was last used by frame
@@ -144,6 +160,25 @@ pub struct ExposurePass<'a> {
     pub output: &'a ViewOutput,
 }
 
+/// Building a view's hook inputs from lighting's render-resolution targets.
+#[derive(Clone, Copy, Debug)]
+pub struct HookInputsPass {
+    /// Lighting's `rr_depth`: R32F reverse-Z at render resolution.
+    pub rr_depth: TextureIndex,
+    /// Lighting's `rr_motion`: RG16F previous minus current UV at render resolution.
+    pub rr_motion: TextureIndex,
+    pub chain: ChainImages,
+    /// The output extent.
+    pub extent: [u32; 2],
+    /// The render's view constants: the render extent and jitter.
+    pub view: GpuPtr<ViewConstants>,
+    /// The frame's jitter in render pixels, as in the view constants.
+    pub jitter: [f32; 2],
+    /// orr's frame id.
+    pub frame: u64,
+    pub hooks: Hooks,
+}
+
 /// Tonemapping one image: pre-exposed linear Rec.2020 radiance in, display-linear Rec.709
 /// (1.0 = paper white) out, at the exposure the view's adapt pass wrote.
 #[derive(Clone, Copy, Debug)]
@@ -156,6 +191,9 @@ pub struct TonemapPass<'a> {
     pub view: GpuPtr<ViewConstants>,
     pub display: &'a ResolvedDisplay,
     pub output: &'a ViewOutput,
+    /// With a `display_linear` hook, the chain's other image ([`ChainImages::rr_output_store`]),
+    /// which tonemap writes too as the hook's source.
+    pub hook_source: Option<StorageImageIndex>,
 }
 
 /// What compose reads.
@@ -210,11 +248,84 @@ impl OutputKernels {
             Ok(gpu.create_compute_pipeline(&stage, name)?)
         };
         Ok(Self {
+            hook_inputs: pipeline(&hook_inputs::MODULE, "hook_inputs")?,
             meter: pipeline(&meter::MODULE, "meter")?,
             adapt: pipeline(&adapt::MODULE, "adapt")?,
             tonemap: pipeline(&tonemap::MODULE, "tonemap")?,
             compose: pipeline(&compose::MODULE, "compose")?,
         })
+    }
+
+    /// Records the `hook_inputs` pass when the view sets a hook: depth and motion at output
+    /// resolution, with a `scene_referred` hook the copy of RR's output it reads as its
+    /// source, and with `field` the field cleared to identity. Allocates the inputs on the
+    /// first frame that sets a hook and frees them on the first that sets none, which
+    /// records nothing. Order the writes of lighting's targets and RR before it with a
+    /// barrier; [`HookInputs::run`] orders its writes before the hooks.
+    pub fn hook_inputs(
+        &self,
+        list: &mut CommandList<'_>,
+        view: &mut OutputView,
+        pass: &HookInputsPass,
+        field: Option<&mut DistortionField>,
+    ) -> Result<Option<HookInputs>> {
+        if !pass.hooks.any() {
+            view.hooks = None;
+            return Ok(None);
+        }
+        if view
+            .hooks
+            .as_ref()
+            .is_none_or(|t| t.extent() != pass.extent)
+        {
+            view.hooks = Some(HookTargets::new(&view.device, pass.extent)?);
+        }
+        let targets = view.hooks.as_mut().expect("hook targets");
+        if std::mem::take(&mut targets.fresh) {
+            list.discard(targets.depth.texture());
+            list.discard(targets.motion.texture());
+        }
+        let field = field.map_or(StorageImageIndex::NONE, |f| {
+            assert_eq!(
+                f.extent(),
+                [pass.extent[0].div_ceil(2), pass.extent[1].div_ceil(2)],
+                "distortion field for another extent"
+            );
+            f.prepare(list);
+            f.current_storage()
+        });
+        let (copy_source, copy_target) = if pass.hooks.scene_referred {
+            (pass.chain.rr_output, pass.chain.linear_store)
+        } else {
+            (TextureIndex::NONE, StorageImageIndex::NONE)
+        };
+        let inputs = HookInputs {
+            hooks: pass.hooks,
+            chain: pass.chain,
+            depth: targets.depth.sampled,
+            motion: targets.motion.sampled,
+            extent: pass.extent,
+            view: pass.view,
+            jitter: pass.jitter,
+        };
+        let root = hook_inputs::Root {
+            view: pass.view,
+            rr_depth: pass.rr_depth,
+            rr_motion: pass.rr_motion,
+            depth: targets.depth.storage,
+            motion: targets.motion.storage,
+            copy_source,
+            copy_target,
+            field,
+            width: pass.extent[0],
+            height: pass.extent[1],
+            _pad: 0,
+        };
+        let root = view.roots(pass.frame).put(HOOK_ROOT, &root);
+        list.begin_pass("hook_inputs", false);
+        list.dispatch(&self.hook_inputs, root, groups(pass.extent, 8));
+        list.end_pass();
+        Ok(Some(inputs))
     }
 
     /// Records `meter` (auto exposure only) and `adapt`, which writes the view's next
@@ -327,8 +438,12 @@ impl OutputKernels {
             view: pass.view,
             source: pass.source,
             target: pass.target,
+            hook_source: pass.hook_source.unwrap_or(StorageImageIndex::NONE),
             width: pass.extent[0],
             height: pass.extent[1],
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         let root = roots.put(TONEMAP_ROOT, &root);
         list.begin_pass("tonemap", false);
