@@ -55,3 +55,7 @@ opt-level = 3
 # The spectral reference integrator runs in tests.
 [profile.dev.package.orr-atmosphere]
 opt-level = 3
+
+# The OpenPBR harness samples millions of directions in tests.
+[profile.dev.package.openpbr-ref]
+opt-level = 3

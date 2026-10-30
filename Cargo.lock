@@ -581,6 +581,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "lighting-suite"
+version = "0.0.1"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "gpu-suite",
+ "orr-gpu",
+ "orr-lighting",
+ "orr-pack",
+ "orr-shaders",
+]
+
+[[package]]
 name = "litrs"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -800,12 +813,14 @@ dependencies = [
 name = "orr-scene"
 version = "0.0.1"
 dependencies = [
+ "bytemuck",
  "glam",
  "half",
  "image",
  "log",
  "nv-flip",
  "orr-gpu",
+ "orr-pack",
  "orr-shaders",
  "thiserror",
 ]
@@ -1026,6 +1041,16 @@ name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
+
+[[package]]
+name = "scene-suite"
+version = "0.0.1"
+dependencies = [
+ "glam",
+ "orr-gpu",
+ "orr-scene",
+ "orr-shaders",
+]
 
 [[package]]
 name = "serde"
