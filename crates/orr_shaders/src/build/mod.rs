@@ -3,6 +3,7 @@
 
 mod codegen;
 mod compile;
+mod cpu;
 mod layout;
 mod lint;
 mod locate;
@@ -14,6 +15,7 @@ mod sys;
 mod toolchain;
 
 pub use compile::{Build, Output};
+pub use cpu::CpuLibrary;
 pub use lint::{Lint, LintError};
 pub use locate::SLANG_VERSION;
 pub use toolchain::SLANGC_OPTIONS;

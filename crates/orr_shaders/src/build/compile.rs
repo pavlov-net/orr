@@ -38,6 +38,9 @@ pub struct Build {
     out_dir: Option<PathBuf>,
 }
 
+/// Structs of orr's shared libraries and the default-feature Rust types they map to.
+const LIBRARY_TYPES: &[(&str, &str)] = &[("AliasEntry", "::orr_shaders::AliasEntry")];
+
 /// What [`Build::compile`] produced.
 #[derive(Debug)]
 pub struct Output {
@@ -57,7 +60,10 @@ impl Build {
             lib: super::toolchain::load()?,
             kernels: None,
             includes: Vec::new(),
-            externs: BTreeMap::new(),
+            externs: LIBRARY_TYPES
+                .iter()
+                .map(|(s, r)| ((*s).to_owned(), (*r).to_owned()))
+                .collect(),
             debug_info: env::var("PROFILE").map_or(true, |p| p != "release"),
             fp_precise: false,
             asserts: false,
@@ -139,12 +145,7 @@ impl Build {
     /// `shaders.manifest.json` to the output directory. Prints `rerun-if-changed` lines.
     pub fn compile(self) -> Result<Output, Error> {
         let started = Instant::now();
-        let out_dir = match &self.out_dir {
-            Some(d) => d.clone(),
-            None => env::var_os("OUT_DIR")
-                .map(PathBuf::from)
-                .ok_or(Error::NoOutDir)?,
-        };
+        let out_dir = out_dir(self.out_dir.as_deref())?;
         let lib_dir = canonical_lossy(Path::new(crate::LIB_DIR));
         let own_root = self.kernels.as_deref().map(canonical).transpose()?;
         let mut roots: Vec<PathBuf> = own_root.iter().cloned().collect();
@@ -796,7 +797,17 @@ fn words_to_bytes(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
-fn write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+/// `dir`, else `OUT_DIR`.
+pub(super) fn out_dir(dir: Option<&Path>) -> Result<PathBuf, Error> {
+    match dir {
+        Some(d) => Ok(d.to_path_buf()),
+        None => env::var_os("OUT_DIR")
+            .map(PathBuf::from)
+            .ok_or(Error::NoOutDir),
+    }
+}
+
+pub(super) fn write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     let io = |source| Error::Io {
         path: path.to_path_buf(),
         source,
@@ -810,7 +821,7 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     fs::write(path, bytes).map_err(io)
 }
 
-fn canonical(path: &Path) -> Result<PathBuf, Error> {
+pub(super) fn canonical(path: &Path) -> Result<PathBuf, Error> {
     path.canonicalize()
         .map(strip_verbatim)
         .map_err(|source| Error::Io {

@@ -6,10 +6,12 @@
 //! layout and ABI rules, and generates Rust for their roots, records and modules.
 
 pub mod abi;
+mod alias;
 #[cfg(feature = "build")]
 pub mod build;
 mod module;
 
+pub use alias::AliasEntry;
 pub use module::{EntryPoint, KernelSet, ShaderModule, Stage};
 
 /// The directory of orr's shared Slang libraries, imported as `orr.<name>`.
