@@ -22,6 +22,7 @@ fn build(dir: &Path) -> Build {
     Build::new()
         .unwrap_or_else(|e| panic!("{e}"))
         .kernels(dir.join("src"))
+        .metal_check(false)
         .out_dir(dir.join("out"))
 }
 
@@ -233,31 +234,110 @@ fn spirv_validation_runs_in_process() {
 }
 
 #[test]
+fn metal_check_compares_layouts_and_finds_invalid_msl() {
+    // Gap-free under C layout, but Metal puts `v` at its native alignment, 16.
+    let src = "struct P { float3 a; uint b; float3x4 m; uint16_t h; uint16_t h2; float2 c; }\n\
+        struct Root { uint64_t addr; float4 v; P* p; uint2 u2; uint _pad0; uint _pad1; }\n\
+        [[vk::binding(0, 0)]] ConstantBuffer<Root> root;\n\
+        [shader(\"compute\")] [numthreads(64, 1, 1)] void main(uint3 id: SV_DispatchThreadID) {\n\
+        P x = root.p[id.x]; x.a += root.v.xyz; x.b += uint(root.addr) + root.u2.x; x.h += 1; root.p[id.x + 1] = x; }\n";
+    let dir = fixture("metal-layout", &[("src/k.slang", src)]);
+    assert_eq!(lints(build(&dir).compile()), [Lint::RootLayout; 2]);
+    match build(&dir)
+        .allow(Lint::RootLayout)
+        .metal_check(true)
+        .compile()
+    {
+        Err(Error::Lints(l)) => {
+            assert!(l.iter().all(|l| l.lint == Lint::Metal), "{l:?}");
+            assert!(
+                l[0].message
+                    .contains("struct Root field v is at offset 16 on Metal, 8 in SPIR-V"),
+                "{l:?}"
+            );
+        }
+        other => panic!("expected a Metal layout failure, got {other:?}"),
+    }
+
+    // A 64-bit max outside orr.atomic lowers to a fetch atomic Metal does not have.
+    let src = "import orr.atomic;\n\
+        struct Root { uint64_t* v; uint n; uint pad; }\n[[vk::binding(0, 0)]] ConstantBuffer<Root> root;\n\
+        [shader(\"compute\")] [numthreads(32, 1, 1)] void main(uint3 id: SV_DispatchThreadID) {\n\
+        atomic_max_u64(root.v + id.x, id.x); InterlockedMax(root.v[id.x + 1], 1ull); }\n";
+    let dir = fixture("metal-atomic", &[("src/k.slang", src)]);
+    let found = build(&dir).metal_check(true).compile();
+    match found {
+        Err(Error::Lints(l)) => {
+            assert_eq!(l.len(), 1, "{l:?}");
+            assert!(l[0].message.contains("64-bit fetch atomic"), "{l:?}");
+        }
+        other => panic!("expected a Metal failure, got {other:?}"),
+    }
+}
+
+/// Instructions of a SPIR-V module as (opcode, operands).
+fn instructions(words: &[u32]) -> Vec<(u32, &[u32])> {
+    let mut out = Vec::new();
+    let mut at = 5;
+    while let Some(&first) = words.get(at) {
+        let count = (first >> 16) as usize;
+        out.push((first & 0xffff, &words[at + 1..at + count]));
+        at += count;
+    }
+    out
+}
+
+fn read_words(path: &Path) -> Vec<u32> {
+    fs::read(path)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .collect()
+}
+
+#[test]
 #[allow(clippy::print_stderr)]
-fn omm_variant_declares_the_mode_and_validates() {
-    let src = "struct Root { uint64_t tlas; float4* out; }\n[[vk::binding(0, 0)]] ConstantBuffer<Root> root;\n\
+fn omm_variant_declares_the_mode_and_forces_two_state() {
+    const OP_CAPABILITY: u32 = 17;
+    const OP_SPEC_CONSTANT: u32 = 50;
+    const OP_EXECUTION_MODE_ID: u32 = 331;
+    const OMM: u32 = 5381;
+    const OMM_MODE: u32 = 6032;
+    let src = "#include \"orr/root.h\"\nimport orr.abi;\nimport orr.trace;\n\
+        struct Root { uint* out; Tlas scene; }\nORR_ROOT(Root);\n\
         void body(uint2 i) {\n\
         RayDesc r; r.Origin = float3(i, 0); r.Direction = float3(0, 0, 1); r.TMin = 0; r.TMax = 1;\n\
-        RayQuery<RAY_FLAG_NONE> q; q.TraceRayInline(RaytracingAccelerationStructure(root.tlas), 0, 0xff, r);\n\
-        while (q.Proceed()) { q.CommitNonOpaqueTriangleHit(); }\n\
-        root.out[i.x] = float4(q.CommittedRayT()); }\n\
+        Hit h = trace_closest(root.scene, r, MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, AcceptAll());\n\
+        root.out[i.x] = h.hit ? h.instance_index : 0; }\n\
         [shader(\"raygeneration\")] void main_rays() { body(DispatchRaysIndex().xy); }\n\
         [shader(\"compute\")] [numthreads(8, 4, 1)] void main_compute(uint3 id: SV_DispatchThreadID) { body(id.xy); }\n";
     let dir = fixture("omm", &[("src/k.slang", src)]);
-    build(&dir)
-        .allow(Lint::RayQuery)
-        .allow(Lint::HeapTokens)
-        .compile()
-        .unwrap_or_else(|e| panic!("{e}"));
-    let bytes = fs::read(dir.join("out/k.omm.spv")).unwrap();
-    let words: Vec<u32> = bytes
-        .chunks_exact(4)
-        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
-        .collect();
-    // OpExecutionModeId (331, 4 words) with OpacityMicromapIdKHR (6031), once per entry.
-    let modes = words
-        .windows(3)
-        .filter(|w| w[0] == (4 << 16 | 331) && w[2] == 6031)
+    build(&dir).compile().unwrap_or_else(|e| panic!("{e}"));
+
+    let base = read_words(&dir.join("out/k.spv"));
+    let variant = read_words(&dir.join("out/k.omm.spv"));
+    let capabilities = |words: &[u32]| -> Vec<u32> {
+        instructions(words)
+            .into_iter()
+            .filter(|(op, _)| *op == OP_CAPABILITY)
+            .map(|(_, a)| a[0])
+            .collect()
+    };
+    // The two-state constant: 0 in the module, the ray flag in the variant.
+    let spec_values = |words: &[u32]| -> Vec<u32> {
+        instructions(words)
+            .into_iter()
+            .filter(|(op, _)| *op == OP_SPEC_CONSTANT)
+            .map(|(_, a)| a[2])
+            .collect()
+    };
+    assert!(!capabilities(&base).contains(&OMM) && !capabilities(&base).contains(&OMM_MODE));
+    assert!(capabilities(&variant).contains(&OMM) && capabilities(&variant).contains(&OMM_MODE));
+    assert_eq!(spec_values(&base), [0]);
+    assert_eq!(spec_values(&variant), [0x400]);
+    let modes = instructions(&variant)
+        .into_iter()
+        .filter(|(op, a)| *op == OP_EXECUTION_MODE_ID && a[1] == 6031)
         .count();
     assert_eq!(modes, 2);
 
@@ -269,7 +349,11 @@ fn omm_variant_declares_the_mode_and_validates() {
     };
     let val = Path::new(&tools).join(format!("spirv-val{}", std::env::consts::EXE_SUFFIX));
     let out = Command::new(&val)
-        .args(["--target-env", "vulkan1.4"])
+        .args([
+            "--target-env",
+            "vulkan1.4",
+            "--uniform-buffer-standard-layout",
+        ])
         .arg(dir.join("out/k.omm.spv"))
         .output()
         .unwrap_or_else(|e| panic!("{}: {e}", val.display()));
