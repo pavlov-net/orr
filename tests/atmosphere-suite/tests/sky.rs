@@ -4,7 +4,7 @@
 //! disc through the atmosphere, the sky-view LUT composed with the medium inside
 //! `near_range`, the fold of several lights, and lighting's bake of the linked sky.
 
-use atmosphere_suite::{Probe, Rig, SUN, dir, probe};
+use atmosphere_suite::{Probe, Rig, SUN, dir, probe, sky_radiance};
 use glam::{DVec3, Vec3};
 use orr::abi::TextureIndex;
 use orr::{DirectionalLight, DiscProfile, LightId};
@@ -46,31 +46,12 @@ fn rgb(c: [f32; 4]) -> [f64; 3] {
 }
 
 fn eye_light() -> [f32; 4] {
-    [EYE.x as f32, EYE.y as f32, EYE.z as f32, EYE.y as f32]
+    atmosphere_suite::eye_light(EYE)
 }
 
 /// `AtmosphereSky.radiance` from [`EYE`] along each of `dirs`.
 fn radiance(rig: &Rig, dirs: &[DVec3]) -> Vec<[f64; 3]> {
-    let input: Vec<[f32; 4]> = dirs
-        .iter()
-        .map(|d| [d.x as f32, d.y as f32, d.z as f32, 0.0])
-        .collect();
-    let n = dirs.len() as u32;
-    let out = probe(
-        rig.block(),
-        "sky_radiance",
-        n.into(),
-        Probe {
-            threads: n,
-            count: n,
-            input: &input,
-            light: eye_light(),
-            ..Probe::default()
-        },
-    );
-    let out: Vec<_> = out.into_iter().map(rgb).collect();
-    assert!(out.iter().flatten().all(|c| c.is_finite()), "{out:?}");
-    out
+    sky_radiance(rig, EYE, dirs)
 }
 
 /// The direction of every sky-view texel, row by row, from [`EYE`], once a frame has written

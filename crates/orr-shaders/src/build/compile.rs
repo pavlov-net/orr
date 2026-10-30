@@ -32,7 +32,7 @@ pub struct Build {
     kernels: Option<PathBuf>,
     includes: Vec<PathBuf>,
     externs: BTreeMap<String, String>,
-    debug_info: bool,
+    debug_info: DebugInfo,
     fp_precise: bool,
     asserts: bool,
     metal_check: bool,
@@ -41,6 +41,18 @@ pub struct Build {
     out_dir: Option<PathBuf>,
     link_points: Vec<PathBuf>,
     links: Vec<Link>,
+}
+
+/// Where a build puts the SPIR-V's debug info.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DebugInfo {
+    Off,
+    /// In the SPIR-V (`-g2`).
+    Embedded,
+    /// In a sidecar beside each module (`-g2 -separate-debug-info`): the module is stripped
+    /// but keeps its `DebugBuildIdentifier`, and `<name>.dbg.spv` holds the debug info, the
+    /// form Aftermath maps crash dumps through.
+    Separate,
 }
 
 /// Structs of orr's shared libraries and the default-feature Rust types they map to.
@@ -66,6 +78,7 @@ pub struct Output {
 impl Build {
     /// Locates and version-checks the Slang release.
     pub fn new() -> Result<Self, Error> {
+        let release = env::var("PROFILE").is_ok_and(|p| p == "release");
         Ok(Self {
             lib: super::toolchain::load()?,
             kernels: None,
@@ -74,9 +87,16 @@ impl Build {
                 .iter()
                 .map(|(s, r)| ((*s).to_owned(), (*r).to_owned()))
                 .collect(),
-            debug_info: env::var("PROFILE").map_or(true, |p| p != "release"),
+            debug_info: if release {
+                DebugInfo::Separate
+            } else {
+                DebugInfo::Embedded
+            },
             fp_precise: false,
-            asserts: false,
+            asserts: match env::var_os("ORR_SHADER_ASSERTS") {
+                Some(v) => v == "1",
+                None => !release,
+            },
             metal_check: env::var_os("ORR_METAL_CHECK").is_some_and(|v| v == "1"),
             precompile: env::var_os("ORR_SHADER_PRECOMPILE").is_none_or(|v| v != "0"),
             allowed: BTreeSet::new(),
@@ -144,9 +164,10 @@ impl Build {
         self
     }
 
-    /// Debug info in the SPIR-V (`-g2`). On by default unless the profile is `release`.
-    pub fn debug_info(mut self, on: bool) -> Self {
-        self.debug_info = on;
+    /// Where the debug info goes: [`DebugInfo::Embedded`] by default, [`DebugInfo::Separate`]
+    /// when the profile is `release`.
+    pub fn debug_info(mut self, debug_info: DebugInfo) -> Self {
+        self.debug_info = debug_info;
         self
     }
 
@@ -156,8 +177,11 @@ impl Build {
         self
     }
 
-    /// Links `orr.debug`'s `ASSERTS = true`, so checks such as `Tlas.get()` on address 0
-    /// abort. Off by default; the device then needs `shaderAbort`.
+    /// Links `orr.debug`'s `ASSERTS = true`, so `orr_assert` and checks such as `Tlas.get()`
+    /// on address 0 abort. Pipelines from modules that abort need a device with
+    /// `shaderAbort`. On by default unless the profile is `release`; `ORR_SHADER_ASSERTS=0`
+    /// or `1` overrides the default, for example to build for a capture session, whose
+    /// devices leave `shaderAbort` off.
     pub fn asserts(mut self, on: bool) -> Self {
         self.asserts = on;
         self
@@ -410,6 +434,7 @@ impl Build {
                 name,
                 spv: &record.spv,
                 omm: record.omm.as_deref(),
+                debug_info: record.debug_info.as_deref(),
                 hash: record.hash,
                 interface: interface_hash(model),
                 model,
@@ -428,6 +453,7 @@ impl Build {
                 name,
                 spv: &record.spv,
                 omm: record.omm.as_deref(),
+                debug_info: record.debug_info.as_deref(),
                 hash: record.hash,
                 interface: interface_hash(&record.model),
                 model: &record.model,
@@ -452,6 +478,7 @@ impl Build {
                     linked,
                     spv: &r.spv,
                     omm: r.omm.as_deref(),
+                    debug_info: r.debug_info.as_deref(),
                     hash: r.hash,
                     inputs: &r.inputs,
                     precompiled: &r.precompiled,
@@ -544,6 +571,7 @@ impl Build {
             options: &kernel_options,
             metal: metal_options.as_deref(),
             asserts: self.asserts,
+            separate_debug: self.debug_info == DebugInfo::Separate,
             precompiled: &precompiled,
         };
         let mut modules = BTreeMap::new();
@@ -568,8 +596,12 @@ impl Build {
             options.push("-I".into());
             options.push(dir.display().to_string());
         }
-        if self.debug_info {
-            options.push("-g2".into());
+        match self.debug_info {
+            DebugInfo::Off => {}
+            DebugInfo::Embedded => options.push("-g2".into()),
+            DebugInfo::Separate => {
+                options.extend(["-g2".into(), "-separate-debug-info".into()]);
+            }
         }
         if self.fp_precise {
             options.extend(["-fp-mode".into(), "precise".into()]);
@@ -664,6 +696,8 @@ struct ManifestModule<'a> {
     linked: bool,
     spv: &'a Path,
     omm: Option<&'a Path>,
+    /// The separated debug info of `spv`.
+    debug_info: Option<&'a Path>,
     hash: u64,
     inputs: &'a [PathBuf],
     /// The library modules the compile loaded precompiled, by import name.
@@ -678,6 +712,7 @@ struct Record {
     inputs: Vec<PathBuf>,
     spv: PathBuf,
     omm: Option<PathBuf>,
+    debug_info: Option<PathBuf>,
     hash: u64,
     precompiled: Vec<String>,
     model: Model,
@@ -702,6 +737,8 @@ struct Settings<'a> {
     /// The Metal session's options when the MSL check runs.
     metal: Option<&'a [String]>,
     asserts: bool,
+    /// `options` hold `-separate-debug-info`.
+    separate_debug: bool,
     precompiled: &'a Precompiled,
 }
 
@@ -752,6 +789,7 @@ fn print_cargo<'a>(
             "ORR_METAL_CHECK",
             "ORR_SHADER_PRECOMPILE",
             "ORR_SHADER_TIMINGS",
+            "ORR_SHADER_ASSERTS",
         ] {
             println!("cargo:rerun-if-env-changed={var}");
         }
@@ -856,7 +894,10 @@ fn cache_key(settings: &Settings<'_>, job: &Job, inputs: &[PathBuf]) -> Option<S
 fn load_record(settings: &Settings<'_>, job: &Job) -> Option<Record> {
     let record: Record = serde_json::from_slice(&fs::read(&job.record).ok()?).ok()?;
     let key = cache_key(settings, job, &record.inputs)?;
-    let outputs_exist = record.spv.is_file() && record.omm.as_ref().is_none_or(|p| p.is_file());
+    let outputs_exist = [Some(&record.spv), record.omm.as_ref(), record.debug_info.as_ref()]
+        .into_iter()
+        .flatten()
+        .all(|p| p.is_file());
     (record.key == key && record.kernel == job.path && outputs_exist).then_some(record)
 }
 
@@ -933,7 +974,14 @@ fn compile_one(
     let program = session
         .link(&module, &extra, |_| true)
         .map_err(compile_err)?;
-    let words = program.spirv().map_err(compile_err)?;
+    let (words, debug_info) = if settings.separate_debug {
+        let (stripped, debug) = program.spirv_separated().map_err(compile_err)?;
+        let path = job.spv.with_extension("dbg.spv");
+        write(&path, &words_to_bytes(&debug))?;
+        (spirv::restore_strings(stripped, &debug), Some(path))
+    } else {
+        (program.spirv().map_err(compile_err)?, None)
+    };
     write(&job.spv, &words_to_bytes(&words))?;
     let layout = program.layout().map_err(compile_err)?;
     let model =
@@ -984,6 +1032,7 @@ fn compile_one(
         inputs,
         spv: job.spv.clone(),
         omm,
+        debug_info,
         hash: hash64(&words_to_bytes(&words)),
         precompiled,
         model,
