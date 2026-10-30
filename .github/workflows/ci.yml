@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .tools/dl
+          key: tools-dl-${{ runner.os }}-${{ hashFiles('tools/fetch-slang.sh') }}
+      - name: Fetch pinned tools
+        run: bash tools/fetch-slang.sh
+      # Every crate, test and example builds on both platforms; this is what catches a
+      # commit that does not build on its own.
+      - name: Check the workspace
+        run: cargo check --workspace --all-targets
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check formatting
+        run: cargo fmt --all --check
