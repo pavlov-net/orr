@@ -1,0 +1,25 @@
+[package]
+name = "pack_suite"
+description = "Headless GPU tests of orr_pack's Slang loaders against its CPU readers, run with the validation layer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+orr_gpu.workspace = true
+orr_pack.workspace = true
+orr_scene = { workspace = true, features = ["testing"] }
+orr_shaders.workspace = true
+
+[dev-dependencies]
+bytemuck.workspace = true
+glam.workspace = true
+orr_cook = { path = "../../crates/orr_cook" }
+
+[build-dependencies]
+orr_shaders = { workspace = true, features = ["build"] }
+
+[lints]
+workspace = true
