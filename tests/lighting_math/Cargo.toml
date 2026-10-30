@@ -1,0 +1,19 @@
+[package]
+name = "lighting_math"
+description = "orr_lighting's real-time OpenPBR BSDF on the CPU, checked against adobe/openpbr-bsdf through the OpenPBR harness."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+openpbr_ref = { path = "../openpbr_ref" }
+shader_math = { path = "../shader_math" }
+orr_shaders.workspace = true
+
+[build-dependencies]
+orr_shaders = { workspace = true, features = ["build"] }
+
+[lints]
+workspace = true
