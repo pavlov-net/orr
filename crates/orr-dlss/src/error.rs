@@ -12,6 +12,13 @@ pub enum DlssError {
     /// An NGX call failed.
     #[error("{call} failed: NGX result {result:#x}")]
     Ngx { call: &'static str, result: u32 },
+    /// The device was created without an extension NGX needs; create it with
+    /// [`crate::DlssSdk::device_hooks`].
+    #[error("the device lacks {0}, which NGX needs")]
+    MissingExtension(String),
+    /// An orr-gpu call failed.
+    #[error(transparent)]
+    Gpu(#[from] orr_gpu::Error),
     /// A Vulkan call failed.
     #[error("{call} failed: {result}")]
     Vulkan {

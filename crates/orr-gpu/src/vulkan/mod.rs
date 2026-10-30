@@ -11,6 +11,7 @@ mod diagnostics;
 mod features;
 mod garbage;
 mod heap;
+mod interop;
 mod memory;
 mod mesh;
 mod pipeline;
@@ -26,12 +27,17 @@ pub use accel::{
     ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance, ClassicKind,
     InstanceFlags, Micromap, MicromapDesc, MicromapTriangle, MicromapUsage, OmmFormat,
 };
+pub use ash;
 pub use cache::{PipelineCacheKind, PipelineCacheReport};
 pub use command::{CommandList, DecompressRegion, DispatchArgs, MeshArgs};
 pub use device::{Device, DeviceDesc};
 pub use diagnostics::{
     Checkpoint, DeviceFault, Diagnostics, DiagnosticsReport, FaultAccess, FaultAddress,
     QueueProgress,
+};
+pub use interop::{
+    DeviceHooks, Features, ImageHandles, RawCommandBuffer, RawDevice, defer_after_submitted,
+    image_handles, raw_device,
 };
 pub use memory::{Allocation, HeapReport, MemoryKind, MemoryReport, MemoryUsage};
 pub use mesh::{ColorAttachment, DepthAttachment, MeshPipeline, MeshPipelineDesc, Rendering};

@@ -17,6 +17,7 @@ debug_overlay = []
 
 [dependencies]
 ash.workspace = true
+orr-gpu.workspace = true
 log.workspace = true
 thiserror.workspace = true
 uuid = { version = "1", default-features = false }

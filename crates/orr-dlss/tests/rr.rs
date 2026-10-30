@@ -6,8 +6,13 @@ mod harness;
 
 use ash::vk;
 use harness::{Gpu, f16_bytes, f16_values};
-use orr_dlss::Quality;
 use orr_dlss::raw::{ClassicBind, Image, Ngx, RayReconstruction, RrInputs};
+use orr_dlss::{DlssSdk, Quality};
+use orr_gpu::{
+    Allocation, CommandList, Device, DeviceDesc, Format, Hazards, MemoryKind, QueueKind, Stages,
+    Texture, TextureDesc, TextureMemory, TextureRegion, TextureUsage,
+};
+use std::time::Duration;
 
 /// A value RR never writes: negative alpha, and channel values no denoised pixel matches.
 const SENTINEL: [f32; 4] = [-3.0, 0.125, -5.0, -7.0];
@@ -70,23 +75,10 @@ struct Targets {
     overlay: Image,
 }
 
-/// Uploads the static inputs and returns the targets and the colour staging buffer.
-fn targets(
-    gpu: &mut Gpu,
-    render: [u32; 2],
-    overlay: Option<([u32; 4], [f32; 4])>,
-) -> (Targets, usize) {
+/// The inputs that stay the same every frame: depth, motion, specular motion, diffuse
+/// albedo, specular albedo, normal and roughness, overlay.
+fn static_inputs(render: [u32; 2], overlay: Option<([u32; 4], [f32; 4])>) -> [Vec<u8>; 7] {
     let px = (render[0] * render[1]) as usize;
-    let t = Targets {
-        color: gpu.image(render, vk::Format::R16G16B16A16_SFLOAT),
-        depth: gpu.image(render, vk::Format::R32_SFLOAT),
-        motion: gpu.image(render, vk::Format::R16G16_SFLOAT),
-        diffuse: gpu.image(render, vk::Format::R8G8B8A8_UNORM),
-        specular: gpu.image(render, vk::Format::R8G8B8A8_UNORM),
-        normals: gpu.image(render, vk::Format::R16G16B16A16_SFLOAT),
-        specular_motion: gpu.image(render, vk::Format::R16G16_SFLOAT),
-        overlay: gpu.image(render, vk::Format::R16G16B16A16_SFLOAT),
-    };
     let mut diffuse = Vec::with_capacity(px * 4);
     for y in 0..render[1] {
         for x in 0..render[0] {
@@ -104,19 +96,45 @@ fn targets(
             }
         }
     }
-    let uploads: Vec<(&Image, Vec<u8>)> = vec![
-        (&t.depth, 0.5f32.to_le_bytes().repeat(px)),
-        (&t.motion, vec![0; px * 4]),
-        (&t.specular_motion, vec![0; px * 4]),
-        (&t.diffuse, diffuse),
-        (&t.specular, [10u8, 10, 10, 255].repeat(px)),
-        (&t.normals, f16_bytes(&[0.0, 0.0, 1.0, 0.5]).repeat(px)),
-        (&t.overlay, f16_bytes(&over)),
+    [
+        0.5f32.to_le_bytes().repeat(px),
+        vec![0; px * 4],
+        vec![0; px * 4],
+        diffuse,
+        [10u8, 10, 10, 255].repeat(px),
+        f16_bytes(&[0.0, 0.0, 1.0, 0.5]).repeat(px),
+        f16_bytes(&over),
+    ]
+}
+
+/// Uploads the static inputs and returns the targets and the colour staging buffer.
+fn targets(
+    gpu: &mut Gpu,
+    render: [u32; 2],
+    overlay: Option<([u32; 4], [f32; 4])>,
+) -> (Targets, usize) {
+    let px = (render[0] * render[1]) as usize;
+    let t = Targets {
+        color: gpu.image(render, vk::Format::R16G16B16A16_SFLOAT),
+        depth: gpu.image(render, vk::Format::R32_SFLOAT),
+        motion: gpu.image(render, vk::Format::R16G16_SFLOAT),
+        diffuse: gpu.image(render, vk::Format::R8G8B8A8_UNORM),
+        specular: gpu.image(render, vk::Format::R8G8B8A8_UNORM),
+        normals: gpu.image(render, vk::Format::R16G16B16A16_SFLOAT),
+        specular_motion: gpu.image(render, vk::Format::R16G16_SFLOAT),
+        overlay: gpu.image(render, vk::Format::R16G16B16A16_SFLOAT),
+    };
+    let images = [
+        &t.depth,
+        &t.motion,
+        &t.specular_motion,
+        &t.diffuse,
+        &t.specular,
+        &t.normals,
+        &t.overlay,
     ];
-    let staging: Vec<usize> = uploads
-        .iter()
-        .map(|(_, b)| gpu.buffer(b.len() as u64))
-        .collect();
+    let uploads = static_inputs(render, overlay);
+    let staging: Vec<usize> = uploads.iter().map(|b| gpu.buffer(b.len() as u64)).collect();
     let color_staging = gpu.buffer(px as u64 * 8);
     gpu.begin();
     let all = [
@@ -130,7 +148,7 @@ fn targets(
         &t.overlay,
     ];
     gpu.to_general(&all);
-    for ((image, bytes), &s) in uploads.iter().zip(&staging) {
+    for ((image, bytes), &s) in images.iter().zip(&uploads).zip(&staging) {
         gpu.upload(s, image, bytes);
     }
     gpu.submit_wait();
@@ -354,5 +372,144 @@ fn transparency_layer_is_composited_after_denoising() {
         "mean relative error {}",
         sum / f64::from(n)
     );
+    validation_clean(&gpu);
+}
+
+/// Runs RR through the orr-gpu API for `frames` frames on the inputs `targets` makes, on a
+/// device whose Render queue binds heaps in every list. The last frame writes a fresh output
+/// cleared to the sentinel; returns it.
+fn run_on_orr(device: &Device, output: [u32; 2], quality: Quality, frames: u64) -> Vec<f32> {
+    let sdk = DlssSdk::new(device, harness::PROJECT_ID).expect("NGX init on an orr device");
+    assert!(sdk.support().rr, "ray reconstruction unavailable");
+    let mut rr =
+        orr_dlss::RayReconstruction::new(&sdk, output, quality, None).unwrap_or_else(|e| {
+            for l in Ngx::take_log() {
+                eprintln!("NGX: {l}");
+            }
+            panic!("RR create: {e}")
+        });
+    let render = rr.render_size();
+    let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
+    let texture = |format, size: [u32; 2], name| {
+        let desc = TextureDesc::d2(format, size[0], size[1], usage);
+        device
+            .create_texture(&desc, TextureMemory::Dedicated, name)
+            .expect("texture")
+    };
+    let statics: Vec<Texture> = [
+        Format::R32Float,
+        Format::Rg16Float,
+        Format::Rg16Float,
+        Format::Rgba8Unorm,
+        Format::Rgba8Unorm,
+        Format::Rgba16Float,
+        Format::Rgba16Float,
+    ]
+    .into_iter()
+    .map(|f| texture(f, render, "rr input"))
+    .collect();
+    let color = texture(Format::Rgba16Float, render, "rr color");
+    let warm = texture(Format::Rgba16Float, output, "rr warm output");
+    let last = texture(Format::Rgba16Float, output, "rr output");
+    let pixels = u64::from(output[0] * output[1]);
+    let readback: Allocation<u8> = device
+        .gpu_malloc(MemoryKind::Readback, pixels * 8, "rr readback")
+        .expect("readback");
+    let mut uploads = Vec::new();
+    let mut upload = |list: &mut CommandList<'_>, t: &Texture, bytes: &[u8]| {
+        let mut a: Allocation<u8> = device
+            .gpu_malloc(MemoryKind::Upload, bytes.len() as u64, "rr upload")
+            .expect("upload");
+        a.as_mut_slice().unwrap().copy_from_slice(bytes);
+        list.copy_to_texture(t, &TextureRegion::whole_mip(t.desc(), 0), a.gpu);
+        uploads.push(a);
+    };
+
+    let queue = device.queue(QueueKind::Render).unwrap();
+    for frame in 0..frames {
+        let mut list = queue.command_list().expect("list");
+        if frame == 0 {
+            for t in statics.iter().chain([&color, &warm, &last]) {
+                list.discard(t);
+            }
+            for (t, bytes) in statics.iter().zip(static_inputs(render, None)) {
+                upload(&mut list, t, &bytes);
+            }
+        }
+        let out = if frame + 1 == frames {
+            upload(
+                &mut list,
+                &last,
+                &f16_bytes(&SENTINEL).repeat(pixels as usize),
+            );
+            &last
+        } else {
+            &warm
+        };
+        upload(&mut list, &color, &f16_bytes(&noisy_color(render, frame)));
+        list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
+        let s = &statics;
+        let inputs = orr_dlss::RrInputs {
+            color: &color,
+            color_before_transparency: None,
+            depth: &s[0],
+            motion: &s[1],
+            specular_motion: &s[2],
+            diffuse_albedo: &s[3],
+            specular_albedo: &s[4],
+            normal_roughness: &s[5],
+            transparency: None,
+            depth_of_field_guide: None,
+            output: out,
+            reset: frame == 0,
+            jitter: rr.jitter(frame),
+        };
+        rr.record(&mut list, &inputs).expect("RR evaluate");
+        list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
+        if frame + 1 == frames {
+            list.copy_from_texture(
+                readback.gpu,
+                &last,
+                &TextureRegion::whole_mip(last.desc(), 0),
+            );
+        }
+        let done = queue.submit(vec![list], &[]).expect("submit");
+        queue.wait(done, Duration::from_secs(30)).expect("wait");
+    }
+    device.collect_garbage();
+    f16_values(readback.as_slice().unwrap(), pixels as usize * 4)
+}
+
+#[test]
+fn rr_on_an_orr_device_matches_the_raw_harness() {
+    let (output, frames) = ([1920, 1080], 8);
+    // The harness device holds the NGX turn for the whole test.
+    let mut gpu = Gpu::new(true);
+    // SAFETY: the device has NGX's extensions and outlives `ngx`.
+    let ngx = unsafe { Ngx::new(gpu.raw(), harness::PROJECT_ID) }.expect("NGX init");
+    let images = outputs(&mut gpu, output, 1);
+    let rr = create(&gpu, &ngx, output, Quality::Performance);
+    let (t, staging) = targets(&mut gpu, rr.render_size(), None);
+    let reference = run(&mut gpu, &mut [(rr, false)], &t, staging, frames, &images).remove(0);
+
+    let hooks = DlssSdk::device_hooks(harness::PROJECT_ID);
+    let device = Device::new(&DeviceDesc {
+        name: "orr-dlss tests",
+        hooks: Some(&hooks),
+        validation: gpu.validation,
+        ..DeviceDesc::default()
+    })
+    .expect("orr device with NGX hooks");
+    let out = run_on_orr(&device, output, Quality::Performance, frames);
+    check_output(&out, [960, 540]);
+    // RR is bit-deterministic for identical inputs.
+    let differ = out.iter().zip(&reference).filter(|(a, b)| a != b).count();
+    assert_eq!(
+        differ,
+        0,
+        "{differ} of {} values differ from the harness",
+        out.len()
+    );
+    assert_eq!(device.validation_messages(), 0, "orr device validation");
     validation_clean(&gpu);
 }

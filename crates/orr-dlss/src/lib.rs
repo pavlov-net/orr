@@ -11,11 +11,14 @@
 //! NGX loads its feature DLLs from, in order: the executable's directory; in debug builds,
 //! the SDK the crate was built against; the SDK at `DLSS_SDK` at run time.
 //!
-//! [`raw`] works on ash handles. Every NGX call must come from one thread.
+//! [`DlssSdk`] and [`RayReconstruction`] work on an orr-gpu device and record into its
+//! command lists, serialising every NGX call. [`raw`] works on ash handles; its caller keeps
+//! NGX calls on one thread at a time.
 
 mod error;
 mod jitter;
 pub mod raw;
+mod sdk;
 
 #[cfg(not(ngx))]
 mod mock;
@@ -26,6 +29,7 @@ mod sys;
 
 pub use error::DlssError;
 pub use jitter::{jitter, jitter_phases, mip_bias};
+pub use sdk::{DlssDeviceHooks, DlssSdk, RayReconstruction, RrInputs};
 pub use uuid::Uuid;
 
 /// Ratio of output to render resolution. `Dlaa` renders at output resolution.

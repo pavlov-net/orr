@@ -17,7 +17,7 @@ pub(crate) enum Item {
     Image {
         image: vk::Image,
         memory: Option<vk::DeviceMemory>,
-        view: vk::ImageView,
+        views: [vk::ImageView; 2],
     },
     Pipeline(vk::Pipeline),
     Accel(vk::AccelerationStructureKHR),
@@ -28,6 +28,8 @@ pub(crate) enum Item {
     },
     ImageSlot(u32),
     RaygenRecord(u32),
+    /// A library's objects, released by its closure.
+    Release(Box<dyn FnOnce() + Send>),
 }
 
 /// A buffer with its own memory, as `gpu_malloc` creates it.
@@ -102,9 +104,11 @@ impl Shared {
                 Item::Image {
                     image,
                     memory,
-                    view,
+                    views,
                 } => {
-                    d.destroy_image_view(view, None);
+                    for v in views {
+                        d.destroy_image_view(v, None);
+                    }
                     d.destroy_image(image, None);
                     if let Some(m) = memory {
                         d.free_memory(m, None);
@@ -122,6 +126,7 @@ impl Shared {
                         r.release(slot);
                     }
                 }
+                Item::Release(release) => release(),
             }
         }
     }

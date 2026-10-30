@@ -21,6 +21,12 @@ Features:
 - `debug_overlay`: loads the SDK's `dev` DLLs, which draw the DLSS debug overlay. Never ship
   these.
 
+## Use
+
+Create the orr-gpu device with `DeviceDesc::hooks` set to `DlssSdk::device_hooks(project_id)`,
+then `DlssSdk::new` on it. `RayReconstruction::record` records into an orr command list.
+The `raw` module offers the same features on ash handles for programs without orr-gpu.
+
 ## Runtime DLLs
 
 NGX looks for its feature DLLs beside the executable first. Debug builds also look in the

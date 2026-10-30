@@ -16,6 +16,7 @@ use super::diagnostics::{Breadcrumbs, Diagnostics, DiagnosticsReport, FaultFns, 
 use super::features::{self, SURFACE_INSTANCE_EXTENSIONS, Selection};
 use super::garbage::{Garbage, Item, MAX_TIMELINES};
 use super::heap::Heaps;
+use super::interop::{ClassicBind, DeviceHooks};
 use super::memory::{MemoryKind, MemoryTypes, Range, Usage, buffer_usage, sharing};
 use super::queue::{Calibration, PassResult, Queue, QueueKind, QueueRequest, Timeline};
 use super::ray::RecordBlock;
@@ -36,6 +37,8 @@ const RAY_TRACING_VALIDATION_VAR: &str = "NV_ALLOW_RAYTRACING_VALIDATION";
 pub struct DeviceDesc<'a> {
     /// Application name reported to the driver.
     pub name: &'a str,
+    /// Extensions and features a library that records raw Vulkan commands needs.
+    pub hooks: Option<&'a dyn DeviceHooks>,
     pub queues: QueueRequest,
     /// Loads the Khronos validation layer with synchronisation checks, when installed.
     /// Messages are logged and counted ([`Device::validation_messages`]).
@@ -59,6 +62,7 @@ impl Default for DeviceDesc<'_> {
     fn default() -> Self {
         Self {
             name: "orr",
+            hooks: None,
             queues: QueueRequest::default(),
             validation: false,
             diagnostics: Diagnostics::Off,
@@ -74,8 +78,7 @@ impl Default for DeviceDesc<'_> {
 /// State every object of one device shares. Objects hold it through an `Arc`, so it is
 /// destroyed after the last of them.
 pub(crate) struct Shared {
-    // Keeps the loader library loaded.
-    _entry: ash::Entry,
+    pub entry: ash::Entry,
     pub instance: ash::Instance,
     pub physical: vk::PhysicalDevice,
     pub device: ash::Device,
@@ -131,6 +134,11 @@ pub(crate) struct Shared {
     pub lost: OnceLock<DiagnosticsReport>,
     /// The raw queue of each created kind.
     pub queue_handles: [Option<vk::Queue>; MAX_TIMELINES],
+    /// The family of each created kind's queue.
+    pub families_by_kind: [u32; MAX_TIMELINES],
+    /// Every enabled device extension.
+    pub extensions: Vec<CString>,
+    classic_bind: OnceLock<ClassicBind>,
 }
 
 /// Surface and swapchain entry points of a device that presents.
@@ -146,6 +154,12 @@ pub(crate) struct PresentFns {
 }
 
 impl Shared {
+    pub(crate) fn classic_bind(&self) -> &ClassicBind {
+        self.classic_bind
+            .get()
+            .expect("the classic bind exists once the device is created")
+    }
+
     pub(crate) fn heaps(&self) -> &Heaps {
         self.heaps
             .get()
@@ -175,6 +189,9 @@ impl Drop for Shared {
             }
             if let Some(b) = self.breadcrumbs.take() {
                 self.destroy(Item::Buffer(b.raw));
+            }
+            if let Some(c) = self.classic_bind.take() {
+                c.destroy(&self.device);
             }
             if let Some(h) = self.heaps.take() {
                 self.destroy(Item::Buffer(h.resource.raw));
@@ -338,7 +355,7 @@ impl Device {
             }
         };
         let created = create_device(&instance, physical, desc, selection);
-        let (device, plans, optional) = match created {
+        let (device, plans, optional, extensions) = match created {
             Ok(c) => c,
             Err(e) => {
                 destroy_instance();
@@ -522,10 +539,12 @@ impl Device {
         let pipeline_cache =
             PipelineCache::open(&instance, &device, physical, &caps, desc.pipeline_cache);
         let mut queue_handles = [None; MAX_TIMELINES];
+        let mut families_by_kind = [0; MAX_TIMELINES];
         for plan in &plans {
             // SAFETY: the queue was requested at device creation.
             queue_handles[plan.kind.index()] =
                 Some(unsafe { device.get_device_queue(plan.family, plan.index) });
+            families_by_kind[plan.kind.index()] = plan.family;
         }
         let fault_fn = if optional.device_fault {
             Some(FaultFns::Khr(ash::khr::device_fault::Device::load(
@@ -609,7 +628,10 @@ impl Device {
             trail: Mutex::default(),
             lost: OnceLock::new(),
             queue_handles,
-            _entry: entry,
+            families_by_kind,
+            extensions,
+            classic_bind: OnceLock::new(),
+            entry,
             instance,
             physical,
             device,
@@ -649,6 +671,7 @@ impl Device {
         }
         let heaps = Heaps::new(&shared, desc.image_heap_slots, desc.sampler_heap_slots)?;
         let _ = shared.heaps.set(heaps);
+        let _ = shared.classic_bind.set(ClassicBind::new(&shared.device)?);
         if optional.ray_dispatch {
             let _ = shared.records.set(RecordBlock::new(&shared, &rt_props)?);
         }
@@ -658,6 +681,9 @@ impl Device {
         };
         let tlas = build_empty_tlas(&device)?;
         let _ = device.shared.empty_tlas.set(tlas);
+        if let Some(hooks) = desc.hooks {
+            hooks.device_created(&device.shared.raw_device());
+        }
         log::info!(
             "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, host image copy {}, decompression {}, occupancy priority {}, validation layer {}, ray tracing validation {}, diagnostics {:?} (breadcrumbs {}, checkpoints {}, aftermath {}, device fault {})",
             device.shared.caps.device_name,
@@ -758,6 +784,26 @@ fn create_instance(
             ext_names.push(name.as_ptr());
         }
     }
+    let hooked = desc
+        .hooks
+        .map(|h| h.instance_extensions(entry))
+        .unwrap_or_default();
+    for name in &hooked {
+        if !exts
+            .iter()
+            .any(|e| e.extension_name_as_c_str() == Ok(name.as_c_str()))
+        {
+            return Err(Error::Unsupported {
+                device: "instance".into(),
+                missing: name.to_string_lossy().into_owned(),
+            });
+        }
+        // SAFETY: every entry points at a NUL-terminated name.
+        let listed = |&p: &*const c_char| unsafe { CStr::from_ptr(p) } == name.as_c_str();
+        if !ext_names.iter().any(listed) {
+            ext_names.push(name.as_ptr());
+        }
+    }
     let name = CString::new(desc.name).unwrap_or_default();
     let app = vk::ApplicationInfo::default()
         .application_name(&name)
@@ -815,7 +861,15 @@ fn create_device(
     physical: vk::PhysicalDevice,
     desc: &DeviceDesc<'_>,
     mut selection: Selection,
-) -> Result<(ash::Device, Vec<QueuePlan>, features::Optional), Error> {
+) -> Result<
+    (
+        ash::Device,
+        Vec<QueuePlan>,
+        features::Optional,
+        Vec<CString>,
+    ),
+    Error,
+> {
     // SAFETY: the physical device belongs to the instance.
     let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
     // SAFETY: as above.
@@ -834,15 +888,34 @@ fn create_device(
                 .queue_priorities(&priorities[..n as usize])
         })
         .collect();
-    let ext_names: Vec<_> = selection.extensions.iter().map(|n| n.as_ptr()).collect();
+    let mut extensions: Vec<CString> = selection.extensions.iter().map(|&n| n.to_owned()).collect();
+    let _hooked_features = match desc.hooks {
+        Some(hooks) => {
+            for ext in hooks.device_extensions(instance, physical) {
+                if !selection.offers(&ext) {
+                    return Err(features::unsupported(
+                        &name,
+                        ext.to_string_lossy().into_owned(),
+                    ));
+                }
+                if !extensions.contains(&ext) {
+                    extensions.push(ext);
+                }
+            }
+            selection.enable.hook(hooks, physical)
+        }
+        None => Vec::new(),
+    };
+    let ext_names: Vec<_> = extensions.iter().map(|n| n.as_ptr()).collect();
     let mut info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_infos)
         .enabled_extension_names(&ext_names);
     info.p_next = selection.enable.head();
-    // SAFETY: the feature chain lives in `selection` until the call returns.
+    // SAFETY: the feature chain lives in `selection` and `_hooked_features` until the call
+    // returns.
     let device = unsafe { instance.create_device(physical, &info, None) }
         .map_err(Error::vk("vkCreateDevice"))?;
-    Ok((device, plans, selection.optional))
+    Ok((device, plans, selection.optional, extensions))
 }
 
 /// Memory requirements of the universal buffer and of optimal images decide the types.

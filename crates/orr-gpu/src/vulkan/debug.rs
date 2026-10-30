@@ -50,10 +50,20 @@ unsafe extern "system" fn callback(
     // General messages come from the loader (layer versions, environment overrides); the
     // settings ones report how the layer itself is configured (GPU-AV runs). The implicit
     // cluster-build VUID is a known false positive of the layer.
+    // NGX clears its own history images after a layout transition whose barrier covers only
+    // shader stages: a hazard inside NGX, on no application object.
+    let ngx_internal = id.starts_with("SYNC-HAZARD") && {
+        // SAFETY: the layer passes `object_count` valid entries.
+        let objects = unsafe { slice(data.p_objects, data.object_count) };
+        objects
+            .iter()
+            .any(|o| text(o.p_object_name).starts_with("nv.ngx."))
+    };
     if types == vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
         || id == "VALIDATION-SETTINGS"
         || id.starts_with("WARNING-Setting-")
         || id == "VUID-vkCmdBuildClusterAccelerationStructureIndirectNV-dstImplicitData-12303"
+        || ngx_internal
     {
         log::debug!("{id}: {message}");
         return vk::FALSE;
@@ -68,6 +78,18 @@ unsafe extern "system" fn callback(
         .0
         .fetch_add(1, Ordering::Relaxed);
     vk::FALSE
+}
+
+/// # Safety
+///
+/// A non-null `p` points at `n` values.
+unsafe fn slice<'a, T>(p: *const T, n: u32) -> &'a [T] {
+    if p.is_null() {
+        &[]
+    } else {
+        // SAFETY: forwarded from the caller.
+        unsafe { std::slice::from_raw_parts(p, n as usize) }
+    }
 }
 
 pub(crate) fn name_object<H: vk::Handle>(
