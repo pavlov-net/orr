@@ -1,17 +1,24 @@
 [package]
 name = "output_suite"
-description = "Headless GPU tests of orr_output's passes against the Slang CPU target, run with the validation layer."
+description = "Headless GPU tests of orr_output's passes against the Slang CPU target and CPU models, run with the validation layer."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
 
-[dev-dependencies]
+[dependencies]
 orr_output = { path = "../../crates/orr_output" }
 orr_scene = { workspace = true, features = ["testing"] }
-output_math = { path = "../output_math" }
+orr_shaders.workspace = true
+bytemuck.workspace = true
 half = "2.7"
+
+[dev-dependencies]
+output_math = { path = "../output_math" }
+
+[build-dependencies]
+orr_shaders = { workspace = true, features = ["build"] }
 
 [lints]
 workspace = true
