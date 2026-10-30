@@ -46,14 +46,15 @@ jobs:
       - name: Bump version
         env:
           VERSION: ${{ steps.drafter.outputs.resolved_version }}
+        # Runs only when the resolved version is higher than the workspace's, so
+        # nothing else (such as a re-resolved Cargo.lock) is ever committed.
         # `cargo set-version` needs network access (it runs `cargo metadata`).
-        # It is skipped when the resolved version is lower than the workspace's;
         # release.yml still rejects a tag that doesn't match the crates.
         run: |
           current=$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[] | select(.publish == null)][0].version')
-          if [ "$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | head -n1)" = "$VERSION" ] \
-             && [ "$current" != "$VERSION" ]; then
-            echo "::warning::Resolved $VERSION is lower than the workspace's $current; not bumping."
+          if [ "$current" = "$VERSION" ] \
+             || [ "$(printf '%s\n%s\n' "$current" "$VERSION" | sort -V | tail -n1)" = "$current" ]; then
+            echo "Workspace is at $current; resolved $VERSION is not higher, not bumping."
           else
             cargo set-version --workspace "$VERSION"
           fi
@@ -70,7 +71,7 @@ jobs:
           PUSH_TOKEN: ${{ steps.app-token.outputs.token }}
           VERSION: ${{ steps.drafter.outputs.resolved_version }}
         run: |
-          if ! git diff --quiet -- '*Cargo.toml' Cargo.lock; then
+          if ! git diff --quiet -- '*Cargo.toml'; then
             git config --global user.name "pavlov-net-release-drafter[bot]"
             git config --global user.email "349057244+pavlov-net-release-drafter[bot]@users.noreply.github.com"
             git add -u -- '*Cargo.toml' Cargo.lock
