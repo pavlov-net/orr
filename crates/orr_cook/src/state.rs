@@ -173,17 +173,15 @@ pub(crate) fn load(archive: &Path, memo: &Memo) -> Vec<Record> {
     if state.version != STATE_VERSION {
         return Vec::new();
     }
+    let mut files = memo.files.lock().expect("memo lock");
     for f in state.files {
         let stat = Stat {
             size: f.size,
             mtime: f.mtime,
         };
-        memo.files
-            .lock()
-            .expect("memo lock")
-            .entry(f.path)
-            .or_insert((stat, f.hash));
+        files.entry(f.path).or_insert((stat, f.hash));
     }
+    drop(files);
     state.sources
 }
 
