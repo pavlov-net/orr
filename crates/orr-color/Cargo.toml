@@ -1,0 +1,11 @@
+[package]
+name = "orr-color"
+description = "Color constants for orr: primaries, RGB and XYZ matrices, luminance and transfer functions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
