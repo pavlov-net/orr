@@ -36,6 +36,147 @@ impl<'a> BlobIn<'a> {
             chunk_len: 0,
         }
     }
+
+    /// Compresses the blob as the writer would, on the calling thread, for
+    /// [`EntryBlobs::push_encoded`].
+    pub fn encode(&self, zstd_level: i32) -> Result<EncodedBlob<'a>> {
+        let chunk = chunk_len(self)?;
+        self.encode_chunked(chunk, raw_key(self, chunk), zstd_level)
+    }
+
+    fn encode_chunked(&self, chunk: u32, key: Hash32, zstd_level: i32) -> Result<EncodedBlob<'a>> {
+        if self.codec == Codec::GDeflate {
+            return Err(Error::InvalidBlob("GDeflate encoding is not available"));
+        }
+        let mut stored = Vec::new();
+        let mut lens = Vec::new();
+        let mut planes = Vec::new();
+        let raw_chunks: Vec<&[u8]> = if self.bytes.is_empty() {
+            vec![&[]]
+        } else {
+            self.bytes.chunks(chunk as usize).collect()
+        };
+        let (mut codec, mut filter) = (self.codec, self.filter);
+        for c in &raw_chunks {
+            let src = if filter == Filter::BytePlanes4 {
+                split_planes(c, &mut planes);
+                &planes[..]
+            } else {
+                c
+            };
+            let n = stored.len();
+            match codec {
+                Codec::Zstd => stored.extend(zstd::bulk::compress(src, zstd_level)?),
+                _ => stored.extend_from_slice(src),
+            }
+            lens.push((stored.len() - n) as u32);
+        }
+        if codec == Codec::Zstd && stored.len() >= self.bytes.len() {
+            (codec, filter) = (Codec::None, Filter::None);
+            stored.clear();
+            stored.extend_from_slice(self.bytes);
+            lens = raw_chunks.iter().map(|c| c.len() as u32).collect();
+        }
+        Ok(EncodedBlob {
+            rec: Blob {
+                offset: 0,
+                stored_len: 0,
+                raw_len: self.bytes.len() as u32,
+                first_chunk: 0,
+                chunk_count: lens.len() as u16,
+                codec: codec_byte(codec, filter),
+                mount: u8::from(self.mount),
+            },
+            key,
+            raw: self.bytes,
+            stored,
+            chunks: lens,
+        })
+    }
+}
+
+/// A blob compressed by [`BlobIn::encode`]; it borrows the decoded bytes for the entry's
+/// content hash.
+pub struct EncodedBlob<'a> {
+    rec: Blob,
+    /// Dedup key of the decoded bytes and settings.
+    key: Hash32,
+    raw: &'a [u8],
+    stored: Vec<u8>,
+    chunks: Vec<u32>,
+}
+
+impl EncodedBlob<'_> {
+    pub fn stored_len(&self) -> usize {
+        self.stored.len()
+    }
+
+    pub fn codec(&self) -> Codec {
+        self.rec.codec()
+    }
+
+    pub fn filter(&self) -> Filter {
+        self.rec.filter()
+    }
+}
+
+/// The blobs of an entry being added by [`ArchiveWriter::add_streamed`].
+pub struct EntryBlobs<'w> {
+    writer: &'w mut ArchiveWriter,
+    content: &'w mut blake3::Hasher,
+}
+
+impl EntryBlobs<'_> {
+    /// Encodes and appends a blob.
+    pub fn push(&mut self, b: &BlobIn) -> Result<()> {
+        let rec = self.writer.encode(b)?;
+        hash_blob(self.content, b.bytes);
+        self.writer.blobs.push(rec);
+        Ok(())
+    }
+
+    /// Appends a blob encoded elsewhere.
+    pub fn push_encoded(&mut self, e: &EncodedBlob) -> Result<()> {
+        let rec = match self.writer.seen.get(&e.key) {
+            Some(r) => *r,
+            None => self
+                .writer
+                .place(e.rec, &e.stored, &e.chunks, Some(e.key))?,
+        };
+        hash_blob(self.content, e.raw);
+        self.writer.blobs.push(rec);
+        Ok(())
+    }
+}
+
+/// Chunk length of a blob: one chunk for mount blobs, else as asked or by the default rule.
+fn chunk_len(b: &BlobIn) -> Result<u32> {
+    let raw_len =
+        u32::try_from(b.bytes.len()).map_err(|_| Error::InvalidBlob("blob over 4 GiB"))?;
+    let chunk = match b.chunk_len {
+        _ if b.mount => raw_len.max(1),
+        0 if raw_len > DEFAULT_CHUNK => DEFAULT_CHUNK,
+        0 => raw_len.max(1),
+        c if c.is_power_of_two() && u64::from(c) >= PAGE => c,
+        _ => {
+            return Err(Error::InvalidBlob(
+                "chunk length is not a power of two from 4096",
+            ));
+        }
+    };
+    if raw_len.div_ceil(chunk) > u32::from(u16::MAX) {
+        return Err(Error::InvalidBlob("more than 65535 chunks"));
+    }
+    Ok(chunk)
+}
+
+fn raw_key(b: &BlobIn, chunk: u32) -> Hash32 {
+    let mut key = blake3::Hasher::new();
+    key.update(b"raw");
+    key.update(&[b.codec as u8, b.filter as u8, u8::from(b.mount)]);
+    key.update(&chunk.to_le_bytes());
+    key.update(b.bytes);
+    Hash32::finish(&key)
 }
 
 /// Where [`ArchiveWriter::finish`] puts the archive.
@@ -125,34 +266,50 @@ impl ArchiveWriter {
         cook_key: Hash32,
         blobs: &[BlobIn],
     ) -> Result<AssetId> {
-        let mut content = blake3::Hasher::new();
-        for b in blobs {
-            hash_blob(&mut content, b.bytes);
-        }
+        self.add_streamed(name, class, schema, cook_key, |e| {
+            blobs.iter().try_for_each(|b| e.push(b))
+        })
+    }
+
+    /// Adds an asset whose blobs `push_blobs` pushes in order, so they need not all be in
+    /// memory at once. On failure the entry and its blob records are dropped.
+    pub fn add_streamed<E: From<Error>>(
+        &mut self,
+        name: &str,
+        class: u16,
+        schema: u16,
+        cook_key: Hash32,
+        push_blobs: impl FnOnce(&mut EntryBlobs<'_>) -> Result<(), E>,
+    ) -> Result<AssetId, E> {
         let entry = Entry {
             id: AssetId::NONE,
             class,
             schema,
             flags: 0,
-            content_hash: Hash32::finish(&content),
+            content_hash: Hash32([0; 32]),
             cook_key,
             first_blob: 0,
-            blob_count: blobs.len() as u32,
+            blob_count: 0,
             name: StrRef::default(),
             _reserved: [0; 6],
         };
-        self.insert(name, entry, |w| {
-            for b in blobs {
-                let rec = w.encode(b)?;
-                w.blobs.push(rec);
-            }
-            Ok(())
-        })
+        let mut content = blake3::Hasher::new();
+        let first = self.blobs.len();
+        let id = self.insert(name, entry, |w| {
+            push_blobs(&mut EntryBlobs {
+                writer: w,
+                content: &mut content,
+            })
+        })?;
+        let e = self.entries.last_mut().expect("just inserted");
+        e.content_hash = Hash32::finish(&content);
+        e.blob_count = (self.blobs.len() - first) as u32;
+        Ok(id)
     }
 
     /// Copies an entry from another archive with its stored bytes as they are.
     pub fn copy_entry(&mut self, from: &Archive, e: &Entry) -> Result<()> {
-        self.insert(from.name(e), *e, |w| {
+        self.insert::<Error>(from.name(e), *e, |w| {
             let mut buf = Vec::new();
             for b in from.blobs(e) {
                 let stored = match from.stored(b, None) {
@@ -174,15 +331,15 @@ impl ArchiveWriter {
 
     /// Adds `entry` under `name` with the blob records `push_blobs` appends. On failure the
     /// entry and its blob records are dropped.
-    fn insert(
+    fn insert<E: From<Error>>(
         &mut self,
         name: &str,
         entry: Entry,
-        push_blobs: impl FnOnce(&mut Self) -> Result<()>,
-    ) -> Result<AssetId> {
+        push_blobs: impl FnOnce(&mut Self) -> Result<(), E>,
+    ) -> Result<AssetId, E> {
         let id = AssetId::from_name(name);
         if id == AssetId::NONE || self.ids.contains(&id) {
-            return Err(Error::Duplicate(name.into()));
+            return Err(Error::Duplicate(name.into()).into());
         }
         let first_blob = self.blobs.len();
         if let Err(e) = push_blobs(self) {
@@ -204,75 +361,13 @@ impl ArchiveWriter {
     }
 
     fn encode(&mut self, b: &BlobIn) -> Result<Blob> {
-        if b.codec == Codec::GDeflate {
-            return Err(Error::InvalidBlob("GDeflate encoding is not available"));
-        }
-        let raw_len =
-            u32::try_from(b.bytes.len()).map_err(|_| Error::InvalidBlob("blob over 4 GiB"))?;
-        let chunk = match b.chunk_len {
-            _ if b.mount => raw_len.max(1),
-            0 if raw_len > DEFAULT_CHUNK => DEFAULT_CHUNK,
-            0 => raw_len.max(1),
-            c if c.is_power_of_two() && u64::from(c) >= PAGE => c,
-            _ => {
-                return Err(Error::InvalidBlob(
-                    "chunk length is not a power of two from 4096",
-                ));
-            }
-        };
-        if raw_len.div_ceil(chunk) > u32::from(u16::MAX) {
-            return Err(Error::InvalidBlob("more than 65535 chunks"));
-        }
-
-        let mut key = blake3::Hasher::new();
-        key.update(b"raw");
-        key.update(&[b.codec as u8, b.filter as u8, u8::from(b.mount)]);
-        key.update(&chunk.to_le_bytes());
-        key.update(b.bytes);
-        let key = Hash32::finish(&key);
+        let chunk = chunk_len(b)?;
+        let key = raw_key(b, chunk);
         if let Some(rec) = self.seen.get(&key) {
             return Ok(*rec);
         }
-
-        let mut stored = Vec::new();
-        let mut lens = Vec::new();
-        let mut planes = Vec::new();
-        let raw_chunks: Vec<&[u8]> = if b.bytes.is_empty() {
-            vec![&[]]
-        } else {
-            b.bytes.chunks(chunk as usize).collect()
-        };
-        let (mut codec, mut filter) = (b.codec, b.filter);
-        for c in &raw_chunks {
-            let src = if filter == Filter::BytePlanes4 {
-                split_planes(c, &mut planes);
-                &planes[..]
-            } else {
-                c
-            };
-            let n = stored.len();
-            match codec {
-                Codec::Zstd => stored.extend(zstd::bulk::compress(src, self.zstd_level)?),
-                _ => stored.extend_from_slice(src),
-            }
-            lens.push((stored.len() - n) as u32);
-        }
-        if codec == Codec::Zstd && stored.len() >= b.bytes.len() {
-            (codec, filter) = (Codec::None, Filter::None);
-            stored.clear();
-            stored.extend_from_slice(b.bytes);
-            lens = raw_chunks.iter().map(|c| c.len() as u32).collect();
-        }
-        let rec = Blob {
-            offset: 0,
-            stored_len: 0,
-            raw_len,
-            first_chunk: 0,
-            chunk_count: lens.len() as u16,
-            codec: codec_byte(codec, filter),
-            mount: u8::from(b.mount),
-        };
-        self.place(rec, &stored, &lens, Some(key))
+        let e = b.encode_chunked(chunk, key, self.zstd_level)?;
+        self.place(e.rec, &e.stored, &e.chunks, Some(e.key))
     }
 
     /// Stores encoded bytes once and returns the blob record pointing at them.

@@ -10,7 +10,8 @@ mod common;
 use glam::{DVec3, Quat, Vec3};
 use orr_cook::{
     ArchiveSpec, AssetSpec, DataFormat, GltfSettings, Instances, Manifest, MipFilter, Placement,
-    PrototypeSpec, Source, TextureSettings, Usage,
+    PrototypeSpec, RasterInput, RasterLayerSpec, RasterSet, Reduction, Source, TextureSettings,
+    Usage,
 };
 use orr_pack::{Archive, Class, Target};
 
@@ -44,6 +45,11 @@ const GOLDEN: &[(u16, u32, &str)] = &[
         "a251a6855f4d9ece691a2b1e0c5b8324970d386350f71a6fdd03c7087c72e194",
     ),
     (
+        Class::RasterSet as u16,
+        1,
+        "552868a7a913b6a2812e5d834cbba45fb4613839e85d744cfdc358ab53dba9be",
+    ),
+    (
         USER,
         1,
         "4ba4fdc45927952e6db847bca8db82d192871fc2f541209f7c4f776ada77d9e4",
@@ -57,6 +63,14 @@ fn cooked_bytes_match_their_cook_versions() {
         image::Rgba([(x * 6) as u8, (y * 10) as u8, (x ^ y) as u8, (x * y) as u8])
     })
     .save(&png)
+    .unwrap();
+    let raster = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("golden.r32");
+    let heights: Vec<f32> = (0..32 * 32).map(|i| ((i * 7) % 61) as f32 - 20.0).collect();
+    std::fs::write(&raster, bytemuck::cast_slice(&heights)).unwrap();
+    std::fs::write(
+        raster.with_extension("json"),
+        r#"{"width": 32, "height": 32, "format": "r32f"}"#,
+    )
     .unwrap();
     let records = (0..40)
         .map(|i| Placement {
@@ -102,6 +116,25 @@ fn cooked_bytes_match_their_cook_versions() {
                             ..Default::default()
                         }],
                         ..Default::default()
+                    }),
+                },
+                AssetSpec {
+                    name: "terrain".into(),
+                    source: Source::Raster(RasterSet {
+                        world_min: [-16.0, -16.0],
+                        world_size: 32.0,
+                        layers: vec![RasterLayerSpec {
+                            name: "height".into(),
+                            input: RasterInput::Whole {
+                                path: raster,
+                                tile_size: 8,
+                            },
+                            border: 1,
+                            reduction: Reduction::Mean,
+                            srgb: false,
+                            compress: None,
+                            quality: Default::default(),
+                        }],
                     }),
                 },
                 AssetSpec {

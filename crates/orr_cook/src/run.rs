@@ -21,6 +21,7 @@ use crate::cache::Cache;
 use crate::instances::{self, Catalog, ModelFacts};
 use crate::key::{self, Key, ZSTD_LEVEL};
 use crate::mesh::{self, MeshData};
+use crate::raster::{self, RasterReport};
 use crate::report::{self, ArchiveReport, AssetReport, Outcome};
 use crate::state::{self, Input, Memo, Record};
 use crate::texture::material::{ImageFacts, ImageFile, Packer, TextureJob, image_facts};
@@ -99,6 +100,7 @@ enum Work<'m> {
     /// The placements, the cell size, the catalog without models, and the mesh unit of
     /// each prototype's model.
     Instances(&'m Instances, u8, Catalog, Vec<(String, usize)>),
+    Raster(raster::Plan),
 }
 
 enum State {
@@ -159,9 +161,12 @@ struct Imported {
     units: Vec<NewUnit>,
 }
 
+/// A cooked unit: where its entries are, the job's seconds and a raster set's report.
+type UnitResult = (From, f64, Option<RasterReport>);
+
 enum Msg {
     Import(usize, std::thread::Result<Result<Imported>>),
-    Unit(usize, std::thread::Result<Result<(From, f64)>>),
+    Unit(usize, std::thread::Result<Result<UnitResult>>),
 }
 
 struct Run<'m, 's> {
@@ -182,6 +187,8 @@ struct Run<'m, 's> {
     imports: Vec<Import<'m>>,
     instances: Vec<(usize, usize, &'m Instances)>,
     assets: Vec<AssetReport>,
+    /// Reports of cooked raster sets, by unit, until written.
+    rasters: HashMap<usize, RasterReport>,
     /// Units whose dependencies are done, largest first; models and shared results apart,
     /// as they finish on the coordinator.
     ready: BTreeSet<(Reverse<u64>, usize)>,
@@ -209,6 +216,7 @@ impl<'m, 's> Run<'m, 's> {
             imports: Vec::new(),
             instances: Vec::new(),
             assets: Vec::new(),
+            rasters: HashMap::new(),
             ready: BTreeSet::new(),
             local: Vec::new(),
             pending: Vec::new(),
@@ -328,6 +336,25 @@ impl<'m, 's> Run<'m, 's> {
                     }),
                     deps: Vec::new(),
                     working_set: bytes.len() as u64,
+                    triangles: 0,
+                    state: State::Waiting,
+                    mesh: None,
+                });
+            }
+            Source::Raster(set) => {
+                let planned = raster::plan(name, set, &self.shared.memo)?;
+                for f in &planned.files {
+                    self.input(a, index, f);
+                }
+                self.add(Unit {
+                    archive: a,
+                    asset: index,
+                    name: name.into(),
+                    class: Class::RasterSet as u16,
+                    key: planned.key,
+                    work: Some(Work::Raster(planned.plan)),
+                    deps: Vec::new(),
+                    working_set: raster::WORKING_SET,
                     triangles: 0,
                     state: State::Waiting,
                     mesh: None,
@@ -814,7 +841,10 @@ impl<'m, 's> Run<'m, 's> {
             };
             running -= 1;
             bytes -= self.units[u].working_set;
-            let (from, seconds) = r.unwrap_or_else(|p| resume_unwind(p))?;
+            let (from, seconds, raster) = r.unwrap_or_else(|p| resume_unwind(p))?;
+            if let Some(report) = raster {
+                self.rasters.insert(u, report);
+            }
             self.done(u, from, None, Outcome::Cooked, seconds)?;
         }
     }
@@ -850,8 +880,8 @@ impl<'m, 's> Run<'m, 's> {
         scope.spawn(move |_| {
             let r = catch_unwind(AssertUnwindSafe(|| {
                 let start = Instant::now();
-                let from = cook_unit(shared, &name, class, key, work)?;
-                Ok((from, start.elapsed().as_secs_f64()))
+                let (from, raster) = cook_unit(shared, &name, class, key, work)?;
+                Ok((from, start.elapsed().as_secs_f64(), raster))
             }));
             let _ = tx.send(Msg::Unit(u, r));
         });
@@ -893,7 +923,7 @@ impl<'m, 's> Run<'m, 's> {
             schema: orr_pack::model::SCHEMA,
             blobs: vec![(bytes, true)],
         };
-        let from = cook_unit(self.shared, &unit.name, unit.class, unit.key, work)?;
+        let (from, _) = cook_unit(self.shared, &unit.name, unit.class, unit.key, work)?;
         self.done(
             u,
             from,
@@ -942,6 +972,9 @@ impl<'m, 's> Run<'m, 's> {
                     From::Memory(arc) => write(arc)?,
                     From::Old => write(old.expect("linked from the old archive"))?,
                     From::Cache(path) => write(&Archive::open(path)?)?,
+                }
+                if let (Some(r), Some(first)) = (self.rasters.remove(&u), reports.first_mut()) {
+                    first.raster = Some(r);
                 }
                 self.assets[asset].entries.extend(reports);
                 self.window -= d.memory;
@@ -1127,7 +1160,14 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
 }
 
 /// Cooks one unit into a one-unit archive: in the cache when there is one, else in memory.
-fn cook_unit(shared: &Shared, name: &str, class: u16, key: Hash32, work: Work<'_>) -> Result<From> {
+fn cook_unit(
+    shared: &Shared,
+    name: &str,
+    class: u16,
+    key: Hash32,
+    work: Work<'_>,
+) -> Result<(From, Option<RasterReport>)> {
+    let mut detail = None;
     let path = shared.cache.as_ref().map(|c| c.path(key));
     let mut w = ArchiveWriter::create(path.clone().map_or(Target::Memory, Target::File))?;
     w.set_zstd_level(ZSTD_LEVEL);
@@ -1157,13 +1197,7 @@ fn cook_unit(shared: &Shared, name: &str, class: u16, key: Hash32, work: Work<'_
             texture::add(&mut w, name, key, &built)?;
         }
         Work::TextureFile(path, hash, settings) => {
-            let bytes = std::fs::read(&path).map_err(|source| Error::Read {
-                path: path.clone(),
-                source,
-            })?;
-            if Hash32::of(&bytes) != hash {
-                return Err(Error::Changed { path });
-            }
+            let bytes = state::read_checked(&path, hash)?;
             let built = texture::cook_file(name, &bytes, &settings)?;
             texture::add(&mut w, name, key, &built)?;
         }
@@ -1171,10 +1205,15 @@ fn cook_unit(shared: &Shared, name: &str, class: u16, key: Hash32, work: Work<'_
         Work::Instances(src, cell_log2, catalog, _) => {
             instances::cook(&mut w, name, src, cell_log2, &catalog, key)?;
         }
+        Work::Raster(plan) => {
+            let scratch = raster::scratch_dir(shared.cache.as_ref().map(Cache::dir));
+            detail = Some(raster::cook(&mut w, name, key, &plan, &scratch)?);
+        }
     }
-    Ok(match (w.finish()?, path) {
+    let from = match (w.finish()?, path) {
         (Some(bytes), _) => From::Memory(Arc::new(Archive::from_memory(bytes)?)),
         (None, Some(path)) => From::Cache(path),
         (None, None) => unreachable!("a file target has a path"),
-    })
+    };
+    Ok((from, detail))
 }

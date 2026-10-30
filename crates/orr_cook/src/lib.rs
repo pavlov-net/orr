@@ -14,6 +14,9 @@
 //!
 //! A texture source emits one texture `N`.
 //!
+//! A raster source emits one raster set `N`: a tiled LOD pyramid per layer, built by the
+//! cook from a whole raster or imported from producer tiles ([`RasterSet`]).
+//!
 //! An instances source emits instance pages `N/<x>_<y>_<z>/<i>` per world cell
 //! ([`Instances`]); it can place models cooked by any archive of the manifest. A user source
 //! emits one entry `N` of a consumer class.
@@ -36,6 +39,7 @@ mod instances;
 mod key;
 mod manifest;
 mod mesh;
+mod raster;
 mod report;
 mod run;
 mod state;
@@ -49,6 +53,10 @@ use serde::Deserialize;
 
 pub use instances::{Instances, Placement, PrototypeSpec, SectionSpec};
 pub use mesh::MeshSettings;
+pub use raster::{
+    RasterCompression, RasterFormat, RasterInput, RasterLayerReport, RasterLayerSpec, RasterReport,
+    RasterSet, Reduction,
+};
 pub use report::{
     ArchiveReport, AssetReport, CookReport, EntryReport, MeshReport, Outcome, TextureReport,
 };
@@ -114,6 +122,8 @@ pub enum Source {
     },
     /// Placements of models cooked by the same manifest.
     Instances(Instances),
+    /// Raster layers tiled into one raster set.
+    Raster(RasterSet),
     /// Opaque bytes of a consumer class (at least [`Class::USER_FIRST`]), stored as one
     /// payload blob. `version` changes the cook key only.
     User {
@@ -224,6 +234,9 @@ pub enum Error {
     /// Placements that do not fit an instance page.
     #[error("{asset}: {message}")]
     Instances { asset: String, message: String },
+    /// A raster set whose inputs or settings do not fit the format.
+    #[error("{asset}: {message}")]
+    Raster { asset: String, message: String },
     #[error("{asset}: class {class:#06x} is not a user class")]
     UserClass { asset: String, class: u16 },
 }

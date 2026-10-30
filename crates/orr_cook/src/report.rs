@@ -7,6 +7,8 @@ use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, Class, Entry};
 use serde::Serialize;
 
+use crate::RasterReport;
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CookReport {
     /// Wall time of the whole cook.
@@ -51,6 +53,8 @@ pub struct EntryReport {
     pub mesh: Option<MeshReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub texture: Option<TextureReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raster: Option<RasterReport>,
 }
 
 /// How an entry was obtained.
@@ -149,5 +153,6 @@ pub(crate) fn entry(
         stored,
         mesh,
         texture,
+        raster: None,
     }
 }

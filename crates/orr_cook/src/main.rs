@@ -4,6 +4,7 @@ use std::process::ExitCode;
 
 use orr_cook::{CookOptions, Manifest, Outcome};
 use orr_pack::instance::{InstancePageInfo, InstanceRecord};
+use orr_pack::raster::{RasterLayer, RasterSetInfo};
 use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, Class, Codec, Entry};
 
@@ -152,6 +153,8 @@ fn inspect(args: &[String]) -> Result<bool> {
                 texture_line(&a, e, &mut out)?;
             } else if e.class == Class::InstancePage as u16 {
                 instance_line(&a, e, &mut out)?;
+            } else if e.class == Class::RasterSet as u16 {
+                raster_lines(&a, e, &mut out)?;
             }
         }
         if name.is_some() {
@@ -218,6 +221,53 @@ fn instance_line(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
         h.log2_scale_max.exp2(),
         h.user_stride
     )?;
+    Ok(())
+}
+
+/// Placement of a raster set, then per layer its format, tiles, LODs, reduction, value
+/// range and stored bytes.
+fn raster_lines(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
+    let blobs = a.blobs(e);
+    let mut head = vec![0; blobs[0].raw_len as usize];
+    a.read(&blobs[0], &mut head)?;
+    let info = RasterSetInfo::parse(&head)?;
+    let h = info.header;
+    writeln!(
+        out,
+        "    world min {:?} m, size {} m, {} layers, {} tiles",
+        h.world_min,
+        h.world_size,
+        info.layers.len(),
+        info.tiles.len()
+    )?;
+    for (i, (l, name)) in info.layers.iter().zip(&info.names).enumerate() {
+        let tiles: Vec<_> = info
+            .tiles
+            .iter()
+            .filter(|t| usize::from(t.layer) == i)
+            .collect();
+        let stored: u64 = tiles
+            .iter()
+            .map(|t| u64::from(blobs[t.blob as usize].stored_len))
+            .sum();
+        let reduction = match l.reduction {
+            RasterLayer::MEAN => "mean",
+            RasterLayer::MIN => "min",
+            RasterLayer::MAX => "max",
+            _ => "nearest",
+        };
+        writeln!(
+            out,
+            "    {name}: vk format {} tile {}+2x{}, {} lods, {} tiles, {reduction}, {}, range {:?}, stored {stored} B",
+            l.vk_format,
+            l.tile_size,
+            l.border,
+            l.lod_count,
+            tiles.len(),
+            if l.lossless == 1 { "lossless" } else { "BCn" },
+            l.value_range,
+        )?;
+    }
     Ok(())
 }
 
