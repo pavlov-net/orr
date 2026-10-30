@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+openpbr = []
 build = ["dep:thiserror", "dep:libloading", "dep:serde", "dep:serde_json", "dep:blake3", "dep:bindgen", "dep:cc"]
 
 [dependencies]

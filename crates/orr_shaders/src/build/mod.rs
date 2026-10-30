@@ -20,8 +20,8 @@ pub use lint::{Lint, LintError};
 pub use locate::SLANG_VERSION;
 pub use toolchain::SLANGC_OPTIONS;
 
-use std::io;
 use std::path::PathBuf;
+use std::{env, io};
 
 /// A build failure.
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +36,13 @@ pub enum Error {
     /// `ORR_SLANGC` is not the absolute path of an existing file.
     #[error("ORR_SLANGC is {}, which is not the absolute path of an existing file", path.display())]
     SlangcMissing { path: PathBuf },
+    /// `ORR_OPENPBR_BSDF` is unset or wrong and no `.tools` directory above the crate holds
+    /// adobe/openpbr-bsdf.
+    #[error(
+        "adobe/openpbr-bsdf not found: no .tools/openpbr-bsdf/openpbr.h in or above {} and ORR_OPENPBR_BSDF does not name a checkout; run tools/fetch-slang.sh",
+        searched_from.display()
+    )]
+    OpenPbrNotFound { searched_from: PathBuf },
     /// The release's Slang library could not be loaded.
     #[error("cannot load the Slang library at {}: {source}", path.display())]
     LibraryLoad {
@@ -87,6 +94,18 @@ pub enum Error {
     /// One or more lints failed.
     #[error("{}", lint_lines(.0))]
     Lints(Vec<LintError>),
+}
+
+/// The adobe/openpbr-bsdf checkout that `orr.openpbr` includes: `ORR_OPENPBR_BSDF` when
+/// set, else `.tools/openpbr-bsdf` in or above `CARGO_MANIFEST_DIR`, where
+/// `tools/fetch-slang.sh` puts it.
+pub fn openpbr_dir() -> Result<PathBuf, Error> {
+    let start = env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .ok_or(Error::NoManifestDir)?;
+    locate::find_openpbr(env::var_os("ORR_OPENPBR_BSDF"), &start).ok_or(Error::OpenPbrNotFound {
+        searched_from: start,
+    })
 }
 
 fn lint_lines(lints: &[LintError]) -> String {

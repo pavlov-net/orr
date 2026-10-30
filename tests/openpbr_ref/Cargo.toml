@@ -1,0 +1,19 @@
+[package]
+name = "openpbr_ref"
+description = "The OpenPBR reference BSDF on the CPU: adobe/openpbr-bsdf's C++ build and orr.openpbr through Slang's C++ target, with the harness that checks a BSDF against them."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+orr_shaders = { workspace = true, features = ["openpbr"] }
+shader_math = { path = "../shader_math" }
+
+[build-dependencies]
+orr_shaders = { workspace = true, features = ["build"] }
+cc = "1.2"
+
+[lints]
+workspace = true

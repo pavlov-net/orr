@@ -47,3 +47,16 @@ pub(crate) fn release_dir(slangc: &Path) -> &Path {
         .and_then(Path::parent)
         .expect("slangc lies in the release's bin directory")
 }
+
+/// adobe/openpbr-bsdf: `ORR_OPENPBR_BSDF` when set, else `.tools/openpbr-bsdf` in or above
+/// `start`. `None` when neither holds `openpbr.h`.
+pub(crate) fn find_openpbr(orr_openpbr_bsdf: Option<OsString>, start: &Path) -> Option<PathBuf> {
+    if let Some(dir) = orr_openpbr_bsdf.filter(|d| !d.is_empty()) {
+        let dir = PathBuf::from(dir);
+        return dir.join("openpbr.h").is_file().then_some(dir);
+    }
+    start
+        .ancestors()
+        .map(|d| d.join(".tools").join("openpbr-bsdf"))
+        .find(|d| d.join("openpbr.h").is_file())
+}
