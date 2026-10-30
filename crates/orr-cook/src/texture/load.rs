@@ -40,6 +40,10 @@ impl Blocks {
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<Source, String> {
+    const KTX1: &[u8] = b"\xABKTX 11\xBB\r\n\x1A\n";
+    if bytes.starts_with(KTX1) {
+        return Err("KTX1 images are not supported; convert them to KTX2".into());
+    }
     match decode_container(bytes, InputOverrides::default()).map_err(|e| e.to_string())? {
         Some(image) => container(image),
         None => file(bytes),
