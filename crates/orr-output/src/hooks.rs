@@ -123,13 +123,17 @@ pub struct DistortionField {
 impl DistortionField {
     /// A field for an output of `extent`.
     pub fn new(gpu: &Device, extent: [u32; 2]) -> Result<Self> {
-        let half = [extent[0].div_ceil(2), extent[1].div_ceil(2)];
+        let half = Self::extent_for(extent);
         let image = || Image::new(gpu, Format::Rgba16Float, half, "distortion field");
         Ok(Self {
             images: [image()?, image()?],
             current: 0,
             fresh: true,
         })
+    }
+
+    pub(crate) fn extent_for(output: [u32; 2]) -> [u32; 2] {
+        output.map(|n| n.div_ceil(2))
     }
 
     pub fn extent(&self) -> [u32; 2] {

@@ -416,7 +416,7 @@ impl OutputKernels {
         let field = field.map_or(StorageImageIndex::NONE, |f| {
             assert_eq!(
                 f.extent(),
-                [pass.extent[0].div_ceil(2), pass.extent[1].div_ceil(2)],
+                DistortionField::extent_for(pass.extent),
                 "distortion field for another extent"
             );
             f.prepare(list);
