@@ -20,13 +20,7 @@ public struct TextureIndex
     [ForceInline]
     public T get<T : IOpaqueDescriptor>()
     {
-        __target_switch
-        {
-        case metal:
-            return metal_resource<T>(metal_texture_pool + uint64_t(index));
-        default:
-            return getDescriptorFromHandle(DescriptorHandle<T>(uint2(index, 0)));
-        }
+        return heap_view<T>(index);
     }
 }
 
@@ -40,13 +34,7 @@ public struct StorageImageIndex
     [ForceInline]
     public T get<T : IOpaqueDescriptor>()
     {
-        __target_switch
-        {
-        case metal:
-            return metal_resource<T>(metal_texture_pool + uint64_t(index));
-        default:
-            return getDescriptorFromHandle(DescriptorHandle<T>(uint2(index, 0)));
-        }
+        return heap_view<T>(index);
     }
 }
 
@@ -110,6 +98,19 @@ struct MetalSampler
     uint64_t id;
 }
 [[vk::binding(2, 0)]] StructuredBuffer<MetalSampler> metal_samplers;
+
+// The view of type `T` in resource heap slot `index`.
+[ForceInline]
+T heap_view<T : IOpaqueDescriptor>(uint index)
+{
+    __target_switch
+    {
+    case metal:
+        return metal_resource<T>(metal_texture_pool + uint64_t(index));
+    default:
+        return getDescriptorFromHandle(DescriptorHandle<T>(uint2(index, 0)));
+    }
+}
 
 // A resource of type `T` from its Metal resource ID.
 T metal_resource<T>(uint64_t id)
