@@ -11,6 +11,8 @@ mod locate;
 mod metal;
 mod model;
 mod precompile;
+#[cfg(feature = "hot-reload")]
+mod reload;
 mod slang;
 mod spirv;
 mod sys;
@@ -21,6 +23,8 @@ pub use cpu::CpuLibrary;
 pub use link::LinkPoint;
 pub use lint::{Lint, LintError};
 pub use locate::SLANG_VERSION;
+#[cfg(feature = "hot-reload")]
+pub use reload::{Reload, Watcher};
 pub use toolchain::SLANGC_OPTIONS;
 
 use std::path::PathBuf;
@@ -97,6 +101,9 @@ pub enum Error {
     /// The `link` calls or a link-points file are invalid.
     #[error("{message}")]
     Link { message: String },
+    /// A build manifest could not be read, or does not list a module.
+    #[error("{}: {message}", path.display())]
+    Manifest { path: PathBuf, message: String },
     /// One or more lints failed.
     #[error("{}", lint_lines(.0))]
     Lints(Vec<LintError>),

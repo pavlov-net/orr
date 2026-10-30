@@ -35,6 +35,14 @@ pub mod orr_edited {
     include!(concat!(env!("OUT_DIR"), "/edited-orr/orr_kernels.rs"));
 }
 
+/// Every point linked into the renderer fixture from the copies in [`HOT_CONSUMER`].
+pub mod hot_linked {
+    include!(concat!(env!("OUT_DIR"), "/hot-linked/orr_kernels.rs"));
+}
+
+/// The copy of `consumer/` that [`hot_linked`] links, for tests that edit it.
+pub const HOT_CONSUMER: &str = concat!(env!("OUT_DIR"), "/hot-consumer");
+
 /// What a surface returned through the switch.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SurfaceCall {

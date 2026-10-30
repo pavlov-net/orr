@@ -251,6 +251,8 @@ unsafe fn c_str<'a>(p: *const c_char) -> Option<&'a str> {
 /// The loaded library and its exported functions.
 pub(crate) struct Library {
     pub(crate) api: sys::SlangLib,
+    /// The file the library was loaded from.
+    pub(crate) path: PathBuf,
     /// The directory holding the library and the downstream libraries it loads by name.
     dir: CString,
 }
@@ -274,7 +276,11 @@ impl Library {
         let api = unsafe { sys::SlangLib::from_library(library)? };
         let dir = path.parent().unwrap_or(Path::new("."));
         let dir = CString::new(dir.to_string_lossy().as_bytes()).expect("path has no nul");
-        Ok(Arc::new(Self { api, dir }))
+        Ok(Arc::new(Self {
+            api,
+            path: path.to_path_buf(),
+            dir,
+        }))
     }
 
     pub(crate) fn build_tag(&self) -> String {

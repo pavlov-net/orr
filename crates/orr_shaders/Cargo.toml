@@ -10,6 +10,8 @@ repository.workspace = true
 [features]
 openpbr = []
 build = ["dep:thiserror", "dep:libloading", "dep:serde", "dep:serde_json", "dep:blake3", "dep:bindgen", "dep:cc"]
+# `Watcher`: recompiles compiled-in modules from source at run time, for dev builds.
+hot-reload = ["build"]
 
 [dependencies]
 bytemuck.workspace = true

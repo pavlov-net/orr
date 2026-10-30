@@ -42,12 +42,16 @@ pub(crate) fn load() -> Result<Arc<Library>, Error> {
         },
     })?;
     enable_spirv_validation();
-    let library = library_path(locate::release_dir(&slangc));
-    let lib = Library::load(&library).map_err(|source| Error::LibraryLoad {
-        path: library.clone(),
+    load_library(&library_path(locate::release_dir(&slangc)))
+}
+
+/// Loads the Slang library at `path` and checks that it is exactly [`SLANG_VERSION`].
+pub(crate) fn load_library(path: &Path) -> Result<Arc<Library>, Error> {
+    let lib = Library::load(path).map_err(|source| Error::LibraryLoad {
+        path: path.to_path_buf(),
         source,
     })?;
-    check_version(&library, &lib.build_tag())?;
+    check_version(path, &lib.build_tag())?;
     Ok(lib)
 }
 
