@@ -592,6 +592,7 @@ dependencies = [
  "orr-lighting",
  "orr-pack",
  "orr-shaders",
+ "shader-maths",
 ]
 
 [[package]]

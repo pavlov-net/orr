@@ -5,16 +5,29 @@ use std::ffi::CString;
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 
+use super::mesh::{MeshPipeline, Rendering, attachment_view};
 use super::pipeline::ComputePipeline;
 use super::queue::{ListResources, MAX_PASSES, Queue};
 use super::ray::RayDispatchPipeline;
 use super::texture::Texture;
-use crate::{Error, GpuPtr, Hazards, Stages, TextureRegion};
+use crate::{
+    ClearColor, ColorLoad, DepthLoad, Error, GpuPtr, Hazards, Stages, TextureRegion, TextureUsage,
+};
 
 /// `vkCmdDispatchIndirect` arguments: workgroup counts.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct DispatchArgs {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+/// `vkCmdDrawMeshTasksIndirectEXT` arguments: task workgroup counts, or mesh workgroup
+/// counts for pipelines without a task stage.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct MeshArgs {
     pub x: u32,
     pub y: u32,
     pub z: u32,
@@ -32,6 +45,8 @@ pub struct CommandList<'q> {
     res: Option<ListResources>,
     passes: Vec<PassRecord>,
     open: bool,
+    /// Rendering extent while between `begin_rendering` and `end_rendering`.
+    rendering: Option<[u32; 2]>,
     bound: vk::Pipeline,
 }
 
@@ -42,6 +57,7 @@ impl<'q> CommandList<'q> {
             res: Some(res),
             passes: Vec::new(),
             open: false,
+            rendering: None,
             bound: vk::Pipeline::null(),
         }
     }
@@ -68,6 +84,7 @@ impl<'q> CommandList<'q> {
             "pass {:?} was not ended",
             self.passes.last().map(|p| p.name)
         );
+        assert!(self.rendering.is_none(), "rendering was not ended");
         let res = self.res.take().unwrap();
         // SAFETY: the buffer is recording and owned by this list.
         if let Err(e) = unsafe { self.device().end_command_buffer(res.cmd) } {
@@ -194,6 +211,181 @@ impl<'q> CommandList<'q> {
                 extent[2],
             );
         };
+    }
+
+    /// Starts drawing into `r`'s attachments, which stay in `GENERAL`. Viewport and scissor
+    /// cover the extent. Order earlier writes to the attachments with a barrier before
+    /// `COLOR_OUT` and `DEPTH`.
+    pub fn begin_rendering(&mut self, r: &Rendering<'_>) {
+        assert!(self.rendering.is_none(), "begin_rendering inside rendering");
+        assert!(
+            self.queue.graphics,
+            "rendering needs a queue with graphics (Render or Present)"
+        );
+        let colors: Vec<_> = r
+            .colors
+            .iter()
+            .map(|a| {
+                let (load, clear) = match a.load {
+                    ColorLoad::Keep => (vk::AttachmentLoadOp::LOAD, vk::ClearColorValue::default()),
+                    ColorLoad::Discard => (
+                        vk::AttachmentLoadOp::DONT_CARE,
+                        vk::ClearColorValue::default(),
+                    ),
+                    ColorLoad::Clear(c) => (
+                        vk::AttachmentLoadOp::CLEAR,
+                        match c {
+                            ClearColor::Float(v) => vk::ClearColorValue { float32: v },
+                            ClearColor::Uint(v) => vk::ClearColorValue { uint32: v },
+                            ClearColor::Sint(v) => vk::ClearColorValue { int32: v },
+                        },
+                    ),
+                };
+                vk::RenderingAttachmentInfo::default()
+                    .image_view(attachment_view(a.texture, TextureUsage::COLOR))
+                    .image_layout(vk::ImageLayout::GENERAL)
+                    .load_op(load)
+                    .store_op(store_op(a.store))
+                    .clear_value(vk::ClearValue { color: clear })
+            })
+            .collect();
+        let depth = r.depth.map(|a| {
+            let (load, value) = match a.load {
+                DepthLoad::Keep => (vk::AttachmentLoadOp::LOAD, 0.0),
+                DepthLoad::Discard => (vk::AttachmentLoadOp::DONT_CARE, 0.0),
+                DepthLoad::Clear(v) => (vk::AttachmentLoadOp::CLEAR, v),
+            };
+            vk::RenderingAttachmentInfo::default()
+                .image_view(attachment_view(a.texture, TextureUsage::DEPTH))
+                .image_layout(vk::ImageLayout::GENERAL)
+                .load_op(load)
+                .store_op(store_op(a.store))
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: value,
+                        stencil: 0,
+                    },
+                })
+        });
+        let stencil = r
+            .depth
+            .filter(|a| a.texture.desc().format.has_stencil())
+            .and(depth);
+        let area = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: vk::Extent2D {
+                width: r.extent[0],
+                height: r.extent[1],
+            },
+        };
+        let mut info = vk::RenderingInfo::default()
+            .render_area(area)
+            .layer_count(1)
+            .color_attachments(&colors);
+        if let Some(d) = &depth {
+            info = info.depth_attachment(d);
+        }
+        if let Some(s) = &stencil {
+            info = info.stencil_attachment(s);
+        }
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: r.extent[0] as f32,
+            height: r.extent[1] as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let cmd = self.cmd();
+        // SAFETY: recording on a graphics queue; the attachments are live views in GENERAL.
+        unsafe {
+            self.device().cmd_begin_rendering(cmd, &info);
+            self.device().cmd_set_viewport(cmd, 0, &[viewport]);
+            self.device().cmd_set_scissor(cmd, 0, &[area]);
+        }
+        self.rendering = Some(r.extent);
+    }
+
+    /// Limits drawing to the rectangle at `offset` of size `extent`, clamped to the
+    /// rendering extent. Lasts until the next `set_scissor` or `end_rendering`.
+    pub fn set_scissor(&mut self, offset: [u32; 2], extent: [u32; 2]) {
+        let full = self.rendering.expect("set_scissor outside rendering");
+        let x = offset[0].min(full[0]);
+        let y = offset[1].min(full[1]);
+        let rect = vk::Rect2D {
+            offset: vk::Offset2D {
+                x: x as i32,
+                y: y as i32,
+            },
+            extent: vk::Extent2D {
+                width: extent[0].min(full[0] - x),
+                height: extent[1].min(full[1] - y),
+            },
+        };
+        // SAFETY: recording inside rendering.
+        unsafe { self.device().cmd_set_scissor(self.cmd(), 0, &[rect]) };
+    }
+
+    pub fn end_rendering(&mut self) {
+        assert!(
+            self.rendering.take().is_some(),
+            "end_rendering without begin_rendering"
+        );
+        // SAFETY: recording inside rendering begun in this list.
+        unsafe { self.device().cmd_end_rendering(self.cmd()) };
+    }
+
+    /// Draws `p` over `groups` task workgroups (mesh workgroups without a task stage) with
+    /// `root` as its root pointer. Inside rendering only.
+    pub fn draw_mesh_tasks<R>(&mut self, p: &MeshPipeline, root: GpuPtr<R>, groups: [u32; 3]) {
+        assert!(
+            self.rendering.is_some(),
+            "draw_mesh_tasks outside rendering"
+        );
+        self.bind(vk::PipelineBindPoint::GRAPHICS, p.raw, root.address().0);
+        // SAFETY: recording inside rendering with a mesh pipeline bound.
+        unsafe {
+            self.queue.shared.mesh_fn.cmd_draw_mesh_tasks(
+                self.cmd(),
+                groups[0],
+                groups[1],
+                groups[2],
+            );
+        }
+    }
+
+    /// Draws `p` once per element of `args`, reading the draw count from `count` on the GPU
+    /// and drawing at most `max`. Inside rendering only.
+    pub fn draw_mesh_tasks_indirect_count<R>(
+        &mut self,
+        p: &MeshPipeline,
+        root: GpuPtr<R>,
+        args: GpuPtr<MeshArgs>,
+        count: GpuPtr<u32>,
+        max: u32,
+    ) {
+        assert!(
+            self.rendering.is_some(),
+            "draw_mesh_tasks_indirect_count outside rendering"
+        );
+        self.bind(vk::PipelineBindPoint::GRAPHICS, p.raw, root.address().0);
+        let shared = &self.queue.shared;
+        let stride = size_of::<MeshArgs>() as u64;
+        let (args_buffer, args_offset) = shared.locate(args.address(), stride * u64::from(max));
+        let (count_buffer, count_offset) = shared.locate(count.address(), 4);
+        // SAFETY: recording inside rendering with a mesh pipeline bound; the arguments and
+        // the count each lie in one buffer.
+        unsafe {
+            shared.mesh_fn.cmd_draw_mesh_tasks_indirect_count(
+                self.cmd(),
+                args_buffer,
+                args_offset,
+                count_buffer,
+                count_offset,
+                max,
+                stride as u32,
+            );
+        }
     }
 
     /// Runs `p` with workgroup counts read from `args` on the GPU.
@@ -354,10 +546,23 @@ impl Drop for CommandList<'_> {
     }
 }
 
+fn store_op(store: bool) -> vk::AttachmentStoreOp {
+    if store {
+        vk::AttachmentStoreOp::STORE
+    } else {
+        vk::AttachmentStoreOp::DONT_CARE
+    }
+}
+
 fn vk_stages(s: Stages, ray: bool) -> vk::PipelineStageFlags2 {
     use vk::PipelineStageFlags2 as P;
     if s.contains(Stages::ALL) {
-        return P::ALL_COMMANDS;
+        // ALL_COMMANDS covers every queue command but not host access.
+        return if s.contains(Stages::HOST) {
+            P::ALL_COMMANDS | P::HOST
+        } else {
+            P::ALL_COMMANDS
+        };
     }
     let mut out = P::NONE;
     for (flag, stages) in [
