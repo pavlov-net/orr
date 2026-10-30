@@ -7,10 +7,16 @@
 //! - `N`: a model binding the mesh to one material per section,
 //! - `N/mesh`: every triangle primitive of the default scene with node transforms applied,
 //!   one section per glTF material,
-//! - `N/material/<i>`: glTF material `i`, or `N/material/default` for primitives without one.
+//! - `N/material/<i>`: glTF material `i`, or `N/material/default` for primitives without one,
+//! - `N/texture/<material>/<role>`: the material's textures (roles `base_color`, `opacity`,
+//!   `normal`, `roughness`, `metalness`, `roughness_metalness`, `occlusion`, `emission`);
+//!   materials that would cook the same texture share the first one's entry.
+//!
+//! A texture source emits one texture `N`.
 
 mod gltf;
 mod mesh;
+mod texture;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,6 +26,8 @@ use orr_pack::model::{ModelHeader, ModelInfo};
 use orr_pack::{ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span, Target};
 
 pub use mesh::MeshSettings;
+pub use texture::material::{TextureOverride, TextureRules};
+pub use texture::{DataFormat, MipFilter, Primaries, Quality, TextureSettings, Usage, Wrap};
 
 /// Archives to cook.
 #[derive(Clone, Debug, Default)]
@@ -47,11 +55,17 @@ pub enum Source {
         path: PathBuf,
         settings: GltfSettings,
     },
+    /// An image file: PNG, JPEG, Radiance HDR, OpenEXR, KTX2 or DDS.
+    Texture {
+        path: PathBuf,
+        settings: TextureSettings,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct GltfSettings {
     pub mesh: MeshSettings,
+    pub textures: TextureRules,
 }
 
 /// Result of [`cook`].
@@ -76,6 +90,9 @@ pub enum Error {
     /// The mesh does not fit the cooked format or the settings.
     #[error("{asset}: {message}")]
     Mesh { asset: String, message: String },
+    /// An image cannot be read or cooked with its settings.
+    #[error("{asset}: {message}")]
+    Texture { asset: String, message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -83,7 +100,15 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Changes whenever the cook writes different output for the same inputs and settings.
 const COOK_VERSION: u32 = 1;
 
+/// Cooks every archive of the manifest. Work runs on the cook's own thread pool.
 pub fn cook(manifest: &Manifest) -> Result<Cooked> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .build()
+        .map_err(|e| orr_pack::Error::from(std::io::Error::other(e)))?;
+    pool.install(|| cook_on_pool(manifest))
+}
+
+fn cook_on_pool(manifest: &Manifest) -> Result<Cooked> {
     let mut cooked = Cooked::default();
     for spec in &manifest.archives {
         let mut w = ArchiveWriter::create(spec.output.clone())?;
@@ -92,6 +117,15 @@ pub fn cook(manifest: &Manifest) -> Result<Cooked> {
                 Source::Gltf { path, settings } => {
                     cook_gltf(&mut w, &asset.name, path, settings)?;
                 }
+                Source::Texture { path, settings } => {
+                    let bytes = std::fs::read(path).map_err(|source| Error::Read {
+                        path: path.clone(),
+                        source,
+                    })?;
+                    let built = texture::cook_file(&asset.name, &bytes, settings)?;
+                    let key = cook_key(Class::Texture, &[&texture::encoder_key(settings), &bytes]);
+                    texture::add(&mut w, &asset.name, key, &built)?;
+                }
             }
         }
         if let Some(bytes) = w.finish()? {
@@ -99,6 +133,17 @@ pub fn cook(manifest: &Manifest) -> Result<Cooked> {
         }
     }
     Ok(cooked)
+}
+
+/// Content key of a cooked entry from everything that shapes its output.
+fn cook_key(class: Class, parts: &[&[u8]]) -> Hash32 {
+    let mut h = blake3::Hasher::new();
+    h.update(&COOK_VERSION.to_le_bytes());
+    h.update(&(class as u16).to_le_bytes());
+    for p in parts {
+        h.update(p);
+    }
+    Hash32(*h.finalize().as_bytes())
 }
 
 fn mount(bytes: &[u8]) -> BlobIn<'_> {
@@ -115,14 +160,8 @@ fn cook_gltf(
     settings: &GltfSettings,
 ) -> Result<()> {
     let src = gltf::import(name, path)?;
-    let key = |class: Class| {
-        let mut h = blake3::Hasher::new();
-        h.update(&COOK_VERSION.to_le_bytes());
-        h.update(&(class as u16).to_le_bytes());
-        h.update(format!("{settings:?}").as_bytes());
-        h.update(&src.input_hash.0);
-        Hash32(*h.finalize().as_bytes())
-    };
+    let settings_key = format!("{settings:?}");
+    let key = |class: Class| cook_key(class, &[settings_key.as_bytes(), &src.input_hash.0]);
 
     let cooked = mesh::cook(name, &src.mesh, &settings.mesh)?;
     let info = cooked.info.to_bytes();
@@ -140,14 +179,17 @@ fn cook_gltf(
         &blobs,
     )?;
 
+    let mut packer = texture::material::Packer::new(name, &src.images, &settings.textures);
     let mut materials = Vec::with_capacity(src.materials.len());
-    for (suffix, m) in &src.materials {
+    for (suffix, m, textures) in &src.materials {
+        let mut m = *m;
+        packer.material(w, suffix, &mut m, textures)?;
         materials.push(w.add(
             &format!("{name}/material/{suffix}"),
             Class::Material as u16,
             orr_pack::material::SCHEMA,
             key(Class::Material),
-            &[mount(bytemuck::bytes_of::<Material>(m))],
+            &[mount(bytemuck::bytes_of::<Material>(&m))],
         )?);
     }
 
