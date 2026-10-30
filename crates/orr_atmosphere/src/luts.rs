@@ -296,8 +296,6 @@ impl AtmosphereState {
             let g = cx.put_root(&root(StorageImageIndex::NONE, 0))?;
             cx.cmd
                 .dispatch(&self.pipelines.ground_irradiance, g, [GROUND_SIZE, 1, 1]);
-            cx.cmd
-                .barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
             cx.cmd.end_pass();
             self.medium_changed = false;
         }

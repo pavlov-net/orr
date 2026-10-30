@@ -396,9 +396,9 @@ public float3 atmosphere_light_transmittance(AtmosphereGpu* a, float h, float mu
         * exp(-atmosphere_fog_optical_depth_to_space(a, h, mu));
 }
 
-// Multiply-scattered radiance per unit scattering coefficient and per unit spectral
-// irradiance of a light at zenith cosine mu_light, at altitude h: groups from `layer`, or
-// the Rec.2020 layer at `group_passes`.
+// Multiply-scattered radiance per unit scattering coefficient of a light at zenith cosine
+// mu_light, at altitude h: three groups from `layer`, per unit spectral irradiance, or the
+// Rec.2020 layer at `group_passes`, per unit of the light's Rec.2020 illuminance.
 public float3 atmosphere_lut_multiple_scattering(AtmosphereGpu* a, float h, float mu_light,
                                                  uint layer)
 {
