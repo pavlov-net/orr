@@ -199,6 +199,8 @@ pub(crate) struct Entry {
 pub(crate) struct StrayParam {
     pub(crate) name: String,
     pub(crate) entry: Option<String>,
+    /// The file declaring a global parameter, when reflection finds it.
+    pub(crate) file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,7 +214,9 @@ pub(crate) struct Model {
     pub(crate) bad_atomics: Vec<u16>,
 }
 
-unsafe fn text(p: *const c_char) -> String {
+/// # Safety
+/// `p` is null or a nul-terminated string that outlives the call.
+pub(crate) unsafe fn text(p: *const c_char) -> String {
     if p.is_null() {
         String::new()
     } else {
@@ -225,8 +229,15 @@ struct Extract<'a> {
     api: &'a sys::SlangLib,
     layout: *mut sys::SlangReflection,
     spv: &'a spirv::Module,
-    decls: &'a HashMap<String, PathBuf>,
+    decls: &'a Decls,
     structs: BTreeMap<String, StructDef>,
+}
+
+/// Declaring files of the structs and global variables of every loaded module, by name.
+#[derive(Default)]
+struct Decls {
+    structs: HashMap<String, PathBuf>,
+    globals: HashMap<String, PathBuf>,
 }
 
 /// Reads the model of a linked program. `layout` must stay alive for the call.
@@ -236,7 +247,7 @@ pub(crate) fn extract(
     words: &[u32],
 ) -> Result<Model, String> {
     let spv = spirv::Module::parse(words)?;
-    let decls = struct_decls(session);
+    let decls = declarations(session);
     let api = &session.lib.api;
     let mut x = Extract {
         api,
@@ -249,33 +260,40 @@ pub(crate) fn extract(
     unsafe { x.run() }
 }
 
-/// Every struct declared in a module loaded into the session, by name, with its file.
-fn struct_decls(session: &Session) -> HashMap<String, PathBuf> {
+/// Every struct and module-scope variable declared in a module loaded into the session.
+fn declarations(session: &Session) -> Decls {
+    use sys::SlangDeclKind as K;
     let api = &session.lib.api;
-    let mut out = HashMap::new();
-    let mut stack: Vec<*mut sys::SlangReflectionDecl> = session
+    let mut out = Decls::default();
+    let mut stack: Vec<(*mut sys::SlangReflectionDecl, bool)> = session
         .loaded_modules()
         .iter()
         .map(super::slang::Module::reflection)
         .filter(|d| !d.is_null())
+        .map(|d| (d, true))
         .collect();
     // SAFETY: decls come from modules owned by the live session.
     unsafe {
-        while let Some(decl) = stack.pop() {
+        while let Some((decl, module_scope)) = stack.pop() {
             for i in 0..api.spReflectionDecl_getChildrenCount(decl) {
                 let child = api.spReflectionDecl_getChild(decl, i);
                 if child.is_null() {
                     continue;
                 }
                 let kind = api.spReflectionDecl_getKind(child);
-                if kind == sys::SlangDeclKind::SLANG_DECL_KIND_STRUCT {
-                    let name = text(api.spReflectionDecl_getName(child));
-                    if let Some((file, _)) = session.decl_location(child) {
-                        out.entry(name).or_insert(file);
-                    }
+                let map = match kind {
+                    K::SLANG_DECL_KIND_STRUCT => Some(&mut out.structs),
+                    K::SLANG_DECL_KIND_VARIABLE if module_scope => Some(&mut out.globals),
+                    _ => None,
+                };
+                if let Some(map) = map
+                    && let Some((file, _)) = session.decl_location(child)
+                {
+                    map.entry(text(api.spReflectionDecl_getName(child)))
+                        .or_insert(file);
                 }
-                if kind != sys::SlangDeclKind::SLANG_DECL_KIND_FUNC {
-                    stack.push(child);
+                if kind != K::SLANG_DECL_KIND_FUNC {
+                    stack.push((child, false));
                 }
             }
         }
@@ -304,6 +322,9 @@ impl Extract<'_> {
                 use sys::SlangParameterCategory as C;
                 if category == C::SLANG_PARAMETER_CATEGORY_SPECIALIZATION_CONSTANT {
                     let id = api.spReflectionVariableLayout_GetOffset(vl, category) as u32;
+                    if id == spirv::OMM_SPEC_ID {
+                        continue;
+                    }
                     let scalar = Scalar::from_slang(api.spReflectionType_GetScalarType(ty))
                         .ok_or_else(|| format!("specialisation constant {name} is not a scalar"))?;
                     let default = spec_defaults.get(&id).map_or(0, |(_, w)| {
@@ -331,7 +352,12 @@ impl Extract<'_> {
                         _ => return Err(format!("the root {name} is not a struct")),
                     }
                 } else {
-                    stray_params.push(StrayParam { name, entry: None });
+                    let file = self.decls.globals.get(&name).cloned();
+                    stray_params.push(StrayParam {
+                        name,
+                        entry: None,
+                        file,
+                    });
                 }
             }
             spec.sort_by_key(|s| s.id);
@@ -376,6 +402,7 @@ impl Extract<'_> {
                         stray_params.push(StrayParam {
                             name: text(api.spReflectionVariable_GetName(var)),
                             entry: Some(name.clone()),
+                            file: None,
                         });
                     }
                 }
@@ -646,7 +673,7 @@ impl Extract<'_> {
                     name: name.clone(),
                     fields: Vec::new(),
                     size: None,
-                    file: self.decls.get(&short).cloned(),
+                    file: self.decls.structs.get(&short).cloned(),
                 },
             );
             let mut fields = Vec::new();

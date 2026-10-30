@@ -975,6 +975,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "shader-abi"
+version = "0.0.1"
+dependencies = [
+ "orr-shaders",
+]
+
+[[package]]
 name = "shader-corpus"
 version = "0.0.1"
 dependencies = [

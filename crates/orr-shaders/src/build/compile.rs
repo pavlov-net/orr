@@ -10,9 +10,8 @@ use super::codegen::{self, Kernel, Owner, Shared};
 use super::layout::{Plan, Planner};
 use super::lint::{self, Lint, LintError};
 use super::model::{self, Model, StructDef, Ty};
-use super::slang::GlobalSession;
-use super::slang::Library;
-use super::{Error, SLANG_VERSION, SLANGC_OPTIONS, spirv};
+use super::slang::{GlobalSession, Library, Session};
+use super::{Error, SLANG_VERSION, SLANGC_OPTIONS, metal, spirv};
 
 /// Compiles a crate's Slang kernels and generates Rust for them. Used from `build.rs`.
 ///
@@ -33,6 +32,8 @@ pub struct Build {
     externs: BTreeMap<String, String>,
     debug_info: bool,
     fp_precise: bool,
+    asserts: bool,
+    metal_check: bool,
     allowed: BTreeSet<Lint>,
     out_dir: Option<PathBuf>,
 }
@@ -59,6 +60,8 @@ impl Build {
             externs: BTreeMap::new(),
             debug_info: env::var("PROFILE").map_or(true, |p| p != "release"),
             fp_precise: false,
+            asserts: false,
+            metal_check: env::var_os("ORR_METAL_CHECK").is_some_and(|v| v == "1"),
             allowed: BTreeSet::new(),
             out_dir: None,
         })
@@ -101,6 +104,21 @@ impl Build {
     /// `-fp-mode precise`, for entry-parity test kernels.
     pub fn fp_precise(mut self, on: bool) -> Self {
         self.fp_precise = on;
+        self
+    }
+
+    /// Links `orr.debug`'s `ASSERTS = true`, so checks such as `Tlas.get()` on address 0
+    /// abort. Off by default; the device then needs `shaderAbort`.
+    pub fn asserts(mut self, on: bool) -> Self {
+        self.asserts = on;
+        self
+    }
+
+    /// Also compiles each module's compute and mesh-pipeline entries to MSL and checks them
+    /// ([`Lint::Metal`]). Defaults to on when `ORR_METAL_CHECK=1`. The `.metal` files are
+    /// written beside the SPIR-V.
+    pub fn metal_check(mut self, on: bool) -> Self {
+        self.metal_check = on;
         self
     }
 
@@ -161,12 +179,25 @@ impl Build {
             Some(root) => find_kernels(root)?,
             None => Vec::new(),
         };
+        let metal_options = self.metal_check.then(|| {
+            let mut o: Vec<String> = metal::OPTIONS.iter().map(|s| (*s).to_owned()).collect();
+            for root in &roots {
+                o.extend(["-I".to_owned(), root.display().to_string()]);
+            }
+            o
+        });
+        let settings = Settings {
+            tool: tool_hash(),
+            options: &options,
+            metal: metal_options.as_deref(),
+            asserts: self.asserts,
+        };
         let records = out_dir.join("orr-shaders");
         let mut jobs = Vec::new();
         let mut modules = BTreeMap::new();
         for (name, path) in kernels {
             let record_path = records.join(format!("{name}.json"));
-            match load_record(&record_path, &options, &path) {
+            match load_record(&record_path, &settings, &path) {
                 Some(record) => {
                     modules.insert(name, record);
                 }
@@ -174,10 +205,17 @@ impl Build {
             }
         }
         let compiled: Vec<String> = jobs.iter().map(|(n, ..)| n.clone()).collect();
-        let fresh = compile_all(&self.lib, &options, jobs, &out_dir)?;
+        let fresh = compile_all(&self.lib, &settings, jobs, &out_dir)?;
         modules.extend(fresh);
 
         let mut lints = lint::duplicate_imports(&roots);
+        for (name, record) in &modules {
+            lints.extend(record.metal.iter().map(|message| LintError {
+                lint: Lint::Metal,
+                module: name.clone(),
+                message: message.clone(),
+            }));
+        }
         let mut seen_files = BTreeSet::new();
         for record in modules.values() {
             for input in &record.inputs {
@@ -247,7 +285,7 @@ impl Build {
                         field: m.field,
                         message: m.message,
                     })?;
-            lints.extend(lint::model_lints(name, &model, &module_plans));
+            lints.extend(lint::model_lints(name, &model, &module_plans, &lib_dir));
             plans.insert(name.clone(), module_plans);
             models.insert(name.clone(), model);
         }
@@ -309,6 +347,7 @@ impl Build {
         let manifest = Manifest {
             slang: SLANG_VERSION,
             options: &options,
+            asserts: self.asserts,
             modules: modules
                 .iter()
                 .map(|(name, r)| ManifestModule {
@@ -352,6 +391,7 @@ impl Build {
 struct Manifest<'a> {
     slang: &'a str,
     options: &'a [String],
+    asserts: bool,
     modules: Vec<ManifestModule<'a>>,
 }
 
@@ -375,6 +415,34 @@ struct Record {
     omm: Option<PathBuf>,
     hash: u64,
     model: Model,
+    /// MSL check failures; empty when the check passed or did not run.
+    metal: Vec<String>,
+}
+
+/// What every module of one build is compiled with.
+struct Settings<'a> {
+    /// A hash of the running build script, so a changed build invalidates every record.
+    tool: String,
+    options: &'a [String],
+    /// The Metal session's options when the MSL check runs.
+    metal: Option<&'a [String]>,
+    asserts: bool,
+}
+
+impl Settings<'_> {
+    /// Everything besides the inputs that changes a module's outputs.
+    fn key_parts(&self) -> Vec<&str> {
+        let mut parts = vec![self.tool.as_str()];
+        parts.extend(self.options.iter().map(String::as_str));
+        if self.asserts {
+            parts.push("+asserts");
+        }
+        if let Some(metal) = self.metal {
+            parts.push("+metal");
+            parts.extend(metal.iter().map(String::as_str));
+        }
+        parts
+    }
 }
 
 fn print_cargo(roots: &[PathBuf], modules: &BTreeMap<String, Record>) {
@@ -463,10 +531,17 @@ fn find_kernels(root: &Path) -> Result<Vec<(String, PathBuf)>, Error> {
     Ok(out)
 }
 
-fn cache_key(options: &[String], kernel: &Path, inputs: &[PathBuf]) -> Option<String> {
+fn tool_hash() -> String {
+    env::current_exe()
+        .and_then(fs::read)
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        .unwrap_or_default()
+}
+
+fn cache_key(settings: &Settings<'_>, kernel: &Path, inputs: &[PathBuf]) -> Option<String> {
     let mut h = blake3::Hasher::new();
     h.update(SLANG_VERSION.as_bytes());
-    for o in options {
+    for o in settings.key_parts() {
         h.update(o.as_bytes());
         h.update(&[0]);
     }
@@ -479,16 +554,16 @@ fn cache_key(options: &[String], kernel: &Path, inputs: &[PathBuf]) -> Option<St
     Some(h.finalize().to_hex().to_string())
 }
 
-fn load_record(path: &Path, options: &[String], kernel: &Path) -> Option<Record> {
+fn load_record(path: &Path, settings: &Settings<'_>, kernel: &Path) -> Option<Record> {
     let record: Record = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    let key = cache_key(options, kernel, &record.inputs)?;
+    let key = cache_key(settings, kernel, &record.inputs)?;
     let outputs_exist = record.spv.is_file() && record.omm.as_ref().is_none_or(|p| p.is_file());
     (record.key == key && record.kernel == kernel && outputs_exist).then_some(record)
 }
 
 fn compile_all(
     lib: &Arc<Library>,
-    options: &[String],
+    settings: &Settings<'_>,
     jobs: Vec<(String, PathBuf, PathBuf)>,
     out_dir: &Path,
 ) -> Result<BTreeMap<String, Record>, Error> {
@@ -508,7 +583,7 @@ fn compile_all(
                     let Some((name, path, record_path)) = queue.lock().expect("queue").pop() else {
                         break;
                     };
-                    let result = compile_one(lib, &mut global, options, &name, &path, out_dir)
+                    let result = compile_one(lib, &mut global, settings, &name, &path, out_dir)
                         .and_then(|record| {
                             write(
                                 &record_path,
@@ -533,7 +608,7 @@ fn compile_all(
 fn compile_one(
     lib: &Arc<Library>,
     global: &mut Option<GlobalSession>,
-    options: &[String],
+    settings: &Settings<'_>,
     name: &str,
     path: &Path,
     out_dir: &Path,
@@ -546,7 +621,7 @@ fn compile_one(
         *global = Some(GlobalSession::new(Arc::clone(lib)).map_err(slang_err)?);
     }
     let global = global.as_ref().expect("created above");
-    let session = global.session(options).map_err(slang_err)?;
+    let session = global.session(settings.options).map_err(slang_err)?;
     let source = fs::read_to_string(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
@@ -558,7 +633,10 @@ fn compile_one(
     let module = session
         .load(&name.replace('/', "."), path, &source)
         .map_err(compile_err)?;
-    let program = session.link(&module).map_err(compile_err)?;
+    let extra = link_modules(&session, settings, out_dir).map_err(compile_err)?;
+    let program = session
+        .link(&module, &extra, |_| true)
+        .map_err(compile_err)?;
     let words = program.spirv().map_err(compile_err)?;
     let spv = out_dir.join(format!("{name}.spv"));
     write(&spv, &words_to_bytes(&words))?;
@@ -575,7 +653,14 @@ fn compile_one(
         .collect();
     inputs.sort();
     inputs.dedup();
-    let key = cache_key(options, path, &inputs).ok_or_else(|| Error::Io {
+    let metal = match settings.metal {
+        Some(metal_options) => {
+            let session = global.session(metal_options).map_err(slang_err)?;
+            metal_issues(&session, settings, &model, name, path, &source, out_dir)?
+        }
+        None => Vec::new(),
+    };
+    let key = cache_key(settings, path, &inputs).ok_or_else(|| Error::Io {
         path: path.to_path_buf(),
         source: std::io::Error::other("an input vanished during the build"),
     })?;
@@ -596,7 +681,66 @@ fn compile_one(
         omm,
         hash: hash64(&words_to_bytes(&words)),
         model,
+        metal,
     })
+}
+
+/// The modules linked into every kernel besides its own: `ASSERTS = true` when asserts are
+/// on.
+fn link_modules(
+    session: &Session,
+    settings: &Settings<'_>,
+    out_dir: &Path,
+) -> Result<Vec<super::slang::Module>, String> {
+    if !settings.asserts {
+        return Ok(Vec::new());
+    }
+    let path = out_dir.join("orr-shaders").join("asserts.slang");
+    Ok(vec![session.load(
+        "orr_asserts",
+        &path,
+        "export static const bool ASSERTS = true;\n",
+    )?])
+}
+
+/// Loads the kernel at `path` once more into the Metal `session`, compiles its non-raygen
+/// entries to MSL and returns what the MSL check finds. Writes `<name>.metal`.
+fn metal_issues(
+    session: &Session,
+    settings: &Settings<'_>,
+    model: &Model,
+    name: &str,
+    path: &Path,
+    source: &str,
+    out_dir: &Path,
+) -> Result<Vec<String>, Error> {
+    let entries: BTreeSet<&str> = model
+        .entries
+        .iter()
+        .filter(|e| e.stage != crate::Stage::RayGen)
+        .map(|e| e.name.as_str())
+        .collect();
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let text = metal::without_raygen(source);
+    let compiled = (|| {
+        let module = session.load(&name.replace('/', "."), path, &text)?;
+        let extra = link_modules(session, settings, out_dir)?;
+        let program = session.link(&module, &extra, |e| entries.contains(e))?;
+        Ok::<_, String>((program.text()?, program))
+    })();
+    let (msl, program) = match compiled {
+        Ok(r) => r,
+        Err(diagnostics) => return Ok(vec![format!("Metal emission failed:\n{diagnostics}")]),
+    };
+    write(&out_dir.join(format!("{name}.metal")), msl.as_bytes())?;
+    let mut issues = metal::msl_issues(&msl);
+    match program.layout() {
+        Ok(layout) => issues.extend(metal::layout_issues(&session.lib.api, layout, model)),
+        Err(diagnostics) => issues.push(format!("no Metal layout: {diagnostics}")),
+    }
+    Ok(issues)
 }
 
 /// The interface of a module's entry points: the root's layout, through pointees, and the

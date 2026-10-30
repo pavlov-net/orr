@@ -33,8 +33,12 @@ jobs:
             echo "$(basename "$f"): $glibc $glibcxx"
           done
       # Kernels compile in the crates' build scripts with warnings as errors and Slang's
-      # bundled SPIR-V validator; shader crates join this list as they gain kernels.
+      # bundled SPIR-V validator, and their compute and mesh entries through the MSL check;
+      # shader crates join this list as they gain kernels.
       - name: Test
+        env:
+          ORR_METAL_CHECK: "1"
         run: |
           cargo test -p orr-shaders --features build
           cargo test -p shader-corpus
+          cargo test -p shader-abi

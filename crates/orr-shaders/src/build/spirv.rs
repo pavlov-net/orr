@@ -60,9 +60,14 @@ pub(crate) mod decoration {
 
 pub(crate) const STORAGE_UNIFORM: u32 = 2;
 pub(crate) const STORAGE_PHYSICAL: u32 = 5349;
+const CAPABILITY_OMM: u32 = 5381;
 const CAPABILITY_OMM_EXECUTION_MODE: u32 = 6032;
 const EXECUTION_MODE_OMM_ID: u32 = 6031;
 const OMM_EXTENSION: &str = "SPV_KHR_opacity_micromap";
+/// The specialisation constant id of `orr.trace`'s `OMM_2_STATE`, which carries the forced
+/// two-state micromap ray flag: 0 in a module, the flag in its variant.
+pub(crate) const OMM_SPEC_ID: u32 = 0x8000_0000;
+const RAY_FLAG_FORCE_OMM_2_STATE: u32 = 0x400;
 
 /// (decoration, literal operands) pairs.
 type Decorations = Vec<(u32, Vec<u32>)>;
@@ -390,12 +395,26 @@ fn takes_literals(o: u16) -> bool {
 }
 
 /// The module with `OpExecutionModeId <entry> OpacityMicromapIdKHR <true>` on every entry
-/// point, plus its capability and extension. `None` when the module has no ray query.
+/// point, plus its capability and extension. Where the module uses `orr.trace`'s
+/// `OMM_2_STATE`, its value becomes the forced two-state ray flag and the micromap
+/// capability is declared. `None` when the module has no ray query.
 pub(crate) fn omm_variant(words: &[u32]) -> Option<Vec<u32>> {
     let module = Module::parse(words).ok()?;
     if !module.ray_query {
         return None;
     }
+    let two_state = module
+        .spec_constants
+        .keys()
+        .copied()
+        .find(|id| module.decoration(*id, decoration::SPEC_ID) == Some(&[OMM_SPEC_ID]));
+    let mut words = words.to_vec();
+    if let Some(id) = two_state {
+        let (at, _) =
+            instructions(&words).find(|(_, i)| i.op == op::SPEC_CONSTANT && i.args[1] == id)?;
+        words[at + 3] = RAY_FLAG_FORCE_OMM_2_STATE;
+    }
+    let words = &words[..];
     let mut bound = words[3];
     let mut new_id = || {
         let id = bound;
@@ -437,11 +456,12 @@ pub(crate) fn omm_variant(words: &[u32]) -> Option<Vec<u32>> {
         v.extend_from_slice(args);
         v
     };
+    let mut capabilities = inst(op::CAPABILITY, &[CAPABILITY_OMM_EXECUTION_MODE]);
+    if two_state.is_some() {
+        capabilities.extend(inst(op::CAPABILITY, &[CAPABILITY_OMM]));
+    }
     let mut inserts: Vec<(usize, Vec<u32>)> = vec![
-        (
-            after_capabilities,
-            inst(op::CAPABILITY, &[CAPABILITY_OMM_EXECUTION_MODE]),
-        ),
+        (after_capabilities, capabilities),
         (
             after_extensions,
             inst(op::EXTENSION, &encode_string(OMM_EXTENSION)),

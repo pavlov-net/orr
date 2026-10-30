@@ -34,8 +34,12 @@ struct GlobalSessionVtbl {
         *const sys::slang_SessionDesc,
         *mut *mut c_void,
     ) -> Result_,
-    // findProfile .. setSPIRVCoreGrammar
-    _unused: [usize; 23],
+    // findProfile
+    _unused0: usize,
+    set_downstream_compiler_path:
+        unsafe extern "system" fn(*mut c_void, sys::SlangPassThrough, *const c_char),
+    // setDownstreamCompilerPrelude .. setSPIRVCoreGrammar
+    _unused1: [usize; 21],
     parse_command_line_arguments: unsafe extern "system" fn(
         *mut c_void,
         c_int,
@@ -99,6 +103,13 @@ struct ComponentTypeVtbl {
     ) -> Result_,
     // getTargetMetadata, getEntryPointMetadata
     _unused3: [usize; 2],
+}
+
+#[repr(C)]
+struct EntryPointVtbl {
+    component: ComponentTypeVtbl,
+    get_function_reflection:
+        unsafe extern "system" fn(*mut c_void) -> *mut sys::SlangReflectionFunction,
 }
 
 #[repr(C)]
@@ -192,6 +203,8 @@ unsafe fn c_str<'a>(p: *const c_char) -> Option<&'a str> {
 /// The loaded library and its exported functions.
 pub(crate) struct Library {
     pub(crate) api: sys::SlangLib,
+    /// The directory holding the library and the downstream libraries it loads by name.
+    dir: CString,
 }
 
 impl Library {
@@ -211,7 +224,9 @@ impl Library {
         let library = unsafe { libloading::Library::new(path)? };
         // SAFETY: the symbols are declared with the signatures of the release's slang.h.
         let api = unsafe { sys::SlangLib::from_library(library)? };
-        Ok(Arc::new(Self { api }))
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let dir = CString::new(dir.to_string_lossy().as_bytes()).expect("path has no nul");
+        Ok(Arc::new(Self { api, dir }))
     }
 
     pub(crate) fn build_tag(&self) -> String {
@@ -241,10 +256,29 @@ impl GlobalSession {
             lib.api
                 .slang_createGlobalSession2(&desc, (&raw mut out).cast())
         };
-        match Com::from_raw(out) {
-            Some(com) if !failed(r) => Ok(Self { com, lib }),
-            _ => Err(format!("slang_createGlobalSession2 failed: {r:#x}")),
+        let com = match Com::from_raw(out) {
+            Some(com) if !failed(r) => com,
+            _ => return Err(format!("slang_createGlobalSession2 failed: {r:#x}")),
+        };
+        // Slang loads its SPIR-V tools by file name, which can find another release's copy
+        // on the search path; pin them to the release beside the library.
+        use sys::SlangPassThrough as P;
+        for tool in [
+            P::SLANG_PASS_THROUGH_GLSLANG,
+            P::SLANG_PASS_THROUGH_SPIRV_OPT,
+            P::SLANG_PASS_THROUGH_SPIRV_DIS,
+            P::SLANG_PASS_THROUGH_SPIRV_LINK,
+        ] {
+            // SAFETY: the vtable is IGlobalSession's; the path outlives the call.
+            unsafe {
+                (com.vtbl::<GlobalSessionVtbl>().set_downstream_compiler_path)(
+                    com.as_ptr(),
+                    tool,
+                    lib.dir.as_ptr(),
+                );
+            }
         }
+        Ok(Self { com, lib })
     }
 
     /// A session configured by slangc command-line options.
@@ -330,12 +364,19 @@ impl Session {
         }
     }
 
-    /// Composes the module with every entry point it defines and links the result.
-    pub(crate) fn link(&self, module: &Module) -> Result<Program, String> {
+    /// Composes the module, the entry points it defines whose names `keep` accepts, and
+    /// `extra` modules, and links the result.
+    pub(crate) fn link(
+        &self,
+        module: &Module,
+        extra: &[Module],
+        keep: impl Fn(&str) -> bool,
+    ) -> Result<Program, String> {
         let mut parts = vec![module.com.as_ptr()];
+        parts.extend(extra.iter().map(|m| m.com.as_ptr()));
         let mut entries = Vec::new();
-        // SAFETY: the vtables are IModule's and ISession's; out parameters receive owned
-        // references.
+        // SAFETY: the vtables are IModule's, IEntryPoint's and ISession's; out parameters
+        // receive owned references.
         unsafe {
             let mv = module.com.vtbl::<ModuleVtbl>();
             for i in 0..(mv.get_defined_entry_point_count)(module.com.as_ptr()) {
@@ -344,6 +385,11 @@ impl Session {
                 let ep = Com::from_raw(ep)
                     .filter(|_| !failed(r))
                     .ok_or("getDefinedEntryPoint failed")?;
+                let function = (ep.vtbl::<EntryPointVtbl>().get_function_reflection)(ep.as_ptr());
+                let name = c_str(self.lib.api.spReflectionFunction_GetName(function)).unwrap_or("");
+                if !keep(name) {
+                    continue;
+                }
                 parts.push(ep.as_ptr());
                 entries.push(ep);
             }
@@ -427,8 +473,8 @@ impl Module {
 }
 
 impl Program {
-    /// The SPIR-V of the session's one target.
-    pub(crate) fn spirv(&self) -> Result<Vec<u32>, String> {
+    /// The code of the session's one target.
+    fn code(&self) -> Result<Com, String> {
         let mut code = ptr::null_mut();
         let mut diag = ptr::null_mut();
         // SAFETY: the vtable is IComponentType's.
@@ -441,7 +487,19 @@ impl Program {
             )
         };
         let text = blob_text(diag);
-        let code = Com::from_raw(code).filter(|_| !failed(r)).ok_or(text)?;
+        Com::from_raw(code).filter(|_| !failed(r)).ok_or(text)
+    }
+
+    /// The target code as text, for source targets.
+    pub(crate) fn text(&self) -> Result<String, String> {
+        Ok(String::from_utf8_lossy(blob_bytes(&self.code()?))
+            .trim_end_matches(' ')
+            .to_owned())
+    }
+
+    /// The SPIR-V of the session's one target.
+    pub(crate) fn spirv(&self) -> Result<Vec<u32>, String> {
+        let code = self.code()?;
         let bytes = blob_bytes(&code);
         if !bytes.len().is_multiple_of(4) {
             return Err(format!(

@@ -6,6 +6,7 @@ mod compile;
 mod layout;
 mod lint;
 mod locate;
+mod metal;
 mod model;
 mod slang;
 mod spirv;

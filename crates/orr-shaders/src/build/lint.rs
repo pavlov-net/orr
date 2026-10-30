@@ -10,8 +10,8 @@ use super::model::{Model, Scalar, Ty};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum Lint {
-    /// `root` is the only shader parameter besides specialisation constants: no other
-    /// globals, no entry-point uniforms.
+    /// `root` is the only shader parameter besides specialisation constants and the Metal
+    /// bindings of `orr/abi.slang`: no other globals, no entry-point uniforms.
     SingleRoot,
     /// Root size is a multiple of 16; members are 32/64-bit scalars, 4-vectors, matrices
     /// with 4-wide rows, heap slots, TLAS addresses and pointers, each at its native
@@ -40,6 +40,11 @@ pub enum Lint {
     /// A struct is generated only by the crate whose shader root declares it; others map
     /// it with [`Build::extern_type`](super::Build::extern_type).
     Ownership,
+    /// The module's compute and mesh-pipeline entries emit MSL, lay out roots and pointees
+    /// as the SPIR-V does, and the MSL has none of the constructs Metal rejects: 64-bit
+    /// fetch atomics, a ray query inside a struct, a kernel parameter without a binding.
+    /// Checked only with [`Build::metal_check`](super::Build::metal_check).
+    Metal,
 }
 
 impl fmt::Display for Lint {
@@ -207,6 +212,7 @@ pub(crate) fn model_lints(
     module: &str,
     model: &Model,
     plans: &HashMap<String, Plan>,
+    lib_dir: &Path,
 ) -> Vec<LintError> {
     let mut out = Vec::new();
     let mut push = |lint, message: String| {
@@ -216,7 +222,11 @@ pub(crate) fn model_lints(
             message,
         });
     };
+    let abi = lib_dir.join("orr/abi.slang");
     for p in &model.stray_params {
+        if p.file.as_deref().is_some_and(|f| same_file(f, &abi)) {
+            continue;
+        }
         let place = match &p.entry {
             Some(e) => format!("entry point {e} has uniform parameter {}", p.name),
             None => format!("global parameter {}", p.name),

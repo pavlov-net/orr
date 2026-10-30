@@ -1,5 +1,5 @@
 //! Compiles the corpus. It probes compiler behaviour, so it uses the tokens and layouts the
-//! lints keep out of real kernels.
+//! lints and the MSL check keep out of real kernels.
 
 use std::env;
 use std::path::PathBuf;
@@ -16,6 +16,7 @@ fn main() {
             .allow(Lint::CoopVec)
             .allow(Lint::ImplicitPadding)
             .allow(Lint::RootLayout)
+            .metal_check(false)
             .extern_type("Material", "crate::Material")
             .compile()
     });

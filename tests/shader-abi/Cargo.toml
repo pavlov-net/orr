@@ -1,0 +1,17 @@
+[package]
+name = "shader-abi"
+description = "Kernels over orr's Slang ABI and trace libraries, built with the MSL check."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+orr-shaders.workspace = true
+
+[build-dependencies]
+orr-shaders = { workspace = true, features = ["build"] }
+
+[lints]
+workspace = true
