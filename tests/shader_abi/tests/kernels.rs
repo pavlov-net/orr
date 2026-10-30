@@ -599,7 +599,7 @@ fn raygen_and_compute_entries_trace_one_ptlas() {
         Stages::COMPUTE | Stages::RAY,
         Hazards::ACCEL_STRUCT,
     );
-    list.dispatch(&compute, roots[0], [w / gx, h / gy, 1]);
+    list.dispatch(&compute, roots[0], [w.div_ceil(gx), h.div_ceil(gy), 1]);
     list.dispatch_rays(&rays, roots[1], [w, h, 1]);
     list.barrier(
         Stages::COMPUTE | Stages::RAY,
@@ -833,10 +833,7 @@ fn task_mesh_pixel_two_targets() {
         .unwrap()
     });
     let stage = |e| ShaderStage::new(&mesh::MODULE, e, SpecData::default()).unwrap();
-    let colors = [
-        ColorTarget::new(Format::Rgba32Float),
-        ColorTarget::new(Format::Rgba32Float),
-    ];
+    let colors = [ColorTarget::new(Format::Rgba32Float); 2];
     let p = d
         .create_mesh_pipeline(
             &MeshPipelineDesc {
@@ -863,21 +860,14 @@ fn task_mesh_pixel_two_targets() {
     for t in &targets {
         list.discard(t);
     }
-    let clear = ColorLoad::Clear(ClearColor::Float([0.0; 4]));
+    let attachments = targets.each_ref().map(|texture| ColorAttachment {
+        texture,
+        load: ColorLoad::Clear(ClearColor::Float([0.0; 4])),
+        store: true,
+    });
     list.begin_rendering(&Rendering {
         extent: [W, H],
-        colors: &[
-            ColorAttachment {
-                texture: &targets[0],
-                load: clear,
-                store: true,
-            },
-            ColorAttachment {
-                texture: &targets[1],
-                load: clear,
-                store: true,
-            },
-        ],
+        colors: &attachments,
         depth: None,
     });
     list.draw_mesh_tasks(&p, root.gpu, [1, 1, 1]);
