@@ -372,10 +372,14 @@ pub fn xy_from_xyz(c: [f64; 3]) -> [f64; 2] {
     [c[0] / s, c[1] / s]
 }
 
+/// XYZ of chromaticity `xy` at luminance 1.
+fn xyz_from_xy(xy: [f64; 2]) -> [f64; 3] {
+    [xy[0] / xy[1], 1.0, (1.0 - xy[0] - xy[1]) / xy[1]]
+}
+
 /// Linear Rec.2020 of chromaticity `xy` at luminance 1.
 pub fn rec2020_from_xy(xy: [f64; 2]) -> [f32; 3] {
-    let xyz = [xy[0] / xy[1], 1.0, (1.0 - xy[0] - xy[1]) / xy[1]];
-    mul3(&XYZ_TO_REC2020, xyz).map(|c| c as f32)
+    mul3(&XYZ_TO_REC2020, xyz_from_xy(xy)).map(|c| c as f32)
 }
 
 /// The CPU model of adapt's white point range: `xy` unchanged inside it, else rebuilt at the
@@ -470,8 +474,7 @@ pub fn cat16_rec2020(from: [f64; 2], to: [f64; 2]) -> [[f64; 3]; 3] {
         [0.3875265432, 0.6214474419, -0.0089739852],
         [-0.0158414988, -0.034122938, 1.0499644369],
     ];
-    let white = |xy: [f64; 2]| mul3(&M, [xy[0] / xy[1], 1.0, (1.0 - xy[0] - xy[1]) / xy[1]]);
-    let (s, d) = (white(from), white(to));
+    let (s, d) = (mul3(&M, xyz_from_xy(from)), mul3(&M, xyz_from_xy(to)));
     let column = |i: usize| {
         let mut e = [0.0; 3];
         e[i] = 1.0;
