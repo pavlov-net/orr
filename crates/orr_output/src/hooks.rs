@@ -68,16 +68,16 @@ pub struct ChainImages {
 }
 
 /// A texture with a sampled and a storage view, both freed with it.
-pub(crate) struct Image {
+pub struct Image {
     texture: Texture,
-    pub(crate) sampled: TextureIndex,
-    pub(crate) storage: StorageImageIndex,
+    pub sampled: TextureIndex,
+    pub storage: StorageImageIndex,
     bytes: u64,
     device: Device,
 }
 
 impl Image {
-    pub(crate) fn new(gpu: &Device, format: Format, extent: [u32; 2], name: &str) -> Result<Self> {
+    pub fn new(gpu: &Device, format: Format, extent: [u32; 2], name: &str) -> Result<Self> {
         let desc = TextureDesc::d2(
             format,
             extent[0],
@@ -97,7 +97,7 @@ impl Image {
         })
     }
 
-    pub(crate) fn texture(&self) -> &Texture {
+    pub fn texture(&self) -> &Texture {
         &self.texture
     }
 }

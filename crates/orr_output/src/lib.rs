@@ -31,7 +31,7 @@ pub use exposure::{
     keyed_ev100, luminance_from_ev100,
 };
 pub use gt7::{GT7_REFERENCE_NITS, GT7_SDR_NITS, Gt7Curve, Gt7Params};
-pub use hooks::{ChainImages, DistortionField, HookInputs, HookPass, HookPoint, Hooks};
+pub use hooks::{ChainImages, DistortionField, HookInputs, HookPass, HookPoint, Hooks, Image};
 pub use orr_scene::orr_gpu::{HdrMetadata, LowLatency, OutputFormat, PresentMode};
 pub use passes::{
     CapturePass, ComposePass, ComposeRoot, ComposeSource, ExposurePass, HookInputsPass,
