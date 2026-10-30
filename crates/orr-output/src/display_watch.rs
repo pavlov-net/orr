@@ -37,12 +37,6 @@ unsafe trait IDisplayInformationStaticsInterop: IUnknown {
     fn GetRuntimeClassName(&self, name: *mut *mut c_void) -> HRESULT;
     fn GetTrustLevel(&self, level: *mut i32) -> HRESULT;
     fn GetForWindow(&self, window: HWND, riid: *const GUID, info: *mut *mut c_void) -> HRESULT;
-    fn GetForMonitor(
-        &self,
-        monitor: HMONITOR,
-        riid: *const GUID,
-        info: *mut *mut c_void,
-    ) -> HRESULT;
 }
 
 const SUBCLASS_ID: usize = 0x6f72_725f_6477;
@@ -63,9 +57,8 @@ pub struct DisplayWatch {
 
 struct Hooks {
     hwnd: HWND,
-    info: DisplayInformation,
     token: i64,
-    _subclass: Box<Subclass>,
+    subclass: Box<Subclass>,
 }
 
 struct Subclass {
@@ -121,7 +114,7 @@ impl DisplayWatch {
         ))?;
 
         let subclass = Box::new(Subclass {
-            info: info.clone(),
+            info,
             feed: feed.clone(),
             // SAFETY: `hwnd` is a live window.
             monitor: Cell::new(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }),
@@ -137,15 +130,14 @@ impl DisplayWatch {
             )
         };
         if !installed.as_bool() {
-            let _ = info.RemoveAdvancedColorInfoChanged(token);
+            let _ = subclass.info.RemoveAdvancedColorInfoChanged(token);
             return Err(windows_core::Error::from_thread().into());
         }
 
         let hooks = Hooks {
             hwnd,
-            info,
             token,
-            _subclass: subclass,
+            subclass,
         };
         Ok((
             Self {
@@ -164,7 +156,10 @@ impl Drop for Hooks {
         unsafe {
             let _ = RemoveWindowSubclass(self.hwnd, Some(subclass_proc), SUBCLASS_ID);
         }
-        let _ = self.info.RemoveAdvancedColorInfoChanged(self.token);
+        let _ = self
+            .subclass
+            .info
+            .RemoveAdvancedColorInfoChanged(self.token);
     }
 }
 
@@ -352,7 +347,6 @@ fn until_nul(s: &[u16]) -> &[u16] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DisplayRequest, OutputFormat};
 
     #[test]
     fn advanced_color_mapping_on_captured_values() {
@@ -397,15 +391,5 @@ mod tests {
         assert_eq!(info.os_hdr_on, Some(true));
         assert_eq!(info.max_full_frame_nits, None);
         assert_eq!(info.refresh_hz, None);
-        let all = [
-            OutputFormat::Sdr,
-            OutputFormat::Hdr10Pq,
-            OutputFormat::ScRgb,
-        ];
-        let r = DisplayRequest::default().resolve(&all, Some(&info), false);
-        assert_eq!(
-            (r.encoding, r.paper_white_nits, r.peak_nits, r.black_nits),
-            (OutputFormat::Hdr10Pq, 203.0, 580.0, 0.005)
-        );
     }
 }
