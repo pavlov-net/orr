@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use ash::vk;
 use ash::vk::TaggedStructure as _;
 
-use super::command::{CommandList, PassRecord};
+use super::command::{CommandList, Finished, PassRecord};
 use super::device::{Device, Shared};
 use super::garbage::{After, MAX_TIMELINES};
 use crate::{Error, TimelinePoint};
@@ -71,6 +71,8 @@ pub(crate) struct ListResources {
     pub cmd: vk::CommandBuffer,
     pub timestamps: vk::QueryPool,
     pub stats: vk::QueryPool,
+    /// Compacted sizes of classic acceleration structures; on graphics and compute queues.
+    pub compacted: vk::QueryPool,
 }
 
 struct Pending {
@@ -90,8 +92,12 @@ pub struct Queue {
     pub(crate) kind: QueueKind,
     pub(crate) family: u32,
     raw: vk::Queue,
-    submit_lock: Mutex<()>,
+    /// Held for every queue operation. True while the last operation on the timeline is a
+    /// sparse bind, which the next submit waits for: binds are not ordered with submits.
+    submit_lock: Mutex<bool>,
     pools: Mutex<Pools>,
+    /// The family takes sparse binds.
+    pub(crate) sparse: bool,
     /// Graphics or compute: heaps bind and pipeline statistics work.
     pub(crate) shaders: bool,
     /// Graphics: task, mesh and pixel statistics.
@@ -142,8 +148,9 @@ impl Queue {
             kind,
             family,
             raw,
-            submit_lock: Mutex::new(()),
+            submit_lock: Mutex::new(false),
             pools: Mutex::default(),
+            sparse: flags.contains(vk::QueueFlags::SPARSE_BINDING),
             shaders: flags.intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE),
             graphics: flags.contains(vk::QueueFlags::GRAPHICS),
             timestamp_mask: mask,
@@ -208,11 +215,21 @@ impl Queue {
         } else {
             vk::QueryPool::null()
         };
+        let compacted = if self.shaders {
+            query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR)
+                    .query_count(MAX_PASSES),
+            )?
+        } else {
+            vk::QueryPool::null()
+        };
         Ok(ListResources {
             pool,
             cmd,
             timestamps,
             stats,
+            compacted,
         })
     }
 
@@ -226,6 +243,9 @@ impl Queue {
             }
             if r.stats != vk::QueryPool::null() {
                 d.destroy_query_pool(r.stats, None);
+            }
+            if r.compacted != vk::QueryPool::null() {
+                d.destroy_query_pool(r.compacted, None);
             }
         }
     }
@@ -261,6 +281,9 @@ impl Queue {
             if res.stats != vk::QueryPool::null() {
                 d.reset_query_pool(res.stats, 0, MAX_PASSES);
             }
+            if res.compacted != vk::QueryPool::null() {
+                d.reset_query_pool(res.compacted, 0, MAX_PASSES);
+            }
             d.begin_command_buffer(
                 res.cmd,
                 &vk::CommandBufferBeginInfo::default()
@@ -293,7 +316,7 @@ impl Queue {
         lists: Vec<CommandList<'_>>,
         wait: &[TimelinePoint],
     ) -> Result<TimelinePoint, Error> {
-        let mut finished = Vec::with_capacity(lists.len());
+        let mut finished: Vec<Finished> = Vec::with_capacity(lists.len());
         for list in lists {
             assert!(
                 std::ptr::eq(list.queue(), self),
@@ -302,17 +325,16 @@ impl Queue {
             match list.finish() {
                 Ok(f) => finished.push(f),
                 Err(e) => {
-                    let mut pools = self.pools.lock().unwrap();
-                    pools.free.extend(finished.into_iter().map(|(r, _)| r));
+                    self.release(finished);
                     return Err(e);
                 }
             }
         }
         let cmds: Vec<_> = finished
             .iter()
-            .map(|(r, _)| vk::CommandBufferSubmitInfo::default().command_buffer(r.cmd))
+            .map(|f| vk::CommandBufferSubmitInfo::default().command_buffer(f.res.cmd))
             .collect();
-        let waits: Vec<_> = wait
+        let mut waits: Vec<_> = wait
             .iter()
             .map(|p| {
                 vk::SemaphoreSubmitInfo::default()
@@ -322,8 +344,16 @@ impl Queue {
             })
             .collect();
         let timeline = self.timeline();
-        let _guard = self.submit_lock.lock().unwrap();
+        let mut after_bind = self.submit_lock.lock().unwrap();
         let value = timeline.submitted.load(Ordering::Acquire) + 1;
+        if *after_bind {
+            waits.push(
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(timeline.semaphore)
+                    .value(value - 1)
+                    .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS),
+            );
+        }
         let signal = [vk::SemaphoreSubmitInfo::default()
             .semaphore(timeline.semaphore)
             .value(value)
@@ -338,19 +368,73 @@ impl Queue {
                 .device
                 .queue_submit2(self.raw, &[submit], vk::Fence::null())
         };
-        let mut pools = self.pools.lock().unwrap();
         if let Err(e) = result {
-            pools.free.extend(finished.into_iter().map(|(r, _)| r));
+            self.release(finished);
             return Err(Error::vk("vkQueueSubmit2")(e));
         }
         timeline.submitted.store(value, Ordering::Release);
-        pools
-            .pending
-            .extend(
-                finished
-                    .into_iter()
-                    .map(|(res, passes)| Pending { value, res, passes }),
-            );
+        *after_bind = false;
+        let after = self.shared.after_point(self.point(value));
+        let mut pools = self.pools.lock().unwrap();
+        for f in finished {
+            for item in f.keep {
+                self.shared.defer(after, item);
+            }
+            pools.pending.push_back(Pending {
+                value,
+                res: f.res,
+                passes: f.passes,
+            });
+        }
+        Ok(self.point(value))
+    }
+
+    /// Takes back the resources of lists that were not submitted.
+    fn release(&self, finished: Vec<Finished>) {
+        let mut pools = self.pools.lock().unwrap();
+        for f in finished {
+            pools.free.push(f.res);
+            for item in f.keep {
+                self.shared.defer_after_submitted(item);
+            }
+        }
+    }
+
+    /// Queues sparse binds after everything submitted to this queue so far; its next submit
+    /// waits for them. The returned point completes once they are bound.
+    pub(crate) fn bind_sparse(
+        &self,
+        buffers: &[vk::SparseBufferMemoryBindInfo<'_>],
+    ) -> Result<TimelinePoint, Error> {
+        assert!(
+            self.sparse,
+            "the {:?} queue cannot bind sparse memory",
+            self.kind
+        );
+        let timeline = self.timeline();
+        let mut after_bind = self.submit_lock.lock().unwrap();
+        let value = timeline.submitted.load(Ordering::Acquire) + 1;
+        let wait_values = [value - 1];
+        let signal_values = [value];
+        let semaphores = [timeline.semaphore];
+        let mut values = vk::TimelineSemaphoreSubmitInfo::default()
+            .wait_semaphore_values(&wait_values)
+            .signal_semaphore_values(&signal_values);
+        let info = vk::BindSparseInfo::default()
+            .wait_semaphores(&semaphores)
+            .buffer_binds(buffers)
+            .signal_semaphores(&semaphores)
+            .push(&mut values);
+        // SAFETY: the lock serialises access to the queue; the binds name live buffers and
+        // memory.
+        unsafe {
+            self.shared
+                .device
+                .queue_bind_sparse(self.raw, &[info], vk::Fence::null())
+        }
+        .map_err(Error::vk("vkQueueBindSparse"))?;
+        timeline.submitted.store(value, Ordering::Release);
+        *after_bind = true;
         Ok(self.point(value))
     }
 

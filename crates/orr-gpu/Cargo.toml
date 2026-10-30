@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+links = "orr_gpu"
 
 [dependencies]
 orr-shaders.workspace = true
@@ -15,6 +16,9 @@ blake3.workspace = true
 bytemuck.workspace = true
 log.workspace = true
 thiserror.workspace = true
+
+[build-dependencies]
+orr-shaders = { workspace = true, features = ["build"] }
 
 [lints]
 workspace = true

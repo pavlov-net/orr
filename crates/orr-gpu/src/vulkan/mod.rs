@@ -14,12 +14,14 @@ mod mesh;
 mod pipeline;
 mod queue;
 mod ray;
+mod rtas;
+mod sparse;
 mod spirv;
 mod texture;
 
 pub use accel::{
     ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance, ClassicKind,
-    InstanceFlags, RtasFlags, RtasSizes,
+    InstanceFlags, Micromap, MicromapDesc, MicromapTriangle, MicromapUsage, OmmFormat,
 };
 pub use cache::{PipelineCacheKind, PipelineCacheReport};
 pub use command::{CommandList, DispatchArgs, MeshArgs};
@@ -29,4 +31,5 @@ pub use mesh::{ColorAttachment, DepthAttachment, MeshPipeline, MeshPipelineDesc,
 pub use pipeline::{ComputePipeline, ShaderStage};
 pub use queue::{PassResult, PipelineStats, Queue, QueueKind, QueueRequest};
 pub use ray::RayDispatchPipeline;
+pub use sparse::{PageBind, SparseAllocation};
 pub use texture::{Texture, TextureMemory};

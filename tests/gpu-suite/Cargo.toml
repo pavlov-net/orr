@@ -13,6 +13,7 @@ orr-shaders.workspace = true
 log.workspace = true
 
 [dev-dependencies]
+ash.workspace = true
 blake3.workspace = true
 glam.workspace = true
 half = "2.7"

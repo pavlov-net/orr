@@ -18,6 +18,7 @@ use super::heap::Heaps;
 use super::memory::{MemoryKind, MemoryTypes, Usage, buffer_usage, sharing};
 use super::queue::{Calibration, PassResult, Queue, QueueKind, QueueRequest, Timeline};
 use super::ray::RecordBlock;
+use super::rtas::{RtasCheck, cluster_caps};
 use super::texture::{image_info, vk_format};
 use crate::{
     Caps, ComponentType, CooperativeVectorCombination, Error, Format, Limits, TextureDesc,
@@ -25,6 +26,9 @@ use crate::{
 };
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
+
+/// The driver exposes `VK_NV_ray_tracing_validation` only with this set to 1.
+const RAY_TRACING_VALIDATION_VAR: &str = "NV_ALLOW_RAYTRACING_VALIDATION";
 
 /// How to create a [`Device`].
 #[derive(Clone, Copy, Debug)]
@@ -70,6 +74,10 @@ pub(crate) struct Shared {
     pub device: ash::Device,
     pub heap_fn: ash::ext::descriptor_heap::Device,
     pub accel_fn: ash::khr::acceleration_structure::Device,
+    pub cluster_fn: ash::nv::cluster_acceleration_structure::Device,
+    pub ptlas_fn: ash::nv::partitioned_acceleration_structure::Device,
+    /// With `Caps::device_address_commands`.
+    pub dac_fn: Option<ash::khr::device_address_commands::Device>,
     pub mesh_fn: ash::ext::mesh_shader::Device,
     pub rt_fn: Option<ash::khr::ray_tracing_pipeline::Device>,
     pub debug_fn: ash::ext::debug_utils::Device,
@@ -89,6 +97,8 @@ pub(crate) struct Shared {
     /// Raygen shader-table records; with `Caps::ray_dispatch` only.
     pub records: OnceLock<RecordBlock>,
     empty_tlas: OnceLock<EmptyTlas>,
+    /// The debug PTLAS check, created by the first PTLAS build of a debug build.
+    pub rtas_check: OnceLock<RtasCheck>,
     /// `gpu_malloc` buffers by start address: end address and buffer.
     pub buffers: RwLock<BTreeMap<u64, (u64, vk::Buffer)>>,
     pub usage: Usage,
@@ -115,6 +125,10 @@ impl Drop for Shared {
             let _ = self.device.device_wait_idle();
             for item in self.garbage.get_mut().unwrap().take_all() {
                 self.destroy(item);
+            }
+            if let Some(c) = self.rtas_check.take() {
+                self.device.destroy_pipeline(c.pipeline, None);
+                self.destroy(Item::Buffer(c.failures));
             }
             if let Some(t) = self.empty_tlas.take() {
                 self.accel_fn.destroy_acceleration_structure(t.accel, None);
@@ -238,6 +252,12 @@ impl Device {
     /// Creates the device: the first Vulkan 1.4 GPU (discrete first) with every required
     /// feature of contracts.md 7. Fails naming the first missing item.
     pub fn new(desc: &DeviceDesc<'_>) -> Result<Device, Error> {
+        if cfg!(debug_assertions) && std::env::var_os(RAY_TRACING_VALIDATION_VAR).is_none() {
+            // SAFETY: the driver reads the variable at instance creation. Setting it races
+            // only with other threads touching the environment, which Windows serialises;
+            // elsewhere debug builds create the device before such threads start.
+            unsafe { std::env::set_var(RAY_TRACING_VALIDATION_VAR, "1") };
+        }
         // SAFETY: loading the system Vulkan loader.
         let entry = unsafe { ash::Entry::load() }.map_err(|e| Error::Loader(e.to_string()))?;
         let messages = Box::<MessageCount>::default();
@@ -287,10 +307,16 @@ impl Device {
         let mut rt_props = vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
         let mut reorder_props =
             vk::PhysicalDeviceRayTracingInvocationReorderPropertiesEXT::default();
+        let mut cluster_props =
+            vk::PhysicalDeviceClusterAccelerationStructurePropertiesNV::default();
+        let mut ptlas_props =
+            vk::PhysicalDevicePartitionedAccelerationStructurePropertiesNV::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default()
             .push(&mut heap_props)
             .push(&mut as_props)
-            .push(&mut driver);
+            .push(&mut driver)
+            .push(&mut cluster_props)
+            .push(&mut ptlas_props);
         if optional.ray_dispatch {
             props2 = props2.push(&mut rt_props).push(&mut reorder_props);
         }
@@ -372,6 +398,8 @@ impl Device {
             frame_boundary: optional.frame_boundary,
             pipeline_executable_info: optional.executable_info,
             conservative_raster: optional.conservative_raster,
+            ray_tracing_validation: optional.ray_tracing_validation,
+            cluster: cluster_caps(&cluster_props, &ptlas_props, optional.omm),
             limits: Limits {
                 image_descriptor_bytes: p.image_descriptor_size as u32,
                 sampler_descriptor_bytes: p.sampler_descriptor_size as u32,
@@ -428,6 +456,11 @@ impl Device {
         let shared = Arc::new(Shared {
             heap_fn: ash::ext::descriptor_heap::Device::load(&instance, &device),
             accel_fn: ash::khr::acceleration_structure::Device::load(&instance, &device),
+            cluster_fn: ash::nv::cluster_acceleration_structure::Device::load(&instance, &device),
+            ptlas_fn: ash::nv::partitioned_acceleration_structure::Device::load(&instance, &device),
+            dac_fn: optional
+                .device_address_commands
+                .then(|| ash::khr::device_address_commands::Device::load(&instance, &device)),
             mesh_fn: ash::ext::mesh_shader::Device::load(&instance, &device),
             rt_fn: optional
                 .ray_dispatch
@@ -451,6 +484,7 @@ impl Device {
             heaps: OnceLock::new(),
             records: OnceLock::new(),
             empty_tlas: OnceLock::new(),
+            rtas_check: OnceLock::new(),
             buffers: RwLock::default(),
             usage: Usage::default(),
             buffer_usage: usage,
@@ -494,7 +528,7 @@ impl Device {
         let tlas = build_empty_tlas(&device)?;
         let _ = device.shared.empty_tlas.set(tlas);
         log::info!(
-            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, host image copy {}, decompression {}, validation layer {}",
+            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, host image copy {}, decompression {}, validation layer {}, ray tracing validation {}",
             device.shared.caps.device_name,
             device.shared.caps.driver,
             rebar,
@@ -504,6 +538,7 @@ impl Device {
             optional.host_image_copy,
             optional.memory_decompression,
             desc.validation,
+            optional.ray_tracing_validation,
         );
         Ok(device)
     }
@@ -529,9 +564,11 @@ impl Device {
         )
     }
 
-    /// Validation-layer warnings and errors reported so far.
+    /// Validation-layer and ray-tracing-validation warnings and errors reported so far, and
+    /// PTLAS builds the debug check rejected among completed work.
     pub fn validation_messages(&self) -> u32 {
-        self.shared.messages.get()
+        let rejected = self.shared.rtas_check.get().map_or(0, RtasCheck::failures);
+        self.shared.messages.get() + rejected
     }
 }
 

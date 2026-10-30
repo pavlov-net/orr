@@ -12,6 +12,8 @@ use orr_gpu::{
 };
 use orr_shaders::bytemuck::Pod;
 
+pub mod clusters;
+
 pub mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
 }

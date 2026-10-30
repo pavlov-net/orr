@@ -18,6 +18,7 @@ mod error;
 mod format;
 mod present;
 mod raster;
+pub mod rtas;
 mod sync;
 mod texture;
 
@@ -34,6 +35,11 @@ pub use raster::{
     Blend, BlendEquation, BlendFactor, BlendOp, ClearColor, ColorLoad, ColorMask, ColorTarget,
     Cull, DepthBias, DepthLoad, DepthTarget, Fill, FrontFace, RasterState,
 };
+pub use rtas::{
+    BlasLimits, ClusterCaps, ClusterLimits, ClusterVertexFormat, MoveKind, MoveLimits, PtlasArgs,
+    PtlasLimits, RtasFlags, RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc, RtasSizes,
+    partition_translation,
+};
 pub use sync::{Hazards, Stages, TimelinePoint};
 pub use texture::{
     AddressMode, CompareOp, Filter, SamplerDesc, TextureDesc, TextureKind, TextureRegion,
@@ -45,7 +51,13 @@ pub use vulkan::{
     Allocation, ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance,
     ClassicKind, ColorAttachment, CommandList, ComputePipeline, DepthAttachment, Device,
     DeviceDesc, DispatchArgs, HeapReport, InstanceFlags, MemoryKind, MemoryReport, MemoryUsage,
-    MeshArgs, MeshPipeline, MeshPipelineDesc, PassResult, PipelineCacheKind, PipelineCacheReport,
-    PipelineStats, Queue, QueueKind, QueueRequest, RayDispatchPipeline, Rendering, RtasFlags,
-    RtasSizes, ShaderStage, Texture, TextureMemory,
+    MeshArgs, MeshPipeline, MeshPipelineDesc, Micromap, MicromapDesc, MicromapTriangle,
+    MicromapUsage, OmmFormat, PageBind, PassResult, PipelineCacheKind, PipelineCacheReport,
+    PipelineStats, Queue, QueueKind, QueueRequest, RayDispatchPipeline, Rendering, ShaderStage,
+    SparseAllocation, Texture, TextureMemory,
 };
+
+#[cfg(not(target_vendor = "apple"))]
+mod shaders {
+    include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
+}

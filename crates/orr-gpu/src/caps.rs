@@ -50,6 +50,10 @@ pub struct Caps {
     /// Conservative rasterisation (`VK_EXT_conservative_rasterization`) for
     /// [`crate::RasterState::conservative`].
     pub conservative_raster: bool,
+    /// `VK_NV_ray_tracing_validation` checks acceleration-structure builds and traces;
+    /// debug builds only.
+    pub ray_tracing_validation: bool,
+    pub cluster: crate::ClusterCaps,
     pub limits: Limits,
 }
 

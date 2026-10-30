@@ -5,13 +5,16 @@ use std::ffi::CString;
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 
+use super::garbage::Item;
+use super::memory::MemoryKind;
 use super::mesh::{MeshPipeline, Rendering};
 use super::pipeline::ComputePipeline;
 use super::queue::{ListResources, MAX_PASSES, Queue};
 use super::ray::RayDispatchPipeline;
 use super::texture::Texture;
 use crate::{
-    ClearColor, ColorLoad, DepthLoad, Error, GpuPtr, Hazards, Stages, TextureRegion, TextureUsage,
+    ClearColor, ColorLoad, DepthLoad, Error, GpuAddress, GpuPtr, Hazards, Stages, TextureRegion,
+    TextureUsage,
 };
 
 /// `vkCmdDispatchIndirect` arguments: workgroup counts.
@@ -38,6 +41,14 @@ pub(crate) struct PassRecord {
     pub stats: bool,
 }
 
+/// What a finished list hands to its submit.
+pub(crate) struct Finished {
+    pub res: ListResources,
+    pub passes: Vec<PassRecord>,
+    /// Objects the list's commands use, destroyed once its submit completes.
+    pub keep: Vec<Item>,
+}
+
 /// A one-shot command list for one queue. Record on any thread, then hand it to the queue's
 /// owner for [`Queue::submit`]. Dropping it unsubmitted discards it.
 pub struct CommandList<'q> {
@@ -48,6 +59,9 @@ pub struct CommandList<'q> {
     /// Rendering extent while between `begin_rendering` and `end_rendering`.
     rendering: Option<[u32; 2]>,
     bound: vk::Pipeline,
+    keep: Vec<Item>,
+    /// Compacted-size queries recorded so far.
+    pub(crate) compact_queries: u32,
 }
 
 impl<'q> CommandList<'q> {
@@ -59,6 +73,8 @@ impl<'q> CommandList<'q> {
             open: false,
             rendering: None,
             bound: vk::Pipeline::null(),
+            keep: Vec::new(),
+            compact_queries: 0,
         }
     }
 
@@ -67,10 +83,40 @@ impl<'q> CommandList<'q> {
     }
 
     pub(crate) fn cmd(&self) -> vk::CommandBuffer {
-        self.res
-            .as_ref()
-            .expect("command list already finished")
-            .cmd
+        self.res().cmd
+    }
+
+    pub(crate) fn res(&self) -> &ListResources {
+        self.res.as_ref().expect("command list already finished")
+    }
+
+    /// Upload memory holding `bytes`, alive until the list's submit completes.
+    pub(crate) fn keep_upload(&mut self, bytes: &[u8], name: &str) -> GpuAddress {
+        let shared = &self.queue.shared;
+        let (raw, mapped) = shared
+            .create_buffer(
+                MemoryKind::Upload,
+                bytes.len() as u64,
+                shared.buffer_usage,
+                16,
+                name,
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let ptr = mapped.expect("Upload memory is mapped");
+        // SAFETY: the mapping holds at least `bytes.len()` bytes and nothing else uses it.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr(), bytes.len()) };
+        self.keep.push(Item::Buffer(raw));
+        GpuAddress(raw.address)
+    }
+
+    /// Dispatches an internal pipeline with `root` as its root pointer.
+    pub(crate) fn dispatch_raw(&mut self, p: vk::Pipeline, root: GpuAddress, groups: [u32; 3]) {
+        self.bind(vk::PipelineBindPoint::COMPUTE, p, root.0);
+        // SAFETY: recording with a compute pipeline bound.
+        unsafe {
+            self.device()
+                .cmd_dispatch(self.cmd(), groups[0], groups[1], groups[2]);
+        };
     }
 
     fn device(&self) -> &ash::Device {
@@ -78,7 +124,7 @@ impl<'q> CommandList<'q> {
     }
 
     /// Ends recording and hands the resources to the submit.
-    pub(crate) fn finish(mut self) -> Result<(ListResources, Vec<PassRecord>), Error> {
+    pub(crate) fn finish(mut self) -> Result<Finished, Error> {
         assert!(
             !self.open,
             "pass {:?} was not ended",
@@ -91,7 +137,11 @@ impl<'q> CommandList<'q> {
             self.queue.recycle(res);
             return Err(Error::vk("vkEndCommandBuffer")(e));
         }
-        Ok((res, std::mem::take(&mut self.passes)))
+        Ok(Finished {
+            res,
+            passes: std::mem::take(&mut self.passes),
+            keep: std::mem::take(&mut self.keep),
+        })
     }
 
     /// Makes writes in `before` stages visible to `after` stages. [`Stages::RAY`] is
@@ -542,6 +592,9 @@ impl Drop for CommandList<'_> {
     fn drop(&mut self) {
         if let Some(res) = self.res.take() {
             self.queue.recycle(res);
+        }
+        for item in self.keep.drain(..) {
+            self.queue.shared.defer_after_submitted(item);
         }
     }
 }

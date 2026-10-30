@@ -21,6 +21,11 @@ pub(crate) enum Item {
     },
     Pipeline(vk::Pipeline),
     Accel(vk::AccelerationStructureKHR),
+    /// A sparse buffer; the memory bound to it belongs to others.
+    SparseBuffer {
+        buffer: vk::Buffer,
+        address: u64,
+    },
     ImageSlot(u32),
     RaygenRecord(u32),
 }
@@ -107,6 +112,10 @@ impl Shared {
                 }
                 Item::Pipeline(p) => d.destroy_pipeline(p, None),
                 Item::Accel(a) => self.accel_fn.destroy_acceleration_structure(a, None),
+                Item::SparseBuffer { buffer, address } => {
+                    self.buffers.write().unwrap().remove(&address);
+                    d.destroy_buffer(buffer, None);
+                }
                 Item::ImageSlot(slot) => self.heaps().release_image_slot(slot),
                 Item::RaygenRecord(slot) => {
                     if let Some(r) = self.records.get() {
