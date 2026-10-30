@@ -1,0 +1,17 @@
+[package]
+name = "output-suite"
+description = "Headless GPU tests of orr-output's passes against the Slang CPU target, run with the validation layer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dev-dependencies]
+orr-output = { path = "../../crates/orr-output" }
+orr-scene = { workspace = true, features = ["testing"] }
+output-maths = { path = "../output-maths" }
+half = "2.7"
+
+[lints]
+workspace = true

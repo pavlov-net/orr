@@ -6,6 +6,11 @@ mod display_watch;
 mod encode;
 mod exposure;
 mod gt7;
+mod passes;
+
+mod shaders {
+    include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
+}
 
 pub use display::{
     CalibrationPattern, DisplayFeed, DisplayInfo, DisplayRequest, PatternLevels, ResolvedDisplay,
@@ -18,10 +23,13 @@ pub use exposure::{
 };
 pub use gt7::{GT7_REFERENCE_NITS, GT7_SDR_NITS, Gt7Curve, Gt7Params};
 pub use orr_scene::orr_gpu::{HdrMetadata, OutputFormat, PresentMode};
+pub use passes::{ComposePass, OutputKernels, OutputRoots, TonemapPass};
 
 /// Errors from orr-output.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error(transparent)]
+    Gpu(#[from] orr_scene::orr_gpu::Error),
     #[error("the window handle is not a Win32 window")]
     NotWin32Window,
     #[cfg(windows)]

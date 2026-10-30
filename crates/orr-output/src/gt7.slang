@@ -60,3 +60,12 @@ public float3 gt7_tonemap(float3 rec2020, Gt7Curve c)
     float3 scaled = max(rec2020_from_ictcp(scaled_ucs) / GT7_REFERENCE_NITS, 0.0);
     return c.output_scale * min(lerp(skewed, scaled, c.blend_ratio), c.peak);
 }
+
+// Exposed linear Rec.2020 (1.0 = paper white) to display-linear Rec.709 (1.0 = paper white,
+// up to the peak over paper white). SDR gamut-compresses and clamps to [0, 1]; HDR keeps
+// colours outside Rec.709 as negative components.
+public float3 gt7_display_linear(float3 exposed, Gt7Curve c, bool sdr)
+{
+    float3 rgb = mul(REC2020_TO_REC709, gt7_tonemap(exposed / c.output_scale, c));
+    return sdr ? saturate(gamut_compress(rgb)) : rgb;
+}

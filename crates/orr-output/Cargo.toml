@@ -6,13 +6,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+links = "orr_output"
 
 [dependencies]
 orr-scene.workspace = true
+orr-shaders.workspace = true
 raw-window-handle.workspace = true
 bytemuck.workspace = true
 thiserror.workspace = true
 log.workspace = true
+
+[build-dependencies]
+orr-shaders = { workspace = true, features = ["build"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.62.2"

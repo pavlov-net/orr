@@ -464,6 +464,7 @@ dependencies = [
 name = "gpu-suite"
 version = "0.0.1"
 dependencies = [
+ "blake3",
  "log",
  "orr-gpu",
  "orr-shaders",
@@ -844,23 +845,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "output-gpu"
-version = "0.0.1"
-dependencies = [
- "half",
- "log",
- "orr-output",
- "orr-scene",
- "output-maths",
-]
-
-[[package]]
 name = "output-maths"
 version = "0.0.1"
 dependencies = [
  "cc",
  "orr-output",
  "orr-shaders",
+]
+
+[[package]]
+name = "output-suite"
+version = "0.0.1"
+dependencies = [
+ "half",
+ "orr-output",
+ "orr-scene",
+ "output-maths",
 ]
 
 [[package]]
