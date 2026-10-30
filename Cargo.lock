@@ -771,6 +771,7 @@ version = "0.0.1"
 dependencies = [
  "ash",
  "bitflags",
+ "blake3",
  "bytemuck",
  "log",
  "orr-shaders",

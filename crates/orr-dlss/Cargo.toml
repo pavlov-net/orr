@@ -1,5 +1,31 @@
 [package]
 name = "orr-dlss"
+description = "DLSS ray reconstruction, super resolution, DLAA and frame generation through NVIDIA NGX on Vulkan."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+links = "orr_dlss"
+
+[features]
+# No SDK: features report unsupported, and ray reconstruction copies colour to the output
+# with a bilinear upscale.
+mock = []
+# NGX development DLLs, which draw the DLSS debug overlay.
+debug_overlay = []
+
+[dependencies]
+ash.workspace = true
+log.workspace = true
+thiserror.workspace = true
+uuid = { version = "1", default-features = false }
+
+[build-dependencies]
+bindgen = "0.72.1"
+
+[dev-dependencies]
+half = "2.7"
+
+[lints]
+workspace = true
