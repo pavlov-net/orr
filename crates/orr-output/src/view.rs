@@ -1,6 +1,6 @@
 //! What output does with one view each frame.
 
-use crate::{AutoWhiteBalance, CalibrationPattern, Exposure, Grade, Gt7Params};
+use crate::{AutoWhiteBalance, CalibrationPattern, Exposure, Grade, Gt7Params, ScreenshotRequest};
 
 /// Output's settings for one view, passed with each render of it.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -16,6 +16,8 @@ pub struct ViewOutput {
     /// A camera cut: auto exposure snaps to the target and resets its long-term stage, and
     /// auto white balance snaps to its target.
     pub cut: bool,
+    /// A capture of this frame, read back through `OutputView::screenshots`.
+    pub screenshot: Option<ScreenshotRequest>,
     pub debug: OutputDebug,
 }
 

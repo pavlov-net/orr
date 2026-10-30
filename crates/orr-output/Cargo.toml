@@ -15,6 +15,9 @@ raw-window-handle.workspace = true
 bytemuck.workspace = true
 thiserror.workspace = true
 log.workspace = true
+png = "0.18"
+exr = { version = "1.74", default-features = false }
+moxcms = "0.8"
 
 [build-dependencies]
 orr-shaders = { workspace = true, features = ["build"] }

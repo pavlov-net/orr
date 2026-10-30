@@ -1,5 +1,5 @@
 //! Output's compute passes, recorded into a command list: hook inputs, exposure and white
-//! balance (meter and adapt), tonemap, compose and compose-UI.
+//! balance (meter and adapt), tonemap, compose and compose-UI, and screenshot capture.
 
 use std::ops::RangeInclusive;
 
@@ -19,8 +19,8 @@ use crate::shaders::hook_inputs;
 use crate::shaders::tonemap::{self, TonemapConstants};
 use crate::{
     AutoExposure, ChainImages, CompensationCurve, DistortionField, Exposure, ExposureTelemetry,
-    Gt7Curve, HookInputs, Hooks, MeterWeights, OutputDebug, ResolvedDisplay, Result, SkyTelemetry,
-    ViewOutput,
+    Gt7Curve, HookInputs, Hooks, MeterWeights, OutputDebug, Primaries, ResolvedDisplay, Result,
+    Screenshot, SkyTelemetry, ViewOutput,
 };
 
 /// Output's compute pipelines on one device.
@@ -30,6 +30,7 @@ pub struct OutputKernels {
     adapt: ComputePipeline,
     tonemap: ComputePipeline,
     compose: ComputePipeline,
+    scene_referred: ComputePipeline,
 }
 
 /// Words of the meter's histogram (`exposure.slang`).
@@ -43,7 +44,9 @@ const METER_ROOT: u64 = 512;
 const ADAPT_ROOT: u64 = 768;
 const ADAPT_PARAMS: u64 = 1024;
 const HOOK_ROOT: u64 = 1280;
-const COMPENSATION: u64 = 1536;
+const CAPTURE_ROOT: u64 = 1536;
+const SCENE_CAPTURE_ROOT: u64 = 1792;
+const COMPENSATION: u64 = 2048;
 const ZEROS: u64 = COMPENSATION + 4 * COMPENSATION_ENTRIES as u64;
 const UPLOAD_BYTES: u64 = ZEROS + 4 * HISTOGRAM_WORDS;
 
@@ -85,11 +88,19 @@ impl OutputRoots {
 }
 
 /// Output's state for one view history: its [`OutputRoots`] per frame in flight, the
-/// exposure telemetry they read back and, while the view sets a hook, the hook inputs.
+/// exposure telemetry they read back, the screenshots being read back and, while the view
+/// sets a hook, the hook inputs.
 pub struct OutputView {
     frames: Vec<OutputRoots>,
+    captures: Vec<Capture>,
     hooks: Option<HookTargets>,
     device: Device,
+}
+
+/// A screenshot recorded into a frame, read back once the frame completes.
+struct Capture {
+    readback: Allocation<[f32; 4]>,
+    shot: Screenshot,
 }
 
 impl OutputView {
@@ -99,6 +110,7 @@ impl OutputView {
             .collect::<Result<_>>()?;
         Ok(Self {
             frames,
+            captures: Vec::new(),
             hooks: None,
             device: gpu.clone(),
         })
@@ -114,6 +126,54 @@ impl OutputView {
     pub fn roots(&mut self, frame: u64) -> &mut OutputRoots {
         let n = self.frames.len() as u64;
         &mut self.frames[(frame % n) as usize]
+    }
+
+    /// Takes the screenshots of frames at or before `completed`, oldest first. `completed`
+    /// must be a frame whose work has completed on the GPU.
+    pub fn screenshots(&mut self, completed: u64) -> Vec<Screenshot> {
+        let (mut done, pending): (Vec<Capture>, _) = std::mem::take(&mut self.captures)
+            .into_iter()
+            .partition(|c| c.shot.frame <= completed);
+        self.captures = pending;
+        done.sort_by_key(|c| c.shot.frame);
+        done.into_iter()
+            .map(|c| {
+                let floats = c.readback.as_slice().expect("readback memory");
+                Screenshot {
+                    rgba: floats.as_flattened().to_vec(),
+                    ..c.shot
+                }
+            })
+            .collect()
+    }
+
+    /// Readback memory for a capture of `frame`, kept until [`OutputView::screenshots`]
+    /// takes it.
+    fn capture(
+        &mut self,
+        frame: u64,
+        size: [u32; 2],
+        primaries: Option<Primaries>,
+        display: &ResolvedDisplay,
+    ) -> Result<GpuPtr<[f32; 4]>> {
+        let shot = Screenshot {
+            frame,
+            size,
+            rgba: Vec::new(),
+            scene_referred: primaries.is_some(),
+            primaries: primaries.unwrap_or(Primaries::Rec709),
+            paper_white_nits: display.paper_white_nits,
+            hdr: display.encoding != OutputFormat::Sdr,
+        };
+        let [w, h] = size;
+        let readback = self.device.gpu_malloc(
+            MemoryKind::Readback,
+            u64::from(w) * u64::from(h),
+            "screenshot",
+        )?;
+        let ptr = readback.gpu;
+        self.captures.push(Capture { readback, shot });
+        Ok(ptr)
     }
 
     /// The exposure telemetry of the newest frame at or before `completed` that ran the
@@ -230,6 +290,37 @@ pub struct ComposePass<'a> {
     pub display: &'a ResolvedDisplay,
 }
 
+/// A display capture (`ScreenshotRequest::Display`): compose's result as display-linear
+/// Rec.709 floats, 1.0 = paper white, holding what the display shows (each encoding's clamp,
+/// no quantisation).
+#[derive(Clone, Copy, Debug)]
+pub struct CapturePass<'a> {
+    /// Tonemap's output, or the encoded backbuffer; `Black` for a UI-only frame.
+    pub source: ComposeSource,
+    /// The frame's UI layer, to include the UI.
+    pub ui: Option<TextureIndex>,
+    pub extent: [u32; 2],
+    pub display: &'a ResolvedDisplay,
+    /// orr's frame id, which the screenshot carries.
+    pub frame: u64,
+}
+
+/// A scene-referred capture (`ScreenshotRequest::SceneReferred`): the view's pre-exposed
+/// radiance after `hooks.scene_referred` divided by the current pre-exposure, in cd/m2.
+#[derive(Clone, Copy, Debug)]
+pub struct SceneCapturePass<'a> {
+    /// Pre-exposed linear Rec.2020 radiance.
+    pub source: TextureIndex,
+    pub extent: [u32; 2],
+    /// The render's view constants: the current exposure slot.
+    pub view: GpuPtr<ViewConstants>,
+    /// Converts to Rec.709.
+    pub rec709: bool,
+    /// The display, whose paper white the screenshot records.
+    pub display: &'a ResolvedDisplay,
+    pub frame: u64,
+}
+
 /// Upload memory for one compose pass's root. Recording writes it, so reuse it only once
 /// the list that last recorded with it has completed: a display keeps one per presented
 /// image and frame in flight.
@@ -257,6 +348,10 @@ impl OutputKernels {
             adapt: pipeline(&adapt::MODULE, "adapt")?,
             tonemap: pipeline(&tonemap::MODULE, "tonemap")?,
             compose: pipeline(&compose::MODULE, "compose")?,
+            scene_referred: gpu.create_compute_pipeline(
+                &ShaderStage::new(&compose::MODULE, "scene_referred", SpecData::default())?,
+                "screenshot_scene_referred",
+            )?,
         })
     }
 
@@ -481,27 +576,9 @@ impl OutputKernels {
         root: &mut ComposeRoot,
         pass: &ComposePass<'_>,
     ) {
-        // ENCODING_* in display.slang.
-        let encoding = match pass.display.encoding {
-            OutputFormat::Sdr => 0,
-            OutputFormat::Hdr10Pq => 1,
-            OutputFormat::ScRgb => 2,
-        };
-        // SOURCE_* in compose.slang.
-        let (source, source_kind) = match pass.source {
-            ComposeSource::Linear(t) => (t, 0),
-            ComposeSource::Encoded(t) => (t, 1),
-            ComposeSource::Black => (TextureIndex::NONE, 2),
-        };
         root.upload.as_mut_slice().expect("upload memory")[0] = compose::Root {
-            source,
-            ui: pass.ui.unwrap_or(TextureIndex::NONE),
             target: pass.target,
-            width: pass.extent[0],
-            height: pass.extent[1],
-            source_kind,
-            encoding,
-            paper_white_nits: pass.display.paper_white_nits,
+            ..compose_root(pass.source, pass.ui, pass.extent, pass.display)
         };
         let name = match pass.source {
             ComposeSource::Linear(_) => "compose",
@@ -510,6 +587,95 @@ impl OutputKernels {
         list.begin_pass(name, false);
         list.dispatch(&self.compose, root.upload.gpu, groups(pass.extent, 8));
         list.end_pass();
+    }
+
+    /// Records a display capture into readback memory the view holds until
+    /// [`OutputView::screenshots`] takes it. Order the writes of its source and UI layer
+    /// before it with a barrier; it ends with a barrier to the host.
+    pub fn capture(
+        &self,
+        list: &mut CommandList<'_>,
+        view: &mut OutputView,
+        pass: &CapturePass<'_>,
+    ) -> Result<()> {
+        let capture = view.capture(pass.frame, pass.extent, None, pass.display)?;
+        let root = compose::Root {
+            capture,
+            ..compose_root(pass.source, pass.ui, pass.extent, pass.display)
+        };
+        let root = view.roots(pass.frame).put(CAPTURE_ROOT, &root);
+        list.begin_pass("screenshot", false);
+        list.dispatch(&self.compose, root, groups(pass.extent, 8));
+        list.end_pass();
+        list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+        Ok(())
+    }
+
+    /// Records a scene-referred capture into readback memory the view holds until
+    /// [`OutputView::screenshots`] takes it. Order the writes of its source before it with a
+    /// barrier; it ends with a barrier to the host.
+    pub fn capture_scene_referred(
+        &self,
+        list: &mut CommandList<'_>,
+        view: &mut OutputView,
+        pass: &SceneCapturePass<'_>,
+    ) -> Result<()> {
+        let primaries = if pass.rec709 {
+            Primaries::Rec709
+        } else {
+            Primaries::Rec2020
+        };
+        let capture = view.capture(pass.frame, pass.extent, Some(primaries), pass.display)?;
+        let root = compose::Root {
+            capture,
+            view: pass.view,
+            source: pass.source,
+            rec709: u32::from(pass.rec709),
+            ..compose_root(ComposeSource::Black, None, pass.extent, pass.display)
+        };
+        let root = view.roots(pass.frame).put(SCENE_CAPTURE_ROOT, &root);
+        list.begin_pass("screenshot_scene_referred", false);
+        list.dispatch(&self.scene_referred, root, groups(pass.extent, 8));
+        list.end_pass();
+        list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+        Ok(())
+    }
+}
+
+/// The compose root for `source` and `ui` on `display`, writing no image and no capture.
+fn compose_root(
+    source: ComposeSource,
+    ui: Option<TextureIndex>,
+    extent: [u32; 2],
+    display: &ResolvedDisplay,
+) -> compose::Root {
+    // ENCODING_* in display.slang.
+    let encoding = match display.encoding {
+        OutputFormat::Sdr => 0,
+        OutputFormat::Hdr10Pq => 1,
+        OutputFormat::ScRgb => 2,
+    };
+    // SOURCE_* in compose.slang.
+    let (source, source_kind) = match source {
+        ComposeSource::Linear(t) => (t, 0),
+        ComposeSource::Encoded(t) => (t, 1),
+        ComposeSource::Black => (TextureIndex::NONE, 2),
+    };
+    compose::Root {
+        capture: GpuPtr::NULL,
+        view: GpuPtr::NULL,
+        source,
+        ui: ui.unwrap_or(TextureIndex::NONE),
+        target: StorageImageIndex::NONE,
+        width: extent[0],
+        height: extent[1],
+        source_kind,
+        encoding,
+        paper_white_nits: display.paper_white_nits,
+        rec709: 0,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
     }
 }
 

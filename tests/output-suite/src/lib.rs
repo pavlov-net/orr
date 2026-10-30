@@ -3,8 +3,9 @@
 
 use half::f16;
 use orr_output::{
-    ExposurePass, ExposureTelemetry, OutputKernels, OutputView, ResolvedDisplay, TonemapPass,
-    ViewOutput,
+    CapturePass, ComposeSource, DisplayRequest, ExposurePass, ExposureTelemetry, OutputFormat,
+    OutputKernels, OutputView, ResolvedDisplay, SceneCapturePass, Screenshot, ScreenshotRequest,
+    TonemapPass, ViewOutput,
 };
 use orr_scene::orr_gpu::{
     Allocation, ComputePipeline, Format, GpuPtr, Hazards, MemoryKind, QueueKind, ShaderStage,
@@ -22,8 +23,8 @@ use shaders::synth;
 
 /// One view rendered frame by frame: its exposure slots and view constants, a radiance
 /// image lit from per-pixel luminance with the current pre-exposure (`synth.slang`), the
-/// exposure passes and, on request, tonemap into an RGBA16F display-linear image. Every
-/// frame is waited on.
+/// exposure passes and, on request, tonemap into an RGBA16F display-linear image and the
+/// view's screenshot, recorded where a renderer records them. Every frame is waited on.
 pub struct Harness {
     kernels: OutputKernels,
     synth: ComputePipeline,
@@ -40,6 +41,7 @@ pub struct Harness {
     radiance_store: StorageImageIndex,
     radiance_index: TextureIndex,
     linear_store: StorageImageIndex,
+    linear_index: TextureIndex,
     extent: [u32; 2],
     frame: u64,
     /// Seconds per frame.
@@ -64,6 +66,7 @@ impl Harness {
         let radiance_store = gpu.write_storage(slot(), &radiance, &view);
         let radiance_index = gpu.write_sampled(slot(), &radiance, &view);
         let linear_store = gpu.write_storage(slot(), &linear, &view);
+        let linear_index = gpu.write_sampled(slot(), &linear, &view);
 
         let exposure = gpu
             .gpu_malloc::<ExposureState>(MemoryKind::DeviceLocal, 2, "exposure slots")
@@ -111,6 +114,7 @@ impl Harness {
             radiance_store,
             radiance_index,
             linear_store,
+            linear_index,
             extent: [width, height],
             frame: 0,
             dt: 1.0 / 30.0,
@@ -144,7 +148,9 @@ impl Harness {
     }
 
     /// Runs one frame with the image's luminance times `scale`: the exposure passes, then
-    /// tonemap when `display` is set. Returns the frame's telemetry.
+    /// tonemap when `display` is set, and `output.screenshot`, a scene-referred one before
+    /// the exposure passes and a display one (without UI) after tonemap. Returns the frame's
+    /// telemetry.
     pub fn frame(
         &mut self,
         scale: f32,
@@ -188,6 +194,23 @@ impl Harness {
         let groups = [self.extent[0].div_ceil(8), self.extent[1].div_ceil(8), 1];
         list.dispatch(&self.synth, self.synth_root.gpu, groups);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        if let Some(ScreenshotRequest::SceneReferred { rec709 }) = output.screenshot {
+            let sdr = DisplayRequest::default().resolve(&[OutputFormat::Sdr], None, false);
+            self.kernels
+                .capture_scene_referred(
+                    &mut list,
+                    &mut self.output,
+                    &SceneCapturePass {
+                        source: self.radiance_index,
+                        extent: self.extent,
+                        view,
+                        rec709,
+                        display: display.unwrap_or(&sdr),
+                        frame: self.frame,
+                    },
+                )
+                .unwrap();
+        }
         let roots = self.output.roots(self.frame);
         self.kernels.exposure(
             &mut list,
@@ -215,11 +238,32 @@ impl Harness {
                     hook_source: None,
                 },
             );
+            if let Some(ScreenshotRequest::Display { .. }) = output.screenshot {
+                list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+                self.kernels
+                    .capture(
+                        &mut list,
+                        &mut self.output,
+                        &CapturePass {
+                            source: ComposeSource::Linear(self.linear_index),
+                            ui: None,
+                            extent: self.extent,
+                            display,
+                            frame: self.frame,
+                        },
+                    )
+                    .unwrap();
+            }
         }
         wait(queue.submit(vec![list], &[]).unwrap());
         let telemetry = self.output.telemetry(self.frame).expect("telemetry");
         assert_eq!(telemetry.frame, self.frame);
         telemetry
+    }
+
+    /// The screenshots of every frame run so far that have not been taken, oldest first.
+    pub fn screenshots(&mut self) -> Vec<Screenshot> {
+        self.output.screenshots(self.frame)
     }
 
     /// The last frame's radiance image, RGBA.

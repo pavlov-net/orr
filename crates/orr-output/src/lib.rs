@@ -9,6 +9,7 @@ mod exposure;
 mod gt7;
 mod hooks;
 mod passes;
+mod screenshot;
 mod ui;
 mod view;
 mod white_balance;
@@ -32,9 +33,10 @@ pub use gt7::{GT7_REFERENCE_NITS, GT7_SDR_NITS, Gt7Curve, Gt7Params};
 pub use hooks::{ChainImages, DistortionField, HookInputs, HookPass, HookPoint, Hooks};
 pub use orr_scene::orr_gpu::{HdrMetadata, OutputFormat, PresentMode};
 pub use passes::{
-    ComposePass, ComposeRoot, ComposeSource, ExposurePass, HookInputsPass, OutputKernels,
-    OutputRoots, OutputView, TonemapPass,
+    CapturePass, ComposePass, ComposeRoot, ComposeSource, ExposurePass, HookInputsPass,
+    OutputKernels, OutputRoots, OutputView, SceneCapturePass, TonemapPass,
 };
+pub use screenshot::{Primaries, Screenshot, ScreenshotRequest};
 pub use ui::UiLayer;
 pub use view::{OutputDebug, ViewOutput};
 pub use white_balance::{
