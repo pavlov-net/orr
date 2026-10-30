@@ -49,6 +49,21 @@ struct Case {
     blobs: Vec<(Vec<u8>, Codec, Filter, bool, u32)>,
 }
 
+impl Case {
+    fn ins(&self) -> Vec<BlobIn<'_>> {
+        self.blobs
+            .iter()
+            .map(|(bytes, codec, filter, mount, chunk_len)| BlobIn {
+                bytes,
+                codec: *codec,
+                filter: *filter,
+                mount: *mount,
+                chunk_len: *chunk_len,
+            })
+            .collect()
+    }
+}
+
 fn cases() -> Vec<Case> {
     const K: usize = 1024;
     let mut out = Vec::new();
@@ -105,18 +120,7 @@ fn write(target: Target, cases: &[Case]) -> Option<Arc<[u8]>> {
     let mut w = ArchiveWriter::create(target).unwrap();
     w.set_zstd_level(3);
     for c in cases {
-        let blobs: Vec<BlobIn> = c
-            .blobs
-            .iter()
-            .map(|(bytes, codec, filter, mount, chunk_len)| BlobIn {
-                bytes,
-                codec: *codec,
-                filter: *filter,
-                mount: *mount,
-                chunk_len: *chunk_len,
-            })
-            .collect();
-        w.add(&c.name, USER, 1, Hash32::of(c.name.as_bytes()), &blobs)
+        w.add(&c.name, USER, 1, Hash32::of(c.name.as_bytes()), &c.ins())
             .unwrap();
     }
     w.finish().unwrap()
@@ -440,17 +444,7 @@ fn streamed_and_pre_encoded_blobs_equal_plain_adds() {
     let mut w = ArchiveWriter::create(Target::Memory).unwrap();
     w.set_zstd_level(3);
     for c in &cases {
-        let ins: Vec<BlobIn> = c
-            .blobs
-            .iter()
-            .map(|(bytes, codec, filter, mount, chunk_len)| BlobIn {
-                bytes,
-                codec: *codec,
-                filter: *filter,
-                mount: *mount,
-                chunk_len: *chunk_len,
-            })
-            .collect();
+        let ins = c.ins();
         let pre: Vec<_> = ins.iter().map(|b| b.encode(3)).collect();
         w.add_streamed(&c.name, USER, 1, Hash32::of(c.name.as_bytes()), |e| {
             for (j, (b, p)) in ins.iter().zip(&pre).enumerate() {

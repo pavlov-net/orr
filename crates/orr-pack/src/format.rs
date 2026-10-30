@@ -263,7 +263,7 @@ pub(crate) fn validate(h: &Header, index: &[u8]) -> Result<Layout> {
         }
         let c = u64::from(b.chunk_raw_len());
         let n = u64::from(b.chunk_count);
-        if n > 1 && (!c.is_power_of_two() || (n - 1) * c >= u64::from(b.raw_len)) {
+        if n > 1 && (n - 1) * c >= u64::from(b.raw_len) {
             return Err(Error::Malformed("blob chunk count"));
         }
         if cs.iter().map(|c| u64::from(c.stored_len)).sum::<u64>() != u64::from(b.stored_len) {
