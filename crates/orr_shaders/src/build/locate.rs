@@ -1,4 +1,4 @@
-// Shared by the crate's build.rs (through `#[path]`) and `Toolchain`.
+// Shared by the crate's build.rs (through `#[path]`) and `Build::new`.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
