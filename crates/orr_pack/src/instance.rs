@@ -151,13 +151,9 @@ impl InstancePageInfo {
         let prototypes: Vec<Prototype> = self
             .prototypes
             .iter()
-            .map(|p| {
-                let s = p.sections;
-                let rows = &self.sections[s.first as usize..(s.first + s.count) as usize];
-                Prototype {
-                    sections: put_table(&mut out, rows),
-                    ..*p
-                }
+            .map(|p| Prototype {
+                sections: put_table(&mut out, self.sections_of(p)),
+                ..*p
             })
             .collect();
         h.prototypes = put_table(&mut out, &prototypes);
