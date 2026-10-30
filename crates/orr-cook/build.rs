@@ -1,6 +1,7 @@
 //! Puts the locked versions of the libraries that shape cooked bytes into environment
 //! variables that enter cook keys: `ORR_COOK_ZSTD_LIBS` for every entry,
-//! `ORR_COOK_MESH_LIBS` for meshes and `ORR_COOK_TEXTURE_LIBS` for textures.
+//! `ORR_COOK_MESH_LIBS` for meshes, `ORR_COOK_TEXTURE_LIBS` for textures and
+//! `ORR_COOK_RASTER_LIBS` for raster sets.
 
 use std::path::Path;
 
@@ -44,8 +45,13 @@ fn main() {
         "cargo:rustc-env=ORR_COOK_MESH_LIBS={}",
         versions(&|n| MESH.contains(&n))
     );
+    let texture = |n: &str| n == "ctt" || n.starts_with("ctt-") || TEXTURE.contains(&n);
     println!(
         "cargo:rustc-env=ORR_COOK_TEXTURE_LIBS={}",
-        versions(&|n| n == "ctt" || n.starts_with("ctt-") || TEXTURE.contains(&n))
+        versions(&texture)
+    );
+    println!(
+        "cargo:rustc-env=ORR_COOK_RASTER_LIBS={}",
+        versions(&|n| n == "tiff" || texture(n))
     );
 }

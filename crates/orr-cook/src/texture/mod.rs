@@ -13,7 +13,7 @@ use orr_pack::texture::{
 use orr_pack::{ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span};
 use serde::Deserialize;
 
-pub(crate) use encode::Encoding;
+pub(crate) use encode::{Encoding, encode as encode_chains};
 pub(crate) use load::Source;
 pub(crate) use mips::{MipSpec, Toksvig};
 

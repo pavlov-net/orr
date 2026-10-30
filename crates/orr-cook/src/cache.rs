@@ -26,6 +26,10 @@ impl Cache {
         })
     }
 
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub(crate) fn path(&self, key: Hash32) -> PathBuf {
         self.dir.join(hex(key))
     }

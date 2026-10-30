@@ -13,15 +13,26 @@
 //! texture = { path = "sky.exr", settings = { usage = { environment = { max_lights = 4 } } } }
 //! ```
 //!
-//! Each asset names exactly one source: `gltf`, `texture`, `instances` or `user`, with the
-//! fields of the matching [`Source`] variant. Settings fields left out take their defaults.
+//! ```toml
+//! [[archive.asset]]
+//! name = "terrain"
+//! raster = { world_min = [-8192.0, -8192.0], world_size = 16384.0, layer = [
+//!     { name = "height", input = { whole = { path = "height.r32", tile_size = 512 } } },
+//!     { name = "surface", reduction = "nearest",
+//!       input = { tiles = { root = "surface", pattern = "{lod}/*/0_{lod}_{x}_{y}.tif" } } },
+//! ] }
+//! ```
+//!
+//! Each asset names exactly one source: `gltf`, `texture`, `instances`, `raster` or `user`,
+//! with the fields of the matching [`Source`] variant. Settings fields left out take their
+//! defaults.
 
 use std::path::{Path, PathBuf};
 
 use orr_pack::Target;
 use serde::{Deserialize, Deserializer};
 
-use crate::{ArchiveSpec, Error, Manifest, Result, Source};
+use crate::{ArchiveSpec, Error, Manifest, RasterInput, Result, Source};
 
 impl Manifest {
     /// Reads a TOML manifest; relative paths in it are resolved against its directory.
@@ -47,6 +58,14 @@ impl Manifest {
             for asset in &mut a.assets {
                 match &mut asset.source {
                     Source::Gltf { path, .. } | Source::Texture { path, .. } => resolve(path),
+                    Source::Raster(set) => {
+                        for l in &mut set.layers {
+                            match &mut l.input {
+                                RasterInput::Whole { path, .. } => resolve(path),
+                                RasterInput::Tiles { root, .. } => resolve(root),
+                            }
+                        }
+                    }
                     Source::Instances(_) | Source::User { .. } => {}
                 }
             }

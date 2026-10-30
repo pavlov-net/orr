@@ -70,8 +70,7 @@ impl Memo {
         {
             return Ok(*h);
         }
-        let bytes = fs::read(path).map_err(|source| read_error(path, source))?;
-        let hash = Hash32::of(&bytes);
+        let hash = hash_file(path)?;
         if let Some(stat) = stat {
             self.insert(path.to_owned(), stat, hash);
         }
@@ -93,6 +92,26 @@ impl Memo {
     fn get(&self, path: &Path) -> Option<(Stat, Hash32)> {
         self.files.lock().expect("memo lock").get(path).copied()
     }
+}
+
+/// Hashes a file without holding it whole.
+pub(crate) fn hash_file(path: &Path) -> Result<Hash32> {
+    let mut h = blake3::Hasher::new();
+    let file = fs::File::open(path).map_err(|source| read_error(path, source))?;
+    h.update_reader(file)
+        .map_err(|source| read_error(path, source))?;
+    Ok(Hash32(*h.finalize().as_bytes()))
+}
+
+/// Reads a file whose hash a plan recorded; fails if it changed since.
+pub(crate) fn read_checked(path: &Path, hash: Hash32) -> Result<Vec<u8>> {
+    let bytes = fs::read(path).map_err(|source| read_error(path, source))?;
+    if Hash32::of(&bytes) != hash {
+        return Err(Error::Changed {
+            path: path.to_owned(),
+        });
+    }
+    Ok(bytes)
 }
 
 fn read_error(path: &Path, source: std::io::Error) -> Error {

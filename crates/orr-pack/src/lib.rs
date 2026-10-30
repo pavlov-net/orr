@@ -12,6 +12,7 @@ pub mod instance;
 pub mod material;
 pub mod mesh;
 pub mod model;
+pub mod raster;
 pub mod texture;
 mod writer;
 
@@ -22,7 +23,7 @@ use bytemuck::{Pod, Zeroable};
 
 pub use archive::{Archive, StoredRange};
 pub use format::{Blob, Chunk, Entry, FORMAT_VERSION, Header, StrRef};
-pub use writer::{ArchiveWriter, BlobIn, Target};
+pub use writer::{ArchiveWriter, BlobIn, EncodedBlob, EntryBlobs, Target};
 
 /// Root of this crate's Slang modules (`orr_pack.*`), for shader include paths.
 pub const SHADER_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders");
@@ -151,6 +152,7 @@ const SCHEMAS: &[(Class, u16)] = &[
     (Class::Model, model::SCHEMA),
     (Class::Texture, texture::SCHEMA),
     (Class::InstancePage, instance::SCHEMA),
+    (Class::RasterSet, raster::SCHEMA),
 ];
 
 impl Class {

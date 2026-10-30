@@ -432,3 +432,50 @@ fn finish_replaces_an_open_archive() {
     assert!(d.join("a.orrpack.tmp").exists());
     assert!(!d.join("a.orrpack.payload.tmp").exists());
 }
+
+#[test]
+fn streamed_and_pre_encoded_blobs_equal_plain_adds() {
+    let cases = cases();
+    let plain = write(Target::Memory, &cases).unwrap();
+    let mut w = ArchiveWriter::create(Target::Memory).unwrap();
+    w.set_zstd_level(3);
+    for c in &cases {
+        let ins: Vec<BlobIn> = c
+            .blobs
+            .iter()
+            .map(|(bytes, codec, filter, mount, chunk_len)| BlobIn {
+                bytes,
+                codec: *codec,
+                filter: *filter,
+                mount: *mount,
+                chunk_len: *chunk_len,
+            })
+            .collect();
+        let pre: Vec<_> = ins.iter().map(|b| b.encode(3)).collect();
+        w.add_streamed(&c.name, USER, 1, Hash32::of(c.name.as_bytes()), |e| {
+            for (j, (b, p)) in ins.iter().zip(&pre).enumerate() {
+                match p {
+                    Ok(p) if j % 2 == 1 => e.push_encoded(p)?,
+                    _ => e.push(b)?,
+                }
+            }
+            Ok::<_, Error>(())
+        })
+        .unwrap();
+    }
+    assert!(plain[..] == w.finish().unwrap().unwrap()[..]);
+
+    let mut w = ArchiveWriter::create(Target::Memory).unwrap();
+    let bytes = data(1 << 20, 3);
+    let failed = w.add_streamed("broken", USER, 1, Hash32([0; 32]), |e| {
+        e.push(&BlobIn::new(&bytes))?;
+        Err(Error::InvalidBlob("stop"))
+    });
+    assert!(matches!(failed, Err(Error::InvalidBlob("stop"))));
+    w.add("kept", USER, 1, Hash32([1; 32]), &[BlobIn::new(&bytes)])
+        .unwrap();
+    let a = Archive::from_memory(w.finish().unwrap().unwrap()).unwrap();
+    assert_eq!(a.entries().len(), 1);
+    let e = a.find(AssetId::from_name("kept")).unwrap();
+    a.verify(e).unwrap();
+}

@@ -17,6 +17,7 @@ pub(crate) const VERSIONS: &[(Class, u32)] = &[
     (Class::Material, 1),
     (Class::Model, 1),
     (Class::InstancePage, 2),
+    (Class::RasterSet, 1),
 ];
 
 /// Cook version of user classes, which the cook stores as given.
@@ -33,6 +34,7 @@ fn libraries(class: u16) -> &'static str {
     match Class::from_u16(class) {
         Some(Class::Mesh) => env!("ORR_COOK_MESH_LIBS"),
         Some(Class::Texture) => env!("ORR_COOK_TEXTURE_LIBS"),
+        Some(Class::RasterSet) => env!("ORR_COOK_RASTER_LIBS"),
         _ => "",
     }
 }
