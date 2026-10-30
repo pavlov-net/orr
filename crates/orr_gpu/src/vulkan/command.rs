@@ -144,6 +144,38 @@ impl<'q> CommandList<'q> {
         })
     }
 
+    /// Moves a swapchain image into `GENERAL` after its acquire (`acquired`), or into
+    /// `PRESENT_SRC` after the last write before its present.
+    pub(crate) fn swapchain_barrier(&mut self, t: &Texture, acquired: bool) {
+        let all = vk::PipelineStageFlags2::ALL_COMMANDS;
+        let rw = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
+        let b = vk::ImageMemoryBarrier2::default()
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(t.image)
+            .subresource_range(t.full_range());
+        let b = if acquired {
+            b.src_stage_mask(super::queue::SWAPCHAIN_WRITE_STAGES)
+                .dst_stage_mask(all)
+                .dst_access_mask(rw)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::GENERAL)
+        } else {
+            b.src_stage_mask(all)
+                .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+                .dst_stage_mask(all)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+        };
+        // SAFETY: recording.
+        unsafe {
+            self.device().cmd_pipeline_barrier2(
+                self.cmd(),
+                &vk::DependencyInfo::default().image_memory_barriers(&[b]),
+            );
+        }
+    }
+
     /// Makes writes in `before` stages visible to `after` stages. [`Stages::RAY`] is
     /// ignored without `Caps::ray_dispatch`, since no ray-dispatch work can run then.
     pub fn barrier(&mut self, before: Stages, after: Stages, hazards: Hazards) {

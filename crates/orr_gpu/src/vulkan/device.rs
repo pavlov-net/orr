@@ -12,7 +12,7 @@ use ash::vk::TaggedStructure as _;
 use super::accel::{EmptyTlas, build_empty_tlas};
 use super::cache::PipelineCache;
 use super::debug::{MessageCount, messenger_info, name_object};
-use super::features::{self, Selection};
+use super::features::{self, SURFACE_INSTANCE_EXTENSIONS, Selection};
 use super::garbage::{Garbage, Item, MAX_TIMELINES};
 use super::heap::Heaps;
 use super::memory::{MemoryKind, MemoryTypes, Usage, buffer_usage, sharing};
@@ -83,6 +83,8 @@ pub(crate) struct Shared {
     pub debug_fn: ash::ext::debug_utils::Device,
     pub calibrated_fn: Option<ash::khr::calibrated_timestamps::Device>,
     pub exec_fn: Option<ash::khr::pipeline_executable_properties::Device>,
+    /// On devices with the Present queue.
+    pub present_fn: Option<PresentFns>,
     messenger: (ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT),
     messages: Box<MessageCount>,
     pub caps: Caps,
@@ -107,6 +109,18 @@ pub(crate) struct Shared {
     pub garbage: Mutex<Garbage>,
     pub results: Mutex<VecDeque<(TimelinePoint, Vec<PassResult>)>>,
     pub calibration: Mutex<Option<Calibration>>,
+}
+
+/// Surface and swapchain entry points of a device that presents.
+pub(crate) struct PresentFns {
+    pub surface: ash::khr::surface::Instance,
+    pub win32: ash::khr::win32_surface::Instance,
+    pub caps2: ash::khr::get_surface_capabilities2::Instance,
+    pub swapchain: ash::khr::swapchain::Device,
+    pub wait2: Option<ash::khr::present_wait2::Device>,
+    pub latency: Option<ash::nv::low_latency2::Device>,
+    pub hdr: Option<ash::ext::hdr_metadata::Device>,
+    pub timing: Option<ash::ext::present_timing::Device>,
 }
 
 impl Shared {
@@ -282,7 +296,7 @@ impl Device {
                 instance.destroy_instance(None);
             }
         };
-        let picked = pick_device(&instance, desc.skip_extensions);
+        let picked = pick_device(&instance, desc.skip_extensions, desc.queues.present);
         let (physical, selection) = match picked {
             Ok(p) => p,
             Err(e) => {
@@ -399,6 +413,11 @@ impl Device {
             pipeline_executable_info: optional.executable_info,
             conservative_raster: optional.conservative_raster,
             ray_tracing_validation: optional.ray_tracing_validation,
+            present_wait: optional.present_wait,
+            low_latency: optional.low_latency,
+            present_metering: optional.present_metering,
+            present_timing: optional.present_timing,
+            hdr_metadata: optional.hdr_metadata,
             cluster: cluster_caps(&cluster_props, &ptlas_props, optional.omm),
             limits: Limits {
                 image_descriptor_bytes: p.image_descriptor_size as u32,
@@ -471,6 +490,24 @@ impl Device {
                 .then(|| ash::khr::calibrated_timestamps::Device::load(&instance, &device)),
             exec_fn: optional.executable_info.then(|| {
                 ash::khr::pipeline_executable_properties::Device::load(&instance, &device)
+            }),
+            present_fn: optional.surface.then(|| PresentFns {
+                surface: ash::khr::surface::Instance::load(&entry, &instance),
+                win32: ash::khr::win32_surface::Instance::load(&entry, &instance),
+                caps2: ash::khr::get_surface_capabilities2::Instance::load(&entry, &instance),
+                swapchain: ash::khr::swapchain::Device::load(&instance, &device),
+                wait2: optional
+                    .present_wait
+                    .then(|| ash::khr::present_wait2::Device::load(&instance, &device)),
+                latency: optional
+                    .low_latency
+                    .then(|| ash::nv::low_latency2::Device::load(&instance, &device)),
+                hdr: optional
+                    .hdr_metadata
+                    .then(|| ash::ext::hdr_metadata::Device::load(&instance, &device)),
+                timing: optional
+                    .present_timing
+                    .then(|| ash::ext::present_timing::Device::load(&instance, &device)),
             }),
             messenger: (debug_instance, messenger),
             messages,
@@ -607,6 +644,20 @@ fn create_instance(
     if validation {
         ext_names.push(ash::ext::layer_settings::NAME.as_ptr());
     }
+    if desc.queues.present {
+        for name in SURFACE_INSTANCE_EXTENSIONS {
+            if !exts
+                .iter()
+                .any(|e| e.extension_name_as_c_str() == Ok(*name))
+            {
+                return Err(Error::Unsupported {
+                    device: "instance".into(),
+                    missing: name.to_string_lossy().into_owned(),
+                });
+            }
+            ext_names.push(name.as_ptr());
+        }
+    }
     let name = CString::new(desc.name).unwrap_or_default();
     let app = vk::ApplicationInfo::default()
         .application_name(&name)
@@ -635,6 +686,7 @@ fn create_instance(
 fn pick_device(
     instance: &ash::Instance,
     skip: &[&CStr],
+    surface: bool,
 ) -> Result<(vk::PhysicalDevice, Selection), Error> {
     // SAFETY: plain query.
     let mut devices = unsafe { instance.enumerate_physical_devices() }
@@ -645,7 +697,7 @@ fn pick_device(
     devices.sort_by_key(|&p| props(p).device_type != vk::PhysicalDeviceType::DISCRETE_GPU);
     let mut first_failure = None;
     for p in devices {
-        match features::select(instance, p, skip) {
+        match features::select(instance, p, skip, surface) {
             Ok(selection) => return Ok((p, selection)),
             Err(missing) => {
                 first_failure.get_or_insert_with(|| {

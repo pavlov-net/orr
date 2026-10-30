@@ -19,6 +19,22 @@ const REQUIRED_EXTENSIONS: &[&CStr] = &[
     ash::nv::partitioned_acceleration_structure::NAME,
 ];
 
+/// Required on devices that present (`QueueRequest::present`).
+const SURFACE_EXTENSIONS: &[&CStr] = &[
+    ash::khr::swapchain::NAME,
+    ash::khr::swapchain_maintenance1::NAME,
+];
+
+/// Instance extensions of devices that present.
+pub(crate) const SURFACE_INSTANCE_EXTENSIONS: &[&CStr] = &[
+    ash::khr::surface::NAME,
+    #[cfg(windows)]
+    ash::khr::win32_surface::NAME,
+    ash::khr::get_surface_capabilities2::NAME,
+    ash::khr::surface_maintenance1::NAME,
+    ash::ext::swapchain_colorspace::NAME,
+];
+
 /// Spec version of `VK_NV_cluster_acceleration_structure` with OMM in clusters.
 const CLUSTER_SPEC_VERSION: u32 = 4;
 
@@ -41,6 +57,13 @@ pub(crate) struct Optional {
     pub host_image_copy: bool,
     pub conservative_raster: bool,
     pub ray_tracing_validation: bool,
+    /// The device presents: swapchain and swapchain_maintenance1 are enabled.
+    pub surface: bool,
+    pub present_wait: bool,
+    pub low_latency: bool,
+    pub present_metering: bool,
+    pub present_timing: bool,
+    pub hdr_metadata: bool,
 }
 
 /// Exposed only when `NV_ALLOW_RAYTRACING_VALIDATION=1` is set before instance creation.
@@ -76,6 +99,11 @@ pub(crate) struct Features {
     pub frame_boundary: vk::PhysicalDeviceFrameBoundaryFeaturesEXT<'static>,
     pub executable: vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR<'static>,
     pub rt_validation: vk::PhysicalDeviceRayTracingValidationFeaturesNV<'static>,
+    pub swapchain_maintenance: vk::PhysicalDeviceSwapchainMaintenance1FeaturesKHR<'static>,
+    pub present_id2: vk::PhysicalDevicePresentId2FeaturesKHR<'static>,
+    pub present_wait2: vk::PhysicalDevicePresentWait2FeaturesKHR<'static>,
+    pub present_metering: vk::PhysicalDevicePresentMeteringFeaturesNV<'static>,
+    pub present_timing: vk::PhysicalDevicePresentTimingFeaturesEXT<'static>,
 }
 
 impl Features {
@@ -139,6 +167,19 @@ impl Features {
         if opt.ray_tracing_validation {
             chain.push(ptr(&mut self.rt_validation));
         }
+        if opt.surface {
+            chain.push(ptr(&mut self.swapchain_maintenance));
+        }
+        if opt.present_wait {
+            chain.push(ptr(&mut self.present_id2));
+            chain.push(ptr(&mut self.present_wait2));
+        }
+        if opt.present_metering {
+            chain.push(ptr(&mut self.present_metering));
+        }
+        if opt.present_timing {
+            chain.push(ptr(&mut self.present_timing));
+        }
         for pair in chain.windows(2) {
             // SAFETY: every pointer is a live field of `self` whose header is a
             // `VkBaseOutStructure`.
@@ -168,17 +209,19 @@ fn has(list: &[vk::ExtensionProperties], name: &CStr) -> Option<u32> {
 }
 
 /// Checks `physical` against orr's required set and picks the optional items it offers,
-/// leaving out the optional extensions named in `skip`. The error names the first missing
-/// item.
+/// leaving out the optional extensions named in `skip`. `surface` adds the extensions and
+/// features presenting needs. The error names the first missing item.
 pub(crate) fn select(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
     skip: &[&CStr],
+    surface: bool,
 ) -> Result<Selection, String> {
     // SAFETY: `physical` came from this instance.
     let list = unsafe { instance.enumerate_device_extension_properties(physical) }
         .map_err(|e| format!("extension list ({e})"))?;
-    for name in REQUIRED_EXTENSIONS {
+    let surface_names = if surface { SURFACE_EXTENSIONS } else { &[] };
+    for name in REQUIRED_EXTENSIONS.iter().chain(surface_names) {
         if has(&list, name).is_none() {
             return Err(name.to_string_lossy().into_owned());
         }
@@ -214,6 +257,17 @@ pub(crate) fn select(
         host_image_copy: false,
         conservative_raster: present(ash::ext::conservative_rasterization::NAME),
         ray_tracing_validation: cfg!(debug_assertions) && present(RAY_TRACING_VALIDATION),
+        surface,
+        present_wait: surface
+            && present(ash::khr::present_id2::NAME)
+            && present(ash::khr::present_wait2::NAME),
+        low_latency: surface && present(ash::nv::low_latency2::NAME),
+        present_metering: surface && present(ash::nv::present_metering::NAME),
+        // Present timing requires calibrated timestamps enabled with it.
+        present_timing: surface
+            && present(ash::ext::present_timing::NAME)
+            && present(ash::khr::calibrated_timestamps::NAME),
+        hdr_metadata: surface && present(ash::ext::hdr_metadata::NAME),
     };
 
     let mut q = Box::<Features>::default();
@@ -299,6 +353,9 @@ pub(crate) fn select(
     if let Some((name, _)) = required.iter().find(|(_, v)| *v == vk::FALSE) {
         return Err((*name).to_owned());
     }
+    if surface && q.swapchain_maintenance.swapchain_maintenance1 == vk::FALSE {
+        return Err("swapchainMaintenance1".to_owned());
+    }
 
     opt.ray_dispatch &=
         q.ray_pipeline.ray_tracing_pipeline != 0 && q.reorder.ray_tracing_invocation_reorder != 0;
@@ -316,6 +373,11 @@ pub(crate) fn select(
     opt.executable_info &= q.executable.pipeline_executable_info != 0;
     opt.host_image_copy = q.v14.host_image_copy != 0;
     opt.ray_tracing_validation &= q.rt_validation.ray_tracing_validation != 0;
+    opt.present_wait &= q.present_id2.present_id2 != 0 && q.present_wait2.present_wait2 != 0;
+    // Low latency keys its frames by present id.
+    opt.low_latency &= opt.present_wait;
+    opt.present_metering &= q.present_metering.present_metering != 0;
+    opt.present_timing &= q.present_timing.present_timing != 0;
 
     let mut e = Box::<Features>::default();
     e.core.features = vk::PhysicalDeviceFeatures {
@@ -386,9 +448,15 @@ pub(crate) fn select(
     e.frame_boundary.frame_boundary = 1;
     e.executable.pipeline_executable_info = 1;
     e.rt_validation.ray_tracing_validation = 1;
+    e.swapchain_maintenance.swapchain_maintenance1 = 1;
+    e.present_id2.present_id2 = 1;
+    e.present_wait2.present_wait2 = 1;
+    e.present_metering.present_metering = 1;
+    e.present_timing.present_timing = 1;
     e.link(&opt);
 
     let mut extensions = REQUIRED_EXTENSIONS.to_vec();
+    extensions.extend_from_slice(surface_names);
     let mut add = |on: bool, names: &[&'static CStr]| {
         if on {
             extensions.extend_from_slice(names);
@@ -446,6 +514,15 @@ pub(crate) fn select(
         &[ash::khr::pipeline_executable_properties::NAME],
     );
     add(opt.ray_tracing_validation, &[RAY_TRACING_VALIDATION]);
+    add(
+        opt.present_wait,
+        &[ash::khr::present_id2::NAME, ash::khr::present_wait2::NAME],
+    );
+    add(opt.low_latency, &[ash::nv::low_latency2::NAME]);
+    add(opt.present_metering, &[ash::nv::present_metering::NAME]);
+    add(opt.hdr_metadata, &[ash::ext::hdr_metadata::NAME]);
+    // Calibrated timestamps are already in the list when present timing is on.
+    add(opt.present_timing, &[ash::ext::present_timing::NAME]);
     Ok(Selection {
         extensions,
         optional: opt,

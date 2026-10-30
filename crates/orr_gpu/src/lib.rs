@@ -30,7 +30,9 @@ pub use error::{Error, VkResult};
 pub use format::Format;
 pub use orr_shaders::abi::*;
 pub use orr_shaders::{EntryPoint, KernelSet, ShaderModule, Stage};
-pub use present::{HdrMetadata, OutputFormat, PresentMode};
+pub use present::{
+    HdrMetadata, LatencyMarker, LatencyTimings, OutputFormat, PresentMode, Refresh, SwapchainDesc,
+};
 pub use raster::{
     Blend, BlendEquation, BlendFactor, BlendOp, ClearColor, ColorLoad, ColorMask, ColorTarget,
     Cull, DepthBias, DepthLoad, DepthTarget, Fill, FrontFace, RasterState,
@@ -50,11 +52,11 @@ pub use texture::{
 pub use vulkan::{
     Allocation, ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance,
     ClassicKind, ColorAttachment, CommandList, ComputePipeline, DepthAttachment, Device,
-    DeviceDesc, DispatchArgs, HeapReport, InstanceFlags, MemoryKind, MemoryReport, MemoryUsage,
-    MeshArgs, MeshPipeline, MeshPipelineDesc, Micromap, MicromapDesc, MicromapTriangle,
-    MicromapUsage, OmmFormat, PageBind, PassResult, PipelineCacheKind, PipelineCacheReport,
-    PipelineStats, Queue, QueueKind, QueueRequest, RayDispatchPipeline, Rendering, ShaderStage,
-    SparseAllocation, Texture, TextureMemory,
+    DeviceDesc, DispatchArgs, HeapReport, InstanceFlags, LowLatency, MemoryKind, MemoryReport,
+    MemoryUsage, MeshArgs, MeshPipeline, MeshPipelineDesc, Micromap, MicromapDesc,
+    MicromapTriangle, MicromapUsage, OmmFormat, PageBind, PassResult, PipelineCacheKind,
+    PipelineCacheReport, PipelineStats, Queue, QueueKind, QueueRequest, RayDispatchPipeline,
+    Rendering, ShaderStage, SparseAllocation, Swapchain, SwapchainFrame, Texture, TextureMemory,
 };
 
 #[cfg(not(target_vendor = "apple"))]
