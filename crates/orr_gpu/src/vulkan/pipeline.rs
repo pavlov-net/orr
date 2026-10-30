@@ -250,20 +250,16 @@ impl Shared {
         );
         self.log_statistics(raw, name);
     }
-}
 
-impl Device {
-    /// Creates a compute pipeline from a compute entry point.
-    pub fn create_compute_pipeline(
+    pub(crate) fn create_compute(
         &self,
         s: &ShaderStage<'_>,
         name: &str,
-    ) -> Result<ComputePipeline, Error> {
-        let shared = &self.shared;
-        let parts = StageParts::new(shared, s, Stage::Compute, name)?;
+    ) -> Result<vk::Pipeline, Error> {
+        let parts = StageParts::new(self, s, Stage::Compute, name)?;
         let mut key = KeyHasher::new(PipelineKind::Compute);
         parts.hash(vk::ShaderStageFlags::COMPUTE, &mut key);
-        let raw = shared.create_pipeline(
+        self.create_pipeline(
             PipelineKind::Compute,
             key.finish_key(),
             name,
@@ -275,18 +271,27 @@ impl Device {
                 info.p_next = chain.head();
                 // SAFETY: valid create info; the SPIR-V was validated by the shader build.
                 unsafe {
-                    shared
-                        .device
+                    self.device
                         .create_compute_pipelines(chain.cache, &[info], None)
                 }
                 .map(|p| p[0])
                 .map_err(|(_, e)| e)
             },
-        )?;
+        )
+    }
+}
+
+impl Device {
+    /// Creates a compute pipeline from a compute entry point.
+    pub fn create_compute_pipeline(
+        &self,
+        s: &ShaderStage<'_>,
+        name: &str,
+    ) -> Result<ComputePipeline, Error> {
         Ok(ComputePipeline {
-            raw,
+            raw: self.shared.create_compute(s, name)?,
             workgroup: s.entry.workgroup,
-            shared: Arc::clone(shared),
+            shared: Arc::clone(&self.shared),
         })
     }
 }

@@ -40,7 +40,11 @@ pub(crate) struct Optional {
     pub executable_info: bool,
     pub host_image_copy: bool,
     pub conservative_raster: bool,
+    pub ray_tracing_validation: bool,
 }
+
+/// Exposed only when `NV_ALLOW_RAYTRACING_VALIDATION=1` is set before instance creation.
+pub(crate) const RAY_TRACING_VALIDATION: &CStr = c"VK_NV_ray_tracing_validation";
 
 /// Every feature struct orr reads or enables, chained through raw pointers.
 #[derive(Default)]
@@ -71,6 +75,7 @@ pub(crate) struct Features {
     pub decompression: vk::PhysicalDeviceMemoryDecompressionFeaturesEXT<'static>,
     pub frame_boundary: vk::PhysicalDeviceFrameBoundaryFeaturesEXT<'static>,
     pub executable: vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR<'static>,
+    pub rt_validation: vk::PhysicalDeviceRayTracingValidationFeaturesNV<'static>,
 }
 
 impl Features {
@@ -130,6 +135,9 @@ impl Features {
         }
         if opt.executable_info {
             chain.push(ptr(&mut self.executable));
+        }
+        if opt.ray_tracing_validation {
+            chain.push(ptr(&mut self.rt_validation));
         }
         for pair in chain.windows(2) {
             // SAFETY: every pointer is a live field of `self` whose header is a
@@ -205,6 +213,7 @@ pub(crate) fn select(
         executable_info: present(ash::khr::pipeline_executable_properties::NAME),
         host_image_copy: false,
         conservative_raster: present(ash::ext::conservative_rasterization::NAME),
+        ray_tracing_validation: cfg!(debug_assertions) && present(RAY_TRACING_VALIDATION),
     };
 
     let mut q = Box::<Features>::default();
@@ -306,6 +315,7 @@ pub(crate) fn select(
     opt.frame_boundary &= q.frame_boundary.frame_boundary != 0;
     opt.executable_info &= q.executable.pipeline_executable_info != 0;
     opt.host_image_copy = q.v14.host_image_copy != 0;
+    opt.ray_tracing_validation &= q.rt_validation.ray_tracing_validation != 0;
 
     let mut e = Box::<Features>::default();
     e.core.features = vk::PhysicalDeviceFeatures {
@@ -375,6 +385,7 @@ pub(crate) fn select(
     e.decompression.memory_decompression = 1;
     e.frame_boundary.frame_boundary = 1;
     e.executable.pipeline_executable_info = 1;
+    e.rt_validation.ray_tracing_validation = 1;
     e.link(&opt);
 
     let mut extensions = REQUIRED_EXTENSIONS.to_vec();
@@ -434,6 +445,7 @@ pub(crate) fn select(
         opt.executable_info,
         &[ash::khr::pipeline_executable_properties::NAME],
     );
+    add(opt.ray_tracing_validation, &[RAY_TRACING_VALIDATION]);
     Ok(Selection {
         extensions,
         optional: opt,

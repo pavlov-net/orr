@@ -48,10 +48,12 @@ unsafe extern "system" fn callback(
     let id = text(data.p_message_id_name);
     let message = text(data.p_message);
     // General messages come from the loader (layer versions, environment overrides); the
-    // settings ones report how the layer itself is configured (GPU-AV runs).
+    // settings ones report how the layer itself is configured (GPU-AV runs). The implicit
+    // cluster-build VUID is a known false positive of the layer.
     if types == vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
         || id == "VALIDATION-SETTINGS"
         || id.starts_with("WARNING-Setting-")
+        || id == "VUID-vkCmdBuildClusterAccelerationStructureIndirectNV-dstImplicitData-12303"
     {
         log::debug!("{id}: {message}");
         return vk::FALSE;
