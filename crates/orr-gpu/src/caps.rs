@@ -47,6 +47,9 @@ pub struct Caps {
     pub frame_boundary: bool,
     /// Pipeline creation logs register, shared-memory and spill counts.
     pub pipeline_executable_info: bool,
+    /// Conservative rasterisation (`VK_EXT_conservative_rasterization`) for
+    /// [`crate::RasterState::conservative`].
+    pub conservative_raster: bool,
     pub limits: Limits,
 }
 
@@ -68,6 +71,8 @@ pub struct Limits {
     pub max_image_extent_2d: u32,
     pub max_image_extent_3d: u32,
     pub max_image_layers: u32,
+    /// Colour targets one mesh pipeline can write.
+    pub max_color_targets: u32,
     /// Invocations one [`crate::CommandList::dispatch_rays`] may launch; 0 without
     /// `Caps::ray_dispatch`.
     pub max_ray_dispatch_invocations: u32,

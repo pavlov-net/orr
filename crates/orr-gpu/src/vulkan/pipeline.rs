@@ -1,15 +1,20 @@
-//! Compute pipelines in descriptor-heap mode with the root at binding (0, 0).
+//! Shader stages and compute pipelines in descriptor-heap mode with the root at binding
+//! (0, 0).
 
+use std::borrow::Cow;
 use std::ffi::CStr;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Instant;
 
 use ash::vk;
 use ash::vk::TaggedStructure as _;
 
+use super::cache::{KeyHasher, PipelineKind};
 use super::debug::name_object;
 use super::device::{Device, Shared};
 use super::garbage::Item;
+use super::spirv;
 use crate::{EntryPoint, Error, ShaderModule, SpecData, Stage};
 
 /// One shader stage of a pipeline: SPIR-V words, the entry point and specialisation data.
@@ -133,7 +138,7 @@ impl Shared {
 
 /// What a stage's create info points to: code, root mapping and specialisation entries.
 pub(super) struct StageParts<'a> {
-    code: &'a [u32],
+    code: Cow<'a, [u32]>,
     entry: &'a CStr,
     mappings: [vk::DescriptorSetAndBindingMappingEXT<'static>; 1],
     map_entries: Vec<vk::SpecializationMapEntry>,
@@ -162,8 +167,14 @@ impl<'a> StageParts<'a> {
                 s.entry.name, s.entry.stage
             )));
         }
+        let code = shared.code(s);
+        let code = if matches!(want, Stage::Task | Stage::Mesh) {
+            spirv::payload_first(code, s.entry.name.to_bytes())
+        } else {
+            Cow::Borrowed(code)
+        };
         Ok(Self {
-            code: shared.code(s),
+            code,
             entry: s.entry.name,
             mappings: [root_mapping()],
             map_entries: s
@@ -180,9 +191,21 @@ impl<'a> StageParts<'a> {
         })
     }
 
+    /// Feeds everything that shapes the compiled stage into a pipeline key.
+    pub(super) fn hash(&self, stage: vk::ShaderStageFlags, h: &mut impl Hasher) {
+        stage.as_raw().hash(h);
+        bytemuck::cast_slice::<u32, u8>(&self.code).hash(h);
+        self.entry.to_bytes().hash(h);
+        self.map_entries.len().hash(h);
+        for e in &self.map_entries {
+            (e.constant_id, e.offset, e.size).hash(h);
+        }
+        self.spec.hash(h);
+    }
+
     pub(super) fn chain(&self) -> StageChain<'_> {
         StageChain {
-            module: vk::ShaderModuleCreateInfo::default().code(self.code),
+            module: vk::ShaderModuleCreateInfo::default().code(&self.code),
             mapping: vk::ShaderDescriptorSetAndBindingMappingInfoEXT::default()
                 .mappings(&self.mappings),
             spec: vk::SpecializationInfo::default()
@@ -237,23 +260,29 @@ impl Device {
         name: &str,
     ) -> Result<ComputePipeline, Error> {
         let shared = &self.shared;
-        let start = Instant::now();
         let parts = StageParts::new(shared, s, Stage::Compute, name)?;
-        let mut chain = parts.chain();
-        let stage = chain.info(vk::ShaderStageFlags::COMPUTE);
-        let mut flags =
-            vk::PipelineCreateFlags2CreateInfo::default().flags(shared.pipeline_flags());
-        let info = vk::ComputePipelineCreateInfo::default()
-            .stage(stage)
-            .push(&mut flags);
-        // SAFETY: valid create info; the SPIR-V was validated by the shader build.
-        let raw = unsafe {
-            shared
-                .device
-                .create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
-        }
-        .map_err(|(_, e)| Error::vk("vkCreateComputePipelines")(e))?[0];
-        shared.created(raw, name, start);
+        let mut key = KeyHasher::new(PipelineKind::Compute);
+        parts.hash(vk::ShaderStageFlags::COMPUTE, &mut key);
+        let raw = shared.create_pipeline(
+            PipelineKind::Compute,
+            key.finish_key(),
+            name,
+            "vkCreateComputePipelines",
+            |chain| {
+                let mut stage = parts.chain();
+                let mut info = vk::ComputePipelineCreateInfo::default()
+                    .stage(stage.info(vk::ShaderStageFlags::COMPUTE));
+                info.p_next = chain.head();
+                // SAFETY: valid create info; the SPIR-V was validated by the shader build.
+                unsafe {
+                    shared
+                        .device
+                        .create_compute_pipelines(chain.cache, &[info], None)
+                }
+                .map(|p| p[0])
+                .map_err(|(_, e)| e)
+            },
+        )?;
         Ok(ComputePipeline {
             raw,
             workgroup: s.entry.workgroup,

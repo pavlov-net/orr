@@ -34,6 +34,9 @@ pub enum TextureMemory<'a> {
 pub struct Texture {
     pub(crate) image: vk::Image,
     memory: Option<vk::DeviceMemory>,
+    /// The view rendering writes through: mip 0, layer 0. Null without `COLOR` or `DEPTH`
+    /// usage.
+    attachment: vk::ImageView,
     desc: TextureDesc,
     shared: Arc<Shared>,
 }
@@ -41,6 +44,16 @@ pub struct Texture {
 impl Texture {
     pub fn desc(&self) -> &TextureDesc {
         &self.desc
+    }
+
+    /// The view rendering writes through; panics unless the texture has `usage`.
+    pub(crate) fn attachment(&self, usage: TextureUsage) -> vk::ImageView {
+        assert!(
+            self.desc.usage.contains(usage),
+            "a {:?} attachment needs a texture with {usage:?} usage",
+            self.desc.format
+        );
+        self.attachment
     }
 
     pub(crate) fn full_range(&self) -> vk::ImageSubresourceRange {
@@ -104,6 +117,7 @@ impl Drop for Texture {
         self.shared.defer_after_submitted(Item::Image {
             image: self.image,
             memory: self.memory,
+            view: self.attachment,
         });
     }
 }
@@ -178,6 +192,13 @@ fn check(desc: &TextureDesc) -> Result<(), Error> {
     }
     if desc.kind == TextureKind::D3 && desc.layers != 1 {
         return bad("3D textures have one layer");
+    }
+    if desc.kind == TextureKind::D3
+        && desc
+            .usage
+            .intersects(TextureUsage::COLOR | TextureUsage::DEPTH)
+    {
+        return bad("3D textures cannot be colour or depth targets");
     }
     if desc.kind == TextureKind::Cube
         && (!desc.layers.is_multiple_of(6) || desc.extent[0] != desc.extent[1])
@@ -275,12 +296,30 @@ impl Device {
             }
         };
         name_object(&shared.debug_fn, image, name);
-        Ok(Texture {
+        let mut t = Texture {
             image,
             memory: own,
+            attachment: vk::ImageView::null(),
             desc: *desc,
             shared: Arc::clone(shared),
-        })
+        };
+        if desc
+            .usage
+            .intersects(TextureUsage::COLOR | TextureUsage::DEPTH)
+        {
+            let mut info = t.view_info(&ViewDesc {
+                kind: Some(ViewKind::D2),
+                mips: 1,
+                layers: 1,
+                ..ViewDesc::default()
+            });
+            info.subresource_range.aspect_mask = aspect(desc.format);
+            // SAFETY: the image is live and bound to memory. On failure dropping `t` frees it.
+            t.attachment = unsafe { d.create_image_view(&info, None) }
+                .map_err(Error::vk("vkCreateImageView"))?;
+            name_object(&shared.debug_fn, t.attachment, name);
+        }
+        Ok(t)
     }
 
     /// Destroys `t` once `after` has completed.
@@ -289,6 +328,7 @@ impl Device {
         let item = Item::Image {
             image: t.image,
             memory: t.memory,
+            view: t.attachment,
         };
         // SAFETY: `t` is never used or dropped again; its Arc is released exactly once.
         unsafe { std::ptr::drop_in_place(&mut t.shared) };
@@ -374,9 +414,13 @@ pub(crate) fn vk_address_mode(a: AddressMode) -> vk::SamplerAddressMode {
 
 pub(crate) fn vk_compare(c: CompareOp) -> vk::CompareOp {
     match c {
+        CompareOp::Never => vk::CompareOp::NEVER,
         CompareOp::Less => vk::CompareOp::LESS,
         CompareOp::LessOrEqual => vk::CompareOp::LESS_OR_EQUAL,
+        CompareOp::Equal => vk::CompareOp::EQUAL,
+        CompareOp::NotEqual => vk::CompareOp::NOT_EQUAL,
         CompareOp::Greater => vk::CompareOp::GREATER,
         CompareOp::GreaterOrEqual => vk::CompareOp::GREATER_OR_EQUAL,
+        CompareOp::Always => vk::CompareOp::ALWAYS,
     }
 }

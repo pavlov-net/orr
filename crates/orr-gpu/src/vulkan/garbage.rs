@@ -17,6 +17,7 @@ pub(crate) enum Item {
     Image {
         image: vk::Image,
         memory: Option<vk::DeviceMemory>,
+        view: vk::ImageView,
     },
     Pipeline(vk::Pipeline),
     Accel(vk::AccelerationStructureKHR),
@@ -93,7 +94,12 @@ impl Shared {
                     d.destroy_buffer(b.buffer, None);
                     d.free_memory(b.memory, None);
                 }
-                Item::Image { image, memory } => {
+                Item::Image {
+                    image,
+                    memory,
+                    view,
+                } => {
+                    d.destroy_image_view(view, None);
                     d.destroy_image(image, None);
                     if let Some(m) = memory {
                         d.free_memory(m, None);

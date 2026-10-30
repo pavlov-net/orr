@@ -18,9 +18,10 @@ bitflags::bitflags! {
         const SAMPLED = 1 << 0;
         /// Storage views ([`crate::StorageImageIndex`]).
         const STORAGE = 1 << 1;
-        /// Colour target of a mesh pipeline.
+        /// Colour target of a mesh pipeline: rendering writes mip 0, layer 0. Not for 3D
+        /// textures.
         const COLOR = 1 << 2;
-        /// Depth target of a mesh pipeline.
+        /// Depth target of a mesh pipeline, like `COLOR`.
         const DEPTH = 1 << 3;
     }
 }
@@ -124,13 +125,17 @@ pub enum AddressMode {
     ClampToBorder,
 }
 
-/// Comparison for depth-compare samplers.
+/// A comparison, for depth tests and depth-compare samplers: `op(new, stored)`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum CompareOp {
+    Never,
     Less,
     LessOrEqual,
+    Equal,
+    NotEqual,
     Greater,
     GreaterOrEqual,
+    Always,
 }
 
 /// A sampler written into the sampler heap.

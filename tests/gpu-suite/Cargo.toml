@@ -12,6 +12,11 @@ orr-gpu.workspace = true
 orr-shaders.workspace = true
 log.workspace = true
 
+[dev-dependencies]
+blake3.workspace = true
+glam.workspace = true
+half = "2.7"
+
 [build-dependencies]
 orr-shaders = { workspace = true, features = ["build"] }
 

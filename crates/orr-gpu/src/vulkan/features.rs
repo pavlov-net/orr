@@ -39,6 +39,7 @@ pub(crate) struct Optional {
     pub frame_boundary: bool,
     pub executable_info: bool,
     pub host_image_copy: bool,
+    pub conservative_raster: bool,
 }
 
 /// Every feature struct orr reads or enables, chained through raw pointers.
@@ -158,11 +159,13 @@ fn has(list: &[vk::ExtensionProperties], name: &CStr) -> Option<u32> {
         .map(|e| e.spec_version)
 }
 
-/// Checks `physical` against orr's required set and picks the optional items it offers.
-/// The error names the first missing item.
+/// Checks `physical` against orr's required set and picks the optional items it offers,
+/// leaving out the optional extensions named in `skip`. The error names the first missing
+/// item.
 pub(crate) fn select(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
+    skip: &[&CStr],
 ) -> Result<Selection, String> {
     // SAFETY: `physical` came from this instance.
     let list = unsafe { instance.enumerate_device_extension_properties(physical) }
@@ -179,7 +182,7 @@ pub(crate) fn select(
         ));
     }
 
-    let present = |n: &CStr| has(&list, n).is_some();
+    let present = |n: &CStr| has(&list, n).is_some() && !skip.contains(&n);
     let mut opt = Optional {
         ray_dispatch: present(ash::khr::ray_tracing_pipeline::NAME)
             && present(ash::ext::ray_tracing_invocation_reorder::NAME),
@@ -201,6 +204,7 @@ pub(crate) fn select(
         frame_boundary: present(ash::ext::frame_boundary::NAME),
         executable_info: present(ash::khr::pipeline_executable_properties::NAME),
         host_image_copy: false,
+        conservative_raster: present(ash::ext::conservative_rasterization::NAME),
     };
 
     let mut q = Box::<Features>::default();
@@ -211,8 +215,12 @@ pub(crate) fn select(
     };
 
     let c = &q.core.features;
-    let required: [(&str, vk::Bool32); 39] = [
+    let required: [(&str, vk::Bool32); 42] = [
         ("shaderInt64", c.shader_int64),
+        // Slang declares the Geometry capability for SV_PrimitiveID in mesh and pixel stages.
+        ("geometryShader", c.geometry_shader),
+        ("fillModeNonSolid", c.fill_mode_non_solid),
+        ("depthBiasClamp", c.depth_bias_clamp),
         ("shaderInt16", c.shader_int16),
         ("samplerAnisotropy", c.sampler_anisotropy),
         ("pipelineStatisticsQuery", c.pipeline_statistics_query),
@@ -302,6 +310,9 @@ pub(crate) fn select(
     let mut e = Box::<Features>::default();
     e.core.features = vk::PhysicalDeviceFeatures {
         shader_int64: 1,
+        geometry_shader: 1,
+        fill_mode_non_solid: 1,
+        depth_bias_clamp: 1,
         shader_int16: 1,
         sampler_anisotropy: 1,
         pipeline_statistics_query: 1,
@@ -415,6 +426,10 @@ pub(crate) fn select(
         &[ash::khr::calibrated_timestamps::NAME],
     );
     add(opt.frame_boundary, &[ash::ext::frame_boundary::NAME]);
+    add(
+        opt.conservative_raster,
+        &[ash::ext::conservative_rasterization::NAME],
+    );
     add(
         opt.executable_info,
         &[ash::khr::pipeline_executable_properties::NAME],

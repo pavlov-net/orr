@@ -38,12 +38,17 @@ impl log::Log for StderrLog {
     fn flush(&self) {}
 }
 
+/// Logs info and above to stderr.
+pub fn log_to_stderr() {
+    let _ = log::set_logger(&StderrLog);
+    log::set_max_level(log::LevelFilter::Info);
+}
+
 /// The suite's device: every queue kind, validation on.
 pub fn device() -> &'static Device {
     static DEVICE: OnceLock<Device> = OnceLock::new();
     DEVICE.get_or_init(|| {
-        let _ = log::set_logger(&StderrLog);
-        log::set_max_level(log::LevelFilter::Info);
+        log_to_stderr();
         let desc = DeviceDesc {
             name: "gpu-suite",
             validation: true,

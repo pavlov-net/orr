@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
+use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -9,6 +10,7 @@ use ash::vk;
 use ash::vk::TaggedStructure as _;
 
 use super::accel::{EmptyTlas, build_empty_tlas};
+use super::cache::PipelineCache;
 use super::debug::{MessageCount, messenger_info, name_object};
 use super::features::{self, Selection};
 use super::garbage::{Garbage, Item, MAX_TIMELINES};
@@ -33,6 +35,12 @@ pub struct DeviceDesc<'a> {
     /// Loads the Khronos validation layer with synchronisation checks, when installed.
     /// Messages are logged and counted ([`Device::validation_messages`]).
     pub validation: bool,
+    /// The disk pipeline cache: read at creation, written by
+    /// [`Device::save_pipeline_cache`]. `None`: no disk cache.
+    pub pipeline_cache: Option<&'a Path>,
+    /// Optional extensions to leave off even when the device offers them; their `Caps`
+    /// stay false.
+    pub skip_extensions: &'a [&'a CStr],
     /// Resource-heap slots for sampled and storage image views.
     pub image_heap_slots: u32,
     pub sampler_heap_slots: u32,
@@ -44,6 +52,8 @@ impl Default for DeviceDesc<'_> {
             name: "orr",
             queues: QueueRequest::default(),
             validation: false,
+            pipeline_cache: None,
+            skip_extensions: &[],
             image_heap_slots: 262_144,
             sampler_heap_slots: 1024,
         }
@@ -60,6 +70,7 @@ pub(crate) struct Shared {
     pub device: ash::Device,
     pub heap_fn: ash::ext::descriptor_heap::Device,
     pub accel_fn: ash::khr::acceleration_structure::Device,
+    pub mesh_fn: ash::ext::mesh_shader::Device,
     pub rt_fn: Option<ash::khr::ray_tracing_pipeline::Device>,
     pub debug_fn: ash::ext::debug_utils::Device,
     pub calibrated_fn: Option<ash::khr::calibrated_timestamps::Device>,
@@ -67,6 +78,7 @@ pub(crate) struct Shared {
     messenger: (ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT),
     messages: Box<MessageCount>,
     pub caps: Caps,
+    pub pipeline_cache: PipelineCache,
     pub heap_props: vk::PhysicalDeviceDescriptorHeapPropertiesEXT<'static>,
     pub as_scratch_align: u32,
     pub memory: MemoryTypes,
@@ -118,6 +130,7 @@ impl Drop for Shared {
             for t in self.timelines.iter().flatten() {
                 self.device.destroy_semaphore(t.semaphore, None);
             }
+            self.pipeline_cache.destroy(&self.device);
             self.device.destroy_device(None);
             self.messenger
                 .0
@@ -249,7 +262,7 @@ impl Device {
                 instance.destroy_instance(None);
             }
         };
-        let picked = pick_device(&instance);
+        let picked = pick_device(&instance, desc.skip_extensions);
         let (physical, selection) = match picked {
             Ok(p) => p,
             Err(e) => {
@@ -358,6 +371,7 @@ impl Device {
             calibrated_timestamps: optional.calibrated_timestamps,
             frame_boundary: optional.frame_boundary,
             pipeline_executable_info: optional.executable_info,
+            conservative_raster: optional.conservative_raster,
             limits: Limits {
                 image_descriptor_bytes: p.image_descriptor_size as u32,
                 sampler_descriptor_bytes: p.sampler_descriptor_size as u32,
@@ -373,6 +387,7 @@ impl Device {
                 max_image_extent_2d: props.limits.max_image_dimension2_d,
                 max_image_extent_3d: props.limits.max_image_dimension3_d,
                 max_image_layers: props.limits.max_image_array_layers,
+                max_color_targets: props.limits.max_color_attachments,
                 max_ray_dispatch_invocations: rt_props.max_ray_dispatch_invocation_count,
                 device_local_bytes: memory.heap_size(MemoryKind::DeviceLocal),
                 upload_bytes: memory.heap_size(MemoryKind::Upload),
@@ -408,9 +423,12 @@ impl Device {
             });
         }
 
+        let pipeline_cache =
+            PipelineCache::open(&instance, &device, physical, &caps, desc.pipeline_cache);
         let shared = Arc::new(Shared {
             heap_fn: ash::ext::descriptor_heap::Device::load(&instance, &device),
             accel_fn: ash::khr::acceleration_structure::Device::load(&instance, &device),
+            mesh_fn: ash::ext::mesh_shader::Device::load(&instance, &device),
             rt_fn: optional
                 .ray_dispatch
                 .then(|| ash::khr::ray_tracing_pipeline::Device::load(&instance, &device)),
@@ -424,6 +442,7 @@ impl Device {
             messenger: (debug_instance, messenger),
             messages,
             caps,
+            pipeline_cache,
             heap_props,
             as_scratch_align: as_props.min_acceleration_structure_scratch_offset_alignment,
             memory,
@@ -576,7 +595,10 @@ fn create_instance(
     unsafe { entry.create_instance(&info, None) }.map_err(Error::vk("vkCreateInstance"))
 }
 
-fn pick_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, Selection), Error> {
+fn pick_device(
+    instance: &ash::Instance,
+    skip: &[&CStr],
+) -> Result<(vk::PhysicalDevice, Selection), Error> {
     // SAFETY: plain query.
     let mut devices = unsafe { instance.enumerate_physical_devices() }
         .map_err(Error::vk("vkEnumeratePhysicalDevices"))?;
@@ -586,7 +608,7 @@ fn pick_device(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, Selectio
     devices.sort_by_key(|&p| props(p).device_type != vk::PhysicalDeviceType::DISCRETE_GPU);
     let mut first_failure = None;
     for p in devices {
-        match features::select(instance, p) {
+        match features::select(instance, p, skip) {
             Ok(selection) => return Ok((p, selection)),
             Err(missing) => {
                 first_failure.get_or_insert_with(|| {
