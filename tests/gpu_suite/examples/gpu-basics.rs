@@ -2,8 +2,10 @@
 //! texture and a mesh pass that draws a textured, depth-tested cube sampling it.
 //!
 //! Runs headless for a fixed number of frames and writes the last one as a binary PPM:
-//! `gpu-basics [frames] [out.ppm]` (default 120 frames, `gpu-basics.ppm`).
+//! `gpu-basics [frames] [out.ppm]` (default 120 frames, `gpu-basics.ppm` beside the
+//! executable).
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use glam::camera::rh::{proj, view};
@@ -57,7 +59,13 @@ fn rows(m: Mat4) -> [[f32; 4]; 4] {
 fn main() {
     let mut args = std::env::args().skip(1);
     let frames: u64 = args.next().map_or(120, |a| a.parse().expect("frame count"));
-    let out_path = args.next().unwrap_or_else(|| "gpu-basics.ppm".into());
+    let out_path = args.next().map_or_else(
+        || {
+            let exe = std::env::current_exe().expect("executable path");
+            exe.with_file_name("gpu-basics.ppm")
+        },
+        PathBuf::from,
+    );
 
     let d = device();
     let queue = render();
@@ -227,7 +235,8 @@ fn main() {
     }
     std::fs::write(&out_path, ppm).unwrap();
     println!(
-        "{frames} frames; last frame written to {out_path}; validation messages: {}",
+        "{frames} frames; last frame written to {}; validation messages: {}",
+        out_path.display(),
         d.validation_messages()
     );
     assert_eq!(
