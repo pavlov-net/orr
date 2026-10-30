@@ -12,6 +12,9 @@ fn main() {
         b.kernels(&src)
             .roots(&scene)
             .extern_type("Gt7Curve", "crate::Gt7Curve")
+            .extern_type("ViewConstants", "::orr_scene::ViewConstants")
+            .extern_type("ExposureState", "::orr_scene::ExposureState")
+            .extern_type("SkyStats", "::orr_scene::SkyStats")
             .compile()
     });
     match out {

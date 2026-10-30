@@ -7,6 +7,7 @@ mod encode;
 mod exposure;
 mod gt7;
 mod passes;
+mod view;
 
 mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
@@ -19,11 +20,14 @@ pub use display::{
 pub use display_watch::DisplayWatch;
 pub use encode::{pq_decode, pq_encode, srgb_decode, srgb_encode};
 pub use exposure::{
-    MID_GREY, ev100_from_exposure, ev100_from_luminance, exposure_from_ev100, luminance_from_ev100,
+    AutoExposure, CompensationCurve, Exposure, ExposureTelemetry, Grade, MID_GREY, MeterWeights,
+    Physiological, SkyTelemetry, ev100_from_exposure, ev100_from_luminance, exposure_from_ev100,
+    keyed_ev100, luminance_from_ev100,
 };
 pub use gt7::{GT7_REFERENCE_NITS, GT7_SDR_NITS, Gt7Curve, Gt7Params};
 pub use orr_scene::orr_gpu::{HdrMetadata, OutputFormat, PresentMode};
-pub use passes::{ComposePass, OutputKernels, OutputRoots, TonemapPass};
+pub use passes::{ComposePass, ExposurePass, OutputKernels, OutputRoots, OutputView, TonemapPass};
+pub use view::{OutputDebug, ViewOutput};
 
 /// Errors from orr-output.
 #[derive(Debug, thiserror::Error)]

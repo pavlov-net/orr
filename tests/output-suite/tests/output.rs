@@ -4,17 +4,19 @@
 use half::f16;
 use orr_output::{
     ComposePass, DisplayInfo, DisplayRequest, Gt7Curve, Gt7Params, OutputFormat, OutputKernels,
-    OutputRoots, ResolvedDisplay, TonemapPass, exposure_from_ev100, pq_decode, pq_encode,
-    srgb_decode,
+    OutputRoots, ResolvedDisplay, TonemapPass, ViewOutput, exposure_from_ev100, pq_decode,
+    pq_encode, srgb_decode,
 };
 use orr_scene::orr_gpu::{
     Format, Hazards, MemoryKind, QueueKind, Stages, TextureDesc, TextureMemory, TextureRegion,
     TextureUsage, ViewDesc,
 };
 use orr_scene::testing::{assert_clean, device, read_texture, wait};
+use orr_scene::{ExposureState, ViewConstants};
 use output_maths::{encode_display, gt7_display_linear};
 
 const WIDTH: u32 = 1024;
+const EV100: f32 = 12.0;
 
 /// Linear Rec.2020 hues, one per row: grey, the Rec.2020 primaries and secondaries, the
 /// Rec.709 red and a warm tone.
@@ -50,8 +52,7 @@ fn run(display: &ResolvedDisplay, format: Format) -> Vec<u8> {
     let gpu = device();
     let height = HUES.len() as u32;
     // Lit two stops brighter than the manual exposure, so tonemap scales by a quarter.
-    let exposure = exposure_from_ev100(12.0);
-    let pre_exposure = 4.0 * exposure;
+    let pre_exposure = 4.0 * exposure_from_ev100(EV100);
     let radiance: Vec<[f32; 4]> = ramp()
         .iter()
         .map(|c| [c[0] * 4.0, c[1] * 4.0, c[2] * 4.0, 1.0])
@@ -81,9 +82,30 @@ fn run(display: &ResolvedDisplay, format: Format) -> Vec<u8> {
         .unwrap();
     upload.as_mut_slice().unwrap().copy_from_slice(&radiance);
 
+    // The view's current slot holds the pre-exposure and the next one the adapted exposure,
+    // as adapt leaves them.
+    let mut exposure = gpu
+        .gpu_malloc::<ExposureState>(MemoryKind::Upload, 2, "exposure slots")
+        .unwrap();
+    exposure.as_mut_slice().unwrap().copy_from_slice(&[
+        ExposureState {
+            pre_exposure,
+            ..ExposureState::default()
+        },
+        ExposureState {
+            adapted_ev100: EV100,
+            ..ExposureState::default()
+        },
+    ]);
+    let mut constants = gpu
+        .gpu_malloc::<ViewConstants>(MemoryKind::Upload, 1, "view constants")
+        .unwrap();
+    let mut view: ViewConstants = bytemuck::Zeroable::zeroed();
+    view.exposure = exposure.gpu;
+    constants.as_mut_slice().unwrap()[0] = view;
+
     let kernels = OutputKernels::new(gpu).unwrap();
     let mut roots = OutputRoots::new(gpu).unwrap();
-    let gt7 = Gt7Params::default();
     let extent = [WIDTH, height];
     let queue = gpu.queue(QueueKind::Render).unwrap();
     let mut list = queue.command_list().unwrap();
@@ -100,9 +122,9 @@ fn run(display: &ResolvedDisplay, format: Format) -> Vec<u8> {
             source: source_index,
             target: linear_store,
             extent,
-            exposure: exposure / pre_exposure,
-            gt7: &gt7,
+            view: constants.gpu,
             display,
+            output: &ViewOutput::default(),
         },
     );
     list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
