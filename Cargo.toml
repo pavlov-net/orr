@@ -12,7 +12,9 @@ repository = "https://github.com/pavlov-net/orr"
 
 [workspace.dependencies]
 orr = { path = "crates/orr" }
+orr-atmosphere = { path = "crates/orr-atmosphere" }
 orr-gpu = { path = "crates/orr-gpu" }
+orr-lighting = { path = "crates/orr-lighting" }
 orr-pack = { path = "crates/orr-pack" }
 orr-scene = { path = "crates/orr-scene" }
 orr-shaders = { path = "crates/orr-shaders" }
@@ -58,4 +60,8 @@ opt-level = 3
 
 # The OpenPBR harness samples millions of directions in tests.
 [profile.dev.package.openpbr-ref]
+opt-level = 3
+
+# The real-time BSDF runs through the same harness.
+[profile.dev.package.lighting-maths]
 opt-level = 3
