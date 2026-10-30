@@ -12,10 +12,10 @@ use super::mesh::{MeshPipeline, Rendering};
 use super::pipeline::ComputePipeline;
 use super::queue::{ListResources, MAX_PASSES, Queue};
 use super::ray::RayDispatchPipeline;
-use super::texture::Texture;
+use super::texture::{Texture, vk_extent, vk_offset};
 use crate::{
-    ClearColor, ColorLoad, DepthLoad, Error, GpuAddress, GpuPtr, Hazards, Stages, TextureRegion,
-    TextureUsage,
+    Caps, ClearColor, ColorLoad, DepthLoad, Error, GpuAddress, GpuPtr, Hazards, Stages,
+    TextureRegion, TextureUsage,
 };
 
 /// `vkCmdDispatchIndirect` arguments: workgroup counts.
@@ -35,6 +35,16 @@ pub struct MeshArgs {
     pub x: u32,
     pub y: u32,
     pub z: u32,
+}
+
+/// One GDeflate region for [`CommandList::decompress`]: device addresses and byte counts.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct DecompressRegion {
+    pub src: u64,
+    pub dst: u64,
+    pub compressed_bytes: u64,
+    pub decompressed_bytes: u64,
 }
 
 pub(crate) struct PassRecord {
@@ -178,12 +188,13 @@ impl<'q> CommandList<'q> {
         }
     }
 
-    /// Makes writes in `before` stages visible to `after` stages. [`Stages::RAY`] is
-    /// ignored without `Caps::ray_dispatch`, since no ray-dispatch work can run then.
+    /// Makes writes in `before` stages visible to `after` stages. [`Stages::RAY`] and
+    /// [`Stages::DECOMPRESS`] are ignored without their `Caps`, since no such work can run
+    /// then.
     pub fn barrier(&mut self, before: Stages, after: Stages, hazards: Hazards) {
-        let ray = self.queue.shared.caps.ray_dispatch;
-        let mut src = vk_stages(before, ray);
-        let mut dst = vk_stages(after, ray);
+        let caps = &self.queue.shared.caps;
+        let mut src = vk_stages(before, caps);
+        let mut dst = vk_stages(after, caps);
         let mut src_access = vk::AccessFlags2::MEMORY_WRITE;
         let mut dst_access = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
         if hazards.contains(Hazards::DRAW_ARGUMENTS) {
@@ -508,33 +519,58 @@ impl<'q> CommandList<'q> {
         unsafe { self.device().cmd_copy_buffer2(self.cmd(), &info) };
     }
 
+    /// `row_texels`: texels from one buffer row to the next; 0 packs rows tightly.
     fn texture_copy(
         &self,
         t: &Texture,
         region: &TextureRegion,
         buffer: GpuPtr<u8>,
+        row_texels: u32,
     ) -> (vk::Buffer, vk::BufferImageCopy2<'static>) {
-        let bytes = region.bytes(t.desc().format);
-        let (b, offset) = self.queue.shared.locate(buffer.address(), bytes);
+        let format = t.desc().format;
+        let block = format.block_extent();
+        assert!(
+            row_texels == 0 || (row_texels >= region.extent[0] && row_texels.is_multiple_of(block)),
+            "rows of {row_texels} texels for a region {} texels wide in {format:?}",
+            region.extent[0]
+        );
+        let rows = TextureRegion {
+            extent: [
+                row_texels.max(region.extent[0]),
+                region.extent[1],
+                region.extent[2],
+            ],
+            ..*region
+        };
+        let (b, offset) = self
+            .queue
+            .shared
+            .locate(buffer.address(), rows.bytes(format));
         let copy = vk::BufferImageCopy2::default()
             .buffer_offset(offset)
+            .buffer_row_length(row_texels)
             .image_subresource(t.layers(region))
-            .image_offset(vk::Offset3D {
-                x: region.offset[0] as i32,
-                y: region.offset[1] as i32,
-                z: region.offset[2] as i32,
-            })
-            .image_extent(vk::Extent3D {
-                width: region.extent[0],
-                height: region.extent[1],
-                depth: region.extent[2],
-            });
+            .image_offset(vk_offset(region))
+            .image_extent(vk_extent(region));
         (b, copy)
     }
 
     /// Copies tightly packed texels from `src` into `region` of `dst`.
     pub fn copy_to_texture(&mut self, dst: &Texture, region: &TextureRegion, src: GpuPtr<u8>) {
-        let (buffer, copy) = self.texture_copy(dst, region, src);
+        self.copy_rows_to_texture(dst, region, src, 0);
+    }
+
+    /// Copies texels from `src`, whose rows start `row_texels` texels apart (a multiple of the
+    /// format's block width, at least the region's width), into `region` of `dst`: an edge
+    /// tile of a cooked texture, whose rows keep the full tile width.
+    pub fn copy_rows_to_texture(
+        &mut self,
+        dst: &Texture,
+        region: &TextureRegion,
+        src: GpuPtr<u8>,
+        row_texels: u32,
+    ) {
+        let (buffer, copy) = self.texture_copy(dst, region, src, row_texels);
         let regions = [copy];
         let info = vk::CopyBufferToImageInfo2::default()
             .src_buffer(buffer)
@@ -547,7 +583,7 @@ impl<'q> CommandList<'q> {
 
     /// Copies `region` of `src` into `dst`, tightly packed.
     pub fn copy_from_texture(&mut self, dst: GpuPtr<u8>, src: &Texture, region: &TextureRegion) {
-        let (buffer, copy) = self.texture_copy(src, region, dst);
+        let (buffer, copy) = self.texture_copy(src, region, dst, 0);
         let regions = [copy];
         let info = vk::CopyImageToBufferInfo2::default()
             .src_image(src.image)
@@ -556,6 +592,68 @@ impl<'q> CommandList<'q> {
             .regions(&regions);
         // SAFETY: recording; the texture is in GENERAL.
         unsafe { self.device().cmd_copy_image_to_buffer2(self.cmd(), &info) };
+    }
+
+    /// Decompresses up to `max_count` GDeflate 1.0 regions listed at `regions`, as many as
+    /// the GPU-written `count` says. Each region decompresses to at most 65,536 bytes; its
+    /// addresses are multiples of 4. Later reads of the output wait on a barrier from
+    /// [`Stages::DECOMPRESS`]. Needs `Caps::memory_decompression` and a graphics or compute
+    /// queue.
+    pub fn decompress(
+        &mut self,
+        regions: GpuPtr<DecompressRegion>,
+        count: GpuPtr<u32>,
+        max_count: u32,
+    ) {
+        let f = self
+            .queue
+            .shared
+            .decompress_fn
+            .as_ref()
+            .expect("decompression needs Caps::memory_decompression");
+        assert!(
+            self.queue.shaders,
+            "decompression runs on a graphics or compute queue"
+        );
+        let limit = self.queue.shared.caps.limits.max_decompress_regions;
+        assert!(
+            max_count <= limit,
+            "{max_count} decompression regions, more than the device's {limit}"
+        );
+        // SAFETY: recording on a graphics or compute queue with the extension enabled; the
+        // addresses are the caller's live allocations.
+        unsafe {
+            (f.fp().cmd_decompress_memory_indirect_count_ext)(
+                self.cmd(),
+                vk::MemoryDecompressionMethodFlagsEXT::GDEFLATE_1_0,
+                regions.address().0,
+                count.address().0,
+                max_count,
+                size_of::<DecompressRegion>() as u32,
+            );
+        }
+    }
+
+    /// Occupancy priority (0 lowest, 0.5 the default, 1 highest) and throttling (0 none, 1
+    /// the most) of the dispatches recorded after it in this list, against work running
+    /// beside them on other queues. Does nothing without `Caps::occupancy_priority`.
+    pub fn set_occupancy(&mut self, priority: f32, throttling: f32) {
+        assert!(
+            (0.0..=1.0).contains(&priority) && (0.0..=1.0).contains(&throttling),
+            "occupancy priority {priority} and throttling {throttling} outside 0..=1"
+        );
+        let Some(f) = &self.queue.shared.occupancy_fn else {
+            return;
+        };
+        assert!(
+            self.queue.shaders,
+            "occupancy priority needs a compute queue"
+        );
+        let params = vk::ComputeOccupancyPriorityParametersNV::default()
+            .occupancy_priority(priority)
+            .occupancy_throttling(throttling);
+        // SAFETY: recording on a compute queue with the extension enabled.
+        unsafe { (f.fp().cmd_set_compute_occupancy_priority_nv)(self.cmd(), &params) };
     }
 
     /// Opens a named pass: a debug label and GPU timestamps, and with `stats` shader
@@ -647,7 +745,7 @@ fn store_op(store: bool) -> vk::AttachmentStoreOp {
     }
 }
 
-fn vk_stages(s: Stages, ray: bool) -> vk::PipelineStageFlags2 {
+fn vk_stages(s: Stages, caps: &Caps) -> vk::PipelineStageFlags2 {
     use vk::PipelineStageFlags2 as P;
     if s.contains(Stages::ALL) {
         // ALL_COMMANDS covers every queue command but not host access.
@@ -666,7 +764,7 @@ fn vk_stages(s: Stages, ray: bool) -> vk::PipelineStageFlags2 {
         (Stages::PIXEL, P::FRAGMENT_SHADER),
         (
             Stages::RAY,
-            if ray {
+            if caps.ray_dispatch {
                 P::RAY_TRACING_SHADER_KHR
             } else {
                 P::NONE
@@ -679,6 +777,14 @@ fn vk_stages(s: Stages, ray: bool) -> vk::PipelineStageFlags2 {
         ),
         (Stages::AS_BUILD, P::ACCELERATION_STRUCTURE_BUILD_KHR),
         (Stages::HOST, P::HOST),
+        (
+            Stages::DECOMPRESS,
+            if caps.memory_decompression {
+                P::MEMORY_DECOMPRESSION_EXT
+            } else {
+                P::NONE
+            },
+        ),
     ] {
         if s.contains(flag) {
             out |= stages;

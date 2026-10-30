@@ -11,10 +11,14 @@ pub struct Caps {
     /// Host-visible device-local memory covers VRAM, so [`crate::MemoryKind::Upload`] is not
     /// limited to the small BAR window.
     pub rebar: bool,
-    /// Host image copy (`hostImageCopy`).
+    /// Host image copy into [`crate::TextureUsage::HOST_COPY`] textures (`hostImageCopy`).
+    /// Only with `rebar`: host-copy textures take Upload memory.
     pub host_image_copy: bool,
-    /// GDeflate 1.0 memory decompression.
+    /// GDeflate 1.0 memory decompression ([`crate::CommandList::decompress`]).
     pub memory_decompression: bool,
+    /// [`crate::CommandList::set_occupancy`] sets the occupancy priority of dispatches
+    /// (`VK_NV_compute_occupancy_priority`); without it the call does nothing.
+    pub occupancy_priority: bool,
     /// Ray-dispatch pipelines (`VK_KHR_ray_tracing_pipeline` with invocation reordering):
     /// [`crate::Device::create_ray_dispatch_pipeline`] and
     /// [`crate::CommandList::dispatch_rays`].
@@ -109,6 +113,9 @@ pub struct Limits {
     pub device_local_bytes: u64,
     /// Size of the heap behind [`crate::MemoryKind::Upload`].
     pub upload_bytes: u64,
+    /// Regions one [`crate::CommandList::decompress`] may list; 0 without
+    /// `Caps::memory_decompression`.
+    pub max_decompress_regions: u32,
 }
 
 /// A component type of a cooperative-vector operation.
