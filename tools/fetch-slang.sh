@@ -8,6 +8,12 @@
 #                    solar spectrum, ozone cross sections and CIE 1931 2-deg tables
 #   display/gt7/     Polyphony Digital's GT7 tone-mapping sample (MIT), checked against its
 #                    sha256
+# With ORR_VALIDATION_DATA=1 it also fetches the test-only validation data:
+#   sky/pragueskymodel/
+#                    PetrVevoda/pragueskymodel at a pinned commit (its solar radiance table)
+#   sky/prague/PragueSkyModelGround.dat
+#                    the Prague sky model's ground-level dataset (103 MB), checked against its
+#                    sha256
 # Build scripts never download; run this once after cloning and after a pin changes.
 #
 # SLANG_ASSET=glibc-2.28 selects the Linux build for glibc older than 2.34.
@@ -20,6 +26,9 @@ openpbr_commit=c91aad1d1ce1693e803f039d7c92c2965c4eb013
 glm_commit=0af55ccecd98d4e5a8d1fad7de25ba429d60e863
 sky_commit=34f14e745cff948f4ca3157d1b62a445ffa7286f
 gt7_sum=94df7e7e310b9423ebb5aaaa29416f376ebbae66e0948fb259f8688314b29822
+prague_commit=2385c912e9051c1258013ff8c3ce2e19e10fb917
+prague_ground_id=1IflyFZTJxC_N298yXq_2GK4ycIsVJZk6
+prague_ground_sum=76bd619dc6dfcbc900c2996436dd6cf68197c03e3982fe5580f2b109ce1c71c2
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 tools="${ORR_TOOLS:-$root/.tools}"
@@ -94,4 +103,18 @@ else
   echo "$gt7_sum  $gt7.part" | sha256sum -c --quiet -
   mv "$gt7.part" "$gt7"
   echo "gt7 sample in $gt7"
+fi
+
+if [ "${ORR_VALIDATION_DATA:-0}" = 1 ]; then
+  fetch_commit https://github.com/PetrVevoda/pragueskymodel "$prague_commit" "$tools/sky/pragueskymodel"
+  ground="$tools/sky/prague/PragueSkyModelGround.dat"
+  if echo "$prague_ground_sum  $ground" | sha256sum -c --quiet - 2>/dev/null; then
+    echo "prague ground dataset already in $ground"
+  else
+    mkdir -p "$(dirname "$ground")"
+    curl -fsSL --retry 3 -o "$ground.part"       "https://drive.usercontent.google.com/download?id=$prague_ground_id&export=download&confirm=t"
+    echo "$prague_ground_sum  $ground.part" | sha256sum -c --quiet -
+    mv "$ground.part" "$ground"
+    echo "prague ground dataset in $ground"
+  fi
 fi
