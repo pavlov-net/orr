@@ -434,11 +434,17 @@ impl Queue {
                 .queue_submit2(self.raw, &[submit], vk::Fence::null())
         };
         if let Err(e) = result {
+            drop(after_bind);
             self.release(finished);
-            return Err(Error::vk("vkQueueSubmit2")(e));
+            return Err(self.shared.vk_error("vkQueueSubmit2", e));
         }
         timeline.submitted.store(value, Ordering::Release);
         *after_bind = false;
+        let passes = finished
+            .iter()
+            .flat_map(|f| f.passes.iter().map(|p| (p.id, p.name)))
+            .collect();
+        self.shared.record_submit(self.kind, value, passes);
         let after = self.shared.after_point(self.point(value));
         let mut pools = self.pools.lock().unwrap();
         for f in finished {
@@ -503,7 +509,7 @@ impl Queue {
                 .device
                 .queue_bind_sparse(self.raw, &[info], vk::Fence::null())
         }
-        .map_err(Error::vk("vkQueueBindSparse"))?;
+        .map_err(|e| self.shared.vk_error("vkQueueBindSparse", e))?;
         timeline.submitted.store(value, Ordering::Release);
         *after_bind = true;
         Ok(self.point(value))
@@ -526,7 +532,7 @@ impl Queue {
                 .device
                 .queue_submit2(self.raw, &[submit], vk::Fence::null())
         }
-        .map_err(Error::vk("vkQueueSubmit2"))
+        .map_err(|e| self.shared.vk_error("vkQueueSubmit2", e))
     }
 
     /// The last completed value of this queue's timeline.
@@ -707,7 +713,7 @@ impl Shared {
             self.device
                 .wait_semaphores(&info, timeout.as_nanos().min(u128::from(u64::MAX)) as u64)
         }
-        .map_err(Error::vk("vkWaitSemaphores"))
+        .map_err(|e| self.vk_error("vkWaitSemaphores", e))
     }
 
     /// A calibration whose tick arithmetic wraps at `mask`, the caller's valid timestamp bits.

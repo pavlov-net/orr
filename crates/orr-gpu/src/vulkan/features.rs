@@ -5,6 +5,7 @@ use std::ffi::{CStr, c_void};
 
 use ash::vk;
 
+use super::diagnostics::Diagnostics;
 use crate::Error;
 
 const REQUIRED_EXTENSIONS: &[&CStr] = &[
@@ -35,6 +36,17 @@ pub(crate) const SURFACE_INSTANCE_EXTENSIONS: &[&CStr] = &[
     ash::ext::swapchain_colorspace::NAME,
 ];
 
+/// Optional extensions Nsight Graphics captures do not support; [`Diagnostics::Capture`]
+/// leaves them off.
+const CAPTURE_UNSUPPORTED: &[&CStr] = &[
+    ash::khr::device_address_commands::NAME,
+    ash::khr::device_fault::NAME,
+    ash::khr::opacity_micromap::NAME,
+    ash::khr::pipeline_binary::NAME,
+    ash::khr::shader_abort::NAME,
+    ash::khr::shader_constant_data::NAME,
+];
+
 /// Spec version of `VK_NV_cluster_acceleration_structure` with OMM in clusters.
 const CLUSTER_SPEC_VERSION: u32 = 4;
 
@@ -57,6 +69,16 @@ pub(crate) struct Optional {
     pub host_image_copy: bool,
     pub conservative_raster: bool,
     pub ray_tracing_validation: bool,
+    /// `VK_NV_device_diagnostic_checkpoints`.
+    pub checkpoints: bool,
+    /// `VK_NV_device_diagnostics_config`, configured for Aftermath.
+    pub aftermath: bool,
+    /// `VK_AMD_buffer_marker`, for the breadcrumb buffer.
+    pub buffer_marker: bool,
+    /// `VK_KHR_device_fault`.
+    pub device_fault: bool,
+    /// `VK_EXT_device_fault`, where the KHR extension is off.
+    pub device_fault_ext: bool,
     /// The device presents: swapchain and swapchain_maintenance1 are enabled.
     pub surface: bool,
     pub present_wait: bool,
@@ -91,6 +113,7 @@ pub(crate) struct Features {
     pub address_commands: vk::PhysicalDeviceDeviceAddressCommandsFeaturesKHR<'static>,
     pub unified: vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR<'static>,
     pub abort: vk::PhysicalDeviceShaderAbortFeaturesKHR<'static>,
+    pub constant_data: vk::PhysicalDeviceShaderConstantDataFeaturesKHR<'static>,
     pub binary: vk::PhysicalDevicePipelineBinaryFeaturesKHR<'static>,
     pub coop: vk::PhysicalDeviceCooperativeVectorFeaturesNV<'static>,
     pub replicated: vk::PhysicalDeviceShaderReplicatedCompositesFeaturesEXT<'static>,
@@ -104,12 +127,17 @@ pub(crate) struct Features {
     pub present_wait2: vk::PhysicalDevicePresentWait2FeaturesKHR<'static>,
     pub present_metering: vk::PhysicalDevicePresentMeteringFeaturesNV<'static>,
     pub present_timing: vk::PhysicalDevicePresentTimingFeaturesEXT<'static>,
+    pub fault: vk::PhysicalDeviceFaultFeaturesKHR<'static>,
+    pub fault_ext: vk::PhysicalDeviceFaultFeaturesEXT<'static>,
+    /// Device creation only.
+    pub diagnostics_config: vk::DeviceDiagnosticsConfigCreateInfoNV<'static>,
 }
 
 impl Features {
-    /// Links the structs the device supports into one chain headed by `core`. The chain
-    /// points into `self`, so `self` must not move while it is in use.
-    fn link(&mut self, opt: &Optional) {
+    /// Links the structs the device supports into one chain headed by `core`; `create` adds
+    /// the device-creation-only structs. The chain points into `self`, so `self` must not
+    /// move while it is in use.
+    fn link(&mut self, opt: &Optional, create: bool) {
         let mut chain: Vec<*mut vk::BaseOutStructure<'static>> = Vec::new();
         fn ptr<T>(s: &mut T) -> *mut vk::BaseOutStructure<'static> {
             std::ptr::from_mut(s).cast()
@@ -144,6 +172,7 @@ impl Features {
         }
         if opt.shader_abort {
             chain.push(ptr(&mut self.abort));
+            chain.push(ptr(&mut self.constant_data));
         }
         if opt.pipeline_binary {
             chain.push(ptr(&mut self.binary));
@@ -180,6 +209,15 @@ impl Features {
         if opt.present_timing {
             chain.push(ptr(&mut self.present_timing));
         }
+        if opt.device_fault {
+            chain.push(ptr(&mut self.fault));
+        }
+        if opt.device_fault_ext {
+            chain.push(ptr(&mut self.fault_ext));
+        }
+        if create && opt.aftermath {
+            chain.push(ptr(&mut self.diagnostics_config));
+        }
         for pair in chain.windows(2) {
             // SAFETY: every pointer is a live field of `self` whose header is a
             // `VkBaseOutStructure`.
@@ -210,12 +248,14 @@ fn has(list: &[vk::ExtensionProperties], name: &CStr) -> Option<u32> {
 
 /// Checks `physical` against orr's required set and picks the optional items it offers,
 /// leaving out the optional extensions named in `skip`. `surface` adds the extensions and
-/// features presenting needs. The error names the first missing item.
+/// features presenting needs; `diagnostics` the ones its mode uses. The error names the
+/// first missing item.
 pub(crate) fn select(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
     skip: &[&CStr],
     surface: bool,
+    diagnostics: Diagnostics<'_>,
 ) -> Result<Selection, String> {
     // SAFETY: `physical` came from this instance.
     let list = unsafe { instance.enumerate_device_extension_properties(physical) }
@@ -233,7 +273,18 @@ pub(crate) fn select(
         ));
     }
 
-    let present = |n: &CStr| has(&list, n).is_some() && !skip.contains(&n);
+    let capture = matches!(diagnostics, Diagnostics::Capture);
+    let aftermath = matches!(diagnostics, Diagnostics::Aftermath { .. });
+    let breadcrumbs = matches!(
+        diagnostics,
+        Diagnostics::Checkpoints | Diagnostics::Aftermath { .. }
+    );
+    let present = |n: &CStr| {
+        has(&list, n).is_some()
+            && !skip.contains(&n)
+            && !(capture && CAPTURE_UNSUPPORTED.contains(&n))
+    };
+    let device_fault = present(ash::khr::device_fault::NAME);
     let mut opt = Optional {
         ray_dispatch: present(ash::khr::ray_tracing_pipeline::NAME)
             && present(ash::ext::ray_tracing_invocation_reorder::NAME),
@@ -244,7 +295,7 @@ pub(crate) fn select(
         // shader_abort requires device_fault and shader_constant_data enabled with it.
         shader_abort: cfg!(debug_assertions)
             && present(ash::khr::shader_abort::NAME)
-            && present(ash::khr::device_fault::NAME)
+            && device_fault
             && present(ash::khr::shader_constant_data::NAME),
         pipeline_binary: present(ash::khr::pipeline_binary::NAME),
         cooperative_vector: present(ash::nv::cooperative_vector::NAME)
@@ -256,7 +307,17 @@ pub(crate) fn select(
         executable_info: present(ash::khr::pipeline_executable_properties::NAME),
         host_image_copy: false,
         conservative_raster: present(ash::ext::conservative_rasterization::NAME),
-        ray_tracing_validation: cfg!(debug_assertions) && present(RAY_TRACING_VALIDATION),
+        // Aftermath hides the extension.
+        ray_tracing_validation: cfg!(debug_assertions)
+            && !aftermath
+            && present(RAY_TRACING_VALIDATION),
+        checkpoints: breadcrumbs && present(ash::nv::device_diagnostic_checkpoints::NAME),
+        aftermath: aftermath
+            && present(ash::nv::device_diagnostic_checkpoints::NAME)
+            && present(ash::nv::device_diagnostics_config::NAME),
+        buffer_marker: breadcrumbs && present(ash::amd::buffer_marker::NAME),
+        device_fault,
+        device_fault_ext: !device_fault && present(ash::ext::device_fault::NAME),
         surface,
         present_wait: surface
             && present(ash::khr::present_id2::NAME)
@@ -271,7 +332,7 @@ pub(crate) fn select(
     };
 
     let mut q = Box::<Features>::default();
-    q.link(&opt);
+    q.link(&opt, false);
     // SAFETY: the chain holds only structs of extensions the device lists.
     unsafe {
         instance.get_physical_device_features2(physical, &mut *std::ptr::from_mut(&mut q.core));
@@ -363,7 +424,7 @@ pub(crate) fn select(
     // OMM builds take micromap addresses, which need device address commands.
     opt.omm &= q.omm.micromap != 0 && opt.device_address_commands;
     opt.unified_image_layouts &= q.unified.unified_image_layouts != 0;
-    opt.shader_abort &= q.abort.shader_abort != 0;
+    opt.shader_abort &= q.abort.shader_abort != 0 && q.constant_data.shader_constant_data != 0;
     opt.pipeline_binary &= q.binary.pipeline_binaries != 0;
     opt.cooperative_vector &=
         q.coop.cooperative_vector != 0 && q.replicated.shader_replicated_composites != 0;
@@ -378,6 +439,9 @@ pub(crate) fn select(
     opt.low_latency &= opt.present_wait;
     opt.present_metering &= q.present_metering.present_metering != 0;
     opt.present_timing &= q.present_timing.present_timing != 0;
+    opt.device_fault &= q.fault.device_fault != 0;
+    opt.shader_abort &= opt.device_fault;
+    opt.device_fault_ext &= q.fault_ext.device_fault != 0;
 
     let mut e = Box::<Features>::default();
     e.core.features = vk::PhysicalDeviceFeatures {
@@ -440,6 +504,7 @@ pub(crate) fn select(
     e.address_commands.device_address_commands = 1;
     e.unified.unified_image_layouts = 1;
     e.abort.shader_abort = 1;
+    e.constant_data.shader_constant_data = 1;
     e.binary.pipeline_binaries = 1;
     e.coop.cooperative_vector = 1;
     e.replicated.shader_replicated_composites = 1;
@@ -453,7 +518,13 @@ pub(crate) fn select(
     e.present_wait2.present_wait2 = 1;
     e.present_metering.present_metering = 1;
     e.present_timing.present_timing = 1;
-    e.link(&opt);
+    e.fault.device_fault = 1;
+    e.fault_ext.device_fault = 1;
+    e.diagnostics_config.flags = vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_SHADER_DEBUG_INFO
+        | vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_RESOURCE_TRACKING
+        | vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_AUTOMATIC_CHECKPOINTS
+        | vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_SHADER_ERROR_REPORTING;
+    e.link(&opt, true);
 
     let mut extensions = REQUIRED_EXTENSIONS.to_vec();
     extensions.extend_from_slice(surface_names);
@@ -479,14 +550,21 @@ pub(crate) fn select(
         &[ash::khr::unified_image_layouts::NAME],
     );
     add(opt.memory_budget, &[ash::ext::memory_budget::NAME]);
+    add(opt.device_fault, &[ash::khr::device_fault::NAME]);
+    add(opt.device_fault_ext, &[ash::ext::device_fault::NAME]);
     add(
         opt.shader_abort,
         &[
             ash::khr::shader_abort::NAME,
-            ash::khr::device_fault::NAME,
             ash::khr::shader_constant_data::NAME,
         ],
     );
+    add(
+        opt.checkpoints,
+        &[ash::nv::device_diagnostic_checkpoints::NAME],
+    );
+    add(opt.aftermath, &[ash::nv::device_diagnostics_config::NAME]);
+    add(opt.buffer_marker, &[ash::amd::buffer_marker::NAME]);
     add(opt.pipeline_binary, &[ash::khr::pipeline_binary::NAME]);
     add(
         opt.cooperative_vector,

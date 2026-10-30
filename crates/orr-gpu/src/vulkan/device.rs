@@ -12,10 +12,11 @@ use ash::vk::TaggedStructure as _;
 use super::accel::{EmptyTlas, build_empty_tlas};
 use super::cache::PipelineCache;
 use super::debug::{MessageCount, messenger_info, name_object};
+use super::diagnostics::{Breadcrumbs, Diagnostics, DiagnosticsReport, FaultFns, Trail};
 use super::features::{self, SURFACE_INSTANCE_EXTENSIONS, Selection};
 use super::garbage::{Garbage, Item, MAX_TIMELINES};
 use super::heap::Heaps;
-use super::memory::{MemoryKind, MemoryTypes, Usage, buffer_usage, sharing};
+use super::memory::{MemoryKind, MemoryTypes, Range, Usage, buffer_usage, sharing};
 use super::queue::{Calibration, PassResult, Queue, QueueKind, QueueRequest, Timeline};
 use super::ray::RecordBlock;
 use super::rtas::{RtasCheck, cluster_caps};
@@ -39,6 +40,7 @@ pub struct DeviceDesc<'a> {
     /// Loads the Khronos validation layer with synchronisation checks, when installed.
     /// Messages are logged and counted ([`Device::validation_messages`]).
     pub validation: bool,
+    pub diagnostics: Diagnostics<'a>,
     /// The disk pipeline cache: read at creation, written by
     /// [`Device::save_pipeline_cache`]. `None`: no disk cache.
     pub pipeline_cache: Option<&'a Path>,
@@ -56,6 +58,7 @@ impl Default for DeviceDesc<'_> {
             name: "orr",
             queues: QueueRequest::default(),
             validation: false,
+            diagnostics: Diagnostics::Off,
             pipeline_cache: None,
             skip_extensions: &[],
             image_heap_slots: 262_144,
@@ -101,14 +104,25 @@ pub(crate) struct Shared {
     empty_tlas: OnceLock<EmptyTlas>,
     /// The debug PTLAS check, created by the first PTLAS build of a debug build.
     pub rtas_check: OnceLock<RtasCheck>,
-    /// `gpu_malloc` buffers by start address: end address and buffer.
-    pub buffers: RwLock<BTreeMap<u64, (u64, vk::Buffer)>>,
+    /// `gpu_malloc` and sparse buffers by start address.
+    pub buffers: RwLock<BTreeMap<u64, Range>>,
+    /// The most recently freed ranges, oldest first.
+    pub freed: Mutex<VecDeque<(u64, Range)>>,
     pub usage: Usage,
     /// Usage of every `gpu_malloc` buffer.
     pub buffer_usage: vk::BufferUsageFlags,
     pub garbage: Mutex<Garbage>,
     pub results: Mutex<VecDeque<(TimelinePoint, Vec<PassResult>)>>,
     pub calibration: Mutex<Option<Calibration>>,
+    pub checkpoint_fn: Option<ash::nv::device_diagnostic_checkpoints::Device>,
+    pub fault_fn: Option<FaultFns>,
+    /// With `Caps::breadcrumbs`.
+    pub breadcrumbs: OnceLock<Breadcrumbs>,
+    pub trail: Mutex<Trail>,
+    /// The report made when device loss was first seen.
+    pub lost: OnceLock<DiagnosticsReport>,
+    /// The raw queue of each created kind.
+    pub queue_handles: [Option<vk::Queue>; MAX_TIMELINES],
 }
 
 /// Surface and swapchain entry points of a device that presents.
@@ -150,6 +164,9 @@ impl Drop for Shared {
             }
             if let Some(r) = self.records.take() {
                 self.destroy(Item::Buffer(r.raw));
+            }
+            if let Some(b) = self.breadcrumbs.take() {
+                self.destroy(Item::Buffer(b.raw));
             }
             if let Some(h) = self.heaps.take() {
                 self.destroy(Item::Buffer(h.resource.raw));
@@ -272,6 +289,9 @@ impl Device {
             // elsewhere debug builds create the device before such threads start.
             unsafe { std::env::set_var(RAY_TRACING_VALIDATION_VAR, "1") };
         }
+        if let Diagnostics::Aftermath { dump_dir } = desc.diagnostics {
+            super::aftermath::enable(dump_dir, desc.name).map_err(Error::Aftermath)?;
+        }
         // SAFETY: loading the system Vulkan loader.
         let entry = unsafe { ash::Entry::load() }.map_err(|e| Error::Loader(e.to_string()))?;
         let messages = Box::<MessageCount>::default();
@@ -296,7 +316,12 @@ impl Device {
                 instance.destroy_instance(None);
             }
         };
-        let picked = pick_device(&instance, desc.skip_extensions, desc.queues.present);
+        let picked = pick_device(
+            &instance,
+            desc.skip_extensions,
+            desc.queues.present,
+            desc.diagnostics,
+        );
         let (physical, selection) = match picked {
             Ok(p) => p,
             Err(e) => {
@@ -405,6 +430,10 @@ impl Device {
             unified_image_layouts: optional.unified_image_layouts,
             memory_budget: optional.memory_budget,
             shader_abort: optional.shader_abort,
+            device_fault: optional.device_fault || optional.device_fault_ext,
+            breadcrumbs: optional.buffer_marker,
+            checkpoints: optional.checkpoints,
+            aftermath: optional.aftermath,
             pipeline_binary: optional.pipeline_binary,
             cooperative_vector: coop,
             shader_float8: optional.shader_float8,
@@ -472,6 +501,23 @@ impl Device {
 
         let pipeline_cache =
             PipelineCache::open(&instance, &device, physical, &caps, desc.pipeline_cache);
+        let mut queue_handles = [None; MAX_TIMELINES];
+        for plan in &plans {
+            // SAFETY: the queue was requested at device creation.
+            queue_handles[plan.kind.index()] =
+                Some(unsafe { device.get_device_queue(plan.family, plan.index) });
+        }
+        let fault_fn = if optional.device_fault {
+            Some(FaultFns::Khr(ash::khr::device_fault::Device::load(
+                &instance, &device,
+            )))
+        } else if optional.device_fault_ext {
+            Some(FaultFns::Ext(ash::ext::device_fault::Device::load(
+                &instance, &device,
+            )))
+        } else {
+            None
+        };
         let shared = Arc::new(Shared {
             heap_fn: ash::ext::descriptor_heap::Device::load(&instance, &device),
             accel_fn: ash::khr::acceleration_structure::Device::load(&instance, &device),
@@ -523,11 +569,20 @@ impl Device {
             empty_tlas: OnceLock::new(),
             rtas_check: OnceLock::new(),
             buffers: RwLock::default(),
+            freed: Mutex::default(),
             usage: Usage::default(),
             buffer_usage: usage,
             garbage: Mutex::default(),
             results: Mutex::default(),
             calibration: Mutex::default(),
+            checkpoint_fn: optional
+                .checkpoints
+                .then(|| ash::nv::device_diagnostic_checkpoints::Device::load(&instance, &device)),
+            fault_fn,
+            breadcrumbs: OnceLock::new(),
+            trail: Mutex::default(),
+            lost: OnceLock::new(),
+            queue_handles,
             _entry: entry,
             instance,
             physical,
@@ -553,6 +608,19 @@ impl Device {
             );
             queues[plan.kind.index()] = Some(q);
         }
+        if optional.buffer_marker {
+            let marker_fn = ash::amd::buffer_marker::Device::load(&shared.instance, &shared.device);
+            let _ = shared
+                .breadcrumbs
+                .set(Breadcrumbs::new(&shared, marker_fn)?);
+        }
+        if optional.aftermath {
+            super::aftermath::add_device(Arc::downgrade(&shared));
+        } else if matches!(desc.diagnostics, Diagnostics::Aftermath { .. }) {
+            log::warn!(
+                "Aftermath asked for, but the device lacks diagnostics config or checkpoints"
+            );
+        }
         let heaps = Heaps::new(&shared, desc.image_heap_slots, desc.sampler_heap_slots)?;
         let _ = shared.heaps.set(heaps);
         if optional.ray_dispatch {
@@ -565,7 +633,7 @@ impl Device {
         let tlas = build_empty_tlas(&device)?;
         let _ = device.shared.empty_tlas.set(tlas);
         log::info!(
-            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, host image copy {}, decompression {}, validation layer {}, ray tracing validation {}",
+            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, host image copy {}, decompression {}, validation layer {}, ray tracing validation {}, diagnostics {:?} (breadcrumbs {}, checkpoints {}, aftermath {}, device fault {})",
             device.shared.caps.device_name,
             device.shared.caps.driver,
             rebar,
@@ -576,6 +644,11 @@ impl Device {
             optional.memory_decompression,
             desc.validation,
             optional.ray_tracing_validation,
+            desc.diagnostics,
+            optional.buffer_marker,
+            optional.checkpoints,
+            optional.aftermath,
+            device.shared.caps.device_fault,
         );
         Ok(device)
     }
@@ -687,6 +760,7 @@ fn pick_device(
     instance: &ash::Instance,
     skip: &[&CStr],
     surface: bool,
+    diagnostics: Diagnostics<'_>,
 ) -> Result<(vk::PhysicalDevice, Selection), Error> {
     // SAFETY: plain query.
     let mut devices = unsafe { instance.enumerate_physical_devices() }
@@ -697,7 +771,7 @@ fn pick_device(
     devices.sort_by_key(|&p| props(p).device_type != vk::PhysicalDeviceType::DISCRETE_GPU);
     let mut first_failure = None;
     for p in devices {
-        match features::select(instance, p, skip, surface) {
+        match features::select(instance, p, skip, surface, diagnostics) {
             Ok(selection) => return Ok((p, selection)),
             Err(missing) => {
                 first_failure.get_or_insert_with(|| {

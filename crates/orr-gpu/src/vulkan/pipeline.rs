@@ -173,6 +173,9 @@ impl<'a> StageParts<'a> {
         } else {
             Cow::Borrowed(code)
         };
+        if shared.caps.aftermath {
+            super::aftermath::add_shader(&code);
+        }
         Ok(Self {
             code,
             entry: s.entry.name,

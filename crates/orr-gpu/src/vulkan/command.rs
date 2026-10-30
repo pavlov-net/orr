@@ -5,6 +5,7 @@ use std::ffi::CString;
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 
+use super::diagnostics::next_pass_id;
 use super::garbage::Item;
 use super::memory::MemoryKind;
 use super::mesh::{MeshPipeline, Rendering};
@@ -37,6 +38,7 @@ pub struct MeshArgs {
 }
 
 pub(crate) struct PassRecord {
+    pub id: u32,
     pub name: &'static str,
     pub stats: bool,
 }
@@ -558,6 +560,8 @@ impl<'q> CommandList<'q> {
 
     /// Opens a named pass: a debug label and GPU timestamps, and with `stats` shader
     /// invocation counts. Passes do not nest; [`crate::Device::pass_results`] reads them.
+    /// With `Caps::breadcrumbs` and `Caps::checkpoints` the pass's begin and end are also
+    /// marked for [`crate::Device::diagnostics_report`] and crash dumps.
     pub fn begin_pass(&mut self, name: &'static str, stats: bool) {
         assert!(!self.open, "pass {name} begun inside another pass");
         assert!(
@@ -568,12 +572,14 @@ impl<'q> CommandList<'q> {
         let res = self.res.as_ref().unwrap();
         let (cmd, timestamps, stats_pool) = (res.cmd, res.timestamps, res.stats);
         let label = CString::new(name).unwrap_or_default();
+        let id = next_pass_id();
         // SAFETY: recording; the queries were reset when the list was created.
         unsafe {
             self.queue.shared.debug_fn.cmd_begin_debug_utils_label(
                 cmd,
                 &vk::DebugUtilsLabelEXT::default().label_name(&label),
             );
+            self.queue.shared.mark_pass(cmd, id, false);
             if timestamps != vk::QueryPool::null() {
                 self.device().cmd_write_timestamp2(
                     cmd,
@@ -592,7 +598,7 @@ impl<'q> CommandList<'q> {
             }
         }
         let stats = stats && stats_pool != vk::QueryPool::null();
-        self.passes.push(PassRecord { name, stats });
+        self.passes.push(PassRecord { id, name, stats });
         self.open = true;
     }
 
@@ -614,6 +620,8 @@ impl<'q> CommandList<'q> {
                     2 * index + 1,
                 );
             }
+            let id = self.passes[index as usize].id;
+            self.queue.shared.mark_pass(cmd, id, true);
             self.queue.shared.debug_fn.cmd_end_debug_utils_label(cmd);
         }
         self.open = false;

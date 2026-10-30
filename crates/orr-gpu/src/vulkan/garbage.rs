@@ -113,7 +113,7 @@ impl Shared {
                 Item::Pipeline(p) => d.destroy_pipeline(p, None),
                 Item::Accel(a) => self.accel_fn.destroy_acceleration_structure(a, None),
                 Item::SparseBuffer { buffer, address } => {
-                    self.buffers.write().unwrap().remove(&address);
+                    self.unregister_range(address);
                     d.destroy_buffer(buffer, None);
                 }
                 Item::ImageSlot(slot) => self.heaps().release_image_slot(slot),
