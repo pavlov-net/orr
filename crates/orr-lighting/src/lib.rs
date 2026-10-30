@@ -6,11 +6,14 @@
 //! over the scene's sphere, rect and emissive lights and the environment, presamples the
 //! light tiles, and writes the scene's `SkyStats`. Kernels reach the result through
 //! [`SceneLighting::light_set`] and the Slang modules `light_sampling`, `environment` and
-//! `media` under this crate's shader root (`DEP_ORR_LIGHTING_SHADER_DIRS`).
+//! `media` under this crate's shader root (`DEP_ORR_LIGHTING_SHADER_DIRS`). Kernels that
+//! shade with the real-time OpenPBR BSDF import `bsdf` and read [`BsdfTables`].
 
+mod bsdf;
 mod environment;
 mod scene;
 
+pub use bsdf::BsdfTables;
 pub use environment::{ENVIRONMENT_SIZE, EnvironmentMapGpu};
 pub use orr_scene::orr_gpu::KernelSet;
 pub use orr_scene::{Cone, DirectionalLight, DiscProfile, Light, LightId};

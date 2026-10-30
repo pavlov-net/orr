@@ -1,5 +1,5 @@
-// orr-lighting's `bsdf` with heap LUTs on the GPU: prepare, eval, pdf and one sample per
-// case, the same calls as the CPU entry points in slang/bsdf_cpu.slang.
+// orr-lighting's `bsdf` with heap LUTs on the GPU: per case every call the CPU entry points in
+// slang/bsdf_cpu.slang make, on the case's material and view.
 #include "orr/root.h"
 import bsdf;
 import bsdf_inputs;
@@ -14,14 +14,29 @@ struct BsdfCase
     float3 u;
 }
 
+struct CaseSample
+{
+    float3 wi;
+    float3 weight;
+    float pdf;
+    uint lobe;
+}
+
 struct BsdfCaseResult
 {
     float3 eval;
+    float3 diffuse;
     float pdf;
-    float3 sample_wi;
-    float3 sample_weight;
-    float sample_pdf;
-    uint sample_lobe;
+    CaseSample sample;
+    CaseSample entry;
+    float3 albedo_diffuse;
+    float3 albedo_specular;
+    float3 albedo_transmission;
+    float3 albedo_subsurface;
+    float3 emission;
+    float3 extinction;
+    float3 scattering_albedo;
+    float anisotropy;
 }
 
 struct Root
@@ -34,6 +49,11 @@ struct Root
 }
 ORR_ROOT(Root);
 
+CaseSample case_sample(BsdfSample s)
+{
+    return { s.wi, s.weight, s.pdf, s.lobe };
+}
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void main(uint3 id: SV_DispatchThreadID)
@@ -41,14 +61,22 @@ void main(uint3 id: SV_DispatchThreadID)
     if (id.x >= root.count)
         return;
     BsdfCase c = root.cases[id.x];
-    Bsdf p = prepare(root.materials[c.material], c.view, c.collapse != 0);
+    Inputs m = root.materials[c.material];
+    Bsdf p = prepare(m, c.view, c.collapse != 0);
     BsdfCaseResult r;
-    r.eval = p.eval(c.wi);
+    r.eval = p.eval(c.wi, r.diffuse);
     r.pdf = p.pdf(c.wi);
-    BsdfSample s = p.sample(c.u);
-    r.sample_wi = s.wi;
-    r.sample_weight = s.weight;
-    r.sample_pdf = s.pdf;
-    r.sample_lobe = s.lobe;
+    r.sample = case_sample(p.sample(c.u));
+    r.entry = case_sample(p.subsurface_entry(c.u));
+    LobeAlbedo a = p.albedo();
+    r.albedo_diffuse = a.diffuse;
+    r.albedo_specular = a.specular;
+    r.albedo_transmission = a.transmission;
+    r.albedo_subsurface = a.subsurface;
+    r.emission = p.emission();
+    SubsurfaceVolume v = bsdf_subsurface_volume(bsdf_params(m));
+    r.extinction = v.extinction;
+    r.scattering_albedo = v.albedo;
+    r.anisotropy = v.anisotropy;
     root.results[id.x] = r;
 }

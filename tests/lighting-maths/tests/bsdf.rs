@@ -5,7 +5,7 @@
 
 use std::thread;
 
-use lighting_maths::{RealTime, subsurface_volume};
+use lighting_maths::{RealTime, edge_case, edge_direction, finite_non_negative, subsurface_volume};
 use openpbr_ref::harness::{self, Estimate, integrate_cells};
 use openpbr_ref::materials::{VIEW_COSINES, grid, view};
 use openpbr_ref::report::{Counts, TABLE_TOLERANCE, evaluate};
@@ -451,62 +451,12 @@ fn emission_and_subsurface_volume_match_the_reference() {
 /// pdf, samples and estimates stay finite and non-negative.
 #[test]
 fn finite_for_any_parameters_and_directions() {
-    fn unit(rng: &mut Rng) -> f32 {
-        match rng.next_u32() % 4 {
-            0 => 0.0,
-            1 => 1.0,
-            _ => rng.f32(),
-        }
-    }
-    fn colour(rng: &mut Rng) -> [f32; 3] {
-        [unit(rng), unit(rng), unit(rng)]
-    }
+    let ok3 = finite_non_negative;
     let mut rng = Rng::new(11);
     let mut bsdf = RealTime::new();
     for case in 0..100_000 {
-        let angle = rng.range(0.0, std::f32::consts::TAU);
-        let inputs = Inputs {
-            base_weight: unit(&mut rng),
-            base_color: colour(&mut rng),
-            base_diffuse_roughness: unit(&mut rng),
-            base_metalness: unit(&mut rng),
-            subsurface_weight: unit(&mut rng),
-            subsurface_color: colour(&mut rng),
-            subsurface_scatter_anisotropy: rng.range(-1.0, 1.0),
-            specular_weight: unit(&mut rng),
-            specular_color: colour(&mut rng),
-            specular_roughness: unit(&mut rng),
-            specular_roughness_anisotropy: unit(&mut rng),
-            specular_ior: [1.0, 1.0001, 1.5, 3.0][(rng.next_u32() % 4) as usize],
-            specular_rotation: [angle.cos(), angle.sin()],
-            coat_weight: unit(&mut rng),
-            coat_color: colour(&mut rng),
-            coat_roughness: unit(&mut rng),
-            coat_ior: [1.0, 1.6, 3.0][(rng.next_u32() % 3) as usize],
-            coat_darkening: unit(&mut rng),
-            fuzz_weight: unit(&mut rng),
-            fuzz_color: colour(&mut rng),
-            fuzz_roughness: unit(&mut rng),
-            transmission_weight: unit(&mut rng),
-            transmission_color: colour(&mut rng),
-            thin_film_weight: unit(&mut rng),
-            thin_film_thickness: unit(&mut rng),
-            emission_luminance: 10.0,
-            geometry_thin_walled: rng.next_u32() % 2,
-            exterior_ior: [1.0, 1.33, 2.0][(rng.next_u32() % 3) as usize],
-            ..Inputs::default()
-        };
-        let mut view_dir = rng.unit();
-        match case % 5 {
-            0 => view_dir[2] = 0.0,
-            1 => view_dir[2] = 1e-7,
-            2 => view_dir[2] = -1e-6,
-            _ => {}
-        }
-        let len = view_dir.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let view_dir = view_dir.map(|x| x / len);
+        let (inputs, view_dir) = edge_case(&mut rng, case);
         bsdf.prepare(&inputs, view_dir);
-        let ok3 = |v: [f32; 3]| v.iter().all(|x| x.is_finite() && *x >= 0.0);
         let a = bsdf.albedo();
         assert!(
             ok3(a.diffuse) && ok3(a.specular) && ok3(a.transmission) && ok3(a.subsurface),
@@ -514,10 +464,7 @@ fn finite_for_any_parameters_and_directions() {
         );
         assert!(ok3(bsdf.emission()), "case {case}");
         for _ in 0..8 {
-            let mut wi = rng.unit();
-            if rng.next_u32().is_multiple_of(4) {
-                wi = [wi[0], wi[1], 0.0].map(|x| x / (wi[0] * wi[0] + wi[1] * wi[1]).sqrt());
-            }
+            let wi = edge_direction(&mut rng);
             let e = bsdf.eval(wi);
             let p = bsdf.pdf(wi);
             assert!(

@@ -1,19 +1,29 @@
 [package]
 name = "lighting-maths"
-description = "orr-lighting's real-time OpenPBR BSDF on the CPU, checked against adobe/openpbr-bsdf through the OpenPBR harness."
+description = "orr-lighting's real-time OpenPBR BSDF on the CPU and, with feature gpu, on the GPU, checked against adobe/openpbr-bsdf through the OpenPBR harness."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# `RealTimeGpu` and the GPU suite; need a Vulkan device.
+gpu = ["dep:orr-gpu", "dep:orr-lighting", "openpbr-ref/gpu"]
+
 [dependencies]
 openpbr-ref = { path = "../openpbr-ref" }
 shader-maths = { path = "../shader-maths" }
 orr-shaders.workspace = true
+orr-gpu = { workspace = true, optional = true }
+orr-lighting = { workspace = true, optional = true }
 
 [build-dependencies]
 orr-shaders = { workspace = true, features = ["build"] }
+
+[[test]]
+name = "gpu"
+required-features = ["gpu"]
 
 [lints]
 workspace = true
