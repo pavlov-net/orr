@@ -1,0 +1,36 @@
+name: shaders
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shaders:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: .tools/dl
+          key: tools-dl-${{ runner.os }}-${{ hashFiles('tools/fetch-slang.sh') }}
+      - name: Fetch pinned tools
+        run: bash tools/fetch-slang.sh
+      - name: Report glibc symbol versions
+        if: runner.os == 'Linux'
+        run: |
+          ldd --version | head -1
+          for f in .tools/slang-2026.20/bin/slangc .tools/slang-2026.20/lib/*.so*; do
+            [ -f "$f" ] || continue
+            glibc=$(objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+            glibcxx=$(objdump -T "$f" | grep -o 'GLIBCXX_[0-9.]*' | sort -uV | tail -1)
+            echo "$(basename "$f"): $glibc $glibcxx"
+          done
+      - name: Test
+        run: cargo test -p orr-shaders --features build

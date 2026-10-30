@@ -1,5 +1,21 @@
 [package]
 name = "orr-shaders"
+description = "Slang shaders for orr: GPU ABI types, compiled shader modules and the build-script compiler driver."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+
+[features]
+build = ["dep:thiserror"]
+
+[dependencies]
+thiserror = { workspace = true, optional = true }
+
+[[test]]
+name = "toolchain"
+required-features = ["build"]
+
+[lints]
+workspace = true
