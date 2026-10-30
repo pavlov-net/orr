@@ -117,7 +117,7 @@ const TOKEN_RULES: &[TokenRule] = &[
 ];
 
 /// Identifiers with their line and whether `(` follows, outside comments and strings.
-fn tokens(src: &str) -> Vec<(&str, u32, bool)> {
+pub(crate) fn tokens(src: &str) -> Vec<(&str, u32, bool)> {
     let b = src.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;

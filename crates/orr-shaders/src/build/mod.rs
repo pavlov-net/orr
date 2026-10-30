@@ -5,6 +5,7 @@ mod codegen;
 mod compile;
 mod cpu;
 mod layout;
+mod link;
 mod lint;
 mod locate;
 mod metal;
@@ -16,6 +17,7 @@ mod toolchain;
 
 pub use compile::{Build, Output};
 pub use cpu::CpuLibrary;
+pub use link::LinkPoint;
 pub use lint::{Lint, LintError};
 pub use locate::SLANG_VERSION;
 pub use toolchain::SLANGC_OPTIONS;
@@ -91,6 +93,9 @@ pub enum Error {
         first: String,
         second: String,
     },
+    /// The `link` calls or a link-points file are invalid.
+    #[error("{message}")]
+    Link { message: String },
     /// One or more lints failed.
     #[error("{}", lint_lines(.0))]
     Lints(Vec<LintError>),

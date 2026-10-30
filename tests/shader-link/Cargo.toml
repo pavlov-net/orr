@@ -1,0 +1,17 @@
+[package]
+name = "shader-link"
+description = "Link points through orr_shaders::build: a renderer fixture, a consumer build linking every point into it, and the surface switch on the CPU."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+orr-shaders.workspace = true
+
+[build-dependencies]
+orr-shaders = { workspace = true, features = ["build"] }
+
+[lints]
+workspace = true

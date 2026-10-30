@@ -16,7 +16,7 @@ mod module;
 pub mod openpbr;
 
 pub use alias::AliasEntry;
-pub use module::{EntryPoint, KernelSet, ShaderModule, Stage};
+pub use module::{EntryPoint, KernelMismatch, KernelSet, Mismatch, ShaderModule, Stage};
 
 /// The directory of orr's shared Slang libraries, imported as `orr.<name>`.
 pub const LIB_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders");

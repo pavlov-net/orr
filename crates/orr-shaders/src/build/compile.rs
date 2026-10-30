@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::codegen::{self, Kernel, Owner, Shared};
 use super::layout::{Plan, Planner};
+use super::link::{self, KernelPoints, Link, LinkModule, LinkPoint, LinkPoints};
 use super::lint::{self, Lint, LintError};
 use super::model::{self, Model, StructDef, Ty};
 use super::slang::{GlobalSession, Library, Session};
@@ -36,6 +37,8 @@ pub struct Build {
     metal_check: bool,
     allowed: BTreeSet<Lint>,
     out_dir: Option<PathBuf>,
+    link_points: Vec<PathBuf>,
+    links: Vec<Link>,
 }
 
 /// Structs of orr's shared libraries and the default-feature Rust types they map to.
@@ -47,10 +50,15 @@ pub struct Output {
     /// The crate's shader root followed by every root it was given, `;`-separated, for
     /// `cargo:shader_dirs`.
     pub shader_dirs: String,
-    /// The modules compiled by this run; the others were up to date.
+    /// The modules compiled by this run, linked kernels as `linked/<kernel>`; the others
+    /// were up to date.
     pub compiled: Vec<String>,
     /// The build manifest: every module with its inputs, options and outputs.
     pub manifest: PathBuf,
+    /// `link_points.json`: the kernels of this build and of every file given to
+    /// [`Build::link_points`] that declare a link point. `compile` prints it as
+    /// `cargo:link_points`.
+    pub link_points: PathBuf,
 }
 
 impl Build {
@@ -70,6 +78,8 @@ impl Build {
             metal_check: env::var_os("ORR_METAL_CHECK").is_some_and(|v| v == "1"),
             allowed: BTreeSet::new(),
             out_dir: None,
+            link_points: Vec::new(),
+            links: Vec::new(),
         })
     }
 
@@ -91,6 +101,35 @@ impl Build {
     pub fn roots(mut self, list: &str) -> Self {
         self.includes
             .extend(list.split(';').filter(|s| !s.is_empty()).map(PathBuf::from));
+        self
+    }
+
+    /// Every `link_points.json` in a `DEP_*_LINK_POINTS` value (`;`-separated): the kernels
+    /// that [`link`](Self::link) compiles. Repeatable.
+    pub fn link_points(mut self, list: &str) -> Self {
+        self.link_points
+            .extend(list.split(';').filter(|s| !s.is_empty()).map(PathBuf::from));
+        self
+    }
+
+    /// Links Slang type `ty` from `module` (relative to `CARGO_MANIFEST_DIR`) into every
+    /// kernel of the [`link_points`](Self::link_points) files that declares `point`.
+    ///
+    /// Each such kernel is compiled once more with a generated module that exports the
+    /// kernel's `extern struct`, and goes into `KERNELS` in `orr_kernels.rs`. Surfaces and
+    /// displacements become one `switch` on the input's id: ids run from 1 in call order,
+    /// id 0 and unknown ids call the default type, and `orr_kernels.rs` holds the ids as
+    /// `surface::<NAME>` and `displacement::<NAME>`. Environment and medium take one call
+    /// each at most. `module` is imported by its file stem, so its directory joins the
+    /// include path.
+    pub fn link(
+        mut self,
+        point: LinkPoint,
+        name: &str,
+        module: impl AsRef<Path>,
+        ty: &str,
+    ) -> Self {
+        self.links.push(Link::new(point, name, module.as_ref(), ty));
         self
     }
 
@@ -142,8 +181,11 @@ impl Build {
     }
 
     /// Compiles changed modules in parallel, checks layouts and lints, and writes
-    /// `orr_shaders.rs`, the `.spv` files with their `.omm.spv` variants and
-    /// `shaders.manifest.json` to the output directory. Prints `rerun-if-changed` lines.
+    /// `orr_shaders.rs`, the `.spv` files with their `.omm.spv` variants,
+    /// `shaders.manifest.json` and `link_points.json` to the output directory. With
+    /// [`link`](Self::link) calls it also compiles the linked kernels under `linked/`;
+    /// `orr_kernels.rs` holds their `KERNELS` set, empty without links. Prints
+    /// `rerun-if-changed` lines and `cargo:link_points`.
     pub fn compile(self) -> Result<Output, Error> {
         let started = Instant::now();
         let out_dir = out_dir(self.out_dir.as_deref())?;
@@ -167,29 +209,33 @@ impl Build {
         let mut include_dirs = roots.clone();
         include_dirs.extend(super::openpbr_dir().ok());
 
-        let mut options: Vec<String> = SLANGC_OPTIONS.iter().map(|s| (*s).to_owned()).collect();
-        for dir in &include_dirs {
-            options.push("-I".into());
-            options.push(dir.display().to_string());
-        }
-        if self.debug_info {
-            options.push("-g2".into());
-        }
-        if self.fp_precise {
-            options.extend(["-fp-mode".into(), "precise".into()]);
+        let links = link::resolve(&self.links)?;
+        let mut listed = LinkPoints::default();
+        for path in &self.link_points {
+            listed.merge(LinkPoints::read(path)?);
         }
 
-        let kernels = match &own_root {
-            Some(root) => find_kernels(root)?,
-            None => Vec::new(),
-        };
-        let metal_options = self.metal_check.then(|| {
-            let mut o: Vec<String> = metal::OPTIONS.iter().map(|s| (*s).to_owned()).collect();
-            for dir in &include_dirs {
-                o.extend(["-I".to_owned(), dir.display().to_string()]);
+        let mut kernels = Vec::new();
+        let mut own_points = LinkPoints::default();
+        if let Some(root) = &own_root {
+            kernels = find_kernels(root)?;
+            for (name, path) in &kernels {
+                let points = link::declared(&read(path)?);
+                if !points.is_empty() {
+                    own_points.kernels.push(KernelPoints {
+                        name: name.clone(),
+                        path: path.clone(),
+                        root: root.clone(),
+                        points,
+                    });
+                }
             }
-            o
-        });
+        }
+
+        let options = self.options(&include_dirs);
+        let metal_options = self
+            .metal_check
+            .then(|| metal_session_options(&include_dirs));
         let settings = Settings {
             tool: tool_hash(),
             options: &options,
@@ -197,23 +243,49 @@ impl Build {
             asserts: self.asserts,
         };
         let records = out_dir.join("orr-shaders");
-        let mut jobs = Vec::new();
-        let mut modules = BTreeMap::new();
-        for (name, path) in kernels {
-            let record_path = records.join(format!("{name}.json"));
-            match load_record(&record_path, &settings, &path) {
-                Some(record) => {
-                    modules.insert(name, record);
-                }
-                None => jobs.push((name, path, record_path)),
-            }
-        }
-        let compiled: Vec<String> = jobs.iter().map(|(n, ..)| n.clone()).collect();
-        let fresh = compile_all(&self.lib, &settings, jobs, &out_dir)?;
-        modules.extend(fresh);
+        let jobs = kernels
+            .into_iter()
+            .map(|(name, path)| Job {
+                record: records.join(format!("{name}.json")),
+                spv: out_dir.join(format!("{name}.spv")),
+                name,
+                path,
+                links: Vec::new(),
+            })
+            .collect();
+        let (modules, mut compiled) = run(&self.lib, &settings, jobs)?;
 
-        let mut lints = lint::duplicate_imports(&roots);
-        for (name, record) in &modules {
+        // The listed kernels compiled once more with the linked types.
+        let mut linked_modules = BTreeMap::new();
+        let mut lint_roots = roots.clone();
+        if !links.is_empty() {
+            let jobs = linked_jobs(&links, &listed, &out_dir)?;
+            let module_dirs = link::module_dirs(&links);
+            let mut linked_dirs = include_dirs.clone();
+            let kernel_roots = listed.kernels.iter().map(|k| &k.root);
+            for dir in module_dirs.iter().chain(kernel_roots) {
+                if !linked_dirs.contains(dir) {
+                    linked_dirs.push(dir.clone());
+                }
+            }
+            lint_roots.extend(module_dirs);
+            let options = self.options(&linked_dirs);
+            let metal_options = self
+                .metal_check
+                .then(|| metal_session_options(&linked_dirs));
+            let settings = Settings {
+                tool: settings.tool.clone(),
+                options: &options,
+                metal: metal_options.as_deref(),
+                asserts: self.asserts,
+            };
+            let (fresh, names) = run(&self.lib, &settings, jobs)?;
+            linked_modules = fresh;
+            compiled.extend(names.into_iter().map(|n| format!("linked/{n}")));
+        }
+
+        let mut lints = lint::duplicate_imports(&lint_roots);
+        for (name, record) in modules.iter().chain(&linked_modules) {
             lints.extend(record.metal.iter().map(|message| LintError {
                 lint: Lint::Metal,
                 module: name.clone(),
@@ -221,7 +293,7 @@ impl Build {
             }));
         }
         let mut seen_files = BTreeSet::new();
-        for record in modules.values() {
+        for record in modules.values().chain(linked_modules.values()) {
             for input in &record.inputs {
                 if seen_files.insert(input.clone())
                     && let Ok(src) = fs::read_to_string(input)
@@ -280,18 +352,19 @@ impl Build {
                     def.size = shared.size;
                 }
             }
-            let module_plans =
-                Planner::new(&model.structs)
-                    .plan_all()
-                    .map_err(|m| Error::Layout {
-                        module: name.clone(),
-                        structure: m.structure,
-                        field: m.field,
-                        message: m.message,
-                    })?;
+            let module_plans = plan(name, &model)?;
             lints.extend(lint::model_lints(name, &model, &module_plans, &lib_dir));
             plans.insert(name.clone(), module_plans);
             models.insert(name.clone(), model);
+        }
+        for (name, record) in &linked_modules {
+            let module_plans = plan(name, &record.model)?;
+            lints.extend(lint::model_lints(
+                name,
+                &record.model,
+                &module_plans,
+                &lib_dir,
+            ));
         }
 
         lints.retain(|l| !self.allowed.contains(&l.lint));
@@ -348,15 +421,36 @@ impl Build {
         let rust = codegen::generate(&kernels_out, &shared, &manifest_path);
         write(&out_dir.join("orr_shaders.rs"), rust.as_bytes())?;
 
+        let no_owners = HashMap::new();
+        let no_plans = HashMap::new();
+        let linked_out: Vec<Kernel<'_>> = linked_modules
+            .iter()
+            .map(|(name, record)| Kernel {
+                name,
+                spv: &record.spv,
+                omm: record.omm.as_deref(),
+                hash: record.hash,
+                interface: interface_hash(&record.model),
+                model: &record.model,
+                owners: &no_owners,
+                plans: &no_plans,
+            })
+            .collect();
+        let rust = codegen::kernel_set(&linked_out, &link::ids(&links), &manifest_path);
+        write(&out_dir.join("orr_kernels.rs"), rust.as_bytes())?;
+
         let manifest = Manifest {
             slang: SLANG_VERSION,
             options: &options,
             asserts: self.asserts,
             modules: modules
                 .iter()
-                .map(|(name, r)| ManifestModule {
+                .map(|(name, r)| (name, r, false))
+                .chain(linked_modules.iter().map(|(name, r)| (name, r, true)))
+                .map(|(name, r, linked)| ManifestModule {
                     name,
                     kernel: &r.kernel,
+                    linked,
                     spv: &r.spv,
                     omm: r.omm.as_deref(),
                     hash: r.hash,
@@ -371,14 +465,30 @@ impl Build {
                 .as_bytes(),
         )?;
 
-        print_cargo(&roots, &modules);
+        let link_points_path = out_dir.join("link_points.json");
+        own_points.merge(listed);
+        write(
+            &link_points_path,
+            serde_json::to_string_pretty(&own_points)
+                .expect("link points serialise")
+                .as_bytes(),
+        )?;
+
+        let mut watched = roots;
+        watched.extend(self.link_points.iter().cloned());
+        watched.extend(links.iter().map(|l| l.module.clone()));
+        print_cargo(
+            &watched,
+            modules.values().chain(linked_modules.values()),
+            &link_points_path,
+        );
         if env::var_os("ORR_SHADER_TIMINGS").is_some() {
             #[allow(clippy::print_stdout)]
             {
                 println!(
                     "cargo:warning=orr-shaders: {} of {} modules compiled in {:.2} s",
                     compiled.len(),
-                    modules.len(),
+                    modules.len() + linked_modules.len(),
                     started.elapsed().as_secs_f64()
                 );
             }
@@ -387,8 +497,117 @@ impl Build {
             shader_dirs,
             compiled,
             manifest: manifest_path,
+            link_points: link_points_path,
         })
     }
+
+    /// The session options for kernels that import from `include_dirs`.
+    fn options(&self, include_dirs: &[PathBuf]) -> Vec<String> {
+        let mut options: Vec<String> = SLANGC_OPTIONS.iter().map(|s| (*s).to_owned()).collect();
+        for dir in include_dirs {
+            options.push("-I".into());
+            options.push(dir.display().to_string());
+        }
+        if self.debug_info {
+            options.push("-g2".into());
+        }
+        if self.fp_precise {
+            options.extend(["-fp-mode".into(), "precise".into()]);
+        }
+        options
+    }
+}
+
+fn metal_session_options(include_dirs: &[PathBuf]) -> Vec<String> {
+    let mut o: Vec<String> = metal::OPTIONS.iter().map(|s| (*s).to_owned()).collect();
+    for dir in include_dirs {
+        o.extend(["-I".to_owned(), dir.display().to_string()]);
+    }
+    o
+}
+
+/// One job per listed kernel that declares a linked point, with its generated link
+/// modules.
+fn linked_jobs(links: &[Link], listed: &LinkPoints, out_dir: &Path) -> Result<Vec<Job>, Error> {
+    let declared: BTreeSet<LinkPoint> = listed
+        .kernels
+        .iter()
+        .flat_map(|k| k.points.iter().map(|d| d.point))
+        .collect();
+    if let Some(l) = links.iter().find(|l| !declared.contains(&l.point)) {
+        return Err(Error::Link {
+            message: format!(
+                "the {} point is linked, but no kernel in the link-points files declares it \
+                 (they list {} kernels); pass the renderer's DEP_ORR_LINK_POINTS to \
+                 Build::link_points",
+                l.point.label(),
+                listed.kernels.len()
+            ),
+        });
+    }
+    let modules_dir = out_dir.join("orr-shaders").join("link");
+    let records = out_dir.join("orr-shaders").join("linked");
+    let mut generated: BTreeMap<&link::Declared, Option<LinkModule>> = BTreeMap::new();
+    let mut jobs: Vec<Job> = Vec::new();
+    for k in &listed.kernels {
+        let mut modules = Vec::new();
+        for decl in &k.points {
+            if !generated.contains_key(decl) {
+                generated.insert(decl, link::write_module(decl, links, &modules_dir)?);
+            }
+            modules.extend(generated[decl].clone());
+        }
+        if modules.is_empty() {
+            continue;
+        }
+        if jobs.iter().any(|j| j.name == k.name) {
+            return Err(Error::Link {
+                message: format!("two link-points files list a kernel named {}", k.name),
+            });
+        }
+        jobs.push(Job {
+            name: k.name.clone(),
+            path: k.path.clone(),
+            record: records.join(format!("{}.json", k.name)),
+            spv: out_dir.join("linked").join(format!("{}.spv", k.name)),
+            links: modules,
+        });
+    }
+    Ok(jobs)
+}
+
+/// The layout plans of every struct of a module.
+fn plan(name: &str, model: &Model) -> Result<HashMap<String, Plan>, Error> {
+    Planner::new(&model.structs)
+        .plan_all()
+        .map_err(|m| Error::Layout {
+            module: name.to_owned(),
+            structure: m.structure,
+            field: m.field,
+            message: m.message,
+        })
+}
+
+/// Loads up-to-date records and compiles the rest. Returns every module and the names of
+/// those compiled.
+fn run(
+    lib: &Arc<Library>,
+    settings: &Settings<'_>,
+    jobs: Vec<Job>,
+) -> Result<(BTreeMap<String, Record>, Vec<String>), Error> {
+    let mut modules = BTreeMap::new();
+    let mut todo = Vec::new();
+    for job in jobs {
+        match load_record(settings, &job) {
+            Some(record) => {
+                modules.insert(job.name, record);
+            }
+            None => todo.push(job),
+        }
+    }
+    let compiled = todo.iter().map(|j| j.name.clone()).collect();
+    modules.extend(compile_all(lib, settings, todo)?);
+    Ok((modules, compiled))
 }
 
 #[derive(Serialize)]
@@ -403,6 +622,8 @@ struct Manifest<'a> {
 struct ManifestModule<'a> {
     name: &'a str,
     kernel: &'a Path,
+    /// Compiled with this build's linked types; goes into `KERNELS`.
+    linked: bool,
     spv: &'a Path,
     omm: Option<&'a Path>,
     hash: u64,
@@ -449,16 +670,28 @@ impl Settings<'_> {
     }
 }
 
-fn print_cargo(roots: &[PathBuf], modules: &BTreeMap<String, Record>) {
-    let mut lines = BTreeSet::new();
-    for r in roots {
-        lines.insert(r.clone());
-    }
-    for m in modules.values() {
+/// The work of compiling one kernel file.
+struct Job {
+    name: String,
+    path: PathBuf,
+    record: PathBuf,
+    spv: PathBuf,
+    /// Generated link modules composed with the kernel.
+    links: Vec<LinkModule>,
+}
+
+fn print_cargo<'a>(
+    watched: &[PathBuf],
+    modules: impl Iterator<Item = &'a Record>,
+    link_points: &Path,
+) {
+    let mut lines: BTreeSet<PathBuf> = watched.iter().cloned().collect();
+    for m in modules {
         lines.extend(m.inputs.iter().cloned());
     }
     #[allow(clippy::print_stdout)]
     {
+        println!("cargo:link_points={}", link_points.display());
         for l in lines {
             println!("cargo:rerun-if-changed={}", l.display());
         }
@@ -547,14 +780,19 @@ fn tool_hash() -> String {
         .unwrap_or_default()
 }
 
-fn cache_key(settings: &Settings<'_>, kernel: &Path, inputs: &[PathBuf]) -> Option<String> {
+fn cache_key(settings: &Settings<'_>, job: &Job, inputs: &[PathBuf]) -> Option<String> {
     let mut h = blake3::Hasher::new();
     h.update(SLANG_VERSION.as_bytes());
     for o in settings.key_parts() {
         h.update(o.as_bytes());
         h.update(&[0]);
     }
-    h.update(kernel.to_string_lossy().as_bytes());
+    h.update(job.path.to_string_lossy().as_bytes());
+    for l in &job.links {
+        h.update(&[0]);
+        h.update(l.module.as_bytes());
+    }
+    h.update(&[1]);
     for input in inputs {
         h.update(input.to_string_lossy().as_bytes());
         h.update(&[0]);
@@ -563,18 +801,17 @@ fn cache_key(settings: &Settings<'_>, kernel: &Path, inputs: &[PathBuf]) -> Opti
     Some(h.finalize().to_hex().to_string())
 }
 
-fn load_record(path: &Path, settings: &Settings<'_>, kernel: &Path) -> Option<Record> {
-    let record: Record = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    let key = cache_key(settings, kernel, &record.inputs)?;
+fn load_record(settings: &Settings<'_>, job: &Job) -> Option<Record> {
+    let record: Record = serde_json::from_slice(&fs::read(&job.record).ok()?).ok()?;
+    let key = cache_key(settings, job, &record.inputs)?;
     let outputs_exist = record.spv.is_file() && record.omm.as_ref().is_none_or(|p| p.is_file());
-    (record.key == key && record.kernel == kernel && outputs_exist).then_some(record)
+    (record.key == key && record.kernel == job.path && outputs_exist).then_some(record)
 }
 
 fn compile_all(
     lib: &Arc<Library>,
     settings: &Settings<'_>,
-    jobs: Vec<(String, PathBuf, PathBuf)>,
-    out_dir: &Path,
+    jobs: Vec<Job>,
 ) -> Result<BTreeMap<String, Record>, Error> {
     if jobs.is_empty() {
         return Ok(BTreeMap::new());
@@ -589,18 +826,17 @@ fn compile_all(
             scope.spawn(|| {
                 let mut global: Option<GlobalSession> = None;
                 loop {
-                    let Some((name, path, record_path)) = queue.lock().expect("queue").pop() else {
+                    let Some(job) = queue.lock().expect("queue").pop() else {
                         break;
                     };
-                    let result = compile_one(lib, &mut global, settings, &name, &path, out_dir)
-                        .and_then(|record| {
-                            write(
-                                &record_path,
-                                &serde_json::to_vec(&record).expect("records serialise"),
-                            )?;
-                            Ok(record)
-                        });
-                    results.lock().expect("results").push((name, result));
+                    let result = compile_one(lib, &mut global, settings, &job).and_then(|record| {
+                        write(
+                            &job.record,
+                            &serde_json::to_vec(&record).expect("records serialise"),
+                        )?;
+                        Ok(record)
+                    });
+                    results.lock().expect("results").push((job.name, result));
                 }
             });
         }
@@ -618,10 +854,9 @@ fn compile_one(
     lib: &Arc<Library>,
     global: &mut Option<GlobalSession>,
     settings: &Settings<'_>,
-    name: &str,
-    path: &Path,
-    out_dir: &Path,
+    job: &Job,
 ) -> Result<Record, Error> {
+    let (name, path) = (job.name.as_str(), job.path.as_path());
     let slang_err = |message: String| Error::Slang {
         module: name.to_owned(),
         message,
@@ -642,13 +877,12 @@ fn compile_one(
     let module = session
         .load(&name.replace('/', "."), path, &source)
         .map_err(compile_err)?;
-    let extra = link_modules(&session, settings, out_dir).map_err(compile_err)?;
+    let extra = link_modules(&session, settings, &job.links).map_err(compile_err)?;
     let program = session
         .link(&module, &extra, |_| true)
         .map_err(compile_err)?;
     let words = program.spirv().map_err(compile_err)?;
-    let spv = out_dir.join(format!("{name}.spv"));
-    write(&spv, &words_to_bytes(&words))?;
+    write(&job.spv, &words_to_bytes(&words))?;
     let layout = program.layout().map_err(compile_err)?;
     let model = model::extract(&session, layout, &words).map_err(|message| Error::Reflection {
         module: name.to_owned(),
@@ -657,26 +891,32 @@ fn compile_one(
 
     let mut inputs: Vec<PathBuf> = module
         .dependencies()
-        .iter()
-        .map(|p| canonical_lossy(p))
+        .into_iter()
+        // The job's link modules close `extra`; their files are inputs too.
+        .chain(
+            extra[extra.len() - job.links.len()..]
+                .iter()
+                .flat_map(super::slang::Module::dependencies),
+        )
+        .map(|p| canonical_lossy(&p))
         .collect();
     inputs.sort();
     inputs.dedup();
     let metal = match settings.metal {
         Some(metal_options) => {
             let session = global.session(metal_options).map_err(slang_err)?;
-            metal_issues(&session, settings, &model, name, path, &source, out_dir)?
+            metal_issues(&session, settings, &model, job, &source)?
         }
         None => Vec::new(),
     };
-    let key = cache_key(settings, path, &inputs).ok_or_else(|| Error::Io {
+    let key = cache_key(settings, job, &inputs).ok_or_else(|| Error::Io {
         path: path.to_path_buf(),
         source: std::io::Error::other("an input vanished during the build"),
     })?;
 
     let omm = match spirv::omm_variant(&words) {
         Some(variant) => {
-            let p = out_dir.join(format!("{name}.omm.spv"));
+            let p = job.spv.with_extension("omm.spv");
             write(&p, &words_to_bytes(&variant))?;
             Some(p)
         }
@@ -686,7 +926,7 @@ fn compile_one(
         key,
         kernel: path.to_path_buf(),
         inputs,
-        spv,
+        spv: job.spv.clone(),
         omm,
         hash: hash64(&words_to_bytes(&words)),
         model,
@@ -694,22 +934,25 @@ fn compile_one(
     })
 }
 
-/// The modules linked into every kernel besides its own: `ASSERTS = true` when asserts are
-/// on.
+/// The modules composed with a kernel besides its own: `ASSERTS = true` when asserts are
+/// on, and the job's link modules.
 fn link_modules(
     session: &Session,
     settings: &Settings<'_>,
-    out_dir: &Path,
+    links: &[LinkModule],
 ) -> Result<Vec<super::slang::Module>, String> {
-    if !settings.asserts {
-        return Ok(Vec::new());
+    let mut out = Vec::new();
+    if settings.asserts {
+        out.push(session.load(
+            "orr_asserts",
+            Path::new("orr_asserts.slang"),
+            "export static const bool ASSERTS = true;\n",
+        )?);
     }
-    let path = out_dir.join("orr-shaders").join("asserts.slang");
-    Ok(vec![session.load(
-        "orr_asserts",
-        &path,
-        "export static const bool ASSERTS = true;\n",
-    )?])
+    for l in links {
+        out.push(session.load(&l.module, &l.path, &l.source)?);
+    }
+    Ok(out)
 }
 
 /// Loads the kernel at `path` once more into the Metal `session`, compiles its non-raygen
@@ -718,10 +961,8 @@ fn metal_issues(
     session: &Session,
     settings: &Settings<'_>,
     model: &Model,
-    name: &str,
-    path: &Path,
+    job: &Job,
     source: &str,
-    out_dir: &Path,
 ) -> Result<Vec<String>, Error> {
     let entries: BTreeSet<&str> = model
         .entries
@@ -734,8 +975,8 @@ fn metal_issues(
     }
     let text = metal::without_raygen(source);
     let compiled = (|| {
-        let module = session.load(&name.replace('/', "."), path, &text)?;
-        let extra = link_modules(session, settings, out_dir)?;
+        let module = session.load(&job.name.replace('/', "."), &job.path, &text)?;
+        let extra = link_modules(session, settings, &job.links)?;
         let program = session.link(&module, &extra, |e| entries.contains(e))?;
         Ok::<_, String>((program.text()?, program))
     })();
@@ -743,7 +984,7 @@ fn metal_issues(
         Ok(r) => r,
         Err(diagnostics) => return Ok(vec![format!("Metal emission failed:\n{diagnostics}")]),
     };
-    write(&out_dir.join(format!("{name}.metal")), msl.as_bytes())?;
+    write(&job.spv.with_extension("metal"), msl.as_bytes())?;
     let mut issues = metal::msl_issues(&msl);
     match program.layout() {
         Ok(layout) => issues.extend(metal::layout_issues(&session.lib.api, layout, model)),
@@ -836,6 +1077,13 @@ pub(super) fn canonical(path: &Path) -> Result<PathBuf, Error> {
             path: path.to_path_buf(),
             source,
         })
+}
+
+pub(super) fn read(path: &Path) -> Result<String, Error> {
+    fs::read_to_string(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn canonical_lossy(path: &Path) -> PathBuf {

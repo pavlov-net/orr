@@ -42,6 +42,7 @@ jobs:
           cargo test -p orr-shaders --features build,openpbr
           cargo test -p shader-corpus
           cargo test -p shader-abi
+          cargo test -p shader-link
           cargo test -p shader-maths
           cargo test -p openpbr-ref
           cargo test -p output-maths
