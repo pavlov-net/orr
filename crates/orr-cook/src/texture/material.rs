@@ -19,15 +19,19 @@
 use std::collections::HashMap;
 
 use orr_pack::material::{Material, TextureBinding, slot};
-use orr_pack::{ArchiveWriter, AssetId, Class, Hash32};
+use orr_pack::{AssetId, Class, Hash32};
+use rayon::prelude::*;
+use serde::Deserialize;
 
 use super::load::{self, Source};
 use super::mips::{MipSpec, Toksvig};
-use super::{Encoding, Img, MipFilter, Plan, Primaries, Quality, Wrap, srgb_to_linear};
+use super::{Built, Encoding, Img, MipFilter, Plan, Primaries, Quality, Wrap, srgb_to_linear};
+use crate::key::Key;
 use crate::{Error, Result};
 
 /// Texture settings for images a glTF file references.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct TextureRules {
     pub quality: Quality,
     /// Largest mip 0 edge of every texture.
@@ -38,7 +42,8 @@ pub struct TextureRules {
     pub overrides: Vec<(String, TextureOverride)>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct TextureOverride {
     pub quality: Option<Quality>,
     pub max_size: Option<u32>,
@@ -72,31 +77,93 @@ pub(crate) struct ImageFile {
     pub bytes: Vec<u8>,
 }
 
-struct Decoded {
-    img: Img,
+/// What packing needs to know of one source image; its texels are decoded again by the
+/// texture jobs that read them.
+pub(crate) struct ImageFacts {
+    w: u32,
+    h: u32,
     srgb: bool,
     primaries: Option<Primaries>,
+    /// Per channel, the value every texel lies within 1/255 of, if there is one.
+    constant: [Option<f32>; 4],
     hash: Hash32,
 }
 
-/// Cooks the textures of a glTF file's materials, sharing identical ones.
+/// Decodes a 2D image: its only layer and the file's colour facts.
+fn decode(file: &ImageFile) -> Result<(Img, bool, Option<Primaries>), String> {
+    let Source {
+        mut layers,
+        cube,
+        srgb,
+        primaries,
+        ..
+    } = load::decode(&file.bytes)?;
+    if cube || layers.len() != 1 {
+        return Err("not a 2D image".into());
+    }
+    Ok((layers.remove(0), srgb, primaries))
+}
+
+/// Facts of the images `used`, decoded in parallel.
+pub(crate) fn image_facts(
+    asset: &str,
+    images: &[ImageFile],
+    used: &[usize],
+) -> Result<HashMap<usize, ImageFacts>> {
+    used.par_iter()
+        .map(|&i| {
+            let fail = |message: String| Error::Texture {
+                asset: asset.into(),
+                message,
+            };
+            let file = images
+                .get(i)
+                .ok_or_else(|| fail(format!("image {i} does not exist")))?;
+            let (img, srgb, primaries) =
+                decode(file).map_err(|e| fail(format!("image {}: {e}", file.name)))?;
+            let constant = std::array::from_fn(|c| {
+                let (lo, hi) = img.px.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
+                    (lo.min(p[c]), hi.max(p[c]))
+                });
+                (hi - lo <= 1.0 / 255.0 + 1e-6).then_some(0.5 * (lo + hi))
+            });
+            Ok((
+                i,
+                ImageFacts {
+                    w: img.w,
+                    h: img.h,
+                    srgb,
+                    primaries,
+                    constant,
+                    hash: Hash32::of(&file.bytes),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Plans the textures of a glTF file's materials, sharing identical ones. The textures
+/// are cooked later by their [`TextureJob`]s.
 pub(crate) struct Packer<'a> {
     asset: &'a str,
     images: &'a [ImageFile],
+    facts: &'a HashMap<usize, ImageFacts>,
     rules: &'a TextureRules,
-    decoded: HashMap<usize, Decoded>,
     made: HashMap<Hash32, AssetId>,
+    pub jobs: Vec<TextureJob>,
 }
 
 /// A texture to make from one or more source channels.
-struct Pack<'p> {
+#[derive(Clone, Debug)]
+struct Pack {
     role: &'static str,
     encoding: Encoding,
     /// Channel sources in output order.
     channels: Vec<Channel>,
     refs: Vec<TexRef>,
     coverage: Option<(usize, f32)>,
-    toksvig: Option<(usize, &'p TexRef, f32)>,
+    /// Output channel, normal map and its scale.
+    toksvig: Option<(usize, TexRef, f32)>,
     normal: bool,
     shrink: bool,
 }
@@ -115,65 +182,51 @@ enum Channel {
     Constant(f32),
 }
 
+/// One packed texture to cook.
+pub(crate) struct TextureJob {
+    pub name: String,
+    pub key: Hash32,
+    asset: String,
+    pack: Pack,
+    /// Source images, sorted.
+    images: Vec<usize>,
+    size: [u32; 2],
+    quality: Quality,
+    max_size: Option<u32>,
+    grid: Option<[u16; 2]>,
+    primaries: Primaries,
+    filter: MipFilter,
+}
+
 impl<'a> Packer<'a> {
-    pub(crate) fn new(asset: &'a str, images: &'a [ImageFile], rules: &'a TextureRules) -> Self {
+    pub(crate) fn new(
+        asset: &'a str,
+        images: &'a [ImageFile],
+        facts: &'a HashMap<usize, ImageFacts>,
+        rules: &'a TextureRules,
+    ) -> Self {
         Self {
             asset,
             images,
+            facts,
             rules,
-            decoded: HashMap::new(),
             made: HashMap::new(),
+            jobs: Vec::new(),
         }
     }
 
-    fn fail(&self, message: String) -> Error {
-        Error::Texture {
-            asset: self.asset.into(),
-            message,
-        }
-    }
-
-    fn image(&mut self, i: usize) -> Result<&Decoded> {
-        if !self.decoded.contains_key(&i) {
-            let file = self
-                .images
-                .get(i)
-                .ok_or_else(|| self.fail(format!("image {i} does not exist")))?;
-            let Source {
-                mut layers,
-                cube,
-                srgb,
-                primaries,
-                ..
-            } = load::decode(&file.bytes)
-                .map_err(|e| self.fail(format!("image {}: {e}", file.name)))?;
-            if cube || layers.len() != 1 {
-                return Err(self.fail(format!("image {}: not a 2D image", file.name)));
-            }
-            let d = Decoded {
-                img: layers.remove(0),
-                srgb,
-                primaries,
-                hash: Hash32::of(&file.bytes),
-            };
-            self.decoded.insert(i, d);
-        }
-        Ok(&self.decoded[&i])
+    fn image(&self, i: usize) -> &ImageFacts {
+        &self.facts[&i]
     }
 
     /// The value of `channel` if every texel lies within 1/255 of one value.
-    fn constant(&mut self, i: usize, channel: usize) -> Result<Option<f32>> {
-        let img = &self.image(i)?.img;
-        let (lo, hi) = img.px.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
-            (lo.min(p[channel]), hi.max(p[channel]))
-        });
-        Ok((hi - lo <= 1.0 / 255.0 + 1e-6).then_some(0.5 * (lo + hi)))
+    fn constant(&self, i: usize, channel: usize) -> Option<f32> {
+        self.image(i).constant[channel]
     }
 
     /// Cooks the material's textures, binds them and folds constants into its factors.
     pub(crate) fn material(
         &mut self,
-        w: &mut ArchiveWriter,
         suffix: &str,
         m: &mut Material,
         t: &MaterialTextures,
@@ -188,10 +241,8 @@ impl<'a> Packer<'a> {
         };
 
         if let Some(r) = &t.base_color {
-            let srgb = self.image(r.image)?.srgb;
-            let rgb: Vec<Option<f32>> = (0..3)
-                .map(|c| self.constant(r.image, c))
-                .collect::<Result<_>>()?;
+            let srgb = self.image(r.image).srgb;
+            let rgb: Vec<Option<f32>> = (0..3).map(|c| self.constant(r.image, c)).collect();
             if rgb.iter().all(Option::is_some) {
                 for (c, v) in rgb.into_iter().enumerate() {
                     let v = v.expect("constant");
@@ -206,7 +257,6 @@ impl<'a> Packer<'a> {
                     b: 1.0,
                 };
                 let id = self.make(
-                    w,
                     suffix,
                     Pack {
                         role: "base_color",
@@ -222,13 +272,12 @@ impl<'a> Packer<'a> {
                 bind(m, slot::BASE_COLOR, id, 0, r);
             }
             if m.alpha_mode != Material::OPAQUE {
-                match self.constant(r.image, 3)? {
+                match self.constant(r.image, 3) {
                     Some(a) => m.geometry_opacity *= a,
                     None => {
                         let coverage =
                             (m.alpha_mode == Material::MASK).then_some((0, m.alpha_cutoff));
                         let id = self.make(
-                            w,
                             suffix,
                             Pack {
                                 role: "opacity",
@@ -257,9 +306,7 @@ impl<'a> Packer<'a> {
         let mut normal_packed = None;
         if let Some((r, scale)) = &t.normal {
             let flat = [0.5, 0.5, 1.0];
-            let consts: Vec<Option<f32>> = (0..3)
-                .map(|c| self.constant(r.image, c))
-                .collect::<Result<_>>()?;
+            let consts: Vec<Option<f32>> = (0..3).map(|c| self.constant(r.image, c)).collect();
             let is_flat = consts
                 .iter()
                 .zip(flat)
@@ -273,7 +320,6 @@ impl<'a> Packer<'a> {
                     b: 2.0 * s,
                 };
                 let id = self.make(
-                    w,
                     suffix,
                     Pack {
                         role: "normal",
@@ -301,15 +347,12 @@ impl<'a> Packer<'a> {
         // Roughness, metalness, occlusion; specular weight has no glTF core source.
         let mr = t.metal_rough;
         let (rough_const, metal_const) = match &mr {
-            Some(r) => (self.constant(r.image, 1)?, self.constant(r.image, 2)?),
+            Some(r) => (self.constant(r.image, 1), self.constant(r.image, 2)),
             None => (Some(1.0), Some(1.0)),
         };
         let rough_varies = rough_const.is_none() || normal_packed.is_some();
         let metal_varies = metal_const.is_none();
-        let occ = match &t.occlusion {
-            Some((r, s)) => Some((*r, *s, self.constant(r.image, 0)?)),
-            None => None,
-        };
+        let occ = t.occlusion.map(|(r, s)| (r, s, self.constant(r.image, 0)));
         let occ_varies = occ.as_ref().is_some_and(|o| o.2.is_none());
         let rough_channel = |m: &Material| match (&mr, rough_const) {
             (Some(r), None) => Channel::Image {
@@ -368,11 +411,10 @@ impl<'a> Packer<'a> {
             let mut channels: Vec<Channel> = rm.iter().map(|c| c.2).collect();
             channels.resize(4, Channel::Constant(0.0));
             let toksvig = match (&normal_packed, rough_varies) {
-                (Some((r, s)), true) => Some((0, r, *s)),
+                (Some((r, s)), true) => Some((0, *r, *s)),
                 _ => None,
             };
             let id = self.make(
-                w,
                 suffix,
                 Pack {
                     role,
@@ -400,7 +442,6 @@ impl<'a> Packer<'a> {
             && (occ_varies || o.2.is_some_and(|c| 1.0 - o.1 + o.1 * c < 1.0 - 1.0 / 255.0))
         {
             let id = self.make(
-                w,
                 suffix,
                 Pack {
                     role: "occlusion",
@@ -417,10 +458,8 @@ impl<'a> Packer<'a> {
         }
 
         if let Some(r) = &t.emissive {
-            let srgb = self.image(r.image)?.srgb;
-            let rgb: Vec<Option<f32>> = (0..3)
-                .map(|c| self.constant(r.image, c))
-                .collect::<Result<_>>()?;
+            let srgb = self.image(r.image).srgb;
+            let rgb: Vec<Option<f32>> = (0..3).map(|c| self.constant(r.image, c)).collect();
             if rgb.iter().all(Option::is_some) {
                 for (c, v) in rgb.into_iter().enumerate() {
                     let v = v.expect("constant");
@@ -435,7 +474,6 @@ impl<'a> Packer<'a> {
                     b: 1.0,
                 };
                 let id = self.make(
-                    w,
                     suffix,
                     Pack {
                         role: "emission",
@@ -454,8 +492,8 @@ impl<'a> Packer<'a> {
         Ok(())
     }
 
-    /// Cooks one pack, or returns the id of an identical one cooked before.
-    fn make(&mut self, w: &mut ArchiveWriter, suffix: &str, p: Pack) -> Result<AssetId> {
+    /// Plans one pack, or returns the id of an identical one planned before.
+    fn make(&mut self, suffix: &str, p: Pack) -> Result<AssetId> {
         let mut images: Vec<usize> = p
             .channels
             .iter()
@@ -486,14 +524,22 @@ impl<'a> Packer<'a> {
         }
         let mut size = [1u32, 1];
         for &i in &images {
-            let img = &self.image(i)?.img;
-            size = [size[0].max(img.w), size[1].max(img.h)];
+            let f = self.image(i);
+            size = [size[0].max(f.w), size[1].max(f.h)];
         }
         if p.shrink {
             size = [4, 4];
         }
+        let colour = p.encoding == Encoding::Bc7Srgb;
+        let primaries = primaries
+            .or(if colour {
+                self.image(images[0]).primaries
+            } else {
+                None
+            })
+            .unwrap_or(Primaries::Rec709);
 
-        let mut key = format!(
+        let mut recipe = format!(
             "{} {:?} {:?} {:?} {:?} {:?} {quality:?} {max_size:?} {grid:?} {primaries:?} {:?} {:?}",
             p.role,
             p.encoding,
@@ -506,15 +552,61 @@ impl<'a> Packer<'a> {
         )
         .into_bytes();
         for &i in &images {
-            key.extend_from_slice(&self.image(i)?.hash.0);
+            recipe.extend_from_slice(&self.image(i).hash.0);
         }
-        key.extend_from_slice(super::encoder_key_base());
-        let key = crate::cook_key(Class::Texture, &[&key]);
-        if let Some(id) = self.made.get(&key) {
+        let same = Hash32::of(&recipe);
+        if let Some(id) = self.made.get(&same) {
             return Ok(*id);
         }
+        let name = format!("{}/texture/{suffix}/{}", self.asset, p.role);
+        let key = Key::new(Class::Texture, &name)
+            .str(super::ENCODERS)
+            .bytes(&recipe)
+            .finish();
+        let id = AssetId::from_name(&name);
+        self.made.insert(same, id);
+        self.jobs.push(TextureJob {
+            name,
+            key,
+            asset: self.asset.into(),
+            pack: p,
+            images,
+            size,
+            quality,
+            max_size,
+            grid,
+            primaries,
+            filter: self.rules.filter,
+        });
+        Ok(id)
+    }
+}
 
-        let mut img = Img::new(size[0], size[1]);
+impl TextureJob {
+    /// Estimated peak bytes: 8 per compressed source byte for the decoded sources, 48 per
+    /// output texel for the packed image and its chain.
+    pub(crate) fn working_set(&self, images: &[ImageFile]) -> u64 {
+        let sources: u64 = self
+            .images
+            .iter()
+            .map(|&i| images[i].bytes.len() as u64 * 8)
+            .sum();
+        sources + u64::from(self.size[0]) * u64::from(self.size[1]) * 48
+    }
+
+    pub(crate) fn run(&self, images: &[ImageFile]) -> Result<Built> {
+        let fail = |message: String| Error::Texture {
+            asset: self.asset.clone(),
+            message,
+        };
+        let mut decoded = HashMap::new();
+        for &i in &self.images {
+            let (img, ..) =
+                decode(&images[i]).map_err(|e| fail(format!("image {}: {e}", images[i].name)))?;
+            decoded.insert(i, img.resized(self.size[0], self.size[1]));
+        }
+        let p = &self.pack;
+        let mut img = Img::new(self.size[0], self.size[1]);
         for (c, ch) in p.channels.iter().enumerate() {
             match *ch {
                 Channel::Constant(v) => img.px.iter_mut().for_each(|t| t[c] = v),
@@ -525,8 +617,7 @@ impl<'a> Packer<'a> {
                     a,
                     b,
                 } => {
-                    let src = self.image(image)?.img.resized(size[0], size[1]);
-                    for (t, s) in img.px.iter_mut().zip(&src.px) {
+                    for (t, s) in img.px.iter_mut().zip(&decoded[&image].px) {
                         let v = if srgb {
                             srgb_to_linear(s[channel])
                         } else {
@@ -537,57 +628,38 @@ impl<'a> Packer<'a> {
                 }
             }
         }
-        let toksvig = match &p.toksvig {
-            Some((channel, r, scale)) => {
-                let mut n = self.image(r.image)?.img.resized(size[0], size[1]);
-                for t in &mut n.px {
-                    *t = [
-                        (2.0 * t[0] - 1.0) * scale,
-                        (2.0 * t[1] - 1.0) * scale,
-                        2.0 * t[2] - 1.0,
-                        1.0,
-                    ];
-                }
-                Some(Toksvig {
-                    channel: *channel,
-                    normals: n,
-                })
+        let toksvig = p.toksvig.as_ref().map(|(channel, r, scale)| {
+            let mut n = decoded[&r.image].clone();
+            for t in &mut n.px {
+                *t = [
+                    (2.0 * t[0] - 1.0) * scale,
+                    (2.0 * t[1] - 1.0) * scale,
+                    2.0 * t[2] - 1.0,
+                    1.0,
+                ];
             }
-            None => None,
-        };
-        let colour = p.encoding == Encoding::Bc7Srgb;
-        let primaries = primaries
-            .or(if colour {
-                self.image(images[0])?.primaries
-            } else {
-                None
-            })
-            .unwrap_or(Primaries::Rec709);
+            Toksvig {
+                channel: *channel,
+                normals: n,
+            }
+        });
+        drop(decoded);
         let plan = Plan {
             encoding: p.encoding,
             cube: false,
-            primaries,
+            primaries: self.primaries,
             mips: MipSpec {
-                filter: self.rules.filter,
+                filter: self.filter,
                 wrap: p.refs[0].wrap,
-                grid: grid.map(|g| g.map(u32::from)),
+                grid: self.grid.map(|g| g.map(u32::from)),
                 normal: p.normal,
                 coverage: p.coverage,
             },
-            quality,
-            max_size,
+            quality: self.quality,
+            max_size: self.max_size,
             toksvig,
             lights: Vec::new(),
         };
-        let built = super::build(vec![img], &plan)
-            .map_err(|e| self.fail(format!("texture {}: {e}", p.role)))?;
-        let id = super::add(
-            w,
-            &format!("{}/texture/{suffix}/{}", self.asset, p.role),
-            key,
-            &built,
-        )?;
-        self.made.insert(key, id);
-        Ok(id)
+        super::build(vec![img], &plan).map_err(|e| fail(format!("texture {}: {e}", p.role)))
     }
 }

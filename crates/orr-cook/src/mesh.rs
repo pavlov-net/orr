@@ -9,11 +9,13 @@ use orr_pack::mesh::{
     oct_encode,
 };
 use orr_pack::{Aabb, Span, Sphere};
+use serde::Deserialize;
 
 use crate::{Error, Result};
 
 /// How meshes are clustered and quantised.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct MeshSettings {
     /// Cluster vertex limit on solid sections.
     pub max_vertices: u16,
@@ -465,4 +467,30 @@ fn write_page(clusters: &[ClusterData], stride: usize) -> Vec<u8> {
         tri_first += c.tris.len().next_multiple_of(4);
     }
     page
+}
+
+impl MeshData {
+    /// Hash of everything the mesh cook reads.
+    pub(crate) fn hash(&self) -> orr_pack::Hash32 {
+        let mut h = blake3::Hasher::new();
+        let mut part = |b: &[u8]| {
+            h.update(&(b.len() as u64).to_le_bytes());
+            h.update(b);
+        };
+        part(bytemuck::cast_slice(&self.positions));
+        part(bytemuck::cast_slice(&self.normals));
+        part(self.tangents.as_deref().map_or(&[], bytemuck::cast_slice));
+        part(bytemuck::cast_slice(&self.uvs));
+        part(bytemuck::cast_slice(&self.indices));
+        for s in &self.sections {
+            part(&(s.indices.start as u64).to_le_bytes());
+            part(&(s.indices.end as u64).to_le_bytes());
+            part(&[s.flags]);
+        }
+        orr_pack::Hash32(*h.finalize().as_bytes())
+    }
+
+    pub(crate) fn triangles(&self) -> u64 {
+        self.indices.len() as u64 / 3
+    }
 }

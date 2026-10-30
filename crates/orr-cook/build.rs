@@ -1,7 +1,12 @@
-//! Puts the locked versions of ctt and its encoder crates into `ORR_COOK_ENCODERS`, which
-//! enters texture cook keys.
+//! Puts the locked versions of the libraries that shape cooked bytes into environment
+//! variables that enter cook keys: `ORR_COOK_ZSTD_LIBS` for every entry,
+//! `ORR_COOK_MESH_LIBS` for meshes and `ORR_COOK_TEXTURE_LIBS` for textures.
 
 use std::path::Path;
+
+const ZSTD: &[&str] = &["zstd", "zstd-safe", "zstd-sys"];
+const MESH: &[&str] = &["meshopt", "gltf", "gltf-json"];
+const TEXTURE: &[&str] = &["bcdec_rs", "image", "png", "half"];
 
 fn main() {
     let dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
@@ -9,7 +14,7 @@ fn main() {
         .ancestors()
         .map(|d| d.join("Cargo.lock"))
         .find(|p| p.exists());
-    let mut versions = Vec::new();
+    let mut locked = Vec::new();
     if let Some(lock) = lock {
         println!("cargo:rerun-if-changed={}", lock.display());
         let text = std::fs::read_to_string(&lock).expect("Cargo.lock");
@@ -17,13 +22,30 @@ fn main() {
         for line in text.lines() {
             if let Some(n) = line.strip_prefix("name = ") {
                 name = Some(n.trim_matches('"').to_string());
-            } else if let (Some(v), Some(n)) = (line.strip_prefix("version = "), name.take())
-                && (n == "ctt" || n.starts_with("ctt-"))
-            {
-                versions.push(format!("{n} {}", v.trim_matches('"')));
+            } else if let (Some(v), Some(n)) = (line.strip_prefix("version = "), name.take()) {
+                locked.push((n, v.trim_matches('"').to_string()));
             }
         }
     }
-    versions.sort();
-    println!("cargo:rustc-env=ORR_COOK_ENCODERS={}", versions.join(", "));
+    let versions = |pick: &dyn Fn(&str) -> bool| {
+        let mut v: Vec<String> = locked
+            .iter()
+            .filter(|(n, _)| pick(n))
+            .map(|(n, v)| format!("{n} {v}"))
+            .collect();
+        v.sort();
+        v.join(", ")
+    };
+    println!(
+        "cargo:rustc-env=ORR_COOK_ZSTD_LIBS={}",
+        versions(&|n| ZSTD.contains(&n))
+    );
+    println!(
+        "cargo:rustc-env=ORR_COOK_MESH_LIBS={}",
+        versions(&|n| MESH.contains(&n))
+    );
+    println!(
+        "cargo:rustc-env=ORR_COOK_TEXTURE_LIBS={}",
+        versions(&|n| n == "ctt" || n.starts_with("ctt-") || TEXTURE.contains(&n))
+    );
 }

@@ -19,13 +19,16 @@ fn dir(name: &str) -> PathBuf {
 }
 
 fn cook(assets: Vec<AssetSpec>) -> Archive {
-    let cooked = orr_cook::cook(&Manifest {
-        archives: vec![ArchiveSpec {
-            output: Target::Memory,
-            cell_log2: ArchiveSpec::DEFAULT_CELL_LOG2,
-            assets,
-        }],
-    })
+    let cooked = orr_cook::cook(
+        &Manifest {
+            archives: vec![ArchiveSpec {
+                output: Target::Memory,
+                cell_log2: ArchiveSpec::DEFAULT_CELL_LOG2,
+                assets,
+            }],
+        },
+        &Default::default(),
+    )
     .unwrap();
     Archive::from_memory(std::sync::Arc::clone(&cooked.memory[0])).unwrap()
 }

@@ -182,7 +182,9 @@ fn cook_memory(path: &Path) -> orr_cook::Result<Archive> {
             }],
         }],
     };
-    let bytes = orr_cook::cook(&manifest)?.memory.remove(0);
+    let bytes = orr_cook::cook(&manifest, &Default::default())?
+        .memory
+        .remove(0);
     Ok(Archive::from_memory(bytes).unwrap())
 }
 

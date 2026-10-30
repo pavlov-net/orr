@@ -2,17 +2,21 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
+use orr_cook::{CookOptions, Manifest, Outcome};
 use orr_pack::instance::{InstancePageInfo, InstanceRecord};
 use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, Class, Codec, Entry};
 
 const USAGE: &str = "usage:
+  orr-cook build <manifest.toml> [--jobs N] [--force] [--cache DIR] [--cache-cap BYTES]
+                 [--working-set BYTES] [--report r.json]
   orr-cook inspect <archive> [--class C] [--name N]
   orr-cook verify <archive>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
+        Some("build") => build(&args[1..]),
         Some("inspect") => inspect(&args[1..]),
         Some("verify") => verify(&args[1..]),
         _ => Err(USAGE.into()),
@@ -28,6 +32,55 @@ fn main() -> ExitCode {
 }
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+fn build(args: &[String]) -> Result<bool> {
+    let mut opts = CookOptions::default();
+    let mut manifest = None;
+    let mut it = args.iter();
+    let number =
+        |v: Option<&String>| -> Result<u64> { Ok(v.ok_or(USAGE)?.parse().map_err(|_| USAGE)?) };
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--jobs" => opts.jobs = number(it.next())? as usize,
+            "--force" => opts.force = true,
+            "--cache" => opts.cache = Some(it.next().ok_or(USAGE)?.into()),
+            "--cache-cap" => opts.cache_cap = Some(number(it.next())?),
+            "--working-set" => opts.working_set = number(it.next())?,
+            "--report" => opts.report = Some(it.next().ok_or(USAGE)?.into()),
+            _ if manifest.is_none() => manifest = Some(Path::new(a)),
+            _ => return Err(USAGE.into()),
+        }
+    }
+    let manifest = Manifest::load(manifest.ok_or(USAGE)?)?;
+    let cooked = orr_cook::cook(&manifest, &opts)?;
+    let mut out = io::stdout().lock();
+    let (mut cooked_n, mut linked) = (0, 0);
+    for e in cooked.report.assets.iter().flat_map(|a| &a.entries) {
+        match e.outcome {
+            Outcome::Cooked => cooked_n += 1,
+            Outcome::Cache | Outcome::Archive => linked += 1,
+        }
+    }
+    for a in &cooked.report.archives {
+        writeln!(
+            out,
+            "{}: {} entries, {} B{}",
+            a.output
+                .as_deref()
+                .unwrap_or(Path::new("(memory)"))
+                .display(),
+            a.entries,
+            a.bytes,
+            if a.written { "" } else { ", unchanged" }
+        )?;
+    }
+    writeln!(
+        out,
+        "{cooked_n} entries cooked, {linked} linked in {:.2} s",
+        cooked.report.seconds
+    )?;
+    Ok(true)
+}
 
 fn class_name(class: u16) -> String {
     match Class::from_u16(class) {

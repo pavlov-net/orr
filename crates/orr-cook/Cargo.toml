@@ -16,14 +16,24 @@ bytemuck.workspace = true
 # Exact pin: 0.6.1 removed a public re-export in a patch release. Default features pull
 # encoders the cook does not use.
 ctt = { version = "=0.6.1", default-features = false, features = ["encoder-bc7enc", "encoder-intel", "ispc-prebuilt", "rayon"] }
-glam.workspace = true
+glam = { workspace = true, features = ["serde"] }
 gltf = { version = "=1.4.1", default-features = false, features = ["utils", "names", "extras", "KHR_materials_emissive_strength", "KHR_materials_ior"] }
 half = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr", "exr"] }
 meshopt = "=0.7.0"
 png = "0.18"
 rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror.workspace = true
+toml = "0.9"
+zstd.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_System_SystemInformation"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true

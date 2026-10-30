@@ -9,14 +9,16 @@ use orr_pack::instance::{
     self, InstancePageHeader, InstancePageInfo, InstanceRecord, MAX_HIDDEN_SECTION, MAX_POSE,
     MAX_RECORDS, PARTITION_INSTANCES, Prototype, SectionOverride,
 };
-use orr_pack::{ArchiveWriter, AssetId, BlobIn, Class, Span};
+use orr_pack::{ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span};
+use serde::Deserialize;
 
-use crate::{Error, Result, cook_key, mount};
+use crate::{Error, Result, mount};
 
 /// Placements of cooked models. The cook splits them into the archive's cells and writes one
 /// instance page per cell, or several when a cell holds more than
 /// [`instance::MAX_RECORDS`]; pages are named `N/<x>_<y>_<z>/<i>` after the cell.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Instances {
     pub records: Vec<Placement>,
     pub prototypes: Vec<PrototypeSpec>,
@@ -29,7 +31,8 @@ pub struct Instances {
     pub joined: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Placement {
     /// World position, metres.
     pub position: DVec3,
@@ -41,7 +44,8 @@ pub struct Placement {
 }
 
 /// A model as the records place it.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PrototypeSpec {
     /// Asset name of a model cooked by the same manifest.
     pub model: String,
@@ -54,7 +58,8 @@ pub struct PrototypeSpec {
     pub sections: Vec<SectionSpec>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SectionSpec {
     /// Asset name of a material cooked by the same manifest; `None` keeps the model's.
     pub material: Option<String>,
@@ -78,12 +83,14 @@ pub(crate) struct Catalog {
     pub materials: HashSet<String>,
 }
 
+/// Writes the pages of `src`, cells in Morton order, every page under `key`.
 pub(crate) fn cook(
     w: &mut ArchiveWriter,
     name: &str,
     src: &Instances,
     cell_log2: u8,
     catalog: &Catalog,
+    key: Hash32,
 ) -> Result<()> {
     let prototypes = resolve_prototypes(name, src, catalog)?;
     check_records(name, src)?;
@@ -104,7 +111,8 @@ pub(crate) fn cook(
         cells.entry(c.as_ivec3().to_array()).or_default().push(i);
     }
 
-    let source_key = source_key(src, cell_log2, &prototypes);
+    let mut cells: Vec<_> = cells.into_iter().collect();
+    cells.sort_by_key(|(c, _)| morton(*c));
     for (cell, records) in &cells {
         let pages = split_cell(&rel, records, edge).ok_or_else(|| crowded(name, *cell))?;
         for (page, members) in pages.into_iter().enumerate() {
@@ -117,16 +125,11 @@ pub(crate) fn cook(
             if stride > 0 {
                 blobs.push(BlobIn::new(&built.user));
             }
-            let key_cell: Vec<u8> = cell
-                .iter()
-                .chain(&[page as i32])
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
             w.add(
                 &format!("{name}/{}_{}_{}/{page}", cell[0], cell[1], cell[2]),
                 Class::InstancePage as u16,
                 instance::SCHEMA,
-                cook_key(Class::InstancePage, &[&source_key, &key_cell]),
+                key,
                 &blobs,
             )?;
         }
@@ -271,15 +274,12 @@ fn check_records(name: &str, src: &Instances) -> Result<()> {
     Ok(())
 }
 
-fn source_key(src: &Instances, cell_log2: u8, prototypes: &[Resolved]) -> Vec<u8> {
+/// Hash of the placements and settings; the models and materials enter keys through their
+/// own keys.
+pub(crate) fn input_hash(src: &Instances, cell_log2: u8) -> Hash32 {
     let mut h = blake3::Hasher::new();
     h.update(&[cell_log2, u8::from(src.joined)]);
     h.update(format!("{:?}", src.prototypes).as_bytes());
-    for r in prototypes {
-        h.update(&r.facts.instances.to_le_bytes());
-        h.update(&r.facts.sections.to_le_bytes());
-        h.update(&r.facts.position_exponent.to_le_bytes());
-    }
     for p in &src.records {
         h.update(bytemuck::cast_slice(&p.position.to_array()));
         h.update(bytemuck::cast_slice(&p.rotation.to_array()));
@@ -288,7 +288,28 @@ fn source_key(src: &Instances, cell_log2: u8, prototypes: &[Resolved]) -> Vec<u8
     }
     h.update(&src.user_stride.to_le_bytes());
     h.update(&src.user);
-    h.finalize().as_bytes().to_vec()
+    Hash32(*h.finalize().as_bytes())
+}
+
+/// Morton code of a cell, signed coordinates biased to unsigned.
+fn morton(cell: [i32; 3]) -> u128 {
+    let mut code = 0u128;
+    let c = cell.map(|v| (v as u32) ^ 0x8000_0000);
+    for bit in 0..32 {
+        for (axis, v) in c.iter().enumerate() {
+            code |= u128::from((v >> bit) & 1) << (3 * bit + axis);
+        }
+    }
+    code
+}
+
+/// Commit order of an instance source's pages: cells in Morton order, then page index.
+pub(crate) fn page_order(source: &str, page: &str) -> Option<(u128, u32)> {
+    let rest = page.strip_prefix(source)?.strip_prefix('/')?;
+    let (cell, index) = rest.split_once('/')?;
+    let mut it = cell.split('_').map(str::parse::<i32>);
+    let c = [it.next()?.ok()?, it.next()?.ok()?, it.next()?.ok()?];
+    Some((morton(c), index.parse().ok()?))
 }
 
 /// The records of one cell in pages of at most [`MAX_RECORDS`]: Morton-prefix cells of the

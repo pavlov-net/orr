@@ -11,6 +11,7 @@ use orr_pack::texture::{
     tail_first_mip, tile,
 };
 use orr_pack::{ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span};
+use serde::Deserialize;
 
 pub(crate) use encode::Encoding;
 pub(crate) use load::Source;
@@ -19,7 +20,8 @@ pub(crate) use mips::{MipSpec, Toksvig};
 use crate::{Error, Result};
 
 /// How one texture is cooked.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct TextureSettings {
     pub usage: Usage,
     /// Alpha-tested coverage cutoff. With it, every mip's alpha is scaled so the fraction of
@@ -58,7 +60,8 @@ impl Default for TextureSettings {
 }
 
 /// What a texture holds; sets its format.
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Usage {
     /// sRGB colour (RGB) to BC7 sRGB.
     Color,
@@ -81,6 +84,7 @@ pub enum Usage {
     /// BC6H with mips. Each connected region over `light_threshold` (luminance), brightest
     /// first up to `max_lights`, moves into one directional light of equal energy.
     Environment {
+        #[serde(default)]
         light_threshold: Option<f32>,
         max_lights: u8,
     },
@@ -89,7 +93,8 @@ pub enum Usage {
 }
 
 /// Uncompressed formats for [`Usage::Data`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DataFormat {
     R8,
     Rg8,
@@ -107,7 +112,8 @@ pub enum DataFormat {
 }
 
 /// Encoder effort.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Quality {
     /// For development cooks.
     Fast,
@@ -117,7 +123,8 @@ pub enum Quality {
 }
 
 /// Colour primaries.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Primaries {
     Rec709,
     DisplayP3,
@@ -144,7 +151,8 @@ impl Primaries {
 }
 
 /// Mip downsampling filter, applied to linear values.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MipFilter {
     /// Area average.
     Box,
@@ -154,7 +162,8 @@ pub enum MipFilter {
 }
 
 /// Filter edge handling.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Wrap {
     #[default]
     Repeat,
@@ -380,22 +389,8 @@ pub(crate) fn cook_file(asset: &str, bytes: &[u8], s: &TextureSettings) -> Resul
         })
 }
 
-/// Bytes naming the encoders and the locked versions of ctt and its encoder crates, for
-/// cook keys.
-pub(crate) fn encoder_key_base() -> &'static [u8] {
-    concat!(
-        "bc7e for BC7, intel for BC4 BC5 BC6H; ",
-        env!("ORR_COOK_ENCODERS")
-    )
-    .as_bytes()
-}
-
-/// Bytes naming every encoder choice that shapes a `Source::Texture` output, for cook keys.
-pub(crate) fn encoder_key(s: &TextureSettings) -> Vec<u8> {
-    let mut k = encoder_key_base().to_vec();
-    k.extend_from_slice(format!("{s:?}").as_bytes());
-    k
-}
+/// The encoders, for cook keys; their crate versions enter through [`crate::key`].
+pub(crate) const ENCODERS: &str = "bc7e for BC7, intel for BC4 BC5 BC6H";
 
 fn cook_source(src: Source, s: &TextureSettings) -> Result<Built, String> {
     let primaries = s.primaries.or(src.primaries).unwrap_or(Primaries::Rec709);

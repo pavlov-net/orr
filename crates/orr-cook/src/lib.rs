@@ -15,38 +15,65 @@
 //! A texture source emits one texture `N`.
 //!
 //! An instances source emits instance pages `N/<x>_<y>_<z>/<i>` per world cell
-//! ([`Instances`]); it can place models cooked by any archive of the manifest, and is cooked
-//! after every other source. A user source emits one entry `N` of a consumer class.
+//! ([`Instances`]); it can place models cooked by any archive of the manifest. A user source
+//! emits one entry `N` of a consumer class.
+//!
+//! The cook is incremental. Every entry carries a cook key: a hash of its class's cook
+//! version, the libraries that shape its bytes, its name, its settings, the content of its
+//! inputs and the keys of the entries it depends on. An entry whose key matches an entry of
+//! the archive being replaced, or of the cache ([`CookOptions::cache`]), is copied from there
+//! without cooking; an archive whose entries all match is left as it is. A file archive
+//! keeps `<archive>.cookstate` beside it: the hash of each input file by size and time, and
+//! the files and keys of each source, so a source whose files did not change is not even
+//! imported. Entries are written in a fixed order (sorted by name, instance pages last in
+//! Morton order of their cells), so the same inputs give the same bytes whatever the thread
+//! count, the target and the mix of cooked and linked entries.
 
+mod alloc;
+mod cache;
 mod gltf;
 mod instances;
+mod key;
+mod manifest;
 mod mesh;
+mod report;
+mod run;
+mod state;
 mod texture;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use orr_pack::material::Material;
-use orr_pack::model::{ModelHeader, ModelInfo};
-use orr_pack::{ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span, Target};
+use orr_pack::{BlobIn, Target};
+use serde::Deserialize;
 
 pub use instances::{Instances, Placement, PrototypeSpec, SectionSpec};
 pub use mesh::MeshSettings;
+pub use report::{
+    ArchiveReport, AssetReport, CookReport, EntryReport, MeshReport, Outcome, TextureReport,
+};
 pub use texture::material::{TextureOverride, TextureRules};
 pub use texture::{DataFormat, MipFilter, Primaries, Quality, TextureSettings, Usage, Wrap};
 
-/// Archives to cook.
-#[derive(Clone, Debug, Default)]
+/// Archives to cook. [`Manifest::load`] reads one from TOML.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
+    #[serde(rename = "archive", default)]
     pub archives: Vec<ArchiveSpec>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArchiveSpec {
+    /// In TOML, a file path.
+    #[serde(deserialize_with = "manifest::file_target")]
     pub output: Target,
     /// World cells of instance pages have an edge of `2^cell_log2` m; the renderer's cell
     /// size must match. [`Self::DEFAULT_CELL_LOG2`] is 256 m.
+    #[serde(default = "manifest::default_cell_log2")]
     pub cell_log2: u8,
+    #[serde(rename = "asset", default)]
     pub assets: Vec<AssetSpec>,
 }
 
@@ -62,23 +89,27 @@ impl ArchiveSpec {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct AssetSpec {
     /// Logical name; asset ids derive from it.
     pub name: String,
+    #[serde(flatten)]
     pub source: Source,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Source {
     /// A glTF 2.0 file, `.gltf` or `.glb`.
     Gltf {
         path: PathBuf,
+        #[serde(default)]
         settings: GltfSettings,
     },
     /// An image file: PNG, JPEG, Radiance HDR, OpenEXR, KTX2 or DDS.
     Texture {
         path: PathBuf,
+        #[serde(default)]
         settings: TextureSettings,
     },
     /// Placements of models cooked by the same manifest.
@@ -93,15 +124,52 @@ pub enum Source {
     },
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct GltfSettings {
     pub mesh: MeshSettings,
     pub textures: TextureRules,
 }
 
+/// How [`cook`] runs.
+#[derive(Clone, Debug)]
+pub struct CookOptions {
+    /// Threads of the cook's own pool; 0 uses one per core. The cook never uses the global
+    /// rayon pool.
+    pub jobs: usize,
+    /// Cook every entry, ignoring the cache, the archive being replaced and the cookstate.
+    pub force: bool,
+    /// Where to write the [`CookReport`] as JSON.
+    pub report: Option<PathBuf>,
+    /// Directory of the content-addressed cache; `None` for no cache, e.g. in-process cooks.
+    pub cache: Option<PathBuf>,
+    /// After the cook, least recently used cache archives are removed down to this size.
+    pub cache_cap: Option<u64>,
+    /// Bytes the running jobs may hold by their estimates; a job over it runs alone.
+    pub working_set: u64,
+    /// Bytes of finished entries that may wait for their turn to be written; past it only
+    /// the jobs the next entries wait on start.
+    pub reorder_window: u64,
+}
+
+impl Default for CookOptions {
+    fn default() -> Self {
+        Self {
+            jobs: 0,
+            force: false,
+            report: None,
+            cache: None,
+            cache_cap: None,
+            working_set: alloc::physical_memory() / 2,
+            reorder_window: 1 << 30,
+        }
+    }
+}
+
 /// Result of [`cook`].
 #[derive(Debug, Default)]
 pub struct Cooked {
+    pub report: CookReport,
     /// One archive per [`Target::Memory`] output, in manifest order.
     pub memory: Vec<Arc<[u8]>>,
 }
@@ -115,6 +183,17 @@ pub enum Error {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("cannot write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// The manifest cannot be read.
+    #[error("{path}: {message}")]
+    Manifest { path: PathBuf, message: String },
+    /// An input file changed while the cook ran.
+    #[error("{path} changed during the cook")]
+    Changed { path: PathBuf },
     /// The source cannot be imported.
     #[error("{asset}: {message}")]
     Import { asset: String, message: String },
@@ -151,89 +230,9 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Changes whenever the cook writes different output for the same inputs and settings.
-const COOK_VERSION: u32 = 1;
-
-/// Cooks every archive of the manifest. Work runs on the cook's own thread pool.
-pub fn cook(manifest: &Manifest) -> Result<Cooked> {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .build()
-        .map_err(|e| orr_pack::Error::from(std::io::Error::other(e)))?;
-    pool.install(|| cook_on_pool(manifest))
-}
-
-fn cook_on_pool(manifest: &Manifest) -> Result<Cooked> {
-    let mut catalog = instances::Catalog::default();
-    let mut writers = Vec::with_capacity(manifest.archives.len());
-    for spec in &manifest.archives {
-        let mut w = ArchiveWriter::create(spec.output.clone())?;
-        for asset in &spec.assets {
-            cook_asset(&mut w, asset, &mut catalog)?;
-        }
-        writers.push(w);
-    }
-    let mut cooked = Cooked::default();
-    for (spec, mut w) in manifest.archives.iter().zip(writers) {
-        for asset in &spec.assets {
-            if let Source::Instances(src) = &asset.source {
-                instances::cook(&mut w, &asset.name, src, spec.cell_log2, &catalog)?;
-            }
-        }
-        if let Some(bytes) = w.finish()? {
-            cooked.memory.push(bytes);
-        }
-    }
-    Ok(cooked)
-}
-
-/// Cooks every source but instances, which wait for the models of the whole manifest.
-fn cook_asset(
-    w: &mut ArchiveWriter,
-    asset: &AssetSpec,
-    catalog: &mut instances::Catalog,
-) -> Result<()> {
-    let name = &asset.name;
-    match &asset.source {
-        Source::Gltf { path, settings } => cook_gltf(w, name, path, settings, catalog),
-        Source::Texture { path, settings } => {
-            let bytes = std::fs::read(path).map_err(|source| Error::Read {
-                path: path.clone(),
-                source,
-            })?;
-            let built = texture::cook_file(name, &bytes, settings)?;
-            let key = cook_key(Class::Texture, &[&texture::encoder_key(settings), &bytes]);
-            texture::add(w, name, key, &built)?;
-            Ok(())
-        }
-        Source::Instances(_) => Ok(()),
-        Source::User {
-            class,
-            schema,
-            version,
-            bytes,
-        } => {
-            if *class < Class::USER_FIRST {
-                return Err(Error::UserClass {
-                    asset: name.clone(),
-                    class: *class,
-                });
-            }
-            let key = cook_key(*class, &[&version.to_le_bytes(), bytes]);
-            w.add(name, *class, *schema, key, &[BlobIn::new(bytes)])?;
-            Ok(())
-        }
-    }
-}
-
-/// Content key of a cooked entry from everything that shapes its output.
-fn cook_key(class: impl Into<u16>, parts: &[&[u8]]) -> Hash32 {
-    let mut h = blake3::Hasher::new();
-    h.update(&COOK_VERSION.to_le_bytes());
-    h.update(&class.into().to_le_bytes());
-    for p in parts {
-        h.update(p);
-    }
-    Hash32(*h.finalize().as_bytes())
+/// Cooks every archive of the manifest on the cook's own thread pool.
+pub fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
+    run::cook(manifest, opts)
 }
 
 fn mount(bytes: &[u8]) -> BlobIn<'_> {
@@ -243,75 +242,8 @@ fn mount(bytes: &[u8]) -> BlobIn<'_> {
     }
 }
 
-fn cook_gltf(
-    w: &mut ArchiveWriter,
-    name: &str,
-    path: &Path,
-    settings: &GltfSettings,
-    catalog: &mut instances::Catalog,
-) -> Result<()> {
-    let src = gltf::import(name, path)?;
-    let settings_key = format!("{settings:?}");
-    let key = |class: Class| cook_key(class, &[settings_key.as_bytes(), &src.input_hash.0]);
-
-    let cooked = mesh::cook(name, &src.mesh, &settings.mesh)?;
-    let info = cooked.info.to_bytes();
-    let pinned = cooked.info.header.pinned_pages as usize;
-    let mut blobs = vec![mount(&info)];
-    blobs.extend(cooked.pages.iter().enumerate().map(|(i, p)| BlobIn {
-        mount: i < pinned,
-        ..BlobIn::new(p)
-    }));
-    let mesh = w.add(
-        &format!("{name}/mesh"),
-        Class::Mesh as u16,
-        orr_pack::mesh::SCHEMA,
-        key(Class::Mesh),
-        &blobs,
-    )?;
-
-    let mut packer = texture::material::Packer::new(name, &src.images, &settings.textures);
-    let mut materials = Vec::with_capacity(src.materials.len());
-    for (suffix, m, textures) in &src.materials {
-        let mut m = *m;
-        packer.material(w, suffix, &mut m, textures)?;
-        let material_name = format!("{name}/material/{suffix}");
-        catalog.materials.insert(material_name.clone());
-        materials.push(w.add(
-            &material_name,
-            Class::Material as u16,
-            orr_pack::material::SCHEMA,
-            key(Class::Material),
-            &[mount(bytemuck::bytes_of::<Material>(&m))],
-        )?);
-    }
-
-    catalog.models.insert(
-        name.to_owned(),
-        instances::ModelFacts {
-            instances: (cooked.info.parts.len() as u32).max(1),
-            sections: cooked.info.sections.len() as u32,
-            position_exponent: cooked.info.header.position_exponent,
-        },
-    );
-    let model = ModelInfo {
-        header: ModelHeader {
-            kind: ModelHeader::MODEL,
-            _pad: [0; 3],
-            bounds: cooked.info.header.bounds,
-            mesh,
-            skeleton: AssetId::NONE,
-            materials: Span::default(),
-        },
-        materials,
-    }
-    .to_bytes();
-    w.add(
-        name,
-        Class::Model as u16,
-        orr_pack::model::SCHEMA,
-        key(Class::Model),
-        &[mount(&model)],
-    )?;
-    Ok(())
+/// The cook version of a class. It changes whenever the cook writes different bytes for the
+/// same inputs, and it enters every cook key of the class.
+pub fn cook_version(class: u16) -> u32 {
+    key::version(class)
 }

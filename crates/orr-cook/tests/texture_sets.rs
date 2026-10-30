@@ -161,13 +161,19 @@ fn texture_set_cooks() {
     }
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("texture-set.orr");
     let t = std::time::Instant::now();
-    orr_cook::cook(&Manifest {
-        archives: vec![ArchiveSpec {
-            output: Target::File(out.clone()),
-            cell_log2: ArchiveSpec::DEFAULT_CELL_LOG2,
-            assets,
-        }],
-    })
+    orr_cook::cook(
+        &Manifest {
+            archives: vec![ArchiveSpec {
+                output: Target::File(out.clone()),
+                cell_log2: ArchiveSpec::DEFAULT_CELL_LOG2,
+                assets,
+            }],
+        },
+        &orr_cook::CookOptions {
+            force: true,
+            ..Default::default()
+        },
+    )
     .unwrap();
     println!(
         "{} PNGs cooked in {:.1} s to {} MiB",
@@ -262,25 +268,28 @@ fn hdr_set_round_trips() {
         if sw != 2 * sh {
             continue;
         }
-        let cooked = orr_cook::cook(&Manifest {
-            archives: vec![ArchiveSpec {
-                output: Target::Memory,
-                cell_log2: ArchiveSpec::DEFAULT_CELL_LOG2,
-                assets: vec![AssetSpec {
-                    name: "env".into(),
-                    source: Source::Texture {
-                        path: p.clone(),
-                        settings: TextureSettings {
-                            usage: Usage::Environment {
-                                light_threshold: None,
-                                max_lights: 0,
+        let cooked = orr_cook::cook(
+            &Manifest {
+                archives: vec![ArchiveSpec {
+                    output: Target::Memory,
+                    cell_log2: ArchiveSpec::DEFAULT_CELL_LOG2,
+                    assets: vec![AssetSpec {
+                        name: "env".into(),
+                        source: Source::Texture {
+                            path: p.clone(),
+                            settings: TextureSettings {
+                                usage: Usage::Environment {
+                                    light_threshold: None,
+                                    max_lights: 0,
+                                },
+                                ..TextureSettings::default()
                             },
-                            ..TextureSettings::default()
                         },
-                    },
+                    }],
                 }],
-            }],
-        })
+            },
+            &Default::default(),
+        )
         .unwrap();
         let a = Archive::from_memory(std::sync::Arc::clone(&cooked.memory[0])).unwrap();
         let e = a.find(AssetId::from_name("env")).unwrap();
