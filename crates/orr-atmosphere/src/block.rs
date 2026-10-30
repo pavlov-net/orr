@@ -12,7 +12,8 @@ use crate::{Atmosphere, DOBSON_UNIT};
 /// LUT passes per frame: the wavelength groups three at a time.
 pub(crate) const PASSES: usize = SPECTRAL_GROUPS / 3;
 
-fn rec2020(c: Vec3) -> [f64; 3] {
+/// A linear Rec.709 colour in linear Rec.2020.
+pub(crate) fn rec2020(c: Vec3) -> [f64; 3] {
     mul(&REC709_TO_REC2020, c.as_dvec3().to_array())
 }
 
@@ -24,7 +25,7 @@ fn xyz(v: [f64; 3]) -> [f32; 4] {
 const NIGHT_ZENITH: f64 = 2e-4;
 
 /// Ozone molecules per m^3 at the tent's peak.
-fn ozone_peak(a: &Atmosphere) -> f64 {
+pub(crate) fn ozone_peak(a: &Atmosphere) -> f64 {
     f64::from(a.ozone.column) * DOBSON_UNIT / f64::from(a.ozone.half_width)
 }
 

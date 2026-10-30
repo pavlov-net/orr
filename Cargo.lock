@@ -1677,6 +1677,7 @@ name = "scene-suite"
 version = "0.0.1"
 dependencies = [
  "glam",
+ "gpu-suite",
  "orr",
  "orr-gpu",
  "orr-scene",

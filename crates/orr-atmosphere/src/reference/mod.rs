@@ -24,9 +24,10 @@ use glam::DVec3;
 
 use self::medium::{COMPONENTS, Columns, Densities, Leg, Profile, Ray};
 use self::phase::{FogPhase, Rng};
-use crate::colour::{REC709_TO_REC2020, REC2020_TO_XYZ, mul};
+use crate::Atmosphere;
+use crate::block::{ozone_peak, rec2020};
+use crate::colour::{REC2020_TO_XYZ, mul};
 use crate::spectrum::{self, Bands, rgb_at};
-use crate::{Atmosphere, DOBSON_UNIT};
 
 /// Interactions after which a path ends.
 const MAX_INTERACTIONS: u32 = 256;
@@ -152,23 +153,21 @@ impl Reference {
     pub fn run(&self, channels: Channels) -> Run<'_> {
         let a = &self.atmosphere;
         let alpha = f64::from(a.aerosol.angstrom_exponent);
+        let groups = || {
+            self.chans(&spectrum::GROUPS, |k| {
+                spectrum::GROUPS.aerosol_factor(k, alpha)
+            })
+        };
         let chans = match channels {
             Channels::Spectral => self.chans(&spectrum::SPECTRAL, |k| {
                 (spectrum::SPECTRAL.wavelength[k] / 550.0).powf(-alpha)
             }),
-            Channels::Groups => self.chans(&spectrum::GROUPS, |k| {
-                spectrum::GROUPS.aerosol_factor(k, alpha)
-            }),
+            Channels::Groups => groups(),
             Channels::Rgb => self.chans(&spectrum::RGB, |k| spectrum::RGB.aerosol_factor(k, alpha)),
         };
-        let light_groups = (channels == Channels::Rgb).then(|| {
-            self.chans(&spectrum::GROUPS, |k| {
-                spectrum::GROUPS.aerosol_factor(k, alpha)
-            })
-        });
+        let light_groups = (channels == Channels::Rgb).then(groups);
         Run {
             reference: self,
-            channels,
             chans,
             light_groups,
         }
@@ -180,21 +179,14 @@ impl Reference {
         aerosol_factor: impl Fn(usize) -> f64,
     ) -> Vec<Chan> {
         let a = &self.atmosphere;
-        let rec2020 = |c: glam::Vec3| mul(&REC709_TO_REC2020, c.as_dvec3().to_array());
         let ground = rec2020(a.ground_albedo);
         let (fog_ext, fog_albedo) = a.height_fog.map_or((0.0, [0.0; 3]), |f| {
             (f64::from(f.density), rec2020(f.albedo))
         });
-        let ozone_peak = f64::from(a.ozone.column) * DOBSON_UNIT / f64::from(a.ozone.half_width);
+        let ozone_peak = ozone_peak(a);
         (0..N)
             .map(|k| {
-                let per_channel = |rgb: [f64; 3]| {
-                    if N == 3 {
-                        rgb[k]
-                    } else {
-                        rgb_at(bands.wavelength[k], rgb)
-                    }
-                };
+                let per_channel = |rgb: [f64; 3]| rgb_at(bands.wavelength[k], rgb);
                 let rayleigh = bands.rayleigh[k] * f64::from(a.rayleigh.density);
                 let aerosol = f64::from(a.aerosol.optical_depth_550) * aerosol_factor(k);
                 Chan {
@@ -253,7 +245,6 @@ fn dot(a: &Densities, b: &Densities) -> f64 {
 /// A [`Reference`] at one spectral resolution.
 pub struct Run<'a> {
     reference: &'a Reference,
-    channels: Channels,
     chans: Vec<Chan>,
     /// The group channels that give the Rec.2020 bands their light transmittance.
     light_groups: Option<Vec<Chan>>,
@@ -334,14 +325,7 @@ impl Run<'_> {
     fn tint(&self, light: &Light) -> Vec<f64> {
         self.chans
             .iter()
-            .enumerate()
-            .map(|(k, ch)| {
-                if self.channels == Channels::Rgb {
-                    light.colour[k]
-                } else {
-                    rgb_at(ch.wavelength, light.colour)
-                }
-            })
+            .map(|ch| rgb_at(ch.wavelength, light.colour))
             .collect()
     }
 
