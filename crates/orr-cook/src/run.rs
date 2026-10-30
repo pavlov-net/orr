@@ -8,7 +8,7 @@
 //! [`CookOptions::reorder_window`], only the jobs the next unwritten units wait on start.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
@@ -656,12 +656,6 @@ impl<'m, 's> Run<'m, 's> {
             .iter()
             .map(|(n, &u)| (AssetId::from_name(n), u))
             .collect();
-        let materials: HashSet<String> = self
-            .units
-            .iter()
-            .filter(|u| u.class == Class::Material as u16)
-            .map(|u| u.name.clone())
-            .collect();
         for (a, asset, src) in std::mem::take(&mut self.instances) {
             let name = self.assets[asset].name.clone();
             let cell_log2 = self.manifest.archives[a].cell_log2;
@@ -698,17 +692,13 @@ impl<'m, 's> Run<'m, 's> {
             let mut deps: Vec<usize> = meshes.iter().map(|m| m.1).collect();
             deps.sort_unstable();
             deps.dedup();
-            let catalog = Catalog {
-                materials: materials.clone(),
-                ..Catalog::default()
-            };
             self.add(Unit {
                 archive: a,
                 asset,
                 name,
                 class: Class::InstancePage as u16,
                 key: key.finish(),
-                work: Some(Work::Instances(src, cell_log2, catalog, meshes)),
+                work: Some(Work::Instances(src, cell_log2, Catalog::new(), meshes)),
                 deps,
                 working_set: src.records.len() as u64 * 256,
                 triangles: 0,
@@ -971,7 +961,7 @@ impl<'m, 's> Run<'m, 's> {
         if let Work::Instances(_, _, catalog, meshes) = &mut work {
             for (model, mesh) in meshes.drain(..) {
                 if let Some((_, facts)) = self.units[mesh].mesh {
-                    catalog.models.insert(model, facts);
+                    catalog.insert(model, facts);
                 }
             }
         }

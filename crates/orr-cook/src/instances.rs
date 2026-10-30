@@ -1,7 +1,7 @@
 //! Instance page cook: world placements grouped by cell, quantised, Morton-ordered and cut
 //! into PTLAS partitions.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use bytemuck::Zeroable;
 use glam::{DVec3, Quat, Vec3};
@@ -77,11 +77,8 @@ pub(crate) struct ModelFacts {
     pub position_exponent: i8,
 }
 
-#[derive(Default)]
-pub(crate) struct Catalog {
-    pub models: HashMap<String, ModelFacts>,
-    pub materials: HashSet<String>,
-}
+/// Facts of the models an instance source names, by asset name.
+pub(crate) type Catalog = HashMap<String, ModelFacts>;
 
 /// Writes the pages of `src`, cells in Morton order, every page under `key`.
 pub(crate) fn cook(
@@ -166,13 +163,10 @@ fn resolve_prototypes(name: &str, src: &Instances, catalog: &Catalog) -> Result<
         .enumerate()
         .map(|(i, p)| {
             let prototype = i as u16;
-            let facts = *catalog
-                .models
-                .get(&p.model)
-                .ok_or_else(|| Error::UnknownModel {
-                    asset: name.into(),
-                    model: p.model.clone(),
-                })?;
+            let facts = *catalog.get(&p.model).ok_or_else(|| Error::UnknownModel {
+                asset: name.into(),
+                model: p.model.clone(),
+            })?;
             if p.pose >= MAX_POSE {
                 return Err(Error::PoseVariant {
                     asset: name.into(),
@@ -209,12 +203,6 @@ fn resolve_prototypes(name: &str, src: &Instances, catalog: &Catalog) -> Result<
                 sections.resize(facts.sections as usize, SectionOverride::zeroed());
                 for (s, spec) in p.sections.iter().enumerate() {
                     if let Some(m) = &spec.material {
-                        if !catalog.materials.contains(m) {
-                            return Err(Error::UnknownMaterial {
-                                asset: name.into(),
-                                material: m.clone(),
-                            });
-                        }
                         sections[s].material = AssetId::from_name(m);
                     }
                     sections[s].hidden = u8::from(spec.hidden);
@@ -403,11 +391,9 @@ fn build_page(
             .unwrap_or(0);
         joined_positions(name, &mut header, f64::from(k).exp2(), rel, members)?
     } else {
+        set_scale_range(&mut header, members.iter().map(|&i| src.records[i].scale));
         quantise_positions(&mut header, rel, members)
     };
-    if !src.joined {
-        set_scale_range(&mut header, members.iter().map(|&i| src.records[i].scale));
-    }
 
     let mut records = Vec::with_capacity(members.len());
     for (n, &i) in members.iter().enumerate() {
