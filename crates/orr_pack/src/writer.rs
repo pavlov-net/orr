@@ -385,8 +385,11 @@ impl ArchiveWriter {
         key.update(bytemuck::cast_slice(chunks));
         key.update(stored);
         let key = Hash32::finish(&key);
-        if let Some(r) = self.seen.get(&key) {
-            return Ok(*r);
+        if let Some(&r) = self.seen.get(&key) {
+            if let Some(k) = raw_key {
+                self.seen.insert(k, r);
+            }
+            return Ok(r);
         }
         rec.stored_len =
             u32::try_from(stored.len()).map_err(|_| Error::InvalidBlob("blob over 4 GiB"))?;
@@ -411,20 +414,19 @@ impl ArchiveWriter {
 
     /// Appends to the payload and pads it to 4096 bytes; returns the payload-relative offset.
     fn write_payload(&mut self, bytes: &[u8]) -> Result<u64> {
-        let pad = |n: u64| (n.next_multiple_of(PAGE) - n) as usize;
+        let pad = &[0; PAGE as usize][..bytes.len().next_multiple_of(PAGE as usize) - bytes.len()];
         Ok(match self.payload.as_mut().expect("writer is live") {
             Payload::Memory(v) => {
                 let at = v.len() as u64;
                 v.extend_from_slice(bytes);
-                v.resize(v.len() + pad(v.len() as u64), 0);
+                v.extend_from_slice(pad);
                 at
             }
             Payload::File { out, len, .. } => {
                 let at = *len;
                 out.write_all(bytes)?;
-                let p = pad(bytes.len() as u64);
-                out.write_all(&[0; PAGE as usize][..p])?;
-                *len += (bytes.len() + p) as u64;
+                out.write_all(pad)?;
+                *len += (bytes.len() + pad.len()) as u64;
                 at
             }
         })

@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use orr_cook::{CookOptions, Manifest, Outcome};
 use orr_pack::clip::ClipHeader;
 use orr_pack::instance::{InstancePageInfo, InstanceRecord};
-use orr_pack::mesh::{MeshHeader, MeshInfo};
+use orr_pack::mesh::{MeshHeader, MeshInfo, PageHeader};
 use orr_pack::raster::{RasterLayer, RasterSetInfo};
 use orr_pack::skeleton::{NO_PARENT, SkeletonInfo};
 use orr_pack::texture::TextureInfo;
@@ -311,7 +311,8 @@ fn clip_line(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-/// Grid, sections, parts and pages of a mesh, then per level its error, clusters and bytes.
+/// Grid, sections, parts and pages of a mesh, then per level its error, clusters, bytes and
+/// micromap bytes.
 fn mesh_lines(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
     let head = mount_blob(a, e)?;
     let info = MeshInfo::parse(&head)?;
@@ -334,17 +335,26 @@ fn mesh_lines(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
     let blobs = a.blobs(e);
     for (i, l) in info.levels.iter().enumerate() {
         let range = l.clusters.first..l.clusters.first + l.clusters.count;
-        let (mut first, mut stored, mut resident) = (0, 0u64, 0u64);
+        let (mut first, mut stored, mut resident, mut omm) = (0, 0u64, 0u64, 0u64);
         for p in &info.pages {
             if range.contains(&first) {
-                stored += u64::from(blobs[p.blob as usize].stored_len);
+                let b = &blobs[p.blob as usize];
+                stored += u64::from(b.stored_len);
                 resident += u64::from(p.resident_len);
+                // A stored page starts with its resident header.
+                let mut page = vec![0; b.raw_len as usize];
+                a.read(b, &mut page)?;
+                let h: PageHeader = bytemuck::pod_read_unaligned(
+                    page.get(..size_of::<PageHeader>())
+                        .ok_or("page header is short")?,
+                );
+                omm += u64::from(h.len.saturating_sub(h.omm_offset));
             }
             first += u32::from(p.cluster_count);
         }
         writeln!(
             out,
-            "    level {i}: error {} m, {} clusters, stored {stored} B, resident {resident} B",
+            "    level {i}: error {} m, {} clusters, stored {stored} B, resident {resident} B, micromaps {omm} B",
             l.error, l.clusters.count
         )?;
     }

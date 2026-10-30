@@ -24,9 +24,17 @@ enum Bytes {
 }
 
 impl Bytes {
-    fn aligned(b: Box<[u8]>) -> Self {
+    fn boxed(b: Box<[u8]>) -> Self {
         if b.as_ptr().cast::<u64>().is_aligned() {
             Self::Boxed(b)
+        } else {
+            Self::copy(&b)
+        }
+    }
+
+    fn shared(b: Arc<[u8]>) -> Self {
+        if b.as_ptr().cast::<u64>().is_aligned() {
+            Self::Shared(b)
         } else {
             Self::copy(&b)
         }
@@ -86,11 +94,7 @@ impl Archive {
                 have: bytes.len() as u64,
             });
         }
-        let bytes = if bytes.as_ptr().cast::<u64>().is_aligned() {
-            Bytes::Shared(bytes)
-        } else {
-            Bytes::copy(&bytes)
-        };
+        let bytes = Bytes::shared(bytes);
         let layout = validate(&header, &bytes.get()[..header.index_len as usize])?;
         Ok(Self {
             bytes,
@@ -122,7 +126,7 @@ impl Archive {
         }
         let layout = validate(&header, &index)?;
         Ok(Self {
-            bytes: Bytes::aligned(index),
+            bytes: Bytes::boxed(index),
             file: Some((file, path.to_owned())),
             header,
             layout,
