@@ -169,6 +169,21 @@ struct NewUnit {
     triangles: u64,
 }
 
+impl NewUnit {
+    /// A unit with no dependencies and no triangles.
+    fn leaf(name: &str, class: u16, key: Hash32, working_set: u64, work: Work<'static>) -> Self {
+        Self {
+            name: name.into(),
+            class,
+            key,
+            work,
+            deps: Vec::new(),
+            working_set,
+            triangles: 0,
+        }
+    }
+}
+
 struct Imported {
     files: Vec<Input>,
     units: Vec<NewUnit>,
@@ -315,20 +330,14 @@ impl<'m, 's> Run<'m, 's> {
                     .debug(settings)
                     .hash(hash)
                     .finish();
-                let working_set = texture_file_working_set(path);
-                self.add(Unit {
-                    archive: a,
-                    asset: index,
-                    name: name.into(),
-                    class: Class::Texture as u16,
+                let unit = NewUnit::leaf(
+                    name,
+                    Class::Texture as u16,
                     key,
-                    work: Some(Work::TextureFile(path.clone(), hash, settings.clone())),
-                    deps: Vec::new(),
-                    working_set,
-                    triangles: 0,
-                    state: State::Waiting,
-                    mesh: None,
-                });
+                    texture_file_working_set(path),
+                    Work::TextureFile(path.clone(), hash, settings.clone()),
+                );
+                self.add_units(a, index, vec![unit]);
             }
             Source::User {
                 class,
@@ -347,41 +356,26 @@ impl<'m, 's> Run<'m, 's> {
                     .bytes(&version.to_le_bytes())
                     .bytes(bytes)
                     .finish();
-                self.add(Unit {
-                    archive: a,
-                    asset: index,
-                    name: name.into(),
-                    class: *class,
-                    key,
-                    work: Some(Work::Blobs {
-                        schema: *schema,
-                        blobs: vec![(bytes.clone(), false)],
-                    }),
-                    deps: Vec::new(),
-                    working_set: bytes.len() as u64,
-                    triangles: 0,
-                    state: State::Waiting,
-                    mesh: None,
-                });
+                let work = Work::Blobs {
+                    schema: *schema,
+                    blobs: vec![(bytes.clone(), false)],
+                };
+                let unit = NewUnit::leaf(name, *class, key, bytes.len() as u64, work);
+                self.add_units(a, index, vec![unit]);
             }
             Source::Raster(set) => {
                 let planned = raster::plan(name, set, &self.shared.memo)?;
                 for f in &planned.files {
                     self.input(a, index, f);
                 }
-                self.add(Unit {
-                    archive: a,
-                    asset: index,
-                    name: name.into(),
-                    class: Class::RasterSet as u16,
-                    key: planned.key,
-                    work: Some(Work::Raster(planned.plan)),
-                    deps: Vec::new(),
-                    working_set: raster::WORKING_SET,
-                    triangles: 0,
-                    state: State::Waiting,
-                    mesh: None,
-                });
+                let unit = NewUnit::leaf(
+                    name,
+                    Class::RasterSet as u16,
+                    planned.key,
+                    raster::WORKING_SET,
+                    Work::Raster(planned.plan),
+                );
+                self.add_units(a, index, vec![unit]);
             }
             Source::Instances(src) => self.instances.push((a, index, src)),
             Source::Mesh {
@@ -466,13 +460,9 @@ impl<'m, 's> Run<'m, 's> {
         if let Some(entries) = self.old[a].as_ref().and_then(|o| o.by_key.get(&key)) {
             return Some((From::Old, entries.clone(), Outcome::Archive));
         }
-        let archive = self.shared.cache.as_ref()?.find(key)?;
-        let entries = (0..archive.entries().len()).collect();
-        Some((
-            From::Cache(self.shared.cache.as_ref()?.path(key)),
-            entries,
-            Outcome::Cache,
-        ))
+        let cache = self.shared.cache.as_ref()?;
+        let entries = (0..cache.find(key)?.entries().len()).collect();
+        Some((From::Cache(cache.path(key)), entries, Outcome::Cache))
     }
 
     fn with_archive<T>(&self, a: usize, from: &From, f: impl FnOnce(&Archive) -> T) -> Result<T> {
@@ -1184,18 +1174,13 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
             .bytes(&bytes)
             .finish();
         skeleton = (AssetId::from_name(&skeleton_name), Some(key));
-        units.push(NewUnit {
-            name: skeleton_name,
-            class: Class::Skeleton as u16,
-            key,
-            working_set: bytes.len() as u64,
-            triangles: 0,
-            work: Work::Blobs {
-                schema: orr_pack::skeleton::SCHEMA,
-                blobs: vec![(bytes, true)],
-            },
-            deps: Vec::new(),
-        });
+        let working_set = bytes.len() as u64;
+        let work = Work::Blobs {
+            schema: orr_pack::skeleton::SCHEMA,
+            blobs: vec![(bytes, true)],
+        };
+        let class = Class::Skeleton as u16;
+        units.push(NewUnit::leaf(&skeleton_name, class, key, working_set, work));
         for (clip_name, mut clip) in std::mem::take(&mut src.clips) {
             clip.header.skeleton = skeleton.0;
             let clip_name = format!("{name}/clip/{clip_name}");
@@ -1204,18 +1189,13 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
                 .bytes(&head)
                 .bytes(&samples)
                 .finish();
-            units.push(NewUnit {
-                name: clip_name,
-                class: Class::Clip as u16,
-                key,
-                working_set: (head.len() + samples.len()) as u64,
-                triangles: 0,
-                work: Work::Blobs {
-                    schema: orr_pack::clip::SCHEMA,
-                    blobs: vec![(head, true), (samples, false)],
-                },
-                deps: Vec::new(),
-            });
+            let working_set = (head.len() + samples.len()) as u64;
+            let work = Work::Blobs {
+                schema: orr_pack::clip::SCHEMA,
+                blobs: vec![(head, true), (samples, false)],
+            };
+            let class = Class::Clip as u16;
+            units.push(NewUnit::leaf(&clip_name, class, key, working_set, work));
         }
     }
 
@@ -1275,15 +1255,10 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
     }
     let images = Arc::new(src.images);
     for job in jobs {
-        units.push(NewUnit {
-            name: job.name.clone(),
-            class: Class::Texture as u16,
-            key: job.key,
-            working_set: job.working_set(&images),
-            triangles: 0,
-            work: Work::Texture(job, Arc::clone(&images)),
-            deps: Vec::new(),
-        });
+        let (name, key, working_set) = (job.name.clone(), job.key, job.working_set(&images));
+        let work = Work::Texture(job, Arc::clone(&images));
+        let class = Class::Texture as u16;
+        units.push(NewUnit::leaf(&name, class, key, working_set, work));
     }
     Ok(Imported {
         files: src.files,
@@ -1294,18 +1269,13 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
 /// A material entry holding `m`.
 fn material_unit(name: String, m: &Material) -> NewUnit {
     let bytes = bytemuck::bytes_of(m).to_vec();
-    NewUnit {
-        key: Key::new(Class::Material, &name).bytes(&bytes).finish(),
-        name,
-        class: Class::Material as u16,
-        working_set: bytes.len() as u64,
-        triangles: 0,
-        work: Work::Blobs {
-            schema: orr_pack::material::SCHEMA,
-            blobs: vec![(bytes, true)],
-        },
-        deps: Vec::new(),
-    }
+    let key = Key::new(Class::Material, &name).bytes(&bytes).finish();
+    let working_set = bytes.len() as u64;
+    let work = Work::Blobs {
+        schema: orr_pack::material::SCHEMA,
+        blobs: vec![(bytes, true)],
+    };
+    NewUnit::leaf(&name, Class::Material as u16, key, working_set, work)
 }
 
 /// The cooked textures a section with material `m` reads at mesh cook time.
