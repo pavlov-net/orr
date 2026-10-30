@@ -92,10 +92,28 @@ impl HeapBuffer {
     }
 }
 
-/// Free image slots: never-used slots count up from `next`; freed ones are reused first.
-struct SlotAllocator {
+/// Free slots below a capacity: never-used slots count up from `next`; freed ones are reused
+/// first.
+#[derive(Default)]
+pub(crate) struct SlotAllocator {
     next: u32,
     free: Vec<u32>,
+}
+
+impl SlotAllocator {
+    pub(crate) fn take(&mut self, capacity: u32) -> Option<u32> {
+        if let Some(slot) = self.free.pop() {
+            return Some(slot);
+        }
+        (self.next < capacity).then(|| {
+            self.next += 1;
+            self.next - 1
+        })
+    }
+
+    pub(crate) fn release(&mut self, slot: u32) {
+        self.free.push(slot);
+    }
 }
 
 pub(crate) struct Heaps {
@@ -150,10 +168,7 @@ impl Heaps {
         Ok(Heaps {
             resource,
             sampler,
-            slots: Mutex::new(SlotAllocator {
-                next: 0,
-                free: Vec::new(),
-            }),
+            slots: Mutex::default(),
         })
     }
 
@@ -166,7 +181,7 @@ impl Heaps {
     }
 
     pub(crate) fn release_image_slot(&self, slot: u32) {
-        self.slots.lock().unwrap().free.push(slot);
+        self.slots.lock().unwrap().release(slot);
     }
 }
 
@@ -174,15 +189,12 @@ impl Device {
     /// Takes a free image slot. Sampled and storage views share the slot space.
     pub fn alloc_image_slot(&self) -> Result<u32, Error> {
         let heaps = self.shared.heaps();
-        let mut s = heaps.slots.lock().unwrap();
-        if let Some(slot) = s.free.pop() {
-            return Ok(slot);
-        }
-        if s.next >= heaps.resource.slots {
-            return Err(Error::HeapFull("image"));
-        }
-        s.next += 1;
-        Ok(s.next - 1)
+        heaps
+            .slots
+            .lock()
+            .unwrap()
+            .take(heaps.resource.slots)
+            .ok_or(Error::HeapFull("image"))
     }
 
     /// Returns `slot` to the free list once `after` has completed.

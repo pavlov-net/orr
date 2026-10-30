@@ -1,5 +1,6 @@
 //! Compute pipelines in descriptor-heap mode with the root at binding (0, 0).
 
+use std::ffi::CStr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -130,6 +131,104 @@ impl Shared {
     }
 }
 
+/// What a stage's create info points to: code, root mapping and specialisation entries.
+pub(super) struct StageParts<'a> {
+    code: &'a [u32],
+    entry: &'a CStr,
+    mappings: [vk::DescriptorSetAndBindingMappingEXT<'static>; 1],
+    map_entries: Vec<vk::SpecializationMapEntry>,
+    spec: &'a [u8],
+}
+
+/// The structs chained into a stage's create info.
+pub(super) struct StageChain<'p> {
+    module: vk::ShaderModuleCreateInfo<'p>,
+    mapping: vk::ShaderDescriptorSetAndBindingMappingInfoEXT<'p>,
+    spec: vk::SpecializationInfo<'p>,
+    entry: &'p CStr,
+}
+
+impl<'a> StageParts<'a> {
+    /// The parts of `s`, after checking that its entry is a `want` entry.
+    pub(super) fn new(
+        shared: &Shared,
+        s: &ShaderStage<'a>,
+        want: Stage,
+        name: &str,
+    ) -> Result<Self, Error> {
+        if s.entry.stage != want {
+            return Err(Error::Shader(format!(
+                "{name}: {:?} is a {:?} entry, not {want:?}",
+                s.entry.name, s.entry.stage
+            )));
+        }
+        Ok(Self {
+            code: shared.code(s),
+            entry: s.entry.name,
+            mappings: [root_mapping()],
+            map_entries: s
+                .spec
+                .entries
+                .iter()
+                .map(|e| vk::SpecializationMapEntry {
+                    constant_id: e.constant_id,
+                    offset: e.offset,
+                    size: e.size as usize,
+                })
+                .collect(),
+            spec: s.spec.bytes,
+        })
+    }
+
+    pub(super) fn chain(&self) -> StageChain<'_> {
+        StageChain {
+            module: vk::ShaderModuleCreateInfo::default().code(self.code),
+            mapping: vk::ShaderDescriptorSetAndBindingMappingInfoEXT::default()
+                .mappings(&self.mappings),
+            spec: vk::SpecializationInfo::default()
+                .map_entries(&self.map_entries)
+                .data(self.spec),
+            entry: self.entry,
+        }
+    }
+}
+
+impl StageChain<'_> {
+    pub(super) fn info(
+        &mut self,
+        stage: vk::ShaderStageFlags,
+    ) -> vk::PipelineShaderStageCreateInfo<'_> {
+        let info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(stage)
+            .name(self.entry);
+        let info = if self.spec.map_entry_count == 0 {
+            info
+        } else {
+            info.specialization_info(&self.spec)
+        };
+        info.push(&mut self.module).push(&mut self.mapping)
+    }
+}
+
+impl Shared {
+    pub(super) fn pipeline_flags(&self) -> vk::PipelineCreateFlags2 {
+        let mut flags = vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT;
+        if self.exec_fn.is_some() {
+            flags |= vk::PipelineCreateFlags2::CAPTURE_STATISTICS_KHR;
+        }
+        flags
+    }
+
+    pub(super) fn created(&self, raw: vk::Pipeline, name: &str, start: Instant) {
+        name_object(&self.debug_fn, raw, name);
+        log::debug!(
+            "pipeline {name}: created in {:.1} ms",
+            start.elapsed().as_secs_f64() * 1e3
+        );
+        self.log_statistics(raw, name);
+    }
+}
+
 impl Device {
     /// Creates a compute pipeline from a compute entry point.
     pub fn create_compute_pipeline(
@@ -137,44 +236,13 @@ impl Device {
         s: &ShaderStage<'_>,
         name: &str,
     ) -> Result<ComputePipeline, Error> {
-        if s.entry.stage != Stage::Compute {
-            return Err(Error::Shader(format!(
-                "{name}: {:?} is a {:?} entry",
-                s.entry.name, s.entry.stage
-            )));
-        }
         let shared = &self.shared;
         let start = Instant::now();
-        let map_entries: Vec<_> = s
-            .spec
-            .entries
-            .iter()
-            .map(|e| vk::SpecializationMapEntry {
-                constant_id: e.constant_id,
-                offset: e.offset,
-                size: e.size as usize,
-            })
-            .collect();
-        let spec = vk::SpecializationInfo::default()
-            .map_entries(&map_entries)
-            .data(s.spec.bytes);
-        let mut module = vk::ShaderModuleCreateInfo::default().code(shared.code(s));
-        let mappings = [root_mapping()];
-        let mut mapping =
-            vk::ShaderDescriptorSetAndBindingMappingInfoEXT::default().mappings(&mappings);
-        let mut stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .name(s.entry.name)
-            .push(&mut module)
-            .push(&mut mapping);
-        if !map_entries.is_empty() {
-            stage = stage.specialization_info(&spec);
-        }
-        let mut flags = vk::PipelineCreateFlags2::DESCRIPTOR_HEAP_EXT;
-        if shared.exec_fn.is_some() {
-            flags |= vk::PipelineCreateFlags2::CAPTURE_STATISTICS_KHR;
-        }
-        let mut flags = vk::PipelineCreateFlags2CreateInfo::default().flags(flags);
+        let parts = StageParts::new(shared, s, Stage::Compute, name)?;
+        let mut chain = parts.chain();
+        let stage = chain.info(vk::ShaderStageFlags::COMPUTE);
+        let mut flags =
+            vk::PipelineCreateFlags2CreateInfo::default().flags(shared.pipeline_flags());
         let info = vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .push(&mut flags);
@@ -185,12 +253,7 @@ impl Device {
                 .create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
         }
         .map_err(|(_, e)| Error::vk("vkCreateComputePipelines")(e))?[0];
-        name_object(&shared.debug_fn, raw, name);
-        log::debug!(
-            "pipeline {name}: created in {:.1} ms",
-            start.elapsed().as_secs_f64() * 1e3
-        );
-        shared.log_statistics(raw, name);
+        shared.created(raw, name, start);
         Ok(ComputePipeline {
             raw,
             workgroup: s.entry.workgroup,

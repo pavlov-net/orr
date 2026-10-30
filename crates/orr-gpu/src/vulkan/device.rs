@@ -13,8 +13,9 @@ use super::debug::{MessageCount, messenger_info, name_object};
 use super::features::{self, Selection};
 use super::garbage::{Garbage, Item, MAX_TIMELINES};
 use super::heap::Heaps;
-use super::memory::{BUFFER_USAGE, MemoryKind, MemoryTypes, Usage, sharing};
+use super::memory::{MemoryKind, MemoryTypes, Usage, buffer_usage, sharing};
 use super::queue::{Calibration, PassResult, Queue, QueueKind, QueueRequest, Timeline};
+use super::ray::RecordBlock;
 use super::texture::{image_info, vk_format};
 use crate::{
     Caps, ComponentType, CooperativeVectorCombination, Error, Format, Limits, TextureDesc,
@@ -59,6 +60,7 @@ pub(crate) struct Shared {
     pub device: ash::Device,
     pub heap_fn: ash::ext::descriptor_heap::Device,
     pub accel_fn: ash::khr::acceleration_structure::Device,
+    pub rt_fn: Option<ash::khr::ray_tracing_pipeline::Device>,
     pub debug_fn: ash::ext::debug_utils::Device,
     pub calibrated_fn: Option<ash::khr::calibrated_timestamps::Device>,
     pub exec_fn: Option<ash::khr::pipeline_executable_properties::Device>,
@@ -72,10 +74,14 @@ pub(crate) struct Shared {
     pub families: Vec<u32>,
     pub timelines: [Option<Timeline>; MAX_TIMELINES],
     heaps: OnceLock<Heaps>,
+    /// Raygen shader-table records; with `Caps::ray_dispatch` only.
+    pub records: OnceLock<RecordBlock>,
     empty_tlas: OnceLock<EmptyTlas>,
     /// `gpu_malloc` buffers by start address: end address and buffer.
     pub buffers: RwLock<BTreeMap<u64, (u64, vk::Buffer)>>,
     pub usage: Usage,
+    /// Usage of every `gpu_malloc` buffer.
+    pub buffer_usage: vk::BufferUsageFlags,
     pub garbage: Mutex<Garbage>,
     pub results: Mutex<VecDeque<(TimelinePoint, Vec<PassResult>)>>,
     pub calibration: Mutex<Option<Calibration>>,
@@ -101,6 +107,9 @@ impl Drop for Shared {
             if let Some(t) = self.empty_tlas.take() {
                 self.accel_fn.destroy_acceleration_structure(t.accel, None);
                 self.destroy(Item::Buffer(t.storage));
+            }
+            if let Some(r) = self.records.take() {
+                self.destroy(Item::Buffer(r.raw));
             }
             if let Some(h) = self.heaps.take() {
                 self.destroy(Item::Buffer(h.resource.raw));
@@ -262,14 +271,21 @@ impl Device {
         let mut heap_props = vk::PhysicalDeviceDescriptorHeapPropertiesEXT::default();
         let mut as_props = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
         let mut driver = vk::PhysicalDeviceDriverProperties::default();
+        let mut rt_props = vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
+        let mut reorder_props =
+            vk::PhysicalDeviceRayTracingInvocationReorderPropertiesEXT::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default()
             .push(&mut heap_props)
             .push(&mut as_props)
             .push(&mut driver);
+        if optional.ray_dispatch {
+            props2 = props2.push(&mut rt_props).push(&mut reorder_props);
+        }
         // SAFETY: every struct in the chain belongs to an enabled extension or core 1.4.
         unsafe { instance.get_physical_device_properties2(physical, &mut props2) };
         let props = props2.properties;
         heap_props.p_next = std::ptr::null_mut();
+        rt_props.p_next = std::ptr::null_mut();
         let device_name = c_string(&props.device_name);
 
         let coop = if optional.cooperative_vector {
@@ -300,7 +316,8 @@ impl Device {
         let mut family_list: Vec<u32> = plans.iter().map(|p| p.family).collect();
         family_list.sort_unstable();
         family_list.dedup();
-        let memory = select_memory(&device, memory_props, &family_list)
+        let usage = buffer_usage(optional.ray_dispatch);
+        let memory = select_memory(&device, memory_props, &family_list, usage)
             .map_err(|m| features::unsupported(&device_name, m));
         let (memory, rebar) = match memory {
             Ok(m) => m,
@@ -324,6 +341,10 @@ impl Device {
             ),
             driver_version: props.driver_version,
             rebar,
+            ray_dispatch: optional.ray_dispatch,
+            reorder: optional.ray_dispatch
+                && reorder_props.ray_tracing_invocation_reorder_reordering_hint
+                    == vk::RayTracingInvocationReorderModeEXT::REORDER,
             host_image_copy: optional.host_image_copy,
             memory_decompression: optional.memory_decompression,
             omm: optional.omm,
@@ -352,6 +373,7 @@ impl Device {
                 max_image_extent_2d: props.limits.max_image_dimension2_d,
                 max_image_extent_3d: props.limits.max_image_dimension3_d,
                 max_image_layers: props.limits.max_image_array_layers,
+                max_ray_dispatch_invocations: rt_props.max_ray_dispatch_invocation_count,
                 device_local_bytes: memory.heap_size(MemoryKind::DeviceLocal),
                 upload_bytes: memory.heap_size(MemoryKind::Upload),
             },
@@ -389,6 +411,9 @@ impl Device {
         let shared = Arc::new(Shared {
             heap_fn: ash::ext::descriptor_heap::Device::load(&instance, &device),
             accel_fn: ash::khr::acceleration_structure::Device::load(&instance, &device),
+            rt_fn: optional
+                .ray_dispatch
+                .then(|| ash::khr::ray_tracing_pipeline::Device::load(&instance, &device)),
             debug_fn: ash::ext::debug_utils::Device::load(&instance, &device),
             calibrated_fn: optional
                 .calibrated_timestamps
@@ -405,9 +430,11 @@ impl Device {
             families: family_list,
             timelines,
             heaps: OnceLock::new(),
+            records: OnceLock::new(),
             empty_tlas: OnceLock::new(),
             buffers: RwLock::default(),
             usage: Usage::default(),
+            buffer_usage: usage,
             garbage: Mutex::default(),
             results: Mutex::default(),
             calibration: Mutex::default(),
@@ -438,6 +465,9 @@ impl Device {
         }
         let heaps = Heaps::new(&shared, desc.image_heap_slots, desc.sampler_heap_slots)?;
         let _ = shared.heaps.set(heaps);
+        if optional.ray_dispatch {
+            let _ = shared.records.set(RecordBlock::new(&shared, &rt_props)?);
+        }
         let device = Device {
             shared,
             queues: Arc::new(queues),
@@ -445,10 +475,12 @@ impl Device {
         let tlas = build_empty_tlas(&device)?;
         let _ = device.shared.empty_tlas.set(tlas);
         log::info!(
-            "device {} ({}): rebar {}, omm {}, host image copy {}, decompression {}, validation layer {}",
+            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, host image copy {}, decompression {}, validation layer {}",
             device.shared.caps.device_name,
             device.shared.caps.driver,
             rebar,
+            device.shared.caps.ray_dispatch,
+            device.shared.caps.reorder,
             optional.omm,
             optional.host_image_copy,
             optional.memory_decompression,
@@ -606,11 +638,12 @@ fn select_memory(
     device: &ash::Device,
     props: vk::PhysicalDeviceMemoryProperties,
     families: &[u32],
+    usage: vk::BufferUsageFlags,
 ) -> Result<(MemoryTypes, bool), String> {
     let (sharing, family_list) = sharing(families);
     let buffer = vk::BufferCreateInfo::default()
         .size(65536)
-        .usage(BUFFER_USAGE)
+        .usage(usage)
         .sharing_mode(sharing)
         .queue_family_indices(family_list);
     let mut out = vk::MemoryRequirements2::default();

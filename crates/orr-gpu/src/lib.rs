@@ -1,12 +1,13 @@
 //! orr's GPU interface: one device with GPU memory reached by address, a texture heap,
-//! compute pipelines whose only parameter is a root pointer, stage barriers and timeline
-//! submits.
+//! compute and ray-dispatch pipelines whose only parameter is a root pointer, stage
+//! barriers and timeline submits.
 //!
-//! Shaders read everything through the root: [`CommandList::dispatch`] pushes the
-//! [`GpuPtr`] of a root struct in GPU memory; buffers are pointers inside it, textures and
-//! samplers are heap slots ([`TextureIndex`], [`StorageImageIndex`], [`SamplerIndex`]) and
-//! acceleration structures are [`Tlas`] addresses. Textures stay in one layout for their
-//! whole life; [`CommandList::discard`] starts one.
+//! Shaders read everything through the root: [`CommandList::dispatch`] and
+//! [`CommandList::dispatch_rays`] push the [`GpuPtr`] of a root struct in GPU memory;
+//! buffers are pointers inside it, textures and samplers are heap slots ([`TextureIndex`],
+//! [`StorageImageIndex`], [`SamplerIndex`]) and acceleration structures are [`Tlas`]
+//! addresses. Textures stay in one layout for their whole life; [`CommandList::discard`]
+//! starts one.
 //!
 //! Each [`Queue`] has one owner thread that submits; any thread records its own
 //! [`CommandList`]s and sends them to the owner.
@@ -38,5 +39,6 @@ pub use vulkan::{
     Allocation, ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance,
     ClassicKind, CommandList, ComputePipeline, Device, DeviceDesc, DispatchArgs, HeapReport,
     InstanceFlags, MemoryKind, MemoryReport, MemoryUsage, PassResult, PipelineStats, Queue,
-    QueueKind, QueueRequest, RtasFlags, RtasSizes, ShaderStage, Texture, TextureMemory,
+    QueueKind, QueueRequest, RayDispatchPipeline, RtasFlags, RtasSizes, ShaderStage, Texture,
+    TextureMemory,
 };

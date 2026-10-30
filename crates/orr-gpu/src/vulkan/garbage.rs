@@ -21,6 +21,7 @@ pub(crate) enum Item {
     Pipeline(vk::Pipeline),
     Accel(vk::AccelerationStructureKHR),
     ImageSlot(u32),
+    RaygenRecord(u32),
 }
 
 /// A buffer with its own memory, as `gpu_malloc` creates it.
@@ -101,6 +102,11 @@ impl Shared {
                 Item::Pipeline(p) => d.destroy_pipeline(p, None),
                 Item::Accel(a) => self.accel_fn.destroy_acceleration_structure(a, None),
                 Item::ImageSlot(slot) => self.heaps().release_image_slot(slot),
+                Item::RaygenRecord(slot) => {
+                    if let Some(r) = self.records.get() {
+                        r.release(slot);
+                    }
+                }
             }
         }
     }

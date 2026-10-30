@@ -16,6 +16,11 @@ pub mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
 }
 
+/// Kernels compiled with `-fp-mode precise`, whose raygen and compute entries must agree.
+pub mod parity {
+    include!(concat!(env!("OUT_DIR"), "/parity/orr_shaders.rs"));
+}
+
 struct StderrLog;
 
 impl log::Log for StderrLog {

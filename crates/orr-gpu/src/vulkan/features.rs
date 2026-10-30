@@ -25,6 +25,7 @@ const CLUSTER_SPEC_VERSION: u32 = 4;
 /// Optional extensions found on the device.
 #[derive(Default, Clone, Copy)]
 pub(crate) struct Optional {
+    pub ray_dispatch: bool,
     pub omm: bool,
     pub device_address_commands: bool,
     pub unified_image_layouts: bool,
@@ -54,6 +55,8 @@ pub(crate) struct Features {
     pub ray_query: vk::PhysicalDeviceRayQueryFeaturesKHR<'static>,
     pub position_fetch: vk::PhysicalDeviceRayTracingPositionFetchFeaturesKHR<'static>,
     pub mesh: vk::PhysicalDeviceMeshShaderFeaturesEXT<'static>,
+    pub ray_pipeline: vk::PhysicalDeviceRayTracingPipelineFeaturesKHR<'static>,
+    pub reorder: vk::PhysicalDeviceRayTracingInvocationReorderFeaturesEXT<'static>,
     pub cluster: vk::PhysicalDeviceClusterAccelerationStructureFeaturesNV<'static>,
     pub ptlas: vk::PhysicalDevicePartitionedAccelerationStructureFeaturesNV<'static>,
     pub omm: vk::PhysicalDeviceOpacityMicromapFeaturesKHR<'static>,
@@ -92,6 +95,10 @@ impl Features {
             ptr(&mut self.cluster),
             ptr(&mut self.ptlas),
         ]);
+        if opt.ray_dispatch {
+            chain.push(ptr(&mut self.ray_pipeline));
+            chain.push(ptr(&mut self.reorder));
+        }
         if opt.omm {
             chain.push(ptr(&mut self.omm));
         }
@@ -174,6 +181,8 @@ pub(crate) fn select(
 
     let present = |n: &CStr| has(&list, n).is_some();
     let mut opt = Optional {
+        ray_dispatch: present(ash::khr::ray_tracing_pipeline::NAME)
+            && present(ash::ext::ray_tracing_invocation_reorder::NAME),
         omm: present(ash::khr::opacity_micromap::NAME),
         device_address_commands: present(ash::khr::device_address_commands::NAME),
         unified_image_layouts: present(ash::khr::unified_image_layouts::NAME),
@@ -274,6 +283,8 @@ pub(crate) fn select(
         return Err((*name).to_owned());
     }
 
+    opt.ray_dispatch &=
+        q.ray_pipeline.ray_tracing_pipeline != 0 && q.reorder.ray_tracing_invocation_reorder != 0;
     opt.device_address_commands &= q.address_commands.device_address_commands != 0;
     // OMM builds take micromap addresses, which need device address commands.
     opt.omm &= q.omm.micromap != 0 && opt.device_address_commands;
@@ -340,6 +351,8 @@ pub(crate) fn select(
         .mesh_shader_queries(true);
     e.cluster.cluster_acceleration_structure = 1;
     e.ptlas.partitioned_acceleration_structure = 1;
+    e.ray_pipeline.ray_tracing_pipeline = 1;
+    e.reorder.ray_tracing_invocation_reorder = 1;
     e.omm.micromap = 1;
     e.address_commands.device_address_commands = 1;
     e.unified.unified_image_layouts = 1;
@@ -359,6 +372,13 @@ pub(crate) fn select(
             extensions.extend_from_slice(names);
         }
     };
+    add(
+        opt.ray_dispatch,
+        &[
+            ash::khr::ray_tracing_pipeline::NAME,
+            ash::ext::ray_tracing_invocation_reorder::NAME,
+        ],
+    );
     add(opt.omm, &[ash::khr::opacity_micromap::NAME]);
     add(
         opt.device_address_commands,

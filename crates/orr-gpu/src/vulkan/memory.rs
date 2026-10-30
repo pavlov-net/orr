@@ -38,17 +38,24 @@ impl MemoryKind {
     }
 }
 
-/// Usage every `gpu_malloc` buffer carries, so any block can hold any kind of data.
-pub(crate) const BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
-    vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
-        | vk::BufferUsageFlags::UNIFORM_BUFFER.as_raw()
-        | vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
-        | vk::BufferUsageFlags::TRANSFER_DST.as_raw()
-        | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw()
-        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw()
-        | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR.as_raw()
-        | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR.as_raw(),
-);
+/// Usage every `gpu_malloc` buffer carries, so any block can hold any kind of data. The
+/// shader-binding-table bit needs the ray-tracing pipeline extension.
+pub(crate) fn buffer_usage(ray_dispatch: bool) -> vk::BufferUsageFlags {
+    use vk::BufferUsageFlags as U;
+    let usage = U::STORAGE_BUFFER
+        | U::UNIFORM_BUFFER
+        | U::TRANSFER_SRC
+        | U::TRANSFER_DST
+        | U::INDIRECT_BUFFER
+        | U::SHADER_DEVICE_ADDRESS
+        | U::ACCELERATION_STRUCTURE_STORAGE_KHR
+        | U::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
+    if ray_dispatch {
+        usage | U::SHADER_BINDING_TABLE_KHR
+    } else {
+        usage
+    }
+}
 
 /// The memory type behind each [`MemoryKind`].
 pub(crate) struct MemoryTypes {
@@ -384,7 +391,8 @@ impl Shared {
 impl Device {
     /// Allocates `count` values of `T` in their own memory with a device address. The buffer
     /// can hold any data on any queue: storage, uniform, indirect arguments, copies,
-    /// acceleration structures and their build inputs.
+    /// acceleration structures and their build inputs, and with `Caps::ray_dispatch` shader
+    /// binding tables.
     pub fn gpu_malloc<T>(
         &self,
         kind: MemoryKind,
@@ -401,9 +409,9 @@ impl Device {
                 ))
             })?;
         let align = align_of::<T>() as u64;
-        let (raw, mapped) = self
-            .shared
-            .create_buffer(kind, size, BUFFER_USAGE, align, name)?;
+        let (raw, mapped) =
+            self.shared
+                .create_buffer(kind, size, self.shared.buffer_usage, align, name)?;
         Ok(Allocation {
             // SAFETY: the address is the start of `size` bytes owned by the allocation.
             gpu: unsafe { GpuPtr::from_address(GpuAddress(raw.address)) },

@@ -8,7 +8,7 @@ bitflags::bitflags! {
         const TASK = 1 << 2;
         const MESH = 1 << 3;
         const PIXEL = 1 << 4;
-        /// Ray-dispatch pipelines.
+        /// Ray-dispatch pipelines; ignored without `Caps::ray_dispatch`.
         const RAY = 1 << 5;
         /// Colour attachment writes and blending.
         const COLOR_OUT = 1 << 6;
