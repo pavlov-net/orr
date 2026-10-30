@@ -9,6 +9,13 @@ repository.workspace = true
 
 [dependencies]
 orr-pack.workspace = true
+base64 = "0.22"
+blake3.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+gltf = { version = "=1.4.1", default-features = false, features = ["utils", "names", "extras", "KHR_materials_emissive_strength", "KHR_materials_ior"] }
+meshopt = "=0.7.0"
+thiserror.workspace = true
 
 [lints]
 workspace = true

@@ -5,8 +5,12 @@
 //! one or more [`Blob`]s; blobs are compressed per chunk so a chunk reads and decodes alone.
 
 mod archive;
+mod blob;
 mod codec;
 mod format;
+pub mod material;
+pub mod mesh;
+pub mod model;
 mod writer;
 
 use std::fmt;
@@ -67,6 +71,35 @@ impl fmt::Debug for Hash32 {
     }
 }
 
+/// An axis-aligned box.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
+pub struct Aabb {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
+
+impl Aabb {
+    /// The box that contains nothing: min above max.
+    pub const EMPTY: Self = Self {
+        min: [f32::INFINITY; 3],
+        max: [f32::NEG_INFINITY; 3],
+    };
+
+    pub fn extend(&mut self, p: [f32; 3]) {
+        self.min = [0, 1, 2].map(|a| self.min[a].min(p[a]));
+        self.max = [0, 1, 2].map(|a| self.max[a].max(p[a]));
+    }
+}
+
+/// A bounding sphere.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct Sphere {
+    pub center: [f32; 3],
+    pub radius: f32,
+}
+
 /// A range of records in a table: `first..first + count`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
@@ -93,7 +126,11 @@ pub enum Class {
 }
 
 /// Current schema of each built-in class whose format this crate defines.
-const SCHEMAS: &[(Class, u16)] = &[];
+const SCHEMAS: &[(Class, u16)] = &[
+    (Class::Mesh, mesh::SCHEMA),
+    (Class::Material, material::SCHEMA),
+    (Class::Model, model::SCHEMA),
+];
 
 impl Class {
     pub const USER_FIRST: u16 = 0x8000;
