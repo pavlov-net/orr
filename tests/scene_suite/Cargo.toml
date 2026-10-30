@@ -1,0 +1,21 @@
+[package]
+name = "scene_suite"
+description = "Headless GPU tests of orr_scene's tables, uploads and frame skeleton, run with the validation layer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+orr.workspace = true
+orr_scene = { workspace = true, features = ["testing"] }
+orr_gpu.workspace = true
+orr_shaders.workspace = true
+glam.workspace = true
+
+[build-dependencies]
+orr_shaders = { workspace = true, features = ["build"] }
+
+[lints]
+workspace = true

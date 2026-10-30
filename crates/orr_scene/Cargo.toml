@@ -1,13 +1,31 @@
 [package]
 name = "orr_scene"
+description = "Scenes for orr: GPU scene tables, per-frame uploads, views and the frame skeleton."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+links = "orr_scene"
+
+[features]
+# `orr_scene::testing`: headless device, readback and reference-image comparison.
+testing = ["dep:image", "dep:nv-flip", "dep:log"]
 
 [dependencies]
 orr_gpu.workspace = true
+orr_pack.workspace = true
+orr_shaders.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+half = "2.7"
+thiserror.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "exr"], optional = true }
+nv-flip = { version = "0.1.2", optional = true }
+log = { workspace = true, optional = true }
+
+[build-dependencies]
+orr_shaders = { workspace = true, features = ["build"] }
 
 [lints]
 workspace = true
