@@ -254,7 +254,17 @@ impl Display {
         self.request = *request;
     }
 
-    /// The swapchain's low-latency handle; `None` without `Caps::low_latency`.
+    /// Turns Reflex low latency on or off (`vkSetLatencySleepModeNV`, no frame-rate cap). Off
+    /// until called; kept across swapchain recreation. Does nothing without
+    /// `Caps::low_latency`.
+    pub fn set_low_latency(&mut self, on: bool, boost: bool) {
+        if let Some(l) = &self.latency {
+            l.set_mode(on, boost, 0);
+        }
+    }
+
+    /// The swapchain's low-latency handle, for latency reports; `None` without
+    /// `Caps::low_latency`.
     pub fn latency(&self) -> Option<&LowLatency> {
         self.latency.as_ref()
     }
