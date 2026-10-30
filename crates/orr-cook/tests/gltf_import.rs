@@ -1,6 +1,7 @@
 //! glTF import beyond plain float meshes: quantised and meshopt-compressed buffers, part
 //! attributes, material extensions and overrides, model selection with joined grids, and
-//! the textures a mesh cook reads (opacity for opaque-first triangles, displacement bounds).
+//! the textures a mesh cook reads (opacity for opaque-first triangles and micromaps,
+//! displacement bounds).
 
 #[path = "common/glb.rs"]
 mod glb;
@@ -10,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use glb::{Glb, I8, U16};
 use orr_cook::{
-    ArchiveSpec, AssetSpec, GltfSettings, Manifest, MaterialPatch, MeshPatch, NodeSelect,
-    PartAttribute, Source,
+    ArchiveSpec, AssetSpec, GltfSettings, LodMode, Manifest, MaterialPatch, MeshPatch,
+    MeshSettings, NodeSelect, OmmSettings, PartAttribute, Source,
 };
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{self, Cluster, MeshInfo, PageView};
@@ -552,6 +553,245 @@ fn opaque_triangles_never_cover_cut_out_texels() {
         opaque > 100 && tested > 100,
         "{opaque} opaque, {tested} alpha-tested"
     );
+}
+
+/// Micromap index of barycentrics (u, v) at `level`, for the point `c0 w + c1 u + c2 v`
+/// (the Vulkan specification's reference code).
+fn bary_to_index(u: f32, v: f32, level: u32) -> u32 {
+    let n = 1u32 << level;
+    let (fu, fv) = (u.clamp(0.0, 1.0) * n as f32, v.clamp(0.0, 1.0) * n as f32);
+    let (mut iu, iv) = ((fu as u32).min(n - 1), (fv as u32).min(n - 1));
+    let (uf, vf) = (fu - iu as f32, fv - iv as f32);
+    let iuv = iu + iv;
+    if iuv >= n {
+        iu -= iuv - n + 1;
+    }
+    let mut iw = !(iu + iv);
+    if uf + vf >= 1.0 && iuv < n - 1 {
+        iw = iw.wrapping_sub(1);
+    }
+    let mut b0 = !(iu ^ iw) & (n - 1);
+    let t = (iu ^ iv) & b0;
+    let mut f = t;
+    f ^= f >> 1;
+    f ^= f >> 2;
+    f ^= f >> 4;
+    f ^= f >> 8;
+    let mut b1 = ((f ^ iu) & !b0) | t;
+    for b in [&mut b0, &mut b1] {
+        *b = (*b | (*b << 8)) & 0x00ff00ff;
+        *b = (*b | (*b << 4)) & 0x0f0f0f0f;
+        *b = (*b | (*b << 2)) & 0x33333333;
+        *b = (*b | (*b << 1)) & 0x55555555;
+    }
+    b0 | (b1 << 1)
+}
+
+/// A 4x4 card atlas of 64-texel leaves with soft, ragged edges; odd cells have a one-texel
+/// transparent vein through the leaf.
+fn card_atlas() -> Vec<u8> {
+    png(256, 256, |x, y| {
+        let cell = (y / 64) * 4 + x / 64;
+        let (lx, ly) = ((x % 64) as f32 + 0.5 - 32.0, (y % 64) as f32 + 0.5 - 32.0);
+        let (rx, ry) = (
+            14.0 + (cell % 4) as f32 * 4.0,
+            26.0 - (cell / 4) as f32 * 2.0,
+        );
+        let d = ((lx / rx).powi(2) + (ly / ry).powi(2)).sqrt();
+        let ragged = 0.08 * (((x * 13 + y * 7) % 11) as f32 / 11.0);
+        let mut a = ((1.0 - d - ragged) * 6.0 + 0.3).clamp(0.0, 1.0);
+        if cell % 2 == 1 && (lx - ly * 0.3).abs() < 0.5 {
+            a = 0.0;
+        }
+        [60, 140, 40, (a * 255.0).round() as u8]
+    })
+}
+
+/// `count` cards of 2x2 quads at scattered places and turns, each over one atlas cell.
+fn cards(count: u32) -> (Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<u32>) {
+    let (mut pos, mut uv, mut idx) = (Vec::new(), Vec::new(), Vec::new());
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut rand = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 40) as f32 / (1u64 << 24) as f32
+    };
+    for c in 0..count {
+        let origin = [rand() * 4.0, rand() * 4.0, rand() * 4.0];
+        let (yaw, pitch) = (rand() * std::f32::consts::TAU, rand() * 3.0 - 1.5);
+        let right = [yaw.cos(), 0.0, yaw.sin()];
+        let up = [
+            -yaw.sin() * pitch.sin(),
+            pitch.cos(),
+            yaw.cos() * pitch.sin(),
+        ];
+        let cell = c % 16;
+        let (u0, v0) = ((cell % 4) as f32 * 0.25, (cell / 4) as f32 * 0.25);
+        let flip = c % 3 == 0;
+        let first = pos.len() as u32;
+        for j in 0..3 {
+            for i in 0..3 {
+                let (s, t) = (i as f32 / 2.0, j as f32 / 2.0);
+                pos.push([0, 1, 2].map(|a| origin[a] + 0.3 * (s * right[a] + t * up[a])));
+                let s = if flip { 1.0 - s } else { s };
+                uv.push([u0 + (s * 62.0 + 1.0) / 256.0, v0 + (t * 62.0 + 1.0) / 256.0]);
+            }
+        }
+        for j in 0..2 {
+            for i in 0..2 {
+                let k = first + j * 3 + i;
+                idx.extend([k, k + 3, k + 1, k + 1, k + 3, k + 4]);
+            }
+        }
+    }
+    (pos, uv, idx)
+}
+
+#[test]
+fn micromap_states_never_contradict_the_alpha_test() {
+    let d = dir("gltf-omm");
+    let (pos, uv, idx) = cards(160);
+    let mut g = Glb::default();
+    let pa = g.floats(&pos, "VEC3");
+    let ta = g.floats(&uv, "VEC2");
+    let ia = g.indices(&idx);
+    let img = g.image(&card_atlas());
+    let path = d.join("cards.glb");
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"TEXCOORD_0":{ta}}},"indices":{ia},"material":0}}]}}],
+"materials":[{{"alphaMode":"MASK","alphaCutoff":0.3,"doubleSided":true,"pbrMetallicRoughness":{{"baseColorTexture":{{"index":0}}}}}}],
+"textures":[{{"source":0}}],"images":[{{"bufferView":{img},"mimeType":"image/png"}}]"#
+        ),
+    );
+    let defaults = OmmSettings::default();
+    let capped = OmmSettings {
+        max_level: 4,
+        target_edge: 0.0,
+        cluster_bytes_max: 1024,
+    };
+    for omm in [defaults, capped.clone()] {
+        let settings = GltfSettings {
+            mesh: MeshSettings {
+                lod: LodMode::Discrete {
+                    errors: vec![0.01, 0.05],
+                },
+                omm: Some(omm.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (a, report) = cook(&path, settings).unwrap();
+        let opacity = texture_mip(&a, "g/texture/0/opacity", 0);
+        let e = a.find(AssetId::from_name("g/mesh")).unwrap();
+        let blobs = a.blobs(e);
+        let info = MeshInfo::parse(&read(&a, &blobs[0])).unwrap();
+        let (mut known, mut samples, mut top_level) = (0u64, 0u64, 0);
+        for p in &info.pages {
+            let mut page = vec![0; p.resident_len as usize];
+            mesh::decode_page(&read(&a, &blobs[p.blob as usize]), &mut page).unwrap();
+            let view = PageView::new(&page, &info.header).unwrap();
+            let maps = view.micromaps().unwrap();
+            corrupt_micromaps_are_rejected(&page, &info.header);
+            for i in 0..maps.entry_count() {
+                top_level = top_level.max(maps.entry(i).level);
+            }
+            for ci in 0..view.cluster_count() {
+                let c = view.cluster(ci);
+                for t in u32::from(c.alpha_first)..u32::from(c.tri_count) {
+                    let index = view
+                        .omm_index(&c, t)
+                        .expect("alpha-tested triangles have micromaps");
+                    let uv = view.triangle(&c, t).map(|v| view.uv(&c, u32::from(v)));
+                    let level = u32::try_from(index).map_or(0, |e| u32::from(maps.entry(e).level));
+                    let n = (2 << level).min(32);
+                    for j in 0..n {
+                        for i in 0..n - j {
+                            for (du, dv) in [(0.2, 0.3), (0.65, 0.25)] {
+                                let (bu, bv) =
+                                    ((i as f32 + du) / n as f32, (j as f32 + dv) / n as f32);
+                                if bu + bv > 1.0 {
+                                    continue;
+                                }
+                                let state = match u32::try_from(index) {
+                                    Ok(e) => maps.state(e, bary_to_index(bu, bv, level)),
+                                    Err(_) => (-1 - index) as u8,
+                                };
+                                samples += 1;
+                                if state >= 2 {
+                                    continue;
+                                }
+                                known += 1;
+                                let bw = 1.0 - bu - bv;
+                                let p =
+                                    [0, 1].map(|k| uv[0][k] * bw + uv[1][k] * bu + uv[2][k] * bv);
+                                let pass = opacity.bilinear(p) >= 0.3;
+                                assert_eq!(
+                                    pass,
+                                    state == 1,
+                                    "state {state} at {p:?}, triangle {t}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            known * 2 > samples,
+            "{known} of {samples} samples in known states"
+        );
+        if omm == capped {
+            // Unadaptive level 4 is 64 B per triangle, over the cap.
+            assert!(
+                top_level < omm.max_level.into(),
+                "level {top_level} under the cap"
+            );
+        }
+        let entry = report.assets[0]
+            .entries
+            .iter()
+            .find(|e| e.name == "g/mesh")
+            .unwrap();
+        for l in &entry.mesh.as_ref().unwrap().levels {
+            assert!(l.omm_triangles > 0 && l.omm_bytes > 0);
+            assert!(
+                l.omm_unknown > 0.0 && l.omm_unknown < 0.5,
+                "unknown share {}",
+                l.omm_unknown
+            );
+        }
+    }
+}
+
+/// A usage count off by one, an entry past the page and an index past the entries each fail
+/// [`PageView::micromaps`].
+fn corrupt_micromaps_are_rejected(page: &[u8], mesh: &mesh::MeshHeader) {
+    let h: mesh::PageHeader = bytemuck::pod_read_unaligned(&page[..size_of::<mesh::PageHeader>()]);
+    let rejects = |edit: &dyn Fn(&mut Vec<u8>)| {
+        let mut p = page.to_vec();
+        edit(&mut p);
+        PageView::new(&p, mesh).unwrap().micromaps().is_err()
+    };
+    let usage = std::mem::offset_of!(mesh::PageHeader, omm_usage);
+    assert!(rejects(&|p| p[usage] ^= 1));
+    let entry = h.omm_offset as usize;
+    assert!(rejects(
+        &|p| p[entry..entry + 4].copy_from_slice(&h.len.to_le_bytes())
+    ));
+    let view = PageView::new(page, mesh).unwrap();
+    let c = (0..view.cluster_count())
+        .map(|i| view.cluster(i))
+        .find(|c| c.omm_first != Cluster::NO_OMM)
+        .unwrap();
+    let at = (h.omm_offset + c.omm_first) as usize;
+    let past = view.micromaps().unwrap().entry_count() as i16;
+    assert!(rejects(
+        &|p| p[at..at + 2].copy_from_slice(&past.to_le_bytes())
+    ));
 }
 
 /// One mip of a cooked single-channel texture: BC4 or R16.

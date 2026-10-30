@@ -64,7 +64,7 @@ use serde::Deserialize;
 
 pub use gltf::{NodeSelect, PartAttribute};
 pub use instances::{Instances, Placement, PrototypeSpec, SectionSpec};
-pub use mesh::{LodMode, MeshInput, MeshParts, MeshSettings};
+pub use mesh::{LodMode, MeshInput, MeshParts, MeshSettings, OmmSettings};
 pub use patch::{MaterialPatch, MeshPatch};
 pub use raster::{
     RasterCompression, RasterFormat, RasterInput, RasterLayerReport, RasterLayerSpec, RasterReport,
@@ -140,9 +140,9 @@ pub enum Source {
     /// Raster layers tiled into one raster set.
     Raster(RasterSet),
     /// A mesh built in memory, one material per section; library callers only. Alpha-tested
-    /// sections with an opacity texture keep every triangle alpha-tested, and displaced
-    /// sections bound their clusters by the declared range, since the cook does not read
-    /// the bound textures.
+    /// sections with an opacity texture keep every triangle alpha-tested without micromaps,
+    /// and displaced sections bound their clusters by the declared range, since the cook
+    /// does not read the bound textures.
     #[serde(skip)]
     Mesh {
         mesh: MeshInput,

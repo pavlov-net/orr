@@ -2,7 +2,10 @@
 
 use std::path::PathBuf;
 
-use orr_pack::mesh::{MeshHeader, MeshInfo, PageView, Section, decode_page};
+use orr_pack::mesh::{
+    MeshHeader, MeshInfo, OMM_STATE_UNKNOWN_TRANSPARENT, OMM_UNKNOWN_TRANSPARENT, PageView,
+    Section, decode_page,
+};
 use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, Class, Entry};
 use serde::Serialize;
@@ -104,6 +107,13 @@ pub struct LevelReport {
     pub resident: u64,
     pub stored_per_triangle: f64,
     pub resident_per_triangle: f64,
+    /// Resident bytes of the pages' micromap regions.
+    pub omm_bytes: u64,
+    /// Alpha-tested triangles with micromaps.
+    pub omm_triangles: u64,
+    /// Share of those triangles' micro-triangles in an unknown state, each triangle weighted
+    /// alike; a special index counts for its whole triangle.
+    pub omm_unknown: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -190,6 +200,9 @@ fn mesh_report(
             resident: 0,
             stored_per_triangle: 0.0,
             resident_per_triangle: 0.0,
+            omm_bytes: 0,
+            omm_triangles: 0,
+            omm_unknown: 0.0,
         })
         .collect();
     let (mut foliage_tris, mut foliage_clusters) = (0u64, 0u64);
@@ -202,12 +215,29 @@ fn mesh_report(
         let mut raw = vec![0; b.raw_len as usize];
         a.read(b, &mut raw).ok()?;
         let mut page = vec![0; p.resident_len as usize];
-        decode_page(&raw, &mut page).ok()?;
+        let layout = decode_page(&raw, &mut page).ok()?;
         let view = PageView::new(&page, &m.header).ok()?;
+        let maps = view.micromaps().ok()?;
         let r = &mut levels[level];
         for i in 0..view.cluster_count() {
             let c = view.cluster(i);
             r.triangles += u64::from(c.tri_count);
+            for t in u32::from(c.alpha_first)..u32::from(c.tri_count) {
+                let Some(index) = view.omm_index(&c, t) else {
+                    break;
+                };
+                r.omm_triangles += 1;
+                r.omm_unknown += match u32::try_from(index) {
+                    Ok(e) => {
+                        let micro = 1u32 << (2 * maps.entry(e).level);
+                        let unknown = (0..micro)
+                            .filter(|&k| maps.state(e, k) >= OMM_STATE_UNKNOWN_TRANSPARENT)
+                            .count();
+                        unknown as f64 / f64::from(micro)
+                    }
+                    Err(_) => f64::from(u8::from(index <= OMM_UNKNOWN_TRANSPARENT)),
+                };
+            }
             let foliage = Section::ALPHA_TESTED | Section::DOUBLE_SIDED;
             if m.sections.get(usize::from(c.section))?.flags & foliage != 0 {
                 foliage_tris += u64::from(c.tri_count);
@@ -217,11 +247,13 @@ fn mesh_report(
         r.pages += 1;
         r.stored += u64::from(b.stored_len);
         r.resident += u64::from(p.resident_len);
+        r.omm_bytes += u64::from(layout.len - layout.omm_offset);
         first += u32::from(p.cluster_count);
     }
     for l in &mut levels {
         l.stored_per_triangle = l.stored as f64 / l.triangles.max(1) as f64;
         l.resident_per_triangle = l.resident as f64 / l.triangles.max(1) as f64;
+        l.omm_unknown /= l.omm_triangles.max(1) as f64;
     }
     Some(MeshReport {
         position_exponent: m.header.position_exponent,

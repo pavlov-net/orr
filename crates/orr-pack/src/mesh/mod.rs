@@ -16,18 +16,20 @@
 //!   attribute array. `vertex_first` is even, so every cluster's positions start 4-aligned.
 //! - Triangles at `tris_offset + tri_first`: u8x3 cluster-local corners, opaque triangles
 //!   first and alpha-tested ones from `alpha_first`, 4-aligned per cluster.
-//! - Opacity micromap data from `omm_offset` to the end of the page.
+//! - Opacity micromaps from `omm_offset` to the end of the page ([`Micromaps`]).
 
 mod codec;
+mod omm;
 
 use bytemuck::{Pod, Zeroable};
 
 pub use codec::{decode_page, encode_page};
+pub use omm::*;
 
 use crate::blob::{put_table, read, table};
 use crate::{Aabb, Affine3, Error, Result, Span, Sphere};
 
-pub const SCHEMA: u16 = 2;
+pub const SCHEMA: u16 = 3;
 
 /// Largest resident page.
 pub const PAGE_MAX: usize = 128 << 10;
@@ -448,6 +450,22 @@ impl<'a> PageView<'a> {
         assert!(t < u32::from(c.tri_count));
         let at = (self.header.tris_offset + c.tri_first + t * 3) as usize;
         self.page[at..at + 3].try_into().unwrap()
+    }
+
+    /// Micromap index of triangle `t`: an entry of the page's [`Micromaps`], or negative for
+    /// a special index. `None` for opaque triangles (before `alpha_first`) and clusters
+    /// without micromaps.
+    pub fn omm_index(&self, c: &Cluster, t: u32) -> Option<i16> {
+        assert!(t < u32::from(c.tri_count));
+        let alpha = u32::from(c.alpha_first);
+        if c.omm_first == Cluster::NO_OMM || t < alpha {
+            return None;
+        }
+        let at = [self.header.omm_offset, c.omm_first, 2 * (t - alpha)]
+            .map(|o| o as usize)
+            .iter()
+            .sum();
+        Some(read(self.page, at).expect("micromap index outside the page"))
     }
 
     fn attr(&self, c: &Cluster, v: u32, at: u32) -> u32 {

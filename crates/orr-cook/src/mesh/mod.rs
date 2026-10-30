@@ -7,11 +7,13 @@
 //! borders locked), falling back to sloppy simplification when that keeps more than three
 //! quarters of its input. From `merge_level` on, the parts of a section simplify together
 //! into the body (part 0, [`Cluster::MERGED`]). Each piece of each level is cut into spatial
-//! clusters; alpha-tested clusters put opaque triangles first. Pages hold whole clusters of
-//! one level, coarsest level first, and the coarsest level's pages are pinned.
+//! clusters; alpha-tested clusters put opaque triangles first and carry opacity micromaps
+//! over the rest. Pages hold whole clusters of one level, coarsest level first, and the
+//! coarsest level's pages are pinned.
 
 mod lod;
 pub(crate) mod maps;
+mod omm;
 
 use std::ops::Range;
 
@@ -19,15 +21,18 @@ use glam::{Vec2, Vec3};
 use meshopt::VertexDataAdapter;
 use orr_pack::material::Material;
 use orr_pack::mesh::{
-    Cluster, Level, MeshHeader, MeshInfo, PAGE_MAX, PageHeader, PageInfo, Part, PartLevel, Section,
-    oct_encode,
+    Cluster, Level, MeshHeader, MeshInfo, OMM_ALIGN, PAGE_MAX, PageHeader, PageInfo, Part,
+    PartLevel, Section, oct_encode,
 };
 use orr_pack::{Aabb, Hash32, Span, Sphere};
+use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::texture::Wrap;
 use crate::{Error, Result};
 use maps::{Displacement, Opacity};
+pub use omm::OmmSettings;
+use omm::{ClusterOmm, OmmAlpha};
 
 /// How meshes are simplified, clustered and quantised.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -50,6 +55,9 @@ pub struct MeshSettings {
     /// First discrete level whose parts merge into the body; `None` keeps parts at every
     /// level. Ignored on meshes without parts.
     pub merge_level: Option<u8>,
+    /// Opacity micromaps on alpha-tested clusters; `None` for content whose coverage
+    /// changes at run time, which never uses them.
+    pub omm: Option<OmmSettings>,
 }
 
 impl Default for MeshSettings {
@@ -62,6 +70,7 @@ impl Default for MeshSettings {
             position_step_log2: -11,
             deformation_bound: 0.0,
             merge_level: None,
+            omm: Some(OmmSettings::default()),
         }
     }
 }
@@ -287,6 +296,25 @@ pub(crate) fn cook(
             }
         }
     }
+    let mut omm_alpha = Vec::with_capacity(maps.len());
+    for (si, sm) in maps.iter().enumerate() {
+        let alpha = match (&s.omm, &sm.opacity) {
+            (Some(_), Some(Opacity::Texture { mip0, cutoff })) => {
+                let a = OmmAlpha::new(mip0, *cutoff);
+                if a.is_none() {
+                    warnings.push(format!(
+                        "section {si}: opacity texture {}x{} is over {} texels a side; no micromaps",
+                        mip0.w,
+                        mip0.h,
+                        OmmAlpha::MAX_SIZE
+                    ));
+                }
+                a
+            }
+            _ => None,
+        };
+        omm_alpha.push(alpha);
+    }
     let levels = lod::levels(&w, &grid, &parts, s, m.sections.len());
 
     let attributes = if m.tangents.is_some() {
@@ -346,13 +374,22 @@ pub(crate) fn cook(
                 );
                 let verts = &ml.vertices[vo..vo + vc];
                 let tris = &mut ml.triangles[to..to + tc * 3];
-                let opaque = partition_opaque(&w, verts, tris, section_maps.opacity.as_ref());
+                let uv = ClusterUvs::new(&w, verts);
+                let uvs: Vec<[f32; 2]> = verts
+                    .iter()
+                    .map(|&v| uv.stored(w.uvs[v as usize]))
+                    .collect();
+                let opaque = partition_opaque(&uvs, tris, section_maps.opacity.as_ref());
+                stored_corner_order(tris);
                 let meshlet = meshopt::Meshlet {
                     vertices: verts,
                     triangles: tris,
                 };
                 let bounds = meshopt::compute_meshlet_bounds(meshlet, &adapter);
-                let mut c = build_cluster(&w, &grid, verts, tris, &bounds, sec.flags);
+                let mut c = build_cluster(&w, &grid, verts, tris, &bounds, sec.flags, &uv);
+                if s.omm.is_some() && section_maps.opacity.is_some() {
+                    c.uvs = uvs;
+                }
                 c.record.section = piece.section;
                 c.record.part = piece.part;
                 c.record.alpha_first = opaque;
@@ -376,6 +413,18 @@ pub(crate) fn cook(
             }
         }
         by_level.push(clusters);
+    }
+    if let Some(o) = &s.omm {
+        let clusters: Vec<&mut ClusterData> = by_level.iter_mut().flatten().collect();
+        clusters.into_par_iter().for_each(|c| {
+            let section = usize::from(c.record.section);
+            if let Some(opacity) = &maps[section].opacity {
+                let alpha = &c.tris.as_chunks::<3>().0[usize::from(c.record.alpha_first)..];
+                let texture = omm_alpha[section].as_ref();
+                c.omm = omm::cluster_omm(opacity, texture, &c.uvs, alpha, o);
+            }
+            c.uvs = Vec::new();
+        });
     }
 
     // Pages, coarsest level first; mesh cluster indices count in page order.
@@ -407,6 +456,10 @@ pub(crate) fn cook(
         }
         for (bytes, n) in paginate(clusters, stride) {
             let stored = orr_pack::mesh::encode_page(&bytes)?;
+            // Micromaps follow the stored corner order, so the page must decode as written.
+            let mut decoded = vec![0; bytes.len()];
+            orr_pack::mesh::decode_page(&stored, &mut decoded)?;
+            assert!(decoded == bytes, "a cooked page decodes to itself");
             page_info.push(PageInfo {
                 blob: pages.len() as u32 + 1,
                 resident_len: bytes.len() as u32,
@@ -535,6 +588,9 @@ fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
     {
         return Err("vertex attribute counts differ".into());
     }
+    if let Some(o) = &s.omm {
+        o.check()?;
+    }
     if !(0.0..=65504.0).contains(&s.deformation_bound) {
         return Err(format!(
             "deformation_bound {} m is outside 0..=65504",
@@ -564,20 +620,16 @@ fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
     Ok(())
 }
 
-/// Stable partition of a cluster's triangles: opaque ones first. Returns their count.
-fn partition_opaque(
-    w: &lod::Welded,
-    verts: &[u32],
-    tris: &mut [u8],
-    opacity: Option<&Opacity>,
-) -> u8 {
+/// Stable partition of a cluster's triangles over its stored vertex uvs: opaque ones first.
+/// Returns their count.
+fn partition_opaque(uvs: &[[f32; 2]], tris: &mut [u8], opacity: Option<&Opacity>) -> u8 {
     let n = tris.len() / 3;
     let Some(opacity) = opacity else {
         return n as u8;
     };
     let (mut opaque, mut tested) = (Vec::with_capacity(n * 3), Vec::with_capacity(n * 3));
     for t in tris.as_chunks::<3>().0 {
-        let uv = t.map(|i| w.uvs[verts[usize::from(i)] as usize]);
+        let uv = t.map(|i| uvs[usize::from(i)]);
         if opacity.opaque(uv) {
             opaque.extend_from_slice(t);
         } else {
@@ -588,6 +640,58 @@ fn partition_opaque(
     opaque.extend_from_slice(&tested);
     tris.copy_from_slice(&opaque);
     first as u8
+}
+
+/// Rotates each triangle's corners as the page codec stores them; order and winding stay.
+fn stored_corner_order(tris: &mut [u8]) {
+    let n = tris.len() / 3;
+    let meshlet = meshopt::Meshlet {
+        vertices: &[],
+        triangles: tris,
+    };
+    let stored = meshopt::encode_meshlet(meshlet).expect("the meshlet codec takes a cluster");
+    let (_, decoded) =
+        meshopt::decode_meshlet(&stored, 0, n).expect("the meshlet codec decodes its own stream");
+    tris.copy_from_slice(&decoded);
+}
+
+/// A cluster's uvs as the page stores them: unorm16 over the cluster's uv range.
+struct ClusterUvs {
+    offset: [f32; 2],
+    scale: [f32; 2],
+}
+
+impl ClusterUvs {
+    fn new(w: &lod::Welded, verts: &[u32]) -> Self {
+        let (lo, hi) = verts
+            .iter()
+            .fold((Vec2::INFINITY, Vec2::NEG_INFINITY), |(lo, hi), &v| {
+                let uv = Vec2::from(w.uvs[v as usize]);
+                (lo.min(uv), hi.max(uv))
+            });
+        Self {
+            offset: lo.to_array(),
+            scale: (hi - lo).to_array(),
+        }
+    }
+
+    fn quantise(&self, uv: [f32; 2]) -> [u32; 2] {
+        [0, 1].map(|a| {
+            if self.scale[a] > 0.0 {
+                ((uv[a] - self.offset[a]) / self.scale[a] * 65535.0)
+                    .round()
+                    .clamp(0.0, 65535.0) as u32
+            } else {
+                0
+            }
+        })
+    }
+
+    /// The uv a page reader decodes for `uv`.
+    fn stored(&self, uv: [f32; 2]) -> [f32; 2] {
+        let q = self.quantise(uv);
+        [0, 1].map(|a| self.offset[a] + q[a] as f32 / 65535.0 * self.scale[a])
+    }
 }
 
 /// f16 bits of the smallest half at or above `v`.
@@ -694,6 +798,9 @@ struct ClusterData {
     local: Vec<[u16; 3]>,
     attrs: Vec<u32>,
     tris: Vec<u8>,
+    /// Vertex uvs as the page stores them, until the micromaps are made.
+    uvs: Vec<[f32; 2]>,
+    omm: Option<ClusterOmm>,
 }
 
 impl ClusterData {
@@ -720,6 +827,7 @@ fn build_cluster(
     tris: &[u8],
     bounds: &meshopt::Bounds,
     flags: u8,
+    uv: &ClusterUvs,
 ) -> ClusterData {
     let anchor = [0, 1, 2].map(|a| {
         verts
@@ -737,21 +845,6 @@ fn build_cluster(
         .collect();
     let local_max = [0, 1, 2].map(|a| local.iter().map(|l| l[a]).max().unwrap());
 
-    let (uv_lo, uv_hi) = verts
-        .iter()
-        .fold((Vec2::INFINITY, Vec2::NEG_INFINITY), |(lo, hi), &v| {
-            let uv = Vec2::from(w.uvs[v as usize]);
-            (lo.min(uv), hi.max(uv))
-        });
-    let (uv_lo, uv_hi) = (uv_lo.to_array(), uv_hi.to_array());
-    let uv_scale = [0, 1].map(|a| uv_hi[a] - uv_lo[a]);
-    let unorm = |v: f32, lo: f32, scale: f32| {
-        if scale > 0.0 {
-            ((v - lo) / scale * 65535.0).round().clamp(0.0, 65535.0) as u32
-        } else {
-            0
-        }
-    };
     let mut attrs = Vec::with_capacity(verts.len() * 3);
     for &v in verts {
         let v = v as usize;
@@ -763,8 +856,8 @@ fn build_cluster(
             let e = oct_encode(Vec3::new(x, y, z).normalize_or(Vec3::X).to_array());
             attrs.push(e & !(1 << 16) | u32::from(s < 0.0) << 16);
         }
-        let uv = w.uvs[v];
-        attrs.push(unorm(uv[0], uv_lo[0], uv_scale[0]) | unorm(uv[1], uv_lo[1], uv_scale[1]) << 16);
+        let q = uv.quantise(w.uvs[v]);
+        attrs.push(q[0] | q[1] << 16);
         if let Some(k) = &w.skin {
             attrs.push(u32::from_le_bytes(k.joints[v]));
             attrs.push(u32::from_le_bytes(k.weights[v]));
@@ -806,8 +899,8 @@ fn build_cluster(
             0
         },
         local_max,
-        uv_offset: uv_lo,
-        uv_scale,
+        uv_offset: uv.offset,
+        uv_scale: uv.scale,
         omm_first: Cluster::NO_OMM,
         area: area as f32,
         ..bytemuck::Zeroable::zeroed()
@@ -817,6 +910,8 @@ fn build_cluster(
         local,
         attrs,
         tris: tris.to_vec(),
+        uvs: Vec::new(),
+        omm: None,
     }
 }
 
@@ -824,15 +919,27 @@ fn build_cluster(
 /// page and its cluster count.
 fn paginate(clusters: &[ClusterData], stride: usize) -> Vec<(Vec<u8>, usize)> {
     let cost = |c: &ClusterData| {
-        size_of::<Cluster>() + c.slots() * (6 + stride) + (c.tris.len()).next_multiple_of(4)
+        size_of::<Cluster>()
+            + c.slots() * (6 + stride)
+            + c.tris.len().next_multiple_of(4)
+            + c.omm.as_ref().map_or(0, ClusterOmm::bytes)
     };
     let mut pages = Vec::new();
     let mut first = 0;
     while first < clusters.len() {
         let mut size = size_of::<PageHeader>();
         let mut end = first;
-        while end < clusters.len() && size + cost(&clusters[end]) <= PAGE_MAX {
-            size += cost(&clusters[end]);
+        let mut aligned = false;
+        while end < clusters.len() {
+            let c = &clusters[end];
+            // Room to align the micromap region, once per page.
+            let align = c.omm.is_some() && !aligned;
+            let add = cost(c) + if align { OMM_ALIGN as usize - 1 } else { 0 };
+            if size + add > PAGE_MAX {
+                break;
+            }
+            size += add;
+            aligned |= align;
             end += 1;
         }
         pages.push((write_page(&clusters[first..end], stride), end - first));
@@ -850,7 +957,13 @@ fn write_page(clusters: &[ClusterData], stride: usize) -> Vec<u8> {
     let positions = size_of::<PageHeader>() + clusters.len() * size_of::<Cluster>();
     let attrs = positions + slots * 6;
     let tris = attrs + slots * stride;
-    let omm = tris + tris_len;
+    let region = omm::page_region(&clusters.iter().map(|c| c.omm.as_ref()).collect::<Vec<_>>());
+    let omm = if region.bytes.is_empty() {
+        tris + tris_len
+    } else {
+        (tris + tris_len).next_multiple_of(OMM_ALIGN as usize)
+    };
+    let len = omm + region.bytes.len();
     let header = PageHeader {
         cluster_count: clusters.len() as u32,
         attr_stride: stride as u32,
@@ -858,16 +971,19 @@ fn write_page(clusters: &[ClusterData], stride: usize) -> Vec<u8> {
         attrs_offset: attrs as u32,
         tris_offset: tris as u32,
         omm_offset: omm as u32,
-        len: omm as u32,
+        len: len as u32,
+        omm_usage: region.usage,
         ..bytemuck::Zeroable::zeroed()
     };
-    let mut page = vec![0u8; omm];
+    let mut page = vec![0u8; len];
     page[..size_of::<PageHeader>()].copy_from_slice(bytemuck::bytes_of(&header));
+    page[omm..].copy_from_slice(&region.bytes);
     let (mut vertex_first, mut tri_first) = (0, 0);
     for (i, c) in clusters.iter().enumerate() {
         let mut r = c.record;
         r.vertex_first = vertex_first as u32;
         r.tri_first = tri_first as u32;
+        r.omm_first = region.omm_first[i].unwrap_or(Cluster::NO_OMM);
         let at = size_of::<PageHeader>() + i * size_of::<Cluster>();
         page[at..at + size_of::<Cluster>()].copy_from_slice(bytemuck::bytes_of(&r));
         let p = positions + vertex_first * 6;

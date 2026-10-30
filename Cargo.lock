@@ -1275,6 +1275,7 @@ dependencies = [
  "gpu-suite",
  "half",
  "log",
+ "orr",
  "orr-egui",
  "orr-output",
  "orr-scene",
