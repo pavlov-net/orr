@@ -255,14 +255,16 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
 #[test]
 fn renderer_rejects_a_set_built_against_other_kernels() {
     match renderer_error(&orr_edited::KERNELS) {
-        Some(orr::Error::Kernels(e)) => {
+        Some(orr::Error::Scene(orr::SceneError::Kernels(e))) => {
             assert_eq!(e.kernel, "environment/bake");
             assert!(matches!(e.reason, Mismatch::Interface { .. }), "{e}");
         }
         other => panic!("expected an interface mismatch, got {other:?}"),
     }
     match renderer_error(&linked::KERNELS) {
-        Some(orr::Error::Kernels(e)) => assert_eq!(e.reason, Mismatch::UnknownKernel, "{e}"),
+        Some(orr::Error::Scene(orr::SceneError::Kernels(e))) => {
+            assert_eq!(e.reason, Mismatch::UnknownKernel, "{e}");
+        }
         other => panic!("expected an unknown kernel, got {other:?}"),
     }
     assert_clean();
