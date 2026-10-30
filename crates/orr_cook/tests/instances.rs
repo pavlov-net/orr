@@ -49,7 +49,9 @@ fn cook(assets: Vec<AssetSpec>) -> orr_cook::Result<Archive> {
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(Target::Memory, assets)],
     };
-    let bytes = orr_cook::cook(&manifest)?.memory.remove(0);
+    let bytes = orr_cook::cook(&manifest, &Default::default())?
+        .memory
+        .remove(0);
     Ok(Archive::from_memory(bytes).unwrap())
 }
 

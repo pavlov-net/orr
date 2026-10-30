@@ -24,11 +24,11 @@ use gltf::image::Source as ImageSource;
 use gltf::material::AlphaMode;
 use gltf::mesh::Mode;
 use gltf::texture::WrappingMode;
-use orr_pack::Hash32;
 use orr_pack::material::Material;
 use orr_pack::mesh::Section;
 
 use crate::mesh::{MeshData, SectionData};
+use crate::state::{Input, Memo};
 use crate::texture::Wrap;
 use crate::texture::material::{ImageFile, MaterialTextures, TexRef};
 use crate::{Error, Result};
@@ -38,8 +38,8 @@ pub(crate) struct Imported {
     /// Name suffix, material and its images per mesh section.
     pub materials: Vec<(String, Material, MaterialTextures)>,
     pub images: Vec<ImageFile>,
-    /// blake3 of the document and every buffer it reads.
-    pub input_hash: Hash32,
+    /// Every file read: the document, its buffers and images.
+    pub files: Vec<Input>,
 }
 
 #[derive(Default)]
@@ -50,23 +50,24 @@ struct Vertices {
     uvs: Vec<[f32; 2]>,
 }
 
-pub(crate) fn import(asset: &str, path: &Path) -> Result<Imported> {
+pub(crate) fn import(asset: &str, path: &Path, memo: &Memo) -> Result<Imported> {
     let fail = |message: String| Error::Import {
         asset: asset.into(),
         message,
     };
-    let read = |p: &Path| {
-        std::fs::read(p).map_err(|source| Error::Read {
-            path: p.into(),
-            source,
-        })
+    let mut files = Vec::new();
+    let mut read = |p: &Path| {
+        let (bytes, hash) = memo.read(p)?;
+        files.push(Input {
+            path: p.to_owned(),
+            hash,
+        });
+        Ok::<_, Error>(bytes)
     };
     let bytes = read(path)?;
     let doc =
         gltf::Gltf::from_slice(&bytes).map_err(|e| fail(format!("{}: {e}", path.display())))?;
-    let mut hash = blake3::Hasher::new();
-    hash.update(&bytes);
-    // A data URI's bytes, or a file next to the document, which enters the input hash.
+    // A data URI's bytes, or a file next to the document.
     let mut load_uri = |uri: &str, what: String| match uri.strip_prefix("data:") {
         Some(data) => {
             let (_, b64) = data
@@ -76,11 +77,7 @@ pub(crate) fn import(asset: &str, path: &Path) -> Result<Imported> {
                 .decode(b64)
                 .map_err(|e| fail(format!("{what}: {e}")))
         }
-        None => {
-            let data = read(&path.parent().unwrap_or(Path::new("")).join(uri))?;
-            hash.update(&data);
-            Ok(data)
-        }
+        None => read(&path.parent().unwrap_or(Path::new("")).join(uri)),
     };
 
     let mut buffers = Vec::new();
@@ -102,6 +99,7 @@ pub(crate) fn import(asset: &str, path: &Path) -> Result<Imported> {
         }
         buffers.push(data);
     }
+    check_accessors(&doc).map_err(fail)?;
 
     let mut images = Vec::new();
     for img in doc.images() {
@@ -268,7 +266,7 @@ pub(crate) fn import(asset: &str, path: &Path) -> Result<Imported> {
         },
         materials,
         images,
-        input_hash: Hash32(*hash.finalize().as_bytes()),
+        files,
     })
 }
 
@@ -340,4 +338,29 @@ fn textures(m: &gltf::Material<'_>) -> Result<MaterialTextures, String> {
             .map(|i| tex(i.texture(), i.tex_coord()))
             .transpose()?,
     })
+}
+
+/// Every buffer view lies inside its buffer, and every accessor's stride holds its element
+/// and its last element ends inside its view.
+fn check_accessors(doc: &gltf::Gltf) -> Result<(), String> {
+    for v in doc.views() {
+        if v.offset() + v.length() > v.buffer().length() {
+            return Err(format!("buffer view {} runs past its buffer", v.index()));
+        }
+    }
+    for a in doc.accessors() {
+        let Some(v) = a.view() else { continue };
+        let size = a.size();
+        let stride = v.stride().unwrap_or(size);
+        if stride < size {
+            return Err(format!(
+                "accessor {}: stride {stride} is below its {size}-byte element",
+                a.index()
+            ));
+        }
+        if a.count() > 0 && a.offset() + stride * (a.count() - 1) + size > v.length() {
+            return Err(format!("accessor {} runs past its buffer view", a.index()));
+        }
+    }
+    Ok(())
 }

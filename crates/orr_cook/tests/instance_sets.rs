@@ -132,7 +132,7 @@ fn scatter_set_cooks_within_its_error_bounds() {
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(Target::File(out.clone()), assets)],
     };
-    orr_cook::cook(&manifest).unwrap();
+    orr_cook::cook(&manifest, &Default::default()).unwrap();
 
     let a = Archive::open(&out).unwrap();
     let file_index: BTreeMap<String, usize> = files

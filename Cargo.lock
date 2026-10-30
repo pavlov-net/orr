@@ -900,9 +900,11 @@ dependencies = [
 name = "output_suite"
 version = "0.0.1"
 dependencies = [
+ "bytemuck",
  "half",
  "orr_output",
  "orr_scene",
+ "orr_shaders",
  "output_math",
 ]
 
