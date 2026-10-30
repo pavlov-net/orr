@@ -30,12 +30,12 @@ const ROTATION_DEG: f64 = 0.1;
 const SKIN_MM: f64 = 0.5;
 
 /// The source document and its buffers.
-struct Source_ {
+struct Doc {
     doc: gltf::Document,
     buffers: Vec<Vec<u8>>,
 }
 
-fn load(path: &Path) -> Source_ {
+fn load(path: &Path) -> Doc {
     let bytes = std::fs::read(path).unwrap();
     let g = gltf::Gltf::from_slice(&bytes).unwrap();
     let buffers = g
@@ -47,13 +47,13 @@ fn load(path: &Path) -> Source_ {
             }
         })
         .collect();
-    Source_ {
+    Doc {
         doc: g.document,
         buffers,
     }
 }
 
-impl Source_ {
+impl Doc {
     fn buf<'s>(&'s self) -> impl Clone + Fn(gltf::Buffer<'_>) -> Option<&'s [u8]> + 's {
         move |b| self.buffers.get(b.index()).map(Vec::as_slice)
     }
@@ -319,7 +319,7 @@ struct Errors {
 }
 
 /// glTF node of each skeleton joint, by name.
-fn joint_nodes(src: &Source_, skel: &SkeletonInfo) -> Vec<usize> {
+fn joint_nodes(src: &Doc, skel: &SkeletonInfo) -> Vec<usize> {
     skel.names
         .iter()
         .map(|n| {
@@ -342,7 +342,7 @@ struct Skinned {
 }
 
 /// Skinned vertices, and the vertices of meshes without a skin as (node, local position).
-fn source_vertices(src: &Source_, nodes: &[usize]) -> (Vec<Skinned>, Vec<(usize, Vec3)>) {
+fn source_vertices(src: &Doc, nodes: &[usize]) -> (Vec<Skinned>, Vec<(usize, Vec3)>) {
     let joint_of: HashMap<usize, usize> = nodes.iter().enumerate().map(|(j, &n)| (n, j)).collect();
     let (mut skinned, mut rigid) = (Vec::new(), Vec::new());
     for node in src.doc.nodes() {

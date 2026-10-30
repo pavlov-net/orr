@@ -407,7 +407,7 @@ impl ClipSettings {
             ));
         }
         if !(self.position_error >= 0.0 && self.rotation_error >= 0.0) {
-            return Err("clip error bounds are not positive".into());
+            return Err("clip error bounds are negative".into());
         }
         Ok(())
     }
