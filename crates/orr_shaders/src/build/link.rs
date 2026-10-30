@@ -257,7 +257,7 @@ fn check(links: &[Link]) -> Result<(), Error> {
 /// The id constants of each switch point, in link order from 1.
 pub(crate) fn ids(links: &[Link]) -> BTreeMap<LinkPoint, Vec<(&str, u8)>> {
     let mut out: BTreeMap<LinkPoint, Vec<(&str, u8)>> = BTreeMap::new();
-    for point in [LinkPoint::Surface, LinkPoint::Displacement] {
+    for point in LinkPoint::ALL.into_iter().filter(|p| p.switch().is_some()) {
         out.insert(point, Vec::new());
     }
     for l in links {
