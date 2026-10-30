@@ -237,6 +237,16 @@ pub struct HeapReport {
     pub usage: Option<u64>,
 }
 
+/// A registered address range.
+pub(crate) struct Range {
+    pub end: u64,
+    pub buffer: vk::Buffer,
+    pub name: Box<str>,
+}
+
+/// Freed ranges kept for fault reports.
+const FREED_KEPT: usize = 256;
+
 /// Concurrent sharing across `families` when there is more than one.
 pub(crate) fn sharing(families: &[u32]) -> (vk::SharingMode, &[u32]) {
     if families.len() > 1 {
@@ -327,28 +337,45 @@ impl Shared {
             size,
             address,
         };
-        self.buffers
-            .write()
-            .unwrap()
-            .insert(address, (address + size, buffer));
+        self.register_range(address, size, buffer, name);
         self.usage.add(kind, size);
         Ok((raw, mapped))
     }
 
     pub(crate) fn unregister_buffer(&self, b: &RawBuffer) {
-        self.buffers.write().unwrap().remove(&b.address);
+        self.unregister_range(b.address);
         self.usage.sub(b.kind, b.size);
+    }
+
+    /// Records `size` bytes at `address` as `buffer`, for [`Shared::locate`] and fault
+    /// reports.
+    pub(crate) fn register_range(&self, address: u64, size: u64, buffer: vk::Buffer, name: &str) {
+        let range = Range {
+            end: address + size,
+            buffer,
+            name: name.into(),
+        };
+        self.buffers.write().unwrap().insert(address, range);
+    }
+
+    /// Forgets the range at `address`; fault reports still name it among recent frees.
+    pub(crate) fn unregister_range(&self, address: u64) {
+        let Some(range) = self.buffers.write().unwrap().remove(&address) else {
+            return;
+        };
+        let mut freed = self.freed.lock().unwrap();
+        if freed.len() == FREED_KEPT {
+            freed.pop_front();
+        }
+        freed.push_back((address, range));
     }
 
     /// The buffer holding `bytes` bytes at `address`, and the offset into it.
     pub(crate) fn locate(&self, address: GpuAddress, bytes: u64) -> (vk::Buffer, u64) {
         let map = self.buffers.read().unwrap();
-        let found = map
-            .range(..=address.0)
-            .next_back()
-            .and_then(|(&start, &(end, buffer))| {
-                (address.0 + bytes <= end).then_some((buffer, address.0 - start))
-            });
+        let found = map.range(..=address.0).next_back().and_then(|(&start, r)| {
+            (address.0 + bytes <= r.end).then_some((r.buffer, address.0 - start))
+        });
         found.unwrap_or_else(|| {
             panic!(
                 "{bytes} bytes at {:#x} are not inside one gpu_malloc allocation",

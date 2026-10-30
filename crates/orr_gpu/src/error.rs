@@ -34,6 +34,9 @@ pub enum Error {
     /// The heap has no free slot.
     #[error("{0} heap is full")]
     HeapFull(&'static str),
+    /// Aftermath crash dumps were asked for and cannot be enabled.
+    #[error("Aftermath: {0}")]
+    Aftermath(String),
     /// A file could not be read or written.
     #[error("{}: {source}", path.display())]
     Io {

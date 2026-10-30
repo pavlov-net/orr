@@ -97,11 +97,7 @@ impl Device {
             d.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(buffer))
         };
         super::debug::name_object(&shared.debug_fn, buffer, name);
-        shared
-            .buffers
-            .write()
-            .unwrap()
-            .insert(address, (address + size, buffer));
+        shared.register_range(address, size, buffer, name);
         Ok(SparseAllocation {
             // SAFETY: the range belongs to the allocation.
             gpu: unsafe { GpuPtr::from_address(GpuAddress(address)) },

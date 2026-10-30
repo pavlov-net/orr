@@ -15,6 +15,7 @@ raw-window-handle.workspace = true
 bitflags.workspace = true
 blake3.workspace = true
 bytemuck.workspace = true
+libloading = "0.8"
 log.workspace = true
 thiserror.workspace = true
 

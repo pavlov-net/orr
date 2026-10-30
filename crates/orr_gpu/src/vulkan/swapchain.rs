@@ -574,7 +574,7 @@ impl Swapchain {
             Ok(()) => Ok(true),
             Err(vk::Result::TIMEOUT) => Ok(false),
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR) => Ok(true),
-            Err(e) => Err(Error::vk("vkWaitForPresent2KHR")(e)),
+            Err(e) => Err(self.shared().vk_error("vkWaitForPresent2KHR", e)),
         }
     }
 
@@ -638,7 +638,7 @@ impl Swapchain {
                 }
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.recreate()?,
                 Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => return Err(Error::Timeout),
-                Err(e) => return Err(Error::vk("vkAcquireNextImageKHR")(e)),
+                Err(e) => return Err(self.shared().vk_error("vkAcquireNextImageKHR", e)),
             }
         }
         Ok(None)
@@ -705,7 +705,7 @@ impl Swapchain {
         match result {
             Ok(suboptimal) => self.stale |= suboptimal,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.stale = true,
-            Err(e) => return Err(Error::vk("vkQueuePresentKHR")(e)),
+            Err(e) => return Err(self.shared().vk_error("vkQueuePresentKHR", e)),
         }
         Ok(id)
     }

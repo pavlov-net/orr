@@ -32,8 +32,20 @@ pub struct Caps {
     pub unified_image_layouts: bool,
     /// The memory report carries the OS budget per heap.
     pub memory_budget: bool,
-    /// Shader `abort` (`VK_KHR_shader_abort`); enabled in debug builds only.
+    /// Shader `abort` (`VK_KHR_shader_abort`); enabled in debug builds only. The message of
+    /// an abort that loses the device is in [`crate::DiagnosticsReport::abort`].
     pub shader_abort: bool,
+    /// Device fault reports (`VK_KHR_device_fault` or `VK_EXT_device_fault`) in device-lost
+    /// reports.
+    pub device_fault: bool,
+    /// Passes write GPU breadcrumbs (`VK_AMD_buffer_marker`), so reports tell which passes
+    /// began and ended; with [`crate::Diagnostics::Checkpoints`] or `Aftermath`.
+    pub breadcrumbs: bool,
+    /// Passes set checkpoints (`VK_NV_device_diagnostic_checkpoints`), which device-lost
+    /// reports and crash dumps read; with [`crate::Diagnostics::Checkpoints`] or `Aftermath`.
+    pub checkpoints: bool,
+    /// Nsight Aftermath writes crash dumps ([`crate::Diagnostics::Aftermath`]).
+    pub aftermath: bool,
     /// Pipeline binaries (`VK_KHR_pipeline_binary`).
     pub pipeline_binary: bool,
     /// Cooperative-vector type combinations; empty without cooperative vectors or replicated

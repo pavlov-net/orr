@@ -2,10 +2,12 @@
 //! re-exported at the crate root.
 
 mod accel;
+mod aftermath;
 mod cache;
 mod command;
 mod debug;
 mod device;
+mod diagnostics;
 mod features;
 mod garbage;
 mod heap;
@@ -27,6 +29,10 @@ pub use accel::{
 pub use cache::{PipelineCacheKind, PipelineCacheReport};
 pub use command::{CommandList, DispatchArgs, MeshArgs};
 pub use device::{Device, DeviceDesc};
+pub use diagnostics::{
+    Checkpoint, DeviceFault, Diagnostics, DiagnosticsReport, FaultAccess, FaultAddress,
+    QueueProgress,
+};
 pub use memory::{Allocation, HeapReport, MemoryKind, MemoryReport, MemoryUsage};
 pub use mesh::{ColorAttachment, DepthAttachment, MeshPipeline, MeshPipelineDesc, Rendering};
 pub use pipeline::{ComputePipeline, ShaderStage};
