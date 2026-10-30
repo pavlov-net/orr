@@ -8,6 +8,7 @@ mod archive;
 mod blob;
 mod codec;
 mod format;
+pub mod instance;
 pub mod material;
 pub mod mesh;
 pub mod model;
@@ -22,6 +23,9 @@ use bytemuck::{Pod, Zeroable};
 pub use archive::{Archive, StoredRange};
 pub use format::{Blob, Chunk, Entry, FORMAT_VERSION, Header, StrRef};
 pub use writer::{ArchiveWriter, BlobIn, Target};
+
+/// Root of this crate's Slang modules (`orr_pack.*`), for shader include paths.
+pub const SHADER_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders");
 
 /// Stable asset identity: the first 16 bytes of blake3 of the logical name.
 #[repr(transparent)]
@@ -93,6 +97,20 @@ impl Aabb {
     }
 }
 
+/// An affine transform as three rows `[R | t]`, 48 B.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
+pub struct Affine3 {
+    pub rows: [[f32; 4]; 3],
+}
+
+impl Affine3 {
+    pub fn transform_point(&self, p: [f32; 3]) -> [f32; 3] {
+        self.rows
+            .map(|r| r[0] * p[0] + r[1] * p[1] + r[2] * p[2] + r[3])
+    }
+}
+
 /// A bounding sphere.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
@@ -132,6 +150,7 @@ const SCHEMAS: &[(Class, u16)] = &[
     (Class::Material, material::SCHEMA),
     (Class::Model, model::SCHEMA),
     (Class::Texture, texture::SCHEMA),
+    (Class::InstancePage, instance::SCHEMA),
 ];
 
 impl Class {
@@ -177,6 +196,12 @@ impl Class {
     /// The schema this crate reads and writes for the class, if it defines the class's format.
     pub fn schema(self) -> Option<u16> {
         SCHEMAS.iter().find(|(c, _)| *c == self).map(|(_, s)| *s)
+    }
+}
+
+impl From<Class> for u16 {
+    fn from(c: Class) -> u16 {
+        c as u16
     }
 }
 

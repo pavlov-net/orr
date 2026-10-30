@@ -2,6 +2,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
+use orr_pack::instance::{InstancePageInfo, InstanceRecord};
 use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, Class, Codec, Entry};
 
@@ -93,8 +94,12 @@ fn inspect(args: &[String]) -> Result<bool> {
             stored,
             a.name(e)
         )?;
-        if e.class == Class::Texture as u16 && (name.is_some() || class.is_some()) {
-            texture_line(&a, e, &mut out)?;
+        if name.is_some() || class.is_some() {
+            if e.class == Class::Texture as u16 {
+                texture_line(&a, e, &mut out)?;
+            } else if e.class == Class::InstancePage as u16 {
+                instance_line(&a, e, &mut out)?;
+            }
         }
         if name.is_some() {
             for (i, b) in blobs.iter().enumerate() {
@@ -137,6 +142,28 @@ fn texture_line(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
         h.mip_count,
         h.tail_first_mip,
         info.lights.len()
+    )?;
+    Ok(())
+}
+
+/// Cell, records, prototypes, partitions and the scale range of an instance page.
+fn instance_line(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
+    let b = &a.blobs(e)[0];
+    let mut head = vec![0; b.raw_len as usize];
+    a.read(b, &mut head)?;
+    let info = InstancePageInfo::parse(&head)?;
+    let h = info.header;
+    writeln!(
+        out,
+        "    cell {:?}, {} records, {} prototypes, {} partitions, step {:?} m, scale {:.3}..{:.3}, user stride {}",
+        h.cell,
+        a.blobs(e)[1].raw_len as usize / size_of::<InstanceRecord>(),
+        info.prototypes.len(),
+        info.partitions.len(),
+        h.extent.map(|x| x / 65535.0),
+        h.log2_scale_min.exp2(),
+        h.log2_scale_max.exp2(),
+        h.user_stride
     )?;
     Ok(())
 }
