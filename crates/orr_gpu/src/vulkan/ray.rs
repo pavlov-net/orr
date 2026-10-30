@@ -3,11 +3,10 @@
 
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use ash::vk;
-use ash::vk::TaggedStructure as _;
 
+use super::cache::{KeyHasher, PipelineKind};
 use super::device::{Device, Shared};
 use super::garbage::{Item, RawBuffer};
 use super::heap::SlotAllocator;
@@ -106,33 +105,41 @@ impl Device {
                     .into(),
             });
         };
-        let start = Instant::now();
         let parts = StageParts::new(shared, s, Stage::RayGen, name)?;
-        let mut chain = parts.chain();
-        let stages = [chain.info(vk::ShaderStageFlags::RAYGEN_KHR)];
+        let mut key = KeyHasher::new(PipelineKind::RayDispatch);
+        parts.hash(vk::ShaderStageFlags::RAYGEN_KHR, &mut key);
         let groups = [vk::RayTracingShaderGroupCreateInfoKHR::default()
             .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
             .general_shader(0)
             .closest_hit_shader(vk::SHADER_UNUSED_KHR)
             .any_hit_shader(vk::SHADER_UNUSED_KHR)
             .intersection_shader(vk::SHADER_UNUSED_KHR)];
-        let mut flags =
-            vk::PipelineCreateFlags2CreateInfo::default().flags(shared.pipeline_flags());
-        let info = vk::RayTracingPipelineCreateInfoKHR::default()
-            .stages(&stages)
-            .groups(&groups)
-            .max_pipeline_ray_recursion_depth(0)
-            .push(&mut flags);
-        // SAFETY: valid create info; the SPIR-V was validated by the shader build.
-        let raw = unsafe {
-            rt.create_ray_tracing_pipelines(
-                vk::DeferredOperationKHR::null(),
-                vk::PipelineCache::null(),
-                &[info],
-                None,
-            )
-        }
-        .map_err(|(_, e)| Error::vk("vkCreateRayTracingPipelinesKHR")(e))?[0];
+        let raw = shared.create_pipeline(
+            PipelineKind::RayDispatch,
+            key.finish_key(),
+            name,
+            "vkCreateRayTracingPipelinesKHR",
+            |chain| {
+                let mut stage = parts.chain();
+                let stages = [stage.info(vk::ShaderStageFlags::RAYGEN_KHR)];
+                let mut info = vk::RayTracingPipelineCreateInfoKHR::default()
+                    .stages(&stages)
+                    .groups(&groups)
+                    .max_pipeline_ray_recursion_depth(0);
+                info.p_next = chain.head();
+                // SAFETY: valid create info; the SPIR-V was validated by the shader build.
+                unsafe {
+                    rt.create_ray_tracing_pipelines(
+                        vk::DeferredOperationKHR::null(),
+                        chain.cache,
+                        &[info],
+                        None,
+                    )
+                }
+                .map(|p| p[0])
+                .map_err(|(_, e)| e)
+            },
+        )?;
         let destroy = |e: Error| {
             // SAFETY: the pipeline was never used.
             unsafe { shared.device.destroy_pipeline(raw, None) };
@@ -158,7 +165,6 @@ impl Device {
                 handle.len(),
             );
         }
-        shared.created(raw, name, start);
         Ok(RayDispatchPipeline {
             raw,
             raygen: vk::StridedDeviceAddressRegionKHR {

@@ -5,7 +5,7 @@ use std::ffi::CString;
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 
-use super::mesh::{MeshPipeline, Rendering, attachment_view};
+use super::mesh::{MeshPipeline, Rendering};
 use super::pipeline::ComputePipeline;
 use super::queue::{ListResources, MAX_PASSES, Queue};
 use super::ray::RayDispatchPipeline;
@@ -242,7 +242,7 @@ impl<'q> CommandList<'q> {
                     ),
                 };
                 vk::RenderingAttachmentInfo::default()
-                    .image_view(attachment_view(a.texture, TextureUsage::COLOR))
+                    .image_view(a.texture.attachment(TextureUsage::COLOR))
                     .image_layout(vk::ImageLayout::GENERAL)
                     .load_op(load)
                     .store_op(store_op(a.store))
@@ -256,7 +256,7 @@ impl<'q> CommandList<'q> {
                 DepthLoad::Clear(v) => (vk::AttachmentLoadOp::CLEAR, v),
             };
             vk::RenderingAttachmentInfo::default()
-                .image_view(attachment_view(a.texture, TextureUsage::DEPTH))
+                .image_view(a.texture.attachment(TextureUsage::DEPTH))
                 .image_layout(vk::ImageLayout::GENERAL)
                 .load_op(load)
                 .store_op(store_op(a.store))

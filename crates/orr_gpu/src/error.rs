@@ -34,6 +34,12 @@ pub enum Error {
     /// The heap has no free slot.
     #[error("{0} heap is full")]
     HeapFull(&'static str),
+    /// A file could not be read or written.
+    #[error("{}: {source}", path.display())]
+    Io {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
 }
 
 /// A Vulkan result code.

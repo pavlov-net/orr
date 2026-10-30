@@ -2,6 +2,7 @@
 //! re-exported at the crate root.
 
 mod accel;
+mod cache;
 mod command;
 mod debug;
 mod device;
@@ -9,18 +10,22 @@ mod features;
 mod garbage;
 mod heap;
 mod memory;
+mod mesh;
 mod pipeline;
 mod queue;
 mod ray;
+mod spirv;
 mod texture;
 
 pub use accel::{
     ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance, ClassicKind,
     InstanceFlags, RtasFlags, RtasSizes,
 };
-pub use command::{CommandList, DispatchArgs};
+pub use cache::{PipelineCacheKind, PipelineCacheReport};
+pub use command::{CommandList, DispatchArgs, MeshArgs};
 pub use device::{Device, DeviceDesc};
 pub use memory::{Allocation, HeapReport, MemoryKind, MemoryReport, MemoryUsage};
+pub use mesh::{ColorAttachment, DepthAttachment, MeshPipeline, MeshPipelineDesc, Rendering};
 pub use pipeline::{ComputePipeline, ShaderStage};
 pub use queue::{PassResult, PipelineStats, Queue, QueueKind, QueueRequest};
 pub use ray::RayDispatchPipeline;
