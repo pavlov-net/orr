@@ -1,6 +1,6 @@
 [package]
 name = "shader_abi"
-description = "Kernels over orr's Slang ABI and trace libraries, built with the MSL check."
+description = "Kernels over orr's Slang ABI and trace libraries, built with the MSL check and run on the GPU."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,11 @@ publish = false
 
 [dependencies]
 orr_shaders.workspace = true
+
+[dev-dependencies]
+gpu_suite = { path = "../gpu_suite" }
+log.workspace = true
+orr_gpu.workspace = true
 
 [build-dependencies]
 orr_shaders = { workspace = true, features = ["build"] }

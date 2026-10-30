@@ -1,5 +1,5 @@
 // Task, mesh and pixel entries drawing triangles into two render targets: coverage, and a
-// flat value per triangle read through `SV_PrimitiveID`.
+// flat value per triangle read through `SV_PrimitiveID`, which the mesh entry writes.
 #include "orr/root.h"
 
 struct Root
@@ -31,10 +31,20 @@ struct Vertex
     float4 position : SV_Position;
 }
 
+struct Primitive
+{
+    uint index : SV_PrimitiveID;
+}
+
 [shader("mesh")]
 [numthreads(32, 1, 1)]
 [outputtopology("triangle")]
-void mesh_main(uint tid: SV_GroupThreadID, in payload Payload p, out indices uint3 triangles[32], out vertices Vertex vertices[96])
+void mesh_main(
+    uint tid: SV_GroupThreadID,
+    in payload Payload p,
+    out indices uint3 triangles[32],
+    out vertices Vertex vertices[96],
+    out primitives Primitive primitives[32])
 {
     uint count = min(p.triangle_count, 32);
     SetMeshOutputCounts(count * 3, count);
@@ -47,6 +57,9 @@ void mesh_main(uint tid: SV_GroupThreadID, in payload Payload p, out indices uin
             vertices[tid * 3 + i] = v;
         }
         triangles[tid] = uint3(0, 1, 2) + tid * 3;
+        Primitive prim;
+        prim.index = tid;
+        primitives[tid] = prim;
     }
 }
 
