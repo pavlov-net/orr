@@ -68,11 +68,36 @@ public struct GroupGpu
     public float log2_scale_max;
 }
 
+// A mesh made resident from a mounted pack. Page and node page addresses are 0 until
+// their data is resident.
+public struct MeshGpu
+{
+    public uint8_t* info;        // blob 0: MeshHeader and its tables (orr_pack.mesh)
+    public uint64_t* pages;      // resident page per MeshHeader page
+    public uint64_t* node_pages; // node page per MeshHeader node page
+    public uint page_count;
+    public uint node_page_count;
+    public uint cluster_count;
+    public uint _pad;
+}
+
+// A model made resident from a mounted pack: its mesh and the material of each section.
+public struct ModelGpu
+{
+    public uint mesh;            // in SceneRoot.meshes
+    public uint section_count;
+    public uint* materials;      // MaterialId per mesh section
+    public float3 bounds_min;
+    public float3 bounds_max;
+}
+
 public struct SceneRoot
 {
     public InstanceGpu* instances;
     public SlotStateGpu* slot_state;
     public GroupGpu* groups;
+    public ModelGpu* models;         // global, by ModelId
+    public MeshGpu* meshes;          // global
     public MaterialGpu* materials;   // global
     public uint* material_sets;      // MaterialId per model section per set
     public LightGpu* lights;

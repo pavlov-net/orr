@@ -59,7 +59,7 @@ fn instance_and_material_tables_read_back_as_written() {
     let mut mats = f.materials();
     let materials: Vec<(MaterialId, MaterialGpu)> = (0..3)
         .map(|i| {
-            let mut m: MaterialGpu = orr_shaders::bytemuck::Zeroable::zeroed();
+            let mut m: MaterialGpu = bytemuck::Zeroable::zeroed();
             m.base_color = [i as f32, 0.5, 0.25];
             m.specular_ior = 1.5;
             m.surface = i;
@@ -196,24 +196,16 @@ fn instance_and_material_tables_read_back_as_written() {
             }
         };
         assert_eq!(
-            orr_shaders::bytemuck::bytes_of(inst),
-            orr_shaders::bytemuck::bytes_of(&expected),
+            bytemuck::bytes_of(inst),
+            bytemuck::bytes_of(&expected),
             "slot {slot}: {inst:?}"
         );
     }
     let state = read_buffer(root.slot_state, 1000);
-    assert!(
-        state
-            .iter()
-            .all(|s| orr_shaders::bytemuck::bytes_of(s) == [0; 8])
-    );
+    assert!(state.iter().all(|s| bytemuck::bytes_of(s) == [0; 8]));
     let table = read_buffer(root.materials, 3);
     for ((id, m), got) in materials.iter().zip(&table) {
-        assert_eq!(
-            orr_shaders::bytemuck::bytes_of(m),
-            orr_shaders::bytemuck::bytes_of(got),
-            "{id:?}"
-        );
+        assert_eq!(bytemuck::bytes_of(m), bytemuck::bytes_of(got), "{id:?}");
     }
     assert_clean();
 }

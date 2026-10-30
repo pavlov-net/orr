@@ -34,12 +34,19 @@ pub fn emissive_spans(
     first: u32,
     clusters: impl IntoIterator<Item = Cluster>,
 ) -> Vec<EmissiveSpan> {
+    indexed_spans((first..).zip(clusters))
+}
+
+/// The EMISSIVE spans of `clusters`, given with their mesh cluster indices in increasing
+/// order.
+pub(crate) fn indexed_spans(
+    clusters: impl IntoIterator<Item = (u32, Cluster)>,
+) -> Vec<EmissiveSpan> {
     let mut spans: Vec<EmissiveSpan> = Vec::new();
-    for (i, c) in clusters.into_iter().enumerate() {
+    for (index, c) in clusters {
         if c.flags & Cluster::EMISSIVE == 0 {
             continue;
         }
-        let index = first + i as u32;
         match spans.last_mut() {
             Some(s) if s.section == c.section && s.first_cluster + s.cluster_count == index => {
                 s.cluster_count += 1;

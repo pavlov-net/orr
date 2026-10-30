@@ -85,6 +85,13 @@ impl Archive {
         Self::with_file(File::open(path)?, path, index)
     }
 
+    /// A file archive from a handle the caller opened with read and delete sharing, and the
+    /// bytes of its index range: the archive stays the file that handle names even after
+    /// another file is renamed over `path`.
+    pub fn from_index_file(file: File, path: &Path, index: Box<[u8]>) -> Result<Archive> {
+        Self::with_file(file, path, index)
+    }
+
     /// An archive held entirely in memory; reads never do IO.
     pub fn from_memory(bytes: Arc<[u8]>) -> Result<Archive> {
         let header = read_header(&bytes)?;
