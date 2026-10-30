@@ -9,11 +9,13 @@ use openpbr_ref::report::{Counts, Results, evaluate};
 
 fn main() {
     let mut args: Vec<_> = std::env::args_os().skip(1).collect();
-    let gpu = args
-        .iter()
-        .position(|a| a == "--gpu")
-        .map(|i| args.remove(i));
-    let results = if gpu.is_some() { on_gpu() } else { on_cpu() };
+    let gpu = args.iter().position(|a| a == "--gpu");
+    let results = if let Some(i) = gpu {
+        args.remove(i);
+        on_gpu()
+    } else {
+        on_cpu()
+    };
     let markdown = results.markdown();
     match args.first() {
         Some(path) => std::fs::write(path, markdown)
