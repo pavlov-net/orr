@@ -6,7 +6,8 @@ use std::sync::OnceLock;
 use glam::DVec3;
 use orr::abi::{GpuPtr, SamplerIndex};
 use orr::orr_gpu::{
-    ComputePipeline, Hazards, MemoryKind, QueueKind, ShaderStage, SpecData, Stages,
+    ComputePipeline, Format, Hazards, MemoryKind, QueueKind, ShaderStage, SpecData, Stages,
+    Texture, TextureDesc, TextureIndex, TextureMemory, TextureRegion, TextureUsage, ViewDesc,
 };
 use orr::{
     DirectionalLight, FrameDesc, FrameTime, Light, LightId, Renderer, RendererDesc, SceneDesc,
@@ -271,4 +272,38 @@ pub fn sky_radiance(rig: &Rig, eye: DVec3, dirs: &[DVec3]) -> Vec<[f64; 3]> {
         .collect();
     assert!(out.iter().flatten().all(|c| c.is_finite()), "{out:?}");
     out
+}
+
+/// A sampled texture and its heap slot.
+pub struct TestTexture {
+    pub index: TextureIndex,
+    _texture: Texture,
+}
+
+/// A 4 x 4 RGBA32F texture holding `texel` everywhere.
+pub fn uniform_texture(texel: [f32; 4], name: &str) -> TestTexture {
+    let d = device();
+    let desc = TextureDesc::d2(Format::Rgba32Float, 4, 4, TextureUsage::SAMPLED);
+    let texture = d
+        .create_texture(&desc, TextureMemory::Dedicated, name)
+        .unwrap();
+    let mut staging = d
+        .gpu_malloc::<[f32; 4]>(MemoryKind::Upload, 16, name)
+        .unwrap();
+    staging.as_mut_slice().unwrap().fill(texel);
+    let render = d.queue(QueueKind::Render).unwrap();
+    let mut list = render.command_list().unwrap();
+    list.discard(&texture);
+    list.copy_to_texture(
+        &texture,
+        &TextureRegion::whole_mip(&desc, 0),
+        staging.gpu.cast(),
+    );
+    list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
+    wait(render.submit(vec![list], &[]).unwrap());
+    let slot = d.alloc_image_slot().unwrap();
+    TestTexture {
+        index: d.write_sampled(slot, &texture, &ViewDesc::default()),
+        _texture: texture,
+    }
 }

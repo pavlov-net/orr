@@ -1182,6 +1182,7 @@ dependencies = [
  "bindgen",
  "half",
  "log",
+ "orr_gpu",
  "thiserror 2.0.21",
  "uuid",
 ]
@@ -1264,6 +1265,7 @@ dependencies = [
  "orr_pack",
  "orr_shaders",
  "thiserror 2.0.21",
+ "windows",
 ]
 
 [[package]]
@@ -1705,13 +1707,17 @@ checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 name = "scene_suite"
 version = "0.0.1"
 dependencies = [
+ "bytemuck",
  "glam",
  "gpu_suite",
  "log",
  "orr",
+ "orr_cook",
  "orr_gpu",
+ "orr_pack",
  "orr_scene",
  "orr_shaders",
+ "png 0.18.1",
 ]
 
 [[package]]
