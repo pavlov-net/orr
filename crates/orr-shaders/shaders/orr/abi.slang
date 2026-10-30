@@ -4,8 +4,8 @@
 // Mesh-shader kernels: task (`amplification`), mesh and pixel entries live in one file and
 // pass a groupshared payload to `DispatchMesh`. Mesh outputs are written as whole structs,
 // never field by field. Pixel entries read per-primitive data through `SV_PrimitiveID`
-// lookups or flat per-vertex attributes, not per-primitive inputs. Workgroup sizes are
-// literals.
+// lookups (the mesh entry writes it as a per-primitive output) or flat per-vertex
+// attributes, not per-primitive inputs. Workgroup sizes are literals.
 module abi;
 
 import orr.debug;

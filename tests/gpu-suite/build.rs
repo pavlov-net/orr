@@ -1,4 +1,5 @@
-//! Builds the suite's kernels, and the entry-parity kernels with precise floating point.
+//! Builds the suite's kernels, and the entry-parity kernels with precise floating point. The
+//! kernels are Vulkan-only, so the MSL check stays off whatever `ORR_METAL_CHECK` says.
 
 use std::env;
 use std::path::PathBuf;
@@ -24,7 +25,11 @@ fn main() {
     let gpu = env::var("DEP_ORR_GPU_SHADER_DIRS").expect("orr-gpu shader roots");
     let built = Build::new()
         .and_then(|b| {
-            let mut b = b.kernels(dir.join("src")).roots(&gpu).debug_info(true);
+            let mut b = b
+                .kernels(dir.join("src"))
+                .roots(&gpu)
+                .debug_info(true)
+                .metal_check(false);
             for t in RTAS_RECORDS {
                 b = b.extern_type(t, &format!("::orr_gpu::rtas::{t}"));
             }
@@ -35,6 +40,7 @@ fn main() {
             Build::new()?
                 .kernels(dir.join("parity"))
                 .fp_precise(true)
+                .metal_check(false)
                 .out_dir(out.join("parity"))
                 .compile()
         });

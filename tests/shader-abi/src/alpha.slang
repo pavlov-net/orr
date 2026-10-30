@@ -1,17 +1,17 @@
-// Orthographic rays over the unit square towards +z with an alpha test on non-opaque
-// triangles; writes the hit's instance index plus one, or zero on a miss.
+// Orthographic rays over the unit square towards +z with the cluster probe's alpha test on
+// non-opaque triangles. Per ray: hit, instance index, primitive and cluster id.
 #include "orr/root.h"
 import orr.abi;
 import orr.trace;
 
 struct Root
 {
-    uint* out;
+    uint4* out;
     Tlas scene;
     uint width;
     uint height;
-    uint pad0;
-    uint pad1;
+    uint flags;
+    uint pad;
 }
 ORR_ROOT(Root);
 
@@ -19,7 +19,7 @@ struct AlphaTest : IAnyHit
 {
     bool accept(Candidate c)
     {
-        return ((c.instance_index ^ c.primitive_index) & 1) == 0 || c.barycentrics.x < 0.5;
+        return (uint(c.cluster_id) + c.primitive_index) % 3 != 0;
     }
 }
 
@@ -35,6 +35,6 @@ void main(uint3 id: SV_DispatchThreadID)
     ray.TMin = 0.0;
     ray.TMax = 4.0;
     AlphaTest alpha;
-    Hit h = trace_closest(root.scene, ray, 0xff, RAY_FLAG_NONE, alpha);
-    root.out[id.y * root.width + id.x] = h.hit ? h.instance_index + 1 : 0;
+    Hit h = trace_closest(root.scene, ray, 0xff, root.flags, alpha);
+    root.out[id.y * root.width + id.x] = h.hit ? uint4(1, h.instance_index, h.primitive_index, uint(h.cluster_id)) : uint4(0);
 }

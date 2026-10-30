@@ -41,11 +41,13 @@ jobs:
         run: |
           cargo test -p orr-shaders --features build,openpbr
           cargo test -p shader-corpus
-          cargo test -p shader-abi
+          cargo test -p shader-abi --lib
+          cargo build -p shader-abi --all-targets
           cargo test -p shader-link --test link
           cargo build -p shader-link --all-targets
           cargo test -p shader-maths
           cargo test -p openpbr-ref
           cargo build -p openpbr-ref --features gpu --all-targets
           cargo test -p lighting-maths
+          cargo build -p lighting-maths --features gpu --all-targets
           cargo test -p output-maths

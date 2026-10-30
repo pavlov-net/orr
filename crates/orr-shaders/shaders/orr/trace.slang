@@ -47,7 +47,7 @@ public struct Candidate
     public float3 object_direction;
 }
 
-// The committed hit of a trace.
+// The committed hit of a trace. On a miss the index fields are zero and `cluster_id` is -1.
 public struct Hit
 {
     public bool hit;
@@ -337,10 +337,10 @@ Hit committed(inout RayQuery<RAY_FLAG_NONE> q)
     h.hit = status != COMMITTED_NOTHING;
     h.triangle = status == COMMITTED_TRIANGLE_HIT;
     h.t = q.CommittedRayT();
-    h.instance_index = q.CommittedInstanceIndex();
-    h.custom_index = q.CommittedInstanceID();
-    h.geometry_index = q.CommittedGeometryIndex();
-    h.primitive_index = q.CommittedPrimitiveIndex();
+    h.instance_index = h.hit ? q.CommittedInstanceIndex() : 0;
+    h.custom_index = h.hit ? q.CommittedInstanceID() : 0;
+    h.geometry_index = h.hit ? q.CommittedGeometryIndex() : 0;
+    h.primitive_index = h.hit ? q.CommittedPrimitiveIndex() : 0;
     h.barycentrics = h.triangle ? q.CommittedTriangleBarycentrics() : float2(0);
     h.front_face = h.triangle && q.CommittedTriangleFrontFace();
     __target_switch
