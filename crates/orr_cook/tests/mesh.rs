@@ -15,6 +15,7 @@ fn dir(name: &str) -> PathBuf {
     d
 }
 
+#[derive(Default)]
 struct Prim {
     pos: Vec<[f32; 3]>,
     nrm: Vec<[f32; 3]>,
@@ -27,13 +28,7 @@ struct Prim {
 fn torus(scale: f32) -> Prim {
     let (nu, nv) = (96, 48);
     let (big, small) = (scale, 0.35 * scale);
-    let mut p = Prim {
-        pos: vec![],
-        nrm: vec![],
-        tan: vec![],
-        uv: vec![],
-        idx: vec![],
-    };
+    let mut p = Prim::default();
     for j in 0..=nv {
         for i in 0..=nu {
             let (u, v) = (i as f32 / nu as f32, j as f32 / nv as f32);
@@ -63,13 +58,7 @@ fn torus(scale: f32) -> Prim {
 /// A wavy grid of quads above the torus.
 fn sheet(scale: f32) -> Prim {
     let n = 40;
-    let mut p = Prim {
-        pos: vec![],
-        nrm: vec![],
-        tan: vec![],
-        uv: vec![],
-        idx: vec![],
-    };
+    let mut p = Prim::default();
     for j in 0..=n {
         for i in 0..=n {
             let (u, v) = (i as f32 / n as f32, j as f32 / n as f32);
@@ -208,7 +197,7 @@ fn key(section: u8, p: [[f32; 3]; 3]) -> (TriKey, usize) {
 }
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    Vec3::from(a).dot(Vec3::from(b))
 }
 
 /// Cooks the fixture at a scale and checks the grid, clusters, attributes and materials
