@@ -68,6 +68,7 @@ pub(crate) struct Optional {
     pub executable_info: bool,
     pub host_image_copy: bool,
     pub conservative_raster: bool,
+    pub occupancy_priority: bool,
     pub ray_tracing_validation: bool,
     /// `VK_NV_device_diagnostic_checkpoints`.
     pub checkpoints: bool,
@@ -120,6 +121,7 @@ pub(crate) struct Features {
     pub float8: vk::PhysicalDeviceShaderFloat8FeaturesEXT<'static>,
     pub decompression: vk::PhysicalDeviceMemoryDecompressionFeaturesEXT<'static>,
     pub frame_boundary: vk::PhysicalDeviceFrameBoundaryFeaturesEXT<'static>,
+    pub occupancy: vk::PhysicalDeviceComputeOccupancyPriorityFeaturesNV<'static>,
     pub executable: vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR<'static>,
     pub rt_validation: vk::PhysicalDeviceRayTracingValidationFeaturesNV<'static>,
     pub swapchain_maintenance: vk::PhysicalDeviceSwapchainMaintenance1FeaturesKHR<'static>,
@@ -189,6 +191,9 @@ impl Features {
         }
         if opt.frame_boundary {
             chain.push(ptr(&mut self.frame_boundary));
+        }
+        if opt.occupancy_priority {
+            chain.push(ptr(&mut self.occupancy));
         }
         if opt.executable_info {
             chain.push(ptr(&mut self.executable));
@@ -307,6 +312,7 @@ pub(crate) fn select(
         executable_info: present(ash::khr::pipeline_executable_properties::NAME),
         host_image_copy: false,
         conservative_raster: present(ash::ext::conservative_rasterization::NAME),
+        occupancy_priority: present(ash::nv::compute_occupancy_priority::NAME),
         // Aftermath hides the extension.
         ray_tracing_validation: cfg!(debug_assertions)
             && !aftermath
@@ -431,6 +437,7 @@ pub(crate) fn select(
     opt.shader_float8 &= q.float8.shader_float8 != 0;
     opt.memory_decompression &= q.decompression.memory_decompression != 0;
     opt.frame_boundary &= q.frame_boundary.frame_boundary != 0;
+    opt.occupancy_priority &= q.occupancy.compute_occupancy_priority != 0;
     opt.executable_info &= q.executable.pipeline_executable_info != 0;
     opt.host_image_copy = q.v14.host_image_copy != 0;
     opt.ray_tracing_validation &= q.rt_validation.ray_tracing_validation != 0;
@@ -511,6 +518,7 @@ pub(crate) fn select(
     e.float8.shader_float8 = 1;
     e.decompression.memory_decompression = 1;
     e.frame_boundary.frame_boundary = 1;
+    e.occupancy.compute_occupancy_priority = 1;
     e.executable.pipeline_executable_info = 1;
     e.rt_validation.ray_tracing_validation = 1;
     e.swapchain_maintenance.swapchain_maintenance1 = 1;
@@ -583,6 +591,10 @@ pub(crate) fn select(
         &[ash::khr::calibrated_timestamps::NAME],
     );
     add(opt.frame_boundary, &[ash::ext::frame_boundary::NAME]);
+    add(
+        opt.occupancy_priority,
+        &[ash::nv::compute_occupancy_priority::NAME],
+    );
     add(
         opt.conservative_raster,
         &[ash::ext::conservative_rasterization::NAME],

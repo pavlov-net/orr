@@ -44,20 +44,21 @@ pub use rtas::{
 };
 pub use sync::{Hazards, Stages, TimelinePoint};
 pub use texture::{
-    AddressMode, CompareOp, Filter, SamplerDesc, TextureDesc, TextureKind, TextureRegion,
-    TextureUsage, ViewDesc, ViewKind,
+    AddressMode, CompareOp, Filter, SamplerDesc, SparseLayout, TextureDesc, TextureKind,
+    TextureRegion, TextureUsage, ViewDesc, ViewKind,
 };
 
 #[cfg(not(target_vendor = "apple"))]
 pub use vulkan::{
     Allocation, Checkpoint, ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance,
-    ClassicKind, ColorAttachment, CommandList, ComputePipeline, DepthAttachment, Device,
-    DeviceDesc, DeviceFault, Diagnostics, DiagnosticsReport, DispatchArgs, FaultAccess,
+    ClassicKind, ColorAttachment, CommandList, ComputePipeline, DecompressRegion, DepthAttachment,
+    Device, DeviceDesc, DeviceFault, Diagnostics, DiagnosticsReport, DispatchArgs, FaultAccess,
     FaultAddress, HeapReport, InstanceFlags, LowLatency, MemoryKind, MemoryReport, MemoryUsage,
     MeshArgs, MeshPipeline, MeshPipelineDesc, Micromap, MicromapDesc, MicromapTriangle,
     MicromapUsage, OmmFormat, PageBind, PassResult, PipelineCacheKind, PipelineCacheReport,
     PipelineStats, Queue, QueueKind, QueueProgress, QueueRequest, RayDispatchPipeline, Rendering,
-    ShaderStage, SparseAllocation, Swapchain, SwapchainFrame, Texture, TextureMemory,
+    ShaderStage, SparseAllocation, SparseBinds, Swapchain, SwapchainFrame, Texture, TextureMemory,
+    TileBind,
 };
 
 #[cfg(not(target_vendor = "apple"))]

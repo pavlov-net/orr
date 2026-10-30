@@ -19,6 +19,8 @@ bitflags::bitflags! {
         /// Host reads and writes of mapped memory.
         const HOST = 1 << 9;
         const ALL = 1 << 10;
+        /// Memory decompression; ignored without `Caps::memory_decompression`.
+        const DECOMPRESS = 1 << 11;
     }
 }
 

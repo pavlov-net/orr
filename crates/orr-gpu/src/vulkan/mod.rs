@@ -27,7 +27,7 @@ pub use accel::{
     InstanceFlags, Micromap, MicromapDesc, MicromapTriangle, MicromapUsage, OmmFormat,
 };
 pub use cache::{PipelineCacheKind, PipelineCacheReport};
-pub use command::{CommandList, DispatchArgs, MeshArgs};
+pub use command::{CommandList, DecompressRegion, DispatchArgs, MeshArgs};
 pub use device::{Device, DeviceDesc};
 pub use diagnostics::{
     Checkpoint, DeviceFault, Diagnostics, DiagnosticsReport, FaultAccess, FaultAddress,
@@ -38,6 +38,6 @@ pub use mesh::{ColorAttachment, DepthAttachment, MeshPipeline, MeshPipelineDesc,
 pub use pipeline::{ComputePipeline, ShaderStage};
 pub use queue::{PassResult, PipelineStats, Queue, QueueKind, QueueRequest};
 pub use ray::RayDispatchPipeline;
-pub use sparse::{PageBind, SparseAllocation};
+pub use sparse::{PageBind, SparseAllocation, SparseBinds, TileBind};
 pub use swapchain::{LowLatency, Swapchain, SwapchainFrame};
 pub use texture::{Texture, TextureMemory};

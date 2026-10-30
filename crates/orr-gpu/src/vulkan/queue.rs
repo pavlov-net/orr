@@ -482,6 +482,8 @@ impl Queue {
     pub(crate) fn bind_sparse(
         &self,
         buffers: &[vk::SparseBufferMemoryBindInfo<'_>],
+        opaque: &[vk::SparseImageOpaqueMemoryBindInfo<'_>],
+        images: &[vk::SparseImageMemoryBindInfo<'_>],
     ) -> Result<TimelinePoint, Error> {
         assert!(
             self.sparse,
@@ -500,6 +502,8 @@ impl Queue {
         let info = vk::BindSparseInfo::default()
             .wait_semaphores(&semaphores)
             .buffer_binds(buffers)
+            .image_opaque_binds(opaque)
+            .image_binds(images)
             .signal_semaphores(&semaphores)
             .push(&mut values);
         // SAFETY: the lock serialises access to the queue; the binds name live buffers and

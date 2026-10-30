@@ -23,6 +23,10 @@ bitflags::bitflags! {
         const COLOR = 1 << 2;
         /// Depth target of a mesh pipeline, like `COLOR`.
         const DEPTH = 1 << 3;
+        /// Written and read by the host ([`crate::Device::host_copy_to_texture`]) with no
+        /// command list. Needs `Caps::host_image_copy`; the texture takes Upload memory and
+        /// cannot be sparse.
+        const HOST_COPY = 1 << 4;
     }
 }
 
@@ -107,6 +111,67 @@ impl TextureRegion {
     /// Bytes of tightly packed data for the region in `format`.
     pub fn bytes(&self, format: Format) -> u64 {
         format.region_bytes(self.extent) * u64::from(self.layers)
+    }
+}
+
+/// How a sparse texture's memory is bound: tiles above the mip tail, then the tail.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct SparseLayout {
+    /// Texels per tile per axis.
+    pub tile_extent: [u32; 3],
+    /// Bytes per tile, which is also the alignment of bound memory offsets.
+    pub tile_bytes: u64,
+    /// The first mip of the mip tail; the texture's mip count when it has no tail.
+    pub tail_first_mip: u32,
+    /// Bytes one mip tail binds, a whole number of tiles; 0 without a tail.
+    pub tail_bytes: u64,
+    /// One tail covers every layer; otherwise each layer binds its own.
+    pub single_tail: bool,
+}
+
+impl SparseLayout {
+    /// Tiles per axis of `mip` of a texture described by `desc`.
+    pub fn tiles(&self, desc: &TextureDesc, mip: u32) -> [u32; 2] {
+        let size = |e: u32, t: u32| (e >> mip).max(1).div_ceil(t);
+        [
+            size(desc.extent[0], self.tile_extent[0]),
+            size(desc.extent[1], self.tile_extent[1]),
+        ]
+    }
+
+    /// Mip tails a texture described by `desc` binds: 0 without a tail, 1 with
+    /// `single_tail`, otherwise one per layer.
+    pub fn tails(&self, desc: &TextureDesc) -> u32 {
+        match (self.tail_bytes, self.single_tail) {
+            (0, _) => 0,
+            (_, true) => 1,
+            (_, false) => desc.layers,
+        }
+    }
+
+    /// The texels tile `tile` of `mip` covers, clipped to the mip, in every layer from
+    /// `layer`.
+    pub fn tile_region(
+        &self,
+        desc: &TextureDesc,
+        mip: u32,
+        layer: u32,
+        tile: [u32; 2],
+    ) -> TextureRegion {
+        let size = |e: u32| (e >> mip).max(1);
+        let x = tile[0] * self.tile_extent[0];
+        let y = tile[1] * self.tile_extent[1];
+        TextureRegion {
+            mip,
+            base_layer: layer,
+            layers: 1,
+            offset: [x, y, 0],
+            extent: [
+                self.tile_extent[0].min(size(desc.extent[0]) - x),
+                self.tile_extent[1].min(size(desc.extent[1]) - y),
+                1,
+            ],
+        }
     }
 }
 

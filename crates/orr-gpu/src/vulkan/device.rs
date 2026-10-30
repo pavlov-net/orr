@@ -47,6 +47,9 @@ pub struct DeviceDesc<'a> {
     /// Optional extensions to leave off even when the device offers them; their `Caps`
     /// stay false.
     pub skip_extensions: &'a [&'a CStr],
+    /// Reports `Caps::rebar` and `Caps::host_image_copy` false whatever the device offers,
+    /// so callers take the staging path, as on a device without resizable BAR.
+    pub force_staging: bool,
     /// Resource-heap slots for sampled and storage image views.
     pub image_heap_slots: u32,
     pub sampler_heap_slots: u32,
@@ -61,6 +64,7 @@ impl Default for DeviceDesc<'_> {
             diagnostics: Diagnostics::Off,
             pipeline_cache: None,
             skip_extensions: &[],
+            force_staging: false,
             image_heap_slots: 262_144,
             sampler_heap_slots: 1024,
         }
@@ -81,6 +85,10 @@ pub(crate) struct Shared {
     pub ptlas_fn: ash::nv::partitioned_acceleration_structure::Device,
     /// With `Caps::device_address_commands`.
     pub dac_fn: Option<ash::khr::device_address_commands::Device>,
+    /// With `Caps::memory_decompression`.
+    pub decompress_fn: Option<ash::ext::memory_decompression::Device>,
+    /// With `Caps::occupancy_priority`.
+    pub occupancy_fn: Option<ash::nv::compute_occupancy_priority::Device>,
     pub mesh_fn: ash::ext::mesh_shader::Device,
     pub rt_fn: Option<ash::khr::ray_tracing_pipeline::Device>,
     pub debug_fn: ash::ext::debug_utils::Device,
@@ -350,6 +358,7 @@ impl Device {
             vk::PhysicalDeviceClusterAccelerationStructurePropertiesNV::default();
         let mut ptlas_props =
             vk::PhysicalDevicePartitionedAccelerationStructurePropertiesNV::default();
+        let mut decompress_props = vk::PhysicalDeviceMemoryDecompressionPropertiesEXT::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default()
             .push(&mut heap_props)
             .push(&mut as_props)
@@ -358,6 +367,9 @@ impl Device {
             .push(&mut ptlas_props);
         if optional.ray_dispatch {
             props2 = props2.push(&mut rt_props).push(&mut reorder_props);
+        }
+        if optional.memory_decompression {
+            props2 = props2.push(&mut decompress_props);
         }
         // SAFETY: every struct in the chain belongs to an enabled extension or core 1.4.
         unsafe { instance.get_physical_device_properties2(physical, &mut props2) };
@@ -418,13 +430,14 @@ impl Device {
                 c_string(&driver.driver_info)
             ),
             driver_version: props.driver_version,
-            rebar,
+            rebar: rebar && !desc.force_staging,
             ray_dispatch: optional.ray_dispatch,
             reorder: optional.ray_dispatch
                 && reorder_props.ray_tracing_invocation_reorder_reordering_hint
                     == vk::RayTracingInvocationReorderModeEXT::REORDER,
-            host_image_copy: optional.host_image_copy,
+            host_image_copy: optional.host_image_copy && rebar && !desc.force_staging,
             memory_decompression: optional.memory_decompression,
+            occupancy_priority: optional.occupancy_priority,
             omm: optional.omm,
             device_address_commands: optional.device_address_commands,
             unified_image_layouts: optional.unified_image_layouts,
@@ -467,6 +480,13 @@ impl Device {
                 max_ray_dispatch_invocations: rt_props.max_ray_dispatch_invocation_count,
                 device_local_bytes: memory.heap_size(MemoryKind::DeviceLocal),
                 upload_bytes: memory.heap_size(MemoryKind::Upload),
+                max_decompress_regions: if optional.memory_decompression {
+                    decompress_props
+                        .max_decompression_indirect_count
+                        .min(u64::from(u32::MAX)) as u32
+                } else {
+                    0
+                },
             },
         };
 
@@ -526,6 +546,12 @@ impl Device {
             dac_fn: optional
                 .device_address_commands
                 .then(|| ash::khr::device_address_commands::Device::load(&instance, &device)),
+            decompress_fn: optional
+                .memory_decompression
+                .then(|| ash::ext::memory_decompression::Device::load(&instance, &device)),
+            occupancy_fn: optional
+                .occupancy_priority
+                .then(|| ash::nv::compute_occupancy_priority::Device::load(&instance, &device)),
             mesh_fn: ash::ext::mesh_shader::Device::load(&instance, &device),
             rt_fn: optional
                 .ray_dispatch
@@ -633,15 +659,16 @@ impl Device {
         let tlas = build_empty_tlas(&device)?;
         let _ = device.shared.empty_tlas.set(tlas);
         log::info!(
-            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, host image copy {}, decompression {}, validation layer {}, ray tracing validation {}, diagnostics {:?} (breadcrumbs {}, checkpoints {}, aftermath {}, device fault {})",
+            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, host image copy {}, decompression {}, occupancy priority {}, validation layer {}, ray tracing validation {}, diagnostics {:?} (breadcrumbs {}, checkpoints {}, aftermath {}, device fault {})",
             device.shared.caps.device_name,
             device.shared.caps.driver,
-            rebar,
+            device.shared.caps.rebar,
             device.shared.caps.ray_dispatch,
             device.shared.caps.reorder,
             optional.omm,
-            optional.host_image_copy,
+            device.shared.caps.host_image_copy,
             optional.memory_decompression,
+            optional.occupancy_priority,
             desc.validation,
             optional.ray_tracing_validation,
             desc.diagnostics,
@@ -852,7 +879,7 @@ fn select_memory(
         ),
         (Format::Bc7Unorm, TextureUsage::SAMPLED),
     ] {
-        let info = image_info(&TextureDesc::d2(format, 256, 256, usage), families);
+        let info = image_info(&TextureDesc::d2(format, 256, 256, usage), false, families);
         debug_assert_eq!(info.format, vk_format(format));
         let mut out = vk::MemoryRequirements2::default();
         // SAFETY: valid create info.

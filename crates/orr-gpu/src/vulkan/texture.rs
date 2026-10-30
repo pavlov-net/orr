@@ -1,4 +1,5 @@
-//! Textures: images that stay in `GENERAL`, with dedicated or placed memory.
+//! Textures: images that stay in `GENERAL`, with dedicated, placed or sparse memory, and host
+//! copies.
 
 use std::sync::Arc;
 
@@ -10,20 +11,31 @@ use super::device::{Device, Shared};
 use super::garbage::Item;
 use super::memory::{Allocation, MemoryKind, sharing};
 use crate::{
-    AddressMode, CompareOp, Error, Filter, Format, TextureDesc, TextureKind, TextureRegion,
-    TextureUsage, TimelinePoint, ViewDesc, ViewKind,
+    AddressMode, CompareOp, Error, Filter, Format, SparseLayout, TextureDesc, TextureKind,
+    TextureRegion, TextureUsage, TimelinePoint, ViewDesc, ViewKind,
 };
 
 /// Where a texture's memory comes from.
 pub enum TextureMemory<'a> {
     /// Its own allocation.
     Dedicated,
-    /// Inside a [`MemoryKind::DeviceLocal`] block, at an offset aligned as
-    /// [`Device::texture_requirements`] says. The block must outlive the texture.
+    /// Inside a block, at an offset aligned as [`Device::texture_requirements`] says: a
+    /// [`MemoryKind::DeviceLocal`] block, or an Upload block for
+    /// [`TextureUsage::HOST_COPY`]. The block must outlive the texture.
     Placed {
         block: &'a Allocation<u8>,
         offset: u64,
     },
+    /// No memory until [`Device::bind_sparse`] binds its tiles and mip tails
+    /// ([`Texture::sparse_layout`]) to DeviceLocal blocks. 2D and cube colour textures.
+    Sparse,
+}
+
+/// Where a sparse texture's mip tails sit in its opaque range.
+pub(crate) struct SparseTail {
+    pub offset: u64,
+    pub stride: u64,
+    pub size: u64,
 }
 
 /// An image and its memory. It has no layout state: [`crate::CommandList::discard`] puts it
@@ -41,12 +53,19 @@ pub struct Texture {
     /// False for a swapchain image: the swapchain owns it and drops this texture once its
     /// presents have completed.
     owns_image: bool,
+    /// With [`TextureMemory::Sparse`].
+    pub(crate) sparse: Option<(SparseLayout, SparseTail)>,
     shared: Arc<Shared>,
 }
 
 impl Texture {
     pub fn desc(&self) -> &TextureDesc {
         &self.desc
+    }
+
+    /// How tiles and mip tails bind, for a texture created with [`TextureMemory::Sparse`].
+    pub fn sparse_layout(&self) -> Option<&SparseLayout> {
+        self.sparse.as_ref().map(|(l, _)| l)
     }
 
     /// The view rendering writes through; panics unless the texture has `usage`.
@@ -127,6 +146,7 @@ impl Texture {
             attachment: vk::ImageView::null(),
             desc: *desc,
             owns_image: false,
+            sparse: None,
             shared: Arc::clone(shared),
         };
         t.create_attachment(name)?;
@@ -190,7 +210,11 @@ fn data_aspect(format: Format) -> vk::ImageAspectFlags {
     }
 }
 
-pub(crate) fn image_info<'a>(desc: &TextureDesc, families: &'a [u32]) -> vk::ImageCreateInfo<'a> {
+pub(crate) fn image_info<'a>(
+    desc: &TextureDesc,
+    sparse: bool,
+    families: &'a [u32],
+) -> vk::ImageCreateInfo<'a> {
     let mut usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
     for (flag, vk_flag) in [
         (TextureUsage::SAMPLED, vk::ImageUsageFlags::SAMPLED),
@@ -200,12 +224,13 @@ pub(crate) fn image_info<'a>(desc: &TextureDesc, families: &'a [u32]) -> vk::Ima
             TextureUsage::DEPTH,
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
         ),
+        (TextureUsage::HOST_COPY, vk::ImageUsageFlags::HOST_TRANSFER),
     ] {
         if desc.usage.contains(flag) {
             usage |= vk_flag;
         }
     }
-    let (image_type, flags) = match desc.kind {
+    let (image_type, mut flags) = match desc.kind {
         TextureKind::D2 => (vk::ImageType::TYPE_2D, vk::ImageCreateFlags::empty()),
         TextureKind::D3 => (vk::ImageType::TYPE_3D, vk::ImageCreateFlags::empty()),
         TextureKind::Cube => (
@@ -213,6 +238,9 @@ pub(crate) fn image_info<'a>(desc: &TextureDesc, families: &'a [u32]) -> vk::Ima
             vk::ImageCreateFlags::CUBE_COMPATIBLE,
         ),
     };
+    if sparse {
+        flags |= vk::ImageCreateFlags::SPARSE_BINDING | vk::ImageCreateFlags::SPARSE_RESIDENCY;
+    }
     let (sharing, families) = sharing(families);
     vk::ImageCreateInfo::default()
         .flags(flags)
@@ -233,7 +261,7 @@ pub(crate) fn image_info<'a>(desc: &TextureDesc, families: &'a [u32]) -> vk::Ima
         .initial_layout(vk::ImageLayout::UNDEFINED)
 }
 
-fn check(desc: &TextureDesc) -> Result<(), Error> {
+fn check(desc: &TextureDesc, sparse: bool, caps: &crate::Caps) -> Result<(), Error> {
     let bad = |m: &str| Err(Error::Invalid(format!("texture {desc:?}: {m}")));
     if desc.extent.contains(&0) || desc.mips == 0 || desc.layers == 0 {
         return bad("zero extent, mips or layers");
@@ -260,13 +288,133 @@ fn check(desc: &TextureDesc) -> Result<(), Error> {
     if desc.mips > 32 - largest.leading_zeros() {
         return bad("more mips than the extent allows");
     }
+    let host = desc.usage.contains(TextureUsage::HOST_COPY);
+    if sparse && (desc.kind == TextureKind::D3 || desc.format.is_depth() || host) {
+        return bad("sparse textures are 2D or cube colour textures without host copy");
+    }
+    if host && !caps.host_image_copy {
+        return bad("host copy needs Caps::host_image_copy");
+    }
     Ok(())
+}
+
+/// Fails when the device cannot create the image `info` describes.
+fn check_format(
+    shared: &Shared,
+    info: &vk::ImageCreateInfo<'_>,
+    desc: &TextureDesc,
+) -> Result<(), Error> {
+    let query = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(info.format)
+        .ty(info.image_type)
+        .tiling(info.tiling)
+        .usage(info.usage)
+        .flags(info.flags);
+    let mut out = vk::ImageFormatProperties2::default();
+    // SAFETY: a plain query on the device's physical device.
+    let r = unsafe {
+        shared
+            .instance
+            .get_physical_device_image_format_properties2(shared.physical, &query, &mut out)
+    };
+    let l = out.image_format_properties;
+    let fits = r.is_ok()
+        && desc.extent[0] <= l.max_extent.width
+        && desc.extent[1] <= l.max_extent.height
+        && desc.extent[2] <= l.max_extent.depth
+        && desc.mips <= l.max_mip_levels
+        && desc.layers <= l.max_array_layers;
+    if fits {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!(
+            "texture {desc:?}: the device cannot create it with usage {:?} and flags {:?}",
+            info.usage, info.flags
+        )))
+    }
+}
+
+/// The tile shape and mip tail placement of the sparse image `image`.
+fn sparse_layout(
+    shared: &Shared,
+    image: vk::Image,
+    desc: &TextureDesc,
+    tile_bytes: u64,
+) -> Result<(SparseLayout, SparseTail), Error> {
+    let d = &shared.device;
+    let info = vk::ImageSparseMemoryRequirementsInfo2::default().image(image);
+    // SAFETY: `image` is a live sparse image.
+    let n = unsafe { d.get_image_sparse_memory_requirements2_len(&info) };
+    let mut reqs = vec![vk::SparseImageMemoryRequirements2::default(); n];
+    // SAFETY: as above, with room for `n` entries.
+    unsafe { d.get_image_sparse_memory_requirements2(&info, &mut reqs) };
+    let colour_only = |r: &vk::SparseImageMemoryRequirements2<'_>| {
+        r.memory_requirements.format_properties.aspect_mask == vk::ImageAspectFlags::COLOR
+    };
+    let r = match reqs.as_slice() {
+        [r] if colour_only(r) => r.memory_requirements,
+        _ => {
+            return Err(Error::Invalid(format!(
+                "texture {desc:?}: sparse aspects other than colour alone"
+            )));
+        }
+    };
+    let g = r.format_properties.image_granularity;
+    let tail_first_mip = r.image_mip_tail_first_lod.min(desc.mips);
+    let has_tail = tail_first_mip < desc.mips;
+    let layout = SparseLayout {
+        tile_extent: [g.width, g.height, g.depth],
+        tile_bytes,
+        tail_first_mip,
+        tail_bytes: if has_tail {
+            r.image_mip_tail_size.next_multiple_of(tile_bytes)
+        } else {
+            0
+        },
+        single_tail: r
+            .format_properties
+            .flags
+            .contains(vk::SparseImageFormatFlags::SINGLE_MIPTAIL),
+    };
+    let tail = SparseTail {
+        offset: r.image_mip_tail_offset,
+        stride: r.image_mip_tail_stride,
+        size: if has_tail { r.image_mip_tail_size } else { 0 },
+    };
+    Ok((layout, tail))
+}
+
+fn host_check(t: &Texture, region: &TextureRegion, len: usize) -> Result<(), Error> {
+    let bytes = region.bytes(t.desc.format);
+    if !t.desc.usage.contains(TextureUsage::HOST_COPY) || (len as u64) < bytes {
+        return Err(Error::Invalid(format!(
+            "a host copy of {bytes} bytes through {len} with a {:?} texture",
+            t.desc.usage
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn vk_offset(r: &TextureRegion) -> vk::Offset3D {
+    vk::Offset3D {
+        x: r.offset[0] as i32,
+        y: r.offset[1] as i32,
+        z: r.offset[2] as i32,
+    }
+}
+
+pub(crate) fn vk_extent(r: &TextureRegion) -> vk::Extent3D {
+    vk::Extent3D {
+        width: r.extent[0],
+        height: r.extent[1],
+        depth: r.extent[2],
+    }
 }
 
 impl Device {
     /// Size and alignment of a texture's memory, for placing it in a block.
     pub fn texture_requirements(&self, desc: &TextureDesc) -> (u64, u64) {
-        let info = image_info(desc, &self.shared.families);
+        let info = image_info(desc, false, &self.shared.families);
         let req = vk::DeviceImageMemoryRequirements::default().create_info(&info);
         let mut out = vk::MemoryRequirements2::default();
         // SAFETY: valid create info.
@@ -282,17 +430,23 @@ impl Device {
     }
 
     /// Creates a texture. Its contents are undefined until written; record
-    /// [`crate::CommandList::discard`] before its first use.
+    /// [`crate::CommandList::discard`] before its first GPU use. A
+    /// [`TextureUsage::HOST_COPY`] texture starts in `GENERAL`, ready for host copies.
     pub fn create_texture(
         &self,
         desc: &TextureDesc,
         memory: TextureMemory<'_>,
         name: &str,
     ) -> Result<Texture, Error> {
-        check(desc)?;
+        let is_sparse = matches!(memory, TextureMemory::Sparse);
         let shared = &self.shared;
+        check(desc, is_sparse, &shared.caps)?;
+        let host = desc.usage.contains(TextureUsage::HOST_COPY);
         let d = &shared.device;
-        let info = image_info(desc, &shared.families);
+        let info = image_info(desc, is_sparse, &shared.families);
+        if is_sparse || host {
+            check_format(shared, &info, desc)?;
+        }
         // SAFETY: valid create info for this device.
         let image = unsafe { d.create_image(&info, None) }.map_err(Error::vk("vkCreateImage"))?;
         // SAFETY: `image` is live.
@@ -301,15 +455,39 @@ impl Device {
             // SAFETY: the image is not used anywhere else.
             unsafe { d.destroy_image(image, None) };
         };
+        let kind = if host {
+            MemoryKind::Upload
+        } else {
+            MemoryKind::DeviceLocal
+        };
+        let mut sparse = None;
         let own = match memory {
-            TextureMemory::Dedicated => {
+            TextureMemory::Sparse => {
                 let ty = shared.memory.of(MemoryKind::DeviceLocal);
+                let layout = if req.memory_type_bits & (1 << ty) == 0 {
+                    Err(Error::Invalid(format!(
+                        "{name}: sparse textures cannot take DeviceLocal memory (type {ty})"
+                    )))
+                } else {
+                    sparse_layout(shared, image, desc, req.alignment)
+                };
+                sparse = Some(layout.inspect_err(|_| destroy())?);
+                None
+            }
+            TextureMemory::Dedicated => {
+                let ty = shared.memory.of(kind);
+                if req.memory_type_bits & (1 << ty) == 0 {
+                    destroy();
+                    return Err(Error::Invalid(format!(
+                        "{name}: memory type {ty} cannot hold this texture"
+                    )));
+                }
                 let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
                 let alloc = vk::MemoryAllocateInfo::default()
                     .allocation_size(req.size)
                     .memory_type_index(ty)
                     .push(&mut dedicated);
-                // SAFETY: valid allocate info; the device-local type was chosen to hold images.
+                // SAFETY: valid allocate info of a type the image accepts.
                 let mem = unsafe { d.allocate_memory(&alloc, None) };
                 let mem = mem.map_err(|e| {
                     destroy();
@@ -328,7 +506,8 @@ impl Device {
             TextureMemory::Placed { block, offset } => {
                 let raw = block.raw();
                 let ty = shared.memory.of(raw.kind);
-                let fits = req.memory_type_bits & (1 << ty) != 0
+                let fits = (!host || raw.kind == MemoryKind::Upload)
+                    && req.memory_type_bits & (1 << ty) != 0
                     && offset % req.alignment == 0
                     && offset + req.size <= raw.size;
                 if !fits {
@@ -353,10 +532,69 @@ impl Device {
             attachment: vk::ImageView::null(),
             desc: *desc,
             owns_image: true,
+            sparse,
             shared: Arc::clone(shared),
         };
+        if host {
+            let transition = [vk::HostImageLayoutTransitionInfo::default()
+                .image(image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .subresource_range(t.full_range())];
+            // SAFETY: the image is bound, has host-transfer usage and nothing uses it yet.
+            unsafe { d.transition_image_layout(&transition) }
+                .map_err(Error::vk("vkTransitionImageLayout"))?;
+        }
         t.create_attachment(name)?;
         Ok(t)
+    }
+
+    /// Writes tightly packed texels from `data` into `region` of `t` on the calling thread,
+    /// with no command list. `t` needs [`TextureUsage::HOST_COPY`]. Threads may copy into
+    /// disjoint regions at once; no GPU work may use the region during the copy. Submits made
+    /// after it returns see the texels.
+    pub fn host_copy_to_texture(
+        &self,
+        t: &Texture,
+        region: &TextureRegion,
+        data: &[u8],
+    ) -> Result<(), Error> {
+        host_check(t, region, data.len())?;
+        let regions = [vk::MemoryToImageCopy::default()
+            .host_pointer(data.as_ptr().cast())
+            .image_subresource(t.layers(region))
+            .image_offset(vk_offset(region))
+            .image_extent(vk_extent(region))];
+        let info = vk::CopyMemoryToImageInfo::default()
+            .dst_image(t.image)
+            .dst_image_layout(vk::ImageLayout::GENERAL)
+            .regions(&regions);
+        // SAFETY: the texture is in GENERAL with host-transfer usage; `data` holds the region.
+        unsafe { self.shared.device.copy_memory_to_image(&info) }
+            .map_err(Error::vk("vkCopyMemoryToImage"))
+    }
+
+    /// Reads `region` of `t` into `out`, tightly packed, on the calling thread. `t` needs
+    /// [`TextureUsage::HOST_COPY`], and GPU writes to the region must have completed.
+    pub fn host_copy_from_texture(
+        &self,
+        out: &mut [u8],
+        t: &Texture,
+        region: &TextureRegion,
+    ) -> Result<(), Error> {
+        host_check(t, region, out.len())?;
+        let regions = [vk::ImageToMemoryCopy::default()
+            .host_pointer(out.as_mut_ptr().cast())
+            .image_subresource(t.layers(region))
+            .image_offset(vk_offset(region))
+            .image_extent(vk_extent(region))];
+        let info = vk::CopyImageToMemoryInfo::default()
+            .src_image(t.image)
+            .src_image_layout(vk::ImageLayout::GENERAL)
+            .regions(&regions);
+        // SAFETY: the texture is in GENERAL with host-transfer usage; `out` holds the region.
+        unsafe { self.shared.device.copy_image_to_memory(&info) }
+            .map_err(Error::vk("vkCopyImageToMemory"))
     }
 
     /// Destroys `t` once `after` has completed.

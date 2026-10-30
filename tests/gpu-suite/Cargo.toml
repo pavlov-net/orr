@@ -26,6 +26,8 @@ ash.workspace = true
 blake3.workspace = true
 glam.workspace = true
 half = "2.7"
+# GDeflate encoder for the memory decompression test.
+gdeflate = "0.4.1"
 
 [build-dependencies]
 orr-shaders = { workspace = true, features = ["build"] }
