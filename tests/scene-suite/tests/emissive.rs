@@ -22,6 +22,7 @@ fn frame(scenes: &[SceneId]) -> FrameDesc<'_> {
             delta: 1.0 / 60.0,
         },
         scenes,
+        low_latency: None,
     }
 }
 

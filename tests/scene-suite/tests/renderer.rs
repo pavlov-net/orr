@@ -20,6 +20,7 @@ fn empty_frames_and_scene_frames_submit_in_order() {
                     delta: 1.0 / 60.0,
                 },
                 scenes: &[],
+                low_latency: None,
             })
             .unwrap();
         ids.push(f.id());
@@ -35,6 +36,7 @@ fn empty_frames_and_scene_frames_submit_in_order() {
             .begin_frame(&FrameDesc {
                 time: FrameTime::default(),
                 scenes: &list,
+                low_latency: None,
             })
             .unwrap();
         f.scene(s)
@@ -64,6 +66,7 @@ fn empty_frames_and_scene_frames_submit_in_order() {
         .begin_frame(&FrameDesc {
             time: FrameTime::default(),
             scenes: &[],
+            low_latency: None,
         })
         .unwrap();
     wait(f.end().unwrap());

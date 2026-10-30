@@ -1,14 +1,15 @@
 //! GPU tests of orr-gpu. Every test runs on one shared device with validation on and fails
 //! if the layer reports anything.
 
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use orr_gpu::{
     Allocation, ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance,
-    ClassicKind, CommandList, ComputePipeline, Device, DeviceDesc, GpuPtr, InstanceFlags,
-    MemoryKind, OutputFormat, Queue, QueueKind, QueueRequest, RtasFlags, ShaderModule, ShaderStage,
-    SpecData, SwapchainFrame, TimelinePoint,
+    ClassicKind, CommandList, ComputePipeline, Device, DeviceDesc, Diagnostics, GpuPtr,
+    InstanceFlags, LatencyTimings, MemoryKind, OutputFormat, Queue, QueueKind, QueueRequest,
+    RtasFlags, ShaderModule, ShaderStage, SpecData, SwapchainFrame, TimelinePoint,
 };
 use orr_shaders::bytemuck::Pod;
 
@@ -48,14 +49,28 @@ pub fn log_to_stderr() {
     log::set_max_level(log::LevelFilter::Info);
 }
 
-/// The suite's device: every queue kind, validation on.
+static DEVICE: OnceLock<Device> = OnceLock::new();
+
+/// The suite's device: every queue kind, validation on. `ORR_CAPTURE=1` creates it for an
+/// Nsight Graphics capture ([`Diagnostics::Capture`]).
 pub fn device() -> &'static Device {
-    static DEVICE: OnceLock<Device> = OnceLock::new();
+    let diagnostics = if std::env::var_os("ORR_CAPTURE").is_some_and(|v| v == "1") {
+        Diagnostics::Capture
+    } else {
+        Diagnostics::Off
+    };
+    device_with(diagnostics)
+}
+
+/// The suite's device created with `diagnostics`, for test binaries that need them; the
+/// first call in a process decides.
+pub fn device_with(diagnostics: Diagnostics<'static>) -> &'static Device {
     DEVICE.get_or_init(|| {
         log_to_stderr();
         let desc = DeviceDesc {
             name: "gpu-suite",
             validation: true,
+            diagnostics,
             queues: QueueRequest {
                 render_compute: true,
                 async_compute: true,
@@ -202,9 +217,10 @@ pub fn triangle_scene() -> Scene {
     }
 }
 
-/// Records the swapchain test card into `frame`'s image. Keep the root until the list is
-/// submitted.
+/// Records the swapchain test card into `frame`'s image, with its root in `device`'s upload
+/// memory. Keep the root until the list is submitted.
 pub fn fill_frame<'q>(
+    device: &Device,
     queue: &'q Queue,
     fill: &ComputePipeline,
     frame: &SwapchainFrame,
@@ -216,8 +232,12 @@ pub fn fill_frame<'q>(
         OutputFormat::Hdr10Pq => 1,
         OutputFormat::ScRgb => 2,
     };
-    let root = upload(
-        &[shaders::swapchain_fill::Root {
+    let mut root = device
+        .gpu_malloc::<shaders::swapchain_fill::Root>(MemoryKind::Upload, 1, "swapchain fill root")
+        .unwrap();
+    root.as_mut_slice()
+        .unwrap()
+        .copy_from_slice(&[shaders::swapchain_fill::Root {
             target: frame.storage(),
             width,
             height,
@@ -226,10 +246,41 @@ pub fn fill_frame<'q>(
             paper_white_nits: 200.0,
             pad0: 0,
             pad1: 0,
-        }],
-        "swapchain fill root",
-    );
+        }]);
     let mut list = queue.command_list().unwrap();
     list.dispatch(fill, root.gpu, [width.div_ceil(8), height.div_ceil(8), 1]);
     (list, root)
+}
+
+/// Asserts that every frame id up to `frames` has a latency report with every marker of the
+/// render and present threads, in order, and a GPU span. The first frames run before the
+/// driver's history fills and the last are in flight. 621.01 never reports ids that are
+/// multiples of 128 (measured.md PR-10).
+pub fn check_latency_reports(reports: &BTreeMap<u64, LatencyTimings>, frames: u64) {
+    for id in (64..frames - 64).filter(|id| id % 128 != 0) {
+        let t = reports
+            .get(&id)
+            .unwrap_or_else(|| panic!("no latency report for frame {id}"));
+        let ordered = [
+            t.simulation_start,
+            t.simulation_end,
+            t.render_submit_start,
+            t.render_submit_end,
+            t.present_start,
+            t.present_end,
+        ];
+        assert!(
+            ordered.iter().all(|&v| v != 0),
+            "frame {id}: a marker is missing: {t:?}"
+        );
+        // Markers set within the same microsecond can read 1 us out of order.
+        assert!(
+            ordered.windows(2).all(|w| w[0] <= w[1] + 1),
+            "frame {id}: markers out of order: {t:?}"
+        );
+        assert!(
+            t.gpu_render_start != 0 && t.gpu_render_start <= t.gpu_render_end,
+            "frame {id}: no GPU span: {t:?}"
+        );
+    }
 }

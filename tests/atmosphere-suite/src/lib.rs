@@ -30,6 +30,8 @@ pub mod linked {
 
 use shaders::probe::{MODULE, Root};
 
+pub mod prague;
+
 pub const SUN: LightId = LightId(0);
 
 /// Unit direction at an elevation and an azimuth from +x toward +z, in degrees.
@@ -118,6 +120,7 @@ impl Rig {
                     delta: 1.0 / 60.0,
                 },
                 scenes: &listed,
+                low_latency: None,
             })
             .unwrap();
         self.frame_id = f.id();
@@ -236,4 +239,36 @@ pub fn probe(
     list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
     wait(render.submit(vec![list], &[]).unwrap());
     read_buffer(output.gpu, outputs)
+}
+
+/// A probe's `light` field carrying the eye position.
+pub fn eye_light(eye: DVec3) -> [f32; 4] {
+    [eye.x as f32, eye.y as f32, eye.z as f32, eye.y as f32]
+}
+
+/// `AtmosphereSky.radiance` from `eye` along each of `dirs`: linear Rec.2020 nits.
+pub fn sky_radiance(rig: &Rig, eye: DVec3, dirs: &[DVec3]) -> Vec<[f64; 3]> {
+    let input: Vec<[f32; 4]> = dirs
+        .iter()
+        .map(|d| [d.x as f32, d.y as f32, d.z as f32, 0.0])
+        .collect();
+    let n = dirs.len() as u32;
+    let out = probe(
+        rig.block(),
+        "sky_radiance",
+        n.into(),
+        Probe {
+            threads: n,
+            count: n,
+            input: &input,
+            light: eye_light(eye),
+            ..Probe::default()
+        },
+    );
+    let out: Vec<_> = out
+        .into_iter()
+        .map(|c| [c[0], c[1], c[2]].map(f64::from))
+        .collect();
+    assert!(out.iter().flatten().all(|c| c.is_finite()), "{out:?}");
+    out
 }

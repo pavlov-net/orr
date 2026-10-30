@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use glam::DVec3;
 use orr_gpu::{
-    CommandList, ComputePipeline, Device, GpuPtr, Hazards, KernelSet, MemoryKind, PassResult,
-    QueueKind, ShaderStage, SpecData, Stages, TimelinePoint,
+    CommandList, ComputePipeline, Device, GpuPtr, Hazards, KernelSet, LatencyMarker, LowLatency,
+    MemoryKind, PassResult, QueueKind, ShaderStage, SpecData, Stages, TimelinePoint,
 };
 
 use crate::emissive::ModelEmission;
@@ -66,11 +66,22 @@ impl Default for RendererDesc {
 }
 
 /// What one frame renders.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct FrameDesc<'a> {
     pub time: FrameTime,
     /// Scenes updated this frame, in order. Others keep their tables and record nothing.
     pub scenes: &'a [SceneId],
+    /// The display's Reflex handle while its low latency is on: `begin_frame` sleeps on it
+    /// and the frame sets its markers under [`Frame::id`].
+    pub low_latency: Option<&'a LowLatency>,
+}
+
+/// The latency markers a consumer sets, on the render thread during the write phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsumerMarker {
+    SimulationStart,
+    SimulationEnd,
+    InputSample,
 }
 
 /// Figures of the last frame whose GPU work has completed.
@@ -304,8 +315,9 @@ impl Scenes {
         &self.core.stats
     }
 
-    /// Step 1: waits until frame N - frames_in_flight has completed, recycles its upload
-    /// window and the slots freed before it, and opens frame N.
+    /// Step 1: waits until frame N - frames_in_flight has completed, sleeps on the low
+    /// latency handle when one is given, recycles the upload window and the slots freed
+    /// before it, and opens frame N.
     pub fn begin_frame(&mut self, desc: &FrameDesc<'_>) -> Result<Frame<'_>> {
         let started = Instant::now();
         let core = &mut self.core;
@@ -325,6 +337,9 @@ impl Scenes {
             f.stats.gpu = self.device.pass_results(f.point).unwrap_or_default();
             core.completed_frame = f.id;
             core.stats = f.stats;
+        }
+        if let Some(latency) = desc.low_latency {
+            latency.sleep();
         }
         core.next_frame += 1;
         let completed = core.completed_frame;
@@ -366,6 +381,7 @@ impl Scenes {
             cpu: vec![("begin_frame", now - started)],
             step_start: now,
             scatter: Default::default(),
+            latency: desc.low_latency.cloned(),
         })
     }
 }
@@ -398,6 +414,7 @@ pub struct Frame<'a> {
     cpu: Vec<(&'static str, Duration)>,
     step_start: Instant,
     scatter: crate::upload::ScatterTotals,
+    latency: Option<LowLatency>,
 }
 
 impl<'a> Frame<'a> {
@@ -444,6 +461,22 @@ impl<'a> Frame<'a> {
         }
     }
 
+    /// Sets `marker` under this frame's id when the frame has a low latency handle. Call on
+    /// the render thread.
+    pub fn latency_marker(&self, marker: ConsumerMarker) {
+        self.marker(match marker {
+            ConsumerMarker::SimulationStart => LatencyMarker::SimulationStart,
+            ConsumerMarker::SimulationEnd => LatencyMarker::SimulationEnd,
+            ConsumerMarker::InputSample => LatencyMarker::InputSample,
+        });
+    }
+
+    fn marker(&self, marker: LatencyMarker) {
+        if let Some(latency) = &self.latency {
+            latency.marker(self.id, marker);
+        }
+    }
+
     fn step(&mut self, name: &'static str) {
         let now = Instant::now();
         self.cpu.push((name, now - self.step_start));
@@ -458,6 +491,7 @@ impl<'a> Frame<'a> {
     ) -> Result<()> {
         assert!(!self.updated, "update_scenes runs once a frame");
         self.step("write");
+        self.marker(LatencyMarker::RenderSubmitStart);
         self.updated = true;
         let device = self.device;
         let core = &*self.core;
@@ -654,6 +688,7 @@ impl<'a> Frame<'a> {
         let render = self.device.queue(QueueKind::Render).expect("render queue");
         let list = self.list.take().expect("frame list");
         let point = render.submit(vec![list], wait)?;
+        self.marker(LatencyMarker::RenderSubmitEnd);
         render.mark_frame_end(self.id)?;
         self.step("end");
         let used = self.core.windows[self.window].used();

@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use gpu_suite::shaders::swapchain_fill;
 use gpu_suite::window::Window;
-use gpu_suite::{assert_clean, device, fill_frame, pipeline, render};
+use gpu_suite::{assert_clean, check_latency_reports, device, fill_frame, pipeline, render};
 use orr_gpu::{
-    ComputePipeline, LatencyMarker, LatencyTimings, PresentMode, Queue, QueueKind, Swapchain,
-    SwapchainDesc, TimelinePoint,
+    ComputePipeline, LatencyMarker, PresentMode, Queue, QueueKind, Swapchain, SwapchainDesc,
+    TimelinePoint,
 };
 
 /// The tests share the window class and the GPU; one runs at a time.
@@ -50,7 +50,7 @@ fn present_one(
 ) -> Option<u64> {
     let frame = sc.acquire().unwrap()?;
     let q = present_queue();
-    let (list, _root) = fill_frame(q, fill, &frame, n);
+    let (list, _root) = fill_frame(device(), q, fill, &frame, n);
     q.submit_present(vec![list], wait, &frame).unwrap();
     Some(sc.present(frame, batch).unwrap())
 }
@@ -108,44 +108,12 @@ fn thousand_resizes() {
             "the swapchain follows the window"
         );
         let q = present_queue();
-        let (list, _root) = fill_frame(q, &fill, &frame, i);
+        let (list, _root) = fill_frame(device(), q, &fill, &frame, i);
         q.submit_present(vec![list], &[], &frame).unwrap();
         sc.present(frame, None).unwrap();
         device().collect_garbage();
     }
     finish(sc);
-}
-
-/// Every frame id has a report with every marker the two threads set, in order. 621.01
-/// never reports ids that are multiples of 128 (measured.md PR-10).
-fn check_reports(reports: &BTreeMap<u64, LatencyTimings>, frames: u64) {
-    // The first frames run before the driver's history fills; the last are in flight.
-    for id in (64..frames - 64).filter(|id| id % 128 != 0) {
-        let t = reports
-            .get(&id)
-            .unwrap_or_else(|| panic!("no latency report for frame {id}"));
-        let ordered = [
-            t.simulation_start,
-            t.simulation_end,
-            t.render_submit_start,
-            t.render_submit_end,
-            t.present_start,
-            t.present_end,
-        ];
-        assert!(
-            ordered.iter().all(|&v| v != 0),
-            "frame {id}: a marker is missing: {t:?}"
-        );
-        // Markers set within the same microsecond can read 1 us out of order.
-        assert!(
-            ordered.windows(2).all(|w| w[0] <= w[1] + 1),
-            "frame {id}: markers out of order: {t:?}"
-        );
-        assert!(
-            t.gpu_render_start != 0 && t.gpu_render_start <= t.gpu_render_end,
-            "frame {id}: no GPU span: {t:?}"
-        );
-    }
 }
 
 #[test]
@@ -200,6 +168,6 @@ fn render_thread_sleeps_and_marks_beside_the_present_thread() {
     }
     render_thread.join().unwrap();
     let (sc, reports) = present_thread.join().unwrap();
-    check_reports(&reports, FRAMES);
+    check_latency_reports(&reports, FRAMES);
     finish(sc);
 }

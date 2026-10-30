@@ -30,6 +30,7 @@ fn cpu_records_ahead_and_windows_wait_for_their_frame() {
     let desc = FrameDesc {
         time: FrameTime::default(),
         scenes: &list,
+        low_latency: None,
     };
 
     // Three groups, one written by each of the next three frames.
