@@ -10,7 +10,7 @@ use lighting_suite::{
     TestScene, assert_clean, compute_barrier, finish, kernels, pipeline, read, readback, render,
     upload,
 };
-use orr_gpu::{ComputePipeline, GpuAddress, KernelSet};
+use orr_gpu::{ComputePipeline, GpuAddress, GpuPtr, KernelSet};
 use orr_lighting::{
     DirectionalLight, DiscProfile, EmissiveSelection, LIGHT_TILE_SIZE, LIGHT_TILES, Light, LightId,
     LightSample, LightSetGpu, SceneLighting, SceneLightingSettings, ScenePass,
@@ -534,6 +534,25 @@ fn emissive_producer_tiles_match_the_density_and_irradiance() {
     assert_clean();
 }
 
+/// Runs the scene pass, then the NEE probe's `threads` candidate threads and its totals pass.
+fn run_nee_probe(
+    scene: &TestScene,
+    lighting: &mut SceneLighting,
+    root: GpuPtr<nee_probe::Root>,
+    threads: u32,
+) {
+    let probe = [
+        pipeline(&nee_probe::MODULE, "candidates"),
+        pipeline(&nee_probe::MODULE, "totals"),
+    ];
+    let mut list = render().command_list().unwrap();
+    lighting.record(&mut list, &scene.pass([0.0; 3]));
+    compute_barrier(&mut list);
+    list.dispatch(&probe[0], root, [threads / 64, 1, 1]);
+    list.dispatch(&probe[1], root, [1, 1, 1]);
+    finish(list);
+}
+
 #[test]
 fn directional_share_matches_the_lights_weights() {
     let mut scene = TestScene::new(SceneDesc {
@@ -615,16 +634,7 @@ fn directional_share_matches_the_lights_weights() {
         }],
         "nee probe root",
     );
-    let mut list = render().command_list().unwrap();
-    lighting.record(&mut list, &scene.pass([0.0; 3]));
-    compute_barrier(&mut list);
-    list.dispatch(
-        &pipeline(&nee_probe::MODULE, "candidates"),
-        root.gpu,
-        [threads / 64, 1, 1],
-    );
-    list.dispatch(&pipeline(&nee_probe::MODULE, "totals"), root.gpu, [1, 1, 1]);
-    finish(list);
+    run_nee_probe(&scene, &mut lighting, root.gpu, threads);
 
     let table = scene.lights();
     let states = read(lighting.directional_states(), 8);
@@ -934,16 +944,7 @@ fn a_scene_without_lights_gives_empty_candidates_and_no_nan() {
         }],
         "nee probe root",
     );
-    let mut list = render().command_list().unwrap();
-    lighting.record(&mut list, &scene.pass([0.0; 3]));
-    compute_barrier(&mut list);
-    list.dispatch(
-        &pipeline(&nee_probe::MODULE, "candidates"),
-        root.gpu,
-        [threads / 64, 1, 1],
-    );
-    list.dispatch(&pipeline(&nee_probe::MODULE, "totals"), root.gpu, [1, 1, 1]);
-    finish(list);
+    run_nee_probe(&scene, &mut lighting, root.gpu, threads);
 
     let c = checks.as_slice().unwrap();
     assert_eq!((c[1], c[2]), (0, 0), "non-finite or non-empty candidates");

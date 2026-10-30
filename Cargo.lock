@@ -1109,7 +1109,9 @@ name = "orr"
 version = "0.0.1"
 dependencies = [
  "orr-lighting",
+ "orr-output",
  "orr-scene",
+ "thiserror",
 ]
 
 [[package]]

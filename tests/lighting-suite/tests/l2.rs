@@ -141,12 +141,9 @@ fn equal_area_mapping_matches_the_cook() {
         }],
         "octahedral root",
     );
+    let p = pipeline(&mapping::MODULE, "main");
     let mut list = render().command_list().unwrap();
-    list.dispatch(
-        &pipeline(&mapping::MODULE, "main"),
-        root.gpu,
-        [n / 64, 1, 1],
-    );
+    list.dispatch(&p, root.gpu, [n / 64, 1, 1]);
     finish(list);
 
     let mut worst = 0.0f32;
@@ -193,19 +190,15 @@ fn sampling_matches_density(scene: &TestScene, lighting: &mut SceneLighting) {
         }],
         "env probe root",
     );
+    let probe = [
+        pipeline(&env_probe::MODULE, "sample"),
+        pipeline(&env_probe::MODULE, "integrate"),
+    ];
     let mut list = render().command_list().unwrap();
     lighting.record(&mut list, &scene.pass([0.0; 3]));
     compute_barrier(&mut list);
-    list.dispatch(
-        &pipeline(&env_probe::MODULE, "sample"),
-        root.gpu,
-        [threads / 64, 1, 1],
-    );
-    list.dispatch(
-        &pipeline(&env_probe::MODULE, "integrate"),
-        root.gpu,
-        [bins as u32, 1, 1],
-    );
+    list.dispatch(&probe[0], root.gpu, [threads / 64, 1, 1]);
+    list.dispatch(&probe[1], root.gpu, [bins as u32, 1, 1]);
     finish(list);
 
     let samples = f64::from(threads * per_thread);
@@ -420,14 +413,11 @@ fn discs(lights: &[DirectionalLight], focus: [f32; 3]) -> Discs {
         }],
         "disc probe root",
     );
+    let p = pipeline(&disc_probe::MODULE, "integrate");
     let mut list = render().command_list().unwrap();
     lighting.record(&mut list, &scene.pass(focus));
     compute_barrier(&mut list);
-    list.dispatch(
-        &pipeline(&disc_probe::MODULE, "integrate"),
-        root.gpu,
-        [count, 1, 1],
-    );
+    list.dispatch(&p, root.gpu, [count, 1, 1]);
     let states = copy_back(
         &mut list,
         lighting.directional_states(),
