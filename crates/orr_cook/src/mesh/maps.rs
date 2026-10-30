@@ -44,19 +44,16 @@ impl Raster {
             self.texels.iter().all(|&t| f(t));
             return;
         }
-        let edges: Vec<[f64; 3]> = (0..3)
-            .filter_map(|i| {
-                let (a, b) = (p[i], p[(i + 1) % 3]);
-                let n = [b[1] - a[1], a[0] - b[0]];
-                let c = p[(i + 2) % 3];
-                let side = n[0] * (c[0] - a[0]) + n[1] * (c[1] - a[1]);
-                // The edge's outward normal, as n.x x + n.y y + d > 0 outside.
-                (n != [0.0, 0.0]).then(|| {
-                    let s = if side > 0.0 { -1.0 } else { 1.0 };
-                    [s * n[0], s * n[1], -s * (n[0] * a[0] + n[1] * a[1])]
-                })
-            })
-            .collect();
+        // Each edge's outward normal, as n.x x + n.y y + d > 0 outside; degenerate edges
+        // never reject.
+        let edges = [0, 1, 2].map(|i| {
+            let (a, b) = (p[i], p[(i + 1) % 3]);
+            let n = [b[1] - a[1], a[0] - b[0]];
+            let c = p[(i + 2) % 3];
+            let side = n[0] * (c[0] - a[0]) + n[1] * (c[1] - a[1]);
+            let s = if side > 0.0 { -1.0 } else { 1.0 };
+            [s * n[0], s * n[1], -s * (n[0] * a[0] + n[1] * a[1])]
+        });
         for y in (lo[1].floor() as i64 - 2)..=(hi[1].floor() as i64 + 2) {
             for x in (lo[0].floor() as i64 - 2)..=(hi[0].floor() as i64 + 2) {
                 let (x0, x1) = ((x - 1) as f64, (x + 2) as f64);

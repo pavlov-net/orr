@@ -135,7 +135,8 @@ public uint3 load_triangle(uint8_t* page, PageHeader h, Cluster c, uint t)
 }
 
 // Micromap index of alpha-tested triangle `t` (at least `alpha_first`) of a cluster whose
-// `omm_first` is not CLUSTER_NO_OMM: cluster-relative, or negative for a special index.
+// `omm_first` is not CLUSTER_NO_OMM: an entry of the page's micromap, or negative for a
+// special index.
 public int load_omm_index(uint8_t* page, PageHeader h, Cluster c, uint t)
 {
     int16_t* p = (int16_t*)(page + h.omm_offset + c.omm_first);

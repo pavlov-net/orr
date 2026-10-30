@@ -4,7 +4,7 @@
 use orr_pack::material::Material;
 use serde::Deserialize;
 
-use crate::mesh::{LodMode, MeshSettings};
+use crate::mesh::{LodMode, MeshSettings, OmmSettings};
 
 macro_rules! patch {
     ($(#[$doc:meta])* $name:ident for $target:ty { $($field:ident: $ty:ty,)* }) => {
@@ -87,6 +87,7 @@ patch! {
         position_step_log2: i8,
         deformation_bound: f32,
         merge_level: Option<u8>,
+        omm: Option<OmmSettings>,
     }
 }
 
