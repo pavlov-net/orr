@@ -718,6 +718,9 @@ dependencies = [
 [[package]]
 name = "orr"
 version = "0.0.1"
+dependencies = [
+ "orr-scene",
+]
 
 [[package]]
 name = "orr-atmosphere"
@@ -1047,6 +1050,7 @@ name = "scene-suite"
 version = "0.0.1"
 dependencies = [
  "glam",
+ "orr",
  "orr-gpu",
  "orr-scene",
  "orr-shaders",

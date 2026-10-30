@@ -36,6 +36,7 @@ pub struct CpuLibrary {
     lib: Arc<Library>,
     sources: Vec<PathBuf>,
     includes: Vec<PathBuf>,
+    defines: Vec<String>,
     out_dir: Option<PathBuf>,
 }
 
@@ -46,6 +47,7 @@ impl CpuLibrary {
             lib: super::toolchain::load()?,
             sources: Vec::new(),
             includes: Vec::new(),
+            defines: Vec::new(),
             out_dir: None,
         })
     }
@@ -56,9 +58,16 @@ impl CpuLibrary {
         self
     }
 
-    /// One more import root. [`LIB_DIR`](crate::LIB_DIR) is always present.
+    /// One more import root. [`LIB_DIR`](crate::LIB_DIR) is always present, and so is
+    /// [`openpbr_dir`](super::openpbr_dir) when it is found.
     pub fn include(mut self, dir: impl AsRef<Path>) -> Self {
         self.includes.push(dir.as_ref().to_path_buf());
+        self
+    }
+
+    /// Defines a preprocessor macro for every source, as `-D name=value`.
+    pub fn define(mut self, name: &str, value: &str) -> Self {
+        self.defines.push(format!("{name}={value}"));
         self
     }
 
@@ -84,6 +93,12 @@ impl CpuLibrary {
             .chain([Path::new(crate::LIB_DIR)])
         {
             options.extend(["-I".to_owned(), canonical(dir)?.display().to_string()]);
+        }
+        if let Ok(dir) = super::openpbr_dir() {
+            options.extend(["-I".to_owned(), dir.display().to_string()]);
+        }
+        for define in &self.defines {
+            options.extend(["-D".to_owned(), define.clone()]);
         }
         let slang_err = |message: String| Error::Slang {
             module: name.to_owned(),
@@ -116,6 +131,14 @@ impl CpuLibrary {
         };
         let program = session.link(first, rest, |_| false).map_err(compile_err)?;
         let cpp = program.text().map_err(compile_err)?;
+        if cpp.contains("KernelContext") {
+            return Err(slang_err(
+                "the exported functions read global shader parameters (specialisation constants, \
+                 resources or uniforms), which the C++ target passes as an extra KernelContext \
+                 argument that `extern \"C\"` callers cannot supply"
+                    .to_owned(),
+            ));
+        }
         let cpp_path = out_dir.join(format!("{name}.cpp"));
         write(&cpp_path, cpp.as_bytes())?;
 
@@ -138,6 +161,7 @@ impl CpuLibrary {
                 println!("cargo:rerun-if-changed={}", input.display());
             }
             println!("cargo:rerun-if-env-changed=ORR_SLANGC");
+            println!("cargo:rerun-if-env-changed=ORR_OPENPBR_BSDF");
         }
         Ok(())
     }

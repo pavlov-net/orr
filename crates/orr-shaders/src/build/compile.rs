@@ -80,7 +80,8 @@ impl Build {
         self
     }
 
-    /// One more import root. [`LIB_DIR`](crate::LIB_DIR) is always present.
+    /// One more import root. [`LIB_DIR`](crate::LIB_DIR) is always present, and so is
+    /// [`openpbr_dir`](super::openpbr_dir) when it is found.
     pub fn include(mut self, dir: impl AsRef<Path>) -> Self {
         self.includes.push(dir.as_ref().to_path_buf());
         self
@@ -163,11 +164,13 @@ impl Build {
         if lib_dir.is_dir() {
             roots.push(lib_dir.clone());
         }
+        let mut include_dirs = roots.clone();
+        include_dirs.extend(super::openpbr_dir().ok());
 
         let mut options: Vec<String> = SLANGC_OPTIONS.iter().map(|s| (*s).to_owned()).collect();
-        for root in &roots {
+        for dir in &include_dirs {
             options.push("-I".into());
-            options.push(root.display().to_string());
+            options.push(dir.display().to_string());
         }
         if self.debug_info {
             options.push("-g2".into());
@@ -182,8 +185,8 @@ impl Build {
         };
         let metal_options = self.metal_check.then(|| {
             let mut o: Vec<String> = metal::OPTIONS.iter().map(|s| (*s).to_owned()).collect();
-            for root in &roots {
-                o.extend(["-I".to_owned(), root.display().to_string()]);
+            for dir in &include_dirs {
+                o.extend(["-I".to_owned(), dir.display().to_string()]);
             }
             o
         });
@@ -459,7 +462,12 @@ fn print_cargo(roots: &[PathBuf], modules: &BTreeMap<String, Record>) {
         for l in lines {
             println!("cargo:rerun-if-changed={}", l.display());
         }
-        for var in ["ORR_SLANGC", "ORR_METAL_CHECK", "ORR_SHADER_TIMINGS"] {
+        for var in [
+            "ORR_SLANGC",
+            "ORR_OPENPBR_BSDF",
+            "ORR_METAL_CHECK",
+            "ORR_SHADER_TIMINGS",
+        ] {
             println!("cargo:rerun-if-env-changed={var}");
         }
     }
