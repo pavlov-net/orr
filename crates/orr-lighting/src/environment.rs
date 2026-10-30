@@ -7,7 +7,7 @@ use orr_scene::SceneRoot;
 use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, Format, GpuPtr, Hazards, MemoryKind,
     SamplerIndex, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
-    TextureUsage, TimelinePoint, ViewDesc,
+    TextureUsage, ViewDesc,
 };
 
 use crate::shaders::environment::{bake, pyramid};
@@ -39,6 +39,7 @@ pub struct EnvironmentMapGpu {
 }
 
 pub(crate) struct EnvironmentBake {
+    device: Device,
     bake: ComputePipeline,
     mean: ComputePipeline,
     build: ComputePipeline,
@@ -102,6 +103,7 @@ impl EnvironmentBake {
             };
         }
         Ok(Self {
+            device: device.clone(),
             bake: pipeline(device, kernels, &bake::MODULE, "main")?,
             mean: pipeline(device, kernels, &pyramid::MODULE, "mean")?,
             build: pipeline(device, kernels, &pyramid::MODULE, "build")?,
@@ -153,10 +155,12 @@ impl EnvironmentBake {
     pub(crate) fn environment(&self) -> GpuPtr<EnvironmentGpu> {
         self.record.gpu
     }
+}
 
-    pub(crate) fn free(self, device: &Device, after: TimelinePoint) {
+impl Drop for EnvironmentBake {
+    fn drop(&mut self) {
         for slot in self.map_slots {
-            device.free_image_slot(slot, after);
+            self.device.free_image_slot_after_submitted(slot);
         }
     }
 }
