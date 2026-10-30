@@ -10,6 +10,7 @@ links = "orr"
 
 [dependencies]
 orr_scene.workspace = true
+orr_lighting.workspace = true
 
 [lints]
 workspace = true

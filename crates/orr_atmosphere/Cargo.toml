@@ -1,14 +1,20 @@
 [package]
 name = "orr_atmosphere"
-description = "Planetary sky and atmosphere for orr: spectral coefficients and an f64 reference integrator."
+description = "Planetary sky and atmosphere for orr: spectral LUT passes, the atmosphere data block and an f64 reference integrator."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+links = "orr_atmosphere"
 
 [dependencies]
+orr.workspace = true
+orr_shaders.workspace = true
 glam.workspace = true
+
+[build-dependencies]
+orr_shaders = { workspace = true, features = ["build"] }
 
 [lints]
 workspace = true

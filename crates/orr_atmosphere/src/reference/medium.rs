@@ -408,7 +408,8 @@ impl Ray {
 }
 
 /// Columns of the four components from a point to the top of the atmosphere, on
-/// Bruneton's (r, mu) mapping of the spherical planet; rays that hit the ground have none.
+/// Bruneton's (r, mu) mapping of the spherical planet with rows at sqrt(rho / H), which
+/// resolves thin layers near the ground; rays that hit the ground have none.
 pub(super) struct Columns {
     data: Vec<Densities>,
     radius: f64,
@@ -424,7 +425,8 @@ impl Columns {
         let horizon = (top * top - radius * radius).sqrt();
         let data = super::parallel(COLUMNS_R * COLUMNS_MU, |i| {
             let (ir, im) = (i / COLUMNS_MU, i % COLUMNS_MU);
-            let rho = horizon * ir as f64 / (COLUMNS_R - 1) as f64;
+            let x = ir as f64 / (COLUMNS_R - 1) as f64;
+            let rho = horizon * x * x;
             let r = (rho * rho + radius * radius).sqrt();
             let (dmin, dmax) = (top - r, rho + horizon);
             let d = dmin + (dmax - dmin) * im as f64 / (COLUMNS_MU - 1) as f64;
@@ -456,7 +458,7 @@ impl Columns {
         } else {
             0.0
         };
-        let fr = rho / horizon * (COLUMNS_R - 1) as f64;
+        let fr = (rho / horizon).sqrt() * (COLUMNS_R - 1) as f64;
         let fm = xm * (COLUMNS_MU - 1) as f64;
         let (ir, im) = (
             (fr as usize).min(COLUMNS_R - 2),
