@@ -1,0 +1,18 @@
+[package]
+name = "shader-corpus"
+description = "Slang probe corpus compiled through orr_shaders::build; its tests check the generated Rust."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bytemuck.workspace = true
+orr-shaders.workspace = true
+
+[build-dependencies]
+orr-shaders = { workspace = true, features = ["build"] }
+
+[lints]
+workspace = true

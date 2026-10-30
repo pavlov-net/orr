@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "tests/*"]
 exclude = ["probes"]
 resolver = "3"
 
