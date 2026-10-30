@@ -19,6 +19,11 @@
 //! one's node must sit on that grid: translation a multiple of the step, rotation a multiple
 //! of 90 degrees, unit scale, every placed grid coordinate within 24 bits.
 //!
+//! A node with `EXT_mesh_gpu_instancing` is a model of its own, named after the node and in
+//! its mesh's space, whatever the selection; its instances, scene space from the node's
+//! transform times each instance's, become instance records ([`Imported::instances`]). Such
+//! models do not mix with skins.
+//!
 //! Materials map as [`material`] lists. Textures become the material's canonical channel
 //! set ([`crate::texture::material`]); `texCoord` 0 or 1 becomes the binding's uv set and
 //! the sampler's wrap modes set the mip filter's edges.
@@ -77,6 +82,8 @@ pub(crate) struct Imported {
     pub skeleton: Option<SkeletonInfo>,
     /// Clips by name; their skeleton id is left for the caller to set.
     pub clips: Vec<(String, Clip)>,
+    /// Per instanced model: its node name and its instances' scene-space transforms.
+    pub instances: Vec<(String, Vec<Mat4>)>,
     /// Every file read: the document, its buffers and images.
     pub files: Vec<Input>,
 }
@@ -127,6 +134,19 @@ struct Building {
     groups: BTreeMap<usize, Vec<u32>>,
     /// Bind position and skeleton joint per part value, from skins.
     joint_pivots: Vec<Option<([f32; 3], u16)>>,
+}
+
+impl Building {
+    fn new(node: Option<usize>, from_scene: Mat4, parts: usize) -> Self {
+        Self {
+            node,
+            from_scene,
+            v: Vertices::default(),
+            tangents: true,
+            groups: BTreeMap::new(),
+            joint_pivots: vec![None; parts],
+        }
+    }
 }
 
 pub(crate) fn import(
@@ -213,7 +233,25 @@ pub(crate) fn import(
         ));
     }
 
-    let (mut models, owner) = select_models(doc, &graph, settings).map_err(fail)?;
+    let (mut models, mut owner) = select_models(doc, &graph, settings).map_err(fail)?;
+    let instanced = instanced_nodes(&src, &graph).map_err(fail)?;
+    if !instanced.is_empty() && skeleton.is_some() {
+        return Err(fail("instanced nodes need a scene without skins".into()));
+    }
+    let parts_count = settings
+        .parts_from_attribute
+        .as_ref()
+        .map_or(0, |p| usize::from(p.parts));
+    let mut instances = Vec::with_capacity(instanced.len());
+    for (n, transforms) in instanced {
+        owner[n] = Some(models.len());
+        instances.push((models.len(), transforms));
+        models.push(Building::new(
+            Some(n),
+            graph.world[n].inverse(),
+            parts_count,
+        ));
+    }
     let parts = settings.parts_from_attribute.as_ref();
     let mut materials: BTreeMap<usize, ImportedMaterial> = BTreeMap::new();
     for &n in &graph.order {
@@ -466,15 +504,31 @@ pub(crate) fn import(
     // Material slots in glTF index order, the default material last; only those in use.
     let used: Vec<usize> = materials.keys().copied().collect();
     let mut out = Vec::new();
-    for b in models {
+    let mut instance_out = Vec::with_capacity(instances.len());
+    let mut names = std::collections::HashSet::new();
+    for (mi, b) in models.into_iter().enumerate() {
         let node = b.node;
+        let instanced = instances.iter().find(|i| i.0 == mi).map(|i| i.1.clone());
+        // The whole scene may hold nothing but instanced nodes.
+        if node.is_none() && b.groups.values().all(Vec::is_empty) && !instances.is_empty() {
+            continue;
+        }
         let name = node.map(|n| {
-            doc.nodes()
-                .nth(n)
-                .and_then(|d| d.name())
-                .unwrap_or_default()
-                .to_string()
+            let named = doc.nodes().nth(n).and_then(|d| d.name());
+            match (named, &instanced) {
+                (Some(name), _) => name.to_string(),
+                (None, Some(_)) => format!("node{n}"),
+                (None, None) => String::new(),
+            }
         });
+        if let Some(name) = &name
+            && !names.insert(name.clone())
+        {
+            return Err(fail(format!("two models are named {name:?}")));
+        }
+        if let (Some(name), Some(transforms)) = (&name, instanced) {
+            instance_out.push((name.clone(), transforms));
+        }
         let mut mesh_settings = settings.mesh.clone();
         patch::apply_matching(
             &settings.mesh_overrides,
@@ -560,8 +614,67 @@ pub(crate) fn import(
         images,
         skeleton: skeleton.map(|s| s.info),
         clips,
+        instances: instance_out,
         files,
     })
+}
+
+/// Nodes with `EXT_mesh_gpu_instancing` and a mesh, in scene order, with each instance's
+/// scene-space transform: the node's world transform times the instance's TRS.
+fn instanced_nodes(src: &data::Document, graph: &Graph) -> Result<Vec<(usize, Vec<Mat4>)>, String> {
+    let mut out = Vec::new();
+    for &n in &graph.order {
+        let Some(ext) = src.json["nodes"][n]
+            .get("extensions")
+            .and_then(|e| e.get("EXT_mesh_gpu_instancing"))
+        else {
+            continue;
+        };
+        if src.doc.nodes().nth(n).and_then(|d| d.mesh()).is_none() {
+            continue;
+        }
+        let what = format!("node {n} EXT_mesh_gpu_instancing");
+        let read = |attribute: &str, k: usize| -> Result<Option<Vec<f32>>, String> {
+            let Some(i) = ext["attributes"].get(attribute) else {
+                return Ok(None);
+            };
+            let a = i
+                .as_u64()
+                .and_then(|i| src.doc.accessors().nth(i as usize))
+                .ok_or_else(|| format!("{what}: {attribute} names no accessor"))?;
+            src.floats(&a, k).map(Some)
+        };
+        let t = read("TRANSLATION", 3)?;
+        let r = read("ROTATION", 4)?;
+        let sc = read("SCALE", 3)?;
+        let counts: Vec<usize> = [(&t, 3), (&r, 4), (&sc, 3)]
+            .iter()
+            .filter_map(|(v, k)| v.as_ref().map(|v| v.len() / k))
+            .collect();
+        let Some(&count) = counts.first() else {
+            return Err(format!("{what}: no TRANSLATION, ROTATION or SCALE"));
+        };
+        if counts.iter().any(|&c| c != count) {
+            return Err(format!("{what}: attribute counts differ"));
+        }
+        let world = graph.world[n];
+        let transforms = (0..count)
+            .map(|i| {
+                let t = t
+                    .as_ref()
+                    .map_or(Vec3::ZERO, |v| Vec3::from_slice(&v[3 * i..]));
+                let r = r.as_ref().map_or(glam::Quat::IDENTITY, |v| {
+                    glam::Quat::from_slice(&v[4 * i..]).normalize()
+                });
+                let s = sc
+                    .as_ref()
+                    .map_or(Vec3::ONE, |v| Vec3::from_slice(&v[3 * i..]));
+                world * Mat4::from_scale_rotation_translation(s, r, t)
+            })
+            .collect();
+        out.push((n, transforms));
+    }
+    Ok(out)
 }
 
 /// The models to build and, per glTF node, the model it belongs to.
@@ -574,14 +687,7 @@ fn select_models(
         .parts_from_attribute
         .as_ref()
         .map_or(0, |p| usize::from(p.parts));
-    let building = |node, from_scene| Building {
-        node,
-        from_scene,
-        v: Vertices::default(),
-        tangents: true,
-        groups: BTreeMap::new(),
-        joint_pivots: vec![None; parts],
-    };
+    let building = |node, from_scene| Building::new(node, from_scene, parts);
     let n = graph.parent.len();
     if settings.models.is_empty() {
         let owner = (0..n).map(|i| graph.in_scene[i].then_some(0)).collect();

@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use orr_pack::mesh::{
-    MeshHeader, MeshInfo, OMM_STATE_UNKNOWN_TRANSPARENT, OMM_UNKNOWN_TRANSPARENT, PageView,
-    Section, decode_page,
+    Cluster, MeshHeader, MeshInfo, Node, OMM_STATE_UNKNOWN_TRANSPARENT, OMM_UNKNOWN_TRANSPARENT,
+    PageView, Section, cluster_resident_len, decode_page,
 };
 use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, Class, Entry};
@@ -87,17 +87,33 @@ pub struct MeshReport {
     pub clusters: u32,
     /// First merged level, if any.
     pub merge_level: Option<u8>,
+    /// DAG mode: the error the merged stage serves from, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_error: Option<f32>,
+    /// DAG mode: groups, the deepest group depth plus one, hierarchy nodes, their bytes and
+    /// node pages (0 when the hierarchy is resident).
+    pub groups: usize,
+    pub dag_depth: u32,
+    pub hierarchy_nodes: usize,
+    pub hierarchy_bytes: u64,
+    pub node_pages: usize,
     /// Stored bytes of the whole entry per source triangle.
     pub bytes_per_triangle: f64,
     /// Mean triangles per cluster on alpha-tested or double-sided sections, if any.
     pub foliage_cluster_fill: Option<f64>,
-    /// Finest first.
+    /// Finest first: discrete levels, or in DAG mode the part stage's group depths.
     pub levels: Vec<LevelReport>,
+    /// DAG mode: the merged stage's group depths.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub merged_levels: Vec<LevelReport>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+/// A page counts toward every level it holds clusters of, and its bytes are shared among
+/// them by the clusters' resident sizes.
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct LevelReport {
-    /// Simplification error from the source, metres.
+    /// Simplification error from the source, metres; in DAG mode the largest of the
+    /// depth's clusters.
     pub error: f32,
     pub triangles: u64,
     pub clusters: u32,
@@ -188,39 +204,72 @@ fn mesh_report(
     triangles: u64,
 ) -> Option<MeshReport> {
     let blobs = a.blobs(e);
+    let dag = !m.groups.is_empty();
+    let clusters: u32 = m.pages.iter().map(|p| u32::from(p.cluster_count)).sum();
+    // Level of each mesh cluster: a discrete level, or a DAG group depth.
+    let mut level_of = vec![0usize; clusters as usize];
+    if dag {
+        let mut page_first = Vec::with_capacity(m.pages.len());
+        let mut first = 0u32;
+        for p in &m.pages {
+            page_first.push(first);
+            first += u32::from(p.cluster_count);
+        }
+        for g in &m.groups {
+            let at = (page_first[g.page as usize] + u32::from(g.first_cluster)) as usize;
+            level_of[at..at + usize::from(g.cluster_count)].fill(usize::from(g.depth));
+        }
+    } else {
+        for (li, l) in m.levels.iter().enumerate() {
+            let r = l.clusters.first as usize..(l.clusters.first + l.clusters.count) as usize;
+            level_of[r].fill(li);
+        }
+    }
     let mut levels: Vec<LevelReport> = m
         .levels
         .iter()
         .map(|l| LevelReport {
             error: l.error,
-            triangles: 0,
             clusters: l.clusters.count,
-            pages: 0,
-            stored: 0,
-            resident: 0,
-            stored_per_triangle: 0.0,
-            resident_per_triangle: 0.0,
-            omm_bytes: 0,
-            omm_triangles: 0,
-            omm_unknown: 0.0,
+            ..LevelReport::default()
         })
         .collect();
+    let mut merged_levels: Vec<LevelReport> = Vec::new();
     let (mut foliage_tris, mut foliage_clusters) = (0u64, 0u64);
-    let mut first = 0u32;
+    let mut first = 0usize;
     for p in &m.pages {
         let b = blobs.get(p.blob as usize)?;
-        let level = m.levels.iter().position(|l| {
-            (l.clusters.first..l.clusters.first + l.clusters.count).contains(&first)
-        })?;
         let mut raw = vec![0; b.raw_len as usize];
         a.read(b, &mut raw).ok()?;
         let mut page = vec![0; p.resident_len as usize];
         let layout = decode_page(&raw, &mut page).ok()?;
         let view = PageView::new(&page, &m.header).ok()?;
         let maps = view.micromaps().ok()?;
-        let r = &mut levels[level];
+        // Per cluster: its level and resident bytes, which share out the page's bytes.
+        let mut shares: Vec<(bool, usize, f64)> = Vec::new();
         for i in 0..view.cluster_count() {
             let c = view.cluster(i);
+            let level = level_of[first + i as usize];
+            let merged = c.flags & Cluster::MERGED != 0 && dag;
+            let list = if merged {
+                &mut merged_levels
+            } else {
+                &mut levels
+            };
+            if list.len() <= level {
+                list.resize(level + 1, LevelReport::default());
+            }
+            let r = &mut list[level];
+            if dag {
+                r.clusters += 1;
+                r.error = r.error.max(c.self_error);
+            }
+            let resident = cluster_resident_len(
+                usize::from(c.vertex_count),
+                usize::from(c.tri_count),
+                layout.attr_stride as usize,
+            );
+            shares.push((merged, level, resident as f64));
             r.triangles += u64::from(c.tri_count);
             for t in u32::from(c.alpha_first)..u32::from(c.tri_count) {
                 let Some(index) = view.omm_index(&c, t) else {
@@ -244,17 +293,36 @@ fn mesh_report(
                 foliage_clusters += 1;
             }
         }
-        r.pages += 1;
-        r.stored += u64::from(b.stored_len);
-        r.resident += u64::from(p.resident_len);
-        r.omm_bytes += u64::from(layout.len - layout.omm_offset);
-        first += u32::from(p.cluster_count);
+        let total: f64 = shares.iter().map(|s| s.2).sum();
+        let mut counted = Vec::new();
+        for (merged, level, w) in shares {
+            let list = if merged {
+                &mut merged_levels
+            } else {
+                &mut levels
+            };
+            let r = &mut list[level];
+            let share = |bytes: u32| (f64::from(bytes) * w / total).round() as u64;
+            r.stored += share(b.stored_len);
+            r.resident += share(p.resident_len);
+            r.omm_bytes += share(layout.len - layout.omm_offset);
+            if !counted.contains(&(merged, level)) {
+                counted.push((merged, level));
+                r.pages += 1;
+            }
+        }
+        first += usize::from(p.cluster_count);
     }
-    for l in &mut levels {
+    for l in levels.iter_mut().chain(&mut merged_levels) {
         l.stored_per_triangle = l.stored as f64 / l.triangles.max(1) as f64;
         l.resident_per_triangle = l.resident as f64 / l.triangles.max(1) as f64;
         l.omm_unknown /= l.omm_triangles.max(1) as f64;
     }
+    let hierarchy_nodes = if m.node_pages.is_empty() {
+        m.nodes.len()
+    } else {
+        m.node_pages.iter().map(|p| p.node_count as usize).sum()
+    };
     Some(MeshReport {
         position_exponent: m.header.position_exponent,
         clas_truncate_bits: m.header.clas_truncate_bits,
@@ -262,12 +330,24 @@ fn mesh_report(
         parts: m.parts.len(),
         pages: m.pages.len(),
         pinned_pages: m.header.pinned_pages,
-        clusters: m.pages.iter().map(|p| u32::from(p.cluster_count)).sum(),
+        clusters,
         merge_level: (m.header.merge_level != MeshHeader::NO_MERGE_LEVEL)
             .then_some(m.header.merge_level),
+        merge_error: (dag && m.header.merge_error.is_finite()).then_some(m.header.merge_error),
+        groups: m.groups.len(),
+        dag_depth: m
+            .groups
+            .iter()
+            .map(|g| u32::from(g.depth) + 1)
+            .max()
+            .unwrap_or(0),
+        hierarchy_nodes,
+        hierarchy_bytes: (hierarchy_nodes * size_of::<Node>()) as u64,
+        node_pages: m.node_pages.len(),
         bytes_per_triangle: stored as f64 / triangles.max(1) as f64,
         foliage_cluster_fill: (foliage_clusters > 0)
             .then(|| foliage_tris as f64 / foliage_clusters as f64),
         levels,
+        merged_levels,
     })
 }

@@ -64,7 +64,7 @@ use serde::Deserialize;
 
 pub use gltf::{NodeSelect, PartAttribute};
 pub use instances::{Instances, Placement, PrototypeSpec, SectionSpec};
-pub use mesh::{LodMode, MeshInput, MeshParts, MeshSettings, OmmSettings};
+pub use mesh::{LodMode, MeshInput, MeshParts, MeshSettings, OmmSettings, StaticDisplacement};
 pub use patch::{MaterialPatch, MeshPatch};
 pub use raster::{
     RasterCompression, RasterFormat, RasterInput, RasterLayerReport, RasterLayerSpec, RasterReport,

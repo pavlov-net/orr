@@ -7,6 +7,7 @@
 //! wait for their turn to be written; while the bytes waiting exceed
 //! [`CookOptions::reorder_window`], only the jobs the next unwritten units wait on start.
 
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -37,8 +38,8 @@ use crate::texture::material::{
 };
 use crate::texture::{self, ENCODERS, Wrap};
 use crate::{
-    CookOptions, Cooked, Error, GltfSettings, Instances, Manifest, MeshSettings, Result, Source,
-    TextureSettings, mount,
+    CookOptions, Cooked, Error, GltfSettings, Instances, Manifest, MeshSettings, Placement,
+    PrototypeSpec, Result, Source, TextureSettings, mount,
 };
 
 /// Peak bytes of a mesh cook per source triangle (P2's clodBuild process peak, an upper
@@ -111,7 +112,7 @@ enum Work<'m> {
     Same,
     /// The placements, the cell size, the catalog without models, and the mesh unit of
     /// each prototype's model.
-    Instances(&'m Instances, u8, Catalog, Vec<(String, usize)>),
+    Instances(Cow<'m, Instances>, u8, Catalog, Vec<(String, usize)>),
     Raster(raster::Plan),
 }
 
@@ -187,6 +188,18 @@ impl NewUnit {
 struct Imported {
     files: Vec<Input>,
     units: Vec<NewUnit>,
+    /// Placements of the instanced models, cooked as instance unit `<asset>/instances`.
+    instances: Option<Instances>,
+}
+
+/// An instance source waiting for the keys of the models it places.
+struct PendingInstances<'m> {
+    archive: usize,
+    asset: usize,
+    name: String,
+    src: Cow<'m, Instances>,
+    /// The glTF source record the unit's key joins: (archive, record).
+    record: Option<(usize, usize)>,
 }
 
 /// A cooked unit: where its entries are, the job's seconds and its report details.
@@ -220,7 +233,7 @@ struct Run<'m, 's> {
     records: Vec<Vec<Record>>,
     files: Vec<Vec<PathBuf>>,
     imports: Vec<Import<'m>>,
-    instances: Vec<(usize, usize, &'m Instances)>,
+    instances: Vec<PendingInstances<'m>>,
     assets: Vec<AssetReport>,
     /// Report details of cooked units, by unit, until written.
     details: HashMap<usize, Detail>,
@@ -377,7 +390,13 @@ impl<'m, 's> Run<'m, 's> {
                 );
                 self.add_units(a, index, vec![unit]);
             }
-            Source::Instances(src) => self.instances.push((a, index, src)),
+            Source::Instances(src) => self.instances.push(PendingInstances {
+                archive: a,
+                asset: index,
+                name: name.into(),
+                src: Cow::Borrowed(src),
+                record: None,
+            }),
             Source::Mesh {
                 mesh,
                 materials,
@@ -426,10 +445,16 @@ impl<'m, 's> Run<'m, 's> {
             }
         }
         for (key, (from, entries, outcome)) in links {
-            let (name, class) = self.with_archive(a, &from, |arc| {
+            let (mut name, class) = self.with_archive(a, &from, |arc| {
                 let e = &arc.entries()[entries[0]];
                 (arc.name(e).to_owned(), e.class)
             })?;
+            // Instance pages are named `<source>/<cell>/<page>`; the unit is the source.
+            if class == Class::InstancePage as u16
+                && let Some(source) = name.rsplitn(3, '/').nth(2)
+            {
+                name = source.to_owned();
+            }
             let u = self.add(Unit {
                 archive: a,
                 asset,
@@ -636,6 +661,15 @@ impl<'m, 's> Run<'m, 's> {
             files: imported.files,
             units: keys,
         });
+        if let Some(src) = imported.instances {
+            self.instances.push(PendingInstances {
+                archive: a,
+                asset,
+                name: format!("{}/instances", self.assets[asset].name),
+                src: Cow::Owned(src),
+                record: Some((a, self.records[a].len() - 1)),
+            });
+        }
     }
 
     /// Keys and dependencies of instance sources, from the keys of the models and
@@ -646,11 +680,17 @@ impl<'m, 's> Run<'m, 's> {
             .iter()
             .map(|(n, &u)| (AssetId::from_name(n), u))
             .collect();
-        for (a, asset, src) in std::mem::take(&mut self.instances) {
-            let name = self.assets[asset].name.clone();
+        for pending in std::mem::take(&mut self.instances) {
+            let PendingInstances {
+                archive: a,
+                asset,
+                name,
+                src,
+                record,
+            } = pending;
             let cell_log2 = self.manifest.archives[a].cell_log2;
             let mut key =
-                Key::new(Class::InstancePage, &name).hash(instances::input_hash(src, cell_log2));
+                Key::new(Class::InstancePage, &name).hash(instances::input_hash(&src, cell_log2));
             let mut meshes = Vec::new();
             for p in &src.prototypes {
                 let model = self
@@ -682,15 +722,20 @@ impl<'m, 's> Run<'m, 's> {
             let mut deps: Vec<usize> = meshes.iter().map(|m| m.1).collect();
             deps.sort_unstable();
             deps.dedup();
+            let key = key.finish();
+            if let Some((ra, r)) = record {
+                self.records[ra][r].units.push(key);
+            }
+            let working_set = src.records.len() as u64 * 256;
             self.add(Unit {
                 archive: a,
                 asset,
                 name,
                 class: Class::InstancePage as u16,
-                key: key.finish(),
+                key,
                 work: Some(Work::Instances(src, cell_log2, Catalog::new(), meshes)),
                 deps,
-                working_set: src.records.len() as u64 * 256,
+                working_set,
                 triangles: 0,
                 state: State::Waiting,
                 mesh: None,
@@ -1224,6 +1269,9 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
         .map(|j| (AssetId::from_name(&j.name), (j.name.clone(), j.key)))
         .collect();
 
+    // Materials of statically displaced sections without their displacement, which the
+    // geometry holds.
+    let mut baked: HashMap<usize, (AssetId, Hash32)> = HashMap::new();
     for model in src.models {
         let (model_name, mesh_name) = match &model.node {
             None => (name.to_string(), format!("{name}/mesh")),
@@ -1231,18 +1279,37 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
         };
         let mut mesh = model.mesh;
         let mut deps = Vec::new();
+        let mut model_materials = Vec::with_capacity(model.materials.len());
         for (sec, &mi) in mesh.sections.iter_mut().zip(&model.materials) {
             let t = &src.materials[mi].textures;
             sec.maps = map_spec(&materials[mi].2, t, &textures);
             deps.extend(sec.maps.units().map(str::to_string));
+            let bakes = model.settings.displace_static.is_some()
+                && sec
+                    .maps
+                    .displacement
+                    .as_ref()
+                    .is_some_and(|d| d.texture.is_some());
+            model_materials.push(if bakes {
+                *baked.entry(mi).or_insert_with(|| {
+                    let mut m = materials[mi].2;
+                    m.textures[slot::DISPLACEMENT] = bytemuck::Zeroable::zeroed();
+                    m.displacement_scale = 0.0;
+                    m.displacement_offset = 0.0;
+                    m.displacement_min = 0.0;
+                    m.displacement_max = 0.0;
+                    let suffix = &src.materials[mi].suffix;
+                    let unit = material_unit(format!("{name}/material/{suffix}/static"), &m);
+                    let id = (AssetId::from_name(&unit.name), unit.key);
+                    units.push(unit);
+                    id
+                })
+            } else {
+                (materials[mi].0, materials[mi].1)
+            });
         }
         deps.sort_unstable();
         deps.dedup();
-        let model_materials: Vec<_> = model
-            .materials
-            .iter()
-            .map(|&mi| (materials[mi].0, materials[mi].1))
-            .collect();
         units.extend(mesh_and_model(
             model_name,
             mesh_name,
@@ -1253,6 +1320,9 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
             skeleton,
         ));
     }
+    let instances = (!src.instances.is_empty())
+        .then(|| gltf_instances(name, &src.instances))
+        .transpose()?;
     let images = Arc::new(src.images);
     for job in jobs {
         let (name, key, working_set) = (job.name.clone(), job.key, job.working_set(&images));
@@ -1263,7 +1333,40 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
     Ok(Imported {
         files: src.files,
         units,
+        instances,
     })
+}
+
+/// The instance source of a glTF file's instanced models: one prototype per model, a
+/// placement per instance.
+fn gltf_instances(name: &str, models: &[(String, Vec<glam::Mat4>)]) -> Result<Instances> {
+    let mut src = Instances::default();
+    for (p, (node, transforms)) in models.iter().enumerate() {
+        src.prototypes.push(PrototypeSpec {
+            model: format!("{name}/{node}"),
+            ..PrototypeSpec::default()
+        });
+        for (i, m) in transforms.iter().enumerate() {
+            let (scale, rotation, translation) = m.to_scale_rotation_translation();
+            let back = glam::Mat4::from_scale_rotation_translation(scale, rotation, translation);
+            let tolerance = 1e-4 * m.abs().to_cols_array().into_iter().fold(1.0, f32::max);
+            if !back.abs_diff_eq(*m, tolerance) {
+                return Err(Error::Import {
+                    asset: name.into(),
+                    message: format!(
+                        "{node}: instance {i} has a shear, which a placement cannot hold"
+                    ),
+                });
+            }
+            src.records.push(Placement {
+                position: translation.as_dvec3(),
+                rotation,
+                scale,
+                prototype: p as u16,
+            });
+        }
+    }
+    Ok(src)
 }
 
 /// A material entry holding `m`.
@@ -1504,6 +1607,10 @@ fn cook_unit(
                 mount: i < pinned,
                 ..BlobIn::new(p)
             }));
+            blobs.extend(cooked.node_pages.iter().enumerate().map(|(i, p)| BlobIn {
+                mount: i == 0,
+                ..BlobIn::new(p)
+            }));
             w.add(name, class, orr_pack::mesh::SCHEMA, key, &blobs)?;
         }
         Work::Texture(job, images) => {
@@ -1518,7 +1625,7 @@ fn cook_unit(
         }
         Work::Model(..) | Work::Same => unreachable!("finished on the coordinator"),
         Work::Instances(src, cell_log2, catalog, _) => {
-            instances::cook(&mut w, name, src, cell_log2, &catalog, key)?;
+            instances::cook(&mut w, name, &src, cell_log2, &catalog, key)?;
         }
         Work::Raster(plan) => {
             let scratch = raster::scratch_dir(shared.cache.as_ref().map(Cache::dir));

@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use orr_cook::{CookOptions, Manifest, Outcome};
 use orr_pack::clip::ClipHeader;
 use orr_pack::instance::{InstancePageInfo, InstanceRecord};
-use orr_pack::mesh::{MeshHeader, MeshInfo, PageHeader};
+use orr_pack::mesh::{Cluster, MeshHeader, MeshInfo, Node, PageHeader, cluster_resident_len};
 use orr_pack::raster::{RasterLayer, RasterSetInfo};
 use orr_pack::skeleton::{NO_PARENT, SkeletonInfo};
 use orr_pack::texture::TextureInfo;
@@ -333,6 +333,9 @@ fn mesh_lines(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
         }
     )?;
     let blobs = a.blobs(e);
+    if !info.groups.is_empty() {
+        return dag_lines(a, e, &info, out);
+    }
     for (i, l) in info.levels.iter().enumerate() {
         let range = l.clusters.first..l.clusters.first + l.clusters.count;
         let (mut first, mut stored, mut resident, mut omm) = (0, 0u64, 0u64, 0u64);
@@ -356,6 +359,104 @@ fn mesh_lines(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
             out,
             "    level {i}: error {} m, {} clusters, stored {stored} B, resident {resident} B, micromaps {omm} B",
             l.error, l.clusters.count
+        )?;
+    }
+    Ok(())
+}
+
+/// A DAG mesh: groups, hierarchy and merge error, then per stage and group depth its
+/// largest error, clusters, triangles, the pages holding it and its share of their bytes.
+fn dag_lines(a: &Archive, e: &Entry, info: &MeshInfo, out: &mut impl Write) -> Result<()> {
+    let h = info.header;
+    let nodes: usize = if info.node_pages.is_empty() {
+        info.nodes.len()
+    } else {
+        info.node_pages.iter().map(|p| p.node_count as usize).sum()
+    };
+    writeln!(
+        out,
+        "    DAG: {} groups, {nodes} hierarchy nodes ({} B{}){}",
+        info.groups.len(),
+        nodes * size_of::<Node>(),
+        if info.node_pages.is_empty() {
+            ", resident".to_string()
+        } else {
+            format!(" in {} node pages", info.node_pages.len())
+        },
+        if h.merge_error.is_finite() {
+            format!(", merged from error {} m", h.merge_error)
+        } else {
+            String::new()
+        }
+    )?;
+    let blobs = a.blobs(e);
+    #[derive(Default)]
+    struct Row {
+        error: f32,
+        clusters: u32,
+        triangles: u64,
+        pages: u32,
+        stored: u64,
+        resident: u64,
+    }
+    let mut rows: std::collections::BTreeMap<(bool, u8), Row> = Default::default();
+    let mut records = Vec::with_capacity(info.pages.len());
+    for p in &info.pages {
+        // A stored page starts with its resident header and cluster records.
+        let b = &blobs[p.blob as usize];
+        let mut page = vec![0; b.raw_len as usize];
+        a.read(b, &mut page)?;
+        let at = |i: usize| size_of::<PageHeader>() + i * size_of::<Cluster>();
+        let clusters: Vec<Cluster> = (0..usize::from(p.cluster_count))
+            .map(|i| {
+                page.get(at(i)..at(i + 1))
+                    .map(bytemuck::pod_read_unaligned)
+                    .ok_or("cluster record is short")
+            })
+            .collect::<std::result::Result<_, _>>()?;
+        records.push(clusters);
+    }
+    // A page's bytes are shared among the depths it holds by their clusters' resident sizes.
+    let stride = h.attr_stride() as usize;
+    let size = |c: &Cluster| {
+        cluster_resident_len(
+            usize::from(c.vertex_count),
+            usize::from(c.tri_count),
+            stride,
+        ) as f64
+    };
+    let totals: Vec<f64> = records.iter().map(|r| r.iter().map(size).sum()).collect();
+    let mut counted = std::collections::HashSet::new();
+    for g in &info.groups {
+        let clusters = &records[g.page as usize];
+        let first = usize::from(g.first_cluster);
+        let group = &clusters[first..first + usize::from(g.cluster_count)];
+        let merged = group.iter().any(|c| c.flags & Cluster::MERGED != 0);
+        let r = rows.entry((merged, g.depth)).or_default();
+        let p = &info.pages[g.page as usize];
+        let share = group.iter().map(size).sum::<f64>() / totals[g.page as usize];
+        for c in group {
+            r.error = r.error.max(c.self_error);
+            r.clusters += 1;
+            r.triangles += u64::from(c.tri_count);
+        }
+        if counted.insert((merged, g.depth, g.page)) {
+            r.pages += 1;
+        }
+        r.stored += (f64::from(blobs[p.blob as usize].stored_len) * share).round() as u64;
+        r.resident += (f64::from(p.resident_len) * share).round() as u64;
+    }
+    for ((merged, depth), r) in rows {
+        writeln!(
+            out,
+            "    {}depth {depth}: error {} m, {} clusters, {} triangles, {} pages, stored {} B, resident {} B",
+            if merged { "merged " } else { "" },
+            r.error,
+            r.clusters,
+            r.triangles,
+            r.pages,
+            r.stored,
+            r.resident
         )?;
     }
     Ok(())

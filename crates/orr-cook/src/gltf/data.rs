@@ -17,6 +17,7 @@ const COOK_EXTENSIONS: &[&str] = &[
     "KHR_mesh_quantization",
     "KHR_meshopt_compression",
     "EXT_meshopt_compression",
+    "EXT_mesh_gpu_instancing",
     "KHR_materials_anisotropy",
     "KHR_materials_clearcoat",
     "KHR_materials_diffuse_transmission",

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use glam::{Mat3, Mat4, Quat, Vec3, Vec4};
 use gltf::animation::util::ReadOutputs;
 use gltf::animation::{Interpolation, Property};
-use orr_cook::{ArchiveSpec, AssetSpec, GltfSettings, Manifest, Source};
+use orr_cook::{ArchiveSpec, AssetSpec, GltfSettings, LodMode, Manifest, MeshSettings, Source};
 use orr_pack::clip::Clip;
 use orr_pack::mesh::{self, Cluster, MeshHeader, MeshInfo, PageView};
 use orr_pack::model::ModelInfo;
@@ -571,6 +571,18 @@ fn skinned_fixture_matches_gltf() {
         e.skin_mm <= SKIN_MM && e.weight_steps <= 1.0 && e.source_mm < 1.0,
         "{e:?}"
     );
+    // A DAG keeps source vertices with their joints and weights at every depth.
+    let dag = GltfSettings {
+        mesh: MeshSettings {
+            lod: LodMode::Dag,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (cooked, e) = check(&path, "rig", dag);
+    let info = MeshInfo::parse(&cooked.blob(cooked.entry("/mesh"), 0)).unwrap();
+    assert!(!info.groups.is_empty());
+    assert!(e.skin_mm <= SKIN_MM && e.weight_steps <= 1.0, "{e:?}");
 }
 
 #[test]

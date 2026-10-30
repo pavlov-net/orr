@@ -1,5 +1,6 @@
-//! Mesh class: blob 0 holds a [`MeshHeader`] and its tables ([`MeshInfo`]); every other blob
-//! is one page of whole clusters.
+//! Mesh class: blob 0 holds a [`MeshHeader`] and its tables ([`MeshInfo`]); the blobs after
+//! it are the pages of whole clusters ([`PageInfo`]), then in DAG mode the hierarchy's node
+//! pages when it is paged ([`NodePage`], records read by [`nodes`]).
 //!
 //! A page is stored in the codec form [`encode_page`] writes, and [`decode_page`] turns it
 //! into the resident layout the GPU reads:
@@ -29,7 +30,10 @@ pub use omm::*;
 use crate::blob::{put_table, read, table};
 use crate::{Aabb, Affine3, Error, Result, Span, Sphere};
 
-pub const SCHEMA: u16 = 3;
+pub const SCHEMA: u16 = 4;
+
+/// Largest hierarchy node page.
+pub const NODE_PAGE_MAX: usize = 64 << 10;
 
 /// Largest resident page.
 pub const PAGE_MAX: usize = 128 << 10;
@@ -68,21 +72,29 @@ pub struct MeshHeader {
     pub _pad: [u8; 3],
     /// Error from which the merged stage serves in DAG mode; infinity for none.
     pub merge_error: f32,
+    /// DAG mode: [`Node`] table when the hierarchy is resident; empty when it is paged.
     pub nodes: Span,
+    /// DAG mode: [`Group`] per group, in page order.
     pub groups: Span,
+    /// DAG mode: [`NodePage`] per node page when the hierarchy is paged; the first is the
+    /// top page.
     pub node_pages: Span,
-    /// u32 root node per (part, section), then one per section for the merged stage.
+    /// DAG mode: u32 root node per (part, section), part-major, then one per section for
+    /// the merged stage; [`Self::NO_ROOT`] where the stage has no triangles.
     pub roots: Span,
     /// [`PageInfo`] per page.
     pub pages: Span,
     /// Pages `0..pinned_pages` are resident from mount.
     pub pinned_pages: u32,
+    /// u32 page indices that [`PageInfo::deps`] ranges index.
+    pub page_deps: Span,
 }
 
 impl MeshHeader {
     pub const TANGENT: u8 = 1;
     pub const SKIN: u8 = 2;
     pub const NO_MERGE_LEVEL: u8 = 0xFF;
+    pub const NO_ROOT: u32 = !0;
 
     /// Bytes per vertex in the attribute array.
     pub fn attr_stride(&self) -> u32 {
@@ -148,9 +160,64 @@ pub struct PageInfo {
     pub resident_len: u32,
     pub cluster_count: u16,
     pub _pad: u16,
-    /// Pages this page's clusters depend on.
+    /// Range of [`MeshInfo::page_deps`]: the earlier pages holding the coarser clusters this
+    /// page's groups simplify into. Empty in discrete mode.
     pub deps: Span,
 }
+
+/// A DAG hierarchy node. Traversal enters a node while its projected `max_error` is over
+/// the threshold; a leaf names a group.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
+pub struct Node {
+    /// Bounds every group below the node.
+    pub sphere: Sphere,
+    /// The largest group error below the node; infinity when a terminal group is below.
+    pub max_error: f32,
+    /// Children are nodes `child_first..child_first + child_count`, in one node page.
+    pub child_first: u32,
+    pub child_count: u16,
+    pub _pad: u16,
+    /// Group index for a leaf, -1 for an internal node.
+    pub group: i32,
+}
+
+/// A DAG group: clusters that stream and are replaced together.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
+pub struct Group {
+    /// Bounds and error of the coarser geometry the group simplifies into; every cluster
+    /// of the group has them as `parent_sphere` and `parent_error`.
+    pub simplified: Sphere,
+    /// Infinity for a terminal group.
+    pub error: f32,
+    pub page: u32,
+    /// The group's clusters are `first_cluster..first_cluster + cluster_count` of its page.
+    pub first_cluster: u16,
+    pub cluster_count: u16,
+    /// Simplification steps from the stage's source geometry.
+    pub depth: u8,
+    pub _pad: [u8; 3],
+}
+
+/// A page of hierarchy nodes: a contiguous node range whose parents all sit in one page.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct NodePage {
+    pub first_node: u32,
+    pub node_count: u32,
+    /// Blob index within the mesh entry; the blob holds `node_count` [`Node`] records.
+    pub blob: u32,
+    /// The page holding these nodes' parents; [`Self::TOP`] for the top page.
+    pub parent_page: u32,
+}
+
+impl NodePage {
+    pub const TOP: u32 = !0;
+}
+
+const _: () = assert!(size_of::<Node>() == 32);
+const _: () = assert!(size_of::<Group>() == 32);
 
 /// Header of a resident page.
 #[repr(C)]
@@ -231,8 +298,12 @@ pub struct MeshInfo {
     pub parts: Vec<Part>,
     pub part_levels: Vec<PartLevel>,
     pub levels: Vec<Level>,
+    pub nodes: Vec<Node>,
+    pub groups: Vec<Group>,
+    pub node_pages: Vec<NodePage>,
     pub roots: Vec<u32>,
     pub pages: Vec<PageInfo>,
+    pub page_deps: Vec<u32>,
 }
 
 impl MeshInfo {
@@ -243,8 +314,12 @@ impl MeshInfo {
             parts: table(blob, header.parts)?,
             part_levels: table(blob, header.part_levels)?,
             levels: table(blob, header.levels)?,
+            nodes: table(blob, header.nodes)?,
+            groups: table(blob, header.groups)?,
+            node_pages: table(blob, header.node_pages)?,
             roots: table(blob, header.roots)?,
             pages: table(blob, header.pages)?,
+            page_deps: table(blob, header.page_deps)?,
             header,
         })
     }
@@ -257,20 +332,40 @@ impl MeshInfo {
         h.parts = put_table(&mut out, &self.parts);
         h.part_levels = put_table(&mut out, &self.part_levels);
         h.levels = put_table(&mut out, &self.levels);
+        h.nodes = put_table(&mut out, &self.nodes);
+        h.groups = put_table(&mut out, &self.groups);
+        h.node_pages = put_table(&mut out, &self.node_pages);
         h.roots = put_table(&mut out, &self.roots);
         h.pages = put_table(&mut out, &self.pages);
-        h.nodes = Span::default();
-        h.groups = Span::default();
-        h.node_pages = Span::default();
+        h.page_deps = put_table(&mut out, &self.page_deps);
         out[..size_of::<MeshHeader>()].copy_from_slice(bytemuck::bytes_of(&h));
         out
     }
+}
+
+/// The [`Node`] records of a node page blob.
+pub fn nodes(blob: &[u8]) -> Result<Vec<Node>> {
+    if !blob.len().is_multiple_of(size_of::<Node>()) {
+        return Err(Error::Malformed("node page length"));
+    }
+    Ok(blob
+        .chunks_exact(size_of::<Node>())
+        .map(bytemuck::pod_read_unaligned)
+        .collect())
 }
 
 /// Bytes per vertex in the attribute array of a mesh with these [`MeshHeader::attributes`].
 pub fn attr_stride(attributes: u8) -> u32 {
     let has = |a: u8| u32::from(attributes & a != 0);
     8 + 4 * has(MeshHeader::TANGENT) + 8 * has(MeshHeader::SKIN)
+}
+
+/// Bytes a cluster of `vertices` and `triangles` takes in a resident page, its record
+/// included and its micromaps not.
+pub fn cluster_resident_len(vertices: usize, triangles: usize, attr_stride: usize) -> usize {
+    size_of::<Cluster>()
+        + vertices.next_multiple_of(2) * (6 + attr_stride)
+        + (triangles * 3).next_multiple_of(4)
 }
 
 fn exp2(k: i8) -> f32 {
