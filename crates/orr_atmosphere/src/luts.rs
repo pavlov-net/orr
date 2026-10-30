@@ -212,7 +212,7 @@ impl AtmosphereState {
     /// The candidate lights, at most [`MAX_SKY_LIGHTS`]: ids in the scene's light table. The
     /// sky folds in the `sky_lights` brightest by top-of-atmosphere luminance among those that
     /// are directional and no more than 18 deg below the focus horizon; ties go to the earlier
-    /// candidate.
+    /// candidate. A `Textured` light with zero illuminance counts with its disc integral.
     pub fn set_lights(&mut self, lights: &[LightId]) {
         assert!(
             lights.len() <= MAX_SKY_LIGHTS,

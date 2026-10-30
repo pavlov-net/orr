@@ -21,6 +21,16 @@ pub const REC709_TO_REC2020: [[f64; 3]; 3] = [
     [0.016_391_438_9, 0.088_013_307_9, 0.895_595_253_2],
 ];
 
+/// Linear Rec.2020 to linear Rec.709.
+pub const REC2020_TO_REC709: [[f64; 3]; 3] = [
+    [1.660_491_002_3, -0.587_641_138_9, -0.072_849_863_3],
+    [-0.124_550_474_6, 1.132_899_897_1, -0.008_349_422_6],
+    [-0.018_150_763_4, -0.100_578_898_0, 1.118_729_661_4],
+];
+
+/// Luminance weights of linear Rec.2020.
+pub const REC2020_LUMINANCE: [f64; 3] = [0.262_700_212_0, 0.677_998_071_5, 0.059_301_716_5];
+
 /// Luminous efficacy of the CIE photopic curve's peak, lm/W.
 pub const LUMINOUS_EFFICACY: f64 = 683.0;
 
