@@ -8,11 +8,15 @@ use orr_dlss::Uuid;
 use orr_dlss::raw::{self, Image};
 use std::ffi::{CStr, CString, c_void};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 pub const PROJECT_ID: Uuid = Uuid::from_u128(0x6a3c1e0d_9b2f_4c7a_8e15_3d0f7b9a2c41);
 
 static MESSAGES: AtomicU32 = AtomicU32::new(0);
 static NGX_HAZARDS: AtomicU32 = AtomicU32::new(0);
+
+/// NGX state is process-wide and not thread-safe: one `Gpu`, and so one test, at a time.
+static TURN: Mutex<()> = Mutex::new(());
 
 unsafe extern "system" fn on_message(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
@@ -48,7 +52,6 @@ unsafe extern "system" fn on_message(
         return vk::FALSE;
     }
     MESSAGES.fetch_add(1, Ordering::Relaxed);
-    log::error!("[{severity:?}] {id}: {}", text(data.p_message));
     #[allow(clippy::print_stderr)]
     {
         eprintln!("validation [{severity:?}] {id}: {}", text(data.p_message));
@@ -81,11 +84,13 @@ pub struct Gpu {
     pub cmd: vk::CommandBuffer,
     images: Vec<(vk::Image, vk::ImageView, vk::DeviceMemory)>,
     buffers: Vec<Buffer>,
+    _turn: MutexGuard<'static, ()>,
 }
 
 impl Gpu {
     /// A device on the first discrete GPU with NGX's extensions when `ngx` is set.
     pub fn new(ngx: bool) -> Gpu {
+        let turn = TURN.lock().unwrap_or_else(PoisonError::into_inner);
         // SAFETY: test setup; every create call gets valid infos, and the objects are
         // destroyed in `Drop`.
         unsafe {
@@ -236,6 +241,7 @@ impl Gpu {
                 cmd,
                 images: Vec::new(),
                 buffers: Vec::new(),
+                _turn: turn,
             };
             // Heaps hold only their reserved ranges: binding them is what the tests need.
             let reserved = align_up(
