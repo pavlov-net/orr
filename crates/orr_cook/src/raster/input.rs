@@ -60,11 +60,15 @@ pub(crate) fn is_tiff(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
 }
 
-fn tiff_error(path: &Path, e: TiffError) -> Error {
+fn import_error(path: &Path, message: String) -> Error {
     Error::Import {
         asset: path.display().to_string(),
-        message: format!("TIFF: {e}"),
+        message,
     }
+}
+
+fn tiff_error(path: &Path, e: TiffError) -> Error {
+    import_error(path, format!("TIFF: {e}"))
 }
 
 /// Input format of a TIFF image: 8-bit gray, gray-alpha, RGB and RGBA, 16-bit gray and
@@ -116,10 +120,7 @@ pub(crate) struct TiffTile {
 }
 
 pub(crate) fn decode_tiff(path: &Path, bytes: &[u8]) -> Result<TiffTile> {
-    let fail = |m: String| Error::Import {
-        asset: path.display().to_string(),
-        message: m,
-    };
+    let fail = |m| import_error(path, m);
     let mut d = Decoder::new(Cursor::new(bytes))
         .map_err(|e| tiff_error(path, e))?
         .with_limits(Limits::unlimited());
@@ -165,10 +166,7 @@ impl WholeRaster {
     pub(crate) fn open(path: &Path, sidecar: Option<&Sidecar>) -> Result<Self> {
         let file = File::open(path).map_err(|e| read_error(path, e))?;
         let file = BufReader::with_capacity(1 << 20, file);
-        let fail = |m: String| Error::Import {
-            asset: path.display().to_string(),
-            message: m,
-        };
+        let fail = |m| import_error(path, m);
         let (w, h, format, source) = match sidecar {
             Some(s) => (
                 s.width,
@@ -266,10 +264,7 @@ impl WholeRaster {
                     let (dw, dh) = (dw as usize, dh as usize);
                     let bytes =
                         result_bytes(decoder.read_chunk(index).map_err(|e| tiff_error(path, e))?)
-                            .map_err(|m| Error::Import {
-                            asset: path.display().to_string(),
-                            message: m,
-                        })?;
+                            .map_err(|m| import_error(path, m))?;
                     let stride = bytes.len() / dh.max(1);
                     let x0 = (col * *cw) as usize * bpp;
                     for r in 0..dh.min(rows) {
@@ -352,13 +347,13 @@ impl Level {
             let at = self.offset + (ly * u64::from(self.size) + lo as u64) * bpp as u64;
             read_at(&self.file, &mut row[left * bpp..][..span * bpp], at)
                 .map_err(|e| read_error(&self.path, e))?;
-            let first: Vec<u8> = row[left * bpp..][..bpp].to_vec();
-            for p in row[..left * bpp].chunks_exact_mut(bpp) {
-                p.copy_from_slice(&first);
+            let first = left * bpp;
+            for p in 0..left {
+                row.copy_within(first..first + bpp, p * bpp);
             }
-            let last: Vec<u8> = row[(left + span - 1) * bpp..][..bpp].to_vec();
-            for p in row[(left + span) * bpp..].chunks_exact_mut(bpp) {
-                p.copy_from_slice(&last);
+            let last = (left + span - 1) * bpp;
+            for p in left + span..n {
+                row.copy_within(last..last + bpp, p * bpp);
             }
         }
         Ok(out)
