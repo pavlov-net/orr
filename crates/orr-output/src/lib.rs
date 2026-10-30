@@ -7,6 +7,7 @@ mod encode;
 mod exposure;
 mod gt7;
 mod passes;
+mod ui;
 mod view;
 
 mod shaders {
@@ -26,7 +27,11 @@ pub use exposure::{
 };
 pub use gt7::{GT7_REFERENCE_NITS, GT7_SDR_NITS, Gt7Curve, Gt7Params};
 pub use orr_scene::orr_gpu::{HdrMetadata, OutputFormat, PresentMode};
-pub use passes::{ComposePass, ExposurePass, OutputKernels, OutputRoots, OutputView, TonemapPass};
+pub use passes::{
+    ComposePass, ComposeRoot, ComposeSource, ExposurePass, OutputKernels, OutputRoots, OutputView,
+    TonemapPass,
+};
+pub use ui::UiLayer;
 pub use view::{OutputDebug, ViewOutput};
 
 /// Errors from orr-output.

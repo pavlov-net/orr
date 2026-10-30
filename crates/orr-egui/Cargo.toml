@@ -1,5 +1,20 @@
 [package]
 name = "orr-egui"
+description = "egui painter for orr: draws egui meshes into a UI layer with mesh shaders."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+
+[dependencies]
+orr-gpu.workspace = true
+egui = { version = "0.37", default-features = false, features = ["bytemuck"] }
+orr-shaders.workspace = true
+bytemuck.workspace = true
+
+[build-dependencies]
+orr-shaders = { workspace = true, features = ["build"] }
+
+[lints]
+workspace = true

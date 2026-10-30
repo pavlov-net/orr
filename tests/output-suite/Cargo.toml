@@ -16,6 +16,9 @@ half = "2.7"
 
 [dev-dependencies]
 output-maths = { path = "../output-maths" }
+orr-egui = { path = "../../crates/orr-egui" }
+egui = { version = "0.37", default-features = false, features = ["monochrome_emoji_fonts"] }
+egui_demo_lib = "0.37"
 
 [build-dependencies]
 orr-shaders = { workspace = true, features = ["build"] }
