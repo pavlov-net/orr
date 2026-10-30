@@ -1,0 +1,431 @@
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
+use std::fs::{self, File};
+use std::io::{self, BufWriter, Seek, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::codec::split_planes;
+use crate::format::{HEADER_LEN, Layout, MAGIC, MOUNT_ALIGN, PAGE, codec_byte, hash_blob};
+use crate::{
+    Archive, AssetId, Blob, Chunk, Codec, Entry, Error, FORMAT_VERSION, Filter, Hash32, Header,
+    Result, StrRef,
+};
+
+/// One blob to add.
+#[derive(Copy, Clone, Debug)]
+pub struct BlobIn<'a> {
+    pub bytes: &'a [u8],
+    pub codec: Codec,
+    pub filter: Filter,
+    /// Store the blob in the mount section, resident from mount.
+    pub mount: bool,
+    /// Decoded chunk length: a power of two from 4096 up, or 0 for the default (256 KiB
+    /// chunks for payload blobs over 256 KiB, else one chunk). Mount blobs are one chunk.
+    pub chunk_len: u32,
+}
+
+impl<'a> BlobIn<'a> {
+    /// A zstd payload blob with default chunking.
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            codec: Codec::Zstd,
+            filter: Filter::None,
+            mount: false,
+            chunk_len: 0,
+        }
+    }
+}
+
+/// Where [`ArchiveWriter::finish`] puts the archive.
+#[derive(Clone, Debug)]
+pub enum Target {
+    /// Written to `<path>.tmp`, then renamed over the path.
+    File(PathBuf),
+    /// Returned as bytes; the same bytes a file target would hold.
+    Memory,
+}
+
+const DEFAULT_CHUNK: u32 = 256 << 10;
+
+enum Payload {
+    Memory(Vec<u8>),
+    File {
+        out: BufWriter<File>,
+        scratch: PathBuf,
+        path: PathBuf,
+        len: u64,
+    },
+}
+
+/// Builds an archive. Mount blobs and payload blobs each land in call order, so the same
+/// calls give the same bytes.
+pub struct ArchiveWriter {
+    payload: Option<Payload>,
+    entries: Vec<Entry>,
+    blobs: Vec<Blob>,
+    chunks: Vec<Chunk>,
+    names: String,
+    mount: Vec<u8>,
+    ids: HashSet<AssetId>,
+    /// Blob records by a hash of their decoded bytes and settings, and by a hash of their
+    /// stored bytes and layout.
+    seen: HashMap<Hash32, Blob>,
+    zstd_level: i32,
+}
+
+impl ArchiveWriter {
+    pub fn create(target: Target) -> Result<Self> {
+        let payload = match target {
+            Target::Memory => Payload::Memory(Vec::new()),
+            Target::File(path) => {
+                let scratch = suffixed(&path, ".payload.tmp");
+                let out = BufWriter::with_capacity(
+                    1 << 20,
+                    File::options()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&scratch)?,
+                );
+                Payload::File {
+                    out,
+                    scratch,
+                    path,
+                    len: 0,
+                }
+            }
+        };
+        Ok(Self {
+            payload: Some(payload),
+            entries: Vec::new(),
+            blobs: Vec::new(),
+            chunks: Vec::new(),
+            names: String::new(),
+            mount: Vec::new(),
+            ids: HashSet::new(),
+            seen: HashMap::new(),
+            zstd_level: 19,
+        })
+    }
+
+    /// zstd compression level for blobs added from now on (default 19).
+    pub fn set_zstd_level(&mut self, level: i32) {
+        self.zstd_level = level;
+    }
+
+    /// Adds an asset named `name` and returns its id.
+    pub fn add(
+        &mut self,
+        name: &str,
+        class: u16,
+        schema: u16,
+        cook_key: Hash32,
+        blobs: &[BlobIn],
+    ) -> Result<AssetId> {
+        let mut content = blake3::Hasher::new();
+        for b in blobs {
+            hash_blob(&mut content, b.bytes);
+        }
+        let entry = Entry {
+            id: AssetId::NONE,
+            class,
+            schema,
+            flags: 0,
+            content_hash: Hash32::finish(&content),
+            cook_key,
+            first_blob: 0,
+            blob_count: blobs.len() as u32,
+            name: StrRef::default(),
+            _reserved: [0; 6],
+        };
+        self.insert(name, entry, |w| {
+            for b in blobs {
+                let rec = w.encode(b)?;
+                w.blobs.push(rec);
+            }
+            Ok(())
+        })
+    }
+
+    /// Copies an entry from another archive with its stored bytes as they are.
+    pub fn copy_entry(&mut self, from: &Archive, e: &Entry) -> Result<()> {
+        self.insert(from.name(e), *e, |w| {
+            let mut buf = Vec::new();
+            for b in from.blobs(e) {
+                let stored = match from.stored(b, None) {
+                    Some(s) => s,
+                    None => {
+                        buf.resize(b.stored_len as usize, 0);
+                        from.read_stored(b, &mut buf)?;
+                        &buf
+                    }
+                };
+                let chunks: Vec<u32> = from.chunks(b).iter().map(|c| c.stored_len).collect();
+                let rec = w.place(*b, stored, &chunks, None)?;
+                w.blobs.push(rec);
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// Adds `entry` under `name` with the blob records `push_blobs` appends. On failure the
+    /// entry and its blob records are dropped.
+    fn insert(
+        &mut self,
+        name: &str,
+        entry: Entry,
+        push_blobs: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<AssetId> {
+        let id = AssetId::from_name(name);
+        if id == AssetId::NONE || self.ids.contains(&id) {
+            return Err(Error::Duplicate(name.into()));
+        }
+        let first_blob = self.blobs.len();
+        if let Err(e) = push_blobs(self) {
+            self.blobs.truncate(first_blob);
+            return Err(e);
+        }
+        self.ids.insert(id);
+        self.entries.push(Entry {
+            id,
+            first_blob: first_blob as u32,
+            name: StrRef {
+                offset: self.names.len() as u32,
+                len: name.len() as u32,
+            },
+            ..entry
+        });
+        self.names.push_str(name);
+        Ok(id)
+    }
+
+    fn encode(&mut self, b: &BlobIn) -> Result<Blob> {
+        if b.codec == Codec::GDeflate {
+            return Err(Error::InvalidBlob("GDeflate encoding is not available"));
+        }
+        let raw_len =
+            u32::try_from(b.bytes.len()).map_err(|_| Error::InvalidBlob("blob over 4 GiB"))?;
+        let chunk = match b.chunk_len {
+            _ if b.mount => raw_len.max(1),
+            0 if raw_len > DEFAULT_CHUNK => DEFAULT_CHUNK,
+            0 => raw_len.max(1),
+            c if c.is_power_of_two() && u64::from(c) >= PAGE => c,
+            _ => {
+                return Err(Error::InvalidBlob(
+                    "chunk length is not a power of two from 4096",
+                ));
+            }
+        };
+        if raw_len.div_ceil(chunk) > u32::from(u16::MAX) {
+            return Err(Error::InvalidBlob("more than 65535 chunks"));
+        }
+
+        let mut key = blake3::Hasher::new();
+        key.update(b"raw");
+        key.update(&[b.codec as u8, b.filter as u8, u8::from(b.mount)]);
+        key.update(&chunk.to_le_bytes());
+        key.update(b.bytes);
+        let key = Hash32::finish(&key);
+        if let Some(rec) = self.seen.get(&key) {
+            return Ok(*rec);
+        }
+
+        let mut stored = Vec::new();
+        let mut lens = Vec::new();
+        let mut planes = Vec::new();
+        let raw_chunks: Vec<&[u8]> = if b.bytes.is_empty() {
+            vec![&[]]
+        } else {
+            b.bytes.chunks(chunk as usize).collect()
+        };
+        let (mut codec, mut filter) = (b.codec, b.filter);
+        for c in &raw_chunks {
+            let src = if filter == Filter::BytePlanes4 {
+                split_planes(c, &mut planes);
+                &planes[..]
+            } else {
+                c
+            };
+            let n = stored.len();
+            match codec {
+                Codec::Zstd => stored.extend(zstd::bulk::compress(src, self.zstd_level)?),
+                _ => stored.extend_from_slice(src),
+            }
+            lens.push((stored.len() - n) as u32);
+        }
+        if codec == Codec::Zstd && stored.len() >= b.bytes.len() {
+            (codec, filter) = (Codec::None, Filter::None);
+            stored.clear();
+            stored.extend_from_slice(b.bytes);
+            lens = raw_chunks.iter().map(|c| c.len() as u32).collect();
+        }
+        let rec = Blob {
+            offset: 0,
+            stored_len: 0,
+            raw_len,
+            first_chunk: 0,
+            chunk_count: lens.len() as u16,
+            codec: codec_byte(codec, filter),
+            mount: u8::from(b.mount),
+        };
+        self.place(rec, &stored, &lens, Some(key))
+    }
+
+    /// Stores encoded bytes once and returns the blob record pointing at them.
+    fn place(
+        &mut self,
+        mut rec: Blob,
+        stored: &[u8],
+        chunks: &[u32],
+        raw_key: Option<Hash32>,
+    ) -> Result<Blob> {
+        let mut key = blake3::Hasher::new();
+        key.update(b"stored");
+        key.update(&[rec.codec, rec.mount]);
+        key.update(&rec.raw_len.to_le_bytes());
+        key.update(bytemuck::cast_slice(chunks));
+        key.update(stored);
+        let key = Hash32::finish(&key);
+        if let Some(r) = self.seen.get(&key) {
+            return Ok(*r);
+        }
+        rec.stored_len =
+            u32::try_from(stored.len()).map_err(|_| Error::InvalidBlob("blob over 4 GiB"))?;
+        rec.first_chunk = self.chunks.len() as u32;
+        rec.chunk_count = chunks.len() as u16;
+        self.chunks
+            .extend(chunks.iter().map(|&stored_len| Chunk { stored_len }));
+        rec.offset = if rec.is_mount() {
+            let at = self.mount.len().next_multiple_of(MOUNT_ALIGN);
+            self.mount.resize(at, 0);
+            self.mount.extend_from_slice(stored);
+            at as u64
+        } else {
+            self.write_payload(stored)?
+        };
+        self.seen.insert(key, rec);
+        if let Some(k) = raw_key {
+            self.seen.insert(k, rec);
+        }
+        Ok(rec)
+    }
+
+    /// Appends to the payload and pads it to 4096 bytes; returns the payload-relative offset.
+    fn write_payload(&mut self, bytes: &[u8]) -> Result<u64> {
+        let pad = |n: u64| (n.next_multiple_of(PAGE) - n) as usize;
+        Ok(match self.payload.as_mut().expect("writer is live") {
+            Payload::Memory(v) => {
+                let at = v.len() as u64;
+                v.extend_from_slice(bytes);
+                v.resize(v.len() + pad(v.len() as u64), 0);
+                at
+            }
+            Payload::File { out, len, .. } => {
+                let at = *len;
+                out.write_all(bytes)?;
+                let p = pad(bytes.len() as u64);
+                out.write_all(&[0; PAGE as usize][..p])?;
+                *len += (bytes.len() + p) as u64;
+                at
+            }
+        })
+    }
+
+    /// Writes the index range and completes the archive. A file target is written to
+    /// `<path>.tmp`, synced and renamed over the path; readers that opened the old file with
+    /// delete sharing keep reading the old bytes. Returns the bytes for a memory target.
+    pub fn finish(mut self) -> Result<Option<Arc<[u8]>>> {
+        let l = Layout::new(
+            self.entries.len(),
+            self.blobs.len(),
+            self.chunks.len(),
+            self.names.len(),
+            self.mount.len(),
+        );
+        for b in &mut self.blobs {
+            b.offset += if b.is_mount() {
+                l.mount as u64
+            } else {
+                l.index_len as u64
+            };
+        }
+        self.entries.sort_unstable_by_key(|e| e.id);
+
+        let mut index = vec![0u8; l.index_len];
+        index[l.entries..l.blobs].copy_from_slice(bytemuck::cast_slice(&self.entries));
+        index[l.blobs..l.chunks].copy_from_slice(bytemuck::cast_slice(&self.blobs));
+        index[l.chunks..l.names].copy_from_slice(bytemuck::cast_slice(&self.chunks));
+        index[l.names..l.names + self.names.len()].copy_from_slice(self.names.as_bytes());
+        index[l.mount..l.mount + self.mount.len()].copy_from_slice(&self.mount);
+
+        let payload = self.payload.take().expect("writer is live");
+        let payload_len = match &payload {
+            Payload::Memory(v) => v.len() as u64,
+            Payload::File { len, .. } => *len,
+        };
+        let header = Header {
+            magic: MAGIC,
+            version: FORMAT_VERSION,
+            index_len: l.index_len as u32,
+            file_len: l.index_len as u64 + payload_len,
+            entry_count: self.entries.len() as u32,
+            blob_count: self.blobs.len() as u32,
+            chunk_count: self.chunks.len() as u32,
+            names_len: self.names.len() as u32,
+            mount_offset: l.mount as u32,
+            mount_len: self.mount.len() as u32,
+            toc_hash: Hash32::of(&index[HEADER_LEN..l.mount]),
+            _reserved: [0; 12],
+        };
+        index[..HEADER_LEN].copy_from_slice(bytemuck::bytes_of(&header));
+
+        match payload {
+            Payload::Memory(v) => {
+                index.extend_from_slice(&v);
+                Ok(Some(index.into()))
+            }
+            Payload::File {
+                out, scratch, path, ..
+            } => {
+                let result = write_file(&path, &index, out);
+                let _ = fs::remove_file(&scratch);
+                result.map(|()| None)
+            }
+        }
+    }
+}
+
+impl Drop for ArchiveWriter {
+    fn drop(&mut self) {
+        if let Some(Payload::File { scratch, .. }) = self.payload.take() {
+            let _ = fs::remove_file(scratch);
+        }
+    }
+}
+
+fn write_file(path: &Path, index: &[u8], payload: BufWriter<File>) -> Result<()> {
+    let mut payload = payload
+        .into_inner()
+        .map_err(io::IntoInnerError::into_error)?;
+    payload.rewind()?;
+    let tmp = suffixed(path, ".tmp");
+    let mut out = File::create(&tmp)?;
+    out.write_all(index)?;
+    io::copy(&mut payload, &mut out)?;
+    out.sync_all()?;
+    drop(out);
+    fs::rename(&tmp, path).map_err(|source| Error::Replace {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = OsString::from(path.as_os_str());
+    s.push(suffix);
+    s.into()
+}
