@@ -674,6 +674,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "openpbr_ref"
+version = "0.0.1"
+dependencies = [
+ "cc",
+ "orr_shaders",
+ "shader_math",
+]
+
+[[package]]
 name = "orr"
 version = "0.0.1"
 
@@ -732,6 +741,7 @@ version = "0.0.1"
 name = "orr_output"
 version = "0.0.1"
 dependencies = [
+ "bytemuck",
  "log",
  "orr_scene",
  "raw-window-handle",
@@ -769,6 +779,15 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "output_math"
+version = "0.0.1"
+dependencies = [
+ "cc",
+ "orr_output",
+ "orr_shaders",
 ]
 
 [[package]]
