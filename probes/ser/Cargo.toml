@@ -1,0 +1,12 @@
+[package]
+name = "ser"
+description = "Driver probe: Shader Execution Reordering for a foliage path tracer, ray query vs ray-tracing pipeline traversal."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ash = { git = "https://github.com/ash-rs/ash", rev = "8844f6b4eefb16d08cd73c8f3d340e1ac12deb16" }
+
+# Standalone: excluded from the orr workspace.
+[workspace]

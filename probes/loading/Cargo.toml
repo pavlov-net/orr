@@ -1,0 +1,18 @@
+[package]
+name = "loading"
+description = "Driver probe: the loading path end to end (BAR writes, host image copy, loading-queue builds, queue issues, disk reads, memory decompression) against a concurrent synthetic frame."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ash = { git = "https://github.com/ash-rs/ash", rev = "8844f6b4eefb16d08cd73c8f3d340e1ac12deb16" }
+zstd = "0.13.3"
+gdeflate = "0.4.1"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_System_Ioctl", "Win32_Security"] }
+
+[profile.release]
+debug = 1
+
+# Standalone: excluded from the orr workspace.
+[workspace]

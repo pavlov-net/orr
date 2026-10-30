@@ -1,0 +1,18 @@
+[package]
+name = "ngx-interop"
+description = "Driver probe: NGX ray reconstruction and frame generation on a descriptor-heap device (heap rebind, image layouts, Rec.2020 inputs, depth-of-field guide, exposure history, cost)."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ash = { git = "https://github.com/ash-rs/ash", rev = "8844f6b4eefb16d08cd73c8f3d340e1ac12deb16" }
+
+[build-dependencies]
+bindgen = "0.72.1"
+
+[profile.release]
+debug = 1
+
+# Standalone: excluded from the orr workspace.
+[workspace]

@@ -1,0 +1,46 @@
+[workspace]
+members = ["crates/*"]
+exclude = ["probes"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+repository = "https://github.com/pavlov-net/orr"
+
+[workspace.dependencies]
+orr = { path = "crates/orr" }
+orr-gpu = { path = "crates/orr-gpu" }
+orr-pack = { path = "crates/orr-pack" }
+orr-shaders = { path = "crates/orr-shaders" }
+# crates.io ash is stuck on Vulkan 1.3.281; master carries 1.4 headers
+# with descriptor heap, cluster acceleration structures and cooperative
+# vectors.
+ash = { git = "https://github.com/ash-rs/ash", rev = "8844f6b4eefb16d08cd73c8f3d340e1ac12deb16" }
+raw-window-handle = "0.6"
+thiserror = "2"
+log = "0.4"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_qualifications = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+manual_let_else = "warn"
+semicolon_if_nothing_returned = "warn"
+redundant_closure_for_method_calls = "warn"
+ptr_as_ptr = "warn"
+ptr_cast_constness = "warn"
+ref_as_ptr = "warn"
+cast_lossless = "warn"
+clone_on_ref_ptr = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+
+[profile.dev.package."*"]
+opt-level = 3

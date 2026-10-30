@@ -1,0 +1,14 @@
+[package]
+name = "as-sweeps"
+description = "Driver probe: acceleration-structure sizes, PTLAS build cost and partition sweeps, KHR OMM and LSS with clusters."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ash = { git = "https://github.com/ash-rs/ash", rev = "8844f6b4eefb16d08cd73c8f3d340e1ac12deb16" }
+meshopt = "0.7.0"
+serde_json = "1.0.154"
+
+# Standalone: excluded from the orr workspace.
+[workspace]

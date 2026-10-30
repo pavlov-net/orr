@@ -1,0 +1,12 @@
+[package]
+name = "slang-cpp"
+description = "CI probe: Slang C++ target built with cc and linked into Rust (OpenPBR wrapper and packing), checked against the OpenPBR C++ reference."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[build-dependencies]
+cc = "1.2"
+
+# Standalone: excluded from the orr workspace.
+[workspace]

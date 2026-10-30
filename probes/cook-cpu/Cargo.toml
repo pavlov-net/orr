@@ -1,0 +1,23 @@
+[package]
+name = "cook-cpu"
+description = "CPU probes for the cook: cluster LOD build, mesh codecs, zstd chunking, part locks, ctt, glTF coverage, scatter counts, repeated geometry, replace-rename."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+meshopt = "=0.7.0"
+gltf = { version = "=1.4.1", features = ["extras", "names"] }
+serde_json = "1"
+zstd = "0.14"
+ctt = { version = "=0.6.1", default-features = false, features = ["encoder-bc7enc", "encoder-intel", "encoder-amd", "ispc-prebuilt", "rayon"] }
+image = { version = "0.25", default-features = false, features = ["png", "hdr", "exr"] }
+rayon = "1"
+blake3 = "1"
+bcdec_rs = "=0.2.1"
+
+[profile.release]
+debug = 1
+
+# Standalone: excluded from the orr workspace.
+[workspace]

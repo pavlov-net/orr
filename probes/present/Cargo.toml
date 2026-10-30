@@ -1,0 +1,21 @@
+[package]
+name = "present"
+description = "Driver probe: render-thread budget and the present path (metered frame-generation batches, Reflex attribution, VRR timing, surface formats, HDR metadata)."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ash = { git = "https://github.com/ash-rs/ash", rev = "8844f6b4eefb16d08cd73c8f3d340e1ac12deb16" }
+zstd = "0.13.3"
+tracy-client = { version = "0.18.5", default-features = false, features = ["enable", "ondemand"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Performance", "Win32_System_WindowsProgramming"] }
+
+[build-dependencies]
+bindgen = "0.72.1"
+
+[profile.release]
+debug = 1
+
+# Standalone: excluded from the orr workspace.
+[workspace]
