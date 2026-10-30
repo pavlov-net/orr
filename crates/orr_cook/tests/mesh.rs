@@ -340,7 +340,8 @@ fn check_fixture(scale: f32, translation: [f32; 3]) {
             let foliage = info.sections[s].flags & Section::ALPHA_TESTED != 0;
             assert!(c.tri_count <= 128);
             assert!(c.vertex_count <= if foliage { 256 } else { 128 });
-            assert_eq!(c.alpha_first, if foliage { 0 } else { c.tri_count });
+            // The sheet's constant opacity passes its cutoff, so every triangle is opaque.
+            assert_eq!(c.alpha_first, c.tri_count);
             assert!(c.anchor.iter().all(|&v| v.abs() < 1 << 23));
             let mut local_max = [0; 3];
             for v in 0..u32::from(c.vertex_count) {
@@ -418,8 +419,10 @@ fn corrupt_pages_are_rejected() {
     write_glb(&path, &[&prims[0], &prims[1]], [0.0; 3]);
     let a = cook_memory(&path).unwrap();
     let me = a.find(AssetId::from_name("fixture/mesh")).unwrap();
+    let info = MeshInfo::parse(&read_blob(&a, &a.blobs(me)[0])).unwrap();
     let page = read_blob(&a, &a.blobs(me)[1]);
-    let mut dst = vec![0; page.len()];
+    let mut dst = vec![0; info.pages[0].resident_len as usize];
+    mesh::decode_page(&page, &mut dst).unwrap();
 
     let short = &page[..page.len() - 4];
     assert!(mesh::decode_page(short, &mut dst).is_err());
@@ -430,9 +433,9 @@ fn corrupt_pages_are_rejected() {
     bad[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(mesh::decode_page(&bad, &mut dst).is_err());
 
-    // A triangle corner past its cluster's vertices.
+    // Cluster 0 claims more vertices than its stream holds.
     let mut bad = page.clone();
-    let h: mesh::PageHeader = bytemuck::pod_read_unaligned(&page[..size_of::<mesh::PageHeader>()]);
-    bad[h.tris_offset as usize] = 255;
+    let at = size_of::<mesh::PageHeader>() + std::mem::offset_of!(mesh::Cluster, vertex_count);
+    bad[at..at + 2].copy_from_slice(&300u16.to_le_bytes());
     assert!(mesh::decode_page(&bad, &mut dst).is_err());
 }

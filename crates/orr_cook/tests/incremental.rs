@@ -6,9 +6,9 @@ use std::time::{Duration, SystemTime};
 
 use glam::{DVec3, Quat, Vec3};
 use orr_cook::{
-    ArchiveSpec, AssetSpec, CookOptions, Cooked, DataFormat, GltfSettings, Instances, Manifest,
-    MipFilter, Outcome, Placement, PrototypeSpec, Quality, Source, TextureRules, TextureSettings,
-    Usage,
+    ArchiveSpec, AssetSpec, CookOptions, Cooked, DataFormat, GltfSettings, Instances, LodMode,
+    Manifest, MipFilter, Outcome, Placement, PrototypeSpec, Quality, Source, TextureRules,
+    TextureSettings, Usage,
 };
 use orr_pack::{Archive, AssetId, Class, Target};
 
@@ -402,7 +402,7 @@ cell_log2 = 7
 
 [[archive.asset]]
 name = "quad"
-gltf = { path = "quad.gltf", settings = { textures = { quality = "fast" }, mesh = { position_step_log2 = -10 } } }
+gltf = { path = "quad.gltf", settings = { textures = { quality = "fast" }, mesh = { position_step_log2 = -10, lod = { discrete = { errors = [0.01, 0.1] } }, merge_level = 2 }, models = [{ node = "quad" }], joined = ["quad"], parts_from_attribute = { name = "_ID", parts = 4, by_section = true }, mesh_overrides = [["quad", { max_vertices = 64 }]], material_overrides = [["", { surface = 2, subsurface_radius = 0.01 }]] } }
 
 [[archive.asset]]
 name = "tex"
@@ -421,6 +421,10 @@ name = "scatter"
 [archive.asset.instances]
 prototypes = [{ model = "quad", sections = [{ hidden = true }] }]
 records = [{ position = [1.0, 2.0, 3.0], rotation = [0.0, 0.0, 0.0, 1.0], scale = [1.0, 1.0, 1.0], prototype = 0 }]
+
+[[archive.asset]]
+name = "paint"
+material = { base_color = [0.5, 0.25, 0.125], surface = 4 }
 "#,
     )
     .unwrap();
@@ -435,6 +439,26 @@ records = [{ position = [1.0, 2.0, 3.0], rotation = [0.0, 0.0, 0.0, 1.0], scale 
     assert_eq!(settings.textures.quality, Quality::Fast);
     assert_eq!(settings.mesh.position_step_log2, -10);
     assert_eq!(settings.mesh.max_triangles, 128);
+    assert_eq!(
+        settings.mesh.lod,
+        LodMode::Discrete {
+            errors: vec![0.01, 0.1]
+        }
+    );
+    assert_eq!(settings.mesh.merge_level, Some(2));
+    assert_eq!(settings.models[0].node, "quad");
+    assert_eq!(settings.joined, ["quad"]);
+    let parts = settings.parts_from_attribute.as_ref().unwrap();
+    assert_eq!(
+        (parts.name.as_str(), parts.parts, parts.by_section),
+        ("_ID", 4, true)
+    );
+    assert_eq!(settings.mesh_overrides[0].1.max_vertices, Some(64));
+    let patch = &settings.material_overrides[0].1;
+    assert_eq!(
+        (patch.surface, patch.subsurface_radius),
+        (Some(2), Some(0.01))
+    );
     let Source::Texture { settings, .. } = &a.assets[1].source else {
         panic!("texture");
     };
@@ -458,6 +482,13 @@ records = [{ position = [1.0, 2.0, 3.0], rotation = [0.0, 0.0, 0.0, 1.0], scale 
     };
     assert_eq!(i.records[0].position, DVec3::new(1.0, 2.0, 3.0));
     assert!(i.prototypes[0].sections[0].hidden);
+    let Source::Material(paint) = &a.assets[5].source else {
+        panic!("material");
+    };
+    assert_eq!(
+        (paint.base_color, paint.surface),
+        (Some([0.5, 0.25, 0.125]), Some(4))
+    );
 
     std::fs::write(&path, "[[archive]]\noutput = \"x\"\nbogus = 1\n").unwrap();
     assert!(matches!(

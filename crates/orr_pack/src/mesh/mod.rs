@@ -1,7 +1,8 @@
 //! Mesh class: blob 0 holds a [`MeshHeader`] and its tables ([`MeshInfo`]); every other blob
 //! is one page of whole clusters.
 //!
-//! [`decode_page`] turns a stored page into the resident layout the GPU reads:
+//! A page is stored in the codec form [`encode_page`] writes, and [`decode_page`] turns it
+//! into the resident layout the GPU reads:
 //!
 //! - [`PageHeader`], then `cluster_count` [`Cluster`] records of 128 B.
 //! - Positions at `positions_offset`: u16x3 per vertex, the grid offset from the cluster's
@@ -17,12 +18,16 @@
 //!   first and alpha-tested ones from `alpha_first`, 4-aligned per cluster.
 //! - Opacity micromap data from `omm_offset` to the end of the page.
 
+mod codec;
+
 use bytemuck::{Pod, Zeroable};
+
+pub use codec::{decode_page, encode_page};
 
 use crate::blob::{put_table, read, table};
 use crate::{Aabb, Affine3, Error, Result, Span, Sphere};
 
-pub const SCHEMA: u16 = 1;
+pub const SCHEMA: u16 = 2;
 
 /// Largest resident page.
 pub const PAGE_MAX: usize = 128 << 10;
@@ -282,34 +287,24 @@ pub struct PageLayout {
     pub len: u32,
 }
 
-/// Decodes a stored page (from [`crate::Archive::decode`] or [`crate::Archive::read`]) into
-/// `dst` in the resident layout, after checking that every cluster's ranges lie inside it.
-pub fn decode_page(blob: &[u8], dst: &mut [u8]) -> Result<PageLayout> {
-    let h = check_page(blob)?;
-    let len = h.len as usize;
-    if dst.len() < len {
-        return Err(Error::BufferSize {
-            need: len,
-            have: dst.len(),
-        });
+impl PageLayout {
+    fn of(h: &PageHeader) -> Self {
+        Self {
+            cluster_count: h.cluster_count,
+            positions_offset: h.positions_offset,
+            attrs_offset: h.attrs_offset,
+            attr_stride: h.attr_stride,
+            tris_offset: h.tris_offset,
+            omm_offset: h.omm_offset,
+            len: h.len,
+        }
     }
-    dst[..len].copy_from_slice(&blob[..len]);
-    Ok(PageLayout {
-        cluster_count: h.cluster_count,
-        positions_offset: h.positions_offset,
-        attrs_offset: h.attrs_offset,
-        attr_stride: h.attr_stride,
-        tris_offset: h.tris_offset,
-        omm_offset: h.omm_offset,
-        len: h.len,
-    })
 }
 
-fn check_page(p: &[u8]) -> Result<PageHeader> {
+/// Checks the regions a page header names; returns the vertex slots and the bytes of the
+/// triangle region.
+fn layout(h: &PageHeader) -> Result<(usize, usize)> {
     let bad = |what| Err(Error::Malformed(what));
-    let Some(h) = read::<PageHeader>(p, 0) else {
-        return bad("page shorter than its header");
-    };
     let n = h.cluster_count as usize;
     let regions_ordered = h.positions_offset as usize
         == size_of::<PageHeader>() + n * size_of::<Cluster>()
@@ -317,8 +312,7 @@ fn check_page(p: &[u8]) -> Result<PageHeader> {
         && h.tris_offset >= h.attrs_offset
         && h.omm_offset >= h.tris_offset
         && h.len >= h.omm_offset
-        && h.len as usize == p.len()
-        && p.len() <= PAGE_MAX;
+        && h.len as usize <= PAGE_MAX;
     if !regions_ordered || h.attr_stride < 8 || !h.attr_stride.is_multiple_of(4) {
         return bad("page regions");
     }
@@ -328,24 +322,37 @@ fn check_page(p: &[u8]) -> Result<PageHeader> {
     {
         return bad("page vertex arrays");
     }
-    let tris_len = (h.omm_offset - h.tris_offset) as usize;
-    for i in 0..n {
+    Ok((slots, (h.omm_offset - h.tris_offset) as usize))
+}
+
+fn check_cluster(c: &Cluster, slots: usize, tris_len: usize) -> Result<()> {
+    let (v0, vn) = (c.vertex_first as usize, usize::from(c.vertex_count));
+    let (t0, tn) = (c.tri_first as usize, usize::from(c.tri_count));
+    if !v0.is_multiple_of(2) || v0 + vn > slots || !t0.is_multiple_of(4) || t0 + tn * 3 > tris_len {
+        return Err(Error::Malformed("cluster outside its page"));
+    }
+    if c.alpha_first > c.tri_count {
+        return Err(Error::Malformed("cluster alpha_first"));
+    }
+    Ok(())
+}
+
+/// Checks a resident page: its regions, every cluster's ranges and triangle corners.
+fn check_page(p: &[u8]) -> Result<PageHeader> {
+    let Some(h) = read::<PageHeader>(p, 0) else {
+        return Err(Error::Malformed("page shorter than its header"));
+    };
+    let (slots, tris_len) = layout(&h)?;
+    if h.len as usize != p.len() {
+        return Err(Error::Malformed("page regions"));
+    }
+    for i in 0..h.cluster_count as usize {
         let c: Cluster = read(p, size_of::<PageHeader>() + i * size_of::<Cluster>()).unwrap();
-        let (v0, vn) = (c.vertex_first as usize, usize::from(c.vertex_count));
-        let (t0, tn) = (c.tri_first as usize, usize::from(c.tri_count));
-        if !v0.is_multiple_of(2)
-            || v0 + vn > slots
-            || !t0.is_multiple_of(4)
-            || t0 + tn * 3 > tris_len
-        {
-            return bad("cluster outside its page");
-        }
-        if c.alpha_first > c.tri_count {
-            return bad("cluster alpha_first");
-        }
-        let tris = &p[h.tris_offset as usize + t0..][..tn * 3];
+        check_cluster(&c, slots, tris_len)?;
+        let vn = usize::from(c.vertex_count);
+        let tris = &p[(h.tris_offset + c.tri_first) as usize..][..usize::from(c.tri_count) * 3];
         if tris.iter().any(|&v| usize::from(v) >= vn) {
-            return bad("triangle corner outside its cluster");
+            return Err(Error::Malformed("triangle corner outside its cluster"));
         }
     }
     Ok(h)

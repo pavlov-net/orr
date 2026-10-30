@@ -14,18 +14,28 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
+use glam::{Vec2, Vec3, Vec4};
+
+use orr_pack::material::{Material, slot};
 use orr_pack::model::{ModelHeader, ModelInfo};
+use orr_pack::texture::TextureInfo;
 use orr_pack::{Aabb, Archive, ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span, Target};
 
 use crate::cache::Cache;
 use crate::instances::{self, Catalog, ModelFacts};
 use crate::key::{self, Key, ZSTD_LEVEL};
-use crate::mesh::{self, MeshData};
+use crate::mesh::maps::{Displacement, Opacity, Raster};
+use crate::mesh::{
+    self, DisplacementSpec, MapSpec, MeshData, MeshInput, OpacitySpec, PartData, Pivots,
+    SectionData, SectionMaps,
+};
 use crate::raster::{self, RasterReport};
 use crate::report::{self, ArchiveReport, AssetReport, Outcome};
 use crate::state::{self, Input, Memo, Record};
-use crate::texture::material::{ImageFacts, ImageFile, Packer, TextureJob, image_facts};
-use crate::texture::{self, ENCODERS};
+use crate::texture::material::{
+    ImageFacts, ImageFile, MaterialTextures, Packer, TexRef, TextureJob, image_facts,
+};
+use crate::texture::{self, ENCODERS, Wrap};
 use crate::{
     CookOptions, Cooked, Error, GltfSettings, Instances, Manifest, MeshSettings, Result, Source,
     TextureSettings, mount,
@@ -90,7 +100,9 @@ enum Work<'m> {
         schema: u16,
         blobs: Vec<(Vec<u8>, bool)>,
     },
-    Mesh(Arc<MeshData>, MeshSettings),
+    /// The mesh, its settings and its sections' cooked maps, read from the texture units
+    /// it waits for when it starts.
+    Mesh(Arc<MeshData>, MeshSettings, Vec<SectionMaps>),
     Texture(TextureJob, Arc<Vec<ImageFile>>),
     TextureFile(PathBuf, Hash32, TextureSettings),
     /// A model of the mesh in `deps[0]`, these materials and this skeleton.
@@ -107,7 +119,8 @@ enum State {
     Waiting,
     Running,
     Done(Done),
-    Written,
+    /// Where its entries are, kept while a mesh that reads them has not started.
+    Written(Option<From>),
 }
 
 struct Done {
@@ -161,8 +174,15 @@ struct Imported {
     units: Vec<NewUnit>,
 }
 
-/// A cooked unit: where its entries are, the job's seconds and a raster set's report.
-type UnitResult = (From, f64, Option<RasterReport>);
+/// A cooked unit: where its entries are, the job's seconds and its report details.
+type UnitResult = (From, f64, Detail);
+
+/// What a cooked unit adds to its first entry's report.
+#[derive(Default)]
+struct Detail {
+    raster: Option<RasterReport>,
+    warnings: Vec<String>,
+}
 
 enum Msg {
     Import(usize, std::thread::Result<Result<Imported>>),
@@ -187,14 +207,16 @@ struct Run<'m, 's> {
     imports: Vec<Import<'m>>,
     instances: Vec<(usize, usize, &'m Instances)>,
     assets: Vec<AssetReport>,
-    /// Reports of cooked raster sets, by unit, until written.
-    rasters: HashMap<usize, RasterReport>,
+    /// Report details of cooked units, by unit, until written.
+    details: HashMap<usize, Detail>,
     /// Units whose dependencies are done, largest first; models and shared results apart,
     /// as they finish on the coordinator.
     ready: BTreeSet<(Reverse<u64>, usize)>,
     local: Vec<usize>,
     pending: Vec<usize>,
     dependents: Vec<Vec<usize>>,
+    /// Per unit: mesh units that read its texture and have not started.
+    map_users: Vec<usize>,
     window: u64,
 }
 
@@ -216,11 +238,12 @@ impl<'m, 's> Run<'m, 's> {
             imports: Vec::new(),
             instances: Vec::new(),
             assets: Vec::new(),
-            rasters: HashMap::new(),
+            details: HashMap::new(),
             ready: BTreeSet::new(),
             local: Vec::new(),
             pending: Vec::new(),
             dependents: Vec::new(),
+            map_users: Vec::new(),
             window: 0,
         };
         for (a, spec) in manifest.archives.iter().enumerate() {
@@ -361,6 +384,19 @@ impl<'m, 's> Run<'m, 's> {
                 });
             }
             Source::Instances(src) => self.instances.push((a, index, src)),
+            Source::Mesh {
+                mesh,
+                materials,
+                settings,
+            } => {
+                let units = mesh_units(name, mesh, materials, settings)?;
+                self.add_units(a, index, units);
+            }
+            Source::Material(patch) => {
+                let mut m = Material::default();
+                patch.apply(&mut m);
+                self.add_units(a, index, vec![material_unit(name.into(), &m)]);
+            }
         }
         Ok(())
     }
@@ -568,14 +604,11 @@ impl<'m, 's> Run<'m, 's> {
         }
     }
 
-    fn add_import(&mut self, i: usize, imported: Imported) {
-        let (a, asset, identity) = {
-            let imp = &self.imports[i];
-            (imp.archive, imp.asset, imp.identity)
-        };
+    /// Adds units whose dependencies name units of the same list.
+    fn add_units(&mut self, a: usize, asset: usize, units: Vec<NewUnit>) -> Vec<Hash32> {
         let mut keys = Vec::new();
         let mut deps = Vec::new();
-        for nu in imported.units {
+        for nu in units {
             keys.push(nu.key);
             deps.push(nu.deps);
             self.add(Unit {
@@ -596,6 +629,15 @@ impl<'m, 's> Run<'m, 's> {
         for (u, names) in (first..).zip(deps) {
             self.units[u].deps = names.iter().map(|n| self.by_name[n]).collect();
         }
+        keys
+    }
+
+    fn add_import(&mut self, i: usize, imported: Imported) {
+        let (a, asset, identity) = {
+            let imp = &self.imports[i];
+            (imp.archive, imp.asset, imp.identity)
+        };
+        let keys = self.add_units(a, asset, imported.units);
         for f in &imported.files {
             self.input(a, asset, &f.path);
         }
@@ -706,6 +748,7 @@ impl<'m, 's> Run<'m, 's> {
     fn link_all(&mut self) -> Result<()> {
         self.pending = vec![0; self.units.len()];
         self.dependents = vec![Vec::new(); self.units.len()];
+        self.map_users = vec![0; self.units.len()];
         for u in 0..self.units.len() {
             if !matches!(self.units[u].state, State::Waiting) {
                 continue;
@@ -733,6 +776,11 @@ impl<'m, 's> Run<'m, 's> {
         for u in 0..self.units.len() {
             if !matches!(self.units[u].state, State::Waiting) {
                 continue;
+            }
+            if let Some(Work::Mesh(data, ..)) = &self.units[u].work {
+                for unit in data.sections.iter().flat_map(|s| s.maps.units()) {
+                    self.map_users[self.by_name[unit]] += 1;
+                }
             }
             let deps = self.units[u].deps.clone();
             for d in deps {
@@ -841,10 +889,8 @@ impl<'m, 's> Run<'m, 's> {
             };
             running -= 1;
             bytes -= self.units[u].working_set;
-            let (from, seconds, raster) = r.unwrap_or_else(|p| resume_unwind(p))?;
-            if let Some(report) = raster {
-                self.rasters.insert(u, report);
-            }
+            let (from, seconds, detail) = r.unwrap_or_else(|p| resume_unwind(p))?;
+            self.details.insert(u, detail);
             self.done(u, from, None, Outcome::Cooked, seconds)?;
         }
     }
@@ -861,6 +907,62 @@ impl<'m, 's> Run<'m, 's> {
         }
     }
 
+    /// The cooked maps a mesh unit's sections read, from the texture units it waited for.
+    fn section_maps(&mut self, u: usize, mesh: &MeshData) -> Result<Vec<SectionMaps>> {
+        let a = self.units[u].archive;
+        let mut users = Vec::new();
+        let mut read = |unit: &str, all: bool, wrap| -> Result<Vec<Raster>> {
+            let t = self.by_name[unit];
+            users.push(t);
+            let from = match &self.units[t].state {
+                State::Done(d) => &d.from,
+                State::Written(Some(f)) => f,
+                _ => unreachable!("a mesh starts after the textures it reads"),
+            };
+            self.with_archive(a, from, |arc| {
+                texture_mips(arc, AssetId::from_name(unit), all, wrap)
+            })?
+        };
+        let mut out = Vec::with_capacity(mesh.sections.len());
+        for s in &mesh.sections {
+            let opacity = match &s.maps.opacity {
+                OpacitySpec::None => None,
+                OpacitySpec::Constant(pass) => Some(Opacity::Constant(*pass)),
+                OpacitySpec::Unknown => Some(Opacity::Unknown),
+                OpacitySpec::Texture {
+                    unit, cutoff, wrap, ..
+                } => Some(Opacity::Texture {
+                    mip0: read(unit, false, *wrap)?.remove(0),
+                    cutoff: *cutoff,
+                }),
+            };
+            let displacement = match &s.maps.displacement {
+                None => None,
+                Some(d) => Some(Displacement {
+                    scale: d.scale,
+                    offset: d.offset,
+                    min: d.min,
+                    max: d.max,
+                    mips: match &d.texture {
+                        Some((unit, _, wrap)) => read(unit, true, *wrap)?,
+                        None => Vec::new(),
+                    },
+                }),
+            };
+            out.push(SectionMaps {
+                opacity,
+                displacement,
+            });
+        }
+        for t in users {
+            self.map_users[t] -= 1;
+            if self.map_users[t] == 0 && matches!(self.units[t].state, State::Written(_)) {
+                self.units[t].state = State::Written(None);
+            }
+        }
+        Ok(out)
+    }
+
     fn spawn(&mut self, scope: &rayon::Scope<'m>, tx: &mpsc::Sender<Msg>, u: usize)
     where
         's: 'm,
@@ -873,6 +975,16 @@ impl<'m, 's> Run<'m, 's> {
                 }
             }
         }
+        if let Work::Mesh(data, _, maps) = &mut work {
+            match self.section_maps(u, data) {
+                Ok(m) => *maps = m,
+                Err(e) => {
+                    let _ = tx.send(Msg::Unit(u, Ok(Err(e))));
+                    self.units[u].state = State::Running;
+                    return;
+                }
+            }
+        }
         self.units[u].state = State::Running;
         let unit = &self.units[u];
         let (name, class, key) = (unit.name.clone(), unit.class, unit.key);
@@ -880,8 +992,8 @@ impl<'m, 's> Run<'m, 's> {
         scope.spawn(move |_| {
             let r = catch_unwind(AssertUnwindSafe(|| {
                 let start = Instant::now();
-                let (from, raster) = cook_unit(shared, &name, class, key, work)?;
-                Ok((from, start.elapsed().as_secs_f64(), raster))
+                let (from, detail) = cook_unit(shared, &name, class, key, work)?;
+                Ok((from, start.elapsed().as_secs_f64(), detail))
             }));
             let _ = tx.send(Msg::Unit(u, r));
         });
@@ -940,10 +1052,14 @@ impl<'m, 's> Run<'m, 's> {
                 if !matches!(self.units[u].state, State::Done(_)) {
                     break;
                 }
-                let State::Done(d) = std::mem::replace(&mut self.units[u].state, State::Written)
+                let State::Done(d) =
+                    std::mem::replace(&mut self.units[u].state, State::Written(None))
                 else {
                     unreachable!("checked above");
                 };
+                if self.map_users[u] > 0 {
+                    self.units[u].state = State::Written(Some(d.from.clone()));
+                }
                 let unit = &self.units[u];
                 let (asset, working_set, triangles) =
                     (unit.asset, unit.working_set, unit.triangles);
@@ -973,8 +1089,9 @@ impl<'m, 's> Run<'m, 's> {
                     From::Old => write(old.expect("linked from the old archive"))?,
                     From::Cache(path) => write(&Archive::open(path)?)?,
                 }
-                if let (Some(r), Some(first)) = (self.rasters.remove(&u), reports.first_mut()) {
-                    first.raster = Some(r);
+                if let (Some(d), Some(first)) = (self.details.remove(&u), reports.first_mut()) {
+                    first.raster = d.raster;
+                    first.warnings = d.warnings;
                 }
                 self.assets[asset].entries.extend(reports);
                 self.window -= d.memory;
@@ -1064,10 +1181,10 @@ fn texture_file_working_set(path: &Path) -> u64 {
         )
 }
 
-/// Imports a glTF file and plans its units: the mesh, the packed textures, the materials,
-/// the skeleton and clips, and the model.
+/// Imports a glTF file and plans its units: the skeleton and clips, the packed textures, the
+/// materials, and a mesh and a model per model.
 fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) -> Result<Imported> {
-    let mut src = crate::gltf::import(name, path, memo, &settings.clips)?;
+    let mut src = crate::gltf::import(name, path, memo, settings)?;
     let mut units = Vec::new();
     let mut skeleton = (AssetId::NONE, None);
     if let Some(info) = src.skeleton.take() {
@@ -1112,61 +1229,60 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
         }
     }
 
-    let mesh_name = format!("{name}/mesh");
-    let mesh_key = Key::new(Class::Mesh, &mesh_name)
-        .debug(&settings.mesh)
-        .hash(src.mesh.hash())
-        .finish();
-
     let mut used: Vec<usize> = src
         .materials
         .iter()
-        .flat_map(|(_, _, t)| {
-            [
-                t.base_color,
-                t.metal_rough,
-                t.normal.map(|n| n.0),
-                t.occlusion.map(|o| o.0),
-                t.emissive,
-            ]
-        })
-        .flatten()
-        .map(|r| r.image)
+        .flat_map(|m| m.textures.refs().map(|r| r.image))
         .collect();
     used.sort_unstable();
     used.dedup();
     let facts: HashMap<usize, ImageFacts> = image_facts(name, &src.images, &used)?;
     let mut packer = Packer::new(name, &src.images, &facts, &settings.textures);
+    // Per material: its id, key and cooked parameters.
     let mut materials = Vec::new();
-    let mut model_key = Key::new(Class::Model, name).hash(mesh_key);
-    if let Some(key) = skeleton.1 {
-        model_key = model_key.hash(key);
-    }
-    for (suffix, m, textures) in &src.materials {
-        let mut m = *m;
-        packer.material(suffix, &mut m, textures)?;
-        let material_name = format!("{name}/material/{suffix}");
-        let bytes = bytemuck::bytes_of(&m).to_vec();
-        let key = Key::new(Class::Material, &material_name)
-            .bytes(&bytes)
-            .finish();
-        model_key = model_key.hash(key);
-        materials.push(AssetId::from_name(&material_name));
-        units.push(NewUnit {
-            name: material_name,
-            class: Class::Material as u16,
-            key,
-            working_set: bytes.len() as u64,
-            triangles: 0,
-            work: Work::Blobs {
-                schema: orr_pack::material::SCHEMA,
-                blobs: vec![(bytes, true)],
-            },
-            deps: Vec::new(),
-        });
+    for m in &src.materials {
+        let mut cooked = m.material;
+        packer.material(&m.suffix, &mut cooked, &m.textures)?;
+        let unit = material_unit(format!("{name}/material/{}", m.suffix), &cooked);
+        materials.push((AssetId::from_name(&unit.name), unit.key, cooked));
+        units.push(unit);
     }
     let jobs = std::mem::take(&mut packer.jobs);
     drop(packer);
+    let textures: HashMap<AssetId, (String, Hash32)> = jobs
+        .iter()
+        .map(|j| (AssetId::from_name(&j.name), (j.name.clone(), j.key)))
+        .collect();
+
+    for model in src.models {
+        let (model_name, mesh_name) = match &model.node {
+            None => (name.to_string(), format!("{name}/mesh")),
+            Some(n) => (format!("{name}/{n}"), format!("{name}/{n}/mesh")),
+        };
+        let mut mesh = model.mesh;
+        let mut deps = Vec::new();
+        for (sec, &mi) in mesh.sections.iter_mut().zip(&model.materials) {
+            let t = &src.materials[mi].textures;
+            sec.maps = map_spec(&materials[mi].2, t, &textures);
+            deps.extend(sec.maps.units().map(str::to_string));
+        }
+        deps.sort_unstable();
+        deps.dedup();
+        let model_materials: Vec<_> = model
+            .materials
+            .iter()
+            .map(|&mi| (materials[mi].0, materials[mi].1))
+            .collect();
+        units.extend(mesh_and_model(
+            model_name,
+            mesh_name,
+            mesh,
+            model.settings,
+            deps,
+            &model_materials,
+            skeleton,
+        ));
+    }
     let images = Arc::new(src.images);
     for job in jobs {
         units.push(NewUnit {
@@ -1179,29 +1295,222 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
             deps: Vec::new(),
         });
     }
-    let triangles = src.mesh.triangles();
-    units.push(NewUnit {
-        name: mesh_name.clone(),
-        class: Class::Mesh as u16,
-        key: mesh_key,
-        working_set: triangles * MESH_BYTES_PER_TRIANGLE,
-        triangles,
-        work: Work::Mesh(Arc::new(src.mesh), settings.mesh.clone()),
-        deps: Vec::new(),
-    });
-    units.push(NewUnit {
-        name: name.into(),
-        class: Class::Model as u16,
-        key: model_key.finish(),
-        working_set: 0,
-        triangles: 0,
-        work: Work::Model(materials, skeleton.0),
-        deps: vec![mesh_name],
-    });
     Ok(Imported {
         files: src.files,
         units,
     })
+}
+
+/// A material entry holding `m`.
+fn material_unit(name: String, m: &Material) -> NewUnit {
+    let bytes = bytemuck::bytes_of(m).to_vec();
+    NewUnit {
+        key: Key::new(Class::Material, &name).bytes(&bytes).finish(),
+        name,
+        class: Class::Material as u16,
+        working_set: bytes.len() as u64,
+        triangles: 0,
+        work: Work::Blobs {
+            schema: orr_pack::material::SCHEMA,
+            blobs: vec![(bytes, true)],
+        },
+        deps: Vec::new(),
+    }
+}
+
+/// The cooked textures a section with material `m` reads at mesh cook time.
+fn map_spec(
+    m: &Material,
+    t: &MaterialTextures,
+    textures: &HashMap<AssetId, (String, Hash32)>,
+) -> MapSpec {
+    let bound = |s: usize| {
+        let b = m.textures[s];
+        (b.texture != AssetId::NONE).then(|| (textures.get(&b.texture), b.uv_set))
+    };
+    let wrap = |r: Option<&TexRef>| r.map_or([Wrap::Repeat; 2], |r| r.wrap);
+    let opacity = match (m.alpha_mode, bound(slot::OPACITY)) {
+        (Material::MASK, None) => OpacitySpec::Constant(m.geometry_opacity >= m.alpha_cutoff),
+        (Material::MASK, Some((Some((unit, key)), 0))) => OpacitySpec::Texture {
+            unit: unit.clone(),
+            key: *key,
+            cutoff: m.alpha_cutoff,
+            wrap: wrap(t.base_color.as_ref()),
+        },
+        (Material::MASK, Some(_)) => OpacitySpec::Unknown,
+        _ => OpacitySpec::None,
+    };
+    let displacement = bound(slot::DISPLACEMENT).map(|b| DisplacementSpec {
+        scale: m.displacement_scale,
+        offset: m.displacement_offset,
+        min: m.displacement_min,
+        max: m.displacement_max,
+        texture: match b {
+            (Some((unit, key)), 0) => Some((unit.clone(), *key, wrap(t.displacement.as_ref()))),
+            _ => None,
+        },
+    });
+    MapSpec {
+        opacity,
+        displacement,
+    }
+}
+
+/// A mesh, its materials and a model from a library caller's mesh.
+fn mesh_units(
+    name: &str,
+    input: &MeshInput,
+    materials: &[Material],
+    settings: &MeshSettings,
+) -> Result<Vec<NewUnit>> {
+    let fail = |message: String| Error::Mesh {
+        asset: name.into(),
+        message,
+    };
+    if materials.len() != input.sections.len() {
+        return Err(fail(format!(
+            "{} materials for {} sections",
+            materials.len(),
+            input.sections.len()
+        )));
+    }
+    let mut units = Vec::new();
+    let mesh_name = format!("{name}/mesh");
+    let mut sections = Vec::new();
+    let mut materials_out = Vec::new();
+    for (i, (m, span)) in materials.iter().zip(&input.sections).enumerate() {
+        let unit = material_unit(format!("{name}/material/{i}"), m);
+        materials_out.push((AssetId::from_name(&unit.name), unit.key));
+        units.push(unit);
+        let first = span.first as usize;
+        sections.push(SectionData::new(
+            first..first + span.count as usize,
+            m,
+            map_spec(m, &MaterialTextures::default(), &HashMap::new()),
+        ));
+    }
+    let n = input.positions.len();
+    let mesh = MeshData {
+        positions: input.positions.iter().map(Vec3::to_array).collect(),
+        normals: input.normals.iter().map(Vec3::to_array).collect(),
+        tangents: input
+            .tangents
+            .as_ref()
+            .map(|t| t.iter().map(Vec4::to_array).collect()),
+        uvs: input.uvs.as_ref().map_or_else(
+            || vec![[0.0; 2]; n],
+            |u| u.iter().map(Vec2::to_array).collect(),
+        ),
+        indices: input.indices.clone(),
+        sections,
+        skin: None,
+        parts: input.parts.as_ref().map(|p| PartData {
+            values: p.values.clone(),
+            count: p.count,
+            by_section: p.by_section,
+            pivots: p.pivots.as_ref().map_or(Pivots::Origin, |v| {
+                Pivots::PerVertex(v.iter().map(Vec3::to_array).collect())
+            }),
+            joints: None,
+        }),
+        min_exponent: None,
+    };
+    units.extend(mesh_and_model(
+        name.into(),
+        mesh_name,
+        mesh,
+        settings.clone(),
+        Vec::new(),
+        &materials_out,
+        (AssetId::NONE, None),
+    ));
+    Ok(units)
+}
+
+/// A mesh unit and the model unit of that mesh with these materials (id and key) and
+/// skeleton (id and key).
+fn mesh_and_model(
+    model_name: String,
+    mesh_name: String,
+    mesh: MeshData,
+    settings: MeshSettings,
+    deps: Vec<String>,
+    materials: &[(AssetId, Hash32)],
+    skeleton: (AssetId, Option<Hash32>),
+) -> [NewUnit; 2] {
+    let mesh_key = Key::new(Class::Mesh, &mesh_name)
+        .debug(&settings)
+        .hash(mesh.hash())
+        .finish();
+    let mut model_key = Key::new(Class::Model, &model_name).hash(mesh_key);
+    if let Some(key) = skeleton.1 {
+        model_key = model_key.hash(key);
+    }
+    for m in materials {
+        model_key = model_key.hash(m.1);
+    }
+    let triangles = mesh.triangles();
+    [
+        NewUnit {
+            name: mesh_name.clone(),
+            class: Class::Mesh as u16,
+            key: mesh_key,
+            working_set: triangles * MESH_BYTES_PER_TRIANGLE,
+            triangles,
+            work: Work::Mesh(Arc::new(mesh), settings, Vec::new()),
+            deps,
+        },
+        NewUnit {
+            name: model_name,
+            class: Class::Model as u16,
+            key: model_key.finish(),
+            working_set: 0,
+            triangles: 0,
+            work: Work::Model(materials.iter().map(|m| m.0).collect(), skeleton.0),
+            deps: vec![mesh_name],
+        },
+    ]
+}
+
+/// One channel of every mip (all of them, or mip 0 only) of a cooked texture entry.
+fn texture_mips(arc: &Archive, id: AssetId, all: bool, wrap: [Wrap; 2]) -> Result<Vec<Raster>> {
+    let e = arc.expect(id, Class::Texture as u16, orr_pack::texture::SCHEMA)?;
+    let blobs = arc.blobs(e);
+    let mut head = vec![0; blobs[0].raw_len as usize];
+    arc.read(&blobs[0], &mut head)?;
+    let info = TextureInfo::parse(&head)?;
+    let h = info.header;
+    let mips = if all { u32::from(h.mip_count) } else { 1 };
+    let mut out = Vec::with_capacity(mips as usize);
+    let mut blob = (usize::MAX, Vec::new());
+    for mip in 0..mips {
+        let b = h.mip_blob(mip);
+        if blob.0 != b {
+            blob = (b, vec![0; blobs[b].raw_len as usize]);
+            arc.read(&blobs[b], &mut blob.1)?;
+        }
+        let bytes = info.mip_texels(&blob.1, mip, 0)?;
+        let [w, hh] = h.mip_size(mip);
+        let texels = match h.vk_format {
+            orr_pack::texture::vk::R16_UNORM => bytes
+                .chunks_exact(2)
+                .map(|c| f32::from(u16::from_le_bytes([c[0], c[1]])) / 65535.0)
+                .collect(),
+            f => texture::decode_blocks(f, w, hh, &bytes)
+                .map_err(|_| orr_pack::Error::Malformed("texture format the mesh cook reads"))?
+                .px
+                .iter()
+                .map(|p| p[0])
+                .collect(),
+        };
+        out.push(Raster {
+            w,
+            h: hh,
+            texels,
+            wrap,
+        });
+    }
+    Ok(out)
 }
 
 /// Cooks one unit into a one-unit archive: in the cache when there is one, else in memory.
@@ -1211,8 +1520,8 @@ fn cook_unit(
     class: u16,
     key: Hash32,
     work: Work<'_>,
-) -> Result<(From, Option<RasterReport>)> {
-    let mut detail = None;
+) -> Result<(From, Detail)> {
+    let mut detail = Detail::default();
     let path = shared.cache.as_ref().map(|c| c.path(key));
     let mut w = ArchiveWriter::create(path.clone().map_or(Target::Memory, Target::File))?;
     w.set_zstd_level(ZSTD_LEVEL);
@@ -1224,9 +1533,10 @@ fn cook_unit(
                 .collect();
             w.add(name, class, schema, key, &blobs)?;
         }
-        Work::Mesh(data, settings) => {
-            let cooked = mesh::cook(name, &data, &settings)?;
-            drop(data);
+        Work::Mesh(data, settings, maps) => {
+            let cooked = mesh::cook(name, &data, &settings, &maps)?;
+            drop((data, maps));
+            detail.warnings = cooked.warnings;
             let info = cooked.info.to_bytes();
             let pinned = cooked.info.header.pinned_pages as usize;
             let mut blobs = vec![mount(&info)];
@@ -1252,7 +1562,7 @@ fn cook_unit(
         }
         Work::Raster(plan) => {
             let scratch = raster::scratch_dir(shared.cache.as_ref().map(Cache::dir));
-            detail = Some(raster::cook(&mut w, name, key, &plan, &scratch)?);
+            detail.raster = Some(raster::cook(&mut w, name, key, &plan, &scratch)?);
         }
     }
     let from = match (w.finish()?, path) {

@@ -177,6 +177,15 @@ impl Skeleton {
         }))
     }
 
+    /// Bind-space position of skeleton joint `j`.
+    pub(crate) fn bind_origin(&self, j: u16) -> [f32; 3] {
+        self.inverse_binds[usize::from(j)]
+            .inverse()
+            .w_axis
+            .truncate()
+            .to_array()
+    }
+
     /// Skeleton joint of each joint of glTF skin `s`.
     pub(crate) fn skin_joints(&self, s: usize) -> &[u16] {
         &self.skins[&s]

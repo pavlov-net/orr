@@ -7,16 +7,21 @@
 //! - `N`: a model binding the mesh to one material per section,
 //! - `N/mesh`: every triangle primitive of the default scene, one section per glTF material:
 //!   with node transforms applied, or with skins in bind space with joints and weights,
+//! - with [`GltfSettings::models`], instead of those two, `N/<node>` and `N/<node>/mesh` per
+//!   selected node, in the node's space,
 //! - `N/skeleton`, with skins: their joints and the joints' ancestors,
 //! - `N/clip/<animation>`: each animation that moves the skeleton, resampled at
 //!   [`ClipSettings`]; an animation without a unique name that is not all digits is
 //!   named by its glTF animation index,
 //! - `N/material/<i>`: glTF material `i`, or `N/material/default` for primitives without one,
 //! - `N/texture/<material>/<role>`: the material's textures (roles `base_color`, `opacity`,
-//!   `normal`, `roughness`, `metalness`, `roughness_metalness`, `occlusion`, `emission`);
+//!   `normal`, `roughness`, `metalness`, `roughness_metalness`, `occlusion`, `emission`,
+//!   `subsurface_color`, `specular_weight`, `coat`, `transmission`, `displacement`);
 //!   materials that would cook the same texture share the first one's entry.
 //!
-//! A texture source emits one texture `N`.
+//! A mesh source emits the model `N`, its mesh `N/mesh` and its materials
+//! `N/material/<section>`. A material source emits one material `N`. A texture source emits
+//! one texture `N`.
 //!
 //! A raster source emits one raster set `N`: a tiled LOD pyramid per layer, built by the
 //! cook from a whole raster or imported from producer tiles ([`RasterSet`]).
@@ -43,6 +48,7 @@ mod instances;
 mod key;
 mod manifest;
 mod mesh;
+mod patch;
 mod raster;
 mod report;
 mod run;
@@ -56,14 +62,17 @@ use std::sync::Arc;
 use orr_pack::{BlobIn, Target};
 use serde::Deserialize;
 
+pub use gltf::{NodeSelect, PartAttribute};
 pub use instances::{Instances, Placement, PrototypeSpec, SectionSpec};
-pub use mesh::MeshSettings;
+pub use mesh::{LodMode, MeshInput, MeshParts, MeshSettings};
+pub use patch::{MaterialPatch, MeshPatch};
 pub use raster::{
     RasterCompression, RasterFormat, RasterInput, RasterLayerReport, RasterLayerSpec, RasterReport,
     RasterSet, Reduction,
 };
 pub use report::{
-    ArchiveReport, AssetReport, CookReport, EntryReport, MeshReport, Outcome, TextureReport,
+    ArchiveReport, AssetReport, CookReport, EntryReport, LevelReport, MeshReport, Outcome,
+    TextureReport,
 };
 pub use skin::ClipSettings;
 pub use texture::material::{TextureOverride, TextureRules};
@@ -130,8 +139,20 @@ pub enum Source {
     Instances(Instances),
     /// Raster layers tiled into one raster set.
     Raster(RasterSet),
-    /// Opaque bytes of a consumer class (at least [`Class::USER_FIRST`]), stored as one
-    /// payload blob. `version` changes the cook key only.
+    /// A mesh built in memory, one material per section; library callers only. Alpha-tested
+    /// sections with an opacity texture keep every triangle alpha-tested, and displaced
+    /// sections bound their clusters by the declared range, since the cook does not read
+    /// the bound textures.
+    #[serde(skip)]
+    Mesh {
+        mesh: MeshInput,
+        materials: Vec<orr_pack::material::Material>,
+        settings: MeshSettings,
+    },
+    /// A material: the OpenPBR defaults with these fields set.
+    Material(MaterialPatch),
+    /// Opaque bytes of a consumer class (at least [`orr_pack::Class::USER_FIRST`]), stored as
+    /// one payload blob. `version` changes the cook key only.
     User {
         class: u16,
         schema: u16,
@@ -143,8 +164,21 @@ pub enum Source {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GltfSettings {
+    /// Nodes that become models; empty makes the whole scene one model.
+    pub models: Vec<NodeSelect>,
     pub mesh: MeshSettings,
+    /// Applied in order to the mesh of every model whose node name contains the pattern.
+    /// The whole-scene model has an empty name, so only an empty pattern reaches it.
+    pub mesh_overrides: Vec<(String, MeshPatch)>,
     pub textures: TextureRules,
+    /// Applied in order to every material whose glTF name contains the pattern, before its
+    /// textures are cooked.
+    pub material_overrides: Vec<(String, MaterialPatch)>,
+    /// Rigid parts from a per-vertex attribute.
+    pub parts_from_attribute: Option<PartAttribute>,
+    /// Patterns of selected models that join crack-free: they share one grid step and
+    /// their nodes must keep them on it.
+    pub joined: Vec<String>,
     pub clips: ClipSettings,
 }
 
