@@ -96,11 +96,11 @@ fn main() {
     let mut frame = 0u64;
     while window.pump() && start.elapsed() < Duration::from_secs(seconds) {
         frame += 1;
-        let mut list = render.command_list().unwrap();
         let Some(mut f) = display.begin_frame(frame).unwrap() else {
             std::thread::sleep(Duration::from_millis(10));
             continue;
         };
+        let mut list = render.command_list().unwrap();
         let (resolved, extent, wait_for) = (f.display, f.extent, f.wait);
         if logged != Some(resolved) {
             log::info!("{resolved:?}; feed {:?}", feed.latest().1);
@@ -214,7 +214,6 @@ fn main() {
         painter
             .paint(&mut list, frame, layer, &primitives, pixels_per_point)
             .unwrap();
-        list.barrier(Stages::COLOR_OUT, Stages::ALL, Hazards::empty());
 
         let point = render.submit(vec![list], wait_for.as_slice()).unwrap();
         display.present(point).unwrap();
