@@ -14,7 +14,8 @@ type Result_ = sys::SlangResult;
 
 #[repr(C)]
 struct UnknownVtbl {
-    query_interface: usize,
+    query_interface:
+        unsafe extern "system" fn(*mut c_void, *const sys::SlangUUID, *mut *mut c_void) -> Result_,
     add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
     release: unsafe extern "system" fn(*mut c_void) -> u32,
 }
@@ -106,6 +107,34 @@ struct ComponentTypeVtbl {
 }
 
 #[repr(C)]
+struct ComponentType2Vtbl {
+    unknown: UnknownVtbl,
+    get_target_compile_result: unsafe extern "system" fn(
+        *mut c_void,
+        sys::SlangInt,
+        *mut *mut c_void,
+        *mut *mut c_void,
+    ) -> Result_,
+}
+
+/// `IComponentType2`'s interface id.
+const COMPONENT_TYPE2: sys::SlangUUID = sys::SlangUUID {
+    data1: 0x9c2a_4b3d,
+    data2: 0x7f68,
+    data3: 0x4e91,
+    data4: [0xa5, 0x2c, 0x8b, 0x19, 0x3e, 0x45, 0x7a, 0x9f],
+};
+
+#[repr(C)]
+struct CompileResultVtbl {
+    unknown: UnknownVtbl,
+    // castAs
+    _unused0: usize,
+    get_item_count: unsafe extern "system" fn(*mut c_void) -> u32,
+    get_item_data: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> Result_,
+}
+
+#[repr(C)]
 struct EntryPointVtbl {
     component: ComponentTypeVtbl,
     get_function_reflection:
@@ -193,6 +222,19 @@ pub(crate) fn blob_text(blob: *mut c_void) -> String {
                 .to_owned()
         })
         .unwrap_or_default()
+}
+
+fn words(bytes: &[u8]) -> Result<Vec<u32>, String> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(format!(
+            "SPIR-V of {} bytes is not whole words",
+            bytes.len()
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+        .collect())
 }
 
 fn failed(r: Result_) -> bool {
@@ -545,24 +587,57 @@ impl Program {
     /// The target code as text, for source targets.
     pub(crate) fn text(&self) -> Result<String, String> {
         Ok(String::from_utf8_lossy(blob_bytes(&self.code()?))
-            .trim_end_matches(' ')
+            .trim_end_matches('\0')
             .to_owned())
     }
 
     /// The SPIR-V of the session's one target.
     pub(crate) fn spirv(&self) -> Result<Vec<u32>, String> {
-        let code = self.code()?;
-        let bytes = blob_bytes(&code);
-        if !bytes.len().is_multiple_of(4) {
-            return Err(format!(
-                "SPIR-V of {} bytes is not whole words",
-                bytes.len()
-            ));
+        words(blob_bytes(&self.code()?))
+    }
+
+    /// The stripped SPIR-V and its separated debug info, for sessions built with
+    /// `-separate-debug-info`.
+    pub(crate) fn spirv_separated(&self) -> Result<(Vec<u32>, Vec<u32>), String> {
+        // SAFETY: the vtables are ISlangUnknown's, IComponentType2's and
+        // ICompileResult's; out parameters receive owned references.
+        unsafe {
+            let mut two = ptr::null_mut();
+            let r = (self.com.vtbl::<UnknownVtbl>().query_interface)(
+                self.com.as_ptr(),
+                &COMPONENT_TYPE2,
+                &mut two,
+            );
+            let two = Com::from_raw(two)
+                .filter(|_| !failed(r))
+                .ok_or("the program has no IComponentType2")?;
+            let mut result = ptr::null_mut();
+            let mut diag = ptr::null_mut();
+            let r = (two.vtbl::<ComponentType2Vtbl>().get_target_compile_result)(
+                two.as_ptr(),
+                0,
+                &mut result,
+                &mut diag,
+            );
+            let text = blob_text(diag);
+            let result = Com::from_raw(result).filter(|_| !failed(r)).ok_or(text)?;
+            let v = result.vtbl::<CompileResultVtbl>();
+            let count = (v.get_item_count)(result.as_ptr());
+            if count != 2 {
+                return Err(format!(
+                    "separate debug info gave {count} outputs, not stripped SPIR-V and debug info"
+                ));
+            }
+            let item = |i| {
+                let mut blob = ptr::null_mut();
+                let r = (v.get_item_data)(result.as_ptr(), i, &mut blob);
+                let blob = Com::from_raw(blob)
+                    .filter(|_| !failed(r))
+                    .ok_or(format!("getItemData({i}) failed: {r:#x}"))?;
+                words(blob_bytes(&blob))
+            };
+            Ok((item(0)?, item(1)?))
         }
-        Ok(bytes
-            .chunks_exact(4)
-            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-            .collect())
     }
 
     /// The program layout of the session's one target; valid while the program lives.

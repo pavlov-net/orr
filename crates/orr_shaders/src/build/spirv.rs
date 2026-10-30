@@ -1,5 +1,6 @@
-//! A SPIR-V reader for the few instructions the build needs, and the opacity-micromap pass.
-//! Unknown instructions are skipped by their word count.
+//! A SPIR-V reader for the few instructions the build needs, the opacity-micromap pass and
+//! the string pass over stripped modules. Unknown instructions are skipped by their word
+//! count.
 
 use std::collections::{HashMap, HashSet};
 
@@ -9,7 +10,10 @@ const HEADER_WORDS: usize = 5;
 pub(crate) mod op {
     pub(crate) const NAME: u16 = 5;
     pub(crate) const MEMBER_NAME: u16 = 6;
+    pub(crate) const STRING: u16 = 7;
     pub(crate) const EXTENSION: u16 = 10;
+    pub(crate) const EXT_INST_IMPORT: u16 = 11;
+    pub(crate) const EXT_INST: u16 = 12;
     pub(crate) const MEMORY_MODEL: u16 = 14;
     pub(crate) const ENTRY_POINT: u16 = 15;
     pub(crate) const EXECUTION_MODE: u16 = 16;
@@ -392,6 +396,48 @@ fn takes_literals(o: u16) -> bool {
             | op::DECORATE
             | op::MEMBER_DECORATE
     )
+}
+
+/// `stripped` with the strings of `full` that its instructions still name. Slang's
+/// `-separate-debug-info` moves every `OpString` but the build identifier's to the sidecar,
+/// so a stripped `printf` names a format the module no longer defines.
+pub(crate) fn restore_strings(stripped: Vec<u32>, full: &[u32]) -> Vec<u32> {
+    let defined: HashSet<u32> = instructions(&stripped)
+        .filter(|(_, i)| i.op == op::STRING)
+        .map(|(_, i)| i.args[0])
+        .collect();
+    let named: HashSet<u32> = instructions(&stripped)
+        .filter(|(_, i)| i.op == op::EXT_INST)
+        .flat_map(|(_, i)| i.args.get(4..).unwrap_or_default().iter().copied())
+        .filter(|id| !defined.contains(id))
+        .collect();
+    let missing: Vec<u32> = instructions(full)
+        .filter(|(_, i)| i.op == op::STRING && named.contains(&i.args[0]))
+        .flat_map(|(at, i)| full[at..=at + i.args.len()].iter().copied())
+        .collect();
+    if missing.is_empty() {
+        return stripped;
+    }
+    // Strings open the debug section, which follows the execution modes.
+    let at = instructions(&stripped)
+        .find(|(_, i)| {
+            !matches!(
+                i.op,
+                op::CAPABILITY
+                    | op::EXTENSION
+                    | op::EXT_INST_IMPORT
+                    | op::MEMORY_MODEL
+                    | op::ENTRY_POINT
+                    | op::EXECUTION_MODE
+                    | op::EXECUTION_MODE_ID
+            )
+        })
+        .map_or(stripped.len(), |(at, _)| at);
+    let mut out = Vec::with_capacity(stripped.len() + missing.len());
+    out.extend_from_slice(&stripped[..at]);
+    out.extend(missing);
+    out.extend_from_slice(&stripped[at..]);
+    out
 }
 
 /// The module with `OpExecutionModeId <entry> OpacityMicromapIdKHR <true>` on every entry
