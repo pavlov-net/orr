@@ -1,6 +1,6 @@
 [package]
 name = "scene_suite"
-description = "Headless GPU tests of orr_scene's tables, uploads and frame skeleton, run with the validation layer."
+description = "GPU tests of orr_scene's tables, uploads and frame skeleton, run with the validation layer."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,10 @@ orr_scene = { workspace = true, features = ["testing"] }
 orr_gpu.workspace = true
 orr_shaders.workspace = true
 glam.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+gpu_suite = { path = "../gpu_suite" }
+log.workspace = true
 
 [build-dependencies]
 orr_shaders = { workspace = true, features = ["build"] }

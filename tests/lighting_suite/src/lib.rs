@@ -165,6 +165,7 @@ impl TestScene {
                     delta: 1.0 / 60.0,
                 },
                 scenes: &list,
+                low_latency: None,
             })
             .unwrap();
         self.frame = f.id();

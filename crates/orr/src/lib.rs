@@ -16,10 +16,10 @@
 //! into the frame's command list. A frame may list no scenes and render no view.
 
 pub use orr_scene::{
-    Affine3, Budgets, Cone, CopyVariant, DepthOfField, DirectionalLight, DiscProfile, Error,
-    ExposureState, Focus, FrameDesc, FrameStats, FrameTime, Glare, GroupGpu, GroupWriter,
-    InstanceFlags, InstanceGpu, InstanceRange, InstancesDesc, Lens, LensDistortion, Light,
-    LightGpu, LightId, MaterialGpu, MaterialId, MaterialWriter, ModelId, Pose, Projection,
+    Affine3, Budgets, Cone, ConsumerMarker, CopyVariant, DepthOfField, DirectionalLight,
+    DiscProfile, Error, ExposureState, Focus, FrameDesc, FrameStats, FrameTime, Glare, GroupGpu,
+    GroupWriter, InstanceFlags, InstanceGpu, InstanceRange, InstancesDesc, Lens, LensDistortion,
+    Light, LightGpu, LightId, MaterialGpu, MaterialId, MaterialWriter, ModelId, Pose, Projection,
     REBASE_GRID_LOG2, RendererDesc, Result, SceneCompute, SceneDesc, SceneId, SceneRoot,
     SceneWriter, SkyStats, SlotStateGpu, TransformGroupDesc, TransformGroupId, ViewConstants,
     ViewDesc, ViewHistoryId, ViewTarget, WorldPos, abi, material_flags, orr_gpu, orr_pack,
@@ -74,8 +74,8 @@ impl Renderer {
         self.scenes.destroy_view_history(id);
     }
 
-    /// Step 1: waits until the frame `frames_in_flight` back has completed and opens the
-    /// next one.
+    /// Step 1: waits until the frame `frames_in_flight` back has completed, sleeps on the
+    /// low latency handle when one is given, and opens the next one.
     pub fn begin_frame(&mut self, desc: &FrameDesc<'_>) -> Result<Frame<'_>> {
         Ok(Frame {
             scenes: self.scenes.begin_frame(desc)?,
@@ -107,6 +107,12 @@ impl<'a> Frame<'a> {
     /// Step 2: a material writer; Send.
     pub fn materials(&self) -> MaterialWriter<'_> {
         self.scenes.materials()
+    }
+
+    /// Step 2, on the render thread: sets a latency marker under [`Frame::id`] when the frame
+    /// has a low latency handle.
+    pub fn latency_marker(&self, marker: ConsumerMarker) {
+        self.scenes.latency_marker(marker);
     }
 
     /// Step 3: applies every write, then hands each listed scene in order to `compute`.

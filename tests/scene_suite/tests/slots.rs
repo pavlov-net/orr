@@ -19,6 +19,7 @@ fn removed_slots_wait_for_their_frame() {
     let desc = FrameDesc {
         time: FrameTime::default(),
         scenes: &list,
+        low_latency: None,
     };
     let add = |w: &mut orr_scene::SceneWriter<'_>| {
         w.add_instances(&InstancesDesc {
