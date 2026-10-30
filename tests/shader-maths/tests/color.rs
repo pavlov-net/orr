@@ -159,9 +159,9 @@ fn ictcp_matches_bt2100() {
 }
 
 const THRESHOLD: [f64; 3] = [0.815, 0.803, 0.880];
-const LIMIT: [f64; 3] = [1.147, 1.264, 1.312];
+const LIMIT: [f64; 3] = [1.593_869_6, 1.087_499_8, 1.116_575_8];
 
-/// ACES 1.3 Reference Gamut Compression on linear RGB.
+/// ACES 1.3 Reference Gamut Compression on linear RGB with orr's limits.
 fn gamut_compress_ref(rgb: [f64; 3]) -> [f64; 3] {
     let p = 1.2;
     let ach = rgb[0].max(rgb[1]).max(rgb[2]);
@@ -182,7 +182,7 @@ fn gamut_compress_ref(rgb: [f64; 3]) -> [f64; 3] {
 }
 
 #[test]
-fn gamut_compression_matches_aces_and_keeps_order() {
+fn gamut_compression_matches_rgc_and_keeps_order() {
     let mut rng = Rng::new(42);
     for _ in 0..100_000 {
         let scale = 10f32.powf(rng.range(-3.0, 2.0));
@@ -228,4 +228,32 @@ fn gamut_compression_matches_aces_and_keeps_order() {
             "channel {channel} limit"
         );
     }
+}
+
+#[test]
+fn gamut_compression_brings_rec2020_inside_rec709() {
+    let to709 = rgb_to_xyz(REC709, D65).inverse() * rgb_to_xyz(REC2020, D65);
+    // The Rec.2020 cube's faces, where every distance limit is reached.
+    let n = 400;
+    let mut worst = f64::MAX;
+    for face in 0..3 {
+        for k in 0..=n {
+            for j in 0..=n {
+                let (a, b) = (f64::from(k) / f64::from(n), f64::from(j) / f64::from(n));
+                let mut c = [0.0; 3];
+                c[(face + 1) % 3] = a;
+                c[(face + 2) % 3] = b;
+                if a.max(b) == 0.0 {
+                    continue;
+                }
+                let r = (to709 * DVec3::from(c)).to_array().map(|v| v as f32);
+                let out = gamut_compress(r);
+                worst = worst.min(out.iter().map(|&v| f64::from(v)).fold(f64::MAX, f64::min));
+            }
+        }
+    }
+    assert!(
+        worst > -1e-6,
+        "a Rec.2020 colour stays outside Rec.709: {worst}"
+    );
 }

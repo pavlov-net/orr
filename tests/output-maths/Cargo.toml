@@ -1,0 +1,19 @@
+[package]
+name = "output-maths"
+description = "orr-output's GT7, exposure and encoding maths on the CPU, checked against references."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+orr-output = { path = "../../crates/orr-output" }
+orr-shaders.workspace = true
+
+[build-dependencies]
+cc = "1.2"
+orr-shaders = { workspace = true, features = ["build"] }
+
+[lints]
+workspace = true

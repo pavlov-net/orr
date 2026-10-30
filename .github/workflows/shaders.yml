@@ -43,3 +43,4 @@ jobs:
           cargo test -p shader-corpus
           cargo test -p shader-abi
           cargo test -p shader-maths
+          cargo test -p output-maths

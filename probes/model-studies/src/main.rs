@@ -12,6 +12,7 @@ fn main() {
     match cmd.as_str() {
         "gbuf" => gbuf::run(),
         "gamut" => gamut::run(),
+        "gamut-sweep" => gamut::sweep(),
         "exposure" => exposure::run(),
         "atmo-bands" => atmo_run::bands(),
         "atmo-curvature" => atmo_run::curvature(),
@@ -21,6 +22,6 @@ fn main() {
         "atmo-f32" => atmo_run::altitude_f32(),
         "sss-entry" => sss::run_entry(),
         "sss-dwivedi" => sss::run_dwivedi(),
-        _ => eprintln!("usage: model-studies <gbuf|sss-entry|sss-dwivedi|gamut|exposure|atmo-bands|atmo-curvature|atmo-phase|atmo-eye|atmo-aerosol|atmo-f32>"),
+        _ => eprintln!("usage: model-studies <gbuf|sss-entry|sss-dwivedi|gamut|gamut-sweep|exposure|atmo-bands|atmo-curvature|atmo-phase|atmo-eye|atmo-aerosol|atmo-f32>"),
     }
 }

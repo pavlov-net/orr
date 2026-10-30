@@ -77,10 +77,16 @@ static const float PQ_C1 = 3424.0 / 4096.0;
 static const float PQ_C2 = 2413.0 / 4096.0 * 32.0;
 static const float PQ_C3 = 2392.0 / 4096.0 * 32.0;
 
+// The PQ curve on luminance relative to 10000 nits, without the upper clamp.
+float3 pq_curve(float3 y)
+{
+    float3 p = pow(y, PQ_M1);
+    return pow((PQ_C1 + PQ_C2 * p) / (1.0 + PQ_C3 * p), PQ_M2);
+}
+
 public float3 pq_encode(float3 nits)
 {
-    float3 y = pow(clamp(nits / 10000.0, 0.0, 1.0), PQ_M1);
-    return pow((PQ_C1 + PQ_C2 * y) / (1.0 + PQ_C3 * y), PQ_M2);
+    return pq_curve(clamp(nits / 10000.0, 0.0, 1.0));
 }
 
 public float3 pq_decode(float3 signal)
@@ -89,7 +95,9 @@ public float3 pq_decode(float3 signal)
     return 10000.0 * pow(max(e - PQ_C1, 0.0) / (PQ_C2 - PQ_C3 * e), 1.0 / PQ_M1);
 }
 
-// ICtCp (Rec. ITU-R BT.2100, PQ form) from linear Rec.2020 in nits, and back.
+// ICtCp (Rec. ITU-R BT.2100, PQ form) from linear Rec.2020 in nits, and back. Above 10000
+// nits the forward direction follows the PQ curve on, so brighter colours keep their order;
+// the inverse clamps the signal like pq_decode.
 static const float3x3 REC2020_TO_LMS = float3x3(
     1688.0 / 4096.0, 2146.0 / 4096.0, 262.0 / 4096.0,
     683.0 / 4096.0, 2951.0 / 4096.0, 462.0 / 4096.0,
@@ -109,7 +117,7 @@ static const float3x3 ICTCP_TO_LMS = float3x3(
 
 public float3 ictcp_from_rec2020(float3 nits)
 {
-    return mul(LMS_TO_ICTCP, pq_encode(mul(REC2020_TO_LMS, nits)));
+    return mul(LMS_TO_ICTCP, pq_curve(max(mul(REC2020_TO_LMS, nits) / 10000.0, 0.0)));
 }
 
 public float3 rec2020_from_ictcp(float3 ictcp)
@@ -119,14 +127,16 @@ public float3 rec2020_from_ictcp(float3 ictcp)
 
 // SDR gamut compression: brings linear Rec.709 colour from outside the Rec.709 gamut (some
 // channels below 0) inside it and leaves colours near the achromatic axis as they are.
-// ACES 1.3 Reference Gamut Compression applied in Rec.709 with the ACES parameters: per
+// ACES 1.3 Reference Gamut Compression applied in Rec.709 with the ACES thresholds: per
 // channel, the distance d = (max - c) / max beyond the threshold is compressed so that the
-// limit (1.147, 1.264, 1.312) maps to 1. Channels within their threshold are returned
-// unchanged.
+// limit maps to 1. The limits are the largest distances any Rec.2020 colour reaches in
+// Rec.709, so every Rec.2020 colour lands inside Rec.709 and distinct inputs stay distinct
+// and ordered. Channels within their threshold are returned unchanged.
 static const float3 GAMUT_THRESHOLD = float3(0.815, 0.803, 0.880);
 static const float GAMUT_POWER = 1.2;
-// (limit - threshold) / (((1 - threshold) / (limit - threshold))^-power - 1)^(1 / power)
-static const float3 GAMUT_SCALE = float3(0.327301877, 0.285938029, 0.146821458);
+// (limit - threshold) / (((1 - threshold) / (limit - threshold))^-power - 1)^(1 / power),
+// limits (1.5938696, 1.0874998, 1.1165758).
+static const float3 GAMUT_SCALE = float3(0.217865883, 0.465177228, 0.195374901);
 
 public float3 gamut_compress(float3 rgb)
 {

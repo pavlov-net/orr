@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 orr-scene.workspace = true
 raw-window-handle.workspace = true
+bytemuck.workspace = true
 thiserror.workspace = true
 log.workspace = true
 

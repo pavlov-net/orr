@@ -157,18 +157,23 @@ fn hue_diff(a: f32, b: f32) -> f32 {
     d.min(360.0 - d)
 }
 
-pub fn run() {
-    let gt7 = Gt7::sdr();
-    // Rec.2020 RGC distance limits: the largest distance any Rec.2020 colour reaches in
-    // Rec.709 per channel (from the Rec.2020 primaries).
-    let mut lim2020 = [1.0f32; 3];
+/// Rec.2020 RGC distance limits: the largest distance any Rec.2020 colour reaches in
+/// Rec.709 per channel (from the Rec.2020 primaries).
+fn rec2020_limits() -> [f32; 3] {
+    let mut lim = [1.0f32; 3];
     for p in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 0.0]] {
         let r = mat(&BT2020_TO_709, p);
         let ach = r[0].max(r[1]).max(r[2]);
         for i in 0..3 {
-            lim2020[i] = lim2020[i].max((ach - r[i]) / ach + 0.001);
+            lim[i] = lim[i].max((ach - r[i]) / ach + 0.001);
         }
     }
+    lim
+}
+
+pub fn run() {
+    let gt7 = Gt7::sdr();
+    let lim2020 = rec2020_limits();
     println!("Rec.2020 boundary distances in Rec.709 (RGC limits): {lim2020:.3?}");
     let aces_thr = [0.815, 0.803, 0.880];
     let aces_lim = [1.147, 1.264, 1.312];
@@ -240,4 +245,145 @@ pub fn run() {
         }
     }
     println!("GT7 port vs Polyphony sample, max abs error over the ramps: {max_err:.2e}");
+}
+
+/// Chroma compression in ICtCp at constant intensity and hue with a knee: the ratio of
+/// chroma to the Rec.709 boundary chroma at that intensity and hue passes unchanged below
+/// `knee` and approaches 1 above it (tanh). The boundary is found by bisection.
+fn ucs_knee(sdr2020: [f32; 3], knee: f32) -> [f32; 3] {
+    let fits = |c: [f32; 3]| {
+        let r = mat(&BT2020_TO_709, c);
+        r.iter().all(|&v| (-1e-6..=1.0 + 1e-6).contains(&v))
+    };
+    let mut u = ictcp(sdr2020.map(|v| v * 2.5));
+    let white = ictcp([2.5; 3])[0];
+    u[0] = u[0].min(white);
+    let chroma = (u[1] * u[1] + u[2] * u[2]).sqrt();
+    if chroma == 0.0 {
+        return ictcp_inv(u).map(|v| v / 2.5);
+    }
+    // Boundary chroma along the hue at this intensity.
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    let at = |c: f32| ictcp_inv([u[0], u[1] / chroma * c, u[2] / chroma * c]).map(|v| v / 2.5);
+    while fits(at(hi)) && hi < 64.0 {
+        hi *= 2.0;
+    }
+    for _ in 0..40 {
+        let m = 0.5 * (lo + hi);
+        if fits(at(m)) { lo = m } else { hi = m }
+    }
+    let r = chroma / lo;
+    let out = if r <= knee { r } else { knee + (1.0 - knee) * ((r - knee) / (1.0 - knee)).tanh() };
+    at(out * lo)
+}
+
+/// Saturation sweep: at fixed ICtCp hue and intensity, chroma rises from 0 to the Rec.2020
+/// boundary; each input goes through GT7 SDR and a gamut method. Reports, over the samples
+/// whose GT7 output lies outside Rec.709 [0, 1], how many consecutive pairs collapse to one
+/// displayed colour, how many reverse the order of displayed chroma, and the share of the
+/// displayed chroma range the out-of-gamut part spans. Runs over every out-of-gamut sample,
+/// then over those with a channel below zero and none above one (what gamut compression
+/// handles; the [0, 1] clamp takes the rest).
+pub fn sweep() {
+    sweep_over(false);
+    sweep_over(true);
+}
+
+fn sweep_over(below_zero_only: bool) {
+    let gt7 = Gt7::sdr();
+    let aces_thr = [0.815, 0.803, 0.880];
+    let aces_lim = [1.147, 1.264, 1.312];
+    let lim2020 = rec2020_limits();
+    let hues: Vec<[f32; 3]> = vec![
+        [1.0, 0.0, 0.0], [1.0, 0.5, 0.0], [1.0, 1.0, 0.0], [0.5, 1.0, 0.0],
+        [0.0, 1.0, 0.0], [0.0, 1.0, 0.5], [0.0, 1.0, 1.0], [0.0, 0.5, 1.0],
+        [0.0, 0.0, 1.0], [0.5, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 0.0, 0.5],
+    ];
+    let levels = [1.0f32, 10.0, 50.0, 100.0, 250.0, 1000.0, 4000.0];
+    let lum = |c: [f32; 3]| 0.2627 * c[0] + 0.6780 * c[1] + 0.0593 * c[2];
+    let names = ["clip", "rgc_aces", "ucs_knee_0.8", "rgc_2020"];
+    let steps = 512;
+    // per method: oog samples, collapsed pairs, order reversals, span sum, span n, hue drift sum, hue n, hue max
+    let mut acc = [[0.0f64; 8]; 4];
+    let mut worst_rev = [0.0f32; 4];
+    for &h in &hues {
+        for &nits in &levels {
+            let base = h.map(|v| v * nits / REF_LUM / lum(h));
+            let ub = ictcp(base.map(|v| v * REF_LUM / 100.0));
+            let mut prev: Option<([f32; 3], f32, [[f32; 3]; 4], [f32; 4])> = None;
+            let mut span: [(f32, f32); 4] = [(f32::INFINITY, f32::NEG_INFINITY); 4];
+            let mut total_range: [(f32, f32); 4] = [(f32::INFINITY, f32::NEG_INFINITY); 4];
+            for k in 0..=steps {
+                let s = k as f32 / steps as f32;
+                let input = ictcp_inv([ub[0], ub[1] * s, ub[2] * s]).map(|v| v.max(0.0));
+                let sdr = gt7.apply(input);
+                let r709 = mat(&BT2020_TO_709, sdr);
+                let (_, c_pre) = hue(ictcp(sdr.map(|v| v * 2.5)));
+                let oog = r709.iter().any(|&v| !(-1e-6..=1.0 + 1e-6).contains(&v));
+                let oog = oog && (!below_zero_only || r709.iter().all(|&v| v <= 1.0 + 1e-6));
+                let outs: [[f32; 3]; 4] = [
+                    r709.map(|v| v.clamp(0.0, 1.0)),
+                    rgc(r709, aces_thr, aces_lim).map(|v| v.clamp(0.0, 1.0)),
+                    mat(&BT2020_TO_709, ucs_knee(sdr, 0.8)).map(|v| v.clamp(0.0, 1.0)),
+                    rgc(r709, aces_thr, lim2020).map(|v| v.clamp(0.0, 1.0)),
+                ];
+                let mut cs = [0.0f32; 4];
+                for (m, o) in outs.iter().enumerate() {
+                    let disp = mat(&BT709_TO_2020, *o).map(|v| v * 2.5);
+                    let (hd, c) = hue(ictcp(disp));
+                    cs[m] = c;
+                    total_range[m] = (total_range[m].0.min(c), total_range[m].1.max(c));
+                    if !oog {
+                        continue;
+                    }
+                    span[m] = (span[m].0.min(c), span[m].1.max(c));
+                    if c >= 0.02 && s > 0.0 {
+                        let (hb, _) = hue(ub);
+                        let d = hue_diff(hd, hb);
+                        acc[m][5] += f64::from(d);
+                        acc[m][6] += 1.0;
+                        acc[m][7] = acc[m][7].max(f64::from(d));
+                    }
+                    if let Some((p709, pc_pre, pouts, pcs)) = prev {
+                        let pre_diff = (0..3).map(|i| (r709[i] - p709[i]).abs()).fold(0.0f32, f32::max);
+                        if pre_diff >= 0.5 / 1023.0 {
+                            acc[m][0] += 1.0;
+                            let diff = (0..3).map(|i| (o[i] - pouts[m][i]).abs()).fold(0.0f32, f32::max);
+                            // A channel below zero in both samples that GT7 moved but the
+                            // method leaves equal (pinned at the boundary).
+                            let pinned = (0..3).any(|i| {
+                                r709[i] < 0.0 && p709[i] < 0.0 && (r709[i] - p709[i]).abs() > 1e-5 && (o[i] - pouts[m][i]).abs() < 1e-7
+                            });
+                            if diff < 1e-6 || pinned {
+                                acc[m][1] += 1.0;
+                            }
+                        }
+                        if c_pre > pc_pre + 1e-4 && c < pcs[m] - 1e-4 {
+                            acc[m][2] += 1.0;
+                            worst_rev[m] = worst_rev[m].max(pcs[m] - c);
+                        }
+                    }
+                }
+                prev = oog.then_some((r709, c_pre, outs, cs));
+            }
+            for m in 0..4 {
+                if span[m].1 > span[m].0 && total_range[m].1 > 0.0 {
+                    acc[m][3] += f64::from((span[m].1 - span[m].0) / total_range[m].1);
+                    acc[m][4] += 1.0;
+                }
+            }
+        }
+    }
+    let domain = if below_zero_only { "below-zero samples" } else { "all out-of-gamut samples" };
+    println!("
+saturation sweep, {domain}: 12 hues x {} levels (nits), {} chroma steps to the Rec.2020 boundary, GT7 SDR", levels.len(), steps);
+    println!("pairs = consecutive out-of-gamut samples GT7 keeps apart by half a 10-bit code; collapsed = of those, displayed equal, or a below-zero channel GT7 moved pinned at the boundary; reversed = GT7 chroma rises, displayed chroma falls (by 1e-4)");
+    println!("{:14} {:>8} {:>10} {:>9} {:>11} {:>12} {:>14}", "method", "pairs", "collapsed", "reversed", "worst rev", "oog span", "hue mean/max");
+    for m in 0..4 {
+        let a = acc[m];
+        println!(
+            "{:14} {:>8} {:>9.1}% {:>9} {:>11.2e} {:>11.1}% {:>7.2}/{:>5.2}",
+            names[m], a[0], 100.0 * a[1] / a[0].max(1.0), a[2], worst_rev[m], 100.0 * a[3] / a[4].max(1.0), a[5] / a[6].max(1.0), a[7]
+        );
+    }
 }
