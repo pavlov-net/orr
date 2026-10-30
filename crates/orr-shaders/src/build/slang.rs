@@ -283,6 +283,16 @@ impl GlobalSession {
 
     /// A session configured by slangc command-line options.
     pub(crate) fn session(&self, args: &[String]) -> Result<Session, String> {
+        self.session_with(args, false)
+    }
+
+    /// A session whose targets emit every `export`ed function, entry point or not: what
+    /// slangc does for a source target given no entry points.
+    pub(crate) fn whole_program_session(&self, args: &[String]) -> Result<Session, String> {
+        self.session_with(args, true)
+    }
+
+    fn session_with(&self, args: &[String], whole_program: bool) -> Result<Session, String> {
         let args: Vec<CString> = args
             .iter()
             .map(|a| CString::new(a.as_str()).expect("no nul in compiler options"))
@@ -307,6 +317,18 @@ impl GlobalSession {
             let _aux = Com::from_raw(aux);
             if failed(r) {
                 return Err(format!("Slang rejected the options {args:?}: {r:#x}"));
+            }
+            let mut targets = Vec::new();
+            if whole_program && !desc.targets.is_null() {
+                targets.extend_from_slice(std::slice::from_raw_parts(
+                    desc.targets,
+                    desc.targetCount as usize,
+                ));
+                for t in &mut targets {
+                    t.flags |=
+                        sys::SLANG_TARGET_FLAG_GENERATE_WHOLE_PROGRAM.0 as sys::SlangTargetFlags;
+                }
+                desc.targets = targets.as_ptr();
             }
             let mut out = ptr::null_mut();
             let r = (v.create_session)(self.com.as_ptr(), &desc, &mut out);

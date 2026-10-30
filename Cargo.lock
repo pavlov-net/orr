@@ -459,6 +459,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpu-suite"
+version = "0.0.1"
+dependencies = [
+ "log",
+ "orr-gpu",
+ "orr-shaders",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -708,7 +717,10 @@ name = "orr-gpu"
 version = "0.0.1"
 dependencies = [
  "ash",
+ "bitflags",
+ "bytemuck",
  "log",
+ "orr-shaders",
  "thiserror",
 ]
 
@@ -752,6 +764,7 @@ dependencies = [
  "bindgen",
  "blake3",
  "bytemuck",
+ "cc",
  "libloading",
  "serde",
  "serde_json",
@@ -986,6 +999,16 @@ name = "shader-corpus"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
+ "orr-shaders",
+]
+
+[[package]]
+name = "shader-maths"
+version = "0.0.1"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "orr-pack",
  "orr-shaders",
 ]
 

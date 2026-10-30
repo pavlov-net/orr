@@ -42,3 +42,4 @@ jobs:
           cargo test -p orr-shaders --features build
           cargo test -p shader-corpus
           cargo test -p shader-abi
+          cargo test -p shader-maths

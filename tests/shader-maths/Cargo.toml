@@ -1,0 +1,22 @@
+[package]
+name = "shader-maths"
+description = "orr's Slang maths libraries compiled for the CPU and checked against references."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+orr-shaders.workspace = true
+
+[dev-dependencies]
+bytemuck.workspace = true
+glam.workspace = true
+orr-pack.workspace = true
+
+[build-dependencies]
+orr-shaders = { workspace = true, features = ["build"] }
+
+[lints]
+workspace = true
