@@ -25,6 +25,7 @@ thiserror = "2"
 log = "0.4"
 glam = "0.34"
 blake3 = "1"
+bitflags = "2"
 bytemuck = { version = "1", features = ["derive"] }
 # 0.14 is the version ctt uses, so one zstd-sys builds.
 zstd = "0.14"

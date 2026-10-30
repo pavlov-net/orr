@@ -1,0 +1,19 @@
+[package]
+name = "gpu-suite"
+description = "Headless GPU tests of orr-gpu, run with the validation layer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+orr-gpu.workspace = true
+orr-shaders.workspace = true
+log.workspace = true
+
+[build-dependencies]
+orr-shaders = { workspace = true, features = ["build"] }
+
+[lints]
+workspace = true
