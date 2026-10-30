@@ -9,6 +9,7 @@ mod exposure;
 mod gt7;
 mod hooks;
 mod passes;
+mod present;
 mod screenshot;
 mod ui;
 mod view;
@@ -31,11 +32,12 @@ pub use exposure::{
 };
 pub use gt7::{GT7_REFERENCE_NITS, GT7_SDR_NITS, Gt7Curve, Gt7Params};
 pub use hooks::{ChainImages, DistortionField, HookInputs, HookPass, HookPoint, Hooks};
-pub use orr_scene::orr_gpu::{HdrMetadata, OutputFormat, PresentMode};
+pub use orr_scene::orr_gpu::{HdrMetadata, LowLatency, OutputFormat, PresentMode};
 pub use passes::{
     CapturePass, ComposePass, ComposeRoot, ComposeSource, ExposurePass, HookInputsPass,
     OutputKernels, OutputRoots, OutputView, SceneCapturePass, TonemapPass,
 };
+pub use present::{Display, DisplayFrame, Presented};
 pub use screenshot::{Primaries, Screenshot, ScreenshotRequest};
 pub use ui::UiLayer;
 pub use view::{OutputDebug, ViewOutput};
@@ -51,6 +53,8 @@ pub enum Error {
     Gpu(#[from] orr_scene::orr_gpu::Error),
     #[error("the window handle is not a Win32 window")]
     NotWin32Window,
+    #[error("present thread: {0}")]
+    Thread(String),
     #[cfg(windows)]
     #[error("display watch: {0}")]
     Windows(#[from] windows_core::Error),

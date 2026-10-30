@@ -50,13 +50,14 @@ pub use texture::{
 
 #[cfg(not(target_vendor = "apple"))]
 pub use vulkan::{
-    Allocation, ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance,
+    Allocation, Checkpoint, ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance,
     ClassicKind, ColorAttachment, CommandList, ComputePipeline, DepthAttachment, Device,
-    DeviceDesc, DispatchArgs, HeapReport, InstanceFlags, LowLatency, MemoryKind, MemoryReport,
-    MemoryUsage, MeshArgs, MeshPipeline, MeshPipelineDesc, Micromap, MicromapDesc,
-    MicromapTriangle, MicromapUsage, OmmFormat, PageBind, PassResult, PipelineCacheKind,
-    PipelineCacheReport, PipelineStats, Queue, QueueKind, QueueRequest, RayDispatchPipeline,
-    Rendering, ShaderStage, SparseAllocation, Swapchain, SwapchainFrame, Texture, TextureMemory,
+    DeviceDesc, DeviceFault, Diagnostics, DiagnosticsReport, DispatchArgs, FaultAccess,
+    FaultAddress, HeapReport, InstanceFlags, LowLatency, MemoryKind, MemoryReport, MemoryUsage,
+    MeshArgs, MeshPipeline, MeshPipelineDesc, Micromap, MicromapDesc, MicromapTriangle,
+    MicromapUsage, OmmFormat, PageBind, PassResult, PipelineCacheKind, PipelineCacheReport,
+    PipelineStats, Queue, QueueKind, QueueProgress, QueueRequest, RayDispatchPipeline, Rendering,
+    ShaderStage, SparseAllocation, Swapchain, SwapchainFrame, Texture, TextureMemory,
 };
 
 #[cfg(not(target_vendor = "apple"))]
