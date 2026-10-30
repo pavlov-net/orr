@@ -11,15 +11,17 @@ use orr_gpu::{
     QueueKind, ShaderStage, SpecData, Stages, TimelinePoint,
 };
 
+use crate::emissive::ModelEmission;
 use crate::material::{MaterialTable, MaterialWriter};
 use crate::memory::UploadWindow;
-use crate::scene::{GroupWriter, Scene, SceneDesc, SceneId, SceneWriter};
-use crate::shaders::{upload, world as world_kernel};
+use crate::producer::ProducerUpdate;
+use crate::scene::{GroupWriter, ModelId, Scene, SceneDesc, SceneId, SceneWriter};
+use crate::shaders::{emissive, upload, world as world_kernel};
 use crate::time::FrameTime;
 use crate::upload::{Record, scatter};
 use crate::view::{RasterView, ViewDesc, ViewHistory, ViewHistoryId, view_constants};
 use crate::world::{needs_rebase, origin_for};
-use crate::{Error, ExposureState, Result, SceneRoot};
+use crate::{Error, ExposureState, ProducerBatch, Result, SceneRoot};
 
 /// Pool sizes and per-frame limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,14 +98,33 @@ pub struct SceneCompute<'a, 'q> {
     pub cmd: &'a mut CommandList<'q>,
     pub scene: SceneId,
     pub root: GpuPtr<SceneRoot>,
+    /// The scene's producer batches, indexed by `ProducerId`.
+    pub batches: GpuPtr<ProducerBatch>,
     pub time: FrameTime,
     /// The scene focus and its pixels per radian, as last set.
     pub focus: Option<(DVec3, f32)>,
+    device: &'a Device,
+    window: &'a UploadWindow,
+}
+
+impl SceneCompute<'_, '_> {
+    /// `value` in this frame's upload window, 16-byte aligned; the GPU can read it until
+    /// the frame completes.
+    pub fn put<T: bytemuck::Pod>(&self, value: &T) -> Result<GpuPtr<T>> {
+        self.window.put(self.device, value)
+    }
+
+    /// `root` in this frame's upload window at an address a dispatch can take as its root.
+    pub fn put_root<T: bytemuck::Pod>(&self, root: &T) -> Result<GpuPtr<T>> {
+        self.window.put_root(self.device, root)
+    }
 }
 
 struct Pipelines {
     scatter: ComputePipeline,
     rebase: ComputePipeline,
+    emissive_instances: ComputePipeline,
+    emissive_producers: ComputePipeline,
 }
 
 struct InFlight {
@@ -116,6 +137,8 @@ struct Core {
     fif: u32,
     cell_log2: u32,
     materials: MaterialTable,
+    /// Emission by `ModelId`.
+    models: Vec<Option<ModelEmission>>,
     /// Records outside any scene: materials, view-history initialisation.
     global: Mutex<Vec<Record>>,
     scenes: Vec<Option<Scene>>,
@@ -169,11 +192,14 @@ impl Scenes {
             pipelines: Pipelines {
                 scatter: pipeline(device, &upload::MODULE, "scatter")?,
                 rebase: pipeline(device, &world_kernel::MODULE, "rebase_lights")?,
+                emissive_instances: pipeline(device, &emissive::MODULE, "instances")?,
+                emissive_producers: pipeline(device, &emissive::MODULE, "producers")?,
             },
             core: Core {
                 fif: desc.frames_in_flight,
                 cell_log2: desc.cell_log2,
                 materials: MaterialTable::new(device, desc.budgets.materials)?,
+                models: Vec::new(),
                 global: Mutex::new(Vec::new()),
                 scenes: Vec::new(),
                 histories: Vec::new(),
@@ -209,6 +235,16 @@ impl Scenes {
         if let Some(s) = self.core.scenes.get_mut(id.0 as usize) {
             *s = None;
         }
+    }
+
+    /// What copies of `model` add to the emissive list from now on; copies added before
+    /// keep their entries. Model loading sets it when a model becomes resident.
+    pub(crate) fn set_model_emission(&mut self, model: ModelId, emission: Option<ModelEmission>) {
+        let i = model.0 as usize;
+        if self.core.models.len() <= i {
+            self.core.models.resize(i + 1, None);
+        }
+        self.core.models[i] = emission;
     }
 
     /// The froxel depth every view of the scene uses, in m (`SceneRoot::near_range`).
@@ -298,6 +334,14 @@ impl Scenes {
                 }
                 !done
             });
+            cpu.emissive_removed.retain(|&(frame, first, count)| {
+                let done = frame <= completed;
+                if done {
+                    cpu.emissive.free(first, count);
+                }
+                !done
+            });
+            cpu.retired.retain(|(frame, _)| *frame > completed);
         }
         self.device.collect_garbage();
         let slot = (frame % u64::from(core.fif)) as usize;
@@ -381,6 +425,7 @@ impl<'a> Frame<'a> {
             seq: &self.core.seq,
             frame: self.id,
             cell_log2: self.core.cell_log2,
+            models: &self.core.models,
         })
     }
 
@@ -423,6 +468,15 @@ impl<'a> Frame<'a> {
             let scene = core.scene(id)?;
             let cpu = &mut *scene.cpu.lock().unwrap();
             records.append(&mut cpu.records);
+            let counts = scene.tables.producer_counts.gpu;
+            for (i, p) in cpu.producers.iter().enumerate() {
+                if p.as_ref()
+                    .is_some_and(|p| p.update == ProducerUpdate::EveryFrame)
+                {
+                    let at = counts.offset(i as u64).address().0;
+                    records.push(Record::fill(core.next_seq(), at, 2, 0));
+                }
+            }
             if let Some((focus, _)) = cpu.focus
                 && needs_rebase(cpu.origin_cell, focus, core.cell_log2)
             {
@@ -462,6 +516,9 @@ impl<'a> Frame<'a> {
                 materials: core.materials.table.gpu,
                 material_sets: t.material_sets.gpu.cast(),
                 lights: t.lights.gpu,
+                emissive: t.emissive.gpu,
+                producers: t.producers.gpu,
+                batches: t.batches.gpu,
                 sky_stats: t.sky_stats.gpu,
                 environment: cpu.environment,
                 medium: cpu.medium,
@@ -473,12 +530,14 @@ impl<'a> Frame<'a> {
                 group_capacity: scene.desc.group_capacity,
                 light_capacity: scene.desc.light_capacity,
                 material_set_capacity: scene.desc.material_set_capacity,
+                producer_capacity: scene.desc.producer_capacity,
+                emissive_capacity: scene.desc.emissive_capacity,
                 near_range: cpu.near_range,
                 _pad: 0,
             };
             let src = window.put(device, &root)?;
             records.push(Record::values(core.next_seq(), t.root.gpu, src, 1));
-            roots.push((id, t.root.gpu, cpu.focus));
+            roots.push((id, t.root.gpu, t.batches.gpu, cpu.focus, scene.desc));
         }
 
         list.begin_pass("upload", true);
@@ -509,16 +568,40 @@ impl<'a> Frame<'a> {
             list.end_pass();
             list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         }
-        for (scene, root, focus) in roots {
+        for &(scene, root, batches, focus, _) in &roots {
             let mut sc = SceneCompute {
                 cmd: &mut list,
                 scene,
                 root,
+                batches,
                 time: self.time,
                 focus,
+                device,
+                window,
             };
             compute(&mut sc);
             list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
+        }
+        if !roots.is_empty() {
+            list.begin_pass("emissive", false);
+            for &(_, scene, _, _, desc) in &roots {
+                let r = emissive::Root {
+                    scene,
+                    _pad0: 0,
+                    _pad1: 0,
+                };
+                let ptr = window.put_root(device, &r)?;
+                if desc.producer_capacity > 0 {
+                    let p = &self.pipelines.emissive_producers;
+                    list.dispatch(p, ptr, [desc.producer_capacity, 1, 1]);
+                }
+                if desc.emissive_capacity > 0 {
+                    let groups = desc.emissive_capacity.div_ceil(64);
+                    list.dispatch(&self.pipelines.emissive_instances, ptr, [groups, 1, 1]);
+                }
+            }
+            list.end_pass();
+            list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         }
         self.list = Some(list);
         self.step("update_scenes");

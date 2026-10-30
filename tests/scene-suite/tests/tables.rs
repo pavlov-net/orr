@@ -408,24 +408,45 @@ fn lights_move_with_the_render_origin() {
             f64::from(root.origin_cell[2]),
         ) * 256.0
     };
+    let rect_center = DVec3::new(-31_000.5, 12.0, 4_000.75);
+    let rect = Light::Rect {
+        center: rect_center,
+        edge_x: Vec3::X,
+        edge_y: Vec3::Z,
+        luminance: Vec3::ONE,
+    };
+    let sun = Light::Directional(orr_scene::DirectionalLight {
+        direction_to_light: Vec3::Y,
+        illuminance: Vec3::splat(1e5),
+        angular_radius: 0.0047,
+        disc: orr_scene::DiscProfile::LimbDarkened,
+    });
     let check = |root: &SceneRoot| {
-        let l: LightGpu = read_buffer(root.lights, 1)[0];
-        let expected = (far - origin_of(root)).as_vec3();
-        assert_eq!(Vec3::from(l.position), expected);
-        assert_eq!(l.kind, 2);
+        let l: Vec<LightGpu> = read_buffer(root.lights, 3);
+        // Render positions equal the CPU's from the f64 inputs.
+        assert_eq!(Vec3::from(l[0].position), (far - origin_of(root)).as_vec3());
+        assert_eq!(
+            Vec3::from(l[1].position),
+            (rect_center - origin_of(root)).as_vec3()
+        );
+        assert_eq!((l[0].kind, l[1].kind, l[2].kind), (2, 3, 1));
+        assert_eq!(l[2].position, [0.0; 3]);
         // Rec.709 red in Rec.2020.
         assert!(
-            (l.color[0] - 0.627_403_9).abs() < 1e-6 && (l.color[1] - 0.069_097_29).abs() < 1e-6
+            (l[0].color[0] - 0.627_403_9).abs() < 1e-6
+                && (l[0].color[1] - 0.069_097_29).abs() < 1e-6
         );
     };
-    // The light is written against the old origin and the focus moves in the same frame.
+    // The lights are written against the old origin and the focus moves in the same frame.
     let root = run_frame(&mut scenes, s, |w| {
         w.set_light(orr_scene::LightId(0), Some(&light)).unwrap();
+        w.set_light(orr_scene::LightId(1), Some(&rect)).unwrap();
+        w.set_light(orr_scene::LightId(2), Some(&sun)).unwrap();
         w.set_focus(far + DVec3::new(10.0, 0.0, 0.0), 1000.0);
     });
     assert_eq!(origin_of(&root), DVec3::new(19_968.0, 0.0, -9_216.0));
     check(&root);
-    // A focus 2 km away moves the origin and the light without rewriting it.
+    // A focus 2 km away moves the origin and the lights without rewriting them.
     let root = run_frame(&mut scenes, s, |w| {
         w.set_focus(far + DVec3::new(2000.0, 0.0, 0.0), 1000.0);
     });

@@ -75,6 +75,10 @@ pub(crate) const LIGHT_DIRECTIONAL: u32 = 1;
 pub(crate) const LIGHT_SPHERE: u32 = 2;
 pub(crate) const LIGHT_RECT: u32 = 3;
 
+/// `EmissiveGpu::kind`.
+pub(crate) const EMISSIVE_INSTANCE: u32 = 1;
+pub(crate) const EMISSIVE_PRODUCER: u32 = 2;
+
 /// Linear Rec.709 to linear Rec.2020 (rows), as `orr.color`'s `REC709_TO_REC2020`.
 const REC709_TO_REC2020: [[f32; 3]; 3] = [
     [0.627_403_9, 0.329_283_04, 0.043_313_066],

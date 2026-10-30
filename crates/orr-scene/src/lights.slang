@@ -44,3 +44,26 @@ public struct LightGpu
     public uint _pad5;
     public uint4 lit_by;          // DISC_TEXTURED: directional lights lighting the disc, or NO_LIGHT
 }
+
+// `EmissiveGpu.kind`.
+public static const uint EMISSIVE_NONE = 0;
+public static const uint EMISSIVE_INSTANCE = 1;
+public static const uint EMISSIVE_PRODUCER = 2;
+
+// One entry of the scene's emissive list. Entries 0..producer_capacity are the producer
+// entries by ProducerId; the rest are EMISSIVE cluster spans of instance slots, one per
+// (slot, span). `power`, `area` and a producer's `cluster_count` are rewritten on the GPU
+// every frame the scene is updated.
+public struct EmissiveGpu
+{
+    public uint kind;            // EMISSIVE_*
+    public uint source;          // instance slot or ProducerId
+    public uint first_cluster;   // instance: the span's first mesh cluster, finest level
+    public uint cluster_count;   // instance: the span's clusters; producer: emissive clusters emitted
+    public uint section;         // instance: the span's model section
+    public uint sections;        // instance: the model's section count, the material-set stride
+    public uint material;        // instance: the section's MaterialId for a copy with no set
+    public float model_area;     // instance: sum of the span's Cluster.area, model space, m^2
+    public float3 power;         // luminance x area per channel (nit m^2), 0 when hidden
+    public float area;           // emitting area in render space, m^2
+}

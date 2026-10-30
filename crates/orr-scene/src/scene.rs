@@ -7,12 +7,17 @@ use bytemuck::{Pod, Zeroable};
 use glam::{DVec3, IVec3};
 use orr_gpu::{Allocation, Device, GpuAddress, GpuPtr, MemoryKind};
 
-use crate::lights::{Light, LightId, light_gpu};
+use crate::emissive::{ModelEmission, Run, Runs};
+use crate::lights::{EMISSIVE_INSTANCE, EMISSIVE_PRODUCER, Light, LightId, light_gpu};
 use crate::material::MaterialId;
 use crate::memory::{RangeAllocator, UploadWindow};
+use crate::producer::{self, Producer, ProducerDesc, ProducerId};
 use crate::upload::{Op, Record};
 use crate::world::WorldPos;
-use crate::{Error, GroupGpu, InstanceGpu, LightGpu, Result, SceneRoot, SkyStats, SlotStateGpu};
+use crate::{
+    EmissiveGpu, Error, GroupGpu, InstanceGpu, LightGpu, ProducerBatch, ProducerGpu, Result,
+    SceneRoot, SkyStats, SlotStateGpu,
+};
 
 /// A scene in [`crate::Scenes`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -27,6 +32,10 @@ pub struct SceneDesc {
     pub light_capacity: u32,
     /// `MaterialId` entries in the scene's material-set table.
     pub material_set_capacity: u32,
+    /// Producer entries: every `ProducerId` is below it.
+    pub producer_capacity: u32,
+    /// Emissive list entries for instances: one per copy per EMISSIVE span of its model.
+    pub emissive_capacity: u32,
 }
 
 impl Default for SceneDesc {
@@ -36,6 +45,8 @@ impl Default for SceneDesc {
             group_capacity: 1024,
             light_capacity: 256,
             material_set_capacity: 4096,
+            producer_capacity: 256,
+            emissive_capacity: 16_384,
         }
     }
 }
@@ -158,6 +169,12 @@ pub(crate) struct Tables {
     pub groups: Allocation<GroupGpu>,
     pub material_sets: Allocation<MaterialId>,
     pub lights: Allocation<LightGpu>,
+    /// Producer entries first, then instance spans.
+    pub emissive: Allocation<EmissiveGpu>,
+    pub producers: Allocation<ProducerGpu>,
+    pub batches: Allocation<ProducerBatch>,
+    /// Cluster and vertex count of each producer batch.
+    pub producer_counts: Allocation<[u32; 2]>,
     pub sky_stats: Allocation<SkyStats>,
 }
 
@@ -198,6 +215,14 @@ pub(crate) struct SceneCpu {
     pub slots: RangeAllocator,
     /// Ranges removed in a frame, freed once that frame has completed.
     pub removed: Vec<(u64, InstanceRange)>,
+    /// Instance entries of the emissive list, counted after the producer entries.
+    pub emissive: RangeAllocator,
+    pub emissive_runs: Runs,
+    /// Entry ranges removed in a frame, freed once that frame has completed.
+    pub emissive_removed: Vec<(u64, u32, u32)>,
+    pub producers: Vec<Option<Producer>>,
+    /// Memory of replaced or cleared producer entries, freed once that frame has completed.
+    pub retired: Vec<(u64, Producer)>,
     /// Index = TransformGroupId; entry 0 is the null group.
     pub groups: Vec<Option<Group>>,
     pub records: Vec<Record>,
@@ -232,6 +257,14 @@ impl Scene {
             groups: device.gpu_malloc(dl, n(desc.group_capacity), "transform groups")?,
             material_sets: device.gpu_malloc(dl, n(desc.material_set_capacity), "material sets")?,
             lights: device.gpu_malloc(dl, n(desc.light_capacity), "lights")?,
+            emissive: device.gpu_malloc(
+                dl,
+                n(desc.producer_capacity + desc.emissive_capacity),
+                "emissive list",
+            )?,
+            producers: device.gpu_malloc(dl, n(desc.producer_capacity), "producers")?,
+            batches: device.gpu_malloc(dl, n(desc.producer_capacity), "producer batches")?,
+            producer_counts: device.gpu_malloc(dl, n(desc.producer_capacity), "producer counts")?,
             sky_stats: device.gpu_malloc(dl, 1, "sky stats")?,
         };
         // Tables start zeroed: empty slots, the null group, no lights. These apply before
@@ -246,6 +279,13 @@ impl Scene {
                 tables.material_sets.size,
             ),
             zero(tables.lights.gpu.address(), tables.lights.size),
+            zero(tables.emissive.gpu.address(), tables.emissive.size),
+            zero(tables.producers.gpu.address(), tables.producers.size),
+            zero(tables.batches.gpu.address(), tables.batches.size),
+            zero(
+                tables.producer_counts.gpu.address(),
+                tables.producer_counts.size,
+            ),
             zero(tables.sky_stats.gpu.address(), tables.sky_stats.size),
         ];
         Ok(Self {
@@ -254,6 +294,11 @@ impl Scene {
             cpu: Mutex::new(SceneCpu {
                 slots: RangeAllocator::new(desc.instance_capacity),
                 removed: Vec::new(),
+                emissive: RangeAllocator::new(desc.emissive_capacity),
+                emissive_runs: Runs::default(),
+                emissive_removed: Vec::new(),
+                producers: (0..desc.producer_capacity).map(|_| None).collect(),
+                retired: Vec::new(),
                 groups: vec![None],
                 records,
                 focus: None,
@@ -279,6 +324,8 @@ pub struct SceneWriter<'f> {
     pub(crate) seq: &'f AtomicU64,
     pub(crate) frame: u64,
     pub(crate) cell_log2: u32,
+    /// Emission by `ModelId`.
+    pub(crate) models: &'f [Option<ModelEmission>],
 }
 
 impl Drop for SceneWriter<'_> {
@@ -427,19 +474,64 @@ impl<'f> SceneWriter<'f> {
             + byte as u64
     }
 
-    /// `desc.copies` new instance slots.
+    /// `desc.copies` new instance slots, and an emissive list entry per copy for each
+    /// EMISSIVE span of the model.
     pub fn add_instances(&mut self, desc: &InstancesDesc) -> Result<InstanceRange> {
-        let first = self
-            .scene
-            .cpu
-            .lock()
-            .unwrap()
-            .slots
-            .alloc(desc.copies)
-            .ok_or(Error::Capacity {
+        let emission = self
+            .models
+            .get(desc.model.0 as usize)
+            .and_then(Option::as_ref)
+            .filter(|m| !m.spans.is_empty());
+        let (first, entry) = {
+            let cpu = &mut *self.scene.cpu.lock().unwrap();
+            let first = cpu.slots.alloc(desc.copies).ok_or(Error::Capacity {
                 what: "instances",
                 capacity: self.scene.desc.instance_capacity,
             })?;
+            let entry = match emission {
+                None => None,
+                Some(m) => {
+                    let spans = m.spans.len() as u32;
+                    let Some(entry) = cpu.emissive.alloc(desc.copies * spans) else {
+                        cpu.slots.free(first, desc.copies);
+                        return Err(Error::Capacity {
+                            what: "emissive list entries",
+                            capacity: self.scene.desc.emissive_capacity,
+                        });
+                    };
+                    let run = Run {
+                        copies: desc.copies,
+                        entry,
+                        spans,
+                    };
+                    cpu.emissive_runs.insert(first, run);
+                    Some(entry)
+                }
+            };
+            (first, entry)
+        };
+        if let (Some(m), Some(entry)) = (emission, entry) {
+            let entries = self.upload(
+                self.emissive_entry(entry),
+                desc.copies * m.spans.len() as u32,
+            )?;
+            for (e, (copy, span)) in entries
+                .iter_mut()
+                .zip((0..desc.copies).flat_map(|c| m.spans.iter().map(move |s| (c, s))))
+            {
+                *e = EmissiveGpu {
+                    kind: EMISSIVE_INSTANCE,
+                    source: first + copy,
+                    first_cluster: span.first_cluster,
+                    cluster_count: span.cluster_count,
+                    section: u32::from(span.section),
+                    sections: m.sections,
+                    material: m.materials[usize::from(span.section)].0,
+                    model_area: span.area,
+                    ..Zeroable::zeroed()
+                };
+            }
+        }
         let range = InstanceRange {
             first,
             count: desc.copies,
@@ -540,14 +632,70 @@ impl<'f> SceneWriter<'f> {
         )
     }
 
-    /// Empties the slots of `range`; they are reused once this frame has completed.
+    /// Instance entry `entry` of the emissive list.
+    fn emissive_entry(&self, entry: u32) -> GpuPtr<EmissiveGpu> {
+        self.scene
+            .tables
+            .emissive
+            .gpu
+            .offset(u64::from(self.scene.desc.producer_capacity + entry))
+    }
+
+    /// Empties the slots of `range` and their emissive list entries; they are reused once
+    /// this frame has completed.
     pub fn remove(&mut self, range: InstanceRange) {
         let n = range.count * words(size_of::<InstanceGpu>());
         let seq = self.next_seq();
-        let mut cpu = self.scene.cpu.lock().unwrap();
+        let cpu = &mut *self.scene.cpu.lock().unwrap();
         cpu.records
             .push(Record::fill(seq, self.instance_word(range.first, 0), n, 0));
         cpu.removed.push((self.frame, range));
+        for (entry, count) in cpu.emissive_runs.remove(range.first, range.count) {
+            let at = self.emissive_entry(entry).address().0;
+            let n = count * words(size_of::<EmissiveGpu>());
+            cpu.records.push(Record::fill(seq, at, n, 0));
+            cpu.emissive_removed.push((self.frame, entry, count));
+        }
+    }
+
+    /// Sets or clears producer entry `id`. Setting allocates the entry's batch and resets
+    /// its counts; the previous batch, if any, is freed once this frame has completed.
+    pub fn set_producer(&mut self, id: ProducerId, desc: Option<&ProducerDesc<'_>>) -> Result<()> {
+        assert!(
+            id.0 < self.scene.desc.producer_capacity,
+            "{id:?} outside the producer table"
+        );
+        let t = &self.scene.tables;
+        let i = u64::from(id.0);
+        let counts = t.producer_counts.gpu.offset(i);
+        let (record, batch, entry, producer) = match desc {
+            None => (
+                ProducerGpu::zeroed(),
+                ProducerBatch::zeroed(),
+                EmissiveGpu::zeroed(),
+                None,
+            ),
+            Some(d) => {
+                let b = producer::build(self.device, d, counts)?;
+                let words = self.upload(b.static_at, (b.static_bytes.len() / 4) as u32)?;
+                bytemuck::cast_slice_mut(words).copy_from_slice(&b.static_bytes);
+                let entry = EmissiveGpu {
+                    kind: EMISSIVE_PRODUCER,
+                    source: id.0,
+                    ..Zeroable::zeroed()
+                };
+                (b.record, b.batch, entry, Some(b.producer))
+            }
+        };
+        self.write(t.producers.gpu.offset(i), record)?;
+        self.write(t.batches.gpu.offset(i), batch)?;
+        self.write(t.emissive.gpu.offset(i), entry)?;
+        self.push(Record::fill(self.next_seq(), counts.address().0, 2, 0));
+        let cpu = &mut *self.scene.cpu.lock().unwrap();
+        if let Some(old) = std::mem::replace(&mut cpu.producers[id.0 as usize], producer) {
+            cpu.retired.push((self.frame, old));
+        }
+        Ok(())
     }
 
     /// Sets or clears light `id`.
