@@ -1,9 +1,10 @@
+use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::{env, fs};
 
 use super::Error;
-use super::compile::{canonical, out_dir, write};
+use super::compile::{canonical, out_dir, read, write};
+use super::link::{self, Link, LinkPoint};
 use super::slang::{GlobalSession, Library};
 
 /// Options of the C++ session; include roots follow.
@@ -37,6 +38,7 @@ pub struct CpuLibrary {
     sources: Vec<PathBuf>,
     includes: Vec<PathBuf>,
     defines: Vec<String>,
+    links: Vec<Link>,
     out_dir: Option<PathBuf>,
 }
 
@@ -48,6 +50,7 @@ impl CpuLibrary {
             sources: Vec::new(),
             includes: Vec::new(),
             defines: Vec::new(),
+            links: Vec::new(),
             out_dir: None,
         })
     }
@@ -71,6 +74,19 @@ impl CpuLibrary {
         self
     }
 
+    /// Links Slang type `ty` from `module` into every source that declares `point`, with
+    /// the same generated module and ids as [`Build::link`](super::Build::link).
+    pub fn link(
+        mut self,
+        point: LinkPoint,
+        name: &str,
+        module: impl AsRef<Path>,
+        ty: &str,
+    ) -> Self {
+        self.links.push(Link::new(point, name, module.as_ref(), ty));
+        self
+    }
+
     /// Writes the C++ here instead of `OUT_DIR`.
     pub fn out_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.out_dir = Some(dir.as_ref().to_path_buf());
@@ -85,10 +101,13 @@ impl CpuLibrary {
             .map(PathBuf::from)
             .ok_or(Error::NoManifestDir)?;
         let out_dir = out_dir(self.out_dir.as_deref())?;
+        let links = link::resolve(&self.links)?;
+        let link_dirs = link::module_dirs(&links);
         let mut options: Vec<String> = OPTIONS.iter().map(|s| (*s).to_owned()).collect();
         for dir in self
             .includes
             .iter()
+            .chain(&link_dirs)
             .map(PathBuf::as_path)
             .chain([Path::new(crate::LIB_DIR)])
         {
@@ -112,17 +131,29 @@ impl CpuLibrary {
         let session = global.whole_program_session(&options).map_err(slang_err)?;
         let mut modules = Vec::new();
         let mut inputs = Vec::new();
+        let mut declared = Vec::new();
         for source in &self.sources {
             let path = canonical(&manifest.join(source))?;
-            let text = fs::read_to_string(&path).map_err(|source| Error::Io {
-                path: path.clone(),
-                source,
-            })?;
+            let text = read(&path)?;
             let stem = path
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let module = session.load(&stem, &path, &text).map_err(compile_err)?;
+            inputs.extend(module.dependencies());
+            modules.push(module);
+            declared.extend(link::declared(&text));
+        }
+        declared.sort();
+        declared.dedup();
+        for decl in &declared {
+            let Some(m) = link::write_module(decl, &links, &out_dir.join(format!("{name}-link")))?
+            else {
+                continue;
+            };
+            let module = session
+                .load(&m.module, &m.path, &m.source)
+                .map_err(compile_err)?;
             inputs.extend(module.dependencies());
             modules.push(module);
         }

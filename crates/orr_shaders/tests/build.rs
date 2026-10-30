@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use orr_shaders::build::{Build, Error, Lint, Output};
+use orr_shaders::build::{Build, Error, LinkPoint, Lint, Output};
 
 /// Writes `files` under a fresh directory named for the test and returns it.
 fn fixture(name: &str, files: &[(&str, &str)]) -> PathBuf {
@@ -363,4 +363,123 @@ fn omm_variant_declares_the_mode_and_forces_two_state() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// The surface interface in the shape the build's method table forwards.
+const SURFACE: &str = "module surface;\n\
+    public struct SurfaceInput { public uint surface; public float x; }\n\
+    public struct GSurface { public float4 albedo; }\n\
+    public interface ISurface {\n\
+        static GSurface surface(SurfaceInput i, out float depth_offset);\n\
+        static float coverage(SurfaceInput i) { return 1; }\n\
+    }\n\
+    public struct StandardSurface : ISurface {\n\
+        public static GSurface surface(SurfaceInput i, out float d) { d = 0; return { float4(0) }; }\n\
+    }\n";
+
+/// A consumer surface returning `value`.
+fn consumer_surface(ty: &str, value: &str) -> String {
+    format!(
+        "import surface;\nstruct {ty} : ISurface {{ static GSurface surface(SurfaceInput i, out float d) {{ d = 0; return {{ float4({value}) }}; }} }}\n"
+    )
+}
+
+const MEDIA: &str = "module media;\n\
+    public interface IMedium { static float density(uint64_t data); }\n\
+    public struct NoMedium : IMedium { public static float density(uint64_t data) { return 0; } }\n";
+
+/// A renderer root with a surface kernel, a medium kernel and one that links nothing, built
+/// once; returns the fixture and the renderer's output.
+fn link_fixture(name: &str) -> (PathBuf, Output) {
+    let surface_kernel = format!(
+        "import surface;\nextern struct Surface : ISurface = StandardSurface;\n{}",
+        kernel(
+            "SurfaceInput i = { root.count, 1.0 }; float d; root.out[id.x] = Surface.surface(i, d).albedo * Surface.coverage(i) + d;"
+        )
+    );
+    let medium_kernel = format!(
+        "import media;\nextern struct Medium : IMedium = NoMedium;\n{}",
+        kernel("root.out[id.x] = Medium.density(0);")
+    );
+    let dir = fixture(
+        name,
+        &[
+            ("src/surface.slang", SURFACE),
+            ("src/media.slang", MEDIA),
+            ("src/resolve.slang", &surface_kernel),
+            ("src/fog.slang", &medium_kernel),
+            ("src/plain.slang", &kernel("root.out[id.x] = 1;")),
+            (
+                "consumer/ground.slang",
+                &consumer_surface("Ground", "i.x * 2"),
+            ),
+            ("consumer/grass.slang", &consumer_surface("Grass", "3")),
+            (
+                "consumer/air.slang",
+                "import media;\nstruct Air : IMedium { static float density(uint64_t data) { return 0.5; } }\n",
+            ),
+        ],
+    );
+    let renderer = build(&dir).compile().unwrap_or_else(|e| panic!("{e}"));
+    (dir, renderer)
+}
+
+fn consumer(dir: &Path, renderer: &Output) -> Build {
+    Build::new()
+        .unwrap_or_else(|e| panic!("{e}"))
+        .roots(&renderer.shader_dirs)
+        .link_points(&renderer.link_points.display().to_string())
+        .metal_check(false)
+        .out_dir(dir.join("consumer-out"))
+}
+
+#[test]
+fn editing_a_linked_module_recompiles_only_the_kernels_it_links_into() {
+    let (dir, renderer) = link_fixture("link-incremental");
+    let ground = dir.join("consumer/ground.slang");
+    let compiled = |extra: bool| {
+        let b = consumer(&dir, &renderer)
+            .link(LinkPoint::Surface, "ground", &ground, "Ground")
+            .link(
+                LinkPoint::Medium,
+                "air",
+                dir.join("consumer/air.slang"),
+                "Air",
+            );
+        let b = if extra {
+            b.link(
+                LinkPoint::Surface,
+                "grass",
+                dir.join("consumer/grass.slang"),
+                "Grass",
+            )
+        } else {
+            b
+        };
+        b.compile().unwrap_or_else(|e| panic!("{e}")).compiled
+    };
+    assert_eq!(compiled(false), ["linked/fog", "linked/resolve"]);
+    assert!(compiled(false).is_empty());
+    fs::write(&ground, consumer_surface("Ground", "i.x * 4")).unwrap();
+    assert_eq!(compiled(false), ["linked/resolve"]);
+    assert_eq!(compiled(true), ["linked/resolve"]);
+}
+
+#[test]
+fn link_calls_are_checked() {
+    let (dir, renderer) = link_fixture("link-errors");
+    let air = dir.join("consumer/air.slang");
+    let ground = dir.join("consumer/ground.slang");
+    let message = |b: Build| match b.compile() {
+        Err(Error::Link { message }) => message,
+        other => panic!("expected a link error, got {other:?}"),
+    };
+    let twice = consumer(&dir, &renderer)
+        .link(LinkPoint::Medium, "air", &air, "Air")
+        .link(LinkPoint::Medium, "fog", &air, "Air");
+    assert!(message(twice).contains("at most 1"));
+    let undeclared = consumer(&dir, &renderer).link(LinkPoint::Environment, "sky", &air, "Air");
+    assert!(message(undeclared).contains("no kernel"));
+    let name = consumer(&dir, &renderer).link(LinkPoint::Surface, "Ground", &ground, "Ground");
+    assert!(message(name).contains("lower-case"));
 }
