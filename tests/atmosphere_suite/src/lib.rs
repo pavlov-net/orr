@@ -114,13 +114,13 @@ impl Rig {
         let listed = [self.scene];
         let mut f = self
             .renderer
-            .begin_frame(&FrameDesc {
+            .begin_frame(FrameDesc {
                 time: FrameTime {
                     absolute: f64::from(self.frames) / 60.0,
                     delta: 1.0 / 60.0,
                 },
                 scenes: &listed,
-                low_latency: None,
+                display: None,
             })
             .unwrap();
         self.frame_id = f.id();

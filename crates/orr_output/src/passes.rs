@@ -29,7 +29,7 @@ pub struct OutputKernels {
     meter: ComputePipeline,
     adapt: ComputePipeline,
     tonemap: ComputePipeline,
-    compose: ComputePipeline,
+    compose: ComposeKernel,
     scene_referred: ComputePipeline,
 }
 
@@ -336,6 +336,35 @@ impl ComposeRoot {
     }
 }
 
+/// The compose kernel on its own, for a display's present thread.
+pub(crate) struct ComposeKernel(ComputePipeline);
+
+impl ComposeKernel {
+    pub(crate) fn new(gpu: &Device) -> Result<Self> {
+        let stage = ShaderStage::new(&compose::MODULE, "main", SpecData::default())?;
+        Ok(Self(gpu.create_compute_pipeline(&stage, "compose")?))
+    }
+
+    pub(crate) fn record(
+        &self,
+        list: &mut CommandList<'_>,
+        root: &mut ComposeRoot,
+        pass: &ComposePass<'_>,
+    ) {
+        root.upload.as_mut_slice().expect("upload memory")[0] = compose::Root {
+            target: pass.target,
+            ..compose_root(pass.source, pass.ui, pass.extent, pass.display)
+        };
+        let name = match pass.source {
+            ComposeSource::Linear(_) => "compose",
+            _ => "compose_ui",
+        };
+        list.begin_pass(name, false);
+        list.dispatch(&self.0, root.upload.gpu, groups(pass.extent, 8));
+        list.end_pass();
+    }
+}
+
 impl OutputKernels {
     pub fn new(gpu: &Device) -> Result<Self> {
         let pipeline = |module, name| -> Result<ComputePipeline> {
@@ -347,7 +376,7 @@ impl OutputKernels {
             meter: pipeline(&meter::MODULE, "meter")?,
             adapt: pipeline(&adapt::MODULE, "adapt")?,
             tonemap: pipeline(&tonemap::MODULE, "tonemap")?,
-            compose: pipeline(&compose::MODULE, "compose")?,
+            compose: ComposeKernel::new(gpu)?,
             scene_referred: gpu.create_compute_pipeline(
                 &ShaderStage::new(&compose::MODULE, "scene_referred", SpecData::default())?,
                 "screenshot_scene_referred",
@@ -576,17 +605,7 @@ impl OutputKernels {
         root: &mut ComposeRoot,
         pass: &ComposePass<'_>,
     ) {
-        root.upload.as_mut_slice().expect("upload memory")[0] = compose::Root {
-            target: pass.target,
-            ..compose_root(pass.source, pass.ui, pass.extent, pass.display)
-        };
-        let name = match pass.source {
-            ComposeSource::Linear(_) => "compose",
-            _ => "compose_ui",
-        };
-        list.begin_pass(name, false);
-        list.dispatch(&self.compose, root.upload.gpu, groups(pass.extent, 8));
-        list.end_pass();
+        self.compose.record(list, root, pass);
     }
 
     /// Records a display capture into readback memory the view holds until
@@ -605,7 +624,7 @@ impl OutputKernels {
         };
         let root = view.roots(pass.frame).put(CAPTURE_ROOT, &root);
         list.begin_pass("screenshot", false);
-        list.dispatch(&self.compose, root, groups(pass.extent, 8));
+        list.dispatch(&self.compose.0, root, groups(pass.extent, 8));
         list.end_pass();
         list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
         Ok(())

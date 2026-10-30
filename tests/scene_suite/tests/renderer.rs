@@ -14,13 +14,13 @@ fn empty_frames_and_scene_frames_submit_in_order() {
     let mut last = None;
     for i in 0..4 {
         let f = r
-            .begin_frame(&FrameDesc {
+            .begin_frame(FrameDesc {
                 time: FrameTime {
                     absolute: f64::from(i) / 60.0,
                     delta: 1.0 / 60.0,
                 },
                 scenes: &[],
-                low_latency: None,
+                display: None,
             })
             .unwrap();
         ids.push(f.id());
@@ -33,10 +33,10 @@ fn empty_frames_and_scene_frames_submit_in_order() {
     let list = [s];
     for i in 0..3 {
         let mut f = r
-            .begin_frame(&FrameDesc {
+            .begin_frame(FrameDesc {
                 time: FrameTime::default(),
                 scenes: &list,
-                low_latency: None,
+                display: None,
             })
             .unwrap();
         f.scene(s)
@@ -63,10 +63,10 @@ fn empty_frames_and_scene_frames_submit_in_order() {
     }
     wait(last.unwrap());
     let f = r
-        .begin_frame(&FrameDesc {
+        .begin_frame(FrameDesc {
             time: FrameTime::default(),
             scenes: &[],
-            low_latency: None,
+            display: None,
         })
         .unwrap();
     wait(f.end().unwrap());
