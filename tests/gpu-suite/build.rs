@@ -4,7 +4,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use orr_shaders::build::Build;
+use orr_shaders::build::{Build, DebugInfo};
 
 /// The `rtas` records the kernels use, mirrored in `orr_gpu::rtas`.
 const RTAS_RECORDS: &[&str] = &[
@@ -28,7 +28,7 @@ fn main() {
             let mut b = b
                 .kernels(dir.join("src"))
                 .roots(&gpu)
-                .debug_info(true)
+                .debug_info(DebugInfo::Embedded)
                 .metal_check(false);
             for t in RTAS_RECORDS {
                 b = b.extern_type(t, &format!("::orr_gpu::rtas::{t}"));

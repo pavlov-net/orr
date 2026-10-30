@@ -24,6 +24,8 @@ pub struct ShaderStage<'a> {
     /// The opacity-micromap variant; used instead of `spirv` when `Caps::omm` is set and it
     /// is not empty.
     pub spirv_omm: &'a [u32],
+    /// The path of `spirv`'s separated debug info, handed to Aftermath; empty for none.
+    pub debug_info: &'a str,
     pub entry: &'a EntryPoint,
     pub spec: SpecData<'a>,
 }
@@ -37,6 +39,7 @@ impl<'a> ShaderStage<'a> {
         Ok(Self {
             spirv: module.spirv,
             spirv_omm: module.spirv_omm,
+            debug_info: module.debug_info,
             entry,
             spec,
         })
@@ -173,8 +176,20 @@ impl<'a> StageParts<'a> {
         } else {
             Cow::Borrowed(code)
         };
+        if !shared.caps.shader_abort && spirv::aborts(&code) {
+            return Err(Error::Shader(format!(
+                "{name}: the module was built with asserts, which need shaderAbort, and the device has none; build the shaders with ORR_SHADER_ASSERTS=0"
+            )));
+        }
         if shared.caps.aftermath {
-            super::aftermath::add_shader(&code);
+            // A sidecar that is not on this machine leaves the dump without source lines.
+            if !s.debug_info.is_empty()
+                && let Ok(sidecar) = std::fs::read(s.debug_info)
+            {
+                super::aftermath::add_sidecar(&code, &sidecar);
+            } else {
+                super::aftermath::add_shader(&code);
+            }
         }
         Ok(Self {
             code,

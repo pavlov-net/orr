@@ -24,6 +24,7 @@ pub(crate) struct Kernel<'a> {
     pub(crate) name: &'a str,
     pub(crate) spv: &'a Path,
     pub(crate) omm: Option<&'a Path>,
+    pub(crate) debug_info: Option<&'a Path>,
     pub(crate) hash: u64,
     /// Shared by every entry point: they share the root and the constants.
     pub(crate) interface: u64,
@@ -172,9 +173,12 @@ fn emit_module(out: &mut String, item: &str, k: &Kernel<'_>, manifest: &Path) {
         ),
         None => "&[]".to_owned(),
     };
+    let debug_info = k
+        .debug_info
+        .map_or_else(String::new, |p| p.display().to_string());
     let _ = writeln!(
         out,
-        "{item}: ::orr_shaders::ShaderModule = ::orr_shaders::ShaderModule {{\n    name: {name:?},\n    kernel: {name:?},\n    spirv: ::orr_shaders::aligned_spirv!({spv:?}),\n    spirv_omm: {omm},\n    hash: {hash:#018x},\n    manifest: {manifest:?},\n    entry_points: &[",
+        "{item}: ::orr_shaders::ShaderModule = ::orr_shaders::ShaderModule {{\n    name: {name:?},\n    kernel: {name:?},\n    spirv: ::orr_shaders::aligned_spirv!({spv:?}),\n    spirv_omm: {omm},\n    debug_info: {debug_info:?},\n    hash: {hash:#018x},\n    manifest: {manifest:?},\n    entry_points: &[",
         name = k.name,
         spv = k.spv.display().to_string(),
         hash = k.hash,

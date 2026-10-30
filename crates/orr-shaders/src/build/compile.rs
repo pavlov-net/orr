@@ -894,10 +894,14 @@ fn cache_key(settings: &Settings<'_>, job: &Job, inputs: &[PathBuf]) -> Option<S
 fn load_record(settings: &Settings<'_>, job: &Job) -> Option<Record> {
     let record: Record = serde_json::from_slice(&fs::read(&job.record).ok()?).ok()?;
     let key = cache_key(settings, job, &record.inputs)?;
-    let outputs_exist = [Some(&record.spv), record.omm.as_ref(), record.debug_info.as_ref()]
-        .into_iter()
-        .flatten()
-        .all(|p| p.is_file());
+    let outputs_exist = [
+        Some(&record.spv),
+        record.omm.as_ref(),
+        record.debug_info.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .all(|p| p.is_file());
     (record.key == key && record.kernel == job.path && outputs_exist).then_some(record)
 }
 
@@ -974,18 +978,25 @@ fn compile_one(
     let program = session
         .link(&module, &extra, |_| true)
         .map_err(compile_err)?;
-    let (words, debug_info) = if settings.separate_debug {
+    // A stripped module has no names, which the model reads; the sidecar is the whole
+    // module.
+    let (words, full, debug_info) = if settings.separate_debug {
         let (stripped, debug) = program.spirv_separated().map_err(compile_err)?;
         let path = job.spv.with_extension("dbg.spv");
         write(&path, &words_to_bytes(&debug))?;
-        (spirv::restore_strings(stripped, &debug), Some(path))
+        (
+            spirv::restore_strings(stripped, &debug),
+            Some(debug),
+            Some(path),
+        )
     } else {
-        (program.spirv().map_err(compile_err)?, None)
+        (program.spirv().map_err(compile_err)?, None, None)
     };
     write(&job.spv, &words_to_bytes(&words))?;
     let layout = program.layout().map_err(compile_err)?;
+    let named = full.as_deref().unwrap_or(&words);
     let model =
-        model::extract(&session, layout, &words, settings.precompiled).map_err(|message| {
+        model::extract(&session, layout, named, settings.precompiled).map_err(|message| {
             Error::Reflection {
                 module: name.to_owned(),
                 message,

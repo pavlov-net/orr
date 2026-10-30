@@ -11,6 +11,9 @@ pub struct ShaderModule {
     /// The same module with the opacity-micromap execution mode on every entry point, for
     /// devices with the micromap feature; empty when the module has no ray query.
     pub spirv_omm: &'static [u32],
+    /// The absolute path of `spirv`'s separated debug info (`<name>.dbg.spv`); empty when the
+    /// debug info is embedded or off.
+    pub debug_info: &'static str,
     /// A hash of `spirv`.
     pub hash: u64,
     /// The absolute path of the build manifest that lists the module's inputs.

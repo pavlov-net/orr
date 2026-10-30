@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use orr_shaders::build::{Build, Error, LinkPoint, Lint, Output};
+use orr_shaders::build::{Build, DebugInfo, Error, LinkPoint, Lint, Output};
 
 /// Writes `files` under a fresh directory named for the test and returns it.
 fn fixture(name: &str, files: &[(&str, &str)]) -> PathBuf {
@@ -554,7 +554,7 @@ fn precompiled_modules_give_the_same_spirv_and_rust() {
         let [on, off] = [true, false].map(|on| {
             let out = dir.join(if on { "on" } else { "off" });
             let built = build(&dir)
-                .debug_info(false)
+                .debug_info(DebugInfo::Off)
                 .asserts(true)
                 .precompile(on)
                 .out_dir(&out)
@@ -627,7 +627,7 @@ fn linked_kernels_load_precompiled_consumer_modules() {
                 dir.join("consumer/air.slang"),
                 "Air",
             )
-            .debug_info(false)
+            .debug_info(DebugInfo::Off)
             .precompile(on)
             .out_dir(&out)
             .compile()
@@ -669,4 +669,143 @@ fn cooperative_vectors_stay_out_of_records() {
             other => panic!("a cooperative vector in memory compiled: {other:?}"),
         }
     }
+}
+
+const OP_STRING: u32 = 7;
+const OP_EXT_INST_IMPORT: u32 = 11;
+const OP_EXT_INST: u32 = 12;
+
+/// The SPIR-V literal string in `words`, up to its nul.
+fn literal(words: &[u32]) -> String {
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// The `NonSemantic.Shader.DebugInfo.100` instruction numbers a module uses.
+fn debug_instructions(words: &[u32]) -> Vec<u32> {
+    let ops = instructions(words);
+    let Some(set) = ops.iter().find_map(|(op, a)| {
+        (*op == OP_EXT_INST_IMPORT && literal(&a[1..]) == "NonSemantic.Shader.DebugInfo.100")
+            .then_some(a[0])
+    }) else {
+        return Vec::new();
+    };
+    ops.iter()
+        .filter(|(op, a)| *op == OP_EXT_INST && a[2] == set)
+        .map(|(_, a)| a[3])
+        .collect()
+}
+
+#[test]
+fn separate_debug_info_strips_the_module_into_a_sidecar() {
+    const DEBUG_SOURCE: u32 = 35;
+    const DEBUG_LINE: u32 = 103;
+    const DEBUG_BUILD_IDENTIFIER: u32 = 105;
+    // A precompiled import, and an array in a pointee, which the model knows by its SPIR-V
+    // wrapper struct's name.
+    let src = "#include \"orr/debug.h\"\n\
+        struct Rec { uint3 a[2]; uint b; }\n\
+        struct Root { Rec* recs; uint count; uint pad; }\n\
+        [[vk::binding(0, 0)]] ConstantBuffer<Root> root;\n\
+        [shader(\"compute\")] [numthreads(32, 1, 1)]\n\
+        void main(uint3 id: SV_DispatchThreadID) {\n\
+            orr_assert(id.x < root.count, \"past the end\");\n\
+            root.recs[id.x].b = root.recs[id.x].a[1].y;\n\
+        }\n";
+    let dir = fixture("separate_debug", &[("src/k.slang", src)]);
+    let out = build(&dir)
+        .debug_info(DebugInfo::Separate)
+        .asserts(true)
+        .compile()
+        .unwrap_or_else(|e| panic!("{e}"));
+    let stripped = read_words(&dir.join("out/k.spv"));
+    let sidecar = dir.join("out/k.dbg.spv");
+    let kept = debug_instructions(&stripped);
+    let debug = debug_instructions(&read_words(&sidecar));
+    assert!(kept.contains(&DEBUG_BUILD_IDENTIFIER), "{kept:?}");
+    assert!(!kept.contains(&DEBUG_SOURCE) && !kept.contains(&DEBUG_LINE));
+    assert!(debug.contains(&DEBUG_SOURCE) && debug.contains(&DEBUG_LINE));
+    // The assert's printf format stays in the stripped module.
+    let strings: Vec<String> = instructions(&stripped)
+        .into_iter()
+        .filter(|(op, _)| *op == OP_STRING)
+        .map(|(_, a)| literal(&a[1..]))
+        .collect();
+    assert!(
+        strings.iter().any(|s| s.ends_with(": past the end")),
+        "{strings:?}"
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&out.manifest).unwrap()).unwrap();
+    let listed = manifest["modules"][0]["debug_info"].as_str().unwrap();
+    assert_eq!(
+        Path::new(listed).canonicalize().unwrap(),
+        sidecar.canonicalize().unwrap()
+    );
+    let rust = fs::read_to_string(dir.join("out/orr_shaders.rs")).unwrap();
+    assert!(rust.contains(&format!("debug_info: {listed:?}")), "{rust}");
+
+    build(&dir)
+        .debug_info(DebugInfo::Embedded)
+        .compile()
+        .unwrap_or_else(|e| panic!("{e}"));
+    let embedded = debug_instructions(&read_words(&dir.join("out/k.spv")));
+    assert!(embedded.contains(&DEBUG_LINE));
+    let rust = fs::read_to_string(dir.join("out/orr_shaders.rs")).unwrap();
+    assert!(rust.contains("debug_info: \"\""), "{rust}");
+}
+
+#[test]
+fn orr_assert_aborts_with_its_location_only_when_asserts_are_linked() {
+    const OP_CONSTANT: u32 = 43;
+    const OP_CONSTANT_COMPOSITE: u32 = 44;
+    const OP_ABORT: u32 = 5121;
+    let src = format!(
+        "#include \"orr/debug.h\"\n{}",
+        kernel(
+            "orr_assert(id.x < root.count, \"thread %u past %u\", id.x, root.count);\n root.out[id.x] = float4(id.x);"
+        )
+    );
+    let dir = fixture("asserts", &[("src/k.slang", &src)]);
+    let imports = |words: &[u32]| -> Vec<String> {
+        instructions(words)
+            .into_iter()
+            .filter(|(op, _)| *op == OP_EXT_INST_IMPORT)
+            .map(|(_, a)| literal(&a[1..]))
+            .collect()
+    };
+
+    build(&dir)
+        .asserts(false)
+        .compile()
+        .unwrap_or_else(|e| panic!("{e}"));
+    let off = read_words(&dir.join("out/k.spv"));
+    assert!(!instructions(&off).iter().any(|(op, _)| *op == OP_ABORT));
+    assert!(!imports(&off).iter().any(|i| i == "NonSemantic.DebugPrintf"));
+
+    build(&dir)
+        .asserts(true)
+        .compile()
+        .unwrap_or_else(|e| panic!("{e}"));
+    let on = read_words(&dir.join("out/k.spv"));
+    assert!(imports(&on).iter().any(|i| i == "NonSemantic.DebugPrintf"));
+    // The abort's message: a struct holding the text as a uint array.
+    let ops = instructions(&on);
+    let value = |id: u32| {
+        ops.iter()
+            .find(|(op, a)| matches!(*op, OP_CONSTANT | OP_CONSTANT_COMPOSITE) && a[1] == id)
+            .map(|(_, a)| &a[2..])
+            .unwrap()
+    };
+    let (_, message) = ops.iter().find(|(op, _)| *op == OP_ABORT).unwrap();
+    let fields = value(message[1]);
+    let text: Vec<u32> = value(fields[0]).iter().map(|&id| value(id)[0]).collect();
+    let text = literal(&text);
+    let kernel_path = dir.join("src/k.slang").canonicalize().unwrap();
+    let file = text
+        .strip_suffix(":5: thread %u past %u")
+        .unwrap_or_else(|| panic!("{text}"));
+    assert_eq!(Path::new(file).canonicalize().unwrap(), kernel_path);
 }

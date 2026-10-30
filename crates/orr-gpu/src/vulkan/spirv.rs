@@ -2,6 +2,8 @@
 
 use std::borrow::Cow;
 
+const OP_CAPABILITY: u32 = 17;
+const CAPABILITY_ABORT: u32 = 5120;
 const OP_ENTRY_POINT: u32 = 15;
 const OP_VARIABLE: u32 = 59;
 const STORAGE_TASK_PAYLOAD: u32 = 5402;
@@ -17,6 +19,13 @@ fn instructions(code: &[u32]) -> impl Iterator<Item = (usize, &[u32])> {
         at += count.max(1);
         Some((start, inst))
     })
+}
+
+/// Whether the module declares `AbortKHR`, which needs `shaderAbort`.
+pub(super) fn aborts(code: &[u32]) -> bool {
+    instructions(code)
+        .take_while(|(_, inst)| inst[0] & 0xffff == OP_CAPABILITY)
+        .any(|(_, inst)| inst.get(1) == Some(&CAPABILITY_ABORT))
 }
 
 /// The interface ids of entry point `name`.
