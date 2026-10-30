@@ -6,6 +6,7 @@
 
 mod archive;
 mod blob;
+pub mod clip;
 mod codec;
 mod format;
 pub mod instance;
@@ -13,6 +14,7 @@ pub mod material;
 pub mod mesh;
 pub mod model;
 pub mod raster;
+pub mod skeleton;
 pub mod texture;
 mod writer;
 
@@ -106,9 +108,30 @@ pub struct Affine3 {
 }
 
 impl Affine3 {
+    pub const IDENTITY: Self = Self {
+        rows: [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ],
+    };
+
     pub fn transform_point(&self, p: [f32; 3]) -> [f32; 3] {
         self.rows
             .map(|r| r[0] * p[0] + r[1] * p[1] + r[2] * p[2] + r[3])
+    }
+
+    /// `self x o`: `o` applies first.
+    pub fn mul(&self, o: &Self) -> Self {
+        let (a, b) = (&self.rows, &o.rows);
+        Self {
+            rows: std::array::from_fn(|i| {
+                std::array::from_fn(|j| {
+                    let t = if j == 3 { a[i][3] } else { 0.0 };
+                    a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j] + t
+                })
+            }),
+        }
     }
 }
 
@@ -153,6 +176,8 @@ const SCHEMAS: &[(Class, u16)] = &[
     (Class::Texture, texture::SCHEMA),
     (Class::InstancePage, instance::SCHEMA),
     (Class::RasterSet, raster::SCHEMA),
+    (Class::Skeleton, skeleton::SCHEMA),
+    (Class::Clip, clip::SCHEMA),
 ];
 
 impl Class {

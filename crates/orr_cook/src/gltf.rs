@@ -1,5 +1,10 @@
-//! glTF 2.0 import: the default scene's triangle primitives as one mesh, and the materials
-//! they use.
+//! glTF 2.0 import: the default scene's triangle primitives as one mesh, the materials they
+//! use, and with skins a skeleton and its clips ([`crate::skin`]).
+//!
+//! Without skins, node transforms are applied to the vertices. With skins, the mesh is in
+//! bind space: a skinned primitive's vertices stay as stored (glTF ignores its node's
+//! transform), take their joints and weights from `JOINTS_n`/`WEIGHTS_n`, and a primitive
+//! without a skin follows its nearest skeleton joint rigidly.
 //!
 //! Material mapping (glTF -> OpenPBR):
 //! - `baseColorFactor` rgb -> `base_color`; `metallicFactor` -> `metalness`;
@@ -24,10 +29,13 @@ use gltf::image::Source as ImageSource;
 use gltf::material::AlphaMode;
 use gltf::mesh::Mode;
 use gltf::texture::WrappingMode;
+use orr_pack::clip::Clip;
 use orr_pack::material::Material;
 use orr_pack::mesh::Section;
+use orr_pack::skeleton::SkeletonInfo;
 
-use crate::mesh::{MeshData, SectionData};
+use crate::mesh::{MeshData, SectionData, Skin};
+use crate::skin::{ClipSettings, Graph, Skeleton, influences};
 use crate::state::{Input, Memo};
 use crate::texture::Wrap;
 use crate::texture::material::{ImageFile, MaterialTextures, TexRef};
@@ -38,6 +46,9 @@ pub(crate) struct Imported {
     /// Name suffix, material and its images per mesh section.
     pub materials: Vec<(String, Material, MaterialTextures)>,
     pub images: Vec<ImageFile>,
+    pub skeleton: Option<SkeletonInfo>,
+    /// Clips by name; their skeleton id is left for the caller to set.
+    pub clips: Vec<(String, Clip)>,
     /// Every file read: the document, its buffers and images.
     pub files: Vec<Input>,
 }
@@ -48,9 +59,24 @@ struct Vertices {
     normals: Vec<[f32; 3]>,
     tangents: Vec<[f32; 4]>,
     uvs: Vec<[f32; 2]>,
+    joints: Vec<[u8; 4]>,
+    weights: Vec<[u8; 4]>,
 }
 
-pub(crate) fn import(asset: &str, path: &Path, memo: &Memo) -> Result<Imported> {
+/// How a primitive's vertices are skinned.
+enum Binding<'a> {
+    /// A skin: skeleton joint per skin joint.
+    Skin(&'a [u16]),
+    /// Rigidly on one joint.
+    Rigid(u8),
+}
+
+pub(crate) fn import(
+    asset: &str,
+    path: &Path,
+    memo: &Memo,
+    clip_settings: &ClipSettings,
+) -> Result<Imported> {
     let fail = |message: String| Error::Import {
         asset: asset.into(),
         message,
@@ -127,16 +153,38 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo) -> Result<Imported> 
         .default_scene()
         .or_else(|| doc.scenes().next())
         .ok_or_else(|| fail("no scene".into()))?;
+    let graph = Graph::new(&doc, &scene);
+    let mut skins: Vec<usize> = graph
+        .order
+        .iter()
+        .filter_map(|&n| {
+            let node = doc.nodes().nth(n)?;
+            node.mesh()?;
+            Some(node.skin()?.index())
+        })
+        .collect();
+    skins.sort_unstable();
+    skins.dedup();
+    let skeleton = Skeleton::build(&doc, &buffers, &graph, &skins).map_err(fail)?;
     let mut v = Vertices::default();
     let mut all_tangents = true;
     // Material, its images and triangles per glTF material index; usize::MAX is the default
     // material.
     let mut groups: BTreeMap<usize, (Material, MaterialTextures, Vec<u32>)> = BTreeMap::new();
-    let mut stack: Vec<_> = scene.nodes().map(|n| (n, Mat4::IDENTITY)).collect();
-    while let Some((node, parent)) = stack.pop() {
-        let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
-        stack.extend(node.children().map(|c| (c, world)));
+    for &n in &graph.order {
+        let node = doc.nodes().nth(n).expect("node index");
         let Some(mesh) = node.mesh() else { continue };
+        let (world, binding) = match (&skeleton, node.skin()) {
+            (None, _) => (graph.world[n], None),
+            (Some(sk), Some(s)) => (
+                Mat4::IDENTITY,
+                Some(Binding::Skin(sk.skin_joints(s.index()))),
+            ),
+            (Some(sk), None) => {
+                let (j, m) = sk.attach(n, &graph).map_err(fail)?;
+                (m, Some(Binding::Rigid(j as u8)))
+            }
+        };
         let linear = Mat3::from_mat4(world);
         let flip = linear.determinant() < 0.0;
         let normal_m = linear.inverse().transpose();
@@ -189,6 +237,42 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo) -> Result<Imported> 
             {
                 return Err(fail(format!("{}: attribute counts differ", what())));
             }
+            let skin: Vec<([u8; 4], [u8; 4])> = match &binding {
+                None => Vec::new(),
+                Some(Binding::Rigid(j)) => vec![([*j; 4], [255, 0, 0, 0]); n],
+                Some(Binding::Skin(map)) => {
+                    let mut sets = Vec::new();
+                    for set in 0.. {
+                        match (r.read_joints(set), r.read_weights(set)) {
+                            (None, None) => break,
+                            (Some(j), Some(w)) => {
+                                let j: Vec<[u16; 4]> = j.into_u16().collect();
+                                let w: Vec<[f32; 4]> = w.into_f32().collect();
+                                if j.len() != n || w.len() != n {
+                                    return Err(fail(format!(
+                                        "{}: attribute counts differ",
+                                        what()
+                                    )));
+                                }
+                                sets.push((j, w));
+                            }
+                            _ => {
+                                return Err(fail(format!(
+                                    "{}: JOINTS_{set} and WEIGHTS_{set} come in pairs",
+                                    what()
+                                )));
+                            }
+                        }
+                    }
+                    if sets.is_empty() {
+                        return Err(fail(format!("{}: skinned without JOINTS_0", what())));
+                    }
+                    (0..n)
+                        .map(|i| influences(&sets, map, i))
+                        .collect::<Result<_, _>>()
+                        .map_err(|m| fail(format!("{}: {m}", what())))?
+                }
+            };
 
             let base = v.positions.len() as u32;
             let mat = prim.material();
@@ -204,6 +288,8 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo) -> Result<Imported> 
                     v.normals.extend(normals);
                     v.tangents.extend(tangents);
                     v.uvs.extend(uvs);
+                    v.joints.extend(skin.iter().map(|s| s.0));
+                    v.weights.extend(skin.iter().map(|s| s.1));
                     tris.extend(indices.iter().map(|i| base + i));
                 }
                 // Without normals, glTF asks for flat shading: one vertex per corner.
@@ -217,6 +303,10 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo) -> Result<Imported> 
                             v.normals.push(face.to_array());
                             v.tangents.push(tangents[i as usize]);
                             v.uvs.push(uvs[i as usize]);
+                            if let Some(&(j, w)) = skin.get(i as usize) {
+                                v.joints.push(j);
+                                v.weights.push(w);
+                            }
                         }
                     }
                 }
@@ -254,6 +344,10 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo) -> Result<Imported> 
         indices.extend(tris);
         materials.push((suffix, m, t));
     }
+    let clips = match &skeleton {
+        Some(sk) => sk.clips(&doc, &buffers, clip_settings).map_err(fail)?,
+        None => Vec::new(),
+    };
 
     Ok(Imported {
         mesh: MeshData {
@@ -263,9 +357,15 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo) -> Result<Imported> 
             uvs: v.uvs,
             indices,
             sections,
+            skin: skeleton.is_some().then_some(Skin {
+                joints: v.joints,
+                weights: v.weights,
+            }),
         },
         materials,
         images,
+        skeleton: skeleton.map(|s| s.info),
+        clips,
         files,
     })
 }

@@ -12,12 +12,14 @@ pub(crate) const ZSTD_LEVEL: i32 = 19;
 /// Cook version per class. Bump a class's version whenever the cook writes different bytes
 /// for the same inputs; the golden test fails until it is bumped.
 pub(crate) const VERSIONS: &[(Class, u32)] = &[
-    (Class::Mesh, 1),
+    (Class::Mesh, 2),
     (Class::Texture, 1),
     (Class::Material, 1),
-    (Class::Model, 1),
+    (Class::Model, 2),
     (Class::InstancePage, 2),
     (Class::RasterSet, 1),
+    (Class::Skeleton, 1),
+    (Class::Clip, 1),
 ];
 
 /// Cook version of user classes, which the cook stores as given.
@@ -32,7 +34,7 @@ pub(crate) fn version(class: u16) -> u32 {
 
 fn libraries(class: u16) -> &'static str {
     match Class::from_u16(class) {
-        Some(Class::Mesh) => env!("ORR_COOK_MESH_LIBS"),
+        Some(Class::Mesh | Class::Skeleton | Class::Clip) => env!("ORR_COOK_MESH_LIBS"),
         Some(Class::Texture) => env!("ORR_COOK_TEXTURE_LIBS"),
         Some(Class::RasterSet) => env!("ORR_COOK_RASTER_LIBS"),
         _ => "",

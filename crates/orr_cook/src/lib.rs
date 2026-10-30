@@ -5,8 +5,12 @@
 //!
 //! A glTF source emits, under the asset name `N`:
 //! - `N`: a model binding the mesh to one material per section,
-//! - `N/mesh`: every triangle primitive of the default scene with node transforms applied,
-//!   one section per glTF material,
+//! - `N/mesh`: every triangle primitive of the default scene, one section per glTF material:
+//!   with node transforms applied, or with skins in bind space with joints and weights,
+//! - `N/skeleton`, with skins: their joints and the joints' ancestors,
+//! - `N/clip/<animation>`: each animation that moves the skeleton, resampled at
+//!   [`ClipSettings`]; an animation without a unique name that is not all digits is
+//!   named by its glTF animation index,
 //! - `N/material/<i>`: glTF material `i`, or `N/material/default` for primitives without one,
 //! - `N/texture/<material>/<role>`: the material's textures (roles `base_color`, `opacity`,
 //!   `normal`, `roughness`, `metalness`, `roughness_metalness`, `occlusion`, `emission`);
@@ -42,6 +46,7 @@ mod mesh;
 mod raster;
 mod report;
 mod run;
+mod skin;
 mod state;
 mod texture;
 
@@ -60,6 +65,7 @@ pub use raster::{
 pub use report::{
     ArchiveReport, AssetReport, CookReport, EntryReport, MeshReport, Outcome, TextureReport,
 };
+pub use skin::ClipSettings;
 pub use texture::material::{TextureOverride, TextureRules};
 pub use texture::{DataFormat, MipFilter, Primaries, Quality, TextureSettings, Usage, Wrap};
 
@@ -139,6 +145,7 @@ pub enum Source {
 pub struct GltfSettings {
     pub mesh: MeshSettings,
     pub textures: TextureRules,
+    pub clips: ClipSettings,
 }
 
 /// How [`cook`] runs.

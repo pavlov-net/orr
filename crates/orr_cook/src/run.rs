@@ -93,8 +93,8 @@ enum Work<'m> {
     Mesh(Arc<MeshData>, MeshSettings),
     Texture(TextureJob, Arc<Vec<ImageFile>>),
     TextureFile(PathBuf, Hash32, TextureSettings),
-    /// A model of the mesh in `deps[0]` and these materials.
-    Model(Vec<AssetId>),
+    /// A model of the mesh in `deps[0]`, these materials and this skeleton.
+    Model(Vec<AssetId>, AssetId),
     /// The same key as `deps[0]`, whose result it shares.
     Same,
     /// The placements, the cell size, the catalog without models, and the mesh unit of
@@ -497,7 +497,7 @@ impl<'m, 's> Run<'m, 's> {
     }
 
     fn make_ready(&mut self, u: usize) {
-        if let Some(Work::Model(_) | Work::Same) = self.units[u].work {
+        if let Some(Work::Model(..) | Work::Same) = self.units[u].work {
             self.local.push(u);
         } else {
             self.ready.insert((Reverse(self.units[u].working_set), u));
@@ -680,7 +680,7 @@ impl<'m, 's> Run<'m, 's> {
     /// The mesh unit of a model unit.
     fn mesh_of(&self, model: usize, by_id: &HashMap<AssetId, usize>) -> Result<usize> {
         let u = &self.units[model];
-        if let Some(Work::Model(_)) = &u.work {
+        if let Some(Work::Model(..)) = &u.work {
             return Ok(u.deps[0]);
         }
         let State::Done(d) = &u.state else {
@@ -891,8 +891,8 @@ impl<'m, 's> Run<'m, 's> {
     /// header, or a unit sharing the result of one with the same key.
     fn finish_local(&mut self, u: usize) -> Result<()> {
         let start = Instant::now();
-        let materials = match self.units[u].work.take() {
-            Some(Work::Model(materials)) => materials,
+        let (materials, skeleton) = match self.units[u].work.take() {
+            Some(Work::Model(materials, skeleton)) => (materials, skeleton),
             Some(Work::Same) => {
                 let State::Done(d) = &self.units[self.units[u].deps[0]].state else {
                     unreachable!("shared results are done and not yet written");
@@ -912,7 +912,7 @@ impl<'m, 's> Run<'m, 's> {
                 _pad: [0; 3],
                 bounds,
                 mesh: AssetId::from_name(&self.units[mesh].name),
-                skeleton: AssetId::NONE,
+                skeleton,
                 materials: Span::default(),
             },
             materials,
@@ -1064,11 +1064,53 @@ fn texture_file_working_set(path: &Path) -> u64 {
         )
 }
 
-/// Imports a glTF file and plans its units: the mesh, the packed textures, the materials
-/// and the model.
+/// Imports a glTF file and plans its units: the mesh, the packed textures, the materials,
+/// the skeleton and clips, and the model.
 fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) -> Result<Imported> {
-    let src = crate::gltf::import(name, path, memo)?;
+    let mut src = crate::gltf::import(name, path, memo, &settings.clips)?;
     let mut units = Vec::new();
+    let mut skeleton = (AssetId::NONE, None);
+    if let Some(info) = src.skeleton.take() {
+        let skeleton_name = format!("{name}/skeleton");
+        let bytes = info.to_bytes();
+        let key = Key::new(Class::Skeleton, &skeleton_name)
+            .bytes(&bytes)
+            .finish();
+        skeleton = (AssetId::from_name(&skeleton_name), Some(key));
+        units.push(NewUnit {
+            name: skeleton_name,
+            class: Class::Skeleton as u16,
+            key,
+            working_set: bytes.len() as u64,
+            triangles: 0,
+            work: Work::Blobs {
+                schema: orr_pack::skeleton::SCHEMA,
+                blobs: vec![(bytes, true)],
+            },
+            deps: Vec::new(),
+        });
+        for (clip_name, mut clip) in std::mem::take(&mut src.clips) {
+            clip.header.skeleton = skeleton.0;
+            let clip_name = format!("{name}/clip/{clip_name}");
+            let (head, samples) = clip.to_bytes();
+            let key = Key::new(Class::Clip, &clip_name)
+                .bytes(&head)
+                .bytes(&samples)
+                .finish();
+            units.push(NewUnit {
+                name: clip_name,
+                class: Class::Clip as u16,
+                key,
+                working_set: (head.len() + samples.len()) as u64,
+                triangles: 0,
+                work: Work::Blobs {
+                    schema: orr_pack::clip::SCHEMA,
+                    blobs: vec![(head, true), (samples, false)],
+                },
+                deps: Vec::new(),
+            });
+        }
+    }
 
     let mesh_name = format!("{name}/mesh");
     let mesh_key = Key::new(Class::Mesh, &mesh_name)
@@ -1097,6 +1139,9 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
     let mut packer = Packer::new(name, &src.images, &facts, &settings.textures);
     let mut materials = Vec::new();
     let mut model_key = Key::new(Class::Model, name).hash(mesh_key);
+    if let Some(key) = skeleton.1 {
+        model_key = model_key.hash(key);
+    }
     for (suffix, m, textures) in &src.materials {
         let mut m = *m;
         packer.material(suffix, &mut m, textures)?;
@@ -1150,7 +1195,7 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
         key: model_key.finish(),
         working_set: 0,
         triangles: 0,
-        work: Work::Model(materials),
+        work: Work::Model(materials, skeleton.0),
         deps: vec![mesh_name],
     });
     Ok(Imported {
@@ -1201,7 +1246,7 @@ fn cook_unit(
             let built = texture::cook_file(name, &bytes, &settings)?;
             texture::add(&mut w, name, key, &built)?;
         }
-        Work::Model(_) | Work::Same => unreachable!("finished on the coordinator"),
+        Work::Model(..) | Work::Same => unreachable!("finished on the coordinator"),
         Work::Instances(src, cell_log2, catalog, _) => {
             instances::cook(&mut w, name, src, cell_log2, &catalog, key)?;
         }
