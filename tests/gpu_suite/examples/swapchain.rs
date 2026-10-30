@@ -82,7 +82,7 @@ fn main() {
             log::info!("  {:?}, recreated: {recreated}", frame.format());
         }
         slots.insert(frame.storage().0);
-        let (list, _root) = fill_frame(device(), queue, &fill, &frame, n);
+        let (list, _root) = fill_frame(d, queue, &fill, &frame, n);
         queue.submit_present(vec![list], &[], &frame).unwrap();
         sc.present(frame, None).unwrap();
         presents += 1;
