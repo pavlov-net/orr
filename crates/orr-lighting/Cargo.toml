@@ -10,6 +10,7 @@ links = "orr_lighting"
 
 [dependencies]
 orr-scene.workspace = true
+orr-math.workspace = true
 orr-shaders = { workspace = true, features = ["openpbr"] }
 glam.workspace = true
 bytemuck.workspace = true

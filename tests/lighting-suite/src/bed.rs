@@ -29,11 +29,14 @@ use orr_scene::{
     TransformGroupDesc, ViewDesc, ViewHistoryId, ViewTarget,
 };
 
-use crate::shaders::{accumulate, exposure, flat_color};
+use crate::shaders::{accumulate, exposure, flat_color, guide_read};
 use crate::{TestTexture, affine, device, linear_clamp, pipeline, render, texture, upload};
 
 /// Render extent of every bed view.
 pub const EXTENT: [u32; 2] = [128, 96];
+
+/// Near plane of every bed view, m.
+pub const NEAR: f32 = 0.05;
 
 const PIXELS: u64 = (EXTENT[0] * EXTENT[1]) as u64;
 
@@ -690,7 +693,7 @@ fn time(frame: u64) -> FrameTime {
 }
 
 /// World from view for a camera at `eye` looking at `target`, y up.
-fn look(eye: Vec3, target: Vec3) -> Quat {
+pub fn look(eye: Vec3, target: Vec3) -> Quat {
     let back = (eye - target).normalize();
     let right = Vec3::Y.cross(back).normalize();
     Quat::from_mat3(&Mat3::from_cols(right, back.cross(right), back))
@@ -707,6 +710,8 @@ pub struct BedFrame<'a> {
     /// The orr-scene frame id.
     pub frame: u64,
     pub view: &'a RasterView,
+    /// The view as the frame rendered it.
+    pub desc: ViewDesc<'static>,
     pub lighting: &'a SceneLighting,
     /// The radiance target the kernel writes, at [`EXTENT`].
     pub target: &'a mut LightingView,
@@ -787,6 +792,18 @@ impl Accumulated {
     pub fn flip(&self, reference: &Accumulated, exposure: f32) -> FlipError {
         flip(&reference.display(exposure), &self.display(exposure))
     }
+}
+
+/// A bed view's guide targets, RGBA per pixel in rows of [`EXTENT`] top to bottom; unused
+/// channels 0.
+#[derive(Clone, Debug)]
+pub struct GuideImages {
+    pub diffuse_albedo: Vec<[f32; 4]>,
+    pub specular_albedo: Vec<[f32; 4]>,
+    pub normal_roughness: Vec<[f32; 4]>,
+    pub specular_motion: Vec<[f32; 4]>,
+    pub depth: Vec<[f32; 4]>,
+    pub motion: Vec<[f32; 4]>,
 }
 
 /// One analytic scene mounted, placed and viewed, ready to accumulate frames.
@@ -981,8 +998,27 @@ impl Bed {
     ) -> Accumulated {
         assert!(frames > 0);
         for k in 0..frames {
-            self.run_frame(first + k, seed, k == 0, k + 1 == frames, kernel);
+            self.run_frame(first + k, seed, k == 0, k == 0, k + 1 == frames, kernel);
         }
+        self.mean(frames)
+    }
+
+    /// Moves the camera to `eye`, looking at `target`, and renders one frame as the view's
+    /// next, with no camera cut; returns its radiance.
+    pub fn follow(
+        &mut self,
+        eye: Vec3,
+        target: Vec3,
+        index: u32,
+        kernel: &mut dyn FnMut(&mut CommandList<'_>, &mut BedFrame<'_>),
+    ) -> Accumulated {
+        self.spec.eye = eye;
+        self.spec.target = target;
+        self.run_frame(index, 0, false, true, true, kernel);
+        self.mean(1)
+    }
+
+    fn mean(&self, frames: u32) -> Accumulated {
         let n = frames as f32;
         Accumulated {
             mean: self
@@ -998,13 +1034,71 @@ impl Bed {
     /// Renders later frames at pre-exposure `p`, as the output's meter would set it.
     pub fn set_pre_exposure(&mut self, p: f32) {
         self.pre_exposure = p;
-        self.run_frame(0, 0, true, false, &mut |_, _| {});
+        self.run_frame(0, 0, true, true, false, &mut |_, _| {});
+    }
+
+    /// Reads the guide targets of the last frame.
+    pub fn guides(&self) -> GuideImages {
+        let d = device();
+        let t = &self.target;
+        let textures = [
+            t.diffuse_albedo(),
+            t.specular_albedo(),
+            t.normal_roughness(),
+            t.specular_motion(),
+            t.depth(),
+            t.motion(),
+        ];
+        let slots: Vec<u32> = textures
+            .iter()
+            .map(|_| d.alloc_image_slot().unwrap())
+            .collect();
+        let index: Vec<_> = textures
+            .iter()
+            .zip(&slots)
+            .map(|(t, &slot)| d.write_sampled(slot, t, &orr_gpu::ViewDesc::default()))
+            .collect();
+        let out = crate::readback::<[f32; 4]>(PIXELS * 6, "guide readback");
+        let read = pipeline(&guide_read::MODULE, "main");
+        let mut list = render().command_list().unwrap();
+        let root = upload(
+            &[guide_read::Root {
+                diffuse_albedo: index[0],
+                specular_albedo: index[1],
+                normal_roughness: index[2],
+                specular_motion: index[3],
+                depth: index[4],
+                motion: index[5],
+                out: out.gpu,
+                width: EXTENT[0],
+                count: PIXELS as u32,
+                _pad0: 0,
+            }],
+            "guide read root",
+        );
+        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+        list.dispatch(&read, root.gpu, [PIXELS.div_ceil(64) as u32, 1, 1]);
+        crate::finish(list);
+        for slot in slots {
+            d.free_image_slot_after_submitted(slot);
+        }
+        let v = out.as_slice().unwrap();
+        let plane = |k: usize| (0..PIXELS as usize).map(|i| v[i * 6 + k]).collect();
+        GuideImages {
+            diffuse_albedo: plane(0),
+            specular_albedo: plane(1),
+            normal_roughness: plane(2),
+            specular_motion: plane(3),
+            depth: plane(4),
+            motion: plane(5),
+        }
     }
 
     fn run_frame(
         &mut self,
         index: u32,
         seed: u32,
+        cut: bool,
         first: bool,
         last: bool,
         kernel: &mut dyn FnMut(&mut CommandList<'_>, &mut BedFrame<'_>),
@@ -1021,24 +1115,23 @@ impl Bed {
                 low_latency: None,
             })
             .unwrap();
-        let view = f
-            .raster_view(&ViewDesc {
-                scene: self.scene,
-                history: self.history,
-                position: eye.as_dvec3(),
-                rotation: look(eye, self.spec.target),
-                projection: Projection {
-                    fov_y: self.spec.fov_y,
-                    near: 0.05,
-                },
-                lens: Lens::default(),
-                render_extent: UVec2::from(EXTENT),
-                jitter: Vec2::ZERO,
-                reset_history: first,
-                mip_bias: 0.0,
-                target: ViewTarget::AfterRr,
-            })
-            .unwrap();
+        let desc = ViewDesc {
+            scene: self.scene,
+            history: self.history,
+            position: eye.as_dvec3(),
+            rotation: look(eye, self.spec.target),
+            projection: Projection {
+                fov_y: self.spec.fov_y,
+                near: NEAR,
+            },
+            lens: Lens::default(),
+            render_extent: UVec2::from(EXTENT),
+            jitter: Vec2::ZERO,
+            reset_history: cut,
+            mip_bias: 0.0,
+            target: ViewTarget::AfterRr,
+        };
+        let view = f.raster_view(&desc).unwrap();
         let id = f.id();
         let list = f.list().unwrap();
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
@@ -1058,6 +1151,7 @@ impl Bed {
                 seed,
                 frame: id,
                 view: &view,
+                desc,
                 lighting: &self.lighting,
                 target: &mut self.target,
                 roots: &mut self.roots,
@@ -1135,7 +1229,8 @@ impl FlatColor {
     }
 }
 
-/// orr-lighting's opaque dispatch recording into bed frames with `settings`.
+/// orr-lighting's opaque dispatch and guide resolve recording into bed frames with
+/// `settings`.
 pub struct Paths {
     kernels: LightingKernels,
     _tables: BsdfTables,
@@ -1154,9 +1249,19 @@ impl Paths {
         }
     }
 
+    /// Starts the view's frame, then records the opaque dispatch and the guide resolve.
     pub fn record(&self, list: &mut CommandList<'_>, f: &mut BedFrame<'_>) {
         let pass = f.pass();
+        f.target
+            .begin(f.frame, f.lighting, &f.desc, false, &self.settings);
         self.kernels
             .record_opaque(list, f.lighting, f.target, &pass, &self.settings);
+        list.barrier(
+            Stages::COMPUTE | Stages::RAY,
+            Stages::COMPUTE,
+            Hazards::empty(),
+        );
+        self.kernels
+            .record_guides(list, f.target, &pass, &self.settings);
     }
 }

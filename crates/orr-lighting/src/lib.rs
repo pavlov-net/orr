@@ -9,9 +9,11 @@
 //! `media` under this crate's shader root (`DEP_ORR_LIGHTING_SHADER_DIRS`). Kernels that
 //! shade with the real-time OpenPBR BSDF import `bsdf` and read [`BsdfTables`].
 //!
-//! Each view, after its raster half, [`LightingKernels::record_opaque`] traces one path per
-//! G-buffer pixel into the view's [`LightingView`] radiance, with the settings of
-//! [`ViewLighting`]. The `path` module holds the path itself for kernels that trace more.
+//! Each view, [`LightingView::begin`] settles the frame's history reset; after the view's
+//! raster half, [`LightingKernels::record_opaque`] traces one path per G-buffer pixel into
+//! the view's [`LightingView`] radiance with the settings of [`ViewLighting`], and
+//! [`LightingKernels::record_guides`] writes the view's ray reconstruction guides. The `path`
+//! module holds the path itself for kernels that trace more.
 
 mod bsdf;
 mod environment;
@@ -27,12 +29,12 @@ pub use scene::{
     ScenePass, WorldCacheSettings,
 };
 pub use shaders::types::{
-    DirectionalState, EmissiveSelection, EnvironmentGpu, LightSample, LightSetGpu, LightSetStats,
-    PathRoot,
+    DirectionalState, EmissiveSelection, EnvironmentGpu, GuideRoot, LightSample, LightSetGpu,
+    LightSetStats, PathRoot,
 };
 pub use view::{
-    LightingDebugView, LightingKernels, LightingView, MediaSettings, PathEntry, ReferenceSettings,
-    ThinLens, ViewLighting, ViewPass,
+    CameraJump, GuideKind, GuideSettings, LightingDebugView, LightingKernels, LightingView,
+    MediaSettings, PathEntry, ReferenceSettings, ThinLens, ViewLighting, ViewPass,
 };
 
 use orr_scene::orr_gpu::{ComputePipeline, Device, ShaderModule, ShaderStage, SpecData};

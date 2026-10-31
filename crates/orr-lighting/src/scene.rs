@@ -145,6 +145,8 @@ pub struct SceneLighting {
     directional_roots: Ring<directional::Root>,
     tile_roots: Ring<tiles::Root>,
     frames: [Option<u64>; FRAME_SLOTS],
+    reset_pending: bool,
+    reset_frame: Option<u64>,
 }
 
 impl SceneLighting {
@@ -193,6 +195,8 @@ impl SceneLighting {
             directional_roots: Ring::new(device, "directional roots")?,
             tile_roots: Ring::new(device, "light tile roots")?,
             frames: [None; FRAME_SLOTS],
+            reset_pending: false,
+            reset_frame: None,
         })
     }
 
@@ -222,6 +226,9 @@ impl SceneLighting {
     pub fn record(&mut self, list: &mut CommandList<'_>, pass: &ScenePass) {
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         self.frames[slot] = Some(pass.frame);
+        if std::mem::take(&mut self.reset_pending) {
+            self.reset_frame = Some(pass.frame);
+        }
         let focus = [pass.focus[0], pass.focus[1], pass.focus[2], 0.0];
         let bake_root = self
             .bake_roots
@@ -279,6 +286,16 @@ impl SceneLighting {
             Hazards::empty(),
         );
         list.end_pass();
+    }
+
+    /// A lighting discontinuity (time skip, teleport): the next [`Self::record`] marks its
+    /// frame as a history reset for every view of the scene ([`crate::LightingView::begin`]).
+    pub fn reset_history(&mut self) {
+        self.reset_pending = true;
+    }
+
+    pub(crate) fn resets_history(&self, frame: u64) -> bool {
+        self.reset_frame == Some(frame)
     }
 
     /// Statistics of `frame`, once its submit has completed; `None` when that frame's slot
