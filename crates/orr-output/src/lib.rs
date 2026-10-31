@@ -48,7 +48,7 @@ pub use passes::{
     CapturePass, ComposePass, ComposeRoot, ComposeSource, ExposurePass, HookInputsPass,
     OutputKernels, OutputRoots, OutputView, SceneCapturePass, TonemapPass,
 };
-pub use present::{Display, DisplayFrame, Presented};
+pub use present::{Display, DisplayFrame, Presented, UI_PASS};
 pub use screenshot::{Primaries, Screenshot, ScreenshotRequest};
 pub use ui::{UiLayer, UiPass};
 pub use view::{OutputDebug, PostQuality, ViewOutput};

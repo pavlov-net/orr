@@ -1,12 +1,16 @@
 //! The showcase scene path traced in a window with DLSS frame generation: the camera orbits
 //! while the display presents generated images between rendered frames, with an egui
-//! overlay naming the mode, the images generated per frame and the encoding. The overlay is
-//! composed over every presented image, so it never moves with the interpolation.
+//! overlay naming the mode, the images generated per frame and the encoding, and a dot
+//! crossing the bottom of the window at constant speed. The overlay is composed over every
+//! presented image, so it never moves with the interpolation; with `--ui-per-present` the UI
+//! is drawn once per presented image, so the dot advances on every presented image instead
+//! of every rendered frame.
 //!
-//! `dlss [--frames N] [--off | --2x | --3x | --4x] [--cycle]`. The default is NGX's
-//! recommended mode (4x Dynamic on RTX 50). `--cycle` steps every few seconds through 2x,
-//! 4x, Dynamic and off, with SDR, PQ and scRGB requests, to show frame generation turning
-//! on and off at run time. Without frame generation the scene renders without it.
+//! `dlss [--frames N] [--off | --2x | --3x | --4x] [--cycle] [--ui-per-present]`. The
+//! default is NGX's recommended mode (4x Dynamic on RTX 50). `--cycle` steps every few
+//! seconds through 2x, 4x, Dynamic and off, with SDR, PQ and scRGB requests, to show frame
+//! generation turning on and off at run time. Without frame generation the scene renders
+//! without it.
 
 use std::time::{Duration, Instant};
 
@@ -26,6 +30,8 @@ use orr_math::{UVec2, Vec2, Vec3};
 const ORBIT_RATE: f64 = 0.4;
 /// Seconds per step of `--cycle`.
 const CYCLE_STEP: f64 = 4.0;
+/// The dot's speed in points per second.
+const CURSOR_SPEED: f64 = 400.0;
 
 fn main() {
     let options = Options::from_args();
@@ -98,6 +104,7 @@ fn run(options: &Options) {
     if !cycling {
         set_mode(&mut display, chosen);
     }
+    display.set_ui_per_present(options.has("--ui-per-present"));
 
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
     let _workers = Workers::new(renderer.loading(), 2);
@@ -165,7 +172,12 @@ fn run(options: &Options) {
         f.scene(scene)
             .expect("scene writer")
             .set_focus(eye.as_dvec3(), extent[1] as f32 / FOV_Y);
-        let mut ui = |pass: &mut orr::UiPass<'_, '_>| overlay.paint(pass, id);
+        let width = f64::from(extent[0]);
+        let mut ui = |pass: &mut orr::UiPass<'_, '_>| {
+            overlay.paint(pass, id);
+            let x = ((t + f64::from(pass.time_offset)) * CURSOR_SPEED).rem_euclid(width);
+            overlay.paint_cursor(pass, id, x as f32);
+        };
         let mut hooks = ViewHooks {
             ui: Some(&mut ui),
             ..ViewHooks::default()

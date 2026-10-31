@@ -107,7 +107,7 @@ impl Renderer {
             );
         }
         if ui {
-            f.ui_layer(&mut list);
+            f.ui_layer(&mut list, 0);
         }
         let (resolved, extent, wait_for) = (f.display, f.extent, f.wait);
         let point = queue.submit(vec![list], wait_for.as_slice()).unwrap();

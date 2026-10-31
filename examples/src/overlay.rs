@@ -47,6 +47,24 @@ impl Overlay {
         self.pending.append(out.textures_delta);
     }
 
+    /// Draws a white dot centered at `x`, 24 px above the bottom of the layer.
+    pub fn paint_cursor(&mut self, pass: &mut UiPass<'_, '_>, frame: u64, x: f32) {
+        use egui::epaint::ClippedShape;
+        use egui::{Color32, Pos2, Rect, Shape};
+        let [_, h, _] = pass.layer.desc().extent;
+        let center = Pos2::new(x, h as f32 / self.pixels_per_point - 24.0);
+        let dot = self.ctx.tessellate(
+            vec![ClippedShape::new(
+                Rect::EVERYTHING,
+                Shape::circle_filled(center, 10.0, Color32::WHITE),
+            )],
+            self.pixels_per_point,
+        );
+        self.painter
+            .paint(pass.cmd, frame, pass.layer, &dot, self.pixels_per_point)
+            .expect("egui paint");
+    }
+
     /// Draws the last layout into the frame's UI layer.
     pub fn paint(&mut self, pass: &mut UiPass<'_, '_>, frame: u64) {
         self.painter
@@ -76,4 +94,6 @@ impl Overlay {
     pub fn layout(&mut self, _: [u32; 2], _: FrameTime, _: &str) {}
 
     pub fn paint(&mut self, _: &mut UiPass<'_, '_>, _: u64) {}
+
+    pub fn paint_cursor(&mut self, _: &mut UiPass<'_, '_>, _: u64, _: f32) {}
 }
