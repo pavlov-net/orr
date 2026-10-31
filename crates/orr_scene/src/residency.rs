@@ -8,6 +8,10 @@
 //! recently touched first. A unit loads only with its dependencies (coarser pages, a
 //! hierarchy page's parent) resident or loading in the same plan, and a unit stays while a
 //! resident or loading unit depends on it.
+//!
+//! While device-local memory use sits above 90% of the OS budget, every class's budget
+//! shrinks step by step and units past their hold are evicted down to it; below 80% the
+//! budgets grow back.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -15,6 +19,15 @@ use crate::MountId;
 
 /// Frames a resident unit is kept after its last request or touch.
 pub(crate) const HOLD_FRAMES: u64 = 30;
+
+/// Budgets shrink while device-local use is above this share of the OS budget...
+const SHRINK_ABOVE: f64 = 0.9;
+/// ...and grow back while it is below this share.
+const GROW_BELOW: f64 = 0.8;
+/// Budget factor change per step.
+const SCALE_STEP: f64 = 0.95;
+/// The least share of its configured budget a class keeps.
+const MIN_SCALE: f64 = 0.125;
 
 /// A residency class: one pool and one byte budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -159,7 +172,8 @@ pub(crate) struct Plan {
 /// The budgets and limits a [`Residency`] plans under.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Limits {
-    /// By [`ResidencyClass::ALL`] order.
+    /// By [`ResidencyClass::ALL`] order, without memory pressure. Pinned and locked units
+    /// must fit them.
     pub budgets: [u64; 4],
     pub io_requests: u32,
     pub io_bytes: u64,
@@ -167,6 +181,8 @@ pub(crate) struct Limits {
 
 pub(crate) struct Residency {
     limits: Limits,
+    /// The share of `limits.budgets` that loads and evictions plan under.
+    scale: f64,
     mounts: HashMap<MountId, Vec<Unit>>,
     /// Resident units that are not pinned, by last touch, per class.
     lru: [BTreeSet<(u64, Key)>; 4],
@@ -182,12 +198,9 @@ pub(crate) struct Residency {
 
 impl Residency {
     pub(crate) fn new(limits: Limits) -> Self {
-        let mut stats = ResidencyStats::default();
-        for (s, b) in stats.classes.iter_mut().zip(limits.budgets) {
-            s.budget = b;
-        }
-        Self {
+        let mut r = Self {
             limits,
+            scale: 1.0,
             mounts: HashMap::new(),
             lru: Default::default(),
             used: [0; 4],
@@ -196,12 +209,34 @@ impl Residency {
             in_flight: (0, 0),
             requests: HashMap::new(),
             failed: 0,
-            stats,
-        }
+            stats: ResidencyStats::default(),
+        };
+        r.refresh();
+        r
     }
 
     pub(crate) fn stats(&self) -> &ResidencyStats {
         &self.stats
+    }
+
+    /// The budget of class `c` under the current memory pressure.
+    fn budget(&self, c: usize) -> u64 {
+        self.stats.classes[c].budget
+    }
+
+    /// Takes the share of its OS budget that device-local memory uses
+    /// (`MemoryReport::pressure`), and shrinks or grows the budgets the next plans use.
+    /// `None`, without a budget from the OS, changes nothing.
+    pub(crate) fn react(&mut self, pressure: Option<f64>) {
+        let Some(p) = pressure else {
+            return;
+        };
+        if p > SHRINK_ABOVE {
+            self.scale = (self.scale * SCALE_STEP).max(MIN_SCALE);
+        } else if p < GROW_BELOW {
+            self.scale = (self.scale / SCALE_STEP).min(1.0);
+        }
+        self.refresh();
     }
 
     /// Adds a mount's units. Fails without adding any when the pinned and locked units do
@@ -359,7 +394,7 @@ impl Residency {
     }
 
     /// Decides this step's loads and evictions from the requests since the last plan, then
-    /// drops every request.
+    /// drops every request. Classes over their budget first evict units past their hold.
     pub(crate) fn plan(&mut self, frame: u64) -> Plan {
         let mut requests: Vec<(Key, Priority)> = self.requests.drain().collect();
         requests.sort_by(|a, b| a.1.rank(&b.1).then(a.0.cmp(&b.0)));
@@ -367,6 +402,14 @@ impl Residency {
             self.touch(k, frame);
         }
         let mut plan = Plan::default();
+        for class in ResidencyClass::ALL {
+            let c = class as usize;
+            let over = self.used[c].saturating_sub(self.budget(c));
+            for k in self.victims(c, over, frame, &[]).0 {
+                self.evict(k);
+                plan.evictions.push(k);
+            }
+        }
         let mut dropped = 0;
         for (k, _) in requests {
             match self.unit(k).map(|u| u.state) {
@@ -448,29 +491,36 @@ impl Residency {
         let mut victims = Vec::new();
         for class in ResidencyClass::ALL {
             let c = class as usize;
-            let mut over = (self.used[c] + need[c]).saturating_sub(self.limits.budgets[c]);
-            if over == 0 {
-                continue;
-            }
-            for &(touched, k) in &self.lru[c] {
-                if over == 0 || touched + HOLD_FRAMES >= frame {
-                    break;
-                }
-                let u = self.unit(k).expect("resident unit");
-                if !u.locked && u.dependents == 0 && !held.contains(&k) {
-                    victims.push(k);
-                    over = over.saturating_sub(u.bytes);
-                }
-            }
-            if over > 0 {
+            let over = (self.used[c] + need[c]).saturating_sub(self.budget(c));
+            let (v, short) = self.victims(c, over, frame, &held);
+            if short > 0 {
                 return false;
             }
+            victims.extend(v);
         }
         for k in victims {
             self.evict(k);
             evictions.push(k);
         }
         true
+    }
+
+    /// Units of class `c` past their hold, least recently touched first, whose eviction
+    /// frees `over` bytes, leaving `held` units and those with resident dependents; and the
+    /// bytes still over when no more can go.
+    fn victims(&self, c: usize, mut over: u64, frame: u64, held: &[Key]) -> (Vec<Key>, u64) {
+        let mut victims = Vec::new();
+        for &(touched, k) in &self.lru[c] {
+            if over == 0 || touched + HOLD_FRAMES >= frame {
+                break;
+            }
+            let u = self.unit(k).expect("resident unit");
+            if !u.locked && u.dependents == 0 && !held.contains(&k) {
+                victims.push(k);
+                over = over.saturating_sub(u.bytes);
+            }
+        }
+        (victims, over)
     }
 
     fn evict(&mut self, k: Key) {
@@ -502,6 +552,7 @@ impl Residency {
 
     fn refresh(&mut self) {
         for (c, s) in self.stats.classes.iter_mut().enumerate() {
+            s.budget = (self.limits.budgets[c] as f64 * self.scale) as u64;
             s.resident_bytes = self.used[c] - self.loading_bytes[c];
             s.loading_bytes = self.loading_bytes[c];
             s.resident_units = self.resident_units[c];
@@ -722,5 +773,45 @@ mod tests {
             }
         );
         assert!(!r.landed(Key { mount: b, unit: 1 }, true, 3));
+    }
+
+    #[test]
+    fn budgets_shrink_under_memory_pressure_and_grow_back() {
+        let mut r = Residency::new(limits(400));
+        let mut units: Vec<UnitDesc> = (0..4).map(|_| unit(100, &[], Start::Absent)).collect();
+        units.push(unit(100, &[], Start::Pinned));
+        r.register(M, &units).unwrap();
+        // 300 of 400 resident beside the pinned 100.
+        step(&mut r, &[0, 1, 2], 1);
+        r.react(None);
+        r.react(Some(0.85));
+        assert_eq!(class(&r).budget, 400, "no budget or between the thresholds");
+        for _ in 0..5 {
+            r.react(Some(0.95));
+        }
+        assert_eq!(class(&r).budget, (400.0 * 0.95f64.powi(5)) as u64);
+        assert_eq!(
+            step(&mut r, &[], HOLD_FRAMES).evictions,
+            [],
+            "units in their hold stay"
+        );
+        // Over 309 by 91: one unit goes, the oldest.
+        let late = 1 + HOLD_FRAMES + 1;
+        assert_eq!(step(&mut r, &[], late).evictions, [key(0)]);
+        assert_eq!(class(&r).resident_bytes, 300);
+        let plan = step(&mut r, &[3], late);
+        assert_eq!((plan.evictions, plan.loads), (vec![key(1)], vec![key(3)]));
+        for _ in 0..100 {
+            r.react(Some(2.0));
+        }
+        assert_eq!(class(&r).budget, 50, "the floor");
+        let later = late + HOLD_FRAMES + 1;
+        assert_eq!(step(&mut r, &[], later).evictions, [key(2), key(3)]);
+        assert_eq!(class(&r).resident_bytes, 100, "the pinned unit stays");
+        for _ in 0..100 {
+            r.react(Some(0.5));
+        }
+        assert_eq!(class(&r).budget, 400);
+        assert_eq!(step(&mut r, &[0, 1, 2], later).loads.len(), 3);
     }
 }

@@ -64,6 +64,8 @@ pub(crate) struct Optional {
     pub unified_image_layouts: bool,
     pub memory_budget: bool,
     pub memory_priority: bool,
+    /// `VK_EXT_pageable_device_local_memory`, only beside `memory_priority`.
+    pub pageable_memory: bool,
     pub shader_abort: bool,
     pub pipeline_binary: bool,
     pub cooperative_vector: bool,
@@ -139,6 +141,7 @@ pub(crate) struct FeatureChain {
     pub fault: vk::PhysicalDeviceFaultFeaturesKHR<'static>,
     pub fault_ext: vk::PhysicalDeviceFaultFeaturesEXT<'static>,
     pub priority: vk::PhysicalDeviceMemoryPriorityFeaturesEXT<'static>,
+    pub pageable: vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT<'static>,
     /// Device creation only.
     pub diagnostics_config: vk::DeviceDiagnosticsConfigCreateInfoNV<'static>,
 }
@@ -233,6 +236,9 @@ impl FeatureChain {
         }
         if opt.memory_priority {
             chain.push(ptr(&mut self.priority));
+        }
+        if opt.pageable_memory {
+            chain.push(ptr(&mut self.pageable));
         }
         if create && opt.aftermath {
             chain.push(ptr(&mut self.diagnostics_config));
@@ -378,6 +384,7 @@ pub(crate) fn select(
         unified_image_layouts: present(ash::khr::unified_image_layouts::NAME),
         memory_budget: present(ash::ext::memory_budget::NAME),
         memory_priority: present(ash::ext::memory_priority::NAME),
+        pageable_memory: present(ash::ext::pageable_device_local_memory::NAME),
         // shader_abort requires device_fault and shader_constant_data enabled with it.
         shader_abort: cfg!(debug_assertions)
             && present(ash::khr::shader_abort::NAME)
@@ -532,6 +539,7 @@ pub(crate) fn select(
     opt.shader_abort &= opt.device_fault;
     opt.device_fault_ext &= q.fault_ext.device_fault != 0;
     opt.memory_priority &= q.priority.memory_priority != 0;
+    opt.pageable_memory &= opt.memory_priority && q.pageable.pageable_device_local_memory != 0;
 
     let mut e = Box::<FeatureChain>::default();
     e.core.features = vk::PhysicalDeviceFeatures {
@@ -613,6 +621,7 @@ pub(crate) fn select(
     e.fault.device_fault = 1;
     e.fault_ext.device_fault = 1;
     e.priority.memory_priority = 1;
+    e.pageable.pageable_device_local_memory = 1;
     e.diagnostics_config.flags = vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_SHADER_DEBUG_INFO
         | vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_RESOURCE_TRACKING
         | vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_AUTOMATIC_CHECKPOINTS
@@ -650,6 +659,10 @@ pub(crate) fn select(
     );
     add(opt.memory_budget, &[ash::ext::memory_budget::NAME]);
     add(opt.memory_priority, &[ash::ext::memory_priority::NAME]);
+    add(
+        opt.pageable_memory,
+        &[ash::ext::pageable_device_local_memory::NAME],
+    );
     add(opt.device_fault, &[ash::khr::device_fault::NAME]);
     add(opt.device_fault_ext, &[ash::ext::device_fault::NAME]);
     add(

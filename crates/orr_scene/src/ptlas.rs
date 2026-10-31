@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use orr_gpu::{
     Allocation, ClusterVertexFormat, CommandList, Device, GpuAddress, GpuPtr, Hazards, MemoryKind,
-    PtlasArgs, PtlasLimits, RtasFlags, RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc, Stages,
-    Tlas, partition_translation,
+    MemoryPriority, PtlasArgs, PtlasLimits, RtasFlags, RtasIo, RtasLimits, RtasMode, RtasOp,
+    RtasOpDesc, Stages, Tlas, partition_translation,
 };
 use orr_math::IVec3;
 
@@ -377,7 +377,12 @@ impl Ptlas {
         };
         let mut gpu = device.gpu_malloc::<PtlasGpu>(MemoryKind::Upload, 1, "PTLAS tables")?;
         gpu.as_mut_slice().expect("upload is mapped")[0] = record;
-        let tlas = device.gpu_malloc::<u8>(dl, sizes.result_max, "PTLAS")?;
+        let tlas = device.gpu_malloc_with_priority::<u8>(
+            dl,
+            MemoryPriority::High,
+            sizes.result_max,
+            "PTLAS",
+        )?;
         let bytes = [
             tlas.size,
             pending.size,

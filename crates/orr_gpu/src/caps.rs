@@ -41,6 +41,10 @@ pub struct Caps {
     pub unified_image_layouts: bool,
     /// The memory report carries the OS budget per heap.
     pub memory_budget: bool,
+    /// Allocations carry their [`crate::MemoryPriority`] (`VK_EXT_memory_priority`), and with
+    /// `VK_EXT_pageable_device_local_memory` the OS pages low-priority device-local memory
+    /// out first when VRAM runs short. Without it every allocation has the same priority.
+    pub memory_priority: bool,
     /// Shader `abort` (`VK_KHR_shader_abort`); enabled in debug builds only. The message of
     /// an abort that loses the device is in [`crate::DiagnosticsReport::abort`].
     pub shader_abort: bool,

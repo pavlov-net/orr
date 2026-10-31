@@ -14,9 +14,10 @@ use std::time::Duration;
 
 use orr_gpu::{
     Allocation, BlasLimits, ClusterLimits, ClusterVertexFormat, CommandList, ComputePipeline,
-    Device, GpuAddress, GpuPtr, Hazards, KernelSet, MemoryKind, Micromap, MicromapDesc,
-    MicromapTriangle, MicromapUsage, MoveKind, MoveLimits, OmmFormat, QueueKind, RtasFlags, RtasIo,
-    RtasLimits, RtasMode, RtasOp, RtasOpDesc, ShaderStage, SpecData, Stages, TimelinePoint,
+    Device, GpuAddress, GpuPtr, Hazards, KernelSet, MemoryKind, MemoryPriority, Micromap,
+    MicromapDesc, MicromapTriangle, MicromapUsage, MoveKind, MoveLimits, OmmFormat, QueueKind,
+    RtasFlags, RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc, ShaderStage, SpecData, Stages,
+    TimelinePoint,
 };
 use orr_pack::mesh::{Cluster, MeshHeader, Part};
 
@@ -433,9 +434,12 @@ fn pack(
         offsets.push(total);
         total += u64::from(s).next_multiple_of(align);
     }
-    let block =
-        step.device
-            .gpu_malloc::<u8>(MemoryKind::DeviceLocal, total.max(align), "cluster AS")?;
+    let block = step.device.gpu_malloc_with_priority::<u8>(
+        MemoryKind::DeviceLocal,
+        MemoryPriority::High,
+        total.max(align),
+        "cluster AS",
+    )?;
     let base = block.gpu.address().0;
     keep.push(block);
     let dst: Vec<u64> = offsets.iter().map(|o| base + o).collect();
@@ -610,8 +614,9 @@ pub(crate) fn build(
                     triangles: unsafe { GpuPtr::<MicromapTriangle>::from_address(at) },
                 };
                 let sizes = device.micromap_sizes(&desc);
-                let block = device.gpu_malloc::<u8>(
+                let block = device.gpu_malloc_with_priority::<u8>(
                     MemoryKind::DeviceLocal,
+                    MemoryPriority::High,
                     sizes.result_max,
                     "micromap",
                 )?;
@@ -980,8 +985,12 @@ pub(crate) fn build_masks(
     let scratch = device.gpu_malloc::<u8>(dl, sizes.scratch.max(16), "mask BLAS scratch")?;
     let scratch_at = scratch.gpu.address();
     keep.push(scratch);
-    let block =
-        Arc::new(device.gpu_malloc::<u8>(dl, sizes.result_max.max(16), "mask BLAS block")?);
+    let block = Arc::new(device.gpu_malloc_with_priority::<u8>(
+        dl,
+        MemoryPriority::High,
+        sizes.result_max.max(16),
+        "mask BLAS block",
+    )?);
     let root = AccelRoot {
         addresses: job_src,
         records,

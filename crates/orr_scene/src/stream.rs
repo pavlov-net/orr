@@ -5,7 +5,9 @@
 //! writes each unit's address into its table entry, hands the requests since the last step
 //! to the [`Residency`] manager, writes null over the entries of the units it evicts (their
 //! memory returns once the frames that could read it have completed) and sends the loads
-//! to the loading thread. The frame's submit waits the taken batches' points.
+//! to the loading thread. The frame's submit waits the taken batches' points. Under memory
+//! pressure the step shrinks the residency budgets, evicting streamed units, and the stream
+//! pool's blocks sit at low priority so the OS pages them out before anything else.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -190,6 +192,7 @@ impl Streaming {
                 }
             }
         }
+        self.residency.react(w.device.memory_report().pressure());
         let Plan { loads, evictions } = self.residency.plan(frame);
         for k in evictions {
             let (slot, table) = self.resident.remove(&k).expect("evicted unit is resident");
