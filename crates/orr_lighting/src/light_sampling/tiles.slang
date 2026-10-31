@@ -22,11 +22,20 @@ struct Root
     EmissiveSelection* emissive;
     float* cluster_cdf;
     LightSample* tiles;
+    // Per feedback id: pixels the views of the frame before counted, and their decayed sums.
+    uint* feedback_counts;
+    float* feedback_weights;
     // This frame's slot of the statistics readback.
     LightSetStats* stats;
     // Values `cluster_cdf` holds.
     uint cluster_capacity;
     uint frame;
+    // Share of the selection placed by feedback once there is any.
+    float feedback_share;
+    // 1: drop the feedback so far.
+    uint clear_feedback;
+    uint _pad0;
+    uint _pad1;
 }
 ORR_ROOT(Root);
 
@@ -34,8 +43,9 @@ static const uint SELECT_GROUP = 1024;
 
 groupshared float scan_w[SELECT_GROUP];
 groupshared uint scan_c[SELECT_GROUP];
-// Local lights, emissive entries and clusters kept, and entries dropped.
-groupshared uint counts[4];
+// Local lights, emissive entries and clusters kept, entries dropped, and feedback pixels.
+groupshared uint counts[5];
+groupshared float environment_feedback;
 
 // Inclusive sums over the workgroup; `total` is the group's sum.
 uint scan_uint(uint lane, uint v, out uint total)
@@ -103,8 +113,25 @@ void candidate(SceneRoot* s, uint i, out float w, out uint count)
     w = count > 0 ? y : 0.0;
 }
 
+// Feedback weight of feedback id `i` this frame: the weight before, decayed, plus the pixels
+// counted for it in the frame before, whose count it clears. A clear drops both, and the
+// counts are not yet written after the light set is created.
+float feedback(uint i)
+{
+    bool clear = root.clear_feedback != 0;
+    uint pixels = clear ? 0 : root.feedback_counts[i];
+    float h = clear ? 0.0 : root.feedback_weights[i] * FEEDBACK_HISTORY + float(pixels);
+    root.feedback_weights[i] = h;
+    root.feedback_counts[i] = 0;
+    InterlockedAdd(counts[4], pixels);
+    return h;
+}
+
 // The selection CDF and probabilities, each emissive entry's place in the cluster pool, the
-// light set record, `SkyStats` and the frame's statistics. One workgroup.
+// light set record, `SkyStats` and the frame's statistics. One workgroup. A candidate's
+// probability blends its share of the emitted power with its share of the feedback weights,
+// `feedback_share` of the second once any light has fed back; lights with no power take no
+// feedback share, so every light the feedback names stays reachable through its power.
 [shader("compute")]
 [numthreads(SELECT_GROUP, 1, 1)]
 void select(uint lane: SV_GroupIndex)
@@ -112,17 +139,29 @@ void select(uint lane: SV_GroupIndex)
     SceneRoot* s = root.scene;
     uint lights = s.light_capacity;
     uint n = lights + s.producer_capacity + s.emissive_capacity;
-    if (lane < 4)
+    if (lane < 5)
         counts[lane] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    bool environment = root.environment.mean.a > 0.0;
+    if (lane == 0)
+    {
+        float h = feedback(n);
+        environment_feedback = environment ? h : 0.0;
+    }
     float carry_w = 0.0;
+    float carry_h = 0.0;
     uint carry_c = 0;
     for (uint base = 0; base < n; base += SELECT_GROUP)
     {
         uint i = base + lane;
         float w = 0.0;
         uint c = 0;
+        float h = 0.0;
         if (i < n)
+        {
             candidate(s, i, w, c);
+            h = feedback(i);
+        }
         uint chunk_c;
         uint first = carry_c + scan_uint(lane, c, chunk_c) - c;
         bool fits = first + c <= root.cluster_capacity;
@@ -138,10 +177,12 @@ void select(uint lane: SV_GroupIndex)
             InterlockedAdd(counts[2], c);
         }
         float chunk_w;
-        float cdf = carry_w + scan_float(lane, SELECT_GROUP, w, chunk_w);
+        float chunk_h;
+        scan_float(lane, SELECT_GROUP, w, chunk_w);
+        scan_float(lane, SELECT_GROUP, w > 0.0 ? h : 0.0, chunk_h);
         if (i < n)
         {
-            root.cdf[i] = cdf;
+            root.cdf[i] = w;
             if (i >= lights)
             {
                 EmissiveSelection* e = root.emissive + (i - lights);
@@ -152,11 +193,34 @@ void select(uint lane: SV_GroupIndex)
         }
         carry_c += chunk_c;
         carry_w += chunk_w;
+        carry_h += chunk_h;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    float power = carry_w;
+    float fed = carry_h + environment_feedback;
+    float a = fed > 0.0 ? clamp(root.feedback_share, 0.0, 1.0) : 0.0;
+    float env0 = environment ? (power > 0.0 ? ENVIRONMENT_SHARE : 1.0) : 0.0;
+    float power_scale = power > 0.0 ? (1.0 - a) * (1.0 - env0) / power : 0.0;
+    float fed_scale = fed > 0.0 ? a / fed : 0.0;
+    float env = (1.0 - a) * env0 + fed_scale * environment_feedback;
+    float carry = 0.0;
+    for (uint base = 0; base < n; base += SELECT_GROUP)
+    {
+        uint i = base + lane;
+        float p = 0.0;
+        if (i < n)
+        {
+            float w = root.cdf[i];
+            p = w * power_scale + (w > 0.0 ? root.feedback_weights[i] * fed_scale : 0.0);
+        }
+        float chunk;
+        float cdf = carry + scan_float(lane, SELECT_GROUP, p, chunk);
+        if (i < n)
+            root.cdf[i] = cdf;
+        carry += chunk;
     }
     DeviceMemoryBarrierWithGroupSync();
-    float total = carry_w;
-    bool environment = root.environment.mean.a > 0.0;
-    float env = environment ? (total > 0.0 ? ENVIRONMENT_SHARE : 1.0) : 0.0;
+    float total = carry;
     float scale = total > 0.0 ? (1.0 - env) / total : 0.0;
     for (uint i = lane; i < n; i += SELECT_GROUP)
     {
@@ -178,6 +242,7 @@ void select(uint lane: SV_GroupIndex)
     set.emissive = root.emissive;
     set.cluster_cdf = root.cluster_cdf;
     set.tiles = root.tiles;
+    set.feedback_counts = root.feedback_counts;
     set.candidate_count = n;
     set.candidate_total = total;
     set.environment_probability = env;
@@ -201,7 +266,7 @@ void select(uint lane: SV_GroupIndex)
     st.emissive_clusters = counts[2];
     st.dropped_entries = counts[3];
     st.environment_probability = env;
-    st._pad0 = 0;
+    st.feedback_pixels = counts[4];
     st._pad1 = 0;
     *root.stats = st;
 }

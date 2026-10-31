@@ -53,6 +53,7 @@ void candidates(uint3 id: SV_DispatchThreadID)
     v.position = root.position.xyz;
     v.normal = root.normal.xyz;
     v.pixel = uint2(id.x % 1024, id.x / 1024);
+    v.local = nullptr;
     uint per_light = root.rings * root.sectors;
     uint tile_bin = set.directional_count * per_light;
     for (uint f = 0; f < root.frames; f++)

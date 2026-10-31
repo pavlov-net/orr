@@ -55,5 +55,9 @@ path = "rigid-parts.rs"
 name = "producer-field"
 path = "producer-field.rs"
 
+[[example]]
+name = "many-lights"
+path = "many-lights.rs"
+
 [lints]
 workspace = true

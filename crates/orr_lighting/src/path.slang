@@ -5,7 +5,8 @@
 // next-event estimation by the power heuristic. Hits shade through the kernel's linked
 // surface with a `HitContext`. Paths may end in the scene's world cache; the cache's update
 // paths trace the same path and add what each vertex scattered to its cell. Radiance is
-// written pre-exposed.
+// written pre-exposed. Each pixel also writes its light feedback, one of the lights that
+// added to its path, for the next frame's light selection and local samplers.
 module path;
 
 import orr.abi;
@@ -21,6 +22,7 @@ import visibility;
 import bsdf;
 import media;
 import environment;
+import lights;
 import light_sampling;
 import world_cache;
 
@@ -37,6 +39,10 @@ public static const uint PATH_CACHE_LOD = 8;    // x1's cache level in r, 1 in g
 
 // `PathRoot.cache_flags`: paths may end in the world cache.
 public static const uint CACHE_TERMINATE = 1 << 0;
+
+// `PathRoot.light_flags`: the opaque dispatch counts each pixel's light feedback into the
+// scene's selection.
+public static const uint LIGHT_FEEDBACK_COUNT = 1 << 0;
 
 // Separates an update path's samples from the opaque path's of the same pixel.
 public static const uint UPDATE_STREAM = 0x9E3779B9;
@@ -65,6 +71,9 @@ public struct PathRoot
     public GBufferGpu* gbuffer;
     public LightSetGpu* set;
     public WorldCacheGpu* cache;
+    // The view's local light samplers, `local_columns` per row of `LOCAL_TILE` pixel tiles;
+    // null for none.
+    public LocalLights* local;
     public StorageImageIndex radiance;  // RGBA16F at the G-buffer's extent
     public uint primary_candidates;
     public uint bounce_candidates;
@@ -81,7 +90,11 @@ public struct PathRoot
     public float focus_distance;
     public uint cache_flags;            // CACHE_*
     public uint update_block;           // pixels per side of an update path's block
-    public uint _pad0;
+    // RG32_UINT at the G-buffer's extent: per pixel, its light feedback (a feedback id or
+    // NO_LIGHT) and x1's camera distance in m as float bits, 0 without x1.
+    public StorageImageIndex feedback;
+    public uint local_columns;
+    public uint light_flags;            // LIGHT_*
 }
 
 // A path vertex: its surface, where the path came from and how rays leave it.
@@ -216,13 +229,25 @@ public float nee_probability(LightSetGpu* set, GSurface s)
     return lerp(1.0, saturate(s.bsdf.specular_roughness / NEE_METAL_ROUGHNESS), s.bsdf.metalness);
 }
 
-// Next-event estimation at `x`: `candidates` draws from the light set's mixture resampled by
-// unshadowed luminance, one shadow ray for the winner, weighted against BSDF sampling unless
-// `weight_one`. Draws four sampler dimensions per candidate and counts the ray in `rays`.
-public float3 shade_vertex_nee<S : ISurface, M : IMedium>(PathRoot r, PathVertex x, Bsdf b, float run, uint2 pixel, uint depth, uint candidates, bool weight_one, inout Sampler rng, inout uint rays)
+// The local light sampler of `pixel`'s screen tile, or null.
+public LocalLights* pixel_local_lights(PathRoot r, uint2 pixel)
+{
+    if (r.local == nullptr)
+        return nullptr;
+    uint2 t = pixel / LOCAL_TILE;
+    return r.local + t.y * r.local_columns + t.x;
+}
+
+// Next-event estimation at `x` with local sampler `local` (null for none): `candidates`
+// draws from the light set's mixture resampled by unshadowed luminance, one shadow ray for
+// the winner, weighted against BSDF sampling unless `weight_one`. `light` is the winner's
+// feedback id, NO_LIGHT for a directional winner or none. Draws four sampler dimensions per
+// candidate and counts the ray in `rays`.
+public float3 shade_vertex_nee<S : ISurface, M : IMedium>(PathRoot r, PathVertex x, Bsdf b, float run, uint2 pixel, LocalLights* local, uint depth, uint candidates, bool weight_one, inout Sampler rng, inout uint rays, out uint light)
 {
     LightSetGpu* set = r.set;
-    NeeVertex v = { x.surface.position, x.surface.normal, pixel };
+    light = NO_LIGHT;
+    NeeVertex v = { x.surface.position, x.surface.normal, pixel, local };
     ResolvedLightSample chosen = no_candidate();
     float chosen_target = 0.0;
     float sum = 0.0;
@@ -269,6 +294,8 @@ public float3 shade_vertex_nee<S : ISurface, M : IMedium>(PathRoot r, PathVertex
         || chosen.kind == LIGHT_SAMPLE_EMISSIVE;
     if (!weight_one && shared)
         mis = power_heuristic(run * chosen.pdf, b.pdf(dir));
+    if (chosen.kind != LIGHT_SAMPLE_DIRECTIONAL)
+        light = chosen.light;
     return f * vis * (W * mis / run);
 }
 
@@ -294,15 +321,31 @@ public interface IPathRecord
     // emission included) was `radiance`; next-event estimation and a BSDF ray follow it.
     [mutating]
     void vertex(PathRoot r, PathVertex x, Bsdf b, float3 throughput, float3 radiance, inout Sampler rng);
+    // Light with feedback id `id` added `contribution` of luminance to the path's radiance.
+    [mutating]
+    void light(uint id, float contribution);
     // The path ended with `radiance`.
     [mutating]
     void finish(PathRoot r, float3 radiance);
 }
 
 // A view's path: it ends in the cache after a diffuse bounce, where its cone outgrew the
-// cell, or at the last bounce, and records nothing.
+// cell, or at the last bounce. Its light feedback is one of the lights that added to it,
+// chosen with probability proportional to what each added.
 public struct ViewPath : IPathRecord
 {
+    public uint feedback;
+    float total;
+    uint state;
+
+    // `seed` picks the feedback's random choices, apart from the path's sampler.
+    public __init(uint seed)
+    {
+        feedback = NO_LIGHT;
+        total = 0.0;
+        state = seed;
+    }
+
     public bool may_end(uint depth, bool diffuse, bool wide, bool last)
     {
         return depth >= 1 && (diffuse || wide || last);
@@ -310,6 +353,17 @@ public struct ViewPath : IPathRecord
 
     [mutating]
     public void vertex(PathRoot r, PathVertex x, Bsdf b, float3 throughput, float3 radiance, inout Sampler rng) {}
+
+    [mutating]
+    public void light(uint id, float contribution)
+    {
+        if (!(contribution > 0.0) || !isfinite(contribution))
+            return;
+        total += contribution;
+        state = pcg(state);
+        if (unit_float(state) * total < contribution)
+            feedback = id;
+    }
 
     [mutating]
     public void finish(PathRoot r, float3 radiance) {}
@@ -357,6 +411,9 @@ public struct CacheUpdate : IPathRecord
     }
 
     [mutating]
+    public void light(uint id, float contribution) {}
+
+    [mutating]
     public void finish(PathRoot r, float3 radiance)
     {
         for (uint i = 0; i < count; i++)
@@ -387,6 +444,8 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
     float3 radiance = float3(0.0);
     bool alive = (x.surface.flags & GBUFFER_UNLIT) == 0;
     BsdfRay ray = (BsdfRay)0;
+    // Only x1 reads its screen tile's local sampler.
+    LocalLights* x1_local = pixel_local_lights(r, pixel);
     if (alive)
         record.vertex(r, x, b, throughput, radiance, rng);
 
@@ -394,6 +453,9 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
     for (uint depth = 0; depth <= r.max_bounces; depth++)
     {
         bool counted = r.mode == PATH_DIRECT ? depth == 0 : r.mode == PATH_INDIRECT ? depth > 0 : true;
+        LocalLights* local = nullptr;
+        if (depth == 0)
+            local = x1_local;
         Hit h = (Hit)0;
         float3 positions[3] = { float3(0.0), float3(0.0), float3(0.0) };
         if (alive)
@@ -403,9 +465,12 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
             uint candidates = depth == 0 ? r.primary_candidates : r.bounce_candidates;
             if (count_nee && candidates > 0 && u_run < run)
             {
-                float3 l = shade_vertex_nee<S, M>(r, x, b, run, pixel, depth, candidates, one_technique, rng, rays);
+                uint light;
+                float3 l = shade_vertex_nee<S, M>(r, x, b, run, pixel, local, depth, candidates, one_technique, rng, rays, light);
                 if (counted)
                     radiance += throughput * l;
+                if (light != NO_LIGHT)
+                    record.light(light, luminance_rec2020(throughput * l));
             }
             BsdfSample bs = b.sample(rng.next4().xyz);
             float u_roulette = rng.next();
@@ -448,8 +513,9 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
             if (count_bsdf && counted)
             {
                 float3 env = environment_map(set.environment, ray.dir);
-                float w = weigh ? power_heuristic(ray.pdf, ray.run * nee_environment_pdf(set, ray.normal, ray.dir)) : 1.0;
+                float w = weigh ? power_heuristic(ray.pdf, ray.run * nee_environment_pdf(set, local, ray.normal, ray.dir)) : 1.0;
                 float3 l = env * w;
+                record.light(feedback_environment(set), luminance_rec2020(throughput * l));
                 for (uint k = 0; k < set.directional_count; k++)
                 {
                     uint id = set.directional_ids[k];
@@ -502,7 +568,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
             {
                 float l = luminance_rec2020(material_emission(s.materials + sh.surface.material));
                 float cos_light = dot(sh.surface.geometric_normal, ray.dir);
-                w = power_heuristic(ray.pdf, ray.run * nee_emissive_pdf(set, ray.normal, entry, l, t, cos_light));
+                w = power_heuristic(ray.pdf, ray.run * nee_emissive_pdf(set, local, ray.normal, entry, l, t, cos_light));
             }
             radiance += throughput * b.emission() * w;
         }
@@ -598,6 +664,7 @@ public void opaque_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
     else
         surface = gbuffer_vertex(r.scene, v, r.gbuffer, pixel, x1);
     float3 radiance = float3(0.0);
+    uint feedback = NO_LIGHT;
     if (surface)
     {
         Bsdf b = bsdf_prepare(x1.surface.bsdf, x1.surface.normal, x1.view);
@@ -617,8 +684,9 @@ public void opaque_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
         }
         else
         {
-            ViewPath view_path;
+            ViewPath view_path = ViewPath(pcg3d(uint3(pixel, r.frame ^ r.seed)).x);
             radiance += pre_exposure * trace_path<C, S, M>(r, x1, pixel, rng, rays, view_path);
+            feedback = view_path.feedback;
         }
     }
     else
@@ -635,6 +703,9 @@ public void opaque_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
     else if (r.mode == PATH_ORIGIN_BIAS)
         out = float4(surface ? length(vertex_origin(x1, x1.surface.normal) - x1.surface.position) : 0.0, 0.0, 0.0, out.a);
     r.radiance.get<RWTexture2D<float4>>()[pixel] = out;
+    r.feedback.get<RWTexture2D<uint2>>()[pixel] = uint2(feedback, asuint(surface ? x1.camera_distance : 0.0));
+    if ((r.light_flags & LIGHT_FEEDBACK_COUNT) != 0 && feedback != NO_LIGHT)
+        count_feedback(set, feedback);
 }
 
 // The update path of `block`, a square of `PathRoot.update_block` pixels: one pixel of it,

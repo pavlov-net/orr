@@ -4,10 +4,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use orr::orr_gpu::{Device, DeviceDesc, QueueRequest};
 use orr::orr_output::orr_dlss::Uuid;
-use orr::{DlssSdk, FrameTime, Loading};
+use orr::{
+    DlssSdk, FrameDesc, FrameTime, LoadState, Loading, MountId, PackSource, Renderer, Screenshot,
+};
 
 pub mod field;
 pub mod mesh;
@@ -146,6 +149,29 @@ pub struct Capture {
 }
 
 impl Capture {
+    /// A display screenshot (linear, relative to paper white) encoded as sRGB.
+    pub fn from_screenshot(shot: &Screenshot) -> Self {
+        let rgba8 = shot
+            .rgba
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| {
+                let v = f64::from(v.clamp(0.0, 1.0));
+                let v = if k % 4 == 3 {
+                    v
+                } else {
+                    orr_color::srgb_encode(v)
+                };
+                (v * 255.0).round() as u8
+            })
+            .collect();
+        Capture {
+            width: shot.size[0],
+            height: shot.size[1],
+            rgba8,
+        }
+    }
+
     pub fn save_png(&self, path: &Path) {
         let file = std::fs::File::create(path)
             .unwrap_or_else(|e| panic!("creating {}: {e}", path.display()));
@@ -164,6 +190,38 @@ pub fn fixed_time(n: u64) -> FrameTime {
         absolute: n as f64 / 60.0,
         delta: 1.0 / 60.0,
     }
+}
+
+/// Mounts `source` and renders empty frames until it is mounted and the frame id reaches
+/// `first_frame`, so the frames after it, whose light sampling follows the frame id, repeat
+/// across runs. Returns the mount and the last frame id. Panics if the mount fails or takes
+/// longer than a minute.
+pub fn mount_at(renderer: &mut Renderer, source: PackSource, first_frame: u64) -> (MountId, u64) {
+    let mount = renderer.mount(source);
+    let mut frame = 0;
+    let start = Instant::now();
+    while matches!(renderer.mount_state(mount), LoadState::Pending) || frame < first_frame {
+        frame += 1;
+        let f = renderer
+            .begin_frame(FrameDesc {
+                time: fixed_time(frame),
+                scenes: &[],
+                display: None,
+            })
+            .expect("begin frame");
+        f.end().expect("end frame");
+        assert!(start.elapsed() < Duration::from_secs(60), "mount pending");
+        if matches!(renderer.mount_state(mount), LoadState::Pending) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    if frame > first_frame {
+        log::warn!("mounting took {frame} frames; this run will not repeat others exactly");
+    }
+    if let LoadState::Failed(e) = renderer.mount_state(mount) {
+        panic!("mount failed: {e}");
+    }
+    (mount, frame)
 }
 
 /// Threads lent to orr's loading side until dropped.

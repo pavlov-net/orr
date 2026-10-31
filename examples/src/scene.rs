@@ -3,7 +3,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use orr::orr_gpu::{AddressMode, Allocation, Device, Filter, MemoryKind, SamplerDesc};
 use orr::orr_lighting::EnvironmentMapGpu;
@@ -11,7 +10,7 @@ use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
     Affine3, DirectionalLight, DiscProfile, FrameDesc, GroupWriter, InstanceFlags, InstancesDesc,
-    Light, LightId, LoadState, PackSource, Renderer, SceneDesc, SceneId, SceneLightingSettings,
+    Light, LightId, PackSource, Renderer, SceneDesc, SceneId, SceneLightingSettings,
     TransformGroupDesc, ViewHistoryId,
 };
 use orr_cook::{
@@ -20,8 +19,8 @@ use orr_cook::{
 };
 use orr_math::{DVec3, Vec3};
 
-use crate::fixed_time;
 use crate::mesh::MeshBuilder;
+use crate::{fixed_time, mount_at};
 
 const OBJECTS: &str = "objects";
 const GROUND: &str = "ground";
@@ -53,30 +52,7 @@ impl Showcase {
     /// id reaches a fixed value (light sampling's random sequence follows the frame id, so
     /// headless runs repeat), then creates the scene in one more frame.
     pub fn load(renderer: &mut Renderer, gpu: &Device) -> Self {
-        let mount = renderer.mount(PackSource::Memory(cook()));
-        let mut frame = 0;
-        let start = Instant::now();
-        while matches!(renderer.mount_state(mount), LoadState::Pending) || frame < FIRST_FRAME {
-            frame += 1;
-            let f = renderer
-                .begin_frame(FrameDesc {
-                    time: fixed_time(frame),
-                    scenes: &[],
-                    display: None,
-                })
-                .expect("begin frame");
-            f.end().expect("end frame");
-            assert!(start.elapsed() < Duration::from_secs(60), "mount pending");
-            if matches!(renderer.mount_state(mount), LoadState::Pending) {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-        if frame > FIRST_FRAME {
-            log::warn!("mounting took {frame} frames; this run will not repeat others exactly");
-        }
-        if let LoadState::Failed(e) = renderer.mount_state(mount) {
-            panic!("mount failed: {e}");
-        }
+        let (mount, mut frame) = mount_at(renderer, PackSource::Memory(cook()), FIRST_FRAME);
 
         let scene = renderer
             .create_scene(
