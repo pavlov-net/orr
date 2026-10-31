@@ -304,17 +304,14 @@ fn rr_performance_and_dlaa_overwrite_every_pixel_after_heap_binds() {
 
     let uhd = outputs(&mut gpu, [3840, 2160], 1);
     let hd = outputs(&mut gpu, [1920, 1080], 1);
+    Ngx::take_log();
     let rr = create(&gpu, &ngx, [3840, 2160], Quality::Performance);
     assert_eq!(rr.render_size(), [1920, 1080]);
+    let preset = rr.applied_preset(&Ngx::take_log());
     let (t, staging) = targets(&mut gpu, rr.render_size(), None);
     let out = run(&mut gpu, &mut [(rr, false)], &t, staging, 8, &uhd);
     check_output(&out[0], [1920, 1080]);
-    let log = Ngx::take_log();
-    eprintln!(
-        "applied preset {:?}, vram {}",
-        Ngx::applied_preset(&log),
-        ngx.vram_bytes()
-    );
+    eprintln!("applied preset {preset:?}, vram {}", ngx.vram_bytes());
 
     let dlaa = create(&gpu, &ngx, [1920, 1080], Quality::Dlaa);
     assert_eq!(dlaa.render_size(), [1920, 1080]);
