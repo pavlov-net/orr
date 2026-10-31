@@ -117,6 +117,7 @@ impl Device {
         let raw = shared.create_pipeline(
             PipelineKind::RayDispatch,
             key.finish_key(),
+            vk::PipelineCreateFlags2::empty(),
             name,
             "vkCreateRayTracingPipelinesKHR",
             |chain| {

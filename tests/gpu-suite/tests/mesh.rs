@@ -1,12 +1,12 @@
 //! Mesh pipelines: a G-buffer pass against a CPU rasteriser, blending and scissors.
 
-use gpu_suite::shaders::{blend, gbuffer};
+use gpu_suite::shaders::{blend, gbuffer, tiles};
 use gpu_suite::{assert_clean, device, readback, render, run, upload};
 use orr_gpu::{
     Blend, ClearColor, ColorAttachment, ColorLoad, ColorMask, ColorTarget, CompareOp,
-    DepthAttachment, DepthLoad, DepthTarget, Format, Hazards, MeshArgs, MeshPipelineDesc,
-    Rendering, ShaderStage, SpecData, Stages, Texture, TextureDesc, TextureMemory, TextureRegion,
-    TextureUsage,
+    DepthAttachment, DepthLoad, DepthTarget, Format, Generated, Hazards, MeshArgs,
+    MeshPipelineDesc, Rendering, Sequence, ShaderStage, SpecData, Stages, Texture, TextureDesc,
+    TextureMemory, TextureRegion, TextureUsage,
 };
 
 const W: u32 = 256;
@@ -346,5 +346,126 @@ fn blend_mask_and_scissor() {
         }
     }
     assert_eq!(wrong, 0, "pixels differing from the blend reference");
+    assert_clean();
+}
+
+/// Tiles drawn by device-generated sequences, each picking one of eight mesh pipelines,
+/// match the same draws recorded on the CPU and the CPU model.
+#[test]
+fn generated_draws_match_recorded_draws() {
+    let d = device();
+    if !gpu_suite::require(d.caps().generated_commands, "no device-generated commands") {
+        return;
+    }
+    const PIPELINES: u32 = 8;
+    let (tiles_x, tiles_y) = (W / 32, H / 32);
+    let tile_count = tiles_x * tiles_y;
+    let specs: Vec<_> = (1..=PIPELINES)
+        .map(|value| tiles::Spec { value }.bytes())
+        .collect();
+    let stage = |e, bytes| {
+        let spec = SpecData {
+            entries: tiles::Spec::ENTRIES,
+            bytes,
+        };
+        ShaderStage::new(&tiles::MODULE, e, spec).unwrap()
+    };
+    let colors = [ColorTarget::new(Format::R32Uint)];
+    let descs: Vec<_> = specs
+        .iter()
+        .map(|bytes| MeshPipelineDesc {
+            pixel: Some(stage("pixel_main", bytes)),
+            colors: &colors,
+            ..MeshPipelineDesc::new(stage("mesh_main", bytes))
+        })
+        .collect();
+    let set = d.create_mesh_set(&descs, "tiles").unwrap();
+    let recorded: Vec<_> = descs
+        .iter()
+        .map(|desc| d.create_mesh_pipeline(desc, "tile").unwrap())
+        .collect();
+
+    // Roots 64 bytes apart, the root alignment; every fifth tile draws nothing.
+    let slots: Vec<[u32; 16]> = (0..tile_count)
+        .map(|tile| {
+            let mut slot = [0u32; 16];
+            slot[..3].copy_from_slice(&[tile, tiles_x, tiles_y]);
+            slot
+        })
+        .collect();
+    let roots = upload(&slots, "tile roots");
+    let root = |tile: u32| roots.gpu.offset(u64::from(tile)).cast::<tiles::Root>();
+    let pipeline_of = |tile: u32| tile * 5 % PIPELINES;
+    let groups = |tile: u32| if tile % 5 == 4 { [0, 1, 1] } else { [1, 1, 1] };
+    let max = tile_count + 16;
+    let mut sequences: Vec<_> = (0..tile_count)
+        .map(|t| Sequence::new(pipeline_of(t), root(t), groups(t)))
+        .collect();
+    sequences.resize(max as usize, Sequence::default());
+    let sequences = upload(&sequences, "tile sequences");
+    let count = upload(&[tile_count], "tile sequence count");
+    let layout = set.preprocess_layout(max);
+    let arenas = d
+        .create_device_arenas(1, layout.size() as u64 + 4096, "tile preprocess")
+        .unwrap();
+    let run_set = Generated {
+        set: &set,
+        sequences: sequences.gpu,
+        count: count.gpu,
+        max,
+        preprocess: arenas.allocate(layout).unwrap(),
+    };
+
+    let targets: Vec<_> = (0..2)
+        .map(|i| target(Format::R32Uint, TextureUsage::COLOR, &format!("tiles {i}")))
+        .collect();
+    let outs: Vec<_> = (0..2)
+        .map(|i| readback::<u32>(u64::from(W * H), &format!("tiles out {i}")))
+        .collect();
+    let mut list = render().command_list().unwrap();
+    for (i, t) in targets.iter().enumerate() {
+        list.discard(t);
+        list.begin_rendering(&Rendering {
+            extent: [W, H],
+            colors: &[ColorAttachment {
+                texture: t,
+                load: ColorLoad::Clear(ClearColor::Uint([0; 4])),
+                store: true,
+            }],
+            depth: None,
+        });
+        if i == 0 {
+            list.execute_generated(&run_set, false);
+        } else {
+            for tile in 0..tile_count {
+                let p = &recorded[pipeline_of(tile) as usize];
+                list.draw_mesh_tasks(p, root(tile), groups(tile));
+            }
+        }
+        list.end_rendering();
+    }
+    list.barrier(Stages::COLOR_OUT, Stages::TRANSFER, Hazards::empty());
+    for (t, out) in targets.iter().zip(&outs) {
+        list.copy_from_texture(out.gpu.cast(), t, &TextureRegion::whole_mip(t.desc(), 0));
+    }
+    list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
+    run(list);
+
+    let want: Vec<u32> = (0..W * H)
+        .map(|i| {
+            let tile = (i / W / 32) * tiles_x + i % W / 32;
+            if groups(tile)[0] == 0 {
+                0
+            } else {
+                ((pipeline_of(tile) + 1) << 16) | tile
+            }
+        })
+        .collect();
+    for (i, out) in outs.iter().enumerate() {
+        assert!(
+            out.as_slice().unwrap() == want.as_slice(),
+            "target {i} differs from the CPU model"
+        );
+    }
     assert_clean();
 }

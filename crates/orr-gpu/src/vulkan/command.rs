@@ -216,9 +216,9 @@ impl<'q> CommandList<'q> {
         }
     }
 
-    /// Makes writes in `before` stages visible to `after` stages. [`Stages::RAY`] and
-    /// [`Stages::DECOMPRESS`] are ignored without their `Caps`, since no such work can run
-    /// then.
+    /// Makes writes in `before` stages visible to `after` stages. [`Stages::RAY`],
+    /// [`Stages::DECOMPRESS`] and [`Stages::PREPROCESS`] are ignored without their `Caps`,
+    /// since no such work can run then.
     pub fn barrier(&mut self, before: Stages, after: Stages, hazards: Hazards) {
         let caps = &self.queue.shared.caps;
         let mut src = vk_stages(before, caps);
@@ -279,7 +279,13 @@ impl<'q> CommandList<'q> {
         }
     }
 
-    fn bind(&mut self, point: vk::PipelineBindPoint, pipeline: vk::Pipeline, root: u64) {
+    /// The pipeline and push data a command changed behind the list's back: the next
+    /// command binds and pushes its own.
+    pub(crate) fn pipeline_lost(&mut self) {
+        self.bound = vk::Pipeline::null();
+    }
+
+    pub(crate) fn bind(&mut self, point: vk::PipelineBindPoint, pipeline: vk::Pipeline, root: u64) {
         let cmd = self.cmd();
         if self.rebind_heaps {
             self.queue
@@ -887,6 +893,14 @@ fn vk_stages(s: Stages, caps: &Caps) -> vk::PipelineStageFlags2 {
             Stages::DECOMPRESS,
             if caps.memory_decompression {
                 P::MEMORY_DECOMPRESSION_EXT
+            } else {
+                P::NONE
+            },
+        ),
+        (
+            Stages::PREPROCESS,
+            if caps.generated_commands {
+                P::COMMAND_PREPROCESS_EXT
             } else {
                 P::NONE
             },

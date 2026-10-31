@@ -21,6 +21,10 @@ bitflags::bitflags! {
         const ALL = 1 << 10;
         /// Memory decompression; ignored without `Caps::memory_decompression`.
         const DECOMPRESS = 1 << 11;
+        /// Preprocessing of device-generated commands
+        /// ([`crate::CommandList::preprocess_generated`]); ignored without
+        /// `Caps::generated_commands`.
+        const PREPROCESS = 1 << 12;
     }
 }
 

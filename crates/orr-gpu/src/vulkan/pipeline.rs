@@ -269,17 +269,21 @@ impl Shared {
         self.log_statistics(raw, name);
     }
 
+    /// A compute pipeline with `extra` creation flags.
     pub(crate) fn create_compute(
         &self,
         s: &ShaderStage<'_>,
+        extra: vk::PipelineCreateFlags2,
         name: &str,
     ) -> Result<vk::Pipeline, Error> {
         let parts = StageParts::new(self, s, Stage::Compute, name)?;
         let mut key = KeyHasher::new(PipelineKind::Compute);
         parts.hash(vk::ShaderStageFlags::COMPUTE, &mut key);
+        extra.as_raw().hash(&mut key);
         self.create_pipeline(
             PipelineKind::Compute,
             key.finish_key(),
+            extra,
             name,
             "vkCreateComputePipelines",
             |chain| {
@@ -307,7 +311,9 @@ impl Device {
         name: &str,
     ) -> Result<ComputePipeline, Error> {
         Ok(ComputePipeline {
-            raw: self.shared.create_compute(s, name)?,
+            raw: self
+                .shared
+                .create_compute(s, vk::PipelineCreateFlags2::empty(), name)?,
             workgroup: s.entry.workgroup,
             shared: Arc::clone(&self.shared),
         })

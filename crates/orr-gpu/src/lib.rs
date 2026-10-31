@@ -55,13 +55,14 @@ pub use vulkan::{
     Allocation, Checkpoint, ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance,
     ClassicKind, ColorAttachment, CommandList, ComputePipeline, DecompressRegion, DepthAttachment,
     Device, DeviceArenas, DeviceDesc, DeviceFault, DeviceHooks, Diagnostics, DiagnosticsReport,
-    DispatchArgs, FaultAccess, FaultAddress, HeapReport, HostArenas, InstanceFlags, LowLatency,
-    LssEndCaps, LssIndexing, MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout,
-    MemoryKind, MemoryPriority, MemoryReport, MemoryUsage, MeshArgs, MeshPipeline,
-    MeshPipelineDesc, Micromap, MicromapDesc, MicromapTriangle, MicromapUsage, OmmFormat, PageBind,
-    PassResult, PipelineCacheKind, PipelineCacheReport, PipelineStats, Queue, QueueKind,
-    QueueProgress, QueueRequest, RayDispatchPipeline, Rendering, ShaderStage, SparseAllocation,
-    SparseBinds, Swapchain, SwapchainFrame, Texture, TextureMemory, TileBind,
+    DispatchArgs, ExecutionSet, FaultAccess, FaultAddress, Generated, HeapReport, HostArenas,
+    InstanceFlags, LowLatency, LssEndCaps, LssIndexing, MATRIX_ALIGN, MatrixConversion,
+    MatrixFormat, MatrixLayout, MemoryKind, MemoryPriority, MemoryReport, MemoryUsage, MeshArgs,
+    MeshPipeline, MeshPipelineDesc, Micromap, MicromapDesc, MicromapTriangle, MicromapUsage,
+    OmmFormat, PageBind, PassResult, PipelineCacheKind, PipelineCacheReport, PipelineStats, Queue,
+    QueueKind, QueueProgress, QueueRequest, RayDispatchPipeline, Rendering, Sequence, SetKind,
+    ShaderStage, SparseAllocation, SparseBinds, Swapchain, SwapchainFrame, Texture, TextureMemory,
+    TileBind,
 };
 
 #[cfg(not(target_vendor = "apple"))]

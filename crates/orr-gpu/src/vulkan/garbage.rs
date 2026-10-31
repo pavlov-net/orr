@@ -26,6 +26,12 @@ pub(crate) enum Item {
         buffer: vk::Buffer,
         address: u64,
     },
+    /// An execution set, its command layouts and its pipelines, destroyed in that order.
+    ExecutionSet {
+        set: vk::IndirectExecutionSetEXT,
+        layouts: Vec<vk::IndirectCommandsLayoutEXT>,
+        pipelines: Vec<vk::Pipeline>,
+    },
     ImageSlot(u32),
     RaygenRecord(u32),
     /// A library's objects, released by its closure.
@@ -125,6 +131,25 @@ impl Shared {
                 Item::SparseBuffer { buffer, address } => {
                     self.unregister_range(address);
                     d.destroy_buffer(buffer, None);
+                }
+                Item::ExecutionSet {
+                    set,
+                    layouts,
+                    pipelines,
+                } => {
+                    let f = self
+                        .generated_fn
+                        .as_ref()
+                        .expect("execution sets need Caps::generated_commands");
+                    if set != vk::IndirectExecutionSetEXT::null() {
+                        f.destroy_indirect_execution_set(set, None);
+                    }
+                    for l in layouts {
+                        f.destroy_indirect_commands_layout(l, None);
+                    }
+                    for p in pipelines {
+                        d.destroy_pipeline(p, None);
+                    }
                 }
                 Item::ImageSlot(slot) => self.heaps().release_image_slot(slot),
                 Item::RaygenRecord(slot) => {

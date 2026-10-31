@@ -1,5 +1,5 @@
-//! Compiles orr-gpu's own kernels and publishes its shader root, which holds the `rtas`
-//! library.
+//! Compiles orr-gpu's own kernels and publishes its shader root, which holds the `rtas` and
+//! `sequence` libraries.
 
 use std::env;
 use std::path::PathBuf;

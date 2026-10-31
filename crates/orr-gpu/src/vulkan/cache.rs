@@ -457,19 +457,21 @@ impl<'a> Chain<'a> {
 }
 
 impl Shared {
-    /// Creates a pipeline through the cache. `create` builds the create info with the
-    /// chain's head as its `p_next` and the chain's cache, and calls the create function.
+    /// Creates a pipeline through the cache with `extra` creation flags, which `key` covers.
+    /// `create` builds the create info with the chain's head as its `p_next` and the chain's
+    /// cache, and calls the create function.
     pub(super) fn create_pipeline(
         &self,
         kind: PipelineKind,
         key: [u8; 32],
+        extra: vk::PipelineCreateFlags2,
         name: &str,
         call: &'static str,
         mut create: impl FnMut(&mut Chain<'_>) -> Result<vk::Pipeline, vk::Result>,
     ) -> Result<vk::Pipeline, Error> {
         let start = Instant::now();
         let cache = &self.pipeline_cache;
-        let flags = self.pipeline_flags();
+        let flags = self.pipeline_flags() | extra;
         let count = |hit: bool| {
             if hit { &cache.hits } else { &cache.misses }.fetch_add(1, Ordering::Relaxed);
         };

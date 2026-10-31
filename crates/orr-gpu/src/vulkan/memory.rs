@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use ash::vk;
+use ash::vk::TaggedStructure as _;
 use bytemuck::Pod;
 use orr_memory::{AllocError, AllocationFlags, Allocator, AllocatorDesc, Arena, Pool, PoolDesc};
 
@@ -461,11 +462,19 @@ impl Shared {
             align = align.max(pools.placement_align);
             size = size.next_multiple_of(pools.placement_align);
         }
-        let info = vk::BufferCreateInfo::default()
+        // Device-generated commands preprocess into DeviceLocal arena memory.
+        let mut usage2 = vk::BufferUsageFlags2CreateInfo::default().usage(
+            vk::BufferUsageFlags2::from_raw(u64::from(usage.as_raw()))
+                | vk::BufferUsageFlags2::PREPROCESS_BUFFER_EXT,
+        );
+        let mut info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(usage)
             .sharing_mode(sharing)
             .queue_family_indices(families);
+        if priority.is_none() && kind == MemoryKind::DeviceLocal && self.caps.generated_commands {
+            info = info.push(&mut usage2);
+        }
         let pool = match priority {
             Some(p) => pools.buffers[p as usize][kind.index()],
             None => pools.transient[kind.index()],

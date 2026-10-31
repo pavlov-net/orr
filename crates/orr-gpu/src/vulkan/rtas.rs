@@ -405,7 +405,8 @@ impl RtasCheck {
             "main",
             SpecData::default(),
         )?;
-        let pipeline = shared.create_compute(&stage, "orr PTLAS check")?;
+        let pipeline =
+            shared.create_compute(&stage, vk::PipelineCreateFlags2::empty(), "orr PTLAS check")?;
         let made = shared.create_buffer(
             MemoryKind::Readback,
             4,
