@@ -1,12 +1,16 @@
 //! `UsdGeomMesh` faces as welded triangles: ngons by ear clipping, holes dropped, normals
 //! and `st` by their interpolation (smooth point normals where none are authored), uvs
-//! flipped from USD's bottom-left origin to the cook's top-left.
+//! flipped from USD's bottom-left origin to the cook's top-left. Or as a subdivision cage
+//! ([`CageBuilder`]): faces as authored with their creases, corners, holes and boundary
+//! rules, `st` as face-varying values (unindexed values weld where a point's corners agree).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use orr_math::{Affine2, DMat3, DMat4, DVec3, Vec2};
+use orr_pack::subd::Influence as SkinInfluence;
 
-use super::read::{PrimReader, Primvar};
+use super::read::{Interp, PrimReader, Primvar};
+use crate::subd::{Boundary, CageInput, Corner, Crease, FaceVarying, UvLinear};
 
 /// The authored topology and attributes of one mesh prim.
 pub(super) struct MeshPrim {
@@ -19,6 +23,11 @@ pub(super) struct MeshPrim {
     pub holes: Vec<usize>,
     pub scheme: String,
     pub double_sided: bool,
+    pub creases: Vec<Crease>,
+    pub corners: Vec<Corner>,
+    pub boundary: Boundary,
+    pub uv_linear: UvLinear,
+    pub smooth_triangles: bool,
 }
 
 impl MeshPrim {
@@ -50,7 +59,86 @@ impl MeshPrim {
                 points.len()
             ));
         }
+        let index = |i: i64, what: &str| {
+            u32::try_from(i)
+                .ok()
+                .filter(|&i| (i as usize) < points.len())
+                .ok_or_else(|| format!("{path} {what}: point {i}"))
+        };
+        let mut creases = Vec::new();
+        let chain = r.ints("creaseIndices")?.unwrap_or_default();
+        let lengths = r.ints("creaseLengths")?.unwrap_or_default();
+        let sharp = r.numbers("creaseSharpnesses")?.unwrap_or_default();
+        let edges: i64 = lengths.iter().map(|&l| (l - 1).max(0)).sum();
+        let per_edge = sharp.len() as i64 == edges && sharp.len() != lengths.len();
+        if !per_edge && sharp.len() != lengths.len() {
+            return Err(format!(
+                "{path}: {} crease sharpnesses for {} creases",
+                sharp.len(),
+                lengths.len()
+            ));
+        }
+        let (mut at, mut edge) = (0usize, 0usize);
+        for (c, &len) in lengths.iter().enumerate() {
+            let len = usize::try_from(len).map_err(|_| format!("{path}: crease length {len}"))?;
+            let run = chain
+                .get(at..at + len)
+                .ok_or_else(|| format!("{path}: crease lengths pass the crease indices"))?;
+            for pair in run.windows(2) {
+                creases.push(Crease {
+                    edge: [
+                        index(pair[0], "creaseIndices")?,
+                        index(pair[1], "creaseIndices")?,
+                    ],
+                    sharpness: sharp[if per_edge { edge } else { c }] as f32,
+                });
+                edge += 1;
+            }
+            at += len;
+        }
+        let corner_points = r.ints("cornerIndices")?.unwrap_or_default();
+        let corner_sharp = r.numbers("cornerSharpnesses")?.unwrap_or_default();
+        if corner_points.len() != corner_sharp.len() {
+            return Err(format!(
+                "{path}: corner indices and sharpnesses differ in count"
+            ));
+        }
+        let corners = corner_points
+            .iter()
+            .zip(&corner_sharp)
+            .map(|(&p, &s)| {
+                Ok(Corner {
+                    point: index(p, "cornerIndices")?,
+                    sharpness: s as f32,
+                })
+            })
+            .collect::<Result<_, String>>()?;
+        let boundary = match r.token("interpolateBoundary")?.as_deref() {
+            Some("none") => Boundary::None,
+            Some("edgeOnly") => Boundary::Edges,
+            Some("edgeAndCorner") | None => Boundary::EdgesAndCorners,
+            Some(t) => return Err(format!("{path}: interpolateBoundary {t}")),
+        };
+        let uv_linear = match r.token("faceVaryingLinearInterpolation")?.as_deref() {
+            Some("none") => UvLinear::None,
+            Some("cornersOnly") => UvLinear::CornersOnly,
+            Some("cornersPlus1") | None => UvLinear::CornersPlus1,
+            Some("cornersPlus2") => UvLinear::CornersPlus2,
+            Some("boundaries") => UvLinear::Boundaries,
+            Some("all") => UvLinear::All,
+            Some(t) => return Err(format!("{path}: faceVaryingLinearInterpolation {t}")),
+        };
+        let smooth_triangles = match r.token("triangleSubdivisionRule")?.as_deref() {
+            Some("smooth") => true,
+            Some("catmullClark") | None => false,
+            Some(t) => return Err(format!("{path}: triangleSubdivisionRule {t}")),
+        };
         Ok(Self {
+            creases,
+            corners,
+            boundary,
+            uv_linear,
+            smooth_triangles,
             counts,
             indices,
             points,
@@ -179,6 +267,172 @@ impl Welder {
         }
         Ok(())
     }
+}
+
+/// One model's subdivision cage, appended mesh by mesh, in model space and right-handed.
+#[derive(Default)]
+pub(super) struct CageBuilder {
+    pub cage: CageInput,
+    pub skin: Vec<SkinInfluence>,
+    /// Scene material per face.
+    pub materials: Vec<usize>,
+    uvs: HashMap<[u32; 2], u32>,
+    /// The first mesh's path, naming the rules every other must share.
+    first: Option<String>,
+}
+
+impl CageBuilder {
+    pub(super) fn is_empty(&self) -> bool {
+        self.cage.face_counts.is_empty()
+    }
+
+    /// Adds the mesh's faces, creases, corners, holes and uvs.
+    pub(super) fn add(
+        &mut self,
+        mesh: &MeshPrim,
+        at: &Placing<'_>,
+        path: &str,
+    ) -> Result<(), String> {
+        if mesh.scheme != "catmullClark" {
+            return Err(format!(
+                "{path}: subdivision scheme {}; cages cook as Catmull-Clark",
+                mesh.scheme
+            ));
+        }
+        let rules = (mesh.boundary, mesh.uv_linear, mesh.smooth_triangles);
+        let c = &mut self.cage;
+        match &self.first {
+            None => {
+                (c.boundary, c.uv_linear, c.smooth_triangles) = rules;
+                self.first = Some(path.into());
+            }
+            Some(first) if (c.boundary, c.uv_linear, c.smooth_triangles) != rules => {
+                return Err(format!(
+                    "{path}: its boundary, face-varying or triangle rules differ from {first}'s \
+                     in the same model; select them as separate models"
+                ));
+            }
+            Some(_) => {}
+        }
+        let flip = (DMat3::from_mat4(at.transform).determinant() < 0.0) != mesh.left_handed;
+        let base = c.positions.len() as u32;
+        let first_face = c.face_counts.len() as u32;
+        for &p in &mesh.points {
+            c.positions.push(at.transform.transform_point3(p).as_vec3());
+        }
+        if let Some(s) = at.skin {
+            self.skin.extend(
+                s.iter()
+                    .map(|&(joints, weights)| SkinInfluence { joints, weights }),
+            );
+        }
+        let had_uvs = c.uvs.is_some();
+        if mesh.uvs.is_some() && !had_uvs {
+            // Earlier meshes without uvs read value 0.
+            c.uvs = Some(FaceVarying {
+                values: vec![Vec2::ZERO],
+                indices: vec![0; c.face_indices.len()],
+            });
+        }
+        let welds = mesh
+            .uvs
+            .as_ref()
+            .map(|uv| uv_values(mesh, uv, path))
+            .transpose()?;
+        let mut corner = 0;
+        for (face, &count) in mesh.counts.iter().enumerate() {
+            let (material, uv_t) = (at.face_material)(face);
+            self.materials.push(material);
+            c.face_counts.push(count as u32);
+            let ring: Vec<usize> = if flip {
+                std::iter::once(corner)
+                    .chain((corner + 1..corner + count).rev())
+                    .collect()
+            } else {
+                (corner..corner + count).collect()
+            };
+            corner += count;
+            for k in ring {
+                c.face_indices.push(base + mesh.indices[k] as u32);
+                let Some(fv) = c.uvs.as_mut() else { continue };
+                let value = match &welds {
+                    Some((values, index)) => {
+                        let v = values[index[k] as usize];
+                        let v = uv_t.map_or(v, |t| t.transform_point2(v));
+                        Vec2::new(v.x, 1.0 - v.y)
+                    }
+                    None => Vec2::ZERO,
+                };
+                let id = match &welds {
+                    // A value stays shared among the corners of one source value and one
+                    // uv transform.
+                    Some((_, index)) => {
+                        let source = [index[k], uv_t.map_or(u32::MAX, |_| material as u32)];
+                        *self.uvs.entry(source).or_insert_with(|| {
+                            fv.values.push(value);
+                            fv.values.len() as u32 - 1
+                        })
+                    }
+                    None => 0,
+                };
+                fv.indices.push(id);
+            }
+        }
+        for cr in &mesh.creases {
+            c.creases.push(Crease {
+                edge: cr.edge.map(|p| base + p),
+                sharpness: cr.sharpness,
+            });
+        }
+        for co in &mesh.corners {
+            c.corners.push(Corner {
+                point: base + co.point,
+                sharpness: co.sharpness,
+            });
+        }
+        let holes: BTreeSet<usize> = mesh.holes.iter().copied().collect();
+        for h in holes {
+            if h >= mesh.counts.len() {
+                return Err(format!("{path}: hole {h} past the faces"));
+            }
+            c.holes.push(first_face + h as u32);
+        }
+        // Per-mesh uv welding must not join another mesh's values.
+        self.uvs.clear();
+        Ok(())
+    }
+}
+
+/// The mesh's uv values and one value index per face corner: indexed and vertex primvars
+/// keep their sharing, unindexed face-varying values weld where a point's corners agree.
+fn uv_values(mesh: &MeshPrim, uv: &Primvar, path: &str) -> Result<(Vec<Vec2>, Vec<u32>), String> {
+    let mut values = Vec::new();
+    let mut index = Vec::with_capacity(mesh.indices.len());
+    let mut seen: HashMap<(usize, [u64; 2]), u32> = HashMap::new();
+    let mut corner = 0;
+    for (face, &count) in mesh.counts.iter().enumerate() {
+        for k in corner..corner + count {
+            let point = mesh.indices[k];
+            let v = uv
+                .at(point, face, k)
+                .ok_or_else(|| format!("{path}: st does not cover face {face}"))?;
+            let element = match (uv.interp, &uv.indices) {
+                (Interp::FaceVarying, Some(ix)) => ix[k] as usize,
+                (Interp::FaceVarying, None) => point,
+                (Interp::Vertex, _) => point,
+                (Interp::Uniform, _) => usize::MAX - face,
+                (Interp::Constant, _) => usize::MAX,
+            };
+            let key = (element, [v[0].to_bits(), v[1].to_bits()]);
+            let id = *seen.entry(key).or_insert_with(|| {
+                values.push(Vec2::new(v[0] as f32, v[1] as f32));
+                values.len() as u32 - 1
+            });
+            index.push(id);
+        }
+        corner += count;
+    }
+    Ok((values, index))
 }
 
 /// Area-weighted point normals from the faces around each point.

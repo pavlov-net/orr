@@ -526,6 +526,7 @@ pub(crate) fn import(
             node,
             SceneModel {
                 node: name,
+                subd: None,
                 mesh: MeshData {
                     positions: v.positions,
                     normals: v.normals,

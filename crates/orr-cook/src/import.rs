@@ -10,6 +10,7 @@ use serde::Deserialize;
 
 use crate::mesh::{MeshData, MeshSettings};
 use crate::state::Input;
+use crate::subd::{CageData, SubdSettings};
 use crate::texture::material::{ImageFile, MaterialTextures};
 
 /// Selects nodes of a scene (glTF nodes, USD prims) as models.
@@ -60,12 +61,22 @@ pub(crate) struct SceneSkeleton {
 pub(crate) struct SceneModel {
     /// The selected node's name; `None` for the whole scene.
     pub node: Option<String>,
+    /// A mesh without sections cooks no mesh entry.
     pub mesh: MeshData,
+    pub subd: Option<SceneSubd>,
     /// Index into [`Scene::skeletons`] of a skinned mesh.
     pub skeleton: Option<usize>,
     pub settings: MeshSettings,
     /// Index into [`Scene::materials`] per mesh section.
     pub materials: Vec<usize>,
+}
+
+/// A model's subdivision cage.
+pub(crate) struct SceneSubd {
+    pub cage: CageData,
+    /// Index into [`Scene::materials`] per cage section.
+    pub materials: Vec<usize>,
+    pub settings: SubdSettings,
 }
 
 pub(crate) struct SceneMaterial {

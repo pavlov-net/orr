@@ -33,8 +33,8 @@ const GOLDEN: &[(u16, u32, &str)] = &[
     ),
     (
         Class::Model as u16,
-        2,
-        "4dd1af8fae291797d78c5caa5d5af27bddb995855cb408d5cba3f004ec6baa62",
+        3,
+        "f88a9bd90ab88d29ffab4f1e5b374b686704e3bbee80f0808c8017d103883757",
     ),
     (
         Class::Texture as u16,
@@ -208,4 +208,62 @@ fn cooked_bytes_match_their_cook_versions() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// (cook version, hash) of the subdivision cage class, as the rows above.
+#[cfg(feature = "subd")]
+const SUBD_GOLDEN: (u32, &str) = (
+    1,
+    "35fdeae53cf41d76dd2a238f813ed73c4375bd5a11fe007c534d73e5a7fce9da",
+);
+
+#[cfg(feature = "subd")]
+#[test]
+fn cooked_cages_match_their_cook_version() {
+    use orr_cook::{CageInput, Crease};
+    let positions = (0..8)
+        .map(|i| {
+            let b = |k: u32| if i & (1 << k) != 0 { 1.0 } else { -1.0 };
+            Vec3::new(b(0), b(1), b(2))
+        })
+        .collect();
+    let cage = CageInput {
+        positions,
+        face_counts: vec![4; 6],
+        face_indices: vec![
+            0, 2, 3, 1, 4, 5, 7, 6, 0, 1, 5, 4, 2, 6, 7, 3, 0, 4, 6, 2, 1, 3, 7, 5,
+        ],
+        creases: vec![Crease {
+            edge: [0, 1],
+            sharpness: 1.5,
+        }],
+        ..Default::default()
+    };
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(
+            Target::Memory,
+            vec![AssetSpec {
+                name: "cage".into(),
+                source: Source::Subd {
+                    cage,
+                    materials: vec![Default::default()],
+                    settings: Default::default(),
+                },
+            }],
+        )],
+    };
+    let bytes = orr_cook::cook(&manifest, &Default::default())
+        .unwrap()
+        .memory
+        .remove(0);
+    let a = Archive::from_memory(bytes).unwrap();
+    let class = Class::Subd as u16;
+    let e = a.entries().iter().find(|e| e.class == class).unwrap();
+    let hash = blake3::hash(&e.content_hash.0).to_hex().to_string();
+    let current = orr_cook::cook_version(class);
+    assert_eq!(
+        (current, hash.as_str()),
+        SUBD_GOLDEN,
+        "bump the subd cook version in src/key.rs when its output changes, then update the row"
+    );
 }

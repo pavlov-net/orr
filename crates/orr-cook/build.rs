@@ -8,6 +8,10 @@
 //! `.tools`) and sets `ORR_COOK_NTC_SDK`, `ORR_COOK_NTC_INTERFACE` (the headers'
 //! `InterfaceVersion`) and `ORR_COOK_NTC_SCHEMA` (the NTC file schema version the checkout
 //! writes).
+//!
+//! With the `subd` feature, compiles OpenSubdiv's Sdc, Vtr and Far sources from the release
+//! checkout in `ORR_OPENSUBDIV` (else `OpenSubdiv-3.8.0` under `ORR_TOOLS` or the nearest
+//! `.tools`) with the Far shim, and sets `ORR_COOK_SUBD_LIBS` to the release it read.
 
 use std::path::Path;
 
@@ -17,6 +21,7 @@ const TEXTURE: &[&str] = &["bcdec_rs", "image", "png", "half"];
 
 fn main() {
     ntc();
+    subd();
     let dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let lock = Path::new(&dir)
         .ancestors()
@@ -103,3 +108,61 @@ fn ntc() {
 
 #[cfg(not(feature = "ntc"))]
 fn ntc() {}
+
+/// The OpenSubdiv release the cook is pinned to: its checkout directory and version number.
+#[cfg(feature = "subd")]
+const OPENSUBDIV: (&str, &str) = ("OpenSubdiv-3.8.0", "30800");
+
+#[cfg(feature = "subd")]
+fn subd() {
+    let src = orr_shaders::build::fetched("ORR_OPENSUBDIV", OPENSUBDIV.0)
+        .unwrap_or_else(|e| panic!("the subd feature needs an OpenSubdiv checkout: {e}"));
+    let version = src.join("opensubdiv/version.h");
+    let text =
+        std::fs::read_to_string(&version).unwrap_or_else(|e| panic!("{}: {e}", version.display()));
+    let number = constant_define(&text, "OPENSUBDIV_VERSION_NUMBER", &version);
+    assert_eq!(
+        number,
+        OPENSUBDIV.1,
+        "{} is OpenSubdiv {number}; the cook is pinned to {}",
+        src.display(),
+        OPENSUBDIV.1
+    );
+    println!("cargo:rustc-env=ORR_COOK_SUBD_LIBS=OpenSubdiv {number}");
+    println!("cargo:rerun-if-changed=src/subd/osd.cpp");
+    let mut files = Vec::new();
+    for dir in ["sdc", "vtr", "far"] {
+        let dir = src.join("opensubdiv").join(dir);
+        let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        for e in entries {
+            let path = e.expect("directory entry").path();
+            if path.extension().is_some_and(|x| x == "cpp") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let mut b = cc::Build::new();
+    b.cpp(true)
+        .std("c++17")
+        .include(&src)
+        .define("_USE_MATH_DEFINES", None)
+        .define("NOMINMAX", None)
+        .warnings(false)
+        .files(&files)
+        .file("src/subd/osd.cpp");
+    b.compile("orr_osd");
+}
+
+#[cfg(feature = "subd")]
+fn constant_define(text: &str, name: &str, file: &Path) -> String {
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("#define ")?.strip_prefix(name))
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|| panic!("{} has no {name}", file.display()))
+}
+
+#[cfg(not(feature = "subd"))]
+fn subd() {
+    println!("cargo:rustc-env=ORR_COOK_SUBD_LIBS=");
+}

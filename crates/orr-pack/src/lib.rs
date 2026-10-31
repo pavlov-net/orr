@@ -16,6 +16,7 @@ pub mod model;
 pub mod neural;
 pub mod raster;
 pub mod skeleton;
+pub mod subd;
 pub mod texture;
 mod writer;
 
@@ -180,6 +181,7 @@ const SCHEMAS: &[(Class, u16)] = &[
     (Class::Skeleton, skeleton::SCHEMA),
     (Class::Clip, clip::SCHEMA),
     (Class::NeuralTextureSet, neural::SCHEMA),
+    (Class::Subd, subd::SCHEMA),
 ];
 
 impl Class {

@@ -40,6 +40,9 @@ zstd.workspace = true
 # Neural texture sets through RTXNTC's LibNTC (NVIDIA RTX SDK licence, never vendored): the
 # headers of the checkout at ORR_NTC_SDK at build time, the library loaded when a set cooks.
 ntc = ["dep:libloading", "dep:cc", "dep:orr-shaders"]
+# Subdivision cages through OpenSubdiv's Far (Apache-2.0, never vendored): the release
+# checkout at ORR_OPENSUBDIV is compiled into the cook.
+subd = ["dep:cc", "dep:orr-shaders"]
 
 [build-dependencies]
 cc = { workspace = true, optional = true }
