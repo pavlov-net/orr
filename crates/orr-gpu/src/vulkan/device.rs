@@ -455,6 +455,7 @@ impl Device {
             device_address_commands: optional.device_address_commands,
             unified_image_layouts: optional.unified_image_layouts,
             memory_budget: optional.memory_budget,
+            memory_priority: optional.memory_priority,
             shader_abort: optional.shader_abort,
             device_fault: optional.device_fault || optional.device_fault_ext,
             breadcrumbs: optional.buffer_marker,
@@ -717,7 +718,7 @@ impl Device {
             hooks.device_created(&device.shared.raw_device());
         }
         log::info!(
-            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, lss {}, address commands {}, cooperative vector combinations {}, host image copy {}, decompression {}, occupancy priority {}, validation layer {}, ray tracing validation {}, diagnostics {:?} (breadcrumbs {}, checkpoints {}, aftermath {}, device fault {})",
+            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, lss {}, address commands {}, cooperative vector combinations {}, host image copy {}, decompression {}, occupancy priority {}, memory priority {} (pageable {}), validation layer {}, ray tracing validation {}, diagnostics {:?} (breadcrumbs {}, checkpoints {}, aftermath {}, device fault {})",
             device.shared.caps.device_name,
             device.shared.caps.driver,
             device.shared.caps.rebar,
@@ -730,6 +731,8 @@ impl Device {
             device.shared.caps.host_image_copy,
             optional.memory_decompression,
             optional.occupancy_priority,
+            optional.memory_priority,
+            optional.pageable_memory,
             desc.validation,
             optional.ray_tracing_validation,
             desc.diagnostics,

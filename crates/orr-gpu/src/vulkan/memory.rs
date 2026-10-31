@@ -44,6 +44,31 @@ impl MemoryKind {
     }
 }
 
+/// How firmly the OS keeps an allocation in VRAM when the process is over its budget, with
+/// `Caps::memory_priority`. Allocations of different priorities never share a block.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum MemoryPriority {
+    /// Paged out first: streaming pools, which shrink under pressure anyway.
+    Low,
+    /// Resident data; what [`Device::gpu_malloc`] gives.
+    #[default]
+    Normal,
+    /// Paged out last: acceleration structures and tables every frame reads. Render
+    /// targets and transient arenas take it too.
+    High,
+}
+
+impl MemoryPriority {
+    /// The `VK_EXT_memory_priority` value.
+    fn value(self) -> f32 {
+        match self {
+            MemoryPriority::Low => 0.25,
+            MemoryPriority::Normal => 0.5,
+            MemoryPriority::High => 1.0,
+        }
+    }
+}
+
 /// Usage every `gpu_malloc` buffer carries, so any block can hold any kind of data. The
 /// shader-binding-table bit needs the ray-tracing pipeline extension.
 pub(crate) fn buffer_usage(ray_dispatch: bool) -> vk::BufferUsageFlags {
@@ -240,6 +265,16 @@ impl MemoryReport {
     pub fn kind(&self, kind: MemoryKind) -> MemoryUsage {
         self.kinds[kind.index()]
     }
+
+    /// The largest share of its OS budget a device-local heap uses; above 1 the OS pages
+    /// memory out. `None` without `Caps::memory_budget`.
+    pub fn pressure(&self) -> Option<f64> {
+        self.heaps
+            .iter()
+            .filter(|h| h.device_local)
+            .filter_map(|h| Some(h.usage? as f64 / h.budget?.max(1) as f64))
+            .reduce(f64::max)
+    }
 }
 
 /// Live `gpu_malloc` bytes and allocations of one kind, transient arena blocks included.
@@ -281,10 +316,6 @@ pub(crate) fn sharing(families: &[u32]) -> (vk::SharingMode, &[u32]) {
     }
 }
 
-/// Priority of resident data.
-const RESIDENT_PRIORITY: f32 = 0.5;
-/// Priority of transient memory and render targets, which the OS keeps in VRAM first.
-const FRAME_PRIORITY: f32 = 1.0;
 /// Least alignment of any buffer.
 const MIN_ALIGN: u64 = 16;
 /// Alignment of `gpu_malloc` buffers, which may hold acceleration structures and roots.
@@ -294,11 +325,13 @@ const MALLOC_ALIGN: u64 = 256;
 /// in them stay aligned and share no granule with a neighboring buffer.
 const PLACEMENT_MIN_BYTES: u64 = 64 << 10;
 
-/// The allocator and its pools: per kind one pool of resident buffers and one of transient
-/// arena blocks, image pools apart from buffer pools, and render targets apart from both.
+/// The allocator and its pools: per kind one buffer pool per priority and one pool of
+/// transient arena blocks, image pools apart from buffer pools, and render targets apart
+/// from both.
 pub(crate) struct Pools {
     pub allocator: Allocator,
-    buffers: [Pool; 3],
+    /// By priority, then kind.
+    buffers: [[Pool; 3]; 3],
     transient: [Pool; 3],
     /// DeviceLocal and Upload (host-copy) textures.
     images: [Pool; 2],
@@ -319,31 +352,39 @@ impl Pools {
     ) -> Result<Self, Error> {
         // SAFETY: forwarded from the caller.
         let allocator = unsafe { Allocator::new(desc) }.map_err(memory_error)?;
-        let pool = |name: &str, kind: MemoryKind, priority: f32| {
+        let pool = |name: &str, kind: MemoryKind, priority: MemoryPriority| {
             allocator
                 .create_pool(&PoolDesc {
                     name,
                     memory_type: types.of(kind),
-                    priority,
+                    priority: priority.value(),
                 })
                 .map_err(memory_error)
         };
         use MemoryKind::{DeviceLocal, Readback, Upload};
+        use MemoryPriority::{High, Low, Normal};
+        let buffers = |priority: MemoryPriority, suffix: &str| -> Result<[Pool; 3], Error> {
+            Ok([
+                pool(&format!("orr upload{suffix}"), Upload, priority)?,
+                pool(&format!("orr device-local{suffix}"), DeviceLocal, priority)?,
+                pool(&format!("orr readback{suffix}"), Readback, priority)?,
+            ])
+        };
         let buffers = [
-            pool("orr upload", Upload, RESIDENT_PRIORITY)?,
-            pool("orr device-local", DeviceLocal, RESIDENT_PRIORITY)?,
-            pool("orr readback", Readback, RESIDENT_PRIORITY)?,
+            buffers(Low, " low")?,
+            buffers(Normal, "")?,
+            buffers(High, " high")?,
         ];
         let transient = [
-            pool("orr transient upload", Upload, FRAME_PRIORITY)?,
-            pool("orr transient device-local", DeviceLocal, FRAME_PRIORITY)?,
-            pool("orr transient readback", Readback, FRAME_PRIORITY)?,
+            pool("orr transient upload", Upload, High)?,
+            pool("orr transient device-local", DeviceLocal, High)?,
+            pool("orr transient readback", Readback, High)?,
         ];
         let images = [
-            pool("orr textures", DeviceLocal, RESIDENT_PRIORITY)?,
-            pool("orr host-copy textures", Upload, RESIDENT_PRIORITY)?,
+            pool("orr textures", DeviceLocal, Normal)?,
+            pool("orr host-copy textures", Upload, Normal)?,
         ];
-        let targets = pool("orr targets", DeviceLocal, FRAME_PRIORITY)?;
+        let targets = pool("orr targets", DeviceLocal, High)?;
         Ok(Self {
             allocator,
             buffers,
@@ -388,7 +429,7 @@ pub(crate) fn memory_error(e: orr_memory::Error) -> Error {
 }
 
 impl Shared {
-    /// Creates a buffer in the resident pool of `kind`, mapped when host-visible.
+    /// Creates a buffer in the normal-priority pool of `kind`, mapped when host-visible.
     pub(crate) fn create_buffer(
         &self,
         kind: MemoryKind,
@@ -397,14 +438,14 @@ impl Shared {
         align: u64,
         name: &str,
     ) -> Result<(RawBuffer, Option<NonNull<u8>>), Error> {
-        self.create_buffer_in(false, kind, size, usage, align, name)
+        self.create_buffer_in(Some(MemoryPriority::Normal), kind, size, usage, align, name)
     }
 
-    /// Creates a buffer of `kind` in the transient pool when `transient`, else the resident
-    /// pool, at an address that is a multiple of `align` (a power of two).
+    /// Creates a buffer of `kind` in the buffer pool of `priority`, or the transient pool
+    /// for `None`, at an address that is a multiple of `align` (a power of two).
     fn create_buffer_in(
         &self,
-        transient: bool,
+        priority: Option<MemoryPriority>,
         kind: MemoryKind,
         size: u64,
         usage: vk::BufferUsageFlags,
@@ -425,10 +466,9 @@ impl Shared {
             .usage(usage)
             .sharing_mode(sharing)
             .queue_family_indices(families);
-        let pool = if transient {
-            pools.transient[kind.index()]
-        } else {
-            pools.buffers[kind.index()]
+        let pool = match priority {
+            Some(p) => pools.buffers[p as usize][kind.index()],
+            None => pools.transient[kind.index()],
         };
         let flags = if self.memory.host_visible(kind) {
             AllocationFlags::MAPPED
@@ -554,6 +594,17 @@ impl Device {
         count: u64,
         name: &str,
     ) -> Result<Allocation<T>, Error> {
+        self.gpu_malloc_with_priority(kind, MemoryPriority::Normal, count, name)
+    }
+
+    /// As [`Device::gpu_malloc`], from blocks of `priority`.
+    pub fn gpu_malloc_with_priority<T>(
+        &self,
+        kind: MemoryKind,
+        priority: MemoryPriority,
+        count: u64,
+        name: &str,
+    ) -> Result<Allocation<T>, Error> {
         let size = count
             .checked_mul(size_of::<T>() as u64)
             .filter(|&s| s > 0)
@@ -564,9 +615,10 @@ impl Device {
                 ))
             })?;
         let align = (align_of::<T>() as u64).max(MALLOC_ALIGN);
+        let usage = self.shared.buffer_usage;
         let (raw, mapped) =
             self.shared
-                .create_buffer(kind, size, self.shared.buffer_usage, align, name)?;
+                .create_buffer_in(Some(priority), kind, size, usage, align, name)?;
         Ok(Allocation {
             // SAFETY: the address is the start of `size` bytes owned by the allocation.
             gpu: unsafe { GpuPtr::from_address(GpuAddress(raw.address)) },
@@ -646,7 +698,7 @@ impl Ring {
         let blocks = (0..count)
             .map(|i| {
                 let (raw, mapped) = shared.create_buffer_in(
-                    true,
+                    None,
                     kind,
                     bytes,
                     shared.buffer_usage,

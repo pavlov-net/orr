@@ -43,7 +43,8 @@ pub use interop::{
     defer_after_submitted, image_handles, raw_device,
 };
 pub use memory::{
-    Allocation, DeviceArenas, HeapReport, HostArenas, MemoryKind, MemoryReport, MemoryUsage,
+    Allocation, DeviceArenas, HeapReport, HostArenas, MemoryKind, MemoryPriority, MemoryReport,
+    MemoryUsage,
 };
 pub use mesh::{ColorAttachment, DepthAttachment, MeshPipeline, MeshPipelineDesc, Rendering};
 pub use pipeline::{ComputePipeline, ShaderStage};

@@ -11,8 +11,8 @@
 use orr_gpu::rtas::consts::GEOMETRY_OPAQUE;
 use orr_gpu::{
     Allocation, BlasLimits, ClusterLimits, ClusterVertexFormat, CommandList, Device, GpuAddress,
-    GpuPtr, Hazards, MemoryKind, RtasFlags, RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc,
-    Stages,
+    GpuPtr, Hazards, MemoryKind, MemoryPriority, RtasFlags, RtasIo, RtasLimits, RtasMode, RtasOp,
+    RtasOpDesc, Stages,
 };
 
 use crate::material::MaterialId;
@@ -181,7 +181,12 @@ impl Op {
         let sizes = device.rtas_sizes(&desc);
         Ok(Self {
             desc,
-            results: device.gpu_malloc(MemoryKind::DeviceLocal, sizes.result_max.max(256), name)?,
+            results: device.gpu_malloc_with_priority(
+                MemoryKind::DeviceLocal,
+                MemoryPriority::High,
+                sizes.result_max.max(256),
+                name,
+            )?,
             records,
             count,
             addresses,

@@ -5,7 +5,7 @@ use std::ptr::NonNull;
 use std::sync::Mutex;
 
 use bytemuck::Pod;
-use orr_gpu::{Allocation, Device, GpuAddress, GpuPtr, MemoryKind};
+use orr_gpu::{Allocation, Device, GpuAddress, GpuPtr, MemoryKind, MemoryPriority};
 
 use crate::Result;
 
@@ -122,7 +122,9 @@ impl Pool {
             Some(f) => f,
             None => {
                 let size = self.block_bytes.max(u64::from(units) * POOL_UNIT);
-                let memory = device.gpu_malloc::<u8>(self.kind, size, self.name)?;
+                let low = MemoryPriority::Low;
+                let memory =
+                    device.gpu_malloc_with_priority::<u8>(self.kind, low, size, self.name)?;
                 let mut ranges = RangeAllocator::new((size / POOL_UNIT) as u32);
                 let first = ranges.alloc(units).expect("a new block fits");
                 let b = Some(PoolBlock {

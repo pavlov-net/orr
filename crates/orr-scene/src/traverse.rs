@@ -12,8 +12,8 @@
 
 use orr_gpu::{
     Allocation, BlasLimits, ClusterVertexFormat, CommandList, Device, DispatchArgs, GpuAddress,
-    GpuPtr, Hazards, KernelSet, MemoryKind, RtasFlags, RtasIo, RtasLimits, RtasMode, RtasOp,
-    RtasOpDesc, Stages,
+    GpuPtr, Hazards, KernelSet, MemoryKind, MemoryPriority, RtasFlags, RtasIo, RtasLimits,
+    RtasMode, RtasOp, RtasOpDesc, Stages,
 };
 
 use crate::memory::UploadWindow;
@@ -473,7 +473,12 @@ impl Cuts {
         let dl = MemoryKind::DeviceLocal;
         let arena = || -> Result<Arena> {
             Ok(Arena {
-                block: device.gpu_malloc(dl, sizes.result_max.max(256), "cut BLAS")?,
+                block: device.gpu_malloc_with_priority(
+                    dl,
+                    MemoryPriority::High,
+                    sizes.result_max.max(256),
+                    "cut BLAS",
+                )?,
                 max_clas,
             })
         };

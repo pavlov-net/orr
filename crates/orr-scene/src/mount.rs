@@ -9,8 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use orr_gpu::{
-    Allocation, Device, GpuPtr, MemoryKind, QueueKind, SamplerIndex, Texture, TextureDesc,
-    TextureIndex, TextureKind, TextureMemory, TextureRegion, TextureUsage, TimelinePoint, ViewDesc,
+    Allocation, Device, GpuPtr, MemoryKind, MemoryPriority, QueueKind, SamplerIndex, Texture,
+    TextureDesc, TextureIndex, TextureKind, TextureMemory, TextureRegion, TextureUsage,
+    TimelinePoint, ViewDesc,
 };
 use orr_io::{AlignedBuf, Read, SECTOR};
 use orr_pack::instance::{InstancePageInfo, InstanceRecord};
@@ -1394,8 +1395,9 @@ impl Mounts {
         let m = MemoryKind::DeviceLocal;
         Ok(Self {
             entries: Vec::new(),
-            clusters: device.gpu_malloc(
+            clusters: device.gpu_malloc_with_priority(
                 m,
+                MemoryPriority::High,
                 u64::from(accel.cluster_capacity.max(1)),
                 "resident clusters",
             )?,

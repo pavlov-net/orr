@@ -694,3 +694,33 @@ fn address_commands_match_buffer_commands() {
     );
     assert_clean();
 }
+
+#[test]
+fn priorities_allocate_and_the_report_carries_the_pressure() {
+    use orr_gpu::{MemoryKind, MemoryPriority};
+    let d = device();
+    for priority in [
+        MemoryPriority::Low,
+        MemoryPriority::Normal,
+        MemoryPriority::High,
+    ] {
+        for kind in [MemoryKind::Upload, MemoryKind::DeviceLocal] {
+            let a = d
+                .gpu_malloc_with_priority::<u32>(kind, priority, 1 << 16, "priority")
+                .unwrap();
+            assert!(
+                a.gpu.address().0.is_multiple_of(256),
+                "{kind:?} {priority:?}"
+            );
+        }
+    }
+    d.collect_garbage();
+    let pressure = d.memory_report().pressure();
+    if d.caps().memory_budget {
+        let p = pressure.expect("a device-local heap with an OS budget");
+        assert!(p > 0.0 && p.is_finite(), "pressure {p}");
+    } else {
+        assert_eq!(pressure, None);
+    }
+    assert_clean();
+}
