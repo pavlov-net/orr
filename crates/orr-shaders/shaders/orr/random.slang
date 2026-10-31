@@ -52,6 +52,12 @@ public float unit_float(uint x)
     return float(x >> 8) * (1.0 / 16777216.0);
 }
 
+// Interleaved gradient noise (Jimenez 2014): a value in [0, 1) per pixel position.
+public float interleaved_gradient_noise(float2 p)
+{
+    return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+}
+
 // The R2 sequence (Roberts 2018), exact in fixed point for every index.
 public float2 r2(uint n)
 {

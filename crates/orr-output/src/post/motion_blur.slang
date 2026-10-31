@@ -6,6 +6,7 @@
 // into `target`.
 #include "orr/root.h"
 import orr.abi;
+import orr.random;
 import view;
 
 static const uint TILE = 20;
@@ -73,11 +74,6 @@ float distance_at(int2 p)
 float2 longer(float2 a, float2 b)
 {
     return dot(b, b) > dot(a, a) ? b : a;
-}
-
-float interleaved_gradient_noise(float2 p)
-{
-    return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
 }
 
 [shader("compute")]

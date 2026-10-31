@@ -1,6 +1,6 @@
 //! Output's compute passes, recorded into a command list: hook inputs, exposure and white
-//! balance (meter and adapt), motion blur, tonemap, compose and compose-UI, and screenshot
-//! capture.
+//! balance (meter and adapt), motion blur, depth of field, tonemap, compose and compose-UI,
+//! and screenshot capture.
 
 use std::ops::RangeInclusive;
 
@@ -9,8 +9,9 @@ use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, GpuPtr, Hazards, MemoryKind, OutputFormat,
     ShaderStage, SpecData, Stages, StorageImageIndex, TextureIndex,
 };
-use orr_scene::{SkyStats, ViewConstants};
+use orr_scene::{DepthOfField, SkyStats, ViewConstants};
 
+use crate::dof::{DofKernels, DofTargets};
 use crate::exposure::{COMPENSATION_ENTRIES, HISTOGRAM_BINS, HISTOGRAM_WORDS_PER_BIN};
 use crate::hooks::HookTargets;
 use crate::motion_blur::{MotionBlurKernels, MotionBlurTargets};
@@ -20,9 +21,10 @@ use crate::shaders::exposure::meter;
 use crate::shaders::hook_inputs;
 use crate::shaders::tonemap::{self, TonemapConstants};
 use crate::{
-    AutoExposure, ChainImages, CompensationCurve, DistortionField, Exposure, ExposureTelemetry,
-    Gt7Curve, HookInputs, Hooks, MeterWeights, MotionBlurPass, OutputDebug, Primaries,
-    ResolvedDisplay, Result, Screenshot, SkyTelemetry, ViewOutput,
+    AutoExposure, ChainImages, CompensationCurve, DepthOfFieldPass, DistortionField,
+    DofGuideImages, DofPath, Exposure, ExposureTelemetry, Gt7Curve, HookInputs, Hooks,
+    MeterWeights, MotionBlurPass, OutputDebug, Primaries, ResolvedDisplay, Result, Screenshot,
+    SkyTelemetry, ViewOutput,
 };
 
 /// Output's compute pipelines on one device.
@@ -31,6 +33,7 @@ pub struct OutputKernels {
     meter: ComputePipeline,
     adapt: ComputePipeline,
     motion_blur: MotionBlurKernels,
+    dof: DofKernels,
     tonemap: ComputePipeline,
     compose: ComposeKernel,
     scene_referred: ComputePipeline,
@@ -50,9 +53,12 @@ const HOOK_ROOT: u64 = 1280;
 const CAPTURE_ROOT: u64 = 1536;
 const SCENE_CAPTURE_ROOT: u64 = 1792;
 const MOTION_BLUR_ROOT: u64 = 2048;
-const COMPENSATION: u64 = 2304;
+const DOF_ROOT: u64 = 2304;
+const COMPENSATION: u64 = 2560;
 const ZEROS: u64 = COMPENSATION + 4 * COMPENSATION_ENTRIES as u64;
 const UPLOAD_BYTES: u64 = ZEROS + 4 * HISTOGRAM_WORDS;
+const _: () =
+    assert!(size_of::<crate::shaders::post::dof::Root>() as u64 <= COMPENSATION - DOF_ROOT);
 
 /// GPU memory for one view's output passes in one frame. Recording a pass writes its root
 /// here, so reuse it only once the list that last recorded with it has completed; an
@@ -93,12 +99,14 @@ impl OutputRoots {
 
 /// Output's state for one view history: its [`OutputRoots`] per frame in flight, the
 /// exposure telemetry they read back, the screenshots being read back, while the view sets
-/// a hook the hook inputs, and while its shutter is open the motion blur tiles.
+/// a hook the hook inputs, while its shutter is open the motion blur tiles, and while its
+/// lens has depth of field that effect's images, history and lens state.
 pub struct OutputView {
     frames: Vec<OutputRoots>,
     captures: Vec<Capture>,
     hooks: Option<HookTargets>,
     motion_blur: Option<MotionBlurTargets>,
+    dof: Option<DofTargets>,
     device: Device,
 }
 
@@ -118,6 +126,7 @@ impl OutputView {
             captures: Vec::new(),
             hooks: None,
             motion_blur: None,
+            dof: None,
             device: gpu.clone(),
         })
     }
@@ -133,6 +142,17 @@ impl OutputView {
         self.motion_blur
             .as_ref()
             .map_or(0, MotionBlurTargets::bytes)
+    }
+
+    /// Bytes of the depth-of-field images and lens state held for the view: 0 unless its
+    /// last frame had depth of field on.
+    pub fn depth_of_field_bytes(&self) -> u64 {
+        self.dof.as_ref().map_or(0, DofTargets::bytes)
+    }
+
+    /// The images RR reads on the guide path, while the view's depth of field runs there.
+    pub fn depth_of_field_guide(&self) -> Option<DofGuideImages<'_>> {
+        self.dof.as_ref().and_then(DofTargets::guide_images)
     }
 
     /// The roots frame `frame` records with. Its slot was last used by frame
@@ -390,6 +410,7 @@ impl OutputKernels {
             meter: pipeline(&meter::MODULE, "meter")?,
             adapt: pipeline(&adapt::MODULE, "adapt")?,
             motion_blur: MotionBlurKernels::new(gpu)?,
+            dof: DofKernels::new(gpu)?,
             tonemap: pipeline(&tonemap::MODULE, "tonemap")?,
             compose: ComposeKernel::new(gpu)?,
             scene_referred: gpu.create_compute_pipeline(
@@ -597,6 +618,84 @@ impl OutputKernels {
         self.motion_blur.record(list, root, pass.extent);
         *chain = chain.swapped();
         Ok(true)
+    }
+
+    /// Records the `depth_of_field` pass when the lens has depth of field on the after-RR
+    /// path: it blurs `chain.rr_output` into `chain.linear` and swaps `chain`; returns whether
+    /// it recorded. Allocates the view's images on the first such frame and frees them on the
+    /// first with depth of field off. Order the writes of lighting's targets and of the
+    /// source before it with a barrier; it ends with a barrier, so tonemap may follow
+    /// directly.
+    pub fn depth_of_field(
+        &self,
+        list: &mut CommandList<'_>,
+        view: &mut OutputView,
+        pass: &DepthOfFieldPass<'_>,
+        chain: &mut ChainImages,
+    ) -> Result<bool> {
+        let Some(dof) = self.dof_targets(list, view, pass, DofPath::AfterRr)? else {
+            return Ok(false);
+        };
+        let targets = view.dof.as_mut().expect("dof targets");
+        let root = self
+            .dof
+            .root(targets, pass, &dof, chain.rr_output, chain.linear_store);
+        let root = view.roots(pass.frame).put(DOF_ROOT, &root);
+        let targets = view.dof.as_ref().expect("dof targets");
+        self.dof
+            .record(list, "depth_of_field", targets, root, pass.extent);
+        *chain = chain.swapped();
+        Ok(true)
+    }
+
+    /// Records the `depth_of_field_guide` pass when the lens has depth of field on the guide
+    /// path: it blurs `radiance` (lighting's, at the render extent) into the images
+    /// [`OutputView::depth_of_field_guide`] returns for RR; returns whether it recorded.
+    /// Allocation and ordering are as for [`OutputKernels::depth_of_field`].
+    pub fn depth_of_field_guide(
+        &self,
+        list: &mut CommandList<'_>,
+        view: &mut OutputView,
+        pass: &DepthOfFieldPass<'_>,
+        radiance: TextureIndex,
+    ) -> Result<bool> {
+        let Some(dof) = self.dof_targets(list, view, pass, DofPath::Guide)? else {
+            return Ok(false);
+        };
+        let targets = view.dof.as_mut().expect("dof targets");
+        let color = targets.guide.as_ref().expect("guide targets").color.storage;
+        let root = self.dof.root(targets, pass, &dof, radiance, color);
+        let root = view.roots(pass.frame).put(DOF_ROOT, &root);
+        let targets = view.dof.as_ref().expect("dof targets");
+        self.dof
+            .record(list, "depth_of_field_guide", targets, root, pass.extent);
+        Ok(true)
+    }
+
+    /// The lens's depth of field when it runs on `path` this frame, with the view's images
+    /// allocated and, when new, discarded.
+    fn dof_targets(
+        &self,
+        list: &mut CommandList<'_>,
+        view: &mut OutputView,
+        pass: &DepthOfFieldPass<'_>,
+        path: DofPath,
+    ) -> Result<Option<DepthOfField>> {
+        let Some(dof) = pass.depth_of_field else {
+            view.dof = None;
+            return Ok(None);
+        };
+        if pass.output.post.dof_path != path {
+            return Ok(None);
+        }
+        if view.dof.as_ref().is_none_or(|t| !t.fits(pass.extent, path)) {
+            view.dof = Some(DofTargets::new(&view.device, pass.extent, path)?);
+        }
+        let targets = view.dof.as_mut().expect("dof targets");
+        if targets.fresh {
+            targets.discard(list);
+        }
+        Ok(Some(dof))
     }
 
     /// Records the tonemap pass. Order its source's and the adapt pass's writes before it
