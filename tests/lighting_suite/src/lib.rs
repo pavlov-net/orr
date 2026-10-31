@@ -35,6 +35,7 @@ pub fn kernels(replacements: &[(&'static ShaderModule, &'static str)]) -> Kernel
         .collect();
     KernelSet {
         modules: Box::leak(modules.into_boxed_slice()),
+        surfaces: 0,
     }
 }
 

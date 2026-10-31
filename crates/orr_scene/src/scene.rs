@@ -230,6 +230,7 @@ pub(crate) struct SceneCpu {
     pub origin_cell: IVec3,
     pub environment: u64,
     pub medium: u64,
+    pub surface_data: u64,
     pub near_range: f32,
 }
 
@@ -305,6 +306,7 @@ impl Scene {
                 origin_cell: IVec3::ZERO,
                 environment: 0,
                 medium: 0,
+                surface_data: 0,
                 near_range: 256.0,
             }),
             writing: AtomicBool::new(false),
@@ -717,6 +719,11 @@ impl<'f> SceneWriter<'f> {
     /// Consumer data for the linked medium.
     pub fn set_medium(&mut self, data: GpuAddress) {
         self.scene.cpu.lock().unwrap().medium = data.0;
+    }
+
+    /// Consumer data for linked surfaces whose material names none (`MaterialGpu::data`).
+    pub fn set_surface_data(&mut self, data: GpuAddress) {
+        self.scene.cpu.lock().unwrap().surface_data = data.0;
     }
 
     /// The primary view's camera and pixels per radian (render height / vertical fov):

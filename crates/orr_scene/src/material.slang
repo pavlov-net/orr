@@ -3,6 +3,7 @@
 module material;
 
 import orr.abi;
+import orr.color;
 
 // `MaterialGpu.flags`.
 public static const uint MATERIAL_ALPHA_TESTED = 1 << 0;
@@ -18,6 +19,9 @@ public static const uint MATERIAL_COAT = 1 << 9;
 public static const uint MATERIAL_FUZZ = 1 << 10;
 public static const uint MATERIAL_THIN_FILM = 1 << 11;
 public static const uint MATERIAL_ANISOTROPY = 1 << 12;
+// Ray origin policy (gbuffer ORIGIN_*), 2 bits.
+public static const uint MATERIAL_ORIGIN_SHIFT = 13;
+public static const uint MATERIAL_ORIGIN_MASK = 3 << 13;
 public static const uint MATERIAL_COST_SHIFT = 16;
 public static const uint MATERIAL_COST_MASK = 3 << 16;
 
@@ -34,6 +38,11 @@ public static const uint TEXTURE_SUBSURFACE_COLOR = 8;
 public static const uint TEXTURE_DISPLACEMENT = 9;
 public static const uint TEXTURE_COAT = 10;
 public static const uint TEXTURE_TRANSMISSION = 11;
+
+// `TextureIndex.index` of an unbound slot.
+public static const uint TEXTURE_NONE = 0xffffffff;
+// A material id that names no material.
+public static const uint MATERIAL_NONE = 0xffffffff;
 
 public struct MaterialGpu
 {
@@ -84,6 +93,7 @@ public struct MaterialGpu
     public uint surface;                    // linked surface id; 0 = StandardSurface
     public float transmission_dispersion_scale;
     public float transmission_dispersion_abbe_number;
+    public uint64_t data;                   // consumer data for the linked surface; 0 = the scene's
 }
 
 // Emitted radiance of `m` in nits: `emission_color x emission_luminance` with
@@ -91,4 +101,47 @@ public struct MaterialGpu
 public float3 material_emission(MaterialGpu* m)
 {
     return (m.flags & MATERIAL_EMISSIVE) != 0 ? m.emission_color * m.emission_luminance : float3(0.0);
+}
+
+// Where a texture lookup reads: uv and its change per render pixel along x and y, with any
+// level-of-detail bias already applied.
+public struct UvFootprint
+{
+    public float2 uv;
+    public float2 dx;
+    public float2 dy;
+}
+
+public bool material_bound(MaterialGpu* m, uint slot)
+{
+    return m.textures[slot].index != TEXTURE_NONE;
+}
+
+// The first channel `slot` reads.
+uint material_channel(MaterialGpu* m, uint slot)
+{
+    uint bits = slot < 8 ? m.channels_lo >> (4 * slot) : m.channels_hi >> (4 * (slot - 8));
+    return bits & 15;
+}
+
+// The texture footprint function: `slot`'s texture filtered over footprint `f`, its
+// channels from the slot's first one on in xyzw. Color slots come back in linear
+// Rec.2020. An unbound slot reads `fallback`.
+public float4 material_texture(MaterialGpu* m, uint slot, UvFootprint f, float4 fallback)
+{
+    TextureIndex t = m.textures[slot];
+    if (t.index == TEXTURE_NONE)
+        return fallback;
+    float4 v = t.get<Texture2D<float4>>().SampleGrad(m.sampler.get(), f.uv, f.dx, f.dy);
+    uint c = material_channel(m, slot);
+    float4 r = c == 0 ? v : c == 1 ? float4(v.yzw, 1.0) : c == 2 ? float4(v.zw, 0.0, 1.0) : float4(v.w, 0.0, 0.0, 1.0);
+    if (slot == TEXTURE_BASE_COLOR || slot == TEXTURE_EMISSION || slot == TEXTURE_SUBSURFACE_COLOR)
+    {
+        uint primaries = (m.primaries >> (2 * slot)) & 3;
+        if (primaries == 0)
+            r.rgb = mul(REC709_TO_REC2020, r.rgb);
+        else if (primaries == 1)
+            r.rgb = mul(P3_TO_REC2020, r.rgb);
+    }
+    return r;
 }

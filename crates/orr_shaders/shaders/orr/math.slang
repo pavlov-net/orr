@@ -114,13 +114,19 @@ public float3x4 affine_mul(float3x4 a, float3x4 b)
 // The inverse of an affine transform with a non-singular linear part.
 public float3x4 affine_inverse(float3x4 m)
 {
-    float3x3 c = cofactors(affine_linear(m));
-    float3x3 inv = transpose(c) * (1.0 / dot(m[0].xyz, c[0]));
+    float3x3 inv = linear_inverse(affine_linear(m));
     return affine(inv, -mul(inv, affine_translation(m)));
 }
 
+// The inverse of a non-singular 3 x 3 matrix.
+public float3x3 linear_inverse(float3x3 m)
+{
+    float3x3 c = cofactors(m);
+    return transpose(c) * (1.0 / dot(m[0], c[0]));
+}
+
 // The cofactor matrix: the inverse transpose times the determinant.
-float3x3 cofactors(float3x3 m)
+public float3x3 cofactors(float3x3 m)
 {
     return float3x3(cross(m[1], m[2]), cross(m[2], m[0]), cross(m[0], m[1]));
 }

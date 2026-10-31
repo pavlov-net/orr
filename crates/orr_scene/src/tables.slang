@@ -68,16 +68,30 @@ public struct GroupGpu
     public float log2_scale_max;
 }
 
+// A discrete level of a mesh: its error and its range of mesh cluster indices.
+public struct MeshLevel
+{
+    public float error;            // m, mesh space
+    public uint first;
+    public uint count;
+}
+
 // A mesh made resident from a mounted pack. Page and node page addresses are 0 until
 // their data is resident.
 public struct MeshGpu
 {
-    public uint8_t* info;        // blob 0: MeshHeader and its tables (orr_pack.mesh)
-    public uint64_t* pages;      // resident page per MeshHeader page
-    public uint64_t* node_pages; // node page per MeshHeader node page
+    public uint8_t* info;          // blob 0: MeshHeader and its tables (orr_pack.mesh)
+    public uint64_t* pages;        // resident page per MeshHeader page
+    public uint64_t* node_pages;   // node page per MeshHeader node page
+    public uint* page_clusters;    // first mesh cluster index per page, then the cluster count
+    public MeshLevel* levels;      // finest first; none in DAG mode
     public uint page_count;
     public uint node_page_count;
     public uint cluster_count;
+    public uint level_count;       // 0: DAG mode
+    public float position_step;    // m: the position grid step
+    public uint attributes;        // orr_pack.mesh MESH_*
+    public float merge_error;      // DAG mode: the error from which the merged stage serves; infinity without one
     public uint _pad;
 }
 
@@ -107,6 +121,7 @@ public struct SceneRoot
     public SkyStats* sky_stats;
     public uint64_t environment;     // consumer data for the linked environment
     public uint64_t medium;          // consumer data for the linked medium
+    public uint64_t surface_data;    // consumer data for linked surfaces whose material has none
     public Tlas tlas;                // the scene's PTLAS, or the device's empty TLAS
     public int4 origin_cell;         // render origin cell, w = cell_log2
     public float delta_time;

@@ -42,7 +42,7 @@ public struct ViewConstants
     public uint exposure_slot;                // this render's slot; the other is the next render's
     public uint frame_index;
     public float delta_time;
-    public uint _pad;
+    public float mip_bias;                    // texture level-of-detail bias of the upscaler
 }
 
 public static const float HDR_CEILING = 16384.0;
