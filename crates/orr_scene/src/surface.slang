@@ -70,15 +70,18 @@ public interface ISurface
 }
 
 // The material's alpha test at the hit: 1 at or above the cutoff, else 0. The opacity is the
-// opacity slot, else the base color slot's alpha, times `geometry_opacity`.
+// opacity slot, else the base color slot's alpha, times `geometry_opacity`, read bilinearly
+// from mip 0 whatever the footprint: the test the cook's opaque triangles and opacity
+// micromaps follow, so the raster, ray candidates and micromaps agree.
 public float material_coverage(SurfaceInput i)
 {
     MaterialGpu* m = i.scene.materials + i.material;
+    UvFootprint finest = { i.uv.uv, float2(0.0), float2(0.0) };
     float opacity = m.geometry_opacity;
     if (material_bound(m, TEXTURE_OPACITY))
-        opacity *= material_texture(m, TEXTURE_OPACITY, i.uv, float4(1.0)).x;
+        opacity *= material_texture(m, TEXTURE_OPACITY, finest, float4(1.0)).x;
     else if (material_bound(m, TEXTURE_BASE_COLOR))
-        opacity *= material_texture(m, TEXTURE_BASE_COLOR, i.uv, float4(1.0)).w;
+        opacity *= material_texture(m, TEXTURE_BASE_COLOR, finest, float4(1.0)).w;
     return opacity >= m.alpha_cutoff ? 1.0 : 0.0;
 }
 

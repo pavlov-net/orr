@@ -8,21 +8,24 @@ use std::time::{Duration, Instant};
 
 use glam::DVec3;
 use orr_gpu::{
-    CommandList, ComputePipeline, Device, GpuPtr, Hazards, KernelSet, LatencyMarker, LowLatency,
-    MemoryKind, PassResult, QueueKind, SamplerDesc, SamplerIndex, ShaderModule, SpecData, Stages,
-    TextureIndex, TimelinePoint,
+    Allocation, CommandList, ComputePipeline, Device, GpuPtr, Hazards, KernelSet, LatencyMarker,
+    LowLatency, MemoryKind, PassResult, QueueKind, SamplerDesc, SamplerIndex, ShaderModule,
+    SpecData, Stages, TextureIndex, TimelinePoint,
 };
 use orr_pack::AssetId;
 
+use crate::accel::{AccelKernels, AccelLimits, AccelShared};
 use crate::emissive::ModelEmission;
 use crate::loading::{self, Loading, Msg};
 use crate::material::{MaterialId, MaterialTable, MaterialWriter};
+use crate::memory::RangeAllocator;
 use crate::memory::UploadWindow;
 use crate::mount::{
     Apply, InstancePage, LoadState, MountId, MountTask, Mounts, PackSource, PageId, TableSizes,
 };
 use crate::pipelines::{PipelineId, Pipelines, ReloadReport};
 use crate::producer::ProducerUpdate;
+use crate::ptlas::{FrameInputs, PtlasPipelines, RtStats};
 use crate::raster::{self, RasterPipelines, TargetSizes, ViewTargets};
 #[cfg(feature = "hot-reload")]
 use crate::reload::Reloader;
@@ -31,7 +34,7 @@ use crate::shaders::{emissive, world as world_kernel};
 use crate::time::FrameTime;
 use crate::upload::{Record, scatter};
 use crate::view::{RasterView, ViewDesc, ViewHistory, ViewHistoryId, view_constants};
-use crate::world::{needs_rebase, origin_for};
+use crate::world::{WorldPos, needs_rebase, origin_for};
 use crate::{Error, ExposureState, ProducerBatch, Result, SceneRoot};
 
 /// Pool sizes and per-frame limits.
@@ -53,6 +56,15 @@ pub struct Budgets {
     pub visible_clusters: u32,
     /// Cluster work items one view's culling can hand to the raster, up to 32 clusters each.
     pub cluster_work: u32,
+    /// Entries in the resident cluster table: every cluster of every resident mesh.
+    pub resident_clusters: u32,
+    /// Triangles one CLAS build on the loading queue takes, at most.
+    pub stream_clas_triangles: u32,
+    /// Micromaps one loading-queue submit builds, at most.
+    pub micromap_pages: u32,
+    /// Per-frame PTLAS work beyond mandatory work, in rebuilt instances: the full instance
+    /// count of every partition a write touches plus one per update.
+    pub ptlas_rebuilt: u32,
 }
 
 impl Default for Budgets {
@@ -66,6 +78,10 @@ impl Default for Budgets {
             mesh_pages: 1 << 20,
             visible_clusters: 1 << 20,
             cluster_work: 1 << 18,
+            resident_clusters: 1 << 21,
+            stream_clas_triangles: 1 << 20,
+            micromap_pages: 64,
+            ptlas_rebuilt: 250_000,
         }
     }
 }
@@ -140,6 +156,8 @@ pub struct FrameStats {
     pub scatter_words: u64,
     pub scatter_dispatches: u32,
     pub scenes_updated: u32,
+    /// PTLAS work of the frame's scenes.
+    pub rt: RtStats,
 }
 
 /// Scene compute: a listed scene's turn in `update_scenes`, after its uploads have landed.
@@ -179,6 +197,8 @@ struct InFlight {
     id: u64,
     point: TimelinePoint,
     stats: FrameStats,
+    /// Scenes whose PTLAS the frame built.
+    traced: Vec<SceneId>,
 }
 
 struct Core {
@@ -202,6 +222,10 @@ struct Core {
     stats: FrameStats,
     high_water: u64,
     mounts: Mounts,
+    accel: Arc<AccelShared>,
+    ptlas: PtlasPipelines,
+    /// Scratch of every scene's PTLAS build; the builds of a frame run one after another.
+    ptlas_scratch: Mutex<Option<Allocation<u8>>>,
 }
 
 /// Global scene state, mounted packs and every resident scene. Render thread only.
@@ -240,6 +264,15 @@ impl Scenes {
         assert!(desc.frames_in_flight >= 1, "frames_in_flight is at least 1");
         assert!(desc.cell_log2 <= 16, "cells of 2^{} m", desc.cell_log2);
         let b = &desc.budgets;
+        let accel = Arc::new(AccelShared {
+            kernels: AccelKernels::new(device, desc.kernels)?,
+            limits: AccelLimits {
+                clas_triangles: b.stream_clas_triangles,
+                micromaps: b.micromap_pages,
+            },
+            cluster_ids: Mutex::new(RangeAllocator::new(b.resident_clusters)),
+            cluster_capacity: b.resident_clusters,
+        });
         let mounts = Mounts::new(
             device,
             TableSizes {
@@ -248,6 +281,7 @@ impl Scenes {
                 model_materials: b.model_materials,
                 page_table: b.mesh_pages,
             },
+            &accel,
         )?;
         let sampler = device.sampler(&SamplerDesc {
             max_anisotropy: 16.0,
@@ -262,6 +296,7 @@ impl Scenes {
         };
         let mut pipelines = Pipelines::new(device, desc.kernels)?;
         let raster = RasterPipelines::new(device, desc.kernels, &mut pipelines)?;
+        let ptlas = PtlasPipelines::new(device, desc.kernels, &mut pipelines)?;
         #[cfg(feature = "hot-reload")]
         let mut reloader = Reloader::new();
         #[cfg(feature = "hot-reload")]
@@ -298,6 +333,9 @@ impl Scenes {
                 stats: FrameStats::default(),
                 high_water: 0,
                 mounts,
+                accel,
+                ptlas,
+                ptlas_scratch: Mutex::new(None),
             },
         })
     }
@@ -331,7 +369,14 @@ impl Scenes {
     /// and lookups fail with [`Error::NotReady`] until [`Scenes::mount_state`] is `Ready`.
     pub fn mount(&mut self, source: PackSource) -> MountId {
         let (id, cancel) = self.core.mounts.add();
-        let task = MountTask::new(id, &self.loading, &self.device, self.sampler, cancel);
+        let task = MountTask::new(
+            id,
+            &self.loading,
+            &self.device,
+            self.sampler,
+            cancel,
+            &self.core.accel,
+        );
         self.loading.send(Msg::Mount(Arc::new(task), source));
         id
     }
@@ -497,6 +542,13 @@ impl Scenes {
             render.wait(f.point, Duration::from_secs(10))?;
             let mut f = core.in_flight.pop_front().unwrap();
             f.stats.gpu = self.device.pass_results(f.point).unwrap_or_default();
+            let slot = (f.id % u64::from(core.fif)) as usize;
+            for id in &f.traced {
+                let Ok(scene) = core.scene(*id) else { continue };
+                if let Some((c, unplaced)) = scene.cpu.lock().unwrap().ptlas.counters(slot) {
+                    f.stats.rt.add(&c, unplaced);
+                }
+            }
             core.completed_frame = f.id;
             core.stats = f.stats;
         }
@@ -522,6 +574,7 @@ impl Scenes {
                 !done
             });
             cpu.retired.retain(|(frame, _)| *frame > completed);
+            cpu.ptlas.retire(completed);
         }
         core.mounts.retire(completed, &self.device, &core.materials);
         self.device.collect_garbage();
@@ -566,6 +619,7 @@ impl Scenes {
             latency: desc.low_latency.cloned(),
             loading: loading_points,
             reloads,
+            traced: Vec::new(),
         })
     }
 }
@@ -602,6 +656,8 @@ pub struct Frame<'a> {
     /// Loading batches taken at step 1; the frame's submit waits them.
     loading: Vec<TimelinePoint>,
     reloads: Vec<ReloadReport>,
+    /// Scenes whose PTLAS this frame builds.
+    traced: Vec<SceneId>,
 }
 
 impl<'a> Frame<'a> {
@@ -699,6 +755,7 @@ impl<'a> Frame<'a> {
         let mut copies = Vec::new();
         let mut rebased = Vec::new();
         let mut roots = Vec::new();
+        let mut traced = Vec::new();
         for &id in &self.listed {
             let scene = core.scene(id)?;
             let cpu = &mut *scene.cpu.lock().unwrap();
@@ -712,12 +769,16 @@ impl<'a> Frame<'a> {
                     records.push(Record::fill(core.next_seq(), at, 2, 0));
                 }
             }
+            let mut rebase = false;
             if let Some((focus, _)) = cpu.focus
                 && needs_rebase(cpu.origin_cell, focus, core.cell_log2)
             {
                 cpu.origin_cell = origin_for(focus, core.cell_log2);
                 rebased.push((scene.tables.root.gpu, scene.desc.light_capacity));
+                rebase = true;
             }
+            let tlas = cpu.ptlas.tlas(device, core.fif)?;
+            records.append(&mut cpu.ptlas.partition_records(device, window, &core.seq)?);
             for (index, g) in cpu.groups.iter_mut().enumerate() {
                 let Some(g) = g else { continue };
                 let before = g.record();
@@ -751,6 +812,7 @@ impl<'a> Frame<'a> {
                 models: core.mounts.models.gpu,
                 meshes: core.mounts.meshes.gpu,
                 materials: core.materials.table.gpu,
+                clusters: core.mounts.clusters.gpu,
                 material_sets: t.material_sets.gpu.cast(),
                 lights: t.lights.gpu,
                 emissive: t.emissive.gpu,
@@ -760,7 +822,8 @@ impl<'a> Frame<'a> {
                 environment: cpu.environment,
                 medium: cpu.medium,
                 surface_data: cpu.surface_data,
-                tlas: device.empty_tlas(),
+                tlas: tlas.unwrap_or_else(|| device.empty_tlas()),
+                part_slots: cpu.ptlas.part_slots.gpu,
                 origin_cell: cpu.origin_cell.extend(core.cell_log2 as i32).to_array(),
                 delta_time: self.time.delta,
                 frame_index: self.id as u32,
@@ -771,10 +834,15 @@ impl<'a> Frame<'a> {
                 producer_capacity: scene.desc.producer_capacity,
                 emissive_capacity: scene.desc.emissive_capacity,
                 near_range: cpu.near_range,
-                _pad: 0,
+                part_base: scene.desc.instance_capacity,
+                part_capacity: scene.desc.part_capacity,
+                producer_base: scene.desc.instance_capacity + scene.desc.part_capacity,
             };
             let src = window.put(device, &root)?;
             records.push(Record::values(core.next_seq(), t.root.gpu, src, 1));
+            if tlas.is_some() {
+                traced.push((id, rebase));
+            }
             roots.push((id, t.root.gpu, t.batches.gpu, cpu.focus, scene.desc));
         }
 
@@ -824,6 +892,56 @@ impl<'a> Frame<'a> {
             compute(&mut sc);
             list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
         }
+        if !traced.is_empty() {
+            let mut scratch = core.ptlas_scratch.lock().unwrap();
+            let need = traced
+                .iter()
+                .filter_map(|&(id, _)| core.scene(id).ok())
+                .map(|s| s.cpu.lock().unwrap().ptlas.scratch_bytes(device))
+                .max()
+                .unwrap_or(0);
+            if scratch.as_ref().is_none_or(|a| a.size < need) {
+                *scratch = Some(device.gpu_malloc::<u8>(
+                    MemoryKind::DeviceLocal,
+                    need.max(256),
+                    "PTLAS scratch",
+                )?);
+            }
+            let scratch = scratch.as_ref().expect("made above").gpu.address();
+            for &(id, rebased) in &traced {
+                let scene = core.scene(id)?;
+                let cpu = &mut *scene.cpu.lock().unwrap();
+                let (focus_cell, focus_offset) = match cpu.focus {
+                    Some((f, ppr)) => {
+                        let w = WorldPos::new(f, core.cell_log2);
+                        (w.cell.extend(1).to_array(), w.offset.extend(ppr).to_array())
+                    }
+                    None => ([0; 4], [0.0; 4]),
+                };
+                let inputs = FrameInputs {
+                    scene: scene.tables.root.gpu,
+                    focus_cell,
+                    focus_offset,
+                    origin_cell: cpu.origin_cell,
+                    cell_log2: core.cell_log2,
+                    rebased,
+                    budget: core.budgets.ptlas_rebuilt,
+                    error_pixels: core.raster_error_pixels,
+                    slot: (self.id % u64::from(core.fif)) as usize,
+                };
+                let kernels = &core.ptlas;
+                cpu.ptlas.record(
+                    device,
+                    window,
+                    &mut list,
+                    self.pipelines,
+                    kernels,
+                    &inputs,
+                    scratch,
+                )?;
+            }
+        }
+        self.traced = traced.iter().map(|&(id, _)| id).collect();
         if !roots.is_empty() {
             list.begin_pass("emissive", false);
             for &(_, scene, _, _, desc) in &roots {
@@ -959,11 +1077,13 @@ impl<'a> Frame<'a> {
             scatter_words: self.scatter.words,
             scatter_dispatches: self.scatter.dispatches,
             scenes_updated: self.listed.len() as u32,
+            rt: RtStats::default(),
         };
         self.core.in_flight.push_back(InFlight {
             id: self.id,
             point,
             stats,
+            traced: std::mem::take(&mut self.traced),
         });
         Ok(point)
     }

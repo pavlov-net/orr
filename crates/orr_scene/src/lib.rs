@@ -14,6 +14,7 @@
 //! copies run on the loading side ([`Loading`]): orr's loading thread and the threads the
 //! consumer lends to [`Loading::run_worker`]. The render thread only polls.
 
+mod accel;
 mod emissive;
 mod lights;
 mod loading;
@@ -22,6 +23,7 @@ pub mod memory;
 mod mount;
 mod pipelines;
 mod producer;
+mod ptlas;
 mod raster;
 #[cfg(feature = "hot-reload")]
 mod reload;
@@ -45,6 +47,7 @@ pub use material::{BoundTexture, MaterialId, MaterialWriter, material_flags};
 pub use mount::{InstancePage, LoadState, MountId, PackSource, PageId};
 pub use pipelines::{PipelineId, ReloadReport};
 pub use producer::{ClusterTopology, ProducerDesc, ProducerId, ProducerUpdate};
+pub use ptlas::RtStats;
 pub use scene::{
     Affine3, CopyVariant, GroupWriter, InstanceFlags, InstanceRange, InstancesDesc, ModelId, Pose,
     SceneDesc, SceneId, SceneWriter, TransformGroupDesc, TransformGroupId,
@@ -53,9 +56,9 @@ pub use scenes::{
     Budgets, ConsumerMarker, Frame, FrameDesc, FrameStats, RendererDesc, SceneCompute, Scenes,
 };
 pub use shaders::types::{
-    EmissiveGpu, GBufferGpu, GroupGpu, InstanceGpu, LightGpu, MaterialGpu, MeshGpu, MeshLevel,
-    ModelGpu, ProducerBatch, ProducerClusterGpu, ProducerGpu, RasterGpu, RasterRoot, SceneRoot,
-    SkyStats, SlotStateGpu, TaskWork, TopologyGpu, VisibleCluster,
+    ClusterRef, EmissiveGpu, GBufferGpu, GroupGpu, InstanceGpu, LightGpu, MaterialGpu, MeshGpu,
+    MeshLevel, ModelGpu, ProducerBatch, ProducerClusterGpu, ProducerGpu, RasterGpu, RasterRoot,
+    RtCutGpu, SceneRoot, SkyStats, SlotStateGpu, TaskWork, TopologyGpu, VisibleCluster,
 };
 pub use time::FrameTime;
 pub use view::{

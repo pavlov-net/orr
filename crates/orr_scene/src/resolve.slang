@@ -146,7 +146,7 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     Placement prev;
     if (!placement(group_gpu, group_gpu.previous, inst.group_index, v, prev))
         prev = p;
-    float3 prev_relative = place(prev, object) + v.eye_render.xyz - v.prev_eye_render.xyz;
+    float3 prev_relative = place(prev, object) + v.eye_motion.xyz;
     float4 previous = mul(v.prev_clip_from_view, float4(mul(v.prev_view_from_world_rotation, float4(prev_relative, 0.0)), 1.0));
     float2 motion = (previous.xy / previous.w - current.xy / current.w) * 0.5;
 

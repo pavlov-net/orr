@@ -1281,6 +1281,7 @@ dependencies = [
  "log",
  "nv-flip",
  "orr_gpu",
+ "orr_math",
  "orr_pack",
  "orr_shaders",
  "thiserror 2.0.21",

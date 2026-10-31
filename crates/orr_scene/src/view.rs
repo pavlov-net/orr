@@ -25,8 +25,8 @@ pub struct ViewConstants {
     pub prev_view_from_world_rotation: [[f32; 4]; 3],
     /// The camera in render space.
     pub eye_render: [f32; 4],
-    /// Last frame's camera in this frame's render space.
-    pub prev_eye_render: [f32; 4],
+    /// This frame's camera minus last frame's, w 0.
+    pub eye_motion: [f32; 4],
     /// w = cell_log2.
     pub eye_cell: [i32; 4],
     pub eye_offset: [f32; 4],
@@ -279,7 +279,6 @@ pub(crate) fn view_constants(
         cell: origin_cell,
         offset: glam::Vec3::ZERO,
     };
-    let prev_eye = WorldPos::new(previous.position, cell_log2);
     let view_from_world = Mat3::from_quat(desc.rotation.inverse());
     let prev_view_from_world = Mat3::from_quat(previous.rotation.inverse());
     ViewConstants {
@@ -290,8 +289,8 @@ pub(crate) fn view_constants(
         view_from_world_rotation: rotation_rows(view_from_world),
         prev_view_from_world_rotation: rotation_rows(prev_view_from_world),
         eye_render: eye.relative_to(origin, cell_log2).extend(0.0).to_array(),
-        prev_eye_render: prev_eye
-            .relative_to(origin, cell_log2)
+        eye_motion: (desc.position - previous.position)
+            .as_vec3()
             .extend(0.0)
             .to_array(),
         eye_cell: eye.cell.extend(cell_log2 as i32).to_array(),

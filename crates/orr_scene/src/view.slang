@@ -33,7 +33,7 @@ public struct ViewConstants
     public float3x4 view_from_world_rotation;  // translation column 0
     public float3x4 prev_view_from_world_rotation;
     public float4 eye_render;                 // camera in render space, w 0
-    public float4 prev_eye_render;            // last frame's camera, current render origin
+    public float4 eye_motion;                 // this frame's camera minus last frame's, w 0
     public int4 eye_cell;                     // w = cell_log2
     public float4 eye_offset;
     public float2 jitter;                     // render pixels

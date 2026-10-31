@@ -42,14 +42,27 @@ public struct InstanceGpu
     public uint variant;       // pose u8, material set u8, section mask u16 (bit set = hidden)
 }
 
-// Per-slot state written only by the GPU; zeroed when a slot is handed out.
+// `SlotStateGpu.rt_flags`.
+public static const uint RT_WRITTEN = 1;    // its PTLAS instance holds a BLAS
+public static const uint RT_GLOBAL = 2;     // written into the global partition
+public static const uint RT_IN_RANGE = 4;   // inside rt_range at the last decision
+public static const uint RT_SEEN = 8;       // the PTLAS kernel has run over the slot
+
+// Per-slot state written only by the GPU; zeroed when a slot is handed out. The `rt_`
+// fields describe what the slot's PTLAS instance holds.
 public struct SlotStateGpu
 {
-    public uint8_t rt_lod;
-    public uint8_t stable_frames;
+    public uint8_t rt_lod;          // the mesh cut it was written or updated with
+    public uint8_t stable_frames;   // frames since its transform last moved, saturating
     public uint8_t chain_step;
     public uint8_t fade;
     public uint last_visible_frame;
+    public uint64_t rt_blas;        // 0 while null-written
+    public uint rt_partition;       // cell partition, or the partition count for the global one
+    public uint rt_flags;           // RT_*
+    public uint2 rt_key;            // hash of the transform, model and class it was written with
+    public uint rt_age;             // frames its pending PTLAS work has waited
+    public uint _pad;
 }
 
 // A transform group: `count` transforms relative to the group's anchor. A null `current`
@@ -76,6 +89,23 @@ public struct MeshLevel
     public uint count;
 }
 
+// A resident cluster, named by the cluster id of its CLAS.
+public struct ClusterRef
+{
+    public uint8_t* page;
+    public uint local;             // index in the page
+    public uint mesh_cluster;      // mesh cluster index
+}
+
+// One cut of a mesh that ray tracing can use: the cluster BLAS over its clusters and the
+// largest error among them.
+public struct RtCutGpu
+{
+    public uint64_t blas;
+    public float error;            // m, mesh space
+    public uint clusters;
+}
+
 // A mesh made resident from a mounted pack. Page and node page addresses are 0 until
 // their data is resident.
 public struct MeshGpu
@@ -92,7 +122,10 @@ public struct MeshGpu
     public float position_step;    // m: the position grid step
     public uint attributes;        // orr_pack.mesh MESH_*
     public float merge_error;      // DAG mode: the error from which the merged stage serves; infinity without one
+    public uint cluster_base;      // cluster id of mesh cluster 0
+    public uint rt_cut_count;      // 0: not traced
     public uint _pad;
+    public RtCutGpu* rt_cuts;      // finest first
 }
 
 // A model made resident from a mounted pack: its mesh and the material of each section.
@@ -113,6 +146,7 @@ public struct SceneRoot
     public ModelGpu* models;         // global, by ModelId
     public MeshGpu* meshes;          // global
     public MaterialGpu* materials;   // global
+    public ClusterRef* clusters;     // global, by cluster id
     public uint* material_sets;      // MaterialId per model section per set
     public LightGpu* lights;
     public EmissiveGpu* emissive;    // producer_capacity + emissive_capacity entries
@@ -123,6 +157,7 @@ public struct SceneRoot
     public uint64_t medium;          // consumer data for the linked medium
     public uint64_t surface_data;    // consumer data for linked surfaces whose material has none
     public Tlas tlas;                // the scene's PTLAS, or the device's empty TLAS
+    public uint* part_slots;         // per part instance: the slot of the copy holding it
     public int4 origin_cell;         // render origin cell, w = cell_log2
     public float delta_time;
     public uint frame_index;
@@ -133,7 +168,9 @@ public struct SceneRoot
     public uint producer_capacity;
     public uint emissive_capacity;   // instance span entries, after the producer entries
     public float near_range;         // m
-    public uint _pad;
+    public uint part_base;           // PTLAS index of part instance 0
+    public uint part_capacity;
+    public uint producer_base;       // PTLAS index of producer entry 0
 }
 
 // Transform `index` of `group` as a row-major [R | t] relative to the group's anchor.
