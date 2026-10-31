@@ -59,10 +59,23 @@ pub struct RtStats {
     pub global: u32,
     /// Copies with no free partition, not traced.
     pub unplaced: u32,
+    /// Cell partitions holding copies.
+    pub partitions: u32,
+    /// Device bytes of the PTLAS and the arrays its builds read, scratch excluded.
+    pub bytes: u64,
+}
+
+/// One scene's PTLAS figures of a completed frame.
+pub(crate) struct PtlasFigures {
+    counters: [u32; COUNTERS],
+    unplaced: u32,
+    partitions: u32,
+    bytes: u64,
 }
 
 impl RtStats {
-    pub(crate) fn add(&mut self, c: &[u32; COUNTERS], unplaced: u32) {
+    pub(crate) fn add(&mut self, f: &PtlasFigures) {
+        let c = &f.counters;
         self.writes += c[COUNTER_WRITES];
         self.updates += c[COUNTER_UPDATES];
         self.translations += c[COUNTER_TRANSLATES];
@@ -71,7 +84,9 @@ impl RtStats {
         self.max_age = self.max_age.max(c[COUNTER_MAX_AGE]);
         self.dropped += c[COUNTER_DROPPED];
         self.global += c[COUNTER_GLOBAL];
-        self.unplaced += unplaced;
+        self.unplaced += f.unplaced;
+        self.partitions += f.partitions;
+        self.bytes += f.bytes;
     }
 }
 
@@ -117,6 +132,8 @@ struct Storage {
     record: Allocation<PtlasGpu>,
     _blocks: Vec<Allocation<u8>>,
     _pending: Allocation<PendingGpu>,
+    /// Device bytes of the PTLAS, its arrays and its tables.
+    bytes: u64,
     commands: GpuPtr<u8>,
     command_count: GpuPtr<u32>,
     counters: GpuPtr<u32>,
@@ -315,8 +332,20 @@ impl Ptlas {
         };
         let mut gpu = device.gpu_malloc::<PtlasGpu>(MemoryKind::Upload, 1, "PTLAS tables")?;
         gpu.as_mut_slice().expect("upload is mapped")[0] = record;
+        let tlas = device.gpu_malloc::<u8>(dl, sizes.result_max, "PTLAS")?;
+        let bytes = [
+            tlas.size,
+            pending.size,
+            self.partition_table.size,
+            self.slot_table.size,
+            self.part_slots.size,
+        ]
+        .into_iter()
+        .chain(blocks.iter().map(|b| b.size))
+        .sum();
         Ok(Storage {
-            tlas: device.gpu_malloc::<u8>(dl, sizes.result_max, "PTLAS")?,
+            tlas,
+            bytes,
             record: gpu,
             _blocks: blocks,
             _pending: pending,
@@ -365,10 +394,15 @@ impl Ptlas {
     }
 
     /// The figures of the frame that used readback slot `slot`.
-    pub(crate) fn counters(&self, slot: usize) -> Option<([u32; COUNTERS], u32)> {
+    pub(crate) fn figures(&self, slot: usize) -> Option<PtlasFigures> {
         let s = self.storage.as_ref()?;
         let c = s.readback.as_slice()?.get(slot)?;
-        Some((*c, self.unplaced))
+        Some(PtlasFigures {
+            counters: *c,
+            unplaced: self.unplaced,
+            partitions: (self.partitions.len() - self.free.len()) as u32,
+            bytes: s.bytes,
+        })
     }
 
     /// Records this frame's PTLAS work after the scene's tables and transforms are final.

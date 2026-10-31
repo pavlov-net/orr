@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use glam::DVec3;
+use glam::{DVec3, Vec3};
 use orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, GpuPtr, Hazards, KernelSet, LatencyMarker,
     LowLatency, MemoryKind, PassResult, QueueKind, SamplerDesc, SamplerIndex, ShaderModule,
@@ -59,7 +59,9 @@ pub struct Budgets {
     pub cluster_work: u32,
     /// Entries in the resident cluster table: every cluster of every resident mesh.
     pub resident_clusters: u32,
-    /// Triangles one CLAS build on the loading queue takes, at most.
+    /// Triangles one CLAS build on the loading queue takes, at most. On 621.01 an implicit
+    /// build of about 413k triangles in 3,875 clusters of up to 256 vertices faults the
+    /// device while 270k builds, so the default stays under that.
     pub stream_clas_triangles: u32,
     /// Micromaps one loading-queue submit builds, at most.
     pub micromap_pages: u32,
@@ -94,7 +96,7 @@ impl Default for Budgets {
             visible_clusters: 1 << 20,
             cluster_work: 1 << 18,
             resident_clusters: 1 << 21,
-            stream_clas_triangles: 1 << 20,
+            stream_clas_triangles: 1 << 18,
             micromap_pages: 64,
             ptlas_rebuilt: 250_000,
             mesh_page_pool: 3 << 30,
@@ -587,8 +589,8 @@ impl Scenes {
             let slot = (f.id % u64::from(core.fif)) as usize;
             for id in &f.traced {
                 let Ok(scene) = core.scene(*id) else { continue };
-                if let Some((c, unplaced)) = scene.cpu.lock().unwrap().ptlas.counters(slot) {
-                    f.stats.rt.add(&c, unplaced);
+                if let Some(figures) = scene.cpu.lock().unwrap().ptlas.figures(slot) {
+                    f.stats.rt.add(&figures);
                 }
             }
             core.completed_frame = f.id;
@@ -716,6 +718,11 @@ impl<'a> Frame<'a> {
 
     pub fn time(&self) -> FrameTime {
         self.time
+    }
+
+    /// The newest frame whose work had completed when this one began.
+    pub fn completed(&self) -> u64 {
+        self.core.completed_frame
     }
 
     /// The current pipeline of `id`.
@@ -1042,8 +1049,21 @@ impl<'a> Frame<'a> {
         let device = self.device;
         let core = &mut *self.core;
         let scene = core.scene(view.scene)?;
-        let origin = scene.cpu.lock().unwrap().origin_cell;
+        let (origin, focus) = {
+            let cpu = scene.cpu.lock().unwrap();
+            (cpu.origin_cell, cpu.focus.map_or(view.position, |f| f.0))
+        };
         let root = scene.tables.root.gpu;
+        let sky_stats = scene.tables.sky_stats.gpu;
+        let focus = WorldPos::new(focus, core.cell_log2)
+            .relative_to(
+                WorldPos {
+                    cell: origin,
+                    offset: Vec3::ZERO,
+                },
+                core.cell_log2,
+            )
+            .to_array();
         let instance_capacity = scene.desc.instance_capacity;
         let sizes = TargetSizes {
             extent: view.render_extent.to_array(),
@@ -1097,6 +1117,8 @@ impl<'a> Frame<'a> {
             gbuf_x: targets.x.as_ref().map(|x| Arc::clone(&x.texture)),
             hzb: Arc::clone(&targets.hzb.texture),
             counts: targets.counts(),
+            sky_stats,
+            focus,
         };
         self.step("raster_view");
         Ok(out)
