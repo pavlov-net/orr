@@ -29,6 +29,8 @@ jobs:
       # commit that does not build on its own.
       - name: Check the workspace
         run: cargo check --workspace --all-targets
+      - name: Test file IO
+        run: cargo test -p orr-io
 
   fmt:
     runs-on: ubuntu-latest

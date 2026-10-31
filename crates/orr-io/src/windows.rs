@@ -250,13 +250,11 @@ impl IoRing {
             let mut submitted = 0;
             // SAFETY: the ring is live; no wait.
             let h = unsafe { (self.fns.submit)(self.ring, 0, 0, &mut submitted) };
-            if let Err(e) = hr("SubmitIoRing", h) {
-                for s in &mut self.slots {
-                    if let Some(f) = s.take() {
-                        (f.read.done)(Err(io::Error::new(e.kind(), e.to_string())));
-                    }
-                }
-                return;
+            // Entries a failed submit leaves in the queue go with the next one; setting the
+            // event makes the next wait return so that it happens. Reads already in the kernel
+            // keep their slots and buffers until they complete.
+            if hr("SubmitIoRing", h).is_err() {
+                self.event.set();
             }
         }
         let mut cqe = IORING_CQE::default();

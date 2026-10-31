@@ -2,6 +2,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use orr_io::open_shared;
+
 use crate::codec::decode_chunk;
 use crate::format::{Layout, PAGE, hash_blob, read_header, validate};
 use crate::{AssetId, Blob, Chunk, Class, Entry, Error, Hash32, Header, Result};
@@ -81,7 +83,7 @@ impl Archive {
     /// A file archive from the bytes of its index range. Opens the file with read and delete
     /// sharing, so a writer can replace it while it stays mounted.
     pub fn from_index(path: &Path, index: Box<[u8]>) -> Result<Archive> {
-        Self::with_file(File::open(path)?, path, index)
+        Self::with_file(open_shared(path)?, path, index)
     }
 
     /// A file archive from a handle the caller opened with read and delete sharing, and the
@@ -112,7 +114,7 @@ impl Archive {
 
     /// Opens a file archive with two positioned reads: the head, then the index range.
     pub fn open(path: &Path) -> Result<Archive> {
-        let file = File::open(path)?;
+        let file = open_shared(path)?;
         let mut head = vec![0; Self::HEAD_LEN];
         let n = orr_io::read_at(&file, 0, &mut head)?;
         let range = Self::index_range(&head[..n])?;

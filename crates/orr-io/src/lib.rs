@@ -1,8 +1,9 @@
 //! File reads: sector-aligned buffers, file handles that let a file be replaced by rename
 //! while open, a positioned read, and a completion ring for batched reads.
 //!
-//! On Windows the ring is an IoRing, loaded at run time. Elsewhere, and where IoRing is
-//! missing, [`Ring::positioned`] runs the same reads as positioned reads.
+//! On Windows the ring is an IoRing, loaded at run time, and on Linux an io_uring. Elsewhere,
+//! and where the system refuses them, [`Ring::positioned`] runs the same reads as positioned
+//! reads.
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::cell::RefCell;
@@ -12,11 +13,18 @@ use std::io;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::{Arc, Weak};
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 use std::sync::{Condvar, Mutex};
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(windows)]
 mod windows;
+
+#[cfg(target_os = "linux")]
+use crate::linux as sys;
+#[cfg(windows)]
+use crate::windows as sys;
 
 /// Alignment and size granule of unbuffered reads.
 pub const SECTOR: usize = 4096;
@@ -67,10 +75,12 @@ pub fn open_shared(path: &Path) -> io::Result<File> {
     open(path, false, false)
 }
 
+#[cfg(any(windows, target_os = "linux"))]
+use crate::sys::open;
 #[cfg(windows)]
-use crate::windows::{open, reopen};
+use crate::windows::reopen;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn open(path: &Path, _unbuffered: bool, _overlapped: bool) -> io::Result<File> {
     File::open(path)
 }
@@ -115,8 +125,9 @@ pub fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 /// A file opened for unbuffered reads at [`SECTOR`] offsets, through a [`Ring`] or through
-/// each thread's own handle. Every handle names the file as it was when opened, so a file
-/// renamed over the path later is never read through them.
+/// each thread's own handle. On Linux the file is buffered where the file system refuses
+/// unbuffered reads. Every handle names the file as it was when opened, so a file renamed
+/// over the path later is never read through them.
 pub struct ReadFile {
     /// Unbuffered and overlapped, for IoRing.
     #[cfg(windows)]
@@ -181,17 +192,21 @@ pub struct Ring {
 
 enum Backend {
     #[cfg(windows)]
-    IoRing(windows::IoRing),
+    Native(windows::IoRing),
+    #[cfg(target_os = "linux")]
+    Native(Box<linux::Uring>),
     Positioned(VecDeque<Read>),
 }
 
 impl Ring {
     /// A ring backed by the operating system's completion ring, or `None` where it is
-    /// missing.
+    /// missing or refused, as on old Linux kernels or where seccomp blocks io_uring.
     pub fn native() -> Option<Self> {
         #[cfg(windows)]
-        let backend = windows::IoRing::new().map(Backend::IoRing);
-        #[cfg(not(windows))]
+        let backend = windows::IoRing::new().map(Backend::Native);
+        #[cfg(target_os = "linux")]
+        let backend = linux::Uring::new().map(|r| Backend::Native(Box::new(r)));
+        #[cfg(not(any(windows, target_os = "linux")))]
         let backend = None;
         backend.map(|backend| Self { backend })
     }
@@ -207,8 +222,8 @@ impl Ring {
     pub fn push(&mut self, read: Read) {
         debug_assert!(read.offset.is_multiple_of(SECTOR as u64));
         match &mut self.backend {
-            #[cfg(windows)]
-            Backend::IoRing(r) => r.push(read),
+            #[cfg(any(windows, target_os = "linux"))]
+            Backend::Native(r) => r.push(read),
             Backend::Positioned(queued) => queued.push_back(read),
         }
     }
@@ -216,8 +231,8 @@ impl Ring {
     /// Issues queued reads and runs `done` for every completed one.
     pub fn pump(&mut self) {
         match &mut self.backend {
-            #[cfg(windows)]
-            Backend::IoRing(r) => r.pump(),
+            #[cfg(any(windows, target_os = "linux"))]
+            Backend::Native(r) => r.pump(),
             Backend::Positioned(queued) => {
                 while let Some(read) = queued.pop_front() {
                     let mut buf = AlignedBuf::new(read.len);
@@ -232,8 +247,8 @@ impl Ring {
     /// Whether reads are queued or in flight.
     pub fn busy(&self) -> bool {
         match &self.backend {
-            #[cfg(windows)]
-            Backend::IoRing(r) => r.busy(),
+            #[cfg(any(windows, target_os = "linux"))]
+            Backend::Native(r) => r.busy(),
             Backend::Positioned(queued) => !queued.is_empty(),
         }
     }
@@ -241,22 +256,22 @@ impl Ring {
 
 /// Wakes a thread blocked in [`Wake::wait`] from any thread.
 pub struct Wake {
-    #[cfg(windows)]
-    event: windows::Event,
-    #[cfg(not(windows))]
+    #[cfg(any(windows, target_os = "linux"))]
+    event: sys::Event,
+    #[cfg(not(any(windows, target_os = "linux")))]
     set: Mutex<bool>,
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     cv: Condvar,
 }
 
 impl Default for Wake {
     fn default() -> Self {
         Self {
-            #[cfg(windows)]
-            event: windows::Event::new(),
-            #[cfg(not(windows))]
+            #[cfg(any(windows, target_os = "linux"))]
+            event: sys::Event::new(),
+            #[cfg(not(any(windows, target_os = "linux")))]
             set: Mutex::new(false),
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             cv: Condvar::new(),
         }
     }
@@ -264,9 +279,9 @@ impl Default for Wake {
 
 impl Wake {
     pub fn set(&self) {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         self.event.set();
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             *self.set.lock().unwrap() = true;
             self.cv.notify_one();
@@ -277,13 +292,13 @@ impl Wake {
     /// once while a positioned ring has queued reads, and may return early otherwise.
     pub fn wait(&self, ring: Option<&Ring>) {
         let ring = ring.filter(|r| r.busy());
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         match ring.map(|r| &r.backend) {
-            Some(Backend::IoRing(r)) => windows::wait_any(&[&self.event, r.event()]),
+            Some(Backend::Native(r)) => sys::wait_any(&[&self.event, r.event()]),
             Some(Backend::Positioned(_)) => {}
-            None => windows::wait_any(&[&self.event]),
+            None => sys::wait_any(&[&self.event]),
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         if ring.is_none() {
             let mut set = self.set.lock().unwrap();
             while !*set {
