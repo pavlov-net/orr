@@ -755,6 +755,7 @@ dependencies = [
  "orr-scene",
  "orr-shaders",
  "png 0.18.1",
+ "serde_json",
  "winit",
 ]
 

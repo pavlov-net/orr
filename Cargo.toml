@@ -42,6 +42,7 @@ bytemuck = { version = "1", features = ["derive"] }
 # 0.14 is the version ctt uses, so one zstd-sys builds.
 zstd = "0.14"
 png = "0.18"
+serde_json = "1.0.154"
 egui = { version = "0.37", default-features = false }
 io-uring = "0.7.15"
 libc = "0.2"

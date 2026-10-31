@@ -9,13 +9,17 @@ use std::time::{Duration, Instant};
 use orr::orr_gpu::{Device, DeviceDesc, QueueRequest};
 use orr::orr_output::orr_dlss::Uuid;
 use orr::{
-    DlssSdk, FrameDesc, FrameTime, LoadState, Loading, MountId, PackSource, Renderer, Screenshot,
+    Affine3, DlssSdk, FrameDesc, FrameTime, LoadState, Loading, MountId, PackSource, Renderer,
+    Screenshot,
 };
+use orr_math::{Mat3, Vec3};
 
 pub mod field;
 pub mod mesh;
 pub mod overlay;
 pub mod scene;
+pub mod sky;
+pub mod vegetation;
 pub mod window;
 
 /// The examples' compiled kernels and the Rust types of their Slang structs.
@@ -182,6 +186,33 @@ impl Capture {
             .and_then(|mut w| w.write_image_data(&self.rgba8))
             .unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
     }
+}
+
+/// Rows [R | t] of rotation `m` and translation `t`.
+pub fn affine(m: Mat3, t: Vec3) -> Affine3 {
+    let r = |i: usize| {
+        let row = m.row(i);
+        [row.x, row.y, row.z, t[i]]
+    };
+    Affine3 {
+        rows: [r(0), r(1), r(2)],
+    }
+}
+
+/// Writes an 8-bit grayscale PNG of `f` over an `n` x `n` grid of unit coordinates to
+/// `path`, for the cook to read.
+pub fn gray_png(path: &Path, n: u32, f: impl Fn(f32, f32) -> u8) {
+    let data: Vec<u8> = (0..n * n)
+        .map(|i| f((i % n) as f32 / n as f32, (i / n) as f32 / n as f32))
+        .collect();
+    let file =
+        std::fs::File::create(path).unwrap_or_else(|e| panic!("creating {}: {e}", path.display()));
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), n, n);
+    enc.set_color(png::ColorType::Grayscale);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()
+        .and_then(|mut w| w.write_image_data(&data))
+        .unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
 }
 
 /// Frame `n` of a fixed 60 Hz clock, so headless runs repeat exactly.

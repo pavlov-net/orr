@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use examples::mesh::MeshBuilder;
 use examples::shaders::{capture, sun_shadow, wind};
 use examples::window::Window;
-use examples::{Capture, Options, Workers, assert_clean, device, fixed_time};
+use examples::{Capture, Options, Workers, affine, assert_clean, device, fixed_time};
 use orr::orr_gpu::{Format, Hazards, MemoryKind, QueueKind, SpecData, Stages, TimelinePoint};
 use orr::orr_output::Image;
 use orr::orr_pack::Target;
@@ -422,17 +422,6 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     drop(window);
     gpu.collect_garbage();
     captured
-}
-
-/// Rows [R | t] of rotation `m` and translation `t`.
-fn affine(m: Mat3, t: Vec3) -> Affine3 {
-    let r = |i: usize| {
-        let row = m.row(i);
-        [row.x, row.y, row.z, t[i]]
-    };
-    Affine3 {
-        rows: [r(0), r(1), r(2)],
-    }
 }
 
 /// The tree and the ground, cooked into an in-memory pack. The tree's trunk is part 0 and

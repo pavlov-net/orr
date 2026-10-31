@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use examples::mesh::MeshBuilder;
 use examples::shaders::{capture, sun_shadow};
 use examples::window::Window;
-use examples::{Capture, Options, Workers, assert_clean, device, fixed_time};
+use examples::{Capture, Options, Workers, assert_clean, device, fixed_time, gray_png};
 use orr::orr_gpu::{Format, Hazards, MemoryKind, QueueKind, SpecData, Stages, TimelinePoint};
 use orr::orr_output::Image;
 use orr::orr_pack::material::{Material, slot};
@@ -431,26 +431,13 @@ fn rings_png() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("orr-cluster-rt-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join("rings.png");
-    let n = 256;
-    let data: Vec<u8> = (0..n * n)
-        .map(|i| {
-            let (u, v) = (
-                (i % n) as f32 / n as f32 - 0.5,
-                (i / n) as f32 / n as f32 - 0.5,
-            );
-            if ((u * u + v * v).sqrt() * 8.0).fract() < 0.6 {
-                255
-            } else {
-                0
-            }
-        })
-        .collect();
-    let file = std::fs::File::create(&path).expect("rings.png");
-    let mut enc = png::Encoder::new(file, n, n);
-    enc.set_color(png::ColorType::Grayscale);
-    enc.set_depth(png::BitDepth::Eight);
-    enc.write_header()
-        .and_then(|mut w| w.write_image_data(&data))
-        .expect("rings.png");
+    gray_png(&path, 256, |u, v| {
+        let (u, v) = (u - 0.5, v - 0.5);
+        if ((u * u + v * v).sqrt() * 8.0).fract() < 0.6 {
+            255
+        } else {
+            0
+        }
+    });
     path
 }

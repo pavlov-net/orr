@@ -246,12 +246,12 @@ public float3 cache_radiance(uint2 r)
     return unpack_rgb9e5(r.x) * (1.0 / CACHE_STORE_SCALE);
 }
 
-// Adds `count` to `*p`, summed across the lanes of the wave that add to it.
+// Adds 1 to `*p` where `count`, one atomic per lane: on 621.01 a wave-summed add after a
+// raygen entry's coherence point loses the device.
 public void count_add(uint* p, bool count)
 {
-    uint n = WaveActiveSum(count ? 1u : 0u);
-    if (WaveIsFirstLane() && n > 0)
-        InterlockedAdd(*p, n);
+    if (count)
+        InterlockedAdd(*p, 1u);
 }
 
 void atomic_add_float(uint* p, float v)

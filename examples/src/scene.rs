@@ -1,10 +1,9 @@
 //! The examples' cooked scene: a gold knot, a glossy and a mirror sphere, a block and a
 //! glowing panel on a ground, under a cooked sky and a 100 klx sun.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use orr::orr_gpu::{AddressMode, Allocation, Device, Filter, MemoryKind, SamplerDesc};
+use orr::orr_gpu::{Allocation, Device};
 use orr::orr_lighting::EnvironmentMapGpu;
 use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
@@ -13,13 +12,11 @@ use orr::{
     Light, LightId, PackSource, Renderer, SceneDesc, SceneId, SceneLightingSettings,
     TransformGroupDesc, ViewHistoryId,
 };
-use orr_cook::{
-    ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Quality, Source, TextureSettings,
-    Usage,
-};
+use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source};
 use orr_math::{DVec3, Vec3};
 
 use crate::mesh::MeshBuilder;
+use crate::sky::{self, Sky};
 use crate::{fixed_time, mount_at};
 
 const OBJECTS: &str = "objects";
@@ -76,30 +73,7 @@ impl Showcase {
                 .model(mount, AssetId::from_name(name))
                 .unwrap_or_else(|e| panic!("model {name}: {e}"))
         });
-        let mut environment = gpu
-            .gpu_malloc::<EnvironmentMapGpu>(MemoryKind::Upload, 1, "showcase sky")
-            .expect("environment");
-        environment.as_mut_slice().expect("environment")[0] = EnvironmentMapGpu {
-            map: renderer
-                .texture(mount, AssetId::from_name(SKY))
-                .expect("sky texture"),
-            sampler: gpu
-                .sampler(&SamplerDesc {
-                    mag: Filter::Linear,
-                    min: Filter::Linear,
-                    mip: Filter::Linear,
-                    address: [AddressMode::ClampToEdge; 3],
-                    ..SamplerDesc::default()
-                })
-                .expect("sky sampler"),
-            intensity: 1.0,
-            primaries: orr_color::Primaries::Rec709.id().into(),
-            from_world: [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-            ],
-        };
+        let environment = sky::environment(renderer, gpu, mount, SKY);
 
         frame += 1;
         let listed = [scene];
@@ -234,25 +208,12 @@ fn cook() -> Arc<[u8]> {
             settings: MeshSettings::default(),
         },
     };
-    let sky = sky_hdr();
+    let sky = Sky::new("showcase", SUN);
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(
             Target::Memory,
             vec![
-                AssetSpec {
-                    name: SKY.into(),
-                    source: Source::Texture {
-                        path: sky.clone(),
-                        settings: TextureSettings {
-                            usage: Usage::Environment {
-                                light_threshold: None,
-                                max_lights: 0,
-                            },
-                            quality: Quality::Fast,
-                            ..TextureSettings::default()
-                        },
-                    },
-                },
+                sky.asset(SKY),
                 mesh(
                     OBJECTS,
                     objects.finish(),
@@ -262,60 +223,8 @@ fn cook() -> Arc<[u8]> {
             ],
         )],
     };
-    let pack = orr_cook::cook(&manifest, &Default::default())
+    orr_cook::cook(&manifest, &Default::default())
         .expect("cook")
         .memory
-        .remove(0);
-    let _ = std::fs::remove_dir_all(sky.parent().expect("temp dir"));
-    pack
-}
-
-/// Sky radiance in nits, linear Rec.709, along unit direction `d`: a gradient from a bright
-/// horizon to a blue zenith with a glow around the sun, over a dim ground.
-fn sky(d: Vec3) -> Vec3 {
-    let glow = 6.0 * (60.0 * (d.dot(SUN) - 1.0)).exp();
-    if d.y < 0.0 {
-        return Vec3::new(0.55, 0.52, 0.48) * 6000.0;
-    }
-    let horizon = Vec3::new(0.85, 0.9, 1.0) * 5000.0;
-    let zenith = Vec3::new(0.2, 0.38, 1.0) * 4000.0;
-    horizon.lerp(zenith, d.y.sqrt()) * (1.0 + glow)
-}
-
-/// The sky as a 1024 x 512 equirectangular Radiance HDR file in a temp directory, for the
-/// cook to read.
-fn sky_hdr() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("orr-showcase-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let path = dir.join("sky.hdr");
-    let (w, h) = (1024u32, 512u32);
-    let mut bytes = format!("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y {h} +X {w}\n").into_bytes();
-    for y in 0..h {
-        for x in 0..w {
-            let (theta, phi) = (
-                (y as f32 + 0.5) / h as f32 * std::f32::consts::PI,
-                (x as f32 + 0.5) / w as f32 * std::f32::consts::TAU - std::f32::consts::PI,
-            );
-            let d = Vec3::new(
-                theta.sin() * phi.sin(),
-                theta.cos(),
-                -theta.sin() * phi.cos(),
-            );
-            bytes.extend(rgbe(sky(d)));
-        }
-    }
-    std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
-    path
-}
-
-/// Radiance's shared-exponent encoding of `c`.
-fn rgbe(c: Vec3) -> [u8; 4] {
-    let v = c.max_element();
-    if v < 1e-30 {
-        return [0; 4];
-    }
-    let e = v.log2().floor() as i32 + 1;
-    let scale = 256.0 / 2f32.powi(e);
-    let m = |x: f32| (x * scale).clamp(0.0, 255.0) as u8;
-    [m(c.x), m(c.y), m(c.z), (e + 128) as u8]
+        .remove(0)
 }

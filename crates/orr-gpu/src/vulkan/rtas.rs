@@ -25,6 +25,10 @@ const PTLAS_COMMAND_STRIDE: u32 =
 /// Alignment of a PTLAS.
 const PTLAS_ALIGN: u32 = 256;
 
+/// Scratch bytes a move takes per object at least: 621.01 reports none but writes 24 per
+/// moved object plus 16, past the end of a smaller block into whatever follows it.
+const MOVE_SCRATCH_PER_OBJECT: u64 = 32;
+
 pub(crate) fn cluster_caps(
     p: &vk::PhysicalDeviceClusterAccelerationStructurePropertiesNV<'_>,
     pt: &vk::PhysicalDevicePartitionedAccelerationStructurePropertiesNV<'_>,
@@ -245,9 +249,13 @@ impl Device {
                 });
             }
         }
+        let mut scratch = sizes.build_scratch_size;
+        if let RtasLimits::Move(l) = d.limits {
+            scratch = scratch.max(MOVE_SCRATCH_PER_OBJECT * u64::from(l.max_args) + 256);
+        }
         RtasSizes {
             result_max: sizes.acceleration_structure_size,
-            scratch: sizes.build_scratch_size,
+            scratch,
         }
     }
 

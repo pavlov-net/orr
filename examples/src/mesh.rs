@@ -179,6 +179,68 @@ impl MeshBuilder {
         }
     }
 
+    /// A tapered tube from `a` (radius `ra`) to `b` (radius `rb`), `segments` around and
+    /// `rings` along, open at both ends.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tube(
+        &mut self,
+        section: usize,
+        a: Vec3,
+        b: Vec3,
+        ra: f32,
+        rb: f32,
+        segments: u32,
+        rings: u32,
+    ) {
+        let axis = (b - a).normalize();
+        let side = axis.any_orthonormal_vector();
+        let up = axis.cross(side);
+        let first = self.positions.len() as u32;
+        for r in 0..=rings {
+            let t = r as f32 / rings as f32;
+            let center = a.lerp(b, t);
+            let radius = ra + (rb - ra) * t;
+            for s in 0..=segments {
+                let phi = s as f32 / segments as f32 * std::f32::consts::TAU;
+                let n = side * phi.cos() + up * phi.sin();
+                self.vertex(
+                    center + n * radius,
+                    n,
+                    Vec2::new(s as f32 / segments as f32, t * 4.0),
+                );
+            }
+        }
+        let w = segments + 1;
+        for r in 0..rings {
+            for s in 0..segments {
+                let c = first + r * w + s;
+                self.section(section)
+                    .extend([c, c + 1, c + w, c + 1, c + w + 1, c + w]);
+            }
+        }
+    }
+
+    /// A 3 x 3 cell patch `size` across at `center`, facing `normal` and cupped away from
+    /// it; leaves under an opacity mask.
+    pub fn leaf(&mut self, section: usize, center: Vec3, normal: Vec3, size: f32) {
+        let u = normal.any_orthonormal_vector();
+        let v = normal.cross(u);
+        let first = self.positions.len() as u32;
+        for j in 0..4 {
+            for i in 0..4 {
+                let (x, y) = (i as f32 / 3.0 - 0.5, j as f32 / 3.0 - 0.5);
+                let bend = 0.25 * size * (x * x + y * y);
+                let p = center + (u * x + v * y) * size - normal * bend;
+                self.vertex(p, normal, Vec2::new(i as f32 / 3.0, j as f32 / 3.0));
+            }
+        }
+        for j in 0..3 {
+            for i in 0..3 {
+                self.cell(section, first + j * 4 + i, 4);
+            }
+        }
+    }
+
     pub fn finish(self) -> MeshInput {
         let mut m = MeshInput {
             positions: self.positions,
