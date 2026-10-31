@@ -361,6 +361,17 @@ public uint gsurface_origin(GSurface s)
     return (s.flags & GBUFFER_ORIGIN_MASK) >> GBUFFER_ORIGIN_SHIFT;
 }
 
+// `n` turned toward unit `v` until dot(n, v) >= 0.01.
+public float3 lean_normal(float3 n, float3 v)
+{
+    float nv = dot(n, v);
+    if (nv >= 0.01)
+        return n;
+    float3 t = n - nv * v;
+    float l = length(t);
+    return l > 1e-6 ? 0.01 * v + sqrt(1.0 - 1e-4) * (t / l) : v;
+}
+
 // The pixel's surface: render-space position from the depth target, the shading normal
 // leaned so that dot(N, V) >= 0.01, the visible triangle and its material. A pixel with no
 // geometry (depth 0) returns a surface whose material is MATERIAL_NONE.
@@ -385,14 +396,7 @@ public GSurface load_gsurface(SceneRoot* scene, ViewConstants* view, GBufferGpu*
     float depth = g.depth.get<Texture2D<float>>().Load(int3(pixel, 0));
     float2 uv = (float2(pixel) + 0.5) / float2(g.extent);
     s.position = render_from_view(view, view_position(view, uv, depth));
-    float3 v = normalize(view.eye_render.xyz - s.position);
-    float nv = dot(s.normal, v);
-    if (nv < 0.01)
-    {
-        float3 t = s.normal - nv * v;
-        float l = length(t);
-        s.normal = l > 1e-6 ? 0.01 * v + sqrt(1.0 - 1e-4) * (t / l) : v;
-    }
+    s.normal = lean_normal(s.normal, normalize(view.eye_render.xyz - s.position));
     s.instance = c.instance;
     s.cluster = c.cluster;
     s.primitive = visibility_triangle(vis);

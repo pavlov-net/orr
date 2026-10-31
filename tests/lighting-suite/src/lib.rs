@@ -15,12 +15,17 @@ use orr_scene::{
     SceneId, SceneRoot, SceneWriter, Scenes,
 };
 
-pub use gpu_suite::{assert_clean, device, pipeline, readback, render, run, upload};
+pub use gpu_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
 
 pub mod bed;
 
 pub mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
+}
+
+/// orr-scene's and orr-lighting's kernels with `surfaces/context.slang` linked as surface 1.
+pub mod linked {
+    include!(concat!(env!("OUT_DIR"), "/linked/orr_kernels.rs"));
 }
 
 /// A kernel set in which each `(module, kernel)` stands in for orr-lighting's module compiled

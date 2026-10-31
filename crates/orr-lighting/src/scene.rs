@@ -100,10 +100,10 @@ pub struct LightingStats {
 }
 
 /// Per-root ring of one root per frame slot, in upload memory.
-struct Ring<T: 'static>(Allocation<T>);
+pub(crate) struct Ring<T: 'static>(Allocation<T>);
 
 impl<T: bytemuck::Pod> Ring<T> {
-    fn new(device: &Device, name: &str) -> Result<Self, Error> {
+    pub(crate) fn new(device: &Device, name: &str) -> Result<Self, Error> {
         Ok(Self(device.gpu_malloc::<T>(
             MemoryKind::Upload,
             FRAME_SLOTS as u64,
@@ -111,7 +111,7 @@ impl<T: bytemuck::Pod> Ring<T> {
         )?))
     }
 
-    fn write(&mut self, slot: usize, value: T) -> GpuPtr<T> {
+    pub(crate) fn write(&mut self, slot: usize, value: T) -> GpuPtr<T> {
         self.0.as_mut_slice().unwrap()[slot] = value;
         self.0.gpu.offset(slot as u64)
     }

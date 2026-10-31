@@ -2583,6 +2583,7 @@ dependencies = [
  "orr-color",
  "orr-cook",
  "orr-gpu",
+ "orr-math",
  "orr-pack",
  "orr-scene",
  "orr-shaders",

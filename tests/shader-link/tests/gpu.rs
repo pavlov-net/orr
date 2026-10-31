@@ -4,7 +4,7 @@
 use orr::{Renderer, RendererDesc};
 use orr_gpu::{
     Allocation, ComputePipeline, GpuPtr, Hazards, MemoryKind, QueueKind, ShaderModule, ShaderStage,
-    SpecData, Stages,
+    SpecData, Stage, Stages,
 };
 use orr_scene::testing::{assert_clean, device, wait};
 use orr_shaders::bytemuck::Pod;
@@ -240,13 +240,24 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
         .map(|m| m.kernel)
         .collect();
     kernels.sort_unstable();
-    assert_eq!(kernels, ["environment/bake", "light_sampling/directional"]);
+    assert_eq!(
+        kernels,
+        [
+            "environment/bake",
+            "light_sampling/directional",
+            "path/opaque"
+        ]
+    );
     if let Some(e) = renderer_error(&orr_linked::KERNELS) {
         panic!("{e}");
     }
     // The linked modules create pipelines as orr's own do.
     for &m in orr_linked::KERNELS.modules {
-        pipeline(m);
+        for e in m.entry_points.iter().filter(|e| e.stage == Stage::Compute) {
+            let name = e.name.to_str().unwrap();
+            let stage = ShaderStage::new(m, name, SpecData::default()).unwrap();
+            device().create_compute_pipeline(&stage, m.name).unwrap();
+        }
     }
     assert!(renderer_error(&unlinked::KERNELS).is_none());
     assert_clean();

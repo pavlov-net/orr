@@ -8,15 +8,16 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use orr_cook::{
-    ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Quality, Source, TextureSettings,
-    Usage,
+    ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSettings, Quality, Source,
+    TextureSettings, Usage,
 };
 use orr_gpu::{
     Allocation, CommandList, ComputePipeline, GpuPtr, Hazards, KernelSet, MemoryKind, Stages,
 };
 use orr_lighting::{
-    DirectionalLight, DiscProfile, EnvironmentMapGpu, Light, LightId, SceneLighting,
-    SceneLightingSettings, ScenePass,
+    BsdfTables, DirectionalLight, DiscProfile, EnvironmentMapGpu, Light, LightId, LightingKernels,
+    LightingView, PathEntry, SceneLighting, SceneLightingSettings, ScenePass, ViewLighting,
+    ViewPass,
 };
 use orr_math::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
@@ -28,7 +29,7 @@ use orr_scene::{
     TransformGroupDesc, ViewDesc, ViewHistoryId, ViewTarget,
 };
 
-use crate::shaders::{accumulate, flat_color};
+use crate::shaders::{accumulate, exposure, flat_color};
 use crate::{TestTexture, affine, device, linear_clamp, pipeline, render, texture, upload};
 
 /// Render extent of every bed view.
@@ -81,6 +82,7 @@ impl Analytic {
             eye,
             target,
             fov_y: 0.8,
+            focus: None,
         };
         match self {
             Analytic::Furnace => Spec {
@@ -90,6 +92,7 @@ impl Analytic {
                 eye: Vec3::new(0.0, 0.0, 4.0),
                 target: Vec3::ZERO,
                 fov_y: 0.6,
+                focus: None,
             },
             Analytic::CornellBox => Spec {
                 copies: vec![
@@ -111,6 +114,7 @@ impl Analytic {
                 eye: Vec3::new(0.0, 1.0, 3.4),
                 target: Vec3::new(0.0, 1.0, 0.0),
                 fov_y: 0.75,
+                focus: None,
             },
             Analytic::EmissiveQuad => Spec {
                 copies: vec![
@@ -126,6 +130,7 @@ impl Analytic {
                 eye: Vec3::new(0.0, 1.5, 4.0),
                 target: Vec3::new(0.0, 0.5, 0.0),
                 fov_y: 0.8,
+                focus: None,
             },
             Analytic::SunAndGround => lit(
                 vec![at(WHITE_SPHERE, Vec3::new(0.0, 1.0, 0.0))],
@@ -160,7 +165,9 @@ pub struct Item {
 }
 
 /// An analytic scene: copies, lights and a uniform environment (nits, linear Rec.2020;
-/// none is black), and its camera at `eye` looking at `target`, y up.
+/// none is black), and its camera at `eye` looking at `target`, y up. With a `focus` (a
+/// point and pixels per radian), ray tracing picks each copy's cut as for a primary view
+/// there; without one it traces every copy's finest cut.
 #[derive(Clone, Debug)]
 pub struct Spec {
     pub copies: Vec<Item>,
@@ -170,6 +177,7 @@ pub struct Spec {
     pub target: Vec3,
     /// Radians.
     pub fov_y: f32,
+    pub focus: Option<(Vec3, f32)>,
 }
 
 pub const SUN: DirectionalLight = DirectionalLight {
@@ -192,6 +200,17 @@ pub const EMITTER: &str = "emitter";
 pub const LEAF: &str = "leaf";
 pub const GLASS_SLAB: &str = "glass slab";
 pub const SKIN_SLAB: &str = "skin slab";
+/// An upright 2 m square perfect mirror (metal), facing +z.
+pub const MIRROR: &str = "mirror";
+/// The floor as a perfectly smooth black dielectric: only its mirror reflection shows.
+pub const SMOOTH_FLOOR: &str = "smooth floor";
+/// The floor with a strong bump normal map.
+pub const BUMPY_FLOOR: &str = "bumpy floor";
+/// An upright 1 m square facing +z whose material names linked surface 1.
+pub const PANEL: &str = "panel";
+/// A valley 3 m across and 8 m long along z, y = 0.5 x^2, finely tessellated, with
+/// discrete levels of 1 cm and 3 cm error.
+pub const TROUGH: &str = "trough";
 
 /// The bed's emitter: nits, white.
 pub const EMITTER_LUMINANCE: f32 = 50.0;
@@ -323,6 +342,23 @@ fn square(half: f32, y: f32) -> [Vec3; 4] {
         .map(|(x, z)| Vec3::new(x * half, y, z * half))
 }
 
+/// An upright square of half side `half` around the origin, facing +z.
+fn upright(half: f32) -> MeshInput {
+    mesh(|b| {
+        b.quad(
+            0,
+            [
+                Vec3::new(-half, -half, 0.0),
+                Vec3::new(half, -half, 0.0),
+                Vec3::new(half, half, 0.0),
+                Vec3::new(-half, half, 0.0),
+            ],
+            Vec3::Z,
+            1,
+        );
+    })
+}
+
 fn mesh(build: impl FnOnce(&mut MeshBuilder)) -> MeshInput {
     let mut b = MeshBuilder::default();
     build(&mut b);
@@ -350,6 +386,33 @@ fn rings_png() -> PathBuf {
         .collect();
     let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), n, n);
     enc.set_color(png::ColorType::Grayscale);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header().unwrap().write_image_data(&data).unwrap();
+    path
+}
+
+/// A tangent-space normal map of round bumps tilting normals up to about 50 degrees.
+fn bumps_png() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("orr-lighting-bed-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bumps.png");
+    let n = 128;
+    let data: Vec<u8> = (0..n * n)
+        .flat_map(|i| {
+            let tau = std::f32::consts::TAU;
+            let (u, v) = ((i % n) as f32 / n as f32, (i / n) as f32 / n as f32);
+            let (dx, dy) = (
+                1.2 * (8.0 * tau * u).cos() * (8.0 * tau * v).sin(),
+                1.2 * (8.0 * tau * u).sin() * (8.0 * tau * v).cos(),
+            );
+            let normal = Vec3::new(-dx, -dy, 1.0).normalize();
+            normal
+                .to_array()
+                .map(|c| ((c * 0.5 + 0.5) * 255.0).round() as u8)
+        })
+        .collect();
+    let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), n, n);
+    enc.set_color(png::ColorType::Rgb);
     enc.set_depth(png::BitDepth::Eight);
     enc.write_header().unwrap().write_image_data(&data).unwrap();
     path
@@ -407,6 +470,49 @@ fn cook() -> Arc<[u8]> {
         ..Material::default()
     };
     let white = diffuse([0.73; 3]);
+    let mirror = Material {
+        base_color: [1.0; 3],
+        metalness: 1.0,
+        specular_roughness: 0.0,
+        ..Material::default()
+    };
+    let smooth = Material {
+        base_color: [0.0; 3],
+        specular_roughness: 0.0,
+        specular_ior: 1.5,
+        ..Material::default()
+    };
+    let mut bumpy = floor;
+    bumpy.textures[slot::NORMAL].texture = AssetId::from_name("bumps");
+    let panel = Material {
+        base_color: [0.0; 3],
+        surface: 1,
+        ..Material::default()
+    };
+    let trough = mesh(|b| {
+        let (nx, nz) = (48u32, 16u32);
+        let first = b.positions.len() as u32;
+        for j in 0..=nz {
+            for i in 0..=nx {
+                let x = -1.5 + 3.0 * i as f32 / nx as f32;
+                let z = -4.0 + 8.0 * j as f32 / nz as f32;
+                let n = Vec3::new(-x, 1.0, 0.0).normalize();
+                b.vertex(
+                    Vec3::new(x, 0.5 * x * x, z),
+                    n,
+                    Vec2::new(i as f32 / nx as f32, j as f32 / nz as f32),
+                );
+            }
+        }
+        let w = nx + 1;
+        for j in 0..nz {
+            for i in 0..nx {
+                let c = first + j * w + i;
+                b.triangle(0, [c, c + 1, c + w + 1]);
+                b.triangle(0, [c, c + w + 1, c + w]);
+            }
+        }
+    });
     let (x, y, z) = (Vec3::X, Vec3::Y, Vec3::Z);
     let cornell = mesh(|b| {
         let c = |px: f32, py: f32, pz: f32| Vec3::new(px, py, pz);
@@ -510,6 +616,42 @@ fn cook() -> Arc<[u8]> {
                 ),
                 model(GLASS_SLAB, slab(), vec![glass]),
                 model(SKIN_SLAB, slab(), vec![skin]),
+                AssetSpec {
+                    name: "bumps".into(),
+                    source: Source::Texture {
+                        path: bumps_png(),
+                        settings: TextureSettings {
+                            usage: Usage::Normal,
+                            quality: Quality::Fast,
+                            ..TextureSettings::default()
+                        },
+                    },
+                },
+                model(MIRROR, upright(1.0), vec![mirror]),
+                model(
+                    SMOOTH_FLOOR,
+                    mesh(|b| b.quad(0, square(5.0, 0.0), y, 8)),
+                    vec![smooth],
+                ),
+                model(
+                    BUMPY_FLOOR,
+                    mesh(|b| b.quad(0, square(5.0, 0.0), y, 8)),
+                    vec![bumpy],
+                ),
+                model(PANEL, upright(0.5), vec![panel]),
+                AssetSpec {
+                    name: TROUGH.into(),
+                    source: Source::Mesh {
+                        mesh: trough,
+                        materials: vec![white],
+                        settings: MeshSettings {
+                            lod: LodMode::Discrete {
+                                errors: vec![0.01, 0.03],
+                            },
+                            ..MeshSettings::default()
+                        },
+                    },
+                },
             ],
         )],
     };
@@ -566,12 +708,24 @@ pub struct BedFrame<'a> {
     pub frame: u64,
     pub view: &'a RasterView,
     pub lighting: &'a SceneLighting,
-    /// One RGBA radiance value per pixel, rows of [`EXTENT`], that the kernel writes.
-    pub radiance: GpuPtr<[f32; 4]>,
+    /// The radiance target the kernel writes, at [`EXTENT`].
+    pub target: &'a mut LightingView,
     roots: &'a mut Roots,
 }
 
 impl BedFrame<'_> {
+    /// The frame as the opaque dispatch reads it.
+    pub fn pass(&self) -> ViewPass {
+        ViewPass {
+            frame: self.frame,
+            scene: self.view.scene,
+            view: self.view.view,
+            gbuffer: self.view.gbuffer,
+            sample_index: self.index,
+            seed: self.seed,
+        }
+    }
+
     /// `value` in root memory that lives until the frame completes.
     pub fn put<T: bytemuck::Pod>(&mut self, value: &T) -> GpuPtr<T> {
         self.roots.put(value)
@@ -644,24 +798,32 @@ pub struct Bed {
     history: ViewHistoryId,
     _mount: MountId,
     _environment: Option<(TestTexture, Allocation<EnvironmentMapGpu>)>,
-    radiance: Allocation<[f32; 4]>,
+    target: LightingView,
     sum: Allocation<[f32; 4]>,
     out: Allocation<[f32; 4]>,
     roots: Roots,
     accumulate: ComputePipeline,
+    exposure: ComputePipeline,
+    pre_exposure: f32,
     frame: u64,
     _workers: Workers,
 }
 
 impl Bed {
     pub fn new(analytic: Analytic) -> Self {
-        Self::with(analytic.spec(), &KernelSet::default())
+        Self::with(analytic.spec())
     }
 
-    /// The bed for `spec` with orr-lighting's modules replaced from `kernels`.
-    pub fn with(spec: Spec, kernels: &KernelSet) -> Self {
+    pub fn with(spec: Spec) -> Self {
+        Self::with_renderer(spec, &RendererDesc::default())
+    }
+
+    /// The bed for `spec` on a renderer created with `renderer`; orr-lighting's modules are
+    /// replaced from its kernels too.
+    pub fn with_renderer(spec: Spec, renderer: &RendererDesc) -> Self {
+        let kernels = renderer.kernels;
         let d = device();
-        let mut scenes = Scenes::new(d, &RendererDesc::default()).unwrap();
+        let mut scenes = Scenes::new(d, renderer).unwrap();
         let loading = scenes.loading();
         let threads = (0..2)
             .map(|_| {
@@ -691,7 +853,7 @@ impl Bed {
         }
 
         let desc = SceneDesc {
-            light_capacity: 4,
+            light_capacity: 8,
             ..SceneDesc::default()
         };
         let scene = scenes.create_scene(&desc).unwrap();
@@ -762,6 +924,9 @@ impl Bed {
         if let Some((_, data)) = &environment {
             w.set_environment(data.gpu.address());
         }
+        if let Some((at, pixels_per_radian)) = spec.focus {
+            w.set_focus(at.as_dvec3(), pixels_per_radian);
+        }
         drop(w);
         let point = f.end(&[]).unwrap();
         render().wait(point, Duration::from_secs(10)).unwrap();
@@ -777,7 +942,7 @@ impl Bed {
             history,
             _mount: mount,
             _environment: environment,
-            radiance: buffer(MemoryKind::DeviceLocal, "bed radiance"),
+            target: LightingView::new(d, EXTENT).unwrap(),
             sum: buffer(MemoryKind::DeviceLocal, "bed sum"),
             out: buffer(MemoryKind::Readback, "bed readback"),
             roots: Roots {
@@ -787,6 +952,8 @@ impl Bed {
                 used: 0,
             },
             accumulate: pipeline(&accumulate::MODULE, "main"),
+            exposure: pipeline(&exposure::MODULE, "main"),
+            pre_exposure: 1.0,
             frame,
             _workers: workers,
         }
@@ -801,86 +968,20 @@ impl Bed {
         seed: u32,
         kernel: &mut dyn FnMut(&mut CommandList<'_>, &mut BedFrame<'_>),
     ) -> Accumulated {
+        self.accumulate_from(0, frames, seed, kernel)
+    }
+
+    /// As [`Self::accumulate`], with frame indices from `first`.
+    pub fn accumulate_from(
+        &mut self,
+        first: u32,
+        frames: u32,
+        seed: u32,
+        kernel: &mut dyn FnMut(&mut CommandList<'_>, &mut BedFrame<'_>),
+    ) -> Accumulated {
         assert!(frames > 0);
-        let eye = self.spec.eye;
-        for index in 0..frames {
-            self.frame += 1;
-            self.roots.used = 0;
-            let list = [self.scene];
-            let mut f = self
-                .scenes
-                .begin_frame(&FrameDesc {
-                    time: time(self.frame),
-                    scenes: &list,
-                    low_latency: None,
-                })
-                .unwrap();
-            let view = f
-                .raster_view(&ViewDesc {
-                    scene: self.scene,
-                    history: self.history,
-                    position: eye.as_dvec3(),
-                    rotation: look(eye, self.spec.target),
-                    projection: Projection {
-                        fov_y: self.spec.fov_y,
-                        near: 0.05,
-                    },
-                    lens: Lens::default(),
-                    render_extent: UVec2::from(EXTENT),
-                    jitter: Vec2::ZERO,
-                    reset_history: index == 0,
-                    mip_bias: 0.0,
-                    target: ViewTarget::AfterRr,
-                })
-                .unwrap();
-            let id = f.id();
-            let list = f.list().unwrap();
-            list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-            self.lighting.record(
-                list,
-                &ScenePass {
-                    frame: id,
-                    scene: view.scene,
-                    focus: eye.to_array(),
-                },
-            );
-            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-            kernel(
-                list,
-                &mut BedFrame {
-                    index,
-                    seed,
-                    frame: id,
-                    view: &view,
-                    lighting: &self.lighting,
-                    radiance: self.radiance.gpu,
-                    roots: &mut self.roots,
-                },
-            );
-            list.barrier(
-                Stages::COMPUTE | Stages::RAY,
-                Stages::COMPUTE,
-                Hazards::empty(),
-            );
-            let root = self.roots.put(&accumulate::Root {
-                radiance: self.radiance.gpu,
-                sum: self.sum.gpu,
-                count: PIXELS as u32,
-                first: u32::from(index == 0),
-                _pad: 0,
-            });
-            list.dispatch(&self.accumulate, root, [PIXELS.div_ceil(64) as u32, 1, 1]);
-            if index + 1 == frames {
-                list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
-                list.copy(
-                    self.out.gpu.cast(),
-                    self.sum.gpu.cast(),
-                    PIXELS * size_of::<[f32; 4]>() as u64,
-                );
-                list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
-            }
-            let point = f.end(&[]).unwrap();
-            render().wait(point, Duration::from_secs(10)).unwrap();
+        for k in 0..frames {
+            self.run_frame(first + k, seed, k == 0, k + 1 == frames, kernel);
         }
         let n = frames as f32;
         Accumulated {
@@ -892,6 +993,108 @@ impl Bed {
                 .map(|p| p.map(|v| v / n))
                 .collect(),
         }
+    }
+
+    /// Renders later frames at pre-exposure `p`, as the output's meter would set it.
+    pub fn set_pre_exposure(&mut self, p: f32) {
+        self.pre_exposure = p;
+        self.run_frame(0, 0, true, false, &mut |_, _| {});
+    }
+
+    fn run_frame(
+        &mut self,
+        index: u32,
+        seed: u32,
+        first: bool,
+        last: bool,
+        kernel: &mut dyn FnMut(&mut CommandList<'_>, &mut BedFrame<'_>),
+    ) {
+        let eye = self.spec.eye;
+        self.frame += 1;
+        self.roots.used = 0;
+        let list = [self.scene];
+        let mut f = self
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(self.frame),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        let view = f
+            .raster_view(&ViewDesc {
+                scene: self.scene,
+                history: self.history,
+                position: eye.as_dvec3(),
+                rotation: look(eye, self.spec.target),
+                projection: Projection {
+                    fov_y: self.spec.fov_y,
+                    near: 0.05,
+                },
+                lens: Lens::default(),
+                render_extent: UVec2::from(EXTENT),
+                jitter: Vec2::ZERO,
+                reset_history: first,
+                mip_bias: 0.0,
+                target: ViewTarget::AfterRr,
+            })
+            .unwrap();
+        let id = f.id();
+        let list = f.list().unwrap();
+        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+        self.lighting.record(
+            list,
+            &ScenePass {
+                frame: id,
+                scene: view.scene,
+                focus: eye.to_array(),
+            },
+        );
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        kernel(
+            list,
+            &mut BedFrame {
+                index,
+                seed,
+                frame: id,
+                view: &view,
+                lighting: &self.lighting,
+                target: &mut self.target,
+                roots: &mut self.roots,
+            },
+        );
+        list.barrier(
+            Stages::COMPUTE | Stages::RAY,
+            Stages::COMPUTE,
+            Hazards::empty(),
+        );
+        let root = self.roots.put(&accumulate::Root {
+            sum: self.sum.gpu,
+            radiance: self.target.radiance_index(),
+            width: EXTENT[0],
+            count: PIXELS as u32,
+            first: u32::from(first),
+            _pad0: 0,
+            _pad1: 0,
+        });
+        list.dispatch(&self.accumulate, root, [PIXELS.div_ceil(64) as u32, 1, 1]);
+        let root = self.roots.put(&exposure::Root {
+            view: view.view,
+            pre_exposure: self.pre_exposure,
+            _pad: 0,
+        });
+        list.dispatch(&self.exposure, root, [1, 1, 1]);
+        if last {
+            list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
+            list.copy(
+                self.out.gpu.cast(),
+                self.sum.gpu.cast(),
+                PIXELS * size_of::<[f32; 4]>() as u64,
+            );
+            list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
+        }
+        let point = f.end(&[]).unwrap();
+        render().wait(point, Duration::from_secs(10)).unwrap();
     }
 }
 
@@ -916,7 +1119,8 @@ impl FlatColor {
             scene: f.view.scene,
             view: f.view.view,
             gbuffer: f.view.gbuffer,
-            radiance: f.radiance,
+            radiance: f.target.radiance_storage(),
+            _pad2: 0,
             sky: [self.sky[0], self.sky[1], self.sky[2], 0.0],
             frame: f.index,
             seed: f.seed,
@@ -928,5 +1132,31 @@ impl FlatColor {
             root,
             [EXTENT[0].div_ceil(8), EXTENT[1].div_ceil(8), 1],
         );
+    }
+}
+
+/// orr-lighting's opaque dispatch recording into bed frames with `settings`.
+pub struct Paths {
+    kernels: LightingKernels,
+    _tables: BsdfTables,
+    pub settings: ViewLighting,
+}
+
+impl Paths {
+    pub fn new(kernels: &KernelSet, entry: PathEntry, settings: ViewLighting) -> Self {
+        let mut list = render().command_list().unwrap();
+        let tables = BsdfTables::new(device(), &mut list).unwrap();
+        crate::run(list);
+        Self {
+            kernels: LightingKernels::new(device(), kernels, &tables, entry).unwrap(),
+            _tables: tables,
+            settings,
+        }
+    }
+
+    pub fn record(&self, list: &mut CommandList<'_>, f: &mut BedFrame<'_>) {
+        let pass = f.pass();
+        self.kernels
+            .record_opaque(list, f.lighting, f.target, &pass, &self.settings);
     }
 }

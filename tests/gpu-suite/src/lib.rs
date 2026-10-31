@@ -91,6 +91,14 @@ pub fn run(list: CommandList<'_>) -> TimelinePoint {
     point
 }
 
+/// `cond`; when false, logs one line saying the calling test is skipped because of `why`.
+pub fn require(cond: bool, why: &str) -> bool {
+    if !cond {
+        log::warn!("skipped on {}: {why}", device().caps().device_name);
+    }
+    cond
+}
+
 /// Fails the calling test if the validation layer has reported anything.
 pub fn assert_clean() {
     assert_eq!(

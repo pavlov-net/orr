@@ -8,10 +8,15 @@
 //! [`SceneLighting::light_set`] and the Slang modules `light_sampling`, `environment` and
 //! `media` under this crate's shader root (`DEP_ORR_LIGHTING_SHADER_DIRS`). Kernels that
 //! shade with the real-time OpenPBR BSDF import `bsdf` and read [`BsdfTables`].
+//!
+//! Each view, after its raster half, [`LightingKernels::record_opaque`] traces one path per
+//! G-buffer pixel into the view's [`LightingView`] radiance, with the settings of
+//! [`ViewLighting`]. The `path` module holds the path itself for kernels that trace more.
 
 mod bsdf;
 mod environment;
 mod scene;
+mod view;
 
 pub use bsdf::BsdfTables;
 pub use environment::{ENVIRONMENT_SIZE, EnvironmentMapGpu};
@@ -23,6 +28,11 @@ pub use scene::{
 };
 pub use shaders::types::{
     DirectionalState, EmissiveSelection, EnvironmentGpu, LightSample, LightSetGpu, LightSetStats,
+    PathRoot,
+};
+pub use view::{
+    LightingDebugView, LightingKernels, LightingView, MediaSettings, PathEntry, ReferenceSettings,
+    ThinLens, ViewLighting, ViewPass,
 };
 
 use orr_scene::orr_gpu::{ComputePipeline, Device, ShaderModule, ShaderStage, SpecData};

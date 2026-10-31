@@ -48,29 +48,6 @@ const ORR_LINKS: [(LinkPoint, &str, &str, &str); 2] = [
     (LinkPoint::Medium, "air", "consumer/air.slang", "Air"),
 ];
 
-/// orr-scene's Slang structs orr-lighting's build maps.
-const SCENE_TYPES: &[&str] = &[
-    "SceneRoot",
-    "InstanceGpu",
-    "SlotStateGpu",
-    "GroupGpu",
-    "ModelGpu",
-    "MeshGpu",
-    "MeshLevel",
-    "ClusterRef",
-    "RtCutGpu",
-    "MaterialGpu",
-    "LightGpu",
-    "EmissiveGpu",
-    "ProducerGpu",
-    "ProducerBatch",
-    "ProducerClusterGpu",
-    "TopologyGpu",
-    "SkyStats",
-    "ViewConstants",
-    "ExposureState",
-];
-
 fn renderer(src: &Path, out: &Path) -> Result<Output, Error> {
     Build::new()?.kernels(src).out_dir(out).compile()
 }
@@ -125,14 +102,13 @@ fn edited_orr(roots: &str, src: &Path, out: &Path) -> Result<Output, Error> {
             text
         }
     });
-    let mut b = Build::new()?
+    let scene = env::var("DEP_ORR_TYPES").expect("orr's type map");
+    Build::new()?
         .kernels(src)
         .roots(&others.join(";"))
-        .out_dir(out);
-    for t in SCENE_TYPES {
-        b = b.extern_type(t, &format!("::orr_scene::{t}"));
-    }
-    b.compile()
+        .types(&scene)
+        .out_dir(out)
+        .compile()
 }
 
 /// Copies every `.slang` file under `src` to `dst` through `edit`, writing only what changed.
