@@ -666,14 +666,15 @@ mod depth_of_field {
 }
 
 /// Glare: the band pyramid against its CPU model, the fitted tables and the diaphragm PSF
-/// they are fitted to.
+/// they are fitted to; FFT glare against direct convolution with its kernel, and its kernel
+/// against the PSF.
 mod glare {
     use orr_output::{
-        Exposure, OutputDebug, OutputFormat, ResolvedDisplay, ViewOutput, srgb_encode,
+        Exposure, GlareMethod, OutputDebug, OutputFormat, ResolvedDisplay, ViewOutput, srgb_encode,
     };
     use orr_scene::Glare;
     use orr_scene::testing::{Image, Pixels, assert_clean, flip};
-    use output_suite::{Harness, REC709_TO_XYZ, XYZ_TO_REC2020, mul3};
+    use output_suite::{Harness, REC709_TO_XYZ, XYZ_TO_REC2020, mul3, read_rgba16f};
 
     #[allow(dead_code, unreachable_pub)]
     mod pyramid {
@@ -682,6 +683,10 @@ mod glare {
     #[allow(dead_code, unreachable_pub)]
     mod psf {
         include!(concat!(env!("ORR_GLARE_MODEL"), "/psf.rs"));
+    }
+    #[allow(dead_code, unreachable_pub)]
+    mod fft {
+        include!(concat!(env!("ORR_GLARE_MODEL"), "/fft.rs"));
     }
     #[allow(
         dead_code,
@@ -1097,7 +1102,7 @@ mod glare {
     }
 
     /// The HDR rendition's halo at the SDR clip level (250 nits) has the SDR rendition's
-    /// extent within one pyramid level.
+    /// extent within one pyramid level, by either method.
     #[test]
     fn hdr_halo_at_sdr_clip_matches_sdr_halo() {
         let extent = [512, 512];
@@ -1110,18 +1115,23 @@ mod glare {
             peak_nits: 1000.0,
             black_nits: 0.0,
         };
-        let out = output(ev, OutputDebug::None);
-        let mut h = harness(extent, Some(1.0));
-        settle(&mut h, &nits, &out, &sdr());
-        let sdr_reach = reach(&h.display_linear(), 512, [256, 256], 0.99);
-        settle(&mut h, &nits, &out, &hdr);
-        let hdr_reach = reach(&h.display_linear(), 512, [256, 256], 1.0);
-        log::info!("halo reach: SDR clip {sdr_reach} px, HDR 250 nits {hdr_reach} px");
-        let ratio = f64::from(hdr_reach.max(1)) / f64::from(sdr_reach.max(1));
-        assert!(
-            ratio.log2().abs() <= 1.0,
-            "SDR {sdr_reach}, HDR {hdr_reach}"
-        );
+        for method in [GlareMethod::Bands, GlareMethod::Fft] {
+            let mut out = output(ev, OutputDebug::None);
+            out.post.glare = method;
+            let mut h = harness(extent, Some(1.0));
+            settle(&mut h, &nits, &out, &sdr());
+            let sdr_reach = reach(&h.display_linear(), 512, [256, 256], 0.99);
+            settle(&mut h, &nits, &out, &hdr);
+            let hdr_reach = reach(&h.display_linear(), 512, [256, 256], 1.0);
+            log::info!(
+                "{method:?} halo reach: SDR clip {sdr_reach} px, HDR 250 nits {hdr_reach} px"
+            );
+            let ratio = f64::from(hdr_reach.max(1)) / f64::from(sdr_reach.max(1));
+            assert!(
+                ratio.log2().abs() <= 1.0,
+                "{method:?}: SDR {sdr_reach}, HDR {hdr_reach}"
+            );
+        }
         assert_clean();
     }
 
@@ -1155,6 +1165,369 @@ mod glare {
         log::info!("night street halo reach: {lit:?} with glare, {plain:?} without");
         assert!(lit[0] < lit[1] && lit[1] < lit[2], "{lit:?}");
         assert!(plain[0] == plain[1] && plain[1] == plain[2], "{plain:?}");
+        assert_clean();
+    }
+
+    /// The FFT kernel's table and spikes as the GPU reads them.
+    fn fft_kernel() -> fft::Kernel {
+        let bytes = std::fs::read(data::FFT_TABLE_BIN).expect("fft glare table");
+        let floats: Vec<f64> = bytes
+            .chunks_exact(4)
+            .map(|b| f64::from(f32::from_le_bytes(b.try_into().unwrap())))
+            .collect();
+        let mut levels = Vec::new();
+        let mut at = 0;
+        for k in 0..fft::LEVELS {
+            let n = fft::TABLE >> k;
+            levels.push(
+                (at..at + n * n)
+                    .map(|i| [floats[4 * i], floats[4 * i + 1], floats[4 * i + 2]])
+                    .collect(),
+            );
+            at += n * n;
+        }
+        assert_eq!(4 * at, floats.len());
+        fft::Kernel {
+            levels,
+            kappa: data::FFT_KAPPA,
+            spikes: data::FFT_SPIKES.to_vec(),
+        }
+    }
+
+    /// The FFT's image size and kernel radius for `extent`: a quarter of the longer side of
+    /// the image at its resolution, as far as power-of-two padding up to 4096 allows.
+    fn fft_layout(extent: [u32; 2], first_level: u32) -> ([u32; 2], i64) {
+        let size = extent.map(|n| n >> first_level);
+        let share = size[0].max(size[1]).div_ceil(4);
+        let room = |n: u32| ((n + 2 * share).next_power_of_two().min(4096) - n) / 2;
+        (size, i64::from(share.min(room(size[0])).min(room(size[1]))))
+    }
+
+    /// The lens's F-number at the reference pitch on SDR or a 250-nit peak.
+    fn lens_f_number(ev100: f32) -> f64 {
+        (f64::from(ev100).exp2() / 100.0).sqrt().clamp(1.4, 22.0)
+    }
+
+    /// The glare kernel the GPU builds: per pixel within `radius`, the PSF's energy, the
+    /// source pixel's own left out.
+    fn glare_kernel(n: f64, first_level: u32, radius: i64) -> Vec<[f64; 3]> {
+        let kernel = fft_kernel();
+        let u = fft::Kernel::texels(n, first_level);
+        let side = 2 * radius + 1;
+        (0..side * side)
+            .map(|i| {
+                let (dx, dy) = (i % side - radius, i / side - radius);
+                if dx * dx + dy * dy > radius * radius || (dx, dy) == (0, 0) {
+                    [0.0; 3]
+                } else {
+                    kernel.energy(dx, dy, u)
+                }
+            })
+            .collect()
+    }
+
+    /// The exposed radiance the harness rendered, averaged over 2^first_level pixel blocks.
+    fn exposed_blocks(
+        h: &Harness,
+        extent: [u32; 2],
+        first_level: u32,
+        scale: f64,
+    ) -> Vec<[f64; 3]> {
+        let radiance = h.radiance();
+        let f = 1u32 << first_level;
+        let size = extent.map(|n| n >> first_level);
+        (0..size[0] * size[1])
+            .map(|i| {
+                let (x, y) = (i % size[0], i / size[0]);
+                let mut sum = [0.0; 3];
+                for b in 0..f {
+                    for a in 0..f {
+                        let p = radiance[((y * f + b) * extent[0] + x * f + a) as usize];
+                        for c in 0..3 {
+                            let v = f64::from(p[c]) * scale;
+                            sum[c] += if v > 0.0 { v.min(65504.0) } else { 0.0 };
+                        }
+                    }
+                }
+                sum.map(|s| s / f64::from(f * f))
+            })
+            .collect()
+    }
+
+    /// Direct convolution of `image` (`size`) with `kernel` (`radius`), edge pixels repeated.
+    fn convolve(
+        image: &[[f64; 3]],
+        size: [u32; 2],
+        kernel: &[[f64; 3]],
+        radius: i64,
+    ) -> Vec<[f64; 3]> {
+        let [w, h] = size.map(i64::from);
+        let side = 2 * radius + 1;
+        let taps: Vec<(i64, i64, [f64; 3])> = (0..side * side)
+            .filter(|&i| kernel[i as usize] != [0.0; 3])
+            .map(|i| (i % side - radius, i / side - radius, kernel[i as usize]))
+            .collect();
+        (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                let mut sum = [0.0; 3];
+                for &(dx, dy, k) in &taps {
+                    let sx = (x - dx).clamp(0, w - 1);
+                    let sy = (y - dy).clamp(0, h - 1);
+                    let v = image[(sy * w + sx) as usize];
+                    for c in 0..3 {
+                        sum[c] += k[c] * v[c];
+                    }
+                }
+                sum
+            })
+            .collect()
+    }
+
+    fn fft_output(ev100: f32, debug: OutputDebug, first_level: u32) -> ViewOutput {
+        let mut out = output(ev100, debug);
+        out.post.glare = GlareMethod::Fft;
+        out.post.glare_first_level = first_level;
+        out
+    }
+
+    /// The kernel's energy outside each radius against the PSF's, from 2 pixels out to 512,
+    /// at F-numbers across the range and both resolutions. Inside 8 pixels the lattice disc
+    /// the kernel is summed over differs in shape from the PSF's circle, which shows for the
+    /// spikes: up to 0.10 at f/22, where the kernel is the table itself.
+    #[test]
+    fn fft_kernel_matches_psf_encircled_energy() {
+        let kernel = fft_kernel();
+        let reach: i64 = 600;
+        let (mut near, mut far): (f64, f64) = (0.0, 0.0);
+        for first_level in [1, 2] {
+            for n in [1.4, 2.8, 5.6, 8.0, 11.0, 16.0, 22.0] {
+                let u = fft::Kernel::texels(n, first_level);
+                let pitch = f64::from(1u32 << first_level) * data::REFERENCE_PITCH_UM;
+                // Energy and pixel count per squared distance.
+                let mut shells = std::collections::BTreeMap::<i64, ([f64; 3], u64)>::new();
+                let mut total = [0.0; 3];
+                for dy in -reach..=reach {
+                    for dx in -reach..=reach {
+                        let d2 = dx * dx + dy * dy;
+                        if d2 > reach * reach {
+                            continue;
+                        }
+                        let e = kernel.energy(dx, dy, u);
+                        let s = shells.entry(d2).or_default();
+                        for c in 0..3 {
+                            s.0[c] += e[c];
+                            total[c] += e[c];
+                        }
+                        s.1 += 1;
+                    }
+                }
+                let mut inside = [0.0; 3];
+                let mut count = 0;
+                let mut next = 2.0;
+                for (&d2, &(e, k)) in &shells {
+                    for c in 0..3 {
+                        inside[c] += e[c];
+                    }
+                    count += k;
+                    let r = (d2 as f64).sqrt();
+                    if r < next || r > 512.0 {
+                        continue;
+                    }
+                    next = r * 2.0;
+                    let area_radius = (count as f64 / std::f64::consts::PI).sqrt();
+                    let psf = psf::encircled_rgb(
+                        &data::EE,
+                        data::EE_TAIL,
+                        &data::SPECTRAL,
+                        area_radius,
+                        n,
+                        pitch,
+                    );
+                    for c in 0..3 {
+                        let error = ((1.0 - inside[c]) / (1.0 - psf[c]) - 1.0).abs();
+                        let worst = if r < 8.0 { &mut near } else { &mut far };
+                        *worst = worst.max(error);
+                    }
+                }
+                for (total, kappa) in total.iter().zip(kernel.kappa) {
+                    // Each spike past the reach carries kappa / distance.
+                    let past = kappa * kernel.spikes.len() as f64 / (reach as f64 * u);
+                    assert!(
+                        (total + past - 1.0).abs() < 1e-4,
+                        "level {first_level} f/{n}: {total} inside, {past} past"
+                    );
+                }
+            }
+        }
+        log::info!(
+            "fft kernel: energy outside a radius within {near:.3} of the PSF's inside 8 pixels, {far:.3} past"
+        );
+        assert!(near < 0.12 && far < 0.02, "{near}, {far}");
+    }
+
+    #[test]
+    fn fft_convolution_matches_direct_convolution() {
+        let extent = [320, 192];
+        let mut h = harness(extent, Some(0.8));
+        let ev = ev_at(5) + 0.37;
+        let nits = scene(
+            extent,
+            200.0,
+            &[
+                ([80, 60], 4e6),
+                ([81, 60], 2e6),
+                ([240, 140], 6e6),
+                ([319, 191], 1e6),
+                ([3, 100], 3e6),
+            ],
+        );
+        for first_level in [1, 2] {
+            let out = fft_output(ev, OutputDebug::Linear, first_level);
+            let (_, exposure, pre) = settle(&mut h, &nits, &out, &hdr(250.0));
+            let (size, radius) = fft_layout(extent, first_level);
+            let kernel = glare_kernel(lens_f_number(ev), first_level, radius);
+            let input = exposed_blocks(&h, extent, first_level, exposure / pre);
+            let cpu = convolve(&input, size, &kernel, radius);
+            let gpu = read_rgba16f(h.output().glare().expect("glare ran"));
+            let mut error = [0.0; 3];
+            let mut energy = [0.0; 3];
+            for ((g, c), i) in gpu.iter().zip(&cpu).zip(&input) {
+                for k in 0..3 {
+                    error[k] += (f64::from(g[k]) - 0.8 * c[k]).abs();
+                    energy[k] += i[k];
+                }
+            }
+            let w0 = weights(&h)[0];
+            for k in 0..3 {
+                let relative = error[k] / energy[k];
+                log::info!(
+                    "first level {first_level}, channel {k}: error {relative:.2e} of the energy"
+                );
+                assert!(
+                    relative < 1e-3,
+                    "first level {first_level}, channel {k}: {relative}"
+                );
+                let sum: f64 = kernel.iter().map(|e| e[k]).sum();
+                assert!(
+                    (w0[k] - (1.0 - 0.8 * sum)).abs() < 1e-5,
+                    "w0 {w0:?}, kernel {sum}"
+                );
+            }
+        }
+        assert_clean();
+    }
+
+    #[test]
+    fn fft_uniform_field_is_unchanged() {
+        let extent = [200, 120];
+        let nits = vec![900.0; 200 * 120];
+        let out = fft_output(ev_at(7), OutputDebug::Linear, 1);
+        let (plain, ..) = settle(&mut harness(extent, None), &nits, &out, &hdr(250.0));
+        let (glared, ..) = settle(&mut harness(extent, Some(1.0)), &nits, &out, &hdr(250.0));
+        let mut worst: f64 = 0.0;
+        for (a, b) in plain.iter().zip(&glared) {
+            for k in 0..3 {
+                worst = worst.max((b[k] / a[k] - 1.0).abs());
+            }
+        }
+        log::info!("fft uniform field: worst relative change {worst:.2e}");
+        assert!(worst < 1e-3, "{worst}");
+        assert_clean();
+    }
+
+    #[test]
+    fn fft_point_source_keeps_energy() {
+        let extent = [512, 512];
+        let ev = ev_at(6);
+        let mut nits = vec![0.0; 512 * 512];
+        let source = EXPOSED * 1.2 * ev.exp2();
+        nits[256 * 512 + 256] = source;
+        let out = fft_output(ev, OutputDebug::Linear, 1);
+        let (image, exposure, _) =
+            settle(&mut harness(extent, Some(1.0)), &nits, &out, &hdr(250.0));
+        let energy = f64::from(source) * exposure;
+        for k in 0..3 {
+            let sum: f64 = image.iter().map(|p| p[k]).sum();
+            log::info!(
+                "fft point source: channel {k} keeps {:.5} of its energy",
+                sum / energy
+            );
+            assert!((sum / energy - 1.0).abs() < 1e-3, "{k}: {}", sum / energy);
+        }
+        assert_clean();
+    }
+
+    /// A point source's glare peaks once per spike around it, inside the kernel table's
+    /// reach and past it, along the edges' normals.
+    #[test]
+    fn fft_spikes_match_the_blades() {
+        let extent = [512, 512];
+        let ev = ev_at(6);
+        let mut nits = vec![0.0; 512 * 512];
+        nits[256 * 512 + 256] = EXPOSED * 1.2 * ev.exp2();
+        let mut h = harness(extent, Some(1.0));
+        let out = fft_output(ev, OutputDebug::Linear, 1);
+        settle(&mut h, &nits, &out, &hdr(250.0));
+        let glare = read_rgba16f(h.output().glare().expect("glare ran"));
+        let side = 256;
+        let at = |x: f64, y: f64| {
+            let (x0, y0) = (x.floor(), y.floor());
+            let (fx, fy) = (x - x0, y - y0);
+            let p = |x: f64, y: f64| f64::from(glare[y as usize * side + x as usize][1]);
+            p(x0, y0) * (1.0 - fx) * (1.0 - fy)
+                + p(x0 + 1.0, y0) * fx * (1.0 - fy)
+                + p(x0, y0 + 1.0) * (1.0 - fx) * fy
+                + p(x0 + 1.0, y0 + 1.0) * fx * fy
+        };
+        let table = fft::TABLE as f64 / fft::Kernel::texels(lens_f_number(ev), 1);
+        let steps = 1440;
+        for radius in [0.6 * table, 1.5 * table] {
+            let ring: Vec<f64> = (0..steps)
+                .map(|i| {
+                    let a = std::f64::consts::TAU * i as f64 / steps as f64;
+                    at(128.0 + radius * a.cos(), 128.0 + radius * a.sin())
+                })
+                .collect();
+            let max = ring.iter().copied().fold(0.0, f64::max);
+            let peaks: Vec<f64> = (0..steps)
+                .filter(|&i| {
+                    let v = ring[i];
+                    v > 0.05 * max
+                        && (1..=8).all(|d| {
+                            v > ring[(i + d) % steps] && v >= ring[(i + steps - d) % steps]
+                        })
+                })
+                .map(|i| 360.0 * i as f64 / steps as f64)
+                .collect();
+            log::info!("fft spikes at radius {radius:.1}: peaks at {peaks:?} degrees");
+            assert_eq!(peaks.len(), data::BLADES as usize, "{radius}: {peaks:?}");
+            for p in &peaks {
+                let off = (p - 30.0).rem_euclid(60.0);
+                assert!(off.min(60.0 - off) < 1.0, "{radius}: {peaks:?}");
+            }
+        }
+        assert_clean();
+    }
+
+    #[test]
+    fn fft_glare_frees_its_buffers() {
+        let extent = [128, 128];
+        let nits = vec![1.0; 128 * 128];
+        let mut h = harness(extent, Some(1.0));
+        settle(&mut h, &nits, &output(10.0, OutputDebug::None), &sdr());
+        let bands = h.output().glare_bytes();
+        let fft = fft_output(10.0, OutputDebug::None, 1);
+        settle(&mut h, &nits, &fft, &sdr());
+        let fft_bytes = h.output().glare_bytes();
+        assert!(
+            fft_bytes > bands && bands > 0,
+            "bands {bands}, fft {fft_bytes}"
+        );
+        assert_eq!(h.glare_weights().map(|w| w.len()), Some(1));
+        h.glare = None;
+        settle(&mut h, &nits, &fft, &sdr());
+        assert_eq!(h.output().glare_bytes(), 0);
         assert_clean();
     }
 }

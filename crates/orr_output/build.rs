@@ -3,8 +3,10 @@
 //! matching functions, D65 weighted, in Rec.2020) against the pyramid's kernels, into
 //! `OUT_DIR/glare_tables.rs`. The PSF data the output suite checks the fit with goes to
 //! `OUT_DIR/glare_psf.rs`, published with the CPU model's directory as `glare_psf` and
-//! `glare_model`. With the `pcl-stats` feature on Windows it also builds the PCL Stats shim
-//! against `pclstats.h` from the Reflex SDK at `REFLEX_SDK`.
+//! `glare_model`. The FFT glare's kernel table (`build/fft.rs`) goes to
+//! `OUT_DIR/glare_fft_table.bin`, its far-field terms to `OUT_DIR/glare_fft.rs`. With the
+//! `pcl-stats` feature on Windows it also builds the PCL Stats shim against `pclstats.h` from
+//! the Reflex SDK at `REFLEX_SDK`.
 
 use std::env;
 use std::fmt::Write as _;
@@ -14,6 +16,9 @@ use std::path::{Path, PathBuf};
 use orr_color::RgbPrimaries;
 use orr_shaders::build::{Build, fetched};
 
+#[allow(dead_code, unreachable_pub)]
+#[path = "build/fft.rs"]
+mod fft;
 #[allow(unreachable_pub)]
 #[path = "build/fit.rs"]
 mod fit;
@@ -82,7 +87,8 @@ fn glare(manifest: &Path, out_dir: &Path) {
     let d65 = fetched("ORR_CIE_D65", "cie/CIE_std_illum_D65.csv").unwrap_or_else(|e| panic!("{e}"));
     let spectral = spectral(&sky.join("atmosphere/constants.h"), &d65);
 
-    let (ee, tail) = psf::Diaphragm::new(GLARE_BLADES).encircled();
+    let diaphragm = psf::Diaphragm::new(GLARE_BLADES);
+    let (ee, tail) = diaphragm.encircled();
     let tables = fit::tables(&ee, tail, &spectral);
     let entries = pyramid::LAST_LEVEL as usize + 1;
 
@@ -140,6 +146,45 @@ fn glare(manifest: &Path, out_dir: &Path) {
     writeln!(
         rs,
         "pub static TABLES: [[[[f64; 3]; {entries}]; {n}]; 2] = {tables:?};"
+    )
+    .unwrap();
+    let kernel = fft::Kernel::compute(&diaphragm, &spectral, fit::REFERENCE_PITCH_UM);
+    let kappa = kernel.kappa.map(|k| k as f32);
+    let spikes: Vec<[f32; 2]> = kernel.spikes.iter().map(|s| s.map(|c| c as f32)).collect();
+    let table_path = out_dir.join("glare_fft_table.bin");
+    let bytes: Vec<u8> = kernel
+        .levels
+        .iter()
+        .flatten()
+        .flat_map(|e| [e[0] as f32, e[1] as f32, e[2] as f32, 0.0])
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    fs::write(&table_path, bytes).unwrap_or_else(|e| panic!("{}: {e}", table_path.display()));
+    let fft_rs = format!(
+        "pub(crate) const GLARE_FFT_KAPPA: [f32; 3] = {kappa:?};\n\
+         pub(crate) const GLARE_FFT_SPIKES: [[f32; 2]; {}] = {spikes:?};\n\
+         pub(crate) const GLARE_FFT_TABLE: usize = {};\n\
+         pub(crate) const GLARE_FFT_LEVELS: usize = {};\n\
+         pub(crate) const GLARE_FFT_BOX_TEXELS: f64 = {:?};\n\
+         pub(crate) const GLARE_FFT_REFERENCE_F: f64 = {:?};\n\
+         pub(crate) const GLARE_FFT_TEXELS_PER_PIXEL: f64 = {:?};\n",
+        spikes.len(),
+        fft::TABLE,
+        fft::LEVELS,
+        fft::BOX_TEXELS,
+        fft::REFERENCE_F,
+        fft::TEXELS_PER_PIXEL,
+    );
+    write(&out_dir.join("glare_fft.rs"), &fft_rs);
+    let kappa64 = kappa.map(f64::from);
+    let spikes64: Vec<[f64; 2]> = spikes.iter().map(|s| s.map(f64::from)).collect();
+    writeln!(
+        rs,
+        "pub const FFT_KAPPA: [f64; 3] = {kappa64:?};\n\
+         pub static FFT_SPIKES: [[f64; 2]; {}] = {spikes64:?};\n\
+         pub const FFT_TABLE_BIN: &str = {:?};",
+        spikes64.len(),
+        table_path.display().to_string()
     )
     .unwrap();
     let psf_path = out_dir.join("glare_psf.rs");

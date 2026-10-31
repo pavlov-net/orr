@@ -72,6 +72,30 @@ impl Diaphragm {
         (re * re + im * im) / (q2 * q2) / self.area
     }
 
+    // Unit directions of the diffraction spikes, which run along the edges' normals: one
+    // per blade for even counts, whose opposite edges share a normal, two for odd.
+    pub fn spikes(&self) -> Vec<[f64; 2]> {
+        let n = self.vertices.len();
+        let mut out: Vec<[f64; 2]> = Vec::new();
+        for j in 0..n {
+            let a = self.vertices[j];
+            let b = self.vertices[(j + 1) % n];
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let len = dx.hypot(dy);
+            for s in [1.0, -1.0] {
+                let d =
+                    [s * dy / len, -s * dx / len].map(|c| if c.abs() < 1e-12 { 0.0 } else { c });
+                if !out
+                    .iter()
+                    .any(|o| (o[0] - d[0]).abs() + (o[1] - d[1]).abs() < 1e-9)
+                {
+                    out.push(d);
+                }
+            }
+        }
+        out
+    }
+
     // The PSF averaged over directions at radius `rho`, with enough directions to resolve
     // the edge spikes, whose width falls as 1 / rho.
     fn azimuthal(&self, rho: f64) -> f64 {
