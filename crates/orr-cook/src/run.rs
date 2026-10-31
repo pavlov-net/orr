@@ -23,6 +23,7 @@ use orr_pack::texture::TextureInfo;
 use orr_pack::{Aabb, Archive, ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span, Target};
 
 use crate::cache::Cache;
+use crate::import::Scene;
 use crate::instances::{self, Catalog, ModelFacts};
 use crate::key::{self, Key, ZSTD_LEVEL};
 use crate::mesh::maps::{Displacement, Opacity, Raster};
@@ -34,13 +35,13 @@ use crate::raster::{self, RasterReport};
 use crate::report::{self, ArchiveReport, AssetReport, Outcome};
 use crate::state::{self, Input, Memo, Record};
 use crate::texture::material::{
-    ImageFacts, ImageFile, MaterialTextures, Packer, TexRef, TextureJob, image_facts,
+    ImageFacts, ImageFile, MaterialTextures, Packer, TexRef, TextureJob, TextureRules, image_facts,
 };
 use crate::texture::neural::{self, NeuralJob};
 use crate::texture::{self, ENCODERS, Wrap};
 use crate::{
     CookOptions, Cooked, Error, GltfSettings, Instances, Manifest, MeshSettings, Placement,
-    PrototypeSpec, Result, Source, TextureSettings, mount,
+    PrototypeSpec, Result, Source, TextureSettings, UsdSettings, mount,
 };
 
 /// Peak bytes of a mesh cook per source triangle (P2's clodBuild process peak, an upper
@@ -151,14 +152,24 @@ struct Old {
     by_key: HashMap<Hash32, Vec<usize>>,
 }
 
-/// A glTF source to import.
+/// A scene or material document to import.
 struct Import<'m> {
     archive: usize,
     asset: usize,
     name: &'m str,
     path: &'m Path,
-    settings: &'m GltfSettings,
+    kind: ImportKind<'m>,
     identity: Hash32,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum ImportKind<'m> {
+    Gltf(&'m GltfSettings),
+    Usd(&'m UsdSettings),
+    MaterialX {
+        material: &'m str,
+        textures: &'m TextureRules,
+    },
 }
 
 /// A unit an import made; `deps` name units of the same import.
@@ -200,7 +211,7 @@ struct PendingInstances<'m> {
     asset: usize,
     name: String,
     src: Cow<'m, Instances>,
-    /// The glTF source record the unit's key joins: (archive, record).
+    /// The scene source record the unit's key joins: (archive, record).
     record: Option<(usize, usize)>,
 }
 
@@ -232,7 +243,7 @@ struct Run<'m, 's> {
     order: Vec<Vec<usize>>,
     cursor: Vec<usize>,
     writers: Vec<Option<ArchiveWriter>>,
-    /// Per archive: records of its glTF sources and every input file, for the cookstate.
+    /// Per archive: records of its scene sources and every input file, for the cookstate.
     records: Vec<Vec<Record>>,
     files: Vec<Vec<PathBuf>>,
     imports: Vec<Import<'m>>,
@@ -319,24 +330,18 @@ impl<'m, 's> Run<'m, 's> {
         });
         match &asset.source {
             Source::Gltf { path, settings } => {
-                let identity = Key::new(0u16, name)
-                    .hash(key::salt())
-                    .str(&path.to_string_lossy())
-                    .debug(settings)
-                    .finish();
-                if let Some(record) = previous.get(&identity)
-                    && self.link_record(a, index, record)?
-                {
-                    return Ok(());
-                }
-                self.imports.push(Import {
-                    archive: a,
-                    asset: index,
-                    name,
-                    path,
-                    settings,
-                    identity,
-                });
+                self.queue_import(a, index, name, path, ImportKind::Gltf(settings), previous)?;
+            }
+            Source::Usd { path, settings } => {
+                self.queue_import(a, index, name, path, ImportKind::Usd(settings), previous)?;
+            }
+            Source::MaterialX {
+                path,
+                material,
+                textures,
+            } => {
+                let kind = ImportKind::MaterialX { material, textures };
+                self.queue_import(a, index, name, path, kind, previous)?;
             }
             Source::Texture { path, settings } => {
                 let hash = self.shared.memo.hash(path)?;
@@ -414,6 +419,37 @@ impl<'m, 's> Run<'m, 's> {
                 self.add_units(a, index, vec![material_unit(name.into(), &m)]);
             }
         }
+        Ok(())
+    }
+
+    /// Links a scene source's recorded units, or queues it for import.
+    fn queue_import(
+        &mut self,
+        a: usize,
+        asset: usize,
+        name: &'m str,
+        path: &'m Path,
+        kind: ImportKind<'m>,
+        previous: &HashMap<Hash32, Record>,
+    ) -> Result<()> {
+        let identity = Key::new(0u16, name)
+            .hash(key::salt())
+            .str(&path.to_string_lossy())
+            .debug(&kind)
+            .finish();
+        if let Some(record) = previous.get(&identity)
+            && self.link_record(a, asset, record)?
+        {
+            return Ok(());
+        }
+        self.imports.push(Import {
+            archive: a,
+            asset,
+            name,
+            path,
+            kind,
+            identity,
+        });
         Ok(())
     }
 
@@ -570,7 +606,7 @@ impl<'m, 's> Run<'m, 's> {
         self.cook_all(scope, threads, &tx, &rx)
     }
 
-    /// Imports every changed glTF source, largest file first.
+    /// Imports every changed scene source, largest file first.
     fn import_all(
         &mut self,
         scope: &rayon::Scope<'m>,
@@ -601,11 +637,10 @@ impl<'m, 's> Run<'m, 's> {
                 bytes += ws;
                 let (tx, shared) = (tx.clone(), self.shared);
                 let imp = &self.imports[i];
-                let (name, path, settings) = (imp.name, imp.path, imp.settings);
+                let (name, path, kind) = (imp.name, imp.path, imp.kind);
                 scope.spawn(move |_| {
-                    let r = catch_unwind(AssertUnwindSafe(|| {
-                        import_gltf(name, path, settings, &shared.memo)
-                    }));
+                    let r =
+                        catch_unwind(AssertUnwindSafe(|| import(name, path, kind, &shared.memo)));
                     let _ = tx.send(Msg::Import(i, r));
                 });
             }
@@ -1210,19 +1245,45 @@ fn texture_file_working_set(path: &Path) -> u64 {
         )
 }
 
-/// Imports a glTF file and plans its units: the skeleton and clips, the packed textures, the
+/// Imports a scene or material document and plans its units.
+fn import(name: &str, path: &Path, kind: ImportKind<'_>, memo: &Memo) -> Result<Imported> {
+    let (scene, rules) = match kind {
+        ImportKind::Gltf(s) => (crate::gltf::import(name, path, memo, s)?, &s.textures),
+        ImportKind::Usd(s) => (crate::usd::import(name, path, s)?, &s.textures),
+        ImportKind::MaterialX { material, textures } => (
+            crate::materialx::import(name, path, memo, material)?,
+            textures,
+        ),
+    };
+    plan_scene(name, scene, rules)
+}
+
+/// The entry name of material `suffix` of asset `name`.
+fn material_name(name: &str, suffix: &str) -> String {
+    if suffix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name}/material/{suffix}")
+    }
+}
+
+/// Plans an imported scene's units: the skeletons and clips, the packed textures, the
 /// materials, and a mesh and a model per model.
-fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) -> Result<Imported> {
-    let mut src = crate::gltf::import(name, path, memo, settings)?;
+fn plan_scene(name: &str, mut src: Scene, rules: &TextureRules) -> Result<Imported> {
     let mut units = Vec::new();
-    let mut skeleton = (AssetId::NONE, None);
-    if let Some(info) = src.skeleton.take() {
-        let skeleton_name = format!("{name}/skeleton");
-        let bytes = info.to_bytes();
+    let mut skeletons = Vec::with_capacity(src.skeletons.len());
+    for sk in std::mem::take(&mut src.skeletons) {
+        let prefix = match sk.prefix.as_str() {
+            "" => name.to_string(),
+            p => format!("{name}/{p}"),
+        };
+        let skeleton_name = format!("{prefix}/skeleton");
+        let bytes = sk.info.to_bytes();
         let key = Key::new(Class::Skeleton, &skeleton_name)
             .bytes(&bytes)
             .finish();
-        skeleton = (AssetId::from_name(&skeleton_name), Some(key));
+        let skeleton = (AssetId::from_name(&skeleton_name), Some(key));
+        skeletons.push(skeleton);
         let working_set = bytes.len() as u64;
         let work = Work::Blobs {
             schema: orr_pack::skeleton::SCHEMA,
@@ -1230,9 +1291,9 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
         };
         let class = Class::Skeleton as u16;
         units.push(NewUnit::leaf(&skeleton_name, class, key, working_set, work));
-        for (clip_name, mut clip) in std::mem::take(&mut src.clips) {
+        for (clip_name, mut clip) in sk.clips {
             clip.header.skeleton = skeleton.0;
-            let clip_name = format!("{name}/clip/{clip_name}");
+            let clip_name = format!("{prefix}/clip/{clip_name}");
             let (head, samples) = clip.to_bytes();
             let key = Key::new(Class::Clip, &clip_name)
                 .bytes(&head)
@@ -1256,13 +1317,13 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
     used.sort_unstable();
     used.dedup();
     let facts: HashMap<usize, ImageFacts> = image_facts(name, &src.images, &used)?;
-    let mut packer = Packer::new(name, &src.images, &facts, &settings.textures);
+    let mut packer = Packer::new(name, &src.images, &facts, rules);
     // Per material: its id, key and cooked parameters.
     let mut materials = Vec::new();
     for m in &src.materials {
         let mut cooked = m.material;
         packer.material(&m.suffix, &mut cooked, &m.textures)?;
-        let unit = material_unit(format!("{name}/material/{}", m.suffix), &cooked);
+        let unit = material_unit(material_name(name, &m.suffix), &cooked);
         materials.push((AssetId::from_name(&unit.name), unit.key, cooked));
         units.push(unit);
     }
@@ -1304,7 +1365,7 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
                     m.displacement_min = 0.0;
                     m.displacement_max = 0.0;
                     let suffix = &src.materials[mi].suffix;
-                    let unit = material_unit(format!("{name}/material/{suffix}/static"), &m);
+                    let unit = material_unit(format!("{}/static", material_name(name, suffix)), &m);
                     let id = (AssetId::from_name(&unit.name), unit.key);
                     units.push(unit);
                     id
@@ -1315,6 +1376,9 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
         }
         deps.sort_unstable();
         deps.dedup();
+        let skeleton = model
+            .skeleton
+            .map_or((AssetId::NONE, None), |s| skeletons[s]);
         units.extend(mesh_and_model(
             model_name,
             mesh_name,
@@ -1326,7 +1390,7 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
         ));
     }
     let instances = (!src.instances.is_empty())
-        .then(|| gltf_instances(name, &src.instances))
+        .then(|| scene_instances(name, &src.instances))
         .transpose()?;
     let images = Arc::new(src.images);
     for job in jobs {
@@ -1348,9 +1412,9 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
     })
 }
 
-/// The instance source of a glTF file's instanced models: one prototype per model, a
-/// placement per instance.
-fn gltf_instances(name: &str, models: &[(String, Vec<glam::Mat4>)]) -> Result<Instances> {
+/// The instance source of a scene's instanced models: one prototype per model, a placement
+/// per instance.
+fn scene_instances(name: &str, models: &[(String, Vec<glam::Mat4>)]) -> Result<Instances> {
     let mut src = Instances::default();
     for (p, (node, transforms)) in models.iter().enumerate() {
         src.prototypes.push(PrototypeSpec {
@@ -1409,7 +1473,7 @@ fn map_spec(
             unit: unit.clone(),
             key: *key,
             cutoff: m.alpha_cutoff,
-            wrap: wrap(t.base_color.as_ref()),
+            wrap: wrap(t.opacity.as_ref()),
         },
         (Material::MASK, Some(_)) => OpacitySpec::Unknown,
         _ => OpacitySpec::None,

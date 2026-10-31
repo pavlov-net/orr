@@ -66,28 +66,31 @@ pub struct TextureOverride {
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct TexRef {
     pub image: usize,
+    /// The source channel of a scalar input; color inputs read RGB.
+    pub channel: u8,
     pub uv_set: u8,
     pub wrap: [Wrap; 2],
+    /// Whether color texels are sRGB-encoded; `None` takes the file's own encoding.
+    pub srgb: Option<bool>,
 }
 
-/// The images one glTF material reads.
+/// The images one material reads, per input.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MaterialTextures {
     pub base_color: Option<TexRef>,
-    /// Roughness in G, metalness in B.
-    pub metal_rough: Option<TexRef>,
-    pub normal: Option<(TexRef, f32)>,
+    /// Read under `MASK` and `BLEND` only.
+    pub opacity: Option<TexRef>,
+    pub roughness: Option<TexRef>,
+    pub metalness: Option<TexRef>,
+    /// With its scale per tangent axis; a negative scale flips the axis.
+    pub normal: Option<(TexRef, [f32; 2])>,
     /// With its strength.
     pub occlusion: Option<(TexRef, f32)>,
     pub emissive: Option<TexRef>,
-    /// Specular weight in A.
     pub specular: Option<TexRef>,
-    /// Coat weight in R.
     pub coat: Option<TexRef>,
-    /// Transmission weight in R.
     pub transmission: Option<TexRef>,
     pub subsurface_color: Option<TexRef>,
-    /// Displacement in R.
     pub displacement: Option<TexRef>,
 }
 
@@ -96,7 +99,9 @@ impl MaterialTextures {
     pub(crate) fn refs(&self) -> impl Iterator<Item = &TexRef> {
         [
             self.base_color.as_ref(),
-            self.metal_rough.as_ref(),
+            self.opacity.as_ref(),
+            self.roughness.as_ref(),
+            self.metalness.as_ref(),
             self.normal.as_ref().map(|n| &n.0),
             self.occlusion.as_ref().map(|o| &o.0),
             self.emissive.as_ref(),
@@ -290,7 +295,7 @@ impl<'a> Packer<'a> {
         t: &MaterialTextures,
     ) -> Result<()> {
         if let Some(r) = &t.base_color {
-            let srgb = self.image(r.image).srgb;
+            let srgb = r.srgb.unwrap_or(self.image(r.image).srgb);
             let rgb: Vec<Option<f32>> = (0..3).map(|c| self.constant(r.image, c)).collect();
             if rgb.iter().all(Option::is_some) {
                 for (c, v) in rgb.into_iter().enumerate() {
@@ -320,34 +325,36 @@ impl<'a> Packer<'a> {
                 )?;
                 bind(m, slot::BASE_COLOR, id, 0, r);
             }
-            if m.alpha_mode != Material::OPAQUE {
-                match self.constant(r.image, 3) {
-                    Some(a) => m.geometry_opacity *= a,
-                    None => {
-                        let coverage =
-                            (m.alpha_mode == Material::MASK).then_some((0, m.alpha_cutoff));
-                        let id = self.make(
-                            suffix,
-                            Pack {
-                                role: "opacity",
-                                encoding: Encoding::Bc4,
-                                channels: vec![Channel::Image {
-                                    image: r.image,
-                                    channel: 3,
-                                    srgb: false,
-                                    a: 0.0,
-                                    b: m.geometry_opacity,
-                                }],
-                                refs: vec![*r],
-                                coverage,
-                                toksvig: None,
-                                normal: false,
-                                shrink: false,
-                            },
-                        )?;
-                        m.geometry_opacity = 1.0;
-                        bind(m, slot::OPACITY, id, 0, r);
-                    }
+        }
+        if m.alpha_mode != Material::OPAQUE
+            && let Some(r) = &t.opacity
+        {
+            let channel = usize::from(r.channel);
+            match self.constant(r.image, channel) {
+                Some(a) => m.geometry_opacity *= a,
+                None => {
+                    let coverage = (m.alpha_mode == Material::MASK).then_some((0, m.alpha_cutoff));
+                    let id = self.make(
+                        suffix,
+                        Pack {
+                            role: "opacity",
+                            encoding: Encoding::Bc4,
+                            channels: vec![Channel::Image {
+                                image: r.image,
+                                channel,
+                                srgb: false,
+                                a: 0.0,
+                                b: m.geometry_opacity,
+                            }],
+                            refs: vec![*r],
+                            coverage,
+                            toksvig: None,
+                            normal: false,
+                            shrink: false,
+                        },
+                    )?;
+                    m.geometry_opacity = 1.0;
+                    bind(m, slot::OPACITY, id, 0, r);
                 }
             }
         }
@@ -374,8 +381,8 @@ impl<'a> Packer<'a> {
                         role: "normal",
                         encoding: Encoding::Bc5,
                         channels: vec![
-                            channel(0, *scale),
-                            channel(1, *scale),
+                            channel(0, scale[0]),
+                            channel(1, scale[1]),
                             channel(2, 1.0),
                             Channel::Constant(1.0),
                         ],
@@ -388,25 +395,28 @@ impl<'a> Packer<'a> {
                 )?;
                 bind(m, slot::NORMAL, id, 0, r);
                 if consts.iter().any(Option::is_none) {
-                    normal_packed = Some((*r, *scale));
+                    normal_packed = Some((*r, scale[0]));
                 }
             }
         }
 
-        // Roughness, metalness, occlusion; specular weight has no glTF core source.
-        let mr = t.metal_rough;
-        let (rough_const, metal_const) = match &mr {
-            Some(r) => (self.constant(r.image, 1), self.constant(r.image, 2)),
-            None => (Some(1.0), Some(1.0)),
+        // Roughness, metalness, occlusion.
+        let (rough, metal) = (t.roughness, t.metalness);
+        let constant = |r: &Option<TexRef>| match r {
+            Some(r) => self.constant(r.image, usize::from(r.channel)),
+            None => Some(1.0),
         };
+        let (rough_const, metal_const) = (constant(&rough), constant(&metal));
         let rough_varies = rough_const.is_none() || normal_packed.is_some();
         let metal_varies = metal_const.is_none();
-        let occ = t.occlusion.map(|(r, s)| (r, s, self.constant(r.image, 0)));
+        let occ = t
+            .occlusion
+            .map(|(r, s)| (r, s, self.constant(r.image, usize::from(r.channel))));
         let occ_varies = occ.as_ref().is_some_and(|o| o.2.is_none());
-        let rough_channel = |m: &Material| match (&mr, rough_const) {
+        let rough_channel = |m: &Material| match (&rough, rough_const) {
             (Some(r), None) => Channel::Image {
                 image: r.image,
-                channel: 1,
+                channel: usize::from(r.channel),
                 srgb: false,
                 a: 0.0,
                 b: m.specular_roughness,
@@ -421,45 +431,50 @@ impl<'a> Packer<'a> {
         }
         let occ_channel = |o: &(TexRef, f32, Option<f32>)| Channel::Image {
             image: o.0.image,
-            channel: 0,
+            channel: usize::from(o.0.channel),
             srgb: false,
             a: 1.0 - o.1,
             b: o.1,
         };
         let metal_channel = |m: &Material, r: &TexRef| Channel::Image {
             image: r.image,
-            channel: 2,
+            channel: usize::from(r.channel),
             srgb: false,
             a: 0.0,
             b: m.metalness,
         };
-        let mut rm = Vec::new();
-        let mut refs: Vec<TexRef> = Vec::new();
+        let normal_ref = normal_packed.as_ref().map(|n| n.0);
+        // Per texture: its (slot, source) channels and the references it samples like.
+        // Roughness and metalness share one texture when they sample alike.
+        type Slots = Vec<(usize, Channel)>;
+        let mut packs: Vec<(Slots, Vec<TexRef>)> = Vec::new();
         if rough_varies {
-            rm.push(("roughness", slot::ROUGHNESS, rough_channel(m)));
-            refs.extend(mr);
+            let refs = rough.or(normal_ref).into_iter().collect();
+            packs.push((vec![(slot::ROUGHNESS, rough_channel(m))], refs));
         }
         if metal_varies {
-            let r = mr.expect("varying metalness has an image");
-            rm.push(("metalness", slot::METALNESS, metal_channel(m, &r)));
-            if refs.is_empty() {
-                refs.push(r);
+            let r = metal.expect("varying metalness has an image");
+            let entry = (slot::METALNESS, metal_channel(m, &r));
+            let alike = |a: &TexRef| a.uv_set == r.uv_set && a.wrap == r.wrap;
+            match packs.first_mut() {
+                Some((channels, refs)) if refs.first().is_none_or(alike) => {
+                    channels.push(entry);
+                    if refs.is_empty() {
+                        refs.push(r);
+                    }
+                }
+                _ => packs.push((vec![entry], vec![r])),
             }
         }
-        let normal_ref = normal_packed.as_ref().map(|n| n.0);
-        if let Some(n) = normal_ref
-            && refs.is_empty()
-        {
-            refs.push(n);
-        }
-        if !rm.is_empty() {
-            let (encoding, role) = match rm.len() {
-                1 => (Encoding::Bc4, rm[0].0),
+        for (rm, refs) in packs {
+            let (encoding, role) = match rm.as_slice() {
+                [(slot::ROUGHNESS, _)] => (Encoding::Bc4, "roughness"),
+                [_] => (Encoding::Bc4, "metalness"),
                 _ => (Encoding::Bc5, "roughness_metalness"),
             };
-            let mut channels: Vec<Channel> = rm.iter().map(|c| c.2).collect();
+            let mut channels: Vec<Channel> = rm.iter().map(|c| c.1).collect();
             channels.resize(4, Channel::Constant(0.0));
-            let toksvig = match (&normal_packed, rough_varies) {
+            let toksvig = match (&normal_packed, rm[0].0 == slot::ROUGHNESS) {
                 (Some((r, s)), true) => Some((0, *r, *s)),
                 _ => None,
             };
@@ -476,15 +491,13 @@ impl<'a> Packer<'a> {
                     shrink: false,
                 },
             )?;
-            let uv = refs[0];
-            for (i, (_, s, _)) in rm.iter().enumerate() {
-                bind(m, *s, id, i as u8, &uv);
-            }
-            if rough_varies {
-                m.specular_roughness = 1.0;
-            }
-            if metal_varies {
-                m.metalness = 1.0;
+            for (i, (s, _)) in rm.iter().enumerate() {
+                bind(m, *s, id, i as u8, &refs[0]);
+                if *s == slot::ROUGHNESS {
+                    m.specular_roughness = 1.0;
+                } else {
+                    m.metalness = 1.0;
+                }
             }
         }
         if let Some(o) = &occ
@@ -522,10 +535,10 @@ impl<'a> Packer<'a> {
             )?;
         }
         if let Some(r) = &t.specular {
-            match self.constant(r.image, 3) {
+            match self.constant(r.image, usize::from(r.channel)) {
                 Some(v) => m.specular_weight *= v,
                 None => {
-                    let id = self.single(suffix, r, 3, 1.0, "specular_weight")?;
+                    let id = self.single(suffix, r, 1.0, "specular_weight")?;
                     bind(m, slot::SPECULAR_WEIGHT, id, 0, r);
                 }
             }
@@ -540,10 +553,10 @@ impl<'a> Packer<'a> {
         for (r, role, s, weight) in weights {
             let Some(r) = r else { continue };
             let factor = *weight(m);
-            *weight(m) = match self.constant(r.image, 0) {
+            *weight(m) = match self.constant(r.image, usize::from(r.channel)) {
                 Some(v) => factor * v,
                 None => {
-                    let id = self.single(suffix, r, 0, factor, role)?;
+                    let id = self.single(suffix, r, factor, role)?;
                     bind(m, s, id, 0, r);
                     1.0
                 }
@@ -557,7 +570,7 @@ impl<'a> Packer<'a> {
                     encoding: Encoding::Raw(DataFormat::R16),
                     channels: vec![Channel::Image {
                         image: r.image,
-                        channel: 0,
+                        channel: usize::from(r.channel),
                         srgb: false,
                         a: 0.0,
                         b: 1.0,
@@ -566,7 +579,7 @@ impl<'a> Packer<'a> {
                     coverage: None,
                     toksvig: None,
                     normal: false,
-                    shrink: self.constant(r.image, 0).is_some(),
+                    shrink: self.constant(r.image, usize::from(r.channel)).is_some(),
                 },
             )?;
             bind(m, slot::DISPLACEMENT, id, 0, r);
@@ -607,7 +620,7 @@ impl<'a> Packer<'a> {
         s: usize,
         colour: fn(&mut Material) -> &mut [f32; 3],
     ) -> Result<()> {
-        let srgb = self.image(r.image).srgb;
+        let srgb = r.srgb.unwrap_or(self.image(r.image).srgb);
         let rgb: Vec<Option<f32>> = (0..3).map(|c| self.constant(r.image, c)).collect();
         if rgb.iter().all(Option::is_some) {
             let target = colour(m);
@@ -641,12 +654,11 @@ impl<'a> Packer<'a> {
         Ok(())
     }
 
-    /// A BC4 texture of one source channel times `scale`.
+    /// A BC4 texture of the reference's channel times `scale`.
     fn single(
         &mut self,
         suffix: &str,
         r: &TexRef,
-        channel: usize,
         scale: f32,
         role: &'static str,
     ) -> Result<AssetId> {
@@ -657,7 +669,7 @@ impl<'a> Packer<'a> {
                 encoding: Encoding::Bc4,
                 channels: vec![Channel::Image {
                     image: r.image,
-                    channel,
+                    channel: usize::from(r.channel),
                     srgb: false,
                     a: 0.0,
                     b: scale,
@@ -737,7 +749,10 @@ impl<'a> Packer<'a> {
         if let Some(id) = self.made.get(&same) {
             return Ok(*id);
         }
-        let name = format!("{}/texture/{suffix}/{}", self.asset, p.role);
+        let name = match suffix {
+            "" => format!("{}/texture/{}", self.asset, p.role),
+            _ => format!("{}/texture/{suffix}/{}", self.asset, p.role),
+        };
         let key = Key::new(Class::Texture, &name)
             .str(super::ENCODERS)
             .bytes(&recipe)

@@ -21,7 +21,7 @@
 //!
 //! A node with `EXT_mesh_gpu_instancing` is a model of its own, named after the node and in
 //! its mesh's space, whatever the selection; its instances, scene space from the node's
-//! transform times each instance's, become instance records ([`Imported::instances`]). Such
+//! transform times each instance's, become instance records ([`Scene::instances`]). Such
 //! models do not mix with skins.
 //!
 //! Materials map as [`material`] lists. Textures become the material's canonical channel
@@ -38,71 +38,14 @@ use base64::Engine;
 use glam::{Mat3, Mat4, Vec3};
 use gltf::image::Source as ImageSource;
 use gltf::mesh::{Mode, Semantic};
-use orr_pack::clip::Clip;
-use orr_pack::material::Material;
-use orr_pack::skeleton::SkeletonInfo;
-use serde::Deserialize;
 
-use crate::mesh::{self, MeshData, MeshSettings, PartData, Pivots, SectionData, Skin};
+use crate::import::{Scene, SceneMaterial, SceneModel, SceneSkeleton};
+use crate::mesh::{self, MeshData, PartData, Pivots, SectionData, Skin};
 use crate::patch::{self, MaterialPatch, MeshPatch};
 use crate::skin::{Graph, Skeleton, influences};
 use crate::state::{Input, Memo};
-use crate::texture::material::{ImageFile, MaterialTextures};
+use crate::texture::material::ImageFile;
 use crate::{Error, GltfSettings, Result};
-
-/// Selects nodes of a glTF scene as models.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NodeSelect {
-    /// A node whose name contains this becomes model `<asset>/<node name>`, unless an
-    /// ancestor already did.
-    pub node: String,
-}
-
-/// Rigid parts from a per-vertex attribute.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PartAttribute {
-    /// Custom vertex attribute name, such as `_ID`: integer, or float scalar rounded to the
-    /// nearest integer.
-    pub name: String,
-    /// Declared value count; every value is below it, and values without triangles stay as
-    /// empty parts.
-    pub parts: u16,
-    /// One part per (value, section): part = value x sections + section.
-    pub by_section: bool,
-    /// Custom per-vertex vec3 pivot attribute, read without a skin.
-    pub pivot: Option<String>,
-}
-
-pub(crate) struct Imported {
-    pub models: Vec<ImportedModel>,
-    pub materials: Vec<ImportedMaterial>,
-    pub images: Vec<ImageFile>,
-    pub skeleton: Option<SkeletonInfo>,
-    /// Clips by name; their skeleton id is left for the caller to set.
-    pub clips: Vec<(String, Clip)>,
-    /// Per instanced model: its node name and its instances' scene-space transforms.
-    pub instances: Vec<(String, Vec<Mat4>)>,
-    /// Every file read: the document, its buffers and images.
-    pub files: Vec<Input>,
-}
-
-pub(crate) struct ImportedModel {
-    /// The selected node's name; `None` for the whole scene.
-    pub node: Option<String>,
-    pub mesh: MeshData,
-    pub settings: MeshSettings,
-    /// Index into [`Imported::materials`] per mesh section.
-    pub materials: Vec<usize>,
-}
-
-pub(crate) struct ImportedMaterial {
-    /// Entry name suffix: the glTF material index, or `default`.
-    pub suffix: String,
-    pub material: Material,
-    pub textures: MaterialTextures,
-}
 
 #[derive(Default)]
 struct Vertices {
@@ -154,7 +97,7 @@ pub(crate) fn import(
     path: &Path,
     memo: &Memo,
     settings: &GltfSettings,
-) -> Result<Imported> {
+) -> Result<Scene> {
     let fail = |message: String| Error::Import {
         asset: asset.into(),
         message,
@@ -253,7 +196,7 @@ pub(crate) fn import(
         ));
     }
     let parts = settings.parts_from_attribute.as_ref();
-    let mut materials: BTreeMap<usize, ImportedMaterial> = BTreeMap::new();
+    let mut materials: BTreeMap<usize, SceneMaterial> = BTreeMap::new();
     for &n in &graph.order {
         let node = doc.nodes().nth(n).expect("node index");
         let Some(mesh) = node.mesh() else { continue };
@@ -449,7 +392,7 @@ pub(crate) fn import(
                     &mut m,
                     MaterialPatch::apply,
                 );
-                e.insert(ImportedMaterial {
+                e.insert(SceneMaterial {
                     suffix: match index {
                         usize::MAX => "default".to_string(),
                         i => i.to_string(),
@@ -581,7 +524,7 @@ pub(crate) fn import(
         let v = b.v;
         out.push((
             node,
-            ImportedModel {
+            SceneModel {
                 node: name,
                 mesh: MeshData {
                     positions: v.positions,
@@ -597,6 +540,7 @@ pub(crate) fn import(
                     parts: mesh_parts,
                     min_exponent: None,
                 },
+                skeleton: skeleton.as_ref().map(|_| 0),
                 settings: mesh_settings,
                 materials: slots,
             },
@@ -608,12 +552,18 @@ pub(crate) fn import(
         None => Vec::new(),
     };
 
-    Ok(Imported {
+    Ok(Scene {
         models: out.into_iter().map(|m| m.1).collect(),
         materials: materials.into_values().collect(),
         images,
-        skeleton: skeleton.map(|s| s.info),
-        clips,
+        skeletons: skeleton
+            .map(|s| SceneSkeleton {
+                prefix: String::new(),
+                info: s.info,
+                clips,
+            })
+            .into_iter()
+            .collect(),
         instances: instance_out,
         files,
     })
@@ -735,14 +685,14 @@ fn select_models(
 
 /// Puts the joined models on one grid and checks that their nodes keep them on it.
 fn join(
-    models: &mut [(Option<usize>, ImportedModel)],
+    models: &mut [(Option<usize>, SceneModel)],
     graph: &Graph,
     patterns: &[String],
 ) -> Result<(), String> {
     if patterns.is_empty() {
         return Ok(());
     }
-    let matches = |m: &ImportedModel, p: &str| m.node.as_deref().is_some_and(|n| n.contains(p));
+    let matches = |m: &SceneModel, p: &str| m.node.as_deref().is_some_and(|n| n.contains(p));
     let joined: Vec<usize> = (0..models.len())
         .filter(|&i| patterns.iter().any(|p| matches(&models[i].1, p)))
         .collect();

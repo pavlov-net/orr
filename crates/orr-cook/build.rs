@@ -12,7 +12,7 @@
 use std::path::Path;
 
 const ZSTD: &[&str] = &["zstd", "zstd-safe", "zstd-sys"];
-const MESH: &[&str] = &["meshopt", "gltf", "gltf-json"];
+const MESH: &[&str] = &["meshopt", "gltf", "gltf-json", "openusd", "roxmltree"];
 const TEXTURE: &[&str] = &["bcdec_rs", "image", "png", "half"];
 
 fn main() {

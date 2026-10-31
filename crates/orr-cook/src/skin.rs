@@ -1,4 +1,5 @@
-//! glTF skins and animations: one skeleton per import and its clips.
+//! glTF skins and animations: one skeleton per import and its clips; clip resampling from
+//! keyed channels, which USD animations share ([`resample`]).
 //!
 //! The skeleton holds every joint of the skins the scene's meshes use, plus their ancestors
 //! up to the scene roots, so model space is the scene's space and an animated ancestor
@@ -21,7 +22,6 @@ use std::collections::HashMap;
 
 use glam::{Mat3, Mat4, Quat, Vec3};
 use gltf::animation::util::ReadOutputs;
-use gltf::animation::{Interpolation, Property};
 use orr_pack::Affine3;
 use orr_pack::AssetId;
 use orr_pack::clip::{Clip, ClipHeader};
@@ -238,10 +238,20 @@ impl Skeleton {
                     Some(ReadOutputs::MorphTargetWeights(_)) => continue,
                     None => return Err(format!("{}: channel without output", what())),
                 };
+                use gltf::animation::{Interpolation as I, Property as P};
                 let ch = Channel {
                     joint: usize::from(joint),
-                    property: ch.target().property(),
-                    interpolation: ch.sampler().interpolation(),
+                    property: match ch.target().property() {
+                        P::Translation => Property::Translation,
+                        P::Rotation => Property::Rotation,
+                        P::Scale => Property::Scale,
+                        P::MorphTargetWeights => unreachable!("skipped"),
+                    },
+                    interpolation: match ch.sampler().interpolation() {
+                        I::Step => Interpolation::Step,
+                        I::Linear => Interpolation::Linear,
+                        I::CubicSpline => Interpolation::CubicSpline,
+                    },
                     times,
                     values,
                 };
@@ -251,17 +261,7 @@ impl Skeleton {
             if channels.is_empty() {
                 continue;
             }
-            let mut rate = settings.rate;
-            let clip = loop {
-                let clip = self.resample(&channels, rate);
-                let (position, rotation) = self.error(&channels, &clip);
-                if (position <= settings.position_error && rotation <= settings.rotation_error)
-                    || rate * 2.0 > settings.max_rate
-                {
-                    break clip;
-                }
-                rate *= 2.0;
-            };
+            let clip = resample(&self.info, &channels, settings);
             clips.push((anim.index(), anim.name().unwrap_or_default(), clip));
         }
         let mut count: HashMap<&str, usize> = HashMap::new();
@@ -277,97 +277,110 @@ impl Skeleton {
             })
             .collect())
     }
+}
 
-    /// Local transforms at glTF time `t`: the rest pose with the channels applied.
-    fn pose(&self, channels: &[Channel], t: f64) -> Vec<Trs> {
-        let mut pose = self.info.rest.clone();
-        for c in channels {
-            let v = c.eval(t);
-            let p = &mut pose[c.joint];
-            match c.property {
-                Property::Translation => p.translation = [v[0], v[1], v[2]],
-                Property::Rotation => p.rotation = v,
-                Property::Scale => p.scale = [v[0], v[1], v[2]],
-                Property::MorphTargetWeights => unreachable!("skipped"),
-            }
+/// The clip of `channels` (checked), resampled at the rate nearest `settings.rate` that fits
+/// a whole number of frame intervals, doubling until the clip's sampler holds every joint
+/// within the settings' bounds or the rate reaches `max_rate`.
+pub(crate) fn resample(info: &SkeletonInfo, channels: &[Channel], settings: &ClipSettings) -> Clip {
+    let mut rate = settings.rate;
+    loop {
+        let clip = sample(info, channels, rate);
+        let (position, rotation) = error(info, channels, &clip);
+        if (position <= settings.position_error && rotation <= settings.rotation_error)
+            || rate * 2.0 > settings.max_rate
+        {
+            return clip;
         }
-        pose
+        rate *= 2.0;
     }
+}
 
-    /// The channels sampled from their first key to their last at the rate nearest `rate`
-    /// that fits a whole number of frame intervals.
-    fn resample(&self, channels: &[Channel], rate: f32) -> Clip {
-        let (start, duration) = span(channels);
-        let intervals = if duration > 0.0 {
-            (duration * f64::from(rate)).round().max(1.0) as u32
-        } else {
-            0
-        };
-        let sample_rate = if intervals > 0 {
-            (f64::from(intervals) / duration) as f32
-        } else {
-            rate
-        };
-        let n = self.info.joint_count();
-        let mut samples: Vec<Trs> = Vec::with_capacity((intervals as usize + 1) * n);
-        for f in 0..=intervals {
-            let t = start + duration * f64::from(f) / f64::from(intervals.max(1));
-            let mut pose = self.pose(channels, t);
-            if f > 0 {
-                for (p, q) in pose.iter_mut().zip(&samples[samples.len() - n..]) {
-                    let d: f32 = (0..4).map(|i| p.rotation[i] * q.rotation[i]).sum();
-                    if d < 0.0 {
-                        p.rotation = p.rotation.map(|x| -x);
-                    }
+/// Local transforms at time `t`: the rest pose with the channels applied.
+fn pose(info: &SkeletonInfo, channels: &[Channel], t: f64) -> Vec<Trs> {
+    let mut pose = info.rest.clone();
+    for c in channels {
+        let v = c.eval(t);
+        let p = &mut pose[c.joint];
+        match c.property {
+            Property::Translation => p.translation = [v[0], v[1], v[2]],
+            Property::Rotation => p.rotation = v,
+            Property::Scale => p.scale = [v[0], v[1], v[2]],
+        }
+    }
+    pose
+}
+
+/// The channels sampled from their first key to their last at the rate nearest `rate`
+/// that fits a whole number of frame intervals.
+fn sample(info: &SkeletonInfo, channels: &[Channel], rate: f32) -> Clip {
+    let (start, duration) = span(channels);
+    let intervals = if duration > 0.0 {
+        (duration * f64::from(rate)).round().max(1.0) as u32
+    } else {
+        0
+    };
+    let sample_rate = if intervals > 0 {
+        (f64::from(intervals) / duration) as f32
+    } else {
+        rate
+    };
+    let n = info.joint_count();
+    let mut samples: Vec<Trs> = Vec::with_capacity((intervals as usize + 1) * n);
+    for f in 0..=intervals {
+        let t = start + duration * f64::from(f) / f64::from(intervals.max(1));
+        let mut pose = pose(info, channels, t);
+        if f > 0 {
+            for (p, q) in pose.iter_mut().zip(&samples[samples.len() - n..]) {
+                let d: f32 = (0..4).map(|i| p.rotation[i] * q.rotation[i]).sum();
+                if d < 0.0 {
+                    p.rotation = p.rotation.map(|x| -x);
                 }
             }
-            samples.extend(pose);
         }
-        Clip {
-            header: ClipHeader {
-                skeleton: AssetId::NONE,
-                joint_count: n as u32,
-                frame_count: intervals + 1,
-                sample_rate,
-                duration: intervals as f32 / sample_rate,
-            },
-            samples,
-        }
+        samples.extend(pose);
     }
+    Clip {
+        header: ClipHeader {
+            skeleton: AssetId::NONE,
+            joint_count: n as u32,
+            frame_count: intervals + 1,
+            sample_rate,
+            duration: intervals as f32 / sample_rate,
+        },
+        samples,
+    }
+}
 
-    /// Largest model-space joint error of `clip` against the channels, in metres and
-    /// degrees, over every key time and the middle of every frame interval.
-    fn error(&self, channels: &[Channel], clip: &Clip) -> (f32, f32) {
-        let (start, duration) = span(channels);
-        let h = &clip.header;
-        let mut times: Vec<f64> = channels
-            .iter()
-            .flat_map(|c| c.times.iter().map(|&t| f64::from(t) - start))
-            .collect();
-        times.extend(
-            (0..h.frame_count - 1).map(|f| (f64::from(f) + 0.5) / f64::from(h.sample_rate)),
-        );
-        let n = self.info.joint_count();
-        let (mut sampled, mut model, mut want) = (
-            vec![Trs::IDENTITY; n],
-            vec![Affine3::IDENTITY; n],
-            vec![Affine3::IDENTITY; n],
-        );
-        let (mut position, mut rotation) = (0.0f32, 0.0f32);
-        for t in times {
-            let t = t.clamp(0.0, duration);
-            clip.sample(t as f32, &mut sampled);
-            self.info.model_pose(&sampled, &mut model);
-            self.info
-                .model_pose(&self.pose(channels, start + t), &mut want);
-            for (a, b) in model.iter().zip(&want) {
-                let (p, r) = pose_error(a, b);
-                position = position.max(p);
-                rotation = rotation.max(r);
-            }
+/// Largest model-space joint error of `clip` against the channels, in metres and
+/// degrees, over every key time and the middle of every frame interval.
+fn error(info: &SkeletonInfo, channels: &[Channel], clip: &Clip) -> (f32, f32) {
+    let (start, duration) = span(channels);
+    let h = &clip.header;
+    let mut times: Vec<f64> = channels
+        .iter()
+        .flat_map(|c| c.times.iter().map(|&t| f64::from(t) - start))
+        .collect();
+    times.extend((0..h.frame_count - 1).map(|f| (f64::from(f) + 0.5) / f64::from(h.sample_rate)));
+    let n = info.joint_count();
+    let (mut sampled, mut model, mut want) = (
+        vec![Trs::IDENTITY; n],
+        vec![Affine3::IDENTITY; n],
+        vec![Affine3::IDENTITY; n],
+    );
+    let (mut position, mut rotation) = (0.0f32, 0.0f32);
+    for t in times {
+        let t = t.clamp(0.0, duration);
+        clip.sample(t as f32, &mut sampled);
+        info.model_pose(&sampled, &mut model);
+        info.model_pose(&pose(info, channels, start + t), &mut want);
+        for (a, b) in model.iter().zip(&want) {
+            let (p, r) = pose_error(a, b);
+            position = position.max(p);
+            rotation = rotation.max(r);
         }
-        (position, rotation)
     }
+    (position, rotation)
 }
 
 /// How clips are resampled.
@@ -398,7 +411,7 @@ impl Default for ClipSettings {
 }
 
 impl ClipSettings {
-    fn check(&self) -> Result<(), String> {
+    pub(crate) fn check(&self) -> Result<(), String> {
         let positive = |v: f32| v.is_finite() && v > 0.0;
         if !positive(self.rate) || !(self.max_rate.is_finite() && self.max_rate >= self.rate) {
             return Err(format!(
@@ -439,17 +452,34 @@ fn pose_error(a: &Affine3, b: &Affine3) -> (f32, f32) {
     (t(a).distance(t(b)), cos.acos().to_degrees())
 }
 
-struct Channel {
-    joint: usize,
-    property: Property,
-    interpolation: Interpolation,
-    times: Vec<f32>,
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) enum Property {
+    Translation,
+    Rotation,
+    Scale,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) enum Interpolation {
+    Step,
+    /// Rotations slerp on the shorter arc.
+    Linear,
+    CubicSpline,
+}
+
+/// One animated property of one joint, keyed in seconds.
+pub(crate) struct Channel {
+    /// Skeleton joint.
+    pub joint: usize,
+    pub property: Property,
+    pub interpolation: Interpolation,
+    pub times: Vec<f32>,
     /// xyz(w); three per key (in-tangent, value, out-tangent) for cubic splines.
-    values: Vec<[f32; 4]>,
+    pub values: Vec<[f32; 4]>,
 }
 
 impl Channel {
-    fn check(&self) -> Result<(), String> {
+    pub(crate) fn check(&self) -> Result<(), String> {
         let n = self.times.len();
         let per = if self.interpolation == Interpolation::CubicSpline {
             3
@@ -544,7 +574,7 @@ fn rest(node: &gltf::Node<'_>) -> Result<Trs, String> {
     })
 }
 
-fn close(a: &Mat4, b: &Mat4) -> bool {
+pub(crate) fn close(a: &Mat4, b: &Mat4) -> bool {
     let tol = 1e-5 * a.to_cols_array().iter().fold(1.0f32, |m, v| m.max(v.abs()));
     a.to_cols_array()
         .iter()
@@ -552,7 +582,7 @@ fn close(a: &Mat4, b: &Mat4) -> bool {
         .all(|(x, y)| (x - y).abs() <= tol)
 }
 
-fn affine(m: &Mat4) -> Affine3 {
+pub(crate) fn affine(m: &Mat4) -> Affine3 {
     Affine3 {
         rows: std::array::from_fn(|i| m.row(i).to_array()),
     }

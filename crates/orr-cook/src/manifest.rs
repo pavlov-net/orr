@@ -23,9 +23,9 @@
 //! ] }
 //! ```
 //!
-//! Each asset names exactly one source: `gltf`, `texture`, `instances`, `raster`, `material`
-//! or `user`, with the fields of the matching [`Source`] variant (`Source::Mesh` is for
-//! library callers). Settings fields left out take their defaults.
+//! Each asset names exactly one source: `gltf`, `usd`, `materialx`, `texture`, `instances`,
+//! `raster`, `material` or `user`, with the fields of the matching [`Source`] variant
+//! (`Source::Mesh` is for library callers). Settings fields left out take their defaults.
 
 use std::path::{Path, PathBuf};
 
@@ -57,7 +57,10 @@ impl Manifest {
             }
             for asset in &mut a.assets {
                 match &mut asset.source {
-                    Source::Gltf { path, .. } | Source::Texture { path, .. } => resolve(path),
+                    Source::Gltf { path, .. }
+                    | Source::Usd { path, .. }
+                    | Source::MaterialX { path, .. }
+                    | Source::Texture { path, .. } => resolve(path),
                     Source::Raster(set) => {
                         for l in &mut set.layers {
                             match &mut l.input {
