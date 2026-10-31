@@ -126,6 +126,10 @@ pub struct RendererDesc {
     pub positioned_reads: bool,
     /// Raster LOD: the largest cluster error drawn, in render pixels.
     pub raster_error_pixels: f32,
+    /// Clusters whose screen rect's longer side is at most this many render pixels raster
+    /// in compute, unless they cross the near plane; others take the mesh-shader path. 0
+    /// turns the software raster off; values above 128 act as 128.
+    pub software_raster_pixels: f32,
 }
 
 impl Default for RendererDesc {
@@ -137,6 +141,7 @@ impl Default for RendererDesc {
             cell_log2: 8,
             positioned_reads: false,
             raster_error_pixels: 1.0,
+            software_raster_pixels: 32.0,
         }
     }
 }
@@ -228,6 +233,7 @@ struct Core {
     cell_log2: u32,
     budgets: Budgets,
     raster_error_pixels: f32,
+    software_raster_pixels: f32,
     raster: RasterPipelines,
     materials: MaterialTable,
     /// Emission by `ModelId`.
@@ -340,6 +346,7 @@ impl Scenes {
                 cell_log2: desc.cell_log2,
                 budgets: desc.budgets,
                 raster_error_pixels: desc.raster_error_pixels,
+                software_raster_pixels: desc.software_raster_pixels,
                 raster,
                 materials: MaterialTable::new(device, desc.budgets.materials)?,
                 models: Vec::new(),
@@ -1076,6 +1083,7 @@ impl<'a> Frame<'a> {
             instance_capacity,
             constants,
             core.raster_error_pixels,
+            core.software_raster_pixels,
         )?;
         let out = RasterView {
             view: constants,

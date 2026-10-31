@@ -2,9 +2,9 @@
 //! packing against a CPU decoder, reference images of each G-buffer channel, motion vectors
 //! that reproject the previous frame, discrete levels chosen by distance, a linked surface
 //! whose coverage and depth offset give the depth and motion of the shape it stands for,
-//! camera rays through the PTLAS against the visibility buffer, resolved hits against a CPU
-//! decode, hit contexts, `rt_range`, far-from-origin and rebase invariance, and the PTLAS
-//! budget.
+//! the software raster against the mesh-shader raster, camera rays through the PTLAS against
+//! the visibility buffer, resolved hits against a CPU decode, hit contexts, `rt_range`,
+//! far-from-origin and rebase invariance, and the PTLAS budget.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -1653,6 +1653,147 @@ fn masked_sections_draw_nothing() {
         drawn(&masked),
         drawn(&whole)
     );
+    assert_clean();
+}
+
+/// Per pixel: the visible (instance, mesh cluster, triangle) and its depth.
+type Surfaces = Vec<Option<((u32, u32, u32), f32)>>;
+
+/// The view's visibility buffer decoded, and its counts.
+fn surfaces(view: &RasterView) -> (Surfaces, Vec<u32>) {
+    let vis: Vec<u64> = read_buffer(view.targets.visibility, u64::from(EXTENT[0] * EXTENT[1]));
+    let counts: Vec<u32> = read_buffer(view.counts, 8);
+    let clusters: Vec<VisibleCluster> =
+        read_buffer(view.targets.clusters, u64::from(counts[0].max(1)));
+    let decoded = vis
+        .iter()
+        .map(|&w| {
+            (w != 0).then(|| {
+                let c = clusters[(w as u32 >> 7) as usize];
+                let depth = f32::from_bits((w >> 32) as u32);
+                ((c.instance, c.cluster, w as u32 & 127), depth)
+            })
+        })
+        .collect();
+    (decoded, counts)
+}
+
+#[test]
+fn software_and_hardware_raster_draw_the_same_visibility_buffer() {
+    let _serial = serial();
+    let shots = [
+        (Vec3::new(0.3, 2.6, 5.5), Vec3::new(0.0, 0.6, 0.0)),
+        (Vec3::new(-1.0, 1.2, 2.2), Vec3::new(1.2, 0.9, 0.4)),
+        (Vec3::new(1.5, 5.0, 14.0), Vec3::new(0.0, 0.6, 0.0)),
+    ];
+    let run = |software_raster_pixels: f32| {
+        let mut w = World::with(&RendererDesc {
+            software_raster_pixels,
+            ..RendererDesc::default()
+        });
+        let placed = place(&mut w, &showcase());
+        shots
+            .iter()
+            .enumerate()
+            .map(|(i, &(eye, target))| {
+                let list = [placed.scene];
+                let mut f = w
+                    .scenes
+                    .begin_frame(&FrameDesc {
+                        time: time(i as u32),
+                        scenes: &list,
+                        low_latency: None,
+                    })
+                    .unwrap();
+                let view = f
+                    .raster_view(&ViewDesc {
+                        scene: placed.scene,
+                        history: placed.history,
+                        position: eye.as_dvec3(),
+                        rotation: look(eye, target),
+                        projection: Projection {
+                            fov_y: 0.9,
+                            near: 0.1,
+                        },
+                        lens: Lens::default(),
+                        render_extent: UVec2::from(EXTENT),
+                        jitter: Vec2::new(0.25, -0.125),
+                        reset_history: true,
+                        mip_bias: 0.0,
+                        target: ViewTarget::AfterRr,
+                    })
+                    .unwrap();
+                wait(f.end(&[]).unwrap());
+                surfaces(&view)
+            })
+            .collect::<Vec<_>>()
+    };
+    let hardware = run(0.0);
+    let software = run(1e9);
+    let [w, h] = EXTENT.map(|v| v as usize);
+    for (shot, ((hw, hw_counts), (sw, sw_counts))) in hardware.iter().zip(&software).enumerate() {
+        assert_eq!(
+            hw_counts[7], 0,
+            "shot {shot}: no software clusters when it is off"
+        );
+        assert_eq!(
+            hw_counts[0], sw_counts[0],
+            "shot {shot}: the same clusters are visible"
+        );
+        assert!(
+            sw_counts[7] > 0,
+            "shot {shot}: some clusters raster in software"
+        );
+        if shot == 2 {
+            assert_eq!(
+                sw_counts[7], sw_counts[0],
+                "far away, every cluster is software"
+            );
+        }
+        let id = |s: &Surfaces, x: usize, y: usize| s[y * w + x].map(|(id, _)| id);
+        let mut covered = 0;
+        let mut differ = 0;
+        let mut depth_error = 0f32;
+        for y in 0..h {
+            for x in 0..w {
+                let (a, b) = (hw[y * w + x], sw[y * w + x]);
+                covered += usize::from(a.is_some() || b.is_some());
+                match (a, b) {
+                    (Some((ia, da)), Some((ib, db))) if ia == ib => {
+                        depth_error = depth_error.max((da - db).abs() / da);
+                        continue;
+                    }
+                    (None, None) => continue,
+                    _ => differ += 1,
+                }
+                // A tie on an edge: the other path drew a neighbor's surface here.
+                let near = |s: &Surfaces, want: Option<(u32, u32, u32)>| {
+                    [(0, 1), (2, 1), (1, 0), (1, 2)].iter().any(|&(dx, dy)| {
+                        let (nx, ny) = ((x + dx).wrapping_sub(1), (y + dy).wrapping_sub(1));
+                        nx < w && ny < h && id(s, nx, ny) == want
+                    })
+                };
+                assert!(
+                    near(hw, id(sw, x, y)) && near(sw, id(hw, x, y)),
+                    "shot {shot}: pixel ({x}, {y}) differs away from an edge: {a:?} against {b:?}"
+                );
+            }
+        }
+        assert!(
+            covered > w * h / 100,
+            "shot {shot}: {covered} pixels covered"
+        );
+        assert!(
+            differ * 200 < covered,
+            "shot {shot}: {differ} of {covered} pixels differ"
+        );
+        // Both snap corners to 1/256 pixel; the hardware's depth plane differs from the
+        // software's by a few thousandths of a pixel's depth slope on sub-pixel triangles.
+        assert!(
+            depth_error < 1e-4,
+            "shot {shot}: depth differs by {depth_error:e}"
+        );
+    }
     assert_clean();
 }
 
