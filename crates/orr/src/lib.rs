@@ -644,8 +644,10 @@ impl<'a> Frame<'a> {
                 output.not_rendering_scene,
             );
         }
+        let distortion = output.lens_distortion(view.lens.distortion);
+        let field_on = distortion.is_some() || (output.distortion_field && set.any());
         let mut field = match display.as_mut() {
-            Some(frame) if output.distortion_field && set.any() => Some(frame.distortion_field()?),
+            Some(frame) if field_on => Some(frame.distortion_field()?),
             _ => None,
         };
         let kernels = &self.output.kernels;
@@ -719,7 +721,10 @@ impl<'a> Frame<'a> {
                 output,
                 hook_source: set.display_linear.then_some(radiance_store),
                 glare: None,
+                distortion,
+                frame: id,
             },
+            field.as_deref_mut(),
         );
         list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         if let (Some(inputs), Some(hook)) = (inputs, hooks.display_linear.as_mut()) {
@@ -843,7 +848,10 @@ impl<'a> Frame<'a> {
                 output: &view_output,
                 hook_source: None,
                 glare: None,
+                distortion: None,
+                frame: id,
             },
+            None,
         );
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         output.compose(list, id, &mut frame, sampled);

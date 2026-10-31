@@ -9,7 +9,7 @@ use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, GpuPtr, Hazards, MemoryKind, OutputFormat,
     ShaderStage, SpecData, Stages, StorageImageIndex, Texture, TextureIndex,
 };
-use orr_scene::{DepthOfField, SkyStats, ViewConstants};
+use orr_scene::{DepthOfField, LensDistortion, SkyStats, ViewConstants};
 
 use crate::dof::{DofKernels, DofTargets};
 use crate::exposure::{COMPENSATION_ENTRIES, HISTOGRAM_BINS, HISTOGRAM_WORDS_PER_BIN};
@@ -37,6 +37,7 @@ pub struct OutputKernels {
     dof: DofKernels,
     glare: GlareKernels,
     tonemap: ComputePipeline,
+    tonemap_hook_source: ComputePipeline,
     compose: ComposeKernel,
     scene_referred: ComputePipeline,
 }
@@ -314,6 +315,11 @@ pub struct TonemapPass<'a> {
     /// The view's glare, composited into the exposed radiance before white balance and the
     /// grade.
     pub glare: Option<GlareComposite>,
+    /// The lens's distortion and chromatic aberration, applied as the gather's sample
+    /// positions; with it, `source` is read at neighboring texels.
+    pub distortion: Option<LensDistortion>,
+    /// orr's frame id, for the distortion field.
+    pub frame: u64,
 }
 
 /// What compose reads.
@@ -435,6 +441,10 @@ impl OutputKernels {
             dof: DofKernels::new(gpu)?,
             glare: GlareKernels::new(gpu)?,
             tonemap: pipeline(&tonemap::MODULE, "tonemap")?,
+            tonemap_hook_source: gpu.create_compute_pipeline(
+                &ShaderStage::new(&tonemap::MODULE, "copy_hook_source", SpecData::default())?,
+                "tonemap_hook_source",
+            )?,
             compose: ComposeKernel::new(gpu)?,
             scene_referred: gpu.create_compute_pipeline(
                 &ShaderStage::new(&compose::MODULE, "scene_referred", SpecData::default())?,
@@ -479,6 +489,7 @@ impl OutputKernels {
                 "distortion field for another extent"
             );
             f.prepare(list);
+            f.mark_written(pass.frame);
             f.current_storage()
         });
         let (copy_source, copy_target) = if pass.hooks.scene_referred {
@@ -761,16 +772,20 @@ impl OutputKernels {
         Ok(Some(targets.composite()))
     }
 
-    /// Records the tonemap pass. Order its source's and the adapt pass's writes before it
-    /// with a barrier.
+    /// Records the tonemap pass. With lens distortion and `field`, it composes the lens's map
+    /// into the field after any stage that wrote it this frame (`hook_inputs`, a
+    /// `scene_referred` hook); frame generation reads the result. Order its source's, the
+    /// field's and the adapt pass's writes before it with a barrier.
     pub fn tonemap(
         &self,
         list: &mut CommandList<'_>,
         roots: &mut OutputRoots,
         pass: &TonemapPass<'_>,
+        field: Option<&mut DistortionField>,
     ) {
         let d = pass.display;
         let o = pass.output;
+        let lens = o.lens_distortion(pass.distortion);
         let row = |r: [f32; 3]| [r[0], r[1], r[2], 0.0];
         // DEBUG_* in tonemap.slang.
         let (debug, pattern) = match o.debug {
@@ -790,8 +805,23 @@ impl OutputKernels {
             pattern_patch: pattern.map_or(0.0, |p| p.patch),
             pattern_surround: pattern.map_or(0.0, |p| p.surround),
             white_balance: u32::from(o.white_balance.is_some()),
-            _pad1: 0,
-            _pad2: 0,
+            distortion: u32::from(lens.is_some()),
+            k1: lens.map_or(0.0, |l| l.k1),
+            k2: lens.map_or(0.0, |l| l.k2),
+            chromatic_aberration: lens.map_or(0.0, |l| l.chromatic_aberration),
+            distortion_scale: lens.map_or(1.0, |l| distortion_scale(&l, pass.extent)),
+            _pad: 0,
+        };
+        let (field, field_source) = match (lens, field) {
+            (Some(_), Some(f)) => {
+                assert_eq!(
+                    f.extent(),
+                    DistortionField::extent_for(pass.extent),
+                    "distortion field for another extent"
+                );
+                f.compose_next(list, pass.frame)
+            }
+            _ => (StorageImageIndex::NONE, TextureIndex::NONE),
         };
         let root = tonemap::Root {
             constants: roots.put(TONEMAP_CONSTANTS, &constants),
@@ -803,14 +833,24 @@ impl OutputKernels {
             hook_source: pass.hook_source.unwrap_or(StorageImageIndex::NONE),
             glare: pass.glare.map_or(TextureIndex::NONE, |g| g.chain),
             linear: self.glare.linear,
+            field,
+            field_source,
             width: pass.extent[0],
             height: pass.extent[1],
-            _pad: 0,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         let root = roots.put(TONEMAP_ROOT, &root);
         list.begin_pass("tonemap", false);
         list.dispatch(&self.tonemap, root, groups(pass.extent, 8));
         list.end_pass();
+        if lens.is_some() && pass.hook_source.is_some() {
+            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+            list.begin_pass("tonemap_hook_source", false);
+            list.dispatch(&self.tonemap_hook_source, root, groups(pass.extent, 8));
+            list.end_pass();
+        }
     }
 
     /// Records a compose pass, named `compose`, or `compose_ui` when it blends a UI layer
@@ -948,6 +988,28 @@ fn adapt_params(auto: &AutoExposure, cut: bool) -> AdaptParams {
         bound_darken: long.bound_darken,
         ..bytemuck::Zeroable::zeroed()
     }
+}
+
+/// The scale on green's sample radius that keeps every tap of `lens` inside an image of
+/// `extent`: one over the largest radial factor `1 + k1 u + k2 u^2` on the image's border
+/// (u the squared radius in half-diagonals, from the long edges' midpoints to the corners)
+/// times the wider of the red and blue scales. The edge then samples the source's edge. It
+/// assumes the radius maps monotonically.
+fn distortion_scale(lens: &LensDistortion, extent: [u32; 2]) -> f32 {
+    let [w, h] = extent.map(f64::from);
+    let u0 = w.min(h).powi(2) / (w * w + h * h);
+    let (k1, k2) = (f64::from(lens.k1), f64::from(lens.k2));
+    let factor = |u: f64| 1.0 + k1 * u + k2 * u * u;
+    let mut largest = factor(u0).max(factor(1.0));
+    if k2 != 0.0 {
+        let vertex = -k1 / (2.0 * k2);
+        if (u0..1.0).contains(&vertex) {
+            largest = largest.max(factor(vertex));
+        }
+    }
+    debug_assert!(largest > 0.0, "lens distortion folds the image: {lens:?}");
+    let spread = 1.0 + f64::from(lens.chromatic_aberration).abs();
+    (1.0 / (largest * spread)) as f32
 }
 
 /// `size` x `size` workgroups covering `extent`.

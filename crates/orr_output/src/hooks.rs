@@ -139,11 +139,14 @@ impl Drop for Image {
 /// `DLSSG.BidirectionalDistortionField`): RGBA16F at half the output resolution, RG the UV
 /// offset from a presented pixel to its undistorted position, BA the reverse, zero for
 /// identity. Two images ping-pong so each warping stage reads the previous field and writes
-/// the next. A display keeps one.
+/// the next: `hook_inputs` clears it, warping hooks and tonemap's lens distortion compose
+/// into it. A display keeps one.
 pub struct DistortionField {
     images: [Image; 2],
     current: usize,
     fresh: bool,
+    /// The frame whose stages wrote `current`; earlier stages this frame compose into it.
+    written: Option<u64>,
 }
 
 impl DistortionField {
@@ -155,6 +158,7 @@ impl DistortionField {
             images: [image()?, image()?],
             current: 0,
             fresh: true,
+            written: None,
         })
     }
 
@@ -176,7 +180,8 @@ impl DistortionField {
         self.images.iter().map(|i| i.bytes).sum()
     }
 
-    pub(crate) fn current_texture(&self) -> &Texture {
+    /// The texture of [`DistortionField::current`], for a frame generation recorded by hand.
+    pub fn current_texture(&self) -> &Texture {
         self.images[self.current].texture()
     }
 
@@ -191,6 +196,30 @@ impl DistortionField {
                 list.discard(image.texture());
             }
         }
+    }
+
+    /// Marks `current` as frame `frame`'s field, which later stages compose into.
+    pub(crate) fn mark_written(&mut self, frame: u64) {
+        self.written = Some(frame);
+    }
+
+    /// For a stage of frame `frame` that writes every texel: the image it writes and the
+    /// field it composes into, `NONE` when no earlier stage wrote one this frame. Flips the
+    /// field, so record the stage before any later one.
+    pub(crate) fn compose_next(
+        &mut self,
+        list: &mut CommandList<'_>,
+        frame: u64,
+    ) -> (StorageImageIndex, TextureIndex) {
+        self.prepare(list);
+        let source = if self.written == Some(frame) {
+            self.current()
+        } else {
+            TextureIndex::NONE
+        };
+        self.current ^= 1;
+        self.written = Some(frame);
+        (self.current_storage(), source)
     }
 }
 

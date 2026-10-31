@@ -262,7 +262,10 @@ impl Harness {
                     output,
                     hook_source: None,
                     glare: self.composite,
+                    distortion: None,
+                    frame: self.frame,
                 },
+                None,
             );
             if let Some(ScreenshotRequest::Display { .. }) = output.screenshot {
                 list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
@@ -313,7 +316,8 @@ impl Harness {
     }
 }
 
-fn read_rgba16f(t: &Texture) -> Vec<[f32; 4]> {
+/// Reads an RGBA16F texture's first mip back.
+pub fn read_rgba16f(t: &Texture) -> Vec<[f32; 4]> {
     let region = TextureRegion::whole_mip(t.desc(), 0);
     read_texture(t, &region)
         .chunks_exact(8)
@@ -526,4 +530,90 @@ pub fn cat16_rec2020(from: [f64; 2], to: [f64; 2]) -> [[f64; 3]; 3] {
 pub fn uv_from_xy(xy: [f64; 2]) -> [f64; 2] {
     let d = -2.0 * xy[0] + 12.0 * xy[1] + 3.0;
     [4.0 * xy[0] / d, 6.0 * xy[1] / d]
+}
+
+/// The lens map of `orr_scene::LensDistortion` in f64, in output pixels with pixel centers
+/// at `i + 0.5`, for checking tonemap's gather and distortion field.
+#[derive(Clone, Copy, Debug)]
+pub struct LensModel {
+    center: [f64; 2],
+    half_diagonal: f64,
+    k1: f64,
+    k2: f64,
+    chromatic_aberration: f64,
+    scale: f64,
+}
+
+impl LensModel {
+    /// The scale is found by walking the image's border: the largest radial factor there,
+    /// times the wider of the red and blue scales, maps to the source's edge.
+    pub fn new(lens: &orr_scene::LensDistortion, extent: [u32; 2]) -> Self {
+        let [w, h] = extent.map(f64::from);
+        let mut model = Self {
+            center: [0.5 * w, 0.5 * h],
+            half_diagonal: 0.5 * w.hypot(h),
+            k1: f64::from(lens.k1),
+            k2: f64::from(lens.k2),
+            chromatic_aberration: f64::from(lens.chromatic_aberration),
+            scale: 1.0,
+        };
+        let steps = 4096;
+        let mut reach = 0.0f64;
+        for i in 0..=steps {
+            let t = f64::from(i) / f64::from(steps);
+            for p in [[t * w, 0.0], [t * w, h], [0.0, t * h], [w, t * h]] {
+                let s = model.forward(p);
+                reach = reach
+                    .max((s[0] - model.center[0]).abs() / (0.5 * w))
+                    .max((s[1] - model.center[1]).abs() / (0.5 * h));
+            }
+        }
+        model.scale = 1.0 / (reach * (1.0 + model.chromatic_aberration.abs()));
+        model
+    }
+
+    /// Where output position `p` takes green from.
+    pub fn forward(&self, p: [f64; 2]) -> [f64; 2] {
+        let d = [p[0] - self.center[0], p[1] - self.center[1]];
+        let u = (d[0] * d[0] + d[1] * d[1]) / (self.half_diagonal * self.half_diagonal);
+        let f = self.scale * (1.0 + self.k1 * u + self.k2 * u * u);
+        [self.center[0] + d[0] * f, self.center[1] + d[1] * f]
+    }
+
+    /// Where output position `p` takes red and blue from.
+    pub fn red_blue(&self, p: [f64; 2]) -> ([f64; 2], [f64; 2]) {
+        let g = self.forward(p);
+        let at = |s: f64| std::array::from_fn(|a| self.center[a] + (g[a] - self.center[a]) * s);
+        (
+            at(1.0 + self.chromatic_aberration),
+            at(1.0 - self.chromatic_aberration),
+        )
+    }
+
+    /// The output position whose green tap lands on `x`, by bisection on the radius.
+    pub fn inverse(&self, x: [f64; 2]) -> [f64; 2] {
+        let d = [x[0] - self.center[0], x[1] - self.center[1]];
+        let rho = d[0].hypot(d[1]);
+        if rho == 0.0 {
+            return x;
+        }
+        let radial = |r: f64| {
+            let u = (r / self.half_diagonal).powi(2);
+            r * self.scale * (1.0 + self.k1 * u + self.k2 * u * u)
+        };
+        let (mut lo, mut hi) = (0.0, 1.5 * self.half_diagonal);
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            if radial(mid) < rho {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let r = 0.5 * (lo + hi);
+        [
+            self.center[0] + d[0] * r / rho,
+            self.center[1] + d[1] * r / rho,
+        ]
+    }
 }
