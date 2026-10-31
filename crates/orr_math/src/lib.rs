@@ -8,3 +8,6 @@
 //! Features `serde`, `bytemuck` and `mint` enable the matching glam integrations.
 
 pub use glam::prelude::*;
+
+/// Projection and view matrices per handedness and graphics API.
+pub use glam::camera;

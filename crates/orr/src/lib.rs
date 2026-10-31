@@ -44,8 +44,8 @@ use orr_gpu::{
     CommandList, Device, Format, GpuPtr, Hazards, ShaderModule, Stages, TextureIndex, TimelinePoint,
 };
 use orr_output::{
-    ComposePass, ComposeRoot, ComposeSource, DisplayFrame, Image, OutputDebug, OutputKernels, OutputView,
-    TonemapPass, ViewOutput,
+    ComposePass, ComposeRoot, ComposeSource, DisplayFrame, Image, OutputDebug, OutputKernels,
+    OutputView, TonemapPass, ViewOutput,
 };
 use orr_scene::Scenes;
 
