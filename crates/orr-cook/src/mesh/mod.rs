@@ -18,6 +18,7 @@ mod displace;
 mod lod;
 pub(crate) mod maps;
 mod omm;
+mod tangents;
 mod thickness;
 
 use std::ops::Range;
@@ -36,9 +37,10 @@ use serde::Deserialize;
 use crate::assembly::AssemblySettings;
 use crate::texture::Wrap;
 use crate::{Error, Result};
-use maps::{Displacement, Opacity};
+use maps::{Displacement, Opacity, Raster};
 pub use omm::OmmSettings;
 use omm::{ClusterOmm, OmmAlpha};
+pub(crate) use tangents::TangentCheck;
 
 /// How meshes are simplified, clustered and quantised.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -78,6 +80,10 @@ pub struct MeshSettings {
     /// Repeated rigid pieces of a static, unskinned, unjoined mesh cook once as unit models
     /// `<model>/unit/<i>`, placed by the instance sources that place the model.
     pub assemblies: Option<AssemblySettings>,
+    /// Degrees: a mesh drops `TANGENT` when tangents derived per triangle from positions and
+    /// uvs shade its normal maps within this of the stored ones at the 99th percentile;
+    /// `None` keeps stored tangents.
+    pub tangent_error_max: Option<f32>,
 }
 
 /// Cook-time displacement: triangles split until no edge is over `max_edge`, vertices moved
@@ -107,6 +113,7 @@ impl Default for MeshSettings {
             omm: Some(OmmSettings::default()),
             displace_static: None,
             assemblies: None,
+            tangent_error_max: Some(1.0),
         }
     }
 }
@@ -237,6 +244,24 @@ impl SectionData {
 pub(crate) struct MapSpec {
     pub opacity: OpacitySpec,
     pub displacement: Option<DisplacementSpec>,
+    pub normal: NormalSpec,
+}
+
+/// What a section's material reads the vertex tangent for.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum NormalSpec {
+    /// Nothing.
+    #[default]
+    None,
+    /// Only to turn this unit's cooked normal map, on uv set 0.
+    Texture {
+        unit: String,
+        key: Hash32,
+        wrap: [Wrap; 2],
+    },
+    /// More than a normal map the cook can read: anisotropy, a linked surface, or a normal
+    /// map on another uv set or not cooked here.
+    Tangent,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -276,7 +301,11 @@ impl MapSpec {
             .displacement
             .as_ref()
             .and_then(|d| d.texture.as_ref().map(|t| t.0.as_str()));
-        opacity.into_iter().chain(displacement)
+        let normal = match &self.normal {
+            NormalSpec::Texture { unit, .. } => Some(unit.as_str()),
+            _ => None,
+        };
+        opacity.into_iter().chain(displacement).chain(normal)
     }
 
     /// Everything of the spec that shapes the cooked mesh: values and texture keys.
@@ -293,7 +322,11 @@ impl MapSpec {
                 d.texture.as_ref().map(|t| (t.1, t.2)),
             )
         });
-        format!("{opacity} {displacement:?}")
+        let normal = match &self.normal {
+            NormalSpec::Texture { key, wrap, .. } => format!("texture {key:?} {wrap:?}"),
+            n => format!("{n:?}"),
+        };
+        format!("{opacity} {displacement:?} {normal}")
     }
 }
 
@@ -302,6 +335,17 @@ impl MapSpec {
 pub(crate) struct SectionMaps {
     pub opacity: Option<Opacity>,
     pub displacement: Option<Displacement>,
+    /// Mip 0 of the [`NormalSpec::Texture`] map, stored x and y.
+    pub normal: Option<[Raster; 2]>,
+}
+
+impl SectionMaps {
+    /// Static displacement bakes this section into the geometry.
+    pub(crate) fn bakes(&self) -> bool {
+        self.displacement
+            .as_ref()
+            .is_some_and(|d| !d.mips.is_empty())
+    }
 }
 
 pub(crate) struct CookedMesh {
@@ -311,6 +355,8 @@ pub(crate) struct CookedMesh {
     /// Node page blobs, in [`MeshInfo::node_pages`] order; the first is the top page.
     pub node_pages: Vec<Vec<u8>>,
     pub warnings: Vec<String>,
+    /// The tangent check of a mesh with tangents.
+    pub tangents: Option<TangentCheck>,
 }
 
 pub(crate) fn cook(
@@ -325,7 +371,13 @@ pub(crate) fn cook(
     };
     check(m, s).map_err(fail)?;
     let mut warnings = Vec::new();
-    let mut w = lod::Welded::new(m);
+    // Baked displacement moves the geometry the derived tangents would follow.
+    let bakes = s.displace_static.is_some() && maps.iter().any(SectionMaps::bakes);
+    let tangent_check = match (&m.tangents, s.tangent_error_max) {
+        (Some(t), Some(max)) if !bakes => tangents::check(m, t, maps, max),
+        _ => TangentCheck::KEPT,
+    };
+    let mut w = lod::Welded::new(m, !tangent_check.derive);
     let source_grid =
         Grid::new(&w.positions, s.position_step_log2, m.min_exponent).map_err(fail)?;
     let mut parts = lod::Parts::new(&w, m, &source_grid).map_err(fail)?;
@@ -379,7 +431,7 @@ pub(crate) fn cook(
         omm_alpha.push(alpha);
     }
 
-    let attributes = if m.tangents.is_some() {
+    let attributes = if w.tangents.is_some() {
         MeshHeader::TANGENT
     } else {
         0
@@ -460,6 +512,7 @@ pub(crate) fn cook(
         pages: built.pages,
         node_pages: built.node_pages,
         warnings,
+        tangents: m.tangents.is_some().then_some(tangent_check),
     })
 }
 
@@ -741,6 +794,13 @@ fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
                 errors.len() + 1
             ));
         }
+    }
+    if let Some(t) = s.tangent_error_max
+        && !(t.is_finite() && t >= 0.0)
+    {
+        return Err(format!(
+            "tangent_error_max {t} deg is not finite and non-negative"
+        ));
     }
     if let Some(e) = s.merge_error
         && !(e.is_finite() && e > 0.0)

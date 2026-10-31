@@ -24,14 +24,16 @@ pub(crate) struct Welded {
 }
 
 impl Welded {
-    pub(crate) fn new(m: &MeshData) -> Self {
+    /// Welds `m`, without its tangents unless `tangents`.
+    pub(crate) fn new(m: &MeshData, tangents: bool) -> Self {
         let n = m.positions.len();
+        let stored = m.tangents.as_ref().filter(|_| tangents);
         let mut streams = vec![
             VertexStream::new(m.positions.as_ptr()),
             VertexStream::new(m.normals.as_ptr()),
             VertexStream::new(m.uvs.as_ptr()),
         ];
-        if let Some(t) = &m.tangents {
+        if let Some(t) = stored {
             streams.push(VertexStream::new(t.as_ptr()));
         }
         if let Some(k) = &m.skin {
@@ -53,10 +55,7 @@ impl Welded {
         Self {
             positions: remap_all(&m.positions),
             normals: remap_all(&m.normals),
-            tangents: m
-                .tangents
-                .as_ref()
-                .map(|t| meshopt::remap_vertex_buffer(t, count, &remap)),
+            tangents: stored.map(|t| meshopt::remap_vertex_buffer(t, count, &remap)),
             uvs: meshopt::remap_vertex_buffer(&m.uvs, count, &remap),
             skin: m.skin.as_ref().map(|k| Skin {
                 joints: meshopt::remap_vertex_buffer(&k.joints, count, &remap),

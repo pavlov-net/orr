@@ -94,6 +94,22 @@ fn build(args: &[String]) -> Result<bool> {
             a.repeated_bytes
         )?;
     }
+    let tangents: Vec<_> = cooked
+        .report
+        .assets
+        .iter()
+        .flat_map(|a| &a.entries)
+        .filter_map(|e| e.mesh.as_ref()?.tangents.as_ref())
+        .collect();
+    if !tangents.is_empty() {
+        writeln!(
+            out,
+            "tangents derived on {} of {} meshes, {} B saved",
+            tangents.iter().filter(|t| t.derived).count(),
+            tangents.len(),
+            tangents.iter().map(|t| t.bytes_saved).sum::<u64>()
+        )?;
+    }
     writeln!(
         out,
         "{cooked_n} entries cooked, {linked} linked in {:.2} s",

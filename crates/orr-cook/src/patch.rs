@@ -94,6 +94,7 @@ patch! {
         omm: Option<OmmSettings>,
         displace_static: Option<StaticDisplacement>,
         assemblies: Option<AssemblySettings>,
+        tangent_error_max: Option<f32>,
     }
 }
 

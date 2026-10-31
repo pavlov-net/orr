@@ -18,7 +18,7 @@ pub(crate) enum Encoding {
     /// RGB as sRGB, alpha linear.
     Bc7Srgb,
     Bc7,
-    /// Normal maps store x and y as `0.5 v + 0.5`.
+    /// Normal maps store x and y as `orr_pack::texture::normal` encodes them.
     Bc5,
     Bc4,
     Bc6h,

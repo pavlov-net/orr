@@ -1252,3 +1252,94 @@ fn a_statically_displaced_library_mesh_binds_its_material_without_displacement()
     assert_eq!(m.textures[slot::DISPLACEMENT].texture, AssetId::NONE);
     assert_eq!(m.displacement_scale, 0.0);
 }
+
+/// A normal-mapped 16 x 16 grid whose tangents follow its uvs, except on the vertex column
+/// at x = 0.5 with `seam`, where they turn 90 degrees.
+fn normal_mapped(path: &Path, seam: bool) {
+    let (pos, uv, idx) = grid(16, |_, _| 0.0);
+    let tangents: Vec<[f32; 4]> = pos
+        .iter()
+        .map(|p| {
+            if seam && (p[0] - 0.5).abs() < 1e-4 {
+                [0.0, 0.0, 1.0, -1.0]
+            } else {
+                [1.0, 0.0, 0.0, -1.0]
+            }
+        })
+        .collect();
+    // Tilted toward -x everywhere, more toward the middle rows; y varies by column.
+    let tex = png(64, 64, |x, y| {
+        let nx = -0.3 - 0.2 * (y as f32 * 0.1).sin().abs();
+        let ny = 0.4 * (x as f32 * 0.2).sin();
+        let nz = (1.0 - nx * nx - ny * ny).sqrt();
+        let b = |v: f32| (127.5 * v + 127.5).round() as u8;
+        [b(nx), b(ny), b(nz), 255]
+    });
+    let mut g = Glb::default();
+    let pa = g.floats(&pos, "VEC3");
+    let na = g.floats(&vec![[0.0f32, 1.0, 0.0]; pos.len()], "VEC3");
+    let ta = g.floats(&tangents, "VEC4");
+    let ua = g.floats(&uv, "VEC2");
+    let ia = g.indices(&idx);
+    let img = g.image(&tex);
+    g.write(
+        path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"NORMAL":{na},"TANGENT":{ta},"TEXCOORD_0":{ua}}},"indices":{ia},"material":0}}]}}],
+"materials":[{{"normalTexture":{{"index":0}}}}],
+"textures":[{{"source":0}}],"images":[{{"bufferView":{img},"mimeType":"image/png"}}]"#
+        ),
+    );
+}
+
+#[test]
+fn tangents_are_derived_unless_a_seam_turns_the_shading() {
+    let d = dir("gltf-tangents");
+    let tangents = |seam: bool| {
+        let path = d.join(format!("grid-{seam}.glb"));
+        normal_mapped(&path, seam);
+        let (a, report) = cook(&path, GltfSettings::default()).unwrap();
+        let mesh = report
+            .assets
+            .iter()
+            .flat_map(|a| &a.entries)
+            .find_map(|e| e.mesh.clone())
+            .unwrap();
+        (a, mesh)
+    };
+
+    let (a, mesh) = tangents(false);
+    let t = mesh.tangents.unwrap();
+    assert!(t.derived && t.angle_p99.unwrap() <= 0.1, "{t:?}");
+    assert!(t.texels >= 64 * 64);
+    assert_eq!(t.bytes_saved, 4 * mesh.vertices);
+    assert_eq!(
+        mesh_of(&a, "g/mesh").info.header.attributes & mesh::MeshHeader::TANGENT,
+        0
+    );
+
+    // BC5 holds x at 0.5 v + 0.5: every texel tilts toward -x, by 0.3 to 0.5.
+    let e = a.find(AssetId::from_name("g/texture/0/normal")).unwrap();
+    let blobs = a.blobs(e);
+    let info = TextureInfo::parse(&read(&a, &blobs[0])).unwrap();
+    assert_eq!(info.header.vk_format, orr_pack::texture::vk::BC5_UNORM);
+    let bytes = info.mip_texels(&read(&a, &blobs[1]), 0, 0).unwrap();
+    for block in bytes.chunks_exact(16) {
+        let mut px = [0u8; 32];
+        bcdec_rs::bc5(block, &mut px, 8, false);
+        for xy in px.as_chunks::<2>().0 {
+            let [x, _, _] = orr_pack::texture::normal::decode(xy.map(|v| f32::from(v) / 255.0));
+            assert!((-0.53..=-0.27).contains(&x), "{x}");
+        }
+    }
+
+    let (a, mesh) = tangents(true);
+    let t = mesh.tangents.unwrap();
+    assert!(!t.derived && t.angle_p99.unwrap() > 10.0, "{t:?}");
+    assert_eq!(t.bytes_saved, 0);
+    assert_ne!(
+        mesh_of(&a, "g/mesh").info.header.attributes & mesh::MeshHeader::TANGENT,
+        0
+    );
+}

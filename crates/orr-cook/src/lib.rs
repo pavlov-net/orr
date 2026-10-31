@@ -103,7 +103,8 @@ pub use raster::{
 };
 pub use report::{
     ArchiveReport, AssemblyReport, AssemblyUnitReport, AssetReport, CookReport, EntryReport,
-    LevelReport, MeshReport, NeuralReport, NeuralTextureReport, Outcome, TextureReport,
+    LevelReport, MeshReport, NeuralReport, NeuralTextureReport, Outcome, TangentReport,
+    TextureReport,
 };
 pub use skin::ClipSettings;
 pub use subd::{Boundary, CageInput, Corner, Crease, FaceVarying, SubdSettings, UvLinear};
