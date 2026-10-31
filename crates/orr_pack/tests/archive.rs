@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use orr_pack::{
-    Archive, ArchiveWriter, AssetId, BlobIn, Codec, Error, Filter, Hash32, StoredRange, Target,
+    Archive, ArchiveWriter, AssetId, BcLayout, BlobIn, Codec, Error, Filter, Hash32, StoredRange,
+    Target,
 };
 
 const USER: u16 = 0x8001;
@@ -78,6 +79,9 @@ fn cases() -> Vec<Case> {
         (Codec::Zstd, Filter::None, "zstd"),
         (Codec::Zstd, Filter::BytePlanes4, "zstd-planes"),
         (Codec::None, Filter::BytePlanes4, "none-planes"),
+        (Codec::Zstd, Filter::BcSplit(BcLayout::Bc5), "zstd-bc5"),
+        (Codec::Zstd, Filter::BcSplit(BcLayout::Bc7), "zstd-bc7"),
+        (Codec::None, Filter::BcSplit(BcLayout::Bc6h), "none-bc6h"),
     ] {
         let b = |v: Vec<u8>, mount, chunk| (v, codec, filter, mount, chunk);
         add(&format!("{tag}/empty"), vec![b(Vec::new(), false, 0)]);

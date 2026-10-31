@@ -5,7 +5,6 @@ use std::io::{self, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::codec::split_planes;
 use crate::format::{HEADER_LEN, Layout, MAGIC, MOUNT_ALIGN, PAGE, codec_byte, hash_blob};
 use crate::{
     Archive, AssetId, Blob, Chunk, Codec, Entry, Error, FORMAT_VERSION, Filter, GDEFLATE_PAGE,
@@ -57,7 +56,7 @@ impl<'a> BlobIn<'a> {
     ) -> Result<EncodedBlob<'a>> {
         let mut stored = Vec::new();
         let mut lens = Vec::new();
-        let mut planes = Vec::new();
+        let mut filtered = Vec::new();
         let raw_chunks: Vec<&[u8]> = if self.bytes.is_empty() {
             vec![&[]]
         } else {
@@ -65,11 +64,11 @@ impl<'a> BlobIn<'a> {
         };
         let (mut codec, mut filter) = (plan.codec, plan.filter);
         for c in &raw_chunks {
-            let src = if filter == Filter::BytePlanes4 {
-                split_planes(c, &mut planes);
-                &planes[..]
-            } else {
+            let src = if filter == Filter::None {
                 c
+            } else {
+                filter.apply(c, &mut filtered);
+                &filtered[..]
             };
             let n = stored.len();
             match codec {
@@ -165,7 +164,7 @@ impl Plan {
     fn key(&self, b: &BlobIn) -> Hash32 {
         let mut key = blake3::Hasher::new();
         key.update(b"raw");
-        key.update(&[self.codec as u8, self.filter as u8, u8::from(b.mount)]);
+        key.update(&[self.codec as u8, self.filter.code(), u8::from(b.mount)]);
         key.update(&self.chunk.to_le_bytes());
         key.update(b.bytes);
         Hash32::finish(&key)

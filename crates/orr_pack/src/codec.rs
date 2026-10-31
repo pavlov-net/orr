@@ -1,6 +1,59 @@
-use crate::{Codec, Error, Filter, GDeflate, Result};
+use crate::{BcLayout, Codec, Error, Filter, GDeflate, Result};
 
-pub(crate) fn split_planes(src: &[u8], dst: &mut Vec<u8>) {
+impl Filter {
+    /// The filter's nibble in [`crate::Blob::codec`].
+    pub(crate) fn code(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::BytePlanes4 => 1,
+            Self::BcSplit(l) => 2 + l as u8,
+        }
+    }
+
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::None),
+            1 => Some(Self::BytePlanes4),
+            c => BcLayout::ALL
+                .get(usize::from(c) - 2)
+                .map(|&l| Self::BcSplit(l)),
+        }
+    }
+
+    /// Writes the filtered form of `src` to `dst`.
+    pub(crate) fn apply(self, src: &[u8], dst: &mut Vec<u8>) {
+        match self {
+            Self::None => {
+                dst.clear();
+                dst.extend_from_slice(src);
+            }
+            Self::BytePlanes4 => split_planes(src, dst),
+            Self::BcSplit(l) => l.split(src, dst),
+        }
+    }
+
+    /// Largest filtered form of `raw` bytes.
+    fn max_len(self, raw: usize) -> usize {
+        match self {
+            Self::BcSplit(l) => l.max_split_len(raw),
+            _ => raw,
+        }
+    }
+
+    fn undo(self, src: &[u8], dst: &mut [u8]) -> Result<()> {
+        if let Self::BcSplit(l) = self {
+            return l.join(src, dst);
+        }
+        check_len(src.len(), dst.len())?;
+        match self {
+            Self::BytePlanes4 => join_planes(src, dst),
+            _ => dst.copy_from_slice(src),
+        }
+        Ok(())
+    }
+}
+
+fn split_planes(src: &[u8], dst: &mut Vec<u8>) {
     let n = src.len() / 4;
     dst.clear();
     for p in 0..4 {
@@ -28,39 +81,45 @@ pub(crate) fn decode_chunk(
     src: &[u8],
     dst: &mut [u8],
 ) -> Result<()> {
-    let planes = filter == Filter::BytePlanes4;
     let mut scratch = Vec::new();
-    let out: &mut [u8] = if planes {
-        scratch.resize(dst.len(), 0);
-        &mut scratch
-    } else {
-        dst
+    let decoded = match (codec, filter) {
+        (Codec::None, _) => src,
+        (_, Filter::None) => {
+            let n = decompress(codec, gdeflate, src, dst)?;
+            return check_len(n, dst.len());
+        }
+        _ => {
+            scratch.resize(filter.max_len(dst.len()), 0);
+            let n = decompress(codec, gdeflate, src, &mut scratch)?;
+            &scratch[..n]
+        }
     };
+    filter.undo(decoded, dst)
+}
+
+fn check_len(n: usize, want: usize) -> Result<()> {
+    if n == want {
+        Ok(())
+    } else {
+        Err(Error::Decode(format!("{n} decoded bytes for {want}")))
+    }
+}
+
+/// Decompresses `src` into the front of `dst` and returns the decoded length.
+fn decompress(
+    codec: Codec,
+    gdeflate: Option<&dyn GDeflate>,
+    src: &[u8],
+    dst: &mut [u8],
+) -> Result<usize> {
     match codec {
-        Codec::None => {
-            if src.len() != out.len() {
-                return Err(Error::Decode(format!(
-                    "{} stored bytes for {}",
-                    src.len(),
-                    out.len()
-                )));
-            }
-            out.copy_from_slice(src);
-        }
+        Codec::None => unreachable!("stored chunks are not decompressed"),
         Codec::Zstd => {
-            let n = zstd::bulk::decompress_to_buffer(src, &mut *out)
-                .map_err(|e| Error::Decode(e.to_string()))?;
-            if n != out.len() {
-                return Err(Error::Decode(format!(
-                    "zstd gave {n} bytes, expected {}",
-                    out.len()
-                )));
-            }
+            zstd::bulk::decompress_to_buffer(src, dst).map_err(|e| Error::Decode(e.to_string()))
         }
-        Codec::GDeflate => gdeflate.ok_or(Error::GDeflate)?.decompress(src, out)?,
+        Codec::GDeflate => {
+            gdeflate.ok_or(Error::GDeflate)?.decompress(src, dst)?;
+            Ok(dst.len())
+        }
     }
-    if planes {
-        join_planes(&scratch, dst);
-    }
-    Ok(())
 }

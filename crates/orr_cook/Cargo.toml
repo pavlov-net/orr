@@ -57,5 +57,9 @@ windows = { version = "0.62.2", features = ["Win32_System_SystemInformation"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[[bench]]
+name = "bc_split"
+harness = false
+
 [lints]
 workspace = true

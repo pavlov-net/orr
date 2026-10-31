@@ -46,6 +46,8 @@ pub struct TextureRules {
     /// Largest mip 0 edge of every texture.
     pub max_size: Option<u32>,
     pub filter: MipFilter,
+    /// See [`super::TextureSettings::bc_split`].
+    pub bc_split: Option<bool>,
     /// Applied in order to every texture made from an image whose name or URI contains the
     /// pattern.
     pub overrides: Vec<(String, TextureOverride)>,
@@ -60,6 +62,7 @@ pub struct TextureOverride {
     pub max_size: Option<u32>,
     pub atlas_grid: Option<[u16; 2]>,
     pub primaries: Option<Primaries>,
+    pub bc_split: Option<bool>,
 }
 
 /// One image a material reads.
@@ -247,6 +250,7 @@ pub(crate) struct TextureJob {
     grid: Option<[u16; 2]>,
     primaries: Primaries,
     filter: MipFilter,
+    bc_split: Option<bool>,
 }
 
 fn bind(m: &mut Material, s: usize, id: AssetId, channel: u8, r: &TexRef) {
@@ -702,6 +706,7 @@ impl<'a> Packer<'a> {
         let mut max_size = self.rules.max_size;
         let mut grid = None;
         let mut primaries = None;
+        let mut bc_split = self.rules.bc_split;
         for (pattern, o) in &self.rules.overrides {
             if images
                 .iter()
@@ -711,6 +716,7 @@ impl<'a> Packer<'a> {
                 max_size = o.max_size.or(max_size);
                 grid = o.atlas_grid.or(grid);
                 primaries = o.primaries.or(primaries);
+                bc_split = o.bc_split.or(bc_split);
             }
         }
         let mut size = [1u32, 1];
@@ -731,7 +737,7 @@ impl<'a> Packer<'a> {
             .unwrap_or(Primaries::Rec709);
 
         let mut recipe = format!(
-            "{} {:?} {:?} {:?} {:?} {:?} {quality:?} {max_size:?} {grid:?} {primaries:?} {:?} {:?}",
+            "{} {:?} {:?} {:?} {:?} {:?} {quality:?} {max_size:?} {grid:?} {primaries:?} {bc_split:?} {:?} {:?}",
             p.role,
             p.encoding,
             p.channels,
@@ -772,6 +778,7 @@ impl<'a> Packer<'a> {
             grid,
             primaries,
             filter: self.rules.filter,
+            bc_split,
         });
         Ok(id)
     }
@@ -792,6 +799,7 @@ impl TextureJob {
     pub(crate) fn run(&self, images: &[ImageFile]) -> Result<Built> {
         let (img, plan) = self.prepare(images)?;
         super::build(vec![img], &plan)
+            .map(|b| b.with_split(self.bc_split))
             .map_err(|e| self.fail(format!("texture {}: {e}", self.pack.role)))
     }
 

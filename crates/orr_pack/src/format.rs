@@ -98,10 +98,7 @@ impl Blob {
     }
 
     pub fn filter(&self) -> Filter {
-        match self.codec >> 4 {
-            1 => Filter::BytePlanes4,
-            _ => Filter::None,
-        }
+        Filter::from_code(self.codec >> 4).unwrap_or(Filter::None)
     }
 
     pub fn is_mount(&self) -> bool {
@@ -128,7 +125,7 @@ impl Blob {
 }
 
 pub(crate) fn codec_byte(codec: Codec, filter: Filter) -> u8 {
-    codec as u8 | (filter as u8) << 4
+    codec as u8 | filter.code() << 4
 }
 
 pub(crate) const HEADER_LEN: usize = size_of::<Header>();
@@ -256,7 +253,7 @@ pub(crate) fn validate(h: &Header, index: &[u8]) -> Result<Layout> {
         };
         if b.chunk_count == 0
             || b.codec & 0xF > Codec::GDeflate as u8
-            || b.codec >> 4 > Filter::BytePlanes4 as u8
+            || Filter::from_code(b.codec >> 4).is_none()
             || b.mount > 1
         {
             return Err(Error::Malformed("blob record"));

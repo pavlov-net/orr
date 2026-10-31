@@ -5,6 +5,7 @@
 //! one or more [`Blob`]s; blobs are compressed per chunk so a chunk reads and decodes alone.
 
 mod archive;
+mod bc_split;
 mod blob;
 pub mod clip;
 mod codec;
@@ -26,6 +27,7 @@ use std::path::PathBuf;
 use bytemuck::{Pod, Zeroable};
 
 pub use archive::{Archive, StoredRange};
+pub use bc_split::BcLayout;
 pub use format::{Blob, Chunk, Entry, FORMAT_VERSION, Header, StrRef};
 pub use writer::{ArchiveWriter, BlobIn, EncodedBlob, EntryBlobs, Target};
 
@@ -258,13 +260,19 @@ pub trait GDeflate: Send + Sync {
 /// Largest decoded GDeflate page and chunk: the decompression region limit.
 pub const GDEFLATE_PAGE: u32 = 64 << 10;
 
-/// A reversible byte transform applied to each chunk before compression.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// A reversible byte transform applied to each chunk before compression and undone by
+/// [`Archive::decode`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Filter {
-    None = 0,
+    None,
     /// Splits each chunk into four planes of byte 0, 1, 2 and 3 of every 4-byte word; a
     /// trailing partial word stays in place.
-    BytePlanes4 = 1,
+    BytePlanes4,
+    /// Splits the BCn blocks of each chunk into streams of like fields: endpoints, then
+    /// indices. BC6H and BC7 blocks are grouped by mode after a stream of one mode byte per
+    /// block, so the split is longer than the blocks. Bytes after the last whole block stay
+    /// at the end.
+    BcSplit(BcLayout),
 }
 
 #[derive(Debug, thiserror::Error)]

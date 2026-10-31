@@ -10,6 +10,8 @@
 //! - `ORR_HDR_SET=<dir>`: every `.hdr` under `dir` as a 1024^2 environment map; prints the
 //!   PSNR of the map resampled back to a 1024 x 512 equirect against the source.
 //!
+//! Both check that every compressed BCn tile is stored split and decodes to its blocks.
+//!
 //! - `ORR_NTC_SET=<dir>` (with the `ntc` feature, LibNTC and a CUDA device): every glTF
 //!   file under `dir` cooks neural texture sets beside its BC textures; every set holds no
 //!   more bytes than the BC textures it stands in for and every texture meets the PSNR
@@ -21,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, Source, TextureSettings, Usage};
 use orr_pack::texture::{FormatInfo, TextureInfo, octahedral, vk};
-use orr_pack::{Archive, AssetId, Target};
+use orr_pack::{Archive, AssetId, BcLayout, Codec, Filter, Target};
 
 fn files(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     for e in std::fs::read_dir(dir).unwrap() {
@@ -32,6 +34,26 @@ fn files(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
             out.push(p);
         }
     }
+}
+
+/// Verifies every texture of `a`, which decodes each blob chunk by chunk through the BCn
+/// split and checks the bytes, and returns the number of split chunks.
+fn split_chunks(a: &Archive) -> u32 {
+    let mut n = 0;
+    for e in a.entries() {
+        a.verify(e).unwrap();
+        let info = TextureInfo::parse(&read_blob(a, e, 0)).unwrap();
+        let Some(layout) = BcLayout::of(info.header.vk_format) else {
+            continue;
+        };
+        for b in &a.blobs(e)[1..] {
+            if b.codec() != Codec::None {
+                assert_eq!(b.filter(), Filter::BcSplit(layout), "{}", a.name(e));
+                n += u32::from(b.chunk_count);
+            }
+        }
+    }
+    n
 }
 
 fn read_blob(a: &Archive, e: &orr_pack::Entry, i: usize) -> Vec<u8> {
@@ -188,9 +210,10 @@ fn texture_set_cooks() {
         std::fs::metadata(&out).unwrap().len() >> 20
     );
     let a = Archive::open(&out).unwrap();
-    for e in a.entries() {
-        a.verify(e).unwrap();
-    }
+    println!(
+        "{} tiles decode exact through the BCn split",
+        split_chunks(&a)
+    );
     let (mut worst, mut over, mut count) = ([0.0f32; 4], [0u32; 4], [0u32; 4]);
     for (name, grid) in checks {
         let e = a.find(AssetId::from_name(&name)).unwrap();
@@ -299,6 +322,7 @@ fn hdr_set_round_trips() {
         )
         .unwrap();
         let a = Archive::from_memory(std::sync::Arc::clone(&cooked.memory[0])).unwrap();
+        let split = split_chunks(&a);
         let e = a.find(AssetId::from_name("env")).unwrap();
         let info = TextureInfo::parse(&read_blob(&a, e, 0)).unwrap();
         let n = info.header.width;
@@ -356,7 +380,7 @@ fn hdr_set_round_trips() {
         }
         let db = 10.0 * (f64::from(w * h * 3) / mse).log10();
         println!(
-            "{}: {sw}x{sh} -> {n}^2, round trip {db:.1} dB",
+            "{}: {sw}x{sh} -> {n}^2, round trip {db:.1} dB, {split} split tiles exact",
             p.file_name().unwrap().to_string_lossy()
         );
     }
