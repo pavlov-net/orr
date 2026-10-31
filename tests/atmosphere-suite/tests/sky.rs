@@ -53,6 +53,11 @@ fn radiance(rig: &Rig, dirs: &[DVec3]) -> Vec<[f64; 3]> {
 /// The direction of every sky-view texel, row by row, from [`EYE`], once a frame has written
 /// the block.
 fn texel_directions(rig: &Rig) -> Vec<DVec3> {
+    texel_directions_from(rig, EYE)
+}
+
+/// The direction of every sky-view texel of a LUT at the altitude of `eye`.
+fn texel_directions_from(rig: &Rig, eye: DVec3) -> Vec<DVec3> {
     let n = SKY_VIEW_SIZE[0] * SKY_VIEW_SIZE[1];
     let texels = probe(
         rig.block(),
@@ -60,7 +65,7 @@ fn texel_directions(rig: &Rig) -> Vec<DVec3> {
         n.into(),
         Probe {
             threads: n,
-            light: eye_light(),
+            light: atmosphere_suite::eye_light(eye),
             ..Probe::default()
         },
     );
@@ -72,7 +77,7 @@ fn texel_directions(rig: &Rig) -> Vec<DVec3> {
 
 /// The rows either side of the horizon match the reference within the 5% sky gate, single
 /// scattering on both sides, so the LUT adds no step of its own. The sky still steps there:
-/// just above the horizon the ray grazes the planet for hundreds of kilometres, just below
+/// just above the horizon the ray grazes the planet for hundreds of kilometers, just below
 /// it meets the ground about 5 km away (from 2 m).
 #[test]
 fn horizon_matches_reference() {
@@ -212,55 +217,61 @@ fn disc_integral_after_the_medium() {
 
 /// The worst per-channel error of the sky-view LUT, composed with the reference over
 /// [0, `near_range`] along the same ray, against the reference's whole path, at light 5, 30
-/// and 60 deg toward the zenith and the horizon, height fog off and on.
-fn composition_error(multiple: bool, precision: &Precision) -> f64 {
+/// and 60 deg toward the zenith and the horizon, height fog off and on, seen from each of
+/// `eyes`, the rig's other views, with the focus at [`EYE`].
+fn composition_error(multiple: bool, precision: &Precision, eyes: &[DVec3]) -> f64 {
     let [w, h] = SKY_VIEW_SIZE;
     let mut worst = 0.0f64;
     for atmosphere in [earth(), foggy()] {
         let fog = atmosphere.height_fog.is_some();
         let mut rig = Rig::new(&atmosphere);
         rig.sky.set_multiple_scattering(multiple);
+        rig.eyes = eyes.to_vec();
         rig.frame(None, EYE);
-        let texels = texel_directions(&rig);
-        // The zenith, and the lowest row above the horizon toward the light and away.
-        let row = &texels[(h / 2 - 1) as usize * w as usize..][..w as usize];
-        let along = |sign: f64| {
-            *row.iter()
-                .max_by(|a, b| (sign * a.x).total_cmp(&(sign * b.x)))
-                .unwrap()
-        };
-        let views = [
-            ("zenith", texels[0]),
-            ("horizon toward", along(1.0)),
-            ("horizon away", along(-1.0)),
-        ];
         let reference = Reference::new(&atmosphere);
         let groups = reference.run(Channels::Groups);
-        for elevation in [5.0, 30.0, 60.0] {
-            let sun = dir(elevation, 0.0);
-            rig.frame(Some(sun), EYE);
-            let dirs: Vec<DVec3> = views.iter().map(|v| v.1).collect();
-            let lut = radiance(&rig, &dirs);
-            let light = Light::solar(sun);
-            for ((name, d), lut) in views.iter().zip(&lut) {
-                let nits = |v: &[f64]| groups.rec2020(v).map(|c| c * SOLAR_ILLUMINANCE);
-                let full = nits(&groups.sky(EYE, *d, &light, 0.0, precision).values);
-                let near = groups.segment(EYE, *d, NEAR_RANGE, &light, Geometry::Sphere, precision);
-                let near_inscatter = nits(&near.inscatter.values);
-                let t = groups.rec2020(&near.transmittance);
-                let composed: [f64; 3] =
-                    std::array::from_fn(|c| near_inscatter[c] + t[c] / SOLAR_COLOUR[c] * lut[c]);
-                let y = luminance(full);
-                let error = (0..3)
-                    .map(|c| (composed[c] - full[c]).abs() / full[c].abs().max(0.05 * y))
-                    .fold(0.0, f64::max);
-                eprintln!(
-                    "fog {fog:>5}, light {elevation:>4} deg, {name:>14}: {y:.3e} cd/m^2 \
-                     ({:.1}% inside near_range), worst channel off by {:.2}%",
-                    luminance(near_inscatter) / y * 100.0,
-                    error * 100.0
-                );
-                worst = worst.max(error);
+        for &eye in eyes {
+            let texels = texel_directions_from(&rig, eye);
+            // The zenith, and the lowest row above the horizon toward the light and away.
+            let row = &texels[(h / 2 - 1) as usize * w as usize..][..w as usize];
+            let along = |sign: f64| {
+                *row.iter()
+                    .max_by(|a, b| (sign * a.x).total_cmp(&(sign * b.x)))
+                    .unwrap()
+            };
+            let views = [
+                ("zenith", texels[0]),
+                ("horizon toward", along(1.0)),
+                ("horizon away", along(-1.0)),
+            ];
+            for elevation in [5.0, 30.0, 60.0] {
+                let sun = dir(elevation, 0.0);
+                rig.frame(Some(sun), EYE);
+                let dirs: Vec<DVec3> = views.iter().map(|v| v.1).collect();
+                let lut = sky_radiance(&rig, eye, &dirs);
+                let light = Light::solar(sun);
+                for ((name, d), lut) in views.iter().zip(&lut) {
+                    let nits = |v: &[f64]| groups.rec2020(v).map(|c| c * SOLAR_ILLUMINANCE);
+                    let full = nits(&groups.sky(eye, *d, &light, 0.0, precision).values);
+                    let near =
+                        groups.segment(eye, *d, NEAR_RANGE, &light, Geometry::Sphere, precision);
+                    let near_inscatter = nits(&near.inscatter.values);
+                    let t = groups.rec2020(&near.transmittance);
+                    let composed: [f64; 3] = std::array::from_fn(|c| {
+                        near_inscatter[c] + t[c] / SOLAR_COLOUR[c] * lut[c]
+                    });
+                    let y = luminance(full);
+                    let error = (0..3)
+                        .map(|c| (composed[c] - full[c]).abs() / full[c].abs().max(0.05 * y))
+                        .fold(0.0, f64::max);
+                    eprintln!(
+                        "eye {:>7.0} m, fog {fog:>5}, light {elevation:>4} deg, {name:>14}:                          {y:.3e} cd/m^2 ({:.1}% inside near_range), worst channel off by {:.2}%",
+                        eye.y,
+                        luminance(near_inscatter) / y * 100.0,
+                        error * 100.0
+                    );
+                    worst = worst.max(error);
+                }
             }
         }
     }
@@ -275,7 +286,7 @@ fn near_range_composition() {
         relative_error: 1.0,
         max_samples: 0,
     };
-    let worst = composition_error(false, &single);
+    let worst = composition_error(false, &single, &[EYE]);
     assert!(worst < 0.05, "composed sky off by {:.2}%", worst * 100.0);
     assert_clean();
 }
@@ -289,8 +300,85 @@ fn near_range_composition_full_sky() {
         relative_error: 0.01,
         max_samples: 1 << 22,
     };
-    let worst = composition_error(true, &precision);
+    let worst = composition_error(true, &precision, &[EYE]);
     eprintln!("worst channel {:.1}%", worst * 100.0);
+    assert_clean();
+}
+
+/// Eyes 50 m, 100 m, 1 km and 10 km above the focus at [`EYE`].
+const HIGH_EYES: [DVec3; 4] = [
+    DVec3::new(0.0, 52.0, 0.0),
+    DVec3::new(30.0, 102.0, 0.0),
+    DVec3::new(0.0, 1002.0, 40.0),
+    DVec3::new(-50.0, 10_002.0, 0.0),
+];
+
+/// Views well above the focus get sky-view LUTs at their own altitudes and meet the 5% sky
+/// gate there (single scattering on both sides, as in `near_range_composition`).
+#[test]
+fn extra_views_meet_the_sky_gate() {
+    let single = Precision {
+        relative_error: 1.0,
+        max_samples: 0,
+    };
+    let mut rig = Rig::new(&earth());
+    rig.eyes = HIGH_EYES.to_vec();
+    rig.frame(None, EYE);
+    let block = read_buffer(rig.block(), 1)[0];
+    let mut altitudes = block.sky_view_altitude[1..block.sky_view_count as usize].to_vec();
+    altitudes.sort_by(f32::total_cmp);
+    assert_eq!(altitudes, HIGH_EYES.map(|e| e.y as f32), "one LUT per eye");
+
+    let worst = composition_error(false, &single, &HIGH_EYES);
+    assert!(worst < 0.05, "composed sky off by {:.2}%", worst * 100.0);
+    assert_clean();
+}
+
+/// An eye moving 0.2 m in one frame through 25 m above the focus, where it gets its own LUT,
+/// and through 50 m, where that LUT stops being blended with the focus LUT, changes no sky
+/// pixel by more than 2%. Below the horizon the virtual ground still changes by far more:
+/// from 2 m it lies inside `near_range` near the horizon, from 27 m kilometers away.
+#[test]
+fn crossing_the_view_thresholds() {
+    let elevations = [0.1, 0.3, 1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 40.0, 60.0, 89.0];
+    let dirs: Vec<DVec3> = elevations
+        .iter()
+        .flat_map(|&e| (0..16).map(move |a| dir(e, f64::from(a) * 22.5)))
+        .collect();
+    let ground: Vec<DVec3> = [-0.5, -1.0, -3.0, -10.0]
+        .iter()
+        .flat_map(|&e| (0..16).map(move |a| dir(e, f64::from(a) * 22.5)))
+        .collect();
+    let mut worst = 0.0f64;
+    for atmosphere in [earth(), foggy()] {
+        let fog = atmosphere.height_fog.is_some();
+        let mut rig = Rig::new(&atmosphere);
+        for elevation in [5.0, 30.0] {
+            let sun = Some(dir(elevation, 0.0));
+            for (from, to, luts) in [(24.9, 25.1, [1, 2]), (49.9, 50.1, [2, 2])] {
+                let mut sky = Vec::new();
+                let mut below = Vec::new();
+                for (above, luts) in [(from, luts[0]), (to, luts[1])] {
+                    let eye = EYE + DVec3::Y * above;
+                    rig.eyes = vec![eye];
+                    rig.frame(sun, EYE);
+                    let count = read_buffer(rig.block(), 1)[0].sky_view_count;
+                    assert_eq!(count, luts, "{above} m above the focus");
+                    sky.push(sky_radiance(&rig, eye, &dirs));
+                    below.push(sky_radiance(&rig, eye, &ground));
+                }
+                let change = lut_difference(&sky[1], &sky[0]);
+                eprintln!(
+                    "fog {fog:>5}, light {elevation:>4} deg, {from} to {to} m: sky {:.2}%, \
+                     virtual ground {:.1}%",
+                    change * 100.0,
+                    lut_difference(&below[1], &below[0]) * 100.0
+                );
+                worst = worst.max(change);
+            }
+        }
+    }
+    assert!(worst < 0.02, "sky changed by {:.2}%", worst * 100.0);
     assert_clean();
 }
 

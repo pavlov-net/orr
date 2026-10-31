@@ -15,7 +15,7 @@ use orr::{
 };
 use orr_atmosphere::presets::solar_disc;
 use orr_atmosphere::spectrum::{SOLAR_COLOUR, SOLAR_ILLUMINANCE};
-use orr_atmosphere::{Atmosphere, AtmosphereGpu, AtmosphereState};
+use orr_atmosphere::{Atmosphere, AtmosphereGpu, AtmosphereState, MAX_EXTRA_VIEWS};
 use orr_lighting::{LightingStats, SceneLighting, SceneLightingSettings, ScenePass};
 use orr_scene::testing::{device, read_buffer, wait};
 
@@ -47,12 +47,15 @@ pub fn solar_rec2020() -> [f64; 3] {
 }
 
 /// A renderer with orr's kernels linked to the sky, one scene and one atmosphere whose
-/// candidate is [`SUN`], and optionally lighting's scene pass after the atmosphere's.
+/// candidate is [`SUN`] and that holds [`MAX_EXTRA_VIEWS`] extra sky-view LUTs, and optionally
+/// lighting's scene pass after the atmosphere's.
 pub struct Rig {
     pub renderer: Renderer,
     pub scene: SceneId,
     pub sky: AtmosphereState,
     pub lighting: Option<SceneLighting>,
+    /// The eyes of the scene's views other than the focus view, passed to every `record`.
+    pub eyes: Vec<DVec3>,
     frames: u32,
     frame_id: u64,
     lights: Vec<LightId>,
@@ -68,13 +71,15 @@ impl Rig {
         let scene = renderer
             .create_scene(&SceneDesc::default(), &Default::default())
             .unwrap();
-        let mut sky = AtmosphereState::new(device(), atmosphere, SamplerIndex(7)).unwrap();
+        let mut sky =
+            AtmosphereState::new(device(), atmosphere, SamplerIndex(7), MAX_EXTRA_VIEWS).unwrap();
         sky.set_lights(&[SUN]);
         Self {
             renderer,
             scene,
             sky,
             lighting: None,
+            eyes: Vec::new(),
             frames: 0,
             frame_id: 0,
             lights: Vec::new(),
@@ -141,10 +146,11 @@ impl Rig {
             w.set_medium(self.sky.data());
         }
         let mut root = None;
-        let (sky, lighting, frame) = (&mut self.sky, &mut self.lighting, self.frame_id);
+        let (sky, lighting, eyes, frame) =
+            (&mut self.sky, &mut self.lighting, &self.eyes, self.frame_id);
         f.update_scenes(&mut |cx| {
             root = Some(cx.root);
-            sky.record(cx).unwrap();
+            sky.record(cx, eyes).unwrap();
             if let Some(lighting) = lighting.as_mut() {
                 let pass = ScenePass {
                     frame,
