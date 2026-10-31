@@ -1,7 +1,7 @@
-//! A shader abort and a hang lose the device, and the report names the pass. Each test
-//! loses its device, so each runs alone: `cargo test --test crash -- <name>`. The hang
-//! resets the GPU and runs only with `ORR_GPU_HANG_TEST=1` and no other GPU application
-//! running.
+//! A shader abort and a hang lose the device, and the report names the pass. Both are
+//! ignored by default so whole-suite runs never lose the device on purpose; each runs alone:
+//! `ORR_GPU_EXPECT_FAULT=1 cargo test --test crash -- --ignored <name>`. The hang resets the
+//! GPU, so no other GPU application may be running.
 
 use std::path::Path;
 use std::time::Duration;
@@ -66,6 +66,7 @@ fn lose_device(
 }
 
 #[test]
+#[ignore = "loses the device: run with ORR_GPU_EXPECT_FAULT=1 and --test crash -- --ignored"]
 fn abort_reports_pass_and_faults() {
     let d = device_with(Diagnostics::Checkpoints);
     if !d.caps().shader_abort || !d.caps().breadcrumbs {
@@ -89,11 +90,8 @@ fn abort_reports_pass_and_faults() {
 }
 
 #[test]
+#[ignore = "hangs and resets the GPU: run alone, with no other GPU application, using ORR_GPU_EXPECT_FAULT=1 and --test crash -- --ignored"]
 fn hang_reports_pass_and_dumps() {
-    if std::env::var_os("ORR_GPU_HANG_TEST").is_none_or(|v| v != "1") {
-        log::warn!("skipped: set ORR_GPU_HANG_TEST=1 to hang the GPU");
-        return;
-    }
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("crash-dumps");
     let _ = std::fs::remove_dir_all(&dir);
     let dir: &'static Path = Box::leak(dir.into_boxed_path());
