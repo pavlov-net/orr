@@ -241,24 +241,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     let captured = last
         .filter(|_| capture)
         .and_then(|(id, _)| renderer.screenshots(history, id).pop())
-        .map(|shot| Capture {
-            width: shot.size[0],
-            height: shot.size[1],
-            rgba8: shot
-                .rgba
-                .iter()
-                .enumerate()
-                .map(|(k, &v)| {
-                    let v = f64::from(v.clamp(0.0, 1.0));
-                    let v = if k % 4 == 3 {
-                        v
-                    } else {
-                        orr_color::srgb_encode(v)
-                    };
-                    (v * 255.0).round() as u8
-                })
-                .collect(),
-        });
+        .map(|shot| Capture::from_screenshot(&shot));
     drop(sum);
     drop(roots);
     drop(overlay);

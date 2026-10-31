@@ -117,7 +117,7 @@ void histogram(uint3 id: SV_DispatchThreadID)
 {
     LightSetGpu* set = root.set;
     uint4 h = pcg4d(uint4(id.x, root.frame, 0x7072u, 3u));
-    ResolvedLightSample r = resolve_light_sample(set.tiles[id.x], root.receiver.xyz,
+    ResolvedLightSample r = resolve_light_sample(set, set.tiles[id.x], root.receiver.xyz,
                                                  float2(unit_float(h.x), unit_float(h.y)));
     if (r.pdf == 0.0)
     {

@@ -597,7 +597,7 @@ impl<'a> Frame<'a> {
             state.lighting = Some(fresh);
         }
         let paths = state.lighting.as_mut().expect("lighting view");
-        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+        list.barrier(Stages::ALL, Stages::COMPUTE | Stages::RAY, Hazards::empty());
         lights.paths.record_opaque(
             list,
             scene,
@@ -613,7 +613,11 @@ impl<'a> Frame<'a> {
             lighting,
         );
         state.samples = state.samples.wrapping_add(1);
-        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        list.barrier(
+            Stages::COMPUTE | Stages::RAY,
+            Stages::COMPUTE,
+            Hazards::empty(),
+        );
         let (radiance, radiance_store) = (paths.radiance_index(), paths.radiance_storage());
         if let Some(hook) = hooks.transparency.as_mut() {
             self.scenes

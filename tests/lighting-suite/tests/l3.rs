@@ -10,7 +10,7 @@ use lighting_suite::{
     TestScene, affine, assert_clean, compute_barrier, finish, kernels, pipeline, read, readback,
     render, upload,
 };
-use orr_gpu::{ComputePipeline, GpuAddress, GpuPtr, KernelSet};
+use orr_gpu::{ComputePipeline, GpuAddress, GpuPtr, Hazards, KernelSet, Stages};
 use orr_lighting::{
     DirectionalLight, DiscProfile, EmissiveSelection, LIGHT_TILE_SIZE, LIGHT_TILES, Light, LightId,
     LightSample, LightSetGpu, SceneLighting, SceneLightingSettings, ScenePass,
@@ -956,6 +956,96 @@ fn a_scene_without_lights_gives_empty_candidates_and_no_nan() {
         (sky.dome_luminance, sky.directional),
         (0.0, [0.0; 4]),
         "sky statistics {sky:?}"
+    );
+    assert_clean();
+}
+
+/// Copies `counts` into the scene's light feedback counts, as the views of a frame would add
+/// them.
+fn feed_back(set: &LightSetGpu, counts: &[u32]) {
+    let staging = upload(counts, "feedback counts");
+    let mut list = render().command_list().unwrap();
+    list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
+    list.copy(
+        set.feedback_counts.cast(),
+        staging.gpu.cast(),
+        size_of_val(counts) as u64,
+    );
+    finish(list);
+}
+
+#[test]
+fn light_feedback_blends_into_the_selection_and_clears_on_a_reset() {
+    let mut scene = TestScene::new(SceneDesc {
+        light_capacity: 4,
+        ..SceneDesc::default()
+    });
+    scene.write(|w, _| {
+        for (id, i) in [(0u32, 100.0f32), (1, 900.0)] {
+            w.set_light(
+                LightId(id),
+                Some(&Light::Sphere {
+                    position: DVec3::new(f64::from(id), 3.0, 0.0),
+                    radius: 0.2,
+                    intensity: Vec3::splat(i),
+                    cone: None,
+                }),
+            )
+            .unwrap();
+        }
+    });
+    let mut lighting = scene.lighting(&kernels(&[(&procedural_bake::MODULE, BAKE)]));
+    let share = f64::from(SceneLightingSettings::default().feedback_share);
+    let mut frame = scene.frame;
+    scene_pass(&scene, &mut lighting, frame);
+    let set: LightSetGpu = read(lighting.light_set(), 1)[0];
+    let probabilities = |set: &LightSetGpu| {
+        let p = read(set.light_probability, 4);
+        [p[0], p[1], set.environment_probability].map(f64::from)
+    };
+    let power = probabilities(&set);
+    assert_eq!(power[2], 0.25);
+
+    // Light 3 is empty: what fed back for it takes no share.
+    let n = set.candidate_count as usize;
+    let mut counts = vec![0u32; n + 1];
+    counts[0] = 3000;
+    counts[3] = 500;
+    counts[n] = 1000;
+    feed_back(&set, &counts);
+    frame += 1;
+    scene_pass(&scene, &mut lighting, frame);
+    assert_eq!(lighting.stats(frame).unwrap().feedback_pixels, 4500);
+    let fed = [3000.0, 0.0, 1000.0].map(|c| c / 4000.0);
+    let expected: [f64; 3] = std::array::from_fn(|i| (1.0 - share) * power[i] + share * fed[i]);
+    let check = |got: [f64; 3], what: &str| {
+        for i in 0..3 {
+            assert!(
+                (got[i] - expected[i]).abs() <= 1e-5,
+                "{what}: probabilities {got:?} against {expected:?}"
+            );
+        }
+        let sum: f64 = got.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "{what}: probabilities sum to {sum}"
+        );
+    };
+    check(probabilities(&set), "after feedback");
+    assert_eq!(read(set.light_probability, 4)[3], 0.0);
+
+    // Without new feedback the weights decay together, so the blend holds.
+    frame += 1;
+    scene_pass(&scene, &mut lighting, frame);
+    check(probabilities(&set), "a frame later");
+
+    lighting.reset_history();
+    frame += 1;
+    scene_pass(&scene, &mut lighting, frame);
+    let reset = probabilities(&set);
+    assert!(
+        (0..3).all(|i| (reset[i] - power[i]).abs() <= 1e-6),
+        "after a reset: {reset:?} against {power:?}"
     );
     assert_clean();
 }

@@ -1,7 +1,9 @@
 // Light selection and sampling. Directional lights are a reserved share of every vertex's
 // candidates, weighted by n.l; the scene's other lights (sphere and rect lights, emissive
 // entries and the baked environment) are drawn from a selection CDF into presampled light
-// tiles each frame, and vertices take candidates from the tiles.
+// tiles each frame, and vertices take candidates from the tiles. The selection blends
+// emitted power with the light feedback of earlier frames, and a view's first vertices may
+// also draw from the lights that fed back in their screen tile.
 module light_sampling;
 
 import orr.abi;
@@ -30,6 +32,14 @@ public static const uint TILE_FRAME_STEP = 37;
 public static const float DIRECTIONAL_SHARE = 0.5;
 // Share of tile samples drawn from the environment when other lights are present.
 public static const float ENVIRONMENT_SHARE = 0.25;
+
+// Each frame the selection's feedback weights keep this share of their value and add the
+// pixel counts of the frame before.
+public static const float FEEDBACK_HISTORY = 0.5;
+// Pixels per side of the screen tiles that share one local sampler.
+public static const uint LOCAL_TILE = 16;
+// Lights one local sampler holds.
+public static const uint LOCAL_LIGHTS = 8;
 
 // `LightSample` kinds (bits 0-1), and the kind of a directional candidate.
 public static const uint LIGHT_SAMPLE_ENVIRONMENT = 0;
@@ -84,8 +94,8 @@ public struct LightSample
     // Environment: -(probability per sr). Rect, emissive: probability per m². Sphere: the
     // light's selection probability. 0: no sample.
     public float pdf;
-    // Sphere: the inner and outer spot half angles / pi, 2x16 unorm.
-    public uint cone;
+    // The light's feedback id (`feedback_environment`).
+    public uint light;
     // Bits 0-1: LIGHT_SAMPLE_*. Bit 2: LIGHT_SAMPLE_TWO_SIDED. Bits 8-15: the radiance
     // exponent + 128. Bits 16-31: the sphere radius, half float.
     public uint bits;
@@ -109,6 +119,9 @@ public struct LightSetGpu
     public EmissiveSelection* emissive;
     public float* cluster_cdf;
     public LightSample* tiles;
+    // Per feedback id, the pixels whose feedback named it this frame; the next scene pass
+    // reads and clears them.
+    public uint* feedback_counts;
     public uint directional_count;
     public uint candidate_count;
     // The last value of `cdf`.
@@ -137,6 +150,21 @@ public struct LightSetStats
     // Emitting entries left out of the selection because the cluster pool was full.
     public uint dropped_entries;
     public float environment_probability;
+    // Pixels whose feedback named a light in the frame before.
+    public uint feedback_pixels;
+    public uint _pad1;
+}
+
+// The lights that fed back in one screen tile of a view in its last frame, as a selection.
+public struct LocalLights
+{
+    // Feedback ids.
+    public uint ids[LOCAL_LIGHTS];
+    // Inclusive sums of the pixels that named each.
+    public float cdf[LOCAL_LIGHTS];
+    public uint count;
+    // Probability that a tile-light candidate of the tile's first vertices comes from here.
+    public float share;
     public uint _pad0;
     public uint _pad1;
 }
@@ -150,6 +178,8 @@ public struct NeeVertex
     public float3 normal;
     // The pixel the path belongs to; it picks the tile.
     public uint2 pixel;
+    // The local sampler of the pixel's screen tile, or null.
+    public LocalLights* local;
 }
 
 // One light candidate at a vertex, before visibility.
@@ -166,7 +196,8 @@ public struct ResolvedLightSample
     public float pdf;
     // LIGHT_SAMPLE_*.
     public uint kind;
-    // LIGHT_SAMPLE_DIRECTIONAL: the light's LightId.
+    // LIGHT_SAMPLE_DIRECTIONAL: the light's LightId; otherwise its feedback id, or NO_LIGHT
+    // without a candidate.
     public uint light;
 }
 
@@ -520,7 +551,7 @@ public float3 decode_radiance(LightSample s)
     return unpack_rgb9e5(s.radiance) * exp2(float(k));
 }
 
-LightSample light_sample(uint kind, float3 point, float3 normal, float3 radiance, float pdf)
+LightSample light_sample(uint kind, uint light, float3 point, float3 normal, float3 radiance, float pdf)
 {
     uint2 r = encode_radiance(radiance);
     LightSample s;
@@ -528,7 +559,7 @@ LightSample light_sample(uint kind, float3 point, float3 normal, float3 radiance
     s.normal = oct_encode_snorm16(normal);
     s.radiance = r.x;
     s.pdf = pdf;
-    s.cone = 0;
+    s.light = light;
     s.bits = kind | (r.y << 8);
     return s;
 }
@@ -640,9 +671,10 @@ public float emissive_area_pdf(LightSetGpu* set, uint entry, float luminance)
     return e.total > 0.0 ? e.probability * luminance / e.total : 0.0;
 }
 
-// Tile sample of emissive entry `entry` from `u`: a cluster by its CDF, a triangle by area
-// and a point uniform in the triangle. A triangle's front face winds counter-clockwise.
-LightSample emissive_sample(LightSetGpu* set, uint entry, float4 u)
+// Sample of emissive entry `entry` from `u`, the entry chosen with `probability`: a cluster
+// by its CDF, a triangle by area and a point uniform in the triangle. A triangle's front
+// face winds counter-clockwise.
+LightSample emissive_sample(LightSetGpu* set, uint entry, float4 u, float probability)
 {
     SceneRoot* s = set.scene;
     EmissiveSelection e = set.emissive[entry];
@@ -682,8 +714,8 @@ LightSample emissive_sample(LightSetGpu* set, uint entry, float4 u)
     float b1 = u.w * su;
     float3 p = b0 * p0 + b1 * p1 + (1.0 - b0 - b1) * p2;
     float3 l = material_emission(mat);
-    LightSample r = light_sample(LIGHT_SAMPLE_EMISSIVE, render_point(anchor, m, p), normalize(n), l,
-                                 emissive_area_pdf(set, entry, luminance_rec2020(l)));
+    LightSample r = light_sample(LIGHT_SAMPLE_EMISSIVE, s.light_capacity + entry, render_point(anchor, m, p),
+                                 normalize(n), l, probability * luminance_rec2020(l) / e.total);
     if ((mat.flags & MATERIAL_DOUBLE_SIDED) != 0)
         r.bits |= LIGHT_SAMPLE_TWO_SIDED;
     return r;
@@ -695,25 +727,76 @@ float sample_radius(float radius)
     return unpack_half2x16(pack_half2x16(float2(radius, 0.0))).x;
 }
 
-// Tile sample of sphere or rect light `id` from `u`.
-LightSample local_sample(LightSetGpu* set, uint id, float2 u)
+// Sample of sphere or rect light `id` from `u`, the light chosen with `probability`.
+LightSample local_sample(LightSetGpu* set, uint id, float2 u, float probability)
 {
     LightGpu l = set.scene.lights[id];
-    float p = set.light_probability[id];
     if (l.kind == LIGHT_RECT)
     {
         float3 n = cross(l.edge_x, l.edge_y);
         float area = length(n);
         float3 x = l.position + (u.x - 0.5) * l.edge_x + (u.y - 0.5) * l.edge_y;
-        return light_sample(LIGHT_SAMPLE_RECT, x, n / area, l.color, p / area);
+        return light_sample(LIGHT_SAMPLE_RECT, id, x, n / area, l.color, probability / area);
     }
     float r = sample_radius(l.radius);
     float3 axis = l.cone_cos_outer > -1.0 ? l.direction : float3(0.0, 0.0, 1.0);
-    LightSample s = light_sample(LIGHT_SAMPLE_SPHERE, l.position, axis, l.color / (PI * r * r), p);
-    s.cone = pack_unorm2x16(float2(acos(clamp(l.cone_cos_inner, -1.0, 1.0)),
-                                   acos(clamp(l.cone_cos_outer, -1.0, 1.0))) * INV_PI);
+    LightSample s = light_sample(LIGHT_SAMPLE_SPHERE, id, l.position, axis, l.color / (PI * r * r), probability);
     s.bits |= (pack_half2x16(float2(r, 0.0)) & 0xffff) << 16;
     return s;
+}
+
+// The environment's feedback id. Sphere and rect lights take their LightId, and emissive
+// entries the light capacity plus their entry.
+public uint feedback_environment(LightSetGpu* set)
+{
+    return set.candidate_count;
+}
+
+// Probability that a tile sample comes from the light with feedback id `id`.
+public float global_selection(LightSetGpu* set, uint id)
+{
+    if (id == feedback_environment(set))
+        return set.environment_probability;
+    uint lights = set.scene.light_capacity;
+    return id < lights ? set.light_probability[id] : set.emissive[id - lights].probability;
+}
+
+// Probability that local sampler `local` draws the light with feedback id `id`.
+public float local_selection(LocalLights* local, uint id)
+{
+    uint n = min(local.count, LOCAL_LIGHTS);
+    for (uint k = 0; k < n; k++)
+    {
+        if (local.ids[k] == id)
+            return (local.cdf[k] - (k > 0 ? local.cdf[k - 1] : 0.0)) / local.cdf[n - 1];
+    }
+    return 0.0;
+}
+
+// Probability that a tile-light candidate of a vertex reading `local` (null for none) is the
+// light with feedback id `id`.
+public float light_selection(LightSetGpu* set, LocalLights* local, uint id)
+{
+    float g = global_selection(set, id);
+    if (local == nullptr)
+        return g;
+    return local.share * local_selection(local, id) + (1.0 - local.share) * g;
+}
+
+// Sample of the light with feedback id `id` from `u`, the light chosen with `probability`.
+LightSample tile_light_sample(LightSetGpu* set, uint id, float4 u, float probability)
+{
+    if (id == feedback_environment(set))
+    {
+        float pdf;
+        float3 d = environment_sample(set.environment, float3(u.z, u.xy), pdf);
+        return light_sample(LIGHT_SAMPLE_ENVIRONMENT, id, d, float3(0.0, 0.0, 1.0),
+                            environment_map(set.environment, d), -probability * pdf);
+    }
+    uint lights = set.scene.light_capacity;
+    if (id < lights)
+        return local_sample(set, id, u.xy, probability);
+    return emissive_sample(set, id - lights, u, probability);
 }
 
 // Tile sample `index` of `frame`, drawn from the light set's selection.
@@ -723,24 +806,37 @@ public LightSample presample_light(LightSetGpu* set, uint index, uint frame)
     uint4 h1 = pcg4d(uint4(index, frame, 0x6c69u, 2u));
     float x = unit_float(h0.x);
     float4 u = float4(unit_float(h0.y), unit_float(h0.z), unit_float(h0.w), unit_float(h1.x));
-    LightSample none = {};
     float env = set.environment_probability;
-    if (x < env)
+    uint id = feedback_environment(set);
+    if (!(x < env))
     {
-        float pdf;
-        float3 d = environment_sample(set.environment, float3(x / env, u.xy), pdf);
-        return light_sample(LIGHT_SAMPLE_ENVIRONMENT, d, float3(0.0, 0.0, 1.0),
-                            environment_map(set.environment, d), -env * pdf);
+        float total = set.candidate_total;
+        if (!(total > 0.0))
+        {
+            LightSample none = {};
+            return none;
+        }
+        id = upper_bound(set.cdf, set.candidate_count, below((x - env) / (1.0 - env), total));
     }
-    float total = set.candidate_total;
-    if (!(total > 0.0))
-        return none;
-    float t = below((x - env) / (1.0 - env), total);
-    uint c = upper_bound(set.cdf, set.candidate_count, t);
-    uint lights = set.scene.light_capacity;
-    if (c < lights)
-        return local_sample(set, c, u.xy);
-    return emissive_sample(set, c - lights, u);
+    return tile_light_sample(set, id, u, global_selection(set, id));
+}
+
+// The local sampler candidate of a vertex at `x` from `pick` and `u`, with the density of
+// its point alone (the light chosen with probability 1).
+ResolvedLightSample local_candidate(LightSetGpu* set, LocalLights* local, float3 x, float pick, float4 u)
+{
+    uint n = min(local.count, LOCAL_LIGHTS);
+    float target = below(pick, local.cdf[n - 1]);
+    uint k = 0;
+    while (k + 1 < n && !(local.cdf[k] > target))
+        k++;
+    return resolve_light_sample(set, tile_light_sample(set, local.ids[k], u, 1.0), x, u.xy);
+}
+
+// Adds one pixel whose feedback names `id` to the scene's feedback counts.
+public void count_feedback(LightSetGpu* set, uint id)
+{
+    InterlockedAdd(set.feedback_counts[id], 1u);
 }
 
 public ResolvedLightSample no_candidate()
@@ -755,15 +851,17 @@ public ResolvedLightSample no_candidate()
     return r;
 }
 
-// Tile sample `s` seen from `x`: a sphere's point is drawn here with `u`, uniform over the
-// cone the sphere subtends. The density leaves out the vertex's directional share.
-public ResolvedLightSample resolve_light_sample(LightSample s, float3 x, float2 u)
+// Light sample `s` of `set` seen from `x`: a sphere's point is drawn here with `u`, uniform
+// over the cone the sphere subtends. The density is the sample's, without the vertex's
+// directional share.
+public ResolvedLightSample resolve_light_sample(LightSetGpu* set, LightSample s, float3 x, float2 u)
 {
     if (s.pdf == 0.0)
         return no_candidate();
     ResolvedLightSample r = no_candidate();
     uint kind = s.bits & 3;
     r.kind = kind;
+    r.light = s.light;
     float3 l = decode_radiance(s);
     if (kind == LIGHT_SAMPLE_ENVIRONMENT)
     {
@@ -788,9 +886,9 @@ public ResolvedLightSample resolve_light_sample(LightSample s, float3 x, float2 
         float b = dot(to_centre, r.dir);
         float3 h = to_centre - b * r.dir;
         r.distance = b - sqrt(max(0.0, r2 - dot(h, h)));
-        float2 angles = unpack_unorm2x16(s.cone) * PI;
+        LightGpu* light = set.scene.lights + s.light;
         float c = dot(oct_decode_snorm16(s.normal), -axis);
-        r.radiance = l * spot_falloff(c, cos(angles.x), cos(angles.y));
+        r.radiance = l * spot_falloff(c, light.cone_cos_inner, light.cone_cos_outer);
         r.pdf = s.pdf / (TWO_PI * one_minus_cos);
         return r;
     }
@@ -817,15 +915,18 @@ public uint light_tile(uint2 pixel, uint frame)
 }
 
 // One next-event candidate for vertex `v`: with the vertex's directional share, a directional
-// light chosen by weight x n.l and a direction in its cone; otherwise a sample at a random
-// offset in the vertex's tile. Draws three sampler dimensions.
+// light chosen by weight x n.l and a direction in its cone; otherwise, with the local
+// sampler's share, a light it holds and a point on it, or else a sample at a random offset
+// in the vertex's tile. The density is the candidate's in the vertex's whole mixture. Draws
+// three sampler dimensions.
 public ResolvedLightSample nee_candidate(LightSetGpu* set, NeeVertex v, inout Sampler rng)
 {
     float total;
     float share = directional_share(set, v.normal, total);
     float choice = rng.next();
     float pick = rng.next();
-    float2 u = rng.next2();
+    float4 u4 = rng.next4();
+    float2 u = u4.xy;
     if (choice < share)
     {
         float target = pick * total;
@@ -855,22 +956,37 @@ public ResolvedLightSample nee_candidate(LightSetGpu* set, NeeVertex v, inout Sa
         r.light = id;
         return r;
     }
-    uint tile = light_tile(v.pixel, set.frame);
-    uint index = min(uint(pick * float(TILE_SIZE)), TILE_SIZE - 1);
-    ResolvedLightSample r = resolve_light_sample(set.tiles[tile * TILE_SIZE + index], v.position, u);
+    LocalLights* local = v.local;
+    ResolvedLightSample r;
+    if (local != nullptr && (choice - share) < local.share * (1.0 - share))
+    {
+        r = local_candidate(set, local, v.position, pick, u4);
+        if (r.pdf > 0.0)
+            r.pdf *= light_selection(set, local, r.light);
+    }
+    else
+    {
+        uint tile = light_tile(v.pixel, set.frame);
+        uint index = min(uint(pick * float(TILE_SIZE)), TILE_SIZE - 1);
+        r = resolve_light_sample(set, set.tiles[tile * TILE_SIZE + index], v.position, u);
+        if (local != nullptr && r.pdf > 0.0)
+            r.pdf *= light_selection(set, local, r.light) / global_selection(set, r.light);
+    }
     r.pdf *= 1.0 - share;
     return r;
 }
 
-// Densities per sr of the candidates of a vertex with `normal` in direction `dir`, for
-// weighting BSDF samples against next-event estimation: from the environment, from
-// directional light `id`, and from emissive entry `entry` hit at `distance` on a surface
-// emitting `luminance` nits whose normal makes `cos_light` with the ray.
-public float nee_environment_pdf(LightSetGpu* set, float3 normal, float3 dir)
+// Densities per sr of the candidates of a vertex with `normal` and local sampler `local`
+// (null for none) in direction `dir`, for weighting BSDF samples against next-event
+// estimation: from the environment, from directional light `id`, and from emissive entry
+// `entry` hit at `distance` on a surface emitting `luminance` nits whose normal makes
+// `cos_light` with the ray.
+public float nee_environment_pdf(LightSetGpu* set, LocalLights* local, float3 normal, float3 dir)
 {
     float total;
     float share = directional_share(set, normal, total);
-    return (1.0 - share) * set.environment_probability * environment_pdf(set.environment, dir);
+    float p = light_selection(set, local, feedback_environment(set));
+    return (1.0 - share) * p * environment_pdf(set.environment, dir);
 }
 
 public float nee_directional_pdf(LightSetGpu* set, float3 normal, uint id, float3 dir)
@@ -878,13 +994,16 @@ public float nee_directional_pdf(LightSetGpu* set, float3 normal, uint id, float
     return directional_probability(set, normal, id) * directional_pdf(set.scene.lights[id], dir);
 }
 
-public float nee_emissive_pdf(LightSetGpu* set, float3 normal, uint entry, float luminance,
-                              float distance, float cos_light)
+public float nee_emissive_pdf(LightSetGpu* set, LocalLights* local, float3 normal, uint entry,
+                              float luminance, float distance, float cos_light)
 {
     float total;
     float share = directional_share(set, normal, total);
-    float a = emissive_area_pdf(set, entry, luminance);
-    return a > 0.0 ? (1.0 - share) * a * distance * distance / abs(cos_light) : 0.0;
+    EmissiveSelection e = set.emissive[entry];
+    if (!(e.total > 0.0))
+        return 0.0;
+    float p = light_selection(set, local, set.scene.light_capacity + entry);
+    return (1.0 - share) * p * luminance / e.total * distance * distance / abs(cos_light);
 }
 
 // Density per sr of tile samples from sphere or rect light `id` seen from `x` in direction

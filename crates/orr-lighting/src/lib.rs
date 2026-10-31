@@ -4,18 +4,22 @@
 //! bakes the scene's linked environment at the scene focus into an equal-area octahedral map
 //! with an importance pyramid, derives every directional light's state, builds the selection
 //! over the scene's sphere, rect and emissive lights and the environment, presamples the
-//! light tiles, writes the scene's `SkyStats`, and resolves the scene's world cache. Kernels
-//! reach the result through [`SceneLighting::light_set`], [`SceneLighting::world_cache`] and
-//! the Slang modules `light_sampling`, `world_cache`, `environment` and `media` under this
-//! crate's shader root (`DEP_ORR_LIGHTING_SHADER_DIRS`). Kernels that shade with the
-//! real-time OpenPBR BSDF import `bsdf` and read [`BsdfTables`].
+//! light tiles, writes the scene's `SkyStats`, and resolves the scene's world cache. The
+//! selection blends emitted power with the light feedback of the scene's views in earlier
+//! frames: each pixel of an opaque dispatch names one of the lights that added to its path,
+//! chosen in proportion to what each added. Kernels reach the result through
+//! [`SceneLighting::light_set`], [`SceneLighting::world_cache`] and the Slang modules
+//! `light_sampling`, `world_cache`, `environment` and `media` under this crate's shader root
+//! (`DEP_ORR_LIGHTING_SHADER_DIRS`). Kernels that shade with the real-time OpenPBR BSDF
+//! import `bsdf` and read [`BsdfTables`].
 //!
 //! Each view, [`LightingView::begin`] settles the frame's history reset; after the view's
-//! raster half, [`LightingKernels::record_opaque`] traces the world cache's update paths
-//! and one path per G-buffer pixel into the view's [`LightingView`] radiance with the
-//! settings of [`ViewLighting`], and
-//! [`LightingKernels::record_guides`] writes the view's ray reconstruction guides. The `path`
-//! module holds the path itself for kernels that trace more.
+//! raster half, [`LightingKernels::record_opaque`] traces the world cache's update paths,
+//! builds a local light sampler per screen tile from the view's last light feedback, and
+//! traces one path per G-buffer pixel into the view's [`LightingView`] radiance and light
+//! feedback with the settings of [`ViewLighting`], and [`LightingKernels::record_guides`]
+//! writes the view's ray reconstruction guides. The `path` module holds the path itself for
+//! kernels that trace more.
 
 mod bsdf;
 mod environment;
@@ -33,11 +37,12 @@ pub use scene::{
 };
 pub use shaders::types::{
     DirectionalState, EmissiveSelection, EnvironmentGpu, GuideRoot, LightSample, LightSetGpu,
-    LightSetStats, PathRoot, WorldCacheGpu,
+    LightSetStats, LocalLights, PathRoot, WorldCacheGpu,
 };
 pub use view::{
     CameraJump, GuideKind, GuideSettings, LightingDebugView, LightingKernels, LightingView,
-    MediaSettings, PathEntry, ReferenceSettings, ThinLens, ViewLighting, ViewPass,
+    MAX_LOCAL_LIGHT_SHARE, MediaSettings, PathEntry, ReferenceSettings, ThinLens, ViewLighting,
+    ViewPass,
 };
 pub use world_cache::{MAX_CAPACITY_LOG2, WorldCacheStats};
 

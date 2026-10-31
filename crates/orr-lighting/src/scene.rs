@@ -36,6 +36,9 @@ pub struct SceneLightingSettings {
     /// it are left out of next-event estimation (counted in [`LightingStats`]); BSDF hits
     /// still see them.
     pub emissive_clusters: u32,
+    /// Share of the light selection placed by where the views' pixels found their light in
+    /// earlier frames, the rest by emitted power; in [0, 1). 0 selects by power alone.
+    pub feedback_share: f32,
 }
 
 impl Default for SceneLightingSettings {
@@ -44,6 +47,7 @@ impl Default for SceneLightingSettings {
             world_cache: WorldCacheSettings::default(),
             near_range: 256.0,
             emissive_clusters: 1 << 20,
+            feedback_share: 0.5,
         }
     }
 }
@@ -107,6 +111,8 @@ pub struct LightingStats {
     pub dropped_entries: u32,
     /// Share of tile samples taken from the environment.
     pub environment_probability: f32,
+    /// Pixels of the frame before whose light feedback named a light.
+    pub feedback_pixels: u32,
     pub world_cache: WorldCacheStats,
 }
 
@@ -130,6 +136,13 @@ impl<T: bytemuck::Pod> Ring<T> {
     pub(crate) fn at(&self, slot: usize) -> GpuPtr<T> {
         self.0.gpu.offset(slot as u64)
     }
+}
+
+fn check_settings(settings: &SceneLightingSettings) -> Result<(), Error> {
+    if !(0.0..1.0).contains(&settings.feedback_share) {
+        return Err(Error::Settings("feedback_share must lie in [0, 1)"));
+    }
+    Ok(())
 }
 
 pub(crate) fn device_local<T>(
@@ -159,6 +172,8 @@ pub struct SceneLighting {
     emissive: Allocation<EmissiveSelection>,
     cluster_cdf: Allocation<f32>,
     tiles: Allocation<LightSample>,
+    feedback_counts: Allocation<u32>,
+    feedback_weights: Allocation<f32>,
     readback: Allocation<LightSetStats>,
     bake_roots: Ring<crate::shaders::environment::bake::Root>,
     directional_roots: Ring<directional::Root>,
@@ -170,6 +185,7 @@ pub struct SceneLighting {
     frames: [Option<u64>; FRAME_SLOTS],
     reset_pending: bool,
     reset_frame: Option<u64>,
+    clear_feedback: bool,
 }
 
 impl SceneLighting {
@@ -182,8 +198,11 @@ impl SceneLighting {
         scene: &SceneDesc,
         settings: &SceneLightingSettings,
     ) -> Result<Self, Error> {
+        check_settings(settings)?;
         let lights = u64::from(scene.light_capacity);
         let entries = u64::from(scene.producer_capacity) + u64::from(scene.emissive_capacity);
+        // Every candidate, then the environment.
+        let feedback_ids = lights + entries + 1;
         Ok(Self {
             device: device.clone(),
             settings: *settings,
@@ -209,6 +228,8 @@ impl SceneLighting {
                 u64::from(LIGHT_TILES * LIGHT_TILE_SIZE),
                 "light tiles",
             )?,
+            feedback_counts: device_local(device, feedback_ids, "light feedback counts")?,
+            feedback_weights: device_local(device, feedback_ids, "light feedback weights")?,
             readback: device.gpu_malloc(
                 MemoryKind::Readback,
                 FRAME_SLOTS as u64,
@@ -223,6 +244,7 @@ impl SceneLighting {
             frames: [None; FRAME_SLOTS],
             reset_pending: false,
             reset_frame: None,
+            clear_feedback: true,
         })
     }
 
@@ -234,6 +256,7 @@ impl SceneLighting {
     /// `world_cache` reallocates and clears the cache; old buffers are freed once the work
     /// submitted so far has completed.
     pub fn set_settings(&mut self, settings: &SceneLightingSettings) -> Result<(), Error> {
+        check_settings(settings)?;
         if settings.world_cache != *self.cache.settings() {
             self.cache = WorldCache::new(&self.device, &settings.world_cache)?;
         }
@@ -250,16 +273,17 @@ impl SceneLighting {
 
     /// Records the scene pass after the scene's `update_scenes` in the same or an earlier
     /// list: bakes the environment and builds its pyramid, derives every directional light's
-    /// state, builds the light selection and the emissive cluster CDFs, presamples the light
-    /// tiles, writes `SkyStats`, resolves the world cache at the focus, and writes the
-    /// statistics [`Self::stats`] reads. Its outputs are visible to every later stage of the
-    /// list.
+    /// state, builds the light selection from emitted power and the light feedback of the
+    /// views of earlier frames, builds the emissive cluster CDFs, presamples the light tiles,
+    /// writes `SkyStats`, resolves the world cache at the focus, and writes the statistics
+    /// [`Self::stats`] reads. Its outputs are visible to every later stage of the list.
     pub fn record(&mut self, list: &mut CommandList<'_>, pass: &ScenePass) {
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         self.frames[slot] = Some(pass.frame);
         if std::mem::take(&mut self.reset_pending) {
             self.reset_frame = Some(pass.frame);
             self.cache.clear();
+            self.clear_feedback = true;
         }
         let focus = [pass.focus[0], pass.focus[1], pass.focus[2], 0.0];
         let bake_root = self
@@ -288,9 +312,15 @@ impl SceneLighting {
                 emissive: self.emissive.gpu,
                 cluster_cdf: self.cluster_cdf.gpu,
                 tiles: self.tiles.gpu,
+                feedback_counts: self.feedback_counts.gpu,
+                feedback_weights: self.feedback_weights.gpu,
                 stats: self.readback.gpu.offset(slot as u64),
                 cluster_capacity: self.settings.emissive_clusters,
                 frame: pass.frame as u32,
+                feedback_share: self.settings.feedback_share,
+                clear_feedback: u32::from(std::mem::take(&mut self.clear_feedback)),
+                _pad0: 0,
+                _pad1: 0,
             },
         );
 
@@ -324,8 +354,8 @@ impl SceneLighting {
     }
 
     /// A lighting discontinuity (time skip, teleport): the next [`Self::record`] clears the
-    /// world cache and marks its frame as a history reset for every view of the scene
-    /// ([`crate::LightingView::begin`]).
+    /// world cache and the light feedback and marks its frame as a history reset for every
+    /// view of the scene ([`crate::LightingView::begin`]).
     pub fn reset_history(&mut self) {
         self.reset_pending = true;
     }
@@ -354,6 +384,7 @@ impl SceneLighting {
                 emissive_clusters: s.emissive_clusters,
                 dropped_entries: s.dropped_entries,
                 environment_probability: s.environment_probability,
+                feedback_pixels: s.feedback_pixels,
                 world_cache: self.cache.stats(slot),
             }
         })

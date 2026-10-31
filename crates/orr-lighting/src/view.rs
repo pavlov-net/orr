@@ -3,18 +3,19 @@
 
 use orr_math::{DVec3, Quat};
 use orr_scene::orr_gpu::{
-    self, CommandList, ComputePipeline, Device, Format, GpuPtr, RayDispatchPipeline, ShaderModule,
-    ShaderStage, SpecData, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
-    TextureUsage,
+    self, Allocation, CommandList, ComputePipeline, Device, Format, GpuPtr, Hazards,
+    RayDispatchPipeline, ShaderModule, ShaderStage, SpecData, Stages, StorageImageIndex, Texture,
+    TextureDesc, TextureIndex, TextureMemory, TextureUsage,
 };
 use orr_scene::{GBufferGpu, SceneId, SceneRoot, ViewConstants, ViewDesc};
 
-use crate::scene::{FRAME_SLOTS, Ring};
+use crate::scene::{FRAME_SLOTS, Ring, device_local};
 use crate::shaders::guides::resolve;
+use crate::shaders::light_sampling::local;
 use crate::shaders::path::opaque;
-use crate::shaders::types::{GuideRoot, PathRoot};
+use crate::shaders::types::{GuideRoot, LocalLights, PathRoot};
 use crate::shaders::world_cache::update;
-use crate::{BsdfTables, Error, KernelSet, SceneLighting, module};
+use crate::{BsdfTables, Error, KernelSet, SceneLighting, module, pipeline};
 
 /// Lighting settings of one view, passed with every render of it.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -23,6 +24,11 @@ pub struct ViewLighting {
     pub primary_di_candidates: u32,
     /// Light candidates resampled at its later vertices.
     pub bounce_di_candidates: u32,
+    /// Share of the first vertex's candidates, past the directional lights' share, drawn from
+    /// the lights that its screen tile's pixels found in the view's last frame, at most
+    /// [`MAX_LOCAL_LIGHT_SHARE`]; the rest come from the scene's light selection. 0 turns the
+    /// local samplers off.
+    pub local_light_share: f32,
     /// BSDF bounces after the first vertex's; the last bounce still adds the emission and
     /// sky its ray reaches.
     pub max_bounces: u32,
@@ -38,6 +44,7 @@ impl Default for ViewLighting {
         Self {
             primary_di_candidates: 8,
             bounce_di_candidates: 4,
+            local_light_share: 0.5,
             max_bounces: 3,
             media: MediaSettings::default(),
             guides: GuideSettings::default(),
@@ -163,6 +170,17 @@ pub struct ThinLens {
     pub focus_distance: f32,
 }
 
+/// Largest [`ViewLighting::local_light_share`]: the scene's selection keeps a share, so every
+/// light stays reachable.
+pub const MAX_LOCAL_LIGHT_SHARE: f32 = 0.9;
+
+/// Pixels per side of the screen tiles that share a local light sampler (`light_sampling`'s
+/// `LOCAL_TILE`).
+const LOCAL_TILE: u32 = 16;
+
+/// `path`'s `LIGHT_FEEDBACK_COUNT`.
+const LIGHT_FEEDBACK_COUNT: u32 = 1;
+
 /// Bounces from which Russian roulette may end a path: after the first, or 64 in the
 /// reference.
 const ROULETTE_DEPTH: u32 = 1;
@@ -177,6 +195,13 @@ struct Target {
     store: StorageImageIndex,
 }
 
+/// A frame's light feedback: written by its opaque dispatch, read by the next frame's local
+/// samplers.
+struct Feedback {
+    target: Target,
+    sampled: TextureIndex,
+}
+
 /// One view's lighting targets at its render extent, which are ray reconstruction's inputs,
 /// and its history; kept with the view's history.
 pub struct LightingView {
@@ -189,10 +214,16 @@ pub struct LightingView {
     specular_motion: Target,
     depth: Target,
     motion: Target,
+    feedback: [Feedback; 2],
+    /// The feedback the next opaque dispatch writes; the other holds the last frame's.
+    feedback_index: usize,
+    local: Allocation<LocalLights>,
+    local_tiles: [u32; 2],
     slots: Vec<u32>,
     radiance_sampled: TextureIndex,
     roots: Ring<PathRoot>,
     update_roots: Ring<PathRoot>,
+    local_roots: Ring<local::Root>,
     guide_roots: Ring<GuideRoot>,
     previous: Option<(SceneId, DVec3, Quat)>,
     history_reset: bool,
@@ -221,10 +252,33 @@ impl LightingView {
         let specular_motion = target(Format::Rg16Float, "specular motion")?;
         let depth = target(Format::R32Float, "rr depth")?;
         let motion = target(Format::Rg16Float, "rr motion")?;
-        let sampled = device.alloc_image_slot()?;
-        slots.push(sampled);
-        let radiance_sampled =
-            device.write_sampled(sampled, &radiance.texture, &orr_gpu::ViewDesc::default());
+        let feedback_targets = [
+            target(Format::Rg32Uint, "light feedback")?,
+            target(Format::Rg32Uint, "light feedback")?,
+        ];
+        let mut sampled_view = |texture: &Texture| -> Result<TextureIndex, Error> {
+            let slot = device.alloc_image_slot()?;
+            slots.push(slot);
+            Ok(device.write_sampled(slot, texture, &orr_gpu::ViewDesc::default()))
+        };
+        let radiance_sampled = sampled_view(&radiance.texture)?;
+        let [a, b] = feedback_targets;
+        let feedback = [
+            Feedback {
+                sampled: sampled_view(&a.texture)?,
+                target: a,
+            },
+            Feedback {
+                sampled: sampled_view(&b.texture)?,
+                target: b,
+            },
+        ];
+        let local_tiles = extent.map(|e| e.div_ceil(LOCAL_TILE));
+        let local = device_local(
+            device,
+            u64::from(local_tiles[0]) * u64::from(local_tiles[1]),
+            "local light samplers",
+        )?;
         Ok(Self {
             device: device.clone(),
             extent,
@@ -235,10 +289,15 @@ impl LightingView {
             specular_motion,
             depth,
             motion,
+            feedback,
+            feedback_index: 0,
+            local,
+            local_tiles,
             slots,
             radiance_sampled,
             roots: Ring::new(device, "path roots")?,
             update_roots: Ring::new(device, "update path roots")?,
+            local_roots: Ring::new(device, "local light sampler roots")?,
             guide_roots: Ring::new(device, "guide roots")?,
             previous: None,
             history_reset: true,
@@ -327,6 +386,13 @@ impl LightingView {
     pub fn motion(&self) -> &Texture {
         &self.motion.texture
     }
+
+    /// RG32_UINT: per pixel, the light feedback of the last opaque dispatch (a light's
+    /// feedback id or `u32::MAX`) and its first vertex's camera distance in m as `f32` bits, 0
+    /// on sky pixels.
+    pub fn light_feedback(&self) -> &Texture {
+        &self.feedback[1 - self.feedback_index].target.texture
+    }
 }
 
 impl Drop for LightingView {
@@ -405,6 +471,7 @@ pub struct LightingKernels {
     opaque: PathPipeline,
     update: PathPipeline,
     guides: ComputePipeline,
+    local: ComputePipeline,
 }
 
 /// The specialisation constants of kernel module `$kernel`, which imports `bsdf`.
@@ -458,14 +525,17 @@ impl LightingKernels {
             opaque,
             update,
             guides,
+            local: pipeline(device, kernels, &local::MODULE, "main")?,
         })
     }
 
-    /// Records the world cache's update paths and the opaque dispatch of `pass` into
-    /// `view`'s radiance after the scene's [`SceneLighting::record`] and the view's raster
-    /// half in the same or an earlier list; orders nothing after it. The scene's first view
-    /// in a frame traces one update path per `update_block`^2 pixels, its later views one per
-    /// four times as many; the reference traces none and never reads the cache.
+    /// Records the world cache's update paths, the view's local light samplers and the
+    /// opaque dispatch of `pass` into `view`'s radiance and light feedback after the scene's
+    /// [`SceneLighting::record`] and the view's raster half in the same or an earlier list;
+    /// orders nothing after it. The scene's first view in a frame traces one update path per
+    /// `update_block`^2 pixels, its later views one per four times as many. The reference
+    /// traces none, never reads the cache, builds no local samplers and adds nothing to the
+    /// scene's light feedback.
     pub fn record_opaque(
         &self,
         list: &mut CommandList<'_>,
@@ -493,12 +563,41 @@ impl LightingKernels {
         let first = !reference && scene.first_view(pass.frame);
         let block = scene.world_cache_settings().update_block * if first { 1 } else { 2 };
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
+        let local_share = lighting.local_light_share.clamp(0.0, MAX_LOCAL_LIGHT_SHARE);
+        let local = !reference && local_share > 0.0;
+        let written = view.feedback_index;
+        view.feedback_index = 1 - written;
+        if local {
+            let root = view.local_roots.write(
+                slot,
+                local::Root {
+                    view: pass.view,
+                    gbuffer: pass.gbuffer,
+                    set: scene.light_set(),
+                    local: view.local.gpu,
+                    previous: view.feedback[1 - written].sampled,
+                    columns: view.local_tiles[0],
+                    share: local_share,
+                    reset: u32::from(view.history_reset),
+                },
+            );
+            let [w, h] = view.local_tiles;
+            list.begin_pass("local light samplers", false);
+            list.dispatch(&self.local, root, [w, h, 1]);
+            list.end_pass();
+            list.barrier(
+                Stages::COMPUTE,
+                Stages::COMPUTE | Stages::RAY,
+                Hazards::empty(),
+            );
+        }
         let path_root = PathRoot {
             scene: pass.scene,
             view: pass.view,
             gbuffer: pass.gbuffer,
             set: scene.light_set(),
             cache: scene.world_cache(pass.frame),
+            local: if local { view.local.gpu } else { GpuPtr::NULL },
             radiance: view.radiance.store,
             primary_candidates: lighting.primary_di_candidates,
             bounce_candidates: lighting.bounce_di_candidates,
@@ -512,7 +611,9 @@ impl LightingKernels {
             focus_distance: lens.map_or(0.0, |l| l.focus_distance),
             cache_flags: if reference { 0 } else { CACHE_TERMINATE },
             update_block: block,
-            _pad0: 0,
+            feedback: view.feedback[written].target.store,
+            local_columns: view.local_tiles[0],
+            light_flags: if reference { 0 } else { LIGHT_FEEDBACK_COUNT },
         };
         let root = view.roots.write(slot, path_root);
         if !reference {
@@ -520,6 +621,8 @@ impl LightingKernels {
                 slot,
                 PathRoot {
                     mode: 0,
+                    local: GpuPtr::NULL,
+                    light_flags: 0,
                     ..path_root
                 },
             );

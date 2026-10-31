@@ -872,7 +872,7 @@ impl Bed {
         }
 
         let desc = SceneDesc {
-            light_capacity: 8,
+            light_capacity: spec.lights.len().max(8) as u32,
             ..SceneDesc::default()
         };
         let scene = scenes.create_scene(&desc).unwrap();

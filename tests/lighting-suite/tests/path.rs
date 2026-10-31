@@ -13,7 +13,7 @@ use lighting_suite::{
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::{
     DirectionalLight, DiscProfile, Light, LightId, LightingDebugView, PathEntry, ReferenceSettings,
-    ThinLens, ViewLighting,
+    SceneLightingSettings, ThinLens, ViewLighting,
 };
 use orr_math::{DVec3, Mat3, Vec3};
 use orr_scene::RendererDesc;
@@ -607,5 +607,108 @@ fn a_linked_surface_switches_form_only_from_the_second_bounce() {
         indirect[0] < 0.15 * indirect[1],
         "light from later bounces holds the near form: {indirect:?}"
     );
+    assert_clean();
+}
+
+/// A ring of colored sphere lights, two spots and three rects around the sphere on the
+/// ground, under a dim sky and no directional light.
+fn many_lights() -> Spec {
+    let mut lights = Vec::new();
+    for k in 0..24 {
+        let a = f64::from(k) * std::f64::consts::TAU / 24.0;
+        let r = 1.6 + 0.4 * f64::from(k % 3);
+        let hue = Vec3::new(
+            1.0 + (k % 2) as f32,
+            1.0 + (k % 3) as f32 * 0.5,
+            1.0 + (k % 5) as f32 * 0.25,
+        );
+        lights.push(Light::Sphere {
+            position: DVec3::new(r * a.cos(), 0.3 + 0.2 * f64::from(k % 4), r * a.sin()),
+            radius: 0.05,
+            intensity: hue * (2.0 + (k % 7) as f32 * 3.0),
+            cone: None,
+        });
+    }
+    for x in [-0.8f64, 0.8] {
+        lights.push(Light::Sphere {
+            position: DVec3::new(x, 2.5, 0.8),
+            radius: 0.1,
+            intensity: Vec3::splat(150.0),
+            cone: Some(orr_scene::Cone {
+                direction: Vec3::new(-x as f32 * 0.3, -1.0, -0.2).normalize(),
+                inner: 0.3,
+                outer: 0.45,
+            }),
+        });
+    }
+    for (k, z) in [-1.5f64, 0.0, 1.5].into_iter().enumerate() {
+        lights.push(Light::Rect {
+            center: DVec3::new(-2.5, 1.0, z),
+            edge_x: Vec3::new(0.0, 0.0, 0.6),
+            edge_y: Vec3::new(0.0, 0.4, 0.0),
+            luminance: Vec3::splat(40.0 * (k + 1) as f32),
+        });
+    }
+    Spec {
+        lights,
+        environment: Some(SKY.map(|c| c / 2000.0)),
+        ..Analytic::SunAndGround.spec()
+    }
+}
+
+/// Mean rgb of each quarter of the image.
+fn quarter_means(a: &Accumulated) -> Vec<[f64; 3]> {
+    let [w, h] = EXTENT.map(|e| e as usize);
+    let mut out = Vec::new();
+    for (qx, qy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+        let mut sum = [0.0f64; 3];
+        for y in qy * h / 2..(qy + 1) * h / 2 {
+            for x in qx * w / 2..(qx + 1) * w / 2 {
+                let p = a.mean[y * w + x];
+                for c in 0..3 {
+                    sum[c] += f64::from(p[c]);
+                }
+            }
+        }
+        out.push(sum.map(|s| s / (w * h / 4) as f64));
+    }
+    out
+}
+
+#[test]
+fn light_feedback_and_local_samplers_keep_direct_light_unbiased() {
+    let mut bed = Bed::with(many_lights());
+    let direct = ViewLighting {
+        debug_view: LightingDebugView::DirectOnly,
+        ..ViewLighting::default()
+    };
+    let by_power = SceneLightingSettings {
+        feedback_share: 0.0,
+        ..*bed.lighting.settings()
+    };
+    bed.lighting.set_settings(&by_power).unwrap();
+    let plain = render_paths(
+        &mut bed,
+        &paths(ViewLighting {
+            local_light_share: 0.0,
+            ..direct
+        }),
+        96,
+        1,
+    );
+    bed.lighting
+        .set_settings(&SceneLightingSettings::default())
+        .unwrap();
+    let guided = render_paths(&mut bed, &paths(direct), 96, 2);
+    let stats = bed.lighting.stats(bed.last_frame()).unwrap();
+    assert!(stats.feedback_pixels > 0, "no pixel fed back a light");
+    assert_close("image", image_mean(&guided), image_mean(&plain), 0.015);
+    for (q, (g, p)) in quarter_means(&guided)
+        .into_iter()
+        .zip(quarter_means(&plain))
+        .enumerate()
+    {
+        assert_close(&format!("quarter {q}"), g, p, 0.04);
+    }
     assert_clean();
 }
