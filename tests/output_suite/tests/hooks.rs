@@ -266,6 +266,7 @@ impl View {
             inputs.run(
                 &mut list,
                 HookPoint::SceneReferred,
+                &self.chain,
                 field.as_deref_mut(),
                 hook,
             );
@@ -297,7 +298,13 @@ impl View {
             },
         );
         if let (Some(inputs), Some(hook)) = (&inputs, display_linear) {
-            inputs.run(&mut list, HookPoint::DisplayLinear, field, hook);
+            inputs.run(
+                &mut list,
+                HookPoint::DisplayLinear,
+                &self.chain,
+                field,
+                hook,
+            );
         }
         let point = queue.submit(vec![list], &[]).unwrap();
         wait(point);

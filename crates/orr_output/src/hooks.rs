@@ -57,14 +57,28 @@ impl Hooks {
     }
 }
 
-/// The two output-resolution RGBA16F images a view's output chain alternates between: RR's
-/// output and tonemap's display-linear target. Each hook's source is the other image.
+/// The two output-resolution RGBA16F images a view's output chain alternates between.
+/// `rr_output` holds the radiance the next pass reads, RR's output at first; `linear` is the
+/// free image tonemap writes as the display-linear target. A camera effect writes `linear`
+/// and swaps the two. Each hook's source is the other image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChainImages {
     pub rr_output: TextureIndex,
     pub rr_output_store: StorageImageIndex,
     pub linear: TextureIndex,
     pub linear_store: StorageImageIndex,
+}
+
+impl ChainImages {
+    /// The chain after a pass that read `rr_output` and wrote `linear`.
+    pub fn swapped(self) -> Self {
+        Self {
+            rr_output: self.linear,
+            rr_output_store: self.linear_store,
+            linear: self.rr_output,
+            linear_store: self.rr_output_store,
+        }
+    }
 }
 
 /// A texture with a sampled and a storage view, both freed with it.
@@ -99,6 +113,10 @@ impl Image {
 
     pub fn texture(&self) -> &Texture {
         &self.texture
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
     }
 }
 
@@ -194,7 +212,6 @@ impl HookTargets {
 #[derive(Clone, Copy, Debug)]
 pub struct HookInputs {
     pub(crate) hooks: Hooks,
-    pub(crate) chain: ChainImages,
     pub(crate) depth: TextureIndex,
     pub(crate) motion: TextureIndex,
     pub(crate) extent: [u32; 2],
@@ -204,25 +221,28 @@ pub struct HookInputs {
 
 impl HookInputs {
     /// Records the hook at `point`, between barriers that order everything before it and
-    /// make its writes visible to every later pass. Pass the field given to `hook_inputs`.
+    /// make its writes visible to every later pass. `chain` is the chain as it stands at the
+    /// point: for `SceneReferred` the one given to `hook_inputs`, for `DisplayLinear` the one
+    /// tonemap wrote. Pass the field given to `hook_inputs`.
     pub fn run(
         &self,
         list: &mut CommandList<'_>,
         point: HookPoint,
+        chain: &ChainImages,
         field: Option<&mut DistortionField>,
         hook: &mut dyn FnMut(&mut HookPass<'_, '_>),
     ) {
         let (image, source) = match point {
             HookPoint::SceneReferred => {
                 debug_assert!(self.hooks.scene_referred, "no scene_referred source copied");
-                (self.chain.rr_output_store, self.chain.linear)
+                (chain.rr_output_store, chain.linear)
             }
             HookPoint::DisplayLinear => {
                 debug_assert!(
                     self.hooks.display_linear,
                     "no display_linear source written"
                 );
-                (self.chain.linear_store, self.chain.rr_output)
+                (chain.linear_store, chain.rr_output)
             }
         };
         let (distortion, distortion_source) = match &field {

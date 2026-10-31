@@ -552,7 +552,7 @@ impl Queue {
     fn read_passes(&self, res: &ListResources, passes: &[PassRecord]) -> Vec<PassResult> {
         let d = &self.shared.device;
         let mut ticks = vec![0u64; 2 * passes.len()];
-        if res.timestamps != vk::QueryPool::null() {
+        if res.timestamps != vk::QueryPool::null() && !passes.is_empty() {
             // SAFETY: every query in range was written by the completed submit.
             let _ = unsafe {
                 d.get_query_pool_results(

@@ -10,6 +10,7 @@ pub struct ViewOutput {
     pub white_balance: Option<AutoWhiteBalance>,
     pub grade: Grade,
     pub gt7: Gt7Params,
+    pub post: PostQuality,
     /// A hook warps the image: the view's hooks get the display's distortion field, which
     /// frame generation reads.
     pub distortion_field: bool,
@@ -19,6 +20,21 @@ pub struct ViewOutput {
     /// A capture of this frame, read back through `OutputView::screenshots`.
     pub screenshot: Option<ScreenshotRequest>,
     pub debug: OutputDebug,
+}
+
+/// Sample counts of the camera effects that the view's lens turns on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PostQuality {
+    /// Samples per pixel along the blur, in symmetric pairs.
+    pub motion_blur_samples: u32,
+}
+
+impl Default for PostQuality {
+    fn default() -> Self {
+        Self {
+            motion_blur_samples: 35,
+        }
+    }
 }
 
 /// Debug views in place of the tonemapped image.
