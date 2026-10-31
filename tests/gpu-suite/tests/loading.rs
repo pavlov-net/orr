@@ -1,6 +1,7 @@
-//! The loading side on orr-gpu: sparse texture tiles, CLAS-pool page rebinds, GDeflate
-//! decompression, host image copy and the staging path, and the queues they run on. The
-//! loading and sparse probes' correctness cases are regression tests here.
+//! The loading side on orr-gpu: sparse texture tiles, CLAS-pool page rebinds, host image copy
+//! and the staging path, and the queues they run on (GDeflate decompression is tested in
+//! pack-suite on the cook's pages). The loading and sparse probes' correctness cases are
+//! regression tests here.
 
 use std::time::Duration;
 
@@ -8,8 +9,8 @@ use gpu_suite::clusters::*;
 use gpu_suite::shaders::{step, texel_read};
 use gpu_suite::{assert_clean, device, pipeline, readback, render, upload};
 use orr_gpu::{
-    Allocation, BlasLimits, ClusterVertexFormat, CommandList, DecompressRegion, Device, DeviceDesc,
-    Format, GpuAddress, Hazards, MemoryKind, PageBind, Queue, QueueKind, QueueRequest, RtasFlags,
+    Allocation, BlasLimits, ClusterVertexFormat, CommandList, Device, DeviceDesc, Format,
+    GpuAddress, Hazards, MemoryKind, PageBind, Queue, QueueKind, QueueRequest, RtasFlags,
     RtasLimits, RtasMode, RtasOp, RtasOpDesc, SparseBinds, Stages, Texture, TextureDesc,
     TextureKind, TextureMemory, TextureRegion, TextureUsage, TileBind, TimelinePoint, ViewDesc,
 };
@@ -538,95 +539,6 @@ fn clas_pages_rebind_beside_live_blas() {
         .unwrap();
     drop(b);
     drop((range, a, b_blocks));
-    assert_clean();
-}
-
-/// GDeflate 64 KiB regions compressed on the CPU decompress bit-exact on the loading
-/// queue; a GPU count below the maximum leaves the regions after it untouched.
-#[test]
-fn gdeflate_bit_exact() {
-    const REGION: usize = 64 << 10;
-    const REGIONS: usize = 64;
-    let d = device();
-    if !d.caps().memory_decompression {
-        log::warn!("no memory decompression; skipped");
-        return;
-    }
-    let mut rng = Rng(11);
-    // Halves of compressible text-like bytes and incompressible random bytes.
-    let source: Vec<u8> = (0..REGIONS)
-        .flat_map(|i| {
-            if i % 2 == 0 {
-                (0..REGION)
-                    .map(|j| b"orr loads pages "[(j + i) % 16] ^ (rng.next() % 3) as u8)
-                    .collect::<Vec<u8>>()
-            } else {
-                rng.bytes(REGION)
-            }
-        })
-        .collect();
-    let mut compressor = gdeflate::Compressor::new(gdeflate::CompressionLevel::Level12).unwrap();
-    let chunks: Vec<Vec<u8>> = source
-        .chunks(REGION)
-        .map(|c| compressor.compress(c, REGION).unwrap().bytes)
-        .collect();
-    let mut packed = Vec::new();
-    let mut offsets = Vec::new();
-    for c in &chunks {
-        packed.resize(packed.len().next_multiple_of(4), 0);
-        offsets.push(packed.len() as u64);
-        packed.extend_from_slice(c);
-    }
-    packed.resize(packed.len().next_multiple_of(4), 0);
-    let compressed = upload(&packed, "gdeflate input");
-    let out = d
-        .gpu_malloc::<u8>(
-            MemoryKind::DeviceLocal,
-            (REGIONS * REGION) as u64,
-            "gdeflate out",
-        )
-        .unwrap();
-    let regions: Vec<DecompressRegion> = (0..REGIONS)
-        .map(|i| DecompressRegion {
-            src: compressed.gpu.address().0 + offsets[i],
-            dst: out.gpu.address().0 + (i * REGION) as u64,
-            compressed_bytes: chunks[i].len() as u64,
-            decompressed_bytes: REGION as u64,
-        })
-        .collect();
-    let regions = upload(&regions, "gdeflate regions");
-    let fill = vec![0xcdu8; REGIONS * REGION];
-    let cleared = upload(&fill, "gdeflate clear");
-    let host = readback::<u8>((REGIONS * REGION) as u64, "gdeflate readback");
-    let loading = queue(QueueKind::Loading);
-    for count in [REGIONS as u32, REGIONS as u32 - 5] {
-        let count_at = upload(&[count], "gdeflate count");
-        let mut list = loading.command_list().unwrap();
-        list.copy(out.gpu, cleared.gpu, out.size);
-        list.barrier(Stages::TRANSFER, Stages::DECOMPRESS, Hazards::empty());
-        list.decompress(regions.gpu, count_at.gpu, REGIONS as u32);
-        list.barrier(Stages::DECOMPRESS, Stages::TRANSFER, Hazards::empty());
-        let decompressed = loading.submit(vec![list], &[]).unwrap();
-        let mut list = render().command_list().unwrap();
-        list.copy(host.gpu, out.gpu, out.size);
-        list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
-        run_on(render(), list, &[decompressed]);
-        let got = host.as_slice().unwrap();
-        for i in 0..REGIONS {
-            let span = i * REGION..(i + 1) * REGION;
-            if i < count as usize {
-                assert!(
-                    got[span.clone()] == source[span],
-                    "region {i} of {count} differs"
-                );
-            } else {
-                assert!(
-                    got[span].iter().all(|&b| b == 0xcd),
-                    "region {i} past the count of {count} was written"
-                );
-            }
-        }
-    }
     assert_clean();
 }
 

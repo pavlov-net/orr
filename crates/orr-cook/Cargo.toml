@@ -43,6 +43,9 @@ ntc = ["dep:libloading", "dep:cc", "dep:orr-shaders"]
 # Subdivision cages through OpenSubdiv's Far (Apache-2.0, never vendored): the release
 # checkout at ORR_OPENSUBDIV is compiled into the cook.
 subd = ["dep:cc", "dep:orr-shaders"]
+# GDeflate payload blobs through NVIDIA's libdeflate fork (`gdeflate` branch; MIT and
+# Apache-2.0, never vendored), compiled from the checkout at ORR_GDEFLATE.
+gdeflate = ["dep:cc", "dep:orr-shaders"]
 
 [build-dependencies]
 cc = { workspace = true, optional = true }

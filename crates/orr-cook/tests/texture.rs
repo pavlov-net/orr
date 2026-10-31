@@ -24,6 +24,7 @@ fn cook(assets: Vec<AssetSpec>) -> Archive {
             archives: vec![ArchiveSpec {
                 output: Target::Memory,
                 cell_log2: ArchiveSpec::DEFAULT_CELL_LOG2,
+                gdeflate: false,
                 assets,
             }],
         },

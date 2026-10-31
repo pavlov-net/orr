@@ -42,6 +42,11 @@
 //! ([`Instances`]); it can place models cooked by any archive of the manifest. A user source
 //! emits one entry `N` of a consumer class.
 //!
+//! An archive with [`ArchiveSpec::gdeflate`] stores its payload blobs as GDeflate pages of
+//! 64 KiB, which the GPU decompresses, instead of zstd; mount blobs stay zstd, and a blob
+//! that does not compress is stored raw. The codec is NVIDIA's libdeflate fork, built with
+//! the `gdeflate` feature (module `gdeflate`).
+//!
 //! The cook is incremental. Every entry carries a cook key: a hash of its class's cook
 //! version, the libraries that shape its bytes, its name, its settings, the content of its
 //! inputs and the keys of the entries it depends on. An entry whose key matches an entry of
@@ -55,6 +60,8 @@
 
 mod alloc;
 mod cache;
+#[cfg(feature = "gdeflate")]
+pub mod gdeflate;
 mod gltf;
 mod import;
 mod instances;
@@ -116,6 +123,10 @@ pub struct ArchiveSpec {
     /// size must match. [`Self::DEFAULT_CELL_LOG2`] is 256 m.
     #[serde(default = "manifest::default_cell_log2")]
     pub cell_log2: u8,
+    /// Payload blobs as GDeflate pages, decompressed on the GPU, instead of zstd. Needs the
+    /// `gdeflate` feature.
+    #[serde(default)]
+    pub gdeflate: bool,
     #[serde(rename = "asset", default)]
     pub assets: Vec<AssetSpec>,
 }
@@ -127,6 +138,7 @@ impl ArchiveSpec {
         Self {
             output,
             cell_log2: Self::DEFAULT_CELL_LOG2,
+            gdeflate: false,
             assets,
         }
     }
@@ -323,6 +335,9 @@ pub enum Error {
     Raster { asset: String, message: String },
     #[error("{asset}: class {class:#06x} is not a user class")]
     UserClass { asset: String, class: u16 },
+    /// An archive asks for GDeflate in a cook built without the `gdeflate` feature.
+    #[error("archive {archive} asks for GDeflate; orr-cook is built without the gdeflate feature")]
+    NoGDeflate { archive: usize },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

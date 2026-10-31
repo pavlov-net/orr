@@ -241,9 +241,22 @@ impl From<Class> for u16 {
 pub enum Codec {
     None = 0,
     Zstd = 1,
-    /// Decompressed on the GPU; the CPU decode refuses it.
+    /// GDeflate 1.0 pages of at most 64 KiB, decompressed on the GPU. [`Archive::decode`]
+    /// refuses them; [`Archive::verify_with`] decodes them with a [`GDeflate`] codec.
     GDeflate = 2,
 }
+
+/// A CPU GDeflate 1.0 codec. orr-pack has none of its own; orr-cook's `gdeflate` feature
+/// provides one.
+pub trait GDeflate: Send + Sync {
+    /// Appends the compressed form of `page`, at most [`GDEFLATE_PAGE`] bytes, to `out`.
+    fn compress(&self, page: &[u8], out: &mut Vec<u8>) -> Result<()>;
+    /// Decompresses one page into `dst`, which holds exactly its decoded length.
+    fn decompress(&self, page: &[u8], dst: &mut [u8]) -> Result<()>;
+}
+
+/// Largest decoded GDeflate page and chunk: the decompression region limit.
+pub const GDEFLATE_PAGE: u32 = 64 << 10;
 
 /// A reversible byte transform applied to each chunk before compression.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -286,6 +299,8 @@ pub enum Error {
     ContentHash { name: String },
     #[error("blob does not decode: {0}")]
     Decode(String),
+    #[error("blob does not encode: {0}")]
+    Encode(String),
     #[error("GDeflate blobs are decoded on the GPU")]
     GDeflate,
     #[error("buffer holds {have} bytes, needs {need}")]

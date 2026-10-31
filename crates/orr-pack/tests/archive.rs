@@ -440,7 +440,7 @@ fn streamed_and_pre_encoded_blobs_equal_plain_adds() {
     w.set_zstd_level(3);
     for c in &cases {
         let ins = c.ins();
-        let pre: Vec<_> = ins.iter().map(|b| b.encode(3)).collect();
+        let pre: Vec<_> = ins.iter().map(|b| b.encode(3, None)).collect();
         w.add_streamed(&c.name, USER, 1, Hash32::of(c.name.as_bytes()), |e| {
             for (j, (b, p)) in ins.iter().zip(&pre).enumerate() {
                 match p {

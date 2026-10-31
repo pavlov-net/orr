@@ -8,8 +8,8 @@ use std::sync::Arc;
 use crate::codec::split_planes;
 use crate::format::{HEADER_LEN, Layout, MAGIC, MOUNT_ALIGN, PAGE, codec_byte, hash_blob};
 use crate::{
-    Archive, AssetId, Blob, Chunk, Codec, Entry, Error, FORMAT_VERSION, Filter, Hash32, Header,
-    Result, StrRef,
+    Archive, AssetId, Blob, Chunk, Codec, Entry, Error, FORMAT_VERSION, Filter, GDEFLATE_PAGE,
+    GDeflate, Hash32, Header, Result, StrRef,
 };
 
 /// One blob to add.
@@ -21,7 +21,8 @@ pub struct BlobIn<'a> {
     /// Store the blob in the mount section, resident from mount.
     pub mount: bool,
     /// Decoded chunk length: a power of two from 4096 up, or 0 for the default (256 KiB
-    /// chunks for payload blobs over 256 KiB, else one chunk). Mount blobs are one chunk.
+    /// chunks for payload blobs over 256 KiB, else one chunk). Mount blobs are one chunk;
+    /// GDeflate chunks are at most 64 KiB, and 64 KiB by default.
     pub chunk_len: u32,
 }
 
@@ -37,26 +38,32 @@ impl<'a> BlobIn<'a> {
         }
     }
 
-    /// Compresses the blob as the writer would, on the calling thread, for
-    /// [`EntryBlobs::push_encoded`].
-    pub fn encode(&self, zstd_level: i32) -> Result<EncodedBlob<'a>> {
-        let chunk = chunk_len(self)?;
-        self.encode_chunked(chunk, raw_key(self, chunk), zstd_level)
+    /// Compresses the blob as a writer with this zstd level and GDeflate codec would, on the
+    /// calling thread, for [`EntryBlobs::push_encoded`].
+    pub fn encode(
+        &self,
+        zstd_level: i32,
+        gdeflate: Option<&dyn GDeflate>,
+    ) -> Result<EncodedBlob<'a>> {
+        let plan = Plan::new(self, gdeflate.is_some())?;
+        self.encode_planned(&plan, zstd_level, gdeflate)
     }
 
-    fn encode_chunked(&self, chunk: u32, key: Hash32, zstd_level: i32) -> Result<EncodedBlob<'a>> {
-        if self.codec == Codec::GDeflate {
-            return Err(Error::InvalidBlob("GDeflate encoding is not available"));
-        }
+    fn encode_planned(
+        &self,
+        plan: &Plan,
+        zstd_level: i32,
+        gdeflate: Option<&dyn GDeflate>,
+    ) -> Result<EncodedBlob<'a>> {
         let mut stored = Vec::new();
         let mut lens = Vec::new();
         let mut planes = Vec::new();
         let raw_chunks: Vec<&[u8]> = if self.bytes.is_empty() {
             vec![&[]]
         } else {
-            self.bytes.chunks(chunk as usize).collect()
+            self.bytes.chunks(plan.chunk as usize).collect()
         };
-        let (mut codec, mut filter) = (self.codec, self.filter);
+        let (mut codec, mut filter) = (plan.codec, plan.filter);
         for c in &raw_chunks {
             let src = if filter == Filter::BytePlanes4 {
                 split_planes(c, &mut planes);
@@ -67,11 +74,20 @@ impl<'a> BlobIn<'a> {
             let n = stored.len();
             match codec {
                 Codec::Zstd => stored.extend(zstd::bulk::compress(src, zstd_level)?),
-                _ => stored.extend_from_slice(src),
+                Codec::GDeflate => {
+                    let g = gdeflate.ok_or(Error::InvalidBlob("no GDeflate codec"))?;
+                    g.compress(src, &mut stored)?;
+                    if !(stored.len() - n).is_multiple_of(4) {
+                        return Err(Error::Encode(
+                            "GDeflate page length not a multiple of 4".into(),
+                        ));
+                    }
+                }
+                Codec::None => stored.extend_from_slice(src),
             }
             lens.push((stored.len() - n) as u32);
         }
-        if codec == Codec::Zstd && stored.len() >= self.bytes.len() {
+        if codec != Codec::None && stored.len() >= self.bytes.len() {
             (codec, filter) = (Codec::None, Filter::None);
             stored.clear();
             stored.extend_from_slice(self.bytes);
@@ -87,11 +103,72 @@ impl<'a> BlobIn<'a> {
                 codec: codec_byte(codec, filter),
                 mount: u8::from(self.mount),
             },
-            key,
+            key: plan.key(self),
             raw: self.bytes,
             stored,
             chunks: lens,
         })
+    }
+}
+
+/// How a blob is stored: its codec and filter after the writer's GDeflate rule, and its
+/// decoded chunk length.
+struct Plan {
+    codec: Codec,
+    filter: Filter,
+    chunk: u32,
+}
+
+impl Plan {
+    /// With a GDeflate codec, payload blobs asked for as zstd are stored as GDeflate without
+    /// a filter. Mount blobs are one chunk; GDeflate chunks are at most 64 KiB.
+    fn new(b: &BlobIn, gdeflate: bool) -> Result<Self> {
+        let (codec, filter) = match b.codec {
+            _ if b.bytes.is_empty() => (Codec::None, Filter::None),
+            Codec::Zstd if gdeflate && !b.mount => (Codec::GDeflate, Filter::None),
+            Codec::GDeflate if b.mount => {
+                return Err(Error::InvalidBlob("GDeflate blob in the mount section"));
+            }
+            Codec::GDeflate if b.filter != Filter::None => {
+                return Err(Error::InvalidBlob("filter on a GDeflate blob"));
+            }
+            c => (c, b.filter),
+        };
+        let raw_len =
+            u32::try_from(b.bytes.len()).map_err(|_| Error::InvalidBlob("blob over 4 GiB"))?;
+        let chunk = match b.chunk_len {
+            _ if b.mount => raw_len.max(1),
+            0 if raw_len > DEFAULT_CHUNK => DEFAULT_CHUNK,
+            0 => raw_len.max(1),
+            c if c.is_power_of_two() && u64::from(c) >= PAGE => c,
+            _ => {
+                return Err(Error::InvalidBlob(
+                    "chunk length is not a power of two from 4096",
+                ));
+            }
+        };
+        let chunk = match codec {
+            Codec::GDeflate => chunk.min(GDEFLATE_PAGE),
+            _ => chunk,
+        };
+        if raw_len.div_ceil(chunk) > u32::from(u16::MAX) {
+            return Err(Error::InvalidBlob("more than 65535 chunks"));
+        }
+        Ok(Self {
+            codec,
+            filter,
+            chunk,
+        })
+    }
+
+    /// Dedup key of the decoded bytes and how they are stored.
+    fn key(&self, b: &BlobIn) -> Hash32 {
+        let mut key = blake3::Hasher::new();
+        key.update(b"raw");
+        key.update(&[self.codec as u8, self.filter as u8, u8::from(b.mount)]);
+        key.update(&self.chunk.to_le_bytes());
+        key.update(b.bytes);
+        Hash32::finish(&key)
     }
 }
 
@@ -145,36 +222,6 @@ impl EntryBlobs<'_> {
     }
 }
 
-/// Chunk length of a blob: one chunk for mount blobs, else as asked or by the default rule.
-fn chunk_len(b: &BlobIn) -> Result<u32> {
-    let raw_len =
-        u32::try_from(b.bytes.len()).map_err(|_| Error::InvalidBlob("blob over 4 GiB"))?;
-    let chunk = match b.chunk_len {
-        _ if b.mount => raw_len.max(1),
-        0 if raw_len > DEFAULT_CHUNK => DEFAULT_CHUNK,
-        0 => raw_len.max(1),
-        c if c.is_power_of_two() && u64::from(c) >= PAGE => c,
-        _ => {
-            return Err(Error::InvalidBlob(
-                "chunk length is not a power of two from 4096",
-            ));
-        }
-    };
-    if raw_len.div_ceil(chunk) > u32::from(u16::MAX) {
-        return Err(Error::InvalidBlob("more than 65535 chunks"));
-    }
-    Ok(chunk)
-}
-
-fn raw_key(b: &BlobIn, chunk: u32) -> Hash32 {
-    let mut key = blake3::Hasher::new();
-    key.update(b"raw");
-    key.update(&[b.codec as u8, b.filter as u8, u8::from(b.mount)]);
-    key.update(&chunk.to_le_bytes());
-    key.update(b.bytes);
-    Hash32::finish(&key)
-}
-
 /// Where [`ArchiveWriter::finish`] puts the archive.
 #[derive(Clone, Debug)]
 pub enum Target {
@@ -210,6 +257,7 @@ pub struct ArchiveWriter {
     /// stored bytes and layout.
     seen: HashMap<Hash32, Blob>,
     zstd_level: i32,
+    gdeflate: Option<Arc<dyn GDeflate>>,
 }
 
 impl ArchiveWriter {
@@ -245,12 +293,25 @@ impl ArchiveWriter {
             ids: HashSet::new(),
             seen: HashMap::new(),
             zstd_level: 19,
+            gdeflate: None,
         })
     }
 
     /// zstd compression level for blobs added from now on (default 19).
     pub fn set_zstd_level(&mut self, level: i32) {
         self.zstd_level = level;
+    }
+
+    /// GDeflate codec for blobs added from now on (default none). With one, payload blobs
+    /// added as zstd are stored as GDeflate pages without a filter, and blobs added as
+    /// GDeflate are accepted.
+    pub fn set_gdeflate(&mut self, gdeflate: Option<Arc<dyn GDeflate>>) {
+        self.gdeflate = gdeflate;
+    }
+
+    /// The GDeflate codec set by [`Self::set_gdeflate`], for [`BlobIn::encode`].
+    pub fn gdeflate(&self) -> Option<Arc<dyn GDeflate>> {
+        self.gdeflate.clone()
     }
 
     /// Adds an asset named `name` and returns its id.
@@ -357,12 +418,11 @@ impl ArchiveWriter {
     }
 
     fn encode(&mut self, b: &BlobIn) -> Result<Blob> {
-        let chunk = chunk_len(b)?;
-        let key = raw_key(b, chunk);
-        if let Some(rec) = self.seen.get(&key) {
+        let plan = Plan::new(b, self.gdeflate.is_some())?;
+        if let Some(rec) = self.seen.get(&plan.key(b)) {
             return Ok(*rec);
         }
-        let e = b.encode_chunked(chunk, key, self.zstd_level)?;
+        let e = b.encode_planned(&plan, self.zstd_level, self.gdeflate.as_deref())?;
         self.place(e.rec, &e.stored, &e.chunks, Some(e.key))
     }
 

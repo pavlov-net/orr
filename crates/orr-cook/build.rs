@@ -12,6 +12,11 @@
 //! With the `subd` feature, compiles OpenSubdiv's Sdc, Vtr and Far sources from the release
 //! checkout in `ORR_OPENSUBDIV` (else `OpenSubdiv-3.8.0` under `ORR_TOOLS` or the nearest
 //! `.tools`) with the Far shim, and sets `ORR_COOK_SUBD_LIBS` to the release it read.
+//!
+//! With the `gdeflate` feature, compiles the GDeflate codec of NVIDIA's libdeflate fork from
+//! the checkout in `ORR_GDEFLATE` (else `libdeflate-gdeflate` under `ORR_TOOLS` or the
+//! nearest `.tools`, where `tools/fetch-slang.sh` puts it) and sets `ORR_COOK_GDEFLATE` to
+//! its commit.
 
 use std::path::Path;
 
@@ -22,6 +27,7 @@ const TEXTURE: &[&str] = &["bcdec_rs", "image", "png", "half"];
 fn main() {
     ntc();
     subd();
+    gdeflate();
     let dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let lock = Path::new(&dir)
         .ancestors()
@@ -166,3 +172,59 @@ fn constant_define(text: &str, name: &str, file: &Path) -> String {
 fn subd() {
     println!("cargo:rustc-env=ORR_COOK_SUBD_LIBS=");
 }
+
+#[cfg(feature = "gdeflate")]
+fn gdeflate() {
+    let src =
+        orr_shaders::build::fetched("ORR_GDEFLATE", "libdeflate-gdeflate").unwrap_or_else(|e| {
+            panic!("the gdeflate feature needs a NVIDIA/libdeflate gdeflate checkout: {e}")
+        });
+    println!("cargo:rustc-env=ORR_COOK_GDEFLATE={}", commit(&src));
+    let cpu = if cfg!(any(target_arch = "aarch64", target_arch = "arm")) {
+        "lib/arm/cpu_features.c"
+    } else {
+        "lib/x86/cpu_features.c"
+    };
+    // The GDeflate page bound calls the plain DEFLATE bound in `deflate_compress.c`.
+    let files = [
+        "lib/gdeflate_compress.c",
+        "lib/gdeflate_decompress.c",
+        "lib/deflate_compress.c",
+        "lib/utils.c",
+        cpu,
+    ];
+    for f in files {
+        println!("cargo:rerun-if-changed={}", src.join(f).display());
+    }
+    cc::Build::new()
+        .include(&src)
+        .files(files.map(|f| src.join(f)))
+        .warnings(false)
+        .compile("orr_gdeflate");
+}
+
+/// The commit a git checkout has checked out, from its `HEAD` and refs.
+#[cfg(feature = "gdeflate")]
+fn commit(checkout: &Path) -> String {
+    let git = checkout.join(".git");
+    let read = |f: &Path| std::fs::read_to_string(f).map(|s| s.trim().to_owned());
+    let head = read(&git.join("HEAD"))
+        .unwrap_or_else(|e| panic!("{} is not a git checkout: {e}", checkout.display()));
+    println!("cargo:rerun-if-changed={}", git.join("HEAD").display());
+    let Some(name) = head.strip_prefix("ref: ") else {
+        return head;
+    };
+    if let Ok(id) = read(&git.join(name)) {
+        return id;
+    }
+    read(&git.join("packed-refs"))
+        .ok()
+        .and_then(|refs| {
+            refs.lines()
+                .find_map(|l| l.strip_suffix(name)?.strip_suffix(' ').map(str::to_owned))
+        })
+        .unwrap_or_else(|| panic!("{}: cannot resolve {name}", checkout.display()))
+}
+
+#[cfg(not(feature = "gdeflate"))]
+fn gdeflate() {}

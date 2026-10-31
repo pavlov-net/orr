@@ -9,6 +9,9 @@
 #   display/gt7/     Polyphony Digital's GT7 tone-mapping sample (MIT), checked against its
 #                    sha256
 #   vma/             GPUOpen VulkanMemoryAllocator v3.5.0 at its tag commit
+#   libdeflate-gdeflate/
+#                    NVIDIA/libdeflate's gdeflate branch at a pinned commit (MIT and
+#                    Apache-2.0): the GDeflate codec of orr-cook's `gdeflate` feature
 #   cie/CIE_std_illum_D65.csv
 #                    CIE standard illuminant D65 at 1 nm (CIE, CC BY-SA 4.0,
 #                    doi:10.25039/CIE.DS.hjfjmt59), checked against its sha256
@@ -29,6 +32,7 @@ slang_version=2026.20
 openpbr_commit=c91aad1d1ce1693e803f039d7c92c2965c4eb013
 glm_commit=0af55ccecd98d4e5a8d1fad7de25ba429d60e863
 vma_commit=0f1a757da579831283413295cc7f3b47eb521c77
+gdeflate_commit=8ba9502fb30d2bf728592d121f0d402e40c8cb05
 sky_commit=34f14e745cff948f4ca3157d1b62a445ffa7286f
 d65_sum=e76f210bffff3d552ef7113025da5f325d5dfec200dd4b878b1a2f3a507032cb
 gt7_sum=94df7e7e310b9423ebb5aaaa29416f376ebbae66e0948fb259f8688314b29822
@@ -100,6 +104,7 @@ fetch_commit https://github.com/g-truc/glm "$glm_commit" "$tools/glm"
 fetch_commit https://github.com/ebruneton/precomputed_atmospheric_scattering "$sky_commit" \
   "$tools/precomputed_atmospheric_scattering"
 fetch_commit https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator "$vma_commit" "$tools/vma"
+fetch_commit https://github.com/NVIDIA/libdeflate "$gdeflate_commit" "$tools/libdeflate-gdeflate"
 
 gt7="$tools/display/gt7/gt7_tone_mapping.cpp"
 if echo "$gt7_sum  $gt7" | sha256sum -c --quiet - 2>/dev/null; then
