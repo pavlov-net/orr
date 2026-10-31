@@ -24,7 +24,8 @@ use orr::orr_gpu::{
 };
 use orr::{
     ConsumerMarker, Display, DisplayRequest, DlssSdk, FrameDesc, FrameGenerationMode, FrameTime,
-    Lens, Projection, Renderer, RendererDesc, SceneId, ViewDesc, ViewHistoryId, ViewTarget,
+    Lens, Projection, Renderer, RendererDesc, SceneId, TextureFilter, ViewDesc, ViewHistoryId,
+    ViewTarget,
 };
 use orr_egui::Painter;
 use orr_math::{DVec3, Quat, UVec2, Vec2};
@@ -251,6 +252,7 @@ fn frame_generation_presents_generated_images_before_each_frame() {
             // The bar jumps back when it wraps.
             reset_history: i % PHASE == 0 || (i as f32 * SPEED) % travel < SPEED,
             mip_bias: 0.0,
+            texture_filter: TextureFilter::Hardware,
             target: ViewTarget::Display,
         };
         f.frame_generation(&view, &t.depth, &t.motion, false);

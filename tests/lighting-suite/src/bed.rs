@@ -26,7 +26,7 @@ use orr_scene::testing::{FlipError, Image, Pixels, flip};
 use orr_scene::{
     FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens, LoadState, Loading,
     MountId, PackSource, Projection, RasterView, RendererDesc, SceneDesc, SceneId, Scenes,
-    TransformGroupDesc, ViewDesc, ViewHistoryId, ViewTarget,
+    TextureFilter, TransformGroupDesc, ViewDesc, ViewHistoryId, ViewTarget,
 };
 
 use crate::shaders::{accumulate, exposure, flat_color, guide_read};
@@ -1143,6 +1143,7 @@ impl Bed {
             jitter: Vec2::ZERO,
             reset_history: cut,
             mip_bias: 0.0,
+            texture_filter: TextureFilter::Hardware,
             target: ViewTarget::AfterRr,
         };
         if !self.light_writes.is_empty() {

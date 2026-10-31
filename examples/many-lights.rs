@@ -22,7 +22,7 @@ use orr::orr_pack::{AssetId, Target};
 use orr::{
     Affine3, Cone, DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc, FrameTime,
     GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LightId, PackSource, Projection,
-    Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest,
+    Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
     TransformGroupDesc, ViewDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshSettings, Source};
@@ -353,6 +353,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                 jitter: Vec2::ZERO,
                 reset_history: i == 0,
                 mip_bias: 0.0,
+                texture_filter: TextureFilter::Hardware,
                 target,
             },
             &lighting,

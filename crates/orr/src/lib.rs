@@ -51,8 +51,9 @@ pub use orr_scene::{
     ProducerStats, ProducerUpdate, Projection, REBASE_GRID_LOG2, RasterGpu, ReloadReport,
     RendererDesc, ResidencyClass, ResidencyStats, RtCutGpu, RtStats, SceneCompute, SceneDesc,
     SceneId, SceneRoot, SceneWriter, SkeletonRef, SkinStats, SkinnedDesc, SkyStats, SlotStateGpu,
-    TopologyGpu, TransformGroupDesc, TransformGroupId, TransparencyPass, ViewConstants, ViewDesc,
-    ViewHistoryId, ViewTarget, WorldPos, abi, material_flags, orr_gpu, orr_pack,
+    TextureFilter, TopologyGpu, TransformGroupDesc, TransformGroupId, TransparencyPass,
+    ViewConstants, ViewDesc, ViewHistoryId, ViewTarget, WorldPos, abi, material_flags, orr_gpu,
+    orr_pack,
 };
 
 use orr_gpu::{

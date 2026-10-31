@@ -13,7 +13,7 @@ use orr_scene::testing::{assert_clean, device, read_buffer, read_texture, wait};
 use orr_scene::{
     Affine3, ClusterTopology, FrameDesc, FrameTime, GroupWriter, Lens, MaterialGpu, MaterialId,
     Opacity, ProducerDesc, ProducerId, ProducerStats, ProducerUpdate, Projection, RasterView,
-    RendererDesc, SceneDesc, SceneId, Scenes, TransformGroupDesc, TransformGroupId,
+    RendererDesc, SceneDesc, SceneId, Scenes, TextureFilter, TransformGroupDesc, TransformGroupId,
     TransparencyPass, ViewDesc, ViewHistoryId, ViewTarget, VisibleCluster, material_flags,
 };
 use orr_shaders::bytemuck::Zeroable;
@@ -249,6 +249,7 @@ impl Field {
                 jitter: Vec2::ZERO,
                 reset_history: self.frame <= 2,
                 mip_bias: 0.0,
+                texture_filter: TextureFilter::Hardware,
                 target: ViewTarget::AfterRr,
             })
             .unwrap();

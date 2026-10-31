@@ -23,7 +23,7 @@ use orr::orr_pack::material::Material;
 use orr::{
     Affine3, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
     InstancesDesc, Lens, LoadState, PackSource, Pose, Projection, Renderer, RendererDesc,
-    SceneDesc, SceneLightingSettings, TransformGroupDesc, ViewDesc, ViewTarget,
+    SceneDesc, SceneLightingSettings, TextureFilter, TransformGroupDesc, ViewDesc, ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSettings, Source};
 use orr_math::camera::rh::view;
@@ -336,6 +336,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                 jitter: Vec2::ZERO,
                 reset_history: i == 0,
                 mip_bias: 0.0,
+                texture_filter: TextureFilter::Hardware,
                 target: if options.headless {
                     ViewTarget::AfterRr
                 } else {

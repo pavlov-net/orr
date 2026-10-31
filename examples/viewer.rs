@@ -22,8 +22,8 @@ use orr::orr_gpu::{
 };
 use orr::{
     Display, DisplayRequest, ExposureTelemetry, FrameDesc, FrameTime, HookPass, Lens, Projection,
-    Renderer, RendererDesc, ResolvedDisplay, ScreenshotRequest, ViewDesc, ViewHooks, ViewLighting,
-    ViewOutput, ViewTarget,
+    Renderer, RendererDesc, ResolvedDisplay, ScreenshotRequest, TextureFilter, ViewDesc, ViewHooks,
+    ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_math::camera::rh::view;
 use orr_math::{UVec2, Vec2, Vec3};
@@ -216,6 +216,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                 jitter: Vec2::ZERO,
                 reset_history: i == 0,
                 mip_bias: 0.0,
+                texture_filter: TextureFilter::Hardware,
                 target,
             },
             &ViewLighting::default(),

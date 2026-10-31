@@ -6,7 +6,7 @@ use orr_scene::testing::{assert_clean, device, read_buffer, wait};
 use orr_scene::{
     Affine3, CopyVariant, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstanceGpu,
     InstanceRange, InstancesDesc, Lens, Light, LightGpu, MaterialGpu, MaterialId, ModelId, Pose,
-    Projection, RendererDesc, SceneDesc, SceneId, SceneRoot, Scenes, SlotStateGpu,
+    Projection, RendererDesc, SceneDesc, SceneId, SceneRoot, Scenes, SlotStateGpu, TextureFilter,
     TransformGroupDesc, TransformGroupId, ViewConstants, ViewDesc, ViewTarget, WorldPos,
 };
 use scene_suite::pipeline;
@@ -486,6 +486,7 @@ fn view_constants_project_and_reconstruct_render_positions() {
             jitter,
             reset_history: true,
             mip_bias: 0.0,
+            texture_filter: TextureFilter::Hardware,
             target: ViewTarget::AfterRr,
         })
         .unwrap();
@@ -592,6 +593,7 @@ fn exposure_slots_alternate_per_render_of_a_view() {
                     jitter: Vec2::ZERO,
                     reset_history: false,
                     mip_bias: 0.0,
+                    texture_filter: TextureFilter::Hardware,
                     target: ViewTarget::AfterRr,
                 })
                 .unwrap();
@@ -669,6 +671,7 @@ fn copies_are_placed_relative_to_the_eye_from_cells() {
             jitter: Vec2::ZERO,
             reset_history: false,
             mip_bias: 0.0,
+            texture_filter: TextureFilter::Hardware,
             target: ViewTarget::AfterRr,
         })
         .unwrap();

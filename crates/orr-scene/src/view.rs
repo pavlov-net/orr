@@ -41,6 +41,22 @@ pub struct ViewConstants {
     pub delta_time: f32,
     /// Added to the level of detail of every primary-hit texture lookup.
     pub mip_bias: f32,
+    /// [`TextureFilter`] as its `view.slang` constant.
+    pub texture_filter: u32,
+    pub _pad: u32,
+}
+
+/// How a view's material textures are filtered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TextureFilter {
+    /// The samplers' trilinear and anisotropic filtering.
+    #[default]
+    Hardware,
+    /// Under magnification, in the material resolve and at ray hits, one texel picked at
+    /// random per lookup so its expected value is the bicubic (cubic B-spline) filtered
+    /// texture; elsewhere the samplers' filtering. Its noise needs a temporal resolve such
+    /// as DLSS ray reconstruction to average it.
+    Stochastic,
 }
 
 /// One exposure slot of a view (`view.slang`); orr-output writes it.
@@ -174,6 +190,8 @@ pub struct ViewDesc<'a> {
     /// Texture level-of-detail bias for an upscaled image: log2(render width / output
     /// width), 0 without upscaling.
     pub mip_bias: f32,
+    /// How the view filters material textures.
+    pub texture_filter: TextureFilter,
     pub target: ViewTarget<'a>,
 }
 
@@ -325,5 +343,10 @@ pub(crate) fn view_constants(
         frame_index: frame as u32,
         delta_time,
         mip_bias: desc.mip_bias,
+        texture_filter: match desc.texture_filter {
+            TextureFilter::Hardware => 0,
+            TextureFilter::Stochastic => 1,
+        },
+        _pad: 0,
     }
 }

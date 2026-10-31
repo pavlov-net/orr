@@ -104,12 +104,67 @@ public float3 material_emission(MaterialGpu* m)
 }
 
 // Where a texture lookup reads: uv and its change per render pixel along x and y, with any
-// level-of-detail bias already applied.
+// level-of-detail bias already applied, and the two uniforms in [0, 1) that pick the
+// stochastic filter's texel. A negative `tap.x` takes hardware filtering only.
 public struct UvFootprint
 {
     public float2 uv;
     public float2 dx;
     public float2 dy;
+    public float2 tap;
+}
+
+// The offset from the texel below a sample, -1 to 2, that the cubic B-spline weights at
+// fraction `f` give to uniform `u`.
+int bspline_offset(float f, float u)
+{
+    float g = 1.0 - f;
+    float w0 = g * g * g / 6.0;
+    float w1 = (4.0 - 6.0 * f * f + 3.0 * f * f * f) / 6.0;
+    float w3 = f * f * f / 6.0;
+    return u < w0 ? -1 : u < w0 + w1 ? 0 : u < 1.0 - w3 ? 1 : 2;
+}
+
+// The stochastic filter's texel for footprint `f` on a mip 0 of `size` texels: true, with
+// `texel_uv` at the center of the texel `f.tap` picks, where the filter takes one texel in
+// place of hardware filtering. Its expected value is the cubic B-spline filtered texture
+// where the footprint is under half a texel along both of its axes, blending to hardware
+// bilinear at one texel; larger footprints keep hardware trilinear and anisotropic
+// filtering.
+public bool stochastic_texel(UvFootprint f, float2 size, out float2 texel_uv)
+{
+    texel_uv = f.uv;
+    if (f.tap.x < 0.0)
+        return false;
+    float2 dx = f.dx * size;
+    float2 dy = f.dy * size;
+    float major = sqrt(max(dot(dx, dx), dot(dy, dy)));
+    float share = saturate(2.0 - 2.0 * major);
+    if (f.tap.x >= share)
+        return false;
+    float2 x = f.uv * size - 0.5;
+    float2 below = floor(x);
+    float2 t = x - below;
+    float2 k = float2(bspline_offset(t.x, f.tap.x / share), bspline_offset(t.y, f.tap.y));
+    texel_uv = (below + k + 0.5) / size;
+    return true;
+}
+
+// `t` read through sampler `s` over footprint `f`: one stochastic texel under
+// magnification, else the sampler's filtering.
+public float4 texture_footprint(TextureIndex t, SamplerIndex s, UvFootprint f)
+{
+    Texture2D<float4> texture = t.get<Texture2D<float4>>();
+    if (f.tap.x >= 0.0)
+    {
+        uint width;
+        uint height;
+        texture.GetDimensions(width, height);
+        float2 texel_uv;
+        if (stochastic_texel(f, float2(width, height), texel_uv))
+            return texture.SampleLevel(s.get(), texel_uv, 0.0);
+    }
+    return texture.SampleGrad(s.get(), f.uv, f.dx, f.dy);
 }
 
 public bool material_bound(MaterialGpu* m, uint slot)
@@ -124,15 +179,15 @@ uint material_channel(MaterialGpu* m, uint slot)
     return bits & 15;
 }
 
-// The texture footprint function: `slot`'s texture filtered over footprint `f`, its
-// channels from the slot's first one on in xyzw. Color slots come back in linear
-// Rec.2020. An unbound slot reads `fallback`.
+// The texture footprint function: `slot`'s texture filtered over footprint `f`
+// (`texture_footprint`), its channels from the slot's first one on in xyzw. Color slots
+// come back in linear Rec.2020. An unbound slot reads `fallback`.
 public float4 material_texture(MaterialGpu* m, uint slot, UvFootprint f, float4 fallback)
 {
     TextureIndex t = m.textures[slot];
     if (t.index == TEXTURE_NONE)
         return fallback;
-    float4 v = t.get<Texture2D<float4>>().SampleGrad(m.sampler.get(), f.uv, f.dx, f.dy);
+    float4 v = texture_footprint(t, m.sampler, f);
     uint c = material_channel(m, slot);
     float4 r = c == 0 ? v : c == 1 ? float4(v.yzw, 1.0) : c == 2 ? float4(v.zw, 0.0, 1.0) : float4(v.w, 0.0, 0.0, 1.0);
     if (slot == TEXTURE_BASE_COLOR || slot == TEXTURE_EMISSION || slot == TEXTURE_SUBSURFACE_COLOR)

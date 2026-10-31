@@ -82,7 +82,7 @@ pub use transparency::TransparencyPass;
 pub use traverse::CutStats;
 pub use view::{
     DepthOfField, ExposureState, Focus, Glare, Lens, LensDistortion, Projection, RasterView,
-    ViewConstants, ViewDesc, ViewHistoryId, ViewTarget,
+    TextureFilter, ViewConstants, ViewDesc, ViewHistoryId, ViewTarget,
 };
 pub use world::{REBASE_GRID_LOG2, WorldPos};
 

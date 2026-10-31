@@ -36,8 +36,8 @@ use orr::{
     Lens, Light, LightId, LightingStats, LoadState, MaterialGpu, ModelId, MountId, Opacity,
     PackSource, PipelineId, Pose, ProducerDesc, ProducerId, ProducerUpdate, Projection, Renderer,
     RendererDesc, SceneCompute, SceneDesc, SceneId, SceneLightingSettings, ScreenshotRequest,
-    TransformGroupDesc, TransformGroupId, TransparencyPass, ViewDesc, ViewHistoryId, ViewHooks,
-    ViewLighting, ViewOutput, ViewTarget,
+    TextureFilter, TransformGroupDesc, TransformGroupId, TransparencyPass, ViewDesc, ViewHistoryId,
+    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Quality, Source};
 use orr_cook::{TextureSettings, Usage};
@@ -1581,6 +1581,7 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                         jitter: Vec2::ZERO,
                         reset_history: i == 0,
                         mip_bias: 0.0,
+                        texture_filter: TextureFilter::Hardware,
                         target: view_target,
                     },
                     &ViewLighting::default(),
