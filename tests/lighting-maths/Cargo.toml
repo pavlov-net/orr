@@ -12,8 +12,8 @@ publish = false
 gpu = ["dep:orr-gpu", "dep:orr-lighting", "openpbr-ref/gpu"]
 
 [dependencies]
-openpbr-ref = { path = "../openpbr-ref" }
-shader-maths = { path = "../shader-maths" }
+openpbr-ref.workspace = true
+shader-maths.workspace = true
 orr-shaders.workspace = true
 orr-gpu = { workspace = true, optional = true }
 orr-lighting = { workspace = true, optional = true }

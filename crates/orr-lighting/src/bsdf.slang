@@ -20,6 +20,10 @@
 // lobe (`LOBE_VOLUME`), which `Bsdf.subsurface_entry` samples alone for a random walk; lobes
 // are chosen by their estimated albedo, glossy ones favoured by up to `SPECULAR_BIAS`; and no
 // dispersion.
+//
+// `bsdf_prepare` is `bsdf_prepare_layers` followed by `Bsdf.finish` with the fitted `FOLD_*`
+// constants. `finish`, `eval` and `pdf` are forward-differentiable in `finish`'s `BsdfFit`;
+// the functions marked `[TreatAsDifferentiable]` do not depend on it.
 module bsdf;
 
 import orr.math;
@@ -44,6 +48,22 @@ public static const float MIRROR_ROUGHNESS = 0.01;
 // share; it falls to 1 at roughness 1.
 public static const float SPECULAR_BIAS = 2.0;
 
+// `bsdf_collapse` moves the coat's and fuzz's albedo onto the base: a share goes on the
+// specular lobe's shape and the rest on a cosine lobe. The coat's share is `FOLD_COAT` plus
+// `FOLD_COAT_SLOPE` times the coat roughness, the fuzz's `FOLD_FUZZ`, each at most 1. Fitted
+// to the reference's eval over the harness grid (`bsdf-fit` in tests/lighting-maths).
+public static const float FOLD_COAT = 0.47870687;
+public static const float FOLD_COAT_SLOPE = 2.7307014;
+public static const float FOLD_FUZZ = 0.5356808;
+
+// The coefficients `Bsdf.finish` takes, the `FOLD_*` constants in `bsdf_prepare`.
+public struct BsdfFit : IDifferentiable
+{
+    public float fold_coat;
+    public float fold_coat_slope;
+    public float fold_fuzz;
+}
+
 public struct BsdfSample
 {
     public float3 wi;
@@ -53,7 +73,7 @@ public struct BsdfSample
 }
 
 // Directional albedo from the view, by kind, for guides and lobe selection.
-public struct LobeAlbedo
+public struct LobeAlbedo : IDifferentiable
 {
     public float3 diffuse;              // diffuse reflection and thin-walled diffuse transmission
     public float3 specular;             // glossy and mirror reflection: specular, coat, fuzz
@@ -87,68 +107,137 @@ static const float MIN_MS_ALPHA = 0.04 * 0.04;
 static const float MIN_COS = 1e-4;
 static const float LARGEST_BELOW_ONE = 0.99999994;
 
+// What `bsdf_prepare_layers` leaves for `Bsdf.finish`: directional albedo estimates per lobe
+// without the coat and fuzz folded, and the lobe-selection inputs.
+public struct BsdfLayers
+{
+    bool collapsed;
+    float e_ss;                         // the specular lobe's single-scattering albedo
+    float coat_roughness;
+    float3 scale;
+    float3 e[LOBES];
+    LobeAlbedo estimate;                // specular left out
+    float3 specular_single;             // the specular lobe's reflection coefficient under the layers
+    float3 specular_multiple;           // the multiple-scattering lobes' reflection
+    float glossy_bias;
+    float coat_bias;
+    bool dms_floor;
+    bool mms_floor;
+}
 
 // Prepared at one shading point for one view.
-public struct Bsdf
+public struct Bsdf : IDifferentiable
 {
-    float3 t;
-    float3 b;
-    float3 n;                           // toward the view
-    float3 v;                           // the view in (t, b, n)
-    float3 scale;
-    bool inside;
-    float3 layer;                       // what the coat and fuzz pass of the view to the base
+    no_diff float3 t;
+    no_diff float3 b;
+    no_diff float3 n;                   // toward the view
+    no_diff float3 v;                   // the view in (t, b, n)
+    no_diff float3 scale;
+    no_diff bool inside;
+    no_diff float3 layer;               // what the coat and fuzz pass of the view to the base
 
-    float2 alpha;
-    float alpha_iso;
-    bool mirror;
-    bool bounded;                       // reflection only: bounded visible-normal sampling
-    float eta_refraction;
-    float eta_transparent;
-    float eta_opaque;
-    float3 reflect_transparent;
-    float3 reflect_opaque;
-    float3 reflect_const;
-    float metal;
-    float3 f0;
-    float3 f82;
-    float film;
-    float film_thickness;
-    float film_exterior;
-    float film_ior;
-    float film_interior;
-    float3 transmit;
-    float3 walk;
-    float walk_ms_share;
-    float3 fold;                        // collapsed coat and fuzz albedo over the specular lobe's single-scattering albedo
+    no_diff float2 alpha;
+    no_diff float alpha_iso;
+    no_diff bool mirror;
+    no_diff bool bounded;               // reflection only: bounded visible-normal sampling
+    no_diff float eta_refraction;
+    no_diff float eta_transparent;
+    no_diff float eta_opaque;
+    no_diff float3 reflect_transparent;
+    no_diff float3 reflect_opaque;
+    no_diff float3 reflect_const;
+    no_diff float metal;
+    no_diff float3 f0;
+    no_diff float3 f82;
+    no_diff float film;
+    no_diff float film_thickness;
+    no_diff float film_exterior;
+    no_diff float film_ior;
+    no_diff float film_interior;
+    no_diff float3 transmit;
+    no_diff float3 walk;
+    no_diff float walk_ms_share;
+    float3 fold;                        // collapsed coat and fuzz albedo on the specular shape, over its single-scattering albedo
+    float3 fold_diffuse;                // collapsed coat and fuzz albedo on a cosine lobe
 
-    float3 dms_reflect;
-    float3 dms_transmit;
-    float dms_ratio;
-    float dms_ec;
-    float3 mms;
-    float mms_ec;
+    no_diff float3 dms_reflect;
+    no_diff float3 dms_transmit;
+    no_diff float dms_ratio;
+    no_diff float dms_ec;
+    no_diff float3 mms;
+    no_diff float mms_ec;
 
-    float3 diffuse;
-    float3 thin_diffuse;
-    float diffuse_roughness;
-    float diffuse_comp;
-    float3 thin_specular;
+    no_diff float3 diffuse;
+    no_diff float3 thin_diffuse;
+    no_diff float diffuse_roughness;
+    no_diff float diffuse_comp;
+    no_diff float3 thin_specular;
 
-    float coat_presence;                // of the coat lobe, under the fuzz
-    float3 coat_tint;
-    float coat_tint_presence;
-    float coat_eta;
-    float coat_alpha;
-    bool coat_mirror;
+    no_diff float coat_presence;        // of the coat lobe, under the fuzz
+    no_diff float3 coat_tint;
+    no_diff float coat_tint_presence;
+    no_diff float coat_eta;
+    no_diff float coat_alpha;
+    no_diff bool coat_mirror;
 
-    float fuzz_presence;
-    float3 fuzz_tint;
-    float3 fuzz_ltc;                    // a_inv, b_inv, albedo at the view
+    no_diff float fuzz_presence;
+    no_diff float3 fuzz_tint;
+    no_diff float3 fuzz_ltc;            // a_inv, b_inv, albedo at the view
 
-    float3 emitted;
+    no_diff float3 emitted;
     float probability[LOBES];
     LobeAlbedo estimate;
+
+    // Completes `bsdf_prepare_layers` with `fit`: folds the coat and fuzz when collapsed, and
+    // sets the albedo estimates and lobe probabilities.
+    [mutating, ForwardDifferentiable]
+    public void finish(no_diff BsdfLayers layers, BsdfFit fit)
+    {
+        float3 e[LOBES] = layers.e;
+        LobeAlbedo a = layers.estimate;
+        fold = float3(0.0);
+        fold_diffuse = float3(0.0);
+        if (layers.collapsed)
+        {
+            float3 glossy = e[COAT] * saturate(fit.fold_coat + fit.fold_coat_slope * layers.coat_roughness)
+                + e[FUZZ] * saturate(fit.fold_fuzz);
+            fold = glossy / max(layers.e_ss, 0.05);
+            fold_diffuse = e[COAT] + e[FUZZ] - glossy;
+            e[SPECULAR] += fold * layers.e_ss;
+            e[DIFFUSE] += fold_diffuse;
+            e[COAT] = float3(0.0);
+            e[FUZZ] = float3(0.0);
+        }
+        a.specular = (e[COAT] + e[FUZZ] + fold_diffuse + (layers.specular_single + fold) * layers.e_ss
+            + layers.specular_multiple) * layers.scale;
+        // Table interpolation can leave a complement a rounding error below zero.
+        estimate.diffuse = max(a.diffuse, 0.0);
+        estimate.specular = max(a.specular, 0.0);
+        estimate.transmission = max(a.transmission, 0.0);
+        estimate.subsurface = max(a.subsurface, 0.0);
+
+        float sum = 0.0;
+        for (uint i = 0; i < LOBES; i++)
+        {
+            float w = max(max3(e[i]), 0.0);
+            if (i == SPECULAR || i == THIN_SPECULAR)
+                w *= layers.glossy_bias;
+            if (i == COAT)
+                w *= layers.coat_bias;
+            probability[i] = w;
+            sum += w;
+        }
+        // The multiple-scattering lobes keep a share where their estimate rounds to nothing.
+        if (layers.dms_floor)
+            probability[DIELECTRIC_MS] = max(probability[DIELECTRIC_MS], 1e-3 * sum);
+        if (layers.mms_floor)
+            probability[METAL_MS] = max(probability[METAL_MS], 1e-3 * sum);
+        sum = 0.0;
+        for (uint i = 0; i < LOBES; i++)
+            sum += probability[i];
+        for (uint i = 0; i < LOBES; i++)
+            probability[i] = sum > 0.0 ? probability[i] / sum : 0.0;
+    }
 
     // Directional albedo from the view, by kind.
     public LobeAlbedo albedo()
@@ -163,7 +252,8 @@ public struct Bsdf
     }
 
     // BSDF x cos toward `wi`, over every non-delta lobe.
-    public float3 eval(float3 wi)
+    [ForwardDifferentiable]
+    public float3 eval(no_diff float3 wi)
     {
         float density;
         float3 diffuse;
@@ -179,7 +269,8 @@ public struct Bsdf
     }
 
     // The density `sample` draws `wi` with, over every non-delta lobe.
-    public float pdf(float3 wi)
+    [ForwardDifferentiable]
+    public float pdf(no_diff float3 wi)
     {
         float density;
         float3 diffuse;
@@ -361,6 +452,7 @@ public struct Bsdf
         return r;
     }
 
+    [TreatAsDifferentiable]
     float3 local(float3 wi)
     {
         return to_local(wi, t, b, n);
@@ -390,7 +482,8 @@ public struct Bsdf
     }
 
     // BSDF x cos, density and the diffuse lobes' share at local `l` over the non-delta lobes.
-    float3 evaluate(float3 l, out float pdf, out float3 diffuse_share)
+    [ForwardDifferentiable]
+    float3 evaluate(no_diff float3 l, out float pdf, out float3 diffuse_share)
     {
         pdf = 0.0;
         diffuse_share = float3(0.0);
@@ -415,6 +508,7 @@ public struct Bsdf
             if (probability[DIFFUSE] > 0.0)
             {
                 diffuse_base += eon(diffuse, l) * l.z;
+                top += fold_diffuse * l.z * INV_PI;
                 pdf += probability[DIFFUSE] * l.z * INV_PI;
             }
             if (probability[METAL_MS] > 0.0)
@@ -444,9 +538,9 @@ public struct Bsdf
         }
         if (probability[SPECULAR] > 0.0 && !mirror)
         {
-            float3 folded;
-            base += specular_lobe(l, lobe_pdf, folded);
-            top += folded;
+            float shape;
+            base += specular_lobe(l, lobe_pdf, shape);
+            top += fold * shape;
             pdf += probability[SPECULAR] * lobe_pdf;
         }
         if (probability[DIELECTRIC_MS] > 0.0)
@@ -460,6 +554,7 @@ public struct Bsdf
     }
 
     // GGX reflection with a white coefficient, D G / (4 cos_v), and its bounded sampling density.
+    [TreatAsDifferentiable]
     float ggx_reflection(float3 l, out float pdf)
     {
         float3 h = normalize(v + l);
@@ -468,11 +563,13 @@ public struct Bsdf
             * openpbr_eval_aniso_smith_g1(l, alpha) / (4.0 * v.z);
     }
 
-    // The specular lobe below the layers, and the collapsed layers' share in `folded`.
-    float3 specular_lobe(float3 l, out float pdf, out float3 folded)
+    // The specular lobe below the layers, and in `shape` the white reflection the collapsed
+    // layers' `fold` scales.
+    [TreatAsDifferentiable]
+    float3 specular_lobe(float3 l, out float pdf, out float shape)
     {
         pdf = 0.0;
-        folded = float3(0.0);
+        shape = 0.0;
         float g1v = openpbr_eval_aniso_smith_g1(v, alpha);
         float g = g1v * openpbr_eval_aniso_smith_g1(l, alpha);
         if (l.z > 0.0)
@@ -485,8 +582,7 @@ public struct Bsdf
                 pdf = ggx_vndf_bounded_pdf(v, l, alpha);
             else
                 pdf = reflect_probability(rc, tc * transmit) * d * g1v / (4.0 * v.z);
-            float shape = d * g / (4.0 * v.z);
-            folded = fold * shape;
+            shape = d * g / (4.0 * v.z);
             return rc * shape;
         }
         if (all(transmit == 0.0))
@@ -505,6 +601,7 @@ public struct Bsdf
 
     // Subsurface transmission: GGX refraction plus its share of the dielectric multiple
     // scattering.
+    [TreatAsDifferentiable]
     float3 walk_lobe(float3 l, out float pdf)
     {
         pdf = walk_ms_share * INV_TWO_PI;
@@ -545,6 +642,7 @@ public struct Bsdf
         return abs(c);
     }
 
+    [TreatAsDifferentiable]
     float3 coat_lobe(float3 l, out float pdf)
     {
         float3 h = normalize(v + l);
@@ -555,6 +653,7 @@ public struct Bsdf
         return float3(coat_presence * d * g * openpbr_fresnel(coat_eta, abs(dot(v, h))) / (4.0 * v.z));
     }
 
+    [TreatAsDifferentiable]
     float3 fuzz_lobe(float3 l, out float pdf)
     {
         pdf = ltc_eval(view_aligned(l, float2(v.x, -v.y)));
@@ -580,12 +679,14 @@ public struct Bsdf
         return view_aligned(l, v.xy);
     }
 
+    [TreatAsDifferentiable]
     float3 eon(float3 rho, float3 l)
     {
         return openpbr_f_EON(rho, diffuse_roughness, v, l, false) * diffuse_comp
             * openpbr_look_up_opaque_dielectric_energy_complement(eta_opaque, alpha_iso, l.z);
     }
 
+    [TreatAsDifferentiable]
     float metal_ms(float cos_l)
     {
         float f = mms_ec * openpbr_look_up_ideal_metal_energy_complement(alpha_iso, cos_l)
@@ -595,6 +696,7 @@ public struct Bsdf
 
     // adobe's dielectric multiple-scattering factor toward cosine `cos_l` (negative below),
     // the reflection ratio included.
+    [TreatAsDifferentiable]
     float dielectric_ms(float cos_l)
     {
         if (dms_ec == 0.0)
@@ -631,6 +733,7 @@ public struct Bsdf
     }
 
     // The coat's colour on light leaving the base toward local cosine `c`.
+    [TreatAsDifferentiable]
     float3 leaving(float c)
     {
         if (inside ? c >= 0.0 : c <= 0.0)
@@ -668,6 +771,7 @@ float reflect_probability(float3 reflection, float3 transmission)
 }
 
 // `l` mirrored through the surface plane.
+[TreatAsDifferentiable]
 float3 mirrored(float3 l)
 {
     return float3(l.xy, -l.z);
@@ -694,6 +798,7 @@ float3 ltc_coeffs(float alpha, float mu)
     return openpbr_disney_sheen_fetch_coeffs(lobe, float3(0.0, 0.0, mu));
 }
 
+[ForwardDifferentiable]
 float max3(float3 v)
 {
     return max(v.x, max(v.y, v.z));
@@ -730,7 +835,8 @@ float dielectric_energy(float eta, float alpha, float mu)
 
 // `p` without coat, fuzz and thin film, for deeper path vertices: the base keeps their
 // complement and the coat's colour, and their directional albedo moves onto the base
-// specular lobe, so the directional albedo from the view is kept.
+// specular lobe and a cosine lobe (the `FOLD_*` shares), so the directional albedo from the
+// view is kept.
 public BsdfParams bsdf_collapse(BsdfParams p)
 {
     p.flags = (p.flags | BSDF_COLLAPSED) & ~BSDF_THIN_FILM;
@@ -753,6 +859,16 @@ public SubsurfaceVolume bsdf_subsurface_volume(BsdfParams p)
 // `exterior_ior` the medium on the side `n` points to. A view within 1e-4 of the surface
 // plane leans up to it.
 public Bsdf bsdf_prepare(BsdfParams p, float3 n, float3 wo, float exterior_ior = 1.0)
+{
+    BsdfLayers layers;
+    Bsdf s = bsdf_prepare_layers(p, n, wo, exterior_ior, layers);
+    BsdfFit fit = { FOLD_COAT, FOLD_COAT_SLOPE, FOLD_FUZZ };
+    s.finish(layers, fit);
+    return s;
+}
+
+// `bsdf_prepare` up to the fitted coefficients: `Bsdf.finish` with `layers` completes it.
+public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterior_ior, out BsdfLayers layers)
 {
     Bsdf s;
     bool thin = (p.flags & BSDF_THIN_WALLED) != 0;
@@ -906,73 +1022,42 @@ public Bsdf bsdf_prepare(BsdfParams p, float3 n, float3 wo, float exterior_ior =
         / openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_opaque_dielectric_average_energy_complement(eta_o, s.alpha_iso));
     s.diffuse = p.base_color * opaque + thin_reflect_diffuse;
 
-    // Directional albedo estimates: they choose lobes and answer `albedo`.
+    // Directional albedo estimates without the coat and fuzz: `finish` adds them, folded or
+    // not, and turns the estimates into lobe probabilities.
     float e_ss = 1.0 - openpbr_look_up_ideal_metal_energy_complement(s.alpha_iso, mu);
     float3 below = s.layer * s.leaving(mu);
     float3 rc;
     float3 tc;
-    s.fold = float3(0.0);
     s.coefficients(mu, rc, tc);
-    float3 coat_albedo = float3(coat_reflected * fuzz_in);
-    float3 fuzz_albedo = fuzz_presence * s.fuzz_ltc.z * p.fuzz_color;
-    s.coat_presence = coat_presence * fuzz_in;
-    s.fuzz_presence = fuzz_presence;
-    if (collapsed)
-    {
-        s.fold = (coat_albedo + fuzz_albedo) / max(e_ss, 0.05);
-        coat_albedo = float3(0.0);
-        fuzz_albedo = float3(0.0);
-        s.coat_presence = 0.0;
-        s.fuzz_presence = 0.0;
-    }
+    s.coat_presence = collapsed ? 0.0 : coat_presence * fuzz_in;
+    s.fuzz_presence = collapsed ? 0.0 : fuzz_presence;
     float3 walk_ss = s.walk * tc * e_ss;
     float3 walk_ms = s.walk * (1.0 - s.dms_ratio) * s.dms_ec;
     s.walk_ms_share = max3(walk_ms) > 0.0 ? max3(walk_ms) / (max3(walk_ss) + max3(walk_ms)) : 0.0;
 
-    float3 e[LOBES];
-    e[COAT] = coat_albedo;
-    e[FUZZ] = fuzz_albedo;
-    e[SPECULAR] = (rc + s.transmit * tc) * e_ss * below + s.fold * e_ss;
-    e[WALK] = (walk_ss + walk_ms) * below;
-    e[DIELECTRIC_MS] = (s.dms_reflect * s.dms_ratio + s.dms_transmit * (1.0 - s.dms_ratio)) * s.dms_ec * below;
-    e[METAL_MS] = s.mms * s.mms_ec * below;
-    e[DIFFUSE] = s.diffuse * s.diffuse_comp * below;
-    e[THIN_SPECULAR] = s.thin_specular * e_ss * below;
-    e[THIN_DIFFUSE] = s.thin_diffuse * s.diffuse_comp * below;
-
-    s.estimate.diffuse = (e[DIFFUSE] + e[THIN_DIFFUSE]) * p.scale;
-    s.estimate.specular = (e[COAT] + e[FUZZ] + (rc * below + s.fold) * e_ss
-        + (s.dms_reflect * s.dms_ratio * s.dms_ec + s.mms * s.mms_ec) * below) * p.scale;
-    s.estimate.transmission = ((s.transmit * tc * e_ss + s.dms_transmit * (1.0 - s.dms_ratio) * s.dms_ec) * below
-        + e[THIN_SPECULAR]) * p.scale;
-    s.estimate.subsurface = e[WALK] * p.scale;
-    // Table interpolation can leave a complement a rounding error below zero.
-    s.estimate.diffuse = max(s.estimate.diffuse, 0.0);
-    s.estimate.specular = max(s.estimate.specular, 0.0);
-    s.estimate.transmission = max(s.estimate.transmission, 0.0);
-    s.estimate.subsurface = max(s.estimate.subsurface, 0.0);
-
-    float bias = lerp(SPECULAR_BIAS, 1.0, roughness);
-    float sum = 0.0;
-    for (uint i = 0; i < LOBES; i++)
-    {
-        float w = max(max3(e[i]), 0.0);
-        if (i == SPECULAR || i == THIN_SPECULAR)
-            w *= bias;
-        if (i == COAT)
-            w *= lerp(SPECULAR_BIAS, 1.0, coat_roughness);
-        s.probability[i] = w;
-        sum += w;
-    }
-    // The multiple-scattering lobes keep a share where their estimate rounds to nothing.
-    if (s.dms_ec > 0.0 && (any(s.dms_reflect > 0.0) || any(s.dms_transmit > 0.0)))
-        s.probability[DIELECTRIC_MS] = max(s.probability[DIELECTRIC_MS], 1e-3 * sum);
-    if (s.mms_ec > 0.0 && s.metal > 0.0)
-        s.probability[METAL_MS] = max(s.probability[METAL_MS], 1e-3 * sum);
-    sum = 0.0;
-    for (uint i = 0; i < LOBES; i++)
-        sum += s.probability[i];
-    for (uint i = 0; i < LOBES; i++)
-        s.probability[i] = sum > 0.0 ? s.probability[i] / sum : 0.0;
+    layers.collapsed = collapsed;
+    layers.e_ss = e_ss;
+    layers.coat_roughness = coat_roughness;
+    layers.scale = p.scale;
+    layers.e[COAT] = float3(coat_reflected * fuzz_in);
+    layers.e[FUZZ] = fuzz_presence * s.fuzz_ltc.z * p.fuzz_color;
+    layers.e[SPECULAR] = (rc + s.transmit * tc) * e_ss * below;
+    layers.e[WALK] = (walk_ss + walk_ms) * below;
+    layers.e[DIELECTRIC_MS] = (s.dms_reflect * s.dms_ratio + s.dms_transmit * (1.0 - s.dms_ratio)) * s.dms_ec * below;
+    layers.e[METAL_MS] = s.mms * s.mms_ec * below;
+    layers.e[DIFFUSE] = s.diffuse * s.diffuse_comp * below;
+    layers.e[THIN_SPECULAR] = s.thin_specular * e_ss * below;
+    layers.e[THIN_DIFFUSE] = s.thin_diffuse * s.diffuse_comp * below;
+    layers.estimate.diffuse = (layers.e[DIFFUSE] + layers.e[THIN_DIFFUSE]) * p.scale;
+    layers.estimate.specular = float3(0.0);
+    layers.specular_single = rc * below;
+    layers.specular_multiple = (s.dms_reflect * s.dms_ratio * s.dms_ec + s.mms * s.mms_ec) * below;
+    layers.estimate.transmission = ((s.transmit * tc * e_ss + s.dms_transmit * (1.0 - s.dms_ratio) * s.dms_ec) * below
+        + layers.e[THIN_SPECULAR]) * p.scale;
+    layers.estimate.subsurface = layers.e[WALK] * p.scale;
+    layers.glossy_bias = lerp(SPECULAR_BIAS, 1.0, roughness);
+    layers.coat_bias = lerp(SPECULAR_BIAS, 1.0, coat_roughness);
+    layers.dms_floor = s.dms_ec > 0.0 && (any(s.dms_reflect > 0.0) || any(s.dms_transmit > 0.0));
+    layers.mms_floor = s.mms_ec > 0.0 && s.metal > 0.0;
     return s;
 }

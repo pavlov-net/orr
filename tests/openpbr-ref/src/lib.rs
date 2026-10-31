@@ -7,10 +7,15 @@
 //! tables from the descriptor heap. [`harness`] holds the checks that hold for any correct
 //! BSDF (energy, sampling against the density, reciprocity) and the comparison of two
 //! BSDFs; [`report`] runs them over [`materials::grid`] and writes the tables. A real-time
-//! approximation joins the harness by implementing [`Bsdf`].
+//! approximation joins the harness by implementing [`Bsdf`], and [`fit`] fits its
+//! coefficients to the reference when it also implements [`fit::Fit`].
 //!
 //! Directions are unit vectors in the shading frame: the normal is +z and the tangent +x.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+
+pub mod fit;
 pub mod harness;
 pub mod materials;
 pub mod report;
@@ -314,6 +319,41 @@ openpbr_bsdf!(
     slang_openpbr_volume,
     slang_openpbr_emission
 );
+
+/// `job(state, i)` for every i below `count` on up to the machine's parallelism threads,
+/// each with its own `make()`; results in index order.
+pub(crate) fn in_parallel<S, T: Send>(
+    count: usize,
+    make: &(impl Fn() -> S + Sync),
+    job: impl Fn(&mut S, usize) -> T + Sync,
+) -> Vec<T> {
+    let threads = thread::available_parallelism().map_or(4, usize::from);
+    let next = AtomicUsize::new(0);
+    let mut out: Vec<(usize, T)> = thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads.min(count))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut state = make();
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= count {
+                            break;
+                        }
+                        done.push((i, job(&mut state, i)));
+                    }
+                    done
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("harness thread panicked"))
+            .collect()
+    });
+    out.sort_by_key(|(i, _)| *i);
+    out.into_iter().map(|(_, t)| t).collect()
+}
 
 mod ffi {
     use super::Inputs;

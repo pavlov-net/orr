@@ -7,7 +7,7 @@ use std::thread;
 
 use lighting_maths::{RealTime, edge_case, edge_direction, finite_non_negative, subsurface_volume};
 use openpbr_ref::harness::{self, Estimate, integrate_cells};
-use openpbr_ref::materials::{VIEW_COSINES, grid, view};
+use openpbr_ref::materials::{Material, VIEW_COSINES, grid, view};
 use openpbr_ref::report::{Counts, TABLE_TOLERANCE, evaluate};
 use openpbr_ref::{Bsdf, Inputs, Lobe, Reference};
 use shader_maths::stats::{Rng, SphereGrid};
@@ -208,13 +208,25 @@ fn albedo_by_kind_matches_the_reference_over_the_parameter_grid() {
 }
 
 /// Albedo from sample / pdf equals eval integrated over the sphere within 1%: every direction
-/// eval reaches, sampling reaches with the density pdf reports.
+/// eval reaches, sampling reaches with the density pdf reports. Collapsed too, where the
+/// coat and fuzz fold onto the specular and cosine lobes.
 #[test]
 fn sampled_albedo_equals_integrated_eval() {
-    let mut bsdf = RealTime::new();
     let cells = SphereGrid { nz: 32, nphi: 64 };
     let mut failures = Vec::new();
-    for (i, m) in grid().iter().enumerate().filter(|(_, m)| !m.delta) {
+    let materials = grid();
+    let layered = |m: &&Material| m.inputs.coat_weight > 0.0 || m.inputs.fuzz_weight > 0.0;
+    let cases = materials.iter().enumerate().filter(|(_, m)| !m.delta);
+    for (collapse, (i, m)) in cases
+        .clone()
+        .map(|c| (false, c))
+        .chain(cases.filter(|(_, m)| layered(m)).map(|c| (true, c)))
+    {
+        let (mut bsdf, label) = if collapse {
+            (RealTime::collapsed(), " collapsed")
+        } else {
+            (RealTime::new(), "")
+        };
         for (v, &mu) in VIEW_COSINES.iter().enumerate() {
             let a = harness::albedo(&mut bsdf, &m.inputs, view(mu), 200_000, (i * 8 + v) as u64);
             let sampled: f64 = a.total.mean.iter().sum();
@@ -226,7 +238,7 @@ fn sampled_albedo_equals_integrated_eval() {
             .sum();
             if (sampled - integrated).abs() > 0.01 * integrated + 3.0 * se {
                 failures.push(format!(
-                    "{}, mu {mu}: sampled {sampled:.4}, integrated {integrated:.4}",
+                    "{}{label}, mu {mu}: sampled {sampled:.4}, integrated {integrated:.4}",
                     m.name
                 ));
             }

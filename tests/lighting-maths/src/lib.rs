@@ -7,6 +7,7 @@
 
 use std::ffi::c_void;
 
+use openpbr_ref::fit::Fit;
 use openpbr_ref::{Bsdf, Eval, Inputs, Lobe, Sample, Volume};
 use shader_maths::stats::Rng;
 
@@ -36,6 +37,26 @@ pub struct LobeAlbedo {
 pub struct RealTime {
     prepared: Vec<u128>,
     collapse: bool,
+    coefficients: Option<[f32; COEFFICIENTS]>,
+}
+
+/// The number of fitted coefficients in `bsdf` (`BsdfFit`).
+pub const COEFFICIENTS: usize = 3;
+
+/// The names of the fitted constants, in `BsdfFit` order.
+pub const COEFFICIENT_NAMES: [&str; COEFFICIENTS] = ["FOLD_COAT", "FOLD_COAT_SLOPE", "FOLD_FUZZ"];
+
+/// The coefficients the fit starts from: the collapse puts all of the coat's and fuzz's
+/// albedo on the specular lobe's shape.
+pub const START: [f32; COEFFICIENTS] = [1.0, 0.0, 1.0];
+
+/// The values `bsdf_prepare` uses.
+pub fn fitted_constants() -> [f32; COEFFICIENTS] {
+    let mut c = [0.0; COEFFICIENTS];
+    // SAFETY: the output holds `COEFFICIENTS` floats, the count `bsdf_cpu` writes
+    // (`Fitting::collapsed` checks it).
+    unsafe { ffi::lighting_bsdf_fit_constants(c.as_mut_ptr()) };
+    c
 }
 
 impl RealTime {
@@ -46,6 +67,14 @@ impl RealTime {
     /// Prepares every material through `bsdf_collapse` first.
     pub fn collapsed() -> Self {
         Self::with_collapse(true)
+    }
+
+    /// [`RealTime::collapsed`] with `coefficients` in place of the fitted constants.
+    pub fn collapsed_with(coefficients: [f32; COEFFICIENTS]) -> Self {
+        Self {
+            coefficients: Some(coefficients),
+            ..Self::collapsed()
+        }
     }
 
     fn with_collapse(collapse: bool) -> Self {
@@ -60,6 +89,7 @@ impl RealTime {
         let mut bsdf = Self {
             prepared: vec![0; (prepared as usize).div_ceil(16)],
             collapse,
+            coefficients: None,
         };
         bsdf.prepare(&Inputs::default(), [0.0, 0.0, 1.0]);
         bsdf
@@ -134,6 +164,19 @@ fn sample_with(call: impl FnOnce(*mut f32, *mut f32, *mut f32, *mut u32)) -> Opt
 
 impl Bsdf for RealTime {
     fn prepare(&mut self, inputs: &Inputs, view: V3) {
+        if let Some(c) = self.coefficients {
+            // SAFETY: `prepared` has the size the library reports, 16-byte aligned; the
+            // coefficients are `COEFFICIENTS` floats.
+            unsafe {
+                ffi::lighting_bsdf_prepare_fit(
+                    inputs,
+                    view.as_ptr(),
+                    c.as_ptr(),
+                    self.prepared.as_mut_ptr().cast(),
+                );
+            }
+            return;
+        }
         // SAFETY: `prepared` has the size the library reports, 16-byte aligned.
         unsafe {
             ffi::lighting_bsdf_prepare(
@@ -169,6 +212,81 @@ impl Bsdf for RealTime {
         sample_with(|wi, weight, pdf, lobe| unsafe {
             ffi::lighting_bsdf_sample(self.ptr(), u.as_ptr(), wi, weight, pdf, lobe);
         })
+    }
+}
+
+/// The real-time BSDF as the fitting harness's candidate: prepared up to `Bsdf.finish`, then
+/// evaluated at any coefficients with forward derivatives along each.
+pub struct Fitting {
+    layered: Vec<u128>,
+    layers: Vec<u128>,
+}
+
+impl Fitting {
+    /// Prepares every material through `bsdf_collapse` first, which is where the
+    /// coefficients act.
+    pub fn collapsed() -> Self {
+        // SAFETY: the queries read nothing.
+        let (n, bsdf, layers) = unsafe {
+            (
+                ffi::lighting_bsdf_fit_coefficients(),
+                ffi::lighting_bsdf_size(),
+                ffi::lighting_bsdf_layers_size(),
+            )
+        };
+        assert_eq!(n as usize, COEFFICIENTS, "bsdf_cpu fits a different count");
+        Self {
+            layered: vec![0; (bsdf as usize).div_ceil(16)],
+            layers: vec![0; (layers as usize).div_ceil(16)],
+        }
+    }
+}
+
+impl Fit for Fitting {
+    fn coefficients(&self) -> usize {
+        COEFFICIENTS
+    }
+
+    fn prepare(&mut self, inputs: &Inputs, view: V3) {
+        // SAFETY: the buffers have the sizes the library reports, 16-byte aligned.
+        unsafe {
+            ffi::lighting_bsdf_fit_prepare(
+                inputs,
+                view.as_ptr(),
+                self.layered.as_mut_ptr().cast(),
+                self.layers.as_mut_ptr().cast(),
+            );
+        }
+    }
+
+    fn eval(
+        &self,
+        coefficients: &[f32],
+        wi: V3,
+        d_eval: &mut [V3],
+        d_pdf: &mut [f32],
+    ) -> (V3, f32) {
+        assert!(
+            coefficients.len() == COEFFICIENTS
+                && d_eval.len() == COEFFICIENTS
+                && d_pdf.len() == COEFFICIENTS
+        );
+        let (mut eval, mut pdf) = ([0.0; 3], 0.0);
+        // SAFETY: the buffers hold a prepared BSDF and its layers; the slices have the
+        // lengths the library writes.
+        unsafe {
+            ffi::lighting_bsdf_fit_eval(
+                self.layered.as_ptr().cast(),
+                self.layers.as_ptr().cast(),
+                coefficients.as_ptr(),
+                wi.as_ptr(),
+                eval.as_mut_ptr(),
+                &mut pdf,
+                d_eval.as_mut_ptr().cast(),
+                d_pdf.as_mut_ptr(),
+            );
+        }
+        (eval, pdf)
     }
 }
 
@@ -283,6 +401,31 @@ mod ffi {
         );
         pub(crate) fn lighting_bsdf_albedo(p: *const c_void, out: *mut f32);
         pub(crate) fn lighting_bsdf_emission(p: *const c_void, out: *mut f32);
+        pub(crate) fn lighting_bsdf_fit_coefficients() -> u32;
+        pub(crate) fn lighting_bsdf_layers_size() -> u32;
+        pub(crate) fn lighting_bsdf_fit_constants(out: *mut f32);
+        pub(crate) fn lighting_bsdf_fit_prepare(
+            inputs: *const Inputs,
+            view: *const f32,
+            out: *mut c_void,
+            layers: *mut c_void,
+        );
+        pub(crate) fn lighting_bsdf_prepare_fit(
+            inputs: *const Inputs,
+            view: *const f32,
+            fit: *const f32,
+            out: *mut c_void,
+        );
+        pub(crate) fn lighting_bsdf_fit_eval(
+            layered: *const c_void,
+            layers: *const c_void,
+            fit: *const f32,
+            wi: *const f32,
+            eval: *mut f32,
+            pdf: *mut f32,
+            d_eval: *mut f32,
+            d_pdf: *mut f32,
+        );
         pub(crate) fn lighting_bsdf_volume(
             inputs: *const Inputs,
             extinction: *mut f32,

@@ -27,6 +27,7 @@ orr-pack = { path = "crates/orr-pack" }
 orr-scene = { path = "crates/orr-scene" }
 orr-shaders = { path = "crates/orr-shaders" }
 gpu-suite = { path = "tests/gpu-suite" }
+openpbr-ref = { path = "tests/openpbr-ref" }
 shader-maths = { path = "tests/shader-maths" }
 # crates.io ash is stuck on Vulkan 1.3.281; master carries 1.4 headers
 # with descriptor heap, cluster acceleration structures and cooperative
