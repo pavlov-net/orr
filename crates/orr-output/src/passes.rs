@@ -1,5 +1,6 @@
 //! Output's compute passes, recorded into a command list: hook inputs, exposure and white
-//! balance (meter and adapt), tonemap, compose and compose-UI, and screenshot capture.
+//! balance (meter and adapt), motion blur, tonemap, compose and compose-UI, and screenshot
+//! capture.
 
 use std::ops::RangeInclusive;
 
@@ -12,6 +13,7 @@ use orr_scene::{SkyStats, ViewConstants};
 
 use crate::exposure::{COMPENSATION_ENTRIES, HISTOGRAM_BINS, HISTOGRAM_WORDS_PER_BIN};
 use crate::hooks::HookTargets;
+use crate::motion_blur::{MotionBlurKernels, MotionBlurTargets};
 use crate::shaders::compose;
 use crate::shaders::exposure::adapt::{self, AdaptParams, ExposureTelemetryGpu};
 use crate::shaders::exposure::meter;
@@ -19,8 +21,8 @@ use crate::shaders::hook_inputs;
 use crate::shaders::tonemap::{self, TonemapConstants};
 use crate::{
     AutoExposure, ChainImages, CompensationCurve, DistortionField, Exposure, ExposureTelemetry,
-    Gt7Curve, HookInputs, Hooks, MeterWeights, OutputDebug, Primaries, ResolvedDisplay, Result,
-    Screenshot, SkyTelemetry, ViewOutput,
+    Gt7Curve, HookInputs, Hooks, MeterWeights, MotionBlurPass, OutputDebug, Primaries,
+    ResolvedDisplay, Result, Screenshot, SkyTelemetry, ViewOutput,
 };
 
 /// Output's compute pipelines on one device.
@@ -28,6 +30,7 @@ pub struct OutputKernels {
     hook_inputs: ComputePipeline,
     meter: ComputePipeline,
     adapt: ComputePipeline,
+    motion_blur: MotionBlurKernels,
     tonemap: ComputePipeline,
     compose: ComposeKernel,
     scene_referred: ComputePipeline,
@@ -46,7 +49,8 @@ const ADAPT_PARAMS: u64 = 1024;
 const HOOK_ROOT: u64 = 1280;
 const CAPTURE_ROOT: u64 = 1536;
 const SCENE_CAPTURE_ROOT: u64 = 1792;
-const COMPENSATION: u64 = 2048;
+const MOTION_BLUR_ROOT: u64 = 2048;
+const COMPENSATION: u64 = 2304;
 const ZEROS: u64 = COMPENSATION + 4 * COMPENSATION_ENTRIES as u64;
 const UPLOAD_BYTES: u64 = ZEROS + 4 * HISTOGRAM_WORDS;
 
@@ -88,12 +92,13 @@ impl OutputRoots {
 }
 
 /// Output's state for one view history: its [`OutputRoots`] per frame in flight, the
-/// exposure telemetry they read back, the screenshots being read back and, while the view
-/// sets a hook, the hook inputs.
+/// exposure telemetry they read back, the screenshots being read back, while the view sets
+/// a hook the hook inputs, and while its shutter is open the motion blur tiles.
 pub struct OutputView {
     frames: Vec<OutputRoots>,
     captures: Vec<Capture>,
     hooks: Option<HookTargets>,
+    motion_blur: Option<MotionBlurTargets>,
     device: Device,
 }
 
@@ -112,6 +117,7 @@ impl OutputView {
             frames,
             captures: Vec::new(),
             hooks: None,
+            motion_blur: None,
             device: gpu.clone(),
         })
     }
@@ -119,6 +125,14 @@ impl OutputView {
     /// Bytes of the hook inputs held for the view: 0 unless its last frame set a hook.
     pub fn hook_input_bytes(&self) -> u64 {
         self.hooks.as_ref().map_or(0, HookTargets::bytes)
+    }
+
+    /// Bytes of the motion blur tiles held for the view: 0 unless its last frame had the
+    /// shutter open.
+    pub fn motion_blur_bytes(&self) -> u64 {
+        self.motion_blur
+            .as_ref()
+            .map_or(0, MotionBlurTargets::bytes)
     }
 
     /// The roots frame `frame` records with. Its slot was last used by frame
@@ -375,6 +389,7 @@ impl OutputKernels {
             hook_inputs: pipeline(&hook_inputs::MODULE, "hook_inputs")?,
             meter: pipeline(&meter::MODULE, "meter")?,
             adapt: pipeline(&adapt::MODULE, "adapt")?,
+            motion_blur: MotionBlurKernels::new(gpu)?,
             tonemap: pipeline(&tonemap::MODULE, "tonemap")?,
             compose: ComposeKernel::new(gpu)?,
             scene_referred: gpu.create_compute_pipeline(
@@ -429,7 +444,6 @@ impl OutputKernels {
         };
         let inputs = HookInputs {
             hooks: pass.hooks,
-            chain: pass.chain,
             depth: targets.depth.sampled,
             motion: targets.motion.sampled,
             extent: pass.extent,
@@ -545,6 +559,44 @@ impl OutputKernels {
             Hazards::empty(),
         );
         roots.telemetry_frame = Some(pass.frame);
+    }
+
+    /// Records the `motion_blur` pass when the shutter is open and the view's history holds:
+    /// it blurs `chain.rr_output` into `chain.linear` and swaps `chain`, so the blurred
+    /// radiance is `chain.rr_output` again; returns whether it recorded. Allocates the
+    /// view's tiles on the first frame with the shutter open and frees them on the first
+    /// with it shut. Order the writes of lighting's targets and of the source before it
+    /// with a barrier; it ends with a barrier, so tonemap may follow directly.
+    pub fn motion_blur(
+        &self,
+        list: &mut CommandList<'_>,
+        view: &mut OutputView,
+        pass: &MotionBlurPass<'_>,
+        chain: &mut ChainImages,
+    ) -> Result<bool> {
+        if pass.shutter <= 0.0 {
+            view.motion_blur = None;
+            return Ok(false);
+        }
+        if view
+            .motion_blur
+            .as_ref()
+            .is_none_or(|t| t.extent() != pass.extent)
+        {
+            view.motion_blur = Some(MotionBlurTargets::new(&view.device, pass.extent)?);
+        }
+        if pass.history_reset {
+            return Ok(false);
+        }
+        let targets = view.motion_blur.as_mut().expect("motion blur tiles");
+        if std::mem::take(&mut targets.fresh) {
+            targets.discard(list);
+        }
+        let root = MotionBlurKernels::root(targets, pass, chain);
+        let root = view.roots(pass.frame).put(MOTION_BLUR_ROOT, &root);
+        self.motion_blur.record(list, root, pass.extent);
+        *chain = chain.swapped();
+        Ok(true)
     }
 
     /// Records the tonemap pass. Order its source's and the adapt pass's writes before it
@@ -734,6 +786,6 @@ fn adapt_params(auto: &AutoExposure, cut: bool) -> AdaptParams {
 }
 
 /// `size` x `size` workgroups covering `extent`.
-fn groups(extent: [u32; 2], size: u32) -> [u32; 3] {
+pub(crate) fn groups(extent: [u32; 2], size: u32) -> [u32; 3] {
     [extent[0].div_ceil(size), extent[1].div_ceil(size), 1]
 }

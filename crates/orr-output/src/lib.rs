@@ -8,6 +8,7 @@ mod encode;
 mod exposure;
 mod gt7;
 mod hooks;
+mod motion_blur;
 mod passes;
 mod present;
 mod screenshot;
@@ -32,6 +33,7 @@ pub use exposure::{
 };
 pub use gt7::{GT7_REFERENCE_NITS, GT7_SDR_NITS, Gt7Curve, Gt7Params};
 pub use hooks::{ChainImages, DistortionField, HookInputs, HookPass, HookPoint, Hooks, Image};
+pub use motion_blur::{MOTION_BLUR_MAX_RADIUS, MotionBlurPass};
 pub use orr_scene::orr_gpu::{HdrMetadata, LowLatency, OutputFormat, PresentMode};
 pub use passes::{
     CapturePass, ComposePass, ComposeRoot, ComposeSource, ExposurePass, HookInputsPass,
@@ -40,7 +42,7 @@ pub use passes::{
 pub use present::{Display, DisplayFrame, Presented};
 pub use screenshot::{Primaries, Screenshot, ScreenshotRequest};
 pub use ui::{UiLayer, UiPass};
-pub use view::{OutputDebug, ViewOutput};
+pub use view::{OutputDebug, PostQuality, ViewOutput};
 pub use white_balance::{
     AutoWhiteBalance, D65_XY, WHITE_BALANCE_CCT, WHITE_BALANCE_DUV, cct_duv_from_xy,
     xy_from_cct_duv,
