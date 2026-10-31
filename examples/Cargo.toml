@@ -72,5 +72,9 @@ path = "dense-vegetation.rs"
 name = "bench"
 path = "bench.rs"
 
+[[example]]
+name = "skinned"
+path = "skinned.rs"
+
 [lints]
 workspace = true

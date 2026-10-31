@@ -29,7 +29,8 @@ use crate::loading::{ArchiveFile, BlobSource, Loading, Msg, decoded, read_stored
 use crate::material::{BoundTexture, MaterialId, MaterialTable};
 use crate::memory::{Block, RangeAllocator, UploadWindow};
 use crate::residency::{ResidencyClass, Start, UnitDesc};
-use crate::scene::{ModelCpu, ModelId};
+use crate::scene::{ModelCpu, ModelId, SkinShape};
+use crate::skin;
 use crate::stream::{StreamUnit, Streaming};
 use crate::traverse::{NodePageFeedback, PAGED_DEPTH};
 use crate::upload::Record;
@@ -130,6 +131,27 @@ fn hierarchy_depth(nodes: &[orr_pack::mesh::Node], roots: &[u32]) -> u32 {
     levels
 }
 
+/// A resident skeleton: its blob (`orr_pack::skeleton`), which pose kernels read in place
+/// through `orr_pack.skeleton`, valid until its pack is unmounted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SkeletonRef {
+    pub blob: GpuPtr<u8>,
+    pub joint_count: u32,
+}
+
+/// A resident clip (`orr_pack::clip`): its header and samples, which pose kernels read in
+/// place through `orr_pack.skeleton`, valid until its pack is unmounted.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClipRef {
+    pub header: GpuPtr<u8>,
+    pub samples: GpuPtr<u8>,
+    pub skeleton: AssetId,
+    pub joint_count: u32,
+    pub frame_count: u32,
+    pub sample_rate: f32,
+    pub duration: f32,
+}
+
 /// A resident instance page: its tables on the CPU, its records and consumer data on the
 /// GPU, valid until its pack is unmounted.
 #[derive(Debug)]
@@ -169,6 +191,8 @@ struct Placed {
     meshes: Vec<PlacedMesh>,
     models: Vec<(AssetId, ModelInfo)>,
     pages: Vec<PlacedPage>,
+    skeletons: Vec<(AssetId, SkeletonRef)>,
+    clips: Vec<(AssetId, ClipRef)>,
 }
 
 /// One mount on the loading side, shared by its jobs and reads.
@@ -496,7 +520,13 @@ fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
         };
         if !matches!(
             class,
-            Class::Mesh | Class::Texture | Class::Material | Class::Model | Class::InstancePage
+            Class::Mesh
+                | Class::Texture
+                | Class::Material
+                | Class::Model
+                | Class::InstancePage
+                | Class::Skeleton
+                | Class::Clip
         ) {
             continue;
         }
@@ -516,9 +546,56 @@ fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
                 t.placed.lock().unwrap().models.push((id, m));
                 Ok(())
             }),
+            Class::Skeleton => fetch(t, i, 0, move |t, b| place_skeleton(t, id, b)),
+            Class::Clip => fetch(t, i, 0, move |t, b| place_clip(t, i, id, b)),
             _ => fetch(t, i, 0, move |t, b| place_page(t, i, id, b)),
         }
     }
+    Ok(())
+}
+
+/// A skeleton's blob into a block of its own.
+fn place_skeleton(t: &Arc<MountTask>, id: AssetId, blob: &[u8]) -> Result<()> {
+    let info = orr_pack::skeleton::SkeletonInfo::parse(blob)?;
+    let block = t.block(blob.len() as u64, "skeleton")?;
+    t.write(block, 0, blob)?;
+    let r = SkeletonRef {
+        // SAFETY: the blob is resident in the mount's block.
+        blob: unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu)) },
+        joint_count: info.joint_count() as u32,
+    };
+    t.placed.lock().unwrap().skeletons.push((id, r));
+    Ok(())
+}
+
+/// A clip's header and samples (blobs 0 and 1) into one block.
+fn place_clip(t: &Arc<MountTask>, entry: usize, id: AssetId, head: &[u8]) -> Result<()> {
+    let h: orr_pack::clip::ClipHeader = bytemuck::pod_read_unaligned(
+        head.get(..size_of::<orr_pack::clip::ClipHeader>())
+            .ok_or(orr_pack::Error::Malformed("clip header"))?,
+    );
+    let samples = u64::from(h.frame_count)
+        * u64::from(h.joint_count)
+        * size_of::<orr_pack::skeleton::Trs>() as u64;
+    let at = (head.len() as u64).next_multiple_of(256);
+    let block = t.block(at + samples.max(16), "clip")?;
+    t.write(block, 0, head)?;
+    // SAFETY: the blobs are resident in the mount's block.
+    let ptr = |o: u64| unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu + o)) };
+    let r = ClipRef {
+        header: ptr(0),
+        samples: ptr(at),
+        skeleton: h.skeleton,
+        joint_count: h.joint_count,
+        frame_count: h.frame_count,
+        sample_rate: h.sample_rate,
+        duration: h.duration,
+    };
+    t.placed.lock().unwrap().clips.push((id, r));
+    fetch(t, entry, 1, move |t, bytes| {
+        orr_pack::clip::Clip::parse(bytemuck::bytes_of(&h), bytes)?;
+        t.write(block, at, bytes)
+    });
     Ok(())
 }
 
@@ -864,6 +941,8 @@ struct ResolvedMesh {
 struct ResolvedModel {
     id: AssetId,
     mesh: usize,
+    /// Its skeleton's joints; 0 without a skeleton.
+    joints: u32,
     /// Indices into `Resolved::materials`, one per section.
     materials: Vec<usize>,
     bounds: Aabb,
@@ -878,6 +957,8 @@ pub(crate) struct Resolved {
     meshes: Vec<ResolvedMesh>,
     models: Vec<ResolvedModel>,
     pages: Vec<PlacedPage>,
+    skeletons: Vec<(AssetId, SkeletonRef)>,
+    clips: Vec<(AssetId, ClipRef)>,
     accel: MountAccel,
     /// Resident cluster id ranges taken for the mount's meshes.
     cluster_ranges: Vec<(u32, u32)>,
@@ -970,6 +1051,7 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
                         node_stamps: GpuPtr::from_address(orr_gpu::GpuAddress(m.node_stamps)),
                         root_count: m.header.roots.count,
                         _pad: 0,
+                        skin: GpuPtr::NULL,
                     }
                 },
                 page_addresses,
@@ -1003,9 +1085,21 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
                 .iter()
                 .map(|id| material_index.get(id).copied().ok_or_else(|| missing(*id)))
                 .collect::<Result<Vec<_>>>()?;
+            let joints = match m.header.skeleton {
+                AssetId::NONE => 0,
+                k => {
+                    p.skeletons
+                        .iter()
+                        .find(|(id, _)| *id == k)
+                        .ok_or_else(|| missing(k))?
+                        .1
+                        .joint_count
+                }
+            };
             Ok(ResolvedModel {
                 id: *id,
                 mesh,
+                joints,
                 materials,
                 bounds: m.header.bounds,
             })
@@ -1019,6 +1113,8 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
         meshes,
         models,
         pages: p.pages,
+        skeletons: p.skeletons,
+        clips: p.clips,
         accel: MountAccel::default(),
         cluster_ranges: Vec::new(),
     })
@@ -1077,8 +1173,22 @@ fn build_accel(
         .collect();
     let refs: Vec<Vec<ClusterRef>> = inputs.iter().map(accel::cluster_refs).collect();
     let built = accel::build(device, &shared.kernels, shared.limits, &inputs, wait)?;
+    let mut skins = Vec::with_capacity(inputs.len());
+    for (input, templates) in inputs.iter().zip(&built.templates) {
+        skins.push(if input.header.attributes & MeshHeader::SKIN != 0 {
+            Some(skin::mesh_table(device, input, templates)?)
+        } else {
+            None
+        });
+    }
     drop(inputs);
-    for ((m, mut refs), cuts) in r.meshes.iter_mut().zip(refs).zip(built.cuts) {
+    r.accel = built.accel;
+    let meshes = r.meshes.iter_mut().zip(refs).zip(built.cuts).zip(skins);
+    for (((m, mut refs), cuts), skin) in meshes {
+        if let Some(table) = skin {
+            m.gpu.skin = table.gpu.cast();
+            r.accel.skins.push(table);
+        }
         for (r, &clas) in refs.iter_mut().zip(&cuts.rt.clas) {
             r.clas = clas;
         }
@@ -1091,7 +1201,6 @@ fn build_accel(
         m.gpu.animated_sections = cuts.animated_sections;
         m.rt = cuts.rt;
     }
-    r.accel = built.accel;
     Ok(built.point)
 }
 
@@ -1187,6 +1296,8 @@ pub(crate) struct Resident {
     pub textures: HashMap<AssetId, TextureIndex>,
     pub materials: HashMap<AssetId, MaterialId>,
     pub pages: HashMap<AssetId, PageId>,
+    pub skeletons: HashMap<AssetId, SkeletonRef>,
+    pub clips: HashMap<AssetId, ClipRef>,
     meshes: Vec<u32>,
     /// Per mesh of `meshes`: what its section-mask BLAS build from.
     rt: Vec<MeshRt>,
@@ -1614,6 +1725,8 @@ impl Mounts {
             textures: r.textures.iter().map(|t| (t.id, t.index)).collect(),
             materials: HashMap::new(),
             pages: HashMap::new(),
+            skeletons: r.skeletons.into_iter().collect(),
+            clips: r.clips.into_iter().collect(),
             meshes: Vec::new(),
             rt: Vec::new(),
             hierarchy: Vec::new(),
@@ -1725,9 +1838,16 @@ impl Mounts {
             if w.model_cpu.len() <= i {
                 w.model_cpu.resize(i + 1, ModelCpu::default());
             }
+            let mesh = &meshes[m.mesh];
+            let skinned = mesh.header.attributes & MeshHeader::SKIN != 0;
             w.model_cpu[i] = ModelCpu {
                 sections: n,
-                animated_parts: meshes[m.mesh].gpu.animated_parts,
+                animated_parts: mesh.gpu.animated_parts,
+                joints: m.joints,
+                skin: skinned.then(|| SkinShape {
+                    vertices: mesh.clusters.iter().map(|c| c.vertex_count).sum(),
+                    clusters: mesh.gpu.cluster_count,
+                }),
             };
             let spans = &meshes[m.mesh].spans;
             w.emission[i] = (!spans.is_empty()).then(|| ModelEmission {

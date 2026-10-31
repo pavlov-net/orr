@@ -28,6 +28,7 @@ use crate::{ClusterRef, PartGpu, Result, RtCutGpu};
 /// `ClasJob.flags` (`accel.slang`).
 const CLAS_MICROMAP: u32 = 1;
 const CLAS_NON_OPAQUE: u32 = 2;
+const CLAS_TEMPLATE: u32 = 4;
 /// `AccelRoot.op` of `records`.
 const ACCEL_BLAS: u32 = 0;
 const ACCEL_MOVE: u32 = 1;
@@ -79,6 +80,8 @@ pub(crate) struct ClusterInfo {
     pub micromap: bool,
     pub self_error: f32,
     pub parent_error: f32,
+    /// m a skinned vertex may move from its rest position.
+    pub deformation_bound: f32,
 }
 
 impl ClusterInfo {
@@ -94,6 +97,7 @@ impl ClusterInfo {
             micromap: c.omm_first != Cluster::NO_OMM && c.alpha_first < c.tri_count,
             self_error: c.self_error,
             parent_error: c.parent_error,
+            deformation_bound: half::f16::from_bits(c.deformation_bound).to_f32(),
         }
     }
 }
@@ -214,6 +218,8 @@ pub(crate) struct MeshCuts {
 #[derive(Default)]
 pub(crate) struct MountAccel {
     blocks: Vec<Allocation<u8>>,
+    /// The skin tables of the mount's skinned meshes.
+    pub skins: Vec<Allocation<u8>>,
     micromaps: Vec<(Micromap, Allocation<u8>)>,
     cuts: Option<Allocation<RtCutGpu>>,
     part_blas: Option<Allocation<u64>>,
@@ -549,6 +555,8 @@ pub(crate) struct Built {
     pub accel: MountAccel,
     /// By mesh.
     pub cuts: Vec<MeshCuts>,
+    /// By mesh: the cluster template of each cluster of a skinned mesh; empty otherwise.
+    pub templates: Vec<Vec<u64>>,
     /// The point the last move signals; none when nothing was built.
     pub point: Option<(QueueKind, TimelinePoint)>,
 }
@@ -574,6 +582,7 @@ pub(crate) fn build(
                     ..MeshCuts::default()
                 })
                 .collect(),
+            templates: vec![Vec::new(); meshes.len()],
             point: None,
         });
     }
@@ -653,32 +662,43 @@ pub(crate) fn build(
                 }
             }
         }
-        let mut start = 0;
-        while start < members.len() {
-            let mut end = start;
-            let mut tris = 0;
-            while end < members.len() && end - start < BATCH_CLUSTERS {
-                let (mi, ci) = members[end];
-                let t = meshes[mi].clusters[ci].tri_count;
-                if end > start && tris + t > limits.clas_triangles {
-                    break;
-                }
-                tris += t;
-                end += 1;
-            }
-            let batch = &members[start..end];
+        for batch in batches(meshes, &members, limits.clas_triangles) {
             build_clas(
                 &mut step,
                 k,
                 meshes,
                 &micromap_of,
                 batch,
-                with_omm,
+                ClusterBuild::Clas { omm: with_omm },
                 &mut clas,
                 &mut accel.blocks,
             )?;
-            start = end;
         }
+    }
+
+    // A template per cluster of each skinned mesh, which its skinned copies instantiate.
+    let skinned = |m: &MeshInput<'_>| m.header.attributes & MeshHeader::SKIN != 0;
+    let mut templates: Vec<Vec<u64>> = meshes
+        .iter()
+        .map(|m| vec![0; if skinned(m) { m.clusters.len() } else { 0 }])
+        .collect();
+    let members: Vec<(usize, usize)> = meshes
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| skinned(m))
+        .flat_map(|(mi, m)| (0..m.clusters.len()).map(move |ci| (mi, ci)))
+        .collect();
+    for batch in batches(meshes, &members, limits.clas_triangles) {
+        build_clas(
+            &mut step,
+            k,
+            meshes,
+            &micromap_of,
+            batch,
+            ClusterBuild::Template,
+            &mut templates,
+            &mut accel.blocks,
+        )?;
     }
 
     // One cluster BLAS per cut over the moved CLAS; a cut with animated part clusters also
@@ -863,6 +883,7 @@ pub(crate) fn build(
     Ok(Built {
         accel,
         cuts,
+        templates,
         point: Some((kind, point)),
     })
 }
@@ -1060,7 +1081,43 @@ fn mask_slots(lists: Vec<Option<Vec<u64>>>) -> Vec<(Vec<u64>, Vec<u32>)> {
     out
 }
 
-/// One CLAS batch: build, read the sizes back and move into a block of its own.
+/// Consecutive runs of `members` of at most `BATCH_CLUSTERS` clusters and `triangles`
+/// triangles (a larger cluster alone).
+fn batches<'m>(
+    meshes: &[MeshInput<'_>],
+    members: &'m [(usize, usize)],
+    triangles: u32,
+) -> Vec<&'m [(usize, usize)]> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < members.len() {
+        let mut end = start;
+        let mut tris = 0;
+        while end < members.len() && end - start < BATCH_CLUSTERS {
+            let (mi, ci) = members[end];
+            let t = meshes[mi].clusters[ci].tri_count;
+            if end > start && tris + t > triangles {
+                break;
+            }
+            tris += t;
+            end += 1;
+        }
+        out.push(&members[start..end]);
+        start = end;
+    }
+    out
+}
+
+/// What one batch of [`build_clas`] builds.
+#[derive(Clone, Copy)]
+enum ClusterBuild {
+    /// CLAS, with micromaps when `omm`.
+    Clas { omm: bool },
+    /// Cluster templates, without micromaps.
+    Template,
+}
+
+/// One CLAS or template batch: build, read the sizes back and move into a block of its own.
 #[allow(clippy::too_many_arguments)]
 fn build_clas(
     step: &mut Step<'_>,
@@ -1068,11 +1125,13 @@ fn build_clas(
     meshes: &[MeshInput<'_>],
     micromaps: &[Vec<u64>],
     batch: &[(usize, usize)],
-    with_omm: bool,
+    build: ClusterBuild,
     clas: &mut [Vec<u64>],
     keep: &mut Vec<Allocation<u8>>,
 ) -> Result<()> {
     let caps = step.device.caps();
+    let with_omm = matches!(build, ClusterBuild::Clas { omm: true });
+    let template = matches!(build, ClusterBuild::Template);
     let mut jobs = Vec::with_capacity(batch.len());
     let (mut vertices, mut triangles) = (0u32, 0u32);
     let (mut max_tris, mut max_verts, mut min_truncate) = (1, 1, u32::MAX);
@@ -1086,7 +1145,15 @@ fn build_clas(
         if with_omm {
             flags |= CLAS_MICROMAP;
         }
-        let truncate = u32::from(m.header.clas_truncate_bits);
+        if template {
+            flags |= CLAS_TEMPLATE;
+        }
+        // Skinned positions are off the position grid, so templates keep every bit.
+        let truncate = if template {
+            0
+        } else {
+            u32::from(m.header.clas_truncate_bits)
+        };
         jobs.push(ClasJob {
             // SAFETY: the page is resident in the mount's block.
             page: unsafe { GpuPtr::from_address(GpuAddress(m.pages[c.page as usize])) },
@@ -1112,7 +1179,11 @@ fn build_clas(
         flags |= RtasFlags::ALLOW_OMM;
     }
     let desc = RtasOpDesc {
-        op: RtasOp::BuildClas,
+        op: if template {
+            RtasOp::BuildTemplates
+        } else {
+            RtasOp::BuildClas
+        },
         mode: RtasMode::Implicit,
         flags,
         vertex_format: ClusterVertexFormat::F32x3,
@@ -1145,13 +1216,24 @@ fn build_clas(
             omm_indices: step
                 .block(MemoryKind::DeviceLocal, 4 * u64::from(triangles), "omm")?
                 .cast(),
+            bounds: step
+                .block(
+                    MemoryKind::DeviceLocal,
+                    if template { 32 * u64::from(n) } else { 16 },
+                    "template bounds",
+                )?
+                .cast(),
             count: n,
             ..bytemuck::Zeroable::zeroed()
         };
         step.dispatch(&k.clas, &root, n)
     })?;
-    let align = u64::from(caps.cluster.align_clas);
-    let moved = pack(step, k, MoveKind::Clas, align, &addresses, &sizes, keep)?;
+    let (kind, align) = if template {
+        (MoveKind::Template, caps.cluster.align_template)
+    } else {
+        (MoveKind::Clas, caps.cluster.align_clas)
+    };
+    let moved = pack(step, k, kind, u64::from(align), &addresses, &sizes, keep)?;
     for (&(mi, ci), a) in batch.iter().zip(moved) {
         clas[mi][ci] = a;
     }

@@ -26,6 +26,8 @@ use crate::upload::Record;
 
 /// `ptlas.slang` constants.
 const PARTITION_NONE: u32 = u32::MAX;
+/// `Ptlas::slot_partition` of a skinned copy's slot, which sits in the global partition.
+const PARTITION_SKINNED: u32 = u32::MAX - 1;
 const DISTANCE_BUCKETS: u32 = 64;
 const COUNTERS: usize = 17;
 const PTLAS_REBASE: u32 = 1;
@@ -204,7 +206,9 @@ impl Ptlas {
                 instances: desc.instance_capacity + desc.part_capacity + desc.producer_capacity,
                 partitions,
                 max_per_partition: desc.partition_instances,
-                global_instances: desc.global_instances + desc.producer_capacity,
+                global_instances: desc.global_instances
+                    + desc.producer_capacity
+                    + desc.skinned_capacity,
                 max_ops: 3,
                 translation: true,
             },
@@ -264,10 +268,20 @@ impl Ptlas {
             .collect()
     }
 
+    /// Takes slots `first..first + count` for skinned copies, which the PTLAS kernels write
+    /// into the global partition; the GPU slot table holds no partition for them.
+    pub(crate) fn place_skinned(&mut self, first: u32, count: u32) {
+        self.high_water = self.high_water.max(first + count);
+        self.slot_partition[first as usize..(first + count) as usize].fill(PARTITION_SKINNED);
+    }
+
     /// Takes slots `first..first + count` out of their partitions in `frame`.
     pub(crate) fn remove(&mut self, first: u32, count: u32, frame: u64) {
         for slot in first..first + count {
             let p = std::mem::replace(&mut self.slot_partition[slot as usize], PARTITION_NONE);
+            if p == PARTITION_SKINNED {
+                continue;
+            }
             if p == PARTITION_NONE {
                 self.unplaced = self.unplaced.saturating_sub(1);
                 continue;

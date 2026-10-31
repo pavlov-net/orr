@@ -1,7 +1,7 @@
 // Decides per slot whether a copy takes its pose this frame: a copy with animated parts
 // inside its `animation_range` of the focus (15% hysteresis), every such copy without a
-// focus. The raster poses the clusters of animated parts of these copies; the PTLAS kernels
-// give the traced ones part runs.
+// focus, skinned copies aside. The raster poses the clusters of animated parts of these
+// copies; the PTLAS kernels give the traced ones part runs.
 #include "orr/root.h"
 import tables;
 import hit;
@@ -37,7 +37,7 @@ void animate(uint3 id: SV_DispatchThreadID)
     MeshGpu* mesh = s.meshes + model.mesh;
     GroupGpu* g = s.groups + inst.group;
     Placement pl;
-    if (inst.flags != 0 && inst.pose_group != 0 && mesh.animated_parts > 0
+    if (inst.flags != 0 && (inst.flags & INSTANCE_SKINNED) == 0 && inst.pose_group != 0 && mesh.animated_parts > 0
         && placement(g, g.current, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, uint(s.origin_cell.w), pl))
     {
         now = true;

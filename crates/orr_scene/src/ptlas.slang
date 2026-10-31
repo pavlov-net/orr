@@ -360,17 +360,35 @@ void want(uint3 id: SV_DispatchThreadID)
     ModelGpu* model = s.models + inst.model;
     MeshGpu* mesh = s.meshes + model.mesh;
     Placement pl = (Placement)0;
+    // A skinned copy traces the BLAS its skinning built this frame, in the global partition;
+    // its skinning decided the range.
+    bool skinned = (inst.flags & INSTANCE_SKINNED) != 0;
+    uint64_t skinned_blas = skinned && inst.pose_index < s.skinned_capacity ? s.skin_state[inst.pose_index].blas : 0;
     active = active && placement(g, g.current, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, cell_log2, pl);
-    active = active && mesh.rt_cut_count > 0;
-    uint cell = active ? t.slot_partition[slot] : PARTITION_NONE;
+    active = active && (skinned || mesh.rt_cut_count > 0);
+    uint cell = !active ? PARTITION_NONE : skinned ? global_partition() : t.slot_partition[slot];
     active = active && cell != PARTITION_NONE;
 
     uint stable = 255;
     bool in_range = false;
     uint64_t body = 0;
     if (active)
-    {
         stable = !seen ? 255 : moved(g, inst.group_index) ? 0 : min(uint(st.stable_frames) + 1, 255u);
+    if (active && skinned)
+    {
+        in_range = skinned_blas != 0;
+        // An update keeps the instance's explicit AABB, which only a bounded mesh's reach
+        // covers in every pose; an unbounded one is rewritten with this frame's bounds.
+        float3 lo, hi;
+        if (!skinned_reach(s, inst, lo, hi))
+            st.rt_key = uint2(0);
+        op.cut = RT_CUT_BUILT;
+        op.rest = skinned_blas;
+        op.blas = skinned_blas;
+        op.key = instance_key(g, inst);
+    }
+    else if (active)
+    {
         float3 center = place(pl, 0.5 * (model.bounds_min + model.bounds_max));
         float radius = 0.5 * length(model.bounds_max - model.bounds_min) * pl.scale;
         float distance = has_focus ? max(length(center) - radius, 0.0) : 0.0;
@@ -419,7 +437,7 @@ void want(uint3 id: SV_DispatchThreadID)
     uint target = cell;
     bool parted = inst.pose_group != 0 && mesh.animated_parts > 0;
     bool in_global = written && (st.rt_flags & RT_GLOBAL) != 0;
-    if (!parted && seen && stable < MOVER_FRAMES)
+    if (!skinned && !parted && seen && stable < MOVER_FRAMES)
     {
         uint claim = 0;
         if (!in_global)
@@ -731,11 +749,13 @@ void emit(uint3 id: SV_DispatchThreadID)
         if (!disable)
         {
             GroupGpu* g = s.groups + inst.group;
-            ModelGpu* model = s.models + inst.model;
             int3 cell = global ? s.origin_cell.xyz : t.partitions[op.partition].cell;
             Placement pl;
             placement(g, g.current, inst.group_index, cell, float3(0.0), uint(s.origin_cell.w), pl);
-            w = instance_write(slot, op.partition, pl, model.bounds_min, model.bounds_max, blas, inst.candidate_class);
+            float3 lo, hi;
+            if ((inst.flags & INSTANCE_SKINNED) == 0 || !skinned_reach(s, inst, lo, hi))
+                copy_bounds(s, inst, lo, hi);
+            w = instance_write(slot, op.partition, pl, lo, hi, blas, inst.candidate_class);
         }
         store((uint64_t)t.writes, index, w);
         if (global && !was_global)

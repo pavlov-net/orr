@@ -12,6 +12,9 @@ import view;
 public static const uint INSTANCE_RASTER = 1;
 public static const uint INSTANCE_RAY = 2;
 public static const uint INSTANCE_CAST_ONLY = 4;
+// Set by orr on copies from `add_skinned`: `pose_group` is the palette group and
+// `pose_index` the copy's entry in `SceneRoot.skinned`.
+public static const uint INSTANCE_SKINNED = 8;
 
 // `InstanceGpu.material_base` when the copy uses its model's section materials.
 public static const uint NO_MATERIAL_SET = 0xffffffff;
@@ -171,6 +174,52 @@ public struct MeshGpu
     public uint* node_stamps;      // per node page: the last frame the traversal reported it
     public uint root_count;
     public uint _pad;
+    public SkinMeshGpu* skin;      // MESH_SKIN meshes: what skinned copies build from, else null
+}
+
+// What skinned copies of a MESH_SKIN mesh read: each cluster's place in a copy's vertex
+// arrays, its cluster template, and the cuts a copy takes, finest first.
+public struct SkinMeshGpu
+{
+    public uint* vertex_first;     // per mesh cluster: its first vertex in a copy's arrays, then the total
+    public uint64_t* templates;    // per mesh cluster: its cluster template; 0 without cluster AS
+    public uint* cut_clusters;     // the mesh clusters of each cut, ascending, cut after cut
+    public uint* cut_first;        // per cut: its first entry in `cut_clusters`, then the total
+    public float* cut_error;       // per cut: the largest error of its clusters, m, mesh space
+    public uint cut_count;
+    public uint vertex_count;
+    public float bound;            // the largest deformation bound of its clusters, m; 0: unbounded
+    public uint _pad;
+}
+
+// A skinned copy (`add_skinned`): its vertex arrays, rewritten every frame its scene is
+// updated, and where its joint palette lives. An unused entry is all zero.
+public struct SkinnedGpu
+{
+    public float3* positions;      // per vertex: skinned by this frame's palette, mesh space
+    public float3* previous;       // per vertex: skinned by last frame's palette
+    public uint* normals;          // per vertex: unit normal, oct 2x16 unorm
+    public uint* tangents;         // per vertex: unit tangent, oct 2x16 unorm with the bitangent sign in bit 16
+    public float* boxes;           // per mesh cluster: min xyz, max xyz of its skinned vertices
+    public uint slot;
+    public uint palette_group;
+    public uint palette_first;     // the palette entry of joint 0
+    public uint joint_count;
+}
+
+// `SkinStateGpu.cut` before a copy has taken one.
+public static const uint SKIN_NO_CUT = 0xffffffff;
+
+// What the frame's skinning made of a skinned copy, written by the GPU.
+public struct SkinStateGpu
+{
+    public uint3 lo;               // bounds of its skinned clusters, mesh space, as `ordered` floats
+    public uint cut;               // the cut it takes, or SKIN_NO_CUT
+    public uint3 hi;
+    public uint clusters;          // clusters skinned this frame; 0: neither drawn nor traced
+    public uint64_t blas;          // its cluster BLAS this frame; 0: not traced
+    public uint first;             // its first skinning work item
+    public uint job;               // its BLAS build record
 }
 
 // A model made resident from a mounted pack: its mesh and the material of each section.
@@ -218,6 +267,27 @@ public struct SceneRoot
     public uint part_capacity;
     public uint producer_base;       // PTLAS index of producer entry 0; also how `SurfaceInput`, `GSurface` and `VisibleCluster` name producer entries
     public CutGpu* cut;              // the frame's cuts
+    public SkinnedGpu* skinned;      // skinned copies, `skinned_capacity` entries
+    public SkinStateGpu* skin_state; // per skinned copy, written by the GPU
+    public uint2* skin_work;         // this frame's skinning work items: skinned copy, mesh cluster
+    public uint skinned_capacity;
+    public uint _pad;
+}
+
+// The page of `mesh` holding mesh cluster `cluster`.
+public uint cluster_page(MeshGpu* mesh, uint cluster)
+{
+    uint lo = 0;
+    uint hi = mesh.page_count;
+    while (hi - lo > 1)
+    {
+        uint mid = (lo + hi) / 2;
+        if (mesh.page_clusters[mid] <= cluster)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return lo;
 }
 
 // Transform `index` of `group` as a row-major [R | t] relative to the group's anchor.

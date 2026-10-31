@@ -36,6 +36,7 @@ mod reload;
 mod residency;
 mod scene;
 mod scenes;
+mod skin;
 mod stream;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -54,7 +55,7 @@ pub use emissive::{EmissiveSpan, ModelEmission, emissive_spans};
 pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId};
 pub use loading::Loading;
 pub use material::{BoundTexture, MaterialId, MaterialWriter, material_flags};
-pub use mount::{InstancePage, LoadState, MountId, PackSource, PageId};
+pub use mount::{ClipRef, InstancePage, LoadState, MountId, PackSource, PageId, SkeletonRef};
 pub use pipelines::{PipelineId, ReloadReport};
 pub use producer::{
     ClusterTopology, Opacity, OriginPolicy, ProducerDesc, ProducerId, ProducerStats, ProducerUpdate,
@@ -72,9 +73,10 @@ pub use shaders::types::{
     BlasJob, ClusterRef, ClusterWork, CutGpu, CutKey, EmissiveGpu, FeedbackGpu, GBufferGpu,
     GroupGpu, InstanceGpu, LightGpu, MaskGpu, MaterialGpu, MeshGpu, MeshLevel, ModelGpu, NodeItem,
     PartGpu, ProducerBatch, ProducerClusterGpu, ProducerGpu, ProducerStateGpu, RasterGpu,
-    RasterRoot, RtCutGpu, SceneRoot, SkyStats, SlotCutGpu, SlotStateGpu, TopologyGpu,
-    VisibleCluster,
+    RasterRoot, RtCutGpu, SceneRoot, SkinMeshGpu, SkinStateGpu, SkinnedGpu, SkyStats, SlotCutGpu,
+    SlotStateGpu, TopologyGpu, VisibleCluster,
 };
+pub use skin::{SkinStats, SkinnedDesc};
 pub use time::FrameTime;
 pub use transparency::TransparencyPass;
 pub use traverse::CutStats;

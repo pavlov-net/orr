@@ -1,14 +1,18 @@
 // Acceleration-structure records the loading side builds from: `clas` expands each listed
 // cluster's grid positions to f32, writes its per-triangle flags and micromap indices, and
-// stores its CLAS build; `records` stores cluster BLAS and move records from address jobs.
+// stores its CLAS build, or with CLAS_TEMPLATE its cluster template build over the rest
+// positions, bounded by its rest box grown by its deformation bound; `records` stores
+// cluster BLAS and move records from address jobs.
 #include "orr/root.h"
 import orr.abi;
+import orr.packing;
 import orr_pack.mesh;
 import rtas;
 
 // `ClasJob.flags`.
 public static const uint CLAS_MICROMAP = 1;   // alpha-tested triangles take the page's micromap
 public static const uint CLAS_NON_OPAQUE = 2; // every triangle is non-opaque (linked coverage)
+public static const uint CLAS_TEMPLATE = 4;   // a template build for skinned copies
 
 // One cluster to build a CLAS for.
 public struct ClasJob
@@ -46,8 +50,10 @@ public struct AccelRoot
     public float* vertices;        // f32x3 per vertex
     public uint* triangle_flags;
     public int* omm_indices;
+    public float* bounds;          // CLAS_TEMPLATE: 8 floats per job, min xyz and max xyz first
     public uint count;
     public uint op;
+    public uint64_t _pad;
 }
 ORR_ROOT(AccelRoot);
 
@@ -80,6 +86,32 @@ void clas(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     }
     if (t != 0)
         return;
+    if ((job.flags & CLAS_TEMPLATE) != 0)
+    {
+        float bound = float(c.deformation_bound);
+        float* box = root.bounds + 8 * group;
+        float3 lo = grid_position(c.anchor, uint3(0), job.step) - bound;
+        float3 hi = grid_position(c.anchor, uint3(c.local_max[0], c.local_max[1], c.local_max[2]), job.step) + bound;
+        for (uint i = 0; i < 3; i++)
+        {
+            box[i] = lo[i];
+            box[3 + i] = hi[i];
+        }
+        TemplateBuild tb = (TemplateBuild)0;
+        tb.cluster.cluster_id = 0;
+        tb.cluster.tri_count = c.tri_count;
+        tb.cluster.vertex_count = c.vertex_count;
+        tb.cluster.truncate_bits = job.truncate_bits;
+        tb.cluster.index_format = 1;
+        tb.cluster.base_geometry_and_flags = geometry_index_and_flags(0, 0);
+        tb.cluster.omm_index_format = 4;
+        tb.cluster.vertices = (uint64_t)(root.vertices + 3 * job.vertex_first);
+        tb.cluster.indices = (uint64_t)(job.page + h.tris_offset + c.tri_first);
+        tb.cluster.triangle_flags = (uint64_t)(root.triangle_flags + job.triangle_first);
+        tb.bounds = bound > 0.0 ? (uint64_t)box : 0;
+        store((uint64_t)root.records, group, tb);
+        return;
+    }
     ClasBuild b;
     b.cluster_id = job.cluster_id;
     b.flags = 0;

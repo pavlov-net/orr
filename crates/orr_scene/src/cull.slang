@@ -8,7 +8,8 @@
 // entries into the particle list; `raster_args` sizes the raster to the lists' new entries.
 // Between the passes the HZB is rebuilt from the first pass's visibility buffer.
 // Clusters of animated parts are culled where their pose places them; whole copies by their
-// model's rest bounds, and posed copies only by their clusters' HZB tests.
+// model's rest bounds, and posed copies only by their clusters' HZB tests. Skinned copies
+// and their clusters are culled by the boxes of this frame's skinned vertices.
 #include "orr/root.h"
 import orr.packing;
 import orr.trace;
@@ -64,18 +65,18 @@ void instances(uint3 id: SV_DispatchThreadID)
         return;
     InstanceGpu inst = s.instances[slot];
     Placement p;
-    if (!instance_placement(s, inst, v, p))
+    float3 lo, hi;
+    if (!instance_placement(s, inst, v, p) || !copy_bounds(s, inst, lo, hi))
         return;
-    ModelGpu* model = s.models + inst.model;
-    float3 center = place(p, 0.5 * (model.bounds_min + model.bounds_max));
-    float radius = 0.5 * length(model.bounds_max - model.bounds_min) * p.scale;
+    float3 center = place(p, 0.5 * (lo + hi));
+    float radius = 0.5 * length(hi - lo) * p.scale;
     if (!sphere_visible(v, center, radius))
         return;
     // Posed parts may leave the rest bounds; their clusters are tested one by one.
     bool posed = (s.slot_state[slot].rt_flags & RT_ANIMATED) != 0;
     if (second)
     {
-        bool occluded = !posed && box_occluded(v, r, p, model.bounds_min, model.bounds_max, false);
+        bool occluded = !posed && box_occluded(v, r, p, lo, hi, false);
         r.slot_visibility[slot] = occluded ? SLOT_CULLED : SLOT_REVEALED;
         return;
     }
@@ -84,7 +85,7 @@ void instances(uint3 id: SV_DispatchThreadID)
     {
         GroupGpu* g = s.groups + inst.group;
         Placement before;
-        if (placement(g, g.previous, inst.group_index, v, before) && box_occluded(v, r, before, model.bounds_min, model.bounds_max, true))
+        if (placement(g, g.previous, inst.group_index, v, before) && box_occluded(v, r, before, lo, hi, true))
         {
             state = SLOT_OCCLUDED;
             InterlockedAdd(r.counts[COUNT_OCCLUDED_INSTANCES], 1);
@@ -150,6 +151,15 @@ void cluster_box(MeshGpu* mesh, Cluster c, out float3 lo, out float3 hi)
     hi = grid_position(c.anchor, uint3(c.local_max[0], c.local_max[1], c.local_max[2]), mesh.position_step) + reach;
 }
 
+// Whether the skinned box `lo..hi` of a cluster of `inst` survives frustum and section
+// culling; deformation leaves no back-face cone to test.
+bool skinned_visible(ViewConstants* v, InstanceGpu inst, Placement p, Cluster c, float3 lo, float3 hi)
+{
+    if (section_hidden(inst, c.section))
+        return false;
+    return sphere_visible(v, place(p, 0.5 * (lo + hi)), 0.5 * length(hi - lo) * p.scale);
+}
+
 // The visible-cluster index of a new entry, or false past capacity.
 bool add_visible(RasterGpu* r, VisibleCluster vc, out uint visible)
 {
@@ -171,7 +181,7 @@ void append(RasterGpu* r, uint count, uint* list, uint visible)
 }
 
 // Hands cluster `local` of page `page_index` to the raster lists.
-void draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint slot, MeshGpu* mesh, uint8_t* page, uint page_index, uint local, Cluster c, Placement p, uint material, MaterialGpu* m)
+void draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint slot, MeshGpu* mesh, uint8_t* page, uint page_index, uint local, Cluster c, Placement p, float3 lo, float3 hi, uint material, MaterialGpu* m)
 {
     VisibleCluster vc;
     vc.page = page;
@@ -183,8 +193,6 @@ void draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint slot, MeshGpu* mesh
     if (!add_visible(r, vc, visible))
         return;
     s.slot_state[slot].last_visible_frame = s.frame_index;
-    float3 lo = grid_position(c.anchor, uint3(0), mesh.position_step);
-    float3 hi = grid_position(c.anchor, uint3(c.local_max[0], c.local_max[1], c.local_max[2]), mesh.position_step);
     if (r.software_pixels > 0.0 && small_on_screen(v, p, lo, hi, r.software_pixels))
     {
         append(r, COUNT_SOFTWARE, r.software, visible);
@@ -244,6 +252,10 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         Placement p = (Placement)0;
         Cluster c = (Cluster)0;
         uint material = MATERIAL_NONE;
+        SkinnedGpu k;
+        bool skinned = copy_skin(s, inst, k);
+        float3 lo = float3(0.0);
+        float3 hi = float3(0.0);
         bool shown = page != nullptr && instance_placement(s, inst, v, copy);
         if (shown)
         {
@@ -253,12 +265,15 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         if (shown)
         {
             material = section_material(s, inst, model, c.section);
-            shown = material != MATERIAL_NONE && cluster_visible(v, inst, p, c, s.materials + material);
+            if (skinned)
+                skinned_box(k, mesh.page_clusters[w.page] + local, lo, hi);
+            else
+                cluster_box(mesh, c, lo, hi);
+            shown = material != MATERIAL_NONE
+                && (skinned ? skinned_visible(v, inst, p, c, lo, hi) : cluster_visible(v, inst, p, c, s.materials + material));
         }
         if (shown)
         {
-            float3 lo, hi;
-            cluster_box(mesh, c, lo, hi);
             if (second)
             {
                 if (box_occluded(v, r, p, lo, hi, false))
@@ -287,7 +302,14 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
             }
         }
         if (shown)
-            draw(s, v, r, slot, mesh, page, w.page, local, c, p, material, s.materials + material);
+        {
+            if (!skinned)
+            {
+                lo = grid_position(c.anchor, uint3(0), mesh.position_step);
+                hi = grid_position(c.anchor, uint3(c.local_max[0], c.local_max[1], c.local_max[2]), mesh.position_step);
+            }
+            draw(s, v, r, slot, mesh, page, w.page, local, c, p, lo, hi, material, s.materials + material);
+        }
     }
     GroupMemoryBarrierWithGroupSync();
     if (thread != 0 || rejected == 0 || second)
