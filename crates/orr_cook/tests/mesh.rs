@@ -162,6 +162,7 @@ fn cook_memory(path: &Path) -> orr_cook::Result<Archive> {
         archives: vec![ArchiveSpec {
             output: Target::Memory,
             cell_log2: ArchiveSpec::DEFAULT_CELL_LOG2,
+            gdeflate: false,
             assets: vec![AssetSpec {
                 name: "fixture".into(),
                 source: Source::Gltf {

@@ -171,6 +171,7 @@ fn texture_set_cooks() {
             archives: vec![ArchiveSpec {
                 output: Target::File(out.clone()),
                 cell_log2: ArchiveSpec::DEFAULT_CELL_LOG2,
+                gdeflate: false,
                 assets,
             }],
         },
@@ -278,6 +279,7 @@ fn hdr_set_round_trips() {
                 archives: vec![ArchiveSpec {
                     output: Target::Memory,
                     cell_log2: ArchiveSpec::DEFAULT_CELL_LOG2,
+                    gdeflate: false,
                     assets: vec![AssetSpec {
                         name: "env".into(),
                         source: Source::Texture {

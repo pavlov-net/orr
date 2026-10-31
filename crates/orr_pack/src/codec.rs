@@ -1,4 +1,4 @@
-use crate::{Codec, Error, Filter, Result};
+use crate::{Codec, Error, Filter, GDeflate, Result};
 
 pub(crate) fn split_planes(src: &[u8], dst: &mut Vec<u8>) {
     let n = src.len() / 4;
@@ -20,7 +20,14 @@ fn join_planes(src: &[u8], dst: &mut [u8]) {
 }
 
 /// Decodes one stored chunk into `dst`, whose length is the chunk's decoded length.
-pub(crate) fn decode_chunk(codec: Codec, filter: Filter, src: &[u8], dst: &mut [u8]) -> Result<()> {
+/// GDeflate chunks need `gdeflate`.
+pub(crate) fn decode_chunk(
+    codec: Codec,
+    filter: Filter,
+    gdeflate: Option<&dyn GDeflate>,
+    src: &[u8],
+    dst: &mut [u8],
+) -> Result<()> {
     let planes = filter == Filter::BytePlanes4;
     let mut scratch = Vec::new();
     let out: &mut [u8] = if planes {
@@ -50,7 +57,7 @@ pub(crate) fn decode_chunk(codec: Codec, filter: Filter, src: &[u8], dst: &mut [
                 )));
             }
         }
-        Codec::GDeflate => return Err(Error::GDeflate),
+        Codec::GDeflate => gdeflate.ok_or(Error::GDeflate)?.decompress(src, out)?,
     }
     if planes {
         join_planes(&scratch, dst);

@@ -20,7 +20,9 @@ use glam::{Vec2, Vec3, Vec4};
 use orr_pack::material::{Material, slot};
 use orr_pack::model::{ModelHeader, ModelInfo};
 use orr_pack::texture::TextureInfo;
-use orr_pack::{Aabb, Archive, ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span, Target};
+use orr_pack::{
+    Aabb, Archive, ArchiveWriter, AssetId, BlobIn, Class, GDeflate, Hash32, Span, Target,
+};
 
 use crate::cache::Cache;
 use crate::import::Scene;
@@ -244,7 +246,11 @@ struct Run<'m, 's> {
     opts: &'m CookOptions,
     shared: &'s Shared,
     units: Vec<Unit<'m>>,
-    by_name: HashMap<String, usize>,
+    /// Units by archive and name, and by name in the first archive that has the name.
+    by_name: HashMap<(usize, String), usize>,
+    first_by_name: HashMap<String, usize>,
+    /// Per archive: the GDeflate codec of its payload blobs, if it asks for one.
+    codecs: Vec<Option<Arc<dyn GDeflate>>>,
     old: Vec<Option<Old>>,
     /// Per archive: units in write order, the next one to write, and the writer (none
     /// while the archive matches the one it replaces).
@@ -279,6 +285,8 @@ impl<'m, 's> Run<'m, 's> {
             shared,
             units: Vec::new(),
             by_name: HashMap::new(),
+            first_by_name: HashMap::new(),
+            codecs: Vec::with_capacity(n),
             old: Vec::with_capacity(n),
             order: vec![Vec::new(); n],
             cursor: vec![0; n],
@@ -297,6 +305,16 @@ impl<'m, 's> Run<'m, 's> {
             window: 0,
         };
         for (a, spec) in manifest.archives.iter().enumerate() {
+            let codec: Option<Arc<dyn GDeflate>> = match spec.gdeflate {
+                false => None,
+                #[cfg(feature = "gdeflate")]
+                true => Some(Arc::new(crate::gdeflate::Libdeflate::new(
+                    key::GDEFLATE_LEVEL,
+                )?)),
+                #[cfg(not(feature = "gdeflate"))]
+                true => return Err(Error::NoGDeflate { archive: a }),
+            };
+            run.codecs.push(codec);
             let mut previous = HashMap::new();
             let old = match &spec.output {
                 Target::File(path) if !opts.force => {
@@ -453,6 +471,7 @@ impl<'m, 's> Run<'m, 's> {
             .str(&path.to_string_lossy())
             .debug(&kind)
             .finish();
+        let identity = key::stored_as(identity, self.codecs[a].is_some());
         if let Some(record) = previous.get(&identity)
             && self.link_record(a, asset, record)?
         {
@@ -476,10 +495,29 @@ impl<'m, 's> Run<'m, 's> {
 
     fn add(&mut self, unit: Unit<'m>) -> usize {
         let i = self.units.len();
-        self.by_name.insert(unit.name.clone(), i);
-        self.order[unit.archive].push(i);
+        let a = unit.archive;
+        self.by_name.insert((a, unit.name.clone()), i);
+        let units = &self.units;
+        self.first_by_name
+            .entry(unit.name.clone())
+            .and_modify(|u| {
+                if a < units[*u].archive {
+                    *u = i;
+                }
+            })
+            .or_insert(i);
+        self.order[a].push(i);
         self.units.push(unit);
         i
+    }
+
+    /// The unit named `name` in archive `a`, else in the first archive that has one, so
+    /// the lookup does not depend on the order imports finish in.
+    fn named(&self, a: usize, name: &str) -> Option<usize> {
+        self.by_name
+            .get(&(a, name.to_owned()))
+            .or_else(|| self.first_by_name.get(name))
+            .copied()
     }
 
     /// Links every unit of a recorded source if its files are unchanged and every key is
@@ -681,14 +719,15 @@ impl<'m, 's> Run<'m, 's> {
         let mut keys = Vec::new();
         let mut deps = Vec::new();
         for nu in units {
-            keys.push(nu.key);
+            let key = key::stored_as(nu.key, self.codecs[a].is_some());
+            keys.push(key);
             deps.push(nu.deps);
             self.add(Unit {
                 archive: a,
                 asset,
                 name: nu.name,
                 class: nu.class,
-                key: nu.key,
+                key,
                 work: Some(nu.work),
                 deps: Vec::new(),
                 working_set: nu.working_set,
@@ -699,7 +738,10 @@ impl<'m, 's> Run<'m, 's> {
         }
         let first = self.units.len() - deps.len();
         for (u, names) in (first..).zip(deps) {
-            self.units[u].deps = names.iter().map(|n| self.by_name[n]).collect();
+            self.units[u].deps = names
+                .iter()
+                .map(|n| self.by_name[&(a, n.clone())])
+                .collect();
         }
         keys
     }
@@ -732,10 +774,10 @@ impl<'m, 's> Run<'m, 's> {
     /// Keys and dependencies of instance sources, from the keys of the models and
     /// materials they name.
     fn instance_units(&mut self) -> Result<()> {
-        let by_id: HashMap<AssetId, usize> = self
+        let by_id: HashMap<(usize, AssetId), usize> = self
             .by_name
             .iter()
-            .map(|(n, &u)| (AssetId::from_name(n), u))
+            .map(|((a, n), &u)| ((*a, AssetId::from_name(n)), u))
             .collect();
         for pending in std::mem::take(&mut self.instances) {
             let PendingInstances {
@@ -751,9 +793,7 @@ impl<'m, 's> Run<'m, 's> {
             let mut meshes = Vec::new();
             for p in &src.prototypes {
                 let model = self
-                    .by_name
-                    .get(&p.model)
-                    .copied()
+                    .named(a, &p.model)
                     .filter(|&u| self.units[u].class == Class::Model as u16)
                     .ok_or_else(|| Error::UnknownModel {
                         asset: name.clone(),
@@ -766,9 +806,7 @@ impl<'m, 's> Run<'m, 's> {
                 for s in &p.sections {
                     if let Some(m) = &s.material {
                         let u = self
-                            .by_name
-                            .get(m)
-                            .copied()
+                            .named(a, m)
                             .filter(|&u| self.units[u].class == Class::Material as u16)
                             .ok_or_else(|| Error::UnknownMaterial {
                                 asset: name.clone(),
@@ -784,7 +822,7 @@ impl<'m, 's> Run<'m, 's> {
             let mut deps: Vec<usize> = meshes.iter().map(|m| m.1).collect();
             deps.sort_unstable();
             deps.dedup();
-            let key = key.finish();
+            let key = key::stored_as(key.finish(), self.codecs[a].is_some());
             if let Some((ra, r)) = record {
                 self.records[ra][r].units.push(key);
             }
@@ -807,7 +845,11 @@ impl<'m, 's> Run<'m, 's> {
     }
 
     /// The mesh and subdivision cage units of a model unit.
-    fn parts_of(&self, model: usize, by_id: &HashMap<AssetId, usize>) -> Result<Vec<usize>> {
+    fn parts_of(
+        &self,
+        model: usize,
+        by_id: &HashMap<(usize, AssetId), usize>,
+    ) -> Result<Vec<usize>> {
         let u = &self.units[model];
         if let Some(Work::Model(..)) = &u.work {
             return Ok(u.deps.clone());
@@ -825,10 +867,13 @@ impl<'m, 's> Run<'m, 's> {
             .into_iter()
             .filter(|&id| id != AssetId::NONE)
             .map(|id| {
-                by_id.get(&id).copied().ok_or_else(|| Error::UnknownModel {
-                    asset: u.name.clone(),
-                    model: format!("geometry {id}"),
-                })
+                by_id
+                    .get(&(u.archive, id))
+                    .copied()
+                    .ok_or_else(|| Error::UnknownModel {
+                        asset: u.name.clone(),
+                        model: format!("geometry {id}"),
+                    })
             })
             .collect()
     }
@@ -868,8 +913,9 @@ impl<'m, 's> Run<'m, 's> {
                 continue;
             }
             if let Some(Work::Mesh(data, ..)) = &self.units[u].work {
+                let a = self.units[u].archive;
                 for unit in data.sections.iter().flat_map(|s| s.maps.units()) {
-                    self.map_users[self.by_name[unit]] += 1;
+                    self.map_users[self.by_name[&(a, unit.to_owned())]] += 1;
                 }
             }
             let deps = self.units[u].deps.clone();
@@ -1002,7 +1048,7 @@ impl<'m, 's> Run<'m, 's> {
         let a = self.units[u].archive;
         let mut users = Vec::new();
         let mut read = |unit: &str, all: bool, wrap| -> Result<Vec<Raster>> {
-            let t = self.by_name[unit];
+            let t = self.by_name[&(a, unit.to_owned())];
             users.push(t);
             let from = match &self.units[t].state {
                 State::Done(d) => &d.from,
@@ -1081,11 +1127,12 @@ impl<'m, 's> Run<'m, 's> {
         self.units[u].state = State::Running;
         let unit = &self.units[u];
         let (name, class, key) = (unit.name.clone(), unit.class, unit.key);
+        let gdeflate = self.codecs[unit.archive].clone();
         let (tx, shared) = (tx.clone(), self.shared);
         scope.spawn(move |_| {
             let r = catch_unwind(AssertUnwindSafe(|| {
                 let start = Instant::now();
-                let (from, detail) = cook_unit(shared, &name, class, key, work)?;
+                let (from, detail) = cook_unit(shared, &name, class, key, gdeflate, work)?;
                 Ok((from, start.elapsed().as_secs_f64(), detail))
             }));
             let _ = tx.send(Msg::Unit(u, r));
@@ -1140,7 +1187,15 @@ impl<'m, 's> Run<'m, 's> {
             schema: orr_pack::model::SCHEMA,
             blobs: vec![(bytes, true)],
         };
-        let (from, _) = cook_unit(self.shared, &unit.name, unit.class, unit.key, work)?;
+        let gdeflate = self.codecs[unit.archive].clone();
+        let (from, _) = cook_unit(
+            self.shared,
+            &unit.name,
+            unit.class,
+            unit.key,
+            gdeflate,
+            work,
+        )?;
         self.done(
             u,
             from,
@@ -1803,17 +1858,20 @@ fn texture_mips(arc: &Archive, id: AssetId, all: bool, wrap: [Wrap; 2]) -> Resul
 }
 
 /// Cooks one unit into a one-unit archive: in the cache when there is one, else in memory.
+/// With a `gdeflate` codec, its payload blobs are GDeflate pages.
 fn cook_unit(
     shared: &Shared,
     name: &str,
     class: u16,
     key: Hash32,
+    gdeflate: Option<Arc<dyn GDeflate>>,
     work: Work<'_>,
 ) -> Result<(From, Detail)> {
     let mut detail = Detail::default();
     let path = shared.cache.as_ref().map(|c| c.path(key));
     let mut w = ArchiveWriter::create(path.clone().map_or(Target::Memory, Target::File))?;
     w.set_zstd_level(ZSTD_LEVEL);
+    w.set_gdeflate(gdeflate);
     match work {
         Work::Blobs { schema, blobs } => {
             let blobs: Vec<BlobIn> = blobs

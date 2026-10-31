@@ -6,7 +6,7 @@ use orr_io::open_shared;
 
 use crate::codec::decode_chunk;
 use crate::format::{Layout, PAGE, hash_blob, read_header, validate};
-use crate::{AssetId, Blob, Chunk, Class, Entry, Error, Hash32, Header, Result};
+use crate::{AssetId, Blob, Chunk, Class, Entry, Error, GDeflate, Hash32, Header, Result};
 
 /// A 4096-byte-aligned file range covering stored bytes, for unbuffered reads. The stored
 /// bytes start `skip` bytes into it.
@@ -251,6 +251,17 @@ impl Archive {
         stored: &[u8],
         dst: &mut [u8],
     ) -> Result<()> {
+        self.decode_with(b, chunk, None, stored, dst)
+    }
+
+    fn decode_with(
+        &self,
+        b: &Blob,
+        chunk: Option<u32>,
+        gdeflate: Option<&dyn GDeflate>,
+        stored: &[u8],
+        dst: &mut [u8],
+    ) -> Result<()> {
         check_chunk(b, chunk)?;
         let (codec, filter) = (b.codec(), b.filter());
         let (_, len) = self.span(b, chunk);
@@ -261,14 +272,15 @@ impl Archive {
         match chunk {
             Some(i) => {
                 check_len(dst, b.chunk_len(i) as usize)?;
-                decode_chunk(codec, filter, stored, dst)
+                decode_chunk(codec, filter, gdeflate, stored, dst)
             }
             None => {
                 check_len(dst, b.raw_len as usize)?;
                 let (mut src, mut out) = (0, 0);
                 for (i, c) in (0..).zip(self.chunks(b)) {
                     let (n, m) = (c.stored_len as usize, b.chunk_len(i) as usize);
-                    decode_chunk(codec, filter, &stored[src..src + n], &mut dst[out..out + m])?;
+                    let (s, d) = (&stored[src..src + n], &mut dst[out..out + m]);
+                    decode_chunk(codec, filter, gdeflate, s, d)?;
                     src += n;
                     out += m;
                 }
@@ -280,23 +292,29 @@ impl Archive {
     /// Reads and decodes a whole blob into `dst` (`b.raw_len` bytes). Positioned reads on a
     /// file archive, none for memory archives and mount blobs.
     pub fn read(&self, b: &Blob, dst: &mut [u8]) -> Result<()> {
-        self.read_part(b, None, dst)
+        self.read_part(b, None, None, dst)
     }
 
     /// Reads and decodes chunk `chunk` into `dst` (`b.chunk_len(chunk)` bytes).
     pub fn read_chunk(&self, b: &Blob, chunk: u32, dst: &mut [u8]) -> Result<()> {
         check_chunk(b, Some(chunk))?;
-        self.read_part(b, Some(chunk), dst)
+        self.read_part(b, Some(chunk), None, dst)
     }
 
-    fn read_part(&self, b: &Blob, chunk: Option<u32>, dst: &mut [u8]) -> Result<()> {
+    fn read_part(
+        &self,
+        b: &Blob,
+        chunk: Option<u32>,
+        gdeflate: Option<&dyn GDeflate>,
+        dst: &mut [u8],
+    ) -> Result<()> {
         if let Some(s) = self.stored(b, chunk) {
-            return self.decode(b, chunk, s, dst);
+            return self.decode_with(b, chunk, gdeflate, s, dst);
         }
         let (offset, len) = self.span(b, chunk);
         let mut stored = vec![0; len as usize];
         self.read_file(offset, &mut stored)?;
-        self.decode(b, chunk, &stored, dst)
+        self.decode_with(b, chunk, gdeflate, &stored, dst)
     }
 
     /// Reads the stored bytes of a blob as they are (`b.stored_len` bytes).
@@ -315,8 +333,17 @@ impl Archive {
     }
 
     /// Decodes every blob of `e`, checks its content hash, and checks its schema when this
-    /// crate defines the class.
+    /// crate defines the class. Fails on GDeflate blobs.
     pub fn verify(&self, e: &Entry) -> Result<()> {
+        self.verify_gdeflate(e, None)
+    }
+
+    /// [`Self::verify`], decoding GDeflate blobs with `gdeflate`.
+    pub fn verify_with(&self, e: &Entry, gdeflate: &dyn GDeflate) -> Result<()> {
+        self.verify_gdeflate(e, Some(gdeflate))
+    }
+
+    fn verify_gdeflate(&self, e: &Entry, gdeflate: Option<&dyn GDeflate>) -> Result<()> {
         if let Some(expected) = Class::from_u16(e.class).and_then(Class::schema)
             && e.schema != expected
         {
@@ -330,7 +357,7 @@ impl Archive {
         let mut raw = Vec::new();
         for b in self.blobs(e) {
             raw.resize(b.raw_len as usize, 0);
-            self.read(b, &mut raw)?;
+            self.read_part(b, None, gdeflate, &mut raw)?;
             hash_blob(&mut hasher, &raw);
         }
         if Hash32::finish(&hasher) != e.content_hash {

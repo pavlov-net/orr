@@ -560,22 +560,40 @@ fn verify(args: &[String]) -> Result<bool> {
     };
     let a = Archive::open(Path::new(path))?;
     let mut out = io::stdout().lock();
-    let (mut bad, mut gpu_only) = (0, 0);
+    let (mut bad, mut unchecked) = (0, 0);
+    let gdeflate = gdeflate();
     for e in a.entries() {
-        if a.blobs(e).iter().any(|b| b.codec() == Codec::GDeflate) {
-            gpu_only += 1;
-            continue;
-        }
-        if let Err(err) = a.verify(e) {
+        let result = if a.blobs(e).iter().any(|b| b.codec() == Codec::GDeflate) {
+            match &gdeflate {
+                Some(g) => a.verify_with(e, g.as_ref()),
+                None => {
+                    unchecked += 1;
+                    continue;
+                }
+            }
+        } else {
+            a.verify(e)
+        };
+        if let Err(err) = result {
             writeln!(out, "FAIL {} ({}): {err}", a.name(e), e.id)?;
             bad += 1;
         }
     }
     writeln!(
         out,
-        "{} entries: {} ok, {bad} failed, {gpu_only} not checked (GDeflate)",
+        "{} entries: {} ok, {bad} failed, {unchecked} not checked (GDeflate without the gdeflate feature)",
         a.entries().len(),
-        a.entries().len() - bad - gpu_only
+        a.entries().len() - bad - unchecked
     )?;
     Ok(bad == 0)
+}
+
+/// The CPU GDeflate decoder, with the `gdeflate` feature.
+fn gdeflate() -> Option<Box<dyn orr_pack::GDeflate>> {
+    #[cfg(feature = "gdeflate")]
+    return orr_cook::gdeflate::Libdeflate::new(1)
+        .ok()
+        .map(|g| Box::new(g) as _);
+    #[cfg(not(feature = "gdeflate"))]
+    None
 }

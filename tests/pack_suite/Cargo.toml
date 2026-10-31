@@ -17,7 +17,7 @@ orr_shaders.workspace = true
 [dev-dependencies]
 glam.workspace = true
 gpu_suite = { path = "../gpu_suite" }
-orr_cook.workspace = true
+orr_cook = { workspace = true, features = ["gdeflate"] }
 png = "0.18"
 
 [[bench]]

@@ -13,7 +13,7 @@ mod texel;
 use std::path::{Path, PathBuf};
 
 use orr_pack::raster::{self, RasterLayer, RasterSetHeader, RasterSetInfo, TileKey, morton};
-use orr_pack::{ArchiveWriter, BlobIn, Class, EncodedBlob, Filter, Hash32, Span};
+use orr_pack::{ArchiveWriter, BlobIn, Class, EncodedBlob, Filter, GDeflate, Hash32, Span};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -126,7 +126,8 @@ pub struct RasterLayerReport {
     pub raw: u64,
     /// Stored bytes of its tiles as written.
     pub stored: u64,
-    /// Stored bytes with plain zstd and with zstd over byte planes, for lossless layers.
+    /// Stored bytes with plain zstd (GDeflate pages in GDeflate archives) and with zstd over
+    /// byte planes, for lossless layers of zstd archives.
     pub zstd: u64,
     pub byte_planes: Option<u64>,
     /// Tiles stored with byte planes.
@@ -471,6 +472,7 @@ pub(crate) fn cook(
             byte_plane_tiles: 0,
         })
         .collect();
+    let gdeflate = w.gdeflate();
     w.add_streamed(
         asset,
         Class::RasterSet as u16,
@@ -494,7 +496,9 @@ pub(crate) fn cook(
                 let encoded: Vec<Encoded> = raws
                     .par_iter()
                     .zip(batch)
-                    .map(|(raw, (t, _))| encode(raw, &layers[usize::from(t.layer)]))
+                    .map(|(raw, (t, _))| {
+                        encode(raw, &layers[usize::from(t.layer)], gdeflate.as_deref())
+                    })
                     .collect::<Result<_>>()?;
                 for ((enc, raw), (t, _)) in encoded.iter().zip(&raws).zip(batch) {
                     let r = &mut report[usize::from(t.layer)];
@@ -563,11 +567,11 @@ struct Encoded<'a> {
 }
 
 /// zstd, and for lossless layers of multi-byte texels also zstd over byte planes; the
-/// smaller one is kept.
-fn encode<'a>(raw: &'a [u8], l: &Layer) -> Result<Encoded<'a>> {
-    let plain = BlobIn::new(raw).encode(ZSTD_LEVEL)?;
+/// smaller one is kept. With a GDeflate codec, GDeflate pages alone.
+fn encode<'a>(raw: &'a [u8], l: &Layer, gdeflate: Option<&dyn GDeflate>) -> Result<Encoded<'a>> {
+    let plain = BlobIn::new(raw).encode(ZSTD_LEVEL, gdeflate)?;
     let zstd = plain.stored_len();
-    if !l.tries_byte_planes() {
+    if !l.tries_byte_planes() || gdeflate.is_some() {
         return Ok(Encoded {
             best: plain,
             zstd,
@@ -578,7 +582,7 @@ fn encode<'a>(raw: &'a [u8], l: &Layer) -> Result<Encoded<'a>> {
         filter: Filter::BytePlanes4,
         ..BlobIn::new(raw)
     }
-    .encode(ZSTD_LEVEL)?;
+    .encode(ZSTD_LEVEL, None)?;
     let p = planes.stored_len();
     Ok(Encoded {
         best: if p < zstd { planes } else { plain },

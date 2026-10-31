@@ -3,11 +3,15 @@
 //! A key covers the class's cook version, the zstd library and level, the libraries of the
 //! class (locked versions from `Cargo.lock`, build script), the entry name and the parts the
 //! caller adds: settings, input content hashes and the keys of the entries it depends on.
+//! Keys of GDeflate archives also cover the encoder's commit and level.
 
 use orr_pack::{Class, Hash32};
 
 /// zstd level of every cooked blob.
 pub(crate) const ZSTD_LEVEL: i32 = 19;
+
+/// GDeflate level of the payload blobs of GDeflate archives.
+pub(crate) const GDEFLATE_LEVEL: i32 = 12;
 
 /// Cook version per class. Bump a class's version whenever the cook writes different bytes
 /// for the same inputs; the golden test fails until it is bumped.
@@ -84,6 +88,24 @@ impl Key {
     pub(crate) fn finish(self) -> Hash32 {
         Hash32(*self.0.finalize().as_bytes())
     }
+}
+
+/// The key of an entry in an archive with or without GDeflate payload blobs; zstd archives
+/// keep `key` as it is.
+pub(crate) fn stored_as(key: Hash32, gdeflate: bool) -> Hash32 {
+    if !gdeflate {
+        return key;
+    }
+    #[cfg(feature = "gdeflate")]
+    let commit = crate::gdeflate::COMMIT;
+    #[cfg(not(feature = "gdeflate"))]
+    let commit = "";
+    Key(blake3::Hasher::new())
+        .str("gdeflate")
+        .str(commit)
+        .bytes(&GDEFLATE_LEVEL.to_le_bytes())
+        .hash(key)
+        .finish()
 }
 
 /// Every version and library that enters any key; source records carry it, so a change

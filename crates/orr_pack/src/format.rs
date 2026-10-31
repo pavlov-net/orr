@@ -1,6 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 
-use crate::{AssetId, Codec, Error, Filter, Hash32, Result};
+use crate::{AssetId, Codec, Error, Filter, GDEFLATE_PAGE, Hash32, Result};
 
 pub const FORMAT_VERSION: u32 = 1;
 pub(crate) const MAGIC: [u8; 8] = *b"ORRPACK\0";
@@ -269,10 +269,17 @@ pub(crate) fn validate(h: &Header, index: &[u8]) -> Result<Layout> {
         if cs.iter().map(|c| u64::from(c.stored_len)).sum::<u64>() != u64::from(b.stored_len) {
             return Err(Error::Malformed("chunk lengths do not sum to the blob"));
         }
-        if b.codec() == Codec::GDeflate && cs.iter().any(|c| !c.stored_len.is_multiple_of(4)) {
-            return Err(Error::Malformed(
-                "GDeflate chunk length not a multiple of 4",
-            ));
+        if b.codec() == Codec::GDeflate {
+            if cs.iter().any(|c| !c.stored_len.is_multiple_of(4)) {
+                return Err(Error::Malformed(
+                    "GDeflate chunk length not a multiple of 4",
+                ));
+            }
+            if b.chunk_raw_len() > GDEFLATE_PAGE || b.filter() != Filter::None || b.is_mount() {
+                return Err(Error::Malformed(
+                    "GDeflate blob with a filter, in the mount section or over 64 KiB chunks",
+                ));
+            }
         }
         let end = b.offset + u64::from(b.stored_len);
         let placed = if b.is_mount() {

@@ -399,6 +399,7 @@ fn manifests_load_from_toml() {
 [[archive]]
 output = "out.orr"
 cell_log2 = 7
+gdeflate = true
 
 [[archive.asset]]
 name = "quad"
@@ -432,6 +433,7 @@ material = { base_color = [0.5, 0.25, 0.125], surface = 4 }
     let a = &m.archives[0];
     assert!(matches!(&a.output, Target::File(p) if *p == d.join("out.orr")));
     assert_eq!(a.cell_log2, 7);
+    assert!(a.gdeflate);
     let Source::Gltf { path: p, settings } = &a.assets[0].source else {
         panic!("gltf");
     };
@@ -514,4 +516,97 @@ fn accessors_past_their_views_fail_to_import() {
         matches!(&err, orr_cook::Error::Import { message, .. } if message.contains("runs past")),
         "{err}"
     );
+}
+
+/// GDeflate archives: payload blobs are GDeflate pages of at most 64 KiB in whole 4-byte
+/// packets, mount blobs stay zstd, the decoded bytes equal the zstd archive's, and the keys
+/// differ, so switching an archive to GDeflate recooks it.
+#[cfg(feature = "gdeflate")]
+#[test]
+fn gdeflate_archives_store_payload_pages() {
+    use orr_cook::gdeflate::Libdeflate;
+    use orr_pack::Codec;
+
+    let d = dir("incremental-gdeflate");
+    write_scene(&d);
+    let mut pages: Vec<u8> = b"orr pages "
+        .iter()
+        .copied()
+        .cycle()
+        .take(3 << 16)
+        .collect();
+    let mut x = 9u32;
+    pages.extend((0..(1 << 16) + 1000).map(|_| {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (x >> 24) as u8
+    }));
+    let spec = |output, gdeflate| {
+        let mut assets = assets(&d, Quality::Fast);
+        assets.push(AssetSpec {
+            name: "pages".into(),
+            source: Source::User {
+                class: Class::USER_FIRST + 4,
+                schema: 1,
+                version: 1,
+                bytes: pages.clone(),
+            },
+        });
+        ArchiveSpec {
+            gdeflate,
+            ..ArchiveSpec::new(output, assets)
+        }
+    };
+    let cooked = orr_cook::cook(
+        &Manifest {
+            archives: vec![spec(Target::Memory, false), spec(Target::Memory, true)],
+        },
+        &opts(4),
+    )
+    .unwrap();
+    let zstd = Archive::from_memory(std::sync::Arc::clone(&cooked.memory[0])).unwrap();
+    let gd = Archive::from_memory(std::sync::Arc::clone(&cooked.memory[1])).unwrap();
+    let codec = Libdeflate::new(1).unwrap();
+    let mut gdeflate_blobs = 0;
+    for (z, e) in zstd.entries().iter().zip(gd.entries()) {
+        assert_eq!(zstd.name(z), gd.name(e));
+        assert_eq!(z.content_hash, e.content_hash, "{}", gd.name(e));
+        assert_ne!(z.cook_key, e.cook_key, "{}", gd.name(e));
+        gd.verify_with(e, &codec).unwrap();
+        for b in gd.blobs(e) {
+            if b.is_mount() {
+                assert_ne!(b.codec(), Codec::GDeflate, "{}", gd.name(e));
+            } else {
+                assert_ne!(b.codec(), Codec::Zstd, "{}", gd.name(e));
+            }
+            if b.codec() == Codec::GDeflate {
+                gdeflate_blobs += 1;
+                assert!(b.chunk_raw_len() <= 64 << 10);
+                assert!(gd.chunks(b).iter().all(|c| c.stored_len % 4 == 0));
+            }
+        }
+    }
+    assert!(gdeflate_blobs >= 2, "{gdeflate_blobs} GDeflate blobs");
+    let e = gd
+        .expect(AssetId::from_name("pages"), Class::USER_FIRST + 4, 1)
+        .unwrap();
+    let b = gd.blobs(e)[0];
+    assert_eq!((b.codec(), b.chunk_count), (Codec::GDeflate, 5));
+    assert!(matches!(gd.verify(e), Err(orr_pack::Error::GDeflate)));
+
+    let file = d.join("out.orr");
+    let cook_file = |gdeflate| {
+        orr_cook::cook(
+            &Manifest {
+                archives: vec![spec(Target::File(file.clone()), gdeflate)],
+            },
+            &opts(4),
+        )
+        .unwrap()
+    };
+    cook_file(false);
+    let switched = cook_file(true);
+    assert!(names(&switched, Outcome::Archive).is_empty());
+    assert_eq!(*std::fs::read(&file).unwrap(), *cooked.memory[1]);
+    let again = cook_file(true);
+    assert_eq!(names(&again, Outcome::Cooked), BTreeSet::new());
 }
