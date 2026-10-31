@@ -1,0 +1,22 @@
+[package]
+name = "orr-memory"
+description = "GPU memory for orr: Vulkan Memory Allocator pools, transient arenas and an offset allocator."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+links = "orr_memory"
+
+[dependencies]
+ash.workspace = true
+bitflags.workspace = true
+log.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+bindgen = { workspace = true, features = ["runtime"] }
+cc.workspace = true
+
+[lints]
+workspace = true

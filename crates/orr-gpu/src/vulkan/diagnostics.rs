@@ -152,6 +152,9 @@ pub struct DiagnosticsReport {
     /// The Aftermath crash dump, which Nsight Graphics opens; its decoded JSON sits beside
     /// it with a `.json` extension.
     pub crash_dump: Option<PathBuf>,
+    /// GPU memory statistics as JSON (totals per heap, memory type and pool); lost devices
+    /// only.
+    pub memory: Option<String>,
 }
 
 /// One queue's progress through its recent passes.
@@ -371,6 +374,7 @@ impl Shared {
             faults,
             abort,
             crash_dump,
+            memory: lost.then(|| self.pools.allocator.stats_json(false)),
         }
     }
 
@@ -662,6 +666,9 @@ impl fmt::Display for DiagnosticsReport {
         }
         if let Some(d) = &self.crash_dump {
             writeln!(f, "  crash dump: {}", d.display())?;
+        }
+        if let Some(m) = &self.memory {
+            writeln!(f, "  memory: {m}")?;
         }
         Ok(())
     }

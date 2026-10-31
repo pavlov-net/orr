@@ -16,7 +16,7 @@ pub(crate) enum Item {
     Buffer(RawBuffer),
     Image {
         image: vk::Image,
-        memory: Option<vk::DeviceMemory>,
+        memory: Option<orr_memory::Allocation>,
         views: [vk::ImageView; 2],
     },
     Pipeline(vk::Pipeline),
@@ -32,14 +32,20 @@ pub(crate) enum Item {
     Release(Box<dyn FnOnce() + Send>),
 }
 
-/// A buffer with its own memory, as `gpu_malloc` creates it.
-#[derive(Clone, Copy)]
+/// A buffer bound to memory from orr-gpu's pools, as `gpu_malloc` creates it.
 pub(crate) struct RawBuffer {
     pub buffer: vk::Buffer,
-    pub memory: vk::DeviceMemory,
+    pub allocation: orr_memory::Allocation,
     pub kind: MemoryKind,
     pub size: u64,
     pub address: u64,
+}
+
+impl RawBuffer {
+    /// The memory and memory offset of byte `offset` of the buffer.
+    pub(crate) fn memory_at(&self, offset: u64) -> (vk::DeviceMemory, u64) {
+        (self.allocation.memory, self.allocation.offset + offset)
+    }
 }
 
 #[derive(Default)]
@@ -83,6 +89,7 @@ impl Shared {
     }
 
     pub(crate) fn collect(&self) {
+        self.pools.next_frame();
         let completed = self.completed();
         let due = self.garbage.lock().unwrap().take_due(&completed);
         for item in due {
@@ -98,8 +105,7 @@ impl Shared {
             match item {
                 Item::Buffer(b) => {
                     self.unregister_buffer(&b);
-                    d.destroy_buffer(b.buffer, None);
-                    d.free_memory(b.memory, None);
+                    self.pools.allocator.destroy_buffer(b.buffer, b.allocation);
                 }
                 Item::Image {
                     image,
@@ -109,9 +115,9 @@ impl Shared {
                     for v in views {
                         d.destroy_image_view(v, None);
                     }
-                    d.destroy_image(image, None);
-                    if let Some(m) = memory {
-                        d.free_memory(m, None);
+                    match memory {
+                        Some(m) => self.pools.allocator.destroy_image(image, m),
+                        None => d.destroy_image(image, None),
                     }
                 }
                 Item::Pipeline(p) => d.destroy_pipeline(p, None),

@@ -91,7 +91,7 @@ fn bound_memory(
             block.size
         )));
     }
-    Ok((block.raw().memory, offset))
+    Ok(block.raw().memory_at(offset))
 }
 
 fn sparse_of(t: &Texture) -> Result<&(SparseLayout, SparseTail), Error> {

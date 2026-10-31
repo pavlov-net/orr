@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
+use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -17,7 +18,7 @@ use super::features::{self, SURFACE_INSTANCE_EXTENSIONS, Selection};
 use super::garbage::{Garbage, Item, MAX_TIMELINES};
 use super::heap::Heaps;
 use super::interop::{ClassicBind, DeviceHooks};
-use super::memory::{MemoryKind, MemoryTypes, Range, Usage, buffer_usage, sharing};
+use super::memory::{MemoryKind, MemoryTypes, Pools, Range, Usage, buffer_usage, sharing};
 use super::queue::{Calibration, PassResult, Queue, QueueKind, QueueRequest, Timeline};
 use super::ray::RecordBlock;
 use super::rtas::{RtasCheck, cluster_caps};
@@ -26,6 +27,7 @@ use crate::{
     Caps, ComponentType, CooperativeVectorCombination, Error, Format, Limits, TextureDesc,
     TextureUsage, TimelinePoint, Tlas,
 };
+use orr_memory::AllocatorDesc;
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 
@@ -50,8 +52,9 @@ pub struct DeviceDesc<'a> {
     /// Optional extensions to leave off even when the device offers them; their `Caps`
     /// stay false.
     pub skip_extensions: &'a [&'a CStr],
-    /// Reports `Caps::rebar` and `Caps::host_image_copy` false whatever the device offers,
-    /// so callers take the staging path, as on a device without resizable BAR.
+    /// Reports `Caps::rebar` and `Caps::host_image_copy` false and puts
+    /// [`MemoryKind::Upload`] in host memory whatever the device offers, so callers take the
+    /// staging path, as on a device without resizable BAR.
     pub force_staging: bool,
     /// Resource-heap slots for sampled and storage image views.
     pub image_heap_slots: u32,
@@ -106,6 +109,8 @@ pub(crate) struct Shared {
     pub heap_props: vk::PhysicalDeviceDescriptorHeapPropertiesEXT<'static>,
     pub as_scratch_align: u32,
     pub memory: MemoryTypes,
+    /// The allocator and its pools; dropped in `Drop` before the device.
+    pub pools: ManuallyDrop<Pools>,
     /// Distinct queue families of the created queues; buffers and images share across them.
     pub families: Vec<u32>,
     pub timelines: [Option<Timeline>; MAX_TIMELINES],
@@ -201,6 +206,7 @@ impl Drop for Shared {
                 self.device.destroy_semaphore(t.semaphore, None);
             }
             self.pipeline_cache.destroy(&self.device);
+            ManuallyDrop::drop(&mut self.pools);
             self.device.destroy_device(None);
             self.messenger
                 .0
@@ -424,8 +430,14 @@ impl Device {
         family_list.sort_unstable();
         family_list.dedup();
         let usage = buffer_usage(optional.ray_dispatch);
-        let memory = select_memory(&device, memory_props, &family_list, usage)
-            .map_err(|m| features::unsupported(&device_name, m));
+        let memory = select_memory(
+            &device,
+            memory_props,
+            &family_list,
+            usage,
+            !desc.force_staging,
+        )
+        .map_err(|m| features::unsupported(&device_name, m));
         let (memory, rebar) = match memory {
             Ok(m) => m,
             Err(e) => {
@@ -447,12 +459,12 @@ impl Device {
                 c_string(&driver.driver_info)
             ),
             driver_version: props.driver_version,
-            rebar: rebar && !desc.force_staging,
+            rebar,
             ray_dispatch: optional.ray_dispatch,
             reorder: optional.ray_dispatch
                 && reorder_props.ray_tracing_invocation_reorder_reordering_hint
                     == vk::RayTracingInvocationReorderModeEXT::REORDER,
-            host_image_copy: optional.host_image_copy && rebar && !desc.force_staging,
+            host_image_copy: optional.host_image_copy && rebar,
             memory_decompression: optional.memory_decompression,
             occupancy_priority: optional.occupancy_priority,
             omm: optional.omm,
@@ -536,6 +548,38 @@ impl Device {
             });
         }
 
+        let allocator = AllocatorDesc {
+            entry: &entry,
+            instance: &instance,
+            physical,
+            device: &device,
+            api_version: vk::API_VERSION_1_4,
+            memory_budget: optional.memory_budget,
+            memory_priority: optional.memory_priority,
+        };
+        let placement = placement_align(
+            &device,
+            &family_list,
+            usage,
+            props.limits.buffer_image_granularity,
+        );
+        // SAFETY: the handles are live, buffer device address and the named extensions are
+        // enabled, and `Shared` drops the pools before the device.
+        let pools = match unsafe { Pools::new(&allocator, &memory, placement) } {
+            Ok(p) => p,
+            Err(e) => {
+                // SAFETY: nothing else uses the device or the semaphores.
+                unsafe {
+                    for t in timelines.iter().flatten() {
+                        device.destroy_semaphore(t.semaphore, None);
+                    }
+                    device.destroy_device(None);
+                }
+                destroy_instance();
+                return Err(e);
+            }
+        };
+
         let pipeline_cache =
             PipelineCache::open(&instance, &device, physical, &caps, desc.pipeline_cache);
         let mut queue_handles = [None; MAX_TIMELINES];
@@ -607,6 +651,7 @@ impl Device {
             heap_props,
             as_scratch_align: as_props.min_acceleration_structure_scratch_offset_alignment,
             memory,
+            pools: ManuallyDrop::new(pools),
             families: family_list,
             timelines,
             heaps: OnceLock::new(),
@@ -918,12 +963,45 @@ fn create_device(
     Ok((device, plans, selection.optional, extensions))
 }
 
+/// The memory-offset alignment and size granularity of large DeviceLocal and Upload blocks:
+/// at least 64 KiB, the standard sparse tile size, at least a sparse buffer's page, and at
+/// least `bufferImageGranularity`, so an image placed or a page bound inside a block never
+/// shares a granule with a neighboring buffer.
+fn placement_align(
+    device: &ash::Device,
+    families: &[u32],
+    usage: vk::BufferUsageFlags,
+    granularity: u64,
+) -> u64 {
+    let (sharing, family_list) = sharing(families);
+    let info = vk::BufferCreateInfo::default()
+        .size(1 << 20)
+        .usage(usage)
+        .flags(vk::BufferCreateFlags::SPARSE_BINDING | vk::BufferCreateFlags::SPARSE_RESIDENCY)
+        .sharing_mode(sharing)
+        .queue_family_indices(family_list);
+    let mut out = vk::MemoryRequirements2::default();
+    // SAFETY: valid create info; sparse binding and residency are required features.
+    unsafe {
+        device.get_device_buffer_memory_requirements(
+            &vk::DeviceBufferMemoryRequirements::default().create_info(&info),
+            &mut out,
+        );
+    };
+    out.memory_requirements
+        .alignment
+        .max(granularity)
+        .max(64 << 10)
+        .next_power_of_two()
+}
+
 /// Memory requirements of the universal buffer and of optimal images decide the types.
 fn select_memory(
     device: &ash::Device,
     props: vk::PhysicalDeviceMemoryProperties,
     families: &[u32],
     usage: vk::BufferUsageFlags,
+    allow_rebar: bool,
 ) -> Result<(MemoryTypes, bool), String> {
     let (sharing, family_list) = sharing(families);
     let buffer = vk::BufferCreateInfo::default()
@@ -964,5 +1042,5 @@ fn select_memory(
         };
         image_bits &= out.memory_requirements.memory_type_bits;
     }
-    MemoryTypes::select(props, buffer_bits, image_bits)
+    MemoryTypes::select(props, buffer_bits, image_bits, allow_rebar)
 }

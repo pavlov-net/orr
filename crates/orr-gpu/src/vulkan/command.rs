@@ -131,8 +131,9 @@ impl<'q> CommandList<'q> {
         let ptr = mapped.expect("Upload memory is mapped");
         // SAFETY: the mapping holds at least `bytes.len()` bytes and nothing else uses it.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.as_ptr(), bytes.len()) };
+        let address = GpuAddress(raw.address);
         self.keep.push(Item::Buffer(raw));
-        GpuAddress(raw.address)
+        address
     }
 
     /// Dispatches an internal pipeline with `root` as its root pointer.

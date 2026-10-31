@@ -163,6 +163,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "bindgen"
+version = "0.73.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "787ef8ef523575546b106a58213d6e6b06198a05c2f757258c68a74273670cfa"
+dependencies = [
+ "bitflags 2.13.2",
+ "cexpr",
+ "clang-sys",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash",
+ "shlex 2.0.1",
+ "syn 3.0.9",
+]
+
+[[package]]
 name = "bit_field"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1876,7 +1893,7 @@ name = "orr-dlss"
 version = "0.0.1"
 dependencies = [
  "ash",
- "bindgen",
+ "bindgen 0.72.1",
  "half",
  "log",
  "orr-gpu",
@@ -1904,6 +1921,7 @@ dependencies = [
  "bytemuck",
  "libloading",
  "log",
+ "orr-memory",
  "orr-shaders",
  "raw-window-handle",
  "thiserror 2.0.21",
@@ -1935,6 +1953,18 @@ name = "orr-math"
 version = "0.0.1"
 dependencies = [
  "glam",
+]
+
+[[package]]
+name = "orr-memory"
+version = "0.0.1"
+dependencies = [
+ "ash",
+ "bindgen 0.73.2",
+ "bitflags 2.13.2",
+ "cc",
+ "log",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1988,7 +2018,7 @@ dependencies = [
 name = "orr-shaders"
 version = "0.0.1"
 dependencies = [
- "bindgen",
+ "bindgen 0.72.1",
  "blake3",
  "bytemuck",
  "cc",

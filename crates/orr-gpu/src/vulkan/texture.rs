@@ -1,15 +1,14 @@
-//! Textures: images that stay in `GENERAL`, with dedicated, placed or sparse memory, and host
-//! copies.
+//! Textures: images that stay in `GENERAL`, with memory from orr-gpu's image pools, placed
+//! or sparse memory, and host copies.
 
 use std::sync::{Arc, OnceLock};
 
 use ash::vk;
-use ash::vk::TaggedStructure as _;
 
 use super::debug::name_object;
 use super::device::{Device, Shared};
 use super::garbage::Item;
-use super::memory::{Allocation, MemoryKind, sharing};
+use super::memory::{Allocation, MemoryKind, memory_error, sharing};
 use crate::{
     AddressMode, CompareOp, Error, Filter, Format, SparseLayout, TextureDesc, TextureKind,
     TextureRegion, TextureUsage, TimelinePoint, ViewDesc, ViewKind,
@@ -17,7 +16,10 @@ use crate::{
 
 /// Where a texture's memory comes from.
 pub enum TextureMemory<'a> {
-    /// Its own allocation.
+    /// Memory orr-gpu manages, from blocks that hold only images. Render targets (`COLOR` or
+    /// `DEPTH` usage, or single-mip 2D `STORAGE` textures of 1 MiB and more), textures of
+    /// 16 MiB and more and textures the driver wants alone get their own `VkDeviceMemory`;
+    /// render targets sit at the highest memory priority.
     Dedicated,
     /// Inside a block, at an offset aligned as [`Device::texture_requirements`] says: a
     /// [`MemoryKind::DeviceLocal`] block, or an Upload block for
@@ -45,7 +47,7 @@ pub(crate) struct SparseTail {
 /// [`Device::free_texture`] names the point instead.
 pub struct Texture {
     pub(crate) image: vk::Image,
-    memory: Option<vk::DeviceMemory>,
+    memory: Option<orr_memory::Allocation>,
     /// The view rendering writes through: mip 0, layer 0. Null without `COLOR` or `DEPTH`
     /// usage.
     attachment: vk::ImageView,
@@ -203,10 +205,22 @@ impl Drop for Texture {
         }
         self.shared.defer_after_submitted(Item::Image {
             image: self.image,
-            memory: self.memory,
+            memory: self.memory.take(),
             views: self.views(),
         });
     }
+}
+
+/// Render targets, and single-mip 2D storage textures of 1 MiB and more, which are
+/// resolution-sized targets.
+fn is_target(desc: &TextureDesc, bytes: u64) -> bool {
+    desc.usage
+        .intersects(TextureUsage::COLOR | TextureUsage::DEPTH)
+        || (desc.usage.contains(TextureUsage::STORAGE)
+            && desc.kind == TextureKind::D2
+            && desc.mips == 1
+            && desc.layers == 1
+            && bytes >= 1 << 20)
 }
 
 fn aspect(format: Format) -> vk::ImageAspectFlags {
@@ -463,21 +477,41 @@ impl Device {
         if is_sparse || host {
             check_format(shared, &info, desc)?;
         }
-        // SAFETY: valid create info for this device.
-        let image = unsafe { d.create_image(&info, None) }.map_err(Error::vk("vkCreateImage"))?;
+        let (image, own) = if let TextureMemory::Dedicated = memory {
+            let bytes = self.texture_requirements(desc).0;
+            let (pool, flags) = shared.pools.image(host, is_target(desc, bytes), bytes);
+            // SAFETY: valid create info for this device.
+            let made = unsafe {
+                shared
+                    .pools
+                    .allocator
+                    .create_image(pool, &info, flags, name)
+            };
+            let (image, allocation) = made.map_err(|e| match e {
+                orr_memory::Error::Vulkan {
+                    result: vk::Result::ERROR_FEATURE_NOT_PRESENT,
+                    ..
+                } => Error::Invalid(format!(
+                    "{name}: memory type {} cannot hold this texture",
+                    pool.memory_type()
+                )),
+                e => memory_error(e),
+            })?;
+            (image, Some(allocation))
+        } else {
+            // SAFETY: valid create info for this device.
+            let image =
+                unsafe { d.create_image(&info, None) }.map_err(Error::vk("vkCreateImage"))?;
+            (image, None)
+        };
         // SAFETY: `image` is live.
         let req = unsafe { d.get_image_memory_requirements(image) };
         let destroy = || {
-            // SAFETY: the image is not used anywhere else.
+            // SAFETY: the image is not used anywhere else and owns no memory.
             unsafe { d.destroy_image(image, None) };
         };
-        let kind = if host {
-            MemoryKind::Upload
-        } else {
-            MemoryKind::DeviceLocal
-        };
         let mut sparse = None;
-        let own = match memory {
+        match memory {
             TextureMemory::Sparse => {
                 let ty = shared.memory.of(MemoryKind::DeviceLocal);
                 let layout = if req.memory_type_bits & (1 << ty) == 0 {
@@ -488,59 +522,37 @@ impl Device {
                     sparse_layout(shared, image, desc, req.alignment)
                 };
                 sparse = Some(layout.inspect_err(|_| destroy())?);
-                None
             }
-            TextureMemory::Dedicated => {
-                let ty = shared.memory.of(kind);
-                if req.memory_type_bits & (1 << ty) == 0 {
-                    destroy();
-                    return Err(Error::Invalid(format!(
-                        "{name}: memory type {ty} cannot hold this texture"
-                    )));
-                }
-                let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
-                let alloc = vk::MemoryAllocateInfo::default()
-                    .allocation_size(req.size)
-                    .memory_type_index(ty)
-                    .push(&mut dedicated);
-                // SAFETY: valid allocate info of a type the image accepts.
-                let mem = unsafe { d.allocate_memory(&alloc, None) };
-                let mem = mem.map_err(|e| {
-                    destroy();
-                    Error::vk("vkAllocateMemory")(e)
-                })?;
-                // SAFETY: fresh image and dedicated memory.
-                if let Err(e) = unsafe { d.bind_image_memory(image, mem, 0) } {
-                    destroy();
-                    // SAFETY: the memory is not used anywhere else.
-                    unsafe { d.free_memory(mem, None) };
-                    return Err(Error::vk("vkBindImageMemory")(e));
-                }
-                name_object(&shared.debug_fn, mem, name);
-                Some(mem)
-            }
+            TextureMemory::Dedicated => {}
             TextureMemory::Placed { block, offset } => {
                 let raw = block.raw();
                 let ty = shared.memory.of(raw.kind);
+                let (_, memory_offset) = raw.memory_at(offset);
                 let fits = (!host || raw.kind == MemoryKind::Upload)
                     && req.memory_type_bits & (1 << ty) != 0
-                    && offset % req.alignment == 0
+                    && memory_offset.is_multiple_of(req.alignment)
                     && offset + req.size <= raw.size;
                 if !fits {
                     destroy();
                     return Err(Error::Invalid(format!(
-                        "{name}: {} bytes aligned to {} do not fit a {:?} block of {} bytes at offset {offset}",
+                        "{name}: {} bytes aligned to {} do not fit a {:?} block of {} bytes at offset {offset} (memory offset {memory_offset})",
                         req.size, req.alignment, raw.kind, raw.size
                     )));
                 }
-                // SAFETY: the range lies inside the block's memory, whose type the image accepts.
-                unsafe { d.bind_image_memory(image, raw.memory, offset) }.map_err(|e| {
+                // SAFETY: the range lies inside the block's memory, whose type the image
+                // accepts; the allocator serializes binds with its own use of the memory.
+                unsafe {
+                    shared
+                        .pools
+                        .allocator
+                        .bind_image(&raw.allocation, offset, image)
+                }
+                .map_err(|e| {
                     destroy();
-                    Error::vk("vkBindImageMemory")(e)
+                    memory_error(e)
                 })?;
-                None
             }
-        };
+        }
         name_object(&shared.debug_fn, image, name);
         let mut t = Texture {
             image,
@@ -620,7 +632,7 @@ impl Device {
         let mut t = std::mem::ManuallyDrop::new(t);
         let item = Item::Image {
             image: t.image,
-            memory: t.memory,
+            memory: t.memory.take(),
             views: t.views(),
         };
         // SAFETY: `t` is never used or dropped again; its Arc is released exactly once.
