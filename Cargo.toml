@@ -16,6 +16,7 @@ orr-atmosphere = { path = "crates/orr-atmosphere" }
 orr-color = { path = "crates/orr-color", version = "0.0.1" }
 orr-cook = { path = "crates/orr-cook" }
 orr-gpu = { path = "crates/orr-gpu" }
+orr-io = { path = "crates/orr-io", version = "0.0.1" }
 orr-lighting = { path = "crates/orr-lighting" }
 orr-math = { path = "crates/orr-math", version = "0.0.1" }
 orr-pack = { path = "crates/orr-pack" }
@@ -37,6 +38,7 @@ bytemuck = { version = "1", features = ["derive"] }
 # 0.14 is the version ctt uses, so one zstd-sys builds.
 zstd = "0.14"
 png = "0.18"
+windows = "0.62.2"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

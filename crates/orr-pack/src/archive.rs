@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -115,7 +114,7 @@ impl Archive {
     pub fn open(path: &Path) -> Result<Archive> {
         let file = File::open(path)?;
         let mut head = vec![0; Self::HEAD_LEN];
-        let n = read_some(&file, 0, &mut head)?;
+        let n = orr_io::read_at(&file, 0, &mut head)?;
         let range = Self::index_range(&head[..n])?;
         let mut index = vec![0; range.len as usize].into_boxed_slice();
         read_exact(&file, 0, &mut index)?;
@@ -361,28 +360,8 @@ fn check_len(dst: &[u8], need: usize) -> Result<()> {
     }
 }
 
-/// Positioned read; never moves a shared cursor, so many threads can read one `File`.
-fn read_some(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-    #[cfg(unix)]
-    use std::os::unix::fs::FileExt;
-    #[cfg(windows)]
-    use std::os::windows::fs::FileExt;
-    let mut done = 0;
-    while done < buf.len() {
-        #[cfg(windows)]
-        let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
-        #[cfg(unix)]
-        let n = file.read_at(&mut buf[done..], offset + done as u64)?;
-        if n == 0 {
-            break;
-        }
-        done += n;
-    }
-    Ok(done)
-}
-
 fn read_exact(file: &File, offset: u64, buf: &mut [u8]) -> Result<()> {
-    let n = read_some(file, offset, buf)?;
+    let n = orr_io::read_at(file, offset, buf)?;
     if n == buf.len() {
         Ok(())
     } else {

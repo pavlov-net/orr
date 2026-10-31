@@ -1179,6 +1179,7 @@ dependencies = [
  "image",
  "libc",
  "meshopt",
+ "orr-io",
  "orr-pack",
  "png 0.18.1",
  "rayon",
@@ -1230,6 +1231,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "orr-io"
+version = "0.0.1"
+dependencies = [
+ "windows",
+]
+
+[[package]]
 name = "orr-lighting"
 version = "0.0.1"
 dependencies = [
@@ -1271,6 +1279,7 @@ dependencies = [
  "blake3",
  "bytemuck",
  "meshopt",
+ "orr-io",
  "thiserror 2.0.21",
  "zstd",
 ]

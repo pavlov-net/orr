@@ -9,6 +9,7 @@ repository.workspace = true
 links = "orr_pack"
 
 [dependencies]
+orr-io.workspace = true
 blake3.workspace = true
 bytemuck.workspace = true
 meshopt = "=0.7.0"
