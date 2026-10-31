@@ -25,8 +25,8 @@ use orr_pack::{AssetId, Span, Target};
 use orr_scene::testing::{FlipError, Image, Pixels, flip};
 use orr_scene::{
     FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens, LoadState, Loading,
-    MountId, PackSource, Projection, RasterView, RendererDesc, SceneDesc, SceneId, Scenes,
-    TextureFilter, TransformGroupDesc, ViewArena, ViewDesc, ViewHistoryId, ViewTarget,
+    MaterialId, MountId, PackSource, Projection, RasterView, RendererDesc, SceneDesc, SceneId,
+    Scenes, TextureFilter, TransformGroupDesc, ViewArena, ViewDesc, ViewHistoryId, ViewTarget,
 };
 
 use crate::shaders::{accumulate, exposure, flat_color, guide_read};
@@ -223,6 +223,31 @@ pub const PANEL: &str = "panel";
 /// A valley 3 m across and 8 m long along z, y = 0.5 x^2, finely tessellated, with
 /// discrete levels of 1 cm and 3 cm error.
 pub const TROUGH: &str = "trough";
+/// A 2 m square facing +y, emitting [`EMITTER_LUMINANCE`] nits, nothing else.
+pub const LIGHT_FLOOR: &str = "light floor";
+/// A smooth glass slab 1.6 x [`SLAB_THICKNESS`] x 1 m around its origin (IOR 1.5) whose
+/// interior transmits half the light over its thickness.
+pub const TINTED_SLAB: &str = "tinted slab";
+pub const SLAB_THICKNESS: f32 = 0.3;
+/// [`TINTED_SLAB`] with specular roughness 0.3.
+pub const ROUGH_SLAB: &str = "rough slab";
+/// A smooth glass sphere of radius 1 m (IOR 1.5), clear.
+pub const GLASS_SPHERE: &str = "glass sphere";
+/// A smooth glass box 4 x 1 x 4 m around its origin (IOR 1.5) holding a scattering medium
+/// of [`MILK_SIGMA_T`] and [`MILK_SIGMA_S`] per m, isotropic.
+pub const MILKY_SLAB: &str = "milky slab";
+pub const MILK_SIGMA_T: f32 = 2.0;
+pub const MILK_SIGMA_S: f32 = 0.5;
+/// A smooth glass sphere of radius 1 m (IOR 1.5) holding a non-absorbing medium that
+/// scatters 3 times per m.
+pub const CLOUD_SPHERE: &str = "cloud sphere";
+/// A water box 6 x 4 x 6 m around its origin (IOR 1.33) whose transmission color over 1 m
+/// is exp(-[`WATER_SIGMA`]) in Rec.709.
+pub const WATER_BOX: &str = "water box";
+pub const WATER_SIGMA: [f32; 3] = [0.4, 0.2, 0.1];
+/// A black 2 m square facing +y with opacity [`PRESENCE_VEIL_OPACITY`], blended: a presence layer.
+pub const PRESENCE_VEIL: &str = "presence veil";
+pub const PRESENCE_VEIL_OPACITY: f32 = 0.25;
 
 /// The bed's emitter: nits, white.
 pub const EMITTER_LUMINANCE: f32 = 50.0;
@@ -561,6 +586,49 @@ fn cook() -> Arc<[u8]> {
         );
     });
     let slab = || mesh(|b| b.cuboid(0, Vec3::new(0.8, 0.15, 0.5)));
+    let light_floor = Material {
+        base_color: [0.0; 3],
+        specular_weight: 0.0,
+        emission_color: [1.0; 3],
+        emission_luminance: EMITTER_LUMINANCE,
+        ..Material::default()
+    };
+    let tinted = Material {
+        transmission_color: [0.5; 3],
+        transmission_depth: SLAB_THICKNESS,
+        ..glass
+    };
+    let rough = Material {
+        specular_roughness: 0.3,
+        ..tinted
+    };
+    // OpenPBR's interior: sigma_t = -ln(color) / depth, sigma_s = scatter / depth.
+    let milk = Material {
+        transmission_color: [(-MILK_SIGMA_T).exp(); 3],
+        transmission_depth: 1.0,
+        transmission_scatter: [MILK_SIGMA_S; 3],
+        ..glass
+    };
+    let cloud = Material {
+        transmission_color: [(-3.0f32).exp(); 3],
+        transmission_depth: 1.0,
+        transmission_scatter: [3.0; 3],
+        ..glass
+    };
+    let water = Material {
+        specular_ior: 1.33,
+        transmission_color: WATER_SIGMA.map(|s| (-s).exp()),
+        transmission_depth: 1.0,
+        ..glass
+    };
+    let veil = Material {
+        base_color: [0.0; 3],
+        specular_weight: 0.0,
+        geometry_opacity: PRESENCE_VEIL_OPACITY,
+        alpha_mode: Material::BLEND,
+        double_sided: 1,
+        ..Material::default()
+    };
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(
             Target::Memory,
@@ -649,6 +717,38 @@ fn cook() -> Arc<[u8]> {
                     vec![bumpy],
                 ),
                 model(PANEL, upright(0.5), vec![panel]),
+                model(
+                    LIGHT_FLOOR,
+                    mesh(|b| b.quad(0, square(1.0, 0.0), y, 1)),
+                    vec![light_floor],
+                ),
+                model(
+                    TINTED_SLAB,
+                    mesh(|b| b.cuboid(0, Vec3::new(0.8, SLAB_THICKNESS * 0.5, 0.5))),
+                    vec![tinted],
+                ),
+                model(
+                    ROUGH_SLAB,
+                    mesh(|b| b.cuboid(0, Vec3::new(0.8, SLAB_THICKNESS * 0.5, 0.5))),
+                    vec![rough],
+                ),
+                model(GLASS_SPHERE, mesh(|b| b.sphere(0, 32, 1.0)), vec![glass]),
+                model(
+                    MILKY_SLAB,
+                    mesh(|b| b.cuboid(0, Vec3::new(2.0, 0.5, 2.0))),
+                    vec![milk],
+                ),
+                model(CLOUD_SPHERE, mesh(|b| b.sphere(0, 32, 1.0)), vec![cloud]),
+                model(
+                    WATER_BOX,
+                    mesh(|b| b.cuboid(0, Vec3::new(3.0, 2.0, 3.0))),
+                    vec![water],
+                ),
+                model(
+                    PRESENCE_VEIL,
+                    mesh(|b| b.quad(0, square(1.0, 0.0), y, 1)),
+                    vec![veil],
+                ),
                 AssetSpec {
                     name: TROUGH.into(),
                     source: Source::Mesh {
@@ -820,7 +920,7 @@ pub struct Bed {
     scenes: Scenes,
     scene: SceneId,
     history: ViewHistoryId,
-    _mount: MountId,
+    mount: MountId,
     _environment: Option<(TestTexture, Allocation<EnvironmentMapGpu>)>,
     target: LightingView,
     /// Holds `target`'s targets.
@@ -975,7 +1075,7 @@ impl Bed {
             scenes,
             scene,
             history,
-            _mount: mount,
+            mount,
             _environment: environment,
             target: LightingView::new(d, &arena).unwrap(),
             _arena: arena,
@@ -1050,6 +1150,16 @@ impl Bed {
                 .map(|p| p.map(|v| v / n))
                 .collect(),
         }
+    }
+
+    /// The first material of the bed's model `model`.
+    pub fn material(&self, model: &str) -> MaterialId {
+        self.scenes
+            .material(
+                self.mount,
+                AssetId::from_name(&format!("{model}/material/0")),
+            )
+            .unwrap_or_else(|e| panic!("material of {model}: {e}"))
     }
 
     /// The orr-scene frame id of the last frame run.
@@ -1288,18 +1398,19 @@ impl Paths {
         }
     }
 
-    /// Starts the view's frame, then records the opaque dispatch and the guide resolve.
+    /// Starts the view's frame, then records the opaque dispatch, the dielectric dispatch and
+    /// the guide resolve.
     pub fn record(&self, list: &mut CommandList<'_>, f: &mut BedFrame<'_>) {
         let pass = f.pass();
         f.target
             .begin(f.frame, f.lighting, &f.desc, false, &self.settings);
         self.kernels
             .record_opaque(list, f.lighting, f.target, &pass, &self.settings);
-        list.barrier(
-            Stages::COMPUTE | Stages::RAY,
-            Stages::COMPUTE,
-            Hazards::empty(),
-        );
+        let paths = Stages::COMPUTE | Stages::RAY;
+        list.barrier(paths, paths, Hazards::empty());
+        self.kernels
+            .record_dielectric(list, f.target, &pass, &self.settings);
+        list.barrier(paths, Stages::COMPUTE, Hazards::empty());
         self.kernels
             .record_guides(list, f.target, &pass, &self.settings);
     }

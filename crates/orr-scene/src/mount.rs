@@ -26,7 +26,7 @@ use crate::accel::{
 };
 use crate::emissive::{EmissiveSpan, ModelEmission, indexed_spans};
 use crate::loading::{ArchiveFile, BlobSource, Loading, Msg, decoded, read_stored};
-use crate::material::{BoundTexture, MaterialId, MaterialTable};
+use crate::material::{BoundTexture, MaterialId, MaterialTable, candidate_class};
 use crate::memory::{Block, RangeAllocator, UploadWindow};
 use crate::residency::{ResidencyClass, Start, UnitDesc};
 use crate::scene::{ModelCpu, ModelId, SkinShape};
@@ -1128,7 +1128,8 @@ fn build_accel(
     r: &mut Resolved,
     wait: Option<TimelinePoint>,
 ) -> Result<Option<TimelinePoint>> {
-    // Sections whose linked coverage decides every triangle at run time.
+    // Sections whose linked coverage decides every triangle at run time, and dielectric and
+    // presence sections, whose every candidate goes to the ray's candidate handler.
     let mut non_opaque: Vec<Vec<bool>> = r
         .meshes
         .iter()
@@ -1137,7 +1138,8 @@ fn build_accel(
     for model in &r.models {
         for (section, &mi) in model.materials.iter().enumerate() {
             let m = &r.materials[mi].1;
-            if m.surface != 0 && m.flags & material_flags::ALPHA_TESTED != 0 {
+            let layered = m.flags & (material_flags::DIELECTRIC | material_flags::PRESENCE) != 0;
+            if layered || (m.surface != 0 && m.flags & material_flags::ALPHA_TESTED != 0) {
                 non_opaque[model.mesh][section] = true;
             }
         }
@@ -1848,6 +1850,7 @@ impl Mounts {
                     vertices: mesh.clusters.iter().map(|c| c.vertex_count).sum(),
                     clusters: mesh.gpu.cluster_count,
                 }),
+                candidate_class: candidate_class(m.materials.iter().map(|&k| materials[k].1.flags)),
             };
             let spans = &meshes[m.mesh].spans;
             w.emission[i] = (!spans.is_empty()).then(|| ModelEmission {

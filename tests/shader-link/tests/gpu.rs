@@ -243,6 +243,7 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
     assert_eq!(
         kernels,
         [
+            "dielectric/dispatch",
             "environment/bake",
             "light_sampling/directional",
             "path/opaque",

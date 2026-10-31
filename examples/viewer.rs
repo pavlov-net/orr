@@ -11,15 +11,12 @@
 
 use std::time::{Duration, Instant};
 
+use examples::average::Average;
 use examples::overlay::Overlay;
 use examples::scene::{FOV_Y, Showcase, TARGET, orbit_eye};
-use examples::shaders::accumulate;
 use examples::window::Window;
 use examples::{Capture, Options, Workers, assert_clean, device, fixed_time};
-use orr::orr_gpu::{
-    Allocation, Format, MemoryKind, QueueKind, SpecData, TextureDesc, TextureMemory, TextureUsage,
-    TimelinePoint,
-};
+use orr::orr_gpu::{Format, QueueKind, TextureDesc, TextureMemory, TextureUsage, TimelinePoint};
 use orr::{
     Display, DisplayRequest, ExposureTelemetry, FrameDesc, FrameTime, HookPass, Lens, Projection,
     Renderer, RendererDesc, ResolvedDisplay, ScreenshotRequest, TextureFilter, ViewDesc, ViewHooks,
@@ -87,15 +84,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     let mut overlay = Overlay::new(desc.frames_in_flight);
     let capture = options.headless || options.out.is_some();
     let still = options.headless || options.has("--still");
-    let accumulate = renderer
-        .compute_pipeline(&accumulate::MODULE, "main", SpecData::default())
-        .expect("accumulate pipeline");
-    let slots = u64::from(desc.frames_in_flight);
-    let mut roots = gpu
-        .gpu_malloc::<accumulate::Root>(MemoryKind::Upload, slots, "viewer accumulate roots")
-        .expect("accumulate roots");
-    let mut sum: Option<(Allocation<[f32; 4]>, [u32; 2])> = None;
-    let mut accumulated = 0;
+    let mut average = Average::new(&mut renderer, gpu, desc.frames_in_flight, ACCUMULATE_AFTER);
     let frames = options
         .frames
         .or(options.headless.then_some(HEADLESS_FRAMES));
@@ -163,38 +152,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             }),
             ..ViewOutput::default()
         };
-        if sum.as_ref().is_none_or(|(_, e)| *e != extent) {
-            let texels = u64::from(extent[0]) * u64::from(extent[1]);
-            let buffer = gpu
-                .gpu_malloc(MemoryKind::DeviceLocal, texels, "viewer radiance sum")
-                .expect("radiance sum");
-            sum = Some((buffer, extent));
-            accumulated = 0;
-        }
-        let sum_ptr = sum.as_ref().expect("radiance sum").0.gpu;
-        let frames_in_sum = if i < ACCUMULATE_AFTER { 0 } else { accumulated };
-        let pipeline = f.pipeline(accumulate);
-        let slot = id % slots;
-        let mut average = |pass: &mut HookPass<'_, '_>| {
-            roots.as_mut_slice().expect("accumulate roots")[slot as usize] = accumulate::Root {
-                view: pass.view,
-                sum: sum_ptr,
-                image: pass.image,
-                width: pass.extent[0],
-                height: pass.extent[1],
-                frames: frames_in_sum,
-                pad0: 0,
-                pad1: 0,
-                pad2: 0,
-            };
-            pass.cmd.begin_pass("accumulate", false);
-            pass.cmd.dispatch(
-                pipeline,
-                roots.gpu.offset(slot),
-                [pass.extent[0].div_ceil(8), pass.extent[1].div_ceil(8), 1],
-            );
-            pass.cmd.end_pass();
-        };
+        let mut average = average.hook(&f, i, extent);
         let mut ui = |pass: &mut orr::UiPass<'_, '_>| overlay.paint(pass, id);
         let mut hooks = ViewHooks {
             scene_referred: still.then_some(&mut average as &mut dyn FnMut(&mut HookPass<'_, '_>)),
@@ -225,9 +183,6 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         )
         .expect("render view");
         last = Some((id, f.end().expect("end frame")));
-        if i >= ACCUMULATE_AFTER {
-            accumulated += 1;
-        }
     }
 
     if let Some(d) = display.as_ref() {
@@ -243,8 +198,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         .filter(|_| capture)
         .and_then(|(id, _)| renderer.screenshots(history, id).pop())
         .map(|shot| Capture::from_screenshot(&shot));
-    drop(sum);
-    drop(roots);
+    drop(average);
     drop(overlay);
     drop(headless_target);
     drop(showcase);

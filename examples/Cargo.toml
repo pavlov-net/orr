@@ -61,6 +61,10 @@ name = "producer-field"
 path = "producer-field.rs"
 
 [[example]]
+name = "dielectrics"
+path = "dielectrics.rs"
+
+[[example]]
 name = "many-lights"
 path = "many-lights.rs"
 

@@ -111,8 +111,19 @@ fn edited_orr(roots: &str, src: &Path, out: &Path) -> Result<Output, Error> {
         .compile()
 }
 
-/// Copies every `.slang` file under `src` to `dst` through `edit`, writing only what changed.
+/// Copies every `.slang` file under `src` to `dst` through `edit`, writing only what changed
+/// and removing what `src` no longer has.
 fn copy_slang(src: &Path, dst: &Path, edit: &dyn Fn(&str, String) -> String) {
+    for entry in fs::read_dir(dst).into_iter().flatten() {
+        let path = entry.expect("the copied root").path();
+        if !src.join(path.file_name().expect("a file")).exists() {
+            if path.is_dir() {
+                fs::remove_dir_all(&path).expect("the copied root");
+            } else {
+                fs::remove_file(&path).expect("the copied root");
+            }
+        }
+    }
     for entry in fs::read_dir(src).expect("a shader root") {
         let path = entry.expect("a shader root").path();
         let name = path

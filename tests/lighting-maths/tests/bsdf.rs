@@ -496,3 +496,77 @@ fn finite_for_any_parameters_and_directions() {
         }
     }
 }
+
+/// Unpolarized Fresnel reflectance from a medium into one `eta` times denser at incidence
+/// cosine `c`; 1 past the critical angle.
+fn fresnel(eta: f64, c: f64) -> f64 {
+    let s2 = (1.0 - c * c) / (eta * eta);
+    if s2 >= 1.0 {
+        return 1.0;
+    }
+    let t = (1.0 - s2).sqrt();
+    let rs = (c - eta * t) / (c + eta * t);
+    let rp = (t - eta * c) / (t + eta * c);
+    0.5 * (rs * rs + rp * rp)
+}
+
+/// A smooth dielectric seen from either side at several angles, in air and in water:
+/// reflection mirrors the view, refraction follows Snell's law, and the reflection and
+/// transmission albedos are the Fresnel reflectance and its complement, transmission 0
+/// past the critical angle.
+#[test]
+fn smooth_dielectrics_follow_snell_and_fresnel() {
+    let mut bsdf = RealTime::new();
+    for exterior in [1.0f32, 1.33] {
+        let glass = Inputs {
+            base_color: [1.0; 3],
+            specular_roughness: 0.0,
+            specular_ior: 1.5,
+            transmission_weight: 1.0,
+            exterior_ior: exterior,
+            ..Inputs::default()
+        };
+        for inside in [false, true] {
+            for cos in [1.0f64, 0.9, 0.6, 0.3] {
+                let sin = (1.0 - cos * cos).sqrt();
+                let side = if inside { -1.0 } else { 1.0 };
+                bsdf.prepare(&glass, [sin as f32, 0.0, (side * cos) as f32]);
+                let (from, to) = if inside {
+                    (1.5, f64::from(exterior))
+                } else {
+                    (f64::from(exterior), 1.5)
+                };
+                let f = fresnel(to / from, cos);
+                let what = format!("ior {to} from {from} at cos {cos}");
+                let a = bsdf.albedo();
+                assert!(
+                    (f64::from(a.specular[0]) - f).abs() < 2e-3,
+                    "{what}: {a:?}, F {f}"
+                );
+                assert!(
+                    (f64::from(a.transmission[0]) - (1.0 - f)).abs() < 2e-3,
+                    "{what}: {a:?}, F {f}"
+                );
+                let r = bsdf.sample([0.5, 0.5, 0.0]).expect("reflection");
+                assert!(r.lobe.is(Lobe::REFLECTION), "{what}: {r:?}");
+                let mirror = [-sin, 0.0, side * cos];
+                assert!(
+                    (0..3).all(|k| (f64::from(r.wi[k]) - mirror[k]).abs() < 1e-4),
+                    "{what}: {r:?}"
+                );
+                let t = bsdf.sample([0.5, 0.5, 0.999_99]).expect("sample");
+                let sin_t = sin * from / to;
+                if sin_t >= 1.0 {
+                    assert!(t.lobe.is(Lobe::REFLECTION), "{what}: {t:?}");
+                    continue;
+                }
+                assert!(t.lobe.is(Lobe::TRANSMISSION), "{what}: {t:?}");
+                let snell = [-sin_t, 0.0, -side * (1.0 - sin_t * sin_t).sqrt()];
+                assert!(
+                    (0..3).all(|k| (f64::from(t.wi[k]) - snell[k]).abs() < 1e-4),
+                    "{what}: {t:?} against {snell:?}"
+                );
+            }
+        }
+    }
+}

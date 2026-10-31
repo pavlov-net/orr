@@ -108,9 +108,9 @@ pub struct FrameDesc<'a> {
 /// The consumer passes a view runs, each once per `render_view` that sets it.
 #[derive(Default)]
 pub struct ViewHooks<'a> {
-    /// Into the view's transparency overlay after its opaque lighting, at the render extent;
-    /// the overlay is composited over the radiance before `scene_referred`. Particle
-    /// producer entries are drawn here or not at all for primary visibility.
+    /// Into the view's transparency overlay after its opaque and dielectric lighting, at the
+    /// render extent; the overlay is composited over the radiance before `scene_referred`.
+    /// Particle producer entries are drawn here or not at all for primary visibility.
     pub transparency: Option<&'a mut dyn FnMut(&mut TransparencyPass<'_, '_>)>,
     /// On the view's pre-exposed radiance before metering, at the output extent; compute
     /// work in [`Frame::output_list`].
@@ -580,8 +580,9 @@ impl<'a> Frame<'a> {
     }
 
     /// Steps 4-5 for one view: its raster half; the scene's lighting pass before the scene's
-    /// first view this frame; one path per pixel into the view's radiance;
-    /// `hooks.scene_referred`; a scene-referred screenshot; metering and adaptation; then,
+    /// first view this frame; one path per pixel into the view's radiance, then the
+    /// dielectric dispatch over it, which traces each pixel's first dielectric or presence
+    /// layer; `hooks.scene_referred`; a scene-referred screenshot; metering and adaptation; then,
     /// unless the view stops there, tonemap, `hooks.display_linear`, `hooks.ui`, compose and
     /// a display screenshot.
     ///
@@ -662,31 +663,25 @@ impl<'a> Frame<'a> {
             l => *l = Some(LightingView::new(&gpu, arena)?),
         }
         let paths = state.lighting.as_mut().expect("lighting view");
-        list.barrier(Stages::ALL, Stages::COMPUTE | Stages::RAY, Hazards::empty());
+        let pass = ViewPass {
+            frame: id,
+            scene: raster.scene,
+            view: raster.view,
+            gbuffer: raster.gbuffer,
+            sample_index: state.samples,
+            seed: 0,
+        };
+        let traced = Stages::COMPUTE | Stages::RAY;
+        list.barrier(Stages::ALL, traced, Hazards::empty());
         let kernels = lights
             .paths
             .as_ref()
             .expect("compiled with the view history");
-        kernels.record_opaque(
-            list,
-            scene,
-            paths,
-            &ViewPass {
-                frame: id,
-                scene: raster.scene,
-                view: raster.view,
-                gbuffer: raster.gbuffer,
-                sample_index: state.samples,
-                seed: 0,
-            },
-            lighting,
-        );
+        kernels.record_opaque(list, scene, paths, &pass, lighting);
+        list.barrier(traced, traced, Hazards::empty());
+        kernels.record_dielectric(list, paths, &pass, lighting);
         state.samples = state.samples.wrapping_add(1);
-        list.barrier(
-            Stages::COMPUTE | Stages::RAY,
-            Stages::COMPUTE,
-            Hazards::empty(),
-        );
+        list.barrier(traced, Stages::COMPUTE, Hazards::empty());
         let (radiance, radiance_store) = (paths.radiance_index(), paths.radiance_storage());
         if let Some(hook) = hooks.transparency.as_mut() {
             self.scenes
