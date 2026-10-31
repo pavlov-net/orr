@@ -31,8 +31,8 @@ fn failed_assert_dumps_with_source_lines() {
     let out = readback::<u32>(1, "assert out");
     let root = upload(
         &[forced::Root {
-            flag: flag.gpu,
-            out: out.gpu,
+            flag: flag.gpu(),
+            out: out.gpu(),
         }],
         "assert root",
     );
@@ -40,7 +40,7 @@ fn failed_assert_dumps_with_source_lines() {
     let queue = render();
     let mut list = queue.command_list().unwrap();
     list.begin_pass("forced assert", false);
-    list.dispatch(&p, root.gpu, [1, 1, 1]);
+    list.dispatch(&p, root.gpu(), [1, 1, 1]);
     list.end_pass();
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     let result = queue

@@ -132,10 +132,10 @@ impl WorldCache {
         let cache = self.roots.write(
             slot,
             WorldCacheGpu {
-                checks: self.checks.gpu,
-                accumulated: self.accumulated.gpu,
-                resolved: self.resolved.gpu,
-                counters: self.counters.gpu,
+                checks: self.checks.gpu(),
+                accumulated: self.accumulated.gpu(),
+                resolved: self.resolved.gpu(),
+                counters: self.counters.gpu(),
                 focus,
                 lod_scale: s.lod_scale,
                 capacity_mask: (capacity - 1) as u32,
@@ -149,7 +149,7 @@ impl WorldCache {
             resolve::Root {
                 cache,
                 scene,
-                stats: self.readback.gpu.offset(slot as u64),
+                stats: self.readback.gpu().offset(slot as u64),
                 capacity: capacity as u32,
                 cell_lifetime: s.cell_lifetime,
                 max_temporal_samples: s.max_temporal_samples,

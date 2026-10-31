@@ -130,7 +130,7 @@ fn pattern_through_pointer() {
     let out = readback::<u32>(u64::from(count), "pattern out");
     let root = upload(
         &[pattern::Root {
-            out: out.gpu,
+            out: out.gpu(),
             count,
             seed: 0x51ed_270b,
         }],
@@ -138,7 +138,7 @@ fn pattern_through_pointer() {
     );
     let p = pipeline(&pattern::MODULE, "main");
     let mut list = render().command_list().unwrap();
-    list.dispatch(&p, root.gpu, [count.div_ceil(64), 1, 1]);
+    list.dispatch(&p, root.gpu(), [count.div_ceil(64), 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     run(list);
     let wrong = (0..count)
@@ -183,7 +183,7 @@ fn heap_texture_sample_and_storage_write() {
     let stored = readback::<[f32; 4]>(u64::from(w * h), "abi stored");
     let root = upload(
         &[texture::Root {
-            out: sampled.gpu,
+            out: sampled.gpu(),
             source,
             nearest,
             target,
@@ -199,13 +199,13 @@ fn heap_texture_sample_and_storage_write() {
     let whole = TextureRegion::whole_mip(&desc, 0);
     let mut list = render().command_list().unwrap();
     list.discard(&tex);
-    list.copy_to_texture(&tex, &whole, src.gpu.cast());
+    list.copy_to_texture(&tex, &whole, src.gpu().cast());
     list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
-    list.dispatch(&sample, root.gpu, groups);
+    list.dispatch(&sample, root.gpu(), groups);
     list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-    list.dispatch(&store, root.gpu, groups);
+    list.dispatch(&store, root.gpu(), groups);
     list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
-    list.copy_from_texture(stored.gpu.cast(), &tex, &whole);
+    list.copy_from_texture(stored.gpu().cast(), &tex, &whole);
     list.barrier(
         Stages::COMPUTE | Stages::TRANSFER,
         Stages::HOST,
@@ -254,8 +254,8 @@ fn atomic_max_u64_through_pointer() {
     let out = readback::<u64>(u64::from(slots), "abi atomic slots");
     let root = upload(
         &[atomic::Root {
-            slots: out.gpu,
-            values: values.gpu,
+            slots: out.gpu(),
+            values: values.gpu(),
             count,
             slot_count: slots,
             pad0: 0,
@@ -265,9 +265,9 @@ fn atomic_max_u64_through_pointer() {
     );
     let p = pipeline(&atomic::MODULE, "main");
     let mut list = render().command_list().unwrap();
-    list.copy(out.gpu.cast(), zero.gpu.cast(), out.size);
+    list.copy(out.gpu().cast(), zero.gpu().cast(), out.size());
     list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
-    list.dispatch(&p, root.gpu, [count.div_ceil(64), 1, 1]);
+    list.dispatch(&p, root.gpu(), [count.div_ceil(64), 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     run(list);
     assert_eq!(out.as_slice().unwrap(), &expected[..]);
@@ -312,7 +312,7 @@ fn alpha_root(
 ) -> (Allocation<[u32; 4]>, orr_gpu::GpuPtr<alpha::Root>) {
     let out = readback::<[u32; 4]>(u64::from(size * size), "alpha out");
     let root = b.upload(&[alpha::Root {
-        out: out.gpu,
+        out: out.gpu(),
         scene,
         width: size,
         height: size,
@@ -469,9 +469,9 @@ fn alpha_test_omm_variant_on_micromap_clusters() {
     let clusters = vec![front, cl::back_cluster()];
     let flags = cl::data_flags() | RtasFlags::ALLOW_OMM;
     let clas = b.build_clas(&clusters, flags, micromap.address().0, None, None);
-    let blas = b.build_blas(clas.addrs.gpu, &[vec![0], vec![1]], None);
+    let blas = b.build_blas(clas.addrs.gpu(), &[vec![0], vec![1]], None);
     let tlas = b.build_tlas(
-        blas.addrs.gpu,
+        blas.addrs.gpu(),
         &[
             cl::instance([0.0; 3], cl::FRONT_CUSTOM, 0),
             cl::instance([0.0; 3], cl::BACK_CUSTOM, 1),
@@ -558,7 +558,7 @@ fn raygen_and_compute_entries_trace_one_ptlas() {
     let base = cl::base_clusters();
     let mut b = Builder::new();
     let clas = b.build_clas(&base, cl::data_flags(), 0, None, None);
-    let blas = b.build_blas(clas.addrs.gpu, &[vec![0, 1, 2, 3], vec![4]], None);
+    let blas = b.build_blas(clas.addrs.gpu(), &[vec![0, 1, 2, 3], vec![4]], None);
     let limits = cl::ptlas_limits(2);
     let (dst, scratch) = b.ptlas_blocks(limits);
     let ops = cl::PtlasOps {
@@ -568,7 +568,7 @@ fn raygen_and_compute_entries_trace_one_ptlas() {
         ],
         ..Default::default()
     };
-    b.build_ptlas(limits, blas.addrs.gpu, &ops, dst, scratch, false);
+    b.build_ptlas(limits, blas.addrs.gpu(), &ops, dst, scratch, false);
     let tlas = Tlas(dst.0);
     let probe = b.trace(tlas, 0);
 
@@ -584,7 +584,7 @@ fn raygen_and_compute_entries_trace_one_ptlas() {
         [0, 1].map(|_| readback::<clusters::ClusterHit>(u64::from(w * h), "abi cluster hits"));
     let roots = outs.each_ref().map(|out| {
         b.upload(&[clusters::Root {
-            out: out.gpu,
+            out: out.gpu(),
             scene: tlas,
             width: w,
             height: h,
@@ -707,7 +707,7 @@ fn transmittance_and_translucent_resolve() {
     let outs = limits.map(|max_candidates| {
         let out = readback::<candidates::CandidateResult>(u64::from(SIZE * SIZE), "candidates out");
         let root = b.upload(&[candidates::Root {
-            out: out.gpu,
+            out: out.gpu(),
             scene: tlas,
             width: SIZE,
             height: SIZE,
@@ -849,7 +849,7 @@ fn task_mesh_pixel_two_targets() {
     let root = upload(
         &[mesh::Root {
             flat,
-            vertices: verts.gpu,
+            vertices: verts.gpu(),
             triangle_count: count,
             pad: 0,
         }],
@@ -870,11 +870,11 @@ fn task_mesh_pixel_two_targets() {
         colors: &attachments,
         depth: None,
     });
-    list.draw_mesh_tasks(&p, root.gpu, [1, 1, 1]);
+    list.draw_mesh_tasks(&p, root.gpu(), [1, 1, 1]);
     list.end_rendering();
     list.barrier(Stages::COLOR_OUT, Stages::TRANSFER, Hazards::empty());
     for (out, t) in outs.iter().zip(&targets) {
-        list.copy_from_texture(out.gpu.cast(), t, &TextureRegion::whole_mip(t.desc(), 0));
+        list.copy_from_texture(out.gpu().cast(), t, &TextureRegion::whole_mip(t.desc(), 0));
     }
     list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
     run(list);

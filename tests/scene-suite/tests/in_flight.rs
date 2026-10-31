@@ -64,12 +64,12 @@ fn cpu_records_ahead_and_windows_wait_for_their_frame() {
         .gpu_malloc::<gate::Root>(MemoryKind::Upload, 1, "gate root")
         .unwrap();
     gate_root.as_mut_slice().unwrap()[0] = gate::Root {
-        flag: flag.gpu,
-        out: out.gpu,
+        flag: flag.gpu(),
+        out: out.gpu(),
     };
     let p = pipeline(&gate::MODULE, "main");
     let mut cmd = render.command_list().unwrap();
-    cmd.dispatch(&p, gate_root.gpu, [1, 1, 1]);
+    cmd.dispatch(&p, gate_root.gpu(), [1, 1, 1]);
     let gate_point = render.submit(vec![cmd], &[]).unwrap();
 
     let write = |scenes: &mut Scenes, g: TransformGroupId, salt: f32| {
@@ -93,7 +93,7 @@ fn cpu_records_ahead_and_windows_wait_for_their_frame() {
     assert!(render.completed() < n.value(), "frame N ran past the gate");
 
     // Frame N + 2 reuses frame N's window, so it waits for frame N.
-    let flag_ptr = flag.cpu.unwrap().as_ptr() as usize;
+    let flag_ptr = flag.mapped_ptr().unwrap().as_ptr() as usize;
     let release = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(300));
         // SAFETY: the flag allocation outlives this thread (joined below) and the GPU only

@@ -213,9 +213,9 @@ impl AtmosphereState {
             "atmosphere ground irradiance",
         )?;
         let mut record = AtmosphereGpu::zeroed();
-        record.groups = groups.gpu.cast();
-        record.fold = fold.gpu;
-        record.ground_irradiance = ground.gpu;
+        record.groups = groups.gpu().cast();
+        record.fold = fold.gpu();
+        record.ground_irradiance = ground.gpu();
         record.group_passes = PASSES as u32;
         record.transmittance = transmittance.sampled;
         record.multiple_scattering = multiple_scattering.sampled;
@@ -302,7 +302,7 @@ impl AtmosphereState {
 
     /// The block's address, for `SceneWriter::set_environment` and `set_medium`.
     pub fn data(&self) -> GpuAddress {
-        self.block.gpu.address()
+        self.block.gpu().address()
     }
 
     /// Records the atmosphere's passes for the scene `cx` hands over: the medium's tables
@@ -342,14 +342,14 @@ impl AtmosphereState {
         let block = cx.put(&self.record)?;
         self.record.fold_reset = 0;
         cx.cmd.copy(
-            self.block.gpu.cast(),
+            self.block.gpu().cast(),
             block.cast(),
             size_of::<AtmosphereGpu>() as u64,
         );
         if self.medium_changed {
             let groups = cx.put(&block::groups(&self.desc))?;
             cx.cmd.copy(
-                self.groups.gpu.cast(),
+                self.groups.gpu().cast(),
                 groups.cast(),
                 size_of::<[AtmosphereGroups; PASSES]>() as u64,
             );
@@ -366,7 +366,7 @@ impl AtmosphereState {
             .barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
 
         let root = |output: StorageImageIndex, view: u32| Root {
-            atmosphere: self.block.gpu,
+            atmosphere: self.block.gpu(),
             output,
             view,
         };

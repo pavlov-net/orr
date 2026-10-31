@@ -129,9 +129,9 @@ fn the_interior_list_keeps_nested_media_innermost_last() {
     let outside = readback::<u32>(script.len() as u64, "interior outside");
     let root = upload(
         &[interior_probe::Root {
-            steps: steps.gpu,
-            lists: lists.gpu,
-            outside: outside.gpu,
+            steps: steps.gpu(),
+            lists: lists.gpu(),
+            outside: outside.gpu(),
             count: script.len() as u32,
             _pad0: 0,
         }],
@@ -139,7 +139,7 @@ fn the_interior_list_keeps_nested_media_innermost_last() {
     );
     let probe = pipeline(&interior_probe::MODULE, "main");
     let mut list = render().command_list().unwrap();
-    list.dispatch(&probe, root.gpu, [1, 1, 1]);
+    list.dispatch(&probe, root.gpu(), [1, 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     run(list);
     let n = NONE;

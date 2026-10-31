@@ -218,7 +218,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         })),
     )
     .expect("sun");
-    w.set_environment(environment.gpu.address());
+    w.set_environment(environment.gpu().address());
     drop(w);
     f.end().expect("end frame");
 

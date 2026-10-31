@@ -205,7 +205,7 @@ pub fn image_handles(t: &Texture) -> Result<ImageHandles, Error> {
     })
 }
 
-/// The raw buffer behind `a`, which starts at offset 0 and spans `a.size` bytes.
+/// The raw buffer behind `a`, which starts at offset 0 and spans `a.size()` bytes.
 pub fn buffer_handle<T>(a: &Allocation<T>) -> vk::Buffer {
     a.raw().buffer
 }

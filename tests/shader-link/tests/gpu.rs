@@ -40,11 +40,11 @@ fn run<R: Pod, O: Pod>(
     let out = d
         .gpu_malloc::<O>(MemoryKind::Readback, count, "out")
         .unwrap();
-    let root = upload(&[root(out.gpu)]);
+    let root = upload(&[root(out.gpu())]);
     let p = pipeline(set.module(own).unwrap());
     let render = d.queue(QueueKind::Render).unwrap();
     let mut cmd = render.command_list().unwrap();
-    cmd.dispatch(&p, root.gpu, [1, 1, 1]);
+    cmd.dispatch(&p, root.gpu(), [1, 1, 1]);
     cmd.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     wait(render.submit(vec![cmd], &[]).unwrap());
     out.as_slice().unwrap().to_vec()
@@ -81,7 +81,7 @@ fn resolve_on_gpu(set: &KernelSet) -> Vec<(SurfaceInput, resolve::SurfaceOut)> {
     let count = inputs.len() as u32;
     let gpu_inputs = upload(&inputs);
     let out = run(set, &resolve::MODULE, count.into(), |out| resolve::Root {
-        inputs: gpu_inputs.gpu,
+        inputs: gpu_inputs.gpu(),
         out,
         count,
         pad0: 0,
@@ -159,7 +159,7 @@ fn displace_on_gpu(set: &KernelSet) -> Vec<[f32; 4]> {
     let gpu_inputs = upload(&inputs);
     // The kernel has no bounds check: one workgroup writes 64 outputs.
     let mut out = run(set, &tessellate::MODULE, 64, |out| tessellate::Root {
-        inputs: gpu_inputs.gpu,
+        inputs: gpu_inputs.gpu(),
         out,
     });
     out.truncate(2);
@@ -196,7 +196,7 @@ fn sky_on_gpu(set: &KernelSet) -> Vec<[f32; 4]> {
     run(set, &sky::MODULE, 3, |out| sky::Root {
         out,
         environment: 0,
-        medium: air.gpu.address().0,
+        medium: air.gpu().address().0,
         pad: 0,
     })
 }

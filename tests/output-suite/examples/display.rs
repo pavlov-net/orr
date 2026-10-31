@@ -147,7 +147,7 @@ fn main() {
             list.copy_to_texture(
                 &texture,
                 &TextureRegion::whole_mip(texture.desc(), 0),
-                upload.gpu.cast(),
+                upload.gpu().cast(),
             );
             list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
             if let Some(old) = linear.take() {

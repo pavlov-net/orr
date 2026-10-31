@@ -203,9 +203,9 @@ impl Device {
         offset: u64,
     ) -> Result<u64, Error> {
         let shared = &self.shared;
-        check_aligned(dst.gpu.address().0 + offset);
+        check_aligned(dst.gpu().address().0 + offset);
         let mut bytes = shared.matrix_bytes(c.rows, c.columns, &c.dst_format)?;
-        let size = dst.size;
+        let size = dst.size();
         let mapped = dst
             .as_mut_slice()
             .ok_or_else(|| Error::Invalid("matrix destination is not mapped".into()))?;

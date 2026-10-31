@@ -239,8 +239,8 @@ pub fn probe(
         .unwrap();
     root.as_mut_slice().unwrap()[0] = Root {
         atmosphere: block,
-        input: input.gpu,
-        output: output.gpu,
+        input: input.gpu(),
+        output: output.gpu(),
         count: p.count,
         layer: p.layer,
         light: p.light,
@@ -251,10 +251,10 @@ pub fn probe(
     let render = d.queue(QueueKind::Render).unwrap();
     let mut list = render.command_list().unwrap();
     list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-    list.dispatch(pipeline(entry), root.gpu, [p.threads.div_ceil(64), 1, 1]);
+    list.dispatch(pipeline(entry), root.gpu(), [p.threads.div_ceil(64), 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
     wait(render.submit(vec![list], &[]).unwrap());
-    read_buffer(output.gpu, outputs)
+    read_buffer(output.gpu(), outputs)
 }
 
 /// A probe's `light` field carrying the eye position.
@@ -312,7 +312,7 @@ pub fn uniform_texture(texel: [f32; 4], name: &str) -> TestTexture {
     list.copy_to_texture(
         &texture,
         &TextureRegion::whole_mip(&desc, 0),
-        staging.gpu.cast(),
+        staging.gpu().cast(),
     );
     list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
     wait(render.submit(vec![list], &[]).unwrap());

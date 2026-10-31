@@ -103,7 +103,7 @@ impl OutputRoots {
         let bytes = bytemuck::bytes_of(value);
         let slice = self.upload.as_mut_slice().expect("upload memory");
         slice[at as usize..at as usize + bytes.len()].copy_from_slice(bytes);
-        self.upload.gpu.offset(at).cast()
+        self.upload.gpu().offset(at).cast()
     }
 }
 
@@ -223,7 +223,7 @@ impl OutputView {
             u64::from(w) * u64::from(h),
             "screenshot",
         )?;
-        let ptr = readback.gpu;
+        let ptr = readback.gpu();
         self.captures.push(Capture { readback, shot });
         Ok(ptr)
     }
@@ -420,7 +420,7 @@ impl ComposeKernel {
             _ => "compose_ui",
         };
         list.begin_pass(name, false);
-        list.dispatch(&self.0, root.upload.gpu, groups(pass.extent, 8));
+        list.dispatch(&self.0, root.upload.gpu(), groups(pass.extent, 8));
         list.end_pass();
     }
 }
@@ -535,8 +535,8 @@ impl OutputKernels {
         pass: &ExposurePass<'_>,
     ) {
         if !roots.histogram_cleared {
-            let zeros = roots.upload.gpu.offset(ZEROS);
-            list.copy(roots.histogram.gpu.cast(), zeros, 4 * HISTOGRAM_WORDS);
+            let zeros = roots.upload.gpu().offset(ZEROS);
+            list.copy(roots.histogram.gpu().cast(), zeros, 4 * HISTOGRAM_WORDS);
             list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
             roots.histogram_cleared = true;
         }
@@ -575,7 +575,7 @@ impl OutputKernels {
         }
         if let Some(auto) = meter {
             let root = meter::Root {
-                histogram: roots.histogram.gpu,
+                histogram: roots.histogram.gpu(),
                 view: pass.view,
                 source: pass.source,
                 mask: auto.metering_mask.unwrap_or(TextureIndex::NONE),
@@ -594,12 +594,12 @@ impl OutputKernels {
         }
         let root = adapt::Root {
             params: roots.put(ADAPT_PARAMS, &params),
-            compensation: roots.upload.gpu.offset(COMPENSATION).cast(),
-            histogram: roots.histogram.gpu,
+            compensation: roots.upload.gpu().offset(COMPENSATION).cast(),
+            histogram: roots.histogram.gpu(),
             view: pass.view,
             sky: pass.sky,
-            telemetry: roots.telemetry.gpu,
-            white_balance: roots.white_balance.gpu.cast(),
+            telemetry: roots.telemetry.gpu(),
+            white_balance: roots.white_balance.gpu().cast(),
             _pad0: 0,
             _pad1: 0,
         };
@@ -860,7 +860,7 @@ impl OutputKernels {
         let root = tonemap::Root {
             constants: roots.put(TONEMAP_CONSTANTS, &constants),
             view: pass.view,
-            white_balance: roots.white_balance.gpu.cast(),
+            white_balance: roots.white_balance.gpu().cast(),
             glare_weights: pass.glare.map_or(GpuPtr::NULL, |g| g.weights),
             source: pass.source,
             target: pass.target,

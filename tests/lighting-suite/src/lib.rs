@@ -86,7 +86,7 @@ pub fn texture(width: u32, height: u32, texels: &[[f32; 4]], name: &str) -> Test
     list.copy_to_texture(
         &texture,
         &TextureRegion::whole_mip(&desc, 0),
-        staging.gpu.cast(),
+        staging.gpu().cast(),
     );
     list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
     run(list);
@@ -120,7 +120,7 @@ pub fn copy_back<T: bytemuck::Pod>(
     name: &str,
 ) -> Allocation<T> {
     let out = readback::<T>(count, name);
-    list.copy(out.gpu.cast(), src.cast(), count * size_of::<T>() as u64);
+    list.copy(out.gpu().cast(), src.cast(), count * size_of::<T>() as u64);
     out
 }
 

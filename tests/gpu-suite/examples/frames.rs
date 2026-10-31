@@ -44,7 +44,7 @@ fn main() {
     let scene_ptr = upload(&[scene.tlas.tlas()], "frames scene pointer");
     let heap_root = upload(
         &[heap_views::Root {
-            out: sampled.gpu,
+            out: sampled.gpu(),
             source,
             nearest,
             target,
@@ -56,9 +56,9 @@ fn main() {
     );
     let ray_root = upload(
         &[rays::Root {
-            out: hits.gpu,
+            out: hits.gpu(),
             scene: scene.tlas.tlas(),
-            scene_ptr: scene_ptr.gpu,
+            scene_ptr: scene_ptr.gpu(),
             width: w,
             height: h,
         }],
@@ -77,12 +77,12 @@ fn main() {
             list.discard(&tex);
         }
         list.begin_pass("heap textures", true);
-        list.dispatch(&store, heap_root.gpu, groups);
+        list.dispatch(&store, heap_root.gpu(), groups);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        list.dispatch(&sample, heap_root.gpu, groups);
+        list.dispatch(&sample, heap_root.gpu(), groups);
         list.end_pass();
         list.begin_pass("ray query", true);
-        list.dispatch(&trace, ray_root.gpu, groups);
+        list.dispatch(&trace, ray_root.gpu(), groups);
         list.end_pass();
         list.barrier(
             Stages::COMPUTE,

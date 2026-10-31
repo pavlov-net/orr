@@ -63,7 +63,7 @@ impl Average {
         if i >= self.skip {
             self.frames += 1;
         }
-        let sum = self.sum.as_ref().expect("radiance sum").0.gpu;
+        let sum = self.sum.as_ref().expect("radiance sum").0.gpu();
         let pipeline = f.pipeline(self.pipeline);
         let slot = f.id() % self.slots;
         let roots = &mut self.roots;
@@ -82,7 +82,7 @@ impl Average {
             pass.cmd.begin_pass("accumulate", false);
             pass.cmd.dispatch(
                 pipeline,
-                roots.gpu.offset(slot),
+                roots.gpu().offset(slot),
                 [pass.extent[0].div_ceil(8), pass.extent[1].div_ceil(8), 1],
             );
             pass.cmd.end_pass();

@@ -303,7 +303,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             .set_focus(eye.as_dvec3(), extent[1] as f32 / FOV_Y);
         let wind_root = |root| wind::Root {
             scene: root,
-            branches: branches.gpu,
+            branches: branches.gpu(),
             group: poses.0,
             copies,
             parts,
@@ -373,13 +373,13 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         list.begin_pass("sun shadow", false);
         list.dispatch(
             shade,
-            roots.gpu.offset(slot),
+            roots.gpu().offset(slot),
             [extent[0].div_ceil(8), extent[1].div_ceil(8), 1],
         );
         list.end_pass();
         if let Some(out) = readback.as_ref().filter(|_| final_frame) {
             capture_root.as_mut_slice().expect("capture root")[0] = capture::Root {
-                pixels: out.gpu,
+                pixels: out.gpu(),
                 source: target.sampled,
                 width: extent[0],
                 height: extent[1],
@@ -389,7 +389,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
             list.dispatch(
                 encode,
-                capture_root.gpu,
+                capture_root.gpu(),
                 [extent[0].div_ceil(8), extent[1].div_ceil(8), 1],
             );
             list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());

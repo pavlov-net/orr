@@ -11,7 +11,7 @@ fn ptlas_build_with_a_repeated_op_is_rejected() {
     let clusters = base_clusters();
     let mut b = Builder::new();
     let clas = b.build_clas(&clusters, data_flags(), 0, None, None);
-    let blas = b.build_blas(clas.addrs.gpu, &[vec![0, 1, 2, 3], vec![4]], None);
+    let blas = b.build_blas(clas.addrs.gpu(), &[vec![0, 1, 2, 3], vec![4]], None);
     let limits = ptlas_limits(2);
     let (dst, scratch) = b.ptlas_blocks(limits);
     let writes = |front_x: f32| PtlasOps {
@@ -21,13 +21,13 @@ fn ptlas_build_with_a_repeated_op_is_rejected() {
         ],
         ..Default::default()
     };
-    b.build_ptlas(limits, blas.addrs.gpu, &writes(0.0), dst, scratch, false);
+    b.build_ptlas(limits, blas.addrs.gpu(), &writes(0.0), dst, scratch, false);
     b.flush();
     assert_eq!(device().validation_messages(), 0, "a valid build passes");
 
     let mut repeated = writes(0.25);
     repeated.repeat_first = true;
-    b.build_ptlas(limits, blas.addrs.gpu, &repeated, dst, scratch, true);
+    b.build_ptlas(limits, blas.addrs.gpu(), &repeated, dst, scratch, true);
     let out = b.trace(orr_gpu::Tlas(dst.0), 0);
     b.flush();
     assert_eq!(

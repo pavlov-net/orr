@@ -154,7 +154,7 @@ fn forest() -> Scene {
             kind: ClassicKind::Blas,
             flags: RtasFlags::FAST_TRACE | RtasFlags::ALLOW_DATA_ACCESS,
             geometry: ClassicGeometry::Triangles {
-                positions: p.gpu,
+                positions: p.gpu(),
                 vertex_count: vertices.len() as u32,
                 indices: GpuPtr::NULL,
                 triangle_count: vertices.len() as u32 / 3,
@@ -165,7 +165,7 @@ fn forest() -> Scene {
         list.build_classic(&ClassicBuild {
             desc: &desc,
             dst: &accel,
-            scratch: s.gpu.address(),
+            scratch: s.gpu().address(),
         });
         scratch.push(s);
         positions.push(p);
@@ -209,7 +209,7 @@ fn forest() -> Scene {
         kind: ClassicKind::Tlas,
         flags: RtasFlags::FAST_TRACE,
         geometry: ClassicGeometry::Instances {
-            records: records.gpu.address(),
+            records: records.gpu().address(),
             capacity: instances.len() as u32,
         },
     };
@@ -217,7 +217,7 @@ fn forest() -> Scene {
     list.build_classic(&ClassicBuild {
         desc: &desc,
         dst: &tlas,
-        scratch: s.gpu.address(),
+        scratch: s.gpu().address(),
     });
     scratch.push(s);
     run(list);
@@ -259,9 +259,9 @@ impl Run {
                 cam_right: [right[0], right[1], right[2], 0.0],
                 cam_up: [up[0], up[1], up[2], 0.0],
                 sun: [sun[0], sun[1], sun[2], 3.0],
-                out_rad: rad.gpu,
-                out_hash: hash.gpu,
-                transforms: scene.transforms.gpu,
+                out_rad: rad.gpu(),
+                out_hash: hash.gpu(),
+                transforms: scene.transforms.gpu(),
                 scene: scene.tlas.tlas(),
                 width: WIDTH,
                 height: HEIGHT,
@@ -346,8 +346,8 @@ fn raygen_and_compute_entries_trace_the_same_paths() {
     let [gx, gy, _] = compute.workgroup();
     let mut list = render().command_list().unwrap();
     for (c, r) in &runs {
-        list.dispatch(&compute, c.root.gpu, [WIDTH / gx, HEIGHT / gy, 1]);
-        list.dispatch_rays(&rays, r.root.gpu, [WIDTH, HEIGHT, 1]);
+        list.dispatch(&compute, c.root.gpu(), [WIDTH / gx, HEIGHT / gy, 1]);
+        list.dispatch_rays(&rays, r.root.gpu(), [WIDTH, HEIGHT, 1]);
     }
     list.barrier(
         Stages::COMPUTE | Stages::RAY,

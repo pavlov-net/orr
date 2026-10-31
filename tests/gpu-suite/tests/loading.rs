@@ -145,7 +145,7 @@ fn staged_tile_upload(t: &Texture, data: &[Vec<Vec<u8>>]) -> TimelinePoint {
     let mut list = queue(QueueKind::Loading).command_list().unwrap();
     list.discard(t);
     let tile_row_bytes = (layout.tile_extent[0] / block) as usize * block_bytes;
-    let gpu = staging.gpu;
+    let gpu = staging.gpu();
     let mapped = staging.as_mut_slice().unwrap();
     for (i, &(layer, mip, tile)) in tiles.iter().enumerate() {
         let region = layout.tile_region(&desc, mip, layer, tile);
@@ -195,7 +195,7 @@ fn read_mips(t: &Texture, wait: &[TimelinePoint]) -> Vec<Vec<Vec<u8>>> {
     let mut at = 0;
     for (m, &bytes) in sizes.iter().enumerate() {
         let region = TextureRegion::whole_mip(&desc, m as u32);
-        list.copy_from_texture(out.gpu.offset(at), t, &region);
+        list.copy_from_texture(out.gpu().offset(at), t, &region);
         at += bytes;
     }
     list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
@@ -338,7 +338,7 @@ fn tile_sampled_after_loading_wait() {
     let staging = upload(&texels, "tile texels");
     let mut list = queue(QueueKind::Loading).command_list().unwrap();
     list.discard(&t);
-    list.copy_to_texture(&t, &region, staging.gpu);
+    list.copy_to_texture(&t, &region, staging.gpu());
     let loaded = queue(QueueKind::Loading).submit(vec![list], &[]).unwrap();
 
     let slot = d.alloc_image_slot().unwrap();
@@ -347,7 +347,7 @@ fn tile_sampled_after_loading_wait() {
     let out = readback::<[f32; 4]>(u64::from(w * h), "tile texels out");
     let root = upload(
         &[texel_read::Root {
-            out: out.gpu,
+            out: out.gpu(),
             source,
             x: region.offset[0],
             y: region.offset[1],
@@ -359,7 +359,7 @@ fn tile_sampled_after_loading_wait() {
     );
     let read = pipeline(&texel_read::MODULE, "main");
     let mut list = render().command_list().unwrap();
-    list.dispatch(&read, root.gpu, [w.div_ceil(8), h.div_ceil(8), 1]);
+    list.dispatch(&read, root.gpu(), [w.div_ceil(8), h.div_ceil(8), 1]);
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     let point = run_on(render(), list, &[loaded]);
     let wrong = out
@@ -400,13 +400,13 @@ fn build_at(b: &mut Builder, at: u64, blas_off: u64, front_z: f32) -> orr_gpu::T
     let clusters = base_clusters();
     let clas = b.build_clas(&clusters, data_flags(), 0, Some(GpuAddress(at)), None);
     let blas = b.build_blas(
-        clas.addrs.gpu,
+        clas.addrs.gpu(),
         &[vec![0, 1, 2, 3], vec![4]],
         Some(GpuAddress(at + blas_off)),
     );
     b.keep_any(clas);
     let tlas = b.build_tlas(
-        blas.addrs.gpu,
+        blas.addrs.gpu(),
         &[
             instance([0.0, 0.0, front_z], FRONT_CUSTOM, 0),
             instance([0.0; 3], BACK_CUSTOM, 1),
@@ -590,9 +590,9 @@ fn texture_round_trip_in_one_submit() {
             down.as_mut_slice().unwrap().fill(0xcdcd_cdcd);
             let mut list = render().command_list().unwrap();
             list.discard(&t);
-            list.copy_to_texture(&t, &region, up.gpu.cast());
+            list.copy_to_texture(&t, &region, up.gpu().cast());
             list.barrier(Stages::TRANSFER, Stages::TRANSFER, Hazards::empty());
-            list.copy_from_texture(down.gpu.cast(), &t, &region);
+            list.copy_from_texture(down.gpu().cast(), &t, &region);
             list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
             run_on(render(), list, &[]);
             wrong += u32::from(down.as_slice().unwrap() != up.as_slice().unwrap());
@@ -629,9 +629,9 @@ fn three_queues_copy_concurrently() {
                     }
                     down.as_mut_slice().unwrap().fill(0xcdcd_cdcd);
                     let mut list = queue.command_list().unwrap();
-                    list.copy(scratch.gpu.cast(), up.gpu.cast(), WORDS * 4);
+                    list.copy(scratch.gpu().cast(), up.gpu().cast(), WORDS * 4);
                     list.barrier(Stages::TRANSFER, Stages::TRANSFER, Hazards::empty());
-                    list.copy(down.gpu.cast(), scratch.gpu.cast(), WORDS * 4);
+                    list.copy(down.gpu().cast(), scratch.gpu().cast(), WORDS * 4);
                     list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
                     run_on(queue, list, &[]);
                     assert_eq!(
@@ -708,7 +708,7 @@ fn staged_upload(d: &Device, queue: &Queue, t: &Texture, mips: &[Vec<u8>]) -> Ti
     let mut staging = d
         .gpu_malloc::<u8>(MemoryKind::Upload, bytes as u64, "staging")
         .unwrap();
-    let gpu = staging.gpu;
+    let gpu = staging.gpu();
     let mapped = staging.as_mut_slice().unwrap();
     let mut list = queue.command_list().unwrap();
     list.discard(t);
@@ -766,7 +766,7 @@ fn forced_staging_path() {
             .gpu_malloc::<u8>(MemoryKind::Readback, texels.len() as u64, "staged out")
             .unwrap();
         let mut list = render.command_list().unwrap();
-        list.copy_from_texture(out.gpu, &t, &region);
+        list.copy_from_texture(out.gpu(), &t, &region);
         list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
         run_on(render, list, &[copied]);
         assert!(out.as_slice().unwrap() == &texels[..], "mip {m} differs");
@@ -800,8 +800,8 @@ fn compute_queue_orders_by_timeline() {
         .map(|i| {
             upload(
                 &[step::Root {
-                    src: buffers[i].gpu,
-                    dst: buffers[i + 1].gpu,
+                    src: buffers[i].gpu(),
+                    dst: buffers[i + 1].gpu(),
                     n: N,
                     pad0: 0,
                     pad1: 0,
@@ -820,13 +820,17 @@ fn compute_queue_orders_by_timeline() {
         if i % 2 == 0 {
             list.set_occupancy(0.25, 0.0);
         }
-        list.dispatch(&p, root.gpu, [N.div_ceil(64), 1, 1]);
+        list.dispatch(&p, root.gpu(), [N.div_ceil(64), 1, 1]);
         let waits: Vec<TimelinePoint> = last.into_iter().collect();
         last = Some(q.submit(vec![list], &waits).unwrap());
     }
     let out = readback::<u32>(u64::from(N), "chain out");
     let mut list = render().command_list().unwrap();
-    list.copy(out.gpu.cast(), buffers[LINKS].gpu.cast(), u64::from(N) * 4);
+    list.copy(
+        out.gpu().cast(),
+        buffers[LINKS].gpu().cast(),
+        u64::from(N) * 4,
+    );
     list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
     run_on(render(), list, &[last.unwrap()]);
     let expected: Vec<u32> = start
@@ -925,14 +929,14 @@ fn indirect_copies_match_recorded_copies() {
     let mut list = loading.command_list().unwrap();
     for (i, &s) in page_source.as_slice().unwrap().iter().enumerate() {
         list.copy(
-            dst[0].gpu.offset(i as u64 * page_bytes),
-            src.gpu.offset(u64::from(s) * page_bytes),
+            dst[0].gpu().offset(i as u64 * page_bytes),
+            src.gpu().offset(u64::from(s) * page_bytes),
             page_bytes,
         );
     }
     list.discard(&textures[0]);
     for (region, &slot) in regions.iter().zip(&slot_of) {
-        let at = staging.gpu.offset(u64::from(slot) * tile_bytes);
+        let at = staging.gpu().offset(u64::from(slot) * tile_bytes);
         list.copy_rows_to_texture(&textures[0], region, at, tile_texels);
     }
     let recorded = loading.submit(vec![list], &bound).unwrap();
@@ -950,13 +954,13 @@ fn indirect_copies_match_recorded_copies() {
         .unwrap();
     let root = upload(
         &[copy_lists::Root {
-            page_source: page_source.gpu,
-            tiles: tile_words.gpu,
-            src_pages: src.gpu.address().0,
-            dst_pages: dst[1].gpu.address().0,
-            page_list: page_list.gpu.address().0,
-            staging: staging.gpu.address().0,
-            tile_list: tile_list.gpu.address().0,
+            page_source: page_source.gpu(),
+            tiles: tile_words.gpu(),
+            src_pages: src.gpu().address().0,
+            dst_pages: dst[1].gpu().address().0,
+            page_list: page_list.gpu().address().0,
+            staging: staging.gpu().address().0,
+            tile_list: tile_list.gpu().address().0,
             pages: PAGES,
             page_entries: PAGES + EMPTY,
             page_bytes: PAGE_BYTES,
@@ -977,19 +981,19 @@ fn indirect_copies_match_recorded_copies() {
     list.discard(&textures[1]);
     list.dispatch(
         &pages_kernel,
-        root.gpu,
+        root.gpu(),
         [(PAGES + EMPTY).div_ceil(64), 1, 1],
     );
-    list.dispatch(&tiles_kernel, root.gpu, [TILES.div_ceil(64), 1, 1]);
+    list.dispatch(&tiles_kernel, root.gpu(), [TILES.div_ceil(64), 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::DRAW_ARGUMENTS);
-    list.copy_indirect(page_list.gpu, PAGES + EMPTY);
-    list.copy_to_texture_indirect(&textures[1], tile_list.gpu, &layers);
+    list.copy_indirect(page_list.gpu(), PAGES + EMPTY);
+    list.copy_to_texture_indirect(&textures[1], tile_list.gpu(), &layers);
     let written = loading.submit(vec![list], &bound).unwrap();
 
     let out = readback::<u8>(2 * pool_bytes, "page pools out");
     let mut list = render().command_list().unwrap();
     for (i, a) in dst.iter().enumerate() {
-        list.copy(out.gpu.offset(i as u64 * pool_bytes), a.gpu, pool_bytes);
+        list.copy(out.gpu().offset(i as u64 * pool_bytes), a.gpu(), pool_bytes);
     }
     list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
     run_on(render(), list, &[recorded, written]);

@@ -73,12 +73,12 @@ fn cooked_pages_decompress_on_the_loading_queue() {
         let out = d
             .gpu_malloc::<u8>(MemoryKind::DeviceLocal, source.len() as u64, "gdeflate out")
             .unwrap();
-        let mut src = stored.gpu.address().0;
+        let mut src = stored.gpu().address().0;
         let regions: Vec<DecompressRegion> = (0..n)
             .map(|i| {
                 let region = DecompressRegion {
                     src,
-                    dst: out.gpu.address().0 + u64::from(b.chunk_raw_len()) * i as u64,
+                    dst: out.gpu().address().0 + u64::from(b.chunk_raw_len()) * i as u64,
                     compressed_bytes: u64::from(chunks[i].stored_len),
                     decompressed_bytes: u64::from(b.chunk_len(i as u32)),
                 };
@@ -93,13 +93,13 @@ fn cooked_pages_decompress_on_the_loading_queue() {
         for count in [n as u32, n as u32 - 5] {
             let count_at = upload(&[count], "gdeflate count");
             let mut list = loading.command_list().unwrap();
-            list.copy(out.gpu, cleared.gpu, out.size);
+            list.copy(out.gpu(), cleared.gpu(), out.size());
             list.barrier(Stages::TRANSFER, Stages::DECOMPRESS, Hazards::empty());
-            list.decompress(regions.gpu, count_at.gpu, n as u32);
+            list.decompress(regions.gpu(), count_at.gpu(), n as u32);
             list.barrier(Stages::DECOMPRESS, Stages::TRANSFER, Hazards::empty());
             let decompressed = loading.submit(vec![list], &[]).unwrap();
             let mut list = render().command_list().unwrap();
-            list.copy(host.gpu, out.gpu, out.size);
+            list.copy(host.gpu(), out.gpu(), out.size());
             list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
             let read = render().submit(vec![list], &[decompressed]).unwrap();
             render().wait(read, WAIT).unwrap();

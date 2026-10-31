@@ -470,7 +470,11 @@ fn painter_draws_textures_clips_and_split_meshes() {
     let queue = gpu.queue(QueueKind::Render).unwrap();
     let mut list = queue.command_list().unwrap();
     list.discard(&user);
-    list.copy_to_texture(&user, &TextureRegion::whole_mip(user.desc(), 0), upload.gpu);
+    list.copy_to_texture(
+        &user,
+        &TextureRegion::whole_mip(user.desc(), 0),
+        upload.gpu(),
+    );
     wait(queue.submit(vec![list], &[]).unwrap());
 
     let x0 = GRID as f32 + 8.0;
@@ -660,8 +664,8 @@ fn compose_ui_matches_model() {
         let mut list = queue.command_list().unwrap();
         list.discard(layer.texture());
         let whole = TextureRegion::whole_mip(source.texture.desc(), 0);
-        list.copy_to_texture(&source.texture, &whole, upload.gpu);
-        list.copy_to_texture(layer.texture(), &whole, upload.gpu.offset((n * 8) as u64));
+        list.copy_to_texture(&source.texture, &whole, upload.gpu());
+        list.copy_to_texture(layer.texture(), &whole, upload.gpu().offset((n * 8) as u64));
         list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
         let pass = |source, ui, target: &Target| ComposePass {
             source,

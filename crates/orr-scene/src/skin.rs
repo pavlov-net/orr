@@ -93,7 +93,7 @@ pub(crate) fn mesh_table(
     ];
     let mut block =
         device.gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, "skin table")?;
-    let base = block.gpu;
+    let base = block.gpu();
     let record = SkinMeshGpu {
         vertex_first: base.offset(at[0]).cast(),
         templates: base.offset(at[1]).cast(),
@@ -141,7 +141,7 @@ impl CopyArrays {
 
     /// Copy `i`'s positions, previous positions, normals, tangents and boxes.
     pub(crate) fn of(&self, i: u32) -> [GpuPtr<u8>; 5] {
-        let base = self.memory.gpu.offset(self.stride * u64::from(i));
+        let base = self.memory.gpu().offset(self.stride * u64::from(i));
         let v = self.vertices;
         [
             base,
@@ -252,7 +252,7 @@ impl SkinFrame {
         let clas_at = take(8 * n);
         let blas_at = take(8 * jobs);
         let memory = device.gpu_malloc::<u8>(MemoryKind::DeviceLocal, end, "skinning")?;
-        let at = |o: u64| memory.gpu.offset(o);
+        let at = |o: u64| memory.gpu().offset(o);
         let mut record = device.gpu_malloc::<SkinFrameGpu>(MemoryKind::Upload, 1, "skin frame")?;
         record.as_mut_slice().expect("upload is mapped")[0] = SkinFrameGpu {
             work: at(work_at).cast(),
@@ -354,7 +354,7 @@ impl SkinFrame {
             device,
             &SkinRoot {
                 scene,
-                frame: self.record.gpu,
+                frame: self.record.gpu(),
                 focus_cell,
                 focus_offset,
                 error_pixels,
@@ -375,14 +375,14 @@ impl SkinFrame {
         if let (Some(inst), Some(blas), Some(scratch)) =
             (&self.instantiate, &self.blas, &self.scratch)
         {
-            let scratch = scratch.gpu.address();
+            let scratch = scratch.gpu().address();
             list.barrier(Stages::COMPUTE, Stages::AS_BUILD, Hazards::empty());
             list.rtas_execute(
                 &inst.desc,
                 &RtasIo {
                     args: self.instantiate_records,
                     count: self.counters.offset(SKIN_WORK),
-                    dst_implicit: inst.results.gpu.address(),
+                    dst_implicit: inst.results.gpu().address(),
                     dst_addresses: self.clas,
                     dst_sizes: GpuPtr::NULL,
                     scratch,
@@ -395,7 +395,7 @@ impl SkinFrame {
                 &RtasIo {
                     args: self.blas_records,
                     count: self.counters.offset(SKIN_JOBS),
-                    dst_implicit: blas.results.gpu.address(),
+                    dst_implicit: blas.results.gpu().address(),
                     dst_addresses: self.blas_addresses,
                     dst_sizes: GpuPtr::NULL,
                     scratch,
@@ -417,7 +417,10 @@ impl SkinFrame {
             Hazards::empty(),
         );
         list.copy(
-            self.readback.gpu.offset(SKIN_COUNTERS * slot as u64).cast(),
+            self.readback
+                .gpu()
+                .offset(SKIN_COUNTERS * slot as u64)
+                .cast(),
             self.counters.cast(),
             4 * SKIN_COUNTERS,
         );

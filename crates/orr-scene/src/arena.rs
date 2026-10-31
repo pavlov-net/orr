@@ -367,14 +367,14 @@ impl ViewArena {
                 }
                 ArenaKind::Buffer { bytes } => {
                     let (gpu, own) = match &self.block {
-                        Some(block) => (block.gpu.offset(offsets[i]), None),
+                        Some(block) => (block.gpu().offset(offsets[i]), None),
                         None => {
                             let a = self.device.gpu_malloc::<u8>(
                                 MemoryKind::DeviceLocal,
                                 bytes.max(1),
                                 r.name,
                             )?;
-                            (a.gpu, Some(a))
+                            (a.gpu(), Some(a))
                         }
                     };
                     (Made::Buffer(ArenaBuffer { gpu, place }), own)
@@ -436,7 +436,10 @@ impl ViewArena {
     pub fn report(&self) -> ArenaReport {
         let unaliased_bytes = self.entries.iter().map(|e| e.bytes).sum();
         ArenaReport {
-            bytes: self.block.as_ref().map_or(unaliased_bytes, |b| b.size),
+            bytes: self
+                .block
+                .as_ref()
+                .map_or(unaliased_bytes, Allocation::size),
             unaliased_bytes,
             targets: self
                 .entries

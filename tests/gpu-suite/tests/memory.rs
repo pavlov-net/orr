@@ -56,7 +56,12 @@ fn steady_frames_reuse_memory_without_allocating() {
                 && arenas.gpu_ptr(block).address().0.is_multiple_of(256),
             "frame {frame}: an aligned allocation is not aligned on both sides"
         );
-        let root = arenas.upload(&[gate::Root { flag, out: out.gpu }]).unwrap();
+        let root = arenas
+            .upload(&[gate::Root {
+                flag,
+                out: out.gpu(),
+            }])
+            .unwrap();
         let scratch = d
             .gpu_malloc::<u32>(MemoryKind::DeviceLocal, 4096, "scratch")
             .unwrap();

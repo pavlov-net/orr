@@ -110,7 +110,7 @@ impl Blur {
 
     fn put_root(&mut self, scene: Scene, motion_scale: f32) {
         self.root.as_mut_slice().unwrap()[0] = blur_scene::Root {
-            reference: self.reference_out.gpu,
+            reference: self.reference_out.gpu(),
             radiance: self.radiance_store,
             depth: self.depth_store,
             motion: self.motion_store,
@@ -138,14 +138,14 @@ impl Blur {
         let queue = gpu.queue(QueueKind::Render).unwrap();
         let mut list = queue.command_list().unwrap();
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
-        list.dispatch(&self.scene, self.root.gpu, groups(OUT));
+        list.dispatch(&self.scene, self.root.gpu(), groups(OUT));
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         let output = ViewOutput::default();
         let mut p = MotionBlurPass {
             rr_depth: self.depth,
             rr_motion: self.motion,
             extent: OUT,
-            view: self.constants.gpu,
+            view: self.constants.gpu(),
             shutter: SHUTTER,
             generated: 0,
             history_reset: false,
@@ -182,9 +182,9 @@ impl Blur {
         let queue = gpu.queue(QueueKind::Render).unwrap();
         let mut list = queue.command_list().unwrap();
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
-        list.dispatch(&self.reference, self.root.gpu, groups(OUT));
+        list.dispatch(&self.reference, self.root.gpu(), groups(OUT));
         wait(queue.submit(vec![list], &[]).unwrap());
-        read_buffer(self.reference_out.gpu, 4 * u64::from(OUT[0] * OUT[1]))
+        read_buffer(self.reference_out.gpu(), 4 * u64::from(OUT[0] * OUT[1]))
             .chunks_exact(4)
             .map(|c| [c[0], c[1], c[2], c[3]])
             .collect()
@@ -421,7 +421,7 @@ mod depth_of_field {
         fn put_root(&mut self, scene: Scene, dof: &DepthOfField) {
             let polygon = dof.blades >= 3 && dof.f_number > dof.round_at_f_number;
             self.root.as_mut_slice().unwrap()[0] = dof_scene::Root {
-                reference: self.reference_out.gpu,
+                reference: self.reference_out.gpu(),
                 radiance: self.chain.rr_output_store,
                 depth: self.depth_store,
                 motion: self.motion_store,
@@ -454,7 +454,7 @@ mod depth_of_field {
             let queue = gpu.queue(QueueKind::Render).unwrap();
             let mut list = queue.command_list().unwrap();
             list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
-            list.dispatch(&self.scene, self.root.gpu, groups(OUT));
+            list.dispatch(&self.scene, self.root.gpu(), groups(OUT));
             list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
             let mut output = ViewOutput::default();
             output.post.dof_path = path;
@@ -462,7 +462,7 @@ mod depth_of_field {
                 rr_depth: self.depth,
                 rr_motion: self.motion,
                 extent: OUT,
-                view: self.constants.gpu,
+                view: self.constants.gpu(),
                 sensor_width_mm: SENSOR_MM,
                 depth_of_field: dof,
                 history_reset: false,
@@ -507,9 +507,9 @@ mod depth_of_field {
             let queue = gpu.queue(QueueKind::Render).unwrap();
             let mut list = queue.command_list().unwrap();
             list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
-            list.dispatch(&self.reference, self.root.gpu, groups(OUT));
+            list.dispatch(&self.reference, self.root.gpu(), groups(OUT));
             wait(queue.submit(vec![list], &[]).unwrap());
-            read_buffer(self.reference_out.gpu, 4 * u64::from(OUT[0] * OUT[1]))
+            read_buffer(self.reference_out.gpu(), 4 * u64::from(OUT[0] * OUT[1]))
                 .chunks_exact(4)
                 .map(|c| [c[0], c[1], c[2], c[3]])
                 .collect()
@@ -1642,7 +1642,7 @@ mod lens_distortion {
             self.frame += 1;
             self.upload.as_mut_slice().unwrap().copy_from_slice(image);
             let mut c: ViewConstants = bytemuck::Zeroable::zeroed();
-            c.exposure = self.exposure.gpu;
+            c.exposure = self.exposure.gpu();
             c.exposure_slot = (self.frame % 2) as u32;
             c.extent = OUT;
             c.delta_time = 1.0 / 60.0;
@@ -1659,7 +1659,7 @@ mod lens_distortion {
             let mut list = queue.command_list().unwrap();
             list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
             let whole = TextureRegion::whole_mip(self.source.desc(), 0);
-            list.copy_to_texture(&self.source, &whole, self.upload.gpu.cast());
+            list.copy_to_texture(&self.source, &whole, self.upload.gpu().cast());
             list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
             let roots = self.output.roots(self.frame);
             self.kernels.exposure(
@@ -1668,8 +1668,8 @@ mod lens_distortion {
                 &ExposurePass {
                     source: self.source_index,
                     extent: OUT,
-                    view: self.constants.gpu,
-                    sky: self.sky.gpu,
+                    view: self.constants.gpu(),
+                    sky: self.sky.gpu(),
                     frame: self.frame,
                     output: &output,
                 },
@@ -1681,7 +1681,7 @@ mod lens_distortion {
                     source: self.source_index,
                     target: self.target_store,
                     extent: OUT,
-                    view: self.constants.gpu,
+                    view: self.constants.gpu(),
                     display: &self.display,
                     output: &output,
                     hook_source: None,

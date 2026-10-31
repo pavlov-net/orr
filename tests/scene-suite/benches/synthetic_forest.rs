@@ -954,17 +954,17 @@ fn record_trace(list: &mut CommandList<'_>, t: &mut Tracer, view: &RasterView) {
         scene: view.scene,
         view: view.view,
         gbuffer: view.gbuffer,
-        traced: t.traced.gpu,
+        traced: t.traced.gpu(),
         seen: GpuPtr::NULL,
         cones: GpuPtr::NULL,
         mode: 0,
         pad0: 0,
         pad1: 0,
     };
-    let n = t.traced.size / size_of::<trace::Traced>() as u64;
+    let n = t.traced.size() / size_of::<trace::Traced>() as u64;
     list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::ACCEL_STRUCT);
     list.begin_pass("trace", false);
-    list.dispatch(&t.pipeline, t.root.gpu, [n.div_ceil(64) as u32, 1, 1]);
+    list.dispatch(&t.pipeline, t.root.gpu(), [n.div_ceil(64) as u32, 1, 1]);
     list.end_pass();
 }
 

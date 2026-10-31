@@ -57,22 +57,47 @@ impl RangeAllocator {
     }
 }
 
-/// Memory loading jobs write into: mapped Upload memory, or DeviceLocal memory (`cpu` none)
-/// that a copy fills from staging.
+/// Memory loading jobs write into: mapped Upload memory, or DeviceLocal memory (no mapped
+/// address) that a copy fills from staging. Valid while the allocation it came from lives.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Block {
-    pub gpu: u64,
-    pub cpu: Option<usize>,
-    pub size: u64,
+    gpu: u64,
+    cpu: Option<usize>,
+    size: u64,
 }
 
 impl Block {
     pub(crate) fn of(a: &Allocation<u8>) -> Self {
         Self {
-            gpu: a.gpu.address().0,
-            cpu: a.cpu.map(|p| p.as_ptr() as usize),
-            size: a.size,
+            gpu: a.gpu().address().0,
+            cpu: a.mapped_ptr().map(|p| p.as_ptr() as usize),
+            size: a.size(),
         }
+    }
+
+    /// `size` bytes from `at` in this block.
+    pub(crate) fn sub(&self, at: u64, size: u64) -> Self {
+        assert!(at + size <= self.size, "sub-block outside its block");
+        Self {
+            gpu: self.gpu + at,
+            cpu: self.cpu.map(|p| p + at as usize),
+            size,
+        }
+    }
+
+    /// Device address of the first byte.
+    pub(crate) fn gpu(&self) -> u64 {
+        self.gpu
+    }
+
+    /// Mapped address of the first byte, for Upload blocks.
+    pub(crate) fn cpu(&self) -> Option<usize> {
+        self.cpu
+    }
+
+    /// Bytes.
+    pub(crate) fn size(&self) -> u64 {
+        self.size
     }
 }
 
@@ -147,12 +172,7 @@ impl Pool {
         let b = self.blocks[block].as_mut().expect("live block");
         b.slots += 1;
         let at = u64::from(first) * POOL_UNIT;
-        let whole = Block::of(&b.memory);
-        let memory = Block {
-            gpu: whole.gpu + at,
-            cpu: whole.cpu.map(|p| p + at as usize),
-            size: bytes,
-        };
+        let memory = Block::of(&b.memory).sub(at, bytes);
         let slot = PoolSlot {
             block: block as u32,
             first,
@@ -207,11 +227,11 @@ impl UploadWindow {
         let mut w = self.inner.lock().unwrap();
         loop {
             if let Some(b) = w.blocks.get(w.block) {
-                let base = b.gpu.address().0;
+                let base = b.gpu().address().0;
                 let at = (base + w.offset).next_multiple_of(align) - base;
-                if at + bytes <= b.size {
-                    // SAFETY: `at + bytes` lies inside the block's mapping.
-                    let cpu = unsafe { b.cpu.expect("upload is mapped").add(at as usize) };
+                if at + bytes <= b.size() {
+                    // SAFETY: `at + bytes <= b.size()`, checked above, keeps it in the mapping.
+                    let cpu = unsafe { b.mapped_ptr().expect("upload is mapped").add(at as usize) };
                     w.used += at + bytes - w.offset;
                     w.offset = at + bytes;
                     return Ok((GpuAddress(base + at), cpu));
@@ -240,12 +260,15 @@ impl UploadWindow {
     ) -> Result<(GpuPtr<T>, &mut [T])> {
         const { assert!(align_of::<T>() <= 16) };
         let (gpu, cpu) = self.alloc(device, size_of::<T>() as u64 * u64::from(count), 16)?;
-        // SAFETY: the window handed out that many exclusive, 16-byte aligned bytes of mapped
-        // memory, valid while `self` is borrowed; any bit pattern is a `T`.
+        let cpu = cpu.cast::<T>();
+        assert!(cpu.is_aligned(), "upload window slice is not aligned");
+        // SAFETY: the window handed out that many exclusive bytes of mapped memory, valid
+        // while `self` is borrowed and aligned for `T` (asserted above); any bit pattern is
+        // a `T`.
         Ok(unsafe {
             (
                 GpuPtr::from_address(gpu),
-                std::slice::from_raw_parts_mut(cpu.cast::<T>().as_ptr(), count as usize),
+                std::slice::from_raw_parts_mut(cpu.as_ptr(), count as usize),
             )
         })
     }
@@ -262,8 +285,10 @@ impl UploadWindow {
     /// value Vulkan allows.
     pub(crate) fn put_root<T: Pod>(&self, device: &Device, root: &T) -> Result<GpuPtr<T>> {
         let (gpu, cpu) = self.alloc(device, size_of::<T>() as u64, 256)?;
-        // SAFETY: room for one `T` at a 256-byte aligned address.
-        unsafe { cpu.cast::<T>().write(*root) };
+        let cpu = cpu.cast::<T>();
+        assert!(cpu.is_aligned(), "upload window root is not aligned");
+        // SAFETY: room for one `T`, aligned (asserted above).
+        unsafe { cpu.write(*root) };
         // SAFETY: the root was just written at `gpu`.
         Ok(unsafe { GpuPtr::from_address(gpu) })
     }

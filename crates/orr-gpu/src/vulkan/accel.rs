@@ -614,10 +614,10 @@ fn with_micromap_build<R>(
 
 /// An acceleration structure's range: 256-byte aligned and inside `block`.
 fn check_as_range(size: u64, block: &Allocation<u8>, offset: u64) -> Result<(), Error> {
-    if !offset.is_multiple_of(256) || offset + size > block.size {
+    if !offset.is_multiple_of(256) || offset + size > block.size() {
         return Err(Error::Invalid(format!(
             "{size} bytes at offset {offset} in a block of {}",
-            block.size
+            block.size()
         )));
     }
     Ok(())
@@ -665,7 +665,7 @@ impl Device {
             .filter(|_| shared.caps.omm)
             .ok_or_else(|| Error::Invalid("micromaps need Caps::omm".into()))?;
         check_as_range(size, block, offset)?;
-        let address = block.gpu.address().0 + offset;
+        let address = block.gpu().address().0 + offset;
         let info = vk::AccelerationStructureCreateInfo2KHR {
             address_range: address_range(GpuAddress(address), size),
             address_flags: ADDRESS_FLAGS,
@@ -700,7 +700,7 @@ pub(crate) fn build_empty_tlas(device: &Device) -> Result<EmptyTlas, Error> {
         kind: ClassicKind::Tlas,
         flags: RtasFlags::FAST_TRACE,
         geometry: ClassicGeometry::Instances {
-            records: instances.gpu.address(),
+            records: instances.gpu().address(),
             capacity: 1,
         },
     };
@@ -733,7 +733,7 @@ pub(crate) fn build_empty_tlas(device: &Device) -> Result<EmptyTlas, Error> {
         list.build_classic(&ClassicBuild {
             desc: &desc,
             dst: &tlas,
-            scratch: scratch.gpu.address(),
+            scratch: scratch.gpu().address(),
         });
         list.end_pass();
         // SAFETY: recording; the TLAS was built and made visible above.

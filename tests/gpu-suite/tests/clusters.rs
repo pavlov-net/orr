@@ -41,8 +41,8 @@ fn two_instances(front_z: f32) -> [ClassicInstance; 2] {
 fn trace_base(b: &mut Builder, clas_at: Option<GpuAddress>, blas_at: Option<GpuAddress>) {
     let clusters = base_clusters();
     let clas = b.build_clas(&clusters, data_flags(), 0, clas_at, None);
-    let blas = b.build_blas(clas.addrs.gpu, &[vec![0, 1, 2, 3], vec![4]], blas_at);
-    let tlas = b.build_tlas(blas.addrs.gpu, &two_instances(FRONT_Z));
+    let blas = b.build_blas(clas.addrs.gpu(), &[vec![0, 1, 2, 3], vec![4]], blas_at);
+    let tlas = b.build_tlas(blas.addrs.gpu(), &two_instances(FRONT_Z));
     let out = b.trace(tlas, 0);
     let out_fno = b.trace(tlas, MODE_FORCE_NON_OPAQUE);
     b.flush();
@@ -68,7 +68,7 @@ fn clas_mixed() {
     let clusters = base_clusters();
     let mut b = Builder::new();
     let clas = b.build_clas(&clusters[..4], data_flags(), 0, None, None);
-    let blas = b.build_blas(clas.addrs.gpu, &[vec![0, 1, 2, 3]], None);
+    let blas = b.build_blas(clas.addrs.gpu(), &[vec![0, 1, 2, 3]], None);
 
     let back = &clusters[4];
     let desc = ClassicDesc {
@@ -96,7 +96,7 @@ fn clas_mixed() {
         dst: &full,
         scratch: scratch.address(),
     });
-    b.list().classic_compacted_size(&full, compacted.gpu);
+    b.list().classic_compacted_size(&full, compacted.gpu());
     b.list()
         .barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
     b.flush();
@@ -117,7 +117,7 @@ fn clas_mixed() {
         &[blas.addrs.as_slice().unwrap()[0], small.address().0],
         "blas table",
     );
-    let tlas = b.build_tlas(table.gpu, &two_instances(FRONT_Z));
+    let tlas = b.build_tlas(table.gpu(), &two_instances(FRONT_Z));
     let out = b.trace(tlas, 0);
     let out_fno = b.trace(tlas, MODE_FORCE_NON_OPAQUE);
     b.flush();
@@ -144,7 +144,7 @@ fn clas_ptlas() {
     let mut b = Builder::new();
     let clas = b.build_clas(&clusters, data_flags(), 0, None, None);
     let blas = b.build_blas(
-        clas.addrs.gpu,
+        clas.addrs.gpu(),
         &[vec![0, 1, 2, 3], vec![4], vec![0, 2]],
         None,
     );
@@ -160,7 +160,7 @@ fn clas_ptlas() {
         ],
         ..Default::default()
     };
-    b.build_ptlas(limits, blas.addrs.gpu, &ops, dst, scratch, false);
+    b.build_ptlas(limits, blas.addrs.gpu(), &ops, dst, scratch, false);
     let out = b.trace(tlas, 0);
     b.flush();
     let insts = front_back(&clusters, [0.0, 0.0, FRONT_Z]);
@@ -186,7 +186,7 @@ fn clas_ptlas() {
         }],
         ..Default::default()
     };
-    b.build_ptlas(limits, blas.addrs.gpu, &ops, dst, scratch, true);
+    b.build_ptlas(limits, blas.addrs.gpu(), &ops, dst, scratch, true);
     let out = b.trace(tlas, 0);
     b.flush();
     let subset = [&clusters[0], &clusters[2]];
@@ -203,7 +203,7 @@ fn clas_ptlas() {
         }],
         ..Default::default()
     };
-    b.build_ptlas(limits, blas.addrs.gpu, &ops, dst, scratch, true);
+    b.build_ptlas(limits, blas.addrs.gpu(), &ops, dst, scratch, true);
     let out = b.trace(tlas, 0);
     b.flush();
     let insts = [
@@ -235,8 +235,8 @@ fn clas_alpha() {
     let clusters = vec![mixed, nodup, back_cluster()];
     let mut b = Builder::new();
     let clas = b.build_clas(&clusters, data_flags(), 0, None, None);
-    let blas = b.build_blas(clas.addrs.gpu, &[vec![0, 1], vec![2]], None);
-    let tlas = b.build_tlas(blas.addrs.gpu, &two_instances(0.0));
+    let blas = b.build_blas(clas.addrs.gpu(), &[vec![0, 1], vec![2]], None);
+    let tlas = b.build_tlas(blas.addrs.gpu(), &two_instances(0.0));
     let out = b.trace(tlas, MODE_ALPHA);
     let out_fno = b.trace(tlas, MODE_ALPHA | MODE_FORCE_NON_OPAQUE);
     b.flush();
@@ -296,8 +296,8 @@ fn clas_omm() {
     let clusters = vec![front, back_cluster()];
     let flags = data_flags() | RtasFlags::ALLOW_OMM;
     let clas = b.build_clas(&clusters, flags, micromap.address().0, None, None);
-    let blas = b.build_blas(clas.addrs.gpu, &[vec![0], vec![1]], None);
-    let tlas = b.build_tlas(blas.addrs.gpu, &two_instances(0.0));
+    let blas = b.build_blas(clas.addrs.gpu(), &[vec![0], vec![1]], None);
+    let tlas = b.build_tlas(blas.addrs.gpu(), &two_instances(0.0));
     let out = b.trace(tlas, MODE_ALPHA);
     let out2 = b.trace(tlas, MODE_ALPHA | MODE_OMM_2_STATE);
     b.flush();
@@ -372,7 +372,7 @@ fn clas_template() {
     // CLAS addresses: the back cluster, then the two instantiations.
     let table = readback::<u64>(3, "clas table");
     let mut root = zeroed_root();
-    root.table = tmpl.addrs.gpu;
+    root.table = tmpl.addrs.gpu();
     root.instantiate = b.upload(&[
         instantiate(1, v3.address(), 100, 5),
         instantiate(0, v1.address(), 200, 0),
@@ -384,10 +384,10 @@ fn clas_template() {
         data_flags(),
         &templates,
     );
-    let inst = b.cluster_op(&desc, root, 2, None, Some(table.gpu.offset(1)));
-    b.build_clas(&back, data_flags(), 0, None, Some(table.gpu));
-    let blas = b.build_blas(table.gpu, &[vec![1, 2], vec![0]], None);
-    let tlas = b.build_tlas(blas.addrs.gpu, &two_instances(0.0));
+    let inst = b.cluster_op(&desc, root, 2, None, Some(table.gpu().offset(1)));
+    b.build_clas(&back, data_flags(), 0, None, Some(table.gpu()));
+    let blas = b.build_blas(table.gpu(), &[vec![1, 2], vec![0]], None);
+    let tlas = b.build_tlas(blas.addrs.gpu(), &two_instances(0.0));
     let out = b.trace(tlas, 0);
     b.flush();
     let insts = [
@@ -500,21 +500,21 @@ fn clas_pool_sizes_and_moves() {
     used.as_mut_slice().unwrap()[0] = 0;
     let moved = readback::<u64>(u64::from(n), "pool addresses");
     let mut root = zeroed_root();
-    root.sizes = clas.sizes.gpu;
-    root.pool_used = used.gpu;
+    root.sizes = clas.sizes.gpu();
+    root.pool_used = used.gpu();
     root.pool = pool.address().0;
-    root.refs = moved.gpu;
+    root.refs = moved.gpu();
     root.n = n;
     root.op = OP_POOL;
     b.args(root);
     let mut root = zeroed_root();
-    root.table = clas.addrs.gpu;
+    root.table = clas.addrs.gpu();
     root.moves = b.upload(&(0..u64::from(n)).map(move_record).collect::<Vec<_>>());
     root.op = OP_MOVE;
     let desc = move_desc(n, clas.reserved.result_max);
-    b.cluster_op(&desc, root, n, None, Some(moved.gpu));
-    let blas = b.build_blas(moved.gpu, &[vec![0, 1, 2, 3], vec![4]], None);
-    let tlas = b.build_tlas(blas.addrs.gpu, &two_instances(FRONT_Z));
+    b.cluster_op(&desc, root, n, None, Some(moved.gpu()));
+    let blas = b.build_blas(moved.gpu(), &[vec![0, 1, 2, 3], vec![4]], None);
+    let tlas = b.build_tlas(blas.addrs.gpu(), &two_instances(FRONT_Z));
     let out = b.trace(tlas, 0);
     b.flush();
 
@@ -549,7 +549,7 @@ fn ptlas_every_frame_two_in_flight() {
     let clusters = base_clusters();
     let mut b = Builder::new();
     let clas = b.build_clas(&clusters, data_flags(), 0, None, None);
-    let blas = b.build_blas(clas.addrs.gpu, &[vec![0, 1, 2, 3], vec![4]], None);
+    let blas = b.build_blas(clas.addrs.gpu(), &[vec![0, 1, 2, 3], vec![4]], None);
     b.flush();
     let limits = ptlas_limits(2);
     let (dst, scratch) = b.ptlas_blocks(limits);
@@ -574,8 +574,8 @@ fn ptlas_every_frame_two_in_flight() {
             ],
             ..Default::default()
         };
-        b.build_ptlas(limits, blas.addrs.gpu, &ops, dst, scratch, f > 0);
-        b.trace_into(Tlas(dst.0), 0, slots[f % 2].gpu);
+        b.build_ptlas(limits, blas.addrs.gpu(), &ops, dst, scratch, f > 0);
+        b.trace_into(Tlas(dst.0), 0, slots[f % 2].gpu());
         points.push(b.submit());
     }
     for (f, &point) in points.iter().enumerate().skip(FRAMES - 2) {
@@ -776,7 +776,7 @@ fn lss_beside_clusters() {
     let segs = segments();
     let mut b = Builder::new();
     let clas = b.build_clas(&clusters[..4], data_flags(), 0, None, None);
-    let blas = b.build_blas(clas.addrs.gpu, &[vec![0, 1, 2, 3]], None);
+    let blas = b.build_blas(clas.addrs.gpu(), &[vec![0, 1, 2, 3]], None);
     let list_blas = lss_blas(&mut b, &segs, LssIndexing::List);
     let successive_blas = lss_blas(&mut b, &segs, LssIndexing::Successive);
     b.flush();

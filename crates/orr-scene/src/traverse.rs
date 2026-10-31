@@ -220,7 +220,7 @@ impl Cuts {
         let mut blocks = Vec::new();
         let mut block = |bytes: u64, name: &str| -> Result<GpuPtr<u8>> {
             let a = device.gpu_malloc::<u8>(dl, bytes.max(16), name)?;
-            let gpu = a.gpu;
+            let gpu = a.gpu();
             blocks.push(a);
             Ok(gpu)
         };
@@ -304,7 +304,7 @@ impl Cuts {
     }
 
     pub(crate) fn gpu(&self) -> GpuPtr<CutGpu> {
-        self.record.gpu
+        self.record.gpu()
     }
 
     fn blas_desc(&self, max_clas: u32) -> RtasOpDesc {
@@ -363,7 +363,7 @@ impl Cuts {
         let (focus_cell, focus_offset) = f.focus.unwrap_or(([0; 4], [0.0; 4]));
         let base = TraverseRoot {
             scene: f.scene,
-            cut: self.record.gpu,
+            cut: self.record.gpu(),
             focus_cell,
             focus_offset,
             raster_pixels: f.raster_pixels,
@@ -436,10 +436,10 @@ impl Cuts {
                 &RtasIo {
                     args: self.records.address(),
                     count: self.counters.offset(CUT_BUILDS),
-                    dst_implicit: arena.block.gpu.address(),
+                    dst_implicit: arena.block.gpu().address(),
                     dst_addresses: self.job_blas,
                     dst_sizes: self.job_sizes,
-                    scratch: scratch.gpu.address(),
+                    scratch: scratch.gpu().address(),
                     src: GpuAddress(0),
                 },
             );
@@ -447,7 +447,7 @@ impl Cuts {
         } else {
             step(list);
         }
-        let at = self.readback.gpu.offset((READBACK_WORDS * f.slot) as u64);
+        let at = self.readback.gpu().offset((READBACK_WORDS * f.slot) as u64);
         list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
         list.copy(at.cast(), self.counters.cast(), 4 * COUNTERS as u64);
         list.copy(

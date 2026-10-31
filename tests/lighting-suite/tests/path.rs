@@ -326,8 +326,8 @@ fn rays_leave_surfaces_from_the_origin_to_30_km() {
     let out = readback::<[f32; 4]>(cases.len() as u64, "origins");
     let root = upload(
         &[origins::Root {
-            cases: input.gpu,
-            origins: out.gpu,
+            cases: input.gpu(),
+            origins: out.gpu(),
             count: cases.len() as u32,
             _pad0: 0,
             _pad1: 0,
@@ -335,7 +335,7 @@ fn rays_leave_surfaces_from_the_origin_to_30_km() {
         "origins root",
     );
     let mut list = render().command_list().unwrap();
-    list.dispatch(&module, root.gpu, [cases.len().div_ceil(64) as u32, 1, 1]);
+    list.dispatch(&module, root.gpu(), [cases.len().div_ceil(64) as u32, 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     run(list);
     for (c, o) in cases.iter().zip(out.as_slice().unwrap()) {

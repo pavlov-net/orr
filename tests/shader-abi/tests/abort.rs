@@ -17,7 +17,7 @@ fn null_tlas_aborts_with_asserts() {
     let out = readback::<u32>(32, "null tlas out");
     let root = upload(
         &[null_tlas::Root {
-            out: out.gpu,
+            out: out.gpu(),
             scene: Tlas(0),
         }],
         "null tlas root",
@@ -25,7 +25,7 @@ fn null_tlas_aborts_with_asserts() {
     let p = pipeline(&null_tlas::MODULE, "main");
     let queue = render();
     let mut list = queue.command_list().unwrap();
-    list.dispatch(&p, root.gpu, [1, 1, 1]);
+    list.dispatch(&p, root.gpu(), [1, 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     let result = queue
         .submit(vec![list], &[])

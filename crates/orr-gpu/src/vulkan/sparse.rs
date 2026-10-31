@@ -83,12 +83,12 @@ fn bound_memory(
     };
     if block.kind() != MemoryKind::DeviceLocal
         || !offset.is_multiple_of(align)
-        || offset + bytes > block.size
+        || offset + bytes > block.size()
     {
         return Err(Error::Invalid(format!(
             "{bytes} bytes at offset {offset} (alignment {align}) of a {:?} block of {} bytes",
             block.kind(),
-            block.size
+            block.size()
         )));
     }
     Ok(block.raw().memory_at(offset))

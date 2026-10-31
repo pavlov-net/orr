@@ -407,13 +407,13 @@ impl ViewTargets {
         RasterGpu {
             gbuffer: self.gbuffer(),
             work: t.work.gpu(),
-            args: self.args.gpu,
+            args: self.args.gpu(),
             opaque: t.opaque.gpu(),
             alpha: t.alpha.gpu(),
             software: t.software.gpu(),
             particles: t.particles.gpu(),
             counts: self.counts(),
-            slot_visibility: self.slot_visibility.gpu,
+            slot_visibility: self.slot_visibility.gpu(),
             bin_args: t.bin_args.gpu(),
             bin_tiles: t.bin_tiles.gpu(),
             depth: t.depth_values.gpu(),
@@ -445,14 +445,14 @@ impl ViewTargets {
     /// Mesh args of the particle draws, and the draw count beside them.
     pub(crate) fn particle_draws(&self) -> (GpuPtr<MeshArgs>, GpuPtr<u32>) {
         (
-            self.args.gpu.offset(ARGS_PARTICLES).cast(),
+            self.args.gpu().offset(ARGS_PARTICLES).cast(),
             self.counts().offset(COUNT_DRAWS),
         )
     }
 
     /// `RasterGpu.counts` ([`crate::RasterView::counts`]).
     pub(crate) fn counts(&self) -> GpuPtr<u32> {
-        self.args.gpu.offset(ARGS)
+        self.args.gpu().offset(ARGS)
     }
 
     /// `bin`'s resolve dispatch args.
@@ -500,7 +500,7 @@ pub(crate) fn record(
     let s = targets.sizes;
     let pixels = s.extent[0] * s.extent[1];
     let [tx, ty] = tiles(s.extent);
-    let args = targets.args.gpu;
+    let args = targets.args.gpu();
     let grid = |at: u64| args.offset(at).cast::<DispatchArgs>();
     let mesh_args = |at: u64| args.offset(at).cast::<MeshArgs>();
     let draws = targets.counts().offset(COUNT_DRAWS);

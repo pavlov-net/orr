@@ -147,10 +147,10 @@ impl DofKernels {
         };
         Root {
             view: pass.view,
-            lens: targets.lens.gpu,
-            diaphragm: targets.diaphragm.gpu,
-            sprites: targets.sprites.gpu,
-            scatter: targets.scatter.gpu,
+            lens: targets.lens.gpu(),
+            diaphragm: targets.diaphragm.gpu(),
+            sprites: targets.sprites.gpu(),
+            scatter: targets.scatter.gpu(),
             rr_depth: pass.rr_depth,
             rr_motion: pass.rr_motion,
             source,
@@ -245,8 +245,8 @@ impl DofKernels {
             colors: &[keep(targets.chain.texture()), keep(targets.layer.texture())],
             depth: None,
         });
-        let args = targets.scatter.gpu.offset(1).cast::<MeshArgs>();
-        let count = targets.scatter.gpu.offset(4);
+        let args = targets.scatter.gpu().offset(1).cast::<MeshArgs>();
+        let count = targets.scatter.gpu().offset(4);
         list.draw_mesh_tasks_indirect_count(&self.sprites, root, args, count, 1);
         list.end_rendering();
         list.barrier(Stages::COLOR_OUT, Stages::COMPUTE, Hazards::empty());
@@ -387,10 +387,10 @@ impl DofTargets {
 
     pub(crate) fn bytes(&self) -> u64 {
         self.images().map(Image::bytes).sum::<u64>()
-            + self.lens.size
-            + self.diaphragm.size
-            + self.sprites.size
-            + self.scatter.size
+            + self.lens.size()
+            + self.diaphragm.size()
+            + self.sprites.size()
+            + self.scatter.size()
     }
 
     pub(crate) fn guide_images(&self) -> Option<DofGuideImages<'_>> {

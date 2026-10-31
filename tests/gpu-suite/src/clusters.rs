@@ -551,7 +551,7 @@ impl Builder {
 
     /// Keeps `a` alive with the builder; returns its address.
     pub fn keep<T: 'static>(&mut self, a: Allocation<T>) -> GpuPtr<T> {
-        let gpu = a.gpu;
+        let gpu = a.gpu();
         self.keep.push(Box::new(a));
         gpu
     }
@@ -640,7 +640,7 @@ impl Builder {
         let sizes = d
             .gpu_malloc::<u32>(MemoryKind::Readback, u64::from(n), "sizes")
             .unwrap();
-        let dst_addresses = addrs.unwrap_or(out_addrs.gpu);
+        let dst_addresses = addrs.unwrap_or(out_addrs.gpu());
         self.list().rtas_execute(
             desc,
             &RtasIo {
@@ -648,7 +648,7 @@ impl Builder {
                 count,
                 dst_implicit: implicit,
                 dst_addresses,
-                dst_sizes: sizes.gpu,
+                dst_sizes: sizes.gpu(),
                 scratch: scratch.address(),
                 src: GpuAddress(0),
             },
@@ -808,7 +808,7 @@ impl Builder {
     /// Traces every ray of the unit square into a fresh readback buffer.
     pub fn trace(&mut self, tlas: Tlas, mode: u32) -> Allocation<u32> {
         let out = readback::<u32>(u64::from(W * H) * REC as u64, "rays");
-        self.trace_into(tlas, mode, out.gpu);
+        self.trace_into(tlas, mode, out.gpu());
         out
     }
 
@@ -821,7 +821,7 @@ impl Builder {
         mode: u32,
     ) -> Allocation<u32> {
         let out = readback::<u32>(u64::from(W * H) * REC as u64, "rays");
-        let root = self.trace_root(tlas, mode, out.gpu);
+        let root = self.trace_root(tlas, mode, out.gpu());
         let list = self.list.as_mut().unwrap();
         list.barrier(Stages::ALL, Stages::RAY, Hazards::ACCEL_STRUCT);
         list.dispatch_rays(p, root, [W, H, 1]);

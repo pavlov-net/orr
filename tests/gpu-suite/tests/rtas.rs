@@ -230,28 +230,28 @@ fn stores_match_vulkan_structs() {
     );
     let root = upload(
         &[rtas_store::Root {
-            clas: inputs.0.gpu,
-            templates: inputs.1.gpu,
-            instantiate: inputs.2.gpu,
-            blas: inputs.3.gpu,
-            moves: inputs.4.gpu,
-            writes: inputs.5.gpu,
-            updates: inputs.6.gpu,
-            translates: inputs.7.gpu,
-            commands: inputs.8.gpu,
-            classic: inputs.9.gpu,
-            cells: inputs.10.gpu,
-            translations: translations.gpu,
-            out_clas: o_clas.gpu.address().0,
-            out_templates: o_templates.gpu.address().0,
-            out_instantiate: o_inst.gpu.address().0,
-            out_blas: o_blas.gpu.address().0,
-            out_moves: o_moves.gpu.address().0,
-            out_writes: o_writes.gpu.address().0,
-            out_updates: o_updates.gpu.address().0,
-            out_translates: o_translates.gpu.address().0,
-            out_commands: o_commands.gpu.address().0,
-            out_classic: o_classic.gpu.address().0,
+            clas: inputs.0.gpu(),
+            templates: inputs.1.gpu(),
+            instantiate: inputs.2.gpu(),
+            blas: inputs.3.gpu(),
+            moves: inputs.4.gpu(),
+            writes: inputs.5.gpu(),
+            updates: inputs.6.gpu(),
+            translates: inputs.7.gpu(),
+            commands: inputs.8.gpu(),
+            classic: inputs.9.gpu(),
+            cells: inputs.10.gpu(),
+            translations: translations.gpu(),
+            out_clas: o_clas.gpu().address().0,
+            out_templates: o_templates.gpu().address().0,
+            out_instantiate: o_inst.gpu().address().0,
+            out_blas: o_blas.gpu().address().0,
+            out_moves: o_moves.gpu().address().0,
+            out_writes: o_writes.gpu().address().0,
+            out_updates: o_updates.gpu().address().0,
+            out_translates: o_translates.gpu().address().0,
+            out_commands: o_commands.gpu().address().0,
+            out_classic: o_classic.gpu().address().0,
             records: RECORDS as u32,
             cell_count: cells.len() as u32,
             pad: 0,
@@ -260,7 +260,7 @@ fn stores_match_vulkan_structs() {
     );
     let p = pipeline(&rtas_store::MODULE, "main");
     let mut list = render().command_list().unwrap();
-    list.dispatch(&p, root.gpu, [1, 1, 1]);
+    list.dispatch(&p, root.gpu(), [1, 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     run(list);
 

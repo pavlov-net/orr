@@ -557,7 +557,11 @@ impl Scenes {
         GpuPtr<crate::MaterialGpu>,
     ) {
         let m = &self.core.mounts;
-        (m.models.gpu, m.meshes.gpu, self.core.materials.table.gpu)
+        (
+            m.models.gpu(),
+            m.meshes.gpu(),
+            self.core.materials.table.gpu(),
+        )
     }
 
     pub fn device(&self) -> &Device {
@@ -604,7 +608,7 @@ impl Scenes {
             self.device
                 .gpu_malloc::<ExposureState>(MemoryKind::DeviceLocal, 2, "exposure")?;
         // Both slots start with pre-exposure 1 and `initialized` 0.
-        let base = exposure.gpu.address().0;
+        let base = exposure.gpu().address().0;
         let words = (size_of::<ExposureState>() / 4) as u32;
         let one = 1.0f32.to_bits();
         self.core
@@ -642,8 +646,8 @@ impl Scenes {
             return;
         };
         // Its slots' initialisation may not have been applied yet.
-        let base = h.exposure.gpu.address().0;
-        let end = base + h.exposure.size;
+        let base = h.exposure.gpu().address().0;
+        let end = base + h.exposure.size();
         self.core
             .global
             .get_mut()
@@ -950,7 +954,7 @@ impl<'a> Frame<'a> {
             let cpu = &mut *scene.cpu.lock().unwrap();
             records.append(&mut cpu.records);
             masks.extend(std::mem::take(&mut cpu.masks));
-            let counts = scene.tables.producer_counts.gpu;
+            let counts = scene.tables.producer_counts.gpu();
             for (i, p) in cpu.producers.iter().enumerate() {
                 if p.as_ref()
                     .is_some_and(|p| p.update == ProducerUpdate::EveryFrame)
@@ -964,7 +968,7 @@ impl<'a> Frame<'a> {
                 && needs_rebase(cpu.origin_cell, focus, core.cell_log2)
             {
                 cpu.origin_cell = origin_for(focus, core.cell_log2);
-                rebased.push((scene.tables.root.gpu, scene.desc.light_capacity));
+                rebased.push((scene.tables.root.gpu(), scene.desc.light_capacity));
                 rebase = true;
             }
             let producers = cpu.producers.iter().any(Option::is_some);
@@ -998,7 +1002,11 @@ impl<'a> Frame<'a> {
                 match g.writer {
                     GroupWriter::Cpu => {
                         if g.written && !fresh {
-                            copies.push((g.buffers[1].gpu, g.buffers[0].gpu, g.buffers[0].size));
+                            copies.push((
+                                g.buffers[1].gpu(),
+                                g.buffers[0].gpu(),
+                                g.buffers[0].size(),
+                            ));
                         }
                         g.previous_is_current = !g.written || fresh;
                     }
@@ -1012,31 +1020,31 @@ impl<'a> Frame<'a> {
                 let after = g.record();
                 if bytemuck::bytes_of(&before) != bytemuck::bytes_of(&after) {
                     let src = window.put(device, &after)?;
-                    let dst = scene.tables.groups.gpu.offset(index as u64);
+                    let dst = scene.tables.groups.gpu().offset(index as u64);
                     records.push(Record::values(core.next_seq(), dst, src, 1));
                 }
             }
             let t = &scene.tables;
             let root = SceneRoot {
-                instances: t.instances.gpu,
-                slot_state: t.slot_state.gpu,
-                groups: t.groups.gpu,
-                models: core.mounts.models.gpu,
-                meshes: core.mounts.meshes.gpu,
-                materials: core.materials.table.gpu,
-                clusters: core.mounts.clusters.gpu,
-                material_sets: t.material_sets.gpu.cast(),
-                lights: t.lights.gpu,
-                emissive: t.emissive.gpu,
-                producers: t.producers.gpu,
-                batches: t.batches.gpu,
-                producer_state: t.producer_state.gpu,
-                sky_stats: t.sky_stats.gpu,
+                instances: t.instances.gpu(),
+                slot_state: t.slot_state.gpu(),
+                groups: t.groups.gpu(),
+                models: core.mounts.models.gpu(),
+                meshes: core.mounts.meshes.gpu(),
+                materials: core.materials.table.gpu(),
+                clusters: core.mounts.clusters.gpu(),
+                material_sets: t.material_sets.gpu().cast(),
+                lights: t.lights.gpu(),
+                emissive: t.emissive.gpu(),
+                producers: t.producers.gpu(),
+                batches: t.batches.gpu(),
+                producer_state: t.producer_state.gpu(),
+                sky_stats: t.sky_stats.gpu(),
                 environment: cpu.environment,
                 medium: cpu.medium,
                 surface_data: cpu.surface_data,
                 tlas: tlas.unwrap_or_else(|| device.empty_tlas()),
-                part_slots: cpu.ptlas.part_slots.gpu,
+                part_slots: cpu.ptlas.part_slots.gpu(),
                 origin_cell: cpu.origin_cell.extend(core.cell_log2 as i32).to_array(),
                 delta_time: self.time.delta,
                 frame_index: self.id as u32,
@@ -1051,18 +1059,18 @@ impl<'a> Frame<'a> {
                 part_capacity: scene.desc.part_capacity,
                 producer_base: scene.desc.instance_capacity + scene.desc.part_capacity,
                 cut,
-                skinned: t.skinned.gpu,
-                skin_state: t.skin_state.gpu,
+                skinned: t.skinned.gpu(),
+                skin_state: t.skin_state.gpu(),
                 skin_work: skin_work.unwrap_or(GpuPtr::NULL).cast(),
                 skinned_capacity: scene.desc.skinned_capacity,
                 _pad: 0,
             };
             let src = window.put(device, &root)?;
-            records.push(Record::values(core.next_seq(), t.root.gpu, src, 1));
+            records.push(Record::values(core.next_seq(), t.root.gpu(), src, 1));
             if tlas.is_some() {
                 traced.push((id, rebase));
             }
-            roots.push((id, t.root.gpu, t.batches.gpu, cpu.focus, scene.desc));
+            roots.push((id, t.root.gpu(), t.batches.gpu(), cpu.focus, scene.desc));
         }
 
         if !masks.is_empty() {
@@ -1225,14 +1233,14 @@ impl<'a> Frame<'a> {
                 .map(|s| s.cpu.lock().unwrap().ptlas.scratch_bytes(device))
                 .max()
                 .unwrap_or(0);
-            if scratch.as_ref().is_none_or(|a| a.size < need) {
+            if scratch.as_ref().is_none_or(|a| a.size() < need) {
                 *scratch = Some(device.gpu_malloc::<u8>(
                     MemoryKind::DeviceLocal,
                     need.max(256),
                     "PTLAS scratch",
                 )?);
             }
-            let scratch = scratch.as_ref().expect("made above").gpu.address();
+            let scratch = scratch.as_ref().expect("made above").gpu().address();
             for &(id, rebased) in &traced {
                 let scene = core.scene(id)?;
                 let cpu = &mut *scene.cpu.lock().unwrap();
@@ -1244,7 +1252,7 @@ impl<'a> Frame<'a> {
                     None => ([0; 4], [0.0; 4]),
                 };
                 let inputs = FrameInputs {
-                    scene: scene.tables.root.gpu,
+                    scene: scene.tables.root.gpu(),
                     focus_cell,
                     focus_offset,
                     origin_cell: cpu.origin_cell,
@@ -1374,8 +1382,8 @@ impl<'a> Frame<'a> {
             let cpu = scene.cpu.lock().unwrap();
             (cpu.origin_cell, cpu.focus.map_or(view.position, |f| f.0))
         };
-        let root = scene.tables.root.gpu;
-        let sky_stats = scene.tables.sky_stats.gpu;
+        let root = scene.tables.root.gpu();
+        let sky_stats = scene.tables.sky_stats.gpu();
         let focus = WorldPos::new(focus, core.cell_log2)
             .relative_to(
                 WorldPos {
@@ -1665,7 +1673,7 @@ fn record_producers(
                 .filter_map(|(i, p)| p.as_ref().map(|p| (i, p)))
                 .filter(|(_, p)| p.builds())
                 .map(|(i, producer)| Job {
-                    scene: scene.tables.root.gpu,
+                    scene: scene.tables.root.gpu(),
                     entry: i as u32,
                     producer,
                 })
@@ -1674,11 +1682,11 @@ fn record_producers(
     if !jobs.is_empty() {
         let need = producer::scratch_bytes(device, &jobs).max(256);
         let mut held = core.producer_scratch.lock().unwrap();
-        if held.as_ref().is_none_or(|a| a.size < need) {
+        if held.as_ref().is_none_or(|a| a.size() < need) {
             *held =
                 Some(device.gpu_malloc::<u8>(MemoryKind::DeviceLocal, need, "producer scratch")?);
         }
-        let scratch = held.as_ref().expect("made above").gpu.address();
+        let scratch = held.as_ref().expect("made above").gpu().address();
         producer::record(
             device,
             window,
@@ -1715,8 +1723,8 @@ fn record_producers(
         cpu.producer_readback.as_mut().expect("made above").record(
             list,
             slot,
-            t.producer_counts.gpu,
-            t.producer_state.gpu,
+            t.producer_counts.gpu(),
+            t.producer_state.gpu(),
             set,
         );
     }

@@ -166,7 +166,7 @@ pub(crate) fn run(options: &Options) -> Capture {
         roots.as_mut_slice().unwrap()[slot] = basics::Root {
             clip_from_object: rows(projection * view * model),
             world_from_object: rows(model),
-            vertices: vertices.gpu,
+            vertices: vertices.gpu(),
             texture,
             sampler,
             paint_target,
@@ -174,7 +174,7 @@ pub(crate) fn run(options: &Options) -> Capture {
             size: PAINT,
             pad: 0,
         };
-        let root = roots.gpu.offset(slot as u64);
+        let root = roots.gpu().offset(slot as u64);
 
         let mut list = queue.command_list().unwrap();
         if frame == 0 {
@@ -217,7 +217,7 @@ pub(crate) fn run(options: &Options) -> Capture {
         if frame + 1 == frames {
             list.barrier(Stages::COLOR_OUT, Stages::TRANSFER, Hazards::empty());
             list.copy_from_texture(
-                pixels.gpu.cast(),
+                pixels.gpu().cast(),
                 &color,
                 &TextureRegion::whole_mip(&color_desc, 0),
             );

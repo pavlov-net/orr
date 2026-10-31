@@ -386,15 +386,15 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         let groups = [extent[0].div_ceil(8), extent[1].div_ceil(8), 1];
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::ACCEL_STRUCT);
         list.begin_pass("shade", false);
-        list.dispatch(shade, roots.gpu.offset(slot), groups);
+        list.dispatch(shade, roots.gpu().offset(slot), groups);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        list.dispatch(tint, tint_roots.gpu.offset(slot), groups);
+        list.dispatch(tint, tint_roots.gpu().offset(slot), groups);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        list.dispatch(water, water_roots.gpu.offset(slot), groups);
+        list.dispatch(water, water_roots.gpu().offset(slot), groups);
         list.end_pass();
         if let Some(out) = readback.as_ref().filter(|_| final_frame) {
             capture_root.as_mut_slice().expect("capture root")[0] = capture::Root {
-                pixels: out.gpu,
+                pixels: out.gpu(),
                 source: target.sampled,
                 width: extent[0],
                 height: extent[1],
@@ -402,7 +402,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                 pad1: 0,
             };
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-            list.dispatch(encode, capture_root.gpu, groups);
+            list.dispatch(encode, capture_root.gpu(), groups);
             list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
         }
         list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());

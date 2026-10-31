@@ -856,7 +856,7 @@ impl Roots {
         self.used = (at + bytes.len() as u64).next_multiple_of(256);
         assert!(self.used <= ROOT_BYTES, "bed frame roots overflow");
         self.memory.as_mut_slice().unwrap()[at as usize..][..bytes.len()].copy_from_slice(bytes);
-        self.memory.gpu.offset(at).cast()
+        self.memory.gpu().offset(at).cast()
     }
 }
 
@@ -1050,7 +1050,7 @@ impl Bed {
             w.set_light(LightId(i as u32), Some(l)).unwrap();
         }
         if let Some((_, data)) = &environment {
-            w.set_environment(data.gpu.address());
+            w.set_environment(data.gpu().address());
         }
         if let Some((at, pixels_per_radian)) = spec.focus {
             w.set_focus(at.as_dvec3(), pixels_per_radian);
@@ -1210,7 +1210,7 @@ impl Bed {
                 specular_motion: index[3],
                 depth: index[4],
                 motion: index[5],
-                out: out.gpu,
+                out: out.gpu(),
                 width: EXTENT[0],
                 count: PIXELS as u32,
                 _pad0: 0,
@@ -1218,7 +1218,7 @@ impl Bed {
             "guide read root",
         );
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-        list.dispatch(&read, root.gpu, [PIXELS.div_ceil(64) as u32, 1, 1]);
+        list.dispatch(&read, root.gpu(), [PIXELS.div_ceil(64) as u32, 1, 1]);
         crate::finish(list);
         for slot in slots {
             d.free_image_slot_after_submitted(slot);
@@ -1312,7 +1312,7 @@ impl Bed {
             Hazards::empty(),
         );
         let root = self.roots.put(&accumulate::Root {
-            sum: self.sum.gpu,
+            sum: self.sum.gpu(),
             radiance: self.target.radiance_index(),
             width: EXTENT[0],
             count: PIXELS as u32,
@@ -1330,8 +1330,8 @@ impl Bed {
         if last {
             list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
             list.copy(
-                self.out.gpu.cast(),
-                self.sum.gpu.cast(),
+                self.out.gpu().cast(),
+                self.sum.gpu().cast(),
                 PIXELS * size_of::<[f32; 4]>() as u64,
             );
             list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
