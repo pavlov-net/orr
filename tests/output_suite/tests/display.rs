@@ -111,7 +111,7 @@ impl Renderer {
         }
         let (resolved, extent, wait_for) = (f.display, f.extent, f.wait);
         let point = queue.submit(vec![list], wait_for.as_slice()).unwrap();
-        display.present(point).unwrap();
+        display.present(&[point]).unwrap();
         display.wait_idle();
         // The compose root is reused two frames later.
         wait(point);

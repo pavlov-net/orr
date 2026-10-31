@@ -558,7 +558,7 @@ pub(crate) struct Built {
     /// By mesh: the cluster template of each cluster of a skinned mesh; empty otherwise.
     pub templates: Vec<Vec<u64>>,
     /// The point the last move signals; none when nothing was built.
-    pub point: Option<(QueueKind, TimelinePoint)>,
+    pub point: Option<TimelinePoint>,
 }
 
 /// Builds the micromaps, CLAS and cut BLAS of `meshes` on the loading queue after `wait`.
@@ -884,7 +884,7 @@ pub(crate) fn build(
         accel,
         cuts,
         templates,
-        point: Some((kind, point)),
+        point: Some(point),
     })
 }
 

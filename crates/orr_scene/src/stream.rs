@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use orr_gpu::{Device, GpuPtr, MemoryKind, QueueKind, TimelinePoint};
+use orr_gpu::{Device, GpuPtr, MemoryKind, TimelinePoint};
 
 use crate::loading::{BlobSource, Loading, Msg, decoded, read_stored};
 use crate::memory::{Pool, PoolSlot};
@@ -178,7 +178,7 @@ impl Streaming {
     ) -> Result<Vec<TimelinePoint>> {
         let mut points = Vec::new();
         for batch in loading.take_streams(w.device) {
-            points.extend(batch.point.map(|(_, p)| p));
+            points.extend(batch.point);
             for l in batch.loads {
                 let ok = l.result.is_ok();
                 let live = self.residency.landed(l.key, ok, frame);
@@ -265,7 +265,7 @@ pub(crate) struct Landed {
 
 /// A stream task's loads, handed to the render thread once their copies have landed.
 pub(crate) struct StreamBatch {
-    pub point: Option<(QueueKind, TimelinePoint)>,
+    pub point: Option<TimelinePoint>,
     loads: Vec<Landed>,
 }
 

@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use orr_dlss::{DlssSdk, FgCamera, FgInputs, FrameGeneration};
 use orr_gpu::{
-    Allocation, CommandList, Device, DeviceDesc, Format, Hazards, MemoryKind, QueueKind, Stages,
-    Texture, TextureDesc, TextureMemory, TextureRegion, TextureUsage,
+    Allocation, CommandList, Device, DeviceDesc, Format, Hazards, MemoryKind, QueueKind,
+    QueueRequest, Stages, Texture, TextureDesc, TextureMemory, TextureRegion, TextureUsage,
 };
 
 const OUTPUT: [u32; 2] = [1280, 720];
@@ -34,6 +34,10 @@ fn device() -> Device {
         hooks: Some(&hooks),
         validation: std::env::var("VK_INSTANCE_LAYERS")
             .is_ok_and(|v| v.contains("KHRONOS_validation")),
+        queues: QueueRequest {
+            render_compute: true,
+            ..QueueRequest::default()
+        },
         ..DeviceDesc::default()
     })
     .expect("orr device with NGX hooks")
@@ -163,10 +167,17 @@ fn bar_center(bgra: &[u8]) -> f64 {
     sum / count
 }
 
-/// Runs `FRAMES` frames generating `count` images each, the presented image shifted `shift`
-/// pixels with the field passed when `with_field`. Returns the bar centers in the last
-/// frame's generated images, in order.
-fn run(device: &Device, sdk: &DlssSdk, count: u32, shift: u32, with_field: bool) -> Vec<f64> {
+/// Runs `FRAMES` frames on `kind` generating `count` images each, the presented image
+/// shifted `shift` pixels with the field passed when `with_field`. Returns the bar centers
+/// in the last frame's generated images, in order.
+fn run(
+    device: &Device,
+    sdk: &DlssSdk,
+    kind: QueueKind,
+    count: u32,
+    shift: u32,
+    with_field: bool,
+) -> Vec<f64> {
     let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
     let texture = |format, size: [u32; 2], name| {
         let desc = TextureDesc::d2(format, size[0], size[1], usage);
@@ -207,7 +218,7 @@ fn run(device: &Device, sdk: &DlssSdk, count: u32, shift: u32, with_field: bool)
         uploads.push(a);
     };
 
-    let queue = device.queue(QueueKind::Render).unwrap();
+    let queue = device.queue(kind).unwrap();
     for f in 0..FRAMES {
         let mut list = queue.command_list().expect("list");
         if f == 0 {
@@ -293,16 +304,21 @@ fn generated_images_split_the_step() {
         counts.push(most);
     }
     for count in counts {
-        let centers = run(&device, &sdk, count, 0, false);
-        eprintln!("{}x: bar centers {centers:?}", count + 1);
-        for (k, c) in (1..=count).zip(&centers) {
-            let want = expected(k, count, 0);
-            assert!(
-                (c - want).abs() <= TOLERANCE,
-                "{}x image {k}: bar at {c:.1}, expected {want:.1}",
-                count + 1
-            );
+        let mut by_queue = Vec::new();
+        for kind in [QueueKind::Render, QueueKind::Compute] {
+            let centers = run(&device, &sdk, kind, count, 0, false);
+            eprintln!("{}x on {kind:?}: bar centers {centers:?}", count + 1);
+            for (k, c) in (1..=count).zip(&centers) {
+                let want = expected(k, count, 0);
+                assert!(
+                    (c - want).abs() <= TOLERANCE,
+                    "{}x image {k} on {kind:?}: bar at {c:.1}, expected {want:.1}",
+                    count + 1
+                );
+            }
+            by_queue.push(centers);
         }
+        assert_eq!(by_queue[0], by_queue[1], "the queues generate other images");
     }
     assert_eq!(device.validation_messages(), 0, "validation messages");
 }
@@ -314,7 +330,7 @@ fn bound_distortion_field_keeps_a_shifted_bar_in_place() {
         return;
     };
     let shift = 96;
-    let with = run(&device, &sdk, 1, shift, true)[0];
+    let with = run(&device, &sdk, QueueKind::Render, 1, shift, true)[0];
     let want = expected(1, 1, shift);
     assert!(
         (with - want).abs() <= TOLERANCE,

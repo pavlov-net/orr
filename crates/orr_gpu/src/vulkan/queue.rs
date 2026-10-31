@@ -769,24 +769,26 @@ impl Shared {
 }
 
 impl Device {
+    /// Whether `point`, on any queue's timeline, has completed.
+    pub fn is_complete(&self, point: TimelinePoint) -> bool {
+        self.shared.completed_value(point.timeline) >= point.value
+    }
+
     /// Pass timings and statistics of the submit that signals `point`, once it has
     /// completed; `None` before. Results of the 64 most recent submits with passes are kept.
     pub fn pass_results(&self, point: TimelinePoint) -> Option<Vec<PassResult>> {
-        let shared = &self.shared;
-        if shared.completed_value(point.timeline) < point.value {
+        if !self.is_complete(point) {
             return None;
         }
-        if let Some((_, r)) = shared
-            .results
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(p, _)| *p == point)
-        {
-            return Some(r.clone());
-        }
+        // `command_list` moves results from pending to the store under the pools lock, so
+        // pending is read first: a submit found in neither has no passes.
         let queue = self.queue(QueueKind::ALL[point.timeline as usize])?;
-        Some(queue.take_results(point.value).unwrap_or_default())
+        if let Some(r) = queue.take_results(point.value) {
+            return Some(r);
+        }
+        let store = self.shared.results.lock().unwrap();
+        let found = store.iter().find(|(p, _)| *p == point);
+        Some(found.map(|(_, r)| r.clone()).unwrap_or_default())
     }
 
     /// Destroys objects whose deferred-free points have completed. Call once a frame.
