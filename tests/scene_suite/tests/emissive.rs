@@ -374,6 +374,7 @@ fn producer_power_follows_emitted_clusters_every_frame() {
         vertex_user: false,
         flags: InstanceFlags::RASTER | InstanceFlags::RAY,
         user_tag: 0,
+        ..ProducerDesc::default()
     };
     w.set_producer(
         ProducerId(1),

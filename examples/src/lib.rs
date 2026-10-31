@@ -9,6 +9,7 @@ use orr::orr_gpu::{Device, DeviceDesc, QueueRequest};
 use orr::orr_output::orr_dlss::Uuid;
 use orr::{DlssSdk, FrameTime, Loading};
 
+pub mod field;
 pub mod mesh;
 pub mod overlay;
 pub mod scene;

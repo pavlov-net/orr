@@ -17,8 +17,8 @@ use crate::ptlas::Ptlas;
 use crate::upload::{Op, Record};
 use crate::world::WorldPos;
 use crate::{
-    EmissiveGpu, Error, GroupGpu, InstanceGpu, LightGpu, ProducerBatch, ProducerGpu, Result,
-    SceneRoot, SkyStats, SlotStateGpu,
+    EmissiveGpu, Error, GroupGpu, InstanceGpu, LightGpu, ProducerBatch, ProducerGpu,
+    ProducerStateGpu, Result, SceneRoot, SkyStats, SlotStateGpu,
 };
 
 /// A scene in [`crate::Scenes`].
@@ -195,6 +195,7 @@ pub(crate) struct Tables {
     pub batches: Allocation<ProducerBatch>,
     /// Cluster and vertex count of each producer batch.
     pub producer_counts: Allocation<[u32; 2]>,
+    pub producer_state: Allocation<ProducerStateGpu>,
     pub sky_stats: Allocation<SkyStats>,
 }
 
@@ -254,6 +255,8 @@ pub(crate) struct SceneCpu {
     pub producers: Vec<Option<Producer>>,
     /// Memory of replaced or cleared producer entries, freed once that frame has completed.
     pub retired: Vec<(u64, Producer)>,
+    /// Producer figures copied back each frame; made at the first update.
+    pub producer_readback: Option<producer::Readback>,
     /// Index = TransformGroupId; entry 0 is the null group.
     pub groups: Vec<Option<Group>>,
     pub records: Vec<Record>,
@@ -298,6 +301,7 @@ impl Scene {
             producers: device.gpu_malloc(dl, n(desc.producer_capacity), "producers")?,
             batches: device.gpu_malloc(dl, n(desc.producer_capacity), "producer batches")?,
             producer_counts: device.gpu_malloc(dl, n(desc.producer_capacity), "producer counts")?,
+            producer_state: device.gpu_malloc(dl, n(desc.producer_capacity), "producer state")?,
             sky_stats: device.gpu_malloc(dl, 1, "sky stats")?,
         };
         // Tables start zeroed: empty slots, the null group, no lights. These apply before
@@ -319,6 +323,10 @@ impl Scene {
                 tables.producer_counts.gpu.address(),
                 tables.producer_counts.size,
             ),
+            zero(
+                tables.producer_state.gpu.address(),
+                tables.producer_state.size,
+            ),
             zero(tables.sky_stats.gpu.address(), tables.sky_stats.size),
         ];
         Ok(Self {
@@ -334,6 +342,7 @@ impl Scene {
                 emissive_removed: Vec::new(),
                 producers: (0..desc.producer_capacity).map(|_| None).collect(),
                 retired: Vec::new(),
+                producer_readback: None,
                 groups: vec![None],
                 records,
                 focus: None,
@@ -736,8 +745,9 @@ impl<'f> SceneWriter<'f> {
         }
     }
 
-    /// Sets or clears producer entry `id`. Setting allocates the entry's batch and resets
-    /// its counts; the previous batch, if any, is freed once this frame has completed.
+    /// Sets or clears producer entry `id`. Setting allocates the entry's batch and build
+    /// memory and resets its counts; its templates build this frame. The previous entry's
+    /// memory, if any, is freed once this frame has completed.
     pub fn set_producer(&mut self, id: ProducerId, desc: Option<&ProducerDesc<'_>>) -> Result<()> {
         assert!(
             id.0 < self.scene.desc.producer_capacity,
@@ -769,6 +779,22 @@ impl<'f> SceneWriter<'f> {
         self.write(t.batches.gpu.offset(i), batch)?;
         self.write(t.emissive.gpu.offset(i), entry)?;
         self.push(Record::fill(self.next_seq(), counts.address().0, 2, 0));
+        // The new entry has built nothing; its PTLAS instance follows from the record.
+        let state = t.producer_state.gpu.offset(i);
+        let blas = std::mem::offset_of!(ProducerStateGpu, blas) as u64;
+        self.push(Record::fill(
+            self.next_seq(),
+            state.address().0 + blas,
+            2,
+            0,
+        ));
+        let clusters = std::mem::offset_of!(ProducerStateGpu, clusters) as u64;
+        self.push(Record::fill(
+            self.next_seq(),
+            state.address().0 + clusters,
+            1,
+            0,
+        ));
         let cpu = &mut *self.scene.cpu.lock().unwrap();
         if let Some(old) = std::mem::replace(&mut cpu.producers[id.0 as usize], producer) {
             cpu.retired.push((self.frame, old));

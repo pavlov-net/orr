@@ -20,13 +20,14 @@ use crate::{
 };
 
 /// `RasterGpu.counts` entries and `RasterGpu.args` offsets (`visibility.slang`).
-const COUNTS: u64 = 8;
+const COUNTS: u64 = 9;
 const COUNT_DRAWS: u64 = 3;
-const ARGS: u64 = 12;
+const ARGS: u64 = 15;
 const ARGS_WORK: u64 = 0;
 const ARGS_OPAQUE: u64 = 3;
 const ARGS_ALPHA: u64 = 6;
 const ARGS_SOFTWARE: u64 = 9;
+const ARGS_PARTICLES: u64 = 12;
 const MAX_HZB_MIPS: u32 = 16;
 const TILE: u32 = 8;
 
@@ -36,6 +37,7 @@ pub(crate) struct RasterPipelines {
     instances: PipelineId,
     cap: PipelineId,
     clusters: PipelineId,
+    producers: PipelineId,
     raster_args: PipelineId,
     opaque: MeshPipeline,
     alpha: MeshPipeline,
@@ -75,6 +77,7 @@ impl RasterPipelines {
             instances: compute(&cull::MODULE, "instances")?,
             cap: compute(&cull::MODULE, "cap")?,
             clusters: compute(&cull::MODULE, "clusters")?,
+            producers: compute(&cull::MODULE, "producers")?,
             raster_args: compute(&cull::MODULE, "raster_args")?,
             opaque: mesh("cluster_mesh", "opaque_pixel", None)?,
             alpha: mesh("cluster_mesh", "alpha_pixel", None)?,
@@ -167,6 +170,7 @@ pub(crate) struct ViewTargets {
     opaque: Allocation<u32>,
     alpha: Allocation<u32>,
     software: Allocation<u32>,
+    particles: Allocation<u32>,
     /// Workgroup args (`ARGS`), then counts.
     args: Allocation<u32>,
     bin_args: Allocation<u32>,
@@ -178,6 +182,8 @@ pub(crate) struct ViewTargets {
     pub x: Option<Target>,
     pub motion: Target,
     pub hzb: Target,
+    /// The transparency point's overlay, made at the first transparency pass.
+    pub overlay: Option<Target>,
 }
 
 fn tiles(extent: [u32; 2]) -> [u32; 2] {
@@ -226,6 +232,7 @@ impl ViewTargets {
             opaque: device.gpu_malloc(dl, u64::from(s.visible_clusters), "opaque clusters")?,
             alpha: device.gpu_malloc(dl, u64::from(s.visible_clusters), "alpha clusters")?,
             software: device.gpu_malloc(dl, u64::from(s.visible_clusters), "software clusters")?,
+            particles: device.gpu_malloc(dl, u64::from(s.visible_clusters), "particle clusters")?,
             args: device.gpu_malloc(dl, ARGS + COUNTS, "raster args")?,
             bin_args: device.gpu_malloc(dl, 3 * u64::from(s.bins), "bin args")?,
             bin_tiles: device.gpu_malloc(
@@ -242,6 +249,7 @@ impl ViewTargets {
                 .transpose()?,
             motion: Target::d2(device, Format::Rg16Float, s.extent, "motion")?,
             hzb,
+            overlay: None,
         };
         for target in [&t.depth, &t.a, &t.b, &t.motion, &t.hzb]
             .into_iter()
@@ -279,6 +287,7 @@ impl ViewTargets {
             opaque: self.opaque.gpu,
             alpha: self.alpha.gpu,
             software: self.software.gpu,
+            particles: self.particles.gpu,
             counts: self.counts(),
             bin_args: self.bin_args.gpu,
             bin_tiles: self.bin_tiles.gpu,
@@ -302,8 +311,33 @@ impl ViewTargets {
         }
     }
 
+    /// The overlay, made on first use.
+    pub(crate) fn overlay(
+        &mut self,
+        device: &Device,
+        list: &mut CommandList<'_>,
+    ) -> Result<&Target> {
+        if self.overlay.is_none() {
+            let [w, h] = self.sizes.extent;
+            let usage = TextureUsage::SAMPLED | TextureUsage::COLOR;
+            let desc = TextureDesc::d2(Format::Rgba16Float, w, h, usage);
+            let overlay = Target::new(device, &desc, "transparency overlay")?;
+            list.discard(&overlay.texture);
+            self.overlay = Some(overlay);
+        }
+        Ok(self.overlay.as_ref().expect("made above"))
+    }
+
+    /// Mesh args of the particle draws, and the draw count beside them.
+    pub(crate) fn particle_draws(&self) -> (GpuPtr<MeshArgs>, GpuPtr<u32>) {
+        (
+            self.args.gpu.offset(ARGS_PARTICLES).cast(),
+            self.counts().offset(COUNT_DRAWS),
+        )
+    }
+
     /// `RasterGpu.counts`: visible clusters, visible clusters dropped, work dropped, 1, work
-    /// asked for, hardware opaque and alpha draws, software clusters.
+    /// asked for, hardware opaque and alpha draws, software clusters, particle clusters.
     pub(crate) fn counts(&self) -> GpuPtr<u32> {
         self.args.gpu.offset(ARGS)
     }
@@ -320,6 +354,7 @@ pub(crate) fn record(
     targets: &ViewTargets,
     scene: GpuPtr<SceneRoot>,
     instance_capacity: u32,
+    producer_capacity: u32,
     view: GpuPtr<ViewConstants>,
     error_pixels: f32,
     software_pixels: f32,
@@ -364,6 +399,9 @@ pub(crate) fn record(
         );
     }
     list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+    if producer_capacity > 0 {
+        list.dispatch(pipelines.get(p.producers), r0, [producer_capacity, 1, 1]);
+    }
     list.dispatch(pipelines.get(p.cap), r0, [1, 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
     list.dispatch_indirect(pipelines.get(p.clusters), r0, grid(ARGS_WORK));

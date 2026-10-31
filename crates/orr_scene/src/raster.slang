@@ -1,5 +1,5 @@
-// The raster into the visibility buffer. The hardware path draws the opaque and alpha
-// lists through mesh pipelines; `software` rasters the clusters small on screen in compute
+// The raster into the visibility buffer, of cooked and producer clusters alike. The
+// hardware path draws the opaque and alpha lists through mesh pipelines; `software` rasters the clusters small on screen in compute
 // with the same snapping, sample points and coverage. Alpha-tested triangles keep a pixel by
 // each surface's coverage. Pixel stages write only the visibility buffer. `depth` copies the
 // resolved depth into the depth target.
@@ -7,6 +7,7 @@
 import orr.atomic;
 import orr.random;
 import orr_pack.mesh;
+import producer;
 import surface;
 import visibility;
 
@@ -28,13 +29,20 @@ struct Primitive
 
 groupshared float3 corners[256];
 
-// One cluster's draw: its vertices and triangles `first..first + count`.
+// One cluster's draw: its vertices and triangles `first..first + count`, from a resident
+// page or a producer batch.
 struct ClusterDraw
 {
     VisibleCluster vc;
+    bool producer;
     PageHeader h;
     Cluster c;
+    float step;          // the mesh's position step
+    ProducerBatch b;
+    ProducerClusterGpu k;
     Placement p;
+    uint vertex_count;
+    uint tri_count;
     uint first;
     uint count;
     uint split;          // first alpha-tested triangle
@@ -46,29 +54,48 @@ struct ClusterDraw
 ClusterDraw cluster_draw(uint visible, bool alpha)
 {
     SceneRoot* s = root.scene;
-    ClusterDraw d;
+    ClusterDraw d = (ClusterDraw)0;
     d.vc = root.raster.gbuffer.clusters[visible];
-    d.h = load_page_header(d.vc.page);
-    d.c = load_cluster(d.vc.page, d.vc.local);
     MaterialGpu* m = s.materials + d.vc.material;
-    d.split = alpha_start(m, d.c);
+    uint entry;
+    if (visible_producer(s, d.vc, entry))
+    {
+        d.producer = true;
+        d.b = s.batches[entry];
+        d.k = d.b.clusters[d.vc.cluster];
+        d.vertex_count = d.k.vertex_count;
+        d.tri_count = d.k.tri_count;
+        bool tested = s.producers[entry].opacity == PRODUCER_ALPHA_TESTED && (m.flags & MATERIAL_ALPHA_TESTED) != 0;
+        d.split = tested ? 0 : d.tri_count;
+    }
+    else
+    {
+        d.h = load_page_header(d.vc.page);
+        d.c = load_cluster(d.vc.page, d.vc.local);
+        d.step = s.meshes[s.models[s.instances[d.vc.instance].model].mesh].position_step;
+        d.vertex_count = d.c.vertex_count;
+        d.tri_count = d.c.tri_count;
+        d.split = alpha_start(m, d.c);
+    }
     d.first = alpha ? d.split : 0;
-    d.count = alpha ? d.c.tri_count - d.split : d.split;
+    d.count = alpha ? d.tri_count - d.split : d.split;
     d.single_sided = (m.flags & MATERIAL_DOUBLE_SIDED) == 0;
-    InstanceGpu inst = s.instances[d.vc.instance];
-    Placement copy;
-    instance_placement(s, inst, root.view, copy);
-    cluster_placement(s, d.vc.instance, inst, d.c, copy, false, d.p);
+    visible_placement(s, root.view, d.vc, false, d.p);
     return d;
+}
+
+// The corners of triangle `t` of the draw.
+uint3 draw_triangle(ClusterDraw d, uint t)
+{
+    return d.producer ? cluster_corners(d.k, t) : load_triangle(d.vc.page, d.h, d.c, t);
 }
 
 // Vertex `i` of the draw; keeps its eye-relative position for the back-face test.
 Vertex cluster_vertex(ClusterDraw d, uint visible, uint i)
 {
-    SceneRoot* s = root.scene;
     ViewConstants* v = root.view;
-    float step = s.meshes[s.models[s.instances[d.vc.instance].model].mesh].position_step;
-    float3 q = place(d.p, load_position(d.vc.page, d.h, d.c, i, step));
+    float3 x = d.producer ? d.b.positions[d.k.first_vertex + i] : load_position(d.vc.page, d.h, d.c, i, d.step);
+    float3 q = place(d.p, x);
     corners[i] = q;
     Vertex o;
     o.position = mul(v.clip_from_view_jittered, float4(view_from_relative(v, q), 1.0));
@@ -88,7 +115,7 @@ bool back_facing(ClusterDraw d, uint3 k)
 Primitive cluster_primitive(ClusterDraw d, uint t, out uint3 corners_out)
 {
     uint triangle = d.first + t;
-    uint3 k = load_triangle(d.vc.page, d.h, d.c, triangle);
+    uint3 k = draw_triangle(d, triangle);
     Primitive o;
     o.triangle = triangle;
     o.cull = back_facing(d, k);
@@ -118,8 +145,8 @@ void cluster_mesh(
     }
     uint visible = alpha ? r.alpha[index] : r.opaque[index];
     ClusterDraw d = cluster_draw(visible, alpha);
-    SetMeshOutputCounts(d.c.vertex_count, d.count);
-    for (uint i = thread; i < d.c.vertex_count; i += 128)
+    SetMeshOutputCounts(d.vertex_count, d.count);
+    for (uint i = thread; i < d.vertex_count; i += 128)
         vertices[i] = cluster_vertex(d, visible, i);
     GroupMemoryBarrierWithGroupSync();
     if (thread < d.count)
@@ -148,12 +175,14 @@ void opaque_pixel(Vertex v, uint triangle: SV_PrimitiveID)
 }
 
 // Whether an alpha-tested triangle keeps the pixel at `pixel_center`: with probability
-// coverage x (1 - fade), the copy's fade from its slot state.
+// coverage x (1 - fade), a copy's fade from its slot state.
 bool alpha_keeps(VisibleCluster vc, uint triangle, float2 pixel_center)
 {
     SceneRoot* s = root.scene;
     PrimaryHit hit = primary_hit(s, root.view, vc, triangle, pixel_center);
-    float keep = Surface.coverage(hit.input) * (1.0 - float(s.slot_state[vc.instance].fade) / 255.0);
+    uint entry;
+    float fade = visible_producer(s, vc, entry) ? 0.0 : float(s.slot_state[vc.instance].fade) / 255.0;
+    float keep = Surface.coverage(hit.input) * (1.0 - fade);
     float noise = unit_float(pcg3d(uint3(uint2(pixel_center), s.frame_index)).x);
     return keep > noise;
 }
@@ -212,7 +241,7 @@ bool micropoly(SoftTriangle t)
 bool soft_setup(ClusterDraw d, uint triangle, uint2 extent, out SoftTriangle t)
 {
     t = (SoftTriangle)0;
-    uint3 k = load_triangle(d.vc.page, d.h, d.c, triangle);
+    uint3 k = draw_triangle(d, triangle);
     if (back_facing(d, k))
         return false;
     int2 v0 = soft_xy[k.x];
@@ -313,7 +342,7 @@ void software(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         return;
     uint visible = r.software[index];
     ClusterDraw d = cluster_draw(visible, false);
-    for (uint i = thread; i < d.c.vertex_count; i += 128)
+    for (uint i = thread; i < d.vertex_count; i += 128)
     {
         float4 clip = cluster_vertex(d, visible, i).position;
         float2 xy = pixel_from_clip(v, clip);
@@ -324,7 +353,7 @@ void software(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
 
     SoftTriangle t = (SoftTriangle)0;
     uint units = 0;
-    if (thread < d.c.tri_count && soft_setup(d, thread, v.extent, t))
+    if (thread < d.tri_count && soft_setup(d, thread, v.extent, t))
         units = micropoly(t) ? 1 : uint(t.rect.w - t.rect.y + 1);
     soft[thread] = t;
     GroupMemoryBarrierWithGroupSync();

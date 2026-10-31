@@ -444,6 +444,7 @@ fn set_producers(
                 vertex_user: false,
                 flags: InstanceFlags::RASTER | InstanceFlags::RAY,
                 user_tag: 0,
+                ..ProducerDesc::default()
             }),
         )
         .unwrap();

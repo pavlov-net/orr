@@ -195,8 +195,14 @@ pub struct RasterView {
     pub hzb: Arc<Texture>,
     /// Visible clusters written, then visible clusters and cluster work dropped for want
     /// of room (`Budgets::visible_clusters`, `Budgets::cluster_work`), 1, cluster work
-    /// items asked for, mesh-shader opaque and alpha draws, and software-rastered clusters.
+    /// items asked for, mesh-shader opaque and alpha draws, software-rastered clusters, and
+    /// visible particle clusters.
     pub counts: GpuPtr<u32>,
+    /// The view's raster state: `gbuffer` and the culling lists, the particle list among
+    /// them.
+    pub raster: GpuPtr<crate::RasterGpu>,
+    /// The view history it rendered with.
+    pub history: ViewHistoryId,
     /// The scene's sky statistics, which lighting's scene pass writes and exposure reads.
     pub sky_stats: GpuPtr<crate::SkyStats>,
     /// The scene focus in render space; the view's camera while the scene has none.

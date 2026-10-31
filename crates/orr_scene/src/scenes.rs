@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 
 use glam::{DVec3, Vec3};
 use orr_gpu::{
-    Allocation, CommandList, ComputePipeline, Device, GpuPtr, Hazards, KernelSet, LatencyMarker,
-    LowLatency, MemoryKind, PassResult, QueueKind, SamplerDesc, SamplerIndex, ShaderModule,
-    SpecData, Stages, TextureIndex, TimelinePoint,
+    Allocation, ClearColor, ColorAttachment, ColorLoad, CommandList, ComputePipeline, Device,
+    GpuPtr, Hazards, KernelSet, LatencyMarker, LowLatency, MemoryKind, PassResult, QueueKind,
+    Rendering, SamplerDesc, SamplerIndex, ShaderModule, SpecData, Stages, StorageImageIndex,
+    TextureIndex, TimelinePoint,
 };
 use orr_pack::AssetId;
 
@@ -24,15 +25,17 @@ use crate::mount::{
     Apply, InstancePage, LoadState, MountId, MountTask, Mounts, PackSource, PageId, TableSizes,
 };
 use crate::pipelines::{PipelineId, Pipelines, ReloadReport};
-use crate::producer::ProducerUpdate;
+use crate::producer::{self, Job, ProducerKernels, ProducerStats, ProducerUpdate, Readback};
 use crate::ptlas::{FrameInputs, PtlasPipelines, RtStats};
 use crate::raster::{self, RasterPipelines, TargetSizes, ViewTargets};
 #[cfg(feature = "hot-reload")]
 use crate::reload::Reloader;
 use crate::residency::ResidencyStats;
 use crate::scene::{GroupWriter, ModelCpu, ModelId, Scene, SceneDesc, SceneId, SceneWriter};
+use crate::shaders::transparency::CompositeRoot;
 use crate::shaders::{animation, emissive, world as world_kernel};
 use crate::time::FrameTime;
+use crate::transparency::TransparencyPass;
 use crate::upload::{Record, scatter};
 use crate::view::{RasterView, ViewDesc, ViewHistory, ViewHistoryId, view_constants};
 use crate::world::{WorldPos, needs_rebase, origin_for};
@@ -188,6 +191,8 @@ pub struct FrameStats {
     pub scenes_updated: u32,
     /// PTLAS work of the frame's scenes.
     pub rt: RtStats,
+    /// Producer entries of the frame's scenes: emitted against capacity, drops, builds.
+    pub producers: ProducerStats,
 }
 
 /// Scene compute: a listed scene's turn in `update_scenes`, after its uploads have landed.
@@ -229,6 +234,8 @@ struct InFlight {
     stats: FrameStats,
     /// Scenes whose PTLAS the frame built.
     traced: Vec<SceneId>,
+    /// Scenes the frame updated.
+    updated: Vec<SceneId>,
 }
 
 struct Core {
@@ -259,6 +266,9 @@ struct Core {
     ptlas: PtlasPipelines,
     /// Scratch of every scene's PTLAS build; the builds of a frame run one after another.
     ptlas_scratch: Mutex<Option<Allocation<u8>>>,
+    producers: ProducerKernels,
+    /// Scratch of producer builds, grown to the largest frame's.
+    producer_scratch: Mutex<Option<Allocation<u8>>>,
 }
 
 /// Global scene state, mounted packs and every resident scene. Render thread only.
@@ -331,6 +341,7 @@ impl Scenes {
         let mut pipelines = Pipelines::new(device, desc.kernels)?;
         let raster = RasterPipelines::new(device, desc.kernels, &mut pipelines)?;
         let ptlas = PtlasPipelines::new(device, desc.kernels, &mut pipelines)?;
+        let producers = ProducerKernels::new(device, desc.kernels, &mut pipelines)?;
         #[cfg(feature = "hot-reload")]
         let mut reloader = Reloader::new();
         #[cfg(feature = "hot-reload")]
@@ -372,6 +383,8 @@ impl Scenes {
                 accel,
                 ptlas,
                 ptlas_scratch: Mutex::new(None),
+                producers,
+                producer_scratch: Mutex::new(None),
             },
         })
     }
@@ -595,6 +608,12 @@ impl Scenes {
                 let Ok(scene) = core.scene(*id) else { continue };
                 if let Some(figures) = scene.cpu.lock().unwrap().ptlas.figures(slot) {
                     f.stats.rt.add(&figures);
+                }
+            }
+            for id in &f.updated {
+                let Ok(scene) = core.scene(*id) else { continue };
+                if let Some(r) = &scene.cpu.lock().unwrap().producer_readback {
+                    f.stats.producers.add(&r.figures(slot));
                 }
             }
             core.completed_frame = f.id;
@@ -843,7 +862,8 @@ impl<'a> Frame<'a> {
                 rebased.push((scene.tables.root.gpu, scene.desc.light_capacity));
                 rebase = true;
             }
-            let tlas = cpu.ptlas.tlas(device, core.fif)?;
+            let producers = cpu.producers.iter().any(Option::is_some);
+            let tlas = cpu.ptlas.tlas(device, core.fif, producers)?;
             records.append(&mut cpu.ptlas.partition_records(device, window, &core.seq)?);
             for (index, g) in cpu.groups.iter_mut().enumerate() {
                 let Some(g) = g else { continue };
@@ -884,6 +904,7 @@ impl<'a> Frame<'a> {
                 emissive: t.emissive.gpu,
                 producers: t.producers.gpu,
                 batches: t.batches.gpu,
+                producer_state: t.producer_state.gpu,
                 sky_stats: t.sky_stats.gpu,
                 environment: cpu.environment,
                 medium: cpu.medium,
@@ -971,6 +992,15 @@ impl<'a> Frame<'a> {
             compute(&mut sc);
             list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
         }
+        record_producers(
+            device,
+            core,
+            &self.listed,
+            window,
+            &mut list,
+            self.pipelines,
+            self.id,
+        )?;
         list.begin_pass("animate", false);
         for &(id, root, _, focus, _) in &roots {
             let slots = core.scene(id)?.cpu.lock().unwrap().ptlas.high_water;
@@ -1120,6 +1150,7 @@ impl<'a> Frame<'a> {
             )
             .to_array();
         let instance_capacity = scene.desc.instance_capacity;
+        let producer_capacity = scene.desc.producer_capacity;
         let sizes = TargetSizes {
             extent: view.render_extent.to_array(),
             extended: core.materials.any_extended(),
@@ -1156,6 +1187,7 @@ impl<'a> Frame<'a> {
             targets,
             root,
             instance_capacity,
+            producer_capacity,
             constants,
             core.raster_error_pixels,
             core.software_raster_pixels,
@@ -1172,11 +1204,85 @@ impl<'a> Frame<'a> {
             gbuf_x: targets.x.as_ref().map(|x| Arc::clone(&x.texture)),
             hzb: Arc::clone(&targets.hzb.texture),
             counts: targets.counts(),
+            raster,
+            history: view.history,
             sky_stats,
             focus,
         };
         self.step("raster_view");
         Ok(out)
+    }
+
+    /// Step 5's transparency point for a view `raster_view` rendered this frame: clears
+    /// the view's overlay, runs `hook` to draw into it, then composites the overlay over
+    /// `radiance` (RGBA16F at the render extent, pre-exposed) in place.
+    pub fn transparency(
+        &mut self,
+        view: &RasterView,
+        radiance: StorageImageIndex,
+        hook: &mut dyn FnMut(&mut TransparencyPass<'_, '_>),
+    ) -> Result<()> {
+        self.ensure_updated()?;
+        let device = self.device;
+        let composite = self.pipelines.get(self.pipelines.own.composite);
+        let core = &mut *self.core;
+        let window = &core.windows[self.window];
+        let list = self.list.as_mut().expect("frame list");
+        let targets = core
+            .histories
+            .get_mut(view.history.0 as usize)
+            .and_then(Option::as_mut)
+            .and_then(|h| h.targets.as_mut())
+            .ok_or(Error::UnknownViewHistory(view.history))?;
+        let extent = targets.sizes.extent;
+        let (particle_args, particle_draws) = targets.particle_draws();
+        let depth = Arc::clone(&targets.depth.texture);
+        let depth_index = targets.depth.sampled;
+        let overlay = targets.overlay(device, list)?;
+        list.barrier(Stages::ALL, Stages::COLOR_OUT, Hazards::empty());
+        list.begin_rendering(&Rendering {
+            extent,
+            colors: &[ColorAttachment {
+                texture: &overlay.texture,
+                load: ColorLoad::Clear(ClearColor::Float([0.0; 4])),
+                store: true,
+            }],
+            depth: None,
+        });
+        list.end_rendering();
+        list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
+        hook(&mut TransparencyPass {
+            cmd: list,
+            overlay: &overlay.texture,
+            depth: &depth,
+            depth_index,
+            extent,
+            view: view.view,
+            scene: view.scene,
+            raster: view.raster,
+            particle_args,
+            particle_draws,
+            device,
+            window,
+        });
+        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+        let root = window.put_root(
+            device,
+            &CompositeRoot {
+                overlay: overlay.sampled,
+                radiance,
+                width: extent[0],
+                height: extent[1],
+            },
+        )?;
+        list.dispatch(
+            composite,
+            root,
+            [extent[0].div_ceil(8), extent[1].div_ceil(8), 1],
+        );
+        list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
+        self.step("transparency");
+        Ok(())
     }
 
     /// Step 6: submits the frame on the render queue after `wait`, and returns the point
@@ -1207,15 +1313,106 @@ impl<'a> Frame<'a> {
                 masks_refused: self.masks_refused,
                 ..RtStats::default()
             },
+            producers: ProducerStats::default(),
         };
         self.core.in_flight.push_back(InFlight {
             id: self.id,
             point,
             stats,
             traced: std::mem::take(&mut self.traced),
+            updated: if self.updated {
+                std::mem::take(&mut self.listed)
+            } else {
+                Vec::new()
+            },
         });
         Ok(point)
     }
+}
+
+/// Builds the producer entries of the listed scenes that build this frame, then copies each
+/// scene's producer counts and states back for [`FrameStats::producers`].
+fn record_producers(
+    device: &Device,
+    core: &Core,
+    listed: &[SceneId],
+    window: &UploadWindow,
+    list: &mut CommandList<'_>,
+    pipelines: &Pipelines,
+    frame: u64,
+) -> Result<()> {
+    let slot = (frame % u64::from(core.fif)) as usize;
+    let mut scenes = Vec::with_capacity(listed.len());
+    for &id in listed {
+        let scene = core.scene(id)?;
+        scenes.push((scene, scene.cpu.lock().unwrap()));
+    }
+    let jobs: Vec<Job<'_>> = scenes
+        .iter()
+        .flat_map(|(scene, cpu)| {
+            cpu.producers
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| p.as_ref().map(|p| (i, p)))
+                .filter(|(_, p)| p.builds())
+                .map(|(i, producer)| Job {
+                    scene: scene.tables.root.gpu,
+                    entry: i as u32,
+                    producer,
+                })
+        })
+        .collect();
+    if !jobs.is_empty() {
+        let need = producer::scratch_bytes(device, &jobs).max(256);
+        let mut held = core.producer_scratch.lock().unwrap();
+        if held.as_ref().is_none_or(|a| a.size < need) {
+            *held =
+                Some(device.gpu_malloc::<u8>(MemoryKind::DeviceLocal, need, "producer scratch")?);
+        }
+        let scratch = held.as_ref().expect("made above").gpu.address();
+        producer::record(
+            device,
+            window,
+            list,
+            pipelines,
+            &core.producers,
+            &jobs,
+            scratch,
+        )?;
+    }
+    drop(jobs);
+    for (scene, cpu) in &mut scenes {
+        let capacity = scene.desc.producer_capacity;
+        if capacity == 0 {
+            continue;
+        }
+        for p in cpu.producers.iter_mut().flatten() {
+            p.templates_built = true;
+            p.built = true;
+        }
+        let set = cpu
+            .producers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                p.as_ref()
+                    .map(|p| (i as u32, p.max_clusters, p.max_vertices))
+            })
+            .collect();
+        if cpu.producer_readback.is_none() {
+            cpu.producer_readback = Some(Readback::new(device, capacity, core.fif)?);
+        }
+        let t = &scene.tables;
+        cpu.producer_readback.as_mut().expect("made above").record(
+            list,
+            slot,
+            t.producer_counts.gpu,
+            t.producer_state.gpu,
+            set,
+        );
+    }
+    list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
+    Ok(())
 }
 
 impl Drop for Scenes {

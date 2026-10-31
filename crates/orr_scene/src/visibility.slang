@@ -6,6 +6,7 @@ import orr.abi;
 import orr.math;
 import orr.packing;
 import orr_pack.mesh;
+import producer;
 __exported import hit;
 
 // `RasterGpu.counts` entries.
@@ -17,7 +18,8 @@ public static const uint COUNT_WORK = 4;             // cluster work items asked
 public static const uint COUNT_OPAQUE = 5;           // hardware opaque draws
 public static const uint COUNT_ALPHA = 6;            // hardware alpha draws
 public static const uint COUNT_SOFTWARE = 7;         // clusters the software raster draws
-public static const uint COUNTS = 8;
+public static const uint COUNT_PARTICLES = 8;        // visible particle clusters
+public static const uint COUNTS = 9;
 
 // `ClusterWork.flags`.
 public static const uint WORK_DAG = 1;      // select clusters by the DAG cluster rule
@@ -40,10 +42,11 @@ public struct RasterGpu
 {
     public GBufferGpu gbuffer;       // what later passes read
     public ClusterWork* work;
-    public uint* args;               // workgroups x, y, z: work, opaque, alpha, software
+    public uint* args;               // workgroups x, y, z: work, opaque, alpha, software, particles
     public uint* opaque;             // visible clusters with opaque triangles, hardware path
     public uint* alpha;              // visible clusters with alpha-tested triangles, hardware path
     public uint* software;           // visible clusters of the software raster
+    public uint* particles;          // visible clusters of particle entries, for the transparency point
     public uint* counts;             // COUNT_*
     public uint* bin_args;           // per surface bin: x, y, z
     public uint* bin_tiles;          // per bin: tile_capacity tile indices
@@ -68,6 +71,7 @@ public static const uint ARGS_WORK = 0;
 public static const uint ARGS_OPAQUE = 3;
 public static const uint ARGS_ALPHA = 6;
 public static const uint ARGS_SOFTWARE = 9;
+public static const uint ARGS_PARTICLES = 12;
 
 // Workgroup grids cover `n` groups in rows of GRID_X, the smallest maximum Vulkan allows.
 public static const uint GRID_X = 65535;
@@ -151,12 +155,10 @@ public float2 pixel_from_clip(ViewConstants* v, float4 clip)
     return (clip.xy / clip.w * 0.5 + 0.5) * float2(v.extent);
 }
 
-// True when cluster `c`'s grid box, placed by `p`, lies in front of the near plane and its
-// screen rect's longer side is at most `pixels`.
-public bool small_on_screen(ViewConstants* v, Placement p, Cluster c, float step, float pixels)
+// True when the box `lo..hi`, placed by `p`, lies in front of the near plane and its screen
+// rect's longer side is at most `pixels`.
+public bool small_on_screen(ViewConstants* v, Placement p, float3 lo, float3 hi, float pixels)
 {
-    float3 lo = grid_position(c.anchor, uint3(0), step);
-    float3 hi = grid_position(c.anchor, uint3(c.local_max[0], c.local_max[1], c.local_max[2]), step);
     float2 rect_min = float2(1e30);
     float2 rect_max = float2(-1e30);
     for (uint i = 0; i < 8; i++)
@@ -218,7 +220,32 @@ public struct PrimaryHit
     public float3 direction;   // unit pixel ray, render space
     public float distance;     // m along the ray
     public Placement placement;
-    public float error;        // m: the cluster's LOD error times the instance scale
+    public float3 object;      // the hit in mesh or entry space
+    public float error;        // m: the cluster's LOD error times the instance scale; 0 on producer clusters
+    public uint origin;        // a producer entry's origin policy, else ORIGIN_DEFAULT
+}
+
+// The producer entry a visible cluster names; false for cooked clusters.
+public bool visible_producer(SceneRoot* s, VisibleCluster vc, out uint entry)
+{
+    entry = 0;
+    return vc.page == nullptr && hit_producer(s, vc.instance, entry);
+}
+
+// The view-relative placement of visible cluster `vc`, current or previous; false when its
+// group or pose hides it.
+public bool visible_placement(SceneRoot* s, ViewConstants* v, VisibleCluster vc, bool previous, out Placement p)
+{
+    uint entry;
+    if (visible_producer(s, vc, entry))
+        return producer_placement(s, s.producers[entry], previous, v.eye_cell.xyz, v.eye_offset.xyz, uint(v.eye_cell.w), p);
+    InstanceGpu inst = s.instances[vc.instance];
+    GroupGpu* g = s.groups + inst.group;
+    Placement copy;
+    p = (Placement)0;
+    if (!placement(g, previous ? g.previous : g.current, inst.group_index, v, copy))
+        return false;
+    return cluster_placement(s, vc.instance, inst, load_cluster(vc.page, vc.local), copy, previous, p);
 }
 
 // The surface input where the ray through `pixel_center` (render pixels) meets triangle
@@ -228,16 +255,35 @@ public struct PrimaryHit
 // cell. Without mesh tangents the tangent follows the triangle's uv.
 public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc, uint triangle, float2 pixel_center)
 {
-    InstanceGpu inst = s.instances[vc.instance];
-    MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
     MaterialGpu* m = s.materials + vc.material;
-    PrimaryHit hit;
-    Cluster c = load_cluster(vc.page, vc.local);
-    Placement copy;
-    instance_placement(s, inst, v, copy);
-    cluster_placement(s, vc.instance, inst, c, copy, false, hit.placement);
+    PrimaryHit hit = (PrimaryHit)0;
+    SurfaceInput i = (SurfaceInput)0;
+    Corners t;
+    uint attributes = 0;
+    uint entry;
+    visible_placement(s, v, vc, false, hit.placement);
+    if (visible_producer(s, vc, entry))
+    {
+        ProducerBatch b = s.batches[entry];
+        ProducerTriangle pt = producer_triangle(b, b.clusters[vc.cluster], triangle, false);
+        t = pt.corners;
+        i.user_tag = s.producers[entry].user_tag;
+        i.cluster_user = pt.cluster_user;
+        i.vertex_user = pt.vertex_user;
+        hit.origin = s.producers[entry].origin;
+    }
+    else
+    {
+        InstanceGpu inst = s.instances[vc.instance];
+        MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
+        Cluster c = load_cluster(vc.page, vc.local);
+        t = load_corners(vc.page, c, triangle, mesh);
+        attributes = mesh.attributes;
+        hit.error = c.self_error * hit.placement.scale;
+        i.part = c.part;
+        i.user_tag = inst.user_tag;
+    }
     Placement pl = hit.placement;
-    Corners t = load_corners(vc.page, c, triangle, mesh);
     float3 q0 = place(pl, t.position[0]);
     float3 e1 = mul(pl.linear, t.position[1] - t.position[0]);
     float3 e2 = mul(pl.linear, t.position[2] - t.position[0]);
@@ -250,25 +296,20 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     float2 bx = ray_barycentrics(dx, q0, e1, e2).xy - b.xy;
     float2 by = ray_barycentrics(dy, q0, e1, e2).xy - b.xy;
 
-    SurfaceInput i;
-    triangle_geometry(i, t, mesh, m, pl, b.xy, bx, by, d, exp2(v.mip_bias));
+    triangle_geometry(i, t, attributes, m, pl, b.xy, bx, by, d, exp2(v.mip_bias));
     float spread = 1.0 / pixels_per_radian(v);
     hit.relative = b.z * d;
     hit.direction = d;
     hit.distance = b.z;
-    hit.error = c.self_error * pl.scale;
+    hit.object = (1.0 - b.x - b.y) * t.position[0] + b.x * t.position[1] + b.y * t.position[2];
     i.context.kind = HIT_PRIMARY;
     i.context.depth = 0;
     i.context.cone_width = b.z * spread;
     i.context.cone_spread = spread;
     i.instance = vc.instance;
     i.cluster = vc.cluster;
-    i.part = c.part;
     i.primitive = triangle;
     i.barycentrics = b.xy;
-    i.user_tag = inst.user_tag;
-    i.cluster_user = 0;
-    i.vertex_user = uint3(0);
     i.material = vc.material;
     i.surface = m.surface;
     i.position = hit.relative + v.eye_render.xyz;

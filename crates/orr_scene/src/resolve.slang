@@ -7,6 +7,7 @@
 #include "orr/root.h"
 import orr.math;
 import orr_pack.mesh;
+import producer;
 import surface;
 import visibility;
 
@@ -126,7 +127,7 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     float3 relative = hit.relative + hit.direction * offset;
     g.position = relative + v.eye_render.xyz;
     g.raster_error = hit.error;
-    g.flags = (g.flags & ~GBUFFER_ORIGIN_MASK) | (((m.flags & MATERIAL_ORIGIN_MASK) >> MATERIAL_ORIGIN_SHIFT) << GBUFFER_ORIGIN_SHIFT);
+    g.flags = (g.flags & ~GBUFFER_ORIGIN_MASK) | (hit_origin(m, hit.origin) << GBUFFER_ORIGIN_SHIFT);
     g.instance = vc.instance;
     g.cluster = vc.cluster;
     g.primitive = visibility_triangle(w);
@@ -139,15 +140,20 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     float3 view_pos = view_from_relative(v, relative);
     float4 clip = mul(v.clip_from_view_jittered, float4(view_pos, 1.0));
     float4 current = mul(v.clip_from_view, float4(view_pos, 1.0));
+    // A producer batch with previous positions moves the point by its vertices' motion too.
     Placement p = hit.placement;
     float3 object = mul(linear_inverse(p.linear), relative - p.translation);
-    InstanceGpu inst = s.instances[vc.instance];
-    GroupGpu* group_gpu = s.groups + inst.group;
-    Placement prev_copy;
     Placement prev;
-    if (!placement(group_gpu, group_gpu.previous, inst.group_index, v, prev_copy)
-        || !cluster_placement(s, vc.instance, inst, load_cluster(vc.page, vc.local), prev_copy, true, prev))
+    if (!visible_placement(s, v, vc, true, prev))
         prev = p;
+    uint entry;
+    if (visible_producer(s, vc, entry) && s.batches[entry].previous != nullptr)
+    {
+        ProducerBatch pb = s.batches[entry];
+        Corners c = producer_triangle(pb, pb.clusters[vc.cluster], visibility_triangle(w), true).corners;
+        float2 bc = hit.input.barycentrics;
+        object += (1.0 - bc.x - bc.y) * c.position[0] + bc.x * c.position[1] + bc.y * c.position[2] - hit.object;
+    }
     float3 prev_relative = place(prev, object) + v.eye_motion.xyz;
     float4 previous = mul(v.prev_clip_from_view, float4(mul(v.prev_view_from_world_rotation, float4(prev_relative, 0.0)), 1.0));
     float2 motion = (previous.xy / previous.w - current.xy / current.w) * 0.5;

@@ -7,6 +7,7 @@ module hit;
 import orr.abi;
 import orr.math;
 import orr_pack.mesh;
+import producer;
 __exported import surface;
 
 // An instance's transform as hits and the raster use it: mesh space to a frame centered
@@ -102,6 +103,65 @@ public bool cluster_placement(SceneRoot* s, uint slot, InstanceGpu inst, Cluster
     return true;
 }
 
+// The producer entry of PTLAS instance or visible-cluster index `index`; false for slots
+// and part instances.
+public bool hit_producer(SceneRoot* s, uint index, out uint entry)
+{
+    entry = index - s.producer_base;
+    return index >= s.producer_base && entry < s.producer_capacity;
+}
+
+// The transform of producer entry `p`, current or previous, relative to the point at
+// `cell` + `offset`. False when its group hides it.
+public bool producer_placement(SceneRoot* s, ProducerGpu p, bool previous, int3 cell, float3 offset, uint cell_log2, out Placement pl)
+{
+    GroupGpu* g = s.groups + p.group;
+    return placement(g, previous ? g.previous : g.current, p.group_index, cell, offset, cell_log2, pl);
+}
+
+// The material of an emitted cluster, MATERIAL_NONE outside the entry's materials.
+public uint producer_material(ProducerGpu p, ProducerClusterGpu k)
+{
+    return uint(k.material) < p.material_count ? p.materials[k.material] : MATERIAL_NONE;
+}
+
+// The origin policy of a hit on material `m`: a producer entry's own unless it is the
+// default, else the material's.
+public uint hit_origin(MaterialGpu* m, uint producer_origin)
+{
+    uint material = (m.flags & MATERIAL_ORIGIN_MASK) >> MATERIAL_ORIGIN_SHIFT;
+    return producer_origin != ORIGIN_DEFAULT ? producer_origin : material;
+}
+
+// One triangle of an emitted cluster: entry-relative corners, last frame's with `previous`
+// where the batch keeps them, attributes, and the cluster's and vertices' user words.
+public struct ProducerTriangle
+{
+    public Corners corners;
+    public uint cluster_user;
+    public uint3 vertex_user;
+}
+
+public ProducerTriangle producer_triangle(ProducerBatch b, ProducerClusterGpu k, uint triangle, bool previous)
+{
+    uint3 c = cluster_corners(k, triangle) + k.first_vertex;
+    float3* positions = previous && b.previous != nullptr ? b.previous : b.positions;
+    ProducerTriangle t;
+    for (uint j = 0; j < 3; j++)
+    {
+        uint v = c[j];
+        t.corners.position[j] = positions[v];
+        VertexAttributes a = (VertexAttributes)0;
+        a.normal = producer_normal(b.attrs[v]);
+        a.uv = producer_uv(b.attrs[v]);
+        a.tangent = float4(1.0, 0.0, 0.0, 1.0);
+        t.corners.attributes[j] = a;
+        t.vertex_user[j] = b.vertex_user != nullptr ? b.vertex_user[v] : 0;
+    }
+    t.cluster_user = k.user;
+    return t;
+}
+
 // The material of a cluster's section for one copy.
 public uint section_material(SceneRoot* s, InstanceGpu inst, ModelGpu* model, uint section)
 {
@@ -140,12 +200,13 @@ public Corners load_corners(uint8_t* page, Cluster c, uint triangle, MeshGpu* me
     return t;
 }
 
-// The geometry of `i` at barycentrics `b` of triangle `t` placed by `pl`: uv and its
+// The geometry of `i` at barycentrics `b` of triangle `t` placed by `pl`, with `attributes`
+// the mesh's MESH_* flags: uv and its
 // footprint from the barycentric steps `bx` and `by` of one footprint width, normals and
 // tangent frame in render space (back faces of double-sided materials turned toward the
 // ray `d`), and the object-space position and normal. Without mesh tangents the tangent
 // follows the triangle's uv.
-public void triangle_geometry(inout SurfaceInput i, Corners t, MeshGpu* mesh, MaterialGpu* m, Placement pl, float2 b, float2 bx, float2 by, float3 d, float bias)
+public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, MaterialGpu* m, Placement pl, float2 b, float2 bx, float2 by, float3 d, float bias)
 {
     VertexAttributes a0 = t.attributes[0];
     VertexAttributes a1 = t.attributes[1];
@@ -167,7 +228,7 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, MeshGpu* mesh, Ma
     float3 n_obj = safe_normalize(w.x * a0.normal + w.y * a1.normal + w.z * a2.normal, ng);
     float3 n = safe_normalize(mul(normal_matrix, n_obj) * mirror, ng);
     float4 tangent;
-    if ((mesh.attributes & MESH_TANGENT) != 0)
+    if ((attributes & MESH_TANGENT) != 0)
     {
         float3 tt = w.x * a0.tangent.xyz + w.y * a1.tangent.xyz + w.z * a2.tangent.xyz;
         tangent = float4(safe_normalize(mul(pl.linear, tt), float3(1, 0, 0)), a0.tangent.w * mirror);
@@ -260,13 +321,15 @@ public struct SurfaceHit
     public UvFootprint uv;
     public uint user_tag;
     public uint part;
+    public uint cluster_user;     // producer words, 0 on cooked clusters
+    public uint3 vertex_user;     // per corner
     public float geometric_error; // m: the hit cluster's LOD error times the instance scale
     public float depth_offset;    // m, along the ray
     public bool valid;            // false for hits on entries this module does not resolve
 }
 
 // The instance slot of PTLAS instance `index`: slot instances name themselves, part
-// instances their copy's slot. False for producer entries.
+// instances their copy's slot. False for producer entries (`hit_producer`).
 public bool hit_slot(SceneRoot* s, uint index, out uint slot)
 {
     slot = index;
@@ -280,43 +343,102 @@ public bool hit_slot(SceneRoot* s, uint index, out uint slot)
     return false;
 }
 
+// The material of the hit on cluster `cluster_id` of PTLAS instance `instance_index`, or
+// MATERIAL_NONE where it names none.
+public uint traced_material(SceneRoot* s, uint instance_index, uint cluster_id)
+{
+    uint entry;
+    if (hit_producer(s, instance_index, entry))
+    {
+        ProducerBatch b = s.batches[entry];
+        if (cluster_id >= emitted_clusters(b))
+            return MATERIAL_NONE;
+        return producer_material(s.producers[entry], b.clusters[cluster_id]);
+    }
+    uint slot;
+    if (!hit_slot(s, instance_index, slot))
+        return MATERIAL_NONE;
+    InstanceGpu inst = s.instances[slot];
+    ClusterRef r = s.clusters[cluster_id];
+    return section_material(s, inst, s.models + inst.model, load_cluster(r.page, r.local).section);
+}
+
 // What `resolve_hit` and `resolve_alpha` share: the surface input of a hit and its cluster.
 struct HitInput
 {
     SurfaceInput input;
-    Cluster cluster;
     Placement placement;
+    float error;       // m, mesh space: the cluster's LOD error; 0 for producer clusters
+    uint origin;       // a producer entry's origin policy, else ORIGIN_DEFAULT
 }
 
 bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, Corners t, bool fetched, bool previous, HitContext context, out HitInput h)
 {
     h = (HitInput)0;
-    uint slot;
-    if (!hit_slot(s, instance_index, slot))
+    uint cell_log2 = uint(s.origin_cell.w);
+    SurfaceInput i = (SurfaceInput)0;
+    Corners corners;
+    uint material;
+    uint attributes;
+    Placement pl;
+    uint entry;
+    if (hit_producer(s, instance_index, entry))
+    {
+        ProducerGpu p = s.producers[entry];
+        ProducerBatch b = s.batches[entry];
+        if (cluster_id >= emitted_clusters(b))
+            return false;
+        ProducerClusterGpu k = b.clusters[cluster_id];
+        if (!producer_placement(s, p, previous, s.origin_cell.xyz, float3(0.0), cell_log2, pl))
+            return false;
+        ProducerTriangle pt = producer_triangle(b, k, primitive, previous);
+        corners = pt.corners;
+        material = producer_material(p, k);
+        attributes = 0;
+        i.instance = instance_index;
+        i.cluster = cluster_id;
+        i.part = 0;
+        i.user_tag = p.user_tag;
+        i.cluster_user = pt.cluster_user;
+        i.vertex_user = pt.vertex_user;
+        h.origin = p.origin;
+    }
+    else
+    {
+        uint slot;
+        if (!hit_slot(s, instance_index, slot))
+            return false;
+        InstanceGpu inst = s.instances[slot];
+        ModelGpu* model = s.models + inst.model;
+        MeshGpu* mesh = s.meshes + model.mesh;
+        ClusterRef r = s.clusters[cluster_id];
+        Cluster c = load_cluster(r.page, r.local);
+        corners = load_corners(r.page, c, primitive, mesh);
+        material = section_material(s, inst, model, c.section);
+        attributes = mesh.attributes;
+        GroupGpu* g = s.groups + inst.group;
+        if (!placement(g, previous ? g.previous : g.current, inst.group_index, s.origin_cell.xyz, float3(0.0), cell_log2, pl))
+            return false;
+        // A part instance traces its part posed.
+        if (instance_index >= s.part_base)
+        {
+            float3x4 pose;
+            if (!part_pose(s, inst, mesh, c.part, previous, pose))
+                return false;
+            pl = placed_after(pl, pose);
+        }
+        i.instance = slot;
+        i.cluster = r.mesh_cluster;
+        i.part = c.part;
+        i.user_tag = inst.user_tag;
+        h.error = c.self_error;
+        h.origin = ORIGIN_DEFAULT;
+    }
+    if (material == MATERIAL_NONE)
         return false;
-    InstanceGpu inst = s.instances[slot];
-    ModelGpu* model = s.models + inst.model;
-    MeshGpu* mesh = s.meshes + model.mesh;
-    ClusterRef r = s.clusters[cluster_id];
-    Cluster c = load_cluster(r.page, r.local);
-    Corners corners = load_corners(r.page, c, primitive, mesh);
     if (fetched)
         corners.position = t.position;
-    uint material = section_material(s, inst, model, c.section);
     MaterialGpu* m = s.materials + material;
-    GroupGpu* g = s.groups + inst.group;
-    uint cell_log2 = uint(s.origin_cell.w);
-    Placement pl;
-    if (!placement(g, previous ? g.previous : g.current, inst.group_index, s.origin_cell.xyz, float3(0.0), cell_log2, pl))
-        return false;
-    // A part instance traces its part posed.
-    if (instance_index >= s.part_base)
-    {
-        float3x4 pose;
-        if (!part_pose(s, inst, mesh, c.part, previous, pose))
-            return false;
-        pl = placed_after(pl, pose);
-    }
 
     // Barycentric steps of the cone's footprint: two directions across the ray, carried
     // along it onto the triangle's plane.
@@ -339,15 +461,10 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
     float2 bx = float2(dot(cross(x * w, e2), n), dot(cross(e1, x * w), n)) / nn;
     float2 by = float2(dot(cross(yp * w, e2), n), dot(cross(e1, yp * w), n)) / nn;
 
-    SurfaceInput i = (SurfaceInput)0;
-    triangle_geometry(i, corners, mesh, m, pl, bary, bx, by, d, 1.0);
+    triangle_geometry(i, corners, attributes, m, pl, bary, bx, by, d, 1.0);
     i.context = context;
-    i.instance = slot;
-    i.cluster = r.mesh_cluster;
-    i.part = c.part;
     i.primitive = primitive;
     i.barycentrics = bary;
-    i.user_tag = inst.user_tag;
     i.material = material;
     i.surface = m.surface;
     i.position = place(pl, i.object_position);
@@ -357,7 +474,6 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
     i.view = v;
     i.data = m.data != 0 ? m.data : s.surface_data;
     h.input = i;
-    h.cluster = c;
     h.placement = pl;
     return true;
 }
@@ -381,7 +497,7 @@ public SurfaceHit resolve_hit<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
     MaterialGpu* m = s.materials + h.input.material;
     g.position = h.input.position + d * offset;
     g.raster_error = 0.0;
-    g.flags = (g.flags & ~GBUFFER_ORIGIN_MASK) | (((m.flags & MATERIAL_ORIGIN_MASK) >> MATERIAL_ORIGIN_SHIFT) << GBUFFER_ORIGIN_SHIFT);
+    g.flags = (g.flags & ~GBUFFER_ORIGIN_MASK) | (hit_origin(m, h.origin) << GBUFFER_ORIGIN_SHIFT);
     g.instance = h.input.instance;
     g.cluster = h.input.cluster;
     g.primitive = primitive;
@@ -390,7 +506,9 @@ public SurfaceHit resolve_hit<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
     hit.uv = h.input.uv;
     hit.user_tag = h.input.user_tag;
     hit.part = h.input.part;
-    hit.geometric_error = h.cluster.self_error * h.placement.scale;
+    hit.geometric_error = h.error * h.placement.scale;
+    hit.cluster_user = h.input.cluster_user;
+    hit.vertex_user = h.input.vertex_user;
     hit.depth_offset = offset;
     hit.valid = true;
     return hit;

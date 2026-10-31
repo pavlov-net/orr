@@ -46,12 +46,13 @@ pub use orr_scene::{
     ExposureState, Focus, FrameStats, FrameTime, Glare, GroupGpu, GroupWriter, InstanceFlags,
     InstanceGpu, InstancePage, InstanceRange, InstancesDesc, Lens, LensDistortion, Light, LightGpu,
     LightId, LoadState, Loading, MaterialGpu, MaterialId, MaterialWriter, MeshGpu, ModelEmission,
-    ModelGpu, ModelId, MountId, PackSource, PageId, PipelineId, Pose, ProducerBatch,
-    ProducerClusterGpu, ProducerDesc, ProducerGpu, ProducerId, ProducerUpdate, Projection,
-    REBASE_GRID_LOG2, ReloadReport, RendererDesc, ResidencyClass, ResidencyStats, RtCutGpu,
-    RtStats, SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter, SkyStats, SlotStateGpu,
-    TopologyGpu, TransformGroupDesc, TransformGroupId, ViewConstants, ViewDesc, ViewHistoryId,
-    ViewTarget, WorldPos, abi, material_flags, orr_gpu, orr_pack,
+    ModelGpu, ModelId, MountId, Opacity, OriginPolicy, PackSource, PageId, PipelineId, Pose,
+    ProducerBatch, ProducerClusterGpu, ProducerDesc, ProducerGpu, ProducerId, ProducerStats,
+    ProducerUpdate, Projection, REBASE_GRID_LOG2, RasterGpu, ReloadReport, RendererDesc,
+    ResidencyClass, ResidencyStats, RtCutGpu, RtStats, SceneCompute, SceneDesc, SceneId, SceneRoot,
+    SceneWriter, SkyStats, SlotStateGpu, TopologyGpu, TransformGroupDesc, TransformGroupId,
+    TransparencyPass, ViewConstants, ViewDesc, ViewHistoryId, ViewTarget, WorldPos, abi,
+    material_flags, orr_gpu, orr_pack,
 };
 
 use orr_gpu::{
@@ -103,6 +104,10 @@ pub struct FrameDesc<'a> {
 /// The consumer passes a view runs, each once per `render_view` that sets it.
 #[derive(Default)]
 pub struct ViewHooks<'a> {
+    /// Into the view's transparency overlay after its opaque lighting, at the render extent;
+    /// the overlay is composited over the radiance before `scene_referred`. Particle
+    /// producer entries are drawn here or not at all for primary visibility.
+    pub transparency: Option<&'a mut dyn FnMut(&mut TransparencyPass<'_, '_>)>,
     /// On the view's pre-exposed radiance before metering, at the output extent.
     pub scene_referred: Option<&'a mut dyn FnMut(&mut HookPass<'_, '_>)>,
     /// On tonemap's display-linear image before compose; not run for `ViewTarget::AfterRr`.
@@ -610,6 +615,11 @@ impl<'a> Frame<'a> {
         state.samples = state.samples.wrapping_add(1);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         let (radiance, radiance_store) = (paths.radiance_index(), paths.radiance_storage());
+        if let Some(hook) = hooks.transparency.as_mut() {
+            self.scenes
+                .transparency(&raster, radiance_store, &mut **hook)?;
+        }
+        let list = self.scenes.list()?;
 
         let linear = image_at(&mut state.linear, &gpu, list, extent, "view linear")?;
         let chain = ChainImages {
