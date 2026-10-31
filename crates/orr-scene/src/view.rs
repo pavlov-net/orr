@@ -6,6 +6,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{DVec3, IVec3, Mat3, Mat4, Quat, UVec2, Vec2, Vec4};
 use orr_gpu::{Allocation, GpuPtr, Texture};
 
+use crate::arena::ViewArena;
 use crate::raster::ViewTargets;
 use crate::world::WorldPos;
 use crate::{GBufferGpu, SceneId};
@@ -195,8 +196,10 @@ pub struct ViewDesc<'a> {
     pub target: ViewTarget<'a>,
 }
 
-/// What a view's raster half hands to the passes after it. The targets stay valid until
-/// the frame's GPU work completes.
+/// What a view's raster half hands to the passes after it. Depth, motion and the HZB stay
+/// valid until the frame's GPU work completes. The G-buffer textures, the visibility buffer
+/// and the visible clusters live in the view's arena: when the view's render enters
+/// [`crate::ViewStep::Rr`] or a later step, other targets may have taken their memory.
 #[derive(Clone)]
 pub struct RasterView {
     pub view: GpuPtr<ViewConstants>,
@@ -246,15 +249,18 @@ pub(crate) struct ViewHistory {
     slot: u32,
     previous: Option<Camera>,
     pub targets: Option<ViewTargets>,
+    /// The transient targets of the view's render, orr-scene's and the later passes'.
+    pub arena: ViewArena,
 }
 
 impl ViewHistory {
-    pub(crate) fn new(exposure: Allocation<ExposureState>) -> Self {
+    pub(crate) fn new(exposure: Allocation<ExposureState>, arena: ViewArena) -> Self {
         Self {
             exposure,
             slot: 0,
             previous: None,
             targets: None,
+            arena,
         }
     }
 }

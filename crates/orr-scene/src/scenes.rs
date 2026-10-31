@@ -16,6 +16,7 @@ use orr_gpu::{
 use orr_pack::AssetId;
 
 use crate::accel::{AccelKernels, AccelLimits, AccelShared};
+use crate::arena::{ArenaReport, ArenaRequest, ViewArena, ViewStep};
 use crate::emissive::ModelEmission;
 use crate::loading::{self, Loading, Msg};
 use crate::material::{MaterialId, MaterialTable, MaterialWriter};
@@ -159,6 +160,9 @@ pub struct RendererDesc {
     /// in compute, unless they cross the near plane; others take the mesh-shader path. 0
     /// turns the software raster off; values above 128 act as 128.
     pub software_raster_pixels: f32,
+    /// A view's transient targets whose spans in the frame order do not overlap share
+    /// memory ([`ViewArena`]).
+    pub alias_view_targets: bool,
 }
 
 impl Default for RendererDesc {
@@ -174,6 +178,7 @@ impl Default for RendererDesc {
             culled_error_scale: 2.0,
             rt_merge_pixels: 32.0,
             software_raster_pixels: 32.0,
+            alias_view_targets: true,
         }
     }
 }
@@ -277,6 +282,7 @@ struct Core {
     culled_error_scale: f32,
     rt_merge_pixels: f32,
     software_raster_pixels: f32,
+    alias_view_targets: bool,
     raster: RasterPipelines,
     cuts: CutPipelines,
     materials: MaterialTable,
@@ -403,6 +409,7 @@ impl Scenes {
                 culled_error_scale: desc.culled_error_scale,
                 rt_merge_pixels: desc.rt_merge_pixels,
                 software_raster_pixels: desc.software_raster_pixels,
+                alias_view_targets: desc.alias_view_targets,
                 raster,
                 cuts,
                 materials: MaterialTable::new(device, desc.budgets.materials)?,
@@ -607,8 +614,18 @@ impl Scenes {
                     Record::fill(0, at + 8, words - 2, 0),
                 ]
             }));
-        let history = ViewHistory::new(exposure);
+        let arena = ViewArena::new(&self.device, self.core.alias_view_targets);
+        let history = ViewHistory::new(exposure, arena);
         Ok(ViewHistoryId(insert(&mut self.core.histories, history)))
+    }
+
+    /// What the arena of view `history` holds, as its last render laid it out.
+    pub fn view_arena_report(&self, history: ViewHistoryId) -> Option<ArenaReport> {
+        self.core
+            .histories
+            .get(history.0 as usize)
+            .and_then(Option::as_ref)
+            .map(|h| h.arena.report())
     }
 
     pub fn destroy_view_history(&mut self, id: ViewHistoryId) {
@@ -1273,8 +1290,19 @@ impl<'a> Frame<'a> {
 
     /// Step 4, the raster half of a view: writes its `ViewConstants`, culls and rasters the
     /// scene into the visibility buffer, resolves the G-buffer, depth, motion and HZB, and
-    /// moves its history on.
+    /// moves its history on. Lays out the view's arena with the raster's transient targets
+    /// alone and enters [`ViewStep::Raster`].
     pub fn raster_view(&mut self, view: &ViewDesc<'_>) -> Result<RasterView> {
+        self.raster_view_with(view, &[])
+    }
+
+    /// [`Self::raster_view`], with `requests`, the transient targets of the passes that
+    /// follow it, laid out in the view's arena beside the raster's.
+    pub fn raster_view_with(
+        &mut self,
+        view: &ViewDesc<'_>,
+        requests: &[ArenaRequest],
+    ) -> Result<RasterView> {
         self.ensure_updated()?;
         if !self.listed.contains(&view.scene) {
             return Err(Error::NotListed(view.scene));
@@ -1322,8 +1350,13 @@ impl<'a> Frame<'a> {
         );
         let window = &core.windows[self.window];
         let list = self.list.as_mut().expect("frame list");
-        if history.targets.as_ref().is_none_or(|t| t.sizes != sizes) {
-            history.targets = Some(ViewTargets::new(device, sizes, list)?);
+        let mut all = ViewTargets::requests(&sizes);
+        all.extend_from_slice(requests);
+        history.arena.layout(&all, list)?;
+        history.arena.enter(ViewStep::Raster, list);
+        match &mut history.targets {
+            Some(t) if t.sizes == sizes => t.bind(&history.arena),
+            t => *t = Some(ViewTargets::new(device, sizes, &history.arena, list)?),
         }
         let targets = history.targets.as_mut().expect("view targets");
         let occlusion =
@@ -1344,6 +1377,7 @@ impl<'a> Frame<'a> {
             core.software_raster_pixels,
             occlusion,
         )?;
+        let (gbuf_a, gbuf_b, gbuf_x) = targets.gbuffer_textures();
         let out = RasterView {
             view: constants,
             scene: root,
@@ -1351,9 +1385,9 @@ impl<'a> Frame<'a> {
             targets: targets.gbuffer(),
             depth: Arc::clone(&targets.depth.texture),
             motion: Arc::clone(&targets.motion.texture),
-            gbuf_a: Arc::clone(&targets.a.texture),
-            gbuf_b: Arc::clone(&targets.b.texture),
-            gbuf_x: targets.x.as_ref().map(|x| Arc::clone(&x.texture)),
+            gbuf_a,
+            gbuf_b,
+            gbuf_x,
             hzb: Arc::clone(&targets.hzb.texture),
             counts: targets.counts(),
             raster,
@@ -1365,9 +1399,10 @@ impl<'a> Frame<'a> {
         Ok(out)
     }
 
-    /// Step 5's transparency point for a view `raster_view` rendered this frame: clears
-    /// the view's overlay, runs `hook` to draw into it, then composites the overlay over
-    /// `radiance` (RGBA16F at the render extent, pre-exposed) in place.
+    /// Step 5's transparency point for a view `raster_view` rendered this frame: enters
+    /// [`ViewStep::Transparency`], clears the view's overlay, runs `hook` to draw into it,
+    /// then composites the overlay over `radiance` (RGBA16F at the render extent,
+    /// pre-exposed) in place.
     pub fn transparency(
         &mut self,
         view: &RasterView,
@@ -1380,22 +1415,25 @@ impl<'a> Frame<'a> {
         let core = &mut *self.core;
         let window = &core.windows[self.window];
         let list = self.list.as_mut().expect("frame list");
-        let targets = core
+        let history = core
             .histories
             .get_mut(view.history.0 as usize)
             .and_then(Option::as_mut)
-            .and_then(|h| h.targets.as_mut())
+            .filter(|h| h.targets.is_some())
             .ok_or(Error::UnknownViewHistory(view.history))?;
+        history.arena.enter(ViewStep::Transparency, list);
+        let targets = history.targets.as_ref().expect("view targets");
         let extent = targets.sizes.extent;
         let (particle_args, particle_draws) = targets.particle_draws();
         let depth = Arc::clone(&targets.depth.texture);
         let depth_index = targets.depth.sampled;
-        let overlay = targets.overlay(device, list)?;
+        let overlay = targets.overlay();
+        let (overlay_texture, overlay_index) = (Arc::clone(overlay.texture()), overlay.sampled());
         list.barrier(Stages::ALL, Stages::COLOR_OUT, Hazards::empty());
         list.begin_rendering(&Rendering {
             extent,
             colors: &[ColorAttachment {
-                texture: &overlay.texture,
+                texture: &overlay_texture,
                 load: ColorLoad::Clear(ClearColor::Float([0.0; 4])),
                 store: true,
             }],
@@ -1405,7 +1443,7 @@ impl<'a> Frame<'a> {
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
         hook(&mut TransparencyPass {
             cmd: list,
-            overlay: &overlay.texture,
+            overlay: &overlay_texture,
             depth: &depth,
             depth_index,
             extent,
@@ -1421,7 +1459,7 @@ impl<'a> Frame<'a> {
         let root = window.put_root(
             device,
             &CompositeRoot {
-                overlay: overlay.sampled,
+                overlay: overlay_index,
                 radiance,
                 width: extent[0],
                 height: extent[1],
@@ -1435,6 +1473,24 @@ impl<'a> Frame<'a> {
         list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         self.step("transparency");
         Ok(())
+    }
+
+    /// The frame's command list and the arena of view `history`, as its last
+    /// `raster_view_with` laid it out, for the passes of the view's render after its raster
+    /// half: they enter their steps ([`ViewArena::enter`]) and take their targets from it.
+    pub fn list_and_arena(
+        &mut self,
+        history: ViewHistoryId,
+    ) -> Result<(&mut CommandList<'a>, &mut ViewArena)> {
+        self.ensure_updated()?;
+        let arena = &mut self
+            .core
+            .histories
+            .get_mut(history.0 as usize)
+            .and_then(Option::as_mut)
+            .ok_or(Error::UnknownViewHistory(history))?
+            .arena;
+        Ok((self.list.as_mut().expect("frame list"), arena))
     }
 
     /// Step 6: submits the frame on the render queue after `wait`, and returns the point

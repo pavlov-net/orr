@@ -479,11 +479,15 @@ impl Shared {
             Some(p) => pools.buffers[p as usize][kind.index()],
             None => pools.transient[kind.index()],
         };
-        let flags = if self.memory.host_visible(kind) {
+        let mut flags = if self.memory.host_visible(kind) {
             AllocationFlags::MAPPED
         } else {
             AllocationFlags::empty()
         };
+        // Textures may be placed in the buffer's memory, also when it gets its own.
+        if kind != MemoryKind::Readback {
+            flags |= AllocationFlags::CAN_ALIAS;
+        }
         // SAFETY: valid create info for this device.
         let (buffer, allocation) = unsafe {
             pools

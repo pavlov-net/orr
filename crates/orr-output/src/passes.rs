@@ -9,13 +9,13 @@ use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, GpuPtr, Hazards, MemoryKind, OutputFormat,
     ShaderStage, SpecData, Stages, StorageImageIndex, Texture, TextureIndex,
 };
-use orr_scene::{DepthOfField, LensDistortion, SkyStats, ViewConstants};
+use orr_scene::{DepthOfField, LensDistortion, SkyStats, ViewArena, ViewConstants};
 
 use crate::dof::{DofKernels, DofTargets};
 use crate::exposure::{COMPENSATION_ENTRIES, HISTOGRAM_BINS, HISTOGRAM_WORDS_PER_BIN};
 use crate::fft_glare::{FftGlareKernels, FftGlareTargets, FftLayout};
 use crate::glare::{GLARE_DISPATCHES, GlareKernels, GlareTargets, ViewGlare, levels};
-use crate::hooks::HookTargets;
+use crate::hooks::{HOOK_DEPTH, HOOK_MOTION};
 use crate::motion_blur::{MotionBlurKernels, MotionBlurTargets};
 use crate::shaders::compose;
 use crate::shaders::exposure::adapt::{self, AdaptParams, ExposureTelemetryGpu};
@@ -115,7 +115,6 @@ impl OutputRoots {
 pub struct OutputView {
     frames: Vec<OutputRoots>,
     captures: Vec<Capture>,
-    hooks: Option<HookTargets>,
     motion_blur: Option<MotionBlurTargets>,
     dof: Option<DofTargets>,
     glare: Option<ViewGlare>,
@@ -136,17 +135,11 @@ impl OutputView {
         Ok(Self {
             frames,
             captures: Vec::new(),
-            hooks: None,
             motion_blur: None,
             dof: None,
             glare: None,
             device: gpu.clone(),
         })
-    }
-
-    /// Bytes of the hook inputs held for the view: 0 unless its last frame set a hook.
-    pub fn hook_input_bytes(&self) -> u64 {
-        self.hooks.as_ref().map_or(0, HookTargets::bytes)
     }
 
     /// Bytes of the motion blur tiles held for the view: 0 unless its last frame had the
@@ -460,34 +453,34 @@ impl OutputKernels {
     }
 
     /// Records the `hook_inputs` pass when the view sets a hook: depth and motion at output
-    /// resolution, with a `scene_referred` hook the copy of RR's output it reads as its
-    /// source, and with `field` the field cleared to identity. Allocates the inputs on the
-    /// first frame that sets a hook and frees them on the first that sets none, which
-    /// records nothing. Order the writes of lighting's targets and RR before it with a
-    /// barrier; [`HookInputs::run`] orders its writes before the hooks.
+    /// resolution into the targets of [`crate::hook_requests`] in `arena`, with a
+    /// `scene_referred` hook the copy of RR's output it reads as its source, and with
+    /// `field` the field cleared to identity. Records nothing when the view sets no hook.
+    /// Order the writes of lighting's targets and RR before it with a barrier;
+    /// [`HookInputs::run`] orders its writes before the hooks.
     pub fn hook_inputs(
         &self,
         list: &mut CommandList<'_>,
         view: &mut OutputView,
+        arena: &ViewArena,
         pass: &HookInputsPass,
         field: Option<&mut DistortionField>,
     ) -> Result<Option<HookInputs>> {
         if !pass.hooks.any() {
-            view.hooks = None;
             return Ok(None);
         }
-        if view
-            .hooks
-            .as_ref()
-            .is_none_or(|t| t.extent() != pass.extent)
-        {
-            view.hooks = Some(HookTargets::new(&view.device, pass.extent)?);
-        }
-        let targets = view.hooks.as_mut().expect("hook targets");
-        if std::mem::take(&mut targets.fresh) {
-            list.discard(targets.depth.texture());
-            list.discard(targets.motion.texture());
-        }
+        let target = |name| {
+            arena
+                .texture(name)
+                .filter(|t| t.texture().desc().extent[..2] == pass.extent)
+                .ok_or_else(|| {
+                    crate::Error::Gpu(orr_scene::orr_gpu::Error::Invalid(format!(
+                        "the view's arena holds no {name} at {:?}",
+                        pass.extent
+                    )))
+                })
+        };
+        let (depth, motion) = (target(HOOK_DEPTH)?, target(HOOK_MOTION)?);
         let field = field.map_or(StorageImageIndex::NONE, |f| {
             assert_eq!(
                 f.extent(),
@@ -505,8 +498,8 @@ impl OutputKernels {
         };
         let inputs = HookInputs {
             hooks: pass.hooks,
-            depth: targets.depth.sampled,
-            motion: targets.motion.sampled,
+            depth: depth.sampled(),
+            motion: motion.sampled(),
             extent: pass.extent,
             view: pass.view,
             jitter: pass.jitter,
@@ -515,8 +508,8 @@ impl OutputKernels {
             view: pass.view,
             rr_depth: pass.rr_depth,
             rr_motion: pass.rr_motion,
-            depth: targets.depth.storage,
-            motion: targets.motion.storage,
+            depth: depth.storage(0),
+            motion: motion.storage(0),
             copy_source,
             copy_target,
             field,

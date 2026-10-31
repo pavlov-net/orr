@@ -7,7 +7,10 @@ use orr_scene::orr_gpu::{
     RayDispatchPipeline, ShaderModule, ShaderStage, SpecData, Stages, StorageImageIndex, Texture,
     TextureDesc, TextureIndex, TextureMemory, TextureUsage,
 };
-use orr_scene::{GBufferGpu, SceneId, SceneRoot, ViewConstants, ViewDesc};
+use orr_scene::{
+    ArenaRequest, ArenaTexture, GBufferGpu, SceneId, SceneRoot, Span, ViewArena, ViewConstants,
+    ViewDesc, ViewStep,
+};
 
 use crate::scene::{FRAME_SLOTS, Ring, device_local};
 use crate::shaders::guides::resolve;
@@ -202,25 +205,67 @@ struct Feedback {
     sampled: TextureIndex,
 }
 
-/// One view's lighting targets at its render extent, which are ray reconstruction's inputs,
-/// and its history; kept with the view's history.
+/// Arena names of a [`LightingView`]'s targets.
+const RADIANCE: &str = "radiance";
+const DIFFUSE_ALBEDO: &str = "diffuse albedo";
+const SPECULAR_ALBEDO: &str = "specular albedo";
+const NORMAL_ROUGHNESS: &str = "normal roughness";
+const SPECULAR_MOTION: &str = "specular motion";
+const RR_DEPTH: &str = "rr depth";
+const RR_MOTION: &str = "rr motion";
+
+/// The radiance lives until the end of the frame: the passes after ray reconstruction and
+/// the consumer read it.
+const RADIANCE_SPAN: Span = Span::new(ViewStep::Lighting, ViewStep::After);
+/// The guides and lighting's depth and motion are ray reconstruction's inputs.
+const GUIDE_SPAN: Span = Span::new(ViewStep::Lighting, ViewStep::Rr);
+
+/// The view's targets in its arena, taken at one layout.
+struct Targets {
+    generation: u64,
+    radiance: ArenaTexture,
+    diffuse_albedo: ArenaTexture,
+    specular_albedo: ArenaTexture,
+    normal_roughness: ArenaTexture,
+    specular_motion: ArenaTexture,
+    depth: ArenaTexture,
+    motion: ArenaTexture,
+}
+
+impl Targets {
+    fn take(arena: &ViewArena) -> Result<Self, Error> {
+        let get = |name| {
+            arena.texture(name).cloned().ok_or_else(|| {
+                Error::Gpu(orr_gpu::Error::Invalid(format!(
+                    "the view's arena holds no {name} target"
+                )))
+            })
+        };
+        Ok(Self {
+            generation: arena.generation(),
+            radiance: get(RADIANCE)?,
+            diffuse_albedo: get(DIFFUSE_ALBEDO)?,
+            specular_albedo: get(SPECULAR_ALBEDO)?,
+            normal_roughness: get(NORMAL_ROUGHNESS)?,
+            specular_motion: get(SPECULAR_MOTION)?,
+            depth: get(RR_DEPTH)?,
+            motion: get(RR_MOTION)?,
+        })
+    }
+}
+
+/// One view's lighting targets at its render extent, which are ray reconstruction's inputs
+/// and live in the view's arena, and its history; kept with the view's history.
 pub struct LightingView {
     device: Device,
     extent: [u32; 2],
-    radiance: Target,
-    diffuse_albedo: Target,
-    specular_albedo: Target,
-    normal_roughness: Target,
-    specular_motion: Target,
-    depth: Target,
-    motion: Target,
+    targets: Targets,
     feedback: [Feedback; 2],
     /// The feedback the next opaque dispatch writes; the other holds the last frame's.
     feedback_index: usize,
     local: Allocation<LocalLights>,
     local_tiles: [u32; 2],
     slots: Vec<u32>,
-    radiance_sampled: TextureIndex,
     roots: Ring<PathRoot>,
     update_roots: Ring<PathRoot>,
     local_roots: Ring<local::Root>,
@@ -230,7 +275,27 @@ pub struct LightingView {
 }
 
 impl LightingView {
-    pub fn new(device: &Device, extent: [u32; 2]) -> Result<Self, Error> {
+    /// The targets a view's arena holds for its [`LightingView`] at `extent`.
+    pub fn requests(extent: [u32; 2]) -> Vec<ArenaRequest> {
+        let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
+        let d2 = |format| TextureDesc::d2(format, extent[0], extent[1], usage);
+        let guide = |name, format| ArenaRequest::texture(name, d2(format), GUIDE_SPAN);
+        vec![
+            ArenaRequest::texture(RADIANCE, d2(Format::Rgba16Float), RADIANCE_SPAN),
+            guide(DIFFUSE_ALBEDO, Format::Rgba8Unorm),
+            guide(SPECULAR_ALBEDO, Format::Rgba8Unorm),
+            guide(NORMAL_ROUGHNESS, Format::Rgba16Float),
+            guide(SPECULAR_MOTION, Format::Rg16Float),
+            guide(RR_DEPTH, Format::R32Float),
+            guide(RR_MOTION, Format::Rg16Float),
+        ]
+    }
+
+    /// A view over the targets `arena` holds from [`Self::requests`], at their extent.
+    pub fn new(device: &Device, arena: &ViewArena) -> Result<Self, Error> {
+        let targets = Targets::take(arena)?;
+        let [w, h, _] = targets.radiance.texture().desc().extent;
+        let extent = [w, h];
         let mut slots = Vec::new();
         let mut target = |format, name: &str| -> Result<Target, Error> {
             let desc = TextureDesc::d2(
@@ -245,13 +310,6 @@ impl LightingView {
             let store = device.write_storage(slot, &texture, &orr_gpu::ViewDesc::default());
             Ok(Target { texture, store })
         };
-        let radiance = target(Format::Rgba16Float, "radiance")?;
-        let diffuse_albedo = target(Format::Rgba8Unorm, "diffuse albedo")?;
-        let specular_albedo = target(Format::Rgba8Unorm, "specular albedo")?;
-        let normal_roughness = target(Format::Rgba16Float, "normal roughness")?;
-        let specular_motion = target(Format::Rg16Float, "specular motion")?;
-        let depth = target(Format::R32Float, "rr depth")?;
-        let motion = target(Format::Rg16Float, "rr motion")?;
         let feedback_targets = [
             target(Format::Rg32Uint, "light feedback")?,
             target(Format::Rg32Uint, "light feedback")?,
@@ -261,7 +319,6 @@ impl LightingView {
             slots.push(slot);
             Ok(device.write_sampled(slot, texture, &orr_gpu::ViewDesc::default()))
         };
-        let radiance_sampled = sampled_view(&radiance.texture)?;
         let [a, b] = feedback_targets;
         let feedback = [
             Feedback {
@@ -282,19 +339,12 @@ impl LightingView {
         Ok(Self {
             device: device.clone(),
             extent,
-            radiance,
-            diffuse_albedo,
-            specular_albedo,
-            normal_roughness,
-            specular_motion,
-            depth,
-            motion,
+            targets,
             feedback,
             feedback_index: 0,
             local,
             local_tiles,
             slots,
-            radiance_sampled,
             roots: Ring::new(device, "path roots")?,
             update_roots: Ring::new(device, "update path roots")?,
             local_roots: Ring::new(device, "local light sampler roots")?,
@@ -302,6 +352,14 @@ impl LightingView {
             previous: None,
             history_reset: true,
         })
+    }
+
+    /// Takes the targets again after `arena` was laid out anew, at the view's extent.
+    pub fn bind(&mut self, arena: &ViewArena) -> Result<(), Error> {
+        if self.targets.generation != arena.generation() {
+            self.targets = Targets::take(arena)?;
+        }
+        Ok(())
     }
 
     pub fn extent(&self) -> [u32; 2] {
@@ -344,47 +402,47 @@ impl LightingView {
 
     /// RGBA16F, pre-exposed noisy radiance; alpha is 1 where the G-buffer holds a surface.
     pub fn radiance(&self) -> &Texture {
-        &self.radiance.texture
+        self.targets.radiance.texture()
     }
 
     pub fn radiance_index(&self) -> TextureIndex {
-        self.radiance_sampled
+        self.targets.radiance.sampled()
     }
 
     /// The radiance's storage view, for passes that draw over it after lighting.
     pub fn radiance_storage(&self) -> StorageImageIndex {
-        self.radiance.store
+        self.targets.radiance.storage(0)
     }
 
     /// RGBA8 unorm, not sRGB: diffuse albedo, subsurface included; 0.5 on sky pixels.
     pub fn diffuse_albedo(&self) -> &Texture {
-        &self.diffuse_albedo.texture
+        self.targets.diffuse_albedo.texture()
     }
 
     /// RGBA8 unorm, not sRGB: specular albedo; 0 on sky pixels.
     pub fn specular_albedo(&self) -> &Texture {
-        &self.specular_albedo.texture
+        self.targets.specular_albedo.texture()
     }
 
     /// RGBA16F: world normal in RGB and linear roughness in A; 0 on sky pixels.
     pub fn normal_roughness(&self) -> &Texture {
-        &self.normal_roughness.texture
+        self.targets.normal_roughness.texture()
     }
 
     /// RG16F, previous uv minus current uv: the mirror reflection's motion on smooth pixels,
     /// the surface's elsewhere.
     pub fn specular_motion(&self) -> &Texture {
-        &self.specular_motion.texture
+        self.targets.specular_motion.texture()
     }
 
     /// R32F reverse-Z device depth, 0 on sky pixels.
     pub fn depth(&self) -> &Texture {
-        &self.depth.texture
+        self.targets.depth.texture()
     }
 
     /// RG16F, previous uv minus current uv, unjittered.
     pub fn motion(&self) -> &Texture {
-        &self.motion.texture
+        self.targets.motion.texture()
     }
 
     /// RG32_UINT: per pixel, the light feedback of the last opaque dispatch (a light's
@@ -598,7 +656,7 @@ impl LightingKernels {
             set: scene.light_set(),
             cache: scene.world_cache(pass.frame),
             local: if local { view.local.gpu } else { GpuPtr::NULL },
-            radiance: view.radiance.store,
+            radiance: view.targets.radiance.storage(0),
             primary_candidates: lighting.primary_di_candidates,
             bounce_candidates: lighting.bounce_di_candidates,
             max_bounces: lighting.max_bounces,
@@ -662,13 +720,13 @@ impl LightingKernels {
                 scene: pass.scene,
                 view: pass.view,
                 gbuffer: pass.gbuffer,
-                radiance: view.radiance.store,
-                diffuse_albedo: view.diffuse_albedo.store,
-                specular_albedo: view.specular_albedo.store,
-                normal_roughness: view.normal_roughness.store,
-                specular_motion: view.specular_motion.store,
-                depth: view.depth.store,
-                motion: view.motion.store,
+                radiance: view.targets.radiance.storage(0),
+                diffuse_albedo: view.targets.diffuse_albedo.storage(0),
+                specular_albedo: view.targets.specular_albedo.storage(0),
+                normal_roughness: view.targets.normal_roughness.storage(0),
+                specular_motion: view.targets.specular_motion.storage(0),
+                depth: view.targets.depth.storage(0),
+                motion: view.targets.motion.storage(0),
                 motion_roughness: lighting.guides.specular_motion_roughness,
                 debug,
                 _pad0: 0,

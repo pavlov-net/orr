@@ -41,7 +41,9 @@ pub use exposure::{
 pub use frame_generation::FrameGenerationMode;
 pub use glare::{GlareComposite, GlarePass};
 pub use gt7::{GT7_REFERENCE_NITS, GT7_SDR_NITS, Gt7Curve, Gt7Params};
-pub use hooks::{ChainImages, DistortionField, HookInputs, HookPass, HookPoint, Hooks, Image};
+pub use hooks::{
+    ChainImages, DistortionField, HookInputs, HookPass, HookPoint, Hooks, Image, hook_requests,
+};
 pub use motion_blur::{MOTION_BLUR_MAX_RADIUS, MotionBlurPass};
 pub use orr_dlss::{self, DlssSdk, Support as DlssSupport};
 pub use orr_scene::orr_gpu::{HdrMetadata, LowLatency, OutputFormat, PresentMode};

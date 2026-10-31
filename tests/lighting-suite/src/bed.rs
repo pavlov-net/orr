@@ -26,7 +26,7 @@ use orr_scene::testing::{FlipError, Image, Pixels, flip};
 use orr_scene::{
     FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens, LoadState, Loading,
     MountId, PackSource, Projection, RasterView, RendererDesc, SceneDesc, SceneId, Scenes,
-    TextureFilter, TransformGroupDesc, ViewDesc, ViewHistoryId, ViewTarget,
+    TextureFilter, TransformGroupDesc, ViewArena, ViewDesc, ViewHistoryId, ViewTarget,
 };
 
 use crate::shaders::{accumulate, exposure, flat_color, guide_read};
@@ -823,6 +823,8 @@ pub struct Bed {
     _mount: MountId,
     _environment: Option<(TestTexture, Allocation<EnvironmentMapGpu>)>,
     target: LightingView,
+    /// Holds `target`'s targets.
+    _arena: ViewArena,
     sum: Allocation<[f32; 4]>,
     out: Allocation<[f32; 4]>,
     roots: Roots,
@@ -960,6 +962,13 @@ impl Bed {
         let lighting =
             SceneLighting::new(d, kernels, &desc, &SceneLightingSettings::default()).unwrap();
         let buffer = |kind, name| d.gpu_malloc::<[f32; 4]>(kind, PIXELS, name).unwrap();
+        let mut arena = ViewArena::new(d, false);
+        let mut list = render().command_list().unwrap();
+        arena
+            .layout(&LightingView::requests(EXTENT), &mut list)
+            .unwrap();
+        let point = render().submit(vec![list], &[]).unwrap();
+        render().wait(point, Duration::from_secs(10)).unwrap();
         Self {
             spec,
             lighting,
@@ -968,7 +977,8 @@ impl Bed {
             history,
             _mount: mount,
             _environment: environment,
-            target: LightingView::new(d, EXTENT).unwrap(),
+            target: LightingView::new(d, &arena).unwrap(),
+            _arena: arena,
             sum: buffer(MemoryKind::DeviceLocal, "bed sum"),
             out: buffer(MemoryKind::Readback, "bed readback"),
             roots: Roots {
