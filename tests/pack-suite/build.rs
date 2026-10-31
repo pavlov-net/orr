@@ -9,6 +9,7 @@ use orr_shaders::build::Build;
 const PACK_TYPES: &[(&str, &str)] = &[
     ("PageHeader", "::orr_pack::mesh::PageHeader"),
     ("Cluster", "::orr_pack::mesh::Cluster"),
+    ("StoredPage", "::orr_pack::mesh::StoredPage"),
     (
         "InstancePageHeader",
         "::orr_pack::instance::InstancePageHeader",

@@ -6,6 +6,9 @@ module mesh;
 
 import orr.packing;
 
+// Largest resident page, bytes.
+public static const uint PAGE_MAX = 128 << 10;
+
 // `MeshHeader.attributes`.
 public static const uint MESH_TANGENT = 1;
 public static const uint MESH_SKIN = 2;

@@ -8,17 +8,21 @@ license.workspace = true
 publish = false
 
 [dependencies]
+bytemuck.workspace = true
 orr-gpu.workspace = true
 orr-pack.workspace = true
 orr-scene = { workspace = true, features = ["testing"] }
 orr-shaders.workspace = true
 
 [dev-dependencies]
-bytemuck.workspace = true
 glam.workspace = true
 gpu-suite = { path = "../gpu-suite" }
-orr-cook = { path = "../../crates/orr-cook" }
+orr-cook.workspace = true
 png = "0.18"
+
+[[bench]]
+name = "page_codec"
+harness = false
 
 [build-dependencies]
 orr-shaders = { workspace = true, features = ["build"] }
