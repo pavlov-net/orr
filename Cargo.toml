@@ -14,6 +14,7 @@ orr = { path = "crates/orr" }
 orr_atmosphere = { path = "crates/orr_atmosphere" }
 orr_color = { path = "crates/orr_color", version = "0.0.1" }
 orr_cook = { path = "crates/orr_cook" }
+orr_dlss = { path = "crates/orr_dlss", version = "0.0.1" }
 orr_egui = { path = "crates/orr_egui" }
 orr_gpu = { path = "crates/orr_gpu" }
 orr_io = { path = "crates/orr_io", version = "0.0.1" }

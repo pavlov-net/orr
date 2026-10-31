@@ -19,6 +19,8 @@ pub struct ViewOutput {
     /// A camera cut: auto exposure snaps to the target and resets its long-term stage, and
     /// auto white balance snaps to its target.
     pub cut: bool,
+    /// Menus and loading screens: frame generation is told the frame shows no scene.
+    pub not_rendering_scene: bool,
     /// A capture of this frame, read back through `OutputView::screenshots`.
     pub screenshot: Option<ScreenshotRequest>,
     pub debug: OutputDebug,

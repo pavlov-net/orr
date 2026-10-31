@@ -176,6 +176,10 @@ impl DistortionField {
         self.images.iter().map(|i| i.bytes).sum()
     }
 
+    pub(crate) fn current_texture(&self) -> &Texture {
+        self.images[self.current].texture()
+    }
+
     pub(crate) fn current_storage(&self) -> StorageImageIndex {
         self.images[self.current].storage
     }

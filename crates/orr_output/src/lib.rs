@@ -1,5 +1,5 @@
-//! Display output for orr: exposure, white balance, tonemapping, the display target and
-//! presentation.
+//! Display output for orr: exposure, white balance, tonemapping, the display target,
+//! frame generation and presentation.
 
 mod display;
 #[cfg(windows)]
@@ -7,6 +7,7 @@ mod display_watch;
 mod dof;
 mod encode;
 mod exposure;
+mod frame_generation;
 mod glare;
 mod gt7;
 mod hooks;
@@ -34,10 +35,12 @@ pub use exposure::{
     Physiological, SkyTelemetry, ev100_from_exposure, ev100_from_luminance, exposure_from_ev100,
     keyed_ev100, luminance_from_ev100,
 };
+pub use frame_generation::FrameGenerationMode;
 pub use glare::{GlareComposite, GlarePass};
 pub use gt7::{GT7_REFERENCE_NITS, GT7_SDR_NITS, Gt7Curve, Gt7Params};
 pub use hooks::{ChainImages, DistortionField, HookInputs, HookPass, HookPoint, Hooks, Image};
 pub use motion_blur::{MOTION_BLUR_MAX_RADIUS, MotionBlurPass};
+pub use orr_dlss::{self, DlssSdk, Support as DlssSupport};
 pub use orr_scene::orr_gpu::{HdrMetadata, LowLatency, OutputFormat, PresentMode};
 pub use passes::{
     CapturePass, ComposePass, ComposeRoot, ComposeSource, ExposurePass, HookInputsPass,
@@ -61,6 +64,13 @@ pub enum Error {
     NotWin32Window,
     #[error("present thread: {0}")]
     Thread(String),
+    #[error(transparent)]
+    Dlss(#[from] orr_dlss::DlssError),
+    /// The device or system lacks something frame generation needs.
+    #[error("frame generation needs {0}")]
+    FrameGenerationUnavailable(&'static str),
+    #[error("frame generation mode {0:?} is out of range for this device")]
+    FrameGenerationMode(FrameGenerationMode),
     #[cfg(windows)]
     #[error("display watch: {0}")]
     Windows(#[from] windows_core::Error),

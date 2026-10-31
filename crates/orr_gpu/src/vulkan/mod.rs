@@ -36,8 +36,8 @@ pub use diagnostics::{
     QueueProgress,
 };
 pub use interop::{
-    DeviceHooks, Features, ImageHandles, RawCommandBuffer, RawDevice, defer_after_submitted,
-    image_handles, raw_device,
+    DeviceHooks, Features, ImageHandles, RawCommandBuffer, RawDevice, buffer_handle,
+    defer_after_submitted, image_handles, raw_device,
 };
 pub use memory::{
     Allocation, DeviceArenas, HeapReport, HostArenas, MemoryKind, MemoryReport, MemoryUsage,
