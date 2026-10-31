@@ -3,6 +3,7 @@
 // pixel's sampler. The mean over frames is the flat color; the noise follows the seed. Alpha is
 // 1 where a surface was drawn and 0 for sky.
 #include "orr/root.h"
+import orr.abi;
 import orr.random;
 import gbuffer;
 import material;
@@ -14,7 +15,8 @@ struct Root
     SceneRoot* scene;
     ViewConstants* view;
     GBufferGpu* gbuffer;
-    float4* radiance;      // one per pixel, rows of the view's extent
+    StorageImageIndex radiance;
+    uint _pad2;
     float4 sky;
     uint frame;            // the frame's index in the accumulation
     uint seed;
@@ -34,5 +36,5 @@ void main(uint3 id: SV_DispatchThreadID)
     bool drawn = s.material != MATERIAL_NONE;
     float3 color = drawn ? s.bsdf.base_color : root.sky.rgb;
     Sampler rng = Sampler(id.xy, root.frame, root.seed);
-    root.radiance[id.y * g.extent.x + id.x] = float4(color * 2.0 * rng.next(), drawn ? 1.0 : 0.0);
+    root.radiance.get<RWTexture2D<float4>>()[id.xy] = float4(color * 2.0 * rng.next(), drawn ? 1.0 : 0.0);
 }

@@ -336,6 +336,14 @@ float3 radiance_scale(LightGpu l, float3 integral)
     }
 }
 
+// Illuminance a directional light emits before the medium, with `integral` its disc's
+// `textured_disc_integral`: the integral for a `Textured` light of zero illuminance, else its
+// illuminance.
+float3 emitted_illuminance(LightGpu l, float3 integral)
+{
+    return l.disc == DISC_TEXTURED && all(l.color == 0.0) ? integral : l.color;
+}
+
 // The state of directional light `index` at the focus, with `transmittance` the medium's
 // toward it.
 public DirectionalState directional_state(SceneRoot* scene, uint index, float3 transmittance)
@@ -344,8 +352,7 @@ public DirectionalState directional_state(SceneRoot* scene, uint index, float3 t
     DirectionalState s = {};
     s.integral = l.disc == DISC_TEXTURED ? textured_disc_integral(scene, index) : float3(0.0);
     s.radiance_scale = radiance_scale(l, s.integral);
-    bool emits_integral = l.disc == DISC_TEXTURED && all(l.color == 0.0);
-    s.focus_illuminance = (emits_integral ? s.integral : l.color) * transmittance;
+    s.focus_illuminance = emitted_illuminance(l, s.integral) * transmittance;
     s.weight = luminance_rec2020(s.focus_illuminance);
     s.transmittance = transmittance;
     return s;
@@ -736,7 +743,7 @@ public LightSample presample_light(LightSetGpu* set, uint index, uint frame)
     return emissive_sample(set, c - lights, u);
 }
 
-ResolvedLightSample no_candidate()
+public ResolvedLightSample no_candidate()
 {
     ResolvedLightSample r;
     r.dir = float3(0.0, 0.0, 1.0);
@@ -914,4 +921,45 @@ public float local_light_pdf(LightSetGpu* set, uint id, float3 x, float3 dir)
     if (t <= 0.0 || abs(ex) > 0.5 || abs(ey) > 0.5)
         return 0.0;
     return p / area * t * t / abs(dn);
+}
+
+// Illuminance of directional light `id` before the medium.
+public float3 directional_illuminance(LightSetGpu* set, uint id)
+{
+    return emitted_illuminance(set.scene.lights[id], set.directional[id].integral);
+}
+
+// Light the linked medium `M` scatters toward `origin` along the `t` m segment from `origin`
+// along unit `dir`, from every directional light and the medium's own emission, marched in
+// `steps` steps offset by `jitter` in [0, 1); `transmittance` is the segment's. Traces no
+// rays.
+public float3 segment_inscatter<M : IMedium>(LightSetGpu* set, float3 origin, float3 dir, float t, uint steps, float jitter, out float3 transmittance)
+{
+    uint64_t data = set.scene.medium;
+    float dt = t / float(max(steps, 1u));
+    float3 inscatter = float3(0.0);
+    transmittance = float3(1.0);
+    for (uint k = 0; k < max(steps, 1u); k++)
+    {
+        float3 x = origin + dir * ((float(k) + jitter) * dt);
+        MediumPoint m = M.sample(data, x);
+        float3 source = m.emission;
+        if (any(m.sigma_s > 0.0))
+        {
+            for (uint j = 0; j < set.directional_count; j++)
+            {
+                uint id = set.directional_ids[j];
+                float3 to_light = set.scene.lights[id].direction;
+                float3 e = directional_illuminance(set, id);
+                float3 phase = M.phase(data, m, dot(to_light, dir));
+                float3 lit = M.transmittance(data, x, to_light, positive_infinity());
+                source += m.sigma_s * e * (phase * lit + M.multiple_scattering(data, x, to_light));
+            }
+        }
+        float3 step = exp(-m.sigma_t * dt);
+        float3 through = select(m.sigma_t > 0.0, (1.0 - step) / max(m.sigma_t, 1e-30), float3(dt));
+        inscatter += transmittance * source * through;
+        transmittance *= step;
+    }
+    return inscatter;
 }
