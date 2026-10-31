@@ -15,7 +15,7 @@ gpu = ["dep:orr_gpu", "dep:log"]
 orr_shaders = { workspace = true, features = ["openpbr"] }
 orr_gpu = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
-shader_math = { path = "../shader_math" }
+shader_math.workspace = true
 
 [build-dependencies]
 orr_shaders = { workspace = true, features = ["build"] }

@@ -13,12 +13,10 @@
 //!   error histograms without that gate.
 
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread;
 
 use crate::harness::{self, Albedo, Comparison, Estimate, HISTOGRAM_BINS};
 use crate::materials::{Material, VIEW_COSINES, grid, view};
-use crate::{Bsdf, Lobe};
+use crate::{Bsdf, Lobe, in_parallel};
 
 /// Sample counts. Seeds are fixed, so a run is deterministic.
 #[derive(Clone, Copy, Debug)]
@@ -79,34 +77,16 @@ pub fn evaluate<C: Bsdf, R: Bsdf>(
     counts: Counts,
 ) -> Results {
     let materials = grid();
-    let threads = thread::available_parallelism().map_or(4, usize::from);
-    let next = AtomicUsize::new(0);
-    let mut results: Vec<(usize, MaterialResults)> = thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads.min(materials.len()))
-            .map(|_| {
-                scope.spawn(|| {
-                    let (mut c, mut r) = (candidate(), reference());
-                    let mut out = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(m) = materials.get(i) else { break };
-                        out.push((i, run_material(&mut c, &mut r, m, i as u64, counts)));
-                    }
-                    out
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("harness thread panicked"))
-            .collect()
-    });
-    results.sort_by_key(|(i, _)| *i);
+    let results = in_parallel(
+        materials.len(),
+        &|| (candidate(), reference()),
+        |(c, r), i| run_material(c, r, &materials[i], i as u64, counts),
+    );
     Results {
         candidate: candidate_name.to_owned(),
         same_model,
         counts,
-        materials: results.into_iter().map(|(_, r)| r).collect(),
+        materials: results,
     }
 }
 
