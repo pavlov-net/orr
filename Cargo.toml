@@ -51,6 +51,7 @@ libloading = "0.9"
 windows = "0.62.2"
 
 cc = "1.10"
+bindgen = "0.72.1"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unused_qualifications = "warn"

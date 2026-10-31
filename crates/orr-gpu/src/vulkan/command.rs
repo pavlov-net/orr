@@ -110,6 +110,8 @@ pub(crate) struct PassRecord {
     pub id: u32,
     pub name: &'static str,
     pub stats: bool,
+    /// The pass opened a counter-frame range.
+    pub range: bool,
 }
 
 /// What a finished list hands to its submit.
@@ -893,6 +895,8 @@ impl<'q> CommandList<'q> {
 
     /// Opens a named pass: a debug label and GPU timestamps, and with `stats` shader
     /// invocation counts. Passes do not nest; [`crate::Device::pass_results`] reads them.
+    /// Inside a counter frame on this list's queue ([`crate::Queue::begin_counter_frame`])
+    /// the pass is also a counter range.
     /// With `Caps::breadcrumbs` and `Caps::checkpoints` the pass's begin and end are also
     /// marked for [`crate::Device::diagnostics_report`] and crash dumps.
     pub fn begin_pass(&mut self, name: &'static str, stats: bool) {
@@ -931,7 +935,18 @@ impl<'q> CommandList<'q> {
             }
         }
         let stats = stats && stats_pool != vk::QueryPool::null();
-        self.passes.push(PassRecord { id, name, stats });
+        let range = self
+            .queue
+            .shared
+            .perf
+            .as_ref()
+            .is_some_and(|p| p.push_range(self.queue.kind, cmd, &label));
+        self.passes.push(PassRecord {
+            id,
+            name,
+            stats,
+            range,
+        });
         self.open = true;
     }
 
@@ -953,8 +968,13 @@ impl<'q> CommandList<'q> {
                     2 * index + 1,
                 );
             }
-            let id = self.passes[index as usize].id;
-            self.queue.shared.mark_pass(cmd, id, true);
+            let pass = &self.passes[index as usize];
+            if pass.range
+                && let Some(p) = &self.queue.shared.perf
+            {
+                p.pop_range(cmd);
+            }
+            self.queue.shared.mark_pass(cmd, pass.id, true);
             self.queue.shared.debug_fn.cmd_end_debug_utils_label(cmd);
         }
         self.open = false;

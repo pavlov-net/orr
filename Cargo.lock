@@ -1992,6 +1992,7 @@ name = "orr-gpu"
 version = "0.0.1"
 dependencies = [
  "ash",
+ "bindgen",
  "bitflags 2.13.2",
  "blake3",
  "bytemuck",

@@ -16,6 +16,7 @@ mod heap;
 mod interop;
 mod memory;
 mod mesh;
+mod perf;
 mod pipeline;
 mod queue;
 mod ray;
@@ -49,6 +50,7 @@ pub use memory::{
     MemoryUsage,
 };
 pub use mesh::{ColorAttachment, DepthAttachment, MeshPipeline, MeshPipelineDesc, Rendering};
+pub use perf::{COUNTER_METRICS, CounterRange, CounterReport};
 pub use pipeline::{ComputePipeline, ShaderStage};
 pub use queue::{PassResult, PipelineStats, Queue, QueueKind, QueueRequest};
 pub use ray::RayDispatchPipeline;

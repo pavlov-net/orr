@@ -1,7 +1,10 @@
 //! The dense vegetation test scene's camera scripts with per-pass timings: renders each
 //! script, prints the median and 90th percentile GPU time of every pass and the render
 //! thread's time per step, and writes every figure the frames report to
-//! `target/orr-reports/dense_vegetation-<git rev>.json`.
+//! `target/orr-reports/dense_vegetation-<git rev>.json`. On a device with
+//! `Caps::perf_counters` (orr-gpu built with `NSIGHT_PERF_SDK`) it also collects per-pass
+//! Nsight Perf SDK counters for one frame of the first script (the middle one unless
+//! `--counter-frame N` says) and adds them to the report.
 //!
 //! `bench [--synthetic] [--script NAME] [--script-frames N] [--headless] [scene switches...]`
 //! (see `examples::vegetation`). It runs all four scripts for 600 frames each unless told
@@ -12,23 +15,33 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use examples::vegetation::{Run, Sample, Script, Settings, run, settled};
-use examples::{Options, assert_clean, device};
-use orr::orr_gpu::MemoryKind;
+use examples::{Options, assert_clean, device, request_perf_counters};
+use orr::orr_gpu::{COUNTER_METRICS, CounterReport, MemoryKind};
 use orr::{FrameStats, LightingStats};
 use serde_json::{Map, Value, json};
 
 const SCRIPT_FRAMES: u64 = 600;
 
 fn main() {
+    request_perf_counters();
     let options = Options::from_args();
     let mut settings = Settings::parse(&options.rest);
     if !options.rest.iter().any(|a| a == "--script") {
         settings.scripts = Script::ALL.to_vec();
     }
     settings.script_frames = settings.script_frames.or(Some(SCRIPT_FRAMES));
+    let frames = options
+        .frames
+        .or(settings.script_frames)
+        .unwrap_or(SCRIPT_FRAMES);
+    settings.counter_frame = settings.counter_frame.or(Some(frames / 2));
     let r = run(&options, &settings);
     for (script, samples) in &r.scripts {
         print_script(*script, settled(samples));
+    }
+    match &r.counters {
+        Some(c) => print_counters(c),
+        None => println!("\nno counter report: the device collects no counters"),
     }
     let path = write_report(&settings, &r);
     println!("\nwrote {}", path.display());
@@ -106,6 +119,42 @@ fn print_script(script: Script, samples: &[Sample]) {
             percentile(&v, 0.9)
         );
     }
+}
+
+fn print_counters(c: &CounterReport) {
+    println!("\ncounters ({}), one row per pass:", c.chip);
+    print!("{:>36}", "pass");
+    for (i, _) in COUNTER_METRICS.iter().enumerate() {
+        print!(" {:>9}", format!("[{i}]"));
+    }
+    println!();
+    for r in &c.ranges {
+        print!("{:>36}", r.name);
+        for v in &r.values {
+            print!(" {v:>9.3}");
+        }
+        println!();
+    }
+    for (i, m) in COUNTER_METRICS.iter().enumerate() {
+        println!("  [{i}] {m}");
+    }
+}
+
+/// The counter frame's rows, one per pass, with each metric by name.
+fn counter_report(c: &CounterReport) -> Value {
+    let rows: Vec<Value> = c
+        .ranges
+        .iter()
+        .map(|r| {
+            let mut row = Map::new();
+            row.insert("pass".into(), r.name.clone().into());
+            for (m, v) in COUNTER_METRICS.iter().zip(&r.values) {
+                row.insert((*m).into(), (*v).into());
+            }
+            Value::Object(row)
+        })
+        .collect();
+    json!({ "chip": c.chip, "passes": rows })
 }
 
 /// Median, 90th percentile and maximum of `v`.
@@ -263,6 +312,7 @@ fn write_report(settings: &Settings, r: &Run) -> PathBuf {
         "load_ms": r.load_ms,
         "memory": memory,
         "scripts": scripts,
+        "counters": r.counters.as_ref().map(counter_report),
     });
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")

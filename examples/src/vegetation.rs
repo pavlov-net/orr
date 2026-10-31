@@ -13,7 +13,9 @@
 //! `--no-part-animation`, `--rt-range M`, `--animation-range M`, `--directional-lights L,T`,
 //! `--sw-raster-px P`, `--lod0-only`, `--world-km K`, `--world-density N` (trees per km^2
 //! outside the tile), `--particles N`, `--stream-load`, `--extent WxH`, `--script NAME`
-//! (walk, turn, overview, flythrough) and `--script-frames N`.
+//! (walk, turn, overview, flythrough), `--script-frames N` and `--counter-frame N` (the frame of
+//! the first script whose per-pass Nsight Perf SDK counters the run collects, when the device
+//! has `Caps::perf_counters`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,9 +23,9 @@ use std::time::{Duration, Instant};
 
 use orr::orr_gpu::{
     Allocation, Blend, ColorAttachment, ColorLoad, ColorMask, ColorTarget, CompareOp,
-    DepthAttachment, DepthLoad, DepthTarget, Device, Format, Hazards, MemoryKind, MeshPipeline,
-    MeshPipelineDesc, QueueKind, RasterState, Rendering, SamplerIndex, ShaderStage, SpecData,
-    Stages, Texture, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
+    CounterReport, DepthAttachment, DepthLoad, DepthTarget, Device, Format, Hazards, MemoryKind,
+    MeshPipeline, MeshPipelineDesc, QueueKind, RasterState, Rendering, SamplerIndex, ShaderStage,
+    SpecData, Stages, Texture, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
 };
 use orr::orr_lighting::EnvironmentMapGpu;
 use orr::orr_pack::material::{Material, slot};
@@ -202,6 +204,8 @@ pub struct Settings {
     pub scripts: Vec<Script>,
     /// Frames per script; `None` runs the window's script until it closes.
     pub script_frames: Option<u64>,
+    /// The frame of the first script that is replayed as a counter frame.
+    pub counter_frame: Option<u64>,
 }
 
 impl Settings {
@@ -229,6 +233,7 @@ impl Settings {
             extent: [1920, 1080],
             scripts: vec![Script::Walk],
             script_frames: None,
+            counter_frame: None,
         };
         let mut args = rest.iter();
         while let Some(a) = args.next() {
@@ -274,6 +279,7 @@ impl Settings {
                 }
                 "--script" => s.scripts = vec![Script::parse(value())],
                 "--script-frames" => s.script_frames = Some(number(value()) as u64),
+                "--counter-frame" => s.counter_frame = Some(number(value()) as u64),
                 _ => panic!("unknown argument {a}"),
             }
         }
@@ -1379,6 +1385,8 @@ pub struct Run {
     /// Cook, mounts and scene setup, ms.
     pub load_ms: f64,
     pub memory: orr::orr_gpu::MemoryReport,
+    /// The counter frame's report, when one was asked for and the device collects counters.
+    pub counters: Option<CounterReport>,
 }
 
 /// One completed frame's figures.
@@ -1450,10 +1458,18 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
     let mut clock = 0u64;
     let wall = Instant::now();
     let mut previous_t = 0.0f64;
+    let render_queue = gpu.queue(QueueKind::Render).expect("render queue");
+    let mut counter_frame = settings.counter_frame.filter(|_| gpu.caps().perf_counters);
+    let mut counters = None;
     for (si, &script) in settings.scripts.iter().enumerate() {
         collected.push((script, Vec::new()));
         let final_script = si + 1 == settings.scripts.len();
-        for i in 0.. {
+        let mut i = 0;
+        loop {
+            // The counter frame repeats frame `i` of the first script until its report is
+            // complete; its replays are not samples.
+            let counting = si == 0 && counter_frame == Some(i);
+            let replay_previous_t = previous_t;
             if frames_per_script.is_some_and(|n| i >= n) || closed {
                 break;
             }
@@ -1463,7 +1479,8 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                 closed = true;
                 break;
             }
-            let final_frame = final_script && frames_per_script.is_some_and(|n| i + 1 == n);
+            let final_frame =
+                !counting && final_script && frames_per_script.is_some_and(|n| i + 1 == n);
             take_sample(
                 &renderer,
                 &scene,
@@ -1489,6 +1506,11 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
             let previous = if i == 0 { t } else { previous_t };
             previous_t = t;
             let (eye, target) = script.camera(&scene.heights, t as f32);
+            let counting = counting
+                && render_queue
+                    .begin_counter_frame()
+                    .inspect_err(|e| log::warn!("no counter frame: {e}"))
+                    .is_ok();
 
             if let Some(source) = scene.stream_pack.as_ref()
                 && clock.is_multiple_of(20)
@@ -1507,98 +1529,115 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                 })
                 .expect("begin frame");
             let id = f.id();
-            let (extent, view_target) = match (&headless_target, f.display()) {
-                (Some(t), _) => (settings.extent, ViewTarget::Texture(t)),
-                (None, Some((_, extent))) => (extent, ViewTarget::Display),
-                (None, None) => {
-                    last = Some((id, f.end().expect("end frame")));
-                    continue;
-                }
-            };
-            f.scene(scene.scene)
-                .expect("scene writer")
-                .set_focus(eye.as_dvec3(), extent[1] as f32 / FOV_Y);
-            f.update_scenes(&mut |c| scene.record(c, eye, t as f32, previous as f32))
-                .expect("update scenes");
-            if let Some(tex) = headless_target.as_ref().filter(|_| clock == 1) {
-                f.list().expect("frame list").discard(tex);
-            }
-            let slot = id % slots;
-            let glow = &scene.glow;
-            let roots = &mut glow_roots;
-            let mut particles = |pass: &mut TransparencyPass<'_, '_>| {
-                roots.as_mut_slice().expect("particle roots")[slot as usize] = glow::Root {
-                    scene: pass.scene,
-                    view: pass.view,
-                    raster: pass.raster,
-                    _pad0: 0,
-                    radiance: [4000.0, 3200.0, 1400.0, 0.0],
+            let point = 'frame: {
+                let (extent, view_target) = match (&headless_target, f.display()) {
+                    (Some(t), _) => (settings.extent, ViewTarget::Texture(t)),
+                    (None, Some((_, extent))) => (extent, ViewTarget::Display),
+                    (None, None) => break 'frame f.end().expect("end frame"),
                 };
-                pass.cmd.begin_rendering(&Rendering {
-                    extent: pass.extent,
-                    colors: &[ColorAttachment {
-                        texture: pass.overlay,
-                        load: ColorLoad::Keep,
-                        store: true,
-                    }],
-                    depth: Some(DepthAttachment {
-                        texture: pass.depth,
-                        load: DepthLoad::Keep,
-                        store: true,
-                    }),
-                });
-                pass.cmd.draw_mesh_tasks_indirect_count(
-                    glow,
-                    roots.gpu.offset(slot),
-                    pass.particle_args,
-                    pass.particle_draws,
-                    1,
-                );
-                pass.cmd.end_rendering();
-            };
-            let mut hooks = ViewHooks {
-                transparency: Some(&mut particles),
-                ..ViewHooks::default()
-            };
-            let output = ViewOutput {
-                screenshot: (options.headless && final_frame)
-                    .then_some(ScreenshotRequest::Display { include_ui: false }),
-                ..ViewOutput::default()
-            };
-            let rendered = f
-                .render_view(
-                    &ViewDesc {
-                        scene: scene.scene,
-                        history: scene.history,
-                        position: eye.as_dvec3(),
-                        rotation: view::look_at_quat(eye, target, Vec3::Y).inverse(),
-                        projection: Projection {
-                            fov_y: FOV_Y,
-                            near: 0.1,
+                f.scene(scene.scene)
+                    .expect("scene writer")
+                    .set_focus(eye.as_dvec3(), extent[1] as f32 / FOV_Y);
+                f.update_scenes(&mut |c| scene.record(c, eye, t as f32, previous as f32))
+                    .expect("update scenes");
+                if let Some(tex) = headless_target.as_ref().filter(|_| clock == 1) {
+                    f.list().expect("frame list").discard(tex);
+                }
+                let slot = id % slots;
+                let glow = &scene.glow;
+                let roots = &mut glow_roots;
+                let mut particles = |pass: &mut TransparencyPass<'_, '_>| {
+                    roots.as_mut_slice().expect("particle roots")[slot as usize] = glow::Root {
+                        scene: pass.scene,
+                        view: pass.view,
+                        raster: pass.raster,
+                        _pad0: 0,
+                        radiance: [4000.0, 3200.0, 1400.0, 0.0],
+                    };
+                    pass.cmd.begin_rendering(&Rendering {
+                        extent: pass.extent,
+                        colors: &[ColorAttachment {
+                            texture: pass.overlay,
+                            load: ColorLoad::Keep,
+                            store: true,
+                        }],
+                        depth: Some(DepthAttachment {
+                            texture: pass.depth,
+                            load: DepthLoad::Keep,
+                            store: true,
+                        }),
+                    });
+                    pass.cmd.draw_mesh_tasks_indirect_count(
+                        glow,
+                        roots.gpu.offset(slot),
+                        pass.particle_args,
+                        pass.particle_draws,
+                        1,
+                    );
+                    pass.cmd.end_rendering();
+                };
+                let mut hooks = ViewHooks {
+                    transparency: Some(&mut particles),
+                    ..ViewHooks::default()
+                };
+                let output = ViewOutput {
+                    screenshot: (options.headless && final_frame)
+                        .then_some(ScreenshotRequest::Display { include_ui: false }),
+                    ..ViewOutput::default()
+                };
+                let rendered = f
+                    .render_view(
+                        &ViewDesc {
+                            scene: scene.scene,
+                            history: scene.history,
+                            position: eye.as_dvec3(),
+                            rotation: view::look_at_quat(eye, target, Vec3::Y).inverse(),
+                            projection: Projection {
+                                fov_y: FOV_Y,
+                                near: 0.1,
+                            },
+                            lens: Lens::default(),
+                            render_extent: UVec2::from(extent),
+                            jitter: Vec2::ZERO,
+                            reset_history: i == 0,
+                            mip_bias: 0.0,
+                            texture_filter: TextureFilter::Hardware,
+                            target: view_target,
                         },
-                        lens: Lens::default(),
-                        render_extent: UVec2::from(extent),
-                        jitter: Vec2::ZERO,
-                        reset_history: i == 0,
-                        mip_bias: 0.0,
-                        texture_filter: TextureFilter::Hardware,
-                        target: view_target,
-                    },
-                    &ViewLighting::default(),
-                    &output,
-                    &mut hooks,
-                )
-                .expect("render view");
-            let list = f.list().expect("frame list");
-            list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
-            list.copy(
-                readback.gpu.offset(slot).cast(),
-                rendered.raster.counts.cast(),
-                (COUNTS * 4) as u64,
-            );
-            list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
-            frame_ids.push((id, si));
-            last = Some((id, f.end().expect("end frame")));
+                        &ViewLighting::default(),
+                        &output,
+                        &mut hooks,
+                    )
+                    .expect("render view");
+                let list = f.list().expect("frame list");
+                list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
+                list.copy(
+                    readback.gpu.offset(slot).cast(),
+                    rendered.raster.counts.cast(),
+                    (COUNTS * 4) as u64,
+                );
+                list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
+                if !counting {
+                    frame_ids.push((id, si));
+                }
+                f.end().expect("end frame")
+            };
+            last = Some((id, point));
+            if !counting {
+                i += 1;
+                continue;
+            }
+            match render_queue.end_counter_frame(point) {
+                Ok(None) => previous_t = replay_previous_t,
+                done => {
+                    counters = done
+                        .inspect_err(|e| log::warn!("no counter frame: {e}"))
+                        .ok()
+                        .flatten();
+                    counter_frame = None;
+                    i += 1;
+                }
+            }
         }
     }
 
@@ -1658,6 +1697,7 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
         terrain_patches: scene.terrain_patches(),
         load_ms,
         memory,
+        counters,
     };
     if let Some(m) = scene.streaming.take() {
         renderer.unmount(m);
