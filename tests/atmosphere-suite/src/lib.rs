@@ -65,7 +65,9 @@ impl Rig {
             ..RendererDesc::default()
         };
         let mut renderer = Renderer::new(device(), desc).unwrap();
-        let scene = renderer.create_scene(&SceneDesc::default()).unwrap();
+        let scene = renderer
+            .create_scene(&SceneDesc::default(), &Default::default())
+            .unwrap();
         let mut sky = AtmosphereState::new(device(), atmosphere, SamplerIndex(7)).unwrap();
         sky.set_lights(&[SUN]);
         Self {

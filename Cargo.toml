@@ -20,6 +20,7 @@ orr-gpu = { path = "crates/orr-gpu" }
 orr-io = { path = "crates/orr-io", version = "0.0.1" }
 orr-lighting = { path = "crates/orr-lighting" }
 orr-math = { path = "crates/orr-math", version = "0.0.1" }
+orr-output = { path = "crates/orr-output" }
 orr-pack = { path = "crates/orr-pack" }
 orr-scene = { path = "crates/orr-scene" }
 orr-shaders = { path = "crates/orr-shaders" }

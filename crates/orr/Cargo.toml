@@ -15,7 +15,7 @@ hot-reload = ["orr-scene/hot-reload"]
 [dependencies]
 orr-scene.workspace = true
 orr-lighting.workspace = true
-orr-output = { path = "../orr-output" }
+orr-output.workspace = true
 thiserror.workspace = true
 
 [build-dependencies]

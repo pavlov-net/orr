@@ -8,6 +8,7 @@ use std::thread::JoinHandle;
 use orr::orr_gpu::{Device, DeviceDesc, QueueRequest};
 use orr::{FrameTime, Loading};
 
+pub mod mesh;
 pub mod window;
 
 /// The examples' compiled kernels and the Rust types of their Slang structs.

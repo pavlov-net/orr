@@ -36,7 +36,9 @@ fn empty_frames_and_scene_frames_submit_in_order() {
     }
     assert_eq!(ids, [1, 2, 3, 4]);
 
-    let s = r.create_scene(&SceneDesc::default()).unwrap();
+    let s = r
+        .create_scene(&SceneDesc::default(), &Default::default())
+        .unwrap();
     let history = r.create_view_history().unwrap();
     let list = [s];
     for i in 0..3 {
@@ -51,7 +53,7 @@ fn empty_frames_and_scene_frames_submit_in_order() {
             .unwrap()
             .set_focus(DVec3::new(f64::from(i) * 700.0, 0.0, 0.0), 1000.0);
         f.update_scenes(&mut |_| {}).unwrap();
-        f.render_view(&ViewDesc {
+        f.raster_view(&ViewDesc {
             scene: s,
             history,
             position: DVec3::new(f64::from(i) * 700.0, 2.0, 0.0),
@@ -184,7 +186,9 @@ fn editing_a_kernel_body_swaps_its_pipeline_and_bad_edits_keep_the_old_one() {
     let pipeline = r
         .compute_pipeline(&fill::MODULE, "main", SpecData::default())
         .unwrap();
-    let s = r.create_scene(&SceneDesc::default()).unwrap();
+    let s = r
+        .create_scene(&SceneDesc::default(), &Default::default())
+        .unwrap();
     let out = device()
         .gpu_malloc::<u32>(MemoryKind::DeviceLocal, FILLED, "fill")
         .unwrap();

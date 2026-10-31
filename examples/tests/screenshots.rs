@@ -8,6 +8,9 @@ mod cluster_rt;
 #[allow(dead_code)]
 #[path = "../gpu-basics.rs"]
 mod gpu_basics;
+#[allow(dead_code)]
+#[path = "../viewer.rs"]
+mod viewer;
 
 use std::path::Path;
 
@@ -40,5 +43,7 @@ fn examples_match_their_references() {
         |rest: &[&str]| cluster_rt::run(&Options::headless(120, rest)).expect("headless capture");
     compare("cluster-rt", cluster_rt(&[]));
     compare("cluster-rt-clusters", cluster_rt(&["--clusters"]));
+    let viewer = viewer::run(&Options::headless(120, &[])).expect("headless capture");
+    compare("viewer", viewer);
     assert_clean();
 }
