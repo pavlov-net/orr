@@ -1,17 +1,16 @@
 //! Camera effects after RR: motion blur against shutter-accumulated references, depth of
-//! field against lens-disc references and glare against its CPU model and PSF.
+//! field against lens-disc references, glare against its CPU model and PSF, and lens
+//! distortion against its analytic map.
 
-use half::f16;
 use orr_output::{ChainImages, MotionBlurPass, OutputKernels, OutputView, ViewOutput, srgb_encode};
 use orr_scene::ViewConstants;
 use orr_scene::orr_gpu::{
     Allocation, ComputePipeline, Format, Hazards, MemoryKind, QueueKind, ShaderStage, SpecData,
-    Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory, TextureRegion,
-    TextureUsage, ViewDesc,
+    Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory, TextureUsage,
+    ViewDesc,
 };
-use orr_scene::testing::{
-    FlipError, Image, Pixels, assert_clean, device, flip, read_buffer, read_texture, wait,
-};
+use orr_scene::testing::{FlipError, Image, Pixels, assert_clean, device, flip, read_buffer, wait};
+use output_suite::read_rgba16f;
 use output_suite::shaders::blur_scene;
 
 /// Not a multiple of the 20-pixel tile either way.
@@ -121,7 +120,7 @@ impl Blur {
             subframes: SUBFRAMES,
             shutter: SHUTTER,
             motion_scale,
-            _pad: 0,
+            time: 0.0,
         };
     }
 
@@ -194,13 +193,6 @@ impl Blur {
 
 fn groups(extent: [u32; 2]) -> [u32; 3] {
     [extent[0].div_ceil(8), extent[1].div_ceil(8), 1]
-}
-
-fn read_rgba16f(t: &Texture) -> Vec<[f32; 4]> {
-    read_texture(t, &TextureRegion::whole_mip(t.desc(), 0))
-        .chunks_exact(8)
-        .map(|p| std::array::from_fn(|c| f16::from_le_bytes([p[2 * c], p[2 * c + 1]]).to_f32()))
-        .collect()
 }
 
 fn srgb8(linear: &[[f32; 4]]) -> Image {
@@ -1163,6 +1155,336 @@ mod glare {
         log::info!("night street halo reach: {lit:?} with glare, {plain:?} without");
         assert!(lit[0] < lit[1] && lit[1] < lit[2], "{lit:?}");
         assert!(plain[0] == plain[1] && plain[1] == plain[2], "{plain:?}");
+        assert_clean();
+    }
+}
+
+/// Lens distortion and chromatic aberration in tonemap's gather, and the distortion field it
+/// writes, against the analytic map.
+mod lens_distortion {
+    use orr_output::{
+        DistortionField, Exposure, ExposurePass, OutputDebug, OutputFormat, OutputKernels,
+        OutputView, ResolvedDisplay, TonemapPass, ViewOutput,
+    };
+    use orr_scene::orr_gpu::{
+        Allocation, Format, Hazards, MemoryKind, QueueKind, Stages, StorageImageIndex, Texture,
+        TextureDesc, TextureIndex, TextureMemory, TextureRegion, TextureUsage, ViewDesc,
+    };
+    use orr_scene::testing::{assert_clean, device, read_texture, wait};
+    use orr_scene::{ExposureState, LensDistortion, SkyStats, ViewConstants};
+    use output_suite::{LensModel, REC709_TO_XYZ, XYZ_TO_REC2020, mul3, read_rgba16f};
+
+    /// Not a multiple of the 8-pixel group, and odd high, so the field rounds up.
+    const OUT: [u32; 2] = [484, 271];
+
+    const BARREL: LensDistortion = LensDistortion {
+        k1: 0.12,
+        k2: 0.03,
+        chromatic_aberration: 0.006,
+    };
+    const PINCUSHION: LensDistortion = LensDistortion {
+        k1: -0.1,
+        k2: 0.0,
+        chromatic_aberration: -0.004,
+    };
+
+    /// RGBA32F radiance tonemapped at unit exposure with the linear debug view on an scRGB
+    /// display, so each output channel is the Rec.709 of the gathered Rec.2020 taps.
+    struct Lens {
+        kernels: OutputKernels,
+        output: OutputView,
+        display: ResolvedDisplay,
+        exposure: Allocation<ExposureState>,
+        constants: Allocation<ViewConstants>,
+        sky: Allocation<SkyStats>,
+        upload: Allocation<[f32; 4]>,
+        source: Texture,
+        target: Texture,
+        source_index: TextureIndex,
+        target_store: StorageImageIndex,
+        frame: u64,
+    }
+
+    impl Lens {
+        fn new() -> Self {
+            let gpu = device();
+            let texture = |name| {
+                let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
+                let desc = TextureDesc::d2(Format::Rgba32Float, OUT[0], OUT[1], usage);
+                gpu.create_texture(&desc, TextureMemory::Dedicated, name)
+                    .unwrap()
+            };
+            let source = texture("lens source");
+            let target = texture("lens target");
+            let view = ViewDesc::default();
+            let mut exposure = gpu.gpu_malloc(MemoryKind::Upload, 2, "exposure").unwrap();
+            exposure.as_mut_slice().unwrap().fill(ExposureState {
+                pre_exposure: 1.0,
+                prev_pre_exposure: 1.0,
+                ..ExposureState::default()
+            });
+            let mut sky = gpu.gpu_malloc(MemoryKind::Upload, 1, "sky").unwrap();
+            sky.as_mut_slice().unwrap()[0] = bytemuck::Zeroable::zeroed();
+            let queue = gpu.queue(QueueKind::Render).unwrap();
+            let mut list = queue.command_list().unwrap();
+            list.discard(&source);
+            list.discard(&target);
+            wait(queue.submit(vec![list], &[]).unwrap());
+            Self {
+                kernels: OutputKernels::new(gpu).unwrap(),
+                output: OutputView::new(gpu, 2).unwrap(),
+                display: ResolvedDisplay {
+                    encoding: OutputFormat::ScRgb,
+                    paper_white_nits: 250.0,
+                    peak_nits: 1000.0,
+                    black_nits: 0.0,
+                },
+                exposure,
+                constants: gpu.gpu_malloc(MemoryKind::Upload, 1, "view").unwrap(),
+                sky,
+                upload: gpu
+                    .gpu_malloc(
+                        MemoryKind::Upload,
+                        u64::from(OUT[0] * OUT[1]),
+                        "lens upload",
+                    )
+                    .unwrap(),
+                source_index: gpu.write_sampled(gpu.alloc_image_slot().unwrap(), &source, &view),
+                target_store: gpu.write_storage(gpu.alloc_image_slot().unwrap(), &target, &view),
+                source,
+                target,
+                frame: 0,
+            }
+        }
+
+        /// Tonemaps `image` (linear Rec.2020, row by row) through `lens`, writing `field`;
+        /// returns the output in linear Rec.2020.
+        fn render(
+            &mut self,
+            image: &[[f32; 4]],
+            lens: LensDistortion,
+            field: Option<&mut DistortionField>,
+        ) -> Vec<[f64; 3]> {
+            let gpu = device();
+            self.frame += 1;
+            self.upload.as_mut_slice().unwrap().copy_from_slice(image);
+            let mut c: ViewConstants = bytemuck::Zeroable::zeroed();
+            c.exposure = self.exposure.gpu;
+            c.exposure_slot = (self.frame % 2) as u32;
+            c.extent = OUT;
+            c.delta_time = 1.0 / 60.0;
+            self.constants.as_mut_slice().unwrap()[0] = c;
+            // exposure_from_ev100 is 1 / (1.2 * 2^ev100).
+            let output = ViewOutput {
+                exposure: Exposure::Manual {
+                    ev100: -(1.2f32.log2()),
+                },
+                debug: OutputDebug::Linear,
+                ..ViewOutput::default()
+            };
+            let queue = gpu.queue(QueueKind::Render).unwrap();
+            let mut list = queue.command_list().unwrap();
+            list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
+            let whole = TextureRegion::whole_mip(self.source.desc(), 0);
+            list.copy_to_texture(&self.source, &whole, self.upload.gpu.cast());
+            list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
+            let roots = self.output.roots(self.frame);
+            self.kernels.exposure(
+                &mut list,
+                roots,
+                &ExposurePass {
+                    source: self.source_index,
+                    extent: OUT,
+                    view: self.constants.gpu,
+                    sky: self.sky.gpu,
+                    frame: self.frame,
+                    output: &output,
+                },
+            );
+            self.kernels.tonemap(
+                &mut list,
+                roots,
+                &TonemapPass {
+                    source: self.source_index,
+                    target: self.target_store,
+                    extent: OUT,
+                    view: self.constants.gpu,
+                    display: &self.display,
+                    output: &output,
+                    hook_source: None,
+                    glare: None,
+                    distortion: Some(lens),
+                    frame: self.frame,
+                },
+                field,
+            );
+            wait(queue.submit(vec![list], &[]).unwrap());
+            read_texture(&self.target, &whole)
+                .chunks_exact(16)
+                .map(|p| {
+                    let c: [f64; 3] = std::array::from_fn(|i| {
+                        f64::from(f32::from_le_bytes(p[4 * i..4 * i + 4].try_into().unwrap()))
+                    });
+                    mul3(&XYZ_TO_REC2020, mul3(&REC709_TO_XYZ, c))
+                })
+                .collect()
+        }
+    }
+
+    /// Gray radiance holding each texel's center along `axis` as a fraction of the extent,
+    /// so a bilinear tap returns its own position.
+    fn ramp(axis: usize) -> Vec<[f32; 4]> {
+        (0..OUT[1])
+            .flat_map(|y| (0..OUT[0]).map(move |x| [x, y]))
+            .map(|p| {
+                let v = (p[axis] as f32 + 0.5) / OUT[axis] as f32;
+                [v, v, v, 1.0]
+            })
+            .collect()
+    }
+
+    /// Whether a tap at `s` lies between the outermost texel centers, where bilinear
+    /// filtering reproduces the ramp.
+    fn inside(s: [f64; 2]) -> bool {
+        (0..2).all(|a| s[a] >= 0.5 && s[a] <= f64::from(OUT[a]) - 0.5)
+    }
+
+    /// The red, green and blue taps of every output pixel, measured from the ramps.
+    fn measured_taps(v: &mut Lens, lens: LensDistortion) -> Vec<[[f64; 2]; 3]> {
+        let x = v.render(&ramp(0), lens, None);
+        let y = v.render(&ramp(1), lens, None);
+        x.iter()
+            .zip(&y)
+            .map(|(x, y)| {
+                std::array::from_fn(|c| [x[c] * f64::from(OUT[0]), y[c] * f64::from(OUT[1])])
+            })
+            .collect()
+    }
+
+    fn check_taps(lens: LensDistortion) {
+        let mut v = Lens::new();
+        let model = LensModel::new(&lens, OUT);
+        let taps = measured_taps(&mut v, lens);
+        let (mut worst, mut checked) = (0.0f64, 0usize);
+        let mut reaches_edge = false;
+        for (i, measured) in taps.iter().enumerate() {
+            let p = [
+                (i % OUT[0] as usize) as f64 + 0.5,
+                (i / OUT[0] as usize) as f64 + 0.5,
+            ];
+            let g = model.forward(p);
+            let (r, b) = model.red_blue(p);
+            for (want, got) in [r, g, b].into_iter().zip(measured) {
+                reaches_edge |= want
+                    .iter()
+                    .zip(OUT)
+                    .any(|(&s, n)| s < 1.0 || s > f64::from(n) - 1.0);
+                assert!(
+                    (0..2).all(|a| want[a] > 0.0 && want[a] < f64::from(OUT[a])),
+                    "{lens:?}: pixel {p:?} samples {want:?}, outside the frame"
+                );
+                if inside(want) {
+                    worst = worst.max((want[0] - got[0]).hypot(want[1] - got[1]));
+                    checked += 1;
+                }
+            }
+        }
+        log::info!("{lens:?}: taps within {worst:.4} px of the analytic map");
+        assert!(
+            worst <= 0.1,
+            "{lens:?}: a tap is {worst:.3} px from the analytic map"
+        );
+        assert!(checked > taps.len() * 3 * 9 / 10, "{checked} taps checked");
+        assert!(
+            reaches_edge,
+            "{lens:?}: no border pixel samples the frame's edge"
+        );
+
+        // Red and blue sit at the set scale of green's offset from the center, at each corner.
+        let center = OUT.map(|n| 0.5 * f64::from(n));
+        let ca = f64::from(lens.chromatic_aberration);
+        for [x, y] in [
+            [3, 3],
+            [OUT[0] - 4, 3],
+            [3, OUT[1] - 4],
+            [OUT[0] - 4, OUT[1] - 4],
+        ] {
+            let [r, g, b] = taps[(y * OUT[0] + x) as usize];
+            for (tap, scale) in [(r, ca), (b, -ca)] {
+                for a in 0..2 {
+                    let want = scale * (g[a] - center[a]);
+                    let got = tap[a] - g[a];
+                    assert!(
+                        (got - want).abs() <= 0.1,
+                        "{lens:?}: shift at corner pixel {x},{y}: {got:.3} px, expected {want:.3}"
+                    );
+                }
+            }
+        }
+        assert_clean();
+    }
+
+    #[test]
+    fn barrel_taps_follow_the_analytic_map() {
+        check_taps(BARREL);
+    }
+
+    #[test]
+    fn pincushion_taps_follow_the_analytic_map() {
+        check_taps(PINCUSHION);
+    }
+
+    /// The field's forward map, then its inverse sampled bilinearly where the forward map
+    /// lands, returns every texel to itself.
+    #[test]
+    fn field_round_trips() {
+        let mut v = Lens::new();
+        for lens in [BARREL, PINCUSHION] {
+            let mut field = DistortionField::new(device(), OUT).unwrap();
+            v.render(&ramp(0), lens, Some(&mut field));
+            let texels: Vec<[f64; 4]> = read_rgba16f(field.current_texture())
+                .into_iter()
+                .map(|t| t.map(f64::from))
+                .collect();
+            let [fw, fh] = field.extent();
+            let size = [f64::from(fw), f64::from(fh)];
+            let texel = |x: f64, y: f64| {
+                let x = x.clamp(0.0, size[0] - 1.0) as usize;
+                let y = y.clamp(0.0, size[1] - 1.0) as usize;
+                texels[y * fw as usize + x]
+            };
+            let inverse_at = |uv: [f64; 2]| -> [f64; 2] {
+                let at: [f64; 2] = std::array::from_fn(|a| uv[a] * size[a] - 0.5);
+                let [i, j] = at.map(f64::floor);
+                let [tx, ty] = [at[0] - i, at[1] - j];
+                std::array::from_fn(|c| {
+                    let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
+                    let top = lerp(texel(i, j)[2 + c], texel(i + 1.0, j)[2 + c], tx);
+                    let bottom = lerp(texel(i, j + 1.0)[2 + c], texel(i + 1.0, j + 1.0)[2 + c], tx);
+                    lerp(top, bottom, ty)
+                })
+            };
+            let (mut worst, mut checked) = (0.0f64, 0);
+            for (i, f) in texels.iter().enumerate() {
+                let t = [(i % fw as usize) as f64, (i / fw as usize) as f64];
+                let uv = [(t[0] + 0.5) / size[0], (t[1] + 0.5) / size[1]];
+                let q = [uv[0] + f[0], uv[1] + f[1]];
+                if !(0..2).all(|a| q[a] >= 0.5 / size[a] && q[a] <= 1.0 - 0.5 / size[a]) {
+                    continue;
+                }
+                let back = inverse_at(q);
+                let dx = (q[0] + back[0] - uv[0]) * f64::from(OUT[0]);
+                let dy = (q[1] + back[1] - uv[1]) * f64::from(OUT[1]);
+                worst = worst.max(dx.hypot(dy));
+                checked += 1;
+            }
+            log::info!("{lens:?}: field round trip within {worst:.4} px");
+            assert!(checked > texels.len() * 9 / 10, "{checked} texels checked");
+            assert!(
+                worst <= 0.05,
+                "{lens:?}: field round trip off by {worst:.4} px"
+            );
+        }
         assert_clean();
     }
 }

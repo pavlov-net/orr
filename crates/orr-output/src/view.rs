@@ -1,5 +1,7 @@
 //! What output does with one view each frame.
 
+use orr_scene::LensDistortion;
+
 use crate::{
     AutoWhiteBalance, CalibrationPattern, DofPath, Exposure, Grade, Gt7Params, ScreenshotRequest,
 };
@@ -14,7 +16,7 @@ pub struct ViewOutput {
     pub gt7: Gt7Params,
     pub post: PostQuality,
     /// A hook warps the image: the view's hooks get the display's distortion field, which
-    /// frame generation reads.
+    /// frame generation reads. A lens with distortion turns the field on too.
     pub distortion_field: bool,
     /// A camera cut: auto exposure snaps to the target and resets its long-term stage, and
     /// auto white balance snaps to its target.
@@ -24,6 +26,14 @@ pub struct ViewOutput {
     /// A capture of this frame, read back through `OutputView::screenshots`.
     pub screenshot: Option<ScreenshotRequest>,
     pub debug: OutputDebug,
+}
+
+impl ViewOutput {
+    /// The part of the view's `lens` distortion that tonemap applies: none under a
+    /// calibration pattern.
+    pub fn lens_distortion(&self, lens: Option<LensDistortion>) -> Option<LensDistortion> {
+        lens.filter(|_| !matches!(self.debug, OutputDebug::Pattern(_)))
+    }
 }
 
 /// Quality settings of the camera effects that the view's lens turns on.

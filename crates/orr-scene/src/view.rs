@@ -131,12 +131,17 @@ pub struct Glare {
     pub strength: f32,
 }
 
-/// Brown-Conrady radial terms on the radius normalised to the half-diagonal; lateral
-/// chromatic aberration scales the red and blue radius relative to green.
+/// Lens distortion applied in tonemap's gather. The output pixel at radius `r` from the
+/// center, in half-diagonals, takes green from radius `s r (1 + k1 r^2 + k2 r^4)`: positive
+/// `k1` gives barrel distortion, negative pincushion. `s` scales the image so every output
+/// pixel samples inside the rendered frame, the border reaching its edge. The radius must
+/// map monotonically over the frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LensDistortion {
     pub k1: f32,
     pub k2: f32,
+    /// Lateral chromatic aberration: red samples at green's radius times
+    /// `1 + chromatic_aberration`, blue times `1 - chromatic_aberration`.
     pub chromatic_aberration: f32,
 }
 

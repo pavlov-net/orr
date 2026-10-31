@@ -128,7 +128,10 @@ fn run(display: &ResolvedDisplay, format: Format) -> Vec<u8> {
             output: &ViewOutput::default(),
             hook_source: None,
             glare: None,
+            distortion: None,
+            frame: 0,
         },
+        None,
     );
     list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
     kernels.compose(

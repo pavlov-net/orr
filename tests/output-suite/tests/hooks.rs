@@ -12,8 +12,9 @@ use orr_scene::orr_gpu::{
     SpecData, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
     TextureRegion, TextureUsage, ViewDesc,
 };
-use orr_scene::testing::{assert_clean, device, read_buffer, read_texture, wait};
-use orr_scene::{ExposureState, SkyStats, ViewConstants};
+use orr_scene::testing::{assert_clean, device, read_buffer, wait};
+use orr_scene::{ExposureState, LensDistortion, SkyStats, ViewConstants};
+use output_suite::read_rgba16f;
 use output_suite::shaders::{dump, field_offset, hook_line, swirl};
 
 const OUT: [u32; 2] = [240, 136];
@@ -67,13 +68,6 @@ fn rgba16f_bytes(c: &[[f32; 4]]) -> Vec<u8> {
         .collect()
 }
 
-fn read_rgba16f(t: &Texture) -> Vec<[f32; 4]> {
-    read_texture(t, &TextureRegion::whole_mip(t.desc(), 0))
-        .chunks_exact(8)
-        .map(|p| std::array::from_fn(|c| f16::from_le_bytes([p[2 * c], p[2 * c + 1]]).to_f32()))
-        .collect()
-}
-
 fn pipeline(module: &'static orr_shaders::ShaderModule, name: &str) -> ComputePipeline {
     let stage = ShaderStage::new(module, "main", SpecData::default()).unwrap();
     device().create_compute_pipeline(&stage, name).unwrap()
@@ -122,6 +116,8 @@ struct View {
     rr_motion_index: TextureIndex,
     chain: ChainImages,
     frame: u64,
+    /// The lens tonemap gathers through; none by default.
+    lens: Option<LensDistortion>,
 }
 
 impl View {
@@ -188,6 +184,7 @@ impl View {
             linear,
             chain,
             frame: 0,
+            lens: None,
         };
         v.exposure.as_mut_slice().unwrap().fill(ExposureState {
             pre_exposure: 1.0,
@@ -296,7 +293,10 @@ impl View {
                 output: &output,
                 hook_source: hooks.display_linear.then_some(self.chain.rr_output_store),
                 glare: None,
+                distortion: self.lens,
+                frame: self.frame,
             },
+            field.as_deref_mut(),
         );
         if let (Some(inputs), Some(hook)) = (&inputs, display_linear) {
             inputs.run(
@@ -608,5 +608,75 @@ fn distortion_field_clears_and_composes() {
         Some(&mut offset_hook(&p, &mut b, Some([0.03, -0.01]))),
     );
     check(&field, [0.03, -0.01, -0.03, 0.01], "second stage only");
+    assert_clean();
+}
+
+const LENS: LensDistortion = LensDistortion {
+    k1: 0.12,
+    k2: 0.03,
+    chromatic_aberration: 0.004,
+};
+
+/// The field the lens alone writes, composed after a uniform `shift` in UV written by an
+/// earlier stage: RG = f + shift, BA = -shift + g(uv - shift).
+fn lens_field(shift: [f64; 2]) -> Vec<[f64; 4]> {
+    let lens = output_suite::LensModel::new(&LENS, OUT);
+    let size = OUT.map(f64::from);
+    let half = OUT.map(|n| n.div_ceil(2));
+    pixels(half)
+        .map(|t| {
+            let uv: [f64; 2] =
+                std::array::from_fn(|a| (f64::from(t[a]) + 0.5) / f64::from(half[a]));
+            let p = [uv[0] * size[0], uv[1] * size[1]];
+            let s = lens.forward(p);
+            let x = [(uv[0] - shift[0]) * size[0], (uv[1] - shift[1]) * size[1]];
+            let q = lens.inverse(x);
+            [
+                (s[0] - p[0]) / size[0] + shift[0],
+                (s[1] - p[1]) / size[1] + shift[1],
+                (q[0] - x[0]) / size[0] - shift[0],
+                (q[1] - x[1]) / size[1] - shift[1],
+            ]
+        })
+        .collect()
+}
+
+/// The largest difference from `want` in output pixels.
+fn field_error(field: &DistortionField, want: &[[f64; 4]]) -> f64 {
+    let got = dump_texture(field.current(), field.extent());
+    got.iter()
+        .zip(want)
+        .flat_map(|(g, w)| (0..4).map(move |c| (f64::from(g[c]) - w[c]).abs()))
+        .fold(0.0, f64::max)
+        * f64::from(OUT[0].max(OUT[1]))
+}
+
+#[test]
+fn lens_distortion_composes_into_the_field() {
+    let mut v = View::new();
+    v.lens = Some(LENS);
+    let mut field = DistortionField::new(device(), OUT).unwrap();
+    let p = pipeline(&field_offset::MODULE, "field offset");
+    let mut root = Root::new();
+
+    // After a scene-referred warp, tonemap composes the lens into the hook's field.
+    let shift = [0.01, 0.02];
+    v.frame(
+        Some(&mut field),
+        Some(&mut offset_hook(&p, &mut root, Some(shift))),
+        None,
+    );
+    let error = field_error(&field, &lens_field(shift.map(f64::from)));
+    assert!(error < 0.02, "lens after a shift: {error:.4} px");
+
+    // Without hooks nothing clears the field: tonemap writes the lens map alone.
+    v.frame(Some(&mut field), None, None);
+    let error = field_error(&field, &lens_field([0.0; 2]));
+    assert!(error < 0.02, "lens alone: {error:.4} px");
+
+    // The display_linear hook's source is tonemap's output, copied after the gather.
+    let passes = v.frame(None, None, Some(&mut |_: &mut HookPass<'_, '_>| {}));
+    assert!(passes.contains(&"tonemap_hook_source"), "{passes:?}");
+    assert_eq!(read_rgba16f(&v.rr_output), read_rgba16f(&v.linear));
     assert_clean();
 }
