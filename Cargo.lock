@@ -1990,11 +1990,11 @@ dependencies = [
  "log",
  "nv-flip",
  "orr-gpu",
+ "orr-io",
  "orr-math",
  "orr-pack",
  "orr-shaders",
  "thiserror 2.0.21",
- "windows",
 ]
 
 [[package]]

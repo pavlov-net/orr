@@ -4,14 +4,16 @@
 //! bakes the scene's linked environment at the scene focus into an equal-area octahedral map
 //! with an importance pyramid, derives every directional light's state, builds the selection
 //! over the scene's sphere, rect and emissive lights and the environment, presamples the
-//! light tiles, and writes the scene's `SkyStats`. Kernels reach the result through
-//! [`SceneLighting::light_set`] and the Slang modules `light_sampling`, `environment` and
-//! `media` under this crate's shader root (`DEP_ORR_LIGHTING_SHADER_DIRS`). Kernels that
-//! shade with the real-time OpenPBR BSDF import `bsdf` and read [`BsdfTables`].
+//! light tiles, writes the scene's `SkyStats`, and resolves the scene's world cache. Kernels
+//! reach the result through [`SceneLighting::light_set`], [`SceneLighting::world_cache`] and
+//! the Slang modules `light_sampling`, `world_cache`, `environment` and `media` under this
+//! crate's shader root (`DEP_ORR_LIGHTING_SHADER_DIRS`). Kernels that shade with the
+//! real-time OpenPBR BSDF import `bsdf` and read [`BsdfTables`].
 //!
 //! Each view, [`LightingView::begin`] settles the frame's history reset; after the view's
-//! raster half, [`LightingKernels::record_opaque`] traces one path per G-buffer pixel into
-//! the view's [`LightingView`] radiance with the settings of [`ViewLighting`], and
+//! raster half, [`LightingKernels::record_opaque`] traces the world cache's update paths
+//! and one path per G-buffer pixel into the view's [`LightingView`] radiance with the
+//! settings of [`ViewLighting`], and
 //! [`LightingKernels::record_guides`] writes the view's ray reconstruction guides. The `path`
 //! module holds the path itself for kernels that trace more.
 
@@ -19,6 +21,7 @@ mod bsdf;
 mod environment;
 mod scene;
 mod view;
+mod world_cache;
 
 pub use bsdf::BsdfTables;
 pub use environment::{ENVIRONMENT_SIZE, EnvironmentMapGpu};
@@ -30,12 +33,13 @@ pub use scene::{
 };
 pub use shaders::types::{
     DirectionalState, EmissiveSelection, EnvironmentGpu, GuideRoot, LightSample, LightSetGpu,
-    LightSetStats, PathRoot,
+    LightSetStats, PathRoot, WorldCacheGpu,
 };
 pub use view::{
     CameraJump, GuideKind, GuideSettings, LightingDebugView, LightingKernels, LightingView,
     MediaSettings, PathEntry, ReferenceSettings, ThinLens, ViewLighting, ViewPass,
 };
+pub use world_cache::{MAX_CAPACITY_LOG2, WorldCacheStats};
 
 use orr_scene::orr_gpu::{ComputePipeline, Device, ShaderModule, ShaderStage, SpecData};
 
@@ -49,6 +53,8 @@ pub mod shaders {
 pub enum Error {
     #[error(transparent)]
     Gpu(#[from] orr_scene::orr_gpu::Error),
+    #[error("invalid lighting settings: {0}")]
+    Settings(&'static str),
     /// A replacement kernel does not match the module it replaces.
     #[error("kernel {kernel}: {reason}")]
     Kernel {

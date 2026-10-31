@@ -823,6 +823,8 @@ pub struct Bed {
     exposure: ComputePipeline,
     pre_exposure: f32,
     frame: u64,
+    last_id: u64,
+    light_writes: Vec<(LightId, Option<Light>)>,
     _workers: Workers,
 }
 
@@ -972,6 +974,8 @@ impl Bed {
             exposure: pipeline(&exposure::MODULE, "main"),
             pre_exposure: 1.0,
             frame,
+            last_id: 0,
+            light_writes: Vec::new(),
             _workers: workers,
         }
     }
@@ -1029,6 +1033,16 @@ impl Bed {
                 .map(|p| p.map(|v| v / n))
                 .collect(),
         }
+    }
+
+    /// The orr-scene frame id of the last frame run.
+    pub fn last_frame(&self) -> u64 {
+        self.last_id
+    }
+
+    /// Sets light `id` from the next frame on.
+    pub fn set_light(&mut self, id: LightId, light: Option<Light>) {
+        self.light_writes.push((id, light));
     }
 
     /// Renders later frames at pre-exposure `p`, as the output's meter would set it.
@@ -1131,8 +1145,15 @@ impl Bed {
             mip_bias: 0.0,
             target: ViewTarget::AfterRr,
         };
+        if !self.light_writes.is_empty() {
+            let mut w = f.scene(self.scene).unwrap();
+            for (id, l) in self.light_writes.drain(..) {
+                w.set_light(id, l.as_ref()).unwrap();
+            }
+        }
         let view = f.raster_view(&desc).unwrap();
         let id = f.id();
+        self.last_id = id;
         let list = f.list().unwrap();
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
         self.lighting.record(

@@ -3,7 +3,9 @@
 // sampling over the light set's mixture and traces one shadow ray for the winner; BSDF rays
 // add the environment, directional discs and emission they reach, weighted against
 // next-event estimation by the power heuristic. Hits shade through the kernel's linked
-// surface with a `HitContext`. Radiance is written pre-exposed.
+// surface with a `HitContext`. Paths may end in the scene's world cache; the cache's update
+// paths trace the same path and add what each vertex scattered to its cell. Radiance is
+// written pre-exposed.
 module path;
 
 import orr.abi;
@@ -20,6 +22,7 @@ import bsdf;
 import media;
 import environment;
 import light_sampling;
+import world_cache;
 
 // `PathRoot.mode`: what the radiance image holds.
 public static const uint PATH_FULL = 0;
@@ -29,6 +32,17 @@ public static const uint PATH_NEE_ONLY = 3;     // light through next-event esti
 public static const uint PATH_BSDF_ONLY = 4;    // light through BSDF rays alone
 public static const uint PATH_RAYS = 5;         // rays traced in r, 1 in g where radiance was not finite
 public static const uint PATH_ORIGIN_BIAS = 6;  // x1's ray origin offset in m, in r
+public static const uint PATH_CACHE = 7;        // the cache's radiance at x1, as a path ending there adds it
+public static const uint PATH_CACHE_LOD = 8;    // x1's cache level in r, 1 in g where a resolved cell answers, a hash of the cell in b
+
+// `PathRoot.cache_flags`: paths may end in the world cache.
+public static const uint CACHE_TERMINATE = 1 << 0;
+
+// Separates an update path's samples from the opaque path's of the same pixel.
+public static const uint UPDATE_STREAM = 0x9E3779B9;
+
+// Vertices of an update path that add samples to the cache.
+public static const uint UPDATE_VERTICES = 4;
 
 // The ray origin floor: `T_MIN_BASE` x (1 + metres from the camera x `T_MIN_SCALE`).
 public static const float T_MIN_BASE = 1e-3;
@@ -50,6 +64,7 @@ public struct PathRoot
     public ViewConstants* view;
     public GBufferGpu* gbuffer;
     public LightSetGpu* set;
+    public WorldCacheGpu* cache;
     public StorageImageIndex radiance;  // RGBA16F at the G-buffer's extent
     public uint primary_candidates;
     public uint bounce_candidates;
@@ -64,6 +79,8 @@ public struct PathRoot
     // the G-buffer.
     public float aperture_radius;
     public float focus_distance;
+    public uint cache_flags;            // CACHE_*
+    public uint update_block;           // pixels per side of an update path's block
     public uint _pad0;
 }
 
@@ -265,12 +282,96 @@ struct BsdfRay
     float pdf;          // 0 for an ideal-specular direction
     float run;          // the vertex's next-event probability
     float3 normal;      // the vertex's shading normal
+    bool diffuse;       // sampled from a diffuse lobe
+}
+
+// What a path records about its vertices as it traces them.
+public interface IPathRecord
+{
+    // Whether a front-face hit at path depth `depth` (x1 is 0) may end the path in the cache,
+    // given that the ray reaching it left a diffuse lobe, that its cone is wider than the
+    // hit's cell, and that it is the last bounce's.
+    bool may_end(uint depth, bool diffuse, bool wide, bool last);
+    // Vertex `x`, prepared as `b`, reached with `throughput` once the path's radiance (its
+    // emission included) was `radiance`; next-event estimation and a BSDF ray follow it.
+    [mutating]
+    void vertex(PathRoot r, PathVertex x, Bsdf b, float3 throughput, float3 radiance, inout Sampler rng);
+    // The path ended with `radiance`.
+    [mutating]
+    void finish(PathRoot r, float3 radiance);
+}
+
+// A view's path: it ends in the cache after a diffuse bounce, where its cone outgrew the
+// cell, or at the last bounce, and records nothing.
+public struct ViewPath : IPathRecord
+{
+    public bool may_end(uint depth, bool diffuse, bool wide, bool last)
+    {
+        return depth >= 1 && (diffuse || wide || last);
+    }
+
+    [mutating]
+    public void vertex(PathRoot r, PathVertex x, Bsdf b, float3 throughput, float3 radiance, inout Sampler rng) {}
+
+    [mutating]
+    public void finish(PathRoot r, float3 radiance) {}
+}
+
+// An update path: it resamples the cache from depth 2 on, and adds to the cell of each of
+// its first `UPDATE_VERTICES` vertices the light that vertex scattered, over its albedo.
+public struct CacheUpdate : IPathRecord
+{
+    uint count;
+    uint64_t keys[UPDATE_VERTICES];
+    float3 scale[UPDATE_VERTICES];      // 1 / (throughput x albedo) per channel, 0 where the albedo is
+    float3 before[UPDATE_VERTICES];     // the path's radiance on arrival
+
+    public __init()
+    {
+        count = 0;
+        for (uint i = 0; i < UPDATE_VERTICES; i++)
+        {
+            keys[i] = 0;
+            scale[i] = float3(0.0);
+            before[i] = float3(0.0);
+        }
+    }
+
+    public bool may_end(uint depth, bool diffuse, bool wide, bool last)
+    {
+        return depth >= 2;
+    }
+
+    [mutating]
+    public void vertex(PathRoot r, PathVertex x, Bsdf b, float3 throughput, float3 radiance, inout Sampler rng)
+    {
+        float u = rng.next();
+        if (count >= UPDATE_VERTICES)
+            return;
+        float3 albedo = cache_albedo(b.albedo(), x.surface.bsdf) * throughput;
+        if (!any(albedo > 1e-6))
+            return;
+        CacheCell cell = cache_cell(r.cache, r.scene, x.surface.position, x.surface.geometric_normal, float3(0.5, 0.5, u), false);
+        keys[count] = cell.key;
+        scale[count] = select(albedo > 1e-6, 1.0 / albedo, float3(0.0));
+        before[count] = radiance;
+        count++;
+    }
+
+    [mutating]
+    public void finish(PathRoot r, float3 radiance)
+    {
+        for (uint i = 0; i < count; i++)
+            cache_add(r.cache, keys[i], (radiance - before[i]) * scale[i]);
+    }
 }
 
 // The opaque path of `pixel` from vertex `x1` (`depth` 0) through linked surface `S` and
-// medium `M`; `C` names the coherence point after each trace. Returns unexposed radiance;
-// `rays` counts every ray traced.
-public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r, PathVertex x1, uint2 pixel, inout Sampler rng, inout uint rays)
+// medium `M`; `C` names the coherence point after each trace, and `record` sees its
+// vertices. With `CACHE_TERMINATE`, a front-face hit that `record` allows, reached by a ray
+// longer than `CACHE_MIN_RAY_CELLS` edges of its cell, ends in its resolved cell. Returns
+// unexposed radiance; `rays` counts every ray traced.
+public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRecord>(PathRoot r, PathVertex x1, uint2 pixel, inout Sampler rng, inout uint rays, inout R record)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
@@ -278,6 +379,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r, 
     bool count_nee = r.mode != PATH_BSDF_ONLY;
     bool count_bsdf = r.mode != PATH_NEE_ONLY;
     bool one_technique = r.mode == PATH_NEE_ONLY || r.mode == PATH_BSDF_ONLY;
+    bool cache = (r.cache_flags & CACHE_TERMINATE) != 0 && !one_technique && r.mode != PATH_DIRECT;
 
     PathVertex x = x1;
     Bsdf b = bsdf_prepare(x.surface.bsdf, x.surface.normal, x.view);
@@ -287,6 +389,8 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r, 
     float3 radiance = float3(0.0);
     bool alive = (x.surface.flags & GBUFFER_UNLIT) == 0;
     BsdfRay ray = (BsdfRay)0;
+    if (alive)
+        record.vertex(r, x, b, throughput, radiance, rng);
 
     // A uniform trip count keeps the coherence point in uniform control flow.
     for (uint depth = 0; depth <= r.max_bounces; depth++)
@@ -327,6 +431,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r, 
                 ray.pdf = delta ? 0.0 : bs.pdf;
                 ray.run = count_nee ? run : 0.0;
                 ray.normal = x.surface.normal;
+                ray.diffuse = (bs.lobe & LOBE_DIFFUSE) != 0;
                 float roughness = x.surface.bsdf.specular_roughness;
                 float spread = delta ? 0.0 : (bs.lobe & LOBE_DIFFUSE) != 0 ? 1.0 : 2.0 * roughness * roughness;
                 cone.spread += spread;
@@ -393,7 +498,24 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r, 
         if (count_bsdf && counted && front)
             radiance += throughput * b.emission();
         alive = (x.surface.flags & GBUFFER_UNLIT) == 0 && r.mode != PATH_DIRECT;
+        if (alive && cache && front)
+        {
+            CacheCell cell = cache_cell(r.cache, s, x.surface.position, x.surface.geometric_normal, rng.next4().xyz, true);
+            float3 cached;
+            if (record.may_end(depth + 1, ray.diffuse, cone.width > cell.size, depth == r.max_bounces)
+                && t > CACHE_MIN_RAY_CELLS * cell.size && cache_lookup(r.cache, cell.key, cached))
+            {
+                if (counted)
+                    radiance += throughput * cache_albedo(b.albedo(), x.surface.bsdf) * cached;
+                alive = false;
+                continue;
+            }
+        }
+        // The last bounce's hit scatters nothing the path estimates.
+        if (alive && depth < r.max_bounces)
+            record.vertex(r, x, b, throughput, radiance, rng);
     }
+    record.finish(r, radiance);
     return radiance;
 }
 
@@ -440,6 +562,14 @@ public bool lens_vertex<S : ISurface>(PathRoot r, uint2 pixel, inout Sampler rng
     return true;
 }
 
+// The coherence points of a lane that traces no path: they run in every lane of the
+// dispatch.
+void skip_points<C : ICoherence>(PathRoot r)
+{
+    for (uint depth = 0; depth <= r.max_bounces; depth++)
+        C.point(coherence_key(false, 0, 0), KEY_BITS);
+}
+
 // The opaque dispatch's body for `pixel`: sky pixels take the linked environment and the
 // directional discs; surfaces the G-buffer's emission and their path.
 public void opaque_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMedium>(PathRoot r, uint2 pixel)
@@ -465,20 +595,56 @@ public void opaque_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
         // The G-buffer's emission is already pre-exposed.
         if (r.mode != PATH_INDIRECT)
             radiance = b.emission() * (lens ? pre_exposure : 1.0);
-        radiance += pre_exposure * trace_path<C, S, M>(r, x1, pixel, rng, rays);
+        if (r.mode == PATH_CACHE || r.mode == PATH_CACHE_LOD)
+        {
+            skip_points<C>(r);
+            CacheCell cell = cache_cell(r.cache, r.scene, x1.surface.position, x1.surface.geometric_normal, rng.next4().xyz, true);
+            float3 cached;
+            bool found = cache_lookup(r.cache, cell.key, cached);
+            if (r.mode == PATH_CACHE)
+                radiance = pre_exposure * cache_albedo(b.albedo(), x1.surface.bsdf) * cached;
+            else
+                radiance = float3(float(cell.level), found ? 1.0 : 0.0, unit_float(cache_hash(cell.key) * 2654435761u));
+        }
+        else
+        {
+            ViewPath view_path;
+            radiance += pre_exposure * trace_path<C, S, M>(r, x1, pixel, rng, rays, view_path);
+        }
     }
     else
     {
-        // Coherence points run in every lane of the dispatch.
-        for (uint depth = 0; depth <= r.max_bounces; depth++)
-            C.point(coherence_key(false, 0, 0), KEY_BITS);
+        skip_points<C>(r);
         if (r.mode != PATH_INDIRECT)
             radiance = pre_exposure * sky_radiance<E, M>(set, v.eye_render.xyz, dir);
     }
     float4 out = float4(apply_hdr_ceiling(radiance), surface ? 1.0 : 0.0);
-    if (r.mode == PATH_RAYS)
+    if (r.mode == PATH_CACHE_LOD)
+        out.rgb = radiance;
+    else if (r.mode == PATH_RAYS)
         out = float4(float(rays), all(isfinite(radiance)) ? 0.0 : 1.0, 0.0, out.a);
     else if (r.mode == PATH_ORIGIN_BIAS)
         out = float4(surface ? length(vertex_origin(x1, x1.surface.normal) - x1.surface.position) : 0.0, 0.0, 0.0, out.a);
     r.radiance.get<RWTexture2D<float4>>()[pixel] = out;
+}
+
+// The update path of `block`, a square of `PathRoot.update_block` pixels: one pixel of it,
+// rotating through the block over frames, traces a path from its G-buffer surface and adds
+// what its vertices scatter to the cache.
+public void update_body<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r, uint2 block)
+{
+    uint n = r.update_block;
+    uint offset = (r.frame + pcg(block.x | (block.y << 16))) % (n * n);
+    uint2 pixel = block * n + uint2(offset % n, offset / n);
+    Sampler rng = Sampler(pixel, r.frame, r.seed ^ UPDATE_STREAM);
+    PathVertex x1;
+    bool surface = all(pixel < r.gbuffer.extent) && gbuffer_vertex(r.scene, r.view, r.gbuffer, pixel, x1);
+    if (surface)
+    {
+        uint rays = 0;
+        CacheUpdate update = CacheUpdate();
+        trace_path<C, S, M>(r, x1, pixel, rng, rays, update);
+    }
+    else
+        skip_points<C>(r);
 }

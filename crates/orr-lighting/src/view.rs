@@ -1,10 +1,11 @@
 //! Per-view lighting: the settings of one `render_view` call, the view's lighting targets and
-//! history, the opaque path dispatch and the guide resolve.
+//! history, the world cache's update paths, the opaque path dispatch and the guide resolve.
 
 use orr_math::{DVec3, Quat};
 use orr_scene::orr_gpu::{
-    self, CommandList, ComputePipeline, Device, Format, GpuPtr, RayDispatchPipeline, ShaderStage,
-    SpecData, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory, TextureUsage,
+    self, CommandList, ComputePipeline, Device, Format, GpuPtr, RayDispatchPipeline, ShaderModule,
+    ShaderStage, SpecData, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
+    TextureUsage,
 };
 use orr_scene::{GBufferGpu, SceneId, SceneRoot, ViewConstants, ViewDesc};
 
@@ -12,6 +13,7 @@ use crate::scene::{FRAME_SLOTS, Ring};
 use crate::shaders::guides::resolve;
 use crate::shaders::path::opaque;
 use crate::shaders::types::{GuideRoot, PathRoot};
+use crate::shaders::world_cache::update;
 use crate::{BsdfTables, Error, KernelSet, SceneLighting, module};
 
 /// Lighting settings of one view, passed with every render of it.
@@ -120,6 +122,12 @@ pub enum LightingDebugView {
     RaysPerPixel,
     /// The first vertex's ray origin offset in m, in red.
     RayOriginBias,
+    /// The world cache's radiance at the first vertex, as a path ending there would add it;
+    /// 0 where no resolved cell covers it.
+    WorldCache,
+    /// The first vertex's world cache level in red, 1 in green where a resolved cell covers
+    /// it, and a hash of its cell in blue.
+    WorldCacheLod,
     /// A ray reconstruction guide as the guide resolve computed it, before its target's
     /// quantization; alpha is 1 on surfaces.
     Guide(GuideKind),
@@ -137,8 +145,8 @@ pub enum GuideKind {
     SpecularMotion,
 }
 
-/// The accumulation reference: no Russian roulette before 64 bounces, and optionally a thin
-/// lens traced from the eye for depth-of-field references.
+/// The accumulation reference: no world cache, no Russian roulette before 64 bounces, and
+/// optionally a thin lens traced from the eye for depth-of-field references.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct ReferenceSettings {
     pub lens: Option<ThinLens>,
@@ -159,6 +167,9 @@ pub struct ThinLens {
 /// reference.
 const ROULETTE_DEPTH: u32 = 1;
 const REFERENCE_ROULETTE_DEPTH: u32 = 64;
+
+/// `path`'s `CACHE_TERMINATE`.
+const CACHE_TERMINATE: u32 = 1;
 
 /// A [`LightingView`] target and its storage view.
 struct Target {
@@ -181,6 +192,7 @@ pub struct LightingView {
     slots: Vec<u32>,
     radiance_sampled: TextureIndex,
     roots: Ring<PathRoot>,
+    update_roots: Ring<PathRoot>,
     guide_roots: Ring<GuideRoot>,
     previous: Option<(SceneId, DVec3, Quat)>,
     history_reset: bool,
@@ -226,6 +238,7 @@ impl LightingView {
             slots,
             radiance_sampled,
             roots: Ring::new(device, "path roots")?,
+            update_roots: Ring::new(device, "update path roots")?,
             guide_roots: Ring::new(device, "guide roots")?,
             previous: None,
             history_reset: true,
@@ -351,14 +364,46 @@ pub enum PathEntry {
     RayDispatch,
 }
 
-enum Opaque {
+/// A kernel with a raygen and a compute entry over one body, as one of them.
+enum PathPipeline {
     Compute(ComputePipeline),
     Rays(RayDispatchPipeline),
 }
 
+impl PathPipeline {
+    fn new(
+        device: &Device,
+        m: &ShaderModule,
+        spec: SpecData,
+        rays: bool,
+        name: &str,
+    ) -> Result<Self, Error> {
+        Ok(if rays {
+            let stage = ShaderStage::new(m, "raygen_main", spec)?;
+            Self::Rays(device.create_ray_dispatch_pipeline(&stage, name)?)
+        } else {
+            let stage = ShaderStage::new(m, "compute_main", spec)?;
+            Self::Compute(device.create_compute_pipeline(&stage, name)?)
+        })
+    }
+
+    /// Runs the kernel over `extent` invocations.
+    fn record<R>(&self, list: &mut CommandList, root: GpuPtr<R>, extent: [u32; 2]) {
+        let [w, h] = extent;
+        match self {
+            Self::Compute(p) => {
+                let [gx, gy, _] = p.workgroup();
+                list.dispatch(p, root, [w.div_ceil(gx), h.div_ceil(gy), 1]);
+            }
+            Self::Rays(p) => list.dispatch_rays(p, root, [w, h, 1]),
+        }
+    }
+}
+
 /// The per-view lighting kernels of one device.
 pub struct LightingKernels {
-    opaque: Opaque,
+    opaque: PathPipeline,
+    update: PathPipeline,
     guides: ComputePipeline,
 }
 
@@ -382,25 +427,26 @@ impl LightingKernels {
         tables: &BsdfTables,
         entry: PathEntry,
     ) -> Result<Self, Error> {
-        let m = module(kernels, &opaque::MODULE)?;
-        let bytes = bsdf_spec!(opaque, tables);
-        let spec = SpecData {
-            entries: opaque::Spec::ENTRIES,
-            bytes: &bytes,
-        };
         let caps = device.caps();
         let rays = match entry {
             PathEntry::Fastest => caps.ray_dispatch && caps.reorder,
             PathEntry::Compute => false,
             PathEntry::RayDispatch => true,
         };
-        let opaque = if rays {
-            let stage = ShaderStage::new(m, "raygen_main", spec)?;
-            Opaque::Rays(device.create_ray_dispatch_pipeline(&stage, "opaque paths")?)
-        } else {
-            let stage = ShaderStage::new(m, "compute_main", spec)?;
-            Opaque::Compute(device.create_compute_pipeline(&stage, "opaque paths")?)
+        let bytes = bsdf_spec!(opaque, tables);
+        let spec = SpecData {
+            entries: opaque::Spec::ENTRIES,
+            bytes: &bytes,
         };
+        let m = module(kernels, &opaque::MODULE)?;
+        let opaque = PathPipeline::new(device, m, spec, rays, "opaque paths")?;
+        let bytes = bsdf_spec!(update, tables);
+        let spec = SpecData {
+            entries: update::Spec::ENTRIES,
+            bytes: &bytes,
+        };
+        let m = module(kernels, &update::MODULE)?;
+        let update = PathPipeline::new(device, m, spec, rays, "world cache update paths")?;
         let bytes = bsdf_spec!(resolve, tables);
         let spec = SpecData {
             entries: resolve::Spec::ENTRIES,
@@ -408,12 +454,18 @@ impl LightingKernels {
         };
         let stage = ShaderStage::new(module(kernels, &resolve::MODULE)?, "main", spec)?;
         let guides = device.create_compute_pipeline(&stage, "guide resolve")?;
-        Ok(Self { opaque, guides })
+        Ok(Self {
+            opaque,
+            update,
+            guides,
+        })
     }
 
-    /// Records the opaque dispatch of `pass` into `view`'s radiance after the scene's
-    /// [`SceneLighting::record`] and the view's raster half in the same or an earlier list;
-    /// orders nothing after it.
+    /// Records the world cache's update paths and the opaque dispatch of `pass` into
+    /// `view`'s radiance after the scene's [`SceneLighting::record`] and the view's raster
+    /// half in the same or an earlier list; orders nothing after it. The scene's first view
+    /// in a frame traces one update path per `update_block`^2 pixels, its later views one per
+    /// four times as many; the reference traces none and never reads the cache.
     pub fn record_opaque(
         &self,
         list: &mut CommandList<'_>,
@@ -434,38 +486,50 @@ impl LightingKernels {
             LightingDebugView::BsdfOnly => 4,
             LightingDebugView::RaysPerPixel => 5,
             LightingDebugView::RayOriginBias => 6,
+            LightingDebugView::WorldCache => 7,
+            LightingDebugView::WorldCacheLod => 8,
         };
+        let reference = lighting.reference.is_some();
+        let first = !reference && scene.first_view(pass.frame);
+        let block = scene.world_cache_settings().update_block * if first { 1 } else { 2 };
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
-        let root = view.roots.write(
-            slot,
-            PathRoot {
-                scene: pass.scene,
-                view: pass.view,
-                gbuffer: pass.gbuffer,
-                set: scene.light_set(),
-                radiance: view.radiance.store,
-                primary_candidates: lighting.primary_di_candidates,
-                bounce_candidates: lighting.bounce_di_candidates,
-                max_bounces: lighting.max_bounces,
-                roulette_depth,
-                mode,
-                frame: pass.sample_index,
-                seed: pass.seed,
-                segment_steps: lighting.media.segment_steps,
-                aperture_radius: lens.map_or(0.0, |l| l.aperture_radius),
-                focus_distance: lens.map_or(0.0, |l| l.focus_distance),
-                _pad0: 0,
-            },
-        );
-        let [w, h] = view.extent;
-        list.begin_pass("opaque paths", false);
-        match &self.opaque {
-            Opaque::Compute(p) => {
-                let [gx, gy, _] = p.workgroup();
-                list.dispatch(p, root, [w.div_ceil(gx), h.div_ceil(gy), 1]);
-            }
-            Opaque::Rays(p) => list.dispatch_rays(p, root, [w, h, 1]),
+        let path_root = PathRoot {
+            scene: pass.scene,
+            view: pass.view,
+            gbuffer: pass.gbuffer,
+            set: scene.light_set(),
+            cache: scene.world_cache(pass.frame),
+            radiance: view.radiance.store,
+            primary_candidates: lighting.primary_di_candidates,
+            bounce_candidates: lighting.bounce_di_candidates,
+            max_bounces: lighting.max_bounces,
+            roulette_depth,
+            mode,
+            frame: pass.sample_index,
+            seed: pass.seed,
+            segment_steps: lighting.media.segment_steps,
+            aperture_radius: lens.map_or(0.0, |l| l.aperture_radius),
+            focus_distance: lens.map_or(0.0, |l| l.focus_distance),
+            cache_flags: if reference { 0 } else { CACHE_TERMINATE },
+            update_block: block,
+            _pad0: 0,
+        };
+        let root = view.roots.write(slot, path_root);
+        if !reference {
+            let update_root = view.update_roots.write(
+                slot,
+                PathRoot {
+                    mode: 0,
+                    ..path_root
+                },
+            );
+            list.begin_pass("world cache update paths", false);
+            self.update
+                .record(list, update_root, view.extent.map(|e| e.div_ceil(block)));
+            list.end_pass();
         }
+        list.begin_pass("opaque paths", false);
+        self.opaque.record(list, root, view.extent);
         list.end_pass();
     }
 
