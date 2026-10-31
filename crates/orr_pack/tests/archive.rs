@@ -221,7 +221,7 @@ fn round_trip_file_and_memory() {
 #[cfg(windows)]
 #[test]
 fn unbuffered_reads_at_stored_ranges() {
-    use std::os::windows::fs::{FileExt, OpenOptionsExt};
+    use std::os::windows::fs::OpenOptionsExt;
     const NO_BUFFERING: u32 = 0x2000_0000;
 
     let path = dir("unbuffered").join("a.orrpack");
@@ -233,12 +233,7 @@ fn unbuffered_reads_at_stored_ranges() {
         .open(&path)
         .unwrap();
     check_stored_ranges(&a, |r, buf| {
-        let mut done = 0;
-        while done < buf.len() {
-            done += f
-                .seek_read(&mut buf[done..], r.offset + done as u64)
-                .unwrap();
-        }
+        assert_eq!(orr_io::read_at(&f, r.offset, buf).unwrap(), buf.len());
     });
 }
 

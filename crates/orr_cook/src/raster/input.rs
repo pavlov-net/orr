@@ -345,7 +345,7 @@ impl Level {
         for (r, row) in out.chunks_exact_mut(n * bpp).enumerate() {
             let ly = (y0 + r as i64).clamp(0, size - 1) as u64;
             let at = self.offset + (ly * u64::from(self.size) + lo as u64) * bpp as u64;
-            read_at(&self.file, &mut row[left * bpp..][..span * bpp], at)
+            read_exact_at(&self.file, &mut row[left * bpp..][..span * bpp], at)
                 .map_err(|e| read_error(&self.path, e))?;
             let first = left * bpp;
             for p in 0..left {
@@ -473,26 +473,11 @@ fn write_error(scratch: &Scratch, source: io::Error) -> Error {
     }
 }
 
-fn read_at(f: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileExt;
-        let (mut done, mut at) = (0, offset);
-        while done < buf.len() {
-            let n = f.seek_read(&mut buf[done..], at)?;
-            if n == 0 {
-                return Err(io::ErrorKind::UnexpectedEof.into());
-            }
-            done += n;
-            at += n as u64;
-        }
-        Ok(())
+fn read_exact_at(f: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    if orr_io::read_at(f, offset, buf)? < buf.len() {
+        return Err(io::ErrorKind::UnexpectedEof.into());
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt;
-        f.read_exact_at(buf, offset)
-    }
+    Ok(())
 }
 
 /// A pattern over relative tile paths: `/`-separated components with `{lod}`, `{x}` and
