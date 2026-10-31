@@ -1,13 +1,16 @@
 //! Device, memory, heaps, compute, timestamps and the empty TLAS.
 
-use gpu_suite::shaders::{atomic_max, coopvec, heap_views, pattern, rays, root_layout};
+use gpu_suite::shaders::{
+    atomic_max, bins, classify_bins, coopvec, heap_views, pattern, rays, root_layout,
+};
 use gpu_suite::{
     CUSTOM_INDEX, assert_clean, device, noise, pipeline, readback, render, run, triangle_scene,
     upload,
 };
 use orr_gpu::{
-    Device, DeviceDesc, Filter, Format, GpuPtr, Hazards, SamplerDesc, SamplerIndex, Stages,
-    TextureDesc, TextureMemory, TextureRegion, TextureUsage, Tlas, ViewDesc,
+    Device, DeviceDesc, Filter, Format, Generated, GpuPtr, Hazards, MemoryKind, SamplerDesc,
+    SamplerIndex, Sequence, ShaderStage, SpecData, Stages, TextureDesc, TextureMemory,
+    TextureRegion, TextureUsage, Tlas, ViewDesc,
 };
 
 #[test]
@@ -721,6 +724,157 @@ fn priorities_allocate_and_the_report_carries_the_pressure() {
         assert!(p > 0.0 && p.is_finite(), "pressure {p}");
     } else {
         assert_eq!(pressure, None);
+    }
+    assert_clean();
+}
+
+/// 256 bins, half of them empty, each dispatched by its own pipeline: device-generated
+/// sequences a kernel writes, preprocessed ahead and not, write the same words as
+/// CPU-recorded indirect dispatches.
+#[test]
+fn generated_dispatches_match_recorded_dispatches() {
+    let d = device();
+    if !gpu_suite::require(d.caps().generated_commands, "no device-generated commands") {
+        return;
+    }
+    const BINS: u32 = 256;
+    let mut next = noise(0x6e9);
+    // 37 is odd, so b * 37 % BINS visits every bin once: exactly half are empty.
+    let items: Vec<u32> = (0..BINS)
+        .map(|b| {
+            let n = 1 + (next() * 300.0) as u32;
+            if b * 37 % BINS < BINS / 2 { 0 } else { n }
+        })
+        .collect();
+    let firsts: Vec<u32> = items
+        .iter()
+        .scan(0, |sum, &n| {
+            let first = *sum;
+            *sum += n;
+            Some(first)
+        })
+        .collect();
+    let total = u64::from(items.iter().sum::<u32>());
+    let expected: Vec<u32> = (0..BINS)
+        .flat_map(|b| (0..items[b as usize]).map(move |i| (b << 20) ^ (i * 0x9e37) ^ 0x5a17))
+        .collect();
+
+    let specs: Vec<_> = (0..BINS).map(|bin| bins::Spec { bin }.bytes()).collect();
+    let stages: Vec<_> = specs
+        .iter()
+        .map(|bytes| {
+            let spec = SpecData {
+                entries: bins::Spec::ENTRIES,
+                bytes,
+            };
+            ShaderStage::new(&bins::MODULE, "main", spec).unwrap()
+        })
+        .collect();
+    let set = d.create_compute_set(&stages, "bins").unwrap();
+    assert_eq!(set.len(), BINS);
+    let recorded: Vec<_> = stages
+        .iter()
+        .map(|s| d.create_compute_pipeline(s, "bin").unwrap())
+        .collect();
+    let classify = pipeline(&classify_bins::MODULE, "main");
+
+    let item_counts = upload(&items, "bin items");
+    // Roots 64 bytes apart, the root alignment: one array per output.
+    let roots = |out: GpuPtr<u32>, name| {
+        let slots: Vec<[u32; 16]> = (0..BINS as usize)
+            .map(|b| {
+                let root = bins::Root {
+                    out,
+                    first: firsts[b],
+                    count: items[b],
+                };
+                let mut slot = [0u32; 16];
+                slot[..4].copy_from_slice(orr_shaders::bytemuck::cast_slice(
+                    orr_shaders::bytemuck::bytes_of(&root),
+                ));
+                slot
+            })
+            .collect();
+        upload(&slots, name)
+    };
+    let outputs: Vec<_> = (0..3)
+        .map(|i| readback::<u32>(total, &format!("bins out {i}")))
+        .collect();
+    let root_arrays: Vec<_> = outputs.iter().map(|o| roots(o.gpu, "bin roots")).collect();
+    let args = d
+        .gpu_malloc::<u32>(MemoryKind::DeviceLocal, u64::from(BINS) * 3, "bin args")
+        .unwrap();
+    // Sequences and counts for the preprocessed and the directly executed runs.
+    let sequences: Vec<_> = (0..2)
+        .map(|_| {
+            d.gpu_malloc::<Sequence>(MemoryKind::DeviceLocal, u64::from(BINS), "bin sequences")
+                .unwrap()
+        })
+        .collect();
+    let counts: Vec<_> = (0..2)
+        .map(|_| upload(&[0u32], "bin sequence count"))
+        .collect();
+    let classify_roots: Vec<_> = (0..2)
+        .map(|i| {
+            upload(
+                &[classify_bins::Root {
+                    items: item_counts.gpu,
+                    count: counts[i].gpu,
+                    args: args.gpu,
+                    sequences: sequences[i].gpu.address().0,
+                    roots: root_arrays[i].gpu.address().0,
+                    bins: BINS,
+                    pad0: 0,
+                }],
+                "classify bins root",
+            )
+        })
+        .collect();
+    let layout = set.preprocess_layout(BINS);
+    let mut arenas = d
+        .create_device_arenas(1, 2 * layout.size() as u64 + 4096, "bin preprocess")
+        .unwrap();
+    let runs: Vec<_> = (0..2)
+        .map(|i| Generated {
+            set: &set,
+            sequences: sequences[i].gpu,
+            count: counts[i].gpu,
+            max: BINS,
+            preprocess: arenas.allocate(layout).unwrap(),
+        })
+        .collect();
+
+    let mut list = render().command_list().unwrap();
+    let groups = [BINS.div_ceil(64), 1, 1];
+    for r in &classify_roots {
+        list.dispatch(&classify, r.gpu, groups);
+    }
+    list.barrier(
+        Stages::COMPUTE,
+        Stages::PREPROCESS | Stages::COMPUTE,
+        Hazards::DRAW_ARGUMENTS,
+    );
+    list.preprocess_generated(&runs[0]);
+    list.barrier(Stages::PREPROCESS, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
+    list.execute_generated(&runs[0], true);
+    list.execute_generated(&runs[1], false);
+    for (b, p) in recorded.iter().enumerate() {
+        let root = root_arrays[2].gpu.offset(b as u64).cast::<bins::Root>();
+        let a = args.gpu.offset(3 * b as u64).cast();
+        list.dispatch_indirect(p, root, a);
+    }
+    list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+    let done = run(list);
+    arenas.reset(done).unwrap();
+
+    for c in &counts {
+        assert_eq!(c.as_slice().unwrap()[0], BINS / 2, "sequences written");
+    }
+    for (i, o) in outputs.iter().enumerate() {
+        assert!(
+            o.as_slice().unwrap() == expected.as_slice(),
+            "output {i} differs from the CPU model"
+        );
     }
     assert_clean();
 }

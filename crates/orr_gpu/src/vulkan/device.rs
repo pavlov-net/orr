@@ -98,6 +98,8 @@ pub(crate) struct Shared {
     pub coop_fn: Option<ash::nv::cooperative_vector::Device>,
     /// With `Caps::occupancy_priority`.
     pub occupancy_fn: Option<ash::nv::compute_occupancy_priority::Device>,
+    /// With `Caps::generated_commands`.
+    pub generated_fn: Option<ash::ext::device_generated_commands::Device>,
     pub mesh_fn: ash::ext::mesh_shader::Device,
     pub rt_fn: Option<ash::khr::ray_tracing_pipeline::Device>,
     pub debug_fn: ash::ext::debug_utils::Device,
@@ -286,6 +288,16 @@ fn plan_queues(
     Ok(plans)
 }
 
+/// Execution sets of compute and of mesh pipelines (task, mesh and pixel stages) can be
+/// bound and run per sequence.
+fn generated_stages(p: &vk::PhysicalDeviceDeviceGeneratedCommandsPropertiesEXT<'_>) -> bool {
+    use vk::ShaderStageFlags as S;
+    let want = S::COMPUTE | S::TASK_EXT | S::MESH_EXT | S::FRAGMENT;
+    p.supported_indirect_commands_shader_stages.contains(want)
+        && p.supported_indirect_commands_shader_stages_pipeline_binding
+            .contains(want)
+}
+
 fn c_string(chars: &[c_char]) -> String {
     // SAFETY: Vulkan property strings are NUL-terminated within their arrays.
     unsafe { CStr::from_ptr(chars.as_ptr()) }
@@ -365,6 +377,7 @@ impl Device {
         let mut ptlas_props =
             vk::PhysicalDevicePartitionedAccelerationStructurePropertiesNV::default();
         let mut decompress_props = vk::PhysicalDeviceMemoryDecompressionPropertiesEXT::default();
+        let mut generated_props = vk::PhysicalDeviceDeviceGeneratedCommandsPropertiesEXT::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default()
             .push(&mut heap_props)
             .push(&mut as_props)
@@ -377,9 +390,13 @@ impl Device {
         if optional.memory_decompression {
             props2 = props2.push(&mut decompress_props);
         }
+        if optional.generated_commands {
+            props2 = props2.push(&mut generated_props);
+        }
         // SAFETY: every struct in the chain belongs to an enabled extension or core 1.4.
         unsafe { instance.get_physical_device_properties2(physical, &mut props2) };
         let props = props2.properties;
+        let generated = optional.generated_commands && generated_stages(&generated_props);
         heap_props.p_next = std::ptr::null_mut();
         rt_props.p_next = std::ptr::null_mut();
         let device_name = c_string(&props.device_name);
@@ -451,6 +468,7 @@ impl Device {
             host_image_copy: optional.host_image_copy && rebar,
             memory_decompression: optional.memory_decompression,
             occupancy_priority: optional.occupancy_priority,
+            generated_commands: generated,
             omm: optional.omm,
             device_address_commands: optional.device_address_commands,
             unified_image_layouts: optional.unified_image_layouts,
@@ -498,6 +516,16 @@ impl Device {
                     decompress_props
                         .max_decompression_indirect_count
                         .min(u64::from(u32::MAX)) as u32
+                } else {
+                    0
+                },
+                max_generated_pipelines: if generated {
+                    generated_props.max_indirect_pipeline_count
+                } else {
+                    0
+                },
+                max_generated_sequences: if generated {
+                    generated_props.max_indirect_sequence_count
                 } else {
                     0
                 },
@@ -603,6 +631,8 @@ impl Device {
             occupancy_fn: optional
                 .occupancy_priority
                 .then(|| ash::nv::compute_occupancy_priority::Device::load(&instance, &device)),
+            generated_fn: generated
+                .then(|| ash::ext::device_generated_commands::Device::load(&instance, &device)),
             mesh_fn: ash::ext::mesh_shader::Device::load(&instance, &device),
             rt_fn: optional
                 .ray_dispatch
@@ -718,7 +748,7 @@ impl Device {
             hooks.device_created(&device.shared.raw_device());
         }
         log::info!(
-            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, lss {}, address commands {}, cooperative vector combinations {}, host image copy {}, decompression {}, occupancy priority {}, memory priority {} (pageable {}), validation layer {}, ray tracing validation {}, diagnostics {:?} (breadcrumbs {}, checkpoints {}, aftermath {}, device fault {})",
+            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, lss {}, address commands {}, cooperative vector combinations {}, host image copy {}, decompression {}, occupancy priority {}, memory priority {} (pageable {}), generated commands {}, validation layer {}, ray tracing validation {}, diagnostics {:?} (breadcrumbs {}, checkpoints {}, aftermath {}, device fault {})",
             device.shared.caps.device_name,
             device.shared.caps.driver,
             device.shared.caps.rebar,
@@ -733,6 +763,7 @@ impl Device {
             optional.occupancy_priority,
             optional.memory_priority,
             optional.pageable_memory,
+            device.shared.caps.generated_commands,
             desc.validation,
             optional.ray_tracing_validation,
             desc.diagnostics,

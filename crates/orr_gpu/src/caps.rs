@@ -19,6 +19,11 @@ pub struct Caps {
     /// [`crate::CommandList::set_occupancy`] sets the occupancy priority of dispatches
     /// (`VK_NV_compute_occupancy_priority`); without it the call does nothing.
     pub occupancy_priority: bool,
+    /// Device-generated commands (`VK_EXT_device_generated_commands`): execution sets of
+    /// compute or mesh pipelines ([`crate::Device::create_compute_set`],
+    /// [`crate::Device::create_mesh_set`]) run per GPU-written sequence by
+    /// [`crate::CommandList::execute_generated`].
+    pub generated_commands: bool,
     /// Ray-dispatch pipelines (`VK_KHR_ray_tracing_pipeline` with invocation reordering):
     /// [`crate::Device::create_ray_dispatch_pipeline`] and
     /// [`crate::CommandList::dispatch_rays`].
@@ -125,6 +130,11 @@ pub struct Limits {
     /// Regions one [`crate::CommandList::decompress`] may list; 0 without
     /// `Caps::memory_decompression`.
     pub max_decompress_regions: u32,
+    /// Pipelines one execution set may hold; 0 without `Caps::generated_commands`.
+    pub max_generated_pipelines: u32,
+    /// Sequences one [`crate::CommandList::execute_generated`] may run; 0 without
+    /// `Caps::generated_commands`.
+    pub max_generated_sequences: u32,
 }
 
 /// A component type of a cooperative-vector operation.

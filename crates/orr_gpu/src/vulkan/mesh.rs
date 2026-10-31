@@ -160,33 +160,30 @@ fn check(shared: &Shared, d: &MeshPipelineDesc<'_>, name: &str) -> Result<(), Er
     Ok(())
 }
 
-impl Device {
-    /// Creates a mesh pipeline. Viewport and scissor are dynamic:
-    /// [`crate::CommandList::begin_rendering`] sets both to the rendering extent and
-    /// [`crate::CommandList::set_scissor`] narrows the scissor. Clip-space y points down the
-    /// target: y = -1 is row 0.
-    pub fn create_mesh_pipeline(
+impl Shared {
+    /// A mesh pipeline with `extra` creation flags.
+    pub(crate) fn create_mesh(
         &self,
         d: &MeshPipelineDesc<'_>,
+        extra: vk::PipelineCreateFlags2,
         name: &str,
-    ) -> Result<MeshPipeline, Error> {
-        let shared = &self.shared;
-        check(shared, d, name)?;
+    ) -> Result<vk::Pipeline, Error> {
+        check(self, d, name)?;
         let mut parts = Vec::with_capacity(3);
         if let Some(s) = &d.task {
             parts.push((
                 vk::ShaderStageFlags::TASK_EXT,
-                StageParts::new(shared, s, Stage::Task, name)?,
+                StageParts::new(self, s, Stage::Task, name)?,
             ));
         }
         parts.push((
             vk::ShaderStageFlags::MESH_EXT,
-            StageParts::new(shared, &d.mesh, Stage::Mesh, name)?,
+            StageParts::new(self, &d.mesh, Stage::Mesh, name)?,
         ));
         if let Some(s) = &d.pixel {
             parts.push((
                 vk::ShaderStageFlags::FRAGMENT,
-                StageParts::new(shared, s, Stage::Pixel, name)?,
+                StageParts::new(self, s, Stage::Pixel, name)?,
             ));
         }
         let mut key = KeyHasher::new(PipelineKind::Mesh);
@@ -194,6 +191,7 @@ impl Device {
             p.hash(*stage, &mut key);
         }
         (d.colors, d.depth, d.raster, d.samples).hash(&mut key);
+        extra.as_raw().hash(&mut key);
 
         let r = &d.raster;
         let colors: Vec<_> = d.colors.iter().map(|t| vk_format(t.format)).collect();
@@ -207,9 +205,10 @@ impl Device {
         };
         let bias = r.depth_bias.unwrap_or_default();
         let dynamic = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let raw = shared.create_pipeline(
+        self.create_pipeline(
             PipelineKind::Mesh,
             key.finish_key(),
+            extra,
             name,
             "vkCreateGraphicsPipelines",
             |chain| {
@@ -278,17 +277,31 @@ impl Device {
                 info.p_next = std::ptr::from_ref(&rendering).cast();
                 // SAFETY: valid create info; the SPIR-V was validated by the shader build.
                 unsafe {
-                    shared
-                        .device
+                    self.device
                         .create_graphics_pipelines(chain.cache, &[info], None)
                 }
                 .map(|p| p[0])
                 .map_err(|(_, e)| e)
             },
-        )?;
+        )
+    }
+}
+
+impl Device {
+    /// Creates a mesh pipeline. Viewport and scissor are dynamic:
+    /// [`crate::CommandList::begin_rendering`] sets both to the rendering extent and
+    /// [`crate::CommandList::set_scissor`] narrows the scissor. Clip-space y points down the
+    /// target: y = -1 is row 0.
+    pub fn create_mesh_pipeline(
+        &self,
+        d: &MeshPipelineDesc<'_>,
+        name: &str,
+    ) -> Result<MeshPipeline, Error> {
         Ok(MeshPipeline {
-            raw,
-            shared: Arc::clone(shared),
+            raw: self
+                .shared
+                .create_mesh(d, vk::PipelineCreateFlags2::empty(), name)?,
+            shared: Arc::clone(&self.shared),
         })
     }
 }

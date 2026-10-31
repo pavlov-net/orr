@@ -11,6 +11,7 @@ mod device;
 mod diagnostics;
 mod features;
 mod garbage;
+mod generated;
 mod heap;
 mod interop;
 mod memory;
@@ -38,6 +39,7 @@ pub use diagnostics::{
     Checkpoint, DeviceFault, Diagnostics, DiagnosticsReport, FaultAccess, FaultAddress,
     QueueProgress,
 };
+pub use generated::{ExecutionSet, Generated, Sequence, SetKind};
 pub use interop::{
     DeviceHooks, Features, ImageHandles, RawCommandBuffer, RawDevice, buffer_handle,
     defer_after_submitted, image_handles, raw_device,
