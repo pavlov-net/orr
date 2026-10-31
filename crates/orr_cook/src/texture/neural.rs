@@ -19,7 +19,7 @@
 use std::sync::Mutex;
 
 use orr_pack::neural::{NeuralHeader, NeuralInfo, NeuralTexture, NeuralWeights};
-use orr_pack::texture::{FormatInfo, mip_size, vk};
+use orr_pack::texture::{FormatInfo, mip_size, normal, vk};
 use orr_pack::{ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span};
 use serde::Deserialize;
 
@@ -240,7 +240,7 @@ impl NeuralJob {
                         let px = c[mip].px[t];
                         for v in &px[..usize::from(n)] {
                             out.push(if stored == NeuralTexture::NORMAL {
-                                0.5 * v + 0.5
+                                normal::encode(*v)
                             } else {
                                 v.clamp(0.0, 1.0)
                             });

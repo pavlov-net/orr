@@ -22,10 +22,7 @@ pub(crate) fn bake(
     maps: &[SectionMaps],
     d: &StaticDisplacement,
 ) -> Vec<bool> {
-    let baked: Vec<bool> = maps
-        .iter()
-        .map(|m| m.displacement.as_ref().is_some_and(|d| !d.mips.is_empty()))
-        .collect();
+    let baked: Vec<bool> = maps.iter().map(SectionMaps::bakes).collect();
     if !baked.iter().any(|&b| b) {
         return baked;
     }

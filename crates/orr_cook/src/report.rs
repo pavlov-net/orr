@@ -133,6 +133,26 @@ pub struct MeshReport {
     /// DAG mode: the merged stage's group depths.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub merged_levels: Vec<LevelReport>,
+    /// Resident vertex slots over every cluster.
+    pub vertices: u64,
+    /// The derived-tangent check of a mesh cooked from tangents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tangents: Option<TangentReport>,
+}
+
+/// Whether a mesh's tangents were derived (`MeshSettings::tangent_error_max`).
+#[derive(Clone, Debug, Serialize)]
+pub struct TangentReport {
+    /// Degrees between the shading from stored and from derived tangents at the 99th
+    /// percentile over the normal-map texels; `None` when the tangents were kept without
+    /// comparing.
+    pub angle_p99: Option<f32>,
+    /// Texel samples compared.
+    pub texels: u64,
+    /// `TANGENT` was dropped.
+    pub derived: bool,
+    /// Resident bytes the dropped tangents would have taken.
+    pub bytes_saved: u64,
 }
 
 /// A page counts toward every level it holds clusters of, and its bytes are shared among
@@ -291,6 +311,7 @@ fn mesh_report(
         .collect();
     let mut merged_levels: Vec<LevelReport> = Vec::new();
     let (mut foliage_tris, mut foliage_clusters) = (0u64, 0u64);
+    let mut vertices = 0u64;
     let mut first = 0usize;
     for p in &m.pages {
         let b = blobs.get(p.blob as usize)?;
@@ -325,6 +346,7 @@ fn mesh_report(
                 layout.attr_stride as usize,
             );
             shares.push((merged, level, resident as f64));
+            vertices += usize::from(c.vertex_count).next_multiple_of(2) as u64;
             r.triangles += u64::from(c.tri_count);
             for t in u32::from(c.alpha_first)..u32::from(c.tri_count) {
                 let Some(index) = view.omm_index(&c, t) else {
@@ -404,5 +426,7 @@ fn mesh_report(
             .then(|| foliage_tris as f64 / foliage_clusters as f64),
         levels,
         merged_levels,
+        vertices,
+        tangents: None,
     })
 }

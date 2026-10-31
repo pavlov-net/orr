@@ -31,12 +31,12 @@ use crate::instances::{self, Catalog, ModelFacts};
 use crate::key::{self, Key, ZSTD_LEVEL};
 use crate::mesh::maps::{Displacement, Opacity, Raster};
 use crate::mesh::{
-    self, DisplacementSpec, MapSpec, MeshData, MeshInput, OpacitySpec, PartData, Pivots,
-    SectionData, SectionMaps,
+    self, DisplacementSpec, MapSpec, MeshData, MeshInput, NormalSpec, OpacitySpec, PartData,
+    Pivots, SectionData, SectionMaps,
 };
 use crate::raster::{self, RasterReport};
 use crate::report::{
-    self, ArchiveReport, AssemblyReport, AssemblyUnitReport, AssetReport, Outcome,
+    self, ArchiveReport, AssemblyReport, AssemblyUnitReport, AssetReport, Outcome, TangentReport,
 };
 use crate::state::{self, Input, Memo, Record};
 use crate::subd::{self, CageData, CageInput, SubdSettings};
@@ -235,6 +235,7 @@ type UnitResult = (From, f64, Detail);
 /// What a cooked unit adds to its first entry's report.
 #[derive(Default)]
 struct Detail {
+    tangents: Option<mesh::TangentCheck>,
     raster: Option<RasterReport>,
     neural: Option<report::NeuralReport>,
     warnings: Vec<String>,
@@ -1090,7 +1091,7 @@ impl<'m, 's> Run<'m, 's> {
     fn section_maps(&mut self, u: usize, mesh: &MeshData) -> Result<Vec<SectionMaps>> {
         let a = self.units[u].archive;
         let mut users = Vec::new();
-        let mut read = |unit: &str, all: bool, wrap| -> Result<Vec<Raster>> {
+        let mut read = |unit: &str, all: bool, wrap, channels| -> Result<Vec<Raster>> {
             let t = self.by_name[&(a, unit.to_owned())];
             users.push(t);
             let from = match &self.units[t].state {
@@ -1099,7 +1100,7 @@ impl<'m, 's> Run<'m, 's> {
                 _ => unreachable!("a mesh starts after the textures it reads"),
             };
             self.with_archive(a, from, |arc| {
-                texture_mips(arc, AssetId::from_name(unit), all, wrap)
+                texture_mips(arc, AssetId::from_name(unit), all, wrap, channels)
             })?
         };
         let mut out = Vec::with_capacity(mesh.sections.len());
@@ -1111,7 +1112,7 @@ impl<'m, 's> Run<'m, 's> {
                 OpacitySpec::Texture {
                     unit, cutoff, wrap, ..
                 } => Some(Opacity::Texture {
-                    mip0: read(unit, false, *wrap)?.remove(0),
+                    mip0: read(unit, false, *wrap, 1)?.remove(0),
                     cutoff: *cutoff,
                 }),
             };
@@ -1123,14 +1124,21 @@ impl<'m, 's> Run<'m, 's> {
                     min: d.min,
                     max: d.max,
                     mips: match &d.texture {
-                        Some((unit, _, wrap)) => read(unit, true, *wrap)?,
+                        Some((unit, _, wrap)) => read(unit, true, *wrap, 1)?,
                         None => Vec::new(),
                     },
                 }),
             };
+            let normal = match &s.maps.normal {
+                NormalSpec::Texture { unit, wrap, .. } => {
+                    read(unit, false, *wrap, 2)?.try_into().ok()
+                }
+                _ => None,
+            };
             out.push(SectionMaps {
                 opacity,
                 displacement,
+                normal,
             });
         }
         for t in users {
@@ -1293,6 +1301,9 @@ impl<'m, 's> Run<'m, 's> {
                     From::Cache(path) => write(&Archive::open(path)?)?,
                 }
                 if let (Some(d), Some(first)) = (self.details.remove(&u), reports.first_mut()) {
+                    if let (Some(m), Some(t)) = (first.mesh.as_mut(), d.tangents) {
+                        m.tangents = Some(tangent_report(m.vertices, t));
+                    }
                     first.raster = d.raster;
                     first.neural = d.neural;
                     first.warnings = d.warnings;
@@ -1365,6 +1376,21 @@ impl<'m, 's> Run<'m, 's> {
         }
         cooked.report.assets = assets;
         Ok(cooked)
+    }
+}
+
+fn tangent_report(vertices: u64, t: mesh::TangentCheck) -> TangentReport {
+    let per_vertex = orr_pack::mesh::attr_stride(orr_pack::mesh::MeshHeader::TANGENT)
+        - orr_pack::mesh::attr_stride(0);
+    TangentReport {
+        angle_p99: t.angle_p99,
+        texels: t.texels,
+        derived: t.derive,
+        bytes_saved: if t.derive {
+            vertices * u64::from(per_vertex)
+        } else {
+            0
+        },
     }
 }
 
@@ -1709,9 +1735,20 @@ fn map_spec(
             _ => None,
         },
     });
+    let normal = match bound(slot::NORMAL) {
+        _ if m.specular_anisotropy > 0.0 || m.surface != 0 => NormalSpec::Tangent,
+        None => NormalSpec::None,
+        Some((Some((unit, key)), 0)) => NormalSpec::Texture {
+            unit: unit.clone(),
+            key: *key,
+            wrap: wrap(t.normal.as_ref().map(|n| &n.0)),
+        },
+        Some(_) => NormalSpec::Tangent,
+    };
     MapSpec {
         opacity,
         displacement,
+        normal,
     }
 }
 
@@ -1985,8 +2022,15 @@ fn subd_units(
     Ok(units)
 }
 
-/// One channel of every mip (all of them, or mip 0 only) of a cooked texture entry.
-fn texture_mips(arc: &Archive, id: AssetId, all: bool, wrap: [Wrap; 2]) -> Result<Vec<Raster>> {
+/// Mip 0, or every mip with `all`, of a cooked texture: per mip, its first `channels`
+/// channels as rasters.
+fn texture_mips(
+    arc: &Archive,
+    id: AssetId,
+    all: bool,
+    wrap: [Wrap; 2],
+    channels: usize,
+) -> Result<Vec<Raster>> {
     let e = arc.expect(id, Class::Texture as u16, orr_pack::texture::SCHEMA)?;
     let blobs = arc.blobs(e);
     let mut head = vec![0; blobs[0].raw_len as usize];
@@ -2004,24 +2048,32 @@ fn texture_mips(arc: &Archive, id: AssetId, all: bool, wrap: [Wrap; 2]) -> Resul
         }
         let bytes = info.mip_texels(&blob.1, mip, 0)?;
         let [w, hh] = h.mip_size(mip);
-        let texels = match h.vk_format {
+        let px: Vec<[f32; 4]> = match h.vk_format {
             orr_pack::texture::vk::R16_UNORM => bytes
                 .chunks_exact(2)
-                .map(|c| f32::from(u16::from_le_bytes([c[0], c[1]])) / 65535.0)
+                .map(|c| {
+                    [
+                        f32::from(u16::from_le_bytes([c[0], c[1]])) / 65535.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ]
+                })
                 .collect(),
-            f => texture::decode_blocks(f, w, hh, &bytes)
-                .map_err(|_| orr_pack::Error::Malformed("texture format the mesh cook reads"))?
-                .px
-                .iter()
-                .map(|p| p[0])
-                .collect(),
+            f => {
+                texture::decode_blocks(f, w, hh, &bytes)
+                    .map_err(|_| orr_pack::Error::Malformed("texture format the mesh cook reads"))?
+                    .px
+            }
         };
-        out.push(Raster {
-            w,
-            h: hh,
-            texels,
-            wrap,
-        });
+        for c in 0..channels {
+            out.push(Raster {
+                w,
+                h: hh,
+                texels: px.iter().map(|p| p[c]).collect(),
+                wrap,
+            });
+        }
     }
     Ok(out)
 }
@@ -2053,6 +2105,7 @@ fn cook_unit(
             let cooked = mesh::cook(name, &data, &settings, &maps)?;
             drop((data, maps));
             detail.warnings = cooked.warnings;
+            detail.tangents = cooked.tangents;
             let info = cooked.info.to_bytes();
             let pinned = cooked.info.header.pinned_pages as usize;
             let mut blobs = vec![mount(&info)];

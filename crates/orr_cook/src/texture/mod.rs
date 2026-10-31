@@ -9,7 +9,7 @@ pub(crate) mod neural;
 
 use orr_pack::texture::{
     ExtractedLight, FormatInfo, TILE_BYTES, TextureHeader, TextureInfo, full_mip_count, mip_size,
-    tail_first_mip, tile,
+    normal, tail_first_mip, tile,
 };
 use orr_pack::{ArchiveWriter, AssetId, BcLayout, BlobIn, Class, Filter, Hash32, Span};
 use serde::Deserialize;
@@ -314,7 +314,13 @@ pub(crate) fn chains(layers: Vec<Img>, plan: &Plan) -> Result<Vec<Vec<Img>>, Str
 
 /// Mip chains, encoding and layout for `layers` (mip 0 each, values linear).
 pub(crate) fn build(layers: Vec<Img>, plan: &Plan) -> Result<Built, String> {
-    let chains = chains(layers, plan)?;
+    let mut chains = chains(layers, plan)?;
+    if plan.mips.normal {
+        for p in chains.iter_mut().flatten().flat_map(|m| &mut m.px) {
+            p[0] = normal::encode(p[0]);
+            p[1] = normal::encode(p[1]);
+        }
+    }
     let [w, h] = [chains[0][0].w, chains[0][0].h];
     let encoded = encode::encode(plan.encoding, plan.quality, &chains)?;
     let alpha_cutoff = plan.mips.coverage.map_or(f32::NAN, |(_, c)| c);

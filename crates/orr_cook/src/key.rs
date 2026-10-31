@@ -16,8 +16,8 @@ pub(crate) const GDEFLATE_LEVEL: i32 = 12;
 /// Cook version per class. Bump a class's version whenever the cook writes different bytes
 /// for the same inputs; the golden test fails until it is bumped.
 pub(crate) const VERSIONS: &[(Class, u32)] = &[
-    (Class::Mesh, 6),
-    (Class::Texture, 2),
+    (Class::Mesh, 7),
+    (Class::Texture, 3),
     (Class::Material, 1),
     (Class::Model, 3),
     (Class::InstancePage, 2),

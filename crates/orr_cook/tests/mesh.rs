@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use glam::{Mat4, Vec3};
-use orr_cook::{ArchiveSpec, AssetSpec, GltfSettings, Manifest, Source};
+use orr_cook::{ArchiveSpec, AssetSpec, GltfSettings, Manifest, MeshSettings, Source};
 use orr_pack::material::Material;
 use orr_pack::mesh::{self, MeshInfo, PageView, Section};
 use orr_pack::model::ModelInfo;
@@ -167,7 +167,14 @@ fn cook_memory(path: &Path) -> orr_cook::Result<Archive> {
                 name: "fixture".into(),
                 source: Source::Gltf {
                     path: path.into(),
-                    settings: GltfSettings::default(),
+                    // The fixture checks how stored tangents are encoded.
+                    settings: GltfSettings {
+                        mesh: MeshSettings {
+                            tangent_error_max: None,
+                            ..MeshSettings::default()
+                        },
+                        ..GltfSettings::default()
+                    },
                 },
             }],
         }],
