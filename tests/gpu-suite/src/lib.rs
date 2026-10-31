@@ -2,6 +2,7 @@
 //! if the layer reports anything.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -62,14 +63,31 @@ pub fn device() -> &'static Device {
     device_with(diagnostics)
 }
 
+/// The pipeline cache file the test binaries of one build profile share, beside them under
+/// `target/<profile>/`. Shader edits leave stale pipelines in it, so it starts over once it
+/// outgrows 256 MiB.
+fn pipeline_cache_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let path = exe.parent()?.parent()?.join("test-pipeline-cache.bin");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 256 << 20) {
+        let _ = std::fs::remove_file(&path);
+    }
+    Some(path)
+}
+
 /// The suite's device created with `diagnostics`, for test binaries that need them; the
-/// first call in a process decides.
+/// first call in a process decides. Without diagnostics its pipelines are cached in a file
+/// under `target/<profile>/` that [`assert_clean`] writes.
 pub fn device_with(diagnostics: Diagnostics<'static>) -> &'static Device {
     DEVICE.get_or_init(|| {
         log_to_stderr();
+        let cache = matches!(diagnostics, Diagnostics::Off)
+            .then(pipeline_cache_path)
+            .flatten();
         let desc = DeviceDesc {
             name: "gpu-suite",
             validation: true,
+            pipeline_cache: cache.as_deref(),
             diagnostics,
             queues: QueueRequest {
                 render_compute: true,
@@ -99,8 +117,12 @@ pub fn require(cond: bool, why: &str) -> bool {
     cond
 }
 
-/// Fails the calling test if the validation layer has reported anything.
+/// Writes the device's pipeline cache, then fails the calling test if the validation layer
+/// has reported anything.
 pub fn assert_clean() {
+    if let Err(e) = device().save_pipeline_cache() {
+        log::warn!("{e}");
+    }
     assert_eq!(
         device().validation_messages(),
         0,

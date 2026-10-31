@@ -151,9 +151,10 @@ pub struct Renderer {
 /// orr-lighting's kernels and tables, and each scene's lighting state.
 struct Lighting {
     kernels: &'static KernelSet,
-    paths: LightingKernels,
+    /// Compiled with the first view history.
+    paths: Option<LightingKernels>,
     scenes: HashMap<SceneId, SceneLighting>,
-    _tables: BsdfTables,
+    tables: BsdfTables,
 }
 
 /// One view history's lighting and output state.
@@ -287,7 +288,8 @@ fn builtin_modules() -> Vec<&'static ShaderModule> {
 impl Renderer {
     /// Checks `desc.kernels` against orr's compiled-in kernels, then compiles the renderer's
     /// pipelines and uploads the BSDF tables on the calling thread, which must own the
-    /// Render queue.
+    /// Render queue. The path tracing pipelines compile with the first view history
+    /// ([`Renderer::create_view_history`]).
     pub fn new(gpu: &Device, desc: RendererDesc) -> Result<Self> {
         desc.kernels
             .check(&builtin_modules())
@@ -300,9 +302,9 @@ impl Renderer {
             scenes: Scenes::new(gpu, &desc)?,
             lighting: Lighting {
                 kernels: desc.kernels,
-                paths: LightingKernels::new(gpu, desc.kernels, &tables, PathEntry::Fastest)?,
+                paths: None,
                 scenes: HashMap::new(),
-                _tables: tables,
+                tables,
             },
             output: Output::new(gpu, desc.frames_in_flight)?,
         })
@@ -354,9 +356,19 @@ impl Renderer {
     }
 
     /// History for one persistent camera: its previous camera, exposure slots and the
-    /// lighting and output state of its renders.
+    /// lighting and output state of its renders. The first call compiles the path tracing
+    /// pipelines.
     pub fn create_view_history(&mut self) -> Result<ViewHistoryId> {
         let gpu = self.scenes.device().clone();
+        let lighting = &mut self.lighting;
+        if lighting.paths.is_none() {
+            lighting.paths = Some(LightingKernels::new(
+                &gpu,
+                lighting.kernels,
+                &lighting.tables,
+                PathEntry::Fastest,
+            )?);
+        }
         let fif = self.output.frames_in_flight;
         let state = ViewState {
             lighting: None,
@@ -651,7 +663,11 @@ impl<'a> Frame<'a> {
         }
         let paths = state.lighting.as_mut().expect("lighting view");
         list.barrier(Stages::ALL, Stages::COMPUTE | Stages::RAY, Hazards::empty());
-        lights.paths.record_opaque(
+        let kernels = lights
+            .paths
+            .as_ref()
+            .expect("compiled with the view history");
+        kernels.record_opaque(
             list,
             scene,
             paths,

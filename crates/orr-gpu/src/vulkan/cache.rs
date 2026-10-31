@@ -258,6 +258,8 @@ pub(crate) struct PipelineCache {
     rejected: Option<String>,
     hits: AtomicU32,
     misses: AtomicU32,
+    /// Held while saving; the misses counted when the file was last written.
+    saved: Mutex<u32>,
 }
 
 impl PipelineCache {
@@ -290,6 +292,7 @@ impl PipelineCache {
             rejected: None,
             hits: AtomicU32::new(0),
             misses: AtomicU32::new(0),
+            saved: Mutex::new(0),
         };
         let Some(path) = path else { return cache };
         let file = match std::fs::read(path) {
@@ -472,8 +475,10 @@ impl Shared {
         let start = Instant::now();
         let cache = &self.pipeline_cache;
         let flags = self.pipeline_flags() | extra;
+        // Counted after the pipeline is in the entries or the VkPipelineCache, so a save that
+        // sees the count sees what it must write.
         let count = |hit: bool| {
-            if hit { &cache.hits } else { &cache.misses }.fetch_add(1, Ordering::Relaxed);
+            if hit { &cache.hits } else { &cache.misses }.fetch_add(1, Ordering::Release);
         };
         let raw = match &cache.backing {
             Backing::None => {
@@ -493,6 +498,7 @@ impl Shared {
             } => {
                 let verdict = &verdicts[kind as usize];
                 let found = entries.lock().unwrap().get(&key).cloned();
+                let mut refused = false;
                 let warm = found.and_then(|binaries| {
                     match self.create_from_binaries(fns, &binaries, flags, &mut create) {
                         Ok(raw) => Some(raw),
@@ -500,6 +506,7 @@ impl Shared {
                             log::info!("pipeline {name}: cached binaries refused ({e:?})");
                             verdict.store(REFUSES_BINARIES, Ordering::Relaxed);
                             entries.lock().unwrap().remove(&key);
+                            refused = true;
                             None
                         }
                     }
@@ -509,14 +516,14 @@ impl Shared {
                     raw
                 } else if verdict.load(Ordering::Relaxed) == REFUSES_BINARIES {
                     let (raw, hit) = self.compile(*pc, flags, call, &mut create)?;
-                    count(hit);
+                    // A refusal changed the entries and verdicts, which the next save writes.
+                    count(hit && !refused);
                     raw
                 } else {
-                    count(false);
                     let capture = flags | vk::PipelineCreateFlags2::CAPTURE_DATA_KHR;
                     let null = vk::PipelineCache::null();
                     let raw = self.compile(null, capture, call, &mut create)?.0;
-                    match self.capture_binaries(fns, raw) {
+                    let raw = match self.capture_binaries(fns, raw) {
                         Ok(b) => {
                             if verdict.load(Ordering::Relaxed) == UNKNOWN {
                                 self.check_binaries(kind, verdict, fns, &b, flags, &mut create);
@@ -536,7 +543,9 @@ impl Shared {
                             log::warn!("pipeline {name}: capturing binaries failed ({e:?})");
                             raw
                         }
-                    }
+                    };
+                    count(false);
+                    raw
                 }
             }
         };
@@ -753,12 +762,19 @@ impl Shared {
 
 impl Device {
     /// Writes the pipeline cache to the path given at device creation, replacing the file
-    /// whole. Does nothing without a path.
+    /// whole. Does nothing without a path, or when no pipeline has missed the cache since
+    /// the device opened it or last wrote it. Safe to call from several threads and
+    /// processes at once: each writes a whole file and the last one stays.
     pub fn save_pipeline_cache(&self) -> Result<(), Error> {
         let cache = &self.shared.pipeline_cache;
         let Some(path) = &cache.path else {
             return Ok(());
         };
+        let mut saved = cache.saved.lock().unwrap();
+        let misses = cache.misses.load(Ordering::Acquire);
+        if misses == *saved {
+            return Ok(());
+        }
         let payload = match &cache.backing {
             Backing::None => return Ok(()),
             Backing::Binaries {
@@ -788,9 +804,13 @@ impl Device {
             std::fs::create_dir_all(dir).map_err(io)?;
         }
         let mut tmp = path.clone().into_os_string();
-        tmp.push(".tmp");
-        std::fs::write(&tmp, &bytes).map_err(io)?;
-        std::fs::rename(&tmp, path).map_err(io)?;
+        tmp.push(format!(".{}.tmp", std::process::id()));
+        let written = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, path));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io(e));
+        }
+        *saved = misses;
         log::debug!(
             "pipeline cache {}: saved {} bytes",
             path.display(),
