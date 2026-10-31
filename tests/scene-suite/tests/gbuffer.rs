@@ -2536,6 +2536,7 @@ fn ptlas_work_past_the_budget_waits_and_lands_nearest_first() {
         [(40, 80, 1), (40, 40, 2), (40, 0, 0), (0, 0, 0), (0, 0, 0)],
         "writes, deferred and the oldest wait per frame"
     );
+    assert_eq!(w.scenes.stats().rt.partitions, 3, "one partition per cell");
     assert_clean();
 }
 

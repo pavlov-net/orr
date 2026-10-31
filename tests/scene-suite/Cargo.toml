@@ -17,6 +17,7 @@ glam.workspace = true
 [dev-dependencies]
 bytemuck.workspace = true
 orr-color.workspace = true
+orr-math.workspace = true
 orr-cook = { path = "../../crates/orr-cook" }
 orr-pack.workspace = true
 png = "0.18"
@@ -24,6 +25,10 @@ png = "0.18"
 [target.'cfg(windows)'.dev-dependencies]
 gpu-suite = { path = "../gpu-suite" }
 log.workspace = true
+
+[[bench]]
+name = "synthetic_forest"
+harness = false
 
 [build-dependencies]
 orr-shaders = { workspace = true, features = ["build"] }
