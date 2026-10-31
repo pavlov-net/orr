@@ -32,7 +32,7 @@ pub use accel::{
 };
 pub use ash;
 pub use cache::{PipelineCacheKind, PipelineCacheReport};
-pub use command::{CommandList, DecompressRegion, DispatchArgs, MeshArgs};
+pub use command::{CommandList, DecompressRegion, DispatchArgs, MemoryCopy, MeshArgs, TextureCopy};
 pub use coopvec::{MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout};
 pub use device::{Device, DeviceDesc};
 pub use diagnostics::{

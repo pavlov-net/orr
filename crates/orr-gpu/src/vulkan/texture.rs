@@ -4,6 +4,7 @@
 use std::sync::{Arc, OnceLock};
 
 use ash::vk;
+use ash::vk::TaggedStructure as _;
 
 use super::debug::name_object;
 use super::device::{Device, Shared};
@@ -441,7 +442,33 @@ pub(crate) fn vk_extent(r: &TextureRegion) -> vk::Extent3D {
     }
 }
 
+pub(crate) fn indirect_copy_format(shared: &Shared, format: Format) -> bool {
+    if !shared.caps.indirect_copy || format.is_depth() {
+        return false;
+    }
+    let mut p3 = vk::FormatProperties3::default();
+    {
+        let mut p = vk::FormatProperties2::default().push(&mut p3);
+        // SAFETY: a plain query on the device's physical device.
+        unsafe {
+            shared.instance.get_physical_device_format_properties2(
+                shared.physical,
+                vk_format(format),
+                &mut p,
+            );
+        }
+    }
+    p3.optimal_tiling_features
+        .contains(vk::FormatFeatureFlags2::COPY_IMAGE_INDIRECT_DST_KHR)
+}
+
 impl Device {
+    /// [`crate::CommandList::copy_to_texture_indirect`] can copy into textures of `format`:
+    /// `Caps::indirect_copy` and a color format the device copies into indirectly.
+    pub fn indirect_copy_format(&self, format: Format) -> bool {
+        indirect_copy_format(&self.shared, format)
+    }
+
     /// Size and alignment of a texture's memory, for placing it in a block.
     pub fn texture_requirements(&self, desc: &TextureDesc) -> (u64, u64) {
         let info = image_info(desc, false, &self.shared.families);

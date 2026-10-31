@@ -32,7 +32,7 @@ bitflags::bitflags! {
     /// Reads a barrier also makes visible beyond shader reads in the `after` stages.
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
     pub struct Hazards: u32 {
-        /// Indirect dispatch and draw arguments.
+        /// Indirect dispatch and draw arguments and indirect copy regions.
         const DRAW_ARGUMENTS = 1 << 0;
         /// Heap descriptors written on the GPU.
         const DESCRIPTORS = 1 << 1;

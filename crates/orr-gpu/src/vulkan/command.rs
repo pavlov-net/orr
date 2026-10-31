@@ -12,10 +12,10 @@ use super::mesh::{MeshPipeline, Rendering};
 use super::pipeline::ComputePipeline;
 use super::queue::{ListResources, MAX_PASSES, Queue};
 use super::ray::RayDispatchPipeline;
-use super::texture::{Texture, vk_extent, vk_offset};
+use super::texture::{Texture, indirect_copy_format, vk_extent, vk_offset};
 use crate::{
     Caps, ClearColor, ColorLoad, DepthLoad, Error, GpuAddress, GpuPtr, Hazards, Stages,
-    TextureRegion, TextureUsage,
+    TextureLayers, TextureRegion, TextureUsage,
 };
 
 /// What device address commands are told about every `gpu_malloc` and sparse range: their
@@ -58,6 +58,52 @@ pub struct DecompressRegion {
     pub dst: u64,
     pub compressed_bytes: u64,
     pub decompressed_bytes: u64,
+}
+
+/// One region of [`CommandList::copy_indirect`] (`VkCopyMemoryIndirectCommandKHR`, 24 B):
+/// device addresses and a byte count, each a multiple of 4. A region of 0 bytes copies
+/// nothing.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct MemoryCopy {
+    pub src: u64,
+    pub dst: u64,
+    pub bytes: u64,
+}
+
+/// One region of [`CommandList::copy_to_texture_indirect`]
+/// (`VkCopyMemoryToImageIndirectCommandKHR`, 56 B). Kernels write it with the `copy`
+/// module's `store`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct TextureCopy {
+    src: u64,
+    row_texels: u32,
+    image_rows: u32,
+    aspect: u32,
+    mip: u32,
+    base_layer: u32,
+    layers: u32,
+    offset: [u32; 3],
+    extent: [u32; 3],
+}
+
+impl TextureCopy {
+    /// Texels from `src`, whose rows start `row_texels` texels apart (0 packs them tightly),
+    /// into `region` of a color texture. The region's extent is not empty.
+    pub fn new(src: GpuAddress, region: &TextureRegion, row_texels: u32) -> Self {
+        Self {
+            src: src.0,
+            row_texels,
+            image_rows: 0,
+            aspect: vk::ImageAspectFlags::COLOR.as_raw(),
+            mip: region.mip,
+            base_layer: region.base_layer,
+            layers: region.layers,
+            offset: region.offset,
+            extent: region.extent,
+        }
+    }
 }
 
 pub(crate) struct PassRecord {
@@ -227,6 +273,9 @@ impl<'q> CommandList<'q> {
         let mut dst_access = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
         if hazards.contains(Hazards::DRAW_ARGUMENTS) {
             dst |= vk::PipelineStageFlags2::DRAW_INDIRECT;
+            if caps.indirect_copy {
+                dst |= vk::PipelineStageFlags2::COPY_INDIRECT_KHR;
+            }
         }
         if hazards.contains(Hazards::ACCEL_STRUCT) {
             src_access |= vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR;
@@ -737,6 +786,87 @@ impl<'q> CommandList<'q> {
                 size_of::<DecompressRegion>() as u32,
             );
         }
+    }
+
+    /// Copies the first `count` regions listed at `regions`, which the GPU may have written
+    /// (ordered by a barrier with [`Hazards::DRAW_ARGUMENTS`]); later reads of the copied
+    /// bytes wait on a barrier from [`Stages::TRANSFER`]. No two regions write the same byte
+    /// or write bytes another reads. Needs `Caps::indirect_copy` and a graphics or compute
+    /// queue.
+    pub fn copy_indirect(&mut self, regions: GpuPtr<MemoryCopy>, count: u32) {
+        let f = self.indirect_copy_fn();
+        if count == 0 {
+            return;
+        }
+        let stride = size_of::<MemoryCopy>() as u64;
+        let info = vk::CopyMemoryIndirectInfoKHR::default()
+            .copy_count(count)
+            .copy_address_range(vk::StridedDeviceAddressRangeKHR {
+                address: regions.address().0,
+                size: stride * u64::from(count),
+                stride,
+            });
+        // SAFETY: recording on a graphics or compute queue with the extension enabled; the
+        // list is the caller's live allocation.
+        unsafe { (f.fp().cmd_copy_memory_indirect_khr)(self.cmd(), &info) };
+    }
+
+    /// Copies the regions listed at `regions` into `dst`, one per entry of `layers`, which
+    /// names the mip and layers region `i` writes; the GPU writes everything else of a
+    /// region (ordered by a barrier with [`Hazards::DRAW_ARGUMENTS`]). Later reads wait on a
+    /// barrier from [`Stages::TRANSFER`]. `dst` is in `GENERAL` and its format passes
+    /// [`crate::Device::indirect_copy_format`]. Needs a graphics or compute queue.
+    pub fn copy_to_texture_indirect(
+        &mut self,
+        dst: &Texture,
+        regions: GpuPtr<TextureCopy>,
+        layers: &[TextureLayers],
+    ) {
+        let f = self.indirect_copy_fn();
+        let format = dst.desc().format;
+        debug_assert!(
+            indirect_copy_format(&self.queue.shared, format),
+            "indirect copies into {format:?} textures are not supported"
+        );
+        if layers.is_empty() {
+            return;
+        }
+        let subresources: Vec<vk::ImageSubresourceLayers> = layers
+            .iter()
+            .map(|l| {
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .mip_level(l.mip)
+                    .base_array_layer(l.base_layer)
+                    .layer_count(l.layers)
+            })
+            .collect();
+        let stride = size_of::<TextureCopy>() as u64;
+        let info = vk::CopyMemoryToImageIndirectInfoKHR::default()
+            .copy_address_range(vk::StridedDeviceAddressRangeKHR {
+                address: regions.address().0,
+                size: stride * layers.len() as u64,
+                stride,
+            })
+            .dst_image(dst.image)
+            .dst_image_layout(vk::ImageLayout::GENERAL)
+            .image_subresources(&subresources);
+        // SAFETY: recording on a graphics or compute queue with the extension enabled; the
+        // texture is in GENERAL and the list is the caller's live allocation.
+        unsafe { (f.fp().cmd_copy_memory_to_image_indirect_khr)(self.cmd(), &info) };
+    }
+
+    fn indirect_copy_fn(&self) -> &'q ash::khr::copy_memory_indirect::Device {
+        let shared = &self.queue.shared;
+        let f = shared
+            .indirect_copy_fn
+            .as_ref()
+            .expect("indirect copies need Caps::indirect_copy");
+        assert!(
+            self.queue.shaders,
+            "indirect copies run on a graphics or compute queue"
+        );
+        f
     }
 
     /// Occupancy priority (0 lowest, 0.5 the default, 1 highest) and throttling (0 none, 1

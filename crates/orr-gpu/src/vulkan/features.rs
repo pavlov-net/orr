@@ -61,6 +61,7 @@ pub(crate) struct Optional {
     pub lss: bool,
     pub omm: bool,
     pub device_address_commands: bool,
+    pub indirect_copy: bool,
     pub unified_image_layouts: bool,
     pub memory_budget: bool,
     pub memory_priority: bool,
@@ -122,6 +123,7 @@ pub(crate) struct FeatureChain {
     pub ptlas: vk::PhysicalDevicePartitionedAccelerationStructureFeaturesNV<'static>,
     pub omm: vk::PhysicalDeviceOpacityMicromapFeaturesKHR<'static>,
     pub address_commands: vk::PhysicalDeviceDeviceAddressCommandsFeaturesKHR<'static>,
+    pub indirect_copy: vk::PhysicalDeviceCopyMemoryIndirectFeaturesKHR<'static>,
     pub unified: vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR<'static>,
     pub abort: vk::PhysicalDeviceShaderAbortFeaturesKHR<'static>,
     pub constant_data: vk::PhysicalDeviceShaderConstantDataFeaturesKHR<'static>,
@@ -184,6 +186,9 @@ impl FeatureChain {
         }
         if opt.device_address_commands {
             chain.push(ptr(&mut self.address_commands));
+        }
+        if opt.indirect_copy {
+            chain.push(ptr(&mut self.indirect_copy));
         }
         if opt.unified_image_layouts {
             chain.push(ptr(&mut self.unified));
@@ -386,6 +391,7 @@ pub(crate) fn select(
             && present(ash::khr::ray_tracing_pipeline::NAME),
         omm: present(ash::khr::opacity_micromap::NAME),
         device_address_commands: present(ash::khr::device_address_commands::NAME),
+        indirect_copy: present(ash::khr::copy_memory_indirect::NAME),
         unified_image_layouts: present(ash::khr::unified_image_layouts::NAME),
         memory_budget: present(ash::ext::memory_budget::NAME),
         memory_priority: present(ash::ext::memory_priority::NAME),
@@ -524,6 +530,8 @@ pub(crate) fn select(
     opt.device_address_commands &= q.address_commands.device_address_commands != 0;
     // OMM builds take micromap addresses, which need device address commands.
     opt.omm &= q.omm.micromap != 0 && opt.device_address_commands;
+    opt.indirect_copy &= q.indirect_copy.indirect_memory_copy != 0
+        && q.indirect_copy.indirect_memory_to_image_copy != 0;
     opt.unified_image_layouts &= q.unified.unified_image_layouts != 0;
     opt.shader_abort &= q.abort.shader_abort != 0 && q.constant_data.shader_constant_data != 0;
     opt.pipeline_binary &= q.binary.pipeline_binaries != 0;
@@ -608,6 +616,10 @@ pub(crate) fn select(
     e.lss.linear_swept_spheres = 1;
     e.omm.micromap = 1;
     e.address_commands.device_address_commands = 1;
+    e.indirect_copy = e
+        .indirect_copy
+        .indirect_memory_copy(true)
+        .indirect_memory_to_image_copy(true);
     e.unified.unified_image_layouts = 1;
     e.abort.shader_abort = 1;
     e.constant_data.shader_constant_data = 1;
@@ -661,6 +673,7 @@ pub(crate) fn select(
         opt.device_address_commands,
         &[ash::khr::device_address_commands::NAME],
     );
+    add(opt.indirect_copy, &[ash::khr::copy_memory_indirect::NAME]);
     add(
         opt.unified_image_layouts,
         &[ash::khr::unified_image_layouts::NAME],
