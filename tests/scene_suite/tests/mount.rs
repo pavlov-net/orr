@@ -15,10 +15,10 @@ use orr_cook::{
     Placement, PrototypeSpec, Quality, Source, TextureSettings,
 };
 use orr_pack::material::{Material, slot};
-use orr_pack::mesh::{MeshInfo, decode_page};
+use orr_pack::mesh::{MeshHeader, MeshInfo, Node, NodePage, decode_page};
 use orr_pack::model::ModelInfo;
 use orr_pack::texture::TextureInfo;
-use orr_pack::{Archive, AssetId, Class, Entry, Span, Target};
+use orr_pack::{Archive, ArchiveWriter, AssetId, BlobIn, Class, Entry, Span, Target};
 use orr_scene::orr_gpu::{
     Device, DeviceDesc, GpuAddress, GpuPtr, QueueKind, QueueRequest, Texture, TextureIndex,
     TextureRegion,
@@ -27,9 +27,10 @@ use orr_scene::testing::{
     assert_clean, device, global_tables, mounted_texture, read_buffer_on, read_texture_on,
 };
 use orr_scene::{
-    Affine3, BoundTexture, EmissiveGpu, Error, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
-    InstancesDesc, LoadState, Loading, MaterialGpu, MeshGpu, ModelGpu, MountId, PackSource,
-    RendererDesc, SceneDesc, SceneRoot, Scenes, TransformGroupDesc, material_flags,
+    Affine3, BoundTexture, Budgets, EmissiveGpu, Error, FrameDesc, FrameTime, GroupWriter,
+    InstanceFlags, InstancesDesc, LoadState, Loading, MaterialGpu, MeshGpu, ModelGpu, ModelId,
+    MountId, PackSource, RendererDesc, ResidencyClass, SceneDesc, SceneRoot, Scenes,
+    TransformGroupDesc, material_flags,
 };
 
 const ALBEDO: &str = "kit/albedo";
@@ -614,9 +615,8 @@ fn a_file_renamed_over_a_mount_is_not_read() {
     assert_clean();
 }
 
-#[test]
-fn staged_device_places_the_same_assets() {
-    let _serial = serial();
+/// A second device without resizable BAR or host image copy, so every write is staged.
+fn staged_device() -> Device {
     let _ = device();
     let staged = Device::new(&DeviceDesc {
         name: "orr-test-staged",
@@ -632,6 +632,13 @@ fn staged_device_places_the_same_assets() {
     })
     .unwrap();
     assert!(!staged.caps().rebar && !staged.caps().host_image_copy);
+    staged
+}
+
+#[test]
+fn staged_device_places_the_same_assets() {
+    let _serial = serial();
+    let staged = staged_device();
     let bytes = pack();
     let a = Archive::from_memory(Arc::clone(bytes)).unwrap();
     {
@@ -787,6 +794,158 @@ fn models_emit_and_unmounted_packs_free_after_frames_in_flight() {
         scenes.model(again, panel_id).unwrap(),
         panel,
         "freed ids are reused"
+    );
+    assert_clean();
+}
+
+const DOME_MESH: &str = "kit/dome/mesh";
+
+/// [`pack`] with the dome's hierarchy split into a top page holding the roots and one
+/// streamed page holding every other node: the layout the cook writes for hierarchies over
+/// one node page, at a size a test can cook quickly.
+fn paged_hierarchy() -> &'static Arc<[u8]> {
+    static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
+    PACK.get_or_init(|| {
+        let a = Archive::from_memory(Arc::clone(pack())).unwrap();
+        let mut w = ArchiveWriter::create(Target::Memory).unwrap();
+        for e in a.entries() {
+            if e.id != AssetId::from_name(DOME_MESH) {
+                w.copy_entry(&a, e).unwrap();
+                continue;
+            }
+            let mut info = MeshInfo::parse(&blob(&a, e, 0)).unwrap();
+            assert_eq!(info.node_pages.len(), 1);
+            let nodes = blob(&a, e, info.node_pages[0].blob as usize);
+            let count = info.node_pages[0].node_count;
+            let top = info
+                .roots
+                .iter()
+                .filter(|&&r| r != MeshHeader::NO_ROOT)
+                .max()
+                .unwrap()
+                + 1;
+            assert!(top < count, "the dome has nodes below its roots");
+            let first_node_blob = 1 + info.pages.len() as u32;
+            info.node_pages = vec![
+                NodePage {
+                    first_node: 0,
+                    node_count: top,
+                    blob: first_node_blob,
+                    parent_page: NodePage::TOP,
+                },
+                NodePage {
+                    first_node: top,
+                    node_count: count - top,
+                    blob: first_node_blob + 1,
+                    parent_page: 0,
+                },
+            ];
+            let blob0 = info.to_bytes();
+            let pages: Vec<Vec<u8>> = (1..first_node_blob as usize)
+                .map(|i| blob(&a, e, i))
+                .collect();
+            let (top_nodes, rest) = nodes.split_at(top as usize * size_of::<Node>());
+            let mount = |bytes| BlobIn {
+                mount: true,
+                ..BlobIn::new(bytes)
+            };
+            let mut blobs = vec![mount(&blob0)];
+            blobs.extend(pages.iter().map(|p| BlobIn::new(p)));
+            blobs.extend([mount(top_nodes), BlobIn::new(rest)]);
+            w.add(a.name(e), e.class, e.schema, e.cook_key, &blobs)
+                .unwrap();
+        }
+        w.finish().unwrap().unwrap()
+    })
+}
+
+/// The node page table of `model`'s mesh.
+fn node_table(scenes: &Scenes, gpu: &Gpu<'_>, model: ModelId) -> Vec<u64> {
+    let (models, meshes, _) = global_tables(scenes);
+    let model: ModelGpu = gpu.value(models.offset(u64::from(model.0)));
+    let mesh: MeshGpu = gpu.value(meshes.offset(u64::from(model.mesh)));
+    gpu.values(mesh.node_pages, mesh.node_page_count)
+}
+
+/// Runs frames, prefetching `model`, until its streamed node page is resident; returns the
+/// frames it took.
+fn stream_in(scenes: &mut Scenes, gpu: &Gpu<'_>, model: ModelId, budget: u64) -> u32 {
+    let start = Instant::now();
+    let mut frames = 0;
+    while node_table(scenes, gpu, model)[1] == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the node page never streamed in"
+        );
+        scenes.prefetch(model, 0);
+        frame(scenes);
+        frames += 1;
+        let pool = *scenes.residency().class(ResidencyClass::HierarchyPages);
+        assert!(pool.resident_bytes + pool.loading_bytes <= budget);
+    }
+    frames
+}
+
+#[test]
+fn hierarchy_pages_stream_on_request_and_evict_after_their_hold() {
+    let _serial = serial();
+    let bytes = paged_hierarchy();
+    let a = Archive::from_memory(Arc::clone(bytes)).unwrap();
+    let mesh = entry(&a, AssetId::from_name(DOME_MESH));
+    let info = MeshInfo::parse(&blob(&a, mesh, 0)).unwrap();
+    let pages: Vec<Vec<u8>> = info
+        .node_pages
+        .iter()
+        .map(|p| blob(&a, mesh, p.blob as usize))
+        .collect();
+    let path = write_pack("paged.orr", bytes);
+    let staged = staged_device();
+    // Room for both mounts' top pages and one streamed page.
+    let budget = 2 * pages[0].len() as u64 + pages[1].len() as u64;
+    let desc = |positioned_reads| RendererDesc {
+        positioned_reads,
+        budgets: Budgets {
+            hierarchy_page_pool: budget,
+            ..Budgets::default()
+        },
+        ..RendererDesc::default()
+    };
+    for (dev, positioned_reads) in [(device(), false), (device(), true), (&staged, false)] {
+        let mut scenes = Scenes::new(dev, &desc(positioned_reads)).unwrap();
+        let _workers = Workers::start(&scenes, 2);
+        let gpu = Gpu(dev);
+        let mounts = [
+            scenes.mount(PackSource::File(path.clone())),
+            scenes.mount(PackSource::Memory(Arc::clone(bytes))),
+        ];
+        let models = mounts.map(|m| {
+            ready(&mut scenes, m);
+            scenes.model(m, AssetId::from_name("kit/dome")).unwrap()
+        });
+        for &m in &models {
+            let table = node_table(&scenes, &gpu, m);
+            assert_eq!(gpu.bytes(table[0], pages[0].len()), pages[0]);
+            assert_eq!(table[1], 0, "streamed pages wait for a request");
+        }
+        let pool = *scenes.residency().class(ResidencyClass::HierarchyPages);
+        assert_eq!(pool.resident_units, 2);
+
+        stream_in(&mut scenes, &gpu, models[0], budget);
+        let first = node_table(&scenes, &gpu, models[0]);
+        assert_eq!(gpu.bytes(first[1], pages[1].len()), pages[1]);
+
+        // The second mount's page fits only once the first one's 30-frame hold has passed.
+        let frames = stream_in(&mut scenes, &gpu, models[1], budget);
+        assert!(frames > 30, "evicted after {frames} frames");
+        assert_eq!(node_table(&scenes, &gpu, models[0])[1], 0, "evicted");
+        let second = node_table(&scenes, &gpu, models[1]);
+        assert_eq!(gpu.bytes(second[1], pages[1].len()), pages[1]);
+        assert_eq!(scenes.residency().failed, 0);
+    }
+    assert_eq!(
+        staged.validation_messages(),
+        0,
+        "validation messages (see the log)"
     );
     assert_clean();
 }

@@ -9,7 +9,9 @@
 //!    from any threads, straight into mapped upload memory.
 //! 3. [`Frame::update_scenes`] applies every write and runs the consumer's scene compute.
 //! 4. [`Frame::render_view`] once per view records its raster half,
-//! 5. then the view's lighting and output.
+//! 5. then the view's lighting and output. A consumer may also shade the G-buffer
+//!    `render_view` returns with its own kernels in [`Frame::list`] and show the result
+//!    with [`Frame::compose`].
 //! 6. [`Frame::end`] submits the frame and hands it to the display's present thread.
 //!
 //! There is no scheduler, render graph or per-frame extraction: each step records directly
@@ -25,23 +27,24 @@ pub use orr_output::{
     ResolvedDisplay, UiPass,
 };
 pub use orr_scene::Error as SceneError;
+pub use orr_scene::{self, RasterView};
 pub use orr_scene::{
-    Affine3, BoundTexture, Budgets, ClusterRef, Cone, ConsumerMarker, CopyVariant, DepthOfField,
-    DirectionalLight, DiscProfile, ExposureState, Focus, FrameStats, FrameTime, Glare, GroupGpu,
-    GroupWriter, InstanceFlags, InstanceGpu, InstancePage, InstanceRange, InstancesDesc, Lens,
-    LensDistortion, Light, LightGpu, LightId, LoadState, Loading, MaterialGpu, MaterialId,
-    MaterialWriter, MeshGpu, ModelGpu, ModelId, MountId, PackSource, PageId, PipelineId, Pose,
-    Projection, REBASE_GRID_LOG2, ReloadReport, RendererDesc, RtCutGpu, RtStats, SceneCompute,
-    SceneDesc, SceneId, SceneRoot, SceneWriter, SkyStats, SlotStateGpu, TransformGroupDesc,
-    TransformGroupId, ViewConstants, ViewDesc, ViewHistoryId, ViewTarget, WorldPos, abi,
-    material_flags, orr_gpu, orr_pack,
+    Affine3, BoundTexture, Budgets, ClassStats, ClusterRef, Cone, ConsumerMarker, CopyVariant,
+    DepthOfField, DirectionalLight, DiscProfile, ExposureState, Focus, FrameStats, FrameTime,
+    Glare, GroupGpu, GroupWriter, InstanceFlags, InstanceGpu, InstancePage, InstanceRange,
+    InstancesDesc, Lens, LensDistortion, Light, LightGpu, LightId, LoadState, Loading, MaterialGpu,
+    MaterialId, MaterialWriter, MeshGpu, ModelGpu, ModelId, MountId, PackSource, PageId,
+    PipelineId, Pose, Projection, REBASE_GRID_LOG2, ReloadReport, RendererDesc, ResidencyClass,
+    ResidencyStats, RtCutGpu, RtStats, SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter,
+    SkyStats, SlotStateGpu, TransformGroupDesc, TransformGroupId, ViewConstants, ViewDesc,
+    ViewHistoryId, ViewTarget, WorldPos, abi, material_flags, orr_gpu, orr_pack,
 };
 
 use orr_gpu::{
     CommandList, Device, Format, GpuPtr, Hazards, ShaderModule, Stages, TextureIndex, TimelinePoint,
 };
 use orr_output::{
-    ComposePass, ComposeRoot, ComposeSource, Image, OutputDebug, OutputKernels, OutputView,
+    ComposePass, ComposeRoot, ComposeSource, DisplayFrame, Image, OutputDebug, OutputKernels, OutputView,
     TonemapPass, ViewOutput,
 };
 use orr_scene::Scenes;
@@ -118,6 +121,29 @@ impl Output {
             self.linear = Some(image);
         }
         Ok(self.linear.as_ref().expect("linear image"))
+    }
+
+    /// Records compose of the display-linear `source` into `frame`'s backbuffer.
+    fn compose(
+        &mut self,
+        list: &mut CommandList<'_>,
+        id: u64,
+        frame: &mut DisplayFrame<'_>,
+        source: TextureIndex,
+    ) {
+        let target = frame.backbuffer(list);
+        let n = self.compose.len() as u64;
+        self.kernels.compose(
+            list,
+            &mut self.compose[(id % n) as usize],
+            &ComposePass {
+                source: ComposeSource::Linear(source),
+                ui: None,
+                target,
+                extent: frame.extent,
+                display: &frame.display,
+            },
+        );
     }
 }
 
@@ -202,6 +228,18 @@ impl Renderer {
 
     pub fn material(&self, m: MountId, id: orr_pack::AssetId) -> Result<MaterialId> {
         Ok(self.scenes.material(m, id)?)
+    }
+
+    /// Wants every streamed unit of `model` resident from the next frame on, `cell_distance`
+    /// world cells from the focus. Requests last one frame: call it every frame while the
+    /// model should load or stay.
+    pub fn prefetch(&mut self, model: ModelId, cell_distance: u32) {
+        self.scenes.prefetch(model, cell_distance);
+    }
+
+    /// Residency figures of the latest frame's step 1.
+    pub fn residency(&self) -> &ResidencyStats {
+        self.scenes.residency()
     }
 
     /// A compute pipeline of `module`'s `entry`, created on the calling thread. With the
@@ -296,10 +334,18 @@ impl<'a> Frame<'a> {
         Ok(self.scenes.update_scenes(compute)?)
     }
 
-    /// Steps 4-5 for one view.
-    pub fn render_view(&mut self, view: &ViewDesc<'_>) -> Result<()> {
-        self.scenes.raster_view(view)?;
-        Ok(())
+    /// Steps 4-5 for one view. Returns the view's raster outputs, the G-buffer that
+    /// kernels read through `load_gsurface` and the scene root whose TLAS they trace, for
+    /// passes the consumer records after it into [`Frame::list`].
+    pub fn render_view(&mut self, view: &ViewDesc<'_>) -> Result<RasterView> {
+        Ok(self.scenes.raster_view(view)?)
+    }
+
+    /// The frame's command list, for the consumer's own passes. Everything recorded into it
+    /// runs in order with orr's passes and is submitted by [`Frame::end`]. The first call
+    /// runs [`Frame::update_scenes`] if the frame has not.
+    pub fn list(&mut self) -> Result<&mut CommandList<'a>> {
+        Ok(self.scenes.list()?)
     }
 
     /// A frame that renders no view into the display (menus, loading screens): runs `ui`
@@ -359,19 +405,26 @@ impl<'a> Frame<'a> {
             },
         );
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        let target = frame.backbuffer(list);
-        let n = output.compose.len() as u64;
-        output.kernels.compose(
-            list,
-            &mut output.compose[(id % n) as usize],
-            &ComposePass {
-                source: ComposeSource::Linear(sampled),
-                ui: None,
-                target,
-                extent: frame.extent,
-                display: &frame.display,
-            },
-        );
+        output.compose(list, id, &mut frame, sampled);
+        Ok(())
+    }
+
+    /// Encodes `linear`, display-linear Rec.709 with 1.0 at paper white, into the display
+    /// at the frame's resolved display, for a view the consumer shaded itself. The image
+    /// covers the window's extent; texels past its edge repeat the last row and column.
+    /// Records a barrier after every earlier pass, so the image may be written just
+    /// before. Does nothing without a display or while its window has no area.
+    pub fn compose(&mut self, linear: TextureIndex) -> Result<()> {
+        let Some(display) = self.display.as_deref_mut() else {
+            return Ok(());
+        };
+        let id = self.scenes.id();
+        let list = self.scenes.list()?;
+        let Some(mut frame) = display.frame() else {
+            return Ok(());
+        };
+        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+        self.output.compose(list, id, &mut frame, linear);
         Ok(())
     }
 
