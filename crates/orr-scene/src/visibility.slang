@@ -12,42 +12,46 @@ __exported import hit;
 // `RasterGpu.counts` entries.
 public static const uint COUNT_VISIBLE = 0;          // visible clusters written
 public static const uint COUNT_VISIBLE_DROPPED = 1;  // visible clusters past capacity
-public static const uint COUNT_WORK_DROPPED = 2;     // cluster work past capacity
+public static const uint COUNT_WORK_DROPPED = 2;     // second-pass work past capacity
 public static const uint COUNT_DRAWS = 3;            // 1: the draw count of the indirect draws
-public static const uint COUNT_WORK = 4;             // cluster work items asked for
+public static const uint COUNT_WORK = 4;             // second-pass work items asked for
 public static const uint COUNT_OPAQUE = 5;           // hardware opaque draws
 public static const uint COUNT_ALPHA = 6;            // hardware alpha draws
 public static const uint COUNT_SOFTWARE = 7;         // clusters the software raster draws
 public static const uint COUNT_PARTICLES = 8;        // visible particle clusters
-public static const uint COUNTS = 9;
+public static const uint COUNT_OCCLUDED_INSTANCES = 9; // instances the first pass found occluded
+public static const uint COUNT_OCCLUDED_CLUSTERS = 10; // clusters the first pass found occluded
+public static const uint COUNT_SECOND_PASS = 11;     // clusters drawn by the second pass
+public static const uint COUNT_HIDDEN = 12;          // clusters both passes found occluded
+public static const uint COUNT_OPAQUE_BASE = 13;     // list entries the first pass drew
+public static const uint COUNT_ALPHA_BASE = 14;
+public static const uint COUNT_SOFTWARE_BASE = 15;
+public static const uint COUNTS = 16;
 
-// `ClusterWork.flags`.
-public static const uint WORK_DAG = 1;      // select clusters by the DAG cluster rule
-public static const uint WORK_MERGED = 2;   // DAG: the merged stage, else the part stage
+// `RasterGpu.flags`.
+public static const uint RASTER_OCCLUSION = 1; // the first pass tests the previous frame's HZB
+
+// `RasterGpu.slot_visibility`, per instance slot.
+public static const uint SLOT_CULLED = 0;
+public static const uint SLOT_VISIBLE = 1;    // the first pass draws its clusters
+public static const uint SLOT_OCCLUDED = 2;   // the first pass found it occluded
+public static const uint SLOT_REVEALED = 3;   // the second pass draws its clusters
 
 // The software raster's largest screen rect, in pixels: its edge functions stay in 32 bits
 // up to here.
 public static const float SOFTWARE_MAX_PIXELS = 128.0;
 
-// Up to 32 clusters of one page for one culling workgroup.
-public struct ClusterWork
-{
-    public uint instance;
-    public uint page;          // mesh page index
-    public uint first;         // first cluster in the page
-    public uint count_flags;   // count in the low byte, WORK_* above it
-}
-
 public struct RasterGpu
 {
     public GBufferGpu gbuffer;       // what later passes read
-    public ClusterWork* work;
+    public ClusterWork* work;        // what the second pass retests
     public uint* args;               // workgroups x, y, z: work, opaque, alpha, software, particles
     public uint* opaque;             // visible clusters with opaque triangles, hardware path
     public uint* alpha;              // visible clusters with alpha-tested triangles, hardware path
     public uint* software;           // visible clusters of the software raster
     public uint* particles;          // visible clusters of particle entries, for the transparency point
     public uint* counts;             // COUNT_*
+    public uint* slot_visibility;    // per instance slot: SLOT_*
     public uint* bin_args;           // per surface bin: x, y, z
     public uint* bin_tiles;          // per bin: tile_capacity tile indices
     public float* depth;             // per pixel: resolved reverse-Z depth
@@ -61,8 +65,10 @@ public struct RasterGpu
     public uint work_capacity;
     public uint visible_capacity;
     public uint bins;                // surface bins: linked surfaces + 1
-    public float error_pixels;       // raster LOD error threshold
     public float software_pixels;    // longest screen-rect side the software raster takes; 0 off
+    public uint flags;               // RASTER_*
+    public uint slots;               // instance slots to walk
+    public uint hzb_mips;            // HZB mips the occlusion tests read
     public uint _pad;
 }
 
@@ -72,6 +78,7 @@ public static const uint ARGS_OPAQUE = 3;
 public static const uint ARGS_ALPHA = 6;
 public static const uint ARGS_SOFTWARE = 9;
 public static const uint ARGS_PARTICLES = 12;
+public static const uint ARGS = 15;
 
 // Workgroup grids cover `n` groups in rows of GRID_X, the smallest maximum Vulkan allows.
 public static const uint GRID_X = 65535;
@@ -173,6 +180,48 @@ public bool small_on_screen(ViewConstants* v, Placement p, float3 lo, float3 hi,
     }
     float2 size = rect_max - rect_min;
     return max(size.x, size.y) <= min(pixels, SOFTWARE_MAX_PIXELS);
+}
+
+// Whether the box `lo..hi`, placed by `p` relative to this frame's eye, lies behind the
+// HZB's farthest depth over its screen rect: through this view, or with `previous` through
+// the previous frame's camera (the HZB still holding the previous frame). False when the box
+// reaches the near plane.
+public bool box_occluded(ViewConstants* v, RasterGpu* r, Placement p, float3 lo, float3 hi, bool previous)
+{
+    float2 rect_min = float2(1e30);
+    float2 rect_max = float2(-1e30);
+    float nearest = 0.0;
+    for (uint i = 0; i < 8; i++)
+    {
+        float3 corner = float3((i & 1) != 0 ? hi.x : lo.x, (i & 2) != 0 ? hi.y : lo.y, (i & 4) != 0 ? hi.z : lo.z);
+        float3 x = place(p, corner);
+        float3 view = previous ? mul(v.prev_view_from_world_rotation, float4(x + v.eye_motion.xyz, 0.0)) : view_from_relative(v, x);
+        float4 clip = mul(previous ? v.prev_clip_from_view : v.clip_from_view_jittered, float4(view, 1.0));
+        if (!(clip.w > 0.0 && clip.z < clip.w))
+            return false;
+        float2 xy = pixel_from_clip(v, clip);
+        rect_min = min(rect_min, xy);
+        rect_max = max(rect_max, xy);
+        nearest = max(nearest, clip.z / clip.w);
+    }
+    // A pixel more on each side covers the jitter between the frames.
+    float2 extent = float2(r.gbuffer.extent);
+    rect_min = max(rect_min - 1.0, 0.0);
+    rect_max = min(rect_max + 1.0, extent - 1.0);
+    if (any(rect_min > rect_max))
+        return false;
+    // A mip whose texels are half the rect's longer side: at most 3 x 3 texels cover it.
+    float2 size = rect_max - rect_min;
+    uint mip = min(uint(max(ceil(log2(max(max(size.x, size.y), 1.0))) - 1.0, 0.0)), r.hzb_mips - 1);
+    uint2 top = max(r.gbuffer.extent >> mip, 1) - 1;
+    uint2 a = min(uint2(rect_min) >> mip, top);
+    uint2 b = min(uint2(rect_max) >> mip, top);
+    RWTexture2D<float> hzb = r.hzb[mip].get<RWTexture2D<float>>();
+    float farthest = 1.0;
+    for (uint y = a.y; y <= b.y; y++)
+        for (uint x = a.x; x <= b.x; x++)
+            farthest = min(farthest, hzb[uint2(x, y)]);
+    return nearest < farthest;
 }
 
 // The triangles of a cluster the alpha bin draws: from the returned index to `tri_count`.

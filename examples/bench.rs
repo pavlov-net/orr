@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use examples::vegetation::{COUNTS, Run, Sample, Script, Settings, run, settled};
+use examples::vegetation::{Run, Sample, Script, Settings, run, settled};
 use examples::{Options, assert_clean, device};
 use orr::orr_gpu::MemoryKind;
 use orr::{FrameStats, LightingStats};
@@ -133,15 +133,19 @@ fn spreads(series: BTreeMap<&'static str, Vec<f64>>) -> Value {
 }
 
 /// `RasterView::counts` by name; the fourth word is a constant 1.
-const RASTER_COUNTS: [(usize, &str); COUNTS - 1] = [
+const RASTER_COUNTS: [(usize, &str); 12] = [
     (0, "visible_clusters"),
     (1, "visible_dropped"),
-    (2, "work_dropped"),
-    (4, "work_items"),
+    (2, "second_pass_work_dropped"),
+    (4, "second_pass_work_items"),
     (5, "mesh_opaque_draws"),
     (6, "mesh_alpha_draws"),
     (7, "software_clusters"),
     (8, "particle_clusters"),
+    (9, "occluded_instances"),
+    (10, "occluded_clusters"),
+    (11, "second_pass_clusters"),
+    (12, "hidden_clusters"),
 ];
 
 fn script_report(script: Script, samples: &[Sample]) -> Value {
@@ -187,6 +191,23 @@ fn script_report(script: Script, samples: &[Sample]) -> Value {
             "built_clas": fig(&|s| s.producers.built.into()),
         },
         "raster": raster,
+        "traversal": {
+            "candidate_items": fig(&|s| s.cuts.candidate_items.into()),
+            "candidate_clusters": fig(&|s| s.cuts.candidate_clusters.into()),
+            "nodes": fig(&|s| s.cuts.nodes.into()),
+            "nodes_dropped": fig(&|s| s.cuts.nodes_dropped.into()),
+            "candidates_dropped": fig(&|s| s.cuts.candidates_dropped.into()),
+            "rt_clusters_dropped": fig(&|s| s.cuts.rt_clusters_dropped.into()),
+            "rt_gathered": fig(&|s| s.cuts.rt_gathered.into()),
+            "rt_cached": fig(&|s| s.cuts.rt_cached.into()),
+            "rt_shared": fig(&|s| s.cuts.rt_shared.into()),
+            "rt_fallback": fig(&|s| s.cuts.rt_fallback.into()),
+            "rt_built_blas": fig(&|s| s.cuts.rt_built.into()),
+            "rt_built_clas": fig(&|s| s.cuts.rt_built_clas.into()),
+            "rt_merged": fig(&|s| s.cuts.rt_merged.into()),
+            "retries": fig(&|s| s.cuts.retries.into()),
+            "page_requests": fig(&|s| s.cuts.page_requests.into()),
+        },
         "lighting": {
             "directional_lights": lit(&|l| l.directional_lights.into()),
             "local_lights": lit(&|l| l.local_lights.into()),

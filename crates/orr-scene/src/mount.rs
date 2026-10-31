@@ -30,6 +30,7 @@ use crate::memory::{Block, RangeAllocator, UploadWindow};
 use crate::residency::{ResidencyClass, Start, UnitDesc};
 use crate::scene::{ModelCpu, ModelId};
 use crate::stream::{StreamUnit, Streaming};
+use crate::traverse::{NodePageFeedback, PAGED_DEPTH};
 use crate::upload::Record;
 use crate::{ClusterRef, Error, MaskGpu, MaterialGpu, MeshGpu, ModelGpu, Result, material_flags};
 
@@ -97,6 +98,35 @@ struct PlacedMesh {
     /// Per page, its micromap region.
     micromaps: Vec<Option<PageMicromap>>,
     parts: Vec<Part>,
+    /// Per node page, the frame the traversal last reported it, in the mesh's block.
+    node_stamps: u64,
+    /// Levels of a resident hierarchy; None when it is paged.
+    depth: Option<u32>,
+}
+
+/// The levels of a hierarchy whose nodes are numbered breadth first from `roots`.
+fn hierarchy_depth(nodes: &[orr_pack::mesh::Node], roots: &[u32]) -> u32 {
+    let mut depth = vec![0u32; nodes.len()];
+    let mut levels = 0;
+    for &r in roots.iter().filter(|&&r| r != MeshHeader::NO_ROOT) {
+        if let Some(d) = depth.get_mut(r as usize) {
+            *d = 1;
+        }
+    }
+    for (i, n) in nodes.iter().enumerate() {
+        levels = levels.max(depth[i]);
+        if n.group >= 0 {
+            continue;
+        }
+        let children = n.child_first as usize..n.child_first as usize + usize::from(n.child_count);
+        let next = depth[i] + 1;
+        for c in children {
+            if let Some(d) = depth.get_mut(c) {
+                *d = next;
+            }
+        }
+    }
+    levels
 }
 
 /// A resident instance page: its tables on the CPU, its records and consumer data on the
@@ -504,6 +534,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
         at
     };
     let page_clusters_at = place(4 * (info.pages.len() as u64 + 1));
+    let stamps_at = place(4 * info.node_pages.len() as u64);
     let page_at: Vec<u64> = info
         .pages
         .iter()
@@ -533,6 +564,13 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
         .collect();
     let block = t.block(size, "mesh")?;
     t.write(block, 0, blob0)?;
+    if !info.node_pages.is_empty() {
+        t.write(block, stamps_at, &vec![0u8; 4 * info.node_pages.len()])?;
+    }
+    let depth = info
+        .node_pages
+        .is_empty()
+        .then(|| hierarchy_depth(&info.nodes, &info.roots));
     let mut first = 0;
     let firsts: Vec<u32> = info
         .pages
@@ -579,6 +617,8 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             clusters: Vec::with_capacity(first as usize),
             micromaps: vec![None; info.pages.len()],
             parts: info.parts.clone(),
+            node_stamps: block.gpu + stamps_at,
+            depth,
         });
         placed.meshes.len() - 1
     };
@@ -817,6 +857,7 @@ struct ResolvedMesh {
     /// Resident cluster table entries from `gpu.cluster_base` on.
     refs: Vec<ClusterRef>,
     rt: MeshRt,
+    depth: Option<u32>,
 }
 
 struct ResolvedModel {
@@ -883,6 +924,13 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
             let pages = page_addresses.len() as u32;
             let node_pages = m.node_pages.len() as u32;
             page_addresses.extend(m.node_pages);
+            let table = |span: orr_pack::Span| {
+                if span.count == 0 {
+                    return GpuPtr::NULL;
+                }
+                // SAFETY: a table of blob 0, resident in the mount's block.
+                unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(m.info + u64::from(span.first))) }
+            };
             ResolvedMesh {
                 id: m.id,
                 entry: m.entry,
@@ -914,6 +962,13 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
                         animated_parts: 0,
                         mask_count: 0,
                         animated_sections: 0,
+                        nodes: table(m.header.nodes),
+                        node_table: table(m.header.node_pages),
+                        groups: table(m.header.groups),
+                        roots: table(m.header.roots).cast(),
+                        node_stamps: GpuPtr::from_address(orr_gpu::GpuAddress(m.node_stamps)),
+                        root_count: m.header.roots.count,
+                        _pad: 0,
                     }
                 },
                 page_addresses,
@@ -926,6 +981,7 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
                 parts: m.parts,
                 refs: Vec::new(),
                 rt: MeshRt::default(),
+                depth: m.depth,
             }
         })
         .collect();
@@ -1021,7 +1077,10 @@ fn build_accel(
     let refs: Vec<Vec<ClusterRef>> = inputs.iter().map(accel::cluster_refs).collect();
     let built = accel::build(device, &shared.kernels, shared.limits, &inputs, wait)?;
     drop(inputs);
-    for ((m, refs), cuts) in r.meshes.iter_mut().zip(refs).zip(built.cuts) {
+    for ((m, mut refs), cuts) in r.meshes.iter_mut().zip(refs).zip(built.cuts) {
+        for (r, &clas) in refs.iter_mut().zip(&cuts.rt.clas) {
+            r.clas = clas;
+        }
         m.refs = refs;
         m.gpu.rt_cuts = cuts.table;
         m.gpu.rt_cut_count = cuts.count;
@@ -1130,12 +1189,25 @@ pub(crate) struct Resident {
     meshes: Vec<u32>,
     /// Per mesh of `meshes`: what its section-mask BLAS build from.
     rt: Vec<MeshRt>,
+    /// Per mesh of `meshes`: the levels of its hierarchy (None when paged) and its clusters.
+    hierarchy: Vec<(Option<u32>, u32)>,
     page_ranges: Vec<(u32, u32)>,
     material_ranges: Vec<(u32, u32)>,
     cluster_ranges: Vec<(u32, u32)>,
     _blocks: Vec<Allocation<u8>>,
     _accel: MountAccel,
     placed_textures: Vec<PlacedTexture>,
+}
+
+/// The traversal's view of the resident hierarchies.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Hierarchy {
+    /// Levels of the deepest hierarchy; paged ones count as `PAGED_DEPTH`.
+    pub depth: u32,
+    /// Some resident mesh has a paged hierarchy.
+    pub paged: bool,
+    /// Clusters of the largest resident mesh.
+    pub max_clusters: u32,
 }
 
 /// Capacities of the global model and mesh tables.
@@ -1167,6 +1239,8 @@ pub(crate) struct Mounts {
     pub streaming: Streaming,
     /// The mount and mesh of each resident model.
     owners: HashMap<ModelId, (MountId, u32)>,
+    /// The mount and mesh of each resident mesh id.
+    mesh_owners: HashMap<u32, (MountId, u32)>,
     /// Section-mask BLAS by mesh id.
     masks: HashMap<u32, MeshMasks>,
     /// Scratch of mask builds, freed once their frame has completed.
@@ -1215,12 +1289,16 @@ type ResolvedTables = (
     Vec<PlacedPage>,
 );
 
-/// A mount's residency units, with how to load the streamed ones, and the streamed units
-/// of each mesh. Mesh pages are pinned up to `pinned_pages` and locked after it (the mount's
-/// acceleration structures reference every cluster); a mesh's top node page is pinned and
-/// its other node pages stream, each after its parent page. Textures and instance pages are
-/// pinned.
-type Units = (Vec<(UnitDesc, Option<StreamUnit>)>, Vec<Vec<u32>>);
+/// A mount's residency units, with how to load the streamed ones, the streamed units of
+/// each mesh, and the unit of each node page of each mesh. Mesh pages are pinned up to
+/// `pinned_pages` and locked after it (the mount's acceleration structures reference every
+/// cluster); a mesh's top node page is pinned and its other node pages stream, each after
+/// its parent page. Textures and instance pages are pinned.
+type Units = (
+    Vec<(UnitDesc, Option<StreamUnit>)>,
+    Vec<Vec<u32>>,
+    Vec<Vec<u32>>,
+);
 
 fn units(
     meshes: &[ResolvedMesh],
@@ -1231,6 +1309,7 @@ fn units(
     let malformed = |what| Error::Pack(orr_pack::Error::Malformed(what));
     let mut units = Vec::new();
     let mut streamed = Vec::with_capacity(meshes.len());
+    let mut node_pages = Vec::with_capacity(meshes.len());
     for (m, table) in meshes.iter().zip(tables) {
         let base = units.len() as u32;
         for (p, (bytes, deps)) in m.page_units.iter().enumerate() {
@@ -1251,6 +1330,7 @@ fn units(
             units.push((unit, None));
         }
         let nodes = units.len() as u32;
+        node_pages.push((nodes..nodes + m.node_units.len() as u32).collect());
         let mut mesh_streamed = Vec::new();
         for (n, &(blob, bytes, parent)) in m.node_units.iter().enumerate() {
             let (start, deps, stream) = if parent == NodePage::TOP {
@@ -1297,7 +1377,7 @@ fn units(
             .iter()
             .map(|p| pinned(ResidencyClass::InstancePages, p.bytes)),
     );
-    Ok((units, streamed))
+    Ok((units, streamed, node_pages))
 }
 
 fn capacity(what: &'static str, capacity: u32) -> Error {
@@ -1337,6 +1417,7 @@ impl Mounts {
             retired: Vec::new(),
             streaming: Streaming::new(device, budgets),
             owners: HashMap::new(),
+            mesh_owners: HashMap::new(),
             masks: HashMap::new(),
             transient: Vec::new(),
         })
@@ -1346,6 +1427,31 @@ impl Mounts {
     pub(crate) fn prefetch(&mut self, model: ModelId, cell_distance: u32) {
         if let Some(&(mount, mesh)) = self.owners.get(&model) {
             self.streaming.prefetch(mount, mesh, cell_distance);
+        }
+    }
+
+    /// What the traversal needs of the resident meshes' hierarchies.
+    pub(crate) fn hierarchy(&self) -> Hierarchy {
+        let mut h = Hierarchy::default();
+        for e in self.entries.iter().flatten() {
+            let Entry::Ready(r) = e else { continue };
+            for &(depth, clusters) in &r.hierarchy {
+                h.depth = h.depth.max(depth.unwrap_or(PAGED_DEPTH));
+                h.paged |= depth.is_none();
+                h.max_clusters = h.max_clusters.max(clusters);
+            }
+        }
+        h
+    }
+
+    /// Hands the traversal's node page requests and reads of a completed frame to the
+    /// residency step of `frame`.
+    pub(crate) fn node_feedback(&mut self, feedback: &[NodePageFeedback], frame: u64) {
+        for f in feedback {
+            if let Some(&(mount, mesh)) = self.mesh_owners.get(&f.mesh) {
+                self.streaming
+                    .node_page(mount, mesh, f.page, f.request.then_some(f.error), frame);
+            }
         }
     }
 
@@ -1448,6 +1554,7 @@ impl Mounts {
         for &id in &r.meshes {
             self.mesh_ids.free(id, 1);
             self.masks.remove(&id);
+            self.mesh_owners.remove(&id);
         }
         for &(s, n) in &r.page_ranges {
             self.page_ranges.free(s, n);
@@ -1507,6 +1614,7 @@ impl Mounts {
             pages: HashMap::new(),
             meshes: Vec::new(),
             rt: Vec::new(),
+            hierarchy: Vec::new(),
             page_ranges: Vec::new(),
             material_ranges: Vec::new(),
             cluster_ranges: r.cluster_ranges,
@@ -1576,6 +1684,9 @@ impl Mounts {
                 &m.refs,
             )?;
             res.rt.push(m.rt.clone());
+            res.hierarchy.push((m.depth, m.gpu.cluster_count));
+            self.mesh_owners
+                .insert(id, (mount, res.meshes.len() as u32 - 1));
             mesh_ids.push(id);
         }
         for m in &models {
@@ -1625,7 +1736,7 @@ impl Mounts {
         }
         let units = units(&meshes, &tables, &res.placed_textures, &pages)?;
         self.streaming
-            .register(mount, Arc::clone(source), units.0, units.1)?;
+            .register(mount, Arc::clone(source), units.0, units.1, units.2)?;
         for p in pages {
             let i = match self.pages.iter().position(Option::is_none) {
                 Some(i) => i,

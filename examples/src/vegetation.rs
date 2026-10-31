@@ -1391,7 +1391,7 @@ pub struct Sample {
 }
 
 /// Words of `RasterView::counts` read back.
-pub const COUNTS: usize = 9;
+pub const COUNTS: usize = 16;
 /// Frames of each script whose figures are left out, while histories and exposure settle.
 const WARM_UP: u64 = 20;
 

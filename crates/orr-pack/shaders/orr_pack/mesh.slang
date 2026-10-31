@@ -70,6 +70,44 @@ public struct Cluster
     public uint16_t _pad;
 }
 
+// 32 B. A DAG hierarchy node: a leaf names a group (`group` >= 0), an internal node has
+// children `child_first..child_first + child_count`, all in one node page.
+public struct Node
+{
+    public float4 sphere;          // bounds every group below
+    public float max_error;        // the largest group error below; infinity over a terminal group
+    public uint child_first;
+    public uint16_t child_count;
+    public uint16_t _pad;
+    public int group;              // -1 for an internal node
+}
+
+// 32 B. A DAG group: clusters `first_cluster..first_cluster + cluster_count` of page `page`,
+// each with `simplified` and `error` as its parent bounds.
+public struct Group
+{
+    public float4 simplified;
+    public float error;            // infinity for a terminal group
+    public uint page;
+    public uint16_t first_cluster;
+    public uint16_t cluster_count;
+    public uint8_t depth;          // simplification steps from the stage's source geometry
+    public uint8_t _pad[3];
+}
+
+// 16 B. Nodes `first_node..first_node + node_count` of a paged hierarchy.
+public struct NodePage
+{
+    public uint first_node;
+    public uint node_count;
+    public uint blob;
+    public uint parent_page;       // NODE_PAGE_TOP for the top page
+}
+
+public static const uint NODE_PAGE_TOP = 0xffffffff;
+// `MeshHeader.roots` where a stage has no triangles.
+public static const uint NO_ROOT = 0xffffffff;
+
 public struct VertexAttributes
 {
     public float3 normal;

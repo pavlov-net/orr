@@ -36,6 +36,7 @@ use crate::shaders::transparency::CompositeRoot;
 use crate::shaders::{animation, emissive, world as world_kernel};
 use crate::time::FrameTime;
 use crate::transparency::TransparencyPass;
+use crate::traverse::{CutInputs, CutPipelines, CutSizes, CutStats, Cuts};
 use crate::upload::{Record, scatter};
 use crate::view::{RasterView, ViewDesc, ViewHistory, ViewHistoryId, view_constants};
 use crate::world::{WorldPos, needs_rebase, origin_for};
@@ -58,8 +59,17 @@ pub struct Budgets {
     pub mesh_pages: u32,
     /// Clusters one view can draw.
     pub visible_clusters: u32,
-    /// Cluster work items one view's culling can hand to the raster, up to 32 clusters each.
+    /// Items of up to 32 clusters in a scene's raster candidate cut, and in the work one
+    /// view's first culling pass leaves to its second.
     pub cluster_work: u32,
+    /// Hierarchy nodes one traversal pass of a scene visits, at most.
+    pub traversal_nodes: u32,
+    /// Clusters of the ray-tracing cuts a scene's traversal gathers in a frame, and CLAS
+    /// that frame's cluster BLAS take; copies past it trace a cached cut.
+    pub rt_cut_clusters: u32,
+    /// Cluster BLAS a scene builds in a frame for the cuts of copies near the focus; copies
+    /// past it trace a cached cut.
+    pub rt_cut_blas: u32,
     /// Entries in the resident cluster table: every cluster of every resident mesh.
     pub resident_clusters: u32,
     /// Triangles one CLAS build on the loading queue takes, at most. On 621.01 an implicit
@@ -98,6 +108,9 @@ impl Default for Budgets {
             mesh_pages: 1 << 20,
             visible_clusters: 1 << 20,
             cluster_work: 1 << 18,
+            traversal_nodes: 1 << 18,
+            rt_cut_clusters: 1 << 18,
+            rt_cut_blas: 1024,
             resident_clusters: 1 << 21,
             stream_clas_triangles: 1 << 18,
             micromap_pages: 64,
@@ -130,8 +143,16 @@ pub struct RendererDesc {
     /// Archive reads are positioned reads on workers even where the system's completion
     /// ring (IoRing, io_uring) is available.
     pub positioned_reads: bool,
-    /// Raster LOD: the largest cluster error drawn, in render pixels.
+    /// Raster LOD: the largest cluster error drawn, in pixels at the scene focus.
     pub raster_error_pixels: f32,
+    /// Ray-tracing LOD: the largest cluster error traced, in pixels at the scene focus.
+    pub rt_error_pixels: f32,
+    /// Copies no view drew last frame trace at this many times `rt_error_pixels`.
+    pub culled_error_scale: f32,
+    /// Copies whose bounding sphere projects to a radius under this many pixels at the focus
+    /// trace their model's merged cut: the finest cached cut any of them needs. 0 turns
+    /// merging off.
+    pub rt_merge_pixels: f32,
     /// Clusters whose screen rect's longer side is at most this many render pixels raster
     /// in compute, unless they cross the near plane; others take the mesh-shader path. 0
     /// turns the software raster off; values above 128 act as 128.
@@ -147,6 +168,9 @@ impl Default for RendererDesc {
             cell_log2: 8,
             positioned_reads: false,
             raster_error_pixels: 1.0,
+            rt_error_pixels: 1.0,
+            culled_error_scale: 2.0,
+            rt_merge_pixels: 32.0,
             software_raster_pixels: 32.0,
         }
     }
@@ -193,6 +217,8 @@ pub struct FrameStats {
     pub rt: RtStats,
     /// Producer entries of the frame's scenes: emitted against capacity, drops, builds.
     pub producers: ProducerStats,
+    /// The DAG traversals of the frame's scenes.
+    pub cuts: CutStats,
 }
 
 /// Scene compute: a listed scene's turn in `update_scenes`, after its uploads have landed.
@@ -243,8 +269,12 @@ struct Core {
     cell_log2: u32,
     budgets: Budgets,
     raster_error_pixels: f32,
+    rt_error_pixels: f32,
+    culled_error_scale: f32,
+    rt_merge_pixels: f32,
     software_raster_pixels: f32,
     raster: RasterPipelines,
+    cuts: CutPipelines,
     materials: MaterialTable,
     /// Emission by `ModelId`.
     models: Vec<Option<ModelEmission>>,
@@ -342,6 +372,7 @@ impl Scenes {
         let raster = RasterPipelines::new(device, desc.kernels, &mut pipelines)?;
         let ptlas = PtlasPipelines::new(device, desc.kernels, &mut pipelines)?;
         let producers = ProducerKernels::new(device, desc.kernels, &mut pipelines)?;
+        let cuts = CutPipelines::new(device, desc.kernels, &mut pipelines)?;
         #[cfg(feature = "hot-reload")]
         let mut reloader = Reloader::new();
         #[cfg(feature = "hot-reload")]
@@ -362,8 +393,12 @@ impl Scenes {
                 cell_log2: desc.cell_log2,
                 budgets: desc.budgets,
                 raster_error_pixels: desc.raster_error_pixels,
+                rt_error_pixels: desc.rt_error_pixels,
+                culled_error_scale: desc.culled_error_scale,
+                rt_merge_pixels: desc.rt_merge_pixels,
                 software_raster_pixels: desc.software_raster_pixels,
                 raster,
+                cuts,
                 materials: MaterialTable::new(device, desc.budgets.materials)?,
                 models: Vec::new(),
                 model_cpu: Vec::new(),
@@ -610,12 +645,19 @@ impl Scenes {
                     f.stats.rt.add(&figures);
                 }
             }
+            let mut feedback = Vec::new();
             for id in &f.updated {
                 let Ok(scene) = core.scene(*id) else { continue };
-                if let Some(r) = &scene.cpu.lock().unwrap().producer_readback {
+                let cpu = scene.cpu.lock().unwrap();
+                if let Some(r) = &cpu.producer_readback {
                     f.stats.producers.add(&r.figures(slot));
                 }
+                if let Some(cuts) = &cpu.cuts {
+                    cuts.figures(slot, &mut f.stats.cuts);
+                    feedback.extend(cuts.feedback(slot));
+                }
             }
+            core.mounts.node_feedback(&feedback, frame);
             core.completed_frame = f.id;
             core.stats = f.stats;
         }
@@ -864,6 +906,18 @@ impl<'a> Frame<'a> {
             }
             let producers = cpu.producers.iter().any(Option::is_some);
             let tlas = cpu.ptlas.tlas(device, core.fif, producers)?;
+            if cpu.cuts.is_none() {
+                let sizes = CutSizes {
+                    slots: scene.desc.instance_capacity,
+                    queue: core.budgets.traversal_nodes,
+                    candidates: core.budgets.cluster_work,
+                    rt_clusters: core.budgets.rt_cut_clusters,
+                    rt_blas: core.budgets.rt_cut_blas,
+                    models: core.budgets.models,
+                };
+                cpu.cuts = Some(Cuts::new(device, sizes, core.fif)?);
+            }
+            let cut = cpu.cuts.as_ref().expect("made above").gpu();
             records.append(&mut cpu.ptlas.partition_records(device, window, &core.seq)?);
             for (index, g) in cpu.groups.iter_mut().enumerate() {
                 let Some(g) = g else { continue };
@@ -924,6 +978,7 @@ impl<'a> Frame<'a> {
                 part_base: scene.desc.instance_capacity,
                 part_capacity: scene.desc.part_capacity,
                 producer_base: scene.desc.instance_capacity + scene.desc.part_capacity,
+                cut,
             };
             let src = window.put(device, &root)?;
             records.push(Record::values(core.next_seq(), t.root.gpu, src, 1));
@@ -1032,6 +1087,37 @@ impl<'a> Frame<'a> {
         }
         list.end_pass();
         list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
+        let hierarchy = core.mounts.hierarchy();
+        for &(id, root, _, focus, _) in &roots {
+            let scene = core.scene(id)?;
+            let cpu = &mut *scene.cpu.lock().unwrap();
+            let focus = focus.map(|(f, ppr)| {
+                let w = WorldPos::new(f, core.cell_log2);
+                (w.cell.extend(1).to_array(), w.offset.extend(ppr).to_array())
+            });
+            let inputs = CutInputs {
+                scene: root,
+                focus,
+                raster_pixels: core.raster_error_pixels,
+                rt_pixels: core.rt_error_pixels,
+                culled_scale: core.culled_error_scale,
+                merge_pixels: core.rt_merge_pixels,
+                slots: cpu.ptlas.high_water,
+                passes: hierarchy.depth,
+                paged: hierarchy.paged,
+                max_clas: hierarchy.max_clusters,
+                slot: (self.id % u64::from(core.fif)) as usize,
+            };
+            let cuts = cpu.cuts.as_mut().expect("made with the root");
+            cuts.record(
+                device,
+                window,
+                &mut list,
+                self.pipelines,
+                &core.cuts,
+                &inputs,
+            )?;
+        }
         if !traced.is_empty() {
             let mut scratch = core.ptlas_scratch.lock().unwrap();
             let need = traced
@@ -1066,7 +1152,6 @@ impl<'a> Frame<'a> {
                     cell_log2: core.cell_log2,
                     rebased,
                     budget: core.budgets.ptlas_rebuilt,
-                    error_pixels: core.raster_error_pixels,
                     slot: (self.id % u64::from(core.fif)) as usize,
                 };
                 let kernels = &core.ptlas;
@@ -1149,7 +1234,7 @@ impl<'a> Frame<'a> {
                 core.cell_log2,
             )
             .to_array();
-        let instance_capacity = scene.desc.instance_capacity;
+        let slots = scene.cpu.lock().unwrap().ptlas.high_water;
         let producer_capacity = scene.desc.producer_capacity;
         let sizes = TargetSizes {
             extent: view.render_extent.to_array(),
@@ -1157,6 +1242,7 @@ impl<'a> Frame<'a> {
             visible_clusters: core.budgets.visible_clusters,
             work: core.budgets.cluster_work,
             bins: core.raster.bins,
+            slots: scene.desc.instance_capacity,
         };
         let history = core
             .histories
@@ -1176,7 +1262,10 @@ impl<'a> Frame<'a> {
         if history.targets.as_ref().is_none_or(|t| t.sizes != sizes) {
             history.targets = Some(ViewTargets::new(device, sizes, list)?);
         }
-        let targets = history.targets.as_ref().expect("view targets");
+        let targets = history.targets.as_mut().expect("view targets");
+        let occlusion =
+            targets.hzb_scene.replace(view.scene) == Some(view.scene) && !view.reset_history;
+        let targets = &*targets;
         let constants = window.put(device, &constants)?;
         let raster = raster::record(
             device,
@@ -1186,11 +1275,11 @@ impl<'a> Frame<'a> {
             list,
             targets,
             root,
-            instance_capacity,
+            slots,
             producer_capacity,
             constants,
-            core.raster_error_pixels,
             core.software_raster_pixels,
+            occlusion,
         )?;
         let out = RasterView {
             view: constants,
@@ -1314,6 +1403,7 @@ impl<'a> Frame<'a> {
                 ..RtStats::default()
             },
             producers: ProducerStats::default(),
+            cuts: CutStats::default(),
         };
         self.core.in_flight.push_back(InFlight {
             id: self.id,

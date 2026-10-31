@@ -1,6 +1,7 @@
 //! Packs mounted from files and from memory: every asset placed on the loading side and
 //! read back equal to the archive's CPU decode, lookups by mount, the threads lent to the
-//! loading side, failures and the archive handles.
+//! loading side, failures, the archive handles, and hierarchy pages streamed on request
+//! and on the traversal's feedback.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,8 +30,8 @@ use orr_scene::testing::{
 use orr_scene::{
     Affine3, BoundTexture, Budgets, EmissiveGpu, Error, FrameDesc, FrameTime, GroupWriter,
     InstanceFlags, InstancesDesc, LoadState, Loading, MaterialGpu, MeshGpu, ModelGpu, ModelId,
-    MountId, PackSource, RendererDesc, ResidencyClass, SceneDesc, SceneRoot, Scenes,
-    TransformGroupDesc, material_flags,
+    MountId, PackSource, RendererDesc, ResidencyClass, SceneDesc, SceneId, SceneRoot, SceneWriter,
+    Scenes, TransformGroupDesc, material_flags,
 };
 
 const ALBEDO: &str = "kit/albedo";
@@ -947,5 +948,134 @@ fn hierarchy_pages_stream_on_request_and_evict_after_their_hold() {
         0,
         "validation messages (see the log)"
     );
+    assert_clean();
+}
+
+/// Runs one frame of `scene` with its focus 3 m above the origin, after `write`; returns the
+/// figures of the last completed frame.
+fn traverse_frame(
+    scenes: &mut Scenes,
+    scene: SceneId,
+    write: impl FnOnce(&mut SceneWriter<'_>),
+) -> orr_scene::CutStats {
+    let list = [scene];
+    let f = scenes
+        .begin_frame(&FrameDesc {
+            time: FrameTime::default(),
+            scenes: &list,
+            low_latency: None,
+        })
+        .unwrap();
+    {
+        let mut s = f.scene(scene).unwrap();
+        s.set_focus(DVec3::new(0.0, 3.0, 0.0), 1000.0);
+        write(&mut s);
+    }
+    f.end(&[]).unwrap();
+    scenes.stats().cuts
+}
+
+#[test]
+fn the_traversal_requests_the_node_pages_it_needs_and_keeps_reading_them() {
+    let _serial = serial();
+    let bytes = paged_hierarchy();
+    let a = Archive::from_memory(Arc::clone(bytes)).unwrap();
+    let mesh = entry(&a, AssetId::from_name(DOME_MESH));
+    let info = MeshInfo::parse(&blob(&a, mesh, 0)).unwrap();
+    let page_bytes = |p: usize| blob(&a, mesh, info.node_pages[p].blob as usize).len() as u64;
+    // Room for both mounts' top pages and one streamed page.
+    let budget = 2 * page_bytes(0) + page_bytes(1);
+    let desc = RendererDesc {
+        budgets: Budgets {
+            hierarchy_page_pool: budget,
+            ..Budgets::default()
+        },
+        ..RendererDesc::default()
+    };
+    let dev = device();
+    let mut scenes = Scenes::new(dev, &desc).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let gpu = Gpu(dev);
+    let mounts = [
+        scenes.mount(PackSource::Memory(Arc::clone(bytes))),
+        scenes.mount(PackSource::Memory(Arc::clone(bytes))),
+    ];
+    let models = mounts.map(|m| {
+        ready(&mut scenes, m);
+        scenes.model(m, AssetId::from_name("kit/dome")).unwrap()
+    });
+    let scene = scenes.create_scene(&SceneDesc::default()).unwrap();
+    let mut range = None;
+    traverse_frame(&mut scenes, scene, |s| {
+        let group = s
+            .create_transform_group(&TransformGroupDesc {
+                count: 1,
+                writer: GroupWriter::Cpu,
+                anchor: DVec3::ZERO,
+            })
+            .unwrap();
+        s.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY;
+        range = Some(
+            s.add_instances(&InstancesDesc {
+                model: models[0],
+                copies: 1,
+                transforms: group,
+                first: 0,
+                pose: None,
+                material_set: None,
+                flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+                rt_range: 100.0,
+                animation_range: 0.0,
+                user_tag: 0,
+            })
+            .unwrap(),
+        );
+    });
+    let range = range.unwrap();
+
+    // Below its roots the copy's cut waits for the page, which the traversal requests.
+    let start = Instant::now();
+    let (mut requests, mut before) = (0, Vec::new());
+    while node_table(&scenes, &gpu, models[0])[1] == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the node page never streamed in"
+        );
+        let c = traverse_frame(&mut scenes, scene, |_| {});
+        requests += c.page_requests;
+        before.push(c.candidate_clusters);
+    }
+    assert!(requests > 0, "the traversal requested the page");
+    assert!(
+        before.iter().all(|&n| n == 0),
+        "nothing drawn before the page: {before:?}"
+    );
+    let mut drawn = 0;
+    for _ in 0..3 {
+        drawn = traverse_frame(&mut scenes, scene, |_| {}).candidate_clusters;
+    }
+    assert!(drawn > 0, "the copy draws once the page is resident");
+
+    // Read every frame, the page outlives its hold: the other mount's page never finds room.
+    for _ in 0..60 {
+        scenes.prefetch(models[1], 0);
+        traverse_frame(&mut scenes, scene, |_| {});
+    }
+    assert_ne!(
+        node_table(&scenes, &gpu, models[0])[1],
+        0,
+        "the page stayed"
+    );
+    assert_eq!(
+        node_table(&scenes, &gpu, models[1])[1],
+        0,
+        "no room for the other page"
+    );
+
+    // Once no traversal reads it, it gives way after its hold.
+    traverse_frame(&mut scenes, scene, |s| s.remove(range));
+    let frames = stream_in(&mut scenes, &gpu, models[1], budget);
+    assert!(frames > 30, "evicted after {frames} frames");
+    assert_eq!(node_table(&scenes, &gpu, models[0])[1], 0, "evicted");
     assert_clean();
 }

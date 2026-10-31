@@ -14,6 +14,7 @@ use crate::material::MaterialId;
 use crate::memory::{RangeAllocator, UploadWindow};
 use crate::producer::{self, Producer, ProducerDesc, ProducerId};
 use crate::ptlas::Ptlas;
+use crate::traverse::Cuts;
 use crate::upload::{Op, Record};
 use crate::world::WorldPos;
 use crate::{
@@ -118,6 +119,30 @@ pub struct InstanceRange {
 /// A cooked model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ModelId(pub u32);
+
+/// A debug hold on the level of detail of copies, in raster and ray tracing alike.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DebugLod {
+    /// DAG meshes draw the part stage's clusters made by this many simplification steps
+    /// (and coarser terminal groups where the DAG stops earlier); discrete meshes draw this
+    /// level, or their coarsest.
+    Level(u8),
+    /// Scales the error threshold: above 1 coarser, below 1 finer.
+    ErrorScale(f32),
+}
+
+impl DebugLod {
+    /// `InstanceGpu::debug_lod`.
+    fn bits(lod: Option<Self>) -> u16 {
+        const LEVEL: u16 = 0x8000;
+        match lod {
+            None => 0,
+            Some(Self::Level(l)) => LEVEL | u16::from(l),
+            // A positive f16 below LEVEL; 0 stands for none.
+            Some(Self::ErrorScale(s)) => half::f16::from_f32(s.clamp(1e-4, 65504.0)).to_bits(),
+        }
+    }
+}
 
 /// `InstanceGpu::flags`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -267,6 +292,8 @@ pub(crate) struct SceneCpu {
     pub surface_data: u64,
     pub near_range: f32,
     pub ptlas: Ptlas,
+    /// Made at the scene's first update.
+    pub cuts: Option<Cuts>,
 }
 
 pub(crate) struct Scene {
@@ -352,6 +379,7 @@ impl Scene {
                 surface_data: 0,
                 near_range: 256.0,
                 ptlas: Ptlas::new(device, desc)?,
+                cuts: None,
             }),
             writing: AtomicBool::new(false),
         })
@@ -624,7 +652,7 @@ impl<'f> SceneWriter<'f> {
                 candidate_class: 0,
                 pose_variants: pose.variants as u16,
                 pose_stride: pose.stride as u16,
-                _pad: 0,
+                debug_lod: 0,
                 user_tag: desc.user_tag,
                 variant: 0,
             };
@@ -663,6 +691,23 @@ impl<'f> SceneWriter<'f> {
             op: Op::Masked {
                 value: u32::from(flags.0) << shift,
                 mask: 0xff << shift,
+            },
+        });
+    }
+
+    /// Holds the copies of `range` at one DAG level or scales their errors, in raster and ray
+    /// tracing; `None` lets them choose their cuts again.
+    pub fn debug_lod(&mut self, range: InstanceRange, lod: Option<DebugLod>) {
+        let byte = std::mem::offset_of!(InstanceGpu, debug_lod);
+        let shift = 8 * (byte % 4);
+        self.push(Record {
+            seq: self.next_seq(),
+            dst: self.instance_word(range.first, byte & !3),
+            count: range.count,
+            stride: words(size_of::<InstanceGpu>()),
+            op: Op::Masked {
+                value: u32::from(DebugLod::bits(lod)) << shift,
+                mask: 0xffff << shift,
             },
         });
     }

@@ -1,10 +1,23 @@
-// The HZB: mip 0 holds the visibility buffer's reverse-Z depth (written by the resolve's
-// classify); each further mip holds the farthest depth (the smallest value) of the texels
-// it covers, three wide where the finer mip has an odd size.
+// The HZB: mip 0 holds the visibility buffer's reverse-Z depth (written by `seed` between
+// the raster passes and by the resolve's classify after them); each further mip holds the
+// farthest depth (the smallest value) of the texels it covers, three wide where the finer
+// mip has an odd size.
 #include "orr/root.h"
+import gbuffer;
 import visibility;
 
 ORR_ROOT(RasterRoot);
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void seed(uint3 id: SV_DispatchThreadID)
+{
+    RasterGpu* r = root.raster;
+    if (any(id.xy >= r.gbuffer.extent))
+        return;
+    uint64_t w = r.gbuffer.visibility[id.y * r.gbuffer.extent.x + id.x];
+    r.hzb[0].get<RWTexture2D<float>>()[id.xy] = visibility_depth(w);
+}
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
