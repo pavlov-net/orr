@@ -16,5 +16,9 @@ windows = { workspace = true, features = [
     "Win32_System_Threading",
 ] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring.workspace = true
+libc.workspace = true
+
 [lints]
 workspace = true
