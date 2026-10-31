@@ -10,6 +10,7 @@ use orr_pack::neural::NeuralInfo;
 use orr_pack::raster::{RasterLayer, RasterSetInfo};
 use orr_pack::skeleton::{NO_PARENT, SkeletonInfo};
 use orr_pack::texture::TextureInfo;
+use orr_pack::volume::VolumeInfo;
 use orr_pack::{Archive, Class, Codec, Entry};
 
 const USAGE: &str = "usage:
@@ -198,6 +199,8 @@ fn inspect(args: &[String]) -> Result<bool> {
                 mesh_lines(&a, e, &mut out)?;
             } else if e.class == Class::NeuralTextureSet as u16 {
                 neural_lines(&a, e, &mut out)?;
+            } else if e.class == Class::Volume as u16 {
+                volume_lines(&a, e, &mut out)?;
             }
         }
         if name.is_some() {
@@ -345,6 +348,42 @@ fn raster_lines(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
             tiles.len(),
             if l.lossless == 1 { "lossless" } else { "BCn" },
             l.value_range,
+        )?;
+    }
+    Ok(())
+}
+
+/// The lattice of a volume, then per grid its format, quantization, bricks, pages and
+/// stored bytes.
+fn volume_lines(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
+    let blobs = a.blobs(e);
+    let info = VolumeInfo::parse(&mount_blob(a, e)?)?;
+    let h = info.header;
+    writeln!(
+        out,
+        "    origin {:?} m, voxel {:?} m, bricks {:?} from voxel {:?}, {} grids, majorants {} B",
+        h.origin,
+        h.voxel_size,
+        h.bricks,
+        h.brick_min,
+        info.grids.len(),
+        blobs.get(1).map_or(0, |b| b.raw_len)
+    )?;
+    for (g, name) in info.grids.iter().zip(&info.names) {
+        let pages = g.pages.first as usize..(g.pages.first + g.pages.count) as usize;
+        let stored: u64 = blobs
+            .get(pages)
+            .map_or(0, |b| b.iter().map(|b| u64::from(b.stored_len)).sum());
+        writeln!(
+            out,
+            "    {name}: vk format {}, scale {} offset {} background {}, range {:?}, {} bricks, {} pages, stored {stored} B",
+            g.vk_format,
+            g.scale,
+            g.offset,
+            g.background,
+            g.value_range,
+            g.bricks.count,
+            g.pages.count,
         )?;
     }
     Ok(())

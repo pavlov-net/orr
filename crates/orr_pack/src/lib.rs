@@ -19,6 +19,7 @@ pub mod raster;
 pub mod skeleton;
 pub mod subd;
 pub mod texture;
+pub mod volume;
 mod writer;
 
 use std::fmt;
@@ -184,6 +185,7 @@ const SCHEMAS: &[(Class, u16)] = &[
     (Class::Clip, clip::SCHEMA),
     (Class::NeuralTextureSet, neural::SCHEMA),
     (Class::Subd, subd::SCHEMA),
+    (Class::Volume, volume::SCHEMA),
 ];
 
 impl Class {

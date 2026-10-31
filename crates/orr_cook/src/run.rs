@@ -45,6 +45,7 @@ use crate::texture::material::{
 };
 use crate::texture::neural::{self, NeuralJob};
 use crate::texture::{self, ENCODERS, Wrap};
+use crate::volume::{self, VolumeReport};
 use crate::{
     CookOptions, Cooked, Error, GltfSettings, Instances, Manifest, MeshSettings, Placement,
     PrototypeSpec, Result, Source, TextureSettings, UsdSettings, mount,
@@ -130,6 +131,7 @@ enum Work<'m> {
     /// each prototype's model.
     Instances(Cow<'m, Instances>, u8, Catalog, Vec<(String, usize)>),
     Raster(raster::Plan),
+    Volume(volume::Plan<'m>),
 }
 
 enum State {
@@ -186,19 +188,19 @@ enum ImportKind<'m> {
 }
 
 /// A unit an import made; `deps` name units of the same import.
-struct NewUnit {
+struct NewUnit<'m> {
     name: String,
     class: u16,
     key: Hash32,
-    work: Work<'static>,
+    work: Work<'m>,
     deps: Vec<String>,
     working_set: u64,
     triangles: u64,
 }
 
-impl NewUnit {
+impl<'m> NewUnit<'m> {
     /// A unit with no dependencies and no triangles.
-    fn leaf(name: &str, class: u16, key: Hash32, working_set: u64, work: Work<'static>) -> Self {
+    fn leaf(name: &str, class: u16, key: Hash32, working_set: u64, work: Work<'m>) -> Self {
         Self {
             name: name.into(),
             class,
@@ -213,7 +215,7 @@ impl NewUnit {
 
 struct Imported {
     files: Vec<Input>,
-    units: Vec<NewUnit>,
+    units: Vec<NewUnit<'static>>,
     /// Placements of the instanced models, cooked as instance unit `<asset>/instances`.
     instances: Option<Instances>,
     assemblies: Vec<Assembly>,
@@ -237,6 +239,7 @@ type UnitResult = (From, f64, Detail);
 struct Detail {
     tangents: Option<mesh::TangentCheck>,
     raster: Option<RasterReport>,
+    volume: Option<VolumeReport>,
     neural: Option<report::NeuralReport>,
     warnings: Vec<String>,
 }
@@ -447,6 +450,20 @@ impl<'m, 's> Run<'m, 's> {
                     planned.key,
                     raster::WORKING_SET,
                     Work::Raster(planned.plan),
+                );
+                self.add_units(a, index, vec![unit]);
+            }
+            Source::Volume { input, settings } => {
+                let planned = volume::plan(name, input, settings, &self.shared.memo)?;
+                if let Some(f) = &planned.file {
+                    self.input(a, index, f);
+                }
+                let unit = NewUnit::leaf(
+                    name,
+                    Class::Volume as u16,
+                    planned.key,
+                    planned.working_set,
+                    Work::Volume(planned.plan),
                 );
                 self.add_units(a, index, vec![unit]);
             }
@@ -743,7 +760,7 @@ impl<'m, 's> Run<'m, 's> {
     }
 
     /// Adds units whose dependencies name units of the same list.
-    fn add_units(&mut self, a: usize, asset: usize, units: Vec<NewUnit>) -> Vec<Hash32> {
+    fn add_units(&mut self, a: usize, asset: usize, units: Vec<NewUnit<'m>>) -> Vec<Hash32> {
         let mut keys = Vec::new();
         let mut deps = Vec::new();
         for nu in units {
@@ -1305,6 +1322,7 @@ impl<'m, 's> Run<'m, 's> {
                         m.tangents = Some(tangent_report(m.vertices, t));
                     }
                     first.raster = d.raster;
+                    first.volume = d.volume;
                     first.neural = d.neural;
                     first.warnings = d.warnings;
                 }
@@ -1681,7 +1699,7 @@ fn bakes_displacement(settings: &MeshSettings, maps: &MapSpec) -> bool {
 
 /// Material `name`'s variant for statically displaced sections, `<name>/static`: without
 /// its displacement, which the geometry holds.
-fn static_material_unit(name: &str, m: &Material) -> NewUnit {
+fn static_material_unit(name: &str, m: &Material) -> NewUnit<'static> {
     let mut m = *m;
     m.textures[slot::DISPLACEMENT] = bytemuck::Zeroable::zeroed();
     m.displacement_scale = 0.0;
@@ -1692,7 +1710,7 @@ fn static_material_unit(name: &str, m: &Material) -> NewUnit {
 }
 
 /// A material entry holding `m`.
-fn material_unit(name: String, m: &Material) -> NewUnit {
+fn material_unit(name: String, m: &Material) -> NewUnit<'static> {
     let bytes = bytemuck::bytes_of(m).to_vec();
     let key = Key::new(Class::Material, &name).bytes(&bytes).finish();
     let working_set = bytes.len() as u64;
@@ -1760,7 +1778,7 @@ fn mesh_units(
     materials: &[Material],
     settings: &MeshSettings,
     textures: &HashMap<AssetId, (String, Hash32)>,
-) -> Result<(Vec<NewUnit>, Option<Assembly>)> {
+) -> Result<(Vec<NewUnit<'static>>, Option<Assembly>)> {
     let fail = |message: String| Error::Mesh {
         asset: name.into(),
         message,
@@ -1866,7 +1884,7 @@ fn model_units(
     subd: Option<SubdPart>,
     materials: &[(AssetId, Hash32)],
     skeleton: (AssetId, Option<Hash32>),
-) -> (Vec<NewUnit>, Option<Assembly>) {
+) -> (Vec<NewUnit<'static>>, Option<Assembly>) {
     let mut units = Vec::new();
     let mut found = None;
     if let Some(part) = &mut mesh
@@ -1929,7 +1947,7 @@ fn geometry_units(
     subd: Option<SubdPart>,
     materials: &[(AssetId, Hash32)],
     skeleton: (AssetId, Option<Hash32>),
-) -> Vec<NewUnit> {
+) -> Vec<NewUnit<'static>> {
     let mut units = Vec::new();
     let mut model_key = Key::new(Class::Model, &model_name);
     if let Some(m) = mesh {
@@ -1991,7 +2009,7 @@ fn subd_units(
     cage: &CageInput,
     materials: &[Material],
     settings: &SubdSettings,
-) -> Result<Vec<NewUnit>> {
+) -> Result<Vec<NewUnit<'static>>> {
     subd::check(cage, materials.len()).map_err(|message| Error::Mesh {
         asset: name.into(),
         message,
@@ -2153,6 +2171,9 @@ fn cook_unit(
         Work::Raster(plan) => {
             let scratch = raster::scratch_dir(shared.cache.as_ref().map(Cache::dir));
             detail.raster = Some(raster::cook(&mut w, name, key, &plan, &scratch)?);
+        }
+        Work::Volume(plan) => {
+            detail.volume = Some(volume::cook(&mut w, name, key, &plan)?);
         }
     }
     let from = match (w.finish()?, path) {

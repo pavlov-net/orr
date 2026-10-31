@@ -26,6 +26,7 @@ pub(crate) const VERSIONS: &[(Class, u32)] = &[
     (Class::Clip, 1),
     (Class::NeuralTextureSet, 1),
     (Class::Subd, 1),
+    (Class::Volume, 1),
 ];
 
 /// Cook version of user classes, which the cook stores as given.
@@ -44,6 +45,7 @@ fn libraries(class: u16) -> &'static str {
         Some(Class::Texture | Class::NeuralTextureSet) => env!("ORR_COOK_TEXTURE_LIBS"),
         Some(Class::RasterSet) => env!("ORR_COOK_RASTER_LIBS"),
         Some(Class::Subd) => env!("ORR_COOK_SUBD_LIBS"),
+        Some(Class::Volume) => env!("ORR_COOK_VOLUME_LIBS"),
         _ => "",
     }
 }
@@ -114,6 +116,8 @@ pub(crate) fn salt() -> Hash32 {
     let mut k = Key::new(0u16, "salt").str(env!("ORR_COOK_MESH_LIBS"));
     k = k.str(env!("ORR_COOK_TEXTURE_LIBS"));
     k = k.str(env!("ORR_COOK_SUBD_LIBS"));
+    k = k.str(env!("ORR_COOK_RASTER_LIBS"));
+    k = k.str(env!("ORR_COOK_VOLUME_LIBS"));
     for (c, v) in VERSIONS {
         k = k.bytes(&(*c as u16).to_le_bytes()).bytes(&v.to_le_bytes());
     }

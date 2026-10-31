@@ -23,8 +23,16 @@
 //! ] }
 //! ```
 //!
+//! ```toml
+//! [[archive.asset]]
+//! name = "smoke"
+//! volume = { input = { vdb = { path = "smoke.vdb" } }, settings = { grids = [
+//!     { name = "density", format = "r8" },
+//! ] } }
+//! ```
+//!
 //! Each asset names exactly one source: `gltf`, `usd`, `materialx`, `texture`, `instances`,
-//! `raster`, `material` or `user`, with the fields of the matching [`Source`] variant
+//! `raster`, `volume`, `material` or `user`, with the fields of the matching [`Source`] variant
 //! (`Source::Mesh` is for library callers). Settings fields left out take their defaults.
 
 use std::path::{Path, PathBuf};
@@ -32,7 +40,7 @@ use std::path::{Path, PathBuf};
 use orr_pack::Target;
 use serde::{Deserialize, Deserializer};
 
-use crate::{ArchiveSpec, Error, Manifest, RasterInput, Result, Source};
+use crate::{ArchiveSpec, Error, Manifest, RasterInput, Result, Source, VolumeInput};
 
 impl Manifest {
     /// Reads a TOML manifest; relative paths in it are resolved against its directory.
@@ -69,7 +77,12 @@ impl Manifest {
                             }
                         }
                     }
+                    Source::Volume {
+                        input: VolumeInput::Vdb { path },
+                        ..
+                    } => resolve(path),
                     Source::Instances(_)
+                    | Source::Volume { .. }
                     | Source::User { .. }
                     | Source::Mesh { .. }
                     | Source::Subd { .. }

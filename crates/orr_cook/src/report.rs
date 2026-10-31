@@ -10,7 +10,7 @@ use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, Class, Entry};
 use serde::Serialize;
 
-use crate::RasterReport;
+use crate::{RasterReport, VolumeReport};
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CookReport {
@@ -85,6 +85,8 @@ pub struct EntryReport {
     pub raster: Option<RasterReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub neural: Option<NeuralReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<VolumeReport>,
     /// Content the cook accepted but flags: displacement that differs across uv seams,
     /// subsurface materials on open meshes.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -266,6 +268,7 @@ pub(crate) fn entry(
         texture,
         raster: None,
         neural: None,
+        volume: None,
         warnings: Vec::new(),
     }
 }

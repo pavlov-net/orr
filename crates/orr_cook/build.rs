@@ -1,7 +1,7 @@
 //! Puts the locked versions of the libraries that shape cooked bytes into environment
 //! variables that enter cook keys: `ORR_COOK_ZSTD_LIBS` for every entry,
-//! `ORR_COOK_MESH_LIBS` for meshes, `ORR_COOK_TEXTURE_LIBS` for textures and
-//! `ORR_COOK_RASTER_LIBS` for raster sets.
+//! `ORR_COOK_MESH_LIBS` for meshes, `ORR_COOK_TEXTURE_LIBS` for textures,
+//! `ORR_COOK_RASTER_LIBS` for raster sets and `ORR_COOK_VOLUME_LIBS` for volumes.
 //!
 //! With the `ntc` feature, compiles the LibNTC shim against the headers of the RTXNTC-Library
 //! checkout in `ORR_NTC_SDK` (else `RTXNTC-Library` under `ORR_TOOLS` or the nearest
@@ -23,6 +23,7 @@ use std::path::Path;
 const ZSTD: &[&str] = &["zstd", "zstd-safe", "zstd-sys"];
 const MESH: &[&str] = &["meshopt", "gltf", "gltf-json", "openusd", "roxmltree"];
 const TEXTURE: &[&str] = &["bcdec_rs", "image", "png", "half"];
+const VOLUME: &[&str] = &["vdb-rs", "blosc-src", "half"];
 
 fn main() {
     ntc();
@@ -71,6 +72,10 @@ fn main() {
     println!(
         "cargo:rustc-env=ORR_COOK_RASTER_LIBS={}",
         versions(&|n| n == "tiff" || texture(n))
+    );
+    println!(
+        "cargo:rustc-env=ORR_COOK_VOLUME_LIBS={}",
+        versions(&|n| VOLUME.contains(&n))
     );
 }
 
