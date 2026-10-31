@@ -7,6 +7,7 @@ mod display_watch;
 mod dof;
 mod encode;
 mod exposure;
+mod glare;
 mod gt7;
 mod hooks;
 mod motion_blur;
@@ -33,6 +34,7 @@ pub use exposure::{
     Physiological, SkyTelemetry, ev100_from_exposure, ev100_from_luminance, exposure_from_ev100,
     keyed_ev100, luminance_from_ev100,
 };
+pub use glare::{GlareComposite, GlarePass};
 pub use gt7::{GT7_REFERENCE_NITS, GT7_SDR_NITS, Gt7Curve, Gt7Params};
 pub use hooks::{ChainImages, DistortionField, HookInputs, HookPass, HookPoint, Hooks, Image};
 pub use motion_blur::{MOTION_BLUR_MAX_RADIUS, MotionBlurPass};

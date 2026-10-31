@@ -1,5 +1,5 @@
-//! Camera effects after RR: motion blur against shutter-accumulated references and depth of
-//! field against lens-disc references.
+//! Camera effects after RR: motion blur against shutter-accumulated references, depth of
+//! field against lens-disc references and glare against its CPU model and PSF.
 
 use half::f16;
 use orr_output::{ChainImages, MotionBlurPass, OutputKernels, OutputView, ViewOutput, srgb_encode};
@@ -669,6 +669,500 @@ mod depth_of_field {
             "{unchanged} of {}",
             guide.len()
         );
+        assert_clean();
+    }
+}
+
+/// Glare: the band pyramid against its CPU model, the fitted tables and the diaphragm PSF
+/// they are fitted to.
+mod glare {
+    use orr_output::{
+        Exposure, OutputDebug, OutputFormat, ResolvedDisplay, ViewOutput, srgb_encode,
+    };
+    use orr_scene::Glare;
+    use orr_scene::testing::{Image, Pixels, assert_clean, flip};
+    use output_suite::{Harness, REC709_TO_XYZ, XYZ_TO_REC2020, mul3};
+
+    #[allow(dead_code, unreachable_pub)]
+    mod pyramid {
+        include!(concat!(env!("ORR_GLARE_MODEL"), "/pyramid.rs"));
+    }
+    #[allow(dead_code, unreachable_pub)]
+    mod psf {
+        include!(concat!(env!("ORR_GLARE_MODEL"), "/psf.rs"));
+    }
+    #[allow(
+        dead_code,
+        unreachable_pub,
+        clippy::unreadable_literal,
+        clippy::excessive_precision
+    )]
+    mod data {
+        include!(env!("ORR_GLARE_PSF"));
+    }
+
+    use pyramid::Plane;
+
+    /// An emitter's exposed value: within the HDR ceiling at any whole-stop pre-exposure.
+    const EXPOSED: f32 = 8000.0;
+
+    /// The EV100 at which the lens is at table F-number `i` at the reference pitch.
+    fn ev_at(i: usize) -> f32 {
+        (100.0 * data::F_NUMBERS[i] * data::F_NUMBERS[i]).log2() as f32
+    }
+
+    /// An scRGB display; Linear debug output on it is not clamped.
+    fn hdr(peak_nits: f32) -> ResolvedDisplay {
+        ResolvedDisplay {
+            encoding: OutputFormat::ScRgb,
+            paper_white_nits: 250.0,
+            peak_nits,
+            black_nits: 0.0,
+        }
+    }
+
+    fn sdr() -> ResolvedDisplay {
+        ResolvedDisplay {
+            encoding: OutputFormat::Sdr,
+            paper_white_nits: 250.0,
+            peak_nits: 250.0,
+            black_nits: 0.0,
+        }
+    }
+
+    fn output(ev100: f32, debug: OutputDebug) -> ViewOutput {
+        ViewOutput {
+            exposure: Exposure::Manual { ev100 },
+            debug,
+            ..ViewOutput::default()
+        }
+    }
+
+    /// The harness's view at `extent` with the reference pixel pitch, glare `strength`.
+    fn harness(extent: [u32; 2], glare: Option<f32>) -> Harness {
+        let mut h = Harness::new(extent[0], extent[1]);
+        h.sensor_width_mm = (data::REFERENCE_PITCH_UM * f64::from(extent[0]) / 1000.0) as f32;
+        h.glare = glare.map(|strength| Glare { strength });
+        h
+    }
+
+    /// Runs frames until pre-exposure settles; returns the last display-linear image in
+    /// linear Rec.2020, the exposure the passes applied and the pre-exposure the radiance was
+    /// rendered with.
+    fn settle(
+        h: &mut Harness,
+        nits: &[f32],
+        out: &ViewOutput,
+        display: &ResolvedDisplay,
+    ) -> (Vec<[f64; 3]>, f64, f64) {
+        h.set_image(nits);
+        let mut telemetry = h.frame(1.0, out, Some(display));
+        for _ in 0..3 {
+            telemetry = h.frame(1.0, out, Some(display));
+        }
+        let rec2020 = h
+            .display_linear()
+            .iter()
+            .map(|p| {
+                let c = [p[0], p[1], p[2]].map(f64::from);
+                mul3(&XYZ_TO_REC2020, mul3(&REC709_TO_XYZ, c))
+            })
+            .collect();
+        let exposure = f64::from(orr_output::exposure_from_ev100(telemetry.adapted_ev100));
+        (rec2020, exposure, f64::from(telemetry.pre_exposure))
+    }
+
+    fn weights(h: &Harness) -> Vec<[f64; 4]> {
+        h.glare_weights()
+            .expect("glare ran")
+            .iter()
+            .map(|w| w.map(f64::from))
+            .collect()
+    }
+
+    /// The weights the pass writes at F-number `n` (reference pitch) for a chain of `mips`
+    /// levels from `first_level`: the tables interpolated in log N, folded into the last mip.
+    fn expected_weights(first_level: usize, n: f64, mips: usize) -> Vec<[f64; 3]> {
+        let f = &data::F_NUMBERS;
+        let n = n.clamp(f[0], f[f.len() - 1]);
+        let t = (n / f[0]).ln() / (f[f.len() - 1] / f[0]).ln() * (f.len() - 1) as f64;
+        let i = (t as usize).min(f.len() - 2);
+        let rows = &data::TABLES[first_level - 1];
+        let mut out = vec![[0.0; 3]; mips + 1];
+        for c in 0..3 {
+            let lerped: Vec<f64> = (0..rows[i].len())
+                .map(|e| rows[i][e][c] + (rows[i + 1][e][c] - rows[i][e][c]) * (t - i as f64))
+                .collect();
+            for (o, w) in out.iter_mut().zip(pyramid::fold(&lerped, mips)) {
+                o[c] = w;
+            }
+        }
+        out
+    }
+
+    fn assert_weights(gpu: &[[f64; 4]], expected: &[[f64; 3]], what: &str) {
+        for (e, w) in expected.iter().enumerate() {
+            for c in 0..3 {
+                assert!(
+                    (gpu[e][c] - w[c]).abs() < 1e-5,
+                    "{what}: entry {e}: {gpu:?}"
+                );
+            }
+        }
+        assert!(
+            gpu[expected.len()..].iter().all(|w| w[..3] == [0.0; 3]),
+            "{what}: {gpu:?}"
+        );
+    }
+
+    /// The CPU model of the GPU run: per channel, the pyramid of the pre-exposed radiance the
+    /// harness rendered, scaled by `scale`, at the frame's weights.
+    fn model(
+        h: &Harness,
+        extent: [u32; 2],
+        first_level: u32,
+        scale: f64,
+        w: &[[f64; 4]],
+    ) -> Vec<[f64; 3]> {
+        let radiance = h.radiance();
+        let mut out = vec![[0.0; 3]; radiance.len()];
+        for c in 0..3 {
+            let input = Plane::dense(extent, radiance.iter().map(|p| f64::from(p[c])).collect());
+            let wc: Vec<f64> = w.iter().map(|e| e[c]).collect();
+            let downs = pyramid::downsamples(&input, first_level, scale);
+            let glare = pyramid::compose(&input, &downs, &wc, scale);
+            for (o, v) in out.iter_mut().zip(&glare.data) {
+                o[c] = *v;
+            }
+        }
+        out
+    }
+
+    /// Point sources and a gradient on a dim ground, `extent[0] * extent[1]` nits.
+    fn scene(extent: [u32; 2], ground: f32, lights: &[([u32; 2], f32)]) -> Vec<f32> {
+        let [w, h] = extent;
+        let mut nits: Vec<f32> = (0..w * h)
+            .map(|i| ground * (1.0 + (i % w) as f32 / w as f32))
+            .collect();
+        for &([x, y], l) in lights {
+            nits[(y * w + x) as usize] = l;
+        }
+        nits
+    }
+
+    #[test]
+    fn tables_are_non_negative_and_keep_energy() {
+        for first in &data::TABLES {
+            for row in first {
+                for c in 0..3 {
+                    assert!(row.iter().all(|w| w[c] >= 0.0), "{row:?}");
+                    let sum: f64 = row.iter().map(|w| w[c]).sum();
+                    assert!((sum - 1.0).abs() < 1e-9, "{sum}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_fit_keeps_uniform_fields_and_point_energy() {
+        let w: Vec<f64> = data::TABLES[0][6].iter().map(|w| w[1]).collect();
+        let size = [96, 64];
+        let input = Plane::dense(size, vec![3.0; 96 * 64]);
+        let downs = pyramid::downsamples(&input, 1, 0.5);
+        let out = pyramid::compose(&input, &downs, &pyramid::fold(&w, downs.len()), 0.5);
+        for v in &out.data {
+            assert!((v / 1.5 - 1.0).abs() < 1e-9, "{v}");
+        }
+        let size = [4096; 2];
+        let input = Plane::impulse(size, [2048, 2048], 1.0);
+        let out = pyramid::compose(&input, &pyramid::downsamples(&input, 1, 1.0), &w, 1.0);
+        assert!((out.sum() - 1.0).abs() < 0.01, "{}", out.sum());
+    }
+
+    #[test]
+    fn pyramid_matches_cpu_model() {
+        let extent = [160, 96];
+        let mut h = harness(extent, Some(1.0));
+        let ev = ev_at(5) + 0.37;
+        let nits = scene(
+            extent,
+            200.0,
+            &[
+                ([40, 30], 4e6),
+                ([41, 30], 2e6),
+                ([120, 70], 6e6),
+                ([159, 95], 1e6),
+            ],
+        );
+        for first_level in [1, 2] {
+            let mut out = output(ev, OutputDebug::Linear);
+            out.post.glare_first_level = first_level;
+            let (gpu, exposure, pre) = settle(&mut h, &nits, &out, &hdr(250.0));
+            let w = weights(&h);
+            let scale = exposure / pre;
+            let cpu = model(&h, extent, first_level, scale, &w);
+            let radiance = h.radiance();
+            let mut worst: f64 = 0.0;
+            for (i, (g, c)) in gpu.iter().zip(&cpu).enumerate() {
+                for k in 0..3 {
+                    let identity = w[0][k] * scale * f64::from(radiance[i][k]);
+                    let glare = (c[k] - identity).abs();
+                    // RGBA16F rounding of the output and of the chain.
+                    let error = (g[k] - c[k]).abs() / (1e-3 * c[k].abs() + 0.02 * glare + 1e-6);
+                    worst = worst.max(error);
+                }
+            }
+            log::info!(
+                "first level {first_level}: worst error against the CPU model {worst:.3} of its bound"
+            );
+            assert!(worst <= 1.0, "first level {first_level}: {worst}");
+        }
+        assert_clean();
+    }
+
+    #[test]
+    fn no_glare_frees_the_chain() {
+        let extent = [64, 64];
+        let nits = vec![1.0; 64 * 64];
+        let mut h = harness(extent, Some(1.0));
+        let out = output(10.0, OutputDebug::None);
+        settle(&mut h, &nits, &out, &sdr());
+        assert!(h.output().glare_bytes() > 0);
+        h.glare = None;
+        settle(&mut h, &nits, &out, &sdr());
+        assert_eq!(h.output().glare_bytes(), 0);
+        assert!(h.glare_weights().is_none());
+        assert_clean();
+    }
+
+    #[test]
+    fn uniform_field_is_unchanged() {
+        let extent = [200, 120];
+        let nits = vec![900.0; 200 * 120];
+        let out = output(ev_at(7), OutputDebug::Linear);
+        let (plain, ..) = settle(&mut harness(extent, None), &nits, &out, &hdr(250.0));
+        let (glared, ..) = settle(&mut harness(extent, Some(1.0)), &nits, &out, &hdr(250.0));
+        let mut worst: f64 = 0.0;
+        for (a, b) in plain.iter().zip(&glared) {
+            for k in 0..3 {
+                worst = worst.max((b[k] / a[k] - 1.0).abs());
+            }
+        }
+        log::info!("uniform field: worst relative change {worst:.2e}");
+        assert!(worst < 1e-3, "{worst}");
+        assert_clean();
+    }
+
+    #[test]
+    fn point_source_keeps_energy() {
+        let extent = [1024, 1024];
+        let ev = ev_at(6);
+        let mut nits = vec![0.0; 1024 * 1024];
+        let source = EXPOSED * 1.2 * ev.exp2();
+        nits[512 * 1024 + 512] = source;
+        let out = output(ev, OutputDebug::Linear);
+        let (image, exposure, _) =
+            settle(&mut harness(extent, Some(1.0)), &nits, &out, &hdr(250.0));
+        let energy = f64::from(source) * exposure;
+        for k in 0..3 {
+            let sum: f64 = image.iter().map(|p| p[k]).sum();
+            log::info!(
+                "point source: channel {k} keeps {:.5} of its energy",
+                sum / energy
+            );
+            assert!((sum / energy - 1.0).abs() < 0.01, "{k}: {}", sum / energy);
+        }
+        assert_clean();
+    }
+
+    /// Encodes per-channel energies over `energy` in log10 from 1e-8 to 1 as 8-bit gray
+    /// levels, which shows the PSF's tail.
+    fn log_image(side: u32, pixels: &[[f64; 3]], energy: f64) -> Image {
+        let level = |v: f64| {
+            let t = ((v.max(1e-12) / energy).log10() + 8.0) / 8.0;
+            (srgb_encode(t.clamp(0.0, 1.0)) * 255.0).round() as u8
+        };
+        Image {
+            width: side,
+            height: side,
+            pixels: Pixels::Rgba8(
+                pixels
+                    .iter()
+                    .flat_map(|p| [level(p[0]), level(p[1]), level(p[2]), 255])
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The PSF at `f_number` around a pixel center, per pixel of a `side` square, from its
+    /// encircled energy over lattice shells of equal area.
+    fn psf_image(side: u32, f_number: f64) -> Vec<[f64; 3]> {
+        let half = i64::from(side / 2);
+        let reach = 2 * half;
+        let mut shells = std::collections::BTreeMap::<i64, u64>::new();
+        for y in -reach..=reach {
+            for x in -reach..=reach {
+                *shells.entry(x * x + y * y).or_default() += 1;
+            }
+        }
+        let ee = |n: u64| {
+            let r = (n as f64 / std::f64::consts::PI).sqrt();
+            psf::encircled_rgb(
+                &data::EE,
+                data::EE_TAIL,
+                &data::SPECTRAL,
+                r,
+                f_number,
+                data::REFERENCE_PITCH_UM,
+            )
+        };
+        let mut inside = 0;
+        let mut per_pixel = std::collections::BTreeMap::new();
+        for (&d2, &n) in shells.range(..=half * half * 2) {
+            let (a, b) = (ee(inside), ee(inside + n));
+            per_pixel.insert(d2, [0, 1, 2].map(|c| (b[c] - a[c]) / n as f64));
+            inside += n;
+        }
+        (0..i64::from(side) * i64::from(side))
+            .map(|i| {
+                let (x, y) = (i % i64::from(side) - half, i / i64::from(side) - half);
+                per_pixel[&(x * x + y * y)]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fitted_kernel_matches_psf() {
+        let extent = [2048, 2048];
+        let side = 512;
+        let i = 6;
+        let ev = ev_at(i);
+        let source = EXPOSED * 1.2 * ev.exp2();
+        let mut nits = vec![0.0; 2048 * 2048];
+        nits[1024 * 2048 + 1024] = source;
+        let mut h = harness(extent, Some(1.0));
+        let out = output(ev, OutputDebug::Linear);
+        let (image, exposure, _) = settle(&mut h, &nits, &out, &hdr(250.0));
+        assert_weights(
+            &weights(&h),
+            &expected_weights(1, data::F_NUMBERS[i], 8),
+            &format!("table F-number {i}"),
+        );
+        let energy = f64::from(source) * exposure;
+        let crop: Vec<[f64; 3]> = (0..side * side)
+            .map(|p| {
+                let (x, y) = (p % side + 1024 - side / 2, p / side + 1024 - side / 2);
+                image[(y * 2048 + x) as usize]
+            })
+            .collect();
+        let fitted = log_image(side, &crop, energy);
+        let reference = log_image(side, &psf_image(side, data::F_NUMBERS[i]), 1.0);
+        let error = flip(&reference, &fitted);
+        log::info!(
+            "fitted kernel against the PSF at f/{:.2}: FLIP {error:?}",
+            data::F_NUMBERS[i]
+        );
+        assert!(error.mean < 0.03, "{error:?}");
+        assert_clean();
+    }
+
+    #[test]
+    fn f_number_follows_exposure_and_hdr_peak() {
+        let extent = [64, 64];
+        let nits = vec![1.0; 64 * 64];
+        let mut h = harness(extent, Some(1.0));
+        let mut last_tail = 0.0;
+        for ev in [6.0, 9.0, 12.0, 15.0] {
+            settle(&mut h, &nits, &output(ev, OutputDebug::None), &sdr());
+            let w = weights(&h);
+            let lens = f64::from(ev).exp2().sqrt() / 10.0;
+            assert_weights(&w, &expected_weights(1, lens, 6), &format!("EV {ev}"));
+            let tail: f64 = w[1..].iter().map(|w| w[1]).sum();
+            assert!(tail >= last_tail, "{ev}: {tail} after {last_tail}");
+            last_tail = tail;
+            settle(
+                &mut h,
+                &nits,
+                &output(ev + 2.0, OutputDebug::None),
+                &hdr(1000.0),
+            );
+            assert_weights(
+                &weights(&h),
+                &expected_weights(1, lens, 6),
+                &format!("EV {} at 1000 nits", ev + 2.0),
+            );
+        }
+        assert_clean();
+    }
+
+    /// Distance from `center` along its row to the last pixel at or above `level` (green,
+    /// display-linear).
+    fn reach(image: &[[f32; 4]], width: u32, center: [u32; 2], level: f32) -> u32 {
+        let row = (center[1] * width) as usize;
+        (center[0]..width)
+            .take_while(|&x| image[row + x as usize][1] >= level)
+            .count() as u32
+    }
+
+    /// The HDR rendition's halo at the SDR clip level (250 nits) has the SDR rendition's
+    /// extent within one pyramid level.
+    #[test]
+    fn hdr_halo_at_sdr_clip_matches_sdr_halo() {
+        let extent = [512, 512];
+        let ev = 8.0;
+        let mut nits = vec![0.05 * 1.2 * 2f32.powf(ev); 512 * 512];
+        nits[256 * 512 + 256] = EXPOSED * 1.2 * 2f32.powf(ev);
+        let hdr = ResolvedDisplay {
+            encoding: OutputFormat::Hdr10Pq,
+            paper_white_nits: 250.0,
+            peak_nits: 1000.0,
+            black_nits: 0.0,
+        };
+        let out = output(ev, OutputDebug::None);
+        let mut h = harness(extent, Some(1.0));
+        settle(&mut h, &nits, &out, &sdr());
+        let sdr_reach = reach(&h.display_linear(), 512, [256, 256], 0.99);
+        settle(&mut h, &nits, &out, &hdr);
+        let hdr_reach = reach(&h.display_linear(), 512, [256, 256], 1.0);
+        log::info!("halo reach: SDR clip {sdr_reach} px, HDR 250 nits {hdr_reach} px");
+        let ratio = f64::from(hdr_reach.max(1)) / f64::from(sdr_reach.max(1));
+        assert!(
+            ratio.log2().abs() <= 1.0,
+            "SDR {sdr_reach}, HDR {hdr_reach}"
+        );
+        assert_clean();
+    }
+
+    /// At night in SDR, brighter emitters show wider halos; without glare every emitter is
+    /// one clipped pixel.
+    #[test]
+    fn night_street_shows_emitter_brightness_in_sdr() {
+        let extent = [480, 160];
+        let ev = 3.0;
+        let k = 1.2 * 2f32.powf(ev);
+        let lights = [[80, 80], [240, 80], [400, 80]];
+        let exposed = [300.0, 2000.0, EXPOSED];
+        let nits = scene(
+            extent,
+            0.02 * k,
+            &[
+                (lights[0], exposed[0] * k),
+                (lights[1], exposed[1] * k),
+                (lights[2], exposed[2] * k),
+            ],
+        );
+        let out = output(ev, OutputDebug::None);
+        let reaches = |glare| {
+            let mut h = harness(extent, glare);
+            settle(&mut h, &nits, &out, &sdr());
+            let image = h.display_linear();
+            lights.map(|p| reach(&image, 480, p, 0.5))
+        };
+        let lit = reaches(Some(1.0));
+        let plain = reaches(None);
+        log::info!("night street halo reach: {lit:?} with glare, {plain:?} without");
+        assert!(lit[0] < lit[1] && lit[1] < lit[2], "{lit:?}");
+        assert!(plain[0] == plain[1] && plain[1] == plain[2], "{plain:?}");
         assert_clean();
     }
 }

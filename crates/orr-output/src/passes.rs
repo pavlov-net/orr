@@ -1,18 +1,19 @@
 //! Output's compute passes, recorded into a command list: hook inputs, exposure and white
-//! balance (meter and adapt), motion blur, depth of field, tonemap, compose and compose-UI,
-//! and screenshot capture.
+//! balance (meter and adapt), motion blur, depth of field, glare, tonemap, compose and
+//! compose-UI, and screenshot capture.
 
 use std::ops::RangeInclusive;
 
 use bytemuck::Pod;
 use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, GpuPtr, Hazards, MemoryKind, OutputFormat,
-    ShaderStage, SpecData, Stages, StorageImageIndex, TextureIndex,
+    ShaderStage, SpecData, Stages, StorageImageIndex, Texture, TextureIndex,
 };
 use orr_scene::{DepthOfField, SkyStats, ViewConstants};
 
 use crate::dof::{DofKernels, DofTargets};
 use crate::exposure::{COMPENSATION_ENTRIES, HISTOGRAM_BINS, HISTOGRAM_WORDS_PER_BIN};
+use crate::glare::{GLARE_DISPATCHES, GlareKernels, GlareTargets, levels};
 use crate::hooks::HookTargets;
 use crate::motion_blur::{MotionBlurKernels, MotionBlurTargets};
 use crate::shaders::compose;
@@ -22,9 +23,9 @@ use crate::shaders::hook_inputs;
 use crate::shaders::tonemap::{self, TonemapConstants};
 use crate::{
     AutoExposure, ChainImages, CompensationCurve, DepthOfFieldPass, DistortionField,
-    DofGuideImages, DofPath, Exposure, ExposureTelemetry, Gt7Curve, HookInputs, Hooks,
-    MeterWeights, MotionBlurPass, OutputDebug, Primaries, ResolvedDisplay, Result, Screenshot,
-    SkyTelemetry, ViewOutput,
+    DofGuideImages, DofPath, Exposure, ExposureTelemetry, GlareComposite, GlarePass, Gt7Curve,
+    HookInputs, Hooks, MeterWeights, MotionBlurPass, OutputDebug, Primaries, ResolvedDisplay,
+    Result, Screenshot, SkyTelemetry, ViewOutput,
 };
 
 /// Output's compute pipelines on one device.
@@ -34,6 +35,7 @@ pub struct OutputKernels {
     adapt: ComputePipeline,
     motion_blur: MotionBlurKernels,
     dof: DofKernels,
+    glare: GlareKernels,
     tonemap: ComputePipeline,
     compose: ComposeKernel,
     scene_referred: ComputePipeline,
@@ -54,11 +56,14 @@ const CAPTURE_ROOT: u64 = 1536;
 const SCENE_CAPTURE_ROOT: u64 = 1792;
 const MOTION_BLUR_ROOT: u64 = 2048;
 const DOF_ROOT: u64 = 2304;
-const COMPENSATION: u64 = 2560;
+const GLARE_ROOTS: u64 = 2560;
+const GLARE_ROOT_STRIDE: u64 = 128;
+const COMPENSATION: u64 = GLARE_ROOTS + GLARE_DISPATCHES as u64 * GLARE_ROOT_STRIDE;
 const ZEROS: u64 = COMPENSATION + 4 * COMPENSATION_ENTRIES as u64;
 const UPLOAD_BYTES: u64 = ZEROS + 4 * HISTOGRAM_WORDS;
 const _: () =
-    assert!(size_of::<crate::shaders::post::dof::Root>() as u64 <= COMPENSATION - DOF_ROOT);
+    assert!(size_of::<crate::shaders::post::dof::Root>() as u64 <= GLARE_ROOTS - DOF_ROOT);
+const _: () = assert!(size_of::<crate::shaders::post::glare::Root>() as u64 <= GLARE_ROOT_STRIDE);
 
 /// GPU memory for one view's output passes in one frame. Recording a pass writes its root
 /// here, so reuse it only once the list that last recorded with it has completed; an
@@ -99,14 +104,16 @@ impl OutputRoots {
 
 /// Output's state for one view history: its [`OutputRoots`] per frame in flight, the
 /// exposure telemetry they read back, the screenshots being read back, while the view sets
-/// a hook the hook inputs, while its shutter is open the motion blur tiles, and while its
-/// lens has depth of field that effect's images, history and lens state.
+/// a hook the hook inputs, while its shutter is open the motion blur tiles, while its lens
+/// has depth of field that effect's images, history and lens state, and while it has glare
+/// the glare chain.
 pub struct OutputView {
     frames: Vec<OutputRoots>,
     captures: Vec<Capture>,
     hooks: Option<HookTargets>,
     motion_blur: Option<MotionBlurTargets>,
     dof: Option<DofTargets>,
+    glare: Option<GlareTargets>,
     device: Device,
 }
 
@@ -127,6 +134,7 @@ impl OutputView {
             hooks: None,
             motion_blur: None,
             dof: None,
+            glare: None,
             device: gpu.clone(),
         })
     }
@@ -148,6 +156,17 @@ impl OutputView {
     /// last frame had depth of field on.
     pub fn depth_of_field_bytes(&self) -> u64 {
         self.dof.as_ref().map_or(0, DofTargets::bytes)
+    }
+
+    /// Bytes of the glare chain held for the view: 0 unless its last frame had glare.
+    pub fn glare_bytes(&self) -> u64 {
+        self.glare.as_ref().map_or(0, GlareTargets::bytes)
+    }
+
+    /// The glare chain (RGBA16F, from 1/2 or 1/4 of the extent), while the view's
+    /// lens has glare: mip 0 holds the weighted band sum the tonemap composites.
+    pub fn glare(&self) -> Option<&Texture> {
+        self.glare.as_ref().map(GlareTargets::texture)
     }
 
     /// The images RR reads on the guide path, while the view's depth of field runs there.
@@ -292,6 +311,9 @@ pub struct TonemapPass<'a> {
     /// With a `display_linear` hook, the chain's other image ([`ChainImages::rr_output_store`]),
     /// which tonemap writes too as the hook's source.
     pub hook_source: Option<StorageImageIndex>,
+    /// The view's glare, composited into the exposed radiance before white balance and the
+    /// grade.
+    pub glare: Option<GlareComposite>,
 }
 
 /// What compose reads.
@@ -411,6 +433,7 @@ impl OutputKernels {
             adapt: pipeline(&adapt::MODULE, "adapt")?,
             motion_blur: MotionBlurKernels::new(gpu)?,
             dof: DofKernels::new(gpu)?,
+            glare: GlareKernels::new(gpu)?,
             tonemap: pipeline(&tonemap::MODULE, "tonemap")?,
             compose: ComposeKernel::new(gpu)?,
             scene_referred: gpu.create_compute_pipeline(
@@ -698,6 +721,46 @@ impl OutputKernels {
         Ok(Some(dof))
     }
 
+    /// Records the `glare` pass when the lens has glare: the band pyramid of `pass.source`
+    /// at the adapted exposure, and this frame's band weights, which the tonemap composites
+    /// from the returned [`GlareComposite`]. Allocates the view's chain on the first frame
+    /// with glare and frees it on the first without, which records nothing; an extent too
+    /// small for two levels records nothing either. Order the source's and the adapt pass's
+    /// writes before it with a barrier; it ends with a barrier, so tonemap may follow
+    /// directly.
+    pub fn glare(
+        &self,
+        list: &mut CommandList<'_>,
+        view: &mut OutputView,
+        pass: &GlarePass<'_>,
+    ) -> Result<Option<GlareComposite>> {
+        let first_level = pass.output.post.glare_first_level.clamp(1, 2);
+        let Some(glare) = pass
+            .glare
+            .filter(|_| levels(pass.extent, first_level).len() >= 2)
+        else {
+            view.glare = None;
+            return Ok(None);
+        };
+        let targets = match &mut view.glare {
+            Some(t) if t.fits(pass.extent, first_level) => t,
+            slot => slot.insert(GlareTargets::new(&view.device, pass.extent, first_level)?),
+        };
+        if std::mem::take(&mut targets.fresh) {
+            list.discard(targets.texture());
+        }
+        let roots = self.glare.roots(targets, pass, &glare);
+        let n = view.frames.len() as u64;
+        let frame = &mut view.frames[(pass.frame % n) as usize];
+        let at: Vec<_> = roots
+            .iter()
+            .enumerate()
+            .map(|(i, r)| frame.put(GLARE_ROOTS + i as u64 * GLARE_ROOT_STRIDE, r))
+            .collect();
+        self.glare.record(list, targets, &at);
+        Ok(Some(targets.composite()))
+    }
+
     /// Records the tonemap pass. Order its source's and the adapt pass's writes before it
     /// with a barrier.
     pub fn tonemap(
@@ -734,9 +797,12 @@ impl OutputKernels {
             constants: roots.put(TONEMAP_CONSTANTS, &constants),
             view: pass.view,
             white_balance: roots.white_balance.gpu.cast(),
+            glare_weights: pass.glare.map_or(GpuPtr::NULL, |g| g.weights),
             source: pass.source,
             target: pass.target,
             hook_source: pass.hook_source.unwrap_or(StorageImageIndex::NONE),
+            glare: pass.glare.map_or(TextureIndex::NONE, |g| g.chain),
+            linear: self.glare.linear,
             width: pass.extent[0],
             height: pass.extent[1],
             _pad: 0,

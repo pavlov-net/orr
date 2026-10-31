@@ -18,4 +18,11 @@ fn main() {
     if let Err(e) = out {
         panic!("{e}");
     }
+    // orr-output's glare PSF data and CPU pyramid model, which the glare tests include.
+    for (dep, var) in [
+        ("DEP_ORR_OUTPUT_GLARE_PSF", "ORR_GLARE_PSF"),
+        ("DEP_ORR_OUTPUT_GLARE_MODEL", "ORR_GLARE_MODEL"),
+    ] {
+        println!("cargo:rustc-env={var}={}", env::var(dep).unwrap());
+    }
 }

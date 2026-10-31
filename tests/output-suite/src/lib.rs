@@ -3,17 +3,17 @@
 
 use half::f16;
 use orr_output::{
-    CapturePass, ComposeSource, DisplayRequest, ExposurePass, ExposureTelemetry, OutputFormat,
-    OutputKernels, OutputView, ResolvedDisplay, SceneCapturePass, Screenshot, ScreenshotRequest,
-    TonemapPass, ViewOutput,
+    CapturePass, ComposeSource, DisplayRequest, ExposurePass, ExposureTelemetry, GlareComposite,
+    GlarePass, OutputFormat, OutputKernels, OutputView, ResolvedDisplay, SceneCapturePass,
+    Screenshot, ScreenshotRequest, TonemapPass, ViewOutput,
 };
 use orr_scene::orr_gpu::{
     Allocation, ComputePipeline, Format, GpuPtr, Hazards, MemoryKind, QueueKind, ShaderStage,
     SpecData, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
     TextureRegion, TextureUsage, ViewDesc,
 };
-use orr_scene::testing::{device, read_texture, wait};
-use orr_scene::{ExposureState, SkyStats, ViewConstants};
+use orr_scene::testing::{device, read_buffer, read_texture, wait};
+use orr_scene::{ExposureState, Glare, SkyStats, ViewConstants};
 
 pub mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
@@ -23,8 +23,8 @@ use shaders::synth;
 
 /// One view rendered frame by frame: its exposure slots and view constants, a radiance
 /// image lit from per-pixel luminance with the current pre-exposure (`synth.slang`), the
-/// exposure passes and, on request, tonemap into an RGBA16F display-linear image and the
-/// view's screenshot, recorded where a renderer records them. Every frame is waited on.
+/// exposure passes and, on request, glare, tonemap into an RGBA16F display-linear image and
+/// the view's screenshot, recorded where a renderer records them. Every frame is waited on.
 pub struct Harness {
     kernels: OutputKernels,
     synth: ComputePipeline,
@@ -48,6 +48,10 @@ pub struct Harness {
     pub dt: f32,
     /// Linear Rec.2020 colour the luminance multiplies; grey by default.
     pub colour: [f32; 3],
+    /// The lens's glare, run before tonemap; off by default.
+    pub glare: Option<Glare>,
+    pub sensor_width_mm: f32,
+    composite: Option<GlareComposite>,
 }
 
 impl Harness {
@@ -119,6 +123,9 @@ impl Harness {
             frame: 0,
             dt: 1.0 / 30.0,
             colour: [1.0; 3],
+            glare: None,
+            sensor_width_mm: 36.0,
+            composite: None,
         }
     }
 
@@ -225,6 +232,24 @@ impl Harness {
             },
         );
         if let Some(display) = display {
+            self.composite = self
+                .kernels
+                .glare(
+                    &mut list,
+                    &mut self.output,
+                    &GlarePass {
+                        source: self.radiance_index,
+                        extent: self.extent,
+                        view,
+                        sensor_width_mm: self.sensor_width_mm,
+                        glare: self.glare,
+                        display,
+                        frame: self.frame,
+                        output,
+                    },
+                )
+                .unwrap();
+            let roots = self.output.roots(self.frame);
             self.kernels.tonemap(
                 &mut list,
                 roots,
@@ -236,6 +261,7 @@ impl Harness {
                     display,
                     output,
                     hook_source: None,
+                    glare: self.composite,
                 },
             );
             if let Some(ScreenshotRequest::Display { .. }) = output.screenshot {
@@ -269,6 +295,16 @@ impl Harness {
     /// The last frame's radiance image, RGBA.
     pub fn radiance(&self) -> Vec<[f32; 4]> {
         read_rgba16f(&self.radiance)
+    }
+
+    /// The last frame's glare weights (`GlareComposite::weights`), if it ran glare.
+    pub fn glare_weights(&self) -> Option<Vec<[f32; 4]>> {
+        self.composite.map(|c| read_buffer(c.weights, 9))
+    }
+
+    /// The view's output state.
+    pub fn output(&self) -> &OutputView {
+        &self.output
     }
 
     /// The last tonemapped frame's display-linear image, RGBA.

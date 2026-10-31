@@ -32,6 +32,8 @@ pub struct PostQuality {
     /// Rings of the half-resolution depth-of-field gathers; ring k holds 8k samples.
     pub dof_rings: u32,
     pub dof_path: DofPath,
+    /// Halvings to the glare pyramid's first level: 1 (half resolution) or 2.
+    pub glare_first_level: u32,
 }
 
 impl Default for PostQuality {
@@ -40,6 +42,7 @@ impl Default for PostQuality {
             motion_blur_samples: 35,
             dof_rings: 5,
             dof_path: DofPath::AfterRr,
+            glare_first_level: 1,
         }
     }
 }

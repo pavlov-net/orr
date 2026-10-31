@@ -683,6 +683,7 @@ impl<'a> Frame<'a> {
                 display: &resolved,
                 output,
                 hook_source: set.display_linear.then_some(radiance_store),
+                glare: None,
             },
         );
         list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
@@ -806,6 +807,7 @@ impl<'a> Frame<'a> {
                 display: &frame.display,
                 output: &view_output,
                 hook_source: None,
+                glare: None,
             },
         );
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());

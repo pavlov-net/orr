@@ -27,7 +27,7 @@ pub use locate::SLANG_VERSION;
 pub use reload::{Reload, Watcher};
 pub use toolchain::SLANGC_OPTIONS;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{env, io};
 
 /// A build failure.
@@ -50,6 +50,18 @@ pub enum Error {
         searched_from.display()
     )]
     OpenPbrNotFound { searched_from: PathBuf },
+    /// A fetched tool or data file is in neither its `ORR_<ITEM>` variable, `ORR_TOOLS` nor
+    /// a `.tools` directory above the crate.
+    #[error(
+        "{} not found: set {var}, or run tools/fetch-slang.sh to put it in .tools (ORR_TOOLS, or the nearest .tools in or above {})",
+        relative.display(),
+        searched_from.display()
+    )]
+    NotFetched {
+        var: String,
+        relative: PathBuf,
+        searched_from: PathBuf,
+    },
     /// The release's Slang library could not be loaded.
     #[error("cannot load the Slang library at {}: {source}", path.display())]
     LibraryLoad {
@@ -119,6 +131,39 @@ pub fn openpbr_dir() -> Result<PathBuf, Error> {
     locate::find_openpbr(env::var_os("ORR_OPENPBR_BSDF"), &start).ok_or(Error::OpenPbrNotFound {
         searched_from: start,
     })
+}
+
+/// A tool or data file that `tools/fetch-slang.sh` fetches: the path in `var` (`ORR_<ITEM>`)
+/// when set, else `relative` under `ORR_TOOLS`, else under the nearest `.tools` in or above
+/// `CARGO_MANIFEST_DIR`. Prints the `rerun-if` lines for the variables and the path found.
+#[allow(clippy::print_stdout)]
+pub fn fetched(var: &str, relative: impl AsRef<Path>) -> Result<PathBuf, Error> {
+    let relative = relative.as_ref();
+    println!("cargo:rerun-if-env-changed={var}");
+    println!("cargo:rerun-if-env-changed=ORR_TOOLS");
+    let start = env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .ok_or(Error::NoManifestDir)?;
+    let set = |name: &str| {
+        env::var_os(name)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    let found = match (set(var), set("ORR_TOOLS")) {
+        (Some(path), _) => Some(path).filter(|p| p.exists()),
+        (None, Some(tools)) => Some(tools.join(relative)).filter(|p| p.exists()),
+        (None, None) => start
+            .ancestors()
+            .map(|d| d.join(".tools").join(relative))
+            .find(|p| p.exists()),
+    };
+    let path = found.ok_or_else(|| Error::NotFetched {
+        var: var.to_owned(),
+        relative: relative.to_owned(),
+        searched_from: start,
+    })?;
+    println!("cargo:rerun-if-changed={}", path.display());
+    Ok(path)
 }
 
 fn lint_lines(lints: &[LintError]) -> String {
