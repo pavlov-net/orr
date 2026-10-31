@@ -1,6 +1,10 @@
 //! `orr_pack.mesh` on the GPU reads what `orr_pack::mesh::PageView` reads from the same
-//! `decode_page` output: synthetic pages at every attribute layout with micromap indices,
-//! and every page of a cooked mesh.
+//! `decode_page` output, and `orr_pack.page_codec` on the loading queue writes what
+//! `decode_page` writes and rejects what it rejects: synthetic pages at every attribute
+//! layout with micromap indices, every page of a cooked mesh, damaged pages, and with
+//! `ORR_COOKED_SET` every page of a set of cooked archives.
+
+use std::path::PathBuf;
 
 use glam::{Vec2, Vec3, Vec4};
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshParts, MeshSettings};
@@ -10,7 +14,7 @@ use orr_pack::mesh::{self, Cluster, MeshHeader, MeshInfo, PageHeader, PageView};
 use orr_pack::{Archive, AssetId, Span, Target};
 use orr_scene::testing::{assert_clean, device};
 use pack_suite::shaders::page::{self, TriangleOut, VertexOut};
-use pack_suite::{dispatch, read};
+use pack_suite::{UNWRITTEN, cooked_set_pages, decode_stored, dispatch, read, stored_pages};
 
 /// Slots per cluster in the kernel's outputs: the most vertices and triangles a cluster has.
 const SLOTS: usize = 256;
@@ -335,8 +339,8 @@ fn wavy(n: u32) -> MeshInput {
     m
 }
 
-#[test]
-fn cooked_mesh_pages_load_alike() {
+/// The wavy grid cooked at two discrete levels and a merged one, as mesh "m".
+fn cooked_wavy() -> Archive {
     let input = wavy(64);
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(
@@ -361,7 +365,12 @@ fn cooked_mesh_pages_load_alike() {
         .unwrap()
         .memory
         .remove(0);
-    let a = Archive::from_memory(bytes).unwrap();
+    Archive::from_memory(bytes).unwrap()
+}
+
+#[test]
+fn cooked_mesh_pages_load_alike() {
+    let a = cooked_wavy();
     let e = a.find(AssetId::from_name("m/mesh")).unwrap();
     let blobs = a.blobs(e);
     let info = MeshInfo::parse(&read(&a, &blobs[0])).unwrap();
@@ -374,4 +383,116 @@ fn cooked_mesh_pages_load_alike() {
         check(&page, &info.header, &mut spread);
     }
     spread.assert_within();
+}
+
+/// Decodes `stored` on the GPU and the CPU: a page the CPU rejects sets status bits, and an
+/// accepted one comes out byte for byte alike with nothing written past its length. Returns
+/// how many pages the CPU accepted.
+fn check_decode(stored: &[Vec<u8>]) -> usize {
+    let gpu = decode_stored(stored);
+    let mut accepted = 0;
+    for (i, ((p, status), got)) in stored
+        .iter()
+        .zip(&gpu.status)
+        .zip(&gpu.resident)
+        .enumerate()
+    {
+        let mut cpu = vec![UNWRITTEN; mesh::PAGE_MAX];
+        match mesh::decode_page(p, &mut cpu) {
+            Ok(layout) => {
+                assert_eq!(*status, 0, "page {i}: the CPU accepts it");
+                let len = layout.len as usize;
+                let wrong = (0..len).filter(|&b| got[b] != cpu[b]).count();
+                assert_eq!(wrong, 0, "page {i}: {wrong} of {len} bytes differ");
+                assert!(
+                    got[len..].iter().all(|&b| b == UNWRITTEN),
+                    "page {i}: written past its length"
+                );
+                accepted += 1;
+            }
+            Err(e) => assert_ne!(*status, 0, "page {i}: the CPU rejects it ({e})"),
+        }
+    }
+    assert_clean();
+    accepted
+}
+
+#[test]
+fn synthetic_pages_decode_alike_on_the_gpu() {
+    let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+    let mut stored = Vec::new();
+    for attributes in [
+        0,
+        MeshHeader::TANGENT,
+        MeshHeader::SKIN,
+        MeshHeader::TANGENT | MeshHeader::SKIN,
+    ] {
+        for entries in [0, 23] {
+            let stride = mesh::attr_stride(attributes) as usize;
+            let p = synthetic(&mut rng, 24, stride, entries);
+            stored.push(mesh::encode_page(&p).unwrap());
+        }
+    }
+    assert_eq!(check_decode(&stored), stored.len());
+}
+
+#[test]
+fn cooked_mesh_pages_decode_alike_on_the_gpu() {
+    let a = cooked_wavy();
+    let stored = stored_pages(&a, a.find(AssetId::from_name("m/mesh")).unwrap());
+    assert_eq!(check_decode(&stored), stored.len());
+}
+
+/// Single-bit changes anywhere in stored pages, most in the stream table and the streams,
+/// some with the page cut short: the GPU rejects what the CPU rejects and decodes the rest
+/// alike.
+#[test]
+fn damaged_pages_are_rejected_alike_on_the_gpu() {
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let mut stored = Vec::new();
+    for attributes in [0, MeshHeader::TANGENT | MeshHeader::SKIN] {
+        let stride = mesh::attr_stride(attributes) as usize;
+        let p = synthetic(&mut rng, 6, stride, 5);
+        let good = mesh::encode_page(&p).unwrap();
+        let h: PageHeader = bytemuck::pod_read_unaligned(&good[..size_of::<PageHeader>()]);
+        let streams = h.positions_offset as usize;
+        for k in 0..192 {
+            let mut bad = good.clone();
+            let at = if k % 8 == 0 {
+                rng.below(streams)
+            } else {
+                streams + rng.below(good.len() - streams)
+            };
+            bad[at] ^= 1 << rng.below(8);
+            if k % 16 == 1 {
+                bad.truncate(good.len() - 1 - rng.below(8));
+            }
+            stored.push(bad);
+        }
+    }
+    let accepted = check_decode(&stored);
+    assert!(
+        accepted > 0 && accepted < stored.len(),
+        "{accepted} of {} accepted",
+        stored.len()
+    );
+}
+
+/// `ORR_COOKED_SET=<dir>`: every mesh page of every `.orr` archive under `dir` decodes on
+/// the GPU byte for byte as on the CPU.
+#[test]
+#[ignore = "needs ORR_COOKED_SET"]
+fn cooked_set_pages_decode_alike_on_the_gpu() {
+    let dir = PathBuf::from(std::env::var("ORR_COOKED_SET").expect("ORR_COOKED_SET"));
+    let set = cooked_set_pages(&dir);
+    assert!(
+        set.iter().any(|(_, pages)| !pages.is_empty()),
+        "no mesh pages under {}",
+        dir.display()
+    );
+    for (path, pages) in &set {
+        for chunk in pages.chunks(64) {
+            assert_eq!(check_decode(chunk), chunk.len(), "{}", path.display());
+        }
+    }
 }

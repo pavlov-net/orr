@@ -372,6 +372,18 @@ fn exp2(k: i8) -> f32 {
     f32::from_bits(((i32::from(k) + 127) as u32) << 23)
 }
 
+/// One page for `orr_pack/page_codec.slang`, which decodes a stored page on the GPU into the
+/// bytes [`decode_page`] writes. Addresses are device addresses, both 4-aligned;
+/// `resident_capacity` is the bytes the page may take at `resident`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Pod, Zeroable)]
+pub struct StoredPage {
+    pub stored: u64,
+    pub resident: u64,
+    pub stored_len: u32,
+    pub resident_capacity: u32,
+}
+
 /// Where the regions of a resident page lie.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PageLayout {
@@ -410,7 +422,10 @@ fn layout(h: &PageHeader) -> Result<(usize, usize)> {
         && h.omm_offset >= h.tris_offset
         && h.len >= h.omm_offset
         && h.len as usize <= PAGE_MAX;
-    if !regions_ordered || h.attr_stride < 8 || !h.attr_stride.is_multiple_of(4) {
+    let aligned = h.attr_stride.is_multiple_of(4)
+        && h.attrs_offset.is_multiple_of(4)
+        && h.omm_offset.is_multiple_of(4);
+    if !regions_ordered || h.attr_stride < 8 || !aligned {
         return bad("page regions");
     }
     let slots = (h.attrs_offset - h.positions_offset) as usize / 6;
@@ -422,11 +437,21 @@ fn layout(h: &PageHeader) -> Result<(usize, usize)> {
     Ok((slots, (h.omm_offset - h.tris_offset) as usize))
 }
 
-fn check_cluster(c: &Cluster, slots: usize, tris_len: usize) -> Result<()> {
+/// Checks cluster `c`'s ranges against the page and against `prev`, the cluster before it:
+/// clusters take their vertex slots and triangle bytes in order, so no two overlap.
+fn check_cluster(c: &Cluster, prev: Option<&Cluster>, slots: usize, tris_len: usize) -> Result<()> {
     let (v0, vn) = (c.vertex_first as usize, usize::from(c.vertex_count));
     let (t0, tn) = (c.tri_first as usize, usize::from(c.tri_count));
     if !v0.is_multiple_of(2) || v0 + vn > slots || !t0.is_multiple_of(4) || t0 + tn * 3 > tris_len {
         return Err(Error::Malformed("cluster outside its page"));
+    }
+    if let Some(p) = prev {
+        let vertices_end =
+            p.vertex_first as usize + usize::from(p.vertex_count).next_multiple_of(2);
+        let tris_end = p.tri_first as usize + (usize::from(p.tri_count) * 3).next_multiple_of(4);
+        if v0 < vertices_end || t0 < tris_end {
+            return Err(Error::Malformed("clusters overlap"));
+        }
     }
     if c.alpha_first > c.tri_count {
         return Err(Error::Malformed("cluster alpha_first"));
@@ -443,9 +468,11 @@ fn check_page(p: &[u8]) -> Result<PageHeader> {
     if h.len as usize != p.len() {
         return Err(Error::Malformed("page regions"));
     }
+    let mut prev = None;
     for i in 0..h.cluster_count as usize {
         let c: Cluster = read(p, size_of::<PageHeader>() + i * size_of::<Cluster>()).unwrap();
-        check_cluster(&c, slots, tris_len)?;
+        check_cluster(&c, prev.as_ref(), slots, tris_len)?;
+        prev = Some(c);
         let vn = usize::from(c.vertex_count);
         let tris = &p[(h.tris_offset + c.tri_first) as usize..][..usize::from(c.tri_count) * 3];
         if tris.iter().any(|&v| usize::from(v) >= vn) {

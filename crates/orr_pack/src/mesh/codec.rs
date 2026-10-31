@@ -14,6 +14,9 @@
 //! A vertex stream holds `vertex_count` vertices of `8 + attr_stride` bytes: the three u16
 //! grid offsets, a zero u16, then the vertex's attributes. The vertex codec is version 1,
 //! encoded at level 3. A triangle stream is the meshlet codec over triangles only.
+//!
+//! Every region of a page starts 4-aligned. `orr_pack/page_codec.slang` decodes the same
+//! form on the GPU and accepts exactly the pages [`decode_page`] accepts.
 
 use meshopt::ffi;
 
@@ -23,6 +26,9 @@ use crate::{Error, Result};
 
 const VERTEX_CODEC_VERSION: i32 = 1;
 const VERTEX_CODEC_LEVEL: i32 = 3;
+/// First byte of a vertex stream: the codec's 0xA0 and its version. Other versions are
+/// rejected.
+const VERTEX_CODEC_HEADER: u8 = 0xA0 | VERTEX_CODEC_VERSION as u8;
 const MAX_VERTICES: usize = 256;
 const MAX_VERTEX_BYTES: usize = 8 + 20;
 
@@ -137,7 +143,8 @@ pub fn decode_page(stored: &[u8], dst: &mut [u8]) -> Result<PageLayout> {
     let mut tris = [0u8; 256 * 3];
     for i in 0..n {
         let c = cluster(stored, i);
-        check_cluster(&c, slots, tris_len)?;
+        let prev = i.checked_sub(1).map(|p| cluster(stored, p));
+        check_cluster(&c, prev.as_ref(), slots, tris_len)?;
         let (v0, vn) = (c.vertex_first as usize, usize::from(c.vertex_count));
         let tn = usize::from(c.tri_count);
         let (a, b, e) = (
@@ -148,6 +155,9 @@ pub fn decode_page(stored: &[u8], dst: &mut [u8]) -> Result<PageLayout> {
         if !(a <= b && b <= e && e <= streams_end) || vn > MAX_VERTICES || stride > MAX_VERTEX_BYTES
         {
             return bad("cluster streams");
+        }
+        if a == b || stored[a] != VERTEX_CODEC_HEADER {
+            return bad("cluster vertex stream");
         }
         // SAFETY: `vertices` holds MAX_VERTICES vertices of up to MAX_VERTEX_BYTES, and the
         // decoder reads only the `b - a` bytes of the stream; it is safe on any input.
