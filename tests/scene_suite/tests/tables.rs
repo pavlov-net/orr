@@ -169,7 +169,7 @@ fn instance_and_material_tables_read_back_as_written() {
                 candidate_class: 0,
                 pose_variants: 4,
                 pose_stride: 4,
-                _pad: 0,
+                debug_lod: 0,
                 user_tag: 77,
                 variant,
             }
@@ -188,7 +188,7 @@ fn instance_and_material_tables_read_back_as_written() {
                 candidate_class: 0,
                 pose_variants: 0,
                 pose_stride: 0,
-                _pad: 0,
+                debug_lod: 0,
                 user_tag: 3,
                 variant,
             }

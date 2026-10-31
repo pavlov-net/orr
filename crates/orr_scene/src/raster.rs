@@ -1,6 +1,7 @@
-//! A view's raster half: instance and cluster culling, the mesh-shader and software raster
-//! into the visibility buffer, the material resolve per surface bin into the G-buffer and
-//! motion, the HZB, and the depth target.
+//! A view's raster half: instance and cluster culling over the scene's raster candidate
+//! cut, the mesh-shader and software raster into the visibility buffer, both in two passes
+//! around an HZB of the first, the material resolve per surface bin into the G-buffer and
+//! motion, the final HZB, and the depth target.
 
 use std::sync::Arc;
 
@@ -15,12 +16,15 @@ use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::shaders::{cull, hzb, raster, resolve};
 use crate::{
-    ClusterWork, GBufferGpu, RasterGpu, RasterRoot, Result, SceneRoot, ViewConstants,
+    ClusterWork, GBufferGpu, RasterGpu, RasterRoot, Result, SceneId, SceneRoot, ViewConstants,
     VisibleCluster,
 };
 
+/// `RasterGpu.flags` (`visibility.slang`).
+const RASTER_OCCLUSION: u32 = 1;
+
 /// `RasterGpu.counts` entries and `RasterGpu.args` offsets (`visibility.slang`).
-const COUNTS: u64 = 9;
+const COUNTS: u64 = 16;
 const COUNT_DRAWS: u64 = 3;
 const ARGS: u64 = 15;
 const ARGS_WORK: u64 = 0;
@@ -44,6 +48,7 @@ pub(crate) struct RasterPipelines {
     software: PipelineId,
     classify: PipelineId,
     resolve: PipelineId,
+    seed: PipelineId,
     reduce: PipelineId,
     depth: MeshPipeline,
     /// Surface bins: linked surfaces plus `StandardSurface`.
@@ -84,6 +89,7 @@ impl RasterPipelines {
             software: compute(&raster::MODULE, "software")?,
             classify: compute(&resolve::MODULE, "classify")?,
             resolve: compute(&resolve::MODULE, "resolve")?,
+            seed: compute(&hzb::MODULE, "seed")?,
             reduce: compute(&hzb::MODULE, "reduce")?,
             depth: mesh(
                 "fullscreen",
@@ -159,6 +165,8 @@ pub(crate) struct TargetSizes {
     pub visible_clusters: u32,
     pub work: u32,
     pub bins: u32,
+    /// The scene's instance slots.
+    pub slots: u32,
 }
 
 /// One view history's raster targets, kept while its extent and sizes hold.
@@ -171,6 +179,7 @@ pub(crate) struct ViewTargets {
     alpha: Allocation<u32>,
     software: Allocation<u32>,
     particles: Allocation<u32>,
+    slot_visibility: Allocation<u32>,
     /// Workgroup args (`ARGS`), then counts.
     args: Allocation<u32>,
     bin_args: Allocation<u32>,
@@ -184,6 +193,8 @@ pub(crate) struct ViewTargets {
     pub hzb: Target,
     /// The transparency point's overlay, made at the first transparency pass.
     pub overlay: Option<Target>,
+    /// The scene the HZB holds the last render of.
+    pub hzb_scene: Option<SceneId>,
 }
 
 fn tiles(extent: [u32; 2]) -> [u32; 2] {
@@ -233,6 +244,7 @@ impl ViewTargets {
             alpha: device.gpu_malloc(dl, u64::from(s.visible_clusters), "alpha clusters")?,
             software: device.gpu_malloc(dl, u64::from(s.visible_clusters), "software clusters")?,
             particles: device.gpu_malloc(dl, u64::from(s.visible_clusters), "particle clusters")?,
+            slot_visibility: device.gpu_malloc(dl, u64::from(s.slots.max(1)), "slot visibility")?,
             args: device.gpu_malloc(dl, ARGS + COUNTS, "raster args")?,
             bin_args: device.gpu_malloc(dl, 3 * u64::from(s.bins), "bin args")?,
             bin_tiles: device.gpu_malloc(
@@ -250,6 +262,7 @@ impl ViewTargets {
             motion: Target::d2(device, Format::Rg16Float, s.extent, "motion")?,
             hzb,
             overlay: None,
+            hzb_scene: None,
         };
         for target in [&t.depth, &t.a, &t.b, &t.motion, &t.hzb]
             .into_iter()
@@ -276,7 +289,7 @@ impl ViewTargets {
         }
     }
 
-    fn record(&self, error_pixels: f32, software_pixels: f32) -> RasterGpu {
+    fn record(&self, software_pixels: f32, occlusion: bool, slots: u32) -> RasterGpu {
         let [tx, ty] = tiles(self.sizes.extent);
         let mut hzb = [StorageImageIndex::NONE; MAX_HZB_MIPS as usize];
         hzb[..self.hzb.storage.len()].copy_from_slice(&self.hzb.storage);
@@ -289,6 +302,7 @@ impl ViewTargets {
             software: self.software.gpu,
             particles: self.particles.gpu,
             counts: self.counts(),
+            slot_visibility: self.slot_visibility.gpu,
             bin_args: self.bin_args.gpu,
             bin_tiles: self.bin_tiles.gpu,
             depth: self.depth_values.gpu,
@@ -305,8 +319,10 @@ impl ViewTargets {
             work_capacity: self.sizes.work,
             visible_capacity: self.sizes.visible_clusters,
             bins: self.sizes.bins,
-            error_pixels,
             software_pixels,
+            flags: if occlusion { RASTER_OCCLUSION } else { 0 },
+            slots,
+            hzb_mips: self.hzb.storage.len() as u32,
             _pad: 0,
         }
     }
@@ -336,14 +352,14 @@ impl ViewTargets {
         )
     }
 
-    /// `RasterGpu.counts`: visible clusters, visible clusters dropped, work dropped, 1, work
-    /// asked for, hardware opaque and alpha draws, software clusters, particle clusters.
+    /// `RasterGpu.counts` ([`crate::RasterView::counts`]).
     pub(crate) fn counts(&self) -> GpuPtr<u32> {
         self.args.gpu.offset(ARGS)
     }
 }
 
-/// Records one view's raster half into `list`.
+/// Records one view's raster half into `list`. With `occlusion` the first pass tests the
+/// previous frame's HZB, which the view's previous render left.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record(
     device: &Device,
@@ -353,13 +369,13 @@ pub(crate) fn record(
     list: &mut CommandList<'_>,
     targets: &ViewTargets,
     scene: GpuPtr<SceneRoot>,
-    instance_capacity: u32,
+    slots: u32,
     producer_capacity: u32,
     view: GpuPtr<ViewConstants>,
-    error_pixels: f32,
     software_pixels: f32,
+    occlusion: bool,
 ) -> Result<GpuPtr<RasterGpu>> {
-    let raster = window.put(device, &targets.record(error_pixels, software_pixels))?;
+    let raster = window.put(device, &targets.record(software_pixels, occlusion, slots))?;
     let root = |value: u32| {
         window.put_root(
             device,
@@ -387,48 +403,60 @@ pub(crate) fn record(
         depth: None,
     };
 
+    let raster_stages = Stages::MESH | Stages::PIXEL;
+    let culled = |list: &mut CommandList<'_>, pass: GpuPtr<RasterRoot>| {
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        list.dispatch(pipelines.get(p.cap), pass, [1, 1, 1]);
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
+        list.dispatch_indirect(pipelines.get(p.clusters), pass, grid(ARGS_WORK));
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        list.dispatch(pipelines.get(p.raster_args), pass, [1, 1, 1]);
+        list.barrier(
+            Stages::COMPUTE,
+            raster_stages | Stages::COMPUTE,
+            Hazards::DRAW_ARGUMENTS,
+        );
+    };
+    // The software dispatch and the hardware draws share no barrier, so they overlap; both
+    // write the visibility buffer by atomic max.
+    let draw = |list: &mut CommandList<'_>| {
+        list.dispatch_indirect(pipelines.get(p.software), r0, grid(ARGS_SOFTWARE));
+        list.begin_rendering(&rendering);
+        list.draw_mesh_tasks_indirect_count(&p.opaque, r0, mesh_args(ARGS_OPAQUE), draws, 1);
+        list.draw_mesh_tasks_indirect_count(&p.alpha, r1, mesh_args(ARGS_ALPHA), draws, 1);
+        list.end_rendering();
+        list.barrier(
+            raster_stages | Stages::COMPUTE,
+            Stages::COMPUTE,
+            Hazards::empty(),
+        );
+    };
+    let slot_groups = [slots.div_ceil(64).max(1), 1, 1];
+
     list.begin_pass("cull", false);
     let cleared = pixels.max(3 * s.bins).max(COUNTS as u32);
     list.dispatch(pipelines.get(p.clear), r0, [cleared.div_ceil(64), 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-    if instance_capacity > 0 {
-        list.dispatch(
-            pipelines.get(p.instances),
-            r0,
-            [instance_capacity.div_ceil(64), 1, 1],
-        );
-    }
-    list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+    list.dispatch(pipelines.get(p.instances), r0, slot_groups);
     if producer_capacity > 0 {
         list.dispatch(pipelines.get(p.producers), r0, [producer_capacity, 1, 1]);
     }
-    list.dispatch(pipelines.get(p.cap), r0, [1, 1, 1]);
-    list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
-    list.dispatch_indirect(pipelines.get(p.clusters), r0, grid(ARGS_WORK));
-    list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-    list.dispatch(pipelines.get(p.raster_args), r0, [1, 1, 1]);
+    culled(list, r0);
     list.end_pass();
-    let raster_stages = Stages::MESH | Stages::PIXEL;
-    list.barrier(
-        Stages::COMPUTE,
-        raster_stages | Stages::COMPUTE,
-        Hazards::DRAW_ARGUMENTS,
-    );
 
-    // The software dispatch and the hardware draws share no barrier, so they overlap; both
-    // write the visibility buffer by atomic max.
     list.begin_pass("raster", false);
-    list.dispatch_indirect(pipelines.get(p.software), r0, grid(ARGS_SOFTWARE));
-    list.begin_rendering(&rendering);
-    list.draw_mesh_tasks_indirect_count(&p.opaque, r0, mesh_args(ARGS_OPAQUE), draws, 1);
-    list.draw_mesh_tasks_indirect_count(&p.alpha, r1, mesh_args(ARGS_ALPHA), draws, 1);
-    list.end_rendering();
+    draw(list);
     list.end_pass();
-    list.barrier(
-        raster_stages | Stages::COMPUTE,
-        Stages::COMPUTE,
-        Hazards::empty(),
-    );
+
+    // The second pass: what the first found occluded, against an HZB of what it drew.
+    if occlusion {
+        list.begin_pass("occlusion", false);
+        reduce_hzb(list, pipelines, p, targets, &root, Some(r0))?;
+        list.dispatch(pipelines.get(p.instances), r1, slot_groups);
+        culled(list, r1);
+        draw(list);
+        list.end_pass();
+    }
 
     list.begin_pass("resolve", false);
     list.dispatch(pipelines.get(p.classify), r0, [tx * ty, 1, 1]);
@@ -449,16 +477,7 @@ pub(crate) fn record(
     );
 
     list.begin_pass("hzb", false);
-    let [w, h] = s.extent;
-    for mip in 1..targets.hzb.storage.len() as u32 {
-        let size = [(w >> mip).max(1), (h >> mip).max(1)];
-        list.dispatch(
-            pipelines.get(p.reduce),
-            root(mip)?,
-            [size[0].div_ceil(8), size[1].div_ceil(8), 1],
-        );
-        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-    }
+    reduce_hzb(list, pipelines, p, targets, &root, None)?;
     list.end_pass();
 
     list.begin_pass("depth", false);
@@ -476,4 +495,31 @@ pub(crate) fn record(
     list.end_pass();
     list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
     Ok(raster)
+}
+
+/// Builds the HZB's mips from mip 0, after `seed` writes mip 0 from the visibility buffer
+/// when given.
+fn reduce_hzb(
+    list: &mut CommandList<'_>,
+    pipelines: &Pipelines,
+    p: &RasterPipelines,
+    targets: &ViewTargets,
+    root: &dyn Fn(u32) -> Result<GpuPtr<RasterRoot>>,
+    seed: Option<GpuPtr<RasterRoot>>,
+) -> Result<()> {
+    let [w, h] = targets.sizes.extent;
+    if let Some(r) = seed {
+        list.dispatch(pipelines.get(p.seed), r, [w.div_ceil(8), h.div_ceil(8), 1]);
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+    }
+    for mip in 1..targets.hzb.storage.len() as u32 {
+        let size = [(w >> mip).max(1), (h >> mip).max(1)];
+        list.dispatch(
+            pipelines.get(p.reduce),
+            root(mip)?,
+            [size[0].div_ceil(8), size[1].div_ceil(8), 1],
+        );
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+    }
+    Ok(())
 }

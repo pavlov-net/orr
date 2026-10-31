@@ -4,9 +4,11 @@
 //! whose coverage and depth offset give the depth and motion of the shape it stands for,
 //! the software raster against the mesh-shader raster, camera rays through the PTLAS against
 //! the visibility buffer, resolved hits against a CPU decode, hit contexts, `rt_range`,
-//! far-from-origin and rebase invariance, the PTLAS budget, and posed rigid parts in raster
-//! and ray tracing with their motion, hiding, section masks and material sets.
+//! far-from-origin and rebase invariance, the PTLAS budget, posed rigid parts in raster
+//! and ray tracing with their motion, hiding, section masks and material sets, and the DAG
+//! traversal's cuts, two-pass occlusion and `debug_lod`.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
@@ -22,18 +24,18 @@ use orr_gpu::{
     TextureRegion,
 };
 use orr_pack::material::{Material, slot};
-use orr_pack::mesh::{MeshInfo, PageView, decode_page};
+use orr_pack::mesh::{Cluster, Group, MeshInfo, PageView, decode_page};
 use orr_pack::model::ModelInfo;
 use orr_pack::{Archive, AssetId, Entry, Span, Target};
 use orr_scene::testing::{
     Image, Pixels, Tolerance, assert_clean, check, device, flip, read_buffer, read_texture, wait,
 };
 use orr_scene::{
-    Affine3, BoundTexture, CopyVariant, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
-    InstanceRange, InstancesDesc, Lens, LoadState, Loading, MaterialGpu, ModelId, MountId,
-    PackSource, Pose, Projection, RasterView, RendererDesc, SceneDesc, SceneId, Scenes,
-    TransformGroupDesc, TransformGroupId, ViewDesc, ViewHistoryId, ViewTarget, VisibleCluster,
-    material_flags,
+    Affine3, BoundTexture, ClusterWork, CopyVariant, CutGpu, DebugLod, FrameDesc, FrameTime,
+    GroupWriter, InstanceFlags, InstanceRange, InstancesDesc, Lens, LoadState, Loading,
+    MaterialGpu, ModelId, MountId, PackSource, Pose, Projection, RasterView, RendererDesc,
+    SceneDesc, SceneId, SceneRoot, Scenes, SlotCutGpu, TransformGroupDesc, TransformGroupId,
+    ViewDesc, ViewHistoryId, ViewTarget, VisibleCluster, material_flags,
 };
 use scene_suite::shaders::{codec, pose, surface_at, trace};
 use scene_suite::{linked, pipeline};
@@ -902,6 +904,14 @@ fn cook() -> Arc<[u8]> {
                     vec![steady],
                     one(),
                 ),
+                model(
+                    "dag ground",
+                    grid(96, 8.0, 2.0, |x, z| {
+                        0.15 * (x * 1.3).sin() * (z * 0.9).cos()
+                    }),
+                    vec![metal],
+                    LodMode::Dag,
+                ),
             ],
         )],
     };
@@ -1116,7 +1126,7 @@ fn texels<T: bytemuck::Pod>(t: &Texture) -> Vec<T> {
 fn read_back(view: &RasterView) -> Frame {
     let pixels = u64::from(EXTENT[0] * EXTENT[1]);
     let vis: Vec<u64> = read_buffer(view.targets.visibility, pixels);
-    let counts = read_buffer(view.counts, 3);
+    let counts = read_buffer(view.counts, 16);
     let clusters: Vec<VisibleCluster> =
         read_buffer(view.targets.clusters, u64::from(counts[0].max(1)));
     let ids = vis
@@ -1142,8 +1152,12 @@ fn read_back(view: &RasterView) -> Frame {
     }
 }
 
-/// Renders `placed` from a camera at `eye` looking at `target`, with copy transforms
-/// `moved` written this frame, and reads the view back.
+/// The views' pixels per radian at the image center: half the rows over tan(0.45), half
+/// the 0.9 rad vertical field.
+const VIEW_PIXELS_PER_RADIAN: f32 = 0.5 * EXTENT[1] as f32 / 0.483_055_07;
+
+/// Renders `placed` from a camera at `eye` looking at `target`, the scene focus at the eye,
+/// with copy transforms `moved` written this frame, and reads the view back.
 fn render(
     w: &mut World,
     placed: &Placed,
@@ -1162,12 +1176,13 @@ fn render(
             low_latency: None,
         })
         .unwrap();
-    if !moved.is_empty() {
+    {
         let mut s = f.scene(placed.scene).unwrap();
+        s.set_focus(eye.as_dvec3(), VIEW_PIXELS_PER_RADIAN);
         for (i, c) in moved.iter().enumerate() {
             s.transforms(placed.group, i as u32, 1).unwrap()[0] = affine(c.linear, c.at);
         }
-        assert_eq!(moved.len() as u32, placed.count);
+        assert!(moved.is_empty() || moved.len() as u32 == placed.count);
     }
     let view = f
         .raster_view(&ViewDesc {
@@ -1257,7 +1272,7 @@ fn each_gbuffer_channel_matches_its_reference() {
         1,
     );
     let g = render(&mut w, &placed, eye, target, &[], false, 2);
-    assert_eq!(g.counts[1..], [0, 0], "nothing dropped");
+    assert_eq!(g.counts[1..3], [0, 0], "nothing dropped");
     assert!(g.x.is_some(), "the coat needs the extended target");
     let x = g.x.as_ref().unwrap();
     let flip = Tolerance::Flip {
@@ -1786,6 +1801,9 @@ fn software_and_hardware_raster_draw_the_same_visibility_buffer() {
                         low_latency: None,
                     })
                     .unwrap();
+                f.scene(placed.scene)
+                    .unwrap()
+                    .set_focus(eye.as_dvec3(), VIEW_PIXELS_PER_RADIAN);
                 let view = f
                     .raster_view(&ViewDesc {
                         scene: placed.scene,
@@ -2046,6 +2064,7 @@ fn crowd() -> Vec<Item> {
 fn finest_world() -> World {
     World::with(&RendererDesc {
         raster_error_pixels: 1e-3,
+        rt_error_pixels: 1e-3,
         ..RendererDesc::default()
     })
 }
@@ -2086,6 +2105,7 @@ struct CpuMesh {
     header: orr_pack::mesh::MeshHeader,
     pages: Vec<Vec<u8>>,
     firsts: Vec<u32>,
+    groups: Vec<Group>,
 }
 
 fn blob(a: &Archive, e: &Entry, i: usize) -> Vec<u8> {
@@ -2119,6 +2139,7 @@ impl CpuMesh {
             header: mi.header,
             pages,
             firsts,
+            groups: mi.groups,
         }
     }
 
@@ -2509,7 +2530,7 @@ fn motion_vectors_do_not_change_when_the_render_origin_moves() {
                 frame: i,
             };
             let g = shoot(&mut w, &placed, &shot);
-            let root: Vec<orr_scene::SceneRoot> = read_buffer(g.view.scene, 1);
+            let root: Vec<SceneRoot> = read_buffer(g.view.scene, 1);
             origins.push(root[0].origin_cell[0]);
             motion.push(g.motion);
         }
@@ -3290,5 +3311,445 @@ fn rewriting_a_material_set_changes_only_the_copies_that_name_it() {
         "copy 1 is green: {:?}",
         before[1]
     );
+    assert_clean();
+}
+
+// --- The DAG traversal, two-pass occlusion and debug_lod --------------------------------------
+
+/// What a cut needs of one mesh cluster: its record and, in DAG mode, its group's depth and
+/// error.
+struct CutCluster {
+    cluster: Cluster,
+    depth: u8,
+    group_error: f32,
+}
+
+impl CpuMesh {
+    /// Every cluster by mesh cluster index.
+    fn clusters(&self) -> Vec<CutCluster> {
+        let mut out: Vec<CutCluster> = self
+            .pages
+            .iter()
+            .flat_map(|page| {
+                let view = PageView::new(page, &self.header).unwrap();
+                (0..view.cluster_count()).map(move |i| CutCluster {
+                    cluster: view.cluster(i),
+                    depth: 0,
+                    group_error: 0.0,
+                })
+            })
+            .collect();
+        for g in &self.groups {
+            for i in 0..u32::from(g.cluster_count) {
+                let c = &mut out
+                    [(self.firsts[g.page as usize] + u32::from(g.first_cluster) + i) as usize];
+                c.depth = g.depth;
+                c.group_error = g.error;
+            }
+        }
+        out
+    }
+}
+
+/// A copy's mesh-space bounds as the traversal projects them from `eye`.
+struct Projector {
+    linear: Mat3,
+    at: Vec3,
+    eye: Vec3,
+    scale: f32,
+}
+
+impl Projector {
+    fn new(item: &Item, eye: Vec3) -> Self {
+        let scale = (0..3)
+            .map(|i| item.linear.col(i).length())
+            .fold(0.0, f32::max);
+        Self {
+            linear: item.linear,
+            at: item.at,
+            eye,
+            scale,
+        }
+    }
+
+    /// `error` over `sphere` in pixels at the eye.
+    fn error(&self, sphere: &orr_pack::Sphere, error: f32) -> f32 {
+        let c = self.linear * Vec3::from(sphere.center) + self.at - self.eye;
+        let d = (c.length() - sphere.radius * self.scale).max(0.01);
+        error * self.scale / d * PIXELS_PER_RADIAN
+    }
+}
+
+/// The mesh clusters the cluster rule takes at `threshold` pixels with errors scaled by
+/// `scale`, and those whose own or parent error lies within 1e-4 of the threshold, where f32
+/// rounding may decide either way.
+fn rule_cut(
+    clusters: &[CutCluster],
+    p: &Projector,
+    threshold: f32,
+    scale: f32,
+) -> (BTreeSet<u32>, BTreeSet<u32>) {
+    let (mut cut, mut near) = (BTreeSet::new(), BTreeSet::new());
+    for (i, c) in clusters.iter().enumerate() {
+        let k = &c.cluster;
+        let own = p.error(&k.self_sphere, k.self_error * scale);
+        let parent = p.error(&k.parent_sphere, k.parent_error * scale);
+        if own <= threshold && parent > threshold {
+            cut.insert(i as u32);
+        }
+        let close = |e: f32| e.is_finite() && (e - threshold).abs() <= 1e-4 * threshold;
+        if close(own) || close(parent) {
+            near.insert(i as u32);
+        }
+    }
+    (cut, near)
+}
+
+/// The scene's cut tables after a frame.
+struct CutRead {
+    counters: Vec<u32>,
+    candidates: Vec<ClusterWork>,
+    slots: Vec<SlotCutGpu>,
+}
+
+fn read_cut(view: &RasterView, slots: u32) -> CutRead {
+    let root: SceneRoot = read_buffer(view.scene, 1)[0];
+    let cut: CutGpu = read_buffer(root.cut, 1)[0];
+    let counters: Vec<u32> = read_buffer(cut.counters, 20);
+    let n = counters[2].min(cut.candidate_capacity);
+    CutRead {
+        candidates: read_buffer(cut.candidates, u64::from(n.max(1)))[..n as usize].to_vec(),
+        slots: read_buffer(cut.slots, u64::from(slots)),
+        counters,
+    }
+}
+
+const WORK_RETRY: u32 = 0x8000_0000;
+const CUT_RETRY_RASTER: u32 = 8;
+
+impl CutRead {
+    /// The mesh clusters of `slot`'s raster candidates.
+    fn raster(&self, m: &CpuMesh, slot: u32) -> BTreeSet<u32> {
+        let retry = self.slots[slot as usize].flags & CUT_RETRY_RASTER != 0;
+        self.candidates
+            .iter()
+            .filter(|w| w.instance == slot && (w.first & WORK_RETRY != 0) == retry)
+            .flat_map(|w| {
+                let first = m.firsts[w.page as usize] + (w.first & !WORK_RETRY);
+                (0..32)
+                    .filter(move |b| w.mask >> b & 1 != 0)
+                    .map(move |b| first + b)
+            })
+            .collect()
+    }
+}
+
+/// The traversal's order-free hash of a set of mesh clusters.
+fn cut_hash(clusters: &BTreeSet<u32>) -> [u32; 2] {
+    clusters.iter().fold([0u32; 2], |h, &c| {
+        let mut a = c.wrapping_mul(0x9e37_79b1).wrapping_add(0x7f4a_7c15);
+        a ^= a >> 16;
+        a = a.wrapping_mul(0x85eb_ca6b);
+        a ^= a >> 13;
+        a = a.wrapping_mul(0xc2b2_ae35);
+        a ^= a >> 16;
+        let mut b = (c ^ 0x5bd1_e995).wrapping_mul(0x27d4_eb2f);
+        b ^= b >> 15;
+        b = b.wrapping_mul(0x1656_67b1);
+        b ^= b >> 13;
+        [h[0].wrapping_add(a), h[1].wrapping_add(b)]
+    })
+}
+
+/// A world that traces the cut it rasters, every copy's own.
+fn traversed_world() -> World {
+    World::with(&RendererDesc {
+        rt_merge_pixels: 0.0,
+        ..RendererDesc::default()
+    })
+}
+
+/// The DAG ground tilted away from the camera, so its cut spans several levels, and balls
+/// at three distances.
+fn dag_items() -> Vec<Item> {
+    let mut items = vec![Item {
+        model: "dag ground",
+        linear: Mat3::from_rotation_x(0.25) * Mat3::from_diagonal(Vec3::new(2.0, 1.0, 4.0)),
+        at: Vec3::new(0.0, -1.0, -12.0),
+    }];
+    for (i, z) in [-2.0f32, -9.0, -30.0].into_iter().enumerate() {
+        items.push(Item {
+            model: "ball",
+            linear: Mat3::from_rotation_y(i as f32),
+            at: Vec3::new(1.5 - i as f32, 0.6, z),
+        });
+    }
+    items
+}
+
+#[test]
+fn the_traversal_takes_the_cluster_rule_over_every_cluster() {
+    let _serial = serial();
+    let mut w = traversed_world();
+    let items = dag_items();
+    let placed = place(&mut w, &items);
+    let eye = Vec3::new(0.3, 1.2, 4.0);
+    let target = Vec3::new(0.0, 0.0, -10.0);
+    // The second frame traces at the RT threshold itself: every copy was drawn in the first.
+    shoot(
+        &mut w,
+        &placed,
+        &Shot::at(eye.as_dvec3(), target.as_dvec3(), 1),
+    );
+    let g = shoot(
+        &mut w,
+        &placed,
+        &Shot::at(eye.as_dvec3(), target.as_dvec3(), 2),
+    );
+    let cut = read_cut(&g.view, placed.count);
+    let mut levels = BTreeSet::new();
+    for (slot, item) in items.iter().enumerate() {
+        let slot = placed.ranges[slot].first;
+        let m = CpuMesh::of(item.model);
+        let clusters = m.clusters();
+        let p = Projector::new(item, eye);
+        let (want, near) = rule_cut(&clusters, &p, 1.0, 1.0);
+        let got = cut.raster(&m, slot);
+        let differ: Vec<u32> = want.symmetric_difference(&got).copied().collect();
+        assert!(
+            differ.iter().all(|c| near.contains(c)),
+            "{}: raster cut differs from the rule at {differ:?} ({} against {})",
+            item.model,
+            got.len(),
+            want.len()
+        );
+        let s = cut.slots[slot as usize];
+        assert_eq!(
+            s.rt_count as usize,
+            got.len(),
+            "{}: ray-tracing cut size",
+            item.model
+        );
+        if differ.is_empty() {
+            assert_eq!(
+                s.rt_hash,
+                cut_hash(&want),
+                "{}: ray-tracing cut",
+                item.model
+            );
+        }
+        levels.extend(want.iter().map(|&c| clusters[c as usize].depth));
+    }
+    assert!(levels.len() >= 3, "the cut spans levels {levels:?}");
+    assert_eq!(cut.counters[8], 0, "no node dropped");
+    assert_clean();
+}
+
+#[test]
+fn traced_dag_cuts_hit_what_the_raster_drew_and_close_without_cracks() {
+    let _serial = serial();
+    let mut w = traversed_world();
+    let items = dag_items();
+    let placed = place(&mut w, &items);
+    let eye = DVec3::new(0.3, 1.2, 4.0);
+    let target = DVec3::new(0.0, 0.0, -10.0);
+    shoot(&mut w, &placed, &Shot::at(eye, target, 1));
+    let g = shoot(&mut w, &placed, &Shot::at(eye, target, 2));
+    let cuts = last_stats(&mut w, 3).cuts;
+    assert!(cuts.rt_built >= 1, "built BLAS: {cuts:?}");
+    let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+    let (matched, covered) = parity(&g, &r, 1e-4);
+    let total = r.traced.len();
+    assert!(covered > total / 3, "{covered} of {total} pixels covered");
+    assert!(
+        matched as f64 >= 0.999 * total as f64,
+        "{matched} of {total} pixels agree"
+    );
+    // A crack shows as background between ground pixels across a row and a column.
+    let ground = placed.ranges[0].first + 1;
+    let [wd, ht] = EXTENT.map(|e| e as usize);
+    let id = |x: usize, y: usize| g.ids[y * wd + x];
+    let mut cracks = 0;
+    for y in 1..ht - 1 {
+        for x in 1..wd - 1 {
+            let closed = |a: u32, b: u32| a == ground && b == ground;
+            if id(x, y) == 0
+                && closed(id(x - 1, y), id(x + 1, y))
+                && closed(id(x, y - 1), id(x, y + 1))
+            {
+                cracks += 1;
+            }
+        }
+    }
+    assert_eq!(cracks, 0, "background pixels inside the ground");
+    assert_clean();
+}
+
+/// The figures of the last completed frame, taken in by an empty one.
+fn last_stats(w: &mut World, frame: u32) -> orr_scene::FrameStats {
+    let f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(frame),
+            scenes: &[],
+            low_latency: None,
+        })
+        .unwrap();
+    wait(f.end(&[]).unwrap());
+    w.scenes.stats().clone()
+}
+
+#[test]
+fn occluded_copies_wait_for_the_second_pass_and_the_image_holds() {
+    let _serial = serial();
+    let mut w = World::new(&KernelSet {
+        modules: &[],
+        surfaces: 0,
+    });
+    let items = [
+        Item {
+            model: "plain",
+            linear: Mat3::from_diagonal(Vec3::new(5.0, 4.0, 1.0)),
+            at: Vec3::new(0.0, 1.0, 0.0),
+        },
+        Item {
+            model: "ball",
+            linear: Mat3::IDENTITY,
+            at: Vec3::new(0.0, 1.0, -3.0),
+        },
+        Item {
+            model: "ball",
+            linear: Mat3::from_diagonal(Vec3::splat(0.3)),
+            at: Vec3::new(0.6, 0.9, 1.5),
+        },
+    ];
+    let placed = place(&mut w, &items);
+    let hidden = placed.ranges[1].first + 1;
+    let target = DVec3::new(0.0, 1.0, -3.0);
+    let front = DVec3::new(0.0, 1.0, 5.0);
+    let same = |a: &Frame, b: &Frame, what: &str| {
+        assert!(a.ids == b.ids, "{what}: visible copies differ");
+        assert!(a.depth == b.depth, "{what}: depth differs");
+        assert!(a.a == b.a && a.b == b.b, "{what}: G-buffer differs");
+    };
+    let first = shoot(&mut w, &placed, &Shot::at(front, target, 1));
+    assert!(!first.ids.contains(&hidden), "the wall hides the far ball");
+    let mut shot = Shot::at(front, target, 2);
+    shot.reset = false;
+    let second = shoot(&mut w, &placed, &shot);
+    assert!(
+        second.counts[9] >= 1,
+        "occluded copies: {:?}",
+        second.counts
+    );
+    assert!(
+        second.counts[0] < first.counts[0],
+        "visible clusters: {} then {}",
+        first.counts[0],
+        second.counts[0]
+    );
+    same(&first, &second, "occlusion");
+
+    // Stepped aside, the far ball shows past the wall's edge: the first pass still finds it
+    // behind last frame's wall, the second draws it.
+    let side = DVec3::new(7.5, 1.0, 5.0);
+    let mut shot = Shot::at(side, target, 3);
+    shot.reset = false;
+    let revealed = shoot(&mut w, &placed, &shot);
+    assert!(revealed.ids.contains(&hidden), "the far ball shows");
+    assert!(
+        revealed.counts[11] > 0,
+        "drawn by the second pass: {:?}",
+        revealed.counts
+    );
+    let fresh = shoot(&mut w, &placed, &Shot::at(side, target, 4));
+    same(&fresh, &revealed, "revealed");
+    assert_clean();
+}
+
+#[test]
+fn debug_lod_holds_a_dag_level_or_scales_the_error_in_raster_and_ray_tracing() {
+    let _serial = serial();
+    let mut w = traversed_world();
+    let items = [Item {
+        model: "dag ground",
+        linear: Mat3::from_rotation_x(0.25) * Mat3::from_diagonal(Vec3::new(2.0, 1.0, 4.0)),
+        at: Vec3::new(0.0, -1.0, -12.0),
+    }];
+    let placed = place(&mut w, &items);
+    let eye = Vec3::new(0.3, 1.2, 4.0);
+    let target = Vec3::new(0.0, 0.0, -10.0);
+    let m = CpuMesh::of("dag ground");
+    let clusters = m.clusters();
+    let p = Projector::new(&items[0], eye);
+    let slot = placed.ranges[0].first;
+    let mut frame = 1;
+    let mut run = |w: &mut World, lod: Option<DebugLod>| {
+        let list = [placed.scene];
+        let f = w
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(frame),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        f.scene(placed.scene)
+            .unwrap()
+            .debug_lod(placed.ranges[0], lod);
+        wait(f.end(&[]).unwrap());
+        // Twice: the copy was drawn the frame before, so it traces at the RT threshold.
+        shoot(
+            w,
+            &placed,
+            &Shot::at(eye.as_dvec3(), target.as_dvec3(), frame + 1),
+        );
+        let g = shoot(
+            w,
+            &placed,
+            &Shot::at(eye.as_dvec3(), target.as_dvec3(), frame + 2),
+        );
+        frame += 3;
+        let cut = read_cut(&g.view, placed.count);
+        (cut.raster(&m, slot), cut.slots[slot as usize])
+    };
+    let deepest = clusters.iter().map(|c| c.depth).max().unwrap();
+    assert!(deepest >= 2, "the DAG has {deepest} levels");
+    for level in [1, deepest] {
+        let want: BTreeSet<u32> = (0..clusters.len() as u32)
+            .filter(|&i| {
+                let c = &clusters[i as usize];
+                c.depth == level || (c.depth < level && c.group_error.is_infinite())
+            })
+            .collect();
+        let (got, s) = run(&mut w, Some(DebugLod::Level(level)));
+        assert_eq!(got, want, "raster cut at level {level}");
+        assert_eq!(
+            (s.rt_count, s.rt_hash),
+            (want.len() as u32, cut_hash(&want)),
+            "ray-tracing cut at level {level}"
+        );
+    }
+    let (plain, _) = run(&mut w, None);
+    let (got, s) = run(&mut w, Some(DebugLod::ErrorScale(0.125)));
+    let (want, near) = rule_cut(&clusters, &p, 0.125, 1.0);
+    let differ: Vec<u32> = want.symmetric_difference(&got).copied().collect();
+    assert!(
+        differ.iter().all(|c| near.contains(c)),
+        "scaled cut differs at {differ:?}"
+    );
+    assert!(
+        got.len() > plain.len(),
+        "finer: {} against {}",
+        got.len(),
+        plain.len()
+    );
+    assert_eq!(
+        s.rt_count as usize,
+        got.len(),
+        "ray tracing follows the scale"
+    );
+    let (back, _) = run(&mut w, None);
+    assert_eq!(back, plain, "clearing the hold restores the cut");
     assert_clean();
 }

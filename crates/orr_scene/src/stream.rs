@@ -37,6 +37,8 @@ struct MountStreams {
     units: Vec<Option<StreamUnit>>,
     /// Streamed units per mesh of the mount.
     meshes: Vec<Vec<u32>>,
+    /// The unit of each node page, per mesh of the mount.
+    node_pages: Vec<Vec<u32>>,
 }
 
 pub(crate) struct Streaming {
@@ -84,6 +86,7 @@ impl Streaming {
         source: Arc<BlobSource>,
         units: Vec<(UnitDesc, Option<StreamUnit>)>,
         meshes: Vec<Vec<u32>>,
+        node_pages: Vec<Vec<u32>>,
     ) -> Result<()> {
         let descs: Vec<UnitDesc> = units.iter().map(|(d, _)| d.clone()).collect();
         self.residency.register(mount, &descs)?;
@@ -94,6 +97,7 @@ impl Streaming {
                 source,
                 units,
                 meshes,
+                node_pages,
             },
         );
         Ok(())
@@ -128,6 +132,37 @@ impl Streaming {
         };
         for &unit in &m.meshes[mesh as usize] {
             self.residency.request(Key { mount, unit }, p);
+        }
+    }
+
+    /// Node page `page` of mesh `mesh` of `mount`: requested for the next step with the
+    /// projected error it would refine, or read by a traversal in `frame`.
+    pub(crate) fn node_page(
+        &mut self,
+        mount: MountId,
+        mesh: u32,
+        page: u32,
+        request: Option<f32>,
+        frame: u64,
+    ) {
+        let Some(&unit) = self
+            .mounts
+            .get(&mount)
+            .and_then(|m| m.node_pages.get(mesh as usize))
+            .and_then(|p| p.get(page as usize))
+        else {
+            return;
+        };
+        let k = Key { mount, unit };
+        match request {
+            Some(error) => self.residency.request(
+                k,
+                Priority {
+                    error,
+                    cell_distance: 0,
+                },
+            ),
+            None => self.residency.touch(k, frame),
         }
     }
 

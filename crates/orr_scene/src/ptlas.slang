@@ -1,15 +1,15 @@
 // A scene's PTLAS work for one frame. `clear` resets the frame's marks and `recycle` returns
 // the part runs released last frame to the free lists; `want` decides each slot's operation
 // (a write, a null write, a BLAS update, taking, rewriting or releasing a part run, or
-// nothing) from its record, its transform, its pose, its distance from the focus and what
-// its PTLAS instances hold, and charges it to the distance bucket of its partition; `cutoff`
-// and `admit` spend the frame's budget of rebuilt instances bucket by bucket from the focus
-// outward, mandatory work first; `emit` writes the admitted records and ages the rest;
-// `translate` writes partition translations and `commands` the build's one command per
-// record type. `producer_want` and `producer_emit` do the same for producer entries: an
-// entry's instance at `producer_base + id`, in the global partition, is rewritten as
-// mandatory work every frame it builds, moves or the render origin moves, and null-written
-// when it has nothing to trace.
+// nothing) from its record, its transform, its pose, its distance from the focus, the cut
+// the traversal gave it and what its PTLAS instances hold, and charges it to the distance
+// bucket of its partition; `cutoff` and `admit` spend the frame's budget of rebuilt
+// instances bucket by bucket from the focus outward, mandatory work first; `emit` writes the
+// admitted records and ages the rest; `translate` writes partition translations and
+// `commands` the build's one command per record type. `producer_want` and `producer_emit`
+// do the same for producer entries: an entry's instance at `producer_base + id`, in the
+// global partition, is rewritten as mandatory work every frame it builds, moves or the
+// render origin moves, and null-written when it has nothing to trace.
 //
 // A traced copy inside its animation range whose cut has animated part clusters holds a
 // run of part instances, one per animated part: its body instance traces the cut's body
@@ -18,6 +18,10 @@
 // the cut. Copies with animated parts stay in their cell partition. Runs come from free
 // lists per run class (2^c part instances), filled from a bump pointer; a run released in
 // a frame is reused from the next.
+//
+// A slot tracing a cluster BLAS built this frame (RT_CUT_BUILT) holds memory the next
+// frame's builds reuse, so every operation on it is mandatory and it takes an update every
+// frame it keeps one.
 #include "orr/root.h"
 import orr.abi;
 import orr.math;
@@ -30,7 +34,6 @@ public static const uint PARTITION_NONE = 0xffffffff;
 public static const uint DISTANCE_BUCKETS = 64;
 // Frames without a transform change after which a mover returns to its cell partition.
 public static const uint MOVER_FRAMES = 30;
-public static const float RT_HYSTERESIS = 1.15;
 
 // `PtlasGpu.counters`. Those from COUNTERS_CLEARED on persist across frames.
 public static const uint COUNTER_WRITES = 0;
@@ -137,7 +140,7 @@ public struct PtlasRoot
     public uint slots;            // slots to walk
     public uint budget;           // rebuilt instances beyond mandatory work
     public uint flags;            // PTLAS_*
-    public float error_pixels;
+    public uint _pad0;
     public TranslateJob* translate_jobs;
     public uint translate_count;
     public uint _pad;
@@ -216,26 +219,16 @@ bool moved(GroupGpu* g, uint index)
     return any(a[0] != b[0]) || any(a[1] != b[1]) || any(a[2] != b[2]);
 }
 
-float projected(RtCutGpu* cuts, uint k, float scale, float distance)
-{
-    return cuts[k].error * scale / max(distance, 1e-3) * root.focus_offset.w;
-}
-
-// The coarsest cut whose error at `distance` stays at or under `limit` pixels.
-uint coarsest_cut(MeshGpu* mesh, float scale, float distance, float limit)
-{
-    for (uint k = mesh.rt_cut_count; k > 1; k--)
-    {
-        if (projected(mesh.rt_cuts, k - 1, scale, distance) <= limit)
-            return k - 1;
-    }
-    return 0;
-}
-
 // The rest-pose and body BLAS of `cut` for the copy's section mask; false when the mask
 // names a set whose BLAS are not built.
-bool cut_blas(MeshGpu* mesh, ModelGpu* model, InstanceGpu inst, uint cut, out uint64_t rest, out uint64_t body)
+bool cut_blas(SceneRoot* s, uint slot, MeshGpu* mesh, ModelGpu* model, InstanceGpu inst, uint cut, out uint64_t rest, out uint64_t body)
 {
+    if (cut == RT_CUT_BUILT)
+    {
+        rest = s.cut.job_blas[s.cut.slots[slot].rt_job];
+        body = rest;
+        return true;
+    }
     RtCutGpu k = mesh.rt_cuts[cut];
     rest = k.blas;
     body = k.body;
@@ -383,22 +376,9 @@ void want(uint3 id: SV_DispatchThreadID)
         float distance = has_focus ? max(length(center) - radius, 0.0) : 0.0;
         float range = float(inst.rt_range) * ((st.rt_flags & RT_IN_RANGE) != 0 ? RT_HYSTERESIS : 1.0);
         in_range = !has_focus || distance <= range;
-
-        uint limit_cut = has_focus ? coarsest_cut(mesh, pl.scale, distance, root.error_pixels) : 0;
-        uint cut = limit_cut;
-        if (written && has_focus)
-        {
-            uint current = min(uint(st.rt_lod), mesh.rt_cut_count - 1);
-            uint coarser = coarsest_cut(mesh, pl.scale, distance, root.error_pixels / RT_HYSTERESIS);
-            if (coarser > current)
-                cut = coarser;
-            else if (projected(mesh.rt_cuts, current, pl.scale, distance) > root.error_pixels * RT_HYSTERESIS)
-                cut = limit_cut;
-            else
-                cut = current;
-        }
-        op.cut = cut;
-        cut_blas(mesh, model, inst, cut, op.rest, body);
+        uint cut = s.cut.slots[slot].rt_cut;
+        op.cut = cut == RT_CUT_BUILT ? cut : min(cut, mesh.rt_cut_count - 1);
+        cut_blas(s, slot, mesh, model, inst, op.cut, op.rest, body);
         active = op.rest != 0;
         op.blas = op.rest;
         op.key = instance_key(g, inst);
@@ -410,7 +390,10 @@ void want(uint3 id: SV_DispatchThreadID)
     // part clusters and a body, and its section mask leaves some part shown.
     uint held = st.part_count;
     uint hidden = (inst.variant >> 16) & 0xffff;
-    bool posed = active && in_range && (st.rt_flags & RT_ANIMATED) != 0
+    // What a BLAS built last frame holds is gone after this frame's builds.
+    bool held_built = written && st.rt_lod == RT_CUT_BUILT;
+    bool built = op.cut == RT_CUT_BUILT;
+    bool posed = active && in_range && !built && (st.rt_flags & RT_ANIMATED) != 0
         && mesh.rt_cuts[op.cut].parts != nullptr && body != 0
         && (mesh.animated_sections & ~hidden) != 0;
     bool release = held != 0 && (!posed || held != mesh.animated_parts);
@@ -419,7 +402,7 @@ void want(uint3 id: SV_DispatchThreadID)
     if (!active || !in_range)
     {
         // A removed slot's instances go now: its slot may be handed out again.
-        bool mandatory = inst.flags == 0;
+        bool mandatory = inst.flags == 0 || held_built;
         if (written)
             op.op = OP_WRITE | OP_NULL;
         if (release)
@@ -452,13 +435,13 @@ void want(uint3 id: SV_DispatchThreadID)
     bool update = false;
     if (!placed || (target == global_partition() && rebased))
     {
-        bool mandatory = in_global && target == global_partition() && rebased;
+        bool mandatory = (in_global && target == global_partition() && rebased) || held_built;
         op.op = OP_WRITE | (mandatory ? OP_MANDATORY : 0);
         charge_write(target, mandatory);
         if (written && st.rt_partition != target)
             charge_write(st.rt_partition, false);
     }
-    else if (st.rt_blas != op.blas)
+    else if (st.rt_blas != op.blas || built)
     {
         update = true;
     }
@@ -477,7 +460,7 @@ void want(uint3 id: SV_DispatchThreadID)
     else if (update)
     {
         // The same cut at a new address is a rebuilt BLAS: mandatory.
-        bool mandatory = op.cut == st.rt_lod;
+        bool mandatory = op.cut == st.rt_lod || held_built;
         op.op = OP_UPDATE | (mandatory ? OP_MANDATORY : 0);
         if (mandatory)
             InterlockedAdd(t.counters[COUNTER_MANDATORY], 1);
@@ -723,7 +706,8 @@ void emit(uint3 id: SV_DispatchThreadID)
     if ((op.op & OP_WRITE) == 0)
     {
         uint index;
-        if (written && blas != st.rt_blas && reserve(COUNTER_UPDATES, t.update_capacity, 1, index))
+        bool rebuilt = op.cut == RT_CUT_BUILT;
+        if (written && (blas != st.rt_blas || rebuilt) && reserve(COUNTER_UPDATES, t.update_capacity, 1, index))
         {
             PtlasUpdate u;
             u.blas = blas;

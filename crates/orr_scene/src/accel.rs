@@ -4,7 +4,7 @@
 //! each cluster's grid positions to f32 and writes its per-triangle flags and micromap
 //! indices, the batch builds implicitly into scratch, and once the built sizes are read back
 //! one move puts the batch into a block of exactly that size. Clusters with micromaps build
-//! in their own batches, the only ones that allow them. Each cut a mesh traces at then builds
+//! in their own batches, the only ones that allow them. Each cut a mesh caches then builds
 //! one cluster BLAS over the moved CLAS, sized and moved the same way; a cut with animated
 //! part clusters also builds one over its body and one per animated part. Section-mask
 //! BLAS build on the frame's list the first frame a copy names the mask.
@@ -30,7 +30,7 @@ const CLAS_NON_OPAQUE: u32 = 2;
 /// `AccelRoot.op` of `records`.
 const ACCEL_BLAS: u32 = 0;
 const ACCEL_MOVE: u32 = 1;
-/// Cuts a DAG mesh traces at, at most.
+/// Cuts a DAG mesh caches, at most.
 const DAG_CUTS: usize = 12;
 /// Clusters in one CLAS batch, at most.
 const BATCH_CLUSTERS: usize = 1 << 16;
@@ -229,7 +229,7 @@ pub(crate) struct AccelShared {
     pub cluster_capacity: u32,
 }
 
-/// The resident cluster table entries of a mesh's clusters.
+/// The resident cluster table entries of a mesh's clusters; their CLAS once built.
 pub(crate) fn cluster_refs(m: &MeshInput<'_>) -> Vec<ClusterRef> {
     m.clusters
         .iter()
@@ -239,14 +239,41 @@ pub(crate) fn cluster_refs(m: &MeshInput<'_>) -> Vec<ClusterRef> {
             page: unsafe { GpuPtr::from_address(GpuAddress(m.pages[c.page as usize])) },
             local: c.local,
             mesh_cluster,
+            clas: 0,
         })
         .collect()
 }
 
-/// The clusters of each cut a mesh traces at, finest first, with the largest error in it.
-/// Discrete meshes trace at their levels. DAG meshes trace at fixed thresholds: a cut
+/// `tables.slang` `cluster_hash` of one mesh cluster.
+fn cluster_hash(mesh_cluster: u32) -> [u32; 2] {
+    let mut a = mesh_cluster
+        .wrapping_mul(0x9e37_79b1)
+        .wrapping_add(0x7f4a_7c15);
+    a ^= a >> 16;
+    a = a.wrapping_mul(0x85eb_ca6b);
+    a ^= a >> 13;
+    a = a.wrapping_mul(0xc2b2_ae35);
+    a ^= a >> 16;
+    let mut b = (mesh_cluster ^ 0x5bd1_e995).wrapping_mul(0x27d4_eb2f);
+    b ^= b >> 15;
+    b = b.wrapping_mul(0x1656_67b1);
+    b ^= b >> 13;
+    [a, b]
+}
+
+/// The order-free hash the traversal gives a set of mesh clusters.
+pub(crate) fn cut_hash(clusters: &[u32]) -> [u32; 2] {
+    clusters.iter().fold([0, 0], |h, &c| {
+        let k = cluster_hash(c);
+        [h[0].wrapping_add(k[0]), h[1].wrapping_add(k[1])]
+    })
+}
+
+/// The clusters of each cut a mesh caches, finest first, with the largest error in it.
+/// Discrete meshes cache their levels. DAG meshes cache cuts at fixed thresholds: a cut
 /// takes every cluster whose own error is at or under the threshold and whose parent's is
-/// over it, from the merged stage once the threshold reaches the merge error.
+/// over it, from the merged stage once the threshold reaches the merge error. Copies whose
+/// traversed cut equals one trace it, as do distant copies and posed ones.
 pub(crate) fn cuts(m: &MeshInput<'_>) -> Vec<(f32, Vec<u32>)> {
     if !m.levels.is_empty() {
         return m
@@ -767,6 +794,7 @@ pub(crate) fn build(
                 clusters: p.clusters.len() as u32,
                 body: at(p.body),
                 parts,
+                hash: cut_hash(&p.clusters),
             }
         })
         .collect();

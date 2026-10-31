@@ -123,8 +123,8 @@ Primitive cluster_primitive(ClusterDraw d, uint t, out uint3 corners_out)
     return o;
 }
 
-// One workgroup per entry of the opaque list, or with root value 1 the alpha list, drawing
-// the cluster's opaque or alpha-tested triangles.
+// One workgroup per entry of the opaque list, or with root value 1 the alpha list, past the
+// entries an earlier pass drew, drawing the cluster's opaque or alpha-tested triangles.
 [shader("mesh")]
 [numthreads(128, 1, 1)]
 [outputtopology("triangle")]
@@ -137,7 +137,7 @@ void cluster_mesh(
 {
     RasterGpu* r = root.raster;
     bool alpha = root.value == 1;
-    uint index = grid_index(group);
+    uint index = grid_index(group) + r.counts[alpha ? COUNT_ALPHA_BASE : COUNT_OPAQUE_BASE];
     if (index >= r.counts[alpha ? COUNT_ALPHA : COUNT_OPAQUE])
     {
         SetMeshOutputCounts(0, 0);
@@ -337,7 +337,7 @@ void software(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
 {
     RasterGpu* r = root.raster;
     ViewConstants* v = root.view;
-    uint index = grid_index(group);
+    uint index = grid_index(group) + r.counts[COUNT_SOFTWARE_BASE];
     if (index >= r.counts[COUNT_SOFTWARE])
         return;
     uint visible = r.software[index];

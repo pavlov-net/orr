@@ -498,7 +498,7 @@ impl Ptlas {
             slots: self.high_water,
             budget: f.budget,
             flags: if f.rebased { PTLAS_REBASE } else { 0 } | if s.built { 0 } else { PTLAS_FIRST },
-            error_pixels: f.error_pixels,
+            _pad0: 0,
             translate_jobs,
             translate_count: jobs.len() as u32,
             _pad: 0,
@@ -570,7 +570,6 @@ pub(crate) struct FrameInputs {
     pub cell_log2: u32,
     pub rebased: bool,
     pub budget: u32,
-    pub error_pixels: f32,
     /// The frame's readback slot.
     pub slot: usize,
 }

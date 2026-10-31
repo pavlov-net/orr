@@ -2,6 +2,7 @@
 module tables;
 
 import orr.abi;
+__exported import cut;
 import material;
 import lights;
 import producer;
@@ -37,10 +38,13 @@ public struct InstanceGpu
     public uint8_t candidate_class; // orr.trace CLASS_*
     public uint16_t pose_variants;
     public uint16_t pose_stride;
-    public uint16_t _pad;
+    public uint16_t debug_lod; // 0 none; DEBUG_LOD_LEVEL | level; else the f16 bits of an error threshold scale
     public uint user_tag;      // never read by orr
     public uint variant;       // pose u8, material set u8, section mask u16 (bit set = hidden)
 }
+
+// `InstanceGpu.debug_lod` holding the copy at one DAG level, in its low byte.
+public static const uint DEBUG_LOD_LEVEL = 0x8000;
 
 // `SlotStateGpu.rt_flags`.
 public static const uint RT_WRITTEN = 1;    // its PTLAS instance holds a BLAS
@@ -55,11 +59,11 @@ public static const uint RT_WAS_ANIMATED = 32; // RT_ANIMATED of the previous fr
 // fields describe what the slot's PTLAS instance holds.
 public struct SlotStateGpu
 {
-    public uint8_t rt_lod;          // the mesh cut it was written or updated with
+    public uint8_t rt_lod;          // the mesh cut it was written or updated with, RT_CUT_BUILT for a BLAS built that frame
     public uint8_t stable_frames;   // frames since its transform last moved, saturating
     public uint8_t chain_step;
     public uint8_t fade;
-    public uint last_visible_frame;
+    public uint last_visible_frame; // the last frame a view drew one of its clusters
     public uint64_t rt_blas;        // 0 while null-written
     public uint rt_partition;       // cell partition, or the partition count for the global one
     public uint rt_flags;           // RT_*
@@ -100,6 +104,7 @@ public struct ClusterRef
     public uint8_t* page;
     public uint local;             // index in the page
     public uint mesh_cluster;      // mesh cluster index
+    public uint64_t clas;          // 0 where the device builds none
 }
 
 // One cut of a mesh that ray tracing can use: the cluster BLAS over its clusters, the
@@ -112,6 +117,7 @@ public struct RtCutGpu
     public uint clusters;
     public uint64_t body;          // `blas` when the cut has no animated part clusters; 0 when its body is empty
     public uint64_t* parts;        // per animated part, 0 where it has no clusters; null without animated part clusters
+    public uint2 hash;             // cut_hash over its clusters
 }
 
 // An animated part: its rest bounds in mesh space and the sections its clusters use.
@@ -158,6 +164,13 @@ public struct MeshGpu
     public uint animated_parts;    // 0: no part is animated
     public uint mask_count;
     public uint animated_sections; // the sections of every animated part, bit per section below 32
+    public uint8_t* nodes;         // DAG mode: the Node table of a resident hierarchy, else null
+    public uint8_t* node_table;    // DAG mode: the NodePage table of a paged hierarchy, else null
+    public uint8_t* groups;        // DAG mode: the Group table
+    public uint* roots;            // DAG mode: MeshHeader.roots
+    public uint* node_stamps;      // per node page: the last frame the traversal reported it
+    public uint root_count;
+    public uint _pad;
 }
 
 // A model made resident from a mounted pack: its mesh and the material of each section.
@@ -204,6 +217,7 @@ public struct SceneRoot
     public uint part_base;           // PTLAS index of part instance 0
     public uint part_capacity;
     public uint producer_base;       // PTLAS index of producer entry 0; also how `SurfaceInput`, `GSurface` and `VisibleCluster` name producer entries
+    public CutGpu* cut;              // the frame's cuts
 }
 
 // Transform `index` of `group` as a row-major [R | t] relative to the group's anchor.
@@ -215,6 +229,22 @@ public float3x4 group_transform(GroupGpu* group, uint index)
 public float3x4 previous_group_transform(GroupGpu* group, uint index)
 {
     return ((float3x4*)group.previous)[index];
+}
+
+// An order-free hash of a set of mesh clusters: the sum of two hashes of each.
+public uint2 cluster_hash(uint mesh_cluster)
+{
+    uint a = mesh_cluster * 0x9e3779b1u + 0x7f4a7c15u;
+    a ^= a >> 16;
+    a *= 0x85ebca6bu;
+    a ^= a >> 13;
+    a *= 0xc2b2ae35u;
+    a ^= a >> 16;
+    uint b = (mesh_cluster ^ 0x5bd1e995u) * 0x27d4eb2fu;
+    b ^= b >> 15;
+    b *= 0x165667b1u;
+    b ^= b >> 13;
+    return uint2(a, b);
 }
 
 // The translation from `eye` to the point at `cell` + `offset`, exact in its cell part for

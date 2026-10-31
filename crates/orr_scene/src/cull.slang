@@ -1,13 +1,14 @@
-// A view's raster start: `clear` empties the visibility buffer and the counters,
-// `instances` culls every instance slot against the view, picks each copy's discrete level
-// by its projected error and writes its clusters as work items of up to 32, `cap` sizes the
-// cluster pass to the items written, `clusters` culls each item's clusters (section mask,
-// DAG cluster rule, frustum, back-face cone) and sorts the survivors into the hardware
-// opaque, hardware alpha and software lists, `producers` culls the clusters producer
-// entries emitted this frame by their vertex boxes into the same lists, particle entries
-// into the particle list, and `raster_args` sizes the raster to them.
+// A view's culling over its scene's raster candidate cut, in two passes. `clear` empties the
+// visibility buffer and the counters; `instances` culls each copy with candidates against
+// the frustum and, in the first pass, the previous frame's HZB; `cap` sizes the cluster pass
+// to the candidate cut or to the work the first pass left; `clusters` culls each item's
+// clusters (section mask, frustum, back-face cone, HZB) and sorts the survivors into the
+// hardware opaque, hardware alpha and software lists; `producers` culls the clusters
+// producer entries emitted this frame by their vertex boxes into the same lists, particle
+// entries into the particle list; `raster_args` sizes the raster to the lists' new entries.
+// Between the passes the HZB is rebuilt from the first pass's visibility buffer.
 // Clusters of animated parts are culled where their pose places them; whole copies by their
-// model's rest bounds.
+// model's rest bounds, and posed copies only by their clusters' HZB tests.
 #include "orr/root.h"
 import orr.packing;
 import orr.trace;
@@ -35,49 +36,10 @@ void clear(uint3 id: SV_DispatchThreadID)
         r.bin_args[id.x] = id.x % 3 == 0 ? 0 : 1;
 }
 
-// The first page holding mesh cluster `cluster`.
-uint page_of(MeshGpu* mesh, uint cluster)
-{
-    uint lo = 0;
-    uint hi = mesh.page_count;
-    while (hi - lo > 1)
-    {
-        uint mid = (lo + hi) / 2;
-        if (mesh.page_clusters[mid] <= cluster)
-            lo = mid;
-        else
-            hi = mid;
-    }
-    return lo;
-}
-
-// Walks the work items of mesh clusters `first..end`: counts them, or writes them from
-// `base` when `write` is set.
-uint emit(RasterGpu* r, MeshGpu* mesh, uint instance, uint first, uint end, uint flags, bool write, uint base)
-{
-    uint n = 0;
-    uint cluster = first;
-    for (uint page = page_of(mesh, first); page < mesh.page_count && cluster < end; page++)
-    {
-        uint page_end = min(end, mesh.page_clusters[page + 1]);
-        for (; cluster < page_end; cluster += 32)
-        {
-            if (write && base + n < r.work_capacity)
-            {
-                ClusterWork w;
-                w.instance = instance;
-                w.page = page;
-                w.first = cluster - mesh.page_clusters[page];
-                w.count_flags = min(32, page_end - cluster) | (flags << 8);
-                r.work[base + n] = w;
-            }
-            n++;
-        }
-        cluster = page_end;
-    }
-    return n;
-}
-
+// One thread per instance slot with raster candidates. The first pass (`root.value` 0)
+// culls the copy's bounds against the frustum and, with RASTER_OCCLUSION, the previous
+// frame's HZB through its previous transform; the second retests the copies it found
+// occluded against this frame's first-pass HZB.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void instances(uint3 id: SV_DispatchThreadID)
@@ -85,80 +47,85 @@ void instances(uint3 id: SV_DispatchThreadID)
     SceneRoot* s = root.scene;
     ViewConstants* v = root.view;
     RasterGpu* r = root.raster;
-    if (id.x >= s.instance_capacity)
+    uint slot = id.x;
+    if (slot >= r.slots)
         return;
-    InstanceGpu inst = s.instances[id.x];
-    if ((inst.flags & INSTANCE_RASTER) == 0 || (inst.flags & INSTANCE_CAST_ONLY) != 0)
+    bool second = root.value != 0;
+    if (second)
+    {
+        if (r.slot_visibility[slot] != SLOT_OCCLUDED)
+            return;
+    }
+    else
+    {
+        r.slot_visibility[slot] = SLOT_CULLED;
+    }
+    if ((s.cut.slots[slot].flags & CUT_RASTER) == 0)
         return;
-    if (inst.candidate_class != CLASS_OPAQUE)
-        return;
+    InstanceGpu inst = s.instances[slot];
     Placement p;
     if (!instance_placement(s, inst, v, p))
         return;
     ModelGpu* model = s.models + inst.model;
-    MeshGpu* mesh = s.meshes + model.mesh;
     float3 center = place(p, 0.5 * (model.bounds_min + model.bounds_max));
     float radius = 0.5 * length(model.bounds_max - model.bounds_min) * p.scale;
     if (!sphere_visible(v, center, radius))
         return;
-
-    uint first = 0;
-    uint end = mesh.cluster_count;
-    uint flags = WORK_DAG;
-    if (mesh.level_count > 0)
+    // Posed parts may leave the rest bounds; their clusters are tested one by one.
+    bool posed = (s.slot_state[slot].rt_flags & RT_ANIMATED) != 0;
+    if (second)
     {
-        // The coarsest level whose error stays under the threshold at the nearest point.
-        uint level = 0;
-        for (uint l = mesh.level_count; l > 0; l--)
+        bool occluded = !posed && box_occluded(v, r, p, model.bounds_min, model.bounds_max, false);
+        r.slot_visibility[slot] = occluded ? SLOT_CULLED : SLOT_REVEALED;
+        return;
+    }
+    uint state = SLOT_VISIBLE;
+    if ((r.flags & RASTER_OCCLUSION) != 0 && !posed)
+    {
+        GroupGpu* g = s.groups + inst.group;
+        Placement before;
+        if (placement(g, g.previous, inst.group_index, v, before) && box_occluded(v, r, before, model.bounds_min, model.bounds_max, true))
         {
-            if (projected_error(v, center, radius, mesh.levels[l - 1].error * p.scale) <= r.error_pixels)
-            {
-                level = l - 1;
-                break;
-            }
+            state = SLOT_OCCLUDED;
+            InterlockedAdd(r.counts[COUNT_OCCLUDED_INSTANCES], 1);
         }
-        first = mesh.levels[level].first;
-        end = first + mesh.levels[level].count;
-        flags = 0;
     }
-    else if (projected_error(v, center, radius, mesh.merge_error * p.scale) <= r.error_pixels)
-    {
-        flags |= WORK_MERGED;
-    }
-    uint n = emit(r, mesh, id.x, first, end, flags, false, 0);
-    uint base;
-    InterlockedAdd(r.counts[COUNT_WORK], n, base);
-    if (base + n > r.work_capacity)
-        InterlockedAdd(r.counts[COUNT_WORK_DROPPED], base + n - max(base, r.work_capacity));
-    emit(r, mesh, id.x, first, end, flags, true, base);
+    r.slot_visibility[slot] = state;
 }
 
-// Sizes the cluster pass to the work written.
+// Sizes the first cluster pass to the scene's candidate cut, or the second to the work the
+// first left for it.
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void cap(uint3 id: SV_DispatchThreadID)
 {
     RasterGpu* r = root.raster;
+    CutGpu* cut = root.scene.cut;
+    if (root.value == 0)
+    {
+        write_grid(r.args + ARGS_WORK, min(cut.counters[CUT_CANDIDATES], cut.candidate_capacity));
+        return;
+    }
     write_grid(r.args + ARGS_WORK, min(r.counts[COUNT_WORK], r.work_capacity));
+    r.counts[COUNT_OPAQUE_BASE] = r.counts[COUNT_OPAQUE];
+    r.counts[COUNT_ALPHA_BASE] = r.counts[COUNT_ALPHA];
+    r.counts[COUNT_SOFTWARE_BASE] = r.counts[COUNT_SOFTWARE];
 }
 
-// Whether cluster `c` of `inst` survives culling.
-bool cluster_visible(ViewConstants* v, RasterGpu* r, InstanceGpu inst, Placement p, Cluster c, uint flags, MaterialGpu* m)
+// How far displacement moves the cluster's surface, at most (m, mesh space).
+float displacement_reach(Cluster c)
+{
+    return max(abs(float(c.displacement_min)), abs(float(c.displacement_max)));
+}
+
+// Whether cluster `c` of `inst` survives frustum, cone and section culling.
+bool cluster_visible(ViewConstants* v, InstanceGpu inst, Placement p, Cluster c, MaterialGpu* m)
 {
     if (section_hidden(inst, c.section))
         return false;
-    if ((flags & WORK_DAG) != 0)
-    {
-        bool merged = (c.flags & CLUSTER_MERGED) != 0;
-        if (merged != ((flags & WORK_MERGED) != 0))
-            return false;
-        float self_e = projected_error(v, place(p, c.self_sphere.xyz), c.self_sphere.w * p.scale, c.self_error * p.scale);
-        float parent_e = projected_error(v, place(p, c.parent_sphere.xyz), c.parent_sphere.w * p.scale, c.parent_error * p.scale);
-        if (self_e > r.error_pixels || parent_e <= r.error_pixels)
-            return false;
-    }
+    float reach = displacement_reach(c);
     float3 center = place(p, c.cull_sphere.xyz);
-    float radius = c.cull_sphere.w * p.scale;
+    float radius = (c.cull_sphere.w + reach) * p.scale;
     if (!sphere_visible(v, center, radius))
         return false;
     // Back-face cone, as meshoptimizer's cluster bounds define it, under uniform scale only.
@@ -166,13 +133,21 @@ bool cluster_visible(ViewConstants* v, RasterGpu* r, InstanceGpu inst, Placement
     bool single = (m.flags & MATERIAL_DOUBLE_SIDED) == 0;
     float det = determinant(p.linear);
     bool uniform = abs(abs(det) - p.scale * p.scale * p.scale) < 1e-3 * abs(det);
-    if (single && uniform && cone.w < 1.0)
+    if (single && uniform && cone.w < 1.0 && reach == 0.0)
     {
         float3 axis = normalize(mul(p.linear, cone.xyz)) * sign(det);
         if (dot(center, axis) >= cone.w * length(center) + radius)
             return false;
     }
     return true;
+}
+
+// The cluster's rest box, grown by its displacement reach.
+void cluster_box(MeshGpu* mesh, Cluster c, out float3 lo, out float3 hi)
+{
+    float reach = displacement_reach(c);
+    lo = grid_position(c.anchor, uint3(0), mesh.position_step) - reach;
+    hi = grid_position(c.anchor, uint3(c.local_max[0], c.local_max[1], c.local_max[2]), mesh.position_step) + reach;
 }
 
 // The visible-cluster index of a new entry, or false past capacity.
@@ -195,47 +170,19 @@ void append(RasterGpu* r, uint count, uint* list, uint visible)
     list[slot] = visible;
 }
 
-// One thread per cluster of a work item.
-[shader("compute")]
-[numthreads(32, 1, 1)]
-void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
+// Hands cluster `local` of page `page_index` to the raster lists.
+void draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint slot, MeshGpu* mesh, uint8_t* page, uint page_index, uint local, Cluster c, Placement p, uint material, MaterialGpu* m)
 {
-    SceneRoot* s = root.scene;
-    ViewConstants* v = root.view;
-    RasterGpu* r = root.raster;
-    uint index = grid_index(group);
-    if (index >= min(r.counts[COUNT_WORK], r.work_capacity))
-        return;
-    ClusterWork w = r.work[index];
-    if (thread >= (w.count_flags & 0xff))
-        return;
-    InstanceGpu inst = s.instances[w.instance];
-    ModelGpu* model = s.models + inst.model;
-    MeshGpu* mesh = s.meshes + model.mesh;
-    uint8_t* page = (uint8_t*)mesh.pages[w.page];
-    Placement copy;
-    if (!instance_placement(s, inst, v, copy) || page == nullptr)
-        return;
-    uint local = w.first + thread;
-    Cluster c = load_cluster(page, local);
-    Placement p;
-    if (!cluster_placement(s, w.instance, inst, c, copy, false, p))
-        return;
-    uint material = section_material(s, inst, model, c.section);
-    if (material == MATERIAL_NONE)
-        return;
-    MaterialGpu* m = s.materials + material;
-    if (!cluster_visible(v, r, inst, p, c, w.count_flags >> 8, m))
-        return;
     VisibleCluster vc;
     vc.page = page;
-    vc.instance = w.instance;
-    vc.cluster = mesh.page_clusters[w.page] + local;
+    vc.instance = slot;
+    vc.cluster = mesh.page_clusters[page_index] + local;
     vc.local = local;
     vc.material = material;
     uint visible;
     if (!add_visible(r, vc, visible))
         return;
+    s.slot_state[slot].last_visible_frame = s.frame_index;
     float3 lo = grid_position(c.anchor, uint3(0), mesh.position_step);
     float3 hi = grid_position(c.anchor, uint3(c.local_max[0], c.local_max[1], c.local_max[2]), mesh.position_step);
     if (r.software_pixels > 0.0 && small_on_screen(v, p, lo, hi, r.software_pixels))
@@ -248,6 +195,114 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         append(r, COUNT_OPAQUE, r.opaque, visible);
     if (alpha < c.tri_count)
         append(r, COUNT_ALPHA, r.alpha, visible);
+}
+
+groupshared uint rejected;
+
+// One thread per cluster of a work item: the scene's candidate cut in the first pass
+// (`root.value` 0), the work it left in the second. The first pass draws the clusters of
+// visible copies that pass culling and, with RASTER_OCCLUSION, the previous frame's HZB
+// through their previous placement, and leaves the others that pass culling, and every
+// cluster of a copy found occluded, to the second; the second draws those that pass
+// culling and this frame's first-pass HZB.
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
+{
+    SceneRoot* s = root.scene;
+    ViewConstants* v = root.view;
+    RasterGpu* r = root.raster;
+    CutGpu* cut = s.cut;
+    bool second = root.value != 0;
+    if (thread == 0)
+        rejected = 0;
+    GroupMemoryBarrierWithGroupSync();
+    uint index = grid_index(group);
+    uint n = second ? min(r.counts[COUNT_WORK], r.work_capacity) : min(cut.counters[CUT_CANDIDATES], cut.candidate_capacity);
+    ClusterWork w = (ClusterWork)0;
+    if (index < n)
+        w = second ? r.work[index] : cut.candidates[index];
+    uint slot = w.instance;
+    bool retry = (w.first & WORK_RETRY) != 0;
+    uint local = (w.first & ~WORK_RETRY) + thread;
+    bool mine = index < n && ((w.mask >> thread) & 1) != 0;
+    // A second traversal's candidates replace the first's for the slot.
+    if (mine && !second)
+        mine = retry == ((cut.slots[slot].flags & CUT_RETRY_RASTER) != 0);
+    uint state = mine ? r.slot_visibility[slot] : SLOT_CULLED;
+    if (state == SLOT_OCCLUDED)
+    {
+        InterlockedOr(rejected, 1u << thread);
+    }
+    else if (state != SLOT_CULLED)
+    {
+        InstanceGpu inst = s.instances[slot];
+        ModelGpu* model = s.models + inst.model;
+        MeshGpu* mesh = s.meshes + model.mesh;
+        uint8_t* page = (uint8_t*)mesh.pages[w.page];
+        Placement copy = (Placement)0;
+        Placement p = (Placement)0;
+        Cluster c = (Cluster)0;
+        uint material = MATERIAL_NONE;
+        bool shown = page != nullptr && instance_placement(s, inst, v, copy);
+        if (shown)
+        {
+            c = load_cluster(page, local);
+            shown = cluster_placement(s, slot, inst, c, copy, false, p);
+        }
+        if (shown)
+        {
+            material = section_material(s, inst, model, c.section);
+            shown = material != MATERIAL_NONE && cluster_visible(v, inst, p, c, s.materials + material);
+        }
+        if (shown)
+        {
+            float3 lo, hi;
+            cluster_box(mesh, c, lo, hi);
+            if (second)
+            {
+                if (box_occluded(v, r, p, lo, hi, false))
+                {
+                    InterlockedAdd(r.counts[COUNT_HIDDEN], 1);
+                    shown = false;
+                }
+                else
+                {
+                    InterlockedAdd(r.counts[COUNT_SECOND_PASS], 1);
+                }
+            }
+            else if ((r.flags & RASTER_OCCLUSION) != 0)
+            {
+                GroupGpu* g = s.groups + inst.group;
+                Placement before_copy;
+                Placement before;
+                if (placement(g, g.previous, inst.group_index, v, before_copy)
+                    && cluster_placement(s, slot, inst, c, before_copy, true, before)
+                    && box_occluded(v, r, before, lo, hi, true))
+                {
+                    InterlockedOr(rejected, 1u << thread);
+                    InterlockedAdd(r.counts[COUNT_OCCLUDED_CLUSTERS], 1);
+                    shown = false;
+                }
+            }
+        }
+        if (shown)
+            draw(s, v, r, slot, mesh, page, w.page, local, c, p, material, s.materials + material);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (thread != 0 || rejected == 0 || second)
+        return;
+    uint at;
+    InterlockedAdd(r.counts[COUNT_WORK], 1, at);
+    if (at >= r.work_capacity)
+    {
+        InterlockedAdd(r.counts[COUNT_WORK_DROPPED], 1);
+        return;
+    }
+    ClusterWork out = w;
+    out.first = w.first & ~WORK_RETRY;
+    out.mask = rejected;
+    r.work[at] = out;
 }
 
 // One workgroup per producer entry, its threads over the clusters it emitted. Opaque and
@@ -312,14 +367,15 @@ void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     }
 }
 
-// Sizes the hardware draws, the software dispatch and the particle draws to their lists.
+// Sizes the hardware draws, the software dispatch and the particle draws to their lists
+// past what an earlier pass drew.
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void raster_args(uint3 id: SV_DispatchThreadID)
 {
     RasterGpu* r = root.raster;
-    write_grid(r.args + ARGS_OPAQUE, r.counts[COUNT_OPAQUE]);
-    write_grid(r.args + ARGS_ALPHA, r.counts[COUNT_ALPHA]);
-    write_grid(r.args + ARGS_SOFTWARE, r.counts[COUNT_SOFTWARE]);
+    write_grid(r.args + ARGS_OPAQUE, r.counts[COUNT_OPAQUE] - r.counts[COUNT_OPAQUE_BASE]);
+    write_grid(r.args + ARGS_ALPHA, r.counts[COUNT_ALPHA] - r.counts[COUNT_ALPHA_BASE]);
+    write_grid(r.args + ARGS_SOFTWARE, r.counts[COUNT_SOFTWARE] - r.counts[COUNT_SOFTWARE_BASE]);
     write_grid(r.args + ARGS_PARTICLES, r.counts[COUNT_PARTICLES]);
 }

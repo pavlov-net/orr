@@ -4,8 +4,11 @@
 //! A frame runs in a fixed order on the render thread: [`Scenes::begin_frame`], writes
 //! through [`SceneWriter`] and [`MaterialWriter`] (from any threads), one
 //! [`Frame::update_scenes`], one [`Frame::raster_view`] per view, then [`Frame::end`].
-//! A view's raster half draws the scene's clusters into a visibility buffer and resolves
-//! each pixel's surface into the G-buffer that later passes read through `load_gsurface`.
+//! `update_scenes` traverses each scene's cluster DAGs once from its focus, choosing the
+//! clusters every view culls and rasters and the ones each traced copy's BLAS holds. A
+//! view's raster half culls and draws the scene's clusters into a visibility buffer in two
+//! passes around an HZB and resolves each pixel's surface into the G-buffer that later
+//! passes read through `load_gsurface`.
 //! Writers put data straight into mapped upload memory and `update_scenes` applies every
 //! write with one scatter dispatch; orr keeps no CPU copy of GPU tables. Every pass reads
 //! a scene through its [`SceneRoot`].
@@ -14,7 +17,8 @@
 //! copies run on the loading side ([`Loading`]): orr's loading thread and the threads the
 //! consumer lends to [`Loading::run_worker`]. The render thread only polls. Hierarchy pages
 //! below a mesh's top page stream on request ([`Scenes::prefetch`]) under the pool budgets
-//! of [`Budgets`]; [`Scenes::residency`] reports what is resident.
+//! of [`Budgets`] and on the traversal's requests; [`Scenes::residency`] reports what is
+//! resident.
 
 mod accel;
 mod emissive;
@@ -37,6 +41,7 @@ mod stream;
 pub mod testing;
 mod time;
 mod transparency;
+mod traverse;
 mod upload;
 mod view;
 mod world;
@@ -57,20 +62,22 @@ pub use producer::{
 pub use ptlas::RtStats;
 pub use residency::{ClassStats, ResidencyClass, ResidencyStats};
 pub use scene::{
-    Affine3, CopyVariant, GroupWriter, InstanceFlags, InstanceRange, InstancesDesc, ModelId, Pose,
-    SceneDesc, SceneId, SceneWriter, TransformGroupDesc, TransformGroupId,
+    Affine3, CopyVariant, DebugLod, GroupWriter, InstanceFlags, InstanceRange, InstancesDesc,
+    ModelId, Pose, SceneDesc, SceneId, SceneWriter, TransformGroupDesc, TransformGroupId,
 };
 pub use scenes::{
     Budgets, ConsumerMarker, Frame, FrameDesc, FrameStats, RendererDesc, SceneCompute, Scenes,
 };
 pub use shaders::types::{
-    ClusterRef, ClusterWork, EmissiveGpu, GBufferGpu, GroupGpu, InstanceGpu, LightGpu, MaskGpu,
-    MaterialGpu, MeshGpu, MeshLevel, ModelGpu, PartGpu, ProducerBatch, ProducerClusterGpu,
-    ProducerGpu, ProducerStateGpu, RasterGpu, RasterRoot, RtCutGpu, SceneRoot, SkyStats,
-    SlotStateGpu, TopologyGpu, VisibleCluster,
+    BlasJob, ClusterRef, ClusterWork, CutGpu, CutKey, EmissiveGpu, FeedbackGpu, GBufferGpu,
+    GroupGpu, InstanceGpu, LightGpu, MaskGpu, MaterialGpu, MeshGpu, MeshLevel, ModelGpu, NodeItem,
+    PartGpu, ProducerBatch, ProducerClusterGpu, ProducerGpu, ProducerStateGpu, RasterGpu,
+    RasterRoot, RtCutGpu, SceneRoot, SkyStats, SlotCutGpu, SlotStateGpu, TopologyGpu,
+    VisibleCluster,
 };
 pub use time::FrameTime;
 pub use transparency::TransparencyPass;
+pub use traverse::CutStats;
 pub use view::{
     DepthOfField, ExposureState, Focus, Glare, Lens, LensDistortion, Projection, RasterView,
     ViewConstants, ViewDesc, ViewHistoryId, ViewTarget,
