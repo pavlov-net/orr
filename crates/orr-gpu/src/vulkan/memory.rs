@@ -1,6 +1,8 @@
 //! `gpu_malloc` and transient arenas: buffers with device addresses, sub-allocated from
 //! orr-memory pools.
 
+use std::alloc::Layout;
+use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
@@ -10,7 +12,7 @@ use std::time::Duration;
 
 use ash::vk;
 use bytemuck::Pod;
-use orr_memory::{AllocationFlags, Allocator, AllocatorDesc, Arena, Pool, PoolDesc};
+use orr_memory::{AllocError, AllocationFlags, Allocator, AllocatorDesc, Arena, Pool, PoolDesc};
 
 use super::debug::name_object;
 use super::device::{Device, Shared};
@@ -590,70 +592,60 @@ impl Device {
     }
 }
 
-/// Short-lived GPU memory: a ring of linear arenas, one per frame in flight on the render
-/// queue, or one per loading batch in flight on the loading queue. Allocation bumps a
-/// pointer in the current arena; [`TransientArenas::finish`] closes it at the timeline
-/// point of the work that uses it, and the arena is reset in one step once that point has
-/// completed. The arenas' blocks hold only transient memory, never resident or streaming
-/// data.
-///
-/// One thread owns the ring. Dropping it frees the blocks once everything submitted before
-/// the drop has completed.
-pub struct TransientArenas {
-    arenas: Vec<ArenaSlot>,
+/// The blocks behind [`HostArenas`] and [`DeviceArenas`]: a ring of linear arenas, one per
+/// frame in flight on the render queue, or one per loading batch in flight on the loading
+/// queue. Allocation bumps the current arena; `reset` closes it at a timeline point and moves
+/// to the next arena once the point that closed that one has completed. The blocks hold only
+/// transient memory, never resident or streaming data.
+struct Ring {
+    blocks: Vec<Block>,
     current: usize,
+    /// The current arena, over mapped addresses for host arenas and device addresses for
+    /// device arenas.
+    arena: RefCell<Arena>,
     kind: MemoryKind,
     name: Box<str>,
     shared: Arc<Shared>,
 }
 
-struct ArenaSlot {
-    block: RawBuffer,
+struct Block {
+    raw: RawBuffer,
     mapped: Option<NonNull<u8>>,
-    arena: Arena,
-    /// The point given to the `finish` that closed the arena.
+    /// The point given to the `reset` that closed the arena.
     done: Option<TimelinePoint>,
 }
 
 // SAFETY: the blocks and their mappings belong to the ring alone.
-unsafe impl Send for TransientArenas {}
+unsafe impl Send for Ring {}
 
-/// Memory from [`TransientArenas`]: `size` bytes at `gpu`, mapped at `cpu` for host-visible
-/// kinds. It is valid until the point its arena was finished at has completed; writing
-/// through `cpu` after that races with later users of the arena.
-#[derive(Debug)]
-pub struct Transient<T: 'static> {
-    pub gpu: GpuPtr<T>,
-    pub cpu: Option<NonNull<T>>,
-    pub size: u64,
-}
+impl Block {
+    fn mapped_addr(&self) -> usize {
+        self.mapped.unwrap().addr().get()
+    }
 
-impl<T> Clone for Transient<T> {
-    fn clone(&self) -> Self {
-        *self
+    /// The arena's base: the mapped address when mapped, else the device address.
+    fn base(&self) -> u64 {
+        self.mapped
+            .map_or(self.raw.address, |p| p.addr().get() as u64)
     }
 }
 
-impl<T> Copy for Transient<T> {}
-
-impl Device {
-    /// `count` arenas of `bytes` each, in `kind` memory from transient-only blocks.
-    pub fn create_transient_arenas(
-        &self,
+impl Ring {
+    fn new(
+        shared: &Arc<Shared>,
         kind: MemoryKind,
         count: u32,
         bytes: u64,
         name: &str,
-    ) -> Result<TransientArenas, Error> {
+    ) -> Result<Self, Error> {
         if count == 0 || bytes == 0 {
             return Err(Error::Invalid(format!(
                 "{name}: {count} transient arenas of {bytes} bytes"
             )));
         }
-        let shared = &self.shared;
-        let arenas = (0..count)
+        let blocks = (0..count)
             .map(|i| {
-                let (block, mapped) = shared.create_buffer_in(
+                let (raw, mapped) = shared.create_buffer_in(
                     true,
                     kind,
                     bytes,
@@ -661,96 +653,227 @@ impl Device {
                     MALLOC_ALIGN,
                     &format!("{name} {i}"),
                 )?;
-                let arena = Arena::new(block.address, bytes);
-                Ok(ArenaSlot {
-                    block,
+                Ok(Block {
+                    raw,
                     mapped,
-                    arena,
                     done: None,
                 })
             })
-            .collect::<Result<_, Error>>()?;
-        Ok(TransientArenas {
-            arenas,
+            .collect::<Result<Vec<_>, Error>>()?;
+        let mut ring = Self {
+            blocks,
             current: 0,
+            arena: RefCell::new(Arena::new(0, bytes)),
             kind,
             name: name.into(),
             shared: Arc::clone(shared),
-        })
-    }
-}
-
-impl TransientArenas {
-    pub fn kind(&self) -> MemoryKind {
-        self.kind
-    }
-
-    /// `count` values of `T` from the current arena, at an address that is a multiple of
-    /// `align` (a power of two), of 16 and of `T`'s alignment. Fails with
-    /// [`Error::ArenaFull`] when the arena has no room left.
-    pub fn alloc<T>(&mut self, count: u64, align: u64) -> Result<Transient<T>, Error> {
-        if !align.is_power_of_two() {
-            return Err(Error::Invalid(format!("{}: alignment {align}", self.name)));
+        };
+        if let Some(b) = ring.blocks.iter().find(|b| {
+            !b.base()
+                .wrapping_sub(b.raw.address)
+                .is_multiple_of(MALLOC_ALIGN)
+        }) {
+            return Err(Error::Invalid(format!(
+                "{name}: mapping {:#x} is not aligned like address {:#x}",
+                b.base(),
+                b.raw.address
+            )));
         }
-        let size = count
-            .checked_mul(size_of::<T>() as u64)
-            .filter(|&s| s > 0)
-            .ok_or_else(|| Error::Invalid(format!("{}: {count} values", self.name)))?;
-        let align = align.max(MIN_ALIGN).max(align_of::<T>() as u64);
-        let slot = &mut self.arenas[self.current];
-        let address = slot.arena.alloc(size, align).ok_or_else(|| {
-            Error::ArenaFull(format!(
-                "{}: {size} bytes with {} of {} used",
-                self.name,
-                slot.arena.used(),
-                slot.arena.size()
-            ))
-        })?;
-        let offset = (address - slot.block.address) as usize;
-        Ok(Transient {
-            // SAFETY: the range lies in the arena's block.
-            gpu: unsafe { GpuPtr::from_address(GpuAddress(address)) },
-            // SAFETY: the mapping covers the block.
-            cpu: slot.mapped.map(|p| unsafe { p.add(offset) }.cast::<T>()),
-            size,
-        })
+        ring.start(0);
+        Ok(ring)
     }
 
-    /// Copies `values` into the current arena; host-visible kinds only.
-    pub fn upload<T: Pod>(&mut self, values: &[T]) -> Result<GpuPtr<T>, Error> {
-        let t = self.alloc::<T>(values.len() as u64, 1)?;
-        let cpu = t.cpu.ok_or_else(|| {
-            Error::Invalid(format!(
-                "{}: {:?} memory is not mapped",
-                self.name, self.kind
-            ))
-        })?;
-        // SAFETY: the range was just allocated for `values.len()` values and nothing else
-        // uses it until the arena is finished.
-        unsafe {
-            std::ptr::copy_nonoverlapping(values.as_ptr(), cpu.as_ptr(), values.len());
-        }
-        Ok(t.gpu)
+    /// Makes block `i` the current arena, empty.
+    fn start(&mut self, i: usize) {
+        let arena = self.arena.get_mut();
+        *arena = Arena::new(self.blocks[i].base(), arena.size());
+        self.current = i;
     }
 
-    /// Closes the current arena: the work signaling `point` is the last to use it. Moves to
-    /// the next arena, first waiting for the point that closed it, then resetting it.
-    pub fn finish(&mut self, point: TimelinePoint) -> Result<(), Error> {
-        self.arenas[self.current].done = Some(point);
-        self.current = (self.current + 1) % self.arenas.len();
-        let next = &mut self.arenas[self.current];
-        if let Some(done) = next.done.take() {
+    /// The current block and the offset of `layout` in it.
+    fn bump(&self, layout: Layout) -> Result<(&Block, u64), AllocError> {
+        let mut arena = self.arena.borrow_mut();
+        let start = arena.allocate(layout)?;
+        Ok((&self.blocks[self.current], start - arena.base()))
+    }
+
+    fn reset(&mut self, after: TimelinePoint) -> Result<(), Error> {
+        self.blocks[self.current].done = Some(after);
+        let next = (self.current + 1) % self.blocks.len();
+        if let Some(done) = self.blocks[next].done {
             self.shared.wait(done, Duration::MAX)?;
+            self.blocks[next].done = None;
         }
-        next.arena.reset();
+        self.start(next);
         Ok(())
     }
 }
 
-impl Drop for TransientArenas {
+impl Drop for Ring {
     fn drop(&mut self) {
-        for slot in self.arenas.drain(..) {
-            self.shared.defer_after_submitted(Item::Buffer(slot.block));
+        for b in self.blocks.drain(..) {
+            self.shared.defer_after_submitted(Item::Buffer(b.raw));
         }
+    }
+}
+
+/// Short-lived host-visible memory, Upload or Readback, for the CPU to fill or read: a ring
+/// of linear arenas, one per frame in flight on the render queue or one per loading batch in
+/// flight on the loading queue. The blocks hold only transient memory.
+///
+/// The allocation methods have the signatures and meaning of `std`'s `Allocator` trait.
+/// Allocation bumps a pointer in the current arena. [`HostArenas::deallocate`] does nothing:
+/// unlike `std`'s allocators, the memory comes back only once the GPU is done with it, when
+/// the ring returns to the arena through [`HostArenas::reset`]. Memory from an arena is valid
+/// on the CPU until that return, whether or not `deallocate` was called; `reset` takes
+/// `&mut self`, so no container borrowing the ring outlives it. The GPU may use the memory
+/// until the point given to the `reset` that closed the arena has completed.
+///
+/// One thread owns the ring. Dropping it frees the blocks once everything submitted before
+/// the drop has completed.
+pub struct HostArenas {
+    ring: Ring,
+}
+
+/// Short-lived DeviceLocal memory for the GPU, handed out as device addresses: a ring of
+/// linear arenas, one per frame in flight on the render queue or one per loading batch in
+/// flight on the loading queue. The blocks hold only transient memory. Nothing is freed one
+/// by one; [`DeviceArenas::reset`] closes the current arena.
+///
+/// One thread owns the ring. Dropping it frees the blocks once everything submitted before
+/// the drop has completed.
+pub struct DeviceArenas {
+    ring: Ring,
+}
+
+impl Device {
+    /// `count` arenas of `bytes` each in `kind` memory, Upload or Readback, from
+    /// transient-only blocks.
+    pub fn create_host_arenas(
+        &self,
+        kind: MemoryKind,
+        count: u32,
+        bytes: u64,
+        name: &str,
+    ) -> Result<HostArenas, Error> {
+        if kind == MemoryKind::DeviceLocal {
+            return Err(Error::Invalid(format!(
+                "{name}: host arenas take Upload or Readback memory"
+            )));
+        }
+        let ring = Ring::new(&self.shared, kind, count, bytes, name)?;
+        Ok(HostArenas { ring })
+    }
+
+    /// `count` arenas of `bytes` each in DeviceLocal memory, from transient-only blocks.
+    pub fn create_device_arenas(
+        &self,
+        count: u32,
+        bytes: u64,
+        name: &str,
+    ) -> Result<DeviceArenas, Error> {
+        let kind = MemoryKind::DeviceLocal;
+        let ring = Ring::new(&self.shared, kind, count, bytes, name)?;
+        Ok(DeviceArenas { ring })
+    }
+}
+
+impl HostArenas {
+    pub fn kind(&self) -> MemoryKind {
+        self.ring.kind
+    }
+
+    /// `layout.size()` bytes from the current arena at a multiple of `layout.align()`; up to
+    /// 256 bytes of alignment the device address is aligned the same. Fails when the arena
+    /// has no room left.
+    pub fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let (ptr, _) = self.place(layout)?;
+        Ok(NonNull::slice_from_raw_parts(ptr, layout.size()))
+    }
+
+    /// The mapped and device addresses of `layout` in the current arena.
+    fn place(&self, layout: Layout) -> Result<(NonNull<u8>, u64), AllocError> {
+        let (block, offset) = self.ring.bump(layout)?;
+        // SAFETY: the range lies in the block's mapping.
+        let ptr = unsafe { block.mapped.unwrap().add(offset as usize) };
+        Ok((ptr, block.raw.address + offset))
+    }
+
+    /// As [`HostArenas::allocate`], with the bytes zeroed.
+    pub fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        let ptr = self.allocate(layout)?;
+        // SAFETY: the range was just allocated and nothing else uses it.
+        unsafe { ptr.cast::<u8>().write_bytes(0, layout.size()) };
+        Ok(ptr)
+    }
+
+    /// Does nothing. The memory comes back once the GPU is done with it, after a
+    /// [`HostArenas::reset`].
+    ///
+    /// # Safety
+    ///
+    /// `ptr` came from these arenas with `layout`.
+    pub unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {}
+
+    /// The device address of `ptr`. Panics if `ptr` is not in the arenas; the end of an
+    /// arena counts, where an empty allocation can land.
+    pub fn gpu_ptr<T>(&self, ptr: NonNull<T>) -> GpuPtr<T> {
+        let addr = ptr.addr().get();
+        let blocks = &self.ring.blocks;
+        // Two blocks can be adjacent in the mapping; a pointer at the start of one is in it,
+        // not at the end of the other.
+        let block = blocks
+            .iter()
+            .find(|b| (b.mapped_addr()..b.mapped_addr() + b.raw.size as usize).contains(&addr))
+            .or_else(|| {
+                blocks
+                    .iter()
+                    .find(|b| b.mapped_addr() + b.raw.size as usize == addr)
+            })
+            .unwrap_or_else(|| panic!("{}: {ptr:p} is not in the arenas", self.ring.name));
+        let offset = (addr - block.mapped_addr()) as u64;
+        // SAFETY: the address lies in or at the end of the block.
+        unsafe { GpuPtr::from_address(GpuAddress(block.raw.address + offset)) }
+    }
+
+    /// Copies `values` into the current arena, at a multiple of 16 and of `T`'s alignment.
+    pub fn upload<T: Pod>(&self, values: &[T]) -> Result<GpuPtr<T>, AllocError> {
+        let layout = Layout::for_value(values)
+            .align_to(MIN_ALIGN as usize)
+            .map_err(|_| AllocError)?;
+        let (ptr, gpu) = self.place(layout)?;
+        // SAFETY: the range was just allocated for `values.len()` values and nothing else
+        // uses it.
+        unsafe {
+            ptr.cast::<T>()
+                .copy_from_nonoverlapping(NonNull::from(values).cast(), values.len());
+        }
+        // SAFETY: the range lies in the block.
+        Ok(unsafe { GpuPtr::from_address(GpuAddress(gpu)) })
+    }
+
+    /// Closes the current arena: the work signaling `after` is the last to use it. Moves to
+    /// the next arena, first waiting for the point that closed it.
+    pub fn reset(&mut self, after: TimelinePoint) -> Result<(), Error> {
+        self.ring.reset(after)
+    }
+}
+
+impl DeviceArenas {
+    /// `layout.size()` bytes from the current arena, at a device address that is a multiple
+    /// of `layout.align()` and of 16. Fails when the arena has no room left.
+    pub fn allocate(&self, layout: Layout) -> Result<GpuPtr<u8>, AllocError> {
+        let layout = layout
+            .align_to(MIN_ALIGN as usize)
+            .map_err(|_| AllocError)?;
+        let (block, offset) = self.ring.bump(layout)?;
+        // SAFETY: the range lies in the block.
+        Ok(unsafe { GpuPtr::from_address(GpuAddress(block.raw.address + offset)) })
+    }
+
+    /// Closes the current arena: the work signaling `after` is the last to use it. Moves to
+    /// the next arena, first waiting for the point that closed it.
+    pub fn reset(&mut self, after: TimelinePoint) -> Result<(), Error> {
+        self.ring.reset(after)
     }
 }

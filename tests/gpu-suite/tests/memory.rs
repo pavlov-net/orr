@@ -1,6 +1,7 @@
 //! Sub-allocation and transient arenas. In its own process so the device-memory counts it
 //! reads are its own.
 
+use std::alloc::Layout;
 use std::time::Duration;
 
 use gpu_suite::shaders::gate;
@@ -17,7 +18,7 @@ fn steady_frames_reuse_memory_without_allocating() {
         .gpu_malloc::<u32>(MemoryKind::Readback, 1, "gate out")
         .unwrap();
     let mut arenas = d
-        .create_transient_arenas(
+        .create_host_arenas(
             MemoryKind::Upload,
             FRAMES_IN_FLIGHT as u32,
             1 << 16,
@@ -46,6 +47,15 @@ fn steady_frames_reuse_memory_without_allocating() {
                 "frame {frame} reused its arena before the arena's point completed"
             );
         }
+        let block = arenas
+            .allocate(Layout::from_size_align(4, 256).unwrap())
+            .unwrap()
+            .cast::<u8>();
+        assert!(
+            block.addr().get().is_multiple_of(256)
+                && arenas.gpu_ptr(block).address().0.is_multiple_of(256),
+            "frame {frame}: an aligned allocation is not aligned on both sides"
+        );
         let root = arenas.upload(&[gate::Root { flag, out: out.gpu }]).unwrap();
         let scratch = d
             .gpu_malloc::<u32>(MemoryKind::DeviceLocal, 4096, "scratch")
@@ -55,7 +65,7 @@ fn steady_frames_reuse_memory_without_allocating() {
         list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
         let point = queue.submit(vec![list], &[]).unwrap();
         d.gpu_free(scratch, point);
-        arenas.finish(point).unwrap();
+        arenas.reset(point).unwrap();
         frames.push((flag.address(), point));
         d.collect_garbage();
     }

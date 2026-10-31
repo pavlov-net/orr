@@ -1,6 +1,7 @@
+use std::alloc::Layout;
 use std::ptr;
 
-use crate::{Result, check, sys};
+use crate::{AllocError, Result, check, sys};
 
 /// Places ranges inside a space of `size` units that the caller owns: a buffer, a heap of
 /// slots, a file. It touches no memory and needs no device.
@@ -15,7 +16,7 @@ unsafe impl Send for VirtualBlock {}
 // SAFETY: `&self` methods only read statistics.
 unsafe impl Sync for VirtualBlock {}
 
-/// A range of a [`VirtualBlock`], given back with [`VirtualBlock::free`].
+/// A range of a [`VirtualBlock`], given back with [`VirtualBlock::deallocate`].
 #[derive(Debug)]
 pub struct VirtualAllocation {
     pub offset: u64,
@@ -48,7 +49,7 @@ impl VirtualBlock {
         let info = sys::VmaVirtualBlockCreateInfo {
             size,
             flags: if linear {
-                sys::VMA_VIRTUAL_BLOCK_CREATE_LINEAR_ALGORITHM_BIT as u32
+                sys::VMA_VIRTUAL_BLOCK_CREATE_LINEAR_ALGORITHM_BIT
             } else {
                 0
             },
@@ -62,16 +63,15 @@ impl VirtualBlock {
         Ok(Self { raw, generation: 0 })
     }
 
-    /// A range of `size` units at a multiple of `align`, a power of two; `None` when no free
-    /// range fits or `size` is 0.
-    pub fn alloc(&mut self, size: u64, align: u64) -> Option<VirtualAllocation> {
-        assert!(align.is_power_of_two(), "alignment {align}");
-        if size == 0 {
-            return None;
+    /// A range of `layout.size()` units at a multiple of `layout.align()`. Fails when no free
+    /// range fits or the size is 0.
+    pub fn allocate(&mut self, layout: Layout) -> Result<VirtualAllocation, AllocError> {
+        if layout.size() == 0 {
+            return Err(AllocError);
         }
         let info = sys::VmaVirtualAllocationCreateInfo {
-            size,
-            alignment: align,
+            size: layout.size() as u64,
+            alignment: layout.align() as u64,
             flags: 0,
             // The linear algorithm takes a null user pointer for a free range.
             pUserData: ptr::dangling_mut(),
@@ -80,19 +80,19 @@ impl VirtualBlock {
         let mut offset = 0;
         // SAFETY: a live block, valid create info and out pointers.
         let r = unsafe { sys::vmaVirtualAllocate(self.raw, &info, &mut raw, &mut offset) };
-        check("vmaVirtualAllocate", r).ok()?;
-        Some(VirtualAllocation {
+        check("vmaVirtualAllocate", r).map_err(|_| AllocError)?;
+        Ok(VirtualAllocation {
             offset,
-            size,
+            size: info.size,
             raw,
             block: self.raw,
             generation: self.generation,
         })
     }
 
-    /// Frees `a`. Panics if `a` came from another block or from before a
+    /// Frees `a` now. Panics if `a` came from another block or from before a
     /// [`VirtualBlock::clear`].
-    pub fn free(&mut self, a: VirtualAllocation) {
+    pub fn deallocate(&mut self, a: VirtualAllocation) {
         assert!(
             a.block == self.raw && a.generation == self.generation,
             "a range freed into a block that does not hold it"

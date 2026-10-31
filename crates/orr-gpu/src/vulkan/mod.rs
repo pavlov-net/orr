@@ -40,7 +40,7 @@ pub use interop::{
     image_handles, raw_device,
 };
 pub use memory::{
-    Allocation, HeapReport, MemoryKind, MemoryReport, MemoryUsage, Transient, TransientArenas,
+    Allocation, DeviceArenas, HeapReport, HostArenas, MemoryKind, MemoryReport, MemoryUsage,
 };
 pub use mesh::{ColorAttachment, DepthAttachment, MeshPipeline, MeshPipelineDesc, Rendering};
 pub use pipeline::{ComputePipeline, ShaderStage};

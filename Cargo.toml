@@ -46,7 +46,6 @@ io-uring = "0.7.15"
 libc = "0.2"
 windows = "0.62.2"
 
-bindgen = { version = "0.73.2", default-features = false }
 cc = "1.10"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

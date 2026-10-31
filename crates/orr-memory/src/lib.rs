@@ -6,9 +6,14 @@
 //!   blocks. Nothing is ever moved: GPU data holds device addresses.
 //! - [`VirtualBlock`] places ranges inside any space the caller owns. It needs no device.
 //! - [`Arena`] bump-allocates device-address ranges and frees them all in one step.
+//!
+//! Requests for a size and an alignment take a [`Layout`](std::alloc::Layout), and a request
+//! that finds no room fails with [`AllocError`], as with `std`'s allocators. Calls that reach
+//! Vulkan fail with [`Error`], which carries the Vulkan result.
 
 mod allocator;
 mod arena;
+mod sys;
 mod virtual_block;
 
 pub use allocator::{
@@ -19,20 +24,17 @@ pub use virtual_block::{VirtualAllocation, VirtualBlock, VirtualStats};
 
 use ash::vk;
 
-#[allow(
-    dead_code,
-    non_camel_case_types,
-    non_snake_case,
-    non_upper_case_globals,
-    unreachable_pub,
-    unused_qualifications,
-    clippy::all,
-    clippy::pedantic,
-    clippy::undocumented_unsafe_blocks
-)]
-mod sys {
-    include!(concat!(env!("OUT_DIR"), "/vma.rs"));
+/// No free range fits the requested layout.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct AllocError;
+
+impl std::fmt::Display for AllocError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("memory allocation failed")
+    }
 }
+
+impl std::error::Error for AllocError {}
 
 /// A failure.
 #[derive(Debug, thiserror::Error)]
@@ -47,8 +49,8 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-fn check(call: &'static str, result: sys::VkResult) -> Result<()> {
-    match vk::Result::from_raw(result) {
+fn check(call: &'static str, result: vk::Result) -> Result<()> {
+    match result {
         vk::Result::SUCCESS => Ok(()),
         result => Err(Error::Vulkan { call, result }),
     }
