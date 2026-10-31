@@ -295,6 +295,7 @@ impl View {
                 display: &self.display,
                 output: &output,
                 hook_source: hooks.display_linear.then_some(self.chain.rr_output_store),
+                glare: None,
             },
         );
         if let (Some(inputs), Some(hook)) = (&inputs, display_linear) {

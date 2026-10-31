@@ -1,11 +1,12 @@
 // Pre-exposed linear Rec.2020 radiance to display-linear Rec.709: the view's adapted
-// exposure, its white balance, the grade, then GT7, or one of the debug views.
+// exposure, its glare, its white balance, the grade, then GT7, or one of the debug views.
 #include "orr/root.h"
 import orr.abi;
 import orr.color;
 import view;
 import exposure;
 import gt7;
+import tent;
 
 static const uint DEBUG_NONE = 0;
 static const uint DEBUG_LINEAR = 1;
@@ -40,10 +41,15 @@ struct Root
     ViewConstants* view;
     // Rows of adapt's white balance matrix.
     float4* white_balance;
+    // The glare pass's weights: entry 0's xyz is the identity weight.
+    float4* glare_weights;
     TextureIndex source;
     StorageImageIndex target;
     // The `display_linear` hook's source, written with the same result; NONE without one.
     StorageImageIndex hook_source;
+    // The glare chain, whose mip 0 holds the weighted band sum; NONE without glare.
+    TextureIndex glare;
+    SamplerIndex linear;
     uint width;
     uint height;
     uint _pad;
@@ -90,11 +96,20 @@ void main(uint3 id: SV_DispatchThreadID)
         float scale = exposure_from_ev100(next.adapted_ev100) / cur.pre_exposure;
         float3 radiance = root.source.get<Texture2D<float4>>().Load(int3(id.xy, 0)).rgb;
         float3 exposed = radiance * scale;
-        float3 balanced = exposed;
+        float3 glared = exposed;
+        if (root.glare.index != NO_IMAGE)
+        {
+            float2 texel = 1.0 / float2(root.width, root.height);
+            float2 uv = (float2(id.xy) + 0.5) * texel;
+            Texture2D<float4> chain = root.glare.get<Texture2D<float4>>();
+            glared = root.glare_weights[0].xyz * exposed
+                   + tent(chain, root.linear.get(), uv, texel, 0.0);
+        }
+        float3 balanced = glared;
         if (k.white_balance != 0)
         {
             float4* m = root.white_balance;
-            balanced = float3(dot(m[0].xyz, exposed), dot(m[1].xyz, exposed), dot(m[2].xyz, exposed));
+            balanced = float3(dot(m[0].xyz, glared), dot(m[1].xyz, glared), dot(m[2].xyz, glared));
         }
         float3 graded = k.grade_scale * float3(dot(k.grade_r.xyz, balanced),
                                                dot(k.grade_g.xyz, balanced),
