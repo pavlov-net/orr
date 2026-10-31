@@ -23,7 +23,8 @@ pub mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
 }
 
-/// orr-scene's and orr-lighting's kernels with `surfaces/context.slang` linked as surface 1.
+/// orr-scene's and orr-lighting's kernels with `surfaces/context.slang` linked as surface 1,
+/// `Rings` as surface 2 and `Veil` as surface 3 (`rings.slang`).
 pub mod linked {
     include!(concat!(env!("OUT_DIR"), "/linked/orr_kernels.rs"));
 }

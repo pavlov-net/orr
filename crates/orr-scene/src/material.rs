@@ -240,7 +240,9 @@ impl MaterialWriter<'_> {
         Ok(id)
     }
 
-    /// Replaces material `id` from this frame on.
+    /// Replaces material `id` from this frame on. Its triangles stay as opaque or
+    /// micromapped in traversal as their mount cooked them: coverage that changes at run time
+    /// goes through a linked surface's `coverage`.
     pub fn update(&mut self, id: MaterialId, m: &MaterialGpu) -> Result<()> {
         assert!(
             id.0 < self.table.capacity,

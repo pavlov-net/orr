@@ -340,27 +340,45 @@ impl<'m, 's> Run<'m, 's> {
                 _ => None,
             };
             run.old.push(old);
-            for asset in &spec.assets {
-                run.source(a, asset, &previous)?;
+            // Texture assets first, so that library meshes find the textures their
+            // materials name; reports keep the manifest's order.
+            let first = run.assets.len();
+            run.assets
+                .extend(spec.assets.iter().map(|asset| AssetReport {
+                    name: asset.name.clone(),
+                    archive: a,
+                    ..AssetReport::default()
+                }));
+            let n = spec.assets.len();
+            let is_texture = |i: &usize| matches!(spec.assets[*i].source, Source::Texture { .. });
+            let order = (0..n)
+                .filter(is_texture)
+                .chain((0..n).filter(|i| !is_texture(i)));
+            let mut textures = HashMap::new();
+            for i in order {
+                let asset = &spec.assets[i];
+                run.source(a, first + i, asset, &previous, &textures)?;
+                if is_texture(&i) {
+                    let u = &run.units[run.by_name[&(a, asset.name.clone())]];
+                    textures.insert(AssetId::from_name(&asset.name), (u.name.clone(), u.key));
+                }
             }
         }
         Ok(run)
     }
 
-    /// Turns a source into units, or into a pending import or instance set.
+    /// Turns a source into units, or into a pending import or instance set, reporting as
+    /// asset `index`. Library meshes read `textures`: the archive's texture assets by id,
+    /// with their unit names and keys.
     fn source(
         &mut self,
         a: usize,
+        index: usize,
         asset: &'m crate::AssetSpec,
         previous: &HashMap<Hash32, Record>,
+        textures: &HashMap<AssetId, (String, Hash32)>,
     ) -> Result<()> {
         let name = asset.name.as_str();
-        let index = self.assets.len();
-        self.assets.push(AssetReport {
-            name: name.into(),
-            archive: a,
-            ..AssetReport::default()
-        });
         match &asset.source {
             Source::Gltf { path, settings } => {
                 self.queue_import(a, index, name, path, ImportKind::Gltf(settings), previous)?;
@@ -443,7 +461,7 @@ impl<'m, 's> Run<'m, 's> {
                 materials,
                 settings,
             } => {
-                let (units, assembly) = mesh_units(name, mesh, materials, settings)?;
+                let (units, assembly) = mesh_units(name, mesh, materials, settings, textures)?;
                 self.add_units(a, index, units);
                 self.add_assemblies(a, assembly);
             }
@@ -1530,22 +1548,10 @@ fn plan_scene(name: &str, mut src: Scene, rules: &TextureRules) -> Result<Import
             let t = &src.materials[mi].textures;
             sec.maps = map_spec(&materials[mi].2, t, &textures);
             deps.extend(sec.maps.units().map(str::to_string));
-            let bakes = model.settings.displace_static.is_some()
-                && sec
-                    .maps
-                    .displacement
-                    .as_ref()
-                    .is_some_and(|d| d.texture.is_some());
-            model_materials.push(if bakes {
+            model_materials.push(if bakes_displacement(&model.settings, &sec.maps) {
                 *baked.entry(mi).or_insert_with(|| {
-                    let mut m = materials[mi].2;
-                    m.textures[slot::DISPLACEMENT] = bytemuck::Zeroable::zeroed();
-                    m.displacement_scale = 0.0;
-                    m.displacement_offset = 0.0;
-                    m.displacement_min = 0.0;
-                    m.displacement_max = 0.0;
                     let suffix = &src.materials[mi].suffix;
-                    let unit = material_unit(format!("{}/static", material_name(name, suffix)), &m);
+                    let unit = static_material_unit(&material_name(name, suffix), &materials[mi].2);
                     let id = (AssetId::from_name(&unit.name), unit.key);
                     units.push(unit);
                     id
@@ -1638,6 +1644,27 @@ fn scene_instances(name: &str, models: &[(String, Vec<glam::Mat4>)]) -> Result<I
     Ok(src)
 }
 
+/// Whether a section with `maps` bakes its displacement into the geometry.
+fn bakes_displacement(settings: &MeshSettings, maps: &MapSpec) -> bool {
+    settings.displace_static.is_some()
+        && maps
+            .displacement
+            .as_ref()
+            .is_some_and(|d| d.texture.is_some())
+}
+
+/// Material `name`'s variant for statically displaced sections, `<name>/static`: without
+/// its displacement, which the geometry holds.
+fn static_material_unit(name: &str, m: &Material) -> NewUnit {
+    let mut m = *m;
+    m.textures[slot::DISPLACEMENT] = bytemuck::Zeroable::zeroed();
+    m.displacement_scale = 0.0;
+    m.displacement_offset = 0.0;
+    m.displacement_min = 0.0;
+    m.displacement_max = 0.0;
+    material_unit(format!("{name}/static"), &m)
+}
+
 /// A material entry holding `m`.
 fn material_unit(name: String, m: &Material) -> NewUnit {
     let bytes = bytemuck::bytes_of(m).to_vec();
@@ -1688,13 +1715,14 @@ fn map_spec(
     }
 }
 
-/// A mesh, its materials and a model from a library caller's mesh, and the model's
-/// assembly.
+/// A mesh, its materials and a model from a library caller's mesh, whose materials name
+/// textures among `textures`, and the model's assembly.
 fn mesh_units(
     name: &str,
     input: &MeshInput,
     materials: &[Material],
     settings: &MeshSettings,
+    textures: &HashMap<AssetId, (String, Hash32)>,
 ) -> Result<(Vec<NewUnit>, Option<Assembly>)> {
     let fail = |message: String| Error::Mesh {
         asset: name.into(),
@@ -1711,17 +1739,26 @@ fn mesh_units(
     let mesh_name = format!("{name}/mesh");
     let mut sections = Vec::new();
     let mut materials_out = Vec::new();
+    let mut deps = Vec::new();
     for (i, (m, span)) in materials.iter().zip(&input.sections).enumerate() {
-        let unit = material_unit(format!("{name}/material/{i}"), m);
+        let maps = map_spec(m, &MaterialTextures::default(), textures);
+        deps.extend(maps.units().map(str::to_string));
+        let mut unit = material_unit(format!("{name}/material/{i}"), m);
+        if bakes_displacement(settings, &maps) {
+            let baked = static_material_unit(&unit.name, m);
+            units.push(std::mem::replace(&mut unit, baked));
+        }
         materials_out.push((AssetId::from_name(&unit.name), unit.key));
         units.push(unit);
         let first = span.first as usize;
         sections.push(SectionData::new(
             first..first + span.count as usize,
             m,
-            map_spec(m, &MaterialTextures::default(), &HashMap::new()),
+            maps,
         ));
     }
+    deps.sort_unstable();
+    deps.dedup();
     let n = input.positions.len();
     let mesh = MeshData {
         positions: input.positions.iter().map(Vec3::to_array).collect(),
@@ -1752,7 +1789,7 @@ fn mesh_units(
         name: mesh_name,
         mesh,
         settings: settings.clone(),
-        deps: Vec::new(),
+        deps,
     };
     let (model, assembly) = model_units(
         name.into(),
