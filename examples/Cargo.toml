@@ -36,6 +36,10 @@ name = "cluster-rt"
 path = "cluster-rt.rs"
 
 [[example]]
+name = "viewer"
+path = "viewer.rs"
+
+[[example]]
 name = "hdr-calibration"
 path = "hdr-calibration.rs"
 

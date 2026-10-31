@@ -12,17 +12,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use examples::mesh::MeshBuilder;
 use examples::shaders::{capture, sun_shadow};
 use examples::window::Window;
 use examples::{Capture, Options, Workers, assert_clean, device, fixed_time};
 use orr::orr_gpu::{Format, Hazards, MemoryKind, QueueKind, SpecData, Stages, TimelinePoint};
 use orr::orr_output::Image;
 use orr::orr_pack::material::{Material, slot};
-use orr::orr_pack::{AssetId, Span, Target};
+use orr::orr_pack::{AssetId, Target};
 use orr::{
     Affine3, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
     InstancesDesc, Lens, LoadState, PackSource, Projection, Renderer, RendererDesc, SceneDesc,
-    TransformGroupDesc, ViewDesc, ViewTarget,
+    SceneLightingSettings, TransformGroupDesc, ViewDesc, ViewTarget,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSettings, Quality, Source,
@@ -98,17 +99,20 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     }
 
     let scene = renderer
-        .create_scene(&SceneDesc {
-            instance_capacity: 16,
-            group_capacity: 4,
-            light_capacity: 1,
-            material_set_capacity: 16,
-            emissive_capacity: 16,
-            part_capacity: 0,
-            ptlas_partitions: 16,
-            global_instances: 16,
-            ..SceneDesc::default()
-        })
+        .create_scene(
+            &SceneDesc {
+                instance_capacity: 16,
+                group_capacity: 4,
+                light_capacity: 1,
+                material_set_capacity: 16,
+                emissive_capacity: 16,
+                part_capacity: 0,
+                ptlas_partitions: 16,
+                global_instances: 16,
+                ..SceneDesc::default()
+            },
+            &SceneLightingSettings::default(),
+        )
         .expect("scene");
     let history = renderer.create_view_history().expect("view history");
     let models = [MODEL, GROUND].map(|name| {
@@ -227,7 +231,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             .expect("scene writer")
             .set_focus(eye.as_dvec3(), extent[1] as f32 / FOV_Y);
         let view = f
-            .render_view(&ViewDesc {
+            .raster_view(&ViewDesc {
                 scene,
                 history,
                 position: eye.as_dvec3(),
@@ -247,7 +251,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                     ViewTarget::Display
                 },
             })
-            .expect("render view");
+            .expect("raster view");
 
         let fresh = image
             .as_ref()
@@ -351,7 +355,7 @@ fn cook() -> Arc<[u8]> {
     };
 
     let mut model = MeshBuilder::default();
-    model.knot(0, 512, 32);
+    model.knot(0, Vec3::new(0.0, 1.4, 0.0), 512, 32);
     model.quad(
         1,
         [
@@ -449,105 +453,4 @@ fn rings_png() -> PathBuf {
         .and_then(|mut w| w.write_image_data(&data))
         .expect("rings.png");
     path
-}
-
-/// Triangles per material section.
-#[derive(Default)]
-struct MeshBuilder {
-    positions: Vec<Vec3>,
-    normals: Vec<Vec3>,
-    uvs: Vec<Vec2>,
-    sections: Vec<Vec<u32>>,
-}
-
-impl MeshBuilder {
-    fn vertex(&mut self, p: Vec3, n: Vec3, uv: Vec2) -> u32 {
-        self.positions.push(p);
-        self.normals.push(n);
-        self.uvs.push(uv);
-        self.positions.len() as u32 - 1
-    }
-
-    /// Two triangles over the grid cell `c`, `c + 1`, `c + w + 1`, `c + w`, counter-clockwise
-    /// seen from the side the normals face.
-    fn cell(&mut self, section: usize, c: u32, w: u32) {
-        if self.sections.len() <= section {
-            self.sections.resize(section + 1, Vec::new());
-        }
-        self.sections[section].extend([c, c + 1, c + w + 1, c, c + w + 1, c + w]);
-    }
-
-    /// A quad over `corners`, counter-clockwise seen from its front, in `n` x `n` cells.
-    fn quad(&mut self, section: usize, corners: [Vec3; 4], n: u32) {
-        let normal = (corners[1] - corners[0])
-            .cross(corners[3] - corners[0])
-            .normalize();
-        let first = self.positions.len() as u32;
-        for j in 0..=n {
-            for i in 0..=n {
-                let (u, v) = (i as f32 / n as f32, j as f32 / n as f32);
-                let p = corners[0]
-                    .lerp(corners[1], u)
-                    .lerp(corners[3].lerp(corners[2], u), v);
-                self.vertex(p, normal, Vec2::new(u, 1.0 - v));
-            }
-        }
-        for j in 0..n {
-            for i in 0..n {
-                self.cell(section, first + j * (n + 1) + i, n + 1);
-            }
-        }
-    }
-
-    /// A (2, 3) torus knot tube standing in the xy plane, `segments` along it and `sides`
-    /// around it.
-    fn knot(&mut self, section: usize, segments: u32, sides: u32) {
-        let center = |t: f32| {
-            let r = (3.0 * t).cos() + 2.0;
-            Vec3::new(r * (2.0 * t).cos(), r * (2.0 * t).sin(), -(3.0 * t).sin()) * 0.33
-                + Vec3::new(0.0, 1.4, 0.0)
-        };
-        let (tube, tau) = (0.13, std::f32::consts::TAU);
-        let first = self.positions.len() as u32;
-        for s in 0..=segments {
-            let t = s as f32 / segments as f32 * tau;
-            let c = center(t);
-            let tangent = (center(t + 1e-3) - center(t - 1e-3)).normalize();
-            let out = c - Vec3::new(0.0, 1.4, 0.0);
-            let normal = (out - tangent * out.dot(tangent)).normalize();
-            let binormal = tangent.cross(normal);
-            for k in 0..=sides {
-                let a = k as f32 / sides as f32 * tau;
-                let n = normal * a.cos() + binormal * a.sin();
-                self.vertex(
-                    c + n * tube,
-                    n,
-                    Vec2::new(s as f32 / segments as f32, k as f32 / sides as f32),
-                );
-            }
-        }
-        for s in 0..segments {
-            for k in 0..sides {
-                self.cell(section, first + s * (sides + 1) + k, sides + 1);
-            }
-        }
-    }
-
-    fn finish(self) -> MeshInput {
-        let mut m = MeshInput {
-            positions: self.positions,
-            normals: self.normals,
-            uvs: Some(self.uvs),
-            ..MeshInput::default()
-        };
-        for tris in self.sections {
-            let first = m.indices.len() as u32;
-            m.indices.extend(tris);
-            m.sections.push(Span {
-                first,
-                count: m.indices.len() as u32 - first,
-            });
-        }
-        m
-    }
 }

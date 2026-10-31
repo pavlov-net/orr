@@ -44,7 +44,9 @@ fn every_frame_id_gets_a_complete_ordered_report() {
 
     let render_thread = std::thread::spawn(move || {
         let mut r = Renderer::new(device(), desc).unwrap();
-        let s = r.create_scene(&SceneDesc::default()).unwrap();
+        let s = r
+            .create_scene(&SceneDesc::default(), &Default::default())
+            .unwrap();
         let list = [s];
         let mut reports = BTreeMap::new();
         let mut out = Vec::new();
