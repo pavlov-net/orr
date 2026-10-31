@@ -3,8 +3,10 @@
 use std::f32::consts::{PI, TAU};
 use std::path::{Path, PathBuf};
 
+use orr_color::RgbPrimaries;
 use orr_cook::{
-    ArchiveSpec, AssetSpec, GltfSettings, Manifest, Quality, Source, TextureSettings, Usage,
+    ArchiveSpec, AssetSpec, GltfSettings, Manifest, Primaries, Quality, Source, TextureOverride,
+    TextureRules, TextureSettings, Usage,
 };
 use orr_pack::material::{Material, slot};
 use orr_pack::model::ModelInfo;
@@ -746,7 +748,7 @@ fn gltf_materials_cook_their_canonical_channel_set() {
         source: Source::Gltf {
             path: path.clone(),
             settings: GltfSettings {
-                textures: orr_cook::TextureRules {
+                textures: TextureRules {
                     quality: Quality::Fast,
                     ..Default::default()
                 },
@@ -827,4 +829,52 @@ fn gltf_materials_cook_their_canonical_channel_set() {
         + chain_bytes(vk::BC4_UNORM, 16, 16)
         + chain_bytes(vk::BC7_SRGB, 8, 8);
     println!("texture bytes: packed {packed}, one texture per image {per_image}");
+}
+
+#[test]
+fn a_constant_color_folds_into_its_factor_in_the_image_primaries() {
+    let d = dir("gltf-constant-primaries");
+    let path = d.join("quad.glb");
+    let texel = [255u8, 128, 0];
+    write_glb(
+        &path,
+        &[r#"{"emissiveTexture":{"index":0},"emissiveFactor":[2,1,0.5]}"#.into()],
+        &[png(8, 8, |_, _| [texel[0], texel[1], texel[2], 255])],
+    );
+    let a = cook(vec![AssetSpec {
+        name: "quad".into(),
+        source: Source::Gltf {
+            path,
+            settings: GltfSettings {
+                textures: TextureRules {
+                    quality: Quality::Fast,
+                    overrides: vec![(
+                        "image 0".into(),
+                        TextureOverride {
+                            primaries: Some(Primaries::DisplayP3),
+                            ..TextureOverride::default()
+                        },
+                    )],
+                    ..TextureRules::default()
+                },
+                ..GltfSettings::default()
+            },
+        },
+    }]);
+    let model = a.find(AssetId::from_name("quad")).unwrap();
+    let model = ModelInfo::parse(&read_blob(&a, model, 0)).unwrap();
+    let m = Material::from_bytes(&read_blob(&a, a.find(model.materials[0]).unwrap(), 0)).unwrap();
+    assert_eq!(m.textures[slot::EMISSION].texture, AssetId::NONE);
+    let (rec709, p3) = (RgbPrimaries::REC709, RgbPrimaries::DISPLAY_P3);
+    let factor = orr_color::mul(&rec709.matrix_to(p3), [2.0, 1.0, 0.5]);
+    let texel = texel.map(|c| orr_color::srgb_decode(f64::from(c) / 255.0));
+    let product = std::array::from_fn(|c| factor[c] * texel[c]);
+    let want = orr_color::mul(&p3.matrix_to(rec709), product);
+    for c in 0..3 {
+        assert!(
+            (f64::from(m.emission_color[c]) - want[c]).abs() < 1e-4,
+            "emission {:?}, want {want:?}",
+            m.emission_color
+        );
+    }
 }

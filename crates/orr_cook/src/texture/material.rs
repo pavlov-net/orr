@@ -23,6 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use orr_color::{RgbPrimaries, vec_f32};
 use orr_pack::material::{Material, TextureBinding, slot};
 use orr_pack::texture::mip_size;
 use orr_pack::{AssetId, Class, Hash32};
@@ -291,6 +292,18 @@ impl<'a> Packer<'a> {
         self.image(i).constant[channel]
     }
 
+    /// The primaries of a color texture made from image `i`: the last override that sets
+    /// them, else the file's tag, else Rec.709.
+    fn color_primaries(&self, i: usize) -> Primaries {
+        self.rules
+            .overrides
+            .iter()
+            .filter(|(pattern, _)| self.images[i].name.contains(pattern.as_str()))
+            .fold(None, |p, (_, o)| o.primaries.or(p))
+            .or(self.image(i).primaries)
+            .unwrap_or(Primaries::Rec709)
+    }
+
     /// Cooks the material's textures, binds them and folds constants into its factors.
     pub(crate) fn material(
         &mut self,
@@ -299,36 +312,9 @@ impl<'a> Packer<'a> {
         t: &MaterialTextures,
     ) -> Result<()> {
         if let Some(r) = &t.base_color {
-            let srgb = r.srgb.unwrap_or(self.image(r.image).srgb);
-            let rgb: Vec<Option<f32>> = (0..3).map(|c| self.constant(r.image, c)).collect();
-            if rgb.iter().all(Option::is_some) {
-                for (c, v) in rgb.into_iter().enumerate() {
-                    let v = v.expect("constant");
-                    m.base_color[c] *= if srgb { srgb_to_linear(v) } else { v };
-                }
-            } else {
-                let image = |channel| Channel::Image {
-                    image: r.image,
-                    channel,
-                    srgb,
-                    a: 0.0,
-                    b: 1.0,
-                };
-                let id = self.make(
-                    suffix,
-                    Pack {
-                        role: "base_color",
-                        encoding: Encoding::Bc7Srgb,
-                        channels: vec![image(0), image(1), image(2), Channel::Constant(1.0)],
-                        refs: vec![*r],
-                        coverage: None,
-                        toksvig: None,
-                        normal: false,
-                        shrink: false,
-                    },
-                )?;
-                bind(m, slot::BASE_COLOR, id, 0, r);
-            }
+            self.color(suffix, m, r, "base_color", slot::BASE_COLOR, |m| {
+                &mut m.base_color
+            })?;
         }
         if m.alpha_mode != Material::OPAQUE
             && let Some(r) = &t.opacity
@@ -614,7 +600,7 @@ impl<'a> Packer<'a> {
     }
 
     /// A color texture whose value multiplies the material color of slot `s`; a constant
-    /// image folds into that color.
+    /// image folds into that color, multiplied in the image's primaries.
     fn color(
         &mut self,
         suffix: &str,
@@ -627,11 +613,21 @@ impl<'a> Packer<'a> {
         let srgb = r.srgb.unwrap_or(self.image(r.image).srgb);
         let rgb: Vec<Option<f32>> = (0..3).map(|c| self.constant(r.image, c)).collect();
         if rgb.iter().all(Option::is_some) {
+            let texel: [f32; 3] = std::array::from_fn(|c| {
+                let v = rgb[c].expect("constant");
+                if srgb { srgb_to_linear(v) } else { v }
+            });
             let target = color(m);
-            for (c, v) in rgb.into_iter().enumerate() {
-                let v = v.expect("constant");
-                target[c] *= if srgb { srgb_to_linear(v) } else { v };
-            }
+            // Rec.709 multiplies directly, so its factors stay exact.
+            *target = match self.color_primaries(r.image) {
+                Primaries::Rec709 => std::array::from_fn(|c| target[c] * texel[c]),
+                p => {
+                    let (rec709, p) = (RgbPrimaries::REC709, orr_color::Primaries::from(p).rgb());
+                    let f = orr_color::mul(&rec709.matrix_to(p), target.map(f64::from));
+                    let product = std::array::from_fn(|c| f[c] * f64::from(texel[c]));
+                    vec_f32(orr_color::mul(&p.matrix_to(rec709), product))
+                }
+            };
             return Ok(());
         }
         let image = |channel| Channel::Image {
@@ -727,14 +723,11 @@ impl<'a> Packer<'a> {
         if p.shrink {
             size = [4, 4];
         }
-        let color = p.encoding == Encoding::Bc7Srgb;
-        let primaries = primaries
-            .or(if color {
-                self.image(images[0]).primaries
-            } else {
-                None
-            })
-            .unwrap_or(Primaries::Rec709);
+        let primaries = if p.encoding == Encoding::Bc7Srgb {
+            self.color_primaries(images[0])
+        } else {
+            primaries.unwrap_or(Primaries::Rec709)
+        };
 
         let mut recipe = format!(
             "{} {:?} {:?} {:?} {:?} {:?} {quality:?} {max_size:?} {grid:?} {primaries:?} {bc_split:?} {:?} {:?}",

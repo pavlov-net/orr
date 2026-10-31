@@ -155,6 +155,16 @@ impl Primaries {
     }
 }
 
+impl From<Primaries> for orr_color::Primaries {
+    fn from(p: Primaries) -> Self {
+        match p {
+            Primaries::Rec709 => Self::Rec709,
+            Primaries::DisplayP3 => Self::DisplayP3,
+            Primaries::Rec2020 => Self::Rec2020,
+        }
+    }
+}
+
 /// Mip downsampling filter, applied to linear values.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]

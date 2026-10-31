@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+orr_color.workspace = true
 orr_io.workspace = true
 orr_pack.workspace = true
 base64 = "0.22"

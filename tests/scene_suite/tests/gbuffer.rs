@@ -5,9 +5,9 @@
 //! the software raster against the mesh-shader raster, camera rays through the PTLAS against
 //! the visibility buffer, resolved hits against a CPU decode, hit contexts, `rt_range`,
 //! far-from-origin and rebase invariance, the PTLAS budget, posed rigid parts in raster
-//! and ray tracing with their motion, hiding, section masks and material sets, the DAG
-//! traversal's cuts, two-pass occlusion and `debug_lod`, and the stochastic texture filter
-//! against CPU bicubic and bilinear filters.
+//! and ray tracing with their motion, hiding, section masks, material sets and color factors
+//! multiplied in their texture's primaries, the DAG traversal's cuts, two-pass occlusion and
+//! `debug_lod`, and the stochastic texture filter against CPU bicubic and bilinear filters.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -16,9 +16,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use glam::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
+use orr_color::RgbPrimaries;
 use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, LodMode, Manifest, MeshInput, MeshParts, MeshSettings,
-    Quality, Source, TextureSettings, Usage,
+    Primaries, Quality, Source, TextureSettings, Usage,
 };
 use orr_gpu::{
     GpuPtr, Hazards, KernelSet, MemoryKind, QueueKind, SamplerIndex, ShaderModule, Stages, Texture,
@@ -763,6 +764,16 @@ fn slab_corners() -> [Vec3; 4] {
     ]
 }
 
+/// A saturated red base color factor on a saturated green texture (sRGB bytes), whose models
+/// tag the texture with each primaries.
+const TINT_FACTOR: [f32; 3] = [0.9, 0.05, 0.05];
+const TINT_TEXEL: [u8; 3] = [40, 230, 60];
+const TINTED: [(&str, Primaries); 3] = [
+    ("tinted rec709", Primaries::Rec709),
+    ("tinted p3", Primaries::DisplayP3),
+    ("tinted rec2020", Primaries::Rec2020),
+];
+
 fn cook() -> Arc<[u8]> {
     let albedo = png("albedo.png", 256, 256, png::ColorType::Rgba, |x, y| {
         let check = ((x / 32) ^ (y / 32)) & 1 == 1;
@@ -871,6 +882,31 @@ fn cook() -> Arc<[u8]> {
         Vec3::new(0.5, 0.5, 0.0),
         Vec3::new(-0.5, 0.5, 0.0),
     ];
+    let green = png("green.png", 4, 4, png::ColorType::Rgb, |_, _| {
+        TINT_TEXEL.to_vec()
+    });
+    let mut tinted = Vec::new();
+    for (name, primaries) in TINTED {
+        let tex = format!("tex/{name}");
+        tinted.push(AssetSpec {
+            name: tex.clone(),
+            source: Source::Texture {
+                path: green.clone(),
+                settings: TextureSettings {
+                    usage: Usage::Color,
+                    quality: Quality::Fast,
+                    primaries: Some(primaries),
+                    ..TextureSettings::default()
+                },
+            },
+        });
+        let mut m = Material {
+            base_color: TINT_FACTOR,
+            ..Material::default()
+        };
+        m.textures[slot::BASE_COLOR].texture = id(&tex);
+        tinted.push(model(name, quad(unit), vec![m], one()));
+    }
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(
             Target::Memory,
@@ -936,7 +972,10 @@ fn cook() -> Arc<[u8]> {
                     vec![metal],
                     LodMode::Dag,
                 ),
-            ],
+            ]
+            .into_iter()
+            .chain(tinted)
+            .collect(),
         )],
     };
     orr_cook::cook(&manifest, &Default::default())
@@ -3420,6 +3459,52 @@ fn rewriting_a_material_set_changes_only_the_copies_that_name_it() {
         "copy 1 is green: {:?}",
         before[1]
     );
+    assert_clean();
+}
+
+#[test]
+fn a_color_factor_multiplies_its_texel_in_the_texture_primaries() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let items: Vec<Item> = TINTED
+        .iter()
+        .enumerate()
+        .map(|(i, &(model, ..))| Item {
+            model,
+            linear: Mat3::IDENTITY,
+            at: Vec3::new(i as f32 * 1.2 - 1.2, 0.0, 0.0),
+        })
+        .collect();
+    let placed = place(&mut w, &items);
+    let g = shoot(
+        &mut w,
+        &placed,
+        &Shot::at(DVec3::new(0.0, 0.0, 3.0), DVec3::ZERO, 1),
+    );
+    let r = rays(&g.view, &trace::MODULE, "pixels", 1);
+    let texel = TINT_TEXEL.map(|c| f64::from(srgb_decode(f32::from(c) / 255.0)));
+    for (range, &(model, primaries)) in placed.ranges.iter().zip(&TINTED) {
+        let p = orr_color::Primaries::from(primaries).rgb();
+        let factor = orr_color::mul(
+            &RgbPrimaries::REC709.matrix_to(p),
+            TINT_FACTOR.map(f64::from),
+        );
+        let product = std::array::from_fn(|c| factor[c] * texel[c]);
+        let want = Vec3::from(orr_color::vec_f32(orr_color::mul(
+            &p.matrix_to(RgbPrimaries::REC2020),
+            product,
+        )));
+        let id = range.first + 1;
+        let i = g.ids.iter().position(|&p| p == id).expect("drawn");
+        let raster = decode_core(g.a[i], g.b[i]).base_color;
+        let t = r.traced.iter().find(|t| t.instance == id).expect("traced");
+        let traced = Vec3::from(t.base_color);
+        assert!(
+            (raster - want).abs().max_element() < 0.01
+                && (traced - want).abs().max_element() < 0.003,
+            "{model}: raster {raster}, traced {traced}, want {want}"
+        );
+    }
     assert_clean();
 }
 

@@ -114,8 +114,7 @@ public struct StandardSurface : ISurface
         MaterialGpu* m = i.scene.materials + i.material;
         float4 one = float4(1.0);
         BsdfParams p;
-        float3 base = material_texture(m, TEXTURE_BASE_COLOR, i.uv, one).rgb;
-        p.base_color = m.base_weight * m.base_color * base;
+        p.base_color = m.base_weight * material_color(m, TEXTURE_BASE_COLOR, i.uv, m.base_color);
         p.metalness = m.metalness * material_texture(m, TEXTURE_METALNESS, i.uv, one).x;
         p.specular_color = m.specular_color;
         p.specular_weight = m.specular_weight * material_texture(m, TEXTURE_SPECULAR_WEIGHT, i.uv, one).x;
@@ -126,7 +125,7 @@ public struct StandardSurface : ISurface
         bool thin = (m.flags & MATERIAL_THIN_WALLED) != 0;
         p.transmission_color = thin || m.transmission_depth == 0.0 ? m.transmission_color : float3(1.0);
         p.subsurface_weight = m.subsurface_weight;
-        p.subsurface_color = m.subsurface_color * material_texture(m, TEXTURE_SUBSURFACE_COLOR, i.uv, one).rgb;
+        p.subsurface_color = material_color(m, TEXTURE_SUBSURFACE_COLOR, i.uv, m.subsurface_color);
         p.subsurface_anisotropy = m.subsurface_scatter_anisotropy;
         p.subsurface_radius = m.subsurface_radius * m.subsurface_radius_scale;
         p.coat_weight = m.coat_weight * material_texture(m, TEXTURE_COAT, i.uv, one).x;
@@ -141,8 +140,7 @@ public struct StandardSurface : ISurface
         p.thin_film_weight = film ? 1.0 : 0.0;
         p.thin_film_thickness = m.thin_film_thickness;
         p.thin_film_ior = m.thin_film_ior;
-        float3 emission = material_texture(m, TEXTURE_EMISSION, i.uv, one).rgb;
-        p.emission = material_emission(m) * emission;
+        p.emission = material_color(m, TEXTURE_EMISSION, i.uv, material_emission(m));
         p.scale = float3(material_texture(m, TEXTURE_OCCLUSION, i.uv, one).x);
 
         GSurface s = (GSurface)0;
