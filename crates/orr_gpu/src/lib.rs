@@ -49,16 +49,18 @@ pub use texture::{
 };
 
 #[cfg(not(target_vendor = "apple"))]
+pub use orr_memory::AllocError;
+#[cfg(not(target_vendor = "apple"))]
 pub use vulkan::{
     Allocation, Checkpoint, ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance,
     ClassicKind, ColorAttachment, CommandList, ComputePipeline, DecompressRegion, DepthAttachment,
-    Device, DeviceDesc, DeviceFault, DeviceHooks, Diagnostics, DiagnosticsReport, DispatchArgs,
-    FaultAccess, FaultAddress, HeapReport, InstanceFlags, LowLatency, MemoryKind, MemoryReport,
-    MemoryUsage, MeshArgs, MeshPipeline, MeshPipelineDesc, Micromap, MicromapDesc,
-    MicromapTriangle, MicromapUsage, OmmFormat, PageBind, PassResult, PipelineCacheKind,
-    PipelineCacheReport, PipelineStats, Queue, QueueKind, QueueProgress, QueueRequest,
-    RayDispatchPipeline, Rendering, ShaderStage, SparseAllocation, SparseBinds, Swapchain,
-    SwapchainFrame, Texture, TextureMemory, TileBind, Transient, TransientArenas,
+    Device, DeviceArenas, DeviceDesc, DeviceFault, DeviceHooks, Diagnostics, DiagnosticsReport,
+    DispatchArgs, FaultAccess, FaultAddress, HeapReport, HostArenas, InstanceFlags, LowLatency,
+    MemoryKind, MemoryReport, MemoryUsage, MeshArgs, MeshPipeline, MeshPipelineDesc, Micromap,
+    MicromapDesc, MicromapTriangle, MicromapUsage, OmmFormat, PageBind, PassResult,
+    PipelineCacheKind, PipelineCacheReport, PipelineStats, Queue, QueueKind, QueueProgress,
+    QueueRequest, RayDispatchPipeline, Rendering, ShaderStage, SparseAllocation, SparseBinds,
+    Swapchain, SwapchainFrame, Texture, TextureMemory, TileBind,
 };
 
 #[cfg(not(target_vendor = "apple"))]

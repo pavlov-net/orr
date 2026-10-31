@@ -12,3 +12,5 @@ extern "C" void orr_memory_leak(const char* expr);
 
 #define VMA_IMPLEMENTATION
 #include "vma.h"
+
+static_assert(VMA_VERSION == VK_MAKE_VERSION(3, 5, 0), "src/bindings.rs is generated from VMA 3.5.0");

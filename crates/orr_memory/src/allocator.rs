@@ -118,19 +118,11 @@ pub struct HeapBudget {
     pub budget: u64,
 }
 
-fn handle<T: vk::Handle, P>(p: *mut P) -> T {
-    T::from_raw(p as usize as u64)
-}
-
-fn raw<P>(h: impl vk::Handle) -> *mut P {
-    h.as_raw() as usize as *mut P
-}
-
 unsafe extern "C" fn on_allocate(
     _: sys::VmaAllocator,
     _: u32,
-    _: sys::VkDeviceMemory,
-    _: sys::VkDeviceSize,
+    _: vk::DeviceMemory,
+    _: vk::DeviceSize,
     user: *mut c_void,
 ) {
     // SAFETY: `user` is the allocator's boxed counter, which outlives VMA's use of it.
@@ -153,37 +145,26 @@ impl Allocator {
             pfnFree: None,
             pUserData: ptr::from_ref::<AtomicU64>(&allocations).cast_mut().cast(),
         };
-        // SAFETY: both are the loader's entry points, with the C signatures VMA declares.
-        let functions = unsafe {
-            sys::VmaVulkanFunctions {
-                vkGetInstanceProcAddr: std::mem::transmute::<
-                    vk::PFN_vkGetInstanceProcAddr,
-                    sys::PFN_vkGetInstanceProcAddr,
-                >(
-                    desc.entry.static_fn().get_instance_proc_addr
-                ),
-                vkGetDeviceProcAddr: std::mem::transmute::<
-                    vk::PFN_vkGetDeviceProcAddr,
-                    sys::PFN_vkGetDeviceProcAddr,
-                >(desc.instance.fp_v1_0().get_device_proc_addr),
-                ..Default::default()
-            }
+        let functions = sys::VmaVulkanFunctions {
+            vkGetInstanceProcAddr: Some(desc.entry.static_fn().get_instance_proc_addr),
+            vkGetDeviceProcAddr: Some(desc.instance.fp_v1_0().get_device_proc_addr),
+            ..Default::default()
         };
-        let mut flags = sys::VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT as u32;
+        let mut flags = sys::VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
         if desc.memory_budget {
-            flags |= sys::VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT as u32;
+            flags |= sys::VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
         }
         if desc.memory_priority {
-            flags |= sys::VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT as u32;
+            flags |= sys::VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT;
         }
         let info = sys::VmaAllocatorCreateInfo {
             flags,
-            physicalDevice: raw(desc.physical),
-            device: raw(desc.device.handle()),
+            physicalDevice: desc.physical,
+            device: desc.device.handle(),
             preferredLargeHeapBlockSize: LARGE_HEAP_BLOCK,
             pDeviceMemoryCallbacks: &callbacks,
             pVulkanFunctions: &functions,
-            instance: raw(desc.instance.handle()),
+            instance: desc.instance.handle(),
             vulkanApiVersion: desc.api_version,
             ..Default::default()
         };
@@ -227,13 +208,13 @@ impl Allocator {
     fn create_info(pool: Pool, flags: AllocationFlags, align: u64) -> sys::VmaAllocationCreateInfo {
         let mut f = 0;
         if flags.contains(AllocationFlags::MAPPED) {
-            f |= sys::VMA_ALLOCATION_CREATE_MAPPED_BIT as u32;
+            f |= sys::VMA_ALLOCATION_CREATE_MAPPED_BIT;
         }
         if flags.contains(AllocationFlags::DEDICATED) {
-            f |= sys::VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT as u32;
+            f |= sys::VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
         }
         if flags.contains(AllocationFlags::WITHIN_BUDGET) {
-            f |= sys::VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT as u32;
+            f |= sys::VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
         }
         sys::VmaAllocationCreateInfo {
             flags: f,
@@ -255,7 +236,7 @@ impl Allocator {
         }
         Allocation {
             raw,
-            memory: handle(info.deviceMemory),
+            memory: info.deviceMemory,
             offset: info.offset,
             size: info.size,
             memory_type: info.memoryType,
@@ -279,10 +260,10 @@ impl Allocator {
     ) -> Result<(vk::Buffer, Allocation)> {
         assert!(align.is_power_of_two(), "alignment {align}");
         let create = Self::create_info(pool, flags, align);
-        let mut buffer = ptr::null_mut();
+        let mut buffer = vk::Buffer::null();
         let mut allocation = ptr::null_mut();
         let mut out = sys::VmaAllocationInfo::default();
-        // SAFETY: forwarded from the caller; ash's struct has the C layout VMA reads.
+        // SAFETY: forwarded from the caller; VMA reads the info only during the call.
         check("vmaCreateBuffer", unsafe {
             sys::vmaCreateBuffer(
                 self.raw,
@@ -293,7 +274,7 @@ impl Allocator {
                 &mut out,
             )
         })?;
-        Ok((handle(buffer), self.finish(allocation, &out, name)))
+        Ok((buffer, self.finish(allocation, &out, name)))
     }
 
     /// Creates an image bound to new memory from `pool`, in its own memory with
@@ -310,7 +291,7 @@ impl Allocator {
         name: &str,
     ) -> Result<(vk::Image, Allocation)> {
         let create = Self::create_info(pool, flags, 1);
-        let mut image = ptr::null_mut();
+        let mut image = vk::Image::null();
         let mut allocation = ptr::null_mut();
         let mut out = sys::VmaAllocationInfo::default();
         // SAFETY: as above.
@@ -324,7 +305,7 @@ impl Allocator {
                 &mut out,
             )
         })?;
-        Ok((handle(image), self.finish(allocation, &out, name)))
+        Ok((image, self.finish(allocation, &out, name)))
     }
 
     /// Memory from `pool` meeting `requirements`, bound to nothing.
@@ -338,15 +319,9 @@ impl Allocator {
         let create = Self::create_info(pool, flags, 1);
         let mut allocation = ptr::null_mut();
         let mut out = sys::VmaAllocationInfo::default();
-        // SAFETY: a live allocator; ash's struct has the C layout VMA reads.
+        // SAFETY: a live allocator and valid create info.
         check("vmaAllocateMemory", unsafe {
-            sys::vmaAllocateMemory(
-                self.raw,
-                ptr::from_ref(requirements).cast(),
-                &create,
-                &mut allocation,
-                &mut out,
-            )
+            sys::vmaAllocateMemory(self.raw, requirements, &create, &mut allocation, &mut out)
         })?;
         Ok(self.finish(allocation, &out, name))
     }
@@ -359,7 +334,7 @@ impl Allocator {
     pub unsafe fn bind_image(&self, a: &Allocation, offset: u64, image: vk::Image) -> Result<()> {
         // SAFETY: forwarded from the caller.
         check("vmaBindImageMemory2", unsafe {
-            sys::vmaBindImageMemory2(self.raw, a.raw, offset, raw(image), ptr::null())
+            sys::vmaBindImageMemory2(self.raw, a.raw, offset, image, ptr::null())
         })
     }
 
@@ -370,7 +345,7 @@ impl Allocator {
     /// No pending GPU work uses either.
     pub unsafe fn destroy_buffer(&self, buffer: vk::Buffer, a: Allocation) {
         // SAFETY: forwarded from the caller; each is destroyed once.
-        unsafe { sys::vmaDestroyBuffer(self.raw, raw(buffer), a.raw) };
+        unsafe { sys::vmaDestroyBuffer(self.raw, buffer, a.raw) };
     }
 
     /// Destroys `image` and frees `a`, which [`Allocator::create_image`] made together.
@@ -380,15 +355,15 @@ impl Allocator {
     /// No pending GPU work uses either.
     pub unsafe fn destroy_image(&self, image: vk::Image, a: Allocation) {
         // SAFETY: as above.
-        unsafe { sys::vmaDestroyImage(self.raw, raw(image), a.raw) };
+        unsafe { sys::vmaDestroyImage(self.raw, image, a.raw) };
     }
 
-    /// Frees `a`.
+    /// Frees `a` at once: nothing here waits for the GPU.
     ///
     /// # Safety
     ///
     /// No pending GPU work uses it, and nothing bound to it is used again.
-    pub unsafe fn free(&self, a: Allocation) {
+    pub unsafe fn deallocate(&self, a: Allocation) {
         // SAFETY: as above.
         unsafe { sys::vmaFreeMemory(self.raw, a.raw) };
     }
@@ -405,9 +380,10 @@ impl Allocator {
         // SAFETY: a live allocator; VMA keeps the properties for its lifetime.
         let heaps = unsafe {
             sys::vmaGetMemoryProperties(self.raw, &mut props);
-            (*props).memoryHeapCount as usize
+            (*props).memory_heap_count as usize
         };
-        let mut budgets = [sys::VmaBudget::default(); vk::MAX_MEMORY_HEAPS];
+        let mut budgets: [sys::VmaBudget; vk::MAX_MEMORY_HEAPS] =
+            std::array::from_fn(|_| sys::VmaBudget::default());
         // SAFETY: room for every heap.
         unsafe { sys::vmaGetHeapBudgets(self.raw, budgets.as_mut_ptr()) };
         budgets[..heaps]
