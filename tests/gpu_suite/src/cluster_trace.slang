@@ -1,7 +1,7 @@
-// Orthographic +z rays over the unit square, one closest-hit trace each. Writes a 20-word
-// record per ray: hit, custom index, instance index, cluster id, primitive, geometry index,
-// t, non-opaque candidates seen, the nearest candidate's cluster id and primitive, the hit
-// triangle's positions, and 0x600d.
+// Orthographic +z rays over the unit square, one closest-hit trace each, from a compute and a
+// raygen entry. Writes a 20-word record per ray: hit, custom index, instance index, cluster
+// id, primitive, geometry index, t, non-opaque candidates seen, the nearest candidate's
+// cluster id and primitive, the hit triangle's positions, and 0x600d.
 #include "orr/root.h"
 import orr.abi;
 import orr.trace;
@@ -42,11 +42,9 @@ struct Candidates : IAnyHit
     }
 }
 
-[shader("compute")]
-[numthreads(8, 8, 1)]
-void main(uint3 id: SV_DispatchThreadID)
+void body(uint2 id)
 {
-    if (any(id.xy >= uint2(root.width, root.height)))
+    if (any(id >= uint2(root.width, root.height)))
         return;
     uint* o = root.out + (id.y * root.width + id.x) * REC;
     o[7] = 0;
@@ -54,7 +52,7 @@ void main(uint3 id: SV_DispatchThreadID)
     o[9] = NONE;
     o[19] = asuint(1e30f);
     RayDesc ray;
-    ray.Origin = float3((float2(id.xy) + 0.5) / float2(root.width, root.height), -1.0);
+    ray.Origin = float3((float2(id) + 0.5) / float2(root.width, root.height), -1.0);
     ray.Direction = float3(0.0, 0.0, 1.0);
     ray.TMin = 0.0;
     ray.TMax = 4.0;
@@ -80,4 +78,17 @@ void main(uint3 id: SV_DispatchThreadID)
         o[12 + v * 3] = h.hit ? asuint(p[v].z) : NONE;
     }
     o[19] = 0x600d;
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void main(uint3 id: SV_DispatchThreadID)
+{
+    body(id.xy);
+}
+
+[shader("raygeneration")]
+void raygen()
+{
+    body(DispatchRaysIndex().xy);
 }

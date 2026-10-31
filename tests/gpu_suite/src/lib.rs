@@ -117,6 +117,17 @@ pub fn upload<T: Pod>(values: &[T], name: &str) -> Allocation<T> {
     a
 }
 
+/// A deterministic stream of floats in [0, 1) seeded by `seed`.
+pub fn noise(seed: u32) -> impl FnMut() -> f32 {
+    let mut s = seed | 1;
+    move || {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        (s >> 8) as f32 / (1u32 << 24) as f32
+    }
+}
+
 /// Readback memory for `count` values.
 pub fn readback<T: Pod>(count: u64, name: &str) -> Allocation<T> {
     device()

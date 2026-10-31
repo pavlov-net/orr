@@ -56,6 +56,9 @@ const CLUSTER_SPEC_VERSION: u32 = 4;
 #[derive(Default, Clone, Copy)]
 pub(crate) struct Optional {
     pub ray_dispatch: bool,
+    /// `VK_NV_ray_tracing_linear_swept_spheres`, with `VK_KHR_ray_tracing_pipeline` enabled
+    /// beside it even where ray dispatch is off.
+    pub lss: bool,
     pub omm: bool,
     pub device_address_commands: bool,
     pub unified_image_layouts: bool,
@@ -111,6 +114,7 @@ pub(crate) struct FeatureChain {
     pub mesh: vk::PhysicalDeviceMeshShaderFeaturesEXT<'static>,
     pub ray_pipeline: vk::PhysicalDeviceRayTracingPipelineFeaturesKHR<'static>,
     pub reorder: vk::PhysicalDeviceRayTracingInvocationReorderFeaturesEXT<'static>,
+    pub lss: vk::PhysicalDeviceRayTracingLinearSweptSpheresFeaturesNV<'static>,
     pub cluster: vk::PhysicalDeviceClusterAccelerationStructureFeaturesNV<'static>,
     pub ptlas: vk::PhysicalDevicePartitionedAccelerationStructureFeaturesNV<'static>,
     pub omm: vk::PhysicalDeviceOpacityMicromapFeaturesKHR<'static>,
@@ -166,6 +170,9 @@ impl FeatureChain {
         if opt.ray_dispatch {
             chain.push(ptr(&mut self.ray_pipeline));
             chain.push(ptr(&mut self.reorder));
+        }
+        if opt.lss {
+            chain.push(ptr(&mut self.lss));
         }
         if opt.omm {
             chain.push(ptr(&mut self.omm));
@@ -364,6 +371,8 @@ pub(crate) fn select(
     let mut opt = Optional {
         ray_dispatch: present(ash::khr::ray_tracing_pipeline::NAME)
             && present(ash::ext::ray_tracing_invocation_reorder::NAME),
+        lss: present(ash::nv::ray_tracing_linear_swept_spheres::NAME)
+            && present(ash::khr::ray_tracing_pipeline::NAME),
         omm: present(ash::khr::opacity_micromap::NAME),
         device_address_commands: present(ash::khr::device_address_commands::NAME),
         unified_image_layouts: present(ash::khr::unified_image_layouts::NAME),
@@ -498,6 +507,7 @@ pub(crate) fn select(
 
     opt.ray_dispatch &=
         q.ray_pipeline.ray_tracing_pipeline != 0 && q.reorder.ray_tracing_invocation_reorder != 0;
+    opt.lss &= q.lss.linear_swept_spheres != 0;
     opt.device_address_commands &= q.address_commands.device_address_commands != 0;
     // OMM builds take micromap addresses, which need device address commands.
     opt.omm &= q.omm.micromap != 0 && opt.device_address_commands;
@@ -580,6 +590,7 @@ pub(crate) fn select(
     e.ptlas.partitioned_acceleration_structure = 1;
     e.ray_pipeline.ray_tracing_pipeline = 1;
     e.reorder.ray_tracing_invocation_reorder = 1;
+    e.lss.linear_swept_spheres = 1;
     e.omm.micromap = 1;
     e.address_commands.device_address_commands = 1;
     e.unified.unified_image_layouts = 1;
@@ -621,6 +632,12 @@ pub(crate) fn select(
             ash::khr::ray_tracing_pipeline::NAME,
             ash::ext::ray_tracing_invocation_reorder::NAME,
         ],
+    );
+    add(opt.lss, &[ash::nv::ray_tracing_linear_swept_spheres::NAME]);
+    // The LSS extension needs the pipeline extension enabled; its feature stays off.
+    add(
+        opt.lss && !opt.ray_dispatch,
+        &[ash::khr::ray_tracing_pipeline::NAME],
     );
     add(opt.omm, &[ash::khr::opacity_micromap::NAME]);
     add(

@@ -12,6 +12,7 @@ use ash::vk::TaggedStructure as _;
 
 use super::accel::{EmptyTlas, build_empty_tlas};
 use super::cache::PipelineCache;
+use super::coopvec::component;
 use super::debug::{MessageCount, messenger_info, name_object};
 use super::diagnostics::{Breadcrumbs, Diagnostics, DiagnosticsReport, FaultFns, Trail};
 use super::features::{self, SURFACE_INSTANCE_EXTENSIONS, Selection};
@@ -24,8 +25,8 @@ use super::ray::RecordBlock;
 use super::rtas::{RtasCheck, cluster_caps};
 use super::texture::{image_info, vk_format};
 use crate::{
-    Caps, ComponentType, CooperativeVectorCombination, Error, Format, Limits, TextureDesc,
-    TextureUsage, TimelinePoint, Tlas,
+    Caps, CooperativeVectorCombination, Error, Format, Limits, TextureDesc, TextureUsage,
+    TimelinePoint, Tlas,
 };
 use orr_memory::AllocatorDesc;
 
@@ -93,6 +94,8 @@ pub(crate) struct Shared {
     pub dac_fn: Option<ash::khr::device_address_commands::Device>,
     /// With `Caps::memory_decompression`.
     pub decompress_fn: Option<ash::ext::memory_decompression::Device>,
+    /// With cooperative vectors (`Caps::cooperative_vector` not empty).
+    pub coop_fn: Option<ash::nv::cooperative_vector::Device>,
     /// With `Caps::occupancy_priority`.
     pub occupancy_fn: Option<ash::nv::compute_occupancy_priority::Device>,
     pub mesh_fn: ash::ext::mesh_shader::Device,
@@ -283,26 +286,6 @@ fn plan_queues(
     Ok(plans)
 }
 
-fn component(t: vk::ComponentTypeKHR) -> ComponentType {
-    use vk::ComponentTypeKHR as C;
-    match t {
-        C::FLOAT16 => ComponentType::F16,
-        C::FLOAT32 => ComponentType::F32,
-        C::FLOAT64 => ComponentType::F64,
-        C::SINT8 => ComponentType::I8,
-        C::SINT16 => ComponentType::I16,
-        C::SINT32 => ComponentType::I32,
-        C::SINT64 => ComponentType::I64,
-        C::UINT8 => ComponentType::U8,
-        C::UINT16 => ComponentType::U16,
-        C::UINT32 => ComponentType::U32,
-        C::UINT64 => ComponentType::U64,
-        C::FLOAT8_E4M3_EXT => ComponentType::E4m3,
-        C::FLOAT8_E5M2_EXT => ComponentType::E5m2,
-        other => ComponentType::Other(other.as_raw()),
-    }
-}
-
 fn c_string(chars: &[c_char]) -> String {
     // SAFETY: Vulkan property strings are NUL-terminated within their arrays.
     unsafe { CStr::from_ptr(chars.as_ptr()) }
@@ -461,6 +444,7 @@ impl Device {
             driver_version: props.driver_version,
             rebar,
             ray_dispatch: optional.ray_dispatch,
+            lss: optional.lss,
             reorder: optional.ray_dispatch
                 && reorder_props.ray_tracing_invocation_reorder_reordering_hint
                     == vk::RayTracingInvocationReorderModeEXT::REORDER,
@@ -612,6 +596,9 @@ impl Device {
             decompress_fn: optional
                 .memory_decompression
                 .then(|| ash::ext::memory_decompression::Device::load(&instance, &device)),
+            coop_fn: optional
+                .cooperative_vector
+                .then(|| ash::nv::cooperative_vector::Device::load(&instance, &device)),
             occupancy_fn: optional
                 .occupancy_priority
                 .then(|| ash::nv::compute_occupancy_priority::Device::load(&instance, &device)),
@@ -730,13 +717,16 @@ impl Device {
             hooks.device_created(&device.shared.raw_device());
         }
         log::info!(
-            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, host image copy {}, decompression {}, occupancy priority {}, validation layer {}, ray tracing validation {}, diagnostics {:?} (breadcrumbs {}, checkpoints {}, aftermath {}, device fault {})",
+            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, lss {}, address commands {}, cooperative vector combinations {}, host image copy {}, decompression {}, occupancy priority {}, validation layer {}, ray tracing validation {}, diagnostics {:?} (breadcrumbs {}, checkpoints {}, aftermath {}, device fault {})",
             device.shared.caps.device_name,
             device.shared.caps.driver,
             device.shared.caps.rebar,
             device.shared.caps.ray_dispatch,
             device.shared.caps.reorder,
             optional.omm,
+            optional.lss,
+            optional.device_address_commands,
+            device.shared.caps.cooperative_vector.len(),
             device.shared.caps.host_image_copy,
             optional.memory_decompression,
             optional.occupancy_priority,

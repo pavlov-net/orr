@@ -18,6 +18,19 @@ use crate::{
     TextureRegion, TextureUsage,
 };
 
+/// What device address commands are told about every `gpu_malloc` and sparse range: their
+/// buffers have storage usage. Sparse ranges may be partly bound, so none claims to be fully
+/// bound.
+pub(crate) const ADDRESS_FLAGS: vk::AddressCommandFlagsKHR =
+    vk::AddressCommandFlagsKHR::STORAGE_BUFFER_USAGE;
+
+pub(crate) fn address_range(address: GpuAddress, size: u64) -> vk::DeviceAddressRangeKHR {
+    vk::DeviceAddressRangeKHR {
+        address: address.0,
+        size,
+    }
+}
+
 /// `vkCmdDispatchIndirect` arguments: workgroup counts.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
@@ -488,7 +501,24 @@ impl<'q> CommandList<'q> {
         self.bind(vk::PipelineBindPoint::GRAPHICS, p.raw, root.address().0);
         let shared = &self.queue.shared;
         let stride = size_of::<MeshArgs>() as u64;
-        let (args_buffer, args_offset) = shared.locate(args.address(), stride * u64::from(max));
+        let args_bytes = stride * u64::from(max);
+        if let Some(dac) = &shared.dac_fn {
+            let info = vk::DrawIndirectCount2InfoKHR::default()
+                .address_range(vk::StridedDeviceAddressRangeKHR {
+                    address: args.address().0,
+                    size: args_bytes,
+                    stride,
+                })
+                .address_flags(ADDRESS_FLAGS)
+                .count_address_range(address_range(count.address(), 4))
+                .count_address_flags(ADDRESS_FLAGS)
+                .max_draw_count(max);
+            // SAFETY: recording inside rendering with a mesh pipeline bound; the arguments and
+            // the count are the caller's live allocations.
+            unsafe { dac.cmd_draw_mesh_tasks_indirect_count2(self.cmd(), &info) };
+            return;
+        }
+        let (args_buffer, args_offset) = shared.locate(args.address(), args_bytes);
         let (count_buffer, count_offset) = shared.locate(count.address(), 4);
         // SAFETY: recording inside rendering with a mesh pipeline bound; the arguments and
         // the count each lie in one buffer.
@@ -513,10 +543,18 @@ impl<'q> CommandList<'q> {
         args: GpuPtr<DispatchArgs>,
     ) {
         self.bind(vk::PipelineBindPoint::COMPUTE, p.raw, root.address().0);
-        let (buffer, offset) = self
-            .queue
-            .shared
-            .locate(args.address(), size_of::<DispatchArgs>() as u64);
+        let shared = &self.queue.shared;
+        let bytes = size_of::<DispatchArgs>() as u64;
+        if let Some(dac) = &shared.dac_fn {
+            let info = vk::DispatchIndirect2InfoKHR::default()
+                .address_range(address_range(args.address(), bytes))
+                .address_flags(ADDRESS_FLAGS);
+            // SAFETY: recording with a compute pipeline bound; the arguments are the caller's
+            // live allocation.
+            unsafe { dac.cmd_dispatch_indirect2(self.cmd(), &info) };
+            return;
+        }
+        let (buffer, offset) = shared.locate(args.address(), bytes);
         // SAFETY: recording with a compute pipeline bound; the arguments lie in one buffer.
         unsafe {
             self.device()
@@ -527,6 +565,17 @@ impl<'q> CommandList<'q> {
     /// Copies `bytes` bytes between GPU allocations.
     pub fn copy(&mut self, dst: GpuPtr<u8>, src: GpuPtr<u8>, bytes: u64) {
         let shared = &self.queue.shared;
+        if let Some(dac) = &shared.dac_fn {
+            let region = [vk::DeviceMemoryCopyKHR::default()
+                .src_range(address_range(src.address(), bytes))
+                .src_flags(ADDRESS_FLAGS)
+                .dst_range(address_range(dst.address(), bytes))
+                .dst_flags(ADDRESS_FLAGS)];
+            let info = vk::CopyDeviceMemoryInfoKHR::default().regions(&region);
+            // SAFETY: recording; both ranges are the caller's live allocations.
+            unsafe { dac.cmd_copy_memory(self.cmd(), &info) };
+            return;
+        }
         let (s, so) = shared.locate(src.address(), bytes);
         let (d, d_off) = shared.locate(dst.address(), bytes);
         let region = [vk::BufferCopy2::default()
@@ -541,14 +590,16 @@ impl<'q> CommandList<'q> {
         unsafe { self.device().cmd_copy_buffer2(self.cmd(), &info) };
     }
 
-    /// `row_texels`: texels from one buffer row to the next; 0 packs rows tightly.
+    /// Copies between `memory` and `region` of `t`, into the texture when `to_texture`.
+    /// `row_texels`: texels from one row in memory to the next; 0 packs rows tightly.
     fn texture_copy(
         &self,
         t: &Texture,
         region: &TextureRegion,
-        buffer: GpuPtr<u8>,
+        memory: GpuPtr<u8>,
         row_texels: u32,
-    ) -> (vk::Buffer, vk::BufferImageCopy2<'static>) {
+        to_texture: bool,
+    ) {
         let format = t.desc().format;
         let block = format.block_extent();
         assert!(
@@ -564,17 +615,59 @@ impl<'q> CommandList<'q> {
             ],
             ..*region
         };
-        let (b, offset) = self
-            .queue
-            .shared
-            .locate(buffer.address(), rows.bytes(format));
-        let copy = vk::BufferImageCopy2::default()
+        let bytes = rows.bytes(format);
+        let shared = &self.queue.shared;
+        let cmd = self.cmd();
+        let layout = vk::ImageLayout::GENERAL;
+        if let Some(dac) = &shared.dac_fn {
+            let regions = [vk::DeviceMemoryImageCopyKHR::default()
+                .address_range(address_range(memory.address(), bytes))
+                .address_flags(ADDRESS_FLAGS)
+                .address_row_length(row_texels)
+                .image_subresource(t.layers(region))
+                .image_layout(layout)
+                .image_offset(vk_offset(region))
+                .image_extent(vk_extent(region))];
+            let info = vk::CopyDeviceMemoryImageInfoKHR::default()
+                .image(t.image)
+                .regions(&regions);
+            // SAFETY: recording; the texture is in GENERAL and the memory range is the
+            // caller's live allocation.
+            unsafe {
+                if to_texture {
+                    dac.cmd_copy_memory_to_image(cmd, &info);
+                } else {
+                    dac.cmd_copy_image_to_memory(cmd, &info);
+                }
+            }
+            return;
+        }
+        let (buffer, offset) = shared.locate(memory.address(), bytes);
+        let regions = [vk::BufferImageCopy2::default()
             .buffer_offset(offset)
             .buffer_row_length(row_texels)
             .image_subresource(t.layers(region))
             .image_offset(vk_offset(region))
-            .image_extent(vk_extent(region));
-        (b, copy)
+            .image_extent(vk_extent(region))];
+        let device = self.device();
+        // SAFETY: recording; the texture is in GENERAL and the range lies in one buffer.
+        unsafe {
+            if to_texture {
+                let info = vk::CopyBufferToImageInfo2::default()
+                    .src_buffer(buffer)
+                    .dst_image(t.image)
+                    .dst_image_layout(layout)
+                    .regions(&regions);
+                device.cmd_copy_buffer_to_image2(cmd, &info);
+            } else {
+                let info = vk::CopyImageToBufferInfo2::default()
+                    .src_image(t.image)
+                    .src_image_layout(layout)
+                    .dst_buffer(buffer)
+                    .regions(&regions);
+                device.cmd_copy_image_to_buffer2(cmd, &info);
+            }
+        }
     }
 
     /// Copies tightly packed texels from `src` into `region` of `dst`.
@@ -592,28 +685,12 @@ impl<'q> CommandList<'q> {
         src: GpuPtr<u8>,
         row_texels: u32,
     ) {
-        let (buffer, copy) = self.texture_copy(dst, region, src, row_texels);
-        let regions = [copy];
-        let info = vk::CopyBufferToImageInfo2::default()
-            .src_buffer(buffer)
-            .dst_image(dst.image)
-            .dst_image_layout(vk::ImageLayout::GENERAL)
-            .regions(&regions);
-        // SAFETY: recording; the texture is in GENERAL.
-        unsafe { self.device().cmd_copy_buffer_to_image2(self.cmd(), &info) };
+        self.texture_copy(dst, region, src, row_texels, true);
     }
 
     /// Copies `region` of `src` into `dst`, tightly packed.
     pub fn copy_from_texture(&mut self, dst: GpuPtr<u8>, src: &Texture, region: &TextureRegion) {
-        let (buffer, copy) = self.texture_copy(src, region, dst, 0);
-        let regions = [copy];
-        let info = vk::CopyImageToBufferInfo2::default()
-            .src_image(src.image)
-            .src_image_layout(vk::ImageLayout::GENERAL)
-            .dst_buffer(buffer)
-            .regions(&regions);
-        // SAFETY: recording; the texture is in GENERAL.
-        unsafe { self.device().cmd_copy_image_to_buffer2(self.cmd(), &info) };
+        self.texture_copy(src, region, dst, 0, false);
     }
 
     /// Decompresses up to `max_count` GDeflate 1.0 regions listed at `regions`, as many as
@@ -779,7 +856,14 @@ fn vk_stages(s: Stages, caps: &Caps) -> vk::PipelineStageFlags2 {
     }
     let mut out = P::NONE;
     for (flag, stages) in [
-        (Stages::TRANSFER, P::ALL_TRANSFER),
+        (
+            Stages::TRANSFER,
+            if caps.cooperative_vector.is_empty() {
+                P::ALL_TRANSFER
+            } else {
+                P::ALL_TRANSFER | P::CONVERT_COOPERATIVE_VECTOR_MATRIX_NV
+            },
+        ),
         (Stages::COMPUTE, P::COMPUTE_SHADER),
         (Stages::TASK, P::TASK_SHADER_EXT),
         (Stages::MESH, P::MESH_SHADER_EXT),

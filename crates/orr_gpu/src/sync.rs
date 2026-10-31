@@ -2,7 +2,7 @@ bitflags::bitflags! {
     /// Pipeline stages a barrier orders.
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
     pub struct Stages: u32 {
-        /// Copies.
+        /// Copies and matrix conversions.
         const TRANSFER = 1 << 0;
         const COMPUTE = 1 << 1;
         const TASK = 1 << 2;

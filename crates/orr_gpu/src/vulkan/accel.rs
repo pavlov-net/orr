@@ -6,13 +6,13 @@ use std::time::{Duration, Instant};
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
 
-use super::command::CommandList;
+use super::command::{ADDRESS_FLAGS, CommandList, address_range};
 use super::debug::name_object;
 use super::device::{Device, Shared};
 use super::garbage::{Item, RawBuffer};
 use super::memory::{Allocation, MemoryKind};
 use super::queue::{MAX_PASSES, QueueKind};
-use crate::{Error, GpuAddress, GpuPtr, Hazards, RtasFlags, RtasSizes, Stages, Tlas};
+use crate::{Caps, Error, GpuAddress, GpuPtr, Hazards, RtasFlags, RtasSizes, Stages, Tlas};
 
 bitflags::bitflags! {
     /// Per-instance flags of a [`ClassicInstance`].
@@ -44,9 +44,40 @@ pub enum ClassicGeometry {
         triangle_count: u32,
         opaque: bool,
     },
+    /// One linear-swept-sphere geometry of `segment_count` segments, each a capsule-like
+    /// sweep between two vertices of `positions` with the vertices' `radii`. Needs
+    /// `Caps::lss`. The primitive index of a hit is the segment's.
+    Lss {
+        positions: GpuPtr<[f32; 3]>,
+        radii: GpuPtr<f32>,
+        indices: GpuPtr<u32>,
+        segment_count: u32,
+        indexing: LssIndexing,
+        end_caps: LssEndCaps,
+        opaque: bool,
+    },
     /// `capacity` [`ClassicInstance`] records at `records`; a record with BLAS address 0 is
     /// inactive and invisible to every ray.
     Instances { records: GpuAddress, capacity: u32 },
+}
+
+/// How [`ClassicGeometry::Lss`] indices name each segment's vertices.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum LssIndexing {
+    /// Two indices per segment.
+    List,
+    /// One index `k` per segment, which runs from vertex `k` to vertex `k + 1`: a strand of
+    /// `n` vertices is `n - 1` successive indices.
+    Successive,
+}
+
+/// Which [`ClassicGeometry::Lss`] segment ends are closed by a sphere.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum LssEndCaps {
+    /// No end is capped.
+    None,
+    /// The ends of each chain of successive segments are capped.
+    Chained,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -167,8 +198,23 @@ fn classic_flags(flags: RtasFlags) -> vk::BuildAccelerationStructureFlagsKHR {
         | vk::BuildAccelerationStructureFlagsKHR::ALLOW_COMPACTION
 }
 
-/// The geometry and primitive count of `desc`.
-fn geometry(desc: &ClassicDesc) -> (vk::AccelerationStructureGeometryKHR<'static>, u32) {
+fn geometry_flags(opaque: bool) -> vk::GeometryFlagsKHR {
+    if opaque {
+        vk::GeometryFlagsKHR::OPAQUE
+    } else {
+        vk::GeometryFlagsKHR::NO_DUPLICATE_ANY_HIT_INVOCATION
+    }
+}
+
+/// Calls `f` with the geometry and primitive count of `desc` on `caps`' device.
+fn with_geometry<R>(
+    desc: &ClassicDesc,
+    caps: &Caps,
+    f: impl FnOnce(&[vk::AccelerationStructureGeometryKHR<'_>], u32) -> R,
+) -> R {
+    let address = |a: GpuAddress| vk::DeviceOrHostAddressConstKHR {
+        device_address: a.0,
+    };
     match desc.geometry {
         ClassicGeometry::Triangles {
             positions,
@@ -180,9 +226,7 @@ fn geometry(desc: &ClassicDesc) -> (vk::AccelerationStructureGeometryKHR<'static
             let indexed = indices != GpuPtr::NULL;
             let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
                 .vertex_format(vk::Format::R32G32B32_SFLOAT)
-                .vertex_data(vk::DeviceOrHostAddressConstKHR {
-                    device_address: positions.address().0,
-                })
+                .vertex_data(address(positions.address()))
                 .vertex_stride(12)
                 .max_vertex(vertex_count.saturating_sub(1))
                 .index_type(if indexed {
@@ -190,29 +234,58 @@ fn geometry(desc: &ClassicDesc) -> (vk::AccelerationStructureGeometryKHR<'static
                 } else {
                     vk::IndexType::NONE_KHR
                 })
-                .index_data(vk::DeviceOrHostAddressConstKHR {
-                    device_address: indices.address().0,
-                });
+                .index_data(address(indices.address()));
             let g = vk::AccelerationStructureGeometryKHR::default()
                 .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
                 .geometry(vk::AccelerationStructureGeometryDataKHR { triangles })
-                .flags(if opaque {
-                    vk::GeometryFlagsKHR::OPAQUE
-                } else {
-                    vk::GeometryFlagsKHR::NO_DUPLICATE_ANY_HIT_INVOCATION
+                .flags(geometry_flags(opaque));
+            f(&[g], triangle_count)
+        }
+        ClassicGeometry::Lss {
+            positions,
+            radii,
+            indices,
+            segment_count,
+            indexing,
+            end_caps,
+            opaque,
+        } => {
+            assert!(caps.lss, "linear swept spheres need Caps::lss");
+            assert!(indices != GpuPtr::NULL, "LSS geometry needs indices");
+            let lss = vk::AccelerationStructureGeometryLinearSweptSpheresDataNV::default()
+                .vertex_format(vk::Format::R32G32B32_SFLOAT)
+                .vertex_data(address(positions.address()))
+                .vertex_stride(12)
+                .radius_format(vk::Format::R32_SFLOAT)
+                .radius_data(address(radii.address()))
+                .radius_stride(4)
+                .index_type(vk::IndexType::UINT32)
+                .index_data(address(indices.address()))
+                .index_stride(4)
+                .indexing_mode(match indexing {
+                    LssIndexing::List => vk::RayTracingLssIndexingModeNV::LIST,
+                    LssIndexing::Successive => vk::RayTracingLssIndexingModeNV::SUCCESSIVE,
+                })
+                .end_caps_mode(match end_caps {
+                    LssEndCaps::None => vk::RayTracingLssPrimitiveEndCapsModeNV::NONE,
+                    LssEndCaps::Chained => vk::RayTracingLssPrimitiveEndCapsModeNV::CHAINED,
                 });
-            (g, triangle_count)
+            // The sphere data rides in the geometry's pNext; the geometry union is unused.
+            let g = vk::AccelerationStructureGeometryKHR {
+                p_next: (&raw const lss).cast(),
+                geometry_type: vk::GeometryTypeKHR::LINEAR_SWEPT_SPHERES_NV,
+                flags: geometry_flags(opaque),
+                ..Default::default()
+            };
+            f(&[g], segment_count)
         }
         ClassicGeometry::Instances { records, capacity } => {
-            let instances = vk::AccelerationStructureGeometryInstancesDataKHR::default().data(
-                vk::DeviceOrHostAddressConstKHR {
-                    device_address: records.0,
-                },
-            );
+            let instances =
+                vk::AccelerationStructureGeometryInstancesDataKHR::default().data(address(records));
             let g = vk::AccelerationStructureGeometryKHR::default()
                 .geometry_type(vk::GeometryTypeKHR::INSTANCES)
                 .geometry(vk::AccelerationStructureGeometryDataKHR { instances });
-            (g, capacity)
+            f(&[g], capacity)
         }
     }
 }
@@ -220,23 +293,23 @@ fn geometry(desc: &ClassicDesc) -> (vk::AccelerationStructureGeometryKHR<'static
 impl Device {
     /// Sizes for building `d`.
     pub fn classic_sizes(&self, d: &ClassicDesc) -> RtasSizes {
-        let (g, count) = geometry(d);
-        let geometries = [g];
-        let build = vk::AccelerationStructureBuildGeometryInfoKHR::default()
-            .ty(vk_type(d.kind))
-            .flags(classic_flags(d.flags))
-            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-            .geometries(&geometries);
         let mut sizes = vk::AccelerationStructureBuildSizesInfoKHR::default();
-        // SAFETY: valid build info; device builds.
-        unsafe {
-            self.shared.accel_fn.get_acceleration_structure_build_sizes(
-                vk::AccelerationStructureBuildTypeKHR::DEVICE,
-                &build,
-                Some(&[count]),
-                &mut sizes,
-            );
-        }
+        with_geometry(d, &self.shared.caps, |geometries, count| {
+            let build = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+                .ty(vk_type(d.kind))
+                .flags(classic_flags(d.flags))
+                .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+                .geometries(geometries);
+            // SAFETY: valid build info; device builds.
+            unsafe {
+                self.shared.accel_fn.get_acceleration_structure_build_sizes(
+                    vk::AccelerationStructureBuildTypeKHR::DEVICE,
+                    &build,
+                    Some(&[count]),
+                    &mut sizes,
+                );
+            }
+        });
         RtasSizes {
             result_max: sizes.acceleration_structure_size,
             scratch: sizes.build_scratch_size,
@@ -289,26 +362,27 @@ impl CommandList<'_> {
             "scratch address {:#x} is not aligned to {align}",
             b.scratch.0
         );
-        let (g, count) = geometry(b.desc);
-        let geometries = [g];
-        let build = vk::AccelerationStructureBuildGeometryInfoKHR::default()
-            .ty(vk_type(b.desc.kind))
-            .flags(classic_flags(b.desc.flags))
-            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-            .dst_acceleration_structure(b.dst.raw)
-            .geometries(&geometries)
-            .scratch_data(vk::DeviceOrHostAddressKHR {
-                device_address: b.scratch.0,
-            });
-        let ranges = [vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(count)];
-        // SAFETY: recording; inputs, destination and scratch are live device memory.
-        unsafe {
-            shared.accel_fn.cmd_build_acceleration_structures(
-                self.cmd(),
-                &[build],
-                &[Some(&ranges)],
-            );
-        };
+        with_geometry(b.desc, &shared.caps, |geometries, count| {
+            let build = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+                .ty(vk_type(b.desc.kind))
+                .flags(classic_flags(b.desc.flags))
+                .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+                .dst_acceleration_structure(b.dst.raw)
+                .geometries(geometries)
+                .scratch_data(vk::DeviceOrHostAddressKHR {
+                    device_address: b.scratch.0,
+                });
+            let ranges =
+                [vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(count)];
+            // SAFETY: recording; inputs, destination and scratch are live device memory.
+            unsafe {
+                shared.accel_fn.cmd_build_acceleration_structures(
+                    self.cmd(),
+                    &[build],
+                    &[Some(&ranges)],
+                );
+            };
+        });
         self.barrier(Stages::AS_BUILD, Stages::ALL, Hazards::ACCEL_STRUCT);
     }
 
@@ -327,7 +401,7 @@ impl CommandList<'_> {
         );
         self.compact_queries += 1;
         let shared = &self.queue().shared;
-        let (buffer, offset) = shared.locate(dst.address(), 8);
+        let flags = vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT;
         // SAFETY: recording; the query was reset when the list was created and `a` is built.
         unsafe {
             shared
@@ -339,6 +413,30 @@ impl CommandList<'_> {
                     pool,
                     index,
                 );
+        }
+        if let Some(dac) = &shared.dac_fn {
+            let range = vk::StridedDeviceAddressRangeKHR {
+                address: dst.address().0,
+                size: 8,
+                stride: 8,
+            };
+            // SAFETY: recording; `dst` is the caller's live allocation.
+            unsafe {
+                dac.cmd_copy_query_pool_results_to_memory(
+                    self.cmd(),
+                    pool,
+                    index,
+                    1,
+                    &range,
+                    ADDRESS_FLAGS,
+                    flags,
+                );
+            }
+            return;
+        }
+        let (buffer, offset) = shared.locate(dst.address(), 8);
+        // SAFETY: recording; the query was written above.
+        unsafe {
             shared.device.cmd_copy_query_pool_results(
                 self.cmd(),
                 pool,
@@ -347,7 +445,7 @@ impl CommandList<'_> {
                 buffer,
                 offset,
                 8,
-                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                flags,
             );
         }
     }
@@ -569,9 +667,8 @@ impl Device {
         check_as_range(size, block, offset)?;
         let address = block.gpu.address().0 + offset;
         let info = vk::AccelerationStructureCreateInfo2KHR {
-            address_range: vk::DeviceAddressRangeKHR { address, size },
-            // Every gpu_malloc buffer has storage usage, which the flags must declare.
-            address_flags: vk::AddressCommandFlagsKHR::STORAGE_BUFFER_USAGE,
+            address_range: address_range(GpuAddress(address), size),
+            address_flags: ADDRESS_FLAGS,
             ty: vk::AccelerationStructureTypeKHR::OPACITY_MICROMAP,
             ..Default::default()
         };

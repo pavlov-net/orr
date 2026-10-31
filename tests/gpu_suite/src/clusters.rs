@@ -16,13 +16,14 @@ use orr_gpu::rtas::{
 use orr_gpu::{
     Allocation, BlasLimits, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance,
     ClassicKind, ClusterLimits, ClusterVertexFormat, CommandList, ComputePipeline, GpuAddress,
-    GpuPtr, Hazards, InstanceFlags, MemoryKind, MoveKind, MoveLimits, PtlasLimits, RtasFlags,
-    RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc, RtasSizes, Stages, TimelinePoint, Tlas,
+    GpuPtr, Hazards, InstanceFlags, MemoryKind, MoveKind, MoveLimits, PtlasLimits,
+    RayDispatchPipeline, RtasFlags, RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc, RtasSizes,
+    Stages, TimelinePoint, Tlas,
 };
 use orr_shaders::bytemuck::{Pod, Zeroable};
 
 use crate::shaders::{cluster_args, cluster_trace};
-use crate::{device, pipeline, render, upload};
+use crate::{device, pipeline, readback, render, upload};
 
 pub const W: u32 = 512;
 pub const H: u32 = 512;
@@ -392,6 +393,12 @@ fn expect(insts: &[RefInst], x: u32, y: u32, mode: u32) -> Option<Expect> {
         hit: committed,
         cand,
     })
+}
+
+/// The opaque hit (instance, triangle, t) the reference expects for ray (x, y), or `None`
+/// when the ray passes within the edge tolerance.
+pub fn reference_hit(insts: &[RefInst], x: u32, y: u32) -> Option<Option<(usize, usize, f32)>> {
+    expect(insts, x, y, 0).map(|e| e.hit)
 }
 
 /// Mismatches of one checked trace.
@@ -800,23 +807,46 @@ impl Builder {
 
     /// Traces every ray of the unit square into a fresh readback buffer.
     pub fn trace(&mut self, tlas: Tlas, mode: u32) -> Allocation<u32> {
-        let d = device();
-        let out = d
-            .gpu_malloc::<u32>(MemoryKind::Readback, u64::from(W * H) * REC as u64, "rays")
-            .unwrap();
+        let out = readback::<u32>(u64::from(W * H) * REC as u64, "rays");
         self.trace_into(tlas, mode, out.gpu);
         out
     }
 
-    pub fn trace_into(&mut self, tlas: Tlas, mode: u32, out: GpuPtr<u32>) {
-        let root = self.upload(&[cluster_trace::Root {
+    /// Traces `tlas` from the raygen entry of `p`, the ray-dispatch pipeline of
+    /// `cluster_trace`.
+    pub fn trace_rays(
+        &mut self,
+        p: &RayDispatchPipeline,
+        tlas: Tlas,
+        mode: u32,
+    ) -> Allocation<u32> {
+        let out = readback::<u32>(u64::from(W * H) * REC as u64, "rays");
+        let root = self.trace_root(tlas, mode, out.gpu);
+        let list = self.list.as_mut().unwrap();
+        list.barrier(Stages::ALL, Stages::RAY, Hazards::ACCEL_STRUCT);
+        list.dispatch_rays(p, root, [W, H, 1]);
+        list.barrier(Stages::RAY, Stages::HOST, Hazards::empty());
+        out
+    }
+
+    fn trace_root(
+        &mut self,
+        tlas: Tlas,
+        mode: u32,
+        out: GpuPtr<u32>,
+    ) -> GpuPtr<cluster_trace::Root> {
+        self.upload(&[cluster_trace::Root {
             out,
             scene: tlas,
             width: W,
             height: H,
             mode,
             pad: 0,
-        }]);
+        }])
+    }
+
+    pub fn trace_into(&mut self, tlas: Tlas, mode: u32, out: GpuPtr<u32>) {
+        let root = self.trace_root(tlas, mode, out);
         let list = self.list.as_mut().unwrap();
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::ACCEL_STRUCT);
         list.dispatch(&self.trace, root, [W / 8, H / 8, 1]);
