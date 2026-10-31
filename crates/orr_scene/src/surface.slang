@@ -21,6 +21,7 @@ public struct HitContext
     public uint depth;         // path depth, 0 at primary hits
     public float cone_width;   // m: the ray cone's width at the hit
     public float cone_spread;  // rad: the ray cone's spread angle
+    public float2 tap;         // the hit's `UvFootprint.tap`: negative x for hardware filtering
 }
 
 // Everything a surface knows about its hit. Directions and normals are unit vectors in
@@ -76,7 +77,7 @@ public interface ISurface
 public float material_coverage(SurfaceInput i)
 {
     MaterialGpu* m = i.scene.materials + i.material;
-    UvFootprint finest = { i.uv.uv, float2(0.0), float2(0.0) };
+    UvFootprint finest = { i.uv.uv, float2(0.0), float2(0.0), float2(-1.0) };
     float opacity = m.geometry_opacity;
     if (material_bound(m, TEXTURE_OPACITY))
         opacity *= material_texture(m, TEXTURE_OPACITY, finest, float4(1.0)).x;

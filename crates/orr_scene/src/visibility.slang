@@ -299,9 +299,9 @@ public bool visible_placement(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
 
 // The surface input where the ray through `pixel_center` (render pixels) meets triangle
 // `triangle` of `vc`: barycentrics and their screen gradients from the ray and its
-// one-pixel neighbors, uv footprint with the view's mip bias, normals and tangent frame in
-// render space (back faces of double-sided materials turned to the viewer), and the world
-// cell. Without mesh tangents the tangent follows the triangle's uv.
+// one-pixel neighbors, uv footprint with the view's mip bias and texture tap, normals and
+// tangent frame in render space (back faces of double-sided materials turned to the
+// viewer), and the world cell. Without mesh tangents the tangent follows the triangle's uv.
 public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc, uint triangle, float2 pixel_center)
 {
     MaterialGpu* m = s.materials + vc.material;
@@ -358,6 +358,10 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     i.context.depth = 0;
     i.context.cone_width = b.z * spread;
     i.context.cone_spread = spread;
+    // A 2x2 quad shares its tap, so neighbors under magnification read the same texel
+    // offset and the resolve's normal variance across the quad sees little filter noise.
+    i.context.tap = texture_tap(v, uint2(pixel_center) / 2, v.frame_index, 0, 0);
+    i.uv.tap = i.context.tap;
     i.instance = vc.instance;
     i.cluster = vc.cluster;
     i.primitive = triangle;

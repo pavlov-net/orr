@@ -7,6 +7,7 @@ module hit;
 import orr.abi;
 import orr.math;
 import orr.packing;
+import orr.random;
 import orr_pack.mesh;
 import producer;
 __exported import surface;
@@ -370,15 +371,32 @@ public RayCone cone_after_hit(RayCone c, float t, float spread_change)
     return o;
 }
 
-// The context of a hit `t` m along cone `c`.
-public HitContext hit_context(uint kind, uint depth, RayCone c, float t)
+// The context of a hit `t` m along cone `c` whose stochastic texture filter draws `tap`
+// (`texture_tap`; negative x: hardware filtering).
+public HitContext hit_context(uint kind, uint depth, RayCone c, float t, float2 tap = float2(-1.0))
 {
     HitContext h;
     h.kind = kind;
     h.depth = depth;
     h.cone_width = cone_width(c, t);
     h.cone_spread = c.spread;
+    h.tap = tap;
     return h;
+}
+
+// Separates the stochastic texture filter's samples from a pixel's other sample streams.
+static const uint TEXTURE_TAP_STREAM = 0x7e47a9u;
+
+// The stochastic texture filter's uniforms for the hit at `depth` on the path through
+// `pixel` in sample `frame` of stream `seed`, from their own sample stream; negative where
+// `v` takes hardware filtering.
+public float2 texture_tap(ViewConstants* v, uint2 pixel, uint frame, uint seed, uint depth)
+{
+    if (v.texture_filter != TEXTURE_FILTER_STOCHASTIC)
+        return float2(-1.0);
+    Sampler rng = Sampler(pixel, frame, seed ^ TEXTURE_TAP_STREAM);
+    rng.dimension = depth;
+    return rng.next2();
 }
 
 // A resolved ray hit.
@@ -535,6 +553,7 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
     float2 by = float2(dot(cross(yp * w, e2), n), dot(cross(e1, yp * w), n)) / nn;
 
     triangle_geometry(i, corners, attributes, m, pl, bary, bx, by, d, 1.0);
+    i.uv.tap = context.tap;
     i.context = context;
     i.primitive = primitive;
     i.barycentrics = bary;

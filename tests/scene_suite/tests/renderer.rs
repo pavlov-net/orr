@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use glam::{DVec3, Quat, UVec2, Vec2};
 use orr::{
     FrameDesc, FrameTime, Lens, PipelineId, Projection, ReloadReport, Renderer, RendererDesc,
-    SceneDesc, SceneId, ViewDesc, ViewTarget,
+    SceneDesc, SceneId, TextureFilter, ViewDesc, ViewTarget,
 };
 use orr_gpu::{GpuPtr, MemoryKind, SpecData};
 use orr_scene::testing::{assert_clean, device, read_buffer, wait};
@@ -67,6 +67,7 @@ fn empty_frames_and_scene_frames_submit_in_order() {
             jitter: Vec2::ZERO,
             reset_history: false,
             mip_bias: 0.0,
+            texture_filter: TextureFilter::Hardware,
             target: ViewTarget::AfterRr,
         })
         .unwrap();

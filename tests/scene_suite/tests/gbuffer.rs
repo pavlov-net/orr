@@ -5,8 +5,9 @@
 //! the software raster against the mesh-shader raster, camera rays through the PTLAS against
 //! the visibility buffer, resolved hits against a CPU decode, hit contexts, `rt_range`,
 //! far-from-origin and rebase invariance, the PTLAS budget, posed rigid parts in raster
-//! and ray tracing with their motion, hiding, section masks and material sets, and the DAG
-//! traversal's cuts, two-pass occlusion and `debug_lod`.
+//! and ray tracing with their motion, hiding, section masks and material sets, the DAG
+//! traversal's cuts, two-pass occlusion and `debug_lod`, and the stochastic texture filter
+//! against CPU bicubic and bilinear filters.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -37,8 +38,8 @@ use orr_scene::{
     GroupWriter, InstanceFlags, InstanceRange, InstancesDesc, Lens, LoadState, Loading,
     MaterialGpu, ModelId, MountId, PackSource, Pose, Projection, RasterView, RendererDesc,
     SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc, SkinnedGpu,
-    SlotCutGpu, TransformGroupDesc, TransformGroupId, ViewDesc, ViewHistoryId, ViewTarget,
-    VisibleCluster, material_flags,
+    SlotCutGpu, TextureFilter, TransformGroupDesc, TransformGroupId, ViewDesc, ViewHistoryId,
+    ViewTarget, VisibleCluster, material_flags,
 };
 use scene_suite::shaders::{codec, pose, skin_pose, surface_at, trace};
 use scene_suite::{linked, pipeline};
@@ -968,6 +969,7 @@ struct World {
     scenes: Scenes,
     mount: MountId,
     _workers: Workers,
+    texture_filter: TextureFilter,
 }
 
 fn time(frame: u32) -> FrameTime {
@@ -1015,6 +1017,7 @@ impl World {
         Self {
             scenes,
             mount,
+            texture_filter: TextureFilter::Hardware,
             _workers: workers,
         }
     }
@@ -1235,6 +1238,7 @@ fn render(
             jitter: Vec2::new(0.25, -0.125),
             reset_history: reset,
             mip_bias: 0.0,
+            texture_filter: w.texture_filter,
             target: ViewTarget::AfterRr,
         })
         .unwrap();
@@ -1386,6 +1390,61 @@ fn each_gbuffer_channel_matches_its_reference() {
     for (name, f) in &channels {
         check(&reference(name), &image(f), flip);
     }
+    assert_clean();
+}
+
+#[test]
+fn a_stochastic_view_changes_magnified_texels_by_frame_and_averages_near_hardware_filtering() {
+    const FRAMES: u32 = 32;
+    let _serial = serial();
+    let mut w = World::new(&KernelSet {
+        modules: &[],
+        surfaces: 0,
+    });
+    let placed = place(&mut w, &showcase());
+    // Close over the ground's checker corner at the origin: about a quarter of an albedo
+    // texel per pixel.
+    let eye = Vec3::new(0.05, 0.25, 0.05);
+    let target = Vec3::ZERO;
+    let base = |g: &Frame, i: usize| [0, 8, 16].map(|s| byte(g.a[i][0], s));
+    let hardware = render(&mut w, &placed, eye, target, &[], true, 1);
+    w.texture_filter = TextureFilter::Stochastic;
+    let pixels = hardware.ids.len();
+    let mut sum = vec![[0.0f32; 3]; pixels];
+    let mut changed = 0;
+    let mut last: Option<Frame> = None;
+    for frame in 2..2 + FRAMES {
+        let g = render(&mut w, &placed, eye, target, &[], false, frame);
+        assert_eq!(
+            g.ids, hardware.ids,
+            "frame {frame}: the filter leaves visibility alone"
+        );
+        for (i, s) in sum.iter_mut().enumerate() {
+            let c = base(&g, i);
+            for k in 0..3 {
+                s[k] += c[k] / FRAMES as f32;
+            }
+        }
+        if let Some(p) = &last {
+            changed += (0..pixels).filter(|&i| base(p, i) != base(&g, i)).count();
+        }
+        last = Some(g);
+    }
+    assert!(
+        changed > pixels / 100,
+        "{changed} texels changed between frames over {pixels} pixels"
+    );
+    let difference = (0..pixels)
+        .map(|i| {
+            let h = base(&hardware, i);
+            (0..3).map(|k| (sum[i][k] - h[k]).abs()).sum::<f32>() / 3.0
+        })
+        .sum::<f32>()
+        / pixels as f32;
+    assert!(
+        difference < 0.01,
+        "mean difference from hardware {difference}"
+    );
     assert_clean();
 }
 
@@ -1855,6 +1914,7 @@ fn software_and_hardware_raster_draw_the_same_visibility_buffer() {
                         jitter: Vec2::new(0.25, -0.125),
                         reset_history: true,
                         mip_bias: 0.0,
+                        texture_filter: TextureFilter::Hardware,
                         target: ViewTarget::AfterRr,
                     })
                     .unwrap();
@@ -2005,6 +2065,7 @@ fn shoot_with(
             jitter: Vec2::new(0.25, -0.125),
             reset_history: shot.reset,
             mip_bias: 0.0,
+            texture_filter: TextureFilter::Hardware,
             target: ViewTarget::AfterRr,
         })
         .unwrap();
@@ -2904,6 +2965,7 @@ fn shoot_rigs(
             jitter: Vec2::new(0.25, -0.125),
             reset_history: shot.reset,
             mip_bias: 0.0,
+            texture_filter: TextureFilter::Hardware,
             target: ViewTarget::AfterRr,
         })
         .unwrap();
@@ -4214,6 +4276,7 @@ fn a_pose_kernel_samples_clips_on_the_gpu_like_the_cpu() {
             jitter: Vec2::ZERO,
             reset_history: true,
             mip_bias: 0.0,
+            texture_filter: TextureFilter::Hardware,
             target: ViewTarget::AfterRr,
         })
         .unwrap();
@@ -4309,5 +4372,147 @@ fn motion_vectors_of_skinned_copies_carry_their_deformation() {
         wrong * 50 < counted,
         "{wrong} of {counted} pixels reproject onto another cluster ({still} without motion)"
     );
+    assert_clean();
+}
+
+// --- Stochastic texture filtering ------------------------------------------------------------
+
+#[test]
+fn stochastic_texture_taps_average_to_the_bicubic_filter_under_magnification() {
+    use orr_gpu::{
+        AddressMode, Filter, Format, SamplerDesc, TextureDesc, TextureMemory, TextureUsage,
+    };
+    use scene_suite::shaders::texture_filter::{self, Footprint, Root};
+
+    const SIZE: u32 = 8;
+    const TAPS: u32 = 4096;
+    let _guard = serial();
+    let d = device();
+    let texels: Vec<[u8; 4]> = (0..SIZE * SIZE)
+        .map(|i| {
+            let h = (i.wrapping_mul(2_654_435_761) >> 7) as u8;
+            [h, h.wrapping_mul(7), h ^ 0x5a, 255]
+        })
+        .collect();
+    let texel = |x: i32, y: i32| -> [f32; 4] {
+        let n = SIZE as i32;
+        texels[(y.rem_euclid(n) * n + x.rem_euclid(n)) as usize].map(|c| f32::from(c) / 255.0)
+    };
+    // The repeating texture filtered with `weights(t)` over taps `-r + 1..=r` around the
+    // texel below each sample.
+    let filter = |uv: [f32; 2], r: i32, weights: &dyn Fn(f32, i32) -> f32| -> [f32; 4] {
+        let x = uv[0] * SIZE as f32 - 0.5;
+        let y = uv[1] * SIZE as f32 - 0.5;
+        let (bx, by) = (x.floor(), y.floor());
+        let (tx, ty) = (x - bx, y - by);
+        let mut sum = [0.0; 4];
+        for j in -r + 1..=r {
+            for i in -r + 1..=r {
+                let w = weights(tx, i) * weights(ty, j);
+                let t = texel(bx as i32 + i, by as i32 + j);
+                for c in 0..4 {
+                    sum[c] += w * t[c];
+                }
+            }
+        }
+        sum
+    };
+    let bspline = |t: f32, k: i32| -> f32 {
+        let s = 1.0 - t;
+        match k {
+            -1 => s * s * s / 6.0,
+            0 => (4.0 - 6.0 * t * t + 3.0 * t * t * t) / 6.0,
+            1 => (1.0 + 3.0 * t + 3.0 * t * t - 3.0 * t * t * t) / 6.0,
+            _ => t * t * t / 6.0,
+        }
+    };
+    let linear = |t: f32, k: i32| -> f32 { if k == 0 { 1.0 - t } else { t } };
+    let cubic = |uv| filter(uv, 2, &bspline);
+    let bilinear = |uv| filter(uv, 1, &linear);
+
+    let uvs = [[0.31, 0.47], [0.02, 0.97], [0.99, 0.01], [0.5626, 0.1874]];
+    let footprint = |uv: [f32; 2], texels: f32, hardware: bool| Footprint {
+        uv,
+        dx: [texels / SIZE as f32, 0.0],
+        dy: [0.0, texels / SIZE as f32],
+        hardware: u32::from(hardware),
+        pad: 0,
+    };
+    let mut cases = Vec::new();
+    for &uv in &uvs {
+        let mix: [f32; 4] = std::array::from_fn(|c| 0.5 * cubic(uv)[c] + 0.5 * bilinear(uv)[c]);
+        cases.extend([
+            (footprint(uv, 0.1, false), cubic(uv), "magnified"),
+            (footprint(uv, 0.75, false), mix, "three quarters of a texel"),
+            (footprint(uv, 2.0, false), bilinear(uv), "minified"),
+            (footprint(uv, 0.1, true), bilinear(uv), "hardware"),
+        ]);
+    }
+    assert!(
+        uvs.iter()
+            .any(|&uv| (0..3).any(|c| (cubic(uv)[c] - bilinear(uv)[c]).abs() > 0.05)),
+        "the texture tells bicubic from bilinear"
+    );
+
+    let desc = TextureDesc::d2(Format::Rgba8Unorm, SIZE, SIZE, TextureUsage::SAMPLED);
+    let texture = d
+        .create_texture(&desc, TextureMemory::Dedicated, "filtered texture")
+        .unwrap();
+    let upload = |bytes: &[u8], name| {
+        let mut a = d
+            .gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, name)
+            .unwrap();
+        a.as_mut_slice().unwrap().copy_from_slice(bytes);
+        a
+    };
+    let staging = upload(bytemuck::cast_slice(&texels), "texels");
+    let footprints: Vec<Footprint> = cases.iter().map(|c| c.0).collect();
+    let input = upload(bytemuck::cast_slice(&footprints), "footprints");
+    let out = d
+        .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, cases.len() as u64, "means")
+        .unwrap();
+    let slot = d.alloc_image_slot().unwrap();
+    let sampler = d
+        .sampler(&SamplerDesc {
+            mag: Filter::Linear,
+            min: Filter::Linear,
+            mip: Filter::Nearest,
+            address: [AddressMode::Repeat; 3],
+            ..SamplerDesc::default()
+        })
+        .unwrap();
+    let root = upload(
+        bytemuck::bytes_of(&Root {
+            footprints: input.gpu.cast(),
+            out: out.gpu,
+            texture: d.write_sampled(slot, &texture, &orr_gpu::ViewDesc::default()),
+            sampler,
+            count: cases.len() as u32,
+            taps: TAPS,
+        }),
+        "texture filter root",
+    );
+    let p = pipeline(&texture_filter::MODULE, "mean");
+    let render = d.queue(QueueKind::Render).unwrap();
+    let mut list = render.command_list().unwrap();
+    list.discard(&texture);
+    list.copy_to_texture(&texture, &TextureRegion::whole_mip(&desc, 0), staging.gpu);
+    list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
+    list.dispatch(&p, root.gpu.cast::<Root>(), [1, 1, 1]);
+    list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+    wait(render.submit(vec![list], &[]).unwrap());
+
+    for ((footprint, want, what), mean) in cases.iter().zip(out.as_slice().unwrap()) {
+        for c in 0..4 {
+            assert!(
+                (mean[c] - want[c]).abs() < 4e-3,
+                "{what} at {:?}: channel {c} is {} against {}",
+                footprint.uv,
+                mean[c],
+                want[c]
+            );
+        }
+    }
+    d.free_image_slot_after_submitted(slot);
     assert_clean();
 }

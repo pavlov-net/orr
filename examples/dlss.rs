@@ -21,7 +21,8 @@ use examples::{Options, PROJECT_ID, Workers, assert_clean, device, fixed_time};
 use orr::orr_gpu::{OutputFormat, QueueKind, TimelinePoint};
 use orr::{
     Display, DisplayRequest, DlssSdk, FrameDesc, FrameGenerationMode, FrameTime, Lens, Projection,
-    Renderer, RendererDesc, ViewDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    Renderer, RendererDesc, TextureFilter, ViewDesc, ViewHooks, ViewLighting, ViewOutput,
+    ViewTarget,
 };
 use orr_math::camera::rh::view;
 use orr_math::{UVec2, Vec2, Vec3};
@@ -197,6 +198,7 @@ fn run(options: &Options) {
                 jitter: Vec2::ZERO,
                 reset_history: i == 0,
                 mip_bias: 0.0,
+                texture_filter: TextureFilter::Hardware,
                 target: ViewTarget::Display,
             },
             &ViewLighting::default(),

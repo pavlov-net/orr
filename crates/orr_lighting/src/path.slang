@@ -544,7 +544,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
             rng.next();
             throughput *= medium_transmittance<M>(s.medium, ray.origin, ray.dir, t);
         }
-        HitContext context = hit_context(HIT_SECONDARY, depth + 1, cone, t);
+        HitContext context = hit_context(HIT_SECONDARY, depth + 1, cone, t, texture_tap(v, pixel, r.frame, r.seed, depth + 1));
         SurfaceHit sh = resolve_hit<S>(s, v, ray.dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, context);
         if (!sh.valid)
         {
@@ -630,7 +630,7 @@ public bool lens_vertex<S : ISurface>(PathRoot r, uint2 pixel, inout Sampler rng
     Hit h = trace_closest(s.tlas, path_ray(origin, dir, positive_infinity()), MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
     if (!h.hit || h.cluster_id < 0)
         return false;
-    SurfaceHit sh = resolve_hit<S>(s, v, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, hit_context(HIT_PRIMARY, 0, cone, h.t));
+    SurfaceHit sh = resolve_hit<S>(s, v, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, hit_context(HIT_PRIMARY, 0, cone, h.t, texture_tap(v, pixel, r.frame, r.seed, 0)));
     if (!sh.valid)
         return false;
     x = hit_vertex(v, sh, dir);

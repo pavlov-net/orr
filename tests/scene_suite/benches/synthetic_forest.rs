@@ -21,8 +21,8 @@ use orr::orr_gpu::{
 use orr::{
     Affine3, Budgets, Display, FrameDesc, FrameStats, FrameTime, GroupWriter, InstanceFlags,
     InstanceRange, InstancesDesc, Lens, LoadState, Loading, ModelId, MountId, PackSource,
-    Projection, RasterView, Renderer, RendererDesc, SceneDesc, SceneId, TransformGroupDesc,
-    ViewDesc, ViewHistoryId, ViewTarget,
+    Projection, RasterView, Renderer, RendererDesc, SceneDesc, SceneId, TextureFilter,
+    TransformGroupDesc, ViewDesc, ViewHistoryId, ViewTarget,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshParts, MeshSettings, Quality, Source,
@@ -944,6 +944,7 @@ fn view_desc<'a>(
         jitter: Vec2::ZERO,
         reset_history: frame <= 3,
         mip_bias: 0.0,
+        texture_filter: TextureFilter::Hardware,
         target: ViewTarget::AfterRr,
     }
 }

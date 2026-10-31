@@ -43,7 +43,13 @@ public struct ViewConstants
     public uint frame_index;
     public float delta_time;
     public float mip_bias;                    // texture level-of-detail bias of the upscaler
+    public uint texture_filter;               // TEXTURE_FILTER_*
+    public uint _pad;
 }
+
+// `ViewConstants.texture_filter`.
+public static const uint TEXTURE_FILTER_HARDWARE = 0;
+public static const uint TEXTURE_FILTER_STOCHASTIC = 1;
 
 public static const float HDR_CEILING = 16384.0;
 
