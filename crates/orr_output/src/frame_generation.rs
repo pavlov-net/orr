@@ -51,7 +51,7 @@ pub(crate) struct DynamicCount {
     over_since: Option<f64>,
     under_since: Option<f64>,
     /// The last measured frame-generation cost of one generated image, ms.
-    per_image_ms: f64,
+    fg_per_image_ms: f64,
 }
 
 impl DynamicCount {
@@ -63,7 +63,7 @@ impl DynamicCount {
             ceiling: max,
             over_since: None,
             under_since: None,
-            per_image_ms: 0.0,
+            fg_per_image_ms: 0.0,
         }
     }
 
@@ -81,11 +81,20 @@ impl DynamicCount {
     }
 
     /// Feeds one rendered frame's measured GPU time `gpu_ms` (render and present queues,
-    /// frame generation and compose-UI included), of which `fg_ms` was frame generation,
-    /// measured at `t` seconds with `generated` images. Returns the count to use.
-    pub(crate) fn measure(&mut self, t: f64, gpu_ms: f64, fg_ms: f64, generated: u32) -> u32 {
+    /// frame generation, UI paints and compose-UI included), of which `fg_ms` was frame
+    /// generation, measured at `t` seconds with `generated` images. `paint_ms` is one UI
+    /// paint's cost when the UI is drawn per presented image (each more image adds one), else
+    /// 0. Returns the count to use.
+    pub(crate) fn measure(
+        &mut self,
+        t: f64,
+        gpu_ms: f64,
+        fg_ms: f64,
+        generated: u32,
+        paint_ms: f64,
+    ) -> u32 {
         if generated > 0 {
-            self.per_image_ms = fg_ms / f64::from(generated);
+            self.fg_per_image_ms = fg_ms / f64::from(generated);
         }
         let budget = 1000.0 / f64::from(self.base_hz);
         if gpu_ms > budget {
@@ -102,7 +111,7 @@ impl DynamicCount {
             self.under_since = None;
             return self.n;
         }
-        let at_next = gpu_ms + self.per_image_ms;
+        let at_next = gpu_ms + self.fg_per_image_ms + paint_ms;
         if at_next < RISE_SHARE * budget {
             let since = *self.under_since.get_or_insert(t);
             if t - since >= DYNAMIC_HOLD_S {
@@ -284,7 +293,7 @@ mod tests {
         for frame in 0..600 {
             let t = f64::from(frame) / 60.0;
             let fg = f64::from(n);
-            let next = d.measure(t, ms_at(&base, t) + fg, fg, n);
+            let next = d.measure(t, ms_at(&base, t) + fg, fg, n, 0.0);
             if next != n {
                 changes.push((t, n, next));
             }
@@ -306,6 +315,27 @@ mod tests {
             assert_eq!((*from, *to), (ef, eto), "{changes:?}");
             assert!((t - et).abs() < 2.5 / 60.0, "{changes:?}");
         }
+    }
+
+    #[test]
+    fn dynamic_rise_counts_one_more_ui_paint() {
+        let budget = 1000.0 / 60.0;
+        let rises = |paint_ms: f64| {
+            let mut d = DynamicCount::new(2, 60.0);
+            d.set_limits(5, Some(240.0));
+            for frame in 0..60 {
+                d.measure(f64::from(frame) / 60.0, budget + 1.0, 2.0, 2, paint_ms);
+            }
+            assert_eq!(d.generated(), 1);
+            // 1 ms of frame generation per image: the next image fits by 0.5 ms alone.
+            let cost = 0.95 * budget - 1.5;
+            for frame in 60..120 {
+                d.measure(f64::from(frame) / 60.0, cost, 1.0, 1, paint_ms);
+            }
+            d.generated() == 2
+        };
+        assert!(rises(0.0));
+        assert!(!rises(1.0));
     }
 
     #[test]

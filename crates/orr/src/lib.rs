@@ -63,7 +63,7 @@ use orr_lighting::{BsdfTables, LightingKernels, LightingView, SceneLighting, Sce
 use orr_output::{
     CapturePass, ChainImages, ComposePass, ComposeRoot, ComposeSource, DisplayFrame, ExposurePass,
     HookInputsPass, HookPoint, Hooks, Image, OutputKernels, OutputView, SceneCapturePass,
-    TonemapPass,
+    TonemapPass, UI_PASS,
 };
 use orr_scene::Scenes;
 
@@ -112,7 +112,10 @@ pub struct ViewHooks<'a> {
     pub scene_referred: Option<&'a mut dyn FnMut(&mut HookPass<'_, '_>)>,
     /// On tonemap's display-linear image before compose; not run for `ViewTarget::AfterRr`.
     pub display_linear: Option<&'a mut dyn FnMut(&mut HookPass<'_, '_>)>,
-    /// Into the display's UI layer; run only for `ViewTarget::Display`.
+    /// Into the display's UI layer; run only for `ViewTarget::Display`. With
+    /// `Display::set_ui_per_present` on and frame generation generating, it runs once per
+    /// presented image. Each run records inside a pass named [`orr_output::UI_PASS`], so it
+    /// begins no pass of its own.
     pub ui: Option<&'a mut dyn FnMut(&mut UiPass<'_, '_>)>,
 }
 
@@ -567,6 +570,7 @@ impl<'a> Frame<'a> {
 
         let raster = self.scenes.raster_view(view)?;
         let id = self.scenes.id();
+        let delta = self.scenes.time().delta;
         let gpu = self.output.device.clone();
         let list = self.scenes.list()?;
         let state = self
@@ -732,14 +736,7 @@ impl<'a> Frame<'a> {
         }
         let ui = match (display.as_mut(), hooks.ui.as_mut()) {
             (Some(frame), Some(hook)) => {
-                let layer = frame.ui_layer(list);
-                let index = layer.index();
-                hook(&mut UiPass {
-                    cmd: list,
-                    layer: layer.texture(),
-                    presented: 0,
-                    time_offset: 0.0,
-                });
+                let index = paint_ui(list, frame, delta, &mut **hook);
                 list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
                 Some(index)
             }
@@ -793,25 +790,23 @@ impl<'a> Frame<'a> {
         Ok(self.scenes.list()?)
     }
 
-    /// A frame that renders no view into the display (menus, loading screens): runs `ui`
-    /// into the display's UI layer, which the present thread composes over black, or over
-    /// the frame's [`Frame::pattern`]. Does nothing without a display or while its window
-    /// has no area.
+    /// Runs `ui` into the display's UI layer. In a frame that renders no view into the
+    /// display (menus, loading screens) the present thread composes it over black, or over
+    /// the frame's [`Frame::pattern`]; after [`Frame::compose`] and
+    /// [`Frame::frame_generation`] it goes over the consumer's image and, with
+    /// `Display::set_ui_per_present` on, runs once per presented image. Each run records
+    /// inside a pass named [`orr_output::UI_PASS`]. Does nothing without a display or while
+    /// its window has no area.
     pub fn ui_only(&mut self, ui: &mut dyn FnMut(&mut UiPass<'_, '_>)) -> Result<()> {
         let Some(display) = self.display.as_deref_mut() else {
             return Ok(());
         };
+        let delta = self.scenes.time().delta;
         let list = self.scenes.list()?;
         let Some(mut frame) = display.frame() else {
             return Ok(());
         };
-        let layer = frame.ui_layer(list).texture();
-        ui(&mut UiPass {
-            cmd: list,
-            layer,
-            presented: 0,
-            time_offset: 0.0,
-        });
+        paint_ui(list, &mut frame, delta, ui);
         Ok(())
     }
 
@@ -921,4 +916,30 @@ impl<'a> Frame<'a> {
         }
         Ok(point)
     }
+}
+
+/// Runs `hook` once per UI layer of `frame`, each inside a [`UI_PASS`] pass with its
+/// presented image's index and time offset, and returns the sampled view of the frame's own
+/// image's layer.
+fn paint_ui(
+    list: &mut CommandList<'_>,
+    frame: &mut DisplayFrame<'_>,
+    delta: f32,
+    hook: &mut dyn FnMut(&mut UiPass<'_, '_>),
+) -> TextureIndex {
+    let mut index = TextureIndex::NONE;
+    for presented in 0..frame.ui_layers() {
+        let time_offset = frame.ui_time_offset(presented, delta);
+        let layer = frame.ui_layer(list, presented);
+        index = layer.index();
+        list.begin_pass(UI_PASS, false);
+        hook(&mut UiPass {
+            cmd: list,
+            layer: layer.texture(),
+            presented,
+            time_offset,
+        });
+        list.end_pass();
+    }
+    index
 }

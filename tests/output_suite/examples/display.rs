@@ -210,7 +210,7 @@ fn main() {
         painter
             .update_textures(&mut list, frame, textures_delta)
             .unwrap();
-        let layer = f.ui_layer(&mut list).texture();
+        let layer = f.ui_layer(&mut list, 0).texture();
         painter
             .paint(&mut list, frame, layer, &primitives, pixels_per_point)
             .unwrap();

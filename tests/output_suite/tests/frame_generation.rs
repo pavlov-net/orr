@@ -1,9 +1,12 @@
 //! Frame generation through `orr::Renderer` and a `Display` on a real window: a bar crossing
 //! the window, shaded by a test kernel and shown with `Frame::compose`, with the egui demo
-//! windows over it. The display runs 2x, then 4x where NGX allows it, then off, `Dynamic`
-//! on a PQ request, 2x on a scRGB request and off again. Each frame presents its generated
-//! images before itself, scRGB presents as PQ while frame generation is on, every frame id
-//! keeps one complete latency report, and the validation layer stays silent. Headless, a
+//! windows and a cursor moving at constant speed over it. The display runs 2x, then 4x
+//! where NGX allows it, then off, `Dynamic` on a PQ request, 2x on a scRGB request, off
+//! again, and 4x with the UI drawn per presented image. Each frame presents its generated
+//! images before itself, scRGB presents as PQ while frame generation is on, the UI hook runs
+//! once per frame except with the UI per presented image, where it runs once per presented
+//! image and the cursor advances by equal steps from image to image, every frame id keeps
+//! one complete latency report, and the validation layer stays silent. Headless, a
 //! lens-distorted pan keeps its generated images aligned through the distortion field.
 #![cfg(windows)]
 
@@ -11,7 +14,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use egui::{Context, FullOutput, Pos2, RawInput, Rect, TexturesDelta, vec2};
+use egui::epaint::ClippedShape;
+use egui::{Color32, Context, FullOutput, Pos2, RawInput, Rect, Shape, TexturesDelta, vec2};
 use gpu_suite::check_latency_reports;
 use gpu_suite::window::Window;
 use orr::orr_gpu::{
@@ -31,13 +35,17 @@ use output_suite::shaders::moving_bar;
 const PROJECT_ID: Uuid = Uuid::from_u128(0x2f6b_91c4_5a0e_4d3b_b7e2_0c18_d94a_6e53);
 /// Frames per phase.
 const PHASE: u64 = 160;
-const PHASES: u64 = 6;
+const PHASES: u64 = 7;
+/// The phase that draws the UI per presented image.
+const UI_PER_PRESENT: u64 = 6;
 /// Frames into a phase before its generated count is checked: the feature and its history
 /// settle first.
 const SETTLE: u64 = 16;
 const BAR_WIDTH: f32 = 64.0;
 /// Pixels per rendered frame.
 const SPEED: f32 = 6.0;
+/// The cursor's speed, pixels per second.
+const CURSOR_SPEED: f64 = 480.0;
 
 /// The bar's images at one extent, as `Arc`s frame generation can keep for the frame.
 struct Targets {
@@ -94,7 +102,8 @@ fn phase(
         2 => (Off, Sdr, Sdr),
         3 => (recommended, Hdr10Pq, Hdr10Pq),
         4 => (Fixed(1), ScRgb, Hdr10Pq),
-        _ => (Off, ScRgb, ScRgb),
+        5 => (Off, ScRgb, ScRgb),
+        _ => (Fixed(most), Sdr, Sdr),
     }
 }
 
@@ -165,13 +174,18 @@ fn frame_generation_presents_generated_images_before_each_frame() {
     let mut last_present_id = 0;
     let mut last = None;
     let mut checked = 0;
+    let mut last_cursor: Option<f64> = None;
+    let mut cursor_steps = 0;
 
     for i in 0..PHASE * PHASES {
         window.pump();
         let (mode, encoding, expected) = phase(i / PHASE, most, recommended);
+        let per_present = i / PHASE == UI_PER_PRESENT;
         if i % PHASE == 0 {
             display.set_request(&request(encoding));
             display.set_frame_generation(&sdk, mode).unwrap();
+            display.set_ui_per_present(per_present);
+            last_cursor = None;
         }
         let time = FrameTime {
             absolute: i as f64 / 60.0,
@@ -260,6 +274,8 @@ fn frame_generation_presents_generated_images_before_each_frame() {
         );
         let primitives = ctx.tessellate(shapes, pixels_per_point);
         pending.append(textures_delta);
+        // (presented, time offset, cursor position unwrapped) per run of the UI hook.
+        let mut paints = Vec::new();
         f.ui_only(&mut |pass| {
             painter
                 .update_textures(pass.cmd, id, std::mem::take(&mut pending))
@@ -267,9 +283,44 @@ fn frame_generation_presents_generated_images_before_each_frame() {
             painter
                 .paint(pass.cmd, id, pass.layer, &primitives, pixels_per_point)
                 .unwrap();
+            let x = (time.absolute + f64::from(pass.time_offset)) * CURSOR_SPEED;
+            let center = Pos2::new((x % f64::from(extent[0])) as f32, 24.0);
+            let cursor = ctx.tessellate(
+                vec![ClippedShape::new(
+                    Rect::EVERYTHING,
+                    Shape::circle_filled(center, 12.0, Color32::WHITE),
+                )],
+                pixels_per_point,
+            );
+            painter
+                .paint(pass.cmd, id, pass.layer, &cursor, pixels_per_point)
+                .unwrap();
+            paints.push((pass.presented, pass.time_offset, x));
         })
         .unwrap();
         last = Some((id, f.end().unwrap()));
+
+        if per_present {
+            let FrameGenerationMode::Fixed(n) = mode else {
+                unreachable!()
+            };
+            let order: Vec<_> = paints.iter().map(|&(k, _, _)| k).collect();
+            assert_eq!(order, (0..=n).collect::<Vec<_>>(), "frame {id}");
+            let step = CURSOR_SPEED * f64::from(time.delta) / f64::from(n + 1);
+            for &(_, _, x) in &paints {
+                if let Some(prev) = last_cursor {
+                    assert!(
+                        ((x - prev) - step).abs() <= 0.1 * step,
+                        "frame {id}: the cursor moved {} px, not {step} px",
+                        x - prev
+                    );
+                    cursor_steps += 1;
+                }
+                last_cursor = Some(x);
+            }
+        } else {
+            assert_eq!(paints, [(0, 0.0, paints[0].2)], "frame {id}");
+        }
 
         if id.is_multiple_of(16) {
             timings.clear();
@@ -306,6 +357,7 @@ fn frame_generation_presents_generated_images_before_each_frame() {
         .wait(point, Duration::from_secs(10))
         .unwrap();
     assert!(checked > 0);
+    assert!(cursor_steps > 0);
     check_latency_reports(&reports, last_id);
     drop(display);
     drop(painter);

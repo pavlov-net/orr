@@ -38,6 +38,8 @@ const MIN_IMAGES: u32 = 5;
 const COST_REPORTS: usize = 32;
 /// The pass frame generation records under, which `Dynamic` reads its cost from.
 const FG_PASS: &str = "frame_generation";
+/// The pass each UI paint records under, which `Dynamic` reads its cost from.
+pub const UI_PASS: &str = "ui";
 
 /// A window's display target. The render thread draws each frame into the frame slot
 /// [`Display::begin_frame`] returns and hands it over with [`Display::present`]; the present
@@ -62,6 +64,7 @@ pub struct Display {
     applied_latency: Option<(bool, bool, u32)>,
     field: Option<DistortionField>,
     fg: Option<Fg>,
+    ui_per_present: bool,
     costs: VecDeque<Cost>,
     started: Instant,
     shared: Arc<Shared>,
@@ -105,6 +108,8 @@ struct Cost {
     /// The frame's main submit.
     render: TimelinePoint,
     generated: u32,
+    /// UI paints the frame drew with UI per presented image on, else 0.
+    paints_per_present: u32,
     /// The frame's compose submits, once the present thread reports them.
     compose: Option<Vec<TimelinePoint>>,
 }
@@ -112,9 +117,12 @@ struct Cost {
 /// One frame slot: the images a frame draws into, reused `frames_in_flight` frames later.
 struct Slot {
     backbuffer: Option<Encoded>,
-    ui: Option<UiLayer>,
+    /// One UI layer, or with UI per presented image on, at least one per presented image
+    /// (kept while `Dynamic` lowers n).
+    ui: Vec<UiLayer>,
     backbuffer_written: bool,
-    ui_drawn: bool,
+    /// Which of `ui` the frame cleared and drew into.
+    ui_drawn: Vec<bool>,
     /// Frame generation's outputs, in the backbuffer's encoding and size.
     generated: Vec<Encoded>,
     /// NGX's interpolation-disabled flag for this slot's frame.
@@ -167,6 +175,7 @@ struct Begun {
     extent: [u32; 2],
     wait: Option<TimelinePoint>,
     generated: u32,
+    ui_per_present: bool,
 }
 
 /// A frame handed to the present thread.
@@ -177,7 +186,9 @@ struct Job {
     display: ResolvedDisplay,
     mode: PresentMode,
     source: Option<TextureIndex>,
-    ui: Option<TextureIndex>,
+    /// The UI layers the frame drew: one for every presented image, or one per presented
+    /// image in order, the frame's own last.
+    ui: Vec<Option<TextureIndex>>,
     /// Generated images, presented in order before the frame.
     generated: Vec<TextureIndex>,
     flag: Option<Arc<Allocation<u32>>>,
@@ -223,6 +234,7 @@ pub struct DisplayFrame<'a> {
     pub wait: Option<TimelinePoint>,
     /// Images frame generation adds after this frame; 0 with it off.
     pub generated: u32,
+    ui_per_present: bool,
 }
 
 impl DisplayFrame<'_> {
@@ -241,17 +253,37 @@ impl DisplayFrame<'_> {
         b.storage
     }
 
-    /// The UI layer, for UI renderers to draw into. The first call records its clear into
-    /// `list`; a frame that never calls it presents no UI.
-    pub fn ui_layer(&mut self, list: &mut CommandList<'_>) -> &UiLayer {
-        let ui = self
-            .slot
-            .ui
-            .as_ref()
-            .expect("begin_frame sizes the UI layer");
-        if !self.slot.ui_drawn {
+    /// The UI layers the frame draws: one per presented image (`generated + 1`) with UI
+    /// per presented image on, frame generation generating and
+    /// [`DisplayFrame::frame_generation`] already called for the frame; otherwise 1, which
+    /// is composed over every presented image.
+    pub fn ui_layers(&self) -> u32 {
+        if self.ui_per_present && self.generated > 0 && self.slot.view.is_some() {
+            self.generated + 1
+        } else {
+            1
+        }
+    }
+
+    /// Seconds from the frame's own image to presented image `presented` (below
+    /// [`DisplayFrame::ui_layers`]), for a frame `delta` seconds after the previous one.
+    /// Generated image k of n shows the time k / (n + 1) of the way from the previous frame
+    /// to this one, so its offset is negative; the frame's own image's is 0.
+    pub fn ui_time_offset(&self, presented: u32, delta: f32) -> f32 {
+        let n = self.ui_layers() - 1;
+        (presented.min(n) as f32 - n as f32) / (n + 1) as f32 * delta
+    }
+
+    /// UI layer `presented` (below [`DisplayFrame::ui_layers`]; the last is the frame's own
+    /// image's), for UI renderers to draw into. The first call per layer records its clear
+    /// into `list`; a frame that never calls it presents no UI, and a layer left undrawn
+    /// presents its image without UI.
+    pub fn ui_layer(&mut self, list: &mut CommandList<'_>, presented: u32) -> &UiLayer {
+        let i = presented.min(self.ui_layers() - 1) as usize;
+        let ui = &self.slot.ui[i];
+        if !self.slot.ui_drawn[i] {
             ui.clear(list);
-            self.slot.ui_drawn = true;
+            self.slot.ui_drawn[i] = true;
         }
         ui
     }
@@ -376,9 +408,9 @@ impl Display {
             slots: (0..n)
                 .map(|_| Slot {
                     backbuffer: None,
-                    ui: None,
+                    ui: Vec::new(),
                     backbuffer_written: false,
-                    ui_drawn: false,
+                    ui_drawn: Vec::new(),
                     generated: Vec::new(),
                     flag: None,
                     view: None,
@@ -392,6 +424,7 @@ impl Display {
             applied_latency: None,
             field: None,
             fg: None,
+            ui_per_present: false,
             costs: VecDeque::new(),
             started: Instant::now(),
             shared,
@@ -475,6 +508,21 @@ impl Display {
             }
         }
         Ok(())
+    }
+
+    /// Draws the UI once per presented image, from the next `begin_frame`. With frame
+    /// generation adding n images, the UI hook runs n + 1 times per frame, each into its
+    /// own layer with the presented image's index and time offset, and compose-UI puts
+    /// layer i over presented image i, so UI motion (a cursor) advances on every presented
+    /// image instead of every rendered frame. Off by default: it costs n more UI paints per
+    /// frame, which `Dynamic` counts, and n more UI layers per frame in flight.
+    pub fn set_ui_per_present(&mut self, on: bool) {
+        self.ui_per_present = on;
+    }
+
+    /// Whether the UI is drawn once per presented image.
+    pub fn ui_per_present(&self) -> bool {
+        self.ui_per_present
     }
 
     /// The frame-generation mode in use.
@@ -561,11 +609,21 @@ impl Display {
                 "backbuffer",
             )?);
         }
-        if s.ui.as_ref().is_none_or(|u| u.extent() != extent) {
-            s.ui = Some(UiLayer::new(&self.device, extent)?);
+        let layers = if self.ui_per_present && generated > 0 {
+            generated as usize + 1
+        } else {
+            1
+        };
+        s.ui.retain(|u| u.extent() == extent);
+        if !self.ui_per_present {
+            s.ui.truncate(1);
+        }
+        while s.ui.len() < layers {
+            s.ui.push(UiLayer::new(&self.device, extent)?);
         }
         s.backbuffer_written = false;
-        s.ui_drawn = false;
+        s.ui_drawn.clear();
+        s.ui_drawn.resize(s.ui.len(), false);
         s.view = None;
         s.field_used = false;
         s.recorded = 0;
@@ -576,6 +634,7 @@ impl Display {
             extent,
             wait,
             generated,
+            ui_per_present: self.ui_per_present,
         });
         Ok(self.frame())
     }
@@ -610,12 +669,20 @@ impl Display {
             };
             let mut gpu_ms = 0.0;
             let mut fg_ms = 0.0;
+            let mut ui_ms = 0.0;
             for p in &render {
                 gpu_ms += p.gpu_ms;
                 if p.name == FG_PASS {
                     fg_ms += p.gpu_ms;
+                } else if p.name == UI_PASS {
+                    ui_ms += p.gpu_ms;
                 }
             }
+            let paint_ms = if c.paints_per_present > 0 {
+                ui_ms / f64::from(c.paints_per_present)
+            } else {
+                0.0
+            };
             for &point in compose {
                 let Some(passes) = self.device.pass_results(point) else {
                     break 'frames;
@@ -627,6 +694,7 @@ impl Display {
                 gpu_ms,
                 fg_ms,
                 c.generated,
+                paint_ms,
             );
             self.costs.pop_front();
         }
@@ -646,6 +714,7 @@ impl Display {
             extent: b.extent,
             wait: b.wait,
             generated: b.generated,
+            ui_per_present: b.ui_per_present,
         })
     }
 
@@ -762,6 +831,7 @@ impl Display {
         };
         let s = &self.slots[b.slot];
         let recorded = s.recorded as usize;
+        let ui_used = s.ui_drawn.iter().rposition(|&d| d).map_or(0, |i| i + 1);
         let job = Job {
             frame: b.frame,
             slot: b.slot,
@@ -771,7 +841,11 @@ impl Display {
             source: s
                 .backbuffer_written
                 .then(|| s.backbuffer.as_ref().expect("sized").sampled),
-            ui: s.ui_drawn.then(|| s.ui.as_ref().expect("sized").index()),
+            ui: s.ui[..ui_used]
+                .iter()
+                .zip(&s.ui_drawn)
+                .map(|(u, &drawn)| drawn.then(|| u.index()))
+                .collect(),
             generated: s.generated[..recorded].iter().map(|g| g.sampled).collect(),
             flag: s.flag.as_ref().filter(|_| recorded > 0).map(Arc::clone),
             min_images: MIN_IMAGES.max(self.fg.as_ref().map_or(0, |f| f.most() + 2)),
@@ -781,6 +855,7 @@ impl Display {
                 frame: b.frame,
                 render: after,
                 generated: s.recorded,
+                paints_per_present: if b.ui_per_present { ui_used as u32 } else { 0 },
                 compose: None,
             });
         }
@@ -820,6 +895,27 @@ impl Drop for Display {
             log::error!("the present thread panicked");
         }
     }
+}
+
+/// What compose-UI composes into each presented image: the generated images, then the
+/// frame's own (`source`, black without one), each with its UI layer. Generated image j
+/// takes layer j when the frame drew one per presented image; the frame's own image takes
+/// the last.
+fn presented_images(
+    generated: &[TextureIndex],
+    source: Option<TextureIndex>,
+    ui: &[Option<TextureIndex>],
+) -> Vec<(ComposeSource, Option<TextureIndex>)> {
+    let own = ui.last().copied().flatten();
+    generated
+        .iter()
+        .enumerate()
+        .map(|(j, &g)| (ComposeSource::Encoded(g), ui.get(j).copied().unwrap_or(own)))
+        .chain([(
+            source.map_or(ComposeSource::Black, ComposeSource::Encoded),
+            own,
+        )])
+        .collect()
 }
 
 fn encoded(gpu: &Device, encoding: OutputFormat, extent: [u32; 2], name: &str) -> Result<Encoded> {
@@ -947,19 +1043,15 @@ impl Presenter {
             .queue(QueueKind::Present)
             .expect("the swapchain needs the Present queue");
 
-        let mut sources = Vec::with_capacity(job.generated.len() + 1);
+        let mut interpolated = false;
         if let Some(flag) = &job.flag {
             // NGX sets the flag in the frame's evaluates.
             queue.wait(job.after, ROOT_TIMEOUT)?;
-            if !FrameGeneration::interpolation_disabled(flag) {
-                sources.extend(job.generated.iter().copied().map(ComposeSource::Encoded));
-            }
+            interpolated = !FrameGeneration::interpolation_disabled(flag);
         }
-        let generated = sources.len() as u32;
-        sources.push(
-            job.source
-                .map_or(ComposeSource::Black, ComposeSource::Encoded),
-        );
+        let generated = if interpolated { job.generated.len() } else { 0 };
+        let sources = presented_images(&job.generated[..generated], job.source, &job.ui);
+        let generated = generated as u32;
         let batch = sources.len() as u32;
         let roots = &mut self.roots[job.slot];
         while roots.len() < sources.len() {
@@ -967,7 +1059,9 @@ impl Presenter {
         }
 
         let mut points = Vec::with_capacity(sources.len());
-        for (k, (source, (root, last))) in sources.into_iter().zip(roots.iter_mut()).enumerate() {
+        for (k, ((source, ui), (root, last))) in
+            sources.into_iter().zip(roots.iter_mut()).enumerate()
+        {
             let Some(image) = self.swapchain.acquire()? else {
                 break;
             };
@@ -980,7 +1074,7 @@ impl Presenter {
                 root,
                 &ComposePass {
                     source,
-                    ui: job.ui,
+                    ui,
                     target: image.storage(),
                     extent: image.extent(),
                     display: &job.display,
@@ -1000,5 +1094,35 @@ impl Presenter {
             }
         }
         Ok((presented, points))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_presented_image_takes_its_own_ui_layer() {
+        let t = TextureIndex;
+        let generated = [t(1), t(2), t(3)];
+        let layers = [Some(t(10)), Some(t(11)), Some(t(12)), Some(t(13))];
+        let images = presented_images(&generated, Some(t(4)), &layers);
+        let ui: Vec<_> = images.iter().map(|&(_, u)| u).collect();
+        assert_eq!(ui, layers);
+        assert_eq!(images[3].0, ComposeSource::Encoded(t(4)));
+
+        // Interpolation disabled: only the frame's own image, with its own layer.
+        let images = presented_images(&[], Some(t(4)), &layers);
+        assert_eq!(images, [(ComposeSource::Encoded(t(4)), Some(t(13)))]);
+
+        // One layer over every image, and no UI without one.
+        let images = presented_images(&generated, None, &[Some(t(10))]);
+        assert!(images.iter().all(|&(_, u)| u == Some(t(10))));
+        assert_eq!(images[3].0, ComposeSource::Black);
+        assert!(
+            presented_images(&generated, Some(t(4)), &[])
+                .iter()
+                .all(|&(_, u)| u.is_none())
+        );
     }
 }
