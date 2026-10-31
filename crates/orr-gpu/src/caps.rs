@@ -27,6 +27,11 @@ pub struct Caps {
     /// reordering is a no-op and kernels run their compute entry. False without
     /// `ray_dispatch`.
     pub reorder: bool,
+    /// Linear swept spheres (`VK_NV_ray_tracing_linear_swept_spheres`):
+    /// [`crate::ClassicGeometry::Lss`] BLAS, which share TLAS and PTLAS with cluster and
+    /// triangle BLAS. Their hits commit with a status that is neither triangle nor
+    /// procedural, and report cluster id -1.
+    pub lss: bool,
     /// Opacity micromaps (`VK_KHR_opacity_micromap` with device address commands); kernels
     /// that trace OMM geometry load their `spirv_omm` variant.
     pub omm: bool,

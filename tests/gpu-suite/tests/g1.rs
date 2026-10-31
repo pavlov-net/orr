@@ -1,12 +1,13 @@
 //! Device, memory, heaps, compute, timestamps and the empty TLAS.
 
-use gpu_suite::shaders::{atomic_max, heap_views, pattern, rays, root_layout};
+use gpu_suite::shaders::{atomic_max, coopvec, heap_views, pattern, rays, root_layout};
 use gpu_suite::{
-    CUSTOM_INDEX, assert_clean, device, pipeline, readback, render, run, triangle_scene, upload,
+    CUSTOM_INDEX, assert_clean, device, noise, pipeline, readback, render, run, triangle_scene,
+    upload,
 };
 use orr_gpu::{
-    Filter, Format, GpuPtr, Hazards, SamplerDesc, SamplerIndex, Stages, TextureDesc, TextureMemory,
-    TextureRegion, TextureUsage, Tlas, ViewDesc,
+    Device, DeviceDesc, Filter, Format, GpuPtr, Hazards, SamplerDesc, SamplerIndex, Stages,
+    TextureDesc, TextureMemory, TextureRegion, TextureUsage, Tlas, ViewDesc,
 };
 
 #[test]
@@ -341,5 +342,289 @@ fn lists_recorded_on_two_threads() {
         let (begin, end) = results[0].cpu.expect("calibrated span");
         assert!(end >= begin);
     }
+    assert_clean();
+}
+
+/// FP16 weights converted into the inference layout, once on the GPU and once on the host,
+/// multiply FP16 vectors as a CPU matmul over the same rounded values does.
+#[test]
+fn cooperative_vector_matmul_matches_cpu() {
+    use half::f16;
+    use orr_gpu::{ComponentType, MatrixConversion, MatrixFormat, MatrixLayout, MemoryKind};
+    let d = device();
+    let fp16 = d.caps().cooperative_vector.iter().any(|c| {
+        [
+            c.input,
+            c.input_interpretation,
+            c.matrix_interpretation,
+            c.result,
+        ]
+        .iter()
+        .all(|&t| t == ComponentType::F16)
+    });
+    if !gpu_suite::require(fp16, "no FP16 cooperative vectors") {
+        return;
+    }
+    const N: usize = 16;
+    const VECTORS: usize = 4096;
+    let mut rnd = noise(7);
+    let weights: Vec<u16> = (0..N * N)
+        .map(|_| f16::from_f32((rnd() * 2.0 - 1.0) / 8.0).to_bits())
+        .collect();
+    let inputs: Vec<f32> = (0..N * VECTORS)
+        .map(|_| f16::from_f32(rnd() * 2.0 - 1.0).to_f32())
+        .collect();
+    let conversion = MatrixConversion {
+        rows: N as u32,
+        columns: N as u32,
+        src_format: MatrixFormat::new(ComponentType::F16, MatrixLayout::RowMajor),
+        dst_format: MatrixFormat::new(ComponentType::F16, MatrixLayout::InferencingOptimal),
+    };
+    let bytes = d
+        .matrix_bytes(N as u32, N as u32, conversion.dst_format)
+        .unwrap();
+    assert!(bytes >= (N * N * 2) as u64);
+
+    // The GPU converts into device memory at offset 64; the host into upload memory at 128.
+    let row_major = upload(&weights, "row-major weights");
+    let on_gpu = d
+        .gpu_malloc::<u8>(MemoryKind::DeviceLocal, 64 + bytes, "gpu-converted weights")
+        .unwrap();
+    let mut on_host = d
+        .gpu_malloc::<u8>(MemoryKind::Upload, 128 + bytes, "host-converted weights")
+        .unwrap();
+    let written = d
+        .convert_matrix(
+            &conversion,
+            orr_shaders::bytemuck::cast_slice(&weights),
+            &mut on_host,
+            128,
+        )
+        .unwrap();
+    assert_eq!(written, bytes);
+
+    let input = upload(&inputs, "coopvec input");
+    let outputs = [0, 1].map(|_| readback::<f32>((N * VECTORS) as u64, "coopvec output"));
+    // Weights reached through the root's address plus the MatrixOffset operand, and through
+    // the address alone.
+    let roots = [
+        (on_gpu.gpu.address().0, 64),
+        (on_host.gpu.address().0 + 128, 0),
+    ]
+    .iter()
+    .zip(&outputs)
+    .map(|(&(weights, offset), out)| {
+        upload(
+            &[coopvec::Root {
+                input: input.gpu,
+                output: out.gpu,
+                weights,
+                offset,
+                count: VECTORS as u32,
+            }],
+            "coopvec root",
+        )
+    })
+    .collect::<Vec<_>>();
+    let p = pipeline(&coopvec::MODULE, "main");
+    let mut list = render().command_list().unwrap();
+    list.convert_matrix(
+        &conversion,
+        row_major.gpu.address(),
+        on_gpu.gpu.offset(64).address(),
+    );
+    list.barrier(
+        Stages::TRANSFER | Stages::HOST,
+        Stages::COMPUTE,
+        Hazards::empty(),
+    );
+    for root in &roots {
+        list.dispatch(&p, root.gpu, [(VECTORS as u32).div_ceil(32), 1, 1]);
+    }
+    list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+    run(list);
+
+    for (which, out) in ["gpu", "host"].iter().zip(&outputs) {
+        let got = out.as_slice().unwrap();
+        let mut worst = 0.0f32;
+        for v in 0..VECTORS {
+            for row in 0..N {
+                let want: f32 = (0..N)
+                    .map(|k| f16::from_bits(weights[row * N + k]).to_f32() * inputs[v * N + k])
+                    .sum();
+                worst = worst.max((got[v * N + row] - want).abs());
+            }
+        }
+        log::info!("cooperative vectors, {which}-converted weights: max error {worst:.2e}");
+        assert!(worst < 2e-3, "{which}-converted weights: max error {worst}");
+    }
+    assert_clean();
+}
+
+/// Buffer copies, a texture upload with padded rows and its readback, an indirect dispatch
+/// and a compacted-size query on `d`, each checked against the CPU. Returns the compacted
+/// size of a small BLAS.
+fn address_command_workload(d: &Device) -> u64 {
+    use orr_gpu::{
+        ClassicBuild, ClassicDesc, ClassicGeometry, ClassicKind, DispatchArgs, MemoryKind,
+        QueueKind, RtasFlags, ShaderStage, SpecData,
+    };
+    let queue = d.queue(QueueKind::Render).unwrap();
+    let upload = |words: &[u32]| {
+        let mut a = d
+            .gpu_malloc::<u32>(MemoryKind::Upload, words.len() as u64, "workload upload")
+            .unwrap();
+        a.as_mut_slice().unwrap().copy_from_slice(words);
+        a
+    };
+    let words: Vec<u32> = (0..4096u32).map(|i| i.wrapping_mul(0x9e37_79b9)).collect();
+    let src = upload(&words);
+    let middle = d
+        .gpu_malloc::<u32>(MemoryKind::DeviceLocal, 4096, "workload middle")
+        .unwrap();
+    let copied = d
+        .gpu_malloc::<u32>(MemoryKind::Readback, 4096, "workload copied")
+        .unwrap();
+
+    // 40x24 texels taken from rows 48 texels apart.
+    let desc = TextureDesc::d2(Format::Rgba8Unorm, 40, 24, TextureUsage::SAMPLED);
+    let region = TextureRegion::whole_mip(&desc, 0);
+    let t = d
+        .create_texture(&desc, TextureMemory::Dedicated, "workload texture")
+        .unwrap();
+    let texels = d
+        .gpu_malloc::<u32>(MemoryKind::Readback, 40 * 24, "workload texels")
+        .unwrap();
+
+    let stage = ShaderStage::new(&pattern::MODULE, "main", SpecData::default()).unwrap();
+    let p = d
+        .create_compute_pipeline(&stage, "workload pattern")
+        .unwrap();
+    let n = 1000u32;
+    let pattern_out = d
+        .gpu_malloc::<u32>(MemoryKind::Readback, u64::from(n), "workload pattern")
+        .unwrap();
+    let mut root = d
+        .gpu_malloc::<pattern::Root>(MemoryKind::Upload, 1, "workload root")
+        .unwrap();
+    root.as_mut_slice().unwrap()[0] = pattern::Root {
+        out: pattern_out.gpu,
+        count: n,
+        seed: 0x5eed,
+    };
+    let mut args = d
+        .gpu_malloc::<DispatchArgs>(MemoryKind::Upload, 1, "workload args")
+        .unwrap();
+    args.as_mut_slice().unwrap()[0] = DispatchArgs {
+        x: n.div_ceil(64),
+        y: 1,
+        z: 1,
+    };
+
+    let mut positions = d
+        .gpu_malloc::<[f32; 3]>(MemoryKind::Upload, 3, "workload triangle")
+        .unwrap();
+    positions.as_mut_slice().unwrap().copy_from_slice(&[
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ]);
+    let blas_desc = ClassicDesc {
+        kind: ClassicKind::Blas,
+        flags: RtasFlags::FAST_TRACE,
+        geometry: ClassicGeometry::Triangles {
+            positions: positions.gpu,
+            vertex_count: 3,
+            indices: GpuPtr::NULL,
+            triangle_count: 1,
+            opaque: true,
+        },
+    };
+    let sizes = d.classic_sizes(&blas_desc);
+    let blas_block = d
+        .gpu_malloc::<u8>(MemoryKind::DeviceLocal, sizes.result_max, "workload blas")
+        .unwrap();
+    let scratch = d
+        .gpu_malloc::<u8>(MemoryKind::DeviceLocal, sizes.scratch, "workload scratch")
+        .unwrap();
+    let blas = d
+        .create_classic_as(ClassicKind::Blas, sizes.result_max, &blas_block, 0)
+        .unwrap();
+    let compacted = d
+        .gpu_malloc::<u64>(MemoryKind::Readback, 1, "workload compacted")
+        .unwrap();
+
+    let mut list = queue.command_list().unwrap();
+    list.copy(middle.gpu.cast(), src.gpu.cast(), 4 * 4096);
+    list.discard(&t);
+    list.barrier(Stages::TRANSFER, Stages::TRANSFER, Hazards::empty());
+    list.copy(copied.gpu.cast(), middle.gpu.cast(), 4 * 4096);
+    list.copy_rows_to_texture(&t, &region, src.gpu.cast(), 48);
+    list.barrier(Stages::TRANSFER, Stages::TRANSFER, Hazards::empty());
+    list.copy_from_texture(texels.gpu.cast(), &t, &region);
+    list.dispatch_indirect(&p, root.gpu, args.gpu);
+    list.build_classic(&ClassicBuild {
+        desc: &blas_desc,
+        dst: &blas,
+        scratch: scratch.gpu.address(),
+    });
+    list.classic_compacted_size(&blas, compacted.gpu);
+    list.barrier(
+        Stages::TRANSFER | Stages::COMPUTE,
+        Stages::HOST,
+        Hazards::empty(),
+    );
+    let point = queue.submit(vec![list], &[]).unwrap();
+    queue
+        .wait(point, std::time::Duration::from_secs(10))
+        .unwrap();
+
+    assert_eq!(copied.as_slice().unwrap(), &words[..], "buffer copies");
+    let rows: Vec<u32> = (0..24)
+        .flat_map(|y| words[y * 48..y * 48 + 40].iter().copied())
+        .collect();
+    assert_eq!(texels.as_slice().unwrap(), &rows[..], "texture rows");
+    let want: Vec<u32> = (0..n)
+        .map(|i| i.wrapping_mul(2_654_435_761) ^ 0x5eed)
+        .collect();
+    assert_eq!(
+        pattern_out.as_slice().unwrap(),
+        &want[..],
+        "indirect dispatch"
+    );
+    let size = compacted.as_slice().unwrap()[0];
+    assert!(
+        size > 0 && size <= sizes.result_max,
+        "compacted to {size} B"
+    );
+    size
+}
+
+/// The commands that take device addresses directly give the same results as their
+/// buffer-handle forms on a device without `VK_KHR_device_address_commands`.
+#[test]
+fn address_commands_match_buffer_commands() {
+    let d = device();
+    if !gpu_suite::require(
+        d.caps().device_address_commands,
+        "no device address commands",
+    ) {
+        return;
+    }
+    let with = address_command_workload(d);
+    let without = Device::new(&DeviceDesc {
+        name: "gpu-suite buffer commands",
+        validation: true,
+        skip_extensions: &[ash::khr::device_address_commands::NAME],
+        ..DeviceDesc::default()
+    })
+    .unwrap();
+    assert!(!without.caps().device_address_commands);
+    assert_eq!(address_command_workload(&without), with, "compacted sizes");
+    assert_eq!(
+        without.validation_messages(),
+        0,
+        "validation messages (see the log)"
+    );
     assert_clean();
 }

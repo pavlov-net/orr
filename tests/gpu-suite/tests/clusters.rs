@@ -1,19 +1,21 @@
 //! Cluster acceleration structures and partitioned TLAS on orr-gpu: the cluster ray-query
 //! probe's cases as regression tests, checked ray by ray against the CPU reference.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use gpu_suite::clusters::*;
-use gpu_suite::{assert_clean, device, readback, render, upload};
+use gpu_suite::shaders::cluster_trace;
+use gpu_suite::{assert_clean, device, noise, readback, render, upload};
 use orr_gpu::rtas::consts::{
     GEOMETRY_CULL_DISABLE, GEOMETRY_NO_DUPLICATE_ANY_HIT, GEOMETRY_OPAQUE, PTLAS_GLOBAL_PARTITION,
 };
 use orr_gpu::rtas::{PtlasTranslate, PtlasUpdate};
 use orr_gpu::{
     BlasLimits, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance, ClassicKind,
-    ClusterVertexFormat, GpuAddress, Hazards, MemoryKind, MicromapDesc, MicromapTriangle,
-    MicromapUsage, OmmFormat, PageBind, RtasFlags, RtasLimits, RtasMode, RtasOp, RtasOpDesc,
-    Stages, Tlas,
+    ClusterVertexFormat, GpuAddress, Hazards, LssEndCaps, LssIndexing, MemoryKind, MicromapDesc,
+    MicromapTriangle, MicromapUsage, OmmFormat, PageBind, RtasFlags, RtasLimits, RtasMode, RtasOp,
+    RtasOpDesc, ShaderStage, SpecData, Stages, Tlas,
 };
 
 /// The reference of a front instance over every cluster but the last and a back instance
@@ -579,6 +581,256 @@ fn ptlas_every_frame_two_in_flight() {
     for (f, &point) in points.iter().enumerate().skip(FRAMES - 2) {
         render().wait(point, Duration::from_secs(10)).unwrap();
         check_frame(f);
+    }
+    assert_clean();
+}
+
+const LSS_CUSTOM: u32 = 55;
+/// Rays this close to a segment's silhouette or end are not checked.
+const LSS_EDGE: f32 = 1e-3;
+const LSS_T_EPS: f32 = 2e-4;
+const CLUSTER_T_EPS: f32 = 1e-4;
+
+/// One segment over the unit square at depth `z`, radius `r` at both ends.
+#[derive(Clone, Copy)]
+struct Segment {
+    a: [f32; 2],
+    b: [f32; 2],
+    z: f32,
+    r: f32,
+}
+
+/// 24 segments alternating in front of the cluster instance (z 0.12) and behind it (z 0.6).
+fn segments() -> Vec<Segment> {
+    let mut rnd = noise(0x2545_f491);
+    (0..24)
+        .map(|i| Segment {
+            a: [0.05 + 0.9 * rnd(), 0.05 + 0.9 * rnd()],
+            b: [0.05 + 0.9 * rnd(), 0.05 + 0.9 * rnd()],
+            z: if i % 2 == 0 { 0.12 } else { 0.6 },
+            r: 0.008 + 0.022 * rnd(),
+        })
+        .collect()
+}
+
+enum Want {
+    Miss,
+    Cluster(usize, f32),
+    Lss(usize, f32),
+}
+
+/// The nearest hit of ray (x, y) among the cluster instance `front` and `segs`; `None`
+/// near any triangle edge, segment silhouette or segment end.
+fn lss_reference(front: &RefInst, segs: &[Segment], x: u32, y: u32) -> Option<Want> {
+    let mut best = match reference_hit(std::slice::from_ref(front), x, y)? {
+        Some((_, tri, t)) => Want::Cluster(tri, t),
+        None => Want::Miss,
+    };
+    let p = [(x as f32 + 0.5) / W as f32, (y as f32 + 0.5) / H as f32];
+    for (i, s) in segs.iter().enumerate() {
+        let d = [s.b[0] - s.a[0], s.b[1] - s.a[1]];
+        let len = (d[0] * d[0] + d[1] * d[1]).sqrt();
+        let u = ((p[0] - s.a[0]) * d[0] + (p[1] - s.a[1]) * d[1]) / (len * len);
+        let q = [s.a[0] + u * d[0] - p[0], s.a[1] + u * d[1] - p[1]];
+        let dist = (q[0] * q[0] + q[1] * q[1]).sqrt();
+        let near_end = (u * len).abs() < LSS_EDGE || ((u - 1.0) * len).abs() < LSS_EDGE;
+        let inside = (0.0..=1.0).contains(&u);
+        if (near_end && dist < s.r + LSS_EDGE) || (inside && (dist - s.r).abs() < LSS_EDGE) {
+            return None;
+        }
+        let best_t = match best {
+            Want::Miss => f32::INFINITY,
+            Want::Cluster(_, t) | Want::Lss(_, t) => t,
+        };
+        if inside && dist < s.r {
+            let t = 1.0 + s.z - (s.r * s.r - dist * dist).sqrt();
+            if t < best_t {
+                best = Want::Lss(i, t);
+            }
+        }
+    }
+    Some(best)
+}
+
+/// Checks every ray record of `out` against the reference; returns the LSS and cluster hit
+/// counts.
+fn check_lss(out: &[u32], front: &RefInst, segs: &[Segment], what: &str) -> (u32, u32) {
+    let (mut lss, mut cluster) = (0, 0);
+    let mut bad: BTreeMap<&'static str, u32> = BTreeMap::new();
+    let mut first = Vec::new();
+    for y in 0..H {
+        for x in 0..W {
+            let o = &out[(y * W + x) as usize * REC..][..REC];
+            let Some(want) = lss_reference(front, segs, x, y) else {
+                continue;
+            };
+            let mut fail = |kind: &'static str, detail: String| {
+                *bad.entry(kind).or_insert(0) += 1;
+                if first.len() < 4 {
+                    first.push(format!("({x},{y}) {kind}: {detail}"));
+                }
+            };
+            if o[19] != 0x600d {
+                fail("unwritten", format!("{:#x}", o[19]));
+                continue;
+            }
+            let t = f32::from_bits(o[6]);
+            match want {
+                Want::Miss if o[0] != 0 => fail("hit_on_miss", format!("instance {}", o[1])),
+                Want::Miss => {}
+                Want::Cluster(tri, want_t) => {
+                    let rt = &front.tris[tri];
+                    if o[0] != 1 {
+                        fail("miss_on_cluster", String::new());
+                    } else if o[1..6] != [FRONT_CUSTOM, 0, rt.cluster, rt.prim, rt.geom] {
+                        fail("cluster_ids", format!("{:?}", &o[1..6]));
+                    } else if (t - want_t).abs() > CLUSTER_T_EPS {
+                        fail("cluster_t", format!("{t} want {want_t}"));
+                    } else {
+                        cluster += 1;
+                    }
+                }
+                Want::Lss(seg, want_t) => {
+                    if o[0] != 1 {
+                        fail("miss_on_lss", format!("segment {seg}"));
+                    } else if o[1..6] != [LSS_CUSTOM, 1, u32::MAX, seg as u32, 0] {
+                        fail("lss_ids", format!("{:?} want segment {seg}", &o[1..6]));
+                    } else if (t - want_t).abs() > LSS_T_EPS {
+                        fail("lss_t", format!("{t} want {want_t}"));
+                    } else {
+                        lss += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        bad.is_empty() && lss > 0 && cluster > 0,
+        "{what}: {lss} LSS and {cluster} cluster hits, mismatches {bad:?}: {}",
+        first.join("; ")
+    );
+    (lss, cluster)
+}
+
+/// An LSS BLAS over `segs`, as list segments or as successive indices over the same
+/// vertices.
+fn lss_blas(b: &mut Builder, segs: &[Segment], indexing: LssIndexing) -> GpuAddress {
+    let d = device();
+    let verts: Vec<[f32; 3]> = segs
+        .iter()
+        .flat_map(|s| [[s.a[0], s.a[1], s.z], [s.b[0], s.b[1], s.z]])
+        .collect();
+    let radii: Vec<f32> = segs.iter().flat_map(|s| [s.r, s.r]).collect();
+    let indices: Vec<u32> = match indexing {
+        LssIndexing::List => (0..verts.len() as u32).collect(),
+        LssIndexing::Successive => (0..segs.len() as u32).map(|i| 2 * i).collect(),
+    };
+    let desc = ClassicDesc {
+        kind: ClassicKind::Blas,
+        flags: RtasFlags::FAST_TRACE,
+        geometry: ClassicGeometry::Lss {
+            positions: b.upload(&verts),
+            radii: b.upload(&radii),
+            indices: b.upload(&indices),
+            segment_count: segs.len() as u32,
+            indexing,
+            end_caps: LssEndCaps::None,
+            opaque: true,
+        },
+    };
+    let sizes = d.classic_sizes(&desc);
+    let block = d
+        .gpu_malloc::<u8>(MemoryKind::DeviceLocal, sizes.result_max, "lss blas")
+        .unwrap();
+    let scratch = b.block(MemoryKind::DeviceLocal, sizes.scratch);
+    let blas = d
+        .create_classic_as(ClassicKind::Blas, sizes.result_max, &block, 0)
+        .unwrap();
+    b.list().build_classic(&ClassicBuild {
+        desc: &desc,
+        dst: &blas,
+        scratch: scratch.address(),
+    });
+    let address = blas.address();
+    b.keep_any(blas);
+    b.keep(block);
+    address
+}
+
+/// A classic TLAS and a PTLAS that mix a cluster BLAS with an LSS BLAS (list indexing in
+/// one, successive in the other) give the reference hits from the compute entry and from
+/// the raygen entry of one kernel. LSS hits report their segment and cluster id -1.
+#[test]
+fn lss_beside_clusters() {
+    let d = device();
+    if !gpu_suite::require(d.caps().lss, "no linear swept spheres") {
+        return;
+    }
+    let raygen = d.caps().ray_dispatch.then(|| {
+        let stage =
+            ShaderStage::new(&cluster_trace::MODULE, "raygen", SpecData::default()).unwrap();
+        d.create_ray_dispatch_pipeline(&stage, "lss raygen")
+            .unwrap()
+    });
+    let clusters = base_clusters();
+    let segs = segments();
+    let mut b = Builder::new();
+    let clas = b.build_clas(&clusters[..4], data_flags(), 0, None, None);
+    let blas = b.build_blas(clas.addrs.gpu, &[vec![0, 1, 2, 3]], None);
+    let list_blas = lss_blas(&mut b, &segs, LssIndexing::List);
+    let successive_blas = lss_blas(&mut b, &segs, LssIndexing::Successive);
+    b.flush();
+    let cluster_blas = blas.addrs.as_slice().unwrap()[0];
+    let tlas_table = b.upload(&[cluster_blas, list_blas.0]);
+    let ptlas_table = b.upload(&[cluster_blas, successive_blas.0]);
+    let tlas = b.build_tlas(
+        tlas_table,
+        &[
+            instance([0.0, 0.0, FRONT_Z], FRONT_CUSTOM, 0),
+            instance([0.0; 3], LSS_CUSTOM, 1),
+        ],
+    );
+    let limits = ptlas_limits(2);
+    let (dst, scratch) = b.ptlas_blocks(limits);
+    let ops = PtlasOps {
+        writes: vec![
+            ptlas_write(0, 0, FRONT_CUSTOM, [0.0, 0.0, FRONT_Z], 0, false),
+            ptlas_write(1, 1, LSS_CUSTOM, [0.0; 3], 1, false),
+        ],
+        ..Default::default()
+    };
+    b.build_ptlas(limits, ptlas_table, &ops, dst, scratch, false);
+
+    let front = ref_inst(
+        FRONT_CUSTOM,
+        0,
+        [0.0, 0.0, FRONT_Z],
+        &clusters[..4].iter().collect::<Vec<_>>(),
+    );
+    for (label, scene) in [("tlas", tlas), ("ptlas", Tlas(dst.0))] {
+        let compute = b.trace(scene, 0);
+        let rays = raygen.as_ref().map(|p| b.trace_rays(p, scene, 0));
+        b.flush();
+        let compute = compute.as_slice().unwrap();
+        let hits = check_lss(compute, &front, &segs, &format!("{label} compute"));
+        if let Some(rays) = rays {
+            let rays = rays.as_slice().unwrap();
+            assert_eq!(
+                check_lss(rays, &front, &segs, &format!("{label} raygen")),
+                hits,
+                "{label}: raygen and compute hit counts"
+            );
+            let differ = compute
+                .chunks(REC)
+                .zip(rays.chunks(REC))
+                .filter(|(c, r)| c[..7] != r[..7])
+                .count();
+            assert_eq!(
+                differ, 0,
+                "{label}: rays whose raygen and compute hits differ"
+            );
+        }
+        log::info!("{label}: {} LSS and {} cluster hits", hits.0, hits.1);
     }
     assert_clean();
 }

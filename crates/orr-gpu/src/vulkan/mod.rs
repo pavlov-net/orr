@@ -5,6 +5,7 @@ mod accel;
 mod aftermath;
 mod cache;
 mod command;
+mod coopvec;
 mod debug;
 mod device;
 mod diagnostics;
@@ -25,11 +26,13 @@ mod texture;
 
 pub use accel::{
     ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance, ClassicKind,
-    InstanceFlags, Micromap, MicromapDesc, MicromapTriangle, MicromapUsage, OmmFormat,
+    InstanceFlags, LssEndCaps, LssIndexing, Micromap, MicromapDesc, MicromapTriangle,
+    MicromapUsage, OmmFormat,
 };
 pub use ash;
 pub use cache::{PipelineCacheKind, PipelineCacheReport};
 pub use command::{CommandList, DecompressRegion, DispatchArgs, MeshArgs};
+pub use coopvec::{MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout};
 pub use device::{Device, DeviceDesc};
 pub use diagnostics::{
     Checkpoint, DeviceFault, Diagnostics, DiagnosticsReport, FaultAccess, FaultAddress,

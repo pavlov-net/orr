@@ -56,6 +56,7 @@ pub use vulkan::{
     ClassicKind, ColorAttachment, CommandList, ComputePipeline, DecompressRegion, DepthAttachment,
     Device, DeviceArenas, DeviceDesc, DeviceFault, DeviceHooks, Diagnostics, DiagnosticsReport,
     DispatchArgs, FaultAccess, FaultAddress, HeapReport, HostArenas, InstanceFlags, LowLatency,
+    LssEndCaps, LssIndexing, MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout,
     MemoryKind, MemoryReport, MemoryUsage, MeshArgs, MeshPipeline, MeshPipelineDesc, Micromap,
     MicromapDesc, MicromapTriangle, MicromapUsage, OmmFormat, PageBind, PassResult,
     PipelineCacheKind, PipelineCacheReport, PipelineStats, Queue, QueueKind, QueueProgress,
