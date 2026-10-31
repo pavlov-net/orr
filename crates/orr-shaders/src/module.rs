@@ -58,6 +58,8 @@ pub enum Stage {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KernelSet {
     pub modules: &'static [&'static ShaderModule],
+    /// Linked surfaces: their ids are `1..=surfaces`.
+    pub surfaces: u32,
 }
 
 impl KernelSet {

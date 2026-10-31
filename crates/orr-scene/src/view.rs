@@ -1,11 +1,14 @@
 //! Views: what a camera renders, its history between frames and the constants kernels read.
 
+use std::sync::Arc;
+
 use bytemuck::{Pod, Zeroable};
 use glam::{DVec3, IVec3, Mat3, Mat4, Quat, UVec2, Vec2, Vec4};
 use orr_gpu::{Allocation, GpuPtr, Texture};
 
-use crate::SceneId;
+use crate::raster::ViewTargets;
 use crate::world::WorldPos;
+use crate::{GBufferGpu, SceneId};
 
 /// Per-view constants (`view.slang`). View space has no translation: x right, y up, looking
 /// down -z. Clip space is Vulkan's (y down) with reverse Z and an infinite far plane.
@@ -36,7 +39,8 @@ pub struct ViewConstants {
     pub exposure_slot: u32,
     pub frame_index: u32,
     pub delta_time: f32,
-    pub _pad: u32,
+    /// Added to the level of detail of every primary-hit texture lookup.
+    pub mip_bias: f32,
 }
 
 /// One exposure slot of a view (`view.slang`); orr-output writes it.
@@ -155,14 +159,36 @@ pub struct ViewDesc<'a> {
     pub jitter: Vec2,
     /// A camera cut: the previous camera is taken to be this one.
     pub reset_history: bool,
+    /// Texture level-of-detail bias for an upscaled image: log2(render width / output
+    /// width), 0 without upscaling.
+    pub mip_bias: f32,
     pub target: ViewTarget<'a>,
 }
 
-/// What a view's raster half hands to the passes after it.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// What a view's raster half hands to the passes after it. The targets stay valid until
+/// the frame's GPU work completes.
+#[derive(Clone)]
 pub struct RasterView {
     pub view: GpuPtr<ViewConstants>,
     pub scene: GpuPtr<crate::SceneRoot>,
+    /// The G-buffer as kernels read it, through `load_gsurface`.
+    pub gbuffer: GpuPtr<GBufferGpu>,
+    /// What `gbuffer` holds: the visibility buffer, the visible clusters and the targets'
+    /// sampled views.
+    pub targets: GBufferGpu,
+    /// D32, reverse Z: 0 where nothing was drawn.
+    pub depth: Arc<Texture>,
+    /// RG16F: previous uv minus current uv.
+    pub motion: Arc<Texture>,
+    pub gbuf_a: Arc<Texture>,
+    pub gbuf_b: Arc<Texture>,
+    /// Present while a resident material may need it.
+    pub gbuf_x: Option<Arc<Texture>>,
+    /// R32F: the farthest reverse-Z depth per texel, mip 0 at the render extent.
+    pub hzb: Arc<Texture>,
+    /// Visible clusters written, then visible clusters and cluster work dropped for want
+    /// of room (`Budgets::visible_clusters`, `Budgets::cluster_work`).
+    pub counts: GpuPtr<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -178,6 +204,7 @@ pub(crate) struct ViewHistory {
     /// The exposure slot the view's next render reads.
     slot: u32,
     previous: Option<Camera>,
+    pub targets: Option<ViewTargets>,
 }
 
 impl ViewHistory {
@@ -186,6 +213,7 @@ impl ViewHistory {
             exposure,
             slot: 0,
             previous: None,
+            targets: None,
         }
     }
 }
@@ -274,6 +302,6 @@ pub(crate) fn view_constants(
         exposure_slot,
         frame_index: frame as u32,
         delta_time,
-        _pad: 0,
+        mip_bias: desc.mip_bias,
     }
 }

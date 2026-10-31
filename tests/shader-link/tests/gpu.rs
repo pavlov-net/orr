@@ -261,11 +261,14 @@ fn renderer_rejects_a_set_built_against_other_kernels() {
         }
         other => panic!("expected an interface mismatch, got {other:?}"),
     }
+    // The fixture's `resolve` shares its kernel name with orr-scene's material resolve, so
+    // its entry points are compared and differ.
     match renderer_error(&linked::KERNELS) {
         Some(orr::Error::Scene(orr::SceneError::Kernels(e))) => {
-            assert_eq!(e.reason, Mismatch::UnknownKernel, "{e}");
+            assert_eq!(e.kernel, "resolve");
+            assert_eq!(e.reason, Mismatch::EntryPoints, "{e}");
         }
-        other => panic!("expected an unknown kernel, got {other:?}"),
+        other => panic!("expected different entry points, got {other:?}"),
     }
     assert_clean();
 }

@@ -109,7 +109,8 @@ pub(crate) fn kernel_set(
     for i in 0..kernels.len() {
         let _ = write!(out, "&MODULE_{i}, ");
     }
-    out.push_str("],\n};\n");
+    let surfaces = ids.get(&LinkPoint::Surface).map_or(0, Vec::len);
+    let _ = writeln!(out, "],\n    surfaces: {surfaces},\n}};");
     for (point, list) in ids {
         let _ = writeln!(
             out,

@@ -1731,6 +1731,7 @@ dependencies = [
  "gpu-suite",
  "log",
  "orr",
+ "orr-color",
  "orr-cook",
  "orr-gpu",
  "orr-pack",

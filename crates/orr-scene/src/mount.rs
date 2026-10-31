@@ -69,8 +69,13 @@ struct PlacedMesh {
     info: u64,
     pages: Vec<u64>,
     node_pages: Vec<u64>,
+    /// First mesh cluster per page, then the cluster count, in the mesh's block.
+    page_clusters: u64,
+    /// The discrete levels' table in blob 0, and their count.
+    levels: (u64, u32),
     cluster_count: u32,
     sections: u32,
+    header: MeshHeader,
     /// EMISSIVE clusters of the finest level, by mesh cluster index.
     emissive: Vec<(u32, Cluster)>,
 }
@@ -533,6 +538,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
         size += bytes.next_multiple_of(256);
         at
     };
+    let page_clusters_at = place(4 * (info.pages.len() as u64 + 1));
     let page_at: Vec<u64> = info
         .pages
         .iter()
@@ -555,6 +561,13 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             f
         })
         .collect();
+    let mut page_clusters = firsts.clone();
+    page_clusters.push(first);
+    t.write(
+        block,
+        page_clusters_at,
+        bytemuck::cast_slice(&page_clusters),
+    )?;
     let finest = info.levels.first().map(|l| l.clusters);
     let mesh = {
         let mut placed = t.placed.lock().unwrap();
@@ -563,8 +576,14 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             info: block.gpu,
             pages: vec![0; info.pages.len()],
             node_pages: vec![0; info.node_pages.len()],
+            page_clusters: block.gpu + page_clusters_at,
+            levels: (
+                block.gpu + u64::from(header.levels.first),
+                header.levels.count,
+            ),
             cluster_count: first,
             sections: info.sections.len() as u32,
+            header,
             emissive: Vec::new(),
         });
         placed.meshes.len() - 1
@@ -843,15 +862,24 @@ fn resolve(archive: Arc<Archive>, p: Placed, sampler: SamplerIndex) -> Result<Re
             page_addresses.extend(m.node_pages);
             ResolvedMesh {
                 id: m.id,
-                gpu: MeshGpu {
-                    // SAFETY: blob 0 of the mesh, resident in the mount's block.
-                    info: unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(m.info)) },
-                    pages: GpuPtr::NULL,
-                    node_pages: GpuPtr::NULL,
-                    page_count: pages,
-                    node_page_count: node_pages,
-                    cluster_count: m.cluster_count,
-                    _pad: 0,
+                // SAFETY: blob 0 of the mesh and its page cluster table, resident in the
+                // mount's block.
+                gpu: unsafe {
+                    MeshGpu {
+                        info: GpuPtr::from_address(orr_gpu::GpuAddress(m.info)),
+                        pages: GpuPtr::NULL,
+                        node_pages: GpuPtr::NULL,
+                        page_clusters: GpuPtr::from_address(orr_gpu::GpuAddress(m.page_clusters)),
+                        levels: GpuPtr::from_address(orr_gpu::GpuAddress(m.levels.0)),
+                        page_count: pages,
+                        node_page_count: node_pages,
+                        cluster_count: m.cluster_count,
+                        level_count: m.levels.1,
+                        position_step: m.header.step(),
+                        attributes: u32::from(m.header.attributes),
+                        merge_error: m.header.merge_error,
+                        _pad: 0,
+                    }
                 },
                 page_addresses,
                 sections: m.sections,
@@ -1239,6 +1267,7 @@ impl Mounts {
             let mid = w.materials.alloc()?;
             res.materials.insert(*id, mid);
             material_ids.push(mid);
+            w.materials.note(mid, m);
             w.put(
                 w.materials.table.gpu.offset(u64::from(mid.0)),
                 std::slice::from_ref(m),

@@ -1,5 +1,6 @@
 //! The global material table and its writer.
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -32,6 +33,9 @@ pub mod material_flags {
     pub const FUZZ: u32 = 1 << 10;
     pub const THIN_FILM: u32 = 1 << 11;
     pub const ANISOTROPY: u32 = 1 << 12;
+    /// The ray origin policy, 0-2 (default, surface, triangle), in bits 13-14.
+    pub const ORIGIN_SHIFT: u32 = 13;
+    pub const ORIGIN_MASK: u32 = 3 << ORIGIN_SHIFT;
     /// The cost class, 0-3, in bits 16-17.
     pub const COST_SHIFT: u32 = 16;
     pub const COST_MASK: u32 = 3 << COST_SHIFT;
@@ -158,6 +162,7 @@ impl MaterialGpu {
             surface: u32::from(m.surface),
             transmission_dispersion_scale: m.transmission_dispersion_scale,
             transmission_dispersion_abbe_number: m.transmission_dispersion_abbe_number,
+            data: 0,
         }
     }
 }
@@ -166,6 +171,16 @@ pub(crate) struct MaterialTable {
     pub table: Allocation<MaterialGpu>,
     pub capacity: u32,
     ids: Mutex<RangeAllocator>,
+    /// Materials whose pixels may use the extended G-buffer target.
+    extended: Mutex<HashSet<u32>>,
+}
+
+/// Whether pixels of `m` may use the extended G-buffer target. A linked surface may set any
+/// lobe.
+fn needs_extended(m: &MaterialGpu) -> bool {
+    use material_flags as f;
+    let thin_sss = m.flags & f::THIN_WALLED != 0 && m.subsurface_weight > 0.0;
+    thin_sss || m.flags & (f::SUBSURFACE | f::COAT | f::FUZZ | f::ANISOTROPY) != 0 || m.surface != 0
 }
 
 impl MaterialTable {
@@ -174,7 +189,23 @@ impl MaterialTable {
             table: device.gpu_malloc(MemoryKind::DeviceLocal, u64::from(capacity), "materials")?,
             capacity,
             ids: Mutex::new(RangeAllocator::new(capacity)),
+            extended: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Records what material `id` now holds.
+    pub(crate) fn note(&self, id: MaterialId, m: &MaterialGpu) {
+        let mut set = self.extended.lock().unwrap();
+        if needs_extended(m) {
+            set.insert(id.0);
+        } else {
+            set.remove(&id.0);
+        }
+    }
+
+    /// Whether any material may write the extended G-buffer target.
+    pub(crate) fn any_extended(&self) -> bool {
+        !self.extended.lock().unwrap().is_empty()
     }
 
     pub(crate) fn alloc(&self) -> Result<MaterialId> {
@@ -187,6 +218,7 @@ impl MaterialTable {
 
     /// Returns `id` for reuse; its record stays until a new material overwrites it.
     pub(crate) fn free(&self, id: MaterialId) {
+        self.extended.lock().unwrap().remove(&id.0);
         self.ids.lock().unwrap().free(id.0, 1);
     }
 }
@@ -215,6 +247,7 @@ impl MaterialWriter<'_> {
             "{id:?} is outside the material table"
         );
         let src = self.window.put(self.device, m)?;
+        self.table.note(id, m);
         let dst = self.table.table.gpu.offset(u64::from(id.0));
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         self.records

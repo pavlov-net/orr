@@ -25,15 +25,8 @@ module bsdf;
 import orr.math;
 import orr.sampling;
 import orr.openpbr;
-
-// `BsdfParams.flags`.
-public static const uint BSDF_THIN_WALLED = 1 << 0;
-public static const uint BSDF_COAT = 1 << 1;
-public static const uint BSDF_FUZZ = 1 << 2;
-public static const uint BSDF_THIN_FILM = 1 << 3;
-public static const uint BSDF_ANISOTROPY = 1 << 4;
-// Set by `bsdf_collapse`.
-public static const uint BSDF_COLLAPSED = 1 << 5;
+// `BsdfParams` and its flags.
+__exported import gbuffer;
 
 // `BsdfSample.lobe` flags (adobe's `OpenPBR_BsdfLobeType` values).
 public static const uint LOBE_REFLECTION = 1 << 0;
@@ -50,40 +43,6 @@ public static const float MIRROR_ROUGHNESS = 0.01;
 // The largest factor by which lobe selection favours a smooth glossy lobe over its albedo
 // share; it falls to 1 at roughness 1.
 public static const float SPECULAR_BIAS = 2.0;
-
-// OpenPBR inputs at a shading point, linear Rec.2020 and absolute units.
-public struct BsdfParams
-{
-    public float3 base_color;           // base_weight x base_color
-    public float metalness;
-    public float3 specular_color;
-    public float specular_weight;
-    public float specular_roughness;
-    public float specular_anisotropy;
-    public float specular_ior;
-    public float tangent_angle;         // rad: the anisotropy direction, from orthonormal_basis(n)'s tangent toward its bitangent
-    public float diffuse_roughness;
-    public float transmission_weight;
-    public float3 transmission_color;   // tint applied at the surface: thin-walled or zero depth; 1 when the interior medium carries the colour
-    public float subsurface_weight;
-    public float3 subsurface_color;
-    public float subsurface_anisotropy;
-    public float3 subsurface_radius;    // m, mean free path per channel (radius x radius_scale)
-    public float coat_weight;
-    public float3 coat_color;
-    public float coat_roughness;
-    public float coat_ior;
-    public float coat_darkening;
-    public float fuzz_weight;
-    public float3 fuzz_color;
-    public float fuzz_roughness;
-    public float thin_film_weight;
-    public float thin_film_thickness;   // nm
-    public float thin_film_ior;
-    public float3 emission;             // any units; `Bsdf.emission` attenuates it by the coat and fuzz
-    public float3 scale;                // multiplies every lobe: the directional occlusion, and the layers `bsdf_collapse` removes
-    public uint flags;                  // BSDF_*: the lobes that are on and thin-walled geometry
-}
 
 public struct BsdfSample
 {
