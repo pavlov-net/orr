@@ -11,6 +11,8 @@ links = "orr_scene"
 [features]
 # `orr_scene::testing`: headless device, readback and reference-image comparison.
 testing = ["dep:image", "dep:nv-flip", "dep:log"]
+# Recompiles kernels whose sources change and swaps their pipelines at step 1, for dev builds.
+hot-reload = ["orr-shaders/hot-reload", "dep:log"]
 
 [dependencies]
 orr-gpu.workspace = true

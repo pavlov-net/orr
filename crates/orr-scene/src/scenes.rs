@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use glam::DVec3;
 use orr_gpu::{
     CommandList, ComputePipeline, Device, GpuPtr, Hazards, KernelSet, LatencyMarker, LowLatency,
-    MemoryKind, PassResult, QueueKind, SamplerDesc, SamplerIndex, ShaderStage, SpecData, Stages,
+    MemoryKind, PassResult, QueueKind, SamplerDesc, SamplerIndex, ShaderModule, SpecData, Stages,
     TextureIndex, TimelinePoint,
 };
 use orr_pack::AssetId;
@@ -21,9 +21,13 @@ use crate::memory::UploadWindow;
 use crate::mount::{
     Apply, InstancePage, LoadState, MountId, MountTask, Mounts, PackSource, PageId, TableSizes,
 };
+use crate::pipelines::{PipelineId, Pipelines, ReloadReport};
 use crate::producer::ProducerUpdate;
+use crate::raster::{self, RasterPipelines, TargetSizes, ViewTargets};
+#[cfg(feature = "hot-reload")]
+use crate::reload::Reloader;
 use crate::scene::{GroupWriter, ModelId, Scene, SceneDesc, SceneId, SceneWriter};
-use crate::shaders::{emissive, upload, world as world_kernel};
+use crate::shaders::{emissive, world as world_kernel};
 use crate::time::FrameTime;
 use crate::upload::{Record, scatter};
 use crate::view::{RasterView, ViewDesc, ViewHistory, ViewHistoryId, view_constants};
@@ -45,6 +49,10 @@ pub struct Budgets {
     pub model_materials: u32,
     /// Page and node page addresses of every resident mesh.
     pub mesh_pages: u32,
+    /// Clusters one view can draw.
+    pub visible_clusters: u32,
+    /// Cluster work items one view's culling can hand to the raster, up to 32 clusters each.
+    pub cluster_work: u32,
 }
 
 impl Default for Budgets {
@@ -56,11 +64,16 @@ impl Default for Budgets {
             meshes: 65_536,
             model_materials: 262_144,
             mesh_pages: 1 << 20,
+            visible_clusters: 1 << 20,
+            cluster_work: 1 << 18,
         }
     }
 }
 
-static NO_KERNELS: KernelSet = KernelSet { modules: &[] };
+static NO_KERNELS: KernelSet = KernelSet {
+    modules: &[],
+    surfaces: 0,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct RendererDesc {
@@ -73,6 +86,8 @@ pub struct RendererDesc {
     pub cell_log2: u32,
     /// Archive reads are positioned reads on workers even where IoRing is available.
     pub positioned_reads: bool,
+    /// Raster LOD: the largest cluster error drawn, in render pixels.
+    pub raster_error_pixels: f32,
 }
 
 impl Default for RendererDesc {
@@ -83,6 +98,7 @@ impl Default for RendererDesc {
             kernels: &NO_KERNELS,
             cell_log2: 8,
             positioned_reads: false,
+            raster_error_pixels: 1.0,
         }
     }
 }
@@ -138,9 +154,15 @@ pub struct SceneCompute<'a, 'q> {
     pub focus: Option<(DVec3, f32)>,
     device: &'a Device,
     window: &'a UploadWindow,
+    pipelines: &'a Pipelines,
 }
 
-impl SceneCompute<'_, '_> {
+impl<'a> SceneCompute<'a, '_> {
+    /// The current pipeline of `id`.
+    pub fn pipeline(&self, id: PipelineId) -> &'a ComputePipeline {
+        self.pipelines.get(id)
+    }
+
     /// `value` in this frame's upload window, 16-byte aligned; the GPU can read it until
     /// the frame completes.
     pub fn put<T: bytemuck::Pod>(&self, value: &T) -> Result<GpuPtr<T>> {
@@ -153,13 +175,6 @@ impl SceneCompute<'_, '_> {
     }
 }
 
-struct Pipelines {
-    scatter: ComputePipeline,
-    rebase: ComputePipeline,
-    emissive_instances: ComputePipeline,
-    emissive_producers: ComputePipeline,
-}
-
 struct InFlight {
     id: u64,
     point: TimelinePoint,
@@ -169,6 +184,9 @@ struct InFlight {
 struct Core {
     fif: u32,
     cell_log2: u32,
+    budgets: Budgets,
+    raster_error_pixels: f32,
+    raster: RasterPipelines,
     materials: MaterialTable,
     /// Emission by `ModelId`.
     models: Vec<Option<ModelEmission>>,
@@ -189,7 +207,10 @@ struct Core {
 /// Global scene state, mounted packs and every resident scene. Render thread only.
 pub struct Scenes {
     device: Device,
+    kernels: &'static KernelSet,
     pipelines: Pipelines,
+    #[cfg(feature = "hot-reload")]
+    reloader: Reloader,
     core: Core,
     loading: Arc<Loading>,
     loading_thread: Option<JoinHandle<()>>,
@@ -210,20 +231,11 @@ fn insert<T>(slots: &mut Vec<Option<T>>, value: T) -> u32 {
     }
 }
 
-fn pipeline(
-    device: &Device,
-    kernels: &KernelSet,
-    own: &'static orr_gpu::ShaderModule,
-    entry: &str,
-) -> Result<ComputePipeline> {
-    let module = kernels.module(own)?;
-    let stage = ShaderStage::new(module, entry, SpecData::default())?;
-    Ok(device.create_compute_pipeline(&stage, module.name)?)
-}
-
 impl Scenes {
     /// Compiles orr-scene's pipelines on the calling thread, from `desc.kernels`' module
-    /// wherever it holds one for an orr-scene kernel, and starts the loading thread.
+    /// wherever it holds one for an orr-scene kernel, and starts the loading thread. With
+    /// the `hot-reload` feature it watches the sources of every module it creates a
+    /// pipeline from.
     pub fn new(device: &Device, desc: &RendererDesc) -> Result<Self> {
         assert!(desc.frames_in_flight >= 1, "frames_in_flight is at least 1");
         assert!(desc.cell_log2 <= 16, "cells of 2^{} m", desc.cell_log2);
@@ -248,20 +260,29 @@ impl Scenes {
                 .name("orr loading".into())
                 .spawn(move || loading::thread(l, d))?
         };
+        let mut pipelines = Pipelines::new(device, desc.kernels)?;
+        let raster = RasterPipelines::new(device, desc.kernels, &mut pipelines)?;
+        #[cfg(feature = "hot-reload")]
+        let mut reloader = Reloader::new();
+        #[cfg(feature = "hot-reload")]
+        for r in &pipelines.recipes {
+            reloader.watch(r.module);
+        }
         Ok(Self {
             loading,
             loading_thread: Some(thread),
             sampler,
             device: device.clone(),
-            pipelines: Pipelines {
-                scatter: pipeline(device, desc.kernels, &upload::MODULE, "scatter")?,
-                rebase: pipeline(device, desc.kernels, &world_kernel::MODULE, "rebase_lights")?,
-                emissive_instances: pipeline(device, desc.kernels, &emissive::MODULE, "instances")?,
-                emissive_producers: pipeline(device, desc.kernels, &emissive::MODULE, "producers")?,
-            },
+            kernels: desc.kernels,
+            pipelines,
+            #[cfg(feature = "hot-reload")]
+            reloader,
             core: Core {
                 fif: desc.frames_in_flight,
                 cell_log2: desc.cell_log2,
+                budgets: desc.budgets,
+                raster_error_pixels: desc.raster_error_pixels,
+                raster,
                 materials: MaterialTable::new(device, desc.budgets.materials)?,
                 models: Vec::new(),
                 global: Mutex::new(Vec::new()),
@@ -279,6 +300,26 @@ impl Scenes {
                 mounts,
             },
         })
+    }
+
+    /// A compute pipeline of `module`'s `entry`, created on the calling thread from the
+    /// renderer's kernel set where it holds a module of the same kernel file. With the
+    /// `hot-reload` feature, editing the kernel's sources replaces the pipeline at a later
+    /// step 1 ([`Frame::reloads`]); look it up each frame with [`Frame::pipeline`] or
+    /// [`SceneCompute::pipeline`].
+    pub fn compute_pipeline(
+        &mut self,
+        module: &'static ShaderModule,
+        entry: &str,
+        spec: SpecData<'_>,
+    ) -> Result<PipelineId> {
+        let id = self
+            .pipelines
+            .create(&self.device, self.kernels, module, entry, spec)?;
+        #[cfg(feature = "hot-reload")]
+        self.reloader
+            .watch(self.pipelines.recipes.last().expect("just created").module);
+        Ok(id)
     }
 
     /// The loading side's job queue, for the threads the consumer lends to it.
@@ -438,7 +479,7 @@ impl Scenes {
 
     /// Step 1: waits until frame N - frames_in_flight has completed, sleeps on the low
     /// latency handle when one is given, recycles the upload window and the slots freed
-    /// before it, and opens frame N.
+    /// before it, swaps in hot-reloaded pipelines, and opens frame N.
     pub fn begin_frame(&mut self, desc: &FrameDesc<'_>) -> Result<Frame<'_>> {
         let started = Instant::now();
         let core = &mut self.core;
@@ -499,6 +540,12 @@ impl Scenes {
             };
             core.mounts.apply(batch, &mut apply);
         }
+        #[cfg(feature = "hot-reload")]
+        let reloads = self
+            .reloader
+            .poll(&mut self.pipelines, &self.loading, &self.device);
+        #[cfg(not(feature = "hot-reload"))]
+        let reloads = Vec::new();
         let mut list = render.command_list()?;
         // Work from earlier frames on this queue finishes before this frame's writes.
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
@@ -518,6 +565,7 @@ impl Scenes {
             scatter: Default::default(),
             latency: desc.low_latency.cloned(),
             loading: loading_points,
+            reloads,
         })
     }
 }
@@ -553,6 +601,7 @@ pub struct Frame<'a> {
     latency: Option<LowLatency>,
     /// Loading batches taken at step 1; the frame's submit waits them.
     loading: Vec<TimelinePoint>,
+    reloads: Vec<ReloadReport>,
 }
 
 impl<'a> Frame<'a> {
@@ -563,6 +612,17 @@ impl<'a> Frame<'a> {
 
     pub fn time(&self) -> FrameTime {
         self.time
+    }
+
+    /// The current pipeline of `id`.
+    pub fn pipeline(&self, id: PipelineId) -> &'a ComputePipeline {
+        self.pipelines.get(id)
+    }
+
+    /// What hot reload applied at this frame's step 1; always empty without the
+    /// `hot-reload` feature.
+    pub fn reloads(&self) -> &[ReloadReport] {
+        &self.reloads
     }
 
     /// Step 2: the writer of listed scene `id`. One writer per scene at a time.
@@ -699,6 +759,7 @@ impl<'a> Frame<'a> {
                 sky_stats: t.sky_stats.gpu,
                 environment: cpu.environment,
                 medium: cpu.medium,
+                surface_data: cpu.surface_data,
                 tlas: device.empty_tlas(),
                 origin_cell: cpu.origin_cell.extend(core.cell_log2 as i32).to_array(),
                 delta_time: self.time.delta,
@@ -724,7 +785,9 @@ impl<'a> Frame<'a> {
         if !copies.is_empty() {
             list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
         }
-        self.scatter = scatter(device, window, &mut list, &self.pipelines.scatter, records)?;
+        let own = &self.pipelines.own;
+        let scatter_pipeline = self.pipelines.get(own.scatter);
+        self.scatter = scatter(device, window, &mut list, scatter_pipeline, records)?;
         list.end_pass();
         list.barrier(
             Stages::COMPUTE | Stages::TRANSFER,
@@ -740,7 +803,8 @@ impl<'a> Frame<'a> {
                     _pad1: 0,
                 };
                 let ptr = window.put_root(device, &r)?;
-                list.dispatch(&self.pipelines.rebase, ptr, [lights.div_ceil(64), 1, 1]);
+                let p = self.pipelines.get(own.rebase);
+                list.dispatch(p, ptr, [lights.div_ceil(64), 1, 1]);
             }
             list.end_pass();
             list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
@@ -755,6 +819,7 @@ impl<'a> Frame<'a> {
                 focus,
                 device,
                 window,
+                pipelines: self.pipelines,
             };
             compute(&mut sc);
             list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
@@ -769,12 +834,13 @@ impl<'a> Frame<'a> {
                 };
                 let ptr = window.put_root(device, &r)?;
                 if desc.producer_capacity > 0 {
-                    let p = &self.pipelines.emissive_producers;
+                    let p = self.pipelines.get(own.emissive_producers);
                     list.dispatch(p, ptr, [desc.producer_capacity, 1, 1]);
                 }
                 if desc.emissive_capacity > 0 {
                     let groups = desc.emissive_capacity.div_ceil(64);
-                    list.dispatch(&self.pipelines.emissive_instances, ptr, [groups, 1, 1]);
+                    let p = self.pipelines.get(own.emissive_instances);
+                    list.dispatch(p, ptr, [groups, 1, 1]);
                 }
             }
             list.end_pass();
@@ -799,17 +865,27 @@ impl<'a> Frame<'a> {
         Ok(self.list.as_mut().expect("frame list"))
     }
 
-    /// Step 4, the raster half of a view: writes its `ViewConstants` and moves its history
-    /// on.
+    /// Step 4, the raster half of a view: writes its `ViewConstants`, culls and rasters the
+    /// scene into the visibility buffer, resolves the G-buffer, depth, motion and HZB, and
+    /// moves its history on.
     pub fn raster_view(&mut self, view: &ViewDesc<'_>) -> Result<RasterView> {
         self.ensure_updated()?;
         if !self.listed.contains(&view.scene) {
             return Err(Error::NotListed(view.scene));
         }
+        let device = self.device;
         let core = &mut *self.core;
         let scene = core.scene(view.scene)?;
         let origin = scene.cpu.lock().unwrap().origin_cell;
         let root = scene.tables.root.gpu;
+        let instance_capacity = scene.desc.instance_capacity;
+        let sizes = TargetSizes {
+            extent: view.render_extent.to_array(),
+            extended: core.materials.any_extended(),
+            visible_clusters: core.budgets.visible_clusters,
+            work: core.budgets.cluster_work,
+            bins: core.raster.bins,
+        };
         let history = core
             .histories
             .get_mut(view.history.0 as usize)
@@ -823,9 +899,40 @@ impl<'a> Frame<'a> {
             self.id,
             self.time.delta,
         );
-        let view = core.windows[self.window].put(self.device, &constants)?;
+        let window = &core.windows[self.window];
+        let list = self.list.as_mut().expect("frame list");
+        if history.targets.as_ref().is_none_or(|t| t.sizes != sizes) {
+            history.targets = Some(ViewTargets::new(device, sizes, list)?);
+        }
+        let targets = history.targets.as_ref().expect("view targets");
+        let constants = window.put(device, &constants)?;
+        let raster = raster::record(
+            device,
+            &core.raster,
+            self.pipelines,
+            window,
+            list,
+            targets,
+            root,
+            instance_capacity,
+            constants,
+            core.raster_error_pixels,
+        )?;
+        let out = RasterView {
+            view: constants,
+            scene: root,
+            gbuffer: raster.cast(),
+            targets: targets.gbuffer(),
+            depth: Arc::clone(&targets.depth.texture),
+            motion: Arc::clone(&targets.motion.texture),
+            gbuf_a: Arc::clone(&targets.a.texture),
+            gbuf_b: Arc::clone(&targets.b.texture),
+            gbuf_x: targets.x.as_ref().map(|x| Arc::clone(&x.texture)),
+            hzb: Arc::clone(&targets.hzb.texture),
+            counts: targets.counts(),
+        };
         self.step("raster_view");
-        Ok(RasterView { view, scene: root })
+        Ok(out)
     }
 
     /// Step 6: submits the frame on the render queue after `wait`, and returns the point

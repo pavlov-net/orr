@@ -8,7 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-orr.workspace = true
+orr = { workspace = true, features = ["hot-reload"] }
 orr-scene = { workspace = true, features = ["testing"] }
 orr-gpu.workspace = true
 orr-shaders.workspace = true
@@ -16,6 +16,7 @@ glam.workspace = true
 
 [dev-dependencies]
 bytemuck.workspace = true
+orr-color.workspace = true
 orr-cook = { path = "../../crates/orr-cook" }
 orr-pack.workspace = true
 png = "0.18"

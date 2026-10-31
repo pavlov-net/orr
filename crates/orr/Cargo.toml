@@ -8,6 +8,10 @@ rust-version.workspace = true
 repository.workspace = true
 links = "orr"
 
+[features]
+# Recompiles kernels whose sources change and swaps their pipelines at step 1, for dev builds.
+hot-reload = ["orr-scene/hot-reload"]
+
 [dependencies]
 orr-scene.workspace = true
 orr-lighting.workspace = true
