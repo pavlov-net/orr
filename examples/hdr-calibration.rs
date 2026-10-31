@@ -9,6 +9,8 @@
 //! `hdr-calibration [frames per pattern] [--ignore-os]`: 120 frames per pattern by default.
 //! `--ignore-os` leaves the watch's feed out of the display, so the surface's formats alone
 //! decide and PQ and scRGB present even with Windows HDR off.
+//!
+//! Built with `--features pcl-stats`, the NVIDIA overlay and FrameView report its PC latency.
 
 #[cfg(not(windows))]
 fn main() {}
@@ -27,8 +29,8 @@ mod run {
     use examples::{assert_clean, device};
     use orr::orr_gpu::{OutputFormat, QueueKind};
     use orr::{
-        CalibrationPattern, Display, DisplayRequest, DisplayWatch, FrameDesc, FrameTime, Renderer,
-        RendererDesc, ResolvedDisplay,
+        CalibrationPattern, ConsumerMarker, Display, DisplayRequest, DisplayWatch, FrameDesc,
+        FrameTime, Renderer, RendererDesc, ResolvedDisplay,
     };
     use orr_egui::Painter;
 
@@ -139,6 +141,7 @@ mod run {
                 })
                 .expect("begin frame");
             let id = f.id();
+            f.latency_marker(ConsumerMarker::SimulationStart);
             let Some((resolved, [w, h])) = f.display() else {
                 last = Some(f.end().expect("end frame"));
                 continue 'frames;
@@ -189,6 +192,7 @@ mod run {
                 },
             );
             let primitives = ctx.tessellate(shapes, pixels_per_point);
+            f.latency_marker(ConsumerMarker::SimulationEnd);
             pending.append(textures_delta);
             f.ui_only(&mut |pass| {
                 painter

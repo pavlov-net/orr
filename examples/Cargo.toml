@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+# orr's `pcl-stats`: hdr-calibration reports PC latency to the NVIDIA overlay and FrameView.
+pcl-stats = ["orr/pcl-stats"]
+
 [dependencies]
 orr.workspace = true
 orr-cook.workspace = true

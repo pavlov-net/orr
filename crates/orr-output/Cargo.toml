@@ -8,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 links = "orr_output"
 
+[features]
+# Sends every Reflex marker as a PCL Stats event too and marks the PC latency ping that
+# `DisplayWatch` receives, for the NVIDIA overlay and FrameView. Windows only; builds
+# pclstats.h from the Reflex SDK at `REFLEX_SDK`.
+pcl-stats = ["dep:cc"]
+
 [dependencies]
 orr-dlss.workspace = true
 orr-math.workspace = true
@@ -22,6 +28,7 @@ exr = { version = "1.74", default-features = false }
 moxcms = "0.8"
 
 [build-dependencies]
+cc = { workspace = true, optional = true }
 orr-color.workspace = true
 orr-shaders = { workspace = true, features = ["build"] }
 

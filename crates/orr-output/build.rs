@@ -3,7 +3,8 @@
 //! matching functions, D65 weighted, in Rec.2020) against the pyramid's kernels, into
 //! `OUT_DIR/glare_tables.rs`. The PSF data the output suite checks the fit with goes to
 //! `OUT_DIR/glare_psf.rs`, published with the CPU model's directory as `glare_psf` and
-//! `glare_model`.
+//! `glare_model`. With the `pcl-stats` feature on Windows it also builds the PCL Stats shim
+//! against `pclstats.h` from the Reflex SDK at `REFLEX_SDK`.
 
 use std::env;
 use std::fmt::Write as _;
@@ -44,6 +45,33 @@ fn main() {
         Err(e) => panic!("{e}"),
     }
     glare(&manifest, &out_dir);
+    #[cfg(feature = "pcl-stats")]
+    pcl_stats(&manifest);
+}
+
+#[cfg(feature = "pcl-stats")]
+fn pcl_stats(manifest: &Path) {
+    println!("cargo:rerun-if-env-changed=REFLEX_SDK");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let sdk = env::var_os("REFLEX_SDK")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .expect("the pcl-stats feature needs REFLEX_SDK set to the Reflex SDK");
+    let include = sdk.join("Reflex_Stats");
+    let header = include.join("pclstats.h");
+    assert!(header.is_file(), "{} not found", header.display());
+    let shim = manifest.join("src/pcl_stats.cpp");
+    println!("cargo:rerun-if-changed={}", header.display());
+    println!("cargo:rerun-if-changed={}", shim.display());
+    cc::Build::new()
+        .cpp(true)
+        .file(shim)
+        .include(include)
+        .compile("orr_pcl_stats");
+    println!("cargo:rustc-link-lib=advapi32");
+    println!("cargo:rustc-link-lib=user32");
 }
 
 fn glare(manifest: &Path, out_dir: &Path) {
