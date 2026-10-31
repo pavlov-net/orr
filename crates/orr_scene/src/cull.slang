@@ -338,7 +338,8 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
 
 // One workgroup per producer entry, its threads over the clusters it emitted. Opaque and
 // alpha-tested entries join the raster lists; particle entries the particle list;
-// dielectric and presence entries are traced only.
+// dielectric and presence entries are traced only. A strand entry's clusters are its
+// segments in groups of STRAND_GROUP, drawn as ribbons.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
@@ -359,17 +360,28 @@ void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     if (!producer_placement(s, p, false, v.eye_cell.xyz, v.eye_offset.xyz, uint(v.eye_cell.w), pl))
         return;
     ProducerBatch b = s.batches[entry];
-    uint n = emitted_clusters(b);
+    bool strands = p.strands != 0;
+    uint n = strands ? (emitted_segments(b) + STRAND_GROUP - 1) / STRAND_GROUP : emitted_clusters(b);
+    uint strand = strands ? strand_material(p) : MATERIAL_NONE;
     for (uint c = thread; c < n; c += 64)
     {
-        ProducerClusterGpu k = b.clusters[c];
-        if (!producer_cluster_valid(b, k))
-            continue;
-        uint material = producer_material(p, k);
+        uint material = strand;
+        float3 lo, hi;
+        if (strands)
+        {
+            if (!strand_cluster_box(b, c, lo, hi))
+                continue;
+        }
+        else
+        {
+            ProducerClusterGpu k = b.clusters[c];
+            if (!producer_cluster_valid(b, k))
+                continue;
+            material = producer_material(p, k);
+            producer_cluster_box(b, k, lo, hi);
+        }
         if (material == MATERIAL_NONE)
             continue;
-        float3 lo, hi;
-        producer_cluster_box(b, k, lo, hi);
         float3 center = place(pl, 0.5 * (lo + hi));
         float radius = 0.5 * length(hi - lo) * pl.scale;
         if (!sphere_visible(v, center, radius))

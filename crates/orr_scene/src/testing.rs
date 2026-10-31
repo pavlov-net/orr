@@ -54,8 +54,13 @@ pub fn device() -> &'static Device {
 
 /// Fails the calling test if the validation layer has reported anything on [`device`].
 pub fn assert_clean() {
+    assert_clean_on(device());
+}
+
+/// Fails the calling test if the validation layer has reported anything on device `d`.
+pub fn assert_clean_on(d: &Device) {
     assert_eq!(
-        device().validation_messages(),
+        d.validation_messages(),
         0,
         "validation messages (see the log)"
     );
@@ -63,7 +68,12 @@ pub fn assert_clean() {
 
 /// Waits for `point` on [`device`].
 pub fn wait(point: TimelinePoint) {
-    let render = device().queue(QueueKind::Render).unwrap();
+    wait_on(device(), point);
+}
+
+/// [`wait`] on device `d`.
+pub fn wait_on(d: &Device, point: TimelinePoint) {
+    let render = d.queue(QueueKind::Render).unwrap();
     render.wait(point, Duration::from_secs(10)).expect("wait");
 }
 

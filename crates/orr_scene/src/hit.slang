@@ -128,6 +128,73 @@ public uint producer_material(ProducerGpu p, ProducerClusterGpu k)
     return uint(k.material) < p.material_count ? p.materials[k.material] : MATERIAL_NONE;
 }
 
+// The material of a strand entry's segments: its first.
+public uint strand_material(ProducerGpu p)
+{
+    return p.material_count > 0 ? p.materials[0] : MATERIAL_NONE;
+}
+
+// `Hit.cluster_id` of a swept-sphere hit, as a uint.
+static const uint SWEPT_CLUSTER = 0xffffffffu;
+
+// The segment of strand entry hit `cluster_id`, `primitive`: a swept-sphere hit names it, a
+// tube hit names a triangle of a tube cluster.
+public uint strand_segment(uint cluster_id, uint primitive)
+{
+    return cluster_id == SWEPT_CLUSTER ? primitive : cluster_id * TUBE_SEGMENTS + primitive / TUBE_SEGMENT_TRIANGLES;
+}
+
+// The geometry of `i` at the entry-relative point `object` on segment `segment` of strand
+// batch `b` placed by `pl`: the swept sphere's normal there, the tangent along the strand,
+// the uv along the segment and its steps across a footprint `width` m wide (along the
+// segment only), the segment's and its vertices' words, and in `barycentrics.x` where along
+// the segment the point lies. With `previous` the point moves with the segment's vertices
+// to last frame's, where the batch keeps them. False for a segment that is not drawn or
+// traced.
+public bool strand_geometry(inout SurfaceInput i, ProducerBatch b, uint segment, float3 object, Placement pl, bool previous, float width)
+{
+    Segment g;
+    if (!load_segment(b, segment, false, g))
+        return false;
+    float u;
+    float3 n_obj = swept_normal(g.a, g.b, g.ra, g.rb, object, u);
+    if (previous)
+        object += strand_motion(b, segment, u);
+    float mirror = determinant(pl.linear) < 0.0 ? -1.0 : 1.0;
+    float3 n = safe_normalize(mul(cofactors(pl.linear), n_obj) * mirror);
+    float3 axis = mul(pl.linear, g.b - g.a);
+    float3 t = safe_normalize(axis, perpendicular(n));
+    float2 uv0 = producer_uv(b.attrs[g.vertex]);
+    float2 uv1 = producer_uv(b.attrs[g.vertex + 1]);
+    i.uv[0].uv = lerp(uv0, uv1, u);
+    i.uv[0].dx = (uv1 - uv0) * (width / max(length(axis), 1e-30));
+    i.uv[0].dy = float2(0.0);
+    i.uv[1] = i.uv[0];
+    i.geometric_normal = n;
+    i.normal = n;
+    i.tangent = float4(t, 1.0);
+    i.object_position = object;
+    i.object_normal = n_obj;
+    i.object_to_render = pl.linear;
+    i.barycentrics = float2(u, 0.0);
+    i.cluster = segment;
+    i.primitive = 0;
+    i.cluster_user = b.segment_user[segment];
+    i.vertex_user = b.vertex_user != nullptr ? uint3(b.vertex_user[g.vertex], b.vertex_user[g.vertex + 1], 0) : uint3(0);
+    return true;
+}
+
+// How far the point `u` along segment `segment` of strand batch `b` moved since last frame,
+// in the entry's space: zero where the batch keeps no previous positions.
+public float3 strand_motion(ProducerBatch b, uint segment, float u)
+{
+    Segment g, last;
+    if (b.previous == nullptr || !load_segment(b, segment, false, g))
+        return float3(0.0);
+    load_segment(b, segment, true, last);
+    return lerp(last.a - g.a, last.b - g.b, u);
+}
+
 // The origin policy of a hit on material `m`: a producer entry's own unless it is the
 // default, else the material's.
 public uint hit_origin(MaterialGpu* m, uint producer_origin)
@@ -460,10 +527,13 @@ public uint traced_material(SceneRoot* s, uint instance_index, uint cluster_id)
     uint entry;
     if (hit_producer(s, instance_index, entry))
     {
+        ProducerGpu p = s.producers[entry];
+        if (p.strands != 0)
+            return strand_material(p);
         ProducerBatch b = s.batches[entry];
         if (cluster_id >= emitted_clusters(b))
             return MATERIAL_NONE;
-        return producer_material(s.producers[entry], b.clusters[cluster_id]);
+        return producer_material(p, b.clusters[cluster_id]);
     }
     uint copy;
     if (!hit_copy(s, instance_index, copy))
@@ -487,13 +557,33 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
     h = (HitInput)0;
     uint cell_log2 = uint(s.origin_cell.w);
     SurfaceInput i = (SurfaceInput)0;
-    Corners corners;
+    Corners corners = (Corners)0;
     uint material;
     uint attributes;
     Placement pl;
     uint entry;
     bool skinned = false;
-    if (hit_producer(s, instance_index, entry))
+    bool producer = hit_producer(s, instance_index, entry);
+    bool strand = producer && s.producers[entry].strands != 0;
+    if (strand)
+    {
+        // Strands are opaque, so only closest hits with their hit point reach here.
+        ProducerGpu p = s.producers[entry];
+        ProducerBatch b = s.batches[entry];
+        if (!fetched || !producer_placement(s, p, previous, s.origin_cell.xyz, float3(0.0), cell_log2, pl))
+            return false;
+        uint segment = strand_segment(cluster_id, primitive);
+        float3 object = cluster_id == SWEPT_CLUSTER ? t.position[0]
+            : (1.0 - bary.x - bary.y) * t.position[0] + bary.x * t.position[1] + bary.y * t.position[2];
+        if (!strand_geometry(i, b, segment, object, pl, previous, context.cone_width))
+            return false;
+        material = strand_material(p);
+        attributes = 0;
+        i.instance = instance_index;
+        i.user_tag = p.user_tag;
+        h.origin = p.origin;
+    }
+    else if (producer)
     {
         ProducerGpu p = s.producers[entry];
         ProducerBatch b = s.batches[entry];
@@ -551,10 +641,31 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
     }
     if (material == MATERIAL_NONE)
         return false;
+    MaterialGpu* m = s.materials + material;
+    if (!strand)
+        hit_triangle(i, d, corners, t, fetched, skinned, previous, attributes, m, pl, primitive, bary, context);
+    i.uv[0].tap = i.uv[1].tap = context.tap;
+    i.context = context;
+    i.material = material;
+    i.surface = m.surface;
+    i.position = place(pl, i.object_position);
+    world_cell(s.origin_cell.xyz, float3(0.0), i.position, cell_log2, i.cell, i.offset);
+    i.view_direction = d;
+    i.scene = s;
+    i.view = v;
+    i.data = m.data != 0 ? m.data : s.surface_data;
+    h.input = i;
+    h.placement = pl;
+    return true;
+}
+
+// The triangle geometry of a hit at barycentrics `bary` of triangle `primitive` with
+// `corners`, the fetched positions `t` replacing theirs where they are this frame's.
+void hit_triangle(inout SurfaceInput i, float3 d, Corners corners, Corners t, bool fetched, bool skinned, bool previous, uint attributes, MaterialGpu* m, Placement pl, uint primitive, float2 bary, HitContext context)
+{
     // A skinned copy's fetched positions are this frame's.
     if (fetched && !(skinned && previous))
         corners.position = t.position;
-    MaterialGpu* m = s.materials + material;
 
     // Barycentric steps of the cone's footprint: two directions across the ray, carried
     // along it onto the triangle's plane.
@@ -578,28 +689,16 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
     float2 by = float2(dot(cross(yp * w, e2), n), dot(cross(e1, yp * w), n)) / nn;
 
     triangle_geometry(i, corners, attributes, m, pl, bary, bx, by, d, 1.0);
-    i.uv[0].tap = i.uv[1].tap = context.tap;
-    i.context = context;
     i.primitive = primitive;
     i.barycentrics = bary;
-    i.material = material;
-    i.surface = m.surface;
-    i.position = place(pl, i.object_position);
-    world_cell(s.origin_cell.xyz, float3(0.0), i.position, cell_log2, i.cell, i.offset);
-    i.view_direction = d;
-    i.scene = s;
-    i.view = v;
-    i.data = m.data != 0 ? m.data : s.surface_data;
-    h.input = i;
-    h.placement = pl;
-    return true;
 }
 
 // The surface at a ray hit through linked surface `S` (the kernel's `Surface`): the
 // committed hit's instance index, cluster id, primitive, barycentrics and fetched
-// object-space positions, the unit render-space ray direction `d`, and the caller's
-// context. `previous` places the hit with the previous frame's transforms. `v` is passed
-// on to the surface and may be null.
+// object-space positions (`orr.trace`'s: on a swept-sphere hit the first is the hit point),
+// the unit render-space ray direction `d`, and the caller's context. `previous` places the
+// hit with the previous frame's transforms. `v` is passed on to the surface and may be null.
+// On a strand entry the surface's `cluster` is the segment and its `primitive` 0.
 public SurfaceHit resolve_hit<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, float3 object_positions[3], bool previous, HitContext context)
 {
     SurfaceHit hit = (SurfaceHit)0;
@@ -617,7 +716,7 @@ public SurfaceHit resolve_hit<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
     g.flags = (g.flags & ~GBUFFER_ORIGIN_MASK) | (hit_origin(m, h.origin) << GBUFFER_ORIGIN_SHIFT);
     g.instance = h.input.instance;
     g.cluster = h.input.cluster;
-    g.primitive = primitive;
+    g.primitive = h.input.primitive;
     g.material = h.input.material;
     hit.surface = g;
     hit.uv = h.input.uv;

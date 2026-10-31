@@ -321,75 +321,126 @@ public bool visible_placement(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     return cluster_placement(s, vc.instance, inst, load_cluster(vc.page, vc.local), copy, previous, p);
 }
 
+// The segment of a strand entry's raster cluster `cluster` that ribbon triangle `triangle`
+// draws.
+public uint ribbon_segment(uint cluster, uint triangle)
+{
+    return cluster * STRAND_GROUP + triangle / 2;
+}
+
+// Where the unit ray from the eye along `d` first meets the strand around segment `segment`
+// of `b` placed by `pl`: the swept spheres of the segment and of the segments joined to its
+// ends, so a ribbon reaching past its segment resolves on the strand's surface. Gives `t`
+// and the segment hit, or where all three miss, the point nearest the segment's axis.
+float strand_ray(ProducerBatch b, Placement pl, float3 d, inout uint segment)
+{
+    Segment g;
+    bool valid = load_segment(b, segment, false, g);
+    float best = 1e30;
+    uint nearest = segment;
+    for (int k = -1; k <= 1; k++)
+    {
+        Segment n = g;
+        uint s = segment + uint(k);
+        if (k == 0 ? !valid : (k < 0 && segment == 0) || !load_segment(b, s, false, n) || n.vertex != g.vertex + uint(k))
+            continue;
+        float t;
+        float3 normal;
+        if (swept_intersect(float3(0.0), d, place(pl, n.a), place(pl, n.b), n.ra * pl.scale, n.rb * pl.scale, t, normal) && t < best)
+        {
+            best = t;
+            nearest = s;
+        }
+    }
+    segment = nearest;
+    return best < 1e30 ? best : ray_axis_closest(float3(0.0), d, place(pl, g.a), place(pl, g.b));
+}
+
 // The surface input where the ray through `pixel_center` (render pixels) meets triangle
 // `triangle` of `vc`: barycentrics and their screen gradients from the ray and its
 // one-pixel neighbors, uv footprint with the view's mip bias and texture tap, normals and
 // tangent frame in render space (back faces of double-sided materials turned to the
 // viewer), and the world cell. Without mesh tangents the tangent follows the triangle's uv.
+// On a strand entry's ribbon the ray meets the strand's swept spheres instead
+// (`strand_ray`); the input is a strand hit's (`strand_geometry`).
 public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc, uint triangle, float2 pixel_center)
 {
     MaterialGpu* m = s.materials + vc.material;
     PrimaryHit hit = (PrimaryHit)0;
     SurfaceInput i = (SurfaceInput)0;
-    Corners t;
-    uint attributes = 0;
-    uint entry;
     visible_placement(s, v, vc, false, hit.placement);
-    if (visible_producer(s, vc, entry))
+    Placement pl = hit.placement;
+    float2 extent = float2(v.extent);
+    float3 d = render_direction(v, view_direction(v, pixel_center / extent));
+    float spread = 1.0 / pixels_per_radian(v);
+    float bias = exp2(v.mip_bias);
+    uint entry;
+    bool producer = visible_producer(s, vc, entry);
+    if (producer && s.producers[entry].strands != 0)
     {
         ProducerBatch b = s.batches[entry];
-        ProducerTriangle pt = producer_triangle(b, b.clusters[vc.cluster], triangle, false);
-        t = pt.corners;
+        uint segment = ribbon_segment(vc.cluster, triangle);
+        float t = strand_ray(b, pl, d, segment);
+        hit.distance = t;
+        hit.object = mul(linear_inverse(pl.linear), t * d - pl.translation);
+        strand_geometry(i, b, segment, hit.object, pl, false, t * spread * bias);
         i.user_tag = s.producers[entry].user_tag;
-        i.cluster_user = pt.cluster_user;
-        i.vertex_user = pt.vertex_user;
         hit.origin = s.producers[entry].origin;
     }
     else
     {
-        InstanceGpu inst = copy_record(s, vc.instance);
-        MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
-        Cluster c = load_cluster(vc.page, vc.local);
-        t = load_corners(vc.page, c, triangle, mesh);
-        SkinnedGpu k;
-        if (copy_skin(s, inst, k))
-            skinned_corners(k, mesh, vc.page, c, vc.cluster, triangle, false, t);
-        attributes = mesh.attributes;
-        hit.error = c.self_error * hit.placement.scale;
-        i.part = c.part;
-        i.user_tag = inst.user_tag;
+        Corners c;
+        uint attributes = 0;
+        if (producer)
+        {
+            ProducerBatch b = s.batches[entry];
+            ProducerTriangle pt = producer_triangle(b, b.clusters[vc.cluster], triangle, false);
+            c = pt.corners;
+            i.user_tag = s.producers[entry].user_tag;
+            i.cluster_user = pt.cluster_user;
+            i.vertex_user = pt.vertex_user;
+            hit.origin = s.producers[entry].origin;
+        }
+        else
+        {
+            InstanceGpu inst = copy_record(s, vc.instance);
+            MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
+            Cluster k = load_cluster(vc.page, vc.local);
+            c = load_corners(vc.page, k, triangle, mesh);
+            SkinnedGpu sk;
+            if (copy_skin(s, inst, sk))
+                skinned_corners(sk, mesh, vc.page, k, vc.cluster, triangle, false, c);
+            attributes = mesh.attributes;
+            hit.error = k.self_error * pl.scale;
+            i.part = k.part;
+            i.user_tag = inst.user_tag;
+        }
+        float3 q0 = place(pl, c.position[0]);
+        float3 e1 = mul(pl.linear, c.position[1] - c.position[0]);
+        float3 e2 = mul(pl.linear, c.position[2] - c.position[0]);
+        float3 dx = render_direction(v, view_direction(v, (pixel_center + float2(1, 0)) / extent));
+        float3 dy = render_direction(v, view_direction(v, (pixel_center + float2(0, 1)) / extent));
+        float3 b = ray_barycentrics(d, q0, e1, e2);
+        float2 bx = ray_barycentrics(dx, q0, e1, e2).xy - b.xy;
+        float2 by = ray_barycentrics(dy, q0, e1, e2).xy - b.xy;
+        triangle_geometry(i, c, attributes, m, pl, b.xy, bx, by, d, bias);
+        hit.distance = b.z;
+        hit.object = (1.0 - b.x - b.y) * c.position[0] + b.x * c.position[1] + b.y * c.position[2];
+        i.cluster = vc.cluster;
+        i.primitive = triangle;
+        i.barycentrics = b.xy;
     }
-    Placement pl = hit.placement;
-    float3 q0 = place(pl, t.position[0]);
-    float3 e1 = mul(pl.linear, t.position[1] - t.position[0]);
-    float3 e2 = mul(pl.linear, t.position[2] - t.position[0]);
-
-    float2 extent = float2(v.extent);
-    float3 d = render_direction(v, view_direction(v, pixel_center / extent));
-    float3 dx = render_direction(v, view_direction(v, (pixel_center + float2(1, 0)) / extent));
-    float3 dy = render_direction(v, view_direction(v, (pixel_center + float2(0, 1)) / extent));
-    float3 b = ray_barycentrics(d, q0, e1, e2);
-    float2 bx = ray_barycentrics(dx, q0, e1, e2).xy - b.xy;
-    float2 by = ray_barycentrics(dy, q0, e1, e2).xy - b.xy;
-
-    triangle_geometry(i, t, attributes, m, pl, b.xy, bx, by, d, exp2(v.mip_bias));
-    float spread = 1.0 / pixels_per_radian(v);
-    hit.relative = b.z * d;
+    hit.relative = hit.distance * d;
     hit.direction = d;
-    hit.distance = b.z;
-    hit.object = (1.0 - b.x - b.y) * t.position[0] + b.x * t.position[1] + b.y * t.position[2];
     i.context.kind = HIT_PRIMARY;
     i.context.depth = 0;
-    i.context.cone_width = b.z * spread;
+    i.context.cone_width = hit.distance * spread;
     i.context.cone_spread = spread;
     // A 2x2 quad shares its tap, so neighbors under magnification read the same texel
     // offset and the resolve's normal variance across the quad sees little filter noise.
     i.context.tap = texture_tap(v, uint2(pixel_center) / 2, v.frame_index, 0, 0);
     i.uv[0].tap = i.uv[1].tap = i.context.tap;
     i.instance = vc.instance;
-    i.cluster = vc.cluster;
-    i.primitive = triangle;
-    i.barycentrics = b.xy;
     i.material = vc.material;
     i.surface = m.surface;
     i.position = hit.relative + v.eye_render.xyz;

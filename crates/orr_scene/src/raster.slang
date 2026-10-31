@@ -3,10 +3,12 @@
 // the clusters small on screen in compute with the same snapping, sample points and
 // coverage. Clusters marked VISIBLE_BY_SIZE are in both lists, and each path draws only the
 // triangles the other leaves: overlap between them is harmless, a gap would be a hole.
-// Alpha-tested triangles keep a pixel by each surface's coverage. Pixel stages write only
-// the visibility buffer. `depth` copies the resolved depth into the depth target.
+// Alpha-tested triangles keep a pixel by each surface's coverage. Strand segments draw as
+// ribbons facing the eye that cover their swept spheres. Pixel stages write only the
+// visibility buffer. `depth` copies the resolved depth into the depth target.
 #include "orr/root.h"
 import orr.atomic;
+import orr.math;
 import orr.random;
 import orr_pack.mesh;
 import producer;
@@ -43,6 +45,7 @@ struct ClusterDraw
     float step;          // the mesh's position step
     ProducerBatch b;
     ProducerClusterGpu k;
+    bool strands;        // ribbons of a strand entry's segments
     float3* skinned;     // a skinned copy's positions of the cluster's vertices, else null
     Placement p;
     uint vertex_count;
@@ -63,9 +66,18 @@ ClusterDraw cluster_draw(uint visible, bool alpha)
     d.vc = root.raster.gbuffer.clusters[visible];
     MaterialGpu* m = s.materials + d.vc.material;
     uint entry;
-    if (visible_producer(s, d.vc, entry))
+    d.producer = visible_producer(s, d.vc, entry);
+    d.strands = d.producer && s.producers[entry].strands != 0;
+    if (d.strands)
     {
-        d.producer = true;
+        d.b = s.batches[entry];
+        uint segments = min(emitted_segments(d.b) - d.vc.cluster * STRAND_GROUP, STRAND_GROUP);
+        d.vertex_count = 4 * segments;
+        d.tri_count = 2 * segments;
+        d.split = d.tri_count;
+    }
+    else if (d.producer)
+    {
         d.b = s.batches[entry];
         d.k = d.b.clusters[d.vc.cluster];
         d.vertex_count = d.k.vertex_count;
@@ -90,24 +102,63 @@ ClusterDraw cluster_draw(uint visible, bool alpha)
     }
     d.first = alpha ? d.split : 0;
     d.count = alpha ? d.tri_count - d.split : d.split;
-    d.single_sided = (m.flags & MATERIAL_DOUBLE_SIDED) == 0;
+    d.single_sided = !d.strands && (m.flags & MATERIAL_DOUBLE_SIDED) == 0;
     visible_placement(s, root.view, d.vc, false, d.p);
     return d;
 }
 
-// The corners of triangle `t` of the draw.
+// The corners of triangle `t` of the draw. Ribbon j is vertices 4 j to 4 j + 3: start left
+// and right, end left and right.
 uint3 draw_triangle(ClusterDraw d, uint t)
 {
+    if (d.strands)
+    {
+        uint j = 4 * (t / 2);
+        return (t & 1) == 0 ? uint3(j, j + 1, j + 2) : uint3(j + 2, j + 1, j + 3);
+    }
     return d.producer ? cluster_corners(d.k, t) : load_triangle(d.vc.page, d.h, d.c, t);
+}
+
+// Corner `i` of the ribbons of strand draw `d`, eye-relative. A ribbon spans its segment and
+// its end spheres and is as wide as the spheres' silhouettes. An invalid segment's corners
+// coincide, so it covers nothing.
+float3 ribbon_corner(ClusterDraw d, uint i)
+{
+    Segment g;
+    if (!load_segment(d.b, ribbon_segment(d.vc.cluster, 2 * (i / 4)), false, g))
+        return d.p.translation;
+    float3 a = place(d.p, g.a);
+    float3 b = place(d.p, g.b);
+    bool end = (i & 2) != 0;
+    float3 c = end ? b : a;
+    float r = (end ? g.rb : g.ra) * d.p.scale;
+    float3 axis = b - a;
+    float3 e = safe_normalize(axis, float3(0.0, 1.0, 0.0));
+    float3 side = safe_normalize(cross(e, c), perpendicular(e));
+    float dist = length(c);
+    float half_width = dist > r ? r * dist / sqrt(dist * dist - r * r) : r;
+    float3 q = c + e * (end ? r : -r) + side * ((i & 1) != 0 ? half_width : -half_width);
+    // Toward the eye by the radius, which keeps the corner on screen and its depth near the
+    // sphere's front.
+    float l = length(q);
+    return l > 2.0 * r ? q * (1.0 - r / l) : q;
 }
 
 // Vertex `i` of the draw; keeps its eye-relative position for the back-face test.
 Vertex cluster_vertex(ClusterDraw d, uint visible, uint i)
 {
     ViewConstants* v = root.view;
-    float3 x = d.producer ? d.b.positions[d.k.first_vertex + i]
-        : d.skinned != nullptr ? d.skinned[i] : load_position(d.vc.page, d.h, d.c, i, d.step);
-    float3 q = place(d.p, x);
+    float3 q;
+    if (d.strands)
+    {
+        q = ribbon_corner(d, i);
+    }
+    else
+    {
+        float3 x = d.producer ? d.b.positions[d.k.first_vertex + i]
+            : d.skinned != nullptr ? d.skinned[i] : load_position(d.vc.page, d.h, d.c, i, d.step);
+        q = place(d.p, x);
+    }
     corners[i] = q;
     Vertex o;
     o.position = mul(v.clip_from_view_jittered, float4(view_from_relative(v, q), 1.0));

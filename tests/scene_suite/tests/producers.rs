@@ -8,7 +8,9 @@
 //! near capacity; and subdivision copies: closed cages with creases, a corner, n-gons and
 //! extraordinary points diced at mixed rates onto a CPU limit surface, closed bit for bit,
 //! rippled along the limit normal, agreeing in raster and rays, and a skinned cage posed
-//! before it dices with last frame's pose for motion.
+//! before it dices with last frame's pose for motion; and strand entries, whose ribbons
+//! resolve where traced swept spheres or tubes are hit and whose swept-sphere shadows match
+//! their tubes'.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -21,16 +23,19 @@ use orr_cook::{
     Subdivision, UsdSettings,
 };
 use orr_gpu::{
-    Blend, ClearColor, ColorAttachment, ColorLoad, ColorMask, ColorTarget, Format, Hazards,
-    MemoryKind, MeshPipelineDesc, QueueKind, RasterState, Rendering, SamplerDesc, ShaderStage,
-    SpecData, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
-    TextureRegion, TextureUsage,
+    Blend, ClearColor, ColorAttachment, ColorLoad, ColorMask, ColorTarget, ComputePipeline, Device,
+    DeviceDesc, Format, Hazards, MemoryKind, MeshPipelineDesc, QueueKind, QueueRequest,
+    RasterState, Rendering, SamplerDesc, ShaderStage, SpecData, Stages, StorageImageIndex, Texture,
+    TextureDesc, TextureIndex, TextureMemory, TextureRegion, TextureUsage,
 };
 use orr_pack::AssetId;
 use orr_pack::subd::{Page as SubdPage, SubdInfo};
-use orr_scene::testing::{assert_clean, device, read_buffer, read_texture, wait};
+use orr_scene::testing::{
+    Image, Pixels, assert_clean, assert_clean_on, device, flip, read_buffer, read_texture, wait,
+    wait_on,
+};
 use orr_scene::{
-    Affine3, ClusterTopology, FrameDesc, FrameTime, GeneratedClusterGpu, GroupWriter, Lens,
+    Affine3, ClusterTopology, Frame, FrameDesc, FrameTime, GeneratedClusterGpu, GroupWriter, Lens,
     LoadState, MaterialGpu, MaterialId, ModelId, MountId, Opacity, PackSource, ProducerBatch,
     ProducerClusterGpu, ProducerDesc, ProducerId, ProducerStateGpu, ProducerStats, ProducerUpdate,
     Projection, RasterView, RendererDesc, SceneDesc, SceneId, SceneWriter, Scenes, SubdDesc,
@@ -38,7 +43,9 @@ use orr_scene::{
     ViewDesc, ViewHistoryId, ViewTarget, VisibleCluster, material_flags, tessellation,
 };
 use orr_shaders::bytemuck::Zeroable;
-use scene_suite::shaders::{blades, particle_draw, patches, producer_rays, tess_rays};
+use scene_suite::shaders::{
+    blades, particle_draw, patches, producer_rays, strand_rays, strands, tess_rays,
+};
 use scene_suite::{Workers, linked, pipeline};
 
 const EXTENT: [u32; 2] = [160, 96];
@@ -2442,4 +2449,321 @@ fn a_skinned_cage_poses_before_it_dices_and_moves_from_last_frames_pose() {
         .count();
     assert!(moved > g.positions.len() / 10, "{moved} vertices moved");
     assert_clean();
+}
+
+const STRANDS: ProducerId = ProducerId(0);
+const STRAND_COUNT: u32 = 128;
+const STRAND_SEGMENTS: u32 = 6;
+const STRAND_WORD: u32 = 5000;
+const STRAND_RADIUS: f32 = 0.02;
+const SHADOW_GRID: [u32; 2] = [128, 96];
+
+/// A second device that leaves linear swept spheres off, so strands trace as tubes.
+fn tube_device() -> Device {
+    let _ = device();
+    let d = Device::new(&DeviceDesc {
+        name: "orr-test-tubes",
+        validation: true,
+        queues: QueueRequest {
+            render_compute: true,
+            async_compute: true,
+            copy: true,
+            present: false,
+        },
+        skip_extensions: &[c"VK_NV_ray_tracing_linear_swept_spheres"],
+        ..DeviceDesc::default()
+    })
+    .unwrap();
+    assert!(!d.caps().lss);
+    d
+}
+
+/// One scene on `d` holding `strands.slang`'s strand entry, emitted every frame.
+struct Strands<'d> {
+    d: &'d Device,
+    emit: ComputePipeline,
+    probe: ComputePipeline,
+    scenes: Scenes,
+    scene: SceneId,
+    history: ViewHistoryId,
+    frame: u32,
+}
+
+impl<'d> Strands<'d> {
+    fn new(d: &'d Device) -> Self {
+        let mut scenes = Scenes::new(d, &RendererDesc::default()).unwrap();
+        let scene = scenes
+            .create_scene(&SceneDesc {
+                producer_capacity: 2,
+                ..SceneDesc::default()
+            })
+            .unwrap();
+        let history = scenes.create_view_history().unwrap();
+        let mut frame = 0;
+        let list = [scene];
+        let f = begin(&mut scenes, &mut frame, &list);
+        let mut m = MaterialGpu::zeroed();
+        m.base_color = [0.5; 3];
+        m.base_weight = 1.0;
+        let material = f.materials().create(&m).unwrap();
+        let mut w = f.scene(scene).unwrap();
+        let group = w
+            .create_transform_group(&TransformGroupDesc {
+                count: 1,
+                writer: GroupWriter::Cpu,
+                anchor: DVec3::ZERO,
+            })
+            .unwrap();
+        w.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY;
+        w.set_producer(
+            STRANDS,
+            Some(&ProducerDesc {
+                max_vertices: STRAND_COUNT * (STRAND_SEGMENTS + 1),
+                max_segments: STRAND_COUNT * STRAND_SEGMENTS,
+                materials: &[material],
+                transform: (group, 0),
+                ..ProducerDesc::default()
+            }),
+        )
+        .unwrap();
+        drop(w);
+        finish(d, f);
+        let pipeline = |module, name| {
+            let stage = ShaderStage::new(module, "main", SpecData::default()).unwrap();
+            d.create_compute_pipeline(&stage, name).unwrap()
+        };
+        Self {
+            d,
+            emit: pipeline(&strands::MODULE, "strands"),
+            probe: pipeline(&strand_rays::MODULE, "strand rays"),
+            scenes,
+            scene,
+            history,
+            frame,
+        }
+    }
+
+    /// Emits the strands and rasters the camera's view.
+    fn frame(&mut self) -> RasterView {
+        let p = &self.emit;
+        let list = [self.scene];
+        let first = self.frame <= 2;
+        let scene = self.scene;
+        let history = self.history;
+        let mut f = begin(&mut self.scenes, &mut self.frame, &list);
+        f.update_scenes(&mut |c| {
+            let r = c
+                .put_root(&strands::Root {
+                    scene: c.root,
+                    producer: STRANDS.0,
+                    count: STRAND_COUNT,
+                    segments: STRAND_SEGMENTS,
+                    base: STRAND_WORD,
+                    radius: STRAND_RADIUS,
+                    height: 0.5,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                    _pad3: 0,
+                })
+                .unwrap();
+            c.cmd.dispatch(p, r, [STRAND_COUNT.div_ceil(64), 1, 1]);
+        })
+        .unwrap();
+        let eye = Vec3::new(0.0, 0.35, 0.8);
+        let view = f
+            .raster_view(&ViewDesc {
+                scene,
+                history,
+                position: eye.as_dvec3(),
+                rotation: look(eye, Vec3::new(0.0, 0.2, -0.7)),
+                projection: Projection {
+                    fov_y: 0.9,
+                    near: 0.05,
+                },
+                lens: Lens::default(),
+                render_extent: UVec2::from(EXTENT),
+                jitter: Vec2::ZERO,
+                reset_history: first,
+                mip_bias: 0.0,
+                texture_filter: TextureFilter::Hardware,
+                target: ViewTarget::AfterRr,
+            })
+            .unwrap();
+        finish(self.d, f);
+        view
+    }
+
+    /// The producer stats of the last frame, which the next frame's start retires.
+    fn stats(&mut self) -> ProducerStats {
+        let f = begin(&mut self.scenes, &mut self.frame, &[]);
+        finish(self.d, f);
+        self.scenes.stats().producers
+    }
+
+    /// What `strand_rays` saw in `mode` over `cells` cells.
+    fn rays(&self, view: &RasterView, mode: u32, cells: [u32; 2]) -> Vec<strand_rays::Seen> {
+        let n = u64::from(cells[0] * cells[1]);
+        let seen = self
+            .d
+            .gpu_malloc::<strand_rays::Seen>(MemoryKind::Readback, n, "seen")
+            .unwrap();
+        let mut root = self
+            .d
+            .gpu_malloc::<strand_rays::Root>(MemoryKind::Upload, 1, "root")
+            .unwrap();
+        let light = Vec3::new(0.4, 0.8, 0.45).normalize();
+        root.as_mut_slice().unwrap()[0] = strand_rays::Root {
+            scene: view.scene,
+            view: view.view,
+            gbuffer: view.gbuffer,
+            seen: seen.gpu(),
+            mode,
+            entry: STRANDS.0,
+            width: cells[0],
+            height: cells[1],
+            grid_x: -1.6,
+            grid_z: 0.0,
+            grid_step: 3.2 / cells[0] as f32,
+            spread: 0.03,
+            light_x: light.x,
+            light_y: light.y,
+            light_z: light.z,
+            _pad: 0,
+        };
+        let render = self.d.queue(QueueKind::Render).unwrap();
+        let mut list = render.command_list().unwrap();
+        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::ACCEL_STRUCT);
+        list.dispatch(&self.probe, root.gpu(), [n.div_ceil(64) as u32, 1, 1]);
+        list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+        wait_on(self.d, render.submit(vec![list], &[]).unwrap());
+        seen.as_slice().unwrap().to_vec()
+    }
+}
+
+fn begin<'a>(scenes: &'a mut Scenes, frame: &mut u32, list: &'a [SceneId]) -> Frame<'a> {
+    let t = time(*frame);
+    *frame += 1;
+    scenes
+        .begin_frame(&FrameDesc {
+            time: t,
+            scenes: list,
+            low_latency: None,
+        })
+        .unwrap()
+}
+
+fn finish(d: &Device, f: Frame<'_>) {
+    wait_on(d, f.end(&[]).unwrap());
+}
+
+#[test]
+fn strand_raster_depth_matches_swept_sphere_and_tube_traces() {
+    if !traced(true) {
+        return;
+    }
+    let tubes = tube_device();
+    for d in [device(), &tubes] {
+        let swept = d.caps().lss;
+        let what = if swept { "swept spheres" } else { "tubes" };
+        let mut s = Strands::new(d);
+        let view = s.frame();
+        let seen = s.rays(&view, 0, EXTENT);
+        let raster = seen.iter().filter(|o| o.raster_t > 0.0).count();
+        let traced = seen.iter().filter(|o| o.traced_t > 0.0).count();
+        let both: Vec<_> = seen
+            .iter()
+            .filter(|o| o.raster_t > 0.0 && o.traced_t > 0.0)
+            .collect();
+        assert!(raster > 500, "{what}: the raster covers {raster} pixels");
+        // Tubes' facets move their silhouettes by up to a tenth of the radius.
+        let share = if swept { 0.95 } else { 0.85 };
+        assert!(
+            both.len() as f32 >= share * raster.max(traced) as f32,
+            "{what}: raster {raster}, traced {traced}, both {}",
+            both.len()
+        );
+        assert!(
+            both.iter()
+                .all(|o| o.valid == 1 && o.swept == u32::from(swept)),
+            "{what}: unresolved or misclassified hits"
+        );
+        let same: Vec<_> = both
+            .iter()
+            .filter(|o| o.raster_word == o.traced_word)
+            .collect();
+        // Where strands cross, a tube's facets can put the other strand in front.
+        let named = if swept { 0.98 } else { 0.95 };
+        assert!(
+            same.len() as f32 >= named * both.len() as f32,
+            "{what}: {} of {} pixels name the same strand",
+            same.len(),
+            both.len()
+        );
+        assert!(
+            same.iter()
+                .all(|o| { (STRAND_WORD..STRAND_WORD + STRAND_COUNT).contains(&o.raster_word) })
+        );
+        // Swept spheres meet the raster's resolve exactly. A tube's facets lie within a
+        // tenth of the radius of the swept surface, which grows along rays that graze it.
+        let slack = if swept { 0.0 } else { 0.12 * STRAND_RADIUS };
+        let compared: Vec<_> = same.iter().filter(|o| swept || o.facing > 0.5).collect();
+        let off = compared
+            .iter()
+            .filter(|o| (o.raster_t - o.traced_t).abs() > 1e-3 * o.traced_t + slack)
+            .count();
+        assert!(
+            off * 200 <= compared.len(),
+            "{what}: depth off on {off} of {} pixels",
+            compared.len()
+        );
+        let turned = same.iter().filter(|o| o.normal_dot < 0.95).count();
+        assert!(
+            turned * 50 <= same.len(),
+            "{what}: normals disagree on {turned} of {} pixels",
+            same.len()
+        );
+        let stats = s.stats();
+        assert_eq!(stats.segments, STRAND_COUNT * STRAND_SEGMENTS, "{what}");
+        assert_eq!(stats.dropped_segments, 0, "{what}");
+        assert_eq!(stats.refused, 0, "{what}");
+        assert_eq!(stats.built, STRAND_COUNT * STRAND_SEGMENTS, "{what}");
+    }
+    assert_clean();
+    assert_clean_on(&tubes);
+}
+
+/// The lit fraction of each shadow-grid cell as a gray display-encoded image.
+fn shadow_image(seen: &[strand_rays::Seen]) -> Image {
+    let pixels = seen
+        .iter()
+        .flat_map(|o| {
+            let g = (orr_color::srgb_encode(f64::from(o.lit)) * 255.0).round() as u8;
+            [g, g, g, 255]
+        })
+        .collect();
+    Image {
+        width: SHADOW_GRID[0],
+        height: SHADOW_GRID[1],
+        pixels: Pixels::Rgba8(pixels),
+    }
+}
+
+#[test]
+fn swept_sphere_shadows_match_tube_shadows() {
+    if !traced(true) || !gpu_suite::require(device().caps().lss, "linear swept spheres") {
+        return;
+    }
+    let tubes = tube_device();
+    let [swept, tube] = [device(), &tubes].map(|d| {
+        let mut s = Strands::new(d);
+        let view = s.frame();
+        s.rays(&view, 1, SHADOW_GRID)
+    });
+    let shaded = swept.iter().filter(|o| o.lit < 0.5).count();
+    assert!(shaded > 300, "{shaded} cells in shadow");
+    let e = flip(&shadow_image(&tube), &shadow_image(&swept));
+    assert!(e.mean <= 0.05, "FLIP {e:?}");
+    assert_clean();
+    assert_clean_on(&tubes);
 }

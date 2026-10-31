@@ -3,7 +3,7 @@
 //
 // A hit is any committed status other than none. Linear swept sphere hits commit with a
 // status that is neither triangle nor procedural, so `Hit.triangle` is false for them and
-// their cluster id is -1.
+// their cluster id is -1. Their primitive index is the segment's.
 module trace;
 
 import orr.abi;
@@ -106,8 +106,9 @@ public Hit trace_closest<A : IAnyHit>(Tlas tlas, RayDesc ray, uint mask, uint fl
     return closest(tlas, ray, mask, flags, any_hit, false, positions);
 }
 
-// As above, and the object-space corner positions of a triangle hit (zero on other hits
-// and on Metal). The BLAS must allow data access.
+// As above, and the object-space corner positions of a triangle hit, whose BLAS must allow
+// data access. On any other hit the first position is the object-space hit point and the
+// others are zero. All are zero on Metal.
 [ForceInline]
 public Hit trace_closest<A : IAnyHit>(Tlas tlas, RayDesc ray, uint mask, uint flags, A any_hit, out float3 positions[3])
 {
@@ -202,7 +203,7 @@ Hit closest<A : IAnyHit>(Tlas tlas, RayDesc ray, uint mask, uint flags, A any_hi
             q.CommitNonOpaqueTriangleHit();
     }
     Hit h = committed(q);
-    committed_positions(q, fetch && h.triangle, positions);
+    committed_positions(q, fetch, h, positions);
     return h;
 }
 
@@ -261,7 +262,7 @@ Hit translucent<H : ITranslucent>(Tlas tlas, RayDesc ray, uint mask, uint flags,
         }
     }
     Hit h = committed(q);
-    committed_positions(q, fetch && h.triangle, positions);
+    committed_positions(q, fetch, h, positions);
     float limit = h.hit ? h.t : ray.TMax;
     layers = 0;
     for (uint i = 0; i < TRANSLUCENT_BINS; i++)
@@ -386,8 +387,9 @@ void candidate_positions(inout RayQuery<RAY_FLAG_NONE> q, inout float3 p[3])
     }
 }
 
+// Triangle hits fetch their corners; other hits have none to fetch, and give their point.
 [ForceInline]
-void committed_positions(inout RayQuery<RAY_FLAG_NONE> q, bool fetch, out float3 p[3])
+void committed_positions(inout RayQuery<RAY_FLAG_NONE> q, bool fetch, Hit h, out float3 p[3])
 {
     p[0] = 0;
     p[1] = 0;
@@ -397,7 +399,9 @@ void committed_positions(inout RayQuery<RAY_FLAG_NONE> q, bool fetch, out float3
     case metal:
         break;
     default:
-        if (fetch)
+        if (fetch && h.triangle)
             p = q.CommittedGetIntersectionTriangleVertexPositions();
+        else if (fetch && h.hit)
+            p[0] = q.CommittedObjectRayOrigin() + h.t * q.CommittedObjectRayDirection();
     }
 }

@@ -157,8 +157,8 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     g.raster_error = hit.error;
     g.flags = (g.flags & ~GBUFFER_ORIGIN_MASK) | (hit_origin(m, hit.origin) << GBUFFER_ORIGIN_SHIFT);
     g.instance = vc.instance;
-    g.cluster = vc.cluster;
-    g.primitive = visibility_triangle(w);
+    g.cluster = hit.input.cluster;
+    g.primitive = hit.input.primitive;
     g.material = vc.material;
     ExposureState* exposure = v.exposure + v.exposure_slot;
     g.bsdf.emission = apply_hdr_ceiling(g.bsdf.emission * exposure.pre_exposure);
@@ -179,7 +179,12 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     bool deformed = false;
     Corners c = (Corners)0;
     SkinnedGpu k;
-    if (visible_producer(s, vc, entry))
+    bool producer = visible_producer(s, vc, entry);
+    if (producer && s.producers[entry].strands != 0)
+    {
+        object += strand_motion(s.batches[entry], hit.input.cluster, hit.input.barycentrics.x);
+    }
+    else if (producer)
     {
         ProducerBatch pb = s.batches[entry];
         deformed = pb.previous != nullptr;
