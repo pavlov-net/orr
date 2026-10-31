@@ -30,6 +30,14 @@ public void orthonormal_basis(float3 n, out float3 t, out float3 b)
     b = float3(c, s + n.y * n.y * a, -n.y);
 }
 
+// A unit vector at right angles to the unit vector `e`.
+public float3 perpendicular(float3 e)
+{
+    float3 t, b;
+    orthonormal_basis(e, t, b);
+    return t;
+}
+
 // `v` in the frame (t, b, n), and back.
 public float3 to_local(float3 v, float3 t, float3 b, float3 n)
 {

@@ -246,8 +246,8 @@ pub(crate) struct Tables {
     /// Tessellated entries' patch batches, zero for others.
     pub patches: Allocation<ProducerBatch>,
     pub tess_state: Allocation<TessStateGpu>,
-    /// Cluster and vertex count of each producer batch.
-    pub producer_counts: Allocation<[u32; 2]>,
+    /// Cluster, vertex and segment count of each producer batch, and a spare word.
+    pub producer_counts: Allocation<[u32; 4]>,
     pub producer_state: Allocation<ProducerStateGpu>,
     pub sky_stats: Allocation<SkyStats>,
     pub skinned: Allocation<SkinnedGpu>,
@@ -1097,6 +1097,7 @@ impl<'f> SceneWriter<'f> {
         let producer = ProducerDesc {
             max_clusters: d.max_clusters,
             max_vertices: d.max_vertices,
+            max_segments: 0,
             update: ProducerUpdate::EveryFrame,
             topologies: &[],
             tessellated: true,
@@ -1144,7 +1145,14 @@ impl<'f> SceneWriter<'f> {
                 None,
             ),
             Some(d) => {
-                let b = producer::build(self.device, d, counts, self.patterns, subd)?;
+                let b = producer::build(
+                    self.device,
+                    d,
+                    counts,
+                    t.batches.gpu().offset(i),
+                    self.patterns,
+                    subd,
+                )?;
                 let words = self.upload(b.static_at, (b.static_bytes.len() / 4) as u32)?;
                 bytemuck::cast_slice_mut(words).copy_from_slice(&b.static_bytes);
                 let entry = EmissiveGpu {
@@ -1161,10 +1169,10 @@ impl<'f> SceneWriter<'f> {
         self.write(t.patches.gpu().offset(i), patches)?;
         self.write(t.tess_state.gpu().offset(i), TessStateGpu::zeroed())?;
         if emit_counts != counts {
-            self.push(Record::fill(self.next_seq(), emit_counts.address().0, 2, 0));
+            self.push(Record::fill(self.next_seq(), emit_counts.address().0, 4, 0));
         }
         self.write(t.emissive.gpu().offset(i), entry)?;
-        self.push(Record::fill(self.next_seq(), counts.address().0, 2, 0));
+        self.push(Record::fill(self.next_seq(), counts.address().0, 4, 0));
         // The new entry has built nothing; its PTLAS instance follows from the record.
         let state = t.producer_state.gpu().offset(i);
         let blas = std::mem::offset_of!(ProducerStateGpu, blas) as u64;

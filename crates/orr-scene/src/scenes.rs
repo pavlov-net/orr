@@ -1151,7 +1151,7 @@ impl<'a> Frame<'a> {
             for p in cpu.producers.iter().flatten() {
                 if p.update == ProducerUpdate::EveryFrame {
                     let at = p.emit_counts.address().0;
-                    records.push(Record::fill(core.next_seq(), at, 2, 0));
+                    records.push(Record::fill(core.next_seq(), at, 4, 0));
                 }
             }
             let mut rebase = false;
@@ -2019,7 +2019,7 @@ fn record_producers(
             .enumerate()
             .filter_map(|(i, p)| {
                 p.as_ref()
-                    .map(|p| (i as u32, p.max_clusters, p.max_vertices, p.tess.is_some()))
+                    .map(|p| (i as u32, p.capacity(), p.tess.is_some()))
             })
             .collect();
         if cpu.producer_readback.is_none() {
