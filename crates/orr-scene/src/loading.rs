@@ -1,10 +1,12 @@
 //! The loading side: one loading thread that issues archive reads and submits the loading
 //! and copy queues, and jobs that run on threads the consumer lends.
 
-pub(crate) mod io;
-
 use std::collections::VecDeque;
+use std::fs::File;
+use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, Weak};
+
+use orr_io::{AlignedBuf, ReadFile, Ring, Wake};
 
 use orr_gpu::Device;
 use orr_pack::{Archive, Blob};
@@ -18,7 +20,7 @@ pub(crate) type Job = Box<dyn FnOnce() + Send>;
 /// Messages to the loading thread.
 pub(crate) enum Msg {
     Mount(Arc<MountTask>, PackSource),
-    Read(io::Read),
+    Read(orr_io::Read),
     /// Every job and read of the mount has finished.
     Done(Arc<MountTask>),
     /// Streamed units to read and place.
@@ -40,7 +42,7 @@ pub struct Loading {
     job_ready: Condvar,
     signal: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     inbox: Mutex<VecDeque<Msg>>,
-    wake: io::Wake,
+    wake: Wake,
     batches: Mutex<Vec<Batch>>,
     streams: Mutex<Vec<StreamBatch>>,
     pub(crate) positioned: bool,
@@ -56,7 +58,7 @@ impl Loading {
             job_ready: Condvar::new(),
             signal: Mutex::new(None),
             inbox: Mutex::new(VecDeque::new()),
-            wake: io::Wake::new(),
+            wake: Wake::default(),
             batches: Mutex::new(Vec::new()),
             streams: Mutex::new(Vec::new()),
             positioned,
@@ -64,9 +66,10 @@ impl Loading {
     }
 
     /// Runs jobs on the calling thread until [`Loading::stop_workers`]: archive decodes and
-    /// placement, host image copies, positioned reads where IoRing is missing, and jobs other
-    /// crates queue with [`Loading::spawn`] (pipeline compiles, hot reload). Call it from
-    /// as many threads as loading should use, with the priority and affinity you choose.
+    /// placement, host image copies, positioned reads where the system's completion ring is
+    /// missing, and jobs other crates queue with [`Loading::spawn`] (pipeline compiles, hot
+    /// reload). Call it from as many threads as loading should use, with the priority and
+    /// affinity you choose.
     pub fn run_worker(&self) {
         let mut jobs = self.jobs.lock().unwrap();
         while !jobs.stopped {
@@ -156,12 +159,29 @@ pub(crate) fn landed(
     })
 }
 
+/// The handles of one mounted archive file, opened together at mount so that a file renamed
+/// over the path later is never read through them.
+pub(crate) struct ArchiveFile {
+    /// For `orr_pack::Archive`, taken once.
+    pub archive: Mutex<Option<File>>,
+    pub reads: Arc<ReadFile>,
+}
+
+impl ArchiveFile {
+    pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            archive: Mutex::new(Some(orr_io::open_shared(path)?)),
+            reads: Arc::new(ReadFile::open(path)?),
+        })
+    }
+}
+
 /// Where a pack's blobs are read from: the archive, its file handles when it is a file,
 /// and whether reads go through the ring.
 pub(crate) struct BlobSource {
     pub loading: Weak<Loading>,
     pub archive: Arc<Archive>,
-    pub file: Option<Arc<io::ArchiveFile>>,
+    pub file: Option<Arc<ArchiveFile>>,
     pub ring: bool,
 }
 
@@ -180,7 +200,7 @@ pub(crate) fn read_stored(src: &BlobSource, b: Blob, then: Stored) {
     }
     let range = src.archive.stored_range(&b, None);
     let file = Arc::clone(src.file.as_ref().expect("file archive"));
-    let check = move |buf: &io::AlignedBuf, n: usize, then: Stored| {
+    let check = move |buf: &AlignedBuf, n: usize, then: Stored| {
         let end = range.skip as usize + b.stored_len as usize;
         if n < end {
             then(Err(orr_pack::Error::Truncated {
@@ -194,8 +214,8 @@ pub(crate) fn read_stored(src: &BlobSource, b: Blob, then: Stored) {
     };
     if src.ring {
         let weak = Arc::downgrade(&loading);
-        loading.send(Msg::Read(io::Read {
-            file,
+        loading.send(Msg::Read(orr_io::Read {
+            file: Arc::clone(&file.reads),
             offset: range.offset,
             len: range.len as usize,
             done: Box::new(move |r| match (r, weak.upgrade()) {
@@ -206,8 +226,8 @@ pub(crate) fn read_stored(src: &BlobSource, b: Blob, then: Stored) {
         }));
     } else {
         loading.spawn(move || {
-            let mut buf = io::AlignedBuf::new(range.len as usize);
-            match io::read_positioned(&file, range.offset, &mut buf) {
+            let mut buf = AlignedBuf::new(range.len as usize);
+            match file.reads.read(range.offset, &mut buf) {
                 Ok(n) => check(&buf, n, then),
                 Err(e) => then(Err(Error::from(e))),
             }
@@ -239,7 +259,7 @@ pub(crate) fn thread(loading: Arc<Loading>, device: Device) {
     let mut ring = if loading.positioned {
         None
     } else {
-        io::Ring::new()
+        Ring::native()
     };
     loop {
         let msgs: Vec<Msg> = loading.inbox.lock().unwrap().drain(..).collect();
@@ -261,7 +281,7 @@ pub(crate) fn thread(loading: Arc<Loading>, device: Device) {
             r.pump();
         }
         if idle && loading.inbox.lock().unwrap().is_empty() {
-            io::wait(&loading.wake, ring.as_ref());
+            loading.wake.wait(ring.as_ref());
         }
     }
 }

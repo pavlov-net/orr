@@ -30,8 +30,8 @@ use crate::raster::{self, RasterPipelines, TargetSizes, ViewTargets};
 #[cfg(feature = "hot-reload")]
 use crate::reload::Reloader;
 use crate::residency::ResidencyStats;
-use crate::scene::{GroupWriter, ModelId, Scene, SceneDesc, SceneId, SceneWriter};
-use crate::shaders::{emissive, world as world_kernel};
+use crate::scene::{GroupWriter, ModelCpu, ModelId, Scene, SceneDesc, SceneId, SceneWriter};
+use crate::shaders::{animation, emissive, world as world_kernel};
 use crate::time::FrameTime;
 use crate::upload::{Record, scatter};
 use crate::view::{RasterView, ViewDesc, ViewHistory, ViewHistoryId, view_constants};
@@ -124,7 +124,8 @@ pub struct RendererDesc {
     pub kernels: &'static KernelSet,
     /// World cells are 2^cell_log2 m on a side.
     pub cell_log2: u32,
-    /// Archive reads are positioned reads on workers even where IoRing is available.
+    /// Archive reads are positioned reads on workers even where the system's completion
+    /// ring (IoRing, io_uring) is available.
     pub positioned_reads: bool,
     /// Raster LOD: the largest cluster error drawn, in render pixels.
     pub raster_error_pixels: f32,
@@ -240,6 +241,8 @@ struct Core {
     materials: MaterialTable,
     /// Emission by `ModelId`.
     models: Vec<Option<ModelEmission>>,
+    /// Sections and animated parts by `ModelId`.
+    model_cpu: Vec<ModelCpu>,
     /// Records outside any scene: materials, view-history initialisation.
     global: Mutex<Vec<Record>>,
     scenes: Vec<Option<Scene>>,
@@ -352,6 +355,7 @@ impl Scenes {
                 raster,
                 materials: MaterialTable::new(device, desc.budgets.materials)?,
                 models: Vec::new(),
+                model_cpu: Vec::new(),
                 global: Mutex::new(Vec::new()),
                 scenes: Vec::new(),
                 histories: Vec::new(),
@@ -632,6 +636,7 @@ impl Scenes {
             records: core.global.get_mut().unwrap(),
             materials: &core.materials,
             emission: &mut core.models,
+            model_cpu: &mut core.model_cpu,
         };
         let mut loading_points = Vec::new();
         for batch in self.loading.take_batches(&self.device) {
@@ -670,6 +675,7 @@ impl Scenes {
             loading: loading_points,
             reloads,
             traced: Vec::new(),
+            masks_refused: 0,
         })
     }
 }
@@ -708,6 +714,8 @@ pub struct Frame<'a> {
     reloads: Vec<ReloadReport>,
     /// Scenes whose PTLAS this frame builds.
     traced: Vec<SceneId>,
+    /// Section masks this frame could not build.
+    masks_refused: u32,
 }
 
 impl<'a> Frame<'a> {
@@ -755,6 +763,7 @@ impl<'a> Frame<'a> {
             frame: self.id,
             cell_log2: self.core.cell_log2,
             models: &self.core.models,
+            model_cpu: &self.core.model_cpu,
         })
     }
 
@@ -803,7 +812,7 @@ impl<'a> Frame<'a> {
         self.marker(LatencyMarker::RenderSubmitStart);
         self.updated = true;
         let device = self.device;
-        let core = &*self.core;
+        let core = &mut *self.core;
         let window = &core.windows[self.window];
         let mut list = self.list.take().expect("frame list");
         let mut records = std::mem::take(&mut *core.global.lock().unwrap());
@@ -811,10 +820,12 @@ impl<'a> Frame<'a> {
         let mut rebased = Vec::new();
         let mut roots = Vec::new();
         let mut traced = Vec::new();
+        let mut masks = Vec::new();
         for &id in &self.listed {
             let scene = core.scene(id)?;
             let cpu = &mut *scene.cpu.lock().unwrap();
             records.append(&mut cpu.records);
+            masks.extend(std::mem::take(&mut cpu.masks));
             let counts = scene.tables.producer_counts.gpu;
             for (i, p) in cpu.producers.iter().enumerate() {
                 if p.as_ref()
@@ -901,6 +912,19 @@ impl<'a> Frame<'a> {
             roots.push((id, t.root.gpu, t.batches.gpu, cpu.focus, scene.desc));
         }
 
+        if !masks.is_empty() {
+            list.begin_pass("masks", false);
+            self.masks_refused += core.mounts.build_masks(
+                device,
+                window,
+                &mut list,
+                masks,
+                self.id,
+                &core.seq,
+                &mut records,
+            )?;
+            list.end_pass();
+        }
         list.begin_pass("upload", true);
         for &(dst, src, bytes) in &copies {
             list.copy(dst, src, bytes);
@@ -947,6 +971,37 @@ impl<'a> Frame<'a> {
             compute(&mut sc);
             list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
         }
+        list.begin_pass("animate", false);
+        for &(id, root, _, focus, _) in &roots {
+            let slots = core.scene(id)?.cpu.lock().unwrap().ptlas.high_water;
+            if slots == 0 {
+                continue;
+            }
+            let (focus_cell, focus_offset) = match focus {
+                Some((f, _)) => {
+                    let w = WorldPos::new(f, core.cell_log2);
+                    (w.cell.extend(1).to_array(), w.offset.extend(0.0).to_array())
+                }
+                None => ([0; 4], [0.0; 4]),
+            };
+            let r = animation::AnimationRoot {
+                scene: root,
+                _pad0: 0,
+                focus_cell,
+                focus_offset,
+                slots,
+                _pad1: 0,
+                _pad2: 0,
+            };
+            let ptr = window.put_root(device, &r)?;
+            list.dispatch(
+                self.pipelines.get(own.animate),
+                ptr,
+                [slots.div_ceil(64), 1, 1],
+            );
+        }
+        list.end_pass();
+        list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         if !traced.is_empty() {
             let mut scratch = core.ptlas_scratch.lock().unwrap();
             let need = traced
@@ -1148,7 +1203,10 @@ impl<'a> Frame<'a> {
             scatter_words: self.scatter.words,
             scatter_dispatches: self.scatter.dispatches,
             scenes_updated: self.listed.len() as u32,
-            rt: RtStats::default(),
+            rt: RtStats {
+                masks_refused: self.masks_refused,
+                ..RtStats::default()
+            },
         };
         self.core.in_flight.push_back(InFlight {
             id: self.id,

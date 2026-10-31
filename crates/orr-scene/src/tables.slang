@@ -47,8 +47,11 @@ public static const uint RT_WRITTEN = 1;    // its PTLAS instance holds a BLAS
 public static const uint RT_GLOBAL = 2;     // written into the global partition
 public static const uint RT_IN_RANGE = 4;   // inside rt_range at the last decision
 public static const uint RT_SEEN = 8;       // the PTLAS kernel has run over the slot
+public static const uint RT_ANIMATED = 16;  // inside animation_range: raster takes the pose
+public static const uint RT_WAS_ANIMATED = 32; // RT_ANIMATED of the previous frame
 
-// Per-slot state written only by the GPU; zeroed when a slot is handed out. The `rt_`
+// Per-slot state written only by the GPU. Handing out a slot zeroes every field before
+// `part_run`; a part run outlives its slot until the PTLAS kernels release it. The `rt_`
 // fields describe what the slot's PTLAS instance holds.
 public struct SlotStateGpu
 {
@@ -63,6 +66,8 @@ public struct SlotStateGpu
     public uint2 rt_key;            // hash of the transform, model and class it was written with
     public uint rt_age;             // frames its pending PTLAS work has waited
     public uint _pad;
+    public uint part_run;           // first part instance of the run it holds
+    public uint part_count;         // part instances in the run; 0: none
 }
 
 // A transform group: `count` transforms relative to the group's anchor. A null `current`
@@ -97,13 +102,34 @@ public struct ClusterRef
     public uint mesh_cluster;      // mesh cluster index
 }
 
-// One cut of a mesh that ray tracing can use: the cluster BLAS over its clusters and the
-// largest error among them.
+// One cut of a mesh that ray tracing can use: the cluster BLAS over its clusters, the
+// largest error among them, and for a cut with animated part clusters the BLAS of its body
+// (the clusters without CLUSTER_ANIMATED_PART) and of each animated part.
 public struct RtCutGpu
 {
-    public uint64_t blas;
+    public uint64_t blas;          // every cluster at rest pose
     public float error;            // m, mesh space
     public uint clusters;
+    public uint64_t body;          // `blas` when the cut has no animated part clusters; 0 when its body is empty
+    public uint64_t* parts;        // per animated part, 0 where it has no clusters; null without animated part clusters
+}
+
+// An animated part: its rest bounds in mesh space and the sections its clusters use.
+public struct PartGpu
+{
+    public float3 bounds_min;
+    public uint sections;          // bit per section below 32
+    public float3 bounds_max;
+    public uint _pad;
+}
+
+// The BLAS of a mesh with some sections hidden: `blas[cut]` over every remaining cluster,
+// `blas[rt_cut_count + cut]` over the remaining body clusters; 0 where none remain.
+public struct MaskGpu
+{
+    public uint mask;              // section bits, below the mesh's section count and 16
+    public uint _pad;
+    public uint64_t* blas;
 }
 
 // A mesh made resident from a mounted pack. Page and node page addresses are 0 until
@@ -124,8 +150,14 @@ public struct MeshGpu
     public float merge_error;      // DAG mode: the error from which the merged stage serves; infinity without one
     public uint cluster_base;      // cluster id of mesh cluster 0
     public uint rt_cut_count;      // 0: not traced
-    public uint _pad;
+    public uint part_count;        // transforms per pose block: the mesh's parts, at least 1
     public RtCutGpu* rt_cuts;      // finest first
+    public PartGpu* parts;         // per animated part
+    public MaskGpu* masks;         // section-mask BLAS, `mask_count` entries
+    public uint first_animated;    // the first animated part; animated parts follow it
+    public uint animated_parts;    // 0: no part is animated
+    public uint mask_count;
+    public uint animated_sections; // the sections of every animated part, bit per section below 32
 }
 
 // A model made resident from a mounted pack: its mesh and the material of each section.

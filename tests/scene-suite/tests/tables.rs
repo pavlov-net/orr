@@ -127,20 +127,18 @@ fn instance_and_material_tables_read_back_as_written() {
         },
         InstanceFlags::CAST_ONLY,
     );
-    for v in w.copy_variants(b, 10, 20).unwrap() {
-        *v = CopyVariant {
-            pose: 1,
-            material_set: 2,
-            section_mask: 0xf0f0,
-        };
-    }
-    for v in w.copy_variants(b, 25, 10).unwrap() {
-        *v = CopyVariant {
-            pose: 7,
-            material_set: 0,
-            section_mask: 1,
-        };
-    }
+    let first = CopyVariant {
+        pose: 1,
+        material_set: 2,
+        section_mask: 0xf0f0,
+    };
+    w.copy_variants(b, 10, &[first; 20]).unwrap();
+    let second = CopyVariant {
+        pose: 7,
+        material_set: 0,
+        section_mask: 1,
+    };
+    w.copy_variants(b, 25, &[second; 10]).unwrap();
     drop(w);
     let mut root = GpuPtr::NULL;
     f.update_scenes(&mut |c| root = c.root).unwrap();

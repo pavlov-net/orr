@@ -61,9 +61,10 @@ pub use scenes::{
     Budgets, ConsumerMarker, Frame, FrameDesc, FrameStats, RendererDesc, SceneCompute, Scenes,
 };
 pub use shaders::types::{
-    ClusterRef, ClusterWork, EmissiveGpu, GBufferGpu, GroupGpu, InstanceGpu, LightGpu, MaterialGpu,
-    MeshGpu, MeshLevel, ModelGpu, ProducerBatch, ProducerClusterGpu, ProducerGpu, RasterGpu,
-    RasterRoot, RtCutGpu, SceneRoot, SkyStats, SlotStateGpu, TopologyGpu, VisibleCluster,
+    ClusterRef, ClusterWork, EmissiveGpu, GBufferGpu, GroupGpu, InstanceGpu, LightGpu, MaskGpu,
+    MaterialGpu, MeshGpu, MeshLevel, ModelGpu, PartGpu, ProducerBatch, ProducerClusterGpu,
+    ProducerGpu, RasterGpu, RasterRoot, RtCutGpu, SceneRoot, SkyStats, SlotStateGpu, TopologyGpu,
+    VisibleCluster,
 };
 pub use time::FrameTime;
 pub use view::{

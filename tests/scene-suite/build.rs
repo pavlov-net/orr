@@ -9,39 +9,15 @@ use std::path::PathBuf;
 
 use orr_shaders::build::{Build, LinkPoint};
 
-const SCENE_TYPES: &[&str] = &[
-    "SceneRoot",
-    "InstanceGpu",
-    "SlotStateGpu",
-    "GroupGpu",
-    "ModelGpu",
-    "MeshGpu",
-    "MeshLevel",
-    "ClusterRef",
-    "RtCutGpu",
-    "MaterialGpu",
-    "LightGpu",
-    "EmissiveGpu",
-    "ProducerGpu",
-    "ProducerBatch",
-    "ProducerClusterGpu",
-    "TopologyGpu",
-    "SkyStats",
-    "ViewConstants",
-    "ExposureState",
-    "GBufferGpu",
-    "VisibleCluster",
-];
-
 fn main() {
     let dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let roots = env::var("DEP_ORR_SCENE_SHADER_DIRS").expect("orr-scene shader roots");
-    let result = Build::new().and_then(|mut b| {
-        b = b.kernels(dir.join("src")).roots(&roots);
-        for t in SCENE_TYPES {
-            b = b.extern_type(t, &format!("::orr_scene::{t}"));
-        }
-        b.compile()
+    let types = env::var("DEP_ORR_SCENE_TYPES").expect("orr-scene type map");
+    let result = Build::new().and_then(|b| {
+        b.kernels(dir.join("src"))
+            .roots(&roots)
+            .types(&types)
+            .compile()
     });
     let own_points = match result {
         Ok(out) => out.link_points,
@@ -66,16 +42,13 @@ fn main() {
 
     let points = env::var("DEP_ORR_SCENE_LINK_POINTS").expect("orr-scene link points");
     let surface = |name: &str| dir.join(format!("surfaces/{name}.slang"));
-    let result = Build::new().and_then(|mut b| {
-        b = b
-            .roots(&roots)
+    let result = Build::new().and_then(|b| {
+        b.roots(&roots)
             .include(dir.join("src"))
             .link_points(&points)
-            .link_points(&own_points.display().to_string());
-        for t in SCENE_TYPES {
-            b = b.extern_type(t, &format!("::orr_scene::{t}"));
-        }
-        b.out_dir(out.join("linked"))
+            .link_points(&own_points.display().to_string())
+            .types(&types)
+            .out_dir(out.join("linked"))
             .link(
                 LinkPoint::Surface,
                 "parallax",

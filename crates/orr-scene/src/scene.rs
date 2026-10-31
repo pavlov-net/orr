@@ -1,5 +1,6 @@
 //! A scene's GPU tables, its CPU bookkeeping and the writer consumers fill it through.
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -136,8 +137,12 @@ impl std::ops::BitOr for InstanceFlags {
     }
 }
 
-/// Where a copy's part poses live: `group[(index + copy * stride + pose_variant) * parts
-/// + part]`, with `copy` the copy's transform index in its group.
+/// Where a copy's part poses live:
+/// `group[(index + copy * stride + pose_variant) * parts + part]`, with `copy` the copy's
+/// transform index in its group and `parts` the mesh's part count. Each entry is the part's
+/// mesh-space transform from its rest pose; the pose group's anchor is not used. Only
+/// clusters of animated parts take their pose. An all-zero entry, or one past the group's
+/// count, hides its part.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pose {
     pub group: TransformGroupId,
@@ -170,7 +175,8 @@ pub struct InstancesDesc {
     pub flags: InstanceFlags,
     /// m from the scene focus within which the copies are traced.
     pub rt_range: f32,
-    /// m from the scene focus within which the copies take their pose.
+    /// m from the scene focus within which the copies take their pose; beyond it they take
+    /// the rest pose in raster and ray tracing.
     pub animation_range: f32,
     /// Never read by orr.
     pub user_tag: u32,
@@ -225,8 +231,19 @@ impl Group {
     }
 }
 
+/// What writers know of a resident model.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ModelCpu {
+    pub sections: u32,
+    pub animated_parts: u32,
+}
+
 pub(crate) struct SceneCpu {
     pub slots: RangeAllocator,
+    /// The model of each slot handed out.
+    pub slot_models: Vec<u32>,
+    /// Section masks copies name since the last frame: their BLAS build if missing.
+    pub masks: HashSet<(ModelId, u16)>,
     /// Ranges removed in a frame, freed once that frame has completed.
     pub removed: Vec<(u64, InstanceRange)>,
     /// Instance entries of the emissive list, counted after the producer entries.
@@ -309,6 +326,8 @@ impl Scene {
             tables,
             cpu: Mutex::new(SceneCpu {
                 slots: RangeAllocator::new(desc.instance_capacity),
+                slot_models: vec![0; desc.instance_capacity as usize],
+                masks: HashSet::new(),
                 removed: Vec::new(),
                 emissive: RangeAllocator::new(desc.emissive_capacity),
                 emissive_runs: Runs::default(),
@@ -344,6 +363,8 @@ pub struct SceneWriter<'f> {
     pub(crate) cell_log2: u32,
     /// Emission by `ModelId`.
     pub(crate) models: &'f [Option<ModelEmission>],
+    /// Sections and animated parts by `ModelId`.
+    pub(crate) model_cpu: &'f [ModelCpu],
 }
 
 impl Drop for SceneWriter<'_> {
@@ -493,7 +514,8 @@ impl<'f> SceneWriter<'f> {
     }
 
     /// `desc.copies` new instance slots, and an emissive list entry per copy for each
-    /// EMISSIVE span of the model.
+    /// EMISSIVE span of the model. With a pose, each copy's PTLAS partition keeps room for
+    /// its part run.
     pub fn add_instances(&mut self, desc: &InstancesDesc) -> Result<InstanceRange> {
         let emission = self
             .models
@@ -531,7 +553,13 @@ impl<'f> SceneWriter<'f> {
                     Some(entry)
                 }
             };
-            let partitions = cpu.ptlas.place(first, desc.copies, cell);
+            let parts = self
+                .model_cpu
+                .get(desc.model.0 as usize)
+                .map_or(0, |m| m.animated_parts);
+            let cost = 1 + if desc.pose.is_some() { parts } else { 0 };
+            cpu.slot_models[first as usize..(first + desc.copies) as usize].fill(desc.model.0);
+            let partitions = cpu.ptlas.place(first, desc.copies, cell, cost);
             (first, entry, partitions, cpu.ptlas.slot_table.gpu)
         };
         self.upload(table.offset(u64::from(first)), desc.copies)?
@@ -592,6 +620,7 @@ impl<'f> SceneWriter<'f> {
                 variant: 0,
             };
         }
+        // The fields from `part_run` on describe a run the PTLAS kernels still release.
         let state = self
             .scene
             .tables
@@ -600,8 +629,16 @@ impl<'f> SceneWriter<'f> {
             .offset(u64::from(first))
             .address()
             .0;
-        let n = desc.copies * words(size_of::<SlotStateGpu>());
-        self.push(Record::fill(self.next_seq(), state, n, 0));
+        let seq = self.next_seq();
+        for word in 0..words(std::mem::offset_of!(SlotStateGpu, part_run)) {
+            self.push(Record {
+                seq,
+                dst: state + 4 * u64::from(word),
+                count: desc.copies,
+                stride: words(size_of::<SlotStateGpu>()),
+                op: Op::Fill(0),
+            });
+        }
         Ok(range)
     }
 
@@ -621,19 +658,33 @@ impl<'f> SceneWriter<'f> {
         });
     }
 
-    /// The variant words of copies `first..first + count` of `range`.
+    /// Sets the variant words of copies `first..` of `range`. Ray tracing hides a copy's
+    /// masked sections through BLAS built per (model, cut, mask) the first frame a copy
+    /// names the mask; a mask hides an animated part's instance only when it covers every
+    /// section of the part.
     pub fn copy_variants(
         &mut self,
         range: InstanceRange,
         first: u32,
-        count: u32,
-    ) -> Result<&'f mut [CopyVariant]> {
+        variants: &[CopyVariant],
+    ) -> Result<()> {
+        let count = variants.len() as u32;
         assert!(
             first + count <= range.count,
             "variants {first}+{count} outside {range:?}"
         );
         let (src, out) = self.window.slice::<CopyVariant>(self.device, count)?;
-        self.push(Record {
+        out.copy_from_slice(variants);
+        let cpu = &mut *self.scene.cpu.lock().unwrap();
+        let slot = (range.first + first) as usize;
+        for (v, &model) in variants.iter().zip(&cpu.slot_models[slot..]) {
+            let sections = self.model_cpu.get(model as usize).map_or(0, |m| m.sections);
+            let mask = u32::from(v.section_mask) & ((1 << sections.min(16)) - 1);
+            if mask != 0 {
+                cpu.masks.insert((ModelId(model), mask as u16));
+            }
+        }
+        cpu.records.push(Record {
             seq: self.next_seq(),
             dst: self.instance_word(
                 range.first + first,
@@ -643,7 +694,7 @@ impl<'f> SceneWriter<'f> {
             stride: words(size_of::<InstanceGpu>()),
             op: Op::Copy(src.address().0),
         });
-        Ok(out)
+        Ok(())
     }
 
     /// Entries `first..first + count` of the scene's material-set table.
