@@ -118,6 +118,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         patches: 8,
         patch_size: TILE / 8.0,
         corner: [-TILE / 2.0; 2],
+        hole: None,
     };
     let grass_field = Grass {
         cells: 128,

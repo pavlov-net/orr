@@ -6,6 +6,9 @@
 #[path = "../cluster-rt.rs"]
 mod cluster_rt;
 #[allow(dead_code)]
+#[path = "../dense-vegetation.rs"]
+mod dense_vegetation;
+#[allow(dead_code)]
 #[path = "../gpu-basics.rs"]
 mod gpu_basics;
 #[allow(dead_code)]
@@ -22,6 +25,9 @@ use std::path::Path;
 
 use examples::{Capture, Options, assert_clean};
 use orr_scene::testing::{Image, Pixels, Tolerance, check};
+
+/// A smaller forest than the bench's, so the debug build renders it in reasonable time.
+const DENSE_VEGETATION: [&str; 5] = ["--synthetic", "--trees", "2000", "--grass-density", "50"];
 
 fn compare(name: &str, c: Capture) {
     let image = Image {
@@ -55,5 +61,8 @@ fn examples_match_their_references() {
     compare("rigid-parts", rigid);
     let field = producer_field::run(&Options::headless(120, &[])).expect("headless capture");
     compare("producer-field", field);
+    let forest = dense_vegetation::capture(&Options::headless(120, &DENSE_VEGETATION))
+        .expect("headless capture");
+    compare("dense-vegetation", forest);
     assert_clean();
 }

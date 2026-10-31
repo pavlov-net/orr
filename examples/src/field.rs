@@ -4,7 +4,7 @@
 //! entry and a kernel (`shaders/terrain.slang`, `grass.slang`, `slab.slang`) the consumer
 //! records in scene compute.
 
-use orr::orr_gpu::{Allocation, Device, MemoryKind};
+use orr::orr_gpu::{Allocation, Device, GpuPtr, MemoryKind};
 use orr::{
     ClusterTopology, MaterialId, Opacity, PipelineId, ProducerDesc, ProducerId, ProducerUpdate,
     SceneCompute, TransformGroupId,
@@ -87,6 +87,11 @@ impl Heights {
         })
     }
 
+    /// The samples on the GPU.
+    pub fn samples(&self) -> GpuPtr<f32> {
+        self.samples.gpu
+    }
+
     /// The height at (x, z), bilinear like `field.slang`'s `height_at`.
     pub fn at(&self, x: f32, z: f32) -> f32 {
         let last = (self.side - 1) as f32;
@@ -105,11 +110,13 @@ impl Heights {
 }
 
 /// The terrain's static entry over `transform`: `patches` x `patches` grid patches of
-/// `patch_size` m from `corner`.
+/// `patch_size` m from `corner`, leaving out the patches inside `hole`, a square of a side
+/// from its first corner that another entry covers.
 pub struct Terrain {
     pub patches: u32,
     pub patch_size: f32,
     pub corner: [f32; 2],
+    pub hole: Option<([f32; 2], f32)>,
 }
 
 impl Terrain {
@@ -152,8 +159,9 @@ impl Terrain {
                 patch_size: self.patch_size,
                 corner_x: self.corner[0],
                 corner_z: self.corner[1],
-                _pad0: 0,
-                _pad1: 0,
+                hole_x: self.hole.map_or(0.0, |h| h.0[0]),
+                hole_z: self.hole.map_or(0.0, |h| h.0[1]),
+                hole_size: self.hole.map_or(0.0, |h| h.1),
             })
             .expect("terrain root");
         let groups = (self.patches * self.patches).div_ceil(64);

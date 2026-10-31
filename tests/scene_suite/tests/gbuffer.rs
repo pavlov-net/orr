@@ -1322,7 +1322,14 @@ fn each_gbuffer_channel_matches_its_reference() {
         ),
         (
             "extended",
-            Box::new(|i| [byte(x[i][2], 0), byte(x[i][2], 8), byte(x[i][3], 8)]),
+            // The target holds data only where the pixel's flags say so.
+            Box::new(|i| {
+                if (g.a[i][3] >> 24) & EXTENDED == 0 {
+                    [0.0; 3]
+                } else {
+                    [byte(x[i][2], 0), byte(x[i][2], 8), byte(x[i][3], 8)]
+                }
+            }),
         ),
     ];
     for (name, f) in &channels {

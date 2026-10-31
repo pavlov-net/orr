@@ -1,6 +1,7 @@
 // A heightfield tile as flat-grid patches: one thread per patch allocates its 9 x 9
 // vertices, places them on the height raster with their normals and uv, and emits the
-// patch as the grid topology. The patch index is the cluster's user word.
+// patch as the grid topology. Patches inside the hole, a square another entry covers, emit
+// nothing. The patch index is the cluster's user word.
 #include "orr/root.h"
 import field;
 import producer;
@@ -19,8 +20,9 @@ struct Root
     float patch_size;    // m
     float corner_x;      // the tile's first corner, entry space
     float corner_z;
-    uint _pad0;
-    uint64_t _pad1;
+    float hole_x;        // the hole's first corner, entry space
+    float hole_z;
+    float hole_size;     // m; 0 for none
 }
 ORR_ROOT(Root);
 
@@ -33,11 +35,14 @@ void main(uint3 id: SV_DispatchThreadID)
         return;
     ProducerBatch b = root.scene.batches[root.producer];
     Heights heights = { root.heights, root.side, root.spacing, root.origin_x, root.origin_z };
+    float2 corner = float2(root.corner_x, root.corner_z) + float2(p % root.patches, p / root.patches) * root.patch_size;
+    float2 hole = float2(root.hole_x, root.hole_z);
+    if (all(corner >= hole) && all(corner + root.patch_size <= hole + root.hole_size))
+        return;
     uint first = alloc_vertices(b, PATCH_SIDE * PATCH_SIDE);
     if (first == NO_ROOM)
         return;
     float step = root.patch_size / float(PATCH_QUADS);
-    float2 corner = float2(root.corner_x, root.corner_z) + float2(p % root.patches, p / root.patches) * root.patch_size;
     for (uint v = 0; v < PATCH_SIDE * PATCH_SIDE; v++)
     {
         float2 xz = corner + float2(v % PATCH_SIDE, v / PATCH_SIDE) * step;
