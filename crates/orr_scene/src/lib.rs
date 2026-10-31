@@ -4,6 +4,8 @@
 //! A frame runs in a fixed order on the render thread: [`Scenes::begin_frame`], writes
 //! through [`SceneWriter`] and [`MaterialWriter`] (from any threads), one
 //! [`Frame::update_scenes`], one [`Frame::raster_view`] per view, then [`Frame::end`].
+//! A view's raster half draws the scene's clusters into a visibility buffer and resolves
+//! each pixel's surface into the G-buffer that later passes read through `load_gsurface`.
 //! Writers put data straight into mapped upload memory and `update_scenes` applies every
 //! write with one scatter dispatch; orr keeps no CPU copy of GPU tables. Every pass reads
 //! a scene through its [`SceneRoot`].
@@ -18,7 +20,11 @@ mod loading;
 mod material;
 pub mod memory;
 mod mount;
+mod pipelines;
 mod producer;
+mod raster;
+#[cfg(feature = "hot-reload")]
+mod reload;
 mod scene;
 mod scenes;
 #[cfg(feature = "testing")]
@@ -37,6 +43,7 @@ pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId};
 pub use loading::Loading;
 pub use material::{BoundTexture, MaterialId, MaterialWriter, material_flags};
 pub use mount::{InstancePage, LoadState, MountId, PackSource, PageId};
+pub use pipelines::{PipelineId, ReloadReport};
 pub use producer::{ClusterTopology, ProducerDesc, ProducerId, ProducerUpdate};
 pub use scene::{
     Affine3, CopyVariant, GroupWriter, InstanceFlags, InstanceRange, InstancesDesc, ModelId, Pose,
@@ -46,8 +53,9 @@ pub use scenes::{
     Budgets, ConsumerMarker, Frame, FrameDesc, FrameStats, RendererDesc, SceneCompute, Scenes,
 };
 pub use shaders::types::{
-    EmissiveGpu, GroupGpu, InstanceGpu, LightGpu, MaterialGpu, MeshGpu, ModelGpu, ProducerBatch,
-    ProducerClusterGpu, ProducerGpu, SceneRoot, SkyStats, SlotStateGpu, TopologyGpu,
+    EmissiveGpu, GBufferGpu, GroupGpu, InstanceGpu, LightGpu, MaterialGpu, MeshGpu, MeshLevel,
+    ModelGpu, ProducerBatch, ProducerClusterGpu, ProducerGpu, RasterGpu, RasterRoot, SceneRoot,
+    SkyStats, SlotStateGpu, TaskWork, TopologyGpu, VisibleCluster,
 };
 pub use time::FrameTime;
 pub use view::{

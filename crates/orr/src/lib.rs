@@ -30,10 +30,11 @@ pub use orr_scene::{
     DirectionalLight, DiscProfile, ExposureState, Focus, FrameStats, FrameTime, Glare, GroupGpu,
     GroupWriter, InstanceFlags, InstanceGpu, InstancePage, InstanceRange, InstancesDesc, Lens,
     LensDistortion, Light, LightGpu, LightId, LoadState, Loading, MaterialGpu, MaterialId,
-    MaterialWriter, MeshGpu, ModelGpu, ModelId, MountId, PackSource, PageId, Pose, Projection,
-    REBASE_GRID_LOG2, RendererDesc, SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter,
-    SkyStats, SlotStateGpu, TransformGroupDesc, TransformGroupId, ViewConstants, ViewDesc,
-    ViewHistoryId, ViewTarget, WorldPos, abi, material_flags, orr_gpu, orr_pack,
+    MaterialWriter, MeshGpu, ModelGpu, ModelId, MountId, PackSource, PageId, PipelineId, Pose,
+    Projection, REBASE_GRID_LOG2, ReloadReport, RendererDesc, SceneCompute, SceneDesc, SceneId,
+    SceneRoot, SceneWriter, SkyStats, SlotStateGpu, TransformGroupDesc, TransformGroupId,
+    ViewConstants, ViewDesc, ViewHistoryId, ViewTarget, WorldPos, abi, material_flags, orr_gpu,
+    orr_pack,
 };
 
 use orr_gpu::{
@@ -203,6 +204,19 @@ impl Renderer {
         Ok(self.scenes.material(m, id)?)
     }
 
+    /// A compute pipeline of `module`'s `entry`, created on the calling thread. With the
+    /// `hot-reload` feature, editing the kernel's sources replaces it at a later step 1
+    /// ([`Frame::reloads`]); look it up each frame with [`Frame::pipeline`] or
+    /// [`SceneCompute::pipeline`].
+    pub fn compute_pipeline(
+        &mut self,
+        module: &'static ShaderModule,
+        entry: &str,
+        spec: orr_gpu::SpecData<'_>,
+    ) -> Result<PipelineId> {
+        Ok(self.scenes.compute_pipeline(module, entry, spec)?)
+    }
+
     /// Step 1: waits until the frame `frames_in_flight` back has completed, sleeps on the
     /// display's low latency handle, opens the next frame and the display's slot for it.
     pub fn begin_frame<'a>(&'a mut self, desc: FrameDesc<'a>) -> Result<Frame<'a>> {
@@ -246,6 +260,16 @@ impl<'a> Frame<'a> {
     pub fn display(&mut self) -> Option<(ResolvedDisplay, [u32; 2])> {
         let f = self.display.as_deref_mut()?.frame()?;
         Some((f.display, f.extent))
+    }
+
+    /// The current pipeline of `id`.
+    pub fn pipeline(&self, id: PipelineId) -> &'a orr_gpu::ComputePipeline {
+        self.scenes.pipeline(id)
+    }
+
+    /// What hot reload applied at this frame's step 1.
+    pub fn reloads(&self) -> &[ReloadReport] {
+        self.scenes.reloads()
     }
 
     /// Step 2: the writer of a scene listed in this frame. One per scene at a time; Send.
