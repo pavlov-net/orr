@@ -227,6 +227,7 @@ impl AtmosphereState {
         record.sky_view_count = 1;
         record.sky_view_weight[0] = 1.0;
         record.multiple_scattering_scale = 1.0;
+        record.fold_reset = 1;
         block::medium(desc, &mut record);
         Ok(Self {
             desc: *desc,
@@ -266,6 +267,14 @@ impl AtmosphereState {
     /// sky folds in the `sky_lights` brightest by top-of-atmosphere luminance among those that
     /// are directional and no more than 18 deg below the focus horizon; ties go to the earlier
     /// candidate. A `Textured` light with zero illuminance counts with its disc integral.
+    ///
+    /// A folded light ranks as if up to 2% brighter (2% times its fold weight), so two nearly
+    /// equal candidates do not trade places every frame.
+    ///
+    /// A light that joins or leaves that set fades in or out over 0.5 s of frame time, so
+    /// up to [`MAX_FOLDED_LIGHTS`] lights are folded while ranks change; when more are
+    /// fading, the faintest fading ones are dropped. A light keeps its fade when the list is
+    /// reordered; one removed from the list leaves the sky at once.
     pub fn set_lights(&mut self, lights: &[LightId]) {
         assert!(
             lights.len() <= MAX_SKY_LIGHTS,
@@ -285,14 +294,21 @@ impl AtmosphereState {
         self.record.multiple_scattering_scale = if on { 1.0 } else { 0.0 };
     }
 
+    /// Makes the next [`record`](Self::record) set every fold weight to its target instead of
+    /// fading: for a cut or a jump in the time of day, where a fade would show the old lights.
+    pub fn skip_fades(&mut self) {
+        self.record.fold_reset = 1;
+    }
+
     /// The block's address, for `SceneWriter::set_environment` and `set_medium`.
     pub fn data(&self) -> GpuAddress {
         self.block.gpu.address()
     }
 
     /// Records the atmosphere's passes for the scene `cx` hands over: the medium's tables
-    /// after a [`set`](Self::set), then the fold and the sky-view LUTs. Its writes are visible
-    /// to every later stage of the list.
+    /// after a [`set`](Self::set), then the fold, which steps the fades by the scene's
+    /// `delta_time`, and the sky-view LUTs. Its writes are visible to every later stage of the
+    /// list.
     ///
     /// `eyes` are the world positions of the scene's other views this frame. The focus LUT
     /// sits at the scene focus altitude (0 without a focus). An eye more than 25 m above or
@@ -324,6 +340,7 @@ impl AtmosphereState {
         }
 
         let block = cx.put(&self.record)?;
+        self.record.fold_reset = 0;
         cx.cmd.copy(
             self.block.gpu.cast(),
             block.cast(),

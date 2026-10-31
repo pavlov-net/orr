@@ -2,7 +2,8 @@
 
 //! `AtmosphereSky` as orr's linked environment: the horizon, the night background, a light's
 //! disc through the atmosphere, the sky-view LUT composed with the medium inside
-//! `near_range`, the fold of several lights, and lighting's bake of the linked sky.
+//! `near_range`, the fold of several lights and its fades, and lighting's bake of the linked
+//! sky.
 
 use atmosphere_suite::{Probe, Rig, SUN, dir, probe, sky_radiance};
 use glam::{DVec3, Vec3};
@@ -12,7 +13,7 @@ use orr_atmosphere::colour::{REC2020_TO_REC709, luminance, mul};
 use orr_atmosphere::presets::solar_disc;
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference};
 use orr_atmosphere::spectrum::{SOLAR_COLOUR, SOLAR_ILLUMINANCE};
-use orr_atmosphere::{Atmosphere, HeightFog, SKY_VIEW_SIZE};
+use orr_atmosphere::{Atmosphere, FoldGpu, HeightFog, MAX_FOLDED_LIGHTS, SKY_VIEW_SIZE};
 use orr_lighting::ENVIRONMENT_SIZE;
 use orr_scene::testing::{assert_clean, read_buffer};
 
@@ -538,5 +539,264 @@ fn lighting_bakes_the_linked_sky() {
             "baked {baked} against {expected}"
         );
     }
+    assert_clean();
+}
+
+/// A fold weight's change in one 1/60 s frame.
+const FADE_STEP: f32 = 1.0 / 30.0;
+
+fn fold_state(rig: &Rig) -> FoldGpu {
+    let block = read_buffer(rig.block(), 1)[0];
+    read_buffer(block.fold, 1)[0]
+}
+
+fn fading_rig(sky_lights: u32) -> Rig {
+    let mut rig = Rig::new(&Atmosphere {
+        sky_lights,
+        ..earth()
+    });
+    rig.fades = true;
+    rig
+}
+
+/// Weights move by `delta_time / 0.5 s` toward 1 for members and 0 for the rest, stay in
+/// [0, 1], and at most `MAX_FOLDED_LIGHTS` are non-zero, members first.
+#[test]
+fn fold_weights_fade() {
+    let mut rig = fading_rig(1);
+    let a = |s: f32| (LightId(0), tinted(dir(30.0, 0.0), Vec3::splat(s)));
+    let b = |s: f32| (LightId(1), tinted(dir(10.0, 180.0), Vec3::splat(s)));
+    rig.sky.set_lights(&[LightId(0), LightId(1)]);
+    rig.frame_lights(&[a(1.0), b(0.5)], EYE);
+    let f = fold_state(&rig);
+    assert_eq!((f.weight[0], f.weight[1], f.folded_count), (1.0, 0.0, 1));
+    for k in 1..=32 {
+        rig.frame_lights(&[a(1.0), b(2.0)], EYE);
+        let f = fold_state(&rig);
+        let rate = (k as f32 * FADE_STEP).min(1.0);
+        assert!(
+            (f.weight[1] - rate).abs() < 1e-5 && (f.weight[0] - (1.0 - rate)).abs() < 1e-5,
+            "frame {k}: weights {:?}",
+            &f.weight[..2]
+        );
+        assert!(f.weight.iter().all(|w| (0.0..=1.0).contains(w)));
+        assert_eq!(f.folded[0], 1, "the member folds first");
+        assert_eq!(f.folded_count, if f.weight[0] > 0.0 { 2 } else { 1 });
+    }
+    let f = fold_state(&rig);
+    assert_eq!((f.weight[0], f.weight[1]), (0.0, 1.0));
+
+    // Reordering the candidates keeps each light's weight.
+    rig.frame_lights(&[a(3.0), b(2.0)], EYE);
+    let before = fold_state(&rig);
+    rig.sky.set_lights(&[LightId(1), LightId(0)]);
+    rig.frame_lights(&[a(3.0), b(2.0)], EYE);
+    let after = fold_state(&rig);
+    assert!((after.weight[1] - (before.weight[0] + FADE_STEP)).abs() < 1e-5);
+    assert!((after.weight[0] - (before.weight[1] - FADE_STEP)).abs() < 1e-5);
+
+    // 4 members leaving and 4 joining fold 8; 8 leaving and 8 joining keep the 8 joining.
+    let many = |bright: &dyn Fn(u32) -> bool| -> Vec<_> {
+        (0..16)
+            .map(|i| {
+                let s = if bright(i) { 1.0 } else { 0.1 };
+                let d = dir(10.0 + f64::from(i) * 4.0, f64::from(i) * 22.5);
+                (LightId(i), tinted(d, Vec3::splat(s)))
+            })
+            .collect()
+    };
+    let ids: Vec<_> = (0..16).map(LightId).collect();
+    for (sky_lights, candidates) in [(4_u32, 8_usize), (8, 16)] {
+        let mut rig = fading_rig(sky_lights);
+        rig.sky.set_lights(&ids[..candidates]);
+        rig.frame_lights(&many(&|i| i < sky_lights), EYE);
+        rig.frame_lights(&many(&|i| i >= sky_lights), EYE);
+        let f = fold_state(&rig);
+        let weights = &f.weight[..candidates];
+        assert_eq!(f.folded_count, MAX_FOLDED_LIGHTS);
+        assert_eq!(
+            weights.iter().filter(|w| **w > 0.0).count(),
+            MAX_FOLDED_LIGHTS as usize
+        );
+        for (i, w) in weights.iter().enumerate() {
+            let i = i as u32;
+            let expected = if (sky_lights..2 * sky_lights).contains(&i) {
+                FADE_STEP
+            } else if 2 * sky_lights <= MAX_FOLDED_LIGHTS {
+                1.0 - FADE_STEP
+            } else {
+                0.0
+            };
+            assert!(
+                (w - expected).abs() < 1e-5,
+                "{sky_lights} sky lights: {weights:?}"
+            );
+        }
+    }
+    assert_clean();
+}
+
+/// The worst per-texel channel change from `last` to `next`, relative to the sky with every
+/// candidate folded at full weight, `full`, or to 5% of its luminance for a channel near
+/// zero.
+fn step_against(next: &[[f64; 3]], last: &[[f64; 3]], full: &[[f64; 3]]) -> f64 {
+    next.iter()
+        .zip(last)
+        .zip(full)
+        .map(|((n, l), f)| {
+            let floor = 0.05 * luminance(*f);
+            (0..3)
+                .map(|c| (n[c] - l[c]).abs() / f[c].abs().max(floor).max(1e-12))
+                .fold(0.0, f64::max)
+        })
+        .fold(0.0, f64::max)
+}
+
+/// Steps of a fading sky with one sky light and two candidates.
+struct Steps {
+    /// Against the sky with both candidates folded.
+    full: f64,
+    /// Against the texel itself.
+    texel: f64,
+}
+
+/// Runs `frames` fading frames of a one-sky-light rig whose candidates are lights 0 and 1,
+/// lit by `at(frame)`, and returns the worst step between consecutive frames, the frame
+/// whose fold first held light 1 and each frame's LUT.
+fn fade_run(
+    frames: u32,
+    at: &dyn Fn(u32) -> Vec<(LightId, DirectionalLight)>,
+) -> (Steps, Option<u32>, Vec<Vec<[f64; 3]>>) {
+    let mut rig = fading_rig(1);
+    let mut both = Rig::new(&Atmosphere {
+        sky_lights: 2,
+        ..earth()
+    });
+    for r in [&mut rig, &mut both] {
+        r.sky.set_lights(&[LightId(0), LightId(1)]);
+    }
+    let mut steps = Steps {
+        full: 0.0,
+        texel: 0.0,
+    };
+    let mut joined = None;
+    let mut luts: Vec<Vec<[f64; 3]>> = Vec::new();
+    for n in 0..frames {
+        rig.frame_lights(&at(n), EYE);
+        both.frame_lights(&at(n), EYE);
+        if joined.is_none() && fold_state(&rig).weight[1] > 0.0 {
+            joined = Some(n);
+        }
+        let next = lut(&rig);
+        if let Some(last) = luts.last() {
+            steps.full = steps.full.max(step_against(&next, last, &lut(&both)));
+            steps.texel = steps.texel.max(lut_difference(&next, last));
+        }
+        luts.push(next);
+    }
+    (steps, joined, luts)
+}
+
+/// With one sky light and two candidates crossing in brightness, the sky changes by under
+/// 5% of the sky with both folded each frame at 60 fps, and 0.5 s after the fold changes
+/// member it holds the new member alone.
+#[test]
+fn crossing_in_brightness() {
+    // Equal at frame 30; light 1 is 2% brighter, enough to take the fold, near frame 36.
+    let at = |n: u32| {
+        let t = n as f32 / 60.0;
+        let a = tinted(dir(30.0, 0.0), Vec3::splat(1.05 - 0.1 * t));
+        let b = tinted(dir(20.0, 150.0), Vec3::splat(0.95 + 0.1 * t));
+        vec![(LightId(0), a), (LightId(1), b)]
+    };
+    let (steps, joined, luts) = fade_run(80, &at);
+    let joined = joined.expect("light 1 joins the fold");
+    let later = joined + 30;
+    let mut alone = Rig::new(&earth());
+    alone.sky.set_lights(&[LightId(1)]);
+    alone.frame_lights(&at(later), EYE);
+    let difference = lut_difference(&luts[later as usize], &lut(&alone));
+    eprintln!(
+        "crossing: joined at frame {joined}; worst frame-to-frame {:.2}% of the full sky, {:.1}% of the texel; \
+         0.5 s later against the new member alone {difference:.2e}",
+        steps.full * 100.0,
+        steps.texel * 100.0
+    );
+    assert!((33..=40).contains(&joined), "{joined}");
+    assert!(
+        steps.full < 0.05,
+        "sky stepped by {:.2}%",
+        steps.full * 100.0
+    );
+    assert!(difference < 0.01, "{difference}");
+    assert_clean();
+}
+
+/// A candidate sinking through the 18 deg cutoff fades out over 0.5 s and fades back in
+/// when it rises through it, with no step in the sky.
+#[test]
+fn crossing_the_cutoff() {
+    let mut rig = fading_rig(2);
+    rig.sky.set_lights(&[LightId(0), LightId(1)]);
+    // -17.5 deg down to -18.5 deg over frames 0-10, back up over frames 50-60.
+    let at = |n: u32| {
+        let e = if n < 50 {
+            -17.5 - f64::from(n.min(10)) * 0.1
+        } else {
+            -18.5 + f64::from((n - 50).min(10)) * 0.1
+        };
+        vec![
+            (LightId(0), tinted(dir(30.0, 0.0), Vec3::splat(0.2))),
+            (LightId(1), solar_disc(dir(e, 90.0).as_vec3())),
+        ]
+    };
+    let mut weights = Vec::new();
+    let mut last: Option<Vec<[f64; 3]>> = None;
+    let mut worst = 0.0_f64;
+    for n in 0..100 {
+        rig.frame_lights(&at(n), EYE);
+        weights.push(fold_state(&rig).weight[1]);
+        let next = lut(&rig);
+        if let Some(last) = &last {
+            worst = worst.max(lut_difference(&next, last));
+        }
+        last = Some(next);
+    }
+    eprintln!("cutoff: worst frame-to-frame {:.2}%", worst * 100.0);
+    for pair in weights.windows(2) {
+        assert!((pair[1] - pair[0]).abs() <= FADE_STEP + 1e-5, "{weights:?}");
+    }
+    assert_eq!(weights[0], 1.0);
+    let out = weights.iter().position(|w| *w == 0.0).unwrap();
+    assert!(
+        (35..=40).contains(&out),
+        "faded out at frame {out}: {weights:?}"
+    );
+    assert_eq!(weights[99], 1.0);
+    assert!(worst < 0.05, "sky stepped by {:.2}%", worst * 100.0);
+    assert_clean();
+}
+
+/// Two candidates of equal brightness swapping rank every frame give a steady sky.
+#[test]
+fn equal_candidates_swapping_rank() {
+    let at = |n: u32| {
+        let s = if n.is_multiple_of(2) { 1e-3 } else { -1e-3 };
+        vec![
+            (LightId(0), tinted(dir(30.0, 0.0), Vec3::splat(1.0 + s))),
+            (LightId(1), tinted(dir(30.0, 180.0), Vec3::splat(1.0 - s))),
+        ]
+    };
+    let (steps, joined, _) = fade_run(60, &at);
+    eprintln!(
+        "swapping: worst frame-to-frame {:.3}% of the texel",
+        steps.texel * 100.0
+    );
+    assert_eq!(joined, None, "light 1 never joins the fold");
+    assert!(
+        steps.texel < 0.005,
+        "sky stepped by {:.3}%",
+        steps.texel * 100.0
+    );
     assert_clean();
 }

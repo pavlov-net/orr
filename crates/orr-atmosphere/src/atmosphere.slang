@@ -44,15 +44,18 @@ public struct AtmosphereGroups
     public float4 light_weight[3];
 }
 
-// Which candidates the sky-view passes fold in.
+// Which candidates the sky-view passes fold in, and how much of each. The fold keeps it
+// across frames.
 public struct FoldGpu
 {
     // Per candidate slot: the light's Rec.2020 illuminance above the atmosphere (a `Textured`
     // disc with zero illuminance gets its disc integral).
     public float4 illuminance[MAX_SKY_LIGHTS];
-    // Per candidate slot.
+    // Per candidate slot: the share of its in-scatter the sky-view LUTs hold, in [0, 1].
     public float weight[MAX_SKY_LIGHTS];
-    // Candidate slots with a non-zero weight, highest weight first.
+    // Per candidate slot: the light table index the weight belongs to.
+    public uint light[MAX_SKY_LIGHTS];
+    // Candidate slots with a non-zero weight: members, then the lights fading out.
     public uint folded[MAX_FOLDED_LIGHTS];
     public uint folded_count;
     public uint _pad0;
@@ -115,7 +118,8 @@ public struct AtmosphereGpu
     public float sky_view_weight[MAX_SKY_VIEWS];
     // Scales the multiple scattering the sky-view LUTs add: 1, or 0 for single scattering.
     public float multiple_scattering_scale;
-    public uint _pad0;
+    // Non-zero: the fold sets every weight to its target instead of fading.
+    public uint fold_reset;
 }
 
 public SceneRoot* atmosphere_scene(AtmosphereGpu* a)
