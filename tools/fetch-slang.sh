@@ -21,6 +21,9 @@
 #   sky/prague/PragueSkyModelGround.dat
 #                    the Prague sky model's ground-level dataset (103 MB), checked against its
 #                    sha256
+#   volumes/smoke.vdb
+#                    OpenVDB's smoke1 sample model from the ASWF artifacts, its zip checked
+#                    against its sha256
 # Build scripts never download; run this once after cloning and after a pin changes.
 #
 # SLANG_ASSET=glibc-2.28 selects the Linux build for glibc older than 2.34.
@@ -39,6 +42,7 @@ gt7_sum=94df7e7e310b9423ebb5aaaa29416f376ebbae66e0948fb259f8688314b29822
 prague_commit=2385c912e9051c1258013ff8c3ce2e19e10fb917
 prague_ground_id=1IflyFZTJxC_N298yXq_2GK4ycIsVJZk6
 prague_ground_sum=76bd619dc6dfcbc900c2996436dd6cf68197c03e3982fe5580f2b109ce1c71c2
+smoke_sum=dca7a0477e77fac197a969f5f418057fc3f89b12887c35d1fc9c1b0d2892f20f
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 tools="${ORR_TOOLS:-$root/.tools}"
@@ -139,5 +143,20 @@ if [ "${ORR_VALIDATION_DATA:-0}" = 1 ]; then
     echo "$prague_ground_sum  $ground.part" | sha256sum -c --quiet -
     mv "$ground.part" "$ground"
     echo "prague ground dataset in $ground"
+  fi
+  smoke="$tools/volumes/smoke.vdb"
+  if [ -f "$smoke" ] && [ "$(cat "$smoke.zip-sha256" 2>/dev/null)" = "$smoke_sum" ]; then
+    echo "smoke1 volume already in $smoke"
+  else
+    mkdir -p "$tools/dl" "$tools/volumes"
+    zip="$tools/dl/smoke1.vdb-1.0.0.zip"
+    if ! echo "$smoke_sum  $zip" | sha256sum -c --quiet - 2>/dev/null; then
+      curl -fsSL --retry 3 -o "$zip.part" https://artifacts.aswf.io/io/aswf/openvdb/models/smoke1.vdb/1.0.0/smoke1.vdb-1.0.0.zip
+      echo "$smoke_sum  $zip.part" | sha256sum -c --quiet -
+      mv "$zip.part" "$zip"
+    fi
+    unzip -o -q "$zip" smoke.vdb -d "$tools/volumes"
+    echo "$smoke_sum" > "$smoke.zip-sha256"
+    echo "smoke1 volume in $smoke"
   fi
 fi

@@ -11,9 +11,9 @@ mod common_skinned;
 
 use glam::{DVec3, Quat, Vec3};
 use orr_cook::{
-    ArchiveSpec, AssetSpec, DataFormat, GltfSettings, Instances, LodMode, Manifest, MeshSettings,
-    MipFilter, Placement, PrototypeSpec, RasterInput, RasterLayerSpec, RasterSet, Reduction,
-    Source, TextureSettings, Usage,
+    ArchiveSpec, AssetSpec, DataFormat, GltfSettings, GridInput, GridVoxels, Instances, LodMode,
+    Manifest, MeshSettings, MipFilter, Placement, PrototypeSpec, RasterInput, RasterLayerSpec,
+    RasterSet, Reduction, Source, TextureSettings, Usage, VolumeGrids, VolumeInput,
 };
 use orr_pack::{Archive, Class, Target};
 
@@ -60,6 +60,11 @@ const GOLDEN: &[(u16, u32, &str)] = &[
         Class::Clip as u16,
         1,
         "517b3a610d36451309d0b6313cbda0b2339f05b2b247c3bcbfa0fd7880a15c44",
+    ),
+    (
+        Class::Volume as u16,
+        1,
+        "2718b024a9f6568a23c9ca2b26bfd551d0951735505dc4b0427e414865989af4",
     ),
     (
         USER,
@@ -168,6 +173,31 @@ fn cooked_bytes_match_their_cook_versions() {
                             quality: Default::default(),
                         }],
                     }),
+                },
+                AssetSpec {
+                    name: "smoke".into(),
+                    source: Source::Volume {
+                        input: VolumeInput::Grids(VolumeGrids {
+                            origin: [-1.0, 0.0, 2.0],
+                            voxel_size: [0.25; 3],
+                            grids: ["density", "heat"]
+                                .into_iter()
+                                .enumerate()
+                                .map(|(g, name)| GridInput {
+                                    name: name.into(),
+                                    background: g as f32,
+                                    voxels: GridVoxels::Dense {
+                                        min: [-3, 2, 5],
+                                        size: [12, 9, 10],
+                                        values: (0..12 * 9 * 10)
+                                            .map(|i| ((i * (7 + g)) % 23) as f32 * 0.125)
+                                            .collect(),
+                                    },
+                                })
+                                .collect(),
+                        }),
+                        settings: Default::default(),
+                    },
                 },
                 AssetSpec {
                     name: "user".into(),

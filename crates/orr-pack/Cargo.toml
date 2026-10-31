@@ -12,6 +12,7 @@ links = "orr_pack"
 orr-io.workspace = true
 blake3.workspace = true
 bytemuck.workspace = true
+half.workspace = true
 meshopt = "=0.7.0"
 thiserror.workspace = true
 zstd.workspace = true

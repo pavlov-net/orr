@@ -20,7 +20,7 @@ ctt = { version = "=0.6.1", default-features = false, features = ["encoder-bc7en
 glam = { workspace = true, features = ["serde"] }
 libloading = { workspace = true, optional = true }
 gltf = { version = "=1.4.1", default-features = false, features = ["utils", "names", "extras", "KHR_materials_emissive_strength", "KHR_materials_ior"] }
-half = "2"
+half.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr", "exr"] }
 meshopt = "=0.7.0"
 # Exact pin: no stable API before 1.0, and its composition shapes cooked meshes.
@@ -33,6 +33,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror.workspace = true
 tiff = "0.11"
+vdb-rs = "0.6"
 toml = "0.9"
 zstd.workspace = true
 

@@ -43,6 +43,9 @@
 //! A raster source emits one raster set `N`: a tiled LOD pyramid per layer, built by the
 //! cook from a whole raster or imported from producer tiles ([`RasterSet`]).
 //!
+//! A volume source emits one volume `N`: its scalar grids as sparse bricks with a majorant
+//! grid ([`VolumeInput`]).
+//!
 //! An instances source emits instance pages `N/<x>_<y>_<z>/<i>` per world cell
 //! ([`Instances`]); it can place models cooked by any archive of the manifest. A user source
 //! emits one entry `N` of a consumer class.
@@ -85,6 +88,7 @@ mod state;
 mod subd;
 mod texture;
 mod usd;
+mod volume;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -112,6 +116,10 @@ pub use texture::material::{TextureOverride, TextureRules};
 pub use texture::neural::NeuralSettings;
 pub use texture::{DataFormat, MipFilter, Primaries, Quality, TextureSettings, Usage, Wrap};
 pub use usd::{Subdivision, UsdSettings, VariantSelection};
+pub use volume::{
+    Block, GridInput, GridVoxels, VolumeFormat, VolumeGridReport, VolumeGridSpec, VolumeGrids,
+    VolumeInput, VolumeReport, VolumeSettings,
+};
 
 /// Archives to cook. [`Manifest::load`] reads one from TOML.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -194,6 +202,12 @@ pub enum Source {
     Instances(Instances),
     /// Raster layers tiled into one raster set.
     Raster(RasterSet),
+    /// Scalar grids on one lattice.
+    Volume {
+        input: VolumeInput,
+        #[serde(default)]
+        settings: VolumeSettings,
+    },
     /// A mesh built in memory, one material per section; library callers only. Alpha-tested
     /// sections with an opacity texture keep every triangle alpha-tested without micromaps,
     /// and displaced sections bound their clusters by the declared range, since the cook
@@ -341,6 +355,9 @@ pub enum Error {
     /// A raster set whose inputs or settings do not fit the format.
     #[error("{asset}: {message}")]
     Raster { asset: String, message: String },
+    /// A volume whose input or settings do not fit the format.
+    #[error("{asset}: {message}")]
+    Volume { asset: String, message: String },
     #[error("{asset}: class {class:#06x} is not a user class")]
     UserClass { asset: String, class: u16 },
     /// An archive asks for GDeflate in a cook built without the `gdeflate` feature.
