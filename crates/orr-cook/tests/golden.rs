@@ -38,7 +38,7 @@ const GOLDEN: &[(u16, u32, &str)] = &[
     ),
     (
         Class::Texture as u16,
-        1,
+        2,
         "43735be6c283598fbb5f7a16384b3f7ac1ad607f834e3de5494294703863242e",
     ),
     (

@@ -9,7 +9,7 @@ use orr_cook::{
 use orr_pack::material::{Material, slot};
 use orr_pack::model::ModelInfo;
 use orr_pack::texture::{FormatInfo, TILE_BYTES, TextureInfo, octahedral, tile_grid, vk};
-use orr_pack::{Archive, AssetId, Class, Target};
+use orr_pack::{Archive, AssetId, BcLayout, Class, Codec, Filter, Target};
 
 fn dir(name: &str) -> PathBuf {
     let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -198,6 +198,58 @@ fn bc7_mip0_keeps_the_source() {
     }
     let db = psnr(&src, &dec);
     assert!(db > 40.0, "BC7 mip 0 PSNR {db:.1} dB");
+}
+
+#[test]
+fn bc_split_keeps_the_blocks() {
+    let d = dir("bc-split");
+    let path = d.join("noise.png");
+    write_png(&path, 520, 520, |x, y| {
+        let v = (x * 7 + y * 13) ^ (x * y);
+        [v as u8, (v >> 3) as u8, (x + y) as u8, (v >> 5) as u8]
+    });
+    for (usage, layout) in [
+        (Usage::ColorAlpha, BcLayout::Bc7),
+        (Usage::Normal, BcLayout::Bc5),
+        (Usage::Linear1, BcLayout::Bc4),
+    ] {
+        let a = cook(
+            [None, Some(false), Some(true)]
+                .into_iter()
+                .enumerate()
+                .map(|(i, bc_split)| {
+                    let settings = TextureSettings {
+                        usage,
+                        quality: Quality::Fast,
+                        bc_split,
+                        ..TextureSettings::default()
+                    };
+                    texture(&path, &i.to_string(), settings)
+                })
+                .collect(),
+        );
+        let levels = ["0", "1", "2"].map(|n| mips(&a, n).1);
+        assert!(
+            levels[0] == levels[1] && levels[1] == levels[2],
+            "{usage:?}"
+        );
+        for (n, filter) in [
+            ("0", Filter::BcSplit(layout)),
+            ("1", Filter::None),
+            ("2", Filter::BcSplit(layout)),
+        ] {
+            let e = a.find(AssetId::from_name(n)).unwrap();
+            let blobs = a.blobs(e);
+            assert_eq!(blobs[0].filter(), Filter::None);
+            assert!(
+                blobs[1..]
+                    .iter()
+                    .all(|b| b.filter() == filter || b.codec() == Codec::None),
+                "{usage:?} {n}"
+            );
+            assert_eq!(blobs[1].filter(), filter, "{usage:?} {n}");
+        }
+    }
 }
 
 /// A BC6H cube with every mip, written as KTX2, cooks to the same blocks.

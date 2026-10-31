@@ -11,7 +11,7 @@ use orr_pack::texture::{
     ExtractedLight, FormatInfo, TILE_BYTES, TextureHeader, TextureInfo, full_mip_count, mip_size,
     tail_first_mip, tile,
 };
-use orr_pack::{ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span};
+use orr_pack::{ArchiveWriter, AssetId, BcLayout, BlobIn, Class, Filter, Hash32, Span};
 use serde::Deserialize;
 
 pub(crate) use encode::{Encoding, encode as encode_chains};
@@ -43,6 +43,9 @@ pub struct TextureSettings {
     pub filter: MipFilter,
     /// Edge handling of the mip filter per axis (u, v).
     pub wrap: [Wrap; 2],
+    /// Store BCn blocks split into endpoint and index streams, which zstd compresses
+    /// better. `None` takes the format's default.
+    pub bc_split: Option<bool>,
 }
 
 impl Default for TextureSettings {
@@ -56,6 +59,7 @@ impl Default for TextureSettings {
             primaries: None,
             filter: MipFilter::Kaiser,
             wrap: [Wrap::Repeat; 2],
+            bc_split: None,
         }
     }
 }
@@ -251,10 +255,29 @@ pub(crate) struct Plan {
     pub lights: Vec<ExtractedLight>,
 }
 
-/// A cooked texture: blob 0 and the blobs after it.
+/// A cooked texture: blob 0 and the blobs after it, stored with `filter`.
 pub(crate) struct Built {
     pub info: TextureInfo,
     pub blobs: Vec<Vec<u8>>,
+    pub filter: Filter,
+}
+
+impl Built {
+    /// Stores the blocks split, or not, as `bc_split` asks; `None` takes the format's
+    /// default.
+    pub(crate) fn with_split(mut self, bc_split: Option<bool>) -> Self {
+        let layout = BcLayout::of(self.info.header.vk_format);
+        self.filter = match layout {
+            Some(l) if bc_split.unwrap_or_else(|| split_by_default(l)) => Filter::BcSplit(l),
+            _ => Filter::None,
+        };
+        self
+    }
+}
+
+/// Whether a format's blocks are split when the settings leave it open.
+fn split_by_default(_: BcLayout) -> bool {
+    true
 }
 
 /// Mips dropped from the top of a `w` x `h` chain so mip 0 fits `max_size`.
@@ -357,11 +380,12 @@ pub(crate) fn layout(
     Built {
         info: TextureInfo { header, lights },
         blobs,
+        filter: Filter::None,
     }
 }
 
 /// Adds a cooked texture: blob 0 and the tail in the mount section, one 64 KiB tile per
-/// chunk in the mip blobs.
+/// chunk in the mip blobs. Every blob after blob 0 takes the texture's filter.
 pub(crate) fn add(w: &mut ArchiveWriter, name: &str, key: Hash32, t: &Built) -> Result<AssetId> {
     let head = t.info.to_bytes();
     let tail = t.info.header.tail_first_mip < t.info.header.mip_count;
@@ -374,11 +398,13 @@ pub(crate) fn add(w: &mut ArchiveWriter, name: &str, key: Hash32, t: &Built) -> 
         if tail && i == last {
             BlobIn {
                 mount: true,
+                filter: t.filter,
                 ..BlobIn::new(b)
             }
         } else {
             BlobIn {
                 chunk_len: TILE_BYTES as u32,
+                filter: t.filter,
                 ..BlobIn::new(b)
             }
         }
@@ -396,6 +422,7 @@ pub(crate) fn add(w: &mut ArchiveWriter, name: &str, key: Hash32, t: &Built) -> 
 pub(crate) fn cook_file(asset: &str, bytes: &[u8], s: &TextureSettings) -> Result<Built> {
     load::decode(bytes)
         .and_then(|src| cook_source(src, s))
+        .map(|b| b.with_split(s.bc_split))
         .map_err(|message| Error::Texture {
             asset: asset.into(),
             message,
