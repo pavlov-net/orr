@@ -11,6 +11,8 @@ links = "orr"
 [features]
 # Recompiles kernels whose sources change and swaps their pipelines at step 1, for dev builds.
 hot-reload = ["orr_scene/hot-reload"]
+# PCL Stats for every display (orr_output's `pcl-stats`; needs the Reflex SDK at `REFLEX_SDK`).
+pcl-stats = ["orr_output/pcl-stats"]
 
 [dependencies]
 orr_scene.workspace = true

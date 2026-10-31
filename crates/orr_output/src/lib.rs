@@ -13,6 +13,8 @@ mod gt7;
 mod hooks;
 mod motion_blur;
 mod passes;
+#[cfg(all(windows, feature = "pcl-stats"))]
+mod pcl_stats;
 mod present;
 mod screenshot;
 mod ui;

@@ -68,6 +68,8 @@ pub struct Display {
     jobs: Option<Sender<Job>>,
     thread: Option<JoinHandle<()>>,
     device: Device,
+    #[cfg(all(windows, feature = "pcl-stats"))]
+    _pcl_stats: Option<crate::pcl_stats::Session>,
 }
 
 /// Frame generation on this display.
@@ -365,6 +367,8 @@ impl Display {
                 .spawn(move || presenter.run(&rx, &shared))
                 .map_err(|e| Error::Thread(e.to_string()))?
         };
+        #[cfg(all(windows, feature = "pcl-stats"))]
+        let pcl_stats = latency.as_ref().map(crate::pcl_stats::Session::start);
         Ok(Self {
             window: handle.hwnd.get(),
             request: *request,
@@ -394,6 +398,8 @@ impl Display {
             jobs: Some(jobs),
             thread: Some(thread),
             device: gpu.clone(),
+            #[cfg(all(windows, feature = "pcl-stats"))]
+            _pcl_stats: pcl_stats,
         })
     }
 

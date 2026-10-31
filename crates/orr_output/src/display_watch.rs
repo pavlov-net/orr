@@ -43,7 +43,8 @@ const SUBCLASS_ID: usize = 0x6f72_725f_6477;
 
 /// Watches the monitor a window is on and publishes what the OS reports for it to a
 /// `DisplayFeed`: on HDR, luminance and SDR white changes, on moves to another monitor and on
-/// display mode changes.
+/// display mode changes. With the `pcl-stats` feature it also receives the PC latency ping
+/// for the frames of every `Display`.
 ///
 /// Create it on the thread that owns the window and pumps its messages; changes arrive
 /// there. Drop it on that thread, before the window is destroyed. It uses the thread's
@@ -189,6 +190,8 @@ unsafe extern "system" fn subclass_proc(
     let subclass = unsafe { &*(data as *const Subclass) };
     match msg {
         WM_DISPLAYCHANGE => subclass.feed.set(read(&subclass.info, hwnd)),
+        #[cfg(feature = "pcl-stats")]
+        m if crate::pcl_stats::is_ping(m) => crate::pcl_stats::ping(),
         WM_WINDOWPOSCHANGED => {
             // SAFETY: `hwnd` is the live subclassed window.
             let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };

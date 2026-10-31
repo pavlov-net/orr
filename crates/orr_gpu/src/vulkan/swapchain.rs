@@ -115,6 +115,8 @@ struct Locked {
     /// The current swapchain was created with low latency on.
     latency: bool,
     mode: Option<SleepMode>,
+    /// Also given every marker, with or without a swapchain.
+    marker_hook: Option<fn(u64, LatencyMarker)>,
 }
 
 impl Locked {
@@ -235,6 +237,9 @@ impl LowLatency {
     /// carries the same strictly increasing id; reports are keyed by it.
     pub fn marker(&self, frame_id: u64, marker: LatencyMarker) {
         let locked = self.lock.lock();
+        if let Some(hook) = locked.marker_hook {
+            hook(frame_id, marker);
+        }
         let Some(raw) = locked.latency_raw() else {
             return;
         };
@@ -243,6 +248,13 @@ impl LowLatency {
             .marker(vk_marker(marker));
         // SAFETY: the swapchain is live and the lock is held.
         unsafe { self.lock.latency_fn().set_latency_marker(raw, &info) };
+    }
+
+    /// Calls `hook` with every later marker of every handle of this swapchain, under the
+    /// swapchain's lock, before the driver's call; `None` removes it. Kept across
+    /// recreation, and called while the swapchain has no image chain too.
+    pub fn set_marker_hook(&self, hook: Option<fn(u64, LatencyMarker)>) {
+        self.lock.lock().marker_hook = hook;
     }
 
     /// Appends the driver's latency reports (`vkGetLatencyTimingsNV`), one per frame id,
@@ -412,6 +424,7 @@ impl Swapchain {
                 raw: vk::SwapchainKHR::null(),
                 latency: false,
                 mode: None,
+                marker_hook: None,
             }),
             sleep,
             sleep_value: AtomicU64::new(0),

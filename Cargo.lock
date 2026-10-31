@@ -2067,6 +2067,7 @@ name = "orr_output"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
+ "cc",
  "exr",
  "log",
  "moxcms",
