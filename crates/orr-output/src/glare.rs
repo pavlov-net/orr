@@ -1,5 +1,6 @@
-//! Glare: Jimenez's band pyramid with per-channel band weights fitted at build to the
-//! diaphragm's Fraunhofer PSF, after the other camera effects; the tonemap composites it.
+//! Glare after the other camera effects, which the tonemap composites: by default
+//! Jimenez's band pyramid with per-channel band weights fitted at build to the diaphragm's
+//! Fraunhofer PSF; FFT convolution with the same PSF (`fft_glare`) as the costlier setting.
 
 use orr_scene::orr_gpu::{
     AddressMode, Allocation, CommandList, ComputePipeline, Device, Filter, Format, GpuPtr, Hazards,
@@ -8,6 +9,7 @@ use orr_scene::orr_gpu::{
 };
 use orr_scene::{Glare, ViewConstants};
 
+use crate::fft_glare::FftGlareTargets;
 use crate::passes::groups;
 use crate::shaders::post::glare::{self, Root};
 use crate::{GT7_SDR_NITS, Image, ResolvedDisplay, Result, ViewOutput};
@@ -46,11 +48,46 @@ pub struct GlarePass<'a> {
 /// What the tonemap composites, from [`crate::OutputKernels::glare`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GlareComposite {
-    /// The chain; mip 0 holds the weighted band sum.
+    /// The chain, whose mip 0 holds the glare: the weighted band sum, or the FFT
+    /// convolution.
     pub chain: TextureIndex,
-    /// The frame's weights, one `[f32; 4]` per entry: xyz per Rec.2020 channel, entry 0 the
-    /// identity weight `1 - sum w`, entry `1 + m` mip m's band times the strength.
+    /// The frame's weights, one `[f32; 4]` per entry, xyz per Rec.2020 channel. Entry 0 is
+    /// the identity weight `1 - sum w`. With bands, entry `1 + m` is mip m's band times the
+    /// strength, 9 entries in all; FFT glare has entry 0 only.
     pub weights: GpuPtr<[f32; 4]>,
+}
+
+/// The reference pixel pitch over the view's, and the stops the HDR rendition's F-number
+/// moves down by.
+pub(crate) fn lens_terms(pass: &GlarePass<'_>) -> (f32, f32) {
+    let pitch_um = 1000.0 * pass.sensor_width_mm / pass.extent[0] as f32;
+    let hdr_shift = match pass.display.encoding {
+        OutputFormat::Sdr => 0.0,
+        _ => (pass.display.peak_nits.max(GT7_SDR_NITS) / GT7_SDR_NITS).log2(),
+    };
+    (GLARE_REFERENCE_PITCH_UM / pitch_um, hdr_shift)
+}
+
+/// A view's glare buffers, for the method its last frame used.
+pub(crate) enum ViewGlare {
+    Bands(Box<GlareTargets>),
+    Fft(Box<FftGlareTargets>),
+}
+
+impl ViewGlare {
+    pub(crate) fn texture(&self) -> &Texture {
+        match self {
+            Self::Bands(t) => t.texture(),
+            Self::Fft(t) => t.texture(),
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        match self {
+            Self::Bands(t) => t.bytes(),
+            Self::Fft(t) => t.bytes(),
+        }
+    }
 }
 
 pub(crate) struct GlareKernels {
@@ -98,11 +135,7 @@ impl GlareKernels {
         glare: &Glare,
     ) -> Vec<Root> {
         let mips = targets.sizes.len() as u32;
-        let pitch_um = 1000.0 * pass.sensor_width_mm / pass.extent[0] as f32;
-        let hdr_shift = match pass.display.encoding {
-            OutputFormat::Sdr => 0.0,
-            _ => (pass.display.peak_nits.max(GT7_SDR_NITS) / GT7_SDR_NITS).log2(),
-        };
+        let (pitch_ratio, hdr_shift) = lens_terms(pass);
         let base = Root {
             view: pass.view,
             tables: self.tables.gpu,
@@ -117,7 +150,7 @@ impl GlareKernels {
             source_texel_x: 0.0,
             source_texel_y: 0.0,
             stride: 1.0,
-            pitch_ratio: GLARE_REFERENCE_PITCH_UM / pitch_um,
+            pitch_ratio,
             hdr_shift,
             strength: glare.strength,
             first_level: targets.first_level,

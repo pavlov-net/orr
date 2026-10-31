@@ -44,8 +44,23 @@ pub struct PostQuality {
     /// Rings of the half-resolution depth-of-field gathers; ring k holds 8k samples.
     pub dof_rings: u32,
     pub dof_path: DofPath,
-    /// Halvings to the glare pyramid's first level: 1 (half resolution) or 2.
+    pub glare: GlareMethod,
+    /// Halvings to the resolution glare runs at: 1 (half resolution) or 2. For the bands it
+    /// is the pyramid's first level.
     pub glare_first_level: u32,
+}
+
+/// How glare convolves the radiance with the diaphragm's PSF.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GlareMethod {
+    /// A band pyramid with per-channel weights fitted to the PSF's energy in rings: radially
+    /// symmetric, without the spikes.
+    #[default]
+    Bands,
+    /// FFT convolution with the PSF itself: the blades' diffraction spikes and the far tail,
+    /// out to a quarter of the image's longer side. Costlier in time and memory (about
+    /// 100 MB at 4K).
+    Fft,
 }
 
 impl Default for PostQuality {
@@ -54,6 +69,7 @@ impl Default for PostQuality {
             motion_blur_samples: 35,
             dof_rings: 5,
             dof_path: DofPath::AfterRr,
+            glare: GlareMethod::Bands,
             glare_first_level: 1,
         }
     }

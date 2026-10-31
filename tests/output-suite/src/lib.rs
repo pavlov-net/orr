@@ -4,8 +4,8 @@
 use half::f16;
 use orr_output::{
     CapturePass, ComposeSource, DisplayRequest, ExposurePass, ExposureTelemetry, GlareComposite,
-    GlarePass, OutputFormat, OutputKernels, OutputView, ResolvedDisplay, SceneCapturePass,
-    Screenshot, ScreenshotRequest, TonemapPass, ViewOutput,
+    GlareMethod, GlarePass, OutputFormat, OutputKernels, OutputView, ResolvedDisplay,
+    SceneCapturePass, Screenshot, ScreenshotRequest, TonemapPass, ViewOutput,
 };
 use orr_scene::orr_gpu::{
     Allocation, ComputePipeline, Format, GpuPtr, Hazards, MemoryKind, QueueKind, ShaderStage,
@@ -51,7 +51,7 @@ pub struct Harness {
     /// The lens's glare, run before tonemap; off by default.
     pub glare: Option<Glare>,
     pub sensor_width_mm: f32,
-    composite: Option<GlareComposite>,
+    composite: Option<(GlareComposite, GlareMethod)>,
 }
 
 impl Harness {
@@ -232,7 +232,7 @@ impl Harness {
             },
         );
         if let Some(display) = display {
-            self.composite = self
+            let composite = self
                 .kernels
                 .glare(
                     &mut list,
@@ -249,6 +249,7 @@ impl Harness {
                     },
                 )
                 .unwrap();
+            self.composite = composite.map(|c| (c, output.post.glare));
             let roots = self.output.roots(self.frame);
             self.kernels.tonemap(
                 &mut list,
@@ -261,7 +262,7 @@ impl Harness {
                     display,
                     output,
                     hook_source: None,
-                    glare: self.composite,
+                    glare: composite,
                     distortion: None,
                     frame: self.frame,
                 },
@@ -302,7 +303,13 @@ impl Harness {
 
     /// The last frame's glare weights (`GlareComposite::weights`), if it ran glare.
     pub fn glare_weights(&self) -> Option<Vec<[f32; 4]>> {
-        self.composite.map(|c| read_buffer(c.weights, 9))
+        self.composite.map(|(c, method)| {
+            let entries = match method {
+                GlareMethod::Bands => 9,
+                GlareMethod::Fft => 1,
+            };
+            read_buffer(c.weights, entries)
+        })
     }
 
     /// The view's output state.

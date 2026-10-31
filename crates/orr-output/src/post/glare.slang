@@ -3,7 +3,7 @@
 // own root:
 //
 // - `downsample` writes mip `mip` of the chain with the 13-tap filter: from the exposed
-//   radiance, clamped to [0, STORAGE_MAX], for mip 0, else from mip `mip - 1`. The first
+//   radiance, clamped to [0, GLARE_STORAGE_MAX], for mip 0, else from mip `mip - 1`. The first
 //   thread of mip 0 also writes the view's weights for this frame.
 // - `upsample` adds the 3x3 tent of mip `mip + 1` to mip `mip`'s band times its weight, in
 //   place, from the chain's last mip up; mip 0 then holds the weighted band sum the tonemap
@@ -13,17 +13,11 @@
 #include "orr/root.h"
 import orr.abi;
 import view;
-import exposure;
+import glare_lens;
 import tent;
 
 static const uint ENTRIES = 9;
 static const uint F_NUMBERS = 10;
-static const float F_MIN = 1.4;
-static const float F_MAX = 22.0;
-static const float STORAGE_MAX = 65504.0;
-// The F-number of a lens metering the scene at a 1/SHUTTER_RATE s shutter:
-// N^2 = 2^EV100 / SHUTTER_RATE.
-static const float SHUTTER_RATE = 100.0;
 
 struct Root
 {
@@ -55,29 +49,10 @@ struct Root
 }
 ORR_ROOT(Root);
 
-// The F-number of the lens for a view adapted to `ev100`: brighter scenes stop down, which
-// widens the PSF's tail.
-float glare_f_number(float ev100)
-{
-    return sqrt(exp2(ev100) / SHUTTER_RATE);
-}
-
-// The exposure tonemap applies: the adapted exposure over the pre-exposure.
-float exposure_scale()
-{
-    ViewConstants* view = root.view;
-    ExposureState* cur = view.exposure + view.exposure_slot;
-    ExposureState* next = view.exposure + (view.exposure_slot ^ 1);
-    return exposure_from_ev100(next.adapted_ev100) / cur.pre_exposure;
-}
-
 void write_weights()
 {
-    ViewConstants* view = root.view;
-    ExposureState* next = view.exposure + (view.exposure_slot ^ 1);
-    float n = glare_f_number(next.adapted_ev100 - root.hdr_shift) * root.pitch_ratio;
-    n = clamp(n, F_MIN, F_MAX);
-    float t = log2(n / F_MIN) / log2(F_MAX / F_MIN) * float(F_NUMBERS - 1);
+    float n = glare_f_number(root.view, root.hdr_shift, root.pitch_ratio);
+    float t = log2(n / GLARE_F_MIN) / log2(GLARE_F_MAX / GLARE_F_MIN) * float(F_NUMBERS - 1);
     uint i = min(uint(t), F_NUMBERS - 2);
     float f = t - float(i);
     float4* a = root.tables + ((root.first_level - 1) * F_NUMBERS + i) * ENTRIES;
@@ -103,11 +78,7 @@ float3 tap(float2 uv, float scale)
 {
     float3 c = root.source.get<Texture2D<float4>>().SampleLevel(root.linear.get(), uv,
         root.mip == 0 ? 0.0 : float(root.mip - 1)).rgb;
-    if (root.mip != 0)
-        return c;
-    c *= scale;
-    // NaN fails the comparison and goes to 0 too.
-    return select(c > 0.0, min(c, STORAGE_MAX), 0.0);
+    return root.mip == 0 ? glare_exposed(c, scale) : c;
 }
 
 [shader("compute")]
@@ -118,7 +89,7 @@ void downsample(uint3 id: SV_DispatchThreadID)
         write_weights();
     if (any(id.xy >= uint2(root.width, root.height)))
         return;
-    float scale = root.mip == 0 ? exposure_scale() : 1.0;
+    float scale = root.mip == 0 ? glare_exposure_scale(root.view) : 1.0;
     float2 uv = (float2(id.xy) + 0.5) / float2(root.width, root.height);
     float2 o = root.stride * float2(root.source_texel_x, root.source_texel_y);
     float3 center = tap(uv, scale);

@@ -59,7 +59,7 @@ struct Root
     // With lens distortion `copy_hook_source` writes it after `main`, since it is the image
     // `main` gathers from.
     StorageImageIndex hook_source;
-    // The glare chain, whose mip 0 holds the weighted band sum; NONE without glare.
+    // The glare chain, whose mip 0 holds the glare; NONE without glare.
     TextureIndex glare;
     // Clamps to the edge.
     SamplerIndex linear;

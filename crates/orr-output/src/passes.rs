@@ -13,7 +13,8 @@ use orr_scene::{DepthOfField, LensDistortion, SkyStats, ViewConstants};
 
 use crate::dof::{DofKernels, DofTargets};
 use crate::exposure::{COMPENSATION_ENTRIES, HISTOGRAM_BINS, HISTOGRAM_WORDS_PER_BIN};
-use crate::glare::{GLARE_DISPATCHES, GlareKernels, GlareTargets, levels};
+use crate::fft_glare::{FftGlareKernels, FftGlareTargets, FftLayout};
+use crate::glare::{GLARE_DISPATCHES, GlareKernels, GlareTargets, ViewGlare, levels};
 use crate::hooks::HookTargets;
 use crate::motion_blur::{MotionBlurKernels, MotionBlurTargets};
 use crate::shaders::compose;
@@ -23,9 +24,9 @@ use crate::shaders::hook_inputs;
 use crate::shaders::tonemap::{self, TonemapConstants};
 use crate::{
     AutoExposure, ChainImages, CompensationCurve, DepthOfFieldPass, DistortionField,
-    DofGuideImages, DofPath, Exposure, ExposureTelemetry, GlareComposite, GlarePass, Gt7Curve,
-    HookInputs, Hooks, MeterWeights, MotionBlurPass, OutputDebug, Primaries, ResolvedDisplay,
-    Result, Screenshot, SkyTelemetry, ViewOutput,
+    DofGuideImages, DofPath, Exposure, ExposureTelemetry, GlareComposite, GlareMethod, GlarePass,
+    Gt7Curve, HookInputs, Hooks, MeterWeights, MotionBlurPass, OutputDebug, Primaries,
+    ResolvedDisplay, Result, Screenshot, SkyTelemetry, ViewOutput,
 };
 
 /// Output's compute pipelines on one device.
@@ -36,6 +37,7 @@ pub struct OutputKernels {
     motion_blur: MotionBlurKernels,
     dof: DofKernels,
     glare: GlareKernels,
+    fft_glare: FftGlareKernels,
     tonemap: ComputePipeline,
     tonemap_hook_source: ComputePipeline,
     compose: ComposeKernel,
@@ -60,6 +62,8 @@ const DOF_ROOT: u64 = 2304;
 const GLARE_ROOTS: u64 = 2560;
 const GLARE_ROOT_STRIDE: u64 = 128;
 const COMPENSATION: u64 = GLARE_ROOTS + GLARE_DISPATCHES as u64 * GLARE_ROOT_STRIDE;
+const _: () =
+    assert!(size_of::<crate::shaders::post::fft_glare::Root>() as u64 <= GLARE_ROOT_STRIDE);
 const ZEROS: u64 = COMPENSATION + 4 * COMPENSATION_ENTRIES as u64;
 const UPLOAD_BYTES: u64 = ZEROS + 4 * HISTOGRAM_WORDS;
 const _: () =
@@ -114,7 +118,7 @@ pub struct OutputView {
     hooks: Option<HookTargets>,
     motion_blur: Option<MotionBlurTargets>,
     dof: Option<DofTargets>,
-    glare: Option<GlareTargets>,
+    glare: Option<ViewGlare>,
     device: Device,
 }
 
@@ -159,15 +163,16 @@ impl OutputView {
         self.dof.as_ref().map_or(0, DofTargets::bytes)
     }
 
-    /// Bytes of the glare chain held for the view: 0 unless its last frame had glare.
+    /// Bytes of the glare buffers held for the view: 0 unless its last frame had glare.
     pub fn glare_bytes(&self) -> u64 {
-        self.glare.as_ref().map_or(0, GlareTargets::bytes)
+        self.glare.as_ref().map_or(0, ViewGlare::bytes)
     }
 
-    /// The glare chain (RGBA16F, from 1/2 or 1/4 of the extent), while the view's
-    /// lens has glare: mip 0 holds the weighted band sum the tonemap composites.
+    /// The glare chain (RGBA16F, from 1/2 or 1/4 of the extent), while the view's lens has
+    /// glare: mip 0 holds what the tonemap composites, the weighted band sum or the FFT
+    /// convolution.
     pub fn glare(&self) -> Option<&Texture> {
-        self.glare.as_ref().map(GlareTargets::texture)
+        self.glare.as_ref().map(ViewGlare::texture)
     }
 
     /// The images RR reads on the guide path, while the view's depth of field runs there.
@@ -440,6 +445,7 @@ impl OutputKernels {
             motion_blur: MotionBlurKernels::new(gpu)?,
             dof: DofKernels::new(gpu)?,
             glare: GlareKernels::new(gpu)?,
+            fft_glare: FftGlareKernels::new(gpu)?,
             tonemap: pipeline(&tonemap::MODULE, "tonemap")?,
             tonemap_hook_source: gpu.create_compute_pipeline(
                 &ShaderStage::new(&tonemap::MODULE, "copy_hook_source", SpecData::default())?,
@@ -732,11 +738,13 @@ impl OutputKernels {
         Ok(Some(dof))
     }
 
-    /// Records the `glare` pass when the lens has glare: the band pyramid of `pass.source`
-    /// at the adapted exposure, and this frame's band weights, which the tonemap composites
-    /// from the returned [`GlareComposite`]. Allocates the view's chain on the first frame
-    /// with glare and frees it on the first without, which records nothing; an extent too
-    /// small for two levels records nothing either. Order the source's and the adapt pass's
+    /// Records the `glare` pass when the lens has glare: with `GlareMethod::Bands` the band
+    /// pyramid of `pass.source` at the adapted exposure and this frame's band weights, with
+    /// `Fft` its FFT convolution with the PSF; the tonemap composites either from the
+    /// returned [`GlareComposite`]. Allocates the view's buffers on the first frame with
+    /// glare by a method and frees them on the first without, which records nothing; an
+    /// extent too small for two pyramid levels, or for the FFT's smallest kernel or too large
+    /// for its transforms, records nothing either. Order the source's and the adapt pass's
     /// writes before it with a barrier; it ends with a barrier, so tonemap may follow
     /// directly.
     pub fn glare(
@@ -746,30 +754,63 @@ impl OutputKernels {
         pass: &GlarePass<'_>,
     ) -> Result<Option<GlareComposite>> {
         let first_level = pass.output.post.glare_first_level.clamp(1, 2);
-        let Some(glare) = pass
-            .glare
-            .filter(|_| levels(pass.extent, first_level).len() >= 2)
-        else {
+        let Some(glare) = pass.glare else {
             view.glare = None;
             return Ok(None);
         };
-        let targets = match &mut view.glare {
-            Some(t) if t.fits(pass.extent, first_level) => t,
-            slot => slot.insert(GlareTargets::new(&view.device, pass.extent, first_level)?),
-        };
-        if std::mem::take(&mut targets.fresh) {
-            list.discard(targets.texture());
-        }
-        let roots = self.glare.roots(targets, pass, &glare);
         let n = view.frames.len() as u64;
-        let frame = &mut view.frames[(pass.frame % n) as usize];
-        let at: Vec<_> = roots
-            .iter()
-            .enumerate()
-            .map(|(i, r)| frame.put(GLARE_ROOTS + i as u64 * GLARE_ROOT_STRIDE, r))
-            .collect();
-        self.glare.record(list, targets, &at);
-        Ok(Some(targets.composite()))
+        match pass.output.post.glare {
+            GlareMethod::Bands => {
+                if levels(pass.extent, first_level).len() < 2 {
+                    view.glare = None;
+                    return Ok(None);
+                }
+                if !matches!(&view.glare, Some(ViewGlare::Bands(t)) if t.fits(pass.extent, first_level))
+                {
+                    view.glare = None;
+                    let t = GlareTargets::new(&view.device, pass.extent, first_level)?;
+                    view.glare = Some(ViewGlare::Bands(Box::new(t)));
+                }
+                let Some(ViewGlare::Bands(targets)) = &mut view.glare else {
+                    unreachable!()
+                };
+                if std::mem::take(&mut targets.fresh) {
+                    list.discard(targets.texture());
+                }
+                let roots = self.glare.roots(targets, pass, &glare);
+                let frame = &mut view.frames[(pass.frame % n) as usize];
+                let at: Vec<_> = roots
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| frame.put(GLARE_ROOTS + i as u64 * GLARE_ROOT_STRIDE, r))
+                    .collect();
+                self.glare.record(list, targets, &at);
+                Ok(Some(targets.composite()))
+            }
+            GlareMethod::Fft => {
+                let Some(layout) = FftLayout::new(pass.extent, first_level) else {
+                    view.glare = None;
+                    return Ok(None);
+                };
+                if !matches!(&view.glare, Some(ViewGlare::Fft(t)) if t.layout == layout) {
+                    view.glare = None;
+                    let t = FftGlareTargets::new(&view.device, layout)?;
+                    view.glare = Some(ViewGlare::Fft(Box::new(t)));
+                }
+                let Some(ViewGlare::Fft(targets)) = &mut view.glare else {
+                    unreachable!()
+                };
+                let fresh = std::mem::take(&mut targets.fresh);
+                if fresh {
+                    list.discard(targets.texture());
+                }
+                let root = self.fft_glare.root(targets, pass, &glare, fresh);
+                let frame = &mut view.frames[(pass.frame % n) as usize];
+                let at = frame.put(GLARE_ROOTS, &root);
+                self.fft_glare.record(list, targets, at);
+                Ok(Some(targets.composite()))
+            }
+        }
     }
 
     /// Records the tonemap pass. With lens distortion and `field`, it composes the lens's map
