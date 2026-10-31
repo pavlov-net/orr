@@ -38,6 +38,31 @@ pub struct AssetReport {
     /// Files the importer read.
     pub inputs: Vec<PathBuf>,
     pub entries: Vec<EntryReport>,
+    /// Models of the asset whose meshes repeat rigid units.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub assemblies: Vec<AssemblyReport>,
+}
+
+/// A model cut into repeated units and the rest.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct AssemblyReport {
+    pub model: String,
+    pub units: Vec<AssemblyUnitReport>,
+    /// Triangles of the source mesh and of the model's own mesh after the split.
+    pub triangles: u64,
+    pub kept_triangles: u64,
+    /// Triangles and stored mesh bytes the copies past each unit's first would have added.
+    pub repeated_triangles: u64,
+    pub repeated_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct AssemblyUnitReport {
+    pub model: String,
+    pub copies: u32,
+    pub triangles: u32,
+    /// Stored bytes of the unit's mesh entry.
+    pub stored: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]

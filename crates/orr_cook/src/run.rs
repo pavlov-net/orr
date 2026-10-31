@@ -24,6 +24,7 @@ use orr_pack::{
     Aabb, Archive, ArchiveWriter, AssetId, BlobIn, Class, GDeflate, Hash32, Span, Target,
 };
 
+use crate::assembly::{self, Assembly};
 use crate::cache::Cache;
 use crate::import::Scene;
 use crate::instances::{self, Catalog, ModelFacts};
@@ -34,7 +35,9 @@ use crate::mesh::{
     SectionData, SectionMaps,
 };
 use crate::raster::{self, RasterReport};
-use crate::report::{self, ArchiveReport, AssetReport, Outcome};
+use crate::report::{
+    self, ArchiveReport, AssemblyReport, AssemblyUnitReport, AssetReport, Outcome,
+};
 use crate::state::{self, Input, Memo, Record};
 use crate::subd::{self, CageData, CageInput, SubdSettings};
 use crate::texture::material::{
@@ -213,6 +216,7 @@ struct Imported {
     units: Vec<NewUnit>,
     /// Placements of the instanced models, cooked as instance unit `<asset>/instances`.
     instances: Option<Instances>,
+    assemblies: Vec<Assembly>,
 }
 
 /// An instance source waiting for the keys of the models it places.
@@ -262,6 +266,8 @@ struct Run<'m, 's> {
     files: Vec<Vec<PathBuf>>,
     imports: Vec<Import<'m>>,
     instances: Vec<PendingInstances<'m>>,
+    /// Assemblies by model unit.
+    assemblies: HashMap<usize, Assembly>,
     assets: Vec<AssetReport>,
     /// Report details of cooked units, by unit, until written.
     details: HashMap<usize, Detail>,
@@ -295,6 +301,7 @@ impl<'m, 's> Run<'m, 's> {
             files: vec![Vec::new(); n],
             imports: Vec::new(),
             instances: Vec::new(),
+            assemblies: HashMap::new(),
             assets: Vec::new(),
             details: HashMap::new(),
             ready: BTreeSet::new(),
@@ -436,8 +443,9 @@ impl<'m, 's> Run<'m, 's> {
                 materials,
                 settings,
             } => {
-                let units = mesh_units(name, mesh, materials, settings)?;
+                let (units, assembly) = mesh_units(name, mesh, materials, settings)?;
                 self.add_units(a, index, units);
+                self.add_assemblies(a, assembly);
             }
             Source::Subd {
                 cage,
@@ -566,6 +574,7 @@ impl<'m, 's> Run<'m, 's> {
         for f in &record.files {
             self.input(a, asset, &f.path);
         }
+        self.add_assemblies(a, record.assemblies.iter().cloned());
         self.records[a].push(record.clone());
         Ok(true)
     }
@@ -746,6 +755,14 @@ impl<'m, 's> Run<'m, 's> {
         keys
     }
 
+    /// Registers assemblies of models just added to archive `a`.
+    fn add_assemblies(&mut self, a: usize, assemblies: impl IntoIterator<Item = Assembly>) {
+        for assembly in assemblies {
+            let u = self.by_name[&(a, assembly.model.clone())];
+            self.assemblies.insert(u, assembly);
+        }
+    }
+
     fn add_import(&mut self, i: usize, imported: Imported) {
         let (a, asset, identity) = {
             let imp = &self.imports[i];
@@ -755,10 +772,12 @@ impl<'m, 's> Run<'m, 's> {
         for f in &imported.files {
             self.input(a, asset, &f.path);
         }
+        self.add_assemblies(a, imported.assemblies.iter().cloned());
         self.records[a].push(Record {
             identity,
             files: imported.files,
             units: keys,
+            assemblies: imported.assemblies,
         });
         if let Some(src) = imported.instances {
             self.instances.push(PendingInstances {
@@ -784,9 +803,15 @@ impl<'m, 's> Run<'m, 's> {
                 archive: a,
                 asset,
                 name,
-                src,
+                mut src,
                 record,
             } = pending;
+            let expanded = assembly::expand(&name, &src, |model| {
+                self.named(a, model).and_then(|u| self.assemblies.get(&u))
+            })?;
+            if let Some(expanded) = expanded {
+                src = Cow::Owned(expanded);
+            }
             let cell_log2 = self.manifest.archives[a].cell_log2;
             let mut key =
                 Key::new(Class::InstancePage, &name).hash(instances::input_hash(&src, cell_log2));
@@ -1272,9 +1297,19 @@ impl<'m, 's> Run<'m, 's> {
             writers,
             records,
             files,
-            assets,
+            mut assets,
+            units,
+            assemblies,
             ..
         } = self;
+        for (u, a) in assemblies {
+            let asset = &mut assets[units[u].asset];
+            let report = assembly_report(&a, &asset.entries);
+            asset.assemblies.push(report);
+        }
+        for a in &mut assets {
+            a.assemblies.sort_by(|x, y| x.model.cmp(&y.model));
+        }
         for (a, (spec, writer)) in manifest.archives.iter().zip(writers).enumerate() {
             let entries = assets
                 .iter()
@@ -1313,6 +1348,38 @@ impl<'m, 's> Run<'m, 's> {
         cooked.report.assets = assets;
         Ok(cooked)
     }
+}
+
+/// An assembly's units, copies and repeated triangles and bytes, from the entries of its
+/// asset.
+fn assembly_report(a: &Assembly, entries: &[report::EntryReport]) -> AssemblyReport {
+    let mut out = AssemblyReport {
+        model: a.model.clone(),
+        triangles: a.source_triangles,
+        kept_triangles: a.kept_triangles,
+        ..AssemblyReport::default()
+    };
+    let mut copies = vec![0u32; a.units.len()];
+    for p in &a.placements {
+        copies[p.unit as usize] += 1;
+    }
+    for (unit, copies) in a.units.iter().zip(copies) {
+        let mesh = format!("{}/mesh", unit.model);
+        let stored = entries
+            .iter()
+            .find(|e| e.name == mesh)
+            .map_or(0, |e| e.stored);
+        let extra = u64::from(copies.saturating_sub(1));
+        out.repeated_triangles += extra * u64::from(unit.triangles);
+        out.repeated_bytes += extra * stored;
+        out.units.push(AssemblyUnitReport {
+            model: unit.model.clone(),
+            copies,
+            triangles: unit.triangles,
+            stored,
+        });
+    }
+    out
 }
 
 fn mesh_facts(a: &Archive, e: &orr_pack::Entry) -> Option<(Aabb, ModelFacts)> {
@@ -1450,6 +1517,7 @@ fn plan_scene(name: &str, mut src: Scene, rules: &TextureRules) -> Result<Import
     // Materials of statically displaced sections without their displacement, which the
     // geometry holds.
     let mut baked: HashMap<usize, (AssetId, Hash32)> = HashMap::new();
+    let mut assemblies = Vec::new();
     for model in src.models {
         let model_name = match &model.node {
             None => name.to_string(),
@@ -1510,13 +1578,9 @@ fn plan_scene(name: &str, mut src: Scene, rules: &TextureRules) -> Result<Import
                 settings: c.settings,
             }
         });
-        units.extend(model_units(
-            model_name,
-            mesh,
-            subd,
-            &model_materials,
-            skeleton,
-        ));
+        let (model, assembly) = model_units(model_name, mesh, subd, &model_materials, skeleton);
+        units.extend(model);
+        assemblies.extend(assembly);
     }
     let instances = (!src.instances.is_empty())
         .then(|| scene_instances(name, &src.instances))
@@ -1538,6 +1602,7 @@ fn plan_scene(name: &str, mut src: Scene, rules: &TextureRules) -> Result<Import
         files: src.files,
         units,
         instances,
+        assemblies,
     })
 }
 
@@ -1623,13 +1688,14 @@ fn map_spec(
     }
 }
 
-/// A mesh, its materials and a model from a library caller's mesh.
+/// A mesh, its materials and a model from a library caller's mesh, and the model's
+/// assembly.
 fn mesh_units(
     name: &str,
     input: &MeshInput,
     materials: &[Material],
     settings: &MeshSettings,
-) -> Result<Vec<NewUnit>> {
+) -> Result<(Vec<NewUnit>, Option<Assembly>)> {
     let fail = |message: String| Error::Mesh {
         asset: name.into(),
         message,
@@ -1688,14 +1754,15 @@ fn mesh_units(
         settings: settings.clone(),
         deps: Vec::new(),
     };
-    units.extend(model_units(
+    let (model, assembly) = model_units(
         name.into(),
         Some(part),
         None,
         &materials_out,
         (AssetId::NONE, None),
-    ));
-    Ok(units)
+    );
+    units.extend(model);
+    Ok((units, assembly))
 }
 
 /// A mesh to cook for a model: its entry name, data, settings and the units its maps read.
@@ -1716,8 +1783,73 @@ struct SubdPart {
 }
 
 /// The mesh and cage units of a model and the model unit, with these materials (id and key,
-/// mesh sections then cage sections) and skeleton (id and key).
+/// mesh sections then cage sections) and skeleton (id and key). With assemblies, also a mesh
+/// and a model per repeated unit, and the assembly placing them; the model's mesh then
+/// holds the rest.
 fn model_units(
+    model_name: String,
+    mut mesh: Option<MeshPart>,
+    subd: Option<SubdPart>,
+    materials: &[(AssetId, Hash32)],
+    skeleton: (AssetId, Option<Hash32>),
+) -> (Vec<NewUnit>, Option<Assembly>) {
+    let mut units = Vec::new();
+    let mut found = None;
+    if let Some(part) = &mut mesh
+        && let Some(settings) = &part.settings.assemblies
+        && let Some(split) = assembly::split(&part.mesh, settings, part.settings.position_step_log2)
+    {
+        let source_triangles = part.mesh.triangles();
+        let mut list = Vec::with_capacity(split.units.len());
+        for (i, (mesh, sections)) in split.units.into_iter().enumerate() {
+            let name = format!("{model_name}/unit/{i}");
+            let unit_materials: Vec<_> = sections
+                .iter()
+                .map(|&s| materials[usize::from(s)])
+                .collect();
+            list.push(assembly::Unit {
+                model: name.clone(),
+                sections,
+                triangles: mesh.triangles() as u32,
+            });
+            let mut deps: Vec<String> = mesh
+                .sections
+                .iter()
+                .flat_map(|s| s.maps.units())
+                .map(str::to_string)
+                .collect();
+            deps.sort_unstable();
+            deps.dedup();
+            let unit_mesh = MeshPart {
+                name: format!("{name}/mesh"),
+                mesh,
+                settings: part.settings.clone(),
+                deps,
+            };
+            units.extend(geometry_units(
+                name,
+                Some(unit_mesh),
+                None,
+                &unit_materials,
+                (AssetId::NONE, None),
+            ));
+        }
+        part.mesh = split.remainder;
+        found = Some(Assembly {
+            model: model_name.clone(),
+            units: list,
+            placements: split.placements,
+            source_triangles,
+            kept_triangles: part.mesh.triangles(),
+        });
+    }
+    units.extend(geometry_units(model_name, mesh, subd, materials, skeleton));
+    (units, found)
+}
+
+/// The mesh and cage units of a model and the model unit, with these materials (id and key,
+/// mesh sections then cage sections) and skeleton (id and key).
+fn geometry_units(
     model_name: String,
     mesh: Option<MeshPart>,
     subd: Option<SubdPart>,
@@ -1806,7 +1938,7 @@ fn subd_units(
         materials: materials.to_vec(),
         settings: settings.clone(),
     };
-    units.extend(model_units(
+    units.extend(geometry_units(
         name.into(),
         None,
         Some(part),

@@ -35,6 +35,11 @@
 //! listing the mesh's sections, then the cage's. A material source emits one material `N`.
 //! A texture source emits one texture `N`.
 //!
+//! With [`MeshSettings::assemblies`], a model `M` whose mesh repeats a rigid piece emits
+//! each repeated unit once as model `M/unit/<i>` with mesh `M/unit/<i>/mesh`, and `M/mesh`
+//! keeps the rest. Instance sources that place `M` also place every unit copy, so `M` is
+//! whole only where an instance source places it.
+//!
 //! A raster source emits one raster set `N`: a tiled LOD pyramid per layer, built by the
 //! cook from a whole raster or imported from producer tiles ([`RasterSet`]).
 //!
@@ -59,6 +64,7 @@
 //! count, the target and the mix of cooked and linked entries.
 
 mod alloc;
+mod assembly;
 mod cache;
 #[cfg(feature = "gdeflate")]
 pub mod gdeflate;
@@ -86,6 +92,7 @@ use std::sync::Arc;
 use orr_pack::{BlobIn, Target};
 use serde::Deserialize;
 
+pub use assembly::AssemblySettings;
 pub use import::{NodeSelect, PartAttribute};
 pub use instances::{Instances, Placement, PrototypeSpec, SectionSpec};
 pub use mesh::{LodMode, MeshInput, MeshParts, MeshSettings, OmmSettings, StaticDisplacement};
@@ -95,8 +102,8 @@ pub use raster::{
     RasterSet, Reduction,
 };
 pub use report::{
-    ArchiveReport, AssetReport, CookReport, EntryReport, LevelReport, MeshReport, NeuralReport,
-    NeuralTextureReport, Outcome, TextureReport,
+    ArchiveReport, AssemblyReport, AssemblyUnitReport, AssetReport, CookReport, EntryReport,
+    LevelReport, MeshReport, NeuralReport, NeuralTextureReport, Outcome, TextureReport,
 };
 pub use skin::ClipSettings;
 pub use subd::{Boundary, CageInput, Corner, Crease, FaceVarying, SubdSettings, UvLinear};

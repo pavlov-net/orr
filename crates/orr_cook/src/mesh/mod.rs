@@ -33,6 +33,7 @@ use orr_pack::{Aabb, Hash32, Span, Sphere};
 use rayon::prelude::*;
 use serde::Deserialize;
 
+use crate::assembly::AssemblySettings;
 use crate::texture::Wrap;
 use crate::{Error, Result};
 use maps::{Displacement, Opacity};
@@ -74,6 +75,9 @@ pub struct MeshSettings {
     pub omm: Option<OmmSettings>,
     /// Bakes the displacement texture of displaced sections into their geometry.
     pub displace_static: Option<StaticDisplacement>,
+    /// Repeated rigid pieces of a static, unskinned, unjoined mesh cook once as unit models
+    /// `<model>/unit/<i>`, placed by the instance sources that place the model.
+    pub assemblies: Option<AssemblySettings>,
 }
 
 /// Cook-time displacement: triangles split until no edge is over `max_edge`, vertices moved
@@ -102,6 +106,7 @@ impl Default for MeshSettings {
             hierarchy_resident_max: 512 << 10,
             omm: Some(OmmSettings::default()),
             displace_static: None,
+            assemblies: None,
         }
     }
 }
@@ -188,6 +193,7 @@ pub(crate) enum Pivots {
     Origin,
 }
 
+#[derive(Clone)]
 pub(crate) struct SectionData {
     pub indices: Range<usize>,
     /// [`Section`] flags.
