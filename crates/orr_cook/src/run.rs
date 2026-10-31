@@ -36,6 +36,7 @@ use crate::state::{self, Input, Memo, Record};
 use crate::texture::material::{
     ImageFacts, ImageFile, MaterialTextures, Packer, TexRef, TextureJob, image_facts,
 };
+use crate::texture::neural::{self, NeuralJob};
 use crate::texture::{self, ENCODERS, Wrap};
 use crate::{
     CookOptions, Cooked, Error, GltfSettings, Instances, Manifest, MeshSettings, Placement,
@@ -105,6 +106,7 @@ enum Work<'m> {
     /// it waits for when it starts.
     Mesh(Arc<MeshData>, MeshSettings, Vec<SectionMaps>),
     Texture(TextureJob, Arc<Vec<ImageFile>>),
+    Neural(NeuralJob, Arc<Vec<ImageFile>>),
     TextureFile(PathBuf, Hash32, TextureSettings),
     /// A model of the mesh in `deps[0]`, these materials and this skeleton.
     Model(Vec<AssetId>, AssetId),
@@ -209,6 +211,7 @@ type UnitResult = (From, f64, Detail);
 #[derive(Default)]
 struct Detail {
     raster: Option<RasterReport>,
+    neural: Option<report::NeuralReport>,
     warnings: Vec<String>,
 }
 
@@ -1116,6 +1119,7 @@ impl<'m, 's> Run<'m, 's> {
                 }
                 if let (Some(d), Some(first)) = (self.details.remove(&u), reports.first_mut()) {
                     first.raster = d.raster;
+                    first.neural = d.neural;
                     first.warnings = d.warnings;
                 }
                 self.assets[asset].entries.extend(reports);
@@ -1263,6 +1267,7 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
         units.push(unit);
     }
     let jobs = std::mem::take(&mut packer.jobs);
+    let sets = std::mem::take(&mut packer.neural);
     drop(packer);
     let textures: HashMap<AssetId, (String, Hash32)> = jobs
         .iter()
@@ -1328,6 +1333,12 @@ fn import_gltf(name: &str, path: &Path, settings: &GltfSettings, memo: &Memo) ->
         let (name, key, working_set) = (job.name.clone(), job.key, job.working_set(&images));
         let work = Work::Texture(job, Arc::clone(&images));
         let class = Class::Texture as u16;
+        units.push(NewUnit::leaf(&name, class, key, working_set, work));
+    }
+    for set in sets {
+        let (name, key, working_set) = (set.name.clone(), set.key, set.working_set(&images));
+        let work = Work::Neural(set, Arc::clone(&images));
+        let class = Class::NeuralTextureSet as u16;
         units.push(NewUnit::leaf(&name, class, key, working_set, work));
     }
     Ok(Imported {
@@ -1617,6 +1628,12 @@ fn cook_unit(
             let built = job.run(&images)?;
             drop(images);
             texture::add(&mut w, name, key, &built)?;
+        }
+        Work::Neural(set, images) => {
+            let built = set.run(&images)?;
+            drop(images);
+            neural::add(&mut w, name, key, &built)?;
+            detail.neural = Some(built.report);
         }
         Work::TextureFile(path, hash, settings) => {
             let bytes = state::read_checked(&path, hash)?;

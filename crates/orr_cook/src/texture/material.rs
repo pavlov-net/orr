@@ -21,15 +21,17 @@
 //! A bound texture's value multiplies the matching factor; normal, occlusion and opacity
 //! textures have no factor.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use orr_pack::material::{Material, TextureBinding, slot};
+use orr_pack::texture::mip_size;
 use orr_pack::{AssetId, Class, Hash32};
 use rayon::prelude::*;
 use serde::Deserialize;
 
 use super::load::{self, Source};
 use super::mips::{MipSpec, Toksvig};
+use super::neural::{self, NeuralJob, NeuralSettings};
 use super::{
     Built, DataFormat, Encoding, Img, MipFilter, Plan, Primaries, Quality, Wrap, srgb_to_linear,
 };
@@ -47,6 +49,8 @@ pub struct TextureRules {
     /// Applied in order to every texture made from an image whose name or URI contains the
     /// pattern.
     pub overrides: Vec<(String, TextureOverride)>,
+    /// With it, each material also cooks a neural texture set of its textures.
+    pub neural: Option<NeuralSettings>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -187,6 +191,11 @@ pub(crate) struct Packer<'a> {
     rules: &'a TextureRules,
     made: HashMap<Hash32, AssetId>,
     pub jobs: Vec<TextureJob>,
+    /// Job index of each planned texture.
+    by_id: HashMap<AssetId, usize>,
+    /// Member textures of each planned neural set.
+    sets: HashSet<Vec<AssetId>>,
+    pub neural: Vec<NeuralJob>,
 }
 
 /// A texture to make from one or more source channels.
@@ -219,6 +228,7 @@ enum Channel {
 }
 
 /// One packed texture to cook.
+#[derive(Clone)]
 pub(crate) struct TextureJob {
     pub name: String,
     pub key: Hash32,
@@ -257,6 +267,9 @@ impl<'a> Packer<'a> {
             rules,
             made: HashMap::new(),
             jobs: Vec::new(),
+            by_id: HashMap::new(),
+            sets: HashSet::new(),
+            neural: Vec::new(),
         }
     }
 
@@ -558,6 +571,28 @@ impl<'a> Packer<'a> {
             )?;
             bind(m, slot::DISPLACEMENT, id, 0, r);
         }
+        if let Some(settings) = &self.rules.neural {
+            self.neural_set(suffix, m, settings)?;
+        }
+        Ok(())
+    }
+
+    /// Plans the neural set of the material's textures, unless one with the same textures
+    /// is planned.
+    fn neural_set(&mut self, suffix: &str, m: &Material, settings: &NeuralSettings) -> Result<()> {
+        let mut ids: Vec<AssetId> = Vec::new();
+        for (s, b) in m.textures.iter().enumerate() {
+            if s != slot::OPACITY && b.texture != AssetId::NONE && !ids.contains(&b.texture) {
+                ids.push(b.texture);
+            }
+        }
+        let jobs: Vec<&TextureJob> = ids.iter().map(|id| &self.jobs[self.by_id[id]]).collect();
+        let Some(set) = neural::plan(self.asset, suffix, &jobs, settings)? else {
+            return Ok(());
+        };
+        if self.sets.insert(set.members()) {
+            self.neural.push(set);
+        }
         Ok(())
     }
 
@@ -709,6 +744,7 @@ impl<'a> Packer<'a> {
             .finish();
         let id = AssetId::from_name(&name);
         self.made.insert(same, id);
+        self.by_id.insert(id, self.jobs.len());
         self.jobs.push(TextureJob {
             name,
             key,
@@ -739,10 +775,44 @@ impl TextureJob {
     }
 
     pub(crate) fn run(&self, images: &[ImageFile]) -> Result<Built> {
-        let fail = |message: String| Error::Texture {
+        let (img, plan) = self.prepare(images)?;
+        super::build(vec![img], &plan)
+            .map_err(|e| self.fail(format!("texture {}: {e}", self.pack.role)))
+    }
+
+    /// The mip chain [`Self::run`] encodes.
+    pub(crate) fn chain(&self, images: &[ImageFile]) -> Result<Vec<Img>> {
+        let (img, plan) = self.prepare(images)?;
+        super::chains(vec![img], &plan)
+            .map(|mut c| c.remove(0))
+            .map_err(|e| self.fail(format!("texture {}: {e}", self.pack.role)))
+    }
+
+    /// Mip 0 size of the cooked texture.
+    pub(crate) fn cooked_size(&self) -> [u32; 2] {
+        let [w, h] = self.size;
+        mip_size(w, h, super::skipped_mips(w, h, self.max_size))
+    }
+
+    pub(crate) fn encoding(&self) -> Encoding {
+        self.pack.encoding
+    }
+
+    /// Whether the texture holds a tangent-space normal map.
+    pub(crate) fn is_normal(&self) -> bool {
+        self.pack.normal
+    }
+
+    fn fail(&self, message: String) -> Error {
+        Error::Texture {
             asset: self.asset.clone(),
             message,
-        };
+        }
+    }
+
+    /// The packed mip 0 and how it cooks.
+    fn prepare(&self, images: &[ImageFile]) -> Result<(Img, Plan)> {
+        let fail = |message: String| self.fail(message);
         let mut decoded = HashMap::new();
         for &i in &self.images {
             let (img, ..) =
@@ -804,6 +874,6 @@ impl TextureJob {
             toksvig,
             lights: Vec::new(),
         };
-        super::build(vec![img], &plan).map_err(|e| fail(format!("texture {}: {e}", p.role)))
+        Ok((img, plan))
     }
 }
