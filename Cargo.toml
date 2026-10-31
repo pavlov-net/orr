@@ -14,12 +14,15 @@ repository = "https://github.com/pavlov-net/orr"
 orr = { path = "crates/orr" }
 orr-atmosphere = { path = "crates/orr-atmosphere" }
 orr-color = { path = "crates/orr-color", version = "0.0.1" }
+orr-cook = { path = "crates/orr-cook" }
 orr-gpu = { path = "crates/orr-gpu" }
 orr-lighting = { path = "crates/orr-lighting" }
 orr-math = { path = "crates/orr-math", version = "0.0.1" }
 orr-pack = { path = "crates/orr-pack" }
 orr-scene = { path = "crates/orr-scene" }
 orr-shaders = { path = "crates/orr-shaders" }
+gpu-suite = { path = "tests/gpu-suite" }
+shader-maths = { path = "tests/shader-maths" }
 # crates.io ash is stuck on Vulkan 1.3.281; master carries 1.4 headers
 # with descriptor heap, cluster acceleration structures and cooperative
 # vectors.
@@ -33,6 +36,7 @@ bitflags = "2"
 bytemuck = { version = "1", features = ["derive"] }
 # 0.14 is the version ctt uses, so one zstd-sys builds.
 zstd = "0.14"
+png = "0.18"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

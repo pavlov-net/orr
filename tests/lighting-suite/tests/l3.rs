@@ -7,8 +7,8 @@ use bytemuck::Zeroable;
 use glam::{DVec3, Mat3, Vec3};
 use lighting_suite::shaders::{emit, hotspot_bake, nee_probe, procedural_bake, tile_probe};
 use lighting_suite::{
-    TestScene, assert_clean, compute_barrier, finish, kernels, pipeline, read, readback, render,
-    upload,
+    TestScene, affine, assert_clean, compute_barrier, finish, kernels, pipeline, read, readback,
+    render, upload,
 };
 use orr_gpu::{ComputePipeline, GpuAddress, GpuPtr, KernelSet};
 use orr_lighting::{
@@ -350,16 +350,6 @@ fn emitting(color: [f32; 3], luminance: f32, flags: u32) -> MaterialGpu {
     m.emission_luminance = luminance;
     m.flags = material_flags::EMISSIVE | flags;
     m
-}
-
-fn affine(m: Mat3, t: Vec3) -> Affine3 {
-    let r = |i: usize| {
-        let row = m.row(i);
-        [row.x, row.y, row.z, t[i]]
-    };
-    Affine3 {
-        rows: [r(0), r(1), r(2)],
-    }
 }
 
 /// What `emit.slang` emits for one producer entry.
