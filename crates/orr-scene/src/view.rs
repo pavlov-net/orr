@@ -187,7 +187,8 @@ pub struct RasterView {
     /// R32F: the farthest reverse-Z depth per texel, mip 0 at the render extent.
     pub hzb: Arc<Texture>,
     /// Visible clusters written, then visible clusters and cluster work dropped for want
-    /// of room (`Budgets::visible_clusters`, `Budgets::cluster_work`).
+    /// of room (`Budgets::visible_clusters`, `Budgets::cluster_work`), 1, cluster work
+    /// items asked for, mesh-shader opaque and alpha draws, and software-rastered clusters.
     pub counts: GpuPtr<u32>,
 }
 

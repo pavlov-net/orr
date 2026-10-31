@@ -4,6 +4,7 @@ module visibility;
 
 import orr.abi;
 import orr.math;
+import orr.packing;
 import orr_pack.mesh;
 __exported import hit;
 
@@ -12,14 +13,22 @@ public static const uint COUNT_VISIBLE = 0;          // visible clusters written
 public static const uint COUNT_VISIBLE_DROPPED = 1;  // visible clusters past capacity
 public static const uint COUNT_WORK_DROPPED = 2;     // cluster work past capacity
 public static const uint COUNT_DRAWS = 3;            // 1: the draw count of the indirect draws
-public static const uint COUNTS = 4;
+public static const uint COUNT_WORK = 4;             // cluster work items asked for
+public static const uint COUNT_OPAQUE = 5;           // hardware opaque draws
+public static const uint COUNT_ALPHA = 6;            // hardware alpha draws
+public static const uint COUNT_SOFTWARE = 7;         // clusters the software raster draws
+public static const uint COUNTS = 8;
 
-// `TaskWork.flags`.
+// `ClusterWork.flags`.
 public static const uint WORK_DAG = 1;      // select clusters by the DAG cluster rule
 public static const uint WORK_MERGED = 2;   // DAG: the merged stage, else the part stage
 
-// Up to 32 clusters of one page for one task workgroup.
-public struct TaskWork
+// The software raster's largest screen rect, in pixels: its edge functions stay in 32 bits
+// up to here.
+public static const float SOFTWARE_MAX_PIXELS = 128.0;
+
+// Up to 32 clusters of one page for one culling workgroup.
+public struct ClusterWork
 {
     public uint instance;
     public uint page;          // mesh page index
@@ -30,10 +39,11 @@ public struct TaskWork
 public struct RasterGpu
 {
     public GBufferGpu gbuffer;       // what later passes read
-    public TaskWork* work;
-    public uint* task_args;          // task workgroups: x, y, z
-    public uint* alpha_args;         // alpha-bin mesh workgroups: x, y, z
-    public uint* alpha;              // visible clusters with alpha-tested triangles
+    public ClusterWork* work;
+    public uint* args;               // workgroups x, y, z: work, opaque, alpha, software
+    public uint* opaque;             // visible clusters with opaque triangles, hardware path
+    public uint* alpha;              // visible clusters with alpha-tested triangles, hardware path
+    public uint* software;           // visible clusters of the software raster
     public uint* counts;             // COUNT_*
     public uint* bin_args;           // per surface bin: x, y, z
     public uint* bin_tiles;          // per bin: tile_capacity tile indices
@@ -49,6 +59,29 @@ public struct RasterGpu
     public uint visible_capacity;
     public uint bins;                // surface bins: linked surfaces + 1
     public float error_pixels;       // raster LOD error threshold
+    public float software_pixels;    // longest screen-rect side the software raster takes; 0 off
+    public uint _pad;
+}
+
+// `RasterGpu.args` offsets.
+public static const uint ARGS_WORK = 0;
+public static const uint ARGS_OPAQUE = 3;
+public static const uint ARGS_ALPHA = 6;
+public static const uint ARGS_SOFTWARE = 9;
+
+// Workgroup grids cover `n` groups in rows of GRID_X, the smallest maximum Vulkan allows.
+public static const uint GRID_X = 65535;
+
+public void write_grid(uint* args, uint n)
+{
+    args[0] = min(n, GRID_X);
+    args[1] = (n + GRID_X - 1) / GRID_X;
+    args[2] = 1;
+}
+
+public uint grid_index(uint3 group)
+{
+    return group.y * GRID_X + group.x;
 }
 
 // What every raster dispatch and draw takes.
@@ -110,6 +143,34 @@ public bool sphere_visible(ViewConstants* v, float3 center, float radius)
             return false;
     }
     return true;
+}
+
+// Pixel coordinates of clip-space `clip`, as the viewport places them.
+public float2 pixel_from_clip(ViewConstants* v, float4 clip)
+{
+    return (clip.xy / clip.w * 0.5 + 0.5) * float2(v.extent);
+}
+
+// True when cluster `c`'s grid box, placed by `p`, lies in front of the near plane and its
+// screen rect's longer side is at most `pixels`.
+public bool small_on_screen(ViewConstants* v, Placement p, Cluster c, float step, float pixels)
+{
+    float3 lo = grid_position(c.anchor, uint3(0), step);
+    float3 hi = grid_position(c.anchor, uint3(c.local_max[0], c.local_max[1], c.local_max[2]), step);
+    float2 rect_min = float2(1e30);
+    float2 rect_max = float2(-1e30);
+    for (uint i = 0; i < 8; i++)
+    {
+        float3 corner = float3((i & 1) != 0 ? hi.x : lo.x, (i & 2) != 0 ? hi.y : lo.y, (i & 4) != 0 ? hi.z : lo.z);
+        float4 clip = mul(v.clip_from_view_jittered, float4(view_from_relative(v, place(p, corner)), 1.0));
+        if (!(clip.w > 0.0 && clip.z < clip.w))
+            return false;
+        float2 xy = pixel_from_clip(v, clip);
+        rect_min = min(rect_min, xy);
+        rect_max = max(rect_max, xy);
+    }
+    float2 size = rect_max - rect_min;
+    return max(size.x, size.y) <= min(pixels, SOFTWARE_MAX_PIXELS);
 }
 
 // The triangles of a cluster the alpha bin draws: from the returned index to `tri_count`.

@@ -1,6 +1,6 @@
-//! A view's raster half: instance and cluster culling, the mesh-shader raster into the
-//! visibility buffer, the material resolve per surface bin into the G-buffer and motion, the
-//! HZB, and the depth target.
+//! A view's raster half: instance and cluster culling, the mesh-shader and software raster
+//! into the visibility buffer, the material resolve per surface bin into the G-buffer and
+//! motion, the HZB, and the depth target.
 
 use std::sync::Arc;
 
@@ -15,12 +15,18 @@ use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::shaders::{cull, hzb, raster, resolve};
 use crate::{
-    GBufferGpu, RasterGpu, RasterRoot, Result, SceneRoot, TaskWork, ViewConstants, VisibleCluster,
+    ClusterWork, GBufferGpu, RasterGpu, RasterRoot, Result, SceneRoot, ViewConstants,
+    VisibleCluster,
 };
 
-/// `RasterGpu.counts` entries (`visibility.slang`).
-const COUNTS: u64 = 4;
+/// `RasterGpu.counts` entries and `RasterGpu.args` offsets (`visibility.slang`).
+const COUNTS: u64 = 8;
 const COUNT_DRAWS: u64 = 3;
+const ARGS: u64 = 12;
+const ARGS_WORK: u64 = 0;
+const ARGS_OPAQUE: u64 = 3;
+const ARGS_ALPHA: u64 = 6;
+const ARGS_SOFTWARE: u64 = 9;
 const MAX_HZB_MIPS: u32 = 16;
 const TILE: u32 = 8;
 
@@ -29,8 +35,11 @@ pub(crate) struct RasterPipelines {
     clear: PipelineId,
     instances: PipelineId,
     cap: PipelineId,
+    clusters: PipelineId,
+    raster_args: PipelineId,
     opaque: MeshPipeline,
     alpha: MeshPipeline,
+    software: PipelineId,
     classify: PipelineId,
     resolve: PipelineId,
     reduce: PipelineId,
@@ -47,12 +56,9 @@ impl RasterPipelines {
     ) -> Result<Self> {
         let module = kernels.module(&raster::MODULE)?;
         let stage = |entry| ShaderStage::new(module, entry, SpecData::default());
-        let mesh = |task: Option<&'static str>,
-                    mesh: &'static str,
-                    pixel: &'static str,
-                    depth: Option<DepthTarget>| {
+        let mesh = |mesh: &'static str, pixel: &'static str, depth: Option<DepthTarget>| {
             let desc = MeshPipelineDesc {
-                task: task.map(stage).transpose()?,
+                task: None,
                 mesh: stage(mesh)?,
                 pixel: Some(stage(pixel)?),
                 colors: &[] as &[ColorTarget],
@@ -68,13 +74,15 @@ impl RasterPipelines {
             clear: compute(&cull::MODULE, "clear")?,
             instances: compute(&cull::MODULE, "instances")?,
             cap: compute(&cull::MODULE, "cap")?,
-            opaque: mesh(Some("clusters"), "opaque_mesh", "opaque_pixel", None)?,
-            alpha: mesh(None, "alpha_mesh", "alpha_pixel", None)?,
+            clusters: compute(&cull::MODULE, "clusters")?,
+            raster_args: compute(&cull::MODULE, "raster_args")?,
+            opaque: mesh("cluster_mesh", "opaque_pixel", None)?,
+            alpha: mesh("cluster_mesh", "alpha_pixel", None)?,
+            software: compute(&raster::MODULE, "software")?,
             classify: compute(&resolve::MODULE, "classify")?,
             resolve: compute(&resolve::MODULE, "resolve")?,
             reduce: compute(&hzb::MODULE, "reduce")?,
             depth: mesh(
-                None,
                 "fullscreen",
                 "depth",
                 Some(DepthTarget {
@@ -155,9 +163,11 @@ pub(crate) struct ViewTargets {
     pub sizes: TargetSizes,
     pub visibility: Allocation<u64>,
     pub clusters: Allocation<VisibleCluster>,
-    work: Allocation<TaskWork>,
+    work: Allocation<ClusterWork>,
+    opaque: Allocation<u32>,
     alpha: Allocation<u32>,
-    /// Task args (3), alpha args (3), counts.
+    software: Allocation<u32>,
+    /// Workgroup args (`ARGS`), then counts.
     args: Allocation<u32>,
     bin_args: Allocation<u32>,
     bin_tiles: Allocation<u32>,
@@ -213,8 +223,10 @@ impl ViewTargets {
             visibility: device.gpu_malloc(dl, pixels, "visibility buffer")?,
             clusters: device.gpu_malloc(dl, u64::from(s.visible_clusters), "visible clusters")?,
             work: device.gpu_malloc(dl, u64::from(s.work), "cluster work")?,
+            opaque: device.gpu_malloc(dl, u64::from(s.visible_clusters), "opaque clusters")?,
             alpha: device.gpu_malloc(dl, u64::from(s.visible_clusters), "alpha clusters")?,
-            args: device.gpu_malloc(dl, 6 + COUNTS, "raster args")?,
+            software: device.gpu_malloc(dl, u64::from(s.visible_clusters), "software clusters")?,
+            args: device.gpu_malloc(dl, ARGS + COUNTS, "raster args")?,
             bin_args: device.gpu_malloc(dl, 3 * u64::from(s.bins), "bin args")?,
             bin_tiles: device.gpu_malloc(
                 dl,
@@ -256,17 +268,17 @@ impl ViewTargets {
         }
     }
 
-    fn record(&self, error_pixels: f32) -> RasterGpu {
+    fn record(&self, error_pixels: f32, software_pixels: f32) -> RasterGpu {
         let [tx, ty] = tiles(self.sizes.extent);
         let mut hzb = [StorageImageIndex::NONE; MAX_HZB_MIPS as usize];
         hzb[..self.hzb.storage.len()].copy_from_slice(&self.hzb.storage);
-        let args = self.args.gpu;
         RasterGpu {
             gbuffer: self.gbuffer(),
             work: self.work.gpu,
-            task_args: args,
-            alpha_args: args.offset(3),
+            args: self.args.gpu,
+            opaque: self.opaque.gpu,
             alpha: self.alpha.gpu,
+            software: self.software.gpu,
             counts: self.counts(),
             bin_args: self.bin_args.gpu,
             bin_tiles: self.bin_tiles.gpu,
@@ -285,12 +297,15 @@ impl ViewTargets {
             visible_capacity: self.sizes.visible_clusters,
             bins: self.sizes.bins,
             error_pixels,
+            software_pixels,
+            _pad: 0,
         }
     }
 
-    /// `RasterGpu.counts`: visible clusters, visible clusters dropped, work dropped, 1.
+    /// `RasterGpu.counts`: visible clusters, visible clusters dropped, work dropped, 1, work
+    /// asked for, hardware opaque and alpha draws, software clusters.
     pub(crate) fn counts(&self) -> GpuPtr<u32> {
-        self.args.gpu.offset(6)
+        self.args.gpu.offset(ARGS)
     }
 }
 
@@ -307,8 +322,9 @@ pub(crate) fn record(
     instance_capacity: u32,
     view: GpuPtr<ViewConstants>,
     error_pixels: f32,
+    software_pixels: f32,
 ) -> Result<GpuPtr<RasterGpu>> {
-    let raster = window.put(device, &targets.record(error_pixels))?;
+    let raster = window.put(device, &targets.record(error_pixels, software_pixels))?;
     let root = |value: u32| {
         window.put_root(
             device,
@@ -322,10 +338,13 @@ pub(crate) fn record(
         )
     };
     let r0 = root(0)?;
+    let r1 = root(1)?;
     let s = targets.sizes;
     let pixels = s.extent[0] * s.extent[1];
     let [tx, ty] = tiles(s.extent);
     let args = targets.args.gpu;
+    let grid = |at: u64| args.offset(at).cast::<DispatchArgs>();
+    let mesh_args = |at: u64| args.offset(at).cast::<MeshArgs>();
     let draws = targets.counts().offset(COUNT_DRAWS);
     let rendering = Rendering {
         extent: s.extent,
@@ -346,25 +365,32 @@ pub(crate) fn record(
     }
     list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
     list.dispatch(pipelines.get(p.cap), r0, [1, 1, 1]);
+    list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
+    list.dispatch_indirect(pipelines.get(p.clusters), r0, grid(ARGS_WORK));
+    list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+    list.dispatch(pipelines.get(p.raster_args), r0, [1, 1, 1]);
     list.end_pass();
-    let raster_stages = Stages::TASK | Stages::MESH | Stages::PIXEL;
+    let raster_stages = Stages::MESH | Stages::PIXEL;
     list.barrier(
         Stages::COMPUTE,
         raster_stages | Stages::COMPUTE,
         Hazards::DRAW_ARGUMENTS,
     );
 
+    // The software dispatch and the hardware draws share no barrier, so they overlap; both
+    // write the visibility buffer by atomic max.
     list.begin_pass("raster", false);
+    list.dispatch_indirect(pipelines.get(p.software), r0, grid(ARGS_SOFTWARE));
     list.begin_rendering(&rendering);
-    list.draw_mesh_tasks_indirect_count(&p.opaque, r0, args.cast::<MeshArgs>(), draws, 1);
-    list.end_rendering();
-    list.barrier(raster_stages, raster_stages, Hazards::DRAW_ARGUMENTS);
-    list.begin_rendering(&rendering);
-    let alpha_args = args.offset(3).cast::<MeshArgs>();
-    list.draw_mesh_tasks_indirect_count(&p.alpha, r0, alpha_args, draws, 1);
+    list.draw_mesh_tasks_indirect_count(&p.opaque, r0, mesh_args(ARGS_OPAQUE), draws, 1);
+    list.draw_mesh_tasks_indirect_count(&p.alpha, r1, mesh_args(ARGS_ALPHA), draws, 1);
     list.end_rendering();
     list.end_pass();
-    list.barrier(raster_stages, Stages::COMPUTE, Hazards::empty());
+    list.barrier(
+        raster_stages | Stages::COMPUTE,
+        Stages::COMPUTE,
+        Hazards::empty(),
+    );
 
     list.begin_pass("resolve", false);
     list.dispatch(pipelines.get(p.classify), r0, [tx * ty, 1, 1]);
