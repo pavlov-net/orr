@@ -5,6 +5,7 @@ mod env;
 mod load;
 pub(crate) mod material;
 mod mips;
+pub(crate) mod neural;
 
 use orr_pack::texture::{
     ExtractedLight, FormatInfo, TILE_BYTES, TextureHeader, TextureInfo, full_mip_count, mip_size,
@@ -256,8 +257,18 @@ pub(crate) struct Built {
     pub blobs: Vec<Vec<u8>>,
 }
 
-/// Mip chains, encoding and layout for `layers` (mip 0 each, values linear).
-pub(crate) fn build(layers: Vec<Img>, plan: &Plan) -> Result<Built, String> {
+/// Mips dropped from the top of a `w` x `h` chain so mip 0 fits `max_size`.
+pub(crate) fn skipped_mips(w: u32, h: u32, max_size: Option<u32>) -> u32 {
+    max_size.map_or(0, |max| {
+        (0..full_mip_count(w, h))
+            .take_while(|&m| mip_size(w, h, m).into_iter().any(|e| e > max.max(1)))
+            .count() as u32
+    })
+}
+
+/// The mip chains of `layers` (mip 0 each, values linear) as they are encoded: filtered,
+/// with Toksvig roughness, without the mips over `max_size`.
+pub(crate) fn chains(layers: Vec<Img>, plan: &Plan) -> Result<Vec<Vec<Img>>, String> {
     let (w, h) = (layers[0].w, layers[0].h);
     if layers.iter().any(|l| (l.w, l.h) != (w, h)) {
         return Err("layers differ in size".into());
@@ -271,15 +282,17 @@ pub(crate) fn build(layers: Vec<Img>, plan: &Plan) -> Result<Built, String> {
             t.apply(c, &plan.mips)?;
         }
     }
-    let skip = plan.max_size.map_or(0, |max| {
-        (0..full_mip_count(w, h))
-            .take_while(|&m| mip_size(w, h, m).into_iter().any(|e| e > max.max(1)))
-            .count()
-    });
+    let skip = skipped_mips(w, h, plan.max_size) as usize;
     for c in &mut chains {
         c.drain(..skip);
     }
-    let [w, h] = mip_size(w, h, skip as u32);
+    Ok(chains)
+}
+
+/// Mip chains, encoding and layout for `layers` (mip 0 each, values linear).
+pub(crate) fn build(layers: Vec<Img>, plan: &Plan) -> Result<Built, String> {
+    let chains = chains(layers, plan)?;
+    let [w, h] = [chains[0][0].w, chains[0][0].h];
     let encoded = encode::encode(plan.encoding, plan.quality, &chains)?;
     let alpha_cutoff = plan.mips.coverage.map_or(f32::NAN, |(_, c)| c);
     Ok(layout(

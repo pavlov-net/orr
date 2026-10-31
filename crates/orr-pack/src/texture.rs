@@ -199,7 +199,7 @@ impl FormatInfo {
         use vk::*;
         let (block, bytes) = match vk_format {
             R8_UNORM => (1, 1),
-            R8G8_UNORM | R16_UNORM | R16_SFLOAT => (1, 2),
+            R8G8_UNORM | R16_UNORM | R16_SFLOAT | A4R4G4B4_UNORM_PACK16 => (1, 2),
             R8G8B8A8_UNORM | R8G8B8A8_SRGB | R16G16_UNORM | R16G16_SFLOAT | R32_SFLOAT => (1, 4),
             R16G16B16A16_UNORM | R16G16B16A16_SFLOAT | R32G32_SFLOAT => (1, 8),
             R32G32B32A32_SFLOAT => (1, 16),
@@ -376,6 +376,8 @@ pub mod vk {
     pub const BC6H_SFLOAT: u32 = 144;
     pub const BC7_UNORM: u32 = 145;
     pub const BC7_SRGB: u32 = 146;
+    /// Neural texture set latents: four 4-bit features per texel.
+    pub const A4R4G4B4_UNORM_PACK16: u32 = 1_000_340_000;
 }
 
 const _: () = {

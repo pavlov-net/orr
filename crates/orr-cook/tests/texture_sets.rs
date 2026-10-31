@@ -10,6 +10,11 @@
 //! - `ORR_HDR_SET=<dir>`: every `.hdr` under `dir` as a 1024^2 environment map; prints the
 //!   PSNR of the map resampled back to a 1024 x 512 equirect against the source.
 //!
+//! - `ORR_NTC_SET=<dir>` (with the `ntc` feature, LibNTC and a CUDA device): every glTF
+//!   file under `dir` cooks neural texture sets beside its BC textures; every set holds no
+//!   more bytes than the BC textures it stands in for and every texture meets the PSNR
+//!   floor.
+//!
 //! `cargo test --release -p orr-cook --test texture_sets -- --ignored --nocapture`
 
 use std::path::{Path, PathBuf};
@@ -353,4 +358,83 @@ fn hdr_set_round_trips() {
             p.file_name().unwrap().to_string_lossy()
         );
     }
+}
+
+#[cfg(feature = "ntc")]
+#[test]
+#[ignore = "needs ORR_NTC_SET, LibNTC and a CUDA device"]
+fn neural_sets_meet_the_floor() {
+    use orr_cook::{GltfSettings, NeuralSettings, TextureRules};
+    use orr_pack::Class;
+    use orr_pack::neural::NeuralInfo;
+
+    let dir = PathBuf::from(std::env::var_os("ORR_NTC_SET").expect("ORR_NTC_SET"));
+    let mut paths = Vec::new();
+    files(&dir, "gltf", &mut paths);
+    files(&dir, "glb", &mut paths);
+    paths.sort();
+    let floor = NeuralSettings::default().min_psnr;
+    let mut sets = 0;
+    for path in paths {
+        let settings = GltfSettings {
+            textures: TextureRules {
+                neural: Some(NeuralSettings::default()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(
+                Target::Memory,
+                vec![AssetSpec {
+                    name: "g".into(),
+                    source: Source::Gltf {
+                        path: path.clone(),
+                        settings,
+                    },
+                }],
+            )],
+        };
+        let mut cooked = orr_cook::cook(&manifest, &Default::default()).unwrap();
+        let a = Archive::from_memory(cooked.memory.remove(0)).unwrap();
+        for r in cooked.report.assets.iter().flat_map(|a| &a.entries) {
+            let Some(n) = &r.neural else { continue };
+            sets += 1;
+            println!(
+                "{} {}: {:.2} bpp, {} bytes against {} BC, {:.1} dB over {} runs",
+                path.display(),
+                r.name,
+                n.bits_per_pixel,
+                n.bytes,
+                n.bc_bytes,
+                n.psnr,
+                n.runs
+            );
+            for t in &n.textures {
+                println!("  {} {:?}", t.name, t.psnr);
+            }
+            assert!(n.bytes <= n.bc_bytes, "{}: more bytes than BC", r.name);
+            for t in &n.textures {
+                assert!(
+                    t.psnr.iter().all(|&p| p >= floor),
+                    "{}: {} under {floor} dB: {:?}",
+                    r.name,
+                    t.name,
+                    t.psnr
+                );
+            }
+            let e = a.find(AssetId::from_name(&r.name)).unwrap();
+            assert_eq!(e.class, Class::NeuralTextureSet as u16);
+            let info = NeuralInfo::parse(&read_blob(&a, e, 0)).unwrap();
+            assert_eq!(info.textures.len(), n.textures.len());
+            let latents = a.find(info.header.latents).unwrap();
+            let t = TextureInfo::parse(&read_blob(&a, latents, 0)).unwrap();
+            assert_eq!(t.header.vk_format, vk::A4R4G4B4_UNORM_PACK16);
+            assert_eq!(
+                u32::from(t.header.layers) * 4,
+                u32::from(info.header.latent_features)
+            );
+        }
+    }
+    assert!(sets > 0, "no neural sets cooked");
 }

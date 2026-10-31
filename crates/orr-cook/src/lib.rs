@@ -71,11 +71,12 @@ pub use raster::{
     RasterSet, Reduction,
 };
 pub use report::{
-    ArchiveReport, AssetReport, CookReport, EntryReport, LevelReport, MeshReport, Outcome,
-    TextureReport,
+    ArchiveReport, AssetReport, CookReport, EntryReport, LevelReport, MeshReport, NeuralReport,
+    NeuralTextureReport, Outcome, TextureReport,
 };
 pub use skin::ClipSettings;
 pub use texture::material::{TextureOverride, TextureRules};
+pub use texture::neural::NeuralSettings;
 pub use texture::{DataFormat, MipFilter, Primaries, Quality, TextureSettings, Usage, Wrap};
 
 /// Archives to cook. [`Manifest::load`] reads one from TOML.

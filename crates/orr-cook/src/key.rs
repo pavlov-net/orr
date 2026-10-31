@@ -20,6 +20,7 @@ pub(crate) const VERSIONS: &[(Class, u32)] = &[
     (Class::RasterSet, 1),
     (Class::Skeleton, 1),
     (Class::Clip, 1),
+    (Class::NeuralTextureSet, 1),
 ];
 
 /// Cook version of user classes, which the cook stores as given.
@@ -35,7 +36,7 @@ pub(crate) fn version(class: u16) -> u32 {
 fn libraries(class: u16) -> &'static str {
     match Class::from_u16(class) {
         Some(Class::Mesh | Class::Skeleton | Class::Clip) => env!("ORR_COOK_MESH_LIBS"),
-        Some(Class::Texture) => env!("ORR_COOK_TEXTURE_LIBS"),
+        Some(Class::Texture | Class::NeuralTextureSet) => env!("ORR_COOK_TEXTURE_LIBS"),
         Some(Class::RasterSet) => env!("ORR_COOK_RASTER_LIBS"),
         _ => "",
     }

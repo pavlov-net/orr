@@ -6,6 +6,7 @@ use orr_cook::{CookOptions, Manifest, Outcome};
 use orr_pack::clip::ClipHeader;
 use orr_pack::instance::{InstancePageInfo, InstanceRecord};
 use orr_pack::mesh::{Cluster, MeshHeader, MeshInfo, Node, PageHeader, cluster_resident_len};
+use orr_pack::neural::NeuralInfo;
 use orr_pack::raster::{RasterLayer, RasterSetInfo};
 use orr_pack::skeleton::{NO_PARENT, SkeletonInfo};
 use orr_pack::texture::TextureInfo;
@@ -166,6 +167,8 @@ fn inspect(args: &[String]) -> Result<bool> {
                 clip_line(&a, e, &mut out)?;
             } else if e.class == Class::Mesh as u16 {
                 mesh_lines(&a, e, &mut out)?;
+            } else if e.class == Class::NeuralTextureSet as u16 {
+                neural_lines(&a, e, &mut out)?;
             }
         }
         if name.is_some() {
@@ -215,6 +218,40 @@ fn texture_line(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
         h.tail_first_mip,
         info.lights.len()
     )?;
+    Ok(())
+}
+
+/// Size, channels, LibNTC version and weight types of a neural texture set, then the
+/// textures it stands in for.
+fn neural_lines(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
+    let info = NeuralInfo::parse(&mount_blob(a, e)?)?;
+    let h = info.header;
+    let kinds: Vec<u32> = info.weights.iter().map(|(w, _)| w.kind).collect();
+    writeln!(
+        out,
+        "    {}x{}, {} mips, {} channels, {} features, {:.2} bpp, libntc {}.{}.{} schema {}, weight types {kinds:?}",
+        h.width,
+        h.height,
+        h.mip_count,
+        h.channel_count,
+        h.latent_features,
+        h.bits_per_pixel,
+        h.library[0],
+        h.library[1],
+        h.library[2],
+        h.file_schema
+    )?;
+    for t in &info.textures {
+        writeln!(
+            out,
+            "    {} channels {}..{} stored {} {:.1} dB",
+            t.texture,
+            t.first_channel,
+            t.first_channel + t.channel_count,
+            t.stored,
+            t.psnr
+        )?;
+    }
     Ok(())
 }
 

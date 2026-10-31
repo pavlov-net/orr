@@ -18,6 +18,7 @@ bytemuck.workspace = true
 # encoders the cook does not use.
 ctt = { version = "=0.6.1", default-features = false, features = ["encoder-bc7enc", "encoder-intel", "ispc-prebuilt", "rayon"] }
 glam = { workspace = true, features = ["serde"] }
+libloading = { workspace = true, optional = true }
 gltf = { version = "=1.4.1", default-features = false, features = ["utils", "names", "extras", "KHR_materials_emissive_strength", "KHR_materials_ior"] }
 half = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr", "exr"] }
@@ -30,6 +31,15 @@ thiserror.workspace = true
 tiff = "0.11"
 toml = "0.9"
 zstd.workspace = true
+
+[features]
+# Neural texture sets through RTXNTC's LibNTC (NVIDIA RTX SDK licence, never vendored): the
+# headers of the checkout at ORR_NTC_SDK at build time, the library loaded when a set cooks.
+ntc = ["dep:libloading", "dep:cc", "dep:orr-shaders"]
+
+[build-dependencies]
+cc = { workspace = true, optional = true }
+orr-shaders = { workspace = true, features = ["build"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = ["Win32_System_SystemInformation"] }

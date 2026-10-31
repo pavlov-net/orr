@@ -46,6 +46,7 @@ serde_json = "1.0.154"
 egui = { version = "0.37", default-features = false }
 io-uring = "0.7.15"
 libc = "0.2"
+libloading = "0.9"
 windows = "0.62.2"
 
 cc = "1.10"

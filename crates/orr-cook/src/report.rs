@@ -58,6 +58,8 @@ pub struct EntryReport {
     pub texture: Option<TextureReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raster: Option<RasterReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neural: Option<NeuralReport>,
     /// Content the cook accepted but flags: displacement that differs across uv seams,
     /// subsurface materials on open meshes.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -143,6 +145,33 @@ pub struct TextureReport {
     pub blob_bytes: Vec<u32>,
 }
 
+/// A cooked neural texture set.
+#[derive(Clone, Debug, Serialize)]
+pub struct NeuralReport {
+    /// LibNTC's bits per mip 0 texel of the chosen run.
+    pub bits_per_pixel: f32,
+    /// PSNR over all channels of the chosen run, dB.
+    pub psnr: f32,
+    /// Compression runs of the adaptive search.
+    pub runs: u32,
+    /// Raw bytes of the latents and weights, and of the BC textures of the members.
+    pub bytes: u64,
+    pub bc_bytes: u64,
+    pub textures: Vec<NeuralTextureReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NeuralTextureReport {
+    /// The BC texture entry.
+    pub name: String,
+    /// Per channel at mip 0, dB.
+    pub psnr: Vec<f32>,
+    /// Whether the set stands in for the texture.
+    pub kept: bool,
+}
+
 /// Sizes of an entry; mesh and texture details only for entries this cook made.
 /// `triangles` counts a mesh's source triangles.
 pub(crate) fn entry(
@@ -191,6 +220,7 @@ pub(crate) fn entry(
         mesh,
         texture,
         raster: None,
+        neural: None,
         warnings: Vec::new(),
     }
 }
