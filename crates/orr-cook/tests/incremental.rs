@@ -1,14 +1,17 @@
 //! Incremental cook: keys, links from the replaced archive and the cache, determinism.
 
+#[path = "common/assembly.rs"]
+mod common_assembly;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use glam::{DVec3, Quat, Vec3};
 use orr_cook::{
-    ArchiveSpec, AssetSpec, CookOptions, Cooked, DataFormat, GltfSettings, Instances, LodMode,
-    Manifest, MipFilter, Outcome, Placement, PrototypeSpec, Quality, Source, TextureRules,
-    TextureSettings, Usage,
+    ArchiveSpec, AssemblySettings, AssetSpec, CookOptions, Cooked, DataFormat, GltfSettings,
+    Instances, LodMode, Manifest, MipFilter, Outcome, Placement, PrototypeSpec, Quality, Source,
+    TextureRules, TextureSettings, Usage,
 };
 use orr_pack::{Archive, AssetId, Class, Target};
 
@@ -609,4 +612,71 @@ fn gdeflate_archives_store_payload_pages() {
     assert_eq!(*std::fs::read(&file).unwrap(), *cooked.memory[1]);
     let again = cook_file(true);
     assert_eq!(names(&again, Outcome::Cooked), BTreeSet::new());
+}
+
+#[test]
+fn linked_imports_still_expand_assemblies() {
+    let d = dir("incremental-assembly");
+    let path = d.join("rack.glb");
+    common_assembly::write(&path, 12, true);
+    let manifest = |output: Target, n: usize| {
+        let mut settings = GltfSettings::default();
+        settings.mesh.assemblies = Some(AssemblySettings::default());
+        let records = (0..n)
+            .map(|i| Placement {
+                position: DVec3::new(10.0 * i as f64, 0.0, 5.0),
+                rotation: Quat::from_rotation_y(i as f32),
+                scale: Vec3::ONE,
+                prototype: 0,
+            })
+            .collect();
+        let assets = vec![
+            AssetSpec {
+                name: "rack".into(),
+                source: Source::Gltf {
+                    path: path.clone(),
+                    settings,
+                },
+            },
+            AssetSpec {
+                name: "scatter".into(),
+                source: Source::Instances(Instances {
+                    records,
+                    prototypes: vec![PrototypeSpec {
+                        model: "rack".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            },
+        ];
+        Manifest {
+            archives: vec![ArchiveSpec::new(output, assets)],
+        }
+    };
+    let file = d.join("out.orr");
+    let first = orr_cook::cook(&manifest(Target::File(file.clone()), 2), &opts(0)).unwrap();
+    assert_eq!(names(&first, Outcome::Cooked).len(), entry_count(&first));
+
+    let more = orr_cook::cook(&manifest(Target::File(file.clone()), 3), &opts(0)).unwrap();
+    let cooked = names(&more, Outcome::Cooked);
+    assert!(!cooked.is_empty());
+    assert!(
+        cooked.iter().all(|n| n.starts_with("scatter/")),
+        "{cooked:?}"
+    );
+    assert_eq!(more.report.assets[0].assemblies[0].units[0].copies, 12);
+    let fresh = orr_cook::cook(&manifest(Target::Memory, 3), &opts(0))
+        .unwrap()
+        .memory
+        .remove(0);
+    assert_eq!(*fresh, *std::fs::read(&file).unwrap());
+    let a = Archive::open(&file).unwrap();
+    let records: usize = a
+        .entries()
+        .iter()
+        .filter(|e| e.class == Class::InstancePage as u16)
+        .map(|e| a.blobs(e)[1].raw_len as usize / size_of::<orr_pack::instance::InstanceRecord>())
+        .sum();
+    assert_eq!(records, 3 * (1 + 12));
 }

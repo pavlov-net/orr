@@ -81,6 +81,19 @@ fn build(args: &[String]) -> Result<bool> {
             if a.written { "" } else { ", unchanged" }
         )?;
     }
+    for a in cooked.report.assets.iter().flat_map(|a| &a.assemblies) {
+        writeln!(
+            out,
+            "{}: {} units, {} copies, {} of {} triangles kept, {} triangles and {} B repeated",
+            a.model,
+            a.units.len(),
+            a.units.iter().map(|u| u.copies).sum::<u32>(),
+            a.kept_triangles,
+            a.triangles,
+            a.repeated_triangles,
+            a.repeated_bytes
+        )?;
+    }
     writeln!(
         out,
         "{cooked_n} entries cooked, {linked} linked in {:.2} s",

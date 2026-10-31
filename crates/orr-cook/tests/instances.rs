@@ -1,11 +1,13 @@
 mod common;
+#[path = "common/assembly.rs"]
+mod common_assembly;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use glam::{DVec3, Quat, Vec3};
 use orr_cook::{
-    ArchiveSpec, AssetSpec, Error, GltfSettings, Instances, Manifest, Placement, PrototypeSpec,
-    SectionSpec, Source,
+    ArchiveSpec, AssemblySettings, AssetSpec, Error, GltfSettings, Instances, Manifest, Placement,
+    PrototypeSpec, SectionSpec, Source,
 };
 use orr_pack::instance::{self, InstancePageInfo, InstanceRecord};
 use orr_pack::{Archive, AssetId, Class, Entry, Target};
@@ -429,4 +431,170 @@ fn user_classes_pass_through() {
         },
     }]);
     assert!(matches!(r, Err(Error::UserClass { class: 7, .. })));
+}
+
+fn assembly_model(path: &Path) -> AssetSpec {
+    let mut settings = GltfSettings::default();
+    settings.mesh.assemblies = Some(AssemblySettings::default());
+    AssetSpec {
+        name: "kit/rack".into(),
+        source: Source::Gltf {
+            path: path.into(),
+            settings,
+        },
+    }
+}
+
+fn cook_with_report(assets: Vec<AssetSpec>) -> orr_cook::Result<(Archive, orr_cook::CookReport)> {
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(Target::Memory, assets)],
+    };
+    let mut cooked = orr_cook::cook(&manifest, &Default::default())?;
+    let a = Archive::from_memory(cooked.memory.remove(0)).unwrap();
+    Ok((a, cooked.report))
+}
+
+#[test]
+fn assemblies_place_their_units_through_instance_sources() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let copies = 40;
+    let placements = [
+        (
+            DVec3::new(10.0, 2.0, 12.0),
+            Quat::from_rotation_y(0.4),
+            Vec3::ONE,
+        ),
+        (
+            DVec3::new(40.0, 1.0, 30.0),
+            Quat::from_rotation_x(-1.2),
+            Vec3::splat(1.5),
+        ),
+        (
+            DVec3::new(70.0, 0.0, 80.0),
+            Quat::IDENTITY,
+            Vec3::splat(0.8),
+        ),
+    ];
+    let src = Instances {
+        records: placements
+            .iter()
+            .map(|&(position, rotation, scale)| Placement {
+                position,
+                rotation,
+                scale,
+                prototype: 0,
+            })
+            .collect(),
+        prototypes: vec![PrototypeSpec {
+            model: "kit/rack".into(),
+            flags: 0x5,
+            pose: 0,
+            sections: vec![
+                SectionSpec {
+                    material: Some("paint".into()),
+                    hidden: false,
+                },
+                SectionSpec {
+                    material: None,
+                    hidden: true,
+                },
+            ],
+        }],
+        ..Default::default()
+    };
+    let paint = AssetSpec {
+        name: "paint".into(),
+        source: Source::Material(Default::default()),
+    };
+    let scatter = |src: Instances| AssetSpec {
+        name: "scatter".into(),
+        source: Source::Instances(src),
+    };
+
+    for sheet in [true, false] {
+        let path = dir.join(format!("assembly-{sheet}.glb"));
+        let centroids = common_assembly::write(&path, copies, sheet);
+        let assets = vec![assembly_model(&path), paint.clone(), scatter(src.clone())];
+        let (a, report) = cook_with_report(assets).unwrap();
+
+        let unit = a
+            .expect(
+                AssetId::from_name("kit/rack/unit/0"),
+                Class::Model as u16,
+                orr_pack::model::SCHEMA,
+            )
+            .unwrap();
+        let info = orr_pack::model::ModelInfo::parse(&read(&a, unit, 0)).unwrap();
+        assert_eq!(info.header.mesh, AssetId::from_name("kit/rack/unit/0/mesh"));
+        assert_eq!(info.materials, [AssetId::from_name("kit/rack/material/0")]);
+        assert!(a.find(AssetId::from_name("kit/rack/unit/1")).is_none());
+        assert!(a.find(AssetId::from_name("kit/rack/mesh")).is_some());
+
+        let mut body = 0;
+        let mut found: Vec<Vec3> = Vec::new();
+        for e in pages(&a) {
+            let head = read(&a, e, 0);
+            let page = InstancePageInfo::parse(&head).unwrap();
+            let edge = f64::from(ArchiveSpec::DEFAULT_CELL_LOG2).exp2();
+            let corner = DVec3::from(page.header.cell.map(f64::from)) * edge;
+            let recs = read(&a, e, 1);
+            let (_, decoded) = instance::decode(&head, &recs).unwrap();
+            for (proto, m) in decoded {
+                let p = &page.prototypes[usize::from(proto)];
+                let sections = &page.sections
+                    [p.sections.first as usize..(p.sections.first + p.sections.count) as usize];
+                assert_eq!(p.flags, 0x5);
+                if p.model == AssetId::from_name("kit/rack") {
+                    body += 1;
+                    assert_eq!(sections.len(), 2);
+                    assert_eq!(sections[1].hidden, 1);
+                    continue;
+                }
+                assert_eq!(p.model, AssetId::from_name("kit/rack/unit/0"));
+                assert_eq!(sections.len(), 1);
+                assert_eq!(sections[0].material, AssetId::from_name("paint"));
+                assert_eq!(sections[0].hidden, 0);
+                let t = DVec3::new(
+                    m.rows[0][3].into(),
+                    m.rows[1][3].into(),
+                    m.rows[2][3].into(),
+                );
+                found.push((t + corner).as_vec3());
+            }
+        }
+        assert_eq!(body, if sheet { placements.len() } else { 0 });
+        assert_eq!(found.len(), placements.len() * copies);
+        for &(position, rotation, scale) in &placements {
+            for c in &centroids {
+                let want = position.as_vec3() + rotation * (scale * *c);
+                let near = found.iter().any(|f| f.distance(want) < 2e-3);
+                assert!(near, "no unit copy at {want}");
+            }
+        }
+
+        let asset = report.assets.iter().find(|r| r.name == "kit/rack").unwrap();
+        let [ar] = &asset.assemblies[..] else {
+            panic!("{:?}", asset.assemblies);
+        };
+        assert_eq!(ar.units.len(), 1);
+        assert_eq!(ar.units[0].copies, copies as u32);
+        assert_eq!(ar.units[0].triangles, common_assembly::UNIT_TRIANGLES);
+        assert_eq!(ar.kept_triangles, if sheet { 128 } else { 0 });
+        assert_eq!(ar.triangles, ar.kept_triangles + copies as u64 * 240);
+        assert_eq!(ar.repeated_triangles, (copies as u64 - 1) * 240);
+        assert!(ar.units[0].stored > 0);
+        assert_eq!(ar.repeated_bytes, (copies as u64 - 1) * ar.units[0].stored);
+    }
+
+    let path = dir.join("assembly-true.glb");
+    let joined = Instances {
+        joined: true,
+        ..src.clone()
+    };
+    let r = cook_with_report(vec![assembly_model(&path), paint.clone(), scatter(joined)]);
+    assert!(matches!(r, Err(Error::Instances { .. })), "{:?}", r.err());
+    let mut uneven = src.clone();
+    uneven.records[0].scale = Vec3::new(1.0, 2.0, 1.0);
+    let r = cook_with_report(vec![assembly_model(&path), paint, scatter(uneven)]);
+    assert!(matches!(r, Err(Error::Instances { .. })), "{:?}", r.err());
 }

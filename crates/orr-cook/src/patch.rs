@@ -4,6 +4,7 @@
 use orr_pack::material::Material;
 use serde::Deserialize;
 
+use crate::assembly::AssemblySettings;
 use crate::mesh::{LodMode, MeshSettings, OmmSettings, StaticDisplacement};
 
 macro_rules! patch {
@@ -92,6 +93,7 @@ patch! {
         hierarchy_resident_max: u32,
         omm: Option<OmmSettings>,
         displace_static: Option<StaticDisplacement>,
+        assemblies: Option<AssemblySettings>,
     }
 }
 

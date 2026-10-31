@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime};
 use orr_pack::Hash32;
 use serde::{Deserialize, Serialize};
 
+use crate::assembly::Assembly;
 use crate::key::{from_hex, hex};
 use crate::{Error, Result};
 
@@ -129,6 +130,9 @@ pub(crate) struct Record {
     pub files: Vec<Input>,
     #[serde(with = "hex_hashes")]
     pub units: Vec<Hash32>,
+    /// The source's models with assemblies, which its linked units do not hold.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assemblies: Vec<Assembly>,
 }
 
 /// A file an importer read and the hash of the bytes it read.
