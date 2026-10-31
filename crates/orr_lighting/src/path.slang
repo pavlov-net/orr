@@ -166,7 +166,7 @@ public struct Alpha<S : ISurface> : IAnyHit
     }
 }
 
-RayDesc path_ray(float3 origin, float3 dir, float t_max)
+public RayDesc path_ray(float3 origin, float3 dir, float t_max)
 {
     RayDesc r;
     r.Origin = origin;
@@ -398,12 +398,10 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r, 
 }
 
 // The first vertex of `pixel` from the G-buffer; false for sky pixels.
-public bool gbuffer_vertex(PathRoot r, uint2 pixel, out PathVertex x)
+public bool gbuffer_vertex(SceneRoot* s, ViewConstants* v, GBufferGpu* gbuffer, uint2 pixel, out PathVertex x)
 {
     x = (PathVertex)0;
-    SceneRoot* s = r.scene;
-    ViewConstants* v = r.view;
-    GSurface g = load_gsurface(s, v, r.gbuffer, pixel);
+    GSurface g = load_gsurface(s, v, gbuffer, pixel);
     if (g.material == MATERIAL_NONE)
         return false;
     x.surface = g;
@@ -459,7 +457,7 @@ public void opaque_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
     if (lens)
         surface = lens_vertex<S>(r, pixel, rng, x1, dir);
     else
-        surface = gbuffer_vertex(r, pixel, x1);
+        surface = gbuffer_vertex(r.scene, v, r.gbuffer, pixel, x1);
     float3 radiance = float3(0.0);
     if (surface)
     {
