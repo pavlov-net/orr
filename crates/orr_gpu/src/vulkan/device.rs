@@ -20,6 +20,7 @@ use super::garbage::{Garbage, Item, MAX_TIMELINES};
 use super::heap::Heaps;
 use super::interop::{ClassicBind, DeviceHooks};
 use super::memory::{MemoryKind, MemoryTypes, Pools, Range, Usage, buffer_usage, sharing};
+use super::perf::{self, Perf};
 use super::queue::{Calibration, PassResult, Queue, QueueKind, QueueRequest, Timeline};
 use super::ray::RecordBlock;
 use super::rtas::{RtasCheck, cluster_caps};
@@ -57,6 +58,10 @@ pub struct DeviceDesc<'a> {
     /// [`MemoryKind::Upload`] in host memory whatever the device offers, so callers take the
     /// staging path, as on a device without resizable BAR.
     pub force_staging: bool,
+    /// Loads the Nsight Perf SDK and enables the extensions its range profiler needs, for
+    /// counter frames ([`crate::Caps::perf_counters`]). Builds without `NSIGHT_PERF_SDK`
+    /// ignore it.
+    pub perf_counters: bool,
     /// Resource-heap slots for sampled and storage image views.
     pub image_heap_slots: u32,
     pub sampler_heap_slots: u32,
@@ -73,6 +78,7 @@ impl Default for DeviceDesc<'_> {
             pipeline_cache: None,
             skip_extensions: &[],
             force_staging: false,
+            perf_counters: false,
             image_heap_slots: 262_144,
             sampler_heap_slots: 1024,
         }
@@ -136,6 +142,8 @@ pub(crate) struct Shared {
     pub buffer_usage: vk::BufferUsageFlags,
     pub garbage: Mutex<Garbage>,
     pub results: Mutex<VecDeque<(TimelinePoint, Vec<PassResult>)>>,
+    /// With `Caps::perf_counters`.
+    pub perf: Option<Perf>,
     pub calibration: Mutex<Option<Calibration>>,
     pub checkpoint_fn: Option<ash::nv::device_diagnostic_checkpoints::Device>,
     pub fault_fn: Option<FaultFns>,
@@ -185,6 +193,9 @@ impl Drop for Shared {
         // and is destroyed once.
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Some(p) = self.perf.take() {
+                p.shut_down();
+            }
             for item in self.garbage.get_mut().unwrap().take_all() {
                 self.destroy(item);
             }
@@ -323,7 +334,13 @@ impl Device {
         // SAFETY: loading the system Vulkan loader.
         let entry = unsafe { ash::Entry::load() }.map_err(|e| Error::Loader(e.to_string()))?;
         let messages = Box::<MessageCount>::default();
-        let instance = create_instance(&entry, desc, &messages)?;
+        let (perf_library, perf_instance) = perf::Library::load(desc.perf_counters, &entry).unzip();
+        let instance = create_instance(
+            &entry,
+            desc,
+            perf_instance.as_deref().unwrap_or_default(),
+            &messages,
+        )?;
         let debug_instance = ash::ext::debug_utils::Instance::load(&entry, &instance);
         // SAFETY: the count outlives the messenger (both live in `Shared`).
         let messenger = unsafe {
@@ -357,7 +374,16 @@ impl Device {
                 return Err(e);
             }
         };
-        let created = create_device(&instance, physical, desc, selection);
+        let (perf_library, perf_device) = perf_library
+            .and_then(|l| l.device_extensions(&entry, &instance, physical, |e| selection.offers(e)))
+            .unzip();
+        let created = create_device(
+            &instance,
+            physical,
+            desc,
+            selection,
+            perf_device.as_deref().unwrap_or_default(),
+        );
         let (device, plans, optional, extensions) = match created {
             Ok(c) => c,
             Err(e) => {
@@ -454,6 +480,7 @@ impl Device {
             }
         };
 
+        let perf = perf_library.and_then(|l| Perf::new(l, &entry, &instance, physical, &device));
         let p = &heap_props;
         let caps = Caps {
             device_name: device_name.clone(),
@@ -493,6 +520,7 @@ impl Device {
             cooperative_vector: coop,
             shader_float8: optional.shader_float8,
             calibrated_timestamps: optional.calibrated_timestamps,
+            perf_counters: perf.is_some(),
             frame_boundary: optional.frame_boundary,
             pipeline_executable_info: optional.executable_info,
             conservative_raster: optional.conservative_raster,
@@ -695,6 +723,7 @@ impl Device {
             buffer_usage: usage,
             garbage: Mutex::default(),
             results: Mutex::default(),
+            perf,
             calibration: Mutex::default(),
             checkpoint_fn: optional
                 .checkpoints
@@ -821,6 +850,7 @@ impl Device {
 fn create_instance(
     entry: &ash::Entry,
     desc: &DeviceDesc<'_>,
+    perf_extensions: &[CString],
     messages: &MessageCount,
 ) -> Result<ash::Instance, Error> {
     // SAFETY: plain queries.
@@ -867,10 +897,11 @@ fn create_instance(
             ext_names.push(name.as_ptr());
         }
     }
-    let hooked = desc
+    let mut hooked = desc
         .hooks
         .map(|h| h.instance_extensions(entry))
         .unwrap_or_default();
+    hooked.extend_from_slice(perf_extensions);
     for name in &hooked {
         if !exts
             .iter()
@@ -944,6 +975,7 @@ fn create_device(
     physical: vk::PhysicalDevice,
     desc: &DeviceDesc<'_>,
     mut selection: Selection,
+    perf_extensions: &[CString],
 ) -> Result<
     (
         ash::Device,
@@ -972,6 +1004,11 @@ fn create_device(
         })
         .collect();
     let mut extensions: Vec<CString> = selection.extensions.iter().map(|&n| n.to_owned()).collect();
+    for ext in perf_extensions {
+        if !extensions.contains(ext) {
+            extensions.push(ext.clone());
+        }
+    }
     let _hooked_features = match desc.hooks {
         Some(hooks) => {
             for ext in hooks.device_extensions(instance, physical) {

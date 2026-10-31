@@ -2,6 +2,7 @@
 //! captures, and the examples' kernels.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -48,6 +49,13 @@ impl log::Log for StderrLog {
 /// The examples' NGX project id.
 pub const PROJECT_ID: Uuid = Uuid::from_u128(0x5d1e_7a40_c2b9_4f86_9e3d_61a0_b8f2_47c5);
 
+/// Asks [`device`] for counter frames (`DeviceDesc::perf_counters`); call before its first use.
+pub fn request_perf_counters() {
+    PERF_COUNTERS.store(true, Ordering::Relaxed);
+}
+
+static PERF_COUNTERS: AtomicBool = AtomicBool::new(false);
+
 /// The process's device, created on first use with every queue, NGX's extensions where
 /// NGX offers them, and the validation messenger on (the layer itself loads through
 /// `VK_INSTANCE_LAYERS`). Logs to stderr.
@@ -68,6 +76,7 @@ pub fn device() -> &'static Device {
                 copy: true,
                 present: true,
             },
+            perf_counters: PERF_COUNTERS.load(Ordering::Relaxed),
             ..DeviceDesc::default()
         };
         Device::new(&desc).expect("device")

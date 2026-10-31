@@ -78,6 +78,10 @@ pub struct Caps {
     pub shader_float8: bool,
     /// Pass timings carry CPU-clock spans.
     pub calibrated_timestamps: bool,
+    /// Counter frames ([`crate::Queue::begin_counter_frame`]) collect Nsight Perf SDK
+    /// counters per pass; with [`crate::DeviceDesc::perf_counters`] on a build that found
+    /// the SDK.
+    pub perf_counters: bool,
     /// Submits can carry frame boundaries for capture tools.
     pub frame_boundary: bool,
     /// Pipeline creation logs register, shared-memory and spill counts.

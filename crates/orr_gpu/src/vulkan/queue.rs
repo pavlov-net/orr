@@ -171,6 +171,15 @@ impl Queue {
         self.kind
     }
 
+    pub(crate) fn raw(&self) -> vk::Queue {
+        self.raw
+    }
+
+    /// Held around every call that uses the raw queue.
+    pub(crate) fn lock_submits(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.submit_lock.lock().unwrap()
+    }
+
     fn timeline(&self) -> &Timeline {
         self.shared.timeline(self.kind.index() as u32)
     }
