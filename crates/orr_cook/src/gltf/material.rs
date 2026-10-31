@@ -156,7 +156,7 @@ pub(crate) fn textures(
     json: &Value,
     m: &gltf::Material<'_>,
 ) -> Result<MaterialTextures, String> {
-    let tex = |t: gltf::Texture<'_>, coord: u32| -> Result<TexRef, String> {
+    let tex = |t: gltf::Texture<'_>, coord: u32, channel: u8| -> Result<TexRef, String> {
         if coord > 1 {
             return Err(format!("texCoord {coord}: only uv sets 0 and 1 exist"));
         }
@@ -168,12 +168,14 @@ pub(crate) fn textures(
         let s = t.sampler();
         Ok(TexRef {
             image: t.source().index(),
+            channel,
             uv_set: coord as u8,
             wrap: [wrap(s.wrap_s()), wrap(s.wrap_t())],
+            srgb: None,
         })
     };
     // A textureInfo object of an extension.
-    let info = |ext: &str, key: &str| -> Result<Option<TexRef>, String> {
+    let info = |ext: &str, key: &str, channel: u8| -> Result<Option<TexRef>, String> {
         let Some(i) = extension(json, m, ext).and_then(|e| e.get(key)) else {
             return Ok(None);
         };
@@ -184,37 +186,47 @@ pub(crate) fn textures(
             .textures()
             .nth(index as usize)
             .ok_or(format!("{ext} {key}: texture {index} does not exist"))?;
-        tex(t, i["texCoord"].as_u64().unwrap_or(0) as u32).map(Some)
+        tex(t, i["texCoord"].as_u64().unwrap_or(0) as u32, channel).map(Some)
     };
     let pbr = m.pbr_metallic_roughness();
+    let base_color = pbr
+        .base_color_texture()
+        .map(|i| tex(i.texture(), i.tex_coord(), 0))
+        .transpose()?;
+    let metal_rough = |channel| {
+        pbr.metallic_roughness_texture()
+            .map(|i| tex(i.texture(), i.tex_coord(), channel))
+            .transpose()
+    };
     Ok(MaterialTextures {
-        base_color: pbr
-            .base_color_texture()
-            .map(|i| tex(i.texture(), i.tex_coord()))
-            .transpose()?,
-        metal_rough: pbr
-            .metallic_roughness_texture()
-            .map(|i| tex(i.texture(), i.tex_coord()))
-            .transpose()?,
+        base_color,
+        opacity: base_color.map(|r| TexRef { channel: 3, ..r }),
+        roughness: metal_rough(1)?,
+        metalness: metal_rough(2)?,
         normal: m
             .normal_texture()
-            .map(|i| Ok::<_, String>((tex(i.texture(), i.tex_coord())?, i.scale())))
+            .map(|i| Ok::<_, String>((tex(i.texture(), i.tex_coord(), 0)?, [i.scale(); 2])))
             .transpose()?,
         occlusion: m
             .occlusion_texture()
-            .map(|i| Ok::<_, String>((tex(i.texture(), i.tex_coord())?, i.strength())))
+            .map(|i| Ok::<_, String>((tex(i.texture(), i.tex_coord(), 0)?, i.strength())))
             .transpose()?,
         emissive: m
             .emissive_texture()
-            .map(|i| tex(i.texture(), i.tex_coord()))
+            .map(|i| tex(i.texture(), i.tex_coord(), 0))
             .transpose()?,
-        specular: info("KHR_materials_specular", "specularTexture")?,
-        coat: info("KHR_materials_clearcoat", "clearcoatTexture")?,
-        transmission: info("KHR_materials_transmission", "transmissionTexture")?,
+        specular: info("KHR_materials_specular", "specularTexture", 3)?,
+        coat: info("KHR_materials_clearcoat", "clearcoatTexture", 0)?,
+        transmission: info("KHR_materials_transmission", "transmissionTexture", 0)?,
         subsurface_color: info(
             "KHR_materials_diffuse_transmission",
             "diffuseTransmissionColorTexture",
+            0,
         )?,
-        displacement: info("KHR_materials_displacement", "displacementGeometryTexture")?,
+        displacement: info(
+            "KHR_materials_displacement",
+            "displacementGeometryTexture",
+            0,
+        )?,
     })
 }

@@ -19,6 +19,15 @@
 //!   `subsurface_color`, `specular_weight`, `coat`, `transmission`, `displacement`);
 //!   materials that would cook the same texture share the first one's entry.
 //!
+//! A USD source emits the same classes under the same names, with these differences
+//! ([`UsdSettings`]): the whole-stage model holds the meshes no other model holds; each
+//! `SkelRoot` is a model `N/<root>` of its skinned meshes with skeleton `N/<root>/skeleton`
+//! and clips `N/<root>/clip/<animation>`; each `PointInstancer` prototype is a model
+//! `N/<prototype>` placed by instance pages `N/instances/...`; materials are
+//! `N/material/<prim path>` (`<prim path>/double_sided` on double-sided meshes), their
+//! textures `N/texture/<prim path>/<role>`. A MaterialX source emits one material `N` and its
+//! textures `N/texture/<role>`.
+//!
 //! A mesh source emits the model `N`, its mesh `N/mesh` and its materials
 //! `N/material/<section>`. A material source emits one material `N`. A texture source emits
 //! one texture `N`.
@@ -44,17 +53,21 @@
 mod alloc;
 mod cache;
 mod gltf;
+mod import;
 mod instances;
 mod key;
 mod manifest;
+mod materialx;
 mod mesh;
 mod patch;
 mod raster;
 mod report;
 mod run;
+mod shading;
 mod skin;
 mod state;
 mod texture;
+mod usd;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,7 +75,7 @@ use std::sync::Arc;
 use orr_pack::{BlobIn, Target};
 use serde::Deserialize;
 
-pub use gltf::{NodeSelect, PartAttribute};
+pub use import::{NodeSelect, PartAttribute};
 pub use instances::{Instances, Placement, PrototypeSpec, SectionSpec};
 pub use mesh::{LodMode, MeshInput, MeshParts, MeshSettings, OmmSettings, StaticDisplacement};
 pub use patch::{MaterialPatch, MeshPatch};
@@ -78,6 +91,7 @@ pub use skin::ClipSettings;
 pub use texture::material::{TextureOverride, TextureRules};
 pub use texture::neural::NeuralSettings;
 pub use texture::{DataFormat, MipFilter, Primaries, Quality, TextureSettings, Usage, Wrap};
+pub use usd::{Subdivision, UsdSettings, VariantSelection};
 
 /// Archives to cook. [`Manifest::load`] reads one from TOML.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -129,6 +143,21 @@ pub enum Source {
         path: PathBuf,
         #[serde(default)]
         settings: GltfSettings,
+    },
+    /// A USD stage: `.usda`, `.usdc` or `.usdz`.
+    Usd {
+        path: PathBuf,
+        #[serde(default)]
+        settings: UsdSettings,
+    },
+    /// One `surfacematerial` of a MaterialX document (`.mtlx`).
+    #[serde(rename = "materialx")]
+    MaterialX {
+        path: PathBuf,
+        /// The `surfacematerial` element's name.
+        material: String,
+        #[serde(default)]
+        textures: TextureRules,
     },
     /// An image file: PNG, JPEG, Radiance HDR, OpenEXR, KTX2 or DDS.
     Texture {
