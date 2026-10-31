@@ -26,15 +26,15 @@ pub use orr_output::{
 };
 pub use orr_scene::Error as SceneError;
 pub use orr_scene::{
-    Affine3, BoundTexture, Budgets, Cone, ConsumerMarker, CopyVariant, DepthOfField,
+    Affine3, BoundTexture, Budgets, ClusterRef, Cone, ConsumerMarker, CopyVariant, DepthOfField,
     DirectionalLight, DiscProfile, ExposureState, Focus, FrameStats, FrameTime, Glare, GroupGpu,
     GroupWriter, InstanceFlags, InstanceGpu, InstancePage, InstanceRange, InstancesDesc, Lens,
     LensDistortion, Light, LightGpu, LightId, LoadState, Loading, MaterialGpu, MaterialId,
     MaterialWriter, MeshGpu, ModelGpu, ModelId, MountId, PackSource, PageId, PipelineId, Pose,
-    Projection, REBASE_GRID_LOG2, ReloadReport, RendererDesc, SceneCompute, SceneDesc, SceneId,
-    SceneRoot, SceneWriter, SkyStats, SlotStateGpu, TransformGroupDesc, TransformGroupId,
-    ViewConstants, ViewDesc, ViewHistoryId, ViewTarget, WorldPos, abi, material_flags, orr_gpu,
-    orr_pack,
+    Projection, REBASE_GRID_LOG2, ReloadReport, RendererDesc, RtCutGpu, RtStats, SceneCompute,
+    SceneDesc, SceneId, SceneRoot, SceneWriter, SkyStats, SlotStateGpu, TransformGroupDesc,
+    TransformGroupId, ViewConstants, ViewDesc, ViewHistoryId, ViewTarget, WorldPos, abi,
+    material_flags, orr_gpu, orr_pack,
 };
 
 use orr_gpu::{

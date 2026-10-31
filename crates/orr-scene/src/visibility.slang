@@ -5,7 +5,7 @@ module visibility;
 import orr.abi;
 import orr.math;
 import orr_pack.mesh;
-import surface;
+__exported import hit;
 
 // `RasterGpu.counts` entries.
 public static const uint COUNT_VISIBLE = 0;          // visible clusters written
@@ -61,33 +61,11 @@ public struct RasterRoot
     public uint _pad;
 }
 
-// An instance's transform as the raster uses it: mesh space to render space relative to
-// the eye.
-public struct Placement
-{
-    public float3x3 linear;
-    public float3 translation;
-    public float scale;              // largest axis scale
-}
-
 // The transform of `index` in `group` relative to the eye, from `transforms` (the group's
 // current or previous buffer). False when the group hides the instance.
 public bool placement(GroupGpu* g, uint8_t* transforms, uint index, ViewConstants* v, out Placement p)
 {
-    p = (Placement)0;
-    if (transforms == nullptr || index >= g.count)
-        return false;
-    float3x4 m = ((float3x4*)transforms)[index];
-    if (all(m[0] == 0.0) && all(m[1] == 0.0) && all(m[2] == 0.0))
-        return false;
-    p.linear = affine_linear(m);
-    float3 anchor = view_relative(g.anchor_cell, g.anchor_offset, v.eye_cell.xyz, v.eye_offset.xyz, uint(v.eye_cell.w));
-    p.translation = anchor + affine_translation(m);
-    float3 c0 = float3(m[0].x, m[1].x, m[2].x);
-    float3 c1 = float3(m[0].y, m[1].y, m[2].y);
-    float3 c2 = float3(m[0].z, m[1].z, m[2].z);
-    p.scale = sqrt(max(dot(c0, c0), max(dot(c1, c1), dot(c2, c2))));
-    return true;
+    return placement(g, transforms, index, v.eye_cell.xyz, v.eye_offset.xyz, uint(v.eye_cell.w), p);
 }
 
 // The instance's current placement.
@@ -95,11 +73,6 @@ public bool instance_placement(SceneRoot* s, InstanceGpu inst, ViewConstants* v,
 {
     GroupGpu* g = s.groups + inst.group;
     return placement(g, g.current, inst.group_index, v, p);
-}
-
-public float3 place(Placement p, float3 x)
-{
-    return mul(p.linear, x) + p.translation;
 }
 
 // A view-space point from an eye-relative render-space one.
@@ -137,23 +110,6 @@ public bool sphere_visible(ViewConstants* v, float3 center, float radius)
             return false;
     }
     return true;
-}
-
-// The material of a cluster's section for one copy.
-public uint section_material(SceneRoot* s, InstanceGpu inst, ModelGpu* model, uint section)
-{
-    if (section >= model.section_count)
-        return MATERIAL_NONE;
-    if (inst.material_base == NO_MATERIAL_SET)
-        return model.materials[section];
-    uint set = (inst.variant >> 8) & 0xff;
-    return s.material_sets[inst.material_base + set * model.section_count + section];
-}
-
-// Whether the copy's section mask hides `section`.
-public bool section_hidden(InstanceGpu inst, uint section)
-{
-    return section < 16 && ((inst.variant >> (16 + section)) & 1) != 0;
 }
 
 // The triangles of a cluster the alpha bin draws: from the returned index to `tri_count`.
@@ -217,19 +173,11 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     PrimaryHit hit;
     instance_placement(s, inst, v, hit.placement);
     Placement pl = hit.placement;
-    PageHeader h = load_page_header(vc.page);
     Cluster c = load_cluster(vc.page, vc.local);
-    uint3 k = load_triangle(vc.page, h, c, triangle);
-    float step = mesh.position_step;
-    float3 p0 = load_position(vc.page, h, c, k.x, step);
-    float3 p1 = load_position(vc.page, h, c, k.y, step);
-    float3 p2 = load_position(vc.page, h, c, k.z, step);
-    VertexAttributes a0 = load_attributes(vc.page, h, c, k.x, mesh.attributes);
-    VertexAttributes a1 = load_attributes(vc.page, h, c, k.y, mesh.attributes);
-    VertexAttributes a2 = load_attributes(vc.page, h, c, k.z, mesh.attributes);
-    float3 q0 = place(pl, p0);
-    float3 e1 = mul(pl.linear, p1 - p0);
-    float3 e2 = mul(pl.linear, p2 - p0);
+    Corners t = load_corners(vc.page, c, triangle, mesh);
+    float3 q0 = place(pl, t.position[0]);
+    float3 e1 = mul(pl.linear, t.position[1] - t.position[0]);
+    float3 e2 = mul(pl.linear, t.position[2] - t.position[0]);
 
     float2 extent = float2(v.extent);
     float3 d = render_direction(v, view_direction(v, pixel_center / extent));
@@ -238,49 +186,9 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     float3 b = ray_barycentrics(d, q0, e1, e2);
     float2 bx = ray_barycentrics(dx, q0, e1, e2).xy - b.xy;
     float2 by = ray_barycentrics(dy, q0, e1, e2).xy - b.xy;
-    float3 w = float3(1.0 - b.x - b.y, b.x, b.y);
 
-    float2 uv1 = a1.uv - a0.uv;
-    float2 uv2 = a2.uv - a0.uv;
-    float bias = exp2(v.mip_bias);
     SurfaceInput i;
-    i.uv.uv = a0.uv + b.x * uv1 + b.y * uv2;
-    i.uv.dx = (bx.x * uv1 + bx.y * uv2) * bias;
-    i.uv.dy = (by.x * uv1 + by.y * uv2) * bias;
-
-    float det = determinant(pl.linear);
-    float mirror = det < 0.0 ? -1.0 : 1.0;
-    float3 ng = safe_normalize(cross(e1, e2)) * mirror;
-    float3x3 normal_matrix = cofactors(pl.linear);
-    float3 n_obj = safe_normalize(w.x * a0.normal + w.y * a1.normal + w.z * a2.normal, ng);
-    float3 n = safe_normalize(mul(normal_matrix, n_obj) * mirror, ng);
-    float4 tangent;
-    if ((mesh.attributes & MESH_TANGENT) != 0)
-    {
-        float3 t = w.x * a0.tangent.xyz + w.y * a1.tangent.xyz + w.z * a2.tangent.xyz;
-        tangent = float4(safe_normalize(mul(pl.linear, t), float3(1, 0, 0)), a0.tangent.w * mirror);
-    }
-    else
-    {
-        float r = uv1.x * uv2.y - uv2.x * uv1.y;
-        float3 t = r != 0.0 ? (e1 * uv2.y - e2 * uv1.y) / r : float3(0.0);
-        float3 bt = r != 0.0 ? (e2 * uv1.x - e1 * uv2.x) / r : float3(0.0);
-        if (dot(t, t) == 0.0)
-        {
-            float3 tb;
-            orthonormal_basis(n, t, tb);
-            bt = tb;
-        }
-        t = safe_normalize(t - n * dot(n, t), float3(1, 0, 0));
-        tangent = float4(t, dot(cross(n, t), bt) < 0.0 ? -1.0 : 1.0);
-    }
-    if (dot(ng, d) > 0.0 && (m.flags & MATERIAL_DOUBLE_SIDED) != 0)
-    {
-        ng = -ng;
-        n = -n;
-        tangent.w = -tangent.w;
-    }
-
+    triangle_geometry(i, t, mesh, m, pl, b.xy, bx, by, d, exp2(v.mip_bias));
     float spread = 1.0 / pixels_per_radian(v);
     hit.relative = b.z * d;
     hit.direction = d;
@@ -300,18 +208,8 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     i.vertex_user = uint3(0);
     i.material = vc.material;
     i.surface = m.surface;
-    i.geometric_normal = ng;
-    i.normal = n;
-    i.tangent = tangent;
-    i.object_position = w.x * p0 + w.y * p1 + w.z * p2;
-    i.object_normal = n_obj;
-    i.object_to_render = pl.linear;
     i.position = hit.relative + v.eye_render.xyz;
-    float size = float(1u << uint(v.eye_cell.w));
-    float3 offset = v.eye_offset.xyz + hit.relative;
-    float3 cells = floor(offset / size);
-    i.cell = v.eye_cell.xyz + int3(cells);
-    i.offset = offset - cells * size;
+    world_cell(v.eye_cell.xyz, v.eye_offset.xyz, hit.relative, uint(v.eye_cell.w), i.cell, i.offset);
     i.view_direction = d;
     i.scene = s;
     i.view = v;

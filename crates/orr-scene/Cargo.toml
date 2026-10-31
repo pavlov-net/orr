@@ -20,6 +20,7 @@ orr-pack.workspace = true
 orr-shaders.workspace = true
 bytemuck.workspace = true
 glam.workspace = true
+orr-math.workspace = true
 half = "2.7"
 thiserror.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "exr"], optional = true }

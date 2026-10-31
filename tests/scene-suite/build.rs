@@ -1,6 +1,7 @@
 //! Builds the suite's kernels against orr-scene's shader root, `hot/` from a copy in
-//! `OUT_DIR` that the hot reload test edits, and orr-scene's kernels with the parallax card
-//! of `surfaces/` linked as surface 1.
+//! `OUT_DIR` that the hot reload test edits, and orr-scene's and the suite's kernels with
+//! the surfaces of `surfaces/` linked: the parallax card as surface 1, the context probe as
+//! 2 and the steady surface as 3.
 
 use std::env;
 use std::fs;
@@ -16,6 +17,8 @@ const SCENE_TYPES: &[&str] = &[
     "ModelGpu",
     "MeshGpu",
     "MeshLevel",
+    "ClusterRef",
+    "RtCutGpu",
     "MaterialGpu",
     "LightGpu",
     "EmissiveGpu",
@@ -40,9 +43,10 @@ fn main() {
         }
         b.compile()
     });
-    if let Err(e) = result {
-        panic!("{e}");
-    }
+    let own_points = match result {
+        Ok(out) => out.link_points,
+        Err(e) => panic!("{e}"),
+    };
 
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let hot = out.join("hot-src");
@@ -61,12 +65,25 @@ fn main() {
     }
 
     let points = env::var("DEP_ORR_SCENE_LINK_POINTS").expect("orr-scene link points");
-    let parallax = dir.join("surfaces/parallax.slang");
-    let result = Build::new().and_then(|b| {
-        b.roots(&roots)
+    let surface = |name: &str| dir.join(format!("surfaces/{name}.slang"));
+    let result = Build::new().and_then(|mut b| {
+        b = b
+            .roots(&roots)
+            .include(dir.join("src"))
             .link_points(&points)
-            .out_dir(out.join("linked"))
-            .link(LinkPoint::Surface, "parallax", &parallax, "Parallax")
+            .link_points(&own_points.display().to_string());
+        for t in SCENE_TYPES {
+            b = b.extern_type(t, &format!("::orr_scene::{t}"));
+        }
+        b.out_dir(out.join("linked"))
+            .link(
+                LinkPoint::Surface,
+                "parallax",
+                surface("parallax"),
+                "Parallax",
+            )
+            .link(LinkPoint::Surface, "probe", surface("probe"), "Probe")
+            .link(LinkPoint::Surface, "steady", surface("steady"), "Steady")
             .compile()
     });
     if let Err(e) = result {

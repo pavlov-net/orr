@@ -15,6 +15,8 @@ const SCENE_TYPES: &[&str] = &[
     "ModelGpu",
     "MeshGpu",
     "MeshLevel",
+    "ClusterRef",
+    "RtCutGpu",
     "MaterialGpu",
     "LightGpu",
     "EmissiveGpu",

@@ -12,6 +12,7 @@ use crate::lights::{EMISSIVE_INSTANCE, EMISSIVE_PRODUCER, Light, LightId, light_
 use crate::material::MaterialId;
 use crate::memory::{RangeAllocator, UploadWindow};
 use crate::producer::{self, Producer, ProducerDesc, ProducerId};
+use crate::ptlas::Ptlas;
 use crate::upload::{Op, Record};
 use crate::world::WorldPos;
 use crate::{
@@ -36,6 +37,15 @@ pub struct SceneDesc {
     pub producer_capacity: u32,
     /// Emissive list entries for instances: one per copy per EMISSIVE span of its model.
     pub emissive_capacity: u32,
+    /// PTLAS instances for the animated parts of copies inside their animation range.
+    pub part_capacity: u32,
+    /// PTLAS cell partitions.
+    pub ptlas_partitions: u32,
+    /// Instances one PTLAS partition holds, at most.
+    pub partition_instances: u32,
+    /// Instances the PTLAS global partition holds, at most: movers beyond it stay in their
+    /// cell partitions.
+    pub global_instances: u32,
 }
 
 impl Default for SceneDesc {
@@ -47,6 +57,10 @@ impl Default for SceneDesc {
             material_set_capacity: 4096,
             producer_capacity: 256,
             emissive_capacity: 16_384,
+            part_capacity: 524_288,
+            ptlas_partitions: 2048,
+            partition_instances: 1000,
+            global_instances: 4096,
         }
     }
 }
@@ -232,6 +246,7 @@ pub(crate) struct SceneCpu {
     pub medium: u64,
     pub surface_data: u64,
     pub near_range: f32,
+    pub ptlas: Ptlas,
 }
 
 pub(crate) struct Scene {
@@ -308,6 +323,7 @@ impl Scene {
                 medium: 0,
                 surface_data: 0,
                 near_range: 256.0,
+                ptlas: Ptlas::new(device, desc)?,
             }),
             writing: AtomicBool::new(false),
         })
@@ -484,12 +500,17 @@ impl<'f> SceneWriter<'f> {
             .get(desc.model.0 as usize)
             .and_then(Option::as_ref)
             .filter(|m| !m.spans.is_empty());
-        let (first, entry) = {
+        let (first, entry, partitions, table) = {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
             let first = cpu.slots.alloc(desc.copies).ok_or(Error::Capacity {
                 what: "instances",
                 capacity: self.scene.desc.instance_capacity,
             })?;
+            let cell = cpu
+                .groups
+                .get(desc.transforms.0 as usize)
+                .and_then(Option::as_ref)
+                .map_or(IVec3::ZERO, |g| g.anchor.cell);
             let entry = match emission {
                 None => None,
                 Some(m) => {
@@ -510,8 +531,11 @@ impl<'f> SceneWriter<'f> {
                     Some(entry)
                 }
             };
-            (first, entry)
+            let partitions = cpu.ptlas.place(first, desc.copies, cell);
+            (first, entry, partitions, cpu.ptlas.slot_table.gpu)
         };
+        self.upload(table.offset(u64::from(first)), desc.copies)?
+            .copy_from_slice(&partitions);
         if let (Some(m), Some(entry)) = (emission, entry) {
             let entries = self.upload(
                 self.emissive_entry(entry),
@@ -652,6 +676,7 @@ impl<'f> SceneWriter<'f> {
         cpu.records
             .push(Record::fill(seq, self.instance_word(range.first, 0), n, 0));
         cpu.removed.push((self.frame, range));
+        cpu.ptlas.remove(range.first, range.count, self.frame);
         for (entry, count) in cpu.emissive_runs.remove(range.first, range.count) {
             let at = self.emissive_entry(entry).address().0;
             let n = count * words(size_of::<EmissiveGpu>());

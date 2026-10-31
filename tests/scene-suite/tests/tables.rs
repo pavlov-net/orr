@@ -6,8 +6,8 @@ use orr_scene::testing::{assert_clean, device, read_buffer, wait};
 use orr_scene::{
     Affine3, CopyVariant, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstanceGpu,
     InstanceRange, InstancesDesc, Lens, Light, LightGpu, MaterialGpu, MaterialId, ModelId, Pose,
-    Projection, RendererDesc, SceneDesc, SceneId, SceneRoot, Scenes, TransformGroupDesc,
-    TransformGroupId, ViewConstants, ViewDesc, ViewTarget, WorldPos,
+    Projection, RendererDesc, SceneDesc, SceneId, SceneRoot, Scenes, SlotStateGpu,
+    TransformGroupDesc, TransformGroupId, ViewConstants, ViewDesc, ViewTarget, WorldPos,
 };
 use scene_suite::pipeline;
 use scene_suite::shaders::{placement, reconstruct};
@@ -201,8 +201,19 @@ fn instance_and_material_tables_read_back_as_written() {
             "slot {slot}: {inst:?}"
         );
     }
-    let state = read_buffer(root.slot_state, 1000);
-    assert!(state.iter().all(|s| bytemuck::bytes_of(s) == [0; 8]));
+    // Zeroed when handed out; then the PTLAS kernel marks each slot seen, and these copies'
+    // models are not resident, so it traces none of them.
+    let untraced = SlotStateGpu {
+        stable_frames: 255,
+        rt_flags: 8,
+        ..bytemuck::Zeroable::zeroed()
+    };
+    let state: Vec<SlotStateGpu> = read_buffer(root.slot_state, 1000);
+    assert!(
+        state
+            .iter()
+            .all(|s| bytemuck::bytes_of(s) == bytemuck::bytes_of(&untraced))
+    );
     let table = read_buffer(root.materials, 3);
     for ((id, m), got) in materials.iter().zip(&table) {
         assert_eq!(bytemuck::bytes_of(m), bytemuck::bytes_of(got), "{id:?}");

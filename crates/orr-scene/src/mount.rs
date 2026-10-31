@@ -13,11 +13,12 @@ use orr_gpu::{
 };
 use orr_pack::instance::{InstancePageInfo, InstanceRecord};
 use orr_pack::material::Material;
-use orr_pack::mesh::{Cluster, MeshHeader, MeshInfo, PageView};
+use orr_pack::mesh::{Cluster, MeshHeader, MeshInfo, PageHeader, PageView};
 use orr_pack::model::ModelInfo;
 use orr_pack::texture::{TextureHeader, TextureInfo};
 use orr_pack::{Aabb, Archive, AssetId, Blob, Class, Codec};
 
+use crate::accel::{self, AccelShared, ClusterInfo, MeshInput, MountAccel, PageMicromap};
 use crate::emissive::{EmissiveSpan, ModelEmission, indexed_spans};
 use crate::loading::io::{AlignedBuf, ArchiveFile, Read, SECTOR, read_positioned};
 use crate::loading::{Loading, Msg};
@@ -25,7 +26,7 @@ use crate::material::{BoundTexture, MaterialId, MaterialTable};
 use crate::memory::{RangeAllocator, UploadWindow};
 use crate::scene::ModelId;
 use crate::upload::Record;
-use crate::{Error, MaterialGpu, MeshGpu, ModelGpu, Result};
+use crate::{ClusterRef, Error, MaterialGpu, MeshGpu, ModelGpu, Result, material_flags};
 
 /// Where a pack's bytes come from.
 #[derive(Clone, Debug)]
@@ -78,6 +79,12 @@ struct PlacedMesh {
     header: MeshHeader,
     /// EMISSIVE clusters of the finest level, by mesh cluster index.
     emissive: Vec<(u32, Cluster)>,
+    /// Discrete levels, finest first: error and mesh cluster range.
+    level_ranges: Vec<(f32, u32, u32)>,
+    /// Every cluster by mesh cluster index, as its page decoded.
+    clusters: Vec<(u32, ClusterInfo)>,
+    /// Per page, its micromap region.
+    micromaps: Vec<Option<PageMicromap>>,
 }
 
 /// A resident instance page: its tables on the CPU, its records and consumer data on the
@@ -145,6 +152,7 @@ pub(crate) struct MountTask {
     file: OnceLock<Arc<ArchiveFile>>,
     ring: OnceLock<bool>,
     placed: Mutex<Placed>,
+    accel: Arc<AccelShared>,
 }
 
 impl MountTask {
@@ -154,6 +162,7 @@ impl MountTask {
         device: &Device,
         sampler: SamplerIndex,
         cancel: Arc<AtomicBool>,
+        accel: &Arc<AccelShared>,
     ) -> Self {
         let caps = device.caps();
         Self {
@@ -171,6 +180,7 @@ impl MountTask {
             file: OnceLock::new(),
             ring: OnceLock::new(),
             placed: Mutex::new(Placed::default()),
+            accel: Arc::clone(accel),
         }
     }
 
@@ -569,6 +579,11 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
         bytemuck::cast_slice(&page_clusters),
     )?;
     let finest = info.levels.first().map(|l| l.clusters);
+    let level_ranges = info
+        .levels
+        .iter()
+        .map(|l| (l.error, l.clusters.first, l.clusters.count))
+        .collect();
     let mesh = {
         let mut placed = t.placed.lock().unwrap();
         placed.meshes.push(PlacedMesh {
@@ -585,6 +600,9 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             sections: info.sections.len() as u32,
             header,
             emissive: Vec::new(),
+            level_ranges,
+            clusters: Vec::with_capacity(first as usize),
+            micromaps: vec![None; info.pages.len()],
         });
         placed.meshes.len() - 1
     };
@@ -595,11 +613,24 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
                 resident.resize(len, 0);
                 orr_pack::mesh::decode_page(stored, resident)?;
                 t.write(block, at, resident)?;
-                let emissive = finest_emissive(resident, &header, first, finest)?;
+                let view = PageView::new(resident, &header)?;
+                let emissive = finest_emissive(&view, first, finest);
+                let clusters: Vec<(u32, ClusterInfo)> = (0..view.cluster_count())
+                    .map(|i| (first + i, ClusterInfo::new(p as u32, i, &view.cluster(i))))
+                    .collect();
+                let h: PageHeader =
+                    bytemuck::pod_read_unaligned(&resident[..size_of::<PageHeader>()]);
+                let micromap = (h.omm_offset < h.len && h.omm_usage.iter().any(|&n| n > 0))
+                    .then_some(PageMicromap {
+                        offset: h.omm_offset,
+                        usage: h.omm_usage,
+                    });
                 let mut placed = t.placed.lock().unwrap();
                 let m = &mut placed.meshes[mesh];
                 m.pages[p] = block.gpu + at;
                 m.emissive.extend(emissive);
+                m.clusters.extend(clusters);
+                m.micromaps[p] = micromap;
                 Ok(())
             })
         });
@@ -622,13 +653,11 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
 /// The EMISSIVE clusters of a page at the mesh's finest level: the first discrete level, or
 /// in DAG mode the clusters of zero error.
 fn finest_emissive(
-    page: &[u8],
-    header: &MeshHeader,
+    view: &PageView<'_>,
     first: u32,
     finest: Option<orr_pack::Span>,
-) -> Result<Vec<(u32, Cluster)>> {
-    let view = PageView::new(page, header)?;
-    Ok((0..view.cluster_count())
+) -> Vec<(u32, Cluster)> {
+    (0..view.cluster_count())
         .map(|i| (first + i, view.cluster(i)))
         .filter(|(index, c)| {
             let in_finest = match finest {
@@ -637,7 +666,7 @@ fn finest_emissive(
             };
             in_finest && c.flags & Cluster::EMISSIVE != 0
         })
-        .collect())
+        .collect()
 }
 
 fn gpu_format(vk_format: u32) -> Option<orr_gpu::Format> {
@@ -799,6 +828,12 @@ struct ResolvedMesh {
     page_addresses: Vec<u64>,
     sections: u32,
     spans: Vec<EmissiveSpan>,
+    header: MeshHeader,
+    levels: Vec<(f32, u32, u32)>,
+    clusters: Vec<ClusterInfo>,
+    micromaps: Vec<Option<PageMicromap>>,
+    /// Resident cluster table entries from `gpu.cluster_base` on.
+    refs: Vec<ClusterRef>,
 }
 
 struct ResolvedModel {
@@ -818,6 +853,9 @@ pub(crate) struct Resolved {
     meshes: Vec<ResolvedMesh>,
     models: Vec<ResolvedModel>,
     pages: Vec<PlacedPage>,
+    accel: MountAccel,
+    /// Resident cluster id ranges taken for the mount's meshes.
+    cluster_ranges: Vec<(u32, u32)>,
 }
 
 fn resolve(archive: Arc<Archive>, p: Placed, sampler: SamplerIndex) -> Result<Resolved> {
@@ -856,6 +894,8 @@ fn resolve(archive: Arc<Archive>, p: Placed, sampler: SamplerIndex) -> Result<Re
         .into_iter()
         .map(|mut m| {
             m.emissive.sort_by_key(|(i, _)| *i);
+            m.clusters.sort_by_key(|(i, _)| *i);
+            let clusters: Vec<ClusterInfo> = m.clusters.into_iter().map(|(_, c)| c).collect();
             let mut page_addresses = m.pages;
             let pages = page_addresses.len() as u32;
             let node_pages = m.node_pages.len() as u32;
@@ -878,12 +918,20 @@ fn resolve(archive: Arc<Archive>, p: Placed, sampler: SamplerIndex) -> Result<Re
                         position_step: m.header.step(),
                         attributes: u32::from(m.header.attributes),
                         merge_error: m.header.merge_error,
+                        cluster_base: 0,
+                        rt_cut_count: 0,
                         _pad: 0,
+                        rt_cuts: GpuPtr::NULL,
                     }
                 },
                 page_addresses,
                 sections: m.sections,
                 spans: indexed_spans(m.emissive),
+                header: m.header,
+                levels: m.level_ranges,
+                clusters,
+                micromaps: m.micromaps,
+                refs: Vec::new(),
             }
         })
         .collect();
@@ -920,7 +968,71 @@ fn resolve(archive: Arc<Archive>, p: Placed, sampler: SamplerIndex) -> Result<Re
         meshes,
         models,
         pages: p.pages,
+        accel: MountAccel::default(),
+        cluster_ranges: Vec::new(),
     })
+}
+
+/// Takes resident cluster ids for every mesh of `r` and builds their acceleration
+/// structures after `wait`. Returns the point the build's last work signals.
+fn build_accel(
+    device: &Device,
+    shared: &AccelShared,
+    r: &mut Resolved,
+    wait: Option<TimelinePoint>,
+) -> Result<Option<(QueueKind, TimelinePoint)>> {
+    // Sections whose linked coverage decides every triangle at run time.
+    let mut non_opaque: Vec<Vec<bool>> = r
+        .meshes
+        .iter()
+        .map(|m| vec![false; m.sections as usize])
+        .collect();
+    for model in &r.models {
+        for (section, &mi) in model.materials.iter().enumerate() {
+            let m = &r.materials[mi].1;
+            if m.surface != 0 && m.flags & material_flags::ALPHA_TESTED != 0 {
+                non_opaque[model.mesh][section] = true;
+            }
+        }
+    }
+    for m in &mut r.meshes {
+        let n = m.clusters.len() as u32;
+        let base = shared
+            .cluster_ids
+            .lock()
+            .unwrap()
+            .alloc(n)
+            .ok_or(Error::Capacity {
+                what: "resident clusters",
+                capacity: shared.cluster_capacity,
+            })?;
+        r.cluster_ranges.push((base, n));
+        m.gpu.cluster_base = base;
+    }
+    let inputs: Vec<MeshInput<'_>> = r
+        .meshes
+        .iter()
+        .zip(&non_opaque)
+        .map(|(m, non_opaque)| MeshInput {
+            header: &m.header,
+            pages: &m.page_addresses[..m.gpu.page_count as usize],
+            clusters: &m.clusters,
+            micromaps: &m.micromaps,
+            levels: &m.levels,
+            non_opaque,
+            cluster_base: m.gpu.cluster_base,
+        })
+        .collect();
+    let refs: Vec<Vec<ClusterRef>> = inputs.iter().map(accel::cluster_refs).collect();
+    let built = accel::build(device, &shared.kernels, shared.limits, &inputs, wait)?;
+    drop(inputs);
+    for ((m, refs), cuts) in r.meshes.iter_mut().zip(refs).zip(built.cuts) {
+        m.refs = refs;
+        m.gpu.rt_cuts = cuts.table;
+        m.gpu.rt_cut_count = cuts.count;
+    }
+    r.accel = built.accel;
+    Ok(built.point)
 }
 
 /// Records the staged copies of a mount (and the discards of its staged textures) in one
@@ -972,14 +1084,24 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<MountTask>) 
         Some(e) => Err(e),
         None => Ok(()),
     };
+    let mut ranges = Vec::new();
     let result = state
         .and_then(|()| resolve(Arc::clone(task.archive()), placed, task.sampler))
-        .and_then(|r| Ok((submit_copies(device, &copies, &r.textures)?, r)));
+        .and_then(|mut r| {
+            let copied = submit_copies(device, &copies, &r.textures)?;
+            let built = build_accel(device, &task.accel, &mut r, copied.map(|(_, p)| p));
+            ranges.clone_from(&r.cluster_ranges);
+            Ok((built?.or(copied), r))
+        });
     let (point, result) = match result {
         Ok((point, r)) => (point, Ok(r)),
         Err(e) => {
             for s in slots {
                 device.free_image_slot_after_submitted(s);
+            }
+            let mut ids = task.accel.cluster_ids.lock().unwrap();
+            for (first, count) in ranges {
+                ids.free(first, count);
             }
             (None, Err(Arc::new(e)))
         }
@@ -1008,8 +1130,10 @@ pub(crate) struct Resident {
     meshes: Vec<u32>,
     page_ranges: Vec<(u32, u32)>,
     material_ranges: Vec<(u32, u32)>,
+    cluster_ranges: Vec<(u32, u32)>,
     _archive: Arc<Archive>,
     _blocks: Vec<Allocation<u8>>,
+    _accel: MountAccel,
     placed_textures: Vec<PlacedTexture>,
 }
 
@@ -1029,6 +1153,9 @@ pub(crate) struct Mounts {
     model_ids: RangeAllocator,
     pub meshes: Allocation<MeshGpu>,
     mesh_ids: RangeAllocator,
+    /// The resident cluster table, by cluster id.
+    pub clusters: Allocation<ClusterRef>,
+    accel: Arc<AccelShared>,
     model_materials: Allocation<u32>,
     model_material_ranges: RangeAllocator,
     page_table: Allocation<u64>,
@@ -1067,10 +1194,20 @@ fn capacity(what: &'static str, capacity: u32) -> Error {
 }
 
 impl Mounts {
-    pub(crate) fn new(device: &Device, sizes: TableSizes) -> Result<Self> {
+    pub(crate) fn new(
+        device: &Device,
+        sizes: TableSizes,
+        accel: &Arc<AccelShared>,
+    ) -> Result<Self> {
         let m = MemoryKind::DeviceLocal;
         Ok(Self {
             entries: Vec::new(),
+            clusters: device.gpu_malloc(
+                m,
+                u64::from(accel.cluster_capacity.max(1)),
+                "resident clusters",
+            )?,
+            accel: Arc::clone(accel),
             models: device.gpu_malloc(m, u64::from(sizes.models), "models")?,
             model_ids: RangeAllocator::new(sizes.models),
             meshes: device.gpu_malloc(m, u64::from(sizes.meshes), "meshes")?,
@@ -1200,6 +1337,10 @@ impl Mounts {
         for t in &r.placed_textures {
             device.free_image_slot_after_submitted(t.index.0);
         }
+        let mut ids = self.accel.cluster_ids.lock().unwrap();
+        for &(first, count) in &r.cluster_ranges {
+            ids.free(first, count);
+        }
     }
 
     /// Applies a batch the loading side finished: allocates its ids and table ranges and
@@ -1210,6 +1351,10 @@ impl Mounts {
             if let Ok(r) = batch.result {
                 for t in &r.textures {
                     w.device.free_image_slot_after_submitted(t.index.0);
+                }
+                let mut ids = self.accel.cluster_ids.lock().unwrap();
+                for &(first, count) in &r.cluster_ranges {
+                    ids.free(first, count);
                 }
             }
             if let Some(slot) = self.entries.get_mut(i) {
@@ -1236,8 +1381,10 @@ impl Mounts {
             meshes: Vec::new(),
             page_ranges: Vec::new(),
             material_ranges: Vec::new(),
+            cluster_ranges: r.cluster_ranges,
             _archive: r.archive,
             _blocks: r.blocks,
+            _accel: r.accel,
             placed_textures: r.textures,
         };
         let result = self.fill(&mut res, r.materials, r.meshes, r.models, r.pages, w);
@@ -1294,6 +1441,10 @@ impl Mounts {
                 ..m.gpu
             };
             w.put(self.meshes.gpu.offset(u64::from(id)), &[gpu])?;
+            w.put(
+                self.clusters.gpu.offset(u64::from(m.gpu.cluster_base)),
+                &m.refs,
+            )?;
             mesh_ids.push(id);
         }
         for m in &models {
