@@ -25,7 +25,7 @@ windows = { version = "0.62.2", features = [
 ash.workspace = true
 blake3.workspace = true
 glam.workspace = true
-half = "2.7"
+half = { version = "2.7", features = ["bytemuck"] }
 # GDeflate encoder for the memory decompression test.
 gdeflate = "0.4.1"
 
