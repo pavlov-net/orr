@@ -164,7 +164,7 @@ fn quantise(signal: f64, max: f64) -> f64 {
     (signal * max).round().clamp(0.0, max)
 }
 
-/// MaxCLL and MaxFALL in nits of Rec.2020 pixels in nits.
+/// MaxCLL and MaxFALL of Rec.2020 pixels in nits.
 fn content_light_level(nits: &[[f64; 3]]) -> (f64, f64) {
     if nits.is_empty() {
         return (0.0, 0.0);
