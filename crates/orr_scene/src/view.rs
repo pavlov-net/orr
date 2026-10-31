@@ -190,6 +190,10 @@ pub struct RasterView {
     /// of room (`Budgets::visible_clusters`, `Budgets::cluster_work`), 1, cluster work
     /// items asked for, mesh-shader opaque and alpha draws, and software-rastered clusters.
     pub counts: GpuPtr<u32>,
+    /// The scene's sky statistics, which lighting's scene pass writes and exposure reads.
+    pub sky_stats: GpuPtr<crate::SkyStats>,
+    /// The scene focus in render space; the view's camera while the scene has none.
+    pub focus: [f32; 3],
 }
 
 #[derive(Clone, Copy)]
