@@ -91,7 +91,24 @@ pub struct TextureRegion {
     pub extent: [u32; 3],
 }
 
+/// One mip of a range of layers: what a texture copy region names besides its box.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct TextureLayers {
+    pub mip: u32,
+    pub base_layer: u32,
+    pub layers: u32,
+}
+
 impl TextureRegion {
+    /// The mip and layers the region covers.
+    pub fn layers(&self) -> TextureLayers {
+        TextureLayers {
+            mip: self.mip,
+            base_layer: self.base_layer,
+            layers: self.layers,
+        }
+    }
+
     /// Every texel of `mip` in every layer of a texture described by `desc`.
     pub fn whole_mip(desc: &TextureDesc, mip: u32) -> Self {
         let size = |e: u32| (e >> mip).max(1);

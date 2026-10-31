@@ -45,7 +45,7 @@ pub use rtas::{
 pub use sync::{Hazards, Stages, TimelinePoint};
 pub use texture::{
     AddressMode, CompareOp, Filter, SamplerDesc, SparseLayout, TextureDesc, TextureKind,
-    TextureRegion, TextureUsage, ViewDesc, ViewKind,
+    TextureLayers, TextureRegion, TextureUsage, ViewDesc, ViewKind,
 };
 
 #[cfg(not(target_vendor = "apple"))]
@@ -57,12 +57,12 @@ pub use vulkan::{
     Device, DeviceArenas, DeviceDesc, DeviceFault, DeviceHooks, Diagnostics, DiagnosticsReport,
     DispatchArgs, ExecutionSet, FaultAccess, FaultAddress, Generated, HeapReport, HostArenas,
     InstanceFlags, LowLatency, LssEndCaps, LssIndexing, MATRIX_ALIGN, MatrixConversion,
-    MatrixFormat, MatrixLayout, MemoryKind, MemoryPriority, MemoryReport, MemoryUsage, MeshArgs,
-    MeshPipeline, MeshPipelineDesc, Micromap, MicromapDesc, MicromapTriangle, MicromapUsage,
-    OmmFormat, PageBind, PassResult, PipelineCacheKind, PipelineCacheReport, PipelineStats, Queue,
-    QueueKind, QueueProgress, QueueRequest, RayDispatchPipeline, Rendering, Sequence, SetKind,
-    ShaderStage, SparseAllocation, SparseBinds, Swapchain, SwapchainFrame, Texture, TextureMemory,
-    TileBind,
+    MatrixFormat, MatrixLayout, MemoryCopy, MemoryKind, MemoryPriority, MemoryReport, MemoryUsage,
+    MeshArgs, MeshPipeline, MeshPipelineDesc, Micromap, MicromapDesc, MicromapTriangle,
+    MicromapUsage, OmmFormat, PageBind, PassResult, PipelineCacheKind, PipelineCacheReport,
+    PipelineStats, Queue, QueueKind, QueueProgress, QueueRequest, RayDispatchPipeline, Rendering,
+    Sequence, SetKind, ShaderStage, SparseAllocation, SparseBinds, Swapchain, SwapchainFrame,
+    Texture, TextureCopy, TextureMemory, TileBind,
 };
 
 #[cfg(not(target_vendor = "apple"))]

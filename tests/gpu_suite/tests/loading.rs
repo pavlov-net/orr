@@ -6,13 +6,14 @@
 use std::time::Duration;
 
 use gpu_suite::clusters::*;
-use gpu_suite::shaders::{step, texel_read};
+use gpu_suite::shaders::{copy_lists, step, texel_read};
 use gpu_suite::{assert_clean, device, pipeline, readback, render, upload};
 use orr_gpu::{
     Allocation, BlasLimits, ClusterVertexFormat, CommandList, Device, DeviceDesc, Format,
-    GpuAddress, Hazards, MemoryKind, PageBind, Queue, QueueKind, QueueRequest, RtasFlags,
-    RtasLimits, RtasMode, RtasOp, RtasOpDesc, SparseBinds, Stages, Texture, TextureDesc,
-    TextureKind, TextureMemory, TextureRegion, TextureUsage, TileBind, TimelinePoint, ViewDesc,
+    GpuAddress, Hazards, MemoryCopy, MemoryKind, PageBind, Queue, QueueKind, QueueRequest,
+    RtasFlags, RtasLimits, RtasMode, RtasOp, RtasOpDesc, SparseBinds, Stages, Texture, TextureCopy,
+    TextureDesc, TextureKind, TextureLayers, TextureMemory, TextureRegion, TextureUsage, TileBind,
+    TimelinePoint, ViewDesc,
 };
 
 const WAIT: Duration = Duration::from_secs(60);
@@ -44,6 +45,12 @@ impl Rng {
             .collect();
         v.truncate(n);
         v
+    }
+
+    fn shuffle<T>(&mut self, v: &mut [T]) {
+        for i in (1..v.len()).rev() {
+            v.swap(i, (self.next() % (i as u64 + 1)) as usize);
+        }
     }
 }
 
@@ -230,9 +237,7 @@ fn tiles_round_trip(desc: &TextureDesc, seed: u64) {
         .collect();
     let in_order: Vec<u64> = (0..n as u64).collect();
     let mut shuffled = in_order.clone();
-    for i in (1..n).rev() {
-        shuffled.swap(i, (rng.next() % (i as u64 + 1)) as usize);
-    }
+    rng.shuffle(&mut shuffled);
     for (pass, (block, slots)) in [(&blocks[0], &in_order), (&blocks[1], &shuffled)]
         .into_iter()
         .enumerate()
@@ -832,5 +837,213 @@ fn compute_queue_orders_by_timeline() {
         out.as_slice().unwrap() == &expected[..],
         "chain result differs"
     );
+    assert_clean();
+}
+
+/// GPU-written lists of 10,000 page copies, followed by entries that copy nothing, and 1,000
+/// sparse tile copies give the bytes and texels of the same copies recorded on the CPU, on
+/// the loading queue.
+#[test]
+fn indirect_copies_match_recorded_copies() {
+    const PAGES: u32 = 10_000;
+    const PAGE_BYTES: u32 = 2048;
+    const TILES: u32 = 1_000;
+    const EMPTY: u32 = 16;
+    let d = device();
+    if !gpu_suite::require(
+        d.caps().indirect_copy && d.indirect_copy_format(Format::Bc7Unorm),
+        "indirect copies into BC7 textures",
+    ) {
+        return;
+    }
+    let loading = queue(QueueKind::Loading);
+    let mut rng = Rng(41);
+
+    let page_bytes = u64::from(PAGE_BYTES);
+    let pages_bytes = u64::from(PAGES) * page_bytes;
+    let pool_bytes = pages_bytes + page_bytes;
+    let src = upload(&rng.bytes(pages_bytes as usize), "page sources");
+    let guard = rng.bytes(PAGE_BYTES as usize);
+    let dst: Vec<Allocation<u8>> = (0..2)
+        .map(|_| {
+            let mut a = d
+                .gpu_malloc::<u8>(MemoryKind::Upload, pool_bytes, "page pool")
+                .unwrap();
+            a.as_mut_slice().unwrap()[pages_bytes as usize..].copy_from_slice(&guard);
+            a
+        })
+        .collect();
+    let mut page_source: Vec<u32> = (0..PAGES).collect();
+    rng.shuffle(&mut page_source);
+    let page_source = upload(&page_source, "page source");
+
+    let mut desc = TextureDesc::d2(Format::Bc7Unorm, 4096, 4096, TextureUsage::SAMPLED);
+    desc.mips = 2;
+    let textures: Vec<Texture> = (0..2)
+        .map(|_| {
+            d.create_texture(&desc, TextureMemory::Sparse, "tile copies")
+                .unwrap()
+        })
+        .collect();
+    let layout = *textures[0].sparse_layout().unwrap();
+    let mut tiles = tiles_of(&textures[0]);
+    let slots: Vec<u64> = (0..tiles.len() as u64).collect();
+    let blocks: Vec<Allocation<u8>> = textures
+        .iter()
+        .map(|t| {
+            d.gpu_malloc::<u8>(MemoryKind::DeviceLocal, sparse_bytes(t), "tile block")
+                .unwrap()
+        })
+        .collect();
+    let bound: Vec<TimelinePoint> = textures
+        .iter()
+        .zip(&blocks)
+        .map(|(t, b)| bind_all(t, b, &slots))
+        .collect();
+    rng.shuffle(&mut tiles);
+    tiles.truncate(TILES as usize);
+    let tile_bytes = layout.tile_bytes;
+    let staging = upload(
+        &rng.bytes((u64::from(TILES) * tile_bytes) as usize),
+        "tile staging",
+    );
+    let mut slot_of: Vec<u32> = (0..TILES).collect();
+    rng.shuffle(&mut slot_of);
+    let tile_words: Vec<u32> = tiles
+        .iter()
+        .zip(&slot_of)
+        .flat_map(|(&(_, mip, [x, y]), &slot)| [x, y, mip, slot])
+        .collect();
+    let tile_words = upload(&tile_words, "tile list source");
+    let regions: Vec<TextureRegion> = tiles
+        .iter()
+        .map(|&(layer, mip, tile)| layout.tile_region(&desc, mip, layer, tile))
+        .collect();
+    let tile_texels = layout.tile_extent[0];
+
+    // The CPU-recorded copies.
+    let mut list = loading.command_list().unwrap();
+    for (i, &s) in page_source.as_slice().unwrap().iter().enumerate() {
+        list.copy(
+            dst[0].gpu.offset(i as u64 * page_bytes),
+            src.gpu.offset(u64::from(s) * page_bytes),
+            page_bytes,
+        );
+    }
+    list.discard(&textures[0]);
+    for (region, &slot) in regions.iter().zip(&slot_of) {
+        let at = staging.gpu.offset(u64::from(slot) * tile_bytes);
+        list.copy_rows_to_texture(&textures[0], region, at, tile_texels);
+    }
+    let recorded = loading.submit(vec![list], &bound).unwrap();
+
+    // The GPU-written copies.
+    let page_list = d
+        .gpu_malloc::<MemoryCopy>(
+            MemoryKind::DeviceLocal,
+            u64::from(PAGES + EMPTY),
+            "page list",
+        )
+        .unwrap();
+    let tile_list = d
+        .gpu_malloc::<TextureCopy>(MemoryKind::DeviceLocal, u64::from(TILES), "tile list")
+        .unwrap();
+    let root = upload(
+        &[copy_lists::Root {
+            page_source: page_source.gpu,
+            tiles: tile_words.gpu,
+            src_pages: src.gpu.address().0,
+            dst_pages: dst[1].gpu.address().0,
+            page_list: page_list.gpu.address().0,
+            staging: staging.gpu.address().0,
+            tile_list: tile_list.gpu.address().0,
+            pages: PAGES,
+            page_entries: PAGES + EMPTY,
+            page_bytes: PAGE_BYTES,
+            tile_count: TILES,
+            tile_texels,
+            tile_bytes: tile_bytes as u32,
+            pad0: 0,
+            pad1: 0,
+            pad2: 0,
+            pad3: 0,
+        }],
+        "copy lists root",
+    );
+    let pages_kernel = pipeline(&copy_lists::MODULE, "pages");
+    let tiles_kernel = pipeline(&copy_lists::MODULE, "tiles");
+    let layers: Vec<TextureLayers> = regions.iter().map(TextureRegion::layers).collect();
+    let mut list = loading.command_list().unwrap();
+    list.discard(&textures[1]);
+    list.dispatch(
+        &pages_kernel,
+        root.gpu,
+        [(PAGES + EMPTY).div_ceil(64), 1, 1],
+    );
+    list.dispatch(&tiles_kernel, root.gpu, [TILES.div_ceil(64), 1, 1]);
+    list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::DRAW_ARGUMENTS);
+    list.copy_indirect(page_list.gpu, PAGES + EMPTY);
+    list.copy_to_texture_indirect(&textures[1], tile_list.gpu, &layers);
+    let written = loading.submit(vec![list], &bound).unwrap();
+
+    let out = readback::<u8>(2 * pool_bytes, "page pools out");
+    let mut list = render().command_list().unwrap();
+    for (i, a) in dst.iter().enumerate() {
+        list.copy(out.gpu.offset(i as u64 * pool_bytes), a.gpu, pool_bytes);
+    }
+    list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
+    run_on(render(), list, &[recorded, written]);
+    let (cpu, gpu) = out.as_slice().unwrap().split_at(pool_bytes as usize);
+    let src_bytes = src.as_slice().unwrap();
+    let page = PAGE_BYTES as usize;
+    for (i, &s) in page_source.as_slice().unwrap().iter().enumerate() {
+        let from = s as usize * page;
+        assert!(
+            cpu[i * page..(i + 1) * page] == src_bytes[from..from + page],
+            "recorded page {i}"
+        );
+    }
+    assert!(
+        cpu == gpu,
+        "indirect page copies differ from the recorded ones"
+    );
+    assert!(
+        gpu[pages_bytes as usize..] == guard[..],
+        "an empty page copy wrote bytes"
+    );
+
+    let mips: Vec<Vec<Vec<Vec<u8>>>> = textures
+        .iter()
+        .map(|t| read_mips(t, &[recorded, written]))
+        .collect();
+    let block_bytes = desc.format.block_bytes() as usize;
+    let tile_row_bytes = (tile_texels / 4) as usize * block_bytes;
+    let staged = staging.as_slice().unwrap();
+    for (region, &slot) in regions.iter().zip(&slot_of) {
+        let [w, _] = mip_extent(&desc, region.mip);
+        let mip_row_bytes = (w / 4) as usize * block_bytes;
+        let x0 = (region.offset[0] / 4) as usize * block_bytes;
+        let y0 = (region.offset[1] / 4) as usize;
+        for r in 0..(region.extent[1] / 4) as usize {
+            let at = (y0 + r) * mip_row_bytes + x0;
+            let row = |t: usize| &mips[t][0][region.mip as usize][at..at + tile_row_bytes];
+            let from = slot as usize * tile_bytes as usize + r * tile_row_bytes;
+            assert!(
+                row(0) == &staged[from..from + tile_row_bytes],
+                "recorded tile at {:?} of mip {}",
+                region.offset,
+                region.mip
+            );
+            assert!(
+                row(1) == row(0),
+                "tile at {:?} of mip {} differs",
+                region.offset,
+                region.mip
+            );
+        }
+    }
+    for (b, p) in blocks.into_iter().zip([recorded, written]) {
+        d.gpu_free(b, p);
+    }
     assert_clean();
 }

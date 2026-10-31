@@ -42,6 +42,11 @@ pub struct Caps {
     pub omm: bool,
     /// Device address commands (`VK_KHR_device_address_commands`).
     pub device_address_commands: bool,
+    /// Copies whose regions the GPU writes (`VK_KHR_copy_memory_indirect`):
+    /// [`crate::CommandList::copy_indirect`] and
+    /// [`crate::CommandList::copy_to_texture_indirect`], on the render, compute and loading
+    /// queues.
+    pub indirect_copy: bool,
     /// `GENERAL` is guaranteed optimal for every use (`VK_KHR_unified_image_layouts`).
     pub unified_image_layouts: bool,
     /// The memory report carries the OS budget per heap.

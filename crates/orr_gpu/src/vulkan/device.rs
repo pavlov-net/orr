@@ -92,6 +92,8 @@ pub(crate) struct Shared {
     pub ptlas_fn: ash::nv::partitioned_acceleration_structure::Device,
     /// With `Caps::device_address_commands`.
     pub dac_fn: Option<ash::khr::device_address_commands::Device>,
+    /// With `Caps::indirect_copy`.
+    pub indirect_copy_fn: Option<ash::khr::copy_memory_indirect::Device>,
     /// With `Caps::memory_decompression`.
     pub decompress_fn: Option<ash::ext::memory_decompression::Device>,
     /// With cooperative vectors (`Caps::cooperative_vector` not empty).
@@ -378,6 +380,7 @@ impl Device {
             vk::PhysicalDevicePartitionedAccelerationStructurePropertiesNV::default();
         let mut decompress_props = vk::PhysicalDeviceMemoryDecompressionPropertiesEXT::default();
         let mut generated_props = vk::PhysicalDeviceDeviceGeneratedCommandsPropertiesEXT::default();
+        let mut indirect_copy_props = vk::PhysicalDeviceCopyMemoryIndirectPropertiesKHR::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default()
             .push(&mut heap_props)
             .push(&mut as_props)
@@ -392,6 +395,9 @@ impl Device {
         }
         if optional.generated_commands {
             props2 = props2.push(&mut generated_props);
+        }
+        if optional.indirect_copy {
+            props2 = props2.push(&mut indirect_copy_props);
         }
         // SAFETY: every struct in the chain belongs to an enabled extension or core 1.4.
         unsafe { instance.get_physical_device_properties2(physical, &mut props2) };
@@ -471,6 +477,10 @@ impl Device {
             generated_commands: generated,
             omm: optional.omm,
             device_address_commands: optional.device_address_commands,
+            indirect_copy: optional.indirect_copy
+                && indirect_copy_props
+                    .supported_queues
+                    .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE),
             unified_image_layouts: optional.unified_image_layouts,
             memory_budget: optional.memory_budget,
             memory_priority: optional.memory_priority,
@@ -622,6 +632,9 @@ impl Device {
             dac_fn: optional
                 .device_address_commands
                 .then(|| ash::khr::device_address_commands::Device::load(&instance, &device)),
+            indirect_copy_fn: caps
+                .indirect_copy
+                .then(|| ash::khr::copy_memory_indirect::Device::load(&instance, &device)),
             decompress_fn: optional
                 .memory_decompression
                 .then(|| ash::ext::memory_decompression::Device::load(&instance, &device)),
@@ -748,7 +761,7 @@ impl Device {
             hooks.device_created(&device.shared.raw_device());
         }
         log::info!(
-            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, lss {}, address commands {}, cooperative vector combinations {}, host image copy {}, decompression {}, occupancy priority {}, memory priority {} (pageable {}), generated commands {}, validation layer {}, ray tracing validation {}, diagnostics {:?} (breadcrumbs {}, checkpoints {}, aftermath {}, device fault {})",
+            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, lss {}, address commands {}, indirect copy {}, cooperative vector combinations {}, host image copy {}, decompression {}, occupancy priority {}, memory priority {} (pageable {}), generated commands {}, validation layer {}, ray tracing validation {}, diagnostics {:?} (breadcrumbs {}, checkpoints {}, aftermath {}, device fault {})",
             device.shared.caps.device_name,
             device.shared.caps.driver,
             device.shared.caps.rebar,
@@ -757,6 +770,7 @@ impl Device {
             optional.omm,
             optional.lss,
             optional.device_address_commands,
+            device.shared.caps.indirect_copy,
             device.shared.caps.cooperative_vector.len(),
             device.shared.caps.host_image_copy,
             optional.memory_decompression,
