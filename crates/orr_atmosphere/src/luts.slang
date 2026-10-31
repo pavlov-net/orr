@@ -30,6 +30,11 @@ static const uint DIRECTIONS = 256;
 static const float GOLDEN_ANGLE = 2.39996322972865332;
 // Candidates more than 18 deg below the focus horizon add less than the night background.
 static const float FOLD_HORIZON = -0.309016994;
+// Seconds a fold weight takes to go between 0 and 1.
+static const float FOLD_FADE = 0.5;
+// A folded light ranks as if this much brighter, times its weight, so near-equal candidates
+// do not trade places every frame.
+static const float FOLD_HOLD = 0.02;
 
 float3 to_rec2020(AtmosphereGroups g, float3 v)
 {
@@ -337,9 +342,14 @@ void ground_irradiance(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
     }
 }
 
-// Fold membership: the `sky_lights` brightest eligible candidates, ties to the earlier one.
-// A candidate is eligible when it names a directional light with some illuminance no more
-// than 18 deg below the focus horizon. Writes each candidate's illuminance.
+// Fold membership and weights. Members are the `sky_lights` brightest eligible candidates,
+// ranked by luminance times 1 + FOLD_HOLD x the candidate's weight, ties to the earlier one;
+// a candidate is eligible when it names a directional light with some illuminance no more
+// than 18 deg below the focus horizon. Each candidate's weight, kept per light across
+// frames, moves toward 1 for a member and 0 otherwise by `delta_time / FOLD_FADE`, or jumps
+// there when `fold_reset` is set. Members come first in `folded`, then the rest by weight; a
+// light that does not fit in `MAX_FOLDED_LIGHTS` drops to 0. Writes each candidate's
+// illuminance.
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void fold(uint3 id: SV_DispatchThreadID)
@@ -347,29 +357,49 @@ void fold(uint3 id: SV_DispatchThreadID)
     AtmosphereGpu* a = root.atmosphere;
     SceneRoot* scene = atmosphere_scene(a);
     FoldGpu* f = a.fold;
+    bool reset = a.fold_reset != 0;
     float luminance[MAX_SKY_LIGHTS];
+    float held[MAX_SKY_LIGHTS];
+    float rank[MAX_SKY_LIGHTS];
+    bool lit[MAX_SKY_LIGHTS];
     for (uint i = 0; i < MAX_SKY_LIGHTS; ++i)
     {
         luminance[i] = 0.0;
+        held[i] = 0.0;
+        rank[i] = 0.0;
+        lit[i] = false;
         f.illuminance[i] = float4(0.0);
         uint index = a.candidates[i];
         if (i >= a.candidate_count || index >= scene.light_capacity)
             continue;
         LightGpu l = scene.lights[index];
-        if (l.kind != LIGHT_DIRECTIONAL || dot(normalize(l.direction), a.up.xyz) < FOLD_HORIZON)
+        if (l.kind != LIGHT_DIRECTIONAL)
             continue;
         float3 e = l.disc == DISC_TEXTURED && all(l.color == 0.0)
             ? textured_disc_integral(scene, index) : l.color;
         f.illuminance[i] = float4(e, 0.0);
-        luminance[i] = max(luminance_rec2020(e), 0.0);
+        float y = luminance_rec2020(e);
+        lit[i] = y > 0.0;
+        if (lit[i] && dot(normalize(l.direction), a.up.xyz) >= FOLD_HORIZON)
+            luminance[i] = y;
+        for (uint j = 0; j < MAX_SKY_LIGHTS && !reset; ++j)
+            if (f.light[j] == index)
+                held[i] = max(held[i], f.weight[j]);
+        rank[i] = luminance[i] * (1.0 + FOLD_HOLD * held[i]);
     }
+    float step = max(scene.delta_time, 0.0) / FOLD_FADE;
+    float weight[MAX_SKY_LIGHTS];
+    bool member[MAX_SKY_LIGHTS];
     for (uint i = 0; i < MAX_SKY_LIGHTS; ++i)
     {
         uint brighter = 0;
         for (uint j = 0; j < MAX_SKY_LIGHTS; ++j)
-            if (luminance[j] > luminance[i] || (luminance[j] == luminance[i] && j < i))
+            if (rank[j] > rank[i] || (rank[j] == rank[i] && j < i))
                 ++brighter;
-        f.weight[i] = luminance[i] > 0.0 && brighter < a.sky_lights ? 1.0 : 0.0;
+        member[i] = luminance[i] > 0.0 && brighter < a.sky_lights;
+        float target = member[i] ? 1.0 : 0.0;
+        float w = reset ? target : clamp(held[i] + (member[i] ? step : -step), 0.0, 1.0);
+        weight[i] = lit[i] ? w : 0.0;
     }
     uint taken = 0;
     uint count = 0;
@@ -377,8 +407,9 @@ void fold(uint3 id: SV_DispatchThreadID)
     {
         int best = -1;
         for (uint i = 0; i < MAX_SKY_LIGHTS; ++i)
-            if ((taken & (1u << i)) == 0 && f.weight[i] > 0.0
-                && (best < 0 || f.weight[i] > f.weight[best]))
+            if ((taken & (1u << i)) == 0 && weight[i] > 0.0
+                && (best < 0 || (member[i] && !member[best])
+                    || (member[i] == member[best] && weight[i] > weight[best])))
                 best = int(i);
         if (best < 0)
             break;
@@ -386,6 +417,11 @@ void fold(uint3 id: SV_DispatchThreadID)
         f.folded[count] = uint(best);
     }
     f.folded_count = count;
+    for (uint i = 0; i < MAX_SKY_LIGHTS; ++i)
+    {
+        f.weight[i] = (taken & (1u << i)) != 0 ? weight[i] : 0.0;
+        f.light[i] = i < a.candidate_count ? a.candidates[i] : ~0u;
+    }
 }
 
 // One sky-view LUT: from `near_range` along each texel's direction, the folded lights'

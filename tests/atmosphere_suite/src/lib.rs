@@ -56,6 +56,9 @@ pub struct Rig {
     pub lighting: Option<SceneLighting>,
     /// The eyes of the scene's views other than the focus view, passed to every `record`.
     pub eyes: Vec<DVec3>,
+    /// Whether fold weights fade between frames; off, every frame skips the fades so a
+    /// frame's sky depends only on its own lights.
+    pub fades: bool,
     frames: u32,
     frame_id: u64,
     lights: Vec<LightId>,
@@ -80,6 +83,7 @@ impl Rig {
             sky,
             lighting: None,
             eyes: Vec::new(),
+            fades: false,
             frames: 0,
             frame_id: 0,
             lights: Vec::new(),
@@ -111,8 +115,8 @@ impl Rig {
         self.frame_lights(&lights, focus)
     }
 
-    /// One frame with exactly `lights` in the light table and the focus at `focus`; waits
-    /// for it and returns the scene root.
+    /// One frame, 1/60 s after the previous one, with exactly `lights` in the light table and
+    /// the focus at `focus`; waits for it and returns the scene root.
     pub fn frame_lights(
         &mut self,
         lights: &[(LightId, DirectionalLight)],
@@ -144,6 +148,9 @@ impl Rig {
             w.set_focus(focus, 1000.0);
             w.set_environment(self.sky.data());
             w.set_medium(self.sky.data());
+        }
+        if !self.fades {
+            self.sky.skip_fades();
         }
         let mut root = None;
         let (sky, lighting, eyes, frame) =
