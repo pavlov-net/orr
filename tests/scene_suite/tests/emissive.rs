@@ -150,17 +150,19 @@ fn instance_spans_follow_scale_material_sets_hidden_sections_and_removal() {
     w.material_sets(10, 4)
         .unwrap()
         .copy_from_slice(&[lamp, lamp, other, dark]);
-    w.copy_variants(with_set, 0, 1).unwrap()[0] = CopyVariant {
+    let set_one = CopyVariant {
         pose: 0,
         material_set: 1,
         section_mask: 0,
     };
+    w.copy_variants(with_set, 0, &[set_one]).unwrap();
     // Copy 3 hides section 1.
-    w.copy_variants(lamps, 3, 1).unwrap()[0] = CopyVariant {
+    let hidden = CopyVariant {
         pose: 0,
         material_set: 0,
         section_mask: 0b10,
     };
+    w.copy_variants(lamps, 3, &[hidden]).unwrap();
     // Twelve entries hold five copies of two spans; a sixth and seventh copy do not fit,
     // and the failed call leaves its slots free.
     let full = w.add_instances(&desc(3, 2, None));

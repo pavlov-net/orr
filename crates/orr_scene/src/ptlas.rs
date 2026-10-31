@@ -1,9 +1,10 @@
 //! A scene's partitioned TLAS: instance index = slot, part instances from `part_base`,
 //! producer entries from `producer_base`. Copies take cell partitions in copy order, per
-//! transform-group anchor cell, at most `partition_instances` to a partition; movers sit in
-//! the global partition until their transform has rested for 30 frames. The `ptlas` kernels
-//! decide each frame's writes, null writes and BLAS updates on the GPU and spend the
-//! frame's budget of rebuilt instances from the focus outward, mandatory work first.
+//! transform-group anchor cell, at most `partition_instances` instances to a partition, a
+//! posed copy counting its body and its part run; movers without animated parts sit in the
+//! global partition until their transform has rested for 30 frames. The `ptlas` kernels
+//! decide each frame's writes, null writes, BLAS updates and part runs on the GPU and spend
+//! the frame's budget of rebuilt instances from the focus outward, mandatory work first.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,9 +26,11 @@ use crate::upload::Record;
 /// `ptlas.slang` constants.
 const PARTITION_NONE: u32 = u32::MAX;
 const DISTANCE_BUCKETS: u32 = 64;
-const COUNTERS: usize = 14;
-const COUNTERS_CLEARED: u32 = 13;
+const COUNTERS: usize = 16;
 const PTLAS_REBASE: u32 = 1;
+const PTLAS_FIRST: u32 = 2;
+const PART_STATE: u32 = 11;
+const PART_CLASSES: u32 = 9;
 
 /// `PtlasGpu.counters` read back for [`RtStats`].
 const COUNTER_WRITES: usize = 0;
@@ -37,7 +40,9 @@ const COUNTER_REBUILT: usize = 4;
 const COUNTER_DEFERRED: usize = 5;
 const COUNTER_MAX_AGE: usize = 6;
 const COUNTER_DROPPED: usize = 7;
-const COUNTER_GLOBAL: usize = 13;
+const COUNTER_PARTS_REFUSED: usize = 13;
+const COUNTER_GLOBAL: usize = 14;
+const COUNTER_PARTS: usize = 15;
 
 /// Ray-tracing figures of a frame, summed over its scenes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -63,6 +68,13 @@ pub struct RtStats {
     pub partitions: u32,
     /// Device bytes of the PTLAS and the arrays its builds read, scratch excluded.
     pub bytes: u64,
+    /// Part instances in the runs copies hold.
+    pub parts: u32,
+    /// Copies that found no room for a part run and traced at rest pose.
+    pub parts_refused: u32,
+    /// Section masks left without BLAS, their mesh's mask table being full; copies naming
+    /// them are not traced.
+    pub masks_refused: u32,
 }
 
 /// One scene's PTLAS figures of a completed frame.
@@ -84,6 +96,8 @@ impl RtStats {
         self.max_age = self.max_age.max(c[COUNTER_MAX_AGE]);
         self.dropped += c[COUNTER_DROPPED];
         self.global += c[COUNTER_GLOBAL];
+        self.parts += c[COUNTER_PARTS];
+        self.parts_refused += c[COUNTER_PARTS_REFUSED];
         self.unplaced += f.unplaced;
         self.partitions += f.partitions;
         self.bytes += f.bytes;
@@ -93,6 +107,7 @@ impl RtStats {
 /// The `ptlas` pipelines.
 pub(crate) struct PtlasPipelines {
     clear: PipelineId,
+    recycle: PipelineId,
     want: PipelineId,
     cutoff: PipelineId,
     admit: PipelineId,
@@ -111,6 +126,7 @@ impl PtlasPipelines {
         let mut c = |entry| p.create(device, kernels, m, entry, Default::default());
         Ok(Self {
             clear: c("clear")?,
+            recycle: c("recycle")?,
             want: c("want")?,
             cutoff: c("cutoff")?,
             admit: c("admit")?,
@@ -123,6 +139,7 @@ impl PtlasPipelines {
 
 struct PartitionCpu {
     cell: IVec3,
+    /// Instances its copies may hold: bodies and part runs.
     count: u32,
 }
 
@@ -146,11 +163,14 @@ struct Storage {
 pub(crate) struct Ptlas {
     limits: PtlasLimits,
     max_per_partition: u32,
+    part_capacity: u32,
     partitions: Vec<PartitionCpu>,
     free: Vec<u32>,
     /// The partition of each cell that takes its next copies.
     open: HashMap<IVec3, u32>,
     slot_partition: Vec<u32>,
+    /// Instances each slot's copy counts in its partition.
+    slot_cost: Vec<u32>,
     /// Partitions whose record changed since the last frame.
     changed: BTreeSet<u32>,
     /// Partitions given a cell since the last frame: their translation is written.
@@ -181,6 +201,7 @@ impl Ptlas {
                 translation: true,
             },
             max_per_partition: desc.partition_instances,
+            part_capacity: desc.part_capacity,
             partitions: (0..partitions)
                 .map(|_| PartitionCpu {
                     cell: IVec3::ZERO,
@@ -190,6 +211,7 @@ impl Ptlas {
             free: (0..partitions).rev().collect(),
             open: HashMap::new(),
             slot_partition: vec![PARTITION_NONE; desc.instance_capacity as usize],
+            slot_cost: vec![0; desc.instance_capacity as usize],
             changed: BTreeSet::new(),
             assigned: BTreeSet::new(),
             emptied: Vec::new(),
@@ -202,18 +224,18 @@ impl Ptlas {
         })
     }
 
-    /// Puts `count` copies from slot `first` into partitions of `cell`, in order; returns
-    /// each copy's partition.
-    pub(crate) fn place(&mut self, first: u32, count: u32, cell: IVec3) -> Vec<u32> {
+    /// Puts `count` copies from slot `first`, each counting `cost` instances, into
+    /// partitions of `cell`, in order; returns each copy's partition.
+    pub(crate) fn place(&mut self, first: u32, count: u32, cell: IVec3, cost: u32) -> Vec<u32> {
         self.high_water = self.high_water.max(first + count);
         (first..first + count)
             .map(|slot| {
-                let open = self
-                    .open
-                    .get(&cell)
-                    .copied()
-                    .filter(|&p| self.partitions[p as usize].count < self.max_per_partition);
-                let Some(p) = open.or_else(|| self.free.pop()) else {
+                self.slot_cost[slot as usize] = cost;
+                let open = self.open.get(&cell).copied().filter(|&p| {
+                    self.partitions[p as usize].count + cost <= self.max_per_partition
+                });
+                let fits = cost <= self.max_per_partition;
+                let Some(p) = open.or_else(|| fits.then(|| self.free.pop()).flatten()) else {
                     self.unplaced += 1;
                     self.slot_partition[slot as usize] = PARTITION_NONE;
                     return PARTITION_NONE;
@@ -223,7 +245,7 @@ impl Ptlas {
                     part.cell = cell;
                     self.assigned.insert(p);
                 }
-                part.count += 1;
+                part.count += cost;
                 self.open.insert(cell, p);
                 self.changed.insert(p);
                 self.slot_partition[slot as usize] = p;
@@ -241,7 +263,7 @@ impl Ptlas {
                 continue;
             }
             let part = &mut self.partitions[p as usize];
-            part.count -= 1;
+            part.count -= self.slot_cost[slot as usize];
             self.changed.insert(p);
             if part.count == 0 {
                 if self.open.get(&part.cell) == Some(&p) {
@@ -313,6 +335,11 @@ impl Ptlas {
         let state = block(4 * (partitions + 1), "partition state")?.cast();
         let buckets = block(4 * u64::from(DISTANCE_BUCKETS), "PTLAS buckets")?.cast();
         let counters = block(4 * COUNTERS as u64, "PTLAS counters")?.cast();
+        let parts = u64::from(self.part_capacity);
+        let part_state = block(4 * u64::from(PART_STATE), "part state")?.cast();
+        let stacks: u64 = (0..PART_CLASSES).map(|c| parts >> c).sum();
+        let part_free = block(4 * stacks, "part free lists")?.cast();
+        let part_released = block(4 * parts, "released part runs")?.cast();
         let record = PtlasGpu {
             partitions: self.partition_table.gpu,
             slot_partition: self.slot_table.gpu,
@@ -325,6 +352,9 @@ impl Ptlas {
             translates,
             commands,
             command_count,
+            part_state,
+            part_free,
+            part_released,
             partition_count: self.limits.partitions,
             write_capacity: self.limits.instances,
             update_capacity: self.limits.instances,
@@ -452,7 +482,7 @@ impl Ptlas {
             focus_offset: f.focus_offset,
             slots: self.high_water,
             budget: f.budget,
-            flags: if f.rebased { PTLAS_REBASE } else { 0 },
+            flags: if f.rebased { PTLAS_REBASE } else { 0 } | if s.built { 0 } else { PTLAS_FIRST },
             error_pixels: f.error_pixels,
             translate_jobs,
             translate_count: jobs.len() as u32,
@@ -468,8 +498,9 @@ impl Ptlas {
         list.dispatch(
             p.get(k.clear),
             root,
-            groups(partitions.max(DISTANCE_BUCKETS).max(COUNTERS_CLEARED)),
+            groups(partitions.max(DISTANCE_BUCKETS).max(COUNTERS as u32)),
         );
+        list.dispatch(p.get(k.recycle), root, [1, 1, 1]);
         step(list);
         list.dispatch(p.get(k.want), root, groups(self.high_water));
         step(list);

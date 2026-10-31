@@ -55,7 +55,10 @@ ClusterDraw cluster_draw(uint visible, bool alpha)
     d.first = alpha ? d.split : 0;
     d.count = alpha ? d.c.tri_count - d.split : d.split;
     d.single_sided = (m.flags & MATERIAL_DOUBLE_SIDED) == 0;
-    instance_placement(s, s.instances[d.vc.instance], root.view, d.p);
+    InstanceGpu inst = s.instances[d.vc.instance];
+    Placement copy;
+    instance_placement(s, inst, root.view, copy);
+    cluster_placement(s, d.vc.instance, inst, d.c, copy, false, d.p);
     return d;
 }
 

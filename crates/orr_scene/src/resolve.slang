@@ -143,8 +143,10 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     float3 object = mul(linear_inverse(p.linear), relative - p.translation);
     InstanceGpu inst = s.instances[vc.instance];
     GroupGpu* group_gpu = s.groups + inst.group;
+    Placement prev_copy;
     Placement prev;
-    if (!placement(group_gpu, group_gpu.previous, inst.group_index, v, prev))
+    if (!placement(group_gpu, group_gpu.previous, inst.group_index, v, prev_copy)
+        || !cluster_placement(s, vc.instance, inst, load_cluster(vc.page, vc.local), prev_copy, true, prev))
         prev = p;
     float3 prev_relative = place(prev, object) + v.eye_motion.xyz;
     float4 previous = mul(v.prev_clip_from_view, float4(mul(v.prev_view_from_world_rotation, float4(prev_relative, 0.0)), 1.0));

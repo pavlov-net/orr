@@ -30,16 +30,76 @@ public bool placement(GroupGpu* g, uint8_t* transforms, uint index, int3 cell, f
         return false;
     p.linear = affine_linear(m);
     p.translation = view_relative(g.anchor_cell, g.anchor_offset, cell, offset, cell_log2) + affine_translation(m);
-    float3 c0 = float3(m[0].x, m[1].x, m[2].x);
-    float3 c1 = float3(m[0].y, m[1].y, m[2].y);
-    float3 c2 = float3(m[0].z, m[1].z, m[2].z);
-    p.scale = sqrt(max(dot(c0, c0), max(dot(c1, c1), dot(c2, c2))));
+    p.scale = largest_scale(p.linear);
     return true;
+}
+
+// The length of the longest column of `r`: its largest axis scale.
+float largest_scale(float3x3 r)
+{
+    float3 c0 = float3(r[0].x, r[1].x, r[2].x);
+    float3 c1 = float3(r[0].y, r[1].y, r[2].y);
+    float3 c2 = float3(r[0].z, r[1].z, r[2].z);
+    return sqrt(max(dot(c0, c0), max(dot(c1, c1), dot(c2, c2))));
 }
 
 public float3 place(Placement p, float3 x)
 {
     return mul(p.linear, x) + p.translation;
+}
+
+// `p` applied after the mesh-space transform `m`.
+public Placement placed_after(Placement p, float3x4 m)
+{
+    Placement o;
+    o.linear = mul(p.linear, affine_linear(m));
+    o.translation = mul(p.linear, affine_translation(m)) + p.translation;
+    o.scale = largest_scale(o.linear);
+    return o;
+}
+
+// Transform `part` of the copy's pose block, from the pose group's current or previous
+// buffer: `group[(pose_index + group_index * stride + variant) * parts + part]`, the pose
+// variant from the copy's variant word, below `pose_variants`. False when the entry is
+// outside the group or all zero: the pose hides the part.
+public bool part_pose(SceneRoot* s, InstanceGpu inst, MeshGpu* mesh, uint part, bool previous, out float3x4 pose)
+{
+    pose = float3x4(0.0);
+    if (inst.pose_group == 0)
+        return false;
+    GroupGpu* g = s.groups + inst.pose_group;
+    uint8_t* transforms = previous ? g.previous : g.current;
+    uint variant = min(inst.variant & 0xff, max(uint(inst.pose_variants), 1u) - 1);
+    uint block = inst.pose_index + inst.group_index * uint(inst.pose_stride) + variant;
+    uint index = block * mesh.part_count + part;
+    if (transforms == nullptr || index >= g.count)
+        return false;
+    pose = ((float3x4*)transforms)[index];
+    return any(pose[0] != 0.0) || any(pose[1] != 0.0) || any(pose[2] != 0.0);
+}
+
+// Whether the raster poses cluster `c` of the copy in `slot` this frame, or with
+// `previous` in the previous one: an animated part's cluster of a copy inside its
+// animation range.
+public bool cluster_posed(SceneRoot* s, uint slot, Cluster c, bool previous)
+{
+    if ((c.flags & CLUSTER_ANIMATED_PART) == 0)
+        return false;
+    return (s.slot_state[slot].rt_flags & (previous ? RT_WAS_ANIMATED : RT_ANIMATED)) != 0;
+}
+
+// The raster's placement of cluster `c` of the copy in `slot`, from the copy's placement:
+// posed by its part's transform when `cluster_posed`. False when the pose hides the part.
+public bool cluster_placement(SceneRoot* s, uint slot, InstanceGpu inst, Cluster c, Placement copy, bool previous, out Placement p)
+{
+    p = copy;
+    if (!cluster_posed(s, slot, c, previous))
+        return true;
+    float3x4 pose;
+    if (!part_pose(s, inst, s.meshes + s.models[inst.model].mesh, c.part, previous, pose))
+        return false;
+    p = placed_after(copy, pose);
+    return true;
 }
 
 // The material of a cluster's section for one copy.
@@ -249,6 +309,14 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
     Placement pl;
     if (!placement(g, previous ? g.previous : g.current, inst.group_index, s.origin_cell.xyz, float3(0.0), cell_log2, pl))
         return false;
+    // A part instance traces its part posed.
+    if (instance_index >= s.part_base)
+    {
+        float3x4 pose;
+        if (!part_pose(s, inst, mesh, c.part, previous, pose))
+            return false;
+        pl = placed_after(pl, pose);
+    }
 
     // Barycentric steps of the cone's footprint: two directions across the ray, carried
     // along it onto the triangle's plane.

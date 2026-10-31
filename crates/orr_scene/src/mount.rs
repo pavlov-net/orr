@@ -12,24 +12,26 @@ use orr_gpu::{
     Allocation, Device, GpuPtr, MemoryKind, QueueKind, SamplerIndex, Texture, TextureDesc,
     TextureIndex, TextureKind, TextureMemory, TextureRegion, TextureUsage, TimelinePoint, ViewDesc,
 };
+use orr_io::{AlignedBuf, Read, SECTOR};
 use orr_pack::instance::{InstancePageInfo, InstanceRecord};
 use orr_pack::material::Material;
-use orr_pack::mesh::{Cluster, MeshHeader, MeshInfo, NodePage, PageHeader, PageView};
+use orr_pack::mesh::{Cluster, MeshHeader, MeshInfo, NodePage, PageHeader, PageView, Part};
 use orr_pack::model::ModelInfo;
 use orr_pack::texture::{TextureHeader, TextureInfo};
 use orr_pack::{Aabb, Archive, AssetId, Class, Codec};
 
-use crate::accel::{self, AccelShared, ClusterInfo, MeshInput, MountAccel, PageMicromap};
+use crate::accel::{
+    self, AccelShared, ClusterInfo, MaskBlas, MeshInput, MeshRt, MountAccel, PageMicromap,
+};
 use crate::emissive::{EmissiveSpan, ModelEmission, indexed_spans};
-use crate::loading::io::{AlignedBuf, ArchiveFile, Read, SECTOR, read_positioned};
-use crate::loading::{BlobSource, Loading, Msg, decoded, read_stored};
+use crate::loading::{ArchiveFile, BlobSource, Loading, Msg, decoded, read_stored};
 use crate::material::{BoundTexture, MaterialId, MaterialTable};
 use crate::memory::{Block, RangeAllocator, UploadWindow};
 use crate::residency::{ResidencyClass, Start, UnitDesc};
-use crate::scene::ModelId;
+use crate::scene::{ModelCpu, ModelId};
 use crate::stream::{StreamUnit, Streaming};
 use crate::upload::Record;
-use crate::{ClusterRef, Error, MaterialGpu, MeshGpu, ModelGpu, Result, material_flags};
+use crate::{ClusterRef, Error, MaskGpu, MaterialGpu, MeshGpu, ModelGpu, Result, material_flags};
 
 /// Where a pack's bytes come from.
 #[derive(Clone, Debug)]
@@ -94,6 +96,7 @@ struct PlacedMesh {
     clusters: Vec<(u32, ClusterInfo)>,
     /// Per page, its micromap region.
     micromaps: Vec<Option<PageMicromap>>,
+    parts: Vec<Part>,
 }
 
 /// A resident instance page: its tables on the CPU, its records and consumer data on the
@@ -376,10 +379,10 @@ pub(crate) fn start(loading: &Arc<Loading>, ring: bool, task: Arc<MountTask>, so
                 task.spawn(move |t| {
                     t.step(|| {
                         let mut head = AlignedBuf::new(Archive::HEAD_LEN);
-                        let n = read_positioned(&file, 0, &mut head)?;
+                        let n = file.reads.read(0, &mut head)?;
                         let range = Archive::index_range(&head.as_slice()[..n])?;
                         let mut index = AlignedBuf::new(range.len as usize);
-                        let n = read_positioned(&file, 0, &mut index)?;
+                        let n = file.reads.read(0, &mut index)?;
                         open_index(t, &file, &path, &index, n, range.len)
                     });
                 });
@@ -393,7 +396,7 @@ fn read_head(loading: &Arc<Loading>, task: Arc<MountTask>, file: Arc<ArchiveFile
     let l = Arc::downgrade(loading);
     let f = Arc::clone(&file);
     let head = Read {
-        file,
+        file: Arc::clone(&file.reads),
         offset: 0,
         len: Archive::HEAD_LEN,
         done: Box::new(move |r| {
@@ -411,7 +414,7 @@ fn read_head(loading: &Arc<Loading>, task: Arc<MountTask>, file: Arc<ArchiveFile
             };
             let (range, l) = range;
             let index = Read {
-                file: Arc::clone(&f),
+                file: Arc::clone(&f.reads),
                 offset: 0,
                 len: (range.len as usize).next_multiple_of(SECTOR),
                 done: Box::new(move |r| match r {
@@ -575,6 +578,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             level_ranges,
             clusters: Vec::with_capacity(first as usize),
             micromaps: vec![None; info.pages.len()],
+            parts: info.parts.clone(),
         });
         placed.meshes.len() - 1
     };
@@ -809,8 +813,10 @@ struct ResolvedMesh {
     levels: Vec<(f32, u32, u32)>,
     clusters: Vec<ClusterInfo>,
     micromaps: Vec<Option<PageMicromap>>,
+    parts: Vec<Part>,
     /// Resident cluster table entries from `gpu.cluster_base` on.
     refs: Vec<ClusterRef>,
+    rt: MeshRt,
 }
 
 struct ResolvedModel {
@@ -900,8 +906,14 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
                         merge_error: m.header.merge_error,
                         cluster_base: 0,
                         rt_cut_count: 0,
-                        _pad: 0,
+                        part_count: m.header.parts.count.max(1),
                         rt_cuts: GpuPtr::NULL,
+                        parts: GpuPtr::NULL,
+                        masks: GpuPtr::NULL,
+                        first_animated: 0,
+                        animated_parts: 0,
+                        mask_count: 0,
+                        animated_sections: 0,
                     }
                 },
                 page_addresses,
@@ -911,7 +923,9 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
                 levels: m.level_ranges,
                 clusters,
                 micromaps: m.micromaps,
+                parts: m.parts,
                 refs: Vec::new(),
+                rt: MeshRt::default(),
             }
         })
         .collect();
@@ -1001,6 +1015,7 @@ fn build_accel(
             levels: &m.levels,
             non_opaque,
             cluster_base: m.gpu.cluster_base,
+            parts: &m.parts,
         })
         .collect();
     let refs: Vec<Vec<ClusterRef>> = inputs.iter().map(accel::cluster_refs).collect();
@@ -1010,6 +1025,11 @@ fn build_accel(
         m.refs = refs;
         m.gpu.rt_cuts = cuts.table;
         m.gpu.rt_cut_count = cuts.count;
+        m.gpu.parts = cuts.parts;
+        m.gpu.first_animated = cuts.animated.first;
+        m.gpu.animated_parts = cuts.animated.count;
+        m.gpu.animated_sections = cuts.animated_sections;
+        m.rt = cuts.rt;
     }
     r.accel = built.accel;
     Ok(built.point)
@@ -1108,6 +1128,8 @@ pub(crate) struct Resident {
     pub materials: HashMap<AssetId, MaterialId>,
     pub pages: HashMap<AssetId, PageId>,
     meshes: Vec<u32>,
+    /// Per mesh of `meshes`: what its section-mask BLAS build from.
+    rt: Vec<MeshRt>,
     page_ranges: Vec<(u32, u32)>,
     material_ranges: Vec<(u32, u32)>,
     cluster_ranges: Vec<(u32, u32)>,
@@ -1145,6 +1167,19 @@ pub(crate) struct Mounts {
     pub streaming: Streaming,
     /// The mount and mesh of each resident model.
     owners: HashMap<ModelId, (MountId, u32)>,
+    /// Section-mask BLAS by mesh id.
+    masks: HashMap<u32, MeshMasks>,
+    /// Scratch of mask builds, freed once their frame has completed.
+    transient: Vec<(u64, Vec<Allocation<u8>>)>,
+}
+
+/// Section-mask BLAS a mesh can hold, at most.
+const MASKS_PER_MESH: u32 = 64;
+
+/// A mesh's section-mask BLAS and the table `MeshGpu::masks` points at.
+struct MeshMasks {
+    table: Allocation<MaskGpu>,
+    built: Vec<(u16, MaskBlas)>,
 }
 
 /// What applying a batch writes into: the frame's records and the global tables.
@@ -1155,6 +1190,8 @@ pub(crate) struct Apply<'a> {
     pub records: &'a mut Vec<Record>,
     pub materials: &'a MaterialTable,
     pub emission: &'a mut Vec<Option<ModelEmission>>,
+    /// Sections and animated parts by `ModelId`.
+    pub model_cpu: &'a mut Vec<ModelCpu>,
 }
 
 impl Apply<'_> {
@@ -1300,6 +1337,8 @@ impl Mounts {
             retired: Vec::new(),
             streaming: Streaming::new(device, budgets),
             owners: HashMap::new(),
+            masks: HashMap::new(),
+            transient: Vec::new(),
         })
     }
 
@@ -1398,6 +1437,7 @@ impl Mounts {
         for (_, r) in done {
             self.release(r, device, materials);
         }
+        self.transient.retain(|(f, _)| *f > completed);
     }
 
     fn release(&mut self, r: Resident, device: &Device, materials: &MaterialTable) {
@@ -1407,6 +1447,7 @@ impl Mounts {
         }
         for &id in &r.meshes {
             self.mesh_ids.free(id, 1);
+            self.masks.remove(&id);
         }
         for &(s, n) in &r.page_ranges {
             self.page_ranges.free(s, n);
@@ -1465,6 +1506,7 @@ impl Mounts {
             materials: HashMap::new(),
             pages: HashMap::new(),
             meshes: Vec::new(),
+            rt: Vec::new(),
             page_ranges: Vec::new(),
             material_ranges: Vec::new(),
             cluster_ranges: r.cluster_ranges,
@@ -1533,6 +1575,7 @@ impl Mounts {
                 self.clusters.gpu.offset(u64::from(m.gpu.cluster_base)),
                 &m.refs,
             )?;
+            res.rt.push(m.rt.clone());
             mesh_ids.push(id);
         }
         for m in &models {
@@ -1566,6 +1609,13 @@ impl Mounts {
             if w.emission.len() <= i {
                 w.emission.resize(i + 1, None);
             }
+            if w.model_cpu.len() <= i {
+                w.model_cpu.resize(i + 1, ModelCpu::default());
+            }
+            w.model_cpu[i] = ModelCpu {
+                sections: n,
+                animated_parts: meshes[m.mesh].gpu.animated_parts,
+            };
             let spans = &meshes[m.mesh].spans;
             w.emission[i] = (!spans.is_empty()).then(|| ModelEmission {
                 sections: n,
@@ -1590,6 +1640,98 @@ impl Mounts {
         Ok(())
     }
 
+    /// Records on `list` the section-mask BLAS that copies of these models name and no frame
+    /// has built, and the records that add them to their meshes' mask tables. Returns the
+    /// masks left unbuilt: their mesh's table is full.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_masks(
+        &mut self,
+        device: &Device,
+        window: &UploadWindow,
+        list: &mut orr_gpu::CommandList<'_>,
+        wanted: impl IntoIterator<Item = (ModelId, u16)>,
+        frame: u64,
+        seq: &AtomicU64,
+        records: &mut Vec<Record>,
+    ) -> Result<u32> {
+        let mut todo: Vec<(u32, u16)> = Vec::new();
+        let mut jobs: Vec<(&MeshRt, u16)> = Vec::new();
+        let mut refused = 0;
+        for (model, mask) in wanted {
+            let Some(&(mount, mesh)) = self.owners.get(&model) else {
+                continue;
+            };
+            let Ok(r) = self.resident(mount) else {
+                continue;
+            };
+            let id = r.meshes[mesh as usize];
+            let rt = &r.rt[mesh as usize];
+            let built = self.masks.get(&id).map_or(&[][..], |m| &m.built[..]);
+            if rt.cuts.is_empty() || built.iter().any(|b| b.0 == mask) || todo.contains(&(id, mask))
+            {
+                continue;
+            }
+            if built.len() + todo.iter().filter(|t| t.0 == id).count() >= MASKS_PER_MESH as usize {
+                refused += 1;
+                continue;
+            }
+            todo.push((id, mask));
+            jobs.push((rt, mask));
+        }
+        if todo.is_empty() {
+            return Ok(refused);
+        }
+        let mut keep = Vec::new();
+        let built =
+            accel::build_masks(device, &self.accel.kernels, window, list, &jobs, &mut keep)?;
+        drop(jobs);
+        self.transient.push((frame, keep));
+        let next = |seq: &AtomicU64| seq.fetch_add(1, Ordering::Relaxed);
+        for ((id, mask), blas) in todo.into_iter().zip(built) {
+            let masks = match self.masks.entry(id) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => e.insert(MeshMasks {
+                    table: device.gpu_malloc(
+                        MemoryKind::DeviceLocal,
+                        u64::from(MASKS_PER_MESH),
+                        "mask table",
+                    )?,
+                    built: Vec::new(),
+                }),
+            };
+            let entry = MaskGpu {
+                mask: u32::from(mask),
+                _pad: 0,
+                blas: blas.table.gpu,
+            };
+            let at = masks.table.gpu.offset(masks.built.len() as u64);
+            records.push(Record::values(
+                next(seq),
+                at,
+                window.put(device, &entry)?,
+                1,
+            ));
+            masks.built.push((mask, blas));
+            let mesh = self.meshes.gpu.offset(u64::from(id)).address().0;
+            let table = window.put(device, &masks.table.gpu.address().0)?;
+            let count = window.put(device, &(masks.built.len() as u32))?;
+            let field = |offset: usize| mesh + offset as u64;
+            records.push(Record::copy(
+                next(seq),
+                field(std::mem::offset_of!(MeshGpu, masks)),
+                table.address().0,
+                2,
+            ));
+            records.push(Record::copy(
+                next(seq),
+                field(std::mem::offset_of!(MeshGpu, mask_count)),
+                count.address().0,
+                1,
+            ));
+        }
+        Ok(refused)
+    }
+
     /// Frees every mount at once; the device is idle.
     pub(crate) fn clear(&mut self, device: &Device, materials: &MaterialTable) {
         for e in std::mem::take(&mut self.entries).into_iter().flatten() {
@@ -1600,5 +1742,6 @@ impl Mounts {
         for (_, r) in std::mem::take(&mut self.retired) {
             self.release(r, device, materials);
         }
+        self.transient.clear();
     }
 }

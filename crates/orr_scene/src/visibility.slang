@@ -232,9 +232,11 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
     MaterialGpu* m = s.materials + vc.material;
     PrimaryHit hit;
-    instance_placement(s, inst, v, hit.placement);
-    Placement pl = hit.placement;
     Cluster c = load_cluster(vc.page, vc.local);
+    Placement copy;
+    instance_placement(s, inst, v, copy);
+    cluster_placement(s, vc.instance, inst, c, copy, false, hit.placement);
+    Placement pl = hit.placement;
     Corners t = load_corners(vc.page, c, triangle, mesh);
     float3 q0 = place(pl, t.position[0]);
     float3 e1 = mul(pl.linear, t.position[1] - t.position[0]);

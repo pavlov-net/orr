@@ -9,6 +9,9 @@ mod cluster_rt;
 #[path = "../gpu-basics.rs"]
 mod gpu_basics;
 #[allow(dead_code)]
+#[path = "../rigid-parts.rs"]
+mod rigid_parts;
+#[allow(dead_code)]
 #[path = "../viewer.rs"]
 mod viewer;
 
@@ -45,5 +48,7 @@ fn examples_match_their_references() {
     compare("cluster-rt-clusters", cluster_rt(&["--clusters"]));
     let viewer = viewer::run(&Options::headless(120, &[])).expect("headless capture");
     compare("viewer", viewer);
+    let rigid = rigid_parts::run(&Options::headless(120, &[])).expect("headless capture");
+    compare("rigid-parts", rigid);
     assert_clean();
 }

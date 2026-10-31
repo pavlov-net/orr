@@ -4,7 +4,8 @@
 //! whose coverage and depth offset give the depth and motion of the shape it stands for,
 //! the software raster against the mesh-shader raster, camera rays through the PTLAS against
 //! the visibility buffer, resolved hits against a CPU decode, hit contexts, `rt_range`,
-//! far-from-origin and rebase invariance, and the PTLAS budget.
+//! far-from-origin and rebase invariance, the PTLAS budget, and posed rigid parts in raster
+//! and ray tracing with their motion, hiding, section masks and material sets.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -13,11 +14,12 @@ use std::time::{Duration, Instant};
 
 use glam::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_cook::{
-    ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSettings, Quality, Source,
+    ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshParts, MeshSettings, Quality, Source,
     TextureSettings, Usage,
 };
 use orr_gpu::{
-    Hazards, KernelSet, MemoryKind, QueueKind, ShaderModule, Stages, Texture, TextureRegion,
+    Hazards, KernelSet, MemoryKind, QueueKind, SamplerIndex, ShaderModule, Stages, Texture,
+    TextureRegion,
 };
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{MeshInfo, PageView, decode_page};
@@ -27,12 +29,13 @@ use orr_scene::testing::{
     Image, Pixels, Tolerance, assert_clean, check, device, flip, read_buffer, read_texture, wait,
 };
 use orr_scene::{
-    Affine3, CopyVariant, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstanceRange,
-    InstancesDesc, Lens, LoadState, Loading, MaterialGpu, ModelId, MountId, PackSource, Projection,
-    RasterView, RendererDesc, SceneDesc, SceneId, Scenes, TransformGroupDesc, TransformGroupId,
-    ViewDesc, ViewHistoryId, ViewTarget, VisibleCluster, material_flags,
+    Affine3, BoundTexture, CopyVariant, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
+    InstanceRange, InstancesDesc, Lens, LoadState, Loading, MaterialGpu, ModelId, MountId,
+    PackSource, Pose, Projection, RasterView, RendererDesc, SceneDesc, SceneId, Scenes,
+    TransformGroupDesc, TransformGroupId, ViewDesc, ViewHistoryId, ViewTarget, VisibleCluster,
+    material_flags,
 };
-use scene_suite::shaders::{codec, surface_at, trace};
+use scene_suite::shaders::{codec, pose, surface_at, trace};
 use scene_suite::{linked, pipeline};
 
 const EXTENT: [u32; 2] = [160, 96];
@@ -674,6 +677,75 @@ fn quad(corners: [Vec3; 4]) -> MeshInput {
     )
 }
 
+/// The 256-part rig: a 2 m plate (part 0, section 0) under 255 boxes 0.08 m wide and 0.15 m
+/// tall (parts 1 to 255, section 1), box p standing at grid cell (p % 16, p / 16) and pivoted
+/// at its base, where `pose.slang` turns it.
+fn rig() -> MeshInput {
+    let (mut p, mut nrm, mut uvs, mut part, mut pivot) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut plate, mut boxes) = (Vec::new(), Vec::new());
+    let mut face =
+        |corners: [Vec3; 4], n: Vec3, value: u16, base: Vec3, tris: &mut Vec<[u32; 3]>| {
+            let first = p.len() as u32;
+            for (c, uv) in corners
+                .iter()
+                .zip([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+            {
+                p.push(*c);
+                nrm.push(n);
+                uvs.push(Vec2::from(uv));
+                part.push(value);
+                pivot.push(base);
+            }
+            tris.push([first, first + 1, first + 2]);
+            tris.push([first, first + 2, first + 3]);
+        };
+    let square = |a: f32, b: f32, at: f32, axis: usize| {
+        let corner = |u: f32, v: f32| {
+            let mut c = [0.0; 3];
+            c[axis] = at;
+            c[(axis + 1) % 3] = u;
+            c[(axis + 2) % 3] = v;
+            Vec3::from(c)
+        };
+        [corner(-a, -b), corner(a, -b), corner(a, b), corner(-a, b)]
+    };
+    face(square(1.0, 1.0, 0.0, 1), Vec3::Y, 0, Vec3::ZERO, &mut plate);
+    for b in 1..RIG_PARTS as u16 {
+        let base = Vec3::new(
+            (f32::from(b % 16) - 7.5) * 0.125,
+            0.0,
+            (f32::from(b / 16) - 7.5) * 0.125,
+        );
+        let (h, w) = (0.15, 0.04);
+        let center = base + Vec3::Y * (h * 0.5);
+        for axis in 0..3 {
+            let half = if axis == 1 { h * 0.5 } else { w };
+            for sign in [-1.0, 1.0] {
+                let mut n = [0.0; 3];
+                n[axis] = sign;
+                let n = Vec3::from(n);
+                let (u, v) = match axis {
+                    0 => (h * 0.5, w),
+                    1 => (w, w),
+                    _ => (w, h * 0.5),
+                };
+                let corners = square(u, v, sign * half, axis).map(|c| c + center);
+                face(corners, n, b, base, &mut boxes);
+            }
+        }
+    }
+    let sections = [plate.len() as u32, boxes.len() as u32];
+    let mut m = mesh(p, nrm, uvs, [plate, boxes].concat(), &sections);
+    m.parts = Some(MeshParts {
+        values: part,
+        count: RIG_PARTS as u16,
+        by_section: false,
+        pivots: Some(pivot),
+    });
+    m
+}
+
 /// The parallax card's virtual quad, as `surfaces/parallax.slang` places it.
 fn slab_corners() -> [Vec3; 4] {
     let z = |x: f32| -0.2 - 0.3 * x;
@@ -823,6 +895,7 @@ fn cook() -> Arc<[u8]> {
                 model("plain", quad(unit), vec![plain], one()),
                 model("probe", quad(unit.map(|c| c * 12.0)), vec![probe], one()),
                 model("steady ball", sphere(16, 0.9), vec![steady, steady], one()),
+                model("rig", rig(), vec![plain, metal], one()),
                 model(
                     "steady ground",
                     grid(12, 6.0, 2.0, |x, z| 0.1 * (x * 0.9).sin() * z.cos()),
@@ -1634,14 +1707,15 @@ fn masked_sections_draw_nothing() {
         })
         .unwrap();
     // Section 1 is the emitting lower half.
-    f.scene(placed.scene)
-        .unwrap()
-        .copy_variants(placed.ranges[0], 0, 1)
-        .unwrap()[0] = CopyVariant {
+    let lower = CopyVariant {
         pose: 0,
         material_set: 0,
         section_mask: 1 << 1,
     };
+    f.scene(placed.scene)
+        .unwrap()
+        .copy_variants(placed.ranges[0], 0, &[lower])
+        .unwrap();
     f.update_scenes(&mut |_| {}).unwrap();
     wait(f.end(&[]).unwrap());
     let masked = render(&mut w, &placed, eye, Vec3::ZERO, &[], true, 3);
@@ -2576,5 +2650,638 @@ fn later_mounts_and_unmounts_leave_traced_scenes_intact() {
         w.scenes.unmount(m);
         check(&mut w, 3 + round);
     }
+    assert_clean();
+}
+
+// --- Rigid parts ------------------------------------------------------------------------------
+
+/// Parts of the rig: the plate and 255 boxes.
+const RIG_PARTS: u32 = 256;
+/// Pose variants of every rig copy.
+const RIG_VARIANTS: u32 = 4;
+
+/// Copies of the rig on a grid, posed from a GPU-written group by `pose.slang`.
+struct Rigs {
+    placed: Placed,
+    range: InstanceRange,
+    pose: TransformGroupId,
+    blocks: u32,
+    centers: Vec<Vec3>,
+    animation_range: f32,
+}
+
+/// `count` rig copies in rows of `row`, `spacing` m apart around the origin, pose variant
+/// `copy % 4`, their pose blocks shared (`stride` 0) or one per copy (`stride` 4), placed in
+/// a frame focused on the origin.
+fn place_rigs(w: &mut World, count: u32, row: u32, spacing: f32, stride: u32, range: f32) -> Rigs {
+    let scene = w.scenes.create_scene(&SceneDesc::default()).unwrap();
+    let history = w.scenes.create_view_history().unwrap();
+    let model = w.model("rig");
+    let rows = count.div_ceil(row);
+    let centers: Vec<Vec3> = (0..count)
+        .map(|i| {
+            let (x, z) = ((i % row) as f32, (i / row) as f32);
+            let half = Vec2::new(row as f32 - 1.0, rows as f32 - 1.0) * 0.5;
+            Vec3::new((x - half.x) * spacing, 0.0, (z - half.y) * spacing)
+        })
+        .collect();
+    let blocks = if stride == 0 {
+        RIG_VARIANTS
+    } else {
+        (count - 1) * stride + RIG_VARIANTS
+    };
+    let list = [scene];
+    let f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(0),
+            scenes: &list,
+            low_latency: None,
+        })
+        .unwrap();
+    let mut s = f.scene(scene).unwrap();
+    s.set_focus(DVec3::ZERO, PIXELS_PER_RADIAN);
+    let group = s
+        .create_transform_group(&TransformGroupDesc {
+            count,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    let pose = s
+        .create_transform_group(&TransformGroupDesc {
+            count: blocks * RIG_PARTS,
+            writer: GroupWriter::Gpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    for (t, &c) in s
+        .transforms(group, 0, count)
+        .unwrap()
+        .iter_mut()
+        .zip(&centers)
+    {
+        *t = affine(Mat3::IDENTITY, c);
+    }
+    let r = s
+        .add_instances(&InstancesDesc {
+            model,
+            copies: count,
+            transforms: group,
+            first: 0,
+            pose: Some(Pose {
+                group: pose,
+                index: 0,
+                variants: RIG_VARIANTS,
+                stride,
+            }),
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 10_000.0,
+            animation_range: range,
+            user_tag: 0,
+        })
+        .unwrap();
+    let variants: Vec<CopyVariant> = (0..count)
+        .map(|i| CopyVariant {
+            pose: (i % RIG_VARIANTS) as u8,
+            material_set: 0,
+            section_mask: 0,
+        })
+        .collect();
+    s.copy_variants(r, 0, &variants).unwrap();
+    drop(s);
+    wait(f.end(&[]).unwrap());
+    Rigs {
+        placed: Placed {
+            scene,
+            ranges: vec![r],
+            group,
+            history,
+            count,
+        },
+        range: r,
+        pose,
+        blocks,
+        centers,
+        animation_range: range,
+    }
+}
+
+/// One frame of the rigs with their poses written by `entry` of `pose.slang` at `t`.
+fn shoot_rigs(
+    w: &mut World,
+    rigs: &Rigs,
+    shot: &Shot,
+    entry: &str,
+    t: f32,
+    amplitude: f32,
+) -> Frame {
+    let kernel = pipeline(&pose::MODULE, entry);
+    let list = [rigs.placed.scene];
+    let mut f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(shot.frame),
+            scenes: &list,
+            low_latency: None,
+        })
+        .unwrap();
+    {
+        let mut s = f.scene(rigs.placed.scene).unwrap();
+        if let Some(focus) = shot.focus {
+            s.set_focus(focus, PIXELS_PER_RADIAN);
+        }
+        for &(i, m) in &shot.moved {
+            s.transforms(rigs.placed.group, i, 1).unwrap()[0] = m;
+        }
+    }
+    f.update_scenes(&mut |c| {
+        let root = pose::Root {
+            scene: c.root,
+            group: rigs.pose.0,
+            blocks: rigs.blocks,
+            time: t,
+            amplitude,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let root = c.put_root(&root).unwrap();
+        c.cmd.dispatch(
+            &kernel,
+            root,
+            [(rigs.blocks * RIG_PARTS).div_ceil(64), 1, 1],
+        );
+    })
+    .unwrap();
+    let view = f
+        .raster_view(&ViewDesc {
+            scene: rigs.placed.scene,
+            history: rigs.placed.history,
+            position: shot.eye,
+            rotation: look(Vec3::ZERO, (shot.target - shot.eye).as_vec3()),
+            projection: Projection {
+                fov_y: 0.9,
+                near: 0.1,
+            },
+            lens: Lens::default(),
+            render_extent: UVec2::from(EXTENT),
+            jitter: Vec2::new(0.25, -0.125),
+            reset_history: shot.reset,
+            mip_bias: 0.0,
+            target: ViewTarget::AfterRr,
+        })
+        .unwrap();
+    wait(f.end(&[]).unwrap());
+    read_back(&view)
+}
+
+/// The figures of the last frame, taken in by an empty one.
+fn last_rt(w: &mut World, frame: u32) -> orr_scene::RtStats {
+    let f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(frame),
+            scenes: &[],
+            low_latency: None,
+        })
+        .unwrap();
+    wait(f.end(&[]).unwrap());
+    w.scenes.stats().rt
+}
+
+/// The rig's rest bounds: the plate and the boxes' tops.
+const RIG_CENTER: Vec3 = Vec3::new(0.0, 0.075, 0.0);
+fn rig_radius() -> f32 {
+    0.5 * Vec3::new(2.0, 0.15, 2.0).length()
+}
+
+/// Which copies take their pose with the focus at `focus`, given which did before, with the
+/// animation range's 15% hysteresis. Fails when a copy lies within 1 cm of a boundary.
+fn animated(rigs: &Rigs, focus: Vec3, before: &[bool]) -> Vec<bool> {
+    rigs.centers
+        .iter()
+        .zip(before)
+        .map(|(&c, &was)| {
+            let d = ((c + RIG_CENTER - focus).length() - rig_radius()).max(0.0);
+            let range = rigs.animation_range * if was { 1.15 } else { 1.0 };
+            assert!(
+                (d - range).abs() > 0.01,
+                "a copy {d} m away sits on the range"
+            );
+            d <= range
+        })
+        .collect()
+}
+
+#[test]
+fn posed_rigid_parts_trace_where_the_raster_draws_them() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let eye = DVec3::new(0.0, 7.0, 12.0);
+    let target = DVec3::new(0.0, 0.0, 1.0);
+    let mut frame = 1;
+    for stride in [0, RIG_VARIANTS] {
+        let rigs = place_rigs(&mut w, 1000, 40, 2.2, stride, 6.09);
+        let mut held = animated(&rigs, Vec3::ZERO, &[false; 1000]);
+        // The focus crosses the field, leaves it (within the render origin's grid step, so
+        // no frame rebases) and comes back.
+        let foci = [
+            Vec3::new(0.3, 0.0, 2.1),
+            Vec3::new(6.2, 0.0, 1.7),
+            Vec3::new(300.0, 0.0, 0.0),
+            Vec3::new(-3.1, 0.0, 4.3),
+        ];
+        for focus in foci {
+            held = animated(&rigs, focus, &held);
+            let posed = held.iter().filter(|&&h| h).count() as u32;
+            let mut previous: Option<Vec<f32>> = None;
+            for step in 0..3 {
+                let mut shot = Shot::at(eye, target, frame);
+                shot.focus = Some(focus.as_dvec3());
+                let t = frame as f32 * 0.21;
+                let g = shoot_rigs(&mut w, &rigs, &shot, "sway", t, 0.35);
+                let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+                // Thousands of sub-pixel boxes put many samples on edges, where the raster
+                // and the ray may take the neighboring surface.
+                let (matched, covered) = parity(&g, &r, 1e-4);
+                let (same, _) = parity(&g, &r, f32::INFINITY);
+                let total = r.traced.len();
+                let context = format!("stride {stride}, focus {focus}, step {step}");
+                assert!(covered > total / 3, "{covered} of {total} pixels covered");
+                assert!(
+                    same as f64 >= 0.998 * total as f64 && matched as f64 >= 0.995 * total as f64,
+                    "{context}: {same} of {total} pixels agree on the copy, {matched} on the depth"
+                );
+                // Only posed copies move from one step to the next.
+                if let Some(before) = &previous {
+                    let moved = (0..total).filter(|&i| g.depth[i] != before[i]).count();
+                    if posed == 0 {
+                        assert_eq!(moved, 0, "{context}: copies at rest moved");
+                    } else {
+                        assert!(moved > 100, "{context}: only {moved} pixels moved");
+                    }
+                }
+                previous = Some(g.depth.clone());
+                let rt = last_rt(&mut w, frame);
+                assert_eq!(
+                    (rt.parts, rt.parts_refused),
+                    (posed * (RIG_PARTS - 1), 0),
+                    "stride {stride}, focus {focus}: part instances of {posed} posed copies"
+                );
+                frame += 1;
+            }
+        }
+        let f = w
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(frame),
+                scenes: &[rigs.placed.scene],
+                low_latency: None,
+            })
+            .unwrap();
+        f.scene(rigs.placed.scene).unwrap().remove(rigs.range);
+        wait(f.end(&[]).unwrap());
+        assert_eq!(
+            last_rt(&mut w, frame).parts,
+            0,
+            "removed copies release their runs"
+        );
+        w.scenes.destroy_scene(rigs.placed.scene);
+    }
+    assert_clean();
+}
+
+#[test]
+fn a_sliding_part_moves_by_its_analytic_motion() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let rigs = place_rigs(&mut w, 1, 1, 0.0, 0, 100.0);
+    // Level with the boxes and just under the plate, whose back faces away.
+    let eye = DVec3::new(0.0, -0.01, 2.5);
+    let target = DVec3::new(0.0, -0.01, 0.0);
+    let amplitude = 0.05;
+    let (t0, t1) = (0.0f32, 0.5f32);
+    shoot_rigs(
+        &mut w,
+        &rigs,
+        &Shot::at(eye, target, 1),
+        "slide",
+        t0,
+        amplitude,
+    );
+    let g = shoot_rigs(
+        &mut w,
+        &rigs,
+        &Shot::at(eye, target, 2),
+        "slide",
+        t1,
+        amplitude,
+    );
+    // Every box moved along the camera's x by d: a point at view depth z moves on screen by
+    // -d f / (aspect z) in NDC, half that in uv.
+    let d = amplitude * (t1.sin() - t0.sin());
+    let f = 1.0 / (0.45f32).tan();
+    let aspect = EXTENT[0] as f32 / EXTENT[1] as f32;
+    let (mut n, mut worst) = (0, 0.0f32);
+    for (i, &id) in g.ids.iter().enumerate() {
+        if id == 0 {
+            continue;
+        }
+        let z = 0.1 / g.depth[i];
+        let expected = -0.5 * d * f / (aspect * z) * EXTENT[0] as f32;
+        let m = Vec2::from(g.motion[i]) * Vec2::new(EXTENT[0] as f32, EXTENT[1] as f32);
+        worst = worst.max((m.x - expected).abs()).max(m.y.abs());
+        n += 1;
+    }
+    assert!(n > 1000, "{n} box pixels");
+    assert!(worst <= 0.05, "motion off its analytic value by {worst} px");
+    assert_clean();
+}
+
+#[test]
+fn a_zero_transform_or_the_null_group_hides_a_posed_copy_with_its_parts() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let rigs = place_rigs(&mut w, 2, 2, 2.4, 0, 100.0);
+    let eye = DVec3::new(0.0, 2.5, 3.5);
+    let target = DVec3::ZERO;
+    let count = |g: &Frame, r: &Rays, slot: u32| {
+        let drawn = g.ids.iter().filter(|&&id| id == slot + 1).count();
+        let traced = r.traced.iter().filter(|t| t.instance == slot + 1).count();
+        (drawn, traced)
+    };
+    let g = shoot_rigs(&mut w, &rigs, &Shot::at(eye, target, 1), "sway", 0.3, 0.3);
+    let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+    let first = rigs.range.first;
+    for slot in [first, first + 1] {
+        let (drawn, traced) = count(&g, &r, slot);
+        assert!(
+            drawn > 500 && traced > 500,
+            "slot {slot}: {drawn} drawn, {traced} traced"
+        );
+    }
+    assert_eq!(last_rt(&mut w, 2).parts, 2 * (RIG_PARTS - 1));
+    // Copy 0 takes an all-zero transform; copy 1 is placed again in the null group.
+    let model = w.model("rig");
+    let f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(3),
+            scenes: &[rigs.placed.scene],
+            low_latency: None,
+        })
+        .unwrap();
+    {
+        let mut s = f.scene(rigs.placed.scene).unwrap();
+        s.transforms(rigs.placed.group, 0, 1).unwrap()[0] = Affine3::default();
+        s.remove(InstanceRange {
+            first: first + 1,
+            count: 1,
+        });
+    }
+    wait(f.end(&[]).unwrap());
+    let f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(4),
+            scenes: &[rigs.placed.scene],
+            low_latency: None,
+        })
+        .unwrap();
+    let hidden = f
+        .scene(rigs.placed.scene)
+        .unwrap()
+        .add_instances(&InstancesDesc {
+            model,
+            copies: 1,
+            transforms: TransformGroupId(0),
+            first: 0,
+            pose: Some(Pose {
+                group: rigs.pose,
+                index: 0,
+                variants: RIG_VARIANTS,
+                stride: 0,
+            }),
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 10_000.0,
+            animation_range: 100.0,
+            user_tag: 0,
+        })
+        .unwrap();
+    wait(f.end(&[]).unwrap());
+    let g = shoot_rigs(&mut w, &rigs, &Shot::at(eye, target, 5), "sway", 0.4, 0.3);
+    let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+    for slot in [first, first + 1, hidden.first] {
+        assert_eq!(count(&g, &r, slot), (0, 0), "slot {slot} is hidden");
+    }
+    assert_eq!(
+        last_rt(&mut w, 6).parts,
+        0,
+        "hidden copies hold no part runs"
+    );
+    assert_clean();
+}
+
+#[test]
+fn a_section_mask_hides_its_sections_in_raster_and_ray_tracing_and_nothing_else() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let rigs = place_rigs(&mut w, 2, 2, 2.4, 0, 100.0);
+    let eye = DVec3::new(0.0, 2.5, 3.5);
+    let target = DVec3::ZERO;
+    let first = rigs.range.first;
+    let shot = |frame| Shot::at(eye, target, frame);
+    let whole = shoot_rigs(&mut w, &rigs, &shot(1), "sway", 0.3, 0.3);
+    // Copy 1 hides section 1, every box: what stays is its plate.
+    let f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(2),
+            scenes: &[rigs.placed.scene],
+            low_latency: None,
+        })
+        .unwrap();
+    let boxes = CopyVariant {
+        pose: 0,
+        material_set: 0,
+        section_mask: 1 << 1,
+    };
+    f.scene(rigs.placed.scene)
+        .unwrap()
+        .copy_variants(rigs.range, 1, &[boxes])
+        .unwrap();
+    wait(f.end(&[]).unwrap());
+    let masked = shoot_rigs(&mut w, &rigs, &shot(3), "sway", 0.3, 0.3);
+    let r = rays(&masked.view, &trace::MODULE, "pixels", 1);
+    let (matched, _) = parity(&masked, &r, 1e-4);
+    assert!(
+        matched as f64 >= 0.999 * r.traced.len() as f64,
+        "{matched} of {} pixels agree",
+        r.traced.len()
+    );
+    // The boxes are metal and pale (green above 0.6 in Rec.2020); the plate is neither.
+    let metal = |i: usize, g: &Frame| decode_core(g.a[i], g.b[i]).metalness > 0.5;
+    let pixels = |g: &Frame, slot: u32, boxes: bool| {
+        (0..g.ids.len())
+            .filter(|&i| g.ids[i] == slot + 1 && metal(i, g) == boxes)
+            .count()
+    };
+    let traced_boxes = |slot: u32| {
+        (0..r.traced.len())
+            .filter(|&i| r.traced[i].instance == slot + 1 && r.traced[i].base_color[1] > 0.6)
+            .count()
+    };
+    assert_eq!(
+        pixels(&masked, first, true),
+        pixels(&whole, first, true),
+        "copy 0 keeps its boxes"
+    );
+    assert!(
+        pixels(&whole, first + 1, true) > 100,
+        "copy 1 shows boxes first"
+    );
+    assert_eq!(pixels(&masked, first + 1, true), 0, "copy 1 draws no box");
+    assert_eq!(traced_boxes(first + 1), 0, "rays hit no box of copy 1");
+    assert!(traced_boxes(first) > 100, "rays hit copy 0's boxes");
+    assert!(
+        pixels(&masked, first + 1, false) > pixels(&whole, first + 1, false),
+        "copy 1 keeps its plate"
+    );
+    assert_eq!(
+        last_rt(&mut w, 4).parts,
+        RIG_PARTS - 1,
+        "the masked copy's boxes leave the PTLAS; copy 0 keeps its run"
+    );
+    assert_clean();
+}
+
+#[test]
+fn rewriting_a_material_set_changes_only_the_copies_that_name_it() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let scene = w.scenes.create_scene(&SceneDesc::default()).unwrap();
+    let history = w.scenes.create_view_history().unwrap();
+    let plain = w.model("plain");
+    let list = [scene];
+    let mut materials = Vec::new();
+    let mut records = Vec::new();
+    let f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(0),
+            scenes: &list,
+            low_latency: None,
+        })
+        .unwrap();
+    {
+        let mut mats = f.materials();
+        for base_color in [[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]] {
+            let m = Material {
+                base_color,
+                ..Material::default()
+            };
+            let m = MaterialGpu::new(&m, &[BoundTexture::NONE; 12], SamplerIndex(0));
+            materials.push(mats.create(&m).unwrap());
+            records.push(Vec3::from(m.base_color));
+        }
+    }
+    let mut s = f.scene(scene).unwrap();
+    s.material_sets(0, 2)
+        .unwrap()
+        .copy_from_slice(&[materials[0], materials[1]]);
+    let group = s
+        .create_transform_group(&TransformGroupDesc {
+            count: 3,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    let mut ranges = Vec::new();
+    for (i, set) in [Some(0), Some(1), None].into_iter().enumerate() {
+        s.transforms(group, i as u32, 1).unwrap()[0] =
+            affine(Mat3::IDENTITY, Vec3::new(i as f32 * 1.2 - 1.2, 0.0, 0.0));
+        ranges.push(
+            s.add_instances(&InstancesDesc {
+                model: plain,
+                copies: 1,
+                transforms: group,
+                first: i as u32,
+                pose: None,
+                material_set: set,
+                flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+                rt_range: 100.0,
+                animation_range: 0.0,
+                user_tag: 0,
+            })
+            .unwrap(),
+        );
+    }
+    drop(s);
+    wait(f.end(&[]).unwrap());
+    let placed = Placed {
+        scene,
+        ranges,
+        group,
+        history,
+        count: 3,
+    };
+    let eye = DVec3::new(0.0, 0.0, 3.0);
+    let colors = |w: &mut World, frame| {
+        let g = shoot(w, &placed, &Shot::at(eye, DVec3::ZERO, frame));
+        let r = rays(&g.view, &trace::MODULE, "pixels", 1);
+        placed
+            .ranges
+            .iter()
+            .map(|range| {
+                let id = range.first + 1;
+                let i = g.ids.iter().position(|&p| p == id).expect("drawn");
+                let t = r.traced.iter().find(|t| t.instance == id).expect("traced");
+                (
+                    decode_core(g.a[i], g.b[i]).base_color,
+                    Vec3::from(t.base_color),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = colors(&mut w, 1);
+    // Set 0 now names the blue material.
+    let f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(2),
+            scenes: &list,
+            low_latency: None,
+        })
+        .unwrap();
+    f.scene(scene).unwrap().material_sets(0, 1).unwrap()[0] = materials[2];
+    wait(f.end(&[]).unwrap());
+    let after = colors(&mut w, 3);
+    let close = |a: Vec3, b: Vec3| (a - b).abs().max_element() < 0.02;
+    let blue = records[2];
+    assert!(
+        close(after[0].0, blue) && close(after[0].1, blue),
+        "copy 0: {:?}",
+        after[0]
+    );
+    for i in 1..3 {
+        assert!(
+            close(after[i].0, before[i].0) && close(after[i].1, before[i].1),
+            "copy {i}: {:?} then {:?}",
+            before[i],
+            after[i]
+        );
+    }
+    assert!(
+        close(before[0].0, records[0]),
+        "copy 0 starts red: {:?}",
+        before[0]
+    );
+    assert!(
+        close(before[1].0, records[1]),
+        "copy 1 is green: {:?}",
+        before[1]
+    );
     assert_clean();
 }

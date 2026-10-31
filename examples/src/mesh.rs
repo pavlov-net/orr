@@ -1,16 +1,19 @@
 //! Meshes the examples cook, built from simple shapes.
 
 use orr::orr_pack::Span;
-use orr_cook::MeshInput;
+use orr_cook::{MeshInput, MeshParts};
 use orr_math::{Vec2, Vec3};
 
-/// Triangles per material section.
+/// Triangles per material section, each vertex in a rigid part.
 #[derive(Default)]
 pub struct MeshBuilder {
     positions: Vec<Vec3>,
     normals: Vec<Vec3>,
     uvs: Vec<Vec2>,
     sections: Vec<Vec<u32>>,
+    parts: Vec<u16>,
+    pivots: Vec<Vec3>,
+    part: (u16, Vec3),
 }
 
 impl MeshBuilder {
@@ -18,7 +21,15 @@ impl MeshBuilder {
         self.positions.push(p);
         self.normals.push(n);
         self.uvs.push(uv);
+        self.parts.push(self.part.0);
+        self.pivots.push(self.part.1);
         self.positions.len() as u32 - 1
+    }
+
+    /// Puts the shapes added from now on in rigid part `value`, pivoted at `pivot`. Shapes
+    /// start in part 0, the body; a mesh with no other part cooks without parts.
+    pub fn part(&mut self, value: u16, pivot: Vec3) {
+        self.part = (value, pivot);
     }
 
     /// Two triangles over the grid cell `c`, `c + 1`, `c + w + 1`, `c + w`, counter-clockwise
@@ -183,6 +194,13 @@ impl MeshBuilder {
                 count: m.indices.len() as u32 - first,
             });
         }
+        let count = self.parts.iter().max().map_or(0, |&p| p + 1);
+        m.parts = (count > 1).then_some(MeshParts {
+            values: self.parts,
+            count,
+            by_section: false,
+            pivots: Some(self.pivots),
+        });
         m
     }
 }

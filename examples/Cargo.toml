@@ -43,5 +43,13 @@ path = "viewer.rs"
 name = "hdr-calibration"
 path = "hdr-calibration.rs"
 
+[[example]]
+name = "dlss"
+path = "dlss.rs"
+
+[[example]]
+name = "rigid-parts"
+path = "rigid-parts.rs"
+
 [lints]
 workspace = true

@@ -4,6 +4,8 @@
 // cluster pass to the items written, `clusters` culls each item's clusters (section mask,
 // DAG cluster rule, frustum, back-face cone) and sorts the survivors into the hardware
 // opaque, hardware alpha and software lists, and `raster_args` sizes the raster to them.
+// Clusters of animated parts are culled where their pose places them; whole copies by their
+// model's rest bounds.
 #include "orr/root.h"
 import orr.trace;
 import orr_pack.mesh;
@@ -194,11 +196,14 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     ModelGpu* model = s.models + inst.model;
     MeshGpu* mesh = s.meshes + model.mesh;
     uint8_t* page = (uint8_t*)mesh.pages[w.page];
-    Placement p;
-    if (!instance_placement(s, inst, v, p) || page == nullptr)
+    Placement copy;
+    if (!instance_placement(s, inst, v, copy) || page == nullptr)
         return;
     uint local = w.first + thread;
     Cluster c = load_cluster(page, local);
+    Placement p;
+    if (!cluster_placement(s, w.instance, inst, c, copy, false, p))
+        return;
     uint material = section_material(s, inst, model, c.section);
     if (material == MATERIAL_NONE)
         return;

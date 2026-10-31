@@ -16,6 +16,7 @@ hot-reload = ["orr_shaders/hot-reload", "dep:log"]
 
 [dependencies]
 orr_gpu.workspace = true
+orr_io.workspace = true
 orr_pack.workspace = true
 orr_shaders.workspace = true
 bytemuck.workspace = true
@@ -26,15 +27,6 @@ thiserror.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "exr"], optional = true }
 nv-flip = { version = "0.1.2", optional = true }
 log = { workspace = true, optional = true }
-
-[target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Storage_FileSystem",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Threading",
-] }
 
 [build-dependencies]
 orr_shaders = { workspace = true, features = ["build"] }
