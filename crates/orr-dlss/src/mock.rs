@@ -1,7 +1,8 @@
 //! The backend without NGX. With the `mock` feature it reports every feature unsupported and
-//! ray reconstruction blits colour to the output; without it, initialisation fails.
+//! ray reconstruction blits color to the output; frame generation cannot be created. Without
+//! it, initialization fails.
 
-use crate::raw::{RrInputs, Vulkan};
+use crate::raw::{FgInputs, RrInputs, Vulkan};
 use crate::{DlssError, Quality, Support, Uuid};
 use ash::vk;
 use std::ffi::CString;
@@ -112,5 +113,28 @@ impl Rr {
             );
         }
         Ok(())
+    }
+}
+
+pub(crate) struct Fg;
+
+impl Fg {
+    pub(crate) unsafe fn new(
+        _ngx: &Ngx,
+        _cmd: vk::CommandBuffer,
+        _output: [u32; 2],
+        _format: vk::Format,
+    ) -> Result<Self, DlssError> {
+        Err(DlssError::Unsupported("frame generation"))
+    }
+
+    pub(crate) unsafe fn record(
+        &mut self,
+        _cmd: vk::CommandBuffer,
+        _inputs: &FgInputs<'_>,
+        _index: u32,
+        _count: u32,
+    ) -> Result<(), DlssError> {
+        Err(DlssError::Unsupported("frame generation"))
     }
 }

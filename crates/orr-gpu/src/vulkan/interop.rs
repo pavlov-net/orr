@@ -11,6 +11,7 @@ use super::command::CommandList;
 use super::debug::name_object;
 use super::device::{Device, Shared};
 use super::garbage::Item;
+use super::memory::Allocation;
 use super::queue::QueueKind;
 use super::texture::Texture;
 use crate::{Error, ViewDesc};
@@ -202,6 +203,11 @@ pub fn image_handles(t: &Texture) -> Result<ImageHandles, Error> {
         },
         range: info.subresource_range,
     })
+}
+
+/// The raw buffer behind `a`, which starts at offset 0 and spans `a.size` bytes.
+pub fn buffer_handle<T>(a: &Allocation<T>) -> vk::Buffer {
+    a.raw().buffer
 }
 
 /// Runs `release` once everything submitted to `device` so far has completed, from

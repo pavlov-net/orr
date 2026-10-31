@@ -9,6 +9,8 @@ repository.workspace = true
 links = "orr_output"
 
 [dependencies]
+orr-dlss.workspace = true
+orr-math.workspace = true
 orr-scene.workspace = true
 orr-shaders.workspace = true
 raw-window-handle.workspace = true
@@ -35,6 +37,7 @@ windows = { version = "0.62.2", features = [
   "Win32_System_WinRT",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
+  "Wdk_Graphics_Direct3D",
 ] }
 
 [target.'cfg(windows)'.dev-dependencies]

@@ -1,4 +1,4 @@
-use crate::raw::{Image, RrInputs, Vulkan};
+use crate::raw::{FgInputs, Image, RrInputs, Vulkan};
 use crate::sys::*;
 use crate::{DlssError, Quality, Support, Uuid};
 use ash::vk::{self, Handle, TaggedStructure};
@@ -446,6 +446,15 @@ fn preset_key(quality: Quality) -> &'static [u8] {
     }
 }
 
+fn aspect(format: vk::Format) -> vk::ImageAspectFlags {
+    match format {
+        vk::Format::D16_UNORM | vk::Format::D32_SFLOAT | vk::Format::X8_D24_UNORM_PACK32 => {
+            vk::ImageAspectFlags::DEPTH
+        }
+        _ => vk::ImageAspectFlags::COLOR,
+    }
+}
+
 fn resource(image: &Image, read_write: bool) -> NVSDK_NGX_Resource_VK {
     // SAFETY: a plain C struct; the fields NGX reads are set below.
     let mut r: NVSDK_NGX_Resource_VK = unsafe { std::mem::zeroed() };
@@ -453,7 +462,7 @@ fn resource(image: &Image, read_write: bool) -> NVSDK_NGX_Resource_VK {
         ImageView: image.view.as_raw() as usize as VkImageView,
         Image: image.image.as_raw() as usize as VkImage,
         SubresourceRange: VkImageSubresourceRange {
-            aspectMask: vk::ImageAspectFlags::COLOR.as_raw(),
+            aspectMask: aspect(image.format).as_raw(),
             baseMipLevel: 0,
             levelCount: 1,
             baseArrayLayer: 0,
@@ -647,6 +656,290 @@ impl Rr {
 }
 
 impl Drop for Rr {
+    fn drop(&mut self) {
+        // SAFETY: the caller of `new` drops the feature after the GPU is done with it.
+        unsafe {
+            NVSDK_NGX_VULKAN_ReleaseFeature(self.handle);
+            NVSDK_NGX_VULKAN_DestroyParameters(self.params);
+        }
+    }
+}
+
+fn buffer_resource(buffer: vk::Buffer, size: u64) -> NVSDK_NGX_Resource_VK {
+    // SAFETY: a plain C struct; the fields NGX reads are set below.
+    let mut r: NVSDK_NGX_Resource_VK = unsafe { std::mem::zeroed() };
+    r.Resource.BufferInfo = NVSDK_NGX_BufferInfo_VK {
+        Buffer: buffer.as_raw() as usize as VkBuffer,
+        SizeInBytes: size.min(u64::from(u32::MAX)) as u32,
+    };
+    r.Type = NVSDK_NGX_Resource_VK_Type_NVSDK_NGX_RESOURCE_VK_TYPE_VK_BUFFER;
+    r.ReadWrite = true;
+    r
+}
+
+/// Backbuffer, depth, motion, distortion field, interpolated output and the
+/// interpolation-disabled flag.
+const FG_SLOTS: usize = 6;
+
+const IDENTITY: [[f32; 4]; 4] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
+
+pub(crate) struct Fg {
+    handle: *mut NVSDK_NGX_Handle,
+    params: *mut NVSDK_NGX_Parameter,
+    resources: [NVSDK_NGX_Resource_VK; FG_SLOTS],
+    /// The camera matrices NGX reads through pointers during the evaluate call.
+    matrices: [[[f32; 4]; 4]; 5],
+}
+
+impl Fg {
+    pub(crate) unsafe fn new(
+        ngx: &Ngx,
+        cmd: vk::CommandBuffer,
+        output: [u32; 2],
+        format: vk::Format,
+    ) -> Result<Self, DlssError> {
+        if !ngx.support().fg {
+            return Err(DlssError::Unsupported("frame generation"));
+        }
+        let mut params = ptr::null_mut();
+        // SAFETY: NGX is initialised.
+        check("NVSDK_NGX_VULKAN_AllocateParameters", unsafe {
+            NVSDK_NGX_VULKAN_AllocateParameters(&mut params)
+        })?;
+        let mut handle = ptr::null_mut();
+        // SAFETY: `params` is a live map; `cmd` is recording on NGX's device (caller).
+        let r = unsafe {
+            let ui = |name: &[u8], v: u32| NVSDK_NGX_Parameter_SetUI(params, key(name), v);
+            ui(NVSDK_NGX_Parameter_CreationNodeMask, 1);
+            ui(NVSDK_NGX_Parameter_VisibilityNodeMask, 1);
+            ui(NVSDK_NGX_Parameter_Width, output[0]);
+            ui(NVSDK_NGX_Parameter_Height, output[1]);
+            ui(NVSDK_NGX_DLSSG_Parameter_Width, output[0]);
+            ui(NVSDK_NGX_DLSSG_Parameter_Height, output[1]);
+            ui(
+                NVSDK_NGX_DLSSG_Parameter_BackbufferFormat,
+                format.as_raw() as u32,
+            );
+            ui(NVSDK_NGX_DLSSG_Parameter_DynamicResolution, 0);
+            ui(NVSDK_NGX_DLSSG_Parameter_AsyncCreateEnabled, 1);
+            ui(
+                NVSDK_NGX_DLSSG_Parameter_UserInterfaceRecompositionEnabled,
+                0,
+            );
+            NVSDK_NGX_VULKAN_CreateFeature1(
+                ngx.device.as_raw() as usize as VkDevice,
+                cmd.as_raw() as usize as VkCommandBuffer,
+                NVSDK_NGX_Feature_NVSDK_NGX_Feature_FrameGeneration,
+                params,
+                &mut handle,
+            )
+        };
+        if let Err(e) = check("NVSDK_NGX_VULKAN_CreateFeature1", r) {
+            // SAFETY: allocated above and not shared.
+            unsafe { NVSDK_NGX_VULKAN_DestroyParameters(params) };
+            return Err(e);
+        }
+        Ok(Self {
+            handle,
+            params,
+            // SAFETY: plain C structs; each is written before NGX reads it.
+            resources: unsafe { std::mem::zeroed() },
+            matrices: [IDENTITY; 5],
+        })
+    }
+
+    pub(crate) unsafe fn record(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        inputs: &FgInputs<'_>,
+        index: u32,
+        count: u32,
+    ) -> Result<(), DlssError> {
+        let c = inputs.camera;
+        self.matrices = [
+            c.view_to_clip,
+            c.clip_to_view,
+            c.clip_to_prev_clip,
+            c.prev_clip_to_clip,
+            IDENTITY,
+        ];
+        self.resources[0] = resource(inputs.backbuffer, false);
+        self.resources[1] = resource(inputs.depth, false);
+        self.resources[2] = resource(inputs.motion, false);
+        if let Some(d) = inputs.distortion {
+            self.resources[3] = resource(d, false);
+        }
+        self.resources[4] = resource(inputs.interpolated, true);
+        if let Some(f) = inputs.disable_interpolation {
+            self.resources[5] = buffer_resource(f.buffer, f.size);
+        }
+        let p = self.params;
+        let r = self.resources.as_mut_ptr();
+        let m = self.matrices.as_mut_ptr();
+        let [motion_w, motion_h] = inputs.motion.extent;
+        let [depth_w, depth_h] = inputs.depth.extent;
+        // SAFETY: `params` is this feature's map; the resources and matrices live in `self`
+        // and are not touched until the next call; `cmd` is recording on NGX's device
+        // (caller).
+        let result = unsafe {
+            let set = |name: &[u8], v: *mut c_void| {
+                NVSDK_NGX_Parameter_SetVoidPointer(p, key(name), v);
+            };
+            let ui = |name: &[u8], v: u32| NVSDK_NGX_Parameter_SetUI(p, key(name), v);
+            let f = |name: &[u8], v: f32| NVSDK_NGX_Parameter_SetF(p, key(name), v);
+            let res = |k: usize, present: bool| {
+                if present {
+                    r.add(k).cast::<c_void>()
+                } else {
+                    ptr::null_mut()
+                }
+            };
+            set(NVSDK_NGX_DLSSG_Parameter_Backbuffer, res(0, true));
+            set(NVSDK_NGX_DLSSG_Parameter_Depth, res(1, true));
+            set(NVSDK_NGX_DLSSG_Parameter_MVecs, res(2, true));
+            set(
+                NVSDK_NGX_DLSSG_Parameter_BidirectionalDistortionField,
+                res(3, inputs.distortion.is_some()),
+            );
+            set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolated, res(4, true));
+            set(
+                NVSDK_NGX_DLSSG_Parameter_OutputDisableInterpolation,
+                res(5, inputs.disable_interpolation.is_some()),
+            );
+            for unused in [
+                &NVSDK_NGX_DLSSG_Parameter_HUDLess[..],
+                NVSDK_NGX_DLSSG_Parameter_UI,
+                NVSDK_NGX_DLSSG_Parameter_UIAlpha,
+                NVSDK_NGX_DLSSG_Parameter_OutputReal,
+            ] {
+                set(unused, ptr::null_mut());
+            }
+            set(NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, m.cast());
+            set(NVSDK_NGX_DLSSG_Parameter_ClipToCameraView, m.add(1).cast());
+            set(NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip, m.add(2).cast());
+            set(NVSDK_NGX_DLSSG_Parameter_PrevClipToClip, m.add(3).cast());
+            set(NVSDK_NGX_DLSSG_Parameter_ClipToLensClip, m.add(4).cast());
+            ui(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, count);
+            ui(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, index);
+            NVSDK_NGX_Parameter_SetULL(
+                p,
+                key(NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID),
+                inputs.frame_id,
+            );
+            f(NVSDK_NGX_DLSSG_Parameter_JitterOffsetX, inputs.jitter[0]);
+            f(NVSDK_NGX_DLSSG_Parameter_JitterOffsetY, inputs.jitter[1]);
+            f(NVSDK_NGX_DLSSG_Parameter_MvecScaleX, inputs.mvec_scale[0]);
+            f(NVSDK_NGX_DLSSG_Parameter_MvecScaleY, inputs.mvec_scale[1]);
+            f(NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetX, 0.0);
+            f(NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetY, 0.0);
+            let vectors: [([&[u8]; 3], [f32; 3]); 4] = [
+                (
+                    [
+                        NVSDK_NGX_DLSSG_Parameter_CameraPosX,
+                        NVSDK_NGX_DLSSG_Parameter_CameraPosY,
+                        NVSDK_NGX_DLSSG_Parameter_CameraPosZ,
+                    ],
+                    c.position,
+                ),
+                (
+                    [
+                        NVSDK_NGX_DLSSG_Parameter_CameraUpX,
+                        NVSDK_NGX_DLSSG_Parameter_CameraUpY,
+                        NVSDK_NGX_DLSSG_Parameter_CameraUpZ,
+                    ],
+                    c.up,
+                ),
+                (
+                    [
+                        NVSDK_NGX_DLSSG_Parameter_CameraRightX,
+                        NVSDK_NGX_DLSSG_Parameter_CameraRightY,
+                        NVSDK_NGX_DLSSG_Parameter_CameraRightZ,
+                    ],
+                    c.right,
+                ),
+                (
+                    [
+                        NVSDK_NGX_DLSSG_Parameter_CameraFwdX,
+                        NVSDK_NGX_DLSSG_Parameter_CameraFwdY,
+                        NVSDK_NGX_DLSSG_Parameter_CameraFwdZ,
+                    ],
+                    c.forward,
+                ),
+            ];
+            for (names, v) in vectors {
+                for (name, v) in names.into_iter().zip(v) {
+                    f(name, v);
+                }
+            }
+            f(NVSDK_NGX_DLSSG_Parameter_CameraNear, c.near);
+            f(NVSDK_NGX_DLSSG_Parameter_CameraFar, c.far);
+            f(NVSDK_NGX_DLSSG_Parameter_CameraFOV, c.fov_y);
+            f(NVSDK_NGX_DLSSG_Parameter_CameraAspectRatio, c.aspect);
+            f(
+                NVSDK_NGX_DLSSG_Parameter_LinearizedDepth_Scale,
+                inputs.depth_scale,
+            );
+            ui(
+                NVSDK_NGX_DLSSG_Parameter_ColorBuffersHDR,
+                u32::from(inputs.hdr),
+            );
+            ui(NVSDK_NGX_DLSSG_Parameter_DepthInverted, 1);
+            ui(NVSDK_NGX_DLSSG_Parameter_CameraMotionIncluded, 1);
+            ui(NVSDK_NGX_DLSSG_Parameter_Reset, u32::from(inputs.reset));
+            ui(
+                NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames,
+                u32::from(inputs.not_rendering_scene),
+            );
+            ui(NVSDK_NGX_DLSSG_Parameter_OrthoProjection, 0);
+            ui(NVSDK_NGX_DLSSG_Parameter_MvecDilated, 0);
+            ui(NVSDK_NGX_DLSSG_Parameter_MvecJittered, 0);
+            ui(NVSDK_NGX_DLSSG_Parameter_MVecsSubrectBaseX, 0);
+            ui(NVSDK_NGX_DLSSG_Parameter_MVecsSubrectBaseY, 0);
+            ui(NVSDK_NGX_DLSSG_Parameter_MVecsSubrectWidth, motion_w);
+            ui(NVSDK_NGX_DLSSG_Parameter_MVecsSubrectHeight, motion_h);
+            ui(NVSDK_NGX_DLSSG_Parameter_DepthSubrectBaseX, 0);
+            ui(NVSDK_NGX_DLSSG_Parameter_DepthSubrectBaseY, 0);
+            ui(NVSDK_NGX_DLSSG_Parameter_DepthSubrectWidth, depth_w);
+            ui(NVSDK_NGX_DLSSG_Parameter_DepthSubrectHeight, depth_h);
+            if let Some(d) = inputs.distortion {
+                ui(
+                    NVSDK_NGX_DLSSG_Parameter_BidirectionalDistortionFieldSubrectBaseX,
+                    0,
+                );
+                ui(
+                    NVSDK_NGX_DLSSG_Parameter_BidirectionalDistortionFieldSubrectBaseY,
+                    0,
+                );
+                ui(
+                    NVSDK_NGX_DLSSG_Parameter_BidirectionalDistortionFieldSubrectWidth,
+                    d.extent[0],
+                );
+                ui(
+                    NVSDK_NGX_DLSSG_Parameter_BidirectionalDistortionFieldSubrectHeight,
+                    d.extent[1],
+                );
+                ui(
+                    NVSDK_NGX_DLSSG_Parameter_BidirectionalDistortionField_LowPrecision_IsLowPrecision,
+                    0,
+                );
+            }
+            NVSDK_NGX_VULKAN_EvaluateFeature_C(
+                cmd.as_raw() as usize as VkCommandBuffer,
+                self.handle,
+                p,
+                None,
+            )
+        };
+        check("NVSDK_NGX_VULKAN_EvaluateFeature_C", result)
+    }
+}
+
+impl Drop for Fg {
     fn drop(&mut self) {
         // SAFETY: the caller of `new` drops the feature after the GPU is done with it.
         unsafe {

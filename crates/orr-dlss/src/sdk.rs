@@ -1,5 +1,5 @@
-//! NGX on an orr-gpu device: device hooks, initialisation, and ray reconstruction recorded
-//! into orr command lists.
+//! NGX on an orr-gpu device: device hooks, initialization, and ray reconstruction and frame
+//! generation recorded into orr command lists.
 
 use std::ffi::CString;
 use std::mem::ManuallyDrop;
@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use ash::vk;
 use orr_gpu::vulkan::{self, Features};
-use orr_gpu::{CommandList, Device, DeviceHooks, QueueKind, Texture};
+use orr_gpu::{Allocation, CommandList, Device, DeviceHooks, QueueKind, Texture};
 
+use crate::raw::FgCamera;
 use crate::{DlssError, Quality, Support, Uuid, raw};
 
 /// Serialises every NGX call this layer makes; NGX is not thread-safe.
@@ -75,7 +76,8 @@ impl Drop for NgxInstance {
 }
 
 /// NGX initialised on an orr-gpu device. Every NGX call made through this API is serialised
-/// across threads.
+/// across threads. Clones share the NGX instance.
+#[derive(Clone)]
 pub struct DlssSdk {
     ngx: Arc<NgxInstance>,
     gpu: Device,
@@ -230,20 +232,6 @@ impl RayReconstruction {
         cmd: &mut CommandList<'_>,
         inputs: &RrInputs<'_>,
     ) -> Result<(), DlssError> {
-        let image = |t: &Texture, name: &str| -> Result<raw::Image, DlssError> {
-            let d = t.desc();
-            assert!(
-                d.mips == 1 && d.layers == 1 && d.extent[2] == 1,
-                "RR {name}: one 2D mip and layer, not {d:?}"
-            );
-            let h = vulkan::image_handles(t)?;
-            Ok(raw::Image {
-                image: h.image,
-                view: h.view,
-                format: h.format,
-                extent: [h.extent.width, h.extent.height],
-            })
-        };
         let opt = |t: Option<&Texture>, name| t.map(|t| image(t, name)).transpose();
         let color = image(inputs.color, "color")?;
         let depth = image(inputs.depth, "depth")?;
@@ -305,4 +293,189 @@ impl Drop for RayReconstruction {
             drop(ngx);
         });
     }
+}
+
+/// One frame generation evaluate on orr textures. Images are 2D with one mip and layer, and
+/// have sampled or storage usage.
+#[derive(Clone, Copy)]
+pub struct FgInputs<'a> {
+    /// Display-encoded, without UI, in the format and size the feature was made for.
+    pub backbuffer: &'a Texture,
+    /// Reverse-Z device depth at render resolution.
+    pub depth: &'a Texture,
+    /// Unjittered motion at render resolution, previous UV minus current UV.
+    pub motion: &'a Texture,
+    /// RGBA16F bidirectional distortion field, while a lens or hook warps the image.
+    pub distortion: Option<&'a Texture>,
+    /// This index's output, in the backbuffer's format and size.
+    pub interpolated: &'a Texture,
+    /// Host-readable; read it with [`FrameGeneration::interpolation_disabled`] once the
+    /// evaluate has completed.
+    pub disable_interpolation: Option<&'a Allocation<u32>>,
+    pub camera: FgCamera,
+    /// NGX's jitter of the guides, render pixels.
+    pub jitter: [f32; 2],
+    /// Scales `motion` to render pixels: the render extent.
+    pub mvec_scale: [f32; 2],
+    pub reset: bool,
+    /// Increases by one each rendered frame, with frame generation on or off.
+    pub frame_id: u64,
+    /// Menus and loading screens.
+    pub not_rendering_scene: bool,
+    /// Scales NGX's linearized depth, `1 / depth`; 1 is NGX's default.
+    pub depth_scale: f32,
+}
+
+/// One frame generation feature for one backbuffer size and format.
+///
+/// Dropping it releases NGX's feature once everything submitted before the drop has
+/// completed.
+pub struct FrameGeneration {
+    inner: Option<Locked<raw::FrameGeneration>>,
+    hdr: bool,
+    format: vk::Format,
+    ngx: Arc<NgxInstance>,
+    gpu: Device,
+}
+
+impl FrameGeneration {
+    /// Creates the feature for backbuffers like `backbuffer`; `hdr` when they hold PQ. NGX's
+    /// setup commands run on the Render queue, and this waits for them; NGX may finish
+    /// creating its resources on its own thread. Call it on the Render queue's owner
+    /// thread.
+    pub fn new(sdk: &DlssSdk, backbuffer: &Texture, hdr: bool) -> Result<Self, DlssError> {
+        let queue = sdk
+            .gpu
+            .queue(QueueKind::Render)
+            .expect("the Render queue always exists");
+        let h = vulkan::image_handles(backbuffer)?;
+        let output = [h.extent.width, h.extent.height];
+        let mut list = queue.command_list()?;
+        let inner = {
+            let cmd = list.vulkan_raw();
+            let _ngx = ngx_lock();
+            // SAFETY: `cmd` records on the Render queue of NGX's device. The feature is
+            // released through the device's garbage list, after the GPU has finished every
+            // submit before the drop and before NGX shuts down (it holds the instance).
+            unsafe { raw::FrameGeneration::new(&sdk.ngx.0.0, cmd.buffer, output, h.format)? }
+        };
+        let fg = Self {
+            inner: Some(Locked(inner)),
+            hdr,
+            format: h.format,
+            ngx: Arc::clone(&sdk.ngx),
+            gpu: sdk.gpu.clone(),
+        };
+        let done = queue.submit(vec![list], &[])?;
+        queue.wait(done, CREATE_TIMEOUT)?;
+        Ok(fg)
+    }
+
+    fn raw(&self) -> &raw::FrameGeneration {
+        &self.inner.as_ref().expect("released on drop only").0
+    }
+
+    pub fn output_size(&self) -> [u32; 2] {
+        self.raw().output_size()
+    }
+
+    /// The most images one rendered frame may generate (`MultiFrameCountMax`).
+    pub fn max_generated(&self) -> u32 {
+        self.raw().max_generated()
+    }
+
+    /// Records generated image `index` of `count` (1-based) into `cmd`, a list on a
+    /// compute-capable queue of the SDK's device. Record every index in order each frame.
+    pub fn record(
+        &mut self,
+        cmd: &mut CommandList<'_>,
+        inputs: &FgInputs<'_>,
+        index: u32,
+        count: u32,
+    ) -> Result<(), DlssError> {
+        let backbuffer = image(inputs.backbuffer, "backbuffer")?;
+        assert_eq!(
+            backbuffer.format, self.format,
+            "FG backbuffers keep the format the feature was made for"
+        );
+        let depth = image(inputs.depth, "depth")?;
+        let motion = image(inputs.motion, "motion")?;
+        let distortion = inputs
+            .distortion
+            .map(|t| image(t, "distortion"))
+            .transpose()?;
+        let interpolated = image(inputs.interpolated, "interpolated")?;
+        let flag = inputs.disable_interpolation.map(|a| raw::Buffer {
+            buffer: vulkan::buffer_handle(a),
+            size: a.size,
+        });
+        let raw_inputs = raw::FgInputs {
+            backbuffer: &backbuffer,
+            depth: &depth,
+            motion: &motion,
+            distortion: distortion.as_ref(),
+            interpolated: &interpolated,
+            disable_interpolation: flag,
+            camera: &inputs.camera,
+            jitter: inputs.jitter,
+            mvec_scale: inputs.mvec_scale,
+            reset: inputs.reset,
+            frame_id: inputs.frame_id,
+            not_rendering_scene: inputs.not_rendering_scene,
+            hdr: self.hdr,
+            depth_scale: inputs.depth_scale,
+        };
+        let device = vulkan::raw_device(&self.gpu).device.handle();
+        let raw_cmd = cmd.vulkan_raw();
+        assert_eq!(
+            raw_cmd.device.handle(),
+            device,
+            "FG records on its SDK's device"
+        );
+        let buffer = raw_cmd.buffer;
+        let fg = &mut self.inner.as_mut().expect("released on drop only").0;
+        let _ngx = ngx_lock();
+        // SAFETY: `buffer` records on NGX's device, after the classic bind `vulkan_raw`
+        // recorded. orr textures stay in GENERAL, and they and the flag buffer are destroyed
+        // only after the work submitted before their drop completes.
+        unsafe { fg.record(buffer, &raw_inputs, index, count) }
+    }
+
+    /// Whether NGX asked, through `flag`, that this frame's generated images not be shown.
+    /// Read it once the evaluates that wrote it have completed; zero it before they run.
+    pub fn interpolation_disabled(flag: &Allocation<u32>) -> bool {
+        flag.as_slice()
+            .and_then(|v| v.first())
+            .is_some_and(|v| v & 0xff != 0)
+    }
+}
+
+impl Drop for FrameGeneration {
+    fn drop(&mut self) {
+        let inner = self.inner.take();
+        let ngx = Arc::clone(&self.ngx);
+        vulkan::defer_after_submitted(&self.gpu, move || {
+            {
+                let _ngx = ngx_lock();
+                let _feature = inner;
+            }
+            drop(ngx);
+        });
+    }
+}
+
+/// The raw image of a texture NGX reads or writes.
+fn image(t: &Texture, name: &str) -> Result<raw::Image, DlssError> {
+    let d = t.desc();
+    assert!(
+        d.mips == 1 && d.layers == 1 && d.extent[2] == 1,
+        "NGX {name}: one 2D mip and layer, not {d:?}"
+    );
+    let h = vulkan::image_handles(t)?;
+    Ok(raw::Image {
+        image: h.image,
+        view: h.view,
+        format: h.format,
+        extent: [h.extent.width, h.extent.height],
+    })
 }

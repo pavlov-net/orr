@@ -385,7 +385,7 @@ pub struct ComposeRoot {
 }
 
 impl ComposeRoot {
-    pub fn new(gpu: &Device) -> Result<Self> {
+    pub fn new(gpu: &Device) -> Result<Self, orr_scene::orr_gpu::Error> {
         Ok(Self {
             upload: gpu.gpu_malloc(MemoryKind::Upload, 1, "compose root")?,
         })

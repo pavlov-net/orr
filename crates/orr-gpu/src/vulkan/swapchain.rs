@@ -504,6 +504,18 @@ impl Swapchain {
         Ok(())
     }
 
+    /// Asks for at least `n` images, at least the largest metered batch plus one. A
+    /// swapchain with fewer is recreated at the next acquire.
+    pub fn set_min_images(&mut self, n: u32) {
+        if n != self.desc.min_images {
+            self.desc.min_images = n;
+            self.stale |= self
+                .current
+                .as_ref()
+                .is_some_and(|g| (g.images.len() as u32) < n);
+        }
+    }
+
     /// Switches between FIFO and IMMEDIATE at the next present, without recreation where the
     /// surface allows it.
     pub fn set_present_mode(&mut self, m: PresentMode) {

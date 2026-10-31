@@ -1,5 +1,5 @@
-//! NGX on ash handles: device requirements, initialisation, and ray reconstruction recorded
-//! into the caller's command buffers.
+//! NGX on ash handles: device requirements, initialization, and ray reconstruction and frame
+//! generation recorded into the caller's command buffers.
 //!
 //! Images passed to NGX stay in `GENERAL`; NGX needs no layout transitions around its calls.
 
@@ -208,6 +208,135 @@ impl RayReconstruction {
     ) -> Result<(), DlssError> {
         // SAFETY: forwarded from the caller.
         unsafe { self.inner.record(cmd, inputs, self.render) }
+    }
+}
+
+/// A buffer NGX writes, from its start.
+#[derive(Clone, Copy, Debug)]
+pub struct Buffer {
+    pub buffer: vk::Buffer,
+    pub size: u64,
+}
+
+/// The camera frame generation reprojects with. Matrices are column-vector matrices given
+/// as their columns, which is NGX's row-major layout for row vectors. None holds jitter.
+/// View space looks down -z with y up; clip space is Vulkan's, y down, reverse Z.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FgCamera {
+    pub view_to_clip: [[f32; 4]; 4],
+    pub clip_to_view: [[f32; 4]; 4],
+    pub clip_to_prev_clip: [[f32; 4]; 4],
+    pub prev_clip_to_clip: [[f32; 4]; 4],
+    /// Relative to a point that stays fixed between resets.
+    pub position: [f32; 3],
+    pub up: [f32; 3],
+    pub right: [f32; 3],
+    pub forward: [f32; 3],
+    pub near: f32,
+    /// Finite, though the projection has no far plane.
+    pub far: f32,
+    /// Vertical field of view, radians.
+    pub fov_y: f32,
+    /// Width over height.
+    pub aspect: f32,
+}
+
+/// One frame generation evaluate: the rendered frame, its guides and the image to write.
+#[derive(Clone, Copy)]
+pub struct FgInputs<'a> {
+    /// Display-encoded, without UI, in the feature's format and size.
+    pub backbuffer: &'a Image,
+    /// Reverse-Z device depth.
+    pub depth: &'a Image,
+    /// Unjittered motion, previous UV minus current UV.
+    pub motion: &'a Image,
+    /// RGBA16F bidirectional distortion field: RG the UV offset from a presented pixel to
+    /// its undistorted position, BA the reverse.
+    pub distortion: Option<&'a Image>,
+    pub interpolated: &'a Image,
+    /// At least 4 bytes; NGX sets the first byte when the generated images of this frame
+    /// should not be shown.
+    pub disable_interpolation: Option<Buffer>,
+    pub camera: &'a FgCamera,
+    /// NGX's jitter of the guides, in render pixels.
+    pub jitter: [f32; 2],
+    /// Scales `motion` to pixels of the motion image.
+    pub mvec_scale: [f32; 2],
+    /// The previous frame is unrelated to this one.
+    pub reset: bool,
+    /// Increases by one each rendered frame, with frame generation on or off.
+    pub frame_id: u64,
+    /// Menus and loading screens.
+    pub not_rendering_scene: bool,
+    /// The backbuffer is PQ.
+    pub hdr: bool,
+    /// Scales NGX's linearized depth, `1 / depth`; NGX's default is 1.
+    pub depth_scale: f32,
+}
+
+/// One frame generation feature at a fixed output size and backbuffer format.
+pub struct FrameGeneration {
+    inner: imp::Fg,
+    output: [u32; 2],
+    max_generated: u32,
+}
+
+impl FrameGeneration {
+    /// Creates the feature, recording NGX's setup work into `cmd`; submit `cmd` before the
+    /// first [`record`](Self::record) runs. NGX may finish creating it on its own thread.
+    ///
+    /// # Safety
+    ///
+    /// `cmd` is recording on a queue of `ngx`'s device. The feature is dropped before `ngx`,
+    /// after the GPU has finished every command buffer that used it.
+    pub unsafe fn new(
+        ngx: &Ngx,
+        cmd: vk::CommandBuffer,
+        output: [u32; 2],
+        format: vk::Format,
+    ) -> Result<Self, DlssError> {
+        let max_generated = ngx.support().max_generated;
+        // SAFETY: forwarded from the caller.
+        let inner = unsafe { imp::Fg::new(&ngx.0, cmd, output, format)? };
+        Ok(Self {
+            inner,
+            output,
+            max_generated,
+        })
+    }
+
+    pub fn output_size(&self) -> [u32; 2] {
+        self.output
+    }
+
+    /// The most images one rendered frame may generate (`MultiFrameCountMax`).
+    pub fn max_generated(&self) -> u32 {
+        self.max_generated
+    }
+
+    /// Records generated image `index` of `count` (1-based) between the previous
+    /// backbuffer and this one. Call it for every index in order each frame. Every image is
+    /// in `GENERAL`. Needs the same classic bind as [`RayReconstruction::record`], and
+    /// leaves NGX's pipeline and descriptors bound.
+    ///
+    /// # Safety
+    ///
+    /// `cmd` is recording on a queue of the feature's device, and every image and buffer
+    /// outlives its execution.
+    pub unsafe fn record(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        inputs: &FgInputs<'_>,
+        index: u32,
+        count: u32,
+    ) -> Result<(), DlssError> {
+        assert!(
+            (1..=count).contains(&index) && count <= self.max_generated.max(1),
+            "generated image {index} of {count} with at most {} per frame",
+            self.max_generated
+        );
+        // SAFETY: forwarded from the caller.
+        unsafe { self.inner.record(cmd, inputs, index, count) }
     }
 }
 

@@ -13,7 +13,8 @@
 //!    one path per pixel, the hooks, exposure, tonemap, the UI and compose. A consumer may
 //!    instead shade the G-buffer [`Frame::raster_view`] returns with its own kernels in
 //!    [`Frame::list`] and show the result with [`Frame::compose`].
-//! 6. [`Frame::end`] submits the frame and hands it to the display's present thread.
+//! 6. [`Frame::end`] records the display's frame generation, submits the frame and hands
+//!    it to the display's present thread.
 //!
 //! There is no scheduler, render graph or per-frame extraction: each step records directly
 //! into the frame's command list. A frame may list no scenes and render no view;
@@ -21,6 +22,7 @@
 //! from [`Frame::pattern`].
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub use orr_lighting::{
     self, Error as LightingError, LightingDebugView, LightingStats, MediaSettings, PathEntry,
@@ -31,9 +33,10 @@ pub use orr_output::DisplayWatch;
 pub use orr_output::{self, Error as OutputError};
 pub use orr_output::{
     AutoExposure, AutoWhiteBalance, CalibrationPattern, CompensationCurve, Display, DisplayFeed,
-    DisplayInfo, DisplayRequest, Exposure, ExposureTelemetry, Grade, Gt7Params, HookPass,
-    MeterWeights, OutputDebug, Physiological, Presented, Primaries, ResolvedDisplay, Screenshot,
-    ScreenshotRequest, SkyTelemetry, UiPass, ViewOutput,
+    DisplayInfo, DisplayRequest, DlssSdk, DlssSupport, Exposure, ExposureTelemetry,
+    FrameGenerationMode, Grade, Gt7Params, HookPass, MeterWeights, OutputDebug, Physiological,
+    Presented, Primaries, ResolvedDisplay, Screenshot, ScreenshotRequest, SkyTelemetry, UiPass,
+    ViewOutput,
 };
 pub use orr_scene::Error as SceneError;
 pub use orr_scene::{self, RasterView};
@@ -349,7 +352,7 @@ impl Renderer {
     }
 
     /// The loading side's job queue, for the threads the consumer lends to it.
-    pub fn loading(&self) -> std::sync::Arc<Loading> {
+    pub fn loading(&self) -> Arc<Loading> {
         self.scenes.loading()
     }
 
@@ -619,6 +622,18 @@ impl<'a> Frame<'a> {
             scene_referred: hooks.scene_referred.is_some(),
             display_linear: tonemapped && hooks.display_linear.is_some(),
         };
+        if let Some(frame) = display.as_mut() {
+            frame.frame_generation(
+                view,
+                &raster.depth,
+                &raster.motion,
+                output.not_rendering_scene,
+            );
+        }
+        let mut field = match display.as_mut() {
+            Some(frame) if output.distortion_field && set.any() => Some(frame.distortion_field()?),
+            _ => None,
+        };
         let kernels = &self.output.kernels;
         let inputs = kernels.hook_inputs(
             list,
@@ -633,10 +648,16 @@ impl<'a> Frame<'a> {
                 frame: id,
                 hooks: set,
             },
-            None,
+            field.as_deref_mut(),
         )?;
         if let (Some(inputs), Some(hook)) = (inputs, hooks.scene_referred.as_mut()) {
-            inputs.run(list, HookPoint::SceneReferred, &chain, None, &mut **hook);
+            inputs.run(
+                list,
+                HookPoint::SceneReferred,
+                &chain,
+                field.as_deref_mut(),
+                &mut **hook,
+            );
         }
         if let Some(ScreenshotRequest::SceneReferred { rec709 }) = output.screenshot {
             kernels.capture_scene_referred(
@@ -688,7 +709,7 @@ impl<'a> Frame<'a> {
         );
         list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         if let (Some(inputs), Some(hook)) = (inputs, hooks.display_linear.as_mut()) {
-            inputs.run(list, HookPoint::DisplayLinear, &chain, None, &mut **hook);
+            inputs.run(list, HookPoint::DisplayLinear, &chain, field, &mut **hook);
         }
         let ui = match (display.as_mut(), hooks.ui.as_mut()) {
             (Some(frame), Some(hook)) => {
@@ -815,6 +836,23 @@ impl<'a> Frame<'a> {
         Ok(())
     }
 
+    /// For a view the consumer shaded itself and showed with [`Frame::compose`]: the camera
+    /// frame generation reprojects the display's image with, and the view's reverse-Z
+    /// `depth` and `motion` (previous UV minus current UV) at its render extent.
+    /// [`Frame::render_view`] does this for the views it renders into the display. Does
+    /// nothing without a display or while its window has no area.
+    pub fn frame_generation(
+        &mut self,
+        view: &ViewDesc<'_>,
+        depth: &Arc<orr_gpu::Texture>,
+        motion: &Arc<orr_gpu::Texture>,
+        not_rendering_scene: bool,
+    ) {
+        if let Some(mut frame) = self.display.as_deref_mut().and_then(Display::frame) {
+            frame.frame_generation(view, depth, motion, not_rendering_scene);
+        }
+    }
+
     /// Encodes `linear`, display-linear Rec.709 with 1.0 at paper white, into the display
     /// at the frame's resolved display, for a view the consumer shaded itself. The image
     /// covers the window's extent; texels past its edge repeat the last row and column.
@@ -834,14 +872,18 @@ impl<'a> Frame<'a> {
         Ok(())
     }
 
-    /// Step 6: submits the frame after the display's slot is free, hands it to the present
-    /// thread without waiting, and returns the render-timeline point its work signals.
+    /// Step 6: records the display's frame generation, submits the frame after the
+    /// display's slot is free, hands it to the present thread without waiting, and returns
+    /// the render-timeline point its work signals.
     pub fn end(mut self) -> Result<TimelinePoint> {
         let wait = self
             .display
             .as_deref_mut()
             .and_then(Display::frame)
             .and_then(|f| f.wait);
+        if let Some(d) = self.display.as_deref_mut() {
+            d.record_frame_generation(self.scenes.list()?)?;
+        }
         let gpu = self.output.device.clone();
         let slots = std::mem::take(&mut self.slots);
         let ended = self.scenes.end(wait.as_slice());

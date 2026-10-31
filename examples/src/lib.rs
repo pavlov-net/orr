@@ -6,9 +6,12 @@ use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
 use orr::orr_gpu::{Device, DeviceDesc, QueueRequest};
-use orr::{FrameTime, Loading};
+use orr::orr_output::orr_dlss::Uuid;
+use orr::{DlssSdk, FrameTime, Loading};
 
 pub mod mesh;
+pub mod overlay;
+pub mod scene;
 pub mod window;
 
 /// The examples' compiled kernels and the Rust types of their Slang structs.
@@ -33,16 +36,22 @@ impl log::Log for StderrLog {
     fn flush(&self) {}
 }
 
-/// The process's device, created on first use with every queue and the validation
-/// messenger on (the layer itself loads through `VK_INSTANCE_LAYERS`). Logs to stderr.
+/// The examples' NGX project id.
+pub const PROJECT_ID: Uuid = Uuid::from_u128(0x5d1e_7a40_c2b9_4f86_9e3d_61a0_b8f2_47c5);
+
+/// The process's device, created on first use with every queue, NGX's extensions where
+/// NGX offers them, and the validation messenger on (the layer itself loads through
+/// `VK_INSTANCE_LAYERS`). Logs to stderr.
 pub fn device() -> &'static Device {
     static DEVICE: OnceLock<Device> = OnceLock::new();
     DEVICE.get_or_init(|| {
         if log::set_logger(&StderrLog).is_ok() {
             log::set_max_level(log::LevelFilter::Info);
         }
+        let hooks = DlssSdk::device_hooks(PROJECT_ID);
         let desc = DeviceDesc {
             name: "orr-examples",
+            hooks: Some(&hooks),
             validation: true,
             queues: QueueRequest {
                 render_compute: true,

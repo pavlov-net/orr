@@ -69,6 +69,13 @@ pub struct Projection {
     pub near: f32,
 }
 
+impl Projection {
+    /// Clip from view for an image of `extent`, unjittered: Vulkan clip space with y down.
+    pub fn clip_from_view(&self, extent: UVec2) -> Mat4 {
+        clip_from_view(self, extent)
+    }
+}
+
 /// The lens the camera effects read.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Lens {
