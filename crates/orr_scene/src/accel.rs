@@ -462,6 +462,9 @@ fn pack(
             src: GpuAddress(0),
         },
     );
+    // Later builds in the same list read the moved structures.
+    step.list()
+        .barrier(Stages::AS_BUILD, Stages::ALL, Hazards::ACCEL_STRUCT);
     Ok(dst)
 }
 
@@ -597,6 +600,9 @@ pub(crate) fn build(
                 }
             }
         }
+        // The CLAS builds below read the micromaps.
+        step.list()
+            .barrier(Stages::AS_BUILD, Stages::ALL, Hazards::ACCEL_STRUCT);
     }
 
     // CLAS: clusters without micromaps first, then those with, in batches of at most
