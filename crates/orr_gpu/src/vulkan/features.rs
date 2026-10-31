@@ -60,6 +60,7 @@ pub(crate) struct Optional {
     pub device_address_commands: bool,
     pub unified_image_layouts: bool,
     pub memory_budget: bool,
+    pub memory_priority: bool,
     pub shader_abort: bool,
     pub pipeline_binary: bool,
     pub cooperative_vector: bool,
@@ -133,6 +134,7 @@ pub(crate) struct FeatureChain {
     pub present_timing: vk::PhysicalDevicePresentTimingFeaturesEXT<'static>,
     pub fault: vk::PhysicalDeviceFaultFeaturesKHR<'static>,
     pub fault_ext: vk::PhysicalDeviceFaultFeaturesEXT<'static>,
+    pub priority: vk::PhysicalDeviceMemoryPriorityFeaturesEXT<'static>,
     /// Device creation only.
     pub diagnostics_config: vk::DeviceDiagnosticsConfigCreateInfoNV<'static>,
 }
@@ -221,6 +223,9 @@ impl FeatureChain {
         }
         if opt.device_fault_ext {
             chain.push(ptr(&mut self.fault_ext));
+        }
+        if opt.memory_priority {
+            chain.push(ptr(&mut self.priority));
         }
         if create && opt.aftermath {
             chain.push(ptr(&mut self.diagnostics_config));
@@ -363,6 +368,7 @@ pub(crate) fn select(
         device_address_commands: present(ash::khr::device_address_commands::NAME),
         unified_image_layouts: present(ash::khr::unified_image_layouts::NAME),
         memory_budget: present(ash::ext::memory_budget::NAME),
+        memory_priority: present(ash::ext::memory_priority::NAME),
         // shader_abort requires device_fault and shader_constant_data enabled with it.
         shader_abort: cfg!(debug_assertions)
             && present(ash::khr::shader_abort::NAME)
@@ -515,6 +521,7 @@ pub(crate) fn select(
     opt.device_fault &= q.fault.device_fault != 0;
     opt.shader_abort &= opt.device_fault;
     opt.device_fault_ext &= q.fault_ext.device_fault != 0;
+    opt.memory_priority &= q.priority.memory_priority != 0;
 
     let mut e = Box::<FeatureChain>::default();
     e.core.features = vk::PhysicalDeviceFeatures {
@@ -594,6 +601,7 @@ pub(crate) fn select(
     e.present_timing.present_timing = 1;
     e.fault.device_fault = 1;
     e.fault_ext.device_fault = 1;
+    e.priority.memory_priority = 1;
     e.diagnostics_config.flags = vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_SHADER_DEBUG_INFO
         | vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_RESOURCE_TRACKING
         | vk::DeviceDiagnosticsConfigFlagsNV::ENABLE_AUTOMATIC_CHECKPOINTS
@@ -624,6 +632,7 @@ pub(crate) fn select(
         &[ash::khr::unified_image_layouts::NAME],
     );
     add(opt.memory_budget, &[ash::ext::memory_budget::NAME]);
+    add(opt.memory_priority, &[ash::ext::memory_priority::NAME]);
     add(opt.device_fault, &[ash::khr::device_fault::NAME]);
     add(opt.device_fault_ext, &[ash::ext::device_fault::NAME]);
     add(

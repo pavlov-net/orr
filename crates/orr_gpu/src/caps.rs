@@ -8,8 +8,8 @@ pub struct Caps {
     pub driver: String,
     /// The raw driver version.
     pub driver_version: u32,
-    /// Host-visible device-local memory covers VRAM, so [`crate::MemoryKind::Upload`] is not
-    /// limited to the small BAR window.
+    /// Host-visible device-local memory covers VRAM, so [`crate::MemoryKind::Upload`] is
+    /// device-local. Without it Upload is host memory.
     pub rebar: bool,
     /// Host image copy into [`crate::TextureUsage::HOST_COPY`] textures (`hostImageCopy`).
     /// Only with `rebar`: host-copy textures take Upload memory.

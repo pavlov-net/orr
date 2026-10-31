@@ -34,6 +34,9 @@ pub enum Error {
     /// The heap has no free slot.
     #[error("{0} heap is full")]
     HeapFull(&'static str),
+    /// A transient arena has no room left for an allocation.
+    #[error("transient arena full: {0}")]
+    ArenaFull(String),
     /// Aftermath crash dumps were asked for and cannot be enabled.
     #[error("Aftermath: {0}")]
     Aftermath(String),

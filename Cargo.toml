@@ -20,6 +20,7 @@ orr_io = { path = "crates/orr_io", version = "0.0.1" }
 orr_lighting = { path = "crates/orr_lighting" }
 orr_math = { path = "crates/orr_math", version = "0.0.1" }
 orr_output = { path = "crates/orr_output" }
+orr_memory = { path = "crates/orr_memory", version = "0.0.1" }
 orr_pack = { path = "crates/orr_pack" }
 orr_scene = { path = "crates/orr_scene" }
 orr_shaders = { path = "crates/orr_shaders" }
@@ -44,6 +45,8 @@ io-uring = "0.7.15"
 libc = "0.2"
 windows = "0.62.2"
 
+bindgen = { version = "0.73.2", default-features = false }
+cc = "1.10"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 unused_qualifications = "warn"

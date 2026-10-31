@@ -58,7 +58,7 @@ pub use vulkan::{
     MicromapTriangle, MicromapUsage, OmmFormat, PageBind, PassResult, PipelineCacheKind,
     PipelineCacheReport, PipelineStats, Queue, QueueKind, QueueProgress, QueueRequest,
     RayDispatchPipeline, Rendering, ShaderStage, SparseAllocation, SparseBinds, Swapchain,
-    SwapchainFrame, Texture, TextureMemory, TileBind,
+    SwapchainFrame, Texture, TextureMemory, TileBind, Transient, TransientArenas,
 };
 
 #[cfg(not(target_vendor = "apple"))]

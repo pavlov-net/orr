@@ -8,6 +8,7 @@
 #                    solar spectrum, ozone cross sections and CIE 1931 2-deg tables
 #   display/gt7/     Polyphony Digital's GT7 tone-mapping sample (MIT), checked against its
 #                    sha256
+#   vma/             GPUOpen VulkanMemoryAllocator v3.5.0 at its tag commit
 # With ORR_VALIDATION_DATA=1 it also fetches the test-only validation data:
 #   sky/pragueskymodel/
 #                    PetrVevoda/pragueskymodel at a pinned commit (its solar radiance table)
@@ -24,6 +25,7 @@ set -euo pipefail
 slang_version=2026.20
 openpbr_commit=c91aad1d1ce1693e803f039d7c92c2965c4eb013
 glm_commit=0af55ccecd98d4e5a8d1fad7de25ba429d60e863
+vma_commit=0f1a757da579831283413295cc7f3b47eb521c77
 sky_commit=34f14e745cff948f4ca3157d1b62a445ffa7286f
 gt7_sum=94df7e7e310b9423ebb5aaaa29416f376ebbae66e0948fb259f8688314b29822
 prague_commit=2385c912e9051c1258013ff8c3ce2e19e10fb917
@@ -93,6 +95,7 @@ fetch_commit https://github.com/adobe/openpbr-bsdf "$openpbr_commit" "$tools/ope
 fetch_commit https://github.com/g-truc/glm "$glm_commit" "$tools/glm"
 fetch_commit https://github.com/ebruneton/precomputed_atmospheric_scattering "$sky_commit" \
   "$tools/precomputed_atmospheric_scattering"
+fetch_commit https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator "$vma_commit" "$tools/vma"
 
 gt7="$tools/display/gt7/gt7_tone_mapping.cpp"
 if echo "$gt7_sum  $gt7" | sha256sum -c --quiet - 2>/dev/null; then

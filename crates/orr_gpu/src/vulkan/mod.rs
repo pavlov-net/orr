@@ -39,7 +39,9 @@ pub use interop::{
     DeviceHooks, Features, ImageHandles, RawCommandBuffer, RawDevice, defer_after_submitted,
     image_handles, raw_device,
 };
-pub use memory::{Allocation, HeapReport, MemoryKind, MemoryReport, MemoryUsage};
+pub use memory::{
+    Allocation, HeapReport, MemoryKind, MemoryReport, MemoryUsage, Transient, TransientArenas,
+};
 pub use mesh::{ColorAttachment, DepthAttachment, MeshPipeline, MeshPipelineDesc, Rendering};
 pub use pipeline::{ComputePipeline, ShaderStage};
 pub use queue::{PassResult, PipelineStats, Queue, QueueKind, QueueRequest};
