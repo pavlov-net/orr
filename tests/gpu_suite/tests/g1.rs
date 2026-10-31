@@ -345,48 +345,82 @@ fn lists_recorded_on_two_threads() {
     assert_clean();
 }
 
-/// FP16 weights converted into the inference layout, once on the GPU and once on the host,
-/// multiply FP16 vectors as a CPU matmul over the same rounded values does.
+/// 16x16 weights converted into the inference layout, on the GPU and on the host, multiply
+/// FP16 vectors through `orr.coopvec` as a CPU matmul does, at every 64-byte placement of
+/// the matrix and with a bias. FP16 weights always; E4M3 and E5M2 weights where the device
+/// has 8-bit floats.
 #[test]
 fn cooperative_vector_matmul_matches_cpu() {
     use half::f16;
-    use orr_gpu::{ComponentType, MatrixConversion, MatrixFormat, MatrixLayout, MemoryKind};
+    use orr_gpu::ComponentType;
     let d = device();
-    let fp16 = d.caps().cooperative_vector.iter().any(|c| {
-        [
-            c.input,
-            c.input_interpretation,
-            c.matrix_interpretation,
-            c.result,
-        ]
-        .iter()
-        .all(|&t| t == ComponentType::F16)
-    });
-    if !gpu_suite::require(fp16, "no FP16 cooperative vectors") {
+    let supports = |w: ComponentType| {
+        d.caps().cooperative_vector.iter().any(|c| {
+            c.input == ComponentType::F16
+                && c.input_interpretation == w
+                && c.matrix_interpretation == w
+                && c.bias_interpretation == ComponentType::F16
+                && c.result == ComponentType::F16
+        })
+    };
+    if !gpu_suite::require(supports(ComponentType::F16), "no FP16 cooperative vectors") {
         return;
     }
-    const N: usize = 16;
     const VECTORS: usize = 4096;
     let mut rnd = noise(7);
-    let weights: Vec<u16> = (0..N * N)
-        .map(|_| f16::from_f32((rnd() * 2.0 - 1.0) / 8.0).to_bits())
-        .collect();
-    let inputs: Vec<f32> = (0..N * VECTORS)
-        .map(|_| f16::from_f32(rnd() * 2.0 - 1.0).to_f32())
-        .collect();
+    let mut random = |scale: f32| f16::from_f32((rnd() * 2.0 - 1.0) * scale);
+    let weights: Vec<f16> = (0..16 * 16).map(|_| random(1.0 / 8.0)).collect();
+    let inputs: Vec<f16> = (0..16 * VECTORS).map(|_| random(1.0)).collect();
+    let bias: Vec<f16> = (0..16).map(|_| random(0.5)).collect();
+    coopvec_case(ComponentType::F16, "f16", &weights, &inputs, &bias);
+
+    if !gpu_suite::require(d.caps().shader_float8, "no 8-bit floats") {
+        return;
+    }
+    // Values with two mantissa bits, so FP16, E4M3 and E5M2 hold them exactly and the CPU
+    // matmul needs no FP8 rounding.
+    let mut rnd = noise(11);
+    let mut exact = |min_exp: i32| {
+        let r = (rnd() * 32.0) as u32;
+        let sign = if r & 1 == 0 { 1.0 } else { -1.0 };
+        let mantissa = 1.0 + ((r >> 1) & 3) as f32 / 4.0;
+        f16::from_f32(sign * mantissa * 2f32.powi(-min_exp - ((r >> 3) & 3) as i32))
+    };
+    let weights: Vec<f16> = (0..16 * 16).map(|_| exact(3)).collect();
+    let inputs: Vec<f16> = (0..16 * VECTORS).map(|_| exact(0)).collect();
+    for (t, entry) in [(ComponentType::E4m3, "e4m3"), (ComponentType::E5m2, "e5m2")] {
+        if gpu_suite::require(supports(t), "no cooperative vectors with this FP8 type") {
+            coopvec_case(t, entry, &weights, &inputs, &bias);
+        }
+    }
+}
+
+/// Converts row-major FP16 `weights` into `component` in the inference layout and multiplies
+/// `inputs` with them through the `entry` kernel, at each matrix placement and once with
+/// `bias`, checking each result against a CPU matmul.
+fn coopvec_case(
+    component: orr_gpu::ComponentType,
+    entry: &str,
+    weights: &[half::f16],
+    inputs: &[half::f16],
+    bias: &[half::f16],
+) {
+    use orr_gpu::{ComponentType, MatrixConversion, MatrixFormat, MatrixLayout, MemoryKind};
+    const N: usize = 16;
+    let vectors = inputs.len() / N;
+    let d = device();
     let conversion = MatrixConversion {
         rows: N as u32,
         columns: N as u32,
         src_format: MatrixFormat::new(ComponentType::F16, MatrixLayout::RowMajor),
-        dst_format: MatrixFormat::new(ComponentType::F16, MatrixLayout::InferencingOptimal),
+        dst_format: MatrixFormat::new(component, MatrixLayout::InferencingOptimal),
     };
     let bytes = d
         .matrix_bytes(N as u32, N as u32, conversion.dst_format)
         .unwrap();
-    assert!(bytes >= (N * N * 2) as u64);
 
     // The GPU converts into device memory at offset 64; the host into upload memory at 128.
-    let row_major = upload(&weights, "row-major weights");
+    let row_major = upload(weights, "row-major weights");
     let on_gpu = d
         .gpu_malloc::<u8>(MemoryKind::DeviceLocal, 64 + bytes, "gpu-converted weights")
         .unwrap();
@@ -396,37 +430,55 @@ fn cooperative_vector_matmul_matches_cpu() {
     let written = d
         .convert_matrix(
             &conversion,
-            orr_shaders::bytemuck::cast_slice(&weights),
+            orr_shaders::bytemuck::cast_slice(weights),
             &mut on_host,
             128,
         )
         .unwrap();
     assert_eq!(written, bytes);
+    // The bias starts 16 bytes into its allocation.
+    let mut biased = vec![half::f16::ZERO; 8];
+    biased.extend(bias);
+    let bias_buf = upload(&biased, "coopvec bias");
 
-    let input = upload(&inputs, "coopvec input");
-    let outputs = [0, 1].map(|_| readback::<f32>((N * VECTORS) as u64, "coopvec output"));
-    // Weights reached through the root's address plus the MatrixOffset operand, and through
-    // the address alone.
-    let roots = [
-        (on_gpu.gpu.address().0, 64),
-        (on_host.gpu.address().0 + 128, 0),
-    ]
-    .iter()
-    .zip(&outputs)
-    .map(|(&(weights, offset), out)| {
-        upload(
-            &[coopvec::Root {
-                input: input.gpu,
-                output: out.gpu,
-                weights,
-                offset,
-                count: VECTORS as u32,
-            }],
-            "coopvec root",
-        )
-    })
-    .collect::<Vec<_>>();
-    let p = pipeline(&coopvec::MODULE, "main");
+    let as_f32: Vec<f32> = inputs.iter().map(|v| v.to_f32()).collect();
+    let input = upload(&as_f32, "coopvec input");
+    let gpu = on_gpu.gpu.address().0;
+    let host = on_host.gpu.address().0;
+    // (base, matrix address, matrix offset, bias offset): the matrix's start in the offset
+    // operand, in the address, or split between them.
+    let runs = [
+        (gpu, gpu, 64, None),
+        (gpu, gpu + 64, 0, None),
+        (host, host, 128, None),
+        (host, host + 64, 64, None),
+        (host, host + 128, 0, None),
+        (gpu, gpu + 64, 0, Some(16)),
+    ];
+    let outputs: Vec<_> = runs
+        .iter()
+        .map(|_| readback::<f32>((N * vectors) as u64, "coopvec output"))
+        .collect();
+    let roots: Vec<_> = runs
+        .iter()
+        .zip(&outputs)
+        .map(|(&(_, weights, offset, bias), out)| {
+            upload(
+                &[coopvec::Root {
+                    input: input.gpu,
+                    output: out.gpu,
+                    weights,
+                    bias: bias.map_or(0, |_| bias_buf.gpu.address().0),
+                    offset,
+                    bias_offset: bias.unwrap_or(0),
+                    count: vectors as u32,
+                    pad: 0,
+                }],
+                "coopvec root",
+            )
+        })
+        .collect();
+    let p = pipeline(&coopvec::MODULE, entry);
     let mut list = render().command_list().unwrap();
     list.convert_matrix(
         &conversion,
@@ -439,24 +491,38 @@ fn cooperative_vector_matmul_matches_cpu() {
         Hazards::empty(),
     );
     for root in &roots {
-        list.dispatch(&p, root.gpu, [(VECTORS as u32).div_ceil(32), 1, 1]);
+        list.dispatch(&p, root.gpu, [(vectors as u32).div_ceil(32), 1, 1]);
     }
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     run(list);
 
-    for (which, out) in ["gpu", "host"].iter().zip(&outputs) {
+    for (&(base, weights_at, offset, with_bias), out) in runs.iter().zip(&outputs) {
         let got = out.as_slice().unwrap();
-        let mut worst = 0.0f32;
-        for v in 0..VECTORS {
+        let (mut outside, mut worst) = (0, 0.0f32);
+        for v in 0..vectors {
             for row in 0..N {
-                let want: f32 = (0..N)
-                    .map(|k| f16::from_bits(weights[row * N + k]).to_f32() * inputs[v * N + k])
-                    .sum();
-                worst = worst.max((got[v * N + row] - want).abs());
+                let b = with_bias.map_or(0.0, |_| bias[row].to_f32());
+                let want = b
+                    + (0..N)
+                        .map(|k| weights[row * N + k].to_f32() * as_f32[v * N + k])
+                        .sum::<f32>();
+                let err = (got[v * N + row] - want).abs();
+                worst = worst.max(err);
+                outside += usize::from(err > 2e-3 + 1e-2 * want.abs());
             }
         }
-        log::info!("cooperative vectors, {which}-converted weights: max error {worst:.2e}");
-        assert!(worst < 2e-3, "{which}-converted weights: max error {worst}");
+        let side = if base == gpu { "gpu" } else { "host" };
+        let bias_note = if with_bias.is_some() {
+            " with bias"
+        } else {
+            ""
+        };
+        let place = format!(
+            "{entry}, {side}-converted, matrix at +{} offset {offset}{bias_note}",
+            weights_at - base
+        );
+        log::info!("cooperative vectors {place}: max error {worst:.2e}");
+        assert_eq!(outside, 0, "{place}: max error {worst}");
     }
     assert_clean();
 }

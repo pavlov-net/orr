@@ -4,7 +4,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use orr_shaders::build::{Build, DebugInfo, Lint};
+use orr_shaders::build::{Build, DebugInfo};
 
 /// The `rtas` records the kernels use, mirrored in `orr_gpu::rtas`.
 const RTAS_RECORDS: &[&str] = &[
@@ -29,9 +29,7 @@ fn main() {
                 .kernels(dir.join("src"))
                 .roots(&gpu)
                 .debug_info(DebugInfo::Embedded)
-                .metal_check(false)
-                // The cooperative-vector test multiplies with the SPIR-V instruction itself.
-                .allow(Lint::CoopVec);
+                .metal_check(false);
             for t in RTAS_RECORDS {
                 b = b.extern_type(t, &format!("::orr_gpu::rtas::{t}"));
             }
