@@ -1,6 +1,7 @@
 //! Packs mounted from a file or from memory. The loading side reads and places every asset
-//! of a pack (whole-pack residency); the render thread takes the finished batch at step 1
-//! and applies its tables with the frame's scatter.
+//! of a pack except the hierarchy pages below a mesh's top page, which stream on request;
+//! the render thread takes the finished batch at step 1 and applies its tables with the
+//! frame's scatter.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -13,18 +14,20 @@ use orr_gpu::{
 };
 use orr_pack::instance::{InstancePageInfo, InstanceRecord};
 use orr_pack::material::Material;
-use orr_pack::mesh::{Cluster, MeshHeader, MeshInfo, PageHeader, PageView};
+use orr_pack::mesh::{Cluster, MeshHeader, MeshInfo, NodePage, PageHeader, PageView};
 use orr_pack::model::ModelInfo;
 use orr_pack::texture::{TextureHeader, TextureInfo};
-use orr_pack::{Aabb, Archive, AssetId, Blob, Class, Codec};
+use orr_pack::{Aabb, Archive, AssetId, Class, Codec};
 
 use crate::accel::{self, AccelShared, ClusterInfo, MeshInput, MountAccel, PageMicromap};
 use crate::emissive::{EmissiveSpan, ModelEmission, indexed_spans};
 use crate::loading::io::{AlignedBuf, ArchiveFile, Read, SECTOR, read_positioned};
-use crate::loading::{Loading, Msg};
+use crate::loading::{BlobSource, Loading, Msg, decoded, read_stored};
 use crate::material::{BoundTexture, MaterialId, MaterialTable};
-use crate::memory::{RangeAllocator, UploadWindow};
+use crate::memory::{Block, RangeAllocator, UploadWindow};
+use crate::residency::{ResidencyClass, Start, UnitDesc};
 use crate::scene::ModelId;
+use crate::stream::{StreamUnit, Streaming};
 use crate::upload::Record;
 use crate::{ClusterRef, Error, MaterialGpu, MeshGpu, ModelGpu, Result, material_flags};
 
@@ -63,13 +66,19 @@ pub(crate) struct PlacedTexture {
     index: TextureIndex,
     primaries: u8,
     staged: bool,
+    bytes: u64,
 }
 
 struct PlacedMesh {
     id: AssetId,
+    entry: u32,
     info: u64,
     pages: Vec<u64>,
     node_pages: Vec<u64>,
+    /// Per page, its resident bytes and the pages it depends on.
+    page_units: Vec<(u64, Vec<u32>)>,
+    /// Per node page, its blob, bytes and parent page.
+    node_units: Vec<(u32, u32, u32)>,
     /// First mesh cluster per page, then the cluster count, in the mesh's block.
     page_clusters: u64,
     /// The discrete levels' table in blob 0, and their count.
@@ -101,9 +110,10 @@ pub struct InstancePage {
 struct PlacedPage {
     id: AssetId,
     page: InstancePage,
+    bytes: u64,
 }
 
-enum StagedCopy {
+pub(crate) enum StagedCopy {
     Buffer {
         src: Allocation<u8>,
         dst: u64,
@@ -125,15 +135,6 @@ struct Placed {
     meshes: Vec<PlacedMesh>,
     models: Vec<(AssetId, ModelInfo)>,
     pages: Vec<PlacedPage>,
-}
-
-/// Memory every job of a mount writes into: mapped Upload memory, or with
-/// [`MountTask::staged`] DeviceLocal memory the copy queue fills from staging.
-#[derive(Clone, Copy)]
-struct Block {
-    gpu: u64,
-    cpu: Option<usize>,
-    size: u64,
 }
 
 /// One mount on the loading side, shared by its jobs and reads.
@@ -227,6 +228,15 @@ impl MountTask {
         self.archive.get().expect("archive parsed")
     }
 
+    fn source(&self) -> BlobSource {
+        BlobSource {
+            loading: Weak::clone(&self.loading),
+            archive: Arc::clone(self.archive()),
+            file: self.file.get().cloned(),
+            ring: *self.ring.get().expect("read path chosen"),
+        }
+    }
+
     fn block(&self, bytes: u64, name: &str) -> Result<Block> {
         let kind = if self.staged {
             MemoryKind::DeviceLocal
@@ -235,63 +245,25 @@ impl MountTask {
         };
         let a = self.device.gpu_malloc::<u8>(kind, bytes, name)?;
         let b = Block {
-            gpu: a.gpu.address().0,
-            cpu: a.cpu.map(|p| p.as_ptr() as usize),
             size: bytes,
+            ..Block::of(&a)
         };
         self.placed.lock().unwrap().blocks.push(a);
         Ok(b)
     }
 
-    /// `bytes` into `block` at `at`: one sequential write into mapped memory, or into staging
-    /// that the batch copies.
     fn write(&self, block: Block, at: u64, bytes: &[u8]) -> Result<()> {
-        assert!(
-            at + bytes.len() as u64 <= block.size,
-            "write outside its block"
-        );
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        match block.cpu {
-            // SAFETY: the block is mapped, outlives the mount's jobs, and every write of a
-            // mount covers its own range.
-            Some(p) => unsafe {
-                std::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    (p as *mut u8).add(at as usize),
-                    bytes.len(),
-                );
-            },
-            None => {
-                let src = self.staging(bytes)?;
-                let copy = StagedCopy::Buffer {
-                    src,
-                    dst: block.gpu + at,
-                };
-                self.placed.lock().unwrap().copies.push(copy);
-            }
+        if let Some(copy) = write(&self.device, block, at, bytes)? {
+            self.placed.lock().unwrap().copies.push(copy);
         }
         Ok(())
-    }
-
-    fn staging(&self, bytes: &[u8]) -> Result<Allocation<u8>> {
-        let src = self.device.gpu_malloc::<u8>(
-            MemoryKind::Upload,
-            bytes.len() as u64,
-            "loading staging",
-        )?;
-        let p = src.cpu.expect("upload is mapped");
-        // SAFETY: a fresh mapping of `bytes.len()` bytes.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_ptr(), bytes.len()) };
-        Ok(src)
     }
 
     fn write_texture(&self, t: &Arc<Texture>, region: &TextureRegion, texels: &[u8]) -> Result<()> {
         if self.host_copy {
             self.device.host_copy_to_texture(t, region, texels)?;
         } else {
-            let src = self.staging(texels)?;
+            let src = staging(&self.device, texels)?;
             let copy = StagedCopy::Texture {
                 src,
                 texture: Arc::clone(t),
@@ -303,27 +275,50 @@ impl MountTask {
     }
 }
 
+/// `bytes` into `block` at `at`: one sequential write into mapped memory, or into staging
+/// and the copy that moves it.
+pub(crate) fn write(
+    device: &Device,
+    block: Block,
+    at: u64,
+    bytes: &[u8],
+) -> Result<Option<StagedCopy>> {
+    assert!(
+        at + bytes.len() as u64 <= block.size,
+        "write outside its block"
+    );
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    match block.cpu {
+        // SAFETY: the block is mapped and outlives the jobs writing it, and every write
+        // covers its own range.
+        Some(p) => unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (p as *mut u8).add(at as usize),
+                bytes.len(),
+            );
+            Ok(None)
+        },
+        None => Ok(Some(StagedCopy::Buffer {
+            src: staging(device, bytes)?,
+            dst: block.gpu + at,
+        })),
+    }
+}
+
+fn staging(device: &Device, bytes: &[u8]) -> Result<Allocation<u8>> {
+    let src = device.gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, "loading staging")?;
+    let p = src.cpu.expect("upload is mapped");
+    // SAFETY: a fresh mapping of `bytes.len()` bytes.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_ptr(), bytes.len()) };
+    Ok(src)
+}
+
 thread_local! {
-    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     static PAGE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
-
-/// Decodes blob `b` from its stored bytes into the calling worker's scratch and hands the
-/// decoded bytes to `then`.
-fn decoded(
-    archive: &Archive,
-    b: &Blob,
-    stored: &[u8],
-    then: impl FnOnce(&[u8]) -> Result<()>,
-) -> Result<()> {
-    SCRATCH.with_borrow_mut(|s| {
-        s.resize(b.raw_len as usize, 0);
-        archive.decode(b, None, stored, s)?;
-        then(s)
-    })
-}
-
-type Then = Box<dyn FnOnce(&Arc<MountTask>, &[u8]) -> Result<()> + Send>;
 
 /// Reads and decodes blob `blob` of entry `entry`, then runs `then` on a worker with its
 /// decoded bytes.
@@ -333,7 +328,6 @@ fn fetch(
     blob: usize,
     then: impl FnOnce(&Arc<MountTask>, &[u8]) -> Result<()> + Send + 'static,
 ) {
-    let then: Then = Box::new(then);
     let archive = task.archive();
     let e = &archive.entries()[entry];
     let Some(&b) = archive.blobs(e).get(blob) else {
@@ -345,58 +339,14 @@ fn fetch(
         return;
     }
     task.begin();
-    if archive.stored(&b, None).is_some() {
-        task.spawn(move |t| {
-            t.step(|| {
-                let a = t.archive();
-                let stored = a.stored(&b, None).expect("stored in place");
-                decoded(a, &b, stored, |bytes| then(t, bytes))
-            });
-        });
-        return;
-    }
-    let range = archive.stored_range(&b, None);
-    let file = Arc::clone(task.file.get().expect("file archive"));
-    let check = move |buf: &AlignedBuf, n: usize, t: &Arc<MountTask>| -> Result<()> {
-        let end = range.skip as usize + b.stored_len as usize;
-        if n < end {
-            return Err(orr_pack::Error::Truncated {
-                need: range.offset + end as u64,
-                have: range.offset + n as u64,
-            }
-            .into());
-        }
-        let a = t.archive();
-        decoded(a, &b, &buf.as_slice()[range.skip as usize..end], |bytes| {
-            then(t, bytes)
-        })
-    };
-    if *task.ring.get().expect("read path chosen") {
-        let t = Arc::clone(task);
-        let read = Read {
-            file,
-            offset: range.offset,
-            len: range.len as usize,
-            done: Box::new(move |r| match r {
-                Ok((buf, n)) => t.spawn(move |t| t.step(|| check(&buf, n, t))),
-                Err(e) => {
-                    t.fail(e.into());
-                    t.end();
-                }
-            }),
-        };
-        if let Some(l) = task.loading.upgrade() {
-            l.send(Msg::Read(read));
-        }
-    } else {
-        task.spawn(move |t| {
-            t.step(|| {
-                let mut buf = AlignedBuf::new(range.len as usize);
-                let n = read_positioned(&file, range.offset, &mut buf)?;
-                check(&buf, n, t)
-            });
-        });
-    }
+    let t = Arc::clone(task);
+    read_stored(
+        &task.source(),
+        b,
+        Box::new(move |stored| {
+            t.step(|| decoded(t.archive(), &b, stored?, |bytes| then(&t, bytes)));
+        }),
+    );
 }
 
 /// Starts a mount on the loading thread: the first reads of a file archive, or the parse of
@@ -538,10 +488,12 @@ fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
     Ok(())
 }
 
-/// Blob 0, then every page and node page of a mesh, into one block.
+/// Blob 0, then every page and the top node page of a mesh, into one block. The other node
+/// pages stream.
 fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Result<()> {
     let info = MeshInfo::parse(blob0)?;
     let header = info.header;
+    let node_bytes = |p: &NodePage| p.node_count * size_of::<orr_pack::mesh::Node>() as u32;
     let mut size = (blob0.len() as u64).next_multiple_of(256);
     let mut place = |bytes: u64| {
         let at = size;
@@ -554,10 +506,27 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
         .iter()
         .map(|p| place(u64::from(p.resident_len)))
         .collect();
-    let node_at: Vec<u64> = info
+    let node_at: Vec<Option<u64>> = info
         .node_pages
         .iter()
-        .map(|p| place(u64::from(p.node_count) * size_of::<orr_pack::mesh::Node>() as u64))
+        .map(|p| (p.parent_page == NodePage::TOP).then(|| place(u64::from(node_bytes(p)))))
+        .collect();
+    let page_units = info
+        .pages
+        .iter()
+        .map(|p| {
+            let deps = p.deps.first as usize..(p.deps.first + p.deps.count) as usize;
+            let deps = info
+                .page_deps
+                .get(deps)
+                .ok_or(orr_pack::Error::Malformed("page dependencies"))?;
+            Ok((u64::from(p.resident_len), deps.to_vec()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let node_units = info
+        .node_pages
+        .iter()
+        .map(|p| (p.blob, node_bytes(p), p.parent_page))
         .collect();
     let block = t.block(size, "mesh")?;
     t.write(block, 0, blob0)?;
@@ -588,9 +557,12 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
         let mut placed = t.placed.lock().unwrap();
         placed.meshes.push(PlacedMesh {
             id,
+            entry: entry as u32,
             info: block.gpu,
             pages: vec![0; info.pages.len()],
             node_pages: vec![0; info.node_pages.len()],
+            page_units,
+            node_units,
             page_clusters: block.gpu + page_clusters_at,
             levels: (
                 block.gpu + u64::from(header.levels.first),
@@ -636,7 +608,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
         });
     }
     for (n, node_page) in info.node_pages.iter().enumerate() {
-        let at = node_at[n];
+        let Some(at) = node_at[n] else { continue };
         let len = node_page.node_count as usize * size_of::<orr_pack::mesh::Node>();
         fetch(t, entry, node_page.blob as usize, move |t, nodes| {
             if nodes.len() != len {
@@ -736,6 +708,7 @@ fn place_texture(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) ->
         index,
         primaries: h.primaries,
         staged: !t.host_copy,
+        bytes: t.device.texture_requirements(&desc).0,
     });
     for blob in 1..h.blob_count() {
         let (info, texture) = (Arc::clone(&info), Arc::clone(&texture));
@@ -776,7 +749,8 @@ fn place_page(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
     }
     let user_len = record_count * user_stride;
     let user_at = records_len.next_multiple_of(256);
-    let block = t.block((user_at + user_len).max(16), "instance page")?;
+    let bytes = (user_at + user_len).max(16);
+    let block = t.block(bytes, "instance page")?;
     let page = InstancePage {
         info,
         // SAFETY: the block holds the records from its start.
@@ -789,7 +763,11 @@ fn place_page(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu + user_at)) }
         },
     };
-    t.placed.lock().unwrap().pages.push(PlacedPage { id, page });
+    t.placed
+        .lock()
+        .unwrap()
+        .pages
+        .push(PlacedPage { id, page, bytes });
     if record_count > 0 {
         fetch(t, entry, 1, move |t, records| t.write(block, 0, records));
     }
@@ -814,16 +792,15 @@ pub(crate) struct Batch {
 
 impl Batch {
     pub(crate) fn landed(&self, device: &Device) -> bool {
-        self.point.is_none_or(|(kind, point)| {
-            device
-                .queue(kind)
-                .is_some_and(|q| q.completed() >= point.value())
-        })
+        crate::loading::landed(device, self.point.as_ref())
     }
 }
 
 struct ResolvedMesh {
     id: AssetId,
+    entry: u32,
+    page_units: Vec<(u64, Vec<u32>)>,
+    node_units: Vec<(u32, u32, u32)>,
     gpu: MeshGpu,
     page_addresses: Vec<u64>,
     sections: u32,
@@ -846,7 +823,7 @@ struct ResolvedModel {
 
 /// A mount's assets with every reference between them resolved inside the pack.
 pub(crate) struct Resolved {
-    archive: Arc<Archive>,
+    source: Arc<BlobSource>,
     blocks: Vec<Allocation<u8>>,
     textures: Vec<PlacedTexture>,
     materials: Vec<(AssetId, MaterialGpu)>,
@@ -858,7 +835,7 @@ pub(crate) struct Resolved {
     cluster_ranges: Vec<(u32, u32)>,
 }
 
-fn resolve(archive: Arc<Archive>, p: Placed, sampler: SamplerIndex) -> Result<Resolved> {
+fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resolved> {
     let missing = |id| Error::Pack(orr_pack::Error::Missing(id));
     let textures: HashMap<AssetId, BoundTexture> = p
         .textures
@@ -902,6 +879,9 @@ fn resolve(archive: Arc<Archive>, p: Placed, sampler: SamplerIndex) -> Result<Re
             page_addresses.extend(m.node_pages);
             ResolvedMesh {
                 id: m.id,
+                entry: m.entry,
+                page_units: m.page_units,
+                node_units: m.node_units,
                 // SAFETY: blob 0 of the mesh and its page cluster table, resident in the
                 // mount's block.
                 gpu: unsafe {
@@ -961,7 +941,7 @@ fn resolve(archive: Arc<Archive>, p: Placed, sampler: SamplerIndex) -> Result<Re
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Resolved {
-        archive,
+        source: Arc::new(source),
         blocks: p.blocks,
         textures: p.textures,
         materials,
@@ -1038,7 +1018,7 @@ fn build_accel(
 /// Records the staged copies of a mount (and the discards of its staged textures) in one
 /// list on the copy queue, else the loading queue, else the render queue. None when nothing
 /// was staged.
-fn submit_copies(
+pub(crate) fn submit_copies(
     device: &Device,
     copies: &[StagedCopy],
     textures: &[PlacedTexture],
@@ -1086,7 +1066,7 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<MountTask>) 
     };
     let mut ranges = Vec::new();
     let result = state
-        .and_then(|()| resolve(Arc::clone(task.archive()), placed, task.sampler))
+        .and_then(|()| resolve(task.source(), placed, task.sampler))
         .and_then(|mut r| {
             let copied = submit_copies(device, &copies, &r.textures)?;
             let built = build_accel(device, &task.accel, &mut r, copied.map(|(_, p)| p));
@@ -1131,7 +1111,6 @@ pub(crate) struct Resident {
     page_ranges: Vec<(u32, u32)>,
     material_ranges: Vec<(u32, u32)>,
     cluster_ranges: Vec<(u32, u32)>,
-    _archive: Arc<Archive>,
     _blocks: Vec<Allocation<u8>>,
     _accel: MountAccel,
     placed_textures: Vec<PlacedTexture>,
@@ -1163,6 +1142,9 @@ pub(crate) struct Mounts {
     sizes: TableSizes,
     pub pages: Vec<Option<InstancePage>>,
     retired: Vec<(u64, Resident)>,
+    pub streaming: Streaming,
+    /// The mount and mesh of each resident model.
+    owners: HashMap<ModelId, (MountId, u32)>,
 }
 
 /// What applying a batch writes into: the frame's records and the global tables.
@@ -1176,7 +1158,7 @@ pub(crate) struct Apply<'a> {
 }
 
 impl Apply<'_> {
-    fn put<T: bytemuck::Pod>(&mut self, dst: GpuPtr<T>, values: &[T]) -> Result<()> {
+    pub(crate) fn put<T: bytemuck::Pod>(&mut self, dst: GpuPtr<T>, values: &[T]) -> Result<()> {
         if values.is_empty() {
             return Ok(());
         }
@@ -1189,6 +1171,98 @@ impl Apply<'_> {
     }
 }
 
+type ResolvedTables = (
+    Vec<(AssetId, MaterialGpu)>,
+    Vec<ResolvedMesh>,
+    Vec<ResolvedModel>,
+    Vec<PlacedPage>,
+);
+
+/// A mount's residency units, with how to load the streamed ones, and the streamed units
+/// of each mesh. Mesh pages are pinned up to `pinned_pages` and locked after it (the mount's
+/// acceleration structures reference every cluster); a mesh's top node page is pinned and
+/// its other node pages stream, each after its parent page. Textures and instance pages are
+/// pinned.
+type Units = (Vec<(UnitDesc, Option<StreamUnit>)>, Vec<Vec<u32>>);
+
+fn units(
+    meshes: &[ResolvedMesh],
+    tables: &[GpuPtr<u64>],
+    textures: &[PlacedTexture],
+    pages: &[PlacedPage],
+) -> Result<Units> {
+    let malformed = |what| Error::Pack(orr_pack::Error::Malformed(what));
+    let mut units = Vec::new();
+    let mut streamed = Vec::with_capacity(meshes.len());
+    for (m, table) in meshes.iter().zip(tables) {
+        let base = units.len() as u32;
+        for (p, (bytes, deps)) in m.page_units.iter().enumerate() {
+            if deps.iter().any(|&d| d as usize >= p) {
+                return Err(malformed("a page depends on a later page"));
+            }
+            let start = if (p as u32) < m.header.pinned_pages {
+                Start::Pinned
+            } else {
+                Start::Locked
+            };
+            let unit = UnitDesc {
+                class: ResidencyClass::MeshPages,
+                bytes: bytes.next_multiple_of(256),
+                deps: deps.iter().map(|d| base + d).collect(),
+                start,
+            };
+            units.push((unit, None));
+        }
+        let nodes = units.len() as u32;
+        let mut mesh_streamed = Vec::new();
+        for (n, &(blob, bytes, parent)) in m.node_units.iter().enumerate() {
+            let (start, deps, stream) = if parent == NodePage::TOP {
+                (Start::Pinned, Vec::new(), None)
+            } else {
+                if parent as usize >= n {
+                    return Err(malformed("a node page's parent follows it"));
+                }
+                let stream = StreamUnit {
+                    entry: m.entry,
+                    blob,
+                    bytes,
+                    table: table.offset(u64::from(m.gpu.page_count) + n as u64),
+                };
+                mesh_streamed.push(units.len() as u32);
+                (Start::Absent, vec![nodes + parent], Some(stream))
+            };
+            let unit = UnitDesc {
+                class: ResidencyClass::HierarchyPages,
+                bytes: u64::from(bytes),
+                deps,
+                start,
+            };
+            units.push((unit, stream));
+        }
+        streamed.push(mesh_streamed);
+    }
+    let pinned = |class, bytes| {
+        let unit = UnitDesc {
+            class,
+            bytes,
+            deps: Vec::new(),
+            start: Start::Pinned,
+        };
+        (unit, None)
+    };
+    units.extend(
+        textures
+            .iter()
+            .map(|t| pinned(ResidencyClass::Textures, t.bytes)),
+    );
+    units.extend(
+        pages
+            .iter()
+            .map(|p| pinned(ResidencyClass::InstancePages, p.bytes)),
+    );
+    Ok((units, streamed))
+}
+
 fn capacity(what: &'static str, capacity: u32) -> Error {
     Error::Capacity { what, capacity }
 }
@@ -1197,6 +1271,7 @@ impl Mounts {
     pub(crate) fn new(
         device: &Device,
         sizes: TableSizes,
+        budgets: &crate::Budgets,
         accel: &Arc<AccelShared>,
     ) -> Result<Self> {
         let m = MemoryKind::DeviceLocal;
@@ -1223,7 +1298,16 @@ impl Mounts {
             sizes,
             pages: Vec::new(),
             retired: Vec::new(),
+            streaming: Streaming::new(device, budgets),
+            owners: HashMap::new(),
         })
+    }
+
+    /// Requests every streamed unit of `model`'s mesh for the next step 1.
+    pub(crate) fn prefetch(&mut self, model: ModelId, cell_distance: u32) {
+        if let Some(&(mount, mesh)) = self.owners.get(&model) {
+            self.streaming.prefetch(mount, mesh, cell_distance);
+        }
     }
 
     /// A new pending mount and the flag that cancels it.
@@ -1297,6 +1381,7 @@ impl Mounts {
                         *e = None;
                     }
                 }
+                self.streaming.unregister(m, frame);
                 self.retired.push((frame, r));
             }
             Some(Entry::Unmounted) => *slot = Some(Entry::Unmounted),
@@ -1317,6 +1402,7 @@ impl Mounts {
 
     fn release(&mut self, r: Resident, device: &Device, materials: &MaterialTable) {
         for id in r.models.values() {
+            self.owners.remove(id);
             self.model_ids.free(id.0, 1);
         }
         for &id in &r.meshes {
@@ -1364,7 +1450,7 @@ impl Mounts {
         }
         let entry = match batch.result {
             Err(e) => Entry::Failed(e),
-            Ok(r) => match self.place(r, w) {
+            Ok(r) => match self.place(batch.mount, r, w) {
                 Ok(r) => Entry::Ready(Box::new(r)),
                 Err(e) => Entry::Failed(Arc::new(e)),
             },
@@ -1372,7 +1458,7 @@ impl Mounts {
         self.entries[i] = Some(entry);
     }
 
-    fn place(&mut self, r: Resolved, w: &mut Apply<'_>) -> Result<Resident> {
+    fn place(&mut self, mount: MountId, r: Resolved, w: &mut Apply<'_>) -> Result<Resident> {
         let mut res = Resident {
             models: HashMap::new(),
             textures: r.textures.iter().map(|t| (t.id, t.index)).collect(),
@@ -1382,18 +1468,19 @@ impl Mounts {
             page_ranges: Vec::new(),
             material_ranges: Vec::new(),
             cluster_ranges: r.cluster_ranges,
-            _archive: r.archive,
             _blocks: r.blocks,
             _accel: r.accel,
             placed_textures: r.textures,
         };
-        let result = self.fill(&mut res, r.materials, r.meshes, r.models, r.pages, w);
+        let resolved = (r.materials, r.meshes, r.models, r.pages);
+        let result = self.fill(mount, &r.source, &mut res, resolved, w);
         match result {
             Ok(()) => Ok(res),
             Err(e) => {
                 for id in res.models.values() {
                     w.emission[id.0 as usize] = None;
                 }
+                self.streaming.unregister(mount, 0);
                 self.release(res, w.device, w.materials);
                 Err(e)
             }
@@ -1402,11 +1489,10 @@ impl Mounts {
 
     fn fill(
         &mut self,
+        mount: MountId,
+        source: &Arc<BlobSource>,
         res: &mut Resident,
-        materials: Vec<(AssetId, MaterialGpu)>,
-        meshes: Vec<ResolvedMesh>,
-        models: Vec<ResolvedModel>,
-        pages: Vec<PlacedPage>,
+        (materials, meshes, models, pages): ResolvedTables,
         w: &mut Apply<'_>,
     ) -> Result<()> {
         let mut material_ids = Vec::with_capacity(materials.len());
@@ -1421,6 +1507,7 @@ impl Mounts {
             )?;
         }
         let mut mesh_ids = Vec::with_capacity(meshes.len());
+        let mut tables = Vec::with_capacity(meshes.len());
         for m in &meshes {
             let id = self
                 .mesh_ids
@@ -1434,6 +1521,7 @@ impl Mounts {
                 .ok_or(capacity("mesh page table", self.sizes.page_table))?;
             res.page_ranges.push((start, n));
             let table = self.page_table.gpu.offset(u64::from(start));
+            tables.push(table);
             w.put(table, &m.page_addresses)?;
             let gpu = MeshGpu {
                 pages: table,
@@ -1473,6 +1561,7 @@ impl Mounts {
                 bounds_max: m.bounds.max,
             };
             w.put(self.models.gpu.offset(u64::from(id.0)), &[gpu])?;
+            self.owners.insert(id, (mount, m.mesh as u32));
             let i = id.0 as usize;
             if w.emission.len() <= i {
                 w.emission.resize(i + 1, None);
@@ -1484,6 +1573,9 @@ impl Mounts {
                 spans: spans.clone(),
             });
         }
+        let units = units(&meshes, &tables, &res.placed_textures, &pages)?;
+        self.streaming
+            .register(mount, Arc::clone(source), units.0, units.1)?;
         for p in pages {
             let i = match self.pages.iter().position(Option::is_none) {
                 Some(i) => i,

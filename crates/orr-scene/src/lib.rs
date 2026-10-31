@@ -12,7 +12,9 @@
 //!
 //! Packs mount from a file or from memory ([`Scenes::mount`]). Their reads, decodes and
 //! copies run on the loading side ([`Loading`]): orr's loading thread and the threads the
-//! consumer lends to [`Loading::run_worker`]. The render thread only polls.
+//! consumer lends to [`Loading::run_worker`]. The render thread only polls. Hierarchy pages
+//! below a mesh's top page stream on request ([`Scenes::prefetch`]) under the pool budgets
+//! of [`Budgets`]; [`Scenes::residency`] reports what is resident.
 
 mod accel;
 mod emissive;
@@ -27,8 +29,10 @@ mod ptlas;
 mod raster;
 #[cfg(feature = "hot-reload")]
 mod reload;
+mod residency;
 mod scene;
 mod scenes;
+mod stream;
 #[cfg(feature = "testing")]
 pub mod testing;
 mod time;
@@ -48,6 +52,7 @@ pub use mount::{InstancePage, LoadState, MountId, PackSource, PageId};
 pub use pipelines::{PipelineId, ReloadReport};
 pub use producer::{ClusterTopology, ProducerDesc, ProducerId, ProducerUpdate};
 pub use ptlas::RtStats;
+pub use residency::{ClassStats, ResidencyClass, ResidencyStats};
 pub use scene::{
     Affine3, CopyVariant, GroupWriter, InstanceFlags, InstanceRange, InstancesDesc, ModelId, Pose,
     SceneDesc, SceneId, SceneWriter, TransformGroupDesc, TransformGroupId,
@@ -101,6 +106,8 @@ pub enum Error {
     NotReady(MountId),
     #[error("{0:?} failed to load")]
     MountFailed(MountId),
+    #[error("{pool}: over its budget of {budget} bytes")]
+    Budget { pool: &'static str, budget: u64 },
     #[error("{0:?} was unmounted while loading")]
     Unmounted(MountId),
     #[error("{asset} is not an asset of this class in {mount:?}")]

@@ -29,6 +29,7 @@ use crate::ptlas::{FrameInputs, PtlasPipelines, RtStats};
 use crate::raster::{self, RasterPipelines, TargetSizes, ViewTargets};
 #[cfg(feature = "hot-reload")]
 use crate::reload::Reloader;
+use crate::residency::ResidencyStats;
 use crate::scene::{GroupWriter, ModelId, Scene, SceneDesc, SceneId, SceneWriter};
 use crate::shaders::{emissive, world as world_kernel};
 use crate::time::FrameTime;
@@ -65,6 +66,20 @@ pub struct Budgets {
     /// Per-frame PTLAS work beyond mandatory work, in rebuilt instances: the full instance
     /// count of every partition a write touches plus one per update.
     pub ptlas_rebuilt: u32,
+    /// Bytes of resident mesh pages.
+    pub mesh_page_pool: u64,
+    /// Bytes of resident hierarchy pages.
+    pub hierarchy_page_pool: u64,
+    /// Bytes of resident textures.
+    pub texture_pool: u64,
+    /// Bytes of resident instance pages.
+    pub instance_page_pool: u64,
+    /// Streamed units the loading side reads at once, at most.
+    pub io_requests: u32,
+    /// Bytes of streamed units the loading side reads at once, at most.
+    pub io_bytes: u64,
+    /// Bytes per block of the stream pool.
+    pub stream_block: u64,
 }
 
 impl Default for Budgets {
@@ -82,6 +97,13 @@ impl Default for Budgets {
             stream_clas_triangles: 1 << 20,
             micromap_pages: 64,
             ptlas_rebuilt: 250_000,
+            mesh_page_pool: 3 << 30,
+            hierarchy_page_pool: 256 << 20,
+            texture_pool: 4 << 30,
+            instance_page_pool: 256 << 20,
+            io_requests: 64,
+            io_bytes: 64 << 20,
+            stream_block: 16 << 20,
         }
     }
 }
@@ -281,6 +303,7 @@ impl Scenes {
                 model_materials: b.model_materials,
                 page_table: b.mesh_pages,
             },
+            b,
             &accel,
         )?;
         let sampler = device.sampler(&SamplerDesc {
@@ -412,6 +435,18 @@ impl Scenes {
     /// The cooked material `id` of mount `m`, for consumer data and [`MaterialWriter`] edits.
     pub fn material(&self, m: MountId, id: AssetId) -> Result<MaterialId> {
         self.core.mounts.lookup(m, id, |r| &r.materials)
+    }
+
+    /// Wants every streamed unit of `model` resident from the next step 1 on, `cell_distance`
+    /// world cells from the focus. Requests last one step: call it every frame while the
+    /// model should load or stay.
+    pub fn prefetch(&mut self, model: ModelId, cell_distance: u32) {
+        self.core.mounts.prefetch(model, cell_distance);
+    }
+
+    /// Residency figures of the latest step 1.
+    pub fn residency(&self) -> &ResidencyStats {
+        self.core.mounts.streaming.stats()
     }
 
     /// A resident instance page.
@@ -577,22 +612,28 @@ impl Scenes {
             cpu.ptlas.retire(completed);
         }
         core.mounts.retire(completed, &self.device, &core.materials);
+        core.mounts.streaming.retire(completed);
         self.device.collect_garbage();
         let slot = (frame % u64::from(core.fif)) as usize;
         core.windows[slot].reset();
+        let mut apply = Apply {
+            device: &self.device,
+            window: &core.windows[slot],
+            seq: &core.seq,
+            records: core.global.get_mut().unwrap(),
+            materials: &core.materials,
+            emission: &mut core.models,
+        };
         let mut loading_points = Vec::new();
         for batch in self.loading.take_batches(&self.device) {
             loading_points.extend(batch.point.map(|(_, p)| p));
-            let mut apply = Apply {
-                device: &self.device,
-                window: &core.windows[slot],
-                seq: &core.seq,
-                records: core.global.get_mut().unwrap(),
-                materials: &core.materials,
-                emission: &mut core.models,
-            };
             core.mounts.apply(batch, &mut apply);
         }
+        loading_points.extend(
+            core.mounts
+                .streaming
+                .step(frame, &self.loading, &mut apply)?,
+        );
         #[cfg(feature = "hot-reload")]
         let reloads = self
             .reloader

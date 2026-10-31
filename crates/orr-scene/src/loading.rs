@@ -4,12 +4,14 @@
 pub(crate) mod io;
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 
 use orr_gpu::Device;
+use orr_pack::{Archive, Blob};
 
-use crate::PackSource;
 use crate::mount::{Batch, MountTask, finish, start};
+use crate::stream::{self, StreamBatch, StreamTask};
+use crate::{Error, PackSource, Result};
 
 pub(crate) type Job = Box<dyn FnOnce() + Send>;
 
@@ -19,6 +21,10 @@ pub(crate) enum Msg {
     Read(io::Read),
     /// Every job and read of the mount has finished.
     Done(Arc<MountTask>),
+    /// Streamed units to read and place.
+    Stream(Arc<StreamTask>),
+    /// Every read of the stream task has finished.
+    StreamDone(Arc<StreamTask>),
     Stop,
 }
 
@@ -36,6 +42,7 @@ pub struct Loading {
     inbox: Mutex<VecDeque<Msg>>,
     wake: io::Wake,
     batches: Mutex<Vec<Batch>>,
+    streams: Mutex<Vec<StreamBatch>>,
     pub(crate) positioned: bool,
 }
 
@@ -51,6 +58,7 @@ impl Loading {
             inbox: Mutex::new(VecDeque::new()),
             wake: io::Wake::new(),
             batches: Mutex::new(Vec::new()),
+            streams: Mutex::new(Vec::new()),
             positioned,
         }
     }
@@ -120,6 +128,110 @@ impl Loading {
         *all = rest;
         done
     }
+
+    pub(crate) fn push_stream(&self, batch: StreamBatch) {
+        self.streams.lock().unwrap().push(batch);
+    }
+
+    /// Takes every stream batch whose copies have completed, without waiting.
+    pub(crate) fn take_streams(&self, device: &Device) -> Vec<StreamBatch> {
+        let mut all = self.streams.lock().unwrap();
+        let (done, rest): (Vec<_>, Vec<_>) = all
+            .drain(..)
+            .partition(|b| landed(device, b.point.as_ref()));
+        *all = rest;
+        done
+    }
+}
+
+/// Whether the work signalling `point` has completed; true without one.
+pub(crate) fn landed(
+    device: &Device,
+    point: Option<&(orr_gpu::QueueKind, orr_gpu::TimelinePoint)>,
+) -> bool {
+    point.is_none_or(|(kind, point)| {
+        device
+            .queue(*kind)
+            .is_some_and(|q| q.completed() >= point.value())
+    })
+}
+
+/// Where a pack's blobs are read from: the archive, its file handles when it is a file,
+/// and whether reads go through the ring.
+pub(crate) struct BlobSource {
+    pub loading: Weak<Loading>,
+    pub archive: Arc<Archive>,
+    pub file: Option<Arc<io::ArchiveFile>>,
+    pub ring: bool,
+}
+
+pub(crate) type Stored = Box<dyn FnOnce(Result<&[u8]>) + Send>;
+
+/// Reads blob `b`'s stored bytes, then hands them to `then` on a worker. A read error goes
+/// to `then` on the thread that saw it. Without a loading side `then` is not called.
+pub(crate) fn read_stored(src: &BlobSource, b: Blob, then: Stored) {
+    let Some(loading) = src.loading.upgrade() else {
+        return;
+    };
+    if src.archive.stored(&b, None).is_some() {
+        let a = Arc::clone(&src.archive);
+        loading.spawn(move || then(Ok(a.stored(&b, None).expect("stored in place"))));
+        return;
+    }
+    let range = src.archive.stored_range(&b, None);
+    let file = Arc::clone(src.file.as_ref().expect("file archive"));
+    let check = move |buf: &io::AlignedBuf, n: usize, then: Stored| {
+        let end = range.skip as usize + b.stored_len as usize;
+        if n < end {
+            then(Err(orr_pack::Error::Truncated {
+                need: range.offset + end as u64,
+                have: range.offset + n as u64,
+            }
+            .into()));
+            return;
+        }
+        then(Ok(&buf.as_slice()[range.skip as usize..end]));
+    };
+    if src.ring {
+        let weak = Arc::downgrade(&loading);
+        loading.send(Msg::Read(io::Read {
+            file,
+            offset: range.offset,
+            len: range.len as usize,
+            done: Box::new(move |r| match (r, weak.upgrade()) {
+                (Ok((buf, n)), Some(l)) => l.spawn(move || check(&buf, n, then)),
+                (Err(e), _) => then(Err(e.into())),
+                (Ok(_), None) => {}
+            }),
+        }));
+    } else {
+        loading.spawn(move || {
+            let mut buf = io::AlignedBuf::new(range.len as usize);
+            match io::read_positioned(&file, range.offset, &mut buf) {
+                Ok(n) => check(&buf, n, then),
+                Err(e) => then(Err(Error::from(e))),
+            }
+        });
+    }
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Decodes blob `b` from its stored bytes into the calling worker's scratch and hands the
+/// decoded bytes to `then`.
+pub(crate) fn decoded(
+    archive: &Archive,
+    b: &Blob,
+    stored: &[u8],
+    then: impl FnOnce(&[u8]) -> Result<()>,
+) -> Result<()> {
+    SCRATCH.with_borrow_mut(|s| {
+        s.resize(b.raw_len as usize, 0);
+        archive.decode(b, None, stored, s)?;
+        then(s)
+    })
 }
 
 /// The loading thread: IO completions and messages, until `Msg::Stop`.
@@ -141,6 +253,8 @@ pub(crate) fn thread(loading: Arc<Loading>, device: Device) {
                     None => unreachable!("reads go to the ring only when there is one"),
                 },
                 Msg::Done(task) => finish(&loading, &device, &task),
+                Msg::Stream(task) => stream::start(&loading, &task),
+                Msg::StreamDone(task) => stream::finish(&loading, &device, &task),
             }
         }
         if let Some(r) = &mut ring {

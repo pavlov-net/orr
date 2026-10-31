@@ -57,6 +57,120 @@ impl RangeAllocator {
     }
 }
 
+/// Memory loading jobs write into: mapped Upload memory, or DeviceLocal memory (`cpu` none)
+/// that a copy fills from staging.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Block {
+    pub gpu: u64,
+    pub cpu: Option<usize>,
+    pub size: u64,
+}
+
+impl Block {
+    pub(crate) fn of(a: &Allocation<u8>) -> Self {
+        Self {
+            gpu: a.gpu.address().0,
+            cpu: a.cpu.map(|p| p.as_ptr() as usize),
+            size: a.size,
+        }
+    }
+}
+
+/// A streamed class's memory: blocks of one kind, sub-allocated in 256-byte units. A block
+/// is allocated when no block has room and dropped once it is empty again.
+pub(crate) struct Pool {
+    kind: MemoryKind,
+    block_bytes: u64,
+    name: &'static str,
+    blocks: Vec<Option<PoolBlock>>,
+}
+
+struct PoolBlock {
+    memory: Allocation<u8>,
+    ranges: RangeAllocator,
+    slots: u32,
+}
+
+/// A range of a [`Pool`]: its block, first unit and unit count.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PoolSlot {
+    block: u32,
+    first: u32,
+    units: u32,
+}
+
+const POOL_UNIT: u64 = 256;
+
+impl Pool {
+    pub(crate) fn new(kind: MemoryKind, block_bytes: u64, name: &'static str) -> Self {
+        Self {
+            kind,
+            block_bytes: block_bytes.next_multiple_of(POOL_UNIT),
+            name,
+            blocks: Vec::new(),
+        }
+    }
+
+    /// `bytes` bytes at a 256-byte aligned address.
+    pub(crate) fn alloc(&mut self, device: &Device, bytes: u64) -> Result<(PoolSlot, Block)> {
+        let units = bytes.max(1).div_ceil(POOL_UNIT) as u32;
+        let found = self.blocks.iter_mut().enumerate().find_map(|(i, b)| {
+            let first = b.as_mut()?.ranges.alloc(units)?;
+            Some((i, first))
+        });
+        let (block, first) = match found {
+            Some(f) => f,
+            None => {
+                let size = self.block_bytes.max(u64::from(units) * POOL_UNIT);
+                let memory = device.gpu_malloc::<u8>(self.kind, size, self.name)?;
+                let mut ranges = RangeAllocator::new((size / POOL_UNIT) as u32);
+                let first = ranges.alloc(units).expect("a new block fits");
+                let b = Some(PoolBlock {
+                    memory,
+                    ranges,
+                    slots: 0,
+                });
+                match self.blocks.iter().position(Option::is_none) {
+                    Some(i) => {
+                        self.blocks[i] = b;
+                        (i, first)
+                    }
+                    None => {
+                        self.blocks.push(b);
+                        (self.blocks.len() - 1, first)
+                    }
+                }
+            }
+        };
+        let b = self.blocks[block].as_mut().expect("live block");
+        b.slots += 1;
+        let at = u64::from(first) * POOL_UNIT;
+        let whole = Block::of(&b.memory);
+        let memory = Block {
+            gpu: whole.gpu + at,
+            cpu: whole.cpu.map(|p| p + at as usize),
+            size: bytes,
+        };
+        let slot = PoolSlot {
+            block: block as u32,
+            first,
+            units,
+        };
+        Ok((slot, memory))
+    }
+
+    /// Returns `slot`; call only once the GPU no longer reads it.
+    pub(crate) fn free(&mut self, slot: PoolSlot) {
+        let entry = &mut self.blocks[slot.block as usize];
+        let b = entry.as_mut().expect("slot of a live block");
+        b.ranges.free(slot.first, slot.units);
+        b.slots -= 1;
+        if b.slots == 0 {
+            *entry = None;
+        }
+    }
+}
+
 /// One frame's upload memory: mapped, write-combined blocks handed out by bumping an
 /// offset. Writers on several threads allocate from one window; it is reset once the
 /// frame that used it has completed on the GPU.
