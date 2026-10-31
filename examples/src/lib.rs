@@ -14,6 +14,7 @@ use orr::{
 };
 use orr_math::{Mat3, Vec3};
 
+pub mod creature;
 pub mod field;
 pub mod mesh;
 pub mod overlay;

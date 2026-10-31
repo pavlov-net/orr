@@ -1,4 +1,4 @@
-// The raster into the visibility buffer, of cooked and producer clusters alike. The
+// The raster into the visibility buffer, of cooked, skinned and producer clusters alike. The
 // hardware path draws the opaque and alpha lists through mesh pipelines; `software` rasters the clusters small on screen in compute
 // with the same snapping, sample points and coverage. Alpha-tested triangles keep a pixel by
 // each surface's coverage. Pixel stages write only the visibility buffer. `depth` copies the
@@ -40,6 +40,7 @@ struct ClusterDraw
     float step;          // the mesh's position step
     ProducerBatch b;
     ProducerClusterGpu k;
+    float3* skinned;     // a skinned copy's positions of the cluster's vertices, else null
     Placement p;
     uint vertex_count;
     uint tri_count;
@@ -72,7 +73,12 @@ ClusterDraw cluster_draw(uint visible, bool alpha)
     {
         d.h = load_page_header(d.vc.page);
         d.c = load_cluster(d.vc.page, d.vc.local);
-        d.step = s.meshes[s.models[s.instances[d.vc.instance].model].mesh].position_step;
+        InstanceGpu inst = s.instances[d.vc.instance];
+        MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
+        d.step = mesh.position_step;
+        SkinnedGpu k;
+        if (copy_skin(s, inst, k))
+            d.skinned = k.positions + mesh.skin.vertex_first[d.vc.cluster];
         d.vertex_count = d.c.vertex_count;
         d.tri_count = d.c.tri_count;
         d.split = alpha_start(m, d.c);
@@ -94,7 +100,8 @@ uint3 draw_triangle(ClusterDraw d, uint t)
 Vertex cluster_vertex(ClusterDraw d, uint visible, uint i)
 {
     ViewConstants* v = root.view;
-    float3 x = d.producer ? d.b.positions[d.k.first_vertex + i] : load_position(d.vc.page, d.h, d.c, i, d.step);
+    float3 x = d.producer ? d.b.positions[d.k.first_vertex + i]
+        : d.skinned != nullptr ? d.skinned[i] : load_position(d.vc.page, d.h, d.c, i, d.step);
     float3 q = place(d.p, x);
     corners[i] = q;
     Vertex o;

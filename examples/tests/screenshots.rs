@@ -18,6 +18,9 @@ mod producer_field;
 #[path = "../rigid-parts.rs"]
 mod rigid_parts;
 #[allow(dead_code)]
+#[path = "../skinned.rs"]
+mod skinned;
+#[allow(dead_code)]
 #[path = "../viewer.rs"]
 mod viewer;
 
@@ -61,6 +64,8 @@ fn examples_match_their_references() {
     compare("rigid-parts", rigid);
     let field = producer_field::run(&Options::headless(120, &[])).expect("headless capture");
     compare("producer-field", field);
+    let skinned = skinned::run(&Options::headless(120, &[])).expect("headless capture");
+    compare("skinned", skinned);
     let forest = dense_vegetation::capture(&Options::headless(120, &DENSE_VEGETATION))
         .expect("headless capture");
     compare("dense-vegetation", forest);

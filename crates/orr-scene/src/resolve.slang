@@ -140,17 +140,32 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     float3 view_pos = view_from_relative(v, relative);
     float4 clip = mul(v.clip_from_view_jittered, float4(view_pos, 1.0));
     float4 current = mul(v.clip_from_view, float4(view_pos, 1.0));
-    // A producer batch with previous positions moves the point by its vertices' motion too.
     Placement p = hit.placement;
     float3 object = mul(linear_inverse(p.linear), relative - p.translation);
     Placement prev;
     if (!visible_placement(s, v, vc, true, prev))
         prev = p;
+    // A producer batch with previous positions, or a skinned copy skinned by last frame's
+    // palette, moves the point by its vertices' motion too.
     uint entry;
-    if (visible_producer(s, vc, entry) && s.batches[entry].previous != nullptr)
+    bool deformed = false;
+    Corners c = (Corners)0;
+    SkinnedGpu k;
+    if (visible_producer(s, vc, entry))
     {
         ProducerBatch pb = s.batches[entry];
-        Corners c = producer_triangle(pb, pb.clusters[vc.cluster], visibility_triangle(w), true).corners;
+        deformed = pb.previous != nullptr;
+        if (deformed)
+            c = producer_triangle(pb, pb.clusters[vc.cluster], visibility_triangle(w), true).corners;
+    }
+    else if (copy_skin(s, s.instances[vc.instance], k))
+    {
+        deformed = true;
+        MeshGpu* mesh = s.meshes + s.models[s.instances[vc.instance].model].mesh;
+        skinned_corners(k, mesh, vc.page, load_cluster(vc.page, vc.local), vc.cluster, visibility_triangle(w), true, c);
+    }
+    if (deformed)
+    {
         float2 bc = hit.input.barycentrics;
         object += (1.0 - bc.x - bc.y) * c.position[0] + bc.x * c.position[1] + bc.y * c.position[2] - hit.object;
     }

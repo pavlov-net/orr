@@ -6,6 +6,7 @@ module hit;
 
 import orr.abi;
 import orr.math;
+import orr.packing;
 import orr_pack.mesh;
 import producer;
 __exported import surface;
@@ -261,6 +262,72 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, 
     i.object_to_render = pl.linear;
 }
 
+// The skinned copy `inst` names; false for copies not from `add_skinned`.
+public bool copy_skin(SceneRoot* s, InstanceGpu inst, out SkinnedGpu k)
+{
+    k = (SkinnedGpu)0;
+    if ((inst.flags & INSTANCE_SKINNED) == 0 || inst.pose_index >= s.skinned_capacity)
+        return false;
+    k = s.skinned[inst.pose_index];
+    return k.positions != nullptr;
+}
+
+// The copy's mesh-space bounds this frame: those of its skinned clusters, else its model's
+// rest bounds. False for a skinned copy that skinned nothing this frame.
+public bool copy_bounds(SceneRoot* s, InstanceGpu inst, out float3 lo, out float3 hi)
+{
+    ModelGpu* model = s.models + inst.model;
+    lo = model.bounds_min;
+    hi = model.bounds_max;
+    if ((inst.flags & INSTANCE_SKINNED) == 0)
+        return true;
+    if (inst.pose_index >= s.skinned_capacity)
+        return false;
+    SkinStateGpu st = s.skin_state[inst.pose_index];
+    lo = float3(unordered(st.lo.x), unordered(st.lo.y), unordered(st.lo.z));
+    hi = float3(unordered(st.hi.x), unordered(st.hi.y), unordered(st.hi.z));
+    return st.clusters > 0 && all(lo <= hi);
+}
+
+// The mesh-space box a skinned copy's vertices stay in whatever its pose: its model's rest
+// bounds grown by its mesh's deformation bound. False when the mesh is unbounded, so only
+// this frame's skinned bounds hold.
+public bool skinned_reach(SceneRoot* s, InstanceGpu inst, out float3 lo, out float3 hi)
+{
+    ModelGpu* model = s.models + inst.model;
+    float bound = s.meshes[model.mesh].skin.bound;
+    lo = model.bounds_min - bound;
+    hi = model.bounds_max + bound;
+    return bound > 0.0;
+}
+
+// The mesh-space box of mesh cluster `mesh_cluster`'s skinned vertices this frame.
+public void skinned_box(SkinnedGpu k, uint mesh_cluster, out float3 lo, out float3 hi)
+{
+    float* b = k.boxes + 6 * mesh_cluster;
+    lo = float3(b[0], b[1], b[2]);
+    hi = float3(b[3], b[4], b[5]);
+}
+
+// Gives the corners of triangle `triangle` of cluster `c` (mesh cluster `mesh_cluster`) of
+// `page` the copy's skinned positions, last frame's with `previous`, and its skinned normals
+// and tangents.
+public void skinned_corners(SkinnedGpu k, MeshGpu* mesh, uint8_t* page, Cluster c, uint mesh_cluster, uint triangle, bool previous, inout Corners t)
+{
+    uint3 v = load_triangle(page, load_page_header(page), c, triangle) + mesh.skin.vertex_first[mesh_cluster];
+    float3* p = previous ? k.previous : k.positions;
+    for (uint j = 0; j < 3; j++)
+    {
+        t.position[j] = p[v[j]];
+        t.attributes[j].normal = oct_decode_unorm16(k.normals[v[j]]);
+        if ((mesh.attributes & MESH_TANGENT) != 0)
+        {
+            uint w = k.tangents[v[j]];
+            t.attributes[j].tangent = float4(oct_decode_unorm16(w), (w & (1u << 16)) != 0 ? -1.0 : 1.0);
+        }
+    }
+}
+
 // The world cell and the offset in it of the point `relative` from `cell` + `offset`.
 public void world_cell(int3 cell, float3 offset, float3 relative, uint cell_log2, out int3 out_cell, out float3 out_offset)
 {
@@ -382,6 +449,7 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
     uint attributes;
     Placement pl;
     uint entry;
+    bool skinned = false;
     if (hit_producer(s, instance_index, entry))
     {
         ProducerGpu p = s.producers[entry];
@@ -414,6 +482,10 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
         ClusterRef r = s.clusters[cluster_id];
         Cluster c = load_cluster(r.page, r.local);
         corners = load_corners(r.page, c, primitive, mesh);
+        SkinnedGpu k;
+        skinned = copy_skin(s, inst, k);
+        if (skinned)
+            skinned_corners(k, mesh, r.page, c, r.mesh_cluster, primitive, previous, corners);
         material = section_material(s, inst, model, c.section);
         attributes = mesh.attributes;
         GroupGpu* g = s.groups + inst.group;
@@ -436,7 +508,8 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
     }
     if (material == MATERIAL_NONE)
         return false;
-    if (fetched)
+    // A skinned copy's fetched positions are this frame's.
+    if (fetched && !(skinned && previous))
         corners.position = t.position;
     MaterialGpu* m = s.materials + material;
 

@@ -22,7 +22,8 @@ use crate::material::{MaterialId, MaterialTable, MaterialWriter};
 use crate::memory::RangeAllocator;
 use crate::memory::UploadWindow;
 use crate::mount::{
-    Apply, InstancePage, LoadState, MountId, MountTask, Mounts, PackSource, PageId, TableSizes,
+    Apply, ClipRef, InstancePage, LoadState, MountId, MountTask, Mounts, PackSource, PageId,
+    SkeletonRef, TableSizes,
 };
 use crate::pipelines::{PipelineId, Pipelines, ReloadReport};
 use crate::producer::{self, Job, ProducerKernels, ProducerStats, ProducerUpdate, Readback};
@@ -34,6 +35,7 @@ use crate::residency::ResidencyStats;
 use crate::scene::{GroupWriter, ModelCpu, ModelId, Scene, SceneDesc, SceneId, SceneWriter};
 use crate::shaders::transparency::CompositeRoot;
 use crate::shaders::{animation, emissive, world as world_kernel};
+use crate::skin::{SkinFrame, SkinKernels, SkinStats};
 use crate::time::FrameTime;
 use crate::transparency::TransparencyPass;
 use crate::traverse::{CutInputs, CutPipelines, CutSizes, CutStats, Cuts};
@@ -219,6 +221,8 @@ pub struct FrameStats {
     pub producers: ProducerStats,
     /// The DAG traversals of the frame's scenes.
     pub cuts: CutStats,
+    /// The skinning of the frame's scenes.
+    pub skin: SkinStats,
 }
 
 /// Scene compute: a listed scene's turn in `update_scenes`, after its uploads have landed.
@@ -297,6 +301,7 @@ struct Core {
     /// Scratch of every scene's PTLAS build; the builds of a frame run one after another.
     ptlas_scratch: Mutex<Option<Allocation<u8>>>,
     producers: ProducerKernels,
+    skin: SkinKernels,
     /// Scratch of producer builds, grown to the largest frame's.
     producer_scratch: Mutex<Option<Allocation<u8>>>,
 }
@@ -372,6 +377,7 @@ impl Scenes {
         let raster = RasterPipelines::new(device, desc.kernels, &mut pipelines)?;
         let ptlas = PtlasPipelines::new(device, desc.kernels, &mut pipelines)?;
         let producers = ProducerKernels::new(device, desc.kernels, &mut pipelines)?;
+        let skin = SkinKernels::new(device, desc.kernels, &mut pipelines)?;
         let cuts = CutPipelines::new(device, desc.kernels, &mut pipelines)?;
         #[cfg(feature = "hot-reload")]
         let mut reloader = Reloader::new();
@@ -419,6 +425,7 @@ impl Scenes {
                 ptlas,
                 ptlas_scratch: Mutex::new(None),
                 producers,
+                skin,
                 producer_scratch: Mutex::new(None),
             },
         })
@@ -481,6 +488,16 @@ impl Scenes {
     /// The model `id` of mount `m`.
     pub fn model(&self, m: MountId, id: AssetId) -> Result<ModelId> {
         self.core.mounts.lookup(m, id, |r| &r.models)
+    }
+
+    /// The skeleton `id` of mount `m`, for pose kernels that fill skinned palettes.
+    pub fn skeleton(&self, m: MountId, id: AssetId) -> Result<SkeletonRef> {
+        self.core.mounts.lookup(m, id, |r| &r.skeletons)
+    }
+
+    /// The clip `id` of mount `m`, for pose kernels that sample it.
+    pub fn clip(&self, m: MountId, id: AssetId) -> Result<ClipRef> {
+        self.core.mounts.lookup(m, id, |r| &r.clips)
     }
 
     /// The instance page `id` of mount `m`.
@@ -656,6 +673,9 @@ impl Scenes {
                     cuts.figures(slot, &mut f.stats.cuts);
                     feedback.extend(cuts.feedback(slot));
                 }
+                if let Some(skin) = &cpu.skin_frame {
+                    f.stats.skin.add(&skin.figures(slot));
+                }
             }
             core.mounts.node_feedback(&feedback, frame);
             core.completed_frame = f.id;
@@ -683,6 +703,13 @@ impl Scenes {
                 !done
             });
             cpu.retired.retain(|(frame, _)| *frame > completed);
+            cpu.skins_removed.retain(|&(frame, first, count, _)| {
+                let done = frame <= completed;
+                if done {
+                    cpu.skinned.free(first, count);
+                }
+                !done
+            });
             cpu.ptlas.retire(completed);
         }
         core.mounts.retire(completed, &self.device, &core.materials);
@@ -918,6 +945,15 @@ impl<'a> Frame<'a> {
                 cpu.cuts = Some(Cuts::new(device, sizes, core.fif)?);
             }
             let cut = cpu.cuts.as_ref().expect("made above").gpu();
+            if cpu.skinned_high_water > 0 && cpu.skin_frame.is_none() {
+                cpu.skin_frame = Some(SkinFrame::new(
+                    device,
+                    scene.desc.skinned_clusters,
+                    scene.desc.skinned_capacity,
+                    core.fif,
+                )?);
+            }
+            let skin_work = cpu.skin_frame.as_ref().map(|f| f.work);
             records.append(&mut cpu.ptlas.partition_records(device, window, &core.seq)?);
             for (index, g) in cpu.groups.iter_mut().enumerate() {
                 let Some(g) = g else { continue };
@@ -979,6 +1015,11 @@ impl<'a> Frame<'a> {
                 part_capacity: scene.desc.part_capacity,
                 producer_base: scene.desc.instance_capacity + scene.desc.part_capacity,
                 cut,
+                skinned: t.skinned.gpu,
+                skin_state: t.skin_state.gpu,
+                skin_work: skin_work.unwrap_or(GpuPtr::NULL).cast(),
+                skinned_capacity: scene.desc.skinned_capacity,
+                _pad: 0,
             };
             let src = window.put(device, &root)?;
             records.push(Record::values(core.next_seq(), t.root.gpu, src, 1));
@@ -1087,6 +1128,28 @@ impl<'a> Frame<'a> {
         }
         list.end_pass();
         list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
+        for &(id, root, _, focus, _) in &roots {
+            let cpu = core.scene(id)?.cpu.lock().unwrap();
+            let Some(skin) = &cpu.skin_frame else {
+                continue;
+            };
+            let focus = focus.map(|(f, ppr)| {
+                let w = WorldPos::new(f, core.cell_log2);
+                (w.cell.extend(1).to_array(), w.offset.extend(ppr).to_array())
+            });
+            skin.record(
+                device,
+                window,
+                &mut list,
+                self.pipelines,
+                &core.skin,
+                root,
+                focus,
+                core.raster_error_pixels,
+                cpu.skinned_high_water,
+                (self.id % u64::from(core.fif)) as usize,
+            )?;
+        }
         let hierarchy = core.mounts.hierarchy();
         for &(id, root, _, focus, _) in &roots {
             let scene = core.scene(id)?;
@@ -1404,6 +1467,7 @@ impl<'a> Frame<'a> {
             },
             producers: ProducerStats::default(),
             cuts: CutStats::default(),
+            skin: SkinStats::default(),
         };
         self.core.in_flight.push_back(InFlight {
             id: self.id,

@@ -188,18 +188,8 @@ void candidate(CutGpu* cut, ClusterWork w)
 // Writes the candidate items of mesh clusters `first..end`, in runs of up to 32 of one page.
 void candidates(CutGpu* cut, MeshGpu* mesh, uint slot, uint first, uint end)
 {
-    uint lo = 0;
-    uint hi = mesh.page_count;
-    while (hi - lo > 1)
-    {
-        uint mid = (lo + hi) / 2;
-        if (mesh.page_clusters[mid] <= first)
-            lo = mid;
-        else
-            hi = mid;
-    }
     uint c = first;
-    for (uint page = lo; page < mesh.page_count && c < end; page++)
+    for (uint page = cluster_page(mesh, first); page < mesh.page_count && c < end; page++)
     {
         if (mesh.pages[page] == 0)
         {
@@ -219,6 +209,38 @@ void candidates(CutGpu* cut, MeshGpu* mesh, uint slot, uint first, uint end)
         }
         c = page_end;
     }
+}
+
+// Writes the candidate items of the clusters skinned for `inst` this frame, in runs of up to
+// 32 of one page; false when it skinned none.
+bool skinned_candidates(SceneRoot* s, CutGpu* cut, MeshGpu* mesh, uint slot, InstanceGpu inst)
+{
+    if (inst.pose_index >= s.skinned_capacity)
+        return false;
+    SkinStateGpu st = s.skin_state[inst.pose_index];
+    if (st.clusters == 0)
+        return false;
+    ClusterWork w = (ClusterWork)0;
+    w.instance = slot;
+    uint start = 0;
+    for (uint i = 0; i < st.clusters; i++)
+    {
+        uint c = s.skin_work[st.first + i].y;
+        if (w.mask != 0 && c >= start && c - start < 32 && c < mesh.page_clusters[w.page + 1])
+        {
+            w.mask |= 1u << (c - start);
+            continue;
+        }
+        if (w.mask != 0)
+            candidate(cut, w);
+        w.page = cluster_page(mesh, c);
+        w.first = c - mesh.page_clusters[w.page];
+        w.mask = 1;
+        start = c;
+    }
+    if (w.mask != 0)
+        candidate(cut, w);
+    return true;
 }
 
 [shader("compute")]
@@ -260,6 +282,15 @@ void init(uint3 id: SV_DispatchThreadID)
     Lod l = slot_lod(s, inst, slot, c, false);
     bool raster = (inst.flags & INSTANCE_RASTER) != 0 && (inst.flags & INSTANCE_CAST_ONLY) == 0
         && inst.candidate_class == CLASS_OPAQUE;
+    // A skinned copy's raster candidates are the clusters its skinning took this frame; it
+    // traces the BLAS built over them.
+    if ((inst.flags & INSTANCE_SKINNED) != 0)
+    {
+        if (raster && skinned_candidates(s, cut, mesh, slot, inst))
+            c.flags |= CUT_RASTER;
+        cut.slots[slot] = c;
+        return;
+    }
     float4 sphere = model_sphere(model);
     float3 center = place(p, sphere.xyz);
     float radius = sphere.w * p.scale;

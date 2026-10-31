@@ -14,12 +14,13 @@ use crate::material::MaterialId;
 use crate::memory::{RangeAllocator, UploadWindow};
 use crate::producer::{self, Producer, ProducerDesc, ProducerId};
 use crate::ptlas::Ptlas;
+use crate::skin::{CopyArrays, SkinFrame, SkinnedDesc};
 use crate::traverse::Cuts;
 use crate::upload::{Op, Record};
 use crate::world::WorldPos;
 use crate::{
     EmissiveGpu, Error, GroupGpu, InstanceGpu, LightGpu, ProducerBatch, ProducerGpu,
-    ProducerStateGpu, Result, SceneRoot, SkyStats, SlotStateGpu,
+    ProducerStateGpu, Result, SceneRoot, SkinStateGpu, SkinnedGpu, SkyStats, SlotStateGpu,
 };
 
 /// A scene in [`crate::Scenes`].
@@ -48,6 +49,10 @@ pub struct SceneDesc {
     /// Instances the PTLAS global partition holds, at most: movers beyond it stay in their
     /// cell partitions.
     pub global_instances: u32,
+    /// Skinned copies (`add_skinned`), at most.
+    pub skinned_capacity: u32,
+    /// Clusters all skinned copies skin and instantiate in one frame, at most.
+    pub skinned_clusters: u32,
 }
 
 impl Default for SceneDesc {
@@ -63,6 +68,8 @@ impl Default for SceneDesc {
             ptlas_partitions: 2048,
             partition_instances: 1000,
             global_instances: 4096,
+            skinned_capacity: 256,
+            skinned_clusters: 8192,
         }
     }
 }
@@ -153,6 +160,10 @@ impl InstanceFlags {
     pub const RAY: Self = Self(2);
     /// Traced for shadows only.
     pub const CAST_ONLY: Self = Self(4);
+    /// The bits consumers set; orr keeps the others.
+    const CONSUMER: u8 = 7;
+    /// `tables.slang` `INSTANCE_SKINNED`.
+    const SKINNED: u8 = 8;
 }
 
 impl std::ops::BitOr for InstanceFlags {
@@ -222,6 +233,8 @@ pub(crate) struct Tables {
     pub producer_counts: Allocation<[u32; 2]>,
     pub producer_state: Allocation<ProducerStateGpu>,
     pub sky_stats: Allocation<SkyStats>,
+    pub skinned: Allocation<SkinnedGpu>,
+    pub skin_state: Allocation<SkinStateGpu>,
 }
 
 pub(crate) struct Group {
@@ -262,6 +275,26 @@ impl Group {
 pub(crate) struct ModelCpu {
     pub sections: u32,
     pub animated_parts: u32,
+    /// Its skeleton's joints; 0 without a skeleton.
+    pub joints: u32,
+    /// Set when its mesh is skinned.
+    pub skin: Option<SkinShape>,
+}
+
+/// The vertex and cluster counts of a skinned mesh.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SkinShape {
+    pub vertices: u32,
+    pub clusters: u32,
+}
+
+/// The copies of one `add_skinned` call: their slots, skinned-copy entries and vertex arrays.
+pub(crate) struct SkinRange {
+    pub slots: InstanceRange,
+    pub entry: u32,
+    pub arrays: CopyArrays,
+    /// Copies not yet removed.
+    pub live: u32,
 }
 
 pub(crate) struct SceneCpu {
@@ -294,6 +327,16 @@ pub(crate) struct SceneCpu {
     pub ptlas: Ptlas,
     /// Made at the scene's first update.
     pub cuts: Option<Cuts>,
+    /// Skinned-copy entries.
+    pub skinned: RangeAllocator,
+    /// One past the highest skinned-copy entry handed out.
+    pub skinned_high_water: u32,
+    pub skins: Vec<SkinRange>,
+    /// Entry ranges and vertex arrays of removed skinned copies, freed once that frame has
+    /// completed.
+    pub skins_removed: Vec<(u64, u32, u32, Option<CopyArrays>)>,
+    /// Made at the first update with skinned copies.
+    pub skin_frame: Option<SkinFrame>,
 }
 
 pub(crate) struct Scene {
@@ -330,6 +373,8 @@ impl Scene {
             producer_counts: device.gpu_malloc(dl, n(desc.producer_capacity), "producer counts")?,
             producer_state: device.gpu_malloc(dl, n(desc.producer_capacity), "producer state")?,
             sky_stats: device.gpu_malloc(dl, 1, "sky stats")?,
+            skinned: device.gpu_malloc(dl, n(desc.skinned_capacity), "skinned copies")?,
+            skin_state: device.gpu_malloc(dl, n(desc.skinned_capacity), "skin state")?,
         };
         // Tables start zeroed: empty slots, the null group, no lights. These apply before
         // any write (sequence 0).
@@ -355,6 +400,8 @@ impl Scene {
                 tables.producer_state.size,
             ),
             zero(tables.sky_stats.gpu.address(), tables.sky_stats.size),
+            zero(tables.skinned.gpu.address(), tables.skinned.size),
+            zero(tables.skin_state.gpu.address(), tables.skin_state.size),
         ];
         Ok(Self {
             desc: *desc,
@@ -380,6 +427,11 @@ impl Scene {
                 near_range: 256.0,
                 ptlas: Ptlas::new(device, desc)?,
                 cuts: None,
+                skinned: RangeAllocator::new(desc.skinned_capacity),
+                skinned_high_water: 0,
+                skins: Vec::new(),
+                skins_removed: Vec::new(),
+                skin_frame: None,
             }),
             writing: AtomicBool::new(false),
         })
@@ -648,7 +700,7 @@ impl<'f> SceneWriter<'f> {
                 first_part: u32::MAX,
                 rt_range: half::f16::from_f32(desc.rt_range).to_bits(),
                 animation_range: half::f16::from_f32(desc.animation_range).to_bits(),
-                flags: desc.flags.0,
+                flags: desc.flags.0 & InstanceFlags::CONSUMER,
                 candidate_class: 0,
                 pose_variants: pose.variants as u16,
                 pose_stride: pose.stride as u16,
@@ -657,13 +709,19 @@ impl<'f> SceneWriter<'f> {
                 variant: 0,
             };
         }
-        // The fields from `part_run` on describe a run the PTLAS kernels still release.
+        self.reset_slot_state(range);
+        Ok(range)
+    }
+
+    /// Zeroes the slot state of new slots. The fields from `part_run` on describe a run the
+    /// PTLAS kernels still release.
+    fn reset_slot_state(&self, range: InstanceRange) {
         let state = self
             .scene
             .tables
             .slot_state
             .gpu
-            .offset(u64::from(first))
+            .offset(u64::from(range.first))
             .address()
             .0;
         let seq = self.next_seq();
@@ -671,11 +729,109 @@ impl<'f> SceneWriter<'f> {
             self.push(Record {
                 seq,
                 dst: state + 4 * u64::from(word),
-                count: desc.copies,
+                count: range.count,
                 stride: words(size_of::<SlotStateGpu>()),
                 op: Op::Fill(0),
             });
         }
+    }
+
+    /// `desc.copies` skinned copies of a model with a skinned mesh, one instance slot each.
+    /// Every frame the scene is updated each copy takes one cut by its distance from the
+    /// focus, skins it with its palette entries into its own vertex arrays, rasters it and,
+    /// inside `rt_range`, traces it through a cluster BLAS built from the cut's cluster
+    /// templates, in the PTLAS global partition. Copies skin whether or not a view shows
+    /// them. Panics if the model's mesh has no skin or the model no skeleton.
+    pub fn add_skinned(&mut self, desc: &SkinnedDesc) -> Result<InstanceRange> {
+        let model = self
+            .model_cpu
+            .get(desc.model.0 as usize)
+            .copied()
+            .unwrap_or_default();
+        let shape = model
+            .skin
+            .unwrap_or_else(|| panic!("{:?} has no skinned mesh", desc.model));
+        assert!(model.joints > 0, "{:?} has no skeleton", desc.model);
+        let arrays = CopyArrays::new(self.device, desc.copies, shape.vertices, shape.clusters)?;
+        let (first, entry) = {
+            let cpu = &mut *self.scene.cpu.lock().unwrap();
+            let first = cpu.slots.alloc(desc.copies).ok_or(Error::Capacity {
+                what: "instances",
+                capacity: self.scene.desc.instance_capacity,
+            })?;
+            let Some(entry) = cpu.skinned.alloc(desc.copies) else {
+                cpu.slots.free(first, desc.copies);
+                return Err(Error::Capacity {
+                    what: "skinned copies",
+                    capacity: self.scene.desc.skinned_capacity,
+                });
+            };
+            cpu.skinned_high_water = cpu.skinned_high_water.max(entry + desc.copies);
+            cpu.slot_models[first as usize..(first + desc.copies) as usize].fill(desc.model.0);
+            cpu.ptlas.place_skinned(first, desc.copies);
+            (first, entry)
+        };
+        let range = InstanceRange {
+            first,
+            count: desc.copies,
+        };
+        let records = self.upload(
+            self.scene.tables.instances.gpu.offset(u64::from(first)),
+            desc.copies,
+        )?;
+        for (copy, r) in (0..).zip(records.iter_mut()) {
+            *r = InstanceGpu {
+                group: desc.transforms.0,
+                group_index: desc.first + copy,
+                model: desc.model.0,
+                material_base: desc.material_set.unwrap_or(u32::MAX),
+                pose_group: desc.palette.0,
+                pose_index: entry + copy,
+                first_part: u32::MAX,
+                rt_range: half::f16::from_f32(desc.rt_range).to_bits(),
+                animation_range: 0,
+                flags: (desc.flags.0 & InstanceFlags::CONSUMER) | InstanceFlags::SKINNED,
+                candidate_class: 0,
+                pose_variants: 0,
+                pose_stride: 0,
+                debug_lod: 0,
+                user_tag: desc.user_tag,
+                variant: 0,
+            };
+        }
+        let skinned = self.upload(
+            self.scene.tables.skinned.gpu.offset(u64::from(entry)),
+            desc.copies,
+        )?;
+        for (copy, k) in (0..).zip(skinned.iter_mut()) {
+            let [positions, previous, normals, tangents, boxes] = arrays.of(copy);
+            *k = SkinnedGpu {
+                positions: positions.cast(),
+                previous: previous.cast(),
+                normals: normals.cast(),
+                tangents: tangents.cast(),
+                boxes: boxes.cast(),
+                slot: first + copy,
+                palette_group: desc.palette.0,
+                palette_first: desc.palette_first + copy * model.joints,
+                joint_count: model.joints,
+            };
+        }
+        let states = self.upload(
+            self.scene.tables.skin_state.gpu.offset(u64::from(entry)),
+            desc.copies,
+        )?;
+        states.fill(SkinStateGpu {
+            cut: u32::MAX,
+            ..Zeroable::zeroed()
+        });
+        self.reset_slot_state(range);
+        self.scene.cpu.lock().unwrap().skins.push(SkinRange {
+            slots: range,
+            entry,
+            arrays,
+            live: desc.copies,
+        });
         Ok(range)
     }
 
@@ -689,8 +845,8 @@ impl<'f> SceneWriter<'f> {
             count: range.count,
             stride: words(size_of::<InstanceGpu>()),
             op: Op::Masked {
-                value: u32::from(flags.0) << shift,
-                mask: 0xff << shift,
+                value: u32::from(flags.0 & InstanceFlags::CONSUMER) << shift,
+                mask: u32::from(InstanceFlags::CONSUMER) << shift,
             },
         });
     }
@@ -782,6 +938,32 @@ impl<'f> SceneWriter<'f> {
             .push(Record::fill(seq, self.instance_word(range.first, 0), n, 0));
         cpu.removed.push((self.frame, range));
         cpu.ptlas.remove(range.first, range.count, self.frame);
+        let end = range.first + range.count;
+        let mut i = 0;
+        while i < cpu.skins.len() {
+            let r = &mut cpu.skins[i];
+            let (a, b) = (
+                range.first.max(r.slots.first),
+                end.min(r.slots.first + r.slots.count),
+            );
+            if a >= b {
+                i += 1;
+                continue;
+            }
+            let entry = r.entry + (a - r.slots.first);
+            let n = b - a;
+            r.live -= n;
+            let at = self.scene.tables.skinned.gpu.offset(u64::from(entry));
+            let w = n * words(size_of::<SkinnedGpu>());
+            cpu.records.push(Record::fill(seq, at.address().0, w, 0));
+            let arrays = if r.live == 0 {
+                Some(cpu.skins.swap_remove(i).arrays)
+            } else {
+                i += 1;
+                None
+            };
+            cpu.skins_removed.push((self.frame, entry, n, arrays));
+        }
         for (entry, count) in cpu.emissive_runs.remove(range.first, range.count) {
             let at = self.emissive_entry(entry).address().0;
             let n = count * words(size_of::<EmissiveGpu>());

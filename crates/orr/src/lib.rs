@@ -41,18 +41,18 @@ pub use orr_output::{
 pub use orr_scene::Error as SceneError;
 pub use orr_scene::{self, RasterView};
 pub use orr_scene::{
-    Affine3, BoundTexture, Budgets, ClassStats, ClusterRef, ClusterTopology, Cone, ConsumerMarker,
-    CopyVariant, DepthOfField, DirectionalLight, DiscProfile, EmissiveGpu, EmissiveSpan,
-    ExposureState, Focus, FrameStats, FrameTime, Glare, GroupGpu, GroupWriter, InstanceFlags,
-    InstanceGpu, InstancePage, InstanceRange, InstancesDesc, Lens, LensDistortion, Light, LightGpu,
-    LightId, LoadState, Loading, MaterialGpu, MaterialId, MaterialWriter, MeshGpu, ModelEmission,
-    ModelGpu, ModelId, MountId, Opacity, OriginPolicy, PackSource, PageId, PipelineId, Pose,
-    ProducerBatch, ProducerClusterGpu, ProducerDesc, ProducerGpu, ProducerId, ProducerStats,
-    ProducerUpdate, Projection, REBASE_GRID_LOG2, RasterGpu, ReloadReport, RendererDesc,
-    ResidencyClass, ResidencyStats, RtCutGpu, RtStats, SceneCompute, SceneDesc, SceneId, SceneRoot,
-    SceneWriter, SkyStats, SlotStateGpu, TopologyGpu, TransformGroupDesc, TransformGroupId,
-    TransparencyPass, ViewConstants, ViewDesc, ViewHistoryId, ViewTarget, WorldPos, abi,
-    material_flags, orr_gpu, orr_pack,
+    Affine3, BoundTexture, Budgets, ClassStats, ClipRef, ClusterRef, ClusterTopology, Cone,
+    ConsumerMarker, CopyVariant, DepthOfField, DirectionalLight, DiscProfile, EmissiveGpu,
+    EmissiveSpan, ExposureState, Focus, FrameStats, FrameTime, Glare, GroupGpu, GroupWriter,
+    InstanceFlags, InstanceGpu, InstancePage, InstanceRange, InstancesDesc, Lens, LensDistortion,
+    Light, LightGpu, LightId, LoadState, Loading, MaterialGpu, MaterialId, MaterialWriter, MeshGpu,
+    ModelEmission, ModelGpu, ModelId, MountId, Opacity, OriginPolicy, PackSource, PageId,
+    PipelineId, Pose, ProducerBatch, ProducerClusterGpu, ProducerDesc, ProducerGpu, ProducerId,
+    ProducerStats, ProducerUpdate, Projection, REBASE_GRID_LOG2, RasterGpu, ReloadReport,
+    RendererDesc, ResidencyClass, ResidencyStats, RtCutGpu, RtStats, SceneCompute, SceneDesc,
+    SceneId, SceneRoot, SceneWriter, SkeletonRef, SkinStats, SkinnedDesc, SkyStats, SlotStateGpu,
+    TopologyGpu, TransformGroupDesc, TransformGroupId, TransparencyPass, ViewConstants, ViewDesc,
+    ViewHistoryId, ViewTarget, WorldPos, abi, material_flags, orr_gpu, orr_pack,
 };
 
 use orr_gpu::{
@@ -380,6 +380,16 @@ impl Renderer {
 
     pub fn model(&self, m: MountId, id: orr_pack::AssetId) -> Result<ModelId> {
         Ok(self.scenes.model(m, id)?)
+    }
+
+    /// The skeleton `id` of mount `m`, for pose kernels that fill skinned palettes.
+    pub fn skeleton(&self, m: MountId, id: orr_pack::AssetId) -> Result<SkeletonRef> {
+        Ok(self.scenes.skeleton(m, id)?)
+    }
+
+    /// The clip `id` of mount `m`, for pose kernels that sample it.
+    pub fn clip(&self, m: MountId, id: orr_pack::AssetId) -> Result<ClipRef> {
+        Ok(self.scenes.clip(m, id)?)
     }
 
     pub fn instance_page(&self, m: MountId, id: orr_pack::AssetId) -> Result<PageId> {

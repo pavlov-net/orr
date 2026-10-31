@@ -327,6 +327,9 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
         MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
         Cluster c = load_cluster(vc.page, vc.local);
         t = load_corners(vc.page, c, triangle, mesh);
+        SkinnedGpu k;
+        if (copy_skin(s, inst, k))
+            skinned_corners(k, mesh, vc.page, c, vc.cluster, triangle, false, t);
         attributes = mesh.attributes;
         hit.error = c.self_error * hit.placement.scale;
         i.part = c.part;
