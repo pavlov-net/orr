@@ -5,7 +5,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::blob::{put_table, read, table};
 use crate::{Aabb, AssetId, Error, Result, Span};
 
-pub const SCHEMA: u16 = 1;
+pub const SCHEMA: u16 = 2;
 
 /// Spans name tables in the same blob: `first` is a byte offset, `count` a record count.
 #[repr(C)]
@@ -15,10 +15,13 @@ pub struct ModelHeader {
     pub kind: u8,
     pub _pad: [u8; 3],
     pub bounds: Aabb,
+    /// The model's mesh, [`AssetId::NONE`] for none.
     pub mesh: AssetId,
+    /// The model's subdivision cage ([`crate::subd`]), [`AssetId::NONE`] for none.
+    pub subd: AssetId,
     /// [`AssetId::NONE`] for a model without a skeleton.
     pub skeleton: AssetId,
-    /// Material [`AssetId`] per mesh section.
+    /// Material [`AssetId`] per mesh section, then per subdivision cage section.
     pub materials: Span,
 }
 

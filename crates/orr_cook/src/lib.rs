@@ -29,8 +29,11 @@
 //! textures `N/texture/<role>`.
 //!
 //! A mesh source emits the model `N`, its mesh `N/mesh` and its materials
-//! `N/material/<section>`. A material source emits one material `N`. A texture source emits
-//! one texture `N`.
+//! `N/material/<section>`. A subdivision cage source emits the model `N`, its cage `N/subd`
+//! and its materials `N/material/<section>`; with [`Subdivision::Cage`], a USD model holding
+//! cages has its cage `<model>/subd` beside its mesh `<model>/mesh`, its material table
+//! listing the mesh's sections, then the cage's. A material source emits one material `N`.
+//! A texture source emits one texture `N`.
 //!
 //! A raster source emits one raster set `N`: a tiled LOD pyramid per layer, built by the
 //! cook from a whole raster or imported from producer tiles ([`RasterSet`]).
@@ -66,6 +69,7 @@ mod run;
 mod shading;
 mod skin;
 mod state;
+mod subd;
 mod texture;
 mod usd;
 
@@ -88,6 +92,7 @@ pub use report::{
     NeuralTextureReport, Outcome, TextureReport,
 };
 pub use skin::ClipSettings;
+pub use subd::{Boundary, CageInput, Corner, Crease, FaceVarying, SubdSettings, UvLinear};
 pub use texture::material::{TextureOverride, TextureRules};
 pub use texture::neural::NeuralSettings;
 pub use texture::{DataFormat, MipFilter, Primaries, Quality, TextureSettings, Usage, Wrap};
@@ -178,6 +183,14 @@ pub enum Source {
         mesh: MeshInput,
         materials: Vec<orr_pack::material::Material>,
         settings: MeshSettings,
+    },
+    /// A Catmull-Clark cage built in memory, one material per section; library callers
+    /// only. Needs the `subd` feature.
+    #[serde(skip)]
+    Subd {
+        cage: CageInput,
+        materials: Vec<orr_pack::material::Material>,
+        settings: SubdSettings,
     },
     /// A material: the OpenPBR defaults with these fields set.
     Material(MaterialPatch),

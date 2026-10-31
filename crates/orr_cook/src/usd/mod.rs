@@ -28,10 +28,12 @@
 //!
 //! Meshes are [`mesh`] lists. A mesh with a `subdivisionScheme` other than `none` (USD's
 //! fallback is `catmullClark`) is a subdivision cage: [`Subdivision::Hull`] cooks its
-//! control faces as they are. Faces take the material of their `GeomSubset` of family
-//! `materialBind`, else of the mesh: the direct binding `material:binding:full`, else
-//! `material:binding`, of the prim or its nearest ancestor (collection bindings are not
-//! read). Materials map as [`crate::shading`] lists and are named `<asset>/material/<path>`
+//! control faces as they are, [`Subdivision::Cage`] cooks the model's cages as one
+//! subdivision cage entry (Catmull-Clark only; every cage of a model shares its
+//! `interpolateBoundary`, `faceVaryingLinearInterpolation` and `triangleSubdivisionRule`).
+//! Faces take the material of their `GeomSubset` of family `materialBind`, else of the
+//! mesh: the direct binding `material:binding:full`, else `material:binding`, of the prim or
+//! its nearest ancestor (collection bindings are not read). Materials map as [`crate::shading`] lists and are named `<asset>/material/<path>`
 //! by their prim path (without the leading `/`), `default` for unbound faces; faces of a
 //! `doubleSided` mesh take a double-sided copy, `<path>/double_sided`.
 
@@ -49,15 +51,17 @@ use openusd::{sdf, usd};
 use orr_math::{Affine2, DMat4, DQuat, DVec3, DVec4, Mat4};
 use serde::Deserialize;
 
+use crate::import::SceneSubd;
 use crate::import::{NodeSelect, Scene, SceneMaterial, SceneModel, SceneSkeleton};
 use crate::mesh::{MeshData, MeshSettings, SectionData, Skin};
 use crate::patch::{self, MaterialPatch, MeshPatch};
 use crate::shading;
 use crate::skin::ClipSettings;
+use crate::subd::SubdSettings;
 use crate::texture::material::{ImageFile, TextureRules};
 use crate::{Error, Result};
 
-use mesh::{MeshPrim, Placing, Welder};
+use mesh::{CageBuilder, MeshPrim, Placing, Welder};
 use read::{PrimReader, Reads, Recorder};
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -74,6 +78,8 @@ pub struct UsdSettings {
     /// Variant selections the stage composes with.
     pub variants: Vec<VariantSelection>,
     pub subdivision: Subdivision,
+    /// Refinement of cages with [`Subdivision::Cage`].
+    pub subd: SubdSettings,
     /// Time code values are read at; the stage's start time code without it (0 when the
     /// stage authors none).
     pub time: Option<f64>,
@@ -92,6 +98,7 @@ impl Default for UsdSettings {
             material_overrides: Vec::new(),
             variants: Vec::new(),
             subdivision: Subdivision::default(),
+            subd: SubdSettings::default(),
             time: None,
             uv: "st".into(),
             clips: ClipSettings::default(),
@@ -116,8 +123,7 @@ pub enum Subdivision {
     /// The control faces, as polygons.
     #[default]
     Hull,
-    /// The cage as a subdivision surface. The cook has no subdivision class yet, so a cage
-    /// fails the import.
+    /// The cage as a subdivision surface; needs the `subd` feature.
     Cage,
 }
 
@@ -149,6 +155,7 @@ struct Building {
     root: Option<usize>,
     skeleton: Option<usize>,
     welder: Welder,
+    cage: CageBuilder,
 }
 
 pub(crate) fn import(asset: &str, path: &Path, settings: &UsdSettings) -> Result<Scene> {
@@ -331,6 +338,7 @@ impl<'s> Importer<'s> {
                     root,
                     skeleton: None,
                     welder: Welder::default(),
+                    cage: CageBuilder::default(),
                 });
                 models.len() - 1
             };
@@ -446,13 +454,7 @@ impl<'s> Importer<'s> {
             let path = r.path().to_string();
             let o = owner[i].expect("owned");
             let mesh = MeshPrim::read(&r, &self.settings.uv)?;
-            if mesh.scheme != "none" && self.settings.subdivision == Subdivision::Cage {
-                return Err(format!(
-                    "{path}: subdivision cage ({}); the cook has no subdivision class, so \
-                     cages cook only as hulls",
-                    mesh.scheme
-                ));
-            }
+            let as_cage = mesh.scheme != "none" && self.settings.subdivision == Subdivision::Cage;
             let skeleton = models[o].skeleton.map(|k| &skels[k].1);
             let (skin, transform) = match (models[o].skinned, self.skinned(i), skeleton) {
                 (true, true, Some(sk)) => {
@@ -469,7 +471,11 @@ impl<'s> Importer<'s> {
                 face_material: &face_material,
                 skin: skin.as_deref(),
             };
-            models[o].welder.add(&mesh, &placing, &path)?;
+            if as_cage {
+                models[o].cage.add(&mesh, &placing, &path)?;
+            } else {
+                models[o].welder.add(&mesh, &placing, &path)?;
+            }
         }
 
         let mut out = Vec::new();
@@ -477,7 +483,10 @@ impl<'s> Importer<'s> {
         let mut instance_out = Vec::new();
         for (mi, b) in models.into_iter().enumerate() {
             // The rest of the stage, or a skeletal root with no skinned mesh, may be empty.
-            if (b.name.is_none() || b.skinned) && b.welder.groups.values().all(Vec::is_empty) {
+            if (b.name.is_none() || b.skinned)
+                && b.welder.groups.values().all(Vec::is_empty)
+                && b.cage.is_empty()
+            {
                 continue;
             }
             if let Some(n) = &b.name
@@ -537,7 +546,27 @@ impl<'s> Importer<'s> {
             indices.extend_from_slice(tris);
             slots.push(m);
         }
-        if sections.is_empty() {
+        let subd = (!b.cage.is_empty()).then(|| {
+            let mut slots: Vec<usize> = b.cage.materials.clone();
+            slots.sort_unstable();
+            slots.dedup();
+            let mut cage = b.cage.cage;
+            cage.face_sections = b
+                .cage
+                .materials
+                .iter()
+                .map(|m| slots.binary_search(m).expect("listed") as u16)
+                .collect();
+            SceneSubd {
+                cage: crate::subd::CageData {
+                    cage,
+                    skin: b.skinned.then_some(b.cage.skin),
+                },
+                materials: slots,
+                settings: self.settings.subd.clone(),
+            }
+        });
+        if sections.is_empty() && subd.is_none() {
             return Err(match &b.name {
                 Some(n) => format!("model {n} has no triangles"),
                 None => "the stage has no triangles".into(),
@@ -545,6 +574,7 @@ impl<'s> Importer<'s> {
         }
         Ok(SceneModel {
             node: b.name,
+            subd,
             mesh: MeshData {
                 positions: w.positions,
                 normals: w.normals,
@@ -581,6 +611,7 @@ impl<'s> Importer<'s> {
                 root: None,
                 skeleton: None,
                 welder: Welder::default(),
+                cage: CageBuilder::default(),
             });
             for (i, o) in owner.iter_mut().enumerate() {
                 if o.is_none() && !self.nodes[i].instanced {
@@ -624,6 +655,7 @@ impl<'s> Importer<'s> {
                 root: None,
                 skeleton: None,
                 welder: Welder::default(),
+                cage: CageBuilder::default(),
             });
         }
         if let Some(s) = matched.iter().position(|m| !m) {

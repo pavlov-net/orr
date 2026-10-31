@@ -34,6 +34,7 @@ use crate::mesh::{
 use crate::raster::{self, RasterReport};
 use crate::report::{self, ArchiveReport, AssetReport, Outcome};
 use crate::state::{self, Input, Memo, Record};
+use crate::subd::{self, CageData, CageInput, SubdSettings};
 use crate::texture::material::{
     ImageFacts, ImageFile, MaterialTextures, Packer, TexRef, TextureJob, TextureRules, image_facts,
 };
@@ -43,6 +44,9 @@ use crate::{
     CookOptions, Cooked, Error, GltfSettings, Instances, Manifest, MeshSettings, Placement,
     PrototypeSpec, Result, Source, TextureSettings, UsdSettings, mount,
 };
+
+/// Peak bytes of a subdivision cage cook per cage face, an estimate.
+const SUBD_BYTES_PER_FACE: u64 = 16 << 10;
 
 /// Peak bytes of a mesh cook per source triangle (P2's clodBuild process peak, an upper
 /// bound).
@@ -94,7 +98,8 @@ struct Unit<'m> {
     /// Source triangles of a mesh, for the report.
     triangles: u64,
     state: State,
-    /// For a done mesh: its bounds and what its model's instance pages need.
+    /// For a done mesh or subdivision cage: its bounds and what its model's instance pages
+    /// need.
     mesh: Option<(Aabb, ModelFacts)>,
 }
 
@@ -109,7 +114,10 @@ enum Work<'m> {
     Texture(TextureJob, Arc<Vec<ImageFile>>),
     Neural(NeuralJob, Arc<Vec<ImageFile>>),
     TextureFile(PathBuf, Hash32, TextureSettings),
-    /// A model of the mesh in `deps[0]`, these materials and this skeleton.
+    /// The cage, its section materials and its settings.
+    Subd(Arc<CageData>, Vec<Material>, SubdSettings),
+    /// A model of the mesh and subdivision cage units in `deps`, these materials and this
+    /// skeleton.
     Model(Vec<AssetId>, AssetId),
     /// The same key as `deps[0]`, whose result it shares.
     Same,
@@ -413,6 +421,14 @@ impl<'m, 's> Run<'m, 's> {
                 let units = mesh_units(name, mesh, materials, settings)?;
                 self.add_units(a, index, units);
             }
+            Source::Subd {
+                cage,
+                materials,
+                settings,
+            } => {
+                let units = subd_units(name, cage, materials, settings)?;
+                self.add_units(a, index, units);
+            }
             Source::Material(patch) => {
                 let mut m = Material::default();
                 patch.apply(&mut m);
@@ -558,9 +574,12 @@ impl<'m, 's> Run<'m, 's> {
             if class == Class::InstancePage as u16 {
                 entries.sort_by_key(|&e| instances::page_order(&name, arc.name(&arc.entries()[e])));
             }
-            let mesh = (class == Class::Mesh as u16)
-                .then(|| mesh_facts(arc, &arc.entries()[entries[0]]))
-                .flatten();
+            let e = &arc.entries()[entries[0]];
+            let mesh = match Class::from_u16(class) {
+                Some(Class::Mesh) => mesh_facts(arc, e),
+                Some(Class::Subd) => subd_facts(arc, e),
+                _ => None,
+            };
             (entries, mesh)
         })?;
         let memory = match &from {
@@ -741,7 +760,9 @@ impl<'m, 's> Run<'m, 's> {
                         model: p.model.clone(),
                     })?;
                 key = key.hash(self.units[model].key);
-                meshes.push((p.model.clone(), self.mesh_of(model, &by_id)?));
+                for part in self.parts_of(model, &by_id)? {
+                    meshes.push((p.model.clone(), part));
+                }
                 for s in &p.sections {
                     if let Some(m) = &s.material {
                         let u = self
@@ -757,6 +778,9 @@ impl<'m, 's> Run<'m, 's> {
                     }
                 }
             }
+            // Prototypes may share a model; each model's parts join once.
+            meshes.sort_unstable();
+            meshes.dedup();
             let mut deps: Vec<usize> = meshes.iter().map(|m| m.1).collect();
             deps.sort_unstable();
             deps.dedup();
@@ -782,28 +806,31 @@ impl<'m, 's> Run<'m, 's> {
         Ok(())
     }
 
-    /// The mesh unit of a model unit.
-    fn mesh_of(&self, model: usize, by_id: &HashMap<AssetId, usize>) -> Result<usize> {
+    /// The mesh and subdivision cage units of a model unit.
+    fn parts_of(&self, model: usize, by_id: &HashMap<AssetId, usize>) -> Result<Vec<usize>> {
         let u = &self.units[model];
         if let Some(Work::Model(..)) = &u.work {
-            return Ok(u.deps[0]);
+            return Ok(u.deps.clone());
         }
         let State::Done(d) = &u.state else {
             unreachable!("a model unit without work is linked");
         };
-        let mesh = self.with_archive(u.archive, &d.from, |arc| {
+        let header = self.with_archive(u.archive, &d.from, |arc| {
             let e = &arc.entries()[d.entries[0]];
             let mut head = vec![0; arc.blobs(e)[0].raw_len as usize];
             arc.read(&arc.blobs(e)[0], &mut head)?;
-            Ok::<_, Error>(ModelInfo::parse(&head)?.header.mesh)
+            Ok::<_, Error>(ModelInfo::parse(&head)?.header)
         })??;
-        by_id
-            .get(&mesh)
-            .copied()
-            .ok_or_else(|| Error::UnknownModel {
-                asset: u.name.clone(),
-                model: format!("mesh {mesh}"),
+        [header.mesh, header.subd]
+            .into_iter()
+            .filter(|&id| id != AssetId::NONE)
+            .map(|id| {
+                by_id.get(&id).copied().ok_or_else(|| Error::UnknownModel {
+                    asset: u.name.clone(),
+                    model: format!("geometry {id}"),
+                })
             })
+            .collect()
     }
 
     /// Links every unit whose key is in the replaced archive or the cache; the others wait
@@ -1034,7 +1061,10 @@ impl<'m, 's> Run<'m, 's> {
         if let Work::Instances(_, _, catalog, meshes) = &mut work {
             for (model, mesh) in meshes.drain(..) {
                 if let Some((_, facts)) = self.units[mesh].mesh {
-                    catalog.insert(model, facts);
+                    catalog
+                        .entry(model)
+                        .and_modify(|f| *f = f.join(facts))
+                        .or_insert(facts);
                 }
             }
         }
@@ -1077,16 +1107,28 @@ impl<'m, 's> Run<'m, 's> {
             }
             _ => unreachable!("only models and shared results finish here"),
         };
-        let mesh = self.units[u].deps[0];
-        let (bounds, _) = self.units[mesh]
-            .mesh
-            .ok_or(orr_pack::Error::Malformed("mesh header"))?;
+        let mut bounds = Aabb::EMPTY;
+        let (mut mesh, mut subd) = (AssetId::NONE, AssetId::NONE);
+        for &part in &self.units[u].deps {
+            let (b, _) = self.units[part]
+                .mesh
+                .ok_or(orr_pack::Error::Malformed("geometry header"))?;
+            bounds.extend(b.min);
+            bounds.extend(b.max);
+            let id = AssetId::from_name(&self.units[part].name);
+            if self.units[part].class == Class::Subd as u16 {
+                subd = id;
+            } else {
+                mesh = id;
+            }
+        }
         let bytes = ModelInfo {
             header: ModelHeader {
                 kind: ModelHeader::MODEL,
                 _pad: [0; 3],
                 bounds,
-                mesh: AssetId::from_name(&self.units[mesh].name),
+                mesh,
+                subd,
                 skeleton,
                 materials: Span::default(),
             },
@@ -1233,6 +1275,21 @@ fn mesh_facts(a: &Archive, e: &orr_pack::Entry) -> Option<(Aabb, ModelFacts)> {
     ))
 }
 
+fn subd_facts(a: &Archive, e: &orr_pack::Entry) -> Option<(Aabb, ModelFacts)> {
+    let b = a.blobs(e).first()?;
+    let mut head = vec![0; b.raw_len as usize];
+    a.read(b, &mut head).ok()?;
+    let info = orr_pack::subd::SubdInfo::parse(&head).ok()?;
+    Some((
+        info.header.bounds,
+        ModelFacts {
+            instances: 1,
+            sections: info.sections.len() as u32,
+            position_exponent: i8::MIN,
+        },
+    ))
+}
+
 /// Estimated peak of a texture cook: 64 B per source texel when the header gives the size.
 fn texture_file_working_set(path: &Path) -> u64 {
     image::ImageReader::open(path)
@@ -1339,9 +1396,9 @@ fn plan_scene(name: &str, mut src: Scene, rules: &TextureRules) -> Result<Import
     // geometry holds.
     let mut baked: HashMap<usize, (AssetId, Hash32)> = HashMap::new();
     for model in src.models {
-        let (model_name, mesh_name) = match &model.node {
-            None => (name.to_string(), format!("{name}/mesh")),
-            Some(n) => (format!("{name}/{n}"), format!("{name}/{n}/mesh")),
+        let model_name = match &model.node {
+            None => name.to_string(),
+            Some(n) => format!("{name}/{n}"),
         };
         let mut mesh = model.mesh;
         let mut deps = Vec::new();
@@ -1379,12 +1436,29 @@ fn plan_scene(name: &str, mut src: Scene, rules: &TextureRules) -> Result<Import
         let skeleton = model
             .skeleton
             .map_or((AssetId::NONE, None), |s| skeletons[s]);
-        units.extend(mesh_and_model(
-            model_name,
-            mesh_name,
+        let mesh = (!mesh.sections.is_empty()).then(|| MeshPart {
+            name: format!("{model_name}/mesh"),
             mesh,
-            model.settings,
+            settings: model.settings,
             deps,
+        });
+        let subd = model.subd.map(|c| {
+            model_materials.extend(
+                c.materials
+                    .iter()
+                    .map(|&mi| (materials[mi].0, materials[mi].1)),
+            );
+            SubdPart {
+                name: format!("{model_name}/subd"),
+                cage: c.cage,
+                materials: c.materials.iter().map(|&mi| materials[mi].2).collect(),
+                settings: c.settings,
+            }
+        });
+        units.extend(model_units(
+            model_name,
+            mesh,
+            subd,
             &model_materials,
             skeleton,
         ));
@@ -1553,61 +1627,138 @@ fn mesh_units(
         }),
         min_exponent: None,
     };
-    units.extend(mesh_and_model(
-        name.into(),
-        mesh_name,
+    let part = MeshPart {
+        name: mesh_name,
         mesh,
-        settings.clone(),
-        Vec::new(),
+        settings: settings.clone(),
+        deps: Vec::new(),
+    };
+    units.extend(model_units(
+        name.into(),
+        Some(part),
+        None,
         &materials_out,
         (AssetId::NONE, None),
     ));
     Ok(units)
 }
 
-/// A mesh unit and the model unit of that mesh with these materials (id and key) and
-/// skeleton (id and key).
-fn mesh_and_model(
-    model_name: String,
-    mesh_name: String,
+/// A mesh to cook for a model: its entry name, data, settings and the units its maps read.
+struct MeshPart {
+    name: String,
     mesh: MeshData,
     settings: MeshSettings,
     deps: Vec<String>,
+}
+
+/// A subdivision cage to cook for a model: its entry name, cage, section materials and
+/// settings.
+struct SubdPart {
+    name: String,
+    cage: CageData,
+    materials: Vec<Material>,
+    settings: SubdSettings,
+}
+
+/// The mesh and cage units of a model and the model unit, with these materials (id and key,
+/// mesh sections then cage sections) and skeleton (id and key).
+fn model_units(
+    model_name: String,
+    mesh: Option<MeshPart>,
+    subd: Option<SubdPart>,
     materials: &[(AssetId, Hash32)],
     skeleton: (AssetId, Option<Hash32>),
-) -> [NewUnit; 2] {
-    let mesh_key = Key::new(Class::Mesh, &mesh_name)
-        .debug(&settings)
-        .hash(mesh.hash())
-        .finish();
-    let mut model_key = Key::new(Class::Model, &model_name).hash(mesh_key);
+) -> Vec<NewUnit> {
+    let mut units = Vec::new();
+    let mut model_key = Key::new(Class::Model, &model_name);
+    if let Some(m) = mesh {
+        let key = Key::new(Class::Mesh, &m.name)
+            .debug(&m.settings)
+            .hash(m.mesh.hash())
+            .finish();
+        model_key = model_key.hash(key);
+        let triangles = m.mesh.triangles();
+        units.push(NewUnit {
+            name: m.name,
+            class: Class::Mesh as u16,
+            key,
+            working_set: triangles * MESH_BYTES_PER_TRIANGLE,
+            triangles,
+            work: Work::Mesh(Arc::new(m.mesh), m.settings, Vec::new()),
+            deps: m.deps,
+        });
+    }
+    if let Some(c) = subd {
+        let mut key = Key::new(Class::Subd, &c.name)
+            .debug(&c.settings)
+            .hash(c.cage.hash());
+        for m in &c.materials {
+            key = key.bytes(bytemuck::bytes_of(m));
+        }
+        let key = key.finish();
+        model_key = model_key.hash(key);
+        units.push(NewUnit::leaf(
+            &c.name,
+            Class::Subd as u16,
+            key,
+            c.cage.faces() * SUBD_BYTES_PER_FACE,
+            Work::Subd(Arc::new(c.cage), c.materials, c.settings),
+        ));
+    }
     if let Some(key) = skeleton.1 {
         model_key = model_key.hash(key);
     }
     for m in materials {
         model_key = model_key.hash(m.1);
     }
-    let triangles = mesh.triangles();
-    [
-        NewUnit {
-            name: mesh_name.clone(),
-            class: Class::Mesh as u16,
-            key: mesh_key,
-            working_set: triangles * MESH_BYTES_PER_TRIANGLE,
-            triangles,
-            work: Work::Mesh(Arc::new(mesh), settings, Vec::new()),
-            deps,
+    let deps = units.iter().map(|u| u.name.clone()).collect();
+    units.push(NewUnit {
+        name: model_name,
+        class: Class::Model as u16,
+        key: model_key.finish(),
+        working_set: 0,
+        triangles: 0,
+        work: Work::Model(materials.iter().map(|m| m.0).collect(), skeleton.0),
+        deps,
+    });
+    units
+}
+
+/// A cage, its materials and a model from a library caller's cage.
+fn subd_units(
+    name: &str,
+    cage: &CageInput,
+    materials: &[Material],
+    settings: &SubdSettings,
+) -> Result<Vec<NewUnit>> {
+    subd::check(cage, materials.len()).map_err(|message| Error::Mesh {
+        asset: name.into(),
+        message,
+    })?;
+    let mut units = Vec::new();
+    let mut ids = Vec::new();
+    for (i, m) in materials.iter().enumerate() {
+        let unit = material_unit(format!("{name}/material/{i}"), m);
+        ids.push((AssetId::from_name(&unit.name), unit.key));
+        units.push(unit);
+    }
+    let part = SubdPart {
+        name: format!("{name}/subd"),
+        cage: CageData {
+            cage: cage.clone(),
+            skin: None,
         },
-        NewUnit {
-            name: model_name,
-            class: Class::Model as u16,
-            key: model_key.finish(),
-            working_set: 0,
-            triangles: 0,
-            work: Work::Model(materials.iter().map(|m| m.0).collect(), skeleton.0),
-            deps: vec![mesh_name],
-        },
-    ]
+        materials: materials.to_vec(),
+        settings: settings.clone(),
+    };
+    units.extend(model_units(
+        name.into(),
+        None,
+        Some(part),
+        &ids,
+        (AssetId::NONE, None),
+    ));
+    Ok(units)
 }
 
 /// One channel of every mip (all of them, or mip 0 only) of a cooked texture entry.
@@ -1703,6 +1854,17 @@ fn cook_unit(
             let bytes = state::read_checked(&path, hash)?;
             let built = texture::cook_file(name, &bytes, &settings)?;
             texture::add(&mut w, name, key, &built)?;
+        }
+        Work::Subd(data, materials, settings) => {
+            let cooked =
+                subd::cook(&data, &materials, &settings).map_err(|message| Error::Mesh {
+                    asset: name.into(),
+                    message,
+                })?;
+            let info = cooked.info.to_bytes();
+            let mut blobs = vec![mount(&info)];
+            blobs.extend(cooked.pages.iter().map(|p| BlobIn::new(p)));
+            w.add(name, class, orr_pack::subd::SCHEMA, key, &blobs)?;
         }
         Work::Model(..) | Work::Same => unreachable!("finished on the coordinator"),
         Work::Instances(src, cell_log2, catalog, _) => {

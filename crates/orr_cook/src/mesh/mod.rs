@@ -197,22 +197,27 @@ pub(crate) struct SectionData {
     pub maps: MapSpec,
 }
 
+/// [`Section`] flags of a section drawn with material `m`.
+pub(crate) fn section_flags(m: &Material) -> u8 {
+    let mut flags = 0;
+    if m.alpha_mode == Material::MASK {
+        flags |= Section::ALPHA_TESTED;
+    }
+    if m.double_sided != 0 {
+        flags |= Section::DOUBLE_SIDED;
+    }
+    if m.emits() {
+        flags |= Section::EMISSIVE;
+    }
+    flags
+}
+
 impl SectionData {
     /// A section of `indices` drawn with material `m`.
     pub(crate) fn new(indices: Range<usize>, m: &Material, maps: MapSpec) -> Self {
-        let mut flags = 0;
-        if m.alpha_mode == Material::MASK {
-            flags |= Section::ALPHA_TESTED;
-        }
-        if m.double_sided != 0 {
-            flags |= Section::DOUBLE_SIDED;
-        }
-        if m.emits() {
-            flags |= Section::EMISSIVE;
-        }
         Self {
             indices,
-            flags,
+            flags: section_flags(m),
             subsurface: m.subsurface_weight > 0.0
                 && m.thin_walled == 0
                 && m.transmission_weight == 0.0,

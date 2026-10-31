@@ -887,6 +887,20 @@ fn usd_set_cooks() {
             count(Class::InstancePage),
             count(Class::Clip),
         );
+        #[cfg(feature = "subd")]
+        {
+            let cages = UsdSettings {
+                subdivision: orr_cook::Subdivision::Cage,
+                ..UsdSettings::default()
+            };
+            let (a, _) = usd(&s, cages).unwrap_or_else(|e| panic!("{} as cages: {e}", s.display()));
+            let n = a
+                .entries()
+                .iter()
+                .filter(|e| e.class == Class::Subd as u16)
+                .count();
+            println!("{}: {n} subdivision cages", s.display());
+        }
     }
 }
 
@@ -968,4 +982,188 @@ fn materialx_documents_map_one_material() {
         Err(e) => e.to_string(),
     };
     assert!(e.contains("noise (noise3d)"), "{e}");
+}
+
+#[cfg(feature = "subd")]
+const CAGE: &str = r#"#usda 1.0
+(
+    upAxis = "Z"
+    metersPerUnit = 0.01
+)
+
+def Xform "World"
+{
+    def Mesh "Box"
+    {
+        int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+        int[] faceVertexIndices = [0, 2, 3, 1, 4, 5, 7, 6, 0, 1, 5, 4, 2, 6, 7, 3, 0, 4, 6, 2, 1, 3, 7, 5]
+        point3f[] points = [(-100, -100, -100), (100, -100, -100), (-100, 100, -100), (100, 100, -100), (-100, -100, 100), (100, -100, 100), (-100, 100, 100), (100, 100, 100)]
+        int[] creaseIndices = [0, 1, 3]
+        int[] creaseLengths = [3]
+        float[] creaseSharpnesses = [2]
+        int[] cornerIndices = [7]
+        float[] cornerSharpnesses = [10]
+        int[] holeIndices = [5]
+        token interpolateBoundary = "edgeOnly"
+        token faceVaryingLinearInterpolation = "boundaries"
+        texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1), (0.5, 0.5)] (
+            interpolation = "faceVarying"
+        )
+        int[] primvars:st:indices = [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 4, 0, 1, 2, 3]
+        rel material:binding = </World/Looks/A>
+
+        def GeomSubset "Front"
+        {
+            uniform token elementType = "face"
+            uniform token familyName = "materialBind"
+            int[] indices = [0, 1]
+            rel material:binding = </World/Looks/B>
+        }
+    }
+
+    def Mesh "Floor"
+    {
+        uniform token subdivisionScheme = "none"
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-300, -300, -200), (300, -300, -200), (300, 300, -200), (-300, 300, -200)]
+        rel material:binding = </World/Looks/A>
+    }
+
+    def Scope "Looks"
+    {
+        def Material "A"
+        {
+            token outputs:surface.connect = </World/Looks/A/S.outputs:surface>
+            def Shader "S"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (1, 0, 0)
+                token outputs:surface
+            }
+        }
+        def Material "B"
+        {
+            token outputs:surface.connect = </World/Looks/B/S.outputs:surface>
+            def Shader "S"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0, 0, 1)
+                token outputs:surface
+            }
+        }
+    }
+}
+"#;
+
+/// The limit positions and uvs of every face of a subdivision cage entry on a 3x3 grid.
+#[cfg(feature = "subd")]
+fn limit_samples(a: &Archive, name: &str) -> Vec<(u32, [f32; 3], [f32; 2])> {
+    use orr_pack::subd::{Page, SubdInfo};
+    let info = SubdInfo::parse(&blob(a, name, 0)).unwrap();
+    let mut out = Vec::new();
+    for p in &info.pages {
+        let page = Page::parse(&blob(a, name, p.blob as usize)).unwrap();
+        let (points, uvs) = (page.points(&info.points), page.uv_points(&info.uvs));
+        for (f, face) in page.faces.iter().enumerate() {
+            for u in [0.0, 0.5, 1.0] {
+                for v in [0.0, 0.5, 1.0] {
+                    let l = page.limit(f, u, v, &points).unwrap();
+                    out.push((face.ptex, l.position, page.limit_uv(f, u, v, &uvs).unwrap()));
+                }
+            }
+        }
+    }
+    out.sort_by_key(|s| s.0);
+    out
+}
+
+#[cfg(feature = "subd")]
+#[test]
+fn usd_cages_cook_the_surface_of_the_same_cage_built_in_memory() {
+    use orr_cook::{Boundary, CageInput, Corner, Crease, FaceVarying, Subdivision, UvLinear};
+    use orr_math::{Vec2, Vec3};
+    let d = dir("usd-cage");
+    std::fs::write(d.join("cage.usda"), CAGE).unwrap();
+    let settings = UsdSettings {
+        subdivision: Subdivision::Cage,
+        ..UsdSettings::default()
+    };
+    let (a, _) = usd(&d.join("cage.usda"), settings).unwrap();
+
+    // One model: the floor's mesh, then the box's cage, their sections in that order.
+    let model = ModelInfo::parse(&blob(&a, "u", 0)).unwrap();
+    assert_eq!(model.header.mesh, AssetId::from_name("u/mesh"));
+    assert_eq!(model.header.subd, AssetId::from_name("u/subd"));
+    let (la, lb) = (
+        AssetId::from_name("u/material/World/Looks/A"),
+        AssetId::from_name("u/material/World/Looks/B"),
+    );
+    assert_eq!(model.materials, [la, la, lb]);
+
+    // The same cage in scene space (Y up, meters), uvs with v flipped.
+    let points = [-1.0f32, 1.0];
+    let positions = (0..8)
+        .map(|i| {
+            let p = [points[i & 1], points[(i >> 1) & 1], points[(i >> 2) & 1]];
+            Vec3::new(p[0], p[2], -p[1])
+        })
+        .collect();
+    let st = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.5, 0.5]];
+    let corners: [u32; 24] = [
+        0, 2, 3, 1, 4, 5, 7, 6, 0, 1, 5, 4, 2, 6, 7, 3, 0, 4, 6, 2, 1, 3, 7, 5,
+    ];
+    let mut uv_indices = [0, 1, 2, 3].repeat(6);
+    uv_indices[19] = 4;
+    let cage = CageInput {
+        positions,
+        face_counts: vec![4; 6],
+        face_indices: corners.to_vec(),
+        face_sections: vec![1, 1, 0, 0, 0, 0],
+        creases: vec![
+            Crease {
+                edge: [0, 1],
+                sharpness: 2.0,
+            },
+            Crease {
+                edge: [1, 3],
+                sharpness: 2.0,
+            },
+        ],
+        corners: vec![Corner {
+            point: 7,
+            sharpness: 10.0,
+        }],
+        holes: vec![5],
+        uvs: Some(FaceVarying {
+            values: st.iter().map(|&[u, v]| Vec2::new(u, 1.0 - v)).collect(),
+            indices: uv_indices,
+        }),
+        left_handed: false,
+        boundary: Boundary::Edges,
+        uv_linear: UvLinear::Boundaries,
+        smooth_triangles: false,
+    };
+    let (b, _) = cook_one(Source::Subd {
+        cage,
+        materials: vec![
+            material(&a, "u/material/World/Looks/A"),
+            material(&a, "u/material/World/Looks/B"),
+        ],
+        settings: Default::default(),
+    })
+    .unwrap();
+    let (usd, built) = (limit_samples(&a, "u/subd"), limit_samples(&b, "u/subd"));
+    assert_eq!(usd.len(), 5 * 9, "the hole cooks no face");
+    for (x, y) in usd.iter().zip(&built) {
+        assert_eq!(x.0, y.0);
+        assert!(
+            (0..3).all(|k| (x.1[k] - y.1[k]).abs() < 1e-6),
+            "{x:?} {y:?}"
+        );
+        assert!(
+            (0..2).all(|k| (x.2[k] - y.2[k]).abs() < 1e-6),
+            "{x:?} {y:?}"
+        );
+    }
 }

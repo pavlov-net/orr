@@ -72,6 +72,7 @@ impl Manifest {
                     Source::Instances(_)
                     | Source::User { .. }
                     | Source::Mesh { .. }
+                    | Source::Subd { .. }
                     | Source::Material(_) => {}
                 }
             }
