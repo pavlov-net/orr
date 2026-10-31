@@ -1,4 +1,4 @@
-use crate::raw::{FgInputs, Image, RrInputs, Vulkan};
+use crate::raw::{FgInputs, Image, RrInputs, SrInputs, Upscaler, Vulkan};
 use crate::sys::*;
 use crate::{DlssError, Quality, Support, Uuid};
 use ash::vk::{self, Handle, TaggedStructure};
@@ -380,12 +380,26 @@ impl Ngx {
         &self,
         output: [u32; 2],
         quality: Quality,
+        upscaler: Upscaler,
     ) -> Result<[u32; 2], DlssError> {
         if quality == Quality::Dlaa {
             return Ok(output);
         }
-        if !self.support().rr {
-            return Err(DlssError::Unsupported("ray reconstruction"));
+        let support = self.support();
+        let (available, callback, call): (bool, &[u8], _) = match upscaler {
+            Upscaler::Rr => (
+                support.rr,
+                NVSDK_NGX_Parameter_DLSSDOptimalSettingsCallback,
+                "DLSSDOptimalSettingsCallback",
+            ),
+            Upscaler::Sr => (
+                support.sr,
+                NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback,
+                "DLSSOptimalSettingsCallback",
+            ),
+        };
+        if !available {
+            return Err(DlssError::Unsupported(upscaler.name()));
         }
         // SAFETY: as in `get_i`; the optimal-settings callback reads these keys.
         unsafe {
@@ -399,9 +413,9 @@ impl Ngx {
             NVSDK_NGX_Parameter_SetI(self.caps, key(NVSDK_NGX_Parameter_RTXValue), 0);
         }
         let r = self
-            .callback(NVSDK_NGX_Parameter_DLSSDOptimalSettingsCallback)
-            .ok_or(DlssError::Unsupported("ray reconstruction"))?;
-        check("DLSSDOptimalSettingsCallback", r)?;
+            .callback(callback)
+            .ok_or(DlssError::Unsupported(upscaler.name()))?;
+        check(call, r)?;
         Ok([
             self.get_ui(NVSDK_NGX_Parameter_OutWidth),
             self.get_ui(NVSDK_NGX_Parameter_OutHeight),
@@ -420,6 +434,15 @@ impl Drop for Ngx {
     }
 }
 
+impl Upscaler {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Rr => "ray reconstruction",
+            Self::Sr => "super resolution",
+        }
+    }
+}
+
 fn perf_quality(quality: Quality) -> NVSDK_NGX_PerfQuality_Value {
     match quality {
         Quality::Dlaa => NVSDK_NGX_PerfQuality_Value_NVSDK_NGX_PerfQuality_Value_DLAA,
@@ -432,16 +455,31 @@ fn perf_quality(quality: Quality) -> NVSDK_NGX_PerfQuality_Value {
     }
 }
 
-fn preset_key(quality: Quality) -> &'static [u8] {
-    match quality {
-        Quality::Dlaa => NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA,
-        Quality::Quality => NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality,
-        Quality::Balanced => NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced,
-        Quality::Performance => {
+fn preset_key(upscaler: Upscaler, quality: Quality) -> &'static [u8] {
+    match (upscaler, quality) {
+        (Upscaler::Rr, Quality::Dlaa) => {
+            NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA
+        }
+        (Upscaler::Rr, Quality::Quality) => {
+            NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality
+        }
+        (Upscaler::Rr, Quality::Balanced) => {
+            NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced
+        }
+        (Upscaler::Rr, Quality::Performance) => {
             NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance
         }
-        Quality::UltraPerformance => {
+        (Upscaler::Rr, Quality::UltraPerformance) => {
             NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance
+        }
+        (Upscaler::Sr, Quality::Dlaa) => NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA,
+        (Upscaler::Sr, Quality::Quality) => NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
+        (Upscaler::Sr, Quality::Balanced) => NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced,
+        (Upscaler::Sr, Quality::Performance) => {
+            NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance
+        }
+        (Upscaler::Sr, Quality::UltraPerformance) => {
+            NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance
         }
     }
 }
@@ -477,25 +515,40 @@ fn resource(image: &Image, read_write: bool) -> NVSDK_NGX_Resource_VK {
     r
 }
 
-pub(crate) struct Rr {
+/// A ray reconstruction or super resolution feature.
+pub(crate) struct Upscale {
+    upscaler: Upscaler,
     handle: *mut NVSDK_NGX_Handle,
     params: *mut NVSDK_NGX_Parameter,
     resources: [NVSDK_NGX_Resource_VK; SLOTS],
 }
 
+/// The most images one evaluate binds: the eleven of ray reconstruction.
 const SLOTS: usize = 11;
 
-impl Rr {
+impl Upscale {
     pub(crate) unsafe fn new(
         ngx: &Ngx,
         cmd: vk::CommandBuffer,
+        upscaler: Upscaler,
         render: [u32; 2],
         output: [u32; 2],
         quality: Quality,
         preset: Option<u32>,
     ) -> Result<Self, DlssError> {
-        if !ngx.support().rr {
-            return Err(DlssError::Unsupported("ray reconstruction"));
+        let support = ngx.support();
+        let (available, feature) = match upscaler {
+            Upscaler::Rr => (
+                support.rr,
+                NVSDK_NGX_Feature_NVSDK_NGX_Feature_RayReconstruction,
+            ),
+            Upscaler::Sr => (
+                support.sr,
+                NVSDK_NGX_Feature_NVSDK_NGX_Feature_SuperSampling,
+            ),
+        };
+        if !available {
+            return Err(DlssError::Unsupported(upscaler.name()));
         }
         let mut params = ptr::null_mut();
         // SAFETY: NGX is initialised.
@@ -519,26 +572,28 @@ impl Rr {
             i(NVSDK_NGX_Parameter_PerfQualityValue, perf_quality(quality));
             i(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, flags);
             i(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
-            i(
-                NVSDK_NGX_Parameter_DLSS_Denoise_Mode,
-                NVSDK_NGX_DLSS_Denoise_Mode_NVSDK_NGX_DLSS_Denoise_Mode_DLUnified,
-            );
-            ui(
-                NVSDK_NGX_Parameter_DLSS_Roughness_Mode,
-                NVSDK_NGX_DLSS_Roughness_Mode_NVSDK_NGX_DLSS_Roughness_Mode_Packed as u32,
-            );
-            ui(
-                NVSDK_NGX_Parameter_Use_HW_Depth,
-                NVSDK_NGX_DLSS_Depth_Type_NVSDK_NGX_DLSS_Depth_Type_HW as u32,
-            );
+            if upscaler == Upscaler::Rr {
+                i(
+                    NVSDK_NGX_Parameter_DLSS_Denoise_Mode,
+                    NVSDK_NGX_DLSS_Denoise_Mode_NVSDK_NGX_DLSS_Denoise_Mode_DLUnified,
+                );
+                ui(
+                    NVSDK_NGX_Parameter_DLSS_Roughness_Mode,
+                    NVSDK_NGX_DLSS_Roughness_Mode_NVSDK_NGX_DLSS_Roughness_Mode_Packed as u32,
+                );
+                ui(
+                    NVSDK_NGX_Parameter_Use_HW_Depth,
+                    NVSDK_NGX_DLSS_Depth_Type_NVSDK_NGX_DLSS_Depth_Type_HW as u32,
+                );
+            }
             if let Some(preset) = preset {
-                ui(preset_key(quality), preset);
+                ui(preset_key(upscaler, quality), preset);
             }
             // Names the device: NGX refuses to guess once several devices have it running.
             NVSDK_NGX_VULKAN_CreateFeature1(
                 ngx.device.as_raw() as usize as VkDevice,
                 cmd.as_raw() as usize as VkCommandBuffer,
-                NVSDK_NGX_Feature_NVSDK_NGX_Feature_RayReconstruction,
+                feature,
                 params,
                 &mut handle,
             )
@@ -549,6 +604,7 @@ impl Rr {
             return Err(e);
         }
         Ok(Self {
+            upscaler,
             handle,
             params,
             // SAFETY: plain C structs; each is written before NGX reads it.
@@ -556,12 +612,13 @@ impl Rr {
         })
     }
 
-    pub(crate) unsafe fn record(
+    pub(crate) unsafe fn record_rr(
         &mut self,
         cmd: vk::CommandBuffer,
         inputs: &RrInputs<'_>,
         render: [u32; 2],
     ) -> Result<(), DlssError> {
+        assert_eq!(self.upscaler, Upscaler::Rr);
         let slots: [(&[u8], Option<&Image>, bool); SLOTS] = [
             (NVSDK_NGX_Parameter_Color, Some(inputs.color), false),
             (NVSDK_NGX_Parameter_Output, Some(inputs.output), true),
@@ -607,11 +664,74 @@ impl Rr {
                 false,
             ),
         ];
+        // SAFETY: forwarded from the caller.
+        unsafe { self.evaluate(cmd, &slots, inputs.jitter, inputs.reset, render, |_| {}) }
+    }
+
+    pub(crate) unsafe fn record_sr(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        inputs: &SrInputs<'_>,
+        render: [u32; 2],
+    ) -> Result<(), DlssError> {
+        assert_eq!(self.upscaler, Upscaler::Sr);
+        let slots: [(&[u8], Option<&Image>, bool); 5] = [
+            (NVSDK_NGX_Parameter_Color, Some(inputs.color), false),
+            (NVSDK_NGX_Parameter_Output, Some(inputs.output), true),
+            (NVSDK_NGX_Parameter_Depth, Some(inputs.depth), false),
+            (
+                NVSDK_NGX_Parameter_MotionVectors,
+                Some(inputs.motion),
+                false,
+            ),
+            (
+                NVSDK_NGX_Parameter_ExposureTexture,
+                Some(inputs.exposure),
+                false,
+            ),
+        ];
+        let pre_exposure = inputs.pre_exposure;
+        let exposure_values = |p: *mut NVSDK_NGX_Parameter| {
+            // SAFETY: `evaluate` passes this feature's live map.
+            unsafe {
+                NVSDK_NGX_Parameter_SetF(p, key(NVSDK_NGX_Parameter_Sharpness), 0.0);
+                NVSDK_NGX_Parameter_SetF(
+                    p,
+                    key(NVSDK_NGX_Parameter_DLSS_Pre_Exposure),
+                    pre_exposure,
+                );
+                NVSDK_NGX_Parameter_SetF(p, key(NVSDK_NGX_Parameter_DLSS_Exposure_Scale), 1.0);
+            }
+        };
+        // SAFETY: forwarded from the caller.
+        unsafe {
+            self.evaluate(
+                cmd,
+                &slots,
+                inputs.jitter,
+                inputs.reset,
+                render,
+                exposure_values,
+            )
+        }
+    }
+
+    /// Binds `slots` (name, image, written) and the values every upscaler takes each frame,
+    /// runs `extra` on the map, and records the evaluate.
+    unsafe fn evaluate(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        slots: &[(&[u8], Option<&Image>, bool)],
+        jitter: [f32; 2],
+        reset: bool,
+        render: [u32; 2],
+        extra: impl FnOnce(*mut NVSDK_NGX_Parameter),
+    ) -> Result<(), DlssError> {
         let p = self.params;
         // SAFETY: `params` is this feature's map; the resource array lives in `self` and is not
         // touched until the next call; `cmd` is recording on NGX's device (caller).
         let r = unsafe {
-            for (slot, &(name, image, rw)) in self.resources.iter_mut().zip(&slots) {
+            for (slot, &(name, image, rw)) in self.resources.iter_mut().zip(slots) {
                 let value = match image {
                     Some(image) => {
                         *slot = resource(image, rw);
@@ -621,19 +741,11 @@ impl Rr {
                 };
                 NVSDK_NGX_Parameter_SetVoidPointer(p, key(name), value);
             }
-            NVSDK_NGX_Parameter_SetF(
-                p,
-                key(NVSDK_NGX_Parameter_Jitter_Offset_X),
-                inputs.jitter[0],
-            );
-            NVSDK_NGX_Parameter_SetF(
-                p,
-                key(NVSDK_NGX_Parameter_Jitter_Offset_Y),
-                inputs.jitter[1],
-            );
+            NVSDK_NGX_Parameter_SetF(p, key(NVSDK_NGX_Parameter_Jitter_Offset_X), jitter[0]);
+            NVSDK_NGX_Parameter_SetF(p, key(NVSDK_NGX_Parameter_Jitter_Offset_Y), jitter[1]);
             NVSDK_NGX_Parameter_SetF(p, key(NVSDK_NGX_Parameter_MV_Scale_X), render[0] as f32);
             NVSDK_NGX_Parameter_SetF(p, key(NVSDK_NGX_Parameter_MV_Scale_Y), render[1] as f32);
-            NVSDK_NGX_Parameter_SetI(p, key(NVSDK_NGX_Parameter_Reset), i32::from(inputs.reset));
+            NVSDK_NGX_Parameter_SetI(p, key(NVSDK_NGX_Parameter_Reset), i32::from(reset));
             NVSDK_NGX_Parameter_SetUI(
                 p,
                 key(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width),
@@ -644,6 +756,7 @@ impl Rr {
                 key(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height),
                 render[1],
             );
+            extra(p);
             NVSDK_NGX_VULKAN_EvaluateFeature_C(
                 cmd.as_raw() as usize as VkCommandBuffer,
                 self.handle,
@@ -655,7 +768,7 @@ impl Rr {
     }
 }
 
-impl Drop for Rr {
+impl Drop for Upscale {
     fn drop(&mut self) {
         // SAFETY: the caller of `new` drops the feature after the GPU is done with it.
         unsafe {

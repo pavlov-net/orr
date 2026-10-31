@@ -27,7 +27,7 @@ const SKY: &str = "sky";
 const FIRST_FRAME: u64 = 500;
 pub const FOV_Y: f32 = 0.8;
 /// Unit direction to the sun.
-const SUN: Vec3 = Vec3::new(-0.453_413_4, 0.654_930_5, 0.604_551_3);
+pub const SUN: Vec3 = Vec3::new(-0.453_413_4, 0.654_930_5, 0.604_551_3);
 /// Lux, linear Rec.709.
 const SUN_ILLUMINANCE: Vec3 = Vec3::new(100_000.0, 95_000.0, 88_000.0);
 /// The sun's angular radius, radians.

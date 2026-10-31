@@ -1,5 +1,5 @@
-//! NGX on an orr-gpu device: device hooks, initialization, and ray reconstruction and frame
-//! generation recorded into orr command lists.
+//! NGX on an orr-gpu device: device hooks, initialization, and ray reconstruction, super
+//! resolution and frame generation recorded into orr command lists.
 
 use std::ffi::CString;
 use std::mem::ManuallyDrop;
@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use ash::vk;
 use orr_gpu::vulkan::{self, Features};
-use orr_gpu::{Allocation, CommandList, Device, DeviceHooks, QueueKind, Texture};
+use orr_gpu::{
+    Allocation, CommandList, Device, DeviceHooks, Format, Hazards, MemoryKind, QueueKind, Stages,
+    Texture, TextureDesc, TextureMemory, TextureRegion, TextureUsage,
+};
 
 use crate::raw::FgCamera;
 use crate::{DlssError, Quality, Support, Uuid, raw};
@@ -128,6 +131,77 @@ impl DlssSdk {
     }
 }
 
+/// An NGX feature on the SDK's device. Dropping it releases the feature once everything
+/// submitted before the drop has completed.
+struct Owned<T: 'static> {
+    inner: Option<Locked<T>>,
+    ngx: Arc<NgxInstance>,
+    gpu: Device,
+}
+
+impl<T: 'static> Owned<T> {
+    /// Records `before` and then `create` into a Render-queue list, submits it and waits.
+    fn create(
+        sdk: &DlssSdk,
+        before: impl FnOnce(&mut CommandList<'_>),
+        create: impl FnOnce(&raw::Ngx, vk::CommandBuffer) -> Result<T, DlssError>,
+    ) -> Result<Self, DlssError> {
+        let queue = sdk
+            .gpu
+            .queue(QueueKind::Render)
+            .expect("the Render queue always exists");
+        let mut list = queue.command_list()?;
+        before(&mut list);
+        let inner = {
+            let cmd = list.vulkan_raw();
+            let _ngx = ngx_lock();
+            create(&sdk.ngx.0.0, cmd.buffer)?
+        };
+        let owned = Self {
+            inner: Some(Locked(inner)),
+            ngx: Arc::clone(&sdk.ngx),
+            gpu: sdk.gpu.clone(),
+        };
+        let done = queue.submit(vec![list], &[])?;
+        queue.wait(done, CREATE_TIMEOUT)?;
+        Ok(owned)
+    }
+
+    fn get(&self) -> &T {
+        &self.inner.as_ref().expect("released on drop only").0
+    }
+
+    /// The feature, and the raw buffer of `cmd`, which must record on the feature's device.
+    fn record_on(&mut self, cmd: &mut CommandList<'_>, what: &str) -> (&mut T, vk::CommandBuffer) {
+        let device = vulkan::raw_device(&self.gpu).device.handle();
+        let raw_cmd = cmd.vulkan_raw();
+        assert_eq!(
+            raw_cmd.device.handle(),
+            device,
+            "{what} records on its SDK's device"
+        );
+        let buffer = raw_cmd.buffer;
+        let inner = &mut self.inner.as_mut().expect("released on drop only").0;
+        (inner, buffer)
+    }
+}
+
+impl<T: 'static> Drop for Owned<T> {
+    fn drop(&mut self) {
+        let inner = self.inner.take();
+        let ngx = Arc::clone(&self.ngx);
+        vulkan::defer_after_submitted(&self.gpu, move || {
+            {
+                let _ngx = ngx_lock();
+                // Locals drop in reverse order: the feature goes before the lock.
+                let _feature = inner;
+            }
+            // Shutting NGX down takes the lock itself.
+            drop(ngx);
+        });
+    }
+}
+
 /// Ray reconstruction inputs at render resolution and the output at output resolution.
 /// Every texture is 2D with one mip and one layer, and has sampled or storage usage.
 #[derive(Clone, Copy)]
@@ -160,11 +234,7 @@ pub struct RrInputs<'a> {
 ///
 /// Dropping it releases NGX's feature once everything submitted before the drop has
 /// completed.
-pub struct RayReconstruction {
-    inner: Option<Locked<raw::RayReconstruction>>,
-    ngx: Arc<NgxInstance>,
-    gpu: Device,
-}
+pub struct RayReconstruction(Owned<raw::RayReconstruction>);
 
 impl RayReconstruction {
     /// Creates the feature. NGX's setup commands run on the Render queue, and this waits for
@@ -176,52 +246,40 @@ impl RayReconstruction {
         quality: Quality,
         preset: Option<u32>,
     ) -> Result<Self, DlssError> {
-        let queue = sdk
-            .gpu
-            .queue(QueueKind::Render)
-            .expect("the Render queue always exists");
-        let mut list = queue.command_list()?;
-        let inner = {
-            let cmd = list.vulkan_raw();
-            let _ngx = ngx_lock();
+        Owned::create(
+            sdk,
+            |_| {},
             // SAFETY: `cmd` records on the Render queue of NGX's device. The feature is
             // released through the device's garbage list, after the GPU has finished every
             // submit before the drop and before NGX shuts down (it holds the instance).
-            unsafe {
-                raw::RayReconstruction::new(&sdk.ngx.0.0, cmd.buffer, output, quality, preset)?
-            }
-        };
-        let rr = Self {
-            inner: Some(Locked(inner)),
-            ngx: Arc::clone(&sdk.ngx),
-            gpu: sdk.gpu.clone(),
-        };
-        let done = queue.submit(vec![list], &[])?;
-        queue.wait(done, CREATE_TIMEOUT)?;
-        Ok(rr)
-    }
-
-    fn raw(&self) -> &raw::RayReconstruction {
-        &self.inner.as_ref().expect("released on drop only").0
+            |ngx, cmd| unsafe { raw::RayReconstruction::new(ngx, cmd, output, quality, preset) },
+        )
+        .map(Self)
     }
 
     /// Render resolution, fixed for the feature's lifetime.
     pub fn render_size(&self) -> [u32; 2] {
-        self.raw().render_size()
+        self.0.get().render_size()
     }
 
     pub fn output_size(&self) -> [u32; 2] {
-        self.raw().output_size()
+        self.0.get().output_size()
     }
 
     /// NGX's jitter offset for `frame` (see [`crate::jitter`]).
     pub fn jitter(&self, frame: u64) -> [f32; 2] {
-        self.raw().jitter(frame)
+        self.0.get().jitter(frame)
     }
 
     /// Texture LOD bias for the render resolution (see [`crate::mip_bias`]).
     pub fn mip_bias(&self) -> f32 {
-        self.raw().mip_bias()
+        self.0.get().mip_bias()
+    }
+
+    /// The preset NGX applied to this feature, read from `log`: [`raw::Ngx::take_log`] from
+    /// before the feature was created.
+    pub fn applied_preset(&self, log: &[String]) -> Option<char> {
+        self.0.get().applied_preset(log)
     }
 
     /// Records the evaluation into `cmd`, a list on a compute-capable queue of the SDK's
@@ -262,15 +320,7 @@ impl RayReconstruction {
             reset: inputs.reset,
             jitter: inputs.jitter,
         };
-        let device = vulkan::raw_device(&self.gpu).device.handle();
-        let raw_cmd = cmd.vulkan_raw();
-        assert_eq!(
-            raw_cmd.device.handle(),
-            device,
-            "RR records on its SDK's device"
-        );
-        let buffer = raw_cmd.buffer;
-        let rr = &mut self.inner.as_mut().expect("released on drop only").0;
+        let (rr, buffer) = self.0.record_on(cmd, "RR");
         let _ngx = ngx_lock();
         // SAFETY: `buffer` records on NGX's device, after the classic bind `vulkan_raw`
         // recorded. orr textures stay in GENERAL and are destroyed only after the work
@@ -279,19 +329,138 @@ impl RayReconstruction {
     }
 }
 
-impl Drop for RayReconstruction {
-    fn drop(&mut self) {
-        let inner = self.inner.take();
-        let ngx = Arc::clone(&self.ngx);
-        vulkan::defer_after_submitted(&self.gpu, move || {
-            {
-                let _ngx = ngx_lock();
-                // Locals drop in reverse order: the feature goes before the lock.
-                let _feature = inner;
-            }
-            // Shutting NGX down takes the lock itself.
-            drop(ngx);
-        });
+/// Super resolution inputs at render resolution and the output at output resolution. Every
+/// texture is 2D with one mip and one layer, and has sampled or storage usage.
+#[derive(Clone, Copy)]
+pub struct SrInputs<'a> {
+    /// HDR color, multiplied by `pre_exposure`.
+    pub color: &'a Texture,
+    /// Reverse-Z device depth.
+    pub depth: &'a Texture,
+    /// Unjittered motion, previous UV minus current UV.
+    pub motion: &'a Texture,
+    /// 1x1; its first channel is the exposure that brings `color / pre_exposure` to the range
+    /// the tonemapper takes (mid gray near 0.18). `None` for color already exposed, such as
+    /// display-linear color with 1.0 at paper white: the feature binds its own texture
+    /// holding 1. Presets J and K read it; L meters the color itself.
+    pub exposure: Option<&'a Texture>,
+    /// The factor `color` was multiplied by, which NGX divides out; 1 when it was not.
+    pub pre_exposure: f32,
+    pub output: &'a Texture,
+    /// Drops the history.
+    pub reset: bool,
+    /// From [`SuperResolution::jitter`] for this frame.
+    pub jitter: [f32; 2],
+}
+
+/// One super resolution (or DLAA) feature at a fixed render and output size, for views
+/// that are not path traced.
+///
+/// Dropping it releases NGX's feature once everything submitted before the drop has
+/// completed.
+pub struct SuperResolution {
+    feature: Owned<raw::SuperResolution>,
+    /// R32F 1x1 holding 1, bound when [`SrInputs::exposure`] is `None`.
+    unit_exposure: Texture,
+}
+
+impl SuperResolution {
+    /// Creates the feature, under the same rules as [`RayReconstruction::new`]. `preset` is a
+    /// `NVSDK_NGX_DLSS_Hint_Render_Preset` value; `None` keeps NGX's default for `quality`.
+    pub fn new(
+        sdk: &DlssSdk,
+        output: [u32; 2],
+        quality: Quality,
+        preset: Option<u32>,
+    ) -> Result<Self, DlssError> {
+        let unit_exposure = sdk.gpu.create_texture(
+            &TextureDesc::d2(Format::R32Float, 1, 1, TextureUsage::SAMPLED),
+            TextureMemory::Dedicated,
+            "dlss sr unit exposure",
+        )?;
+        let mut one =
+            sdk.gpu
+                .gpu_malloc::<f32>(MemoryKind::Upload, 1, "dlss sr unit exposure upload")?;
+        one.as_mut_slice().expect("upload memory is mapped")[0] = 1.0;
+        let fill = |list: &mut CommandList<'_>| {
+            list.discard(&unit_exposure);
+            list.copy_to_texture(
+                &unit_exposure,
+                &TextureRegion::whole_mip(unit_exposure.desc(), 0),
+                one.gpu.cast(),
+            );
+            list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
+        };
+        let feature = Owned::create(
+            sdk,
+            fill,
+            // SAFETY: as in `RayReconstruction::new`.
+            |ngx, cmd| unsafe { raw::SuperResolution::new(ngx, cmd, output, quality, preset) },
+        )?;
+        Ok(Self {
+            feature,
+            unit_exposure,
+        })
+    }
+
+    /// Render resolution, fixed for the feature's lifetime.
+    pub fn render_size(&self) -> [u32; 2] {
+        self.feature.get().render_size()
+    }
+
+    pub fn output_size(&self) -> [u32; 2] {
+        self.feature.get().output_size()
+    }
+
+    /// NGX's jitter offset for `frame` (see [`crate::jitter`]).
+    pub fn jitter(&self, frame: u64) -> [f32; 2] {
+        self.feature.get().jitter(frame)
+    }
+
+    /// Texture LOD bias for the render resolution (see [`crate::mip_bias`]).
+    pub fn mip_bias(&self) -> f32 {
+        self.feature.get().mip_bias()
+    }
+
+    /// The preset NGX applied to this feature, read from `log`: [`raw::Ngx::take_log`] from
+    /// before the feature was created.
+    pub fn applied_preset(&self, log: &[String]) -> Option<char> {
+        self.feature.get().applied_preset(log)
+    }
+
+    /// Records the evaluation into `cmd`, a list on a compute-capable queue of the SDK's
+    /// device. Inputs are at [`render_size`](Self::render_size), the output at
+    /// [`output_size`](Self::output_size).
+    pub fn record(
+        &mut self,
+        cmd: &mut CommandList<'_>,
+        inputs: &SrInputs<'_>,
+    ) -> Result<(), DlssError> {
+        let color = image(inputs.color, "color")?;
+        let depth = image(inputs.depth, "depth")?;
+        let motion = image(inputs.motion, "motion")?;
+        let exposure = image(inputs.exposure.unwrap_or(&self.unit_exposure), "exposure")?;
+        assert!(
+            exposure.extent == [1, 1],
+            "the SR exposure texture is 1x1, not {:?}",
+            exposure.extent
+        );
+        let output = image(inputs.output, "output")?;
+        let raw_inputs = raw::SrInputs {
+            color: &color,
+            depth: &depth,
+            motion: &motion,
+            exposure: &exposure,
+            pre_exposure: inputs.pre_exposure,
+            output: &output,
+            reset: inputs.reset,
+            jitter: inputs.jitter,
+        };
+        let (sr, buffer) = self.feature.record_on(cmd, "SR");
+        let _ngx = ngx_lock();
+        // SAFETY: as in `RayReconstruction::record`. The unit exposure texture is dropped
+        // with the feature, after the work submitted before the drop completes.
+        unsafe { sr.record(buffer, &raw_inputs) }
     }
 }
 
@@ -331,11 +500,9 @@ pub struct FgInputs<'a> {
 /// Dropping it releases NGX's feature once everything submitted before the drop has
 /// completed.
 pub struct FrameGeneration {
-    inner: Option<Locked<raw::FrameGeneration>>,
+    feature: Owned<raw::FrameGeneration>,
     hdr: bool,
     format: vk::Format,
-    ngx: Arc<NgxInstance>,
-    gpu: Device,
 }
 
 impl FrameGeneration {
@@ -344,44 +511,28 @@ impl FrameGeneration {
     /// creating its resources on its own thread. Call it on the Render queue's owner
     /// thread.
     pub fn new(sdk: &DlssSdk, backbuffer: &Texture, hdr: bool) -> Result<Self, DlssError> {
-        let queue = sdk
-            .gpu
-            .queue(QueueKind::Render)
-            .expect("the Render queue always exists");
         let h = vulkan::image_handles(backbuffer)?;
         let output = [h.extent.width, h.extent.height];
-        let mut list = queue.command_list()?;
-        let inner = {
-            let cmd = list.vulkan_raw();
-            let _ngx = ngx_lock();
-            // SAFETY: `cmd` records on the Render queue of NGX's device. The feature is
-            // released through the device's garbage list, after the GPU has finished every
-            // submit before the drop and before NGX shuts down (it holds the instance).
-            unsafe { raw::FrameGeneration::new(&sdk.ngx.0.0, cmd.buffer, output, h.format)? }
-        };
-        let fg = Self {
-            inner: Some(Locked(inner)),
+        let feature = Owned::create(
+            sdk,
+            |_| {},
+            // SAFETY: as in `RayReconstruction::new`.
+            |ngx, cmd| unsafe { raw::FrameGeneration::new(ngx, cmd, output, h.format) },
+        )?;
+        Ok(Self {
+            feature,
             hdr,
             format: h.format,
-            ngx: Arc::clone(&sdk.ngx),
-            gpu: sdk.gpu.clone(),
-        };
-        let done = queue.submit(vec![list], &[])?;
-        queue.wait(done, CREATE_TIMEOUT)?;
-        Ok(fg)
-    }
-
-    fn raw(&self) -> &raw::FrameGeneration {
-        &self.inner.as_ref().expect("released on drop only").0
+        })
     }
 
     pub fn output_size(&self) -> [u32; 2] {
-        self.raw().output_size()
+        self.feature.get().output_size()
     }
 
     /// The most images one rendered frame may generate (`MultiFrameCountMax`).
     pub fn max_generated(&self) -> u32 {
-        self.raw().max_generated()
+        self.feature.get().max_generated()
     }
 
     /// Records generated image `index` of `count` (1-based) into `cmd`, a list on a
@@ -425,15 +576,7 @@ impl FrameGeneration {
             hdr: self.hdr,
             depth_scale: inputs.depth_scale,
         };
-        let device = vulkan::raw_device(&self.gpu).device.handle();
-        let raw_cmd = cmd.vulkan_raw();
-        assert_eq!(
-            raw_cmd.device.handle(),
-            device,
-            "FG records on its SDK's device"
-        );
-        let buffer = raw_cmd.buffer;
-        let fg = &mut self.inner.as_mut().expect("released on drop only").0;
+        let (fg, buffer) = self.feature.record_on(cmd, "FG");
         let _ngx = ngx_lock();
         // SAFETY: `buffer` records on NGX's device, after the classic bind `vulkan_raw`
         // recorded. orr textures stay in GENERAL, and they and the flag buffer are destroyed
@@ -447,20 +590,6 @@ impl FrameGeneration {
         flag.as_slice()
             .and_then(|v| v.first())
             .is_some_and(|v| v & 0xff != 0)
-    }
-}
-
-impl Drop for FrameGeneration {
-    fn drop(&mut self) {
-        let inner = self.inner.take();
-        let ngx = Arc::clone(&self.ngx);
-        vulkan::defer_after_submitted(&self.gpu, move || {
-            {
-                let _ngx = ngx_lock();
-                let _feature = inner;
-            }
-            drop(ngx);
-        });
     }
 }
 

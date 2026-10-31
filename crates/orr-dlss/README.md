@@ -16,18 +16,20 @@ with bindgen, so it needs clang and the Vulkan SDK headers (`VULKAN_SDK`).
 Without `DLSS_SDK` the crate builds without NGX and reports DLSS unavailable at run time.
 Features:
 
-- `mock`: no SDK needed. Every feature reports unsupported, and ray reconstruction copies
-  its colour input to the output with a bilinear upscale.
+- `mock`: no SDK needed. Every feature reports unsupported, and ray reconstruction and super
+  resolution copy their color input to the output with a bilinear upscale.
 - `debug_overlay`: loads the SDK's `dev` DLLs, which draw the DLSS debug overlay. Never ship
   these.
 
 ## Use
 
 Create the orr-gpu device with `DeviceDesc::hooks` set to `DlssSdk::device_hooks(project_id)`,
-then `DlssSdk::new` on it. `RayReconstruction::record` and `FrameGeneration::record`
-record into an orr command list; frame generation is usually driven by orr-output's
-`Display`, which presents the generated images. The `raw` module offers the same features on
-ash handles for programs without orr-gpu.
+then `DlssSdk::new` on it. `RayReconstruction::record`, `SuperResolution::record` and
+`FrameGeneration::record` record into an orr command list. Ray reconstruction upscales path
+traced views; super resolution upscales views that are not path traced, such as raster debug
+views. Frame generation is usually driven by orr-output's `Display`, which presents the
+generated images. The `raw` module offers the same features on ash handles for programs
+without orr-gpu.
 
 ## Runtime DLLs
 

@@ -1,5 +1,5 @@
-//! NGX on ash handles: device requirements, initialization, and ray reconstruction and frame
-//! generation recorded into the caller's command buffers.
+//! NGX on ash handles: device requirements, initialization, and ray reconstruction, super
+//! resolution and frame generation recorded into the caller's command buffers.
 //!
 //! Images passed to NGX stay in `GENERAL`; NGX needs no layout transitions around its calls.
 
@@ -83,20 +83,50 @@ impl Ngx {
     pub fn take_log() -> Vec<String> {
         imp::take_log()
     }
+}
 
-    /// The RR preset named by NGX log lines, as a letter. A driver-wide DLSS override can
-    /// replace the requested preset; its log line wins.
-    pub fn applied_preset(log: &[String]) -> Option<char> {
-        let preset = |line: &str| {
-            let at = line.find("Preset_")? + "Preset_".len();
-            line[at..].chars().next().filter(char::is_ascii_uppercase)
-        };
-        let overridden = log
-            .iter()
-            .filter(|l| l.contains("Overridden Preset"))
-            .find_map(|l| preset(l));
-        overridden.or_else(|| log.iter().find_map(|l| preset(l)))
-    }
+/// The preset NGX applied to the last `upscaler` feature created at `quality`, as a letter,
+/// from NGX's log since before the creation. NGX reports the model it applied for the
+/// feature (`Override Reported: ModelPreset, Value: n`, n = 1 for A); without that line, its
+/// line for the feature's class and mode names the preset. A driver-wide DLSS override can
+/// replace the requested preset, and both lines follow it. NGX also logs other features'
+/// lines while creating one, so lines are matched by feature and mode.
+fn applied_preset(log: &[String], upscaler: Upscaler, quality: Quality) -> Option<char> {
+    let (feature, class) = match upscaler {
+        Upscaler::Rr => (
+            "Feature [SuperSamplingDenoising] ",
+            "[NgxRayReconstruction::",
+        ),
+        Upscaler::Sr => ("Feature [SuperSampling] ", "[NgxDltss::"),
+    };
+    let reported = log.iter().rev().find_map(|l| {
+        let rest = &l[l.find(feature)?..];
+        let at = rest.find("ModelPreset, Value: ")? + "ModelPreset, Value: ".len();
+        let digits: String = rest[at..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        let n: u8 = digits.parse().ok()?;
+        (1..=26).contains(&n).then(|| char::from(b'A' + n - 1))
+    });
+    let mode = match quality {
+        Quality::Dlaa => "(DLAA)",
+        Quality::Quality => "(Quality)",
+        Quality::Balanced => "(Balanced)",
+        Quality::Performance => "(Perf)",
+        Quality::UltraPerformance => "(UltraPerf)",
+    };
+    let named = || {
+        log.iter()
+            .rev()
+            .filter(|l| l.contains(class) && l.contains(mode))
+            .find_map(|l| {
+                let at = l.rfind("Preset")? + "Preset".len();
+                let mut rest = l[at..].chars().skip_while(|c| *c == '_' || *c == ' ');
+                rest.next().filter(char::is_ascii_uppercase)
+            })
+    };
+    reported.or_else(named)
 }
 
 /// An image NGX reads or writes. `view` covers mip 0, layer 0 of `image`.
@@ -135,9 +165,17 @@ pub struct RrInputs<'a> {
     pub jitter: [f32; 2],
 }
 
+/// Ray reconstruction or super resolution, as NGX tells them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Upscaler {
+    Rr,
+    Sr,
+}
+
 /// One ray reconstruction feature at a fixed render and output size.
 pub struct RayReconstruction {
-    inner: imp::Rr,
+    inner: imp::Upscale,
+    quality: Quality,
     render: [u32; 2],
     output: [u32; 2],
     phases: u32,
@@ -159,11 +197,14 @@ impl RayReconstruction {
         quality: Quality,
         preset: Option<u32>,
     ) -> Result<Self, DlssError> {
-        let render = ngx.0.render_size(output, quality)?;
+        let render = ngx.0.render_size(output, quality, Upscaler::Rr)?;
         // SAFETY: forwarded from the caller.
-        let inner = unsafe { imp::Rr::new(&ngx.0, cmd, render, output, quality, preset)? };
+        let inner = unsafe {
+            imp::Upscale::new(&ngx.0, cmd, Upscaler::Rr, render, output, quality, preset)?
+        };
         Ok(Self {
             inner,
+            quality,
             render,
             output,
             phases: crate::jitter_phases(render, output),
@@ -189,6 +230,12 @@ impl RayReconstruction {
         crate::mip_bias(self.render, self.output)
     }
 
+    /// The preset NGX applied to this feature, read from `log`: [`Ngx::take_log`] from
+    /// before the feature was created.
+    pub fn applied_preset(&self, log: &[String]) -> Option<char> {
+        applied_preset(log, Upscaler::Rr, self.quality)
+    }
+
     /// Records the evaluation into `cmd`. Every image is in `GENERAL`, inputs at
     /// [`render_size`](Self::render_size), the output at
     /// [`output_size`](Self::output_size).
@@ -207,7 +254,108 @@ impl RayReconstruction {
         inputs: &RrInputs<'_>,
     ) -> Result<(), DlssError> {
         // SAFETY: forwarded from the caller.
-        unsafe { self.inner.record(cmd, inputs, self.render) }
+        unsafe { self.inner.record_rr(cmd, inputs, self.render) }
+    }
+}
+
+/// Super resolution inputs at render resolution, and the output at output resolution.
+#[derive(Clone, Copy)]
+pub struct SrInputs<'a> {
+    /// HDR radiance, multiplied by `pre_exposure`.
+    pub color: &'a Image,
+    /// Reverse-Z device depth.
+    pub depth: &'a Image,
+    /// Unjittered motion, previous UV minus current UV.
+    pub motion: &'a Image,
+    /// 1x1; its first channel is the exposure that brings `color / pre_exposure` to the range
+    /// the tonemapper takes (mid gray near 0.18). Presets J and K read it; L meters the color
+    /// itself.
+    pub exposure: &'a Image,
+    /// The factor `color` was multiplied by, which NGX divides out.
+    pub pre_exposure: f32,
+    pub output: &'a Image,
+    /// Drops the history.
+    pub reset: bool,
+    /// From [`SuperResolution::jitter`] for this frame.
+    pub jitter: [f32; 2],
+}
+
+/// One super resolution (or DLAA) feature at a fixed render and output size.
+pub struct SuperResolution {
+    inner: imp::Upscale,
+    quality: Quality,
+    render: [u32; 2],
+    output: [u32; 2],
+    phases: u32,
+}
+
+impl SuperResolution {
+    /// Creates the feature, recording NGX's setup work into `cmd`; submit `cmd` before the
+    /// first [`record`](Self::record) runs. `preset` is a `NVSDK_NGX_DLSS_Hint_Render_Preset`
+    /// value; `None` keeps NGX's default for `quality`.
+    ///
+    /// # Safety
+    ///
+    /// As [`RayReconstruction::new`].
+    pub unsafe fn new(
+        ngx: &Ngx,
+        cmd: vk::CommandBuffer,
+        output: [u32; 2],
+        quality: Quality,
+        preset: Option<u32>,
+    ) -> Result<Self, DlssError> {
+        let render = ngx.0.render_size(output, quality, Upscaler::Sr)?;
+        // SAFETY: forwarded from the caller.
+        let inner = unsafe {
+            imp::Upscale::new(&ngx.0, cmd, Upscaler::Sr, render, output, quality, preset)?
+        };
+        Ok(Self {
+            inner,
+            quality,
+            render,
+            output,
+            phases: crate::jitter_phases(render, output),
+        })
+    }
+
+    /// Render resolution, fixed for the feature's lifetime.
+    pub fn render_size(&self) -> [u32; 2] {
+        self.render
+    }
+
+    pub fn output_size(&self) -> [u32; 2] {
+        self.output
+    }
+
+    /// NGX's jitter offset for `frame` (see [`crate::jitter`]).
+    pub fn jitter(&self, frame: u64) -> [f32; 2] {
+        crate::jitter(frame, self.phases)
+    }
+
+    /// Texture LOD bias for the render resolution (see [`crate::mip_bias`]).
+    pub fn mip_bias(&self) -> f32 {
+        crate::mip_bias(self.render, self.output)
+    }
+
+    /// The preset NGX applied to this feature, read from `log`: [`Ngx::take_log`] from
+    /// before the feature was created.
+    pub fn applied_preset(&self, log: &[String]) -> Option<char> {
+        applied_preset(log, Upscaler::Sr, self.quality)
+    }
+
+    /// Records the evaluation into `cmd`, under the same rules as
+    /// [`RayReconstruction::record`].
+    ///
+    /// # Safety
+    ///
+    /// As [`RayReconstruction::record`].
+    pub unsafe fn record(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        inputs: &SrInputs<'_>,
+    ) -> Result<(), DlssError> {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.inner.record_sr(cmd, inputs, self.render) }
     }
 }
 
@@ -457,20 +605,42 @@ impl ClassicBind {
 
 #[cfg(test)]
 mod tests {
-    use super::Ngx;
+    use super::{Quality, Upscaler, applied_preset};
 
     #[test]
-    fn applied_preset_prefers_the_driver_override() {
+    fn applied_preset_is_read_for_the_feature_and_mode() {
         let log = [
+            "[NgxRayReconstruction::FillCreationParams::<lambda>::operator ():1733] Info: (Quality) Using Default Overriden Preset Preset_D",
+            "[NgxDltss::FillCreationParams::<lambda>::operator ():2745] Info: (Quality) Using DRS Overridden Preset K",
+            "[NgxDltss::FillCreationParams::<lambda>::operator ():2745] Info: (Perf) Using DRS Overridden Preset M",
+            "[NGXOverrideStatusCallback:2325] Feature [SuperSampling] Override Reported: ModelPreset, Value: 11, Requested: Yes, Applied: Yes, Is Latest: Yes",
+        ]
+        .map(String::from);
+        assert_eq!(
+            applied_preset(&log, Upscaler::Sr, Quality::Quality),
+            Some('K')
+        );
+        assert_eq!(
+            applied_preset(&log[..3], Upscaler::Sr, Quality::Performance),
+            Some('M')
+        );
+        assert_eq!(
+            applied_preset(&log[..3], Upscaler::Rr, Quality::Quality),
+            Some('D')
+        );
+        assert_eq!(applied_preset(&log, Upscaler::Rr, Quality::Dlaa), None);
+        let rr = [
             "[NgxRayReconstruction::FillCreationParams] Info: (Perf) Using DRS Overridden Preset Preset_F",
             "[NGXOverrideStatusCallback:2325] Feature [SuperSamplingDenoising] Override Reported: ModelPreset, Value: 6",
         ]
         .map(String::from);
-        assert_eq!(Ngx::applied_preset(&log), Some('F'));
         assert_eq!(
-            Ngx::applied_preset(&["Info: Using Preset_E".to_owned()]),
-            Some('E')
+            applied_preset(&rr, Upscaler::Rr, Quality::Performance),
+            Some('F')
         );
-        assert_eq!(Ngx::applied_preset(&[]), None);
+        assert_eq!(
+            applied_preset(&rr, Upscaler::Sr, Quality::Performance),
+            None
+        );
     }
 }

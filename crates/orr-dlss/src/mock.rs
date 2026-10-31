@@ -1,8 +1,8 @@
 //! The backend without NGX. With the `mock` feature it reports every feature unsupported and
-//! ray reconstruction blits color to the output; frame generation cannot be created. Without
-//! it, initialization fails.
+//! ray reconstruction and super resolution blit color to the output; frame generation cannot
+//! be created. Without it, initialization fails.
 
-use crate::raw::{FgInputs, RrInputs, Vulkan};
+use crate::raw::{FgInputs, Image, RrInputs, SrInputs, Upscaler, Vulkan};
 use crate::{DlssError, Quality, Support, Uuid};
 use ash::vk;
 use std::ffi::CString;
@@ -51,6 +51,7 @@ impl Ngx {
         &self,
         output: [u32; 2],
         quality: Quality,
+        _upscaler: Upscaler,
     ) -> Result<[u32; 2], DlssError> {
         let scale = match quality {
             Quality::Dlaa => 1.0,
@@ -63,14 +64,15 @@ impl Ngx {
     }
 }
 
-pub(crate) struct Rr {
+pub(crate) struct Upscale {
     device: ash::Device,
 }
 
-impl Rr {
+impl Upscale {
     pub(crate) unsafe fn new(
         ngx: &Ngx,
         _cmd: vk::CommandBuffer,
+        _upscaler: Upscaler,
         _render: [u32; 2],
         _output: [u32; 2],
         _quality: Quality,
@@ -81,12 +83,30 @@ impl Rr {
         })
     }
 
-    pub(crate) unsafe fn record(
+    pub(crate) unsafe fn record_rr(
         &mut self,
         cmd: vk::CommandBuffer,
         inputs: &RrInputs<'_>,
         render: [u32; 2],
     ) -> Result<(), DlssError> {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.blit(cmd, inputs.color, inputs.output, render) };
+        Ok(())
+    }
+
+    pub(crate) unsafe fn record_sr(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        inputs: &SrInputs<'_>,
+        render: [u32; 2],
+    ) -> Result<(), DlssError> {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.blit(cmd, inputs.color, inputs.output, render) };
+        Ok(())
+    }
+
+    /// A bilinear blit of `color`'s `render` corner over all of `output`.
+    unsafe fn blit(&self, cmd: vk::CommandBuffer, color: &Image, output: &Image, render: [u32; 2]) {
         let layers = vk::ImageSubresourceLayers::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .layer_count(1);
@@ -99,20 +119,19 @@ impl Rr {
             .src_subresource(layers)
             .src_offsets([vk::Offset3D::default(), corner(render)])
             .dst_subresource(layers)
-            .dst_offsets([vk::Offset3D::default(), corner(inputs.output.extent)]);
+            .dst_offsets([vk::Offset3D::default(), corner(output.extent)]);
         // SAFETY: `cmd` is recording on this device and both images are in GENERAL (caller).
         unsafe {
             self.device.cmd_blit_image(
                 cmd,
-                inputs.color.image,
+                color.image,
                 vk::ImageLayout::GENERAL,
-                inputs.output.image,
+                output.image,
                 vk::ImageLayout::GENERAL,
                 &[region],
                 vk::Filter::LINEAR,
             );
         }
-        Ok(())
     }
 }
 
