@@ -131,10 +131,10 @@ public PathVertex hit_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
 }
 
 // The error of the cut ray tracing holds for instance `slot`, in render space; 0 when the
-// slot is not traced.
+// slot is not traced and for producer entries, which trace what they raster.
 public float traced_error(SceneRoot* s, uint slot)
 {
-    if ((s.slot_state[slot].rt_flags & RT_WRITTEN) == 0)
+    if (slot >= s.part_base || (s.slot_state[slot].rt_flags & RT_WRITTEN) == 0)
         return 0.0;
     InstanceGpu inst = s.instances[slot];
     MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
@@ -151,12 +151,9 @@ public float traced_error(SceneRoot* s, uint slot)
 // The material of a traced hit, or MATERIAL_NONE where it names none this module resolves.
 public uint hit_material(SceneRoot* s, Hit h)
 {
-    uint slot;
-    if (!h.hit || h.cluster_id < 0 || !hit_slot(s, h.instance_index, slot))
+    if (!h.hit || h.cluster_id < 0)
         return MATERIAL_NONE;
-    InstanceGpu inst = s.instances[slot];
-    ClusterRef r = s.clusters[h.cluster_id];
-    return section_material(s, inst, s.models + inst.model, load_cluster(r.page, r.local).section);
+    return traced_material(s, h.instance_index, uint(h.cluster_id));
 }
 
 // The coherence key of a traced hit: hit or miss, its material's cost class, its surface id.
@@ -266,9 +263,10 @@ public float3 shade_vertex_nee<S : ISurface, M : IMedium>(PathRoot r, PathVertex
     if (chosen.kind == LIGHT_SAMPLE_ENVIRONMENT)
         vis = select(vis > 0.0, float3(1.0), float3(0.0));
     float mis = 1.0;
-    // Sphere and rect lights are not in the PTLAS, so BSDF rays never reach them; emissive
-    // entries the tiles sample are producer entries, whose hits are not resolved.
-    bool shared = chosen.kind == LIGHT_SAMPLE_ENVIRONMENT || chosen.kind == LIGHT_SAMPLE_DIRECTIONAL;
+    // Sphere and rect lights are not in the PTLAS, so BSDF rays never reach them; the
+    // emissive entries the tiles sample are producer entries, which BSDF rays hit.
+    bool shared = chosen.kind == LIGHT_SAMPLE_ENVIRONMENT || chosen.kind == LIGHT_SAMPLE_DIRECTIONAL
+        || chosen.kind == LIGHT_SAMPLE_EMISSIVE;
     if (!weight_one && shared)
         mis = power_heuristic(run * chosen.pdf, b.pdf(dir));
     return f * vis * (W * mis / run);
@@ -494,9 +492,20 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
         // Back faces of single-sided surfaces never emit; double-sided hits face the ray.
         bool front = dot(sh.surface.geometric_normal, ray.dir) < 0.0;
         // Hits on cooked instances name no emissive entry the tiles sample, so BSDF rays are
-        // the only way to them and their emission takes weight 1.
+        // the only way to them and their emission takes weight 1. A producer entry is
+        // emissive entry `entry` of the tiles.
+        uint entry;
         if (count_bsdf && counted && front)
-            radiance += throughput * b.emission();
+        {
+            float w = 1.0;
+            if (weigh && hit_producer(s, h.instance_index, entry))
+            {
+                float l = luminance_rec2020(material_emission(s.materials + sh.surface.material));
+                float cos_light = dot(sh.surface.geometric_normal, ray.dir);
+                w = power_heuristic(ray.pdf, ray.run * nee_emissive_pdf(set, ray.normal, entry, l, t, cos_light));
+            }
+            radiance += throughput * b.emission() * w;
+        }
         alive = (x.surface.flags & GBUFFER_UNLIT) == 0 && r.mode != PATH_DIRECT;
         if (alive && cache && front)
         {

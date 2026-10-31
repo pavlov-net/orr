@@ -7,7 +7,7 @@ use std::sync::Arc;
 use orr_gpu::{ComputePipeline, Device, KernelSet, ShaderModule, ShaderStage, SpecData, SpecEntry};
 
 use crate::Result;
-use crate::shaders::{animation, emissive, upload, world};
+use crate::shaders::{animation, emissive, transparency, upload, world};
 
 /// A compute pipeline of [`crate::Scenes::compute_pipeline`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -68,6 +68,7 @@ pub(crate) struct Own {
     pub(crate) emissive_instances: PipelineId,
     pub(crate) emissive_producers: PipelineId,
     pub(crate) animate: PipelineId,
+    pub(crate) composite: PipelineId,
 }
 
 pub(crate) struct Pipelines {
@@ -90,6 +91,7 @@ impl Pipelines {
                 emissive_instances: PipelineId(0),
                 emissive_producers: PipelineId(0),
                 animate: PipelineId(0),
+                composite: PipelineId(0),
             },
         };
         let none = SpecData::default();
@@ -99,6 +101,7 @@ impl Pipelines {
             emissive_instances: p.create(device, kernels, &emissive::MODULE, "instances", none)?,
             emissive_producers: p.create(device, kernels, &emissive::MODULE, "producers", none)?,
             animate: p.create(device, kernels, &animation::MODULE, "animate", none)?,
+            composite: p.create(device, kernels, &transparency::MODULE, "composite", none)?,
         };
         Ok(p)
     }

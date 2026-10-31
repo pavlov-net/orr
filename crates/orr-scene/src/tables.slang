@@ -184,6 +184,7 @@ public struct SceneRoot
     public EmissiveGpu* emissive;    // producer_capacity + emissive_capacity entries
     public ProducerGpu* producers;   // by ProducerId
     public ProducerBatch* batches;   // by ProducerId
+    public ProducerStateGpu* producer_state; // by ProducerId, written by the GPU
     public SkyStats* sky_stats;
     public uint64_t environment;     // consumer data for the linked environment
     public uint64_t medium;          // consumer data for the linked medium
@@ -202,7 +203,7 @@ public struct SceneRoot
     public float near_range;         // m
     public uint part_base;           // PTLAS index of part instance 0
     public uint part_capacity;
-    public uint producer_base;       // PTLAS index of producer entry 0
+    public uint producer_base;       // PTLAS index of producer entry 0; also how `SurfaceInput`, `GSurface` and `VisibleCluster` name producer entries
 }
 
 // Transform `index` of `group` as a row-major [R | t] relative to the group's anchor.

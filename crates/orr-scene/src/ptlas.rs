@@ -5,6 +5,7 @@
 //! global partition until their transform has rested for 30 frames. The `ptlas` kernels
 //! decide each frame's writes, null writes, BLAS updates and part runs on the GPU and spend
 //! the frame's budget of rebuilt instances from the focus outward, mandatory work first.
+//! Producer entries sit in the global partition and their writes are mandatory.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +27,7 @@ use crate::upload::Record;
 /// `ptlas.slang` constants.
 const PARTITION_NONE: u32 = u32::MAX;
 const DISTANCE_BUCKETS: u32 = 64;
-const COUNTERS: usize = 16;
+const COUNTERS: usize = 17;
 const PTLAS_REBASE: u32 = 1;
 const PTLAS_FIRST: u32 = 2;
 const PART_STATE: u32 = 11;
@@ -112,6 +113,8 @@ pub(crate) struct PtlasPipelines {
     cutoff: PipelineId,
     admit: PipelineId,
     emit: PipelineId,
+    producer_want: PipelineId,
+    producer_emit: PipelineId,
     translate: PipelineId,
     commands: PipelineId,
 }
@@ -131,6 +134,8 @@ impl PtlasPipelines {
             cutoff: c("cutoff")?,
             admit: c("admit")?,
             emit: c("emit")?,
+            producer_want: c("producer_want")?,
+            producer_emit: c("producer_emit")?,
             translate: c("translate")?,
             commands: c("commands")?,
         })
@@ -164,6 +169,9 @@ pub(crate) struct Ptlas {
     limits: PtlasLimits,
     max_per_partition: u32,
     part_capacity: u32,
+    producer_capacity: u32,
+    /// Copies the global partition takes; producer entries come on top.
+    global_copies: u32,
     partitions: Vec<PartitionCpu>,
     free: Vec<u32>,
     /// The partition of each cell that takes its next copies.
@@ -196,12 +204,14 @@ impl Ptlas {
                 instances: desc.instance_capacity + desc.part_capacity + desc.producer_capacity,
                 partitions,
                 max_per_partition: desc.partition_instances,
-                global_instances: desc.global_instances,
+                global_instances: desc.global_instances + desc.producer_capacity,
                 max_ops: 3,
                 translation: true,
             },
             max_per_partition: desc.partition_instances,
             part_capacity: desc.part_capacity,
+            producer_capacity: desc.producer_capacity,
+            global_copies: desc.global_instances,
             partitions: (0..partitions)
                 .map(|_| PartitionCpu {
                     cell: IVec3::ZERO,
@@ -289,10 +299,15 @@ impl Ptlas {
     }
 
     /// The scene's TLAS for the frame about to record, after making the PTLAS storage the
-    /// first time a slot has been handed out.
-    pub(crate) fn tlas(&mut self, device: &Device, fif: u32) -> Result<Option<Tlas>> {
+    /// first time a slot has been handed out or a producer entry is set.
+    pub(crate) fn tlas(
+        &mut self,
+        device: &Device,
+        fif: u32,
+        producers: bool,
+    ) -> Result<Option<Tlas>> {
         let caps = device.caps();
-        if caps.cluster.max_partitions == 0 || self.high_water == 0 {
+        if caps.cluster.max_partitions == 0 || (self.high_water == 0 && !producers) {
             return Ok(None);
         }
         if self.storage.is_none() {
@@ -358,7 +373,7 @@ impl Ptlas {
             partition_count: self.limits.partitions,
             write_capacity: self.limits.instances,
             update_capacity: self.limits.instances,
-            global_capacity: self.limits.global_instances,
+            global_capacity: self.global_copies,
         };
         let mut gpu = device.gpu_malloc::<PtlasGpu>(MemoryKind::Upload, 1, "PTLAS tables")?;
         gpu.as_mut_slice().expect("upload is mapped")[0] = record;
@@ -503,12 +518,18 @@ impl Ptlas {
         list.dispatch(p.get(k.recycle), root, [1, 1, 1]);
         step(list);
         list.dispatch(p.get(k.want), root, groups(self.high_water));
+        if self.producer_capacity > 0 {
+            list.dispatch(p.get(k.producer_want), root, groups(self.producer_capacity));
+        }
         step(list);
         list.dispatch(p.get(k.cutoff), root, [1, 1, 1]);
         step(list);
         list.dispatch(p.get(k.admit), root, groups(partitions));
         step(list);
         list.dispatch(p.get(k.emit), root, groups(self.high_water));
+        if self.producer_capacity > 0 {
+            list.dispatch(p.get(k.producer_emit), root, groups(self.producer_capacity));
+        }
         if !jobs.is_empty() {
             list.dispatch(p.get(k.translate), root, groups(jobs.len() as u32));
         }

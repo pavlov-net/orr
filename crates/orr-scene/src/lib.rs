@@ -36,6 +36,7 @@ mod stream;
 #[cfg(feature = "testing")]
 pub mod testing;
 mod time;
+mod transparency;
 mod upload;
 mod view;
 mod world;
@@ -50,7 +51,9 @@ pub use loading::Loading;
 pub use material::{BoundTexture, MaterialId, MaterialWriter, material_flags};
 pub use mount::{InstancePage, LoadState, MountId, PackSource, PageId};
 pub use pipelines::{PipelineId, ReloadReport};
-pub use producer::{ClusterTopology, ProducerDesc, ProducerId, ProducerUpdate};
+pub use producer::{
+    ClusterTopology, Opacity, OriginPolicy, ProducerDesc, ProducerId, ProducerStats, ProducerUpdate,
+};
 pub use ptlas::RtStats;
 pub use residency::{ClassStats, ResidencyClass, ResidencyStats};
 pub use scene::{
@@ -63,10 +66,11 @@ pub use scenes::{
 pub use shaders::types::{
     ClusterRef, ClusterWork, EmissiveGpu, GBufferGpu, GroupGpu, InstanceGpu, LightGpu, MaskGpu,
     MaterialGpu, MeshGpu, MeshLevel, ModelGpu, PartGpu, ProducerBatch, ProducerClusterGpu,
-    ProducerGpu, RasterGpu, RasterRoot, RtCutGpu, SceneRoot, SkyStats, SlotStateGpu, TopologyGpu,
-    VisibleCluster,
+    ProducerGpu, ProducerStateGpu, RasterGpu, RasterRoot, RtCutGpu, SceneRoot, SkyStats,
+    SlotStateGpu, TopologyGpu, VisibleCluster,
 };
 pub use time::FrameTime;
+pub use transparency::TransparencyPass;
 pub use view::{
     DepthOfField, ExposureState, Focus, Glare, Lens, LensDistortion, Projection, RasterView,
     ViewConstants, ViewDesc, ViewHistoryId, ViewTarget,

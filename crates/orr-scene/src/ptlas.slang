@@ -6,7 +6,10 @@
 // and `admit` spend the frame's budget of rebuilt instances bucket by bucket from the focus
 // outward, mandatory work first; `emit` writes the admitted records and ages the rest;
 // `translate` writes partition translations and `commands` the build's one command per
-// record type.
+// record type. `producer_want` and `producer_emit` do the same for producer entries: an
+// entry's instance at `producer_base + id`, in the global partition, is rewritten as
+// mandatory work every frame it builds, moves or the render origin moves, and null-written
+// when it has nothing to trace.
 //
 // A traced copy inside its animation range whose cut has animated part clusters holds a
 // run of part instances, one per animated part: its body instance traces the cut's body
@@ -21,6 +24,7 @@ import orr.math;
 import orr.trace;
 import rtas;
 import hit;
+import producer;
 
 public static const uint PARTITION_NONE = 0xffffffff;
 public static const uint DISTANCE_BUCKETS = 64;
@@ -44,9 +48,10 @@ public static const uint COUNTER_BELOW = 11;      // budget the buckets before t
 public static const uint COUNTER_GLOBAL_CLAIMS = 12;
 public static const uint COUNTER_PARTS_REFUSED = 13; // part runs not taken: no room left
 public static const uint COUNTERS_CLEARED = 14;
-public static const uint COUNTER_GLOBAL = 14;     // instances in the global partition
+public static const uint COUNTER_GLOBAL = 14;     // copies in the global partition
 public static const uint COUNTER_PARTS = 15;      // part instances in held runs
-public static const uint COUNTERS = 16;
+public static const uint COUNTER_PRODUCERS = 16;  // producer instances, all in the global partition
+public static const uint COUNTERS = 17;
 
 // `PtlasRoot.flags`.
 public static const uint PTLAS_REBASE = 1;        // the render origin moved: mandatory work only
@@ -120,7 +125,7 @@ public struct PtlasGpu
     public uint partition_count;
     public uint write_capacity;
     public uint update_capacity;
-    public uint global_capacity;
+    public uint global_capacity;  // copies the global partition takes
 }
 
 public struct PtlasRoot
@@ -147,7 +152,7 @@ uint global_partition()
 uint partition_cost(uint p)
 {
     PtlasGpu* t = root.ptlas;
-    return p < t.partition_count ? t.partitions[p].count : max(t.counters[COUNTER_GLOBAL], 1u);
+    return p < t.partition_count ? t.partitions[p].count : max(t.counters[COUNTER_GLOBAL] + t.counters[COUNTER_PRODUCERS], 1u);
 }
 
 // Integer cell distance of a partition from the focus.
@@ -765,6 +770,108 @@ void emit(uint3 id: SV_DispatchThreadID)
         s.instances[slot].first_part = st.part_run;
         write_parts(s, t, st, inst, op.cut, op.partition);
     }
+}
+
+// `ProducerStateGpu.rt_flags` of this frame's decision.
+static const uint PRODUCER_RT_WRITE = 4;
+static const uint PRODUCER_RT_NULL = 8;
+
+// What a producer instance is written with besides its BLAS address: transform and class.
+uint2 producer_key(GroupGpu* g, ProducerGpu p)
+{
+    float3x4 m = ((float3x4*)g.current)[p.group_index];
+    uint a = 0x811c9dc5u;
+    uint b = 0x01000193u;
+    for (uint r = 0; r < 3; r++)
+    {
+        for (uint c = 0; c < 4; c++)
+        {
+            a = mix(a, asuint(m[r][c]));
+            b = mix(b, asuint(m[r][c]) + 0x632be5abu);
+        }
+    }
+    return uint2(mix(mix(a, p.class_id), p.group), mix(b, p.group_index ^ (p.class_id << 24)));
+}
+
+// The render-space placement of producer entry `p`; false when its group hides it.
+bool producer_render_placement(SceneRoot* s, ProducerGpu p, out Placement pl)
+{
+    return producer_placement(s, p, false, s.origin_cell.xyz, float3(0.0), uint(s.origin_cell.w), pl);
+}
+
+// One thread per producer entry: whether its instance is written or null-written this frame.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void producer_want(uint3 id: SV_DispatchThreadID)
+{
+    SceneRoot* s = root.scene;
+    uint e = id.x;
+    if (e >= s.producer_capacity)
+        return;
+    ProducerGpu p = s.producers[e];
+    ProducerStateGpu* st = s.producer_state + e;
+    uint flags = st.rt_flags & ~(PRODUCER_RT_WRITE | PRODUCER_RT_NULL);
+    bool written = (flags & PRODUCER_RT_WRITTEN) != 0;
+    Placement pl;
+    float3 lo, hi;
+    bool active = (p.flags & INSTANCE_RAY) != 0 && st.blas != 0 && producer_bounds(*st, lo, hi)
+        && producer_render_placement(s, p, pl);
+    if (active)
+    {
+        uint2 key = producer_key(s.groups + p.group, p);
+        bool rebased = (root.flags & PTLAS_REBASE) != 0;
+        if (!written || (flags & PRODUCER_RT_BUILT) != 0 || rebased || any(st.rt_key != key))
+            flags |= PRODUCER_RT_WRITE;
+    }
+    else if (written)
+    {
+        flags |= PRODUCER_RT_NULL;
+    }
+    st.rt_flags = flags;
+    if ((flags & (PRODUCER_RT_WRITE | PRODUCER_RT_NULL)) != 0)
+        charge_write(global_partition(), true);
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void producer_emit(uint3 id: SV_DispatchThreadID)
+{
+    SceneRoot* s = root.scene;
+    PtlasGpu* t = root.ptlas;
+    uint e = id.x;
+    if (e >= s.producer_capacity)
+        return;
+    ProducerStateGpu* st = s.producer_state + e;
+    uint flags = st.rt_flags;
+    if ((flags & (PRODUCER_RT_WRITE | PRODUCER_RT_NULL)) == 0)
+    {
+        st.rt_flags = flags & ~PRODUCER_RT_BUILT;
+        return;
+    }
+    uint index;
+    if (!reserve(COUNTER_WRITES, t.write_capacity, 1, index))
+        return;
+    ProducerGpu p = s.producers[e];
+    PtlasWrite w = (PtlasWrite)0;
+    w.instance_index = s.producer_base + e;
+    w.partition = PTLAS_GLOBAL_PARTITION;
+    bool write = (flags & PRODUCER_RT_WRITE) != 0;
+    if (write)
+    {
+        Placement pl;
+        float3 lo, hi;
+        producer_render_placement(s, p, pl);
+        producer_bounds(*st, lo, hi);
+        w = instance_write(w.instance_index, global_partition(), pl, lo, hi, st.blas, p.class_id);
+        st.rt_key = producer_key(s.groups + p.group, p);
+    }
+    store((uint64_t)t.writes, index, w);
+    bool was = (flags & PRODUCER_RT_WRITTEN) != 0;
+    if (write && !was)
+        InterlockedAdd(t.counters[COUNTER_PRODUCERS], 1);
+    if (!write && was)
+        InterlockedAdd(t.counters[COUNTER_PRODUCERS], uint(-1));
+    st.rt_flags = write ? PRODUCER_RT_WRITTEN : 0;
 }
 
 [shader("compute")]

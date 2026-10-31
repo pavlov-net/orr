@@ -3,13 +3,17 @@
 // by its projected error and writes its clusters as work items of up to 32, `cap` sizes the
 // cluster pass to the items written, `clusters` culls each item's clusters (section mask,
 // DAG cluster rule, frustum, back-face cone) and sorts the survivors into the hardware
-// opaque, hardware alpha and software lists, and `raster_args` sizes the raster to them.
+// opaque, hardware alpha and software lists, `producers` culls the clusters producer
+// entries emitted this frame by their vertex boxes into the same lists, particle entries
+// into the particle list, and `raster_args` sizes the raster to them.
 // Clusters of animated parts are culled where their pose places them; whole copies by their
 // model's rest bounds.
 #include "orr/root.h"
+import orr.packing;
 import orr.trace;
 import orr_pack.mesh;
 import gbuffer;
+import producer;
 import tables;
 import view;
 import visibility;
@@ -171,6 +175,19 @@ bool cluster_visible(ViewConstants* v, RasterGpu* r, InstanceGpu inst, Placement
     return true;
 }
 
+// The visible-cluster index of a new entry, or false past capacity.
+bool add_visible(RasterGpu* r, VisibleCluster vc, out uint visible)
+{
+    InterlockedAdd(r.counts[COUNT_VISIBLE], 1, visible);
+    if (visible >= r.visible_capacity)
+    {
+        InterlockedAdd(r.counts[COUNT_VISIBLE_DROPPED], 1);
+        return false;
+    }
+    r.gbuffer.clusters[visible] = vc;
+    return true;
+}
+
 void append(RasterGpu* r, uint count, uint* list, uint visible)
 {
     uint slot;
@@ -210,21 +227,18 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     MaterialGpu* m = s.materials + material;
     if (!cluster_visible(v, r, inst, p, c, w.count_flags >> 8, m))
         return;
-    uint visible;
-    InterlockedAdd(r.counts[COUNT_VISIBLE], 1, visible);
-    if (visible >= r.visible_capacity)
-    {
-        InterlockedAdd(r.counts[COUNT_VISIBLE_DROPPED], 1);
-        return;
-    }
     VisibleCluster vc;
     vc.page = page;
     vc.instance = w.instance;
     vc.cluster = mesh.page_clusters[w.page] + local;
     vc.local = local;
     vc.material = material;
-    r.gbuffer.clusters[visible] = vc;
-    if (r.software_pixels > 0.0 && small_on_screen(v, p, c, mesh.position_step, r.software_pixels))
+    uint visible;
+    if (!add_visible(r, vc, visible))
+        return;
+    float3 lo = grid_position(c.anchor, uint3(0), mesh.position_step);
+    float3 hi = grid_position(c.anchor, uint3(c.local_max[0], c.local_max[1], c.local_max[2]), mesh.position_step);
+    if (r.software_pixels > 0.0 && small_on_screen(v, p, lo, hi, r.software_pixels))
     {
         append(r, COUNT_SOFTWARE, r.software, visible);
         return;
@@ -236,7 +250,69 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         append(r, COUNT_ALPHA, r.alpha, visible);
 }
 
-// Sizes the hardware draws and the software dispatch to their lists.
+// One workgroup per producer entry, its threads over the clusters it emitted. Opaque and
+// alpha-tested entries join the raster lists; particle entries the particle list;
+// dielectric and presence entries are traced only.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
+{
+    SceneRoot* s = root.scene;
+    ViewConstants* v = root.view;
+    RasterGpu* r = root.raster;
+    uint entry = group.x;
+    if (entry >= s.producer_capacity)
+        return;
+    ProducerGpu p = s.producers[entry];
+    if ((p.flags & INSTANCE_RASTER) == 0 || (p.flags & INSTANCE_CAST_ONLY) != 0)
+        return;
+    bool particle = p.opacity == PRODUCER_PARTICLE;
+    if (!particle && p.opacity != PRODUCER_OPAQUE && p.opacity != PRODUCER_ALPHA_TESTED)
+        return;
+    Placement pl;
+    if (!producer_placement(s, p, false, v.eye_cell.xyz, v.eye_offset.xyz, uint(v.eye_cell.w), pl))
+        return;
+    ProducerBatch b = s.batches[entry];
+    uint n = emitted_clusters(b);
+    for (uint c = thread; c < n; c += 64)
+    {
+        ProducerClusterGpu k = b.clusters[c];
+        if (!producer_cluster_valid(b, k))
+            continue;
+        uint material = producer_material(p, k);
+        if (material == MATERIAL_NONE)
+            continue;
+        float3 lo, hi;
+        producer_cluster_box(b, k, lo, hi);
+        float3 center = place(pl, 0.5 * (lo + hi));
+        float radius = 0.5 * length(hi - lo) * pl.scale;
+        if (!sphere_visible(v, center, radius))
+            continue;
+        VisibleCluster vc;
+        vc.page = nullptr;
+        vc.instance = s.producer_base + entry;
+        vc.cluster = c;
+        vc.local = 0;
+        vc.material = material;
+        uint visible;
+        if (!add_visible(r, vc, visible))
+            continue;
+        if (particle)
+        {
+            append(r, COUNT_PARTICLES, r.particles, visible);
+            continue;
+        }
+        if (r.software_pixels > 0.0 && small_on_screen(v, pl, lo, hi, r.software_pixels))
+        {
+            append(r, COUNT_SOFTWARE, r.software, visible);
+            continue;
+        }
+        bool alpha = p.opacity == PRODUCER_ALPHA_TESTED && (s.materials[material].flags & MATERIAL_ALPHA_TESTED) != 0;
+        append(r, alpha ? COUNT_ALPHA : COUNT_OPAQUE, alpha ? r.alpha : r.opaque, visible);
+    }
+}
+
+// Sizes the hardware draws, the software dispatch and the particle draws to their lists.
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void raster_args(uint3 id: SV_DispatchThreadID)
@@ -245,4 +321,5 @@ void raster_args(uint3 id: SV_DispatchThreadID)
     write_grid(r.args + ARGS_OPAQUE, r.counts[COUNT_OPAQUE]);
     write_grid(r.args + ARGS_ALPHA, r.counts[COUNT_ALPHA]);
     write_grid(r.args + ARGS_SOFTWARE, r.counts[COUNT_SOFTWARE]);
+    write_grid(r.args + ARGS_PARTICLES, r.counts[COUNT_PARTICLES]);
 }

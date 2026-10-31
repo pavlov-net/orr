@@ -9,6 +9,9 @@ mod cluster_rt;
 #[path = "../gpu-basics.rs"]
 mod gpu_basics;
 #[allow(dead_code)]
+#[path = "../producer-field.rs"]
+mod producer_field;
+#[allow(dead_code)]
 #[path = "../rigid-parts.rs"]
 mod rigid_parts;
 #[allow(dead_code)]
@@ -50,5 +53,7 @@ fn examples_match_their_references() {
     compare("viewer", viewer);
     let rigid = rigid_parts::run(&Options::headless(120, &[])).expect("headless capture");
     compare("rigid-parts", rigid);
+    let field = producer_field::run(&Options::headless(120, &[])).expect("headless capture");
+    compare("producer-field", field);
     assert_clean();
 }
