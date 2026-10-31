@@ -15,6 +15,7 @@ testing = ["dep:image", "dep:nv-flip", "dep:log"]
 hot-reload = ["orr-shaders/hot-reload", "dep:log"]
 
 [dependencies]
+orr-color.workspace = true
 orr-gpu.workspace = true
 orr-io.workspace = true
 orr-pack.workspace = true

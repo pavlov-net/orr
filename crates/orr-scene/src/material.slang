@@ -181,7 +181,8 @@ uint material_channel(MaterialGpu* m, uint slot)
 
 // The texture footprint function: `slot`'s texture filtered over footprint `f`
 // (`texture_footprint`), its channels from the slot's first one on in xyzw. Color slots
-// come back in linear Rec.2020. An unbound slot reads `fallback`.
+// come back in their texture's primaries; `material_color` multiplies them by a factor. An
+// unbound slot reads `fallback`.
 public float4 material_texture(MaterialGpu* m, uint slot, UvFootprint f, float4 fallback)
 {
     TextureIndex t = m.textures[slot];
@@ -189,14 +190,21 @@ public float4 material_texture(MaterialGpu* m, uint slot, UvFootprint f, float4 
         return fallback;
     float4 v = texture_footprint(t, m.sampler, f);
     uint c = material_channel(m, slot);
-    float4 r = c == 0 ? v : c == 1 ? float4(v.yzw, 1.0) : c == 2 ? float4(v.zw, 0.0, 1.0) : float4(v.w, 0.0, 0.0, 1.0);
-    if (slot == TEXTURE_BASE_COLOR || slot == TEXTURE_EMISSION || slot == TEXTURE_SUBSURFACE_COLOR)
-    {
-        uint primaries = (m.primaries >> (2 * slot)) & 3;
-        if (primaries == 0)
-            r.rgb = mul(REC709_TO_REC2020, r.rgb);
-        else if (primaries == 1)
-            r.rgb = mul(P3_TO_REC2020, r.rgb);
-    }
-    return r;
+    return c == 0 ? v : c == 1 ? float4(v.yzw, 1.0) : c == 2 ? float4(v.zw, 0.0, 1.0) : float4(v.w, 0.0, 0.0, 1.0);
+}
+
+// Linear Rec.2020 `factor` times color slot `slot`'s texel over footprint `f`, in linear
+// Rec.2020. The product is taken in the texture's primaries, so a factor tints a texel as it
+// would in the space the texel was authored in. An unbound slot returns `factor`.
+public float3 material_color(MaterialGpu* m, uint slot, UvFootprint f, float3 factor)
+{
+    if (!material_bound(m, slot))
+        return factor;
+    float3 texel = material_texture(m, slot, f, float4(1.0)).rgb;
+    uint primaries = (m.primaries >> (2 * slot)) & 3;
+    if (primaries == 0)
+        return mul(REC709_TO_REC2020, mul(REC2020_TO_REC709, factor) * texel);
+    if (primaries == 1)
+        return mul(P3_TO_REC2020, mul(REC2020_TO_P3, factor) * texel);
+    return factor * texel;
 }

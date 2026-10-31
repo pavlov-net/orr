@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytemuck::{Pod, Zeroable};
+use orr_color::{RgbPrimaries, mat_f32, mul_f32};
 use orr_gpu::{Allocation, Device, MemoryKind, SamplerIndex, TextureIndex};
 use orr_pack::material::{Material, slot};
 use orr_pack::texture::TextureHeader;
@@ -74,21 +75,17 @@ pub(crate) fn candidate_class(flags: impl IntoIterator<Item = u32>) -> Option<u8
     classes.all(|c| c == first).then_some(first)
 }
 
-/// Linear Rec.709 to linear Rec.2020, row-major.
-const REC709_TO_REC2020: [[f32; 3]; 3] = [
-    [0.627_403_9, 0.329_283_04, 0.043_313_06],
-    [0.069_097_29, 0.919_540_4, 0.011_362_3],
-    [0.016_391_44, 0.088_013_3, 0.895_595_3],
-];
+const REC709_TO_REC2020: [[f32; 3]; 3] =
+    mat_f32(RgbPrimaries::REC709.matrix_to(RgbPrimaries::REC2020));
 
 fn rec2020(c: [f32; 3]) -> [f32; 3] {
-    REC709_TO_REC2020.map(|r| r[0] * c[0] + r[1] * c[1] + r[2] * c[2])
+    mul_f32(&REC709_TO_REC2020, c)
 }
 
 impl MaterialGpu {
     /// The record of a cooked material whose slots read `textures`, sampled with `sampler`.
-    /// Colours convert from Rec.709 to Rec.2020; flags and the cost class follow the
-    /// parameters.
+    /// Colors convert from Rec.709 to Rec.2020, and a color slot's factor multiplies its
+    /// texels in the texture's primaries; flags and the cost class follow the parameters.
     pub fn new(m: &Material, textures: &[BoundTexture; 12], sampler: SamplerIndex) -> Self {
         use material_flags as f;
         let bound = |s: usize| textures[s].index != TextureIndex::NONE;
