@@ -11,13 +11,14 @@
 //! pages hold whole clusters of one level, coarsest level first, and the coarsest level's
 //! pages are pinned. DAG mode builds the clusters, groups, pages and hierarchy in [`dag`].
 //! Alpha-tested clusters put opaque triangles first and carry opacity micromaps over the
-//! rest.
+//! rest. Clusters of subsurface sections carry their minimum thickness ([`thickness`]).
 
 mod dag;
 mod displace;
 mod lod;
 pub(crate) mod maps;
 mod omm;
+mod thickness;
 
 use std::ops::Range;
 
@@ -601,6 +602,11 @@ fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
         .iter_mut()
         .flatten()
         .for_each(|c| c.uvs = Vec::new());
+    thickness::assign(
+        by_level.iter_mut().flatten().collect(),
+        cx.grid,
+        cx.sections,
+    );
 
     // Pages, coarsest level first; mesh cluster indices count in page order.
     let mut pages = Vec::new();

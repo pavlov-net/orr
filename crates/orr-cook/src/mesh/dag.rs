@@ -540,6 +540,11 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
     groups
         .par_iter_mut()
         .try_for_each(|g| fit(cx, &mut g.clusters))?;
+    super::thickness::assign(
+        groups.iter_mut().flat_map(|g| &mut g.clusters).collect(),
+        cx.grid,
+        cx.sections,
+    );
 
     // Terminal groups first and on pages of their own, then merged stages, then coarse to
     // fine.

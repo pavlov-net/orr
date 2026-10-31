@@ -30,7 +30,7 @@ pub use omm::*;
 use crate::blob::{put_table, read, table};
 use crate::{Aabb, Affine3, Error, Result, Span, Sphere};
 
-pub const SCHEMA: u16 = 4;
+pub const SCHEMA: u16 = 5;
 
 /// Largest hierarchy node page.
 pub const NODE_PAGE_MAX: usize = 64 << 10;
@@ -274,7 +274,9 @@ pub struct Cluster {
     pub omm_first: u32,
     /// Triangle area at the cluster's own level, model space, square metres.
     pub area: f32,
-    /// f16 bits, metres.
+    /// f16 bits, metres: on clusters of subsurface sections the smallest distance a ray cast
+    /// inward from one of its triangles travels to the geometry drawn with it (infinity when
+    /// none hits); 0 elsewhere.
     pub min_thickness: u16,
     pub _pad: u16,
 }

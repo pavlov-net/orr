@@ -1,4 +1,5 @@
-//! Discrete levels, rigid parts and the merged stage, on meshes handed over in memory.
+//! Discrete levels, rigid parts, the merged stage and subsurface thickness, on meshes handed
+//! over in memory.
 
 use std::collections::HashSet;
 
@@ -66,6 +67,15 @@ fn wavy(n: u32, bands: u16) -> MeshInput {
 
 fn cook(mesh: MeshInput, settings: MeshSettings) -> orr_cook::Result<Archive> {
     let materials = vec![Material::default(); mesh.sections.len()];
+    cook_with(mesh, materials, settings).map(|(a, _)| a)
+}
+
+/// The archive and the entries' warnings.
+fn cook_with(
+    mesh: MeshInput,
+    materials: Vec<Material>,
+    settings: MeshSettings,
+) -> orr_cook::Result<(Archive, Vec<String>)> {
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(
             Target::Memory,
@@ -79,14 +89,19 @@ fn cook(mesh: MeshInput, settings: MeshSettings) -> orr_cook::Result<Archive> {
             }],
         )],
     };
-    let bytes = orr_cook::cook(&manifest, &Default::default())?
-        .memory
-        .remove(0);
-    let a = Archive::from_memory(bytes).unwrap();
+    let mut cooked = orr_cook::cook(&manifest, &Default::default())?;
+    let warnings = cooked
+        .report
+        .assets
+        .iter()
+        .flat_map(|a| &a.entries)
+        .flat_map(|e| e.warnings.clone())
+        .collect();
+    let a = Archive::from_memory(cooked.memory.remove(0)).unwrap();
     for e in a.entries() {
         a.verify(e).unwrap();
     }
-    Ok(a)
+    Ok((a, warnings))
 }
 
 fn read(a: &Archive, b: &orr_pack::Blob) -> Vec<u8> {
@@ -362,4 +377,124 @@ fn grid_steps_follow_the_extent() {
         assert_eq!(i32::from(info.header.position_exponent), expected);
         assert_eq!(expected, k);
     }
+}
+
+/// A closed `w` x `w` x `t` box, its square faces split into `n` x `n` quads and its sides
+/// into `n` quads along their length, each face with its own vertices and uvs.
+fn slab(w: f32, t: f32, n: u32) -> MeshInput {
+    let mut m = MeshInput::default();
+    let mut uvs = Vec::new();
+    let x = Vec3::X * w;
+    let y = Vec3::Y * w;
+    let z = Vec3::Z * t;
+    // Origin and the two edges, outward normal along their cross product.
+    let faces = [
+        (z, x, y, n, n),
+        (Vec3::ZERO, y, x, n, n),
+        (Vec3::ZERO, z, y, 1, n),
+        (x, y, z, n, 1),
+        (Vec3::ZERO, x, z, n, 1),
+        (y, z, x, 1, n),
+    ];
+    for (f, (o, u, v, nu, nv)) in faces.into_iter().enumerate() {
+        let base = m.positions.len() as u32;
+        let normal = u.cross(v).normalize();
+        for j in 0..=nv {
+            for i in 0..=nu {
+                let (a, b) = (i as f32 / nu as f32, j as f32 / nv as f32);
+                m.positions.push(o + u * a + v * b);
+                m.normals.push(normal);
+                uvs.push(Vec2::new(a + 2.0 * f as f32, b));
+            }
+        }
+        for j in 0..nv {
+            for i in 0..nu {
+                let c = base + j * (nu + 1) + i;
+                let r = nu + 1;
+                m.indices.extend([c, c + 1, c + r + 1, c, c + r + 1, c + r]);
+            }
+        }
+    }
+    m.uvs = Some(uvs);
+    m.sections = vec![Span {
+        first: 0,
+        count: m.indices.len() as u32,
+    }];
+    m
+}
+
+#[test]
+fn subsurface_clusters_carry_their_thickness() {
+    let skin = Material {
+        subsurface_weight: 1.0,
+        ..Material::default()
+    };
+    let w = 0.25;
+    for t in [0.001f32, 0.003, 0.01, 0.03, 0.1] {
+        // Levels under the thickness keep the slab; coarser ones fold it.
+        let modes = [
+            LodMode::Discrete {
+                errors: vec![0.05 * t, 0.2 * t, 0.45 * t],
+            },
+            LodMode::Dag,
+        ];
+        for lod in &modes {
+            let settings = MeshSettings {
+                lod: lod.clone(),
+                ..Default::default()
+            };
+            let (a, warnings) = cook_with(slab(w, t, 24), vec![skin], settings).unwrap();
+            assert!(warnings.is_empty(), "{warnings:?}");
+            let (info, pages) = clusters(&a);
+            let step = 2f32.powi(i32::from(info.header.position_exponent));
+            let snapped = (t / step).round() * step;
+            let mut levels = HashSet::new();
+            for (page, cs) in &pages {
+                let view = PageView::new(page, &info.header).unwrap();
+                for c in cs.iter().filter(|c| c.self_error < 0.5 * t) {
+                    // Caps are `t` apart, sides `w`.
+                    let caps = (0..u32::from(c.tri_count)).any(|i| {
+                        let p = view
+                            .triangle(c, i)
+                            .map(|k| Vec3::from(view.position(c, k.into())));
+                        (p[1] - p[0]).cross(p[2] - p[0]).normalize().z.abs() > 0.5
+                    });
+                    let expected = if caps { snapped } else { w };
+                    let got = half::f16::from_bits(c.min_thickness).to_f32();
+                    assert!(
+                        (got - expected).abs() <= 0.05 * expected,
+                        "{lod:?} slab {t} m: cluster at error {} has {got} m, expected {expected} m",
+                        c.self_error
+                    );
+                    levels.insert(c.self_error.to_bits());
+                }
+            }
+            assert!(levels.len() > 1, "{lod:?}: one level");
+        }
+    }
+
+    // An open box warns; clusters of other materials carry no thickness.
+    let mut open = slab(w, 0.01, 4);
+    let tris = open.indices.len() as u32;
+    open.sections[0].count = tris - 6;
+    let (a, warnings) = cook_with(open, vec![skin], MeshSettings::default()).unwrap();
+    assert!(
+        warnings.len() == 1 && warnings[0].contains("border edges"),
+        "{warnings:?}"
+    );
+    assert!(
+        clusters(&a)
+            .1
+            .iter()
+            .flat_map(|p| &p.1)
+            .all(|c| c.min_thickness != 0)
+    );
+    let a = cook(slab(w, 0.01, 4), MeshSettings::default()).unwrap();
+    assert!(
+        clusters(&a)
+            .1
+            .iter()
+            .flat_map(|p| &p.1)
+            .all(|c| c.min_thickness == 0)
+    );
 }
