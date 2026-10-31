@@ -31,14 +31,29 @@ impl log::Log for StderrLog {
     fn flush(&self) {}
 }
 
-/// The process's test device: every queue kind, validation on, messages logged to stderr.
+/// The pipeline cache file the test binaries of one build profile share, beside them under
+/// `target/<profile>/`. Shader edits leave stale pipelines in it, so it starts over once it
+/// outgrows 256 MiB.
+fn pipeline_cache_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let path = exe.parent()?.parent()?.join("test-pipeline-cache.bin");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 256 << 20) {
+        let _ = std::fs::remove_file(&path);
+    }
+    Some(path)
+}
+
+/// The process's test device: every queue kind, validation on, messages logged to stderr,
+/// pipelines cached in `target/<profile>/test-pipeline-cache.bin` (written by [`assert_clean`]).
 pub fn device() -> &'static Device {
     static DEVICE: OnceLock<Device> = OnceLock::new();
     DEVICE.get_or_init(|| {
         let _ = log::set_logger(&StderrLog);
         log::set_max_level(log::LevelFilter::Info);
+        let cache = pipeline_cache_path();
         let desc = DeviceDesc {
             name: "orr-test",
+            pipeline_cache: cache.as_deref(),
             validation: true,
             queues: QueueRequest {
                 render_compute: true,
@@ -52,8 +67,12 @@ pub fn device() -> &'static Device {
     })
 }
 
-/// Fails the calling test if the validation layer has reported anything on [`device`].
+/// Writes [`device`]'s pipeline cache, then fails the calling test if the validation layer
+/// has reported anything on it.
 pub fn assert_clean() {
+    if let Err(e) = device().save_pipeline_cache() {
+        log::warn!("{e}");
+    }
     assert_eq!(
         device().validation_messages(),
         0,

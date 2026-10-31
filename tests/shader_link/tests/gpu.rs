@@ -245,12 +245,22 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
         [
             "environment/bake",
             "light_sampling/directional",
-            "path/opaque"
+            "path/opaque",
+            "world_cache/update"
         ]
     );
-    if let Some(e) = renderer_error(&orr_linked::KERNELS) {
-        panic!("{e}");
-    }
+    let mut r = Renderer::new(
+        device(),
+        RendererDesc {
+            kernels: &orr_linked::KERNELS,
+            ..RendererDesc::default()
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    // Compiles the path tracing pipelines from the linked `path/opaque` and
+    // `world_cache/update`.
+    r.create_view_history().unwrap();
+    drop(r);
     // The linked modules create pipelines as orr's own do.
     for &m in orr_linked::KERNELS.modules {
         for e in m.entry_points.iter().filter(|e| e.stage == Stage::Compute) {

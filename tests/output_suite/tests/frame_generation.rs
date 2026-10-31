@@ -11,7 +11,7 @@
 #![cfg(windows)]
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use egui::epaint::ClippedShape;
@@ -34,6 +34,13 @@ use orr_output::orr_dlss::Uuid;
 use output_suite::shaders::moving_bar;
 
 const PROJECT_ID: Uuid = Uuid::from_u128(0x2f6b_91c4_5a0e_4d3b_b7e2_0c18_d94a_6e53);
+
+/// NGX frame generation and the driver's latency reports are per process: a second test's
+/// frames break the first one's report order, so one test runs at a time.
+fn serial() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
 /// Frames per phase.
 const PHASE: u64 = 160;
 const PHASES: u64 = 7;
@@ -110,6 +117,7 @@ fn phase(
 
 #[test]
 fn frame_generation_presents_generated_images_before_each_frame() {
+    let _serial = serial();
     gpu_suite::log_to_stderr();
     let hooks = DlssSdk::device_hooks(PROJECT_ID);
     let gpu = Device::new(&DeviceDesc {
@@ -721,6 +729,7 @@ mod lens_distortion {
 
     #[test]
     fn distorted_pan_keeps_mid_frame_flip() {
+        let _serial = super::serial();
         gpu_suite::log_to_stderr();
         let hooks = DlssSdk::device_hooks(PROJECT_ID);
         let gpu = Device::new(&DeviceDesc {
