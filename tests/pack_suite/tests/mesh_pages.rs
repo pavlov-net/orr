@@ -79,15 +79,15 @@ fn check(page: &[u8], mesh: &MeshHeader, spread: &mut Spread) {
         .gpu_malloc::<page::Root>(MemoryKind::Upload, 1, "root")
         .unwrap();
     root.as_mut_slice().unwrap()[0] = page::Root {
-        page: buf.gpu,
-        header: header.gpu,
-        clusters: clusters.gpu,
-        vertices: vertices.gpu,
-        triangles: triangles.gpu,
+        page: buf.gpu(),
+        header: header.gpu(),
+        clusters: clusters.gpu(),
+        vertices: vertices.gpu(),
+        triangles: triangles.gpu(),
         attributes: u32::from(mesh.attributes),
         exponent: i32::from(mesh.position_exponent),
     };
-    dispatch(&page::MODULE, root.gpu, n as u32);
+    dispatch(&page::MODULE, root.gpu(), n as u32);
 
     assert_eq!(
         bytemuck::bytes_of(&header.as_slice().unwrap()[0]),

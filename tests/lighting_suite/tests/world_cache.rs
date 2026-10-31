@@ -105,8 +105,8 @@ impl Cache {
         let out = readback::<cache_probe::KeyOut>(cases.len() as u64, "keys");
         let root = upload(
             &[cache_probe::Root {
-                cases: input.gpu,
-                keys: out.gpu,
+                cases: input.gpu(),
+                keys: out.gpu(),
                 count: cases.len() as u32,
                 ..self.root(GpuPtr::NULL)
             }],
@@ -115,7 +115,7 @@ impl Cache {
         let mut list = render().command_list().unwrap();
         list.dispatch(
             &self.keys,
-            root.gpu,
+            root.gpu(),
             [cases.len().div_ceil(64) as u32, 1, 1],
         );
         finish(list);
@@ -152,8 +152,8 @@ impl Cache {
         let frame = self.scene.frame;
         let root = upload(
             &[cache_probe::Root {
-                samples: input.gpu,
-                cells: cells.gpu,
+                samples: input.gpu(),
+                cells: cells.gpu(),
                 count: samples.len() as u32,
                 ..self.root(self.lighting.world_cache(frame))
             }],
@@ -163,10 +163,10 @@ impl Cache {
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
         self.lighting.record(&mut list, &self.scene.pass([0.0; 3]));
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-        list.dispatch(&self.cells, root.gpu, [self.capacity.div_ceil(64), 1, 1]);
+        list.dispatch(&self.cells, root.gpu(), [self.capacity.div_ceil(64), 1, 1]);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         if !samples.is_empty() {
-            list.dispatch(&self.add, root.gpu, [1, 1, 1]);
+            list.dispatch(&self.add, root.gpu(), [1, 1, 1]);
         }
         finish(list);
         cells

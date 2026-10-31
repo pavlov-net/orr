@@ -39,12 +39,12 @@ fn breadcrumbs_track_running_passes() {
     let roots = upload(
         &[
             gate::Root {
-                flag: open.gpu,
-                out: out.gpu,
+                flag: open.gpu(),
+                out: out.gpu(),
             },
             gate::Root {
-                flag: shut.gpu,
-                out: out.gpu.offset(1),
+                flag: shut.gpu(),
+                out: out.gpu().offset(1),
             },
         ],
         "gate roots",
@@ -55,11 +55,11 @@ fn breadcrumbs_track_running_passes() {
     let queue = render();
     let mut list = queue.command_list().unwrap();
     list.begin_pass("first", false);
-    list.dispatch(&first, roots.gpu, [1, 1, 1]);
+    list.dispatch(&first, roots.gpu(), [1, 1, 1]);
     list.end_pass();
     list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
     list.begin_pass("held", false);
-    list.dispatch(&held, roots.gpu.offset(1), [1, 1, 1]);
+    list.dispatch(&held, roots.gpu().offset(1), [1, 1, 1]);
     list.end_pass();
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     let point = queue.submit(vec![list], &[]).unwrap();

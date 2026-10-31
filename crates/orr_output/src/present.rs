@@ -782,7 +782,7 @@ impl Display {
                 f
             }
         };
-        let flag_ptr = flag.cpu.expect("readback memory is mapped");
+        let flag_ptr = flag.mapped_ptr().expect("readback memory is mapped");
         // SAFETY: the mapping lives as long as `flag`. No GPU work uses it now: the last
         // evaluate that wrote it completed before the present thread read it, which it did
         // before the slot came back to this frame.

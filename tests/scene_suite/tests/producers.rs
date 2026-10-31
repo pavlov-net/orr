@@ -212,7 +212,7 @@ impl Field {
                 low_latency: None,
             })
             .unwrap();
-        let triangles = self.triangles.gpu;
+        let triangles = self.triangles.gpu();
         f.update_scenes(&mut |c| {
             for e in emits {
                 let r = c
@@ -310,7 +310,7 @@ fn rays(view: &RasterView, mode: u32, mask: u32) -> Vec<producer_rays::Seen> {
         scene: view.scene,
         view: view.view,
         gbuffer: view.gbuffer,
-        seen: seen.gpu,
+        seen: seen.gpu(),
         mode,
         mask,
         grid_x: -2.2,
@@ -325,7 +325,7 @@ fn rays(view: &RasterView, mode: u32, mask: u32) -> Vec<producer_rays::Seen> {
     let render = d.queue(QueueKind::Render).unwrap();
     let mut list = render.command_list().unwrap();
     list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::ACCEL_STRUCT);
-    list.dispatch(&p, root.gpu, [n.div_ceil(64) as u32, 1, 1]);
+    list.dispatch(&p, root.gpu(), [n.div_ceil(64) as u32, 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     wait(render.submit(vec![list], &[]).unwrap());
     seen.as_slice().unwrap().to_vec()

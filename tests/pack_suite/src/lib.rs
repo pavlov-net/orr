@@ -76,7 +76,7 @@ pub fn decode_stored(stored: &[Vec<u8>]) -> StoredDecode {
         .gpu_malloc::<StoredPage>(MemoryKind::Upload, n as u64, "pages")
         .unwrap();
     let mut clusters = 1;
-    let (src_at, dst_at) = (src.gpu.address().0, dst.gpu.address().0);
+    let (src_at, dst_at) = (src.gpu().address().0, dst.gpu().address().0);
     let (bytes, records) = (src.as_mut_slice().unwrap(), pages.as_mut_slice().unwrap());
     for (i, p) in stored.iter().enumerate() {
         bytes[offsets[i]..][..p.len()].copy_from_slice(p);
@@ -94,8 +94,8 @@ pub fn decode_stored(stored: &[Vec<u8>]) -> StoredDecode {
     }
     let mut root = d.gpu_malloc::<Root>(MemoryKind::Upload, 1, "root").unwrap();
     root.as_mut_slice().unwrap()[0] = Root {
-        pages: pages.gpu,
-        status: status.gpu,
+        pages: pages.gpu(),
+        status: status.gpu(),
     };
     let pipeline = |entry| {
         let stage = ShaderStage::new(&MODULE, entry, SpecData::default()).unwrap();
@@ -105,9 +105,9 @@ pub fn decode_stored(stored: &[Vec<u8>]) -> StoredDecode {
     let loading = d.queue(QueueKind::Loading).unwrap();
     let mut cmd = loading.command_list().unwrap();
     cmd.begin_pass("page codec", false);
-    cmd.dispatch(&copy, root.gpu, [(slot / 4 / 256) as u32, n as u32, 1]);
+    cmd.dispatch(&copy, root.gpu(), [(slot / 4 / 256) as u32, n as u32, 1]);
     cmd.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-    cmd.dispatch(&decode, root.gpu, [clusters, n as u32, 1]);
+    cmd.dispatch(&decode, root.gpu(), [clusters, n as u32, 1]);
     cmd.end_pass();
     cmd.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     let done = loading.submit(vec![cmd], &[]).unwrap();

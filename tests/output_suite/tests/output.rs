@@ -101,7 +101,7 @@ fn run(display: &ResolvedDisplay, format: Format) -> Vec<u8> {
         .gpu_malloc::<ViewConstants>(MemoryKind::Upload, 1, "view constants")
         .unwrap();
     let mut view: ViewConstants = bytemuck::Zeroable::zeroed();
-    view.exposure = exposure.gpu;
+    view.exposure = exposure.gpu();
     constants.as_mut_slice().unwrap()[0] = view;
 
     let kernels = OutputKernels::new(gpu).unwrap();
@@ -114,7 +114,7 @@ fn run(display: &ResolvedDisplay, format: Format) -> Vec<u8> {
         list.discard(t);
     }
     let whole = TextureRegion::whole_mip(source.desc(), 0);
-    list.copy_to_texture(&source, &whole, upload.gpu.cast());
+    list.copy_to_texture(&source, &whole, upload.gpu().cast());
     list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
     kernels.tonemap(
         &mut list,
@@ -123,7 +123,7 @@ fn run(display: &ResolvedDisplay, format: Format) -> Vec<u8> {
             source: source_index,
             target: linear_store,
             extent,
-            view: constants.gpu,
+            view: constants.gpu(),
             display,
             output: &ViewOutput::default(),
             hook_source: None,

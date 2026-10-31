@@ -138,8 +138,8 @@ impl GlareKernels {
         let (pitch_ratio, hdr_shift) = lens_terms(pass);
         let base = Root {
             view: pass.view,
-            tables: self.tables.gpu,
-            weights: targets.weights.gpu,
+            tables: self.tables.gpu(),
+            weights: targets.weights.gpu(),
             source: TextureIndex::NONE,
             target: StorageImageIndex::NONE,
             linear: self.linear,
@@ -289,12 +289,12 @@ impl GlareTargets {
     pub(crate) fn composite(&self) -> GlareComposite {
         GlareComposite {
             chain: self.chain.sampled,
-            weights: self.weights.gpu,
+            weights: self.weights.gpu(),
         }
     }
 
     pub(crate) fn bytes(&self) -> u64 {
-        self.chain.bytes() + self.weights.size
+        self.chain.bytes() + self.weights.size()
     }
 }
 

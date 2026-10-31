@@ -109,7 +109,7 @@ pub fn read_buffer_on<T: Pod>(d: &Device, src: GpuPtr<T>, count: u64) -> Vec<T> 
     let render = d.queue(QueueKind::Render).unwrap();
     let mut list = render.command_list().unwrap();
     list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
-    list.copy(out.gpu.cast(), src.cast(), out.size);
+    list.copy(out.gpu().cast(), src.cast(), out.size());
     list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
     let point = render.submit(vec![list], &[]).unwrap();
     render.wait(point, Duration::from_secs(10)).expect("wait");
@@ -130,7 +130,7 @@ pub fn read_texture_on(d: &Device, t: &Texture, region: &TextureRegion) -> Vec<u
     let render = d.queue(QueueKind::Render).unwrap();
     let mut list = render.command_list().unwrap();
     list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
-    list.copy_from_texture(out.gpu, t, region);
+    list.copy_from_texture(out.gpu(), t, region);
     list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
     let point = render.submit(vec![list], &[]).unwrap();
     render.wait(point, Duration::from_secs(10)).expect("wait");

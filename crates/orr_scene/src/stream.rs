@@ -346,7 +346,7 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
                 });
                 t.done.lock().unwrap().push(landed(
                     Some(slot),
-                    block.gpu,
+                    block.gpu(),
                     result.map_err(Arc::new),
                 ));
                 if let Some(l) = l.upgrade() {

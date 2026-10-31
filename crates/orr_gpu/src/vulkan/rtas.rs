@@ -423,7 +423,11 @@ impl RtasCheck {
             }
         };
         let counter = mapped.expect("Readback memory is mapped").cast::<u32>();
-        // SAFETY: the mapping holds four bytes nothing else uses yet.
+        assert!(
+            counter.is_aligned(),
+            "PTLAS check mapping is not word aligned"
+        );
+        // SAFETY: the mapping holds one aligned word (asserted above) nothing else uses yet.
         unsafe { counter.as_ptr().write_volatile(0) };
         Ok(Self {
             pipeline,

@@ -344,7 +344,7 @@ pub(crate) fn view_constants(
         eye_offset: eye.offset.extend(0.0).to_array(),
         jitter: desc.jitter.to_array(),
         extent: desc.render_extent.to_array(),
-        exposure: history.exposure.gpu,
+        exposure: history.exposure.gpu(),
         exposure_slot,
         frame_index: frame as u32,
         delta_time,

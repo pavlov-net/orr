@@ -422,7 +422,7 @@ fn run_on_orr(
             .gpu_malloc(MemoryKind::Upload, bytes.len() as u64, "rr upload")
             .expect("upload");
         a.as_mut_slice().unwrap().copy_from_slice(bytes);
-        list.copy_to_texture(t, &TextureRegion::whole_mip(t.desc(), 0), a.gpu);
+        list.copy_to_texture(t, &TextureRegion::whole_mip(t.desc(), 0), a.gpu());
         uploads.push(a);
     };
 
@@ -469,7 +469,7 @@ fn run_on_orr(
         list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
         if frame + 1 == frames {
             list.copy_from_texture(
-                readback.gpu,
+                readback.gpu(),
                 &last,
                 &TextureRegion::whole_mip(last.desc(), 0),
             );

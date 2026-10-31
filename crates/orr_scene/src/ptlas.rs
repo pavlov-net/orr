@@ -328,7 +328,7 @@ impl Ptlas {
             self.storage = Some(self.create(device, fif)?);
         }
         let s = self.storage.as_ref().expect("made above");
-        Ok(Some(Tlas(s.tlas.gpu.address().0)))
+        Ok(Some(Tlas(s.tlas.gpu().address().0)))
     }
 
     fn create(&self, device: &Device, fif: u32) -> Result<Storage> {
@@ -338,7 +338,7 @@ impl Ptlas {
         let mut blocks = Vec::new();
         let mut block = |bytes: u64, name: &str| -> Result<GpuPtr<u8>> {
             let a = device.gpu_malloc::<u8>(dl, bytes.max(16), name)?;
-            let gpu = a.gpu;
+            let gpu = a.gpu();
             blocks.push(a);
             Ok(gpu)
         };
@@ -370,9 +370,9 @@ impl Ptlas {
         let part_free = block(4 * stacks, "part free lists")?.cast();
         let part_released = block(4 * parts, "released part runs")?.cast();
         let record = PtlasGpu {
-            partitions: self.partition_table.gpu,
-            slot_partition: self.slot_table.gpu,
-            pending: pending.gpu,
+            partitions: self.partition_table.gpu(),
+            slot_partition: self.slot_table.gpu(),
+            pending: pending.gpu(),
             partition_state: state,
             buckets,
             counters,
@@ -398,14 +398,14 @@ impl Ptlas {
             "PTLAS",
         )?;
         let bytes = [
-            tlas.size,
-            pending.size,
-            self.partition_table.size,
-            self.slot_table.size,
-            self.part_slots.size,
+            tlas.size(),
+            pending.size(),
+            self.partition_table.size(),
+            self.slot_table.size(),
+            self.part_slots.size(),
         ]
         .into_iter()
-        .chain(blocks.iter().map(|b| b.size))
+        .chain(blocks.iter().map(Allocation::size))
         .sum();
         Ok(Storage {
             tlas,
@@ -446,7 +446,7 @@ impl Ptlas {
                     count: part.count,
                 };
                 let src = window.put(device, &value)?;
-                let dst = self.partition_table.gpu.offset(u64::from(p));
+                let dst = self.partition_table.gpu().offset(u64::from(p));
                 Ok(Record::values(
                     seq.fetch_add(1, Ordering::Relaxed),
                     dst,
@@ -511,7 +511,7 @@ impl Ptlas {
         };
         let root = PtlasRoot {
             scene: f.scene,
-            ptlas: s.record.gpu,
+            ptlas: s.record.gpu(),
             focus_cell: f.focus_cell,
             focus_offset: f.focus_offset,
             slots: self.high_water,
@@ -559,7 +559,7 @@ impl Ptlas {
             Stages::AS_BUILD | Stages::TRANSFER,
             Hazards::empty(),
         );
-        let tlas = s.tlas.gpu.address();
+        let tlas = s.tlas.gpu().address();
         list.rtas_execute(
             &desc(self.limits),
             &RtasIo {
@@ -572,7 +572,7 @@ impl Ptlas {
                 src: if s.built { tlas } else { GpuAddress(0) },
             },
         );
-        let at = s.readback.gpu.offset(f.slot as u64);
+        let at = s.readback.gpu().offset(f.slot as u64);
         list.copy(at.cast(), s.counters.cast(), 4 * COUNTERS as u64);
         list.end_pass();
         s.built = true;

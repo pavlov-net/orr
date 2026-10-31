@@ -63,8 +63,8 @@ pub struct Buffer {
     pub buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     pub address: u64,
-    pub ptr: *mut u8,
-    pub size: u64,
+    ptr: *mut u8,
+    size: u64,
 }
 
 pub struct Gpu {

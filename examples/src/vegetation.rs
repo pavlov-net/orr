@@ -1235,7 +1235,7 @@ impl DenseVegetation {
                 )
                 .expect("moon");
             }
-            w.set_environment(environment.gpu.address());
+            w.set_environment(environment.gpu().address());
         }
         let land_kernel = kernels.terrain;
         f.update_scenes(&mut |c| {
@@ -1316,7 +1316,7 @@ impl DenseVegetation {
             let root = c
                 .put_root(&sway::Root {
                     scene: c.root,
-                    joints: p.joints.gpu,
+                    joints: p.joints.gpu(),
                     group: p.group.0,
                     blocks: p.blocks,
                     parts: p.parts,
@@ -1569,7 +1569,7 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                     });
                     pass.cmd.draw_mesh_tasks_indirect_count(
                         glow,
-                        roots.gpu.offset(slot),
+                        roots.gpu().offset(slot),
                         pass.particle_args,
                         pass.particle_draws,
                         1,
@@ -1612,7 +1612,7 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                 let list = f.list().expect("frame list");
                 list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
                 list.copy(
-                    readback.gpu.offset(slot).cast(),
+                    readback.gpu().offset(slot).cast(),
                     rendered.raster.counts.cast(),
                     (COUNTS * 4) as u64,
                 );

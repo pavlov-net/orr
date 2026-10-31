@@ -38,8 +38,8 @@ fn root_layout_reads_back_exact() {
         &[root_layout::Root {
             m,
             v,
-            rec: rec.gpu,
-            out: out.gpu,
+            rec: rec.gpu(),
+            out: out.gpu(),
             seed: 99,
             pad0: 0,
             pad1: 0,
@@ -49,7 +49,7 @@ fn root_layout_reads_back_exact() {
     );
     let p = pipeline(&root_layout::MODULE, "main");
     let mut list = render().command_list().unwrap();
-    list.dispatch(&p, root.gpu, [1, 1, 1]);
+    list.dispatch(&p, root.gpu(), [1, 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     run(list);
 
@@ -115,7 +115,7 @@ fn sampled_and_storage_views_in_adjacent_slots() {
     let texels = readback::<[f32; 4]>(u64::from(w * h), "heap views texels");
     let root = upload(
         &[heap_views::Root {
-            out: out.gpu,
+            out: out.gpu(),
             source,
             nearest,
             target,
@@ -130,14 +130,18 @@ fn sampled_and_storage_views_in_adjacent_slots() {
     let groups = [w.div_ceil(8), h.div_ceil(4), 1];
     let mut list = render().command_list().unwrap();
     list.discard(&tex);
-    list.dispatch(&store, root.gpu, groups);
+    list.dispatch(&store, root.gpu(), groups);
     list.barrier(
         Stages::COMPUTE,
         Stages::COMPUTE | Stages::TRANSFER,
         Hazards::empty(),
     );
-    list.dispatch(&sample, root.gpu, groups);
-    list.copy_from_texture(texels.gpu.cast(), &tex, &TextureRegion::whole_mip(&desc, 0));
+    list.dispatch(&sample, root.gpu(), groups);
+    list.copy_from_texture(
+        texels.gpu().cast(),
+        &tex,
+        &TextureRegion::whole_mip(&desc, 0),
+    );
     list.barrier(
         Stages::COMPUTE | Stages::TRANSFER,
         Stages::HOST,
@@ -191,8 +195,8 @@ fn atomic_max_u64_matches_cpu() {
     let zero = upload(&vec![0u64; slots as usize], "atomic zero");
     let root = upload(
         &[atomic_max::Root {
-            slots: out.gpu,
-            values: values.gpu,
+            slots: out.gpu(),
+            values: values.gpu(),
             count: count as u32,
             slot_count: slots as u32,
             pad0: 0,
@@ -202,9 +206,9 @@ fn atomic_max_u64_matches_cpu() {
     );
     let p = pipeline(&atomic_max::MODULE, "main");
     let mut list = render().command_list().unwrap();
-    list.copy(out.gpu.cast(), zero.gpu.cast(), out.size);
+    list.copy(out.gpu().cast(), zero.gpu().cast(), out.size());
     list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
-    list.dispatch(&p, root.gpu, [(count as u32).div_ceil(64), 1, 1]);
+    list.dispatch(&p, root.gpu(), [(count as u32).div_ceil(64), 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     run(list);
     assert_eq!(out.as_slice().unwrap(), &expected[..]);
@@ -218,9 +222,9 @@ fn trace(scene: Tlas, entry: &str) -> Vec<u32> {
     let scene_ptr = upload(&[scene], "scene pointer");
     let root = upload(
         &[rays::Root {
-            out: out.gpu,
+            out: out.gpu(),
             scene,
-            scene_ptr: scene_ptr.gpu,
+            scene_ptr: scene_ptr.gpu(),
             width: w,
             height: h,
         }],
@@ -228,7 +232,7 @@ fn trace(scene: Tlas, entry: &str) -> Vec<u32> {
     );
     let p = pipeline(&rays::MODULE, entry);
     let mut list = render().command_list().unwrap();
-    list.dispatch(&p, root.gpu, [w.div_ceil(8), h.div_ceil(4), 1]);
+    list.dispatch(&p, root.gpu(), [w.div_ceil(8), h.div_ceil(4), 1]);
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     run(list);
     out.as_slice().unwrap().to_vec()
@@ -285,7 +289,7 @@ fn lists_recorded_on_two_threads() {
     let b = readback::<u32>(count, "thread b");
     let root_a = upload(
         &[pattern::Root {
-            out: a.gpu,
+            out: a.gpu(),
             count: count as u32,
             seed: 1,
         }],
@@ -293,7 +297,7 @@ fn lists_recorded_on_two_threads() {
     );
     let root_b = upload(
         &[pattern::Root {
-            out: b.gpu,
+            out: b.gpu(),
             count: count as u32,
             seed: 2,
         }],
@@ -314,8 +318,8 @@ fn lists_recorded_on_two_threads() {
                 list
             }
         };
-        let ta = s.spawn(record(root_a.gpu, true));
-        let tb = s.spawn(record(root_b.gpu, false));
+        let ta = s.spawn(record(root_a.gpu(), true));
+        let tb = s.spawn(record(root_b.gpu(), false));
         vec![ta.join().unwrap(), tb.join().unwrap()]
     });
     let point = queue.submit(lists, &[]).unwrap();
@@ -446,8 +450,8 @@ fn coopvec_case(
 
     let as_f32: Vec<f32> = inputs.iter().map(|v| v.to_f32()).collect();
     let input = upload(&as_f32, "coopvec input");
-    let gpu = on_gpu.gpu.address().0;
-    let host = on_host.gpu.address().0;
+    let gpu = on_gpu.gpu().address().0;
+    let host = on_host.gpu().address().0;
     // (base, matrix address, matrix offset, bias offset): the matrix's start in the offset
     // operand, in the address, or split between them.
     let runs = [
@@ -468,10 +472,10 @@ fn coopvec_case(
         .map(|(&(_, weights, offset, bias), out)| {
             upload(
                 &[coopvec::Root {
-                    input: input.gpu,
-                    output: out.gpu,
+                    input: input.gpu(),
+                    output: out.gpu(),
                     weights,
-                    bias: bias.map_or(0, |_| bias_buf.gpu.address().0),
+                    bias: bias.map_or(0, |_| bias_buf.gpu().address().0),
                     offset,
                     bias_offset: bias.unwrap_or(0),
                     count: vectors as u32,
@@ -485,8 +489,8 @@ fn coopvec_case(
     let mut list = render().command_list().unwrap();
     list.convert_matrix(
         &conversion,
-        row_major.gpu.address(),
-        on_gpu.gpu.offset(64).address(),
+        row_major.gpu().address(),
+        on_gpu.gpu().offset(64).address(),
     );
     list.barrier(
         Stages::TRANSFER | Stages::HOST,
@@ -494,7 +498,7 @@ fn coopvec_case(
         Hazards::empty(),
     );
     for root in &roots {
-        list.dispatch(&p, root.gpu, [(vectors as u32).div_ceil(32), 1, 1]);
+        list.dispatch(&p, root.gpu(), [(vectors as u32).div_ceil(32), 1, 1]);
     }
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     run(list);
@@ -577,7 +581,7 @@ fn address_command_workload(d: &Device) -> u64 {
         .gpu_malloc::<pattern::Root>(MemoryKind::Upload, 1, "workload root")
         .unwrap();
     root.as_mut_slice().unwrap()[0] = pattern::Root {
-        out: pattern_out.gpu,
+        out: pattern_out.gpu(),
         count: n,
         seed: 0x5eed,
     };
@@ -602,7 +606,7 @@ fn address_command_workload(d: &Device) -> u64 {
         kind: ClassicKind::Blas,
         flags: RtasFlags::FAST_TRACE,
         geometry: ClassicGeometry::Triangles {
-            positions: positions.gpu,
+            positions: positions.gpu(),
             vertex_count: 3,
             indices: GpuPtr::NULL,
             triangle_count: 1,
@@ -624,20 +628,20 @@ fn address_command_workload(d: &Device) -> u64 {
         .unwrap();
 
     let mut list = queue.command_list().unwrap();
-    list.copy(middle.gpu.cast(), src.gpu.cast(), 4 * 4096);
+    list.copy(middle.gpu().cast(), src.gpu().cast(), 4 * 4096);
     list.discard(&t);
     list.barrier(Stages::TRANSFER, Stages::TRANSFER, Hazards::empty());
-    list.copy(copied.gpu.cast(), middle.gpu.cast(), 4 * 4096);
-    list.copy_rows_to_texture(&t, &region, src.gpu.cast(), 48);
+    list.copy(copied.gpu().cast(), middle.gpu().cast(), 4 * 4096);
+    list.copy_rows_to_texture(&t, &region, src.gpu().cast(), 48);
     list.barrier(Stages::TRANSFER, Stages::TRANSFER, Hazards::empty());
-    list.copy_from_texture(texels.gpu.cast(), &t, &region);
-    list.dispatch_indirect(&p, root.gpu, args.gpu);
+    list.copy_from_texture(texels.gpu().cast(), &t, &region);
+    list.dispatch_indirect(&p, root.gpu(), args.gpu());
     list.build_classic(&ClassicBuild {
         desc: &blas_desc,
         dst: &blas,
-        scratch: scratch.gpu.address(),
+        scratch: scratch.gpu().address(),
     });
-    list.classic_compacted_size(&blas, compacted.gpu);
+    list.classic_compacted_size(&blas, compacted.gpu());
     list.barrier(
         Stages::TRANSFER | Stages::COMPUTE,
         Stages::HOST,
@@ -712,7 +716,7 @@ fn priorities_allocate_and_the_report_carries_the_pressure() {
                 .gpu_malloc_with_priority::<u32>(kind, priority, 1 << 16, "priority")
                 .unwrap();
             assert!(
-                a.gpu.address().0.is_multiple_of(256),
+                a.gpu().address().0.is_multiple_of(256),
                 "{kind:?} {priority:?}"
             );
         }
@@ -800,7 +804,10 @@ fn generated_dispatches_match_recorded_dispatches() {
     let outputs: Vec<_> = (0..3)
         .map(|i| readback::<u32>(total, &format!("bins out {i}")))
         .collect();
-    let root_arrays: Vec<_> = outputs.iter().map(|o| roots(o.gpu, "bin roots")).collect();
+    let root_arrays: Vec<_> = outputs
+        .iter()
+        .map(|o| roots(o.gpu(), "bin roots"))
+        .collect();
     let args = d
         .gpu_malloc::<u32>(MemoryKind::DeviceLocal, u64::from(BINS) * 3, "bin args")
         .unwrap();
@@ -818,11 +825,11 @@ fn generated_dispatches_match_recorded_dispatches() {
         .map(|i| {
             upload(
                 &[classify_bins::Root {
-                    items: item_counts.gpu,
-                    count: counts[i].gpu,
-                    args: args.gpu,
-                    sequences: sequences[i].gpu.address().0,
-                    roots: root_arrays[i].gpu.address().0,
+                    items: item_counts.gpu(),
+                    count: counts[i].gpu(),
+                    args: args.gpu(),
+                    sequences: sequences[i].gpu().address().0,
+                    roots: root_arrays[i].gpu().address().0,
                     bins: BINS,
                     pad0: 0,
                 }],
@@ -837,8 +844,8 @@ fn generated_dispatches_match_recorded_dispatches() {
     let runs: Vec<_> = (0..2)
         .map(|i| Generated {
             set: &set,
-            sequences: sequences[i].gpu,
-            count: counts[i].gpu,
+            sequences: sequences[i].gpu(),
+            count: counts[i].gpu(),
             max: BINS,
             preprocess: arenas.allocate(layout).unwrap(),
         })
@@ -847,7 +854,7 @@ fn generated_dispatches_match_recorded_dispatches() {
     let mut list = render().command_list().unwrap();
     let groups = [BINS.div_ceil(64), 1, 1];
     for r in &classify_roots {
-        list.dispatch(&classify, r.gpu, groups);
+        list.dispatch(&classify, r.gpu(), groups);
     }
     list.barrier(
         Stages::COMPUTE,
@@ -859,8 +866,8 @@ fn generated_dispatches_match_recorded_dispatches() {
     list.execute_generated(&runs[0], true);
     list.execute_generated(&runs[1], false);
     for (b, p) in recorded.iter().enumerate() {
-        let root = root_arrays[2].gpu.offset(b as u64).cast::<bins::Root>();
-        let a = args.gpu.offset(3 * b as u64).cast();
+        let root = root_arrays[2].gpu().offset(b as u64).cast::<bins::Root>();
+        let a = args.gpu().offset(3 * b as u64).cast();
         list.dispatch_indirect(p, root, a);
     }
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());

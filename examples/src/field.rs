@@ -89,7 +89,7 @@ impl Heights {
 
     /// The samples on the GPU.
     pub fn samples(&self) -> GpuPtr<f32> {
-        self.samples.gpu
+        self.samples.gpu()
     }
 
     /// The height at (x, z), bilinear like `field.slang`'s `height_at`.
@@ -149,7 +149,7 @@ impl Terrain {
         let root = c
             .put_root(&terrain::Root {
                 scene: c.root,
-                heights: heights.samples.gpu,
+                heights: heights.samples.gpu(),
                 side: heights.side,
                 spacing: heights.spacing,
                 origin_x: heights.origin[0],
@@ -218,7 +218,7 @@ impl Grass {
         let root = c
             .put_root(&grass::Root {
                 scene: c.root,
-                heights: heights.samples.gpu,
+                heights: heights.samples.gpu(),
                 side: heights.side,
                 spacing: heights.spacing,
                 origin_x: heights.origin[0],

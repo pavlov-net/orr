@@ -681,7 +681,7 @@ impl LightingKernels {
                     view: pass.view,
                     gbuffer: pass.gbuffer,
                     set: scene.light_set(),
-                    local: view.local.gpu,
+                    local: view.local.gpu(),
                     previous: view.feedback[1 - written].sampled,
                     columns: view.local_tiles[0],
                     share: local_share,
@@ -704,7 +704,11 @@ impl LightingKernels {
             gbuffer: pass.gbuffer,
             set: scene.light_set(),
             cache: scene.world_cache(pass.frame),
-            local: if local { view.local.gpu } else { GpuPtr::NULL },
+            local: if local {
+                view.local.gpu()
+            } else {
+                GpuPtr::NULL
+            },
             radiance: view.targets.radiance.storage(0),
             primary_candidates: lighting.primary_di_candidates,
             bounce_candidates: lighting.bounce_di_candidates,
@@ -781,7 +785,7 @@ impl LightingKernels {
             slot,
             PathRoot {
                 light_flags: 0,
-                layers: view.layers.gpu,
+                layers: view.layers.gpu(),
                 dielectric_depth: lighting.dielectric_depth,
                 camera_medium: lighting.camera_medium.map_or(NO_MATERIAL, |m| m.0),
                 dielectric_flags: flags,
@@ -822,7 +826,7 @@ impl LightingKernels {
                 view: pass.view,
                 gbuffer: pass.gbuffer,
                 layers: if view.layers_frame == Some(pass.frame) {
-                    view.layers.gpu
+                    view.layers.gpu()
                 } else {
                     GpuPtr::NULL
                 },

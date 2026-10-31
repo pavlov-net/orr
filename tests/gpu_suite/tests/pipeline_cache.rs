@@ -96,7 +96,7 @@ impl Set {
             .gpu_malloc::<cached::Root>(MemoryKind::Upload, 1, "cached root")
             .unwrap();
         root.as_mut_slice().unwrap()[0] = cached::Root {
-            out: out.gpu,
+            out: out.gpu(),
             pad0: 0,
             pad1: 0,
         };
@@ -110,9 +110,9 @@ impl Set {
         let queue = d.queue(QueueKind::Render).unwrap();
         let mut list = queue.command_list().unwrap();
         list.discard(&tex);
-        list.dispatch(&self.compute, root.gpu, [1, 1, 1]);
+        list.dispatch(&self.compute, root.gpu(), [1, 1, 1]);
         if let Some(r) = &self.raygen {
-            list.dispatch_rays(r, root.gpu, [1, 1, 1]);
+            list.dispatch_rays(r, root.gpu(), [1, 1, 1]);
         }
         list.begin_rendering(&Rendering {
             extent: [4, 4],
@@ -123,10 +123,14 @@ impl Set {
             }],
             depth: None,
         });
-        list.draw_mesh_tasks(&self.mesh, root.gpu, [1, 1, 1]);
+        list.draw_mesh_tasks(&self.mesh, root.gpu(), [1, 1, 1]);
         list.end_rendering();
         list.barrier(Stages::COLOR_OUT, Stages::TRANSFER, Hazards::empty());
-        list.copy_from_texture(texels.gpu.cast(), &tex, &TextureRegion::whole_mip(&desc, 0));
+        list.copy_from_texture(
+            texels.gpu().cast(),
+            &tex,
+            &TextureRegion::whole_mip(&desc, 0),
+        );
         list.barrier(Stages::ALL, Stages::HOST, Hazards::empty());
         let point = queue.submit(vec![list], &[]).unwrap();
         queue.wait(point, Duration::from_secs(10)).unwrap();

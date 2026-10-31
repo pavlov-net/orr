@@ -377,7 +377,7 @@ impl<'d> Step<'d> {
 
     fn block(&mut self, kind: MemoryKind, bytes: u64, name: &str) -> Result<GpuPtr<u8>> {
         let a = self.device.gpu_malloc::<u8>(kind, bytes.max(16), name)?;
-        let gpu = a.gpu;
+        let gpu = a.gpu();
         self.keep.push(a);
         Ok(gpu)
     }
@@ -389,7 +389,7 @@ impl<'d> Step<'d> {
             .gpu_malloc::<u8>(MemoryKind::Upload, bytes.max(16), name)?;
         a.as_mut_slice().expect("upload is mapped")[..bytes as usize]
             .copy_from_slice(bytemuck::cast_slice(values));
-        let gpu = a.gpu.cast();
+        let gpu = a.gpu().cast();
         self.keep.push(a);
         Ok(gpu)
     }
@@ -446,7 +446,7 @@ fn pack(
         total.max(align),
         "cluster AS",
     )?;
-    let base = block.gpu.address().0;
+    let base = block.gpu().address().0;
     keep.push(block);
     let dst: Vec<u64> = offsets.iter().map(|o| base + o).collect();
     let jobs: Vec<AddressJob> = addresses
@@ -535,8 +535,8 @@ fn implicit(
             args: records.address(),
             count,
             dst_implicit: dst.address(),
-            dst_addresses: addresses.gpu,
-            dst_sizes: built.gpu,
+            dst_addresses: addresses.gpu(),
+            dst_sizes: built.gpu(),
             scratch: scratch.address(),
             src: GpuAddress(0),
         },
@@ -810,7 +810,7 @@ pub(crate) fn build(
                         *o = at(j);
                     }
                     row += parts.len();
-                    part_blas.gpu.offset((row - parts.len()) as u64)
+                    part_blas.gpu().offset((row - parts.len()) as u64)
                 }
             };
             RtCutGpu {
@@ -855,9 +855,9 @@ pub(crate) fn build(
         .map(|(((m, clas), &(count, animated)), parts_of)| {
             let mine: Vec<CutPlan> = plans.by_ref().take(count as usize).collect();
             let c = MeshCuts {
-                table: table.gpu.offset(first),
+                table: table.gpu().offset(first),
                 count,
-                parts: parts.gpu.offset(first_part),
+                parts: parts.gpu().offset(first_part),
                 animated,
                 animated_sections: parts_of.iter().fold(0, |s, p| s | p.sections),
                 rt: MeshRt {
@@ -960,11 +960,11 @@ pub(crate) fn build_masks(
         }
     }
     let n = jobs.len() as u32;
-    let longest = tables.iter().map(|t| t.size).max().unwrap_or(8);
+    let longest = tables.iter().map(Allocation::size).max().unwrap_or(8);
     let (zeros, out) = window.slice::<u64>(device, (longest / 8) as u32)?;
     out.fill(0);
     for t in &tables {
-        list.copy(t.gpu.cast(), zeros.cast(), t.size);
+        list.copy(t.gpu().cast(), zeros.cast(), t.size());
     }
     if n == 0 {
         list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
@@ -1004,7 +1004,7 @@ pub(crate) fn build_masks(
     let (addresses, _) = window.slice::<u64>(device, n)?;
     let (built, _) = window.slice::<u32>(device, n)?;
     let scratch = device.gpu_malloc::<u8>(dl, sizes.scratch.max(16), "mask BLAS scratch")?;
-    let scratch_at = scratch.gpu.address();
+    let scratch_at = scratch.gpu().address();
     keep.push(scratch);
     let block = Arc::new(device.gpu_malloc_with_priority::<u8>(
         dl,
@@ -1029,7 +1029,7 @@ pub(crate) fn build_masks(
         &RtasIo {
             args: records.address(),
             count,
-            dst_implicit: block.gpu.address(),
+            dst_implicit: block.gpu().address(),
             dst_addresses: addresses,
             dst_sizes: built,
             scratch: scratch_at,
@@ -1040,7 +1040,7 @@ pub(crate) fn build_masks(
     for (j, (mi, filled)) in targets.iter().enumerate() {
         for &slot in filled {
             list.copy(
-                tables[*mi].gpu.offset(u64::from(slot)).cast(),
+                tables[*mi].gpu().offset(u64::from(slot)).cast(),
                 addresses.offset(j as u64).cast(),
                 8,
             );

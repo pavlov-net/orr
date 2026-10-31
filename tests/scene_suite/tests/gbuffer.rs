@@ -280,10 +280,10 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
         .gpu_malloc::<codec::Case>(MemoryKind::Readback, N as u64, "decoded")
         .unwrap();
     let root = upload(bytemuck::bytes_of(&codec::Root {
-        cases: input.gpu.cast(),
-        words: words.gpu,
-        decoded: decoded.gpu,
-        material: mat.gpu.cast(),
+        cases: input.gpu().cast(),
+        words: words.gpu(),
+        decoded: decoded.gpu(),
+        material: mat.gpu().cast(),
         count: N as u32,
         pad0: 0,
         pad1: 0,
@@ -294,7 +294,7 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
     let mut list = render.command_list().unwrap();
     list.dispatch(
         &p,
-        root.gpu.cast::<codec::Root>(),
+        root.gpu().cast::<codec::Root>(),
         [N.div_ceil(64) as u32, 1, 1],
     );
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
@@ -1804,12 +1804,12 @@ fn load_gsurface_reads_the_visible_surface() {
         scene: g.view.scene,
         view: g.view.view,
         gbuffer: g.view.gbuffer,
-        out: out.gpu,
+        out: out.gpu(),
     };
     let p = pipeline(&surface_at::MODULE, "main");
     let render = d.queue(QueueKind::Render).unwrap();
     let mut list = render.command_list().unwrap();
-    list.dispatch(&p, root.gpu, [n.div_ceil(64) as u32, 1, 1]);
+    list.dispatch(&p, root.gpu(), [n.div_ceil(64) as u32, 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     wait(render.submit(vec![list], &[]).unwrap());
     let vis: Vec<u64> = read_buffer(g.view.targets.visibility, n);
@@ -2139,9 +2139,9 @@ fn rays(view: &RasterView, module: &'static ShaderModule, entry: &str, mode: u32
         scene: view.scene,
         view: view.view,
         gbuffer: view.gbuffer,
-        traced: traced.gpu,
-        seen: seen.gpu,
-        cones: cones.gpu,
+        traced: traced.gpu(),
+        seen: seen.gpu(),
+        cones: cones.gpu(),
         mode,
         pad0: 0,
         pad1: 0,
@@ -2150,7 +2150,7 @@ fn rays(view: &RasterView, module: &'static ShaderModule, entry: &str, mode: u32
     let render = d.queue(QueueKind::Render).unwrap();
     let mut list = render.command_list().unwrap();
     list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::ACCEL_STRUCT);
-    list.dispatch(&p, root.gpu, [n.div_ceil(64) as u32, 1, 1]);
+    list.dispatch(&p, root.gpu(), [n.div_ceil(64) as u32, 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     wait(render.submit(vec![list], &[]).unwrap());
     Rays {
@@ -4568,8 +4568,8 @@ fn stochastic_texture_taps_average_to_the_bicubic_filter_under_magnification() {
         .unwrap();
     let root = upload(
         bytemuck::bytes_of(&Root {
-            footprints: input.gpu.cast(),
-            out: out.gpu,
+            footprints: input.gpu().cast(),
+            out: out.gpu(),
             texture: d.write_sampled(slot, &texture, &orr_gpu::ViewDesc::default()),
             sampler,
             count: cases.len() as u32,
@@ -4581,9 +4581,9 @@ fn stochastic_texture_taps_average_to_the_bicubic_filter_under_magnification() {
     let render = d.queue(QueueKind::Render).unwrap();
     let mut list = render.command_list().unwrap();
     list.discard(&texture);
-    list.copy_to_texture(&texture, &TextureRegion::whole_mip(&desc, 0), staging.gpu);
+    list.copy_to_texture(&texture, &TextureRegion::whole_mip(&desc, 0), staging.gpu());
     list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
-    list.dispatch(&p, root.gpu.cast::<Root>(), [1, 1, 1]);
+    list.dispatch(&p, root.gpu().cast::<Root>(), [1, 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     wait(render.submit(vec![list], &[]).unwrap());
 

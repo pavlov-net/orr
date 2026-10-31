@@ -551,13 +551,13 @@ fn view_constants_project_and_reconstruct_render_positions() {
         .unwrap();
     root_buf.as_mut_slice().unwrap()[0] = reconstruct::Root {
         view: view.view,
-        samples: samples_buf.gpu,
-        out: out.gpu,
+        samples: samples_buf.gpu(),
+        out: out.gpu(),
         count: 256,
         _pad: 0,
     };
     // The constants stay in the frame's upload window until a later frame reuses it.
-    dispatch_once(&reconstruct::MODULE, root_buf.gpu, 4);
+    dispatch_once(&reconstruct::MODULE, root_buf.gpu(), 4);
     for (got, want) in out.as_slice().unwrap().iter().zip(&points) {
         let got = Vec3::from_slice(&got[..3]);
         let err = (got - *want).length() / (*want - eye).length();
@@ -686,11 +686,11 @@ fn copies_are_placed_relative_to_the_eye_from_cells() {
     root.as_mut_slice().unwrap()[0] = placement::Root {
         scene: view.scene,
         view: view.view,
-        out: out.gpu,
+        out: out.gpu(),
         count: N,
         _pad: 0,
     };
-    dispatch_once(&placement::MODULE, root.gpu, 1);
+    dispatch_once(&placement::MODULE, root.gpu(), 1);
     let eye = WorldPos::new(camera, 8);
     let base = WorldPos::new(anchor, 8).relative_to(eye, 8);
     for (i, got) in out.as_slice().unwrap().chunks(2).enumerate() {

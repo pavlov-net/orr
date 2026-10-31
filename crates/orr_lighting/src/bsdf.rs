@@ -27,7 +27,7 @@ impl BsdfTables {
         let mut staging =
             device.gpu_malloc::<u8>(MemoryKind::Upload, total as u64, "bsdf tables")?;
         let first_slot = device.alloc_image_slots(LUTS.len() as u32)?;
-        let base = staging.gpu;
+        let base = staging.gpu();
         let mapped = staging.as_mut_slice().expect("upload memory is mapped");
         let mut textures = Vec::with_capacity(LUTS.len());
         let mut offset = 0;

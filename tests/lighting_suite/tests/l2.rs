@@ -130,10 +130,10 @@ fn equal_area_mapping_matches_the_cook() {
     let points_out = readback::<[f32; 2]>(u64::from(n), "points out");
     let root = upload(
         &[mapping::Root {
-            points: points_in.gpu,
-            dirs_out: dirs_out.gpu,
-            dirs_in: dirs_in.gpu,
-            points_out: points_out.gpu,
+            points: points_in.gpu(),
+            dirs_out: dirs_out.gpu(),
+            dirs_in: dirs_in.gpu(),
+            points_out: points_out.gpu(),
             count: n,
             _pad0: 0,
             _pad1: 0,
@@ -143,7 +143,7 @@ fn equal_area_mapping_matches_the_cook() {
     );
     let p = pipeline(&mapping::MODULE, "main");
     let mut list = render().command_list().unwrap();
-    list.dispatch(&p, root.gpu, [n / 64, 1, 1]);
+    list.dispatch(&p, root.gpu(), [n / 64, 1, 1]);
     finish(list);
 
     let mut worst = 0.0f32;
@@ -180,9 +180,9 @@ fn sampling_matches_density(scene: &TestScene, lighting: &mut SceneLighting) {
     let root = upload(
         &[env_probe::Root {
             environment: lighting.environment(),
-            histogram: histogram.gpu,
-            mismatches: mismatches.gpu,
-            bin_probability: probability.gpu,
+            histogram: histogram.gpu(),
+            mismatches: mismatches.gpu(),
+            bin_probability: probability.gpu(),
             samples_per_thread: per_thread,
             seed: 3,
             subdivisions: 96,
@@ -197,8 +197,8 @@ fn sampling_matches_density(scene: &TestScene, lighting: &mut SceneLighting) {
     let mut list = render().command_list().unwrap();
     lighting.record(&mut list, &scene.pass([0.0; 3]));
     compute_barrier(&mut list);
-    list.dispatch(&probe[0], root.gpu, [threads / 64, 1, 1]);
-    list.dispatch(&probe[1], root.gpu, [bins as u32, 1, 1]);
+    list.dispatch(&probe[0], root.gpu(), [threads / 64, 1, 1]);
+    list.dispatch(&probe[1], root.gpu(), [bins as u32, 1, 1]);
     finish(list);
 
     let samples = f64::from(threads * per_thread);
@@ -268,7 +268,7 @@ fn hdr_map_sampling_matches_its_density() {
         }],
         "hdr map data",
     );
-    let scene = scene_with(&[], data.gpu.address());
+    let scene = scene_with(&[], data.gpu().address());
     let mut lighting = scene.lighting(&KernelSet::default());
     sampling_matches_density(&scene, &mut lighting);
     assert_clean();
@@ -313,7 +313,7 @@ fn sky_stats_match_a_uniform_environment_and_a_slab() {
             TextureIndex::NONE,
         ),
     ];
-    let scene = scene_with(&lights, data.gpu.address());
+    let scene = scene_with(&lights, data.gpu().address());
     let mut lighting = scene.lighting(&kernels(&[(&slab_directional::MODULE, DIRECTIONAL)]));
     let focus = [10.0, 100.0, -5.0];
     let mut list = render().command_list().unwrap();
@@ -393,7 +393,7 @@ fn discs(lights: &[DirectionalLight], focus: [f32; 3]) -> Discs {
             let root = c
                 .put_root(&textured_probe::Root {
                     scene: c.root,
-                    integrals: textured.gpu,
+                    integrals: textured.gpu(),
                 })
                 .unwrap();
             c.cmd.dispatch(&probe, root, [1, 1, 1]);
@@ -404,7 +404,7 @@ fn discs(lights: &[DirectionalLight], focus: [f32; 3]) -> Discs {
     let root = upload(
         &[disc_probe::Root {
             set: lighting.light_set(),
-            integrals: integrals.gpu,
+            integrals: integrals.gpu(),
             eye: [focus[0], focus[1], focus[2], 0.0],
             resolution: 1024,
             _pad0: 0,
@@ -417,7 +417,7 @@ fn discs(lights: &[DirectionalLight], focus: [f32; 3]) -> Discs {
     let mut list = render().command_list().unwrap();
     lighting.record(&mut list, &scene.pass(focus));
     compute_barrier(&mut list);
-    list.dispatch(&p, root.gpu, [count, 1, 1]);
+    list.dispatch(&p, root.gpu(), [count, 1, 1]);
     let states = copy_back(
         &mut list,
         lighting.directional_states(),
@@ -548,7 +548,7 @@ fn glint_converges_to_the_same_value_from_nee_and_bsdf_sampling() {
             upload(
                 &[glint::Root {
                     set: lighting.light_set(),
-                    sums: s.gpu,
+                    sums: s.gpu(),
                     wo: [-a.x, a.y, -a.z, 0.0],
                     light: i as u32,
                     samples_per_thread: per_thread,
@@ -564,7 +564,7 @@ fn glint_converges_to_the_same_value_from_nee_and_bsdf_sampling() {
     compute_barrier(&mut list);
     let p = pipeline(&glint::MODULE, "main");
     for root in &roots {
-        list.dispatch(&p, root.gpu, [threads / 64, 1, 1]);
+        list.dispatch(&p, root.gpu(), [threads / 64, 1, 1]);
     }
     finish(list);
 
@@ -627,11 +627,11 @@ fn stock_height_fog_matches_a_numerical_integral() {
         .map(|(&d, phase)| {
             upload(
                 &[fog_probe::Root {
-                    fog: fog.gpu.address().0,
-                    rays: rays_gpu.gpu.cast(),
-                    transmittance: transmittance.gpu,
-                    cosines: cos_gpu.gpu,
-                    phase: phase.gpu,
+                    fog: fog.gpu().address().0,
+                    rays: rays_gpu.gpu().cast(),
+                    transmittance: transmittance.gpu(),
+                    cosines: cos_gpu.gpu(),
+                    phase: phase.gpu(),
                     ray_count: rays.len() as u32,
                     cosine_count: cosines.len() as u32,
                     diameter_um: d,
@@ -646,7 +646,7 @@ fn stock_height_fog_matches_a_numerical_integral() {
     let p = pipeline(&fog_probe::MODULE, "main");
     let mut list = render().command_list().unwrap();
     for root in &roots {
-        list.dispatch(&p, root.gpu, [(cosines.len() as u32).div_ceil(64), 1, 1]);
+        list.dispatch(&p, root.gpu(), [(cosines.len() as u32).div_ceil(64), 1, 1]);
     }
     finish(list);
 

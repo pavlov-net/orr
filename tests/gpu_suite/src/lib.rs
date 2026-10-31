@@ -191,7 +191,7 @@ pub fn triangle_scene() -> Scene {
         kind: ClassicKind::Blas,
         flags: RtasFlags::FAST_TRACE,
         geometry: ClassicGeometry::Triangles {
-            positions: positions.gpu,
+            positions: positions.gpu(),
             vertex_count: 3,
             indices: GpuPtr::NULL,
             triangle_count: 1,
@@ -225,7 +225,7 @@ pub fn triangle_scene() -> Scene {
         kind: ClassicKind::Tlas,
         flags: RtasFlags::FAST_TRACE,
         geometry: ClassicGeometry::Instances {
-            records: instances.gpu.address(),
+            records: instances.gpu().address(),
             capacity: 1,
         },
     };
@@ -243,12 +243,12 @@ pub fn triangle_scene() -> Scene {
     list.build_classic(&ClassicBuild {
         desc: &blas_desc,
         dst: &blas,
-        scratch: blas_scratch.gpu.address(),
+        scratch: blas_scratch.gpu().address(),
     });
     list.build_classic(&ClassicBuild {
         desc: &tlas_desc,
         dst: &tlas,
-        scratch: tlas_scratch.gpu.address(),
+        scratch: tlas_scratch.gpu().address(),
     });
     run(list);
     Scene {
@@ -289,7 +289,7 @@ pub fn fill_frame<'q>(
             pad1: 0,
         }]);
     let mut list = queue.command_list().unwrap();
-    list.dispatch(fill, root.gpu, [width.div_ceil(8), height.div_ceil(8), 1]);
+    list.dispatch(fill, root.gpu(), [width.div_ceil(8), height.div_ceil(8), 1]);
     (list, root)
 }
 

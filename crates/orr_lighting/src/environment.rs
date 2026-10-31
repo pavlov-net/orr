@@ -80,7 +80,7 @@ impl EnvironmentBake {
             device.gpu_malloc::<EnvironmentGpu>(MemoryKind::Upload, 1, "environment record")?;
         record.as_mut_slice().unwrap()[0] = EnvironmentGpu {
             mean: [0.0; 4],
-            pyramid: pyramid.gpu,
+            pyramid: pyramid.gpu(),
             map: sampled,
             size: ENVIRONMENT_SIZE,
         };
@@ -91,9 +91,9 @@ impl EnvironmentBake {
         )?;
         for (level, root) in pyramid_roots.as_mut_slice().unwrap().iter_mut().enumerate() {
             *root = pyramid::Root {
-                partials: partials.gpu,
-                pyramid: pyramid.gpu,
-                environment: record.gpu,
+                partials: partials.gpu(),
+                pyramid: pyramid.gpu(),
+                environment: record.gpu(),
                 partial_count: GROUPS * GROUPS,
                 size: ENVIRONMENT_SIZE,
                 level: level as u32,
@@ -122,8 +122,8 @@ impl EnvironmentBake {
     pub(crate) fn root(&self, scene: GpuPtr<SceneRoot>, focus: [f32; 3]) -> bake::Root {
         bake::Root {
             scene,
-            partials: self.partials.gpu,
-            luminance: self.pyramid.gpu,
+            partials: self.partials.gpu(),
+            luminance: self.pyramid.gpu(),
             map: self.storage,
             size: ENVIRONMENT_SIZE,
             focus: [focus[0], focus[1], focus[2], 0.0],
@@ -140,20 +140,20 @@ impl EnvironmentBake {
 
     /// The mean and pyramid; after the bake's writes are visible.
     pub(crate) fn record_reduce(&self, list: &mut CommandList<'_>) {
-        list.dispatch(&self.mean, self.pyramid_roots.gpu, [1, 1, 1]);
+        list.dispatch(&self.mean, self.pyramid_roots.gpu(), [1, 1, 1]);
         for level in 1..=LEVELS {
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
             let side = ENVIRONMENT_SIZE >> level;
             list.dispatch(
                 &self.build,
-                self.pyramid_roots.gpu.offset(u64::from(level)),
+                self.pyramid_roots.gpu().offset(u64::from(level)),
                 [side.div_ceil(8), side.div_ceil(8), 1],
             );
         }
     }
 
     pub(crate) fn environment(&self) -> GpuPtr<EnvironmentGpu> {
-        self.record.gpu
+        self.record.gpu()
     }
 }
 

@@ -140,7 +140,7 @@ fn gbuffer_matches_cpu_reference() {
     let tri_buf = upload(&tris, "gbuffer triangles");
     let root = upload(
         &[gbuffer::Root {
-            triangles: tri_buf.gpu,
+            triangles: tri_buf.gpu(),
             triangle_count: tris.len() as u32,
             pad: 0,
         }],
@@ -203,7 +203,7 @@ fn gbuffer_matches_cpu_reference() {
             store: true,
         }),
     });
-    list.draw_mesh_tasks_indirect_count(&p, root.gpu, args.gpu, count.gpu, 4);
+    list.draw_mesh_tasks_indirect_count(&p, root.gpu(), args.gpu(), count.gpu(), 4);
     list.end_rendering();
     list.end_pass();
     list.barrier(
@@ -212,10 +212,10 @@ fn gbuffer_matches_cpu_reference() {
         Hazards::empty(),
     );
     let whole = TextureRegion::whole_mip(gbuf_a.desc(), 0);
-    list.copy_from_texture(out_a.gpu.cast(), &gbuf_a, &whole);
-    list.copy_from_texture(out_b.gpu.cast(), &gbuf_b, &whole);
-    list.copy_from_texture(out_m.gpu.cast(), &motion, &whole);
-    list.copy_from_texture(out_d.gpu.cast(), &depth, &whole);
+    list.copy_from_texture(out_a.gpu().cast(), &gbuf_a, &whole);
+    list.copy_from_texture(out_b.gpu().cast(), &gbuf_b, &whole);
+    list.copy_from_texture(out_m.gpu().cast(), &motion, &whole);
+    list.copy_from_texture(out_d.gpu().cast(), &depth, &whole);
     list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
     let point = run(list);
 
@@ -318,14 +318,14 @@ fn blend_mask_and_scissor() {
         }],
         depth: None,
     });
-    list.draw_mesh_tasks(&over, over_root.gpu, [1, 1, 1]);
+    list.draw_mesh_tasks(&over, over_root.gpu(), [1, 1, 1]);
     let (offset, extent) = ([8u32, 16u32], [20u32, 1000u32]);
     list.set_scissor(offset, extent);
-    list.draw_mesh_tasks(&add, add_root.gpu, [1, 1, 1]);
+    list.draw_mesh_tasks(&add, add_root.gpu(), [1, 1, 1]);
     list.end_rendering();
     list.barrier(Stages::COLOR_OUT, Stages::TRANSFER, Hazards::empty());
     list.copy_from_texture(
-        out.gpu.cast(),
+        out.gpu().cast(),
         &tex,
         &TextureRegion::whole_mip(tex.desc(), 0),
     );
@@ -394,7 +394,7 @@ fn generated_draws_match_recorded_draws() {
         })
         .collect();
     let roots = upload(&slots, "tile roots");
-    let root = |tile: u32| roots.gpu.offset(u64::from(tile)).cast::<tiles::Root>();
+    let root = |tile: u32| roots.gpu().offset(u64::from(tile)).cast::<tiles::Root>();
     let pipeline_of = |tile: u32| tile * 5 % PIPELINES;
     let groups = |tile: u32| if tile % 5 == 4 { [0, 1, 1] } else { [1, 1, 1] };
     let max = tile_count + 16;
@@ -410,8 +410,8 @@ fn generated_draws_match_recorded_draws() {
         .unwrap();
     let run_set = Generated {
         set: &set,
-        sequences: sequences.gpu,
-        count: count.gpu,
+        sequences: sequences.gpu(),
+        count: count.gpu(),
         max,
         preprocess: arenas.allocate(layout).unwrap(),
     };
@@ -446,7 +446,7 @@ fn generated_draws_match_recorded_draws() {
     }
     list.barrier(Stages::COLOR_OUT, Stages::TRANSFER, Hazards::empty());
     for (t, out) in targets.iter().zip(&outs) {
-        list.copy_from_texture(out.gpu.cast(), t, &TextureRegion::whole_mip(t.desc(), 0));
+        list.copy_from_texture(out.gpu().cast(), t, &TextureRegion::whole_mip(t.desc(), 0));
     }
     list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
     run(list);

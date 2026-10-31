@@ -202,12 +202,12 @@ fn editing_a_kernel_body_swaps_its_pipeline_and_bad_edits_keep_the_old_one() {
     let out = device()
         .gpu_malloc::<u32>(MemoryKind::DeviceLocal, FILLED, "fill")
         .unwrap();
-    let (_, values) = fill_frame(&mut r, s, pipeline, out.gpu);
+    let (_, values) = fill_frame(&mut r, s, pipeline, out.gpu());
     assert!(values.iter().all(|&v| v == 1), "{values:?}");
 
     let two = original.replace("root.out[id.x] = 1;", "root.out[id.x] = 2;");
     assert_ne!(two, original);
-    let (report, values) = edit(&path, &two, &mut r, s, pipeline, out.gpu);
+    let (report, values) = edit(&path, &two, &mut r, s, pipeline, out.gpu());
     assert_eq!(
         report,
         ReloadReport::Swapped {
@@ -218,7 +218,7 @@ fn editing_a_kernel_body_swaps_its_pipeline_and_bad_edits_keep_the_old_one() {
     assert!(values.iter().all(|&v| v == 2), "{values:?}");
 
     let broken = two.replace("= 2;", "= 2 +;");
-    let (report, values) = edit(&path, &broken, &mut r, s, pipeline, out.gpu);
+    let (report, values) = edit(&path, &broken, &mut r, s, pipeline, out.gpu());
     let ReloadReport::Rejected { reason, .. } = report else {
         panic!("a syntax error swapped the pipeline");
     };
@@ -230,7 +230,7 @@ fn editing_a_kernel_body_swaps_its_pipeline_and_bad_edits_keep_the_old_one() {
         "uint pad;
     float4 tint;",
     );
-    let (report, values) = edit(&path, &wider, &mut r, s, pipeline, out.gpu);
+    let (report, values) = edit(&path, &wider, &mut r, s, pipeline, out.gpu());
     let ReloadReport::Rejected { reason, .. } = report else {
         panic!("a root edit swapped the pipeline");
     };

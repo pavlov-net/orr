@@ -279,11 +279,11 @@ impl Painter {
         loop {
             if let Some(block) = slot.blocks.get_mut(slot.block) {
                 let at = slot.used.next_multiple_of(align);
-                if at + len <= block.size {
+                if at + len <= block.size() {
                     let mapped = block.as_mut_slice().expect("upload memory is mapped");
                     mapped[at as usize..(at + len) as usize].copy_from_slice(bytes);
                     slot.used = at + len;
-                    return Ok(block.gpu.offset(at));
+                    return Ok(block.gpu().offset(at));
                 }
                 slot.block += 1;
                 slot.used = 0;

@@ -85,7 +85,7 @@ impl Harness {
         });
         let queue = gpu.queue(QueueKind::Render).unwrap();
         let mut list = queue.command_list().unwrap();
-        list.copy(exposure.gpu.cast(), init.gpu.cast(), exposure.size);
+        list.copy(exposure.gpu().cast(), init.gpu().cast(), exposure.size());
         list.discard(&radiance);
         list.discard(&linear);
         wait(queue.submit(vec![list], &[]).unwrap());
@@ -167,18 +167,18 @@ impl Harness {
         let gpu = device();
         self.frame += 1;
         let mut constants: ViewConstants = bytemuck::Zeroable::zeroed();
-        constants.exposure = self.exposure.gpu;
+        constants.exposure = self.exposure.gpu();
         constants.exposure_slot = (self.frame % 2) as u32;
         constants.extent = self.extent;
         constants.frame_index = self.frame as u32;
         constants.delta_time = self.dt;
         self.constants.as_mut_slice().unwrap()[0] = constants;
-        let view = self.constants.gpu;
+        let view = self.constants.gpu();
         let [r, g, b] = self.color;
         self.synth_root.as_mut_slice().unwrap()[0] = synth::Root {
-            luminance: self.luminance.gpu,
+            luminance: self.luminance.gpu(),
             colors: if self.per_pixel_color {
-                self.colors.gpu
+                self.colors.gpu()
             } else {
                 GpuPtr::NULL
             },
@@ -199,7 +199,7 @@ impl Harness {
         let mut list = queue.command_list().unwrap();
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
         let groups = [self.extent[0].div_ceil(8), self.extent[1].div_ceil(8), 1];
-        list.dispatch(&self.synth, self.synth_root.gpu, groups);
+        list.dispatch(&self.synth, self.synth_root.gpu(), groups);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         if let Some(ScreenshotRequest::SceneReferred { rec709 }) = output.screenshot {
             let sdr = DisplayRequest::default().resolve(&[OutputFormat::Sdr], None, false);
@@ -226,7 +226,7 @@ impl Harness {
                 source: self.radiance_index,
                 extent: self.extent,
                 view,
-                sky: self.sky.gpu,
+                sky: self.sky.gpu(),
                 frame: self.frame,
                 output,
             },

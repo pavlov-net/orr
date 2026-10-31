@@ -461,7 +461,7 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
         list.begin_pass("debug shading", false);
         list.dispatch(
             shade,
-            roots.gpu.offset(slot),
+            roots.gpu().offset(slot),
             [render[0].div_ceil(8), render[1].div_ceil(8), 1],
         );
         list.end_pass();
@@ -496,7 +496,7 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
         };
         if let Some(out) = readback.as_ref().filter(|_| final_frame) {
             capture_root.as_mut_slice().expect("capture root")[0] = capture::Root {
-                pixels: out.gpu,
+                pixels: out.gpu(),
                 source: shown,
                 width: extent[0],
                 height: extent[1],
@@ -505,7 +505,7 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
             };
             list.dispatch(
                 encode,
-                capture_root.gpu,
+                capture_root.gpu(),
                 [extent[0].div_ceil(8), extent[1].div_ceil(8), 1],
             );
             list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());

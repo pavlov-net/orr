@@ -84,7 +84,12 @@ impl Breadcrumbs {
             "orr breadcrumbs",
         )?;
         let words = mapped.expect("Readback memory is mapped").cast::<u32>();
-        // SAFETY: the mapping holds 2 * SLOTS words and nothing else writes it yet.
+        assert!(
+            words.is_aligned(),
+            "breadcrumbs mapping is not word aligned"
+        );
+        // SAFETY: the mapping holds 2 * SLOTS words, aligned (asserted above), and nothing
+        // else writes it yet.
         unsafe { std::ptr::write_bytes(words.as_ptr(), 0, 2 * SLOTS as usize) };
         Ok(Self {
             raw,

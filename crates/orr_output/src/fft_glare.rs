@@ -149,12 +149,12 @@ impl FftGlareKernels {
         let l = targets.layout;
         Root {
             view: pass.view,
-            table: self.table.gpu,
-            kernel: self.kernel.gpu,
-            state: targets.state.gpu,
-            spectrum: targets.spectrum.gpu,
-            plane: targets.plane.gpu,
-            weights: targets.weights.gpu,
+            table: self.table.gpu(),
+            kernel: self.kernel.gpu(),
+            state: targets.state.gpu(),
+            spectrum: targets.spectrum.gpu(),
+            plane: targets.plane.gpu(),
+            weights: targets.weights.gpu(),
             source: pass.source,
             target: targets.output.storage,
             width: l.size[0],
@@ -183,7 +183,7 @@ impl FftGlareKernels {
         let args = |i: u64| -> GpuPtr<DispatchArgs> {
             targets
                 .state
-                .gpu
+                .gpu()
                 .cast::<u8>()
                 .offset(ARGS_OFFSET + 12 * i)
                 .cast()
@@ -248,15 +248,15 @@ impl FftGlareTargets {
     pub(crate) fn composite(&self) -> GlareComposite {
         GlareComposite {
             chain: self.output.sampled,
-            weights: self.weights.gpu,
+            weights: self.weights.gpu(),
         }
     }
 
     pub(crate) fn bytes(&self) -> u64 {
         self.output.bytes()
-            + self.plane.size
-            + self.spectrum.size
-            + self.state.size
-            + self.weights.size
+            + self.plane.size()
+            + self.spectrum.size()
+            + self.state.size()
+            + self.weights.size()
     }
 }

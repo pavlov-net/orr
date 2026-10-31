@@ -132,9 +132,9 @@ fn trace(models: &[&'static str]) -> Vec<Rays> {
             let root = f.put(&alpha_probe::Root {
                 scene: pass.scene,
                 view: pass.view,
-                origins: origins[k].gpu,
-                stopped: stopped[k].gpu,
-                calls: calls[k].gpu,
+                origins: origins[k].gpu(),
+                stopped: stopped[k].gpu(),
+                calls: calls[k].gpu(),
                 _pad0: 0,
                 dir: dir.extend(0.0).to_array(),
                 count: n as u32,

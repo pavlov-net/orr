@@ -252,11 +252,11 @@ pub(crate) struct Group {
 
 impl Group {
     pub(crate) fn record(&self) -> GroupGpu {
-        let current = self.buffers[self.current].gpu;
+        let current = self.buffers[self.current].gpu();
         let previous = if self.previous_is_current {
             current
         } else {
-            self.buffers[1 - self.current].gpu
+            self.buffers[1 - self.current].gpu()
         };
         GroupGpu {
             current,
@@ -383,28 +383,28 @@ impl Scene {
         // any write (sequence 0).
         let zero = |a: GpuAddress, bytes: u64| Record::fill(0, a.0, words(bytes as usize), 0);
         let records = vec![
-            zero(tables.instances.gpu.address(), tables.instances.size),
-            zero(tables.slot_state.gpu.address(), tables.slot_state.size),
-            zero(tables.groups.gpu.address(), tables.groups.size),
+            zero(tables.instances.gpu().address(), tables.instances.size()),
+            zero(tables.slot_state.gpu().address(), tables.slot_state.size()),
+            zero(tables.groups.gpu().address(), tables.groups.size()),
             zero(
-                tables.material_sets.gpu.address(),
-                tables.material_sets.size,
+                tables.material_sets.gpu().address(),
+                tables.material_sets.size(),
             ),
-            zero(tables.lights.gpu.address(), tables.lights.size),
-            zero(tables.emissive.gpu.address(), tables.emissive.size),
-            zero(tables.producers.gpu.address(), tables.producers.size),
-            zero(tables.batches.gpu.address(), tables.batches.size),
+            zero(tables.lights.gpu().address(), tables.lights.size()),
+            zero(tables.emissive.gpu().address(), tables.emissive.size()),
+            zero(tables.producers.gpu().address(), tables.producers.size()),
+            zero(tables.batches.gpu().address(), tables.batches.size()),
             zero(
-                tables.producer_counts.gpu.address(),
-                tables.producer_counts.size,
+                tables.producer_counts.gpu().address(),
+                tables.producer_counts.size(),
             ),
             zero(
-                tables.producer_state.gpu.address(),
-                tables.producer_state.size,
+                tables.producer_state.gpu().address(),
+                tables.producer_state.size(),
             ),
-            zero(tables.sky_stats.gpu.address(), tables.sky_stats.size),
-            zero(tables.skinned.gpu.address(), tables.skinned.size),
-            zero(tables.skin_state.gpu.address(), tables.skin_state.size),
+            zero(tables.sky_stats.gpu().address(), tables.sky_stats.size()),
+            zero(tables.skinned.gpu().address(), tables.skinned.size()),
+            zero(tables.skin_state.gpu().address(), tables.skin_state.size()),
         ];
         Ok(Self {
             desc: *desc,
@@ -514,7 +514,7 @@ impl<'f> SceneWriter<'f> {
         let record = group.record();
         let zero = Record::fill(
             self.next_seq(),
-            group.buffers[0].gpu.address().0,
+            group.buffers[0].gpu().address().0,
             words(bytes as usize),
             0,
         );
@@ -531,7 +531,7 @@ impl<'f> SceneWriter<'f> {
             cpu.records.push(zero);
             id
         };
-        self.write(self.scene.tables.groups.gpu.offset(u64::from(id)), record)?;
+        self.write(self.scene.tables.groups.gpu().offset(u64::from(id)), record)?;
         Ok(TransformGroupId(id))
     }
 
@@ -582,7 +582,7 @@ impl<'f> SceneWriter<'f> {
                 g.count
             );
             g.written = true;
-            let at = |b: &Allocation<u8>| b.gpu.cast::<Affine3>().offset(u64::from(first));
+            let at = |b: &Allocation<u8>| b.gpu().cast::<Affine3>().offset(u64::from(first));
             (at(&g.buffers[g.current]), at(&g.buffers[1 - g.current]))
         };
         let (src, out) = self.window.slice::<Affine3>(self.device, count)?;
@@ -598,7 +598,7 @@ impl<'f> SceneWriter<'f> {
         self.scene
             .tables
             .instances
-            .gpu
+            .gpu()
             .offset(u64::from(slot))
             .address()
             .0
@@ -660,7 +660,7 @@ impl<'f> SceneWriter<'f> {
             let cost = 1 + if desc.pose.is_some() { parts } else { 0 };
             cpu.slot_models[first as usize..(first + desc.copies) as usize].fill(desc.model.0);
             let partitions = cpu.ptlas.place(first, desc.copies, cell, cost);
-            (first, entry, partitions, cpu.ptlas.slot_table.gpu)
+            (first, entry, partitions, cpu.ptlas.slot_table.gpu())
         };
         self.upload(table.offset(u64::from(first)), desc.copies)?
             .copy_from_slice(&partitions);
@@ -697,7 +697,7 @@ impl<'f> SceneWriter<'f> {
             stride: 0,
         });
         let records = self.upload(
-            self.scene.tables.instances.gpu.offset(u64::from(first)),
+            self.scene.tables.instances.gpu().offset(u64::from(first)),
             desc.copies,
         )?;
         for (copy, r) in records.iter_mut().enumerate() {
@@ -731,7 +731,7 @@ impl<'f> SceneWriter<'f> {
             .scene
             .tables
             .slot_state
-            .gpu
+            .gpu()
             .offset(u64::from(range.first))
             .address()
             .0;
@@ -792,7 +792,7 @@ impl<'f> SceneWriter<'f> {
             count: desc.copies,
         };
         let records = self.upload(
-            self.scene.tables.instances.gpu.offset(u64::from(first)),
+            self.scene.tables.instances.gpu().offset(u64::from(first)),
             desc.copies,
         )?;
         for (copy, r) in (0..).zip(records.iter_mut()) {
@@ -816,7 +816,7 @@ impl<'f> SceneWriter<'f> {
             };
         }
         let skinned = self.upload(
-            self.scene.tables.skinned.gpu.offset(u64::from(entry)),
+            self.scene.tables.skinned.gpu().offset(u64::from(entry)),
             desc.copies,
         )?;
         for (copy, k) in (0..).zip(skinned.iter_mut()) {
@@ -834,7 +834,7 @@ impl<'f> SceneWriter<'f> {
             };
         }
         let states = self.upload(
-            self.scene.tables.skin_state.gpu.offset(u64::from(entry)),
+            self.scene.tables.skin_state.gpu().offset(u64::from(entry)),
             desc.copies,
         )?;
         states.fill(SkinStateGpu {
@@ -930,7 +930,11 @@ impl<'f> SceneWriter<'f> {
             "material sets {first}+{count} outside the table"
         );
         self.upload(
-            self.scene.tables.material_sets.gpu.offset(u64::from(first)),
+            self.scene
+                .tables
+                .material_sets
+                .gpu()
+                .offset(u64::from(first)),
             count,
         )
     }
@@ -940,7 +944,7 @@ impl<'f> SceneWriter<'f> {
         self.scene
             .tables
             .emissive
-            .gpu
+            .gpu()
             .offset(u64::from(self.scene.desc.producer_capacity + entry))
     }
 
@@ -969,7 +973,7 @@ impl<'f> SceneWriter<'f> {
             let entry = r.entry + (a - r.slots.first);
             let n = b - a;
             r.live -= n;
-            let at = self.scene.tables.skinned.gpu.offset(u64::from(entry));
+            let at = self.scene.tables.skinned.gpu().offset(u64::from(entry));
             let w = n * words(size_of::<SkinnedGpu>());
             cpu.records.push(Record::fill(seq, at.address().0, w, 0));
             let arrays = if r.live == 0 {
@@ -998,7 +1002,7 @@ impl<'f> SceneWriter<'f> {
         );
         let t = &self.scene.tables;
         let i = u64::from(id.0);
-        let counts = t.producer_counts.gpu.offset(i);
+        let counts = t.producer_counts.gpu().offset(i);
         let (record, batch, entry, producer) = match desc {
             None => (
                 ProducerGpu::zeroed(),
@@ -1018,12 +1022,12 @@ impl<'f> SceneWriter<'f> {
                 (b.record, b.batch, entry, Some(b.producer))
             }
         };
-        self.write(t.producers.gpu.offset(i), record)?;
-        self.write(t.batches.gpu.offset(i), batch)?;
-        self.write(t.emissive.gpu.offset(i), entry)?;
+        self.write(t.producers.gpu().offset(i), record)?;
+        self.write(t.batches.gpu().offset(i), batch)?;
+        self.write(t.emissive.gpu().offset(i), entry)?;
         self.push(Record::fill(self.next_seq(), counts.address().0, 2, 0));
         // The new entry has built nothing; its PTLAS instance follows from the record.
-        let state = t.producer_state.gpu.offset(i);
+        let state = t.producer_state.gpu().offset(i);
         let blas = std::mem::offset_of!(ProducerStateGpu, blas) as u64;
         self.push(Record::fill(
             self.next_seq(),
@@ -1053,7 +1057,10 @@ impl<'f> SceneWriter<'f> {
         );
         let origin = self.scene.cpu.lock().unwrap().origin_cell;
         let record = light.map_or(LightGpu::zeroed(), |l| light_gpu(l, origin, self.cell_log2));
-        self.write(self.scene.tables.lights.gpu.offset(u64::from(id.0)), record)
+        self.write(
+            self.scene.tables.lights.gpu().offset(u64::from(id.0)),
+            record,
+        )
     }
 
     /// Consumer data for the linked environment.

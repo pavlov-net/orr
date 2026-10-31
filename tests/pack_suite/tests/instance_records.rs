@@ -31,15 +31,15 @@ fn decode_on_gpu(header: &InstancePageHeader, records: &[InstanceRecord]) -> Vec
         .gpu_malloc::<instances::Root>(MemoryKind::Upload, 1, "root")
         .unwrap();
     root.as_mut_slice().unwrap()[0] = instances::Root {
-        header: h.gpu,
-        records: r.gpu,
-        out: out.gpu,
+        header: h.gpu(),
+        records: r.gpu(),
+        out: out.gpu(),
         count: records.len() as u32,
         _pad: 0,
     };
     dispatch(
         &instances::MODULE,
-        root.gpu,
+        root.gpu(),
         records.len().div_ceil(64) as u32,
     );
     assert_clean();

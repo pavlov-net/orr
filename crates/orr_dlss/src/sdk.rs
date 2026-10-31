@@ -387,7 +387,7 @@ impl SuperResolution {
             list.copy_to_texture(
                 &unit_exposure,
                 &TextureRegion::whole_mip(unit_exposure.desc(), 0),
-                one.gpu.cast(),
+                one.gpu().cast(),
             );
             list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
         };
@@ -558,7 +558,7 @@ impl FrameGeneration {
         let interpolated = image(inputs.interpolated, "interpolated")?;
         let flag = inputs.disable_interpolation.map(|a| raw::Buffer {
             buffer: vulkan::buffer_handle(a),
-            size: a.size,
+            size: a.size(),
         });
         let raw_inputs = raw::FgInputs {
             backbuffer: &backbuffer,

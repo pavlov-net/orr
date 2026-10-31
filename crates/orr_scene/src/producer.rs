@@ -203,7 +203,7 @@ impl Op {
             &RtasIo {
                 args: self.records,
                 count: self.count,
-                dst_implicit: self.results.gpu.address(),
+                dst_implicit: self.results.gpu().address(),
                 dst_addresses: self.addresses,
                 dst_sizes: GpuPtr::NULL,
                 scratch,
@@ -368,7 +368,7 @@ pub(crate) fn build(
     let len = take(0);
 
     let memory = device.gpu_malloc::<u8>(MemoryKind::DeviceLocal, len.max(16), "producer")?;
-    let base = memory.gpu;
+    let base = memory.gpu();
     let at = |offset: u64| base.offset(offset);
     let topologies: Vec<TopologyGpu> = desc
         .topologies
@@ -760,12 +760,12 @@ impl Readback {
         let at = slot as u64 * u64::from(self.capacity);
         let c = u64::from(self.capacity);
         list.copy(
-            self.counts.gpu.offset(at).cast(),
+            self.counts.gpu().offset(at).cast(),
             counts.cast(),
             c * size_of::<[u32; 2]>() as u64,
         );
         list.copy(
-            self.state.gpu.offset(at).cast(),
+            self.state.gpu().offset(at).cast(),
             state.cast(),
             c * size_of::<crate::ProducerStateGpu>() as u64,
         );

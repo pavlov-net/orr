@@ -214,7 +214,7 @@ fn run(
             .gpu_malloc(MemoryKind::Upload, bytes.len() as u64, "fg upload")
             .expect("upload");
         a.as_mut_slice().unwrap().copy_from_slice(bytes);
-        list.copy_to_texture(t, &TextureRegion::whole_mip(t.desc(), 0), a.gpu);
+        list.copy_to_texture(t, &TextureRegion::whole_mip(t.desc(), 0), a.gpu());
         uploads.push(a);
     };
 
@@ -257,7 +257,7 @@ fn run(
         list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
         if f + 1 == FRAMES {
             for (t, r) in generated.iter().zip(&readbacks) {
-                list.copy_from_texture(r.gpu, t, &TextureRegion::whole_mip(t.desc(), 0));
+                list.copy_from_texture(r.gpu(), t, &TextureRegion::whole_mip(t.desc(), 0));
             }
         }
         let done = queue.submit(vec![list], &[]).expect("submit");

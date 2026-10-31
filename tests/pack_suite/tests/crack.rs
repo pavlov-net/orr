@@ -135,7 +135,7 @@ impl Pages {
     }
 
     fn page(&self, p: usize) -> GpuPtr<u8> {
-        self.buf.gpu.offset(self.offsets[p] as u64)
+        self.buf.gpu().offset(self.offsets[p] as u64)
     }
 }
 
@@ -165,8 +165,8 @@ fn raster(
     let out = readback::<i32>(px, "counts out");
     let root = upload(
         &[crack::Root {
-            draws: draws.gpu,
-            counts: counts.gpu,
+            draws: draws.gpu(),
+            counts: counts.gpu(),
             lo_x: sq.lo.x,
             lo_z: sq.lo.y,
             scale: 2.0 / sq.size,
@@ -179,17 +179,17 @@ fn raster(
         "crack root",
     );
     let mut list = render().command_list().unwrap();
-    list.copy(counts.gpu.cast(), zeros.gpu.cast(), px * 4);
+    list.copy(counts.gpu().cast(), zeros.gpu().cast(), px * 4);
     list.barrier(Stages::TRANSFER, Stages::PIXEL, Hazards::empty());
     list.begin_rendering(&Rendering {
         extent: [W, W],
         colors: &[],
         depth: None,
     });
-    list.draw_mesh_tasks(p, root.gpu, [selected.len() as u32, 1, 1]);
+    list.draw_mesh_tasks(p, root.gpu(), [selected.len() as u32, 1, 1]);
     list.end_rendering();
     list.barrier(Stages::PIXEL, Stages::TRANSFER, Hazards::empty());
-    list.copy(out.gpu.cast(), counts.gpu.cast(), px * 4);
+    list.copy(out.gpu().cast(), counts.gpu().cast(), px * 4);
     list.barrier(Stages::TRANSFER, Stages::HOST, Hazards::empty());
     run(list);
     out.as_slice().unwrap().to_vec()
@@ -251,7 +251,7 @@ fn trace_wrong(m: &Mesh, selected: &[(usize, u32)], sq: Square) -> (usize, usize
     let mut b = Builder::new();
     let clas = b.build_clas(&input, data_flags(), 0, None, None);
     let all: Vec<u32> = (0..input.len() as u32).collect();
-    let blas = b.build_blas(clas.addrs.gpu, &[all], None);
+    let blas = b.build_blas(clas.addrs.gpu(), &[all], None);
     let instance = ClassicInstance::new(
         transform,
         0,
@@ -259,7 +259,7 @@ fn trace_wrong(m: &Mesh, selected: &[(usize, u32)], sq: Square) -> (usize, usize
         InstanceFlags::CULL_DISABLE,
         orr_gpu::GpuAddress(0),
     );
-    let tlas = b.build_tlas(blas.addrs.gpu, &[instance]);
+    let tlas = b.build_tlas(blas.addrs.gpu(), &[instance]);
     let out = b.trace(tlas, 0);
     b.flush();
     let out = out.as_slice().unwrap();

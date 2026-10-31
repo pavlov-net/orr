@@ -92,7 +92,7 @@ impl<T: bytemuck::Pod> Root<T> {
 
     fn put(&mut self, value: T) -> GpuPtr<T> {
         self.0.as_mut_slice().unwrap()[0] = value;
-        self.0.gpu
+        self.0.gpu()
     }
 }
 
@@ -201,9 +201,13 @@ impl View {
         }
         let at = image.len() as u64;
         let region = |t: &Texture| TextureRegion::whole_mip(t.desc(), 0);
-        list.copy_to_texture(&v.rr_depth, &region(&v.rr_depth), v.upload.gpu.offset(at));
+        list.copy_to_texture(&v.rr_depth, &region(&v.rr_depth), v.upload.gpu().offset(at));
         let at = at + depth.len() as u64;
-        list.copy_to_texture(&v.rr_motion, &region(&v.rr_motion), v.upload.gpu.offset(at));
+        list.copy_to_texture(
+            &v.rr_motion,
+            &region(&v.rr_motion),
+            v.upload.gpu().offset(at),
+        );
         wait(queue.submit(vec![list], &[]).unwrap());
         v
     }
@@ -219,14 +223,14 @@ impl View {
         let gpu = device();
         self.frame += 1;
         let mut constants: ViewConstants = bytemuck::Zeroable::zeroed();
-        constants.exposure = self.exposure.gpu;
+        constants.exposure = self.exposure.gpu();
         constants.exposure_slot = (self.frame % 2) as u32;
         constants.extent = RENDER;
         constants.jitter = JITTER;
         constants.frame_index = self.frame as u32;
         constants.delta_time = 1.0 / 60.0;
         self.constants.as_mut_slice().unwrap()[0] = constants;
-        let view = self.constants.gpu;
+        let view = self.constants.gpu();
         let output = ViewOutput {
             exposure: Exposure::Manual { ev100: 0.0 },
             distortion_field: field.is_some(),
@@ -241,7 +245,7 @@ impl View {
         let mut list = queue.command_list().unwrap();
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
         let whole = TextureRegion::whole_mip(self.rr_output.desc(), 0);
-        list.copy_to_texture(&self.rr_output, &whole, self.upload.gpu);
+        list.copy_to_texture(&self.rr_output, &whole, self.upload.gpu());
         list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
         let requests = if hooks.any() {
             hook_requests(OUT)
@@ -286,7 +290,7 @@ impl View {
                 source: self.chain.rr_output,
                 extent: OUT,
                 view,
-                sky: self.sky.gpu,
+                sky: self.sky.gpu(),
                 frame: self.frame,
                 output: &output,
             },
@@ -336,7 +340,7 @@ fn dump_texture(t: TextureIndex, extent: [u32; 2]) -> Vec<[f32; 4]> {
         .unwrap();
     let mut root = Root::<dump::Root>::new();
     let root = root.put(dump::Root {
-        out: out.gpu,
+        out: out.gpu(),
         source: t,
         width: extent[0],
         height: extent[1],
@@ -350,7 +354,7 @@ fn dump_texture(t: TextureIndex, extent: [u32; 2]) -> Vec<[f32; 4]> {
     list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
     list.dispatch(&p, root, groups(extent));
     wait(queue.submit(vec![list], &[]).unwrap());
-    read_buffer(out.gpu, 4 * n)
+    read_buffer(out.gpu(), 4 * n)
         .chunks_exact(4)
         .map(|c| [c[0], c[1], c[2], c[3]])
         .collect()

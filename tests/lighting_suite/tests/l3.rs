@@ -137,10 +137,10 @@ fn tiles(scene: &TestScene, lighting: &mut SceneLighting, bins: &Bins) -> Tiles 
         let root = upload(
             &[tile_probe::Root {
                 set: lighting.light_set(),
-                histogram: histogram.gpu,
-                mismatches: mismatches.gpu,
-                bin_probability: probability.gpu,
-                values: values.gpu,
+                histogram: histogram.gpu(),
+                mismatches: mismatches.gpu(),
+                bin_probability: probability.gpu(),
+                values: values.gpu(),
                 _pad: 0,
                 receiver: receiver.extend(0.0).to_array(),
                 axis: axis.normalize().extend(omc as f32).to_array(),
@@ -160,9 +160,9 @@ fn tiles(scene: &TestScene, lighting: &mut SceneLighting, bins: &Bins) -> Tiles 
             },
         );
         compute_barrier(&mut list);
-        list.dispatch(&probe[0], root.gpu, [SAMPLES / 64, 1, 1]);
+        list.dispatch(&probe[0], root.gpu(), [SAMPLES / 64, 1, 1]);
         if f == 0 {
-            list.dispatch(&probe[1], root.gpu, [bins, 1, 1]);
+            list.dispatch(&probe[1], root.gpu(), [bins, 1, 1]);
         }
         finish(list);
         for &v in values.as_slice().unwrap() {
@@ -611,10 +611,10 @@ fn directional_share_matches_the_lights_weights() {
     let root = upload(
         &[nee_probe::Root {
             set: lighting.light_set(),
-            histogram: histogram.gpu,
-            checks: checks.gpu,
-            totals: totals.gpu,
-            normals: normals_gpu.gpu,
+            histogram: histogram.gpu(),
+            checks: checks.gpu(),
+            totals: totals.gpu(),
+            normals: normals_gpu.gpu(),
             _pad: 0,
             position: [0.0; 4],
             normal: [0.0, 1.0, 0.0, 0.0],
@@ -625,7 +625,7 @@ fn directional_share_matches_the_lights_weights() {
         }],
         "nee probe root",
     );
-    run_nee_probe(&scene, &mut lighting, root.gpu, threads);
+    run_nee_probe(&scene, &mut lighting, root.gpu(), threads);
 
     let table = scene.lights();
     let states = read(lighting.directional_states(), 8);
@@ -921,10 +921,10 @@ fn a_scene_without_lights_gives_empty_candidates_and_no_nan() {
     let root = upload(
         &[nee_probe::Root {
             set: lighting.light_set(),
-            histogram: histogram.gpu,
-            checks: checks.gpu,
-            totals: totals.gpu,
-            normals: normals.gpu,
+            histogram: histogram.gpu(),
+            checks: checks.gpu(),
+            totals: totals.gpu(),
+            normals: normals.gpu(),
             _pad: 0,
             position: [1.0, 2.0, 3.0, 0.0],
             normal: [0.0, 1.0, 0.0, 0.0],
@@ -935,7 +935,7 @@ fn a_scene_without_lights_gives_empty_candidates_and_no_nan() {
         }],
         "nee probe root",
     );
-    run_nee_probe(&scene, &mut lighting, root.gpu, threads);
+    run_nee_probe(&scene, &mut lighting, root.gpu(), threads);
 
     let c = checks.as_slice().unwrap();
     assert_eq!((c[1], c[2]), (0, 0), "non-finite or non-empty candidates");
@@ -968,7 +968,7 @@ fn feed_back(set: &LightSetGpu, counts: &[u32]) {
     list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
     list.copy(
         set.feedback_counts.cast(),
-        staging.gpu.cast(),
+        staging.gpu().cast(),
         size_of_val(counts) as u64,
     );
     finish(list);

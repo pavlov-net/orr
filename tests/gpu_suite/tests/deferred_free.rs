@@ -22,8 +22,8 @@ fn deferred_free_waits_for_its_point() {
         .gpu_malloc::<gate::Root>(MemoryKind::Upload, 1, "gate root")
         .unwrap();
     root.as_mut_slice().unwrap()[0] = gate::Root {
-        flag: flag.gpu,
-        out: out.gpu,
+        flag: flag.gpu(),
+        out: out.gpu(),
     };
     let stage = ShaderStage::new(&gate::MODULE, "main", SpecData::default()).unwrap();
     let p = d.create_compute_pipeline(&stage, "gate").unwrap();
@@ -36,7 +36,7 @@ fn deferred_free_waits_for_its_point() {
     let live = d.memory_report().kind(MemoryKind::DeviceLocal).allocations;
 
     let mut list = queue.command_list().unwrap();
-    list.dispatch(&p, root.gpu, [1, 1, 1]);
+    list.dispatch(&p, root.gpu(), [1, 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     let point = queue.submit(vec![list], &[]).unwrap();
     d.gpu_free(victim, point);

@@ -265,7 +265,7 @@ impl MaterialWriter<'_> {
         );
         let src = self.window.put(self.device, m)?;
         self.table.note(id, m);
-        let dst = self.table.table.gpu.offset(u64::from(id.0));
+        let dst = self.table.table.gpu().offset(u64::from(id.0));
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         self.records
             .lock()

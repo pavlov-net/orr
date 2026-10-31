@@ -26,12 +26,12 @@ fn lose_device(
     let roots = upload(
         &[
             gate::Root {
-                flag: flag.gpu,
-                out: out.gpu,
+                flag: flag.gpu(),
+                out: out.gpu(),
             },
             gate::Root {
-                flag: flag.gpu.offset(1),
-                out: out.gpu.offset(1),
+                flag: flag.gpu().offset(1),
+                out: out.gpu().offset(1),
             },
         ],
         "crash roots",
@@ -41,11 +41,11 @@ fn lose_device(
     let queue = render();
     let mut list = queue.command_list().unwrap();
     list.begin_pass("warm", false);
-    list.dispatch(&warm, roots.gpu, [1, 1, 1]);
+    list.dispatch(&warm, roots.gpu(), [1, 1, 1]);
     list.end_pass();
     list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
     list.begin_pass(pass, false);
-    list.dispatch(&p, roots.gpu.offset(1), [1, 1, 1]);
+    list.dispatch(&p, roots.gpu().offset(1), [1, 1, 1]);
     list.end_pass();
     let result = queue
         .submit(vec![list], &[])

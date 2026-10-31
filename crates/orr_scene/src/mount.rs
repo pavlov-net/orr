@@ -302,10 +302,7 @@ impl MountTask {
             MemoryKind::Upload
         };
         let a = self.device.gpu_malloc::<u8>(kind, bytes, name)?;
-        let b = Block {
-            size: bytes,
-            ..Block::of(&a)
-        };
+        let b = Block::of(&a);
         self.placed.lock().unwrap().blocks.push(a);
         Ok(b)
     }
@@ -342,15 +339,15 @@ pub(crate) fn write(
     bytes: &[u8],
 ) -> Result<Option<StagedCopy>> {
     assert!(
-        at + bytes.len() as u64 <= block.size,
+        at + bytes.len() as u64 <= block.size(),
         "write outside its block"
     );
     if bytes.is_empty() {
         return Ok(None);
     }
-    match block.cpu {
-        // SAFETY: the block is mapped and outlives the jobs writing it, and every write
-        // covers its own range.
+    match block.cpu() {
+        // SAFETY: the assert above keeps the write inside the block's mapping, which
+        // outlives the jobs writing it; every write covers its own range.
         Some(p) => unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
@@ -361,16 +358,17 @@ pub(crate) fn write(
         },
         None => Ok(Some(StagedCopy::Buffer {
             src: staging(device, bytes)?,
-            dst: block.gpu + at,
+            dst: block.gpu() + at,
         })),
     }
 }
 
 fn staging(device: &Device, bytes: &[u8]) -> Result<Allocation<u8>> {
-    let src = device.gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, "loading staging")?;
-    let p = src.cpu.expect("upload is mapped");
-    // SAFETY: a fresh mapping of `bytes.len()` bytes.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_ptr(), bytes.len()) };
+    let mut src =
+        device.gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, "loading staging")?;
+    src.as_mut_slice()
+        .expect("upload is mapped")
+        .copy_from_slice(bytes);
     Ok(src)
 }
 
@@ -561,7 +559,7 @@ fn place_skeleton(t: &Arc<MountTask>, id: AssetId, blob: &[u8]) -> Result<()> {
     t.write(block, 0, blob)?;
     let r = SkeletonRef {
         // SAFETY: the blob is resident in the mount's block.
-        blob: unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu)) },
+        blob: unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu())) },
         joint_count: info.joint_count() as u32,
     };
     t.placed.lock().unwrap().skeletons.push((id, r));
@@ -581,7 +579,7 @@ fn place_clip(t: &Arc<MountTask>, entry: usize, id: AssetId, head: &[u8]) -> Res
     let block = t.block(at + samples.max(16), "clip")?;
     t.write(block, 0, head)?;
     // SAFETY: the blobs are resident in the mount's block.
-    let ptr = |o: u64| unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu + o)) };
+    let ptr = |o: u64| unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu() + o)) };
     let r = ClipRef {
         header: ptr(0),
         samples: ptr(at),
@@ -677,14 +675,14 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
         placed.meshes.push(PlacedMesh {
             id,
             entry: entry as u32,
-            info: block.gpu,
+            info: block.gpu(),
             pages: vec![0; info.pages.len()],
             node_pages: vec![0; info.node_pages.len()],
             page_units,
             node_units,
-            page_clusters: block.gpu + page_clusters_at,
+            page_clusters: block.gpu() + page_clusters_at,
             levels: (
-                block.gpu + u64::from(header.levels.first),
+                block.gpu() + u64::from(header.levels.first),
                 header.levels.count,
             ),
             cluster_count: first,
@@ -695,7 +693,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             clusters: Vec::with_capacity(first as usize),
             micromaps: vec![None; info.pages.len()],
             parts: info.parts.clone(),
-            node_stamps: block.gpu + stamps_at,
+            node_stamps: block.gpu() + stamps_at,
             depth,
         });
         placed.meshes.len() - 1
@@ -721,7 +719,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
                     });
                 let mut placed = t.placed.lock().unwrap();
                 let m = &mut placed.meshes[mesh];
-                m.pages[p] = block.gpu + at;
+                m.pages[p] = block.gpu() + at;
                 m.emissive.extend(emissive);
                 m.clusters.extend(clusters);
                 m.micromaps[p] = micromap;
@@ -737,7 +735,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
                 return Err(orr_pack::Error::Malformed("node page length").into());
             }
             t.write(block, at, nodes)?;
-            t.placed.lock().unwrap().meshes[mesh].node_pages[n] = block.gpu + at;
+            t.placed.lock().unwrap().meshes[mesh].node_pages[n] = block.gpu() + at;
             Ok(())
         });
     }
@@ -876,13 +874,13 @@ fn place_page(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
     let page = InstancePage {
         info,
         // SAFETY: the block holds the records from its start.
-        records: unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu)) },
+        records: unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu())) },
         record_count: record_count as u32,
         user: if user_stride == 0 {
             GpuPtr::NULL
         } else {
             // SAFETY: the block holds the consumer data from `user_at`.
-            unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu + user_at)) }
+            unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu() + user_at)) }
         },
     };
     t.placed
@@ -1188,7 +1186,7 @@ fn build_accel(
     let meshes = r.meshes.iter_mut().zip(refs).zip(built.cuts).zip(skins);
     for (((m, mut refs), cuts), skin) in meshes {
         if let Some(table) = skin {
-            m.gpu.skin = table.gpu.cast();
+            m.gpu.skin = table.gpu().cast();
             r.accel.skins.push(table);
         }
         for (r, &clas) in refs.iter_mut().zip(&cuts.rt.clas) {
@@ -1231,13 +1229,13 @@ pub(crate) fn submit_copies(
             StagedCopy::Buffer { src, dst } => {
                 // SAFETY: `dst` lies inside one of the mount's blocks.
                 let dst = unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(*dst)) };
-                list.copy(dst, src.gpu, src.size);
+                list.copy(dst, src.gpu(), src.size());
             }
             StagedCopy::Texture {
                 src,
                 texture,
                 region,
-            } => list.copy_to_texture(texture, region, src.gpu),
+            } => list.copy_to_texture(texture, region, src.gpu()),
         }
     }
     Ok(Some(queue.submit(vec![list], &[])?))
@@ -1769,7 +1767,7 @@ impl Mounts {
             material_ids.push(mid);
             w.materials.note(mid, m);
             w.put(
-                w.materials.table.gpu.offset(u64::from(mid.0)),
+                w.materials.table.gpu().offset(u64::from(mid.0)),
                 std::slice::from_ref(m),
             )?;
         }
@@ -1787,7 +1785,7 @@ impl Mounts {
                 .alloc(n)
                 .ok_or(capacity("mesh page table", self.sizes.page_table))?;
             res.page_ranges.push((start, n));
-            let table = self.page_table.gpu.offset(u64::from(start));
+            let table = self.page_table.gpu().offset(u64::from(start));
             tables.push(table);
             w.put(table, &m.page_addresses)?;
             let gpu = MeshGpu {
@@ -1795,9 +1793,9 @@ impl Mounts {
                 node_pages: table.offset(u64::from(m.gpu.page_count)),
                 ..m.gpu
             };
-            w.put(self.meshes.gpu.offset(u64::from(id)), &[gpu])?;
+            w.put(self.meshes.gpu().offset(u64::from(id)), &[gpu])?;
             w.put(
-                self.clusters.gpu.offset(u64::from(m.gpu.cluster_base)),
+                self.clusters.gpu().offset(u64::from(m.gpu.cluster_base)),
                 &m.refs,
             )?;
             res.rt.push(m.rt.clone());
@@ -1821,7 +1819,7 @@ impl Mounts {
             res.material_ranges.push((start, n));
             let section_materials: Vec<MaterialId> =
                 m.materials.iter().map(|&i| material_ids[i]).collect();
-            let list = self.model_materials.gpu.offset(u64::from(start));
+            let list = self.model_materials.gpu().offset(u64::from(start));
             let raw: Vec<u32> = section_materials.iter().map(|id| id.0).collect();
             w.put(list, &raw)?;
             let gpu = ModelGpu {
@@ -1831,7 +1829,7 @@ impl Mounts {
                 bounds_min: m.bounds.min,
                 bounds_max: m.bounds.max,
             };
-            w.put(self.models.gpu.offset(u64::from(id.0)), &[gpu])?;
+            w.put(self.models.gpu().offset(u64::from(id.0)), &[gpu])?;
             self.owners.insert(id, (mount, m.mesh as u32));
             let i = id.0 as usize;
             if w.emission.len() <= i {
@@ -1938,9 +1936,9 @@ impl Mounts {
             let entry = MaskGpu {
                 mask: u32::from(mask),
                 _pad: 0,
-                blas: blas.table.gpu,
+                blas: blas.table.gpu(),
             };
-            let at = masks.table.gpu.offset(masks.built.len() as u64);
+            let at = masks.table.gpu().offset(masks.built.len() as u64);
             records.push(Record::values(
                 next(seq),
                 at,
@@ -1948,8 +1946,8 @@ impl Mounts {
                 1,
             ));
             masks.built.push((mask, blas));
-            let mesh = self.meshes.gpu.offset(u64::from(id)).address().0;
-            let table = window.put(device, &masks.table.gpu.address().0)?;
+            let mesh = self.meshes.gpu().offset(u64::from(id)).address().0;
+            let table = window.put(device, &masks.table.gpu().address().0)?;
             let count = window.put(device, &(masks.built.len() as u32))?;
             let field = |offset: usize| mesh + offset as u64;
             records.push(Record::copy(

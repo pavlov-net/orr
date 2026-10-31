@@ -240,7 +240,7 @@ fn frame_generation_presents_generated_images_before_each_frame() {
         list.begin_pass("moving_bar", false);
         list.dispatch(
             pipeline,
-            roots.gpu.offset(slot as u64),
+            roots.gpu().offset(slot as u64),
             [extent[0].div_ceil(8), extent[1].div_ceil(8), 1],
         );
         list.end_pass();
@@ -528,7 +528,7 @@ mod lens_distortion {
                 time,
             };
             let mut c: ViewConstants = bytemuck::Zeroable::zeroed();
-            c.exposure = self.exposure.gpu;
+            c.exposure = self.exposure.gpu();
             c.exposure_slot = (self.frame % 2) as u32;
             c.extent = OUT;
             c.delta_time = 1.0 / 60.0;
@@ -542,7 +542,7 @@ mod lens_distortion {
             list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
             list.dispatch(
                 &self.scene,
-                self.scene_root.gpu,
+                self.scene_root.gpu(),
                 [OUT[0].div_ceil(8), OUT[1].div_ceil(8), 1],
             );
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
@@ -553,8 +553,8 @@ mod lens_distortion {
                 &ExposurePass {
                     source: self.radiance.sampled,
                     extent: OUT,
-                    view: self.constants.gpu,
-                    sky: self.sky.gpu,
+                    view: self.constants.gpu(),
+                    sky: self.sky.gpu(),
                     frame: self.frame,
                     output: &output,
                 },
@@ -566,7 +566,7 @@ mod lens_distortion {
                     source: self.radiance.sampled,
                     target: self.linear.storage,
                     extent: OUT,
-                    view: self.constants.gpu,
+                    view: self.constants.gpu(),
                     display: &self.display,
                     output: &output,
                     hook_source: None,

@@ -55,8 +55,8 @@ fn removed_slots_wait_for_their_frame() {
         .gpu_malloc::<gate::Root>(MemoryKind::Upload, 1, "gate root")
         .unwrap();
     gate_root.as_mut_slice().unwrap()[0] = gate::Root {
-        flag: flag.gpu,
-        out: out.gpu,
+        flag: flag.gpu(),
+        out: out.gpu(),
     };
     let p = pipeline(&gate::MODULE, "main");
     let mut f = scenes.begin_frame(&desc).unwrap();
@@ -65,7 +65,7 @@ fn removed_slots_wait_for_their_frame() {
         w.remove(a);
         add(&mut w)
     };
-    f.update_scenes(&mut |c| c.cmd.dispatch(&p, gate_root.gpu, [1, 1, 1]))
+    f.update_scenes(&mut |c| c.cmd.dispatch(&p, gate_root.gpu(), [1, 1, 1]))
         .unwrap();
     let removal = f.end(&[]).unwrap();
 

@@ -134,7 +134,7 @@ impl<T: bytemuck::Pod> Ring<T> {
     }
 
     pub(crate) fn at(&self, slot: usize) -> GpuPtr<T> {
-        self.0.gpu.offset(slot as u64)
+        self.0.gpu().offset(slot as u64)
     }
 }
 
@@ -293,9 +293,9 @@ impl SceneLighting {
             slot,
             directional::Root {
                 scene: pass.scene,
-                states: self.states.gpu,
-                ids: self.directional_ids.gpu,
-                set: self.set.gpu,
+                states: self.states.gpu(),
+                ids: self.directional_ids.gpu(),
+                set: self.set.gpu(),
                 focus,
             },
         );
@@ -303,18 +303,18 @@ impl SceneLighting {
             slot,
             tiles::Root {
                 scene: pass.scene,
-                set: self.set.gpu,
+                set: self.set.gpu(),
                 environment: self.environment.environment(),
-                directional: self.states.gpu,
-                directional_ids: self.directional_ids.gpu,
-                cdf: self.cdf.gpu,
-                light_probability: self.light_probability.gpu,
-                emissive: self.emissive.gpu,
-                cluster_cdf: self.cluster_cdf.gpu,
-                tiles: self.tiles.gpu,
-                feedback_counts: self.feedback_counts.gpu,
-                feedback_weights: self.feedback_weights.gpu,
-                stats: self.readback.gpu.offset(slot as u64),
+                directional: self.states.gpu(),
+                directional_ids: self.directional_ids.gpu(),
+                cdf: self.cdf.gpu(),
+                light_probability: self.light_probability.gpu(),
+                emissive: self.emissive.gpu(),
+                cluster_cdf: self.cluster_cdf.gpu(),
+                tiles: self.tiles.gpu(),
+                feedback_counts: self.feedback_counts.gpu(),
+                feedback_weights: self.feedback_weights.gpu(),
+                stats: self.readback.gpu().offset(slot as u64),
                 cluster_capacity: self.settings.emissive_clusters,
                 frame: pass.frame as u32,
                 feedback_share: self.settings.feedback_share,
@@ -393,7 +393,7 @@ impl SceneLighting {
     /// The light set kernels sample: selection, tiles, directional states and the baked
     /// environment, as the last recorded scene pass left them.
     pub fn light_set(&self) -> GpuPtr<LightSetGpu> {
-        self.set.gpu
+        self.set.gpu()
     }
 
     /// The baked environment, for sampling and miss lookups.
@@ -413,6 +413,6 @@ impl SceneLighting {
 
     /// Per directional light, by LightId, its state for the last recorded frame.
     pub fn directional_states(&self) -> GpuPtr<DirectionalState> {
-        self.states.gpu
+        self.states.gpu()
     }
 }

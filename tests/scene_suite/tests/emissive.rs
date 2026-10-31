@@ -323,7 +323,7 @@ fn producer_power_follows_emitted_clusters_every_frame() {
                 let r = c
                     .put_root(&emit::Root {
                         scene: c.root,
-                        triangles: quad.gpu,
+                        triangles: quad.gpu(),
                         producer: producer.0,
                         count,
                         size,

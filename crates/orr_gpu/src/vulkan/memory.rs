@@ -175,16 +175,15 @@ impl Usage {
     }
 }
 
-/// GPU memory from [`Device::gpu_malloc`]: `count` values of `T` at `gpu`, mapped at `cpu`
-/// for [`MemoryKind::Upload`] and [`MemoryKind::Readback`].
+/// GPU memory from [`Device::gpu_malloc`]: `count` values of `T` at [`Allocation::gpu`],
+/// mapped on the CPU for [`MemoryKind::Upload`] and [`MemoryKind::Readback`].
 ///
 /// Dropping it frees the memory once everything submitted before the drop has completed;
 /// [`Device::gpu_free`] names the point instead.
 pub struct Allocation<T: 'static> {
-    pub gpu: GpuPtr<T>,
-    pub cpu: Option<NonNull<T>>,
-    /// Bytes.
-    pub size: u64,
+    gpu: GpuPtr<T>,
+    cpu: Option<NonNull<T>>,
+    size: u64,
     raw: ManuallyDrop<RawBuffer>,
     shared: Arc<Shared>,
     _type: PhantomData<T>,
@@ -192,12 +191,32 @@ pub struct Allocation<T: 'static> {
 
 // SAFETY: the allocation owns its memory; the mapping is plain memory any thread may use.
 unsafe impl<T: Send> Send for Allocation<T> {}
-// SAFETY: shared access only hands out shared slices of `T`.
+// SAFETY: shared access hands out shared slices of `T` and a raw pointer whose every use
+// is unsafe.
 unsafe impl<T: Sync> Sync for Allocation<T> {}
 
 impl<T> Allocation<T> {
     pub fn kind(&self) -> MemoryKind {
         self.raw.kind
+    }
+
+    /// The device address of the first value.
+    pub fn gpu(&self) -> GpuPtr<T> {
+        self.gpu
+    }
+
+    /// Bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// The mapped first value, for host-visible kinds, for what slices cannot express:
+    /// volatile access and writes from several threads into disjoint ranges. `len()` values,
+    /// uninitialized at first, stay mapped and aligned for `T` while the allocation lives.
+    /// Accesses stay within them, off live slices from [`Allocation::as_slice`] and
+    /// [`Allocation::as_mut_slice`], and ordered against the GPU and other threads.
+    pub fn mapped_ptr(&self) -> Option<NonNull<T>> {
+        self.cpu
     }
 
     /// Number of `T` values.
@@ -230,8 +249,9 @@ impl<T: Pod> Allocation<T> {
     /// the submit that wrote them has completed.
     pub fn as_slice(&self) -> Option<&[T]> {
         let ptr = self.cpu?;
-        // SAFETY: the mapping holds `len()` values for the allocation's lifetime and `T` is
-        // valid for any bit pattern.
+        // SAFETY: the mapping holds `len()` values, aligned for `T` (asserted at creation),
+        // for the allocation's lifetime; `size` is private and fixed; `T` is valid for any
+        // bit pattern.
         Some(unsafe { std::slice::from_raw_parts(ptr.as_ptr(), self.len() as usize) })
     }
 
@@ -632,10 +652,17 @@ impl Device {
         let (raw, mapped) =
             self.shared
                 .create_buffer_in(Some(priority), kind, size, usage, align, name)?;
+        let cpu = mapped.map(NonNull::cast::<T>);
+        if let Some(p) = cpu {
+            assert!(
+                p.is_aligned(),
+                "{name}: mapping is not aligned for its values"
+            );
+        }
         Ok(Allocation {
             // SAFETY: the address is the start of `size` bytes owned by the allocation.
             gpu: unsafe { GpuPtr::from_address(GpuAddress(raw.address)) },
-            cpu: mapped.map(NonNull::cast),
+            cpu,
             size,
             raw: ManuallyDrop::new(raw),
             shared: Arc::clone(&self.shared),
@@ -907,11 +934,16 @@ impl HostArenas {
             .align_to(MIN_ALIGN as usize)
             .map_err(|_| AllocError)?;
         let (ptr, gpu) = self.place(layout)?;
-        // SAFETY: the range was just allocated for `values.len()` values and nothing else
-        // uses it.
+        let ptr = ptr.cast::<T>();
+        assert!(
+            ptr.is_aligned(),
+            "{}: upload is not aligned",
+            self.ring.name
+        );
+        // SAFETY: the range was just allocated for `values.len()` values, aligned (asserted
+        // above), and nothing else uses it.
         unsafe {
-            ptr.cast::<T>()
-                .copy_from_nonoverlapping(NonNull::from(values).cast(), values.len());
+            ptr.copy_from_nonoverlapping(NonNull::from(values).cast(), values.len());
         }
         // SAFETY: the range lies in the block.
         Ok(unsafe { GpuPtr::from_address(GpuAddress(gpu)) })

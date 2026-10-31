@@ -44,7 +44,7 @@ fn heap_commands_after_raw_commands() {
     let roots = outs.each_ref().map(|out| {
         upload(
             &[heap_views::Root {
-                out: out.gpu,
+                out: out.gpu(),
                 source,
                 nearest,
                 target,
@@ -67,7 +67,7 @@ fn heap_commands_after_raw_commands() {
 
     let mut list = render().command_list().unwrap();
     list.discard(&tex);
-    list.dispatch(&sample, roots[0].gpu, groups);
+    list.dispatch(&sample, roots[0].gpu(), groups);
     list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
     let raw = list.vulkan_raw();
     // SAFETY: the buffer is recording; the image is in GENERAL and allows transfer writes.
@@ -81,7 +81,7 @@ fn heap_commands_after_raw_commands() {
         );
     }
     list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
-    list.dispatch(&sample, roots[1].gpu, groups);
+    list.dispatch(&sample, roots[1].gpu(), groups);
     list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
     let point = run(list);
 
