@@ -12,6 +12,7 @@ use orr_gpu::{
     Texture, TextureDesc, TextureIndex, TextureMemory, TextureUsage, ViewDesc,
 };
 
+use crate::arena::{ArenaBuffer, ArenaRequest, ArenaTexture, Span, ViewArena, ViewStep};
 use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::shaders::{cull, hzb, raster, resolve};
@@ -105,8 +106,8 @@ impl RasterPipelines {
     }
 }
 
-/// A per-view texture with a sampled view and, unless it is the depth target, storage
-/// views of each mip.
+/// A per-view texture kept between frames, with a sampled view and, unless it is the depth
+/// target, storage views of each mip.
 pub(crate) struct Target {
     pub texture: Arc<Texture>,
     pub sampled: TextureIndex,
@@ -169,30 +170,82 @@ pub(crate) struct TargetSizes {
     pub slots: u32,
 }
 
-/// One view history's raster targets, kept while its extent and sizes hold.
+/// Arena names of the raster's transient targets.
+const VISIBILITY: &str = "visibility buffer";
+const CLUSTERS: &str = "visible clusters";
+const WORK: &str = "cluster work";
+const OPAQUE: &str = "opaque clusters";
+const ALPHA: &str = "alpha clusters";
+const SOFTWARE: &str = "software clusters";
+const PARTICLES: &str = "particle clusters";
+const BIN_ARGS: &str = "bin args";
+const BIN_TILES: &str = "bin tiles";
+const DEPTH_VALUES: &str = "resolved depth";
+const GBUF_A: &str = "gbuf_a";
+const GBUF_B: &str = "gbuf_b";
+const GBUF_X: &str = "gbuf_x";
+const OVERLAY: &str = "transparency overlay";
+
+/// Raster's working lists and the depth it resolves, which only the raster half reads.
+const CULL: Span = Span::new(ViewStep::Raster, ViewStep::Raster);
+/// The G-buffer and what `load_gsurface` and the transparency point read beside it.
+const GBUFFER: Span = Span::new(ViewStep::Raster, ViewStep::Transparency);
+const OVERLAY_SPAN: Span = Span::new(ViewStep::Transparency, ViewStep::Transparency);
+
+/// The raster's targets in the view's arena, taken at one layout.
+struct Transient {
+    generation: u64,
+    visibility: ArenaBuffer,
+    clusters: ArenaBuffer,
+    work: ArenaBuffer,
+    opaque: ArenaBuffer,
+    alpha: ArenaBuffer,
+    software: ArenaBuffer,
+    particles: ArenaBuffer,
+    bin_args: ArenaBuffer,
+    bin_tiles: ArenaBuffer,
+    depth_values: ArenaBuffer,
+    a: ArenaTexture,
+    b: ArenaTexture,
+    x: Option<ArenaTexture>,
+    overlay: ArenaTexture,
+}
+
+impl Transient {
+    fn take(arena: &ViewArena) -> Self {
+        let buffer = |name| arena.buffer(name).expect("raster target").clone();
+        let texture = |name| arena.texture(name).cloned();
+        Self {
+            generation: arena.generation(),
+            visibility: buffer(VISIBILITY),
+            clusters: buffer(CLUSTERS),
+            work: buffer(WORK),
+            opaque: buffer(OPAQUE),
+            alpha: buffer(ALPHA),
+            software: buffer(SOFTWARE),
+            particles: buffer(PARTICLES),
+            bin_args: buffer(BIN_ARGS),
+            bin_tiles: buffer(BIN_TILES),
+            depth_values: buffer(DEPTH_VALUES),
+            a: texture(GBUF_A).expect("raster target"),
+            b: texture(GBUF_B).expect("raster target"),
+            x: texture(GBUF_X),
+            overlay: texture(OVERLAY).expect("raster target"),
+        }
+    }
+}
+
+/// One view history's raster targets, kept while its extent and sizes hold: the ones read
+/// after the view's render or by its next frame, and the transient ones of its arena.
 pub(crate) struct ViewTargets {
     pub sizes: TargetSizes,
-    pub visibility: Allocation<u64>,
-    pub clusters: Allocation<VisibleCluster>,
-    work: Allocation<ClusterWork>,
-    opaque: Allocation<u32>,
-    alpha: Allocation<u32>,
-    software: Allocation<u32>,
-    particles: Allocation<u32>,
     slot_visibility: Allocation<u32>,
     /// Workgroup args (`ARGS`), then counts.
     args: Allocation<u32>,
-    bin_args: Allocation<u32>,
-    bin_tiles: Allocation<u32>,
-    depth_values: Allocation<f32>,
     pub depth: Target,
-    pub a: Target,
-    pub b: Target,
-    pub x: Option<Target>,
     pub motion: Target,
     pub hzb: Target,
-    /// The transparency point's overlay, made at the first transparency pass.
-    pub overlay: Option<Target>,
+    transient: Transient,
     /// The scene the HZB holds the last render of.
     pub hzb_scene: Option<SceneId>,
 }
@@ -206,11 +259,70 @@ fn hzb_mips(extent: [u32; 2]) -> u32 {
 }
 
 impl ViewTargets {
-    /// New targets, discarded into `list` so their first use sees `GENERAL`.
-    pub(crate) fn new(device: &Device, s: TargetSizes, list: &mut CommandList<'_>) -> Result<Self> {
+    /// The transient targets the raster half takes from the view's arena.
+    pub(crate) fn requests(s: &TargetSizes) -> Vec<ArenaRequest> {
         let [w, h] = s.extent;
         let pixels = u64::from(w) * u64::from(h);
         let [tx, ty] = tiles(s.extent);
+        let clusters = u64::from(s.visible_clusters);
+        let list = 4 * clusters;
+        let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
+        let d2 = |format| TextureDesc::d2(format, w, h, usage);
+        let mut r = vec![
+            ArenaRequest::buffer(VISIBILITY, 8 * pixels, GBUFFER),
+            ArenaRequest::buffer(
+                CLUSTERS,
+                size_of::<VisibleCluster>() as u64 * clusters,
+                GBUFFER,
+            ),
+            ArenaRequest::buffer(PARTICLES, list, GBUFFER),
+            ArenaRequest::texture(GBUF_A, d2(Format::Rgba32Uint), GBUFFER),
+            ArenaRequest::texture(GBUF_B, d2(Format::Rg32Uint), GBUFFER),
+            ArenaRequest::buffer(
+                WORK,
+                size_of::<ClusterWork>() as u64 * u64::from(s.work),
+                CULL,
+            ),
+            ArenaRequest::buffer(OPAQUE, list, CULL),
+            ArenaRequest::buffer(ALPHA, list, CULL),
+            ArenaRequest::buffer(SOFTWARE, list, CULL),
+            ArenaRequest::buffer(BIN_ARGS, 12 * u64::from(s.bins), CULL),
+            ArenaRequest::buffer(
+                BIN_TILES,
+                4 * u64::from(s.bins) * u64::from(tx) * u64::from(ty),
+                CULL,
+            ),
+            ArenaRequest::buffer(DEPTH_VALUES, 4 * pixels, CULL),
+            ArenaRequest::texture(
+                OVERLAY,
+                TextureDesc::d2(
+                    Format::Rgba16Float,
+                    w,
+                    h,
+                    TextureUsage::SAMPLED | TextureUsage::COLOR,
+                ),
+                OVERLAY_SPAN,
+            ),
+        ];
+        if s.extended {
+            r.push(ArenaRequest::texture(
+                GBUF_X,
+                d2(Format::Rgba32Uint),
+                GBUFFER,
+            ));
+        }
+        r
+    }
+
+    /// New targets beside the transient ones of `arena`, which [`Self::requests`] laid out;
+    /// discarded into `list` so their first use sees `GENERAL`.
+    pub(crate) fn new(
+        device: &Device,
+        s: TargetSizes,
+        arena: &ViewArena,
+        list: &mut CommandList<'_>,
+    ) -> Result<Self> {
+        let [w, h] = s.extent;
         let dl = MemoryKind::DeviceLocal;
         let depth = Target::new(
             device,
@@ -237,50 +349,38 @@ impl ViewTargets {
         )?;
         let t = Self {
             sizes: s,
-            visibility: device.gpu_malloc(dl, pixels, "visibility buffer")?,
-            clusters: device.gpu_malloc(dl, u64::from(s.visible_clusters), "visible clusters")?,
-            work: device.gpu_malloc(dl, u64::from(s.work), "cluster work")?,
-            opaque: device.gpu_malloc(dl, u64::from(s.visible_clusters), "opaque clusters")?,
-            alpha: device.gpu_malloc(dl, u64::from(s.visible_clusters), "alpha clusters")?,
-            software: device.gpu_malloc(dl, u64::from(s.visible_clusters), "software clusters")?,
-            particles: device.gpu_malloc(dl, u64::from(s.visible_clusters), "particle clusters")?,
             slot_visibility: device.gpu_malloc(dl, u64::from(s.slots.max(1)), "slot visibility")?,
             args: device.gpu_malloc(dl, ARGS + COUNTS, "raster args")?,
-            bin_args: device.gpu_malloc(dl, 3 * u64::from(s.bins), "bin args")?,
-            bin_tiles: device.gpu_malloc(
-                dl,
-                u64::from(s.bins) * u64::from(tx) * u64::from(ty),
-                "bin tiles",
-            )?,
-            depth_values: device.gpu_malloc(dl, pixels, "resolved depth")?,
             depth,
-            a: Target::d2(device, Format::Rgba32Uint, s.extent, "gbuf_a")?,
-            b: Target::d2(device, Format::Rg32Uint, s.extent, "gbuf_b")?,
-            x: s.extended
-                .then(|| Target::d2(device, Format::Rgba32Uint, s.extent, "gbuf_x"))
-                .transpose()?,
             motion: Target::d2(device, Format::Rg16Float, s.extent, "motion")?,
             hzb,
-            overlay: None,
+            transient: Transient::take(arena),
             hzb_scene: None,
         };
-        for target in [&t.depth, &t.a, &t.b, &t.motion, &t.hzb]
-            .into_iter()
-            .chain(&t.x)
-        {
+        for target in [&t.depth, &t.motion, &t.hzb] {
             list.discard(&target.texture);
         }
         Ok(t)
     }
 
+    /// Takes the transient targets again after `arena` was laid out anew.
+    pub(crate) fn bind(&mut self, arena: &ViewArena) {
+        if self.transient.generation != arena.generation() {
+            self.transient = Transient::take(arena);
+        }
+    }
+
     pub(crate) fn gbuffer(&self) -> GBufferGpu {
+        let t = &self.transient;
         GBufferGpu {
-            visibility: self.visibility.gpu,
-            clusters: self.clusters.gpu,
+            visibility: t.visibility.gpu(),
+            clusters: t.clusters.gpu(),
             depth: self.depth.sampled,
-            a: self.a.sampled,
-            b: self.b.sampled,
-            x: self.x.as_ref().map_or(TextureIndex::NONE, |x| x.sampled),
+            a: t.a.sampled(),
+            b: t.b.sampled(),
+            x: t.x
+                .as_ref()
+                .map_or(TextureIndex::NONE, ArenaTexture::sampled),
             motion: self.motion.sampled,
             hzb: self.hzb.sampled,
             extent: self.sizes.extent,
@@ -289,29 +389,39 @@ impl ViewTargets {
         }
     }
 
+    /// The G-buffer's textures: a, b and x.
+    pub(crate) fn gbuffer_textures(&self) -> (Arc<Texture>, Arc<Texture>, Option<Arc<Texture>>) {
+        let t = &self.transient;
+        (
+            Arc::clone(t.a.texture()),
+            Arc::clone(t.b.texture()),
+            t.x.as_ref().map(|x| Arc::clone(x.texture())),
+        )
+    }
+
     fn record(&self, software_pixels: f32, occlusion: bool, slots: u32) -> RasterGpu {
         let [tx, ty] = tiles(self.sizes.extent);
         let mut hzb = [StorageImageIndex::NONE; MAX_HZB_MIPS as usize];
         hzb[..self.hzb.storage.len()].copy_from_slice(&self.hzb.storage);
+        let t = &self.transient;
         RasterGpu {
             gbuffer: self.gbuffer(),
-            work: self.work.gpu,
+            work: t.work.gpu(),
             args: self.args.gpu,
-            opaque: self.opaque.gpu,
-            alpha: self.alpha.gpu,
-            software: self.software.gpu,
-            particles: self.particles.gpu,
+            opaque: t.opaque.gpu(),
+            alpha: t.alpha.gpu(),
+            software: t.software.gpu(),
+            particles: t.particles.gpu(),
             counts: self.counts(),
             slot_visibility: self.slot_visibility.gpu,
-            bin_args: self.bin_args.gpu,
-            bin_tiles: self.bin_tiles.gpu,
-            depth: self.depth_values.gpu,
-            a: self.a.storage[0],
-            b: self.b.storage[0],
-            x: self
-                .x
+            bin_args: t.bin_args.gpu(),
+            bin_tiles: t.bin_tiles.gpu(),
+            depth: t.depth_values.gpu(),
+            a: t.a.storage(0),
+            b: t.b.storage(0),
+            x: t.x
                 .as_ref()
-                .map_or(StorageImageIndex::NONE, |x| x.storage[0]),
+                .map_or(StorageImageIndex::NONE, |x| x.storage(0)),
             motion: self.motion.storage[0],
             hzb,
             tiles_x: tx,
@@ -327,21 +437,9 @@ impl ViewTargets {
         }
     }
 
-    /// The overlay, made on first use.
-    pub(crate) fn overlay(
-        &mut self,
-        device: &Device,
-        list: &mut CommandList<'_>,
-    ) -> Result<&Target> {
-        if self.overlay.is_none() {
-            let [w, h] = self.sizes.extent;
-            let usage = TextureUsage::SAMPLED | TextureUsage::COLOR;
-            let desc = TextureDesc::d2(Format::Rgba16Float, w, h, usage);
-            let overlay = Target::new(device, &desc, "transparency overlay")?;
-            list.discard(&overlay.texture);
-            self.overlay = Some(overlay);
-        }
-        Ok(self.overlay.as_ref().expect("made above"))
+    /// The transparency point's overlay.
+    pub(crate) fn overlay(&self) -> &ArenaTexture {
+        &self.transient.overlay
     }
 
     /// Mesh args of the particle draws, and the draw count beside them.
@@ -355,6 +453,15 @@ impl ViewTargets {
     /// `RasterGpu.counts` ([`crate::RasterView::counts`]).
     pub(crate) fn counts(&self) -> GpuPtr<u32> {
         self.args.gpu.offset(ARGS)
+    }
+
+    /// `bin`'s resolve dispatch args.
+    fn bin_args(&self, bin: u32) -> GpuPtr<DispatchArgs> {
+        self.transient
+            .bin_args
+            .gpu::<u32>()
+            .offset(3 * u64::from(bin))
+            .cast()
     }
 }
 
@@ -462,12 +569,7 @@ pub(crate) fn record(
     list.dispatch(pipelines.get(p.classify), r0, [tx * ty, 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
     for bin in 0..s.bins {
-        let bin_args = targets.bin_args.gpu.offset(3 * u64::from(bin));
-        list.dispatch_indirect(
-            pipelines.get(p.resolve),
-            root(bin)?,
-            bin_args.cast::<DispatchArgs>(),
-        );
+        list.dispatch_indirect(pipelines.get(p.resolve), root(bin)?, targets.bin_args(bin));
     }
     list.end_pass();
     list.barrier(

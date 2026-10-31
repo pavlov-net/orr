@@ -41,24 +41,24 @@ pub use orr_output::{
 pub use orr_scene::Error as SceneError;
 pub use orr_scene::{self, RasterView};
 pub use orr_scene::{
-    Affine3, BoundTexture, Budgets, ClassStats, ClipRef, ClusterRef, ClusterTopology, Cone,
-    ConsumerMarker, CopyVariant, DepthOfField, DirectionalLight, DiscProfile, EmissiveGpu,
-    EmissiveSpan, ExposureState, Focus, FrameStats, FrameTime, Glare, GroupGpu, GroupWriter,
-    InstanceFlags, InstanceGpu, InstancePage, InstanceRange, InstancesDesc, Lens, LensDistortion,
-    Light, LightGpu, LightId, LoadState, Loading, MaterialGpu, MaterialId, MaterialWriter, MeshGpu,
-    ModelEmission, ModelGpu, ModelId, MountId, Opacity, OriginPolicy, PackSource, PageId,
-    PipelineId, Pose, ProducerBatch, ProducerClusterGpu, ProducerDesc, ProducerGpu, ProducerId,
-    ProducerStats, ProducerUpdate, Projection, REBASE_GRID_LOG2, RasterGpu, ReloadReport,
-    RendererDesc, ResidencyClass, ResidencyStats, RtCutGpu, RtStats, SceneCompute, SceneDesc,
-    SceneId, SceneRoot, SceneWriter, SkeletonRef, SkinStats, SkinnedDesc, SkyStats, SlotStateGpu,
-    TextureFilter, TopologyGpu, TransformGroupDesc, TransformGroupId, TransparencyPass,
-    ViewConstants, ViewDesc, ViewHistoryId, ViewTarget, WorldPos, abi, material_flags, orr_gpu,
-    orr_pack,
+    Affine3, ArenaReport, ArenaTarget, BoundTexture, Budgets, ClassStats, ClipRef, ClusterRef,
+    ClusterTopology, Cone, ConsumerMarker, CopyVariant, DepthOfField, DirectionalLight,
+    DiscProfile, EmissiveGpu, EmissiveSpan, ExposureState, Focus, FrameStats, FrameTime, Glare,
+    GroupGpu, GroupWriter, InstanceFlags, InstanceGpu, InstancePage, InstanceRange, InstancesDesc,
+    Lens, LensDistortion, Light, LightGpu, LightId, LoadState, Loading, MaterialGpu, MaterialId,
+    MaterialWriter, MeshGpu, ModelEmission, ModelGpu, ModelId, MountId, Opacity, OriginPolicy,
+    PackSource, PageId, PipelineId, Pose, ProducerBatch, ProducerClusterGpu, ProducerDesc,
+    ProducerGpu, ProducerId, ProducerStats, ProducerUpdate, Projection, REBASE_GRID_LOG2,
+    RasterGpu, ReloadReport, RendererDesc, ResidencyClass, ResidencyStats, RtCutGpu, RtStats,
+    SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter, SkeletonRef, SkinStats, SkinnedDesc,
+    SkyStats, SlotStateGpu, Span, TextureFilter, TopologyGpu, TransformGroupDesc, TransformGroupId,
+    TransparencyPass, ViewConstants, ViewDesc, ViewHistoryId, ViewStep, ViewTarget, WorldPos, abi,
+    material_flags, orr_gpu, orr_pack,
 };
 
 use orr_gpu::{
     CommandList, Device, Format, GpuPtr, Hazards, KernelSet, OutputFormat, QueueKind, ShaderModule,
-    Stages, StorageImageIndex, TextureIndex, TimelinePoint,
+    Stages, StorageImageIndex, TextureDesc, TextureIndex, TextureUsage, TimelinePoint,
 };
 use orr_lighting::{BsdfTables, LightingKernels, LightingView, SceneLighting, ScenePass, ViewPass};
 use orr_output::{
@@ -66,7 +66,7 @@ use orr_output::{
     HookInputsPass, HookPoint, Hooks, Image, OutputKernels, OutputView, SceneCapturePass,
     TonemapPass, UI_PASS,
 };
-use orr_scene::Scenes;
+use orr_scene::{ArenaRequest, Scenes};
 
 /// A scene, lighting or output failure.
 #[derive(Debug, thiserror::Error)]
@@ -120,8 +120,8 @@ pub struct ViewHooks<'a> {
     pub ui: Option<&'a mut dyn FnMut(&mut UiPass<'_, '_>)>,
 }
 
-/// What a view's `render_view` wrote. The images stay valid until the frame's GPU work
-/// completes.
+/// What a view's `render_view` wrote. `radiance` and `linear` stay valid until the frame's
+/// GPU work completes; of `raster` only depth, motion and the HZB do (see [`RasterView`]).
 #[derive(Clone)]
 pub struct RenderedView {
     pub raster: RasterView,
@@ -153,8 +153,6 @@ struct Lighting {
 struct ViewState {
     lighting: Option<LightingView>,
     output: OutputView,
-    /// Tonemap's target at the output extent.
-    linear: Option<Image>,
     /// Compose roots per frame in flight.
     compose: Vec<ComposeRoot>,
     /// Renders of the view so far: the sample index of its next paths.
@@ -251,6 +249,25 @@ impl Output {
     }
 }
 
+/// The arena name of a view's display-linear image.
+const VIEW_LINEAR: &str = "view linear";
+
+/// The view's display-linear image at the output `extent`: tonemap's target, and from the
+/// scene-referred hook on the hook chain's second image; the consumer may read it after the
+/// render.
+fn linear_request(extent: [u32; 2]) -> ArenaRequest {
+    ArenaRequest::texture(
+        VIEW_LINEAR,
+        TextureDesc::d2(
+            Format::Rgba16Float,
+            extent[0],
+            extent[1],
+            TextureUsage::SAMPLED | TextureUsage::STORAGE,
+        ),
+        Span::new(ViewStep::SceneReferred, ViewStep::After),
+    )
+}
+
 /// Every kernel module compiled into orr.
 fn builtin_modules() -> Vec<&'static ShaderModule> {
     orr_scene::MODULES
@@ -337,13 +354,18 @@ impl Renderer {
         let state = ViewState {
             lighting: None,
             output: OutputView::new(&gpu, fif)?,
-            linear: None,
             compose: compose_roots(&gpu, fif)?,
             samples: 0,
         };
         let id = self.scenes.create_view_history()?;
         self.output.views.insert(id, state);
         Ok(id)
+    }
+
+    /// The transient targets of the view's last render and the memory they take
+    /// ([`RendererDesc::alias_view_targets`]).
+    pub fn view_arena_report(&self, history: ViewHistoryId) -> Option<ArenaReport> {
+        self.scenes.view_arena_report(history)
     }
 
     pub fn destroy_view_history(&mut self, id: ViewHistoryId) {
@@ -579,16 +601,26 @@ impl<'a> Frame<'a> {
             });
         }
 
-        let raster = self.scenes.raster_view(view)?;
+        let set = Hooks {
+            scene_referred: hooks.scene_referred.is_some(),
+            display_linear: tonemapped && hooks.display_linear.is_some(),
+        };
+        let mut requests = LightingView::requests(render);
+        requests.push(linear_request(extent));
+        if set.any() {
+            requests.extend(orr_output::hook_requests(extent));
+        }
+        let raster = self.scenes.raster_view_with(view, &requests)?;
         let id = self.scenes.id();
         let delta = self.scenes.time().delta;
         let gpu = self.output.device.clone();
-        let list = self.scenes.list()?;
+        let (list, arena) = self.scenes.list_and_arena(view.history)?;
         let state = self
             .output
             .views
             .get_mut(&view.history)
             .ok_or(SceneError::UnknownViewHistory(view.history))?;
+        arena.enter(ViewStep::Lighting, list);
 
         let lights = &mut *self.lighting;
         let scene = lights
@@ -606,10 +638,9 @@ impl<'a> Frame<'a> {
             );
             self.lit.push(view.scene);
         }
-        if state.lighting.as_ref().is_none_or(|l| l.extent() != render) {
-            let fresh = LightingView::new(&gpu, render)?;
-            list.discard(fresh.radiance());
-            state.lighting = Some(fresh);
+        match &mut state.lighting {
+            Some(l) if l.extent() == render => l.bind(arena)?,
+            l => *l = Some(LightingView::new(&gpu, arena)?),
         }
         let paths = state.lighting.as_mut().expect("lighting view");
         list.barrier(Stages::ALL, Stages::COMPUTE | Stages::RAY, Hazards::empty());
@@ -638,18 +669,14 @@ impl<'a> Frame<'a> {
             self.scenes
                 .transparency(&raster, radiance_store, &mut **hook)?;
         }
-        let list = self.scenes.list()?;
-
-        let linear = image_at(&mut state.linear, &gpu, list, extent, "view linear")?;
+        let (list, arena) = self.scenes.list_and_arena(view.history)?;
+        arena.enter(ViewStep::SceneReferred, list);
+        let linear = arena.texture(VIEW_LINEAR).expect("requested above").clone();
         let chain = ChainImages {
             rr_output: radiance,
             rr_output_store: radiance_store,
-            linear: linear.sampled,
-            linear_store: linear.storage,
-        };
-        let set = Hooks {
-            scene_referred: hooks.scene_referred.is_some(),
-            display_linear: tonemapped && hooks.display_linear.is_some(),
+            linear: linear.sampled(),
+            linear_store: linear.storage(0),
         };
         if let Some(frame) = display.as_mut() {
             frame.frame_generation(
@@ -669,6 +696,7 @@ impl<'a> Frame<'a> {
         let inputs = kernels.hook_inputs(
             list,
             &mut state.output,
+            arena,
             &HookInputsPass {
                 rr_depth: raster.targets.depth,
                 rr_motion: raster.targets.motion,
@@ -704,6 +732,7 @@ impl<'a> Frame<'a> {
                 },
             )?;
         }
+        arena.enter(ViewStep::Exposure, list);
         kernels.exposure(
             list,
             state.output.roots(id),
@@ -717,6 +746,7 @@ impl<'a> Frame<'a> {
             },
         );
         if !tonemapped {
+            arena.enter(ViewStep::After, list);
             return Ok(RenderedView {
                 raster,
                 radiance,
@@ -724,6 +754,7 @@ impl<'a> Frame<'a> {
             });
         }
 
+        arena.enter(ViewStep::Tonemap, list);
         kernels.tonemap(
             list,
             state.output.roots(id),
@@ -742,9 +773,11 @@ impl<'a> Frame<'a> {
             field.as_deref_mut(),
         );
         list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
+        arena.enter(ViewStep::DisplayLinear, list);
         if let (Some(inputs), Some(hook)) = (inputs, hooks.display_linear.as_mut()) {
             inputs.run(list, HookPoint::DisplayLinear, &chain, field, &mut **hook);
         }
+        arena.enter(ViewStep::Compose, list);
         let ui = match (display.as_mut(), hooks.ui.as_mut()) {
             (Some(frame), Some(hook)) => {
                 let index = paint_ui(list, frame, delta, &mut **hook);
@@ -787,6 +820,7 @@ impl<'a> Frame<'a> {
                 },
             )?;
         }
+        arena.enter(ViewStep::After, list);
         Ok(RenderedView {
             raster,
             radiance,

@@ -1,11 +1,11 @@
 //! Hook points: consumer passes on a view's image after RR, at output resolution, with depth,
 //! motion, a read-only source and the distortion field.
 
-use orr_scene::ViewConstants;
 use orr_scene::orr_gpu::{
     CommandList, Device, Format, GpuPtr, Hazards, Stages, StorageImageIndex, Texture, TextureDesc,
     TextureIndex, TextureMemory, TextureUsage, ViewDesc,
 };
+use orr_scene::{ArenaRequest, Span, ViewConstants, ViewStep};
 
 use crate::Result;
 
@@ -223,30 +223,20 @@ impl DistortionField {
     }
 }
 
-/// Depth and motion at output resolution, allocated while the view sets a hook.
-pub(crate) struct HookTargets {
-    pub(crate) depth: Image,
-    pub(crate) motion: Image,
-    pub(crate) fresh: bool,
-}
+/// Arena names of the hook inputs.
+pub(crate) const HOOK_DEPTH: &str = "hook depth";
+pub(crate) const HOOK_MOTION: &str = "hook motion";
 
-impl HookTargets {
-    pub(crate) fn new(gpu: &Device, extent: [u32; 2]) -> Result<Self> {
-        Ok(Self {
-            depth: Image::new(gpu, Format::R32Float, extent, "hook depth")?,
-            motion: Image::new(gpu, Format::Rg16Float, extent, "hook motion")?,
-            fresh: true,
-        })
-    }
-
-    pub(crate) fn extent(&self) -> [u32; 2] {
-        let [w, h, _] = self.depth.texture().desc().extent;
-        [w, h]
-    }
-
-    pub(crate) fn bytes(&self) -> u64 {
-        self.depth.bytes + self.motion.bytes
-    }
+/// The hook inputs, depth and motion at the output `extent`, which a view's arena holds while
+/// the view sets a hook: from the scene-referred step through the display-linear hook.
+pub fn hook_requests(extent: [u32; 2]) -> Vec<ArenaRequest> {
+    let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
+    let span = Span::new(ViewStep::SceneReferred, ViewStep::DisplayLinear);
+    let d2 = |format| TextureDesc::d2(format, extent[0], extent[1], usage);
+    vec![
+        ArenaRequest::texture(HOOK_DEPTH, d2(Format::R32Float), span),
+        ArenaRequest::texture(HOOK_MOTION, d2(Format::Rg16Float), span),
+    ]
 }
 
 /// What a frame's hooks run with, from [`crate::OutputKernels::hook_inputs`].

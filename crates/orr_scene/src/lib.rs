@@ -21,6 +21,7 @@
 //! resident.
 
 mod accel;
+mod arena;
 mod emissive;
 mod lights;
 mod loading;
@@ -51,6 +52,10 @@ pub use orr_gpu;
 pub use orr_pack;
 pub use orr_shaders::abi;
 
+pub use arena::{
+    ArenaBuffer, ArenaKind, ArenaReport, ArenaRequest, ArenaTarget, ArenaTexture, Span, ViewArena,
+    ViewStep,
+};
 pub use emissive::{EmissiveSpan, ModelEmission, emissive_spans};
 pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId};
 pub use loading::Loading;

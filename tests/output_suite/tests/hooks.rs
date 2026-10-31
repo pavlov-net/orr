@@ -5,7 +5,7 @@ use half::f16;
 use orr_output::{
     ChainImages, DisplayRequest, DistortionField, Exposure, ExposurePass, HookInputsPass, HookPass,
     HookPoint, Hooks, OutputFormat, OutputKernels, OutputView, ResolvedDisplay, TonemapPass,
-    ViewOutput,
+    ViewOutput, hook_requests,
 };
 use orr_scene::orr_gpu::{
     Allocation, ComputePipeline, Format, GpuPtr, Hazards, MemoryKind, QueueKind, ShaderStage,
@@ -13,7 +13,7 @@ use orr_scene::orr_gpu::{
     TextureRegion, TextureUsage, ViewDesc,
 };
 use orr_scene::testing::{assert_clean, device, read_buffer, wait};
-use orr_scene::{ExposureState, LensDistortion, SkyStats, ViewConstants};
+use orr_scene::{ExposureState, LensDistortion, SkyStats, ViewArena, ViewConstants};
 use output_suite::read_rgba16f;
 use output_suite::shaders::{dump, field_offset, hook_line, swirl};
 
@@ -103,6 +103,8 @@ type Hook<'a> = &'a mut dyn FnMut(&mut HookPass<'_, '_>);
 struct View {
     kernels: OutputKernels,
     output: OutputView,
+    /// Holds the hook inputs while a frame sets a hook.
+    arena: ViewArena,
     display: ResolvedDisplay,
     exposure: Allocation<ExposureState>,
     constants: Allocation<ViewConstants>,
@@ -171,6 +173,7 @@ impl View {
         let mut v = Self {
             kernels: OutputKernels::new(gpu).unwrap(),
             output: OutputView::new(gpu, 2).unwrap(),
+            arena: ViewArena::new(gpu, false),
             display: DisplayRequest::default().resolve(&[OutputFormat::Sdr], None, false),
             exposure,
             constants: gpu.gpu_malloc(MemoryKind::Upload, 1, "view").unwrap(),
@@ -240,11 +243,18 @@ impl View {
         let whole = TextureRegion::whole_mip(self.rr_output.desc(), 0);
         list.copy_to_texture(&self.rr_output, &whole, self.upload.gpu);
         list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
+        let requests = if hooks.any() {
+            hook_requests(OUT)
+        } else {
+            Vec::new()
+        };
+        self.arena.layout(&requests, &mut list).unwrap();
         let inputs = self
             .kernels
             .hook_inputs(
                 &mut list,
                 &mut self.output,
+                &self.arena,
                 &HookInputsPass {
                     rr_depth: self.rr_depth_index,
                     rr_motion: self.rr_motion_index,
@@ -519,7 +529,7 @@ fn no_hooks_records_and_holds_nothing() {
     let mut v = View::new();
     let base = v.frame(None, None, None);
     assert_eq!(base, ["adapt", "tonemap"]);
-    assert_eq!(v.output.hook_input_bytes(), 0);
+    assert_eq!(v.arena.report().bytes, 0);
 
     let p = pipeline(&hook_line::MODULE, "line");
     let mut root = Root::new();
@@ -534,7 +544,7 @@ fn no_hooks_records_and_holds_nothing() {
         v.frame(None, Some(&mut hook), Some(&mut other)),
     ];
     let bytes = u64::from(OUT[0] * OUT[1]) * (4 + 4);
-    assert!(v.output.hook_input_bytes() >= bytes);
+    assert!(v.arena.report().bytes >= bytes);
     for passes in with_hooks {
         let added: Vec<_> = passes
             .iter()
@@ -544,7 +554,7 @@ fn no_hooks_records_and_holds_nothing() {
     }
 
     assert_eq!(v.frame(None, None, None), base);
-    assert_eq!(v.output.hook_input_bytes(), 0);
+    assert_eq!(v.arena.report().bytes, 0);
     assert_clean();
 }
 

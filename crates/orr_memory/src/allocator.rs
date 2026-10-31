@@ -81,6 +81,9 @@ bitflags::bitflags! {
         const DEDICATED = 1 << 1;
         /// Fail instead of going over the heap's budget.
         const WITHIN_BUDGET = 1 << 2;
+        /// Other resources may be bound into the memory: a dedicated allocation is made
+        /// without naming its resource, so images can be placed in a buffer's memory.
+        const CAN_ALIAS = 1 << 3;
     }
 }
 
@@ -215,6 +218,9 @@ impl Allocator {
         }
         if flags.contains(AllocationFlags::WITHIN_BUDGET) {
             f |= sys::VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        }
+        if flags.contains(AllocationFlags::CAN_ALIAS) {
+            f |= sys::VMA_ALLOCATION_CREATE_CAN_ALIAS_BIT;
         }
         sys::VmaAllocationCreateInfo {
             flags: f,
