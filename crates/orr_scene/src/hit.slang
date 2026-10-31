@@ -606,13 +606,15 @@ public SurfaceHit resolve_hit<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
     return hit;
 }
 
-// Whether a non-opaque triangle candidate is present: the linked surface's coverage, else
-// the material's alpha test, at least one half.
+// Whether a non-opaque triangle candidate is present: with probability the surface's
+// coverage (the material's alpha test unless a linked surface has its own), against a draw
+// hashed from the candidate and the frame.
 public bool resolve_alpha<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context)
 {
     Corners t = (Corners)0;
     HitInput h;
     if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, false, false, context, h))
         return false;
-    return S.coverage(h.input) >= 0.5;
+    uint3 key = uint3(asuint(bary.x) ^ (instance_index * 0x9E3779B9u), asuint(bary.y) ^ (primitive * 0x85EBCA6Bu), s.frame_index ^ cluster_id);
+    return S.coverage(h.input) > unit_float(pcg3d(key).x);
 }

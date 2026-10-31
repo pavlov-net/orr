@@ -200,7 +200,16 @@ pub const CORNELL: &str = "cornell box";
 pub const TALL_BOX: &str = "tall box";
 pub const SHORT_BOX: &str = "short box";
 pub const EMITTER: &str = "emitter";
+/// The alpha-tested 2 m quad of rings, facing +z, with opacity micromaps.
 pub const LEAF: &str = "leaf";
+/// [`LEAF`] cooked without opacity micromaps.
+pub const BARE_LEAF: &str = "bare leaf";
+/// [`LEAF`] without its opacity texture, its material naming linked surface 2, whose
+/// coverage works the rings out from the uv.
+pub const RINGS_LEAF: &str = "rings leaf";
+/// [`LEAF`] without its opacity texture, its material naming linked surface 3, whose
+/// coverage is a quarter everywhere.
+pub const VEIL: &str = "veil";
 pub const GLASS_SLAB: &str = "glass slab";
 pub const SKIN_SLAB: &str = "skin slab";
 /// An upright 2 m square perfect mirror (metal), facing +z.
@@ -456,6 +465,7 @@ fn cook() -> Arc<[u8]> {
         double_sided: 1,
         ..Material::default()
     };
+    let linked_leaf = move |surface| Material { surface, ..leaf };
     leaf.textures[slot::OPACITY].texture = AssetId::from_name("rings");
     let glass = Material {
         base_color: [1.0; 3],
@@ -600,23 +610,20 @@ fn cook() -> Arc<[u8]> {
                     mesh(|b| b.quad(0, square(0.3, 0.0), -y, 1)),
                     vec![emitter],
                 ),
-                model(
-                    LEAF,
-                    mesh(|b| {
-                        b.quad(
-                            0,
-                            [
-                                Vec3::new(-1.0, -1.0, 0.0),
-                                Vec3::new(1.0, -1.0, 0.0),
-                                Vec3::new(1.0, 1.0, 0.0),
-                                Vec3::new(-1.0, 1.0, 0.0),
-                            ],
-                            z,
-                            1,
-                        );
-                    }),
-                    vec![leaf],
-                ),
+                model(LEAF, upright(1.0), vec![leaf]),
+                AssetSpec {
+                    name: BARE_LEAF.into(),
+                    source: Source::Mesh {
+                        mesh: upright(1.0),
+                        materials: vec![leaf],
+                        settings: MeshSettings {
+                            omm: None,
+                            ..MeshSettings::default()
+                        },
+                    },
+                },
+                model(RINGS_LEAF, upright(1.0), vec![linked_leaf(2)]),
+                model(VEIL, upright(1.0), vec![linked_leaf(3)]),
                 model(GLASS_SLAB, slab(), vec![glass]),
                 model(SKIN_SLAB, slab(), vec![skin]),
                 AssetSpec {

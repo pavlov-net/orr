@@ -1129,3 +1129,126 @@ fn gpu_instancing_becomes_instance_pages() {
     let count = |c: &orr_cook::Cooked| c.report.assets[0].entries.len();
     assert_eq!(count(&again), count(&first));
 }
+
+/// A unit quad facing +z as a library mesh with `material`, then texture asset `texture`
+/// from `pixels` (64 x 64, one channel), cooked.
+fn library_quad(
+    material: Material,
+    settings: MeshSettings,
+    texture: &str,
+    pixels: impl Fn(u32, u32) -> u8,
+) -> Archive {
+    use glam::{Vec2, Vec3};
+    use orr_cook::{MeshInput, TextureSettings, Usage};
+    let path = dir(&format!("library-{texture}")).join("t.png");
+    std::fs::write(&path, png(64, 64, |x, y| [pixels(x, y); 4])).unwrap();
+    let quad = MeshInput {
+        positions: vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ],
+        normals: vec![Vec3::Z; 4],
+        uvs: Some(vec![
+            Vec2::new(0.0, 1.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(0.0, 0.0),
+        ]),
+        indices: vec![0, 1, 2, 0, 2, 3],
+        sections: vec![orr_pack::Span { first: 0, count: 6 }],
+        ..MeshInput::default()
+    };
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(
+            Target::Memory,
+            vec![
+                AssetSpec {
+                    name: "quad".into(),
+                    source: Source::Mesh {
+                        mesh: quad,
+                        materials: vec![material],
+                        settings,
+                    },
+                },
+                AssetSpec {
+                    name: texture.into(),
+                    source: Source::Texture {
+                        path,
+                        settings: TextureSettings {
+                            usage: Usage::Linear1,
+                            ..TextureSettings::default()
+                        },
+                    },
+                },
+            ],
+        )],
+    };
+    let mut cooked = orr_cook::cook(&manifest, &Default::default()).unwrap();
+    assert_eq!(cooked.report.assets[0].name, "quad");
+    Archive::from_memory(cooked.memory.remove(0)).unwrap()
+}
+
+#[test]
+fn a_library_mesh_takes_micromaps_from_a_texture_asset_listed_after_it() {
+    let mut leaf = Material {
+        alpha_mode: Material::MASK,
+        alpha_cutoff: 0.5,
+        ..Material::default()
+    };
+    leaf.textures[slot::OPACITY].texture = AssetId::from_name("half");
+    let a = library_quad(leaf, MeshSettings::default(), "half", |x, _| {
+        if x < 40 { 255 } else { 0 }
+    });
+    let e = a.find(AssetId::from_name("quad/mesh")).unwrap();
+    let blobs = a.blobs(e);
+    let info = MeshInfo::parse(&read(&a, &blobs[0])).unwrap();
+    let mut alpha = 0;
+    for p in &info.pages {
+        let mut page = vec![0; p.resident_len as usize];
+        mesh::decode_page(&read(&a, &blobs[p.blob as usize]), &mut page).unwrap();
+        let view = PageView::new(&page, &info.header).unwrap();
+        for ci in 0..view.cluster_count() {
+            let c = view.cluster(ci);
+            for t in u32::from(c.alpha_first)..u32::from(c.tri_count) {
+                alpha += 1;
+                assert!(
+                    view.omm_index(&c, t).is_some(),
+                    "alpha-tested triangle {t} has no micromap"
+                );
+            }
+        }
+    }
+    assert!(alpha > 0, "no alpha-tested triangles");
+}
+
+#[test]
+fn a_statically_displaced_library_mesh_binds_its_material_without_displacement() {
+    let mut bumpy = Material {
+        displacement_scale: 0.05,
+        displacement_max: 0.05,
+        ..Material::default()
+    };
+    bumpy.textures[slot::DISPLACEMENT].texture = AssetId::from_name("bumps");
+    let settings = MeshSettings {
+        displace_static: Some(orr_cook::StaticDisplacement {
+            max_edge: 0.05,
+            target_error: 0.001,
+        }),
+        ..MeshSettings::default()
+    };
+    let a = library_quad(bumpy, settings, "bumps", |x, y| {
+        ((x * 7 + y * 3) % 64 * 4) as u8
+    });
+    let e = a.find(AssetId::from_name("quad")).unwrap();
+    let model = orr_pack::model::ModelInfo::parse(&read(&a, &a.blobs(e)[0])).unwrap();
+    assert_eq!(
+        model.materials,
+        vec![AssetId::from_name("quad/material/0/static")]
+    );
+    let e = a.find(model.materials[0]).unwrap();
+    let m: Material = bytemuck::pod_read_unaligned(&read(&a, &a.blobs(e)[0]));
+    assert_eq!(m.textures[slot::DISPLACEMENT].texture, AssetId::NONE);
+    assert_eq!(m.displacement_scale, 0.0);
+}
