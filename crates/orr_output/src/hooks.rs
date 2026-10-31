@@ -92,18 +92,26 @@ pub struct Image {
 
 impl Image {
     pub fn new(gpu: &Device, format: Format, extent: [u32; 2], name: &str) -> Result<Self> {
-        let desc = TextureDesc::d2(
-            format,
-            extent[0],
-            extent[1],
-            TextureUsage::SAMPLED | TextureUsage::STORAGE,
-        );
-        let texture = gpu.create_texture(&desc, TextureMemory::Dedicated, name)?;
-        let view = ViewDesc::default();
-        let sampled = gpu.write_sampled(gpu.alloc_image_slot()?, &texture, &view);
-        let storage = gpu.write_storage(gpu.alloc_image_slot()?, &texture, &view);
+        let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
+        Self::with_desc(
+            gpu,
+            &TextureDesc::d2(format, extent[0], extent[1], usage),
+            name,
+        )
+    }
+
+    /// An image of `desc`, which has `SAMPLED` and `STORAGE` usage. The sampled view covers
+    /// every mip, the storage view mip 0.
+    pub(crate) fn with_desc(gpu: &Device, desc: &TextureDesc, name: &str) -> Result<Self> {
+        let texture = gpu.create_texture(desc, TextureMemory::Dedicated, name)?;
+        let sampled = gpu.write_sampled(gpu.alloc_image_slot()?, &texture, &ViewDesc::default());
+        let mip0 = ViewDesc {
+            mips: 1,
+            ..ViewDesc::default()
+        };
+        let storage = gpu.write_storage(gpu.alloc_image_slot()?, &texture, &mip0);
         Ok(Self {
-            bytes: gpu.texture_requirements(&desc).0,
+            bytes: gpu.texture_requirements(desc).0,
             texture,
             sampled,
             storage,

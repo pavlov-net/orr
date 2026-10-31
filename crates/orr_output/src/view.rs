@@ -1,6 +1,8 @@
 //! What output does with one view each frame.
 
-use crate::{AutoWhiteBalance, CalibrationPattern, Exposure, Grade, Gt7Params, ScreenshotRequest};
+use crate::{
+    AutoWhiteBalance, CalibrationPattern, DofPath, Exposure, Grade, Gt7Params, ScreenshotRequest,
+};
 
 /// Output's settings for one view, passed with each render of it.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -22,17 +24,22 @@ pub struct ViewOutput {
     pub debug: OutputDebug,
 }
 
-/// Sample counts of the camera effects that the view's lens turns on.
+/// Quality settings of the camera effects that the view's lens turns on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PostQuality {
     /// Samples per pixel along the blur, in symmetric pairs.
     pub motion_blur_samples: u32,
+    /// Rings of the half-resolution depth-of-field gathers; ring k holds 8k samples.
+    pub dof_rings: u32,
+    pub dof_path: DofPath,
 }
 
 impl Default for PostQuality {
     fn default() -> Self {
         Self {
             motion_blur_samples: 35,
+            dof_rings: 5,
+            dof_path: DofPath::AfterRr,
         }
     }
 }
