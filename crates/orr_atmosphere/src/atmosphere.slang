@@ -111,10 +111,11 @@ public struct AtmosphereGpu
     // Linear filtering, repeating.
     public SamplerIndex sampler;
     public TextureIndex sky_view[MAX_SKY_VIEWS];
+    // How much of each sky-view LUT a view reads, the rest from the focus LUT (entry 0).
+    public float sky_view_weight[MAX_SKY_VIEWS];
     // Scales the multiple scattering the sky-view LUTs add: 1, or 0 for single scattering.
     public float multiple_scattering_scale;
     public uint _pad0;
-    public uint _pad1;
 }
 
 public SceneRoot* atmosphere_scene(AtmosphereGpu* a)
@@ -425,12 +426,15 @@ public uint atmosphere_sky_view_index(AtmosphereGpu* a, float h)
     return best;
 }
 
-// Sky radiance along `dir` from the nearest sky-view LUT: nits, linear Rec.2020, the medium
-// beyond `near_range` and the virtual ground below the horizon, no light discs.
+// Sky radiance along `dir` from the nearest sky-view LUT, blended with the focus LUT by its
+// weight: nits, linear Rec.2020, the medium beyond `near_range` and the virtual ground below
+// the horizon, no light discs.
 public float3 atmosphere_sky_view(AtmosphereGpu* a, float3 dir, float3 eye_render)
 {
     uint i = atmosphere_sky_view_index(a, atmosphere_altitude(a, eye_render));
-    return sky_view_lookup(a, i, dir);
+    float3 l = sky_view_lookup(a, i, dir);
+    float w = a.sky_view_weight[i];
+    return w < 1.0 ? lerp(sky_view_lookup(a, 0, dir), l, w) : l;
 }
 
 float3 sky_view_lookup(AtmosphereGpu* a, uint i, float3 dir)
@@ -453,25 +457,35 @@ public float atmosphere_night_background(AtmosphereGpu* a, float h, float mu)
     return a.night_background * (2.0 / 3.0 * airglow + 1.0 / 3.0);
 }
 
+// Sky-view LUT i along `dir` plus the night background, extinguished from `near_range` to
+// space.
+float3 sky_view_radiance(AtmosphereGpu* a, uint i, float3 dir)
+{
+    float3 l = sky_view_lookup(a, i, dir);
+    float h = max(a.sky_view_altitude[i], 0.0);
+    float mu = dot(dir, a.up.xyz);
+    if (a.night_background <= 0.0 || atmosphere_ray_hits_ground(a, h, mu))
+        return l;
+    float t = atmosphere_scene(a).near_range;
+    float hs = atmosphere_altitude_along(a, h, mu, t);
+    float mu_s = ((a.planet_radius + h) * mu + t) / (a.planet_radius + hs);
+    return l + atmosphere_night_background(a, h, mu)
+        * atmosphere_transmittance_to_space(a, hs, mu_s);
+}
+
 // The sky as orr's environment link point reads it: the nearest sky-view LUT (the medium
 // beyond `near_range`, the folded lights' in-scatter and the virtual ground below the
-// horizon) plus the night background, extinguished from `near_range` to space. No light
-// discs. Link it with `Build::link(LinkPoint::Environment, ..)`.
+// horizon) plus the night background, extinguished from `near_range` to space, blended with
+// the focus LUT's by the nearest LUT's weight. No light discs. Link it with
+// `Build::link(LinkPoint::Environment, ..)`.
 public struct AtmosphereSky : IEnvironment
 {
     public static float3 radiance(uint64_t data, float3 dir, float3 eye_render)
     {
         AtmosphereGpu* a = (AtmosphereGpu*)data;
         uint i = atmosphere_sky_view_index(a, atmosphere_altitude(a, eye_render));
-        float3 l = sky_view_lookup(a, i, dir);
-        float h = max(a.sky_view_altitude[i], 0.0);
-        float mu = dot(dir, a.up.xyz);
-        if (a.night_background <= 0.0 || atmosphere_ray_hits_ground(a, h, mu))
-            return l;
-        float t = atmosphere_scene(a).near_range;
-        float hs = atmosphere_altitude_along(a, h, mu, t);
-        float mu_s = ((a.planet_radius + h) * mu + t) / (a.planet_radius + hs);
-        return l + atmosphere_night_background(a, h, mu)
-            * atmosphere_transmittance_to_space(a, hs, mu_s);
+        float3 l = sky_view_radiance(a, i, dir);
+        float w = a.sky_view_weight[i];
+        return w < 1.0 ? lerp(sky_view_radiance(a, 0, dir), l, w) : l;
     }
 }
