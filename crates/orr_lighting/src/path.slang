@@ -95,6 +95,34 @@ public struct PathRoot
     public StorageImageIndex feedback;
     public uint local_columns;
     public uint light_flags;            // LIGHT_*
+    // The dielectric dispatch's: one layer guide per pixel in rows of the G-buffer's width,
+    // the layer vertices a path may have, the dielectric whose interior holds the eye
+    // (MATERIAL_NONE for none) and DIELECTRIC_* flags.
+    public LayerGuide* layers;
+    public uint dielectric_depth;
+    public uint camera_medium;
+    public uint dielectric_flags;
+    public uint _pad0;
+    public uint _pad1;
+    public uint _pad2;
+}
+
+// What the dielectric dispatch leaves the guide resolve of a pixel's first dielectric or
+// presence layer.
+public struct LayerGuide
+{
+    public float3 diffuse;
+    public float weight;            // of the layer against what the G-buffer holds; 0: no layer
+    public float3 specular;
+    public float roughness;
+    public float3 normal;
+    public float depth;             // reverse-Z device depth of the dominant layer
+    public float2 motion;           // the dominant layer's, previous uv minus current uv
+    public float2 specular_motion;
+    public uint dominant;           // 1: `depth` and `motion` replace the G-buffer's
+    public uint _pad0;
+    public uint _pad1;
+    public uint _pad2;
 }
 
 // A path vertex: its surface, where the path came from and how rays leave it.
@@ -214,7 +242,7 @@ public float3 visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants*
     return medium_transmittance<M>(s.medium, origin, dir, t_max);
 }
 
-float power_heuristic(float a, float b)
+public float power_heuristic(float a, float b)
 {
     return a > 0.0 ? mis_power(a, b) : 0.0;
 }
@@ -238,12 +266,64 @@ public LocalLights* pixel_local_lights(PathRoot r, uint2 pixel)
     return r.local + t.y * r.local_columns + t.x;
 }
 
-// Next-event estimation at `x` with local sampler `local` (null for none): `candidates`
-// draws from the light set's mixture resampled by unshadowed luminance, one shadow ray for
-// the winner, weighted against BSDF sampling unless `weight_one`. `light` is the winner's
+// What next-event estimation weighs light by at a vertex: a surface's BSDF or a medium's
+// phase function.
+public interface IScatter
+{
+    // BSDF x cos, or the phase function, toward `wi`.
+    float3 eval(float3 wi);
+    // The density the vertex's own sampling draws `wi` with.
+    float pdf(float3 wi);
+}
+
+public struct SurfaceScatter : IScatter
+{
+    public Bsdf b;
+
+    public float3 eval(float3 wi)
+    {
+        return b.eval(wi);
+    }
+
+    public float pdf(float3 wi)
+    {
+        return b.pdf(wi);
+    }
+}
+
+// The shadow rays of next-event estimation.
+public interface IShadow
+{
+    // What reaches the ray's origin from `t_max` along `dir`: 0 or 1 for opaque blockers,
+    // times what lies between. `environment`: the light is the environment, whose baked map
+    // carries the medium. `weigh` is false where no BSDF ray reaches the same light the same
+    // way, so the estimate takes weight 1.
+    float3 transmittance(float3 origin, float3 dir, float t_max, HitContext context, bool environment, out bool weigh);
+}
+
+// Shadow rays through the scene's opaque geometry and its linked medium.
+public struct SceneShadow<S : ISurface, M : IMedium> : IShadow
+{
+    public SceneRoot* scene;
+    public ViewConstants* view;
+
+    public float3 transmittance(float3 origin, float3 dir, float t_max, HitContext context, bool environment, out bool weigh)
+    {
+        weigh = true;
+        float3 vis = visibility<S, M>(scene, view, origin, dir, t_max, context);
+        // Environment light reaches vertices without the medium's transmittance, as BSDF
+        // misses see it: the baked map carries the medium.
+        return environment ? select(vis > 0.0, float3(1.0), float3(0.0)) : vis;
+    }
+}
+
+// Next-event estimation at `x` (a zero shading normal for a point in a medium), weighed by
+// `f`, with local sampler `local` (null for none): `candidates` draws from the light set's
+// mixture resampled by unshadowed luminance, one shadow ray through `shadow` for the
+// winner, weighted against BSDF sampling unless `weight_one`. `light` is the winner's
 // feedback id, NO_LIGHT for a directional winner or none. Draws four sampler dimensions per
 // candidate and counts the ray in `rays`.
-public float3 shade_vertex_nee<S : ISurface, M : IMedium>(PathRoot r, PathVertex x, Bsdf b, float run, uint2 pixel, LocalLights* local, uint depth, uint candidates, bool weight_one, inout Sampler rng, inout uint rays, out uint light)
+public float3 shade_vertex_nee<F : IScatter, V : IShadow>(PathRoot r, PathVertex x, F f, V shadow, float run, uint2 pixel, LocalLights* local, uint depth, uint candidates, bool weight_one, inout Sampler rng, inout uint rays, out uint light)
 {
     LightSetGpu* set = r.set;
     light = NO_LIGHT;
@@ -257,7 +337,7 @@ public float3 shade_vertex_nee<S : ISurface, M : IMedium>(PathRoot r, PathVertex
         float u = rng.next();
         if (!(c.pdf > 0.0))
             continue;
-        float target = luminance_rec2020(b.eval(c.dir) * c.radiance);
+        float target = luminance_rec2020(f.eval(c.dir) * c.radiance);
         float w = target / c.pdf;
         if (!(w > 0.0) || !isfinite(w))
             continue;
@@ -273,8 +353,8 @@ public float3 shade_vertex_nee<S : ISurface, M : IMedium>(PathRoot r, PathVertex
     float W = sum / (float(candidates) * chosen_target);
     float3 dir = chosen.dir;
     float3 l = chosen.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, chosen.light, dir) : chosen.radiance;
-    float3 f = b.eval(dir) * l;
-    if (all(f == 0.0))
+    float3 e = f.eval(dir) * l;
+    if (all(e == 0.0))
         return float3(0.0);
     float3 origin = vertex_origin(x, dir);
     float t_max = chosen.distance;
@@ -282,21 +362,18 @@ public float3 shade_vertex_nee<S : ISurface, M : IMedium>(PathRoot r, PathVertex
         t_max = max(0.0, t_max - length(origin - x.surface.position)) * (1.0 - 1e-4);
     RayCone cone = { 0.0, 0.0 };
     rays++;
-    float3 vis = visibility<S, M>(r.scene, r.view, origin, dir, t_max, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0));
-    // Environment light reaches vertices without the medium's transmittance, as BSDF misses
-    // see it: the baked map carries the medium.
-    if (chosen.kind == LIGHT_SAMPLE_ENVIRONMENT)
-        vis = select(vis > 0.0, float3(1.0), float3(0.0));
+    bool weigh;
+    float3 vis = shadow.transmittance(origin, dir, t_max, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0), chosen.kind == LIGHT_SAMPLE_ENVIRONMENT, weigh);
     float mis = 1.0;
     // Sphere and rect lights are not in the PTLAS, so BSDF rays never reach them; the
     // emissive entries the tiles sample are producer entries, which BSDF rays hit.
     bool shared = chosen.kind == LIGHT_SAMPLE_ENVIRONMENT || chosen.kind == LIGHT_SAMPLE_DIRECTIONAL
         || chosen.kind == LIGHT_SAMPLE_EMISSIVE;
-    if (!weight_one && shared)
-        mis = power_heuristic(run * chosen.pdf, b.pdf(dir));
+    if (!weight_one && weigh && shared)
+        mis = power_heuristic(run * chosen.pdf, f.pdf(dir));
     if (chosen.kind != LIGHT_SAMPLE_DIRECTIONAL)
         light = chosen.light;
-    return f * vis * (W * mis / run);
+    return e * vis * (W * mis / run);
 }
 
 // What the BSDF ray of a vertex needs after its trace to weight what it reaches.
@@ -466,7 +543,9 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
             if (count_nee && candidates > 0 && u_run < run)
             {
                 uint light;
-                float3 l = shade_vertex_nee<S, M>(r, x, b, run, pixel, local, depth, candidates, one_technique, rng, rays, light);
+                SurfaceScatter f = { b };
+                SceneShadow<S, M> shadow = { s, v };
+                float3 l = shade_vertex_nee(r, x, f, shadow, run, pixel, local, depth, candidates, one_technique, rng, rays, light);
                 if (counted)
                     radiance += throughput * l;
                 if (light != NO_LIGHT)

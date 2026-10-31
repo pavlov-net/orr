@@ -108,6 +108,25 @@ public float hg_phase(float g, float cos_theta)
     return INV_FOUR_PI * (1.0 - g * g) / (d * sqrt(d));
 }
 
+// A direction scattered from travel direction `d` (unit) by the Henyey-Greenstein phase
+// function of anisotropy `g`, from two uniform numbers; its density is `hg_phase(g, cos)`.
+public float3 sample_hg(float g, float3 d, float2 u)
+{
+    float c;
+    if (abs(g) < 1e-3)
+        c = 1.0 - 2.0 * u.x;
+    else
+    {
+        float s = (1.0 - g * g) / (1.0 - g + 2.0 * g * u.x);
+        c = clamp((1.0 + g * g - s * s) / (2.0 * g), -1.0, 1.0);
+    }
+    float sine = sqrt(max(0.0, 1.0 - c * c));
+    float phi = TWO_PI * u.y;
+    float3 t, b;
+    orthonormal_basis(d, t, b);
+    return normalize(t * (sine * cos(phi)) + b * (sine * sin(phi)) + d * c);
+}
+
 // Draine's phase function, per steradian.
 public float draine_phase(float g, float alpha, float cos_theta)
 {

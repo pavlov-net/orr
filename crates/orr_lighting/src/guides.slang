@@ -1,5 +1,7 @@
 // Ray reconstruction guides. Per pixel: diffuse and specular albedo from the surface's BSDF,
 // world normal and linear roughness, depth and motion from the G-buffer, and specular motion.
+// Pixels with a dielectric or presence layer blend in its guide by its weight, and take its
+// depth and motion where it dominates.
 // A primary surface that is a near-mirror follows its mirror chain and takes the guides of
 // the first surface past it, seen through the chain. Pixels smoother than the specular-motion
 // roughness trace the mirror direction and reproject the reflection's virtual point.
@@ -36,6 +38,9 @@ public struct GuideRoot
     public SceneRoot* scene;
     public ViewConstants* view;
     public GBufferGpu* gbuffer;
+    // One per pixel in rows of the G-buffer's width, from this frame's dielectric dispatch;
+    // null for none.
+    public LayerGuide* layers;
     public StorageImageIndex radiance;          // RGBA16F, written only for a GUIDE_* debug view
     public StorageImageIndex diffuse_albedo;    // RGBA8
     public StorageImageIndex specular_albedo;   // RGBA8
@@ -46,6 +51,8 @@ public struct GuideRoot
     public float motion_roughness;              // specular motion below this roughness
     public uint debug;                          // GUIDE_*
     public uint _pad0;
+    public uint _pad1;
+    public uint _pad2;
 }
 
 public struct Guides
@@ -83,14 +90,21 @@ public bool near_delta(Guides g)
     return g.roughness < NEAR_DELTA_ROUGHNESS && luminance_rec2020(g.specular) > luminance_rec2020(g.diffuse);
 }
 
-// Previous uv minus current uv, unjittered, of a static point at eye-relative render-space
-// position `q` (`w` 1), or of the direction `q` at infinity (`w` 0).
-public float2 reprojected_motion(ViewConstants* v, float3 q, float w)
+// Previous uv minus current uv, unjittered, of a point at eye-relative render-space position
+// `q` that was at `previous_q` last frame, relative to this frame's eye (`w` 1), or of the
+// direction `q` at infinity (`w` 0, `previous_q` = `q`).
+public float2 moved_motion(ViewConstants* v, float3 q, float3 previous_q, float w)
 {
     float4 current = mul(v.clip_from_view, float4(view_from_relative(v, q), w));
-    float3 previous_q = q + v.eye_motion.xyz * w;
-    float4 previous = mul(v.prev_clip_from_view, float4(mul(v.prev_view_from_world_rotation, float4(previous_q, 0.0)), w));
+    float3 p = previous_q + v.eye_motion.xyz * w;
+    float4 previous = mul(v.prev_clip_from_view, float4(mul(v.prev_view_from_world_rotation, float4(p, 0.0)), w));
     return (previous.xy / previous.w - current.xy / current.w) * 0.5;
+}
+
+// `moved_motion` of a static point or a direction.
+public float2 reprojected_motion(ViewConstants* v, float3 q, float w)
+{
+    return moved_motion(v, q, q, w);
 }
 
 float3x3 mirror_matrix(float3 n)
@@ -192,6 +206,26 @@ public void guide_body<S : ISurface>(GuideRoot r, uint2 pixel)
             Reflection m = mirror_chain<S>(s, v, x1, g, chain);
             g = m.guides;
             specular_motion = reprojected_motion(v, m.virtual_point, m.w);
+        }
+    }
+    if (r.layers != nullptr)
+    {
+        LayerGuide l = r.layers[pixel.y * gb.extent.x + pixel.x];
+        if (l.weight > 0.0)
+        {
+            float w = l.weight;
+            float3 n = w * l.normal + (1.0 - w) * g.normal;
+            g.diffuse = lerp(g.diffuse, l.diffuse, w);
+            g.specular = lerp(g.specular, l.specular, w);
+            g.normal = dot(n, n) > 0.0 ? normalize(n) : l.normal;
+            g.roughness = lerp(g.roughness, l.roughness, w);
+            surface = true;
+            if (l.dominant != 0)
+            {
+                depth = l.depth;
+                motion = l.motion;
+                specular_motion = l.specular_motion;
+            }
         }
     }
     r.diffuse_albedo.get<RWTexture2D<float4>>()[pixel] = float4(saturate(g.diffuse), 1.0);

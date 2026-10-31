@@ -17,9 +17,11 @@
 //! raster half, [`LightingKernels::record_opaque`] traces the world cache's update paths,
 //! builds a local light sampler per screen tile from the view's last light feedback, and
 //! traces one path per G-buffer pixel into the view's [`LightingView`] radiance and light
-//! feedback with the settings of [`ViewLighting`], and [`LightingKernels::record_guides`]
-//! writes the view's ray reconstruction guides. The `path` module holds the path itself for
-//! kernels that trace more.
+//! feedback with the settings of [`ViewLighting`]; [`LightingKernels::record_dielectric`]
+//! traces each pixel's first dielectric or presence layer and its path over that radiance,
+//! and [`LightingKernels::record_guides`] writes the view's ray reconstruction guides. The
+//! `path` module holds the opaque path and `dielectric` the dielectric one, for kernels that
+//! trace more.
 
 mod bsdf;
 mod environment;
@@ -36,8 +38,8 @@ pub use scene::{
     ScenePass, WorldCacheSettings,
 };
 pub use shaders::types::{
-    DirectionalState, EmissiveSelection, EnvironmentGpu, GuideRoot, LightSample, LightSetGpu,
-    LightSetStats, LocalLights, PathRoot, WorldCacheGpu,
+    DirectionalState, EmissiveSelection, EnvironmentGpu, GuideRoot, LayerGuide, LightSample,
+    LightSetGpu, LightSetStats, LocalLights, PathRoot, WorldCacheGpu,
 };
 pub use view::{
     CameraJump, GuideKind, GuideSettings, LightingDebugView, LightingKernels, LightingView,

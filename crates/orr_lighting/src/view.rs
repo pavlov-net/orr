@@ -1,5 +1,6 @@
 //! Per-view lighting: the settings of one `render_view` call, the view's lighting targets and
-//! history, the world cache's update paths, the opaque path dispatch and the guide resolve.
+//! history, the world cache's update paths, the opaque path dispatch, the dielectric dispatch
+//! and the guide resolve.
 
 use orr_math::{DVec3, Quat};
 use orr_scene::orr_gpu::{
@@ -8,15 +9,16 @@ use orr_scene::orr_gpu::{
     TextureDesc, TextureIndex, TextureMemory, TextureUsage,
 };
 use orr_scene::{
-    ArenaRequest, ArenaTexture, GBufferGpu, SceneId, SceneRoot, Span, ViewArena, ViewConstants,
-    ViewDesc, ViewStep,
+    ArenaRequest, ArenaTexture, GBufferGpu, MaterialId, SceneId, SceneRoot, Span, ViewArena,
+    ViewConstants, ViewDesc, ViewStep,
 };
 
 use crate::scene::{FRAME_SLOTS, Ring, device_local};
+use crate::shaders::dielectric::dispatch;
 use crate::shaders::guides::resolve;
 use crate::shaders::light_sampling::local;
 use crate::shaders::path::opaque;
-use crate::shaders::types::{GuideRoot, LocalLights, PathRoot};
+use crate::shaders::types::{GuideRoot, LayerGuide, LocalLights, PathRoot};
 use crate::shaders::world_cache::update;
 use crate::{BsdfTables, Error, KernelSet, SceneLighting, module, pipeline};
 
@@ -33,8 +35,15 @@ pub struct ViewLighting {
     /// local samplers off.
     pub local_light_share: f32,
     /// BSDF bounces after the first vertex's; the last bounce still adds the emission and
-    /// sky its ray reaches.
+    /// sky its ray reaches. Dielectric vertices do not count: a path through dielectrics has
+    /// this many bounces after its first opaque vertex or interior scatter.
     pub max_bounces: u32,
+    /// Dielectric and presence vertices a path may have, its first included.
+    pub dielectric_depth: u32,
+    /// The dielectric whose interior holds the eye; each pixel flips it at every dielectric
+    /// surface between the eye and its near-plane point, so a near plane straddling the
+    /// surface works.
+    pub camera_medium: Option<MaterialId>,
     pub media: MediaSettings,
     pub guides: GuideSettings,
     pub debug_view: LightingDebugView,
@@ -49,6 +58,8 @@ impl Default for ViewLighting {
             bounce_di_candidates: 4,
             local_light_share: 0.5,
             max_bounces: 3,
+            dielectric_depth: 4,
+            camera_medium: None,
             media: MediaSettings::default(),
             guides: GuideSettings::default(),
             debug_view: LightingDebugView::None,
@@ -141,6 +152,10 @@ pub enum LightingDebugView {
     /// A ray reconstruction guide as the guide resolve computed it, before its target's
     /// quantization; alpha is 1 on surfaces.
     Guide(GuideKind),
+    /// On pixels whose first layer is a dielectric: its reflection's share of the layer's
+    /// albedo in red, its transmission's in green, and the path's dielectric vertices over
+    /// `dielectric_depth` in blue.
+    DielectricLayer,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -191,6 +206,13 @@ const REFERENCE_ROULETTE_DEPTH: u32 = 64;
 
 /// `path`'s `CACHE_TERMINATE`.
 const CACHE_TERMINATE: u32 = 1;
+
+/// `dielectric`'s `DIELECTRIC_REFERENCE` and `DIELECTRIC_DEBUG_LAYER`.
+const DIELECTRIC_REFERENCE: u32 = 1;
+const DIELECTRIC_DEBUG_LAYER: u32 = 2;
+
+/// `MATERIAL_NONE`.
+const NO_MATERIAL: u32 = u32::MAX;
 
 /// A [`LightingView`] target and its storage view.
 struct Target {
@@ -266,7 +288,14 @@ pub struct LightingView {
     local: Allocation<LocalLights>,
     local_tiles: [u32; 2],
     slots: Vec<u32>,
+    /// Each pixel's first layer for the guide resolve, and the frame the dielectric dispatch
+    /// last wrote it.
+    layers: Allocation<LayerGuide>,
+    layers_frame: Option<u64>,
+    /// The frame and path settings of the last opaque dispatch.
+    path: Option<(u64, PathRoot)>,
     roots: Ring<PathRoot>,
+    dielectric_roots: Ring<PathRoot>,
     update_roots: Ring<PathRoot>,
     local_roots: Ring<local::Root>,
     guide_roots: Ring<GuideRoot>,
@@ -336,6 +365,11 @@ impl LightingView {
             u64::from(local_tiles[0]) * u64::from(local_tiles[1]),
             "local light samplers",
         )?;
+        let layers = device_local(
+            device,
+            u64::from(extent[0]) * u64::from(extent[1]),
+            "layer guides",
+        )?;
         Ok(Self {
             device: device.clone(),
             extent,
@@ -345,7 +379,11 @@ impl LightingView {
             local,
             local_tiles,
             slots,
+            layers,
+            layers_frame: None,
+            path: None,
             roots: Ring::new(device, "path roots")?,
+            dielectric_roots: Ring::new(device, "dielectric roots")?,
             update_roots: Ring::new(device, "update path roots")?,
             local_roots: Ring::new(device, "local light sampler roots")?,
             guide_roots: Ring::new(device, "guide roots")?,
@@ -527,6 +565,7 @@ impl PathPipeline {
 /// The per-view lighting kernels of one device.
 pub struct LightingKernels {
     opaque: PathPipeline,
+    dielectric: PathPipeline,
     update: PathPipeline,
     guides: ComputePipeline,
     local: ComputePipeline,
@@ -565,6 +604,13 @@ impl LightingKernels {
         };
         let m = module(kernels, &opaque::MODULE)?;
         let opaque = PathPipeline::new(device, m, spec, rays, "opaque paths")?;
+        let bytes = bsdf_spec!(dispatch, tables);
+        let spec = SpecData {
+            entries: dispatch::Spec::ENTRIES,
+            bytes: &bytes,
+        };
+        let m = module(kernels, &dispatch::MODULE)?;
+        let dielectric = PathPipeline::new(device, m, spec, rays, "dielectric paths")?;
         let bytes = bsdf_spec!(update, tables);
         let spec = SpecData {
             entries: update::Spec::ENTRIES,
@@ -581,6 +627,7 @@ impl LightingKernels {
         let guides = device.create_compute_pipeline(&stage, "guide resolve")?;
         Ok(Self {
             opaque,
+            dielectric,
             update,
             guides,
             local: pipeline(device, kernels, &local::MODULE, "main")?,
@@ -607,7 +654,9 @@ impl LightingKernels {
             None => (ROULETTE_DEPTH, None),
         };
         let mode = match lighting.debug_view {
-            LightingDebugView::None | LightingDebugView::Guide(_) => 0,
+            LightingDebugView::None
+            | LightingDebugView::Guide(_)
+            | LightingDebugView::DielectricLayer => 0,
             LightingDebugView::DirectOnly => 1,
             LightingDebugView::IndirectOnly => 2,
             LightingDebugView::NeeOnly => 3,
@@ -672,8 +721,16 @@ impl LightingKernels {
             feedback: view.feedback[written].target.store,
             local_columns: view.local_tiles[0],
             light_flags: if reference { 0 } else { LIGHT_FEEDBACK_COUNT },
+            layers: GpuPtr::NULL,
+            dielectric_depth: 0,
+            camera_medium: NO_MATERIAL,
+            dielectric_flags: 0,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         let root = view.roots.write(slot, path_root);
+        view.path = Some((pass.frame, path_root));
         if !reference {
             let update_root = view.update_roots.write(
                 slot,
@@ -694,8 +751,52 @@ impl LightingKernels {
         list.end_pass();
     }
 
+    /// Records the dielectric dispatch of `pass` after [`Self::record_opaque`] of the same
+    /// view and frame, ordered after it, with its path settings: per pixel, a camera ray
+    /// against the dielectric mask up to the opaque depth finds the first dielectric or
+    /// presence layer, whose path replaces the pixel's radiance, and leaves the layer's guide
+    /// for [`Self::record_guides`]. Pixels whose eye lies inside
+    /// [`ViewLighting::camera_medium`] trace their path through it from the G-buffer's surface
+    /// too. Camera rays are pinhole rays whatever the reference's lens. Records nothing
+    /// without the opaque dispatch of `pass.frame`. Orders nothing after it.
+    pub fn record_dielectric(
+        &self,
+        list: &mut CommandList<'_>,
+        view: &mut LightingView,
+        pass: &ViewPass,
+        lighting: &ViewLighting,
+    ) {
+        let Some((_, path)) = view.path.filter(|(frame, _)| *frame == pass.frame) else {
+            return;
+        };
+        let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
+        let mut flags = 0;
+        if lighting.reference.is_some() {
+            flags |= DIELECTRIC_REFERENCE;
+        }
+        if lighting.debug_view == LightingDebugView::DielectricLayer {
+            flags |= DIELECTRIC_DEBUG_LAYER;
+        }
+        let root = view.dielectric_roots.write(
+            slot,
+            PathRoot {
+                light_flags: 0,
+                layers: view.layers.gpu,
+                dielectric_depth: lighting.dielectric_depth,
+                camera_medium: lighting.camera_medium.map_or(NO_MATERIAL, |m| m.0),
+                dielectric_flags: flags,
+                ..path
+            },
+        );
+        view.layers_frame = Some(pass.frame);
+        list.begin_pass("dielectric paths", false);
+        self.dielectric.record(list, root, view.extent);
+        list.end_pass();
+    }
+
     /// Records the guide resolve of `pass` into `view`'s guide targets after the view's
-    /// raster half. Under a [`LightingDebugView::Guide`] view it also overwrites the
+    /// raster half, and after [`Self::record_dielectric`] where that runs in the frame, whose
+    /// layer guides it blends in. Under a [`LightingDebugView::Guide`] view it also overwrites the
     /// radiance, so it must then be ordered after [`Self::record_opaque`]. Orders nothing
     /// after it.
     pub fn record_guides(
@@ -720,6 +821,11 @@ impl LightingKernels {
                 scene: pass.scene,
                 view: pass.view,
                 gbuffer: pass.gbuffer,
+                layers: if view.layers_frame == Some(pass.frame) {
+                    view.layers.gpu
+                } else {
+                    GpuPtr::NULL
+                },
                 radiance: view.targets.radiance.storage(0),
                 diffuse_albedo: view.targets.diffuse_albedo.storage(0),
                 specular_albedo: view.targets.specular_albedo.storage(0),
@@ -730,6 +836,8 @@ impl LightingKernels {
                 motion_roughness: lighting.guides.specular_motion_roughness,
                 debug,
                 _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
             },
         );
         let [w, h] = view.extent;

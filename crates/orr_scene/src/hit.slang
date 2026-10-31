@@ -618,3 +618,50 @@ public bool resolve_alpha<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d
     uint3 key = uint3(asuint(bary.x) ^ (instance_index * 0x9E3779B9u), asuint(bary.y) ^ (primitive * 0x85EBCA6Bu), s.frame_index ^ cluster_id);
     return S.coverage(h.input) > unit_float(pcg3d(key).x);
 }
+
+// How much of a non-opaque triangle candidate is present, 0 to 1: a presence material's
+// opacity, else the linked surface's coverage or the material's alpha test. Presence layers
+// pass rays through by it.
+public float resolve_coverage<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context)
+{
+    Corners t = (Corners)0;
+    HitInput h;
+    if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, false, false, context, h))
+        return 0.0;
+    if ((s.materials[h.input.material].flags & MATERIAL_PRESENCE) != 0)
+        return material_opacity(h.input);
+    return S.coverage(h.input);
+}
+
+// The render-space position last frame of the point a ray hit: the previous transform for
+// rigid content, the previous positions of producer batches that keep them. False where the
+// hit does not resolve.
+public bool hit_previous_position(SceneRoot* s, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, out float3 position)
+{
+    position = float3(0.0);
+    Corners t = (Corners)0;
+    HitInput h;
+    HitContext context = (HitContext)0;
+    if (!hit_input(s, nullptr, d, instance_index, cluster_id, primitive, bary, t, false, true, context, h))
+        return false;
+    position = h.input.position;
+    return true;
+}
+
+// The geometric normal (the triangle's front face, turned toward the ray on double-sided
+// materials) and the material of a ray hit, without shading it. False where the hit does
+// not resolve.
+public bool hit_geometry(SceneRoot* s, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, float3 object_positions[3], out float3 normal, out uint material)
+{
+    normal = float3(0.0);
+    material = MATERIAL_NONE;
+    Corners t = (Corners)0;
+    t.position = object_positions;
+    HitInput h;
+    HitContext context = (HitContext)0;
+    if (!hit_input(s, nullptr, d, instance_index, cluster_id, primitive, bary, t, true, false, context, h))
+        return false;
+    normal = h.input.geometric_normal;
+    material = h.input.material;
+    return true;
+}

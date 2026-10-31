@@ -275,6 +275,9 @@ impl Group {
 pub(crate) struct ModelCpu {
     pub sections: u32,
     pub animated_parts: u32,
+    /// The `orr.trace` candidate class its copies take; `None` where its sections mix
+    /// dielectric or presence materials with others.
+    pub candidate_class: Option<u8>,
     /// Its skeleton's joints; 0 without a skeleton.
     pub joints: u32,
     /// Set when its mesh is skinned.
@@ -604,8 +607,16 @@ impl<'f> SceneWriter<'f> {
 
     /// `desc.copies` new instance slots, and an emissive list entry per copy for each
     /// EMISSIVE span of the model. With a pose, each copy's PTLAS partition keeps room for
-    /// its part run.
+    /// its part run. Copies take the candidate class of the model's own materials (a
+    /// `material_set` does not change it): dielectric or presence models are traced by
+    /// dielectric rays only and never rasterized; a model that mixes either with other
+    /// materials fails with [`Error::MixedClasses`].
     pub fn add_instances(&mut self, desc: &InstancesDesc) -> Result<InstanceRange> {
+        let candidate_class = self
+            .model_cpu
+            .get(desc.model.0 as usize)
+            .map_or(Some(0), |m| m.candidate_class)
+            .ok_or(Error::MixedClasses(desc.model))?;
         let emission = self
             .models
             .get(desc.model.0 as usize)
@@ -701,7 +712,7 @@ impl<'f> SceneWriter<'f> {
                 rt_range: half::f16::from_f32(desc.rt_range).to_bits(),
                 animation_range: half::f16::from_f32(desc.animation_range).to_bits(),
                 flags: desc.flags.0 & InstanceFlags::CONSUMER,
-                candidate_class: 0,
+                candidate_class,
                 pose_variants: pose.variants as u16,
                 pose_stride: pose.stride as u16,
                 debug_lod: 0,
@@ -741,7 +752,9 @@ impl<'f> SceneWriter<'f> {
     /// focus, skins it with its palette entries into its own vertex arrays, rasters it and,
     /// inside `rt_range`, traces it through a cluster BLAS built from the cut's cluster
     /// templates, in the PTLAS global partition. Copies skin whether or not a view shows
-    /// them. Panics if the model's mesh has no skin or the model no skeleton.
+    /// them, and take the candidate class of the model's own materials as in
+    /// [`Self::add_instances`]. Panics if the model's mesh has no skin or the model no
+    /// skeleton.
     pub fn add_skinned(&mut self, desc: &SkinnedDesc) -> Result<InstanceRange> {
         let model = self
             .model_cpu
@@ -752,6 +765,9 @@ impl<'f> SceneWriter<'f> {
             .skin
             .unwrap_or_else(|| panic!("{:?} has no skinned mesh", desc.model));
         assert!(model.joints > 0, "{:?} has no skeleton", desc.model);
+        let candidate_class = model
+            .candidate_class
+            .ok_or(Error::MixedClasses(desc.model))?;
         let arrays = CopyArrays::new(self.device, desc.copies, shape.vertices, shape.clusters)?;
         let (first, entry) = {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
@@ -791,7 +807,7 @@ impl<'f> SceneWriter<'f> {
                 rt_range: half::f16::from_f32(desc.rt_range).to_bits(),
                 animation_range: 0,
                 flags: (desc.flags.0 & InstanceFlags::CONSUMER) | InstanceFlags::SKINNED,
-                candidate_class: 0,
+                candidate_class,
                 pose_variants: 0,
                 pose_stride: 0,
                 debug_lod: 0,

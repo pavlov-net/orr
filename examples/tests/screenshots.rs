@@ -9,6 +9,9 @@ mod cluster_rt;
 #[path = "../dense-vegetation.rs"]
 mod dense_vegetation;
 #[allow(dead_code)]
+#[path = "../dielectrics.rs"]
+mod dielectrics;
+#[allow(dead_code)]
 #[path = "../gpu-basics.rs"]
 mod gpu_basics;
 #[allow(dead_code)]
@@ -62,6 +65,8 @@ fn examples_match_their_references() {
     compare("viewer", viewer);
     let rigid = rigid_parts::run(&Options::headless(120, &[])).expect("headless capture");
     compare("rigid-parts", rigid);
+    let water = dielectrics::run(&Options::headless(120, &[])).expect("headless capture");
+    compare("dielectrics", water);
     let field = producer_field::run(&Options::headless(120, &[])).expect("headless capture");
     compare("producer-field", field);
     let skinned = skinned::run(&Options::headless(120, &[])).expect("headless capture");

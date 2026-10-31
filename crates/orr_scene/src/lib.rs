@@ -136,6 +136,10 @@ pub enum Error {
     },
     #[error("texture format {0} has no GPU format")]
     TextureFormat(u32),
+    /// Copies of a model trace as one candidate class, so its sections are all dielectric,
+    /// all presence or neither.
+    #[error("{0:?} mixes dielectric or presence materials with others")]
+    MixedClasses(ModelId),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

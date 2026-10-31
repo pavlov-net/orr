@@ -71,11 +71,9 @@ public interface ISurface
     }
 }
 
-// The material's alpha test at the hit: 1 at or above the cutoff, else 0. The opacity is the
-// opacity slot, else the base color slot's alpha, times `geometry_opacity`, read bilinearly
-// from mip 0 whatever the footprint: the test the cook's opaque triangles and opacity
-// micromaps follow, so the raster, ray candidates and micromaps agree.
-public float material_coverage(SurfaceInput i)
+// The material's opacity at the hit: the opacity slot, else the base color slot's alpha,
+// times `geometry_opacity`, read bilinearly from mip 0 whatever the footprint.
+public float material_opacity(SurfaceInput i)
 {
     MaterialGpu* m = i.scene.materials + i.material;
     UvFootprint finest = { i.uv.uv, float2(0.0), float2(0.0), float2(-1.0) };
@@ -84,7 +82,15 @@ public float material_coverage(SurfaceInput i)
         opacity *= material_texture(m, TEXTURE_OPACITY, finest, float4(1.0)).x;
     else if (material_bound(m, TEXTURE_BASE_COLOR))
         opacity *= material_texture(m, TEXTURE_BASE_COLOR, finest, float4(1.0)).w;
-    return opacity >= m.alpha_cutoff ? 1.0 : 0.0;
+    return opacity;
+}
+
+// The material's alpha test at the hit: 1 where `material_opacity` is at or above the
+// cutoff, else 0: the test the cook's opaque triangles and opacity micromaps follow, so the
+// raster, ray candidates and micromaps agree.
+public float material_coverage(SurfaceInput i)
+{
+    return material_opacity(i) >= i.scene.materials[i.material].alpha_cutoff ? 1.0 : 0.0;
 }
 
 // The shading frame: the vertex normal and tangent, turned by the material's normal map.
