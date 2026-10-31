@@ -17,7 +17,10 @@
 //!    it to the display's present thread.
 //!
 //! There is no scheduler, render graph or per-frame extraction: each step records directly
-//! into the frame's command list. A frame may list no scenes and render no view;
+//! into the frame's command list on the Render queue, and the output passes into
+//! [`Frame::output_list`]. On a device created with `QueueRequest::render_compute` that
+//! list runs on the Compute queue after the frame's render work, while the next frame's
+//! step 3 runs on the Render queue. A frame may list no scenes and render no view;
 //! [`Frame::ui_only`] then presents its UI alone, over black or over a calibration pattern
 //! from [`Frame::pattern`].
 
@@ -109,19 +112,23 @@ pub struct ViewHooks<'a> {
     /// the overlay is composited over the radiance before `scene_referred`. Particle
     /// producer entries are drawn here or not at all for primary visibility.
     pub transparency: Option<&'a mut dyn FnMut(&mut TransparencyPass<'_, '_>)>,
-    /// On the view's pre-exposed radiance before metering, at the output extent.
+    /// On the view's pre-exposed radiance before metering, at the output extent; compute
+    /// work in [`Frame::output_list`].
     pub scene_referred: Option<&'a mut dyn FnMut(&mut HookPass<'_, '_>)>,
     /// On tonemap's display-linear image before compose; not run for `ViewTarget::AfterRr`.
+    /// Compute work in [`Frame::output_list`].
     pub display_linear: Option<&'a mut dyn FnMut(&mut HookPass<'_, '_>)>,
-    /// Into the display's UI layer; run only for `ViewTarget::Display`. With
-    /// `Display::set_ui_per_present` on and frame generation generating, it runs once per
-    /// presented image. Each run records inside a pass named [`orr_output::UI_PASS`], so it
-    /// begins no pass of its own.
+    /// Into the display's UI layer, in [`Frame::list`]; run only for `ViewTarget::Display`.
+    /// With `Display::set_ui_per_present` on and frame generation generating, it runs once
+    /// per presented image. Each run records inside a pass named [`orr_output::UI_PASS`], so
+    /// it begins no pass of its own.
     pub ui: Option<&'a mut dyn FnMut(&mut UiPass<'_, '_>)>,
 }
 
 /// What a view's `render_view` wrote. `radiance` and `linear` stay valid until the frame's
 /// GPU work completes; of `raster` only depth, motion and the HZB do (see [`RasterView`]).
+/// `linear` and the view's target are written on [`Frame::output_list`]: passes that read
+/// them this frame record there.
 #[derive(Clone)]
 pub struct RenderedView {
     pub raster: RasterView,
@@ -669,7 +676,7 @@ impl<'a> Frame<'a> {
             self.scenes
                 .transparency(&raster, radiance_store, &mut **hook)?;
         }
-        let (list, arena) = self.scenes.list_and_arena(view.history)?;
+        let (list, arena) = self.scenes.output_list_and_arena(view.history)?;
         arena.enter(ViewStep::SceneReferred, list);
         let linear = arena.texture(VIEW_LINEAR).expect("requested above").clone();
         let chain = ChainImages {
@@ -780,12 +787,14 @@ impl<'a> Frame<'a> {
         arena.enter(ViewStep::Compose, list);
         let ui = match (display.as_mut(), hooks.ui.as_mut()) {
             (Some(frame), Some(hook)) => {
+                let list = self.scenes.list()?;
                 let index = paint_ui(list, frame, delta, &mut **hook);
                 list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
                 Some(index)
             }
             _ => None,
         };
+        let (list, arena) = self.scenes.output_list_and_arena(view.history)?;
         let store = match (view.target, display.as_mut()) {
             (ViewTarget::Texture(t), _) => {
                 let slot = gpu.alloc_image_slot()?;
@@ -828,16 +837,26 @@ impl<'a> Frame<'a> {
         })
     }
 
-    /// The frame's command list, for the consumer's own passes. Everything recorded into it
-    /// runs in order with orr's passes and is submitted by [`Frame::end`]. The first call
+    /// The frame's command list on the Render queue, for the consumer's own passes.
+    /// Everything recorded into it runs in order with orr's raster, lighting and UI passes
+    /// and before [`Frame::output_list`], and is submitted by [`Frame::end`]. The first call
     /// runs [`Frame::update_scenes`] if the frame has not.
     pub fn list(&mut self) -> Result<&mut CommandList<'a>> {
         Ok(self.scenes.list()?)
     }
 
-    /// Runs `ui` into the display's UI layer. In a frame that renders no view into the
-    /// display (menus, loading screens) the present thread composes it over black, or over
-    /// the frame's [`Frame::pattern`]; after [`Frame::compose`] and
+    /// The list orr's output passes record into, for the consumer's ray reconstruction and
+    /// passes that read a view's output: compute work only. It runs after everything in
+    /// [`Frame::list`], whatever the recording order. On a device with a Compute queue it
+    /// runs there, overlapping the next frame's [`Frame::update_scenes`]; without one it is
+    /// [`Frame::list`].
+    pub fn output_list(&mut self) -> Result<&mut CommandList<'a>> {
+        Ok(self.scenes.output_list()?)
+    }
+
+    /// Runs `ui` into the display's UI layer, in [`Frame::list`]. In a frame that renders no
+    /// view into the display (menus, loading screens) the present thread composes it over
+    /// black, or over the frame's [`Frame::pattern`]; after [`Frame::compose`] and
     /// [`Frame::frame_generation`] it goes over the consumer's image and, with
     /// `Display::set_ui_per_present` on, runs once per presented image. Each run records
     /// inside a pass named [`orr_output::UI_PASS`]. Does nothing without a display or while
@@ -865,7 +884,7 @@ impl<'a> Frame<'a> {
             return Ok(());
         };
         let id = self.scenes.id();
-        let list = self.scenes.list()?;
+        let list = self.scenes.output_list()?;
         let Some(mut frame) = display.frame() else {
             return Ok(());
         };
@@ -918,14 +937,15 @@ impl<'a> Frame<'a> {
     /// Encodes `linear`, display-linear Rec.709 with 1.0 at paper white, into the display
     /// at the frame's resolved display, for a view the consumer shaded itself. The image
     /// covers the window's extent; texels past its edge repeat the last row and column.
-    /// Records a barrier after every earlier pass, so the image may be written just
-    /// before. Does nothing without a display or while its window has no area.
+    /// Records into [`Frame::output_list`] after a barrier, so the image may be written
+    /// just before in either list. Does nothing without a display or while its window has
+    /// no area.
     pub fn compose(&mut self, linear: TextureIndex) -> Result<()> {
         let Some(display) = self.display.as_deref_mut() else {
             return Ok(());
         };
         let id = self.scenes.id();
-        let list = self.scenes.list()?;
+        let list = self.scenes.output_list()?;
         let Some(mut frame) = display.frame() else {
             return Ok(());
         };
@@ -936,7 +956,7 @@ impl<'a> Frame<'a> {
 
     /// Step 6: records the display's frame generation, submits the frame after the
     /// display's slot is free, hands it to the present thread without waiting, and returns
-    /// the render-timeline point its work signals.
+    /// the point its last submit signals, after which all its work has completed.
     pub fn end(mut self) -> Result<TimelinePoint> {
         let wait = self
             .display
@@ -944,22 +964,29 @@ impl<'a> Frame<'a> {
             .and_then(Display::frame)
             .and_then(|f| f.wait);
         if let Some(d) = self.display.as_deref_mut() {
-            d.record_frame_generation(self.scenes.list()?)?;
+            // Compose wrote the backbuffer on the output list, if it was written.
+            let list = if self.scenes.has_output_list() {
+                self.scenes.output_list()?
+            } else {
+                self.scenes.list()?
+            };
+            d.record_frame_generation(list)?;
         }
         let gpu = self.output.device.clone();
         let slots = std::mem::take(&mut self.slots);
-        let ended = self.scenes.end(wait.as_slice());
+        let ended = self.scenes.end_submits(wait.as_slice());
+        let last = ended.as_ref().ok().and_then(|p| p.last().copied());
         for slot in slots {
-            match &ended {
-                Ok(point) => gpu.free_image_slot(slot, *point),
-                Err(_) => gpu.free_image_slot_after_submitted(slot),
+            match last {
+                Some(point) => gpu.free_image_slot(slot, point),
+                None => gpu.free_image_slot_after_submitted(slot),
             }
         }
-        let point = ended?;
+        let submits = ended?;
         if let Some(d) = self.display {
-            d.present(point)?;
+            d.present(&submits)?;
         }
-        Ok(point)
+        Ok(last.expect("a frame submits"))
     }
 }
 

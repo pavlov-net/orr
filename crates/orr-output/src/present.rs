@@ -105,8 +105,8 @@ impl Fg {
 /// A rendered frame whose GPU cost `Dynamic` has yet to read.
 struct Cost {
     frame: u64,
-    /// The frame's main submit.
-    render: TimelinePoint,
+    /// The frame's submits.
+    submits: Vec<TimelinePoint>,
     generated: u32,
     /// UI paints the frame drew with UI per presented image on, else 0.
     paints_per_present: u32,
@@ -229,7 +229,7 @@ pub struct DisplayFrame<'a> {
     pub display: ResolvedDisplay,
     /// The window's client extent, the size of the backbuffer and UI layer.
     pub extent: [u32; 2],
-    /// The frame's main submit waits this point, after which the present thread no longer
+    /// The frame's render submit waits this point, after which the present thread no longer
     /// reads the slot's images.
     pub wait: Option<TimelinePoint>,
     /// Images frame generation adds after this frame; 0 with it off.
@@ -664,18 +664,20 @@ impl Display {
             let Some(compose) = &c.compose else {
                 break;
             };
-            let Some(render) = self.device.pass_results(c.render) else {
-                break;
-            };
             let mut gpu_ms = 0.0;
             let mut fg_ms = 0.0;
             let mut ui_ms = 0.0;
-            for p in &render {
-                gpu_ms += p.gpu_ms;
-                if p.name == FG_PASS {
-                    fg_ms += p.gpu_ms;
-                } else if p.name == UI_PASS {
-                    ui_ms += p.gpu_ms;
+            for &point in &c.submits {
+                let Some(passes) = self.device.pass_results(point) else {
+                    break 'frames;
+                };
+                for p in &passes {
+                    gpu_ms += p.gpu_ms;
+                    if p.name == FG_PASS {
+                        fg_ms += p.gpu_ms;
+                    } else if p.name == UI_PASS {
+                        ui_ms += p.gpu_ms;
+                    }
                 }
             }
             let paint_ms = if c.paints_per_present > 0 {
@@ -718,9 +720,9 @@ impl Display {
         })
     }
 
-    /// Records the open frame's frame generation into `list`, the frame's main list on the
-    /// Render queue, after compose has written the backbuffer: one evaluate per generated
-    /// image. Does nothing with frame generation off, for a frame whose view did not call
+    /// Records the open frame's frame generation into `list`, the list compose wrote the
+    /// backbuffer with, after compose: one evaluate per generated image. Does nothing with
+    /// frame generation off, for a frame whose view did not call
     /// [`DisplayFrame::frame_generation`] or that never wrote the backbuffer, or while the
     /// generated count is 0. `orr`'s `Frame::end` calls it before submitting.
     pub fn record_frame_generation(&mut self, list: &mut CommandList<'_>) -> Result<()> {
@@ -820,9 +822,10 @@ impl Display {
     }
 
     /// Hands the frame opened by the last `begin_frame` to the present thread, whose submits
-    /// wait `after` (the frame's main submit), and returns without waiting. Reports an error
-    /// the present thread hit since the last call.
-    pub fn present(&mut self, after: TimelinePoint) -> Result<()> {
+    /// wait the frame's `submits` (in order, the last completing after the others), and
+    /// returns without waiting. Reports an error the present thread hit since the last call.
+    pub fn present(&mut self, submits: &[TimelinePoint]) -> Result<()> {
+        let after = *submits.last().expect("a frame submits");
         if let Some(e) = self.shared.lock().error.take() {
             return Err(e.into());
         }
@@ -853,7 +856,7 @@ impl Display {
         if self.fg.as_ref().is_some_and(|f| f.dynamic.is_some()) {
             self.costs.push_back(Cost {
                 frame: b.frame,
-                render: after,
+                submits: submits.to_vec(),
                 generated: s.recorded,
                 paints_per_present: if b.ui_per_present { ui_used as u32 } else { 0 },
                 compose: None,

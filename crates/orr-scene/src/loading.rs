@@ -139,24 +139,15 @@ impl Loading {
     /// Takes every stream batch whose copies have completed, without waiting.
     pub(crate) fn take_streams(&self, device: &Device) -> Vec<StreamBatch> {
         let mut all = self.streams.lock().unwrap();
-        let (done, rest): (Vec<_>, Vec<_>) = all
-            .drain(..)
-            .partition(|b| landed(device, b.point.as_ref()));
+        let (done, rest): (Vec<_>, Vec<_>) = all.drain(..).partition(|b| landed(device, b.point));
         *all = rest;
         done
     }
 }
 
 /// Whether the work signalling `point` has completed; true without one.
-pub(crate) fn landed(
-    device: &Device,
-    point: Option<&(orr_gpu::QueueKind, orr_gpu::TimelinePoint)>,
-) -> bool {
-    point.is_none_or(|(kind, point)| {
-        device
-            .queue(*kind)
-            .is_some_and(|q| q.completed() >= point.value())
-    })
+pub(crate) fn landed(device: &Device, point: Option<orr_gpu::TimelinePoint>) -> bool {
+    point.is_none_or(|p| device.is_complete(p))
 }
 
 /// The handles of one mounted archive file, opened together at mount so that a file renamed

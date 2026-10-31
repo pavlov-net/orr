@@ -9,8 +9,8 @@ use harness::{Gpu, f16_bytes, f16_values};
 use orr_dlss::raw::{ClassicBind, Image, Ngx, RayReconstruction, RrInputs};
 use orr_dlss::{DlssSdk, Quality};
 use orr_gpu::{
-    Allocation, CommandList, Device, DeviceDesc, Format, Hazards, MemoryKind, QueueKind, Stages,
-    Texture, TextureDesc, TextureMemory, TextureRegion, TextureUsage,
+    Allocation, CommandList, Device, DeviceDesc, Format, Hazards, MemoryKind, QueueKind,
+    QueueRequest, Stages, Texture, TextureDesc, TextureMemory, TextureRegion, TextureUsage,
 };
 use std::time::Duration;
 
@@ -375,19 +375,23 @@ fn transparency_layer_is_composited_after_denoising() {
     validation_clean(&gpu);
 }
 
-/// Runs RR through the orr-gpu API for `frames` frames on the inputs `targets` makes, on a
-/// device whose Render queue binds heaps in every list. The last frame writes a fresh output
+/// Runs RR through the orr-gpu API for `frames` frames on the inputs `targets` makes, on
+/// `kind`, a queue that binds heaps in every list. The last frame writes a fresh output
 /// cleared to the sentinel; returns it.
-fn run_on_orr(device: &Device, output: [u32; 2], quality: Quality, frames: u64) -> Vec<f32> {
-    let sdk = DlssSdk::new(device, harness::PROJECT_ID).expect("NGX init on an orr device");
-    assert!(sdk.support().rr, "ray reconstruction unavailable");
-    let mut rr =
-        orr_dlss::RayReconstruction::new(&sdk, output, quality, None).unwrap_or_else(|e| {
-            for l in Ngx::take_log() {
-                eprintln!("NGX: {l}");
-            }
-            panic!("RR create: {e}")
-        });
+fn run_on_orr(
+    device: &Device,
+    sdk: &DlssSdk,
+    kind: QueueKind,
+    output: [u32; 2],
+    quality: Quality,
+    frames: u64,
+) -> Vec<f32> {
+    let mut rr = orr_dlss::RayReconstruction::new(sdk, output, quality, None).unwrap_or_else(|e| {
+        for l in Ngx::take_log() {
+            eprintln!("NGX: {l}");
+        }
+        panic!("RR create: {e}")
+    });
     let render = rr.render_size();
     let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
     let texture = |format, size: [u32; 2], name| {
@@ -425,7 +429,7 @@ fn run_on_orr(device: &Device, output: [u32; 2], quality: Quality, frames: u64) 
         uploads.push(a);
     };
 
-    let queue = device.queue(QueueKind::Render).unwrap();
+    let queue = device.queue(kind).unwrap();
     for frame in 0..frames {
         let mut list = queue.command_list().expect("list");
         if frame == 0 {
@@ -480,6 +484,8 @@ fn run_on_orr(device: &Device, output: [u32; 2], quality: Quality, frames: u64) 
     f16_values(readback.as_slice().unwrap(), pixels as usize * 4)
 }
 
+/// RR on the Render queue and on the render thread's compute-family queue both match the
+/// raw harness bit for bit.
 #[test]
 fn rr_on_an_orr_device_matches_the_raw_harness() {
     let (output, frames) = ([1920, 1080], 8);
@@ -497,19 +503,28 @@ fn rr_on_an_orr_device_matches_the_raw_harness() {
         name: "orr-dlss tests",
         hooks: Some(&hooks),
         validation: gpu.validation,
+        queues: QueueRequest {
+            render_compute: true,
+            ..QueueRequest::default()
+        },
         ..DeviceDesc::default()
     })
     .expect("orr device with NGX hooks");
-    let out = run_on_orr(&device, output, Quality::Performance, frames);
-    check_output(&out, [960, 540]);
-    // RR is bit-deterministic for identical inputs.
-    let differ = out.iter().zip(&reference).filter(|(a, b)| a != b).count();
-    assert_eq!(
-        differ,
-        0,
-        "{differ} of {} values differ from the harness",
-        out.len()
-    );
+    let sdk = DlssSdk::new(&device, harness::PROJECT_ID).expect("NGX init on an orr device");
+    assert!(sdk.support().rr, "ray reconstruction unavailable");
+    for kind in [QueueKind::Render, QueueKind::Compute] {
+        let out = run_on_orr(&device, &sdk, kind, output, Quality::Performance, frames);
+        check_output(&out, [960, 540]);
+        // RR is bit-deterministic for identical inputs.
+        let differ = out.iter().zip(&reference).filter(|(a, b)| a != b).count();
+        assert_eq!(
+            differ,
+            0,
+            "{kind:?}: {differ} of {} values differ from the harness",
+            out.len()
+        );
+    }
+    drop(sdk);
     assert_eq!(device.validation_messages(), 0, "orr device validation");
     validation_clean(&gpu);
 }

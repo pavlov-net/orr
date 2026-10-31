@@ -908,13 +908,13 @@ fn place_page(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
 pub(crate) struct Batch {
     pub mount: MountId,
     /// The point its staged copies signal; none when nothing was staged.
-    pub point: Option<(QueueKind, TimelinePoint)>,
+    pub point: Option<TimelinePoint>,
     pub result: Result<Resolved, Arc<Error>>,
 }
 
 impl Batch {
     pub(crate) fn landed(&self, device: &Device) -> bool {
-        crate::loading::landed(device, self.point.as_ref())
+        crate::loading::landed(device, self.point)
     }
 }
 
@@ -1127,7 +1127,7 @@ fn build_accel(
     shared: &AccelShared,
     r: &mut Resolved,
     wait: Option<TimelinePoint>,
-) -> Result<Option<(QueueKind, TimelinePoint)>> {
+) -> Result<Option<TimelinePoint>> {
     // Sections whose linked coverage decides every triangle at run time.
     let mut non_opaque: Vec<Vec<bool>> = r
         .meshes
@@ -1211,7 +1211,7 @@ pub(crate) fn submit_copies(
     device: &Device,
     copies: &[StagedCopy],
     textures: &[PlacedTexture],
-) -> Result<Option<(QueueKind, TimelinePoint)>> {
+) -> Result<Option<TimelinePoint>> {
     if copies.is_empty() {
         return Ok(None);
     }
@@ -1238,7 +1238,7 @@ pub(crate) fn submit_copies(
             } => list.copy_to_texture(texture, region, src.gpu),
         }
     }
-    Ok(Some((kind, queue.submit(vec![list], &[])?)))
+    Ok(Some(queue.submit(vec![list], &[])?))
 }
 
 /// Ends a mount on the loading thread: resolves its assets, submits its staged copies and
@@ -1258,7 +1258,7 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<MountTask>) 
         .and_then(|()| resolve(task.source(), placed, task.sampler))
         .and_then(|mut r| {
             let copied = submit_copies(device, &copies, &r.textures)?;
-            let built = build_accel(device, &task.accel, &mut r, copied.map(|(_, p)| p));
+            let built = build_accel(device, &task.accel, &mut r, copied);
             ranges.clone_from(&r.cluster_ranges);
             Ok((built?.or(copied), r))
         });

@@ -265,7 +265,8 @@ impl<'a> SceneCompute<'a, '_> {
 
 struct InFlight {
     id: u64,
-    point: TimelinePoint,
+    /// The frame's submits in order; the last completes after the others.
+    points: Vec<TimelinePoint>,
     stats: FrameStats,
     /// Scenes whose PTLAS the frame built.
     traced: Vec<SceneId>,
@@ -299,6 +300,8 @@ struct Core {
     next_frame: u64,
     completed_frame: u64,
     in_flight: VecDeque<InFlight>,
+    /// The last output list submitted on the Compute queue.
+    output: Option<TimelinePoint>,
     stats: FrameStats,
     high_water: u64,
     mounts: Mounts,
@@ -425,6 +428,7 @@ impl Scenes {
                 next_frame: 1,
                 completed_frame: 0,
                 in_flight: VecDeque::new(),
+                output: None,
                 stats: FrameStats::default(),
                 high_water: 0,
                 mounts,
@@ -666,12 +670,17 @@ impl Scenes {
         let render = self.device.queue(QueueKind::Render).expect("render queue");
         while let Some(f) = core.in_flight.front() {
             let due = f.id + u64::from(core.fif) <= frame;
-            if !due && render.completed() < f.point.value() {
+            let last = *f.points.last().expect("a frame submits");
+            if !due && !self.device.is_complete(last) {
                 break;
             }
-            render.wait(f.point, Duration::from_secs(10))?;
+            render.wait(last, Duration::from_secs(10))?;
             let mut f = core.in_flight.pop_front().unwrap();
-            f.stats.gpu = self.device.pass_results(f.point).unwrap_or_default();
+            f.stats.gpu = f
+                .points
+                .iter()
+                .flat_map(|p| self.device.pass_results(*p).unwrap_or_default())
+                .collect();
             let slot = (f.id % u64::from(core.fif)) as usize;
             for id in &f.traced {
                 let Ok(scene) = core.scene(*id) else { continue };
@@ -745,7 +754,7 @@ impl Scenes {
         };
         let mut loading_points = Vec::new();
         for batch in self.loading.take_batches(&self.device) {
-            loading_points.extend(batch.point.map(|(_, p)| p));
+            loading_points.extend(batch.point);
             core.mounts.apply(batch, &mut apply);
         }
         loading_points.extend(
@@ -772,6 +781,9 @@ impl Scenes {
             listed: desc.scenes.to_vec(),
             window: slot,
             list: Some(list),
+            output: None,
+            submits: Vec::new(),
+            after_output: None,
             updated: false,
             cpu: vec![("begin_frame", now - started)],
             step_start: now,
@@ -809,6 +821,13 @@ pub struct Frame<'a> {
     listed: Vec<SceneId>,
     window: usize,
     list: Option<CommandList<'a>>,
+    /// The output list on the Compute queue, once the frame records into it.
+    output: Option<CommandList<'a>>,
+    /// Render submits made before `end`.
+    submits: Vec<TimelinePoint>,
+    /// The previous frame's output submit, which the frame's render work after
+    /// `update_scenes` waits for.
+    after_output: Option<TimelinePoint>,
     updated: bool,
     cpu: Vec<(&'static str, Duration)>,
     step_start: Instant,
@@ -1270,7 +1289,25 @@ impl<'a> Frame<'a> {
             list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         }
         self.list = Some(list);
+        self.overlap_output()?;
         self.step("update_scenes");
+        Ok(())
+    }
+
+    /// While the previous frame's output list may still run on the Compute queue, submits
+    /// the scene update so it overlaps that work, and has the rest of the frame's render
+    /// work, which overwrites the targets the output passes read, wait for it.
+    fn overlap_output(&mut self) -> Result<()> {
+        let Some(previous) = self.core.output.filter(|p| !self.device.is_complete(*p)) else {
+            return Ok(());
+        };
+        let render = self.device.queue(QueueKind::Render).expect("render queue");
+        let list = self.list.take().expect("frame list");
+        self.submits.push(render.submit(vec![list], &self.loading)?);
+        let mut list = render.command_list()?;
+        list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
+        self.list = Some(list);
+        self.after_output = Some(previous);
         Ok(())
     }
 
@@ -1281,11 +1318,34 @@ impl<'a> Frame<'a> {
         Ok(())
     }
 
-    /// The frame's command list, for the steps after `update_scenes` (views, output, UI);
-    /// runs `update_scenes` first when the consumer did not.
+    /// The frame's command list on the Render queue, for the steps after `update_scenes`
+    /// (views, lighting, UI); runs `update_scenes` first when the consumer did not.
     pub fn list(&mut self) -> Result<&mut CommandList<'a>> {
         self.ensure_updated()?;
         Ok(self.list.as_mut().expect("frame list"))
+    }
+
+    /// The list for ray reconstruction and the output passes after it: compute work only.
+    /// On a device with a Compute queue it records there and runs after everything in
+    /// [`Frame::list`], whatever the recording order, overlapping the next frame's
+    /// `update_scenes`; without one it is [`Frame::list`].
+    pub fn output_list(&mut self) -> Result<&mut CommandList<'a>> {
+        self.ensure_updated()?;
+        let Some(compute) = self.device.queue(QueueKind::Compute) else {
+            return Ok(self.list.as_mut().expect("frame list"));
+        };
+        if self.output.is_none() {
+            let mut list = compute.command_list()?;
+            // Earlier frames' output work finishes before this frame's writes.
+            list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
+            self.output = Some(list);
+        }
+        Ok(self.output.as_mut().expect("output list"))
+    }
+
+    /// Whether the frame has recorded into an output list of its own on the Compute queue.
+    pub fn has_output_list(&self) -> bool {
+        self.output.is_some()
     }
 
     /// Step 4, the raster half of a view: writes its `ViewConstants`, culls and rasters the
@@ -1493,15 +1553,54 @@ impl<'a> Frame<'a> {
         Ok((self.list.as_mut().expect("frame list"), arena))
     }
 
-    /// Step 6: submits the frame on the render queue after `wait`, and returns the point
-    /// its work signals.
-    pub fn end(mut self, wait: &[TimelinePoint]) -> Result<TimelinePoint> {
+    /// [`Self::list_and_arena`] with [`Frame::output_list`] in place of the frame's list, for
+    /// the view's passes from ray reconstruction on.
+    pub fn output_list_and_arena(
+        &mut self,
+        history: ViewHistoryId,
+    ) -> Result<(&mut CommandList<'a>, &mut ViewArena)> {
+        self.output_list()?;
+        let arena = &mut self
+            .core
+            .histories
+            .get_mut(history.0 as usize)
+            .and_then(Option::as_mut)
+            .ok_or(Error::UnknownViewHistory(history))?
+            .arena;
+        let list = match self.output.as_mut() {
+            Some(output) => output,
+            None => self.list.as_mut().expect("frame list"),
+        };
+        Ok((list, arena))
+    }
+
+    /// Step 6: submits the frame, its render work after `wait` and then its output list, and
+    /// returns the point its work signals.
+    pub fn end(self, wait: &[TimelinePoint]) -> Result<TimelinePoint> {
+        let points = self.end_submits(wait)?;
+        Ok(*points.last().expect("a frame submits"))
+    }
+
+    /// [`Frame::end`], returning every submit of the frame in order; the last completes
+    /// after the others.
+    pub fn end_submits(mut self, wait: &[TimelinePoint]) -> Result<Vec<TimelinePoint>> {
         self.ensure_updated()?;
         let render = self.device.queue(QueueKind::Render).expect("render queue");
         let list = self.list.take().expect("frame list");
         let mut waits = wait.to_vec();
         waits.append(&mut self.loading);
-        let point = render.submit(vec![list], &waits)?;
+        waits.extend(self.after_output);
+        let mut points = std::mem::take(&mut self.submits);
+        points.push(render.submit(vec![list], &waits)?);
+        if let Some(output) = self.output.take() {
+            let compute = self
+                .device
+                .queue(QueueKind::Compute)
+                .expect("compute queue");
+            let point = compute.submit(vec![output], &points[points.len() - 1..])?;
+            points.push(point);
+            self.core.output = Some(point);
+        }
         self.marker(LatencyMarker::RenderSubmitEnd);
         render.mark_frame_end(self.id)?;
         self.step("end");
@@ -1527,7 +1626,7 @@ impl<'a> Frame<'a> {
         };
         self.core.in_flight.push_back(InFlight {
             id: self.id,
-            point,
+            points: points.clone(),
             stats,
             traced: std::mem::take(&mut self.traced),
             updated: if self.updated {
@@ -1536,7 +1635,7 @@ impl<'a> Frame<'a> {
                 Vec::new()
             },
         });
-        Ok(point)
+        Ok(points)
     }
 }
 
