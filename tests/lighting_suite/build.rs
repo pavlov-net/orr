@@ -36,6 +36,8 @@ const SCENE_TYPES: &[&str] = &[
     "SkyStats",
     "ViewConstants",
     "ExposureState",
+    "GBufferGpu",
+    "VisibleCluster",
 ];
 
 fn main() {

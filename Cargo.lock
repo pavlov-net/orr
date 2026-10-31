@@ -967,11 +967,15 @@ dependencies = [
  "bytemuck",
  "glam",
  "gpu_suite",
+ "orr_color",
+ "orr_cook",
  "orr_gpu",
  "orr_lighting",
+ "orr_math",
  "orr_pack",
  "orr_scene",
  "orr_shaders",
+ "png 0.18.1",
  "shader_math",
 ]
 

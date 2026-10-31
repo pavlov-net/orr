@@ -10,11 +10,15 @@ publish = false
 [dependencies]
 orr_gpu.workspace = true
 orr_shaders.workspace = true
-orr_lighting = { path = "../../crates/orr_lighting" }
-orr_scene.workspace = true
+orr_lighting.workspace = true
+orr_scene = { workspace = true, features = ["testing"] }
 orr_pack.workspace = true
-gpu_suite = { path = "../gpu_suite" }
-shader_math = { path = "../shader_math" }
+orr_cook.workspace = true
+orr_math.workspace = true
+orr_color.workspace = true
+png.workspace = true
+gpu_suite.workspace = true
+shader_math.workspace = true
 glam.workspace = true
 bytemuck.workspace = true
 
