@@ -1,23 +1,22 @@
 //! orr-gpu on its own: a device, GPU memory, the texture heap, a compute pass that paints a
 //! texture and a mesh pass that draws a textured, depth-tested cube sampling it.
 //!
-//! Runs headless for a fixed number of frames and writes the last one as a binary PPM:
-//! `gpu-basics [frames] [out.ppm]` (default 120 frames, `gpu-basics.ppm` beside the
-//! executable).
+//! Runs headless for a fixed number of frames and writes the last one as a PNG:
+//! `gpu-basics [--frames N] [--out file.png]` (default 120 frames, `gpu-basics.png` beside
+//! the executable).
 
-use std::path::PathBuf;
 use std::time::Duration;
 
-use glam::camera::rh::{proj, view};
-use glam::{Mat4, Vec3};
-use gpu_suite::shaders::basics;
-use gpu_suite::{device, readback, render, upload};
-use orr_gpu::{
+use examples::shaders::basics;
+use examples::{Capture, Options, assert_clean, device};
+use orr::orr_gpu::{
     ClearColor, ColorAttachment, ColorLoad, ColorTarget, CompareOp, Cull, DepthAttachment,
     DepthLoad, DepthTarget, Filter, Format, FrontFace, Hazards, MemoryKind, MeshPipelineDesc,
-    RasterState, Rendering, SamplerDesc, SamplerIndex, ShaderStage, SpecData, Stages, TextureDesc,
-    TextureMemory, TextureRegion, TextureUsage, TimelinePoint, ViewDesc,
+    QueueKind, RasterState, Rendering, SamplerDesc, SamplerIndex, ShaderStage, SpecData, Stages,
+    TextureDesc, TextureMemory, TextureRegion, TextureUsage, TimelinePoint, ViewDesc,
 };
+use orr_math::camera::rh::{proj, view};
+use orr_math::{Mat4, Vec3};
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
@@ -55,20 +54,20 @@ fn rows(m: Mat4) -> [[f32; 4]; 4] {
     m.transpose().to_cols_array_2d()
 }
 
-#[allow(clippy::print_stdout)]
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let frames: u64 = args.next().map_or(120, |a| a.parse().expect("frame count"));
-    let out_path = args.next().map_or_else(
-        || {
-            let exe = std::env::current_exe().expect("executable path");
-            exe.with_file_name("gpu-basics.ppm")
-        },
-        PathBuf::from,
-    );
+    let options = Options::from_args();
+    let capture = run(&options);
+    let path = options.out_path("gpu-basics");
+    capture.save_png(&path);
+    log::info!("wrote {}", path.display());
+    assert_clean();
+}
 
+/// Renders the cube for `options.frames` frames (120 by default) and returns the last.
+pub(crate) fn run(options: &Options) -> Capture {
+    let frames = options.frames.unwrap_or(120);
     let d = device();
-    let queue = render();
+    let queue = d.queue(QueueKind::Render).unwrap();
 
     let paint_desc = TextureDesc::d2(
         Format::Rgba8Unorm,
@@ -91,7 +90,7 @@ fn main() {
         },
     );
 
-    // The colour target and depth share one device-local block.
+    // The color target and depth share one device-local block.
     let color_desc = TextureDesc::d2(Format::Rgba8Srgb, WIDTH, HEIGHT, TextureUsage::COLOR);
     let depth_desc = TextureDesc::d2(Format::D32Float, WIDTH, HEIGHT, TextureUsage::DEPTH);
     let (color_size, _) = d.texture_requirements(&color_desc);
@@ -138,11 +137,17 @@ fn main() {
         )
         .unwrap();
 
-    let vertices = upload(&cube(), "cube vertices");
+    let cube = cube();
+    let mut vertices = d
+        .gpu_malloc::<basics::CubeVertex>(MemoryKind::Upload, cube.len() as u64, "cube vertices")
+        .unwrap();
+    vertices.as_mut_slice().unwrap().copy_from_slice(&cube);
     let mut roots = d
         .gpu_malloc::<basics::Root>(MemoryKind::Upload, SLOTS as u64, "roots")
         .unwrap();
-    let pixels = readback::<[u8; 4]>(u64::from(WIDTH * HEIGHT), "pixels");
+    let pixels = d
+        .gpu_malloc::<[u8; 4]>(MemoryKind::Readback, u64::from(WIDTH * HEIGHT), "pixels")
+        .unwrap();
     // Reverse-Z with an infinite far plane; clip-space y points down the target.
     let projection =
         proj::vulkan::perspective_infinite_reverse(0.8, WIDTH as f32 / HEIGHT as f32, 0.1);
@@ -226,22 +231,17 @@ fn main() {
     let last = last.expect("at least one frame");
     queue.wait(last, Duration::from_secs(10)).unwrap();
     for pass in d.pass_results(last).unwrap_or_default() {
-        println!("{}: {:.3} ms {:?}", pass.name, pass.gpu_ms, pass.stats);
+        log::info!("{}: {:.3} ms {:?}", pass.name, pass.gpu_ms, pass.stats);
     }
-
-    let mut ppm = format!("P6\n{WIDTH} {HEIGHT}\n255\n").into_bytes();
-    for p in pixels.as_slice().unwrap() {
-        ppm.extend_from_slice(&p[..3]);
+    Capture {
+        width: WIDTH,
+        height: HEIGHT,
+        rgba8: pixels
+            .as_slice()
+            .unwrap()
+            .iter()
+            .flatten()
+            .copied()
+            .collect(),
     }
-    std::fs::write(&out_path, ppm).unwrap();
-    println!(
-        "{frames} frames; last frame written to {}; validation messages: {}",
-        out_path.display(),
-        d.validation_messages()
-    );
-    assert_eq!(
-        d.validation_messages(),
-        0,
-        "validation messages (see the log)"
-    );
 }

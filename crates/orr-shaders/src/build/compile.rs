@@ -41,6 +41,8 @@ pub struct Build {
     out_dir: Option<PathBuf>,
     link_points: Vec<PathBuf>,
     links: Vec<Link>,
+    type_maps: Vec<PathBuf>,
+    publish_types: Option<String>,
 }
 
 /// Where a build puts the SPIR-V's debug info.
@@ -73,6 +75,9 @@ pub struct Output {
     /// [`Build::link_points`] that declare a link point. `compile` prints it as
     /// `cargo:link_points`.
     pub link_points: PathBuf,
+    /// `types.json`, with [`Build::publish_types`]: the Rust type of every struct this
+    /// build generated or mapped. `compile` prints it as `cargo:types`.
+    pub types: Option<PathBuf>,
 }
 
 impl Build {
@@ -103,6 +108,8 @@ impl Build {
             out_dir: None,
             link_points: Vec::new(),
             links: Vec::new(),
+            type_maps: Vec::new(),
+            publish_types: None,
         })
     }
 
@@ -164,6 +171,26 @@ impl Build {
         self
     }
 
+    /// Maps every struct of each `types.json` in a `DEP_*_TYPES` value (`;`-separated) to
+    /// the Rust type a dependency published for it, as [`extern_type`](Self::extern_type)
+    /// does. An `extern_type` call for the same struct wins. Repeatable.
+    pub fn types(mut self, list: &str) -> Self {
+        self.type_maps
+            .extend(list.split(';').filter(|s| !s.is_empty()).map(PathBuf::from));
+        self
+    }
+
+    /// Publishes this crate's Rust types for its Slang structs to dependents, which read
+    /// them with [`types`](Self::types). `crate_path` names the crate as dependents do
+    /// (`::my_crate`): the generated structs must be re-exported at its root, and an
+    /// `extern_type` path starting with `crate::` is published under it. Mapped types from
+    /// [`types`](Self::types) are published too, so a dependent of this crate needs no
+    /// other map.
+    pub fn publish_types(mut self, crate_path: &str) -> Self {
+        self.publish_types = Some(crate_path.trim_end_matches("::").to_owned());
+        self
+    }
+
     /// Where the debug info goes: [`DebugInfo::Embedded`] by default, [`DebugInfo::Separate`]
     /// when the profile is `release`.
     pub fn debug_info(mut self, debug_info: DebugInfo) -> Self {
@@ -221,8 +248,13 @@ impl Build {
     /// [`link`](Self::link) calls it also compiles the linked kernels under `linked/`;
     /// `orr_kernels.rs` holds their `KERNELS` set, empty without links. Prints
     /// `rerun-if-changed` lines and `cargo:link_points`.
-    pub fn compile(self) -> Result<Output, Error> {
+    pub fn compile(mut self) -> Result<Output, Error> {
         let started = Instant::now();
+        for path in &self.type_maps {
+            for (slang, rust) in read_types(path)? {
+                self.externs.entry(slang).or_insert(rust);
+            }
+        }
         let out_dir = out_dir(self.out_dir.as_deref())?;
         let lib_dir = canonical_lossy(Path::new(crate::LIB_DIR));
         let own_root = self.kernels.as_deref().map(canonical).transpose()?;
@@ -505,13 +537,41 @@ impl Build {
                 .as_bytes(),
         )?;
 
+        let types_path = match &self.publish_types {
+            Some(crate_path) => {
+                let mut published: BTreeMap<String, String> = self
+                    .externs
+                    .iter()
+                    .map(|(slang, rust)| {
+                        let rust = match rust.strip_prefix("crate::") {
+                            Some(rest) => format!("{crate_path}::{rest}"),
+                            None => rust.clone(),
+                        };
+                        (slang.clone(), rust)
+                    })
+                    .collect();
+                for slang in shared.types.keys() {
+                    published.insert(
+                        slang.clone(),
+                        format!("{crate_path}::{}", codegen::rust_name(slang)),
+                    );
+                }
+                let path = out_dir.join("types.json");
+                write_types(&path, &published)?;
+                Some(path)
+            }
+            None => None,
+        };
+
         let mut watched = roots;
         watched.extend(self.link_points.iter().cloned());
         watched.extend(links.iter().map(|l| l.module.clone()));
+        watched.extend(self.type_maps.iter().cloned());
         print_cargo(
             &watched,
             modules.values().chain(linked_modules.values()),
             &link_points_path,
+            types_path.as_deref(),
         );
         if env::var_os("ORR_SHADER_TIMINGS").is_some() {
             #[allow(clippy::print_stdout)]
@@ -529,6 +589,7 @@ impl Build {
             compiled,
             manifest: manifest_path,
             link_points: link_points_path,
+            types: types_path,
         })
     }
 
@@ -793,6 +854,7 @@ fn print_cargo<'a>(
     watched: &[PathBuf],
     modules: impl Iterator<Item = &'a Record>,
     link_points: &Path,
+    types: Option<&Path>,
 ) {
     let mut lines: BTreeSet<PathBuf> = watched.iter().cloned().collect();
     for m in modules {
@@ -801,6 +863,9 @@ fn print_cargo<'a>(
     #[allow(clippy::print_stdout)]
     {
         println!("cargo:link_points={}", link_points.display());
+        if let Some(types) = types {
+            println!("cargo:types={}", types.display());
+        }
         for l in lines {
             println!("cargo:rerun-if-changed={}", l.display());
         }
@@ -1266,6 +1331,52 @@ pub(super) fn canonical(path: &Path) -> Result<PathBuf, Error> {
             path: path.to_path_buf(),
             source,
         })
+}
+
+/// A `types.json`: Slang struct name to Rust path.
+fn read_types(path: &Path) -> Result<BTreeMap<String, String>, Error> {
+    serde_json::from_str(&read(path)?).map_err(|e| Error::Manifest {
+        path: path.to_path_buf(),
+        message: format!("not a types file: {e}"),
+    })
+}
+
+fn write_types(path: &Path, types: &BTreeMap<String, String>) -> Result<(), Error> {
+    write(
+        path,
+        serde_json::to_string_pretty(types)
+            .expect("types serialise")
+            .as_bytes(),
+    )
+}
+
+/// Republishes the types of a dependency this crate re-exports: every `types.json` in
+/// `list` (a `DEP_*_TYPES` value), with each Rust path under `from` (`::dep`) moved to
+/// `to` (`::my_crate::dep`), merged into `OUT_DIR/types.json` and printed as
+/// `cargo:types`.
+pub fn reexport_types(list: &str, from: &str, to: &str) -> Result<PathBuf, Error> {
+    let (from, to) = (from.trim_end_matches("::"), to.trim_end_matches("::"));
+    let mut merged = BTreeMap::new();
+    for path in list.split(';').filter(|s| !s.is_empty()).map(Path::new) {
+        for (slang, rust) in read_types(path)? {
+            let rust = match rust.strip_prefix(from) {
+                Some(rest) if rest.starts_with("::") => format!("{to}{rest}"),
+                _ => rust,
+            };
+            merged.insert(slang, rust);
+        }
+        #[allow(clippy::print_stdout)]
+        {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+    let path = out_dir(None)?.join("types.json");
+    write_types(&path, &merged)?;
+    #[allow(clippy::print_stdout)]
+    {
+        println!("cargo:types={}", path.display());
+    }
+    Ok(path)
 }
 
 pub(super) fn read(path: &Path) -> Result<String, Error> {

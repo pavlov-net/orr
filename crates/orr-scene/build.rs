@@ -1,5 +1,5 @@
 //! Compiles orr-scene's Slang kernels against orr-pack's and orr-gpu's shader roots and
-//! publishes all three.
+//! publishes all three, with the Rust types of orr-scene's Slang structs.
 
 use std::env;
 use std::path::PathBuf;
@@ -14,8 +14,9 @@ fn main() {
         b.kernels(&src)
             .roots(&pack)
             .roots(&gpu)
-            .extern_type("ViewConstants", "crate::view::ViewConstants")
-            .extern_type("ExposureState", "crate::view::ExposureState")
+            .extern_type("ViewConstants", "crate::ViewConstants")
+            .extern_type("ExposureState", "crate::ExposureState")
+            .publish_types("::orr_scene")
             .compile()
     });
     match out {

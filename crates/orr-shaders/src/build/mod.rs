@@ -18,7 +18,7 @@ mod spirv;
 mod sys;
 mod toolchain;
 
-pub use compile::{Build, DebugInfo, Output};
+pub use compile::{Build, DebugInfo, Output, reexport_types};
 pub use cpu::CpuLibrary;
 pub use link::LinkPoint;
 pub use lint::{Lint, LintError};

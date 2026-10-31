@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "tests/*"]
+members = ["crates/*", "tests/*", "examples"]
 exclude = ["probes"]
 resolver = "3"
 
@@ -15,6 +15,7 @@ orr = { path = "crates/orr" }
 orr-atmosphere = { path = "crates/orr-atmosphere" }
 orr-color = { path = "crates/orr-color", version = "0.0.1" }
 orr-cook = { path = "crates/orr-cook" }
+orr-egui = { path = "crates/orr-egui" }
 orr-gpu = { path = "crates/orr-gpu" }
 orr-io = { path = "crates/orr-io", version = "0.0.1" }
 orr-lighting = { path = "crates/orr-lighting" }
@@ -38,6 +39,9 @@ bytemuck = { version = "1", features = ["derive"] }
 # 0.14 is the version ctt uses, so one zstd-sys builds.
 zstd = "0.14"
 png = "0.18"
+egui = { version = "0.37", default-features = false }
+io-uring = "0.7.15"
+libc = "0.2"
 windows = "0.62.2"
 
 [workspace.lints.rust]

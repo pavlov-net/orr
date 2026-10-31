@@ -1,0 +1,43 @@
+[package]
+name = "examples"
+description = "orr's examples, and the test that runs them headless against blessed frames."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+orr.workspace = true
+orr-cook.workspace = true
+orr-math.workspace = true
+orr-color.workspace = true
+orr-shaders.workspace = true
+log.workspace = true
+png.workspace = true
+winit = "0.30.13"
+
+[target.'cfg(windows)'.dependencies]
+orr-egui.workspace = true
+egui = { workspace = true, features = ["monochrome_emoji_fonts"] }
+
+[dev-dependencies]
+orr-scene = { workspace = true, features = ["testing"] }
+
+[build-dependencies]
+orr-shaders = { workspace = true, features = ["build"] }
+
+[[example]]
+name = "gpu-basics"
+path = "gpu-basics.rs"
+
+[[example]]
+name = "cluster-rt"
+path = "cluster-rt.rs"
+
+[[example]]
+name = "hdr-calibration"
+path = "hdr-calibration.rs"
+
+[lints]
+workspace = true

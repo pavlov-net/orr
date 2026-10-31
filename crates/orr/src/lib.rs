@@ -44,8 +44,8 @@ use orr_gpu::{
     CommandList, Device, Format, GpuPtr, Hazards, ShaderModule, Stages, TextureIndex, TimelinePoint,
 };
 use orr_output::{
-    ComposePass, ComposeRoot, ComposeSource, DisplayFrame, Image, OutputDebug, OutputKernels, OutputView,
-    TonemapPass, ViewOutput,
+    ComposePass, ComposeRoot, ComposeSource, DisplayFrame, Image, OutputDebug, OutputKernels,
+    OutputView, TonemapPass, ViewOutput,
 };
 use orr_scene::Scenes;
 
@@ -373,7 +373,7 @@ impl<'a> Frame<'a> {
     /// A frame that renders no view into the display (calibration screens): fills the
     /// display with `pattern`, encoded at the frame's resolved display without
     /// tonemapping, so each level reaches the display at its stated luminance. The patch
-    /// is a centred square half the window's height across. Does nothing without a display
+    /// is a centered square half the window's height across. Does nothing without a display
     /// or while its window has no area.
     pub fn pattern(&mut self, pattern: CalibrationPattern) -> Result<()> {
         let Some(display) = self.display.as_deref_mut() else {

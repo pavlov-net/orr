@@ -20,17 +20,17 @@ fn main() {
 
 #[cfg(windows)]
 mod run {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use egui::{Color32, Context, FullOutput, Pos2, RawInput, Rect, RichText, TexturesDelta, vec2};
-    use gpu_suite::window::Window;
-    use orr::orr_gpu::OutputFormat;
+    use examples::window::Window;
+    use examples::{assert_clean, device};
+    use orr::orr_gpu::{OutputFormat, QueueKind};
     use orr::{
         CalibrationPattern, Display, DisplayRequest, DisplayWatch, FrameDesc, FrameTime, Renderer,
         RendererDesc, ResolvedDisplay,
     };
     use orr_egui::Painter;
-    use orr_scene::testing::{assert_clean, device, wait};
 
     /// The requests the script steps through, with their labels.
     fn requests() -> [(&'static str, DisplayRequest); 5] {
@@ -213,7 +213,10 @@ mod run {
 
         display.wait_idle();
         if let Some(point) = last {
-            wait(point);
+            gpu.queue(QueueKind::Render)
+                .expect("render queue")
+                .wait(point, Duration::from_secs(10))
+                .expect("wait");
         }
         drop(display);
         drop(painter);
