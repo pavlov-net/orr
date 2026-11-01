@@ -302,28 +302,35 @@ public float3 material_normal_frame(MaterialGpu* m, uint slot, float3 v)
     return float3(u_axis * v.x + v_axis * v.y, v.z);
 }
 
-// The texture footprint function: `slot`'s texture filtered over footprint `f` mapped by
-// the slot's uv transform (`texture_footprint`), its channels from the slot's first one on
-// in xyzw. Color slots come back in their texture's primaries; `material_color` multiplies
-// them by a factor. An unbound slot reads `fallback`.
-public float4 material_texture(MaterialGpu* m, uint slot, UvFootprint f, float4 fallback)
+// The uv set `slot` reads, 0 or 1.
+public uint material_uv_set(MaterialGpu* m, uint slot)
+{
+    return (m.uv_sets >> slot) & 1;
+}
+
+// The texture footprint function: `slot`'s texture filtered over the footprint of the uv set
+// it reads, mapped by the slot's uv transform (`texture_footprint`), its channels from the
+// slot's first one on in xyzw. Color slots come back in their texture's primaries;
+// `material_color` multiplies them by a factor. An unbound slot reads `fallback`.
+public float4 material_texture(MaterialGpu* m, uint slot, UvFootprint uv[2], float4 fallback)
 {
     TextureIndex t = m.textures[slot];
     if (t.index == TEXTURE_NONE)
         return fallback;
+    UvFootprint f = material_uv_set(m, slot) == 1 ? uv[1] : uv[0];
     float4 v = texture_footprint(t, m.sampler, material_footprint(m, slot, f), m.texture_streams);
     uint c = material_channel(m, slot);
     return c == 0 ? v : c == 1 ? float4(v.yzw, 1.0) : c == 2 ? float4(v.zw, 0.0, 1.0) : float4(v.w, 0.0, 0.0, 1.0);
 }
 
-// Linear Rec.2020 `factor` times color slot `slot`'s texel over footprint `f`, in linear
+// Linear Rec.2020 `factor` times color slot `slot`'s texel over footprints `uv`, in linear
 // Rec.2020. The product is taken in the texture's primaries, so a factor tints a texel as it
 // would in the space the texel was authored in. An unbound slot returns `factor`.
-public float3 material_color(MaterialGpu* m, uint slot, UvFootprint f, float3 factor)
+public float3 material_color(MaterialGpu* m, uint slot, UvFootprint uv[2], float3 factor)
 {
     if (!material_bound(m, slot))
         return factor;
-    float3 texel = material_texture(m, slot, f, float4(1.0)).rgb;
+    float3 texel = material_texture(m, slot, uv, float4(1.0)).rgb;
     uint primaries = (m.primaries >> (2 * slot)) & 3;
     if (primaries == 0)
         return mul(REC709_TO_REC2020, mul(REC2020_TO_REC709, factor) * texel);

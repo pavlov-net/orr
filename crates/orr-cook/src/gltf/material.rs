@@ -193,7 +193,9 @@ pub(crate) fn textures(
     let tex = |t: gltf::Texture<'_>, info: &Value, channel: u8| -> Result<TexRef, String> {
         let (uv, coord) = uv_transform(info);
         if coord > 1 {
-            return Err(format!("texCoord {coord}: only uv sets 0 and 1 exist"));
+            return Err(format!(
+                "texCoord {coord}: meshes carry TEXCOORD_0 and TEXCOORD_1"
+            ));
         }
         let wrap = |w: WrappingMode| match w {
             WrappingMode::Repeat => Wrap::Repeat,

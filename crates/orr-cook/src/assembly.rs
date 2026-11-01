@@ -457,7 +457,8 @@ fn matches(m: &MeshData, a: &Piece, b: &Piece, r: DQuat, tol: f64) -> bool {
     };
     let same_vertex = |va: u32, vb: u32| {
         let (va, vb) = (va as usize, vb as usize);
-        let uv = (0..2).all(|k| (m.uvs[va][k] - m.uvs[vb][k]).abs() <= 1e-4);
+        let near = |a: [f32; 2], b: [f32; 2]| (0..2).all(|k| (a[k] - b[k]).abs() <= 1e-4);
+        let uv = m.uvs.iter().all(|u| near(u[va], u[vb]));
         let normal = dir_ok(rf * Vec3::from(m.normals[va]), Vec3::from(m.normals[vb]));
         let tangent = m.tangents.as_ref().is_none_or(|t| {
             let (ta, tb) = (t[va], t[vb]);
@@ -504,7 +505,7 @@ fn unit_mesh(m: &MeshData, p: &Piece) -> (MeshData, Vec<u16>) {
         positions: Vec::new(),
         normals: Vec::new(),
         tangents: m.tangents.as_ref().map(|_| Vec::new()),
-        uvs: Vec::new(),
+        uvs: vec![Vec::new(); m.uvs.len()],
         indices: Vec::with_capacity(3 * p.tris.len()),
         sections: Vec::new(),
         skin: None,
@@ -527,7 +528,9 @@ fn unit_mesh(m: &MeshData, p: &Piece) -> (MeshData, Vec<u16>) {
                 let q = point(m, v) - p.center;
                 out.positions.push(q.as_vec3().to_array());
                 out.normals.push(m.normals[i]);
-                out.uvs.push(m.uvs[i]);
+                for (dst, src) in out.uvs.iter_mut().zip(&m.uvs) {
+                    dst.push(src[i]);
+                }
                 if let (Some(dst), Some(src)) = (&mut out.tangents, &m.tangents) {
                     dst.push(src[i]);
                 }
@@ -577,7 +580,11 @@ fn remainder(m: &MeshData, mut removed: Vec<Vec<[u32; 3]>>) -> MeshData {
             .tangents
             .as_ref()
             .map(|t| order.iter().map(|&v| t[v]).collect()),
-        uvs: order.iter().map(|&v| m.uvs[v]).collect(),
+        uvs: m
+            .uvs
+            .iter()
+            .map(|u| order.iter().map(|&v| u[v]).collect())
+            .collect(),
         indices,
         sections,
         skin: None,
@@ -750,7 +757,7 @@ mod tests {
                 positions: self.positions.clone(),
                 normals: self.normals.clone(),
                 tangents: None,
-                uvs: self.uvs.clone(),
+                uvs: vec![self.uvs.clone()],
                 indices,
                 sections: out,
                 skin: None,

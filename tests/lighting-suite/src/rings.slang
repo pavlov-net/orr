@@ -26,7 +26,7 @@ public struct Rings : ISurface
 
     public override static float coverage(SurfaceInput i)
     {
-        return rings_coverage(i.uv.uv);
+        return rings_coverage(i.uv[0].uv);
     }
 }
 

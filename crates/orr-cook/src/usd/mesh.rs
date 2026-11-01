@@ -19,6 +19,7 @@ pub(super) struct MeshPrim {
     pub points: Vec<DVec3>,
     pub normals: Option<Primvar>,
     pub uvs: Option<Primvar>,
+    pub uvs1: Option<Primvar>,
     pub left_handed: bool,
     pub holes: Vec<usize>,
     pub scheme: String,
@@ -31,7 +32,8 @@ pub(super) struct MeshPrim {
 }
 
 impl MeshPrim {
-    pub(super) fn read(r: &PrimReader<'_>, uv: &str) -> Result<Self, String> {
+    /// `uv` and `uv1` name the primvars of uv sets 0 and 1.
+    pub(super) fn read(r: &PrimReader<'_>, uv: &str, uv1: Option<&str>) -> Result<Self, String> {
         let path = r.path();
         let points: Vec<DVec3> = r
             .numbers("points")?
@@ -144,6 +146,10 @@ impl MeshPrim {
             points,
             normals: r.primvar("normals", 3, Some("normals"))?,
             uvs: r.primvar(uv, 2, None)?,
+            uvs1: match uv1 {
+                Some(name) => r.primvar(name, 2, None)?,
+                None => None,
+            },
             left_handed: r.token("orientation")?.as_deref() == Some("leftHanded"),
             holes: usize_list("holeIndices")?,
             scheme: r
@@ -163,9 +169,12 @@ pub(super) struct Welder {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
+    pub uvs1: Vec<[f32; 2]>,
     pub joints: Vec<[u8; 4]>,
     pub weights: Vec<[u8; 4]>,
     pub groups: BTreeMap<usize, Vec<u32>>,
+    /// Scene materials drawn on a mesh without the uv set 1 primvar.
+    pub missing_uv1: BTreeSet<usize>,
     seen: HashMap<[u32; 16], u32>,
 }
 
@@ -180,20 +189,22 @@ pub(super) struct Placing<'a> {
 }
 
 impl Welder {
-    fn vertex(&mut self, p: [f32; 3], n: [f32; 3], uv: [f32; 2], skin: Influence) -> u32 {
+    fn vertex(&mut self, p: [f32; 3], n: [f32; 3], uv: [[f32; 2]; 2], skin: Influence) -> u32 {
         let mut key = [0u32; 16];
-        for (k, v) in key.iter_mut().zip(p.iter().chain(&n).chain(&uv)) {
+        let values = p.iter().chain(&n).chain(uv.as_flattened());
+        for (k, v) in key.iter_mut().zip(values) {
             *k = v.to_bits();
         }
-        key[8] = u32::from_le_bytes(skin.0);
-        key[9] = u32::from_le_bytes(skin.1);
+        key[10] = u32::from_le_bytes(skin.0);
+        key[11] = u32::from_le_bytes(skin.1);
         if let Some(&i) = self.seen.get(&key) {
             return i;
         }
         let i = self.positions.len() as u32;
         self.positions.push(p);
         self.normals.push(n);
-        self.uvs.push(uv);
+        self.uvs.push(uv[0]);
+        self.uvs1.push(uv[1]);
         self.joints.push(skin.0);
         self.weights.push(skin.1);
         self.seen.insert(key, i);
@@ -241,26 +252,29 @@ impl Welder {
                         None => smooth[point],
                     };
                     let n = (normal_m * n).normalize_or_zero();
-                    let st = match &mesh.uvs {
-                        Some(uv) => {
-                            let v = uv
-                                .at(point, face, corner)
-                                .ok_or_else(|| format!("{path}: st does not cover face {face}"))?;
-                            Vec2::new(v[0] as f32, v[1] as f32)
-                        }
-                        None => Vec2::ZERO,
+                    // The material's one uv transform applies to both sets.
+                    let st = |uvs: &Option<Primvar>, set: usize| -> Result<[f32; 2], String> {
+                        let st = match uvs {
+                            Some(uv) => {
+                                let v = uv.at(point, face, corner).ok_or_else(|| {
+                                    format!("{path}: uv set {set} does not cover face {face}")
+                                })?;
+                                Vec2::new(v[0] as f32, v[1] as f32)
+                            }
+                            None => Vec2::ZERO,
+                        };
+                        let st = uv_t.map_or(st, |t| t.transform_point2(st));
+                        Ok([st.x, 1.0 - st.y])
                     };
-                    let st = uv_t.map_or(st, |t| t.transform_point2(st));
+                    let uv = [st(&mesh.uvs, 0)?, st(&mesh.uvs1, 1)?];
                     let skin = at.skin.map_or(([0; 4], [0; 4]), |s| s[point]);
-                    *o = self.vertex(
-                        p.as_vec3().to_array(),
-                        n.as_vec3().to_array(),
-                        [st.x, 1.0 - st.y],
-                        skin,
-                    );
+                    *o = self.vertex(p.as_vec3().to_array(), n.as_vec3().to_array(), uv, skin);
                 }
                 if flip {
                     out.swap(1, 2);
+                }
+                if mesh.uvs1.is_none() {
+                    self.missing_uv1.insert(material);
                 }
                 self.groups.entry(material).or_default().extend(out);
             }

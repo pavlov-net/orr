@@ -148,16 +148,17 @@ enum Value {
 }
 
 /// Maps the surface node (and an optional MaterialX `displacement` node) of `net`.
-/// `uv_set` names the uv set a primvar or geometric property reads.
+/// `primvars` names the mesh primvar of each uv set, which primvar readers and geometric
+/// properties name.
 pub(crate) fn map(
     net: &Network,
     surface: usize,
     displacement: Option<usize>,
-    uv_set: &dyn Fn(&str) -> Result<u8, String>,
+    primvars: &[&str],
 ) -> Result<Mapped, String> {
     let mut m = Mapper {
         net,
-        uv_set,
+        primvars,
         material: Material::default(),
         textures: MaterialTextures::default(),
         uv: Vec::new(),
@@ -194,7 +195,7 @@ pub(crate) fn map(
 
 struct Mapper<'a> {
     net: &'a Network,
-    uv_set: &'a dyn Fn(&str) -> Result<u8, String>,
+    primvars: &'a [&'a str],
     material: Material,
     textures: MaterialTextures,
     /// The uv transform of every texture read.
@@ -396,7 +397,12 @@ impl Mapper<'_> {
     fn coordinates(&self, n: usize) -> Result<(u8, Affine2), String> {
         let node = self.node(n);
         let named = |name: Option<&str>| {
-            (self.uv_set)(name.unwrap_or("st")).map_err(|e| format!("{}: {e}", node.name))
+            let name = name.unwrap_or("st");
+            let set = self.primvars.iter().position(|p| *p == name);
+            set.map(|s| s as u8).ok_or_else(|| {
+                let sets = self.primvars.join(", ");
+                format!("{}: reads {name}; the mesh uv sets are {sets}", node.name)
+            })
         };
         let inner = |input: &str| match self.input(n, input) {
             None => Ok((0, Affine2::IDENTITY)),

@@ -5,14 +5,14 @@
 //! A page is stored in the codec form [`encode_page`] writes, and [`decode_page`] turns it
 //! into the resident layout the GPU reads:
 //!
-//! - [`PageHeader`], then `cluster_count` [`Cluster`] records of 128 B.
+//! - [`PageHeader`], then `cluster_count` [`Cluster`] records of 144 B.
 //! - Positions at `positions_offset`: u16x3 per vertex, the grid offset from the cluster's
 //!   anchor. Mesh-space position is `(anchor + local) x 2^position_exponent`.
 //! - Attributes at `attrs_offset`, `attr_stride` bytes per vertex: normal (octahedral, 2x16
 //!   unorm), tangent when the mesh has [`MeshHeader::TANGENT`] (octahedral 2x16 unorm,
-//!   bitangent sign in the low bit of y: set means -1), uv (2x16 unorm over the cluster's
-//!   `uv_offset` and `uv_scale`), and with [`MeshHeader::SKIN`] joints u8x4 and weights
-//!   unorm8x4.
+//!   bitangent sign in the low bit of y: set means -1), uv set 0 (2x16 unorm over the
+//!   cluster's `uv_offset[0]` and `uv_scale[0]`), uv set 1 likewise when the mesh has
+//!   [`MeshHeader::UV1`], and with [`MeshHeader::SKIN`] joints u8x4 and weights unorm8x4.
 //! - Vertex `i` of a cluster sits at index `vertex_first + i` in both the position and the
 //!   attribute array. `vertex_first` is even, so every cluster's positions start 4-aligned.
 //! - Triangles at `tris_offset + tri_first`: u8x3 cluster-local corners, opaque triangles
@@ -30,7 +30,7 @@ pub use omm::*;
 use crate::blob::{put_table, read, table};
 use crate::{Aabb, Affine3, Error, Result, Span, Sphere};
 
-pub const SCHEMA: u16 = 5;
+pub const SCHEMA: u16 = 6;
 
 /// Largest hierarchy node page.
 pub const NODE_PAGE_MAX: usize = 64 << 10;
@@ -54,7 +54,7 @@ pub struct MeshHeader {
     pub position_exponent: i8,
     /// Low mantissa bits a CLAS build may truncate without moving any position.
     pub clas_truncate_bits: u8,
-    /// [`Self::TANGENT`] and [`Self::SKIN`].
+    /// [`Self::TANGENT`], [`Self::SKIN`] and [`Self::UV1`].
     pub attributes: u8,
     /// Cluster limits the mesh was cooked with.
     pub max_vertices: u16,
@@ -95,6 +95,8 @@ pub struct MeshHeader {
 impl MeshHeader {
     pub const TANGENT: u8 = 1;
     pub const SKIN: u8 = 2;
+    /// A second uv set.
+    pub const UV1: u8 = 4;
     pub const NO_MERGE_LEVEL: u8 = 0xFF;
     pub const NO_ROOT: u32 = !0;
 
@@ -270,8 +272,9 @@ pub struct Cluster {
     pub deformation_bound: u16,
     pub displacement_min: u16,
     pub displacement_max: u16,
-    pub uv_offset: [f32; 2],
-    pub uv_scale: [f32; 2],
+    /// Per uv set, the range its 2x16 unorm values span: `offset + q / 65535 x scale`.
+    pub uv_offset: [[f32; 2]; 2],
+    pub uv_scale: [[f32; 2]; 2],
     /// Byte offset of the cluster's micromap block from `omm_offset`, or [`Self::NO_OMM`].
     pub omm_first: u32,
     /// Triangle area at the cluster's own level, model space, square metres.
@@ -291,7 +294,7 @@ impl Cluster {
     pub const NO_OMM: u32 = !0;
 }
 
-const _: () = assert!(size_of::<Cluster>() == 128);
+const _: () = assert!(size_of::<Cluster>() == 144);
 const _: () = assert!(size_of::<PageHeader>() == 96);
 
 /// Blob 0 of a mesh: the header and its tables.
@@ -361,7 +364,7 @@ pub fn nodes(blob: &[u8]) -> Result<Vec<Node>> {
 /// Bytes per vertex in the attribute array of a mesh with these [`MeshHeader::attributes`].
 pub fn attr_stride(attributes: u8) -> u32 {
     let has = |a: u8| u32::from(attributes & a != 0);
-    8 + 4 * has(MeshHeader::TANGENT) + 8 * has(MeshHeader::SKIN)
+    8 + 4 * has(MeshHeader::TANGENT) + 4 * has(MeshHeader::UV1) + 8 * has(MeshHeader::SKIN)
 }
 
 /// Bytes a cluster of `vertices` and `triangles` takes in a resident page, its record
@@ -491,8 +494,8 @@ pub struct PageView<'a> {
     page: &'a [u8],
     header: PageHeader,
     step: f32,
-    tangent: bool,
-    skin: bool,
+    /// The mesh's [`MeshHeader::attributes`].
+    attributes: u8,
 }
 
 impl<'a> PageView<'a> {
@@ -506,8 +509,7 @@ impl<'a> PageView<'a> {
             page,
             header,
             step: mesh.step(),
-            tangent: mesh.attributes & MeshHeader::TANGENT != 0,
-            skin: mesh.attributes & MeshHeader::SKIN != 0,
+            attributes: mesh.attributes,
         })
     }
 
@@ -541,35 +543,47 @@ impl<'a> PageView<'a> {
 
     /// Tangent xyz and bitangent sign, when the mesh has tangents.
     pub fn tangent(&self, c: &Cluster, v: u32) -> Option<[f32; 4]> {
-        self.tangent.then(|| {
+        self.has(MeshHeader::TANGENT).then(|| {
             let t = self.attr(c, v, 4);
             let [x, y, z] = oct_decode(t);
             [x, y, z, if t & 1 << 16 != 0 { -1.0 } else { 1.0 }]
         })
     }
 
-    pub fn uv(&self, c: &Cluster, v: u32) -> [f32; 2] {
-        let q = self.attr(c, v, if self.tangent { 8 } else { 4 });
+    /// Uv `set` of a vertex. Panics on set 1 when the mesh has no [`MeshHeader::UV1`].
+    pub fn uv(&self, c: &Cluster, v: u32, set: usize) -> [f32; 2] {
+        assert!(
+            set == 0 || self.has(MeshHeader::UV1),
+            "the mesh has no uv set {set}"
+        );
+        // Uv sets follow the normal and tangent words.
+        let at = attr_stride(self.attributes & MeshHeader::TANGENT) - 4 + 4 * set as u32;
+        let q = self.attr(c, v, at);
         let q = [q & 0xFFFF, q >> 16];
-        [0, 1].map(|a| c.uv_offset[a] + q[a] as f32 / 65535.0 * c.uv_scale[a])
+        [0, 1].map(|a| c.uv_offset[set][a] + q[a] as f32 / 65535.0 * c.uv_scale[set][a])
     }
 
     /// Skeleton joints of a vertex, when the mesh has [`MeshHeader::SKIN`].
     pub fn joints(&self, c: &Cluster, v: u32) -> Option<[u8; 4]> {
-        self.skin
+        self.has(MeshHeader::SKIN)
             .then(|| self.attr(c, v, self.skin_at()).to_le_bytes())
     }
 
     /// Weights of [`Self::joints`], summing to 1.
     pub fn weights(&self, c: &Cluster, v: u32) -> Option<[f32; 4]> {
-        self.skin.then(|| {
+        self.has(MeshHeader::SKIN).then(|| {
             let w = self.attr(c, v, self.skin_at() + 4).to_le_bytes();
             w.map(|q| f32::from(q) / 255.0)
         })
     }
 
+    /// Skin words come last.
     fn skin_at(&self) -> u32 {
-        if self.tangent { 12 } else { 8 }
+        attr_stride(self.attributes & !MeshHeader::SKIN)
+    }
+
+    fn has(&self, attribute: u8) -> bool {
+        self.attributes & attribute != 0
     }
 
     pub fn triangle(&self, c: &Cluster, t: u32) -> [u8; 3] {
@@ -612,7 +626,7 @@ impl<'a> PageView<'a> {
 /// Panics if the mesh has no [`MeshHeader::SKIN`], a vertex names a joint past `palette`,
 /// or `out` is shorter than the cluster's vertices.
 pub fn skin(view: &PageView<'_>, c: &Cluster, palette: &[Affine3], out: &mut [[f32; 3]]) {
-    assert!(view.skin, "the mesh has no skin");
+    assert!(view.has(MeshHeader::SKIN), "the mesh has no skin");
     let n = usize::from(c.vertex_count);
     for (v, o) in (0..).zip(&mut out[..n]) {
         let p = view.position(c, v);

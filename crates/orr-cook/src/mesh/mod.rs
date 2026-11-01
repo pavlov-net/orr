@@ -31,7 +31,7 @@ use orr_pack::mesh::{
     Cluster, Level, MeshHeader, MeshInfo, OMM_ALIGN, PAGE_MAX, PageHeader, PageInfo, Part,
     PartLevel, Section, oct_encode,
 };
-use orr_pack::{Aabb, Hash32, Span, Sphere};
+use orr_pack::{Aabb, AssetId, Hash32, Span, Sphere};
 use rayon::prelude::*;
 use serde::Deserialize;
 
@@ -146,6 +146,8 @@ pub struct MeshInput {
     /// xyz and bitangent sign.
     pub tangents: Option<Vec<glam::Vec4>>,
     pub uvs: Option<Vec<Vec2>>,
+    /// Uv set 1, which material slots on set 1 read.
+    pub uvs1: Option<Vec<Vec2>>,
     pub indices: Vec<u32>,
     /// Index ranges, one per material.
     pub sections: Vec<Span>,
@@ -171,7 +173,8 @@ pub(crate) struct MeshData {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub tangents: Option<Vec<[f32; 4]>>,
-    pub uvs: Vec<[f32; 2]>,
+    /// Per uv set, one or two, a uv per vertex.
+    pub uvs: Vec<Vec<[f32; 2]>>,
     pub indices: Vec<u32>,
     pub sections: Vec<SectionData>,
     pub skin: Option<Skin>,
@@ -229,6 +232,13 @@ impl MeshSource {
         }
     }
 
+    /// Drops uv set 1 when no section's material reads it; a lazy mesh drops it on load.
+    pub(crate) fn drop_unread_uv1(&mut self) {
+        if let Self::Data(m) = self {
+            m.drop_unread_uv1();
+        }
+    }
+
     pub(crate) fn hash(&self) -> Hash32 {
         match self {
             Self::Data(m) => m.hash(),
@@ -261,6 +271,7 @@ impl MeshSource {
                     });
                 }
                 m.sections = l.sections;
+                m.drop_unread_uv1();
                 Ok(m)
             }
         }
@@ -299,6 +310,13 @@ pub(crate) struct SectionData {
     pub maps: MapSpec,
 }
 
+/// Whether material `m` binds a texture on uv set 1.
+pub(crate) fn reads_uv1(m: &Material) -> bool {
+    m.textures
+        .iter()
+        .any(|b| b.texture != AssetId::NONE && b.uv_set == 1)
+}
+
 /// [`Section`] flags of a section drawn with material `m`.
 pub(crate) fn section_flags(m: &Material) -> u8 {
     let mut flags = 0;
@@ -334,6 +352,7 @@ pub(crate) struct MapSpec {
     pub opacity: OpacitySpec,
     pub displacement: Option<DisplacementSpec>,
     pub normal: NormalSpec,
+    pub uv1: bool,
 }
 
 /// What a section's material reads the vertex tangent for.
@@ -342,15 +361,16 @@ pub(crate) enum NormalSpec {
     /// Nothing.
     #[default]
     None,
-    /// Only to turn this unit's cooked normal map, on uv set 0.
+    /// Only to turn this unit's cooked normal map, on uv set `uv_set`.
     Texture {
         unit: String,
         key: Hash32,
         wrap: [Wrap; 2],
         uv: [f32; 6],
+        uv_set: usize,
     },
     /// More than a normal map the cook can read: anisotropy, a linked surface, or a normal
-    /// map on another uv set or not cooked here.
+    /// map not cooked here.
     Tangent,
 }
 
@@ -367,6 +387,7 @@ pub(crate) enum OpacitySpec {
         cutoff: f32,
         wrap: [Wrap; 2],
         uv: [f32; 6],
+        uv_set: usize,
     },
     Unknown,
 }
@@ -377,8 +398,18 @@ pub(crate) struct DisplacementSpec {
     pub offset: f32,
     pub min: f32,
     pub max: f32,
-    /// The cooked displacement texture's unit, key, edge modes and uv transform.
-    pub texture: Option<(String, Hash32, [Wrap; 2], [f32; 6])>,
+    pub texture: Option<DisplacementTexture>,
+}
+
+/// The cooked displacement texture: its unit, key and edge modes, and the uv transform and
+/// uv set it reads.
+#[derive(Clone, Debug)]
+pub(crate) struct DisplacementTexture {
+    pub unit: String,
+    pub key: Hash32,
+    pub wrap: [Wrap; 2],
+    pub uv: [f32; 6],
+    pub uv_set: usize,
 }
 
 impl MapSpec {
@@ -391,7 +422,7 @@ impl MapSpec {
         let displacement = self
             .displacement
             .as_ref()
-            .and_then(|d| d.texture.as_ref().map(|t| t.0.as_str()));
+            .and_then(|d| d.texture.as_ref().map(|t| t.unit.as_str()));
         let normal = match &self.normal {
             NormalSpec::Texture { unit, .. } => Some(unit.as_str()),
             _ => None,
@@ -407,23 +438,28 @@ impl MapSpec {
                 cutoff,
                 wrap,
                 uv,
+                uv_set,
                 ..
-            } => format!("texture {key:?} {cutoff:?} {wrap:?} {uv:?}"),
+            } => format!("texture {key:?} {cutoff:?} {wrap:?} {uv:?} {uv_set}"),
             o => format!("{o:?}"),
         };
         let displacement = self.displacement.as_ref().map(|d| {
             (
                 [d.scale, d.offset, d.min, d.max],
-                d.texture.as_ref().map(|t| (t.1, t.2, t.3)),
+                d.texture.as_ref().map(|t| (t.key, t.wrap, t.uv, t.uv_set)),
             )
         });
         let normal = match &self.normal {
-            NormalSpec::Texture { key, wrap, uv, .. } => {
-                format!("texture {key:?} {wrap:?} {uv:?}")
-            }
+            NormalSpec::Texture {
+                key,
+                wrap,
+                uv,
+                uv_set,
+                ..
+            } => format!("texture {key:?} {wrap:?} {uv:?} {uv_set}"),
             n => format!("{n:?}"),
         };
-        format!("{opacity} {displacement:?} {normal}")
+        format!("{opacity} {displacement:?} {normal} {}", self.uv1)
     }
 }
 
@@ -511,7 +547,7 @@ pub(crate) fn cook(
     let mut omm_alpha = Vec::with_capacity(maps.len());
     for (si, sm) in maps.iter().enumerate() {
         let alpha = match (&s.omm, &sm.opacity) {
-            (Some(_), Some(Opacity::Texture { mip0, cutoff })) => {
+            (Some(_), Some(Opacity::Texture { mip0, cutoff, .. })) => {
                 let a = OmmAlpha::new(mip0, *cutoff);
                 if a.is_none() {
                     warnings.push(format!(
@@ -536,7 +572,7 @@ pub(crate) fn cook(
         MeshHeader::SKIN
     } else {
         0
-    };
+    } | if w.uvs.len() > 1 { MeshHeader::UV1 } else { 0 };
     let cx = Ctx {
         w: &w,
         grid: &grid,
@@ -665,10 +701,11 @@ impl Ctx<'_> {
         let cells: Vec<[i32; 3]> = order.iter().map(|&i| cells[i as usize]).collect();
         let sec = &self.sections[usize::from(section)];
         let section_maps = &self.maps[usize::from(section)];
-        let uv = ClusterUvs::new(w, &verts);
+        let uv: Vec<ClusterUvs> = w.uvs.iter().map(|u| ClusterUvs::new(u, &verts)).collect();
+        let set = section_maps.opacity.as_ref().map_or(0, Opacity::uv_set);
         let uvs: Vec<[f32; 2]> = verts
             .iter()
-            .map(|&v| uv.stored(w.uvs[v as usize]))
+            .map(|&v| uv[set].stored(w.uvs[set][v as usize]))
             .collect();
         let opaque = partition_opaque(&uvs, &mut tris, section_maps.opacity.as_ref());
         stored_corner_order(&mut tris);
@@ -690,7 +727,7 @@ impl Ctx<'_> {
         if let Some(d) = &section_maps.displacement
             && !self.baked[usize::from(section)]
         {
-            let uv = |i: u8| w.uvs[verts[usize::from(i)] as usize];
+            let uv = |i: u8| w.uvs[d.uv_set][verts[usize::from(i)] as usize];
             let [lo, hi] = d.bounds(tris.as_chunks::<3>().0.iter().map(|t| t.map(uv)));
             c.record.displacement_min = f16_down(lo);
             c.record.displacement_max = f16_up(hi);
@@ -874,6 +911,16 @@ fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
             return Err(format!("cluster vertex limit {v} is outside 3..=256"));
         }
     }
+    if !(1..=2).contains(&m.uvs.len()) {
+        return Err(format!("{} uv sets; meshes carry one or two", m.uvs.len()));
+    }
+    if m.uvs.len() < 2
+        && let Some(i) = m.sections.iter().position(|s| s.maps.uv1)
+    {
+        return Err(format!(
+            "section {i}: its material reads uv set 1, which the mesh does not have"
+        ));
+    }
     if let LodMode::Discrete { errors } = &s.lod {
         if errors.len() > 254 {
             return Err(format!("{} levels; at most 255", errors.len() + 1));
@@ -916,7 +963,7 @@ fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
         ));
     }
     if m.normals.len() != n
-        || m.uvs.len() != n
+        || m.uvs.iter().any(|u| u.len() != n)
         || m.tangents.as_ref().is_some_and(|t| t.len() != n)
         || m.skin
             .as_ref()
@@ -951,7 +998,7 @@ fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
     let finite = |v: &[f32]| v.iter().all(|x| x.is_finite());
     if !m.positions.iter().all(|p| finite(p))
         || !m.normals.iter().all(|p| finite(p))
-        || !m.uvs.iter().all(|p| finite(p))
+        || !m.uvs.iter().flatten().all(|p| finite(p))
         || !m.tangents.iter().flatten().all(|p| finite(p))
     {
         return Err("non-finite vertex attribute".into());
@@ -994,18 +1041,18 @@ fn stored_corner_order(tris: &mut [u8]) {
     tris.copy_from_slice(&decoded);
 }
 
-/// A cluster's uvs as the page stores them: unorm16 over the cluster's uv range.
+/// A cluster's uvs of one set as the page stores them: unorm16 over the cluster's uv range.
 struct ClusterUvs {
     offset: [f32; 2],
     scale: [f32; 2],
 }
 
 impl ClusterUvs {
-    fn new(w: &lod::Welded, verts: &[u32]) -> Self {
+    fn new(uvs: &[[f32; 2]], verts: &[u32]) -> Self {
         let (lo, hi) = verts
             .iter()
             .fold((Vec2::INFINITY, Vec2::NEG_INFINITY), |(lo, hi), &v| {
-                let uv = Vec2::from(w.uvs[v as usize]);
+                let uv = Vec2::from(uvs[v as usize]);
                 (lo.min(uv), hi.max(uv))
             });
         Self {
@@ -1172,7 +1219,7 @@ fn build_cluster(
     cells: &[[i32; 3]],
     tris: &[u8],
     flags: u8,
-    uv: &ClusterUvs,
+    uv: &[ClusterUvs],
 ) -> ClusterData {
     let anchor = [0, 1, 2].map(|a| cells.iter().map(|g| g[a]).min().unwrap());
     let local: Vec<[u16; 3]> = cells
@@ -1207,8 +1254,10 @@ fn build_cluster(
             let e = oct_encode(Vec3::new(x, y, z).normalize_or(Vec3::X).to_array());
             attrs.push(e & !(1 << 16) | u32::from(s < 0.0) << 16);
         }
-        let q = uv.quantise(w.uvs[v]);
-        attrs.push(q[0] | q[1] << 16);
+        for (u, r) in w.uvs.iter().zip(uv) {
+            let q = r.quantise(u[v]);
+            attrs.push(q[0] | q[1] << 16);
+        }
         if let Some(k) = &w.skin {
             attrs.push(u32::from_le_bytes(k.joints[v]));
             attrs.push(u32::from_le_bytes(k.weights[v]));
@@ -1250,8 +1299,8 @@ fn build_cluster(
             0
         },
         local_max,
-        uv_offset: uv.offset,
-        uv_scale: uv.scale,
+        uv_offset: [0, 1].map(|s| uv.get(s).map_or([0.0; 2], |u| u.offset)),
+        uv_scale: [0, 1].map(|s| uv.get(s).map_or([0.0; 2], |u| u.scale)),
         omm_first: Cluster::NO_OMM,
         area: area as f32,
         ..bytemuck::Zeroable::zeroed()
@@ -1346,6 +1395,13 @@ fn write_page(clusters: &[&ClusterData], stride: usize) -> Vec<u8> {
 }
 
 impl MeshData {
+    /// Drops uv set 1 when no section's material reads it.
+    pub(crate) fn drop_unread_uv1(&mut self) {
+        if !self.sections.iter().any(|s| s.maps.uv1) {
+            self.uvs.truncate(1);
+        }
+    }
+
     /// Hash of everything the mesh cook reads but its settings and the cooked textures,
     /// which enter through their keys.
     pub(crate) fn hash(&self) -> Hash32 {
@@ -1357,7 +1413,9 @@ impl MeshData {
         part(bytemuck::cast_slice(&self.positions));
         part(bytemuck::cast_slice(&self.normals));
         part(self.tangents.as_deref().map_or(&[], bytemuck::cast_slice));
-        part(bytemuck::cast_slice(&self.uvs));
+        for u in &self.uvs {
+            part(bytemuck::cast_slice(u));
+        }
         part(bytemuck::cast_slice(&self.indices));
         if let Some(k) = &self.skin {
             part(bytemuck::cast_slice(&k.joints));

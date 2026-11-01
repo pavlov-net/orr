@@ -774,6 +774,11 @@ const TINTED: [(&str, Primaries); 3] = [
     ("tinted rec2020", Primaries::Rec2020),
 ];
 
+/// The halves of the texture the second-uv quad reads on uv set 1 (sRGB bytes); its uv set
+/// 0 sits in the red half.
+const HALF_RED: [u8; 3] = [230, 20, 20];
+const HALF_GREEN: [u8; 3] = [20, 230, 20];
+
 /// The decal texture's opaque texels (sRGB bytes, alpha) and the roughness of its material
 /// and of the matte decal under it.
 const STICKER_TEXEL: [u8; 4] = [40, 90, 230, 255];
@@ -932,6 +937,17 @@ fn cook() -> Arc<[u8]> {
         m.textures[slot::BASE_COLOR].texture = id(&tex);
         tinted.push(model(name, quad(unit), vec![m], one()));
     }
+    let halves = png("halves.png", 64, 64, png::ColorType::Rgb, |x, _| {
+        if x < 32 { HALF_RED } else { HALF_GREEN }.to_vec()
+    });
+    tinted.push(texture("tex/halves", halves, Usage::Color));
+    let mut second = Material::default();
+    second.textures[slot::BASE_COLOR].texture = id("tex/halves");
+    second.textures[slot::BASE_COLOR].uv_set = 1;
+    let mut second_quad = quad(unit);
+    second_quad.uvs1 = second_quad.uvs.take();
+    second_quad.uvs = Some(vec![Vec2::new(0.25, 0.5); 4]);
+    tinted.push(model("second uv", second_quad, vec![second], one()));
     // A representation chain: a DAG ball, then three coarser balls, each its own color.
     for (step, (rings, color)) in CHAIN_SHAPES.into_iter().enumerate() {
         let m = Material {
@@ -2365,7 +2381,7 @@ impl CpuMesh {
         (
             k.map(|v| Vec3::from(view.position(&c, v))),
             k.map(|v| Vec3::from(view.normal(&c, v))),
-            k.map(|v| Vec2::from(view.uv(&c, v))),
+            k.map(|v| Vec2::from(view.uv(&c, v, 0))),
             t >= u32::from(c.alpha_first),
         )
     }
@@ -3988,6 +4004,48 @@ fn a_color_factor_multiplies_its_texel_in_the_texture_primaries() {
             (raster - want).abs().max_element() < 0.01
                 && (traced - want).abs().max_element() < 0.003,
             "{model}: raster {raster}, traced {traced}, want {want}"
+        );
+    }
+    assert_clean();
+}
+
+#[test]
+fn a_texture_on_uv_set_1_reads_that_set_in_the_raster_and_at_ray_hits() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let item = Item {
+        model: "second uv",
+        linear: Mat3::IDENTITY,
+        at: Vec3::ZERO,
+    };
+    let placed = place(&mut w, &[item]);
+    let g = shoot(
+        &mut w,
+        &placed,
+        &Shot::at(DVec3::new(0.0, 0.0, 1.5), DVec3::ZERO, 1),
+    );
+    let r = rays(&g.view, &trace::MODULE, "pixels", 1);
+    let id = placed.ranges[0].first + 1;
+    // Set 1 spans both halves; set 0 would read red everywhere.
+    let halves = |colors: Vec<Vec3>| {
+        let red = colors.iter().filter(|c| c.x > 2.0 * c.y).count();
+        let green = colors.iter().filter(|c| c.y > 2.0 * c.x).count();
+        (red, green, colors.len())
+    };
+    let raster = (0..g.ids.len())
+        .filter(|&i| g.ids[i] == id)
+        .map(|i| decode_core(g.a[i], g.b[i]).base_color)
+        .collect();
+    let traced = r
+        .traced
+        .iter()
+        .filter(|t| t.instance == id)
+        .map(|t| Vec3::from(t.base_color))
+        .collect();
+    for (path, (red, green, n)) in [("raster", halves(raster)), ("traced", halves(traced))] {
+        assert!(
+            n > 0 && red * 3 > n && green * 3 > n,
+            "{path}: {red} red and {green} green of {n} pixels"
         );
     }
     assert_clean();

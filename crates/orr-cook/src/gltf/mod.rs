@@ -95,6 +95,7 @@ struct Vertices {
     normals: Vec<[f32; 3]>,
     tangents: Vec<[f32; 4]>,
     uvs: Vec<[f32; 2]>,
+    uvs1: Vec<[f32; 2]>,
     joints: Vec<[u8; 4]>,
     weights: Vec<[u8; 4]>,
     values: Vec<u16>,
@@ -116,6 +117,8 @@ struct Building {
     from_scene: Mat4,
     v: Vertices,
     tangents: bool,
+    /// A primitive has TEXCOORD_1.
+    uv1: bool,
     groups: BTreeMap<usize, Vec<u32>>,
     /// Bind position and skeleton joint per part value, from skins.
     joint_pivots: Vec<Option<([f32; 3], u16)>>,
@@ -128,6 +131,7 @@ impl Building {
             from_scene,
             v: Vertices::default(),
             tangents: true,
+            uv1: false,
             groups: BTreeMap::new(),
             joint_pivots: vec![None; parts],
         }
@@ -168,7 +172,9 @@ impl Building {
             positions: v.positions,
             normals: v.normals,
             tangents: self.tangents.then_some(v.tangents),
-            uvs: v.uvs,
+            uvs: std::iter::once(v.uvs)
+                .chain(self.uv1.then_some(v.uvs1))
+                .collect(),
             indices,
             sections: Vec::new(),
             skin: skinned.then_some(Skin {
@@ -281,8 +287,13 @@ fn append_primitive(
     if flip {
         indices.chunks_exact_mut(3).for_each(|t| t.swap(1, 2));
     }
-    let uvs: Vec<[f32; 2]> = rows(Semantic::TexCoords(0), 2)?
-        .map_or_else(|| vec![[0.0; 2]; n], |v| v.as_chunks::<2>().0.to_vec());
+    let [uvs, uvs1] = [0, 1].map(|set| rows(Semantic::TexCoords(set), 2));
+    let (uvs, uvs1) = (uvs?, uvs1?);
+    b.uv1 |= uvs1.is_some();
+    let zeros = |v: Option<Vec<f32>>| {
+        v.map_or_else(|| vec![[0.0; 2]; n], |v| v.as_chunks::<2>().0.to_vec())
+    };
+    let (uvs, uvs1) = (zeros(uvs), zeros(uvs1));
     let tangents = rows(Semantic::Tangents, 4)?.map(|t| {
         t.as_chunks::<4>()
             .0
@@ -406,6 +417,7 @@ fn append_primitive(
             v.normals.extend(normals);
             v.tangents.extend(tangents);
             v.uvs.extend(uvs);
+            v.uvs1.extend(uvs1);
             v.joints.extend(skin.iter().map(|s| s.0));
             v.weights.extend(skin.iter().map(|s| s.1));
             v.values.extend(values);
@@ -424,6 +436,7 @@ fn append_primitive(
                     v.normals.push(face.to_array());
                     v.tangents.push(tangents[i]);
                     v.uvs.push(uvs[i]);
+                    v.uvs1.push(uvs1[i]);
                     if let Some(&(j, w)) = skin.get(i) {
                         v.joints.push(j);
                         v.weights.push(w);
@@ -1101,6 +1114,17 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
         let weights = node.weights().or(mesh.weights()).unwrap_or_default();
         for prim in mesh.primitives() {
             b.material(&prim)?;
+            let reads_uv1 = b.materials[&material_index(&prim)]
+                .textures
+                .refs()
+                .any(|r| r.uv_set == 1);
+            if reads_uv1 && prim.get(&Semantic::TexCoords(1)).is_none() {
+                return Err(fail(format!(
+                    "mesh {} primitive {}: its material reads TEXCOORD_1, which the primitive does not have",
+                    mesh.index(),
+                    prim.index()
+                )));
+            }
             append_primitive(
                 &data,
                 &prim,

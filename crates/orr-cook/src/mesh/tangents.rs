@@ -51,9 +51,9 @@ pub(crate) fn check(
     let mut hist = vec![0.0f64; BINS];
     let mut texels = 0u64;
     for (sec, sm) in m.sections.iter().zip(maps) {
-        let map = match (&sec.maps.normal, &sm.normal) {
+        let (map, set) = match (&sec.maps.normal, &sm.normal) {
             (NormalSpec::None, _) => continue,
-            (NormalSpec::Texture { .. }, Some(map)) => map,
+            (NormalSpec::Texture { uv_set, .. }, Some(map)) => (map, *uv_set),
             _ => return TangentCheck::KEPT,
         };
         let (h, n) = m.indices[sec.indices.clone()]
@@ -62,7 +62,7 @@ pub(crate) fn check(
                 let mut h = vec![0.0f64; BINS];
                 let mut n = 0u64;
                 for t in chunk.as_chunks::<3>().0 {
-                    let tri = Triangle::new(m, tangents, t.map(|i| i as usize));
+                    let tri = Triangle::new(m, set, tangents, t.map(|i| i as usize));
                     texel_centers(&map[0], tri.uv, |w, weight| {
                         let deg = tri.angle(map, w);
                         h[((deg / BIN) as usize).min(BINS - 1)] += weight;
@@ -116,9 +116,10 @@ struct Triangle {
 }
 
 impl Triangle {
-    fn new(m: &MeshData, tangents: &[[f32; 4]], v: [usize; 3]) -> Self {
+    /// The triangle with corners `v`, its derived tangent from uv set `set`.
+    fn new(m: &MeshData, set: usize, tangents: &[[f32; 4]], v: [usize; 3]) -> Self {
         let p = v.map(|i| Vec3::from(m.positions[i]));
-        let uv = v.map(|i| m.uvs[i]);
+        let uv = v.map(|i| m.uvs[set][i]);
         let (e1, e2) = (p[1] - p[0], p[2] - p[0]);
         let uv1 = [uv[1][0] - uv[0][0], uv[1][1] - uv[0][1]];
         let uv2 = [uv[2][0] - uv[0][0], uv[2][1] - uv[0][1]];

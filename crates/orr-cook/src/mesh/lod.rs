@@ -14,7 +14,8 @@ pub(crate) struct Welded {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub tangents: Option<Vec<[f32; 4]>>,
-    pub uvs: Vec<[f32; 2]>,
+    /// Per uv set, a uv per vertex.
+    pub uvs: Vec<Vec<[f32; 2]>>,
     pub skin: Option<Skin>,
     pub values: Option<Vec<u16>>,
     pub pivots: Option<Vec<[f32; 3]>>,
@@ -31,8 +32,8 @@ impl Welded {
         let mut streams = vec![
             VertexStream::new(m.positions.as_ptr()),
             VertexStream::new(m.normals.as_ptr()),
-            VertexStream::new(m.uvs.as_ptr()),
         ];
+        streams.extend(m.uvs.iter().map(|u| VertexStream::new(u.as_ptr())));
         if let Some(t) = stored {
             streams.push(VertexStream::new(t.as_ptr()));
         }
@@ -56,7 +57,11 @@ impl Welded {
             positions: remap_all(&m.positions),
             normals: remap_all(&m.normals),
             tangents: stored.map(|t| meshopt::remap_vertex_buffer(t, count, &remap)),
-            uvs: meshopt::remap_vertex_buffer(&m.uvs, count, &remap),
+            uvs: m
+                .uvs
+                .iter()
+                .map(|u| meshopt::remap_vertex_buffer(u, count, &remap))
+                .collect(),
             skin: m.skin.as_ref().map(|k| Skin {
                 joints: meshopt::remap_vertex_buffer(&k.joints, count, &remap),
                 weights: meshopt::remap_vertex_buffer(&k.weights, count, &remap),
@@ -276,7 +281,8 @@ pub(crate) fn pieces(w: &Welded, parts: &Parts) -> Vec<Piece> {
         .collect()
 }
 
-/// Grid positions where corners (welded vertex, grid position) with different uvs meet.
+/// Grid positions where corners (welded vertex, grid position) with different uvs, in
+/// either set, meet.
 pub(crate) fn seam_cells(
     w: &Welded,
     corners: impl IntoIterator<Item = (u32, [i32; 3])>,
@@ -285,7 +291,8 @@ pub(crate) fn seam_cells(
     let mut seams = HashSet::new();
     for (v, cell) in corners {
         let f = *first.entry(cell).or_insert(v);
-        if w.uvs[f as usize] != w.uvs[v as usize] {
+        let (f, v) = (f as usize, v as usize);
+        if w.uvs.iter().any(|u| u[f] != u[v]) {
             seams.insert(cell);
         }
     }
@@ -410,7 +417,7 @@ pub(crate) fn displacement_seams(
     for t in w.section_triangles(s) {
         for v in t {
             let e = uvs.entry(grid.cells[v as usize]).or_default();
-            let uv = w.uvs[v as usize];
+            let uv = w.uvs[d.uv_set][v as usize];
             if !e.contains(&uv) {
                 e.push(uv);
             }

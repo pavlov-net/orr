@@ -62,13 +62,13 @@ type Corners = (
     Vec<[f32; 3]>,
 );
 
-/// The mesh entry `name`: its info and every cluster.
+/// The mesh entry `name`: its info and every cluster, corner uvs from uv set `set`.
 struct Cooked {
     info: MeshInfo,
     clusters: Vec<Corners>,
 }
 
-fn mesh_of(a: &Archive, name: &str) -> Cooked {
+fn mesh_of(a: &Archive, name: &str, set: usize) -> Cooked {
     let e = a.find(AssetId::from_name(name)).unwrap();
     let blobs = a.blobs(e);
     let info = MeshInfo::parse(&read(a, &blobs[0])).unwrap();
@@ -80,7 +80,10 @@ fn mesh_of(a: &Archive, name: &str) -> Cooked {
         for i in 0..view.cluster_count() {
             let c = view.cluster(i);
             let tris = (0..u32::from(c.tri_count)).map(|t| view.triangle(&c, t).map(u32::from));
-            let uvs = tris.clone().map(|t| t.map(|v| view.uv(&c, v))).collect();
+            let uvs = tris
+                .clone()
+                .map(|t| t.map(|v| view.uv(&c, v, set)))
+                .collect();
             let pos = tris.map(|t| t.map(|v| view.position(&c, v))).collect();
             let normals = (0..u32::from(c.vertex_count))
                 .map(|v| view.normal(&c, v))
@@ -208,7 +211,7 @@ fn quantised_compressed_files_cook_like_float_ones() {
     );
     let (a, _) = cook(&compressed, GltfSettings::default()).unwrap();
     let (b, _) = cook(&plain, GltfSettings::default()).unwrap();
-    let (ma, mb) = (mesh_of(&a, "g/mesh"), mesh_of(&b, "g/mesh"));
+    let (ma, mb) = (mesh_of(&a, "g/mesh", 0), mesh_of(&b, "g/mesh", 0));
     assert_eq!(triangle_set(&ma), triangle_set(&mb));
     assert_eq!(triangle_set(&ma).len(), idx.len() / 3);
     for (_, _, _, n) in &ma.clusters {
@@ -247,7 +250,7 @@ fn float_part_attributes_round_to_parts() {
         ..Default::default()
     };
     let (a, _) = cook(&path, settings).unwrap();
-    let m = mesh_of(&a, "g/mesh");
+    let m = mesh_of(&a, "g/mesh", 0);
     assert_eq!(m.info.parts.len(), 9);
     let mut cooked = [0u32; 9];
     for (c, ..) in &m.clusters {
@@ -313,7 +316,7 @@ fn single_joint_skins_cook_as_rigid_parts() {
         ..Default::default()
     };
     let (a, _) = cook(&path, settings.clone()).unwrap();
-    let m = mesh_of(&a, "g/mesh");
+    let m = mesh_of(&a, "g/mesh", 0);
     assert_eq!(m.info.header.attributes & mesh::MeshHeader::SKIN, 0);
     let pivots: Vec<_> = m.info.parts.iter().map(|p| (p.pivot, p.joint)).collect();
     assert_eq!(pivots, [([0.0, 0.0, 0.25], 0), ([0.5, 0.0, 0.0], 1)]);
@@ -548,7 +551,7 @@ fn selected_models_join_on_one_grid() {
     let (a, _) = cook(&path, settings.clone()).unwrap();
     for name in ["g/rock_a", "g/rock_b"] {
         assert!(a.find(AssetId::from_name(name)).is_some());
-        let m = mesh_of(&a, &format!("{name}/mesh"));
+        let m = mesh_of(&a, &format!("{name}/mesh"), 0);
         // The slab alone needs 2^-10 m; the box takes it too.
         assert_eq!(m.info.header.position_exponent, -10);
     }
@@ -569,7 +572,7 @@ fn selected_models_join_on_one_grid() {
         },
     )
     .unwrap();
-    let k = |name: &str| mesh_of(&a, name).info.header.position_exponent;
+    let k = |name: &str| mesh_of(&a, name, 0).info.header.position_exponent;
     assert_eq!((k("g/rock_a/mesh"), k("g/rock_b/mesh")), (-11, -8));
 
     for (ta, tb) in [
@@ -635,7 +638,7 @@ fn cut_out(name: &str, transform: Option<&str>) -> [f32; 6] {
         ]
     };
     let opacity = texture_mip(&a, "g/texture/0/opacity", 0);
-    let m = mesh_of(&a, "g/mesh");
+    let m = mesh_of(&a, "g/mesh", 0);
     let (mut opaque, mut tested) = (0, 0);
     for (c, uvs, ..) in &m.clusters {
         for (t, uv) in uvs.iter().enumerate() {
@@ -836,7 +839,7 @@ fn micromap_states_never_contradict_the_alpha_test() {
                     let index = view
                         .omm_index(&c, t)
                         .expect("alpha-tested triangles have micromaps");
-                    let uv = view.triangle(&c, t).map(|v| view.uv(&c, u32::from(v)));
+                    let uv = view.triangle(&c, t).map(|v| view.uv(&c, u32::from(v), 0));
                     let level = u32::try_from(index).map_or(0, |e| u32::from(maps.entry(e).level));
                     let n = (2 << level).min(32);
                     for j in 0..n {
@@ -1042,7 +1045,7 @@ fn displacement_bounds_hold_every_mip() {
         .map(|m| texture_mip(&a, "g/texture/0/displacement", m))
         .collect();
     assert!(mips.len() > 3);
-    let m = mesh_of(&a, "g/mesh");
+    let m = mesh_of(&a, "g/mesh", 0);
     let half = |b: u16| half::f16::from_bits(b).to_f32();
     let mut checked = 0;
     for (c, uvs, pos, _) in &m.clusters {
@@ -1191,6 +1194,57 @@ fn webp_textures_replace_their_core_source() {
     }
 }
 
+#[test]
+fn a_texture_on_texcoord_1_binds_uv_set_1_and_the_mesh_stores_it() {
+    let d = dir("gltf-texcoord-1");
+    let mut g = Glb::default();
+    let pos = [
+        [0.0f32, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 1.0],
+    ];
+    let uv1 = |p: [f32; 3]| [0.25 + 0.5 * p[0], 0.5 + 0.5 * p[2]];
+    let pa = g.floats(&pos, "VEC3");
+    let na = g.floats(&[[0.0f32, 1.0, 0.0]; 4], "VEC3");
+    let t0 = g.floats(&[[0.0f32; 2]; 4], "VEC2");
+    let t1 = g.floats(&pos.map(uv1), "VEC2");
+    let ia = g.indices(&[0, 2, 1, 1, 2, 3]);
+    let image = g.image(&png(16, 16, |x, y| {
+        [(x * 16) as u8, (y * 16) as u8, 0, 255]
+    }));
+    let path = d.join("texcoord1.glb");
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"NORMAL":{na},"TEXCOORD_0":{t0},"TEXCOORD_1":{t1}}},"indices":{ia},"material":0}}]}}],
+"materials":[{{"pbrMetallicRoughness":{{"baseColorTexture":{{"index":0,"texCoord":1}}}}}}],
+"textures":[{{"source":0}}],
+"images":[{{"bufferView":{image},"mimeType":"image/png"}}]"#
+        ),
+    );
+    let (a, _) = cook(&path, GltfSettings::default()).unwrap();
+    let e = a.find(AssetId::from_name("g/material/0")).unwrap();
+    let m = Material::from_bytes(&read(&a, &a.blobs(e)[0])).unwrap();
+    assert_eq!(m.textures[slot::BASE_COLOR].uv_set, 1);
+    let mesh = mesh_of(&a, "g/mesh", 1);
+    assert_ne!(mesh.info.header.attributes & mesh::MeshHeader::UV1, 0);
+    let corners: Vec<_> = mesh
+        .clusters
+        .iter()
+        .flat_map(|(_, uvs, pos, _)| uvs.iter().flatten().zip(pos.iter().flatten()))
+        .collect();
+    assert_eq!(corners.len(), 6);
+    for (got, &p) in corners {
+        let want = uv1(p);
+        assert!(
+            (0..2).all(|k| (got[k] - want[k]).abs() < 1e-4),
+            "{got:?} {want:?}"
+        );
+    }
+}
+
 /// A scene with a plain node and an instanced one: node `tree` carries
 /// `EXT_mesh_gpu_instancing` (required) and a translation of its own.
 fn instanced(path: &Path, instances: &[([f32; 3], [f32; 4], [f32; 3])]) {
@@ -1232,10 +1286,10 @@ fn gpu_instancing_becomes_instance_pages() {
     let (a, _) = cook(&path, GltfSettings::default()).unwrap();
 
     // The instanced node is a model in its mesh's space; the scene model keeps the rest.
-    let mesh = mesh_of(&a, "g/tree/mesh");
+    let mesh = mesh_of(&a, "g/tree/mesh", 0);
     assert_eq!(mesh.info.header.bounds.max, [1.0, 0.0, 1.0]);
     assert_eq!(
-        mesh_of(&a, "g/mesh").info.header.bounds.max,
+        mesh_of(&a, "g/mesh", 0).info.header.bounds.max,
         [8.0, 0.0, 8.0]
     );
     let model = AssetId::from_name("g/tree");
@@ -1405,7 +1459,7 @@ fn meshes_layout_places_each_mesh_and_bakes_shears() {
     );
     // The sheared copy holds its linear transform in its geometry.
     close(&placements(&a, "g/mesh/1/baked/0"), &[glam::Mat4::IDENTITY]);
-    let baked = mesh_of(&a, "g/mesh/1/baked/0/mesh");
+    let baked = mesh_of(&a, "g/mesh/1/baked/0/mesh", 0);
     let corners: Vec<[f32; 3]> = baked
         .clusters
         .iter()
@@ -1421,7 +1475,7 @@ fn meshes_layout_places_each_mesh_and_bakes_shears() {
         );
     }
     // Sections in material order, with the second primitive's material first.
-    let plain = mesh_of(&a, "g/mesh/1/mesh");
+    let plain = mesh_of(&a, "g/mesh/1/mesh", 0);
     assert_eq!(plain.info.sections.len(), 2);
     let tris = |s: u8| {
         plain
@@ -1630,7 +1684,7 @@ fn tangents_are_derived_unless_a_seam_turns_the_shading() {
     assert!(t.texels >= 64 * 64);
     assert_eq!(t.bytes_saved, 4 * mesh.vertices);
     assert_eq!(
-        mesh_of(&a, "g/mesh").info.header.attributes & mesh::MeshHeader::TANGENT,
+        mesh_of(&a, "g/mesh", 0).info.header.attributes & mesh::MeshHeader::TANGENT,
         0
     );
 
@@ -1654,7 +1708,7 @@ fn tangents_are_derived_unless_a_seam_turns_the_shading() {
     assert!(!t.derived && t.angle_p99.unwrap() > 10.0, "{t:?}");
     assert_eq!(t.bytes_saved, 0);
     assert_ne!(
-        mesh_of(&a, "g/mesh").info.header.attributes & mesh::MeshHeader::TANGENT,
+        mesh_of(&a, "g/mesh", 0).info.header.attributes & mesh::MeshHeader::TANGENT,
         0
     );
 }
@@ -1683,7 +1737,7 @@ fn morph_targets_cook_at_each_nodes_default_weights() {
         ..Default::default()
     };
     let (a, _) = cook(&path, settings).unwrap();
-    let top = |name: &str| mesh_of(&a, name).info.header.bounds.max[1];
+    let top = |name: &str| mesh_of(&a, name, 0).info.header.bounds.max[1];
     assert_eq!((top("g/quad_a/mesh"), top("g/quad_b/mesh")), (1.0, 2.0));
 }
 
@@ -1709,7 +1763,7 @@ fn hidden_nodes_hide_their_subtrees() {
     );
     let (a, _) = cook(&path, GltfSettings::default()).unwrap();
     assert_eq!(
-        mesh_of(&a, "g/mesh").info.header.bounds.max,
+        mesh_of(&a, "g/mesh", 0).info.header.bounds.max,
         [1.0, 0.0, 1.0]
     );
 }

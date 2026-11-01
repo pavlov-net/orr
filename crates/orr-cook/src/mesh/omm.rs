@@ -151,7 +151,7 @@ pub(crate) fn cluster_omm(
                 data: Vec::new(),
             });
         }
-        Opacity::Texture { mip0, cutoff } => (mip0, *cutoff),
+        Opacity::Texture { mip0, cutoff, .. } => (mip0, *cutoff),
         Opacity::Unknown => return None,
     };
     let alpha = alpha?;

@@ -330,7 +330,7 @@ Surface undisplaced(Patch pt, float3 w, bool previous)
     ProducerTriangle tri = previous ? pt.previous : pt.current;
     float3 positions[3] = tri.corners.position;
     float3 normals[3] = { tri.corners.attributes[0].normal, tri.corners.attributes[1].normal, tri.corners.attributes[2].normal };
-    float2 uvs[3] = { tri.corners.attributes[0].uv, tri.corners.attributes[1].uv, tri.corners.attributes[2].uv };
+    float2 uvs[3] = { tri.corners.attributes[0].uv[0], tri.corners.attributes[1].uv[0], tri.corners.attributes[2].uv[0] };
     Surface o;
     o.normal = safe_normalize(interpolate(normals, w), float3(0.0, 1.0, 0.0));
     SubdCopyGpu* c = root.tess.subd;
@@ -353,17 +353,16 @@ Surface undisplaced(Patch pt, float3 w, bool previous)
 float3 displaced(Patch pt, PatchItem item, uint material, float3 w, bool previous, out Surface base)
 {
     ProducerTriangle tri = previous ? pt.previous : pt.current;
-    float2 uvs[3] = { tri.corners.attributes[0].uv, tri.corners.attributes[1].uv, tri.corners.attributes[2].uv };
+    float2 uvs[3] = { tri.corners.attributes[0].uv[0], tri.corners.attributes[1].uv[0], tri.corners.attributes[2].uv[0] };
     base = undisplaced(pt, w, previous);
     DisplacementInput i = (DisplacementInput)0;
     i.position = base.position;
     i.displacement = entry().displacement;
     i.normal = base.normal;
     i.material = material;
-    i.uv.uv = base.uv;
-    i.uv.dx = (uvs[1] - uvs[0]) / item.rate;
-    i.uv.dy = (uvs[2] - uvs[0]) / item.rate;
-    i.uv.tap = float2(-1.0);
+    UvFootprint f = { base.uv, (uvs[1] - uvs[0]) / item.rate, (uvs[2] - uvs[0]) / item.rate, float2(-1.0) };
+    i.uv[0] = f;
+    i.uv[1] = f;
     i.user = pt.cluster.user;
     i.user_tag = entry().user_tag;
     i.previous = previous ? 1 : 0;

@@ -144,7 +144,7 @@ void pixels(uint3 id: SV_DispatchThreadID)
             o.position = h.surface.position;
             o.normal = h.surface.normal;
             o.geometric_normal = h.surface.geometric_normal;
-            o.uv = h.uv.uv;
+            o.uv = h.uv[0].uv;
             o.material = h.surface.material;
             o.base_color = h.surface.bsdf.base_color;
             o.valid = h.valid ? 1 : 0;

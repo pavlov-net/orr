@@ -12,6 +12,7 @@ public static const uint PAGE_MAX = 128 << 10;
 // `MeshHeader.attributes`.
 public static const uint MESH_TANGENT = 1;
 public static const uint MESH_SKIN = 2;
+public static const uint MESH_UV1 = 4;
 
 // `Cluster.kind`.
 public static const uint CLUSTER_TRIANGLES = 0;
@@ -39,7 +40,7 @@ public struct PageHeader
     public uint _pad2[3];
 }
 
-// 128 B. Spheres are (centre, radius) in mesh space.
+// 144 B. Spheres are (centre, radius) in mesh space.
 public struct Cluster
 {
     public float4 self_sphere;
@@ -62,8 +63,8 @@ public struct Cluster
     public half deformation_bound; // m
     public half displacement_min;  // m
     public half displacement_max;  // m
-    public float2 uv_offset;
-    public float2 uv_scale;
+    public float2 uv_offset[2];    // per uv set
+    public float2 uv_scale[2];
     public uint omm_first;         // bytes from omm_offset
     public float area;             // m^2
     public half min_thickness;     // m
@@ -112,7 +113,7 @@ public struct VertexAttributes
 {
     public float3 normal;
     public float4 tangent;         // xyz and bitangent sign; (1, 0, 0, 1) without MESH_TANGENT
-    public float2 uv;
+    public float2 uv[2];           // per uv set; set 1 is zero without MESH_UV1
     public uint4 joints;           // MESH_SKIN only
     public float4 weights;         // MESH_SKIN only; sum to 1
 }
@@ -141,6 +142,11 @@ public float3 load_position(uint8_t* page, PageHeader h, Cluster c, uint i, floa
     return grid_position(c.anchor, load_local(page, h, c, i), step);
 }
 
+float2 load_uv(uint q, Cluster c, uint set)
+{
+    return c.uv_offset[set] + unpack_unorm2x16(q) * c.uv_scale[set];
+}
+
 // `attributes` is the mesh's `MeshHeader.attributes`.
 public VertexAttributes load_attributes(uint8_t* page, PageHeader h, Cluster c, uint i, uint attributes)
 {
@@ -154,8 +160,10 @@ public VertexAttributes load_attributes(uint8_t* page, PageHeader h, Cluster c, 
         uint t = a[at++];
         v.tangent = float4(oct_decode_unorm16(t), (t & (1u << 16)) != 0 ? -1.0 : 1.0);
     }
-    uint q = a[at++];
-    v.uv = c.uv_offset + float2(float(q & 0xFFFF), float(q >> 16)) / 65535.0 * c.uv_scale;
+    v.uv[0] = load_uv(a[at++], c, 0);
+    v.uv[1] = float2(0.0);
+    if ((attributes & MESH_UV1) != 0)
+        v.uv[1] = load_uv(a[at++], c, 1);
     v.joints = uint4(0);
     v.weights = float4(0.0);
     if ((attributes & MESH_SKIN) != 0)

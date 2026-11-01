@@ -70,13 +70,7 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
         Failure::Read(e) => e,
         Failure::Document(m) => fail(m),
     })?;
-    let uv_set = |name: &str| match name {
-        "st" => Ok(0),
-        n => Err(format!(
-            "geometric property {n}; a standalone material reads st"
-        )),
-    };
-    let mapped = shading::map(&net, surface, displacement, &uv_set)
+    let mapped = shading::map(&net, surface, displacement, &["st"])
         .map_err(|m| fail(format!("material {material}: {m}")))?;
     if mapped.uv.is_some() {
         return Err(fail(format!(

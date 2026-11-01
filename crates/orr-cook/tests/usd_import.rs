@@ -86,7 +86,7 @@ fn triangles(a: &Archive, name: &str) -> (MeshInfo, Vec<Triangle>) {
                 let tri = view.triangle(&c, t).map(u32::from);
                 out.push((
                     tri.map(|v| view.position(&c, v)),
-                    tri.map(|v| view.uv(&c, v)),
+                    tri.map(|v| view.uv(&c, v, 0)),
                 ));
             }
         }

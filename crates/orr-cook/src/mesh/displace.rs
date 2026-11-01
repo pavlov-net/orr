@@ -40,7 +40,7 @@ pub(crate) fn bake(
             let e = at
                 .entry(w.positions[v].map(f32::to_bits))
                 .or_insert((0.0, DVec3::ZERO, 0));
-            e.0 += f64::from(disp.scale * mip0.sample(w.uvs[v]) + disp.offset);
+            e.0 += f64::from(disp.scale * mip0.sample(w.uvs[disp.uv_set][v]) + disp.offset);
             e.1 += Vec3::from(w.normals[v]).normalize_or_zero().as_dvec3();
             e.2 += 1;
         }
@@ -119,8 +119,10 @@ fn midpoint(w: &mut Welded, a: u32, b: u32) -> u32 {
     let n = Vec3::from(w.normals[a]) + Vec3::from(w.normals[b]);
     w.normals
         .push(n.normalize_or(Vec3::from(w.normals[a])).to_array());
-    let (ua, ub) = (w.uvs[a], w.uvs[b]);
-    w.uvs.push([mid(ua[0], ub[0]), mid(ua[1], ub[1])]);
+    for u in &mut w.uvs {
+        let (ua, ub) = (u[a], u[b]);
+        u.push([mid(ua[0], ub[0]), mid(ua[1], ub[1])]);
+    }
     if let Some(t) = &mut w.tangents {
         let (ta, tb) = (t[a], t[b]);
         let v = Vec3::new(ta[0] + tb[0], ta[1] + tb[1], ta[2] + tb[2]).normalize_or(Vec3::X);
