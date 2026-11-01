@@ -224,7 +224,7 @@ impl EntryBlobs<'_> {
 /// Where [`ArchiveWriter::finish`] puts the archive.
 #[derive(Clone, Debug)]
 pub enum Target {
-    /// Written to `<path>.tmp`, then renamed over the path.
+    /// Written to `<path>.payload.tmp`, then renamed over the path.
     File(PathBuf),
     /// Returned as bytes; the same bytes a file target would hold.
     Memory,
@@ -487,9 +487,10 @@ impl ArchiveWriter {
         })
     }
 
-    /// Writes the index range and completes the archive. A file target is written to
-    /// `<path>.tmp`, synced and renamed over the path; readers that opened the old file with
-    /// delete sharing keep reading the old bytes. Returns the bytes for a memory target.
+    /// Writes the index range and completes the archive. A file target's payload file gets
+    /// the index in front of it in place, is synced and renamed over the path; readers that
+    /// opened the old file with delete sharing keep reading the old bytes. Returns the bytes
+    /// for a memory target.
     pub fn finish(mut self) -> Result<Option<Arc<[u8]>>> {
         let l = Layout::new(
             self.entries.len(),
@@ -543,8 +544,10 @@ impl ArchiveWriter {
             Payload::File {
                 out, scratch, path, ..
             } => {
-                let result = write_file(&path, &index, out);
-                let _ = fs::remove_file(&scratch);
+                let result = write_file(&path, &scratch, &index, out);
+                if result.is_err() {
+                    let _ = fs::remove_file(&scratch);
+                }
                 result.map(|()| None)
             }
         }
@@ -559,17 +562,34 @@ impl Drop for ArchiveWriter {
     }
 }
 
-fn write_file(path: &Path, index: &[u8], payload: BufWriter<File>) -> Result<()> {
-    let mut payload = payload
+/// Puts `index` in front of the payload in the payload's own file, moving the payload up
+/// from its end down in place so the disk never holds it twice, then renames the file to
+/// `path` through `<path>.tmp`.
+fn write_file(path: &Path, scratch: &Path, index: &[u8], payload: BufWriter<File>) -> Result<()> {
+    let mut f = payload
         .into_inner()
         .map_err(io::IntoInnerError::into_error)?;
-    payload.rewind()?;
+    let len = f.seek(io::SeekFrom::End(0))?;
+    let shift = index.len() as u64;
+    let mut buf = vec![0u8; 8 << 20];
+    let mut end = len;
+    while end > 0 {
+        let n = (buf.len() as u64).min(end);
+        let start = end - n;
+        let chunk = &mut buf[..n as usize];
+        f.seek(io::SeekFrom::Start(start))?;
+        io::Read::read_exact(&mut f, chunk)?;
+        f.seek(io::SeekFrom::Start(start + shift))?;
+        f.write_all(chunk)?;
+        end = start;
+    }
+    f.seek(io::SeekFrom::Start(0))?;
+    f.write_all(index)?;
+    f.sync_all()?;
+    drop(f);
+    // The finished archive waits at `<path>.tmp` when the path cannot be replaced.
     let tmp = suffixed(path, ".tmp");
-    let mut out = File::create(&tmp)?;
-    out.write_all(index)?;
-    io::copy(&mut payload, &mut out)?;
-    out.sync_all()?;
-    drop(out);
+    fs::rename(scratch, &tmp)?;
     fs::rename(&tmp, path).map_err(|source| Error::Replace {
         path: path.to_owned(),
         source,
