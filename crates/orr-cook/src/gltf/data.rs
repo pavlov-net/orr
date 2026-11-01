@@ -5,7 +5,8 @@
 //! compressed with `EXT_meshopt_compression` or `KHR_meshopt_compression` are decoded with
 //! meshoptimizer's decoders and filters into their fallback buffers, so every view reads as
 //! if it were stored plain. Accessors are read here, including the normalised and
-//! unnormalised integer forms `KHR_mesh_quantization` allows and sparse accessors.
+//! unnormalised integer forms `KHR_mesh_quantization` allows and sparse accessors. An asset
+//! whose `minVersion` is above glTF 2.1 is refused.
 
 use gltf::accessor::{DataType, Dimensions};
 use gltf::buffer::Source as BufferSource;
@@ -59,6 +60,17 @@ pub(crate) fn open(
         (bytes.to_vec(), None)
     };
     let mut json: Value = serde_json::from_slice(&json_bytes).map_err(|e| fail(e.to_string()))?;
+    if let Some(v) = json["asset"].get("minVersion") {
+        let min = v.as_str().and_then(|s| {
+            let (major, minor) = s.split_once('.')?;
+            Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?))
+        });
+        if min.is_none_or(|m| m > (2, 1)) {
+            return Err(fail(format!(
+                "asset minVersion {v} is not a glTF version up to 2.1"
+            )));
+        }
+    }
     if let Some(Value::Array(required)) = json.get_mut("extensionsRequired") {
         required.retain(|e| !e.as_str().is_some_and(|n| COOK_EXTENSIONS.contains(&n)));
     }
@@ -336,5 +348,24 @@ fn component(b: &[u8], ty: DataType, c: usize, normalized: bool) -> f32 {
         }
         DataType::U32 => u32::from_le_bytes(b[4 * c..4 * c + 4].try_into().unwrap()) as f32,
         DataType::F32 => f32::from_le_bytes(b[4 * c..4 * c + 4].try_into().unwrap()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn min_version_above_2_1_is_refused() {
+        let opens = |min: &str| {
+            let json = format!(r#"{{"asset":{{"version":"2.1","minVersion":"{min}"}}}}"#);
+            super::open(json.as_bytes(), &mut |_, _| unreachable!(), &|message| {
+                crate::Error::Import {
+                    asset: String::new(),
+                    message,
+                }
+            })
+            .is_ok()
+        };
+        assert!(opens("2.0") && opens("2.1"));
+        assert!(!opens("2.2") && !opens("2.10") && !opens("3.0") && !opens("2"));
     }
 }
