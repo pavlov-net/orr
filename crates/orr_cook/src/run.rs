@@ -2,10 +2,13 @@
 //! from the archive being replaced or the cache when their keys match, the rest cook on the
 //! cook's pool, and every archive is written in a fixed order.
 //!
-//! Scheduling: jobs start largest first while the estimated working set of the running
-//! jobs stays under [`CookOptions::working_set`] (a job over it runs alone). Finished units
-//! wait for their turn to be written; while the bytes waiting exceed
-//! [`CookOptions::reorder_window`], only the jobs the next unwritten units wait on start.
+//! Scheduling: the jobs the next unwritten units wait on start first, then the rest largest
+//! first, while the estimated working set of the running jobs stays under
+//! [`CookOptions::working_set`] (a job over it runs alone). Finished units wait for their
+//! turn to be written. While the bytes waiting in memory exceed
+//! [`CookOptions::reorder_window`], jobs of a file archive without a cache write their
+//! units to `<archive>.units/` beside it, removed once written, and the jobs of an archive
+//! in memory start only when the next unwritten units wait on them.
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
@@ -72,7 +75,10 @@ pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
     };
     let threads = pool.current_num_threads();
     let mut run = Run::new(manifest, opts, &shared)?;
-    pool.in_place_scope(|scope| run.run(scope, threads))?;
+    if let Err(e) = pool.in_place_scope(|scope| run.run(scope, threads)) {
+        run.remove_scratch();
+        return Err(e);
+    }
     let mut cooked = run.finish()?;
     cooked.report.seconds = start.elapsed().as_secs_f64();
     if let Some(path) = &opts.report {
@@ -158,6 +164,8 @@ struct Done {
 enum From {
     Memory(Arc<Archive>),
     Cache(PathBuf),
+    /// A unit archive in the archive's scratch directory, removed once written and read.
+    Scratch(PathBuf),
     /// The archive the cook replaces.
     Old,
 }
@@ -261,6 +269,12 @@ struct Run<'m, 's> {
     first_by_name: HashMap<String, usize>,
     /// Per archive: the GDeflate codec of its payload blobs, if it asks for one.
     codecs: Vec<Option<Arc<dyn GDeflate>>>,
+    /// Per archive: where its units go once the reorder window is full, for a file archive
+    /// cooked without a cache.
+    scratch: Vec<Option<PathBuf>>,
+    /// Units holding each scratch archive (units of equal keys share one) that are not yet
+    /// written and read.
+    scratch_users: HashMap<PathBuf, usize>,
     old: Vec<Option<Old>>,
     /// Per archive: units in write order, the next one to write, and the writer (none
     /// while the archive matches the one it replaces).
@@ -299,6 +313,8 @@ impl<'m, 's> Run<'m, 's> {
             by_name: HashMap::new(),
             first_by_name: HashMap::new(),
             codecs: Vec::with_capacity(n),
+            scratch: Vec::with_capacity(n),
+            scratch_users: HashMap::new(),
             old: Vec::with_capacity(n),
             order: vec![Vec::new(); n],
             cursor: vec![0; n],
@@ -328,6 +344,14 @@ impl<'m, 's> Run<'m, 's> {
                 true => return Err(Error::NoGDeflate { archive: a }),
             };
             run.codecs.push(codec);
+            run.scratch.push(match (&spec.output, &shared.cache) {
+                (Target::File(path), None) => {
+                    let mut dir = path.as_os_str().to_owned();
+                    dir.push(".units");
+                    Some(PathBuf::from(dir))
+                }
+                _ => None,
+            });
             let mut previous = HashMap::new();
             let old = match &spec.output {
                 Target::File(path) if !opts.force => {
@@ -637,7 +661,7 @@ impl<'m, 's> Run<'m, 's> {
                 .as_ref()
                 .expect("linked from the old archive")
                 .archive),
-            From::Cache(path) => f(&Archive::open(path)?),
+            From::Cache(path) | From::Scratch(path) => f(&Archive::open(path)?),
         })
     }
 
@@ -669,6 +693,10 @@ impl<'m, 's> Run<'m, 's> {
         })?;
         let memory = match &from {
             From::Memory(arc) => arc.header().file_len,
+            From::Scratch(path) => {
+                *self.scratch_users.entry(path.clone()).or_default() += 1;
+                0
+            }
             _ => 0,
         };
         self.window += memory;
@@ -1058,17 +1086,22 @@ impl<'m, 's> Run<'m, 's> {
             {
                 return Ok(());
             }
-            let candidates: Vec<usize> = if self.window > self.opts.reorder_window {
-                (0..self.order.len())
-                    .filter_map(|a| {
-                        self.order[a]
-                            .get(self.cursor[a])
-                            .and_then(|&u| self.blocking(u))
-                    })
-                    .collect()
-            } else {
-                self.ready.iter().map(|&(_, u)| u).collect()
-            };
+            // The units the next unwritten ones wait on start first.
+            let mut candidates: Vec<usize> = (0..self.order.len())
+                .filter_map(|a| {
+                    self.order[a]
+                        .get(self.cursor[a])
+                        .and_then(|&u| self.blocking(u))
+                })
+                .collect();
+            // A full window holds back the jobs of archives without a scratch directory.
+            let full = self.window > self.opts.reorder_window;
+            candidates.extend(
+                self.ready
+                    .iter()
+                    .map(|&(_, u)| u)
+                    .filter(|&u| !full || self.scratch[self.units[u].archive].is_some()),
+            );
             for u in candidates {
                 let ws = self.units[u].working_set;
                 if running >= threads || (running > 0 && bytes + ws > self.opts.working_set) {
@@ -1166,8 +1199,12 @@ impl<'m, 's> Run<'m, 's> {
         }
         for t in users {
             self.map_users[t] -= 1;
-            if self.map_users[t] == 0 && matches!(self.units[t].state, State::Written(_)) {
-                self.units[t].state = State::Written(None);
+            if self.map_users[t] == 0
+                && matches!(self.units[t].state, State::Written(_))
+                && let State::Written(Some(from)) =
+                    std::mem::replace(&mut self.units[t].state, State::Written(None))
+            {
+                self.release(&from);
             }
         }
         Ok(out)
@@ -1202,11 +1239,15 @@ impl<'m, 's> Run<'m, 's> {
         let unit = &self.units[u];
         let (name, class, key) = (unit.name.clone(), unit.class, unit.key);
         let gdeflate = self.codecs[unit.archive].clone();
+        let spill = self.scratch[unit.archive]
+            .clone()
+            .filter(|_| self.window > self.opts.reorder_window);
         let (tx, shared) = (tx.clone(), self.shared);
         scope.spawn(move |_| {
             let r = catch_unwind(AssertUnwindSafe(|| {
                 let start = Instant::now();
-                let (from, detail) = cook_unit(shared, &name, class, key, gdeflate, work)?;
+                let (from, detail) =
+                    cook_unit(shared, &name, class, key, gdeflate, spill.as_deref(), work)?;
                 Ok((from, start.elapsed().as_secs_f64(), detail))
             }));
             let _ = tx.send(Msg::Unit(u, r));
@@ -1268,6 +1309,7 @@ impl<'m, 's> Run<'m, 's> {
             unit.class,
             unit.key,
             gdeflate,
+            None,
             work,
         )?;
         self.done(
@@ -1277,6 +1319,20 @@ impl<'m, 's> Run<'m, 's> {
             Outcome::Cooked,
             start.elapsed().as_secs_f64(),
         )
+    }
+
+    /// Lets go of a written unit's scratch archive, removed when no unit holds it.
+    fn release(&mut self, from: &From) {
+        let From::Scratch(path) = from else { return };
+        let users = self
+            .scratch_users
+            .get_mut(path)
+            .expect("held scratch archive");
+        *users -= 1;
+        if *users == 0 {
+            self.scratch_users.remove(path);
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     /// Writes every unit that is next in its archive's order and done.
@@ -1321,7 +1377,10 @@ impl<'m, 's> Run<'m, 's> {
                 match &d.from {
                     From::Memory(arc) => write(arc)?,
                     From::Old => write(old.expect("linked from the old archive"))?,
-                    From::Cache(path) => write(&Archive::open(path)?)?,
+                    From::Cache(path) | From::Scratch(path) => write(&Archive::open(path)?)?,
+                }
+                if self.map_users[u] == 0 {
+                    self.release(&d.from);
                 }
                 if let (Some(d), Some(first)) = (self.details.remove(&u), reports.first_mut()) {
                     if let (Some(m), Some(t)) = (first.mesh.as_mut(), d.tangents) {
@@ -1341,8 +1400,15 @@ impl<'m, 's> Run<'m, 's> {
     }
 
     /// Completes the archives, then saves cookstates and trims the cache.
+    fn remove_scratch(&self) {
+        for dir in self.scratch.iter().flatten() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
     fn finish(self) -> Result<Cooked> {
         let mut cooked = Cooked::default();
+        self.remove_scratch();
         let Self {
             manifest,
             opts,
@@ -2105,18 +2171,33 @@ fn texture_mips(
     Ok(out)
 }
 
-/// Cooks one unit into a one-unit archive: in the cache when there is one, else in memory.
-/// With a `gdeflate` codec, its payload blobs are GDeflate pages.
+/// Cooks one unit into a one-unit archive: in the cache when there is one, else in `spill`
+/// when given, else in memory. With a `gdeflate` codec, its payload blobs are GDeflate pages.
 fn cook_unit(
     shared: &Shared,
     name: &str,
     class: u16,
     key: Hash32,
     gdeflate: Option<Arc<dyn GDeflate>>,
+    spill: Option<&Path>,
     work: Work<'_>,
 ) -> Result<(From, Detail)> {
     let mut detail = Detail::default();
-    let path = shared.cache.as_ref().map(|c| c.path(key));
+    let scratch = match (&shared.cache, spill) {
+        (None, Some(dir)) => {
+            std::fs::create_dir_all(dir).map_err(|source| Error::Write {
+                path: dir.to_owned(),
+                source,
+            })?;
+            Some(dir.join(key::hex(key)))
+        }
+        _ => None,
+    };
+    let path = shared
+        .cache
+        .as_ref()
+        .map(|c| c.path(key))
+        .or(scratch.clone());
     let mut w = ArchiveWriter::create(path.clone().map_or(Target::Memory, Target::File))?;
     w.set_zstd_level(ZSTD_LEVEL);
     w.set_gdeflate(gdeflate);
@@ -2188,6 +2269,7 @@ fn cook_unit(
     }
     let from = match (w.finish()?, path) {
         (Some(bytes), _) => From::Memory(Arc::new(Archive::from_memory(bytes)?)),
+        (None, Some(path)) if scratch.is_some() => From::Scratch(path),
         (None, Some(path)) => From::Cache(path),
         (None, None) => unreachable!("a file target has a path"),
     };
