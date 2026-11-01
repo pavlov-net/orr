@@ -53,8 +53,9 @@ pub use shaders::types::{
 };
 pub use subsurface::{CapTailTable, SSS_STEPS, SubsurfaceDepth};
 pub use view::{
-    CameraJump, GuideKind, GuideSettings, LightingDebugView, LightingKernels, LightingView,
-    MAX_LOCAL_LIGHT_SHARE, MIN_PIXEL_FRACTION, ReferenceSettings, ThinLens, ViewLighting, ViewPass,
+    CameraJump, DofBackgroundPass, GuideKind, GuideSettings, LightingDebugView, LightingKernels,
+    LightingView, MAX_LOCAL_LIGHT_SHARE, MIN_PIXEL_FRACTION, ReferenceSettings, ThinLens,
+    ViewLighting, ViewPass,
 };
 pub use world_cache::{MAX_CAPACITY_LOG2, WorldCacheStats};
 

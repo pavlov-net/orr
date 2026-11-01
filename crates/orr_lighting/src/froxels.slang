@@ -95,7 +95,7 @@ public struct FroxelRoot
     public uint mode;                           // MEDIA_*
     public uint reference;                      // 1: media apply marches the camera segment
     public uint segment_steps;                  // steps of that march
-    public uint _pad0;
+    public StorageImageIndex dof_background;    // media apply's: the opaque dispatch's background layer, NONE for none
 }
 
 // The view-space ray through point `p` of the view's unjittered image, in render pixels,
@@ -650,9 +650,23 @@ float3 reference_fog<S : ISurface, M : IMedium>(FroxelRoot r, uint2 pixel, float
     return inscatter;
 }
 
+// The camera segment's in-scatter and transmittance over `t` m along the ray through
+// `pixel`.
+float3 camera_fog<S : ISurface, M : IMedium>(FroxelRoot r, uint2 pixel, float t, out float3 transmittance)
+{
+    ViewConstants* v = r.view;
+    if (r.reference == 0)
+        return froxel_fog(r, pixel, t, transmittance);
+    float2 uv = (float2(pixel) + 0.5) / float2(v.extent);
+    float3 dir = render_direction(v, view_direction(v, uv));
+    return reference_fog<S, M>(r, pixel, dir, t, transmittance) * v.exposure[v.exposure_slot].pre_exposure;
+}
+
 // Media apply for `pixel`: L = S + T x L over the camera segment to the pixel's surface, or
 // the dielectric or presence layer it shades, or the scene's `near_range`, whichever is
 // nearer; sky pixels take the whole range, and pixels whose eye lies in an interior none.
+// Marked pixels of the background layer take the same over the segment to their layer's
+// depth.
 public void media_apply<S : ISurface, M : IMedium>(FroxelRoot r, uint2 pixel)
 {
     ViewConstants* v = r.view;
@@ -668,14 +682,7 @@ public void media_apply<S : ISurface, M : IMedium>(FroxelRoot r, uint2 pixel)
         t = max(end, 0.0);
     t = min(t, r.scene.near_range);
     float3 transmittance;
-    float3 inscatter;
-    if (r.reference != 0)
-    {
-        float3 dir = render_direction(v, view_direction(v, uv));
-        inscatter = reference_fog<S, M>(r, pixel, dir, t, transmittance) * v.exposure[v.exposure_slot].pre_exposure;
-    }
-    else
-        inscatter = froxel_fog(r, pixel, t, transmittance);
+    float3 inscatter = camera_fog<S, M>(r, pixel, t, transmittance);
     float4 out = float4(apply_hdr_ceiling(inscatter + transmittance * l.rgb), l.a);
     if (r.mode == MEDIA_INSCATTER)
         out.rgb = apply_hdr_ceiling(inscatter);
@@ -685,4 +692,15 @@ public void media_apply<S : ISurface, M : IMedium>(FroxelRoot r, uint2 pixel)
         out.rgb = float3(luminance_rec2020(transmittance), froxel_slice(t, r.slices, r.scene.near_range) / float(r.slices), float((column.x + column.y) & 1));
     }
     radiance[pixel] = out;
+
+    if (r.mode != MEDIA_COMPOSE || r.dof_background.index == DOF_NONE)
+        return;
+    RWTexture2D<float4> layer = r.dof_background.get<RWTexture2D<float4>>();
+    float4 b = layer[pixel];
+    if (b.a < 0.0)
+        return;
+    float tb = b.a > 0.0 ? length(view_position(v, uv, b.a)) : positive_infinity();
+    tb = end < 0.0 ? 0.0 : min(tb, r.scene.near_range);
+    inscatter = camera_fog<S, M>(r, pixel, tb, transmittance);
+    layer[pixel] = float4(apply_hdr_ceiling(inscatter + transmittance * b.rgb), b.a);
 }

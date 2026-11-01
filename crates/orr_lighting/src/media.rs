@@ -330,7 +330,7 @@ impl MediaKernels {
             mode,
             reference: u32::from(lighting.reference.is_some()),
             segment_steps: settings.segment_steps,
-            _pad0: 0,
+            dof_background: StorageImageIndex::NONE,
         }
     }
 
@@ -437,6 +437,7 @@ impl MediaKernels {
         let extent = view.extent();
         let radiance = view.radiance_storage();
         let layers = view.layer_guides(pass.frame);
+        let dof_background = view.dof_background_store(pass.frame);
         let media = &mut view.media;
         if media.volumes.is_none() {
             return;
@@ -456,6 +457,7 @@ impl MediaKernels {
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         let root = FroxelRoot {
             layers,
+            dof_background,
             ..self.root(media, scene, pass, lighting, radiance, mode)
         };
         let root = media.apply_roots.write(slot, root);

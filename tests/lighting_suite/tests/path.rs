@@ -1,19 +1,20 @@
 //! The opaque path kernel on the bed's analytic scenes: the furnace, convergence, the three
 //! estimators against each other, pixel subsets, directional lights, ray counts, ray
-//! origins, linked surfaces at every hit, and the raygen against the compute entry.
+//! origins, the thin lens and the background layer behind foreground, linked surfaces at
+//! every hit, and the raygen against the compute entry.
 
 use lighting_suite::bed::{
-    Accumulated, Analytic, BUMPY_FLOOR, Bed, EXTENT, FLOOR, FURNACE_RADIANCE, Item, MIRROR, PANEL,
-    Paths, SKY, SMOOTH_FLOOR, SUN, Spec, TROUGH, WHITE_SPHERE,
+    Accumulated, Analytic, BUMPY_FLOOR, Bed, EXTENT, FLOOR, FURNACE_RADIANCE, Item, MIRROR, NEAR,
+    PANEL, Paths, SKY, SMOOTH_FLOOR, SUN, Spec, TROUGH, WHITE_SPHERE,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::{
-    assert_clean, device, linked, pipeline, readback, render, require, run, upload,
+    assert_clean, device, linked, pipeline, readback, render, require, run, texture, upload,
 };
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::{
-    DirectionalLight, DiscProfile, Light, LightId, LightingDebugView, PathEntry, ReferenceSettings,
-    SceneLightingSettings, ThinLens, ViewLighting,
+    DirectionalLight, DiscProfile, DofBackgroundPass, Light, LightId, LightingDebugView, PathEntry,
+    ReferenceSettings, SceneLightingSettings, ThinLens, ViewLighting,
 };
 use orr_math::{DVec3, Mat3, Vec3};
 use orr_scene::RendererDesc;
@@ -268,7 +269,7 @@ fn bright_and_faint_directional_lights_add_up() {
 
 #[test]
 fn rays_per_pixel_do_not_grow_with_directional_lights() {
-    let albedo = lighting_suite::texture(2, 2, &[[0.6, 0.6, 0.6, 1.0]; 4], "moon albedo");
+    let albedo = texture(2, 2, &[[0.6, 0.6, 0.6, 1.0]; 4], "moon albedo");
     let mut lights = Vec::new();
     for k in 0..2 {
         lights.push(Light::Directional(DirectionalLight {
@@ -547,6 +548,88 @@ fn a_thin_lens_with_no_aperture_matches_the_gbuffer() {
     );
     let e = traced.flip(&gbuffer, 1.0 / 500.0);
     assert!(e.mean < 0.05, "thin lens against the G-buffer: {e:?}");
+    assert_clean();
+}
+
+#[test]
+fn the_background_layer_sees_past_the_foreground_as_a_lens_does_without_it() {
+    let lens = ThinLens {
+        aperture_radius: 0.05,
+        focus_distance: 5.0,
+    };
+    let background = Analytic::SunAndGround.spec();
+    let mut without = Bed::with(background.clone());
+    without.set_pre_exposure(1.0 / 64.0);
+    let truth = render_paths(
+        &mut without,
+        &paths(ViewLighting {
+            reference: Some(ReferenceSettings { lens: Some(lens) }),
+            ..reference(2)
+        }),
+        256,
+        1,
+    );
+    drop(without);
+
+    // A small mirror 1.2 m in front of the eye hides part of the sphere and the ground; its
+    // shadow falls outside the view.
+    let forward = (background.target - background.eye).normalize();
+    let mut spec = background;
+    spec.copies.push(Item {
+        model: MIRROR,
+        linear: Mat3::from_diagonal(Vec3::splat(0.3)),
+        at: spec.eye + 1.2 * forward + Vec3::new(-0.25, 0.0, 0.0),
+    });
+    let mut with = Bed::with(spec);
+    with.set_pre_exposure(1.0 / 64.0);
+    let hidden = render_paths(&mut with, &paths(reference(2)), 16, 1);
+    assert!(
+        hidden.flip(&truth, 1.0 / 500.0).mean > 0.06,
+        "the foreground hides too little of the background"
+    );
+
+    // Pixels left of `MARKED` start their background rays 2 m along the view axis, past the
+    // mirror and before the ground.
+    const MARKED: u32 = 96;
+    let start = NEAR / 2.0;
+    let mask: Vec<[f32; 4]> = (0..EXTENT[0] * EXTENT[1])
+        .map(|i| {
+            [
+                if i % EXTENT[0] < MARKED { start } else { 0.0 },
+                0.0,
+                0.0,
+                0.0,
+            ]
+        })
+        .collect();
+    let mask = texture(EXTENT[0], EXTENT[1], &mask, "dof mask");
+    let focus = upload(&[lens.focus_distance], "focus distance");
+    let mut layer_paths = paths(reference(2));
+    layer_paths.dof_background = Some(DofBackgroundPass {
+        mask: mask.index,
+        aperture_radius: lens.aperture_radius,
+        focus_distance: focus.gpu(),
+    });
+    with.accumulate_background_layer(true);
+    let mut layer = render_paths(&mut with, &layer_paths, 256, 1);
+
+    for (i, p) in layer.mean.iter_mut().enumerate() {
+        if i as u32 % EXTENT[0] < MARKED {
+            assert!(
+                (0.0..=start * 1.001).contains(&p[3]),
+                "pixel {i}: layer depth {} not past the mask's {start}",
+                p[3]
+            );
+        } else {
+            assert_eq!(*p, [0.0, 0.0, 0.0, -1.0], "unmarked pixel {i}");
+            *p = truth.mean[i];
+        }
+    }
+    let e = layer.flip(&truth, 1.0 / 500.0);
+    assert!(
+        e.mean < 0.06,
+        "background layer against the lens reference without the foreground: {e:?}"
+    );
     assert_clean();
 }
 
