@@ -4,7 +4,7 @@
 //! | --- | --- |
 //! | `baseColorFactor` rgb, `metallicFactor`, `roughnessFactor` | `base_color`, `metalness`, `specular_roughness` |
 //! | `KHR_materials_ior` `ior` | `specular_ior` |
-//! | `emissiveFactor`, `KHR_materials_emissive_strength` (1 without it) | `emission_color`, `emission_luminance` read as nits |
+//! | `emissiveFactor`, `emissiveStrength` (1 when absent; `KHR_materials_emissive_strength` overrides it) | `emission_color`, `emission_luminance` read as nits |
 //! | `alphaMode` `MASK` with `alphaCutoff`, `BLEND`; base alpha | `alpha_mode`, `alpha_cutoff`; `geometry_opacity` under `MASK` and `BLEND` |
 //! | `doubleSided` | `double_sided` |
 //! | `KHR_materials_specular` `specularFactor`, `specularColorFactor`, `specularTexture` (A) | `specular_weight`, `specular_color`, the specular weight texture |
@@ -45,9 +45,14 @@ fn rgb(v: &Value, k: &str, d: [f32; 3]) -> [f32; 3] {
         })
 }
 
+/// The material's JSON object; `None` for the default material.
+fn raw<'a>(json: &'a Value, m: &gltf::Material<'_>) -> Option<&'a Value> {
+    json["materials"].get(m.index()?)
+}
+
 /// The material's extension objects, by name.
 fn extension<'a>(json: &'a Value, m: &gltf::Material<'_>, name: &str) -> Option<&'a Value> {
-    json["materials"][m.index()?]["extensions"].get(name)
+    raw(json, m)?["extensions"].get(name)
 }
 
 pub(crate) fn material(json: &Value, m: &gltf::Material<'_>) -> Material {
@@ -66,7 +71,9 @@ pub(crate) fn material(json: &Value, m: &gltf::Material<'_>) -> Material {
         specular_roughness: pbr.roughness_factor(),
         emission_color: emissive,
         emission_luminance: if emissive.iter().any(|&c| c > 0.0) {
-            ext("KHR_materials_emissive_strength").map_or(1.0, |e| num(e, "emissiveStrength", 1.0))
+            ext("KHR_materials_emissive_strength")
+                .or(raw(json, m))
+                .map_or(1.0, |e| num(e, "emissiveStrength", 1.0))
         } else {
             0.0
         },

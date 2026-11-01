@@ -284,14 +284,14 @@ fn per_material(g: &mut Glb, materials: usize) -> String {
 fn material_extensions_map_to_openpbr() {
     let d = dir("gltf-materials");
     let mut g = Glb::default();
-    let prims = per_material(&mut g, 4);
+    let prims = per_material(&mut g, 6);
     let path = d.join("materials.glb");
     g.write(
         &path,
         &format!(
             r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
 "meshes":[{{"primitives":[{prims}]}}],
-"extensionsUsed":["KHR_materials_clearcoat","KHR_materials_sheen","KHR_materials_specular","KHR_materials_ior","KHR_materials_anisotropy","KHR_materials_iridescence","KHR_materials_transmission","KHR_materials_volume","KHR_materials_dispersion","KHR_materials_diffuse_transmission"],
+"extensionsUsed":["KHR_materials_clearcoat","KHR_materials_sheen","KHR_materials_specular","KHR_materials_ior","KHR_materials_anisotropy","KHR_materials_iridescence","KHR_materials_transmission","KHR_materials_volume","KHR_materials_dispersion","KHR_materials_diffuse_transmission","KHR_materials_emissive_strength"],
 "extensionsRequired":["KHR_materials_clearcoat"],
 "materials":[
  {{"name":"lacquer","extensions":{{
@@ -307,7 +307,10 @@ fn material_extensions_map_to_openpbr() {
    "KHR_materials_dispersion":{{"dispersion":0.5}}}}}},
  {{"name":"film","extensions":{{"KHR_materials_transmission":{{"transmissionFactor":1.0}}}}}},
  {{"name":"skin leaf","doubleSided":true,"extensions":{{
-   "KHR_materials_diffuse_transmission":{{"diffuseTransmissionFactor":0.4,"diffuseTransmissionColorFactor":[0.3,0.8,0.2]}}}}}}]"#
+   "KHR_materials_diffuse_transmission":{{"diffuseTransmissionFactor":0.4,"diffuseTransmissionColorFactor":[0.3,0.8,0.2]}}}}}},
+ {{"name":"lamp","emissiveFactor":[1.0,1.0,1.0],"emissiveStrength":4.0}},
+ {{"name":"both","emissiveFactor":[1.0,1.0,1.0],"emissiveStrength":4.0,"extensions":{{
+   "KHR_materials_emissive_strength":{{"emissiveStrength":2.0}}}}}}]"#
         ),
     );
     let settings = GltfSettings {
@@ -398,6 +401,8 @@ fn material_extensions_map_to_openpbr() {
         (leaf.surface, leaf.subsurface_radius, leaf.thin_walled),
         (3, 0.004, 0)
     );
+    assert_eq!(m(4).emission_luminance, 4.0);
+    assert_eq!(m(5).emission_luminance, 2.0);
 
     // The patched leaf scatters below the surface of an open triangle: the cook warns.
     let warnings: Vec<&String> = report
