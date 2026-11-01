@@ -97,8 +97,17 @@ pub(crate) struct TexRef {
     pub rg_channel: Option<u8>,
     pub uv_set: u8,
     pub wrap: [Wrap; 2],
+    /// The uv transform the texture is sampled with (`Material::uv_transforms` form).
+    pub uv: [f32; 6],
     /// Whether color texels are sRGB-encoded; `None` takes the file's own encoding.
     pub srgb: Option<bool>,
+}
+
+impl TexRef {
+    /// Whether both read their textures at the same uvs.
+    fn samples_like(&self, o: &TexRef) -> bool {
+        self.uv_set == o.uv_set && self.uv == o.uv
+    }
 }
 
 /// The images one material reads, per input.
@@ -361,7 +370,7 @@ struct Made {
     channels: [u8; 4],
 }
 
-/// Binds slot `s` to packed channel `channel` of `t`.
+/// Binds slot `s` to packed channel `channel` of `t`, sampled as `r` is.
 fn bind(m: &mut Material, s: usize, t: Made, channel: usize, r: &TexRef) {
     m.textures[s] = TextureBinding {
         texture: t.id,
@@ -369,6 +378,7 @@ fn bind(m: &mut Material, s: usize, t: Made, channel: usize, r: &TexRef) {
         uv_set: r.uv_set,
         _pad: [0; 2],
     };
+    m.uv_transforms[s] = r.uv;
 }
 
 /// How a planned texture keeps its source image's blocks.
@@ -596,7 +606,7 @@ impl<'a> Packer<'a> {
         if metal_varies {
             let r = metal.expect("varying metalness has an image");
             let entry = (slot::METALNESS, metal_channel(m, &r));
-            let alike = |a: &TexRef| a.uv_set == r.uv_set && a.wrap == r.wrap;
+            let alike = |a: &TexRef| a.samples_like(&r) && a.wrap == r.wrap;
             match packs.first_mut() {
                 Some((channels, refs)) if refs.first().is_none_or(alike) => {
                     channels.push(entry);
@@ -615,8 +625,9 @@ impl<'a> Packer<'a> {
             };
             let mut channels: Vec<Channel> = rm.iter().map(|c| c.1).collect();
             channels.resize(4, Channel::Constant(0.0));
+            // Toksvig pairs roughness and normal texels, so both must sample alike.
             let toksvig = match (&normal_packed, rm[0].0 == slot::ROUGHNESS) {
-                (Some((r, s)), true) => Some((0, *r, *s)),
+                (Some((r, s)), true) if refs[0].samples_like(r) => Some((0, *r, *s)),
                 _ => None,
             };
             let id = self.make(

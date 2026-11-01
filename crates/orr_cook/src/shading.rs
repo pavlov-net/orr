@@ -125,6 +125,7 @@ impl Tex {
     fn tex_ref(&self) -> TexRef {
         TexRef {
             rg_channel: None,
+            uv: [0.0; 6],
             image: self.image,
             channel: self.channel() as u8,
             uv_set: self.uv_set,

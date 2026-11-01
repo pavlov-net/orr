@@ -156,17 +156,24 @@ pub(crate) fn cluster_omm(
     };
     let alpha = alpha?;
     let corners: Vec<u32> = tris.iter().flatten().map(|&v| u32::from(v)).collect();
+    // The rasterizer reads the texture at the uvs the material samples it at.
+    let mapped: Vec<[f32; 2]> = uvs
+        .iter()
+        .map(|&p| mip0.mapped(p).map(|x| x as f32))
+        .collect();
     let mut level = s.max_level;
     loop {
-        let m = meshopt::opacity_map_measure(&corners, uvs, alpha.w, alpha.h, level, s.target_edge);
+        let m =
+            meshopt::opacity_map_measure(&corners, &mapped, alpha.w, alpha.h, level, s.target_edge);
         let mut levels = m.levels;
         let (mut offsets, size) = meshopt::opacity_map_layout(&levels, STATES);
         let mut data = vec![0; size];
         for (i, &source) in m.sources.iter().enumerate() {
             let uv = tris[source as usize].map(|v| uvs[usize::from(v)]);
+            let at = tris[source as usize].map(|v| mapped[usize::from(v)]);
             let len = meshopt::opacity_map_entry_size(levels[i], STATES);
             let entry = &mut data[offsets[i] as usize..][..len];
-            meshopt::opacity_map_rasterize(entry, levels[i], STATES, &uv, &alpha.texture());
+            meshopt::opacity_map_rasterize(entry, levels[i], STATES, &at, &alpha.texture());
             known_states_hold(entry, levels[i], uv, mip0, cutoff);
         }
         let mut indices = m.indices;

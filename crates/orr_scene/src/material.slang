@@ -121,6 +121,7 @@ public struct MaterialGpu
     public float transmission_dispersion_abbe_number;
     public uint64_t data;                   // consumer data for the linked surface; 0 = the scene's
     public TextureStreamGpu** texture_streams; // by heap index, null where it does not stream; orr sets it
+    public float uv_transforms[72];         // per slot a-1 b c d e-1 f: u' = a u + b v + c, v' = d u + e v + f; 0 = identity
 }
 
 // Whether taps report the level they want to the texture feedback. A kernel whose taps drive
@@ -270,16 +271,47 @@ uint material_channel(MaterialGpu* m, uint slot)
     return bits & 15;
 }
 
-// The texture footprint function: `slot`'s texture filtered over footprint `f`
-// (`texture_footprint`), its channels from the slot's first one on in xyzw. Color slots
-// come back in their texture's primaries; `material_color` multiplies them by a factor. An
-// unbound slot reads `fallback`.
+// Footprint `f` mapped by `slot`'s uv transform.
+public UvFootprint material_footprint(MaterialGpu* m, uint slot, UvFootprint f)
+{
+    uint k = 6 * slot;
+    float2 x = float2(1.0 + m.uv_transforms[k], m.uv_transforms[k + 1]);
+    float2 y = float2(m.uv_transforms[k + 3], 1.0 + m.uv_transforms[k + 4]);
+    UvFootprint g = f;
+    g.uv = float2(dot(x, f.uv) + m.uv_transforms[k + 2], dot(y, f.uv) + m.uv_transforms[k + 5]);
+    g.dx = float2(dot(x, f.dx), dot(y, f.dx));
+    g.dy = float2(dot(x, f.dy), dot(y, f.dy));
+    return g;
+}
+
+// The tangent-space normal `v` read from `slot`'s texture, turned into the mesh uv's frame:
+// the texture's u and v axes are the columns of the inverse of the slot's uv transform.
+public float3 material_normal_frame(MaterialGpu* m, uint slot, float3 v)
+{
+    uint k = 6 * slot;
+    float a = 1.0 + m.uv_transforms[k];
+    float b = m.uv_transforms[k + 1];
+    float d = m.uv_transforms[k + 3];
+    float e = 1.0 + m.uv_transforms[k + 4];
+    float det = a * e - b * d;
+    if (det == 0.0)
+        return v;
+    float s = det < 0.0 ? -1.0 : 1.0;
+    float2 u_axis = normalize(float2(e, -d)) * s;
+    float2 v_axis = normalize(float2(-b, a)) * s;
+    return float3(u_axis * v.x + v_axis * v.y, v.z);
+}
+
+// The texture footprint function: `slot`'s texture filtered over footprint `f` mapped by
+// the slot's uv transform (`texture_footprint`), its channels from the slot's first one on
+// in xyzw. Color slots come back in their texture's primaries; `material_color` multiplies
+// them by a factor. An unbound slot reads `fallback`.
 public float4 material_texture(MaterialGpu* m, uint slot, UvFootprint f, float4 fallback)
 {
     TextureIndex t = m.textures[slot];
     if (t.index == TEXTURE_NONE)
         return fallback;
-    float4 v = texture_footprint(t, m.sampler, f, m.texture_streams);
+    float4 v = texture_footprint(t, m.sampler, material_footprint(m, slot, f), m.texture_streams);
     uint c = material_channel(m, slot);
     return c == 0 ? v : c == 1 ? float4(v.yzw, 1.0) : c == 2 ? float4(v.zw, 0.0, 1.0) : float4(v.w, 0.0, 0.0, 1.0);
 }

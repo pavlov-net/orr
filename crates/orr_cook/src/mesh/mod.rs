@@ -347,6 +347,7 @@ pub(crate) enum NormalSpec {
         unit: String,
         key: Hash32,
         wrap: [Wrap; 2],
+        uv: [f32; 6],
     },
     /// More than a normal map the cook can read: anisotropy, a linked surface, or a normal
     /// map on another uv set or not cooked here.
@@ -365,6 +366,7 @@ pub(crate) enum OpacitySpec {
         key: Hash32,
         cutoff: f32,
         wrap: [Wrap; 2],
+        uv: [f32; 6],
     },
     Unknown,
 }
@@ -375,8 +377,8 @@ pub(crate) struct DisplacementSpec {
     pub offset: f32,
     pub min: f32,
     pub max: f32,
-    /// The cooked displacement texture's unit, key and edge modes.
-    pub texture: Option<(String, Hash32, [Wrap; 2])>,
+    /// The cooked displacement texture's unit, key, edge modes and uv transform.
+    pub texture: Option<(String, Hash32, [Wrap; 2], [f32; 6])>,
 }
 
 impl MapSpec {
@@ -401,18 +403,24 @@ impl MapSpec {
     fn fingerprint(&self) -> String {
         let opacity = match &self.opacity {
             OpacitySpec::Texture {
-                key, cutoff, wrap, ..
-            } => format!("texture {key:?} {cutoff:?} {wrap:?}"),
+                key,
+                cutoff,
+                wrap,
+                uv,
+                ..
+            } => format!("texture {key:?} {cutoff:?} {wrap:?} {uv:?}"),
             o => format!("{o:?}"),
         };
         let displacement = self.displacement.as_ref().map(|d| {
             (
                 [d.scale, d.offset, d.min, d.max],
-                d.texture.as_ref().map(|t| (t.1, t.2)),
+                d.texture.as_ref().map(|t| (t.1, t.2, t.3)),
             )
         });
         let normal = match &self.normal {
-            NormalSpec::Texture { key, wrap, .. } => format!("texture {key:?} {wrap:?}"),
+            NormalSpec::Texture { key, wrap, uv, .. } => {
+                format!("texture {key:?} {wrap:?} {uv:?}")
+            }
             n => format!("{n:?}"),
         };
         format!("{opacity} {displacement:?} {normal}")

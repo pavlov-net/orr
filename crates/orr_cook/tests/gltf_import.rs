@@ -592,9 +592,11 @@ fn selected_models_join_on_one_grid() {
     }
 }
 
-#[test]
-fn opaque_triangles_never_cover_cut_out_texels() {
-    let d = dir("gltf-alpha");
+/// Opaque triangles of a cut-out texture, sampled through `transform` (a
+/// `KHR_texture_transform` object) when given, never cover cut-out texels; returns the
+/// material's opacity uv transform.
+fn cut_out(name: &str, transform: Option<&str>) -> [f32; 6] {
+    let d = dir(name);
     let (pos, uv, idx) = grid(32, |_, _| 0.0);
     // Opaque disc with a ragged edge, cut out elsewhere.
     let tex = png(128, 128, |x, y| {
@@ -609,16 +611,29 @@ fn opaque_triangles_never_cover_cut_out_texels() {
     let ia = g.indices(&idx);
     let img = g.image(&tex);
     let path = d.join("alpha.glb");
+    let ext = transform.map_or(String::new(), |t| {
+        format!(r#","extensions":{{"KHR_texture_transform":{t}}}"#)
+    });
     g.write(
         &path,
         &format!(
             r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+"extensionsUsed":["KHR_texture_transform"],"extensionsRequired":["KHR_texture_transform"],
 "meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"TEXCOORD_0":{ta}}},"indices":{ia},"material":0}}]}}],
-"materials":[{{"alphaMode":"MASK","alphaCutoff":0.5,"pbrMetallicRoughness":{{"baseColorTexture":{{"index":0}}}}}}],
+"materials":[{{"alphaMode":"MASK","alphaCutoff":0.5,"pbrMetallicRoughness":{{"baseColorTexture":{{"index":0{ext}}}}}}}],
 "textures":[{{"source":0}}],"images":[{{"bufferView":{img},"mimeType":"image/png"}}]"#
         ),
     );
     let (a, _) = cook(&path, GltfSettings::default()).unwrap();
+    let e = a.find(AssetId::from_name("g/material/0")).unwrap();
+    let material = Material::from_bytes(&read(&a, &a.blobs(e)[0])).unwrap();
+    let t = material.uv_transforms[slot::OPACITY];
+    let mapped = |p: [f32; 2]| {
+        [
+            (1.0 + t[0]) * p[0] + t[1] * p[1] + t[2],
+            t[3] * p[0] + (1.0 + t[4]) * p[1] + t[5],
+        ]
+    };
     let opacity = texture_mip(&a, "g/texture/0/opacity", 0);
     let m = mesh_of(&a, "g/mesh");
     let (mut opaque, mut tested) = (0, 0);
@@ -632,6 +647,7 @@ fn opaque_triangles_never_cover_cut_out_texels() {
                         let (b0, b1) = (i as f32 / 8.0, j as f32 / 8.0);
                         let p = [0, 1]
                             .map(|k| uv[0][k] * (1.0 - b0 - b1) + uv[1][k] * b0 + uv[2][k] * b1);
+                        let p = mapped(p);
                         assert!(opacity.bilinear(p) >= 0.5, "opaque triangle samples {p:?}");
                     }
                 }
@@ -644,6 +660,25 @@ fn opaque_triangles_never_cover_cut_out_texels() {
         opaque > 100 && tested > 100,
         "{opaque} opaque, {tested} alpha-tested"
     );
+    t
+}
+
+#[test]
+fn opaque_triangles_never_cover_cut_out_texels() {
+    assert_eq!(cut_out("gltf-alpha", None), [0.0; 6]);
+}
+
+/// A texture transform (glTF's `T R S`, uvs turned counter-clockwise) reaches the material
+/// and the cook's opacity reads.
+#[test]
+fn texture_transforms_map_the_uvs_the_cook_reads() {
+    let t = r#"{"offset":[0.2,-0.1],"rotation":0.4,"scale":[0.8,1.2]}"#;
+    let got = cut_out("gltf-alpha-transform", Some(t));
+    let (s, c) = 0.4f32.sin_cos();
+    let want = [c * 0.8 - 1.0, -s * 1.2, 0.2, s * 0.8, c * 1.2 - 1.0, -0.1];
+    for (g, w) in got.iter().zip(want) {
+        assert!((g - w).abs() < 1e-6, "{got:?} against {want:?}");
+    }
 }
 
 /// Micromap index of barycentrics (u, v) at `level`, for the point `c0 w + c1 u + c2 v`

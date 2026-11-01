@@ -4,6 +4,7 @@
 //! | --- | --- |
 //! | `baseColorFactor` rgb, `metallicFactor`, `roughnessFactor` | `base_color`, `metalness`, `specular_roughness` |
 //! | `metallicRoughnessTexture` G and B, or R and G of an image holding only red and green | the roughness and metalness textures |
+//! | `KHR_texture_transform` on any textureInfo (offset, rotation, scale, texCoord) | the slot's `uv_transforms` entry and uv set |
 //! | `KHR_materials_ior` `ior` | `specular_ior` |
 //! | `emissiveFactor`, `emissiveStrength` (1 when absent; `KHR_materials_emissive_strength` overrides it) | `emission_color`, `emission_luminance` read as nits |
 //! | `alphaMode` `MASK` with `alphaCutoff`, `BLEND`; base alpha | `alpha_mode`, `alpha_cutoff`; `geometry_opacity` under `MASK` and `BLEND` |
@@ -159,12 +160,38 @@ pub(crate) fn material(json: &Value, m: &gltf::Material<'_>) -> Material {
     out
 }
 
+/// The `KHR_texture_transform` of a textureInfo object in `Material::uv_transforms` form
+/// (`T R S`, the rotation turning the uvs counter-clockwise), and the uv set it reads: the
+/// extension's `texCoord`, else the object's.
+fn uv_transform(info: &Value) -> ([f32; 6], u32) {
+    let coord = |v: &Value| v["texCoord"].as_u64().map(|c| c as u32);
+    let Some(t) = info["extensions"].get("KHR_texture_transform") else {
+        return ([0.0; 6], coord(info).unwrap_or(0));
+    };
+    let pair = |k: &str, d: [f32; 2]| {
+        t.get(k)
+            .and_then(Value::as_array)
+            .filter(|a| a.len() == 2)
+            .map_or(d, |a| {
+                std::array::from_fn(|i| a[i].as_f64().unwrap_or(0.0) as f32)
+            })
+    };
+    let [ox, oy] = pair("offset", [0.0, 0.0]);
+    let [sx, sy] = pair("scale", [1.0, 1.0]);
+    let (sin, cos) = num(t, "rotation", 0.0).sin_cos();
+    let uv = [cos * sx - 1.0, -sin * sy, ox, sin * sx, cos * sy - 1.0, oy];
+    (uv, coord(t).or(coord(info)).unwrap_or(0))
+}
+
 pub(crate) fn textures(
     doc: &gltf::Document,
     json: &Value,
     m: &gltf::Material<'_>,
 ) -> Result<MaterialTextures, String> {
-    let tex = |t: gltf::Texture<'_>, coord: u32, channel: u8| -> Result<TexRef, String> {
+    let own = m.index().map_or(&Value::Null, |i| &json["materials"][i]);
+    // A texture and the textureInfo object that binds it.
+    let tex = |t: gltf::Texture<'_>, info: &Value, channel: u8| -> Result<TexRef, String> {
+        let (uv, coord) = uv_transform(info);
         if coord > 1 {
             return Err(format!("texCoord {coord}: only uv sets 0 and 1 exist"));
         }
@@ -181,6 +208,7 @@ pub(crate) fn textures(
             wrap: [wrap(s.wrap_s()), wrap(s.wrap_t())],
             srgb: None,
             rg_channel: None,
+            uv,
         })
     };
     // A textureInfo object of an extension.
@@ -195,19 +223,21 @@ pub(crate) fn textures(
             .textures()
             .nth(index as usize)
             .ok_or(format!("{ext} {key}: texture {index} does not exist"))?;
-        tex(t, i["texCoord"].as_u64().unwrap_or(0) as u32, channel).map(Some)
+        tex(t, i, channel).map(Some)
     };
     let pbr = m.pbr_metallic_roughness();
+    let pbr_json = &own["pbrMetallicRoughness"];
     let base_color = pbr
         .base_color_texture()
-        .map(|i| tex(i.texture(), i.tex_coord(), 0))
+        .map(|i| tex(i.texture(), &pbr_json["baseColorTexture"], 0))
         .transpose()?;
     // An image of red and green alone has no blue: it holds roughness and metalness in
     // red and green.
     let metal_rough = |channel: u8| {
         pbr.metallic_roughness_texture()
             .map(|i| {
-                tex(i.texture(), i.tex_coord(), channel).map(|r| TexRef {
+                let info = &pbr_json["metallicRoughnessTexture"];
+                tex(i.texture(), info, channel).map(|r| TexRef {
                     rg_channel: Some(channel - 1),
                     ..r
                 })
@@ -221,15 +251,21 @@ pub(crate) fn textures(
         metalness: metal_rough(2)?,
         normal: m
             .normal_texture()
-            .map(|i| Ok::<_, String>((tex(i.texture(), i.tex_coord(), 0)?, [i.scale(); 2])))
+            .map(|i| {
+                let r = tex(i.texture(), &own["normalTexture"], 0)?;
+                Ok::<_, String>((r, [i.scale(); 2]))
+            })
             .transpose()?,
         occlusion: m
             .occlusion_texture()
-            .map(|i| Ok::<_, String>((tex(i.texture(), i.tex_coord(), 0)?, i.strength())))
+            .map(|i| {
+                let r = tex(i.texture(), &own["occlusionTexture"], 0)?;
+                Ok::<_, String>((r, i.strength()))
+            })
             .transpose()?,
         emissive: m
             .emissive_texture()
-            .map(|i| tex(i.texture(), i.tex_coord(), 0))
+            .map(|i| tex(i.texture(), &own["emissiveTexture"], 0))
             .transpose()?,
         specular: info("KHR_materials_specular", "specularTexture", 3)?,
         coat: info("KHR_materials_clearcoat", "clearcoatTexture", 0)?,

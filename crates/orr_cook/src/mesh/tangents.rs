@@ -146,7 +146,8 @@ impl Triangle {
     fn angle(&self, map: &[Raster; 2], w: Vec3) -> f32 {
         let at = |c: [Vec3; 3]| w.x * c[0] + w.y * c[1] + w.z * c[2];
         let uv = [0, 1].map(|a| w.x * self.uv[0][a] + w.y * self.uv[1][a] + w.z * self.uv[2][a]);
-        let v = Vec3::from(normal::decode([map[0].sample(uv), map[1].sample(uv)]));
+        let v = normal::decode([map[0].sample(uv), map[1].sample(uv)]);
+        let v = Vec3::from(map[0].normal_frame(v));
         let n = at(self.normals).normalize_or(self.geometric);
 
         let stored = shading_normal(n, at(self.tangents).normalize_or(Vec3::X), self.sign, v);
@@ -187,7 +188,7 @@ fn orthonormal_basis(n: Vec3) -> (Vec3, Vec3) {
 /// triangle covering no center samples its centroid.
 fn texel_centers(map: &Raster, uv: [[f32; 2]; 3], mut f: impl FnMut(Vec3, f64)) {
     let size = [f64::from(map.w), f64::from(map.h)];
-    let p = uv.map(|t| [f64::from(t[0]) * size[0], f64::from(t[1]) * size[1]]);
+    let p = uv.map(|t| map.texel_pos(t));
     let cross = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
         (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
     };

@@ -99,7 +99,7 @@ public float3 material_normal(SurfaceInput i, MaterialGpu* m)
     float3 n = i.normal;
     if (!material_bound(m, TEXTURE_NORMAL))
         return n;
-    float3 v = normal_decode(material_texture(m, TEXTURE_NORMAL, i.uv, float4(0.5, 0.5, 1.0, 1.0)).xy);
+    float3 v = material_normal_frame(m, TEXTURE_NORMAL, normal_decode(material_texture(m, TEXTURE_NORMAL, i.uv, float4(0.5, 0.5, 1.0, 1.0)).xy));
     float3 t = safe_normalize(i.tangent.xyz - n * dot(n, i.tangent.xyz), float3(1, 0, 0));
     float3 b = cross(n, t) * i.tangent.w;
     return safe_normalize(t * v.x + b * v.y + n * v.z, n);
@@ -184,7 +184,7 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
         float3 b = -cross(n, t);
         float3 v = float3(0.0, 0.0, 1.0);
         if (material_bound(m, TEXTURE_NORMAL))
-            v = normal_decode(material_texture(m, TEXTURE_NORMAL, f, float4(0.5, 0.5, 1.0, 1.0)).xy);
+            v = material_normal_frame(m, TEXTURE_NORMAL, normal_decode(material_texture(m, TEXTURE_NORMAL, f, float4(0.5, 0.5, 1.0, 1.0)).xy));
         decal_over(layer.normal, layer.normal_cover, safe_normalize(t * v.x + b * v.y + n * v.z, n), share);
     }
 }
