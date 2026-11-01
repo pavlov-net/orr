@@ -1076,10 +1076,25 @@ impl TextureJob {
             .blocks
             .as_ref()
             .ok_or("the image no longer holds blocks")?;
-        let (size, mut mips) = if pass.all_mips {
-            super::kept_mips(b.levels[0].clone(), b.w, b.h, self.max_size)
+        // A BC5 block is the red BC4 block, then the green one.
+        let half = |level: &[u8]| -> Vec<u8> {
+            match pass.half {
+                Some(h) => {
+                    let h = usize::from(h) * 8;
+                    level
+                        .chunks_exact(16)
+                        .flat_map(|b| &b[h..h + 8])
+                        .copied()
+                        .collect()
+                }
+                None => level.to_vec(),
+            }
+        };
+        let (size, mips) = if pass.all_mips {
+            let (size, kept) = super::kept_mips(b.levels[0].clone(), b.w, b.h, self.max_size);
+            (size, kept.iter().map(|m| half(m)).collect())
         } else {
-            let first = b.levels[0][0].clone();
+            let first = half(&b.levels[0][0]);
             let (img, plan) = self
                 .prepare(images, Some((pass.image, src)))
                 .map_err(|e| e.to_string())?;
@@ -1090,17 +1105,6 @@ impl TextureJob {
             mips.insert(0, first);
             ([chain[0].w, chain[0].h], mips)
         };
-        if let Some(h) = pass.half {
-            // A BC5 block is the red BC4 block, then the green one.
-            let h = usize::from(h) * 8;
-            for m in &mut mips {
-                *m = m
-                    .chunks_exact(16)
-                    .flat_map(|b| &b[h..h + 8])
-                    .copied()
-                    .collect();
-            }
-        }
         Ok(super::layout(
             self.pack.encoding.vk_format(),
             size,
