@@ -950,7 +950,8 @@ fn meshes_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
     b.record(&mut views)?;
     let data = instancing_data(b, &src, graph)?;
     // Per mesh, its placements per set of morph weights, the mesh's own first.
-    let mut by_mesh: BTreeMap<usize, Vec<(Vec<f32>, Vec<Mat4>)>> = BTreeMap::new();
+    type Placings = Vec<(Vec<f32>, Vec<Mat4>)>;
+    let mut by_mesh: BTreeMap<usize, Placings> = BTreeMap::new();
     for &n in &shown {
         let node = doc.nodes().nth(n).expect("node index");
         let Some(mesh) = node.mesh() else { continue };
