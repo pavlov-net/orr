@@ -16,6 +16,7 @@ orr_shaders = { workspace = true, features = ["openpbr"] }
 orr_gpu = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
 shader_math.workspace = true
+orr_math.workspace = true
 
 [build-dependencies]
 orr_shaders = { workspace = true, features = ["build"] }

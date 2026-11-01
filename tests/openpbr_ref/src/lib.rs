@@ -10,6 +10,8 @@
 //! approximation joins the harness by implementing [`Bsdf`], and [`fit`] fits its
 //! coefficients to the reference when it also implements [`fit::Fit`].
 //!
+//! [`walk`] is a CPU reference of the real-time subsurface walk on analytic shapes.
+//!
 //! Directions are unit vectors in the shading frame: the normal is +z and the tangent +x.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,6 +23,7 @@ pub mod materials;
 pub mod report;
 #[cfg(feature = "gpu")]
 mod slang_gpu;
+pub mod walk;
 
 #[cfg(feature = "gpu")]
 pub use slang_gpu::{Luts, SlangGpu, log_to_stderr};

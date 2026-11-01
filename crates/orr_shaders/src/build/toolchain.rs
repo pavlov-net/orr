@@ -22,6 +22,10 @@ pub const SLANGC_OPTIONS: &[&str] = &[
     "-fvk-use-entrypoint-name",
     "-warnings-as-errors",
     "all",
+    // Renumbers ids densely: large kernels otherwise leave too few spare ids for the
+    // optimizer the validation layer runs when it applies specialization constants.
+    "-Xspirv-opt",
+    "--compact-ids",
 ];
 
 /// Finds the release, loads its Slang library and checks that it is exactly

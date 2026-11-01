@@ -21,6 +21,7 @@ use crate::shaders::light_sampling::local;
 use crate::shaders::path::opaque;
 use crate::shaders::types::{GuideRoot, LayerGuide, LocalLights, PathRoot};
 use crate::shaders::world_cache::update;
+use crate::subsurface::{CapTailTable, SSS_STEPS, SubsurfaceDepth};
 use crate::{BsdfTables, Error, KernelSet, PathEntry, SceneLighting, module, pipeline};
 
 /// Lighting settings of one view, passed with every render of it.
@@ -41,6 +42,11 @@ pub struct ViewLighting {
     pub max_bounces: u32,
     /// Dielectric and presence vertices a path may have, its first included.
     pub dielectric_depth: u32,
+    /// Steps of a subsurface walk before it stops and keeps the share it would yet carry
+    /// out, clamped to [`SSS_STEPS`](crate::SSS_STEPS).
+    pub sss_max_steps: u32,
+    /// Which subsurface vertices of a path walk.
+    pub sss_depth: SubsurfaceDepth,
     /// The dielectric whose interior holds the eye; each pixel flips it at every dielectric
     /// surface between the eye and its near-plane point, so a near plane straddling the
     /// surface works.
@@ -60,6 +66,8 @@ impl Default for ViewLighting {
             local_light_share: 0.5,
             max_bounces: 3,
             dielectric_depth: 4,
+            sss_max_steps: 16,
+            sss_depth: SubsurfaceDepth::FirstEvent,
             camera_medium: None,
             media: MediaSettings::default(),
             guides: GuideSettings::default(),
@@ -150,6 +158,9 @@ pub enum LightingDebugView {
     /// The froxel volume: each pixel's media transmittance in red, its depth as a share of
     /// the froxel slices in green, and a checker of the froxel columns in blue.
     Froxels,
+    /// Light leaving through subsurface walks: what each walk's exit and the path after it
+    /// add.
+    Subsurface,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -204,6 +215,9 @@ const CACHE_TERMINATE: u32 = 1;
 /// `dielectric`'s `DIELECTRIC_REFERENCE` and `DIELECTRIC_DEBUG_LAYER`.
 const DIELECTRIC_REFERENCE: u32 = 1;
 const DIELECTRIC_DEBUG_LAYER: u32 = 2;
+
+/// `path`'s `SSS_PRIMARY_ONLY`.
+const SSS_PRIMARY_ONLY: u32 = 1;
 
 /// `MATERIAL_NONE`.
 const NO_MATERIAL: u32 = u32::MAX;
@@ -585,6 +599,7 @@ pub struct LightingKernels {
     guides: ComputePipeline,
     local: ComputePipeline,
     media: MediaKernels,
+    cap_tail: CapTailTable,
 }
 
 /// The specialization constants of kernel module `$kernel`, which imports `bsdf`.
@@ -648,6 +663,7 @@ impl LightingKernels {
             guides,
             local: pipeline(device, kernels, &local::MODULE, "main")?,
             media: MediaKernels::new(device, kernels)?,
+            cap_tail: CapTailTable::new(device)?,
         })
     }
 
@@ -719,6 +735,7 @@ impl LightingKernels {
             LightingDebugView::RayOriginBias => 6,
             LightingDebugView::WorldCache => 7,
             LightingDebugView::WorldCacheLod => 8,
+            LightingDebugView::Subsurface => 9,
         };
         let reference = lighting.reference.is_some();
         let first = !reference && scene.first_view(pass.frame);
@@ -784,6 +801,14 @@ impl LightingKernels {
             dielectric_depth: 0,
             camera_medium: NO_MATERIAL,
             dielectric_flags: 0,
+            sss_max_steps: lighting
+                .sss_max_steps
+                .clamp(*SSS_STEPS.start(), *SSS_STEPS.end()),
+            cap_tail: self.cap_tail.gpu(),
+            sss_flags: match lighting.sss_depth {
+                SubsurfaceDepth::FirstEvent => 0,
+                SubsurfaceDepth::PrimaryOnly => SSS_PRIMARY_ONLY,
+            },
             _pad0: 0,
         };
         let root = view.roots.write(slot, path_root);

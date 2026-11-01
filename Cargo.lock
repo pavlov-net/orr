@@ -1423,6 +1423,7 @@ dependencies = [
  "bytemuck",
  "glam 0.34.1",
  "gpu_suite",
+ "openpbr_ref",
  "orr_color",
  "orr_cook",
  "orr_gpu",
@@ -1916,6 +1917,7 @@ dependencies = [
  "cc",
  "log",
  "orr_gpu",
+ "orr_math",
  "orr_shaders",
  "shader_math",
 ]

@@ -19,6 +19,7 @@ orr_color.workspace = true
 png.workspace = true
 gpu_suite.workspace = true
 shader_math.workspace = true
+openpbr_ref.workspace = true
 glam.workspace = true
 bytemuck.workspace = true
 

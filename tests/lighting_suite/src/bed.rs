@@ -249,6 +249,34 @@ pub const WATER_SIGMA: [f32; 3] = [0.4, 0.2, 0.1];
 /// A black 2 m square facing +y with opacity [`PRESENCE_VEIL_OPACITY`], blended: a presence layer.
 pub const PRESENCE_VEIL: &str = "presence veil";
 pub const PRESENCE_VEIL_OPACITY: f32 = 0.25;
+/// Subsurface boxes 2 m square of [`walk_material`] with their top face at y = 0, a quarter,
+/// 1, 4 and 16 of its longest mean free path thick, rounded to the cook's 2^-11 m position
+/// grid.
+pub const WALK_SLABS: [(&str, f32); 4] = [
+    ("walk slab 0.25", 5.0 / 2048.0),
+    ("walk slab 1", 20.0 / 2048.0),
+    ("walk slab 4", 82.0 / 2048.0),
+    ("walk slab 16", 328.0 / 2048.0),
+];
+/// A subsurface sphere of radius 1 m, of [`walk_material`].
+pub const WALK_SPHERE: &str = "walk sphere";
+/// A subsurface sphere of radius 1 m of [`walk_material`] without specular reflection, so
+/// light crosses its surface unchanged.
+pub const WALK_FURNACE: &str = "walk furnace";
+/// The walk models' material: gray subsurface color 0.8, isotropic, mean free paths of
+/// 10, 5 and 2.5 mm per channel, specular roughness 0.4 at IOR 1.4.
+pub fn walk_material() -> Material {
+    Material {
+        subsurface_weight: 1.0,
+        subsurface_color: [0.8; 3],
+        subsurface_radius: 0.01,
+        subsurface_radius_scale: [1.0, 0.5, 0.25],
+        specular_roughness: 0.4,
+        specular_ior: 1.4,
+        ..Material::default()
+    }
+}
+
 /// A dark horizontal canopy 160 m square at y = 0: slats 1 m wide along z with 1 m gaps
 /// between them, faced up and down.
 pub const CANOPY: &str = "canopy";
@@ -646,6 +674,15 @@ fn cook() -> Arc<[u8]> {
             b.quad(0, corners, -y, 1);
         }
     });
+    let walk_slabs = WALK_SLABS.map(|(name, thickness)| {
+        let slab = mesh(|b| {
+            b.cuboid(0, Vec3::new(1.0, 0.5 * thickness, 1.0));
+            for p in &mut b.positions {
+                p.y -= 0.5 * thickness;
+            }
+        });
+        model(name, slab, vec![walk_material()])
+    });
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(
             Target::Memory,
@@ -767,6 +804,20 @@ fn cook() -> Arc<[u8]> {
                     vec![veil],
                 ),
                 model(CANOPY, canopy, vec![diffuse([0.1; 3])]),
+                model(
+                    WALK_SPHERE,
+                    mesh(|b| b.sphere(0, 48, 1.0)),
+                    vec![walk_material()],
+                ),
+                model(
+                    WALK_FURNACE,
+                    mesh(|b| b.sphere(0, 48, 1.0)),
+                    vec![Material {
+                        specular_weight: 0.0,
+                        subsurface_radius_scale: [1.0; 3],
+                        ..walk_material()
+                    }],
+                ),
                 AssetSpec {
                     name: TROUGH.into(),
                     source: Source::Mesh {
@@ -780,7 +831,10 @@ fn cook() -> Arc<[u8]> {
                         },
                     },
                 },
-            ],
+            ]
+            .into_iter()
+            .chain(walk_slabs)
+            .collect(),
         )],
     };
     orr_cook::cook(&manifest, &Default::default())
