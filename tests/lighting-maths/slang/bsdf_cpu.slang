@@ -1,6 +1,7 @@
-// C entry points over orr-lighting's `bsdf` (array LUTs) for the CPU harness. Directions are
-// in the shading frame (normal +z) and pass as float arrays.
+// C entry points over orr-lighting's `bsdf` (array LUTs) and `spectrum` for the CPU harness.
+// Directions are in the shading frame (normal +z) and pass as float arrays.
 import bsdf;
+import spectrum;
 import bsdf_inputs;
 import openpbr_inputs;
 
@@ -40,6 +41,30 @@ export __extern_cpp float lighting_bsdf_pdf(Bsdf* p, float* wi)
 export __extern_cpp void lighting_bsdf_sample(Bsdf* p, float* u, float* wi, float* weight, float* pdf, uint* lobe)
 {
     store_sample(p.sample(load3(u)), wi, weight, pdf, lobe);
+}
+
+// The lobe `sample` draws from `u`.
+export __extern_cpp uint lighting_bsdf_sample_component(Bsdf* p, float* u)
+{
+    return p.sample(load3(u)).component;
+}
+
+export __extern_cpp void lighting_bsdf_delta_value(Bsdf* p, uint component, float* wi, float* value, float* chance)
+{
+    store3(value, p.delta_value(component, load3(wi), *chance));
+}
+
+export __extern_cpp float lighting_dispersed_ior(float ior, float scale, float abbe, float nm)
+{
+    return dispersed_ior(ior, scale, abbe, nm);
+}
+
+// `spectral_transfer` of the wavelengths drawn from `u` with weights `weight` (4), row-major.
+export __extern_cpp void lighting_spectral_transfer(float u, float* weight, float* out)
+{
+    float3x3 m = spectral_transfer(sample_wavelengths(u), float4(weight[0], weight[1], weight[2], weight[3]));
+    for (uint r = 0; r < 3; r++)
+        store3(out + 3 * r, m[r]);
 }
 
 export __extern_cpp void lighting_bsdf_subsurface_entry(Bsdf* p, float* u, float* wi, float* weight, float* pdf, uint* lobe)

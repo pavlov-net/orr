@@ -70,6 +70,7 @@ public struct BsdfSample
     public float3 weight;               // BSDF x cos / pdf, over every lobe
     public float pdf;                   // 0: no sample
     public uint lobe;                   // LOBE_*
+    public uint component;              // the lobe drawn, for `Bsdf.delta_value`
 }
 
 // Directional albedo from the view, by kind, for guides and lobe selection.
@@ -409,7 +410,64 @@ public struct Bsdf : IDifferentiable
         }
         r.wi = normalize(from_local(l, t, b, n));
         r.lobe = lobe;
+        r.component = k;
         return r;
+    }
+
+    // What a delta sample of `component` reaching `wi` has here: BSDF x cos over the
+    // direction's measure, and in `chance` the probability `sample` draws it. Zero where this
+    // BSDF's delta direction for that lobe is not `wi`, or the lobe is not delta.
+    public float3 delta_value(uint component, float3 wi, out float chance)
+    {
+        chance = 0.0;
+        float3 l = local(wi);
+        float3 own = float3(0.0);
+        float3 w = float3(0.0);
+        float within = 1.0;
+        switch (component)
+        {
+        case COAT:
+            if (!coat_mirror)
+                return float3(0.0);
+            own = float3(-v.xy, v.z);
+            w = float3(coat_presence * openpbr_fresnel(coat_eta, v.z));
+            break;
+        case SPECULAR:
+        {
+            if (!mirror)
+                return float3(0.0);
+            float3 rc, tc;
+            coefficients(v.z, rc, tc);
+            tc *= transmit;
+            float pr = reflect_probability(rc, tc);
+            if (l.z > 0.0)
+            {
+                own = float3(-v.xy, v.z);
+                w = rc * layer * leaving(own.z) + fold;
+                within = pr;
+            }
+            else
+            {
+                if (!openpbr_refract(v, float3(0.0, 0.0, 1.0), v.z, eta_refraction, own))
+                    return float3(0.0);
+                w = tc * layer * leaving(own.z);
+                within = 1.0 - pr;
+            }
+            break;
+        }
+        case THIN_SPECULAR:
+            if (!mirror)
+                return float3(0.0);
+            own = -v;
+            w = thin_specular * layer;
+            break;
+        default:
+            return float3(0.0);
+        }
+        if (dot(normalize(own), l) < 1.0 - 1e-6)
+            return float3(0.0);
+        chance = probability[component] * within;
+        return w * scale;
     }
 
     // One direction into the subsurface medium from the walk lobe alone: `weight` is its
@@ -760,6 +818,7 @@ BsdfSample no_sample()
     r.weight = float3(0.0);
     r.pdf = 0.0;
     r.lobe = 0;
+    r.component = LOBES;
     return r;
 }
 

@@ -68,7 +68,7 @@ impl RealTimeGpu {
             let mut list = queue.command_list().expect("command list");
             list.dispatch(
                 &c.pipeline,
-                s.root.gpu,
+                s.root.gpu(),
                 [(chunk.len() as u32).div_ceil(64), 1, 1],
             );
             list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
@@ -241,9 +241,9 @@ fn context() -> &'static Context {
         let results = malloc(&device, MemoryKind::Readback, CHUNK, "bsdf results");
         let mut root = malloc(&device, MemoryKind::Upload, 1, "bsdf root");
         root.as_mut_slice().expect("mapped")[0] = Root {
-            materials: materials.gpu,
-            cases: cases.gpu,
-            results: results.gpu,
+            materials: materials.gpu(),
+            cases: cases.gpu(),
+            results: results.gpu(),
             count: 0,
             _pad0: 0,
         };

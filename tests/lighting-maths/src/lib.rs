@@ -121,6 +121,28 @@ impl RealTime {
         e
     }
 
+    /// The lobe `Bsdf.sample` draws from `u` (`BsdfSample.component`).
+    pub fn sample_component(&self, u: V3) -> u32 {
+        // SAFETY: as in `albedo`; `u` is 3 floats.
+        unsafe { ffi::lighting_bsdf_sample_component(self.ptr(), u.as_ptr()) }
+    }
+
+    /// `Bsdf.delta_value`: BSDF x cos and the probability of drawing it.
+    pub fn delta_value(&self, component: u32, wi: V3) -> (V3, f32) {
+        let (mut value, mut chance) = ([0.0f32; 3], 0.0f32);
+        // SAFETY: as in `albedo`; `wi` and `value` are 3 floats.
+        unsafe {
+            ffi::lighting_bsdf_delta_value(
+                self.ptr(),
+                component,
+                wi.as_ptr(),
+                value.as_mut_ptr(),
+                &mut chance,
+            );
+        };
+        (value, chance)
+    }
+
     /// `Bsdf.subsurface_entry`.
     pub fn subsurface_entry(&self, u: V3) -> Option<Sample> {
         // SAFETY: as in `albedo`.
@@ -358,6 +380,22 @@ pub fn edge_direction(rng: &mut Rng) -> V3 {
     }
 }
 
+/// `dispersed_ior`: OpenPBR's IOR at `nm` for `ior` at 587.6 nm and Abbe number `abbe` over
+/// `scale`.
+pub fn dispersed_ior(ior: f32, scale: f32, abbe: f32, nm: f32) -> f32 {
+    // SAFETY: plain values in and out.
+    unsafe { ffi::lighting_dispersed_ior(ior, scale, abbe, nm) }
+}
+
+/// `spectral_transfer` of the wavelengths `sample_wavelengths` draws from `u`, each
+/// wavelength's estimate scaled by `weight`; rows of the matrix.
+pub fn spectral_transfer(u: f32, weight: [f32; 4]) -> [V3; 3] {
+    let mut out = [[0.0f32; 3]; 3];
+    // SAFETY: `weight` holds 4 floats and `out` 9, as the entry point reads and writes.
+    unsafe { ffi::lighting_spectral_transfer(u, weight.as_ptr(), out.as_mut_ptr().cast()) };
+    out
+}
+
 /// Every component finite and at least 0.
 pub fn finite_non_negative(v: V3) -> bool {
     v.iter().all(|x| x.is_finite() && *x >= 0.0)
@@ -399,6 +437,16 @@ mod ffi {
             pdf: *mut f32,
             lobe: *mut u32,
         );
+        pub(crate) fn lighting_bsdf_sample_component(p: *const c_void, u: *const f32) -> u32;
+        pub(crate) fn lighting_bsdf_delta_value(
+            p: *const c_void,
+            component: u32,
+            wi: *const f32,
+            value: *mut f32,
+            chance: *mut f32,
+        );
+        pub(crate) fn lighting_dispersed_ior(ior: f32, scale: f32, abbe: f32, nm: f32) -> f32;
+        pub(crate) fn lighting_spectral_transfer(u: f32, weight: *const f32, out: *mut f32);
         pub(crate) fn lighting_bsdf_albedo(p: *const c_void, out: *mut f32);
         pub(crate) fn lighting_bsdf_emission(p: *const c_void, out: *mut f32);
         pub(crate) fn lighting_bsdf_fit_coefficients() -> u32;

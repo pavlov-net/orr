@@ -5,7 +5,10 @@
 
 use std::thread;
 
-use lighting_maths::{RealTime, edge_case, edge_direction, finite_non_negative, subsurface_volume};
+use lighting_maths::{
+    RealTime, dispersed_ior, edge_case, edge_direction, finite_non_negative, spectral_transfer,
+    subsurface_volume,
+};
 use openpbr_ref::harness::{self, Estimate, integrate_cells};
 use openpbr_ref::materials::{Material, VIEW_COSINES, grid, view};
 use openpbr_ref::report::{Counts, TABLE_TOLERANCE, evaluate};
@@ -567,6 +570,114 @@ fn smooth_dielectrics_follow_snell_and_fresnel() {
                     "{what}: {t:?} against {snell:?}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn delta_values_match_the_samples_that_drew_them() {
+    let glass = Inputs {
+        base_color: [1.0; 3],
+        specular_roughness: 0.0,
+        specular_ior: 1.5,
+        transmission_weight: 1.0,
+        ..Inputs::default()
+    };
+    // Each with the sides it is seen from.
+    let materials = [
+        (glass, [false, true]),
+        (
+            Inputs {
+                geometry_thin_walled: 1,
+                ..glass
+            },
+            [false, true],
+        ),
+        (
+            Inputs {
+                coat_weight: 1.0,
+                coat_roughness: 0.0,
+                specular_roughness: 0.4,
+                ..Inputs::default()
+            },
+            [false, false],
+        ),
+    ];
+    let mut bsdf = RealTime::new();
+    let mut rng = Rng::new(7);
+    for (i, (m, sides)) in materials.iter().enumerate() {
+        for inside in *sides {
+            let z = if inside { -0.6f32 } else { 0.6 };
+            bsdf.prepare(m, [0.8, 0.0, z]);
+            let mut deltas = 0;
+            for _ in 0..64 {
+                let u = [rng.f32(), rng.f32(), rng.f32()];
+                let Some(s) = bsdf.sample(u) else { continue };
+                if !s.lobe.is(Lobe::SPECULAR) {
+                    continue;
+                }
+                deltas += 1;
+                let component = bsdf.sample_component(u);
+                let (value, chance) = bsdf.delta_value(component, s.wi);
+                let what = format!("material {i}, inside {inside}: {s:?}");
+                assert!((chance - s.pdf).abs() <= 1e-5 * s.pdf, "{what}: {chance}");
+                for c in 0..3 {
+                    let wanted = s.weight[c] * s.pdf;
+                    assert!(
+                        (value[c] - wanted).abs() <= 1e-4 * wanted.max(1e-3),
+                        "{what}: {value:?}"
+                    );
+                }
+                let off = [s.wi[0] + 0.01, s.wi[1], s.wi[2]];
+                let n = off.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let (value, chance) = bsdf.delta_value(component, off.map(|x| x / n));
+                assert!(
+                    chance == 0.0 && value == [0.0; 3],
+                    "{what}: off the direction"
+                );
+            }
+            assert!(deltas > 0, "material {i} drew no delta lobe");
+        }
+    }
+}
+
+#[test]
+fn dispersed_iors_follow_the_abbe_number() {
+    for (ior, scale, abbe) in [
+        (1.5f32, 1.0f32, 20.0f32),
+        (1.7, 0.5, 40.0),
+        (1.33, 1.0, 55.0),
+    ] {
+        let at = |nm| f64::from(dispersed_ior(ior, scale, abbe, nm));
+        assert!((at(587.6) - f64::from(ior)).abs() < 1e-5, "ior {ior}");
+        let v = (at(587.6) - 1.0) / (at(486.1) - at(656.3));
+        let wanted = f64::from(abbe / scale);
+        assert!((v - wanted).abs() < 1e-3 * wanted, "ior {ior}: Abbe {v}");
+        assert!(at(400.0) > at(500.0) && at(500.0) > at(700.0));
+    }
+    assert_eq!(dispersed_ior(1.5, 0.0, 20.0, 450.0), 1.5);
+    // Below 1 (a dense medium against a lighter one) the reciprocal disperses.
+    let inverse = f64::from(dispersed_ior(1.0 / 1.5, 1.0, 20.0, 486.1));
+    assert!((1.0 / inverse - f64::from(dispersed_ior(1.5, 1.0, 20.0, 486.1))).abs() < 1e-5);
+}
+
+/// Colors sent through the sampled wavelengths and back keep their value on average.
+#[test]
+fn sampled_wavelengths_return_colors_unchanged() {
+    let n = 4096;
+    let mut mean = [[0.0f64; 3]; 3];
+    for i in 0..n {
+        let m = spectral_transfer((i as f32 + 0.5) / n as f32, [1.0; 4]);
+        for r in 0..3 {
+            for c in 0..3 {
+                mean[r][c] += f64::from(m[r][c]) / f64::from(n);
+            }
+        }
+    }
+    for r in 0..3 {
+        for c in 0..3 {
+            let wanted = if r == c { 1.0 } else { 0.0 };
+            assert!((mean[r][c] - wanted).abs() < 2e-3, "{mean:?}");
         }
     }
 }

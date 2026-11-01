@@ -235,6 +235,30 @@ pub const SLAB_THICKNESS: f32 = 0.3;
 pub const ROUGH_SLAB: &str = "rough slab";
 /// A smooth glass sphere of radius 1 m (IOR 1.5), clear.
 pub const GLASS_SPHERE: &str = "glass sphere";
+/// [`GLASS_SPHERE`] of a dispersive glass: IOR [`PRISM_IOR`], Abbe number [`PRISM_ABBE`].
+pub const DISPERSIVE_SPHERE: &str = "dispersive sphere";
+/// An upright prism of the dispersive glass: [`prism_corners`] at y = -1 m to 1 m.
+pub const PRISM: &str = "prism";
+pub const PRISM_IOR: f32 = 1.6;
+pub const PRISM_ABBE: f32 = 20.0;
+pub const PRISM_HALF_HEIGHT: f32 = 1.0;
+/// A white emitter of [`EMITTER_LUMINANCE`] facing +z: a strip 2 [`LINE_HALF_WIDTH`] wide
+/// and 2 [`LINE_HALF_HEIGHT`] tall.
+pub const LINE: &str = "line";
+pub const LINE_HALF_WIDTH: f32 = 0.01;
+pub const LINE_HALF_HEIGHT: f32 = 2.0;
+
+/// The corners of [`PRISM`]'s cross section in the xz plane: an equilateral triangle of
+/// circumradius 0.5 m around the origin, apex toward +z, on the cook's 2^-11 m position
+/// grid.
+pub fn prism_corners() -> [Vec3; 3] {
+    let grid = |v: f32| (v * 2048.0).round() / 2048.0;
+    [90.0f32, 210.0, 330.0].map(|a| {
+        let a = a.to_radians();
+        Vec3::new(grid(0.5 * a.cos()), 0.0, grid(0.5 * a.sin()))
+    })
+}
+
 /// A smooth glass box 4 x 1 x 4 m around its origin (IOR 1.5) holding a scattering medium
 /// of [`MILK_SIGMA_T`] and [`MILK_SIGMA_S`] per m, isotropic.
 pub const MILKY_SLAB: &str = "milky slab";
@@ -667,6 +691,42 @@ fn cook() -> Arc<[u8]> {
         transmission_scatter: [3.0; 3],
         ..glass
     };
+    let dispersive = Material {
+        specular_ior: PRISM_IOR,
+        transmission_dispersion_scale: 1.0,
+        transmission_dispersion_abbe_number: PRISM_ABBE,
+        ..glass
+    };
+    let prism = mesh(|b| {
+        let c = prism_corners();
+        let h = Vec3::Y * PRISM_HALF_HEIGHT;
+        for i in 0..3 {
+            let (p, q) = (c[i], c[(i + 1) % 3]);
+            let mid = 0.5 * (p + q);
+            let n = Vec3::Y.cross(q - p).normalize();
+            let n = if n.dot(mid) < 0.0 { -n } else { n };
+            b.quad(0, [p - h, q - h, q + h, p + h], n, 1);
+        }
+        for side in [-1.0f32, 1.0] {
+            let n = Vec3::Y * side;
+            let v = c.map(|p| b.vertex(p + h * side, n, Vec2::ZERO));
+            b.triangle(0, v);
+        }
+    });
+    let line = mesh(|b| {
+        let (w, h) = (LINE_HALF_WIDTH, LINE_HALF_HEIGHT);
+        b.quad(
+            0,
+            [
+                Vec3::new(-w, -h, 0.0),
+                Vec3::new(w, -h, 0.0),
+                Vec3::new(w, h, 0.0),
+                Vec3::new(-w, h, 0.0),
+            ],
+            Vec3::Z,
+            1,
+        );
+    });
     let water = Material {
         specular_ior: 1.33,
         transmission_color: WATER_SIGMA.map(|s| (-s).exp()),
@@ -807,6 +867,13 @@ fn cook() -> Arc<[u8]> {
                     vec![rough],
                 ),
                 model(GLASS_SPHERE, mesh(|b| b.sphere(0, 32, 1.0)), vec![glass]),
+                model(
+                    DISPERSIVE_SPHERE,
+                    mesh(|b| b.sphere(0, 32, 1.0)),
+                    vec![dispersive],
+                ),
+                model(PRISM, prism, vec![dispersive]),
+                model(LINE, line, vec![light_floor]),
                 model(
                     MILKY_SLAB,
                     mesh(|b| b.cuboid(0, Vec3::new(2.0, 0.5, 2.0))),

@@ -37,6 +37,7 @@ import shadow;
 import subsurface;
 import guides;
 import froxels;
+import spectrum;
 
 // Interior list entries a path keeps.
 public static const uint INTERIOR_ENTRIES = 4;
@@ -47,8 +48,11 @@ public static const uint DIELECTRIC_STREAM = 0x85EBCA6B;
 // `PathRoot.dielectric_flags`.
 public static const uint DIELECTRIC_REFERENCE = 1 << 0;   // the accumulation reference: scatter on every interior segment, no cache
 public static const uint DIELECTRIC_DEBUG_LAYER = 1 << 1; // the radiance shows the first layer's shares
+public static const uint DIELECTRIC_DISPERSION = 1 << 2;  // dispersive materials split paths by wavelength
 public static const uint DIELECTRIC_FROST = 1 << 3;       // layer guides keep `background` and `frost`
 
+// The stream of a dispersive path's hero wavelength.
+public static const uint WAVELENGTH_STREAM = 0xD3A2646C;
 
 // The dielectric materials whose interiors hold a point, innermost last.
 public struct Interior
@@ -309,16 +313,130 @@ public BsdfParams vertex_params(LayerVertex l, uint depth)
     return depth > 1 ? bsdf_collapse(l.x.surface.bsdf) : l.x.surface.bsdf;
 }
 
+// Whether material `m`'s IOR varies with wavelength.
+public bool disperses(SceneRoot* s, uint m)
+{
+    if (m == MATERIAL_NONE)
+        return false;
+    MaterialGpu* g = s.materials + m;
+    return g.transmission_dispersion_scale > 0.0 && g.transmission_dispersion_abbe_number > 0.0;
+}
+
+// `ior`, the IOR of material `m` at 587.6 nm, at wavelength `nm`.
+public float dispersed_material_ior(SceneRoot* s, uint m, float ior, float nm)
+{
+    if (m == MATERIAL_NONE)
+        return ior;
+    MaterialGpu* g = s.materials + m;
+    return dispersed_ior(ior, g.transmission_dispersion_scale, g.transmission_dispersion_abbe_number, nm);
+}
+
+// Whether layer vertex `l`, reached with `interior`, has a dispersive side.
+public bool layer_disperses(SceneRoot* s, LayerVertex l, Interior interior)
+{
+    uint m = l.x.surface.material;
+    return l.kind == VERTEX_LAYER && (disperses(s, m) || disperses(s, interior.outside(m, m)));
+}
+
 // The BSDF of layer or opaque vertex `l` at path depth `depth`, against the interior list the
 // path arrived with: a layer's exterior IOR is the innermost other entry's, an opaque
 // vertex's the innermost entry's, so a pool floor meets water. Unless the vertex `walks`, its
-// subsurface share is diffuse reflection.
-public Bsdf prepare_vertex(SceneRoot* s, LayerVertex l, Interior interior, uint depth, bool walks = true)
+// subsurface share is diffuse reflection. A layer takes both IORs at wavelength `nm` where it
+// is above 0, else at 587.6 nm.
+public Bsdf prepare_vertex(SceneRoot* s, LayerVertex l, Interior interior, uint depth, bool walks = true, float nm = 0.0)
 {
     BsdfParams p = walk_params(vertex_params(l, depth), walks);
     uint m = l.x.surface.material;
-    uint outside = l.kind == VERTEX_LAYER ? interior.outside(m, m) : interior.innermost();
-    return bsdf_prepare(p, l.x.surface.normal, l.x.view, interior_ior(s, outside));
+    bool layer = l.kind == VERTEX_LAYER;
+    uint outside = layer ? interior.outside(m, m) : interior.innermost();
+    float exterior = interior_ior(s, outside);
+    if (layer && nm > 0.0)
+    {
+        p.specular_ior = dispersed_material_ior(s, m, p.specular_ior, nm);
+        exterior = dispersed_material_ior(s, outside, exterior, nm);
+    }
+    return bsdf_prepare(p, l.x.surface.normal, l.x.view, exterior);
+}
+
+// A path's wavelengths once it meets a dispersive layer; before that its colors are plain
+// RGB. From there the path follows the hero's refraction, and every companion's estimate is
+// weighed by its own BSDF and density at each direction the hero drew at a dispersive layer,
+// over the mean density of all four (the balance heuristic over wavelengths). The path's
+// throughput stays the hero's; `transfer` takes its contributions to Rec.2020.
+public struct Spectral
+{
+    public bool on;
+    public Wavelengths w;
+    public float4 value;            // per wavelength: its BSDF values over the hero's, multiplied along the path
+    public float4 density;          // its densities over the hero's
+    public float3x3 transfer;
+
+    public __init()
+    {
+        on = false;
+        w = (Wavelengths)0;
+        value = float4(1.0);
+        density = float4(1.0);
+        transfer = float3x3(0.0);
+    }
+
+    // Draws the wavelengths from `u`.
+    [mutating]
+    public void start(float u)
+    {
+        on = true;
+        w = sample_wavelengths(u);
+        update();
+    }
+
+    // The hero's wavelength, 0 before the path disperses.
+    public float hero()
+    {
+        return on ? w.nm.x : 0.0;
+    }
+
+    // Whether a companion still carries an estimate.
+    public bool companions()
+    {
+        return on && any(density.yzw > 0.0);
+    }
+
+    // Weighs companion `k` by its BSDF x cos `f` and density `pdf` toward the direction the
+    // hero drew with BSDF x cos `hero_f` and density `hero_pdf`.
+    [mutating]
+    public void weigh(uint k, float3 f, float pdf, float3 hero_f, float hero_pdf)
+    {
+        float3 basis = spectrum_basis(w.nm[k]);
+        float own = dot(f, basis);
+        float theirs = dot(hero_f, basis);
+        value[k] *= theirs > 0.0 ? own / theirs : 0.0;
+        density[k] *= hero_pdf > 0.0 ? pdf / hero_pdf : 0.0;
+        if (!(value[k] > 0.0) || !(density[k] > 0.0) || !isfinite(value[k] * density[k]))
+        {
+            value[k] = 0.0;
+            density[k] = 0.0;
+        }
+    }
+
+    [mutating]
+    public void update()
+    {
+        float mean = dot(density, float4(1.0 / float(WAVELENGTHS)));
+        transfer = spectral_transfer(w, mean > 0.0 ? value / mean : float4(0.0));
+    }
+
+    // Contribution `c` in Rec.2020.
+    public float3 color(float3 c)
+    {
+        return on ? mul(transfer, c) : c;
+    }
+}
+
+// The hero wavelength's sample of pixel `pixel`, a dimension of its own.
+public float wavelength_sample(PathRoot r, uint2 pixel)
+{
+    Sampler rng = Sampler(pixel, r.frame, r.seed ^ DIELECTRIC_STREAM ^ WAVELENGTH_STREAM);
+    return rng.next();
 }
 
 // The shadow of vertex `l` against the interior list it was reached with.
@@ -398,7 +516,13 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
     RayCone cone = camera_cone(v);
     cone.width = cone_width(cone, l.x.camera_distance);
     bool walked = false;
-    Bsdf b = prepare_vertex(s, l, interior, depth, l.kind == VERTEX_OPAQUE && may_walk(r, l.x.surface, depth, walked, cone.width));
+    bool disperse = (r.dielectric_flags & DIELECTRIC_DISPERSION) != 0;
+    Spectral spectral = Spectral();
+    // Whether `l` is a layer with a dispersive side.
+    bool dispersive = disperse && layer_disperses(s, l, interior);
+    if (dispersive)
+        spectral.start(wavelength_sample(r, pixel));
+    Bsdf b = prepare_vertex(s, l, interior, depth, l.kind == VERTEX_OPAQUE && may_walk(r, l.x.surface, depth, walked, cone.width), spectral.hero());
     float3 radiance = float3(0.0);
     bool alive = l.kind == VERTEX_SCATTER || (l.x.surface.flags & GBUFFER_UNLIT) == 0;
     // Opaque vertices and scatters so far, which the bounce settings count.
@@ -425,6 +549,9 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             alive = false;
         Hit h = (Hit)0;
         float3 positions[3] = { float3(0.0), float3(0.0), float3(0.0) };
+        // A dispersive layer with live companions adds no direct light: its BSDF differs by
+        // wavelength, and its rays reach lights at full weight.
+        bool split = dispersive && spectral.companions();
         if (alive)
         {
             bool medium_vertex = l.kind == VERTEX_SCATTER;
@@ -434,7 +561,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             float run = medium_vertex || exit ? 1.0 : nee_probability(set, l.x.surface);
             float u_run = rng.next();
             uint candidates = depth == 0 ? r.primary_candidates : r.bounce_candidates;
-            bool layer_skips = skip_direct && l.kind == VERTEX_LAYER;
+            bool layer_skips = (skip_direct && l.kind == VERTEX_LAYER) || split;
             if (count_nee && candidates > 0 && u_run < run && !layer_skips)
             {
                 LayerShadow<S, M> shadow = vertex_shadow<S, M>(r, l, interior);
@@ -446,7 +573,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
                 VertexScatter f = { b, medium_vertex, -l.x.view, l.anisotropy, exit, exit_scatter };
                 float3 e = shade_vertex_nee(r, at, f, shadow, run, pixel, local, depth, candidates, one_technique, rng, rays, light);
                 if (counted)
-                    radiance += throughput * e;
+                    radiance += spectral.color(throughput * e);
             }
             if (last)
                 alive = false;
@@ -463,6 +590,8 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             bool crossed = false;
             float4 u = rng.next4();
             float u_roulette = rng.next();
+            uint component = 0;
+            float3 hero_f = float3(0.0);
             if (l.kind == VERTEX_SCATTER)
             {
                 wi = sample_hg(l.anisotropy, -l.x.view, u.xy);
@@ -479,6 +608,8 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
                 alive = bs.pdf > 0.0;
                 wi = bs.wi;
                 pdf = bs.pdf;
+                component = bs.component;
+                hero_f = bs.weight * bs.pdf;
                 throughput *= bs.weight;
                 delta = (bs.lobe & LOBE_SPECULAR) != 0;
                 diffuse = (bs.lobe & LOBE_DIFFUSE) != 0;
@@ -496,6 +627,26 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
                 throughput /= max(keep, 1e-6);
             }
             alive = alive && any(throughput > 0.0) && all(isfinite(throughput));
+            if (alive && split)
+            {
+                for (uint k = 1; k < WAVELENGTHS; k++)
+                {
+                    if (!(spectral.density[k] > 0.0))
+                        continue;
+                    Bsdf bk = prepare_vertex(s, l, interior, depth, false, spectral.w.nm[k]);
+                    float pk;
+                    float3 fk;
+                    if (delta)
+                        fk = bk.delta_value(component, wi, pk);
+                    else
+                    {
+                        fk = bk.eval(wi);
+                        pk = bk.pdf(wi);
+                    }
+                    spectral.weigh(k, fk, pk, hero_f, pdf);
+                }
+                spectral.update();
+            }
             if (alive && walking)
             {
                 walk = walk_from<S>(r, l.x, vertex_params(l, depth), wi, depth, rng, rays);
@@ -511,13 +662,13 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
                 ray.origin = vertex_origin(l.x, wi);
                 ray.dir = wi;
                 ray.pdf = delta ? 0.0 : pdf;
-                ray.run = count_nee ? (l.kind == VERTEX_SCATTER || exit ? 1.0 : nee_probability(set, l.x.surface)) : 0.0;
+                ray.run = count_nee && !split ? (l.kind == VERTEX_SCATTER || exit ? 1.0 : nee_probability(set, l.x.surface)) : 0.0;
                 ray.normal = l.kind == VERTEX_OPAQUE ? l.x.surface.normal : float3(0.0);
                 ray.diffuse = diffuse;
                 ray.chain = l.kind != VERTEX_OPAQUE;
                 ray.scatter = reference || depth == 0;
                 ray.local = depth == 0;
-                if (!delta && count_nee && !one_technique && interior.innermost() != MATERIAL_NONE)
+                if (!delta && count_nee && !one_technique && !split && interior.innermost() != MATERIAL_NONE)
                     skip_direct = true;
                 cone.spread += spread;
                 uint mask = ray.chain || interior.count > 0 ? MASK_OPAQUE | MASK_DIELECTRIC : MASK_OPAQUE;
@@ -569,7 +720,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
                 if (cache && !reference)
                 {
                     if (counted)
-                        radiance += throughput * interior_ambient(r, l.x.surface.position, ray.dir, rng);
+                        radiance += spectral.color(throughput * interior_ambient(r, l.x.surface.position, ray.dir, rng));
                     last = true;
                 }
                 continue;
@@ -580,7 +731,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             float3 through;
             float3 e = froxel_segment_inscatter<M>(r.froxels, v, set, ray.origin, ray.dir, t, r.segment_steps, rng.next(), through);
             if (counted)
-                radiance += throughput * e;
+                radiance += spectral.color(throughput * e);
             throughput *= through;
         }
         else
@@ -613,7 +764,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
                     if (any(d > 0.0))
                         e += d * (weigh ? power_heuristic(ray.pdf, ray.run * nee_directional_pdf(set, ray.normal, id, ray.dir)) : 1.0);
                 }
-                radiance += throughput * e;
+                radiance += spectral.color(throughput * e);
             }
             alive = false;
             continue;
@@ -645,7 +796,10 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             l = opaque_vertex(x);
             opaque++;
         }
-        b = prepare_vertex(s, l, interior, depth, !layer && may_walk(r, l.x.surface, depth, walked, cone.width));
+        dispersive = disperse && layer_disperses(s, l, interior);
+        if (dispersive && !spectral.on)
+            spectral.start(wavelength_sample(r, pixel));
+        b = prepare_vertex(s, l, interior, depth, !layer && may_walk(r, l.x.surface, depth, walked, cone.width), spectral.hero());
         // Emission seen from the front. Cooked emitters are reached by BSDF rays alone; the
         // light set samples producer entries, so their emission is weighed against it.
         uint entry;
@@ -658,7 +812,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
                 float lum = luminance_rec2020(material_emission(s.materials + sh.surface.material));
                 w = power_heuristic(ray.pdf, ray.run * nee_emissive_pdf(set, ray_local, ray.normal, entry, lum, t, dot(sh.surface.geometric_normal, ray.dir)));
             }
-            radiance += throughput * b.emission() * w;
+            radiance += spectral.color(throughput * b.emission() * w);
         }
         if (layer)
             continue;
@@ -674,7 +828,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             if (may && t > CACHE_MIN_RAY_CELLS * cell.size && cache_lookup(r.cache, cell.key, cached))
             {
                 if (counted)
-                    radiance += throughput * cache_albedo(b.albedo(), l.x.surface.bsdf) * cached;
+                    radiance += spectral.color(throughput * cache_albedo(b.albedo(), l.x.surface.bsdf) * cached);
                 alive = false;
             }
         }
