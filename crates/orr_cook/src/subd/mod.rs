@@ -218,6 +218,11 @@ pub(crate) fn cook(
             settings.isolation, settings.smooth_isolation
         ));
     }
+    if let Some(i) = materials.iter().position(crate::mesh::reads_uv1) {
+        return Err(format!(
+            "material {i} reads uv set 1; subdivision cages carry one uv set"
+        ));
+    }
     let cage = &data.cage;
     check(cage, materials.len())?;
     if let Some(skin) = &data.skin

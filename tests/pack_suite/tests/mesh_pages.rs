@@ -105,9 +105,11 @@ fn check(page: &[u8], mesh: &MeshHeader, spread: &mut Spread) {
             bytemuck::bytes_of(&c),
             "cluster {ci}"
         );
-        let uv_scale = (0..2)
-            .map(|a| c.uv_offset[a].abs() + c.uv_scale[a].abs())
-            .fold(f32::MIN_POSITIVE, f32::max);
+        let uv_scale = |set: usize| {
+            (0..2)
+                .map(|a| c.uv_offset[set][a].abs() + c.uv_scale[set][a].abs())
+                .fold(f32::MIN_POSITIVE, f32::max)
+        };
         for v in 0..u32::from(c.vertex_count) {
             let g = &vertices[ci * SLOTS + v as usize];
             let at = format!("cluster {ci} vertex {v}");
@@ -124,7 +126,10 @@ fn check(page: &[u8], mesh: &MeshHeader, spread: &mut Spread) {
             let t = view.tangent(&c, v).unwrap_or([1.0, 0.0, 0.0, 1.0]);
             Spread::add(&mut spread.unit, &g.tangent[..3], &t[..3], 1.0);
             assert_eq!(g.tangent[3], t[3], "{at}: bitangent sign");
-            Spread::add(&mut spread.uv, &g.uv[..2], &view.uv(&c, v), uv_scale);
+            Spread::add(&mut spread.uv, &g.uv[..2], &view.uv(&c, v, 0), uv_scale(0));
+            if mesh.attributes & MeshHeader::UV1 != 0 {
+                Spread::add(&mut spread.uv, &g.uv[2..], &view.uv(&c, v, 1), uv_scale(1));
+            }
             let joints = view.joints(&c, v).unwrap_or_default().map(u32::from);
             assert_eq!(g.joints, joints, "{at}");
             let w = view.weights(&c, v).unwrap_or_default();
@@ -201,8 +206,8 @@ fn synthetic(rng: &mut Rng, clusters: usize, attr_stride: usize, entries: u32) -
             tri_count: tn as u8,
             alpha_first: alpha_first as u8,
             anchor: [0; 3].map(|_| rng.below(2 * reach) as i32 - reach as i32),
-            uv_offset: [rng.float(-4.0, 4.0), rng.float(-4.0, 4.0)],
-            uv_scale: [rng.float(0.01, 8.0), rng.float(0.01, 8.0)],
+            uv_offset: [0; 2].map(|_| [rng.float(-4.0, 4.0), rng.float(-4.0, 4.0)]),
+            uv_scale: [0; 2].map(|_| [rng.float(0.01, 8.0), rng.float(0.01, 8.0)]),
             omm_first,
             section: i as u8,
             area: rng.float(0.0, 10.0),
@@ -263,7 +268,8 @@ fn synthetic_pages_load_alike_at_every_attribute_layout() {
         0,
         MeshHeader::TANGENT,
         MeshHeader::SKIN,
-        MeshHeader::TANGENT | MeshHeader::SKIN,
+        MeshHeader::UV1,
+        MeshHeader::TANGENT | MeshHeader::UV1 | MeshHeader::SKIN,
     ] {
         for exponent in [-11, 3] {
             let mut mesh: MeshHeader = bytemuck::Zeroable::zeroed();
@@ -355,6 +361,7 @@ fn cooked_wavy() -> Archive {
                             errors: vec![0.002, 0.02],
                         },
                         merge_level: Some(2),
+                        tangent_error_max: None,
                         ..Default::default()
                     },
                 },
@@ -425,7 +432,8 @@ fn synthetic_pages_decode_alike_on_the_gpu() {
         0,
         MeshHeader::TANGENT,
         MeshHeader::SKIN,
-        MeshHeader::TANGENT | MeshHeader::SKIN,
+        MeshHeader::UV1,
+        MeshHeader::TANGENT | MeshHeader::UV1 | MeshHeader::SKIN,
     ] {
         for entries in [0, 23] {
             let stride = mesh::attr_stride(attributes) as usize;
@@ -450,7 +458,7 @@ fn cooked_mesh_pages_decode_alike_on_the_gpu() {
 fn damaged_pages_are_rejected_alike_on_the_gpu() {
     let mut rng = Rng(0x2545_F491_4F6C_DD1D);
     let mut stored = Vec::new();
-    for attributes in [0, MeshHeader::TANGENT | MeshHeader::SKIN] {
+    for attributes in [0, MeshHeader::TANGENT | MeshHeader::UV1 | MeshHeader::SKIN] {
         let stride = mesh::attr_stride(attributes) as usize;
         let p = synthetic(&mut rng, 6, stride, 5);
         let good = mesh::encode_page(&p).unwrap();

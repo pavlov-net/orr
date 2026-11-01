@@ -9,7 +9,7 @@
 // codec) into its slots. Both return 0 or PAGE_CODEC_* bits; a page that sets any bit in
 // either pass is malformed, and the thread or workgroup that found it writes nothing.
 //
-// The decode keeps its working set in groupshared memory (about 31 KiB) declared here, so
+// The decode keeps its working set in groupshared memory (about 35 KiB) declared here, so
 // a kernel that calls `page_decode_cluster` holds it; the module has no bindings.
 module page_codec;
 
@@ -35,9 +35,9 @@ public struct StoredPage
 }
 
 static const uint HEADER_BYTES = 96;
-static const uint CLUSTER_BYTES = 128;
+static const uint CLUSTER_BYTES = 144;
 static const uint MAX_VERTICES = 256;
-static const uint MAX_VERTEX_BYTES = 8 + 20;
+static const uint MAX_VERTEX_BYTES = 8 + 24;
 static const uint MAX_CHANNELS = MAX_VERTEX_BYTES / 4;
 static const uint MAX_GROUPS = MAX_VERTICES / 16;
 

@@ -11,7 +11,7 @@ public struct Steady : ISurface
         GSurface s = (GSurface)0;
         s.normal = i.normal;
         s.geometric_normal = i.geometric_normal;
-        s.bsdf.base_color = frac(float3(i.uv.uv * 3.0, dot(i.object_position, float3(0.7, 0.3, 0.5))));
+        s.bsdf.base_color = frac(float3(i.uv[0].uv * 3.0, dot(i.object_position, float3(0.7, 0.3, 0.5))));
         s.bsdf.specular_roughness = saturate(abs(i.object_normal.y));
         return s;
     }

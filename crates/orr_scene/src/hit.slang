@@ -156,7 +156,8 @@ public ProducerTriangle producer_triangle(ProducerBatch b, ProducerClusterGpu k,
         t.corners.position[j] = positions[v];
         VertexAttributes a = (VertexAttributes)0;
         a.normal = producer_normal(b.attrs[v]);
-        a.uv = producer_uv(b.attrs[v]);
+        a.uv[0] = producer_uv(b.attrs[v]);
+        a.uv[1] = a.uv[0];
         a.tangent = float4(1.0, 0.0, 0.0, 1.0);
         t.corners.attributes[j] = a;
         t.vertex_user[j] = b.vertex_user != nullptr ? b.vertex_user[v] : 0;
@@ -221,11 +222,10 @@ public Corners load_corners(uint8_t* page, Cluster c, uint triangle, MeshGpu* me
 }
 
 // The geometry of `i` at barycentrics `b` of triangle `t` placed by `pl`, with `attributes`
-// the mesh's MESH_* flags: uv and its
-// footprint from the barycentric steps `bx` and `by` of one footprint width, normals and
+// the mesh's MESH_* flags: both uv sets and their footprints from the barycentric steps `bx` and `by` of one footprint width, normals and
 // tangent frame in render space (back faces of double-sided materials turned toward the
 // ray `d`), and the object-space position and normal. Without mesh tangents the tangent
-// follows the triangle's uv.
+// follows the triangle's uv in the set the material's normal map reads.
 public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, MaterialGpu* m, Placement pl, float2 b, float2 bx, float2 by, float3 d, float bias)
 {
     VertexAttributes a0 = t.attributes[0];
@@ -235,11 +235,14 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, 
     float3 e1 = mul(pl.linear, t.position[1] - t.position[0]);
     float3 e2 = mul(pl.linear, t.position[2] - t.position[0]);
 
-    float2 uv1 = a1.uv - a0.uv;
-    float2 uv2 = a2.uv - a0.uv;
-    i.uv.uv = a0.uv + b.x * uv1 + b.y * uv2;
-    i.uv.dx = (bx.x * uv1 + bx.y * uv2) * bias;
-    i.uv.dy = (by.x * uv1 + by.y * uv2) * bias;
+    for (uint s = 0; s < 2; s++)
+    {
+        float2 along1 = a1.uv[s] - a0.uv[s];
+        float2 along2 = a2.uv[s] - a0.uv[s];
+        i.uv[s].uv = a0.uv[s] + b.x * along1 + b.y * along2;
+        i.uv[s].dx = (bx.x * along1 + bx.y * along2) * bias;
+        i.uv[s].dy = (by.x * along1 + by.y * along2) * bias;
+    }
 
     float det = determinant(pl.linear);
     float mirror = det < 0.0 ? -1.0 : 1.0;
@@ -255,6 +258,9 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, 
     }
     else
     {
+        bool set1 = material_uv_set(m, TEXTURE_NORMAL) == 1;
+        float2 uv1 = (set1 ? a1.uv[1] : a1.uv[0]) - (set1 ? a0.uv[1] : a0.uv[0]);
+        float2 uv2 = (set1 ? a2.uv[1] : a2.uv[0]) - (set1 ? a0.uv[1] : a0.uv[0]);
         float r = uv1.x * uv2.y - uv2.x * uv1.y;
         float3 tt = r != 0.0 ? (e1 * uv2.y - e2 * uv1.y) / r : float3(0.0);
         float3 bt = r != 0.0 ? (e2 * uv1.x - e1 * uv2.x) / r : float3(0.0);
@@ -421,7 +427,7 @@ public float2 texture_tap(ViewConstants* v, uint2 pixel, uint frame, uint seed, 
 public struct SurfaceHit
 {
     public GSurface surface;      // position includes the surface's depth offset
-    public UvFootprint uv;
+    public UvFootprint uv[2];     // per uv set
     public uint user_tag;
     public uint part;
     public uint cluster_user;     // producer words, 0 on cooked clusters
@@ -572,7 +578,7 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
     float2 by = float2(dot(cross(yp * w, e2), n), dot(cross(e1, yp * w), n)) / nn;
 
     triangle_geometry(i, corners, attributes, m, pl, bary, bx, by, d, 1.0);
-    i.uv.tap = context.tap;
+    i.uv[0].tap = i.uv[1].tap = context.tap;
     i.context = context;
     i.primitive = primitive;
     i.barycentrics = bary;

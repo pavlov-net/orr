@@ -34,8 +34,8 @@ use crate::instances::{self, Catalog, ModelFacts};
 use crate::key::{self, Key, ZSTD_LEVEL};
 use crate::mesh::maps::{Displacement, Opacity, Raster};
 use crate::mesh::{
-    self, DisplacementSpec, MapSpec, MeshData, MeshInput, MeshSource, NormalSpec, OpacitySpec,
-    PartData, Pivots, SectionData, SectionMaps,
+    self, DisplacementSpec, DisplacementTexture, MapSpec, MeshData, MeshInput, MeshSource,
+    NormalSpec, OpacitySpec, PartData, Pivots, SectionData, SectionMaps,
 };
 use crate::raster::{self, RasterReport};
 use crate::report::{
@@ -1170,10 +1170,12 @@ impl<'m, 's> Run<'m, 's> {
                     cutoff,
                     wrap,
                     uv,
+                    uv_set,
                     ..
                 } => Some(Opacity::Texture {
                     mip0: read(unit, false, *wrap, *uv, 1)?.remove(0),
                     cutoff: *cutoff,
+                    uv_set: *uv_set,
                 }),
             };
             let displacement = match &s.maps.displacement {
@@ -1184,9 +1186,10 @@ impl<'m, 's> Run<'m, 's> {
                     min: d.min,
                     max: d.max,
                     mips: match &d.texture {
-                        Some((unit, _, wrap, uv)) => read(unit, true, *wrap, *uv, 1)?,
+                        Some(t) => read(&t.unit, true, t.wrap, t.uv, 1)?,
                         None => Vec::new(),
                     },
+                    uv_set: d.texture.as_ref().map_or(0, |t| t.uv_set),
                 }),
             };
             let normal = match &s.maps.normal {
@@ -1692,6 +1695,7 @@ fn plan_scene(name: &str, mut src: Scene, rules: &TextureRules, memo: &Memo) -> 
                 (materials[mi].0, materials[mi].1)
             });
         }
+        mesh.drop_unread_uv1();
         deps.sort_unstable();
         deps.dedup();
         let skeleton = model
@@ -1807,17 +1811,18 @@ fn map_spec(
 ) -> MapSpec {
     let bound = |s: usize| {
         let b = m.textures[s];
-        (b.texture != AssetId::NONE).then(|| (textures.get(&b.texture), b.uv_set))
+        (b.texture != AssetId::NONE).then(|| (textures.get(&b.texture), usize::from(b.uv_set)))
     };
     let wrap = |r: Option<&TexRef>| r.map_or([Wrap::Repeat; 2], |r| r.wrap);
     let opacity = match (m.alpha_mode, bound(slot::OPACITY)) {
         (Material::MASK, None) => OpacitySpec::Constant(m.geometry_opacity >= m.alpha_cutoff),
-        (Material::MASK, Some((Some((unit, key)), 0))) => OpacitySpec::Texture {
+        (Material::MASK, Some((Some((unit, key)), uv_set))) => OpacitySpec::Texture {
             unit: unit.clone(),
             key: *key,
             cutoff: m.alpha_cutoff,
             wrap: wrap(t.opacity.as_ref()),
             uv: m.uv_transforms[slot::OPACITY],
+            uv_set,
         },
         (Material::MASK, Some(_)) => OpacitySpec::Unknown,
         _ => OpacitySpec::None,
@@ -1827,24 +1832,23 @@ fn map_spec(
         offset: m.displacement_offset,
         min: m.displacement_min,
         max: m.displacement_max,
-        texture: match b {
-            (Some((unit, key)), 0) => Some((
-                unit.clone(),
-                *key,
-                wrap(t.displacement.as_ref()),
-                m.uv_transforms[slot::DISPLACEMENT],
-            )),
-            _ => None,
-        },
+        texture: b.0.map(|(unit, key)| DisplacementTexture {
+            unit: unit.clone(),
+            key: *key,
+            wrap: wrap(t.displacement.as_ref()),
+            uv: m.uv_transforms[slot::DISPLACEMENT],
+            uv_set: b.1,
+        }),
     });
     let normal = match bound(slot::NORMAL) {
         _ if m.specular_anisotropy > 0.0 || m.surface != 0 => NormalSpec::Tangent,
         None => NormalSpec::None,
-        Some((Some((unit, key)), 0)) => NormalSpec::Texture {
+        Some((Some((unit, key)), uv_set)) => NormalSpec::Texture {
             unit: unit.clone(),
             key: *key,
             wrap: wrap(t.normal.as_ref().map(|n| &n.0)),
             uv: m.uv_transforms[slot::NORMAL],
+            uv_set,
         },
         Some(_) => NormalSpec::Tangent,
     };
@@ -1852,6 +1856,7 @@ fn map_spec(
         opacity,
         displacement,
         normal,
+        uv1: mesh::reads_uv1(m),
     }
 }
 
@@ -1900,17 +1905,24 @@ fn mesh_units(
     deps.sort_unstable();
     deps.dedup();
     let n = input.positions.len();
-    let mesh = MeshData {
+    let mut mesh = MeshData {
         positions: input.positions.iter().map(Vec3::to_array).collect(),
         normals: input.normals.iter().map(Vec3::to_array).collect(),
         tangents: input
             .tangents
             .as_ref()
             .map(|t| t.iter().map(Vec4::to_array).collect()),
-        uvs: input.uvs.as_ref().map_or_else(
+        uvs: std::iter::once(input.uvs.as_ref().map_or_else(
             || vec![[0.0; 2]; n],
             |u| u.iter().map(Vec2::to_array).collect(),
-        ),
+        ))
+        .chain(
+            input
+                .uvs1
+                .as_ref()
+                .map(|u| u.iter().map(Vec2::to_array).collect()),
+        )
+        .collect(),
         indices: input.indices.clone(),
         sections,
         skin: None,
@@ -1925,6 +1937,7 @@ fn mesh_units(
         }),
         min_exponent: None,
     };
+    mesh.drop_unread_uv1();
     let part = MeshPart {
         name: mesh_name,
         mesh: MeshSource::Data(Box::new(mesh)),

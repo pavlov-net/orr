@@ -47,7 +47,7 @@ public struct ProducerBatch
     public ProducerClusterGpu* clusters;
     public float3* positions;    // relative to the entry's transform
     public float3* previous;     // each vertex's position last frame; null unless ProducerDesc::previous_positions
-    public uint2* attrs;         // normal oct 2x16 unorm, uv 2x f16
+    public uint2* attrs;         // normal oct 2x16 unorm, uv 2x f16 (both uv sets read it)
     public uint* vertex_user;    // null unless ProducerDesc::vertex_user
     public uint* cluster_count;
     public uint* vertex_count;

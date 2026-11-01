@@ -368,8 +368,8 @@ fn check_fixture(scale: f32, translation: [f32; 3]) {
                     let st = p.tan[sv];
                     assert!(dot([tan[0], tan[1], tan[2]], [st[0], st[1], st[2]]) > 0.99999);
                     assert_eq!(tan[3], st[3]);
-                    let uv = view.uv(&c, v);
-                    for ((got, want), scale) in uv.iter().zip(p.uv[sv]).zip(c.uv_scale) {
+                    let uv = view.uv(&c, v, 0);
+                    for ((got, want), scale) in uv.iter().zip(p.uv[sv]).zip(c.uv_scale[0]) {
                         assert!((got - want).abs() <= scale / 65535.0 * 0.5 + 1e-6);
                     }
                 }

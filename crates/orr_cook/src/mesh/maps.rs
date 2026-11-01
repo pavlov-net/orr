@@ -123,17 +123,30 @@ impl Raster {
 pub(crate) enum Opacity {
     /// Every triangle passes, or none does.
     Constant(bool),
-    /// Opaque when every texel of the triangle's footprint is at or above the cutoff.
-    Texture { mip0: Raster, cutoff: f32 },
+    /// Opaque when every texel of the triangle's footprint, in uv set `uv_set`, is at or
+    /// above the cutoff.
+    Texture {
+        mip0: Raster,
+        cutoff: f32,
+        uv_set: usize,
+    },
     /// The opacity is not known to the cook: every triangle is alpha-tested.
     Unknown,
 }
 
 impl Opacity {
+    /// The uv set [`Self::opaque`] takes its uvs from.
+    pub(crate) fn uv_set(&self) -> usize {
+        match self {
+            Self::Texture { uv_set, .. } => *uv_set,
+            _ => 0,
+        }
+    }
+
     pub(crate) fn opaque(&self, uv: [[f32; 2]; 3]) -> bool {
         match self {
             Self::Constant(pass) => *pass,
-            Self::Texture { mip0, cutoff } => {
+            Self::Texture { mip0, cutoff, .. } => {
                 let mut pass = true;
                 mip0.footprint(uv, |t| {
                     pass = t >= *cutoff;
@@ -155,6 +168,7 @@ pub(crate) struct Displacement {
     /// Every mip of the texture, finest first; empty when the cook cannot read it, so
     /// clusters take the declared range.
     pub mips: Vec<Raster>,
+    pub uv_set: usize,
 }
 
 impl Displacement {

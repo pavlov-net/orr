@@ -369,7 +369,7 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     // A 2x2 quad shares its tap, so neighbors under magnification read the same texel
     // offset and the resolve's normal variance across the quad sees little filter noise.
     i.context.tap = texture_tap(v, uint2(pixel_center) / 2, v.frame_index, 0, 0);
-    i.uv.tap = i.context.tap;
+    i.uv[0].tap = i.uv[1].tap = i.context.tap;
     i.instance = vc.instance;
     i.cluster = vc.cluster;
     i.primitive = triangle;

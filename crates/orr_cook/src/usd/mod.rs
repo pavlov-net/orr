@@ -87,6 +87,8 @@ pub struct UsdSettings {
     pub time: Option<f64>,
     /// The mesh primvar of uv set 0, which shader primvar readers name.
     pub uv: String,
+    /// The mesh primvar of uv set 1; without it meshes carry one uv set.
+    pub uv1: Option<String>,
     pub clips: ClipSettings,
 }
 
@@ -103,6 +105,7 @@ impl Default for UsdSettings {
             subd: SubdSettings::default(),
             time: None,
             uv: "st".into(),
+            uv1: None,
             clips: ClipSettings::default(),
         }
     }
@@ -455,7 +458,7 @@ impl<'s> Importer<'s> {
             let r = self.reader(&prim);
             let path = r.path().to_string();
             let o = owner[i].expect("owned");
-            let mesh = MeshPrim::read(&r, &self.settings.uv)?;
+            let mesh = MeshPrim::read(&r, &self.settings.uv, self.settings.uv1.as_deref())?;
             let as_cage = mesh.scheme != "none" && self.settings.subdivision == Subdivision::Cage;
             let skeleton = models[o].skeleton.map(|k| &skels[k].1);
             let (skin, transform) = match (models[o].skinned, self.skinned(i), skeleton) {
@@ -552,6 +555,13 @@ impl<'s> Importer<'s> {
             if tris.is_empty() {
                 continue;
             }
+            if w.missing_uv1.contains(&m)
+                && self.materials[m].textures.refs().any(|r| r.uv_set == 1)
+            {
+                return Err(format!(
+                    "material {m} reads uv set 1, which a mesh drawn with it does not author"
+                ));
+            }
             sections.push(SectionData::new(
                 indices.len()..indices.len() + tris.len(),
                 &self.materials[m].material,
@@ -593,7 +603,9 @@ impl<'s> Importer<'s> {
                 positions: w.positions,
                 normals: w.normals,
                 tangents: None,
-                uvs: w.uvs,
+                uvs: std::iter::once(w.uvs)
+                    .chain(self.settings.uv1.is_some().then_some(w.uvs1))
+                    .collect(),
                 indices,
                 sections,
                 skin: b.skinned.then_some(Skin {
@@ -918,17 +930,10 @@ impl<'s> Importer<'s> {
                 };
                 let (net, surface, displacement) =
                     shade::network(&self.stage, self.time, p, &mut load)?;
-                let uv = self.settings.uv.clone();
-                let uv_set = |name: &str| {
-                    if name == uv {
-                        Ok(0)
-                    } else {
-                        Err(format!(
-                            "reads primvar {name}; meshes cook uv set 0 from {uv}"
-                        ))
-                    }
-                };
-                let mapped = shading::map(&net, surface, displacement, &uv_set)
+                let primvars: Vec<&str> = std::iter::once(self.settings.uv.as_str())
+                    .chain(self.settings.uv1.as_deref())
+                    .collect();
+                let mapped = shading::map(&net, surface, displacement, &primvars)
                     .map_err(|e| format!("material {p}: {e}"))?;
                 (mapped, p.as_str().trim_start_matches('/').to_string())
             }

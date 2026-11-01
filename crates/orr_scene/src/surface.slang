@@ -40,7 +40,7 @@ public struct SurfaceInput
     public uint3 vertex_user;       // producer vertex words per corner; 0 on cooked clusters
     public uint material;
     public uint surface;            // linked surface id; 0 = StandardSurface
-    public UvFootprint uv;
+    public UvFootprint uv[2];       // per uv set; producer and patch geometry give both its one uv
     public float3 geometric_normal; // the triangle's front face
     public float3 normal;           // interpolated vertex normal
     public float4 tangent;          // xyz unit tangent, w bitangent sign
@@ -76,7 +76,10 @@ public interface ISurface
 public float material_opacity(SurfaceInput i)
 {
     MaterialGpu* m = i.scene.materials + i.material;
-    UvFootprint finest = { i.uv.uv, float2(0.0), float2(0.0), float2(-1.0) };
+    UvFootprint finest[2] = {
+        { i.uv[0].uv, float2(0.0), float2(0.0), float2(-1.0) },
+        { i.uv[1].uv, float2(0.0), float2(0.0), float2(-1.0) },
+    };
     float opacity = m.geometry_opacity;
     if (material_bound(m, TEXTURE_OPACITY))
         opacity *= material_texture(m, TEXTURE_OPACITY, finest, float4(1.0)).x;
@@ -156,25 +159,27 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
     f.uv = float2(0.5, 0.5) + local.xy * float2(0.5, -0.5);
     f.dx = float2(dot(px, axis_x), dot(px, axis_y)) * scale;
     f.dy = float2(dot(py, axis_x), dot(py, axis_y)) * scale;
-    f.tap = i.uv.tap;
+    f.tap = i.uv[0].tap;
+    // A decal projects one uv, which every slot reads.
+    UvFootprint fs[2] = { f, f };
     float4 one = float4(1.0);
     share *= m.geometry_opacity;
     if (material_bound(m, TEXTURE_OPACITY))
-        share *= material_texture(m, TEXTURE_OPACITY, f, one).x;
+        share *= material_texture(m, TEXTURE_OPACITY, fs, one).x;
     else if (material_bound(m, TEXTURE_BASE_COLOR))
-        share *= material_texture(m, TEXTURE_BASE_COLOR, f, one).w;
+        share *= material_texture(m, TEXTURE_BASE_COLOR, fs, one).w;
     if (share <= 0.0)
         return;
 
     uint c = d.channels;
     if ((c & DECAL_BASE_COLOR) != 0)
-        decal_over(layer.base_color, layer.base_color_cover, m.base_weight * material_color(m, TEXTURE_BASE_COLOR, f, m.base_color), share);
+        decal_over(layer.base_color, layer.base_color_cover, m.base_weight * material_color(m, TEXTURE_BASE_COLOR, fs, m.base_color), share);
     if ((c & DECAL_ROUGHNESS) != 0)
-        decal_over(layer.roughness, layer.roughness_cover, m.specular_roughness * material_texture(m, TEXTURE_ROUGHNESS, f, one).x, share);
+        decal_over(layer.roughness, layer.roughness_cover, m.specular_roughness * material_texture(m, TEXTURE_ROUGHNESS, fs, one).x, share);
     if ((c & DECAL_METALNESS) != 0)
-        decal_over(layer.metalness, layer.metalness_cover, m.metalness * material_texture(m, TEXTURE_METALNESS, f, one).x, share);
+        decal_over(layer.metalness, layer.metalness_cover, m.metalness * material_texture(m, TEXTURE_METALNESS, fs, one).x, share);
     if ((c & DECAL_EMISSION) != 0)
-        decal_over(layer.emission, layer.emission_cover, material_color(m, TEXTURE_EMISSION, f, material_emission(m)), share);
+        decal_over(layer.emission, layer.emission_cover, material_color(m, TEXTURE_EMISSION, fs, material_emission(m)), share);
     if ((c & DECAL_NORMAL) != 0)
     {
         // The decal's tangent frame on the surface: its x axis, and its uv's v (down its y
@@ -184,7 +189,7 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
         float3 b = -cross(n, t);
         float3 v = float3(0.0, 0.0, 1.0);
         if (material_bound(m, TEXTURE_NORMAL))
-            v = material_normal_frame(m, TEXTURE_NORMAL, normal_decode(material_texture(m, TEXTURE_NORMAL, f, float4(0.5, 0.5, 1.0, 1.0)).xy));
+            v = material_normal_frame(m, TEXTURE_NORMAL, normal_decode(material_texture(m, TEXTURE_NORMAL, fs, float4(0.5, 0.5, 1.0, 1.0)).xy));
         decal_over(layer.normal, layer.normal_cover, safe_normalize(t * v.x + b * v.y + n * v.z, n), share);
     }
 }

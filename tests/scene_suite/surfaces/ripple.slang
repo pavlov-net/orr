@@ -6,7 +6,7 @@ struct Ripple : IDisplacement
 {
     static float3 displace(DisplacementInput i)
     {
-        float h = 0.05 * sin(9.0 * i.uv.uv.x) * cos(7.0 * i.uv.uv.y);
+        float h = 0.05 * sin(9.0 * i.uv[0].uv.x) * cos(7.0 * i.uv[0].uv.y);
         return i.normal * h;
     }
 }

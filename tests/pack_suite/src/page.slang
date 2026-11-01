@@ -56,7 +56,7 @@ void main(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID)
         v.local = uint4(load_local(page, h, c, i), 0);
         v.normal = float4(a.normal, 0);
         v.tangent = a.tangent;
-        v.uv = float4(a.uv, 0, 0);
+        v.uv = float4(a.uv[0], a.uv[1]);
         v.joints = a.joints;
         v.weights = a.weights;
         root.vertices[slot] = v;
