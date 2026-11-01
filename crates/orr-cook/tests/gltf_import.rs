@@ -1,7 +1,7 @@
 //! glTF import beyond plain float meshes: quantised and meshopt-compressed buffers, default
-//! morph weights, part attributes, material extensions and overrides, model selection with
-//! joined grids, and the textures a mesh cook reads (opacity for opaque-first triangles and
-//! micromaps, displacement bounds).
+//! morph weights, hidden nodes, part attributes, material extensions and overrides, model
+//! selection with joined grids, and the textures a mesh cook reads (opacity for opaque-first
+//! triangles and micromaps, displacement bounds).
 
 #[path = "common/glb.rs"]
 mod glb;
@@ -1457,4 +1457,31 @@ fn morph_targets_cook_at_each_nodes_default_weights() {
     let (a, _) = cook(&path, settings).unwrap();
     let top = |name: &str| mesh_of(&a, name).info.header.bounds.max[1];
     assert_eq!((top("g/quad_a/mesh"), top("g/quad_b/mesh")), (1.0, 2.0));
+}
+
+#[test]
+fn hidden_nodes_hide_their_subtrees() {
+    let d = dir("gltf-visibility");
+    let path = d.join("hidden.glb");
+    let mut g = Glb::default();
+    let (pos, _, idx) = grid(1, |_, _| 0.0);
+    let pa = g.floats(&pos, "VEC3");
+    let ia = g.indices(&idx);
+    let hide = r#""extensions":{"KHR_node_visibility":{"visible":false}}"#;
+    let shown = r#""extensions":{"KHR_node_visibility":{"visible":true}}"#;
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,1,2]}}],
+"extensionsUsed":["KHR_node_visibility"],"extensionsRequired":["KHR_node_visibility"],
+"nodes":[{{"mesh":0}},{{"mesh":0,"translation":[10,0,0],"children":[3],{hide}}},
+ {{"mesh":0,"translation":[20,0,0],"visible":false}},{{"mesh":0,"translation":[0,0,5],{shown}}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa}}},"indices":{ia}}}]}}]"#
+        ),
+    );
+    let (a, _) = cook(&path, GltfSettings::default()).unwrap();
+    assert_eq!(
+        mesh_of(&a, "g/mesh").info.header.bounds.max,
+        [1.0, 0.0, 1.0]
+    );
 }

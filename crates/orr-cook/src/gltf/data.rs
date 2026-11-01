@@ -30,6 +30,7 @@ const COOK_EXTENSIONS: &[&str] = &[
     "KHR_materials_specular",
     "KHR_materials_transmission",
     "KHR_materials_volume",
+    "KHR_node_visibility",
 ];
 
 const MESHOPT: [&str; 2] = ["EXT_meshopt_compression", "KHR_meshopt_compression"];
