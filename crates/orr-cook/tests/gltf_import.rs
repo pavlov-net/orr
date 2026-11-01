@@ -1,7 +1,7 @@
-//! glTF import beyond plain float meshes: quantised and meshopt-compressed buffers, part
-//! attributes, material extensions and overrides, model selection with joined grids, and
-//! the textures a mesh cook reads (opacity for opaque-first triangles and micromaps,
-//! displacement bounds).
+//! glTF import beyond plain float meshes: quantised and meshopt-compressed buffers, default
+//! morph weights, part attributes, material extensions and overrides, model selection with
+//! joined grids, and the textures a mesh cook reads (opacity for opaque-first triangles and
+//! micromaps, displacement bounds).
 
 #[path = "common/glb.rs"]
 mod glb;
@@ -1347,4 +1347,32 @@ fn tangents_are_derived_unless_a_seam_turns_the_shading() {
         mesh_of(&a, "g/mesh").info.header.attributes & mesh::MeshHeader::TANGENT,
         0
     );
+}
+
+#[test]
+fn morph_targets_cook_at_each_nodes_default_weights() {
+    let d = dir("gltf-morph");
+    let path = d.join("morph.glb");
+    let mut g = Glb::default();
+    let (pos, _, idx) = grid(1, |_, _| 0.0);
+    let pa = g.floats(&pos, "VEC3");
+    let da = g.floats(&[[0.0f32; 3], [0.0; 3], [0.0; 3], [0.0, 2.0, 0.0]], "VEC3");
+    let ia = g.indices(&idx);
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,1]}}],
+"nodes":[{{"name":"quad_a","mesh":0}},{{"name":"quad_b","mesh":0,"weights":[1.0]}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa}}},"indices":{ia},"targets":[{{"POSITION":{da}}}]}}],"weights":[0.5]}}]"#
+        ),
+    );
+    let settings = GltfSettings {
+        models: vec![NodeSelect {
+            node: "quad".into(),
+        }],
+        ..Default::default()
+    };
+    let (a, _) = cook(&path, settings).unwrap();
+    let top = |name: &str| mesh_of(&a, name).info.header.bounds.max[1];
+    assert_eq!((top("g/quad_a/mesh"), top("g/quad_b/mesh")), (1.0, 2.0));
 }
