@@ -4,7 +4,8 @@
 //! Without `GltfSettings::models` the whole scene is one model. With it, each node whose
 //! name contains a pattern (and has no selected ancestor) is a model holding its subtree, in
 //! the node's own space; meshes outside every selected subtree are not cooked. Node
-//! transforms are applied to the vertices. With skins, the mesh is in bind space: a skinned
+//! transforms are applied to the vertices, and morph targets at their default weights (the
+//! node's `weights`, else the mesh's). With skins, the mesh is in bind space: a skinned
 //! primitive's vertices stay as stored (glTF ignores its node's transform), take their
 //! joints and weights from `JOINTS_n`/`WEIGHTS_n`, and a primitive without a skin follows
 //! its nearest skeleton joint rigidly; skins and model selection do not mix.
@@ -217,6 +218,7 @@ pub(crate) fn import(
         let linear = Mat3::from_mat4(world);
         let flip = linear.determinant() < 0.0;
         let normal_m = linear.inverse().transpose();
+        let weights = node.weights().or(mesh.weights()).unwrap_or_default();
         for prim in mesh.primitives() {
             let what = format!("mesh {} primitive {}", mesh.index(), prim.index());
             let fail_prim = |m: String| fail(format!("{what}: {m}"));
@@ -230,16 +232,35 @@ pub(crate) fn import(
                 .get(&Semantic::Positions)
                 .ok_or_else(|| fail_prim("no positions".into()))?;
             let n = position.count();
-            // An attribute as rows of `k` floats, `None` when the primitive lacks it.
+            let counted = |a: &gltf::Accessor<'_>, k| {
+                if a.count() != n {
+                    return Err(fail_prim("attribute counts differ".into()));
+                }
+                src.floats(a, k).map_err(fail_prim)
+            };
+            // An attribute as rows of `k` floats, `None` when the primitive lacks it;
+            // positions, normals and tangents with the weighted morph target deltas added.
             let rows = |s: Semantic, k: usize| -> Result<Option<Vec<f32>>> {
-                prim.get(&s)
-                    .map(|a| {
-                        if a.count() != n {
-                            return Err(fail_prim("attribute counts differ".into()));
-                        }
-                        src.floats(&a, k).map_err(fail_prim)
-                    })
-                    .transpose()
+                let Some(a) = prim.get(&s) else {
+                    return Ok(None);
+                };
+                let mut out = counted(&a, k)?;
+                let targets = prim.morph_targets().zip(weights);
+                for (t, &w) in targets.filter(|&(_, &w)| w != 0.0) {
+                    let delta = match s {
+                        Semantic::Positions => t.positions(),
+                        Semantic::Normals => t.normals(),
+                        Semantic::Tangents => t.tangents(),
+                        _ => None,
+                    };
+                    let Some(d) = delta else { continue };
+                    let d = counted(&d, 3)?;
+                    let xyz = out.chunks_exact_mut(k).flat_map(|r| &mut r[..3]);
+                    for (x, d) in xyz.zip(&d) {
+                        *x += w * d;
+                    }
+                }
+                Ok(Some(out))
             };
             let custom = |name: &str, k| -> Result<Option<Vec<f32>>> {
                 let key = name.strip_prefix('_').ok_or_else(|| {
