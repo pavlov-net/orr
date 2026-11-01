@@ -1,13 +1,14 @@
 //! Depth of field, after RR at output resolution or before it at render resolution with the
 //! RR guide.
 
+use orr_math::UVec2;
 use orr_scene::orr_gpu::{
     AddressMode, Allocation, Blend, ColorAttachment, ColorLoad, ColorMask, ColorTarget,
     CommandList, ComputePipeline, Device, Filter, Format, GpuPtr, Hazards, MemoryKind, MeshArgs,
     MeshPipeline, MeshPipelineDesc, Rendering, SamplerDesc, SamplerIndex, ShaderStage, SpecData,
     Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureUsage, ViewDesc,
 };
-use orr_scene::{DepthOfField, Focus, ViewConstants};
+use orr_scene::{DepthOfField, Focus, Lens, Projection, ViewConstants};
 
 use crate::passes::groups;
 use crate::shaders::post::dof::{self, LensState, Root, Sprite};
@@ -53,6 +54,27 @@ pub struct DepthOfFieldPass<'a> {
     /// orr's frame id.
     pub frame: u64,
     pub output: &'a ViewOutput,
+    /// The render extent, at which the hole mask is written and lighting's background layer
+    /// read.
+    pub render_extent: [u32; 2],
+    /// With `PostQuality::dof_ray_hole_fill`: lighting's background layer this frame, traced
+    /// from the [`DofHoleMask`] the view returned before it (`LightingView::dof_background`).
+    /// `None`, and any layer in the frame after a history reset, leaves the mirrored fill.
+    pub background: Option<TextureIndex>,
+}
+
+/// What lighting traces a view's background layer from (`orr_lighting::DofBackgroundPass`),
+/// from [`crate::OutputView::dof_hole_mask`].
+#[derive(Clone, Copy, Debug)]
+pub struct DofHoleMask {
+    /// R16F at the render extent, written by the view's last depth-of-field pass: per pixel
+    /// near out-of-focus foreground, the reverse-Z depth nearer than which everything is
+    /// foreground; 0 elsewhere.
+    pub mask: TextureIndex,
+    /// The aperture's radius, m: half the focal length over the f-number.
+    pub aperture_radius: f32,
+    /// The focus distance, m, as the view's last depth-of-field pass found it.
+    pub focus_distance: GpuPtr<f32>,
 }
 
 /// The guide path's images, which RR reads as `color` and `depth_of_field_guide`.
@@ -75,6 +97,7 @@ pub(crate) struct DofKernels {
     median_background: ComputePipeline,
     median_foreground: ComputePipeline,
     composite: ComputePipeline,
+    mark: ComputePipeline,
     sprites: MeshPipeline,
     point: SamplerIndex,
 }
@@ -109,6 +132,7 @@ impl DofKernels {
             median_background: pipeline("median_background", "dof_median_background")?,
             median_foreground: pipeline("median_foreground", "dof_median_foreground")?,
             composite: pipeline("composite", "dof_composite")?,
+            mark: pipeline("mark", "dof_mark")?,
             sprites,
             point: gpu.sampler(&SamplerDesc {
                 mag: Filter::Nearest,
@@ -145,7 +169,7 @@ impl DofKernels {
             Focus::Manual { distance_m } => (0, distance_m, [0.5, 0.5], 0.0),
             Focus::Auto { uv, speed } => (1, 0.0, uv, speed),
         };
-        Root {
+        let mut root = Root {
             view: pass.view,
             lens: targets.lens.gpu(),
             diaphragm: targets.diaphragm.gpu(),
@@ -172,6 +196,11 @@ impl DofKernels {
             tiles_store: targets.tiles.storage,
             dilated: targets.dilated.sampled,
             dilated_store: targets.dilated.storage,
+            background: TextureIndex::NONE,
+            mask_store: StorageImageIndex::NONE,
+            holes_history: TextureIndex::NONE,
+            holes: TextureIndex::NONE,
+            holes_store: StorageImageIndex::NONE,
             point: self.point,
             width,
             height,
@@ -191,13 +220,26 @@ impl DofKernels {
             focus_v,
             focus_speed,
             reset: u32::from(reset),
+            hole_reset: 1,
             blades: dof.blades,
             round_at_f_number: dof.round_at_f_number,
             max_coc: dof.max_coc,
             _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
+        };
+        if let Some(h) = targets.holes.as_mut() {
+            let hole_reset = reset || std::mem::take(&mut h.fresh);
+            // Lighting traced this frame's layer from the mask the last pass wrote.
+            let traced = std::mem::replace(&mut h.written, true);
+            if let Some(background) = pass.background.filter(|_| traced && !hole_reset) {
+                root.background = background;
+            }
+            root.mask_store = h.mask.storage;
+            root.holes_history = h.accumulated[read].sampled;
+            root.holes = h.accumulated[write].sampled;
+            root.holes_store = h.accumulated[write].storage;
+            root.hole_reset = u32::from(hole_reset);
         }
+        root
     }
 
     /// Records the pass, then a barrier.
@@ -224,6 +266,9 @@ impl DofKernels {
         step(list);
         list.dispatch(&self.reduce, root, groups(half.map(|n| n.div_ceil(2)), 16));
         list.dispatch(&self.dilate, root, groups(tiles(half), 8));
+        if let Some(h) = &targets.holes {
+            list.dispatch(&self.mark, root, groups(h.extent, 8));
+        }
         step(list);
         list.dispatch(&self.gather, root, groups(half, 8));
         step(list);
@@ -266,6 +311,38 @@ pub(crate) struct GuideTargets {
     pub(crate) guide: Image,
 }
 
+/// Ray-traced hole filling's images, while `PostQuality::dof_ray_hole_fill` is on.
+pub(crate) struct HoleTargets {
+    /// R16F at the render extent: [`DofHoleMask::mask`].
+    mask: Image,
+    /// Half resolution: lighting's background layer accumulated, RGB radiance and A its
+    /// sample count; they flip with the stabilizer's histories.
+    accumulated: [Image; 2],
+    /// The render extent.
+    extent: [u32; 2],
+    /// A pass wrote the mask, so lighting may trace from it.
+    written: bool,
+    /// New, so the next pass restarts the accumulation.
+    fresh: bool,
+}
+
+impl HoleTargets {
+    fn new(gpu: &Device, extent: [u32; 2], half: [u32; 2]) -> Result<Self> {
+        let accumulated = || Image::new(gpu, Format::Rgba16Float, half, "dof holes");
+        Ok(Self {
+            mask: Image::new(gpu, Format::R16Float, extent, "dof hole mask")?,
+            accumulated: [accumulated()?, accumulated()?],
+            extent,
+            written: false,
+            fresh: true,
+        })
+    }
+
+    fn images(&self) -> [&Image; 3] {
+        [&self.mask, &self.accumulated[0], &self.accumulated[1]]
+    }
+}
+
 /// A view's depth-of-field images, allocated while its lens has depth of field.
 pub(crate) struct DofTargets {
     layer: Image,
@@ -284,6 +361,7 @@ pub(crate) struct DofTargets {
     scatter: Allocation<u32>,
     max_sprites: u32,
     pub(crate) guide: Option<GuideTargets>,
+    holes: Option<HoleTargets>,
     path: DofPath,
     extent: [u32; 2],
     half: [u32; 2],
@@ -346,6 +424,7 @@ impl DofTargets {
             scatter: gpu.gpu_malloc(MemoryKind::DeviceLocal, 5, "dof scatter")?,
             max_sprites,
             guide,
+            holes: None,
             path,
             extent,
             half,
@@ -365,8 +444,41 @@ impl DofTargets {
         (read, self.current)
     }
 
+    /// Makes or frees the hole-filling images as `on` asks, at the render extent `extent`.
+    pub(crate) fn set_holes(&mut self, gpu: &Device, on: bool, extent: [u32; 2]) -> Result<()> {
+        if !on {
+            self.holes = None;
+        } else if self.holes.as_ref().is_none_or(|h| h.extent != extent) {
+            self.holes = Some(HoleTargets::new(gpu, extent, self.half)?);
+        }
+        Ok(())
+    }
+
+    /// The mask lighting traces the view's background layer from, once a pass wrote one at
+    /// `extent`.
+    pub(crate) fn hole_mask(
+        &self,
+        lens: &Lens,
+        projection: &Projection,
+        extent: [u32; 2],
+    ) -> Option<DofHoleMask> {
+        let dof = lens.depth_of_field?;
+        let holes = self
+            .holes
+            .as_ref()
+            .filter(|h| h.written && h.extent == extent)?;
+        let clip = projection.clip_from_view(UVec2::from(extent));
+        let focal_mm = 0.5 * lens.sensor_width_mm * clip.x_axis.x.abs();
+        Some(DofHoleMask {
+            mask: holes.mask.sampled,
+            aperture_radius: 0.5 * focal_mm / dof.f_number / 1000.0,
+            focus_distance: self.lens.gpu().cast(),
+        })
+    }
+
     fn images(&self) -> impl Iterator<Item = &Image> {
         let guide = self.guide.iter().flat_map(|g| [&g.color, &g.guide]);
+        let holes = self.holes.iter().flat_map(HoleTargets::images);
         [
             &self.layer,
             &self.histories[0],
@@ -377,11 +489,19 @@ impl DofTargets {
         ]
         .into_iter()
         .chain(guide)
+        .chain(holes)
     }
 
-    pub(crate) fn discard(&self, list: &mut CommandList<'_>) {
-        for image in self.images() {
-            list.discard(image.texture());
+    /// Discards the images of a new allocation, which the pass then resets.
+    pub(crate) fn discard_fresh(&self, list: &mut CommandList<'_>) {
+        if self.fresh {
+            for image in self.images() {
+                list.discard(image.texture());
+            }
+        } else if let Some(h) = self.holes.as_ref().filter(|h| h.fresh) {
+            for image in h.images() {
+                list.discard(image.texture());
+            }
         }
     }
 

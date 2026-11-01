@@ -5,11 +5,13 @@
 // - `lens`: the diaphragm table, the focus (manual or the median depth around the autofocus
 //   point, smoothed) and the CoC scale into the per-view lens state.
 // - `setup`: half-resolution color and CoC from each 2x2, keyed on the furthest depth.
-// - `stabilize`: the half-resolution history with CoC-bilateral rejection.
+// - `stabilize`: the half-resolution history with CoC-bilateral rejection, and with ray hole
+//   filling lighting's background layer accumulated over frames.
 // - `select`: highlights split off as sprites, the gather source, and per-tile foreground
 //   CoC.
 // - `reduce`: the gather source's mips with Karis weights; `dilate`: foreground tiles grown by
-//   their reach.
+//   their reach; `mark`: with ray hole filling, the render-resolution mask of the pixels near
+//   foreground, which lighting traces past the foreground next frame.
 // - `gather`: background rings, outermost first, and the foreground layer, with hole fill.
 // - `median_background`, `median_foreground`: 3x3 medians.
 // - `sprite_mesh`, `sprite_pixel`: highlight sprites added onto both layers.
@@ -38,6 +40,11 @@ static const float SCATTER_EXCESS = 1.0;
 static const float SLIGHT_LOW = 2.0;
 static const float SLIGHT_HIGH = 4.0;
 static const float HISTORY_WEIGHT = 0.9;
+// The background layer's accumulation holds at most this many samples per pixel, and is
+// trusted over the mirrored fill once it holds HOLE_TRUST.
+static const float HOLE_SAMPLES = 32.0;
+static const float HOLE_TRUST = 4.0;
+static const uint NONE = 0xffffffff;
 
 public struct LensState
 {
@@ -101,6 +108,17 @@ struct Root
     StorageImageIndex tiles_store;
     TextureIndex dilated;
     StorageImageIndex dilated_store;
+    // Lighting's background layer at the render extent, traced past the foreground from the
+    // mask the previous frame wrote; NONE when there is none to use this frame.
+    TextureIndex background;
+    // R16F at the render extent: per pixel, the reverse-Z depth past which lighting starts its
+    // lens ray next frame; 0 unmarked. NONE without ray hole filling.
+    StorageImageIndex mask_store;
+    // Half resolution, the background layer accumulated: RGB radiance, A its sample count.
+    // Last frame's, then this frame's.
+    TextureIndex holes_history;
+    TextureIndex holes;
+    StorageImageIndex holes_store;
     SamplerIndex point;
     uint width;
     uint height;
@@ -123,13 +141,13 @@ struct Root
     // Autofocus rate, 1/s.
     float focus_speed;
     uint reset;
+    // The accumulated background layer restarts.
+    uint hole_reset;
     uint blades;
     float round_at_f_number;
     // Diameter as a fraction of the width.
     float max_coc;
     uint _pad0;
-    uint _pad1;
-    uint _pad2;
 }
 ORR_ROOT(Root);
 
@@ -305,6 +323,85 @@ void setup(uint3 id: SV_DispatchThreadID)
     root.layer_store.get<RWTexture2D<float4>>()[id.xy] = float4(sum / weights, key);
 }
 
+// This frame's pre-exposure over last frame's.
+float exposure_change()
+{
+    ViewConstants* view = root.view;
+    if (view.exposure == nullptr)
+        return 1.0;
+    ExposureState e = view.exposure[view.exposure_slot];
+    return e.prev_pre_exposure > 0.0 ? e.pre_exposure / e.prev_pre_exposure : 1.0;
+}
+
+// The background layer's texels with data among the render texels under half-resolution
+// pixel `q` (at most 2x2): their mean, RGB radiance and A reverse-Z depth, and their count.
+float4 ray_background(int2 q, out float count)
+{
+    ViewConstants* view = root.view;
+    float2 scale = float2(view.extent) / float2(root.width, root.height);
+    int2 lo = int2(floor(float2(2 * q) * scale));
+    int2 hi = min(min(int2(ceil(float2(2 * q + 2) * scale)) - 1, lo + 1), int2(view.extent) - 1);
+    Texture2D<float4> layer = root.background.get<Texture2D<float4>>();
+    float4 sum = 0.0;
+    count = 0.0;
+    for (int y = lo.y; y <= hi.y; y++)
+    {
+        for (int x = lo.x; x <= hi.x; x++)
+        {
+            float4 t = layer.Load(int3(x, y, 0));
+            if (t.a >= 0.0)
+            {
+                sum += t;
+                count += 1.0;
+            }
+        }
+    }
+    return count > 0.0 ? sum / count : 0.0;
+}
+
+// Where a still point at half-resolution pixel `q` and reverse-Z `depth` (0: at infinity)
+// was last frame, as UV.
+float2 previous_uv(int2 q, float depth)
+{
+    ViewConstants* v = root.view;
+    float2 uv = (float2(q) + 0.5) / float2(half_extent());
+    float w = depth > 0.0 ? 1.0 : 0.0;
+    float3 p = depth > 0.0 ? view_position(v, uv, depth) : view_direction(v, uv);
+    float3x4 r = v.view_from_world_rotation;
+    float3 relative = mul(transpose(float3x3(r[0].xyz, r[1].xyz, r[2].xyz)), p) + w * v.eye_motion.xyz;
+    float4 previous = mul(v.prev_clip_from_view, float4(mul(v.prev_view_from_world_rotation, float4(relative, 0.0)), w));
+    // Unjittered on both sides, so a still camera reprojects `uv` onto itself.
+    float4 current = mul(v.clip_from_view, float4(p, w));
+    return uv + (previous.xy / previous.w - current.xy / current.w) * 0.5;
+}
+
+// Lighting's background layer under `q` added to its accumulation, reprojected by the
+// camera's motion at the layer's depth; pixels without data this frame restart.
+void accumulate_holes(int2 q)
+{
+    if (root.holes_store.index == NONE)
+        return;
+    RWTexture2D<float4> holes = root.holes_store.get<RWTexture2D<float4>>();
+    float n = 0.0;
+    float4 ray = 0.0;
+    if (root.background.index != NONE)
+        ray = ray_background(q, n);
+    if (n == 0.0)
+    {
+        holes[q] = 0.0;
+        return;
+    }
+    float4 last = 0.0;
+    float2 uv = previous_uv(q, ray.a);
+    if (root.hole_reset == 0 && all(uv >= 0.0) && all(uv <= 1.0))
+    {
+        last = root.holes_history.get<Texture2D<float4>>().SampleLevel(root.point.get(), uv, 0.0);
+        last.rgb *= exposure_change();
+    }
+    float count = min(last.a + n, HOLE_SAMPLES);
+    holes[q] = float4(lerp(last.rgb, ray.rgb, n / count), count);
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void stabilize(uint3 id: SV_DispatchThreadID)
@@ -312,6 +409,7 @@ void stabilize(uint3 id: SV_DispatchThreadID)
     if (any(id.xy >= half_extent()))
         return;
     int2 q = int2(id.xy);
+    accumulate_holes(q);
     Texture2D<float4> current = root.layer.get<Texture2D<float4>>();
     float4 c = current.Load(int3(q, 0));
     RWTexture2D<float4> stable = root.stable_store.get<RWTexture2D<float4>>();
@@ -341,14 +439,7 @@ void stabilize(uint3 id: SV_DispatchThreadID)
         return;
     }
     float4 h = root.history.get<Texture2D<float4>>().SampleLevel(root.point.get(), uv, 0.0);
-    ViewConstants* view = root.view;
-    if (view.exposure != nullptr)
-    {
-        ExposureState e = view.exposure[view.exposure_slot];
-        if (e.prev_pre_exposure > 0.0)
-            h.rgb *= e.pre_exposure / e.prev_pre_exposure;
-    }
-    h.rgb = clamp(h.rgb, lo, hi);
+    h.rgb = clamp(h.rgb * exposure_change(), lo, hi);
     float w = HISTORY_WEIGHT * saturate(1.0 - abs(h.a - c.a) / (0.5 + 0.1 * abs(c.a)));
     stable[q] = lerp(c, h, w);
 }
@@ -507,6 +598,30 @@ void dilate(uint3 id: SV_DispatchThreadID)
     root.dilated_store.get<RWTexture2D<float>>()[id.xy] = best;
 }
 
+// Marks the render pixels within a tile of a tile holding foreground with the reverse-Z depth
+// at which the half-resolution CoC reaches -FOREGROUND_MIN: everything nearer is foreground.
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void mark(uint3 id: SV_DispatchThreadID)
+{
+    ViewConstants* view = root.view;
+    if (any(id.xy >= view.extent))
+        return;
+    float2 at = (float2(id.xy) + 0.5) * float2(root.width, root.height) / float2(view.extent);
+    int2 tile = int2(0.5 * at) / int(TILE);
+    int2 last = int2(root.tiles_x, root.tiles_y) - 1;
+    Texture2D<float> tiles = root.tiles.get<Texture2D<float>>();
+    float radius = 0.0;
+    for (int dy = -1; dy <= 1; dy++)
+    {
+        for (int dx = -1; dx <= 1; dx++)
+            radius = max(radius, tiles.Load(int3(clamp(tile + int2(dx, dy), int2(0), last), 0)));
+    }
+    LensState* l = root.lens;
+    float start = (l.coc_scale + 2.0 * FOREGROUND_MIN) / l.coc_slope;
+    root.mask_store.get<RWTexture2D<float>>()[id.xy] = radius > 0.0 ? start : 0.0;
+}
+
 struct Rings
 {
     uint count;
@@ -536,8 +651,21 @@ float2 ring_offset(uint ring, uint j, float spacing, float jitter)
     return float(ring) * spacing * float2(cos(a), sin(a));
 }
 
+// What the foreground hides at `uv`: the accumulated background layer, and how far it is
+// trusted over leaving the sample out.
+float3 hidden(float2 uv, out float trust)
+{
+    trust = 0.0;
+    if (root.holes.index == NONE)
+        return 0.0;
+    float4 h = root.holes.get<Texture2D<float4>>().SampleLevel(root.point.get(), uv, 0.0);
+    trust = saturate(h.a / HOLE_TRUST);
+    return h.rgb;
+}
+
 // The background behind the pixel: rings from the outermost in, each nearer ring covering
-// what the outer ones gathered by its coverage.
+// what the outer ones gathered by its coverage. A foreground sample is left out, or with
+// ray hole filling replaced by what it hides, taken at the pixel's CoC.
 float3 background(float2 q, float4 center, float jitter)
 {
     float cc = center.a;
@@ -561,12 +689,15 @@ float3 background(float2 q, float4 center, float jitter)
                 o = ring_offset(k, j, rings.spacing, jitter);
                 s = chain_sample(q, o, rings.level);
             }
+            float trust = 1.0;
             if (s.a < -FOREGROUND_MIN)
+                s = float4(hidden((q + 0.5 + o) / float2(half_extent()), trust), cc);
+            if (trust <= 0.0)
                 continue;
             // Behind the pixel's surface a sample shows only within the pixel's own blur.
             float radius = min(s.a, cc) * diaphragm(lens_direction(o, false));
             float c = k == 0 ? 1.0 : coverage(radius, length(o), rings.spacing);
-            float w = c * spread_weight(max(s.a, 0.0), rings.spacing);
+            float w = trust * c * spread_weight(max(s.a, 0.0), rings.spacing);
             sum += w * s.rgb;
             weights += w;
             cocs += w * s.a;
@@ -594,9 +725,9 @@ float3 background(float2 q, float4 center, float jitter)
     return total > 0.0 ? color : center.rgb;
 }
 
-// What lies behind a foreground pixel: the background-layer samples around it, each
+// What lies behind a foreground pixel, guessed: the background-layer samples around it, each
 // foreground sample replaced by its mirror.
-float3 hole_fill(float2 q, float4 center, float jitter)
+float3 mirrored_fill(float2 q, float4 center, float jitter)
 {
     Rings rings = rings_for(-center.a);
     float3 sum = 0.0;
@@ -663,8 +794,16 @@ void gather(uint3 id: SV_DispatchThreadID)
     int2 q = int2(id.xy);
     float4 center = root.chain.get<Texture2D<float4>>().Load(int3(q, 0));
     float jitter = interleaved_gradient_noise(float2(q));
-    float3 back = center.a < -FOREGROUND_MIN ? hole_fill(float2(q), center, jitter)
-                                             : background(float2(q), center, jitter);
+    float3 back;
+    if (center.a < -FOREGROUND_MIN)
+    {
+        back = mirrored_fill(float2(q), center, jitter);
+        float trust;
+        float3 ray = hidden((float2(q) + 0.5) / float2(half_extent()), trust);
+        back = lerp(back, ray, trust);
+    }
+    else
+        back = background(float2(q), center, jitter);
     float radius = root.dilated.get<Texture2D<float>>().Load(int3(q / int(TILE), 0));
     root.layer_store.get<RWTexture2D<float4>>()[q] = float4(back, center.a);
     root.history_store.get<RWTexture2D<float4>>()[q] = foreground(float2(q), center, radius, jitter);
@@ -807,10 +946,19 @@ float3 slight(int2 p, float3 center, float cc)
             float2 o = ring_offset(k, j, spacing, jitter);
             int2 at = clamp(int2(floor(float2(p) + 0.5 + o)), int2(0), last);
             float cs = coc_at(at);
+            float3 color = source.Load(int3(at, 0)).rgb;
+            if (cs < -2.0 * FOREGROUND_MIN)
+            {
+                // The foreground layer covers this sample; what it hides shows here.
+                float trust;
+                float3 h = hidden((float2(at) + 0.5) / float2(root.width, root.height), trust);
+                color = lerp(color, h, trust);
+                cs = lerp(cs, cc, trust);
+            }
             // Ordered by signed CoC: a sample behind the pixel shows within the pixel's blur.
             float r = cs > cc ? min(abs(cs), radius) : abs(cs);
             float w = coverage(r, length(o), spacing) * spread_weight(abs(cs), spacing);
-            sum += w * source.Load(int3(at, 0)).rgb;
+            sum += w * color;
             weights += w;
         }
     }
@@ -828,7 +976,6 @@ void composite(uint3 id: SV_DispatchThreadID)
     float cc = coc_at(p);
     float radius = abs(cc);
     float2 h = (float2(p) + 0.5) * 0.5;
-    float2 uv = h / float2(half_extent());
     int2 last = int2(half_extent()) - 1;
 
     // Bilinear taps of the background layer, weighed by CoC likeness to the pixel.
@@ -850,7 +997,15 @@ void composite(uint3 id: SV_DispatchThreadID)
         plain += bilinear * s.rgb;
     }
     back = back_weights > 1e-4 ? back / back_weights : plain;
-    float4 front = root.layer.get<Texture2D<float4>>().SampleLevel(root.point.get(), uv, 0.0);
+    // The foreground layer is premultiplied, so its bilinear taps blend coverage correctly.
+    Texture2D<float4> front_layer = root.layer.get<Texture2D<float4>>();
+    float4 front = 0.0;
+    for (uint k = 0; k < 4; k++)
+    {
+        int2 o = int2(k & 1, k >> 1);
+        float bilinear = (o.x != 0 ? f.x : 1.0 - f.x) * (o.y != 0 ? f.y : 1.0 - f.y);
+        front += bilinear * front_layer.Load(int3(clamp(base + o, int2(0), last), 0));
+    }
 
     float3 near = slight(p, src.rgb, cc);
     if (radius > 0.5)

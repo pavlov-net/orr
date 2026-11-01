@@ -3,7 +3,8 @@
 // scene, a horizontal water plane. `frame` writes the pinhole radiance (translucent layers
 // composited) and the reverse-Z depth of the nearest opaque surface; `reference` averages
 // `lens_samples` rays from points of the aperture through each pixel's point on the focal
-// plane.
+// plane. `background_layer` stands in for lighting's background layer: on each pixel the
+// mask marks, one lens ray per frame that starts past the mask's depth.
 #include "orr/root.h"
 import orr.abi;
 
@@ -11,6 +12,7 @@ static const uint FOREGROUND = 0;
 static const uint BACKGROUND = 1;
 static const uint HIGHLIGHTS = 2;
 static const uint WATER = 3;
+static const uint FENCE = 4;
 
 static const float PI = 3.14159265;
 
@@ -35,6 +37,15 @@ struct Root
     uint blades;
     // Diaphragm curvature: 1 round, 0 a straight-edged polygon.
     float roundness;
+    // The background layer's inputs: the mask, its lens radius (m), its focus distance and
+    // the frame's sample index.
+    TextureIndex mask;
+    StorageImageIndex background;
+    float* layer_focus;
+    float layer_radius;
+    uint sample;
+    uint _pad0;
+    uint _pad1;
 }
 ORR_ROOT(Root);
 
@@ -79,12 +90,17 @@ float distance(uint i)
         return i == 0 ? 1.0 : 6.0;
     case HIGHLIGHTS:
         return i == 0 ? 5.0 : 40.0;
+    case FENCE:
+        return i == 0 ? 0.4 : 1.0;
     default:
         return i == 0 ? 0.5 : 8.0;
     }
 }
 
 static const float WATER_LEVEL = -0.25;
+// The fence's period and bar share, in view angle: about 24 and 10 pixels.
+static const float FENCE_PERIOD = 0.091;
+static const float FENCE_DUTY = 0.4;
 
 // Surface `i` at point `x` (view space), transparent where it has a hole.
 Layer surface(uint i, float3 x)
@@ -129,6 +145,18 @@ Layer surface(uint i, float3 x)
         float bright = length(cell) < 0.08 ? 40.0 : 0.0;
         return layer(float3(0.02, 0.025, 0.04) + bright * float3(1.0, 0.85, 0.6), 1.0);
     }
+    case FENCE:
+    {
+        // Bars in view angle, and behind each, in the pinhole image hidden, a warm stripe.
+        float a = p.x / distance(i);
+        bool behind = abs(frac(a / FENCE_PERIOD) - 0.5) < 0.5 * FENCE_DUTY;
+        float shade = 0.75 + 0.25 * sin(p.y * 60.0);
+        if (i == 0)
+            return layer(float3(0.1, 0.09, 0.08) * shade, behind ? 1.0 : 0.0);
+        if (behind)
+            return layer(float3(1.6, 0.7, 0.15) * (0.8 + 0.2 * sin(p.y * 40.0)), 1.0);
+        return layer(checker(p, 0.03, float3(0.15, 0.35, 0.8), float3(0.09, 0.21, 0.48)), 1.0);
+    }
     default:
         if (i == 0)
         {
@@ -170,14 +198,14 @@ struct Trace
     float depth;
 }
 
-// Surfaces composited front to back along the ray.
-Trace trace(float3 o, float3 d)
+// Surfaces composited front to back along the ray, from ray parameter `start` on.
+Trace trace(float3 o, float3 d, float start)
 {
     Trace r;
     r.color = 0.0;
     r.depth = 0.0;
     float transmit = 1.0;
-    float last = 0.0;
+    float last = start;
     for (uint step = 0; step < surfaces(); step++)
     {
         float best = 1e30;
@@ -221,7 +249,7 @@ void frame(uint3 id: SV_DispatchThreadID)
 {
     if (any(id.xy >= uint2(root.width, root.height)))
         return;
-    Trace t = trace(0.0, focal_point(id.xy) / root.focus);
+    Trace t = trace(0.0, focal_point(id.xy) / root.focus, 0.0);
     root.radiance.get<RWTexture2D<float4>>()[id.xy] = float4(t.color, 1.0);
     root.depth.get<RWTexture2D<float>>()[id.xy] = t.depth > 0.0 ? root.near / t.depth : 0.0;
     root.motion.get<RWTexture2D<float2>>()[id.xy] = 0.0;
@@ -254,7 +282,7 @@ void reference(uint3 id: SV_DispatchThreadID)
         if (r > aperture(angle))
             continue;
         float3 o = float3(root.lens_radius * r * float2(cos(angle), sin(angle)), 0.0);
-        sum += trace(o, (f - o) / root.focus).color;
+        sum += trace(o, (f - o) / root.focus, 0.0).color;
         taken++;
     }
     float3 c = sum / float(taken);
@@ -263,4 +291,32 @@ void reference(uint3 id: SV_DispatchThreadID)
     out[1] = c.y;
     out[2] = c.z;
     out[3] = 1.0;
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void background_layer(uint3 id: SV_DispatchThreadID)
+{
+    if (any(id.xy >= uint2(root.width, root.height)))
+        return;
+    RWTexture2D<float4> layer = root.background.get<RWTexture2D<float4>>();
+    float mask = root.mask.get<Texture2D<float>>().Load(int3(id.xy, 0));
+    if (!(mask > 0.0))
+    {
+        layer[id.xy] = float4(0.0, 0.0, 0.0, -1.0);
+        return;
+    }
+    float focus = *root.layer_focus;
+    float3 f = focal_point(id.xy) * (focus / root.focus);
+    // R2 points over frames, rotated per pixel.
+    uint h = (id.x * 1973u + id.y * 9277u) * 26699u;
+    h = (h ^ (h >> 15)) * 2246822519u;
+    float2 rotation = float2(h & 0xffff, h >> 16) / 65536.0;
+    float2 u = frac(rotation + float(root.sample) * float2(0.7548776662, 0.5698402910));
+    float r = sqrt(u.x);
+    float angle = 2.0 * PI * u.y;
+    float3 o = float3(root.layer_radius * r * float2(cos(angle), sin(angle)), 0.0);
+    // The ray parameter is the view depth, so the ray starts at the mask's.
+    Trace t = trace(o, (f - o) / focus, root.near / mask);
+    layer[id.xy] = float4(t.color, t.depth > 0.0 ? root.near / t.depth : 0.0);
 }
