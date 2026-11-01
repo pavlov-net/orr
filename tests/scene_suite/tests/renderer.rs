@@ -11,9 +11,9 @@ use glam::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr::{
     Affine3, ArenaReport, Budgets, DirectionalLight, DiscProfile, FrameDesc, FrameTime,
     GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, Light, LightId, LoadState,
-    PackSource, PipelineId, Projection, ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId,
-    TextureFilter, TransformGroupDesc, TransparencyPass, ViewDesc, ViewHooks, ViewLighting,
-    ViewOutput, ViewTarget,
+    PackSource, PathEntry, PipelineId, Projection, ReloadReport, Renderer, RendererDesc, SceneDesc,
+    SceneId, TextureFilter, TransformGroupDesc, TransparencyPass, ViewDesc, ViewHooks,
+    ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source};
 use orr_gpu::{
@@ -26,7 +26,11 @@ use scene_suite::hot::fill;
 
 #[test]
 fn empty_frames_and_scene_frames_submit_in_order() {
-    let mut r = Renderer::new(device(), RendererDesc::default()).unwrap();
+    let desc = RendererDesc {
+        path_entry: PathEntry::Compute,
+        ..RendererDesc::default()
+    };
+    let mut r = Renderer::new(device(), desc).unwrap();
     let mut ids = Vec::new();
     let mut last = None;
     for i in 0..4 {
@@ -330,6 +334,7 @@ fn hooked_frames(pack: &Arc<[u8]>, alias: bool) -> (Vec<Vec<u8>>, ArenaReport) {
     // Small cluster lists, so the per-pixel targets take most of the arena and share bytes.
     let desc = RendererDesc {
         alias_view_targets: alias,
+        path_entry: PathEntry::Compute,
         budgets: Budgets {
             visible_clusters: 1024,
             cluster_work: 1024,

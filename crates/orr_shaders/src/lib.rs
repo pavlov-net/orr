@@ -20,7 +20,7 @@ pub mod openpbr;
 pub use alias::AliasEntry;
 #[cfg(feature = "hot-reload")]
 pub use build::{Reload, Watcher};
-pub use module::{EntryPoint, KernelMismatch, KernelSet, Mismatch, ShaderModule, Stage};
+pub use module::{EntryPoint, KernelMismatch, KernelSet, Mismatch, PathEntry, ShaderModule, Stage};
 
 /// The directory of orr's shared Slang libraries, imported as `orr.<name>`.
 pub const LIB_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders");

@@ -486,7 +486,7 @@ fn reference(max_bounces: u32) -> ViewLighting {
 }
 
 fn paths(settings: ViewLighting) -> Paths {
-    Paths::new(&KernelSet::default(), PathEntry::Fastest, settings)
+    Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
 }
 
 fn render_paths(bed: &mut Bed, paths: &Paths, first: u32, frames: u32) -> Accumulated {

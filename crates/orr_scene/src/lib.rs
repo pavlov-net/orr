@@ -52,7 +52,7 @@ mod world;
 
 pub use orr_gpu;
 pub use orr_pack;
-pub use orr_shaders::abi;
+pub use orr_shaders::{PathEntry, abi};
 
 pub use arena::{
     ArenaBuffer, ArenaKind, ArenaReport, ArenaRequest, ArenaTarget, ArenaTexture, Span, ViewArena,

@@ -20,7 +20,7 @@ use crate::shaders::light_sampling::local;
 use crate::shaders::path::opaque;
 use crate::shaders::types::{GuideRoot, LayerGuide, LocalLights, PathRoot};
 use crate::shaders::world_cache::update;
-use crate::{BsdfTables, Error, KernelSet, SceneLighting, module, pipeline};
+use crate::{BsdfTables, Error, KernelSet, PathEntry, SceneLighting, module, pipeline};
 
 /// Lighting settings of one view, passed with every render of it.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -512,18 +512,6 @@ pub struct ViewPass {
     pub sample_index: u32,
     /// Separates sample sets of the same pixels and sample index.
     pub seed: u32,
-}
-
-/// Which entry point of a kernel with both runs.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum PathEntry {
-    /// The raygen entry, which reorders at coherence points, where the device reorders in
-    /// hardware; the compute entry otherwise.
-    #[default]
-    Fastest,
-    Compute,
-    /// Fails without `Caps::ray_dispatch`.
-    RayDispatch,
 }
 
 /// A kernel with a raygen and a compute entry over one body, as one of them.
