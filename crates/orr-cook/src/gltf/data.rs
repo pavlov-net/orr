@@ -1,12 +1,13 @@
 //! A glTF document with its buffers ready to read.
 //!
 //! The JSON is parsed first, and the extensions the cook implements itself are removed from
-//! `extensionsRequired`, so the `gltf` crate validates the rest of the document. Buffer views
-//! compressed with `EXT_meshopt_compression` or `KHR_meshopt_compression` are decoded with
-//! meshoptimizer's decoders and filters into their fallback buffers, so every view reads as
-//! if it were stored plain. Accessors are read here, including the normalised and
-//! unnormalised integer forms `KHR_mesh_quantization` allows and sparse accessors. An asset
-//! whose `minVersion` is above glTF 2.1 is refused.
+//! `extensionsRequired`, so the `gltf` crate validates the rest of the document. A texture's
+//! `EXT_texture_webp` image replaces its core `source`, so a texture may carry only the
+//! extension's source. Buffer views compressed with `EXT_meshopt_compression` or
+//! `KHR_meshopt_compression` are decoded with meshoptimizer's decoders and filters into their
+//! fallback buffers, so every view reads as if it were stored plain. Accessors are read here,
+//! including the normalised and unnormalised integer forms `KHR_mesh_quantization` allows and
+//! sparse accessors. An asset whose `minVersion` is above glTF 2.1 is refused.
 
 use gltf::accessor::{DataType, Dimensions};
 use gltf::buffer::Source as BufferSource;
@@ -19,6 +20,7 @@ const COOK_EXTENSIONS: &[&str] = &[
     "KHR_meshopt_compression",
     "EXT_meshopt_compression",
     "EXT_mesh_gpu_instancing",
+    "EXT_texture_webp",
     "KHR_materials_anisotropy",
     "KHR_materials_clearcoat",
     "KHR_materials_diffuse_transmission",
@@ -73,6 +75,13 @@ pub(crate) fn open(
     }
     if let Some(Value::Array(required)) = json.get_mut("extensionsRequired") {
         required.retain(|e| !e.as_str().is_some_and(|n| COOK_EXTENSIONS.contains(&n)));
+    }
+    if let Some(Value::Array(textures)) = json.get_mut("textures") {
+        for t in textures {
+            if let Some(webp) = t.pointer("/extensions/EXT_texture_webp/source").cloned() {
+                t["source"] = webp;
+            }
+        }
     }
     let root: gltf::json::Root =
         serde_json::from_value(json.clone()).map_err(|e| fail(e.to_string()))?;

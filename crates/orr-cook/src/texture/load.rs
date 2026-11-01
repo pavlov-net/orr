@@ -1,5 +1,6 @@
-//! Image files to float texels: PNG, JPEG, Radiance HDR and OpenEXR through `image`, KTX2
-//! and DDS through ctt's readers, block-compressed texels decoded with bcdec.
+//! Image files to float texels: PNG, JPEG, WebP, Radiance HDR and OpenEXR through `image`,
+//! KTX2 and DDS through ctt's readers, block-compressed texels decoded with bcdec. Formats are
+//! recognized by their bytes.
 
 use std::io::Cursor;
 
