@@ -1,5 +1,6 @@
 //! A shader abort and a hang lose the device, and the report names the pass. Both are
-//! ignored by default so whole-suite runs never lose the device on purpose; each runs alone:
+//! ignored by default and skip themselves unless `ORR_GPU_EXPECT_FAULT=1`, so a broad
+//! `--ignored` run never loses the device. Each runs alone:
 //! `ORR_GPU_EXPECT_FAULT=1 cargo test -p gpu_suite --test crash -- --ignored <name>`.
 //! The hang resets the GPU, so no other GPU application may be running.
 
@@ -7,7 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use gpu_suite::shaders::{abort, gate, hang};
-use gpu_suite::{assert_clean, device_with, pipeline, readback, render, upload};
+use gpu_suite::{assert_clean, device_with, fault_allowed, pipeline, readback, render, upload};
 use orr_gpu::{
     Device, Diagnostics, DiagnosticsReport, Error, Hazards, QueueKind, QueueProgress, ShaderModule,
     Stages,
@@ -68,6 +69,9 @@ fn lose_device(
 #[test]
 #[ignore = "loses the device: run alone with ORR_GPU_EXPECT_FAULT=1 cargo test -p gpu_suite --test crash -- --ignored abort_reports_pass_and_faults"]
 fn abort_reports_pass_and_faults() {
+    if !fault_allowed() {
+        return;
+    }
     let d = device_with(Diagnostics::Checkpoints);
     if !d.caps().shader_abort || !d.caps().breadcrumbs {
         log::warn!(
@@ -92,6 +96,9 @@ fn abort_reports_pass_and_faults() {
 #[test]
 #[ignore = "hangs and resets the GPU: run alone, with no other GPU application, using ORR_GPU_EXPECT_FAULT=1 cargo test -p gpu_suite --test crash -- --ignored hang_reports_pass_and_dumps"]
 fn hang_reports_pass_and_dumps() {
+    if !fault_allowed() {
+        return;
+    }
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("crash-dumps");
     let _ = std::fs::remove_dir_all(&dir);
     let dir: &'static Path = Box::leak(dir.into_boxed_path());

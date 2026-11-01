@@ -99,6 +99,20 @@ pub fn require(cond: bool, why: &str) -> bool {
     cond
 }
 
+/// Whether `ORR_GPU_EXPECT_FAULT=1` is set, which a test that loses or hangs the device on
+/// purpose needs; when not, logs one line saying the calling test is skipped. Call it before
+/// creating the device.
+pub fn fault_allowed() -> bool {
+    let allowed = std::env::var_os("ORR_GPU_EXPECT_FAULT").is_some_and(|v| v == "1");
+    if !allowed {
+        log_to_stderr();
+        log::warn!(
+            "skipped: loses or hangs the device on purpose; set ORR_GPU_EXPECT_FAULT=1 to run it"
+        );
+    }
+    allowed
+}
+
 /// Fails the calling test if the validation layer has reported anything.
 pub fn assert_clean() {
     assert_eq!(

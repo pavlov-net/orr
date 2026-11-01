@@ -1,11 +1,14 @@
-//! Kernels built with asserts lose the device when an assert fails, so these tests are ignored
-//! by default and whole-suite runs never lose the device on purpose. Each runs alone:
+//! Kernels built with asserts lose the device when an assert fails. These tests are ignored by
+//! default and skip themselves unless `ORR_GPU_EXPECT_FAULT=1`, so a broad `--ignored` run
+//! never loses the device. Each runs alone:
 //! `ORR_GPU_EXPECT_FAULT=1 cargo test -p shader_abi --test crash -- --ignored <name>`.
 
 use std::path::Path;
 use std::time::Duration;
 
-use gpu_suite::{assert_clean, device, device_with, pipeline, readback, render, require, upload};
+use gpu_suite::{
+    assert_clean, device, device_with, fault_allowed, pipeline, readback, render, require, upload,
+};
 use orr_gpu::{Diagnostics, Error, Hazards, QueueKind, Stages, Tlas};
 use shader_abi::assert_shaders::{forced, null_tlas};
 
@@ -13,6 +16,9 @@ use shader_abi::assert_shaders::{forced, null_tlas};
 #[test]
 #[ignore = "loses the device: run alone with ORR_GPU_EXPECT_FAULT=1 cargo test -p shader_abi --test crash -- --ignored null_tlas_aborts_with_asserts"]
 fn null_tlas_aborts_with_asserts() {
+    if !fault_allowed() {
+        return;
+    }
     if !require(device().caps().shader_abort, "no shader abort") {
         return;
     }
@@ -45,6 +51,9 @@ fn null_tlas_aborts_with_asserts() {
 #[test]
 #[ignore = "loses the device: run alone with ORR_GPU_EXPECT_FAULT=1 cargo test -p shader_abi --test crash -- --ignored failed_assert_dumps_with_source_lines"]
 fn failed_assert_dumps_with_source_lines() {
+    if !fault_allowed() {
+        return;
+    }
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("assert-dumps");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
