@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 use std::{env, fs, thread};
 
+use jobserver::{Acquired, Client};
 use serde::{Deserialize, Serialize};
 
 use super::codegen::{self, Kernel, Owner, Shared};
@@ -999,30 +1001,32 @@ fn compile_all(
     if jobs.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let threads = thread::available_parallelism()
-        .map_or(1, std::num::NonZero::get)
-        .min(jobs.len());
+    let max = jobs.len();
     let queue = Mutex::new(jobs);
     let results = Mutex::new(Vec::new());
-    thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                let mut global: Option<GlobalSession> = None;
-                loop {
-                    let Some(job) = queue.lock().expect("queue").pop() else {
-                        break;
-                    };
-                    let result = compile_one(lib, &mut global, settings, &job).and_then(|record| {
-                        write(
-                            &job.record,
-                            &serde_json::to_vec(&record).expect("records serialise"),
-                        )?;
-                        Ok(record)
-                    });
-                    results.lock().expect("results").push((job.name, result));
-                }
+    let work = || {
+        let mut global: Option<GlobalSession> = None;
+        loop {
+            let Some(job) = queue.lock().expect("queue").pop() else {
+                break;
+            };
+            let result = compile_one(lib, &mut global, settings, &job).and_then(|record| {
+                write(
+                    &job.record,
+                    &serde_json::to_vec(&record).expect("records serialise"),
+                )?;
+                Ok(record)
             });
+            results.lock().expect("results").push((job.name, result));
         }
+    };
+    thread::scope(|scope| match parallelism() {
+        Parallelism::Threads(n) => {
+            for _ in 0..n.min(max) {
+                scope.spawn(work);
+            }
+        }
+        Parallelism::Jobserver(client) => spawn_with_tokens(scope, client, max, work),
     });
     let mut out = BTreeMap::new();
     let mut results = results.into_inner().expect("results");
@@ -1031,6 +1035,67 @@ fn compile_all(
         out.insert(name, result?);
     }
     Ok(out)
+}
+
+enum Parallelism {
+    Threads(usize),
+    /// Cargo's jobserver, so the modules of every build script share cargo's `-j` limit.
+    Jobserver(Client),
+}
+
+/// In a build script (cargo sets `NUM_JOBS` only there), cargo's jobserver or else
+/// `NUM_JOBS` threads; elsewhere one thread per core.
+fn parallelism() -> Parallelism {
+    let Ok(jobs) = env::var("NUM_JOBS") else {
+        return Parallelism::Threads(thread::available_parallelism().map_or(1, NonZero::get));
+    };
+    // SAFETY: `from_env` duplicates the descriptors (or opens the fifo or semaphore) named in
+    // CARGO_MAKEFLAGS, which this process leaves as cargo passed them.
+    match unsafe { Client::from_env() } {
+        Some(client) => Parallelism::Jobserver(client),
+        None => Parallelism::Threads(jobs.parse().map_or(1, NonZero::<usize>::get)),
+    }
+}
+
+/// Runs `work` on up to `max` threads: one on the build script's implicit token and one
+/// more for each token cargo hands out before the jobs run out.
+fn spawn_with_tokens<'scope>(
+    scope: &'scope thread::Scope<'scope, '_>,
+    client: Client,
+    max: usize,
+    work: impl FnOnce() + Copy + Send + 'scope,
+) {
+    /// Tells the dispatcher that a worker found the queue empty, also when it panics.
+    struct Done(mpsc::Sender<Option<Acquired>>);
+    impl Drop for Done {
+        fn drop(&mut self) {
+            let _ = self.0.send(None);
+        }
+    }
+    let (tx, rx) = mpsc::channel();
+    let spawn = |token: Option<Acquired>| {
+        let done = Done(tx.clone());
+        scope.spawn(move || {
+            let _done = done;
+            let _token = token;
+            work();
+        });
+    };
+    spawn(None);
+    let tokens = tx.clone();
+    let Ok(helper) = client.into_helper_thread(move |token| {
+        if let Ok(token) = token {
+            let _ = tokens.send(Some(token));
+        }
+    }) else {
+        return;
+    };
+    for _ in 1..max {
+        helper.request_token();
+    }
+    while let Ok(Some(token)) = rx.recv() {
+        spawn(Some(token));
+    }
 }
 
 fn compile_one(
