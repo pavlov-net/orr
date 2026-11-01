@@ -48,7 +48,7 @@ fn empty_frames_and_scene_frames_submit_in_order() {
     let s = r
         .create_scene(&SceneDesc::default(), &Default::default())
         .unwrap();
-    let history = r.create_view_history().unwrap();
+    let history = r.create_raster_view_history().unwrap();
     let list = [s];
     for i in 0..3 {
         let mut f = r

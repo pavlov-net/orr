@@ -89,7 +89,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             &SceneLightingSettings::default(),
         )
         .expect("scene");
-    let history = renderer.create_view_history().expect("view history");
+    let history = renderer.create_raster_view_history().expect("view history");
     let [
         terrain_kernel,
         grass_kernel,
