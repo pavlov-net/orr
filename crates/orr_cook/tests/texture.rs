@@ -780,6 +780,10 @@ fn bcn_material_textures_keep_their_blocks() {
     let (specular, specular_blocks) = ktx2(n, n, ctt::Format::BC4_UNORM_BLOCK, |x, y| {
         [wave(x, y, 6), 0, 0, 255]
     });
+    // Constant metalness: roughness alone, a BC4 taken from the red half of the BC5.
+    let (rough, rough_blocks) = ktx2(n, n, ctt::Format::BC5_UNORM_BLOCK, |x, y| {
+        [wave(x, y, 3), 0, 0, 255]
+    });
     let path = d.join("bcn.glb");
     write_glb(
         &path,
@@ -790,8 +794,11 @@ fn bcn_material_textures_keep_their_blocks() {
             r#"{"pbrMetallicRoughness":{"metallicRoughnessTexture":{"index":2}},
                 "extensions":{"KHR_materials_specular":{"specularTexture":{"index":3}}}}"#
                 .into(),
+            r#"{"pbrMetallicRoughness":{"metallicRoughnessTexture":{"index":4}},
+                "normalTexture":{"index":1}}"#
+                .into(),
         ],
-        &[color, normal, rm, specular],
+        &[color, normal, rm, specular, rough],
     );
     // The specular image keeps its weight in red, not glTF's alpha.
     let overrides = vec![(
@@ -852,6 +859,17 @@ fn bcn_material_textures_keep_their_blocks() {
         levels[1], rm_blocks[1],
         "Toksvig raises roughness below mip 0"
     );
+    let m2 = material(2);
+    assert_eq!(m2.textures[slot::METALNESS].texture, AssetId::NONE);
+    let (info, levels) = mips(&a, &name(m2.textures[slot::ROUGHNESS].texture));
+    assert_eq!(info.header.vk_format, vk::BC4_UNORM);
+    assert_eq!(levels[0].len(), rough_blocks.len());
+    let red: Vec<u8> = rough_blocks[0]
+        .chunks_exact(16)
+        .flat_map(|b| &b[..8])
+        .copied()
+        .collect();
+    assert_eq!(levels[0][0], red);
 }
 
 #[test]
