@@ -81,27 +81,28 @@ public bool part_pose(SceneRoot* s, InstanceGpu inst, MeshGpu* mesh, uint part, 
     return any(pose[0] != 0.0) || any(pose[1] != 0.0) || any(pose[2] != 0.0);
 }
 
-// Whether the raster poses cluster `c` of the copy in `slot` this frame, or with
-// `previous` in the previous one: an animated part's cluster of a copy inside its
-// animation range.
-public bool cluster_posed(SceneRoot* s, uint slot, Cluster c, bool previous)
+// Whether the raster poses cluster `c` of slot copy `copy` this frame, or with `previous` in
+// the previous one: an animated part's cluster of a copy inside its animation range. A far
+// chain step is never posed.
+public bool cluster_posed(SceneRoot* s, uint copy, Cluster c, bool previous)
 {
-    if ((c.flags & CLUSTER_ANIMATED_PART) == 0)
+    if ((c.flags & CLUSTER_ANIMATED_PART) == 0 || (copy & COPY_FAR) != 0)
         return false;
-    return (s.slot_state[slot].rt_flags & (previous ? RT_WAS_ANIMATED : RT_ANIMATED)) != 0;
+    return (s.slot_state[copy].rt_flags & (previous ? RT_WAS_ANIMATED : RT_ANIMATED)) != 0;
 }
 
-// The raster's placement of cluster `c` of the copy in `slot`, from the copy's placement:
-// posed by its part's transform when `cluster_posed`. False when the pose hides the part.
-public bool cluster_placement(SceneRoot* s, uint slot, InstanceGpu inst, Cluster c, Placement copy, bool previous, out Placement p)
+// The raster's placement of cluster `c` of slot copy `copy` (record `inst`), from the copy's
+// placement: posed by its part's transform when `cluster_posed`. False when the pose hides
+// the part.
+public bool cluster_placement(SceneRoot* s, uint copy, InstanceGpu inst, Cluster c, Placement placed, bool previous, out Placement p)
 {
-    p = copy;
-    if (!cluster_posed(s, slot, c, previous))
+    p = placed;
+    if (!cluster_posed(s, copy, c, previous))
         return true;
     float3x4 pose;
     if (!part_pose(s, inst, s.meshes + s.models[inst.model].mesh, c.part, previous, pose))
         return false;
-    p = placed_after(copy, pose);
+    p = placed_after(placed, pose);
     return true;
 }
 
@@ -173,6 +174,23 @@ public uint section_material(SceneRoot* s, InstanceGpu inst, ModelGpu* model, ui
         return model.materials[section];
     uint set = (inst.variant >> 8) & 0xff;
     return s.material_sets[inst.material_base + set * model.section_count + section];
+}
+
+// Separates the chain fade's draws from a pixel's or ray's other draws.
+static const uint CHAIN_FADE_STREAM = 0x3c6ef372u;
+
+// The chain fade's uniform draw at `pixel` in frame `frame`, shared by both steps of slot
+// `slot`.
+public float fade_draw_pixel(uint2 pixel, uint frame, uint slot)
+{
+    return unit_float(pcg3d(uint3(pixel.x ^ CHAIN_FADE_STREAM, pixel.y ^ (slot * 0x9e3779b9u), frame)).x);
+}
+
+// The chain fade's uniform draw for a ray along `d` in frame `frame`, shared by both steps
+// of slot `slot`.
+public float fade_draw_ray(float3 d, uint frame, uint slot)
+{
+    return unit_float(pcg3d(uint3(asuint(d.x) ^ (slot * 0x9e3779b9u), asuint(d.y) ^ CHAIN_FADE_STREAM, asuint(d.z) ^ frame)).x);
 }
 
 // Whether the copy's section mask hides `section`.
@@ -413,16 +431,17 @@ public struct SurfaceHit
     public bool valid;            // false for hits on entries this module does not resolve
 }
 
-// The instance slot of PTLAS instance `index`: slot instances name themselves, part
-// instances their copy's slot. False for producer entries (`hit_producer`).
-public bool hit_slot(SceneRoot* s, uint index, out uint slot)
+// The slot copy of PTLAS instance `index`: slot instances name themselves, part instances
+// their copy's slot, and the instance tracing a fading copy's far step its slot with
+// COPY_FAR. False for producer entries (`hit_producer`).
+public bool hit_copy(SceneRoot* s, uint index, out uint copy)
 {
-    slot = index;
+    copy = index;
     if (index < s.part_base)
         return true;
     if (index < s.producer_base)
     {
-        slot = s.part_slots[index - s.part_base];
+        copy = s.part_slots[index - s.part_base];
         return true;
     }
     return false;
@@ -440,10 +459,10 @@ public uint traced_material(SceneRoot* s, uint instance_index, uint cluster_id)
             return MATERIAL_NONE;
         return producer_material(s.producers[entry], b.clusters[cluster_id]);
     }
-    uint slot;
-    if (!hit_slot(s, instance_index, slot))
+    uint copy;
+    if (!hit_copy(s, instance_index, copy))
         return MATERIAL_NONE;
-    InstanceGpu inst = s.instances[slot];
+    InstanceGpu inst = copy_record(s, copy);
     ClusterRef r = s.clusters[cluster_id];
     return section_material(s, inst, s.models + inst.model, load_cluster(r.page, r.local).section);
 }
@@ -491,10 +510,10 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
     }
     else
     {
-        uint slot;
-        if (!hit_slot(s, instance_index, slot))
+        uint copy;
+        if (!hit_copy(s, instance_index, copy))
             return false;
-        InstanceGpu inst = s.instances[slot];
+        InstanceGpu inst = copy_record(s, copy);
         ModelGpu* model = s.models + inst.model;
         MeshGpu* mesh = s.meshes + model.mesh;
         ClusterRef r = s.clusters[cluster_id];
@@ -510,14 +529,14 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
         if (!placement(g, previous ? g.previous : g.current, inst.group_index, s.origin_cell.xyz, float3(0.0), cell_log2, pl))
             return false;
         // A part instance traces its part posed.
-        if (instance_index >= s.part_base)
+        if (instance_index >= s.part_base && (copy & COPY_FAR) == 0)
         {
             float3x4 pose;
             if (!part_pose(s, inst, mesh, c.part, previous, pose))
                 return false;
             pl = placed_after(pl, pose);
         }
-        i.instance = slot;
+        i.instance = copy;
         i.cluster = r.mesh_cluster;
         i.part = c.part;
         i.user_tag = inst.user_tag;
@@ -606,15 +625,31 @@ public SurfaceHit resolve_hit<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
     return hit;
 }
 
-// Whether a non-opaque triangle candidate is present: with probability the surface's
-// coverage (the material's alpha test unless a linked surface has its own), against a draw
-// hashed from the candidate and the frame.
+// Whether a fading copy's step is present for the ray along `d`; true for every other hit.
+bool fade_present(SceneRoot* s, float3 d, uint instance_index)
+{
+    uint copy;
+    if (!hit_copy(s, instance_index, copy))
+        return true;
+    return copy_present(s, copy, fade_draw_ray(d, s.frame_index, copy_slot(copy)));
+}
+
+// Whether a non-opaque triangle candidate is present: on a fading copy's step, by its share
+// of the fade against a draw both steps share; then for alpha-tested materials with
+// probability the surface's coverage (the material's alpha test unless a linked surface has
+// its own), against a draw hashed from the candidate and the frame.
 public bool resolve_alpha<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context)
 {
+    if (!fade_present(s, d, instance_index))
+        return false;
     Corners t = (Corners)0;
     HitInput h;
     if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, false, false, context, h))
         return false;
+    // A fading copy's triangles of materials without an alpha test are candidates only for
+    // the fade.
+    if ((s.materials[h.input.material].flags & MATERIAL_ALPHA_TESTED) == 0)
+        return true;
     uint3 key = uint3(asuint(bary.x) ^ (instance_index * 0x9E3779B9u), asuint(bary.y) ^ (primitive * 0x85EBCA6Bu), s.frame_index ^ cluster_id);
     return S.coverage(h.input) > unit_float(pcg3d(key).x);
 }
@@ -624,6 +659,8 @@ public bool resolve_alpha<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d
 // pass rays through by it.
 public float resolve_coverage<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, HitContext context)
 {
+    if (!fade_present(s, d, instance_index))
+        return 0.0;
     Corners t = (Corners)0;
     HitInput h;
     if (!hit_input(s, v, d, instance_index, cluster_id, primitive, bary, t, false, false, context, h))

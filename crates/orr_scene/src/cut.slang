@@ -65,7 +65,7 @@ public struct SlotCutGpu
     public uint rt_fill;           // CUT_OWNER: addresses written so far
     public uint coarsen[2];        // raster, ray tracing: the error scale (f32 bits) that keeps every node it needs resident
     public uint owner;             // the slot whose BLAS it traces
-    public uint _pad;
+    public uint far_cut;           // while its copy fades: the cached cut of its far step
 }
 
 // A hierarchy node one traversal pass visits for a slot.

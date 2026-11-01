@@ -63,11 +63,18 @@ void instances(uint3 id: SV_DispatchThreadID)
     }
     if ((s.cut.slots[slot].flags & CUT_RASTER) == 0)
         return;
-    InstanceGpu inst = s.instances[slot];
+    InstanceGpu inst = copy_record(s, slot);
     Placement p;
     float3 lo, hi;
     if (!instance_placement(s, inst, v, p) || !copy_bounds(s, inst, lo, hi))
         return;
+    // A fading copy draws both its steps.
+    if (copy_fading(s, slot))
+    {
+        ModelGpu* far = s.models + copy_record(s, slot | COPY_FAR).model;
+        lo = min(lo, far.bounds_min);
+        hi = max(hi, far.bounds_max);
+    }
     float3 center = place(p, 0.5 * (lo + hi));
     float radius = 0.5 * length(hi - lo) * p.scale;
     if (!sphere_visible(v, center, radius))
@@ -180,25 +187,25 @@ void append(RasterGpu* r, uint count, uint* list, uint visible)
     list[slot] = visible;
 }
 
-// Hands cluster `local` of page `page_index` to the raster lists.
-void draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint slot, MeshGpu* mesh, uint8_t* page, uint page_index, uint local, Cluster c, Placement p, float3 lo, float3 hi, uint material, MaterialGpu* m)
+// Hands cluster `local` of page `page_index` of slot copy `copy` to the raster lists.
+void draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint copy, MeshGpu* mesh, uint8_t* page, uint page_index, uint local, Cluster c, Placement p, float3 lo, float3 hi, uint material, MaterialGpu* m)
 {
     VisibleCluster vc;
     vc.page = page;
-    vc.instance = slot;
+    vc.instance = copy;
     vc.cluster = mesh.page_clusters[page_index] + local;
     vc.local = local;
     vc.material = material;
     uint visible;
     if (!add_visible(r, vc, visible))
         return;
-    s.slot_state[slot].last_visible_frame = s.frame_index;
+    s.slot_state[copy_slot(copy)].last_visible_frame = s.frame_index;
     if (r.software_pixels > 0.0 && small_on_screen(v, p, lo, hi, r.software_pixels))
     {
         append(r, COUNT_SOFTWARE, r.software, visible);
         return;
     }
-    uint alpha = alpha_start(m, c);
+    uint alpha = alpha_start(s, vc, m, c);
     if (alpha > 0)
         append(r, COUNT_OPAQUE, r.opaque, visible);
     if (alpha < c.tri_count)
@@ -230,7 +237,8 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     ClusterWork w = (ClusterWork)0;
     if (index < n)
         w = second ? r.work[index] : cut.candidates[index];
-    uint slot = w.instance;
+    uint copy = w.instance;
+    uint slot = copy_slot(copy);
     bool retry = (w.first & WORK_RETRY) != 0;
     uint local = (w.first & ~WORK_RETRY) + thread;
     bool mine = index < n && ((w.mask >> thread) & 1) != 0;
@@ -244,11 +252,11 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     }
     else if (state != SLOT_CULLED)
     {
-        InstanceGpu inst = s.instances[slot];
+        InstanceGpu inst = copy_record(s, copy);
         ModelGpu* model = s.models + inst.model;
         MeshGpu* mesh = s.meshes + model.mesh;
         uint8_t* page = (uint8_t*)mesh.pages[w.page];
-        Placement copy = (Placement)0;
+        Placement placed = (Placement)0;
         Placement p = (Placement)0;
         Cluster c = (Cluster)0;
         uint material = MATERIAL_NONE;
@@ -256,11 +264,11 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         bool skinned = copy_skin(s, inst, k);
         float3 lo = float3(0.0);
         float3 hi = float3(0.0);
-        bool shown = page != nullptr && instance_placement(s, inst, v, copy);
+        bool shown = page != nullptr && instance_placement(s, inst, v, placed);
         if (shown)
         {
             c = load_cluster(page, local);
-            shown = cluster_placement(s, slot, inst, c, copy, false, p);
+            shown = cluster_placement(s, copy, inst, c, placed, false, p);
         }
         if (shown)
         {
@@ -292,7 +300,7 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
                 Placement before_copy;
                 Placement before;
                 if (placement(g, g.previous, inst.group_index, v, before_copy)
-                    && cluster_placement(s, slot, inst, c, before_copy, true, before)
+                    && cluster_placement(s, copy, inst, c, before_copy, true, before)
                     && box_occluded(v, r, before, lo, hi, true))
                 {
                     InterlockedOr(rejected, 1u << thread);
@@ -308,7 +316,7 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
                 lo = grid_position(c.anchor, uint3(0), mesh.position_step);
                 hi = grid_position(c.anchor, uint3(c.local_max[0], c.local_max[1], c.local_max[2]), mesh.position_step);
             }
-            draw(s, v, r, slot, mesh, page, w.page, local, c, p, lo, hi, material, s.materials + material);
+            draw(s, v, r, copy, mesh, page, w.page, local, c, p, lo, hi, material, s.materials + material);
         }
     }
     GroupMemoryBarrierWithGroupSync();

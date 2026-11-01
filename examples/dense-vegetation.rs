@@ -3,7 +3,7 @@
 //! 1 km heightfield tile, path traced under a low sun and a moon. See `examples::vegetation`
 //! for what it holds and the switches it takes.
 //!
-//! `dense-vegetation [--synthetic] [--script walk|turn|overview|flythrough] [--frames N]
+//! `dense-vegetation [--synthetic] [--script walk|turn|overview|flythrough|flyout] [--frames N]
 //! [--headless] [--out file.png] [scene switches...]`. Without `--synthetic` the trees come
 //! from `$ORR_CONTENT/cooked`. Headless runs render 480 x 270 for 120 frames unless told
 //! otherwise and write the last frame as a PNG.

@@ -4,18 +4,20 @@
 //! drawn at the transparency point, a low limb-darkened sun and a textured moon it lights,
 //! all path traced through `render_view`. Trees come from cooked archives in
 //! `$ORR_CONTENT/cooked`, or with `--synthetic` from stand-in trees of four species and three
-//! variants cooked in process. Camera scripts walk, turn, look from above and fly through it
-//! on a fixed clock, so runs repeat; each frame's figures go into a [`Report`].
+//! variants cooked in process. Past 150, 400 and 1000 m from the focus each tree switches to
+//! a coarser stand-in of its species (`tree S far 1` to `3` in the same pack), cross-fading
+//! between them. Camera scripts walk, turn, look from above, fly through it and fly out from
+//! it on a fixed clock, so runs repeat; each frame's figures go into a [`Report`].
 //!
 //! Switches (all optional):
 //! `--synthetic`, `--trees N`, `--species N`, `--grass-density D` (blades per m^2),
 //! `--grass-radius M`, `--parts all|trunk`, `--poses-per-variant N`, `--pose-stride`,
 //! `--no-part-animation`, `--rt-range M`, `--animation-range M`, `--directional-lights L,T`,
 //! `--sw-raster-px P`, `--lod0-only`, `--world-km K`, `--world-density N` (trees per km^2
-//! outside the tile), `--particles N`, `--stream-load`, `--extent WxH`, `--script NAME`
-//! (walk, turn, overview, flythrough), `--script-frames N` and `--counter-frame N` (the frame of
-//! the first script whose per-pass Nsight Perf SDK counters the run collects, when the device
-//! has `Caps::perf_counters`).
+//! outside the tile), `--particles N`, `--stream-load`, `--no-chain`, `--extent WxH`,
+//! `--script NAME` (walk, turn, overview, flythrough, flyout), `--script-frames N` and
+//! `--counter-frame N` (the frame of the first script whose per-pass Nsight Perf SDK counters
+//! the run collects, when the device has `Caps::perf_counters`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -110,14 +112,17 @@ pub enum Script {
     Overview,
     /// Across the tile at 25 m, twice walking speed.
     Flythrough,
+    /// From the forest's edge out to 8 km in a minute, climbing, looking back at it.
+    Flyout,
 }
 
 impl Script {
-    pub const ALL: [Script; 4] = [
+    pub const ALL: [Script; 5] = [
         Script::Walk,
         Script::Turn,
         Script::Overview,
         Script::Flythrough,
+        Script::Flyout,
     ];
 
     pub fn name(self) -> &'static str {
@@ -126,6 +131,7 @@ impl Script {
             Script::Turn => "turn",
             Script::Overview => "overview",
             Script::Flythrough => "flythrough",
+            Script::Flyout => "flyout",
         }
     }
 
@@ -158,6 +164,12 @@ impl Script {
             Script::Overview => {
                 let a = 0.8 + 0.05 * t;
                 let eye = Vec3::new(a.cos() * 400.0, 300.0 + ground(0.0, 0.0), a.sin() * 400.0);
+                (eye, Vec3::new(0.0, ground(0.0, 0.0), 0.0))
+            }
+            Script::Flyout => {
+                let out = Vec3::new(1.0, 0.0, 0.6).normalize();
+                let d = 8000.0 * (t / 60.0).min(1.0);
+                let eye = out * d + Vec3::Y * (ground(0.0, 0.0) + 20.0 + 0.05 * d);
                 (eye, Vec3::new(0.0, ground(0.0, 0.0), 0.0))
             }
             Script::Flythrough => {
@@ -200,6 +212,8 @@ pub struct Settings {
     pub world_density: f32,
     pub particles: u32,
     pub stream_load: bool,
+    /// Trees switch to coarser stand-ins with distance, where the packs hold them.
+    pub chain: bool,
     pub extent: [u32; 2],
     pub scripts: Vec<Script>,
     /// Frames per script; `None` runs the window's script until it closes.
@@ -230,6 +244,7 @@ impl Settings {
             world_density: 400.0,
             particles: 320,
             stream_load: false,
+            chain: true,
             extent: [1920, 1080],
             scripts: vec![Script::Walk],
             script_frames: None,
@@ -272,6 +287,7 @@ impl Settings {
                 "--world-density" => s.world_density = number(value()),
                 "--particles" => s.particles = number(value()) as u32,
                 "--stream-load" => s.stream_load = true,
+                "--no-chain" => s.chain = false,
                 "--extent" => {
                     let v = value();
                     let (w, h) = v.split_once('x').expect("--extent WxH");
@@ -339,6 +355,41 @@ const SPECIES: [Species; 4] = [
 /// A tree model's asset name.
 fn tree_name(species: u32, variant: u32) -> String {
     format!("tree {species} {variant}")
+}
+
+/// Where each coarser stand-in of a tree takes over, in m from the focus.
+const CHAIN_DISTANCES: [f32; 3] = [150.0, 400.0, 1000.0];
+
+/// The asset name of a species' stand-in for chain step `step`, 1 to 3.
+fn far_tree_name(species: u32, step: u32) -> String {
+    format!("tree {species} far {step}")
+}
+
+/// A species' stand-in for chain step `step`: a trunk and a crown of solid balls stacked up
+/// it, narrowing to the top, coarser each step. Section 0 bark, section 1 crown.
+fn far_tree(species: u32, step: u32) -> orr_cook::MeshInput {
+    let s = &SPECIES[species as usize];
+    let mut m = MeshBuilder::default();
+    let trunk = s.height * 0.02;
+    let rings = [8, 5, 3][step as usize - 1];
+    m.tube(
+        0,
+        Vec3::ZERO,
+        Vec3::Y * s.height * 0.6,
+        trunk,
+        trunk * 0.5,
+        rings,
+        1,
+    );
+    let crown_base = s.height * 0.35;
+    let radius = s.crown * 0.55;
+    let balls = ((s.height - crown_base) / (1.6 * radius)).ceil().max(1.0) as u32;
+    for b in 0..balls {
+        let t = (b as f32 + 0.5) / balls as f32;
+        let y = crown_base + (s.height - crown_base) * t;
+        m.sphere(1, Vec3::Y * y, radius * (1.0 - 0.5 * t), rings);
+    }
+    m.finish()
 }
 
 /// A small xorshift generator, so content and placement repeat.
@@ -481,7 +532,22 @@ fn cook(settings: &Settings) -> Arc<[u8]> {
             ..Material::default()
         };
         leaves.textures[slot::OPACITY].texture = AssetId::from_name(LEAF);
+        let crown = Material {
+            base_color: [0.16, 0.36, 0.11],
+            specular_roughness: 0.9,
+            ..Material::default()
+        };
         for s in 0..settings.species.min(SPECIES.len() as u32) {
+            for step in 1..=CHAIN_DISTANCES.len() as u32 {
+                assets.push(AssetSpec {
+                    name: far_tree_name(s, step),
+                    source: Source::Mesh {
+                        mesh: far_tree(s, step),
+                        materials: vec![bark, crown],
+                        settings: MeshSettings::default(),
+                    },
+                });
+            }
             for v in 0..VARIANTS {
                 assets.push(AssetSpec {
                     name: tree_name(s, v),
@@ -841,6 +907,17 @@ impl DenseVegetation {
                 let found = archives.iter().find_map(|(m, a, _)| {
                     let (parts, joints) = tree_parts(a, &name)?;
                     let model = renderer.model(*m, AssetId::from_name(&name)).ok()?;
+                    // The species' stand-ins in the same pack, when it holds them all.
+                    let chain: Option<Vec<(ModelId, f32)>> = (1..=CHAIN_DISTANCES.len() as u32)
+                        .zip(CHAIN_DISTANCES)
+                        .map(|(step, d)| {
+                            let id = AssetId::from_name(&far_tree_name(s, step));
+                            Some((renderer.model(*m, id).ok()?, d))
+                        })
+                        .collect();
+                    if let Some(chain) = chain.filter(|_| settings.chain) {
+                        renderer.set_chain(model, &chain).expect("tree chain");
+                    }
                     Some(TreeModel {
                         model,
                         parts,

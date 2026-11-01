@@ -161,11 +161,12 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
         if (deformed)
             c = producer_triangle(pb, pb.clusters[vc.cluster], visibility_triangle(w), true).corners;
     }
-    else if (copy_skin(s, s.instances[vc.instance], k))
+    else
     {
-        deformed = true;
-        MeshGpu* mesh = s.meshes + s.models[s.instances[vc.instance].model].mesh;
-        skinned_corners(k, mesh, vc.page, load_cluster(vc.page, vc.local), vc.cluster, visibility_triangle(w), true, c);
+        InstanceGpu inst = copy_record(s, vc.instance);
+        deformed = copy_skin(s, inst, k);
+        if (deformed)
+            skinned_corners(k, s.meshes + s.models[inst.model].mesh, vc.page, load_cluster(vc.page, vc.local), vc.cluster, visibility_triangle(w), true, c);
     }
     if (deformed)
     {
