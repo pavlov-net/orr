@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use orr_color::RgbPrimaries;
 use orr_cook::{
-    ArchiveSpec, AssetSpec, GltfSettings, Manifest, Primaries, Quality, Source, TextureOverride,
-    TextureRules, TextureSettings, Usage,
+    ArchiveSpec, AssetSpec, GltfSettings, InputChannels, Manifest, Primaries, Quality, Source,
+    TextureOverride, TextureRules, TextureSettings, Usage,
 };
 use orr_pack::material::{Material, slot};
 use orr_pack::model::ModelInfo;
@@ -699,6 +699,159 @@ fn chain_bytes(format: u32, w: u32, h: u32) -> u64 {
             f.mip_bytes(mw, mh) as u64
         })
         .sum()
+}
+
+/// A KTX2 of `w` x `h` RGBA8 texels in `format` with every mip, and its mips as blocks.
+fn ktx2(
+    w: u32,
+    h: u32,
+    format: ctt::Format,
+    f: impl Fn(u32, u32) -> [u8; 4],
+) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let texels: Vec<u8> = (0..w * h).flat_map(|i| f(i % w, i / w)).collect();
+    let srgb = format == ctt::Format::BC7_SRGB_BLOCK;
+    let image = ctt::ImageRef {
+        surfaces: vec![vec![ctt::SurfaceRef {
+            data: &texels,
+            width: w,
+            height: h,
+            depth: 1,
+            stride: w * 4,
+            slice_stride: 0,
+        }]],
+        kind: ctt::TextureKind::Texture2D,
+        desc: ctt::FormatDesc {
+            format: if srgb {
+                ctt::Format::R8G8B8A8_SRGB
+            } else {
+                ctt::Format::R8G8B8A8_UNORM
+            },
+            color_space: if srgb {
+                ctt::ColorSpace::Srgb
+            } else {
+                ctt::ColorSpace::Linear
+            },
+            alpha: ctt::AlphaMode::Straight,
+        },
+    };
+    let encoder = if srgb {
+        ctt::encoders::Encoder::Bc7enc(Default::default())
+    } else {
+        ctt::encoders::Encoder::Intel(Default::default())
+    };
+    let ctt::PipelineOutput::Encoded(bytes) = ctt::convert(
+        image,
+        ctt::ConvertSettings {
+            format: Some(ctt::TargetFormat::Compressed { format, encoder }),
+            container: ctt::Container::ktx2(),
+            quality: ctt::Quality::Fast,
+            mipmap: true,
+            ..Default::default()
+        },
+    )
+    .unwrap() else {
+        panic!("container output");
+    };
+    let src = ctt::input::decode_container(&bytes, Default::default())
+        .unwrap()
+        .unwrap();
+    let blocks = src.surfaces[0].iter().map(|s| s.data.to_vec()).collect();
+    (bytes, blocks)
+}
+
+/// BCn images that already hold what the material wants keep their blocks: every mip, or
+/// mip 0 where the cook makes the other mips (Toksvig roughness). Two-channel images hold
+/// roughness and metalness in red and green, and overrides name other channels.
+#[test]
+fn bcn_material_textures_keep_their_blocks() {
+    let d = dir("bcn-pass");
+    let n = 64;
+    let wave =
+        |x: u32, y: u32, k: u32| (128.0 + 100.0 * ((x * k + y * 3) as f32 * 0.21).sin()) as u8;
+    let (color, color_blocks) = ktx2(n, n, ctt::Format::BC7_SRGB_BLOCK, |x, y| {
+        [wave(x, y, 1), wave(x, y, 2), wave(x, y, 3), 255]
+    });
+    let (normal, normal_blocks) = ktx2(n, n, ctt::Format::BC5_UNORM_BLOCK, |x, y| {
+        [wave(x, y, 5), wave(y, x, 4), 255, 255]
+    });
+    let (rm, rm_blocks) = ktx2(n, n, ctt::Format::BC5_UNORM_BLOCK, |x, y| {
+        [wave(x, y, 2), wave(y, x, 7), 0, 255]
+    });
+    let (specular, specular_blocks) = ktx2(n, n, ctt::Format::BC4_UNORM_BLOCK, |x, y| {
+        [wave(x, y, 6), 0, 0, 255]
+    });
+    let path = d.join("bcn.glb");
+    write_glb(
+        &path,
+        &[
+            r#"{"pbrMetallicRoughness":{"baseColorTexture":{"index":0},"metallicRoughnessTexture":{"index":2}},
+                "normalTexture":{"index":1}}"#
+                .into(),
+            r#"{"pbrMetallicRoughness":{"metallicRoughnessTexture":{"index":2}},
+                "extensions":{"KHR_materials_specular":{"specularTexture":{"index":3}}}}"#
+                .into(),
+        ],
+        &[color, normal, rm, specular],
+    );
+    // The specular image keeps its weight in red, not glTF's alpha.
+    let overrides = vec![(
+        "image 3".to_string(),
+        TextureOverride {
+            channels: InputChannels {
+                specular: Some(0),
+                ..InputChannels::default()
+            },
+            ..TextureOverride::default()
+        },
+    )];
+    let a = cook(vec![AssetSpec {
+        name: "g".into(),
+        source: Source::Gltf {
+            path,
+            settings: GltfSettings {
+                textures: TextureRules {
+                    overrides,
+                    ..TextureRules::default()
+                },
+                ..GltfSettings::default()
+            },
+        },
+    }]);
+    let material = |i: usize| {
+        let e = a
+            .find(AssetId::from_name(&format!("g/material/{i}")))
+            .unwrap();
+        Material::from_bytes(&read_blob(&a, e, 0)).unwrap()
+    };
+    let (m0, m1) = (material(0), material(1));
+    let name = |t: AssetId| a.name(a.find(t).unwrap()).to_string();
+    let all = |t: AssetId, want: &[Vec<u8>]| {
+        let (info, levels) = mips(&a, &name(t));
+        assert_eq!(info.header.mip_count as usize, want.len());
+        assert_eq!(levels[0], want, "{}", name(t));
+    };
+    all(m0.textures[slot::BASE_COLOR].texture, &color_blocks);
+    all(m0.textures[slot::NORMAL].texture, &normal_blocks);
+    all(m1.textures[slot::SPECULAR_WEIGHT].texture, &specular_blocks);
+    assert_eq!(m1.textures[slot::SPECULAR_WEIGHT].channels, 0);
+    // Without a normal map every mip passes; with one, mip 0 does.
+    let rough = |m: &Material| {
+        let b = (m.textures[slot::ROUGHNESS], m.textures[slot::METALNESS]);
+        assert_eq!(b.0.texture, b.1.texture);
+        (
+            (b.0.channels, b.1.channels),
+            mips(&a, &name(b.0.texture)).1.remove(0),
+        )
+    };
+    let (channels, levels) = rough(&m1);
+    assert_eq!((channels, levels), ((0, 1), rm_blocks.clone()));
+    let (channels, levels) = rough(&m0);
+    assert_eq!(channels, (0, 1));
+    assert_eq!(levels[0], rm_blocks[0]);
+    assert_ne!(
+        levels[1], rm_blocks[1],
+        "Toksvig raises roughness below mip 0"
+    );
 }
 
 #[test]

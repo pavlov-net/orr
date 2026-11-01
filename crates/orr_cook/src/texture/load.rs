@@ -23,6 +23,8 @@ pub(crate) struct Source {
     /// The block-compressed texels of a compressed file, kept so an encoding that matches
     /// can pass them through.
     pub blocks: Option<Blocks>,
+    /// The file holds two channels, red and green.
+    pub rg: bool,
 }
 
 pub(crate) struct Blocks {
@@ -40,7 +42,30 @@ impl Blocks {
     }
 }
 
+/// Decodes an image file, recognized by its first bytes.
 pub(crate) fn decode(bytes: &[u8]) -> Result<Source, String> {
+    let mut src = open(bytes)?;
+    decode_layers(&mut src)?;
+    Ok(src)
+}
+
+/// Fills the layers of an opened block-compressed file with its decoded mip 0.
+pub(crate) fn decode_layers(src: &mut Source) -> Result<(), String> {
+    if let Some(b) = &src.blocks
+        && src.layers.is_empty()
+    {
+        src.layers = b
+            .levels
+            .iter()
+            .map(|l| decode_blocks(b.vk_format, b.w, b.h, &l[0]))
+            .collect::<Result<_, _>>()?;
+    }
+    Ok(())
+}
+
+/// Opens an image file like [`decode`], but leaves `layers` empty when the file holds
+/// block-compressed texels.
+pub(crate) fn open(bytes: &[u8]) -> Result<Source, String> {
     const KTX1: &[u8] = b"\xABKTX 11\xBB\r\n\x1A\n";
     if bytes.starts_with(KTX1) {
         return Err("KTX1 images are not supported; convert them to KTX2".into());
@@ -49,6 +74,29 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Source, String> {
         Some(image) => container(image),
         None => file(bytes),
     }
+}
+
+/// Per channel, the lowest and highest value of mip 0 of layer 0, decoded block by block.
+pub(crate) fn block_range(b: &Blocks) -> Result<[(f32, f32); 4], String> {
+    let f = FormatInfo::of(b.vk_format).ok_or("unknown format")?;
+    let (bw, bh) = (b.w.div_ceil(4) as usize, b.h.div_ceil(4) as usize);
+    let data = &b.levels[0][0];
+    if data.len() != bw * bh * f.bytes as usize {
+        return Err("compressed mip size".into());
+    }
+    let mut range = [(f32::MAX, f32::MIN); 4];
+    for (i, block) in data.chunks_exact(f.bytes as usize).enumerate() {
+        let texels = decode_block(b.vk_format, block)?;
+        let (bx, by) = (i % bw * 4, i / bw * 4);
+        for (k, t) in texels.iter().enumerate() {
+            if bx + k % 4 < b.w as usize && by + k / 4 < b.h as usize {
+                for (r, v) in range.iter_mut().zip(t) {
+                    *r = (r.0.min(*v), r.1.max(*v));
+                }
+            }
+        }
+    }
+    Ok(range)
 }
 
 fn container(image: ctt::Image) -> Result<Source, String> {
@@ -86,12 +134,8 @@ fn container(image: ctt::Image) -> Result<Source, String> {
             }
             levels.push(mips);
         }
-        let layers = levels
-            .iter()
-            .map(|l| decode_blocks(vk_format, w, h, &l[0]))
-            .collect::<Result<_, _>>()?;
         return Ok(Source {
-            layers,
+            layers: Vec::new(),
             cube,
             srgb,
             primaries: None,
@@ -101,6 +145,7 @@ fn container(image: ctt::Image) -> Result<Source, String> {
                 h,
                 levels,
             }),
+            rg: matches!(vk_format, vk::BC5_UNORM | vk::BC5_SNORM),
         });
     }
     // Uncompressed: ctt converts to f32 RGBA in the file's color space.
@@ -147,6 +192,10 @@ fn container(image: ctt::Image) -> Result<Source, String> {
         srgb,
         primaries: None,
         blocks: None,
+        rg: matches!(
+            format.value(),
+            vk::R8G8_UNORM | vk::R16G16_UNORM | vk::R16G16_SFLOAT | vk::R32G32_SFLOAT
+        ),
     })
 }
 
@@ -187,6 +236,7 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
         srgb,
         primaries,
         blocks: None,
+        rg: false,
     })
 }
 

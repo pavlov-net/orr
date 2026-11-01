@@ -290,6 +290,17 @@ fn split_by_default(_: BcLayout) -> bool {
     true
 }
 
+/// The mips of a stored `w` x `h` chain that fit `max_size`, and the size of the first.
+pub(crate) fn kept_mips(
+    mut mips: Vec<Vec<u8>>,
+    w: u32,
+    h: u32,
+    max_size: Option<u32>,
+) -> ([u32; 2], Vec<Vec<u8>>) {
+    let skip = skipped_mips(w, h, max_size);
+    (mip_size(w, h, skip), mips.split_off(skip as usize))
+}
+
 /// Mips dropped from the top of a `w` x `h` chain so mip 0 fits `max_size`.
 pub(crate) fn skipped_mips(w: u32, h: u32, max_size: Option<u32>) -> u32 {
     max_size.map_or(0, |max| {
@@ -436,7 +447,7 @@ pub(crate) fn add(w: &mut ArchiveWriter, name: &str, key: Hash32, t: &Built) -> 
 
 /// Cooks `Source::Texture`: one texture entry from one image file.
 pub(crate) fn cook_file(asset: &str, bytes: &[u8], s: &TextureSettings) -> Result<Built> {
-    load::decode(bytes)
+    load::open(bytes)
         .and_then(|src| cook_source(src, s))
         .map(|b| b.with_split(s.bc_split))
         .map_err(|message| Error::Texture {
@@ -448,13 +459,14 @@ pub(crate) fn cook_file(asset: &str, bytes: &[u8], s: &TextureSettings) -> Resul
 /// The encoders, for cook keys; their crate versions enter through [`crate::key`].
 pub(crate) const ENCODERS: &str = "bc7e for BC7, intel for BC4 BC5 BC6H";
 
-fn cook_source(src: Source, s: &TextureSettings) -> Result<Built, String> {
+fn cook_source(mut src: Source, s: &TextureSettings) -> Result<Built, String> {
     let primaries = s.primaries.or(src.primaries).unwrap_or(Primaries::Rec709);
     if let Usage::Environment {
         light_threshold,
         max_lights,
     } = s.usage
     {
+        load::decode_layers(&mut src)?;
         return env::cook(src, s, primaries, light_threshold, max_lights);
     }
     let encoding = Encoding::of(s.usage);
@@ -463,18 +475,29 @@ fn cook_source(src: Source, s: &TextureSettings) -> Result<Built, String> {
         && b.complete()
         && s.atlas_grid.is_none()
         && s.alpha_cutoff.is_none()
-        && s.max_size.is_none_or(|m| b.w.max(b.h) <= m)
     {
+        // Every mip as stored, without those over the size limit.
+        let mut size = [b.w, b.h];
+        let levels: Vec<Vec<Vec<u8>>> = b
+            .levels
+            .iter()
+            .map(|l| {
+                let kept = kept_mips(l.clone(), b.w, b.h, s.max_size);
+                size = kept.0;
+                kept.1
+            })
+            .collect();
         return Ok(layout(
             b.vk_format,
-            [b.w, b.h],
+            size,
             src.cube,
             primaries,
             f32::NAN,
             Vec::new(),
-            &b.levels,
+            &levels,
         ));
     }
+    load::decode_layers(&mut src)?;
     let coverage = match (s.alpha_cutoff, s.usage) {
         (None, _) => None,
         (Some(c), Usage::ColorAlpha | Usage::Linear4) => Some((3, c)),

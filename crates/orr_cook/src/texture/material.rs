@@ -21,7 +21,9 @@
 //! A bound texture's value multiplies the matching factor; normal, occlusion and opacity
 //! textures have no factor.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use orr_color::{RgbPrimaries, vec_f32};
 use orr_pack::material::{Material, TextureBinding, slot};
@@ -37,6 +39,7 @@ use super::{
     Built, DataFormat, Encoding, Img, MipFilter, Plan, Primaries, Quality, Wrap, srgb_to_linear,
 };
 use crate::key::Key;
+use crate::state::{self, Memo};
 use crate::{Error, Result};
 
 /// Texture settings for images a glTF file references.
@@ -64,6 +67,24 @@ pub struct TextureOverride {
     pub atlas_grid: Option<[u16; 2]>,
     pub primaries: Option<Primaries>,
     pub bc_split: Option<bool>,
+    /// The source channel each material input reads from the matching images, where they
+    /// are laid out differently from what the importer assumes.
+    pub channels: InputChannels,
+}
+
+/// Source channels (0 red .. 3 alpha) of scalar material inputs; `None` keeps the
+/// importer's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InputChannels {
+    pub opacity: Option<u8>,
+    pub roughness: Option<u8>,
+    pub metalness: Option<u8>,
+    pub occlusion: Option<u8>,
+    pub specular: Option<u8>,
+    pub coat: Option<u8>,
+    pub transmission: Option<u8>,
+    pub displacement: Option<u8>,
 }
 
 /// One image a material reads.
@@ -72,6 +93,8 @@ pub(crate) struct TexRef {
     pub image: usize,
     /// The source channel of a scalar input; color inputs read RGB.
     pub channel: u8,
+    /// The channel read instead from an image that holds only red and green.
+    pub rg_channel: Option<u8>,
     pub uv_set: u8,
     pub wrap: [Wrap; 2],
     /// Whether color texels are sRGB-encoded; `None` takes the file's own encoding.
@@ -123,7 +146,40 @@ impl MaterialTextures {
 pub(crate) struct ImageFile {
     /// glTF image name, else its URI, else its index.
     pub name: String,
-    pub bytes: Vec<u8>,
+    pub data: ImageData,
+}
+
+pub(crate) enum ImageData {
+    Bytes(Vec<u8>),
+    /// A file, read when needed. [`image_facts`] reads it first and records its hash and
+    /// length, which guard the later reads.
+    File {
+        path: PathBuf,
+        read: Option<(Hash32, u64)>,
+    },
+}
+
+impl ImageFile {
+    /// The file's bytes; a file must not have changed since its facts were read.
+    pub(crate) fn bytes(&self) -> Result<Cow<'_, [u8]>> {
+        match &self.data {
+            ImageData::Bytes(b) => Ok(Cow::Borrowed(b)),
+            ImageData::File {
+                path,
+                read: Some((hash, _)),
+            } => Ok(Cow::Owned(state::read_checked(path, *hash)?)),
+            ImageData::File { read: None, .. } => {
+                unreachable!("an image's facts are read before its jobs")
+            }
+        }
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        match &self.data {
+            ImageData::Bytes(b) => b.len() as u64,
+            ImageData::File { read, .. } => read.map_or(0, |r| r.1),
+        }
+    }
 }
 
 /// What packing needs to know of one source image; its texels are decoded again by the
@@ -136,59 +192,99 @@ pub(crate) struct ImageFacts {
     /// Per channel, the value every texel lies within 1/255 of, if there is one.
     constant: [Option<f32>; 4],
     hash: Hash32,
+    /// The block format of a block-compressed file, and whether it has every mip.
+    blocks: Option<(u32, bool)>,
+    /// The file holds two channels, red and green.
+    rg: bool,
 }
 
 /// Decodes a 2D image: its only layer and the file's color facts.
-fn decode(file: &ImageFile) -> Result<(Img, bool, Option<Primaries>), String> {
+fn decode(bytes: &[u8]) -> Result<(Img, bool, Option<Primaries>), String> {
     let Source {
         mut layers,
         cube,
         srgb,
         primaries,
         ..
-    } = load::decode(&file.bytes)?;
+    } = load::decode(bytes)?;
     if cube || layers.len() != 1 {
         return Err("not a 2D image".into());
     }
     Ok((layers.remove(0), srgb, primaries))
 }
 
-/// Facts of the images `used`, decoded in parallel.
+/// Facts of the images `used`, read in parallel. File images are read through the memo, and
+/// each one's hash and length are recorded in its [`ImageData::File`].
 pub(crate) fn image_facts(
     asset: &str,
-    images: &[ImageFile],
+    images: &mut [ImageFile],
     used: &[usize],
+    memo: &Memo,
 ) -> Result<HashMap<usize, ImageFacts>> {
-    used.par_iter()
+    let fail = |message: String| Error::Texture {
+        asset: asset.into(),
+        message,
+    };
+    if let Some(&i) = used.iter().find(|&&i| i >= images.len()) {
+        return Err(fail(format!("image {i} does not exist")));
+    }
+    let facts: HashMap<usize, (ImageFacts, Option<u64>)> = used
+        .par_iter()
         .map(|&i| {
-            let fail = |message: String| Error::Texture {
-                asset: asset.into(),
-                message,
+            let file = &images[i];
+            let (bytes, hash, read) = match &file.data {
+                ImageData::Bytes(b) => (Cow::Borrowed(b.as_slice()), Hash32::of(b), None),
+                ImageData::File { path, .. } => {
+                    let (bytes, hash) = memo.read(path)?;
+                    let len = bytes.len() as u64;
+                    (Cow::Owned(bytes), hash, Some(len))
+                }
             };
-            let file = images
-                .get(i)
-                .ok_or_else(|| fail(format!("image {i} does not exist")))?;
-            let (img, srgb, primaries) =
-                decode(file).map_err(|e| fail(format!("image {}: {e}", file.name)))?;
-            let constant = std::array::from_fn(|c| {
-                let (lo, hi) = img.px.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
-                    (lo.min(p[c]), hi.max(p[c]))
-                });
-                (hi - lo <= 1.0 / 255.0 + 1e-6).then_some(0.5 * (lo + hi))
-            });
-            Ok((
-                i,
-                ImageFacts {
-                    w: img.w,
-                    h: img.h,
-                    srgb,
-                    primaries,
-                    constant,
-                    hash: Hash32::of(&file.bytes),
-                },
-            ))
+            let facts =
+                facts_of(&bytes, hash).map_err(|e| fail(format!("image {}: {e}", file.name)))?;
+            Ok((i, (facts, read)))
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    let mut out = HashMap::with_capacity(facts.len());
+    for (i, (f, len)) in facts {
+        if let (ImageData::File { read, .. }, Some(len)) = (&mut images[i].data, len) {
+            *read = Some((f.hash, len));
+        }
+        out.insert(i, f);
+    }
+    Ok(out)
+}
+
+/// The facts of one image file's bytes.
+fn facts_of(bytes: &[u8], hash: Hash32) -> Result<ImageFacts, String> {
+    let src = load::open(bytes)?;
+    if src.cube || src.layers.len() > 1 || src.blocks.as_ref().is_some_and(|b| b.levels.len() != 1)
+    {
+        return Err("not a 2D image".into());
+    }
+    let (w, h, range) = match &src.blocks {
+        Some(b) => (b.w, b.h, load::block_range(b)?),
+        None => {
+            let img = &src.layers[0];
+            let range = std::array::from_fn(|c| {
+                img.px.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| {
+                    (lo.min(p[c]), hi.max(p[c]))
+                })
+            });
+            (img.w, img.h, range)
+        }
+    };
+    let constant = range.map(|(lo, hi)| (hi - lo <= 1.0 / 255.0 + 1e-6).then_some(0.5 * (lo + hi)));
+    Ok(ImageFacts {
+        w,
+        h,
+        srgb: src.srgb,
+        primaries: src.primaries,
+        constant,
+        hash,
+        blocks: src.blocks.as_ref().map(|b| (b.vk_format, b.complete())),
+        rg: src.rg,
+    })
 }
 
 /// Plans the textures of a glTF file's materials, sharing identical ones. The textures
@@ -234,6 +330,8 @@ enum Channel {
         b: f32,
     },
     Constant(f32),
+    /// Never read: stored as 1, or as the source has it where the blocks pass through.
+    Unused,
 }
 
 /// One packed texture to cook.
@@ -252,15 +350,35 @@ pub(crate) struct TextureJob {
     primaries: Primaries,
     filter: MipFilter,
     bc_split: Option<bool>,
+    /// Keeps the source's blocks.
+    pass: Option<Pass>,
 }
 
-fn bind(m: &mut Material, s: usize, id: AssetId, channel: u8, r: &TexRef) {
+/// A planned texture and, per packed channel, the channel of the texture that holds it.
+#[derive(Copy, Clone, Debug)]
+struct Made {
+    id: AssetId,
+    channels: [u8; 4],
+}
+
+/// Binds slot `s` to packed channel `channel` of `t`.
+fn bind(m: &mut Material, s: usize, t: Made, channel: usize, r: &TexRef) {
     m.textures[s] = TextureBinding {
-        texture: id,
-        channels: channel,
+        texture: t.id,
+        channels: t.channels[channel],
         uv_set: r.uv_set,
         _pad: [0; 2],
     };
+}
+
+/// How a planned texture keeps its source image's blocks.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Pass {
+    image: usize,
+    /// Every mip as stored, or only mip 0 with the rest made from it.
+    all_mips: bool,
+    /// The half (0 red, 1 green) of a BC5 source that a BC4 texture takes.
+    half: Option<u8>,
 }
 
 impl<'a> Packer<'a> {
@@ -304,6 +422,23 @@ impl<'a> Packer<'a> {
             .unwrap_or(Primaries::Rec709)
     }
 
+    /// The channel `r` reads for an input: the last override for its image that sets the
+    /// input's channel, else its two-channel reading on a red-green image, else its own.
+    fn channel_of(&self, r: TexRef, input: fn(&InputChannels) -> Option<u8>) -> TexRef {
+        let name = &self.images[r.image].name;
+        let set = self
+            .rules
+            .overrides
+            .iter()
+            .filter(|(pattern, _)| name.contains(pattern.as_str()))
+            .fold(None, |c, (_, o)| input(&o.channels).or(c));
+        let rg = r.rg_channel.filter(|_| self.image(r.image).rg);
+        TexRef {
+            channel: set.or(rg).unwrap_or(r.channel),
+            ..r
+        }
+    }
+
     /// Cooks the material's textures, binds them and folds constants into its factors.
     pub(crate) fn material(
         &mut self,
@@ -311,10 +446,26 @@ impl<'a> Packer<'a> {
         m: &mut Material,
         t: &MaterialTextures,
     ) -> Result<()> {
+        let remap = |r: Option<TexRef>, input| r.map(|r| self.channel_of(r, input));
+        let t = &MaterialTextures {
+            opacity: remap(t.opacity, |c| c.opacity),
+            roughness: remap(t.roughness, |c| c.roughness),
+            metalness: remap(t.metalness, |c| c.metalness),
+            occlusion: t
+                .occlusion
+                .map(|(r, s)| (self.channel_of(r, |c| c.occlusion), s)),
+            specular: remap(t.specular, |c| c.specular),
+            coat: remap(t.coat, |c| c.coat),
+            transmission: remap(t.transmission, |c| c.transmission),
+            displacement: remap(t.displacement, |c| c.displacement),
+            ..t.clone()
+        };
         if let Some(r) = &t.base_color {
-            self.color(suffix, m, r, "base_color", slot::BASE_COLOR, |m| {
-                &mut m.base_color
-            })?;
+            // Base alpha stands in for the opacity slot when that is not bound.
+            let alpha_free = m.alpha_mode != Material::OPAQUE
+                && t.opacity
+                    .is_some_and(|o| self.constant(o.image, usize::from(o.channel)).is_none());
+            self.color(suffix, m, r, slot::BASE_COLOR, alpha_free)?;
         }
         if m.alpha_mode != Material::OPAQUE
             && let Some(r) = &t.opacity
@@ -482,7 +633,7 @@ impl<'a> Packer<'a> {
                 },
             )?;
             for (i, (s, _)) in rm.iter().enumerate() {
-                bind(m, *s, id, i as u8, &refs[0]);
+                bind(m, *s, id, i, &refs[0]);
                 if *s == slot::ROUGHNESS {
                     m.specular_roughness = 1.0;
                 } else {
@@ -510,19 +661,10 @@ impl<'a> Packer<'a> {
         }
 
         if let Some(r) = &t.emissive {
-            self.color(suffix, m, r, "emission", slot::EMISSION, |m| {
-                &mut m.emission_color
-            })?;
+            self.color(suffix, m, r, slot::EMISSION, true)?;
         }
         if let Some(r) = &t.subsurface_color {
-            self.color(
-                suffix,
-                m,
-                r,
-                "subsurface_color",
-                slot::SUBSURFACE_COLOR,
-                |m| &mut m.subsurface_color,
-            )?;
+            self.color(suffix, m, r, slot::SUBSURFACE_COLOR, true)?;
         }
         if let Some(r) = &t.specular {
             match self.constant(r.image, usize::from(r.channel)) {
@@ -599,17 +741,27 @@ impl<'a> Packer<'a> {
         Ok(())
     }
 
-    /// A color texture whose value multiplies the material color of slot `s`; a constant
-    /// image folds into that color, multiplied in the image's primaries.
+    /// A color texture whose value multiplies the material color of slot `s` (base color,
+    /// emission or subsurface color); a constant image folds into that color, multiplied in
+    /// the image's primaries.
     fn color(
         &mut self,
         suffix: &str,
         m: &mut Material,
         r: &TexRef,
-        role: &'static str,
         s: usize,
-        color: fn(&mut Material) -> &mut [f32; 3],
+        alpha_free: bool,
     ) -> Result<()> {
+        let alpha = if alpha_free {
+            Channel::Unused
+        } else {
+            Channel::Constant(1.0)
+        };
+        let (role, color): (_, fn(&mut Material) -> &mut [f32; 3]) = match s {
+            slot::BASE_COLOR => ("base_color", |m| &mut m.base_color),
+            slot::EMISSION => ("emission", |m| &mut m.emission_color),
+            _ => ("subsurface_color", |m| &mut m.subsurface_color),
+        };
         let srgb = r.srgb.unwrap_or(self.image(r.image).srgb);
         let rgb: Vec<Option<f32>> = (0..3).map(|c| self.constant(r.image, c)).collect();
         if rgb.iter().all(Option::is_some) {
@@ -642,7 +794,7 @@ impl<'a> Packer<'a> {
             Pack {
                 role,
                 encoding: Encoding::Bc7Srgb,
-                channels: vec![image(0), image(1), image(2), Channel::Constant(1.0)],
+                channels: vec![image(0), image(1), image(2), alpha],
                 refs: vec![*r],
                 coverage: None,
                 toksvig: None,
@@ -655,13 +807,7 @@ impl<'a> Packer<'a> {
     }
 
     /// A BC4 texture of the reference's channel times `scale`.
-    fn single(
-        &mut self,
-        suffix: &str,
-        r: &TexRef,
-        scale: f32,
-        role: &'static str,
-    ) -> Result<AssetId> {
+    fn single(&mut self, suffix: &str, r: &TexRef, scale: f32, role: &'static str) -> Result<Made> {
         self.make(
             suffix,
             Pack {
@@ -683,14 +829,121 @@ impl<'a> Packer<'a> {
         )
     }
 
-    /// Plans one pack, or returns the id of an identical one planned before.
-    fn make(&mut self, suffix: &str, p: Pack) -> Result<AssetId> {
+    /// How pack `p` keeps the blocks of its one source image, and per packed channel the
+    /// source channel that holds it; `None` when it needs its texels made. The image's blocks
+    /// must be the pack's format (or a BC5 whose half a BC4 takes), with every mip, each
+    /// packed channel a source channel as stored. Mip 0 alone passes when the pack makes its
+    /// other mips from it (Toksvig roughness, alpha coverage) and keeps its full size.
+    fn passes(
+        &self,
+        p: &Pack,
+        size: [u32; 2],
+        grid: Option<[u16; 2]>,
+        skipped: bool,
+    ) -> Option<(Pass, [u8; 4])> {
+        use orr_pack::texture::vk;
+        let count = match p.encoding {
+            Encoding::Bc7Srgb => 4,
+            Encoding::Bc5 => 2,
+            Encoding::Bc4 => 1,
+            _ => return None,
+        };
+        if p.shrink || grid.is_some() {
+            return None;
+        }
+        let mut image = None;
+        let mut channels = [0u8, 1, 2, 3];
+        for (c, ch) in p.channels.iter().take(count).enumerate() {
+            match *ch {
+                Channel::Image {
+                    image: i,
+                    channel,
+                    srgb,
+                    a,
+                    b,
+                } => {
+                    let identity = if p.normal {
+                        (a, b) == (-1.0, 2.0)
+                    } else {
+                        (a, b) == (0.0, 1.0)
+                    };
+                    // Color channels keep their sRGB encoding; alpha and data are linear.
+                    let color = p.encoding == Encoding::Bc7Srgb && c < 3;
+                    if !identity || *image.get_or_insert(i) != i || srgb != color {
+                        return None;
+                    }
+                    channels[c] = channel as u8;
+                }
+                Channel::Unused => {}
+                // A color texture's alpha of 1 holds where the source's is 1.
+                Channel::Constant(v) if p.encoding == Encoding::Bc7Srgb && c == 3 => {
+                    let opaque = self.image(image?).constant[3]
+                        .is_some_and(|a| (a - 1.0).abs() <= 1.0 / 255.0);
+                    if v != 1.0 || !opaque {
+                        return None;
+                    }
+                }
+                Channel::Constant(_) => return None,
+            }
+        }
+        let i = image?;
+        let f = self.image(i);
+        let (format, complete) = f.blocks?;
+        if [f.w, f.h] != size {
+            return None;
+        }
+        let half = match (p.encoding, format) {
+            (e, f) if f == e.vk_format() => None,
+            (Encoding::Bc4, vk::BC5_UNORM) => Some(channels[0]),
+            _ => return None,
+        };
+        // Slots read color and normal channels together from their first one on.
+        let in_order = match p.encoding {
+            Encoding::Bc7Srgb => channels[..3] == [0, 1, 2],
+            Encoding::Bc5 if p.normal => channels[..2] == [0, 1],
+            _ => true,
+        };
+        let held = match format {
+            vk::BC4_UNORM => 1,
+            vk::BC5_UNORM => 2,
+            _ => 4,
+        };
+        // A neural set trains on the packed channels in pack order.
+        let reordered = channels[..count]
+            .iter()
+            .enumerate()
+            .any(|(c, &s)| usize::from(s) != c);
+        if !in_order
+            || channels[..count].iter().any(|&c| c >= held)
+            || reordered && half.is_none() && self.rules.neural.is_some()
+        {
+            return None;
+        }
+        if half.is_some() {
+            channels[0] = 0;
+        }
+        let derived = p.toksvig.is_some() || p.coverage.is_some();
+        if !complete || derived && skipped {
+            return None;
+        }
+        Some((
+            Pass {
+                image: i,
+                all_mips: !derived,
+                half,
+            },
+            channels,
+        ))
+    }
+
+    /// Plans one pack, or returns the one an identical pack planned before.
+    fn make(&mut self, suffix: &str, p: Pack) -> Result<Made> {
         let mut images: Vec<usize> = p
             .channels
             .iter()
             .filter_map(|c| match c {
                 Channel::Image { image, .. } => Some(*image),
-                Channel::Constant(_) => None,
+                Channel::Constant(_) | Channel::Unused => None,
             })
             .collect();
         if let Some((_, r, _)) = &p.toksvig {
@@ -728,9 +981,11 @@ impl<'a> Packer<'a> {
         } else {
             primaries.unwrap_or(Primaries::Rec709)
         };
+        let skipped = super::skipped_mips(size[0], size[1], max_size) > 0;
+        let pass = self.passes(&p, size, grid, skipped);
 
         let mut recipe = format!(
-            "{} {:?} {:?} {:?} {:?} {:?} {quality:?} {max_size:?} {grid:?} {primaries:?} {bc_split:?} {:?} {:?}",
+            "{} {:?} {:?} {:?} {:?} {:?} {quality:?} {max_size:?} {grid:?} {primaries:?} {bc_split:?} {:?} {:?} {:?}",
             p.role,
             p.encoding,
             p.channels,
@@ -739,14 +994,16 @@ impl<'a> Packer<'a> {
             p.refs[0].wrap,
             self.rules.filter,
             size,
+            pass,
         )
         .into_bytes();
         for &i in &images {
             recipe.extend_from_slice(&self.image(i).hash.0);
         }
         let same = Hash32::of(&recipe);
+        let channels = pass.map_or([0, 1, 2, 3], |p| p.1);
         if let Some(id) = self.made.get(&same) {
-            return Ok(*id);
+            return Ok(Made { id: *id, channels });
         }
         let name = match suffix {
             "" => format!("{}/texture/{}", self.asset, p.role),
@@ -772,8 +1029,9 @@ impl<'a> Packer<'a> {
             primaries,
             filter: self.rules.filter,
             bc_split,
+            pass: pass.map(|p| p.0),
         });
-        Ok(id)
+        Ok(Made { id, channels })
     }
 }
 
@@ -781,24 +1039,71 @@ impl TextureJob {
     /// Estimated peak bytes: 8 per compressed source byte for the decoded sources, 48 per
     /// output texel for the packed image and its chain.
     pub(crate) fn working_set(&self, images: &[ImageFile]) -> u64 {
-        let sources: u64 = self
-            .images
-            .iter()
-            .map(|&i| images[i].bytes.len() as u64 * 8)
-            .sum();
+        let sources: u64 = self.images.iter().map(|&i| images[i].len() * 8).sum();
         sources + u64::from(self.size[0]) * u64::from(self.size[1]) * 48
     }
 
     pub(crate) fn run(&self, images: &[ImageFile]) -> Result<Built> {
-        let (img, plan) = self.prepare(images)?;
-        super::build(vec![img], &plan)
-            .map(|b| b.with_split(self.bc_split))
-            .map_err(|e| self.fail(format!("texture {}: {e}", self.pack.role)))
+        let fail = |e: String| self.fail(format!("texture {}: {e}", self.pack.role));
+        let built = match self.pass {
+            Some(pass) => self.pass_through(pass, images).map_err(fail)?,
+            None => {
+                let (img, plan) = self.prepare(images, None)?;
+                super::build(vec![img], &plan).map_err(fail)?
+            }
+        };
+        Ok(built.with_split(self.bc_split))
+    }
+
+    /// The texture from the source's blocks: every mip as stored (without those over
+    /// `max_size`), or mip 0 as stored and the rest made from it.
+    fn pass_through(&self, pass: Pass, images: &[ImageFile]) -> Result<Built, String> {
+        let bytes = images[pass.image].bytes().map_err(|e| e.to_string())?;
+        let src = load::open(&bytes)?;
+        drop(bytes);
+        let b = src
+            .blocks
+            .as_ref()
+            .ok_or("the image no longer holds blocks")?;
+        let (size, mut mips) = if pass.all_mips {
+            super::kept_mips(b.levels[0].clone(), b.w, b.h, self.max_size)
+        } else {
+            let first = b.levels[0][0].clone();
+            let (img, plan) = self
+                .prepare(images, Some((pass.image, src)))
+                .map_err(|e| e.to_string())?;
+            let chain = super::chains(vec![img], &plan)?.remove(0);
+            let mut mips =
+                super::encode_chains(plan.encoding, plan.quality, &[chain[1..].to_vec()])?
+                    .remove(0);
+            mips.insert(0, first);
+            ([chain[0].w, chain[0].h], mips)
+        };
+        if let Some(h) = pass.half {
+            // A BC5 block is the red BC4 block, then the green one.
+            let h = usize::from(h) * 8;
+            for m in &mut mips {
+                *m = m
+                    .chunks_exact(16)
+                    .flat_map(|b| &b[h..h + 8])
+                    .copied()
+                    .collect();
+            }
+        }
+        Ok(super::layout(
+            self.pack.encoding.vk_format(),
+            size,
+            false,
+            self.primaries,
+            self.pack.coverage.map_or(f32::NAN, |c| c.1),
+            Vec::new(),
+            &[mips],
+        ))
     }
 
     /// The mip chain [`Self::run`] encodes.
     pub(crate) fn chain(&self, images: &[ImageFile]) -> Result<Vec<Img>> {
-        let (img, plan) = self.prepare(images)?;
+        let (img, plan) = self.prepare(images, None)?;
         super::chains(vec![img], &plan)
             .map(|mut c| c.remove(0))
             .map_err(|e| self.fail(format!("texture {}: {e}", self.pack.role)))
@@ -827,12 +1132,22 @@ impl TextureJob {
     }
 
     /// The packed mip 0 and how it cooks.
-    fn prepare(&self, images: &[ImageFile]) -> Result<(Img, Plan)> {
+    /// The packed mip 0 and how it cooks; `opened` is one source image already opened.
+    fn prepare(
+        &self,
+        images: &[ImageFile],
+        mut opened: Option<(usize, Source)>,
+    ) -> Result<(Img, Plan)> {
         let fail = |message: String| self.fail(message);
         let mut decoded = HashMap::new();
         for &i in &self.images {
-            let (img, ..) =
-                decode(&images[i]).map_err(|e| fail(format!("image {}: {e}", images[i].name)))?;
+            let img = match opened.take_if(|o| o.0 == i) {
+                Some((_, mut src)) => {
+                    load::decode_layers(&mut src).map_err(&fail)?;
+                    src.layers.remove(0)
+                }
+                None => decode(&images[i].bytes()?).map(|d| d.0).map_err(&fail)?,
+            };
             decoded.insert(i, img.resized(self.size[0], self.size[1]));
         }
         let p = &self.pack;
@@ -840,6 +1155,7 @@ impl TextureJob {
         for (c, ch) in p.channels.iter().enumerate() {
             match *ch {
                 Channel::Constant(v) => img.px.iter_mut().for_each(|t| t[c] = v),
+                Channel::Unused => img.px.iter_mut().for_each(|t| t[c] = 1.0),
                 Channel::Image {
                     image,
                     channel,

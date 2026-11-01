@@ -5,6 +5,8 @@ module instance;
 import orr.packing;
 
 public static const uint EXACT_AXIS = 1u << 30;
+// The x scale is negated: the copy is mirrored.
+public static const uint MIRROR = 1u << 31;
 
 // Blob 0 header, 64 B. Spans are (byte offset in blob 0, count).
 public struct InstancePageHeader
@@ -42,11 +44,14 @@ public float3 decode_instance_scale(InstancePageHeader h, InstanceRecord r)
     return exp2(h.log2_scale_min + range * (float3(code) / 1023.0));
 }
 
-// Cell-relative transform of a record: rows [R * diag(scale) | translation].
+// Cell-relative transform of a record: rows [R * diag(scale) | translation], the x scale
+// negative on a mirrored record.
 public float3x4 decode_instance(InstancePageHeader h, InstanceRecord r)
 {
     float3x3 m = instance_rotation(r.rot, (r.scale & EXACT_AXIS) != 0);
     float3 s = decode_instance_scale(h, r);
+    if ((r.scale & MIRROR) != 0)
+        s.x = -s.x;
     float3 t = decode_instance_position(h, r);
     return float3x4(
         float4(m[0] * s, t.x),

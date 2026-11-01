@@ -3,6 +3,7 @@
 //! | glTF | `Material` |
 //! | --- | --- |
 //! | `baseColorFactor` rgb, `metallicFactor`, `roughnessFactor` | `base_color`, `metalness`, `specular_roughness` |
+//! | `metallicRoughnessTexture` G and B, or R and G of an image holding only red and green | the roughness and metalness textures |
 //! | `KHR_materials_ior` `ior` | `specular_ior` |
 //! | `emissiveFactor`, `emissiveStrength` (1 when absent; `KHR_materials_emissive_strength` overrides it) | `emission_color`, `emission_luminance` read as nits |
 //! | `alphaMode` `MASK` with `alphaCutoff`, `BLEND`; base alpha | `alpha_mode`, `alpha_cutoff`; `geometry_opacity` under `MASK` and `BLEND` |
@@ -179,6 +180,7 @@ pub(crate) fn textures(
             uv_set: coord as u8,
             wrap: [wrap(s.wrap_s()), wrap(s.wrap_t())],
             srgb: None,
+            rg_channel: None,
         })
     };
     // A textureInfo object of an extension.
@@ -200,9 +202,16 @@ pub(crate) fn textures(
         .base_color_texture()
         .map(|i| tex(i.texture(), i.tex_coord(), 0))
         .transpose()?;
-    let metal_rough = |channel| {
+    // An image of red and green alone has no blue: it holds roughness and metalness in
+    // red and green.
+    let metal_rough = |channel: u8| {
         pbr.metallic_roughness_texture()
-            .map(|i| tex(i.texture(), i.tex_coord(), channel))
+            .map(|i| {
+                tex(i.texture(), i.tex_coord(), channel).map(|r| TexRef {
+                    rg_channel: Some(channel - 1),
+                    ..r
+                })
+            })
             .transpose()
     };
     Ok(MaterialTextures {

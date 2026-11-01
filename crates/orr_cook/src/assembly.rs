@@ -599,10 +599,14 @@ fn remainder(m: &MeshData, mut removed: Vec<Vec<[u32; 3]>>) -> MeshData {
 /// A placement of a unit copy from a placement of its model; `None` when a non-uniform
 /// scale meets a unit rotation that does not map axes to axes.
 pub(crate) fn compose(p: &Placement, u: &UnitPlacement) -> Option<Placement> {
-    let r = Quat::from_array(u.rotation);
+    let mut r = Quat::from_array(u.rotation);
     let s = p.scale;
-    let uniform = s.max_element() - s.min_element() <= 1e-6 * s.max_element();
+    let a = s.abs();
+    let uniform = a.max_element() - a.min_element() <= 1e-6 * a.max_element();
     let scale = if uniform {
+        // diag(s) R = (D R D) diag(s) with D = diag(sign(s)), and D R D is a rotation.
+        let d = Mat3::from_diagonal(s.signum());
+        r = Quat::from_mat3(&(d * Mat3::from_quat(r) * d)).normalize();
         s
     } else {
         // S R = R S' when R e_j = +-e_i: S'_j = S_i.

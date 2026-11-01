@@ -1,17 +1,23 @@
-//! A glTF document with its buffers ready to read.
+//! A glTF document and the bytes of the buffer views a caller reads.
 //!
 //! The JSON is parsed first, and the extensions the cook implements itself are removed from
-//! `extensionsRequired`, so the `gltf` crate validates the rest of the document. A texture's
-//! `EXT_texture_webp` image replaces its core `source`, so a texture may carry only the
-//! extension's source. Buffer views compressed with `EXT_meshopt_compression` or
-//! `KHR_meshopt_compression` are decoded with meshoptimizer's decoders and filters into their
-//! fallback buffers, so every view reads as if it were stored plain. Accessors are read here,
-//! including the normalized and unnormalized integer forms `KHR_mesh_quantization` allows and
-//! sparse accessors. An asset whose `minVersion` is above glTF 2.1 is refused.
+//! `extensionsRequired`, so the `gltf` crate validates the rest of the document. Buffers stay
+//! where they are: [`Data::load`] reads the byte ranges of the views a caller needs, and
+//! decodes views compressed with `EXT_meshopt_compression` or `KHR_meshopt_compression` with
+//! meshoptimizer's decoders and filters, so every view reads as if it were stored plain.
+//! Accessors are read here, including the normalized and unnormalized integer forms
+//! `KHR_mesh_quantization` allows and sparse accessors. A texture's `EXT_texture_webp` image
+//! replaces its core `source`, so a texture may carry only the extension's source. An asset
+//! whose `minVersion` is above glTF 2.1 is refused.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use base64::Engine;
 use gltf::accessor::{DataType, Dimensions};
 use gltf::buffer::Source as BufferSource;
 use meshopt::ffi;
+use orr_pack::Hash32;
 use serde_json::Value;
 
 /// Extensions the cook reads itself, removed from `extensionsRequired` before validation.
@@ -38,22 +44,28 @@ const COOK_EXTENSIONS: &[&str] = &[
 
 const MESHOPT: [&str; 2] = ["EXT_meshopt_compression", "KHR_meshopt_compression"];
 
+/// Where a buffer's bytes are.
+pub(crate) enum Buffer {
+    /// A meshopt fallback buffer: its views decode from other buffers.
+    Fallback,
+    /// The GLB binary chunk or a data URI, and its hash.
+    Bytes(Vec<u8>, Hash32),
+    /// A file next to the document.
+    File(PathBuf),
+}
+
+/// A parsed glTF document. Buffer bytes are read by [`Data::load`].
 pub(crate) struct Document {
     pub doc: gltf::Document,
     /// The parsed JSON, for extensions the `gltf` crate does not model.
     pub json: Value,
-    pub buffers: Vec<Vec<u8>>,
+    pub buffers: Vec<Buffer>,
 }
 
-/// Opens a `.gltf` or `.glb` file's bytes; `load` reads a URI (a data URI or a file next to
-/// the document) and names what it loads in errors.
-pub(crate) fn open(
-    bytes: &[u8],
-    load: &mut dyn FnMut(&str, &str) -> crate::Result<Vec<u8>>,
-    fail: &dyn Fn(String) -> crate::Error,
-) -> crate::Result<Document> {
-    let (json_bytes, bin) = if bytes.starts_with(b"glTF") {
-        let glb = gltf::Glb::from_slice(bytes).map_err(|e| fail(e.to_string()))?;
+/// Opens a `.gltf` or `.glb` file's bytes; buffer URIs resolve against `dir`.
+pub(crate) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
+    let (json_bytes, mut bin) = if bytes.starts_with(b"glTF") {
+        let glb = gltf::Glb::from_slice(bytes).map_err(|e| e.to_string())?;
         (
             glb.json.into_owned(),
             glb.bin.map(std::borrow::Cow::into_owned),
@@ -61,16 +73,16 @@ pub(crate) fn open(
     } else {
         (bytes.to_vec(), None)
     };
-    let mut json: Value = serde_json::from_slice(&json_bytes).map_err(|e| fail(e.to_string()))?;
+    let mut json: Value = serde_json::from_slice(&json_bytes).map_err(|e| e.to_string())?;
     if let Some(v) = json["asset"].get("minVersion") {
         let min = v.as_str().and_then(|s| {
             let (major, minor) = s.split_once('.')?;
             Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?))
         });
         if min.is_none_or(|m| m > (2, 1)) {
-            return Err(fail(format!(
+            return Err(format!(
                 "asset minVersion {v} is not a glTF version up to 2.1"
-            )));
+            ));
         }
     }
     if let Some(Value::Array(required)) = json.get_mut("extensionsRequired") {
@@ -83,43 +95,54 @@ pub(crate) fn open(
             }
         }
     }
-    let root: gltf::json::Root =
-        serde_json::from_value(json.clone()).map_err(|e| fail(e.to_string()))?;
-    let doc = gltf::Document::from_json(root).map_err(|e| fail(e.to_string()))?;
-
+    let root: gltf::json::Root = serde_json::from_value(json.clone()).map_err(|e| e.to_string())?;
+    let doc = gltf::Document::from_json(root).map_err(|e| e.to_string())?;
     let mut buffers = Vec::new();
     for b in doc.buffers() {
         let j = &json["buffers"][b.index()];
         let fallback = MESHOPT
             .iter()
             .any(|e| j["extensions"][e]["fallback"].as_bool() == Some(true));
-        let data = if fallback {
-            vec![0; b.length()]
-        } else {
-            match b.source() {
-                BufferSource::Bin if b.index() == 0 => bin
-                    .clone()
-                    .ok_or_else(|| fail("GLB binary chunk missing".into()))?,
-                BufferSource::Bin => {
-                    return Err(fail(format!("buffer {} has no data", b.index())));
-                }
-                BufferSource::Uri(uri) => load(uri, &format!("buffer {}", b.index()))?,
+        let data = match b.source() {
+            _ if fallback => {
+                buffers.push(Buffer::Fallback);
+                continue;
             }
+            BufferSource::Bin if b.index() == 0 => bin.take().ok_or("GLB binary chunk missing")?,
+            BufferSource::Bin => return Err(format!("buffer {} has no data", b.index())),
+            BufferSource::Uri(uri) => match data_uri(uri) {
+                Some(data) => data.map_err(|e| format!("buffer {}: {e}", b.index()))?,
+                None => {
+                    buffers.push(Buffer::File(dir.join(uri)));
+                    continue;
+                }
+            },
         };
         if data.len() < b.length() {
-            return Err(fail(format!(
+            return Err(format!(
                 "buffer {} holds {} bytes, declares {}",
                 b.index(),
                 data.len(),
                 b.length()
-            )));
+            ));
         }
-        buffers.push(data);
+        let hash = Hash32::of(&data);
+        buffers.push(Buffer::Bytes(data, hash));
     }
-    let mut d = Document { doc, json, buffers };
-    d.check_views().map_err(&fail)?;
-    d.decode_views().map_err(&fail)?;
+    let d = Document { doc, json, buffers };
+    d.check_views()?;
     Ok(d)
+}
+
+/// The bytes of a base64 data URI; `None` for any other URI.
+pub(crate) fn data_uri(uri: &str) -> Option<Result<Vec<u8>, String>> {
+    let data = uri.strip_prefix("data:")?;
+    Some(match data.split_once(";base64,") {
+        Some((_, b64)) => base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| e.to_string()),
+        None => Err("data URI is not base64".into()),
+    })
 }
 
 fn field(v: &Value, k: &str) -> usize {
@@ -152,79 +175,110 @@ impl Document {
         Ok(())
     }
 
-    /// Decodes every meshopt-compressed view into its place in its fallback buffer.
-    fn decode_views(&mut self) -> Result<(), String> {
-        for v in self.doc.views() {
-            let j = &self.json["bufferViews"][v.index()]["extensions"];
-            let Some(e) = MESHOPT.iter().find_map(|n| j.get(*n)) else {
-                continue;
-            };
-            let what = format!("buffer view {}", v.index());
-            let (count, stride) = (field(e, "count"), field(e, "byteStride"));
-            let (src_buffer, at, len) = (
+    /// The meshopt compression object of buffer view `v`, if it has one.
+    fn meshopt(&self, v: usize) -> Option<&Value> {
+        let j = &self.json["bufferViews"][v]["extensions"];
+        MESHOPT.iter().find_map(|n| j.get(*n))
+    }
+
+    /// The buffer and byte range buffer view `v`'s stored bytes are read from: its own, or
+    /// with meshopt compression the compressed stream's.
+    pub(crate) fn view_source(&self, v: usize) -> (usize, usize, usize) {
+        match self.meshopt(v) {
+            Some(e) => (
                 field(e, "buffer"),
                 field(e, "byteOffset"),
                 field(e, "byteLength"),
-            );
-            let src = self
-                .buffers
-                .get(src_buffer)
-                .and_then(|b| b.get(at..at.checked_add(len)?))
-                .ok_or_else(|| format!("{what}: compressed range outside its buffer"))?
-                .to_vec();
-            let size = count
-                .checked_mul(stride)
-                .filter(|&s| s <= v.length())
-                .ok_or_else(|| format!("{what}: {count} x {stride} B exceed the view"))?;
-            let mode = e["mode"].as_str().unwrap_or_default();
-            let filter = e["filter"].as_str().unwrap_or("NONE");
-            let valid = match mode {
-                "ATTRIBUTES" => stride % 4 == 0 && (4..=256).contains(&stride),
-                "TRIANGLES" => (stride == 2 || stride == 4) && count % 3 == 0,
-                "INDICES" => stride == 2 || stride == 4,
-                _ => false,
-            } && match filter {
-                "NONE" => true,
-                "OCTAHEDRAL" | "COLOR" => mode == "ATTRIBUTES" && (stride == 4 || stride == 8),
-                "QUATERNION" => mode == "ATTRIBUTES" && stride == 8,
-                "EXPONENTIAL" => mode == "ATTRIBUTES",
-                _ => false,
-            };
-            if !valid {
-                return Err(format!(
-                    "{what}: meshopt mode {mode} filter {filter} with stride {stride}"
-                ));
+            ),
+            None => {
+                let view = self.doc.views().nth(v).expect("view index");
+                (view.buffer().index(), view.offset(), view.length())
             }
-            let mut dst = vec![0u8; size];
-            let (dp, sp) = (dst.as_mut_ptr().cast(), src.as_ptr());
-            // SAFETY: `dst` holds count x stride bytes and the parameters were checked
-            // against each decoder's requirements; the decoders are safe on any input.
-            let rc = unsafe {
-                match mode {
-                    "ATTRIBUTES" => {
-                        ffi::meshopt_decodeVertexBuffer(dp, count, stride, sp, src.len())
-                    }
-                    "TRIANGLES" => ffi::meshopt_decodeIndexBuffer(dp, count, stride, sp, src.len()),
-                    _ => ffi::meshopt_decodeIndexSequence(dp, count, stride, sp, src.len()),
-                }
-            };
-            if rc != 0 {
-                return Err(format!("{what}: meshopt stream does not decode"));
-            }
-            // SAFETY: the filters run in place over the `count` decoded elements.
-            unsafe {
-                match filter {
-                    "OCTAHEDRAL" => ffi::meshopt_decodeFilterOct(dp, count, stride),
-                    "QUATERNION" => ffi::meshopt_decodeFilterQuat(dp, count, stride),
-                    "EXPONENTIAL" => ffi::meshopt_decodeFilterExp(dp, count, stride),
-                    "COLOR" => ffi::meshopt_decodeFilterColor(dp, count, stride),
-                    _ => {}
-                }
-            }
-            let out = &mut self.buffers[v.buffer().index()];
-            out[v.offset()..v.offset() + size].copy_from_slice(&dst);
         }
-        Ok(())
+    }
+
+    /// Adds the buffer views accessor `a` reads, sparse ones included.
+    pub(crate) fn accessor_views(a: &gltf::Accessor<'_>, out: &mut Vec<usize>) {
+        out.extend(a.view().map(|v| v.index()));
+        if let Some(s) = a.sparse() {
+            out.push(s.indices().view().index());
+            out.push(s.values().view().index());
+        }
+    }
+}
+
+/// The bytes of some buffer views of a document, meshopt-compressed views decoded.
+pub(crate) struct Data<'d> {
+    pub doc: &'d Document,
+    views: HashMap<usize, Vec<u8>>,
+}
+
+impl<'d> Data<'d> {
+    /// Reads and decodes `views`, naming `asset` in errors.
+    pub(crate) fn load(
+        doc: &'d Document,
+        views: impl IntoIterator<Item = usize>,
+        asset: &str,
+    ) -> crate::Result<Self> {
+        let mut out = HashMap::new();
+        let mut files = HashMap::new();
+        for v in views {
+            if out.contains_key(&v) {
+                continue;
+            }
+            let fail = |m: String| crate::Error::Import {
+                asset: asset.into(),
+                message: format!("buffer view {v}: {m}"),
+            };
+            let (b, at, len) = doc.view_source(v);
+            let end = at
+                .checked_add(len)
+                .ok_or_else(|| fail("range overflows".into()))?;
+            let bytes = match doc.buffers.get(b) {
+                None => return Err(fail(format!("buffer {b} does not exist"))),
+                Some(Buffer::Fallback) => {
+                    return Err(fail(format!(
+                        "reads fallback buffer {b}, which holds no data"
+                    )));
+                }
+                Some(Buffer::Bytes(data, _)) => data
+                    .get(at..end)
+                    .ok_or_else(|| fail("range outside its buffer".into()))?
+                    .to_vec(),
+                Some(Buffer::File(path)) => {
+                    let read = |source| crate::Error::Read {
+                        path: path.clone(),
+                        source,
+                    };
+                    let file = match files.entry(path) {
+                        std::collections::hash_map::Entry::Occupied(f) => f.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(orr_io::open_shared(path).map_err(read)?)
+                        }
+                    };
+                    let mut bytes = vec![0; len];
+                    orr_io::read_exact_at(file, at as u64, &mut bytes).map_err(read)?;
+                    bytes
+                }
+            };
+            let bytes = match doc.meshopt(v) {
+                Some(e) => {
+                    let length = doc.doc.views().nth(v).expect("view index").length();
+                    decode_view(e, &bytes, length).map_err(fail)?
+                }
+                None => bytes,
+            };
+            out.insert(v, bytes);
+        }
+        Ok(Self { doc, views: out })
+    }
+
+    /// The bytes of a loaded buffer view.
+    pub(crate) fn view(&self, v: &gltf::buffer::View<'_>) -> Result<&[u8], String> {
+        self.views
+            .get(&v.index())
+            .map(Vec::as_slice)
+            .ok_or_else(|| format!("buffer view {} is not loaded", v.index()))
     }
 
     /// An accessor as `count` rows of `n` floats: normalized integers map to 0..1 or -1..1,
@@ -235,6 +289,7 @@ impl Document {
             Dimensions::Vec2 => 2,
             Dimensions::Vec3 => 3,
             Dimensions::Vec4 => 4,
+            Dimensions::Mat4 => 16,
             d => return Err(format!("accessor {}: {d:?} is not a vector", a.index())),
         };
         let ty = a.data_type();
@@ -246,7 +301,7 @@ impl Document {
         };
         let mut out = vec![0.0; a.count() * n];
         if let Some(v) = a.view() {
-            let (data, stride) = self.view_elements(&v, a.size());
+            let (data, stride) = self.view_elements(&v, a.size())?;
             let base = &data[a.offset()..];
             for (i, row) in out.chunks_exact_mut(n).enumerate() {
                 read(&base[i * stride..], row);
@@ -255,7 +310,7 @@ impl Document {
         if let Some(s) = a.sparse() {
             let indices = self.sparse_indices(&s, a.count())?;
             let values = s.values();
-            let (data, stride) = self.view_elements(&values.view(), a.size());
+            let (data, stride) = self.view_elements(&values.view(), a.size())?;
             let base = data
                 .get(values.offset()..)
                 .filter(|b| b.len() >= stride * s.count().saturating_sub(1) + a.size())
@@ -283,7 +338,7 @@ impl Document {
         let Some(v) = a.view() else {
             return Ok(vec![0; a.count()]);
         };
-        let (data, stride) = self.view_elements(&v, a.size());
+        let (data, stride) = self.view_elements(&v, a.size())?;
         let base = &data[a.offset()..];
         Ok((0..a.count())
             .map(|i| {
@@ -297,9 +352,12 @@ impl Document {
             .collect())
     }
 
-    fn view_elements(&self, v: &gltf::buffer::View<'_>, size: usize) -> (&[u8], usize) {
-        let data = &self.buffers[v.buffer().index()][v.offset()..v.offset() + v.length()];
-        (data, v.stride().unwrap_or(size))
+    fn view_elements(
+        &self,
+        v: &gltf::buffer::View<'_>,
+        size: usize,
+    ) -> Result<(&[u8], usize), String> {
+        Ok((self.view(v)?, v.stride().unwrap_or(size)))
     }
 
     fn sparse_indices(
@@ -314,7 +372,7 @@ impl Document {
             IndexType::U16 => 2,
             IndexType::U32 => 4,
         };
-        let (data, _) = self.view_elements(&ix.view(), size);
+        let (data, _) = self.view_elements(&ix.view(), size)?;
         let b = data
             .get(ix.offset()..ix.offset() + size * s.count())
             .ok_or("sparse indices outside their view")?;
@@ -360,19 +418,66 @@ fn component(b: &[u8], ty: DataType, c: usize, normalized: bool) -> f32 {
     }
 }
 
+/// Decodes one meshopt-compressed view from its compressed stream into `length` bytes.
+fn decode_view(e: &Value, src: &[u8], length: usize) -> Result<Vec<u8>, String> {
+    let (count, stride) = (field(e, "count"), field(e, "byteStride"));
+    count
+        .checked_mul(stride)
+        .filter(|&s| s <= length)
+        .ok_or_else(|| format!("{count} x {stride} B exceed the view"))?;
+    let mode = e["mode"].as_str().unwrap_or_default();
+    let filter = e["filter"].as_str().unwrap_or("NONE");
+    let valid = match mode {
+        "ATTRIBUTES" => stride % 4 == 0 && (4..=256).contains(&stride),
+        "TRIANGLES" => (stride == 2 || stride == 4) && count % 3 == 0,
+        "INDICES" => stride == 2 || stride == 4,
+        _ => false,
+    } && match filter {
+        "NONE" => true,
+        "OCTAHEDRAL" | "COLOR" => mode == "ATTRIBUTES" && (stride == 4 || stride == 8),
+        "QUATERNION" => mode == "ATTRIBUTES" && stride == 8,
+        "EXPONENTIAL" => mode == "ATTRIBUTES",
+        _ => false,
+    };
+    if !valid {
+        return Err(format!(
+            "meshopt mode {mode} filter {filter} with stride {stride}"
+        ));
+    }
+    let mut dst = vec![0u8; length];
+    let (dp, sp) = (dst.as_mut_ptr().cast(), src.as_ptr());
+    // SAFETY: `dst` holds at least count x stride bytes and the parameters were checked
+    // against each decoder's requirements; the decoders are safe on any input.
+    let rc = unsafe {
+        match mode {
+            "ATTRIBUTES" => ffi::meshopt_decodeVertexBuffer(dp, count, stride, sp, src.len()),
+            "TRIANGLES" => ffi::meshopt_decodeIndexBuffer(dp, count, stride, sp, src.len()),
+            _ => ffi::meshopt_decodeIndexSequence(dp, count, stride, sp, src.len()),
+        }
+    };
+    if rc != 0 {
+        return Err("meshopt stream does not decode".into());
+    }
+    // SAFETY: the filters run in place over the `count` decoded elements.
+    unsafe {
+        match filter {
+            "OCTAHEDRAL" => ffi::meshopt_decodeFilterOct(dp, count, stride),
+            "QUATERNION" => ffi::meshopt_decodeFilterQuat(dp, count, stride),
+            "EXPONENTIAL" => ffi::meshopt_decodeFilterExp(dp, count, stride),
+            "COLOR" => ffi::meshopt_decodeFilterColor(dp, count, stride),
+            _ => {}
+        }
+    }
+    Ok(dst)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn min_version_above_2_1_is_refused() {
         let opens = |min: &str| {
             let json = format!(r#"{{"asset":{{"version":"2.1","minVersion":"{min}"}}}}"#);
-            super::open(json.as_bytes(), &mut |_, _| unreachable!(), &|message| {
-                crate::Error::Import {
-                    asset: String::new(),
-                    message,
-                }
-            })
-            .is_ok()
+            super::open(json.as_bytes(), std::path::Path::new("")).is_ok()
         };
         assert!(opens("2.0") && opens("2.1"));
         assert!(!opens("2.2") && !opens("2.10") && !opens("3.0") && !opens("2"));

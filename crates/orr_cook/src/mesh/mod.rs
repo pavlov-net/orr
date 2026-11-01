@@ -22,6 +22,7 @@ mod tangents;
 mod thickness;
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use glam::{Vec2, Vec3};
 use meshopt::VertexDataAdapter;
@@ -35,6 +36,7 @@ use rayon::prelude::*;
 use serde::Deserialize;
 
 use crate::assembly::AssemblySettings;
+use crate::state::Memo;
 use crate::texture::Wrap;
 use crate::{Error, Result};
 use maps::{Displacement, Opacity, Raster};
@@ -176,6 +178,93 @@ pub(crate) struct MeshData {
     pub parts: Option<PartData>,
     /// The grid step may not be finer than `2^min_exponent` m (models joined crack-free).
     pub min_exponent: Option<i8>,
+}
+
+/// The hash of a mesh with geometry hash `geometry` and these sections.
+fn sections_hash(geometry: Hash32, sections: &[SectionData]) -> Hash32 {
+    let mut h = blake3::Hasher::new();
+    h.update(&geometry.0);
+    for s in sections {
+        h.update(&(s.indices.start as u64).to_le_bytes());
+        h.update(&(s.indices.end as u64).to_le_bytes());
+        h.update(&[s.flags, s.subsurface.into()]);
+        let f = s.maps.fingerprint();
+        h.update(&(f.len() as u64).to_le_bytes());
+        h.update(f.as_bytes());
+    }
+    Hash32(*h.finalize().as_bytes())
+}
+
+/// A mesh to cook: in memory, or read when its cook starts.
+pub(crate) enum MeshSource {
+    Data(Box<MeshData>),
+    Lazy(LazyMesh),
+}
+
+pub(crate) type LoadMesh = dyn Fn(&Memo) -> Result<MeshData> + Send + Sync;
+
+/// A mesh read when its cook starts.
+pub(crate) struct LazyMesh {
+    /// Sections of the mesh `load` returns; the plan sets their maps.
+    pub sections: Vec<SectionData>,
+    pub triangles: u64,
+    /// Hash of everything `load` reads, besides the sections.
+    pub source: Hash32,
+    /// Reads the mesh; its sections are left empty.
+    pub load: Arc<LoadMesh>,
+}
+
+impl MeshSource {
+    pub(crate) fn sections(&self) -> &[SectionData] {
+        match self {
+            Self::Data(m) => &m.sections,
+            Self::Lazy(l) => &l.sections,
+        }
+    }
+
+    pub(crate) fn sections_mut(&mut self) -> &mut [SectionData] {
+        match self {
+            Self::Data(m) => &mut m.sections,
+            Self::Lazy(l) => &mut l.sections,
+        }
+    }
+
+    pub(crate) fn hash(&self) -> Hash32 {
+        match self {
+            Self::Data(m) => m.hash(),
+            Self::Lazy(l) => sections_hash(l.source, &l.sections),
+        }
+    }
+
+    pub(crate) fn triangles(&self) -> u64 {
+        match self {
+            Self::Data(m) => m.triangles(),
+            Self::Lazy(l) => l.triangles,
+        }
+    }
+
+    /// The mesh, read now if it is lazy; a lazy mesh whose triangles no longer match its
+    /// sections fails as changed.
+    pub(crate) fn load(self, asset: &str, memo: &Memo) -> Result<MeshData> {
+        match self {
+            Self::Data(m) => Ok(*m),
+            Self::Lazy(l) => {
+                let mut m = (l.load)(memo)?;
+                if m.triangles() != l.triangles {
+                    return Err(Error::Mesh {
+                        asset: asset.into(),
+                        message: format!(
+                            "{} triangles read, {} planned: the source changed",
+                            m.triangles(),
+                            l.triangles
+                        ),
+                    });
+                }
+                m.sections = l.sections;
+                Ok(m)
+            }
+        }
+    }
 }
 
 /// Per vertex: four skeleton joints and their unorm8 weights, summing to 255.
@@ -1262,12 +1351,6 @@ impl MeshData {
         part(self.tangents.as_deref().map_or(&[], bytemuck::cast_slice));
         part(bytemuck::cast_slice(&self.uvs));
         part(bytemuck::cast_slice(&self.indices));
-        for s in &self.sections {
-            part(&(s.indices.start as u64).to_le_bytes());
-            part(&(s.indices.end as u64).to_le_bytes());
-            part(&[s.flags, s.subsurface.into()]);
-            part(s.maps.fingerprint().as_bytes());
-        }
         if let Some(k) = &self.skin {
             part(bytemuck::cast_slice(&k.joints));
             part(bytemuck::cast_slice(&k.weights));
@@ -1290,7 +1373,7 @@ impl MeshData {
             part(p.joints.as_deref().map_or(&[], bytemuck::cast_slice));
         }
         part(format!("{:?}", self.min_exponent).as_bytes());
-        Hash32(*h.finalize().as_bytes())
+        sections_hash(Hash32(*h.finalize().as_bytes()), &self.sections)
     }
 
     pub(crate) fn triangles(&self) -> u64 {

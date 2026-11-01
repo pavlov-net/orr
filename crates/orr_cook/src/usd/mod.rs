@@ -52,13 +52,15 @@ use orr_math::{Affine2, DMat4, DQuat, DVec3, DVec4, Mat4};
 use serde::Deserialize;
 
 use crate::import::SceneSubd;
-use crate::import::{NodeSelect, Scene, SceneMaterial, SceneModel, SceneSkeleton};
-use crate::mesh::{MeshData, MeshSettings, SectionData, Skin};
+use crate::import::{
+    Decomposed, NodeSelect, Scene, SceneMaterial, SceneModel, SceneSkeleton, placement,
+};
+use crate::mesh::{MeshData, MeshSettings, MeshSource, SectionData, Skin};
 use crate::patch::{self, MaterialPatch, MeshPatch};
 use crate::shading;
 use crate::skin::ClipSettings;
 use crate::subd::SubdSettings;
-use crate::texture::material::{ImageFile, TextureRules};
+use crate::texture::material::{ImageData, ImageFile, TextureRules};
 use crate::{Error, Result};
 
 use mesh::{CageBuilder, MeshPrim, Placing, Welder};
@@ -495,7 +497,19 @@ impl<'s> Importer<'s> {
                 return Err(format!("two models are named {n:?}"));
             }
             if let (Some(n), Some(t)) = (&b.name, instances.get(&mi)) {
-                instance_out.push((n.clone(), t.clone()));
+                let mut placed = Vec::with_capacity(t.len());
+                for (i, &m) in t.iter().enumerate() {
+                    match placement(m) {
+                        Decomposed::Placed(p) => placed.push(p),
+                        Decomposed::Nothing => {}
+                        Decomposed::Sheared => {
+                            return Err(format!(
+                                "{n}: instance {i} has a shear, which a placement cannot hold"
+                            ));
+                        }
+                    }
+                }
+                instance_out.push((n.clone(), placed));
             }
             out.push(self.model(b)?);
         }
@@ -575,7 +589,7 @@ impl<'s> Importer<'s> {
         Ok(SceneModel {
             node: b.name,
             subd,
-            mesh: MeshData {
+            mesh: MeshSource::Data(Box::new(MeshData {
                 positions: w.positions,
                 normals: w.normals,
                 tangents: None,
@@ -588,7 +602,7 @@ impl<'s> Importer<'s> {
                 }),
                 parts: None,
                 min_exponent: None,
-            },
+            })),
             skeleton: b.skeleton,
             settings,
             materials: slots,
@@ -897,7 +911,7 @@ impl<'s> Importer<'s> {
                         .map_err(|e| format!("{resolved}: {e}"))?;
                     images.push(ImageFile {
                         name: a.asset_path().to_string(),
-                        bytes,
+                        data: ImageData::Bytes(bytes),
                     });
                     image_of.insert(resolved, images.len() - 1);
                     Ok(images.len() - 1)

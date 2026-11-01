@@ -93,6 +93,17 @@ impl Memo {
     fn get(&self, path: &Path) -> Option<(Stat, Hash32)> {
         self.files.lock().expect("memo lock").get(path).copied()
     }
+
+    /// Fails with [`Error::Changed`] when the file no longer has content hash `hash`: its
+    /// memoized size and time are compared, and without them the file is hashed again.
+    pub(crate) fn check(&self, path: &Path, hash: Hash32) -> Result<()> {
+        if self.hash(path)? != hash {
+            return Err(Error::Changed {
+                path: path.to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Hashes a file without holding it whole.
