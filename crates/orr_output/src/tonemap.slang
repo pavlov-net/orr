@@ -1,7 +1,8 @@
 // Pre-exposed linear Rec.2020 radiance to display-linear Rec.709: the lens's distortion and
 // chromatic aberration as the gather's sample positions, the view's adapted exposure, its
-// glare, its white balance, the grade, then GT7, or one of the debug views. With lens
-// distortion on it also composes the lens's map into frame generation's distortion field.
+// glare, its local exposure, its white balance, the grade, then GT7, or one of the debug
+// views. With lens distortion on it also composes the lens's map into frame generation's
+// distortion field.
 #include "orr/root.h"
 import orr.abi;
 import orr.color;
@@ -42,7 +43,13 @@ public struct TonemapConstants
     public float chromatic_aberration;
     // Scales green's radius so every tap lands inside the source.
     public float distortion_scale;
-    public uint _pad;
+    // Local exposure: stops of compression per stop the base sits from the pivot, and the
+    // grid's EV100 range (its bottom and EV per bin) and cells.
+    public float local_strength;
+    public float local_ev_min;
+    public float local_bin_ev;
+    public uint local_width;
+    public uint local_height;
 }
 
 struct Root
@@ -53,6 +60,10 @@ struct Root
     float4* white_balance;
     // The glare pass's weights: entry 0's xyz is the identity weight.
     float4* glare_weights;
+    // Local exposure's blurred grid (exposure.slang); null without local exposure.
+    float2* local_grid;
+    // The EV100 local exposure compresses toward, and 1 once adapt has metered one.
+    float2* local_pivot;
     TextureIndex source;
     StorageImageIndex target;
     // The `display_linear` hook's source, written with the same result; NONE without one.
@@ -128,6 +139,38 @@ void write_field(TonemapConstants* k, uint2 t, float2 size)
     root.field.get<RWTexture2D<float4>>()[t] = float4(f + at_f.rg, here.ba + g);
 }
 
+// The scale local exposure gives the pixel at `p` (pixels) whose radiance is `radiance`: the
+// grid sliced at the pixel's EV100 is its base, which moves toward the pivot by
+// `local_strength` stops per stop; the pixel's detail around the base is kept.
+float local_exposure(TonemapConstants* k, float2 p, float3 radiance, float pre_exposure)
+{
+    float2 pivot = *root.local_pivot;
+    float y = luminance_rec2020(radiance) / pre_exposure;
+    if (pivot.y == 0.0 || !(y > 0.0) || isinf(y))
+        return 1.0;
+    // Cell and bin coordinates, with cell (0, 0) bin 0's center at 0.
+    float z = (ev100_from_luminance(y) - k.local_ev_min) / k.local_bin_ev - 0.5;
+    int3 last = int3(k.local_width, k.local_height, LOCAL_BINS) - 1;
+    float3 g = clamp(float3(p / float(LOCAL_CELL) - 0.5, z), 0.0, float3(last));
+    int3 lo = int3(g);
+    int3 hi = min(lo + 1, last);
+    float3 f = g - float3(lo);
+    float2 sum = 0.0;
+    for (uint c = 0; c < 8; c++)
+    {
+        int3 at = int3((c & 1) != 0 ? hi.x : lo.x, (c & 2) != 0 ? hi.y : lo.y,
+                       (c & 4) != 0 ? hi.z : lo.z);
+        float w = ((c & 1) != 0 ? f.x : 1.0 - f.x) * ((c & 2) != 0 ? f.y : 1.0 - f.y)
+                * ((c & 4) != 0 ? f.z : 1.0 - f.z);
+        uint i = (uint(at.y) * k.local_width + uint(at.x)) * LOCAL_BINS + uint(at.z);
+        sum += w * root.local_grid[i];
+    }
+    if (!(sum.y > 0.0))
+        return 1.0;
+    float base = k.local_ev_min + sum.x / sum.y;
+    return exp2(-k.local_strength * (base - pivot.x));
+}
+
 // Stops from MID_GRAY as color: blue below, green at mid gray, red above, saturating at
 // six stops, with each whole stop a step darker at its top.
 float3 heatmap(float exposed_luminance)
@@ -199,6 +242,10 @@ void main(uint3 id: SV_DispatchThreadID)
                                tent(chain, linear, uv_b, texel, 0.0).b);
             glared = root.glare_weights[0].xyz * exposed + bands;
         }
+        float local = 1.0;
+        if (root.local_grid != nullptr)
+            local = local_exposure(k, uv_g * size, radiance, cur.pre_exposure);
+        glared *= local;
         float3 balanced = glared;
         if (k.white_balance != 0)
         {
@@ -209,7 +256,7 @@ void main(uint3 id: SV_DispatchThreadID)
                                                dot(k.grade_g.xyz, balanced),
                                                dot(k.grade_b.xyz, balanced));
         if (k.debug == DEBUG_EXPOSURE_HEATMAP)
-            c = heatmap(luminance_rec2020(exposed));
+            c = heatmap(luminance_rec2020(exposed) * local);
         else if (k.debug == DEBUG_LINEAR)
         {
             c = mul(REC2020_TO_REC709, graded);

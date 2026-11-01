@@ -336,3 +336,169 @@ fn debug_views() {
     assert!((at(0, 0) - levels.surround).abs() <= step(levels.surround));
     assert_clean();
 }
+
+mod local_exposure {
+    use orr_output::{
+        DisplayRequest, Exposure, LocalExposure, OutputDebug, OutputFormat, ViewOutput,
+        exposure_from_ev100, keyed_ev100, luminance_from_ev100,
+    };
+    use orr_scene::testing::assert_clean;
+    use output_suite::Harness;
+
+    use super::settle;
+
+    /// EV100 `ev` with a quarter-stop checkerboard over it.
+    fn checker(x: u32, y: u32, ev: f32) -> f32 {
+        let d = if (x + y).is_multiple_of(2) {
+            0.125
+        } else {
+            -0.125
+        };
+        luminance_from_ev100(ev + d)
+    }
+
+    fn with(strength: Option<f32>, output: &ViewOutput) -> ViewOutput {
+        ViewOutput {
+            local_exposure: strength.map(|strength| LocalExposure { strength }),
+            ..output.clone()
+        }
+    }
+
+    /// Manual exposure keying `ev100` to mid gray, shown linear.
+    fn manual(ev100: f32) -> ViewOutput {
+        ViewOutput {
+            exposure: Exposure::Manual {
+                ev100: keyed_ev100(ev100, 0.0),
+            },
+            debug: OutputDebug::Linear,
+            ..ViewOutput::default()
+        }
+    }
+
+    /// A quarter of sky, half middle ground and a quarter of deep shadow, each a
+    /// quarter-stop checkerboard: with the meter on target, sky clips at the SDR peak and
+    /// the shadow sits below 2^-10 of paper white.
+    #[test]
+    fn compresses_a_wide_scene() {
+        let (w, h) = (256, 128);
+        let mut harness = Harness::new(w, h);
+        let mid = 10.0;
+        let image: Vec<f32> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let ev = match y * 4 / h {
+                    0 => mid + 3.2,
+                    3 => mid - 11.8,
+                    _ => mid,
+                };
+                checker(x, y, ev)
+            })
+            .collect();
+        harness.set_image(&image);
+        let sdr = DisplayRequest::default().resolve(&[OutputFormat::Sdr], None, false);
+        let shares = |harness: &mut Harness, strength| {
+            let output = with(strength, &ViewOutput::default());
+            settle(harness, 1.0, &output);
+            harness.frame(1.0, &output, Some(&sdr));
+            let image = harness.display_linear();
+            let n = image.len() as f32;
+            let peak = image.iter().filter(|p| p[1] >= 0.99).count() as f32 / n;
+            let dark = image.iter().filter(|p| p[1] < 2f32.powi(-10)).count() as f32 / n;
+            (peak, dark)
+        };
+        let (peak, dark) = shares(&mut harness, None);
+        assert!(
+            peak > 0.05 && dark > 0.05,
+            "global: {peak} at peak, {dark} dark"
+        );
+        let (peak, dark) = shares(&mut harness, Some(0.5));
+        assert!(
+            peak < 0.05 && dark < 0.05,
+            "local: {peak} at peak, {dark} dark"
+        );
+        assert_clean();
+    }
+
+    #[test]
+    fn keeps_an_image_of_uniform_base() {
+        let (w, h) = (128, 96);
+        let mut harness = Harness::new(w, h);
+        let hdr = DisplayRequest::default().resolve(&[OutputFormat::Hdr10Pq], None, false);
+        // EV100 9 is a grid bin's center.
+        let ev = 9.0;
+        let uniform = vec![luminance_from_ev100(ev); harness.pixels()];
+        let checkered: Vec<f32> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| checker(x, y, ev)))
+            .collect();
+        for image in [uniform, checkered] {
+            harness.set_image(&image);
+            let mut shown = |strength| {
+                let output = with(strength, &manual(ev));
+                harness.frame(1.0, &output, Some(&hdr));
+                harness.frame(1.0, &output, Some(&hdr));
+                harness.display_linear()
+            };
+            let global = shown(None);
+            for strength in [0.5, 1.0] {
+                for (a, b) in shown(Some(strength)).iter().zip(&global) {
+                    let change = (a[1] / b[1] - 1.0).abs();
+                    assert!(
+                        change < 1e-3,
+                        "strength {strength}: {} against {}",
+                        a[1],
+                        b[1]
+                    );
+                }
+            }
+        }
+        assert_clean();
+    }
+
+    #[test]
+    fn keeps_a_step_edge_sharp() {
+        let (w, h) = (288, 64);
+        let edge = 144;
+        let mut harness = Harness::new(w, h);
+        let hdr = DisplayRequest::default().resolve(&[OutputFormat::Hdr10Pq], None, false);
+        // Grid bin centers, ten stops apart, with the pivot between them.
+        let (low, high) = (5.0, 15.0);
+        let image: Vec<f32> = (0..h)
+            .flat_map(|_| (0..w).map(|x| luminance_from_ev100(if x < edge { low } else { high })))
+            .collect();
+        harness.set_image(&image);
+        let output = with(Some(0.5), &manual(0.5 * (low + high)));
+        harness.frame(1.0, &output, Some(&hdr));
+        let t = harness.frame(1.0, &output, Some(&hdr));
+        let s = exposure_from_ev100(t.adapted_ev100);
+        let shown = harness.display_linear();
+        // Stops each pixel moved from global exposure.
+        let moved = |x: u32, y: u32| {
+            let i = (y * w + x) as usize;
+            (shown[i][1] / (image[i] * s)).log2()
+        };
+        let across = moved(w - 1, h / 2) - moved(0, h / 2) + (high - low);
+        assert!(
+            (across - 5.0).abs() < 0.05,
+            "{across} stops across the edge"
+        );
+        for y in 0..h {
+            for x in (0..w).filter(|&x| x.abs_diff(edge) > 64) {
+                let side = if x < edge { 2.5 } else { -2.5 };
+                let off = moved(x, y) - side;
+                assert!(off.abs() < 0.1, "({x}, {y}): {off} EV from its side");
+            }
+        }
+        assert_clean();
+    }
+
+    #[test]
+    fn turning_it_off_frees_the_grid() {
+        let mut harness = Harness::new(64, 64);
+        harness.set_image(&vec![100.0; harness.pixels()]);
+        harness.frame(1.0, &with(Some(0.5), &ViewOutput::default()), None);
+        assert!(harness.output().local_exposure_bytes() > 0);
+        harness.frame(1.0, &ViewOutput::default(), None);
+        assert_eq!(harness.output().local_exposure_bytes(), 0);
+        assert_clean();
+    }
+}

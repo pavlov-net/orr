@@ -1,6 +1,6 @@
 //! Output's compute passes, recorded into a command list: hook inputs, exposure and white
-//! balance (meter and adapt), motion blur, depth of field, glare, tonemap, compose and
-//! compose-UI, and screenshot capture.
+//! balance (meter and adapt), local exposure, motion blur, depth of field, glare, tonemap,
+//! compose and compose-UI, and screenshot capture.
 
 use std::ops::RangeInclusive;
 
@@ -16,6 +16,7 @@ use crate::exposure::{COMPENSATION_ENTRIES, HISTOGRAM_BINS, HISTOGRAM_WORDS_PER_
 use crate::fft_glare::{FftGlareKernels, FftGlareTargets, FftLayout};
 use crate::glare::{GLARE_DISPATCHES, GlareKernels, GlareTargets, ViewGlare, levels};
 use crate::hooks::{HOOK_DEPTH, HOOK_MOTION};
+use crate::local_exposure::{LOCAL_BINS, LocalKernels, LocalTargets};
 use crate::motion_blur::{MotionBlurKernels, MotionBlurTargets};
 use crate::shaders::compose;
 use crate::shaders::exposure::adapt::{self, AdaptParams, ExposureTelemetryGpu};
@@ -34,6 +35,7 @@ pub struct OutputKernels {
     hook_inputs: ComputePipeline,
     meter: ComputePipeline,
     adapt: ComputePipeline,
+    local: LocalKernels,
     motion_blur: MotionBlurKernels,
     dof: DofKernels,
     glare: GlareKernels,
@@ -61,7 +63,8 @@ const MOTION_BLUR_ROOT: u64 = 2048;
 const DOF_ROOT: u64 = 2304;
 const GLARE_ROOTS: u64 = 2560;
 const GLARE_ROOT_STRIDE: u64 = 128;
-const COMPENSATION: u64 = GLARE_ROOTS + GLARE_DISPATCHES as u64 * GLARE_ROOT_STRIDE;
+const LOCAL_ROOT: u64 = GLARE_ROOTS + GLARE_DISPATCHES as u64 * GLARE_ROOT_STRIDE;
+const COMPENSATION: u64 = LOCAL_ROOT + 256;
 const _: () =
     assert!(size_of::<crate::shaders::post::fft_glare::Root>() as u64 <= GLARE_ROOT_STRIDE);
 const ZEROS: u64 = COMPENSATION + 4 * COMPENSATION_ENTRIES as u64;
@@ -69,6 +72,9 @@ const UPLOAD_BYTES: u64 = ZEROS + 4 * HISTOGRAM_WORDS;
 const _: () =
     assert!(size_of::<crate::shaders::post::dof::Root>() as u64 <= GLARE_ROOTS - DOF_ROOT);
 const _: () = assert!(size_of::<crate::shaders::post::glare::Root>() as u64 <= GLARE_ROOT_STRIDE);
+const _: () = assert!(
+    size_of::<crate::shaders::exposure::local_grid::Root>() as u64 <= COMPENSATION - LOCAL_ROOT
+);
 
 /// GPU memory for one view's output passes in one frame. Recording a pass writes its root
 /// here, so reuse it only once the list that last recorded with it has completed; an
@@ -81,6 +87,19 @@ pub struct OutputRoots {
     telemetry_frame: Option<u64>,
     white_balance: Allocation<[f32; 4]>,
     compensation: Option<(CompensationCurve, RangeInclusive<f32>)>,
+    /// The local exposure grid tonemap slices this frame, as the exposure pass recorded it.
+    local: Option<LocalSlice>,
+}
+
+/// What tonemap reads to slice a view's local exposure grid.
+#[derive(Clone, Copy)]
+struct LocalSlice {
+    grid: GpuPtr<[f32; 2]>,
+    pivot: GpuPtr<[f32; 2]>,
+    strength: f32,
+    ev_min: f32,
+    bin_ev: f32,
+    cells: [u32; 2],
 }
 
 impl OutputRoots {
@@ -95,6 +114,7 @@ impl OutputRoots {
             telemetry_frame: None,
             white_balance: gpu.gpu_malloc(MemoryKind::DeviceLocal, 3, "white balance")?,
             compensation: None,
+            local: None,
         })
     }
 
@@ -110,14 +130,15 @@ impl OutputRoots {
 /// Output's state for one view history: its [`OutputRoots`] per frame in flight, the
 /// exposure telemetry they read back, the screenshots being read back, while the view sets
 /// a hook the hook inputs, while its shutter is open the motion blur tiles, while its lens
-/// has depth of field that effect's images, history and lens state, and while it has glare
-/// the glare chain.
+/// has depth of field that effect's images, history and lens state, while it has glare the
+/// glare chain, and while it has local exposure that effect's grid.
 pub struct OutputView {
     frames: Vec<OutputRoots>,
     captures: Vec<Capture>,
     motion_blur: Option<MotionBlurTargets>,
     dof: Option<DofTargets>,
     glare: Option<ViewGlare>,
+    local: Option<LocalTargets>,
     device: Device,
 }
 
@@ -138,6 +159,7 @@ impl OutputView {
             motion_blur: None,
             dof: None,
             glare: None,
+            local: None,
             device: gpu.clone(),
         })
     }
@@ -159,6 +181,12 @@ impl OutputView {
     /// Bytes of the glare buffers held for the view: 0 unless its last frame had glare.
     pub fn glare_bytes(&self) -> u64 {
         self.glare.as_ref().map_or(0, ViewGlare::bytes)
+    }
+
+    /// Bytes of the local exposure grid held for the view: 0 unless its last frame had local
+    /// exposure.
+    pub fn local_exposure_bytes(&self) -> u64 {
+        self.local.as_ref().map_or(0, LocalTargets::bytes)
     }
 
     /// The glare chain (RGBA16F, from 1/2 or 1/4 of the extent), while the view's lens has
@@ -435,6 +463,7 @@ impl OutputKernels {
             hook_inputs: pipeline(&hook_inputs::MODULE, "hook_inputs")?,
             meter: pipeline(&meter::MODULE, "meter")?,
             adapt: pipeline(&adapt::MODULE, "adapt")?,
+            local: LocalKernels::new(gpu)?,
             motion_blur: MotionBlurKernels::new(gpu)?,
             dof: DofKernels::new(gpu)?,
             glare: GlareKernels::new(gpu)?,
@@ -524,23 +553,47 @@ impl OutputKernels {
         Ok(Some(inputs))
     }
 
-    /// Records `meter` (with auto exposure or auto white balance) and `adapt`, which writes
-    /// the view's next exposure slot, the white balance tonemap applies and the telemetry.
-    /// Order the source's writes before it with a barrier; it ends with a barrier, so tonemap
-    /// may follow directly.
+    /// Records `meter` (with auto exposure, auto white balance or local exposure), `adapt`,
+    /// which writes the view's next exposure slot, the white balance tonemap applies and the
+    /// telemetry, and with local exposure `local_exposure`, which blurs the grid tonemap
+    /// slices. Allocates the view's grid on the first frame with local exposure and frees it
+    /// on the first without. Order the source's writes before it with a barrier; it ends with
+    /// a barrier, so tonemap may follow directly.
     pub fn exposure(
         &self,
         list: &mut CommandList<'_>,
-        roots: &mut OutputRoots,
+        view: &mut OutputView,
         pass: &ExposurePass<'_>,
-    ) {
+    ) -> Result<()> {
+        let output = pass.output;
+        let n = view.frames.len() as u64;
+        let roots = &mut view.frames[(pass.frame % n) as usize];
         if !roots.histogram_cleared {
             let zeros = roots.upload.gpu().offset(ZEROS);
             list.copy(roots.histogram.gpu().cast(), zeros, 4 * HISTOGRAM_WORDS);
             list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
             roots.histogram_cleared = true;
         }
-        let output = pass.output;
+        let local = match output.local_exposure {
+            None => {
+                view.local = None;
+                None
+            }
+            Some(settings) => {
+                let (targets, fresh) = match &mut view.local {
+                    Some(t) if t.extent == pass.extent => (&*t, false),
+                    slot => (
+                        &*slot.insert(LocalTargets::new(&view.device, pass.extent)?),
+                        true,
+                    ),
+                };
+                let root = roots.put(LOCAL_ROOT, &targets.root());
+                if fresh {
+                    self.local.clear(list, root, targets.cells);
+                }
+                Some((settings, targets, root))
+            }
+        };
         let default_meter = AutoExposure::default();
         let (mut params, meter) = match &output.exposure {
             Exposure::Manual { ev100 } => {
@@ -549,7 +602,8 @@ impl OutputKernels {
                     manual_ev100: *ev100,
                     ..adapt_params(&default_meter, output.cut)
                 };
-                (params, output.white_balance.map(|_| &default_meter))
+                let metered = output.white_balance.is_some() || local.is_some();
+                (params, metered.then_some(&default_meter))
             }
             Exposure::Auto(auto) => {
                 let stale = roots.compensation.as_ref().is_none_or(|(curve, range)| {
@@ -584,7 +638,10 @@ impl OutputKernels {
                 ev_min: params.ev_min,
                 bins_per_ev: 1.0 / params.bin_ev,
                 chroma: params.white_balance,
-                _pad: 0,
+                grid_width: local.map_or(0, |(_, t, _)| t.cells[0]),
+                grid: local.map_or(GpuPtr::NULL, |(_, t, _)| t.sums.gpu()),
+                _pad0: 0,
+                _pad1: 0,
             };
             let root = roots.put(METER_ROOT, &root);
             list.begin_pass("meter", false);
@@ -600,19 +657,30 @@ impl OutputKernels {
             sky: pass.sky,
             telemetry: roots.telemetry.gpu(),
             white_balance: roots.white_balance.gpu().cast(),
-            _pad0: 0,
-            _pad1: 0,
+            local_pivot: local.map_or(GpuPtr::NULL, |(_, t, _)| t.pivot.gpu()),
         };
         let root = roots.put(ADAPT_ROOT, &root);
         list.begin_pass("adapt", false);
         list.dispatch(&self.adapt, root, [1, 1, 1]);
         list.end_pass();
+        if let Some((_, targets, root)) = local {
+            self.local.blur(list, root, targets.cells);
+        }
         list.barrier(
             Stages::COMPUTE,
             Stages::COMPUTE | Stages::HOST,
             Hazards::empty(),
         );
         roots.telemetry_frame = Some(pass.frame);
+        roots.local = local.map(|(settings, targets, _)| LocalSlice {
+            grid: targets.grid.gpu(),
+            pivot: targets.pivot.gpu(),
+            strength: settings.strength,
+            ev_min: params.ev_min,
+            bin_ev: params.bin_ev * HISTOGRAM_BINS as f32 / LOCAL_BINS as f32,
+            cells: targets.cells,
+        });
+        Ok(())
     }
 
     /// Records the `motion_blur` pass when the shutter is open and the view's history holds:
@@ -806,7 +874,8 @@ impl OutputKernels {
         }
     }
 
-    /// Records the tonemap pass. With lens distortion and `field`, it composes the lens's map
+    /// Records the tonemap pass, with the local exposure the exposure pass recorded with the
+    /// same `roots`. With lens distortion and `field`, it composes the lens's map
     /// into the field after any stage that wrote it this frame (`hook_inputs`, a
     /// `scene_referred` hook); frame generation reads the result. Order its source's, the
     /// field's and the adapt pass's writes before it with a barrier.
@@ -844,7 +913,11 @@ impl OutputKernels {
             k2: lens.map_or(0.0, |l| l.k2),
             chromatic_aberration: lens.map_or(0.0, |l| l.chromatic_aberration),
             distortion_scale: lens.map_or(1.0, |l| distortion_scale(&l, pass.extent)),
-            _pad: 0,
+            local_strength: roots.local.map_or(0.0, |l| l.strength),
+            local_ev_min: roots.local.map_or(0.0, |l| l.ev_min),
+            local_bin_ev: roots.local.map_or(1.0, |l| l.bin_ev),
+            local_width: roots.local.map_or(0, |l| l.cells[0]),
+            local_height: roots.local.map_or(0, |l| l.cells[1]),
         };
         let (field, field_source) = match (lens, field) {
             (Some(_), Some(f)) => {
@@ -862,6 +935,8 @@ impl OutputKernels {
             view: pass.view,
             white_balance: roots.white_balance.gpu().cast(),
             glare_weights: pass.glare.map_or(GpuPtr::NULL, |g| g.weights),
+            local_grid: roots.local.map_or(GpuPtr::NULL, |l| l.grid),
+            local_pivot: roots.local.map_or(GpuPtr::NULL, |l| l.pivot),
             source: pass.source,
             target: pass.target,
             hook_source: pass.hook_source.unwrap_or(StorageImageIndex::NONE),

@@ -218,19 +218,20 @@ impl Harness {
                 )
                 .unwrap();
         }
-        let roots = self.output.roots(self.frame);
-        self.kernels.exposure(
-            &mut list,
-            roots,
-            &ExposurePass {
-                source: self.radiance_index,
-                extent: self.extent,
-                view,
-                sky: self.sky.gpu(),
-                frame: self.frame,
-                output,
-            },
-        );
+        self.kernels
+            .exposure(
+                &mut list,
+                &mut self.output,
+                &ExposurePass {
+                    source: self.radiance_index,
+                    extent: self.extent,
+                    view,
+                    sky: self.sky.gpu(),
+                    frame: self.frame,
+                    output,
+                },
+            )
+            .unwrap();
         if let Some(display) = display {
             let composite = self
                 .kernels

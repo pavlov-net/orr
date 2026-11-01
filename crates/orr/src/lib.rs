@@ -37,9 +37,9 @@ pub use orr_output::{self, Error as OutputError};
 pub use orr_output::{
     AutoExposure, AutoWhiteBalance, CalibrationPattern, CompensationCurve, Display, DisplayFeed,
     DisplayInfo, DisplayRequest, DlssSdk, DlssSupport, Exposure, ExposureTelemetry,
-    FrameGenerationMode, Grade, Gt7Params, HookPass, MeterWeights, OutputDebug, Physiological,
-    Presented, Primaries, ResolvedDisplay, Screenshot, ScreenshotRequest, SkyTelemetry, UiPass,
-    ViewOutput,
+    FrameGenerationMode, Grade, Gt7Params, HookPass, LocalExposure, MeterWeights, OutputDebug,
+    Physiological, Presented, Primaries, ResolvedDisplay, Screenshot, ScreenshotRequest,
+    SkyTelemetry, UiPass, ViewOutput,
 };
 pub use orr_scene::Error as SceneError;
 pub use orr_scene::{self, RasterView};
@@ -813,7 +813,7 @@ impl<'a> Frame<'a> {
         arena.enter(ViewStep::Exposure, list);
         kernels.exposure(
             list,
-            state.output.roots(id),
+            &mut state.output,
             &ExposurePass {
                 source: radiance,
                 extent,
@@ -822,7 +822,7 @@ impl<'a> Frame<'a> {
                 frame: id,
                 output,
             },
-        );
+        )?;
         if !tonemapped {
             arena.enter(ViewStep::After, list);
             return Ok(RenderedView {
