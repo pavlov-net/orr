@@ -16,6 +16,7 @@
 // neither the edge in its frustum nor in front of its HZB.
 #include "orr/root.h"
 import orr.abi;
+import orr.atomic;
 import orr.math;
 import orr.packing;
 import producer;
@@ -32,6 +33,7 @@ extern struct Displace : IDisplacement = TextureDisplacement;
 
 // Split passes: patch triangles take up to MAX_DICE^(SPLITS + 1) segments per edge.
 static const uint SPLITS = 3;
+static const uint MAX_FACTOR = MAX_DICE * MAX_DICE * MAX_DICE * MAX_DICE * FACTOR_ONE;
 // Edges no view saw last frame take this share of the rate, never less than one segment.
 static const float UNSEEN_RATE = 1.0 / 15.0;
 // The rate steps by this factor above STEP_DOWN and below STEP_UP of capacity asked for.
@@ -76,15 +78,10 @@ ProducerBatch drawn()
     return root.scene.batches[root.entry];
 }
 
-uint3 load_factors(uint packed)
+// An item's fixed-point factors, each from one segment to MAX_DICE.
+uint3 item_factors(PatchItem item)
 {
-    uint3 f = uint3(packed & 0xff, (packed >> 8) & 0xff, (packed >> 16) & 0xff);
-    return clamp(f, 1, MAX_DICE);
-}
-
-uint pack_factors(uint3 f)
-{
-    return f.x | (f.y << 8) | (f.z << 16);
+    return clamp(unpack_factors(item.factors), FACTOR_ONE, MAX_DICE * FACTOR_ONE);
 }
 
 // One patch triangle: entry-space corners, attributes and words, and for a subdivision
@@ -159,14 +156,14 @@ bool seen(Rates r, float3 center, float radius)
     return !box_occluded(v, root.raster, here, c - rad, c + rad, false);
 }
 
-// Segments edge a-b asks for, before rounding: the same from either end.
+// Segments edge a-b asks for: the same from either end, bit for bit.
 float edge_factor(Rates r, float3 a, float3 b)
 {
     if ((root.flags & TESS_FOCUS) == 0)
         return 1.0;
-    float len = length(mul(r.focus.linear, a - b));
-    float d = max(min(length(place(r.focus, a)), length(place(r.focus, b))), FOCUS_NEAR);
-    float t = len / d * root.focus_offset.w / root.dice_pixels * r.scale;
+    precise float len = length(mul(r.focus.linear, a - b));
+    precise float d = max(min(length(place(r.focus, a)), length(place(r.focus, b))), FOCUS_NEAR);
+    precise float t = len / d * root.focus_offset.w / root.dice_pixels * r.scale;
     float3 mid = 0.5 * (a + b);
     if (!seen(r, mid, 0.5 * length(a - b) + r.reach))
     {
@@ -188,37 +185,39 @@ void push_dice(PatchItem item)
 }
 
 // Sends the subpatch with corners at `p` to the split queue of pass `level` or the dice
-// list; `item.rate` is set at level 0.
+// list; `item.rate` is set at level 0. A split cuts each edge by a fraction of its factor,
+// so subpatch corners move continuously with the factors as dice points do.
 void classify(Rates r, inout PatchItem item, float3 p[3], uint level)
 {
     float3 t = float3(edge_factor(r, p[0], p[1]), edge_factor(r, p[1], p[2]), edge_factor(r, p[2], p[0]));
-    // At least one segment, NaN included.
-    float3 c = min(ceil(t), 65535.0);
-    float3 n = select(c >= 1.0, c, 1.0);
+    // Fixed point, at least one segment (NaN included) and at most what the splits reach.
+    float3 f = round(t * float(FACTOR_ONE));
+    uint3 q = select(f >= float(FACTOR_ONE), uint3(min(f, float(MAX_FACTOR))), uint3(FACTOR_ONE));
+    uint most = max(q.x, max(q.y, q.z));
     if (level == 0)
-        item.rate = max(n.x, max(n.y, n.z));
+        item.rate = float(most) / float(FACTOR_ONE);
     TessGpu* g = root.tess;
-    if (max(n.x, max(n.y, n.z)) > float(MAX_DICE) && level < SPLITS)
+    if (most > MAX_DICE * FACTOR_ONE && level < SPLITS)
     {
-        uint3 split = uint3(min(ceil(n / float(MAX_DICE)), float(MAX_DICE)));
+        uint3 split = clamp((q + MAX_DICE - 1) / MAX_DICE, FACTOR_ONE, MAX_DICE * FACTOR_ONE);
         uint at;
         InterlockedAdd(g.counters[TESS_QUEUE + (level & 1)], 1, at);
         if (at < g.queue_capacity)
         {
-            item.factors = pack_factors(split);
+            pack_factors(split, item.factors);
             g.queue[level & 1][at] = item;
             return;
         }
         InterlockedAdd(g.counters[TESS_SPLIT_DROPPED], 1);
     }
-    item.factors = pack_factors(uint3(min(n, float(MAX_DICE))));
+    pack_factors(min(q, MAX_DICE * FACTOR_ONE), item.factors);
     push_dice(item);
 }
 
-float3 corner_point(Patch pt, uint corner)
+float3 corner_point(Patch pt, uint3 corner)
 {
     float3 c[3] = pt.current.corners.position;
-    return interpolate(c, bary_weights(unpack_bary(corner)));
+    return interpolate(c, bary_weights(corner));
 }
 
 // Steps the rate from last frame's capacity asked for and resets this frame's counts.
@@ -259,10 +258,11 @@ void patches(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     cluster_triangle(b, k, thread, p[0], p[1], p[2]);
     PatchItem item;
     item.patch = (c << 7) | thread;
-    item.corners[0] = pack_bary(uint3(BARY_ONE, 0, 0));
-    item.corners[1] = pack_bary(uint3(0, BARY_ONE, 0));
-    item.corners[2] = pack_bary(uint3(0, 0, BARY_ONE));
+    set_corner(item.corners, 0, uint3(BARY_ONE, 0, 0));
+    set_corner(item.corners, 1, uint3(0, BARY_ONE, 0));
+    set_corner(item.corners, 2, uint3(0, 0, BARY_ONE));
     item.rate = 1.0;
+    item.zeros = PATCH_ZEROS;
     classify(rates(), item, p, 0);
 }
 
@@ -299,17 +299,22 @@ void split(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     Patch pt = load_patch(item.patch);
     Rates r = rates();
     PatternTable* table = root.patterns;
-    PatternGpu pattern = table.patterns[pattern_index(load_factors(item.factors))];
+    uint3 q = item_factors(item);
+    PatternGpu pattern = table.patterns[pattern_index(factor_counts(q))];
     for (uint k = 0; k < pattern.tri_count; k++)
     {
         uint8_t* tri = table.triangles + 3 * (pattern.tri_first + k);
         PatchItem child = item;
+        child.zeros = 0;
         float3 p[3];
         for (uint j = 0; j < 3; j++)
         {
-            uint3 w = unpack_bary(table.vertices[pattern.vertex_first + uint(tri[j])]);
-            child.corners[j] = pack_bary(compose(w, item.corners));
-            p[j] = corner_point(pt, child.corners[j]);
+            uint key = table.vertices[pattern.vertex_first + uint(tri[j])];
+            uint zeros = vertex_zeros(key, item.zeros);
+            child.zeros |= zeros << (3 * j);
+            uint3 c = place(pattern_weights(key, q), item.corners, zeros);
+            set_corner(child.corners, j, c);
+            p[j] = corner_point(pt, c);
         }
         classify(r, child, p, level + 1);
     }
@@ -415,9 +420,10 @@ void dice(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     PatternTable* table = root.patterns;
     ProducerBatch d = drawn();
     Patch pt = load_patch(item.patch);
+    uint3 q = item_factors(item);
     if (thread == 0)
     {
-        g_pattern = pattern_index(load_factors(item.factors));
+        g_pattern = pattern_index(factor_counts(q));
         PatternGpu pattern = table.patterns[g_pattern];
         g_first = alloc_vertices(d, pattern.vertex_count);
         if (g_first != NO_ROOM)
@@ -429,6 +435,8 @@ void dice(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
                 g.patch = item.patch;
                 g.pattern = g_pattern;
                 g.corners = item.corners;
+                pack_factors(q, g.factors);
+                g.zeros = item.zeros;
                 d.generated[c] = g;
             }
         }
@@ -440,7 +448,8 @@ void dice(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     uint material = producer_material(entry(), pt.cluster);
     if (material == MATERIAL_NONE)
         material = 0;
-    uint3 wi = compose(unpack_bary(table.vertices[pattern.vertex_first + thread]), item.corners);
+    uint key = table.vertices[pattern.vertex_first + thread];
+    uint3 wi = place(pattern_weights(key, q), item.corners, vertex_zeros(key, item.zeros));
     float3 w = bary_weights(wi);
     Surface base;
     float3 x = displaced(pt, item, material, w, false, base);
@@ -493,7 +502,10 @@ void weld_clear(uint3 id: SV_DispatchThreadID)
 {
     TessGpu* t = root.tess;
     if (id.x <= t.weld_mask)
+    {
         t.weld[id.x] = 0;
+        t.weld_owner[id.x] = 0;
+    }
 }
 
 // `TessGpu.undisplaced` w of this frame's vertices on a patch triangle's edge: vertices
@@ -516,8 +528,29 @@ uint generated_vertices()
     return min(*d.vertex_count, d.max_vertices);
 }
 
-// One thread per generated vertex on a patch triangle's edge: its slot keeps the lowest
-// vertex at its undisplaced point.
+// The slot of the undisplaced point of vertex `v`, which `claim` takes when it is free;
+// false past WELD_PROBES.
+bool weld_slot(uint v, float3 u, bool claim, out uint slot)
+{
+    TessGpu* t = root.tess;
+    slot = weld_hash(u) & t.weld_mask;
+    for (uint probe = 0; probe < WELD_PROBES; probe++)
+    {
+        uint before = t.weld[slot];
+        if (before == 0 && claim)
+            InterlockedCompareExchange(t.weld[slot], 0, v + 1, before);
+        if (before == 0)
+            return claim;
+        if (all(t.undisplaced[before - 1].xyz == u))
+            return true;
+        slot = (slot + 1) & t.weld_mask;
+    }
+    return false;
+}
+
+// One thread per generated vertex on a patch triangle's edge: its slot keeps, of the
+// vertices at its undisplaced point, the one with the lowest uv and then the lowest index,
+// so the choice does not depend on the order vertices were written in.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void weld(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
@@ -529,25 +562,18 @@ void weld(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     float4 u = t.undisplaced[v];
     if (asuint(u.w) != weld_tag())
         return;
-    uint slot = weld_hash(u.xyz) & t.weld_mask;
-    for (uint probe = 0; probe < WELD_PROBES; probe++)
+    uint slot;
+    if (!weld_slot(v, u.xyz, true, slot))
     {
-        uint before;
-        InterlockedCompareExchange(t.weld[slot], 0, v + 1, before);
-        if (before == 0)
-            return;
-        if (all(t.undisplaced[before - 1].xyz == u.xyz))
-        {
-            InterlockedMin(t.weld[slot], v + 1);
-            return;
-        }
-        slot = (slot + 1) & t.weld_mask;
+        InterlockedAdd(t.counters[TESS_WELD_DROPPED], 1);
+        return;
     }
-    InterlockedAdd(t.counters[TESS_WELD_DROPPED], 1);
+    uint uv = drawn().attrs[v].y;
+    atomic_max_u64(t.weld_owner + slot, (uint64_t(~uv) << 32) | uint64_t(~v));
 }
 
 // One thread per generated vertex on a patch triangle's edge: it takes the displaced
-// position of its slot's vertex.
+// position of its slot's owner.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void weld_apply(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
@@ -559,28 +585,19 @@ void weld_apply(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     float4 u = t.undisplaced[v];
     if (asuint(u.w) != weld_tag())
         return;
-    uint slot = weld_hash(u.xyz) & t.weld_mask;
-    for (uint probe = 0; probe < WELD_PROBES; probe++)
-    {
-        uint owner = t.weld[slot];
-        if (owner == 0)
-            return;
-        if (all(t.undisplaced[owner - 1].xyz == u.xyz))
-        {
-            if (owner - 1 != v)
-            {
-                ProducerBatch d = drawn();
-                float3 x = d.positions[owner - 1];
-                if (any(x != d.positions[v]))
-                    InterlockedAdd(t.counters[TESS_WELDED], 1);
-                d.positions[v] = x;
-                if (d.previous != nullptr)
-                    d.previous[v] = d.previous[owner - 1];
-            }
-            return;
-        }
-        slot = (slot + 1) & t.weld_mask;
-    }
+    uint slot;
+    if (!weld_slot(v, u.xyz, false, slot))
+        return;
+    uint owner = ~uint(t.weld_owner[slot]);
+    if (owner == v)
+        return;
+    ProducerBatch d = drawn();
+    float3 x = d.positions[owner];
+    if (any(x != d.positions[v]))
+        InterlockedAdd(t.counters[TESS_WELDED], 1);
+    d.positions[v] = x;
+    if (d.previous != nullptr)
+        d.previous[v] = d.previous[owner];
 }
 
 // Sizes the weld to the generated vertices.

@@ -109,7 +109,10 @@ pub use world::{REBASE_GRID_LOG2, WorldPos};
 
 /// The tessellation pattern table that `GeneratedClusterGpu::pattern` indexes.
 pub mod tessellation {
-    pub use crate::tessellate::{BARY_ONE, MAX_DICE, PATTERNS, Pattern, pattern, pattern_index};
+    pub use crate::tessellate::{
+        BARY_ONE, FACTOR_ONE, MAX_DICE, PATCH_ZEROS, PATTERNS, Pattern, factor_count, pattern,
+        pattern_index, unpack_factors,
+    };
 }
 
 /// orr_scene's compiled-in kernel modules.

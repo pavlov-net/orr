@@ -201,7 +201,7 @@ void draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint copy, MeshGpu* mesh
     if (!add_visible(r, vc, visible))
         return;
     s.slot_state[copy_slot(copy)].last_visible_frame = s.frame_index;
-    if (r.software_pixels > 0.0 && small_on_screen(v, p, lo, hi, r.software_pixels))
+    if (small_on_screen(v, p, lo, hi, r))
     {
         append(r, COUNT_SOFTWARE, r.software, visible);
         return;
@@ -374,11 +374,17 @@ void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         float radius = 0.5 * length(hi - lo) * pl.scale;
         if (!sphere_visible(v, center, radius))
             continue;
+        // Diced clusters that displacement stretches past the software raster's limit
+        // split their triangles between the two paths by size.
+        float size;
+        bool fits = r.software_pixels > 0.0 && !particle && screen_size(v, pl, lo, hi, size);
+        bool software = fits && size <= software_limit(r);
+        bool by_size = fits && !software && p.tessellated != 0;
         VisibleCluster vc;
         vc.page = nullptr;
         vc.instance = s.producer_base + entry;
         vc.cluster = c;
-        vc.local = 0;
+        vc.local = by_size ? VISIBLE_BY_SIZE : 0;
         vc.material = material;
         uint visible;
         if (!add_visible(r, vc, visible))
@@ -388,11 +394,10 @@ void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
             append(r, COUNT_PARTICLES, r.particles, visible);
             continue;
         }
-        if (r.software_pixels > 0.0 && small_on_screen(v, pl, lo, hi, r.software_pixels))
-        {
+        if (software || by_size)
             append(r, COUNT_SOFTWARE, r.software, visible);
+        if (software)
             continue;
-        }
         bool alpha = p.opacity == PRODUCER_ALPHA_TESTED && (s.materials[material].flags & MATERIAL_ALPHA_TESTED) != 0;
         append(r, alpha ? COUNT_ALPHA : COUNT_OPAQUE, alpha ? r.alpha : r.opaque, visible);
     }

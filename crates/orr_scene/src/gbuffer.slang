@@ -92,9 +92,14 @@ public struct VisibleCluster
     public uint8_t* page;           // its resident page
     public uint instance;
     public uint cluster;            // mesh cluster index
-    public uint local;              // index in the page
+    public uint local;              // index in the page; a producer cluster's VISIBLE_* flags
     public uint material;
 }
+
+// `VisibleCluster.local` of producer clusters: both raster paths draw the cluster, the
+// software raster its triangles whose screen rect fits `software_limit` and the hardware
+// path the others.
+public static const uint VISIBLE_BY_SIZE = 1;
 
 // Visibility buffer words: reverse-Z f32 depth in the high word, then the visible cluster
 // (25 bits) and the triangle (7 bits). 0 = no geometry.

@@ -22,7 +22,9 @@ use crate::shaders::types::{
 use crate::subd::CageShape;
 use crate::{RasterGpu, Result, SceneRoot, TopologyGpu, ViewConstants};
 
-pub use crate::pattern::{BARY_ONE, MAX_DICE, PATTERNS, Pattern};
+pub use crate::pattern::{
+    BARY_ONE, FACTOR_ONE, MAX_DICE, PATCH_ZEROS, PATTERNS, Pattern, factor_count,
+};
 
 /// `patterns.bin`: the build script's pattern table.
 static TABLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/patterns.bin"));
@@ -39,14 +41,19 @@ const ARGS_WELD: u64 = 9;
 /// `TessRoot.flags`.
 const TESS_FOCUS: u32 = 1;
 
-/// The table index of edge factors `f` (edges v0-v1, v1-v2, v2-v0), each 1 to [`MAX_DICE`]:
-/// what `GeneratedClusterGpu::pattern` holds.
-pub fn pattern_index(f: [u32; 3]) -> u32 {
+/// The table index of odd edge counts `n` (edges v0-v1, v1-v2, v2-v0), each 1 to
+/// [`MAX_DICE`]: what `GeneratedClusterGpu::pattern` holds.
+pub fn pattern_index(n: [u32; 3]) -> u32 {
     assert!(
-        f.iter().all(|&x| (1..=MAX_DICE).contains(&x)),
-        "edge factors {f:?} are 1 to {MAX_DICE}"
+        n.iter().all(|&x| x % 2 == 1 && x <= MAX_DICE),
+        "edge counts {n:?} are odd, 1 to {MAX_DICE}"
     );
-    ((f[0] - 1) * MAX_DICE + (f[1] - 1)) * MAX_DICE + (f[2] - 1)
+    crate::pattern::index(n) as u32
+}
+
+/// The fixed-point edge factors packed in `GeneratedClusterGpu::factors`.
+pub fn unpack_factors(packed: [u32; 2]) -> [u32; 3] {
+    [packed[0] & 0xffff, packed[0] >> 16, packed[1]]
 }
 
 fn word(at: usize) -> u32 {
@@ -64,7 +71,7 @@ fn vertex_count() -> usize {
 /// Pattern `index` of the table.
 pub fn pattern(index: u32) -> Pattern {
     assert!((index as usize) < PATTERNS, "pattern index {index}");
-    crate::pattern::generate(crate::pattern::factors(index as usize))
+    crate::pattern::generate(crate::pattern::counts(index as usize))
 }
 
 /// The largest pattern: the vertex and triangle limits of generated clusters.
@@ -248,6 +255,7 @@ pub(crate) struct Layout {
     pub dice: u64,
     pub undisplaced: u64,
     pub weld: u64,
+    pub weld_owner: u64,
     pub counters: u64,
     pub args: u64,
     pub queue_capacity: u32,
@@ -273,6 +281,7 @@ impl Layout {
             dice: take(item * u64::from(queue_capacity)),
             undisplaced: take(16 * u64::from(max_vertices)),
             weld: take(4 * u64::from(weld_slots)),
+            weld_owner: take(8 * u64::from(weld_slots)),
             counters: take(4 * COUNTERS),
             args: take(4 * ARGS),
             queue_capacity,
@@ -291,6 +300,7 @@ impl Layout {
             dice: at(self.dice).cast(),
             undisplaced: at(self.undisplaced).cast(),
             weld: at(self.weld).cast(),
+            weld_owner: at(self.weld_owner).cast(),
             counters: at(self.counters).cast(),
             args: at(self.args).cast(),
             subd,

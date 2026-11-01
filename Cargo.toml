@@ -74,6 +74,10 @@ print_stderr = "warn"
 [profile.dev.package."*"]
 opt-level = 3
 
+# Tests evaluate subdivision limit surfaces at every generated vertex.
+[profile.dev.package.orr_pack]
+opt-level = 3
+
 # The spectral reference integrator runs in tests.
 [profile.dev.package.orr_atmosphere]
 opt-level = 3
