@@ -14,6 +14,7 @@ use orr_gpu::{
     TextureIndex, TimelinePoint,
 };
 use orr_pack::AssetId;
+use orr_shaders::PathEntry;
 
 use crate::accel::{AccelKernels, AccelLimits, AccelShared};
 use crate::arena::{ArenaReport, ArenaRequest, ViewArena, ViewStep};
@@ -142,6 +143,8 @@ pub struct RendererDesc {
     pub frames_in_flight: u32,
     /// Consumer-linked kernels.
     pub kernels: &'static KernelSet,
+    /// Which entry of the path tracing kernels views run.
+    pub path_entry: PathEntry,
     /// World cells are 2^cell_log2 m on a side.
     pub cell_log2: u32,
     /// Archive reads are positioned reads on workers even where the system's completion
@@ -174,6 +177,7 @@ impl Default for RendererDesc {
             budgets: Budgets::default(),
             frames_in_flight: 2,
             kernels: &NO_KERNELS,
+            path_entry: PathEntry::Fastest,
             cell_log2: 8,
             positioned_reads: false,
             raster_error_pixels: 1.0,

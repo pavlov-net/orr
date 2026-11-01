@@ -151,6 +151,7 @@ pub struct Renderer {
 /// orr-lighting's kernels and tables, and each scene's lighting state.
 struct Lighting {
     kernels: &'static KernelSet,
+    entry: PathEntry,
     /// Compiled with the first view history.
     paths: Option<LightingKernels>,
     scenes: HashMap<SceneId, SceneLighting>,
@@ -302,6 +303,7 @@ impl Renderer {
             scenes: Scenes::new(gpu, &desc)?,
             lighting: Lighting {
                 kernels: desc.kernels,
+                entry: desc.path_entry,
                 paths: None,
                 scenes: HashMap::new(),
                 tables,
@@ -366,7 +368,7 @@ impl Renderer {
                 &gpu,
                 lighting.kernels,
                 &lighting.tables,
-                PathEntry::Fastest,
+                lighting.entry,
             )?);
         }
         let fif = self.output.frames_in_flight;

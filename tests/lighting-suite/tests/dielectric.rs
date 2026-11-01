@@ -20,7 +20,7 @@ use orr_math::{Mat3, Vec3};
 const NONE: u32 = u32::MAX;
 
 fn paths(settings: ViewLighting) -> Paths {
-    Paths::new(&KernelSet::default(), PathEntry::Fastest, settings)
+    Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
 }
 
 fn reference(max_bounces: u32) -> ViewLighting {

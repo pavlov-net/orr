@@ -32,7 +32,7 @@ mod world_cache;
 pub use bsdf::BsdfTables;
 pub use environment::{ENVIRONMENT_SIZE, EnvironmentMapGpu};
 pub use orr_scene::orr_gpu::KernelSet;
-pub use orr_scene::{Cone, DirectionalLight, DiscProfile, Light, LightId};
+pub use orr_scene::{Cone, DirectionalLight, DiscProfile, Light, LightId, PathEntry};
 pub use scene::{
     FRAME_SLOTS, LIGHT_TILE_SIZE, LIGHT_TILES, LightingStats, SceneLighting, SceneLightingSettings,
     ScenePass, WorldCacheSettings,
@@ -43,8 +43,7 @@ pub use shaders::types::{
 };
 pub use view::{
     CameraJump, GuideKind, GuideSettings, LightingDebugView, LightingKernels, LightingView,
-    MAX_LOCAL_LIGHT_SHARE, MediaSettings, PathEntry, ReferenceSettings, ThinLens, ViewLighting,
-    ViewPass,
+    MAX_LOCAL_LIGHT_SHARE, MediaSettings, ReferenceSettings, ThinLens, ViewLighting, ViewPass,
 };
 pub use world_cache::{MAX_CAPACITY_LOG2, WorldCacheStats};
 

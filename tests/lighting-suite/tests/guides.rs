@@ -12,7 +12,7 @@ use orr_lighting::{GuideKind, Light, LightingDebugView, PathEntry, ViewLighting}
 use orr_math::{Mat3, Quat, Vec2, Vec3};
 
 fn paths(settings: ViewLighting) -> Paths {
-    Paths::new(&KernelSet::default(), PathEntry::Fastest, settings)
+    Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
 }
 
 /// One frame of `bed` through the opaque dispatch and the guide resolve; its guides.

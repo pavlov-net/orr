@@ -19,7 +19,7 @@ use orr_math::{DVec3, Mat3, Vec3};
 use orr_scene::RendererDesc;
 
 fn paths(settings: ViewLighting) -> Paths {
-    Paths::new(&KernelSet::default(), PathEntry::Fastest, settings)
+    Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
 }
 
 fn render_paths(bed: &mut Bed, paths: &Paths, frames: u32, seed: u32) -> Accumulated {
@@ -537,7 +537,7 @@ fn linked_bed(spec: Spec) -> Bed {
 }
 
 fn linked_paths(settings: ViewLighting) -> Paths {
-    Paths::new(&linked::KERNELS, PathEntry::Fastest, settings)
+    Paths::new(&linked::KERNELS, PathEntry::Compute, settings)
 }
 
 #[test]

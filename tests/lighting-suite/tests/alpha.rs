@@ -260,7 +260,7 @@ fn against_noise(a: &Accumulated, b: &Accumulated, noise: &Accumulated) -> (f32,
 fn direct_paths(kernels: &KernelSet) -> Paths {
     Paths::new(
         kernels,
-        PathEntry::Fastest,
+        PathEntry::Compute,
         ViewLighting {
             max_bounces: 1,
             reference: Some(ReferenceSettings::default()),
