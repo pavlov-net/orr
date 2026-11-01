@@ -11,7 +11,9 @@
 // surface without bending, the Henyey-Greenstein phase function and the world cache for the
 // rest. A camera inside a medium starts from `camera_medium`, flipped at each surface
 // between the eye and the near plane. The dispatch also writes each pixel's layer guide,
-// which the guide resolve blends into ray reconstruction's guides.
+// which the guide resolve blends into ray reconstruction's guides, and, for the frosted-glass
+// term, what the background behind rough transmission looks like and how far its lobes blur
+// it.
 module dielectric;
 
 import orr.abi;
@@ -45,6 +47,7 @@ public static const uint DIELECTRIC_STREAM = 0x85EBCA6B;
 // `PathRoot.dielectric_flags`.
 public static const uint DIELECTRIC_REFERENCE = 1 << 0;   // the accumulation reference: scatter on every interior segment, no cache
 public static const uint DIELECTRIC_DEBUG_LAYER = 1 << 1; // the radiance shows the first layer's shares
+public static const uint DIELECTRIC_FROST = 1 << 3;       // layer guides keep `background` and `frost`
 
 
 // The dielectric materials whose interiors hold a point, innermost last.
@@ -735,6 +738,9 @@ public bool layer_refraction(SceneRoot* s, LayerVertex l, Interior interior, flo
 // transmission reaches along a roughness-free refraction chain, by throughput; the dominant
 // one gives depth and motion: the hit's own where reflection carries more, the virtual point
 // of the chain otherwise. Specular motion follows the mirror reflection's virtual point.
+// Where transmission dominates, `frost` gets the blur the chain's rough interfaces give what
+// it reaches: each widens the ray by its roughness squared per m beyond it (half the cone
+// spread a rough lobe gives a path), and the widths add in quadrature.
 public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, Hit h, float3 dir, Interior interior, float coverage)
 {
     SceneRoot* s = r.scene;
@@ -786,6 +792,11 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
     else if (!thin_walled(x.x.surface))
         list.cross(x.x.surface.material, x.front);
     float length_so_far = 0.0;
+    // Over the rough interfaces i at chain length s_i with widening w_i: sums of w^2, s w^2
+    // and s^2 w^2, which give sum (D - s_i)^2 w_i^2 at chain length D.
+    float3 blur = float3(0.0);
+    if (open)
+        blur += rough_widening(x, 0.0);
     for (uint k = 0; open && k < r.dielectric_depth; k++)
     {
         LayerAccept<S> ta = { s, v, d, hit_context(HIT_SECONDARY, k + 1, cone, 0.0), 0, PRESENCE_ANY };
@@ -819,6 +830,7 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
             through = float3(0.0);
             break;
         }
+        blur += rough_widening(x, length_so_far);
         if (!thin_walled(x.x.surface))
             list.cross(x.x.surface.material, x.front);
     }
@@ -847,7 +859,26 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
         g.depth = 0.0;
         g.motion = reprojected_motion(v, dir, 0.0);
     }
+    if ((r.dielectric_flags & DIELECTRIC_FROST) != 0 && wt > wr && blur.x > 0.0)
+    {
+        // The blur's radius over the width of a pixel where the chain ends; the angle alone
+        // toward the sky.
+        float radius = isfinite(traveled)
+            ? sqrt(max(traveled * traveled * blur.x - 2.0 * traveled * blur.y + blur.z, 0.0)) / (cone.spread * (length(camera) + traveled))
+            : sqrt(blur.x) / cone.spread;
+        g.frost = f32tof16(min(radius, FROST_MAX_RADIUS)) | (f32tof16(guide_luminance(through)) << 16);
+    }
     return g;
+}
+
+// What rough layer `x`, `s` m along a transmission chain, adds to `layer_guides`'s blur sums.
+float3 rough_widening(LayerVertex x, float s)
+{
+    float roughness = x.x.surface.bsdf.specular_roughness;
+    if (roughness < MIRROR_ROUGHNESS)
+        return float3(0.0);
+    float w2 = roughness * roughness * roughness * roughness;
+    return w2 * float3(1.0, s, s * s);
 }
 
 // The dielectric dispatch's body for `pixel`.
@@ -860,6 +891,7 @@ public void dielectric_body<C : ICoherence, S : ISurface, E : IEnvironment, M : 
     Sampler rng = Sampler(pixel, r.frame, r.seed ^ DIELECTRIC_STREAM);
     uint seed = pcg3d(uint3(pixel, r.frame ^ r.seed ^ DIELECTRIC_STREAM)).x;
     uint index = pixel.y * r.gbuffer.extent.x + pixel.x;
+    float background = (r.dielectric_flags & DIELECTRIC_FROST) != 0 ? guide_luminance(r.radiance.get<RWTexture2D<float4>>()[pixel].rgb) : 0.0;
     float2 uv = (float2(pixel) + 0.5) / float2(v.extent);
     float3 dir = render_direction(v, view_direction(v, uv));
     float3 eye = v.eye_render.xyz;
@@ -932,6 +964,7 @@ public void dielectric_body<C : ICoherence, S : ISurface, E : IEnvironment, M : 
         guide.medium_end = -1.0;
     else if (hit_layer)
         guide.medium_end = t_near + h.t;
+    guide.background = background;
     r.layers[index] = guide;
     if (!hit_layer && interior.count == 0)
     {

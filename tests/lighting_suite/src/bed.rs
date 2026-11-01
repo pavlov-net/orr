@@ -12,8 +12,9 @@ use orr_cook::{
     TextureSettings, Usage,
 };
 use orr_gpu::{
-    Allocation, CommandList, ComputePipeline, GpuAddress, GpuPtr, Hazards, KernelSet, MemoryKind,
-    Stages,
+    Allocation, CommandList, ComputePipeline, Format, GpuAddress, GpuPtr, Hazards, KernelSet,
+    MemoryKind, Stages, StorageImageIndex, Texture, TextureDesc, TextureMemory, TextureRegion,
+    TextureUsage,
 };
 use orr_lighting::{
     BsdfTables, DirectionalLight, DiscProfile, DofBackgroundPass, EnvironmentMapGpu, Light,
@@ -927,6 +928,7 @@ impl BedFrame<'_> {
             sample_index: self.index,
             seed: self.seed,
             dof_background: None,
+            frosted_glass: false,
         }
     }
 
@@ -1508,6 +1510,8 @@ pub struct Paths {
     pub settings: ViewLighting,
     /// The background layer request of every frame.
     pub dof_background: Option<DofBackgroundPass>,
+    /// The depth-of-field guide every frame adds the frosted-glass term into.
+    pub frost_guide: Option<FrostGuide>,
 }
 
 impl Paths {
@@ -1520,14 +1524,17 @@ impl Paths {
             _tables: tables,
             settings,
             dof_background: None,
+            frost_guide: None,
         }
     }
 
     /// Starts the view's frame, then records the froxel passes, the opaque dispatch, the
-    /// dielectric dispatch, media apply and the guide resolve.
+    /// dielectric dispatch, media apply, the guide resolve and, with a frost guide, the
+    /// frosted-glass term.
     pub fn record(&self, list: &mut CommandList<'_>, f: &mut BedFrame<'_>) {
         let pass = ViewPass {
             dof_background: self.dof_background,
+            frosted_glass: self.frost_guide.is_some(),
             ..f.pass()
         };
         f.target
@@ -1548,5 +1555,72 @@ impl Paths {
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         self.kernels
             .record_guides(list, f.target, &pass, &self.settings);
+        if let Some(g) = &self.frost_guide {
+            g.fill(list);
+            self.kernels
+                .record_frosted_glass(list, f.target, &pass, g.store);
+        }
+    }
+}
+
+/// An R16F depth-of-field guide at [`EXTENT`] that each frame sets to one value, as output's
+/// guide pass would write it, before the frosted-glass term.
+pub struct FrostGuide {
+    texture: Texture,
+    region: TextureRegion,
+    store: StorageImageIndex,
+    fill: Allocation<u16>,
+}
+
+impl FrostGuide {
+    pub fn new(value: f32) -> Self {
+        let d = device();
+        let desc = TextureDesc::d2(
+            Format::R16Float,
+            EXTENT[0],
+            EXTENT[1],
+            TextureUsage::SAMPLED | TextureUsage::STORAGE,
+        );
+        let texture = d
+            .create_texture(&desc, TextureMemory::Dedicated, "frost guide")
+            .unwrap();
+        let store = d.write_storage(
+            d.alloc_image_slot().unwrap(),
+            &texture,
+            &orr_gpu::ViewDesc::default(),
+        );
+        let bits = half::f16::from_f32(value).to_bits();
+        Self {
+            texture,
+            region: TextureRegion::whole_mip(&desc, 0),
+            store,
+            fill: upload(&vec![bits; PIXELS as usize], "frost guide fill"),
+        }
+    }
+
+    fn fill(&self, list: &mut CommandList<'_>) {
+        list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
+        list.discard(&self.texture);
+        list.copy_to_texture(&self.texture, &self.region, self.fill.gpu().cast());
+        list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
+    }
+
+    /// The guide as the last frame left it, in rows of [`EXTENT`] top to bottom.
+    pub fn read(&self) -> Vec<f32> {
+        let out = crate::readback::<u16>(PIXELS, "frost guide readback");
+        let mut list = render().command_list().unwrap();
+        list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
+        list.copy_from_texture(out.gpu().cast(), &self.texture, &self.region);
+        crate::finish(list);
+        let bits = out.as_slice().unwrap();
+        bits.iter()
+            .map(|&b| half::f16::from_bits(b).to_f32())
+            .collect()
+    }
+}
+
+impl Drop for FrostGuide {
+    fn drop(&mut self) {
+        device().free_image_slot_after_submitted(self.store.0);
     }
 }

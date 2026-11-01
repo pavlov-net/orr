@@ -725,6 +725,7 @@ impl<'a> Frame<'a> {
             sample_index: state.samples,
             seed: 0,
             dof_background: None,
+            frosted_glass: false,
         };
         paths.begin(id, scene, view, output.cut, lighting);
         let traced = Stages::COMPUTE | Stages::RAY;

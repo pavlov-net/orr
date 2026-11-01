@@ -1,12 +1,13 @@
 //! The dielectric dispatch on the bed: the interior list, Beer transmittance through a slab,
 //! rough refraction, the glass furnace, single scattering against a CPU integral, an albedo-1
-//! medium, presence layers, a camera inside water, and layer guides under camera rotation.
+//! medium, presence layers, a camera inside water, layer guides under camera rotation, and
+//! the frosted-glass term of rough glass.
 
 use lighting_suite::bed::{
     Accumulated, Analytic, Bed, CLOUD_SPHERE, EMITTER_LUMINANCE, EXTENT, FLOOR, FURNACE_RADIANCE,
-    GLASS_SPHERE, Item, LIGHT_FLOOR, MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, PRESENCE_VEIL,
-    PRESENCE_VEIL_OPACITY, Paths, ROUGH_SLAB, SUN, Spec, TINTED_SLAB, WATER_BOX, fresnel,
-    water_transmission,
+    FrostGuide, GLASS_SPHERE, Item, LIGHT_FLOOR, MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB,
+    PRESENCE_VEIL, PRESENCE_VEIL_OPACITY, Paths, ROUGH_SLAB, SMOOTH_FLOOR, SUN, Spec, TINTED_SLAB,
+    WATER_BOX, fresnel, water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
 use lighting_suite::{assert_clean, pipeline, readback, render, run, upload};
@@ -372,5 +373,52 @@ fn a_rough_slab_transmits_about_as_much_as_a_smooth_one() {
         )
     };
     assert_close("rough slab", render(ROUGH_SLAB), render(TINTED_SLAB), 0.05);
+    assert_clean();
+}
+
+/// Rough glass over an emitter's edge on a black floor: the frosted-glass term softens the
+/// edge in the depth-of-field guide, darker on its lit side and lighter on its dark side. The guide keeps
+/// what output wrote away from the edge, outside the glass and under smooth glass.
+#[test]
+fn rough_glass_adds_its_blur_into_the_depth_of_field_guide() {
+    const FILL: f32 = 0.25;
+    let [w, h] = EXTENT;
+    let render = |model| {
+        let spec = from_above(
+            vec![
+                at(SMOOTH_FLOOR, Vec3::ZERO),
+                at(LIGHT_FLOOR, Vec3::new(1.0, 0.01, 0.0)),
+                at(model, Vec3::new(0.0, 0.5, 0.0)),
+            ],
+            Vec::new(),
+            5.0,
+        );
+        let mut p = paths(ViewLighting::default());
+        p.frost_guide = Some(FrostGuide::new(FILL));
+        let radiance = render_paths(&mut Bed::with(spec), &p, 1);
+        (radiance, p.frost_guide.as_ref().unwrap().read())
+    };
+    let rows = h / 2 - 8..h / 2 + 8;
+    let column = |v: &dyn Fn(usize) -> f32, x: u32| -> f32 {
+        rows.clone().map(|y| v((y * w + x) as usize)).sum::<f32>() / rows.len() as f32
+    };
+
+    let (radiance, guide) = render(ROUGH_SLAB);
+    let lit = column(&|i| radiance.mean[i][1], w / 2 + 12);
+    assert!(lit > 0.05 * EMITTER_LUMINANCE, "the emitter shows at {lit}");
+    let term = |x| column(&|i| guide[i] - FILL, x);
+    assert!(term(w / 2) < -0.1 * lit, "lit side {}", term(w / 2));
+    assert!(term(w / 2 - 1) > 0.1 * lit, "dark side {}", term(w / 2 - 1));
+    for x in [w / 2 - 24, w / 2 + 24] {
+        assert!(term(x).abs() < 0.01 * lit, "column {x}: {}", term(x));
+    }
+    for (i, &g) in guide[..(4 * w) as usize].iter().enumerate() {
+        assert_eq!(g, FILL, "pixel {i} outside the glass");
+    }
+
+    let (_, smooth) = render(TINTED_SLAB);
+    for (i, &g) in smooth.iter().enumerate() {
+        assert_eq!(g, FILL, "pixel {i} under smooth glass");
+    }
     assert_clean();
 }

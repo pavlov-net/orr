@@ -162,8 +162,13 @@ public struct LayerGuide
     // the pixel shades; 0: at the G-buffer's surface or the sky; below 0: nowhere, the eye
     // lies in an interior.
     public float medium_end;
-    public uint _pad1;
-    public uint _pad2;
+    // With DIELECTRIC_FROST: `guide_luminance` of the radiance the opaque dispatch left the
+    // pixel, which the frosted-glass term blurs.
+    public float background;
+    // With DIELECTRIC_FROST on a pixel whose dominant layer is rough transmission: half
+    // floats of the blur its lobes give the background, as a radius in pixels (low), and of
+    // the transmission's `guide_luminance` (high); 0 elsewhere.
+    public uint frost;
 }
 
 // A path vertex: its surface, where the path came from and how rays leave it.
