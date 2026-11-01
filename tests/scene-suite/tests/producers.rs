@@ -1,23 +1,32 @@
 //! Producer entries in raster and ray tracing: a grass field whose cluster count changes
 //! every frame against a CPU caster of the same blades, the producer words a linked surface
-//! reads at primary and secondary hits, capacity and drops in `FrameStats`, and particle
-//! entries, drawn only at the transparency point and traced under the particle mask.
+//! reads at primary and secondary hits, capacity and drops in `FrameStats`, particle
+//! entries, drawn only at the transparency point and traced under the particle mask, and
+//! tessellated entries: a plane of patches with a uv seam diced at mixed rates against a CPU
+//! reference of the pattern table, closed in raster and rays once displaced, with normals
+//! of its displaced field, displaced by a material texture, and a rate that steps down
+//! near capacity.
+
+use std::collections::{HashMap, HashSet};
 
 use glam::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_gpu::{
     Blend, ClearColor, ColorAttachment, ColorLoad, ColorMask, ColorTarget, Format, Hazards,
-    MemoryKind, MeshPipelineDesc, QueueKind, RasterState, Rendering, ShaderStage, SpecData, Stages,
-    StorageImageIndex, Texture, TextureDesc, TextureMemory, TextureRegion, TextureUsage,
+    MemoryKind, MeshPipelineDesc, QueueKind, RasterState, Rendering, SamplerDesc, ShaderStage,
+    SpecData, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
+    TextureRegion, TextureUsage,
 };
 use orr_scene::testing::{assert_clean, device, read_buffer, read_texture, wait};
 use orr_scene::{
-    Affine3, ClusterTopology, FrameDesc, FrameTime, GroupWriter, Lens, MaterialGpu, MaterialId,
-    Opacity, ProducerDesc, ProducerId, ProducerStats, ProducerUpdate, Projection, RasterView,
-    RendererDesc, SceneDesc, SceneId, Scenes, TextureFilter, TransformGroupDesc, TransformGroupId,
-    TransparencyPass, ViewDesc, ViewHistoryId, ViewTarget, VisibleCluster, material_flags,
+    Affine3, ClusterTopology, FrameDesc, FrameTime, GeneratedClusterGpu, GroupWriter, Lens,
+    MaterialGpu, MaterialId, Opacity, ProducerBatch, ProducerClusterGpu, ProducerDesc, ProducerId,
+    ProducerStateGpu, ProducerStats, ProducerUpdate, Projection, RasterView, RendererDesc,
+    SceneDesc, SceneId, Scenes, TessellationStats, TextureFilter, TransformGroupDesc,
+    TransformGroupId, TransparencyPass, ViewDesc, ViewHistoryId, ViewTarget, VisibleCluster,
+    material_flags, tessellation,
 };
 use orr_shaders::bytemuck::Zeroable;
-use scene_suite::shaders::{blades, particle_draw, producer_rays};
+use scene_suite::shaders::{blades, particle_draw, patches, producer_rays, tess_rays};
 use scene_suite::{linked, pipeline};
 
 const EXTENT: [u32; 2] = [160, 96];
@@ -729,4 +738,707 @@ fn clear(t: &Texture) {
     list.end_rendering();
     list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
     wait(render.submit(vec![list], &[]).unwrap());
+}
+
+/// The ripple displacement's height at `uv` (`surfaces/ripple.slang`).
+fn ripple(uv: Vec2) -> f32 {
+    0.05 * (9.0 * uv.x).sin() * (7.0 * uv.y).cos()
+}
+
+/// Displacement id of `surfaces/ripple.slang` in the suite's linked kernels.
+const RIPPLE: u8 = 1;
+const PLANE: ProducerId = ProducerId(0);
+/// The plane's halves meet at x = 0 with uv this far apart.
+const SEAM_UV: Vec2 = Vec2::new(0.37, 0.11);
+
+/// The plane's uv at (x, z) on the side `right` of the seam.
+fn plane_uv(x: f32, z: f32, right: bool) -> Vec2 {
+    Vec2::new(x, z) * 0.25 + if right { SEAM_UV } else { Vec2::ZERO }
+}
+
+/// A plane of patch triangles over x in [-2, 2], z in [-6, 0]: one cluster per half and
+/// row of 1 m quads, so the two halves meet at a uv seam.
+struct PatchMesh {
+    positions: Vec<Vec3>,
+    uvs: Vec<Vec2>,
+    triangles: Vec<[u8; 3]>,
+    /// First vertex, vertex count, first triangle, triangle count.
+    clusters: Vec<[u32; 4]>,
+}
+
+impl PatchMesh {
+    fn new() -> Self {
+        let mut m = Self {
+            positions: Vec::new(),
+            uvs: Vec::new(),
+            triangles: Vec::new(),
+            clusters: Vec::new(),
+        };
+        for row in 0..6 {
+            for right in [false, true] {
+                let first = m.positions.len() as u32;
+                let tri_first = m.triangles.len() as u32;
+                let x0 = if right { 0.0 } else { -2.0 };
+                let (z0, z1) = (-(row as f32), -(row as f32) - 1.0);
+                for z in [z0, z1] {
+                    for i in 0..3 {
+                        let x = x0 + i as f32;
+                        m.positions.push(Vec3::new(x, 0.0, z));
+                        m.uvs.push(plane_uv(x, z, right));
+                    }
+                }
+                for q in 0..2u8 {
+                    m.triangles.push([q, q + 3, q + 1]);
+                    m.triangles.push([q + 1, q + 3, q + 4]);
+                }
+                m.clusters.push([first, 6, tri_first, 4]);
+            }
+        }
+        m
+    }
+}
+
+/// A tessellated plane entry, its patches emitted once, and a camera above it.
+struct Plane {
+    scenes: Scenes,
+    scene: SceneId,
+    history: ViewHistoryId,
+    group: TransformGroupId,
+    material: MaterialId,
+    mesh: PatchMesh,
+    /// Positions, attributes, triangles and cluster records of `mesh`, for `patches.slang`.
+    gpu: [orr_gpu::Allocation<u8>; 4],
+    frame: u32,
+}
+
+impl Plane {
+    fn new(dice_pixels: f32) -> Self {
+        let d = device();
+        let mut scenes = Scenes::new(
+            d,
+            &RendererDesc {
+                kernels: &linked::KERNELS,
+                dice_pixels,
+                ..RendererDesc::default()
+            },
+        )
+        .unwrap();
+        let scene = scenes
+            .create_scene(&SceneDesc {
+                producer_capacity: 2,
+                ..SceneDesc::default()
+            })
+            .unwrap();
+        let history = scenes.create_view_history().unwrap();
+        let mesh = PatchMesh::new();
+        let attrs: Vec<[u32; 2]> = mesh
+            .uvs
+            .iter()
+            .map(|uv| {
+                let h = |f: f32| u32::from(half::f16::from_f32(f).to_bits());
+                [
+                    orr_pack::mesh::oct_encode([0.0, 1.0, 0.0]),
+                    h(uv.x) | h(uv.y) << 16,
+                ]
+            })
+            .collect();
+        let upload = |bytes: &[u8], name| {
+            let len = bytes.len().next_multiple_of(16) as u64;
+            let mut a = d.gpu_malloc::<u8>(MemoryKind::Upload, len, name).unwrap();
+            a.as_mut_slice().unwrap()[..bytes.len()].copy_from_slice(bytes);
+            a
+        };
+        let positions: Vec<[f32; 3]> = mesh.positions.iter().map(Vec3::to_array).collect();
+        let gpu = [
+            upload(bytemuck::cast_slice(&positions), "plane positions"),
+            upload(bytemuck::cast_slice(&attrs), "plane attributes"),
+            upload(bytemuck::cast_slice(&mesh.triangles), "plane triangles"),
+            upload(bytemuck::cast_slice(&mesh.clusters), "plane clusters"),
+        ];
+        let list = [scene];
+        let f = scenes
+            .begin_frame(&FrameDesc {
+                time: time(0),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        let mut m = MaterialGpu::zeroed();
+        m.base_color = [0.5; 3];
+        m.base_weight = 1.0;
+        m.flags = material_flags::DOUBLE_SIDED;
+        let material = f.materials().create(&m).unwrap();
+        let mut w = f.scene(scene).unwrap();
+        let group = w
+            .create_transform_group(&TransformGroupDesc {
+                count: 1,
+                writer: GroupWriter::Cpu,
+                anchor: DVec3::ZERO,
+            })
+            .unwrap();
+        w.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY;
+        drop(w);
+        wait(f.end(&[]).unwrap());
+        Self {
+            scenes,
+            scene,
+            history,
+            group,
+            material,
+            mesh,
+            gpu,
+            frame: 1,
+        }
+    }
+
+    fn desc<'a>(
+        &self,
+        materials: &'a [MaterialId],
+        displacement: u8,
+        max_clusters: u32,
+    ) -> ProducerDesc<'a> {
+        ProducerDesc {
+            max_clusters,
+            max_vertices: 78 * max_clusters,
+            update: ProducerUpdate::Static,
+            tessellated: true,
+            max_patch_clusters: self.mesh.clusters.len() as u32,
+            max_patch_vertices: self.mesh.positions.len() as u32,
+            displacement,
+            displacement_reach: 0.05,
+            materials,
+            transform: (self.group, 0),
+            ..ProducerDesc::default()
+        }
+    }
+
+    /// One frame with the camera at `eye` looking at `target` and the focus at `focus`;
+    /// with `desc` the entry is set and its patches emitted this frame.
+    fn frame(
+        &mut self,
+        desc: Option<&ProducerDesc<'_>>,
+        eye: Vec3,
+        target: Vec3,
+        focus: Vec3,
+    ) -> RasterView {
+        let p = pipeline(&patches::MODULE, "main");
+        let list = [self.scene];
+        let mut f = self
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(self.frame),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        let fov_y = 0.9;
+        {
+            let mut w = f.scene(self.scene).unwrap();
+            if let Some(desc) = desc {
+                w.set_producer(PLANE, Some(desc)).unwrap();
+            }
+            w.set_focus(focus.as_dvec3(), EXTENT[1] as f32 / fov_y);
+        }
+        let emit = desc.is_some();
+        let g = self.gpu.each_ref().map(|a| a.gpu());
+        let clusters = self.mesh.clusters.len() as u32;
+        f.update_scenes(&mut |c| {
+            if !emit {
+                return;
+            }
+            let r = c
+                .put_root(&patches::Root {
+                    scene: c.root,
+                    positions: g[0].cast(),
+                    attrs: g[1].cast(),
+                    triangles: g[2],
+                    clusters: g[3].cast(),
+                    producer: PLANE.0,
+                    count: clusters,
+                })
+                .unwrap();
+            c.cmd.dispatch(&p, r, [1, 1, 1]);
+        })
+        .unwrap();
+        let view = f
+            .raster_view(&ViewDesc {
+                scene: self.scene,
+                history: self.history,
+                position: eye.as_dvec3(),
+                rotation: look(eye, target),
+                projection: Projection { fov_y, near: 0.05 },
+                lens: Lens::default(),
+                render_extent: UVec2::from(EXTENT),
+                jitter: Vec2::ZERO,
+                reset_history: self.frame <= 2,
+                mip_bias: 0.0,
+                texture_filter: TextureFilter::Hardware,
+                target: ViewTarget::AfterRr,
+            })
+            .unwrap();
+        self.frame += 1;
+        wait(f.end(&[]).unwrap());
+        view
+    }
+
+    /// A material made in a frame of its own.
+    fn material(&mut self, m: &MaterialGpu) -> MaterialId {
+        let f = self
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(self.frame),
+                scenes: &[],
+                low_latency: None,
+            })
+            .unwrap();
+        let id = f.materials().create(m).unwrap();
+        self.frame += 1;
+        wait(f.end(&[]).unwrap());
+        id
+    }
+
+    /// The tessellation figures of the last frame.
+    fn stats(&mut self) -> TessellationStats {
+        let f = self
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(self.frame),
+                scenes: &[],
+                low_latency: None,
+            })
+            .unwrap();
+        self.frame += 1;
+        wait(f.end(&[]).unwrap());
+        self.scenes.stats().tessellation
+    }
+}
+
+/// The plane entry's generated and patch batches as `view`'s scene holds them after its
+/// frame.
+struct Generated {
+    clusters: Vec<ProducerClusterGpu>,
+    records: Vec<GeneratedClusterGpu>,
+    positions: Vec<Vec3>,
+    /// Empty where the entry keeps no previous positions.
+    previous: Vec<Vec3>,
+    attrs: Vec<[u32; 2]>,
+    patch_clusters: Vec<ProducerClusterGpu>,
+    patch_positions: Vec<Vec3>,
+    patch_previous: Vec<Vec3>,
+    state: ProducerStateGpu,
+}
+
+fn generated(view: &RasterView) -> Generated {
+    let root = read_buffer(view.scene, 1)[0];
+    let i = u64::from(PLANE.0);
+    let b = read_buffer(root.batches.offset(i), 1)[0];
+    let p = read_buffer(root.patches.offset(i), 1)[0];
+    let count = |b: &ProducerBatch| {
+        let [c, v] = read_buffer(b.cluster_count.cast::<[u32; 2]>(), 1)[0];
+        (
+            u64::from(c.min(b.max_clusters)),
+            u64::from(v.min(b.max_vertices)),
+        )
+    };
+    let (clusters, vertices) = count(&b);
+    let (patch_clusters, patch_vertices) = count(&p);
+    let v3 = |p: Vec<[f32; 3]>| p.into_iter().map(Vec3::from).collect();
+    let previous = |b: &ProducerBatch, n| {
+        if b.previous.address().0 == 0 {
+            Vec::new()
+        } else {
+            v3(read_buffer(b.previous.cast(), n))
+        }
+    };
+    Generated {
+        clusters: read_buffer(b.clusters, clusters),
+        records: read_buffer(b.generated, clusters),
+        positions: v3(read_buffer(b.positions.cast(), vertices)),
+        previous: previous(&b, vertices),
+        attrs: read_buffer(b.attrs.cast(), vertices),
+        patch_clusters: read_buffer(p.clusters, patch_clusters),
+        patch_positions: v3(read_buffer(p.positions.cast(), patch_vertices)),
+        patch_previous: previous(&p, patch_vertices),
+        state: read_buffer(root.producer_state.offset(i), 1)[0],
+    }
+}
+
+/// `tessellation.slang`'s `compose`: the point at pattern weights `w` of a subpatch with
+/// `corners`, in the patch triangle's weights.
+fn compose(w: [u32; 3], corners: [u32; 3]) -> [u32; 3] {
+    const ONE: u32 = tessellation::BARY_ONE;
+    let unpack = |b: u32| [ONE - (b & 0xffff) - (b >> 16), b & 0xffff, b >> 16];
+    let c = corners.map(unpack);
+    let round = |s: u32| {
+        if s <= ONE / 2 * ONE {
+            (s + ONE / 2) / ONE
+        } else {
+            ONE - (ONE * ONE - s + ONE / 2) / ONE
+        }
+    };
+    let s = |k: usize| w[0] * c[0][k] + w[1] * c[1][k] + w[2] * c[2][k];
+    let (w1, w2) = (round(s(1)), round(s(2)));
+    [ONE - w1 - w2, w1, w2]
+}
+
+/// The undisplaced point at weights `w` of corners `p`, as the tessellator interpolates it.
+fn interpolate(p: [Vec3; 3], w: [u32; 3]) -> Vec3 {
+    let f = w.map(|x| x as f32 * (1.0 / tessellation::BARY_ONE as f32));
+    p[0] * f[0] + p[1] * f[1] + p[2] * f[2]
+}
+
+/// One generated vertex: its index, its patch triangle (cluster, triangle), its weights in
+/// that triangle and the triangle's corners.
+struct Weighted {
+    vertex: usize,
+    patch: u32,
+    w: [u32; 3],
+    corners: [Vec3; 3],
+    /// Last frame's corners, where the batch keeps them.
+    previous: Option<[Vec3; 3]>,
+}
+
+fn vertex_weights(g: &Generated) -> Vec<Weighted> {
+    let mesh = PatchMesh::new();
+    let mut out = Vec::new();
+    for (k, r) in g.clusters.iter().zip(&g.records) {
+        let patch = &g.patch_clusters[(r.patch >> 7) as usize];
+        let cpu = mesh.clusters[patch.user as usize];
+        let tri = mesh.triangles[(cpu[2] + (r.patch & 127)) as usize];
+        let at = |c: u8| (patch.first_vertex + u32::from(c)) as usize;
+        let corners = tri.map(|c| g.patch_positions[at(c)]);
+        let previous = (!g.patch_previous.is_empty()).then(|| tri.map(|c| g.patch_previous[at(c)]));
+        let pattern = tessellation::pattern(r.pattern);
+        assert_eq!(pattern.vertices.len(), usize::from(k.vertex_count));
+        for (i, v) in pattern.vertices.iter().enumerate() {
+            let (w1, w2) = (u32::from(v[0]), u32::from(v[1]));
+            let w = [tessellation::BARY_ONE - w1 - w2, w1, w2];
+            out.push(Weighted {
+                vertex: k.first_vertex as usize + i,
+                patch: r.patch,
+                w: compose(w, r.corners),
+                corners,
+                previous,
+            });
+        }
+    }
+    out
+}
+
+/// The points of each patch triangle's edge vertices, by edge (its end points' bits,
+/// sorted) and patch triangle.
+type EdgePoints = HashMap<[[u32; 3]; 2], HashMap<u32, HashSet<[u32; 3]>>>;
+
+fn edge_points(weights: &[Weighted], point: impl Fn(&Weighted) -> Vec3) -> EdgePoints {
+    // Zeros of either sign are one point.
+    let bits = |p: Vec3| p.to_array().map(|x| (x + 0.0).to_bits());
+    let mut edges = EdgePoints::default();
+    for v in weights {
+        for e in 0..3 {
+            if v.w[e] != 0 {
+                continue;
+            }
+            let mut ends = [bits(v.corners[(e + 1) % 3]), bits(v.corners[(e + 2) % 3])];
+            ends.sort_unstable();
+            edges
+                .entry(ends)
+                .or_default()
+                .entry(v.patch)
+                .or_default()
+                .insert(bits(point(v)));
+        }
+    }
+    edges
+}
+
+#[test]
+fn tessellated_patches_dice_at_mixed_rates_with_bit_identical_shared_edges() {
+    let mut plane = Plane::new(4.0);
+    let materials = [plane.material];
+    let desc = ProducerDesc {
+        previous_positions: true,
+        ..plane.desc(&materials, 0, 4096)
+    };
+    let (eye, target) = (Vec3::new(0.3, 1.0, 0.5), Vec3::new(0.0, 0.0, -3.0));
+    plane.frame(Some(&desc), eye, target, eye);
+    let view = plane.frame(None, eye, target, eye);
+    let g = generated(&view);
+    let stats = plane.stats();
+    assert_eq!(stats.patches, 48, "{stats:?}");
+    assert!(stats.subpatches > 2 * stats.patches, "{stats:?}");
+    assert_eq!(
+        stats.dice_dropped + stats.split_dropped + stats.weld_dropped,
+        0,
+        "{stats:?}"
+    );
+    let patterns: HashSet<u32> = g.records.iter().map(|r| r.pattern).collect();
+    assert!(patterns.len() > 10, "{} patterns", patterns.len());
+
+    // Every vertex lies where the CPU interpolates its weights, exactly, and last frame's
+    // position interpolates last frame's corners at the same weights.
+    let weights = vertex_weights(&g);
+    for v in &weights {
+        assert_eq!(
+            g.positions[v.vertex].to_array(),
+            interpolate(v.corners, v.w).to_array(),
+            "vertex {}",
+            v.vertex
+        );
+        let previous = v.previous.expect("previous corners");
+        assert_eq!(
+            g.previous[v.vertex].to_array(),
+            interpolate(previous, v.w).to_array(),
+            "previous of vertex {}",
+            v.vertex
+        );
+    }
+    // The two patch triangles on each side of a shared edge put the same points on it.
+    let edges = edge_points(&weights, |v| g.positions[v.vertex]);
+    let mut shared = 0;
+    for (ends, sides) in &edges {
+        if sides.len() == 2 {
+            let mut s = sides.values();
+            let (a, b) = (s.next().unwrap(), s.next().unwrap());
+            assert_eq!(a, b, "edge {ends:?}");
+            assert!(a.len() >= 2, "edge {ends:?}");
+            shared += 1;
+        }
+    }
+    assert_eq!(shared, 62, "shared edges");
+    assert_clean();
+}
+
+/// Per pixel of `view`: the distance to the producer surface the raster shows and to the
+/// one the camera ray hits, 0 for none.
+fn depths(view: &RasterView) -> Vec<tess_rays::Depths> {
+    let d = device();
+    let n = u64::from(EXTENT[0] * EXTENT[1]);
+    let out = d
+        .gpu_malloc::<tess_rays::Depths>(MemoryKind::Readback, n, "depths")
+        .unwrap();
+    let mut root = d
+        .gpu_malloc::<tess_rays::Root>(MemoryKind::Upload, 1, "root")
+        .unwrap();
+    root.as_mut_slice().unwrap()[0] = tess_rays::Root {
+        scene: view.scene,
+        view: view.view,
+        gbuffer: view.gbuffer,
+        out: out.gpu(),
+    };
+    let module = linked::KERNELS.module(&tess_rays::MODULE).unwrap();
+    let p = pipeline(module, "main");
+    let render = d.queue(QueueKind::Render).unwrap();
+    let mut list = render.command_list().unwrap();
+    list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::ACCEL_STRUCT);
+    list.dispatch(&p, root.gpu(), [n.div_ceil(64) as u32, 1, 1]);
+    list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+    wait(render.submit(vec![list], &[]).unwrap());
+    out.as_slice().unwrap().to_vec()
+}
+
+/// The unit normal of the rippled plane at (x, z) on side `right` of the seam.
+fn ripple_normal(x: f32, z: f32, right: bool) -> Vec3 {
+    let step = 1e-3;
+    let h = |x: f32, z: f32| ripple(plane_uv(x, z, right));
+    let dx = (h(x + step, z) - h(x - step, z)) / (2.0 * step);
+    let dz = (h(x, z + step) - h(x, z - step)) / (2.0 * step);
+    Vec3::new(-dx, 1.0, -dz).normalize()
+}
+
+#[test]
+fn a_displaced_plane_with_a_uv_seam_closes_in_raster_and_rays_with_normals_of_its_field() {
+    if !traced(true) {
+        return;
+    }
+    let mut plane = Plane::new(3.0);
+    let materials = [plane.material];
+    let desc = plane.desc(&materials, RIPPLE, 8192);
+    // The camera looks across the seam from one side; rates fall away from the focus at
+    // the eye, and part of the plane is out of view.
+    let (eye, target) = (Vec3::new(2.4, 0.8, -1.5), Vec3::new(-1.0, 0.0, -3.0));
+    plane.frame(Some(&desc), eye, target, eye);
+    for _ in 0..2 {
+        plane.frame(None, eye, target, eye);
+    }
+    let view = plane.frame(None, eye, target, eye);
+    let g = generated(&view);
+    let seen = depths(&view);
+    let stats = plane.stats();
+    assert!(stats.welded > 0, "{stats:?}");
+    assert_eq!(
+        stats.dice_dropped + stats.split_dropped + stats.weld_dropped,
+        0,
+        "{stats:?}"
+    );
+    let patterns: HashSet<u32> = g.records.iter().map(|r| r.pattern).collect();
+    assert!(patterns.len() > 10, "{} patterns", patterns.len());
+
+    // Seam vertices took one displaced position: the two sides of every patch edge put
+    // their vertices at the same displaced points.
+    let weights = vertex_weights(&g);
+    let edges = edge_points(&weights, |v| g.positions[v.vertex]);
+    for (ends, sides) in &edges {
+        if sides.len() == 2 {
+            let mut s = sides.values();
+            assert_eq!(s.next(), s.next(), "edge {ends:?}");
+        }
+    }
+
+    // Bounds hold every displaced vertex.
+    let lo = g.state.lo.map(unordered);
+    let hi = g.state.hi.map(unordered);
+    for p in &g.positions {
+        assert!(
+            (0..3).all(|k| lo[k] <= p[k] && p[k] <= hi[k]),
+            "{p} outside {lo:?}..{hi:?}"
+        );
+    }
+    assert!(
+        hi[1] - lo[1] > 0.05,
+        "the ripple moves the plane: {lo:?}..{hi:?}"
+    );
+
+    // No pixel inside the plane's footprint shows the background, through the raster or a
+    // camera ray, and both agree on depth.
+    let camera = look(eye, target);
+    let fov_y = 0.9f32;
+    let aspect = EXTENT[0] as f32 / EXTENT[1] as f32;
+    let (mut inside, mut far_apart) = (0, 0);
+    for (i, s) in seen.iter().enumerate() {
+        let (px, py) = ((i as u32 % EXTENT[0]) as f32, (i as u32 / EXTENT[0]) as f32);
+        let ndc = Vec2::new(
+            (px + 0.5) / EXTENT[0] as f32 * 2.0 - 1.0,
+            1.0 - (py + 0.5) / EXTENT[1] as f32 * 2.0,
+        );
+        let t = (fov_y * 0.5).tan();
+        let d = camera * Vec3::new(ndc.x * t * aspect, ndc.y * t, -1.0).normalize();
+        if d.y >= -0.05 {
+            continue;
+        }
+        // Where the ray crosses the highest and the lowest the ripple reaches.
+        let out = |y: f32| {
+            let hit = eye + d * ((y - eye.y) / d.y);
+            hit.x.abs() > 1.9 || hit.z > -0.1 || hit.z < -5.9
+        };
+        if out(0.05) || out(-0.05) {
+            continue;
+        }
+        inside += 1;
+        assert!(s.raster > 0.0, "pixel {i}: raster shows the background");
+        assert!(s.traced > 0.0, "pixel {i}: the camera ray misses");
+        if (s.raster - s.traced).abs() > 1e-3 * s.traced {
+            far_apart += 1;
+        }
+    }
+    assert!(inside > EXTENT[0] * EXTENT[1] / 4, "{inside} pixels inside");
+    assert!(
+        far_apart * 1000 <= inside,
+        "{far_apart} of {inside} disagree on depth"
+    );
+
+    // Written normals follow the displaced field away from the seam.
+    let mut worst = 0.0f32;
+    for (p, a) in g.positions.iter().zip(&g.attrs) {
+        if p.x.abs() < 1e-4 {
+            continue;
+        }
+        let n = Vec3::from(orr_pack::mesh::oct_decode(a[0]));
+        let want = ripple_normal(p.x, p.z, p.x > 0.0);
+        worst = worst.max(n.dot(want).clamp(-1.0, 1.0).acos());
+    }
+    assert!(worst < NORMAL_TOLERANCE, "normals within {worst} rad");
+    assert_clean();
+}
+
+/// Radians between a written normal and the field's, at most (0.0007 measured): central
+/// differences and the 16-bit octahedral code.
+const NORMAL_TOLERANCE: f32 = 0.003;
+
+/// `producer.slang`'s `unordered`.
+fn unordered(u: u32) -> f32 {
+    f32::from_bits(if u & 0x8000_0000 != 0 {
+        u & 0x7fff_ffff
+    } else {
+        !u
+    })
+}
+
+#[test]
+fn tessellation_steps_its_rate_down_near_capacity_and_back_up_with_room() {
+    let mut plane = Plane::new(2.0);
+    let materials = [plane.material];
+    let desc = plane.desc(&materials, 0, 512);
+    let (eye, target) = (Vec3::new(0.0, 0.6, 0.2), Vec3::new(0.0, 0.0, -3.0));
+    plane.frame(Some(&desc), eye, target, eye);
+    let mut lowest = 1.0f32;
+    for _ in 0..12 {
+        plane.frame(None, eye, target, eye);
+        lowest = lowest.min(plane.stats().lowest_rate_scale);
+    }
+    assert!(lowest < 0.9, "rate scale {lowest}");
+    // Far away the plane takes little room, and the rate climbs back.
+    let far = Vec3::new(0.0, 60.0, 40.0);
+    let mut last = 0.0;
+    for _ in 0..30 {
+        plane.frame(None, eye, target, far);
+        last = plane.stats().lowest_rate_scale;
+    }
+    assert_eq!(last, 1.0, "rate scale after recovering");
+    assert_clean();
+}
+
+#[test]
+fn texture_displacement_moves_patches_along_the_normal_by_the_materials_texture() {
+    let d = device();
+    let mut plane = Plane::new(4.0);
+    // Every texel of a 4 x 4 R16 displacement texture at 0.75.
+    let texel = (0.75f32 * 65535.0).round() as u16;
+    let desc = TextureDesc::d2(Format::R16Unorm, 4, 4, TextureUsage::SAMPLED);
+    let texture = d
+        .create_texture(&desc, TextureMemory::Dedicated, "displacement texture")
+        .unwrap();
+    let mut staging = d
+        .gpu_malloc::<u16>(MemoryKind::Upload, 16, "displacement texels")
+        .unwrap();
+    staging.as_mut_slice().unwrap().fill(texel);
+    let render = d.queue(QueueKind::Render).unwrap();
+    let mut list = render.command_list().unwrap();
+    list.discard(&texture);
+    list.copy_to_texture(
+        &texture,
+        &TextureRegion::whole_mip(&desc, 0),
+        staging.gpu().cast(),
+    );
+    list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
+    wait(render.submit(vec![list], &[]).unwrap());
+    let slot = d.alloc_image_slot().unwrap();
+    let mut m = MaterialGpu::zeroed();
+    m.base_color = [0.5; 3];
+    m.base_weight = 1.0;
+    m.flags = material_flags::DOUBLE_SIDED | material_flags::DISPLACED;
+    m.textures = [TextureIndex::NONE; 12];
+    m.textures[orr_pack::material::slot::DISPLACEMENT] =
+        d.write_sampled(slot, &texture, &orr_gpu::ViewDesc::default());
+    m.sampler = d.sampler(&SamplerDesc::default()).unwrap();
+    m.displacement_scale = 0.2;
+    m.displacement_offset = -0.1;
+    let material = plane.material(&m);
+    let materials = [material];
+    let desc = plane.desc(&materials, 0, 4096);
+    let (eye, target) = (Vec3::new(0.3, 1.0, 0.5), Vec3::new(0.0, 0.0, -3.0));
+    plane.frame(Some(&desc), eye, target, eye);
+    let view = plane.frame(None, eye, target, eye);
+    let g = generated(&view);
+    let stats = plane.stats();
+    // The same texel on both sides of the seam: nothing for the weld to move.
+    assert_eq!(stats.welded, 0, "{stats:?}");
+    let want = 0.2 * f32::from(texel) / 65535.0 - 0.1;
+    assert!(!g.positions.is_empty());
+    for (p, a) in g.positions.iter().zip(&g.attrs) {
+        assert!((p.y - want).abs() < 1e-4, "{p} against height {want}");
+        let n = Vec3::from(orr_pack::mesh::oct_decode(a[0]));
+        assert!(n.dot(Vec3::Y) > 0.9999, "normal {n}");
+    }
+    d.free_image_slot_after_submitted(slot);
+    assert_clean();
 }

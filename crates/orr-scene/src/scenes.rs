@@ -37,6 +37,7 @@ use crate::scene::{GroupWriter, ModelCpu, ModelId, Scene, SceneDesc, SceneId, Sc
 use crate::shaders::transparency::CompositeRoot;
 use crate::shaders::{animation, emissive, world as world_kernel};
 use crate::skin::{SkinFrame, SkinKernels, SkinStats};
+use crate::tessellate::{self, Patterns, SeenBy, TessKernels, TessellationStats};
 use crate::time::FrameTime;
 use crate::transparency::TransparencyPass;
 use crate::traverse::{CutInputs, CutPipelines, CutSizes, CutStats, Cuts};
@@ -163,6 +164,8 @@ pub struct RendererDesc {
     /// A view's transient targets whose spans in the frame order do not overlap share
     /// memory ([`ViewArena`]).
     pub alias_view_targets: bool,
+    /// Tessellation: the longest generated edge, in pixels at the scene focus.
+    pub dice_pixels: f32,
 }
 
 impl Default for RendererDesc {
@@ -179,6 +182,7 @@ impl Default for RendererDesc {
             rt_merge_pixels: 32.0,
             software_raster_pixels: 32.0,
             alias_view_targets: true,
+            dice_pixels: 2.0,
         }
     }
 }
@@ -228,6 +232,8 @@ pub struct FrameStats {
     pub cuts: CutStats,
     /// The skinning of the frame's scenes.
     pub skin: SkinStats,
+    /// The tessellated producer entries of the frame's scenes.
+    pub tessellation: TessellationStats,
 }
 
 /// Scene compute: a listed scene's turn in `update_scenes`, after its uploads have landed.
@@ -313,6 +319,9 @@ struct Core {
     skin: SkinKernels,
     /// Scratch of producer builds, grown to the largest frame's.
     producer_scratch: Mutex<Option<Allocation<u8>>>,
+    patterns: Patterns,
+    tess: TessKernels,
+    dice_pixels: f32,
 }
 
 /// Global scene state, mounted packs and every resident scene. Render thread only.
@@ -388,6 +397,8 @@ impl Scenes {
         let producers = ProducerKernels::new(device, desc.kernels, &mut pipelines)?;
         let skin = SkinKernels::new(device, desc.kernels, &mut pipelines)?;
         let cuts = CutPipelines::new(device, desc.kernels, &mut pipelines)?;
+        let tess = TessKernels::new(device, desc.kernels, &mut pipelines)?;
+        let patterns = Patterns::new(device)?;
         #[cfg(feature = "hot-reload")]
         let mut reloader = Reloader::new();
         #[cfg(feature = "hot-reload")]
@@ -438,6 +449,9 @@ impl Scenes {
                 producers,
                 skin,
                 producer_scratch: Mutex::new(None),
+                patterns,
+                tess,
+                dice_pixels: desc.dice_pixels,
             },
         })
     }
@@ -697,7 +711,9 @@ impl Scenes {
                 let Ok(scene) = core.scene(*id) else { continue };
                 let cpu = scene.cpu.lock().unwrap();
                 if let Some(r) = &cpu.producer_readback {
-                    f.stats.producers.add(&r.figures(slot));
+                    let (producers, tessellation) = r.figures(slot);
+                    f.stats.producers.add(&producers);
+                    f.stats.tessellation.add(&tessellation);
                 }
                 if let Some(cuts) = &cpu.cuts {
                     cuts.figures(slot, &mut f.stats.cuts);
@@ -892,6 +908,7 @@ impl<'a> Frame<'a> {
             cell_log2: self.core.cell_log2,
             models: &self.core.models,
             model_cpu: &self.core.model_cpu,
+            patterns: &self.core.patterns,
         })
     }
 
@@ -954,12 +971,9 @@ impl<'a> Frame<'a> {
             let cpu = &mut *scene.cpu.lock().unwrap();
             records.append(&mut cpu.records);
             masks.extend(std::mem::take(&mut cpu.masks));
-            let counts = scene.tables.producer_counts.gpu();
-            for (i, p) in cpu.producers.iter().enumerate() {
-                if p.as_ref()
-                    .is_some_and(|p| p.update == ProducerUpdate::EveryFrame)
-                {
-                    let at = counts.offset(i as u64).address().0;
+            for p in cpu.producers.iter().flatten() {
+                if p.update == ProducerUpdate::EveryFrame {
+                    let at = p.emit_counts.address().0;
                     records.push(Record::fill(core.next_seq(), at, 2, 0));
                 }
             }
@@ -1038,6 +1052,7 @@ impl<'a> Frame<'a> {
                 emissive: t.emissive.gpu(),
                 producers: t.producers.gpu(),
                 batches: t.batches.gpu(),
+                patches: t.patches.gpu(),
                 producer_state: t.producer_state.gpu(),
                 sky_stats: t.sky_stats.gpu(),
                 environment: cpu.environment,
@@ -1430,6 +1445,7 @@ impl<'a> Frame<'a> {
         let occlusion =
             targets.hzb_scene.replace(view.scene) == Some(view.scene) && !view.reset_history;
         let targets = &*targets;
+        let seen = constants;
         let constants = window.put(device, &constants)?;
         let raster = raster::record(
             device,
@@ -1463,6 +1479,15 @@ impl<'a> Frame<'a> {
             sky_stats,
             focus,
         };
+        let mut cpu = core.scene(view.scene)?.cpu.lock().unwrap();
+        if cpu.seen_by.is_none_or(|s| s.frame != self.id) {
+            cpu.seen_by = Some(crate::scene::LastView {
+                history: view.history,
+                frame: self.id,
+                constants: seen,
+            });
+        }
+        drop(cpu);
         self.step("raster_view");
         Ok(out)
     }
@@ -1631,6 +1656,7 @@ impl<'a> Frame<'a> {
             producers: ProducerStats::default(),
             cuts: CutStats::default(),
             skin: SkinStats::default(),
+            tessellation: TessellationStats::default(),
         };
         self.core.in_flight.push_back(InFlight {
             id: self.id,
@@ -1664,6 +1690,33 @@ fn record_producers(
         let scene = core.scene(id)?;
         scenes.push((scene, scene.cpu.lock().unwrap()));
     }
+    let mut tess_jobs = Vec::new();
+    for (&id, (scene, cpu)) in listed.iter().zip(&scenes) {
+        if !cpu.producers.iter().flatten().any(|p| p.tess.is_some()) {
+            continue;
+        }
+        let focus = cpu.focus.map(|(f, ppr)| {
+            let w = WorldPos::new(f, core.cell_log2);
+            (w.cell.extend(1).to_array(), w.offset.extend(ppr).to_array())
+        });
+        let seen = match cpu.seen_by {
+            Some(s) if s.frame + 1 == frame => seen_by(device, core, window, id, &s)?,
+            _ => None,
+        };
+        for (i, p) in cpu.producers.iter().enumerate() {
+            let Some(tess) = p.as_ref().and_then(|p| p.tess) else {
+                continue;
+            };
+            tess_jobs.push(tessellate::Job {
+                scene: scene.tables.root.gpu(),
+                entry: i as u32,
+                tess,
+                state: scene.tables.tess_state.gpu().offset(i as u64),
+                focus,
+                seen,
+            });
+        }
+    }
     let jobs: Vec<Job<'_>> = scenes
         .iter()
         .flat_map(|(scene, cpu)| {
@@ -1679,23 +1732,45 @@ fn record_producers(
                 })
         })
         .collect();
-    if !jobs.is_empty() {
-        let need = producer::scratch_bytes(device, &jobs).max(256);
+    if !tess_jobs.is_empty() || !jobs.is_empty() {
+        // One scratch for the frame: a block replaced while this list records would be
+        // freed before the list runs.
+        let templates = if tess_jobs.is_empty() {
+            0
+        } else {
+            core.patterns.scratch(device)
+        };
+        let need = producer::scratch_bytes(device, &jobs)
+            .max(templates)
+            .max(256);
         let mut held = core.producer_scratch.lock().unwrap();
         if held.as_ref().is_none_or(|a| a.size() < need) {
             *held =
                 Some(device.gpu_malloc::<u8>(MemoryKind::DeviceLocal, need, "producer scratch")?);
         }
         let scratch = held.as_ref().expect("made above").gpu().address();
-        producer::record(
+        tessellate::record(
             device,
             window,
             list,
             pipelines,
-            &core.producers,
-            &jobs,
+            &core.tess,
+            &core.patterns,
+            &tess_jobs,
+            core.dice_pixels,
             scratch,
         )?;
+        if !jobs.is_empty() {
+            producer::record(
+                device,
+                window,
+                list,
+                pipelines,
+                &core.producers,
+                &jobs,
+                scratch,
+            )?;
+        }
     }
     drop(jobs);
     for (scene, cpu) in &mut scenes {
@@ -1713,7 +1788,7 @@ fn record_producers(
             .enumerate()
             .filter_map(|(i, p)| {
                 p.as_ref()
-                    .map(|p| (i as u32, p.max_clusters, p.max_vertices))
+                    .map(|p| (i as u32, p.max_clusters, p.max_vertices, p.tess.is_some()))
             })
             .collect();
         if cpu.producer_readback.is_none() {
@@ -1725,11 +1800,40 @@ fn record_producers(
             slot,
             t.producer_counts.gpu(),
             t.producer_state.gpu(),
+            t.tess_state.gpu(),
             set,
         );
     }
     list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
     Ok(())
+}
+
+/// Last frame's first view of scene `id` as the tessellator reads it, from `seen`: its
+/// constants and, while its history's HZB still holds that render, the HZB.
+fn seen_by(
+    device: &Device,
+    core: &Core,
+    window: &UploadWindow,
+    id: SceneId,
+    seen: &crate::scene::LastView,
+) -> Result<Option<SeenBy>> {
+    let Some(history) = core
+        .histories
+        .get(seen.history.0 as usize)
+        .and_then(Option::as_ref)
+    else {
+        return Ok(None);
+    };
+    let raster = match &history.targets {
+        Some(t) if t.hzb_scene == Some(id) && t.sizes.extent == seen.constants.extent => {
+            window.put(device, &t.hzb_record())?
+        }
+        _ => GpuPtr::NULL,
+    };
+    Ok(Some(SeenBy {
+        view: window.put(device, &seen.constants)?,
+        raster,
+    }))
 }
 
 impl Drop for Scenes {

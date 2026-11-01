@@ -28,6 +28,7 @@ mod loading;
 mod material;
 pub mod memory;
 mod mount;
+mod pattern;
 mod pipelines;
 mod producer;
 mod ptlas;
@@ -39,6 +40,7 @@ mod scene;
 mod scenes;
 mod skin;
 mod stream;
+mod tessellate;
 #[cfg(feature = "testing")]
 pub mod testing;
 mod time;
@@ -76,12 +78,13 @@ pub use scenes::{
 };
 pub use shaders::types::{
     BlasJob, ClusterRef, ClusterWork, CutGpu, CutKey, EmissiveGpu, FeedbackGpu, GBufferGpu,
-    GroupGpu, InstanceGpu, LightGpu, MaskGpu, MaterialGpu, MeshGpu, MeshLevel, ModelGpu, NodeItem,
-    PartGpu, ProducerBatch, ProducerClusterGpu, ProducerGpu, ProducerStateGpu, RasterGpu,
-    RasterRoot, RtCutGpu, SceneRoot, SkinMeshGpu, SkinStateGpu, SkinnedGpu, SkyStats, SlotCutGpu,
-    SlotStateGpu, TopologyGpu, VisibleCluster,
+    GeneratedClusterGpu, GroupGpu, InstanceGpu, LightGpu, MaskGpu, MaterialGpu, MeshGpu, MeshLevel,
+    ModelGpu, NodeItem, PartGpu, ProducerBatch, ProducerClusterGpu, ProducerGpu, ProducerStateGpu,
+    RasterGpu, RasterRoot, RtCutGpu, SceneRoot, SkinMeshGpu, SkinStateGpu, SkinnedGpu, SkyStats,
+    SlotCutGpu, SlotStateGpu, TessStateGpu, TopologyGpu, VisibleCluster,
 };
 pub use skin::{SkinStats, SkinnedDesc};
+pub use tessellate::TessellationStats;
 pub use time::FrameTime;
 pub use transparency::TransparencyPass;
 pub use traverse::CutStats;
@@ -90,6 +93,11 @@ pub use view::{
     TextureFilter, ViewConstants, ViewDesc, ViewHistoryId, ViewTarget,
 };
 pub use world::{REBASE_GRID_LOG2, WorldPos};
+
+/// The tessellation pattern table that `GeneratedClusterGpu::pattern` indexes.
+pub mod tessellation {
+    pub use crate::tessellate::{BARY_ONE, MAX_DICE, PATTERNS, Pattern, pattern, pattern_index};
+}
 
 /// orr-scene's compiled-in kernel modules.
 pub use shaders::MODULES;

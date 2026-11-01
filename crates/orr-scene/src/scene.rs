@@ -15,12 +15,15 @@ use crate::memory::{RangeAllocator, UploadWindow};
 use crate::producer::{self, Producer, ProducerDesc, ProducerId};
 use crate::ptlas::Ptlas;
 use crate::skin::{CopyArrays, SkinFrame, SkinnedDesc};
+use crate::tessellate::Patterns;
 use crate::traverse::Cuts;
 use crate::upload::{Op, Record};
+use crate::view::ViewHistoryId;
 use crate::world::WorldPos;
 use crate::{
     EmissiveGpu, Error, GroupGpu, InstanceGpu, LightGpu, ProducerBatch, ProducerGpu,
     ProducerStateGpu, Result, SceneRoot, SkinStateGpu, SkinnedGpu, SkyStats, SlotStateGpu,
+    TessStateGpu, ViewConstants,
 };
 
 /// A scene in [`crate::Scenes`].
@@ -229,6 +232,9 @@ pub(crate) struct Tables {
     pub emissive: Allocation<EmissiveGpu>,
     pub producers: Allocation<ProducerGpu>,
     pub batches: Allocation<ProducerBatch>,
+    /// Tessellated entries' patch batches, zero for others.
+    pub patches: Allocation<ProducerBatch>,
+    pub tess_state: Allocation<TessStateGpu>,
     /// Cluster and vertex count of each producer batch.
     pub producer_counts: Allocation<[u32; 2]>,
     pub producer_state: Allocation<ProducerStateGpu>,
@@ -340,6 +346,17 @@ pub(crate) struct SceneCpu {
     pub skins_removed: Vec<(u64, u32, u32, Option<CopyArrays>)>,
     /// Made at the first update with skinned copies.
     pub skin_frame: Option<SkinFrame>,
+    /// The first view `raster_view` rendered of the scene in its last frame, which the
+    /// tessellator's edge factors test for what it saw.
+    pub seen_by: Option<LastView>,
+}
+
+/// A view of a scene: its history, the frame and its constants.
+#[derive(Clone, Copy)]
+pub(crate) struct LastView {
+    pub history: ViewHistoryId,
+    pub frame: u64,
+    pub constants: ViewConstants,
 }
 
 pub(crate) struct Scene {
@@ -373,6 +390,8 @@ impl Scene {
             )?,
             producers: device.gpu_malloc(dl, n(desc.producer_capacity), "producers")?,
             batches: device.gpu_malloc(dl, n(desc.producer_capacity), "producer batches")?,
+            patches: device.gpu_malloc(dl, n(desc.producer_capacity), "producer patches")?,
+            tess_state: device.gpu_malloc(dl, n(desc.producer_capacity), "tessellation state")?,
             producer_counts: device.gpu_malloc(dl, n(desc.producer_capacity), "producer counts")?,
             producer_state: device.gpu_malloc(dl, n(desc.producer_capacity), "producer state")?,
             sky_stats: device.gpu_malloc(dl, 1, "sky stats")?,
@@ -394,6 +413,8 @@ impl Scene {
             zero(tables.emissive.gpu().address(), tables.emissive.size()),
             zero(tables.producers.gpu().address(), tables.producers.size()),
             zero(tables.batches.gpu().address(), tables.batches.size()),
+            zero(tables.patches.gpu().address(), tables.patches.size()),
+            zero(tables.tess_state.gpu().address(), tables.tess_state.size()),
             zero(
                 tables.producer_counts.gpu().address(),
                 tables.producer_counts.size(),
@@ -435,6 +456,7 @@ impl Scene {
                 skins: Vec::new(),
                 skins_removed: Vec::new(),
                 skin_frame: None,
+                seen_by: None,
             }),
             writing: AtomicBool::new(false),
         })
@@ -457,6 +479,7 @@ pub struct SceneWriter<'f> {
     pub(crate) models: &'f [Option<ModelEmission>],
     /// Sections and animated parts by `ModelId`.
     pub(crate) model_cpu: &'f [ModelCpu],
+    pub(crate) patterns: &'f Patterns,
 }
 
 impl Drop for SceneWriter<'_> {
@@ -1003,15 +1026,16 @@ impl<'f> SceneWriter<'f> {
         let t = &self.scene.tables;
         let i = u64::from(id.0);
         let counts = t.producer_counts.gpu().offset(i);
-        let (record, batch, entry, producer) = match desc {
+        let (record, batch, patches, entry, producer) = match desc {
             None => (
                 ProducerGpu::zeroed(),
+                ProducerBatch::zeroed(),
                 ProducerBatch::zeroed(),
                 EmissiveGpu::zeroed(),
                 None,
             ),
             Some(d) => {
-                let b = producer::build(self.device, d, counts)?;
+                let b = producer::build(self.device, d, counts, self.patterns)?;
                 let words = self.upload(b.static_at, (b.static_bytes.len() / 4) as u32)?;
                 bytemuck::cast_slice_mut(words).copy_from_slice(&b.static_bytes);
                 let entry = EmissiveGpu {
@@ -1019,11 +1043,17 @@ impl<'f> SceneWriter<'f> {
                     source: id.0,
                     ..Zeroable::zeroed()
                 };
-                (b.record, b.batch, entry, Some(b.producer))
+                (b.record, b.batch, b.patches, entry, Some(b.producer))
             }
         };
+        let emit_counts = producer.as_ref().map_or(counts, |p| p.emit_counts);
         self.write(t.producers.gpu().offset(i), record)?;
         self.write(t.batches.gpu().offset(i), batch)?;
+        self.write(t.patches.gpu().offset(i), patches)?;
+        self.write(t.tess_state.gpu().offset(i), TessStateGpu::zeroed())?;
+        if emit_counts != counts {
+            self.push(Record::fill(self.next_seq(), emit_counts.address().0, 2, 0));
+        }
         self.write(t.emissive.gpu().offset(i), entry)?;
         self.push(Record::fill(self.next_seq(), counts.address().0, 2, 0));
         // The new entry has built nothing; its PTLAS instance follows from the record.

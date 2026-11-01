@@ -245,7 +245,8 @@ public struct SceneRoot
     public LightGpu* lights;
     public EmissiveGpu* emissive;    // producer_capacity + emissive_capacity entries
     public ProducerGpu* producers;   // by ProducerId
-    public ProducerBatch* batches;   // by ProducerId
+    public ProducerBatch* batches;   // by ProducerId: what is drawn and traced; a tessellated entry's generated clusters
+    public ProducerBatch* patches;   // by ProducerId: the patches a tessellated entry's kernel emits; zero for others
     public ProducerStateGpu* producer_state; // by ProducerId, written by the GPU
     public SkyStats* sky_stats;
     public uint64_t environment;     // consumer data for the linked environment

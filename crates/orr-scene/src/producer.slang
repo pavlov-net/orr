@@ -4,9 +4,10 @@ module producer;
 
 import orr.abi;
 import orr.packing;
+__exported import tessellation;
 
 // `ProducerClusterGpu.topology` of a directly built cluster.
-public static const uint DIRECT_CLUSTER = 0xff;
+public static const uint DIRECT_CLUSTER = 0xffff;
 // Returned when a batch has no room left; the emit is dropped.
 public static const uint NO_ROOM = 0xffffffff;
 
@@ -34,9 +35,8 @@ public struct ProducerClusterGpu
     public uint16_t vertex_count;
     public uint8_t tri_count;
     public uint8_t material;     // index in the entry's materials
-    public uint8_t topology;     // or DIRECT_CLUSTER
-    public uint8_t _pad0;
-    public uint16_t _pad1;
+    public uint16_t topology;    // or DIRECT_CLUSTER
+    public uint16_t _pad;
 }
 
 // A producer entry's batch. Counts reset to 0 before scene compute each frame for
@@ -52,6 +52,7 @@ public struct ProducerBatch
     public uint* cluster_count;
     public uint* vertex_count;
     public TopologyGpu* topologies;
+    public GeneratedClusterGpu* generated; // per cluster of a tessellated entry's batch; null elsewhere
     public uint max_clusters;
     public uint max_vertices;
     public uint topology_count;
@@ -159,9 +160,8 @@ public uint emit_template_cluster(ProducerBatch b, uint topology, uint first_ver
     c.tri_count = uint8_t(t.tri_count);
     c.vertex_count = uint16_t(t.vertex_count);
     c.material = uint8_t(material);
-    c.topology = uint8_t(topology);
-    c._pad0 = 0;
-    c._pad1 = 0;
+    c.topology = uint16_t(topology);
+    c._pad = 0;
     return emit(b, c);
 }
 
@@ -177,9 +177,8 @@ public uint emit_direct_cluster(ProducerBatch b, uint tri_count, uint vertex_cou
     c.tri_count = uint8_t(tri_count);
     c.vertex_count = uint16_t(vertex_count);
     c.material = uint8_t(material);
-    c.topology = uint8_t(DIRECT_CLUSTER);
-    c._pad0 = 0;
-    c._pad1 = 0;
+    c.topology = uint16_t(DIRECT_CLUSTER);
+    c._pad = 0;
     return emit(b, c);
 }
 
