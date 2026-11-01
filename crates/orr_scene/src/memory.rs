@@ -1,11 +1,15 @@
-//! Sub-allocation: index ranges in fixed tables and the per-frame upload windows.
+//! Sub-allocation: index ranges in fixed tables, the per-frame upload windows and the
+//! frames' preprocess memory.
 
+use std::alloc::Layout;
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
 use std::sync::Mutex;
 
 use bytemuck::Pod;
-use orr_gpu::{Allocation, Device, GpuAddress, GpuPtr, MemoryKind, MemoryPriority};
+use orr_gpu::{
+    Allocation, Device, DeviceArenas, GpuAddress, GpuPtr, MemoryKind, MemoryPriority, TimelinePoint,
+};
 
 use crate::Result;
 
@@ -249,6 +253,10 @@ impl Pool {
     }
 }
 
+/// Bytes between kernel roots in an upload window: the largest
+/// `minUniformBufferOffsetAlignment` Vulkan allows.
+pub(crate) const ROOT_ALIGN: u64 = 256;
+
 /// One frame's upload memory: mapped, write-combined blocks handed out by bumping an
 /// offset. Writers on several threads allocate from one window; it is reset once the
 /// frame that used it has completed on the GPU.
@@ -337,15 +345,33 @@ impl UploadWindow {
     }
 
     /// `root` in the window as a kernel root. Roots are read as uniform buffers, whose
-    /// address must be a multiple of `minUniformBufferOffsetAlignment`; 256 is the largest
-    /// value Vulkan allows.
+    /// address must be a multiple of `minUniformBufferOffsetAlignment`; [`ROOT_ALIGN`] is
+    /// the largest value Vulkan allows.
     pub(crate) fn put_root<T: Pod>(&self, device: &Device, root: &T) -> Result<GpuPtr<T>> {
-        let (gpu, cpu) = self.alloc(device, size_of::<T>() as u64, 256)?;
-        let cpu = cpu.cast::<T>();
-        assert!(cpu.is_aligned(), "upload window root is not aligned");
-        // SAFETY: room for one `T`, aligned (asserted above).
-        unsafe { cpu.write(*root) };
-        // SAFETY: the root was just written at `gpu`.
+        self.put_roots(device, 1, |_| *root)
+    }
+
+    /// `root(i)` for each `i` below `count`, at least 1, in the window as kernel roots,
+    /// [`ROOT_ALIGN`] bytes apart from the first.
+    pub(crate) fn put_roots<T: Pod>(
+        &self,
+        device: &Device,
+        count: u32,
+        root: impl Fn(u32) -> T,
+    ) -> Result<GpuPtr<T>> {
+        const { assert!(size_of::<T>() as u64 <= ROOT_ALIGN) };
+        assert!(count > 0, "no roots");
+        let bytes = ROOT_ALIGN * u64::from(count - 1) + size_of::<T>() as u64;
+        let (gpu, cpu) = self.alloc(device, bytes, ROOT_ALIGN)?;
+        for i in 0..count {
+            // SAFETY: the window handed out room for a `T` at each of `count` strides of
+            // ROOT_ALIGN bytes, and `i` is below `count`.
+            let at = unsafe { cpu.add(i as usize * ROOT_ALIGN as usize) }.cast::<T>();
+            assert!(at.is_aligned(), "upload window root is not aligned");
+            // SAFETY: room for one `T` in stride `i`, aligned (asserted above).
+            unsafe { at.write(root(i)) };
+        }
+        // SAFETY: the roots were just written from `gpu`.
         Ok(unsafe { GpuPtr::from_address(gpu) })
     }
 
@@ -360,6 +386,58 @@ impl UploadWindow {
         w.block = 0;
         w.offset = 0;
         w.used = 0;
+    }
+}
+
+/// Preprocess memory of the frames' device-generated commands: one arena per frame in flight
+/// and one more, each closed at its frame's end, so the arena a frame moves to was last used
+/// by a frame that had completed when it began. The ring is made at the first allocation; a
+/// frame that finds no room moves to a ring of twice the size.
+pub(crate) struct PreprocessArenas {
+    arenas: Option<DeviceArenas>,
+    count: u32,
+    bytes: u64,
+    /// Rings outgrown this frame, dropped once its work is submitted.
+    outgrown: Vec<DeviceArenas>,
+}
+
+impl PreprocessArenas {
+    /// Bytes of the first ring's arenas.
+    const FIRST_BYTES: u64 = 1 << 16;
+
+    pub(crate) fn new(frames_in_flight: u32) -> Self {
+        Self {
+            arenas: None,
+            count: frames_in_flight + 1,
+            bytes: Self::FIRST_BYTES / 2,
+            outgrown: Vec::new(),
+        }
+    }
+
+    /// Memory for `layout` in the current frame's arena.
+    pub(crate) fn allocate(&mut self, device: &Device, layout: Layout) -> Result<GpuPtr<u8>> {
+        if let Some(Ok(p)) = self.arenas.as_ref().map(|a| a.allocate(layout)) {
+            return Ok(p);
+        }
+        let need = (layout.size() + layout.align()) as u64;
+        self.bytes = (2 * self.bytes).max(need.next_power_of_two());
+        let grown = device.create_device_arenas(self.count, self.bytes, "preprocess")?;
+        self.outgrown.extend(self.arenas.replace(grown));
+        Ok(self
+            .arenas
+            .as_ref()
+            .and_then(|a| a.allocate(layout).ok())
+            .expect("a new preprocess arena holds the layout"))
+    }
+
+    /// Closes the current frame's arena: the work signaling `after`, already submitted, is
+    /// the last to use it.
+    pub(crate) fn end_frame(&mut self, after: TimelinePoint) -> Result<()> {
+        if let Some(a) = &mut self.arenas {
+            a.reset(after)?;
+        }
+        self.outgrown.clear();
+        Ok(())
     }
 }
 

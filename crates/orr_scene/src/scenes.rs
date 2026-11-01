@@ -22,8 +22,7 @@ use crate::decals::{self, build_bins};
 use crate::emissive::ModelEmission;
 use crate::loading::{self, Loading, Msg};
 use crate::material::{MaterialId, MaterialTable, MaterialWriter};
-use crate::memory::RangeAllocator;
-use crate::memory::UploadWindow;
+use crate::memory::{PreprocessArenas, RangeAllocator, UploadWindow};
 use crate::mount::{
     Apply, ClipRef, InstancePage, LoadState, MountId, MountTask, Mounts, PackSource, PageId,
     SkeletonRef, TableSizes,
@@ -182,6 +181,10 @@ pub struct RendererDesc {
     /// A view's transient targets whose spans in the frame order do not overlap share
     /// memory ([`ViewArena`]).
     pub alias_view_targets: bool,
+    /// The material resolve runs its surface bins as one device-generated command that
+    /// skips empty bins, on devices with `Caps::generated_commands`; off, or without them,
+    /// it records one indirect dispatch per bin.
+    pub generated_resolve: bool,
     /// Tessellation: the longest generated edge, in pixels at the scene focus.
     pub dice_pixels: f32,
 }
@@ -201,6 +204,7 @@ impl Default for RendererDesc {
             rt_merge_pixels: 32.0,
             software_raster_pixels: 32.0,
             alias_view_targets: true,
+            generated_resolve: true,
             dice_pixels: 2.0,
         }
     }
@@ -323,6 +327,7 @@ struct Core {
     scenes: Vec<Option<Scene>>,
     histories: Vec<Option<ViewHistory>>,
     windows: Vec<UploadWindow>,
+    preprocess: PreprocessArenas,
     seq: AtomicU64,
     next_frame: u64,
     completed_frame: u64,
@@ -416,7 +421,8 @@ impl Scenes {
                 .spawn(move || loading::thread(l, d))?
         };
         let mut pipelines = Pipelines::new(device, desc.kernels)?;
-        let raster = RasterPipelines::new(device, desc.kernels, &mut pipelines)?;
+        let generated = desc.generated_resolve && device.caps().generated_commands;
+        let raster = RasterPipelines::new(device, desc.kernels, &mut pipelines, generated)?;
         let ptlas = PtlasPipelines::new(device, desc.kernels, &mut pipelines)?;
         let producers = ProducerKernels::new(device, desc.kernels, &mut pipelines)?;
         let skin = SkinKernels::new(device, desc.kernels, &mut pipelines)?;
@@ -465,6 +471,7 @@ impl Scenes {
                 windows: (0..desc.frames_in_flight)
                     .map(|_| UploadWindow::new(desc.budgets.upload_block))
                     .collect(),
+                preprocess: PreprocessArenas::new(desc.frames_in_flight),
                 seq: AtomicU64::new(1),
                 next_frame: 1,
                 completed_frame: 0,
@@ -1595,6 +1602,10 @@ impl<'a> Frame<'a> {
             bins: core.raster.bins,
             slots: scene.desc.instance_capacity,
         };
+        let preprocess = match core.raster.preprocess_layout(self.pipelines) {
+            Some(layout) => Some(core.preprocess.allocate(device, layout)?),
+            None => None,
+        };
         let history = core
             .histories
             .get_mut(view.history.0 as usize)
@@ -1637,6 +1648,7 @@ impl<'a> Frame<'a> {
             constants,
             core.software_raster_pixels,
             occlusion,
+            preprocess,
         )?;
         let (gbuf_a, gbuf_b, gbuf_x) = targets.gbuffer_textures();
         let out = RasterView {
@@ -1815,6 +1827,9 @@ impl<'a> Frame<'a> {
             points.push(point);
             self.core.output = Some(point);
         }
+        self.core
+            .preprocess
+            .end_frame(*points.last().expect("a frame submits"))?;
         self.marker(LatencyMarker::RenderSubmitEnd);
         render.mark_frame_end(self.id)?;
         self.step("end");

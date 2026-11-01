@@ -52,8 +52,10 @@ public struct RasterGpu
     public uint* particles;          // visible clusters of particle entries, for the transparency point
     public uint* counts;             // COUNT_*
     public uint* slot_visibility;    // per instance slot: SLOT_*
-    public uint* bin_args;           // per surface bin: x, y, z
+    public uint* bin_args;           // per surface bin: x, y, z; then the resolve's sequence count
     public uint* bin_tiles;          // per bin: tile_capacity tile indices
+    public uint64_t sequences;       // the resolve's device-generated sequences, one per bin at most
+    public uint64_t bin_roots;       // per bin: its resolve root, BIN_ROOT_STRIDE bytes apart
     public float* depth;             // per pixel: resolved reverse-Z depth
     public StorageImageIndex a;
     public StorageImageIndex b;
@@ -94,6 +96,9 @@ public uint grid_index(uint3 group)
 {
     return group.y * GRID_X + group.x;
 }
+
+// Bytes between the bins' roots: the largest uniform buffer offset alignment Vulkan allows.
+public static const uint BIN_ROOT_STRIDE = 256;
 
 // What every raster dispatch and draw takes.
 public struct RasterRoot

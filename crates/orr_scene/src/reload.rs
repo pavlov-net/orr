@@ -4,11 +4,11 @@ use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use orr_gpu::{ComputePipeline, Device, ShaderModule};
+use orr_gpu::{Device, ShaderModule};
 use orr_shaders::{Reload, Watcher};
 
 use crate::loading::Loading;
-use crate::pipelines::{Code, Pipelines, ReloadReport};
+use crate::pipelines::{Code, Made, Pipelines, ReloadReport};
 
 /// The least time from one scan's start to the next.
 const SCAN_PERIOD: Duration = Duration::from_millis(250);
@@ -18,8 +18,8 @@ struct Scanned {
     watcher: Watcher,
     /// The recipes the scan saw.
     recipes: usize,
-    /// New pipelines by recipe index.
-    swaps: Vec<(usize, ComputePipeline)>,
+    /// New pipelines and sets by recipe index.
+    swaps: Vec<(usize, Made)>,
     code: Vec<(&'static ShaderModule, Arc<Code>)>,
     reports: Vec<ReloadReport>,
 }

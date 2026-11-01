@@ -1,13 +1,15 @@
 // The material resolve. `classify` runs one workgroup per 8 x 8 tile: it writes sky pixels
-// and the HZB's finest mip, and lists the tile in every surface bin its pixels use.
-// `resolve` then runs once per bin over the bin's tiles with the bin's surface id uniform:
-// each pixel's surface through the linked `Surface` switch, the depth offset applied to
-// depth, position and motion, projected-space NDF filtering of the roughness, and the
-// G-buffer written.
+// and the HZB's finest mip, and lists the tile in every surface bin its pixels use. With
+// device-generated commands `sequences` then writes one sequence per bin with tiles.
+// `resolve` runs once per bin over the bin's tiles with the bin's surface id uniform: each
+// pixel's surface through the linked `Surface` switch, the depth offset applied to depth,
+// position and motion, projected-space NDF filtering of the roughness, and the G-buffer
+// written.
 #include "orr/root.h"
 import orr.math;
 import orr_pack.mesh;
 import producer;
+import sequence;
 import surface;
 import visibility;
 
@@ -76,6 +78,28 @@ void classify(uint group: SV_GroupID, uint t: SV_GroupThreadID)
             r.bin_tiles[bin * r.tile_capacity + slot] = group;
         }
     }
+}
+
+// One thread per bin: a sequence running the resolve set's one pipeline over the bin's
+// tiles with the bin's root, for bins with tiles only.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void sequences(uint3 id: SV_DispatchThreadID)
+{
+    RasterGpu* r = root.raster;
+    uint bin = id.x;
+    if (bin >= r.bins)
+        return;
+    uint tiles = r.bin_args[3 * bin];
+    if (tiles == 0)
+        return;
+    uint slot;
+    InterlockedAdd(r.bin_args[3 * r.bins], 1, slot);
+    Sequence q;
+    q.pipeline = 0;
+    q.root = r.bin_roots + uint64_t(bin) * BIN_ROOT_STRIDE;
+    q.groups = uint3(tiles, 1, 1);
+    store(r.sequences, slot, q);
 }
 
 // Projected-space NDF filtering (Tokuyoshi and Kaplanyan 2021): widens GGX alpha^2 by the

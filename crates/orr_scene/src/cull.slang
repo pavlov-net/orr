@@ -22,7 +22,8 @@ import visibility;
 
 ORR_ROOT(RasterRoot);
 
-// One thread per pixel; the first threads also reset the counters and draw arguments.
+// One thread per pixel; the first threads also reset the counters, the draw arguments and
+// the resolve's sequence count.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void clear(uint3 id: SV_DispatchThreadID)
@@ -33,7 +34,7 @@ void clear(uint3 id: SV_DispatchThreadID)
         r.gbuffer.visibility[id.x] = 0;
     if (id.x < COUNTS)
         r.counts[id.x] = id.x == COUNT_DRAWS ? 1 : 0;
-    if (id.x < 3 * r.bins)
+    if (id.x <= 3 * r.bins)
         r.bin_args[id.x] = id.x % 3 == 0 ? 0 : 1;
 }
 

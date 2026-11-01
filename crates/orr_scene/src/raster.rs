@@ -3,18 +3,20 @@
 //! around an HZB of the first, the material resolve per surface bin into the G-buffer and
 //! motion, the final HZB, and the depth target.
 
+use std::alloc::Layout;
 use std::sync::Arc;
 
 use bytemuck::Zeroable;
 use orr_gpu::{
     Allocation, ColorTarget, CommandList, CompareOp, DepthAttachment, DepthLoad, DepthTarget,
-    Device, DispatchArgs, Format, GpuPtr, Hazards, KernelSet, MemoryKind, MeshArgs, MeshPipeline,
-    MeshPipelineDesc, RasterState, Rendering, ShaderStage, SpecData, Stages, StorageImageIndex,
-    Texture, TextureDesc, TextureIndex, TextureMemory, TextureUsage, ViewDesc,
+    Device, DispatchArgs, Format, Generated, GpuPtr, Hazards, KernelSet, MemoryKind, MeshArgs,
+    MeshPipeline, MeshPipelineDesc, RasterState, Rendering, Sequence, ShaderStage, SpecData,
+    Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory, TextureUsage,
+    ViewDesc,
 };
 
 use crate::arena::{ArenaBuffer, ArenaRequest, ArenaTexture, Span, ViewArena, ViewStep};
-use crate::memory::UploadWindow;
+use crate::memory::{ROOT_ALIGN, UploadWindow};
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::shaders::{cull, hzb, raster, resolve};
 use crate::{
@@ -37,6 +39,18 @@ const ARGS_PARTICLES: u64 = 12;
 const MAX_HZB_MIPS: u32 = 16;
 const TILE: u32 = 8;
 
+/// How the material resolve runs its bins.
+enum Resolve {
+    /// One indirect dispatch per bin, empty or not.
+    Recorded(PipelineId),
+    /// `sequences` writes a sequence per bin with tiles, which one device-generated command
+    /// runs on `set`, the resolve pipeline's execution set.
+    Generated {
+        sequences: PipelineId,
+        set: PipelineId,
+    },
+}
+
 /// The compute kernels are hot-reloadable [`Pipelines`]; the mesh pipelines are not.
 pub(crate) struct RasterPipelines {
     clear: PipelineId,
@@ -49,7 +63,7 @@ pub(crate) struct RasterPipelines {
     alpha: MeshPipeline,
     software: PipelineId,
     classify: PipelineId,
-    resolve: PipelineId,
+    resolve: Resolve,
     seed: PipelineId,
     reduce: PipelineId,
     depth: MeshPipeline,
@@ -58,10 +72,13 @@ pub(crate) struct RasterPipelines {
 }
 
 impl RasterPipelines {
+    /// With `generated` the resolve runs as device-generated commands; the device must have
+    /// `Caps::generated_commands`.
     pub(crate) fn new(
         device: &Device,
         kernels: &KernelSet,
         pipelines: &mut Pipelines,
+        generated: bool,
     ) -> Result<Self> {
         let module = kernels.module(&raster::MODULE)?;
         let stage = |entry| ShaderStage::new(module, entry, SpecData::default());
@@ -78,6 +95,26 @@ impl RasterPipelines {
             Ok::<_, crate::Error>(device.create_mesh_pipeline(&desc, mesh)?)
         };
         let none = SpecData::default;
+        let resolve = if generated {
+            Resolve::Generated {
+                sequences: pipelines.create(
+                    device,
+                    kernels,
+                    &resolve::MODULE,
+                    "sequences",
+                    none(),
+                )?,
+                set: pipelines.create_set(device, kernels, &resolve::MODULE, "resolve")?,
+            }
+        } else {
+            Resolve::Recorded(pipelines.create(
+                device,
+                kernels,
+                &resolve::MODULE,
+                "resolve",
+                none(),
+            )?)
+        };
         let mut compute = |own, entry| pipelines.create(device, kernels, own, entry, none());
         Ok(Self {
             clear: compute(&cull::MODULE, "clear")?,
@@ -90,7 +127,7 @@ impl RasterPipelines {
             alpha: mesh("cluster_mesh", "alpha_pixel", None)?,
             software: compute(&raster::MODULE, "software")?,
             classify: compute(&resolve::MODULE, "classify")?,
-            resolve: compute(&resolve::MODULE, "resolve")?,
+            resolve,
             seed: compute(&hzb::MODULE, "seed")?,
             reduce: compute(&hzb::MODULE, "reduce")?,
             depth: mesh(
@@ -104,6 +141,15 @@ impl RasterPipelines {
             )?,
             bins: kernels.surfaces + 1,
         })
+    }
+
+    /// Preprocess memory one view's resolve takes from [`orr_gpu::DeviceArenas`], when it
+    /// runs as device-generated commands.
+    pub(crate) fn preprocess_layout(&self, pipelines: &Pipelines) -> Option<Layout> {
+        match self.resolve {
+            Resolve::Recorded(_) => None,
+            Resolve::Generated { set, .. } => Some(pipelines.set(set).preprocess_layout(self.bins)),
+        }
     }
 }
 
@@ -181,6 +227,7 @@ const SOFTWARE: &str = "software clusters";
 const PARTICLES: &str = "particle clusters";
 const BIN_ARGS: &str = "bin args";
 const BIN_TILES: &str = "bin tiles";
+const BIN_SEQUENCES: &str = "bin sequences";
 const DEPTH_VALUES: &str = "resolved depth";
 const GBUF_A: &str = "gbuf_a";
 const GBUF_B: &str = "gbuf_b";
@@ -205,6 +252,7 @@ struct Transient {
     particles: ArenaBuffer,
     bin_args: ArenaBuffer,
     bin_tiles: ArenaBuffer,
+    bin_sequences: ArenaBuffer,
     depth_values: ArenaBuffer,
     a: ArenaTexture,
     b: ArenaTexture,
@@ -227,6 +275,7 @@ impl Transient {
             particles: buffer(PARTICLES),
             bin_args: buffer(BIN_ARGS),
             bin_tiles: buffer(BIN_TILES),
+            bin_sequences: buffer(BIN_SEQUENCES),
             depth_values: buffer(DEPTH_VALUES),
             a: texture(GBUF_A).expect("raster target"),
             b: texture(GBUF_B).expect("raster target"),
@@ -287,7 +336,13 @@ impl ViewTargets {
             ArenaRequest::buffer(OPAQUE, list, CULL),
             ArenaRequest::buffer(ALPHA, list, CULL),
             ArenaRequest::buffer(SOFTWARE, list, CULL),
-            ArenaRequest::buffer(BIN_ARGS, 12 * u64::from(s.bins), CULL),
+            // Then the sequence count.
+            ArenaRequest::buffer(BIN_ARGS, 12 * u64::from(s.bins) + 4, CULL),
+            ArenaRequest::buffer(
+                BIN_SEQUENCES,
+                size_of::<Sequence>() as u64 * u64::from(s.bins),
+                CULL,
+            ),
             ArenaRequest::buffer(
                 BIN_TILES,
                 4 * u64::from(s.bins) * u64::from(tx) * u64::from(ty),
@@ -400,7 +455,13 @@ impl ViewTargets {
         )
     }
 
-    fn record(&self, software_pixels: f32, occlusion: bool, slots: u32) -> RasterGpu {
+    fn record(
+        &self,
+        software_pixels: f32,
+        occlusion: bool,
+        slots: u32,
+        bin_roots: GpuPtr<RasterRoot>,
+    ) -> RasterGpu {
         let [tx, ty] = tiles(self.sizes.extent);
         let mut hzb = [StorageImageIndex::NONE; MAX_HZB_MIPS as usize];
         hzb[..self.hzb.storage.len()].copy_from_slice(&self.hzb.storage);
@@ -417,6 +478,8 @@ impl ViewTargets {
             slot_visibility: self.slot_visibility.gpu(),
             bin_args: t.bin_args.gpu(),
             bin_tiles: t.bin_tiles.gpu(),
+            sequences: t.bin_sequences.gpu::<u8>().address().0,
+            bin_roots: bin_roots.address().0,
             depth: t.depth_values.gpu(),
             a: t.a.storage(0),
             b: t.b.storage(0),
@@ -476,10 +539,29 @@ impl ViewTargets {
             .offset(3 * u64::from(bin))
             .cast()
     }
+
+    /// The resolve's device-generated sequences, room for one per bin, and their count.
+    fn sequences(&self) -> (GpuPtr<Sequence>, GpuPtr<u32>) {
+        let t = &self.transient;
+        let count = t
+            .bin_args
+            .gpu::<u32>()
+            .offset(3 * u64::from(self.sizes.bins));
+        (t.bin_sequences.gpu(), count)
+    }
+}
+
+/// Bin `bin`'s root among roots [`ROOT_ALIGN`] bytes apart from `roots`.
+fn bin_root(roots: GpuPtr<RasterRoot>, bin: u32) -> GpuPtr<RasterRoot> {
+    roots
+        .cast::<u8>()
+        .offset(ROOT_ALIGN * u64::from(bin))
+        .cast()
 }
 
 /// Records one view's raster half into `list`. With `occlusion` the first pass tests the
-/// previous frame's HZB, which the view's previous render left.
+/// previous frame's HZB, which the view's previous render left. `preprocess` is memory of
+/// [`RasterPipelines::preprocess_layout`], when it gives one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record(
     device: &Device,
@@ -494,23 +576,23 @@ pub(crate) fn record(
     view: GpuPtr<ViewConstants>,
     software_pixels: f32,
     occlusion: bool,
+    preprocess: Option<GpuPtr<u8>>,
 ) -> Result<GpuPtr<RasterGpu>> {
-    let raster = window.put(device, &targets.record(software_pixels, occlusion, slots))?;
-    let root = |value: u32| {
-        window.put_root(
-            device,
-            &RasterRoot {
-                scene,
-                view,
-                raster,
-                value,
-                _pad: 0,
-            },
-        )
-    };
-    let r0 = root(0)?;
-    let r1 = root(1)?;
     let s = targets.sizes;
+    let (raster, record) = window.slice::<RasterGpu>(device, 1)?;
+    let root_of = |value| RasterRoot {
+        scene,
+        view,
+        raster,
+        value,
+        _pad: 0,
+    };
+    // The bins' roots; bin 0's is also the root of every pass with value 0.
+    let roots = window.put_roots(device, s.bins, root_of)?;
+    record[0] = targets.record(software_pixels, occlusion, slots, roots);
+    let root = |value| window.put_root(device, &root_of(value));
+    let r0 = roots;
+    let r1 = root(1)?;
     let pixels = s.extent[0] * s.extent[1];
     let [tx, ty] = tiles(s.extent);
     let args = targets.args.gpu();
@@ -554,7 +636,7 @@ pub(crate) fn record(
     let slot_groups = [slots.div_ceil(64).max(1), 1, 1];
 
     list.begin_pass("cull", false);
-    let cleared = pixels.max(3 * s.bins).max(COUNTS as u32);
+    let cleared = pixels.max(3 * s.bins + 1).max(COUNTS as u32);
     list.dispatch(pipelines.get(p.clear), r0, [cleared.div_ceil(64), 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
     list.dispatch(pipelines.get(p.instances), r0, slot_groups);
@@ -580,9 +662,32 @@ pub(crate) fn record(
 
     list.begin_pass("resolve", false);
     list.dispatch(pipelines.get(p.classify), r0, [tx * ty, 1, 1]);
-    list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
-    for bin in 0..s.bins {
-        list.dispatch_indirect(pipelines.get(p.resolve), root(bin)?, targets.bin_args(bin));
+    match p.resolve {
+        Resolve::Recorded(resolve) => {
+            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
+            for bin in 0..s.bins {
+                let args = targets.bin_args(bin);
+                list.dispatch_indirect(pipelines.get(resolve), bin_root(roots, bin), args);
+            }
+        }
+        Resolve::Generated { sequences, set } => {
+            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+            list.dispatch(pipelines.get(sequences), r0, [s.bins.div_ceil(64), 1, 1]);
+            list.barrier(
+                Stages::COMPUTE,
+                Stages::PREPROCESS | Stages::COMPUTE,
+                Hazards::DRAW_ARGUMENTS,
+            );
+            let (sequences, count) = targets.sequences();
+            let g = Generated {
+                set: pipelines.set(set),
+                sequences,
+                count,
+                max: s.bins,
+                preprocess: preprocess.expect("preprocess memory for the generated resolve"),
+            };
+            list.execute_generated(&g, false);
+        }
     }
     list.end_pass();
     list.barrier(
