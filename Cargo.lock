@@ -2759,6 +2759,7 @@ dependencies = [
  "bytemuck",
  "glam 0.34.1",
  "gpu_suite",
+ "half",
  "log",
  "orr",
  "orr_color",

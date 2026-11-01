@@ -16,6 +16,7 @@ glam.workspace = true
 
 [dev-dependencies]
 bytemuck.workspace = true
+half.workspace = true
 orr_color.workspace = true
 orr_math.workspace = true
 orr_cook = { path = "../../crates/orr_cook" }

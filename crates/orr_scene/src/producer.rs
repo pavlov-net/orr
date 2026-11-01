@@ -20,7 +20,10 @@ use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::scene::{InstanceFlags, TransformGroupId};
 use crate::shaders::producer_build::{self, BuildRoot, ProducerBuildGpu};
+use crate::shaders::types::{GeneratedClusterGpu, TessGpu, TessStateGpu};
+use crate::tessellate::{EntryTess, Layout, PATTERNS, Patterns, TessellationStats};
 use crate::{ProducerBatch, ProducerClusterGpu, ProducerGpu, Result, SceneRoot, TopologyGpu};
+use bytemuck::Zeroable;
 
 /// `producer_build.slang` `BUILD_*`.
 const BUILD_TEMPLATES: u64 = 0;
@@ -115,12 +118,20 @@ pub struct ProducerDesc<'a> {
     /// in the frame of `set_producer`. Clusters may also build directly from their own
     /// triangles (`emit_direct_cluster`).
     pub topologies: &'a [ClusterTopology<'a>],
-    /// Clusters are base patches for the tessellator, which dices them once per frame for
-    /// raster and ray tracing; until it exists they draw and trace as emitted.
+    /// The entry's kernel emits patches into `SceneRoot.patches`, a batch of
+    /// `max_patch_clusters` clusters over `max_patch_vertices` vertices, and orr's
+    /// tessellator dices their triangles once per frame into the clusters raster and ray
+    /// tracing draw: `max_clusters` and `max_vertices` bound those. Patch topologies index
+    /// the patch batch; they build no templates.
     pub tessellated: bool,
+    pub max_patch_clusters: u32,
+    pub max_patch_vertices: u32,
     /// The linked `IDisplacement` id tessellated patches displace through; 0 is the
     /// material's displacement texture.
     pub displacement: u8,
+    /// The most the entry's displacement moves a point, in m of entry space: edges whose
+    /// sphere grown by it was out of view last frame take a coarse rate.
+    pub displacement_reach: f32,
     pub opacity: Opacity,
     /// Indexed by each cluster's material; at most 256.
     pub materials: &'a [MaterialId],
@@ -146,7 +157,10 @@ impl Default for ProducerDesc<'_> {
             update: ProducerUpdate::EveryFrame,
             topologies: &[],
             tessellated: false,
+            max_patch_clusters: 0,
+            max_patch_vertices: 0,
             displacement: 0,
+            displacement_reach: 0.0,
             opacity: Opacity::Opaque,
             materials: &[],
             transform: (TransformGroupId(0), 0),
@@ -159,9 +173,9 @@ impl Default for ProducerDesc<'_> {
     }
 }
 
-/// One implicit build of an entry: its desc, its result block and where its records and
-/// result addresses are.
-struct Op {
+/// One implicit build: its desc, its result block and where its records and result
+/// addresses are.
+pub(crate) struct Op {
     desc: RtasOpDesc,
     results: Allocation<u8>,
     records: GpuAddress,
@@ -170,7 +184,7 @@ struct Op {
 }
 
 impl Op {
-    fn new(
+    pub(crate) fn new(
         device: &Device,
         desc: RtasOpDesc,
         records: GpuAddress,
@@ -193,11 +207,11 @@ impl Op {
         })
     }
 
-    fn scratch(&self, device: &Device) -> u64 {
+    pub(crate) fn scratch(&self, device: &Device) -> u64 {
         device.rtas_sizes(&self.desc).scratch
     }
 
-    fn record(&self, list: &mut CommandList<'_>, scratch: GpuAddress) {
+    pub(crate) fn record(&self, list: &mut CommandList<'_>, scratch: GpuAddress) {
         list.rtas_execute(
             &self.desc,
             &RtasIo {
@@ -232,25 +246,33 @@ pub(crate) struct Producer {
     pub templates_built: bool,
     /// A `Static` entry has built.
     pub built: bool,
+    /// The counts its kernel emits against: the patch batch's for a tessellated entry.
+    pub emit_counts: GpuPtr<[u32; 2]>,
+    /// A tessellated entry's work memory.
+    pub tess: Option<EntryTess>,
     accel: Option<Accel>,
     /// Held while the entry is set.
     _memory: Allocation<u8>,
 }
 
 impl Producer {
-    /// Whether it builds in a frame its scene is updated.
+    /// Whether it builds in a frame its scene is updated. Tessellated entries dice and
+    /// build every frame.
     pub(crate) fn builds(&self) -> bool {
-        self.accel.is_some() && (self.update == ProducerUpdate::EveryFrame || !self.built)
+        self.accel.is_some()
+            && (self.update == ProducerUpdate::EveryFrame || !self.built || self.tess.is_some())
     }
 }
 
 /// What `set_producer` writes: the entry's memory, its records, and the bytes to upload
 /// to the start of its memory (topology triangles and records, materials, template
-/// positions, the build record), a multiple of 16 long.
+/// positions, the build and tessellation records), a multiple of 16 long.
 pub(crate) struct Built {
     pub producer: Producer,
     pub record: ProducerGpu,
     pub batch: ProducerBatch,
+    /// A tessellated entry's patch batch; zero for others.
+    pub patches: ProducerBatch,
     pub static_bytes: Vec<u8>,
     pub static_at: GpuPtr<u32>,
 }
@@ -276,7 +298,7 @@ fn cluster_desc(op: RtasOp, args: u32, tris: u32, verts: u32) -> RtasOpDesc {
 
 /// Vertex `i` of `n` on the moment curve (t, t², t³): no three distinct points are
 /// collinear, so every template triangle is a proper triangle whatever its corners.
-fn curve(n: usize) -> Vec<[f32; 3]> {
+pub(crate) fn curve(n: usize) -> Vec<[f32; 3]> {
     (0..n)
         .map(|i| {
             let t = i as f32 / n as f32;
@@ -285,10 +307,40 @@ fn curve(n: usize) -> Vec<[f32; 3]> {
         .collect()
 }
 
+/// Offsets of one batch's arrays in an entry's allocation.
+struct BatchAt {
+    clusters: u64,
+    positions: u64,
+    previous: Option<u64>,
+    attrs: u64,
+    vertex_user: Option<u64>,
+}
+
+impl BatchAt {
+    fn new(
+        desc: &ProducerDesc<'_>,
+        clusters: u32,
+        vertices: u32,
+        take: &mut dyn FnMut(u64) -> u64,
+    ) -> Self {
+        let vertices = u64::from(vertices);
+        Self {
+            clusters: take(size_of::<ProducerClusterGpu>() as u64 * u64::from(clusters)),
+            positions: take(12 * vertices),
+            previous: desc.previous_positions.then(|| take(12 * vertices)),
+            attrs: take(8 * vertices),
+            vertex_user: desc.vertex_user.then(|| take(4 * vertices)),
+        }
+    }
+}
+
+/// Builds an entry's allocation and records. A tessellated entry takes its generated
+/// clusters' topologies and CLAS templates from `patterns`.
 pub(crate) fn build(
     device: &Device,
     desc: &ProducerDesc<'_>,
     counts: GpuPtr<[u32; 2]>,
+    patterns: &Patterns,
 ) -> Result<Built> {
     assert!(
         desc.topologies.len() < 256,
@@ -317,18 +369,23 @@ pub(crate) fn build(
         firsts.push(triangles.len() as u64);
         triangles.extend(t.triangles.iter().flatten());
     }
-    let topology_tris = desc
-        .topologies
-        .iter()
-        .map(|t| t.triangles.len() as u32)
-        .max()
-        .unwrap_or(0);
-    let topology_verts = desc
-        .topologies
-        .iter()
-        .map(|t| t.vertex_count)
-        .max()
-        .unwrap_or(0);
+    let tessellated = desc.tessellated;
+    let (topology_tris, topology_verts) = if tessellated {
+        (patterns.max_triangles, patterns.max_vertices)
+    } else {
+        (
+            desc.topologies
+                .iter()
+                .map(|t| t.triangles.len() as u32)
+                .max()
+                .unwrap_or(0),
+            desc.topologies
+                .iter()
+                .map(|t| t.vertex_count)
+                .max()
+                .unwrap_or(0),
+        )
+    };
     let caps = device.caps().cluster;
     let traced = caps.max_tris > 0 && caps.max_partitions > 0;
     let stride = |op| u64::from(device.rtas_args_stride(op));
@@ -341,26 +398,40 @@ pub(crate) fn build(
         start
     };
     let n_topo = desc.topologies.len() as u64;
+    // Topologies the drawn batch's clusters instantiate: the entry's, or every pattern.
+    let built_topologies = if tessellated { PATTERNS as u64 } else { n_topo };
+    let only = |yes: bool, bytes: u64| if yes { bytes } else { 0 };
     let clusters = u64::from(desc.max_clusters);
     let triangles_at = take(triangles.len() as u64);
     let topologies_at = take(size_of::<TopologyGpu>() as u64 * n_topo);
     let materials_at = take(4 * desc.materials.len() as u64);
     let curve_at = take(12 * CURVE as u64);
     let build_at = take(size_of::<ProducerBuildGpu>() as u64);
+    let tess_at = take(only(tessellated, size_of::<TessGpu>() as u64));
     let static_len = take(0) as usize;
-    let vertices = u64::from(desc.max_vertices);
-    let clusters_at = take(size_of::<ProducerClusterGpu>() as u64 * clusters);
-    let positions = take(12 * vertices);
-    let previous = desc.previous_positions.then(|| take(12 * vertices));
-    let attrs = take(8 * vertices);
-    let vertex_user = desc.vertex_user.then(|| take(4 * vertices));
+    let drawn = BatchAt::new(desc, desc.max_clusters, desc.max_vertices, &mut take);
+    let generated_at = take(only(
+        tessellated,
+        size_of::<GeneratedClusterGpu>() as u64 * clusters,
+    ));
+    let patch = tessellated.then(|| {
+        let at = BatchAt::new(
+            desc,
+            desc.max_patch_clusters,
+            desc.max_patch_vertices,
+            &mut take,
+        );
+        (at, take(8))
+    });
+    let tess_layout =
+        tessellated.then(|| Layout::new(desc.max_clusters, desc.max_vertices, &mut take));
     let refs_at = take(4 * clusters);
     let counts_at = take(4 * BUILD_COUNTS);
-    let template_records_at = take(stride(RtasOp::BuildTemplates) * n_topo);
+    let template_records_at = take(only(!tessellated, stride(RtasOp::BuildTemplates) * n_topo));
     let instantiate_records_at = take(stride(RtasOp::InstantiateTemplates) * clusters);
     let direct_records_at = take(stride(RtasOp::BuildClas) * clusters);
     let blas_record_at = take(stride(RtasOp::BuildClusterBlas));
-    let templates_at = take(8 * n_topo);
+    let templates_at = take(only(!tessellated, 8 * n_topo));
     let instantiated_at = take(8 * clusters);
     let direct_at = take(8 * clusters);
     let clas_at = take(8 * clusters);
@@ -381,12 +452,18 @@ pub(crate) fn build(
         })
         .collect();
     let counts_gpu = at(counts_at).cast::<u32>();
+    let opaque = desc.opacity.opaque();
     let build_record = ProducerBuildGpu {
         template_records: at(template_records_at),
         instantiate_records: at(instantiate_records_at),
         direct_records: at(direct_records_at),
         blas_record: at(blas_record_at),
-        templates: at(templates_at).cast(),
+        templates: if tessellated {
+            let set = if opaque { 0 } else { PATTERNS as u64 };
+            patterns.templates.offset(set)
+        } else {
+            at(templates_at).cast()
+        },
         instantiated: at(instantiated_at).cast(),
         direct: at(direct_at).cast(),
         clas: at(clas_at).cast(),
@@ -394,13 +471,12 @@ pub(crate) fn build(
         refs: at(refs_at).cast(),
         counts: counts_gpu,
         curve: at(curve_at).cast(),
-        topology_count: n_topo as u32,
-        geometry_flags: if desc.opacity.opaque() {
-            GEOMETRY_OPAQUE
-        } else {
-            0
-        },
+        topology_count: built_topologies as u32,
+        geometry_flags: if opaque { GEOMETRY_OPAQUE } else { 0 },
     };
+    let tess_record = tess_layout
+        .as_ref()
+        .map(|l| l.record(at, desc.displacement_reach));
     let mut bytes = vec![0u8; static_len];
     let mut put = |offset: u64, data: &[u8]| {
         bytes[offset as usize..][..data.len()].copy_from_slice(data);
@@ -410,6 +486,9 @@ pub(crate) fn build(
     put(materials_at, bytemuck::cast_slice(desc.materials));
     put(curve_at, bytemuck::cast_slice(&curve(CURVE)));
     put(build_at, bytemuck::bytes_of(&build_record));
+    if let Some(r) = &tess_record {
+        put(tess_at, bytemuck::bytes_of(r));
+    }
 
     let accel = if traced {
         let count = |i: u64| counts_gpu.offset(i);
@@ -427,7 +506,7 @@ pub(crate) fn build(
             |op_kind, args| cluster_desc(op_kind, args, topology_tris, topology_verts);
         Some(Accel {
             record: at(build_at).cast(),
-            templates: (n_topo > 0)
+            templates: (n_topo > 0 && !tessellated)
                 .then(|| {
                     op(
                         topology_op(RtasOp::BuildTemplates, n_topo as u32),
@@ -438,7 +517,7 @@ pub(crate) fn build(
                     )
                 })
                 .transpose()?,
-            instantiate: (n_topo > 0)
+            instantiate: (built_topologies > 0)
                 .then(|| {
                     op(
                         topology_op(RtasOp::InstantiateTemplates, desc.max_clusters),
@@ -479,6 +558,33 @@ pub(crate) fn build(
     };
 
     let counts = counts.cast::<u32>();
+    let batch = |b: &BatchAt, counts: GpuPtr<u32>, max_clusters, max_vertices| ProducerBatch {
+        clusters: at(b.clusters).cast(),
+        positions: at(b.positions).cast(),
+        previous: b.previous.map_or(GpuPtr::NULL, |o| at(o).cast()),
+        attrs: at(b.attrs).cast(),
+        vertex_user: b.vertex_user.map_or(GpuPtr::NULL, |o| at(o).cast()),
+        cluster_count: counts,
+        vertex_count: counts.offset(1),
+        topologies: at(topologies_at).cast(),
+        generated: GpuPtr::NULL,
+        max_clusters,
+        max_vertices,
+        topology_count: n_topo as u32,
+        _pad: 0,
+    };
+    let mut drawn_batch = batch(&drawn, counts, desc.max_clusters, desc.max_vertices);
+    let (patches, emit_counts) = match &patch {
+        Some((b, counts_at)) => {
+            drawn_batch.topologies = patterns.topologies;
+            drawn_batch.topology_count = PATTERNS as u32;
+            drawn_batch.generated = at(generated_at).cast();
+            let c = at(*counts_at).cast::<u32>();
+            let patches = batch(b, c, desc.max_patch_clusters, desc.max_patch_vertices);
+            (patches, c.cast())
+        }
+        None => (ProducerBatch::zeroed(), counts.cast()),
+    };
     Ok(Built {
         record: ProducerGpu {
             materials: at(materials_at).cast(),
@@ -491,30 +597,24 @@ pub(crate) fn build(
             class_id: desc.opacity.class(),
             origin: desc.origin as u32,
             displacement: u32::from(desc.displacement),
-            tessellated: u32::from(desc.tessellated),
+            tessellated: u32::from(tessellated),
         },
-        batch: ProducerBatch {
-            clusters: at(clusters_at).cast(),
-            positions: at(positions).cast(),
-            previous: previous.map_or(GpuPtr::NULL, |o| at(o).cast()),
-            attrs: at(attrs).cast(),
-            vertex_user: vertex_user.map_or(GpuPtr::NULL, |o| at(o).cast()),
-            cluster_count: counts,
-            vertex_count: counts.offset(1),
-            topologies: at(topologies_at).cast(),
-            max_clusters: desc.max_clusters,
-            max_vertices: desc.max_vertices,
-            topology_count: n_topo as u32,
-            _pad: 0,
-        },
+        batch: drawn_batch,
+        patches,
         static_bytes: bytes,
         static_at: base.cast(),
         producer: Producer {
             update: desc.update,
             max_clusters: desc.max_clusters,
             max_vertices: desc.max_vertices,
-            templates_built: n_topo == 0,
+            templates_built: n_topo == 0 || tessellated,
             built: false,
+            emit_counts,
+            tess: tess_layout.map(|l| EntryTess {
+                record: at(tess_at).cast(),
+                args: at(l.args).cast(),
+                weld_slots: l.weld_slots,
+            }),
             accel,
             _memory: memory,
         },
@@ -732,9 +832,11 @@ impl ProducerStats {
 pub(crate) struct Readback {
     counts: Allocation<[u32; 2]>,
     state: Allocation<crate::ProducerStateGpu>,
+    tess: Allocation<TessStateGpu>,
     capacity: u32,
-    /// Per slot: (entry, max clusters, max vertices) of each set entry.
-    taken: Vec<Vec<(u32, u32, u32)>>,
+    /// Per slot: each set entry, its maximum clusters and vertices and whether it is
+    /// tessellated.
+    taken: Vec<Vec<(u32, u32, u32, bool)>>,
 }
 
 impl Readback {
@@ -743,6 +845,7 @@ impl Readback {
         Ok(Self {
             counts: device.gpu_malloc(MemoryKind::Readback, n, "producer counts readback")?,
             state: device.gpu_malloc(MemoryKind::Readback, n, "producer state readback")?,
+            tess: device.gpu_malloc(MemoryKind::Readback, n, "tessellation state readback")?,
             capacity: capacity.max(1),
             taken: vec![Vec::new(); fif.max(1) as usize],
         })
@@ -755,7 +858,8 @@ impl Readback {
         slot: usize,
         counts: GpuPtr<[u32; 2]>,
         state: GpuPtr<crate::ProducerStateGpu>,
-        set: Vec<(u32, u32, u32)>,
+        tess: GpuPtr<TessStateGpu>,
+        set: Vec<(u32, u32, u32, bool)>,
     ) {
         let at = slot as u64 * u64::from(self.capacity);
         let c = u64::from(self.capacity);
@@ -769,17 +873,30 @@ impl Readback {
             state.cast(),
             c * size_of::<crate::ProducerStateGpu>() as u64,
         );
+        list.copy(
+            self.tess.gpu().offset(at).cast(),
+            tess.cast(),
+            c * size_of::<TessStateGpu>() as u64,
+        );
         self.taken[slot] = set;
     }
 
     /// The figures of slot `slot`.
-    pub(crate) fn figures(&self, slot: usize) -> ProducerStats {
+    pub(crate) fn figures(&self, slot: usize) -> (ProducerStats, TessellationStats) {
         let at = slot * self.capacity as usize;
-        let (Some(counts), Some(state)) = (self.counts.as_slice(), self.state.as_slice()) else {
-            return ProducerStats::default();
+        let (Some(counts), Some(state), Some(tess)) = (
+            self.counts.as_slice(),
+            self.state.as_slice(),
+            self.tess.as_slice(),
+        ) else {
+            return Default::default();
         };
         let mut s = ProducerStats::default();
-        for &(entry, max_clusters, max_vertices) in &self.taken[slot] {
+        let mut t = TessellationStats::default();
+        for &(entry, max_clusters, max_vertices, tessellated) in &self.taken[slot] {
+            if tessellated {
+                t.add_entry(&tess[at + entry as usize]);
+            }
             let [clusters, vertices] = counts[at + entry as usize];
             let st = &state[at + entry as usize];
             s.entries += 1;
@@ -792,6 +909,6 @@ impl Readback {
             s.refused += st.refused;
             s.built += st.clusters;
         }
-        s
+        (s, t)
     }
 }

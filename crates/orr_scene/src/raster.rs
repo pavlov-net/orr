@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use bytemuck::Zeroable;
 use orr_gpu::{
     Allocation, ColorTarget, CommandList, CompareOp, DepthAttachment, DepthLoad, DepthTarget,
     Device, DispatchArgs, Format, GpuPtr, Hazards, KernelSet, MemoryKind, MeshArgs, MeshPipeline,
@@ -435,6 +436,18 @@ impl ViewTargets {
             hzb_mips: self.hzb.storage.len() as u32,
             _pad: 0,
         }
+    }
+
+    /// A raster record holding only the extent and the HZB, for kernels outside the
+    /// view's raster that test what its last render saw.
+    pub(crate) fn hzb_record(&self) -> RasterGpu {
+        let mut hzb = [StorageImageIndex::NONE; MAX_HZB_MIPS as usize];
+        hzb[..self.hzb.storage.len()].copy_from_slice(&self.hzb.storage);
+        let mut r = RasterGpu::zeroed();
+        r.gbuffer.extent = self.sizes.extent;
+        r.hzb = hzb;
+        r.hzb_mips = self.hzb.storage.len() as u32;
+        r
     }
 
     /// The transparency point's overlay.
