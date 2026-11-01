@@ -31,15 +31,13 @@ import lights;
 import light_sampling;
 import world_cache;
 import path;
+import shadow;
 import subsurface;
 import guides;
 import froxels;
 
 // Interior list entries a path keeps.
 public static const uint INTERIOR_ENTRIES = 4;
-
-// The IOR outside every interior.
-public static const float AMBIENT_IOR = 1.0;
 
 // Separates the dielectric dispatch's samples from the opaque path's of the same pixel.
 public static const uint DIELECTRIC_STREAM = 0x85EBCA6B;
@@ -117,44 +115,6 @@ public struct Interior
     }
 }
 
-// The IOR of material `m`'s interior: AMBIENT_IOR for MATERIAL_NONE.
-public float interior_ior(SceneRoot* s, uint m)
-{
-    return m == MATERIAL_NONE ? AMBIENT_IOR : s.materials[m].specular_ior;
-}
-
-// The homogeneous medium inside dielectric material `m`, from its `transmission_color` over
-// `transmission_depth` and `transmission_scatter` (OpenPBR's mapping): none for
-// MATERIAL_NONE, thin-walled materials and a depth of 0.
-public struct InteriorMedium
-{
-    public float3 sigma_t;          // 1/m
-    public float3 sigma_s;
-    public float anisotropy;
-}
-
-public InteriorMedium interior_medium(SceneRoot* s, uint m)
-{
-    InteriorMedium r = (InteriorMedium)0;
-    if (m == MATERIAL_NONE)
-        return r;
-    MaterialGpu* g = s.materials + m;
-    if ((g.flags & MATERIAL_THIN_WALLED) != 0 || !(g.transmission_depth > 0.0))
-        return r;
-    OpenPBR_HomogeneousVolume v = openpbr_create_volume_from_openpbr_params(
-        g.transmission_color, g.transmission_depth, g.transmission_scatter, g.transmission_scatter_anisotropy);
-    r.sigma_t = max(v.extinction_coefficient, 0.0);
-    r.sigma_s = r.sigma_t * saturate(v.albedo);
-    r.anisotropy = v.anisotropy;
-    return r;
-}
-
-// exp(-sigma t) per channel; 1 where sigma is 0, whatever `t`.
-public float3 beer(float3 sigma, float t)
-{
-    return select(sigma > 0.0, exp(-sigma * t), float3(1.0));
-}
-
 // Applies an interior segment of length `t` (+inf: unbounded) to `throughput`: its Beer
 // transmittance, or with `scatter` one distance sample from the extinction, picking a channel
 // uniformly and weighing by the channels' mean density. True with `at` set where the sample
@@ -223,50 +183,23 @@ public bool is_layer(Hit h)
     return h.hit && (h.custom_index == CLASS_DIELECTRIC || h.custom_index == CLASS_PRESENCE);
 }
 
-// What leaving `medium` along a shadow ray lets through: its Beer transmittance to the first
-// dielectric surface the ray crosses, times 1 - Fresnel there into IOR `exit_ior`, without
-// bending. With no surface before `t_max`, the Beer transmittance over it.
-public float3 interior_crossing<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint medium, float exit_ior, HitContext context)
-{
-    InteriorMedium m = interior_medium(s, medium);
-    LayerAccept<S> a = { s, v, dir, context, 0, PRESENCE_NONE };
-    float3 positions[3];
-    Hit h = trace_closest(s.tlas, path_ray(origin, dir, t_max), MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
-    if (!h.hit || h.cluster_id < 0)
-        return beer(m.sigma_t, t_max);
-    float3 n;
-    uint material;
-    float c = hit_geometry(s, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, n, material) ? abs(dot(n, dir)) : 1.0;
-    float f = openpbr_fresnel(exit_ior / interior_ior(s, medium), c);
-    return beer(m.sigma_t, h.t) * (1.0 - f);
-}
-
 // Shadow rays of a vertex with an interior on either side of its outward geometric normal
-// (zero inside a medium, where `above` holds the medium): rays leaving through an interior
-// cross its surface by `interior_crossing` and take weight 1, since BSDF rays reach the
-// light bent.
+// (zero inside a medium, where `above` holds the medium). The shadow product takes the
+// interior's Beer transmittance and its surface's Fresnel transmission, unbent; rays leaving
+// through an interior take weight 1, since BSDF rays reach the light bent.
 public struct LayerShadow<S : ISurface, M : IMedium> : IShadow
 {
-    public SceneRoot* scene;
-    public ViewConstants* view;
+    public SceneShadow<S, M> plain;
     public float3 normal;
     public uint below;              // against `normal`, MATERIAL_NONE outside every interior
     public uint above;
-    public float below_exit;        // the IOR past `below`'s surface
-    public float above_exit;
 
     public float3 transmittance(float3 origin, float3 dir, float t_max, HitContext context, bool environment, out bool weigh)
     {
-        SceneShadow<S, M> plain = { scene, view };
         float3 vis = plain.transmittance(origin, dir, t_max, context, environment, weigh);
-        bool down = dot(dir, normal) < 0.0;
-        uint medium = down ? below : above;
-        if (medium == MATERIAL_NONE)
-            return vis;
-        weigh = false;
-        if (all(vis == 0.0))
-            return vis;
-        return vis * interior_crossing<S>(scene, view, origin, dir, t_max, medium, down ? below_exit : above_exit, context);
+        if ((dot(dir, normal) < 0.0 ? below : above) != MATERIAL_NONE)
+            weigh = false;
+        return vis;
     }
 }
 
@@ -386,31 +319,25 @@ public Bsdf prepare_vertex(SceneRoot* s, LayerVertex l, Interior interior, uint 
 }
 
 // The shadow of vertex `l` against the interior list it was reached with.
-public LayerShadow<S, M> vertex_shadow<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, LayerVertex l, Interior interior)
+public LayerShadow<S, M> vertex_shadow<S : ISurface, M : IMedium>(PathRoot r, LayerVertex l, Interior interior)
 {
-    LayerShadow<S, M> r;
-    r.scene = s;
-    r.view = v;
-    r.normal = float3(0.0);
+    LayerShadow<S, M> shadow;
+    shadow.plain = scene_shadow<S, M>(r);
+    shadow.normal = float3(0.0);
     if (l.kind == VERTEX_LAYER)
     {
         uint m = l.x.surface.material;
         uint out = interior.outside(m, m);
-        r.normal = l.x.surface.geometric_normal;
-        r.above = out;
-        r.above_exit = interior_ior(s, interior.outside(out, m));
-        r.below = thin_walled(l.x.surface) ? out : m;
-        r.below_exit = thin_walled(l.x.surface) ? r.above_exit : interior_ior(s, out);
+        shadow.normal = l.x.surface.geometric_normal;
+        shadow.above = out;
+        shadow.below = thin_walled(l.x.surface) ? out : m;
     }
     else
     {
-        uint m = interior.innermost();
-        r.above = m;
-        r.below = m;
-        r.above_exit = interior_ior(s, interior.outside(m, m));
-        r.below_exit = r.above_exit;
+        shadow.above = interior.innermost();
+        shadow.below = shadow.above;
     }
-    return r;
+    return shadow;
 }
 
 // The incident radiance a scatter at `p` takes from the world cache: the mean of its cells
@@ -507,7 +434,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             bool layer_skips = skip_direct && l.kind == VERTEX_LAYER;
             if (count_nee && candidates > 0 && u_run < run && !layer_skips)
             {
-                LayerShadow<S, M> shadow = vertex_shadow<S, M>(s, v, l, interior);
+                LayerShadow<S, M> shadow = vertex_shadow<S, M>(r, l, interior);
                 // Layers and scatters light from both sides.
                 PathVertex at = l.x;
                 if (l.kind != VERTEX_OPAQUE)

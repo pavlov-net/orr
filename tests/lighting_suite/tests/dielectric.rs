@@ -5,11 +5,11 @@
 use lighting_suite::bed::{
     Accumulated, Analytic, Bed, CLOUD_SPHERE, EMITTER_LUMINANCE, EXTENT, FLOOR, FURNACE_RADIANCE,
     GLASS_SPHERE, Item, LIGHT_FLOOR, MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, PRESENCE_VEIL,
-    PRESENCE_VEIL_OPACITY, Paths, ROUGH_SLAB, SUN, Spec, TINTED_SLAB, WATER_BOX, WATER_SIGMA,
+    PRESENCE_VEIL_OPACITY, Paths, ROUGH_SLAB, SUN, Spec, TINTED_SLAB, WATER_BOX, fresnel,
+    water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
 use lighting_suite::{assert_clean, pipeline, readback, render, run, upload};
-use orr_color::RgbPrimaries;
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::{
     DirectionalLight, DiscProfile, Light, PathEntry, ReferenceSettings, ViewLighting,
@@ -92,18 +92,6 @@ fn assert_close(what: &str, got: [f64; 3], wanted: [f64; 3], tolerance: f64) {
             "{what}: channel {c} {got:?} against {wanted:?}"
         );
     }
-}
-
-/// Unpolarized Fresnel reflectance into a medium `eta` times denser at incidence cosine `c`.
-fn fresnel(eta: f64, c: f64) -> f64 {
-    let s2 = (1.0 - c * c) / (eta * eta);
-    if s2 >= 1.0 {
-        return 1.0;
-    }
-    let t = (1.0 - s2).sqrt();
-    let rs = (c - eta * t) / (c + eta * t);
-    let rp = (t - eta * c) / (t + eta * c);
-    0.5 * (rs * rs + rp * rp)
 }
 
 #[test]
@@ -325,10 +313,7 @@ fn a_camera_inside_water_sees_its_absorption() {
     let sun = SUN.direction_to_light.normalize();
     let path = f64::from(eye.length() + top / sun.y);
     let leave = 1.0 - fresnel(1.0 / 1.33, f64::from(sun.y));
-    // The material's transmission color converts to Rec.2020 as every authored color does.
-    let color = WATER_SIGMA.map(|s| f64::from(-s).exp());
-    let m = RgbPrimaries::REC709.matrix_to(RgbPrimaries::REC2020);
-    let transmitted: [f64; 3] = std::array::from_fn(|r| (0..3).map(|k| m[r][k] * color[k]).sum());
+    let transmitted = water_transmission();
     let wanted: [f64; 3] = std::array::from_fn(|c| open[c] * leave * transmitted[c].powf(path));
     assert_close("under water", under, wanted, 0.05);
     assert_clean();

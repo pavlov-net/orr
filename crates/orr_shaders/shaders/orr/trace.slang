@@ -45,6 +45,9 @@ public struct Candidate
     public bool front_face;     // triangle candidates only
     public float3 object_origin;
     public float3 object_direction;
+    // Object-space corner positions where the handler asked for them (zero elsewhere and on
+    // Metal). The BLAS must allow data access.
+    public float3 object_positions[3];
 }
 
 // The committed hit of a trace. On a miss the index fields are zero and `cluster_id` is -1.
@@ -79,11 +82,16 @@ public struct AcceptAll : IAnyHit
     }
 }
 
-// Gives the transmittance of each non-opaque candidate for `trace_transmittance`.
+// Gives the transmittance of each non-opaque candidate for `trace_transmittance`. A
+// handler may keep state across the candidates of one trace.
 public interface ICandidate
 {
-    // 0 blocks the ray, 1 lets it through unchanged.
-    float3 transmittance(Candidate c);
+    // Whether `transmittance` reads the candidate's `object_positions`.
+    bool positions(Candidate c);
+    // 0 blocks the ray, 1 lets it through unchanged. `counted` is false for candidates
+    // that do not count toward the trace's `max_candidates`.
+    [mutating]
+    float3 transmittance(Candidate c, out bool counted);
 }
 
 // Decides candidates for `trace_resolve_translucent`: translucent layers resolve in depth
@@ -127,10 +135,10 @@ public bool trace_any<A : IAnyHit>(Tlas tlas, RayDesc ray, uint mask, uint flags
 }
 
 // The product of the transmittance of every non-opaque candidate along the ray, never
-// committing one. An opaque hit gives 0. After `max_candidates` candidates the trace ends
-// with the product so far and sets `overflow`.
+// committing one. An opaque hit gives 0. A counted candidate past the first
+// `max_candidates` ends the trace with the product so far and sets `overflow`.
 [ForceInline]
-public float3 trace_transmittance<H : ICandidate>(Tlas tlas, RayDesc ray, uint mask, uint flags, H handler, uint max_candidates, out bool overflow)
+public float3 trace_transmittance<H : ICandidate>(Tlas tlas, RayDesc ray, uint mask, uint flags, inout H handler, uint max_candidates, out bool overflow)
 {
     overflow = false;
     float3 product = 1;
@@ -139,14 +147,22 @@ public float3 trace_transmittance<H : ICandidate>(Tlas tlas, RayDesc ray, uint m
     begin(q, tlas, ray, mask, flags);
     while (q.Proceed())
     {
-        if (count == max_candidates)
+        Candidate c = candidate(q);
+        if (c.triangle && handler.positions(c))
+            candidate_positions(q, c.object_positions);
+        bool counted;
+        float3 t = handler.transmittance(c, counted);
+        if (counted)
         {
-            overflow = true;
-            q.Abort();
-            break;
+            if (count == max_candidates)
+            {
+                overflow = true;
+                q.Abort();
+                break;
+            }
+            count++;
         }
-        count++;
-        product *= handler.transmittance(candidate(q));
+        product *= t;
         if (all(product == 0))
         {
             q.Abort();
@@ -319,6 +335,9 @@ Candidate candidate(inout RayQuery<RAY_FLAG_NONE> q)
     c.front_face = c.triangle && q.CandidateTriangleFrontFace();
     c.object_origin = q.CandidateObjectRayOrigin();
     c.object_direction = q.CandidateObjectRayDirection();
+    c.object_positions[0] = 0;
+    c.object_positions[1] = 0;
+    c.object_positions[2] = 0;
     __target_switch
     {
     case metal:
@@ -351,6 +370,18 @@ Hit committed(inout RayQuery<RAY_FLAG_NONE> q)
         h.cluster_id = h.hit ? q.CommittedClusterID() : -1;
     }
     return h;
+}
+
+[ForceInline]
+void candidate_positions(inout RayQuery<RAY_FLAG_NONE> q, inout float3 p[3])
+{
+    __target_switch
+    {
+    case metal:
+        break;
+    default:
+        p = q.CandidateGetIntersectionTriangleVertexPositions();
+    }
 }
 
 [ForceInline]

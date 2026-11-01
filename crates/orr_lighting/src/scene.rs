@@ -113,6 +113,10 @@ pub struct LightingStats {
     pub environment_probability: f32,
     /// Pixels of the frame before whose light feedback named a light.
     pub feedback_pixels: u32,
+    /// Shadow rays of the frame before that met more non-opaque candidates (dielectric and
+    /// presence layers, particles, medium proxies) than the shadow product multiplies; each
+    /// kept the product so far.
+    pub shadow_overflows: u32,
     pub world_cache: WorldCacheStats,
 }
 
@@ -174,6 +178,7 @@ pub struct SceneLighting {
     tiles: Allocation<LightSample>,
     feedback_counts: Allocation<u32>,
     feedback_weights: Allocation<f32>,
+    shadow_overflows: Allocation<u32>,
     readback: Allocation<LightSetStats>,
     bake_roots: Ring<crate::shaders::environment::bake::Root>,
     directional_roots: Ring<directional::Root>,
@@ -230,6 +235,7 @@ impl SceneLighting {
             )?,
             feedback_counts: device_local(device, feedback_ids, "light feedback counts")?,
             feedback_weights: device_local(device, feedback_ids, "light feedback weights")?,
+            shadow_overflows: device_local(device, 1, "shadow overflows")?,
             readback: device.gpu_malloc(
                 MemoryKind::Readback,
                 FRAME_SLOTS as u64,
@@ -318,6 +324,7 @@ impl SceneLighting {
                 tiles: self.tiles.gpu(),
                 feedback_counts: self.feedback_counts.gpu(),
                 feedback_weights: self.feedback_weights.gpu(),
+                shadow_overflows: self.shadow_overflows.gpu(),
                 stats: self.readback.gpu().offset(slot as u64),
                 cluster_capacity: self.settings.emissive_clusters,
                 frame: pass.frame as u32,
@@ -325,6 +332,7 @@ impl SceneLighting {
                 clear_feedback: u32::from(std::mem::take(&mut self.clear_feedback)),
                 _pad0: 0,
                 _pad1: 0,
+                _pad2: 0,
             },
         );
 
@@ -389,6 +397,7 @@ impl SceneLighting {
                 dropped_entries: s.dropped_entries,
                 environment_probability: s.environment_probability,
                 feedback_pixels: s.feedback_pixels,
+                shadow_overflows: s.shadow_overflows,
                 world_cache: self.cache.stats(slot),
             }
         })

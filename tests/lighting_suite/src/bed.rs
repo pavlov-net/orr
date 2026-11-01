@@ -246,6 +246,25 @@ pub const CLOUD_SPHERE: &str = "cloud sphere";
 /// is exp(-[`WATER_SIGMA`]) in Rec.709.
 pub const WATER_BOX: &str = "water box";
 pub const WATER_SIGMA: [f32; 3] = [0.4, 0.2, 0.1];
+
+/// The water box's transmission color over 1 m in the linear Rec.2020 the kernels work in.
+pub fn water_transmission() -> [f64; 3] {
+    let color = WATER_SIGMA.map(|s| f64::from(-s).exp());
+    let m = orr_color::RgbPrimaries::REC709.matrix_to(orr_color::RgbPrimaries::REC2020);
+    std::array::from_fn(|r| (0..3).map(|k| m[r][k] * color[k]).sum())
+}
+
+/// Unpolarized Fresnel reflectance into a medium `eta` times denser at incidence cosine `c`.
+pub fn fresnel(eta: f64, c: f64) -> f64 {
+    let s2 = (1.0 - c * c) / (eta * eta);
+    if s2 >= 1.0 {
+        return 1.0;
+    }
+    let t = (1.0 - s2).sqrt();
+    let rs = (c - eta * t) / (c + eta * t);
+    let rp = (t - eta * c) / (t + eta * c);
+    0.5 * (rs * rs + rp * rp)
+}
 /// A black 2 m square facing +y with opacity [`PRESENCE_VEIL_OPACITY`], blended: a presence layer.
 pub const PRESENCE_VEIL: &str = "presence veil";
 pub const PRESENCE_VEIL_OPACITY: f32 = 0.25;

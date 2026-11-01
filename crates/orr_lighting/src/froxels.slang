@@ -24,6 +24,7 @@ import media;
 import light_sampling;
 import world_cache;
 import path;
+import shadow;
 
 // Separates the froxels' samples from the paths' of the same pixel.
 public static const uint FROXEL_STREAM = 0x85EBCA6B;
@@ -379,10 +380,8 @@ float3 froxel_local<S : ISurface, M : IMedium>(FroxelRoot r, uint3 f, float3 x, 
     float t_max = isfinite(chosen.distance) ? chosen.distance * (1.0 - 1e-4) : chosen.distance;
     RayCone cone = { 0.0, 0.0 };
     rays++;
-    float3 vis = visibility<S, M>(r.scene, r.view, x, chosen.dir, t_max, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0));
     // The baked environment carries the medium, as next-event estimation takes it.
-    if (chosen.kind == LIGHT_SAMPLE_ENVIRONMENT)
-        vis = select(vis > 0.0, float3(1.0), float3(0.0));
+    float3 vis = visibility<S, M>(r.scene, r.view, x, chosen.dir, t_max, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), chosen.kind != LIGHT_SAMPLE_ENVIRONMENT, set.shadow_overflows);
     return l * vis * (sum / chosen_target) * INV_FOUR_PI;
 }
 
@@ -434,7 +433,8 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column, 
                 float3 to_light = directional_sample(r.scene.lights[lights.ids[j]], u, cone_pdf);
                 RayCone cone = { 0.0, 0.0 };
                 rays++;
-                vis[j] = unoccluded<S>(r.scene, r.view, x, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0)) ? 1.0 : 0.0;
+                float3 t = visibility<S, M>(r.scene, r.view, x, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), false, r.set.shadow_overflows);
+                vis[j] = (t.x + t.y + t.z) / 3.0;
             }
             float a = held ? blend : 1.0;
             float a_vis = held && lights.changed == 0 ? blend : 1.0;
@@ -635,9 +635,7 @@ float3 reference_fog<S : ISurface, M : IMedium>(FroxelRoot r, uint2 pixel, float
                 float3 l = c.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, c.light, c.dir) : c.radiance;
                 float t_max = isfinite(c.distance) ? c.distance * (1.0 - 1e-4) : c.distance;
                 RayCone cone = { 0.0, 0.0 };
-                float3 vis = visibility<S, M>(s, r.view, x, c.dir, t_max, RAY_FLAG_NONE, hit_context(HIT_SECONDARY, 1, cone, 0.0));
-                if (c.kind == LIGHT_SAMPLE_ENVIRONMENT)
-                    vis = select(vis > 0.0, float3(1.0), float3(0.0));
+                float3 vis = visibility<S, M>(s, r.view, x, c.dir, t_max, RAY_FLAG_NONE, hit_context(HIT_SECONDARY, 1, cone, 0.0), c.kind != LIGHT_SAMPLE_ENVIRONMENT, set.shadow_overflows);
                 source += m.sigma_s * M.phase(data, m, dot(c.dir, dir)) * l * vis / c.pdf;
             }
             for (uint j = 0; j < set.directional_count; j++)
