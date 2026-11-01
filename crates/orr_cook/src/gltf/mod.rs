@@ -10,6 +10,9 @@
 //! joints and weights from `JOINTS_n`/`WEIGHTS_n`, and a primitive without a skin follows
 //! its nearest skeleton joint rigidly; skins and model selection do not mix.
 //!
+//! Nodes hidden by `KHR_node_visibility` or the core `visible` property of glTF 2.1 are not
+//! cooked, nor are their subtrees; hidden joints still pose their skins.
+//!
 //! Rigid parts come from the custom vertex attribute `PartAttribute::name` (integer, or
 //! float rounded to the nearest integer; 0 where a primitive lacks it). With skins the
 //! values are joints of the primitive's skin, pivots their bind positions and `Part::joint`
@@ -160,8 +163,8 @@ pub(crate) fn import(
         .or_else(|| doc.scenes().next())
         .ok_or_else(|| fail("no scene".into()))?;
     let graph = Graph::new(doc, &scene);
-    let mut skins: Vec<usize> = graph
-        .order
+    let shown = shown_nodes(&src.json, &graph);
+    let mut skins: Vec<usize> = shown
         .iter()
         .filter_map(|&n| {
             let node = doc.nodes().nth(n)?;
@@ -185,8 +188,8 @@ pub(crate) fn import(
         ));
     }
     let rigid = skeleton.as_ref().filter(|_| settings.parts_from_skin);
-    let (mut models, mut owner) = select_models(doc, &graph, settings).map_err(fail)?;
-    let instanced = instanced_nodes(&src, &graph).map_err(fail)?;
+    let (mut models, mut owner) = select_models(doc, &graph, &shown, settings).map_err(fail)?;
+    let instanced = instanced_nodes(&src, &graph, &shown).map_err(fail)?;
     if !instanced.is_empty() && skeleton.is_some() {
         return Err(fail("instanced nodes need a scene without skins".into()));
     }
@@ -623,11 +626,32 @@ pub(crate) fn import(
     })
 }
 
-/// Nodes with `EXT_mesh_gpu_instancing` and a mesh, in scene order, with each instance's
-/// scene-space transform: the node's world transform times the instance's TRS.
-fn instanced_nodes(src: &data::Document, graph: &Graph) -> Result<Vec<(usize, Vec<Mat4>)>, String> {
-    let mut out = Vec::new();
+/// The scene's nodes in [`Graph::order`] without those hidden, with their subtrees, by
+/// `KHR_node_visibility` or the core `visible` property of glTF 2.1.
+fn shown_nodes(json: &serde_json::Value, graph: &Graph) -> Vec<usize> {
+    let mut hidden = vec![false; graph.parent.len()];
+    let mut shown = Vec::with_capacity(graph.order.len());
     for &n in &graph.order {
+        let node = &json["nodes"][n];
+        hidden[n] = node["visible"] == false
+            || node["extensions"]["KHR_node_visibility"]["visible"] == false
+            || graph.parent[n].is_some_and(|p| hidden[p]);
+        if !hidden[n] {
+            shown.push(n);
+        }
+    }
+    shown
+}
+
+/// Visible nodes with `EXT_mesh_gpu_instancing` and a mesh, in scene order, with each
+/// instance's scene-space transform: the node's world transform times the instance's TRS.
+fn instanced_nodes(
+    src: &data::Document,
+    graph: &Graph,
+    shown: &[usize],
+) -> Result<Vec<(usize, Vec<Mat4>)>, String> {
+    let mut out = Vec::new();
+    for &n in shown {
         let Some(ext) = src.json["nodes"][n]
             .get("extensions")
             .and_then(|e| e.get("EXT_mesh_gpu_instancing"))
@@ -681,10 +705,11 @@ fn instanced_nodes(src: &data::Document, graph: &Graph) -> Result<Vec<(usize, Ve
     Ok(out)
 }
 
-/// The models to build and, per glTF node, the model it belongs to.
+/// The models to build and, per visible glTF node, the model it belongs to.
 fn select_models(
     doc: &gltf::Document,
     graph: &Graph,
+    shown: &[usize],
     settings: &GltfSettings,
 ) -> Result<(Vec<Building>, Vec<Option<usize>>), String> {
     let parts = settings
@@ -692,16 +717,17 @@ fn select_models(
         .as_ref()
         .map_or(0, |p| usize::from(p.parts));
     let building = |node, from_scene| Building::new(node, from_scene, parts);
-    let n = graph.parent.len();
+    let mut owner: Vec<Option<usize>> = vec![None; graph.parent.len()];
     if settings.models.is_empty() {
-        let owner = (0..n).map(|i| graph.in_scene[i].then_some(0)).collect();
+        for &i in shown {
+            owner[i] = Some(0);
+        }
         return Ok((vec![building(None, Mat4::IDENTITY)], owner));
     }
     let mut models = Vec::new();
-    let mut owner: Vec<Option<usize>> = vec![None; n];
     let mut names: Vec<&str> = Vec::new();
     let mut matched = vec![false; settings.models.len()];
-    for &i in &graph.order {
+    for &i in shown {
         if let Some(m) = graph.parent[i].and_then(|p| owner[p]) {
             owner[i] = Some(m);
             continue;
