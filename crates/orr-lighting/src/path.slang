@@ -57,6 +57,9 @@ public static const float WALK_FOOTPRINT = 0.25;
 // Separates a walk's samples from the path's.
 public static const uint WALK_STREAM = 0x85EBCA6B;
 
+// Separates the pixel subset's sample from the path's.
+public static const uint SUBSET_STREAM = 0x27D4EB2F;
+
 // Separates an update path's samples from the opaque path's of the same pixel.
 public static const uint UPDATE_STREAM = 0x9E3779B9;
 
@@ -120,7 +123,9 @@ public struct PathRoot
     public uint sss_max_steps;
     public CapTail* cap_tail;
     public uint sss_flags;
-    public uint _pad0;
+    // Share of surface pixels whose path runs, in (0, 1]; each runs with this probability
+    // and divides its path's estimate by it.
+    public float pixel_fraction;
 }
 
 // What the dielectric dispatch leaves the guide resolve of a pixel's first dielectric or
@@ -946,8 +951,16 @@ void skip_points<C : ICoherence>(PathRoot r)
         C.point(coherence_key(false, 0, 0), KEY_BITS);
 }
 
+// Whether `pixel`'s opaque path runs this frame, with probability `PathRoot.pixel_fraction`.
+bool runs_path(PathRoot r, uint2 pixel)
+{
+    Sampler subset = Sampler(pixel, r.frame, r.seed ^ SUBSET_STREAM);
+    return r.pixel_fraction >= 1.0 || subset.next() < r.pixel_fraction;
+}
+
 // The opaque dispatch's body for `pixel`: sky pixels take the linked environment and the
-// directional discs; surfaces the G-buffer's emission and their path.
+// directional discs; surfaces the G-buffer's emission and their path, which runs on a random
+// `pixel_fraction` share of them each frame.
 public void opaque_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMedium>(PathRoot r, uint2 pixel)
 {
     ViewConstants* v = r.view;
@@ -983,10 +996,12 @@ public void opaque_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
             else
                 radiance = float3(float(cell.level), found ? 1.0 : 0.0, unit_float(cache_hash(cell.key) * 2654435761u));
         }
+        else if (!runs_path(r, pixel))
+            skip_points<C>(r);
         else
         {
             ViewPath view_path = ViewPath(pcg3d(uint3(pixel, r.frame ^ r.seed)).x);
-            radiance += pre_exposure * trace_path<C, S, M>(r, x1, pixel, rng, rays, view_path);
+            radiance += pre_exposure / r.pixel_fraction * trace_path<C, S, M>(r, x1, pixel, rng, rays, view_path);
             feedback = view_path.feedback;
         }
     }

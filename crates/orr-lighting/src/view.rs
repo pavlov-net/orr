@@ -47,6 +47,12 @@ pub struct ViewLighting {
     pub sss_max_steps: u32,
     /// Which subsurface vertices of a path walk.
     pub sss_depth: SubsurfaceDepth,
+    /// Share of surface pixels whose opaque path runs, clamped to
+    /// [[`MIN_PIXEL_FRACTION`], 1]. Each frame every surface pixel runs its path with this
+    /// probability, chosen independently per pixel, and divides the path's estimate by it;
+    /// the others keep their emission and add no path. Sky pixels and the dielectric, media
+    /// and guide passes run on every pixel.
+    pub pixel_fraction: f32,
     /// The dielectric whose interior holds the eye; each pixel flips it at every dielectric
     /// surface between the eye and its near-plane point, so a near plane straddling the
     /// surface works.
@@ -68,6 +74,7 @@ impl Default for ViewLighting {
             dielectric_depth: 4,
             sss_max_steps: 16,
             sss_depth: SubsurfaceDepth::FirstEvent,
+            pixel_fraction: 1.0,
             camera_medium: None,
             media: MediaSettings::default(),
             guides: GuideSettings::default(),
@@ -196,6 +203,9 @@ pub struct ThinLens {
 /// Largest [`ViewLighting::local_light_share`]: the scene's selection keeps a share, so every
 /// light stays reachable.
 pub const MAX_LOCAL_LIGHT_SHARE: f32 = 0.9;
+
+/// Smallest [`ViewLighting::pixel_fraction`].
+pub const MIN_PIXEL_FRACTION: f32 = 1.0 / 16.0;
 
 /// Pixels per side of the screen tiles that share a local light sampler (`light_sampling`'s
 /// `LOCAL_TILE`).
@@ -809,7 +819,7 @@ impl LightingKernels {
                 SubsurfaceDepth::FirstEvent => 0,
                 SubsurfaceDepth::PrimaryOnly => SSS_PRIMARY_ONLY,
             },
-            _pad0: 0,
+            pixel_fraction: lighting.pixel_fraction.clamp(MIN_PIXEL_FRACTION, 1.0),
         };
         let root = view.roots.write(slot, path_root);
         view.path = Some((pass.frame, path_root));
