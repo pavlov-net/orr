@@ -31,6 +31,7 @@ import lights;
 import light_sampling;
 import world_cache;
 import path;
+import subsurface;
 import guides;
 import froxels;
 
@@ -277,15 +278,25 @@ public struct VertexScatter : IScatter
     public bool phase;
     public float3 travel;           // a scatter's: the path's direction into it
     public float anisotropy;
+    public bool exit;               // a walk's exit, which scatters as `walk`
+    public WalkExitScatter walk;
 
     public float3 eval(float3 wi)
     {
-        return phase ? float3(hg_phase(anisotropy, dot(travel, wi))) : b.eval(wi);
+        if (phase)
+            return float3(hg_phase(anisotropy, dot(travel, wi)));
+        if (exit)
+            return walk.eval(wi);
+        return b.eval(wi);
     }
 
     public float pdf(float3 wi)
     {
-        return phase ? hg_phase(anisotropy, dot(travel, wi)) : b.pdf(wi);
+        if (phase)
+            return hg_phase(anisotropy, dot(travel, wi));
+        if (exit)
+            return walk.pdf(wi);
+        return b.pdf(wi);
     }
 }
 
@@ -356,12 +367,19 @@ public bool thin_walled(GSurface s)
     return (s.bsdf.flags & BSDF_THIN_WALLED) != 0;
 }
 
+// The parameters of layer or opaque vertex `l` at path depth `depth`.
+public BsdfParams vertex_params(LayerVertex l, uint depth)
+{
+    return depth > 1 ? bsdf_collapse(l.x.surface.bsdf) : l.x.surface.bsdf;
+}
+
 // The BSDF of layer or opaque vertex `l` at path depth `depth`, against the interior list the
 // path arrived with: a layer's exterior IOR is the innermost other entry's, an opaque
-// vertex's the innermost entry's, so a pool floor meets water.
-public Bsdf prepare_vertex(SceneRoot* s, LayerVertex l, Interior interior, uint depth)
+// vertex's the innermost entry's, so a pool floor meets water. Unless the vertex `walks`, its
+// subsurface share is diffuse reflection.
+public Bsdf prepare_vertex(SceneRoot* s, LayerVertex l, Interior interior, uint depth, bool walks = true)
 {
-    BsdfParams p = depth > 1 ? bsdf_collapse(l.x.surface.bsdf) : l.x.surface.bsdf;
+    BsdfParams p = walk_params(vertex_params(l, depth), walks);
     uint m = l.x.surface.material;
     uint outside = l.kind == VERTEX_LAYER ? interior.outside(m, m) : interior.innermost();
     return bsdf_prepare(p, l.x.surface.normal, l.x.view, interior_ior(s, outside));
@@ -424,10 +442,10 @@ struct LayerRay
     bool local;                     // left the first vertex, which reads its tile's local light sampler
 }
 
-// Iterations of a dielectric path: a vertex and its ray each.
+// Iterations of a dielectric path: a vertex and its ray each, and one subsurface walk.
 public uint layer_iterations(PathRoot r)
 {
-    return r.max_bounces + 2 + r.dielectric_depth;
+    return r.max_bounces + 3 + r.dielectric_depth;
 }
 
 // The path from `first`, its camera segment applied in `throughput`, with `interior` the list
@@ -447,9 +465,10 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
 
     LayerVertex l = first;
     uint depth = 0;
-    Bsdf b = prepare_vertex(s, l, interior, depth);
     RayCone cone = camera_cone(v);
     cone.width = cone_width(cone, l.x.camera_distance);
+    bool walked = false;
+    Bsdf b = prepare_vertex(s, l, interior, depth, l.kind == VERTEX_OPAQUE && may_walk(r, l.x.surface, depth, walked, cone.width));
     float3 radiance = float3(0.0);
     bool alive = l.kind == VERTEX_SCATTER || (l.x.surface.flags & GBUFFER_UNLIT) == 0;
     // Opaque vertices and scatters so far, which the bounce settings count.
@@ -461,11 +480,17 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
     // A scatter that took the cache's light: it estimates its direct light and ends.
     bool last = false;
     bool first_opaque = l.kind != VERTEX_OPAQUE;
+    // Set while `l` is a walk's exit, which scatters as `exit_scatter`.
+    bool exit = false;
+    WalkExitScatter exit_scatter = (WalkExitScatter)0;
     LayerRay ray = (LayerRay)0;
 
+    // A walk takes an iteration of its own, and its exit vertex the next one at the same
+    // depth.
     for (uint i = 0; i < layer_iterations(r); i++)
     {
-        bool counted = r.mode == PATH_DIRECT ? depth == 0 : r.mode == PATH_INDIRECT ? depth > 0 : true;
+        bool counted = r.mode == PATH_DIRECT ? depth == 0 : r.mode == PATH_INDIRECT ? depth > 0
+            : r.mode == PATH_SUBSURFACE ? walked : true;
         if (alive && l.kind != VERTEX_LAYER && opaque > r.max_bounces + 1)
             alive = false;
         Hit h = (Hit)0;
@@ -476,7 +501,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             LocalLights* local = nullptr;
             if (depth == 0)
                 local = pixel_local_lights(r, pixel);
-            float run = medium_vertex ? 1.0 : nee_probability(set, l.x.surface);
+            float run = medium_vertex || exit ? 1.0 : nee_probability(set, l.x.surface);
             float u_run = rng.next();
             uint candidates = depth == 0 ? r.primary_candidates : r.bounce_candidates;
             bool layer_skips = skip_direct && l.kind == VERTEX_LAYER;
@@ -488,7 +513,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
                 if (l.kind != VERTEX_OPAQUE)
                     at.surface.normal = float3(0.0);
                 uint light;
-                VertexScatter f = { b, medium_vertex, -l.x.view, l.anisotropy };
+                VertexScatter f = { b, medium_vertex, -l.x.view, l.anisotropy, exit, exit_scatter };
                 float3 e = shade_vertex_nee(r, at, f, shadow, run, pixel, local, depth, candidates, one_technique, rng, rays, light);
                 if (counted)
                     radiance += throughput * e;
@@ -496,6 +521,8 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             if (last)
                 alive = false;
         }
+        bool walking = false;
+        WalkExit walk = (WalkExit)0;
         if (alive)
         {
             float3 wi;
@@ -514,8 +541,12 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             }
             else
             {
-                BsdfSample bs = b.sample(u.xyz);
-                alive = bs.pdf > 0.0 && (bs.lobe & LOBE_VOLUME) == 0;
+                BsdfSample bs;
+                if (exit)
+                    bs = walk_exit_sample(exit_scatter, rng);
+                else
+                    bs = b.sample(u.xyz);
+                alive = bs.pdf > 0.0;
                 wi = bs.wi;
                 pdf = bs.pdf;
                 throughput *= bs.weight;
@@ -523,24 +554,34 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
                 diffuse = (bs.lobe & LOBE_DIFFUSE) != 0;
                 float roughness = l.x.surface.bsdf.specular_roughness;
                 spread = delta ? 0.0 : diffuse ? 1.0 : 2.0 * roughness * roughness;
+                // The walk takes the place of an opaque vertex's ray.
+                walking = alive && (bs.lobe & LOBE_VOLUME) != 0;
                 crossed = l.kind == VERTEX_LAYER && (bs.lobe & LOBE_TRANSMISSION) != 0 && !thin_walled(l.x.surface)
                     && (s.materials[l.x.surface.material].flags & MATERIAL_DIELECTRIC) != 0;
             }
-            if (alive && l.kind != VERTEX_LAYER && opaque > r.roulette_depth)
+            if (alive && !walking && l.kind != VERTEX_LAYER && opaque > r.roulette_depth)
             {
                 float keep = saturate(max(throughput.x, max(throughput.y, throughput.z)));
                 alive = u_roulette < keep;
                 throughput /= max(keep, 1e-6);
             }
             alive = alive && any(throughput > 0.0) && all(isfinite(throughput));
-            if (alive)
+            if (alive && walking)
+            {
+                walk = walk_from<S>(r, l.x, vertex_params(l, depth), wi, depth, rng, rays);
+                throughput *= walk.throughput;
+                alive = walk.kind != WALK_NONE;
+                h = walk.hit;
+                positions = walk.positions;
+            }
+            else if (alive)
             {
                 if (crossed)
                     interior.cross(l.x.surface.material, l.front);
                 ray.origin = vertex_origin(l.x, wi);
                 ray.dir = wi;
                 ray.pdf = delta ? 0.0 : pdf;
-                ray.run = count_nee ? (l.kind == VERTEX_SCATTER ? 1.0 : nee_probability(set, l.x.surface)) : 0.0;
+                ray.run = count_nee ? (l.kind == VERTEX_SCATTER || exit ? 1.0 : nee_probability(set, l.x.surface)) : 0.0;
                 ray.normal = l.kind == VERTEX_OPAQUE ? l.x.surface.normal : float3(0.0);
                 ray.diffuse = diffuse;
                 ray.chain = l.kind != VERTEX_OPAQUE;
@@ -559,6 +600,27 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
         C.point(alive ? path_key(s, h) : coherence_key(false, 0, 0), KEY_BITS);
         if (!alive)
             continue;
+        exit = false;
+        if (walking)
+        {
+            walked = true;
+            BsdfParams p = vertex_params(l, depth);
+            if (walk.kind == WALK_BOUNDARY)
+            {
+                HitContext context = hit_context(HIT_SECONDARY, depth + 1, cone, h.t);
+                SurfaceHit sh = resolve_hit<S>(s, v, walk.dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, context);
+                alive = sh.valid;
+                if (alive)
+                    l = opaque_vertex(exit_vertex(v, sh, walk.dir));
+                if (alive && sh.surface.bsdf.subsurface_weight > 0.0)
+                    p = sh.surface.bsdf;
+            }
+            else
+                l.x.view = l.x.surface.normal;
+            exit = true;
+            exit_scatter = walk_exit(l.x, p, rng);
+            continue;
+        }
         depth++;
 
         // The segment: an interior's Beer or scatter, else the linked medium.
@@ -653,7 +715,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             l = opaque_vertex(x);
             opaque++;
         }
-        b = prepare_vertex(s, l, interior, depth);
+        b = prepare_vertex(s, l, interior, depth, !layer && may_walk(r, l.x.surface, depth, walked, cone.width));
         // Emission seen from the front. Cooked emitters are reached by BSDF rays alone; the
         // light set samples producer entries, so their emission is weighed against it.
         uint entry;
@@ -976,20 +1038,20 @@ public void dielectric_body<C : ICoherence, S : ISurface, E : IEnvironment, M : 
         }
         path = sh.valid;
         layers = 1;
-        if (path && r.mode != PATH_INDIRECT && l.front)
+        if (path && r.mode != PATH_INDIRECT && r.mode != PATH_SUBSURFACE && l.front)
             radiance += throughput * emission;
     }
     else if (surface)
     {
         l = opaque_vertex(xg);
         // The G-buffer's emission is already pre-exposed.
-        if (r.mode != PATH_INDIRECT)
+        if (r.mode != PATH_INDIRECT && r.mode != PATH_SUBSURFACE)
             exposed += throughput * prepare_vertex(s, l, interior, 0).emission();
     }
     else
     {
         path = false;
-        if (r.mode != PATH_INDIRECT)
+        if (r.mode != PATH_INDIRECT && r.mode != PATH_SUBSURFACE)
             radiance += throughput * sky_radiance<E, M>(set, eye, dir);
     }
     if (path)

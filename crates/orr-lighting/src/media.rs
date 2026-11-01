@@ -449,7 +449,8 @@ impl MediaKernels {
             | LightingDebugView::WorldCache
             | LightingDebugView::WorldCacheLod
             | LightingDebugView::Guide(_)
-            | LightingDebugView::DielectricLayer => MEDIA_OFF,
+            | LightingDebugView::DielectricLayer
+            | LightingDebugView::Subsurface => MEDIA_OFF,
             _ => MEDIA_COMPOSE,
         };
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;

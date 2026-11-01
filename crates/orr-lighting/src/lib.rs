@@ -24,12 +24,15 @@
 //! [`LightingKernels::record_media_apply`] composes the froxels with the radiance; and
 //! [`LightingKernels::record_guides`] writes the view's ray reconstruction guides. The `path`
 //! module holds the opaque path, `dielectric` the dielectric one and `froxels` the froxel
-//! passes, for kernels that trace more.
+//! passes, for kernels that trace more. Both paths walk the interior of a subsurface surface
+//! at its first vertex on the path (see [`ViewLighting::sss_depth`]); `subsurface` holds the
+//! walk.
 
 mod bsdf;
 mod environment;
 mod media;
 mod scene;
+mod subsurface;
 mod view;
 mod world_cache;
 
@@ -43,10 +46,11 @@ pub use scene::{
     ScenePass, WorldCacheSettings,
 };
 pub use shaders::types::{
-    DirectionalState, EmissiveSelection, EnvironmentGpu, FroxelLights, FroxelRoot, GuideRoot,
-    LayerGuide, LightSample, LightSetGpu, LightSetStats, LocalLights, MediaStatsGpu, PathRoot,
-    WorldCacheGpu,
+    CapTail, DirectionalState, EmissiveSelection, EnvironmentGpu, FroxelLights, FroxelRoot,
+    GuideRoot, LayerGuide, LightSample, LightSetGpu, LightSetStats, LocalLights, MediaStatsGpu,
+    PathRoot, WorldCacheGpu,
 };
+pub use subsurface::{CapTailTable, SSS_STEPS, SubsurfaceDepth};
 pub use view::{
     CameraJump, GuideKind, GuideSettings, LightingDebugView, LightingKernels, LightingView,
     MAX_LOCAL_LIGHT_SHARE, ReferenceSettings, ThinLens, ViewLighting, ViewPass,

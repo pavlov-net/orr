@@ -27,6 +27,11 @@ impl Rng {
         (self.next_u32() >> 8) as f32 / 16_777_216.0
     }
 
+    /// Uniform in [0, 1), at f64 precision.
+    pub fn f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
     /// Uniform in [lo, hi).
     pub fn range(&mut self, lo: f32, hi: f32) -> f32 {
         lo + (hi - lo) * self.f32()

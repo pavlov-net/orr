@@ -186,7 +186,11 @@ fn slices_map_distances_and_back() {
     let p = pipeline(&froxel_probe::MODULE, "main");
     let mut list = render().command_list().unwrap();
     list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-    list.dispatch(&p, root.gpu(), [(distances.len() as u32).div_ceil(64), 1, 1]);
+    list.dispatch(
+        &p,
+        root.gpu(),
+        [(distances.len() as u32).div_ceil(64), 1, 1],
+    );
     finish(list);
     for (t, [c, back]) in distances.iter().zip(out.as_slice().unwrap()) {
         let expected = 64.0 * (t / near_range).sqrt();

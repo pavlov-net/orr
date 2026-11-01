@@ -855,6 +855,34 @@ public SubsurfaceVolume bsdf_subsurface_volume(BsdfParams p)
     return r;
 }
 
+// One estimate of the share of what reaches a subsurface material's surface from inside
+// that leaves toward `wi` (unit, on the side of shading normal `n`): the weight of the walk
+// lobe, prepared from `wi`, for the direction `u` samples from it, over the subsurface
+// weight. Its mean over `u` is the walk lobe's directional albedo from `wi`, so the
+// interface and the layers above it as light from `wi` crosses them. 0 for materials
+// without a walk lobe.
+public float3 bsdf_walk_exit(BsdfParams p, float3 n, float3 wi, float3 u)
+{
+    p.scale = float3(1.0);
+    Bsdf s = bsdf_prepare(p, n, wi);
+    float sss = max3(s.walk);
+    if (!(sss > 0.0))
+        return float3(0.0);
+    BsdfSample e = s.subsurface_entry(u);
+    return e.pdf > 0.0 ? e.weight / sss : float3(0.0);
+}
+
+// `p` with its subsurface share shaded as diffuse reflection in the subsurface color, the
+// limit of a vanishing mean free path. Thin-walled materials are left as they are.
+public BsdfParams bsdf_subsurface_diffuse(BsdfParams p)
+{
+    if ((p.flags & BSDF_THIN_WALLED) != 0)
+        return p;
+    p.base_color = lerp(p.base_color, p.subsurface_color, p.subsurface_weight);
+    p.subsurface_weight = 0.0;
+    return p;
+}
+
 // Prepares `p` at shading normal `n` (unit) seen along `wo` (unit, toward the viewer), with
 // `exterior_ior` the medium on the side `n` points to. A view within 1e-4 of the surface
 // plane leans up to it.
