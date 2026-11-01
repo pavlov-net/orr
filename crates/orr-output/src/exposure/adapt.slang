@@ -1,6 +1,7 @@
 // Turns the meter's histogram and the scene's sky statistics into this render's exposure and
 // white point: reads the view's current exposure slot, writes the next one, the white
-// balance matrix and the telemetry, and clears the histogram for the next frame.
+// balance matrix, local exposure's pivot and the telemetry, and clears the histogram for the
+// next frame.
 #include "orr/root.h"
 import orr.abi;
 import orr.color;
@@ -93,8 +94,9 @@ struct Root
     ExposureTelemetryGpu* telemetry;
     // Rows of the white balance matrix on linear Rec.2020, which tonemap applies.
     float4* white_balance;
-    uint _pad0;
-    uint _pad1;
+    // Local exposure's pivot: the histogram mean EV100, and 1 once one was metered; held while
+    // the histogram is empty. Null without local exposure.
+    float2* local_pivot;
 }
 ORR_ROOT(Root);
 
@@ -239,8 +241,10 @@ void main()
     bool white = p.white_balance != 0;
     Metered m = { 0.0, 0.0, D65_XY };
     bool histogram = false;
-    if (p.mode == MODE_AUTO || white)
+    if (p.mode == MODE_AUTO || white || root.local_pivot != nullptr)
         histogram = histogram_mean(p, m);
+    if (histogram && root.local_pivot != nullptr)
+        *root.local_pivot = float2(m.ev100, 1.0);
     bool metered = p.mode == MODE_AUTO && histogram;
     float metered_ev100 = m.ev100;
 

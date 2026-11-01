@@ -3,7 +3,8 @@
 use orr_scene::LensDistortion;
 
 use crate::{
-    AutoWhiteBalance, CalibrationPattern, DofPath, Exposure, Grade, Gt7Params, ScreenshotRequest,
+    AutoWhiteBalance, CalibrationPattern, DofPath, Exposure, Grade, Gt7Params, LocalExposure,
+    ScreenshotRequest,
 };
 
 /// Output's settings for one view, passed with each render of it.
@@ -12,6 +13,8 @@ pub struct ViewOutput {
     pub exposure: Exposure,
     /// Off by default.
     pub white_balance: Option<AutoWhiteBalance>,
+    /// Off by default: GT7's global operator is the target look.
+    pub local_exposure: Option<LocalExposure>,
     pub grade: Grade,
     pub gt7: Gt7Params,
     pub post: PostQuality,

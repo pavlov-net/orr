@@ -58,3 +58,13 @@ public float adapt_ev100(float current, float target, float speed_up, float spee
         return current + sign(d) * min(speed * dt, abs(d));
     return current + d * (1.0 - exp(-speed * dt / exponential_ev));
 }
+
+// Local exposure's bilateral grid over the view: cells of LOCAL_CELL x LOCAL_CELL pixels, and
+// per cell LOCAL_BINS bins of scene EV100 spread evenly over the histogram's range. The
+// meter sums into each bin the pixel count and the pixels' EV100 above the range's bottom,
+// in 1/LOCAL_EV_STEPS EV, as two words; blurred, each bin holds float2(that EV sum in EV,
+// the count).
+public static const uint LOCAL_CELL = 32;
+public static const uint LOCAL_BINS = 16;
+public static const float LOCAL_EV_STEPS = 4096.0;
+

@@ -1,5 +1,5 @@
-//! Display output for orr: exposure, white balance, tonemapping, the display target,
-//! frame generation and presentation.
+//! Display output for orr: exposure, local exposure, white balance, tonemapping, the display
+//! target, frame generation and presentation.
 
 mod display;
 #[cfg(windows)]
@@ -12,6 +12,7 @@ mod frame_generation;
 mod glare;
 mod gt7;
 mod hooks;
+mod local_exposure;
 mod motion_blur;
 mod passes;
 #[cfg(all(windows, feature = "pcl-stats"))]
@@ -34,9 +35,9 @@ pub use display_watch::DisplayWatch;
 pub use dof::{DepthOfFieldPass, DofGuideImages, DofPath};
 pub use encode::{pq_decode, pq_encode, srgb_decode, srgb_encode};
 pub use exposure::{
-    AutoExposure, CompensationCurve, Exposure, ExposureTelemetry, Grade, MID_GREY, MeterWeights,
-    Physiological, SkyTelemetry, ev100_from_exposure, ev100_from_luminance, exposure_from_ev100,
-    keyed_ev100, luminance_from_ev100,
+    AutoExposure, CompensationCurve, Exposure, ExposureTelemetry, Grade, LocalExposure, MID_GREY,
+    MeterWeights, Physiological, SkyTelemetry, ev100_from_exposure, ev100_from_luminance,
+    exposure_from_ev100, keyed_ev100, luminance_from_ev100,
 };
 pub use frame_generation::FrameGenerationMode;
 pub use glare::{GlareComposite, GlarePass};

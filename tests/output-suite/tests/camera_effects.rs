@@ -1661,19 +1661,21 @@ mod lens_distortion {
             let whole = TextureRegion::whole_mip(self.source.desc(), 0);
             list.copy_to_texture(&self.source, &whole, self.upload.gpu().cast());
             list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
+            self.kernels
+                .exposure(
+                    &mut list,
+                    &mut self.output,
+                    &ExposurePass {
+                        source: self.source_index,
+                        extent: OUT,
+                        view: self.constants.gpu(),
+                        sky: self.sky.gpu(),
+                        frame: self.frame,
+                        output: &output,
+                    },
+                )
+                .unwrap();
             let roots = self.output.roots(self.frame);
-            self.kernels.exposure(
-                &mut list,
-                roots,
-                &ExposurePass {
-                    source: self.source_index,
-                    extent: OUT,
-                    view: self.constants.gpu(),
-                    sky: self.sky.gpu(),
-                    frame: self.frame,
-                    output: &output,
-                },
-            );
             self.kernels.tonemap(
                 &mut list,
                 roots,

@@ -282,19 +282,21 @@ impl View {
                 hook,
             );
         }
+        self.kernels
+            .exposure(
+                &mut list,
+                &mut self.output,
+                &ExposurePass {
+                    source: self.chain.rr_output,
+                    extent: OUT,
+                    view,
+                    sky: self.sky.gpu(),
+                    frame: self.frame,
+                    output: &output,
+                },
+            )
+            .unwrap();
         let roots = self.output.roots(self.frame);
-        self.kernels.exposure(
-            &mut list,
-            roots,
-            &ExposurePass {
-                source: self.chain.rr_output,
-                extent: OUT,
-                view,
-                sky: self.sky.gpu(),
-                frame: self.frame,
-                output: &output,
-            },
-        );
         self.kernels.tonemap(
             &mut list,
             roots,

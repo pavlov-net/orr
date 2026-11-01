@@ -546,19 +546,21 @@ mod lens_distortion {
                 [OUT[0].div_ceil(8), OUT[1].div_ceil(8), 1],
             );
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+            self.kernels
+                .exposure(
+                    list,
+                    &mut self.output,
+                    &ExposurePass {
+                        source: self.radiance.sampled,
+                        extent: OUT,
+                        view: self.constants.gpu(),
+                        sky: self.sky.gpu(),
+                        frame: self.frame,
+                        output: &output,
+                    },
+                )
+                .unwrap();
             let roots = self.output.roots(self.frame);
-            self.kernels.exposure(
-                list,
-                roots,
-                &ExposurePass {
-                    source: self.radiance.sampled,
-                    extent: OUT,
-                    view: self.constants.gpu(),
-                    sky: self.sky.gpu(),
-                    frame: self.frame,
-                    output: &output,
-                },
-            );
             self.kernels.tonemap(
                 list,
                 roots,

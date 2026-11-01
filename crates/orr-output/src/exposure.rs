@@ -185,6 +185,17 @@ impl CompensationCurve {
     }
 }
 
+/// Local exposure: each pixel's exposure moves with its base, the view's luminance blurred
+/// over about 64 pixels without crossing edges of more than a few stops (a bilateral grid of
+/// log luminance). Bases away from the histogram's mean are pulled toward it by `strength`
+/// stops per stop; detail around the base is kept. An image whose base is uniform is
+/// unchanged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LocalExposure {
+    /// 0 is global exposure alone, 1 flattens the base.
+    pub strength: f32,
+}
+
 /// A per-view exposure bias and colour matrix on linear Rec.2020, applied after metering and
 /// before GT7, so the meter never cancels them.
 #[derive(Clone, Copy, Debug, PartialEq)]
