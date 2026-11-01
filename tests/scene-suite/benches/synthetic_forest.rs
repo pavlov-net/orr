@@ -719,7 +719,7 @@ impl Forest {
                 &Default::default(),
             )
             .unwrap();
-        let history = r.create_view_history().unwrap();
+        let history = r.create_raster_view_history().unwrap();
         let list = [scene];
         let f = r
             .begin_frame(FrameDesc {

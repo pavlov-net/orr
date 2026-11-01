@@ -114,7 +114,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             &SceneLightingSettings::default(),
         )
         .expect("scene");
-    let history = renderer.create_view_history().expect("view history");
+    let history = renderer.create_raster_view_history().expect("view history");
     let models = [MODEL, GROUND].map(|name| {
         renderer
             .model(mount, AssetId::from_name(name))

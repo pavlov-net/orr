@@ -381,6 +381,13 @@ impl Renderer {
         Ok(id)
     }
 
+    /// History for a camera that only [`Frame::raster_view`] renders: its previous camera
+    /// and exposure slots, without lighting or output state, so it compiles no path tracing
+    /// pipelines. [`Frame::render_view`] refuses it.
+    pub fn create_raster_view_history(&mut self) -> Result<ViewHistoryId> {
+        Ok(self.scenes.create_view_history()?)
+    }
+
     /// The transient targets of the view's last render and the memory they take
     /// ([`RendererDesc::alias_view_targets`]).
     pub fn view_arena_report(&self, history: ViewHistoryId) -> Option<ArenaReport> {
@@ -598,6 +605,9 @@ impl<'a> Frame<'a> {
         output: &ViewOutput,
         hooks: &mut ViewHooks<'_>,
     ) -> Result<RenderedView> {
+        if !self.output.views.contains_key(&view.history) {
+            return Err(SceneError::UnknownViewHistory(view.history).into());
+        }
         let render = view.render_extent.to_array();
         let sdr = DisplayRequest::default().resolve(&[OutputFormat::Sdr], None, false);
         let mut display = match view.target {
@@ -639,7 +649,7 @@ impl<'a> Frame<'a> {
             .output
             .views
             .get_mut(&view.history)
-            .ok_or(SceneError::UnknownViewHistory(view.history))?;
+            .expect("checked above");
         arena.enter(ViewStep::Lighting, list);
 
         let lights = &mut *self.lighting;

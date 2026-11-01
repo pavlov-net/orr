@@ -63,7 +63,8 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
     let _workers = Workers::new(renderer.loading(), 2);
     let showcase = Showcase::load(&mut renderer, gpu);
-    let (scene, history) = (showcase.scene, showcase.history);
+    let scene = showcase.scene;
+    let history = renderer.create_view_history().expect("view history");
     let frame = showcase.frame;
     let listed = [scene];
 

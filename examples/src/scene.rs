@@ -10,7 +10,7 @@ use orr::orr_pack::{AssetId, Target};
 use orr::{
     Affine3, DirectionalLight, DiscProfile, FrameDesc, GroupWriter, InstanceFlags, InstancesDesc,
     Light, LightId, PackSource, Renderer, SceneDesc, SceneId, SceneLightingSettings,
-    TransformGroupDesc, ViewHistoryId,
+    TransformGroupDesc,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source};
 use orr_math::{DVec3, Vec3};
@@ -35,10 +35,9 @@ const SUN_RADIUS: f32 = 0.004_65;
 /// What the camera looks at.
 pub const TARGET: Vec3 = Vec3::new(0.0, 0.9, 0.0);
 
-/// The scene loaded into a renderer, with a view history for one camera.
+/// The scene loaded into a renderer.
 pub struct Showcase {
     pub scene: SceneId,
-    pub history: ViewHistoryId,
     /// The last frame id `load` used.
     pub frame: u64,
     _environment: Allocation<EnvironmentMapGpu>,
@@ -67,7 +66,6 @@ impl Showcase {
                 &SceneLightingSettings::default(),
             )
             .expect("scene");
-        let history = renderer.create_view_history().expect("view history");
         let models = [OBJECTS, GROUND].map(|name| {
             renderer
                 .model(mount, AssetId::from_name(name))
@@ -125,7 +123,6 @@ impl Showcase {
         f.end().expect("end frame");
         Self {
             scene,
-            history,
             frame,
             _environment: environment,
         }
