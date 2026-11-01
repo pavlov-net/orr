@@ -180,6 +180,7 @@ impl MaterialGpu {
             transmission_dispersion_abbe_number: m.transmission_dispersion_abbe_number,
             data: 0,
             texture_streams: GpuPtr::NULL,
+            uv_transforms: std::array::from_fn(|i| m.uv_transforms[i / 6][i % 6]),
         }
     }
 }

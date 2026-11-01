@@ -1147,7 +1147,7 @@ impl<'m, 's> Run<'m, 's> {
     fn section_maps(&mut self, u: usize, sections: &[SectionData]) -> Result<Vec<SectionMaps>> {
         let a = self.units[u].archive;
         let mut users = Vec::new();
-        let mut read = |unit: &str, all: bool, wrap, channels| -> Result<Vec<Raster>> {
+        let mut read = |unit: &str, all: bool, wrap, uv, channels| -> Result<Vec<Raster>> {
             let t = self.by_name[&(a, unit.to_owned())];
             users.push(t);
             let from = match &self.units[t].state {
@@ -1156,7 +1156,7 @@ impl<'m, 's> Run<'m, 's> {
                 _ => unreachable!("a mesh starts after the textures it reads"),
             };
             self.with_archive(a, from, |arc| {
-                texture_mips(arc, AssetId::from_name(unit), all, wrap, channels)
+                texture_mips(arc, AssetId::from_name(unit), all, wrap, uv, channels)
             })?
         };
         let mut out = Vec::with_capacity(sections.len());
@@ -1166,9 +1166,13 @@ impl<'m, 's> Run<'m, 's> {
                 OpacitySpec::Constant(pass) => Some(Opacity::Constant(*pass)),
                 OpacitySpec::Unknown => Some(Opacity::Unknown),
                 OpacitySpec::Texture {
-                    unit, cutoff, wrap, ..
+                    unit,
+                    cutoff,
+                    wrap,
+                    uv,
+                    ..
                 } => Some(Opacity::Texture {
-                    mip0: read(unit, false, *wrap, 1)?.remove(0),
+                    mip0: read(unit, false, *wrap, *uv, 1)?.remove(0),
                     cutoff: *cutoff,
                 }),
             };
@@ -1180,14 +1184,14 @@ impl<'m, 's> Run<'m, 's> {
                     min: d.min,
                     max: d.max,
                     mips: match &d.texture {
-                        Some((unit, _, wrap)) => read(unit, true, *wrap, 1)?,
+                        Some((unit, _, wrap, uv)) => read(unit, true, *wrap, *uv, 1)?,
                         None => Vec::new(),
                     },
                 }),
             };
             let normal = match &s.maps.normal {
-                NormalSpec::Texture { unit, wrap, .. } => {
-                    read(unit, false, *wrap, 2)?.try_into().ok()
+                NormalSpec::Texture { unit, wrap, uv, .. } => {
+                    read(unit, false, *wrap, *uv, 2)?.try_into().ok()
                 }
                 _ => None,
             };
@@ -1813,6 +1817,7 @@ fn map_spec(
             key: *key,
             cutoff: m.alpha_cutoff,
             wrap: wrap(t.opacity.as_ref()),
+            uv: m.uv_transforms[slot::OPACITY],
         },
         (Material::MASK, Some(_)) => OpacitySpec::Unknown,
         _ => OpacitySpec::None,
@@ -1823,7 +1828,12 @@ fn map_spec(
         min: m.displacement_min,
         max: m.displacement_max,
         texture: match b {
-            (Some((unit, key)), 0) => Some((unit.clone(), *key, wrap(t.displacement.as_ref()))),
+            (Some((unit, key)), 0) => Some((
+                unit.clone(),
+                *key,
+                wrap(t.displacement.as_ref()),
+                m.uv_transforms[slot::DISPLACEMENT],
+            )),
             _ => None,
         },
     });
@@ -1834,6 +1844,7 @@ fn map_spec(
             unit: unit.clone(),
             key: *key,
             wrap: wrap(t.normal.as_ref().map(|n| &n.0)),
+            uv: m.uv_transforms[slot::NORMAL],
         },
         Some(_) => NormalSpec::Tangent,
     };
@@ -2122,6 +2133,7 @@ fn texture_mips(
     id: AssetId,
     all: bool,
     wrap: [Wrap; 2],
+    uv: [f32; 6],
     channels: usize,
 ) -> Result<Vec<Raster>> {
     let e = arc.expect(id, Class::Texture as u16, orr_pack::texture::SCHEMA)?;
@@ -2165,6 +2177,7 @@ fn texture_mips(
                 h: hh,
                 texels: px.iter().map(|p| p[c]).collect(),
                 wrap,
+                uv,
             });
         }
     }

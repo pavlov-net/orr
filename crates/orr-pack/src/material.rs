@@ -4,7 +4,7 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::{AssetId, Error, Result};
 
-pub const SCHEMA: u16 = 1;
+pub const SCHEMA: u16 = 2;
 
 /// A texture bound to a material slot.
 #[repr(C)]
@@ -74,6 +74,10 @@ pub struct Material {
     pub surface: u8,
     /// Indexed by the `slot` constants.
     pub textures: [TextureBinding; 12],
+    /// Per slot, the affine map from mesh uv to the uv its texture is sampled at, stored
+    /// as its difference from the identity so that zero is the identity: `[a - 1, b, c, d,
+    /// e - 1, f]` for `u' = a u + b v + c`, `v' = d u + e v + f`.
+    pub uv_transforms: [[f32; 6]; 12],
 }
 
 pub mod slot {
@@ -157,6 +161,7 @@ impl Default for Material {
             thin_walled: 0,
             surface: 0,
             textures: [TextureBinding::zeroed(); 12],
+            uv_transforms: [[0.0; 6]; 12],
         }
     }
 }

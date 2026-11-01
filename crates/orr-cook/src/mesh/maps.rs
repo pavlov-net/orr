@@ -4,15 +4,48 @@
 
 use crate::texture::Wrap;
 
-/// One mip of one channel, row-major, with the sampler's edge modes.
+/// One mip of one channel, row-major, with the sampler's edge modes and the material
+/// slot's uv transform (`Material::uv_transforms` form).
 pub(crate) struct Raster {
     pub w: u32,
     pub h: u32,
     pub texels: Vec<f32>,
     pub wrap: [Wrap; 2],
+    pub uv: [f32; 6],
 }
 
 impl Raster {
+    /// Mesh uv `p` in texels of this mip, after the uv transform.
+    pub(crate) fn texel_pos(&self, p: [f32; 2]) -> [f64; 2] {
+        let q = self.mapped(p);
+        [q[0] * f64::from(self.w), q[1] * f64::from(self.h)]
+    }
+
+    /// Mesh uv `p` as the texture is sampled at.
+    pub(crate) fn mapped(&self, p: [f32; 2]) -> [f64; 2] {
+        let [a, b, c, d, e, f] = self.uv.map(f64::from);
+        let (u, v) = (f64::from(p[0]), f64::from(p[1]));
+        [(1.0 + a) * u + b * v + c, d * u + (1.0 + e) * v + f]
+    }
+
+    /// `material_normal_frame`: tangent-space normal `v` read from this normal map, turned
+    /// into the mesh uv's frame by the normalized columns of the inverse uv transform.
+    pub(crate) fn normal_frame(&self, v: [f32; 3]) -> [f32; 3] {
+        let [a, b, _, d, e, _] = self.uv;
+        let (a, e) = (1.0 + a, 1.0 + e);
+        let det = a * e - b * d;
+        if det == 0.0 {
+            return v;
+        }
+        let s = det.signum();
+        let unit = |x: f32, y: f32| {
+            let l = (x * x + y * y).sqrt();
+            [x / l * s, y / l * s]
+        };
+        let (u, w) = (unit(e, -d), unit(-b, a));
+        [u[0] * v[0] + w[0] * v[1], u[1] * v[0] + w[1] * v[1], v[2]]
+    }
+
     fn wrapped(&self, v: i64, n: u32, wrap: Wrap) -> usize {
         let n = i64::from(n);
         (match wrap {
@@ -37,7 +70,7 @@ impl Raster {
     /// texel.
     pub(crate) fn footprint(&self, uv: [[f32; 2]; 3], mut f: impl FnMut(f32) -> bool) {
         let size = [f64::from(self.w), f64::from(self.h)];
-        let p = uv.map(|t| [f64::from(t[0]) * size[0], f64::from(t[1]) * size[1]]);
+        let p = uv.map(|t| self.texel_pos(t));
         let lo = [0, 1].map(|a| p.iter().map(|q| q[a]).fold(f64::INFINITY, f64::min));
         let hi = [0, 1].map(|a| p.iter().map(|q| q[a]).fold(f64::NEG_INFINITY, f64::max));
         if (0..2).any(|a| hi[a] - lo[a] > 2.0 * size[a]) {
@@ -75,8 +108,7 @@ impl Raster {
 
     /// Bilinear sample at `uv`, texel centres at half-integers.
     pub(crate) fn sample(&self, uv: [f32; 2]) -> f32 {
-        let x = f64::from(uv[0]) * f64::from(self.w) - 0.5;
-        let y = f64::from(uv[1]) * f64::from(self.h) - 0.5;
+        let [x, y] = self.texel_pos(uv).map(|c| c - 0.5);
         let (x0, y0) = (x.floor(), y.floor());
         let (fx, fy) = ((x - x0) as f32, (y - y0) as f32);
         let (x0, y0) = (x0 as i64, y0 as i64);
