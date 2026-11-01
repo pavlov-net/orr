@@ -1,6 +1,6 @@
 //! `Scenes`, the frame and its fixed order.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -141,6 +141,9 @@ impl Default for Budgets {
         }
     }
 }
+
+/// Farther models a representation chain holds: the length of `ModelGpu::chain`.
+const MAX_CHAIN: usize = 3;
 
 static NO_KERNELS: KernelSet = KernelSet {
     modules: &[],
@@ -312,6 +315,8 @@ struct Core {
     models: Vec<Option<ModelEmission>>,
     /// Sections and animated parts by `ModelId`.
     model_cpu: Vec<ModelCpu>,
+    /// The farther models of every model with a representation chain.
+    chains: HashMap<ModelId, Vec<ModelId>>,
     /// Records outside any scene: materials, view-history initialisation.
     global: Mutex<Vec<Record>>,
     scenes: Vec<Option<Scene>>,
@@ -452,6 +457,7 @@ impl Scenes {
                 materials,
                 models: Vec::new(),
                 model_cpu: Vec::new(),
+                chains: HashMap::new(),
                 global: Mutex::new(global),
                 scenes: Vec::new(),
                 histories: Vec::new(),
@@ -530,7 +536,64 @@ impl Scenes {
     pub fn unmount(&mut self, m: MountId) {
         let frame = self.core.next_frame - 1;
         let core = &mut self.core;
+        let gone = core.mounts.models_of(m);
         core.mounts.unmount(m, frame, &mut core.models);
+        // Chains that name a model of the mount end; their copies take their model again.
+        let ended: Vec<ModelId> = core
+            .chains
+            .iter()
+            .filter(|(model, steps)| gone.contains(model) || steps.iter().any(|s| gone.contains(s)))
+            .map(|(&model, _)| model)
+            .collect();
+        for model in ended {
+            core.chains.remove(&model);
+            if !gone.contains(&model) {
+                core.write_chain(model, &[]);
+            }
+        }
+    }
+
+    /// Gives every copy of `model` up to 3 farther models, each with the distance from the
+    /// focus in m at which copies switch to it, ascending; empty: the model at every
+    /// distance. Copies take their step from the next frame on, and a copy that changes step
+    /// cross-fades between the two over a few frames. Steps past the model itself draw and
+    /// trace rigid, with their own materials, every section shown and no pose. A chain ends
+    /// when a pack holding one of its models is unmounted.
+    pub fn set_chain(&mut self, model: ModelId, chain: &[(ModelId, f32)]) -> Result<()> {
+        let invalid = |reason| Err(Error::InvalidChain { model, reason });
+        if !self.core.mounts.is_live(model) {
+            return invalid("the model is not resident");
+        }
+        if chain.len() > MAX_CHAIN {
+            return invalid("a chain holds at most 3 farther models");
+        }
+        let mut last = 0.0;
+        for &(step, distance) in chain {
+            if !self.core.mounts.is_live(step) {
+                return invalid("a farther model is not resident");
+            }
+            let skinned = self
+                .core
+                .model_cpu
+                .get(step.0 as usize)
+                .is_some_and(|m| m.skin.is_some());
+            if skinned {
+                return invalid("a farther model is skinned");
+            }
+            if !(distance.is_finite() && distance > last) {
+                return invalid("switch distances must be finite, positive and ascending");
+            }
+            last = distance;
+        }
+        let core = &mut self.core;
+        if chain.is_empty() {
+            core.chains.remove(&model);
+        } else {
+            core.chains
+                .insert(model, chain.iter().map(|&(m, _)| m).collect());
+        }
+        core.write_chain(model, chain);
+        Ok(())
     }
 
     /// The model `id` of mount `m`.
@@ -886,6 +949,29 @@ impl Scenes {
 impl Core {
     fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Writes `model`'s chain into its `ModelGpu` with the next frame's records.
+    fn write_chain(&mut self, model: ModelId, chain: &[(ModelId, f32)]) {
+        let mut words = [0u32; 1 + 2 * MAX_CHAIN];
+        words[0] = chain.len() as u32;
+        for (i, &(m, distance)) in chain.iter().enumerate() {
+            words[1 + i] = m.0;
+            words[1 + MAX_CHAIN + i] = distance.to_bits();
+        }
+        let at = self
+            .mounts
+            .models
+            .gpu()
+            .offset(u64::from(model.0))
+            .address()
+            .0
+            + std::mem::offset_of!(crate::ModelGpu, chain_count) as u64;
+        let seq = self.next_seq();
+        let records = self.global.get_mut().unwrap();
+        for (i, &w) in words.iter().enumerate() {
+            records.push(Record::fill(seq, at + 4 * i as u64, 1, w));
+        }
     }
 
     fn scene(&self, id: SceneId) -> Result<&Scene> {

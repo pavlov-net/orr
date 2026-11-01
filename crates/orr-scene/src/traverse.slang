@@ -112,18 +112,18 @@ bool focus_placement(SceneRoot* s, InstanceGpu inst, out Placement p)
     return placement(g, g.current, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, uint(s.origin_cell.w), p);
 }
 
-// The placement of stage part `part`: posed when the copy takes its pose and the part is
-// animated. False when the pose hides it.
-bool stage_placement(SceneRoot* s, uint slot, InstanceGpu inst, MeshGpu* mesh, Placement copy, uint part, bool merged, out Placement p)
+// The placement of stage part `part` of slot copy `copy`: posed when the copy takes its pose
+// and the part is animated. False when the pose hides it.
+bool stage_placement(SceneRoot* s, uint copy, InstanceGpu inst, MeshGpu* mesh, Placement placed, uint part, bool merged, out Placement p)
 {
-    p = copy;
+    p = placed;
     bool animated = !merged && mesh.animated_parts > 0 && part >= mesh.first_animated && part < mesh.first_animated + mesh.animated_parts;
-    if (!animated || (s.slot_state[slot].rt_flags & RT_ANIMATED) == 0)
+    if (!animated || (copy & COPY_FAR) != 0 || (s.slot_state[copy].rt_flags & RT_ANIMATED) == 0)
         return true;
     float3x4 pose;
     if (!part_pose(s, inst, mesh, part, false, pose))
         return false;
-    p = placed_after(copy, pose);
+    p = placed_after(placed, pose);
     return true;
 }
 
@@ -146,11 +146,11 @@ uint coarsest_cut(MeshGpu* mesh, float scale, float distance, float limit)
 }
 
 // The cached cut a slot traces at `distance`, kept within 15% of its error from the one its
-// PTLAS instance holds.
+// PTLAS instance holds when that instance holds the same chain step.
 uint cached_cut(MeshGpu* mesh, SlotStateGpu st, float scale, float distance, float limit)
 {
     uint fresh = coarsest_cut(mesh, scale, distance, limit);
-    bool written = (st.rt_flags & RT_WRITTEN) != 0;
+    bool written = (st.rt_flags & RT_WRITTEN) != 0 && ((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) == chain_near(st);
     if (!written || !has_focus() || st.rt_lod >= mesh.rt_cut_count)
         return fresh;
     uint current = st.rt_lod;
@@ -185,8 +185,9 @@ void candidate(CutGpu* cut, ClusterWork w)
     InterlockedAdd(cut.counters[CUT_CANDIDATE_CLUSTERS], countbits(w.mask));
 }
 
-// Writes the candidate items of mesh clusters `first..end`, in runs of up to 32 of one page.
-void candidates(CutGpu* cut, MeshGpu* mesh, uint slot, uint first, uint end)
+// Writes the candidate items of mesh clusters `first..end` of slot copy `slot`, in runs of
+// up to 32 of one page.
+void candidates(CutGpu* cut, MeshGpu* mesh, uint slot, uint first, uint end, uint flags)
 {
     uint c = first;
     for (uint page = cluster_page(mesh, first); page < mesh.page_count && c < end; page++)
@@ -203,7 +204,7 @@ void candidates(CutGpu* cut, MeshGpu* mesh, uint slot, uint first, uint end)
             ClusterWork w;
             w.instance = slot;
             w.page = page;
-            w.first = c - mesh.page_clusters[page];
+            w.first = (c - mesh.page_clusters[page]) | flags;
             w.mask = n == 32 ? 0xffffffff : (1u << n) - 1;
             candidate(cut, w);
         }
@@ -269,8 +270,10 @@ void init(uint3 id: SV_DispatchThreadID)
     c.coarsen[0] = asuint(1.0);
     c.coarsen[1] = asuint(1.0);
     c.owner = slot;
-    InstanceGpu inst = s.instances[slot];
     SlotStateGpu st = s.slot_state[slot];
+    // The copy's nearer chain step; a step past the first traces a cached cut of its model.
+    uint near = chain_near(st);
+    InstanceGpu inst = step_record(s, s.instances[slot], near);
     Placement p;
     if (inst.flags == 0 || !focus_placement(s, inst, p))
     {
@@ -300,28 +303,25 @@ void init(uint3 id: SV_DispatchThreadID)
     if (ray)
         c.rt_cut = cached_cut(mesh, st, p.scale * l.scale[1], distance, l.threshold[1]);
 
+    // A fading copy also draws its far step and traces a cached cut of it.
+    if (st.fade != 0)
+    {
+        InstanceGpu far = step_record(s, s.instances[slot], chain_far(st));
+        ModelGpu* far_model = s.models + far.model;
+        MeshGpu* far_mesh = s.meshes + far_model.mesh;
+        float4 far_sphere = model_sphere(far_model);
+        float far_distance = has_focus() ? max(length(place(p, far_sphere.xyz)) - far_sphere.w * p.scale, 0.0) : 0.0;
+        if (ray && far_mesh.rt_cut_count > 0)
+            c.far_cut = coarsest_cut(far_mesh, p.scale * l.scale[1], far_distance, l.threshold[1]);
+        if (raster)
+            raster_roots(s, cut, slot | COPY_FAR, far, far_model, far_mesh, p, far_sphere, l, 0);
+    }
+
     if (mesh.level_count > 0)
     {
         if (raster)
         {
-            // The coarsest level whose error stays under the threshold at the nearest point.
-            uint level = 0;
-            if (l.level >= 0)
-            {
-                level = min(uint(l.level), mesh.level_count - 1);
-            }
-            else
-            {
-                for (uint k = mesh.level_count; k > 0; k--)
-                {
-                    if (focus_error(p, sphere, mesh.levels[k - 1].error * l.scale[0]) <= l.threshold[0])
-                    {
-                        level = k - 1;
-                        break;
-                    }
-                }
-            }
-            candidates(cut, mesh, slot, mesh.levels[level].first, mesh.levels[level].first + mesh.levels[level].count);
+            raster_roots(s, cut, slot, inst, model, mesh, p, sphere, l, 0);
             c.flags |= CUT_RASTER;
         }
         if (ray && l.level >= 0)
@@ -330,12 +330,12 @@ void init(uint3 id: SV_DispatchThreadID)
         return;
     }
 
-    // DAG: copies posed in ray tracing trace cached cuts; distant ones their model's merged
-    // cut; the rest a cut gathered here.
-    bool posed = (st.rt_flags & RT_ANIMATED) != 0;
+    // DAG: copies posed in ray tracing and steps past the first trace cached cuts; distant
+    // ones their model's merged cut; the rest a cut gathered here.
+    bool cached = (st.rt_flags & RT_ANIMATED) != 0 || near > 0;
     bool distant = has_focus() && radius * root.focus_offset.w / max(distance, FOCUS_NEAR) < root.merge_pixels;
-    bool gather = ray && !posed && (!distant || l.level >= 0);
-    if (ray && !posed && !gather)
+    bool gather = ray && !cached && (!distant || l.level >= 0);
+    if (ray && !cached && !gather)
     {
         c.flags |= CUT_DISTANT;
         InterlockedMin(cut.model_cut[inst.model], c.rt_cut);
@@ -348,6 +348,34 @@ void init(uint3 id: SV_DispatchThreadID)
     uint mask = (raster ? 1 : 0) | (gather ? 2 : 0);
     if (mask != 0)
         push_roots(s, cut, slot, inst, model, mesh, p, sphere, l, mask, 0);
+}
+
+// The raster candidates of slot copy `copy` (record `inst`): a discrete mesh's coarsest
+// level whose error stays under the threshold at the nearest point, or a DAG's roots.
+void raster_roots(SceneRoot* s, CutGpu* cut, uint copy, InstanceGpu inst, ModelGpu* model, MeshGpu* mesh, Placement p, float4 sphere, Lod l, uint flags)
+{
+    if (mesh.level_count == 0)
+    {
+        push_roots(s, cut, copy, inst, model, mesh, p, sphere, l, 1, flags);
+        return;
+    }
+    uint level = 0;
+    if (l.level >= 0)
+    {
+        level = min(uint(l.level), mesh.level_count - 1);
+    }
+    else
+    {
+        for (uint k = mesh.level_count; k > 0; k--)
+        {
+            if (focus_error(p, sphere, mesh.levels[k - 1].error * l.scale[0]) <= l.threshold[0])
+            {
+                level = k - 1;
+                break;
+            }
+        }
+    }
+    candidates(cut, mesh, copy, mesh.levels[level].first, mesh.levels[level].first + mesh.levels[level].count, flags);
 }
 
 // Pushes the roots of the stage each cut in `mask` takes, for pass `root.pass`: the merged
@@ -472,19 +500,20 @@ void traverse(uint3 id: SV_DispatchThreadID)
     if (id.x >= n)
         return;
     NodeItem item = cut.queue[pass % 2][id.x];
-    uint slot = item.slot;
+    uint copy = item.slot;
+    uint slot = copy_slot(copy);
     bool retry = (item.flags & WORK_RETRY) != 0;
     uint mask = item.flags & 3;
     uint part = (item.flags >> 8) & 0xff;
     bool merged = (item.flags & 0x10000) != 0;
-    InstanceGpu inst = s.instances[slot];
+    InstanceGpu inst = copy_record(s, copy);
     ModelGpu* model = s.models + inst.model;
     MeshGpu* mesh = s.meshes + model.mesh;
     SlotCutGpu* c = cut.slots + slot;
     Lod l = slot_lod(s, inst, slot, *c, retry);
-    Placement copy;
+    Placement placed;
     Placement p;
-    if (!focus_placement(s, inst, copy) || !stage_placement(s, slot, inst, mesh, copy, part, merged, p))
+    if (!focus_placement(s, inst, placed) || !stage_placement(s, copy, inst, mesh, placed, part, merged, p))
         return;
     Node* at;
     uint page;
@@ -574,7 +603,7 @@ void traverse(uint3 id: SV_DispatchThreadID)
         if (raster_mask != 0)
         {
             ClusterWork w;
-            w.instance = slot;
+            w.instance = copy;
             w.page = g.page;
             w.first = (g.first_cluster + run) | (retry ? WORK_RETRY : 0);
             w.mask = raster_mask;
@@ -597,6 +626,7 @@ void finish(uint3 id: SV_DispatchThreadID)
 }
 
 // The second traversal's roots: every cut a non-resident node stopped, at its scaled errors.
+// Its raster candidates replace the first's for both steps of a fading copy.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void retry(uint3 id: SV_DispatchThreadID)
@@ -618,13 +648,23 @@ void retry(uint3 id: SV_DispatchThreadID)
         c.flags &= ~CUT_RT_LOST;
         cut.slots[slot] = c;
     }
-    InstanceGpu inst = s.instances[slot];
+    InstanceGpu inst = copy_record(s, slot);
     Placement p;
     if (!focus_placement(s, inst, p))
         return;
     ModelGpu* model = s.models + inst.model;
     MeshGpu* mesh = s.meshes + model.mesh;
-    push_roots(s, cut, slot, inst, model, mesh, p, model_sphere(model), slot_lod(s, inst, slot, c, true), mask, WORK_RETRY);
+    Lod l = slot_lod(s, inst, slot, c, true);
+    if (mesh.level_count == 0)
+        push_roots(s, cut, slot, inst, model, mesh, p, model_sphere(model), l, mask, WORK_RETRY);
+    else if ((mask & 1) != 0)
+        raster_roots(s, cut, slot, inst, model, mesh, p, model_sphere(model), l, WORK_RETRY);
+    if ((mask & 1) != 0 && copy_fading(s, slot))
+    {
+        InstanceGpu far = copy_record(s, slot | COPY_FAR);
+        ModelGpu* far_model = s.models + far.model;
+        raster_roots(s, cut, slot | COPY_FAR, far, far_model, s.meshes + far_model.mesh, p, model_sphere(far_model), l, WORK_RETRY);
+    }
 }
 
 uint key_bucket(SlotCutGpu c, uint mesh)

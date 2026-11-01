@@ -43,7 +43,8 @@ pub struct SceneDesc {
     pub producer_capacity: u32,
     /// Emissive list entries for instances: one per copy per EMISSIVE span of its model.
     pub emissive_capacity: u32,
-    /// PTLAS instances for the animated parts of copies inside their animation range.
+    /// PTLAS instances for the animated parts of copies inside their animation range, and
+    /// one for each copy fading between two chain steps.
     pub part_capacity: u32,
     /// PTLAS cell partitions.
     pub ptlas_partitions: u32,
@@ -747,7 +748,7 @@ impl<'f> SceneWriter<'f> {
         Ok(range)
     }
 
-    /// Zeroes the slot state of new slots. The fields from `part_run` on describe a run the
+    /// Zeroes the slot state of new slots. The fields from `part_run` on describe runs the
     /// PTLAS kernels still release.
     fn reset_slot_state(&self, range: InstanceRange) {
         let state = self

@@ -1798,6 +1798,20 @@ impl Mounts {
         }
     }
 
+    /// Whether `model` belongs to a ready mount.
+    pub(crate) fn is_live(&self, model: ModelId) -> bool {
+        self.owners
+            .get(&model)
+            .is_some_and(|&(m, _)| self.resident(m).is_ok())
+    }
+
+    /// The models of ready mount `m`; none for other mounts.
+    pub(crate) fn models_of(&self, m: MountId) -> Vec<ModelId> {
+        self.resident(m)
+            .map(|r| r.models.values().copied().collect())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn lookup<T: Copy>(
         &self,
         m: MountId,
@@ -2034,6 +2048,7 @@ impl Mounts {
                 materials: list,
                 bounds_min: m.bounds.min,
                 bounds_max: m.bounds.max,
+                ..bytemuck::Zeroable::zeroed()
             };
             w.put(self.models.gpu().offset(u64::from(id.0)), &[gpu])?;
             self.owners.insert(id, (mount, m.mesh as u32));

@@ -100,14 +100,14 @@ public float3 cap_tail(CapTail* t, float3 albedo, float g, uint cap)
     return r;
 }
 
-// Whether `h` lies on instance `instance`: a slot for cooked instances (part instances name
-// their copy's), the PTLAS index for producer entries.
+// Whether `h` lies on instance `instance`: a slot copy for cooked instances (part instances
+// name their copy's), the PTLAS index for producer entries.
 public bool on_instance(SceneRoot* s, Hit h, uint instance)
 {
-    uint slot;
-    if (!hit_slot(s, h.instance_index, slot))
-        slot = h.instance_index;
-    return slot == instance;
+    uint copy;
+    if (!hit_copy(s, h.instance_index, copy))
+        copy = h.instance_index;
+    return copy == instance;
 }
 
 // The walk from `origin` (inside a surface) along `dir` (unit, into the medium) through

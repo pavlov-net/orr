@@ -155,6 +155,11 @@ pub enum Error {
     /// all presence or neither.
     #[error("{0:?} mixes dielectric or presence materials with others")]
     MixedClasses(ModelId),
+    #[error("chain of {model:?}: {reason}")]
+    InvalidChain {
+        model: ModelId,
+        reason: &'static str,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

@@ -467,6 +467,13 @@ impl Renderer {
         self.scenes.prefetch(model, cell_distance);
     }
 
+    /// Gives every copy of `model` up to 3 farther models, each with the distance from the
+    /// focus in m at which copies switch to it, ascending; empty: the model at every
+    /// distance. A copy that changes step cross-fades between the two over a few frames.
+    pub fn set_chain(&mut self, model: ModelId, chain: &[(ModelId, f32)]) -> Result<()> {
+        Ok(self.scenes.set_chain(model, chain)?)
+    }
+
     /// Wants every tile of mips `finest..` of the cooked texture `texture` of mount `m`
     /// resident from the next frame on. Requests last one frame.
     pub fn prefetch_texture(&mut self, m: MountId, texture: TextureIndex, finest: u32) {

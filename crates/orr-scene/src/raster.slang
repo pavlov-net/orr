@@ -73,7 +73,7 @@ ClusterDraw cluster_draw(uint visible, bool alpha)
     {
         d.h = load_page_header(d.vc.page);
         d.c = load_cluster(d.vc.page, d.vc.local);
-        InstanceGpu inst = s.instances[d.vc.instance];
+        InstanceGpu inst = copy_record(s, d.vc.instance);
         MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
         d.step = mesh.position_step;
         SkinnedGpu k;
@@ -81,7 +81,7 @@ ClusterDraw cluster_draw(uint visible, bool alpha)
             d.skinned = k.positions + mesh.skin.vertex_first[d.vc.cluster];
         d.vertex_count = d.c.vertex_count;
         d.tri_count = d.c.tri_count;
-        d.split = alpha_start(m, d.c);
+        d.split = alpha_start(s, d.vc, m, d.c);
     }
     d.first = alpha ? d.split : 0;
     d.count = alpha ? d.tri_count - d.split : d.split;
@@ -181,17 +181,24 @@ void opaque_pixel(Vertex v, uint triangle: SV_PrimitiveID)
     write_visibility(v.position, v.visible, triangle);
 }
 
-// Whether an alpha-tested triangle keeps the pixel at `pixel_center`: with probability
-// coverage x (1 - fade), a copy's fade from its slot state.
+// Whether a triangle of the alpha bin keeps the pixel at `pixel_center`: on a fading copy's
+// step, by its share of the fade against a draw both steps share; then for alpha-tested
+// materials with probability the surface's coverage.
 bool alpha_keeps(VisibleCluster vc, uint triangle, float2 pixel_center)
 {
     SceneRoot* s = root.scene;
-    PrimaryHit hit = primary_hit(s, root.view, vc, triangle, pixel_center);
     uint entry;
-    float fade = visible_producer(s, vc, entry) ? 0.0 : float(s.slot_state[vc.instance].fade) / 255.0;
-    float keep = Surface.coverage(hit.input) * (1.0 - fade);
+    if (!visible_producer(s, vc, entry))
+    {
+        float u = fade_draw_pixel(uint2(pixel_center), s.frame_index, copy_slot(vc.instance));
+        if (!copy_present(s, vc.instance, u))
+            return false;
+        if ((s.materials[vc.material].flags & MATERIAL_ALPHA_TESTED) == 0)
+            return true;
+    }
+    PrimaryHit hit = primary_hit(s, root.view, vc, triangle, pixel_center);
     float noise = unit_float(pcg3d(uint3(uint2(pixel_center), s.frame_index)).x);
-    return keep > noise;
+    return Surface.coverage(hit.input) > noise;
 }
 
 [shader("pixel")]

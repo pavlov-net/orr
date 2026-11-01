@@ -52,6 +52,8 @@ void instances(uint3 id: SV_DispatchThreadID)
             : s.material_sets[inst.material_base + variant_set * e.sections + e.section];
         float3x3 m = linear_part(s, inst.group, inst.group_index);
         area = e.model_area * pow(abs(determinant(m)), 2.0 / 3.0);
+        // Chain steps past the first add no light; a fading copy shows its model in part.
+        area *= step_presence(s.slot_state[e.source], 0);
         power = material_emission(s.materials + material) * area;
     }
     e.power = power;

@@ -56,25 +56,45 @@ public static const uint RT_IN_RANGE = 4;   // inside rt_range at the last decis
 public static const uint RT_SEEN = 8;       // the PTLAS kernel has run over the slot
 public static const uint RT_ANIMATED = 16;  // inside animation_range: raster takes the pose
 public static const uint RT_WAS_ANIMATED = 32; // RT_ANIMATED of the previous frame
+public static const uint RT_FADING = 64;    // its PTLAS instance was written for a chain fade
+public static const uint RT_STEP_SHIFT = 8; // 2 bits: the chain step its PTLAS instance holds
+public static const uint RT_FAR_CUT_SHIFT = 16; // 8 bits: the cut its far instance holds
+
+// `SlotStateGpu.chain_step`: the step a copy is at, or fades to, in bits 0-1; the step it
+// fades from in bits 2-3 while `fade` is not 0.
+public static const uint CHAIN_STEP_MASK = 3;
+public static const uint CHAIN_FROM_SHIFT = 2;
+public static const uint CHAIN_SEEN = 0x80; // a step has been decided for the copy
+
+// A model and up to 3 farther models.
+public static const uint CHAIN_STEPS = 4;
+// Frames a step change cross-fades over.
+public static const uint CHAIN_FADE_FRAMES = 16;
+public static const float CHAIN_HYSTERESIS = 1.15;
+
+// An instance slot with this bit names the slot's farther chain step while it fades between
+// two; without it, its nearer step, its only one outside a fade. Visible clusters, surface
+// inputs and resolved hits name copies this way.
+public static const uint COPY_FAR = 0x80000000;
 
 // Per-slot state written only by the GPU. Handing out a slot zeroes every field before
-// `part_run`; a part run outlives its slot until the PTLAS kernels release it. The `rt_`
+// `part_run`; part runs outlive their slot until the PTLAS kernels release them. The `rt_`
 // fields describe what the slot's PTLAS instance holds.
 public struct SlotStateGpu
 {
     public uint8_t rt_lod;          // the mesh cut it was written or updated with, RT_CUT_BUILT for a BLAS built that frame
     public uint8_t stable_frames;   // frames since its transform last moved, saturating
-    public uint8_t chain_step;
-    public uint8_t fade;
+    public uint8_t chain_step;      // CHAIN_*
+    public uint8_t fade;            // frames into a chain fade, 1 to CHAIN_FADE_FRAMES - 1; 0: none
     public uint last_visible_frame; // the last frame a view drew one of its clusters
     public uint64_t rt_blas;        // 0 while null-written
     public uint rt_partition;       // cell partition, or the partition count for the global one
     public uint rt_flags;           // RT_*
     public uint2 rt_key;            // hash of the transform, model and class it was written with
     public uint rt_age;             // frames its pending PTLAS work has waited
-    public uint _pad;
     public uint part_run;           // first part instance of the run it holds
     public uint part_count;         // part instances in the run; 0: none
+    public uint far_part;           // 1 + the part instance tracing its far chain step; 0: none
 }
 
 // A transform group: `count` transforms relative to the group's anchor. A null `current`
@@ -222,7 +242,8 @@ public struct SkinStateGpu
     public uint job;               // its BLAS build record
 }
 
-// A model made resident from a mounted pack: its mesh and the material of each section.
+// A model made resident from a mounted pack: its mesh, the material of each section and its
+// representation chain.
 public struct ModelGpu
 {
     public uint mesh;            // in SceneRoot.meshes
@@ -230,6 +251,10 @@ public struct ModelGpu
     public uint* materials;      // MaterialId per mesh section
     public float3 bounds_min;
     public float3 bounds_max;
+    public uint chain_count;     // farther models, below CHAIN_STEPS
+    public uint chain[3];        // ModelId of steps 1 to chain_count
+    public float chain_distance[3]; // m from the focus where each of those steps starts, ascending
+    public uint _pad;
 }
 
 public struct SceneRoot
@@ -273,6 +298,115 @@ public struct SceneRoot
     public uint2* skin_work;         // this frame's skinning work items: skinned copy, mesh cluster
     public uint skinned_capacity;
     public uint _pad;
+}
+
+// The slot a copy names.
+public uint copy_slot(uint copy)
+{
+    return copy & ~COPY_FAR;
+}
+
+// A slot's `chain_step` in bits 0-7 and `fade` in bits 8-15.
+uint chain_word(SlotStateGpu st)
+{
+    return uint(st.chain_step) | (uint(st.fade) << 8);
+}
+
+// The same word read with one load.
+uint slot_chain_word(SceneRoot* s, uint slot)
+{
+    return ((uint*)(s.slot_state + slot))[0] >> 16;
+}
+
+// The step a copy with chain word `w` is at or fades to, and the one it fades from.
+uint word_to(uint w)
+{
+    return w & CHAIN_STEP_MASK;
+}
+
+uint word_from(uint w)
+{
+    return (w >> 8) != 0 ? (w >> CHAIN_FROM_SHIFT) & CHAIN_STEP_MASK : word_to(w);
+}
+
+// The step of a copy with chain word `w`: its nearer, or with `far` its farther.
+uint word_step(uint w, bool far)
+{
+    return far ? max(word_to(w), word_from(w)) : min(word_to(w), word_from(w));
+}
+
+// The nearer and the farther of the steps a copy shows; the same outside a fade.
+public uint chain_near(SlotStateGpu st)
+{
+    return word_step(chain_word(st), false);
+}
+
+public uint chain_far(SlotStateGpu st)
+{
+    return word_step(chain_word(st), true);
+}
+
+// The step slot copy `copy` draws and traces.
+public uint copy_step(SceneRoot* s, uint copy)
+{
+    return word_step(slot_chain_word(s, copy_slot(copy)), (copy & COPY_FAR) != 0);
+}
+
+public bool copy_fading(SceneRoot* s, uint copy)
+{
+    return (slot_chain_word(s, copy_slot(copy)) >> 8) != 0;
+}
+
+// Turns copy record `inst` into its record at chain step `step`: past step 0 the chain's
+// model, rigid, with that model's own materials and every section shown.
+public void to_step(SceneRoot* s, inout InstanceGpu inst, uint step)
+{
+    if (step == 0)
+        return;
+    inst.model = s.models[inst.model].chain[step - 1];
+    inst.material_base = NO_MATERIAL_SET;
+    inst.pose_group = 0;
+    inst.first_part = NO_PART_RUN;
+    inst.variant = 0;
+}
+
+public InstanceGpu step_record(SceneRoot* s, InstanceGpu inst, uint step)
+{
+    InstanceGpu r = inst;
+    to_step(s, r, step);
+    return r;
+}
+
+// The record slot copy `copy` draws and traces.
+public InstanceGpu copy_record(SceneRoot* s, uint copy)
+{
+    InstanceGpu inst = s.instances[copy_slot(copy)];
+    to_step(s, inst, copy_step(s, copy));
+    return inst;
+}
+
+// How much of chain step `step` a copy shows: 1 at its step outside a fade; while fading,
+// its share of the fade, `fade / CHAIN_FADE_FRAMES` for the step it fades to.
+public float step_presence(SlotStateGpu st, uint step)
+{
+    uint w = chain_word(st);
+    float share = float(st.fade) / float(CHAIN_FADE_FRAMES);
+    if (st.fade == 0)
+        return step == word_to(w) ? 1.0 : 0.0;
+    return step == word_to(w) ? share : step == word_from(w) ? 1.0 - share : 0.0;
+}
+
+// Whether slot copy `copy` is present for the uniform draw `u`: always outside a fade; while
+// fading, the step it fades to below its share and the step it fades from above it, so one
+// draw shared by both steps sees exactly one.
+public bool copy_present(SceneRoot* s, uint copy, float u)
+{
+    uint w = slot_chain_word(s, copy_slot(copy));
+    uint fade = w >> 8;
+    if (fade == 0)
+        return true;
+    bool to = word_step(w, (copy & COPY_FAR) != 0) == word_to(w);
+    return to == (u < float(fade) / float(CHAIN_FADE_FRAMES));
 }
 
 // The page of `mesh` holding mesh cluster `cluster`.

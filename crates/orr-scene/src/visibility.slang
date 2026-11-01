@@ -224,10 +224,13 @@ public bool box_occluded(ViewConstants* v, RasterGpu* r, Placement p, float3 lo,
     return nearest < farthest;
 }
 
-// The triangles of a cluster the alpha bin draws: from the returned index to `tri_count`.
-// Linked surfaces with an alpha test run their coverage on every triangle.
-public uint alpha_start(MaterialGpu* m, Cluster c)
+// The triangles of visible cluster `vc` the alpha bin draws: from the returned index to
+// `tri_count`. Linked surfaces with an alpha test run their coverage on every triangle, and
+// a fading copy goes through the alpha bin whole.
+public uint alpha_start(SceneRoot* s, VisibleCluster vc, MaterialGpu* m, Cluster c)
 {
+    if (copy_fading(s, vc.instance))
+        return 0;
     if ((m.flags & MATERIAL_ALPHA_TESTED) == 0)
         return c.tri_count;
     return m.surface != 0 ? 0 : c.alpha_first;
@@ -288,7 +291,7 @@ public bool visible_placement(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     uint entry;
     if (visible_producer(s, vc, entry))
         return producer_placement(s, s.producers[entry], previous, v.eye_cell.xyz, v.eye_offset.xyz, uint(v.eye_cell.w), p);
-    InstanceGpu inst = s.instances[vc.instance];
+    InstanceGpu inst = copy_record(s, vc.instance);
     GroupGpu* g = s.groups + inst.group;
     Placement copy;
     p = (Placement)0;
@@ -323,7 +326,7 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     }
     else
     {
-        InstanceGpu inst = s.instances[vc.instance];
+        InstanceGpu inst = copy_record(s, vc.instance);
         MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
         Cluster c = load_cluster(vc.page, vc.local);
         t = load_corners(vc.page, c, triangle, mesh);

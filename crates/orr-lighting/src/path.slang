@@ -189,17 +189,23 @@ public PathVertex hit_vertex(ViewConstants* v, SurfaceHit sh, float3 dir)
     return x;
 }
 
-// The error of the cut ray tracing holds for instance `slot`, in render space; 0 when the
-// slot is not traced and for producer entries, which trace what they raster.
-public float traced_error(SceneRoot* s, uint slot)
+// The error of the cut ray tracing holds for slot copy `copy`, in render space; 0 when the
+// copy is not traced and for producer entries, which trace what they raster.
+public float traced_error(SceneRoot* s, uint copy)
 {
-    if (slot >= s.part_base || (s.slot_state[slot].rt_flags & RT_WRITTEN) == 0)
+    uint slot = copy_slot(copy);
+    if (slot >= s.part_base)
         return 0.0;
-    InstanceGpu inst = s.instances[slot];
+    SlotStateGpu st = s.slot_state[slot];
+    bool far = (copy & COPY_FAR) != 0;
+    if (far ? st.far_part == 0 : (st.rt_flags & RT_WRITTEN) == 0)
+        return 0.0;
+    InstanceGpu inst = copy_record(s, copy);
     MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
     if (mesh.rt_cut_count == 0)
         return 0.0;
-    float error = mesh.rt_cuts[min(uint(s.slot_state[slot].rt_lod), mesh.rt_cut_count - 1)].error;
+    uint cut = far ? (st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff : uint(st.rt_lod);
+    float error = mesh.rt_cuts[min(cut, mesh.rt_cut_count - 1)].error;
     Placement pl;
     GroupGpu* g = s.groups + inst.group;
     if (!placement(g, g.current, inst.group_index, s.origin_cell.xyz, float3(0.0), uint(s.origin_cell.w), pl))

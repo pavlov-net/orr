@@ -14,7 +14,7 @@ struct Traced
 {
     float depth;           // reverse-Z depth of the hit in the view; 0 on a miss
     float t;
-    uint instance;         // slot + 1; 0 on a miss
+    uint instance;         // slot copy + 1; 0 on a miss
     uint cluster;          // mesh cluster index
     uint primitive;
     uint material;
@@ -132,9 +132,9 @@ void pixels(uint3 id: SV_DispatchThreadID)
         float4 clip = mul(v.clip_from_view_jittered, float4(view_from_relative(v, d * f.hit.t), 1.0));
         o.depth = clip.z / clip.w;
         o.t = f.hit.t;
-        uint slot;
-        hit_slot(s, f.hit.instance_index, slot);
-        o.instance = slot + 1;
+        uint copy;
+        hit_copy(s, f.hit.instance_index, copy);
+        o.instance = copy + 1;
         o.primitive = f.hit.primitive_index;
         o.barycentrics = f.hit.barycentrics;
         o.cluster = s.clusters[f.hit.cluster_id].mesh_cluster;

@@ -907,6 +907,15 @@ fn cook() -> Arc<[u8]> {
         m.textures[slot::BASE_COLOR].texture = id(&tex);
         tinted.push(model(name, quad(unit), vec![m], one()));
     }
+    // A representation chain: a DAG ball, then three coarser balls, each its own color.
+    for (step, (rings, color)) in CHAIN_SHAPES.into_iter().enumerate() {
+        let m = Material {
+            base_color: color,
+            ..Material::default()
+        };
+        let lod = if step == 0 { LodMode::Dag } else { one() };
+        tinted.push(model(CHAIN[step], sphere(rings, 0.9), vec![m, m], lod));
+    }
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(
             Target::Memory,
@@ -2573,6 +2582,299 @@ fn copies_leaving_their_rt_range_stop_tracing_and_trace_again_on_return() {
         } else {
             assert_eq!(hit, 0, "frame {frame}: traced outside its rt_range");
         }
+    }
+    assert_clean();
+}
+
+/// The chain's models, nearest first.
+const CHAIN: [&str; 4] = ["chain 0", "chain 1", "chain 2", "chain 3"];
+const CHAIN_SHAPES: [(u32, [f32; 3]); 4] = [
+    (24, [0.8, 0.2, 0.2]),
+    (12, [0.2, 0.8, 0.2]),
+    (8, [0.2, 0.2, 0.8]),
+    (5, [0.8, 0.8, 0.2]),
+];
+/// Where steps 1, 2 and 3 start, in m from the focus.
+const CHAIN_DISTANCES: [f32; 3] = [20.0, 40.0, 80.0];
+const CHAIN_HYSTERESIS: f32 = 1.15;
+const CHAIN_FADE_FRAMES: u8 = 16;
+const CHAIN_SEEN: u8 = 0x80;
+const COPY_FAR: u32 = 0x8000_0000;
+const RT_FADING: u32 = 64;
+const RT_STEP_SHIFT: u32 = 8;
+
+/// The reference for a copy's chain step: farther past a switch distance x 1.15,
+/// nearer inside it, at once for a copy seen first, else cross-fading over 16 frames; a
+/// change back to the step it fades from reverses the fade, and another change keeps the
+/// step that holds the larger share.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ChainState {
+    to: u8,
+    from: u8,
+    fade: u8,
+    seen: bool,
+}
+
+impl ChainState {
+    fn next(self, distance: f32) -> Self {
+        let n = CHAIN_DISTANCES.len() as u8;
+        if !self.seen {
+            let to = CHAIN_DISTANCES.iter().filter(|&&s| distance >= s).count() as u8;
+            return Self {
+                to,
+                from: to,
+                fade: 0,
+                seen: true,
+            };
+        }
+        let mut s = self;
+        if s.fade != 0 {
+            s.fade = if s.fade + 1 >= CHAIN_FADE_FRAMES {
+                0
+            } else {
+                s.fade + 1
+            };
+        }
+        let mut k = s.to;
+        while k < n && distance > CHAIN_DISTANCES[k as usize] * CHAIN_HYSTERESIS {
+            k += 1;
+        }
+        while k > 0 && distance < CHAIN_DISTANCES[k as usize - 1] {
+            k -= 1;
+        }
+        if k != s.to {
+            if s.fade != 0 && k == s.from {
+                s.from = s.to;
+                s.fade = CHAIN_FADE_FRAMES - s.fade;
+            } else {
+                if s.fade == 0 || s.fade >= CHAIN_FADE_FRAMES / 2 {
+                    s.from = s.to;
+                }
+                s.fade = u8::from(s.from != k);
+            }
+            s.to = k;
+        }
+        if s.fade == 0 {
+            s.from = s.to;
+        }
+        s
+    }
+
+    /// `SlotStateGpu::chain_step`.
+    fn word(self) -> u8 {
+        let from = if self.fade != 0 { self.from << 2 } else { 0 };
+        self.to | from | CHAIN_SEEN
+    }
+
+    fn near(self) -> u8 {
+        self.to.min(self.from)
+    }
+}
+
+/// A world and the chain's four models.
+fn chain_world() -> (World, [ModelId; 4]) {
+    let w = finest_world();
+    let models = CHAIN.map(|name| w.model(name));
+    (w, models)
+}
+
+/// Sets the chain on the first of `models`.
+fn set_chain(w: &mut World, models: &[ModelId; 4]) {
+    let chain: Vec<(ModelId, f32)> = models[1..].iter().copied().zip(CHAIN_DISTANCES).collect();
+    w.scenes.set_chain(models[0], &chain).unwrap();
+}
+
+/// The materials of each of `models`' two sections.
+fn model_materials(root: &SceneRoot, models: &[ModelId]) -> Vec<[u32; 2]> {
+    models
+        .iter()
+        .map(|m| {
+            let gpu = read_buffer(root.models.offset(u64::from(m.0)), 1)[0];
+            let ids = read_buffer(gpu.materials, 2);
+            [ids[0], ids[1]]
+        })
+        .collect()
+}
+
+/// The material of each pixel's visible cluster; `u32::MAX` where nothing was drawn.
+fn pixel_materials(view: &RasterView) -> Vec<u32> {
+    let pixels = u64::from(EXTENT[0] * EXTENT[1]);
+    let vis: Vec<u64> = read_buffer(view.targets.visibility, pixels);
+    let counts = read_buffer(view.counts, 16);
+    let clusters: Vec<VisibleCluster> =
+        read_buffer(view.targets.clusters, u64::from(counts[0].max(1)));
+    vis.iter()
+        .map(|&w| {
+            if w == 0 {
+                u32::MAX
+            } else {
+                clusters[(w as u32 >> 7) as usize].material
+            }
+        })
+        .collect()
+}
+
+/// Copies of the chain's model in a row, traced at any distance.
+fn chain_copies() -> Vec<Item> {
+    [-2.7, -0.9, 0.9, 2.7]
+        .into_iter()
+        .map(|x| Item {
+            model: CHAIN[0],
+            linear: Mat3::IDENTITY,
+            at: Vec3::new(x, 1.0, 0.0),
+        })
+        .collect()
+}
+
+#[test]
+fn chain_steps_and_fades_follow_the_reference_over_a_distance_sweep() {
+    let _serial = serial();
+    let (mut w, models) = chain_world();
+    let items = chain_copies();
+    let placed = place_at(&mut w, &items, DVec3::ZERO, 1e4);
+    let slots: Vec<u32> = placed.ranges.iter().map(|r| r.first).collect();
+    let eye = DVec3::new(0.0, 2.0, 6.0);
+    let target = DVec3::new(0.0, 1.0, 0.0);
+    let g = shoot(&mut w, &placed, &Shot::at(eye, target, 1));
+    let root: SceneRoot = read_buffer(g.view.scene, 1)[0];
+    let m = read_buffer(root.models.offset(u64::from(models[0].0)), 1)[0];
+    set_chain(&mut w, &models);
+    // Out past every step and back, a pause, then back and forth across the first switch
+    // faster than a fade.
+    let mut path: Vec<f32> = (0..45).map(|i| 3.0 + 2.7 * i as f32).collect();
+    path.extend([path[44]; 20]);
+    path.extend((0..45).rev().map(|i| 3.0 + 2.7 * i as f32));
+    path.extend([3.0; 20]);
+    path.extend((0..40).map(|i| 22.0 + 7.0 * (i as f32 * 0.6).sin()));
+    let mut state = vec![ChainState::default(); items.len()];
+    let mut fades = 0;
+    for (i, &z) in path.iter().enumerate() {
+        let frame = i as u32 + 2;
+        let mut shot = Shot::at(eye, target, frame);
+        let mut focus = DVec3::new(0.0, 1.0, f64::from(z));
+        let center = (Vec3::from(m.bounds_min) + Vec3::from(m.bounds_max)) * 0.5;
+        let radius = 0.5 * (Vec3::from(m.bounds_max) - Vec3::from(m.bounds_min)).length();
+        // Keeps every copy's distance clear of the switch distances, where f32 rounding on
+        // the GPU could fall either side.
+        let distances = |f: DVec3| -> Vec<f32> {
+            items
+                .iter()
+                .map(|c| ((c.at + center).as_dvec3() - f).length() as f32 - radius)
+                .map(|d| d.max(0.0))
+                .collect()
+        };
+        let near_switch = |d: f32| {
+            CHAIN_DISTANCES
+                .iter()
+                .any(|&s| (d - s).abs() < 0.01 || (d - s * CHAIN_HYSTERESIS).abs() < 0.01)
+        };
+        while distances(focus).into_iter().any(near_switch) {
+            focus.z += 0.05;
+        }
+        shot.focus = Some(focus);
+        shoot(&mut w, &placed, &shot);
+        let got = read_buffer(root.slot_state, u64::from(placed.count));
+        for (k, d) in distances(focus).into_iter().enumerate() {
+            state[k] = state[k].next(d);
+            let s = got[slots[k] as usize];
+            let want = state[k];
+            assert_eq!(
+                (s.chain_step, s.fade),
+                (want.word(), want.fade),
+                "frame {frame}, copy {k} at {d} m: {want:?}"
+            );
+            // Ray tracing holds the step the raster draws, and a fading copy's far step.
+            let fading = want.fade != 0;
+            assert_eq!(
+                (s.rt_flags >> RT_STEP_SHIFT) & 3,
+                u32::from(want.near()),
+                "frame {frame}, copy {k}: traced step"
+            );
+            assert_eq!(
+                s.rt_flags & RT_FADING != 0,
+                fading,
+                "frame {frame}, copy {k}"
+            );
+            assert_eq!(
+                s.far_part != 0,
+                fading,
+                "frame {frame}, copy {k}: far instance"
+            );
+            fades += usize::from(fading);
+        }
+    }
+    assert!(fades > 100, "{fades} fading copy frames");
+    assert_clean();
+}
+
+#[test]
+fn each_chain_step_traces_what_the_raster_draws_and_a_fade_shows_both() {
+    let _serial = serial();
+    let (mut w, models) = chain_world();
+    set_chain(&mut w, &models);
+    let placed = place_at(&mut w, &chain_copies(), DVec3::ZERO, 1e4);
+    let eye = DVec3::new(0.0, 2.0, 6.0);
+    let target = DVec3::new(0.0, 1.0, 0.0);
+    let far = |id: u32| id != 0 && (id - 1) & COPY_FAR != 0;
+    let mut frame = 0;
+    let mut shoot_at = |w: &mut World, z: f64| {
+        frame += 1;
+        let mut shot = Shot::at(eye, target, frame);
+        shot.focus = Some(DVec3::new(0.0, 1.0, z));
+        shoot(w, &placed, &shot)
+    };
+    // Focus distances inside steps 0 to 3.
+    for (step, z) in [3.0, 30.0, 60.0, 120.0].into_iter().enumerate() {
+        let mut g = shoot_at(&mut w, z);
+        for _ in 0..CHAIN_FADE_FRAMES {
+            g = shoot_at(&mut w, z);
+        }
+        let root: SceneRoot = read_buffer(g.view.scene, 1)[0];
+        let shown = model_materials(&root, &models[step..=step])[0];
+        let r = rays(&g.view, &trace::MODULE, "pixels", 1);
+        let (matched, covered) = parity(&g, &r, 1e-4);
+        let total = r.traced.len();
+        assert!(
+            covered > total / 20,
+            "step {step}: {covered} pixels covered"
+        );
+        assert!(
+            matched as f64 >= 0.999 * total as f64,
+            "step {step}: {matched} of {total} pixels agree"
+        );
+        // Outside a fade every pixel shows the step's model and no far step.
+        let materials = pixel_materials(&g.view);
+        for (i, t) in r.traced.iter().enumerate() {
+            assert!(!far(g.ids[i]) && !far(t.instance));
+            assert!(materials[i] == u32::MAX || shown.contains(&materials[i]));
+            assert!(t.instance == 0 || shown.contains(&t.material));
+        }
+    }
+    // Back to step 0: four frames into the fade both steps show, in raster and traced.
+    let mut g = shoot_at(&mut w, 3.0);
+    for _ in 0..3 {
+        g = shoot_at(&mut w, 3.0);
+    }
+    let root: SceneRoot = read_buffer(g.view.scene, 1)[0];
+    let both = model_materials(&root, &[models[0], models[3]]);
+    let r = rays(&g.view, &trace::MODULE, "pixels", 1);
+    let materials = pixel_materials(&g.view);
+    let drawn_far = g.ids.iter().filter(|&&id| far(id)).count();
+    let traced_far = r.traced.iter().filter(|t| far(t.instance)).count();
+    let covered = g.ids.iter().filter(|&&id| id != 0).count();
+    for (lo, hi, what) in [
+        (drawn_far, covered, "drawn"),
+        (traced_far, covered, "traced"),
+    ] {
+        assert!(
+            lo > hi / 20 && lo < hi * 19 / 20,
+            "{what}: {lo} of {hi} pixels on the far step"
+        );
+    }
+    for (i, t) in r.traced.iter().enumerate() {
+        let on = |m: u32| both.iter().any(|b| b.contains(&m));
+        assert!(materials[i] == u32::MAX || on(materials[i]));
+        assert!(t.instance == 0 || on(t.material));
     }
     assert_clean();
 }

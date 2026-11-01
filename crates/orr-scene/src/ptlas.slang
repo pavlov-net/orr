@@ -22,6 +22,11 @@
 // A slot tracing a cluster BLAS built this frame (RT_CUT_BUILT) holds memory the next
 // frame's builds reuse, so every operation on it is mandatory and it takes an update every
 // frame it keeps one.
+//
+// A slot's instance traces its copy's nearer chain step. While the copy fades between two
+// steps, a part instance of its own (a run of one, named in `part_slots` with COPY_FAR)
+// traces the farther step's cached cut, and both are written non-opaque so hits test the
+// fade. Chain work is mandatory, so ray tracing changes step in the frame the raster does.
 #include "orr/root.h"
 import orr.abi;
 import orr.math;
@@ -82,6 +87,10 @@ public static const uint OP_TAKE = 16;            // take a part run and write i
 public static const uint OP_RELEASE = 32;         // null-write the held part run and release it
 public static const uint OP_POSE = 64;            // rewrite the held part run
 public static const uint OP_PARTS = OP_TAKE | OP_RELEASE | OP_POSE;
+public static const uint OP_FAR_TAKE = 128;       // take a far instance and write it
+public static const uint OP_FAR_WRITE = 256;      // rewrite the held far instance
+public static const uint OP_FAR_RELEASE = 512;    // null-write the held far instance and release it
+public static const uint OP_FAR = OP_FAR_TAKE | OP_FAR_WRITE | OP_FAR_RELEASE;
 
 // A cell partition: the world cell its transforms are relative to and the instances it holds.
 public struct PartitionGpu
@@ -106,7 +115,7 @@ public struct PendingGpu
     public uint64_t rest;         // the rest-pose BLAS
     public uint2 key;
     public uint cut;
-    public uint _pad;
+    public uint far_cut;          // the cut of the far instance
 }
 
 public struct PtlasGpu
@@ -345,10 +354,15 @@ void want(uint3 id: SV_DispatchThreadID)
         return;
     SceneRoot* s = root.scene;
     PtlasGpu* t = root.ptlas;
-    InstanceGpu inst = s.instances[slot];
+    InstanceGpu base = s.instances[slot];
     SlotStateGpu* st = s.slot_state + slot;
+    uint near = chain_near(*st);
+    bool fading = st.fade != 0;
+    InstanceGpu inst = step_record(s, base, near);
     bool seen = (st.rt_flags & RT_SEEN) != 0;
     bool written = (st.rt_flags & RT_WRITTEN) != 0;
+    // The instance holds another chain step or fade state than the copy shows.
+    bool restep = written && (((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) != near || ((st.rt_flags & RT_FADING) != 0) != fading);
     bool has_focus = root.focus_cell.w != 0;
     uint cell_log2 = uint(s.origin_cell.w);
 
@@ -420,11 +434,13 @@ void want(uint3 id: SV_DispatchThreadID)
     if (!active || !in_range)
     {
         // A removed slot's instances go now: its slot may be handed out again.
-        bool mandatory = inst.flags == 0 || held_built;
+        bool mandatory = inst.flags == 0 || held_built || st.far_part != 0;
         if (written)
             op.op = OP_WRITE | OP_NULL;
         if (release)
             op.op |= OP_RELEASE;
+        if (st.far_part != 0)
+            op.op |= OP_FAR_RELEASE;
         if (op.op != OP_NONE)
         {
             op.op |= mandatory ? OP_MANDATORY : 0;
@@ -449,11 +465,11 @@ void want(uint3 id: SV_DispatchThreadID)
         op.blas = body;
     // Global instances are in render space, so a rebase rewrites every one of them now.
     bool rebased = (root.flags & PTLAS_REBASE) != 0;
-    bool placed = written && st.rt_partition == target && all(st.rt_key == op.key);
+    bool placed = written && !restep && st.rt_partition == target && all(st.rt_key == op.key);
     bool update = false;
     if (!placed || (target == global_partition() && rebased))
     {
-        bool mandatory = (in_global && target == global_partition() && rebased) || held_built;
+        bool mandatory = (in_global && target == global_partition() && rebased) || held_built || restep;
         op.op = OP_WRITE | (mandatory ? OP_MANDATORY : 0);
         charge_write(target, mandatory);
         if (written && st.rt_partition != target)
@@ -484,6 +500,26 @@ void want(uint3 id: SV_DispatchThreadID)
             InterlockedAdd(t.counters[COUNTER_MANDATORY], 1);
         else
             InterlockedAdd(t.buckets[partition_bucket(target)], 1);
+    }
+
+    // The far instance of a fading copy: taken when the fade starts, rewritten with the
+    // slot's instance or a new cut, released when it ends.
+    bool far = false;
+    if (fading)
+    {
+        MeshGpu* far_mesh = s.meshes + s.models[step_record(s, base, chain_far(*st)).model].mesh;
+        far = far_mesh.rt_cut_count > 0;
+        op.far_cut = far ? min(s.cut.slots[slot].far_cut, far_mesh.rt_cut_count - 1) : 0;
+    }
+    bool far_held = st.far_part != 0;
+    bool far_moved = (op.op & OP_WRITE) != 0 || op.far_cut != ((st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff) || target != st.rt_partition;
+    uint far_op = far && !far_held ? OP_FAR_TAKE : far && far_moved ? OP_FAR_WRITE : !far && far_held ? OP_FAR_RELEASE : 0;
+    if (far_op != 0)
+    {
+        op.op |= far_op;
+        charge_write(target, true);
+        if (far_op == OP_FAR_RELEASE && st.rt_partition != target)
+            charge_write(st.rt_partition, true);
     }
     op.partition = target;
     t.pending[slot] = op;
@@ -593,39 +629,52 @@ PtlasWrite instance_write(uint index, uint partition, Placement pl, float3 lo, f
     return w;
 }
 
-// Null-writes the slot's part run and puts it on the released list.
-void release_run(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, uint slot)
+// Null-writes the `n` part instances from `start` in `partition` and puts their run on the
+// released list.
+void release_part_run(SceneRoot* s, PtlasGpu* t, uint start, uint n, uint partition)
 {
-    uint n = st.part_count;
     uint index;
     if (reserve(COUNTER_WRITES, t.write_capacity, n, index))
     {
         for (uint j = 0; j < n; j++)
         {
             PtlasWrite w = (PtlasWrite)0;
-            w.instance_index = s.part_base + st.part_run + j;
-            w.partition = ptlas_partition(st.rt_partition);
+            w.instance_index = s.part_base + start + j;
+            w.partition = ptlas_partition(partition);
             store((uint64_t)t.writes, index + j, w);
         }
     }
     uint at;
     InterlockedAdd(t.part_state[PART_RELEASED], 1, at);
-    t.part_released[at] = st.part_run | (run_class(n) << 24);
+    t.part_released[at] = start | (run_class(n) << 24);
     InterlockedAdd(t.counters[COUNTER_PARTS], uint(-int(n)));
+}
+
+// Null-writes the slot's part run and releases it.
+void release_run(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, uint slot)
+{
+    release_part_run(s, t, st.part_run, st.part_count, st.rt_partition);
     st.part_count = 0;
     // An emptied slot's record stays zero.
     if (s.instances[slot].flags != 0)
         s.instances[slot].first_part = NO_PART_RUN;
 }
 
-// Takes a run of `n` part instances for the slot, from its class's free list or else the
-// pool; false when the pool is full.
-bool take_run(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, uint slot, uint n)
+// Null-writes the slot's far instance and releases it.
+void release_far(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st)
+{
+    release_part_run(s, t, st.far_part - 1, 1, st.rt_partition);
+    st.far_part = 0;
+}
+
+// Takes a run of `n` part instances for slot copy `copy`, from its class's free list or else
+// the pool; false when the pool is full.
+bool take_part_run(SceneRoot* s, PtlasGpu* t, uint copy, uint n, out uint start)
 {
     uint c = run_class(n);
     uint top;
     InterlockedAdd(t.part_state[PART_TOPS + c], uint(-1), top);
-    uint start;
+    start = 0;
     if (int(top) > 0)
     {
         start = t.part_free[part_stack(c) + top - 1];
@@ -640,17 +689,54 @@ bool take_run(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, uint slot, uint n)
         }
     }
     for (uint j = 0; j < n; j++)
-        s.part_slots[start + j] = slot;
-    st.part_run = start;
-    st.part_count = n;
+        s.part_slots[start + j] = copy;
     InterlockedAdd(t.counters[COUNTER_PARTS], n);
     return true;
 }
 
+// Takes a run of `n` part instances for the slot's animated parts.
+bool take_run(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, uint slot, uint n)
+{
+    uint start;
+    if (!take_part_run(s, t, slot, n, start))
+        return false;
+    st.part_run = start;
+    st.part_count = n;
+    return true;
+}
+
+// The write of slot copy `inst` over `blas` as PTLAS instance `index` of `partition`, in
+// render space for the global partition and relative to its cell for the others.
+PtlasWrite copy_write(SceneRoot* s, PtlasGpu* t, uint index, uint partition, InstanceGpu inst, uint64_t blas)
+{
+    GroupGpu* g = s.groups + inst.group;
+    int3 cell = partition == global_partition() ? s.origin_cell.xyz : t.partitions[partition].cell;
+    Placement pl;
+    placement(g, g.current, inst.group_index, cell, float3(0.0), uint(s.origin_cell.w), pl);
+    float3 lo, hi;
+    if ((inst.flags & INSTANCE_SKINNED) == 0 || !skinned_reach(s, inst, lo, hi))
+        copy_bounds(s, inst, lo, hi);
+    return instance_write(index, partition, pl, lo, hi, blas, inst.candidate_class);
+}
+
+// Writes the slot's far instance: its copy's far chain step at `cut`, non-opaque.
+void write_far(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, InstanceGpu base, uint partition, uint cut)
+{
+    uint index;
+    if (!reserve(COUNTER_WRITES, t.write_capacity, 1, index))
+        return;
+    InstanceGpu far = step_record(s, base, chain_far(*st));
+    MeshGpu* mesh = s.meshes + s.models[far.model].mesh;
+    PtlasWrite w = copy_write(s, t, s.part_base + st.far_part - 1, partition, far, mesh.rt_cuts[cut].blas);
+    w.flags |= INSTANCE_FORCE_NO_OPAQUE;
+    store((uint64_t)t.writes, index, w);
+    st.rt_flags = (st.rt_flags & ~(0xffu << RT_FAR_CUT_SHIFT)) | (cut << RT_FAR_CUT_SHIFT);
+}
+
 // Writes every part instance of the slot's run: the cut's part BLAS posed by the copy's
 // transform and `pose[part]`, null where the part has no clusters at the cut, its sections
-// are all hidden or its pose hides it.
-void write_parts(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, InstanceGpu inst, uint cut, uint partition)
+// are all hidden or its pose hides it; non-opaque while the copy fades.
+void write_parts(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, InstanceGpu inst, uint cut, uint partition, bool fading)
 {
     uint n = st.part_count;
     uint index;
@@ -673,6 +759,8 @@ void write_parts(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, InstanceGpu inst, 
         w.partition = ptlas_partition(partition);
         if (shown && blas != 0 && (part.sections & ~hidden) != 0 && part_pose(s, inst, mesh, mesh.first_animated + j, false, pose))
             w = instance_write(w.instance_index, partition, placed_after(copy, pose), part.bounds_min, part.bounds_max, blas, inst.candidate_class);
+        if (fading && w.blas != 0)
+            w.flags |= INSTANCE_FORCE_NO_OPAQUE;
         store((uint64_t)t.writes, index + j, w);
     }
 }
@@ -692,7 +780,7 @@ void emit(uint3 id: SV_DispatchThreadID)
     SlotStateGpu* st = s.slot_state + slot;
     bool mandatory = (op.op & OP_MANDATORY) != 0;
     bool admitted;
-    if ((op.op & (OP_WRITE | OP_PARTS)) != 0)
+    if ((op.op & (OP_WRITE | OP_PARTS | OP_FAR)) != 0)
     {
         admitted = (t.partition_state[op.partition] & PS_ADMITTED) != 0;
     }
@@ -711,10 +799,15 @@ void emit(uint3 id: SV_DispatchThreadID)
     }
     st.rt_age = 0;
     st.rt_lod = uint8_t(op.cut);
-    InstanceGpu inst = s.instances[slot];
+    InstanceGpu base = s.instances[slot];
+    uint near = chain_near(*st);
+    bool fading = st.fade != 0;
+    InstanceGpu inst = step_record(s, base, near);
 
     if ((op.op & OP_RELEASE) != 0)
         release_run(s, t, st, slot);
+    if ((op.op & OP_FAR_RELEASE) != 0)
+        release_far(s, t, st);
     bool held = st.part_count != 0;
     if ((op.op & OP_TAKE) != 0)
         held = take_run(s, t, st, slot, s.meshes[s.models[inst.model].mesh].animated_parts);
@@ -748,14 +841,9 @@ void emit(uint3 id: SV_DispatchThreadID)
         w.partition = ptlas_partition(op.partition);
         if (!disable)
         {
-            GroupGpu* g = s.groups + inst.group;
-            int3 cell = global ? s.origin_cell.xyz : t.partitions[op.partition].cell;
-            Placement pl;
-            placement(g, g.current, inst.group_index, cell, float3(0.0), uint(s.origin_cell.w), pl);
-            float3 lo, hi;
-            if ((inst.flags & INSTANCE_SKINNED) == 0 || !skinned_reach(s, inst, lo, hi))
-                copy_bounds(s, inst, lo, hi);
-            w = instance_write(slot, op.partition, pl, lo, hi, blas, inst.candidate_class);
+            w = copy_write(s, t, slot, op.partition, inst, blas);
+            if (fading)
+                w.flags |= INSTANCE_FORCE_NO_OPAQUE;
         }
         store((uint64_t)t.writes, index, w);
         if (global && !was_global)
@@ -765,15 +853,22 @@ void emit(uint3 id: SV_DispatchThreadID)
         st.rt_blas = disable ? 0 : blas;
         st.rt_partition = op.partition;
         st.rt_key = op.key;
-        st.rt_flags = (st.rt_flags & ~(RT_WRITTEN | RT_GLOBAL)) | (disable ? 0 : RT_WRITTEN) | (global ? RT_GLOBAL : 0);
+        uint chain = disable ? 0 : (near << RT_STEP_SHIFT) | (fading ? RT_FADING : 0);
+        st.rt_flags = (st.rt_flags & ~(RT_WRITTEN | RT_GLOBAL | RT_FADING | (CHAIN_STEP_MASK << RT_STEP_SHIFT)))
+            | (disable ? 0 : RT_WRITTEN) | (global ? RT_GLOBAL : 0) | chain;
     }
     if (held && (op.op & (OP_TAKE | OP_POSE)) != 0)
     {
         // A slot handed out again keeps a run of the same size, but its new record does not
         // name it.
         s.instances[slot].first_part = st.part_run;
-        write_parts(s, t, st, inst, op.cut, op.partition);
+        write_parts(s, t, st, inst, op.cut, op.partition, fading);
     }
+    uint start;
+    if ((op.op & OP_FAR_TAKE) != 0 && take_part_run(s, t, slot | COPY_FAR, 1, start))
+        st.far_part = start + 1;
+    if ((op.op & (OP_FAR_TAKE | OP_FAR_WRITE)) != 0 && st.far_part != 0)
+        write_far(s, t, st, base, op.partition, op.far_cut);
 }
 
 // `ProducerStateGpu.rt_flags` of this frame's decision.
