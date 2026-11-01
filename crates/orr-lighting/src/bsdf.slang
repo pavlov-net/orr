@@ -883,6 +883,25 @@ public BsdfParams bsdf_subsurface_diffuse(BsdfParams p)
     return p;
 }
 
+// What a surface lets through straight along `wi` (unit), without bending: its transmission
+// share, surface tint and coat, times 1 - Fresnel at its interface, 0 beyond the critical
+// angle. `n` is the unit geometric normal on the material's front side, `exterior_ior` the
+// medium there. Shadow rays through dielectric layers take it.
+public float3 bsdf_straight_transmission(BsdfParams p, float3 n, float3 wi, float exterior_ior = 1.0)
+{
+    bool thin = (p.flags & BSDF_THIN_WALLED) != 0;
+    float c = dot(wi, n);
+    bool inside = c > 0.0 && !thin;
+    float mu = max(abs(c), MIN_COS);
+    float ior = exterior_ior * openpbr_apply_specular_weight_to_ior(p.specular_ior / exterior_ior, p.specular_weight);
+    float eta = inside ? exterior_ior / ior : ior / exterior_ior;
+    float3 t = (1.0 - p.metalness) * p.transmission_weight * (1.0 - openpbr_fresnel(eta, mu))
+        * view_tint(p.transmission_color, thin, mu, eta);
+    if ((p.flags & BSDF_COAT) != 0 && p.coat_weight > 0.0)
+        t *= lerp(float3(1.0), p.coat_color * (1.0 - openpbr_fresnel(p.coat_ior / exterior_ior, mu)), p.coat_weight);
+    return max(t, 0.0);
+}
+
 // Prepares `p` at shading normal `n` (unit) seen along `wo` (unit, toward the viewer), with
 // `exterior_ior` the medium on the side `n` points to. A view within 1e-4 of the surface
 // plane leans up to it.

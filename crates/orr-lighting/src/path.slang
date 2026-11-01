@@ -26,6 +26,7 @@ import lights;
 import light_sampling;
 import world_cache;
 import subsurface;
+import shadow;
 
 // `PathRoot.mode`: what the radiance image holds.
 public static const uint PATH_FULL = 0;
@@ -255,24 +256,6 @@ public RayDesc path_ray(float3 origin, float3 dir, float t_max)
     return r;
 }
 
-// Whether the segment from `origin` along `dir` reaches `t_max` (+inf toward directional
-// lights and the environment) without an opaque or alpha-tested hit, traced with ray flags
-// `flags`.
-public bool unoccluded<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context)
-{
-    Alpha<S> a = { s, v, dir, context };
-    return !trace_any(s.tlas, path_ray(origin, dir, t_max), MASK_OPAQUE, flags, a);
-}
-
-// 1 when the segment from `origin` along `dir` reaches `t_max` without an opaque or
-// alpha-tested hit, else 0, times the linked medium's transmittance over it.
-public float3 visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context)
-{
-    if (!unoccluded<S>(s, v, origin, dir, t_max, flags, context))
-        return float3(0.0);
-    return medium_transmittance<M>(s.medium, origin, dir, t_max);
-}
-
 public float power_heuristic(float a, float b)
 {
     return a > 0.0 ? mis_power(a, b) : 0.0;
@@ -317,20 +300,27 @@ public interface IShadow
     float3 transmittance(float3 origin, float3 dir, float t_max, HitContext context, bool environment, out bool weigh);
 }
 
-// Shadow rays through the scene's opaque geometry and its linked medium.
+// Shadow rays through the scene and its linked medium, counting their overflows in
+// `overflows`.
 public struct SceneShadow<S : ISurface, M : IMedium> : IShadow
 {
     public SceneRoot* scene;
     public ViewConstants* view;
+    public uint* overflows;
 
     public float3 transmittance(float3 origin, float3 dir, float t_max, HitContext context, bool environment, out bool weigh)
     {
         weigh = true;
-        float3 vis = visibility<S, M>(scene, view, origin, dir, t_max, RAY_FLAG_NONE, context);
         // Environment light reaches vertices without the medium's transmittance, as BSDF
         // misses see it: the baked map carries the medium.
-        return environment ? select(vis > 0.0, float3(1.0), float3(0.0)) : vis;
+        return visibility<S, M>(scene, view, origin, dir, t_max, RAY_FLAG_NONE, context, !environment, overflows);
     }
+}
+
+public SceneShadow<S, M> scene_shadow<S : ISurface, M : IMedium>(PathRoot r)
+{
+    SceneShadow<S, M> shadow = { r.scene, r.view, r.set.shadow_overflows };
+    return shadow;
 }
 
 // Next-event estimation at `x` (a zero shading normal for a point in a medium), weighed by
@@ -741,7 +731,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
             {
                 uint light;
                 PathScatter f = { b, at_exit, exit_scatter };
-                SceneShadow<S, M> shadow = { s, v };
+                SceneShadow<S, M> shadow = scene_shadow<S, M>(r);
                 float3 l = shade_vertex_nee(r, x, f, shadow, run, pixel, local, depth, candidates, one_technique, rng, rays, light);
                 if (counted)
                     radiance += throughput * l;

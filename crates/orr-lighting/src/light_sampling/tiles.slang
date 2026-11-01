@@ -25,6 +25,8 @@ struct Root
     // Per feedback id: pixels the views of the frame before counted, and their decayed sums.
     uint* feedback_counts;
     float* feedback_weights;
+    // Shadow rays of the frame before past the candidate limit.
+    uint* shadow_overflows;
     // This frame's slot of the statistics readback.
     LightSetStats* stats;
     // Values `cluster_cdf` holds.
@@ -36,6 +38,7 @@ struct Root
     uint clear_feedback;
     uint _pad0;
     uint _pad1;
+    uint64_t _pad2;
 }
 ORR_ROOT(Root);
 
@@ -243,6 +246,7 @@ void select(uint lane: SV_GroupIndex)
     set.cluster_cdf = root.cluster_cdf;
     set.tiles = root.tiles;
     set.feedback_counts = root.feedback_counts;
+    set.shadow_overflows = root.shadow_overflows;
     set.candidate_count = n;
     set.candidate_total = total;
     set.environment_probability = env;
@@ -267,7 +271,8 @@ void select(uint lane: SV_GroupIndex)
     st.dropped_entries = counts[3];
     st.environment_probability = env;
     st.feedback_pixels = counts[4];
-    st._pad1 = 0;
+    st.shadow_overflows = root.clear_feedback != 0 ? 0 : *root.shadow_overflows;
+    *root.shadow_overflows = 0;
     *root.stats = st;
 }
 

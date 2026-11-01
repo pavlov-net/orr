@@ -29,8 +29,15 @@ ORR_ROOT(Root);
 // Even primitives are half-transparent grey layers, odd ones pass through.
 struct Layers : ICandidate, ITranslucent
 {
-    float3 transmittance(Candidate c)
+    bool positions(Candidate c)
     {
+        return false;
+    }
+
+    [mutating]
+    float3 transmittance(Candidate c, out bool counted)
+    {
+        counted = true;
         return (c.primitive_index & 1) == 0 ? float3(0.5) : float3(1.0);
     }
 

@@ -122,6 +122,9 @@ public struct LightSetGpu
     // Per feedback id, the pixels whose feedback named it this frame; the next scene pass
     // reads and clears them.
     public uint* feedback_counts;
+    // Shadow rays this frame past `SHADOW_CANDIDATES` non-opaque candidates; the next scene
+    // pass reads and clears it.
+    public uint* shadow_overflows;
     public uint directional_count;
     public uint candidate_count;
     // The last value of `cdf`.
@@ -152,7 +155,8 @@ public struct LightSetStats
     public float environment_probability;
     // Pixels whose feedback named a light in the frame before.
     public uint feedback_pixels;
-    public uint _pad1;
+    // Shadow rays of the frame before that met more non-opaque candidates than they multiply.
+    public uint shadow_overflows;
 }
 
 // The lights that fed back in one screen tile of a view in its last frame, as a selection.
