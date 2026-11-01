@@ -17,6 +17,7 @@
 #include "orr/root.h"
 import orr.abi;
 import orr.math;
+import orr.color;
 import orr.random;
 import view;
 
@@ -875,5 +876,5 @@ void composite(uint3 id: SV_DispatchThreadID)
     float3 c = front.rgb + (1.0 - front.a) * backdrop;
     root.target.get<RWTexture2D<float4>>()[p] = float4(c, src.a);
     if (root.guide.index != 0xffffffff)
-        root.guide.get<RWTexture2D<float>>()[p] = luminance(c) - luminance(src.rgb);
+        root.guide.get<RWTexture2D<float>>()[p] = guide_luminance(c) - guide_luminance(src.rgb);
 }

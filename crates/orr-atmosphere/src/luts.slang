@@ -27,7 +27,6 @@ static const uint GROUND_STEPS = 32;
 static const uint SKY_VIEW_STEPS = 40;
 // Directions per multiple-scattering and ground irradiance texel: 64 lanes, 4 each.
 static const uint DIRECTIONS = 256;
-static const float GOLDEN_ANGLE = 2.39996322972865332;
 // Candidates more than 18 deg below the focus horizon add less than the night background.
 static const float FOLD_HORIZON = -0.309016994;
 // Seconds a fold weight takes to go between 0 and 1.

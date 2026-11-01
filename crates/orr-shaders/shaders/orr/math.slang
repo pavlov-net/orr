@@ -10,6 +10,7 @@ public static const float TWO_PI = 6.28318530717958647692;
 public static const float INV_PI = 0.31830988618379067154;
 public static const float INV_TWO_PI = 0.15915494309189533577;
 public static const float INV_FOUR_PI = 0.07957747154594766788;
+public static const float GOLDEN_ANGLE = 2.39996322972865332;
 
 // `v` at unit length, or `fallback` when its length is zero, denormal or not finite.
 public float3 safe_normalize(float3 v, float3 fallback = float3(0, 0, 1))

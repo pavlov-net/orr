@@ -8,6 +8,7 @@
 module guides;
 
 import orr.abi;
+import orr.math;
 import orr.color;
 import orr.trace;
 import media;
@@ -53,6 +54,48 @@ public struct GuideRoot
     public uint _pad0;
     public uint _pad1;
     public uint _pad2;
+}
+
+// The frosted-glass term: on each pixel whose dominant layer is rough transmission, the
+// transmission times the background's mean over the disc its lobes blur it by, less the
+// background there, added into ray reconstruction's depth-of-field guide, which holds
+// `guide_luminance(after - before)` for each blur.
+public struct FrostRoot
+{
+    // From a dielectric dispatch with DIELECTRIC_FROST, in rows of `width`.
+    public LayerGuide* layers;
+    public StorageImageIndex guide;     // R16F
+    public uint width;
+    public uint height;
+    public uint _pad0;
+    public uint _pad1;
+    public uint _pad2;
+}
+
+// Pixels the frosted-glass term's disc reaches at most.
+public static const float FROST_MAX_RADIUS = 64.0;
+
+// Background reads over the disc.
+static const uint FROST_TAPS = 24;
+
+public void frost_body(FrostRoot r, uint2 pixel)
+{
+    LayerGuide own = r.layers[pixel.y * r.width + pixel.x];
+    float radius = f16tof32(own.frost & 0xffff);
+    float weight = f16tof32(own.frost >> 16);
+    if (radius < 0.5 || weight <= 0.0)
+        return;
+    // A Vogel disc, the same on every pixel and frame, so the term holds still.
+    float sum = 0.0;
+    for (uint k = 0; k < FROST_TAPS; k++)
+    {
+        float d = radius * sqrt((float(k) + 0.5) / float(FROST_TAPS));
+        float a = float(k) * GOLDEN_ANGLE;
+        int2 q = clamp(int2(pixel) + int2(round(d * float2(cos(a), sin(a)))), int2(0), int2(r.width, r.height) - 1);
+        sum += r.layers[q.y * r.width + q.x].background;
+    }
+    RWTexture2D<float> guide = r.guide.get<RWTexture2D<float>>();
+    guide[pixel] = guide[pixel] + weight * (sum / float(FROST_TAPS) - own.background);
 }
 
 public struct Guides

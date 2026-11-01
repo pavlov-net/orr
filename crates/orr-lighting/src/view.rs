@@ -16,10 +16,10 @@ use orr_scene::{
 use crate::media::{MediaKernels, MediaSettings, MediaStats, MediaView};
 use crate::scene::{FRAME_SLOTS, Ring, device_local};
 use crate::shaders::dielectric::dispatch;
-use crate::shaders::guides::resolve;
+use crate::shaders::guides::{frost, resolve};
 use crate::shaders::light_sampling::local;
 use crate::shaders::path::opaque;
-use crate::shaders::types::{GuideRoot, LayerGuide, LocalLights, PathRoot};
+use crate::shaders::types::{FrostRoot, GuideRoot, LayerGuide, LocalLights, PathRoot};
 use crate::shaders::world_cache::update;
 use crate::subsurface::{CapTailTable, SSS_STEPS, SubsurfaceDepth};
 use crate::{BsdfTables, Error, KernelSet, PathEntry, SceneLighting, module, pipeline};
@@ -222,9 +222,10 @@ const REFERENCE_ROULETTE_DEPTH: u32 = 64;
 /// `path`'s `CACHE_TERMINATE`.
 const CACHE_TERMINATE: u32 = 1;
 
-/// `dielectric`'s `DIELECTRIC_REFERENCE` and `DIELECTRIC_DEBUG_LAYER`.
+/// `dielectric`'s `DIELECTRIC_REFERENCE`, `DIELECTRIC_DEBUG_LAYER` and `DIELECTRIC_FROST`.
 const DIELECTRIC_REFERENCE: u32 = 1;
 const DIELECTRIC_DEBUG_LAYER: u32 = 2;
+const DIELECTRIC_FROST: u32 = 8;
 
 /// `path`'s `SSS_PRIMARY_ONLY`.
 const SSS_PRIMARY_ONLY: u32 = 1;
@@ -345,9 +346,10 @@ pub struct LightingView {
     local_tiles: [u32; 2],
     slots: Vec<u32>,
     /// Each pixel's first layer for the guide resolve, and the frame the dielectric dispatch
-    /// last wrote it.
+    /// last wrote it, and whether that dispatch kept the frosted-glass term's inputs.
     layers: Allocation<LayerGuide>,
     layers_frame: Option<u64>,
+    layers_frost: bool,
     /// The frame and path settings of the last opaque dispatch.
     path: Option<(u64, PathRoot)>,
     roots: Ring<PathRoot>,
@@ -355,6 +357,7 @@ pub struct LightingView {
     update_roots: Ring<PathRoot>,
     local_roots: Ring<local::Root>,
     guide_roots: Ring<GuideRoot>,
+    frost_roots: Ring<FrostRoot>,
     previous: Option<(SceneId, DVec3, Quat)>,
     history_reset: bool,
     pub(crate) media: MediaView,
@@ -439,12 +442,14 @@ impl LightingView {
             slots,
             layers,
             layers_frame: None,
+            layers_frost: false,
             path: None,
             roots: Ring::new(device, "path roots")?,
             dielectric_roots: Ring::new(device, "dielectric roots")?,
             update_roots: Ring::new(device, "update path roots")?,
             local_roots: Ring::new(device, "local light sampler roots")?,
             guide_roots: Ring::new(device, "guide roots")?,
+            frost_roots: Ring::new(device, "frosted glass roots")?,
             previous: None,
             history_reset: true,
             media: MediaView::new(device)?,
@@ -627,6 +632,9 @@ pub struct ViewPass {
     /// The opaque dispatch also traces the view's background layer
     /// ([`LightingView::dof_background`]); `None` frees it.
     pub dof_background: Option<DofBackgroundPass>,
+    /// The dielectric dispatch keeps what [`LightingKernels::record_frosted_glass`] reads:
+    /// set while output's depth-of-field guide is on.
+    pub frosted_glass: bool,
 }
 
 /// What the background layer behind out-of-focus foreground reads in one frame. Each marked
@@ -687,6 +695,7 @@ pub struct LightingKernels {
     dielectric: PathPipeline,
     update: PathPipeline,
     guides: ComputePipeline,
+    frost: ComputePipeline,
     local: ComputePipeline,
     media: MediaKernels,
     cap_tail: CapTailTable,
@@ -751,6 +760,7 @@ impl LightingKernels {
             dielectric,
             update,
             guides,
+            frost: pipeline(device, kernels, &frost::MODULE, "main")?,
             local: pipeline(device, kernels, &local::MODULE, "main")?,
             media: MediaKernels::new(device, kernels)?,
             cap_tail: CapTailTable::new(device)?,
@@ -966,8 +976,9 @@ impl LightingKernels {
     /// [`ViewLighting::camera_medium`] trace their path through it from the G-buffer's surface
     /// too. Outside the reference, segments between layers read the froxels of
     /// [`Self::record_media`] of the same frame where it ran. Camera rays are pinhole rays
-    /// whatever the reference's lens. Records nothing without the opaque dispatch of
-    /// `pass.frame`. Orders nothing after it.
+    /// whatever the reference's lens. With [`ViewPass::frosted_glass`] it also keeps each
+    /// pixel's background and rough-transmission blur for [`Self::record_frosted_glass`].
+    /// Records nothing without the opaque dispatch of `pass.frame`. Orders nothing after it.
     pub fn record_dielectric(
         &self,
         list: &mut CommandList<'_>,
@@ -988,6 +999,9 @@ impl LightingKernels {
         if lighting.debug_view == LightingDebugView::DielectricLayer {
             flags |= DIELECTRIC_DEBUG_LAYER;
         }
+        if pass.frosted_glass {
+            flags |= DIELECTRIC_FROST;
+        }
         let root = view.dielectric_roots.write(
             slot,
             PathRoot {
@@ -1002,6 +1016,7 @@ impl LightingKernels {
             },
         );
         view.layers_frame = Some(pass.frame);
+        view.layers_frost = pass.frosted_glass;
         list.begin_pass("dielectric paths", false);
         self.dielectric.record(list, root, view.extent);
         list.end_pass();
@@ -1053,6 +1068,44 @@ impl LightingKernels {
         let [gx, gy, _] = self.guides.workgroup();
         list.begin_pass("guide resolve", false);
         list.dispatch(&self.guides, root, [w.div_ceil(gx), h.div_ceil(gy), 1]);
+        list.end_pass();
+    }
+
+    /// Adds the frosted-glass term into `guide`, ray reconstruction's depth-of-field guide
+    /// (R16F at the view's extent, `luminance(after - before)`), after output wrote it and
+    /// after [`Self::record_dielectric`] of `pass` with [`ViewPass::frosted_glass`]. A pixel
+    /// whose dominant layer is rough transmission adds its transmission's luminance times
+    /// the change that blurring the background over its rough interfaces' disc makes. The
+    /// background is the opaque radiance at the same pixels, unbent by refraction. Other
+    /// pixels keep what output wrote. Records nothing without such a dispatch in
+    /// `pass.frame`. Orders nothing after it.
+    pub fn record_frosted_glass(
+        &self,
+        list: &mut CommandList<'_>,
+        view: &mut LightingView,
+        pass: &ViewPass,
+        guide: StorageImageIndex,
+    ) {
+        if !view.layers_frost || view.layers_frame != Some(pass.frame) {
+            return;
+        }
+        let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
+        let root = view.frost_roots.write(
+            slot,
+            FrostRoot {
+                layers: view.layers.gpu(),
+                guide,
+                width: view.extent[0],
+                height: view.extent[1],
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
+            },
+        );
+        let [w, h] = view.extent;
+        let [gx, gy, _] = self.frost.workgroup();
+        list.begin_pass("frosted glass", false);
+        list.dispatch(&self.frost, root, [w.div_ceil(gx), h.div_ceil(gy), 1]);
         list.end_pass();
     }
 }

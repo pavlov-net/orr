@@ -22,6 +22,7 @@ shader-maths.workspace = true
 openpbr-ref.workspace = true
 glam.workspace = true
 bytemuck.workspace = true
+half.workspace = true
 
 [build-dependencies]
 orr-shaders = { workspace = true, features = ["build"] }
