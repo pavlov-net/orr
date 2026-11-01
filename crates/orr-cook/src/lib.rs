@@ -253,6 +253,12 @@ pub struct GltfSettings {
     pub material_overrides: Vec<(String, MaterialPatch)>,
     /// Rigid parts from a per-vertex attribute.
     pub parts_from_attribute: Option<PartAttribute>,
+    /// Skinned meshes cook as rigid parts instead: every vertex follows one joint (one
+    /// non-zero weight), its part is that skeleton joint, pivoted at the joint's bind
+    /// position, and the mesh keeps no skin attributes. The skeleton still cooks, so its
+    /// parents and rest transforms give the parts' hierarchy; skeleton joint 0 is the body.
+    /// Without skins it does nothing. Does not mix with `parts_from_attribute`.
+    pub parts_from_skin: bool,
     /// Patterns of selected models that join crack-free: they share one grid step and
     /// their nodes must keep them on it.
     pub joined: Vec<String>,

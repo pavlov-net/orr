@@ -53,7 +53,7 @@ use crate::mesh::MeshBuilder;
 use crate::shaders::{fireflies, glow, grass, slab, sway, terrain};
 use crate::sky::{self, Sky};
 use crate::window::Window;
-use crate::{Capture, Options, Workers, affine, device, fixed_time, gray_png};
+use crate::{Capture, Options, Workers, affine, device, entry_head, fixed_time, gray_png};
 
 /// The tile's side, m; it spans -TILE / 2 to TILE / 2 on x and z.
 const TILE: f32 = 1024.0;
@@ -611,15 +611,8 @@ struct TreeModel {
 /// its bounds' center. A part pivoted inside the body's bounds hangs on the body; any other
 /// on the body-hung part whose bounds hold its pivot and whose limb passes nearest it.
 fn tree_parts(archive: &Archive, name: &str) -> Option<(u32, Vec<sway::Joint>)> {
-    let read = |id: AssetId| {
-        let e = archive.find(id)?;
-        let b = archive.blobs(e).first()?;
-        let mut bytes = vec![0; b.raw_len as usize];
-        archive.read(b, &mut bytes).ok()?;
-        Some(bytes)
-    };
-    let model = ModelInfo::parse(&read(AssetId::from_name(name))?).ok()?;
-    let mesh = MeshInfo::parse(&read(model.header.mesh)?).ok()?;
+    let model = ModelInfo::parse(&entry_head(archive, AssetId::from_name(name))?).ok()?;
+    let mesh = MeshInfo::parse(&entry_head(archive, model.header.mesh)?).ok()?;
     struct Limb {
         pivot: Vec3,
         center: Vec3,

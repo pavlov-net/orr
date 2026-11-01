@@ -108,16 +108,7 @@ impl Showcase {
             })
             .expect("instances");
         }
-        w.set_light(
-            LightId(0),
-            Some(&Light::Directional(DirectionalLight {
-                direction_to_light: SUN,
-                illuminance: SUN_ILLUMINANCE,
-                angular_radius: SUN_RADIUS,
-                disc: DiscProfile::LimbDarkened,
-            })),
-        )
-        .expect("sun");
+        w.set_light(LightId(0), Some(&sun())).expect("sun");
         w.set_environment(environment.gpu().address());
         drop(w);
         f.end().expect("end frame");
@@ -127,6 +118,16 @@ impl Showcase {
             _environment: environment,
         }
     }
+}
+
+/// A 100 klx sun along [`SUN`].
+pub fn sun() -> Light {
+    Light::Directional(DirectionalLight {
+        direction_to_light: SUN,
+        illuminance: SUN_ILLUMINANCE,
+        angular_radius: SUN_RADIUS,
+        disc: DiscProfile::LimbDarkened,
+    })
 }
 
 /// The camera on its orbit around [`TARGET`] at `angle` radians.

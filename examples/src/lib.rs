@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use orr::orr_gpu::{Device, DeviceDesc, QueueRequest};
 use orr::orr_output::orr_dlss::Uuid;
+use orr::orr_pack::{Archive, AssetId};
 use orr::{
     Affine3, DlssSdk, FrameDesc, FrameTime, LoadState, Loading, MountId, PackSource, Renderer,
     Screenshot,
@@ -239,10 +240,25 @@ pub fn fixed_time(n: u64) -> FrameTime {
 /// across runs. Returns the mount and the last frame id. Panics if the mount fails or takes
 /// longer than a minute.
 pub fn mount_at(renderer: &mut Renderer, source: PackSource, first_frame: u64) -> (MountId, u64) {
-    let mount = renderer.mount(source);
+    let (mounts, frame) = mount_all_at(renderer, vec![source], first_frame);
+    (mounts[0], frame)
+}
+
+/// [`mount_at`] for several sources at once.
+pub fn mount_all_at(
+    renderer: &mut Renderer,
+    sources: Vec<PackSource>,
+    first_frame: u64,
+) -> (Vec<MountId>, u64) {
+    let mounts: Vec<MountId> = sources.into_iter().map(|s| renderer.mount(s)).collect();
+    let pending = |r: &Renderer| {
+        mounts
+            .iter()
+            .any(|&m| matches!(r.mount_state(m), LoadState::Pending))
+    };
     let mut frame = 0;
     let start = Instant::now();
-    while matches!(renderer.mount_state(mount), LoadState::Pending) || frame < first_frame {
+    while pending(renderer) || frame < first_frame {
         frame += 1;
         let f = renderer
             .begin_frame(FrameDesc {
@@ -253,17 +269,27 @@ pub fn mount_at(renderer: &mut Renderer, source: PackSource, first_frame: u64) -
             .expect("begin frame");
         f.end().expect("end frame");
         assert!(start.elapsed() < Duration::from_secs(60), "mount pending");
-        if matches!(renderer.mount_state(mount), LoadState::Pending) {
+        if pending(renderer) {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
     if frame > first_frame {
         log::warn!("mounting took {frame} frames; this run will not repeat others exactly");
     }
-    if let LoadState::Failed(e) = renderer.mount_state(mount) {
-        panic!("mount failed: {e}");
+    for &m in &mounts {
+        if let LoadState::Failed(e) = renderer.mount_state(m) {
+            panic!("mount failed: {e}");
+        }
     }
-    (mount, frame)
+    (mounts, frame)
+}
+
+/// Blob 0 of entry `id` in `archive`, decoded: the header a CPU reader parses.
+pub fn entry_head(archive: &Archive, id: AssetId) -> Option<Vec<u8>> {
+    let b = archive.blobs(archive.find(id)?).first()?;
+    let mut bytes = vec![0; b.raw_len as usize];
+    archive.read(b, &mut bytes).ok()?;
+    Some(bytes)
 }
 
 /// Threads lent to orr's loading side until dropped.

@@ -84,5 +84,9 @@ path = "bench.rs"
 name = "skinned"
 path = "skinned.rs"
 
+[[example]]
+name = "tree-viewer"
+path = "tree-viewer.rs"
+
 [lints]
 workspace = true
