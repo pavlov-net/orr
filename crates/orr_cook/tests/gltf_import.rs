@@ -16,6 +16,7 @@ use orr_cook::{
 };
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{self, Cluster, MeshInfo, PageView};
+use orr_pack::model::ModelInfo;
 use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, AssetId, Class, Target};
 
@@ -262,6 +263,87 @@ fn float_part_attributes_round_to_parts() {
     }
     assert_eq!(cooked, expected);
     assert_eq!(cooked[7..], [0, 0]);
+}
+
+/// A grid skinned to two joints by x band, `base` and its child `limb`; vertex `blend`
+/// splits its weight between them.
+fn rigid_skin(path: &Path, blend: Option<usize>) -> (Vec<u32>, Vec<usize>) {
+    let (pos, _, idx) = grid(8, |_, _| 0.0);
+    let joint: Vec<usize> = pos.iter().map(|p| usize::from(p[0] > 0.5)).collect();
+    let joints: Vec<[u8; 4]> = joint.iter().map(|&j| [j as u8, 1, 0, 0]).collect();
+    let weights: Vec<[f32; 4]> = (0..pos.len())
+        .map(|i| match blend {
+            Some(b) if b == i => [0.5, 0.5, 0.0, 0.0],
+            _ => [1.0, 0.0, 0.0, 0.0],
+        })
+        .collect();
+    let ib = |t: [f32; 3]| glam::Mat4::from_translation(-glam::Vec3::from(t)).to_cols_array();
+    let binds = [ib([0.0, 0.0, 0.25]), ib([0.5, 0.0, 0.0])];
+    let mut g = Glb::default();
+    let pa = g.floats(&pos, "VEC3");
+    let jv = g.view(bytemuck::cast_slice(&joints), None);
+    let ja = g.accessor(jv, 5121, joints.len(), "VEC4", "");
+    let wa = g.floats(&weights, "VEC4");
+    let ba = g.floats(&binds, "MAT4");
+    let ia = g.indices(&idx);
+    g.write(
+        path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,2]}}],
+"nodes":[{{"name":"base","translation":[0,0,0.25],"children":[1]}},
+{{"name":"limb","translation":[0.5,0,-0.25]}},{{"mesh":0,"skin":0}}],
+"skins":[{{"joints":[0,1],"inverseBindMatrices":{ba}}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"JOINTS_0":{ja},"WEIGHTS_0":{wa}}},"indices":{ia}}}]}}]"#
+        ),
+    );
+    (idx, joint)
+}
+
+#[test]
+fn single_joint_skins_cook_as_rigid_parts() {
+    let d = dir("gltf-rigid-skin");
+    let path = d.join("rigid.glb");
+    let (idx, joint) = rigid_skin(&path, None);
+    let settings = GltfSettings {
+        parts_from_skin: true,
+        ..Default::default()
+    };
+    let (a, _) = cook(&path, settings.clone()).unwrap();
+    let m = mesh_of(&a, "g/mesh");
+    assert_eq!(m.info.header.attributes & mesh::MeshHeader::SKIN, 0);
+    let pivots: Vec<_> = m.info.parts.iter().map(|p| (p.pivot, p.joint)).collect();
+    assert_eq!(pivots, [([0.0, 0.0, 0.25], 0), ([0.5, 0.0, 0.0], 1)]);
+    let mut cooked = [0u32; 2];
+    for (c, ..) in &m.clusters {
+        cooked[usize::from(c.part)] += u32::from(c.tri_count);
+        let animated = c.flags & Cluster::ANIMATED_PART != 0;
+        assert_eq!(animated, c.part == 1);
+    }
+    let mut expected = [0u32; 2];
+    for t in idx.chunks(3) {
+        let v = [0, 1, 2].map(|k| joint[t[k] as usize]);
+        expected[if v[0] == v[1] || v[0] == v[2] {
+            v[0]
+        } else {
+            v[1]
+        }] += 1;
+    }
+    assert_eq!(cooked, expected);
+    let model = ModelInfo::parse(&read(
+        &a,
+        &a.blobs(a.find(AssetId::from_name("g")).unwrap())[0],
+    ));
+    assert_eq!(
+        model.unwrap().header.skeleton,
+        AssetId::from_name("g/skeleton")
+    );
+
+    rigid_skin(&path, Some(3));
+    let Err(e) = cook(&path, settings) else {
+        panic!("a blended vertex cooked");
+    };
+    let e = e.to_string();
+    assert!(e.contains("vertex 3 follows 2 joints"), "{e}");
 }
 
 /// One triangle per material, side by side.
@@ -1247,7 +1329,7 @@ fn a_statically_displaced_library_mesh_binds_its_material_without_displacement()
         ((x * 7 + y * 3) % 64 * 4) as u8
     });
     let e = a.find(AssetId::from_name("quad")).unwrap();
-    let model = orr_pack::model::ModelInfo::parse(&read(&a, &a.blobs(e)[0])).unwrap();
+    let model = ModelInfo::parse(&read(&a, &a.blobs(e)[0])).unwrap();
     assert_eq!(
         model.materials,
         vec![AssetId::from_name("quad/material/0/static")]

@@ -14,7 +14,9 @@
 //! float rounded to the nearest integer; 0 where a primitive lacks it). With skins the
 //! values are joints of the primitive's skin, pivots their bind positions and `Part::joint`
 //! the skeleton joint; without, pivots come from the `PartAttribute::pivot` attribute, else
-//! the model origin.
+//! the model origin. With `GltfSettings::parts_from_skin`, a skin whose vertices each follow
+//! one joint cooks as rigid parts instead of a skinned mesh: part `j` is skeleton joint `j`,
+//! pivoted at its bind position.
 //!
 //! Joined models (`GltfSettings::joined`) share the coarsest grid step among them, and each
 //! one's node must sit on that grid: translation a multiple of the step, rotation a multiple
@@ -177,6 +179,12 @@ pub(crate) fn import(
         ));
     }
 
+    if settings.parts_from_skin && settings.parts_from_attribute.is_some() {
+        return Err(fail(
+            "parts_from_skin and parts_from_attribute do not mix".into(),
+        ));
+    }
+    let rigid = skeleton.as_ref().filter(|_| settings.parts_from_skin);
     let (mut models, mut owner) = select_models(doc, &graph, settings).map_err(fail)?;
     let instanced = instanced_nodes(&src, &graph).map_err(fail)?;
     if !instanced.is_empty() && skeleton.is_some() {
@@ -341,9 +349,23 @@ pub(crate) fn import(
                         .map_err(fail_prim)?
                 }
             };
-            let (values, pivots) = match parts {
-                None => (Vec::new(), Vec::new()),
-                Some(pa) => {
+            let (values, pivots) = match (rigid, parts) {
+                (Some(_), _) => {
+                    let values = skin
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (j, w))| match w[1..] {
+                            [0, 0, 0] => Ok(u16::from(j[0])),
+                            _ => Err(fail_prim(format!(
+                                "vertex {i} follows {} joints; parts from a skin take one",
+                                w.iter().filter(|&&x| x > 0).count()
+                            ))),
+                        })
+                        .collect::<Result<_>>()?;
+                    (values, Vec::new())
+                }
+                (None, None) => (Vec::new(), Vec::new()),
+                (None, Some(pa)) => {
                     let values: Vec<u16> = match custom(&pa.name, 1)? {
                         Some(v) => v
                             .iter()
@@ -521,6 +543,16 @@ pub(crate) fn import(
                 None => "the scene has no triangles".into(),
             }));
         }
+        let joint_parts = rigid.map(|sk| {
+            let joints = 0..sk.info.joint_count() as u16;
+            PartData {
+                values: b.v.values.clone(),
+                count: joints.end,
+                by_section: false,
+                pivots: Pivots::PerValue(joints.map(|j| sk.bind_origin(j)).collect()),
+                joints: None,
+            }
+        });
         let mesh_parts = parts.map(|pa| PartData {
             values: b.v.values.clone(),
             count: pa.parts,
@@ -555,11 +587,11 @@ pub(crate) fn import(
                     uvs: v.uvs,
                     indices,
                     sections,
-                    skin: skeleton.is_some().then_some(Skin {
+                    skin: (skeleton.is_some() && rigid.is_none()).then_some(Skin {
                         joints: v.joints,
                         weights: v.weights,
                     }),
-                    parts: mesh_parts,
+                    parts: mesh_parts.or(joint_parts),
                     min_exponent: None,
                 },
                 skeleton: skeleton.as_ref().map(|_| 0),
