@@ -42,6 +42,9 @@ pub struct ViewLighting {
     pub max_bounces: u32,
     /// Dielectric and presence vertices a path may have, its first included.
     pub dielectric_depth: u32,
+    /// Whether dielectrics with a dispersion (an Abbe number and a dispersion scale above 0)
+    /// split light by wavelength. Off, they refract at their IOR at 587.6 nm.
+    pub dispersion: bool,
     /// Steps of a subsurface walk before it stops and keeps the share it would yet carry
     /// out, clamped to [`SSS_STEPS`](crate::SSS_STEPS).
     pub sss_max_steps: u32,
@@ -72,6 +75,7 @@ impl Default for ViewLighting {
             local_light_share: 0.5,
             max_bounces: 3,
             dielectric_depth: 4,
+            dispersion: true,
             sss_max_steps: 16,
             sss_depth: SubsurfaceDepth::FirstEvent,
             pixel_fraction: 1.0,
@@ -222,9 +226,11 @@ const REFERENCE_ROULETTE_DEPTH: u32 = 64;
 /// `path`'s `CACHE_TERMINATE`.
 const CACHE_TERMINATE: u32 = 1;
 
-/// `dielectric`'s `DIELECTRIC_REFERENCE`, `DIELECTRIC_DEBUG_LAYER` and `DIELECTRIC_FROST`.
+/// `dielectric`'s `DIELECTRIC_REFERENCE`, `DIELECTRIC_DEBUG_LAYER`, `DIELECTRIC_DISPERSION`
+/// and `DIELECTRIC_FROST`.
 const DIELECTRIC_REFERENCE: u32 = 1;
 const DIELECTRIC_DEBUG_LAYER: u32 = 2;
+const DIELECTRIC_DISPERSION: u32 = 4;
 const DIELECTRIC_FROST: u32 = 8;
 
 /// `path`'s `SSS_PRIMARY_ONLY`.
@@ -998,6 +1004,9 @@ impl LightingKernels {
         }
         if lighting.debug_view == LightingDebugView::DielectricLayer {
             flags |= DIELECTRIC_DEBUG_LAYER;
+        }
+        if lighting.dispersion {
+            flags |= DIELECTRIC_DISPERSION;
         }
         if pass.frosted_glass {
             flags |= DIELECTRIC_FROST;

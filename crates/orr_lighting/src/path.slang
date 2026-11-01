@@ -519,7 +519,7 @@ public BsdfSample walk_exit_sample(WalkExitScatter f, inout Sampler rng)
     float3 t, b;
     orthonormal_basis(f.n, t, b);
     float3 l = sample_cosine_hemisphere(rng.next2());
-    BsdfSample bs;
+    BsdfSample bs = (BsdfSample)0;
     bs.wi = normalize(from_local(l, t, b, f.n));
     bs.pdf = cosine_hemisphere_pdf(l.z);
     bs.weight = bs.pdf > 0.0 ? bsdf_walk_exit(f.p, f.n, bs.wi, rng.next4().xyz) : float3(0.0);

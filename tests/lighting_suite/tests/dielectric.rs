@@ -1,21 +1,24 @@
 //! The dielectric dispatch on the bed: the interior list, Beer transmittance through a slab,
 //! rough refraction, the glass furnace, single scattering against a CPU integral, an albedo-1
-//! medium, presence layers, a camera inside water, layer guides under camera rotation, and
-//! the frosted-glass term of rough glass.
+//! medium, presence layers, a camera inside water, layer guides under camera rotation,
+//! the frosted-glass term of rough glass, and dispersion: a white line through a prism
+//! against a CPU model, a dispersive furnace, and paths without dispersive hits.
 
 use lighting_suite::bed::{
-    Accumulated, Analytic, Bed, CLOUD_SPHERE, EMITTER_LUMINANCE, EXTENT, FLOOR, FURNACE_RADIANCE,
-    FrostGuide, GLASS_SPHERE, Item, LIGHT_FLOOR, MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB,
-    PRESENCE_VEIL, PRESENCE_VEIL_OPACITY, Paths, ROUGH_SLAB, SMOOTH_FLOOR, SUN, Spec, TINTED_SLAB,
-    WATER_BOX, fresnel, water_transmission,
+    Accumulated, Analytic, Bed, CLOUD_SPHERE, DISPERSIVE_SPHERE, EMITTER_LUMINANCE, EXTENT, FLOOR,
+    FURNACE_RADIANCE, FrostGuide, GLASS_SPHERE, Item, LIGHT_FLOOR, LINE, LINE_HALF_HEIGHT,
+    LINE_HALF_WIDTH, MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, PRESENCE_VEIL, PRESENCE_VEIL_OPACITY,
+    PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR, Paths, ROUGH_SLAB, SMOOTH_FLOOR, SUN, Spec,
+    TINTED_SLAB, WATER_BOX, fresnel, prism_corners, water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
 use lighting_suite::{assert_clean, pipeline, readback, render, run, upload};
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::{
-    DirectionalLight, DiscProfile, Light, PathEntry, ReferenceSettings, ViewLighting,
+    DirectionalLight, DiscProfile, Light, LightingDebugView, PathEntry, ReferenceSettings,
+    ViewLighting,
 };
-use orr_math::{Mat3, Vec3};
+use orr_math::{DMat3, DVec3, Mat3, Vec3};
 
 /// `MATERIAL_NONE`.
 const NONE: u32 = u32::MAX;
@@ -419,6 +422,274 @@ fn rough_glass_adds_its_blur_into_the_depth_of_field_guide() {
     let (_, smooth) = render(TINTED_SLAB);
     for (i, &g) in smooth.iter().enumerate() {
         assert_eq!(g, FILL, "pixel {i} under smooth glass");
+    }
+    assert_clean();
+}
+
+/// A clear dispersive glass sphere in a uniform environment keeps its energy and its color:
+/// the wavelengths a path splits into return to white on average.
+#[test]
+fn a_dispersive_sphere_in_a_furnace_stays_white() {
+    let spec = Spec {
+        copies: vec![at(DISPERSIVE_SPHERE, Vec3::ZERO)],
+        lights: Vec::new(),
+        environment: Some(FURNACE_RADIANCE),
+        eye: Vec3::new(0.0, 0.0, 4.0),
+        target: Vec3::ZERO,
+        fov_y: 0.6,
+        focus: None,
+    };
+    let settings = ViewLighting {
+        dielectric_depth: 8,
+        ..reference(4)
+    };
+    let image = render_paths(&mut Bed::with(spec), &paths(settings), 64);
+    let mean = drawn_mean(&image);
+    for c in 0..3 {
+        let ratio = mean[c] / f64::from(FURNACE_RADIANCE[c]);
+        assert!(
+            (0.97..=1.02).contains(&ratio),
+            "channel {c}: {ratio} of the environment"
+        );
+    }
+    assert_clean();
+}
+
+/// Without a dispersive material, turning dispersion off changes no pixel's radiance or ray
+/// count. The scene has no light the light set samples, whose presampling differs between
+/// beds.
+#[test]
+fn paths_without_dispersive_hits_ignore_the_dispersion_setting() {
+    let spec = from_above(
+        vec![
+            at(LIGHT_FLOOR, Vec3::ZERO),
+            at(ROUGH_SLAB, Vec3::new(0.0, 0.5, 0.0)),
+            at(GLASS_SPHERE, Vec3::new(0.6, 1.2, 0.0)),
+        ],
+        Vec::new(),
+        3.0,
+    );
+    let mut bed = Bed::with(spec);
+    let mut paths = paths(reference(2));
+    let mut render = |dispersion, debug_view| {
+        paths.settings = ViewLighting {
+            dispersion,
+            debug_view,
+            ..reference(2)
+        };
+        render_paths(&mut bed, &paths, 2)
+    };
+    for view in [LightingDebugView::None, LightingDebugView::RaysPerPixel] {
+        let (on, off, again) = (render(true, view), render(false, view), render(true, view));
+        assert!(on.mean.iter().any(|p| p[3] > 0.5), "nothing drawn");
+        assert!(on == again, "{view:?} differs between identical runs");
+        assert!(on == off, "{view:?} differs");
+    }
+    assert_clean();
+}
+
+/// The CIE 1931 2-deg observer as the kernels fit it (Wyman, Sloan and Shirley's multi-lobe
+/// fit).
+fn cie_xyz(nm: f64) -> DVec3 {
+    let g = |mean: f64, below: f64, above: f64| {
+        let t = (nm - mean) / if nm < mean { below } else { above };
+        (-0.5 * t * t).exp()
+    };
+    DVec3::new(
+        1.056 * g(599.8, 37.9, 31.0) + 0.362 * g(442.0, 16.0, 26.7) - 0.065 * g(501.1, 20.4, 26.2),
+        0.821 * g(568.8, 46.9, 40.5) + 0.286 * g(530.9, 16.3, 31.1),
+        1.217 * g(437.0, 11.8, 36.0) + 0.681 * g(459.0, 26.0, 13.8),
+    )
+}
+
+/// The CPU model's wavelength step, nm, over 360-830 nm.
+const STEP_NM: f64 = 0.25;
+
+fn wavelengths() -> impl Iterator<Item = f64> {
+    (0..=(470.0 / STEP_NM) as usize).map(|i| 360.0 + i as f64 * STEP_NM)
+}
+
+/// The Rec.2020 color each nm of a white spectrum adds, as the kernels take it back from
+/// the sampled wavelengths: the color matching functions times the inverse of the round
+/// trip's integral.
+fn spectral_colors() -> impl Fn(f64) -> DVec3 {
+    let m = orr_color::RgbPrimaries::REC2020.xyz_to_rgb();
+    let to_rgb = DMat3::from_cols_array_2d(&m).transpose();
+    let rgb = move |nm: f64| to_rgb * cie_xyz(nm);
+    let basis = move |nm: f64| {
+        let c = rgb(nm).max(DVec3::ZERO);
+        c / c.element_sum()
+    };
+    let sum = wavelengths().map(|nm| rgb(nm) * STEP_NM).sum::<DVec3>();
+    let mut round_trip = DMat3::ZERO;
+    for nm in wavelengths() {
+        let c = rgb(nm) / sum * STEP_NM;
+        let b = basis(nm);
+        round_trip += DMat3::from_cols(c * b.x, c * b.y, c * b.z);
+    }
+    let back = round_trip.inverse() * DMat3::from_diagonal(1.0 / sum);
+    move |nm| back * rgb(nm)
+}
+
+/// The prism glass's IOR at `nm`: OpenPBR's Cauchy fit through its IOR at 587.6 nm and its
+/// Abbe number over 486.1 and 656.3 nm.
+fn prism_ior(nm: f64) -> f64 {
+    let (d, f, c) = (587.6f64, 486.1f64, 656.3f64);
+    let n_d = f64::from(PRISM_IOR);
+    let b = (n_d - 1.0) / (f64::from(PRISM_ABBE) * (f.powi(-2) - c.powi(-2)));
+    n_d + b * (nm.powi(-2) - d.powi(-2))
+}
+
+/// Refraction of unit `d` through a surface of unit normal `n` facing against it, from IOR
+/// `from` to `to`; none on total internal reflection.
+fn refract(d: DVec3, n: DVec3, from: f64, to: f64) -> Option<DVec3> {
+    let eta = from / to;
+    let c = -d.dot(n);
+    let k = 1.0 - eta * eta * (1.0 - c * c);
+    (k >= 0.0).then(|| eta * d + (eta * c - k.sqrt()) * n)
+}
+
+/// The prism's side faces: two corners and the outward normal.
+fn prism_faces() -> [(DVec3, DVec3, DVec3); 3] {
+    let corners = prism_corners().map(Vec3::as_dvec3);
+    std::array::from_fn(|i| {
+        let (p, q) = (corners[i], corners[(i + 1) % 3]);
+        let n = DVec3::Y.cross(q - p).normalize();
+        (p, q, if n.dot(p + q) < 0.0 { -n } else { n })
+    })
+}
+
+/// A ray from `o` along `d` through the prism at IOR `ior`: where it leaves, its direction
+/// and the Fresnel transmission of both faces.
+fn through_prism(o: DVec3, d: DVec3, ior: f64) -> Option<(DVec3, DVec3, f64)> {
+    let faces = prism_faces();
+    // The nearest side face the ray meets from outside, or from inside.
+    let hit = |o: DVec3, d: DVec3, inside: bool| {
+        faces
+            .iter()
+            .filter_map(|&(p, q, n)| {
+                let facing = d.dot(n);
+                if facing == 0.0 || (facing > 0.0) != inside {
+                    return None;
+                }
+                let t = (p - o).dot(n) / facing;
+                let x = o + d * t;
+                let along = (x - p).dot(q - p) / (q - p).length_squared();
+                let on = (0.0..=1.0).contains(&along) && x.y.abs() < f64::from(PRISM_HALF_HEIGHT);
+                (t > 1e-9 && on).then_some((t, x, n))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+    };
+    let (_, x1, n1) = hit(o, d, false)?;
+    let inner = refract(d, n1, 1.0, ior)?;
+    let (_, x2, n2) = hit(x1, inner, true)?;
+    let out = refract(inner, -n2, ior, 1.0)?;
+    let t = (1.0 - fresnel(ior, -d.dot(n1))) * (1.0 - fresnel(1.0 / ior, inner.dot(n2)));
+    Some((x2, out, t))
+}
+
+/// A thin white line seen through a dispersive prism near minimum deviation splits into its
+/// spectrum. Each pixel's ray, refracted at each wavelength's IOR, reaches the line over a
+/// band of wavelengths; the CPU model adds their colors per pixel. The distance between the
+/// blue and red channels' centroids along the rows, which the spread between 486 and 656 nm
+/// sets, matches the model's within 2%, and each channel's light within 3%.
+#[test]
+fn a_white_line_seen_through_a_prism_splits_by_the_abbe_number() {
+    let ior = f64::from(PRISM_IOR);
+    // The ray that refracts at 587.6 nm into a path parallel to the base.
+    let [(_, _, entry), (base_start, base_end, _), _] = prism_faces();
+    let inside = (base_end - base_start).normalize();
+    let forward = -refract(-inside, -entry, ior, 1.0).expect("leaves the entry face");
+    let eye = -forward * 3.0;
+    let (exit, out, _) = through_prism(eye, forward, ior).expect("crosses the prism");
+    let line_at = exit + out * 4.0;
+    let facing = -out;
+    let line = Item {
+        model: LINE,
+        linear: Mat3::from_rotation_y(facing.x.atan2(facing.z) as f32),
+        at: line_at.as_vec3(),
+    };
+    let fov_y = 0.16f32;
+    let spec = Spec {
+        copies: vec![at(PRISM, Vec3::ZERO), line],
+        lights: Vec::new(),
+        environment: None,
+        eye: eye.as_vec3(),
+        target: Vec3::ZERO,
+        fov_y,
+        focus: None,
+    };
+    let image = render_paths(&mut Bed::with(spec), &paths(reference(0)), 256);
+
+    let [w, h] = EXTENT;
+    let (wf, hf) = (f64::from(w), f64::from(h));
+    let back = -forward;
+    let right = DVec3::Y.cross(back).normalize();
+    let up = back.cross(right);
+    let tan = f64::from(fov_y * 0.5).tan();
+    let lateral = DVec3::Y.cross(facing);
+    let color = spectral_colors();
+    let luminance = f64::from(EMITTER_LUMINANCE);
+    let mut model = vec![DVec3::ZERO; w as usize];
+    let mut rendered = vec![DVec3::ZERO; w as usize];
+    for y in h / 2 - 8..h / 2 + 8 {
+        for x in 0..w {
+            let p = image.mean[(y * w + x) as usize];
+            rendered[x as usize] += DVec3::new(p[0].into(), p[1].into(), p[2].into());
+            let sx = (2.0 * (f64::from(x) + 0.5) / wf - 1.0) * tan * wf / hf;
+            let sy = (1.0 - 2.0 * (f64::from(y) + 0.5) / hf) * tan;
+            let d = (forward + right * sx + up * sy).normalize();
+            for nm in wavelengths() {
+                let Some((o, d, t)) = through_prism(eye, d, prism_ior(nm)) else {
+                    continue;
+                };
+                let toward = d.dot(-facing);
+                if toward <= 0.0 {
+                    continue;
+                }
+                let off = o + d * ((line_at - o).dot(-facing) / toward) - line_at;
+                if off.dot(lateral).abs() < f64::from(LINE_HALF_WIDTH)
+                    && off.y.abs() < f64::from(LINE_HALF_HEIGHT)
+                {
+                    model[x as usize] += color(nm) * (t * luminance * STEP_NM);
+                }
+            }
+        }
+    }
+    // The columns the model's spectrum spans. Light that reaches the line by other routes,
+    // such as a reflection off the base between the two refractions, which undoes the
+    // dispersion, lands elsewhere and is left out.
+    let lit: Vec<usize> = (0..w as usize)
+        .filter(|&x| model[x].abs().max_element() > 0.0)
+        .collect();
+    let span = lit[0]..=lit[lit.len() - 1];
+    // Where along the row channel `c`'s light lies, in pixels, and how much there is.
+    let centroid = |row: &[DVec3], c: usize| {
+        let sum: f64 = span.clone().map(|x| row[x][c]).sum();
+        let at: f64 = span.clone().map(|x| x as f64 * row[x][c]).sum();
+        (at / sum, sum)
+    };
+    let (model_blue, model_blue_sum) = centroid(&model, 2);
+    let (model_red, model_red_sum) = centroid(&model, 0);
+    let (blue, blue_sum) = centroid(&rendered, 2);
+    let (red, red_sum) = centroid(&rendered, 0);
+    let (wanted, got) = (model_blue - model_red, blue - red);
+    assert!(
+        wanted.abs() > 10.0,
+        "the model's blue and red lie {wanted} pixels apart"
+    );
+    assert!(
+        (got - wanted).abs() <= 0.02 * wanted.abs(),
+        "blue and red lie {got} pixels apart, in the model {wanted}"
+    );
+    for (what, a, b) in [
+        ("red", red_sum, model_red_sum),
+        ("blue", blue_sum, model_blue_sum),
+    ] {
+        assert!(
+            (a - b).abs() <= 0.03 * b,
+            "{what} light {a}, in the model {b}"
+        );
     }
     assert_clean();
 }

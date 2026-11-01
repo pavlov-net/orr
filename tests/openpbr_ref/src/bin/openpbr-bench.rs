@@ -69,15 +69,15 @@ fn main() {
     let rows = materials
         .iter()
         .enumerate()
-        .map(|(i, m)| (m.name, table.gpu.offset(i as u64), 1, 1))
-        .chain([("all, mixed per thread", table.gpu, inputs.len() as u32, 0)]);
+        .map(|(i, m)| (m.name, table.gpu().offset(i as u64), 1, 1))
+        .chain([("all, mixed per thread", table.gpu(), inputs.len() as u32, 0)]);
     for (name, first, count, coherent) in rows {
         let modes = [0, EVAL, SAMPLE, EVAL | SAMPLE];
         let slots = roots.as_mut_slice().expect("mapped");
         for (slot, mode) in slots.iter_mut().zip(modes) {
             *slot = Root {
                 materials: first,
-                sink: sink.gpu,
+                sink: sink.gpu(),
                 material_count: count,
                 coherent,
                 calls: CALLS,
@@ -89,7 +89,7 @@ fn main() {
             };
         }
         let ms: Vec<f64> = (0..modes.len())
-            .map(|k| median_ms(&device, &pipeline, roots.gpu.offset(k as u64)))
+            .map(|k| median_ms(&device, &pipeline, roots.gpu().offset(k as u64)))
             .collect();
         let per = |t: f64| t * 1e6 / f64::from(THREADS);
         let per_call = |t: f64| (t - ms[0]).max(0.0) * 1e6 / f64::from(THREADS * CALLS);
