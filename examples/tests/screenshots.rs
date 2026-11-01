@@ -70,26 +70,78 @@ fn compare(name: &str, c: Capture) {
     );
 }
 
+fn headless(rest: &[&str]) -> Options {
+    Options::headless(120, rest)
+}
+
 #[test]
-fn examples_match_their_references() {
+fn gpu_basics_matches_its_reference() {
     let _serial = serial();
-    compare("gpu-basics", gpu_basics::run(&Options::headless(120, &[])));
-    let cluster_rt =
-        |rest: &[&str]| cluster_rt::run(&Options::headless(120, rest)).expect("headless capture");
+    compare("gpu-basics", gpu_basics::run(&headless(&[])));
+    assert_clean();
+}
+
+#[test]
+fn cluster_rt_matches_its_references() {
+    let _serial = serial();
+    let cluster_rt = |rest: &[&str]| cluster_rt::run(&headless(rest)).expect("headless capture");
     compare("cluster-rt", cluster_rt(&[]));
     compare("cluster-rt-clusters", cluster_rt(&["--clusters"]));
-    let viewer = viewer::run(&Options::headless(120, &[])).expect("headless capture");
-    compare("viewer", viewer);
-    let rigid = rigid_parts::run(&Options::headless(120, &[])).expect("headless capture");
-    compare("rigid-parts", rigid);
-    let water = dielectrics::run(&Options::headless(120, &[])).expect("headless capture");
-    compare("dielectrics", water);
-    let field = producer_field::run(&Options::headless(120, &[])).expect("headless capture");
+    assert_clean();
+}
+
+#[test]
+fn viewer_matches_its_reference() {
+    let _serial = serial();
+    compare(
+        "viewer",
+        viewer::run(&headless(&[])).expect("headless capture"),
+    );
+    assert_clean();
+}
+
+#[test]
+fn rigid_parts_matches_its_reference() {
+    let _serial = serial();
+    compare(
+        "rigid-parts",
+        rigid_parts::run(&headless(&[])).expect("headless capture"),
+    );
+    assert_clean();
+}
+
+#[test]
+fn dielectrics_matches_its_reference() {
+    let _serial = serial();
+    compare(
+        "dielectrics",
+        dielectrics::run(&headless(&[])).expect("headless capture"),
+    );
+    assert_clean();
+}
+
+#[test]
+fn producer_field_matches_its_reference() {
+    let _serial = serial();
+    let field = producer_field::run(&headless(&[])).expect("headless capture");
     compare("producer-field", field);
-    let skinned = skinned::run(&Options::headless(120, &[])).expect("headless capture");
-    compare("skinned", skinned);
-    let forest = dense_vegetation::capture(&Options::headless(120, &DENSE_VEGETATION))
-        .expect("headless capture");
+    assert_clean();
+}
+
+#[test]
+fn skinned_matches_its_reference() {
+    let _serial = serial();
+    compare(
+        "skinned",
+        skinned::run(&headless(&[])).expect("headless capture"),
+    );
+    assert_clean();
+}
+
+#[test]
+fn dense_vegetation_matches_its_reference() {
+    let _serial = serial();
+    let forest = dense_vegetation::capture(&headless(&DENSE_VEGETATION)).expect("headless capture");
     compare("dense-vegetation", forest);
     assert_clean();
 }

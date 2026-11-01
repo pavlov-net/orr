@@ -252,6 +252,10 @@ impl SceneLighting {
         &self.settings
     }
 
+    pub(crate) fn device(&self) -> &Device {
+        &self.device
+    }
+
     /// A change of `emissive_clusters` reallocates the cluster pool, and a change of
     /// `world_cache` reallocates and clears the cache; old buffers are freed once the work
     /// submitted so far has completed.

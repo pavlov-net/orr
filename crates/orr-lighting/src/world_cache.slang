@@ -300,8 +300,7 @@ public void cache_add(WorldCacheGpu* c, uint64_t key, float3 sample)
 }
 
 // The resolved E / pi of `key`'s cell; false when the cell is absent or has no history yet.
-// Counts a query.
-public bool cache_lookup(WorldCacheGpu* c, uint64_t key, out float3 radiance)
+public bool cache_read(WorldCacheGpu* c, uint64_t key, out float3 radiance)
 {
     radiance = float3(0.0);
     uint slot;
@@ -310,6 +309,13 @@ public bool cache_lookup(WorldCacheGpu* c, uint64_t key, out float3 radiance)
     found = found && cache_history(r) > 0;
     if (found)
         radiance = cache_radiance(r);
+    return found;
+}
+
+// `cache_read` by a path that may end there, counted as a query.
+public bool cache_lookup(WorldCacheGpu* c, uint64_t key, out float3 radiance)
+{
+    bool found = cache_read(c, key, radiance);
     count_add(c.counters + COUNT_QUERIES, true);
     count_add(c.counters + COUNT_HITS, found);
     return found;
@@ -328,8 +334,16 @@ public float3 world_cache_irradiance(WorldCacheGpu* c, SceneRoot* s, float3 posi
 {
     CacheCell cell = cache_cell(c, s, position, normal, rng.next4().xyz, true);
     float3 radiance;
-    cache_lookup(c, cell.key, radiance);
+    cache_read(c, cell.key, radiance);
     return radiance * PI;
+}
+
+// Irradiance on both faces of a plane at render-space `position` with normal `axis`, from
+// the cache: what a two-sided particle or a point in a medium facing `axis` receives. A face
+// no resolved cell covers adds 0. Draws two sampler dimensions.
+public float3 particle_irradiance(WorldCacheGpu* c, SceneRoot* s, float3 position, float3 axis, inout Sampler rng)
+{
+    return world_cache_irradiance(c, s, position, axis, rng) + world_cache_irradiance(c, s, position, -axis, rng);
 }
 
 // The scene's global light: directional illuminance at the focus plus the dome's

@@ -32,6 +32,7 @@ import light_sampling;
 import world_cache;
 import path;
 import guides;
+import froxels;
 
 // Interior list entries a path keeps.
 public static const uint INTERIOR_ENTRIES = 4;
@@ -585,7 +586,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
         else if (h.hit && (ray.chain || t >= INSCATTER_SEGMENT))
         {
             float3 through;
-            float3 e = segment_inscatter<M>(set, ray.origin, ray.dir, t, r.segment_steps, rng.next(), through);
+            float3 e = froxel_segment_inscatter<M>(r.froxels, v, set, ray.origin, ray.dir, t, r.segment_steps, rng.next(), through);
             if (counted)
                 radiance += throughput * e;
             throughput *= through;
@@ -938,6 +939,10 @@ public void dielectric_body<C : ICoherence, S : ISurface, E : IEnvironment, M : 
             wt = luminance_rec2020(b1.albedo().transmission);
         }
     }
+    if (interior.count > 0)
+        guide.medium_end = -1.0;
+    else if (hit_layer)
+        guide.medium_end = t_near + h.t;
     r.layers[index] = guide;
     if (!hit_layer && interior.count == 0)
     {

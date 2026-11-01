@@ -13,6 +13,7 @@ use orr_scene::{
     ViewConstants, ViewDesc, ViewStep,
 };
 
+use crate::media::{MediaKernels, MediaSettings, MediaStats, MediaView};
 use crate::scene::{FRAME_SLOTS, Ring, device_local};
 use crate::shaders::dielectric::dispatch;
 use crate::shaders::guides::resolve;
@@ -65,18 +66,6 @@ impl Default for ViewLighting {
             debug_view: LightingDebugView::None,
             reference: None,
         }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct MediaSettings {
-    /// Steps of the in-scatter march on path segments of 500 m or more.
-    pub segment_steps: u32,
-}
-
-impl Default for MediaSettings {
-    fn default() -> Self {
-        Self { segment_steps: 16 }
     }
 }
 
@@ -156,6 +145,11 @@ pub enum LightingDebugView {
     /// albedo in red, its transmission's in green, and the path's dielectric vertices over
     /// `dielectric_depth` in blue.
     DielectricLayer,
+    /// The media's in-scatter over each pixel's camera segment alone.
+    Media,
+    /// The froxel volume: each pixel's media transmittance in red, its depth as a share of
+    /// the froxel slices in green, and a checker of the froxel columns in blue.
+    Froxels,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -301,6 +295,7 @@ pub struct LightingView {
     guide_roots: Ring<GuideRoot>,
     previous: Option<(SceneId, DVec3, Quat)>,
     history_reset: bool,
+    pub(crate) media: MediaView,
 }
 
 impl LightingView {
@@ -389,6 +384,7 @@ impl LightingView {
             guide_roots: Ring::new(device, "guide roots")?,
             previous: None,
             history_reset: true,
+            media: MediaView::new(device)?,
         })
     }
 
@@ -491,6 +487,37 @@ impl LightingView {
     }
 }
 
+impl LightingView {
+    /// The layer guides the dielectric dispatch of `frame` wrote; null when it did not run.
+    pub(crate) fn layer_guides(&self, frame: u64) -> GpuPtr<LayerGuide> {
+        if self.layers_frame == Some(frame) {
+            self.layers.gpu()
+        } else {
+            GpuPtr::NULL
+        }
+    }
+
+    /// The froxel counts of `frame`, once its submit has completed; `None` when that frame
+    /// recorded no froxels or its slot holds a later frame.
+    pub fn media_stats(&self, frame: u64) -> Option<MediaStats> {
+        self.media.stats(frame)
+    }
+
+    /// RGBA16F 3D, the froxels' isotropic incident radiance (unexposed, nits) as the last
+    /// [`LightingKernels::record_media`] wrote it, with the visibility of the first shadowed
+    /// directional light in A; `None` before the first.
+    pub fn froxel_incident(&self) -> Option<TextureIndex> {
+        self.media.incident()
+    }
+
+    /// RGBA16F 3D, per froxel the pre-exposed in-scatter from the eye to its far boundary in
+    /// RGB and the luminance of the transmittance in A; `None` before the first
+    /// [`LightingKernels::record_media`].
+    pub fn froxel_integrated(&self) -> Option<TextureIndex> {
+        self.media.integrated()
+    }
+}
+
 impl Drop for LightingView {
     fn drop(&mut self) {
         for &slot in &self.slots {
@@ -557,6 +584,7 @@ pub struct LightingKernels {
     update: PathPipeline,
     guides: ComputePipeline,
     local: ComputePipeline,
+    media: MediaKernels,
 }
 
 /// The specialisation constants of kernel module `$kernel`, which imports `bsdf`.
@@ -619,7 +647,43 @@ impl LightingKernels {
             update,
             guides,
             local: pipeline(device, kernels, &local::MODULE, "main")?,
+            media: MediaKernels::new(device, kernels)?,
         })
+    }
+
+    /// Records the froxel passes of `pass` after the scene's [`SceneLighting::record`], the
+    /// view's raster half and [`LightingView::begin`]: picks the shadowed directional lights,
+    /// writes the linked medium into the froxels, the light reaching those in front of the
+    /// view's surfaces (blended with their reprojected history) and each column's in-scatter
+    /// and transmittance. The outputs are visible to later compute and ray stages. Makes the
+    /// view's froxel targets at its first call and when the extent or the media settings
+    /// that shape them change; a history reset, a new `near_range` and new targets restart
+    /// the froxel history.
+    pub fn record_media(
+        &self,
+        list: &mut CommandList<'_>,
+        scene: &SceneLighting,
+        view: &mut LightingView,
+        pass: &ViewPass,
+        lighting: &ViewLighting,
+    ) -> Result<(), Error> {
+        self.media.record(list, scene, view, pass, lighting)
+    }
+
+    /// Records media apply into `view`'s radiance after [`Self::record_media`] and the paths
+    /// that wrote the radiance: each pixel's radiance x the transmittance over its camera
+    /// segment, plus the in-scatter over it, to its surface or the scene's `near_range`,
+    /// whichever is nearer (sky pixels take the whole range). The reference marches the
+    /// segment per pixel instead. Orders nothing after it.
+    pub fn record_media_apply(
+        &self,
+        list: &mut CommandList<'_>,
+        scene: &SceneLighting,
+        view: &mut LightingView,
+        pass: &ViewPass,
+        lighting: &ViewLighting,
+    ) {
+        self.media.record_apply(list, scene, view, pass, lighting);
     }
 
     /// Records the world cache's update paths, the view's local light samplers and the
@@ -644,7 +708,9 @@ impl LightingKernels {
         let mode = match lighting.debug_view {
             LightingDebugView::None
             | LightingDebugView::Guide(_)
-            | LightingDebugView::DielectricLayer => 0,
+            | LightingDebugView::DielectricLayer
+            | LightingDebugView::Media
+            | LightingDebugView::Froxels => 0,
             LightingDebugView::DirectOnly => 1,
             LightingDebugView::IndirectOnly => 2,
             LightingDebugView::NeeOnly => 3,
@@ -714,12 +780,11 @@ impl LightingKernels {
             local_columns: view.local_tiles[0],
             light_flags: if reference { 0 } else { LIGHT_FEEDBACK_COUNT },
             layers: GpuPtr::NULL,
+            froxels: GpuPtr::NULL,
             dielectric_depth: 0,
             camera_medium: NO_MATERIAL,
             dielectric_flags: 0,
             _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
         };
         let root = view.roots.write(slot, path_root);
         view.path = Some((pass.frame, path_root));
@@ -749,8 +814,10 @@ impl LightingKernels {
     /// presence layer, whose path replaces the pixel's radiance, and leaves the layer's guide
     /// for [`Self::record_guides`]. Pixels whose eye lies inside
     /// [`ViewLighting::camera_medium`] trace their path through it from the G-buffer's surface
-    /// too. Camera rays are pinhole rays whatever the reference's lens. Records nothing
-    /// without the opaque dispatch of `pass.frame`. Orders nothing after it.
+    /// too. Outside the reference, segments between layers read the froxels of
+    /// [`Self::record_media`] of the same frame where it ran. Camera rays are pinhole rays
+    /// whatever the reference's lens. Records nothing without the opaque dispatch of
+    /// `pass.frame`. Orders nothing after it.
     pub fn record_dielectric(
         &self,
         list: &mut CommandList<'_>,
@@ -763,8 +830,10 @@ impl LightingKernels {
         };
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         let mut flags = 0;
+        let mut froxels = view.media.volume(pass.frame);
         if lighting.reference.is_some() {
             flags |= DIELECTRIC_REFERENCE;
+            froxels = GpuPtr::NULL;
         }
         if lighting.debug_view == LightingDebugView::DielectricLayer {
             flags |= DIELECTRIC_DEBUG_LAYER;
@@ -774,6 +843,7 @@ impl LightingKernels {
             PathRoot {
                 light_flags: 0,
                 layers: view.layers.gpu(),
+                froxels,
                 dielectric_depth: lighting.dielectric_depth,
                 camera_medium: lighting.camera_medium.map_or(NO_MATERIAL, |m| m.0),
                 dielectric_flags: flags,
@@ -813,11 +883,7 @@ impl LightingKernels {
                 scene: pass.scene,
                 view: pass.view,
                 gbuffer: pass.gbuffer,
-                layers: if view.layers_frame == Some(pass.frame) {
-                    view.layers.gpu()
-                } else {
-                    GpuPtr::NULL
-                },
+                layers: view.layer_guides(pass.frame),
                 radiance: view.targets.radiance.storage(0),
                 diffuse_albedo: view.targets.diffuse_albedo.storage(0),
                 specular_albedo: view.targets.specular_albedo.storage(0),
