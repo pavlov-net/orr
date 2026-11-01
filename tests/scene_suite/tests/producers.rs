@@ -5,29 +5,41 @@
 //! tessellated entries: a plane of patches with a uv seam diced at mixed rates against a CPU
 //! reference of the pattern table, closed in raster and rays once displaced, with normals
 //! of its displaced field, displaced by a material texture, and a rate that steps down
-//! near capacity.
+//! near capacity; and subdivision copies: closed cages with creases, a corner, n-gons and
+//! extraordinary points diced at mixed rates onto a CPU limit surface, closed bit for bit,
+//! rippled along the limit normal, agreeing in raster and rays, and a skinned cage posed
+//! before it dices with last frame's pose for motion.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use glam::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
+use orr_cook::{
+    ArchiveSpec, AssetSpec, CageInput, Corner, Crease, FaceVarying, Manifest, Source, SubdSettings,
+    Subdivision, UsdSettings,
+};
 use orr_gpu::{
     Blend, ClearColor, ColorAttachment, ColorLoad, ColorMask, ColorTarget, Format, Hazards,
     MemoryKind, MeshPipelineDesc, QueueKind, RasterState, Rendering, SamplerDesc, ShaderStage,
     SpecData, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
     TextureRegion, TextureUsage,
 };
+use orr_pack::AssetId;
+use orr_pack::subd::{Page as SubdPage, SubdInfo};
 use orr_scene::testing::{assert_clean, device, read_buffer, read_texture, wait};
 use orr_scene::{
     Affine3, ClusterTopology, FrameDesc, FrameTime, GeneratedClusterGpu, GroupWriter, Lens,
-    MaterialGpu, MaterialId, Opacity, ProducerBatch, ProducerClusterGpu, ProducerDesc, ProducerId,
-    ProducerStateGpu, ProducerStats, ProducerUpdate, Projection, RasterView, RendererDesc,
-    SceneDesc, SceneId, Scenes, TessellationStats, TextureFilter, TransformGroupDesc,
-    TransformGroupId, TransparencyPass, ViewDesc, ViewHistoryId, ViewTarget, VisibleCluster,
-    material_flags, tessellation,
+    LoadState, MaterialGpu, MaterialId, ModelId, MountId, Opacity, PackSource, ProducerBatch,
+    ProducerClusterGpu, ProducerDesc, ProducerId, ProducerStateGpu, ProducerStats, ProducerUpdate,
+    Projection, RasterView, RendererDesc, SceneDesc, SceneId, SceneWriter, Scenes, SubdDesc,
+    TessellationStats, TextureFilter, TransformGroupDesc, TransformGroupId, TransparencyPass,
+    ViewDesc, ViewHistoryId, ViewTarget, VisibleCluster, material_flags, tessellation,
 };
 use orr_shaders::bytemuck::Zeroable;
 use scene_suite::shaders::{blades, particle_draw, patches, producer_rays, tess_rays};
-use scene_suite::{linked, pipeline};
+use scene_suite::{Workers, linked, pipeline};
 
 const EXTENT: [u32; 2] = [160, 96];
 const FIELD: ProducerId = ProducerId(1);
@@ -1013,8 +1025,8 @@ impl Plane {
     }
 }
 
-/// The plane entry's generated and patch batches as `view`'s scene holds them after its
-/// frame.
+/// A tessellated entry's generated and patch batches as `view`'s scene holds them after
+/// its frame.
 struct Generated {
     clusters: Vec<ProducerClusterGpu>,
     records: Vec<GeneratedClusterGpu>,
@@ -1028,9 +1040,9 @@ struct Generated {
     state: ProducerStateGpu,
 }
 
-fn generated(view: &RasterView) -> Generated {
+fn generated(view: &RasterView, entry: ProducerId) -> Generated {
     let root = read_buffer(view.scene, 1)[0];
-    let i = u64::from(PLANE.0);
+    let i = u64::from(entry.0);
     let b = read_buffer(root.batches.offset(i), 1)[0];
     let p = read_buffer(root.patches.offset(i), 1)[0];
     let count = |b: &ProducerBatch| {
@@ -1162,7 +1174,7 @@ fn tessellated_patches_dice_at_mixed_rates_with_bit_identical_shared_edges() {
     let (eye, target) = (Vec3::new(0.3, 1.0, 0.5), Vec3::new(0.0, 0.0, -3.0));
     plane.frame(Some(&desc), eye, target, eye);
     let view = plane.frame(None, eye, target, eye);
-    let g = generated(&view);
+    let g = generated(&view, PLANE);
     let stats = plane.stats();
     assert_eq!(stats.patches, 48, "{stats:?}");
     assert!(stats.subpatches > 2 * stats.patches, "{stats:?}");
@@ -1261,7 +1273,7 @@ fn a_displaced_plane_with_a_uv_seam_closes_in_raster_and_rays_with_normals_of_it
         plane.frame(None, eye, target, eye);
     }
     let view = plane.frame(None, eye, target, eye);
-    let g = generated(&view);
+    let g = generated(&view, PLANE);
     let seen = depths(&view);
     let stats = plane.stats();
     assert!(stats.welded > 0, "{stats:?}");
@@ -1428,7 +1440,7 @@ fn texture_displacement_moves_patches_along_the_normal_by_the_materials_texture(
     let (eye, target) = (Vec3::new(0.3, 1.0, 0.5), Vec3::new(0.0, 0.0, -3.0));
     plane.frame(Some(&desc), eye, target, eye);
     let view = plane.frame(None, eye, target, eye);
-    let g = generated(&view);
+    let g = generated(&view, PLANE);
     let stats = plane.stats();
     // The same texel on both sides of the seam: nothing for the weld to move.
     assert_eq!(stats.welded, 0, "{stats:?}");
@@ -1440,5 +1452,833 @@ fn texture_displacement_moves_patches_along_the_normal_by_the_materials_texture(
         assert!(n.dot(Vec3::Y) > 0.9999, "normal {n}");
     }
     d.free_image_slot_after_submitted(slot);
+    assert_clean();
+}
+
+/// A cube with one infinitely sharp edge, an icosahedron (triangles around valence-5
+/// points) with a semi-sharp edge and a pentagonal prism with a sharp corner, side by side
+/// along x, each closed and wound outward, with planar uvs.
+fn closed_cages() -> CageInput {
+    let mut c = CageInput::default();
+    let mut add = |points: Vec<Vec3>, faces: Vec<Vec<u32>>, at: Vec3| {
+        let base = c.positions.len() as u32;
+        for f in faces {
+            // Wound so the face's normal points away from the shape's center.
+            let p: Vec<Vec3> = f.iter().map(|&i| points[i as usize]).collect();
+            let mut n = Vec3::ZERO;
+            for k in 0..p.len() {
+                n += p[k].cross(p[(k + 1) % p.len()]);
+            }
+            let mut f: Vec<u32> = f.iter().map(|&i| base + i).collect();
+            if n.dot(p.iter().sum::<Vec3>()) < 0.0 {
+                f.reverse();
+            }
+            c.face_counts.push(f.len() as u32);
+            c.face_indices.extend(f);
+        }
+        c.positions.extend(points.iter().map(|&p| p + at));
+        base
+    };
+    let cube: Vec<Vec3> = (0..8)
+        .map(|i| {
+            let b = |k: u32| if i & (1 << k) != 0 { 0.5 } else { -0.5 };
+            Vec3::new(b(0), b(1), b(2))
+        })
+        .collect();
+    let cube_faces = [
+        [0, 2, 3, 1],
+        [4, 5, 7, 6],
+        [0, 1, 5, 4],
+        [2, 6, 7, 3],
+        [0, 4, 6, 2],
+        [1, 3, 7, 5],
+    ];
+    let first = add(
+        cube,
+        cube_faces.iter().map(|f| f.to_vec()).collect(),
+        Vec3::new(-2.0, 0.0, 0.0),
+    );
+    c.creases.push(Crease {
+        edge: [first, first + 1],
+        sharpness: 10.0,
+    });
+    let phi = (1.0 + 5f32.sqrt()) / 2.0;
+    let mut ico = Vec::new();
+    for a in [-1.0, 1.0] {
+        for b in [-phi, phi] {
+            ico.push(Vec3::new(0.0, a, b));
+            ico.push(Vec3::new(a, b, 0.0));
+            ico.push(Vec3::new(b, 0.0, a));
+        }
+    }
+    let mut ico_faces = Vec::new();
+    for i in 0..12 {
+        for j in i + 1..12 {
+            for k in j + 1..12 {
+                let edge = |a: usize, b: usize| (ico[a].distance(ico[b]) - 2.0).abs() < 1e-4;
+                if edge(i, j) && edge(j, k) && edge(i, k) {
+                    ico_faces.push(vec![i as u32, j as u32, k as u32]);
+                }
+            }
+        }
+    }
+    assert_eq!(ico_faces.len(), 20);
+    let ico: Vec<Vec3> = ico.iter().map(|p| *p * 0.4).collect();
+    let [a, b] = [ico_faces[0][0], ico_faces[0][1]];
+    let first = add(ico, ico_faces, Vec3::ZERO);
+    c.creases.push(Crease {
+        edge: [first + a, first + b],
+        sharpness: 2.5,
+    });
+    let mut prism = Vec::new();
+    for y in [-0.5, 0.5] {
+        for k in 0..5 {
+            let a = std::f32::consts::TAU * k as f32 / 5.0;
+            prism.push(Vec3::new(0.6 * a.cos(), y, 0.6 * a.sin()));
+        }
+    }
+    let mut prism_faces = vec![(0..5).collect::<Vec<u32>>(), (5..10).collect()];
+    for k in 0..5 {
+        prism_faces.push(vec![k, (k + 1) % 5, 5 + (k + 1) % 5, 5 + k]);
+    }
+    let first = add(prism, prism_faces, Vec3::new(2.0, 0.0, 0.0));
+    c.corners.push(Corner {
+        point: first + 5,
+        sharpness: 3.0,
+    });
+    let values = c
+        .positions
+        .iter()
+        .map(|p| Vec2::new(p.x + 0.4 * p.y, p.z + 0.3 * p.y) * 0.5)
+        .collect();
+    c.uvs = Some(FaceVarying {
+        values,
+        indices: c.face_indices.clone(),
+    });
+    c
+}
+
+/// A box arm of three rings along y, skinned to a root joint at y = 0 and a tip joint at
+/// y = 1 under a SkelRoot, cooked as a cage.
+const ARM: &str = r#"#usda 1.0
+(
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+def Xform "World"
+{
+    def SkelRoot "Arm"
+    {
+        def Skeleton "Rig"
+        {
+            uniform token[] joints = ["Root", "Root/Tip"]
+            uniform matrix4d[] bindTransforms = [((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)), ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 1, 0, 1))]
+            uniform matrix4d[] restTransforms = [((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)), ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 1, 0, 1))]
+        }
+
+        def Mesh "Body"
+        {
+            uniform token subdivisionScheme = "catmullClark"
+            int[] faceVertexCounts = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
+            int[] faceVertexIndices = [0, 1, 5, 4, 1, 2, 6, 5, 2, 3, 7, 6, 3, 0, 4, 7, 4, 5, 9, 8, 5, 6, 10, 9, 6, 7, 11, 10, 7, 4, 8, 11, 3, 2, 1, 0, 8, 9, 10, 11]
+            point3f[] points = [(-0.3, 0, -0.3), (-0.3, 0, 0.3), (0.3, 0, 0.3), (0.3, 0, -0.3), (-0.3, 1, -0.3), (-0.3, 1, 0.3), (0.3, 1, 0.3), (0.3, 1, -0.3), (-0.3, 2, -0.3), (-0.3, 2, 0.3), (0.3, 2, 0.3), (0.3, 2, -0.3)]
+            int[] primvars:skel:jointIndices = [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 0] (
+                elementSize = 2
+                interpolation = "vertex"
+            )
+            float[] primvars:skel:jointWeights = [1, 0, 1, 0, 1, 0, 1, 0, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 1, 0, 1, 0, 1, 0, 1, 0] (
+                elementSize = 2
+                interpolation = "vertex"
+            )
+            rel skel:skeleton = </World/Arm/Rig>
+            rel material:binding = </World/Looks/Skin>
+        }
+    }
+
+    def Scope "Looks"
+    {
+        def Material "Skin"
+        {
+            token outputs:surface.connect = </World/Looks/Skin/S.outputs:surface>
+            def Shader "S"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.6, 0.5, 0.4)
+                token outputs:surface
+            }
+        }
+    }
+}
+"#;
+
+/// The cages: `cages` (cage only) and the skinned `arm/Arm` from USD.
+fn cage_pack() -> &'static Arc<[u8]> {
+    static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
+    PACK.get_or_init(|| {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("subd-arm");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("arm.usda"), ARM).unwrap();
+        let material = orr_pack::material::Material {
+            double_sided: 1,
+            ..Default::default()
+        };
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(
+                orr_pack::Target::Memory,
+                vec![
+                    AssetSpec {
+                        name: "cages".into(),
+                        source: Source::Subd {
+                            cage: closed_cages(),
+                            materials: vec![material],
+                            settings: SubdSettings::default(),
+                        },
+                    },
+                    AssetSpec {
+                        name: "arm".into(),
+                        source: Source::Usd {
+                            path: dir.join("arm.usda"),
+                            settings: UsdSettings {
+                                subdivision: Subdivision::Cage,
+                                ..UsdSettings::default()
+                            },
+                        },
+                    },
+                ],
+            )],
+        };
+        orr_cook::cook(&manifest, &Default::default())
+            .unwrap()
+            .memory
+            .remove(0)
+    })
+}
+
+/// A cage entry's blob 0 and pages, parsed from the pack.
+fn cage_entry(name: &str) -> (SubdInfo, Vec<SubdPage>) {
+    let a = orr_pack::Archive::from_memory(Arc::clone(cage_pack())).unwrap();
+    let e = a.find(AssetId::from_name(name)).unwrap();
+    let read = |b: &orr_pack::Blob| {
+        let mut v = vec![0; b.raw_len as usize];
+        a.read(b, &mut v).unwrap();
+        v
+    };
+    let blobs = a.blobs(e);
+    let info = SubdInfo::parse(&read(&blobs[0])).unwrap();
+    let pages = info
+        .pages
+        .iter()
+        .map(|p| SubdPage::parse(&read(&blobs[p.blob as usize])).unwrap())
+        .collect();
+    (info, pages)
+}
+
+/// A cage's limit surface on the CPU, posed by `points`, and the nearest point of it to
+/// any point near it.
+struct LimitSurface {
+    pages: Vec<PosedPage>,
+    /// Samples by grid cell.
+    cells: HashMap<[i32; 3], Vec<(Vec3, Spot)>>,
+    cell: f32,
+}
+
+/// A page with its points and uv points.
+struct PosedPage {
+    page: SubdPage,
+    points: Vec<[f32; 3]>,
+    uv_points: Vec<[f32; 2]>,
+}
+
+/// Face coordinates on face `face` of page `page`.
+#[derive(Clone, Copy)]
+struct Spot {
+    page: usize,
+    face: usize,
+    u: f64,
+    v: f64,
+}
+
+/// A point [`LimitSurface`] finds.
+#[derive(Clone, Copy)]
+struct Nearest {
+    position: Vec3,
+    /// From differences of positions: Gregory patches' basis derivatives leave out their
+    /// rational blend.
+    normal: Vec3,
+    uv: Vec2,
+    distance: f32,
+    /// Radians between the normals of the faces that meet at the point.
+    spread: f32,
+}
+
+impl LimitSurface {
+    fn new(info: &SubdInfo, pages: &[SubdPage], points: &[[f32; 3]]) -> Self {
+        const GRID: usize = 12;
+        let mut s = Self {
+            pages: pages
+                .iter()
+                .map(|p| PosedPage {
+                    page: p.clone(),
+                    points: p.points(points),
+                    uv_points: p.uv_points(&info.uvs),
+                })
+                .collect(),
+            cells: HashMap::new(),
+            cell: 0.08,
+        };
+        for page in 0..s.pages.len() {
+            for face in 0..s.pages[page].page.faces.len() {
+                for i in 0..=GRID {
+                    for j in 0..=GRID {
+                        let (u, v) = (i as f64 / GRID as f64, j as f64 / GRID as f64);
+                        let spot = Spot { page, face, u, v };
+                        let p = Vec3::from(s.at(spot).position);
+                        let key = (p / s.cell).floor().as_ivec3().to_array();
+                        s.cells.entry(key).or_default().push((p, spot));
+                    }
+                }
+            }
+        }
+        s
+    }
+
+    fn at(&self, s: Spot) -> orr_pack::subd::Limit {
+        let p = &self.pages[s.page];
+        p.page
+            .limit(s.face, s.u as f32, s.v as f32, &p.points)
+            .unwrap()
+    }
+
+    /// The faces with samples nearest `x`, each at its nearest sample.
+    fn starts(&self, x: Vec3) -> Vec<Spot> {
+        let c = (x / self.cell).floor().as_ivec3();
+        let mut near: Vec<(f32, Spot)> = Vec::new();
+        for dz in -1..=1 {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let key = (c + glam::IVec3::new(dx, dy, dz)).to_array();
+                    for &(p, spot) in self.cells.get(&key).into_iter().flatten() {
+                        near.push((p.distance(x), spot));
+                    }
+                }
+            }
+        }
+        near.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut starts: Vec<Spot> = Vec::new();
+        for (_, n) in near {
+            if starts.len() < 4 && !starts.iter().any(|s| (s.page, s.face) == (n.page, n.face)) {
+                starts.push(n);
+            }
+        }
+        starts
+    }
+
+    /// The point of `from`'s face nearest `x`, by Gauss-Newton from `from` with coordinates
+    /// clamped to the face.
+    fn project(&self, x: Vec3, from: Spot) -> Spot {
+        let mut s = from;
+        // Derivatives of an n-sided face's patches are twice those in its face coordinates
+        // (OpenSubdiv's scale), which halves each step there.
+        for _ in 0..48 {
+            let l = self.at(s);
+            let r = (Vec3::from(l.position) - x).as_dvec3();
+            let (a, b) = (Vec3::from(l.du).as_dvec3(), Vec3::from(l.dv).as_dvec3());
+            let (aa, ab, bb) = (a.dot(a), a.dot(b), b.dot(b));
+            let det = aa * bb - ab * ab;
+            if det.abs() < 1e-20 {
+                break;
+            }
+            let (ra, rb) = (a.dot(r), b.dot(r));
+            let (du, dv) = ((bb * ra - ab * rb) / det, (aa * rb - ab * ra) / det);
+            s.u = (s.u - du).clamp(0.0, 1.0);
+            s.v = (s.v - dv).clamp(0.0, 1.0);
+            if du.abs().max(dv.abs()) < 1e-10 {
+                break;
+            }
+        }
+        s
+    }
+
+    /// The surface points nearest `x` on each of the faces with samples nearest it.
+    fn candidates(&self, x: Vec3) -> Vec<Nearest> {
+        self.starts(x)
+            .into_iter()
+            .map(|s| self.describe(x, self.project(x, s)))
+            .collect()
+    }
+
+    /// How far `x` is from the surface displaced along its normal by `height` of the uv,
+    /// and that height, on the face that explains it best: on each face, the point whose
+    /// displacement lands nearest `x`, found by projecting `x` moved back along the normal.
+    fn displaced_distance(&self, x: Vec3, height: impl Fn(Vec2) -> f32) -> (f32, f32) {
+        self.starts(x)
+            .into_iter()
+            .map(|s| {
+                let mut s = self.project(x, s);
+                for _ in 0..8 {
+                    let n = self.describe(x, s);
+                    s = self.project(x - n.normal * height(n.uv), s);
+                }
+                let n = self.describe(x, s);
+                let h = height(n.uv);
+                ((x - n.position - n.normal * h).length(), h)
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .unwrap_or_else(|| panic!("no surface near {x}"))
+    }
+
+    fn describe(&self, x: Vec3, s: Spot) -> Nearest {
+        let position = Vec3::from(self.at(s).position);
+        let page = &self.pages[s.page];
+        // Differences of positions, one-sided at the face's borders.
+        let h = 1e-3;
+        let p = |u: f64, v: f64| Vec3::from(self.at(Spot { u, v, ..s }).position).as_dvec3();
+        let (u0, u1) = ((s.u - h).max(0.0), (s.u + h).min(1.0));
+        let (v0, v1) = ((s.v - h).max(0.0), (s.v + h).min(1.0));
+        let normal = (p(u1, s.v) - p(u0, s.v)).cross(p(s.u, v1) - p(s.u, v0));
+        let uv = page
+            .page
+            .limit_uv(s.face, s.u as f32, s.v as f32, &page.uv_points)
+            .unwrap_or_default();
+        Nearest {
+            position,
+            normal: normal.normalize().as_vec3(),
+            uv: Vec2::from(uv),
+            distance: position.distance(x),
+            spread: 0.0,
+        }
+    }
+
+    /// The surface point nearest `x`, with the spread of the normals of the faces that
+    /// meet there.
+    fn nearest(&self, x: Vec3) -> Nearest {
+        let found = self.candidates(x);
+        let best = found
+            .iter()
+            .min_by(|a, b| a.distance.total_cmp(&b.distance))
+            .unwrap_or_else(|| panic!("no surface near {x}"));
+        let spread = found
+            .iter()
+            .filter(|c| c.position.distance(best.position) < 1e-5)
+            .map(|c| c.normal.dot(best.normal).clamp(-1.0, 1.0).acos())
+            .fold(0.0, f32::max);
+        Nearest { spread, ..*best }
+    }
+}
+
+/// Asserts the generated surface is closed and consistently wound: every edge of its
+/// triangles joins exactly two triangles with the same two end points, bit for bit, in
+/// opposite directions. Returns the triangle count.
+fn assert_closed(g: &Generated) -> usize {
+    let bits = |v: u32| {
+        g.positions[v as usize]
+            .to_array()
+            .map(|x| (x + 0.0).to_bits())
+    };
+    let mut directed: HashMap<([u32; 3], [u32; 3]), u32> = HashMap::new();
+    let mut triangles = 0;
+    for (k, r) in g.clusters.iter().zip(&g.records) {
+        let pattern = tessellation::pattern(r.pattern);
+        for t in &pattern.triangles {
+            let v = t.map(|c| k.first_vertex + u32::from(c));
+            for e in 0..3 {
+                *directed
+                    .entry((bits(v[e]), bits(v[(e + 1) % 3])))
+                    .or_default() += 1;
+            }
+            triangles += 1;
+        }
+    }
+    let mut open = 0;
+    for (&(a, b), &n) in &directed {
+        if n != 1 || directed.get(&(b, a)) != Some(&1) {
+            open += 1;
+        }
+    }
+    assert_eq!(
+        open,
+        0,
+        "{open} of {} edges are open or doubled",
+        directed.len()
+    );
+    triangles
+}
+
+/// A mounted cage pack and a scene with room for two copies.
+struct CageScene {
+    scenes: Scenes,
+    _workers: Workers,
+    mount: MountId,
+    scene: SceneId,
+    history: ViewHistoryId,
+    frame: u32,
+}
+
+impl CageScene {
+    fn new(dice_pixels: f32) -> Self {
+        let mut scenes = Scenes::new(
+            device(),
+            &RendererDesc {
+                kernels: &linked::KERNELS,
+                dice_pixels,
+                ..RendererDesc::default()
+            },
+        )
+        .unwrap();
+        let workers = Workers::start(&scenes, 2);
+        let mount = scenes.mount(PackSource::Memory(Arc::clone(cage_pack())));
+        let start = Instant::now();
+        while matches!(scenes.mount_state(mount), LoadState::Pending) {
+            let f = scenes
+                .begin_frame(&FrameDesc {
+                    time: time(0),
+                    scenes: &[],
+                    low_latency: None,
+                })
+                .unwrap();
+            f.end(&[]).unwrap();
+            assert!(start.elapsed() < Duration::from_secs(60), "mount pending");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if let LoadState::Failed(e) = scenes.mount_state(mount) {
+            panic!("mount failed: {e}");
+        }
+        let scene = scenes
+            .create_scene(&SceneDesc {
+                producer_capacity: 2,
+                ..SceneDesc::default()
+            })
+            .unwrap();
+        let history = scenes.create_view_history().unwrap();
+        Self {
+            scenes,
+            _workers: workers,
+            mount,
+            scene,
+            history,
+            frame: 1,
+        }
+    }
+
+    fn model(&self, name: &str) -> ModelId {
+        self.scenes
+            .model(self.mount, AssetId::from_name(name))
+            .unwrap()
+    }
+
+    /// One frame: `write` fills the scene, the focus is at `focus` and the camera at `eye`
+    /// looks at `target`.
+    fn frame(
+        &mut self,
+        write: impl FnOnce(&mut SceneWriter<'_>),
+        eye: Vec3,
+        target: Vec3,
+        focus: Vec3,
+    ) -> RasterView {
+        let list = [self.scene];
+        let mut f = self
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(self.frame),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        let fov_y = 0.9;
+        {
+            let mut w = f.scene(self.scene).unwrap();
+            write(&mut w);
+            w.set_focus(focus.as_dvec3(), EXTENT[1] as f32 / fov_y);
+        }
+        f.update_scenes(&mut |_| {}).unwrap();
+        let view = f
+            .raster_view(&ViewDesc {
+                scene: self.scene,
+                history: self.history,
+                position: eye.as_dvec3(),
+                rotation: look(eye, target),
+                projection: Projection { fov_y, near: 0.05 },
+                lens: Lens::default(),
+                render_extent: UVec2::from(EXTENT),
+                jitter: Vec2::ZERO,
+                reset_history: self.frame <= 2,
+                mip_bias: 0.0,
+                texture_filter: TextureFilter::Hardware,
+                target: ViewTarget::AfterRr,
+            })
+            .unwrap();
+        self.frame += 1;
+        wait(f.end(&[]).unwrap());
+        view
+    }
+
+    fn stats(&mut self) -> TessellationStats {
+        let f = self
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(self.frame),
+                scenes: &[],
+                low_latency: None,
+            })
+            .unwrap();
+        self.frame += 1;
+        wait(f.end(&[]).unwrap());
+        self.scenes.stats().tessellation
+    }
+}
+
+/// Copies of the closed cages: entry 0 on the limit surface, entry 1 rippled.
+const SMOOTH: ProducerId = ProducerId(0);
+const RIPPLED: ProducerId = ProducerId(1);
+/// m along z from entry 0 to entry 1.
+const RIPPLED_Z: f32 = -3.0;
+
+/// m between a generated vertex and the CPU limit surface, at most (1.2e-6 measured): f32
+/// evaluation of the patches against the CPU's f64 sums.
+const LIMIT_TOLERANCE: f32 = 2e-5;
+/// Radians between a generated normal and the CPU limit normal, at most (0.0035 measured,
+/// next to the creases): differences of the field and the 16-bit octahedral code.
+const LIMIT_NORMAL_TOLERANCE: f32 = 0.006;
+/// m between a rippled vertex and the ripple along the limit normal, at most (5.4e-5
+/// measured).
+const RIPPLE_TOLERANCE: f32 = 2e-4;
+/// Radians between the normals of faces meeting at a point beyond which it is on a sharp
+/// edge or corner.
+const SHARP: f32 = 0.01;
+/// m from the prism's semi-sharp corner point within which the surface turns faster than
+/// differences resolve, the dice's (0.017 rad) and the CPU's (0.04 rad between the faces
+/// at the corner).
+const CORNER_REACH: f32 = 0.25;
+
+#[test]
+fn subdivision_cages_dice_closed_at_mixed_rates_on_their_limit_surface_in_raster_and_rays() {
+    let mut s = CageScene::new(1.5);
+    let model = s.model("cages");
+    let (info, pages) = cage_entry("cages/subd");
+    let limit = LimitSurface::new(&info, &pages, &info.points);
+    let desc = |group, index: u32, displacement: u8| SubdDesc {
+        model,
+        transform: (group, index),
+        max_clusters: 16_384,
+        max_vertices: 16_384 * 78,
+        displacement,
+        displacement_reach: if displacement == 0 { 0.0 } else { 0.05 },
+        ..SubdDesc::default()
+    };
+    // The camera looks along the row from beyond the cube, with the focus at the cube:
+    // rates fall from the cube to the prism and the rippled copy behind.
+    let (eye, target, focus) = (
+        Vec3::new(-3.6, 1.4, 1.6),
+        Vec3::new(0.0, 0.0, -1.0),
+        Vec3::new(-2.0, 0.6, 0.6),
+    );
+    let mut group = TransformGroupId(0);
+    s.frame(
+        |w| {
+            group = w
+                .create_transform_group(&TransformGroupDesc {
+                    count: 2,
+                    writer: GroupWriter::Cpu,
+                    anchor: DVec3::ZERO,
+                })
+                .unwrap();
+            let t = w.transforms(group, 0, 2).unwrap();
+            t[0] = Affine3::IDENTITY;
+            t[1] = Affine3::IDENTITY;
+            t[1].rows[2][3] = RIPPLED_Z;
+            w.set_subd(SMOOTH, Some(&desc(group, 0, 0))).unwrap();
+            w.set_subd(RIPPLED, Some(&desc(group, 1, RIPPLE))).unwrap();
+        },
+        eye,
+        target,
+        focus,
+    );
+    for _ in 0..2 {
+        s.frame(|_| {}, eye, target, focus);
+    }
+    let view = s.frame(|_| {}, eye, target, focus);
+    let smooth = generated(&view, SMOOTH);
+    let rippled = generated(&view, RIPPLED);
+    let seen = depths(&view);
+    let stats = s.stats();
+    assert_eq!(stats.entries, 2, "{stats:?}");
+    assert_eq!(
+        stats.dice_dropped + stats.split_dropped + stats.weld_dropped,
+        0,
+        "{stats:?}"
+    );
+    assert!(stats.subpatches > stats.patches, "{stats:?}");
+    assert!(stats.welded > 0, "{stats:?}");
+    let patterns: HashSet<u32> = smooth.records.iter().map(|r| r.pattern).collect();
+    assert!(patterns.len() > 20, "{} patterns", patterns.len());
+
+    // Both copies close: every edge shared by patches, faces, transition edges and creases
+    // puts the same points on both sides.
+    assert!(assert_closed(&smooth) > 1000);
+    assert_closed(&rippled);
+
+    // Every vertex of the smooth copy lies on the CPU limit surface, and its normal is the
+    // surface's wherever the faces that meet there agree on one (not on the sharp edge or
+    // at the sharp corner) and away from the semi-sharp corner.
+    let cage = closed_cages();
+    let corner = cage.positions[cage.corners[0].point as usize];
+    let (mut worst, mut worst_normal) = (0.0f32, 0.0f32);
+    for (p, a) in smooth.positions.iter().zip(&smooth.attrs) {
+        let n = limit.nearest(*p);
+        worst = worst.max(n.distance);
+        if n.spread < SHARP && p.distance(corner) > CORNER_REACH {
+            let got = Vec3::from(orr_pack::mesh::oct_decode(a[0]));
+            worst_normal = worst_normal.max(got.dot(n.normal).clamp(-1.0, 1.0).acos());
+        }
+    }
+    assert!(worst < LIMIT_TOLERANCE, "{worst} m from the limit surface");
+    assert!(
+        worst_normal < LIMIT_NORMAL_TOLERANCE,
+        "normals within {worst_normal} rad"
+    );
+
+    // Each rippled vertex away from the semi-sharp corner lies along the limit normal of a
+    // nearby face by the ripple at its limit uv (batch positions are relative to the copy's
+    // transform): on the sharp edge and corner the faces displace along different normals
+    // and the weld keeps one.
+    let (mut worst_ripple, mut moved) = (0.0f32, 0);
+    for &x in &rippled.positions {
+        if x.distance(corner) < CORNER_REACH {
+            continue;
+        }
+        let (e, h) = limit.displaced_distance(x, ripple);
+        worst_ripple = worst_ripple.max(e);
+        if h.abs() > 0.02 {
+            moved += 1;
+        }
+    }
+    assert!(moved > rippled.positions.len() / 10, "{moved} moved");
+    assert!(
+        worst_ripple < RIPPLE_TOLERANCE,
+        "ripple off by {worst_ripple} m"
+    );
+
+    // Raster and camera rays see the same surfaces at the same depths.
+    if traced(true) {
+        let (mut covered, mut coverage, mut far_apart) = (0, 0, 0);
+        for s in &seen {
+            if s.raster > 0.0 || s.traced > 0.0 {
+                covered += 1;
+            }
+            if (s.raster > 0.0) != (s.traced > 0.0) {
+                coverage += 1;
+            } else if s.raster > 0.0 && (s.raster - s.traced).abs() > 1e-3 * s.traced {
+                far_apart += 1;
+            }
+        }
+        assert!(
+            covered > EXTENT[0] * EXTENT[1] / 8,
+            "{covered} pixels covered"
+        );
+        assert!(
+            coverage * 500 <= covered,
+            "{coverage} of {covered} disagree on coverage"
+        );
+        assert!(
+            far_apart * 1000 <= covered,
+            "{far_apart} of {covered} disagree on depth"
+        );
+    }
+    assert_clean();
+}
+
+/// The arm's palette: the root joint fixed, the tip joint bent by `angle` about z at y = 1.
+fn arm_palette(angle: f32) -> [Affine3; 2] {
+    let r = Mat3::from_rotation_z(angle);
+    let pivot = Vec3::new(0.0, 1.0, 0.0);
+    let t = pivot - r * pivot;
+    let c = r.to_cols_array_2d();
+    let mut tip = Affine3::IDENTITY;
+    for (i, row) in tip.rows.iter_mut().enumerate() {
+        *row = [c[0][i], c[1][i], c[2][i], t[i]];
+    }
+    [Affine3::IDENTITY, tip]
+}
+
+#[test]
+fn a_skinned_cage_poses_before_it_dices_and_moves_from_last_frames_pose() {
+    let mut s = CageScene::new(2.0);
+    let model = s.model("arm/Arm");
+    let (info, pages) = cage_entry("arm/Arm/subd");
+    assert!(!info.skin.is_empty(), "the arm cooks its skin");
+    let (eye, target) = (Vec3::new(1.5, 1.4, 3.0), Vec3::new(0.0, 1.2, 0.0));
+    let mut ids = (TransformGroupId(0), TransformGroupId(0));
+    let angles = [0.2, 0.5];
+    s.frame(
+        |w| {
+            let make = |w: &mut SceneWriter<'_>, count| {
+                w.create_transform_group(&TransformGroupDesc {
+                    count,
+                    writer: GroupWriter::Cpu,
+                    anchor: DVec3::ZERO,
+                })
+                .unwrap()
+            };
+            ids = (make(w, 1), make(w, 2));
+            w.transforms(ids.0, 0, 1).unwrap()[0] = Affine3::IDENTITY;
+            w.transforms(ids.1, 0, 2)
+                .unwrap()
+                .copy_from_slice(&arm_palette(angles[0]));
+            let desc = SubdDesc {
+                model,
+                transform: (ids.0, 0),
+                palette: Some((ids.1, 0)),
+                max_clusters: 8192,
+                max_vertices: 8192 * 78,
+                ..SubdDesc::default()
+            };
+            w.set_subd(SMOOTH, Some(&desc)).unwrap();
+        },
+        eye,
+        target,
+        eye,
+    );
+    let view = s.frame(
+        |w| {
+            w.transforms(ids.1, 0, 2)
+                .unwrap()
+                .copy_from_slice(&arm_palette(angles[1]));
+        },
+        eye,
+        target,
+        eye,
+    );
+    let g = generated(&view, SMOOTH);
+    let stats = s.stats();
+    assert_eq!(
+        stats.dice_dropped + stats.split_dropped + stats.weld_dropped,
+        0,
+        "{stats:?}"
+    );
+    assert_closed(&g);
+    let posed = |angle: f32| {
+        let palette = arm_palette(angle).map(|a| orr_pack::Affine3 { rows: a.rows });
+        let points = info.skinned_points(&palette);
+        LimitSurface::new(&info, &pages, &points)
+    };
+    let (now, before) = (posed(angles[1]), posed(angles[0]));
+    let mut worst = 0.0f32;
+    for (p, q) in g.positions.iter().zip(&g.previous) {
+        worst = worst.max(now.nearest(*p).distance);
+        worst = worst.max(before.nearest(*q).distance);
+    }
+    assert!(
+        worst < LIMIT_TOLERANCE,
+        "{worst} m from the posed limit surfaces"
+    );
+    // The tip moved between the poses.
+    let moved = g
+        .positions
+        .iter()
+        .zip(&g.previous)
+        .filter(|(p, q)| p.distance(**q) > 0.1)
+        .count();
+    assert!(moved > g.positions.len() / 10, "{moved} vertices moved");
     assert_clean();
 }

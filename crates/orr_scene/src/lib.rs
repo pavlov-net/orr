@@ -21,6 +21,10 @@
 //! frames' taps ([`Scenes::prefetch_texture`]), all under the pool budgets of [`Budgets`];
 //! [`Scenes::residency`] reports what is resident. Consumers stream their own blobs into
 //! their own memory with [`Scenes::request_blob`].
+//!
+//! A model's subdivision cage is placed copy by copy as a tessellated producer entry
+//! ([`SceneWriter::set_subd`]): every frame the tessellator dices its limit surface at
+//! rates from the scene focus, for raster and ray tracing alike.
 
 mod accel;
 mod arena;
@@ -43,6 +47,7 @@ mod scene;
 mod scenes;
 mod skin;
 mod stream;
+mod subd;
 mod tessellate;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -91,6 +96,7 @@ pub use shaders::types::{
 };
 pub use skin::{SkinStats, SkinnedDesc};
 pub use stream::{BlobId, BlobTarget};
+pub use subd::SubdDesc;
 pub use tessellate::TessellationStats;
 pub use time::FrameTime;
 pub use transparency::TransparencyPass;
@@ -157,6 +163,12 @@ pub enum Error {
     /// all presence or neither.
     #[error("{0:?} mixes dielectric or presence materials with others")]
     MixedClasses(ModelId),
+    /// Cage-only models have no mesh for instances to draw; their copies are
+    /// subdivision entries.
+    #[error("{0:?} has no mesh")]
+    NoMesh(ModelId),
+    #[error("{0:?} has no subdivision cage")]
+    NoCage(ModelId),
     #[error("chain of {model:?}: {reason}")]
     InvalidChain {
         model: ModelId,

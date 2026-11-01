@@ -1,7 +1,7 @@
 //! Subdivision cage class: a Catmull-Clark cage and the patches of its limit surface.
 //!
-//! Blob 0 holds a [`SubdHeader`] and its tables ([`SubdInfo`]): the cage's control points,
-//! its face-varying uv values, per-point skin influences, the sections and the pages. The
+//! Blob 0 holds a [`SubdHeader`] and its tables ([`SubdInfo`]): the cage's control points and
+//! faces, its face-varying uv values, per-point skin influences, the sections and the pages. The
 //! blobs after it are pages of whole faces ([`Page`]), each read alone.
 //!
 //! Faces are ptex faces: a quad of the cage is one face, an n-sided face is n faces, one per
@@ -18,7 +18,7 @@ use crate::blob::{put_table, read, table};
 use crate::mesh::Section;
 use crate::{Aabb, Affine3, Error, Result, Span};
 
-pub const SCHEMA: u16 = 1;
+pub const SCHEMA: u16 = 2;
 
 /// Largest page.
 pub const PAGE_MAX: usize = 128 << 10;
@@ -53,6 +53,12 @@ pub struct SubdHeader {
     pub skin: Span,
     /// [`PageInfo`] per page.
     pub pages: Span,
+    /// u32 per cage face plus one: face `f`'s corners are
+    /// `cage_corners[cage_faces[f]..cage_faces[f + 1]]`.
+    pub cage_faces: Span,
+    /// u32 cage point per face corner, counter-clockwise from the face's first corner as the
+    /// refiner reads it (a left-handed face's corners after its first are reversed).
+    pub cage_corners: Span,
 }
 
 impl SubdHeader {
@@ -104,19 +110,75 @@ pub struct SubdInfo {
     pub uvs: Vec<[f32; 2]>,
     pub skin: Vec<Influence>,
     pub pages: Vec<PageInfo>,
+    pub cage_faces: Vec<u32>,
+    pub cage_corners: Vec<u32>,
+}
+
+/// A point of the cage's topology that ptex faces meet at.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CagePoint {
+    /// A cage point.
+    Point(u32),
+    /// The middle of the cage edge between two points, the lower first.
+    EdgeMiddle(u32, u32),
+    /// The center of a cage face that is not a quad.
+    FaceCenter(u32),
 }
 
 impl SubdInfo {
     pub fn parse(blob: &[u8]) -> Result<Self> {
         let header: SubdHeader = read(blob, 0).ok_or(Error::Malformed("subd header"))?;
-        Ok(Self {
+        let info = Self {
             sections: table(blob, header.sections)?,
             points: table(blob, header.points)?,
             uvs: table(blob, header.uvs)?,
             skin: table(blob, header.skin)?,
             pages: table(blob, header.pages)?,
+            cage_faces: table(blob, header.cage_faces)?,
+            cage_corners: table(blob, header.cage_corners)?,
             header,
-        })
+        };
+        let faces_ok = info.cage_faces.windows(2).all(|w| w[0] < w[1])
+            && info
+                .cage_faces
+                .last()
+                .is_some_and(|&l| l as usize == info.cage_corners.len());
+        if !faces_ok
+            || info
+                .cage_corners
+                .iter()
+                .any(|&c| c as usize >= info.points.len())
+        {
+            return Err(Error::Malformed("subd cage faces"));
+        }
+        Ok(info)
+    }
+
+    /// The cage points of cage face `face`, counter-clockwise.
+    pub fn face_points(&self, face: u32) -> &[u32] {
+        let f = face as usize;
+        &self.cage_corners[self.cage_faces[f] as usize..self.cage_faces[f + 1] as usize]
+    }
+
+    /// The corners of ptex face `face` at face coordinates (0, 0), (1, 0), (1, 1) and
+    /// (0, 1). A quad's are its points; the face of corner `k` of an n-sided face runs
+    /// from point `k` to the middle of the edge after it, the face center and the middle
+    /// of the edge before it.
+    pub fn ptex_corners(&self, face: &Face) -> [CagePoint; 4] {
+        let p = self.face_points(face.base);
+        let edge = |a: u32, b: u32| CagePoint::EdgeMiddle(a.min(b), a.max(b));
+        if p.len() == 4 {
+            return [0, 1, 2, 3].map(|i| CagePoint::Point(p[i]));
+        }
+        let n = p.len();
+        let k = usize::from(face.corner);
+        let (here, next, before) = (p[k], p[(k + 1) % n], p[(k + n - 1) % n]);
+        [
+            CagePoint::Point(here),
+            edge(here, next),
+            CagePoint::FaceCenter(face.base),
+            edge(before, here),
+        ]
     }
 
     /// The cage points posed by a skinning palette (`model[j] x inverse_binds[j]` per joint).
@@ -147,6 +209,8 @@ impl SubdInfo {
         h.uvs = put_table(&mut out, &self.uvs);
         h.skin = put_table(&mut out, &self.skin);
         h.pages = put_table(&mut out, &self.pages);
+        h.cage_faces = put_table(&mut out, &self.cage_faces);
+        h.cage_corners = put_table(&mut out, &self.cage_corners);
         out[..size_of::<SubdHeader>()].copy_from_slice(bytemuck::bytes_of(&h));
         out
     }
@@ -237,7 +301,8 @@ impl PatchParam {
         }
     }
 
-    fn levels(&self) -> u8 {
+    /// Subdivision levels of the face's grid of patches: `2^levels` patches per side.
+    pub fn levels(&self) -> u8 {
         self.depth - u8::from(self.flags & Self::NON_QUAD != 0)
     }
 
@@ -442,7 +507,13 @@ impl Page {
 
     /// The limit surface of face `face` at face coordinates `(u, v)`, from [`Self::points`].
     pub fn limit(&self, face: usize, u: f32, v: f32, points: &[[f32; 3]]) -> Option<Limit> {
-        let p = &self.patches[self.patch_at(face, u, v)?];
+        Some(self.patch_limit(self.patch_at(face, u, v)?, u, v, points))
+    }
+
+    /// The limit surface of patch `patch` at face coordinates `(u, v)` of its face, from
+    /// [`Self::points`].
+    pub fn patch_limit(&self, patch: usize, u: f32, v: f32, points: &[[f32; 3]]) -> Limit {
+        let p = &self.patches[patch];
         let (mut w, mut du, mut dv) = ([0.0; 20], [0.0; 20], [0.0; 20]);
         let n = p.param.basis(u, v, &mut w, &mut du, &mut dv);
         let cvs = &self.cvs[p.cvs as usize..p.cvs as usize + n];
@@ -456,11 +527,11 @@ impl Page {
             }
             acc.map(|a| a as f32)
         };
-        Some(Limit {
+        Limit {
             position: sum(&w),
             du: sum(&du),
             dv: sum(&dv),
-        })
+        }
     }
 
     /// The limit uv of face `face` at face coordinates `(u, v)`, from [`Self::uv_points`].

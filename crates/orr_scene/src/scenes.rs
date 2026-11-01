@@ -38,6 +38,7 @@ use crate::scene::{GroupWriter, ModelCpu, ModelId, Scene, SceneDesc, SceneId, Sc
 use crate::shaders::transparency::CompositeRoot;
 use crate::shaders::{animation, emissive, world as world_kernel};
 use crate::skin::{SkinFrame, SkinKernels, SkinStats};
+use crate::subd::ModelCage;
 use crate::tessellate::{self, Patterns, SeenBy, TessKernels, TessellationStats};
 use crate::time::FrameTime;
 use crate::transparency::TransparencyPass;
@@ -320,6 +321,8 @@ struct Core {
     models: Vec<Option<ModelEmission>>,
     /// Sections and animated parts by `ModelId`.
     model_cpu: Vec<ModelCpu>,
+    /// Subdivision cages by `ModelId`.
+    cages: Vec<Option<ModelCage>>,
     /// The farther models of every model with a representation chain.
     chains: HashMap<ModelId, Vec<ModelId>>,
     /// Records outside any scene: materials, view-history initialization.
@@ -464,6 +467,7 @@ impl Scenes {
                 materials,
                 models: Vec::new(),
                 model_cpu: Vec::new(),
+                cages: Vec::new(),
                 chains: HashMap::new(),
                 global: Mutex::new(global),
                 scenes: Vec::new(),
@@ -545,7 +549,8 @@ impl Scenes {
         let frame = self.core.next_frame - 1;
         let core = &mut self.core;
         let gone = core.mounts.models_of(m);
-        core.mounts.unmount(m, frame, &mut core.models);
+        core.mounts
+            .unmount(m, frame, &mut core.models, &mut core.cages);
         // Chains that name a model of the mount end; their copies take their model again.
         let ended: Vec<ModelId> = core
             .chains
@@ -908,6 +913,7 @@ impl Scenes {
             materials: &core.materials,
             emission: &mut core.models,
             model_cpu: &mut core.model_cpu,
+            cages: &mut core.cages,
         };
         let mut loading_points = Vec::new();
         for batch in self.loading.take_batches(&self.device) {
@@ -1068,6 +1074,7 @@ impl<'a> Frame<'a> {
             cell_log2: self.core.cell_log2,
             models: &self.core.models,
             model_cpu: &self.core.model_cpu,
+            cages: &self.core.cages,
             patterns: &self.core.patterns,
         })
     }
@@ -1910,6 +1917,7 @@ fn record_producers(
                 state: scene.tables.tess_state.gpu().offset(i as u64),
                 focus,
                 seen,
+                subd: p.as_ref().and_then(|p| p.subd),
             });
         }
     }

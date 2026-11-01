@@ -5,8 +5,9 @@
 // `begin` resets the entry's counts and steps its rate; `patches` classifies each patch
 // triangle; `args` sizes the next pass; each of SPLITS `split` passes cuts the subpatches
 // whose edges need more than MAX_DICE segments by the pattern of their split factors;
-// `dice` writes one generated cluster per subpatch, its vertices displaced through the
-// linked `IDisplacement` with normals from finite differences of the displaced field;
+// `dice` writes one generated cluster per subpatch, its vertices on the patch triangle or a
+// subdivision copy's limit surface, displaced through the linked `IDisplacement` with
+// normals from finite differences of the displaced field;
 // `weld_clear`, `weld` and `weld_apply` give vertices on patch triangle edges that share an
 // undisplaced point one displaced position, which closes uv seams; `finish` keeps the
 // figures. An edge's factor depends only on its endpoints, so patches on both sides of it
@@ -86,13 +87,15 @@ uint pack_factors(uint3 f)
     return f.x | (f.y << 8) | (f.z << 16);
 }
 
-// One patch triangle: entry-space corners, attributes and words.
+// One patch triangle: entry-space corners, attributes and words, and for a subdivision
+// copy the base triangle it covers.
 struct Patch
 {
     ProducerClusterGpu cluster;
     ProducerTriangle current;
     ProducerTriangle previous;
     bool has_previous;
+    SubdTriangleGpu base;
 }
 
 Patch load_patch(uint code)
@@ -103,6 +106,10 @@ Patch load_patch(uint code)
     p.current = producer_triangle(b, p.cluster, code & 127, false);
     p.has_previous = b.previous != nullptr;
     p.previous = producer_triangle(b, p.cluster, code & 127, p.has_previous);
+    p.base = (SubdTriangleGpu)0;
+    SubdCopyGpu* c = root.tess.subd;
+    if (c != nullptr)
+        p.base = c.cage.triangles[c.cage.clusters[code >> 7].z + (code & 127)];
     return p;
 }
 
@@ -308,20 +315,52 @@ void split(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     }
 }
 
-// The displaced point at patch weights `w`, last frame's with `previous`.
-float3 displaced(Patch pt, PatchItem item, uint material, float3 w, bool previous, out float3 base)
+// A point of the undisplaced surface.
+struct Surface
+{
+    float3 position;
+    float3 normal;
+    float2 uv;
+}
+
+// The undisplaced surface at patch weights `w`, last frame's with `previous`: the patch
+// triangle interpolated, or a subdivision copy's limit surface.
+Surface undisplaced(Patch pt, float3 w, bool previous)
 {
     ProducerTriangle tri = previous ? pt.previous : pt.current;
     float3 positions[3] = tri.corners.position;
     float3 normals[3] = { tri.corners.attributes[0].normal, tri.corners.attributes[1].normal, tri.corners.attributes[2].normal };
     float2 uvs[3] = { tri.corners.attributes[0].uv, tri.corners.attributes[1].uv, tri.corners.attributes[2].uv };
-    base = interpolate(positions, w);
+    Surface o;
+    o.normal = safe_normalize(interpolate(normals, w), float3(0.0, 1.0, 0.0));
+    SubdCopyGpu* c = root.tess.subd;
+    if (c == nullptr)
+    {
+        o.position = interpolate(positions, w);
+        o.uv = interpolate(uvs, w);
+        return o;
+    }
+    float2 corners[3] = { triangle_corner(pt.base, 0), triangle_corner(pt.base, 1), triangle_corner(pt.base, 2) };
+    float2 st = interpolate(corners, w);
+    float3 du, dv;
+    o.position = subd_limit(c.cage, previous ? c.previous : c.points, pt.base.patch, st, du, dv);
+    o.normal = subd_normal(du, dv, o.normal);
+    o.uv = subd_limit_uv(c.cage, pt.base.patch, st);
+    return o;
+}
+
+// The displaced point at patch weights `w`, last frame's with `previous`.
+float3 displaced(Patch pt, PatchItem item, uint material, float3 w, bool previous, out Surface base)
+{
+    ProducerTriangle tri = previous ? pt.previous : pt.current;
+    float2 uvs[3] = { tri.corners.attributes[0].uv, tri.corners.attributes[1].uv, tri.corners.attributes[2].uv };
+    base = undisplaced(pt, w, previous);
     DisplacementInput i = (DisplacementInput)0;
-    i.position = base;
+    i.position = base.position;
     i.displacement = entry().displacement;
-    i.normal = safe_normalize(interpolate(normals, w), float3(0.0, 1.0, 0.0));
+    i.normal = base.normal;
     i.material = material;
-    i.uv.uv = interpolate(uvs, w);
+    i.uv.uv = base.uv;
     i.uv.dx = (uvs[1] - uvs[0]) / item.rate;
     i.uv.dy = (uvs[2] - uvs[0]) / item.rate;
     i.uv.tap = float2(-1.0);
@@ -331,7 +370,34 @@ float3 displaced(Patch pt, PatchItem item, uint material, float3 w, bool previou
     i.scene = root.scene;
     MaterialGpu* m = root.scene.materials + material;
     i.data = m.data != 0 ? m.data : root.scene.surface_data;
-    return base + Displace.displace(i);
+    return base.position + Displace.displace(i);
+}
+
+// Whether patch weights `w` lie on a subdivision copy's patch, where its limit surface is
+// defined; always for other entries.
+bool on_patch(Patch pt, float3 w)
+{
+    if (root.tess.subd == nullptr)
+        return true;
+    float2 corners[3] = { triangle_corner(pt.base, 0), triangle_corner(pt.base, 1), triangle_corner(pt.base, 2) };
+    float2 st = interpolate(corners, w);
+    return all(st >= -1e-6) && all(st <= 1.0 + 1e-6);
+}
+
+// Twice a step `e` times the displaced field's derivative along it at `w`, where it is `x`:
+// central differences, or second-order one-sided ones toward the patch where a step would
+// leave it.
+float3 difference(Patch pt, PatchItem item, uint material, float3 w, float3 e, float3 x)
+{
+    Surface unused;
+    bool plus = on_patch(pt, w + e);
+    bool minus = on_patch(pt, w - e);
+    if (plus == minus)
+        return displaced(pt, item, material, w + e, false, unused) - displaced(pt, item, material, w - e, false, unused);
+    float s = plus ? 1.0 : -1.0;
+    float3 a = displaced(pt, item, material, w + s * e, false, unused);
+    float3 b = displaced(pt, item, material, w + 2.0 * s * e, false, unused);
+    return s * (4.0 * a - b - 3.0 * x);
 }
 
 groupshared uint g_first;
@@ -377,34 +443,48 @@ void dice(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         material = 0;
     uint3 wi = compose(unpack_bary(table.vertices[pattern.vertex_first + thread]), item.corners);
     float3 w = bary_weights(wi);
-    float3 base;
+    Surface base;
     float3 x = displaced(pt, item, material, w, false, base);
-    // Central differences along the two patch directions, over a quarter of a generated
-    // step and at most a quarter of the finest step one pattern dices.
+    // Differences along two directions, over a quarter of a generated step and at most a
+    // quarter of the finest step one pattern dices: the patch triangle's edges, or a
+    // subdivision patch's s and t, which always have a side on the patch.
     float h = 0.25 / max(item.rate, float(MAX_DICE));
     float3 e1 = float3(-h, h, 0.0);
     float3 e2 = float3(-h, 0.0, h);
-    float3 unused;
-    float3 du = displaced(pt, item, material, w + e1, false, unused) - displaced(pt, item, material, w - e1, false, unused);
-    float3 dv = displaced(pt, item, material, w + e2, false, unused) - displaced(pt, item, material, w - e2, false, unused);
-    float3 normals[3] = { pt.current.corners.attributes[0].normal, pt.current.corners.attributes[1].normal, pt.current.corners.attributes[2].normal };
-    float3 n = safe_normalize(interpolate(normals, w), float3(0.0, 1.0, 0.0));
+    if (root.tess.subd != nullptr)
+    {
+        float2 a = triangle_corner(pt.base, 1) - triangle_corner(pt.base, 0);
+        float2 b = triangle_corner(pt.base, 2) - triangle_corner(pt.base, 0);
+        float k = 0.5 * h / (a.x * b.y - a.y * b.x);
+        float2 s = float2(b.y, -a.y) * k;
+        float2 t = float2(-b.x, a.x) * k;
+        e1 = float3(-s.x - s.y, s.x, s.y);
+        e2 = float3(-t.x - t.y, t.x, t.y);
+    }
+    float3 du = difference(pt, item, material, w, e1, x);
+    float3 dv = difference(pt, item, material, w, e2, x);
+    float3 n = base.normal;
     float3 nd = safe_normalize(cross(du, dv), n);
     if (dot(nd, n) < 0.0)
         nd = -nd;
-    float2 uvs[3] = { pt.current.corners.attributes[0].uv, pt.current.corners.attributes[1].uv, pt.current.corners.attributes[2].uv };
     uint v = g_first + thread;
     d.positions[v] = x;
-    d.attrs[v] = producer_attributes(nd, interpolate(uvs, w));
+    d.attrs[v] = producer_attributes(nd, base.uv);
     if (d.previous != nullptr)
-        d.previous[v] = pt.has_previous ? displaced(pt, item, material, w, true, unused) : x;
+    {
+        Surface before;
+        d.previous[v] = pt.has_previous ? displaced(pt, item, material, w, true, before) : x;
+    }
     if (d.vertex_user != nullptr)
     {
         uint corner = wi.x >= wi.y && wi.x >= wi.z ? 0 : wi.y >= wi.z ? 1 : 2;
         d.vertex_user[v] = pt.current.vertex_user[corner];
     }
+    // The weld matches points of the patch triangle interpolated, which both sides of a
+    // shared edge agree on where a subdivision copy's limit surface comes from two patches.
     bool edge = wi.x == 0 || wi.y == 0 || wi.z == 0;
-    t.undisplaced[v] = float4(base, asfloat(edge ? weld_tag() : 0));
+    float3 corners[3] = pt.current.corners.position;
+    t.undisplaced[v] = float4(interpolate(corners, w), asfloat(edge ? weld_tag() : 0));
 }
 
 // Empties the weld table; one thread per slot.

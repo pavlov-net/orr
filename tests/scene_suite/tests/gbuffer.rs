@@ -13,7 +13,6 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use glam::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
@@ -38,13 +37,13 @@ use orr_scene::testing::{
 use orr_scene::{
     Affine3, BoundTexture, ClusterWork, CopyVariant, CutGpu, DebugLod, Decal, DecalChannels,
     DecalId, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstanceRange, InstancesDesc, Lens,
-    LoadState, Loading, MaterialGpu, MaterialId, ModelId, MountId, PackSource, Pose, Projection,
-    RasterGpu, RasterView, RendererDesc, SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes,
-    SkinStateGpu, SkinnedDesc, SkinnedGpu, SlotCutGpu, TextureFilter, TransformGroupDesc,
-    TransformGroupId, ViewDesc, ViewHistoryId, ViewTarget, VisibleCluster, material_flags,
+    LoadState, MaterialGpu, MaterialId, ModelId, MountId, PackSource, Pose, Projection, RasterGpu,
+    RasterView, RendererDesc, SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu,
+    SkinnedDesc, SkinnedGpu, SlotCutGpu, TextureFilter, TransformGroupDesc, TransformGroupId,
+    ViewDesc, ViewHistoryId, ViewTarget, VisibleCluster, material_flags,
 };
 use scene_suite::shaders::{codec, pose, skin_pose, surface_at, trace};
-use scene_suite::{linked, pipeline};
+use scene_suite::{Workers, linked, pipeline};
 
 const EXTENT: [u32; 2] = [160, 96];
 
@@ -1027,21 +1026,6 @@ fn pack() -> &'static Arc<[u8]> {
     PACK.get_or_init(cook)
 }
 
-/// Threads lent to the loading side until dropped.
-struct Workers {
-    loading: Arc<Loading>,
-    threads: Vec<JoinHandle<()>>,
-}
-
-impl Drop for Workers {
-    fn drop(&mut self) {
-        self.loading.stop_workers();
-        for t in self.threads.drain(..) {
-            t.join().unwrap();
-        }
-    }
-}
-
 struct World {
     scenes: Scenes,
     mount: MountId,
@@ -1066,14 +1050,7 @@ impl World {
 
     fn with(desc: &RendererDesc) -> Self {
         let mut scenes = Scenes::new(device(), desc).unwrap();
-        let loading = scenes.loading();
-        let threads = (0..2)
-            .map(|_| {
-                let l = Arc::clone(&loading);
-                std::thread::spawn(move || l.run_worker())
-            })
-            .collect();
-        let workers = Workers { loading, threads };
+        let workers = Workers::start(&scenes, 2);
         let mount = scenes.mount(PackSource::Memory(Arc::clone(pack())));
         let start = Instant::now();
         while matches!(scenes.mount_state(mount), LoadState::Pending) {

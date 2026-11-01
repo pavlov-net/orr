@@ -13,9 +13,10 @@ use crate::emissive::{ModelEmission, Run, Runs};
 use crate::lights::{EMISSIVE_INSTANCE, EMISSIVE_PRODUCER, Light, LightId, light_gpu};
 use crate::material::MaterialId;
 use crate::memory::{RangeAllocator, UploadWindow};
-use crate::producer::{self, Producer, ProducerDesc, ProducerId};
+use crate::producer::{self, Producer, ProducerDesc, ProducerId, ProducerUpdate};
 use crate::ptlas::Ptlas;
 use crate::skin::{CopyArrays, SkinFrame, SkinnedDesc};
+use crate::subd::{self, ModelCage, SubdBuild, SubdDesc};
 use crate::tessellate::Patterns;
 use crate::traverse::Cuts;
 use crate::upload::{Op, Record};
@@ -296,6 +297,8 @@ pub(crate) struct ModelCpu {
     pub joints: u32,
     /// Set when its mesh is skinned.
     pub skin: Option<SkinShape>,
+    /// It has a subdivision cage and no mesh.
+    pub cage_only: bool,
 }
 
 /// The vertex and cluster counts of a skinned mesh.
@@ -502,6 +505,8 @@ pub struct SceneWriter<'f> {
     pub(crate) models: &'f [Option<ModelEmission>],
     /// Sections and animated parts by `ModelId`.
     pub(crate) model_cpu: &'f [ModelCpu],
+    /// Subdivision cages by `ModelId`.
+    pub(crate) cages: &'f [Option<ModelCage>],
     pub(crate) patterns: &'f Patterns,
 }
 
@@ -658,6 +663,7 @@ impl<'f> SceneWriter<'f> {
     /// dielectric rays only and never rasterized; a model that mixes either with other
     /// materials fails with [`Error::MixedClasses`].
     pub fn add_instances(&mut self, desc: &InstancesDesc) -> Result<InstanceRange> {
+        self.has_mesh(desc.model)?;
         let candidate_class = self
             .model_cpu
             .get(desc.model.0 as usize)
@@ -802,6 +808,7 @@ impl<'f> SceneWriter<'f> {
     /// [`Self::add_instances`]. Panics if the model's mesh has no skin or the model no
     /// skeleton.
     pub fn add_skinned(&mut self, desc: &SkinnedDesc) -> Result<InstanceRange> {
+        self.has_mesh(desc.model)?;
         let model = self
             .model_cpu
             .get(desc.model.0 as usize)
@@ -895,6 +902,13 @@ impl<'f> SceneWriter<'f> {
             live: desc.copies,
         });
         Ok(range)
+    }
+
+    fn has_mesh(&self, model: ModelId) -> Result<()> {
+        match self.model_cpu.get(model.0 as usize) {
+            Some(m) if m.cage_only => Err(Error::NoMesh(model)),
+            _ => Ok(()),
+        }
     }
 
     /// Replaces the flags of every copy in `range`.
@@ -1042,6 +1056,70 @@ impl<'f> SceneWriter<'f> {
     /// memory and resets its counts; its templates build this frame. The previous entry's
     /// memory, if any, is freed once this frame has completed.
     pub fn set_producer(&mut self, id: ProducerId, desc: Option<&ProducerDesc<'_>>) -> Result<()> {
+        self.set_entry(id, desc, None)
+    }
+
+    /// Sets or clears producer entry `id` as one copy of a model's subdivision cage. Every
+    /// frame the scene is updated, the copy evaluates its cage's base patches on the limit
+    /// surface (skinned copies after posing the cage by their palette entries) and orr's
+    /// tessellator dices them at rates from the scene focus, displaced through
+    /// `desc.displacement`, into the clusters raster and ray tracing draw. Faces near
+    /// extraordinary vertices and creases were refined to the cage's isolation level when
+    /// it cooked; each patch dices like any other. The copy takes the opacity of the cage
+    /// sections' own materials; a cage that mixes dielectric or presence materials with
+    /// others fails with [`Error::MixedClasses`]. Its cage stays valid until its pack is
+    /// unmounted. Panics with materials for another section count, or a palette for a cage
+    /// without skin or a model without a skeleton.
+    pub fn set_subd(&mut self, id: ProducerId, desc: Option<&SubdDesc<'_>>) -> Result<()> {
+        let Some(d) = desc else {
+            return self.set_entry(id, None, None);
+        };
+        let cage = self.cages.get(d.model.0 as usize).and_then(Option::as_ref);
+        let joints = self
+            .model_cpu
+            .get(d.model.0 as usize)
+            .map_or(0, |m| m.joints);
+        subd::check(d, cage, joints)?;
+        let cage = cage.expect("checked");
+        let materials = if d.materials.is_empty() {
+            &cage.materials[..]
+        } else {
+            d.materials
+        };
+        let producer = ProducerDesc {
+            max_clusters: d.max_clusters,
+            max_vertices: d.max_vertices,
+            update: ProducerUpdate::EveryFrame,
+            topologies: &[],
+            tessellated: true,
+            max_patch_clusters: cage.shape.clusters,
+            max_patch_vertices: cage.shape.vertices,
+            displacement: d.displacement,
+            displacement_reach: d.displacement_reach + cage.shape.deviation,
+            opacity: cage.opacity.expect("checked"),
+            materials,
+            transform: d.transform,
+            origin: d.origin,
+            previous_positions: d.palette.is_some(),
+            vertex_user: false,
+            flags: d.flags,
+            user_tag: d.user_tag,
+        };
+        let build = SubdBuild {
+            cage: cage.cage,
+            points: cage.points,
+            shape: cage.shape,
+            palette: d.palette.map(|(g, first)| (g.0, first, joints)),
+        };
+        self.set_entry(id, Some(&producer), Some(&build))
+    }
+
+    fn set_entry(
+        &mut self,
+        id: ProducerId,
+        desc: Option<&ProducerDesc<'_>>,
+        subd: Option<&SubdBuild>,
+    ) -> Result<()> {
         assert!(
             id.0 < self.scene.desc.producer_capacity,
             "{id:?} outside the producer table"
@@ -1058,7 +1136,7 @@ impl<'f> SceneWriter<'f> {
                 None,
             ),
             Some(d) => {
-                let b = producer::build(self.device, d, counts, self.patterns)?;
+                let b = producer::build(self.device, d, counts, self.patterns, subd)?;
                 let words = self.upload(b.static_at, (b.static_bytes.len() / 4) as u32)?;
                 bytemuck::cast_slice_mut(words).copy_from_slice(&b.static_bytes);
                 let entry = EmissiveGpu {

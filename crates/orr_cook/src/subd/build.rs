@@ -160,6 +160,22 @@ pub(super) fn build(
             _pad: 0,
         })
         .collect();
+    // Corners as the refiner reads them: a left-handed face keeps its first corner and
+    // reverses the rest.
+    let mut cage_faces = Vec::with_capacity(cage.face_counts.len() + 1);
+    let mut cage_corners = Vec::with_capacity(cage.face_indices.len());
+    for &c in &cage.face_counts {
+        let first = cage_corners.len();
+        cage_faces.push(first as u32);
+        let face = &cage.face_indices[first..first + c as usize];
+        cage_corners.push(face[0]);
+        if cage.left_handed {
+            cage_corners.extend(face[1..].iter().rev());
+        } else {
+            cage_corners.extend(&face[1..]);
+        }
+    }
+    cage_faces.push(cage_corners.len() as u32);
     let mut attributes = 0;
     if cage.uvs.is_some() {
         attributes |= SubdHeader::UV;
@@ -192,6 +208,8 @@ pub(super) fn build(
             .unwrap_or_default(),
         skin: data.skin.clone().unwrap_or_default(),
         pages: infos,
+        cage_faces,
+        cage_corners,
     };
     Ok(Cooked { info, pages })
 }
@@ -503,12 +521,23 @@ mod tests {
         let mut at = Vec::new();
         let mut ours = Vec::new();
         let mut corner_counts = std::collections::BTreeSet::new();
+        let mut shared: HashMap<orr_pack::subd::CagePoint, [f32; 3]> = HashMap::new();
         for (bytes, page_info) in cooked.pages.iter().zip(&info.pages) {
             let page = Page::parse(bytes).unwrap();
             assert_eq!(page.faces.len() as u32, page_info.face_count);
             let points = page.points(&info.points);
             let uv_points = page.uv_points(&info.uvs);
             for (f, face) in page.faces.iter().enumerate() {
+                let corners = info.ptex_corners(face);
+                for (k, (u, v)) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let p = page.limit(f, u, v, &points).unwrap().position;
+                    let q = *shared.entry(corners[k]).or_insert(p);
+                    let e = (0..3).map(|i| (p[i] - q[i]).abs()).fold(0.0, f32::max);
+                    assert!(e <= 1e-5 * size, "{:?} of face {}", corners[k], face.ptex);
+                }
                 let reach = if face.section == 1 { 0.1 } else { 0.0 };
                 for &u in &steps {
                     for &v in &steps {

@@ -14,7 +14,7 @@ public struct DisplacementInput
 {
     public float3 position;
     public uint displacement;    // linked IDisplacement id; 0 = TextureDisplacement
-    public float3 normal;        // unit, interpolated from the patch's corners
+    public float3 normal;        // unit: interpolated from the patch's corners, or a subdivision copy's limit normal
     public uint material;        // MaterialId
     public UvFootprint uv;       // uv and its change over one generated vertex step; hardware filtering
     public uint user;            // the patch's cluster word

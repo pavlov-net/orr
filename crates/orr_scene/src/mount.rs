@@ -18,6 +18,7 @@ use orr_pack::instance::{InstancePageInfo, InstanceRecord};
 use orr_pack::material::Material;
 use orr_pack::mesh::{Cluster, MeshHeader, MeshInfo, NodePage, PageHeader, PageView, Part};
 use orr_pack::model::ModelInfo;
+use orr_pack::subd::{Page as SubdPage, SubdInfo};
 use orr_pack::texture::{TextureHeader, TextureInfo};
 use orr_pack::{Aabb, Archive, AssetId, Class, Codec};
 
@@ -30,8 +31,10 @@ use crate::material::{BoundTexture, MaterialId, MaterialTable, candidate_class};
 use crate::memory::{Block, RangeAllocator, UploadWindow};
 use crate::residency::{ResidencyClass, Start, UnitDesc};
 use crate::scene::{ModelCpu, ModelId, SkinShape};
+use crate::shaders::types::SubdCageGpu;
 use crate::skin;
 use crate::stream::{MountUnits, StreamUnit, Streaming};
+use crate::subd::{self, CageShape, CageTables, ModelCage};
 use crate::tiles::{TexStream, TileGrid};
 use crate::traverse::{NodePageFeedback, PAGED_DEPTH};
 use crate::upload::Record;
@@ -188,6 +191,15 @@ pub(crate) enum StagedCopy {
     },
 }
 
+/// A subdivision cage's tables, resident in a block of the mount.
+#[derive(Clone, Copy)]
+struct PlacedCage {
+    id: AssetId,
+    cage: GpuPtr<SubdCageGpu>,
+    points: GpuPtr<[f32; 3]>,
+    shape: CageShape,
+}
+
 /// What the jobs of one mount have placed so far.
 #[derive(Default)]
 struct Placed {
@@ -200,6 +212,7 @@ struct Placed {
     pages: Vec<PlacedPage>,
     skeletons: Vec<(AssetId, SkeletonRef)>,
     clips: Vec<(AssetId, ClipRef)>,
+    cages: Vec<PlacedCage>,
 }
 
 /// One mount on the loading side, shared by its jobs and reads.
@@ -541,6 +554,7 @@ fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
                 | Class::InstancePage
                 | Class::Skeleton
                 | Class::Clip
+                | Class::Subd
         ) {
             continue;
         }
@@ -565,8 +579,59 @@ fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
             }),
             Class::Skeleton => fetch(t, i, 0, move |t, b| place_skeleton(t, id, b)),
             Class::Clip => fetch(t, i, 0, move |t, b| place_clip(t, i, id, b)),
+            Class::Subd => fetch(t, i, 0, move |t, b| place_subd(t, i, id, b)),
             _ => fetch(t, i, 0, move |t, b| place_page(t, i, id, b)),
         }
+    }
+    Ok(())
+}
+
+/// A subdivision cage's blob 0, then every page; the last page read builds the cage's
+/// tables into a block of its own.
+fn place_subd(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Result<()> {
+    struct Pending {
+        info: SubdInfo,
+        pages: Vec<Option<SubdPage>>,
+        left: usize,
+    }
+    let info = SubdInfo::parse(blob0)?;
+    let blobs: Vec<u32> = info.pages.iter().map(|p| p.blob).collect();
+    let pending = Arc::new(Mutex::new(Pending {
+        pages: vec![None; blobs.len()],
+        left: blobs.len(),
+        info,
+    }));
+    for (k, blob) in blobs.into_iter().enumerate() {
+        let pending = Arc::clone(&pending);
+        fetch(t, entry, blob as usize, move |t, b| {
+            let page = SubdPage::parse(b)?;
+            let mut p = pending.lock().unwrap();
+            p.pages[k] = Some(page);
+            p.left -= 1;
+            if p.left > 0 {
+                return Ok(());
+            }
+            let pages: Vec<SubdPage> = p.pages.drain(..).flatten().collect();
+            let tables = CageTables::new(&p.info, &pages)?;
+            drop(p);
+            let kind = if t.staged {
+                MemoryKind::DeviceLocal
+            } else {
+                MemoryKind::Upload
+            };
+            let a = t.device.gpu_malloc::<u8>(kind, tables.len(), "subd cage")?;
+            let base = a.gpu();
+            let block = Block::of(&a);
+            t.placed.lock().unwrap().blocks.push(a);
+            t.write(block, 0, &tables.bytes(base))?;
+            t.placed.lock().unwrap().cages.push(PlacedCage {
+                id,
+                cage: base.cast(),
+                points: tables.rest_points(base),
+                shape: tables.shape,
+            });
+            Ok(())
+        });
     }
     Ok(())
 }
@@ -1074,7 +1139,8 @@ struct ResolvedMesh {
 
 struct ResolvedModel {
     id: AssetId,
-    mesh: usize,
+    mesh: Option<usize>,
+    cage: Option<usize>,
     /// Its skeleton's joints; 0 without a skeleton.
     joints: u32,
     /// Indices into `Resolved::materials`, one per section.
@@ -1093,6 +1159,7 @@ pub(crate) struct Resolved {
     pages: Vec<PlacedPage>,
     skeletons: Vec<(AssetId, SkeletonRef)>,
     clips: Vec<(AssetId, ClipRef)>,
+    cages: Vec<PlacedCage>,
     accel: MountAccel,
     /// Resident cluster id ranges taken for the mount's meshes.
     cluster_ranges: Vec<(u32, u32)>,
@@ -1208,11 +1275,23 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
         .models
         .iter()
         .map(|(id, m)| {
-            let mesh = *mesh_index
-                .get(&m.header.mesh)
-                .ok_or_else(|| missing(m.header.mesh))?;
-            if m.materials.len() != meshes[mesh].sections as usize {
-                return Err(orr_pack::Error::Malformed("model materials per mesh section").into());
+            let mesh = match m.header.mesh {
+                AssetId::NONE => None,
+                k => Some(*mesh_index.get(&k).ok_or_else(|| missing(k))?),
+            };
+            let cage = match m.header.subd {
+                AssetId::NONE => None,
+                k => Some(
+                    p.cages
+                        .iter()
+                        .position(|c| c.id == k)
+                        .ok_or_else(|| missing(k))?,
+                ),
+            };
+            let sections = mesh.map_or(0, |i| meshes[i].sections)
+                + cage.map_or(0, |i| p.cages[i].shape.sections);
+            if mesh.is_none() && cage.is_none() || m.materials.len() != sections as usize {
+                return Err(orr_pack::Error::Malformed("model materials per section").into());
             }
             let materials = m
                 .materials
@@ -1233,6 +1312,7 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
             Ok(ResolvedModel {
                 id: *id,
                 mesh,
+                cage,
                 joints,
                 materials,
                 bounds: m.header.bounds,
@@ -1249,6 +1329,7 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
         pages: p.pages,
         skeletons: p.skeletons,
         clips: p.clips,
+        cages: p.cages,
         accel: MountAccel::default(),
         cluster_ranges: Vec::new(),
     })
@@ -1270,11 +1351,13 @@ fn build_accel(
         .map(|m| vec![false; m.sections as usize])
         .collect();
     for model in &r.models {
-        for (section, &mi) in model.materials.iter().enumerate() {
+        let Some(mesh) = model.mesh else { continue };
+        let sections = r.meshes[mesh].sections as usize;
+        for (section, &mi) in model.materials.iter().take(sections).enumerate() {
             let m = &r.materials[mi].1;
             let layered = m.flags & (material_flags::DIELECTRIC | material_flags::PRESENCE) != 0;
             if layered || (m.surface != 0 && m.flags & material_flags::ALPHA_TESTED != 0) {
-                non_opaque[model.mesh][section] = true;
+                non_opaque[mesh][section] = true;
             }
         }
     }
@@ -1538,6 +1621,8 @@ pub(crate) struct Apply<'a> {
     pub emission: &'a mut Vec<Option<ModelEmission>>,
     /// Sections and animated parts by `ModelId`.
     pub model_cpu: &'a mut Vec<ModelCpu>,
+    /// Subdivision cages by `ModelId`.
+    pub cages: &'a mut Vec<Option<ModelCage>>,
 }
 
 impl Apply<'_> {
@@ -1566,6 +1651,7 @@ type ResolvedTables = (
     Vec<ResolvedMesh>,
     Vec<ResolvedModel>,
     Vec<PlacedPage>,
+    Vec<PlacedCage>,
 );
 
 /// A mount's residency units. Mesh pages are pinned up to `pinned_pages` and locked after
@@ -1842,6 +1928,7 @@ impl Mounts {
         m: MountId,
         frame: u64,
         emission: &mut [Option<ModelEmission>],
+        cages: &mut [Option<ModelCage>],
     ) {
         let Some(slot) = self.entries.get_mut(m.0 as usize) else {
             return;
@@ -1856,6 +1943,9 @@ impl Mounts {
                 for id in r.models.values() {
                     if let Some(e) = emission.get_mut(id.0 as usize) {
                         *e = None;
+                    }
+                    if let Some(c) = cages.get_mut(id.0 as usize) {
+                        *c = None;
                     }
                 }
                 self.streaming.unregister(m, frame);
@@ -1957,13 +2047,16 @@ impl Mounts {
             _accel: r.accel,
             placed_textures: r.textures,
         };
-        let resolved = (r.materials, r.meshes, r.models, r.pages);
+        let resolved = (r.materials, r.meshes, r.models, r.pages, r.cages);
         let result = self.fill(mount, &r.source, &mut res, resolved, w);
         match result {
             Ok(()) => Ok(res),
             Err(e) => {
                 for id in res.models.values() {
                     w.emission[id.0 as usize] = None;
+                    if let Some(c) = w.cages.get_mut(id.0 as usize) {
+                        *c = None;
+                    }
                 }
                 self.streaming.unregister(mount, 0);
                 self.release(res, w.device, w.materials);
@@ -1977,7 +2070,7 @@ impl Mounts {
         mount: MountId,
         source: &Arc<BlobSource>,
         res: &mut Resident,
-        (materials, meshes, models, pages): ResolvedTables,
+        (materials, meshes, models, pages, cages): ResolvedTables,
         w: &mut Apply<'_>,
     ) -> Result<()> {
         let mut material_ids = Vec::with_capacity(materials.len());
@@ -2043,7 +2136,7 @@ impl Mounts {
             let raw: Vec<u32> = section_materials.iter().map(|id| id.0).collect();
             w.put(list, &raw)?;
             let gpu = ModelGpu {
-                mesh: mesh_ids[m.mesh],
+                mesh: m.mesh.map_or(u32::MAX, |i| mesh_ids[i]),
                 section_count: n,
                 materials: list,
                 bounds_min: m.bounds.min,
@@ -2051,7 +2144,6 @@ impl Mounts {
                 ..bytemuck::Zeroable::zeroed()
             };
             w.put(self.models.gpu().offset(u64::from(id.0)), &[gpu])?;
-            self.owners.insert(id, (mount, m.mesh as u32));
             let i = id.0 as usize;
             if w.emission.len() <= i {
                 w.emission.resize(i + 1, None);
@@ -2059,8 +2151,38 @@ impl Mounts {
             if w.model_cpu.len() <= i {
                 w.model_cpu.resize(i + 1, ModelCpu::default());
             }
-            let mesh = &meshes[m.mesh];
+            if w.cages.len() <= i {
+                w.cages.resize(i + 1, None);
+            }
+            let mesh_sections = m.mesh.map_or(0, |k| meshes[k].sections as usize);
+            w.cages[i] = m.cage.map(|k| {
+                let c = &cages[k];
+                let flags: Vec<u32> = m.materials[mesh_sections..]
+                    .iter()
+                    .map(|&k| materials[k].1.flags)
+                    .collect();
+                ModelCage {
+                    cage: c.cage,
+                    points: c.points,
+                    shape: c.shape,
+                    materials: section_materials[mesh_sections..].to_vec(),
+                    opacity: subd::opacity(&flags),
+                }
+            });
+            let Some(mesh_index) = m.mesh else {
+                w.model_cpu[i] = ModelCpu {
+                    sections: n,
+                    joints: m.joints,
+                    cage_only: true,
+                    ..ModelCpu::default()
+                };
+                w.emission[i] = None;
+                continue;
+            };
+            self.owners.insert(id, (mount, mesh_index as u32));
+            let mesh = &meshes[mesh_index];
             let skinned = mesh.header.attributes & MeshHeader::SKIN != 0;
+            let mesh_materials = &m.materials[..mesh_sections];
             w.model_cpu[i] = ModelCpu {
                 sections: n,
                 animated_parts: mesh.gpu.animated_parts,
@@ -2069,9 +2191,12 @@ impl Mounts {
                     vertices: mesh.clusters.iter().map(|c| c.vertex_count).sum(),
                     clusters: mesh.gpu.cluster_count,
                 }),
-                candidate_class: candidate_class(m.materials.iter().map(|&k| materials[k].1.flags)),
+                candidate_class: candidate_class(
+                    mesh_materials.iter().map(|&k| materials[k].1.flags),
+                ),
+                cage_only: false,
             };
-            let spans = &meshes[m.mesh].spans;
+            let spans = &mesh.spans;
             w.emission[i] = (!spans.is_empty()).then(|| ModelEmission {
                 sections: n,
                 materials: section_materials,
