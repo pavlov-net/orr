@@ -1,16 +1,16 @@
 //! Packs mounted from a file or from memory. The loading side reads and places every asset
-//! of a pack except the hierarchy pages below a mesh's top page, which stream on request;
-//! the render thread takes the finished batch at step 1 and applies its tables with the
-//! frame's scatter.
+//! of a pack except the hierarchy pages below a mesh's top page and the tiles above the mip
+//! tails of the textures its materials bind, which stream on request; the render thread
+//! takes the finished batch at step 1 and applies its tables with the frame's scatter.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use orr_gpu::{
-    Allocation, Device, GpuPtr, MemoryKind, MemoryPriority, QueueKind, SamplerIndex, Texture,
-    TextureDesc, TextureIndex, TextureKind, TextureMemory, TextureRegion, TextureUsage,
+    Allocation, Device, GpuPtr, MemoryKind, MemoryPriority, QueueKind, SamplerIndex, SparseBinds,
+    Texture, TextureDesc, TextureIndex, TextureKind, TextureMemory, TextureRegion, TextureUsage,
     TimelinePoint, ViewDesc,
 };
 use orr_io::{AlignedBuf, Read, SECTOR};
@@ -31,10 +31,14 @@ use crate::memory::{Block, RangeAllocator, UploadWindow};
 use crate::residency::{ResidencyClass, Start, UnitDesc};
 use crate::scene::{ModelCpu, ModelId, SkinShape};
 use crate::skin;
-use crate::stream::{StreamUnit, Streaming};
+use crate::stream::{MountUnits, StreamUnit, Streaming};
+use crate::tiles::{TexStream, TileGrid};
 use crate::traverse::{NodePageFeedback, PAGED_DEPTH};
 use crate::upload::Record;
-use crate::{ClusterRef, Error, MaskGpu, MaterialGpu, MeshGpu, ModelGpu, Result, material_flags};
+use crate::{
+    ClusterRef, Error, MaskGpu, MaterialGpu, MeshGpu, ModelGpu, Result, TextureStreamGpu,
+    material_flags,
+};
 
 /// Where a pack's bytes come from.
 #[derive(Clone, Debug)]
@@ -71,7 +75,10 @@ pub(crate) struct PlacedTexture {
     index: TextureIndex,
     primaries: u8,
     staged: bool,
+    /// Bytes resident from mount: the whole texture, or a streamed one's mip tails.
     bytes: u64,
+    /// How a streamed texture's tiles load; none for whole textures.
+    stream: Option<Arc<TexStream>>,
 }
 
 struct PlacedMesh {
@@ -338,29 +345,13 @@ pub(crate) fn write(
     at: u64,
     bytes: &[u8],
 ) -> Result<Option<StagedCopy>> {
-    assert!(
-        at + bytes.len() as u64 <= block.size(),
-        "write outside its block"
-    );
-    if bytes.is_empty() {
+    if bytes.is_empty() || block.write_mapped(at, bytes) {
         return Ok(None);
     }
-    match block.cpu() {
-        // SAFETY: the assert above keeps the write inside the block's mapping, which
-        // outlives the jobs writing it; every write covers its own range.
-        Some(p) => unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                (p as *mut u8).add(at as usize),
-                bytes.len(),
-            );
-            Ok(None)
-        },
-        None => Ok(Some(StagedCopy::Buffer {
-            src: staging(device, bytes)?,
-            dst: block.gpu() + at,
-        })),
-    }
+    Ok(Some(StagedCopy::Buffer {
+        src: staging(device, bytes)?,
+        dst: block.gpu() + at,
+    }))
 }
 
 fn staging(device: &Device, bytes: &[u8]) -> Result<Allocation<u8>> {
@@ -399,8 +390,9 @@ fn fetch(
     read_stored(
         &task.source(),
         b,
+        None,
         Box::new(move |stored| {
-            t.step(|| decoded(t.archive(), &b, stored?, |bytes| then(&t, bytes)));
+            t.step(|| decoded(t.archive(), &b, None, stored?, |bytes| then(&t, bytes)));
         }),
     );
 }
@@ -508,10 +500,34 @@ fn open_index(
     plan(t, archive)
 }
 
+/// The textures the pack's materials bind, from the materials' blobs resident in the mount
+/// section.
+fn material_textures(archive: &Archive) -> Result<HashSet<AssetId>> {
+    let mut bound = HashSet::new();
+    for e in archive
+        .entries()
+        .iter()
+        .filter(|e| e.class == Class::Material as u16)
+    {
+        let Some(&b) = archive.blobs(e).first() else {
+            continue;
+        };
+        let Some(stored) = archive.stored(&b, None) else {
+            continue;
+        };
+        let mut bytes = vec![0; b.raw_len as usize];
+        archive.decode(&b, None, stored, &mut bytes)?;
+        let m = Material::from_bytes(&bytes)?;
+        bound.extend(m.textures.iter().map(|t| t.texture));
+    }
+    Ok(bound)
+}
+
 /// Queues the reads of every asset the mount makes resident.
 fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
     let archive = Arc::new(archive);
     let _ = t.archive.set(Arc::clone(&archive));
+    let bound = material_textures(&archive)?;
     for (i, e) in archive.entries().iter().enumerate() {
         let Some(class) = Class::from_u16(e.class) else {
             continue;
@@ -533,7 +549,10 @@ fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
         let id = e.id;
         match class {
             Class::Mesh => fetch(t, i, 0, move |t, b| place_mesh(t, i, id, b)),
-            Class::Texture => fetch(t, i, 0, move |t, b| place_texture(t, i, id, b)),
+            Class::Texture => {
+                let stream = bound.contains(&id);
+                fetch(t, i, 0, move |t, b| place_texture(t, i, id, b, stream));
+            }
             Class::Material => fetch(t, i, 0, move |t, b| {
                 let m = Material::from_bytes(b)?;
                 t.placed.lock().unwrap().materials.push((id, m));
@@ -794,16 +813,20 @@ fn gpu_format(vk_format: u32) -> Option<orr_gpu::Format> {
     })
 }
 
-/// A whole texture: created from blob 0, then every mip copied in from its blob.
-fn place_texture(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Result<()> {
+/// A texture from blob 0: streamed when `stream` and it has mips above its tail, else whole
+/// with every mip copied in from its blob. Textures streamed are those the pack's materials
+/// bind, which kernels sample through the footprint function's residency clamp.
+fn place_texture(
+    t: &Arc<MountTask>,
+    entry: usize,
+    id: AssetId,
+    blob0: &[u8],
+    stream: bool,
+) -> Result<()> {
     let info = Arc::new(TextureInfo::parse(blob0)?);
     let h = info.header;
     let format = gpu_format(h.vk_format).ok_or(Error::TextureFormat(h.vk_format))?;
-    let mut usage = TextureUsage::SAMPLED;
-    if t.host_copy {
-        usage |= TextureUsage::HOST_COPY;
-    }
-    let desc = TextureDesc {
+    let mut desc = TextureDesc {
         kind: if h.kind == TextureHeader::CUBE {
             TextureKind::Cube
         } else {
@@ -813,8 +836,14 @@ fn place_texture(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) ->
         extent: [h.width, h.height, 1],
         mips: u32::from(h.mip_count),
         layers: u32::from(h.layers),
-        usage,
+        usage: TextureUsage::SAMPLED,
     };
+    if stream && h.tail_first_mip > 0 && place_streamed(t, entry, id, &info, &desc)? {
+        return Ok(());
+    }
+    if t.host_copy {
+        desc.usage |= TextureUsage::HOST_COPY;
+    }
     let texture = Arc::new(t.device.create_texture(
         &desc,
         TextureMemory::Dedicated,
@@ -829,6 +858,7 @@ fn place_texture(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) ->
         primaries: h.primaries,
         staged: !t.host_copy,
         bytes: t.device.texture_requirements(&desc).0,
+        stream: None,
     });
     for blob in 1..h.blob_count() {
         let (info, texture) = (Arc::clone(&info), Arc::clone(&texture));
@@ -852,6 +882,112 @@ fn place_texture(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) ->
         });
     }
     Ok(())
+}
+
+/// A streamed texture: a sparse image whose mip tails are bound at mount and filled from
+/// the last blob, and whose tiles above them stream. False, placing nothing, when the
+/// device's tile layout differs from the cooked one.
+fn place_streamed(
+    t: &Arc<MountTask>,
+    entry: usize,
+    id: AssetId,
+    info: &Arc<TextureInfo>,
+    desc: &TextureDesc,
+) -> Result<bool> {
+    let h = info.header;
+    let texture = t
+        .device
+        .create_texture(desc, TextureMemory::Sparse, "streamed texture")?;
+    let layout = *texture.sparse_layout().expect("a sparse texture");
+    let [tw, th] = orr_pack::texture::tile_shape(h.format()?);
+    if layout.tail_first_mip != u32::from(h.tail_first_mip)
+        || layout.tile_bytes != orr_pack::texture::TILE_BYTES as u64
+        || layout.tile_extent[..2] != [tw, th]
+    {
+        return Ok(false);
+    }
+    let texture = Arc::new(texture);
+    let tail = u32::from(h.tail_first_mip);
+    let grid = TileGrid::new(
+        (0..tail).map(|m| layout.tiles(desc, m)).collect(),
+        desc.layers,
+    );
+    let tails = layout.tails(desc);
+    let tail_bytes = u64::from(tails) * layout.tail_bytes;
+    let [cx, cy] = grid.cells();
+    let cells = cx * cy * desc.layers;
+    let record_bytes = size_of::<TextureStreamGpu>() as u64;
+    let block = t.block(record_bytes + 4 * u64::from(cells), "texture stream")?;
+    let map = vec![tail; cells as usize];
+    t.write(block, record_bytes, bytemuck::cast_slice(&map))?;
+    // SAFETY: the record and the map are the block's bytes.
+    let (record, map) = unsafe {
+        (
+            GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu())),
+            GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu() + record_bytes)),
+        )
+    };
+    let tails = match tail_bytes {
+        0 => None,
+        bytes => Some((
+            tails,
+            t.device.gpu_malloc_with_priority::<u8>(
+                MemoryKind::DeviceLocal,
+                MemoryPriority::High,
+                bytes,
+                "texture mip tails",
+            )?,
+        )),
+    };
+    let slot = t.device.alloc_image_slot()?;
+    let index = t.device.write_sampled(slot, &texture, &ViewDesc::default());
+    let stream = Arc::new(TexStream {
+        texture: Arc::clone(&texture),
+        index,
+        layout,
+        grid,
+        entry: entry as u32,
+        blobs: (0..tail).map(|m| h.mip_blob(m) as u32).collect(),
+        record,
+        map,
+        tails,
+    });
+    t.placed.lock().unwrap().textures.push(PlacedTexture {
+        id,
+        texture: Arc::clone(&texture),
+        index,
+        primaries: h.primaries,
+        staged: true,
+        bytes: tail_bytes,
+        stream: Some(stream),
+    });
+    if tail < desc.mips {
+        let info = Arc::clone(info);
+        fetch(t, entry, h.mip_blob(tail), move |t, bytes| {
+            let h = &info.header;
+            for mip in tail..u32::from(h.mip_count) {
+                let [w, hh] = h.mip_size(mip);
+                for layer in 0..u32::from(h.layers) {
+                    let texels = info.mip_texels(bytes, mip, layer)?;
+                    let region = TextureRegion {
+                        mip,
+                        base_layer: layer,
+                        layers: 1,
+                        offset: [0; 3],
+                        extent: [w, hh, 1],
+                    };
+                    let copy = StagedCopy::Texture {
+                        src: staging(&t.device, &texels)?,
+                        texture: Arc::clone(&texture),
+                        region,
+                    };
+                    t.placed.lock().unwrap().copies.push(copy);
+                }
+            }
+            Ok(())
+        });
+    }
+    Ok(true)
 }
 
 /// An instance page: blob 0 stays on the CPU; records and consumer data go into one block.
@@ -1211,9 +1347,10 @@ pub(crate) fn submit_copies(
     device: &Device,
     copies: &[StagedCopy],
     textures: &[PlacedTexture],
+    wait: Option<TimelinePoint>,
 ) -> Result<Option<TimelinePoint>> {
     if copies.is_empty() {
-        return Ok(None);
+        return Ok(wait);
     }
     let kind = [QueueKind::Copy, QueueKind::Loading, QueueKind::Render]
         .into_iter()
@@ -1238,7 +1375,27 @@ pub(crate) fn submit_copies(
             } => list.copy_to_texture(texture, region, src.gpu()),
         }
     }
-    Ok(Some(queue.submit(vec![list], &[])?))
+    Ok(Some(queue.submit(vec![list], wait.as_slice())?))
+}
+
+/// Binds the mip tails of a mount's streamed textures; none when they have none.
+fn bind_tails(device: &Device, textures: &[PlacedTexture]) -> Result<Option<TimelinePoint>> {
+    let mut binds = SparseBinds::new();
+    let mut any = false;
+    for s in textures.iter().filter_map(|t| t.stream.as_ref()) {
+        if let Some((tails, memory)) = &s.tails {
+            for layer in 0..*tails {
+                let at = u64::from(layer) * s.layout.tail_bytes;
+                binds.tail(&s.texture, layer, Some((memory, at)))?;
+                any = true;
+            }
+        }
+    }
+    Ok(if any {
+        Some(device.bind_sparse(&binds)?)
+    } else {
+        None
+    })
 }
 
 /// Ends a mount on the loading thread: resolves its assets, submits its staged copies and
@@ -1257,7 +1414,8 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<MountTask>) 
     let result = state
         .and_then(|()| resolve(task.source(), placed, task.sampler))
         .and_then(|mut r| {
-            let copied = submit_copies(device, &copies, &r.textures)?;
+            let tails = bind_tails(device, &r.textures)?;
+            let copied = submit_copies(device, &copies, &r.textures, tails)?;
             let built = build_accel(device, &task.accel, &mut r, copied);
             ranges.clone_from(&r.cluster_ranges);
             Ok((built?.or(copied), r))
@@ -1298,6 +1456,8 @@ pub(crate) struct Resident {
     pub pages: HashMap<AssetId, PageId>,
     pub skeletons: HashMap<AssetId, SkeletonRef>,
     pub clips: HashMap<AssetId, ClipRef>,
+    /// Where the mount's blobs are read from, for requested blobs.
+    source: Arc<BlobSource>,
     meshes: Vec<u32>,
     /// Per mesh of `meshes`: what its section-mask BLAS build from.
     rt: Vec<MeshRt>,
@@ -1381,6 +1541,13 @@ pub(crate) struct Apply<'a> {
 }
 
 impl Apply<'_> {
+    /// Sets `words` 32-bit words from `dst` to `value`.
+    pub(crate) fn fill(&mut self, dst: GpuPtr<u32>, words: u32, value: u32) {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        self.records
+            .push(Record::fill(seq, dst.address().0, words, value));
+    }
+
     pub(crate) fn put<T: bytemuck::Pod>(&mut self, dst: GpuPtr<T>, values: &[T]) -> Result<()> {
         if values.is_empty() {
             return Ok(());
@@ -1401,23 +1568,17 @@ type ResolvedTables = (
     Vec<PlacedPage>,
 );
 
-/// A mount's residency units, with how to load the streamed ones, the streamed units of
-/// each mesh, and the unit of each node page of each mesh. Mesh pages are pinned up to
-/// `pinned_pages` and locked after it (the mount's acceleration structures reference every
-/// cluster); a mesh's top node page is pinned and its other node pages stream, each after
-/// its parent page. Textures and instance pages are pinned.
-type Units = (
-    Vec<(UnitDesc, Option<StreamUnit>)>,
-    Vec<Vec<u32>>,
-    Vec<Vec<u32>>,
-);
-
+/// A mount's residency units. Mesh pages are pinned up to `pinned_pages` and locked after
+/// it (the mount's acceleration structures reference every cluster); a mesh's top node page
+/// is pinned and its other node pages stream, each after its parent page. Whole textures,
+/// streamed textures' mip tails and instance pages are pinned; a streamed texture's tiles
+/// stream, each after the coarser tile covering it.
 fn units(
     meshes: &[ResolvedMesh],
     tables: &[GpuPtr<u64>],
     textures: &[PlacedTexture],
     pages: &[PlacedPage],
-) -> Result<Units> {
+) -> Result<MountUnits> {
     let malformed = |what| Error::Pack(orr_pack::Error::Malformed(what));
     let mut units = Vec::new();
     let mut streamed = Vec::with_capacity(meshes.len());
@@ -1451,7 +1612,7 @@ fn units(
                 if parent as usize >= n {
                     return Err(malformed("a node page's parent follows it"));
                 }
-                let stream = StreamUnit {
+                let stream = StreamUnit::Pool {
                     entry: m.entry,
                     blob,
                     bytes,
@@ -1479,17 +1640,34 @@ fn units(
         };
         (unit, None)
     };
-    units.extend(
-        textures
-            .iter()
-            .map(|t| pinned(ResidencyClass::Textures, t.bytes)),
-    );
+    let mut streams = Vec::new();
+    for t in textures {
+        units.push(pinned(ResidencyClass::Textures, t.bytes));
+        let Some(s) = &t.stream else { continue };
+        let first = units.len() as u32;
+        let texture = streams.len() as u32;
+        for tile in 0..s.grid.tile_count() {
+            let unit = UnitDesc {
+                class: ResidencyClass::Textures,
+                bytes: s.layout.tile_bytes,
+                deps: s.grid.parent(tile).map(|p| first + p).into_iter().collect(),
+                start: Start::Absent,
+            };
+            units.push((unit, Some(StreamUnit::Tile { texture, tile })));
+        }
+        streams.push((Arc::clone(s), first));
+    }
     units.extend(
         pages
             .iter()
             .map(|p| pinned(ResidencyClass::InstancePages, p.bytes)),
     );
-    Ok((units, streamed, node_pages))
+    Ok(MountUnits {
+        units,
+        meshes: streamed,
+        node_pages,
+        textures: streams,
+    })
 }
 
 fn capacity(what: &'static str, capacity: u32) -> Error {
@@ -1502,6 +1680,8 @@ impl Mounts {
         sizes: TableSizes,
         budgets: &crate::Budgets,
         accel: &Arc<AccelShared>,
+        streams: GpuPtr<GpuPtr<TextureStreamGpu>>,
+        fif: u32,
     ) -> Result<Self> {
         let m = MemoryKind::DeviceLocal;
         Ok(Self {
@@ -1528,7 +1708,7 @@ impl Mounts {
             sizes,
             pages: Vec::new(),
             retired: Vec::new(),
-            streaming: Streaming::new(device, budgets),
+            streaming: Streaming::new(device, budgets, streams, fif)?,
             owners: HashMap::new(),
             mesh_owners: HashMap::new(),
             masks: HashMap::new(),
@@ -1555,6 +1735,31 @@ impl Mounts {
             }
         }
         h
+    }
+
+    /// Queues blob `blob` of asset `id` of mount `m` into `target`.
+    pub(crate) fn request_blob(
+        &mut self,
+        m: MountId,
+        id: AssetId,
+        blob: u32,
+        target: crate::BlobTarget,
+    ) -> Result<crate::BlobId> {
+        let r = self.resident(m)?;
+        let a = &r.source.archive;
+        let missing = Error::Missing {
+            mount: m,
+            asset: id,
+        };
+        let e = a.find(id).ok_or(missing)?;
+        let b = *a
+            .blobs(e)
+            .get(blob as usize)
+            .ok_or(Error::Pack(orr_pack::Error::Malformed(
+                "blob index outside its entry",
+            )))?;
+        let source = Arc::clone(&r.source);
+        Ok(self.streaming.request_blob(&source, b, target))
     }
 
     /// Hands the traversal's node page requests and reads of a completed frame to the
@@ -1727,6 +1932,7 @@ impl Mounts {
             pages: HashMap::new(),
             skeletons: r.skeletons.into_iter().collect(),
             clips: r.clips.into_iter().collect(),
+            source: Arc::clone(&r.source),
             meshes: Vec::new(),
             rt: Vec::new(),
             hierarchy: Vec::new(),
@@ -1768,7 +1974,7 @@ impl Mounts {
             w.materials.note(mid, m);
             w.put(
                 w.materials.table.gpu().offset(u64::from(mid.0)),
-                std::slice::from_ref(m),
+                &[w.materials.record(m)],
             )?;
         }
         let mut mesh_ids = Vec::with_capacity(meshes.len());
@@ -1859,7 +2065,7 @@ impl Mounts {
         }
         let units = units(&meshes, &tables, &res.placed_textures, &pages)?;
         self.streaming
-            .register(mount, Arc::clone(source), units.0, units.1, units.2)?;
+            .register(mount, Arc::clone(source), units, w)?;
         for p in pages {
             let i = match self.pages.iter().position(Option::is_none) {
                 Some(i) => i,

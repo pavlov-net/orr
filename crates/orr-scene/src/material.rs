@@ -6,13 +6,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytemuck::{Pod, Zeroable};
 use orr_color::{RgbPrimaries, mat_f32, mul_f32};
-use orr_gpu::{Allocation, Device, MemoryKind, SamplerIndex, TextureIndex};
+use orr_gpu::{Allocation, Device, GpuPtr, MemoryKind, SamplerIndex, TextureIndex};
 use orr_pack::material::{Material, slot};
 use orr_pack::texture::TextureHeader;
 
 use crate::memory::{RangeAllocator, UploadWindow};
 use crate::upload::Record;
-use crate::{Error, MaterialGpu, Result};
+use crate::{Error, MaterialGpu, Result, TextureStreamGpu};
 
 /// An index in the global material table.
 #[repr(transparent)]
@@ -178,6 +178,7 @@ impl MaterialGpu {
             transmission_dispersion_scale: m.transmission_dispersion_scale,
             transmission_dispersion_abbe_number: m.transmission_dispersion_abbe_number,
             data: 0,
+            texture_streams: GpuPtr::NULL,
         }
     }
 }
@@ -185,6 +186,9 @@ impl MaterialGpu {
 pub(crate) struct MaterialTable {
     pub table: Allocation<MaterialGpu>,
     pub capacity: u32,
+    /// `TextureStreamGpu` addresses by heap index, 0 for textures that do not stream; every
+    /// record written points `MaterialGpu::texture_streams` at it.
+    pub streams: Allocation<GpuPtr<TextureStreamGpu>>,
     ids: Mutex<RangeAllocator>,
     /// Materials whose pixels may use the extended G-buffer target.
     extended: Mutex<HashSet<u32>>,
@@ -203,9 +207,22 @@ impl MaterialTable {
         Ok(Self {
             table: device.gpu_malloc(MemoryKind::DeviceLocal, u64::from(capacity), "materials")?,
             capacity,
+            streams: device.gpu_malloc(
+                MemoryKind::DeviceLocal,
+                u64::from(device.image_slots()),
+                "texture streams",
+            )?,
             ids: Mutex::new(RangeAllocator::new(capacity)),
             extended: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// `m` as the table stores it: pointing at the texture stream table.
+    pub(crate) fn record(&self, m: &MaterialGpu) -> MaterialGpu {
+        MaterialGpu {
+            texture_streams: self.streams.gpu(),
+            ..*m
+        }
     }
 
     /// Records what material `id` now holds.
@@ -263,7 +280,7 @@ impl MaterialWriter<'_> {
             id.0 < self.table.capacity,
             "{id:?} is outside the material table"
         );
-        let src = self.window.put(self.device, m)?;
+        let src = self.window.put(self.device, &self.table.record(m))?;
         self.table.note(id, m);
         let dst = self.table.table.gpu().offset(u64::from(id.0));
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);

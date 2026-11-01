@@ -21,8 +21,8 @@ use orr_pack::model::ModelInfo;
 use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, ArchiveWriter, AssetId, BlobIn, Class, Entry, Span, Target};
 use orr_scene::orr_gpu::{
-    Device, DeviceDesc, GpuAddress, GpuPtr, QueueKind, QueueRequest, Texture, TextureIndex,
-    TextureRegion,
+    Device, DeviceDesc, GpuAddress, GpuPtr, Hazards, QueueKind, QueueRequest, Stages, Texture,
+    TextureIndex, TextureRegion,
 };
 use orr_scene::testing::{
     assert_clean, device, global_tables, mounted_texture, read_buffer_on, read_texture_on,
@@ -241,6 +241,31 @@ fn ready(scenes: &mut Scenes, m: MountId) {
     }
 }
 
+/// Runs frames until `m` is ready and every tile of its streamed textures (those of `a`)
+/// is resident.
+fn ready_whole(scenes: &mut Scenes, m: MountId, a: &Archive) {
+    ready(scenes, m);
+    let textures: Vec<TextureIndex> = a
+        .entries()
+        .iter()
+        .filter(|e| e.class == Class::Texture as u16)
+        .map(|e| scenes.texture(m, e.id).unwrap())
+        .collect();
+    let start = Instant::now();
+    for frames in 1.. {
+        assert!(start.elapsed() < Duration::from_secs(60), "tiles pending");
+        for &t in &textures {
+            scenes.prefetch_texture(m, t, 0);
+        }
+        frame(scenes);
+        let r = *scenes.residency();
+        if frames > 1 && r.loads == 0 && r.class(ResidencyClass::Textures).loading_bytes == 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// Threads lent to the loading side until dropped.
 struct Workers {
     loading: Arc<Loading>,
@@ -308,7 +333,8 @@ fn entry(a: &Archive, id: AssetId) -> &Entry {
 
 /// Every asset of mount `m` as it reads back from the GPU, each checked against the CPU
 /// decode of `a`. Mount-specific ids and addresses are left out, and texture indices are
-/// replaced by the texture's position in `a`, so two mounts of the same bytes compare equal.
+/// replaced by the texture's position in `a`, so two mounts of the same bytes compare equal,
+/// also across renderers.
 fn snapshot(scenes: &Scenes, gpu: &Gpu<'_>, m: MountId, a: &Archive) -> Vec<Vec<u8>> {
     let (models, meshes, materials) = global_tables(scenes);
     let class_of = |c: Class| move |e: &&Entry| e.class == c as u16;
@@ -334,12 +360,16 @@ fn snapshot(scenes: &Scenes, gpu: &Gpu<'_>, m: MountId, a: &Archive) -> Vec<Vec<
                 primaries: header.primaries,
             }
         });
-        let want = MaterialGpu::new(&cooked, &bound, got.sampler);
+        let want = MaterialGpu {
+            texture_streams: scenes.texture_streams(),
+            ..MaterialGpu::new(&cooked, &bound, got.sampler)
+        };
         assert_eq!(
             bytemuck::bytes_of(&got),
             bytemuck::bytes_of(&want),
             "material record"
         );
+        got.texture_streams = GpuPtr::NULL;
         for t in &mut got.textures {
             if *t != TextureIndex::NONE {
                 *t = TextureIndex(textures.iter().position(|(_, i)| i == t).unwrap() as u32);
@@ -443,8 +473,8 @@ fn file_and_memory_mounts_place_the_same_assets() {
         let _workers = Workers::start(&scenes, 3);
         let file = scenes.mount(PackSource::File(path.clone()));
         let memory = scenes.mount(PackSource::Memory(Arc::clone(bytes)));
-        ready(&mut scenes, file);
-        ready(&mut scenes, memory);
+        ready_whole(&mut scenes, file, &a);
+        ready_whole(&mut scenes, memory, &a);
         let gpu = Gpu(device());
         let from_file = snapshot(&scenes, &gpu, file, &a);
         assert!(
@@ -606,11 +636,11 @@ fn a_file_renamed_over_a_mount_is_not_read() {
         std::fs::write(&next, &new).unwrap();
         std::fs::rename(&next, &path).unwrap();
         let _workers = Workers::start(&scenes, 2);
-        ready(&mut scenes, m);
+        ready_whole(&mut scenes, m, &a_old);
         let gpu = Gpu(device());
         snapshot(&scenes, &gpu, m, &a_old);
         let again = scenes.mount(PackSource::File(path));
-        ready(&mut scenes, again);
+        ready_whole(&mut scenes, again, &a_new);
         snapshot(&scenes, &gpu, again, &a_new);
     }
     assert_clean();
@@ -646,13 +676,13 @@ fn staged_device_places_the_same_assets() {
         let mut scenes = Scenes::new(&staged, &RendererDesc::default()).unwrap();
         let _workers = Workers::start(&scenes, 2);
         let m = scenes.mount(PackSource::Memory(Arc::clone(bytes)));
-        ready(&mut scenes, m);
+        ready_whole(&mut scenes, m, &a);
         let on_staged = snapshot(&scenes, &Gpu(&staged), m, &a);
 
         let mut direct = Scenes::new(device(), &RendererDesc::default()).unwrap();
         let _w = Workers::start(&direct, 2);
         let d = direct.mount(PackSource::Memory(Arc::clone(bytes)));
-        ready(&mut direct, d);
+        ready_whole(&mut direct, d, &a);
         assert!(on_staged == snapshot(&direct, &Gpu(device()), d, &a));
     }
     assert_eq!(
@@ -1077,5 +1107,573 @@ fn the_traversal_requests_the_node_pages_it_needs_and_keeps_reading_them() {
     let frames = stream_in(&mut scenes, &gpu, models[1], budget);
     assert!(frames > 30, "evicted after {frames} frames");
     assert_eq!(node_table(&scenes, &gpu, models[0])[1], 0, "evicted");
+    assert_clean();
+}
+
+/// RGBA8 textures streamed by tile: (name, width, height, layers, cube).
+const TILED: [(&str, u32, u32, u32, bool); 3] = [
+    ("tiles/flat", 520, 300, 1, false),
+    ("tiles/array", 520, 300, 3, false),
+    ("tiles/cube", 256, 256, 6, true),
+];
+
+/// The texels of `mip` of `layer` of `TILED[t]`: every byte from its texel, mip, layer and
+/// channel.
+fn tiled_texels(t: usize, mip: u32, layer: u32) -> Vec<u8> {
+    let (_, w, h, _, _) = TILED[t];
+    let [mw, mh] = orr_pack::texture::mip_size(w, h, mip);
+    (0..mw * mh)
+        .flat_map(|i| {
+            let (x, y) = (i % mw, i / mw);
+            (0..4u32).map(move |c| {
+                let v = x
+                    .wrapping_mul(0x9e37)
+                    .wrapping_add(y.wrapping_mul(0x85eb))
+                    .wrapping_add(mip * 0x1b5 + layer * 0x3d + c * 0x5f + t as u32 * 0x11);
+                (v ^ v >> 7) as u8
+            })
+        })
+        .collect()
+}
+
+/// A memory pack of the `TILED` textures, laid out as the cook lays out a texture (blob 0
+/// and the mip tail resident from mount, one 64 KiB tile per chunk in each mip blob above
+/// the tail, edge tiles padded), a material binding each, and a consumer asset.
+fn tiled_pack() -> &'static Arc<[u8]> {
+    use orr_pack::texture::{
+        FormatInfo, TILE_BYTES, TextureHeader, TextureInfo, full_mip_count, tail_first_mip, tile,
+        vk,
+    };
+    static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
+    PACK.get_or_init(|| {
+        let f = FormatInfo::of(vk::R8G8B8A8_UNORM).unwrap();
+        let mut w = ArchiveWriter::create(Target::Memory).unwrap();
+        for (t, &(name, width, height, layers, cube)) in TILED.iter().enumerate() {
+            let mips = full_mip_count(width, height);
+            let tail = tail_first_mip(f, width, height, mips);
+            assert_eq!(tail, 2, "{name} streams two mips");
+            let header = TextureHeader {
+                vk_format: vk::R8G8B8A8_UNORM,
+                width,
+                height,
+                layers: layers as u16,
+                kind: if cube {
+                    TextureHeader::CUBE
+                } else {
+                    TextureHeader::D2
+                },
+                mip_count: mips as u8,
+                tail_first_mip: tail as u8,
+                primaries: TextureHeader::REC709,
+                _pad: [0; 2],
+                alpha_cutoff: f32::NAN,
+                lights: Span::default(),
+            };
+            let head = TextureInfo {
+                header,
+                lights: Vec::new(),
+            }
+            .to_bytes();
+            let mut mip_blobs = Vec::new();
+            for mip in 0..tail {
+                let [mw, mh] = header.mip_size(mip);
+                let mut out = Vec::new();
+                for layer in 0..layers {
+                    tile(f, mw, mh, &tiled_texels(t, mip, layer), &mut out);
+                }
+                mip_blobs.push(out);
+            }
+            let tail_blob: Vec<u8> = (tail..mips)
+                .flat_map(|mip| (0..layers).flat_map(move |layer| tiled_texels(t, mip, layer)))
+                .collect();
+            let mut blobs = vec![BlobIn {
+                mount: true,
+                ..BlobIn::new(&head)
+            }];
+            blobs.extend(mip_blobs.iter().map(|b| BlobIn {
+                chunk_len: TILE_BYTES as u32,
+                ..BlobIn::new(b)
+            }));
+            blobs.push(BlobIn {
+                mount: true,
+                ..BlobIn::new(&tail_blob)
+            });
+            w.add(
+                name,
+                Class::Texture as u16,
+                orr_pack::texture::SCHEMA,
+                orr_pack::Hash32([0; 32]),
+                &blobs,
+            )
+            .unwrap();
+        }
+        // The textures stream because a material binds them.
+        for (name, ..) in TILED {
+            let mut m = Material::default();
+            m.textures[slot::BASE_COLOR].texture = AssetId::from_name(name);
+            let bytes = bytemuck::bytes_of(&m);
+            w.add(
+                &format!("{name}/material"),
+                Class::Material as u16,
+                orr_pack::material::SCHEMA,
+                orr_pack::Hash32([0; 32]),
+                &[BlobIn {
+                    mount: true,
+                    ..BlobIn::new(bytes)
+                }],
+            )
+            .unwrap();
+        }
+        let (texels, data) = consumer_blobs();
+        let head = [0u8; 16];
+        w.add(
+            CONSUMER,
+            CONSUMER_CLASS,
+            1,
+            orr_pack::Hash32([0; 32]),
+            &[
+                BlobIn {
+                    mount: true,
+                    ..BlobIn::new(&head)
+                },
+                BlobIn::new(&texels),
+                BlobIn::new(&data),
+            ],
+        )
+        .unwrap();
+        w.finish().unwrap().unwrap()
+    })
+}
+
+/// A consumer asset of the tiled pack: a class orr does not place, whose blob 1 holds
+/// `CONSUMER_TEXELS` RGBA8 texels and blob 2 other bytes.
+const CONSUMER: &str = "cells/0";
+const CONSUMER_CLASS: u16 = 0x4000;
+const CONSUMER_TEXELS: [u32; 2] = [64, 32];
+
+fn consumer_blobs() -> (Vec<u8>, Vec<u8>) {
+    let [w, h] = CONSUMER_TEXELS;
+    let texels = (0..4 * w * h).map(|i| (i * 7 + i / 13) as u8).collect();
+    let data = (0..100_000u32).map(|i| (i ^ i >> 9) as u8).collect();
+    (texels, data)
+}
+
+/// Tiles above the tail and bytes of the mip tails of `TILED[t]` on `dev`.
+fn tiled_layout(dev: &Device, t: usize) -> (u64, u64) {
+    use orr_scene::orr_gpu::{Format, TextureDesc, TextureKind, TextureMemory, TextureUsage};
+    let (_, w, h, layers, cube) = TILED[t];
+    let desc = TextureDesc {
+        kind: if cube {
+            TextureKind::Cube
+        } else {
+            TextureKind::D2
+        },
+        format: Format::Rgba8Unorm,
+        extent: [w, h, 1],
+        mips: orr_pack::texture::full_mip_count(w, h),
+        layers,
+        usage: TextureUsage::SAMPLED,
+    };
+    let probe = dev
+        .create_texture(&desc, TextureMemory::Sparse, "tile layout probe")
+        .unwrap();
+    let l = *probe.sparse_layout().unwrap();
+    let tiles: u32 = (0..l.tail_first_mip)
+        .map(|m| {
+            let [x, y] = l.tiles(&desc, m);
+            x * y * layers
+        })
+        .sum();
+    (u64::from(tiles), u64::from(l.tails(&desc)) * l.tail_bytes)
+}
+
+/// The mips `mips` of every layer of `TILED[t]` as mount `m` holds them, against the
+/// cooked texels.
+fn assert_tiled(scenes: &Scenes, dev: &Device, m: MountId, t: usize, mips: std::ops::Range<u32>) {
+    let (name, w, h, layers, _) = TILED[t];
+    let texture = mounted_texture(scenes, m, AssetId::from_name(name)).unwrap();
+    for mip in mips {
+        let [mw, mh] = orr_pack::texture::mip_size(w, h, mip);
+        for layer in 0..layers {
+            let region = TextureRegion {
+                mip,
+                base_layer: layer,
+                layers: 1,
+                offset: [0; 3],
+                extent: [mw, mh, 1],
+            };
+            assert!(
+                read_texture_on(dev, &texture, &region) == tiled_texels(t, mip, layer),
+                "{name} mip {mip} layer {layer} differs from the cooked texels"
+            );
+        }
+    }
+}
+
+/// Runs frames, prefetching every tile of the `TILED` textures in `wanted`, until none is
+/// loading; asserts the texture pool stays under `budget` and returns the frames it took.
+fn stream_tiles(scenes: &mut Scenes, m: MountId, wanted: &[usize], budget: u64) -> u32 {
+    let start = Instant::now();
+    let indices: Vec<TextureIndex> = wanted
+        .iter()
+        .map(|&t| scenes.texture(m, AssetId::from_name(TILED[t].0)).unwrap())
+        .collect();
+    for frames in 1.. {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the tiles never settled"
+        );
+        for &i in &indices {
+            scenes.prefetch_texture(m, i, 0);
+        }
+        frame(scenes);
+        let r = *scenes.residency();
+        let pool = *r.class(ResidencyClass::Textures);
+        assert!(pool.resident_bytes + pool.loading_bytes <= budget);
+        if frames > 1 && r.loads == 0 && r.dropped == 0 && pool.loading_bytes == 0 {
+            return frames;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    unreachable!()
+}
+
+/// The residency map kernels read for layer 0 of texture `index`.
+fn residency_map(scenes: &Scenes, gpu: &Gpu<'_>, index: TextureIndex) -> Vec<u32> {
+    let record: GpuPtr<orr_scene::TextureStreamGpu> =
+        gpu.value(scenes.texture_streams().offset(u64::from(index.0)));
+    assert!(record != GpuPtr::NULL, "a streamed texture has a record");
+    let r = gpu.value(record);
+    gpu.values(r.map, r.cells[0] * r.cells[1])
+}
+
+#[test]
+fn streamed_texture_tiles_load_exact_and_evict_after_their_hold() {
+    let _serial = serial();
+    let bytes = tiled_pack();
+    let path = write_pack("tiled.orr", bytes);
+    let staged = staged_device();
+    for (dev, positioned_reads) in [(device(), false), (device(), true), (&staged, false)] {
+        let layouts: Vec<(u64, u64)> = (0..TILED.len()).map(|t| tiled_layout(dev, t)).collect();
+        let tile = orr_pack::texture::TILE_BYTES as u64;
+        let tails: u64 = layouts.iter().map(|l| l.1).sum();
+        // Room for the tails and the array's tiles, which the other two's tiles fit.
+        let budget = tails + layouts[1].0 * tile;
+        assert!(layouts[0].0 + layouts[2].0 <= layouts[1].0);
+        let desc = RendererDesc {
+            positioned_reads,
+            budgets: Budgets {
+                texture_pool: budget,
+                ..Budgets::default()
+            },
+            ..RendererDesc::default()
+        };
+        let mut scenes = Scenes::new(dev, &desc).unwrap();
+        let _workers = Workers::start(&scenes, 2);
+        let gpu = Gpu(dev);
+        let m = scenes.mount(PackSource::File(path.clone()));
+        ready(&mut scenes, m);
+        let pool = *scenes.residency().class(ResidencyClass::Textures);
+        assert_eq!(
+            pool.resident_bytes, tails,
+            "only the mip tails load at mount"
+        );
+        let index =
+            |scenes: &Scenes, t: usize| scenes.texture(m, AssetId::from_name(TILED[t].0)).unwrap();
+        assert!(
+            residency_map(&scenes, &gpu, index(&scenes, 0))
+                .iter()
+                .all(|&v| v == 2),
+            "the map starts at the tail"
+        );
+        for t in 0..TILED.len() {
+            assert_tiled(&scenes, dev, m, t, 2..9);
+        }
+
+        stream_tiles(&mut scenes, m, &[1], budget);
+        assert_tiled(&scenes, dev, m, 1, 0..2);
+
+        // The others' tiles fit once the array's have gone 30 frames untouched.
+        let frames = stream_tiles(&mut scenes, m, &[0, 2], budget);
+        assert!(frames > 30, "settled after {frames} frames");
+        assert_tiled(&scenes, dev, m, 0, 0..9);
+        assert_tiled(&scenes, dev, m, 2, 0..9);
+        assert!(
+            residency_map(&scenes, &gpu, index(&scenes, 0))
+                .iter()
+                .all(|&v| v == 0),
+            "every mip 0 tile of the flat texture is resident"
+        );
+        assert_eq!(scenes.residency().failed, 0);
+        scenes.unmount(m);
+        for _ in 0..4 {
+            frame(&mut scenes);
+        }
+    }
+    assert_eq!(
+        staged.validation_messages(),
+        0,
+        "validation messages (see the log)"
+    );
+    assert_clean();
+}
+
+#[test]
+fn taps_of_a_streamed_texture_read_its_resident_mips_and_load_the_tiles_they_want() {
+    use orr_scene::orr_gpu::{AddressMode, Filter, MemoryKind, SamplerDesc};
+    use scene_suite::pipeline;
+    use scene_suite::shaders::texture_filter::{self, Footprint, Root};
+    let _serial = serial();
+    let dev = device();
+    let mut scenes = Scenes::new(dev, &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let m = scenes.mount(PackSource::Memory(Arc::clone(tiled_pack())));
+    ready(&mut scenes, m);
+    let (_, w, h, _, _) = TILED[0];
+    let texture = scenes.texture(m, AssetId::from_name(TILED[0].0)).unwrap();
+    // One tap per mip 0 texel center, its footprint one texel wide.
+    let footprints: Vec<Footprint> = (0..w * h)
+        .map(|i| Footprint {
+            uv: [
+                ((i % w) as f32 + 0.5) / w as f32,
+                ((i / w) as f32 + 0.5) / h as f32,
+            ],
+            dx: [1.0 / w as f32, 0.0],
+            dy: [0.0, 1.0 / h as f32],
+            hardware: 1,
+            pad: 0,
+        })
+        .collect();
+    let mut input = dev
+        .gpu_malloc::<Footprint>(MemoryKind::Upload, footprints.len() as u64, "footprints")
+        .unwrap();
+    input.as_mut_slice().unwrap().copy_from_slice(&footprints);
+    let out = dev
+        .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, footprints.len() as u64, "taps")
+        .unwrap();
+    let sampler = dev
+        .sampler(&SamplerDesc {
+            mag: Filter::Nearest,
+            min: Filter::Nearest,
+            mip: Filter::Nearest,
+            address: [AddressMode::ClampToEdge; 3],
+            ..SamplerDesc::default()
+        })
+        .unwrap();
+    let mut root = dev
+        .gpu_malloc::<Root>(MemoryKind::Upload, 1, "texture filter root")
+        .unwrap();
+    root.as_mut_slice().unwrap()[0] = Root {
+        footprints: input.gpu(),
+        out: out.gpu(),
+        texture,
+        sampler,
+        count: footprints.len() as u32,
+        taps: 1,
+        streams: scenes.texture_streams(),
+        pad: 0,
+    };
+    let p = pipeline(&texture_filter::MODULE, "mean");
+    // The texels nearest sampling of `mip` reads at each tap.
+    let nearest = |mip: u32| -> Vec<[f32; 4]> {
+        let [mw, mh] = orr_pack::texture::mip_size(w, h, mip);
+        let texels = tiled_texels(0, mip, 0);
+        footprints
+            .iter()
+            .map(|f| {
+                let x = ((f.uv[0] * mw as f32) as u32).min(mw - 1);
+                let y = ((f.uv[1] * mh as f32) as u32).min(mh - 1);
+                let at = 4 * (y * mw + x) as usize;
+                std::array::from_fn(|c| f32::from(texels[at + c]) / 255.0)
+            })
+            .collect()
+    };
+    let render = dev.queue(QueueKind::Render).unwrap();
+    let tap_frame = |scenes: &mut Scenes| -> Vec<[f32; 4]> {
+        let mut f = scenes
+            .begin_frame(&FrameDesc {
+                time: FrameTime::default(),
+                scenes: &[],
+                low_latency: None,
+            })
+            .unwrap();
+        let list = f.list().unwrap();
+        list.dispatch(&p, root.gpu(), [footprints.len().div_ceil(64) as u32, 1, 1]);
+        list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+        let point = f.end(&[]).unwrap();
+        render.wait(point, Duration::from_secs(10)).unwrap();
+        out.as_slice().unwrap().to_vec()
+    };
+    assert!(
+        tap_frame(&mut scenes) == nearest(2),
+        "before any tile streams, taps read the tail"
+    );
+    let start = Instant::now();
+    let finest = nearest(0);
+    while tap_frame(&mut scenes) != finest {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the taps' tiles never arrived"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let tiles = orr_pack::texture::TILE_BYTES as u64 * 21;
+    let (_, tails) = tiled_layout(dev, 0);
+    let pool = *scenes.residency().class(ResidencyClass::Textures);
+    let others: u64 = (1..TILED.len()).map(|t| tiled_layout(dev, t).1).sum();
+    assert_eq!(
+        pool.resident_bytes,
+        tails + others + tiles,
+        "the taps loaded every tile of mips 0 and 1 of the flat texture, and nothing else"
+    );
+    assert_clean();
+}
+
+/// Runs frames until blob `id` is no longer pending.
+fn settle_blob(scenes: &mut Scenes, id: orr_scene::BlobId) -> LoadState {
+    let start = Instant::now();
+    loop {
+        frame(scenes);
+        let state = scenes.blob_state(id);
+        if !matches!(state, LoadState::Pending) {
+            return state;
+        }
+        assert!(start.elapsed() < Duration::from_secs(30), "blob pending");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn requested_blobs_land_in_consumer_buffers_and_images_under_their_budget() {
+    use orr_scene::BlobTarget;
+    use orr_scene::orr_gpu::{Format, MemoryKind, TextureDesc, TextureMemory, TextureUsage};
+    let _serial = serial();
+    let (texels, data) = consumer_blobs();
+    let path = write_pack("tiled.orr", tiled_pack());
+    let staged = staged_device();
+    for (dev, positioned_reads) in [(device(), false), (device(), true), (&staged, false)] {
+        let desc = RendererDesc {
+            positioned_reads,
+            budgets: Budgets {
+                user_blob_pool: data.len() as u64,
+                ..Budgets::default()
+            },
+            ..RendererDesc::default()
+        };
+        let mut scenes = Scenes::new(dev, &desc).unwrap();
+        let _workers = Workers::start(&scenes, 2);
+        let gpu = Gpu(dev);
+        let m = scenes.mount(PackSource::File(path.clone()));
+        ready(&mut scenes, m);
+        let id = AssetId::from_name(CONSUMER);
+        let buffer = dev
+            .gpu_malloc::<u8>(MemoryKind::DeviceLocal, data.len() as u64, "consumer data")
+            .unwrap();
+        let [w, h] = CONSUMER_TEXELS;
+        let image = Arc::new(
+            dev.create_texture(
+                &TextureDesc::d2(Format::Rgba8Unorm, w, h, TextureUsage::SAMPLED),
+                TextureMemory::Dedicated,
+                "consumer image",
+            )
+            .unwrap(),
+        );
+        let render = dev.queue(QueueKind::Render).unwrap();
+        let mut list = render.command_list().unwrap();
+        list.discard(&image);
+        list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
+        render
+            .wait(
+                render.submit(vec![list], &[]).unwrap(),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        let region = TextureRegion::whole_mip(image.desc(), 0);
+
+        let into_buffer = scenes
+            .request_blob(
+                m,
+                id,
+                2,
+                BlobTarget::Buffer {
+                    at: buffer.gpu(),
+                    len: buffer.size(),
+                },
+            )
+            .unwrap();
+        let into_image = scenes
+            .request_blob(
+                m,
+                id,
+                1,
+                BlobTarget::Texture {
+                    texture: Arc::clone(&image),
+                    region,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            settle_blob(&mut scenes, into_buffer),
+            LoadState::Ready
+        ));
+        assert!(gpu.bytes(buffer.gpu().address().0, data.len()) == data);
+        for _ in 0..5 {
+            frame(&mut scenes);
+        }
+        assert!(
+            matches!(scenes.blob_state(into_image), LoadState::Pending),
+            "the second blob waits for room in the budget"
+        );
+        let blobs = *scenes.residency().class(ResidencyClass::UserBlobs);
+        assert_eq!(blobs.resident_bytes, data.len() as u64);
+
+        scenes.release_blob(into_buffer);
+        assert!(matches!(
+            settle_blob(&mut scenes, into_image),
+            LoadState::Ready
+        ));
+        assert!(gpu.texture(&image, &region) == texels);
+        assert!(matches!(
+            scenes.blob_state(into_buffer),
+            LoadState::Failed(e) if matches!(*e, Error::UnknownBlob(_))
+        ));
+        scenes.release_blob(into_image);
+        frame(&mut scenes);
+        let blobs = *scenes.residency().class(ResidencyClass::UserBlobs);
+        assert_eq!((blobs.resident_bytes, blobs.loading_bytes), (0, 0));
+
+        let too_small = scenes
+            .request_blob(
+                m,
+                id,
+                2,
+                BlobTarget::Buffer {
+                    at: buffer.gpu(),
+                    len: 16,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            settle_blob(&mut scenes, too_small),
+            LoadState::Failed(_)
+        ));
+        assert!(matches!(
+            scenes.request_blob(
+                m,
+                AssetId::from_name("cells/none"),
+                0,
+                BlobTarget::Buffer {
+                    at: buffer.gpu(),
+                    len: 16,
+                },
+            ),
+            Err(Error::Missing { .. })
+        ));
+    }
+    assert_eq!(
+        staged.validation_messages(),
+        0,
+        "validation messages (see the log)"
+    );
     assert_clean();
 }

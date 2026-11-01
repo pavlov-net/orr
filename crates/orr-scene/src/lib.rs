@@ -16,9 +16,11 @@
 //! Packs mount from a file or from memory ([`Scenes::mount`]). Their reads, decodes and
 //! copies run on the loading side ([`Loading`]): orr's loading thread and the threads the
 //! consumer lends to [`Loading::run_worker`]. The render thread only polls. Hierarchy pages
-//! below a mesh's top page stream on request ([`Scenes::prefetch`]) under the pool budgets
-//! of [`Budgets`] and on the traversal's requests; [`Scenes::residency`] reports what is
-//! resident.
+//! below a mesh's top page stream on request ([`Scenes::prefetch`]) and on the traversal's
+//! requests, and the tiles of material textures stream on the texture feedback of the
+//! frames' taps ([`Scenes::prefetch_texture`]), all under the pool budgets of [`Budgets`];
+//! [`Scenes::residency`] reports what is resident. Consumers stream their own blobs into
+//! their own memory with [`Scenes::request_blob`].
 
 mod accel;
 mod arena;
@@ -43,6 +45,7 @@ mod stream;
 mod tessellate;
 #[cfg(feature = "testing")]
 pub mod testing;
+mod tiles;
 mod time;
 mod transparency;
 mod traverse;
@@ -81,9 +84,11 @@ pub use shaders::types::{
     GeneratedClusterGpu, GroupGpu, InstanceGpu, LightGpu, MaskGpu, MaterialGpu, MeshGpu, MeshLevel,
     ModelGpu, NodeItem, PartGpu, ProducerBatch, ProducerClusterGpu, ProducerGpu, ProducerStateGpu,
     RasterGpu, RasterRoot, RtCutGpu, SceneRoot, SkinMeshGpu, SkinStateGpu, SkinnedGpu, SkyStats,
-    SlotCutGpu, SlotStateGpu, TessStateGpu, TopologyGpu, VisibleCluster,
+    SlotCutGpu, SlotStateGpu, TessStateGpu, TextureFeedbackGpu, TextureStreamGpu, TopologyGpu,
+    VisibleCluster,
 };
 pub use skin::{SkinStats, SkinnedDesc};
+pub use stream::{BlobId, BlobTarget};
 pub use tessellate::TessellationStats;
 pub use time::FrameTime;
 pub use transparency::TransparencyPass;
@@ -142,6 +147,8 @@ pub enum Error {
         mount: MountId,
         asset: orr_pack::AssetId,
     },
+    #[error("{0:?} does not exist")]
+    UnknownBlob(BlobId),
     #[error("texture format {0} has no GPU format")]
     TextureFormat(u32),
     /// Copies of a model trace as one candidate class, so its sections are all dielectric,

@@ -139,7 +139,7 @@ impl Loading {
     /// Takes every stream batch whose copies have completed, without waiting.
     pub(crate) fn take_streams(&self, device: &Device) -> Vec<StreamBatch> {
         let mut all = self.streams.lock().unwrap();
-        let (done, rest): (Vec<_>, Vec<_>) = all.drain(..).partition(|b| landed(device, b.point));
+        let (done, rest): (Vec<_>, Vec<_>) = all.drain(..).partition(|b| b.landed(device));
         *all = rest;
         done
     }
@@ -178,21 +178,26 @@ pub(crate) struct BlobSource {
 
 pub(crate) type Stored = Box<dyn FnOnce(Result<&[u8]>) + Send>;
 
-/// Reads blob `b`'s stored bytes, then hands them to `then` on a worker. A read error goes
-/// to `then` on the thread that saw it. Without a loading side `then` is not called.
-pub(crate) fn read_stored(src: &BlobSource, b: Blob, then: Stored) {
+/// Reads the stored bytes of blob `b`, or of its chunk `chunk`, then hands them to `then` on
+/// a worker. A read error goes to `then` on the thread that saw it. Without a loading side
+/// `then` is not called.
+pub(crate) fn read_stored(src: &BlobSource, b: Blob, chunk: Option<u32>, then: Stored) {
     let Some(loading) = src.loading.upgrade() else {
         return;
     };
-    if src.archive.stored(&b, None).is_some() {
+    if src.archive.stored(&b, chunk).is_some() {
         let a = Arc::clone(&src.archive);
-        loading.spawn(move || then(Ok(a.stored(&b, None).expect("stored in place"))));
+        loading.spawn(move || then(Ok(a.stored(&b, chunk).expect("stored in place"))));
         return;
     }
-    let range = src.archive.stored_range(&b, None);
+    let range = src.archive.stored_range(&b, chunk);
+    let stored_len = match chunk {
+        Some(i) => src.archive.chunks(&b)[i as usize].stored_len,
+        None => b.stored_len,
+    };
     let file = Arc::clone(src.file.as_ref().expect("file archive"));
     let check = move |buf: &AlignedBuf, n: usize, then: Stored| {
-        let end = range.skip as usize + b.stored_len as usize;
+        let end = range.skip as usize + stored_len as usize;
         if n < end {
             then(Err(orr_pack::Error::Truncated {
                 need: range.offset + end as u64,
@@ -230,17 +235,19 @@ thread_local! {
     static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Decodes blob `b` from its stored bytes into the calling worker's scratch and hands the
-/// decoded bytes to `then`.
+/// Decodes blob `b`, or its chunk `chunk`, from its stored bytes into the calling worker's
+/// scratch and hands the decoded bytes to `then`.
 pub(crate) fn decoded(
     archive: &Archive,
     b: &Blob,
+    chunk: Option<u32>,
     stored: &[u8],
     then: impl FnOnce(&[u8]) -> Result<()>,
 ) -> Result<()> {
     SCRATCH.with_borrow_mut(|s| {
-        s.resize(b.raw_len as usize, 0);
-        archive.decode(b, None, stored, s)?;
+        let len = chunk.map_or(b.raw_len, |i| b.chunk_len(i));
+        s.resize(len as usize, 0);
+        archive.decode(b, chunk, stored, s)?;
         then(s)
     })
 }

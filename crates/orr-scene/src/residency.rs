@@ -2,12 +2,14 @@
 //! class's byte budget and the loading side's in-flight limits.
 //!
 //! A unit is one residency step of a mounted pack: a mesh page (its DAG groups), a hierarchy
-//! page, a texture or an instance page. Units a mount places itself are pinned; units a
-//! cached acceleration structure references are locked. Every other resident unit can be
-//! evicted once it has gone [`HOLD_FRAMES`] frames without a request or touch, least
-//! recently touched first. A unit loads only with its dependencies (coarser pages, a
-//! hierarchy page's parent) resident or loading in the same plan, and a unit stays while a
-//! resident or loading unit depends on it.
+//! page, a whole texture, a streamed texture's mip tails or one of its tiles, or an instance
+//! page. Units a mount places itself are pinned; units a cached acceleration structure
+//! references are locked. Every other resident unit can be evicted once it has gone
+//! [`HOLD_FRAMES`] frames without a request or touch, least recently touched first. A unit
+//! loads only with its dependencies (coarser pages, a hierarchy page's parent, a tile's
+//! coarser tile) resident or loading in the same plan, and a unit stays while a resident or
+//! loading unit depends on it. Loads outside any mount's units (user blobs) count against
+//! their class budget and the in-flight limits only.
 //!
 //! While device-local memory use sits above 90% of the OS budget, every class's budget
 //! shrinks step by step and units past their hold are evicted down to it; below 80% the
@@ -29,21 +31,28 @@ const SCALE_STEP: f64 = 0.95;
 /// The least share of its configured budget a class keeps.
 const MIN_SCALE: f64 = 0.125;
 
+/// Residency classes.
+pub(crate) const CLASSES: usize = 5;
+
 /// A residency class: one pool and one byte budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ResidencyClass {
     MeshPages,
     HierarchyPages,
+    /// Texture tiles and mip tails, and whole textures that do not stream.
     Textures,
     InstancePages,
+    /// Blobs the consumer requests into its own memory ([`crate::Scenes::request_blob`]).
+    UserBlobs,
 }
 
 impl ResidencyClass {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; CLASSES] = [
         Self::MeshPages,
         Self::HierarchyPages,
         Self::Textures,
         Self::InstancePages,
+        Self::UserBlobs,
     ];
 
     pub(crate) fn name(self) -> &'static str {
@@ -52,6 +61,7 @@ impl ResidencyClass {
             Self::HierarchyPages => "hierarchy page pool",
             Self::Textures => "texture pool",
             Self::InstancePages => "instance page pool",
+            Self::UserBlobs => "user blob pool",
         }
     }
 }
@@ -69,7 +79,7 @@ pub struct ClassStats {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResidencyStats {
     /// By [`ResidencyClass::ALL`] order.
-    pub classes: [ClassStats; 4],
+    pub classes: [ClassStats; CLASSES],
     /// Units the step sent to the loading side.
     pub loads: u32,
     pub evictions: u32,
@@ -174,7 +184,7 @@ pub(crate) struct Plan {
 pub(crate) struct Limits {
     /// By [`ResidencyClass::ALL`] order, without memory pressure. Pinned and locked units
     /// must fit them.
-    pub budgets: [u64; 4],
+    pub budgets: [u64; CLASSES],
     pub io_requests: u32,
     pub io_bytes: u64,
 }
@@ -185,11 +195,11 @@ pub(crate) struct Residency {
     scale: f64,
     mounts: HashMap<MountId, Vec<Unit>>,
     /// Resident units that are not pinned, by last touch, per class.
-    lru: [BTreeSet<(u64, Key)>; 4],
+    lru: [BTreeSet<(u64, Key)>; CLASSES],
     /// Resident plus loading bytes per class.
-    used: [u64; 4],
-    loading_bytes: [u64; 4],
-    resident_units: [u32; 4],
+    used: [u64; CLASSES],
+    loading_bytes: [u64; CLASSES],
+    resident_units: [u32; CLASSES],
     in_flight: (u32, u64),
     requests: HashMap<Key, Priority>,
     failed: u32,
@@ -203,9 +213,9 @@ impl Residency {
             scale: 1.0,
             mounts: HashMap::new(),
             lru: Default::default(),
-            used: [0; 4],
-            loading_bytes: [0; 4],
-            resident_units: [0; 4],
+            used: [0; CLASSES],
+            loading_bytes: [0; CLASSES],
+            resident_units: [0; CLASSES],
             in_flight: (0, 0),
             requests: HashMap::new(),
             failed: 0,
@@ -242,7 +252,7 @@ impl Residency {
     /// Adds a mount's units. Fails without adding any when the pinned and locked units do
     /// not fit their budgets beside what is already resident.
     pub(crate) fn register(&mut self, mount: MountId, units: &[UnitDesc]) -> crate::Result<()> {
-        let mut add = [0u64; 4];
+        let mut add = [0u64; CLASSES];
         for u in units.iter().filter(|u| u.start != Start::Absent) {
             add[u.class as usize] += u.bytes;
         }
@@ -364,6 +374,66 @@ impl Residency {
         u.touched = frame;
     }
 
+    /// Takes back the load of `k` a plan started: absent again, its bytes released, and
+    /// counted as dropped.
+    pub(crate) fn cancel(&mut self, k: Key) {
+        let units = self.mounts.get_mut(&k.mount).expect("mounted");
+        let u = &mut units[k.unit as usize];
+        debug_assert_eq!(u.state, State::Loading);
+        let c = u.class as usize;
+        u.state = State::Absent;
+        self.used[c] -= u.bytes;
+        self.loading_bytes[c] -= u.bytes;
+        self.in_flight.0 -= 1;
+        self.in_flight.1 -= u.bytes;
+        for d in u.deps.clone() {
+            units[d as usize].dependents -= 1;
+        }
+        self.stats.loads -= 1;
+        self.stats.dropped += 1;
+        self.refresh();
+    }
+
+    /// Starts a load of `bytes` of class `c` outside any mount's units (user blobs): true
+    /// when the class budget and the in-flight limits have room for it.
+    pub(crate) fn start_loose(&mut self, class: ResidencyClass, bytes: u64) -> bool {
+        let c = class as usize;
+        if self.used[c] + bytes > self.budget(c)
+            || self.in_flight.0 + 1 > self.limits.io_requests
+            || self.in_flight.1 + bytes > self.limits.io_bytes
+        {
+            return false;
+        }
+        self.used[c] += bytes;
+        self.loading_bytes[c] += bytes;
+        self.in_flight.0 += 1;
+        self.in_flight.1 += bytes;
+        self.refresh();
+        true
+    }
+
+    /// A [`Residency::start_loose`] load ended: its bytes stay resident when `ok`.
+    pub(crate) fn loose_landed(&mut self, class: ResidencyClass, bytes: u64, ok: bool) {
+        let c = class as usize;
+        self.loading_bytes[c] -= bytes;
+        self.in_flight.0 -= 1;
+        self.in_flight.1 -= bytes;
+        if ok {
+            self.resident_units[c] += 1;
+        } else {
+            self.used[c] -= bytes;
+        }
+        self.refresh();
+    }
+
+    /// Releases a resident [`Residency::start_loose`] load.
+    pub(crate) fn release_loose(&mut self, class: ResidencyClass, bytes: u64) {
+        let c = class as usize;
+        self.used[c] -= bytes;
+        self.resident_units[c] -= 1;
+        self.refresh();
+    }
+
     /// The loading side finished `k`: resident at `frame` when `ok`, failed otherwise.
     /// False when its mount is gone, so the caller frees what was loaded.
     pub(crate) fn landed(&mut self, k: Key, ok: bool, frame: u64) -> bool {
@@ -471,7 +541,7 @@ impl Residency {
 
     /// Whether `chain` fits the in-flight limits and its budgets, evicting what it needs.
     fn admit(&mut self, chain: &[Key], frame: u64, evictions: &mut Vec<Key>) -> bool {
-        let mut need = [0u64; 4];
+        let mut need = [0u64; CLASSES];
         let mut bytes = 0;
         // The chain's resident dependencies, which must stay.
         let mut held = Vec::new();
@@ -581,7 +651,7 @@ mod tests {
     }
 
     fn limits(budget: u64) -> Limits {
-        let mut budgets = [u64::MAX; 4];
+        let mut budgets = [u64::MAX; CLASSES];
         budgets[ResidencyClass::HierarchyPages as usize] = budget;
         Limits {
             budgets,
@@ -773,6 +843,51 @@ mod tests {
             }
         );
         assert!(!r.landed(Key { mount: b, unit: 1 }, true, 3));
+    }
+
+    #[test]
+    fn a_cancelled_load_returns_its_bytes_and_loads_again_later() {
+        let mut r = Residency::new(limits(300));
+        r.register(
+            M,
+            &[
+                unit(100, &[], Start::Absent),
+                unit(100, &[0], Start::Absent),
+            ],
+        )
+        .unwrap();
+        r.request(key(1), P);
+        let plan = r.plan(1);
+        assert_eq!(plan.loads, vec![key(0), key(1)]);
+        r.cancel(key(1));
+        assert_eq!((r.stats().loads, r.stats().dropped), (1, 1));
+        assert_eq!(class(&r).loading_bytes, 100);
+        assert!(r.landed(key(0), true, 1));
+        assert_eq!(step(&mut r, &[1], 2).loads, vec![key(1)]);
+        assert_eq!(class(&r).resident_bytes, 200);
+    }
+
+    #[test]
+    fn loose_loads_take_their_class_budget_and_the_in_flight_limits() {
+        let mut l = limits(u64::MAX);
+        l.budgets[ResidencyClass::UserBlobs as usize] = 150;
+        l.io_requests = 2;
+        let mut r = Residency::new(l);
+        let user = ResidencyClass::UserBlobs;
+        assert!(r.start_loose(user, 100));
+        assert!(!r.start_loose(user, 100), "over the class budget");
+        assert!(r.start_loose(user, 50));
+        assert!(!r.start_loose(user, 0), "over the in-flight requests");
+        r.loose_landed(user, 100, true);
+        r.loose_landed(user, 50, false);
+        let c = *r.stats().class(user);
+        assert_eq!(
+            (c.resident_bytes, c.loading_bytes, c.resident_units),
+            (100, 0, 1)
+        );
+        r.release_loose(user, 100);
+        assert_eq!(r.stats().class(user).resident_bytes, 0);
+        assert!(r.start_loose(user, 150));
     }
 
     #[test]

@@ -214,7 +214,15 @@ fn instance_and_material_tables_read_back_as_written() {
     );
     let table = read_buffer(root.materials, 3);
     for ((id, m), got) in materials.iter().zip(&table) {
-        assert_eq!(bytemuck::bytes_of(m), bytemuck::bytes_of(got), "{id:?}");
+        let stored = MaterialGpu {
+            texture_streams: scenes.texture_streams(),
+            ..*m
+        };
+        assert_eq!(
+            bytemuck::bytes_of(&stored),
+            bytemuck::bytes_of(got),
+            "{id:?}"
+        );
     }
     assert_clean();
 }

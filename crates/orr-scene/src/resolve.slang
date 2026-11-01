@@ -11,6 +11,9 @@ import producer;
 import surface;
 import visibility;
 
+// Its taps drive texture streaming.
+export static const bool TEXTURE_FEEDBACK = true;
+
 extern struct Surface : ISurface = StandardSurface;
 
 ORR_ROOT(RasterRoot);

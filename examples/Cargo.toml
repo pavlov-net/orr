@@ -73,6 +73,10 @@ name = "dense-vegetation"
 path = "dense-vegetation.rs"
 
 [[example]]
+name = "streaming-stress"
+path = "streaming-stress.rs"
+
+[[example]]
 name = "bench"
 path = "bench.rs"
 

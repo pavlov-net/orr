@@ -1,9 +1,11 @@
 // `texture_footprint` averaged over `taps` points of the R2 sequence per footprint, so its
-// mean stands for the filter's expected value.
+// mean stands for the filter's expected value; through `streams` when it is not null.
 #include "orr/root.h"
 import orr.abi;
 import orr.random;
 import material;
+
+export static const bool TEXTURE_FEEDBACK = true;
 
 struct Footprint
 {
@@ -22,6 +24,8 @@ struct Root
     SamplerIndex sampler;
     uint count;
     uint taps;
+    TextureStreamGpu** streams;
+    uint64_t pad;
 }
 ORR_ROOT(Root);
 
@@ -36,7 +40,7 @@ void mean(uint3 id: SV_DispatchThreadID)
     for (uint n = 0; n < root.taps; n++)
     {
         UvFootprint f = { p.uv, p.dx, p.dy, p.hardware != 0 ? float2(-1.0) : r2(n) };
-        sum += texture_footprint(root.texture, root.sampler, f);
+        sum += texture_footprint(root.texture, root.sampler, f, root.streams);
     }
     root.out[id.x] = sum / float(root.taps);
 }

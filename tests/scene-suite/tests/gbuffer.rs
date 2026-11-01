@@ -4574,6 +4574,8 @@ fn stochastic_texture_taps_average_to_the_bicubic_filter_under_magnification() {
             sampler,
             count: cases.len() as u32,
             taps: TAPS,
+            streams: GpuPtr::NULL,
+            pad: 0,
         }),
         "texture filter root",
     );
