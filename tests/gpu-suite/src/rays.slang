@@ -30,6 +30,7 @@ void trace(uint2 id, Tlas scene)
 [numthreads(8, 4, 1)]
 void main(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(main);
     if (all(id.xy < uint2(root.width, root.height)))
         trace(id.xy, root.scene);
 }
@@ -38,6 +39,7 @@ void main(uint3 id: SV_DispatchThreadID)
 [numthreads(8, 4, 1)]
 void main_ptr(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(main_ptr);
     if (all(id.xy < uint2(root.width, root.height)))
         trace(id.xy, *root.scene_ptr);
 }

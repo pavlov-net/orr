@@ -15,6 +15,7 @@ ORR_ROOT(FroxelRoot);
 [numthreads(1, 1, 1)]
 void order()
 {
+    ORR_OMM(order);
     froxel_order(root);
 }
 
@@ -22,6 +23,7 @@ void order()
 [numthreads(4, 4, 4)]
 void inject(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(inject);
     if (all(id < uint3(root.columns, root.rows, root.slices)))
         froxel_inject<Medium>(root, id);
 }
@@ -30,6 +32,7 @@ void inject(uint3 id: SV_DispatchThreadID)
 [numthreads(FROXEL_LANES, 1, 1)]
 void light(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
 {
+    ORR_OMM(light);
     froxel_light<Surface, Medium>(root, group.xy, lane);
 }
 
@@ -37,6 +40,7 @@ void light(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
 [numthreads(8, 8, 1)]
 void integrate(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(integrate);
     if (all(id.xy < uint2(root.columns, root.rows)))
         froxel_integrate<Medium>(root, id.xy);
 }

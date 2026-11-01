@@ -27,6 +27,7 @@ struct AlphaTest : IAnyHit
 [numthreads(8, 4, 1)]
 void main(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(main);
     if (any(id.xy >= uint2(root.width, root.height)))
         return;
     RayDesc ray;

@@ -681,6 +681,9 @@ fn address_commands_match_buffer_commands() {
     if !gpu_suite::require(
         d.caps().device_address_commands,
         "no device address commands",
+    ) || !gpu_suite::require(
+        !d.caps().omm,
+        "micromap builds need device address commands, so no device without them can be made",
     ) {
         return;
     }

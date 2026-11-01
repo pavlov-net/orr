@@ -46,6 +46,7 @@ ORR_ROOT(Root);
 [numthreads(64, 1, 1)]
 void main(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(main);
     SceneRoot* s = root.scene;
     ViewConstants* v = root.view;
     uint2 extent = v.extent;

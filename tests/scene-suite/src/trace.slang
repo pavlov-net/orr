@@ -116,6 +116,7 @@ float3 pixel_direction(ViewConstants* v, uint2 pixel)
 [numthreads(64, 1, 1)]
 void pixels(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(pixels);
     SceneRoot* s = root.scene;
     ViewConstants* v = root.view;
     uint2 extent = v.extent;
@@ -157,6 +158,7 @@ void pixels(uint3 id: SV_DispatchThreadID)
 [numthreads(64, 1, 1)]
 void same_point(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(same_point);
     SceneRoot* s = root.scene;
     ViewConstants* v = root.view;
     GBufferGpu* g = root.gbuffer;
@@ -228,6 +230,7 @@ void same_point(uint3 id: SV_DispatchThreadID)
 [numthreads(64, 1, 1)]
 void cones(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(cones);
     SceneRoot* s = root.scene;
     ViewConstants* v = root.view;
     uint2 extent = v.extent;

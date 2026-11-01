@@ -187,6 +187,7 @@ void body<C : ICoherence>(uint2 px)
 [shader("raygeneration")]
 void raygen_main()
 {
+    ORR_OMM(raygen_main);
     body<Reorder>(DispatchRaysIndex().xy);
 }
 
@@ -194,6 +195,7 @@ void raygen_main()
 [numthreads(8, 4, 1)]
 void compute_main(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(compute_main);
     if (all(id.xy < uint2(root.width, root.height)))
         body<NoReorder>(id.xy);
 }

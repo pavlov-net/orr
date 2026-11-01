@@ -37,6 +37,7 @@ pub struct Build {
     debug_info: DebugInfo,
     fp_precise: bool,
     asserts: bool,
+    omm: bool,
     metal_check: bool,
     precompile: bool,
     allowed: BTreeSet<Lint>,
@@ -64,6 +65,9 @@ pub enum DebugInfo {
 /// Structs of orr's shared libraries and the default-feature Rust types they map to.
 const LIBRARY_TYPES: &[(&str, &str)] = &[("AliasEntry", "::orr_shaders::AliasEntry")];
 
+/// The session option of builds with micromaps, which `orr/root.h` and `orr.trace` test.
+const OMM_OPTION: &str = "-DORR_OMM_BUILD";
+
 /// What [`Build::compile`] produced.
 #[derive(Debug)]
 pub struct Output {
@@ -82,12 +86,17 @@ pub struct Output {
     /// `types.json`, with [`Build::publish_types`]: the Rust type of every struct this
     /// build generated or mapped. `compile` prints it as `cargo:types`.
     pub types: Option<PathBuf>,
+    /// The build was with opacity micromaps ([`Build::omm`]).
+    pub omm: bool,
 }
 
 impl Build {
     /// Locates and version-checks the Slang release.
     pub fn new() -> Result<Self, Error> {
         let release = env::var("PROFILE").is_ok_and(|p| p == "release");
+        // `1` or `0` from `var`, else `default`.
+        let flag = |var: &str, default: bool| env::var_os(var).map_or(default, |v| v == "1");
+        let capture = flag("ORR_SHADER_CAPTURE", false);
         Ok(Self {
             lib: super::toolchain::load()?,
             kernels: None,
@@ -104,10 +113,8 @@ impl Build {
                 Ok(other) => return Err(Error::DebugInfoVar(other.to_owned())),
             },
             fp_precise: false,
-            asserts: match env::var_os("ORR_SHADER_ASSERTS") {
-                Some(v) => v == "1",
-                None => !release,
-            },
+            asserts: flag("ORR_SHADER_ASSERTS", !release && !capture),
+            omm: flag("ORR_SHADER_OMM", !capture),
             metal_check: env::var_os("ORR_METAL_CHECK").is_some_and(|v| v == "1"),
             precompile: env::var_os("ORR_SHADER_PRECOMPILE").is_none_or(|v| v != "0"),
             allowed: BTreeSet::new(),
@@ -213,11 +220,23 @@ impl Build {
 
     /// Links `orr.debug`'s `ASSERTS = true`, so `orr_assert` and checks such as `Tlas.get()`
     /// on address 0 abort. Pipelines from modules that abort need a device with
-    /// `shaderAbort`. On by default unless the profile is `release`; `ORR_SHADER_ASSERTS=0`
-    /// or `1` overrides the default, for example to build for a capture session, whose
-    /// devices leave `shaderAbort` off.
+    /// `shaderAbort`. On by default unless the profile is `release` or the build is for a
+    /// capture session (`ORR_SHADER_CAPTURE=1`), whose devices leave `shaderAbort` off;
+    /// `ORR_SHADER_ASSERTS=0` or `1` overrides the default.
     pub fn asserts(mut self, on: bool) -> Self {
         self.asserts = on;
+        self
+    }
+
+    /// Builds with opacity micromaps: `ORR_OMM(entry)` from `orr/root.h` declares the
+    /// micromap execution mode on the entry points of ray-query modules, and
+    /// `RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE` reaches the ray queries. Pipelines from
+    /// these modules need a device with micromaps. Without, both drop out and alpha-tested
+    /// geometry is tested in the candidate loop. On by default unless the build is for a
+    /// capture session (`ORR_SHADER_CAPTURE=1`), since captures do not support micromaps;
+    /// `ORR_SHADER_OMM=0` or `1` overrides the default. The Metal check builds without.
+    pub fn omm(mut self, on: bool) -> Self {
+        self.omm = on;
         self
     }
 
@@ -250,11 +269,10 @@ impl Build {
     }
 
     /// Compiles changed modules in parallel, checks layouts and lints, and writes
-    /// `orr_shaders.rs`, the `.spv` files with their `.omm.spv` variants,
-    /// `shaders.manifest.json` and `link_points.json` to the output directory. With
-    /// [`link`](Self::link) calls it also compiles the linked kernels under `linked/`;
-    /// `orr_kernels.rs` holds their `KERNELS` set, empty without links. Prints
-    /// `rerun-if-changed` lines and `cargo:link_points`.
+    /// `orr_shaders.rs`, the `.spv` files, `shaders.manifest.json` and `link_points.json` to
+    /// the output directory. With [`link`](Self::link) calls it also compiles the linked
+    /// kernels under `linked/`; `orr_kernels.rs` holds their `KERNELS` set, empty without
+    /// links. Prints `rerun-if-changed` lines and `cargo:link_points`.
     pub fn compile(mut self) -> Result<Output, Error> {
         let started = Instant::now();
         for path in &self.type_maps {
@@ -353,6 +371,13 @@ impl Build {
                 module: name.clone(),
                 message: message.clone(),
             }));
+            if self.omm {
+                lints.extend(record.model.no_omm_mode.iter().map(|entry| LintError {
+                    lint: Lint::Micromap,
+                    module: name.clone(),
+                    message: no_omm_mode(entry),
+                }));
+            }
         }
         let mut seen_files = BTreeSet::new();
         for record in modules.values().chain(linked_modules.values()) {
@@ -472,7 +497,6 @@ impl Build {
             kernels_out.push(Kernel {
                 name,
                 spv: &record.spv,
-                omm: record.omm.as_deref(),
                 debug_info: record.debug_info.as_deref(),
                 hash: record.hash,
                 // From the module's own model, as a reload of the module alone computes it.
@@ -492,7 +516,6 @@ impl Build {
             .map(|(name, record)| Kernel {
                 name,
                 spv: &record.spv,
-                omm: record.omm.as_deref(),
                 debug_info: record.debug_info.as_deref(),
                 hash: record.hash,
                 interface: interface_hash(&record.model),
@@ -510,6 +533,7 @@ impl Build {
             options: self.options(&include_dirs),
             linked_options: self.options(&linked_dirs),
             asserts: self.asserts,
+            omm: self.omm,
             modules: modules
                 .iter()
                 .map(|(name, r)| (name, r, false))
@@ -519,7 +543,6 @@ impl Build {
                     kernel: r.kernel.clone(),
                     linked,
                     spv: r.spv.clone(),
-                    omm: r.omm.clone(),
                     debug_info: r.debug_info.clone(),
                     hash: r.hash,
                     inputs: r.inputs.clone(),
@@ -597,6 +620,7 @@ impl Build {
             manifest: manifest_path,
             link_points: link_points_path,
             types: types_path,
+            omm: self.omm,
         })
     }
 
@@ -678,6 +702,9 @@ impl Build {
         }
         if self.fp_precise {
             options.extend(["-fp-mode".into(), "precise".into()]);
+        }
+        if self.omm {
+            options.push(OMM_OPTION.into());
         }
         options
     }
@@ -765,6 +792,7 @@ pub(super) struct Manifest {
     /// The source options of the linked kernels.
     pub(super) linked_options: Vec<String>,
     pub(super) asserts: bool,
+    pub(super) omm: bool,
     pub(super) modules: Vec<ManifestModule>,
 }
 
@@ -775,7 +803,6 @@ pub(super) struct ManifestModule {
     /// Compiled with this build's linked types; goes into `KERNELS`.
     pub(super) linked: bool,
     pub(super) spv: PathBuf,
-    pub(super) omm: Option<PathBuf>,
     /// The separated debug info of `spv`.
     pub(super) debug_info: Option<PathBuf>,
     pub(super) hash: u64,
@@ -800,7 +827,6 @@ struct Record {
     kernel: PathBuf,
     inputs: Vec<PathBuf>,
     spv: PathBuf,
-    omm: Option<PathBuf>,
     debug_info: Option<PathBuf>,
     hash: u64,
     links: Vec<LinkFile>,
@@ -885,6 +911,8 @@ fn print_cargo<'a>(
             "ORR_SHADER_TIMINGS",
             "ORR_SHADER_ASSERTS",
             "ORR_SHADER_DEBUG_INFO",
+            "ORR_SHADER_OMM",
+            "ORR_SHADER_CAPTURE",
         ] {
             println!("cargo:rerun-if-env-changed={var}");
         }
@@ -989,14 +1017,10 @@ fn cache_key(settings: &Settings<'_>, job: &Job, inputs: &[PathBuf]) -> Option<S
 fn load_record(settings: &Settings<'_>, job: &Job) -> Option<Record> {
     let record: Record = serde_json::from_slice(&fs::read(&job.record).ok()?).ok()?;
     let key = cache_key(settings, job, &record.inputs)?;
-    let outputs_exist = [
-        Some(&record.spv),
-        record.omm.as_ref(),
-        record.debug_info.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    .all(|p| p.is_file());
+    let outputs_exist = [Some(&record.spv), record.debug_info.as_ref()]
+        .into_iter()
+        .flatten()
+        .all(|p| p.is_file());
     (record.key == key && record.kernel == job.path && outputs_exist).then_some(record)
 }
 
@@ -1151,21 +1175,11 @@ fn compile_one(
         path: path.to_path_buf(),
         source: std::io::Error::other("an input vanished during the build"),
     })?;
-
-    let omm = match spirv::omm_variant(&words) {
-        Some(variant) => {
-            let p = job.spv.with_extension("omm.spv");
-            write(&p, &words_to_bytes(&variant))?;
-            Some(p)
-        }
-        None => None,
-    };
     Ok(Record {
         key,
         kernel: path.to_path_buf(),
         inputs: compiled.inputs,
         spv: job.spv.clone(),
-        omm,
         debug_info,
         hash: hash64(&bytes),
         links: job
@@ -1317,6 +1331,13 @@ fn metal_issues(
         Err(diagnostics) => issues.push(format!("no Metal layout: {diagnostics}")),
     }
     Ok(issues)
+}
+
+/// The [`Lint::Micromap`] message for `entry`.
+pub(super) fn no_omm_mode(entry: &str) -> String {
+    format!(
+        "entry point {entry} traces rays without the opacity-micromap mode; begin it with `ORR_OMM({entry});` from orr/root.h"
+    )
 }
 
 /// The interface of a module's entry points: the root's layout, through pointees, and the

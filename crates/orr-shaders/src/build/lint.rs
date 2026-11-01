@@ -40,6 +40,10 @@ pub enum Lint {
     /// A struct is generated only by the crate whose shader root declares it; others map
     /// it with [`Build::extern_type`](super::Build::extern_type).
     Ownership,
+    /// In builds with micromaps ([`Build::omm`](super::Build::omm)), every entry point of a
+    /// module that traces rays declares the opacity-micromap execution mode with
+    /// `ORR_OMM(entry)` from `orr/root.h`.
+    Micromap,
     /// The module's compute and mesh-pipeline entries emit MSL, lay out roots and pointees
     /// as the SPIR-V does, and the MSL has none of the constructs Metal rejects: 64-bit
     /// fetch atomics, a ray query inside a struct, a kernel parameter without a binding.

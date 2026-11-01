@@ -14,6 +14,7 @@ ORR_ROOT(Root);
 [numthreads(32, 1, 1)]
 void main(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(main);
     RayDesc ray;
     ray.Origin = float3(id.x, 0.0, -1.0);
     ray.Direction = float3(0.0, 0.0, 1.0);

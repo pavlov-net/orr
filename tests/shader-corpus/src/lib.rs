@@ -92,9 +92,6 @@ mod tests {
             stages(&ser::MODULE),
             [(Stage::RayGen, [1, 1, 1]), (Stage::Compute, [8, 4, 1])]
         );
-        // Only modules with a ray query get the opacity-micromap variant.
-        assert!(!rq::MODULE.spirv_omm.is_empty() && !ser::MODULE.spirv_omm.is_empty());
-        assert!(spec::MODULE.spirv_omm.is_empty() && mesh::MODULE.spirv_omm.is_empty());
         assert_eq!(root::MODULE.spirv[0], 0x0723_0203);
     }
 }

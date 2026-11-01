@@ -8,9 +8,9 @@ pub struct ShaderModule {
     /// The kernel file the module was compiled from, as a path under its shader root.
     pub kernel: &'static str,
     pub spirv: &'static [u32],
-    /// The same module with the opacity-micromap execution mode on every entry point, for
-    /// devices with the micromap feature; empty when the module has no ray query.
-    pub spirv_omm: &'static [u32],
+    /// Built with opacity micromaps: its entry points declare the micromap execution mode,
+    /// so its pipelines need a device with micromaps.
+    pub omm: bool,
     /// The absolute path of `spirv`'s separated debug info (`<name>.dbg.spv`); empty when the
     /// debug info is embedded or off.
     pub debug_info: &'static str,

@@ -11,7 +11,7 @@ use super::compile::{self, Manifest, Settings, Unit};
 use super::link::LinkModule;
 use super::precompile::Precompiled;
 use super::slang::{GlobalSession, Library};
-use super::{Error, spirv, toolchain};
+use super::{Error, toolchain};
 use crate::ShaderModule;
 
 /// Watches the inputs of compiled-in modules and recompiles a module when one of them
@@ -45,8 +45,6 @@ pub enum Reload {
     Module {
         module: &'static ShaderModule,
         spirv: Arc<[u32]>,
-        /// Empty when the module has no ray query.
-        spirv_omm: Arc<[u32]>,
         hash: u64,
     },
     /// The module failed to compile, with Slang's file and line, or its entry points or
@@ -245,16 +243,25 @@ fn recompile(
             module.name, e.name
         ));
     }
+    if manifest.omm
+        && let Some(entry) = compiled.model.no_omm_mode.first()
+    {
+        return Err(format!("{}: {}", module.name, compile::no_omm_mode(entry)));
+    }
+    if compiled.model.omm != module.omm {
+        return Err(format!(
+            "{}: rebuild required: the opacity-micromap mode of its entry points changed",
+            module.name
+        ));
+    }
     let hash = compile::hash64(&compile::words_to_bytes(&compiled.words));
     if hash == w.hash {
         return Ok(None);
     }
     w.hash = hash;
-    let omm = spirv::omm_variant(&compiled.words).unwrap_or_default();
     Ok(Some(Reload::Module {
         module,
         spirv: compiled.words.into(),
-        spirv_omm: omm.into(),
         hash,
     }))
 }

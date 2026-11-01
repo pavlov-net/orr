@@ -16,6 +16,7 @@ ORR_ROOT(PathRoot);
 [shader("raygeneration")]
 void raygen_main()
 {
+    ORR_OMM(raygen_main);
     opaque_body<Reorder, Surface, Environment, Medium>(root, DispatchRaysIndex().xy);
 }
 
@@ -23,6 +24,7 @@ void raygen_main()
 [numthreads(8, 4, 1)]
 void compute_main(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(compute_main);
     if (all(id.xy < root.gbuffer.extent))
         opaque_body<NoReorder, Surface, Environment, Medium>(root, id.xy);
 }

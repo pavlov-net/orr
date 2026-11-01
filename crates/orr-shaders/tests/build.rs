@@ -297,25 +297,37 @@ fn read_words(path: &Path) -> Vec<u32> {
 
 #[test]
 #[allow(clippy::print_stderr)]
-fn omm_variant_declares_the_mode_and_forces_two_state() {
+fn omm_builds_declare_the_mode_on_every_ray_query_entry() {
     const OP_CAPABILITY: u32 = 17;
-    const OP_SPEC_CONSTANT: u32 = 50;
     const OP_EXECUTION_MODE_ID: u32 = 331;
     const OMM: u32 = 5381;
     const OMM_MODE: u32 = 6032;
-    let src = "#include \"orr/root.h\"\nimport orr.abi;\nimport orr.trace;\n\
-        struct Root { uint* out; Tlas scene; }\nORR_ROOT(Root);\n\
-        void body(uint2 i) {\n\
-        RayDesc r; r.Origin = float3(i, 0); r.Direction = float3(0, 0, 1); r.TMin = 0; r.TMax = 1;\n\
-        Hit h = trace_closest(root.scene, r, MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, AcceptAll());\n\
-        root.out[i.x] = h.hit ? h.instance_index : 0; }\n\
-        [shader(\"raygeneration\")] void main_rays() { body(DispatchRaysIndex().xy); }\n\
-        [shader(\"compute\")] [numthreads(8, 4, 1)] void main_compute(uint3 id: SV_DispatchThreadID) { body(id.xy); }\n";
-    let dir = fixture("omm", &[("src/k.slang", src)]);
-    build(&dir).compile().unwrap_or_else(|e| panic!("{e}"));
-
-    let base = read_words(&dir.join("out/k.spv"));
-    let variant = read_words(&dir.join("out/k.omm.spv"));
+    const OMM_MODE_ID: u32 = 6031;
+    let src = |compute_mode: &str| {
+        format!(
+            "#include \"orr/root.h\"\nimport orr.abi;\nimport orr.trace;\n\
+            struct Root {{ uint* out; Tlas scene; }}\nORR_ROOT(Root);\n\
+            void body(uint2 i) {{\n\
+            RayDesc r; r.Origin = float3(i, 0); r.Direction = float3(0, 0, 1); r.TMin = 0; r.TMax = 1;\n\
+            Hit h = trace_closest(root.scene, r, MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, AcceptAll());\n\
+            root.out[i.x] = h.hit ? h.instance_index : 0; }}\n\
+            [shader(\"raygeneration\")] void main_rays() {{ ORR_OMM(main_rays); body(DispatchRaysIndex().xy); }}\n\
+            [shader(\"compute\")] [numthreads(8, 4, 1)] void main_compute(uint3 id: SV_DispatchThreadID) {{ {compute_mode} body(id.xy); }}\n"
+        )
+    };
+    let dir = fixture("omm", &[("src/k.slang", &src("ORR_OMM(main_compute);"))]);
+    // Builds the fixture with or without micromaps and keeps its module as `k.<on>.spv`.
+    let omm_build = |on: bool| {
+        build(&dir)
+            .omm(on)
+            .compile()
+            .unwrap_or_else(|e| panic!("{e}"));
+        let rust = fs::read_to_string(dir.join("out/orr_shaders.rs")).unwrap();
+        assert!(rust.contains(&format!("omm: {on},")), "{rust}");
+        let kept = dir.join(format!("out/k.{on}.spv"));
+        fs::copy(dir.join("out/k.spv"), &kept).unwrap();
+        kept
+    };
     let capabilities = |words: &[u32]| -> Vec<u32> {
         instructions(words)
             .into_iter()
@@ -323,23 +335,32 @@ fn omm_variant_declares_the_mode_and_forces_two_state() {
             .map(|(_, a)| a[0])
             .collect()
     };
-    // The two-state constant: 0 in the module, the ray flag in the variant.
-    let spec_values = |words: &[u32]| -> Vec<u32> {
+    let modes = |words: &[u32]| {
         instructions(words)
             .into_iter()
-            .filter(|(op, _)| *op == OP_SPEC_CONSTANT)
-            .map(|(_, a)| a[2])
-            .collect()
+            .filter(|(op, a)| *op == OP_EXECUTION_MODE_ID && a[1] == OMM_MODE_ID)
+            .count()
     };
-    assert!(!capabilities(&base).contains(&OMM) && !capabilities(&base).contains(&OMM_MODE));
-    assert!(capabilities(&variant).contains(&OMM) && capabilities(&variant).contains(&OMM_MODE));
-    assert_eq!(spec_values(&base), [0]);
-    assert_eq!(spec_values(&variant), [0x400]);
-    let modes = instructions(&variant)
-        .into_iter()
-        .filter(|(op, a)| *op == OP_EXECUTION_MODE_ID && a[1] == 6031)
-        .count();
-    assert_eq!(modes, 2);
+    let on = omm_build(true);
+    let words = read_words(&on);
+    assert!(capabilities(&words).contains(&OMM) && capabilities(&words).contains(&OMM_MODE));
+    assert_eq!(modes(&words), 2);
+    let off = omm_build(false);
+    let words = read_words(&off);
+    assert!(!capabilities(&words).contains(&OMM) && !capabilities(&words).contains(&OMM_MODE));
+    assert_eq!(modes(&words), 0);
+
+    // The same fixture, so the build reuses its precompiled libraries.
+    fs::write(dir.join("src/k.slang"), src("")).unwrap();
+    match build(&dir).omm(true).compile() {
+        Err(Error::Lints(l)) => {
+            assert_eq!(l.len(), 1, "{l:?}");
+            assert_eq!(l[0].lint, Lint::Micromap);
+            assert!(l[0].message.contains("ORR_OMM(main_compute);"), "{}", l[0]);
+        }
+        Err(e) => panic!("expected the micromap lint, got: {e}"),
+        Ok(_) => panic!("expected the micromap lint, the build passed"),
+    }
 
     // Only SPIRV-Tools v2026.4 or newer knows the mode (Vulkan SDK 1.4.363): ORR_SPIRV_TOOLS
     // names the directory holding that spirv-val.
@@ -348,21 +369,23 @@ fn omm_variant_declares_the_mode_and_forces_two_state() {
         return;
     };
     let val = Path::new(&tools).join(format!("spirv-val{}", std::env::consts::EXE_SUFFIX));
-    let out = Command::new(&val)
-        .args([
-            "--target-env",
-            "vulkan1.4",
-            "--uniform-buffer-standard-layout",
-        ])
-        .arg(dir.join("out/k.omm.spv"))
-        .output()
-        .unwrap_or_else(|e| panic!("{}: {e}", val.display()));
-    assert!(
-        out.status.success(),
-        "spirv-val rejected the OMM variant:\n{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    for (spv, what) in [(on, "with micromaps"), (off, "without micromaps")] {
+        let out = Command::new(&val)
+            .args([
+                "--target-env",
+                "vulkan1.4",
+                "--uniform-buffer-standard-layout",
+            ])
+            .arg(&spv)
+            .output()
+            .unwrap_or_else(|e| panic!("{}: {e}", val.display()));
+        assert!(
+            out.status.success(),
+            "spirv-val rejected the module built {what}:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 /// The surface interface in the shape the build's method table forwards.

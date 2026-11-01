@@ -21,15 +21,9 @@ public static const uint CLASS_PRESENCE = 2;
 public static const uint CLASS_PARTICLE = 3;
 public static const uint CLASS_MEDIUM = 4;
 
-// Ray flags beside Slang's `RAY_FLAG_*`: opacity micromaps forced to two states. It takes
-// effect in the opacity-micromap variant of the module and is dropped from the others.
+// Ray flags beside Slang's `RAY_FLAG_*`: opacity micromaps forced to two states. Builds
+// without micromaps drop it.
 public static const uint RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE = 0x400;
-
-// The flag is invalid without the micromap capability, which only the variant declares. Its
-// value reaches the ray query through this constant: 0 here, set to the flag by the build in
-// the variant. The id is reserved and never appears in a module's `Spec`.
-[vk::constant_id(2147483648)]
-const uint OMM_2_STATE = 0;
 
 // A non-opaque candidate as the candidate handlers see it.
 public struct Candidate
@@ -294,8 +288,16 @@ void begin(inout RayQuery<RAY_FLAG_NONE> q, Tlas tlas, RayDesc ray, uint mask, u
     case metal:
         metal_begin(q, tlas.get(), ray.Origin, ray.Direction, ray.TMin, ray.TMax, mask, flags);
     default:
-        uint omm = (flags & RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE) != 0 ? OMM_2_STATE : 0;
-        q.TraceRayInline(tlas.get(), (flags & ~RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE) | omm, mask, ray);
+#if defined(ORR_OMM_BUILD)
+        spirv_asm
+        {
+            OpCapability RayTracingOpacityMicromapKHR;
+            OpExtension "SPV_KHR_opacity_micromap"
+        };
+        q.TraceRayInline(tlas.get(), flags, mask, ray);
+#else
+        q.TraceRayInline(tlas.get(), flags & ~RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, mask, ray);
+#endif
     }
 }
 
