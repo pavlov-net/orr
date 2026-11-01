@@ -230,6 +230,19 @@ fn same_inputs_give_the_same_bytes() {
     )
     .unwrap();
     assert_eq!(*one, *std::fs::read(&file).unwrap());
+    // With the window full, units wait in a scratch directory, gone after the cook.
+    let spilled = d.join("spilled.orr");
+    orr_cook::cook(
+        &manifest(&d, Target::File(spilled.clone()), Quality::Fast),
+        &CookOptions {
+            jobs: 8,
+            reorder_window: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(*one, *std::fs::read(&spilled).unwrap());
+    assert!(!d.join("spilled.orr.units").exists());
 
     let a = Archive::from_memory(one).unwrap();
     let pages = a
