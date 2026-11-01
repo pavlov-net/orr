@@ -47,10 +47,12 @@ pub struct Build {
     publish_types: Option<String>,
 }
 
-/// Where a build puts the SPIR-V's debug info.
+/// How much debug info a build puts in the SPIR-V, and where.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DebugInfo {
     Off,
+    /// Line tables only (`-g1`): `OpLine` instructions, no variables, types or scopes.
+    Lines,
     /// In the SPIR-V (`-g2`).
     Embedded,
     /// In a sidecar beside each module (`-g2 -separate-debug-info`): the module is stripped
@@ -94,10 +96,12 @@ impl Build {
                 .iter()
                 .map(|(s, r)| ((*s).to_owned(), (*r).to_owned()))
                 .collect(),
-            debug_info: if release {
-                DebugInfo::Separate
-            } else {
-                DebugInfo::Embedded
+            debug_info: match env::var("ORR_SHADER_DEBUG_INFO").as_deref() {
+                Err(_) | Ok("lines") => DebugInfo::Lines,
+                Ok("off") => DebugInfo::Off,
+                Ok("embedded") => DebugInfo::Embedded,
+                Ok("separate") => DebugInfo::Separate,
+                Ok(other) => return Err(Error::DebugInfoVar(other.to_owned())),
             },
             fp_precise: false,
             asserts: match env::var_os("ORR_SHADER_ASSERTS") {
@@ -193,8 +197,9 @@ impl Build {
         self
     }
 
-    /// Where the debug info goes: [`DebugInfo::Embedded`] by default, [`DebugInfo::Separate`]
-    /// when the profile is `release`.
+    /// How much debug info the SPIR-V carries, overriding `ORR_SHADER_DEBUG_INFO` (`off`,
+    /// `lines`, `embedded` or `separate`). Without either it is [`DebugInfo::Lines`] in
+    /// every profile.
     pub fn debug_info(mut self, debug_info: DebugInfo) -> Self {
         self.debug_info = debug_info;
         self
@@ -665,6 +670,7 @@ impl Build {
         }
         match self.debug_info {
             DebugInfo::Off => {}
+            DebugInfo::Lines => options.push("-g1".into()),
             DebugInfo::Embedded => options.push("-g2".into()),
             DebugInfo::Separate => {
                 options.extend(["-g2".into(), "-separate-debug-info".into()]);
@@ -878,6 +884,7 @@ fn print_cargo<'a>(
             "ORR_SHADER_PRECOMPILE",
             "ORR_SHADER_TIMINGS",
             "ORR_SHADER_ASSERTS",
+            "ORR_SHADER_DEBUG_INFO",
         ] {
             println!("cargo:rerun-if-env-changed={var}");
         }
