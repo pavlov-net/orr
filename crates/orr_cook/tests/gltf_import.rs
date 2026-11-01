@@ -127,11 +127,15 @@ fn grid(n: u32, h: impl Fn(f32, f32) -> f32) -> (Vec<[f32; 3]>, Vec<[f32; 2]>, V
     (p, uv, idx)
 }
 
-fn png(w: u32, h: u32, f: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
+fn encode(format: image::ImageFormat, w: u32, h: u32, f: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
     let img = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(f(x, y)));
     let mut out = std::io::Cursor::new(Vec::new());
-    img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+    img.write_to(&mut out, format).unwrap();
     out.into_inner()
+}
+
+fn png(w: u32, h: u32, f: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
+    encode(image::ImageFormat::Png, w, h, f)
 }
 
 #[test]
@@ -1107,6 +1111,49 @@ fn material_textures_bind_their_slots() {
     assert_eq!((m.coat_weight, m.transmission_weight), (1.0, 1.0));
     let coat = texture_mip(&a, "g/texture/0/coat", 0);
     assert!(coat.texels.iter().all(|&t| t <= 0.5 + 1.0 / 255.0));
+}
+
+#[test]
+fn webp_textures_replace_their_core_source() {
+    let d = dir("gltf-webp");
+    let texel = |x: u32, y: u32| {
+        [
+            (255 - 12 * y - 3 * x) as u8,
+            0,
+            0,
+            (64 + 8 * x + 4 * y) as u8,
+        ]
+    };
+    let mut g = Glb::default();
+    let prims = per_material(&mut g, 1);
+    let webp = g.image(&encode(image::ImageFormat::WebP, 16, 16, texel));
+    let fallback = g.image(&png(16, 16, |_, _| [255; 4]));
+    let path = d.join("webp.glb");
+    // Texture 0 falls back to an opaque PNG; texture 1 has only the WebP image.
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+"meshes":[{{"primitives":[{prims}]}}],
+"extensionsUsed":["EXT_texture_webp","KHR_materials_clearcoat"],
+"extensionsRequired":["EXT_texture_webp"],
+"materials":[{{"alphaMode":"BLEND","pbrMetallicRoughness":{{"baseColorTexture":{{"index":0}}}},
+  "extensions":{{"KHR_materials_clearcoat":{{"clearcoatFactor":1.0,"clearcoatTexture":{{"index":1}}}}}}}}],
+"textures":[{{"source":1,"extensions":{{"EXT_texture_webp":{{"source":0}}}}}},{{"extensions":{{"EXT_texture_webp":{{"source":0}}}}}}],
+"images":[{{"bufferView":{webp},"mimeType":"image/webp"}},{{"bufferView":{fallback},"mimeType":"image/png"}}]"#
+        ),
+    );
+    let (a, _) = cook(&path, GltfSettings::default()).unwrap();
+    for (role, channel) in [("opacity", 3), ("coat", 0)] {
+        let mip = texture_mip(&a, &format!("g/texture/0/{role}"), 0);
+        for y in 0..16 {
+            for x in 0..16 {
+                let want = f32::from(texel(x, y)[channel]) / 255.0;
+                let got = mip.texel(x.into(), y.into());
+                assert!((got - want).abs() <= 4.0 / 255.0, "{role} ({x}, {y})");
+            }
+        }
+    }
 }
 
 /// A scene with a plain node and an instanced one: node `tree` carries

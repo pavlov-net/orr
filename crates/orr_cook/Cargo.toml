@@ -22,7 +22,7 @@ glam = { workspace = true, features = ["serde"] }
 libloading = { workspace = true, optional = true }
 gltf = { version = "=1.4.1", default-features = false, features = ["utils", "names", "extras", "KHR_materials_emissive_strength", "KHR_materials_ior"] }
 half.workspace = true
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr", "exr"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "hdr", "exr"] }
 meshopt = "=0.7.0"
 # Exact pin: no stable API before 1.0, and its composition shapes cooked meshes.
 openusd = "=0.8.0"
