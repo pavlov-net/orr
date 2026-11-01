@@ -209,6 +209,11 @@ impl Heaps {
 }
 
 impl Device {
+    /// Image slots of the resource heap; every slot index is below it.
+    pub fn image_slots(&self) -> u32 {
+        self.shared.heaps().resource.slots
+    }
+
     /// Takes a free image slot. Sampled and storage views share the slot space.
     pub fn alloc_image_slot(&self) -> Result<u32, Error> {
         let heaps = self.shared.heaps();

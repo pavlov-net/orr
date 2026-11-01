@@ -22,6 +22,9 @@ import rtas;
 import tables;
 import tessellation;
 import visibility;
+
+// Its taps drive texture streaming.
+export static const bool TEXTURE_FEEDBACK = true;
 __exported import displacement;
 
 extern struct Displace : IDisplacement = TextureDisplacement;

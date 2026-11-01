@@ -44,17 +44,18 @@ pub use orr_output::{
 pub use orr_scene::Error as SceneError;
 pub use orr_scene::{self, RasterView};
 pub use orr_scene::{
-    Affine3, ArenaReport, ArenaTarget, BoundTexture, Budgets, ClassStats, ClipRef, ClusterRef,
-    ClusterTopology, Cone, ConsumerMarker, CopyVariant, DepthOfField, DirectionalLight,
-    DiscProfile, EmissiveGpu, EmissiveSpan, ExposureState, Focus, FrameStats, FrameTime, Glare,
-    GroupGpu, GroupWriter, InstanceFlags, InstanceGpu, InstancePage, InstanceRange, InstancesDesc,
-    Lens, LensDistortion, Light, LightGpu, LightId, LoadState, Loading, MaterialGpu, MaterialId,
-    MaterialWriter, MeshGpu, ModelEmission, ModelGpu, ModelId, MountId, Opacity, OriginPolicy,
-    PackSource, PageId, PipelineId, Pose, ProducerBatch, ProducerClusterGpu, ProducerDesc,
-    ProducerGpu, ProducerId, ProducerStats, ProducerUpdate, Projection, REBASE_GRID_LOG2,
-    RasterGpu, ReloadReport, RendererDesc, ResidencyClass, ResidencyStats, RtCutGpu, RtStats,
-    SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter, SkeletonRef, SkinStats, SkinnedDesc,
-    SkyStats, SlotStateGpu, Span, TextureFilter, TopologyGpu, TransformGroupDesc, TransformGroupId,
+    Affine3, ArenaReport, ArenaTarget, BlobId, BlobTarget, BoundTexture, Budgets, ClassStats,
+    ClipRef, ClusterRef, ClusterTopology, Cone, ConsumerMarker, CopyVariant, DepthOfField,
+    DirectionalLight, DiscProfile, EmissiveGpu, EmissiveSpan, ExposureState, Focus, FrameStats,
+    FrameTime, Glare, GroupGpu, GroupWriter, InstanceFlags, InstanceGpu, InstancePage,
+    InstanceRange, InstancesDesc, Lens, LensDistortion, Light, LightGpu, LightId, LoadState,
+    Loading, MaterialGpu, MaterialId, MaterialWriter, MeshGpu, ModelEmission, ModelGpu, ModelId,
+    MountId, Opacity, OriginPolicy, PackSource, PageId, PipelineId, Pose, ProducerBatch,
+    ProducerClusterGpu, ProducerDesc, ProducerGpu, ProducerId, ProducerStats, ProducerUpdate,
+    Projection, REBASE_GRID_LOG2, RasterGpu, ReloadReport, RendererDesc, ResidencyClass,
+    ResidencyStats, RtCutGpu, RtStats, SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter,
+    SkeletonRef, SkinStats, SkinnedDesc, SkyStats, SlotStateGpu, Span, TextureFeedbackGpu,
+    TextureFilter, TextureStreamGpu, TopologyGpu, TransformGroupDesc, TransformGroupId,
     TransparencyPass, ViewConstants, ViewDesc, ViewHistoryId, ViewStep, ViewTarget, WorldPos, abi,
     material_flags, orr_gpu, orr_pack,
 };
@@ -464,6 +465,39 @@ impl Renderer {
     /// model should load or stay.
     pub fn prefetch(&mut self, model: ModelId, cell_distance: u32) {
         self.scenes.prefetch(model, cell_distance);
+    }
+
+    /// Wants every tile of mips `finest..` of the cooked texture `texture` of mount `m`
+    /// resident from the next frame on. Requests last one frame.
+    pub fn prefetch_texture(&mut self, m: MountId, texture: TextureIndex, finest: u32) {
+        self.scenes.prefetch_texture(m, texture, finest);
+    }
+
+    /// The stream table for kernels that sample looked-up textures through
+    /// `texture_footprint`.
+    pub fn texture_streams(&self) -> GpuPtr<GpuPtr<TextureStreamGpu>> {
+        self.scenes.texture_streams()
+    }
+
+    /// Streams blob `blob` of asset `id` of mount `m` into consumer memory under the user
+    /// blob budget; poll [`Renderer::blob_state`].
+    pub fn request_blob(
+        &mut self,
+        m: MountId,
+        id: orr_pack::AssetId,
+        blob: u32,
+        target: BlobTarget,
+    ) -> Result<BlobId> {
+        Ok(self.scenes.request_blob(m, id, blob, target)?)
+    }
+
+    pub fn blob_state(&self, id: BlobId) -> LoadState {
+        self.scenes.blob_state(id)
+    }
+
+    /// Returns a requested blob's bytes to the user blob budget.
+    pub fn release_blob(&mut self, id: BlobId) {
+        self.scenes.release_blob(id);
     }
 
     /// Residency figures of the latest frame's step 1.

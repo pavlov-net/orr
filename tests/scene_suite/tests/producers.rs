@@ -940,7 +940,7 @@ impl Plane {
             w.set_focus(focus.as_dvec3(), EXTENT[1] as f32 / fov_y);
         }
         let emit = desc.is_some();
-        let g = self.gpu.each_ref().map(|a| a.gpu());
+        let g = self.gpu.each_ref().map(orr_gpu::Allocation::gpu);
         let clusters = self.mesh.clusters.len() as u32;
         f.update_scenes(&mut |c| {
             if !emit {

@@ -44,6 +44,32 @@ public static const uint TEXTURE_NONE = 0xffffffff;
 // A material id that names no material.
 public static const uint MATERIAL_NONE = 0xffffffff;
 
+// Where a frame's texture feedback goes. A cell holds `frame << 8 | 255 - mip` for the
+// finest mip a tap wanted in it during `frame`; each raise appends a record of the cell and
+// its new value.
+public struct TextureFeedbackGpu
+{
+    public uint* cells;
+    public uint2* records;                  // `capacity` per frame in flight
+    public uint* counts;                    // per frame in flight
+    public uint capacity;
+    public uint frame;                      // the frame index's low 24 bits
+    public uint slot;                       // the frame's slot in records and counts
+    public uint _pad;
+}
+
+// A streamed texture's residency. Per tile of mip 0 in each layer, `map` holds the finest
+// mip resident under it and its eight neighbors; mips from `tail_mip` on are always
+// resident.
+public struct TextureStreamGpu
+{
+    public uint* map;
+    public TextureFeedbackGpu* feedback;
+    public uint2 cells;                     // mip 0 tiles per axis
+    public uint first_cell;                 // of layer 0 in the feedback cells
+    public uint tail_mip;
+}
+
 public struct MaterialGpu
 {
     public float3 base_color;
@@ -94,6 +120,61 @@ public struct MaterialGpu
     public float transmission_dispersion_scale;
     public float transmission_dispersion_abbe_number;
     public uint64_t data;                   // consumer data for the linked surface; 0 = the scene's
+    public TextureStreamGpu** texture_streams; // by heap index, null where it does not stream; orr sets it
+}
+
+// Whether taps report the level they want to the texture feedback. A kernel whose taps drive
+// texture streaming exports `TEXTURE_FEEDBACK = true`; taps of other kernels only clamp,
+// which keeps the code inlined at every tap of the large ray-tracing kernels small.
+public extern static const bool TEXTURE_FEEDBACK = false;
+
+// The streamed texture behind heap index `t` in `streams`, or null when it does not stream.
+public TextureStreamGpu* texture_stream(TextureStreamGpu** streams, TextureIndex t)
+{
+    if (streams == nullptr || t.index == TEXTURE_NONE)
+        return nullptr;
+    return streams[t.index];
+}
+
+// The finest mip resident at `uv` of `layer` of streamed texture `s`, after reporting `lod`
+// (the level a tap there wants) to the frame's feedback with `TEXTURE_FEEDBACK`.
+public float texture_stream_clamp(TextureStreamGpu* s, float2 uv, uint layer, float lod)
+{
+    uint2 cell = min(uint2(frac(uv) * float2(s.cells)), s.cells - 1);
+    uint at = layer * s.cells.x * s.cells.y + cell.y * s.cells.x + cell.x;
+    uint wanted = uint(clamp(floor(lod), 0.0, float(s.tail_mip)));
+    if (TEXTURE_FEEDBACK && wanted < s.tail_mip)
+    {
+        TextureFeedbackGpu* fb = s.feedback;
+        uint v = fb.frame << 8 | (255 - wanted);
+        uint cell_at = s.first_cell + at;
+        if (fb.cells[cell_at] < v)
+        {
+            uint old;
+            InterlockedMax(fb.cells[cell_at], v, old);
+            if (old < v)
+            {
+                uint n;
+                InterlockedAdd(fb.counts[fb.slot], 1, n);
+                if (n < fb.capacity)
+                    fb.records[fb.slot * fb.capacity + n] = uint2(cell_at, v);
+            }
+        }
+    }
+    return float(s.map[at]);
+}
+
+// The level of detail anisotropic filtering of up to 16 taps reads for footprint `f` on a
+// mip 0 of `size` texels.
+public float footprint_lod(UvFootprint f, float2 size)
+{
+    float2 dx = f.dx * size;
+    float2 dy = f.dy * size;
+    float a = length(dx);
+    float b = length(dy);
+    float major = max(a, b);
+    float minor = min(a, b);
+    return log2(max(max(major / 16.0, minor), 1e-8));
 }
 
 // Emitted radiance of `m` in nits: `emission_color x emission_luminance` with
@@ -151,20 +232,30 @@ public bool stochastic_texel(UvFootprint f, float2 size, out float2 texel_uv)
 }
 
 // `t` read through sampler `s` over footprint `f`: one stochastic texel under
-// magnification, else the sampler's filtering.
-public float4 texture_footprint(TextureIndex t, SamplerIndex s, UvFootprint f)
+// magnification, else the sampler's filtering. Streamed textures (`streams`, from
+// `MaterialGpu.texture_streams`; null for none) read no finer than their resident tiles and,
+// with `TEXTURE_FEEDBACK`, report the level they want.
+public float4 texture_footprint(TextureIndex t, SamplerIndex s, UvFootprint f, TextureStreamGpu** streams)
 {
     Texture2D<float4> texture = t.get<Texture2D<float4>>();
-    if (f.tap.x >= 0.0)
+    TextureStreamGpu* stream = texture_stream(streams, t);
+    float min_lod = 0.0;
+    if (f.tap.x >= 0.0 || stream != nullptr)
     {
         uint width;
         uint height;
         texture.GetDimensions(width, height);
+        float2 size = float2(width, height);
+        if (stream != nullptr)
+        {
+            float lod = TEXTURE_FEEDBACK ? footprint_lod(f, size) : 0.0;
+            min_lod = texture_stream_clamp(stream, f.uv, 0, lod);
+        }
         float2 texel_uv;
-        if (stochastic_texel(f, float2(width, height), texel_uv))
+        if (min_lod == 0.0 && stochastic_texel(f, size, texel_uv))
             return texture.SampleLevel(s.get(), texel_uv, 0.0);
     }
-    return texture.SampleGrad(s.get(), f.uv, f.dx, f.dy);
+    return texture.SampleGrad(s.get(), f.uv, f.dx, f.dy, int2(0), min_lod);
 }
 
 public bool material_bound(MaterialGpu* m, uint slot)
@@ -188,7 +279,7 @@ public float4 material_texture(MaterialGpu* m, uint slot, UvFootprint f, float4 
     TextureIndex t = m.textures[slot];
     if (t.index == TEXTURE_NONE)
         return fallback;
-    float4 v = texture_footprint(t, m.sampler, f);
+    float4 v = texture_footprint(t, m.sampler, f, m.texture_streams);
     uint c = material_channel(m, slot);
     return c == 0 ? v : c == 1 ? float4(v.yzw, 1.0) : c == 2 ? float4(v.zw, 0.0, 1.0) : float4(v.w, 0.0, 0.0, 1.0);
 }

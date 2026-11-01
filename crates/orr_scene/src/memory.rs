@@ -36,6 +36,24 @@ impl RangeAllocator {
         Some(start)
     }
 
+    /// Takes `at..at + count`; false when it is not all free.
+    pub fn take(&mut self, at: u32, count: u32) -> bool {
+        let Some((&start, &end)) = self.free.range(..=at).next_back() else {
+            return false;
+        };
+        if at + count > end {
+            return false;
+        }
+        self.free.remove(&start);
+        if start < at {
+            self.free.insert(start, at);
+        }
+        if at + count < end {
+            self.free.insert(at + count, end);
+        }
+        true
+    }
+
     /// Returns `start..start + count` to the free list.
     pub fn free(&mut self, start: u32, count: u32) {
         if count == 0 {
@@ -95,16 +113,31 @@ impl Block {
         self.cpu
     }
 
-    /// Bytes.
-    pub(crate) fn size(&self) -> u64 {
-        self.size
+    /// Copies `bytes` to `at` of a mapped block; false, writing nothing, for an unmapped one.
+    pub(crate) fn write_mapped(&self, at: u64, bytes: &[u8]) -> bool {
+        assert!(
+            at + bytes.len() as u64 <= self.size,
+            "write outside its block"
+        );
+        let Some(p) = self.cpu else { return false };
+        // SAFETY: the assert above keeps the write inside the block's mapping, which outlives
+        // the jobs writing it; every write covers its own range.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                (p as *mut u8).add(at as usize),
+                bytes.len(),
+            );
+        }
+        true
     }
 }
 
-/// A streamed class's memory: blocks of one kind, sub-allocated in 256-byte units. A block
-/// is allocated when no block has room and dropped once it is empty again.
+/// A streamed class's memory: blocks of one kind, sub-allocated in units of a fixed size. A
+/// block is allocated when no block has room and dropped once it is empty again.
 pub(crate) struct Pool {
     kind: MemoryKind,
+    unit: u64,
     block_bytes: u64,
     name: &'static str,
     blocks: Vec<Option<PoolBlock>>,
@@ -117,40 +150,55 @@ struct PoolBlock {
 }
 
 /// A range of a [`Pool`]: its block, first unit and unit count.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PoolSlot {
     block: u32,
     first: u32,
     units: u32,
 }
 
-const POOL_UNIT: u64 = 256;
-
 impl Pool {
-    pub(crate) fn new(kind: MemoryKind, block_bytes: u64, name: &'static str) -> Self {
+    /// A pool of `unit`-byte units in blocks of at least `block_bytes`.
+    pub(crate) fn new(kind: MemoryKind, unit: u64, block_bytes: u64, name: &'static str) -> Self {
         Self {
             kind,
-            block_bytes: block_bytes.next_multiple_of(POOL_UNIT),
+            unit,
+            block_bytes: block_bytes.next_multiple_of(unit),
             name,
             blocks: Vec::new(),
         }
     }
 
-    /// `bytes` bytes at a 256-byte aligned address.
-    pub(crate) fn alloc(&mut self, device: &Device, bytes: u64) -> Result<(PoolSlot, Block)> {
-        let units = bytes.max(1).div_ceil(POOL_UNIT) as u32;
-        let found = self.blocks.iter_mut().enumerate().find_map(|(i, b)| {
-            let first = b.as_mut()?.ranges.alloc(units)?;
-            Some((i, first))
+    /// `bytes` bytes at a unit-aligned offset of their block, right after `after` when those
+    /// units are free.
+    pub(crate) fn alloc(
+        &mut self,
+        device: &Device,
+        bytes: u64,
+        after: Option<PoolSlot>,
+    ) -> Result<(PoolSlot, Block)> {
+        let units = bytes.max(1).div_ceil(self.unit) as u32;
+        let next = after.and_then(|a| {
+            let first = a.first + a.units;
+            let b = self.blocks.get_mut(a.block as usize)?.as_mut()?;
+            b.ranges
+                .take(first, units)
+                .then_some((a.block as usize, first))
+        });
+        let found = next.or_else(|| {
+            self.blocks.iter_mut().enumerate().find_map(|(i, b)| {
+                let first = b.as_mut()?.ranges.alloc(units)?;
+                Some((i, first))
+            })
         });
         let (block, first) = match found {
             Some(f) => f,
             None => {
-                let size = self.block_bytes.max(u64::from(units) * POOL_UNIT);
+                let size = self.block_bytes.max(u64::from(units) * self.unit);
                 let low = MemoryPriority::Low;
                 let memory =
                     device.gpu_malloc_with_priority::<u8>(self.kind, low, size, self.name)?;
-                let mut ranges = RangeAllocator::new((size / POOL_UNIT) as u32);
+                let mut ranges = RangeAllocator::new((size / self.unit) as u32);
                 let first = ranges.alloc(units).expect("a new block fits");
                 let b = Some(PoolBlock {
                     memory,
@@ -171,7 +219,7 @@ impl Pool {
         };
         let b = self.blocks[block].as_mut().expect("live block");
         b.slots += 1;
-        let at = u64::from(first) * POOL_UNIT;
+        let at = u64::from(first) * self.unit;
         let memory = Block::of(&b.memory).sub(at, bytes);
         let slot = PoolSlot {
             block: block as u32,
@@ -179,6 +227,14 @@ impl Pool {
             units,
         };
         Ok((slot, memory))
+    }
+
+    /// The allocation `slot` lies in and its offset there, for sparse binds.
+    pub(crate) fn memory(&self, slot: PoolSlot) -> (&Allocation<u8>, u64) {
+        let b = self.blocks[slot.block as usize]
+            .as_ref()
+            .expect("slot of a live block");
+        (&b.memory, u64::from(slot.first) * self.unit)
     }
 
     /// Returns `slot`; call only once the GPU no longer reads it.
@@ -327,5 +383,11 @@ mod tests {
         assert_eq!(a.alloc(60), Some(0));
         assert_eq!(a.alloc(15), Some(85));
         assert_eq!(a.alloc(1), None);
+        a.free(40, 10);
+        assert!(a.take(45, 1) && !a.take(45, 1) && !a.take(39, 1) && !a.take(43, 3));
+        assert_eq!(
+            (a.alloc(5), a.alloc(4), a.alloc(1)),
+            (Some(40), Some(46), None)
+        );
     }
 }

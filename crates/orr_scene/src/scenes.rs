@@ -45,7 +45,9 @@ use crate::traverse::{CutInputs, CutPipelines, CutSizes, CutStats, Cuts};
 use crate::upload::{Record, scatter};
 use crate::view::{RasterView, ViewDesc, ViewHistory, ViewHistoryId, view_constants};
 use crate::world::{WorldPos, needs_rebase, origin_for};
-use crate::{Error, ExposureState, ProducerBatch, Result, SceneRoot};
+use crate::{
+    BlobId, BlobTarget, Error, ExposureState, ProducerBatch, Result, SceneRoot, TextureStreamGpu,
+};
 
 /// Pool sizes and per-frame limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,10 +92,16 @@ pub struct Budgets {
     pub mesh_page_pool: u64,
     /// Bytes of resident hierarchy pages.
     pub hierarchy_page_pool: u64,
-    /// Bytes of resident textures.
+    /// Bytes of resident textures: whole textures, streamed textures' mip tails and tiles.
     pub texture_pool: u64,
     /// Bytes of resident instance pages.
     pub instance_page_pool: u64,
+    /// Bytes of requested blobs loading or landed and not released.
+    pub user_blob_pool: u64,
+    /// Feedback cells of streamed textures: one per mip 0 tile of each layer.
+    pub texture_feedback_cells: u32,
+    /// Texture feedback records a frame keeps; taps past it report nothing that frame.
+    pub texture_feedback_records: u32,
     /// Streamed units the loading side reads at once, at most.
     pub io_requests: u32,
     /// Bytes of streamed units the loading side reads at once, at most.
@@ -124,6 +132,9 @@ impl Default for Budgets {
             hierarchy_page_pool: 256 << 20,
             texture_pool: 4 << 30,
             instance_page_pool: 256 << 20,
+            user_blob_pool: 256 << 20,
+            texture_feedback_cells: 1 << 20,
+            texture_feedback_records: 1 << 14,
             io_requests: 64,
             io_bytes: 64 << 20,
             stream_block: 16 << 20,
@@ -373,6 +384,7 @@ impl Scenes {
             cluster_ids: Mutex::new(RangeAllocator::new(b.resident_clusters)),
             cluster_capacity: b.resident_clusters,
         });
+        let materials = MaterialTable::new(device, b.materials)?;
         let mounts = Mounts::new(
             device,
             TableSizes {
@@ -383,6 +395,8 @@ impl Scenes {
             },
             b,
             &accel,
+            materials.streams.gpu(),
+            desc.frames_in_flight,
         )?;
         let sampler = device.sampler(&SamplerDesc {
             max_anisotropy: 16.0,
@@ -409,6 +423,11 @@ impl Scenes {
         for r in &pipelines.recipes {
             reloader.watch(r.module);
         }
+        let streams = materials.streams.gpu().address().0;
+        let global = vec![
+            Record::fill(0, streams, 2 * device.image_slots(), 0),
+            mounts.streaming.init(),
+        ];
         Ok(Self {
             loading,
             loading_thread: Some(thread),
@@ -430,10 +449,10 @@ impl Scenes {
                 alias_view_targets: desc.alias_view_targets,
                 raster,
                 cuts,
-                materials: MaterialTable::new(device, desc.budgets.materials)?,
+                materials,
                 models: Vec::new(),
                 model_cpu: Vec::new(),
-                global: Mutex::new(Vec::new()),
+                global: Mutex::new(global),
                 scenes: Vec::new(),
                 histories: Vec::new(),
                 windows: (0..desc.frames_in_flight)
@@ -534,7 +553,9 @@ impl Scenes {
         self.core.mounts.lookup(m, id, |r| &r.pages)
     }
 
-    /// The cooked texture `id` of mount `m`, for consumer data that samples it.
+    /// The cooked texture `id` of mount `m`, for consumer data that samples it. A texture the
+    /// pack's materials bind streams by tile: sample it through `texture_footprint` with
+    /// [`Scenes::texture_streams`], which never reads a tile that is not resident.
     pub fn texture(&self, m: MountId, id: AssetId) -> Result<TextureIndex> {
         self.core.mounts.lookup(m, id, |r| &r.textures)
     }
@@ -549,6 +570,46 @@ impl Scenes {
     /// model should load or stay.
     pub fn prefetch(&mut self, model: ModelId, cell_distance: u32) {
         self.core.mounts.prefetch(model, cell_distance);
+    }
+
+    /// Wants every tile of mips `finest..` of the cooked texture `texture` of mount `m`
+    /// resident from the next step 1 on. Requests last one step: call it every frame while
+    /// the tiles should load or stay. Textures that do not stream are always resident.
+    pub fn prefetch_texture(&mut self, m: MountId, texture: TextureIndex, finest: u32) {
+        self.core
+            .mounts
+            .streaming
+            .prefetch_texture(m, texture.0, finest);
+    }
+
+    /// The stream table `MaterialGpu::texture_streams` points at, for kernels that sample
+    /// looked-up textures through `texture_footprint`; it lives as long as `self`.
+    pub fn texture_streams(&self) -> GpuPtr<GpuPtr<TextureStreamGpu>> {
+        self.core.materials.streams.gpu()
+    }
+
+    /// Streams blob `blob` of asset `id` of mount `m` into `target` through the loading
+    /// side, under the user blob budget. Poll [`Scenes::blob_state`]; the data is there for
+    /// frames that begin after it reads `Ready`.
+    pub fn request_blob(
+        &mut self,
+        m: MountId,
+        id: AssetId,
+        blob: u32,
+        target: BlobTarget,
+    ) -> Result<BlobId> {
+        self.core.mounts.request_blob(m, id, blob, target)
+    }
+
+    /// The progress of a requested blob; `Failed` with [`Error::UnknownBlob`] once released.
+    pub fn blob_state(&self, id: BlobId) -> LoadState {
+        self.core.mounts.streaming.blob_state(id)
+    }
+
+    /// Returns a requested blob's bytes to the user blob budget; its target is the
+    /// consumer's again once the blob is not loading.
+    pub fn release_blob(&mut self, id: BlobId) {
+        self.core.mounts.streaming.release_blob(id);
     }
 
     /// Residency figures of the latest step 1.
@@ -728,6 +789,7 @@ impl Scenes {
                 }
             }
             core.mounts.node_feedback(&feedback, frame);
+            core.mounts.streaming.texture_feedback(slot, f.id);
             core.completed_frame = f.id;
             core.stats = f.stats;
         }
@@ -1623,7 +1685,11 @@ impl<'a> Frame<'a> {
     pub fn end_submits(mut self, wait: &[TimelinePoint]) -> Result<Vec<TimelinePoint>> {
         self.ensure_updated()?;
         let render = self.device.queue(QueueKind::Render).expect("render queue");
-        let list = self.list.take().expect("frame list");
+        let mut list = self.list.take().expect("frame list");
+        self.core
+            .mounts
+            .streaming
+            .record_feedback(&mut list, self.id);
         let mut waits = wait.to_vec();
         waits.append(&mut self.loading);
         waits.extend(self.after_output);
