@@ -35,12 +35,12 @@ use orr_scene::testing::{
     Image, Pixels, Tolerance, assert_clean, check, device, flip, read_buffer, read_texture, wait,
 };
 use orr_scene::{
-    Affine3, BoundTexture, ClusterWork, CopyVariant, CutGpu, DebugLod, FrameDesc, FrameTime,
-    GroupWriter, InstanceFlags, InstanceRange, InstancesDesc, Lens, LoadState, Loading,
-    MaterialGpu, ModelId, MountId, PackSource, Pose, Projection, RasterView, RendererDesc,
-    SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc, SkinnedGpu,
-    SlotCutGpu, TextureFilter, TransformGroupDesc, TransformGroupId, ViewDesc, ViewHistoryId,
-    ViewTarget, VisibleCluster, material_flags,
+    Affine3, BoundTexture, ClusterWork, CopyVariant, CutGpu, DebugLod, Decal, DecalChannels,
+    DecalId, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstanceRange, InstancesDesc, Lens,
+    LoadState, Loading, MaterialGpu, MaterialId, ModelId, MountId, PackSource, Pose, Projection,
+    RasterView, RendererDesc, SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu,
+    SkinnedDesc, SkinnedGpu, SlotCutGpu, TextureFilter, TransformGroupDesc, TransformGroupId,
+    ViewDesc, ViewHistoryId, ViewTarget, VisibleCluster, material_flags,
 };
 use scene_suite::shaders::{codec, pose, skin_pose, surface_at, trace};
 use scene_suite::{linked, pipeline};
@@ -774,6 +774,12 @@ const TINTED: [(&str, Primaries); 3] = [
     ("tinted rec2020", Primaries::Rec2020),
 ];
 
+/// The decal texture's opaque texels (sRGB bytes, alpha) and the roughness of its material
+/// and of the matte decal under it.
+const STICKER_TEXEL: [u8; 4] = [40, 90, 230, 255];
+const STICKER_ROUGHNESS: f32 = 0.15;
+const MATTE_ROUGHNESS: f32 = 0.6;
+
 fn cook() -> Arc<[u8]> {
     let albedo = png("albedo.png", 256, 256, png::ColorType::Rgba, |x, y| {
         let check = ((x / 32) ^ (y / 32)) & 1 == 1;
@@ -882,6 +888,25 @@ fn cook() -> Arc<[u8]> {
         Vec3::new(0.5, 0.5, 0.0),
         Vec3::new(-0.5, 0.5, 0.0),
     ];
+    let sticker = png("sticker.png", 64, 64, png::ColorType::Rgba, |x, y| {
+        let (u, v) = (x as f32 / 32.0 - 1.0, y as f32 / 32.0 - 1.0);
+        let r = (u * u + v * v).sqrt();
+        let shape = (0.55..0.85).contains(&r) || (r < 0.85 && (u.abs() < 0.12 || v > 0.3));
+        if shape {
+            STICKER_TEXEL.to_vec()
+        } else {
+            vec![0, 0, 0, 0]
+        }
+    });
+    let mut sticker_material = Material {
+        specular_roughness: STICKER_ROUGHNESS,
+        ..Material::default()
+    };
+    sticker_material.textures[slot::BASE_COLOR].texture = id("tex/sticker");
+    let matte = Material {
+        specular_roughness: MATTE_ROUGHNESS,
+        ..Material::default()
+    };
     let green = png("green.png", 4, 4, png::ColorType::Rgb, |_, _| {
         TINT_TEXEL.to_vec()
     });
@@ -923,6 +948,9 @@ fn cook() -> Arc<[u8]> {
                 texture("tex/albedo", albedo, Usage::Color),
                 texture("tex/normal", bumps, Usage::Normal),
                 texture("tex/holes", holes, Usage::Linear1),
+                texture("tex/sticker", sticker, Usage::Color),
+                model("sticker", quad(unit), vec![sticker_material], one()),
+                model("matte", quad(unit), vec![matte], one()),
                 model(
                     "ground",
                     grid(24, 8.0, 3.0, |_, _| 0.0),
@@ -2053,6 +2081,7 @@ struct Shot {
     moved: Vec<(u32, Affine3)>,
     reset: bool,
     frame: u32,
+    jitter: Vec2,
 }
 
 impl Shot {
@@ -2064,6 +2093,7 @@ impl Shot {
             moved: Vec::new(),
             reset: frame <= 1,
             frame,
+            jitter: Vec2::new(0.25, -0.125),
         }
     }
 }
@@ -2110,7 +2140,7 @@ fn shoot_with(
             },
             lens: Lens::default(),
             render_extent: UVec2::from(EXTENT),
-            jitter: Vec2::new(0.25, -0.125),
+            jitter: shot.jitter,
             reset_history: shot.reset,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
@@ -2535,6 +2565,132 @@ fn hit_contexts_report_the_kind_depth_and_cone_of_each_hit() {
         checked += 1;
     }
     assert!(checked > 2000, "{checked} pixels checked");
+    assert_clean();
+}
+
+/// Writes the decal test's two decals: a matte decal larger than a bin under a sticker.
+fn set_decals(s: &mut SceneWriter<'_>, matte: MaterialId, sticker: MaterialId, wall_z: f64) {
+    let decal = |center: DVec3, half_extent: Vec3, rotation: Quat, material, channels| Decal {
+        center,
+        rotation,
+        half_extent,
+        material,
+        channels,
+        opacity: 1.0,
+        fade_angles: [1.0, 1.4],
+        depth_fade: 0.0,
+    };
+    let under = decal(
+        DVec3::new(0.0, 2.0, wall_z),
+        Vec3::new(20.0, 20.0, 0.5),
+        Quat::IDENTITY,
+        matte,
+        DecalChannels::ROUGHNESS,
+    );
+    let over = decal(
+        DVec3::new(0.4, 1.6, wall_z),
+        Vec3::new(1.2, 1.2, 0.25),
+        Quat::from_rotation_z(0.3),
+        sticker,
+        DecalChannels::BASE_COLOR | DecalChannels::ROUGHNESS,
+    );
+    s.set_decal(DecalId(0), Some(&under)).unwrap();
+    s.set_decal(DecalId(1), Some(&over)).unwrap();
+}
+
+#[test]
+fn a_decal_on_a_wall_matches_between_the_gbuffer_and_a_mirror_reflection() {
+    let _serial = serial();
+    let mut w = World::new(&linked::KERNELS);
+    let material = |w: &World, name: &str| {
+        w.scenes
+            .material(w.mount, AssetId::from_name(&format!("{name}/material/0")))
+            .unwrap()
+    };
+    let (matte, sticker) = (material(&w, "matte"), material(&w, "sticker"));
+    let wall_z = -4.0f32;
+    let wall = Item {
+        model: "plain",
+        linear: Mat3::from_diagonal(Vec3::splat(8.0)),
+        at: Vec3::new(0.0, 2.0, wall_z),
+    };
+    let floor = Item {
+        model: "plain",
+        linear: Mat3::from_rotation_x(-std::f32::consts::FRAC_PI_2) * 12.0,
+        at: Vec3::ZERO,
+    };
+    let target = DVec3::new(0.0, 0.0, -1.0);
+    let decals = |s: &mut SceneWriter<'_>| set_decals(s, matte, sticker, f64::from(wall_z));
+
+    // The camera sees the wall in the floor, which `cones` treats as a mirror; a camera
+    // mirrored in the floor sees the same wall directly, its image flipped upside down.
+    let eye = Vec3::new(0.0, 1.5, 3.0);
+    let mirrored = place(&mut w, &[floor, wall]);
+    let mut shot = Shot::at(eye.as_dvec3(), target, 1);
+    shot.jitter = Vec2::ZERO;
+    let g = shoot_with(&mut w, &mirrored, &shot, decals);
+    let module = linked::KERNELS.module(&trace::MODULE).unwrap();
+    let r = rays(&g.view, module, "cones", 0);
+    let direct = place(&mut w, &[wall]);
+    let mut shot = Shot::at(DVec3::new(0.0, -1.5, 3.0), target, 1);
+    shot.jitter = Vec2::ZERO;
+    let d = shoot_with(&mut w, &direct, &shot, decals);
+
+    let (width, height) = (EXTENT[0] as usize, EXTENT[1] as usize);
+    let mut reflected = vec![[0.0; 3]; width * height];
+    let mut seen = vec![[0.0; 3]; width * height];
+    let mut reflected_roughness = vec![[0.0; 3]; width * height];
+    let mut seen_roughness = vec![[0.0; 3]; width * height];
+    let (mut compared, mut stickered, mut matte_pixels) = (0, [0, 0], 0);
+    for (i, c) in r.cones.iter().enumerate() {
+        // Pixels whose camera ray meets the floor in front of the wall and whose mirror ray
+        // meets the wall away from its edges.
+        let dir = Vec3::from(c.direction);
+        if dir.y >= -1e-3 {
+            continue;
+        }
+        let p1 = eye + dir * (eye.y / -dir.y);
+        if p1.z <= wall_z + 0.05 || p1.x.abs() > 5.9 || p1.z > 5.9 {
+            continue;
+        }
+        let r2 = Vec3::new(dir.x, -dir.y, dir.z);
+        let p2 = p1 + r2 * ((wall_z - p1.z) / r2.z);
+        if r2.z >= 0.0 || p2.y > 5.8 || p2.x.abs() > 3.8 {
+            continue;
+        }
+        assert_eq!(c.hits, 2, "pixel {i}: floor then wall");
+        let (x, y) = (i % width, i / width);
+        let j = (height - 1 - y) * width + x;
+        assert_eq!(d.ids[j], 1, "pixel {j}: the mirrored camera sees the wall");
+        let core = decode_core(d.a[j], d.b[j]);
+        let got = Vec3::new(c.context[1][0], c.context[1][1], c.context[1][2]);
+        reflected[i] = arr(got.map(srgb_encode));
+        seen[i] = [byte(d.a[j][0], 0), byte(d.a[j][0], 8), byte(d.a[j][0], 16)];
+        reflected_roughness[i] = [c.context[1][3]; 3];
+        seen_roughness[i] = [core.roughness; 3];
+        for (k, rgb) in [reflected[i], seen[i]].into_iter().enumerate() {
+            if rgb[2] > rgb[0] + 0.3 {
+                stickered[k] += 1;
+            }
+        }
+        if (core.roughness - MATTE_ROUGHNESS).abs() < 0.01 {
+            matte_pixels += 1;
+        }
+        compared += 1;
+    }
+    assert!(compared > 3000, "{compared} pixels compared");
+    assert!(
+        stickered.iter().all(|&n| n > 150),
+        "sticker pixels reflected and seen: {stickered:?}"
+    );
+    assert!(matte_pixels > 1000, "{matte_pixels} matte pixels");
+    for (name, a, b) in [
+        ("base color", &seen, &reflected),
+        ("roughness", &seen_roughness, &reflected_roughness),
+    ] {
+        let e = flip(&image(|i| a[i]), &image(|i| b[i]));
+        assert!(e.mean <= 0.01 && e.p99 <= 0.1, "{name}: FLIP {e:?}");
+    }
     assert_clean();
 }
 
@@ -2977,6 +3133,7 @@ fn motion_vectors_do_not_change_when_the_render_origin_moves() {
                 moved,
                 reset: i == 1,
                 frame: i,
+                jitter: Vec2::new(0.25, -0.125),
             };
             let g = shoot(&mut w, &placed, &shot);
             let root: Vec<SceneRoot> = read_buffer(g.view.scene, 1);
@@ -3303,7 +3460,7 @@ fn shoot_rigs(
             },
             lens: Lens::default(),
             render_extent: UVec2::from(EXTENT),
-            jitter: Vec2::new(0.25, -0.125),
+            jitter: shot.jitter,
             reset_history: shot.reset,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,

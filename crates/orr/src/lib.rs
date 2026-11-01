@@ -45,12 +45,12 @@ pub use orr_scene::Error as SceneError;
 pub use orr_scene::{self, RasterView};
 pub use orr_scene::{
     Affine3, ArenaReport, ArenaTarget, BlobId, BlobTarget, BoundTexture, Budgets, ClassStats,
-    ClipRef, ClusterRef, ClusterTopology, Cone, ConsumerMarker, CopyVariant, DepthOfField,
-    DirectionalLight, DiscProfile, EmissiveGpu, EmissiveSpan, ExposureState, Focus, FrameStats,
-    FrameTime, Glare, GroupGpu, GroupWriter, InstanceFlags, InstanceGpu, InstancePage,
-    InstanceRange, InstancesDesc, Lens, LensDistortion, Light, LightGpu, LightId, LoadState,
-    Loading, MaterialGpu, MaterialId, MaterialWriter, MeshGpu, ModelEmission, ModelGpu, ModelId,
-    MountId, Opacity, OriginPolicy, PackSource, PageId, PipelineId, Pose, ProducerBatch,
+    ClipRef, ClusterRef, ClusterTopology, Cone, ConsumerMarker, CopyVariant, Decal, DecalChannels,
+    DecalId, DepthOfField, DirectionalLight, DiscProfile, EmissiveGpu, EmissiveSpan, ExposureState,
+    Focus, FrameStats, FrameTime, Glare, GroupGpu, GroupWriter, InstanceFlags, InstanceGpu,
+    InstancePage, InstanceRange, InstancesDesc, Lens, LensDistortion, Light, LightGpu, LightId,
+    LoadState, Loading, MaterialGpu, MaterialId, MaterialWriter, MeshGpu, ModelEmission, ModelGpu,
+    ModelId, MountId, Opacity, OriginPolicy, PackSource, PageId, PipelineId, Pose, ProducerBatch,
     ProducerClusterGpu, ProducerDesc, ProducerGpu, ProducerId, ProducerStats, ProducerUpdate,
     Projection, REBASE_GRID_LOG2, RasterGpu, ReloadReport, RendererDesc, ResidencyClass,
     ResidencyStats, RtCutGpu, RtStats, SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter,
