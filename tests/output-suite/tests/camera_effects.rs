@@ -278,14 +278,14 @@ mod depth_of_field {
         ChainImages, DepthOfFieldPass, DofPath, OutputKernels, OutputView, ViewOutput, srgb_encode,
     };
     use orr_scene::orr_gpu::{
-        Allocation, ComputePipeline, Format, Hazards, MemoryKind, QueueKind, ShaderStage, SpecData,
-        Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
+        Allocation, ComputePipeline, Format, GpuPtr, Hazards, MemoryKind, QueueKind, ShaderStage,
+        SpecData, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
         TextureRegion, TextureUsage, ViewDesc,
     };
     use orr_scene::testing::{
         FlipError, Image, Pixels, assert_clean, device, flip, read_buffer, read_texture, wait,
     };
-    use orr_scene::{DepthOfField, Focus, ViewConstants};
+    use orr_scene::{DepthOfField, Focus, Lens, Projection, ViewConstants};
     use output_suite::shaders::dof_scene;
 
     use super::{groups, read_rgba16f};
@@ -304,6 +304,9 @@ mod depth_of_field {
         Background,
         Highlights,
         Water,
+        /// A fence in front of the focal plane hiding, in the pinhole image, a warm stripe
+        /// behind each bar.
+        Fence,
     }
 
     fn lens(blades: u32, f_number: f32) -> DepthOfField {
@@ -330,8 +333,17 @@ mod depth_of_field {
         radius_px * FOCUS * 2.0 * TAN_X / OUT[0] as f32
     }
 
+    fn projection() -> Projection {
+        Projection {
+            fov_y: 2.0 * tan_y().atan(),
+            near: NEAR,
+        }
+    }
+
     /// One view's chain and render targets at `OUT` (render extent equal to output, no
-    /// jitter, no motion), filled by `dof_scene.slang`.
+    /// jitter, no motion), filled by `dof_scene.slang`. With `holes` on, ray hole filling
+    /// reads `dof_scene.slang`'s stand-in for lighting's background layer, traced from the
+    /// view's mask.
     struct Bed {
         kernels: OutputKernels,
         output: OutputView,
@@ -348,7 +360,14 @@ mod depth_of_field {
         chain: ChainImages,
         reference_out: Allocation<f32>,
         frame: u64,
-        _targets: [Texture; 2],
+        layer: Texture,
+        layer_index: TextureIndex,
+        layer_store: StorageImageIndex,
+        background_layer: ComputePipeline,
+        holes: bool,
+        reset: bool,
+        /// Depth and motion.
+        targets: [Texture; 2],
     }
 
     impl Bed {
@@ -362,6 +381,7 @@ mod depth_of_field {
             };
             let rr_output = texture(Format::Rgba16Float, "rr output");
             let linear = texture(Format::Rgba16Float, "display linear");
+            let layer = texture(Format::Rgba16Float, "background layer");
             let depth = texture(Format::R32Float, "rr depth");
             let motion = texture(Format::Rg16Float, "rr motion");
             let view = ViewDesc::default();
@@ -383,12 +403,22 @@ mod depth_of_field {
             c.clip_from_view[1][1] = -1.0 / tan_y();
             c.clip_from_view[3][2] = -1.0;
             c.clip_from_view[2][3] = NEAR;
+            c.clip_from_view_jittered = c.clip_from_view;
+            c.prev_clip_from_view = c.clip_from_view;
+            c.view_from_clip[0][0] = TAN_X;
+            c.view_from_clip[1][1] = -tan_y();
+            c.view_from_clip[2][3] = -1.0;
+            c.view_from_clip[3][2] = 1.0 / NEAR;
+            for i in 0..3 {
+                c.view_from_world_rotation[i][i] = 1.0;
+                c.prev_view_from_world_rotation[i][i] = 1.0;
+            }
             c.extent = OUT;
             c.delta_time = 1.0 / 60.0;
             constants.as_mut_slice().unwrap()[0] = c;
             let queue = gpu.queue(QueueKind::Render).unwrap();
             let mut list = queue.command_list().unwrap();
-            for t in [&rr_output, &linear, &depth, &motion] {
+            for t in [&rr_output, &linear, &depth, &motion, &layer] {
                 list.discard(t);
             }
             wait(queue.submit(vec![list], &[]).unwrap());
@@ -414,7 +444,13 @@ mod depth_of_field {
                 frame: 0,
                 rr_output,
                 linear,
-                _targets: [depth, motion],
+                layer_index: gpu.write_sampled(slot(), &layer, &view),
+                layer_store: gpu.write_storage(slot(), &layer, &view),
+                layer,
+                background_layer: pipeline("background_layer", "dof background layer"),
+                holes: false,
+                reset: false,
+                targets: [depth, motion],
             }
         }
 
@@ -436,6 +472,13 @@ mod depth_of_field {
                 lens_radius: lens_radius(dof),
                 blades: if polygon { dof.blades } else { 0 },
                 roundness: (dof.round_at_f_number / dof.f_number).min(1.0),
+                mask: TextureIndex::NONE,
+                background: self.layer_store,
+                layer_focus: GpuPtr::NULL,
+                layer_radius: 0.0,
+                sample: 0,
+                _pad0: 0,
+                _pad1: 0,
             };
         }
 
@@ -455,9 +498,28 @@ mod depth_of_field {
             let mut list = queue.command_list().unwrap();
             list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
             list.dispatch(&self.scene, self.root.gpu(), groups(OUT));
+            let lens = Lens {
+                sensor_width_mm: SENSOR_MM,
+                depth_of_field: dof,
+                ..Lens::default()
+            };
+            let mask = self.output.dof_hole_mask(&lens, &projection(), OUT);
+            let background = match mask.filter(|_| self.holes) {
+                Some(mask) => {
+                    let root = &mut self.root.as_mut_slice().unwrap()[0];
+                    root.mask = mask.mask;
+                    root.layer_focus = mask.focus_distance;
+                    root.layer_radius = mask.aperture_radius;
+                    root.sample = self.frame as u32;
+                    list.dispatch(&self.background_layer, self.root.gpu(), groups(OUT));
+                    Some(self.layer_index)
+                }
+                None => None,
+            };
             list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
             let mut output = ViewOutput::default();
             output.post.dof_path = path;
+            output.post.dof_ray_hole_fill = self.holes;
             let pass = DepthOfFieldPass {
                 rr_depth: self.depth,
                 rr_motion: self.motion,
@@ -465,9 +527,11 @@ mod depth_of_field {
                 view: self.constants.gpu(),
                 sensor_width_mm: SENSOR_MM,
                 depth_of_field: dof,
-                history_reset: false,
+                history_reset: self.reset,
                 frame: self.frame,
                 output: &output,
+                render_extent: OUT,
+                background,
             };
             let mut chain = self.chain;
             let recorded = match path {
@@ -499,6 +563,22 @@ mod depth_of_field {
                 &self.rr_output
             };
             (read_rgba16f(image), names, None)
+        }
+
+        /// The stand-in background layer the last frame traced.
+        fn layer(&self) -> Vec<[f32; 4]> {
+            read_rgba16f(&self.layer)
+        }
+
+        /// The scene's reverse-Z depth.
+        fn depth(&self) -> Vec<f32> {
+            read_texture(
+                &self.targets[0],
+                &TextureRegion::whole_mip(self.targets[0].desc(), 0),
+            )
+            .chunks_exact(4)
+            .map(|p| f32::from_le_bytes([p[0], p[1], p[2], p[3]]))
+            .collect()
         }
 
         fn reference(&mut self, scene: Scene, dof: &DepthOfField) -> Vec<[f32; 4]> {
@@ -575,6 +655,108 @@ mod depth_of_field {
     #[test]
     fn foreground_over_focus_matches_lens_reference() {
         check(Scene::Foreground, lens(0, 1.4), 0.05);
+    }
+
+    /// The mirrored fill guesses what a foreground pixel hides from the background around
+    /// it; the background layer sees it once it has gathered samples.
+    #[test]
+    fn ray_hole_fill_sees_what_the_foreground_hides() {
+        const THRESHOLD: f32 = 0.05;
+        for f_number in [2.0, 1.4, 1.0] {
+            let dof = lens(0, f_number);
+            for path in [DofPath::AfterRr, DofPath::Guide] {
+                let mut b = Bed::new();
+                let reference = b.reference(Scene::Fence, &dof);
+                let (mirrored, _, _) = b.render(Scene::Fence, Some(dof), path);
+                b.holes = true;
+                let mut traced = Vec::new();
+                for _ in 0..8 {
+                    traced = b.render(Scene::Fence, Some(dof), path).0;
+                }
+                let mirrored = flip_against(&reference, &mirrored);
+                let traced = flip_against(&reference, &traced);
+                log::info!("f/{f_number} {path:?}: FLIP traced {traced:?}, mirrored {mirrored:?}");
+                assert!(
+                    mirrored.mean > THRESHOLD,
+                    "f/{f_number} {path:?}: {mirrored:?}"
+                );
+                assert!(
+                    traced.mean <= THRESHOLD,
+                    "f/{f_number} {path:?}: {traced:?}"
+                );
+            }
+        }
+        assert_clean();
+    }
+
+    /// The mask marks every foreground pixel and starts its ray past the foreground; turning
+    /// the fill off frees it.
+    #[test]
+    fn hole_mask_starts_rays_past_the_foreground() {
+        let mut b = Bed::new();
+        b.holes = true;
+        let dof = lens(0, 2.0);
+        let lens = Lens {
+            sensor_width_mm: SENSOR_MM,
+            depth_of_field: Some(dof),
+            ..Lens::default()
+        };
+        b.render(Scene::Foreground, Some(dof), DofPath::AfterRr);
+        let with_holes = b.output.depth_of_field_bytes();
+        let mask = b.output.dof_hole_mask(&lens, &projection(), OUT).unwrap();
+        assert!(
+            b.output
+                .dof_hole_mask(&lens, &projection(), [OUT[0] / 2, OUT[1]])
+                .is_none()
+        );
+        let expected = 0.5 * (0.5 * SENSOR_MM / TAN_X) / dof.f_number / 1000.0;
+        assert!((mask.aperture_radius - expected).abs() < 1e-6 * expected);
+        b.render(Scene::Foreground, Some(dof), DofPath::AfterRr);
+        let (foreground, wall) = (NEAR / 0.35, NEAR / 1.0);
+        let (depth, layer) = (b.depth(), b.layer());
+        let mut marked = 0;
+        for (d, t) in depth.iter().zip(&layer) {
+            if (d - foreground).abs() < 1e-3 * foreground {
+                assert!(t[3] >= 0.0, "an unmarked foreground pixel");
+            }
+            if t[3] >= 0.0 {
+                marked += 1;
+                assert!(
+                    (t[3] - wall).abs() < 2e-3 * wall,
+                    "a ray stopped at {}",
+                    t[3]
+                );
+            } else {
+                assert_eq!(*t, [0.0, 0.0, 0.0, -1.0]);
+            }
+        }
+        assert!(
+            marked > 0 && marked < layer.len(),
+            "{marked} of {}",
+            layer.len()
+        );
+        b.holes = false;
+        b.render(Scene::Foreground, Some(dof), DofPath::AfterRr);
+        assert!(b.output.dof_hole_mask(&lens, &projection(), OUT).is_none());
+        assert!(b.output.depth_of_field_bytes() < with_holes);
+        assert_clean();
+    }
+
+    /// The layer traced from the mask before a cut is not used: the frame after it fills
+    /// holes by mirroring, as a view's first frame does.
+    #[test]
+    fn cut_keeps_the_mirrored_fill() {
+        let dof = Some(lens(0, 1.4));
+        let (first, _, _) = Bed::new().render(Scene::Fence, dof, DofPath::AfterRr);
+        let mut b = Bed::new();
+        b.holes = true;
+        for _ in 0..4 {
+            b.render(Scene::Fence, dof, DofPath::AfterRr);
+        }
+        b.reset = true;
+        let (cut, _, _) = b.render(Scene::Fence, dof, DofPath::AfterRr);
+        assert_eq!(first, cut);
+        assert_clean();
     }
 
     #[test]

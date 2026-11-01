@@ -47,6 +47,11 @@ pub struct PostQuality {
     /// Rings of the half-resolution depth-of-field gathers; ring k holds 8k samples.
     pub dof_rings: u32,
     pub dof_path: DofPath,
+    /// Depth of field fills what out-of-focus foreground hides from lighting's background
+    /// layer, traced past the foreground from the mask the view's last pass wrote
+    /// (`OutputView::dof_hole_mask`), instead of mirroring the background around it.
+    /// Off by default.
+    pub dof_ray_hole_fill: bool,
     pub glare: GlareMethod,
     /// Halvings to the resolution glare runs at: 1 (half resolution) or 2. For the bands it
     /// is the pyramid's first level.
@@ -72,6 +77,7 @@ impl Default for PostQuality {
             motion_blur_samples: 35,
             dof_rings: 5,
             dof_path: DofPath::AfterRr,
+            dof_ray_hole_fill: false,
             glare: GlareMethod::Bands,
             glare_first_level: 1,
         }

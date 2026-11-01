@@ -9,7 +9,9 @@ use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, GpuPtr, Hazards, MemoryKind, OutputFormat,
     ShaderStage, SpecData, Stages, StorageImageIndex, Texture, TextureIndex,
 };
-use orr_scene::{DepthOfField, LensDistortion, SkyStats, ViewArena, ViewConstants};
+use orr_scene::{
+    DepthOfField, Lens, LensDistortion, Projection, SkyStats, ViewArena, ViewConstants,
+};
 
 use crate::dof::{DofKernels, DofTargets};
 use crate::exposure::{COMPENSATION_ENTRIES, HISTOGRAM_BINS, HISTOGRAM_WORDS_PER_BIN};
@@ -25,8 +27,8 @@ use crate::shaders::hook_inputs;
 use crate::shaders::tonemap::{self, TonemapConstants};
 use crate::{
     AutoExposure, ChainImages, CompensationCurve, DepthOfFieldPass, DistortionField,
-    DofGuideImages, DofPath, Exposure, ExposureTelemetry, GlareComposite, GlareMethod, GlarePass,
-    Gt7Curve, HookInputs, Hooks, MeterWeights, MotionBlurPass, OutputDebug, Primaries,
+    DofGuideImages, DofHoleMask, DofPath, Exposure, ExposureTelemetry, GlareComposite, GlareMethod,
+    GlarePass, Gt7Curve, HookInputs, Hooks, MeterWeights, MotionBlurPass, OutputDebug, Primaries,
     ResolvedDisplay, Result, Screenshot, SkyTelemetry, ViewOutput,
 };
 
@@ -199,6 +201,21 @@ impl OutputView {
     /// The images RR reads on the guide path, while the view's depth of field runs there.
     pub fn depth_of_field_guide(&self) -> Option<DofGuideImages<'_>> {
         self.dof.as_ref().and_then(DofTargets::guide_images)
+    }
+
+    /// What lighting traces this frame's background layer from, for the view's next
+    /// depth-of-field pass to fill holes with: once a pass with
+    /// `PostQuality::dof_ray_hole_fill` wrote the mask at `render_extent`, while `lens` has
+    /// depth of field. The mask and focus are the last pass's, a frame behind.
+    pub fn dof_hole_mask(
+        &self,
+        lens: &Lens,
+        projection: &Projection,
+        render_extent: [u32; 2],
+    ) -> Option<DofHoleMask> {
+        self.dof
+            .as_ref()?
+            .hole_mask(lens, projection, render_extent)
     }
 
     /// The roots frame `frame` records with. Its slot was last used by frame
@@ -793,9 +810,9 @@ impl OutputKernels {
             view.dof = Some(DofTargets::new(&view.device, pass.extent, path)?);
         }
         let targets = view.dof.as_mut().expect("dof targets");
-        if targets.fresh {
-            targets.discard(list);
-        }
+        let holes = pass.output.post.dof_ray_hole_fill;
+        targets.set_holes(&view.device, holes, pass.render_extent)?;
+        targets.discard_fresh(list);
         Ok(Some(dof))
     }
 
