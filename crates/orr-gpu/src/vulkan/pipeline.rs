@@ -3,14 +3,12 @@
 
 use std::borrow::Cow;
 use std::ffi::CStr;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Instant;
 
 use ash::vk;
 use ash::vk::TaggedStructure as _;
 
-use super::cache::{KeyHasher, PipelineKind};
 use super::debug::name_object;
 use super::device::{Device, Shared};
 use super::garbage::Item;
@@ -209,18 +207,6 @@ impl<'a> StageParts<'a> {
         })
     }
 
-    /// Feeds everything that shapes the compiled stage into a pipeline key.
-    pub(super) fn hash(&self, stage: vk::ShaderStageFlags, h: &mut impl Hasher) {
-        stage.as_raw().hash(h);
-        bytemuck::cast_slice::<u32, u8>(&self.code).hash(h);
-        self.entry.to_bytes().hash(h);
-        self.map_entries.len().hash(h);
-        for e in &self.map_entries {
-            (e.constant_id, e.offset, e.size).hash(h);
-        }
-        self.spec.hash(h);
-    }
-
     pub(super) fn chain(&self) -> StageChain<'_> {
         StageChain {
             module: vk::ShaderModuleCreateInfo::default().code(&self.code),
@@ -277,29 +263,16 @@ impl Shared {
         name: &str,
     ) -> Result<vk::Pipeline, Error> {
         let parts = StageParts::new(self, s, Stage::Compute, name)?;
-        let mut key = KeyHasher::new(PipelineKind::Compute);
-        parts.hash(vk::ShaderStageFlags::COMPUTE, &mut key);
-        extra.as_raw().hash(&mut key);
-        self.create_pipeline(
-            PipelineKind::Compute,
-            key.finish_key(),
-            extra,
-            name,
-            "vkCreateComputePipelines",
-            |chain| {
-                let mut stage = parts.chain();
-                let mut info = vk::ComputePipelineCreateInfo::default()
-                    .stage(stage.info(vk::ShaderStageFlags::COMPUTE));
-                info.p_next = chain.head();
-                // SAFETY: valid create info; the SPIR-V was validated by the shader build.
-                unsafe {
-                    self.device
-                        .create_compute_pipelines(chain.cache, &[info], None)
-                }
+        self.create_pipeline(extra, name, "vkCreateComputePipelines", |cache, next| {
+            let mut stage = parts.chain();
+            let mut info = vk::ComputePipelineCreateInfo::default()
+                .stage(stage.info(vk::ShaderStageFlags::COMPUTE));
+            info.p_next = next;
+            // SAFETY: valid create info; the SPIR-V was validated by the shader build.
+            unsafe { self.device.create_compute_pipelines(cache, &[info], None) }
                 .map(|p| p[0])
                 .map_err(|(_, e)| e)
-            },
-        )
+        })
     }
 }
 

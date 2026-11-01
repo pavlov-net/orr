@@ -69,8 +69,6 @@ pub struct Caps {
     pub checkpoints: bool,
     /// Nsight Aftermath writes crash dumps ([`crate::Diagnostics::Aftermath`]).
     pub aftermath: bool,
-    /// Pipeline binaries (`VK_KHR_pipeline_binary`).
-    pub pipeline_binary: bool,
     /// Cooperative-vector type combinations; empty without cooperative vectors or replicated
     /// composites.
     pub cooperative_vector: Vec<CooperativeVectorCombination>,

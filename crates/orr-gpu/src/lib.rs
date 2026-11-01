@@ -60,10 +60,9 @@ pub use vulkan::{
     LssEndCaps, LssIndexing, MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout,
     MemoryCopy, MemoryKind, MemoryPriority, MemoryReport, MemoryUsage, MeshArgs, MeshPipeline,
     MeshPipelineDesc, Micromap, MicromapDesc, MicromapTriangle, MicromapUsage, OmmFormat, PageBind,
-    PassResult, PipelineCacheKind, PipelineCacheReport, PipelineStats, Queue, QueueKind,
-    QueueProgress, QueueRequest, RayDispatchPipeline, Rendering, Sequence, SetKind, ShaderStage,
-    SparseAllocation, SparseBinds, Swapchain, SwapchainFrame, Texture, TextureCopy, TextureMemory,
-    TileBind,
+    PassResult, PipelineCacheReport, PipelineStats, Queue, QueueKind, QueueProgress, QueueRequest,
+    RayDispatchPipeline, Rendering, Sequence, SetKind, ShaderStage, SparseAllocation, SparseBinds,
+    Swapchain, SwapchainFrame, Texture, TextureCopy, TextureMemory, TileBind,
 };
 
 #[cfg(not(target_vendor = "apple"))]

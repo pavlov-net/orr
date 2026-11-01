@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 
 use ash::vk;
 
-use super::cache::{KeyHasher, PipelineKind};
 use super::device::{Device, Shared};
 use super::garbage::{Item, RawBuffer};
 use super::heap::SlotAllocator;
@@ -106,8 +105,6 @@ impl Device {
             });
         };
         let parts = StageParts::new(shared, s, Stage::RayGen, name)?;
-        let mut key = KeyHasher::new(PipelineKind::RayDispatch);
-        parts.hash(vk::ShaderStageFlags::RAYGEN_KHR, &mut key);
         let groups = [vk::RayTracingShaderGroupCreateInfoKHR::default()
             .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
             .general_shader(0)
@@ -115,24 +112,22 @@ impl Device {
             .any_hit_shader(vk::SHADER_UNUSED_KHR)
             .intersection_shader(vk::SHADER_UNUSED_KHR)];
         let raw = shared.create_pipeline(
-            PipelineKind::RayDispatch,
-            key.finish_key(),
             vk::PipelineCreateFlags2::empty(),
             name,
             "vkCreateRayTracingPipelinesKHR",
-            |chain| {
+            |cache, next| {
                 let mut stage = parts.chain();
                 let stages = [stage.info(vk::ShaderStageFlags::RAYGEN_KHR)];
                 let mut info = vk::RayTracingPipelineCreateInfoKHR::default()
                     .stages(&stages)
                     .groups(&groups)
                     .max_pipeline_ray_recursion_depth(0);
-                info.p_next = chain.head();
+                info.p_next = next;
                 // SAFETY: valid create info; the SPIR-V was validated by the shader build.
                 unsafe {
                     rt.create_ray_tracing_pipelines(
                         vk::DeferredOperationKHR::null(),
-                        chain.cache,
+                        cache,
                         &[info],
                         None,
                     )
