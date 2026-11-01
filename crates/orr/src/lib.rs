@@ -724,6 +724,7 @@ impl<'a> Frame<'a> {
             gbuffer: raster.gbuffer,
             sample_index: state.samples,
             seed: 0,
+            dof_background: None,
         };
         paths.begin(id, scene, view, output.cut, lighting);
         let traced = Stages::COMPUTE | Stages::RAY;
@@ -733,7 +734,7 @@ impl<'a> Frame<'a> {
             .as_ref()
             .expect("compiled with the view history");
         kernels.record_media(list, scene, paths, &pass, lighting)?;
-        kernels.record_opaque(list, scene, paths, &pass, lighting);
+        kernels.record_opaque(list, scene, paths, &pass, lighting)?;
         list.barrier(traced, traced, Hazards::empty());
         kernels.record_dielectric(list, paths, &pass, lighting);
         state.samples = state.samples.wrapping_add(1);

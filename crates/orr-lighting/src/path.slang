@@ -63,6 +63,12 @@ public static const uint SUBSET_STREAM = 0x27D4EB2F;
 // Separates an update path's samples from the opaque path's of the same pixel.
 public static const uint UPDATE_STREAM = 0x9E3779B9;
 
+// Separates the background layer's samples from the opaque path's of the same pixel.
+public static const uint DOF_STREAM = 0x165667B1;
+
+// `PathRoot.dof_background` and `dof_mask` when the layer is off.
+public static const uint DOF_NONE = 0xffffffff;
+
 // Vertices of an update path that add samples to the cache.
 public static const uint UPDATE_VERTICES = 4;
 
@@ -126,6 +132,17 @@ public struct PathRoot
     // Share of surface pixels whose path runs, in (0, 1]; each runs with this probability
     // and divides its path's estimate by it.
     public float pixel_fraction;
+    // The background layer behind out-of-focus foreground, RGBA16F at the G-buffer's extent;
+    // NONE leaves it out. Pixels whose `dof_mask` red channel holds a reverse-Z depth above 0
+    // trace a second camera ray from the aperture disc of radius `dof_aperture` m, focused at
+    // `*dof_focus` m along the view axis and starting past that depth, and its path.
+    public StorageImageIndex dof_background;
+    public TextureIndex dof_mask;
+    public float* dof_focus;
+    public float dof_aperture;
+    public uint _pad0;
+    public uint _pad1;
+    public uint _pad2;
 }
 
 // What the dielectric dispatch leaves the guide resolve of a pixel's first dielectric or
@@ -916,30 +933,37 @@ public bool gbuffer_vertex(SceneRoot* s, ViewConstants* v, GBufferGpu* gbuffer, 
     return true;
 }
 
-// The reference thin lens's first vertex of `pixel`: a ray from a point of the aperture disc
-// through a jittered point of the pixel on the focal plane, its hit through linked surface
-// `S`. False on a miss, with `dir` the ray's direction. Draws two sampler dimensions.
-public bool lens_vertex<S : ISurface>(PathRoot r, uint2 pixel, inout Sampler rng, out PathVertex x, out float3 dir)
+// A thin lens's first vertex of `pixel`: a ray from a point of the aperture disc of radius
+// `aperture` m through a jittered point of the pixel on the focal plane `focus` m along the
+// view axis, starting `start` m along that axis, its hit through linked surface `S`. False
+// on a miss, with `dir` the ray's direction. `depth` is the hit's distance along the view
+// axis in m, infinity on a miss. Draws two sampler dimensions.
+public bool lens_vertex<S : ISurface>(PathRoot r, uint2 pixel, float aperture, float focus, float start, inout Sampler rng, out PathVertex x, out float3 dir, out float depth)
 {
     x = (PathVertex)0;
+    depth = positive_infinity();
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
     float2 uv = (float2(pixel) + rng.next2()) / float2(v.extent);
     float3 through = view_direction(v, uv);
-    float3 focus = through * (r.focus_distance / max(-through.z, 1e-6));
-    float3 lens = float3(sample_disk_concentric(rng.next2()) * r.aperture_radius, 0.0);
-    float3 origin = render_from_view(v, lens);
-    dir = normalize(render_from_view(v, focus) - origin);
+    float3 at_focus = through * (focus / max(-through.z, 1e-6));
+    float3 lens = float3(sample_disk_concentric(rng.next2()) * aperture, 0.0);
+    float3 view_dir = normalize(at_focus - lens);
+    float t_start = start / max(-view_dir.z, 1e-6);
+    float3 origin = render_from_view(v, lens + view_dir * t_start);
+    dir = render_direction(v, view_dir);
     RayCone cone = camera_cone(v);
-    Alpha<S> a = { s, v, dir, hit_context(HIT_PRIMARY, 0, cone, 0.0) };
+    Alpha<S> a = { s, v, dir, hit_context(HIT_PRIMARY, 0, cone, t_start) };
     float3 positions[3];
     Hit h = trace_closest(s.tlas, path_ray(origin, dir, positive_infinity()), MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
     if (!h.hit || h.cluster_id < 0)
         return false;
-    SurfaceHit sh = resolve_hit<S>(s, v, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, hit_context(HIT_PRIMARY, 0, cone, h.t, texture_tap(v, pixel, r.frame, r.seed, 0)));
+    float t = t_start + h.t;
+    SurfaceHit sh = resolve_hit<S>(s, v, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, false, hit_context(HIT_PRIMARY, 0, cone, t, texture_tap(v, pixel, r.frame, r.seed, 0)));
     if (!sh.valid)
         return false;
     x = hit_vertex(v, sh, dir);
+    depth = -view_dir.z * t;
     return true;
 }
 
@@ -974,7 +998,10 @@ public void opaque_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
     bool lens = r.aperture_radius > 0.0;
     bool surface;
     if (lens)
-        surface = lens_vertex<S>(r, pixel, rng, x1, dir);
+    {
+        float depth;
+        surface = lens_vertex<S>(r, pixel, r.aperture_radius, r.focus_distance, 0.0, rng, x1, dir, depth);
+    }
     else
         surface = gbuffer_vertex(r.scene, v, r.gbuffer, pixel, x1);
     float3 radiance = float3(0.0);
@@ -1022,6 +1049,40 @@ public void opaque_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
     r.feedback.get<RWTexture2D<uint2>>()[pixel] = uint2(feedback, asuint(surface ? x1.camera_distance : 0.0));
     if ((r.light_flags & LIGHT_FEEDBACK_COUNT) != 0 && feedback != NO_LIGHT)
         count_feedback(set, feedback);
+    if (r.dof_background.index != DOF_NONE)
+        r.dof_background.get<RWTexture2D<float4>>()[pixel] = background_texel<C, S, E, M>(r, pixel);
+}
+
+// The background layer's texel of `pixel`: on a marked pixel, the pre-exposed radiance of
+// its lens ray past the mask's depth in RGB, the full path at the opaque path's settings,
+// and the reverse-Z depth of its hit in A (0 on a miss); (0, 0, 0, -1) on other pixels.
+float4 background_texel<C : ICoherence, S : ISurface, E : IEnvironment, M : IMedium>(PathRoot r, uint2 pixel)
+{
+    ViewConstants* v = r.view;
+    float mask = r.dof_mask.get<Texture2D<float>>().Load(int3(pixel, 0));
+    if (!(mask > 0.0))
+    {
+        skip_points<C>(r);
+        return float4(0.0, 0.0, 0.0, -1.0);
+    }
+    PathRoot b = r;
+    b.mode = PATH_FULL;
+    float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
+    float near = v.clip_from_view[2][3];
+    Sampler rng = Sampler(pixel, r.frame, r.seed ^ DOF_STREAM);
+    PathVertex x1;
+    float3 dir;
+    float depth;
+    if (!lens_vertex<S>(b, pixel, r.dof_aperture, *r.dof_focus, near / mask, rng, x1, dir, depth))
+    {
+        skip_points<C>(r);
+        return float4(apply_hdr_ceiling(pre_exposure * sky_radiance<E, M>(r.set, v.eye_render.xyz, dir)), 0.0);
+    }
+    Bsdf bx = bsdf_prepare(x1.surface.bsdf, x1.surface.normal, x1.view);
+    uint rays = 0;
+    ViewPath record = ViewPath(pcg3d(uint3(pixel, r.frame ^ r.seed ^ DOF_STREAM)).x);
+    float3 radiance = bx.emission() + trace_path<C, S, M>(b, x1, pixel, rng, rays, record);
+    return float4(apply_hdr_ceiling(pre_exposure * radiance), near / depth);
 }
 
 // The update path of `block`, a square of `PathRoot.update_block` pixels: one pixel of it,

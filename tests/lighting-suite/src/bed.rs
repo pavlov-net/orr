@@ -16,9 +16,9 @@ use orr_gpu::{
     Stages,
 };
 use orr_lighting::{
-    BsdfTables, DirectionalLight, DiscProfile, EnvironmentMapGpu, Light, LightId, LightingKernels,
-    LightingView, PathEntry, SceneLighting, SceneLightingSettings, ScenePass, ViewLighting,
-    ViewPass,
+    BsdfTables, DirectionalLight, DiscProfile, DofBackgroundPass, EnvironmentMapGpu, Light,
+    LightId, LightingKernels, LightingView, PathEntry, SceneLighting, SceneLightingSettings,
+    ScenePass, ViewLighting, ViewPass,
 };
 use orr_math::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
@@ -926,6 +926,7 @@ impl BedFrame<'_> {
             gbuffer: self.view.gbuffer,
             sample_index: self.index,
             seed: self.seed,
+            dof_background: None,
         }
     }
 
@@ -1026,6 +1027,8 @@ pub struct Bed {
     last_id: u64,
     light_writes: Vec<(LightId, Option<Light>)>,
     medium: Option<GpuAddress>,
+    /// Frames add the background layer instead of the radiance.
+    background_layer: bool,
     _workers: Workers,
 }
 
@@ -1186,6 +1189,7 @@ impl Bed {
             last_id: 0,
             light_writes: Vec::new(),
             medium: None,
+            background_layer: false,
             _workers: workers,
         }
     }
@@ -1273,6 +1277,12 @@ impl Bed {
     /// The bed view's lighting targets as the last frame left them.
     pub fn view(&self) -> &LightingView {
         &self.target
+    }
+
+    /// Whether later frames add the view's background layer to the accumulation instead of
+    /// its radiance.
+    pub fn accumulate_background_layer(&mut self, on: bool) {
+        self.background_layer = on;
     }
 
     /// Renders later frames at pre-exposure `p`, as the output's meter would set it.
@@ -1419,7 +1429,13 @@ impl Bed {
         );
         let root = self.roots.put(&accumulate::Root {
             sum: self.sum.gpu(),
-            radiance: self.target.radiance_index(),
+            radiance: if self.background_layer {
+                self.target
+                    .dof_background_index()
+                    .expect("the frame traced no background layer")
+            } else {
+                self.target.radiance_index()
+            },
             width: EXTENT[0],
             count: PIXELS as u32,
             first: u32::from(first),
@@ -1490,6 +1506,8 @@ pub struct Paths {
     kernels: LightingKernels,
     _tables: BsdfTables,
     pub settings: ViewLighting,
+    /// The background layer request of every frame.
+    pub dof_background: Option<DofBackgroundPass>,
 }
 
 impl Paths {
@@ -1501,20 +1519,25 @@ impl Paths {
             kernels: LightingKernels::new(device(), kernels, &tables, entry).unwrap(),
             _tables: tables,
             settings,
+            dof_background: None,
         }
     }
 
     /// Starts the view's frame, then records the froxel passes, the opaque dispatch, the
     /// dielectric dispatch, media apply and the guide resolve.
     pub fn record(&self, list: &mut CommandList<'_>, f: &mut BedFrame<'_>) {
-        let pass = f.pass();
+        let pass = ViewPass {
+            dof_background: self.dof_background,
+            ..f.pass()
+        };
         f.target
             .begin(f.frame, f.lighting, &f.desc, false, &self.settings);
         self.kernels
             .record_media(list, f.lighting, f.target, &pass, &self.settings)
             .unwrap();
         self.kernels
-            .record_opaque(list, f.lighting, f.target, &pass, &self.settings);
+            .record_opaque(list, f.lighting, f.target, &pass, &self.settings)
+            .unwrap();
         let paths = Stages::COMPUTE | Stages::RAY;
         list.barrier(paths, paths, Hazards::empty());
         self.kernels

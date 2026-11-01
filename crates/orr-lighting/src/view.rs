@@ -245,6 +245,44 @@ struct Feedback {
     sampled: TextureIndex,
 }
 
+/// The background layer behind out-of-focus foreground and the frame the opaque dispatch
+/// last wrote it.
+struct DofLayer {
+    target: Target,
+    sampled: TextureIndex,
+    frame: u64,
+    device: Device,
+}
+
+impl DofLayer {
+    fn new(device: &Device, extent: [u32; 2]) -> Result<Self, Error> {
+        let desc = TextureDesc::d2(
+            Format::Rgba16Float,
+            extent[0],
+            extent[1],
+            TextureUsage::SAMPLED | TextureUsage::STORAGE,
+        );
+        let texture = device.create_texture(&desc, TextureMemory::Dedicated, "dof background")?;
+        let view = orr_gpu::ViewDesc::default();
+        let store = device.write_storage(device.alloc_image_slot()?, &texture, &view);
+        let sampled = device.write_sampled(device.alloc_image_slot()?, &texture, &view);
+        Ok(Self {
+            target: Target { texture, store },
+            sampled,
+            frame: 0,
+            device: device.clone(),
+        })
+    }
+}
+
+impl Drop for DofLayer {
+    fn drop(&mut self) {
+        self.device
+            .free_image_slot_after_submitted(self.target.store.0);
+        self.device.free_image_slot_after_submitted(self.sampled.0);
+    }
+}
+
 /// Arena names of a [`LightingView`]'s targets.
 const RADIANCE: &str = "radiance";
 const DIFFUSE_ALBEDO: &str = "diffuse albedo";
@@ -320,6 +358,7 @@ pub struct LightingView {
     previous: Option<(SceneId, DVec3, Quat)>,
     history_reset: bool,
     pub(crate) media: MediaView,
+    dof: Option<DofLayer>,
 }
 
 impl LightingView {
@@ -409,6 +448,7 @@ impl LightingView {
             previous: None,
             history_reset: true,
             media: MediaView::new(device)?,
+            dof: None,
         })
     }
 
@@ -503,6 +543,19 @@ impl LightingView {
         self.targets.motion.texture()
     }
 
+    /// RGBA16F, the background layer behind out-of-focus foreground as the last opaque
+    /// dispatch given a [`DofBackgroundPass`] wrote it: on each marked pixel, the pre-exposed
+    /// radiance its lens ray reaches past the mask's depth in RGB (with the camera segment's
+    /// media where media apply ran) and that hit's reverse-Z device depth in A, 0 for sky;
+    /// (0, 0, 0, -1) on unmarked pixels. `None` once a dispatch runs without one.
+    pub fn dof_background(&self) -> Option<&Texture> {
+        self.dof.as_ref().map(|l| &l.target.texture)
+    }
+
+    pub fn dof_background_index(&self) -> Option<TextureIndex> {
+        self.dof.as_ref().map(|l| l.sampled)
+    }
+
     /// RG32_UINT: per pixel, the light feedback of the last opaque dispatch (a light's
     /// feedback id or `u32::MAX`) and its first vertex's camera distance in m as `f32` bits, 0
     /// on sky pixels.
@@ -519,6 +572,14 @@ impl LightingView {
         } else {
             GpuPtr::NULL
         }
+    }
+
+    /// The background layer's storage view when the opaque dispatch of `frame` wrote it.
+    pub(crate) fn dof_background_store(&self, frame: u64) -> StorageImageIndex {
+        self.dof
+            .as_ref()
+            .filter(|l| l.frame == frame)
+            .map_or(StorageImageIndex::NONE, |l| l.target.store)
     }
 
     /// The froxel counts of `frame`, once its submit has completed; `None` when that frame
@@ -563,6 +624,25 @@ pub struct ViewPass {
     pub sample_index: u32,
     /// Separates sample sets of the same pixels and sample index.
     pub seed: u32,
+    /// The opaque dispatch also traces the view's background layer
+    /// ([`LightingView::dof_background`]); `None` frees it.
+    pub dof_background: Option<DofBackgroundPass>,
+}
+
+/// What the background layer behind out-of-focus foreground reads in one frame. Each marked
+/// pixel traces a second camera ray from a point of the lens's aperture disc through a
+/// jittered point of the pixel on the focal plane, starting past the mask's depth, and the
+/// path from its hit at the opaque path's settings. The ray sees opaque geometry only:
+/// dielectric and presence layers past the mask are not traced.
+#[derive(Clone, Copy, Debug)]
+pub struct DofBackgroundPass {
+    /// Float image at the view's extent, read from its red channel: per pixel, the reverse-Z
+    /// device depth past which its ray starts; 0 leaves the pixel unmarked.
+    pub mask: TextureIndex,
+    /// m.
+    pub aperture_radius: f32,
+    /// The focus distance in m along the view axis, read on the GPU by the dispatch.
+    pub focus_distance: GpuPtr<f32>,
 }
 
 /// A kernel with a raygen and a compute entry over one body, as one of them.
@@ -718,7 +798,8 @@ impl LightingKernels {
     /// orders nothing after it. The scene's first view in a frame traces one update path per
     /// `update_block`^2 pixels, its later views one per four times as many. The reference
     /// traces none, never reads the cache, builds no local samplers and adds nothing to the
-    /// scene's light feedback.
+    /// scene's light feedback. With [`ViewPass::dof_background`] the dispatch also writes the
+    /// view's background layer, made at the first such call; without it the layer is freed.
     pub fn record_opaque(
         &self,
         list: &mut CommandList<'_>,
@@ -726,7 +807,7 @@ impl LightingKernels {
         view: &mut LightingView,
         pass: &ViewPass,
         lighting: &ViewLighting,
-    ) {
+    ) -> Result<(), Error> {
         let (roulette_depth, lens) = match lighting.reference {
             Some(r) => (REFERENCE_ROULETTE_DEPTH, r.lens),
             None => (ROULETTE_DEPTH, None),
@@ -779,6 +860,31 @@ impl LightingKernels {
                 Hazards::empty(),
             );
         }
+        if pass.dof_background.is_none() {
+            view.dof = None;
+        } else if view.dof.is_none() {
+            let layer = DofLayer::new(&view.device, view.extent)?;
+            list.discard(&layer.target.texture);
+            view.dof = Some(layer);
+        }
+        let (dof_background, dof_mask, dof_focus, dof_aperture) =
+            match (pass.dof_background, view.dof.as_mut()) {
+                (Some(d), Some(layer)) => {
+                    layer.frame = pass.frame;
+                    (
+                        layer.target.store,
+                        d.mask,
+                        d.focus_distance,
+                        d.aperture_radius,
+                    )
+                }
+                _ => (
+                    StorageImageIndex::NONE,
+                    TextureIndex::NONE,
+                    GpuPtr::NULL,
+                    0.0,
+                ),
+            };
         let path_root = PathRoot {
             scene: pass.scene,
             view: pass.view,
@@ -820,6 +926,13 @@ impl LightingKernels {
                 SubsurfaceDepth::PrimaryOnly => SSS_PRIMARY_ONLY,
             },
             pixel_fraction: lighting.pixel_fraction.clamp(MIN_PIXEL_FRACTION, 1.0),
+            dof_background,
+            dof_mask,
+            dof_focus,
+            dof_aperture,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         let root = view.roots.write(slot, path_root);
         view.path = Some((pass.frame, path_root));
@@ -830,6 +943,7 @@ impl LightingKernels {
                     mode: 0,
                     local: GpuPtr::NULL,
                     light_flags: 0,
+                    dof_background: StorageImageIndex::NONE,
                     ..path_root
                 },
             );
@@ -841,6 +955,7 @@ impl LightingKernels {
         list.begin_pass("opaque paths", false);
         self.opaque.record(list, root, view.extent);
         list.end_pass();
+        Ok(())
     }
 
     /// Records the dielectric dispatch of `pass` after [`Self::record_opaque`] of the same
@@ -877,6 +992,7 @@ impl LightingKernels {
             slot,
             PathRoot {
                 light_flags: 0,
+                dof_background: StorageImageIndex::NONE,
                 layers: view.layers.gpu(),
                 froxels,
                 dielectric_depth: lighting.dielectric_depth,
