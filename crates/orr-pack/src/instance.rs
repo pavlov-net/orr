@@ -10,7 +10,8 @@
 //!
 //! A record decodes to a transform relative to the page cell (edge `2^cell_log2` m):
 //! translation `origin + pos * (extent / 65535)`, rotation from `rot`, and per-axis scale
-//! `2^(lerp(log2_scale_min, log2_scale_max, code / 1023))` applied before the rotation.
+//! `2^(lerp(log2_scale_min, log2_scale_max, code / 1023))` applied before the rotation, its x
+//! negated on a mirrored record ([`InstanceRecord::MIRROR`]).
 //! [`decode`] is the reference both for the GPU decode and for consumers' CPU queries.
 
 use bytemuck::{Pod, Zeroable};
@@ -88,15 +89,22 @@ pub struct InstanceRecord {
     pub prototype: u16,
     /// [`encode_rotation`] code, or with [`Self::EXACT_AXIS`] an [`axis_rotation`] index.
     pub rot: u32,
-    /// Bits 0-9, 10-19 and 20-29: x, y and z scale codes; bit 30 [`Self::EXACT_AXIS`].
+    /// Bits 0-9, 10-19 and 20-29: x, y and z scale codes; bit 30 [`Self::EXACT_AXIS`], bit
+    /// 31 [`Self::MIRROR`].
     pub scale: u32,
 }
 
 impl InstanceRecord {
     pub const EXACT_AXIS: u32 = 1 << 30;
+    /// The x scale is negated: the copy is mirrored.
+    pub const MIRROR: u32 = 1 << 31;
 
     pub fn exact_axis(&self) -> bool {
         self.scale & Self::EXACT_AXIS != 0
+    }
+
+    pub fn mirror(&self) -> bool {
+        self.scale & Self::MIRROR != 0
     }
 
     pub fn scale_codes(&self) -> [u32; 3] {
@@ -190,10 +198,14 @@ pub fn decode<'a>(
     ))
 }
 
-/// Cell-relative transform of one record: rows `[R * diag(scale) | translation]`.
+/// Cell-relative transform of one record: rows `[R * diag(scale) | translation]`, the x
+/// scale negative on a mirrored record.
 pub fn decode_record(h: &InstancePageHeader, r: &InstanceRecord) -> Affine3 {
     let t = decode_position(h, r.pos);
-    let s = r.scale_codes().map(|c| decode_scale(h, c));
+    let mut s = r.scale_codes().map(|c| decode_scale(h, c));
+    if r.mirror() {
+        s[0] = -s[0];
+    }
     let m = instance_rotation(r.rot, r.exact_axis());
     Affine3 {
         rows: [0, 1, 2].map(|i| [m[i][0] * s[0], m[i][1] * s[1], m[i][2] * s[2], t[i]]),

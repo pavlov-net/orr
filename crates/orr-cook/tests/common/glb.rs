@@ -125,20 +125,35 @@ impl Glb {
         self.view(bytes, None)
     }
 
-    /// Writes the GLB; `rest` is the document's other top-level members, without braces.
-    pub(crate) fn write(mut self, path: &Path, rest: &str) {
-        let mut buffers = format!(r#"{{"byteLength":{}}}"#, self.bin.len());
+    /// Writes a `.gltf` at `path` with its binary beside it as a `.bin` file; `rest` is as
+    /// for [`Self::write`].
+    #[allow(dead_code)]
+    pub(crate) fn write_split(self, path: &Path, rest: &str) {
+        let bin = path.with_extension("bin");
+        let uri = bin.file_name().unwrap().to_str().unwrap().to_string();
+        let json = self.json(rest, &format!(r#","uri":"{uri}""#));
+        std::fs::write(&bin, &self.bin).unwrap();
+        std::fs::write(path, json).unwrap();
+    }
+
+    fn json(&self, rest: &str, uri: &str) -> String {
+        let mut buffers = format!(r#"{{"byteLength":{}{uri}}}"#, self.bin.len());
         if self.fallback > 0 {
             buffers += &format!(
                 r#",{{"byteLength":{},"extensions":{{"EXT_meshopt_compression":{{"fallback":true}}}}}}"#,
                 self.fallback
             );
         }
-        let json = format!(
+        format!(
             r#"{{"asset":{{"version":"2.0"}},{rest},"buffers":[{buffers}],"bufferViews":[{}],"accessors":[{}]}}"#,
             self.views.join(","),
             self.accessors.join(",")
-        );
+        )
+    }
+
+    /// Writes the GLB; `rest` is the document's other top-level members, without braces.
+    pub(crate) fn write(mut self, path: &Path, rest: &str) {
+        let json = self.json(rest, "");
         let mut json = json.into_bytes();
         json.resize(json.len().next_multiple_of(4), b' ');
         self.bin.resize(self.bin.len().next_multiple_of(4), 0);

@@ -90,6 +90,14 @@ fn reopen(f: &File) -> io::Result<File> {
     f.try_clone()
 }
 
+/// Fills `buf` from `offset` like [`read_at`]; a file that ends first is `UnexpectedEof`.
+pub fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    if read_at(file, offset, buf)? < buf.len() {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(())
+}
+
 /// Reads at `offset` into `buf` without moving a shared cursor, so many threads can read
 /// one `File`. Returns the bytes read; fewer than `buf.len()` only at the end of the file.
 pub fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {

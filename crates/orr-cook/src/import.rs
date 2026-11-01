@@ -2,13 +2,13 @@
 //! materials and images they use, skeletons with their clips, instanced models and their
 //! placements, and the files it read.
 
-use orr_math::Mat4;
+use orr_math::{DMat3, DQuat, DVec3, Mat3, Mat4, Quat, Vec3};
 use orr_pack::clip::Clip;
 use orr_pack::material::Material;
 use orr_pack::skeleton::SkeletonInfo;
 use serde::Deserialize;
 
-use crate::mesh::{MeshData, MeshSettings};
+use crate::mesh::{MeshSettings, MeshSource};
 use crate::state::Input;
 use crate::subd::{CageData, SubdSettings};
 use crate::texture::material::{ImageFile, MaterialTextures};
@@ -43,10 +43,19 @@ pub(crate) struct Scene {
     pub materials: Vec<SceneMaterial>,
     pub images: Vec<ImageFile>,
     pub skeletons: Vec<SceneSkeleton>,
-    /// Per instanced model: its name and its instances' scene-space transforms.
-    pub instances: Vec<(String, Vec<Mat4>)>,
+    /// Per instanced model: its name and its instances' scene-space placements.
+    pub instances: Vec<(String, Vec<Placed>)>,
     /// Every file read.
     pub files: Vec<Input>,
+}
+
+/// One placement: position, rotation and per-axis scale, applied before the rotation; a
+/// negative scale component mirrors.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct Placed {
+    pub position: DVec3,
+    pub rotation: Quat,
+    pub scale: Vec3,
 }
 
 pub(crate) struct SceneSkeleton {
@@ -62,7 +71,7 @@ pub(crate) struct SceneModel {
     /// The selected node's name; `None` for the whole scene.
     pub node: Option<String>,
     /// A mesh without sections cooks no mesh entry.
-    pub mesh: MeshData,
+    pub mesh: MeshSource,
     pub subd: Option<SceneSubd>,
     /// Index into [`Scene::skeletons`] of a skinned mesh.
     pub skeleton: Option<usize>,
@@ -85,4 +94,49 @@ pub(crate) struct SceneMaterial {
     pub suffix: String,
     pub material: Material,
     pub textures: MaterialTextures,
+}
+
+/// Largest shear a placement drops: the largest entry of `linear - R diag(s)` over the
+/// largest entry of `linear`. It is below the instance record's own rotation error.
+pub const SHEAR_MAX: f64 = 1e-3;
+
+/// What a scene-space transform places.
+pub(crate) enum Decomposed {
+    Placed(Placed),
+    /// The transform collapses an axis: nothing shows.
+    Nothing,
+    /// The transform shears further than [`SHEAR_MAX`].
+    Sheared,
+}
+
+fn largest(m: DMat3) -> f64 {
+    m.to_cols_array()
+        .into_iter()
+        .fold(0.0, |a, x| a.max(x.abs()))
+}
+
+/// The placement of a scene-space transform.
+pub(crate) fn placement(m: Mat4) -> Decomposed {
+    let l = Mat3::from_mat4(m).as_dmat3();
+    let mut s = DVec3::new(l.x_axis.length(), l.y_axis.length(), l.z_axis.length());
+    let largest_entry = largest(l);
+    if s.min_element() <= largest_entry * 1e-9 {
+        return Decomposed::Nothing;
+    }
+    if l.determinant() < 0.0 {
+        s.x = -s.x;
+    }
+    // The rotation nearest `l diag(1 / s)`, by polar iteration.
+    let mut r = l * DMat3::from_diagonal(s.recip());
+    for _ in 0..16 {
+        r = (r + r.inverse().transpose()) * 0.5;
+    }
+    if largest(l - r * DMat3::from_diagonal(s)) > SHEAR_MAX * largest_entry {
+        return Decomposed::Sheared;
+    }
+    Decomposed::Placed(Placed {
+        position: m.w_axis.truncate().as_dvec3(),
+        rotation: DQuat::from_mat3(&r).normalize().as_quat(),
+        scale: s.as_vec3(),
+    })
 }

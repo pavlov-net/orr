@@ -21,12 +21,13 @@
 use std::collections::HashMap;
 
 use glam::{Mat3, Mat4, Quat, Vec3};
-use gltf::animation::util::ReadOutputs;
 use orr_pack::Affine3;
 use orr_pack::AssetId;
 use orr_pack::clip::{Clip, ClipHeader};
 use orr_pack::skeleton::{MAX_JOINTS, NO_PARENT, SkeletonInfo, Trs, slerp};
 use serde::Deserialize;
+
+use crate::gltf::data::Data;
 
 /// The default scene's node tree: parent and world transform of each glTF node in it.
 pub(crate) struct Graph {
@@ -79,25 +80,29 @@ pub(crate) struct Skeleton {
 impl Skeleton {
     /// The skeleton of `skins` (glTF skin indices), or `None` without skins.
     pub(crate) fn build(
-        doc: &gltf::Document,
-        buffers: &[Vec<u8>],
+        data: &Data<'_>,
         graph: &Graph,
         skins: &[usize],
     ) -> Result<Option<Self>, String> {
         if skins.is_empty() {
             return Ok(None);
         }
+        let doc = &data.doc.doc;
         let mut wanted = vec![false; graph.parent.len()];
         let mut bind: HashMap<usize, Mat4> = HashMap::new();
         for &s in skins {
             let skin = doc.skins().nth(s).expect("skin index");
-            let mats: Vec<Mat4> = skin
-                .reader(|b| buffers.get(b.index()).map(Vec::as_slice))
-                .read_inverse_bind_matrices()
-                .map_or_else(
-                    || vec![Mat4::IDENTITY; skin.joints().len()],
-                    |it| it.map(|m| Mat4::from_cols_array_2d(&m)).collect(),
-                );
+            let mats: Vec<Mat4> = match skin.inverse_bind_matrices() {
+                Some(a) => data
+                    .floats(&a, 16)
+                    .map_err(|m| format!("skin {s}: {m}"))?
+                    .as_chunks::<16>()
+                    .0
+                    .iter()
+                    .map(Mat4::from_cols_array)
+                    .collect(),
+                None => vec![Mat4::IDENTITY; skin.joints().len()],
+            };
             if mats.len() != skin.joints().len() {
                 return Err(format!(
                     "skin {s}: {} inverse bind matrices for {} joints",
@@ -212,36 +217,34 @@ impl Skeleton {
     /// Clips of every animation that moves the skeleton, with their names.
     pub(crate) fn clips(
         &self,
-        doc: &gltf::Document,
-        buffers: &[Vec<u8>],
+        data: &Data<'_>,
         settings: &ClipSettings,
     ) -> Result<Vec<(String, Clip)>, String> {
         settings.check()?;
         let mut clips = Vec::new();
-        for anim in doc.animations() {
+        for anim in data.doc.doc.animations() {
             let what = || format!("animation {}", anim.index());
             let mut channels = Vec::new();
             for ch in anim.channels() {
                 let Some(&joint) = self.joint_of.get(&ch.target().node().index()) else {
                     continue;
                 };
-                let r = ch.reader(|b| buffers.get(b.index()).map(Vec::as_slice));
-                let times: Vec<f32> = r
-                    .read_inputs()
-                    .ok_or_else(|| format!("{}: channel without input", what()))?
-                    .collect();
-                let values: Vec<[f32; 4]> = match r.read_outputs() {
-                    Some(ReadOutputs::Translations(v) | ReadOutputs::Scales(v)) => {
-                        v.map(|[x, y, z]| [x, y, z, 0.0]).collect()
-                    }
-                    Some(ReadOutputs::Rotations(v)) => v.into_f32().collect(),
-                    Some(ReadOutputs::MorphTargetWeights(_)) => continue,
-                    None => return Err(format!("{}: channel without output", what())),
-                };
                 use gltf::animation::{Interpolation as I, Property as P};
+                let property = ch.target().property();
+                if property == P::MorphTargetWeights {
+                    continue;
+                }
+                let fail = |m: String| format!("{}: {m}", what());
+                let times = data.floats(&ch.sampler().input(), 1).map_err(fail)?;
+                let values: Vec<[f32; 4]> = data
+                    .floats(&ch.sampler().output(), 4)
+                    .map_err(fail)?
+                    .as_chunks::<4>()
+                    .0
+                    .to_vec();
                 let ch = Channel {
                     joint: usize::from(joint),
-                    property: match ch.target().property() {
+                    property: match property {
                         P::Translation => Property::Translation,
                         P::Rotation => Property::Rotation,
                         P::Scale => Property::Scale,

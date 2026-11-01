@@ -97,7 +97,8 @@ impl MaterialGpu {
         };
         let thin = m.thin_walled != 0;
         let dielectric = m.transmission_weight > 0.0;
-        let presence = m.alpha_mode == Material::BLEND && m.geometry_opacity < 1.0;
+        let presence =
+            m.alpha_mode == Material::BLEND && (m.geometry_opacity < 1.0 || bound(slot::OPACITY));
         let subsurface = m.subsurface_weight > 0.0 && !thin && !dielectric;
         let lobes = m.coat_weight > 0.0
             || m.fuzz_weight > 0.0

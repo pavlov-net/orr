@@ -38,12 +38,12 @@ const GOLDEN: &[(u16, u32, &str)] = &[
     ),
     (
         Class::Texture as u16,
-        3,
+        4,
         "43735be6c283598fbb5f7a16384b3f7ac1ad607f834e3de5494294703863242e",
     ),
     (
         Class::InstancePage as u16,
-        2,
+        3,
         "a251a6855f4d9ece691a2b1e0c5b8324970d386350f71a6fdd03c7087c72e194",
     ),
     (

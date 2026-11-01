@@ -9,6 +9,11 @@
 //!   with node transforms applied, or with skins in bind space with joints and weights,
 //! - with [`GltfSettings::models`], instead of those two, `N/<node>` and `N/<node>/mesh` per
 //!   selected node, in the node's space,
+//! - with [`GltfLayout::Meshes`], instead of all three, `N/mesh/<i>` and `N/mesh/<i>/mesh`
+//!   per glTF mesh the scene places, in the mesh's space, placed by instance pages
+//!   `N/instances/...`,
+//! - `N/<model>/baked/<k>` and its mesh for the copies of a model whose transform shears
+//!   ([`SHEAR_MAX`]), with the transform applied,
 //! - `N/skeleton`, with skins: their joints and the joints' ancestors,
 //! - `N/clip/<animation>`: each animation that moves the skeleton, resampled at
 //!   [`ClipSettings`]; an animation without a unique name that is not all digits is
@@ -97,7 +102,8 @@ use orr_pack::{BlobIn, Target};
 use serde::Deserialize;
 
 pub use assembly::AssemblySettings;
-pub use import::{NodeSelect, PartAttribute};
+pub use gltf::GltfLayout;
+pub use import::{NodeSelect, PartAttribute, SHEAR_MAX};
 pub use instances::{Instances, Placement, PrototypeSpec, SectionSpec};
 pub use mesh::{LodMode, MeshInput, MeshParts, MeshSettings, OmmSettings, StaticDisplacement};
 pub use patch::{MaterialPatch, MeshPatch};
@@ -112,7 +118,7 @@ pub use report::{
 };
 pub use skin::ClipSettings;
 pub use subd::{Boundary, CageInput, Corner, Crease, FaceVarying, SubdSettings, UvLinear};
-pub use texture::material::{TextureOverride, TextureRules};
+pub use texture::material::{InputChannels, TextureOverride, TextureRules};
 pub use texture::neural::NeuralSettings;
 pub use texture::{DataFormat, MipFilter, Primaries, Quality, TextureSettings, Usage, Wrap};
 pub use usd::{Subdivision, UsdSettings, VariantSelection};
@@ -241,6 +247,7 @@ pub enum Source {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GltfSettings {
+    pub layout: GltfLayout,
     /// Nodes that become models; empty makes the whole scene one model.
     pub models: Vec<NodeSelect>,
     pub mesh: MeshSettings,

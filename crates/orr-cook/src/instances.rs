@@ -37,7 +37,8 @@ pub struct Placement {
     /// World position, metres.
     pub position: DVec3,
     pub rotation: Quat,
-    /// Per-axis scale, applied before the rotation; every component above zero.
+    /// Per-axis scale, applied before the rotation; no component zero. An odd number of
+    /// negative components mirrors the copy.
     pub scale: Vec3,
     /// Index into [`Instances::prototypes`].
     pub prototype: u16,
@@ -257,10 +258,10 @@ fn check_records(name: &str, src: &Instances) -> Result<()> {
         if !p.position.is_finite() {
             return Err(fail(name, format!("placement {i} position is not finite")));
         }
-        if !(p.scale.is_finite() && p.scale.min_element() > 0.0) {
+        if !(p.scale.is_finite() && p.scale.abs().min_element() > 0.0) {
             return Err(fail(
                 name,
-                format!("placement {i} scale {} is not positive", p.scale),
+                format!("placement {i} scale {} is zero on an axis", p.scale),
             ));
         }
         if !(p.rotation.is_finite() && p.rotation.length_squared() > 1e-12) {
@@ -402,19 +403,26 @@ fn build_page(
             .unwrap_or(0);
         joined_positions(name, &mut header, f64::from(k).exp2(), rel, members)?
     } else {
-        set_scale_range(&mut header, members.iter().map(|&i| src.records[i].scale));
+        set_scale_range(
+            &mut header,
+            members.iter().map(|&i| src.records[i].scale.abs()),
+        );
         quantise_positions(&mut header, rel, members)
     };
 
     let mut records = Vec::with_capacity(members.len());
     for (n, &i) in members.iter().enumerate() {
         let p = &src.records[i];
-        let q = p.rotation.normalize().to_array();
+        let (rotation, mirror) = proper_rotation(p.rotation, p.scale);
+        let q = rotation.to_array();
         let exact = instance::exact_axis_index(q);
         let (rot, mut scale) = match exact {
             Some(index) => (index, InstanceRecord::EXACT_AXIS),
             None => (instance::encode_rotation(q), 0),
         };
+        if mirror {
+            scale |= InstanceRecord::MIRROR;
+        }
         if src.joined {
             if exact.is_none() {
                 return Err(fail(
@@ -429,7 +437,7 @@ fn build_page(
                 ));
             }
         } else {
-            for (a, s) in p.scale.to_array().into_iter().enumerate() {
+            for (a, s) in p.scale.abs().to_array().into_iter().enumerate() {
                 scale |= scale_code(&header, s) << (10 * a);
             }
         }
@@ -542,6 +550,26 @@ fn nearest_code(guess: f64, max: u32, err: impl Fn(u32) -> f64) -> u32 {
     (g.saturating_sub(1)..=(g + 1).min(max))
         .min_by(|&a, &b| err(a).total_cmp(&err(b)))
         .unwrap_or(g)
+}
+
+/// The rotation `R'` and mirror flag for which `R' diag(+-|s|)`, x negated with the flag,
+/// equals `rotation diag(scale)`.
+fn proper_rotation(rotation: Quat, scale: Vec3) -> (Quat, bool) {
+    let sign = scale.signum();
+    let mirror = sign.x * sign.y * sign.z < 0.0;
+    // diag(sign) = diag(d) diag(-1, 1, 1)^mirror, diag(d) a rotation (det +1).
+    let d = if mirror {
+        sign * Vec3::new(-1.0, 1.0, 1.0)
+    } else {
+        sign
+    };
+    let turn = match d.to_array() {
+        [1.0, 1.0, 1.0] => Quat::IDENTITY,
+        [1.0, _, _] => Quat::from_xyzw(1.0, 0.0, 0.0, 0.0),
+        [_, 1.0, _] => Quat::from_xyzw(0.0, 1.0, 0.0, 0.0),
+        _ => Quat::from_xyzw(0.0, 0.0, 1.0, 0.0),
+    };
+    ((rotation.normalize() * turn).normalize(), mirror)
 }
 
 fn set_scale_range(h: &mut InstancePageHeader, scales: impl Iterator<Item = Vec3>) {

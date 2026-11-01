@@ -15,7 +15,7 @@ use roxmltree::{Document, Node as XmlNode};
 use crate::import::{Scene, SceneMaterial};
 use crate::shading::{self, Input, Network, Node};
 use crate::state::{Input as FileInput, Memo};
-use crate::texture::material::ImageFile;
+use crate::texture::material::{ImageData, ImageFile};
 use crate::{Error, Result};
 
 /// Elements that are not nodes.
@@ -42,7 +42,7 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
         message: format!("{}: {message}", path.display()),
     };
     let (bytes, hash) = memo.read(path)?;
-    let mut files = vec![FileInput {
+    let files = vec![FileInput {
         path: path.to_owned(),
         hash,
     }];
@@ -56,14 +56,12 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
         if let Some(&i) = by_path.get(&p) {
             return Ok(i);
         }
-        let (bytes, hash) = memo.read(&p)?;
-        files.push(FileInput {
-            path: p.clone(),
-            hash,
-        });
         images.push(ImageFile {
             name: file.to_string(),
-            bytes,
+            data: ImageData::File {
+                path: p.clone(),
+                read: None,
+            },
         });
         by_path.insert(p, images.len() - 1);
         Ok(images.len() - 1)

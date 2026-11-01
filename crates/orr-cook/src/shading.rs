@@ -124,6 +124,7 @@ struct Tex {
 impl Tex {
     fn tex_ref(&self) -> TexRef {
         TexRef {
+            rg_channel: None,
             image: self.image,
             channel: self.channel() as u8,
             uv_set: self.uv_set,

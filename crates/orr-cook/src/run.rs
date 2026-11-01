@@ -26,13 +26,13 @@ use orr_pack::{
 
 use crate::assembly::{self, Assembly};
 use crate::cache::Cache;
-use crate::import::Scene;
+use crate::import::{Placed, Scene};
 use crate::instances::{self, Catalog, ModelFacts};
 use crate::key::{self, Key, ZSTD_LEVEL};
 use crate::mesh::maps::{Displacement, Opacity, Raster};
 use crate::mesh::{
-    self, DisplacementSpec, MapSpec, MeshData, MeshInput, NormalSpec, OpacitySpec, PartData,
-    Pivots, SectionData, SectionMaps,
+    self, DisplacementSpec, MapSpec, MeshData, MeshInput, MeshSource, NormalSpec, OpacitySpec,
+    PartData, Pivots, SectionData, SectionMaps,
 };
 use crate::raster::{self, RasterReport};
 use crate::report::{
@@ -41,7 +41,8 @@ use crate::report::{
 use crate::state::{self, Input, Memo, Record};
 use crate::subd::{self, CageData, CageInput, SubdSettings};
 use crate::texture::material::{
-    ImageFacts, ImageFile, MaterialTextures, Packer, TexRef, TextureJob, TextureRules, image_facts,
+    ImageData, ImageFacts, ImageFile, MaterialTextures, Packer, TexRef, TextureJob, TextureRules,
+    image_facts,
 };
 use crate::texture::neural::{self, NeuralJob};
 use crate::texture::{self, ENCODERS, Wrap};
@@ -116,7 +117,7 @@ enum Work<'m> {
     },
     /// The mesh, its settings and its sections' cooked maps, read from the texture units
     /// it waits for when it starts.
-    Mesh(Arc<MeshData>, MeshSettings, Vec<SectionMaps>),
+    Mesh(MeshSource, MeshSettings, Vec<SectionMaps>),
     Texture(TextureJob, Arc<Vec<ImageFile>>),
     Neural(NeuralJob, Arc<Vec<ImageFile>>),
     TextureFile(PathBuf, Hash32, TextureSettings),
@@ -216,8 +217,9 @@ impl<'m> NewUnit<'m> {
 struct Imported {
     files: Vec<Input>,
     units: Vec<NewUnit<'static>>,
-    /// Placements of the instanced models, cooked as instance unit `<asset>/instances`.
-    instances: Option<Instances>,
+    /// Placements of the instanced models, cooked as instance units `<asset>/instances`,
+    /// then `<asset>/instances/<k>` for each further 65536 models.
+    instances: Vec<Instances>,
     assemblies: Vec<Assembly>,
 }
 
@@ -815,11 +817,15 @@ impl<'m, 's> Run<'m, 's> {
             units: keys,
             assemblies: imported.assemblies,
         });
-        if let Some(src) = imported.instances {
+        for (k, src) in imported.instances.into_iter().enumerate() {
+            let base = format!("{}/instances", self.assets[asset].name);
             self.instances.push(PendingInstances {
                 archive: a,
                 asset,
-                name: format!("{}/instances", self.assets[asset].name),
+                name: match k {
+                    0 => base,
+                    k => format!("{base}/{k}"),
+                },
                 src: Cow::Owned(src),
                 record: Some((a, self.records[a].len() - 1)),
             });
@@ -975,7 +981,7 @@ impl<'m, 's> Run<'m, 's> {
             }
             if let Some(Work::Mesh(data, ..)) = &self.units[u].work {
                 let a = self.units[u].archive;
-                for unit in data.sections.iter().flat_map(|s| s.maps.units()) {
+                for unit in data.sections().iter().flat_map(|s| s.maps.units()) {
                     self.map_users[self.by_name[&(a, unit.to_owned())]] += 1;
                 }
             }
@@ -1105,7 +1111,7 @@ impl<'m, 's> Run<'m, 's> {
     }
 
     /// The cooked maps a mesh unit's sections read, from the texture units it waited for.
-    fn section_maps(&mut self, u: usize, mesh: &MeshData) -> Result<Vec<SectionMaps>> {
+    fn section_maps(&mut self, u: usize, sections: &[SectionData]) -> Result<Vec<SectionMaps>> {
         let a = self.units[u].archive;
         let mut users = Vec::new();
         let mut read = |unit: &str, all: bool, wrap, channels| -> Result<Vec<Raster>> {
@@ -1120,8 +1126,8 @@ impl<'m, 's> Run<'m, 's> {
                 texture_mips(arc, AssetId::from_name(unit), all, wrap, channels)
             })?
         };
-        let mut out = Vec::with_capacity(mesh.sections.len());
-        for s in &mesh.sections {
+        let mut out = Vec::with_capacity(sections.len());
+        for s in sections {
             let opacity = match &s.maps.opacity {
                 OpacitySpec::None => None,
                 OpacitySpec::Constant(pass) => Some(Opacity::Constant(*pass)),
@@ -1183,7 +1189,7 @@ impl<'m, 's> Run<'m, 's> {
             }
         }
         if let Work::Mesh(data, _, maps) = &mut work {
-            match self.section_maps(u, data) {
+            match self.section_maps(u, data.sections()) {
                 Ok(m) => *maps = m,
                 Err(e) => {
                     let _ = tx.send(Msg::Unit(u, Ok(Err(e))));
@@ -1496,7 +1502,7 @@ fn import(name: &str, path: &Path, kind: ImportKind<'_>, memo: &Memo) -> Result<
             textures,
         ),
     };
-    plan_scene(name, scene, rules)
+    plan_scene(name, scene, rules, memo)
 }
 
 /// The entry name of material `suffix` of asset `name`.
@@ -1510,7 +1516,7 @@ fn material_name(name: &str, suffix: &str) -> String {
 
 /// Plans an imported scene's units: the skeletons and clips, the packed textures, the
 /// materials, and a mesh and a model per model.
-fn plan_scene(name: &str, mut src: Scene, rules: &TextureRules) -> Result<Imported> {
+fn plan_scene(name: &str, mut src: Scene, rules: &TextureRules, memo: &Memo) -> Result<Imported> {
     let mut units = Vec::new();
     let mut skeletons = Vec::with_capacity(src.skeletons.len());
     for sk in std::mem::take(&mut src.skeletons) {
@@ -1557,7 +1563,19 @@ fn plan_scene(name: &str, mut src: Scene, rules: &TextureRules) -> Result<Import
         .collect();
     used.sort_unstable();
     used.dedup();
-    let facts: HashMap<usize, ImageFacts> = image_facts(name, &src.images, &used)?;
+    let facts: HashMap<usize, ImageFacts> = image_facts(name, &mut src.images, &used, memo)?;
+    for i in &used {
+        if let ImageData::File {
+            path,
+            read: Some((hash, _)),
+        } = &src.images[*i].data
+        {
+            src.files.push(Input {
+                path: path.clone(),
+                hash: *hash,
+            });
+        }
+    }
     let mut packer = Packer::new(name, &src.images, &facts, rules);
     // Per material: its id, key and cooked parameters.
     let mut materials = Vec::new();
@@ -1588,7 +1606,7 @@ fn plan_scene(name: &str, mut src: Scene, rules: &TextureRules) -> Result<Import
         let mut mesh = model.mesh;
         let mut deps = Vec::new();
         let mut model_materials = Vec::with_capacity(model.materials.len());
-        for (sec, &mi) in mesh.sections.iter_mut().zip(&model.materials) {
+        for (sec, &mi) in mesh.sections_mut().iter_mut().zip(&model.materials) {
             let t = &src.materials[mi].textures;
             sec.maps = map_spec(&materials[mi].2, t, &textures);
             deps.extend(sec.maps.units().map(str::to_string));
@@ -1609,7 +1627,7 @@ fn plan_scene(name: &str, mut src: Scene, rules: &TextureRules) -> Result<Import
         let skeleton = model
             .skeleton
             .map_or((AssetId::NONE, None), |s| skeletons[s]);
-        let mesh = (!mesh.sections.is_empty()).then(|| MeshPart {
+        let mesh = (!mesh.sections().is_empty()).then(|| MeshPart {
             name: format!("{model_name}/mesh"),
             mesh,
             settings: model.settings,
@@ -1632,9 +1650,7 @@ fn plan_scene(name: &str, mut src: Scene, rules: &TextureRules) -> Result<Import
         units.extend(model);
         assemblies.extend(assembly);
     }
-    let instances = (!src.instances.is_empty())
-        .then(|| scene_instances(name, &src.instances))
-        .transpose()?;
+    let instances = scene_instances(name, &src.instances);
     let images = Arc::new(src.images);
     for job in jobs {
         let (name, key, working_set) = (job.name.clone(), job.key, job.working_set(&images));
@@ -1656,36 +1672,28 @@ fn plan_scene(name: &str, mut src: Scene, rules: &TextureRules) -> Result<Import
     })
 }
 
-/// The instance source of a scene's instanced models: one prototype per model, a placement
-/// per instance.
-fn scene_instances(name: &str, models: &[(String, Vec<glam::Mat4>)]) -> Result<Instances> {
-    let mut src = Instances::default();
-    for (p, (node, transforms)) in models.iter().enumerate() {
-        src.prototypes.push(PrototypeSpec {
-            model: format!("{name}/{node}"),
-            ..PrototypeSpec::default()
-        });
-        for (i, m) in transforms.iter().enumerate() {
-            let (scale, rotation, translation) = m.to_scale_rotation_translation();
-            let back = glam::Mat4::from_scale_rotation_translation(scale, rotation, translation);
-            let tolerance = 1e-4 * m.abs().to_cols_array().into_iter().fold(1.0, f32::max);
-            if !back.abs_diff_eq(*m, tolerance) {
-                return Err(Error::Import {
-                    asset: name.into(),
-                    message: format!(
-                        "{node}: instance {i} has a shear, which a placement cannot hold"
-                    ),
+/// The instance sources of a scene's instanced models: one prototype per model, a placement
+/// per instance, and a source per 65536 models, the most a source's prototype index names.
+fn scene_instances(name: &str, models: &[(String, Vec<Placed>)]) -> Vec<Instances> {
+    models
+        .chunks(1 << 16)
+        .map(|chunk| {
+            let mut src = Instances::default();
+            for (p, (model, placed)) in chunk.iter().enumerate() {
+                src.prototypes.push(PrototypeSpec {
+                    model: format!("{name}/{model}"),
+                    ..PrototypeSpec::default()
                 });
+                src.records.extend(placed.iter().map(|q| Placement {
+                    position: q.position,
+                    rotation: q.rotation,
+                    scale: q.scale,
+                    prototype: p as u16,
+                }));
             }
-            src.records.push(Placement {
-                position: translation.as_dvec3(),
-                rotation,
-                scale,
-                prototype: p as u16,
-            });
-        }
-    }
-    Ok(src)
+            src
+        })
+        .collect()
 }
 
 /// Whether a section with `maps` bakes its displacement into the geometry.
@@ -1842,7 +1850,7 @@ fn mesh_units(
     };
     let part = MeshPart {
         name: mesh_name,
-        mesh,
+        mesh: MeshSource::Data(Box::new(mesh)),
         settings: settings.clone(),
         deps,
     };
@@ -1860,7 +1868,7 @@ fn mesh_units(
 /// A mesh to cook for a model: its entry name, data, settings and the units its maps read.
 struct MeshPart {
     name: String,
-    mesh: MeshData,
+    mesh: MeshSource,
     settings: MeshSettings,
     deps: Vec<String>,
 }
@@ -1889,7 +1897,8 @@ fn model_units(
     let mut found = None;
     if let Some(part) = &mut mesh
         && let Some(settings) = &part.settings.assemblies
-        && let Some(split) = assembly::split(&part.mesh, settings, part.settings.position_step_log2)
+        && let MeshSource::Data(data) = &part.mesh
+        && let Some(split) = assembly::split(data, settings, part.settings.position_step_log2)
     {
         let source_triangles = part.mesh.triangles();
         let mut list = Vec::with_capacity(split.units.len());
@@ -1914,7 +1923,7 @@ fn model_units(
             deps.dedup();
             let unit_mesh = MeshPart {
                 name: format!("{name}/mesh"),
-                mesh,
+                mesh: MeshSource::Data(Box::new(mesh)),
                 settings: part.settings.clone(),
                 deps,
             };
@@ -1926,7 +1935,7 @@ fn model_units(
                 (AssetId::NONE, None),
             ));
         }
-        part.mesh = split.remainder;
+        part.mesh = MeshSource::Data(Box::new(split.remainder));
         found = Some(Assembly {
             model: model_name.clone(),
             units: list,
@@ -1963,7 +1972,7 @@ fn geometry_units(
             key,
             working_set: triangles * MESH_BYTES_PER_TRIANGLE,
             triangles,
-            work: Work::Mesh(Arc::new(m.mesh), m.settings, Vec::new()),
+            work: Work::Mesh(m.mesh, m.settings, Vec::new()),
             deps: m.deps,
         });
     }
@@ -2119,7 +2128,8 @@ fn cook_unit(
                 .collect();
             w.add(name, class, schema, key, &blobs)?;
         }
-        Work::Mesh(data, settings, maps) => {
+        Work::Mesh(source, settings, maps) => {
+            let data = source.load(name, &shared.memo)?;
             let cooked = mesh::cook(name, &data, &settings, &maps)?;
             drop((data, maps));
             detail.warnings = cooked.warnings;

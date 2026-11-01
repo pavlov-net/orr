@@ -474,10 +474,7 @@ fn write_error(scratch: &Scratch, source: io::Error) -> Error {
 }
 
 fn read_exact_at(f: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
-    if orr_io::read_at(f, offset, buf)? < buf.len() {
-        return Err(io::ErrorKind::UnexpectedEof.into());
-    }
-    Ok(())
+    orr_io::read_exact_at(f, offset, buf)
 }
 
 /// A pattern over relative tile paths: `/`-separated components with `{lod}`, `{x}` and

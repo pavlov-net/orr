@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use glb::{Glb, I8, U16};
 use orr_cook::{
-    ArchiveSpec, AssetSpec, GltfSettings, LodMode, Manifest, MaterialPatch, MeshPatch,
+    ArchiveSpec, AssetSpec, GltfLayout, GltfSettings, LodMode, Manifest, MaterialPatch, MeshPatch,
     MeshSettings, NodeSelect, OmmSettings, PartAttribute, Source,
 };
 use orr_pack::material::{Material, slot};
@@ -1262,6 +1262,152 @@ fn gpu_instancing_becomes_instance_pages() {
     assert_eq!(std::fs::read(&file).unwrap(), bytes);
     let count = |c: &orr_cook::Cooked| c.report.assets[0].entries.len();
     assert_eq!(count(&again), count(&first));
+}
+
+/// Every placement of `model` in the archive's instance pages, in world space.
+fn placements(a: &Archive, model: &str) -> Vec<glam::Mat4> {
+    let id = AssetId::from_name(model);
+    let mut out = Vec::new();
+    for e in a
+        .entries()
+        .iter()
+        .filter(|e| e.class == Class::InstancePage as u16)
+    {
+        let blobs = a.blobs(e);
+        let head = read(a, &blobs[0]);
+        let info = orr_pack::instance::InstancePageInfo::parse(&head).unwrap();
+        let bytes = read(a, &blobs[1]);
+        let (cell, records) = orr_pack::instance::decode(&head, &bytes).unwrap();
+        for (p, m) in records {
+            if info.prototypes[usize::from(p)].model != id {
+                continue;
+            }
+            let r = m.rows;
+            let col = |c: usize| glam::Vec4::new(r[0][c], r[1][c], r[2][c], 0.0);
+            let t = [0, 1, 2].map(|k| r[k][3] + cell[k] as f32 * 256.0);
+            out.push(glam::Mat4::from_cols(
+                col(0),
+                col(1),
+                col(2),
+                glam::Vec4::new(t[0], t[1], t[2], 1.0),
+            ));
+        }
+    }
+    out
+}
+
+#[test]
+fn meshes_layout_places_each_mesh_and_bakes_shears() {
+    let d = dir("gltf-meshes");
+    let path = d.join("scene.gltf");
+    let mut g = Glb::default();
+    let quad = [
+        [0.0f32, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 1.0],
+    ];
+    let pv = g.compressed_view(bytemuck::cast_slice(&quad), 12, "ATTRIBUTES", true);
+    let pa = g.accessor(pv, 5126, 4, "VEC3", r#","min":[0,0,0],"max":[1,0,1]"#);
+    let ia = g.indices(&[0, 2, 1, 1, 2, 3]);
+    let ib = g.indices(&[0, 2, 1]);
+    let instances = [[2.0f32, 0.0, 0.0], [0.0, 0.0, 7.0]];
+    let it = g.floats(&instances, "VEC3");
+    let q = glam::Quat::from_rotation_y(0.6);
+    let qa = q.to_array();
+    g.write_split(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,1,2,4]}}],
+"extensionsUsed":["EXT_mesh_gpu_instancing","EXT_meshopt_compression"],
+"extensionsRequired":["EXT_mesh_gpu_instancing","EXT_meshopt_compression"],
+"materials":[{{"name":"a"}},{{"name":"b"}}],
+"nodes":[{{"mesh":0,"translation":[5,0,0]}},
+ {{"mesh":0,"rotation":{qa:?},"scale":[-1,2,1]}},
+ {{"scale":[2,1,1],"children":[3]}},
+ {{"mesh":1,"rotation":{qa:?}}},
+ {{"mesh":1,"translation":[0,3,0],"extensions":{{"EXT_mesh_gpu_instancing":{{"attributes":{{"TRANSLATION":{it}}}}}}}}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa}}},"indices":{ia}}}]}},
+ {{"primitives":[{{"attributes":{{"POSITION":{pa}}},"indices":{ia},"material":1}},
+  {{"attributes":{{"POSITION":{pa}}},"indices":{ib},"material":0}}]}}]"#
+        ),
+    );
+    let settings = GltfSettings {
+        layout: GltfLayout::Meshes,
+        ..GltfSettings::default()
+    };
+    let (a, _) = cook(&path, settings).unwrap();
+
+    let close = |got: &[glam::Mat4], want: &[glam::Mat4]| {
+        assert_eq!(got.len(), want.len());
+        for w in want {
+            assert!(
+                got.iter().any(|g| g.abs_diff_eq(*w, 0.01)),
+                "{w:?} not among {got:?}"
+            );
+        }
+    };
+    let t = glam::Mat4::from_translation;
+    let shear = glam::Mat4::from_scale(glam::Vec3::new(2.0, 1.0, 1.0)) * glam::Mat4::from_quat(q);
+    // A mirrored copy is placed as it is, not baked.
+    close(
+        &placements(&a, "g/mesh/0"),
+        &[
+            t(glam::Vec3::new(5.0, 0.0, 0.0)),
+            glam::Mat4::from_scale_rotation_translation(
+                glam::Vec3::new(-1.0, 2.0, 1.0),
+                q,
+                glam::Vec3::ZERO,
+            ),
+        ],
+    );
+    close(
+        &placements(&a, "g/mesh/1"),
+        &[
+            t(glam::Vec3::new(2.0, 3.0, 0.0)),
+            t(glam::Vec3::new(0.0, 3.0, 7.0)),
+        ],
+    );
+    // The sheared copy holds its linear transform in its geometry.
+    close(&placements(&a, "g/mesh/1/baked/0"), &[glam::Mat4::IDENTITY]);
+    let baked = mesh_of(&a, "g/mesh/1/baked/0/mesh");
+    let corners: Vec<[f32; 3]> = baked
+        .clusters
+        .iter()
+        .flat_map(|c| c.2.iter().flatten().copied())
+        .collect();
+    for p in quad {
+        let want = shear.transform_point3(glam::Vec3::from(p));
+        assert!(
+            corners
+                .iter()
+                .any(|c| (glam::Vec3::from(*c) - want).abs().max_element() < 1e-3),
+            "{want} missing"
+        );
+    }
+    // Sections in material order, with the second primitive's material first.
+    let plain = mesh_of(&a, "g/mesh/1/mesh");
+    assert_eq!(plain.info.sections.len(), 2);
+    let tris = |s: u8| {
+        plain
+            .clusters
+            .iter()
+            .filter(|c| c.0.section == s)
+            .map(|c| c.1.len())
+            .sum::<usize>()
+    };
+    assert_eq!((tris(0), tris(1)), (1, 2));
+    let model = |name: &str| {
+        let e = a.find(AssetId::from_name(name)).unwrap();
+        ModelInfo::parse(&read(&a, &a.blobs(e)[0])).unwrap()
+    };
+    assert_eq!(
+        model("g/mesh/1").materials,
+        [
+            AssetId::from_name("g/material/0"),
+            AssetId::from_name("g/material/1")
+        ]
+    );
 }
 
 /// A unit quad facing +z as a library mesh with `material`, then texture asset `texture`
