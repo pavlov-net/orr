@@ -246,6 +246,25 @@ fn cuts_cover_the_surface_once() {
         }
     }
     assert!(levels.contains(&true), "a view cut mixes levels");
+
+    // The two sections are one stage: the row they share coarsens with the rest.
+    assert_eq!(d.info.roots[1], MeshHeader::NO_ROOT);
+    let seam = |cut: Cut| {
+        let flat = d.select(cut, |_| true);
+        let side = |s: u8| -> HashSet<[u32; 3]> {
+            flat.iter()
+                .filter(|&&c| d.clusters[c].record.section == s)
+                .flat_map(|&c| d.clusters[c].tris.iter().flatten())
+                .map(|p| p.map(f32::to_bits))
+                .collect()
+        };
+        side(0).intersection(&side(1)).count()
+    };
+    let (finest, coarsest) = (seam(Cut::Uniform(0.0)), seam(Cut::Uniform(f32::MAX)));
+    assert!(
+        coarsest * 4 < finest,
+        "{coarsest} of {finest} seam positions"
+    );
 }
 
 #[test]
@@ -274,8 +293,12 @@ fn parts_merge_past_the_merge_error() {
     check_structure(&d);
     assert_eq!(d.info.header.merge_error, merge);
     assert_eq!(d.info.parts.len(), 5);
+    // The two sections cluster alike, so each stage covers both from its first section's
+    // slot.
     assert_eq!(d.info.roots.len(), 5 * 2 + 2);
-    assert!(d.info.roots.iter().all(|&r| r != MeshHeader::NO_ROOT));
+    for (i, &r) in d.info.roots.iter().enumerate() {
+        assert_eq!(r != MeshHeader::NO_ROOT, i % 2 == 0, "root {i}");
+    }
     for c in &d.clusters {
         let r = &c.record;
         if r.flags & Cluster::MERGED != 0 {
@@ -431,7 +454,11 @@ fn paged_hierarchy_keeps_children_together() {
     assert!(!info.node_pages.is_empty());
     let top = &info.node_pages[0];
     assert_eq!(top.parent_page, NodePage::TOP);
-    assert!(info.roots.iter().all(|&r| r < top.node_count));
+    assert!(
+        info.roots
+            .iter()
+            .all(|&r| r == MeshHeader::NO_ROOT || r < top.node_count)
+    );
     let page_of = |n: u32| {
         info.node_pages
             .iter()

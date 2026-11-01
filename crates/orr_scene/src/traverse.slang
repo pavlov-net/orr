@@ -392,14 +392,15 @@ void push_roots(SceneRoot* s, CutGpu* cut, uint slot, InstanceGpu inst, ModelGpu
         bool take = has_merged && l.level < 0 && focus_error(p, sphere, mesh.merge_error * l.scale[k]) <= l.threshold[k];
         merged |= take ? (1u << k) : 0;
     }
+    // A root covers every section of its stage, so hidden sections are left to the
+    // clusters' own test.
     for (uint i = 0; i < mesh.root_count; i++)
     {
         uint node = mesh.roots[i];
         bool stage_merged = i >= part_roots;
-        uint section = stage_merged ? i - part_roots : i % sections;
         uint part = stage_merged ? 0 : i / sections;
         uint m = mask & (stage_merged ? merged : ~merged);
-        if (node == NO_ROOT || m == 0 || section_hidden(inst, section))
+        if (node == NO_ROOT || m == 0)
             continue;
         NodeItem item;
         item.slot = slot;
