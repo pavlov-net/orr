@@ -37,8 +37,9 @@ pub struct Caps {
     /// triangle BLAS. Their hits commit with a status that is neither triangle nor
     /// procedural, and report cluster id -1.
     pub lss: bool,
-    /// Opacity micromaps (`VK_KHR_opacity_micromap` with device address commands); kernels
-    /// that trace OMM geometry load their `spirv_omm` variant.
+    /// Opacity micromaps (`VK_KHR_opacity_micromap` with device address commands). On exactly
+    /// when the shaders were built with micromaps (`ORR_SHADER_OMM`, on by default), which
+    /// then require them. Builds without micromaps alpha-test in the candidate loop.
     pub omm: bool,
     /// Device address commands (`VK_KHR_device_address_commands`).
     pub device_address_commands: bool,

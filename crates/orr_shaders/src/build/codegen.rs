@@ -23,7 +23,6 @@ pub(crate) enum Owner {
 pub(crate) struct Kernel<'a> {
     pub(crate) name: &'a str,
     pub(crate) spv: &'a Path,
-    pub(crate) omm: Option<&'a Path>,
     pub(crate) debug_info: Option<&'a Path>,
     pub(crate) hash: u64,
     /// Shared by every entry point: they share the root and the constants.
@@ -167,21 +166,15 @@ fn emit_kernel(out: &mut String, k: &Kernel<'_>, depth: usize, manifest: &Path) 
 
 /// The `ShaderModule` static of one kernel, declared as `item`.
 fn emit_module(out: &mut String, item: &str, k: &Kernel<'_>, manifest: &Path) {
-    let omm = match k.omm {
-        Some(p) => format!(
-            "::orr_shaders::aligned_spirv!({:?})",
-            p.display().to_string()
-        ),
-        None => "&[]".to_owned(),
-    };
     let debug_info = k
         .debug_info
         .map_or_else(String::new, |p| p.display().to_string());
     let _ = writeln!(
         out,
-        "{item}: ::orr_shaders::ShaderModule = ::orr_shaders::ShaderModule {{\n    name: {name:?},\n    kernel: {name:?},\n    spirv: ::orr_shaders::aligned_spirv!({spv:?}),\n    spirv_omm: {omm},\n    debug_info: {debug_info:?},\n    hash: {hash:#018x},\n    manifest: {manifest:?},\n    entry_points: &[",
+        "{item}: ::orr_shaders::ShaderModule = ::orr_shaders::ShaderModule {{\n    name: {name:?},\n    kernel: {name:?},\n    spirv: ::orr_shaders::aligned_spirv!({spv:?}),\n    omm: {omm},\n    debug_info: {debug_info:?},\n    hash: {hash:#018x},\n    manifest: {manifest:?},\n    entry_points: &[",
         name = k.name,
         spv = k.spv.display().to_string(),
+        omm = k.model.omm,
         hash = k.hash,
         manifest = manifest.display().to_string(),
     );

@@ -1,4 +1,5 @@
 // One body, two entries: raygen reorders by a key, compute does not.
+#include "orr/root.h"
 import handles;
 
 struct Root
@@ -41,6 +42,7 @@ void body<C : ICoherence>(uint2 index)
 [shader("raygeneration")]
 void main_rays()
 {
+    ORR_OMM(main_rays);
     body<Reorder>(DispatchRaysIndex().xy);
 }
 
@@ -48,5 +50,6 @@ void main_rays()
 [numthreads(8, 4, 1)]
 void main_compute(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(main_compute);
     body<NoReorder>(id.xy);
 }

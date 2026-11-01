@@ -521,8 +521,25 @@ pub(crate) fn select(
         q.ray_pipeline.ray_tracing_pipeline != 0 && q.reorder.ray_tracing_invocation_reorder != 0;
     opt.lss &= q.lss.linear_swept_spheres != 0;
     opt.device_address_commands &= q.address_commands.device_address_commands != 0;
-    // OMM builds take micromap addresses, which need device address commands.
+    // Micromap builds take their addresses through device address commands.
     opt.omm &= q.omm.micromap != 0 && opt.device_address_commands;
+    if cfg!(orr_omm) && !opt.omm {
+        let (why, fix) = if capture {
+            (
+                "capture sessions leave micromaps off",
+                "ORR_SHADER_CAPTURE=1 or ORR_SHADER_OMM=0",
+            )
+        } else {
+            (
+                "no VK_KHR_opacity_micromap with micromap, or no VK_KHR_device_address_commands",
+                "ORR_SHADER_OMM=0",
+            )
+        };
+        return Err(format!(
+            "micromap support ({why}), and the shaders were built with micromaps (ORR_SHADER_OMM, on by default); rebuild with {fix}"
+        ));
+    }
+    opt.omm &= cfg!(orr_omm);
     opt.indirect_copy &= q.indirect_copy.indirect_memory_copy != 0
         && q.indirect_copy.indirect_memory_to_image_copy != 0;
     opt.unified_image_layouts &= q.unified.unified_image_layouts != 0;

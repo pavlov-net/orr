@@ -19,9 +19,8 @@ use crate::{EntryPoint, Error, ShaderModule, SpecData, Stage};
 #[derive(Clone, Copy, Debug)]
 pub struct ShaderStage<'a> {
     pub spirv: &'a [u32],
-    /// The opacity-micromap variant; used instead of `spirv` when `Caps::omm` is set and it
-    /// is not empty.
-    pub spirv_omm: &'a [u32],
+    /// `spirv` declares the opacity-micromap execution mode, which needs `Caps::omm`.
+    pub omm: bool,
     /// The path of `spirv`'s separated debug info, handed to Aftermath; empty for none.
     pub debug_info: &'a str,
     pub entry: &'a EntryPoint,
@@ -36,7 +35,7 @@ impl<'a> ShaderStage<'a> {
             .ok_or_else(|| Error::Shader(format!("{} has no entry point {entry}", module.name)))?;
         Ok(Self {
             spirv: module.spirv,
-            spirv_omm: module.spirv_omm,
+            omm: module.omm,
             debug_info: module.debug_info,
             entry,
             spec,
@@ -82,14 +81,6 @@ impl Drop for ComputePipeline {
 }
 
 impl Shared {
-    pub(crate) fn code<'a>(&self, stage: &ShaderStage<'a>) -> &'a [u32] {
-        if self.caps.omm && !stage.spirv_omm.is_empty() {
-            stage.spirv_omm
-        } else {
-            stage.spirv
-        }
-    }
-
     /// Logs registers, shared memory and spills per executable.
     fn log_statistics(&self, pipeline: vk::Pipeline, name: &str) {
         let Some(exec) = &self.exec_fn else { return };
@@ -168,15 +159,19 @@ impl<'a> StageParts<'a> {
                 s.entry.name, s.entry.stage
             )));
         }
-        let code = shared.code(s);
+        if s.omm && !shared.caps.omm {
+            return Err(Error::Shader(format!(
+                "{name}: the module was built with opacity micromaps, which the device has off; build the shaders with ORR_SHADER_OMM=0, or ORR_SHADER_CAPTURE=1 for a capture session"
+            )));
+        }
         let code = if matches!(want, Stage::Task | Stage::Mesh) {
-            spirv::payload_first(code, s.entry.name.to_bytes())
+            spirv::payload_first(s.spirv, s.entry.name.to_bytes())
         } else {
-            Cow::Borrowed(code)
+            Cow::Borrowed(s.spirv)
         };
         if !shared.caps.shader_abort && spirv::aborts(&code) {
             return Err(Error::Shader(format!(
-                "{name}: the module was built with asserts, which need shaderAbort, and the device has none; build the shaders with ORR_SHADER_ASSERTS=0"
+                "{name}: the module was built with asserts, which need shaderAbort, and the device has none; build the shaders with ORR_SHADER_ASSERTS=0, or ORR_SHADER_CAPTURE=1 for a capture session"
             )));
         }
         if shared.caps.aftermath {

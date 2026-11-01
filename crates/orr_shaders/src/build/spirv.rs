@@ -1,6 +1,5 @@
-//! A SPIR-V reader for the few instructions the build needs, the opacity-micromap pass and
-//! the string pass over stripped modules. Unknown instructions are skipped by their word
-//! count.
+//! A SPIR-V reader for the few instructions the build needs and the string pass over
+//! stripped modules. Unknown instructions are skipped by their word count.
 
 use std::collections::{HashMap, HashSet};
 
@@ -27,12 +26,10 @@ pub(crate) mod op {
     pub(crate) const TYPE_RUNTIME_ARRAY: u16 = 29;
     pub(crate) const TYPE_STRUCT: u16 = 30;
     pub(crate) const TYPE_POINTER: u16 = 32;
-    pub(crate) const CONSTANT_TRUE: u16 = 41;
     pub(crate) const CONSTANT: u16 = 43;
     pub(crate) const SPEC_CONSTANT_TRUE: u16 = 48;
     pub(crate) const SPEC_CONSTANT_FALSE: u16 = 49;
     pub(crate) const SPEC_CONSTANT: u16 = 50;
-    pub(crate) const FUNCTION: u16 = 54;
     pub(crate) const VARIABLE: u16 = 59;
     pub(crate) const DECORATE: u16 = 71;
     pub(crate) const MEMBER_DECORATE: u16 = 72;
@@ -64,14 +61,7 @@ pub(crate) mod decoration {
 
 pub(crate) const STORAGE_UNIFORM: u32 = 2;
 pub(crate) const STORAGE_PHYSICAL: u32 = 5349;
-const CAPABILITY_OMM: u32 = 5381;
-const CAPABILITY_OMM_EXECUTION_MODE: u32 = 6032;
 const EXECUTION_MODE_OMM_ID: u32 = 6031;
-const OMM_EXTENSION: &str = "SPV_KHR_opacity_micromap";
-/// The specialization constant id of `orr.trace`'s `OMM_2_STATE`, which carries the forced
-/// two-state micromap ray flag: 0 in a module, the flag in its variant.
-pub(crate) const OMM_SPEC_ID: u32 = 0x8000_0000;
-const RAY_FLAG_FORCE_OMM_2_STATE: u32 = 0x400;
 
 /// (decoration, literal operands) pairs.
 type Decorations = Vec<(u32, Vec<u32>)>;
@@ -132,18 +122,6 @@ fn string(words: &[u32]) -> (String, &[u32]) {
     (String::from_utf8_lossy(&bytes).into_owned(), &[])
 }
 
-fn encode_string(s: &str) -> Vec<u32> {
-    let mut bytes = s.as_bytes().to_vec();
-    bytes.push(0);
-    while !bytes.len().is_multiple_of(4) {
-        bytes.push(0);
-    }
-    bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-
 /// A 64-bit atomic instruction.
 #[derive(Clone, Debug)]
 pub(crate) struct Atomic64 {
@@ -162,8 +140,10 @@ pub(crate) struct Module {
     /// Result type and literal words of spec constants; booleans carry one word, 0 or 1.
     spec_constants: HashMap<u32, (u32, Vec<u32>)>,
     variables: Vec<(u32, u32, u32)>,
-    /// Entry point function ids.
-    pub(crate) entries: Vec<u32>,
+    /// Entry point function ids and names.
+    pub(crate) entries: Vec<(u32, String)>,
+    /// Entry points with the opacity-micromap execution mode.
+    pub(crate) omm_entries: HashSet<u32>,
     pub(crate) atomics64: Vec<Atomic64>,
     pub(crate) ray_query: bool,
 }
@@ -183,8 +163,12 @@ impl Module {
                     m.names.insert(a[0], string(&a[1..]).0);
                 }
                 op::ENTRY_POINT => {
-                    uses.extend(string(&a[2..]).1);
-                    m.entries.push(a[1]);
+                    let (name, interface) = string(&a[2..]);
+                    uses.extend(interface);
+                    m.entries.push((a[1], name));
+                }
+                op::EXECUTION_MODE_ID if a[1] == EXECUTION_MODE_OMM_ID => {
+                    m.omm_entries.insert(a[0]);
                 }
                 op::TYPE_BOOL => {
                     m.types.insert(a[0], Type::Bool);
@@ -438,107 +422,4 @@ pub(crate) fn restore_strings(stripped: Vec<u32>, full: &[u32]) -> Vec<u32> {
     out.extend(missing);
     out.extend_from_slice(&stripped[at..]);
     out
-}
-
-/// The module with `OpExecutionModeId <entry> OpacityMicromapIdKHR <true>` on every entry
-/// point, plus its capability and extension. Where the module uses `orr.trace`'s
-/// `OMM_2_STATE`, its value becomes the forced two-state ray flag and the micromap
-/// capability is declared. `None` when the module has no ray query.
-pub(crate) fn omm_variant(words: &[u32]) -> Option<Vec<u32>> {
-    let module = Module::parse(words).ok()?;
-    if !module.ray_query {
-        return None;
-    }
-    let two_state = module
-        .spec_constants
-        .keys()
-        .copied()
-        .find(|id| module.decoration(*id, decoration::SPEC_ID) == Some(&[OMM_SPEC_ID]));
-    let mut words = words.to_vec();
-    if let Some(id) = two_state {
-        let (at, _) =
-            instructions(&words).find(|(_, i)| i.op == op::SPEC_CONSTANT && i.args[1] == id)?;
-        words[at + 3] = RAY_FLAG_FORCE_OMM_2_STATE;
-    }
-    let words = &words[..];
-    let mut bound = words[3];
-    let mut new_id = || {
-        let id = bound;
-        bound += 1;
-        id
-    };
-    let bool_ty = module
-        .types
-        .iter()
-        .find(|(_, t)| **t == Type::Bool)
-        .map(|(id, _)| *id);
-    let (bool_ty, declare_bool) = match bool_ty {
-        Some(id) => (id, false),
-        None => (new_id(), true),
-    };
-    let true_id = new_id();
-
-    let mut last_capability = None;
-    let mut last_extension = None;
-    let mut last_mode = None;
-    let mut first_function = None;
-    for (at, inst) in instructions(words) {
-        let end = at + (words[at] >> 16) as usize;
-        match inst.op {
-            op::CAPABILITY => last_capability = Some(end),
-            op::EXTENSION => last_extension = Some(end),
-            op::ENTRY_POINT | op::EXECUTION_MODE | op::EXECUTION_MODE_ID => last_mode = Some(end),
-            op::FUNCTION if first_function.is_none() => first_function = Some(at),
-            _ => {}
-        }
-    }
-    let after_capabilities = last_capability?;
-    let after_extensions = last_extension.unwrap_or(after_capabilities);
-    let after_modes = last_mode?;
-    let before_functions = first_function.unwrap_or(words.len());
-
-    let inst = |op: u16, args: &[u32]| {
-        let mut v = vec![((args.len() as u32 + 1) << 16) | u32::from(op)];
-        v.extend_from_slice(args);
-        v
-    };
-    let mut capabilities = inst(op::CAPABILITY, &[CAPABILITY_OMM_EXECUTION_MODE]);
-    if two_state.is_some() {
-        capabilities.extend(inst(op::CAPABILITY, &[CAPABILITY_OMM]));
-    }
-    let mut inserts: Vec<(usize, Vec<u32>)> = vec![
-        (after_capabilities, capabilities),
-        (
-            after_extensions,
-            inst(op::EXTENSION, &encode_string(OMM_EXTENSION)),
-        ),
-        (
-            after_modes,
-            module
-                .entries
-                .iter()
-                .flat_map(|&e| inst(op::EXECUTION_MODE_ID, &[e, EXECUTION_MODE_OMM_ID, true_id]))
-                .collect(),
-        ),
-        (before_functions, {
-            let mut v = Vec::new();
-            if declare_bool {
-                v.extend(inst(op::TYPE_BOOL, &[bool_ty]));
-            }
-            v.extend(inst(op::CONSTANT_TRUE, &[bool_ty, true_id]));
-            v
-        }),
-    ];
-    inserts.sort_by_key(|(at, _)| *at);
-
-    let mut out = Vec::with_capacity(words.len() + 32);
-    let mut copied = 0;
-    for (at, words_in) in inserts {
-        out.extend_from_slice(&words[copied..at]);
-        out.extend(words_in);
-        copied = at;
-    }
-    out.extend_from_slice(&words[copied..]);
-    out[3] = bound;
-    Some(out)
 }

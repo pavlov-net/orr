@@ -322,8 +322,7 @@ fn alpha_root(
     (out, root)
 }
 
-/// Three alpha-tested copies of a grid and an opaque back quad in a classic TLAS, traced
-/// through the module and through its opacity-micromap variant.
+/// Three alpha-tested copies of a grid and an opaque back quad in a classic TLAS.
 #[test]
 fn alpha_test_on_classic_tlas() {
     let mut front = cl::grid(
@@ -347,24 +346,10 @@ fn alpha_test_on_classic_tlas() {
     instances.push(cl::instance([0.0; 3], 6, 1));
     let tlas = b.build_tlas(table, &instances);
 
-    let module = ShaderStage::new(&alpha::MODULE, "main", SpecData::default()).unwrap();
-    let plain = ShaderStage {
-        spirv_omm: &[],
-        ..module
-    };
-    let d = device();
-    let pipelines = [
-        d.create_compute_pipeline(&plain, "alpha").unwrap(),
-        d.create_compute_pipeline(&module, "alpha omm").unwrap(),
-    ];
-    let outs: Vec<_> = pipelines
-        .iter()
-        .map(|p| {
-            let (out, root) = alpha_root(&mut b, tlas, SIZE, 0);
-            traced(&mut b, p, root, SIZE);
-            out
-        })
-        .collect();
+    let stage = ShaderStage::new(&alpha::MODULE, "main", SpecData::default()).unwrap();
+    let pipeline = device().create_compute_pipeline(&stage, "alpha").unwrap();
+    let (out, root) = alpha_root(&mut b, tlas, SIZE, 0);
+    traced(&mut b, &pipeline, root, SIZE);
     b.flush();
 
     let mut scene: Vec<Placed<'_>> = offsets
@@ -380,43 +365,38 @@ fn alpha_test_on_classic_tlas() {
         offset: [0.0; 3],
         opaque: true,
     });
-    for (out, what) in outs.iter().zip(["module", "omm variant"]) {
-        let got = out.as_slice().unwrap();
-        let (mut checked, mut alpha_hits, mut wrong) = (0, 0, Vec::new());
-        for y in 0..SIZE {
-            for x in 0..SIZE {
-                let Some(want) = alpha_expect(&scene, x, y) else {
-                    continue;
-                };
-                checked += 1;
-                alpha_hits += usize::from(want[0] == 1 && want[1] < 3);
-                let g = got[(y * SIZE + x) as usize];
-                if g != want && wrong.len() < 8 {
-                    wrong.push((x, y, g, want));
-                }
+    let got = out.as_slice().unwrap();
+    let (mut checked, mut alpha_hits, mut wrong) = (0, 0, Vec::new());
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let Some(want) = alpha_expect(&scene, x, y) else {
+                continue;
+            };
+            checked += 1;
+            alpha_hits += usize::from(want[0] == 1 && want[1] < 3);
+            let g = got[(y * SIZE + x) as usize];
+            if g != want && wrong.len() < 8 {
+                wrong.push((x, y, g, want));
             }
         }
-        assert!(
-            checked > (SIZE * SIZE) as usize * 9 / 10,
-            "{what}: {checked} rays checked"
-        );
-        assert!(
-            alpha_hits > checked / 4,
-            "{what}: {alpha_hits} alpha-tested hits"
-        );
-        assert!(
-            wrong.is_empty(),
-            "{what}: rays differing from the reference: {wrong:?}"
-        );
     }
+    assert!(
+        checked > (SIZE * SIZE) as usize * 9 / 10,
+        "{checked} rays checked"
+    );
+    assert!(alpha_hits > checked / 4, "{alpha_hits} alpha-tested hits");
+    assert!(
+        wrong.is_empty(),
+        "rays differing from the reference: {wrong:?}"
+    );
     assert_clean();
 }
 
-/// The opacity-micromap variant over the cluster probe's micromap scene, in 4-state and
-/// forced 2-state rays, ray for ray equal to the probe kernel that is checked against the
-/// CPU reference in the same submit.
+/// The module over the cluster probe's micromap scene, in 4-state and forced 2-state rays,
+/// ray for ray equal to the probe kernel that is checked against the CPU reference in the
+/// same submit.
 #[test]
-fn alpha_test_omm_variant_on_micromap_clusters() {
+fn alpha_test_on_micromap_clusters() {
     let d = device();
     if !d.caps().omm || !d.caps().cluster.omm_in_clusters {
         log::warn!(
@@ -425,10 +405,6 @@ fn alpha_test_omm_variant_on_micromap_clusters() {
         );
         return;
     }
-    assert!(
-        !alpha::MODULE.spirv_omm.is_empty(),
-        "alpha.slang has an OMM variant"
-    );
     let mut b = Builder::new();
     let data = b.upload(&cl::OMM_STATES);
     let triangles: Vec<_> = (0..4)

@@ -11,6 +11,7 @@ ORR_ROOT(GuideRoot);
 [numthreads(8, 8, 1)]
 void main(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(main);
     if (all(id.xy < root.gbuffer.extent))
         guide_body<Surface>(root, id.xy);
 }

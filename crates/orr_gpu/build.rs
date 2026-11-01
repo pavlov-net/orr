@@ -1,6 +1,6 @@
 //! Compiles orr_gpu's own kernels and publishes its shader root, which holds the `rtas` and
-//! `sequence` libraries, and generates the Nsight Perf SDK bindings that counter frames use
-//! when the SDK is found.
+//! `sequence` libraries, sets `cfg(orr_omm)` when the shaders are built with micromaps, and
+//! generates the Nsight Perf SDK bindings that counter frames use when the SDK is found.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -9,8 +9,14 @@ use orr_shaders::build::Build;
 
 fn main() {
     let src = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("src");
+    println!("cargo::rustc-check-cfg=cfg(orr_omm)");
     match Build::new().and_then(|b| b.kernels(&src).compile()) {
-        Ok(out) => println!("cargo:shader_dirs={}", out.shader_dirs),
+        Ok(out) => {
+            println!("cargo:shader_dirs={}", out.shader_dirs);
+            if out.omm {
+                println!("cargo::rustc-cfg=orr_omm");
+            }
+        }
         Err(e) => panic!("{e}"),
     }
     perf_bindings();

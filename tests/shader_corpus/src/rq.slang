@@ -1,5 +1,6 @@
 // Inline ray query from compute: TLAS by address, candidate alpha-test loop, cluster ids and
 // position fetch.
+#include "orr/root.h"
 import handles;
 
 struct Root
@@ -18,6 +19,7 @@ bool alpha_ok(uint instance, uint prim, int cluster, float2 bary)
 [numthreads(8, 4, 1)]
 void main(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(main);
     RayDesc ray;
     ray.Origin = float3(id.x, id.y, 0);
     ray.Direction = float3(0, 0, 1);

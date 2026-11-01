@@ -213,6 +213,10 @@ pub(crate) struct Model {
     pub(crate) stray_params: Vec<StrayParam>,
     /// 64-bit atomics other than a max whose result is unused, by opcode.
     pub(crate) bad_atomics: Vec<u16>,
+    /// An entry point declares the opacity-micromap execution mode.
+    pub(crate) omm: bool,
+    /// In a module that traces rays, the entry points without the opacity-micromap mode.
+    pub(crate) no_omm_mode: Vec<String>,
 }
 
 /// # Safety
@@ -330,9 +334,6 @@ impl Extract<'_> {
                 use sys::SlangParameterCategory as C;
                 if category == C::SLANG_PARAMETER_CATEGORY_SPECIALIZATION_CONSTANT {
                     let id = api.spReflectionVariableLayout_GetOffset(vl, category) as u32;
-                    if id == spirv::OMM_SPEC_ID {
-                        continue;
-                    }
                     let scalar = Scalar::from_slang(api.spReflectionType_GetScalarType(ty))
                         .ok_or_else(|| format!("specialization constant {name} is not a scalar"))?;
                     let default = spec_defaults.get(&id).map_or(0, |(_, w)| {
@@ -432,6 +433,16 @@ impl Extract<'_> {
                 .map(|a| a.op)
                 .collect();
 
+            let spv = &self.spv;
+            let no_omm_mode: Vec<String> = if spv.ray_query {
+                spv.entries
+                    .iter()
+                    .filter(|(id, _)| !spv.omm_entries.contains(id))
+                    .map(|(_, name)| name.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
             Ok(Model {
                 entries,
                 root,
@@ -439,6 +450,8 @@ impl Extract<'_> {
                 spec,
                 stray_params,
                 bad_atomics,
+                omm: !self.spv.omm_entries.is_empty(),
+                no_omm_mode,
             })
         }
     }

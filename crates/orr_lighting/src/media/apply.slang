@@ -14,5 +14,6 @@ ORR_ROOT(FroxelRoot);
 [numthreads(8, 8, 1)]
 void main(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(main);
     media_apply<Surface, Medium>(root, id.xy);
 }

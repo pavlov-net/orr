@@ -84,11 +84,13 @@ void body(uint2 id)
 [numthreads(8, 8, 1)]
 void main(uint3 id: SV_DispatchThreadID)
 {
+    ORR_OMM(main);
     body(id.xy);
 }
 
 [shader("raygeneration")]
 void raygen()
 {
+    ORR_OMM(raygen);
     body(DispatchRaysIndex().xy);
 }
