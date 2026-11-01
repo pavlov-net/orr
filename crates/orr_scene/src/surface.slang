@@ -72,10 +72,13 @@ public interface ISurface
 }
 
 // The material's opacity at the hit: the opacity slot, else the base color slot's alpha,
-// times `geometry_opacity`, read bilinearly from mip 0 whatever the footprint.
+// times `geometry_opacity`, read bilinearly from mip 0 whatever the footprint; 1 for a
+// material that is neither alpha-tested nor a presence layer, whose alpha is not read.
 public float material_opacity(SurfaceInput i)
 {
     MaterialGpu* m = i.scene.materials + i.material;
+    if ((m.flags & (MATERIAL_ALPHA_TESTED | MATERIAL_PRESENCE)) == 0)
+        return 1.0;
     UvFootprint finest[2] = {
         { i.uv[0].uv, float2(0.0), float2(0.0), float2(-1.0) },
         { i.uv[1].uv, float2(0.0), float2(0.0), float2(-1.0) },

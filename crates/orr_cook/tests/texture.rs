@@ -760,7 +760,8 @@ fn ktx2(
 }
 
 /// BCn images that already hold what the material wants keep their blocks: every mip, or
-/// mip 0 where the cook makes the other mips (Toksvig roughness). Two-channel images hold
+/// mip 0 where the cook makes the other mips (Toksvig roughness). An opaque material's base
+/// color keeps its alpha, which nothing reads as opacity. Two-channel images hold
 /// roughness and metalness in red and green, and overrides name other channels.
 #[test]
 fn bcn_material_textures_keep_their_blocks() {
@@ -769,7 +770,7 @@ fn bcn_material_textures_keep_their_blocks() {
     let wave =
         |x: u32, y: u32, k: u32| (128.0 + 100.0 * ((x * k + y * 3) as f32 * 0.21).sin()) as u8;
     let (color, color_blocks) = ktx2(n, n, ctt::Format::BC7_SRGB_BLOCK, |x, y| {
-        [wave(x, y, 1), wave(x, y, 2), wave(x, y, 3), 255]
+        [wave(x, y, 1), wave(x, y, 2), wave(x, y, 3), wave(y, x, 4)]
     });
     let (normal, normal_blocks) = ktx2(n, n, ctt::Format::BC5_UNORM_BLOCK, |x, y| {
         [wave(x, y, 5), wave(y, x, 4), 255, 255]
