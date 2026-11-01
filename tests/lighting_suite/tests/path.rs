@@ -1,6 +1,6 @@
 //! The opaque path kernel on the bed's analytic scenes: the furnace, convergence, the three
-//! estimators against each other, directional lights, ray counts, ray origins, linked
-//! surfaces at every hit, and the raygen against the compute entry.
+//! estimators against each other, pixel subsets, directional lights, ray counts, ray
+//! origins, linked surfaces at every hit, and the raygen against the compute entry.
 
 use lighting_suite::bed::{
     Accumulated, Analytic, BUMPY_FLOOR, Bed, EXTENT, FLOOR, FURNACE_RADIANCE, Item, MIRROR, PANEL,
@@ -135,6 +135,31 @@ fn reference_error_halves_with_four_times_the_frames() {
     assert!(
         e4 / e16 > 1.7,
         "rms error {e4} at 4 frames and {e16} at 16 frames"
+    );
+    assert_clean();
+}
+
+#[test]
+fn half_the_pixels_trace_half_the_rays_and_converge_to_every_pixel() {
+    let mut bed = Bed::new(Analytic::CornellBox);
+    let subset = |p| ViewLighting {
+        pixel_fraction: p,
+        ..reference(4)
+    };
+    let every = image_mean(&render_paths(&mut bed, &paths(subset(1.0)), 256, 1));
+    let half = image_mean(&render_paths(&mut bed, &paths(subset(0.5)), 256, 2));
+    assert_close("half the pixels", half, every, 0.01);
+    let mut rays = |p| {
+        let settings = ViewLighting {
+            debug_view: LightingDebugView::RaysPerPixel,
+            ..subset(p)
+        };
+        image_mean(&render_paths(&mut bed, &paths(settings), 8, 3))[0]
+    };
+    let ratio = rays(0.5) / rays(1.0);
+    assert!(
+        (0.45..0.55).contains(&ratio),
+        "rays per pixel ratio {ratio}"
     );
     assert_clean();
 }

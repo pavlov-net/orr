@@ -18,7 +18,8 @@
 //! linked medium, the light reaching it and its integral along the view's rays to the
 //! scene's `near_range`; [`LightingKernels::record_opaque`] traces the world cache's update
 //! paths, builds a local light sampler per screen tile from the view's last light feedback,
-//! and traces one path per G-buffer pixel into the view's [`LightingView`] radiance and light
+//! and traces one path per G-buffer pixel, or per a random share of them
+//! ([`ViewLighting::pixel_fraction`]), into the view's [`LightingView`] radiance and light
 //! feedback with the settings of [`ViewLighting`]; [`LightingKernels::record_dielectric`]
 //! traces each pixel's first dielectric or presence layer and its path over that radiance;
 //! [`LightingKernels::record_media_apply`] composes the froxels with the radiance; and
@@ -53,7 +54,7 @@ pub use shaders::types::{
 pub use subsurface::{CapTailTable, SSS_STEPS, SubsurfaceDepth};
 pub use view::{
     CameraJump, GuideKind, GuideSettings, LightingDebugView, LightingKernels, LightingView,
-    MAX_LOCAL_LIGHT_SHARE, ReferenceSettings, ThinLens, ViewLighting, ViewPass,
+    MAX_LOCAL_LIGHT_SHARE, MIN_PIXEL_FRACTION, ReferenceSettings, ThinLens, ViewLighting, ViewPass,
 };
 pub use world_cache::{MAX_CAPACITY_LOG2, WorldCacheStats};
 
