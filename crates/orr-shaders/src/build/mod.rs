@@ -74,6 +74,10 @@ pub enum Error {
         path.display()
     )]
     SlangVersion { path: PathBuf, found: String },
+    /// `ORR_SHADER_DEBUG_INFO` is set to something other than `off`, `lines`, `embedded` or
+    /// `separate`.
+    #[error("ORR_SHADER_DEBUG_INFO is {0:?}; expected off, lines, embedded or separate")]
+    DebugInfoVar(String),
     /// The build runs outside cargo: `CARGO_MANIFEST_DIR` is unset.
     #[error(
         "CARGO_MANIFEST_DIR is unset; orr_shaders::build runs from a cargo build script or test"
