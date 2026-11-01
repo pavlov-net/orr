@@ -2,9 +2,9 @@
 //! it: one linking every point, one linking nothing, and one against a copy of the renderer
 //! whose resolve root has an extra field. The CPU library calls the same linked types. Two
 //! more consumer builds link into orr's own kernels: one against orr as it is, one against a
-//! copy of orr-lighting's shader root whose environment-bake root has an extra field. The
-//! renderer is linked once more with copies of the consumer modules in `OUT_DIR`, which the
-//! hot reload tests edit.
+//! copy of orr-lighting's environment bake and library files whose bake root has an extra
+//! field. The renderer is linked once more with copies of the consumer modules in
+//! `OUT_DIR`, which the hot reload tests edit.
 
 use std::env;
 use std::fs;
@@ -80,8 +80,8 @@ fn fixture_consumer(renderer: &Output, out: &Path, link: bool) -> Result<Output,
     )
 }
 
-/// Builds a copy of orr-lighting's shader root whose environment-bake root has one more
-/// field, as orr-lighting's build does.
+/// Builds a copy of orr-lighting's environment bake kernel and library files, with one more
+/// field in the bake root.
 fn edited_orr(roots: &str, src: &Path, out: &Path) -> Result<Output, Error> {
     let (lighting, others): (Vec<&str>, Vec<&str>) = roots
         .split(';')
@@ -97,9 +97,9 @@ fn edited_orr(roots: &str, src: &Path, out: &Path) -> Result<Output, Error> {
     public float4 tint;",
             );
             assert_ne!(edited, text, "BakeRoot moved");
-            edited
+            Some(edited)
         } else {
-            text
+            (name == "bake.slang" || !text.contains("[shader(")).then_some(text)
         }
     });
     let scene = env::var("DEP_ORR_TYPES").expect("orr's type map");
@@ -112,8 +112,8 @@ fn edited_orr(roots: &str, src: &Path, out: &Path) -> Result<Output, Error> {
 }
 
 /// Copies every `.slang` file under `src` to `dst` through `edit`, writing only what changed
-/// and removing what `src` no longer has.
-fn copy_slang(src: &Path, dst: &Path, edit: &dyn Fn(&str, String) -> String) {
+/// and removing what `src` no longer has and what `edit` drops.
+fn copy_slang(src: &Path, dst: &Path, edit: &dyn Fn(&str, String) -> Option<String>) {
     for entry in fs::read_dir(dst).into_iter().flatten() {
         let path = entry.expect("the copied root").path();
         if !src.join(path.file_name().expect("a file")).exists() {
@@ -135,7 +135,12 @@ fn copy_slang(src: &Path, dst: &Path, edit: &dyn Fn(&str, String) -> String) {
         if path.is_dir() {
             copy_slang(&path, &target, edit);
         } else if name.ends_with(".slang") {
-            let text = edit(&name, fs::read_to_string(&path).expect("a shader file"));
+            let Some(text) = edit(&name, fs::read_to_string(&path).expect("a shader file")) else {
+                if target.exists() {
+                    fs::remove_file(&target).expect("the copied root");
+                }
+                continue;
+            };
             fs::create_dir_all(dst).expect("the copied root");
             if fs::read_to_string(&target).ok().as_deref() != Some(text.as_str()) {
                 fs::write(&target, text).expect("the copied root");
@@ -150,7 +155,7 @@ fn main() {
     let src = manifest.join("renderer");
     let edited_src = out.join("edited-renderer-src");
     copy_slang(&src, &edited_src, &|name, text| {
-        if name == "resolve.slang" {
+        Some(if name == "resolve.slang" {
             text.replace(
                 "uint pad2;",
                 "uint pad2;
@@ -158,7 +163,7 @@ fn main() {
             )
         } else {
             text
-        }
+        })
     });
     println!(
         "cargo:rerun-if-changed={}",
@@ -169,7 +174,9 @@ fn main() {
     let orr_points = env::var("DEP_ORR_LINK_POINTS").expect("orr's link points");
 
     let hot_consumer = out.join("hot-consumer");
-    copy_slang(&manifest.join("consumer"), &hot_consumer, &|_, text| text);
+    copy_slang(&manifest.join("consumer"), &hot_consumer, &|_, text| {
+        Some(text)
+    });
     let hot_modules: Vec<String> = LINKS
         .iter()
         .map(|(_, _, module, _)| {
