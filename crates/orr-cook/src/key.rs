@@ -25,7 +25,7 @@ pub(crate) const VERSIONS: &[(Class, u32)] = &[
     (Class::Skeleton, 1),
     (Class::Clip, 1),
     (Class::NeuralTextureSet, 1),
-    (Class::Subd, 1),
+    (Class::Subd, 2),
     (Class::Volume, 1),
 ];
 

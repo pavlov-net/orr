@@ -114,6 +114,45 @@ public struct GroupGpu
     public float log2_scale_max;
 }
 
+bool palette_unset(float3x4 m)
+{
+    return all(m[0] == 0.0) && all(m[1] == 0.0) && all(m[2] == 0.0);
+}
+
+// Whether `count` skinning palette entries from `first` are all set: an all-zero entry hides
+// the copy, as an all-zero transform hides a rigid one.
+public bool palette_set(GroupGpu* palette, uint first, uint count)
+{
+    float3x4* p = (float3x4*)palette.current + first;
+    for (uint j = 0; j < count; j++)
+    {
+        if (palette_unset(p[j]))
+            return false;
+    }
+    return true;
+}
+
+// The weighted sum of the palette entries of `joints` (clamped to the `count` from `first`),
+// this frame's or last frame's; last frame's entry is this frame's where it was unset.
+public float3x4 palette_blend(GroupGpu* palette, uint first, uint count, uint4 joints, float4 weights, bool previous)
+{
+    float3x4 m = float3x4(0.0);
+    for (uint i = 0; i < 4; i++)
+    {
+        if (weights[i] <= 0.0)
+            continue;
+        uint at = first + min(joints[i], count - 1);
+        float3x4 e = ((float3x4*)palette.current)[at];
+        if (previous)
+        {
+            float3x4 before = ((float3x4*)palette.previous)[at];
+            e = palette_unset(before) ? e : before;
+        }
+        m += weights[i] * e;
+    }
+    return m;
+}
+
 // A discrete level of a mesh: its error and its range of mesh cluster indices.
 public struct MeshLevel
 {

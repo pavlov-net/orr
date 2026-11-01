@@ -1,5 +1,5 @@
-//! Compiles orr-lighting's `bsdf`, with the orr-scene modules it imports, for the CPU through
-//! `slang/bsdf_cpu.slang` (array LUTs), and for SPIR-V and Metal through
+//! Compiles orr-lighting's `bsdf`, with the orr-scene and orr-pack modules it imports, for
+//! the CPU through `slang/bsdf_cpu.slang` (array LUTs), and for SPIR-V and Metal through
 //! `gpu/bsdf_cases.slang` (heap LUTs). The harness's `Inputs` come from `tests/openpbr-ref/gpu`.
 
 use std::env;
@@ -11,12 +11,14 @@ fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let lighting = manifest.join("../../crates/orr-lighting/src");
     let scene = manifest.join("../../crates/orr-scene/src");
+    let pack = manifest.join("../../crates/orr-pack/shaders");
     let inputs = manifest.join("../openpbr-ref/gpu");
     let result = CpuLibrary::new()
         .and_then(|b| {
             b.source("slang/bsdf_cpu.slang")
                 .include(&lighting)
                 .include(&scene)
+                .include(&pack)
                 .include(&inputs)
                 .include(manifest.join("gpu"))
                 .define("ORR_OPENPBR_ARRAY_LUTS", "1")
@@ -27,6 +29,7 @@ fn main() {
             b.kernels(manifest.join("gpu"))
                 .include(&lighting)
                 .include(&scene)
+                .include(&pack)
                 .include(&inputs)
                 .extern_type("Inputs", "::openpbr_ref::Inputs")
                 .metal_check(true)

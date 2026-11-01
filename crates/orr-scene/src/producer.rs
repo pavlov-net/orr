@@ -20,7 +20,8 @@ use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::scene::{InstanceFlags, TransformGroupId};
 use crate::shaders::producer_build::{self, BuildRoot, ProducerBuildGpu};
-use crate::shaders::types::{GeneratedClusterGpu, TessGpu, TessStateGpu};
+use crate::shaders::types::{GeneratedClusterGpu, SubdCopyGpu, TessGpu, TessStateGpu};
+use crate::subd::{CageShape, SubdBuild};
 use crate::tessellate::{EntryTess, Layout, PATTERNS, Patterns, TessellationStats};
 use crate::{ProducerBatch, ProducerClusterGpu, ProducerGpu, Result, SceneRoot, TopologyGpu};
 use bytemuck::Zeroable;
@@ -250,6 +251,8 @@ pub(crate) struct Producer {
     pub emit_counts: GpuPtr<[u32; 2]>,
     /// A tessellated entry's work memory.
     pub tess: Option<EntryTess>,
+    /// A subdivision copy's record and its cage's sizes.
+    pub subd: Option<(GpuPtr<SubdCopyGpu>, CageShape)>,
     accel: Option<Accel>,
     /// Held while the entry is set.
     _memory: Allocation<u8>,
@@ -335,13 +338,19 @@ impl BatchAt {
 }
 
 /// Builds an entry's allocation and records. A tessellated entry takes its generated
-/// clusters' topologies and CLAS templates from `patterns`.
+/// clusters' topologies and CLAS templates from `patterns`; a subdivision copy's also holds
+/// its copy record and, skinned, its posed cage points and page points.
 pub(crate) fn build(
     device: &Device,
     desc: &ProducerDesc<'_>,
     counts: GpuPtr<[u32; 2]>,
     patterns: &Patterns,
+    subd: Option<&SubdBuild>,
 ) -> Result<Built> {
+    assert!(
+        subd.is_none() || desc.tessellated,
+        "a subdivision copy is a tessellated entry"
+    );
     assert!(
         desc.topologies.len() < 256,
         "{} topologies; at most 255",
@@ -408,7 +417,16 @@ pub(crate) fn build(
     let curve_at = take(12 * CURVE as u64);
     let build_at = take(size_of::<ProducerBuildGpu>() as u64);
     let tess_at = take(only(tessellated, size_of::<TessGpu>() as u64));
+    let copy_at = take(only(subd.is_some(), size_of::<SubdCopyGpu>() as u64));
     let static_len = take(0) as usize;
+    let posed = subd.filter(|s| s.palette.is_some()).map(|s| {
+        let points = 12 * u64::from(s.shape.points);
+        [
+            take(24 * u64::from(s.shape.cage_points)),
+            take(points),
+            take(points),
+        ]
+    });
     let drawn = BatchAt::new(desc, desc.max_clusters, desc.max_vertices, &mut take);
     let generated_at = take(only(
         tessellated,
@@ -474,9 +492,31 @@ pub(crate) fn build(
         topology_count: built_topologies as u32,
         geometry_flags: if opaque { GEOMETRY_OPAQUE } else { 0 },
     };
+    let copy = subd.map(|s| {
+        let (group, first, joints) = s.palette.unwrap_or((0, 0, 0));
+        let [posed, points, previous] = match posed {
+            Some(p) => p.map(|o| at(o).cast()),
+            None => [GpuPtr::NULL, s.points, s.points],
+        };
+        SubdCopyGpu {
+            cage: s.cage,
+            points,
+            previous,
+            posed,
+            palette_group: group,
+            palette_first: first,
+            joint_count: joints,
+            _pad: 0,
+        }
+    });
+    let copy_ptr = if subd.is_some() {
+        at(copy_at).cast()
+    } else {
+        GpuPtr::NULL
+    };
     let tess_record = tess_layout
         .as_ref()
-        .map(|l| l.record(at, desc.displacement_reach));
+        .map(|l| l.record(at, desc.displacement_reach, copy_ptr));
     let mut bytes = vec![0u8; static_len];
     let mut put = |offset: u64, data: &[u8]| {
         bytes[offset as usize..][..data.len()].copy_from_slice(data);
@@ -488,6 +528,9 @@ pub(crate) fn build(
     put(build_at, bytemuck::bytes_of(&build_record));
     if let Some(r) = &tess_record {
         put(tess_at, bytemuck::bytes_of(r));
+    }
+    if let Some(c) = &copy {
+        put(copy_at, bytemuck::bytes_of(c));
     }
 
     let accel = if traced {
@@ -615,6 +658,7 @@ pub(crate) fn build(
                 args: at(l.args).cast(),
                 weld_slots: l.weld_slots,
             }),
+            subd: subd.map(|s| (copy_ptr, s.shape)),
             accel,
             _memory: memory,
         },

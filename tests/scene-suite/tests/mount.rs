@@ -6,7 +6,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bytemuck::Pod;
@@ -29,10 +28,11 @@ use orr_scene::testing::{
 };
 use orr_scene::{
     Affine3, BoundTexture, Budgets, EmissiveGpu, Error, FrameDesc, FrameTime, GroupWriter,
-    InstanceFlags, InstancesDesc, LoadState, Loading, MaterialGpu, MeshGpu, ModelGpu, ModelId,
-    MountId, PackSource, RendererDesc, ResidencyClass, SceneDesc, SceneId, SceneRoot, SceneWriter,
-    Scenes, TransformGroupDesc, material_flags,
+    InstanceFlags, InstancesDesc, LoadState, MaterialGpu, MeshGpu, ModelGpu, ModelId, MountId,
+    PackSource, RendererDesc, ResidencyClass, SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes,
+    TransformGroupDesc, material_flags,
 };
+use scene_suite::Workers;
 
 const ALBEDO: &str = "kit/albedo";
 
@@ -263,34 +263,6 @@ fn ready_whole(scenes: &mut Scenes, m: MountId, a: &Archive) {
             return;
         }
         std::thread::sleep(Duration::from_millis(1));
-    }
-}
-
-/// Threads lent to the loading side until dropped.
-struct Workers {
-    loading: Arc<Loading>,
-    threads: Vec<JoinHandle<()>>,
-}
-
-impl Workers {
-    fn start(scenes: &Scenes, n: usize) -> Self {
-        let loading = scenes.loading();
-        let threads = (0..n)
-            .map(|_| {
-                let l = Arc::clone(&loading);
-                std::thread::spawn(move || l.run_worker())
-            })
-            .collect();
-        Self { loading, threads }
-    }
-}
-
-impl Drop for Workers {
-    fn drop(&mut self) {
-        self.loading.stop_workers();
-        for t in self.threads.drain(..) {
-            t.join().unwrap();
-        }
     }
 }
 

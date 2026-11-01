@@ -19,7 +19,7 @@ bytemuck.workspace = true
 half.workspace = true
 orr-color.workspace = true
 orr-math.workspace = true
-orr-cook = { path = "../../crates/orr-cook" }
+orr-cook = { workspace = true, features = ["subd"] }
 orr-pack.workspace = true
 png = "0.18"
 

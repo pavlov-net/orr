@@ -9,6 +9,7 @@
 module tessellation;
 
 import orr.abi;
+__exported import subd_cage;
 
 public static const uint MAX_DICE = 11;
 public static const uint BARY_ONE = 65534;
@@ -136,6 +137,7 @@ public struct TessGpu
     public uint* weld;           // weld_mask + 1 slots: a generated vertex + 1, 0 empty
     public uint* counters;       // TESS_*
     public uint* args;           // TESS_ARGS_*
+    public SubdCopyGpu* subd;    // a subdivision copy's: patch triangles lie on its limit surface; null for producer kernels' patches
     public uint queue_capacity;
     public uint dice_capacity;
     public uint weld_mask;

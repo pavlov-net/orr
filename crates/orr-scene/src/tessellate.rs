@@ -14,8 +14,12 @@ use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::producer::{Op, curve};
 use crate::shaders::patterns::{self as patterns_kernel, TemplatesRoot};
+use crate::shaders::subd_patches::{self as subd_kernel, SubdRoot};
 use crate::shaders::tessellate::{self as tessellate_kernel, TessRoot};
-use crate::shaders::types::{PatchItem, PatternGpu, PatternTable, TessGpu, TessStateGpu};
+use crate::shaders::types::{
+    PatchItem, PatternGpu, PatternTable, SubdCopyGpu, TessGpu, TessStateGpu,
+};
+use crate::subd::CageShape;
 use crate::{RasterGpu, Result, SceneRoot, TopologyGpu, ViewConstants};
 
 pub use crate::pattern::{BARY_ONE, MAX_DICE, PATTERNS, Pattern};
@@ -276,7 +280,12 @@ impl Layout {
         }
     }
 
-    pub(crate) fn record(&self, at: impl Fn(u64) -> GpuPtr<u8>, reach: f32) -> TessGpu {
+    pub(crate) fn record(
+        &self,
+        at: impl Fn(u64) -> GpuPtr<u8>,
+        reach: f32,
+        subd: GpuPtr<SubdCopyGpu>,
+    ) -> TessGpu {
         TessGpu {
             queue: self.queue.map(|o| at(o).cast()),
             dice: at(self.dice).cast(),
@@ -284,6 +293,7 @@ impl Layout {
             weld: at(self.weld).cast(),
             counters: at(self.counters).cast(),
             args: at(self.args).cast(),
+            subd,
             queue_capacity: self.queue_capacity,
             dice_capacity: self.queue_capacity,
             weld_mask: self.weld_slots - 1,
@@ -292,8 +302,11 @@ impl Layout {
     }
 }
 
-/// The `tessellate` and `patterns` pipelines.
+/// The `tessellate`, `patterns` and `subd_patches` pipelines.
 pub(crate) struct TessKernels {
+    pose: PipelineId,
+    stencils: PipelineId,
+    fill: PipelineId,
     begin: PipelineId,
     patches: PipelineId,
     args: PipelineId,
@@ -313,9 +326,16 @@ impl TessKernels {
         kernels: &orr_gpu::KernelSet,
         p: &mut Pipelines,
     ) -> Result<Self> {
+        let s = &subd_kernel::MODULE;
+        let pose = p.create(device, kernels, s, "pose", Default::default())?;
+        let stencils = p.create(device, kernels, s, "stencils", Default::default())?;
+        let fill = p.create(device, kernels, s, "fill", Default::default())?;
         let m = &tessellate_kernel::MODULE;
         let mut c = |entry| p.create(device, kernels, m, entry, Default::default());
         Ok(Self {
+            pose,
+            stencils,
+            fill,
             begin: c("begin")?,
             patches: c("patches")?,
             args: c("args")?,
@@ -354,10 +374,13 @@ pub(crate) struct Job {
     /// The scene focus as a cell, an offset and pixels per radian.
     pub focus: Option<([i32; 4], [f32; 4])>,
     pub seen: Option<SeenBy>,
+    /// A subdivision copy's record and its cage's sizes.
+    pub subd: Option<(GpuPtr<SubdCopyGpu>, CageShape)>,
 }
 
-/// Records the template builds once, then the passes that dice every job's patches into its
-/// generated batch, each stage's dispatches side by side.
+/// Records the template builds once, the fill of every subdivision copy's patch batch, then
+/// the passes that dice every job's patches into its generated batch, each stage's
+/// dispatches side by side.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record(
     device: &Device,
@@ -406,6 +429,7 @@ pub(crate) fn record(
     let to_indirect = |list: &mut CommandList<'_>| {
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
     };
+    record_subd(device, window, list, p, k, jobs)?;
     let base = roots(0)?;
     for &r in &base {
         list.dispatch(p.get(k.begin), r, [1, 1, 1]);
@@ -455,6 +479,54 @@ pub(crate) fn record(
     }
     list.end_pass();
     list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
+    Ok(())
+}
+
+/// Writes the patch batch of every subdivision copy among `jobs`: skinned copies pose their
+/// cage points and apply the stencils first.
+fn record_subd(
+    device: &Device,
+    window: &UploadWindow,
+    list: &mut CommandList<'_>,
+    p: &Pipelines,
+    k: &TessKernels,
+    jobs: &[Job],
+) -> Result<()> {
+    let copies: Vec<(GpuPtr<SubdRoot>, CageShape)> = jobs
+        .iter()
+        .filter_map(|j| {
+            j.subd.map(|(copy, shape)| {
+                let root = SubdRoot {
+                    scene: j.scene,
+                    copy,
+                    entry: j.entry,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                };
+                window.put_root(device, &root).map(|r| (r, shape))
+            })
+        })
+        .collect::<Result<_>>()?;
+    if copies.is_empty() {
+        return Ok(());
+    }
+    let groups = |n: u32| [n.div_ceil(64), 1, 1];
+    let skinned = || copies.iter().filter(|(_, s)| s.skinned);
+    if skinned().next().is_some() {
+        for (r, s) in skinned() {
+            list.dispatch(p.get(k.pose), *r, groups(s.cage_points));
+        }
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        for (r, s) in skinned() {
+            list.dispatch(p.get(k.stencils), *r, groups(s.points));
+        }
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+    }
+    for (r, s) in &copies {
+        list.dispatch(p.get(k.fill), *r, groups(s.vertices.max(s.clusters).max(1)));
+    }
+    list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
     Ok(())
 }
 

@@ -75,24 +75,6 @@ uint coarsest(SkinMeshGpu* m, float scale, float distance, float limit)
     return 0;
 }
 
-bool unset(float3x4 m)
-{
-    return all(m[0] == 0.0) && all(m[1] == 0.0) && all(m[2] == 0.0);
-}
-
-// Whether every palette entry of the copy is set: an all-zero entry hides the copy, as an
-// all-zero transform hides a rigid one.
-bool palette_shown(GroupGpu* palette, SkinnedGpu k)
-{
-    float3x4* p = (float3x4*)palette.current + k.palette_first;
-    for (uint j = 0; j < k.joint_count; j++)
-    {
-        if (unset(p[j]))
-            return false;
-    }
-    return true;
-}
-
 // One thread per skinned copy.
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -123,7 +105,7 @@ void select(uint3 id: SV_DispatchThreadID)
     bool shown = (inst.flags & (INSTANCE_RASTER | INSTANCE_RAY)) != 0 && sm != nullptr && sm.cut_count > 0
         && palette.current != nullptr && k.palette_first + k.joint_count <= palette.count
         && placement(g, g.current, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, uint(s.origin_cell.w), p);
-    if (!shown || !palette_shown(palette, k))
+    if (!shown || !palette_set(palette, k.palette_first, k.joint_count))
         return;
 
     bool focus = root.focus_cell.w != 0;
@@ -210,28 +192,9 @@ void args(uint3 id: SV_DispatchThreadID)
     f.counters[SKIN_ARGS + 2] = 1;
 }
 
-// The palette entry of joint `j`, this frame's or last frame's; last frame's is this frame's
-// where it was unset.
-float3x4 joint(GroupGpu* palette, SkinnedGpu k, uint j, bool previous)
-{
-    uint at = k.palette_first + min(j, k.joint_count - 1);
-    float3x4 now = ((float3x4*)palette.current)[at];
-    if (!previous)
-        return now;
-    float3x4 before = ((float3x4*)palette.previous)[at];
-    return unset(before) ? now : before;
-}
-
-// The weighted sum of the joints' palette entries.
 float3x4 blend(GroupGpu* palette, SkinnedGpu k, VertexAttributes a, bool previous)
 {
-    float3x4 m = float3x4(0.0);
-    for (uint i = 0; i < 4; i++)
-    {
-        if (a.weights[i] > 0.0)
-            m += a.weights[i] * joint(palette, k, a.joints[i], previous);
-    }
-    return m;
+    return palette_blend(palette, k.palette_first, k.joint_count, a.joints, a.weights, previous);
 }
 
 groupshared uint box_lo[3];
