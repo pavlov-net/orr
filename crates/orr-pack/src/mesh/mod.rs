@@ -80,7 +80,9 @@ pub struct MeshHeader {
     /// top page.
     pub node_pages: Span,
     /// DAG mode: u32 root node per (part, section), part-major, then one per section for
-    /// the merged stage; [`Self::NO_ROOT`] where the stage has no triangles.
+    /// the merged stage. A stage may cover several sections: its root sits at its first
+    /// section's slot and covers clusters of all of them. [`Self::NO_ROOT`] where no stage
+    /// starts.
     pub roots: Span,
     /// [`PageInfo`] per page.
     pub pages: Span,

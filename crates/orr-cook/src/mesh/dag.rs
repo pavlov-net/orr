@@ -1,17 +1,23 @@
 //! Cluster LOD DAGs through meshoptimizer's clusterlod.
 //!
-//! The part stage is one DAG per (part, section), with every grid position another piece
-//! shares locked. With parts and a merge error it is cut at that error: groups at or over
-//! it become terminal and the clusters simplified from them go. Each section then starts a
-//! merged stage from the terminal clusters of all its parts at rest pose, one DAG per
-//! section with section borders locked, its errors raised by the merge error. A copy draws
-//! one stage or the other as a whole, so the stages need no crack-free join.
+//! The part stage is one DAG per (part, class), a class being the sections that cluster
+//! alike (the same vertex limit, and no border dilation, which moves each side of a seam on
+//! its own), with every grid position another stage shares locked. Within a stage the
+//! sections stay apart as attribute seams: a vertex belongs to one section, and positions
+//! where sections meet are protected, so the (permissive) simplifier moves them only along
+//! the border and never onto another section's vertex; the border coarsens with the rest.
+//! Clusters are cut by section as they are emitted; the pieces of one cluster share its
+//! group and bounds, so a cut takes all of them or none. With parts and a merge error the
+//! part stage is cut at that error: groups at or over it become terminal and the clusters
+//! simplified from them go. Each class then starts a merged stage from the terminal
+//! clusters of all its parts at rest pose, its errors raised by the merge error. A copy
+//! draws one stage or the other as a whole, so the stages need no crack-free join.
 //!
 //! `clodBuild` runs through the FFI: with border dilation it moves positions in place, so
 //! the output callback copies each cluster's positions as emitted and snaps them to the
 //! mesh grid.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::raw::{c_int, c_void};
 
 use meshopt::ffi;
@@ -25,13 +31,19 @@ use rayon::prelude::*;
 use super::lod::{self, Parts, Welded};
 use super::{Built, ClusterData, Ctx, Grid, MeshSettings, store_page, write_page};
 
-/// A triangle corner: its welded vertex and grid position.
-type Corner = (u32, [i32; 3]);
+/// Sections that share a stage: the cluster vertex limit, and the section itself when its
+/// borders dilate.
+type Class = (u16, Option<u8>);
 
-/// One input to `clodBuild`: vertices referring to welded vertices, at grid positions.
+/// A triangle corner: its welded vertex, grid position and section.
+type Corner = (u32, [i32; 3], u8);
+
+/// One input to `clodBuild`: vertices referring to welded vertices, at grid positions, in
+/// sections.
 struct Input {
     welded: Vec<u32>,
     cells: Vec<[i32; 3]>,
+    sections: Vec<u8>,
     lock: Vec<u8>,
     indices: Vec<u32>,
 }
@@ -45,6 +57,7 @@ pub(crate) struct DagCluster {
     pub tris: Vec<u8>,
     /// The stage group whose simplification made the cluster; -1 for the stage's source.
     pub refined: i32,
+    pub section: u8,
 }
 
 pub(crate) struct DagGroup {
@@ -57,7 +70,8 @@ pub(crate) struct DagGroup {
 
 pub(crate) struct Stage {
     pub part: u8,
-    pub section: u8,
+    /// The sections of the stage's class that have triangles, ascending.
+    pub sections: Vec<u8>,
     pub merged: bool,
     /// Error of the stage's source geometry: 0, or the merge error on a merged stage.
     pub base: f32,
@@ -89,8 +103,8 @@ impl Snap {
     }
 }
 
-/// Every stage of the mesh: the part stage per (part, section) with triangles, part-major,
-/// then the merged stage per section.
+/// Every stage of the mesh: the part stage per (part, class) with triangles, part-major,
+/// then the merged stage per class.
 pub(crate) fn stages(
     w: &Welded,
     grid: &Grid,
@@ -105,29 +119,42 @@ pub(crate) fn stages(
         min: [0, 1, 2].map(|a| grid.cells.iter().map(|c| c[a]).min().unwrap_or(0)),
         max: [0, 1, 2].map(|a| grid.cells.iter().map(|c| c[a]).max().unwrap_or(0)),
     };
-    let pieces: Vec<(u8, u8, Vec<Corner>)> = lod::pieces(w, parts)
-        .into_iter()
-        .map(|p| {
-            let corners = p.indices.iter().map(|&v| (v, grid.cells[v as usize]));
-            (p.part, p.section, corners.collect())
-        })
-        .collect();
     let options = |section: u8| Options {
         limits: limits(section),
         dilate: s.dilate_double_sided && flags[usize::from(section)] & Section::DOUBLE_SIDED != 0,
         regularize: skinned,
     };
+    // Sections that cluster alike share a stage. Border dilation moves each side of a
+    // seam on its own, so a dilated section keeps a stage of its own.
+    let class = |section: u8| -> Class {
+        let o = options(section);
+        (o.limits.max_vertices, o.dilate.then_some(section))
+    };
+    let mut by_stage: BTreeMap<(u8, Class), (Vec<u8>, Vec<Corner>)> = BTreeMap::new();
+    for p in lod::pieces(w, parts) {
+        let (sections, corners) = by_stage.entry((p.part, class(p.section))).or_default();
+        sections.push(p.section);
+        corners.extend(
+            p.indices
+                .iter()
+                .map(|&v| (v, grid.cells[v as usize], p.section)),
+        );
+    }
+    let pieces: Vec<(u8, Vec<u8>, Vec<Corner>)> = by_stage
+        .into_iter()
+        .map(|((part, _), (sections, corners))| (part, sections, corners))
+        .collect();
     let (shared, seams) = borders(w, pieces.iter().map(|p| p.2.as_slice()));
     let mut stages: Vec<Stage> = pieces
         .par_iter()
-        .map(|(part, section, corners)| {
-            let input = input(corners, |v, _| v, &shared, &seams);
+        .map(|(part, sections, corners)| {
+            let input = input(corners, |v, _, section| (v, section), &shared, &seams);
             Stage {
                 part: *part,
-                section: *section,
+                sections: sections.clone(),
                 merged: false,
                 base: 0.0,
-                groups: build(&input, w, &snap, options(*section)),
+                groups: build(&input, w, &snap, options(sections[0])),
             }
         })
         .collect();
@@ -138,21 +165,31 @@ pub(crate) fn stages(
     for st in &mut stages {
         truncate(&mut st.groups, m);
     }
-    // Each section's merged source: its parts' terminal clusters at their emitted positions.
-    let mut sources: Vec<Vec<Corner>> = vec![Vec::new(); w.sections.len()];
+    // Each class's merged source: its parts' terminal clusters at their emitted positions.
+    let mut sources: BTreeMap<Class, (Vec<u8>, Vec<Corner>)> = BTreeMap::new();
     for st in &stages {
-        let corners = &mut sources[usize::from(st.section)];
+        let (sections, corners) = sources.entry(class(st.sections[0])).or_default();
+        sections.extend(&st.sections);
         for g in st.groups.iter().filter(|g| g.error == f32::INFINITY) {
             for c in &g.clusters {
                 for &k in &c.tris {
                     let k = usize::from(k);
-                    corners.push((c.verts[k], c.cells[k]));
+                    corners.push((c.verts[k], c.cells[k], c.section));
                 }
             }
         }
     }
-    let (shared, seams) = borders(w, sources.iter().map(Vec::as_slice));
-    // Vertices of different parts join where they share a position and attributes.
+    let sources: Vec<(Vec<u8>, Vec<Corner>)> = sources
+        .into_values()
+        .filter(|s| !s.1.is_empty())
+        .map(|(mut sections, corners)| {
+            sections.sort_unstable();
+            sections.dedup();
+            (sections, corners)
+        })
+        .collect();
+    let (shared, seams) = borders(w, sources.iter().map(|s| s.1.as_slice()));
+    // Vertices of different parts join where they share a position, attributes and section.
     let attrs = |v: u32| {
         let v = v as usize;
         let mut k = [0u32; 11];
@@ -169,17 +206,20 @@ pub(crate) fn stages(
     };
     let merged: Vec<Stage> = sources
         .par_iter()
-        .enumerate()
-        .filter(|(_, c)| !c.is_empty())
-        .map(|(section, corners)| {
-            let input = input(corners, |v, cell| (cell, attrs(v)), &shared, &seams);
-            let mut groups = build(&input, w, &snap, options(section as u8));
+        .map(|(sections, corners)| {
+            let input = input(
+                corners,
+                |v, cell, section| (cell, attrs(v), section),
+                &shared,
+                &seams,
+            );
+            let mut groups = build(&input, w, &snap, options(sections[0]));
             for g in &mut groups {
                 g.error += m;
             }
             Stage {
                 part: 0,
-                section: section as u8,
+                sections: sections.clone(),
                 merged: true,
                 base: m,
                 groups,
@@ -190,20 +230,30 @@ pub(crate) fn stages(
     stages
 }
 
-/// Positions the pieces share, which stay locked, and uv seams, which stay protected.
+/// Positions the stages share, which stay locked, and uv and section seams, which stay
+/// protected.
 fn borders<'a>(
     w: &Welded,
-    pieces: impl Iterator<Item = &'a [Corner]> + Clone,
+    stages: impl Iterator<Item = &'a [Corner]> + Clone,
 ) -> (HashSet<[i32; 3]>, HashSet<[i32; 3]>) {
-    let shared = lod::shared_cells(pieces.clone().map(|c| c.iter().map(|&(_, cell)| cell)));
-    let seams = lod::seam_cells(w, pieces.flatten().copied());
+    let shared = lod::shared_cells(stages.clone().map(|c| c.iter().map(|&(_, cell, _)| cell)));
+    let mut seams = lod::seam_cells(w, stages.clone().flatten().map(|&(v, cell, _)| (v, cell)));
+    for corners in stages {
+        let mut section_of: HashMap<[i32; 3], u8> = HashMap::new();
+        for &(_, cell, section) in corners {
+            if *section_of.entry(cell).or_insert(section) != section {
+                seams.insert(cell);
+            }
+        }
+    }
     (shared, seams)
 }
 
-/// A compact `clodBuild` input over `corners`, one vertex per distinct `key`.
+/// A compact `clodBuild` input over `corners`, one vertex per distinct `key`; corners with
+/// different keys never share a vertex.
 fn input<K: std::hash::Hash + Eq>(
     corners: &[Corner],
-    key: impl Fn(u32, [i32; 3]) -> K,
+    key: impl Fn(u32, [i32; 3], u8) -> K,
     shared: &HashSet<[i32; 3]>,
     seams: &HashSet<[i32; 3]>,
 ) -> Input {
@@ -211,13 +261,15 @@ fn input<K: std::hash::Hash + Eq>(
     let mut input = Input {
         welded: Vec::new(),
         cells: Vec::new(),
+        sections: Vec::new(),
         lock: Vec::new(),
         indices: Vec::with_capacity(corners.len()),
     };
-    for &(v, cell) in corners {
-        let l = *local_of.entry(key(v, cell)).or_insert_with(|| {
+    for &(v, cell, section) in corners {
+        let l = *local_of.entry(key(v, cell, section)).or_insert_with(|| {
             input.welded.push(v);
             input.cells.push(cell);
+            input.sections.push(section);
             input
                 .lock
                 .push(lod::vertex_flags(cell, shared, seams).bits());
@@ -268,6 +320,7 @@ struct Options {
 struct Output<'a> {
     groups: Vec<DagGroup>,
     welded: &'a [u32],
+    sections: &'a [u8],
     positions: *const f32,
     snap: &'a Snap,
     local_vertices: Vec<u32>,
@@ -314,6 +367,7 @@ fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
     let mut out = Output {
         groups: Vec::new(),
         welded: &input.welded,
+        sections: &input.sections,
         positions: positions_ptr,
         snap,
         local_vertices: vec![0; max_indices],
@@ -364,24 +418,61 @@ unsafe extern "C" fn emit(
             )
         };
         let local = &o.local_vertices[..n];
-        let cells = local
-            .iter()
-            .map(|&v| {
-                // SAFETY: `v` is below `vertex_count`, and positions hold 3 floats per
-                // vertex.
-                let p = unsafe {
-                    let p = o.positions.add(v as usize * 3);
-                    [*p, *p.add(1), *p.add(2)]
-                };
-                o.snap.cell(p)
-            })
-            .collect();
-        out.push(DagCluster {
-            verts: local.iter().map(|&v| o.welded[v as usize]).collect(),
-            cells,
-            tris: o.local_triangles[..c.index_count].to_vec(),
-            refined: c.refined,
-        });
+        let tris = &o.local_triangles[..c.index_count];
+        let section_of = |t: &[u8]| o.sections[local[usize::from(t[0])] as usize];
+        // One cluster per section: a triangle's corners all lie in one section.
+        let mut pieces: Vec<(u8, Vec<u32>, Vec<u8>)> = Vec::new();
+        if tris
+            .chunks_exact(3)
+            .all(|t| section_of(t) == section_of(tris))
+        {
+            pieces.push((section_of(tris), local.to_vec(), tris.to_vec()));
+        } else {
+            let mut by_section: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
+            for t in tris.chunks_exact(3) {
+                by_section
+                    .entry(section_of(t))
+                    .or_default()
+                    .extend_from_slice(t);
+            }
+            for (section, corners) in by_section {
+                let mut new_of = [u16::MAX; 256];
+                let mut used = Vec::new();
+                let tris = corners
+                    .iter()
+                    .map(|&k| {
+                        let k = usize::from(k);
+                        if new_of[k] == u16::MAX {
+                            new_of[k] = used.len() as u16;
+                            used.push(local[k]);
+                        }
+                        new_of[k] as u8
+                    })
+                    .collect();
+                pieces.push((section, used, tris));
+            }
+        }
+        for (section, used, tris) in pieces {
+            let cells = used
+                .iter()
+                .map(|&v| {
+                    // SAFETY: `v` is below `vertex_count`, and positions hold 3 floats per
+                    // vertex.
+                    let p = unsafe {
+                        let p = o.positions.add(v as usize * 3);
+                        [*p, *p.add(1), *p.add(2)]
+                    };
+                    o.snap.cell(p)
+                })
+                .collect();
+            out.push(DagCluster {
+                verts: used.iter().map(|&v| o.welded[v as usize]).collect(),
+                cells,
+                tris,
+                refined: c.refined,
+                section,
+            });
+        }
     }
     let b = group.simplified;
     o.groups.push(DagGroup {
@@ -510,8 +601,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
                 .iter()
                 .map(|c| {
                     let tris = c.tris.clone();
-                    let mut d =
-                        cx.cluster(st.section, st.part, st.merged, &c.verts, &c.cells, tris);
+                    let mut d = cx.cluster(c.section, st.part, st.merged, &c.verts, &c.cells, tris);
                     let r = &mut d.record;
                     (r.self_sphere, r.self_error) = match usize::try_from(c.refined) {
                         Ok(from) => (st.groups[from].sphere, st.groups[from].error),
@@ -689,12 +779,13 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
         }
     }
     let sections = cx.sections.len();
+    // A stage's root sits at its first section's slot.
     let stage_of = |part: usize, section: usize, merged: bool| {
         stages
             .iter()
             .position(|st| {
                 usize::from(st.part) == part
-                    && usize::from(st.section) == section
+                    && usize::from(st.sections[0]) == section
                     && st.merged == merged
             })
             .map_or(MeshHeader::NO_ROOT, |si| stage_root[si])
