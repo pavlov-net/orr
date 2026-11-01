@@ -105,7 +105,150 @@ public float3 material_normal(SurfaceInput i, MaterialGpu* m)
     return safe_normalize(t * v.x + b * v.y + n * v.z, n);
 }
 
-// OpenPBR from the hit's `MaterialGpu` and its textures.
+// What the decals over a hit write: per parameter the sum of each decal's value times its
+// share, blended in id order (higher ids over lower), and how much of the surface's own
+// value they cover, 0 to 1.
+public struct DecalLayer
+{
+    public float3 base_color;
+    public float base_color_cover;
+    public float3 normal;          // render space
+    public float normal_cover;
+    public float3 emission;        // nits, unexposed
+    public float emission_cover;
+    public float roughness;
+    public float roughness_cover;
+    public float metalness;
+    public float metalness_cover;
+}
+
+void decal_over(inout float3 sum, inout float cover, float3 value, float share)
+{
+    sum = sum * (1.0 - share) + value * share;
+    cover += share - cover * share;
+}
+
+void decal_over(inout float sum, inout float cover, float value, float share)
+{
+    sum = sum * (1.0 - share) + value * share;
+    cover += share - cover * share;
+}
+
+// Decal `d` blended over `layer` at hit `i`, `relative` from the decal's center, with the
+// hit's footprint `px`, `py` (m, on the surface).
+void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 relative, float3 px, float3 py)
+{
+    float3 axis_x = d.axis_x;
+    float3 axis_y = d.axis_y;
+    float3 local = float3(dot(relative, axis_x) * d.inv_half_x, dot(relative, axis_y) * d.inv_half_y, dot(relative, d.axis_z) * d.inv_half_z);
+    if (any(abs(local) > 1.0))
+        return;
+    float facing = dot(i.geometric_normal, d.axis_z);
+    float share = d.opacity * saturate((facing - d.cos_none) / max(d.cos_full - d.cos_none, 1e-6));
+    if (d.depth_fade > 0.0)
+        share *= saturate((1.0 - abs(local.z)) / d.depth_fade);
+    if (share <= 0.0)
+        return;
+
+    MaterialGpu* m = i.scene.materials + d.material;
+    float2 scale = float2(0.5 * d.inv_half_x, -0.5 * d.inv_half_y);
+    UvFootprint f;
+    f.uv = float2(0.5, 0.5) + local.xy * float2(0.5, -0.5);
+    f.dx = float2(dot(px, axis_x), dot(px, axis_y)) * scale;
+    f.dy = float2(dot(py, axis_x), dot(py, axis_y)) * scale;
+    f.tap = i.uv.tap;
+    float4 one = float4(1.0);
+    share *= m.geometry_opacity;
+    if (material_bound(m, TEXTURE_OPACITY))
+        share *= material_texture(m, TEXTURE_OPACITY, f, one).x;
+    else if (material_bound(m, TEXTURE_BASE_COLOR))
+        share *= material_texture(m, TEXTURE_BASE_COLOR, f, one).w;
+    if (share <= 0.0)
+        return;
+
+    uint c = d.channels;
+    if ((c & DECAL_BASE_COLOR) != 0)
+        decal_over(layer.base_color, layer.base_color_cover, m.base_weight * material_color(m, TEXTURE_BASE_COLOR, f, m.base_color), share);
+    if ((c & DECAL_ROUGHNESS) != 0)
+        decal_over(layer.roughness, layer.roughness_cover, m.specular_roughness * material_texture(m, TEXTURE_ROUGHNESS, f, one).x, share);
+    if ((c & DECAL_METALNESS) != 0)
+        decal_over(layer.metalness, layer.metalness_cover, m.metalness * material_texture(m, TEXTURE_METALNESS, f, one).x, share);
+    if ((c & DECAL_EMISSION) != 0)
+        decal_over(layer.emission, layer.emission_cover, material_color(m, TEXTURE_EMISSION, f, material_emission(m)), share);
+    if ((c & DECAL_NORMAL) != 0)
+    {
+        // The decal's tangent frame on the surface: its x axis, and its uv's v (down its y
+        // axis) as the bitangent, as on a mesh whose uv runs like the decal's.
+        float3 n = i.normal;
+        float3 t = safe_normalize(axis_x - n * dot(n, axis_x), cross(n, axis_y));
+        float3 b = -cross(n, t);
+        float3 v = float3(0.0, 0.0, 1.0);
+        if (material_bound(m, TEXTURE_NORMAL))
+            v = normal_decode(material_texture(m, TEXTURE_NORMAL, f, float4(0.5, 0.5, 1.0, 1.0)).xy);
+        decal_over(layer.normal, layer.normal_cover, safe_normalize(t * v.x + b * v.y + n * v.z, n), share);
+    }
+}
+
+// The decals over hit `i`: those of the bin of world space holding it and the scene's global
+// ones, merged in id order. Texture footprints follow the hit's ray cone onto the triangle's
+// plane, with the view's mip bias at primary hits.
+public DecalLayer surface_decals(SurfaceInput i)
+{
+    DecalLayer layer = (DecalLayer)0;
+    SceneRoot* s = i.scene;
+    uint globals = s.decal_globals;
+    if (globals == 0 && s.decal_bin_slots == 0)
+        return layer;
+    uint cell_log2 = uint(s.origin_cell.w);
+    int3 bin = (i.cell << (cell_log2 - s.decal_bin_log2)) + int3(floor(i.offset * exp2(-float(s.decal_bin_log2))));
+    uint run = decal_bin_run(s.decal_bins, s.decal_bin_slots, bin);
+    uint count = run != DECAL_BIN_EMPTY ? s.decal_refs[run] : 0;
+    if (globals == 0 && count == 0)
+        return layer;
+
+    // The footprint: two directions across the ray, the cone's width apart, carried along
+    // the ray onto the triangle's plane.
+    float3 d = i.view_direction;
+    float3 ng = i.geometric_normal;
+    float3 x, y;
+    orthonormal_basis(d, x, y);
+    float width = i.context.cone_width;
+    if (i.context.kind == HIT_PRIMARY && i.view != nullptr)
+        width *= exp2(i.view.mip_bias);
+    float dn = dot(d, ng);
+    dn = abs(dn) < 1e-6 ? (dn < 0.0 ? -1e-6 : 1e-6) : dn;
+    float3 px = (x - d * (dot(x, ng) / dn)) * width;
+    float3 py = (y - d * (dot(y, ng) / dn)) * width;
+
+    uint a = 0;
+    uint b = 0;
+    while (a < globals || b < count)
+    {
+        uint ga = a < globals ? s.decal_refs[a] : 0xffffffff;
+        uint gb = b < count ? s.decal_refs[run + 1 + b] : 0xffffffff;
+        if (ga < gb)
+            a++;
+        else
+            b++;
+        DecalGpu* dc = s.decals + min(ga, gb);
+        blend_decal(layer, i, dc, view_relative(i.cell, i.offset, dc.cell, dc.offset, cell_log2), px, py);
+    }
+    return layer;
+}
+
+// `layer` written over a surface's parameters and shading normal.
+public void apply_decals(DecalLayer layer, inout BsdfParams p, inout float3 normal)
+{
+    p.base_color = p.base_color * (1.0 - layer.base_color_cover) + layer.base_color;
+    p.specular_roughness = p.specular_roughness * (1.0 - layer.roughness_cover) + layer.roughness;
+    p.metalness = p.metalness * (1.0 - layer.metalness_cover) + layer.metalness;
+    p.emission = p.emission * (1.0 - layer.emission_cover) + layer.emission;
+    if (layer.normal_cover > 0.0)
+        normal = safe_normalize(normal * (1.0 - layer.normal_cover) + layer.normal, normal);
+}
+
+// OpenPBR from the hit's `MaterialGpu` and its textures, with the decals over the hit
+// written over the material's parameters.
 public struct StandardSurface : ISurface
 {
     public static GSurface surface(SurfaceInput i, out float depth_offset)
@@ -145,6 +288,7 @@ public struct StandardSurface : ISurface
 
         GSurface s = (GSurface)0;
         s.normal = material_normal(i, m);
+        apply_decals(surface_decals(i), p, s.normal);
         s.geometric_normal = i.geometric_normal;
         p.specular_anisotropy = 0.0;
         p.tangent_angle = 0.0;

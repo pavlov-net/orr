@@ -24,6 +24,7 @@
 
 mod accel;
 mod arena;
+mod decals;
 mod emissive;
 mod lights;
 mod loading;
@@ -61,6 +62,7 @@ pub use arena::{
     ArenaBuffer, ArenaKind, ArenaReport, ArenaRequest, ArenaTarget, ArenaTexture, Span, ViewArena,
     ViewStep,
 };
+pub use decals::{Decal, DecalChannels, DecalId};
 pub use emissive::{EmissiveSpan, ModelEmission, emissive_spans};
 pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId};
 pub use loading::Loading;
@@ -80,12 +82,12 @@ pub use scenes::{
     Budgets, ConsumerMarker, Frame, FrameDesc, FrameStats, RendererDesc, SceneCompute, Scenes,
 };
 pub use shaders::types::{
-    BlasJob, ClusterRef, ClusterWork, CutGpu, CutKey, EmissiveGpu, FeedbackGpu, GBufferGpu,
-    GeneratedClusterGpu, GroupGpu, InstanceGpu, LightGpu, MaskGpu, MaterialGpu, MeshGpu, MeshLevel,
-    ModelGpu, NodeItem, PartGpu, ProducerBatch, ProducerClusterGpu, ProducerGpu, ProducerStateGpu,
-    RasterGpu, RasterRoot, RtCutGpu, SceneRoot, SkinMeshGpu, SkinStateGpu, SkinnedGpu, SkyStats,
-    SlotCutGpu, SlotStateGpu, TessStateGpu, TextureFeedbackGpu, TextureStreamGpu, TopologyGpu,
-    VisibleCluster,
+    BlasJob, ClusterRef, ClusterWork, CutGpu, CutKey, DecalBinGpu, DecalGpu, EmissiveGpu,
+    FeedbackGpu, GBufferGpu, GeneratedClusterGpu, GroupGpu, InstanceGpu, LightGpu, MaskGpu,
+    MaterialGpu, MeshGpu, MeshLevel, ModelGpu, NodeItem, PartGpu, ProducerBatch,
+    ProducerClusterGpu, ProducerGpu, ProducerStateGpu, RasterGpu, RasterRoot, RtCutGpu, SceneRoot,
+    SkinMeshGpu, SkinStateGpu, SkinnedGpu, SkyStats, SlotCutGpu, SlotStateGpu, TessStateGpu,
+    TextureFeedbackGpu, TextureStreamGpu, TopologyGpu, VisibleCluster,
 };
 pub use skin::{SkinStats, SkinnedDesc};
 pub use stream::{BlobId, BlobTarget};

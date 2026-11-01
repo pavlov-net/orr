@@ -3,6 +3,7 @@ module tables;
 
 import orr.abi;
 __exported import cut;
+__exported import decal;
 import material;
 import lights;
 import producer;
@@ -297,6 +298,13 @@ public struct SceneRoot
     public SkinStateGpu* skin_state; // per skinned copy, written by the GPU
     public uint2* skin_work;         // this frame's skinning work items: skinned copy, mesh cluster
     public uint skinned_capacity;
+    public uint decal_capacity;
+    public DecalGpu* decals;         // by DecalId
+    public DecalBinGpu* decal_bins;  // `decal_bin_slots` entries
+    public uint* decal_refs;         // the global decals' ids, then each bin's run
+    public uint decal_globals;       // decals too large for bins, listed first in `decal_refs`
+    public uint decal_bin_slots;     // a power of two; 0 without binned decals
+    public uint decal_bin_log2;      // bins are 2^decal_bin_log2 m cubes on the world cell grid
     public uint _pad;
 }
 

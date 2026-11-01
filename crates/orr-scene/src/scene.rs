@@ -8,6 +8,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{DVec3, IVec3};
 use orr_gpu::{Allocation, Device, GpuAddress, GpuPtr, MemoryKind};
 
+use crate::decals::{Decal, DecalId, Listing, decal_gpu, listing, table_sizes};
 use crate::emissive::{ModelEmission, Run, Runs};
 use crate::lights::{EMISSIVE_INSTANCE, EMISSIVE_PRODUCER, Light, LightId, light_gpu};
 use crate::material::MaterialId;
@@ -21,9 +22,9 @@ use crate::upload::{Op, Record};
 use crate::view::ViewHistoryId;
 use crate::world::WorldPos;
 use crate::{
-    EmissiveGpu, Error, GroupGpu, InstanceGpu, LightGpu, ProducerBatch, ProducerGpu,
-    ProducerStateGpu, Result, SceneRoot, SkinStateGpu, SkinnedGpu, SkyStats, SlotStateGpu,
-    TessStateGpu, ViewConstants,
+    DecalBinGpu, DecalGpu, EmissiveGpu, Error, GroupGpu, InstanceGpu, LightGpu, ProducerBatch,
+    ProducerGpu, ProducerStateGpu, Result, SceneRoot, SkinStateGpu, SkinnedGpu, SkyStats,
+    SlotStateGpu, TessStateGpu, ViewConstants,
 };
 
 /// A scene in [`crate::Scenes`].
@@ -57,6 +58,8 @@ pub struct SceneDesc {
     pub skinned_capacity: u32,
     /// Clusters all skinned copies skin and instantiate in one frame, at most.
     pub skinned_clusters: u32,
+    /// Decals: every `DecalId` is below it.
+    pub decal_capacity: u32,
 }
 
 impl Default for SceneDesc {
@@ -74,6 +77,7 @@ impl Default for SceneDesc {
             global_instances: 4096,
             skinned_capacity: 256,
             skinned_clusters: 8192,
+            decal_capacity: 1024,
         }
     }
 }
@@ -242,6 +246,9 @@ pub(crate) struct Tables {
     pub sky_stats: Allocation<SkyStats>,
     pub skinned: Allocation<SkinnedGpu>,
     pub skin_state: Allocation<SkinStateGpu>,
+    pub decals: Allocation<DecalGpu>,
+    pub decal_bins: Allocation<DecalBinGpu>,
+    pub decal_refs: Allocation<u32>,
 }
 
 pub(crate) struct Group {
@@ -350,6 +357,12 @@ pub(crate) struct SceneCpu {
     /// The first view `raster_view` rendered of the scene in its last frame, which the
     /// tessellator's edge factors test for what it saw.
     pub seen_by: Option<LastView>,
+    /// Where each decal is listed, by `DecalId`.
+    pub decals: Vec<Option<Listing>>,
+    /// Set when a decal changed since the bin table was last written.
+    pub decals_changed: bool,
+    pub decal_bin_slots: u32,
+    pub decal_globals: u32,
 }
 
 /// A view of a scene: its history, the frame and its constants.
@@ -377,6 +390,7 @@ impl Scene {
     pub(crate) fn new(device: &Device, desc: &SceneDesc) -> Result<Self> {
         let n = |c: u32| u64::from(c.max(1));
         let dl = MemoryKind::DeviceLocal;
+        let (decal_slots, decal_refs) = table_sizes(desc.decal_capacity);
         let tables = Tables {
             root: device.gpu_malloc(dl, 1, "scene root")?,
             instances: device.gpu_malloc(dl, n(desc.instance_capacity), "instances")?,
@@ -398,6 +412,9 @@ impl Scene {
             sky_stats: device.gpu_malloc(dl, 1, "sky stats")?,
             skinned: device.gpu_malloc(dl, n(desc.skinned_capacity), "skinned copies")?,
             skin_state: device.gpu_malloc(dl, n(desc.skinned_capacity), "skin state")?,
+            decals: device.gpu_malloc(dl, n(desc.decal_capacity), "decals")?,
+            decal_bins: device.gpu_malloc(dl, n(decal_slots), "decal bins")?,
+            decal_refs: device.gpu_malloc(dl, n(decal_refs), "decal runs")?,
         };
         // Tables start zeroed: empty slots, the null group, no lights. These apply before
         // any write (sequence 0).
@@ -427,6 +444,7 @@ impl Scene {
             zero(tables.sky_stats.gpu().address(), tables.sky_stats.size()),
             zero(tables.skinned.gpu().address(), tables.skinned.size()),
             zero(tables.skin_state.gpu().address(), tables.skin_state.size()),
+            zero(tables.decals.gpu().address(), tables.decals.size()),
         ];
         Ok(Self {
             desc: *desc,
@@ -458,6 +476,10 @@ impl Scene {
                 skins_removed: Vec::new(),
                 skin_frame: None,
                 seen_by: None,
+                decals: vec![None; desc.decal_capacity as usize],
+                decals_changed: false,
+                decal_bin_slots: 0,
+                decal_globals: 0,
             }),
             writing: AtomicBool::new(false),
         })
@@ -1090,6 +1112,24 @@ impl<'f> SceneWriter<'f> {
         let record = light.map_or(LightGpu::zeroed(), |l| light_gpu(l, origin, self.cell_log2));
         self.write(
             self.scene.tables.lights.gpu().offset(u64::from(id.0)),
+            record,
+        )
+    }
+
+    /// Sets or clears decal `id`, from this frame on.
+    pub fn set_decal(&mut self, id: DecalId, decal: Option<&Decal>) -> Result<()> {
+        assert!(
+            id.0 < self.scene.desc.decal_capacity,
+            "{id:?} outside the decal table"
+        );
+        let record = decal.map_or(DecalGpu::zeroed(), |d| decal_gpu(d, self.cell_log2));
+        {
+            let mut cpu = self.scene.cpu.lock().unwrap();
+            cpu.decals[id.0 as usize] = decal.map(|d| listing(d, self.cell_log2));
+            cpu.decals_changed = true;
+        }
+        self.write(
+            self.scene.tables.decals.gpu().offset(u64::from(id.0)),
             record,
         )
     }
