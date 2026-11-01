@@ -1,7 +1,8 @@
 //! A view's raster half on cooked meshes and the scene's ray tracing beside it: G-buffer
-//! packing against a CPU decoder, reference images of each G-buffer channel, motion vectors
-//! that reproject the previous frame, discrete levels chosen by distance, a linked surface
-//! whose coverage and depth offset give the depth and motion of the shape it stands for,
+//! packing against a CPU decoder, reference images of each G-buffer channel, the resolve as
+//! device-generated commands against its recorded dispatches, motion vectors that reproject
+//! the previous frame, discrete levels chosen by distance, a linked surface whose coverage
+//! and depth offset give the depth and motion of the shape it stands for,
 //! the software raster against the mesh-shader raster, camera rays through the PTLAS against
 //! the visibility buffer, resolved hits against a CPU decode, hit contexts, `rt_range`,
 //! far-from-origin and rebase invariance, the PTLAS budget, posed rigid parts in raster
@@ -38,9 +39,9 @@ use orr_scene::{
     Affine3, BoundTexture, ClusterWork, CopyVariant, CutGpu, DebugLod, Decal, DecalChannels,
     DecalId, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstanceRange, InstancesDesc, Lens,
     LoadState, Loading, MaterialGpu, MaterialId, ModelId, MountId, PackSource, Pose, Projection,
-    RasterView, RendererDesc, SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu,
-    SkinnedDesc, SkinnedGpu, SlotCutGpu, TextureFilter, TransformGroupDesc, TransformGroupId,
-    ViewDesc, ViewHistoryId, ViewTarget, VisibleCluster, material_flags,
+    RasterGpu, RasterView, RendererDesc, SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes,
+    SkinStateGpu, SkinnedDesc, SkinnedGpu, SlotCutGpu, TextureFilter, TransformGroupDesc,
+    TransformGroupId, ViewDesc, ViewHistoryId, ViewTarget, VisibleCluster, material_flags,
 };
 use scene_suite::shaders::{codec, pose, skin_pose, surface_at, trace};
 use scene_suite::{linked, pipeline};
@@ -1466,6 +1467,54 @@ fn each_gbuffer_channel_matches_its_reference() {
     for (name, f) in &channels {
         check(&reference(name), &image(f), flip);
     }
+    assert_clean();
+}
+
+#[test]
+fn the_generated_resolve_writes_the_recorded_resolves_gbuffer_and_runs_only_bins_with_tiles() {
+    let _serial = serial();
+    if !gpu_suite::require(
+        device().caps().generated_commands,
+        "device-generated commands",
+    ) {
+        return;
+    }
+    let mut copies = showcase();
+    copies.push(Item {
+        model: "card",
+        linear: Mat3::from_rotation_y(0.35) * Mat3::from_rotation_x(-0.2) * 1.3,
+        at: Vec3::new(0.2, 0.9, 1.4),
+    });
+    let eye = Vec3::new(0.3, 2.6, 5.5);
+    let target = Vec3::new(0.0, 0.6, 0.0);
+    // The G-buffer of a second frame, and the sequences the generated resolve wrote.
+    let frames = |generated_resolve| {
+        let mut w = World::with(&RendererDesc {
+            kernels: &linked::KERNELS,
+            generated_resolve,
+            ..RendererDesc::default()
+        });
+        let placed = place(&mut w, &copies);
+        render(&mut w, &placed, eye + Vec3::X * 0.1, target, &[], true, 1);
+        let g = render(&mut w, &placed, eye, target, &[], false, 2);
+        let raster: RasterGpu = read_buffer(g.view.raster, 1)[0];
+        let sequences = read_buffer(raster.bin_args.offset(3 * u64::from(raster.bins)), 1)[0];
+        (g, raster.bins, sequences)
+    };
+    let (generated, bins, sequences) = frames(true);
+    let (recorded, _, none) = frames(false);
+    assert_eq!(bins, linked::KERNELS.surfaces + 1);
+    assert_eq!(
+        (sequences, none),
+        (2, 0),
+        "sequences for the standard and the card's bins only"
+    );
+    let bits = |f: &Frame| {
+        let depth: Vec<u32> = f.depth.iter().map(|d| d.to_bits()).collect();
+        let motion: Vec<[u32; 2]> = f.motion.iter().map(|m| m.map(f32::to_bits)).collect();
+        (f.a.clone(), f.b.clone(), f.x.clone(), depth, motion)
+    };
+    assert!(bits(&generated) == bits(&recorded), "the G-buffers differ");
     assert_clean();
 }
 

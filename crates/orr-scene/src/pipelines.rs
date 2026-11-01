@@ -4,7 +4,10 @@
 use std::ptr;
 use std::sync::Arc;
 
-use orr_gpu::{ComputePipeline, Device, KernelSet, ShaderModule, ShaderStage, SpecData, SpecEntry};
+use orr_gpu::{
+    ComputePipeline, Device, ExecutionSet, KernelSet, ShaderModule, ShaderStage, SpecData,
+    SpecEntry,
+};
 
 use crate::Result;
 use crate::shaders::{animation, emissive, transparency, upload, world};
@@ -35,17 +38,25 @@ pub(crate) struct Code {
     pub(crate) spirv_omm: Arc<[u32]>,
 }
 
+/// What a recipe makes: a pipeline, or an execution set holding the pipeline alone, which
+/// device-generated sequences run.
+pub(crate) enum Made {
+    Pipeline(ComputePipeline),
+    Set(ExecutionSet),
+}
+
 /// How a pipeline was made, so a reload can make it again from new SPIR-V.
 pub(crate) struct Recipe {
     pub(crate) module: &'static ShaderModule,
     entry: String,
     spec_entries: Vec<SpecEntry>,
     spec_bytes: Vec<u8>,
+    set: bool,
 }
 
 impl Recipe {
-    /// The pipeline, from `code` in place of the module's SPIR-V when given.
-    pub(crate) fn create(&self, device: &Device, code: Option<&Code>) -> Result<ComputePipeline> {
+    /// The pipeline or set, from `code` in place of the module's SPIR-V when given.
+    pub(crate) fn create(&self, device: &Device, code: Option<&Code>) -> Result<Made> {
         let spec = SpecData {
             entries: &self.spec_entries,
             bytes: &self.spec_bytes,
@@ -57,7 +68,12 @@ impl Recipe {
             // The module's sidecar describes the build's SPIR-V; a reload embeds its own.
             stage.debug_info = "";
         }
-        Ok(device.create_compute_pipeline(&stage, self.module.name)?)
+        let name = self.module.name;
+        Ok(if self.set {
+            Made::Set(device.create_compute_set(&[stage], name)?)
+        } else {
+            Made::Pipeline(device.create_compute_pipeline(&stage, name)?)
+        })
     }
 }
 
@@ -73,7 +89,7 @@ pub(crate) struct Own {
 
 pub(crate) struct Pipelines {
     pub(crate) recipes: Vec<Arc<Recipe>>,
-    list: Vec<ComputePipeline>,
+    list: Vec<Made>,
     /// The latest reloaded SPIR-V of each module that has reloaded.
     code: Vec<(&'static ShaderModule, Arc<Code>)>,
     pub(crate) own: Own,
@@ -116,27 +132,62 @@ impl Pipelines {
         entry: &str,
         spec: SpecData<'_>,
     ) -> Result<PipelineId> {
+        self.add(device, kernels, own, entry, spec, false)
+    }
+
+    /// As [`Pipelines::create`], an execution set holding the pipeline alone; needs
+    /// `Caps::generated_commands`.
+    pub(crate) fn create_set(
+        &mut self,
+        device: &Device,
+        kernels: &KernelSet,
+        own: &'static ShaderModule,
+        entry: &str,
+    ) -> Result<PipelineId> {
+        self.add(device, kernels, own, entry, SpecData::default(), true)
+    }
+
+    fn add(
+        &mut self,
+        device: &Device,
+        kernels: &KernelSet,
+        own: &'static ShaderModule,
+        entry: &str,
+        spec: SpecData<'_>,
+        set: bool,
+    ) -> Result<PipelineId> {
         let recipe = Recipe {
             module: kernels.module(own)?,
             entry: entry.to_owned(),
             spec_entries: spec.entries.to_vec(),
             spec_bytes: spec.bytes.to_vec(),
+            set,
         };
-        let pipeline = recipe.create(device, self.code_of(recipe.module))?;
+        let made = recipe.create(device, self.code_of(recipe.module))?;
         self.recipes.push(Arc::new(recipe));
-        self.list.push(pipeline);
+        self.list.push(made);
         Ok(PipelineId(self.list.len() as u32 - 1))
     }
 
     pub(crate) fn get(&self, id: PipelineId) -> &ComputePipeline {
-        &self.list[id.0 as usize]
+        match &self.list[id.0 as usize] {
+            Made::Pipeline(p) => p,
+            Made::Set(_) => panic!("{id:?} is an execution set"),
+        }
     }
 
-    /// Puts `pipeline` in recipe `index`'s place. The old pipeline is destroyed once the
+    pub(crate) fn set(&self, id: PipelineId) -> &ExecutionSet {
+        match &self.list[id.0 as usize] {
+            Made::Set(s) => s,
+            Made::Pipeline(_) => panic!("{id:?} is a pipeline"),
+        }
+    }
+
+    /// Puts `made` in recipe `index`'s place. The old pipeline or set is destroyed once the
     /// work submitted before it was replaced has completed.
     #[cfg_attr(not(feature = "hot-reload"), allow(dead_code))]
-    pub(crate) fn replace(&mut self, index: usize, pipeline: ComputePipeline) {
-        self.list[index] = pipeline;
+    pub(crate) fn replace(&mut self, index: usize, made: Made) {
+        self.list[index] = made;
     }
 
     /// Records the SPIR-V `module` reloaded to, for pipelines created after the reload.
