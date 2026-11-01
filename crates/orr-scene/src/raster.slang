@@ -1,8 +1,10 @@
 // The raster into the visibility buffer, of cooked, skinned and producer clusters alike. The
-// hardware path draws the opaque and alpha lists through mesh pipelines; `software` rasters the clusters small on screen in compute
-// with the same snapping, sample points and coverage. Alpha-tested triangles keep a pixel by
-// each surface's coverage. Pixel stages write only the visibility buffer. `depth` copies the
-// resolved depth into the depth target.
+// hardware path draws the opaque and alpha lists through mesh pipelines; `software` rasters
+// the clusters small on screen in compute with the same snapping, sample points and
+// coverage. Clusters marked VISIBLE_BY_SIZE are in both lists, and each path draws only the
+// triangles the other leaves: overlap between them is harmless, a gap would be a hole.
+// Alpha-tested triangles keep a pixel by each surface's coverage. Pixel stages write only
+// the visibility buffer. `depth` copies the resolved depth into the depth target.
 #include "orr/root.h"
 import orr.atomic;
 import orr.random;
@@ -28,6 +30,7 @@ struct Primitive
 }
 
 groupshared float3 corners[256];
+groupshared float2 pixels[256];
 
 // One cluster's draw: its vertices and triangles `first..first + count`, from a resident
 // page or a producer batch.
@@ -48,6 +51,7 @@ struct ClusterDraw
     uint count;
     uint split;          // first alpha-tested triangle
     bool single_sided;
+    bool by_size;        // VISIBLE_BY_SIZE
 }
 
 // The draw of visible cluster `visible`: its opaque triangles, or with `alpha` its
@@ -68,6 +72,7 @@ ClusterDraw cluster_draw(uint visible, bool alpha)
         d.tri_count = d.k.tri_count;
         bool tested = s.producers[entry].opacity == PRODUCER_ALPHA_TESTED && (m.flags & MATERIAL_ALPHA_TESTED) != 0;
         d.split = tested ? 0 : d.tri_count;
+        d.by_size = (d.vc.local & VISIBLE_BY_SIZE) != 0;
     }
     else
     {
@@ -110,6 +115,16 @@ Vertex cluster_vertex(ClusterDraw d, uint visible, uint i)
     return o;
 }
 
+// Whether the hardware path leaves triangle `k` of a VISIBLE_BY_SIZE draw to the software
+// raster: a pixel under its limit, so snapping cannot push it over.
+bool left_to_software(uint3 k)
+{
+    float2 lo = min(pixels[k.x], min(pixels[k.y], pixels[k.z]));
+    float2 hi = max(pixels[k.x], max(pixels[k.y], pixels[k.z]));
+    float2 size = hi - lo;
+    return max(size.x, size.y) <= software_limit(root.raster) - 1.0;
+}
+
 // Whether a single-sided material shows the back of the triangle with corners `k`.
 bool back_facing(ClusterDraw d, uint3 k)
 {
@@ -125,7 +140,7 @@ Primitive cluster_primitive(ClusterDraw d, uint t, out uint3 corners_out)
     uint3 k = draw_triangle(d, triangle);
     Primitive o;
     o.triangle = triangle;
-    o.cull = back_facing(d, k);
+    o.cull = back_facing(d, k) || (d.by_size && left_to_software(k));
     corners_out = k;
     return o;
 }
@@ -154,7 +169,12 @@ void cluster_mesh(
     ClusterDraw d = cluster_draw(visible, alpha);
     SetMeshOutputCounts(d.vertex_count, d.count);
     for (uint i = thread; i < d.vertex_count; i += 128)
-        vertices[i] = cluster_vertex(d, visible, i);
+    {
+        Vertex o = cluster_vertex(d, visible, i);
+        if (d.by_size)
+            pixels[i] = pixel_from_clip(root.view, o.position);
+        vertices[i] = o;
+    }
     GroupMemoryBarrierWithGroupSync();
     if (thread < d.count)
     {
@@ -215,6 +235,10 @@ static const int SUBPIXEL = 1 << SUBPIXEL_BITS;
 // Triangles whose bounding box spans at most this many pixels in x run one per lane over
 // the whole box; wider ones hand their rows out across the wave.
 static const int MICROPOLY_SPAN = 4;
+// Corners snap within this many pixels of the origin, so their subpixel coordinates fit
+// 32 bits; only VISIBLE_BY_SIZE draws reach that far, and their triangles there are wider
+// than the software limit.
+static const float SOFT_REACH = float(1 << 21);
 
 // A triangle set up for the software raster. Corners are in 1/256 pixel from `origin`,
 // wound so that the edge functions are positive inside.
@@ -264,6 +288,8 @@ bool soft_setup(ClusterDraw d, uint triangle, uint2 extent, out SoftTriangle t)
     float3 z = float3(soft_z[k.x], soft_z[k.y], soft_z[k.z]);
     int2 lo = min(v0, min(v1, v2));
     int2 hi = max(v0, max(v1, v2));
+    if (d.by_size && any(hi - lo > int2(software_limit(root.raster) * float(SUBPIXEL))))
+        return false;
     v0 -= lo;
     v1 -= lo;
     v2 -= lo;
@@ -359,7 +385,7 @@ void software(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     for (uint i = thread; i < d.vertex_count; i += 128)
     {
         float4 clip = cluster_vertex(d, visible, i).position;
-        float2 xy = pixel_from_clip(v, clip);
+        float2 xy = clamp(pixel_from_clip(v, clip), -SOFT_REACH, SOFT_REACH);
         soft_xy[i] = int2(floor(xy * float(SUBPIXEL) + 0.5));
         soft_z[i] = clip.z / clip.w;
     }

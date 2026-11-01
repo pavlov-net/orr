@@ -8,14 +8,15 @@ use std::path::{Path, PathBuf};
 
 use orr_shaders::build::Build;
 
+#[allow(dead_code)]
 #[path = "src/pattern.rs"]
 pub mod pattern;
 
 /// `patterns.bin`: per pattern its first vertex, first triangle, vertex and triangle counts
-/// (four u32), then every vertex as `w1 | w2 << 16`, then every triangle as three u8, padded
-/// to 4 bytes.
+/// (four u32), then every vertex's key (u32), then every triangle as three u8, padded to 4
+/// bytes.
 fn write_patterns(out: &Path) {
-    let table = (0..pattern::PATTERNS).map(|i| pattern::generate(pattern::factors(i)));
+    let table = (0..pattern::PATTERNS).map(|i| pattern::generate(pattern::counts(i)));
     let mut heads = Vec::new();
     let mut vertices = Vec::new();
     let mut triangles = Vec::new();
@@ -23,13 +24,13 @@ fn write_patterns(out: &Path) {
         for x in [
             vertices.len() / 4,
             triangles.len() / 3,
-            p.vertices.len(),
+            p.keys.len(),
             p.triangles.len(),
         ] {
             heads.extend((x as u32).to_le_bytes());
         }
-        for v in &p.vertices {
-            vertices.extend((u32::from(v[0]) | u32::from(v[1]) << 16).to_le_bytes());
+        for k in &p.keys {
+            vertices.extend(k.to_le_bytes());
         }
         triangles.extend(p.triangles.iter().flatten());
     }

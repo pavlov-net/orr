@@ -779,7 +779,8 @@ struct PatchMesh {
 }
 
 impl PatchMesh {
-    fn new() -> Self {
+    /// The mesh with the right half's uv moved by `seam`.
+    fn new(seam: Vec2) -> Self {
         let mut m = Self {
             positions: Vec::new(),
             uvs: Vec::new(),
@@ -796,7 +797,8 @@ impl PatchMesh {
                     for i in 0..3 {
                         let x = x0 + i as f32;
                         m.positions.push(Vec3::new(x, 0.0, z));
-                        m.uvs.push(plane_uv(x, z, right));
+                        let shift = if right { seam } else { Vec2::ZERO };
+                        m.uvs.push(plane_uv(x, z, false) + shift);
                     }
                 }
                 for q in 0..2u8 {
@@ -825,12 +827,19 @@ struct Plane {
 
 impl Plane {
     fn new(dice_pixels: f32) -> Self {
+        let software = RendererDesc::default().software_raster_pixels;
+        Self::build(dice_pixels, software, SEAM_UV)
+    }
+
+    /// The plane with its halves' uv `seam` apart.
+    fn build(dice_pixels: f32, software_raster_pixels: f32, seam: Vec2) -> Self {
         let d = device();
         let mut scenes = Scenes::new(
             d,
             &RendererDesc {
                 kernels: &linked::KERNELS,
                 dice_pixels,
+                software_raster_pixels,
                 ..RendererDesc::default()
             },
         )
@@ -842,7 +851,7 @@ impl Plane {
             })
             .unwrap();
         let history = scenes.create_view_history().unwrap();
-        let mesh = PatchMesh::new();
+        let mesh = PatchMesh::new(seam);
         let attrs: Vec<[u32; 2]> = mesh
             .uvs
             .iter()
@@ -1075,24 +1084,6 @@ fn generated(view: &RasterView, entry: ProducerId) -> Generated {
     }
 }
 
-/// `tessellation.slang`'s `compose`: the point at pattern weights `w` of a subpatch with
-/// `corners`, in the patch triangle's weights.
-fn compose(w: [u32; 3], corners: [u32; 3]) -> [u32; 3] {
-    const ONE: u32 = tessellation::BARY_ONE;
-    let unpack = |b: u32| [ONE - (b & 0xffff) - (b >> 16), b & 0xffff, b >> 16];
-    let c = corners.map(unpack);
-    let round = |s: u32| {
-        if s <= ONE / 2 * ONE {
-            (s + ONE / 2) / ONE
-        } else {
-            ONE - (ONE * ONE - s + ONE / 2) / ONE
-        }
-    };
-    let s = |k: usize| w[0] * c[0][k] + w[1] * c[1][k] + w[2] * c[2][k];
-    let (w1, w2) = (round(s(1)), round(s(2)));
-    [ONE - w1 - w2, w1, w2]
-}
-
 /// The undisplaced point at weights `w` of corners `p`, as the tessellator interpolates it.
 fn interpolate(p: [Vec3; 3], w: [u32; 3]) -> Vec3 {
     let f = w.map(|x| x as f32 * (1.0 / tessellation::BARY_ONE as f32));
@@ -1111,7 +1102,7 @@ struct Weighted {
 }
 
 fn vertex_weights(g: &Generated) -> Vec<Weighted> {
-    let mesh = PatchMesh::new();
+    let mesh = PatchMesh::new(SEAM_UV);
     let mut out = Vec::new();
     for (k, r) in g.clusters.iter().zip(&g.records) {
         let patch = &g.patch_clusters[(r.patch >> 7) as usize];
@@ -1121,14 +1112,13 @@ fn vertex_weights(g: &Generated) -> Vec<Weighted> {
         let corners = tri.map(|c| g.patch_positions[at(c)]);
         let previous = (!g.patch_previous.is_empty()).then(|| tri.map(|c| g.patch_previous[at(c)]));
         let pattern = tessellation::pattern(r.pattern);
-        assert_eq!(pattern.vertices.len(), usize::from(k.vertex_count));
-        for (i, v) in pattern.vertices.iter().enumerate() {
-            let (w1, w2) = (u32::from(v[0]), u32::from(v[1]));
-            let w = [tessellation::BARY_ONE - w1 - w2, w1, w2];
+        let w = pattern.place(tessellation::unpack_factors(r.factors), r.corners, r.zeros);
+        assert_eq!(w.len(), usize::from(k.vertex_count));
+        for (i, &w) in w.iter().enumerate() {
             out.push(Weighted {
                 vertex: k.first_vertex as usize + i,
                 patch: r.patch,
-                w: compose(w, r.corners),
+                w,
                 corners,
                 previous,
             });
@@ -1312,27 +1302,9 @@ fn a_displaced_plane_with_a_uv_seam_closes_in_raster_and_rays_with_normals_of_it
 
     // No pixel inside the plane's footprint shows the background, through the raster or a
     // camera ray, and both agree on depth.
-    let camera = look(eye, target);
-    let fov_y = 0.9f32;
-    let aspect = EXTENT[0] as f32 / EXTENT[1] as f32;
     let (mut inside, mut far_apart) = (0, 0);
     for (i, s) in seen.iter().enumerate() {
-        let (px, py) = ((i as u32 % EXTENT[0]) as f32, (i as u32 / EXTENT[0]) as f32);
-        let ndc = Vec2::new(
-            (px + 0.5) / EXTENT[0] as f32 * 2.0 - 1.0,
-            1.0 - (py + 0.5) / EXTENT[1] as f32 * 2.0,
-        );
-        let t = (fov_y * 0.5).tan();
-        let d = camera * Vec3::new(ndc.x * t * aspect, ndc.y * t, -1.0).normalize();
-        if d.y >= -0.05 {
-            continue;
-        }
-        // Where the ray crosses the highest and the lowest the ripple reaches.
-        let out = |y: f32| {
-            let hit = eye + d * ((y - eye.y) / d.y);
-            hit.x.abs() > 1.9 || hit.z > -0.1 || hit.z < -5.9
-        };
-        if out(0.05) || out(-0.05) {
+        if !in_footprint(eye, target, i, 0.05) {
             continue;
         }
         inside += 1;
@@ -1360,6 +1332,33 @@ fn a_displaced_plane_with_a_uv_seam_closes_in_raster_and_rays_with_normals_of_it
     }
     assert!(worst < NORMAL_TOLERANCE, "normals within {worst} rad");
     assert_clean();
+}
+
+/// The unit direction of the camera ray through pixel `i`'s center.
+fn pixel_ray(eye: Vec3, target: Vec3, i: usize) -> Vec3 {
+    let fov_y = 0.9f32;
+    let aspect = EXTENT[0] as f32 / EXTENT[1] as f32;
+    let (px, py) = ((i as u32 % EXTENT[0]) as f32, (i as u32 / EXTENT[0]) as f32);
+    let ndc = Vec2::new(
+        (px + 0.5) / EXTENT[0] as f32 * 2.0 - 1.0,
+        1.0 - (py + 0.5) / EXTENT[1] as f32 * 2.0,
+    );
+    let t = (fov_y * 0.5).tan();
+    look(eye, target) * Vec3::new(ndc.x * t * aspect, ndc.y * t, -1.0).normalize()
+}
+
+/// Whether the camera ray of pixel `i` crosses the plane's patches, lifted or lowered by up
+/// to `reach`, inside their rectangle and away from its border.
+fn in_footprint(eye: Vec3, target: Vec3, i: usize, reach: f32) -> bool {
+    let d = pixel_ray(eye, target, i);
+    if d.y >= -0.05 {
+        return false;
+    }
+    let within = |y: f32| {
+        let hit = eye + d * ((y - eye.y) / d.y);
+        hit.x.abs() <= 1.9 && hit.z <= -0.1 && hit.z >= -5.9
+    };
+    within(reach) && within(-reach)
 }
 
 /// Radians between a written normal and the field's, at most (0.0007 measured): central
@@ -1452,6 +1451,147 @@ fn texture_displacement_moves_patches_along_the_normal_by_the_materials_texture(
         assert!(n.dot(Vec3::Y) > 0.9999, "normal {n}");
     }
     d.free_image_slot_after_submitted(slot);
+    assert_clean();
+}
+
+/// Pixels whose depth may jump in a step: a thin subpatch beside a count change can win a
+/// pixel or two through its extended plane, while a pop moves a whole region.
+const ISOLATED: usize = 16;
+
+/// The largest change of raster depth, past the [`ISOLATED`] largest, between consecutive
+/// frames as the focus rises from the eye by 2 m in `steps`, the camera still over the
+/// rippled plane, and the pattern counts of the first and the last frame. The plane has no
+/// seam: where a seam's sides displace differently, the weld closes it with a wall whose
+/// width follows the pattern beside it, which jumps as counts change.
+fn rate_sweep(steps: u32) -> (f32, [HashSet<[u32; 3]>; 2]) {
+    let (eye, target) = (Vec3::new(0.2, 1.4, 0.6), Vec3::new(0.0, 0.0, -3.0));
+    let focus = |i: u32| eye + Vec3::Y * (2.0 * i as f32 / steps as f32);
+    let mut plane = Plane::build(
+        8.0,
+        RendererDesc::default().software_raster_pixels,
+        Vec2::ZERO,
+    );
+    let materials = [plane.material];
+    let desc = plane.desc(&materials, RIPPLE, 8192);
+    plane.frame(Some(&desc), eye, target, focus(0));
+    plane.frame(None, eye, target, focus(0));
+    let counts = |view: &RasterView| -> HashSet<[u32; 3]> {
+        generated(view, PLANE)
+            .records
+            .iter()
+            .map(|r| tessellation::pattern(r.pattern).counts)
+            .collect()
+    };
+    let view = plane.frame(None, eye, target, focus(0));
+    let first = counts(&view);
+    let mut last = depths(&view);
+    let mut worst = 0.0f32;
+    let mut view = view;
+    for i in 1..=steps {
+        view = plane.frame(None, eye, target, focus(i));
+        let d = depths(&view);
+        let mut moved: Vec<f32> = last
+            .iter()
+            .zip(&d)
+            .filter(|(a, b)| a.raster > 0.0 && b.raster > 0.0)
+            .map(|(a, b)| (a.raster - b.raster).abs())
+            .collect();
+        moved.sort_by(|a, b| b.total_cmp(a));
+        worst = worst.max(moved[ISOLATED]);
+        last = d;
+    }
+    // Nothing dropped and the rate never stepped, which would move the surface at once.
+    let stats = plane.stats();
+    assert_eq!(stats.dice_dropped + stats.split_dropped, 0, "{stats:?}");
+    assert_eq!(stats.lowest_rate_scale, 1.0, "{stats:?}");
+    (worst, [first, counts(&view)])
+}
+
+#[test]
+fn rates_moving_through_count_changes_move_the_displaced_surface_without_steps() {
+    if !traced(true) {
+        return;
+    }
+    // Pattern counts change along the sweep, yet the surface only moves as far as the rates
+    // do: four times the steps move it a quarter as far per step, where a pop would stay.
+    let (coarse, counts) = rate_sweep(6);
+    let (fine, _) = rate_sweep(24);
+    assert_ne!(counts[0], counts[1], "the sweep changes pattern counts");
+    assert!(coarse > 0.0, "the surface moves");
+    assert!(
+        fine < 0.4 * coarse,
+        "largest step {fine} m in 24 steps against {coarse} m in 6"
+    );
+    assert_clean();
+}
+
+/// Displacement id of `surfaces/cliffs.slang` in the suite's linked kernels.
+const CLIFFS: u8 = 2;
+
+#[test]
+fn steep_cliffs_draw_stretched_diced_triangles_in_hardware_without_holes() {
+    if !traced(true) {
+        return;
+    }
+    let (eye, target) = (Vec3::new(1.8, 1.1, 0.4), Vec3::new(-0.6, 0.0, -3.0));
+    // With a low software limit most diced clusters are split by size between the paths;
+    // without the software raster every cluster draws in hardware.
+    let render = |software_pixels: f32| {
+        let mut plane = Plane::build(3.0, software_pixels, SEAM_UV);
+        let materials = [plane.material];
+        let desc = ProducerDesc {
+            displacement_reach: 0.2,
+            ..plane.desc(&materials, CLIFFS, 16_384)
+        };
+        plane.frame(Some(&desc), eye, target, eye);
+        for _ in 0..2 {
+            plane.frame(None, eye, target, eye);
+        }
+        let view = plane.frame(None, eye, target, eye);
+        let counts: Vec<u32> = read_buffer(view.counts, 8);
+        let clusters: Vec<VisibleCluster> =
+            read_buffer(view.targets.clusters, u64::from(counts[0]));
+        let stats = plane.stats();
+        assert_eq!(
+            stats.dice_dropped + stats.split_dropped + stats.weld_dropped,
+            0,
+            "{stats:?}"
+        );
+        (depths(&view), clusters, counts)
+    };
+    let (split, clusters, counts) = render(8.0);
+    // `gbuffer.slang` VISIBLE_BY_SIZE.
+    let by_size = clusters.iter().filter(|c| c.local & 1 != 0).count();
+    assert!(by_size > 0, "no cluster split by size");
+    assert!(counts[5] > 0 && counts[7] > 0, "draws {counts:?}");
+    let (hardware, _, _) = render(0.0);
+
+    let (mut inside, mut differ) = (0, 0);
+    for (i, (s, h)) in split.iter().zip(&hardware).enumerate() {
+        if !in_footprint(eye, target, i, 0.2) {
+            continue;
+        }
+        inside += 1;
+        assert!(s.traced > 0.0, "pixel {i}: the camera ray misses");
+        assert!(
+            s.raster > 0.0,
+            "pixel {i}: the split raster shows the background"
+        );
+        assert!(
+            h.raster > 0.0,
+            "pixel {i}: the hardware raster shows the background"
+        );
+        // Both paths snap and sample alike; pixels on an edge between a wall and the
+        // ground behind it may go to either.
+        if (s.raster - h.raster).abs() > 1e-3 * h.raster {
+            differ += 1;
+        }
+    }
+    assert!(inside > EXTENT[0] * EXTENT[1] / 4, "{inside} pixels inside");
+    assert!(
+        differ * 100 <= inside,
+        "{differ} of {inside} pixels differ from the hardware raster"
+    );
     assert_clean();
 }
 
@@ -1767,7 +1907,7 @@ impl LimitSurface {
         near.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut starts: Vec<Spot> = Vec::new();
         for (_, n) in near {
-            if starts.len() < 4 && !starts.iter().any(|s| (s.page, s.face) == (n.page, n.face)) {
+            if starts.len() < 8 && !starts.iter().any(|s| (s.page, s.face) == (n.page, n.face)) {
                 starts.push(n);
             }
         }
@@ -1868,42 +2008,61 @@ impl LimitSurface {
 }
 
 /// Asserts the generated surface is closed and consistently wound: every edge of its
-/// triangles joins exactly two triangles with the same two end points, bit for bit, in
-/// opposite directions. Returns the triangle count.
+/// triangles is walked the other way, between the same two end points bit for bit, and in
+/// each direction by at most one triangle that is not a sliver ([`SLIVER`]). Triangles with
+/// two corners at one point are left out. Returns the triangle count.
 fn assert_closed(g: &Generated) -> usize {
     let bits = |v: u32| {
         g.positions[v as usize]
             .to_array()
             .map(|x| (x + 0.0).to_bits())
     };
-    let mut directed: HashMap<([u32; 3], [u32; 3]), u32> = HashMap::new();
+    let mut directed: HashMap<([u32; 3], [u32; 3]), Vec<f64>> = HashMap::new();
     let mut triangles = 0;
     for (k, r) in g.clusters.iter().zip(&g.records) {
         let pattern = tessellation::pattern(r.pattern);
         for t in &pattern.triangles {
             let v = t.map(|c| k.first_vertex + u32::from(c));
+            if (0..3).any(|e| bits(v[e]) == bits(v[(e + 1) % 3])) {
+                continue;
+            }
+            let p = v.map(|i| g.positions[i as usize].as_dvec3());
+            let longest = (0..3)
+                .map(|e| p[e].distance(p[(e + 1) % 3]))
+                .fold(0.0, f64::max);
+            let height = (p[1] - p[0]).cross(p[2] - p[0]).length() / longest;
             for e in 0..3 {
-                *directed
+                directed
                     .entry((bits(v[e]), bits(v[(e + 1) % 3])))
-                    .or_default() += 1;
+                    .or_default()
+                    .push(height);
             }
             triangles += 1;
         }
     }
-    let mut open = 0;
-    for (&(a, b), &n) in &directed {
-        if n != 1 || directed.get(&(b, a)) != Some(&1) {
+    let (mut open, mut overlapping) = (0, 0);
+    for (&(a, b), heights) in &directed {
+        if !directed.contains_key(&(b, a)) {
             open += 1;
+        }
+        if heights.iter().filter(|&&h| h > SLIVER).count() > 1 {
+            overlapping += 1;
         }
     }
     assert_eq!(
-        open,
-        0,
-        "{open} of {} edges are open or doubled",
+        (open, overlapping),
+        (0, 0),
+        "open and overlapping of {} edges",
         directed.len()
     );
     triangles
 }
+
+/// m: triangles lower than this are slivers. Subpatches near a change of count can be
+/// thinner than a float's resolution, and their inner vertices sit on their own patch's
+/// limit surface, which the neighbor's evaluation differs from by up to the 5.4e-5 m the
+/// rippled copy is held to; the fixtures' diced triangles are centimeters high.
+const SLIVER: f64 = 1e-3;
 
 /// A mounted cage pack and a scene with room for two copies.
 struct CageScene {
@@ -2119,8 +2278,8 @@ fn subdivision_cages_dice_closed_at_mixed_rates_on_their_limit_surface_in_raster
     assert_closed(&rippled);
 
     // Every vertex of the smooth copy lies on the CPU limit surface, and its normal is the
-    // surface's wherever the faces that meet there agree on one (not on the sharp edge or
-    // at the sharp corner) and away from the semi-sharp corner.
+    // surface's wherever the faces that meet there nearly agree on one (not on the sharp
+    // edge or at the sharp corner) and away from the semi-sharp corner.
     let cage = closed_cages();
     let corner = cage.positions[cage.corners[0].point as usize];
     let (mut worst, mut worst_normal) = (0.0f32, 0.0f32);
@@ -2129,7 +2288,9 @@ fn subdivision_cages_dice_closed_at_mixed_rates_on_their_limit_surface_in_raster
         worst = worst.max(n.distance);
         if n.spread < SHARP && p.distance(corner) > CORNER_REACH {
             let got = Vec3::from(orr_pack::mesh::oct_decode(a[0]));
-            worst_normal = worst_normal.max(got.dot(n.normal).clamp(-1.0, 1.0).acos());
+            // Faces that meet at the point may disagree by up to their spread.
+            let err = got.dot(n.normal).clamp(-1.0, 1.0).acos() - n.spread;
+            worst_normal = worst_normal.max(err);
         }
     }
     assert!(worst < LIMIT_TOLERANCE, "{worst} m from the limit surface");

@@ -167,10 +167,11 @@ public float2 pixel_from_clip(ViewConstants* v, float4 clip)
     return (clip.xy / clip.w * 0.5 + 0.5) * float2(v.extent);
 }
 
-// True when the box `lo..hi`, placed by `p`, lies in front of the near plane and its screen
-// rect's longer side is at most `pixels`.
-public bool small_on_screen(ViewConstants* v, Placement p, float3 lo, float3 hi, float pixels)
+// The longer side in pixels of the screen rect of the box `lo..hi`, placed by `p`; false
+// unless the box lies in front of the near plane.
+public bool screen_size(ViewConstants* v, Placement p, float3 lo, float3 hi, out float size)
 {
+    size = 0.0;
     float2 rect_min = float2(1e30);
     float2 rect_max = float2(-1e30);
     for (uint i = 0; i < 8; i++)
@@ -183,8 +184,23 @@ public bool small_on_screen(ViewConstants* v, Placement p, float3 lo, float3 hi,
         rect_min = min(rect_min, xy);
         rect_max = max(rect_max, xy);
     }
-    float2 size = rect_max - rect_min;
-    return max(size.x, size.y) <= min(pixels, SOFTWARE_MAX_PIXELS);
+    float2 sides = rect_max - rect_min;
+    size = max(sides.x, sides.y);
+    return true;
+}
+
+// The longest screen-rect side the software raster takes, from `RasterGpu.software_pixels`.
+public float software_limit(RasterGpu* r)
+{
+    return min(r.software_pixels, SOFTWARE_MAX_PIXELS);
+}
+
+// True when the software raster takes the box `lo..hi`, placed by `p`: it lies in front of
+// the near plane and its screen rect's longer side is at most `software_limit`.
+public bool small_on_screen(ViewConstants* v, Placement p, float3 lo, float3 hi, RasterGpu* r)
+{
+    float size;
+    return r.software_pixels > 0.0 && screen_size(v, p, lo, hi, size) && size <= software_limit(r);
 }
 
 // Whether the box `lo..hi`, placed by `p` relative to this frame's eye, lies behind the
