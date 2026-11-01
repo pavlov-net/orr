@@ -96,15 +96,14 @@ public struct PathRoot
     public uint local_columns;
     public uint light_flags;            // LIGHT_*
     // The dielectric dispatch's: one layer guide per pixel in rows of the G-buffer's width,
-    // the layer vertices a path may have, the dielectric whose interior holds the eye
-    // (MATERIAL_NONE for none) and DIELECTRIC_* flags.
+    // the view's froxels this frame (null for none), the layer vertices a path may have, the
+    // dielectric whose interior holds the eye (MATERIAL_NONE for none) and DIELECTRIC_* flags.
     public LayerGuide* layers;
+    public FroxelVolume* froxels;
     public uint dielectric_depth;
     public uint camera_medium;
     public uint dielectric_flags;
     public uint _pad0;
-    public uint _pad1;
-    public uint _pad2;
 }
 
 // What the dielectric dispatch leaves the guide resolve of a pixel's first dielectric or
@@ -120,7 +119,10 @@ public struct LayerGuide
     public float2 motion;           // the dominant layer's, previous uv minus current uv
     public float2 specular_motion;
     public uint dominant;           // 1: `depth` and `motion` replace the G-buffer's
-    public uint _pad0;
+    // Where the camera segment through the linked medium ends: m from the eye to the layer
+    // the pixel shades; 0: at the G-buffer's surface or the sky; below 0: nowhere, the eye
+    // lies in an interior.
+    public float medium_end;
     public uint _pad1;
     public uint _pad2;
 }
@@ -231,13 +233,20 @@ public RayDesc path_ray(float3 origin, float3 dir, float t_max)
     return r;
 }
 
-// 1 when the segment from `origin` along `dir` reaches `t_max` (+inf toward directional
-// lights and the environment) without an opaque or alpha-tested hit, else 0, times the
-// linked medium's transmittance over it.
-public float3 visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, HitContext context)
+// Whether the segment from `origin` along `dir` reaches `t_max` (+inf toward directional
+// lights and the environment) without an opaque or alpha-tested hit, traced with ray flags
+// `flags`.
+public bool unoccluded<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context)
 {
     Alpha<S> a = { s, v, dir, context };
-    if (trace_any(s.tlas, path_ray(origin, dir, t_max), MASK_OPAQUE, RAY_FLAG_NONE, a))
+    return !trace_any(s.tlas, path_ray(origin, dir, t_max), MASK_OPAQUE, flags, a);
+}
+
+// 1 when the segment from `origin` along `dir` reaches `t_max` without an opaque or
+// alpha-tested hit, else 0, times the linked medium's transmittance over it.
+public float3 visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context)
+{
+    if (!unoccluded<S>(s, v, origin, dir, t_max, flags, context))
         return float3(0.0);
     return medium_transmittance<M>(s.medium, origin, dir, t_max);
 }
@@ -310,7 +319,7 @@ public struct SceneShadow<S : ISurface, M : IMedium> : IShadow
     public float3 transmittance(float3 origin, float3 dir, float t_max, HitContext context, bool environment, out bool weigh)
     {
         weigh = true;
-        float3 vis = visibility<S, M>(scene, view, origin, dir, t_max, context);
+        float3 vis = visibility<S, M>(scene, view, origin, dir, t_max, RAY_FLAG_NONE, context);
         // Environment light reaches vertices without the medium's transmittance, as BSDF
         // misses see it: the baked map carries the medium.
         return environment ? select(vis > 0.0, float3(1.0), float3(0.0)) : vis;

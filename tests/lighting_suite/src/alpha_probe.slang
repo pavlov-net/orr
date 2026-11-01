@@ -72,7 +72,7 @@ void main(uint3 id: SV_DispatchThreadID)
     Alpha<ProbeSurface> alpha = { s, root.view, dir, context };
     RayDesc ray = path_ray(origin, dir, positive_infinity());
     uint stopped = 0;
-    if (visibility<ProbeSurface, NoMedium>(s, root.view, origin, dir, positive_infinity(), context).x == 0.0)
+    if (visibility<ProbeSurface, NoMedium>(s, root.view, origin, dir, positive_infinity(), RAY_FLAG_NONE, context).x == 0.0)
         stopped |= 1;
     Counted four = { alpha, root.calls };
     if (trace_any(s.tlas, ray, MASK_OPAQUE, RAY_FLAG_NONE, four))

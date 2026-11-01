@@ -1,10 +1,13 @@
 #![allow(clippy::print_stderr)]
 
-//! LUT parameterization round trips and f32 altitudes on the GPU.
+//! LUT parameterization round trips, f32 altitudes and lighting's froxel material encoding of
+//! the medium on the GPU.
 
 use atmosphere_suite::{Probe, Rig, dir, probe};
 use glam::{DVec3, Vec3};
-use orr_atmosphere::{Atmosphere, MULTIPLE_SCATTERING_SIZE, SKY_VIEW_SIZE, TRANSMITTANCE_SIZE};
+use orr_atmosphere::{
+    Atmosphere, HeightFog, MULTIPLE_SCATTERING_SIZE, SKY_VIEW_SIZE, TRANSMITTANCE_SIZE,
+};
 use orr_scene::testing::{assert_clean, read_buffer};
 
 fn texels(size: [u32; 2]) -> u32 {
@@ -144,6 +147,59 @@ fn altitudes_against_f64() {
             "plane {plane} m, sphere {sphere} m"
         );
         eprintln!("origin {origin}: plane altitude off by {plane:.4} m, spherical {sphere:.4} m");
+    }
+    assert_clean();
+}
+
+/// The default atmosphere with height fog, at altitudes through the fog: in-scatter 2 to 20
+/// degrees from the light through lighting's froxel material encoding within 1% of the
+/// unencoded medium's, per channel.
+#[test]
+fn froxel_material_keeps_three_component_inscatter() {
+    let atmosphere = Atmosphere {
+        height_fog: Some(HeightFog {
+            density: 1e-4,
+            falloff_height: 300.0,
+            base_height: 0.0,
+            albedo: Vec3::splat(0.9),
+            droplet_diameter: 10.0,
+        }),
+        ..Atmosphere::earth(DVec3::ZERO, Vec3::Y)
+    };
+    let mut rig = Rig::new(&atmosphere);
+    rig.frame(Some(dir(30.0, 0.0)), DVec3::new(0.0, 2.0, 0.0));
+    let mut input = Vec::new();
+    for h in [2.0f32, 50.0, 300.0, 1000.0, 3000.0] {
+        for k in 0..=18 {
+            let angle = (2.0 + k as f32).to_radians();
+            input.push([h, angle.cos(), 0.0, 0.0]);
+        }
+    }
+    let n = input.len() as u32;
+    let out = probe(
+        rig.block(),
+        "froxel_packing",
+        2 * u64::from(n),
+        Probe {
+            threads: n,
+            count: n,
+            input: &input,
+            ..Probe::default()
+        },
+    );
+    for (i, case) in input.iter().enumerate() {
+        let (exact, packed) = (out[2 * i], out[2 * i + 1]);
+        for c in 0..3 {
+            let error = (packed[c] - exact[c]).abs() / exact[c];
+            assert!(
+                error < 0.01,
+                "at {} m, cosine {}: channel {c} {} against {}",
+                case[0],
+                case[1],
+                packed[c],
+                exact[c]
+            );
+        }
     }
     assert_clean();
 }

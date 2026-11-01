@@ -589,9 +589,10 @@ impl<'a> Frame<'a> {
     }
 
     /// Steps 4-5 for one view: its raster half; the scene's lighting pass before the scene's
-    /// first view this frame; one path per pixel into the view's radiance, then the
-    /// dielectric dispatch over it, which traces each pixel's first dielectric or presence
-    /// layer; `hooks.scene_referred`; a scene-referred screenshot; metering and adaptation; then,
+    /// first view this frame; the view's froxel volume; one path per pixel into the view's
+    /// radiance, then the dielectric dispatch over it, which traces each pixel's first
+    /// dielectric or presence layer; media apply over each pixel's camera segment;
+    /// `hooks.scene_referred`; a scene-referred screenshot; metering and adaptation; then,
     /// unless the view stops there, tonemap, `hooks.display_linear`, `hooks.ui`, compose and
     /// a display screenshot.
     ///
@@ -683,17 +684,21 @@ impl<'a> Frame<'a> {
             sample_index: state.samples,
             seed: 0,
         };
+        paths.begin(id, scene, view, output.cut, lighting);
         let traced = Stages::COMPUTE | Stages::RAY;
         list.barrier(Stages::ALL, traced, Hazards::empty());
         let kernels = lights
             .paths
             .as_ref()
             .expect("compiled with the view history");
+        kernels.record_media(list, scene, paths, &pass, lighting)?;
         kernels.record_opaque(list, scene, paths, &pass, lighting);
         list.barrier(traced, traced, Hazards::empty());
         kernels.record_dielectric(list, paths, &pass, lighting);
         state.samples = state.samples.wrapping_add(1);
         list.barrier(traced, Stages::COMPUTE, Hazards::empty());
+        kernels.record_media_apply(list, scene, paths, &pass, lighting);
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         let (radiance, radiance_store) = (paths.radiance_index(), paths.radiance_storage());
         if let Some(hook) = hooks.transparency.as_mut() {
             self.scenes

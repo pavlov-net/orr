@@ -12,7 +12,8 @@ use orr_cook::{
     TextureSettings, Usage,
 };
 use orr_gpu::{
-    Allocation, CommandList, ComputePipeline, GpuPtr, Hazards, KernelSet, MemoryKind, Stages,
+    Allocation, CommandList, ComputePipeline, GpuAddress, GpuPtr, Hazards, KernelSet, MemoryKind,
+    Stages,
 };
 use orr_lighting::{
     BsdfTables, DirectionalLight, DiscProfile, EnvironmentMapGpu, Light, LightId, LightingKernels,
@@ -248,6 +249,9 @@ pub const WATER_SIGMA: [f32; 3] = [0.4, 0.2, 0.1];
 /// A black 2 m square facing +y with opacity [`PRESENCE_VEIL_OPACITY`], blended: a presence layer.
 pub const PRESENCE_VEIL: &str = "presence veil";
 pub const PRESENCE_VEIL_OPACITY: f32 = 0.25;
+/// A dark horizontal canopy 160 m square at y = 0: slats 1 m wide along z with 1 m gaps
+/// between them, faced up and down.
+pub const CANOPY: &str = "canopy";
 
 /// The bed's emitter: nits, white.
 pub const EMITTER_LUMINANCE: f32 = 50.0;
@@ -629,6 +633,19 @@ fn cook() -> Arc<[u8]> {
         double_sided: 1,
         ..Material::default()
     };
+    let canopy = mesh(|b| {
+        for i in 0..80 {
+            let x0 = -80.0 + 2.0 * i as f32;
+            let corners = [
+                Vec3::new(x0, 0.0, -80.0),
+                Vec3::new(x0 + 1.0, 0.0, -80.0),
+                Vec3::new(x0 + 1.0, 0.0, 80.0),
+                Vec3::new(x0, 0.0, 80.0),
+            ];
+            b.quad(0, corners, y, 1);
+            b.quad(0, corners, -y, 1);
+        }
+    });
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(
             Target::Memory,
@@ -749,6 +766,7 @@ fn cook() -> Arc<[u8]> {
                     mesh(|b| b.quad(0, square(1.0, 0.0), y, 1)),
                     vec![veil],
                 ),
+                model(CANOPY, canopy, vec![diffuse([0.1; 3])]),
                 AssetSpec {
                     name: TROUGH.into(),
                     source: Source::Mesh {
@@ -934,6 +952,7 @@ pub struct Bed {
     frame: u64,
     last_id: u64,
     light_writes: Vec<(LightId, Option<Light>)>,
+    medium: Option<GpuAddress>,
     _workers: Workers,
 }
 
@@ -1093,6 +1112,7 @@ impl Bed {
             frame,
             last_id: 0,
             light_writes: Vec::new(),
+            medium: None,
             _workers: workers,
         }
     }
@@ -1170,6 +1190,16 @@ impl Bed {
     /// Sets light `id` from the next frame on.
     pub fn set_light(&mut self, id: LightId, light: Option<Light>) {
         self.light_writes.push((id, light));
+    }
+
+    /// Gives the scene's linked medium the data at `data` from the next frame on.
+    pub fn set_medium(&mut self, data: GpuAddress) {
+        self.medium = Some(data);
+    }
+
+    /// The bed view's lighting targets as the last frame left them.
+    pub fn view(&self) -> &LightingView {
+        &self.target
     }
 
     /// Renders later frames at pre-exposure `p`, as the output's meter would set it.
@@ -1273,10 +1303,13 @@ impl Bed {
             texture_filter: TextureFilter::Hardware,
             target: ViewTarget::AfterRr,
         };
-        if !self.light_writes.is_empty() {
+        if !self.light_writes.is_empty() || self.medium.is_some() {
             let mut w = f.scene(self.scene).unwrap();
             for (id, l) in self.light_writes.drain(..) {
                 w.set_light(id, l.as_ref()).unwrap();
+            }
+            if let Some(data) = self.medium.take() {
+                w.set_medium(data);
             }
         }
         let view = f.raster_view(&desc).unwrap();
@@ -1398,12 +1431,15 @@ impl Paths {
         }
     }
 
-    /// Starts the view's frame, then records the opaque dispatch, the dielectric dispatch and
-    /// the guide resolve.
+    /// Starts the view's frame, then records the froxel passes, the opaque dispatch, the
+    /// dielectric dispatch, media apply and the guide resolve.
     pub fn record(&self, list: &mut CommandList<'_>, f: &mut BedFrame<'_>) {
         let pass = f.pass();
         f.target
             .begin(f.frame, f.lighting, &f.desc, false, &self.settings);
+        self.kernels
+            .record_media(list, f.lighting, f.target, &pass, &self.settings)
+            .unwrap();
         self.kernels
             .record_opaque(list, f.lighting, f.target, &pass, &self.settings);
         let paths = Stages::COMPUTE | Stages::RAY;
@@ -1411,6 +1447,9 @@ impl Paths {
         self.kernels
             .record_dielectric(list, f.target, &pass, &self.settings);
         list.barrier(paths, Stages::COMPUTE, Hazards::empty());
+        self.kernels
+            .record_media_apply(list, f.lighting, f.target, &pass, &self.settings);
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         self.kernels
             .record_guides(list, f.target, &pass, &self.settings);
     }

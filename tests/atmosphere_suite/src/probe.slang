@@ -256,3 +256,37 @@ void disc(uint lane: SV_GroupIndex)
     root.output[1] = float4(l.color * SkyTransmittance.transmittance(set.scene.medium, eye,
                                                                      l.direction, positive_infinity()), 0.0);
 }
+
+// Per input (altitude in x, phase cosine in y), the atmosphere's in-scatter per unit
+// illuminance, sigma_s x phase summed over its three components (Rayleigh, aerosol, fog):
+// output 2i exactly, output 2i + 1 through lighting's froxel material encoding, with the
+// RGBA16F target's rounding, with the fog's and the aerosol's shares as its two triples
+// and Rayleigh, the flattest phase, as the rest.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void froxel_packing(uint3 id: SV_DispatchThreadID)
+{
+    if (id.x >= root.count)
+        return;
+    AtmosphereGpu* a = root.atmosphere;
+    float h = root.input[id.x].x;
+    float c = root.input[id.x].y;
+    float3 d = atmosphere_densities(a, h);
+    float3 rayleigh = a.rayleigh.rgb * d.x;
+    float3 aerosol = a.aerosol_scattering.rgb * d.y;
+    float3 fog = atmosphere_fog_extinction(a, h) * a.fog_albedo.rgb;
+    float pr = rayleigh_phase(c);
+    float pa = cornette_shanks_phase(a.aerosol_asymmetry, c);
+    float pf = fog_phase(a.fog_diameter, c);
+    MediumPoint m = {};
+    m.sigma_s = rayleigh + aerosol + fog;
+    m.sigma_t = m.sigma_s;
+    m.phase_share = fog / m.sigma_s;
+    m.phase_share_second = aerosol / m.sigma_s;
+    FroxelMaterial f = froxel_material(m);
+    f.sigma = f16tof32(f32tof16(f.sigma));
+    MediumPoint p = froxel_point(f, false);
+    float3 rest = max(1.0 - p.phase_share - p.phase_share_second, 0.0);
+    root.output[2 * id.x] = float4(rayleigh * pr + aerosol * pa + fog * pf, 0.0);
+    root.output[2 * id.x + 1] = float4(p.sigma_s * (p.phase_share * pf + p.phase_share_second * pa + rest * pr), 0.0);
+}

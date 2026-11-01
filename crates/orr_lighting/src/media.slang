@@ -1,8 +1,12 @@
 // Participating media: the medium link point, the stock height-fog functions implementations
-// call, and the transmittance every lighting segment uses.
+// call, the transmittance every lighting segment uses, and the froxel volume's layout and
+// material encoding.
 module media;
 
+import orr.abi;
 import orr.math;
+import orr.color;
+import orr.packing;
 
 // One point of a medium. Coefficients are per meter in linear Rec.2020.
 public struct MediumPoint
@@ -13,9 +17,10 @@ public struct MediumPoint
     public float3 emission;
     // The point's phase parameter; fixed parameters live in the medium's data.
     public float phase_parameter;
-    // Per channel, the share of `sigma_s` the first phase component holds; the second holds
-    // the rest.
+    // Per channel, the shares of `sigma_s` the first and second phase components hold; a
+    // third holds the rest.
     public float3 phase_share;
+    public float3 phase_share_second;
 }
 
 // A medium linked into orr's kernels. `data` is the address the scene was given for it.
@@ -145,4 +150,118 @@ public float fog_phase(float diameter_um, float cos_theta)
     float alpha = exp(3.62489 - 8.29288 / (d + 5.52825));
     float w_d = exp(-0.599085 / (d - 0.641583) - 0.665888);
     return (1.0 - w_d) * hg_phase(g_hg, cos_theta) + w_d * draine_phase(g_d, alpha, cos_theta);
+}
+
+// One `dt` m step of a medium march with extinction `sigma_t` and `source` radiance per m:
+// adds its in-scatter, seen through `transmittance`, to `inscatter`, then its transmittance
+// to `transmittance`.
+public void march_step(float3 sigma_t, float3 source, float dt, inout float3 inscatter, inout float3 transmittance)
+{
+    float3 step = exp(-sigma_t * dt);
+    inscatter += transmittance * source * select(sigma_t > 0.0, (1.0 - step) / max(sigma_t, 1e-30), float3(dt));
+    transmittance *= step;
+}
+
+// Froxels: a view's volume of ceil(width / FROXEL_TILE) x ceil(height / FROXEL_TILE) columns
+// along unjittered rays spread evenly from one edge of the image to the other, each cut
+// into `slices` shells of distance from the eye to the scene's `near_range`, squared toward
+// the far end: slice coordinate c in [0, slices] lies at near_range (c / slices)^2.
+public static const uint FROXEL_TILE = 8;
+
+// Most directional lights the froxels trace shadow rays toward.
+public static const uint MAX_FROXEL_SHADOWED_LIGHTS = 4;
+
+// `froxel_material` holds coefficients times this, so clear air keeps f16 precision; dense
+// media up to 16 /m fit.
+public static const float FROXEL_SIGMA_SCALE = 4096.0;
+
+// The directional lights a view's froxels trace shadow rays toward, as LightIds, in the
+// order their visibility is stored.
+public struct FroxelLights
+{
+    public uint ids[MAX_FROXEL_SHADOWED_LIGHTS];
+    public uint count;
+    // 1 when the lights differ from the last frame's: their visibility history restarts.
+    public uint changed;
+    public uint _pad0;
+    public uint _pad1;
+}
+
+// One frame's froxel volume of a view, for passes that read it after its integration.
+public struct FroxelVolume
+{
+    public FroxelLights* lights;
+    public StorageImageIndex sigma;             // froxel_material, RGBA16F
+    public StorageImageIndex words;             // froxel_material, RGBA32_UINT
+    public StorageImageIndex incident;          // RGBA16F
+    public StorageImageIndex visibility;        // shadowed lights past the first, one channel each
+    public uint columns;
+    public uint rows;
+    public uint slices;
+    public uint chromatic;
+}
+
+// Render pixels between neighboring column rays of a `grid` of columns over an `extent`
+// image. The first and last rays of each axis lie on the image's edges.
+public float2 froxel_spacing(uint2 extent, uint2 grid)
+{
+    return float2(extent) / max(float2(grid) - 1.0, 1.0);
+}
+
+// Distance from the eye of slice coordinate `c`.
+public float froxel_distance(float c, uint slices, float near_range)
+{
+    float u = c / float(slices);
+    return near_range * u * u;
+}
+
+// Slice coordinate of distance `t`, clamped to the volume.
+public float froxel_slice(float t, uint slices, float near_range)
+{
+    return float(slices) * sqrt(saturate(t / near_range));
+}
+
+// A froxel's medium: `sigma` (RGBA16F) holds sigma_s rgb and the luminance of sigma_t, both
+// times FROXEL_SIGMA_SCALE; `words` (RGBA32_UINT) the emission as rgb9e5, the phase
+// parameter as f16, and the two share triples at 10 bits per channel.
+public struct FroxelMaterial
+{
+    public float4 sigma;
+    public uint4 words;
+}
+
+uint pack_shares(float3 s)
+{
+    uint3 q = uint3(round(saturate(s) * 1023.0));
+    return q.x | (q.y << 10) | (q.z << 20);
+}
+
+float3 unpack_shares(uint p)
+{
+    return float3(uint3(p, p >> 10, p >> 20) & 0x3FF) / 1023.0;
+}
+
+public FroxelMaterial froxel_material(MediumPoint m)
+{
+    FroxelMaterial f;
+    f.sigma = float4(m.sigma_s, luminance_rec2020(m.sigma_t)) * FROXEL_SIGMA_SCALE;
+    f.words = uint4(pack_rgb9e5(m.emission), f32tof16(m.phase_parameter),
+                    pack_shares(m.phase_share), pack_shares(m.phase_share_second));
+    return f;
+}
+
+// The point a froxel's material describes. Its extinction is gray, the stored luminance;
+// with `chromatic`, sigma_s per channel plus gray absorption, the luminance's excess over
+// sigma_s's.
+public MediumPoint froxel_point(FroxelMaterial f, bool chromatic)
+{
+    MediumPoint m;
+    m.sigma_s = f.sigma.rgb / FROXEL_SIGMA_SCALE;
+    float sigma_t = f.sigma.a / FROXEL_SIGMA_SCALE;
+    m.sigma_t = chromatic ? m.sigma_s + max(0.0, sigma_t - luminance_rec2020(m.sigma_s)) : float3(sigma_t);
+    m.emission = unpack_rgb9e5(f.words.x);
+    m.phase_parameter = f16tof32(f.words.y);
+    m.phase_share = unpack_shares(f.words.z);
+    m.phase_share_second = unpack_shares(f.words.w);
+    return m;
 }
