@@ -471,9 +471,10 @@ impl<'a> Packer<'a> {
             ..t.clone()
         };
         if let Some(r) = &t.base_color {
-            // Base alpha stands in for the opacity slot when that is not bound.
-            let alpha_free = m.alpha_mode != Material::OPAQUE
-                && t.opacity
+            // Only an alpha-tested or blended material reads base alpha as opacity, and only
+            // where no opacity slot is bound.
+            let alpha_free = m.alpha_mode == Material::OPAQUE
+                || t.opacity
                     .is_some_and(|o| self.constant(o.image, usize::from(o.channel)).is_none());
             self.colour(suffix, m, r, slot::BASE_COLOR, alpha_free)?;
         }
