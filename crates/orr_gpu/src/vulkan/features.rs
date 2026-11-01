@@ -44,7 +44,6 @@ const CAPTURE_UNSUPPORTED: &[&CStr] = &[
     ash::khr::device_address_commands::NAME,
     ash::khr::device_fault::NAME,
     ash::khr::opacity_micromap::NAME,
-    ash::khr::pipeline_binary::NAME,
     ash::khr::shader_abort::NAME,
     ash::khr::shader_constant_data::NAME,
 ];
@@ -68,7 +67,6 @@ pub(crate) struct Optional {
     /// `VK_EXT_pageable_device_local_memory`, only beside `memory_priority`.
     pub pageable_memory: bool,
     pub shader_abort: bool,
-    pub pipeline_binary: bool,
     pub cooperative_vector: bool,
     pub shader_float8: bool,
     pub memory_decompression: bool,
@@ -127,7 +125,6 @@ pub(crate) struct FeatureChain {
     pub unified: vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR<'static>,
     pub abort: vk::PhysicalDeviceShaderAbortFeaturesKHR<'static>,
     pub constant_data: vk::PhysicalDeviceShaderConstantDataFeaturesKHR<'static>,
-    pub binary: vk::PhysicalDevicePipelineBinaryFeaturesKHR<'static>,
     pub coop: vk::PhysicalDeviceCooperativeVectorFeaturesNV<'static>,
     pub replicated: vk::PhysicalDeviceShaderReplicatedCompositesFeaturesEXT<'static>,
     pub float8: vk::PhysicalDeviceShaderFloat8FeaturesEXT<'static>,
@@ -196,9 +193,6 @@ impl FeatureChain {
         if opt.shader_abort {
             chain.push(ptr(&mut self.abort));
             chain.push(ptr(&mut self.constant_data));
-        }
-        if opt.pipeline_binary {
-            chain.push(ptr(&mut self.binary));
         }
         if opt.cooperative_vector {
             chain.push(ptr(&mut self.coop));
@@ -401,7 +395,6 @@ pub(crate) fn select(
             && present(ash::khr::shader_abort::NAME)
             && device_fault
             && present(ash::khr::shader_constant_data::NAME),
-        pipeline_binary: present(ash::khr::pipeline_binary::NAME),
         cooperative_vector: present(ash::nv::cooperative_vector::NAME)
             && present(ash::ext::shader_replicated_composites::NAME),
         shader_float8: present(ash::ext::shader_float8::NAME),
@@ -534,7 +527,6 @@ pub(crate) fn select(
         && q.indirect_copy.indirect_memory_to_image_copy != 0;
     opt.unified_image_layouts &= q.unified.unified_image_layouts != 0;
     opt.shader_abort &= q.abort.shader_abort != 0 && q.constant_data.shader_constant_data != 0;
-    opt.pipeline_binary &= q.binary.pipeline_binaries != 0;
     opt.cooperative_vector &=
         q.coop.cooperative_vector != 0 && q.replicated.shader_replicated_composites != 0;
     opt.shader_float8 &= q.float8.shader_float8 != 0;
@@ -623,7 +615,6 @@ pub(crate) fn select(
     e.unified.unified_image_layouts = 1;
     e.abort.shader_abort = 1;
     e.constant_data.shader_constant_data = 1;
-    e.binary.pipeline_binaries = 1;
     e.coop.cooperative_vector = 1;
     e.replicated.shader_replicated_composites = 1;
     e.float8.shader_float8 = 1;
@@ -699,7 +690,6 @@ pub(crate) fn select(
     );
     add(opt.aftermath, &[ash::nv::device_diagnostics_config::NAME]);
     add(opt.buffer_marker, &[ash::amd::buffer_marker::NAME]);
-    add(opt.pipeline_binary, &[ash::khr::pipeline_binary::NAME]);
     add(
         opt.cooperative_vector,
         &[

@@ -32,8 +32,8 @@ pub enum Diagnostics<'a> {
     /// working directory.
     Aftermath { dump_dir: &'a Path },
     /// For Nsight Graphics captures: leaves off the optional extensions captures do not
-    /// support (device address commands, KHR device fault, opacity micromaps, pipeline
-    /// binaries, shader abort, shader constant data).
+    /// support (device address commands, KHR device fault, opacity micromaps, shader abort,
+    /// shader constant data).
     Capture,
 }
 

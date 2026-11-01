@@ -48,8 +48,8 @@ pub struct DeviceDesc<'a> {
     /// Messages are logged and counted ([`Device::validation_messages`]).
     pub validation: bool,
     pub diagnostics: Diagnostics<'a>,
-    /// The disk pipeline cache: read at creation, written by
-    /// [`Device::save_pipeline_cache`]. `None`: no disk cache.
+    /// The file of the `VkPipelineCache` every pipeline compiles through: read at creation,
+    /// written by [`Device::save_pipeline_cache`]. `None`: no cache beyond the driver's own.
     pub pipeline_cache: Option<&'a Path>,
     /// Optional extensions to leave off even when the device offers them; their `Caps`
     /// stay false.
@@ -516,7 +516,6 @@ impl Device {
             breadcrumbs: optional.buffer_marker,
             checkpoints: optional.checkpoints,
             aftermath: optional.aftermath,
-            pipeline_binary: optional.pipeline_binary,
             cooperative_vector: coop,
             shader_float8: optional.shader_float8,
             calibrated_timestamps: optional.calibrated_timestamps,
@@ -631,8 +630,7 @@ impl Device {
             }
         };
 
-        let pipeline_cache =
-            PipelineCache::open(&instance, &device, physical, &caps, desc.pipeline_cache);
+        let pipeline_cache = PipelineCache::open(&device, &props, desc.pipeline_cache);
         let mut queue_handles = [None; MAX_TIMELINES];
         let mut families_by_kind = [0; MAX_TIMELINES];
         for plan in &plans {

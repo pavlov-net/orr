@@ -1,5 +1,3 @@
-use std::hash::{Hash, Hasher};
-
 use crate::{CompareOp, Format};
 
 /// Which triangles the rasterizer drops.
@@ -38,16 +36,8 @@ pub struct DepthBias {
     pub clamp: f32,
 }
 
-impl Hash for DepthBias {
-    fn hash<H: Hasher>(&self, h: &mut H) {
-        for v in [self.constant, self.slope, self.clamp] {
-            v.to_bits().hash(h);
-        }
-    }
-}
-
 /// Rasterizer state of a mesh pipeline.
-#[derive(Clone, Copy, PartialEq, Debug, Default, Hash)]
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct RasterState {
     pub cull: Cull,
     pub front_face: FrontFace,

@@ -1,7 +1,6 @@
-//! The disk pipeline cache: warm loads, files from another driver or device, the
-//! `VkPipelineCache` fallback and creation from several threads.
+//! The disk pipeline cache: warm loads, files from another driver or device and creation
+//! from several threads.
 
-use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -9,9 +8,9 @@ use gpu_suite::log_to_stderr;
 use gpu_suite::shaders::cached;
 use orr_gpu::{
     ClearColor, ColorAttachment, ColorLoad, ColorTarget, ComputePipeline, Device, DeviceDesc,
-    Format, Hazards, MemoryKind, MeshPipeline, MeshPipelineDesc, PipelineCacheKind, QueueKind,
-    RayDispatchPipeline, Rendering, ShaderStage, SpecData, Stages, TextureDesc, TextureMemory,
-    TextureRegion, TextureUsage,
+    Format, Hazards, MemoryKind, MeshPipeline, MeshPipelineDesc, QueueKind, RayDispatchPipeline,
+    Rendering, ShaderStage, SpecData, Stages, TextureDesc, TextureMemory, TextureRegion,
+    TextureUsage,
 };
 
 fn cache_path(test: &str) -> PathBuf {
@@ -22,13 +21,12 @@ fn cache_path(test: &str) -> PathBuf {
     path
 }
 
-fn open(path: &Path, skip: &[&CStr]) -> Device {
+fn open(path: &Path) -> Device {
     log_to_stderr();
     Device::new(&DeviceDesc {
         name: "gpu_suite pipeline cache",
         validation: true,
         pipeline_cache: Some(path),
-        skip_extensions: skip,
         ..DeviceDesc::default()
     })
     .unwrap()
@@ -155,8 +153,8 @@ fn rewrite_header(path: &Path, offset: usize, f: impl FnOnce(u32) -> u32) {
 }
 
 /// Header offsets of the device id and driver version.
-const DEVICE_ID: usize = 20;
-const DRIVER_VERSION: usize = 24;
+const DEVICE_ID: usize = 16;
+const DRIVER_VERSION: usize = 20;
 
 fn assert_clean(d: &Device) {
     assert_eq!(
@@ -168,10 +166,11 @@ fn assert_clean(d: &Device) {
 
 /// Writes a cache, loads it warm, then loads it as another driver version and as another
 /// device: both are refused and every pipeline is compiled again.
-fn round_trip(path: &Path, skip: &[&CStr], kind: PipelineCacheKind) {
-    let d = open(path, skip);
-    let report = d.pipeline_cache_report();
-    assert_eq!((report.kind, report.loaded), (kind, 0));
+#[test]
+fn round_trip_and_refuse_foreign_files() {
+    let path = &cache_path("round_trip");
+    let d = open(path);
+    assert!(!d.pipeline_cache_report().loaded);
     let set = Set::new(&d, 1);
     let n = set.kinds();
     assert_eq!(d.pipeline_cache_report().misses, n);
@@ -180,10 +179,10 @@ fn round_trip(path: &Path, skip: &[&CStr], kind: PipelineCacheKind) {
     assert_clean(&d);
     drop((set, d));
 
-    // 621.01 takes back compute binaries, compiles mesh pipelines from the VkPipelineCache
-    // and caches ray-dispatch pipelines through neither, so only the first two are asserted.
-    let d = open(path, skip);
-    assert!(d.pipeline_cache_report().loaded > 0);
+    // 621.01 reports cache hits for compute and mesh pipelines but never for ray-dispatch
+    // pipelines, so only the first two are asserted.
+    let d = open(path);
+    assert!(d.pipeline_cache_report().loaded);
     let set = Set::new(&d, 1);
     assert_eq!(
         set.cached,
@@ -198,13 +197,13 @@ fn round_trip(path: &Path, skip: &[&CStr], kind: PipelineCacheKind) {
     for (offset, what) in [(DRIVER_VERSION, "driver version"), (DEVICE_ID, "device")] {
         let saved = std::fs::read(path).unwrap();
         rewrite_header(path, offset, |v| v ^ 1);
-        let d = open(path, skip);
+        let d = open(path);
         let report = d.pipeline_cache_report();
         assert!(
             report.rejected.as_deref().is_some_and(|r| r.contains(what)),
             "{what}: {report:?}"
         );
-        assert_eq!(report.loaded, 0);
+        assert!(!report.loaded);
         let set = Set::new(&d, 1);
         let report = d.pipeline_cache_report();
         assert_eq!((report.hits, report.misses), (0, n), "{what}: {report:?}");
@@ -216,29 +215,11 @@ fn round_trip(path: &Path, skip: &[&CStr], kind: PipelineCacheKind) {
 }
 
 #[test]
-fn binaries_round_trip_and_refuse_foreign_files() {
-    let path = cache_path("binaries");
-    let probe = open(&path, &[]);
-    if !probe.caps().pipeline_binary {
-        log::warn!("no VK_KHR_pipeline_binary; skipped");
-        return;
-    }
-    drop(probe);
-    round_trip(&path, &[], PipelineCacheKind::Binaries);
-}
-
-#[test]
-fn pipeline_cache_file_round_trip_and_refuse_foreign_files() {
-    let path = cache_path("file");
-    round_trip(&path, &[c"VK_KHR_pipeline_binary"], PipelineCacheKind::File);
-}
-
-#[test]
 fn concurrent_creation() {
     let path = cache_path("concurrent");
     for warm in [false, true] {
-        let d = open(&path, &[]);
-        // Threads 0 and 1 share their first set's key with threads 2 and 3.
+        let d = open(&path);
+        // Threads 0 and 1 compile the same first set as threads 2 and 3.
         let sets: Vec<(Set, Set)> = std::thread::scope(|s| {
             let threads: Vec<_> = (0..4u32)
                 .map(|t| {
