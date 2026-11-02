@@ -1,6 +1,7 @@
 //! The cook run: sources become units (one cook job each, usually one entry), units link
-//! from the archive being replaced or the cache when their keys match, the rest cook on the
-//! cook's pool, and every archive is written in a fixed order.
+//! from the archive being replaced or the cache when their keys match, the rest cook on
+//! threads of their own with their parallel loops on the rayon pool, and every archive is
+//! written in a fixed order.
 //!
 //! Scheduling: the jobs the next unwritten units wait on start first, then the rest largest
 //! first, while the estimated working set of the running jobs stays under
@@ -16,6 +17,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
+use std::thread::Scope;
 use std::time::Instant;
 
 use glam::{Vec2, Vec3, Vec4};
@@ -65,18 +67,23 @@ const MESH_BYTES_PER_TRIANGLE: u64 = 480;
 pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
     let start = Instant::now();
     crate::alloc::install_meshopt_arena();
-    let pool = rayon::ThreadPoolBuilder::new()
+    // A pool built earlier in the process stays; the cook runs on whichever is there.
+    let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(opts.jobs)
-        .build()
-        .map_err(|e| orr_pack::Error::from(std::io::Error::other(e)))?;
+        .build_global();
     let shared = Shared {
         memo: Memo::default(),
         cache: opts.cache.as_deref().map(Cache::new).transpose()?,
         zstd_level: opts.zstd_level,
     };
-    let threads = pool.current_num_threads();
+    let threads = match opts.jobs {
+        0 => std::thread::available_parallelism().map_or(1, usize::from),
+        n => n,
+    };
     let mut run = Run::new(manifest, opts, &shared)?;
-    if let Err(e) = pool.in_place_scope(|scope| run.run(scope, threads)) {
+    // Jobs run on threads of their own and their parallel loops on the pool, so a pool
+    // thread waiting on one job's loop never starts another job on its stack.
+    if let Err(e) = std::thread::scope(|scope| run.run(scope, threads)) {
         run.remove_scratch();
         return Err(e);
     }
@@ -739,9 +746,10 @@ impl<'m, 's> Run<'m, 's> {
         }
     }
 
-    fn run(&mut self, scope: &rayon::Scope<'m>, threads: usize) -> Result<()>
+    fn run<'t>(&mut self, scope: &'t Scope<'t, '_>, threads: usize) -> Result<()>
     where
-        's: 'm,
+        'm: 't,
+        's: 't,
     {
         let (tx, rx) = mpsc::channel::<Msg>();
         self.import_all(scope, threads, &tx, &rx)?;
@@ -752,15 +760,16 @@ impl<'m, 's> Run<'m, 's> {
     }
 
     /// Imports every changed scene source, largest file first.
-    fn import_all(
+    fn import_all<'t>(
         &mut self,
-        scope: &rayon::Scope<'m>,
+        scope: &'t Scope<'t, '_>,
         threads: usize,
         tx: &mpsc::Sender<Msg>,
         rx: &mpsc::Receiver<Msg>,
     ) -> Result<()>
     where
-        's: 'm,
+        'm: 't,
+        's: 't,
     {
         let size: Vec<u64> = self
             .imports
@@ -783,7 +792,7 @@ impl<'m, 's> Run<'m, 's> {
                 let (tx, shared) = (tx.clone(), self.shared);
                 let imp = &self.imports[i];
                 let (name, path, kind) = (imp.name, imp.path, imp.kind);
-                scope.spawn(move |_| {
+                scope.spawn(move || {
                     let r =
                         catch_unwind(AssertUnwindSafe(|| import(name, path, kind, &shared.memo)));
                     let _ = tx.send(Msg::Import(i, r));
@@ -1075,15 +1084,16 @@ impl<'m, 's> Run<'m, 's> {
         Ok(())
     }
 
-    fn cook_all(
+    fn cook_all<'t>(
         &mut self,
-        scope: &rayon::Scope<'m>,
+        scope: &'t Scope<'t, '_>,
         threads: usize,
         tx: &mpsc::Sender<Msg>,
         rx: &mpsc::Receiver<Msg>,
     ) -> Result<()>
     where
-        's: 'm,
+        'm: 't,
+        's: 't,
     {
         let (mut running, mut bytes) = (0usize, 0u64);
         loop {
@@ -1209,9 +1219,10 @@ impl<'m, 's> Run<'m, 's> {
         }
     }
 
-    fn spawn(&mut self, scope: &rayon::Scope<'m>, tx: &mpsc::Sender<Msg>, u: usize)
+    fn spawn<'t>(&mut self, scope: &'t Scope<'t, '_>, tx: &mpsc::Sender<Msg>, u: usize)
     where
-        's: 'm,
+        'm: 't,
+        's: 't,
     {
         let mut work = self.units[u].work.take().expect("waiting units have work");
         if let Work::Instances(_, _, catalog, meshes) = &mut work {
@@ -1242,7 +1253,7 @@ impl<'m, 's> Run<'m, 's> {
             .clone()
             .filter(|_| self.window > self.opts.reorder_window);
         let (tx, shared) = (tx.clone(), self.shared);
-        scope.spawn(move |_| {
+        scope.spawn(move || {
             let r = catch_unwind(AssertUnwindSafe(|| {
                 let start = Instant::now();
                 let (from, detail) =

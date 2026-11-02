@@ -5,7 +5,7 @@
 //! one as rows arrive and written to a scratch file (in the cache directory, or the system
 //! temporary directory without a cache), so memory stays bounded by the band and the
 //! tiles in flight. Tiles are then cut from the level files in table order and encoded in
-//! parallel on the cook's pool.
+//! parallel on the rayon pool.
 
 mod input;
 mod texel;
