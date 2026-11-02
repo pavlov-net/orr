@@ -173,8 +173,9 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     Placement prev;
     if (!visible_placement(s, v, vc, true, prev))
         prev = p;
-    // A producer batch with previous positions, or a skinned copy skinned by last frame's
-    // palette, moves the point by its vertices' motion too.
+    // A producer batch with previous positions, a skinned copy skinned by last frame's
+    // palette, or an edit whose vertices a kernel moved, moves the point by its vertices'
+    // motion too.
     uint entry;
     bool deformed = false;
     Corners c = (Corners)0;
@@ -194,9 +195,12 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     else
     {
         InstanceGpu inst = copy_record(s, vc.instance);
+        MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
         deformed = copy_skin(s, inst, k);
         if (deformed)
-            skinned_corners(k, s.meshes + s.models[inst.model].mesh, vc.page, load_cluster(vc.page, vc.local), vc.cluster, visibility_triangle(w), true, c);
+            skinned_corners(k, mesh, vc.page, load_cluster(vc.page, vc.local), vc.cluster, visibility_triangle(w), true, c);
+        else
+            deformed = edited_corners(mesh, vc.page, vc.local, visibility_triangle(w), c);
     }
     if (deformed)
     {

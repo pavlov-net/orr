@@ -1,6 +1,7 @@
 // What an edit's rebuild runs around its CLAS builds. `bounds` fits each rebuilt cluster's
 // culling data to the triangles it now holds, after the consumer kernel wrote its page;
-// `refs` puts each built CLAS's address into the resident cluster table.
+// `refs` puts each built CLAS's address into the resident cluster table, or each built
+// template's into the edit's skin table.
 #include "orr/root.h"
 import orr.abi;
 import orr.packing;
@@ -21,9 +22,11 @@ public struct EditRoot
 {
     public EditJob* jobs;
     public ClusterRef* clusters;   // the resident cluster table
-    public uint64_t* addresses;    // per job: its built CLAS
+    public uint64_t* addresses;    // per job: its built CLAS or template
+    public uint64_t* templates;    // a skinned mesh's edit: per mesh cluster, its template; else null
     public uint count;
-    public uint _pad;
+    public uint cluster_base;      // with `templates`: the cluster id of mesh cluster 0
+    public uint64_t _pad;
 }
 ORR_ROOT(EditRoot);
 
@@ -36,6 +39,12 @@ void bounds(uint3 id: SV_DispatchThreadID)
     EditJob job = root.jobs[id.x];
     PageHeader h = load_page_header(job.page);
     Cluster* at = cluster_at(job.page, job.local);
+    // Every box of a cluster starts at its anchor, so the anchor returns to the lowest vertex.
+    uint3 lowest = uint3(65535);
+    for (uint i = 0; i < at.vertex_count; i++)
+        lowest = min(lowest, load_local(job.page, h, *at, i));
+    if (any(lowest != 0))
+        store_anchor(job.page, h, job.local, at.anchor + int3(lowest));
     Cluster c = *at;
     uint3 top = uint3(0);
     float3 lo = float3(1e30);
@@ -76,5 +85,9 @@ void refs(uint3 id: SV_DispatchThreadID)
 {
     if (id.x >= root.count)
         return;
-    root.clusters[root.jobs[id.x].cluster_id].clas = root.addresses[id.x];
+    uint cluster = root.jobs[id.x].cluster_id;
+    if (root.templates != nullptr)
+        root.templates[cluster - root.cluster_base] = root.addresses[id.x];
+    else
+        root.clusters[cluster].clas = root.addresses[id.x];
 }

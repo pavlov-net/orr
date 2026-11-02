@@ -10,7 +10,8 @@
 //! cut; the cuts of near copies are matched against their mesh's cached cuts, shared between
 //! copies with equal cuts, and otherwise built as cluster BLAS within the frame's budget.
 //! Copies tracing a cached cut of a streaming mesh ask for the finer cut that would serve
-//! them; an edit's copies always gather, with what it touches held at level 0.
+//! them; an edit's copies always gather, with what it touches held at level 0, split into a
+//! BLAS for the body and one per animated part while they take their pose.
 
 use orr_gpu::{
     Allocation, BlasLimits, ClusterVertexFormat, CommandList, Device, DispatchArgs, GpuAddress,
@@ -22,11 +23,12 @@ use crate::memory::UploadWindow;
 use crate::pipelines::{PipelineId, Pipelines};
 use crate::shaders::traverse::{self, TraverseRoot};
 use crate::{
-    BlasJob, ClusterWork, CutGpu, CutKey, FeedbackGpu, NodeItem, Result, SceneRoot, SlotCutGpu,
+    BlasJob, ClusterWork, CutGpu, CutKey, FeedbackGpu, NodeItem, PartListGpu, Result, SceneRoot,
+    SlotCutGpu,
 };
 
 /// `CutGpu.counters` entries (`cut.slang`), the BLAS build count after them.
-const COUNTERS: usize = 20;
+const COUNTERS: usize = 21;
 const CUT_CANDIDATES: usize = 2;
 const CUT_CANDIDATE_CLUSTERS: usize = 3;
 const CUT_ENTRIES: usize = 4;
@@ -43,7 +45,7 @@ const CUT_MERGED: usize = 15;
 const CUT_REQUESTS: usize = 16;
 const CUT_RETRIES: usize = 17;
 const CUT_FEEDBACK: usize = 18;
-const CUT_BUILDS: u64 = 19;
+const CUT_BUILDS: u64 = 20;
 /// `traverse.slang` args layout.
 const ARGS_PASSES: u32 = 64;
 const ARGS_GATHER: u64 = 3 * ARGS_PASSES as u64;
@@ -134,6 +136,8 @@ pub(crate) struct CutPipelines {
     retry: PipelineId,
     assign: PipelineId,
     share: PipelineId,
+    split: PipelineId,
+    place_lists: PipelineId,
     link: PipelineId,
     prepare: PipelineId,
     gather: PipelineId,
@@ -153,6 +157,8 @@ impl CutPipelines {
             retry: c("retry")?,
             assign: c("assign")?,
             share: c("share")?,
+            split: c("split")?,
+            place_lists: c("place_lists")?,
             link: c("link")?,
             prepare: c("prepare")?,
             gather: c("gather")?,
@@ -176,6 +182,11 @@ impl CutSizes {
     /// Entries of the table of equal cuts: a power of two, at least four per BLAS.
     fn keys(&self) -> u32 {
         (4 * self.rt_blas.max(256)).next_power_of_two()
+    }
+
+    /// Entries of the table of per-part cluster lists: empty parts hold one too.
+    fn part_lists(&self) -> u32 {
+        4 * self.rt_blas.max(256)
     }
 }
 
@@ -219,6 +230,8 @@ pub(crate) struct CutInputs {
     pub paged: bool,
     /// CLAS in the largest cut a mesh can trace.
     pub max_clas: u32,
+    /// A copy of an edit may gather one BLAS per animated part.
+    pub parted_edits: bool,
     /// The frame's readback slot.
     pub slot: usize,
 }
@@ -257,6 +270,10 @@ impl Cuts {
             u64::from(device.rtas_args_stride(RtasOp::BuildClusterBlas)) * n(sizes.rt_blas),
             "cut BLAS records",
         )?;
+        let part_lists = block(
+            u64::from(sizes.part_lists()) * size_of::<PartListGpu>() as u64,
+            "cut part lists",
+        )?;
         let key_table = block(u64::from(keys) * size_of::<CutKey>() as u64, "cut keys")?;
         let model_cut = block(4 * n(sizes.models), "merged cuts")?;
         let counters = block(4 * COUNTERS as u64, "cut counters")?.cast();
@@ -280,6 +297,7 @@ impl Cuts {
             args,
             feedback,
             records,
+            part_lists: part_lists.cast(),
             queue_capacity: sizes.queue,
             candidate_capacity: sizes.candidates,
             entry_capacity: sizes.rt_clusters,
@@ -288,6 +306,8 @@ impl Cuts {
             key_mask: keys - 1,
             model_capacity: sizes.models,
             feedback_capacity: FEEDBACK,
+            part_list_capacity: sizes.part_lists(),
+            _pad: 0,
         };
         let mut record = device.gpu_malloc::<CutGpu>(MemoryKind::Upload, 1, "cut tables")?;
         record.as_mut_slice().expect("upload is mapped")[0] = gpu;
@@ -428,6 +448,15 @@ impl Cuts {
         step(list);
         list.dispatch(p.get(k.share), r0, groups(f.slots));
         step(list);
+        if f.parted_edits {
+            list.dispatch(p.get(k.prepare), r0, [1, 1, 1]);
+            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
+            let entries = self.args.offset(ARGS_GATHER).cast::<DispatchArgs>();
+            list.dispatch_indirect(p.get(k.split), r0, entries);
+            step(list);
+            list.dispatch(p.get(k.place_lists), r0, groups(f.slots));
+            step(list);
+        }
         list.dispatch(p.get(k.link), r0, groups(f.slots));
         step(list);
         list.dispatch(p.get(k.prepare), r0, [1, 1, 1]);

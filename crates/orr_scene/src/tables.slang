@@ -233,10 +233,23 @@ public struct EditGpu
 {
     public float4* spheres;
     public EditGroupGpu* groups;   // the groups held at level 0
+    public uint8_t* pages;         // the pages it holds a copy of, in one block
+    public uint64_t pages_bytes;   // their copy of last frame's state follows them at this offset
     public uint sphere_count;
     public uint group_count;
     public uint whole;             // not 0: every cluster
     public uint _pad;
+}
+
+// A mesh page as it stood before this frame's kernels: an edited page
+// keeps a copy of last frame's state, and no kernel writes any other page.
+public uint8_t* previous_page(MeshGpu* mesh, uint8_t* page)
+{
+    EditGpu* e = mesh.edit;
+    if (e == nullptr)
+        return page;
+    uint64_t at = (uint64_t)page - (uint64_t)e.pages;
+    return at < e.pages_bytes ? (uint8_t*)((uint64_t)page + e.pages_bytes) : page;
 }
 
 // A mesh made resident from a mounted pack, or an edit of one. Page and node page addresses

@@ -782,12 +782,6 @@ impl<'f> SceneWriter<'f> {
             .get(desc.model.0 as usize)
             .and_then(Option::as_ref)
             .filter(|m| !m.spans.is_empty());
-        // An edit's copies stay at rest pose: its clusters take no part transforms.
-        let edit = self
-            .model_cpu
-            .get(desc.model.0 as usize)
-            .is_some_and(|m| m.edit);
-        let pose = desc.pose.filter(|_| !edit);
         let (first, entry, partitions, table) = {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
             let first = cpu.slots.alloc(desc.copies).ok_or(Error::Capacity {
@@ -823,7 +817,7 @@ impl<'f> SceneWriter<'f> {
                 .model_cpu
                 .get(desc.model.0 as usize)
                 .map_or(0, |m| m.animated_parts);
-            let cost = 1 + if pose.is_some() { parts } else { 0 };
+            let cost = 1 + if desc.pose.is_some() { parts } else { 0 };
             cpu.slot_models[first as usize..(first + desc.copies) as usize].fill(desc.model.0);
             let partitions = cpu.ptlas.place(first, desc.copies, cell, cost);
             (first, entry, partitions, cpu.ptlas.slot_table.gpu())
@@ -856,7 +850,7 @@ impl<'f> SceneWriter<'f> {
             first,
             count: desc.copies,
         };
-        let pose = pose.unwrap_or(Pose {
+        let pose = desc.pose.unwrap_or(Pose {
             group: TransformGroupId(0),
             index: 0,
             variants: 0,
@@ -1015,12 +1009,7 @@ impl<'f> SceneWriter<'f> {
                 .iter()
                 .find(|(q, _)| usize::from(*q) == index)
                 .map_or(cooked_base, |&(_, b)| b);
-            let pose = r
-                .poses
-                .iter()
-                .find(|(m, _)| *m == p.model)
-                .map(|&(_, q)| q)
-                .filter(|_| !model_cpu(p.model).edit);
+            let pose = r.poses.iter().find(|(m, _)| *m == p.model).map(|&(_, q)| q);
             let flags = if p.flags == 0 {
                 r.flags.0
             } else {

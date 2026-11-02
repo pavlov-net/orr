@@ -59,7 +59,7 @@ struct Root
     Traced* traced;
     Seen* seen;
     Cone* cones;
-    uint mode;             // 1: `pixels` resolves its hits
+    uint mode;             // 1: `pixels` resolves its hits; 2: gives each hit's position last frame
     uint pad0;
     uint64_t pad1;
 }
@@ -150,6 +150,8 @@ void pixels(uint3 id: SV_DispatchThreadID)
             o.base_color = h.surface.bsdf.base_color;
             o.valid = h.valid ? 1 : 0;
         }
+        if (root.mode == 2)
+            o.valid = hit_previous_position(s, d, f.hit.instance_index, f.hit.cluster_id, f.hit.primitive_index, f.hit.barycentrics, o.position) ? 1 : 0;
     }
     root.traced[id.x] = o;
 }

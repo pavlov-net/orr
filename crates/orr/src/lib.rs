@@ -473,8 +473,8 @@ impl Renderer {
         self.scenes.prefetch_region(center, radius);
     }
 
-    /// Starts an edit of a mesh without skinning: a new model whose touched pages kernels
-    /// write at the scene compute point. Poll [`Renderer::edit_state`].
+    /// Starts an edit of a mesh: a new model whose touched pages kernels write at the scene
+    /// compute point. Poll [`Renderer::edit_state`].
     pub fn create_edit(&mut self, desc: &EditDesc<'_>) -> Result<EditId> {
         Ok(self.scenes.create_edit(desc)?)
     }
@@ -648,6 +648,11 @@ impl<'a> Frame<'a> {
     /// False: this frame cannot rebuild it, and the kernels must leave it unchanged.
     pub fn edit_dirty(&mut self, id: EditId) -> bool {
         self.scenes.edit_dirty(id)
+    }
+
+    /// Like [`edit_dirty`](Self::edit_dirty), but what kernels change has no motion this frame.
+    pub fn edit_dirty_without_motion(&mut self, id: EditId) -> bool {
+        self.scenes.edit_dirty_without_motion(id)
     }
 
     /// Step 2: a material writer; Send.

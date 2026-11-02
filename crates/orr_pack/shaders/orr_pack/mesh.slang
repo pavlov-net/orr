@@ -220,8 +220,20 @@ public void store_local(uint8_t* page, PageHeader h, Cluster c, uint i, uint3 lo
     p[2] = uint16_t(local.z);
 }
 
+// Moves cluster `cluster`'s anchor, its vertices staying where they are. A kernel lowers it to
+// make room before moving a vertex below it. An edit's rebuild puts it back at the lowest vertex.
+public void store_anchor(uint8_t* page, PageHeader h, uint cluster, int3 anchor)
+{
+    Cluster* at = cluster_at(page, cluster);
+    Cluster c = *at;
+    int3 shift = c.anchor - anchor;
+    for (uint i = 0; i < c.vertex_count; i++)
+        store_local(page, h, c, i, uint3(clamp(int3(load_local(page, h, c, i)) + shift, int3(0), int3(65535))));
+    at.anchor = anchor;
+}
+
 // Moves a vertex to the grid point nearest mesh-space `position`, within the 65,536 grid steps
-// above the cluster's anchor. A move farther than that stops at their edge.
+// above the cluster's anchor (see `store_anchor`). A move farther than that stops at their edge.
 public void store_position(uint8_t* page, PageHeader h, Cluster c, uint i, float3 position, float step)
 {
     int3 at = int3(round(position / step)) - c.anchor;

@@ -3,17 +3,19 @@
 //! point, every other page table entry and cluster entry follows the source mesh. Edited
 //! clusters stay at level 0 and their CLAS rebuild on the render queue right after the
 //! scene compute point of a frame that marks the edit dirty; the edit's copies gather their
-//! ray-tracing cut every frame, since cached cuts hold unedited CLAS.
+//! ray-tracing cut every frame, since cached cuts hold unedited CLAS. A skinned mesh's edit
+//! rebuilds cluster templates instead, which its copies instantiate. The block of an edit's
+//! pages also holds their state before the frame's kernels, which motion reads.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use orr_gpu::{
     Allocation, CommandList, Device, GpuAddress, GpuPtr, Hazards, MemoryKind, Micromap, RtasIo,
-    RtasOp, Stages, TimelinePoint,
+    Stages, TimelinePoint,
 };
 use orr_pack::Aabb;
-use orr_pack::mesh::{Group, MeshHeader, PageHeader};
+use orr_pack::mesh::{Cluster, Group, MeshHeader, PageHeader};
 
 use crate::accel::{
     self, AccelKernels, ClasBatch, ClasSource, ClusterBuild, ClusterInfo, PageMicromap,
@@ -26,7 +28,7 @@ use crate::scene::ModelId;
 use crate::shaders::accel::{AccelRoot, ClasJob};
 use crate::shaders::edit::{EditJob, EditRoot};
 use crate::stream::StreamedPage;
-use crate::{ClusterRef, EditGpu, EditGroupGpu, Error, MeshGpu, Result};
+use crate::{ClusterRef, EditGpu, EditGroupGpu, Error, MeshGpu, PartGpu, Result, SkinMeshGpu};
 
 /// Spheres an edit tests its groups against one by one; more pin the whole mesh.
 pub(crate) const EDIT_SPHERES: usize = 64;
@@ -38,8 +40,8 @@ pub struct EditDesc<'a> {
     /// Spheres (center xyz, radius, mesh space) around what the edit changes; `None`, or more
     /// than 64, the whole mesh. Every level 0 group meeting one is held at level 0 and handed
     /// to the consumer kernel; the rest of the mesh keeps its level of detail. A mesh cooked
-    /// with discrete levels has no groups to choose from: its edit holds all of level 0 and
-    /// its copies draw nothing coarser.
+    /// with discrete levels has no groups to choose from and a skinned mesh's copies take one
+    /// cut: their edits hold all of level 0 and their copies draw nothing coarser.
     pub touched: Option<&'a [[f32; 4]]>,
     /// A box (mesh space) the edited triangles stay inside; `None`: the model's bounds.
     pub bounds: Option<Aabb>,
@@ -53,11 +55,14 @@ pub struct EditId(pub u32);
 /// A ready edit, for consumer kernels and instances.
 #[derive(Clone, Copy, Debug)]
 pub struct EditRef {
-    /// The edit's model: its copies draw and trace the edited mesh, at rest pose. Its copies
-    /// are placed with [`crate::SceneWriter::add_instances`].
+    /// The edit's model: its copies draw and trace the edited mesh. They are placed like
+    /// the source's, with [`crate::SceneWriter::add_instances`] and its poses, or with
+    /// [`crate::SceneWriter::add_skinned`] for a skinned mesh.
     pub model: ModelId,
     /// The edit's mesh record. `pages[group.page]` is the page a kernel writes through
-    /// `orr_pack.mesh`'s `store_triangle` and `store_position`.
+    /// `orr_pack.mesh`'s `store_triangle` and `store_position`, after `store_anchor` when a
+    /// vertex goes below its cluster's anchor. Vertices it moves have motion from where they
+    /// were the frame before.
     pub mesh: GpuPtr<MeshGpu>,
     /// The groups held at level 0.
     pub groups: GpuPtr<EditGroupGpu>,
@@ -144,6 +149,26 @@ pub(crate) fn plan_level(
     (held.iter().map(|g| g.page).collect(), held)
 }
 
+/// The mesh clusters of level 0 in an edit's `own` pages, ascending.
+pub(crate) fn level0_clusters(
+    own: &[u32],
+    pages: &[StreamedPage],
+    clusters: &[Vec<ClusterInfo>],
+) -> Vec<u32> {
+    own.iter()
+        .zip(clusters)
+        .flat_map(|(&page, clusters)| {
+            clusters
+                .iter()
+                .zip(pages[page as usize].first..)
+                .filter(|(c, _)| {
+                    c.self_error == 0.0 && c.tri_count > 0 && c.flags & Cluster::MERGED == 0
+                })
+                .map(|(_, id)| id)
+        })
+        .collect()
+}
+
 /// An edit on the loading side: its pages' reads, decodes and copies.
 pub(crate) struct EditTask {
     pub id: EditId,
@@ -185,7 +210,9 @@ impl EditBatch {
 
 /// An edit's pages, resident in its block.
 pub(crate) struct EditLoaded {
-    pub _block: Allocation<u8>,
+    pub block: Allocation<u8>,
+    /// Bytes of the pages; their state before this frame's kernels follows them.
+    pub pages_bytes: u64,
     /// By own page: its address, clusters and micromap.
     pub addresses: Vec<u64>,
     pub clusters: Vec<Vec<ClusterInfo>>,
@@ -218,7 +245,7 @@ pub(crate) fn start(task: &Arc<EditTask>) {
     let bytes = at.max(16);
     let d = &task.device;
     let blocks = d
-        .gpu_malloc::<u8>(MemoryKind::DeviceLocal, bytes, "mesh edit pages")
+        .gpu_malloc::<u8>(MemoryKind::DeviceLocal, 2 * bytes, "mesh edit pages")
         .and_then(|b| {
             Ok((
                 b,
@@ -304,6 +331,7 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<EditTask>) {
         (None, _) if canceled => (Err(Arc::new(Error::UnknownEdit(task.id))), None),
         (None, None) => (Err(Arc::new(Error::UnknownEdit(task.id))), None),
         (None, Some((block, addresses))) => {
+            let pages_bytes = block.size() / 2;
             let copies: Vec<StagedCopy> = staging
                 .into_iter()
                 .map(|src| StagedCopy::Buffer {
@@ -320,7 +348,8 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<EditTask>) {
             match built {
                 Ok((micromaps, point)) => (
                     Ok(EditLoaded {
-                        _block: block,
+                        block,
+                        pages_bytes,
                         addresses,
                         clusters,
                         micromaps,
@@ -346,12 +375,15 @@ struct Build {
     at: u64,
 }
 
-/// An edit's CLAS: the clusters that rebuild when it is dirty and those built once, and what
-/// their results fill.
+/// An edit's CLAS, or a skinned mesh's edit's templates: the clusters that rebuild when it is
+/// dirty and those built once, and what their results fill.
 pub(crate) struct EditClas {
     edited: Vec<Build>,
     frozen: Vec<Build>,
     block: Option<Allocation<u8>>,
+    /// A skinned mesh's edit: its template table and the cluster id of its mesh cluster 0.
+    templates: GpuPtr<u64>,
+    cluster_base: u32,
     /// Triangles one rebuild takes.
     pub triangles: u32,
     pub built: bool,
@@ -368,15 +400,24 @@ pub(crate) struct ClasInputs<'a> {
     /// Clusters of coarser levels are built once only when the cut may take them.
     pub whole: bool,
     pub clas_triangles: u32,
+    /// A skinned mesh's edit: the template table its level 0's builds fill.
+    pub templates: Option<GpuPtr<u64>>,
+    pub cluster_base: u32,
 }
 
 impl EditClas {
     pub(crate) fn new(device: &Device, i: &ClasInputs<'_>) -> Result<Self> {
         let caps = device.caps();
         let traced = caps.cluster.max_tris > 0 && caps.cluster.max_partitions > 0;
-        let omm = caps.omm && caps.cluster.omm_in_clusters;
+        let template = i.templates.is_some();
+        let omm = !template && caps.omm && caps.cluster.omm_in_clusters;
         let step = i.header.step();
-        let truncate_bits = u32::from(i.header.clas_truncate_bits);
+        // Skinned positions are off the position grid, so templates keep every bit.
+        let truncate_bits = if template {
+            0
+        } else {
+            u32::from(i.header.clas_truncate_bits)
+        };
         let mut bytes = 0u64;
         let mut lists = [Vec::new(), Vec::new()];
         for (k, list) in lists.iter_mut().enumerate() {
@@ -414,7 +455,12 @@ impl EditClas {
                             non_opaque: i.non_opaque[c.section as usize],
                         }
                     });
-                    let batch = accel::clas_batch(sources, ClusterBuild::Clas { omm: with_omm });
+                    let build = if template {
+                        ClusterBuild::Template
+                    } else {
+                        ClusterBuild::Clas { omm: with_omm }
+                    };
+                    let batch = accel::clas_batch(sources, build);
                     let jobs = run
                         .iter()
                         .map(|&(pi, local)| EditJob {
@@ -444,6 +490,8 @@ impl EditClas {
             edited,
             frozen,
             block,
+            templates: i.templates.unwrap_or(GpuPtr::NULL),
+            cluster_base: i.cluster_base,
             triangles,
             built: false,
         })
@@ -471,12 +519,20 @@ impl EditRecorder<'_> {
             vertices: u64,
             flags: u64,
             omm: u64,
+            bounds: u64,
             records: u64,
             count: u64,
             scratch: u64,
         }
+        struct Todo<'b> {
+            build: &'b Build,
+            regions: Regions,
+            edited: bool,
+            dst: GpuAddress,
+            templates: GpuPtr<u64>,
+            cluster_base: u32,
+        }
         let d = self.device;
-        let stride = u64::from(d.rtas_args_stride(RtasOp::BuildClas));
         let align = scratch_align(d);
         let mut size = 0u64;
         let mut region = |bytes: u64| {
@@ -484,7 +540,7 @@ impl EditRecorder<'_> {
             size = at + bytes.max(16);
             at
         };
-        let mut todo: Vec<(&Build, Regions, bool, GpuAddress)> = Vec::new();
+        let mut todo: Vec<Todo<'_>> = Vec::new();
         for e in edits.iter() {
             let block = e.block.as_ref().map_or(0, |b| b.gpu().address().0);
             let frozen = if e.built { &[][..] } else { &e.frozen[..] };
@@ -495,19 +551,23 @@ impl EditRecorder<'_> {
                 .chain(frozen.iter().map(|b| (b, false)))
             {
                 let sizes = d.rtas_sizes(&b.batch.desc);
-                todo.push((
-                    b,
-                    Regions {
+                let stride = u64::from(d.rtas_args_stride(b.batch.desc.op));
+                todo.push(Todo {
+                    build: b,
+                    regions: Regions {
                         vertices: region(12 * u64::from(b.batch.vertices)),
                         flags: region(4 * u64::from(b.batch.triangles)),
                         omm: region(4 * u64::from(b.batch.triangles)),
+                        bounds: region(32 * b.jobs.len() as u64),
                         records: region(stride * b.jobs.len() as u64),
                         count: region(4),
                         scratch: region(sizes.scratch),
                     },
                     edited,
-                    GpuAddress(block + b.at),
-                ));
+                    dst: GpuAddress(block + b.at),
+                    templates: e.templates,
+                    cluster_base: e.cluster_base,
+                });
             }
         }
         if todo.is_empty() {
@@ -529,7 +589,8 @@ impl EditRecorder<'_> {
             unsafe { GpuPtr::from_address(GpuAddress(base + at)) }
         };
         let mut roots = Vec::with_capacity(todo.len());
-        for (b, r, edited, dst) in &todo {
+        for t in &todo {
+            let (b, r) = (t.build, &t.regions);
             let n = b.jobs.len() as u32;
             let (jobs, out) = self.window.slice::<EditJob>(d, n)?;
             out.copy_from_slice(&b.jobs);
@@ -540,11 +601,13 @@ impl EditRecorder<'_> {
                     jobs,
                     clusters: self.clusters,
                     addresses,
+                    templates: t.templates,
                     count: n,
+                    cluster_base: t.cluster_base,
                     _pad: 0,
                 },
             )?;
-            if *edited {
+            if t.edited {
                 list.dispatch(&self.kernels.edit_bounds, root, [n.div_ceil(64), 1, 1]);
             }
             let (clas_jobs, out) = self.window.slice::<ClasJob>(d, n)?;
@@ -558,20 +621,23 @@ impl EditRecorder<'_> {
                     vertices: ptr(r.vertices).cast(),
                     triangle_flags: ptr(r.flags).cast(),
                     omm_indices: ptr(r.omm).cast(),
+                    bounds: ptr(r.bounds).cast(),
                     count: n,
                     ..bytemuck::Zeroable::zeroed()
                 },
             )?;
-            roots.push((root, clas, addresses, *dst));
+            roots.push((root, clas, addresses, t.dst));
         }
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        for (&(_, clas, ..), (b, ..)) in roots.iter().zip(&todo) {
-            list.dispatch(&self.kernels.clas, clas, [b.jobs.len() as u32, 1, 1]);
+        for (&(_, clas, ..), t) in roots.iter().zip(&todo) {
+            let groups = t.build.jobs.len() as u32;
+            list.dispatch(&self.kernels.clas, clas, [groups, 1, 1]);
         }
         list.barrier(Stages::COMPUTE, Stages::AS_BUILD, Hazards::empty());
-        for (&(_, _, addresses, dst), (b, r, ..)) in roots.iter().zip(&todo) {
+        for (&(_, _, addresses, dst), t) in roots.iter().zip(&todo) {
+            let r = &t.regions;
             list.rtas_execute(
-                &b.batch.desc,
+                &t.build.batch.desc,
                 &RtasIo {
                     args: GpuAddress(base + r.records),
                     count: ptr(r.count).cast(),
@@ -588,8 +654,8 @@ impl EditRecorder<'_> {
             Stages::COMPUTE | Stages::AS_BUILD,
             Hazards::ACCEL_STRUCT,
         );
-        for (&(root, ..), (b, ..)) in roots.iter().zip(&todo) {
-            let n = b.jobs.len() as u32;
+        for (&(root, ..), t) in roots.iter().zip(&todo) {
+            let n = t.build.jobs.len() as u32;
             list.dispatch(&self.kernels.edit_refs, root, [n.div_ceil(64), 1, 1]);
         }
         list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
@@ -600,71 +666,130 @@ impl EditRecorder<'_> {
     }
 }
 
+/// What a skinned mesh's edit changes of its skin table: its one cut is level 0, and its
+/// templates are its own.
+pub(crate) struct EditSkin<'a> {
+    pub source: SkinMeshGpu,
+    /// Level 0's mesh clusters, ascending.
+    pub cut: &'a [u32],
+}
+
+/// What [`EditTables::new`] lays out.
+pub(crate) struct EditTablesDesc<'a> {
+    pub spheres: Option<&'a [[f32; 4]]>,
+    pub groups: &'a [EditGroupGpu],
+    /// The block of its pages and their bytes.
+    pub pages: (GpuPtr<u8>, u64),
+    pub page_count: u32,
+    pub clusters: u32,
+    pub stamps: bool,
+    /// Its animated parts, which share the box its edited triangles stay inside.
+    pub parts: &'a [PartGpu],
+    pub skin: Option<EditSkin<'a>>,
+}
+
 /// An edit's small tables in one mapped block: the pin spheres, the groups, the one empty
-/// cached cut its copies fall back on and, when its source streams, its page stamps.
+/// cached cut its copies fall back on, its animated parts and, when its source streams or is
+/// skinned, its page stamps or skin table.
 pub(crate) struct EditTables {
     pub _block: Allocation<u8>,
     pub edit: GpuPtr<EditGpu>,
     pub groups: GpuPtr<EditGroupGpu>,
     pub rt_cut: GpuPtr<crate::RtCutGpu>,
     pub stamps: GpuPtr<u32>,
+    pub parts: GpuPtr<PartGpu>,
+    pub skin: GpuPtr<SkinMeshGpu>,
+    pub templates: GpuPtr<u64>,
 }
 
 impl EditTables {
-    pub(crate) fn new(
-        device: &Device,
-        spheres: Option<&[[f32; 4]]>,
-        groups: &[EditGroupGpu],
-        pages: u32,
-        stamps: bool,
-    ) -> Result<Self> {
-        let sphere_bytes = 16 * spheres.map_or(0, <[_]>::len) as u64;
-        let group_bytes = size_of_val(groups) as u64;
-        let stamp_bytes = if stamps { 4 * u64::from(pages) } else { 0 };
-        let edit_at = 0u64;
-        let spheres_at = (size_of::<EditGpu>() as u64).next_multiple_of(16);
-        let groups_at = spheres_at + sphere_bytes;
-        let cut_at = (groups_at + group_bytes).next_multiple_of(16);
-        let stamps_at = cut_at + size_of::<crate::RtCutGpu>() as u64;
-        let bytes = stamps_at + stamp_bytes;
+    pub(crate) fn new(device: &Device, d: &EditTablesDesc<'_>) -> Result<Self> {
+        let spheres = d.spheres.unwrap_or_default();
+        let mut bytes = 0u64;
+        let mut take = |n: u64| {
+            let at = bytes.next_multiple_of(16);
+            bytes = at + n;
+            at
+        };
+        let edit_at = take(size_of::<EditGpu>() as u64);
+        let spheres_at = take(size_of_val(spheres) as u64);
+        let groups_at = take(size_of_val(d.groups) as u64);
+        let cut_at = take(size_of::<crate::RtCutGpu>() as u64);
+        let stamp_bytes = if d.stamps {
+            4 * u64::from(d.page_count)
+        } else {
+            0
+        };
+        let stamps_at = take(stamp_bytes);
+        let parts_at = take(size_of_val(d.parts) as u64);
+        let skin_at = take(size_of::<SkinMeshGpu>() as u64);
+        let templates_bytes = if d.skin.is_some() {
+            8 * u64::from(d.clusters)
+        } else {
+            0
+        };
+        let templates_at = take(templates_bytes);
+        let cut = d.skin.as_ref().map_or(&[][..], |s| s.cut);
+        let cut_clusters_at = take(size_of_val(cut) as u64);
+        let cut_first_at = take(8);
+        let cut_error_at = take(4);
         let a = device.gpu_malloc::<u8>(MemoryKind::Upload, bytes, "mesh edit tables")?;
         let block = Block::of(&a);
-        let base = block.gpu();
-        let at = |o: u64| GpuAddress(base + o);
-        // SAFETY: each address lies in the block, at its table's offset.
-        let (spheres_gpu, edit, groups_gpu, rt_cut, stamps_gpu) = unsafe {
-            (
-                GpuPtr::<[f32; 4]>::from_address(at(spheres_at)),
-                GpuPtr::<EditGpu>::from_address(at(edit_at)),
-                GpuPtr::<EditGroupGpu>::from_address(at(groups_at)),
-                GpuPtr::<crate::RtCutGpu>::from_address(at(cut_at)),
-                GpuPtr::<u32>::from_address(at(stamps_at)),
-            )
+        let at = |o: u64| -> GpuPtr<u8> {
+            // SAFETY: each offset above lies in the block.
+            unsafe { GpuPtr::from_address(GpuAddress(block.gpu() + o)) }
         };
         let record = EditGpu {
-            spheres: spheres_gpu,
-            groups: groups_gpu,
-            sphere_count: spheres.map_or(0, <[_]>::len) as u32,
-            group_count: groups.len() as u32,
-            whole: u32::from(spheres.is_none()),
+            spheres: at(spheres_at).cast(),
+            groups: at(groups_at).cast(),
+            pages: d.pages.0,
+            pages_bytes: d.pages.1,
+            sphere_count: spheres.len() as u32,
+            group_count: d.groups.len() as u32,
+            whole: u32::from(d.spheres.is_none()),
             _pad: 0,
         };
-        let cut: crate::RtCutGpu = bytemuck::Zeroable::zeroed();
+        let empty_cut: crate::RtCutGpu = bytemuck::Zeroable::zeroed();
         let wrote = block.write_mapped(edit_at, bytemuck::bytes_of(&record))
-            && block.write_mapped(
-                spheres_at,
-                bytemuck::cast_slice(spheres.unwrap_or_default()),
-            )
-            && block.write_mapped(groups_at, bytemuck::cast_slice(groups))
-            && block.write_mapped(cut_at, bytemuck::bytes_of(&cut))
-            && block.write_mapped(stamps_at, &vec![0; stamp_bytes as usize]);
+            && block.write_mapped(spheres_at, bytemuck::cast_slice(spheres))
+            && block.write_mapped(groups_at, bytemuck::cast_slice(d.groups))
+            && block.write_mapped(cut_at, bytemuck::bytes_of(&empty_cut))
+            && block.write_mapped(stamps_at, &vec![0; stamp_bytes as usize])
+            && block.write_mapped(parts_at, bytemuck::cast_slice(d.parts));
         assert!(wrote, "edit tables are mapped");
+        let skin = d.skin.as_ref().map(|s| SkinMeshGpu {
+            templates: at(templates_at).cast(),
+            cut_clusters: at(cut_clusters_at).cast(),
+            cut_first: at(cut_first_at).cast(),
+            cut_error: at(cut_error_at).cast(),
+            cut_count: 1,
+            ..s.source
+        });
+        if let Some(skin) = &skin {
+            let wrote = block.write_mapped(skin_at, bytemuck::bytes_of(skin))
+                && block.write_mapped(templates_at, &vec![0; templates_bytes as usize])
+                && block.write_mapped(cut_clusters_at, bytemuck::cast_slice(cut))
+                && block.write_mapped(cut_first_at, bytemuck::cast_slice(&[0, cut.len() as u32]))
+                && block.write_mapped(cut_error_at, bytemuck::bytes_of(&0.0f32));
+            assert!(wrote, "edit tables are mapped");
+        }
         Ok(Self {
+            edit: at(edit_at).cast(),
+            groups: at(groups_at).cast(),
+            rt_cut: at(cut_at).cast(),
+            stamps: if d.stamps {
+                at(stamps_at).cast()
+            } else {
+                GpuPtr::NULL
+            },
+            parts: at(parts_at).cast(),
+            skin: if skin.is_some() {
+                at(skin_at).cast()
+            } else {
+                GpuPtr::NULL
+            },
+            templates: at(templates_at).cast(),
             _block: a,
-            edit,
-            groups: groups_gpu,
-            rt_cut,
-            stamps: if stamps { stamps_gpu } else { GpuPtr::NULL },
         })
     }
 }

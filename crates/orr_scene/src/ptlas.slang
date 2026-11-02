@@ -24,7 +24,8 @@
 //
 // A slot tracing a cluster BLAS built this frame (RT_CUT_BUILT) holds memory the next
 // frame's builds reuse, so every operation on it is mandatory and it takes an update every
-// frame it keeps one.
+// frame it keeps one. A posed copy of an edit builds its body and part BLAS that way
+// (CUT_PARTS); without a run it traces its body alone.
 //
 // A slot's instance traces its copy's nearer chain step. While the copy fades between two
 // steps, a part instance of its own (a run of one, named in `part_slots` with COPY_FAR)
@@ -233,13 +234,21 @@ bool moved(GroupGpu* g, uint index)
     return any(a[0] != b[0]) || any(a[1] != b[1]) || any(a[2] != b[2]);
 }
 
+// The BLAS of list `list` of a CUT_PARTS slot built this frame; 0 when it holds no cluster.
+uint64_t part_list_blas(SceneRoot* s, SlotCutGpu c, uint list)
+{
+    PartListGpu l = s.cut.part_lists[c.rt_parts + list];
+    return l.count > 0 ? s.cut.job_blas[l.job] : 0;
+}
+
 // The rest-pose and body BLAS of `cut` for the copy's section mask; false when the mask
 // names a set whose BLAS are not built.
 bool cut_blas(SceneRoot* s, uint slot, MeshGpu* mesh, ModelGpu* model, InstanceGpu inst, uint cut, out uint64_t rest, out uint64_t body)
 {
     if (cut == RT_CUT_BUILT)
     {
-        rest = s.cut.job_blas[s.cut.slots[slot].rt_job];
+        SlotCutGpu c = s.cut.slots[slot];
+        rest = (c.flags & CUT_PARTS) != 0 ? part_list_blas(s, c, 0) : s.cut.job_blas[c.rt_job];
         body = rest;
         return true;
     }
@@ -391,6 +400,7 @@ void want(uint3 id: SV_DispatchThreadID)
     uint stable = 255;
     bool in_range = false;
     uint64_t body = 0;
+    bool parted_built = false;
     if (active)
         stable = !seen ? 255 : moved(g, inst.group_index) ? 0 : min(uint(st.stable_frames) + 1, 255u);
     if (active && skinned)
@@ -416,7 +426,8 @@ void want(uint3 id: SV_DispatchThreadID)
         uint cut = s.cut.slots[slot].rt_cut;
         op.cut = cut == RT_CUT_BUILT ? cut : min(cut, mesh.rt_cut_count - 1);
         cut_blas(s, slot, mesh, model, inst, op.cut, op.rest, body);
-        active = op.rest != 0;
+        parted_built = op.cut == RT_CUT_BUILT && (s.cut.slots[slot].flags & CUT_PARTS) != 0;
+        active = op.rest != 0 || parted_built;
         op.blas = op.rest;
         op.key = instance_key(g, inst);
     }
@@ -430,8 +441,8 @@ void want(uint3 id: SV_DispatchThreadID)
     // What a BLAS built last frame holds is gone after this frame's builds.
     bool held_built = written && st.rt_lod == RT_CUT_BUILT;
     bool built = op.cut == RT_CUT_BUILT;
-    bool posed = active && in_range && !built && (st.rt_flags & RT_ANIMATED) != 0
-        && mesh.rt_cuts[op.cut].parts != nullptr && body != 0
+    bool posed = active && in_range && (st.rt_flags & RT_ANIMATED) != 0
+        && (parted_built || (!built && mesh.rt_cuts[op.cut].parts != nullptr && body != 0))
         && (mesh.animated_sections & ~hidden) != 0;
     bool release = held != 0 && (!posed || held != mesh.animated_parts);
     bool take = posed && (held == 0 || release);
@@ -470,7 +481,9 @@ void want(uint3 id: SV_DispatchThreadID)
         op.blas = body;
     // Global instances are in render space, so a rebase rewrites every one of them now.
     bool rebased = (root.flags & PTLAS_REBASE) != 0;
-    bool placed = written && !restep && st.rt_partition == target && all(st.rt_key == op.key);
+    // An update cannot take an instance to or from an empty body.
+    bool body_held = !parted_built || (op.blas != 0 && st.rt_blas != 0);
+    bool placed = written && !restep && st.rt_partition == target && all(st.rt_key == op.key) && body_held;
     bool update = false;
     if (!placed || (target == global_partition() && rebased))
     {
@@ -489,12 +502,13 @@ void want(uint3 id: SV_DispatchThreadID)
     // and its copy every frame.
     bool repose = posed && !take && (op.op != OP_NONE || update || op.cut != st.rt_lod || pose_moved(s, inst, mesh));
     op.op |= (take ? OP_TAKE : 0) | (release ? OP_RELEASE : 0) | (repose ? OP_POSE : 0);
-    if (repose)
+    bool parts_mandatory = repose || (take && built);
+    if (parts_mandatory)
         op.op |= OP_MANDATORY;
     if ((op.op & OP_PARTS) != 0)
     {
         // The body's update lands in the partition the parts rebuild.
-        charge_write(target, repose);
+        charge_write(target, parts_mandatory);
     }
     else if (update)
     {
@@ -741,7 +755,7 @@ void write_far(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, InstanceGpu base, ui
 // Writes every part instance of the slot's run: the cut's part BLAS posed by the copy's
 // transform and `pose[part]`, null where the part has no clusters at the cut, its sections
 // are all hidden or its pose hides it; non-opaque while the copy fades.
-void write_parts(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, InstanceGpu inst, uint cut, uint partition, bool fading)
+void write_parts(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, uint slot, InstanceGpu inst, uint cut, uint partition, bool fading)
 {
     uint n = st.part_count;
     uint index;
@@ -749,7 +763,7 @@ void write_parts(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, InstanceGpu inst, 
         return;
     ModelGpu* model = s.models + inst.model;
     MeshGpu* mesh = s.meshes + model.mesh;
-    RtCutGpu k = mesh.rt_cuts[cut];
+    bool built = cut == RT_CUT_BUILT;
     uint hidden = (inst.variant >> 16) & 0xffff;
     GroupGpu* g = s.groups + inst.group;
     Placement copy;
@@ -757,7 +771,11 @@ void write_parts(SceneRoot* s, PtlasGpu* t, SlotStateGpu* st, InstanceGpu inst, 
     for (uint j = 0; j < n; j++)
     {
         PartGpu part = mesh.parts[j];
-        uint64_t blas = k.parts[j];
+        uint64_t blas;
+        if (built)
+            blas = part_list_blas(s, s.cut.slots[slot], 1 + j);
+        else
+            blas = mesh.rt_cuts[cut].parts[j];
         float3x4 pose;
         PtlasWrite w = (PtlasWrite)0;
         w.instance_index = s.part_base + st.part_run + j;
@@ -867,7 +885,7 @@ void emit(uint3 id: SV_DispatchThreadID)
         // A slot handed out again keeps a run of the same size, but its new record does not
         // name it.
         s.instances[slot].first_part = st.part_run;
-        write_parts(s, t, st, inst, op.cut, op.partition, fading);
+        write_parts(s, t, st, slot, inst, op.cut, op.partition, fading);
     }
     uint start;
     if ((op.op & OP_FAR_TAKE) != 0 && take_part_run(s, t, slot | COPY_FAR, 1, start))

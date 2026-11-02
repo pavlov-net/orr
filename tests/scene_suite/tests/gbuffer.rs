@@ -9,7 +9,8 @@
 //! and ray tracing with their motion, hiding, section masks, material sets and color factors
 //! multiplied in their texture's primaries, the DAG traversal's cuts, two-pass occlusion and
 //! `debug_lod`, the stochastic texture filter against CPU bicubic and bilinear filters, a
-//! fractured model's pieces and partial edits, cooked instance pages against the same copies
+//! fractured model's pieces, partial edits, posed and skinned edits and the motion of vertices
+//! kernels move, cooked instance pages against the same copies
 //! placed at run time, and a streaming mesh's finer cached cuts.
 
 use std::collections::BTreeSet;
@@ -41,8 +42,8 @@ use orr_scene::{
     Affine3, BoundTexture, ClusterWork, CopyVariant, CutGpu, DebugLod, Decal, DecalChannels,
     DecalId, EditDesc, EditId, EditRef, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
     InstanceRange, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId, ModelId, MountId,
-    PackSource, Pose, Projection, RasterGpu, RasterView, RendererDesc, SceneDesc, SceneId,
-    SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc, SkinnedGpu, SlotCutGpu,
+    PackSource, Pose, Projection, RasterGpu, RasterView, RendererDesc, SceneCompute, SceneDesc,
+    SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc, SkinnedGpu, SlotCutGpu,
     TextureFilter, TransformGroupDesc, TransformGroupId, ViewDesc, ViewHistoryId, ViewTarget,
     VisibleCluster, material_flags,
 };
@@ -1034,6 +1035,7 @@ fn cook() -> Arc<[u8]> {
                 model("probe", quad(unit.map(|c| c * 12.0)), vec![probe], one()),
                 model("steady ball", sphere(16, 0.9), vec![steady, steady], one()),
                 model("rig", rig(), vec![plain, metal], one()),
+                model("dag rig", rig(), vec![plain, metal], LodMode::Dag),
                 model(
                     "steady ground",
                     grid(12, 6.0, 2.0, |x, z| 0.1 * (x * 0.9).sin() * z.cos()),
@@ -3401,9 +3403,21 @@ struct Rigs {
 /// `copy % 4`, their pose blocks shared (`stride` 0) or one per copy (`stride` 4), placed in
 /// a frame focused on the origin.
 fn place_rigs(w: &mut World, count: u32, row: u32, spacing: f32, stride: u32, range: f32) -> Rigs {
+    let model = w.model("rig");
+    place_rigs_of(w, model, count, row, spacing, stride, range)
+}
+
+fn place_rigs_of(
+    w: &mut World,
+    model: ModelId,
+    count: u32,
+    row: u32,
+    spacing: f32,
+    stride: u32,
+    range: f32,
+) -> Rigs {
     let scene = w.scenes.create_scene(&SceneDesc::default()).unwrap();
     let history = w.scenes.create_view_history().unwrap();
-    let model = w.model("rig");
     let rows = count.div_ceil(row);
     let centers: Vec<Vec3> = (0..count)
         .map(|i| {
@@ -3504,6 +3518,20 @@ fn shoot_rigs(
     t: f32,
     amplitude: f32,
 ) -> Frame {
+    shoot_rigs_edited(w, rigs, shot, entry, t, amplitude, &[])
+}
+
+/// [`shoot_rigs`] in which `edits` (edit, stripe of `pieces`, lift) also change.
+fn shoot_rigs_edited(
+    w: &mut World,
+    rigs: &Rigs,
+    shot: &Shot,
+    entry: &str,
+    t: f32,
+    amplitude: f32,
+    edits: &[(EditId, u32, u32, f32)],
+) -> Frame {
+    let refs: Vec<EditRef> = edits.iter().map(|e| w.scenes.edit(e.0).unwrap()).collect();
     let kernel = pipeline(&pose::MODULE, entry);
     let list = [rigs.placed.scene];
     let mut f = w
@@ -3523,7 +3551,14 @@ fn shoot_rigs(
             s.transforms(rigs.placed.group, i, 1).unwrap()[0] = m;
         }
     }
+    for e in edits {
+        assert!(
+            f.edit_dirty(e.0),
+            "the frame's rebuild budget takes the edit"
+        );
+    }
     f.update_scenes(&mut |c| {
+        dispatch_fractures(c, edits, &refs);
         let root = pose::Root {
             scene: c.root,
             group: rigs.pose.0,
@@ -4707,9 +4742,13 @@ struct Worms {
 /// Worm copies placed by `copies`, with a palette group written on the CPU or, with
 /// `gpu`, by a scene compute kernel.
 fn place_worms(w: &mut World, name: &str, copies: &[(Mat3, Vec3)], gpu: bool) -> Worms {
+    let model = w.model(name);
+    place_worms_of(w, model, copies, gpu)
+}
+
+fn place_worms_of(w: &mut World, model: ModelId, copies: &[(Mat3, Vec3)], gpu: bool) -> Worms {
     let scene = w.scenes.create_scene(&SceneDesc::default()).unwrap();
     let history = w.scenes.create_view_history().unwrap();
-    let model = w.model(name);
     let joints = worm_rig().0.joint_count() as u32;
     let n = copies.len() as u32;
     let list = [scene];
@@ -5201,9 +5240,48 @@ fn shoot_edits(
     shot: &Shot,
     edits: &[(EditId, u32, u32, f32)],
 ) -> Frame {
+    shoot_edits_with(w, placed, shot, edits, true, |_| {})
+}
+
+/// The fracture kernel over each of `edits` (edit, stripe of `pieces`, lift).
+fn dispatch_fractures(
+    c: &mut SceneCompute<'_, '_>,
+    edits: &[(EditId, u32, u32, f32)],
+    refs: &[EditRef],
+) {
+    let p = pipeline(&fracture::MODULE, "main");
+    for (e, r) in edits.iter().zip(refs) {
+        let root = c
+            .put_root(&fracture::Root {
+                mesh: r.mesh,
+                groups: r.groups,
+                piece: e.1,
+                pieces: e.2,
+                min_x: -4.0,
+                size_x: 8.0,
+                lift: e.3,
+                _pad: 0,
+                _pad2: 0,
+            })
+            .unwrap();
+        c.cmd.dispatch(&p, root, [r.group_count, 1, 1]);
+        c.cmd
+            .barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+    }
+}
+
+/// [`shoot_edits`] with `write` run on the scene's writer; without `motion`, the edits have no
+/// motion this frame.
+fn shoot_edits_with(
+    w: &mut World,
+    placed: &Placed,
+    shot: &Shot,
+    edits: &[(EditId, u32, u32, f32)],
+    motion: bool,
+    write: impl FnOnce(&mut SceneWriter<'_>),
+) -> Frame {
     let list = [placed.scene];
     let refs: Vec<EditRef> = edits.iter().map(|e| w.scenes.edit(e.0).unwrap()).collect();
-    let p = pipeline(&fracture::MODULE, "main");
     let mut f = w
         .scenes
         .begin_frame(&FrameDesc {
@@ -5218,34 +5296,18 @@ fn shoot_edits(
         for &(i, t) in &shot.moved {
             s.transforms(placed.group, i, 1).unwrap()[0] = t;
         }
+        write(&mut s);
     }
     for e in edits {
-        assert!(
-            f.edit_dirty(e.0),
-            "the frame's rebuild budget takes the edit"
-        );
+        let admitted = if motion {
+            f.edit_dirty(e.0)
+        } else {
+            f.edit_dirty_without_motion(e.0)
+        };
+        assert!(admitted, "the frame's rebuild budget takes the edit");
     }
-    f.update_scenes(&mut |c| {
-        for (e, r) in edits.iter().zip(&refs) {
-            let root = c
-                .put_root(&fracture::Root {
-                    mesh: r.mesh,
-                    groups: r.groups,
-                    piece: e.1,
-                    pieces: e.2,
-                    min_x: -4.0,
-                    size_x: 8.0,
-                    lift: e.3,
-                    _pad: 0,
-                    _pad2: 0,
-                })
-                .unwrap();
-            c.cmd.dispatch(&p, root, [r.group_count, 1, 1]);
-            c.cmd
-                .barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        }
-    })
-    .unwrap();
+    f.update_scenes(&mut |c| dispatch_fractures(c, edits, &refs))
+        .unwrap();
     let view = f
         .raster_view(&ViewDesc {
             scene: placed.scene,
@@ -5495,6 +5557,465 @@ fn fracture_model(model: &str) {
         w.scenes.destroy_edit(e);
     }
     assert_clean();
+}
+
+/// The largest difference in pixels between two frames' motion, over the pixels where both show
+/// a surface at one depth, and how many those are.
+fn motion_difference(a: &Frame, b: &Frame) -> (f32, usize) {
+    let (mut n, mut worst) = (0, 0.0f32);
+    let size = Vec2::new(EXTENT[0] as f32, EXTENT[1] as f32);
+    for i in 0..a.ids.len() {
+        let same = (a.depth[i] - b.depth[i]).abs() <= 1e-4 * a.depth[i];
+        if a.ids[i] != 0 && b.ids[i] != 0 && same {
+            let d = (Vec2::from(a.motion[i]) - Vec2::from(b.motion[i])) * size;
+            worst = worst.max(d.abs().max_element());
+            n += 1;
+        }
+    }
+    (worst, n)
+}
+
+/// The largest motion in pixels over the frame's covered pixels.
+fn largest_motion(g: &Frame) -> f32 {
+    let size = Vec2::new(EXTENT[0] as f32, EXTENT[1] as f32);
+    (0..g.ids.len())
+        .filter(|&i| g.ids[i] != 0)
+        .map(|i| (Vec2::from(g.motion[i]) * size).abs().max_element())
+        .fold(0.0, f32::max)
+}
+
+/// Every ray hit of `g` lies `by` from where it was last frame.
+fn assert_hits_moved(g: &Frame, by: Vec3, name: &str) {
+    let now = rays(&g.view, &trace::MODULE, "pixels", 1);
+    let before = rays(&g.view, &trace::MODULE, "pixels", 2);
+    let (mut hits, mut off) = (0, 0.0f32);
+    for (a, b) in now.traced.iter().zip(&before.traced) {
+        if a.valid != 0 && b.valid != 0 {
+            let moved = Vec3::from(a.position) - Vec3::from(b.position);
+            off = off.max((moved - by).abs().max_element());
+            hits += 1;
+        }
+    }
+    assert!(hits > 1000, "{name}: {hits} hits");
+    assert!(
+        off < 1e-3,
+        "{name}: a ray hit's last position is off by {off} m"
+    );
+}
+
+#[test]
+fn vertices_a_kernel_moves_have_motion_for_the_frame_they_move() {
+    let _serial = serial();
+    let mut w = finest_world();
+    for name in ["dag ground", "discrete ground"] {
+        let source = w.model(name);
+        let edit = w
+            .scenes
+            .create_edit(&EditDesc {
+                model: source,
+                touched: None,
+                bounds: None,
+            })
+            .unwrap();
+        settle_edits(&mut w, &[edit]);
+        let model = w.scenes.edit(edit).unwrap().model;
+        let placed = place_models(&mut w, &[source, model]);
+        let linear = Mat3::from_rotation_x(0.9);
+        let at = Vec3::new(0.0, 0.0, -6.0);
+        let hidden = Affine3 {
+            rows: [[0.0; 4]; 3],
+        };
+        let lift = 0.25;
+        let up = linear * Vec3::Y * lift;
+        let eye = DVec3::new(0.0, 0.5, 2.0);
+        let target = DVec3::new(0.0, 0.0, -6.0);
+        let shot = |frame: u32, moved: Vec<(u32, Affine3)>| {
+            let mut s = Shot::at(eye, target, frame);
+            s.moved = moved;
+            s
+        };
+
+        // The reference: the model itself moved by the same lift through its transform.
+        shoot(
+            &mut w,
+            &placed,
+            &shot(1, vec![(0, affine(linear, at)), (1, hidden)]),
+        );
+        let rigid = shoot(
+            &mut w,
+            &placed,
+            &shot(2, vec![(0, affine(linear, at + up))]),
+        );
+        assert!(largest_motion(&rigid) > 1.0, "{name}: the lift shows");
+
+        shoot(
+            &mut w,
+            &placed,
+            &shot(3, vec![(0, hidden), (1, affine(linear, at))]),
+        );
+        let quiet = shoot(&mut w, &placed, &shot(4, Vec::new()));
+        assert!(
+            largest_motion(&quiet) < 1e-3,
+            "{name}: the unwritten edit is still"
+        );
+        let lifted = shoot_edits(&mut w, &placed, &shot(5, Vec::new()), &[(edit, 0, 1, lift)]);
+        let (worst, n) = motion_difference(&rigid, &lifted);
+        assert!(n > 1000, "{name}: {n} pixels to compare");
+        assert!(
+            worst <= 0.05,
+            "{name}: motion off the rigid lift's by {worst} px"
+        );
+
+        let r = rays(&lifted.view, &trace::MODULE, "pixels", 0);
+        let (matched, _) = parity(&lifted, &r, 1e-3);
+        assert!(
+            matched as f64 >= 0.995 * r.traced.len() as f64,
+            "{name}: lifted parity"
+        );
+        assert_hits_moved(&lifted, up, name);
+
+        // The frame after, nothing moves.
+        let still = shoot(&mut w, &placed, &shot(6, Vec::new()));
+        assert!(
+            largest_motion(&still) < 1e-3,
+            "{name}: motion after the lift"
+        );
+        assert!(
+            still.depth == lifted.depth,
+            "{name}: the lift holds once kernels stop"
+        );
+
+        // A jump marked as having no motion leaves none, in its frame and after.
+        let jumped = shoot_edits_with(
+            &mut w,
+            &placed,
+            &shot(7, Vec::new()),
+            &[(edit, 0, 1, lift)],
+            false,
+            |_| {},
+        );
+        assert!(
+            largest_motion(&jumped) < 1e-3,
+            "{name}: a jump without motion has motion"
+        );
+        let changed = (0..jumped.depth.len())
+            .filter(|&i| jumped.depth[i] != still.depth[i])
+            .count();
+        assert!(changed > 1000, "{name}: the jump changed {changed} depths");
+        let after = shoot(&mut w, &placed, &shot(8, Vec::new()));
+        assert!(
+            largest_motion(&after) < 1e-3,
+            "{name}: motion after the jump"
+        );
+
+        // A drop past the clusters' anchors, which the kernel lowers, undoes both lifts exactly.
+        let dropped = shoot_edits(
+            &mut w,
+            &placed,
+            &shot(9, Vec::new()),
+            &[(edit, 0, 1, -2.0 * lift)],
+        );
+        assert_hits_moved(&dropped, -2.0 * up, name);
+        assert!(dropped.depth == quiet.depth, "{name}: the drop clamped");
+
+        let f = w
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(10),
+                scenes: &[placed.scene],
+                low_latency: None,
+            })
+            .unwrap();
+        {
+            let mut s = f.scene(placed.scene).unwrap();
+            for &r in &placed.ranges {
+                s.remove(r);
+            }
+        }
+        wait(f.end(&[]).unwrap());
+        w.scenes.destroy_edit(edit);
+        w.scenes.destroy_scene(placed.scene);
+    }
+    assert_clean();
+}
+
+#[test]
+fn a_posed_edit_draws_and_traces_like_its_posed_source() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let around_one_corner = [[-0.5f32, 0.0, -0.5, 0.3]];
+    for (name, touched) in [
+        ("rig", None),
+        ("dag rig", None),
+        ("dag rig", Some(&around_one_corner[..])),
+    ] {
+        posed_edit(&mut w, name, touched);
+    }
+    assert_clean();
+}
+
+/// Two posed copies of an edit of `name` against two of the model: alike unwritten, in their
+/// poses' motion, under a kernel's lift and under section masks.
+fn posed_edit(w: &mut World, name: &str, touched: Option<&[[f32; 4]]>) {
+    const COPIES: u32 = 2;
+    let source = w.model(name);
+    let edit = w
+        .scenes
+        .create_edit(&EditDesc {
+            model: source,
+            touched,
+            bounds: Some(orr_pack::Aabb {
+                min: [-2.0, -1.0, -2.0],
+                max: [2.0, 2.0, 2.0],
+            }),
+        })
+        .unwrap();
+    settle_edits(w, &[edit]);
+    let model = w.scenes.edit(edit).unwrap().model;
+    let rigs = place_rigs_of(w, source, COPIES, COPIES, 2.2, 0, 100.0);
+    let edited = place_rigs_of(w, model, COPIES, COPIES, 2.2, 0, 100.0);
+    let eye = DVec3::new(0.0, 2.5, 4.0);
+    let target = DVec3::ZERO;
+    let check = |w: &mut World, g: &Frame, frame: u32, parts: u32, what: &str| {
+        let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+        let (matched, covered) = parity(g, &r, 1e-3);
+        let total = r.traced.len();
+        assert!(
+            covered > total / 20,
+            "{name}, {what}: {covered} of {total} covered"
+        );
+        assert!(
+            matched as f64 >= 0.995 * total as f64,
+            "{name}, {what}: {matched} of {total} pixels agree"
+        );
+        let rt = last_rt(w, frame);
+        assert_eq!(
+            (rt.parts, rt.parts_refused),
+            (parts, 0),
+            "{name}, {what}: part instances"
+        );
+    };
+    let all_parts = COPIES * (RIG_PARTS - 1);
+
+    // Unwritten, it stands where its source does, every part posed.
+    let mut frame = 1;
+    for t in [0.4, 1.1, 2.3] {
+        let shot = |frame| Shot::at(eye, target, frame);
+        let a = shoot_rigs(w, &rigs, &shot(frame), "sway", t, 0.35);
+        let b = shoot_rigs(w, &edited, &shot(frame + 1), "sway", t, 0.35);
+        check(w, &b, frame + 1, all_parts, "unwritten");
+        let same = (0..a.depth.len())
+            .filter(|&i| (a.depth[i] - b.depth[i]).abs() <= 1e-3 * a.depth[i].max(1e-6))
+            .count();
+        assert!(
+            same as f64 >= 0.995 * a.depth.len() as f64,
+            "{name}: {same} of {} depths equal the source's at {t} s",
+            a.depth.len()
+        );
+        frame += 2;
+    }
+
+    // A part's own motion comes through its pose, as on the source.
+    let slide = |w: &mut World, rigs: &Rigs, frame: u32, t: f32| {
+        shoot_rigs(w, rigs, &Shot::at(eye, target, frame), "slide", t, 0.05)
+    };
+    slide(w, &rigs, frame, 0.0);
+    let a = slide(w, &rigs, frame + 1, 0.5);
+    slide(w, &edited, frame + 2, 0.0);
+    let b = slide(w, &edited, frame + 3, 0.5);
+    let (worst, n) = motion_difference(&a, &b);
+    assert!(n > 1000, "{name}: {n} pixels to compare");
+    assert!(
+        worst <= 0.05,
+        "{name}: the pose's motion differs by {worst} px"
+    );
+    frame += 4;
+
+    // The kernel's lift moves the posed parts too, and rays follow.
+    let lifted = shoot_rigs_edited(
+        w,
+        &edited,
+        &Shot::at(eye, target, frame),
+        "slide",
+        0.5,
+        0.05,
+        &[(edit, 0, 1, 0.25)],
+    );
+    check(w, &lifted, frame, all_parts, "the lift");
+    assert!(largest_motion(&lifted) > 1.0, "{name}: the lift has motion");
+    let moved = (0..b.depth.len())
+        .filter(|&i| lifted.depth[i] != b.depth[i])
+        .count();
+    assert!(moved > 100, "{name}: the lift changed {moved} depths");
+    frame += 1;
+
+    // A mask leaving only the parts traces no body, one leaving only the body no parts; the
+    // other copy keeps every section and so a cut of its own.
+    for (mask, parts) in [(1u16, all_parts), (2, RIG_PARTS - 1), (0, all_parts)] {
+        let f = w
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(frame),
+                scenes: &[edited.placed.scene],
+                low_latency: None,
+            })
+            .unwrap();
+        {
+            let mut s = f.scene(edited.placed.scene).unwrap();
+            let variants = [mask, 0].map(|section_mask| CopyVariant {
+                pose: 0,
+                material_set: 0,
+                section_mask,
+            });
+            s.copy_variants(edited.range, 0, &variants).unwrap();
+        }
+        wait(f.end(&[]).unwrap());
+        frame += 1;
+        for _ in 0..2 {
+            let g = shoot_rigs(
+                w,
+                &edited,
+                &Shot::at(eye, target, frame),
+                "sway",
+                frame as f32 * 0.21,
+                0.35,
+            );
+            check(w, &g, frame, parts, &format!("mask {mask}"));
+            frame += 1;
+        }
+    }
+}
+
+#[test]
+fn a_skinned_edit_follows_its_palette_and_its_kernel() {
+    let _serial = serial();
+    let mut w = finest_world();
+    for name in ["worm", "unbounded worm"] {
+        let source = w.model(name);
+        let edit = w
+            .scenes
+            .create_edit(&EditDesc {
+                model: source,
+                touched: None,
+                bounds: None,
+            })
+            .unwrap();
+        settle_edits(&mut w, &[edit]);
+        let model = w.scenes.edit(edit).unwrap().model;
+        let worms = place_worms(&mut w, name, &[(Mat3::IDENTITY, Vec3::ZERO)], false);
+        let edited = place_worms_of(&mut w, model, &[(Mat3::IDENTITY, Vec3::ZERO)], false);
+        let check = |g: &Frame, what: &str| {
+            let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+            let (matched, covered) = parity(g, &r, 1e-3);
+            let total = r.traced.len();
+            assert!(
+                covered > total / 100,
+                "{name}, {what}: {covered} of {total} covered"
+            );
+            assert!(
+                matched as f64 >= 0.995 * total as f64,
+                "{name}, {what}: {matched} of {total} pixels agree"
+            );
+        };
+
+        // Unwritten, it deforms like its source's finest cut.
+        let t = 0.7;
+        let eye = worm_shot(0);
+        let (e, target) = (eye.eye, eye.target);
+        let shot = |frame| {
+            let mut s = Shot::at(e, target, frame);
+            s.focus = None;
+            s
+        };
+        let a = shoot_worms(&mut w, &worms, &shot(1), t, 0.0);
+        let b = shoot_worms(&mut w, &edited, &shot(2), t, 0.0);
+        check(&b, "unwritten");
+        let same = (0..a.depth.len())
+            .filter(|&i| (a.depth[i] - b.depth[i]).abs() <= 1e-4 * a.depth[i].max(1e-6))
+            .count();
+        assert!(
+            same as f64 >= 0.995 * a.depth.len() as f64,
+            "{name}: {same} of {} depths equal the source's",
+            a.depth.len()
+        );
+
+        // Half of it goes: its templates rebuild over the triangles left.
+        let palette = |s: &mut SceneWriter<'_>| write_palette(s, &edited, t, 0.0);
+        let split = shoot_edits_with(
+            &mut w,
+            &edited.placed,
+            &shot(3),
+            &[(edit, 0, 2, 0.0)],
+            true,
+            palette,
+        );
+        check(&split, "split");
+        let gone = (0..b.ids.len())
+            .filter(|&i| b.ids[i] != 0 && split.ids[i] == 0)
+            .count();
+        assert!(gone > 100, "{name}: the split removed {gone} pixels");
+
+        // A lift of the rest pose: this frame's positions move, last frame's stay what they were.
+        let before = skinned_positions(&split);
+        let lifted = shoot_edits_with(
+            &mut w,
+            &edited.placed,
+            &shot(4),
+            &[(edit, 0, 2, 0.25)],
+            true,
+            palette,
+        );
+        check(&lifted, "lifted");
+        let (now, previous) = (skinned_positions(&lifted), skinned_previous(&lifted));
+        assert_eq!(
+            previous, before,
+            "{name}: previous positions off last frame's"
+        );
+        assert_ne!(now, before, "{name}: the lift moved nothing");
+        assert!(largest_motion(&lifted) > 1.0, "{name}: the lift has motion");
+
+        // The frame after, last frame's positions are the lifted ones.
+        let still = shoot_worms(&mut w, &edited, &shot(5), t, 0.0);
+        check(&still, "still");
+        assert_eq!(
+            skinned_previous(&still),
+            now,
+            "{name}: motion after the lift"
+        );
+        assert!(
+            largest_motion(&still) < 1e-3,
+            "{name}: motion after the lift"
+        );
+    }
+    assert_clean();
+}
+
+/// Skinned copy 0's positions of the clusters it skinned this frame.
+fn skinned_positions(g: &Frame) -> Vec<[f32; 3]> {
+    let (k, _, _) = skinned_entry(&g.view, 0);
+    skinned_array(g, k.positions)
+}
+
+/// Skinned copy 0's previous positions of the clusters it skinned this frame.
+fn skinned_previous(g: &Frame) -> Vec<[f32; 3]> {
+    let (k, _, _) = skinned_entry(&g.view, 0);
+    skinned_array(g, k.previous)
+}
+
+fn skinned_array(g: &Frame, array: GpuPtr<[f32; 3]>) -> Vec<[f32; 3]> {
+    let root = read_buffer(g.view.scene, 1)[0];
+    let (_, _, clusters) = skinned_entry(&g.view, 0);
+    let k: SkinnedGpu = read_buffer(root.skinned, 1)[0];
+    let inst = read_buffer(root.instances.offset(u64::from(k.slot)), 1)[0];
+    let model = read_buffer(root.models.offset(u64::from(inst.model)), 1)[0];
+    let mesh = read_buffer(root.meshes.offset(u64::from(model.mesh)), 1)[0];
+    let skin = read_buffer(mesh.skin, 1)[0];
+    let first: Vec<u32> = read_buffer(skin.vertex_first, u64::from(mesh.cluster_count) + 1);
+    let all: Vec<[f32; 3]> = read_buffer(array, u64::from(skin.vertex_count));
+    clusters
+        .iter()
+        .flat_map(|&c| all[first[c as usize] as usize..first[c as usize + 1] as usize].to_vec())
+        .collect()
 }
 
 #[test]

@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use orr_gpu::{
-    Allocation, Device, GpuPtr, MemoryKind, MemoryPriority, QueueKind, SamplerIndex, SparseBinds,
-    Texture, TextureDesc, TextureIndex, TextureKind, TextureMemory, TextureRegion, TextureUsage,
-    TimelinePoint, ViewDesc,
+    Allocation, Device, GpuPtr, Hazards, MemoryKind, MemoryPriority, QueueKind, SamplerIndex,
+    SparseBinds, Stages, Texture, TextureDesc, TextureIndex, TextureKind, TextureMemory,
+    TextureRegion, TextureUsage, TimelinePoint, ViewDesc,
 };
 use orr_io::{AlignedBuf, Read, SECTOR};
 use orr_math::{DVec3, IVec3, Vec3};
@@ -30,7 +30,7 @@ use crate::accel::{
 };
 use crate::edit::{
     self, ClasInputs, EDIT_SPHERES, EditBatch, EditClas, EditDesc, EditDone, EditId, EditLoaded,
-    EditRecorder, EditRef, EditSource, EditTables, EditTask, Mirror,
+    EditRecorder, EditRef, EditSkin, EditSource, EditTables, EditTablesDesc, EditTask, Mirror,
 };
 use crate::emissive::{EmissiveSpan, ModelEmission, indexed_spans};
 use crate::loading::{ArchiveFile, BlobSource, Loading, Msg, decoded, read_stored};
@@ -49,8 +49,8 @@ use crate::tiles::{TexStream, TileGrid};
 use crate::traverse::{PAGED_DEPTH, PageFeedback};
 use crate::upload::Record;
 use crate::{
-    ClusterRef, EditGroupGpu, Error, MaskGpu, MaterialGpu, MeshGpu, ModelGpu, Result,
-    TextureStreamGpu, material_flags,
+    ClusterRef, EditGroupGpu, Error, MaskGpu, MaterialGpu, MeshGpu, ModelGpu, PartGpu, Result,
+    SkinMeshGpu, TextureStreamGpu, material_flags,
 };
 
 /// Where a pack's bytes come from.
@@ -1263,6 +1263,8 @@ struct ResolvedMesh {
     node_units: Vec<(u32, u32, u32)>,
     gpu: MeshGpu,
     page_addresses: Vec<u64>,
+    /// A skinned mesh's skin table.
+    skin_record: Option<SkinMeshGpu>,
     sections: u32,
     spans: Vec<EmissiveSpan>,
     header: MeshHeader,
@@ -1410,6 +1412,7 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
                     }
                 },
                 page_addresses,
+                skin_record: None,
                 sections: m.sections,
                 spans: indexed_spans(m.emissive),
                 header: m.header,
@@ -1571,6 +1574,10 @@ fn build_accel(
         m.non_opaque = non_opaque;
         if let Some(table) = skin {
             m.gpu.skin = table.gpu().cast();
+            let mapped = table.as_slice().expect("upload is mapped");
+            m.skin_record = Some(bytemuck::pod_read_unaligned(
+                &mapped[..size_of::<SkinMeshGpu>()],
+            ));
             r.accel.skins.push(table);
         }
         for (r, &clas) in refs.iter_mut().zip(&cuts.rt.clas) {
@@ -1733,6 +1740,8 @@ struct EditMesh {
     gpu: MeshGpu,
     addresses: Vec<u64>,
     source: Arc<EditSource>,
+    /// A skinned mesh's skin table.
+    skin: Option<SkinMeshGpu>,
 }
 
 /// An edit on the render thread.
@@ -1776,9 +1785,39 @@ struct EditLive {
     tables: EditTables,
     group_count: u32,
     clas: EditClas,
+    /// Kernels change it this frame.
     dirty: bool,
+    /// What they do this frame has no motion.
+    without_motion: bool,
+    /// The copy of last frame's pages is behind: kernels changed it last frame.
+    stale: bool,
+    /// Its mesh has animated parts.
+    parted: bool,
     mirror: Arc<Mirror>,
-    _loaded: EditLoaded,
+    loaded: EditLoaded,
+}
+
+impl EditLive {
+    /// Where the copy of last frame's pages goes, where it comes from and its bytes.
+    fn page_copy(&self) -> (GpuPtr<u8>, GpuPtr<u8>, u64) {
+        let pages = self.loaded.block.gpu();
+        let bytes = self.loaded.pages_bytes;
+        (pages.offset(bytes), pages, bytes)
+    }
+}
+
+fn record_page_copies(
+    list: &mut orr_gpu::CommandList<'_>,
+    copies: &[(GpuPtr<u8>, GpuPtr<u8>, u64)],
+) {
+    if copies.is_empty() {
+        return;
+    }
+    list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
+    for &(dst, src, bytes) in copies {
+        list.copy(dst, src, bytes);
+    }
+    list.barrier(Stages::TRANSFER, Stages::ALL, Hazards::empty());
 }
 
 /// The traversal's view of the resident hierarchies.
@@ -2143,13 +2182,12 @@ impl Mounts {
             return refuse("the model is an edit");
         }
         let m = &r.edit_sources[mesh as usize];
-        if m.source.header.attributes & MeshHeader::SKIN != 0 {
-            return refuse("its mesh is skinned");
-        }
         let (spheres, (own, groups)) = match m.source.finest_level {
             Some(level) => (None, edit::plan_level(&m.source.pages, level)),
             None => {
-                let spheres = desc.touched.filter(|t| t.len() <= EDIT_SPHERES);
+                let spheres = desc
+                    .touched
+                    .filter(|t| t.len() <= EDIT_SPHERES && m.skin.is_none());
                 (spheres, edit::plan(&m.source.groups, spheres))
             }
         };
@@ -2287,15 +2325,41 @@ impl Mounts {
         let addresses = source.addresses.clone();
         let src_clas = r.rt[p.mesh as usize].clas.clone();
         let src_model = r.model_gpus[&p.model];
+        let src_skin = source.skin;
         let page_count = ids.page_count;
         let n = ids.clusters;
         let base = ids.cluster_base;
+        let bounds = p.bounds.unwrap_or(Aabb {
+            min: src_model.bounds_min,
+            max: src_model.bounds_max,
+        });
+        let parts = vec![
+            PartGpu {
+                bounds_min: bounds.min,
+                sections: src_gpu.animated_sections,
+                bounds_max: bounds.max,
+                _pad: 0,
+            };
+            src_gpu.animated_parts as usize
+        ];
+        let level0 = src_skin.map_or_else(Vec::new, |_| {
+            edit::level0_clusters(&p.own, &stream.pages, &loaded.clusters)
+        });
         let tables = EditTables::new(
             w.device,
-            p.spheres.as_deref(),
-            &p.groups,
-            page_count,
-            src_gpu.page_stamps.address().0 != 0,
+            &EditTablesDesc {
+                spheres: p.spheres.as_deref(),
+                groups: &p.groups,
+                pages: (loaded.block.gpu(), loaded.pages_bytes),
+                page_count,
+                clusters: n,
+                stamps: src_gpu.page_stamps.address().0 != 0,
+                parts: &parts,
+                skin: src_skin.map(|source| EditSkin {
+                    source,
+                    cut: &level0,
+                }),
+            },
         )?;
         let table = self.page_table.gpu().offset(u64::from(start));
         let clusters = self.clusters.gpu().offset(u64::from(base));
@@ -2362,11 +2426,13 @@ impl Mounts {
                 non_opaque: &stream.non_opaque,
                 whole: p.spheres.is_none(),
                 clas_triangles: self.accel.limits.clas_triangles,
+                templates: src_skin.map(|_| tables.templates),
+                cluster_base: base,
             },
         )?;
 
         // The source's model record says how many sections its roots hold; the merged stage
-        // would bypass what the edit pins.
+        // would bypass what the edit pins. Part BLAS are gathered with the cut.
         let gpu = MeshGpu {
             pages: table,
             cluster_base: base,
@@ -2377,12 +2443,10 @@ impl Mounts {
             level_count: src_gpu.level_count.min(1),
             rt_cuts: tables.rt_cut,
             rt_cut_count: 1,
-            parts: GpuPtr::NULL,
+            parts: tables.parts,
             masks: GpuPtr::NULL,
             mask_count: 0,
-            first_animated: 0,
-            animated_parts: 0,
-            animated_sections: 0,
+            skin: tables.skin,
             page_stamps: tables.stamps,
             edit: tables.edit,
             cut_stamps: GpuPtr::NULL,
@@ -2391,10 +2455,6 @@ impl Mounts {
         };
         let mesh_gpu = self.meshes.gpu().offset(u64::from(mesh));
         w.put(mesh_gpu, &[gpu])?;
-        let bounds = p.bounds.unwrap_or(Aabb {
-            min: src_model.bounds_min,
-            max: src_model.bounds_max,
-        });
         let record = ModelGpu {
             mesh,
             bounds_min: bounds.min,
@@ -2416,7 +2476,6 @@ impl Mounts {
         }
         w.emission[i] = w.emission[p.model.0 as usize].clone();
         w.model_cpu[i] = ModelCpu {
-            animated_parts: 0,
             edit: true,
             ..w.model_cpu[p.model.0 as usize]
         };
@@ -2440,8 +2499,12 @@ impl Mounts {
             tables,
             clas,
             dirty: false,
+            without_motion: false,
+            // Nothing has filled the copy of last frame's pages yet.
+            stale: true,
+            parted: src_gpu.animated_parts > 0,
             mirror,
-            _loaded: loaded,
+            loaded,
         })
     }
 
@@ -2461,20 +2524,39 @@ impl Mounts {
         true
     }
 
-    pub(crate) fn edit_dirty(&mut self, id: EditId) -> bool {
+    pub(crate) fn edit_dirty(&mut self, id: EditId, motion: bool) -> bool {
         let Some(Some(EditEntry::Live(e))) = self.edits.get_mut(id.0 as usize) else {
             return false;
         };
         if !e.clas.built {
             return false;
         }
-        if e.dirty {
-            return true;
+        if !e.dirty {
+            e.dirty = Self::admit_edit(&mut self.edit_room, &mut self.edit_first, e.clas.triangles);
         }
-        let admitted =
-            Self::admit_edit(&mut self.edit_room, &mut self.edit_first, e.clas.triangles);
-        e.dirty = admitted;
-        admitted
+        e.without_motion = !motion;
+        e.dirty
+    }
+
+    /// Whether a copy of an edit may gather one BLAS per animated part.
+    pub(crate) fn has_parted_edit(&self) -> bool {
+        self.edits
+            .iter()
+            .flatten()
+            .any(|e| matches!(e, EditEntry::Live(e) if e.parted))
+    }
+
+    /// Brings the copy of last frame's pages up to date before the scene compute point, for
+    /// each edit its kernels changed last frame.
+    pub(crate) fn record_edit_history(&mut self, list: &mut orr_gpu::CommandList<'_>) {
+        let mut copies = Vec::new();
+        for e in self.edits.iter_mut().flatten() {
+            let EditEntry::Live(e) = e else { continue };
+            if std::mem::take(&mut e.stale) {
+                copies.push(e.page_copy());
+            }
+        }
+        record_page_copies(list, &copies);
     }
 
     /// Records this frame's edit rebuilds after the scene compute point: the dirty edits and
@@ -2487,10 +2569,17 @@ impl Mounts {
     ) -> Result<()> {
         let (room, first) = (&mut self.edit_room, &mut self.edit_first);
         let mut todo: Vec<&mut EditClas> = Vec::new();
+        let mut without_motion = Vec::new();
         for e in self.edits.iter_mut().flatten() {
             let EditEntry::Live(e) = e else { continue };
             let build = if e.clas.built {
-                std::mem::take(&mut e.dirty)
+                let dirty = std::mem::take(&mut e.dirty);
+                if dirty && e.without_motion {
+                    without_motion.push(e.page_copy());
+                } else if dirty {
+                    e.stale = true;
+                }
+                dirty
             } else {
                 Self::admit_edit(room, first, e.clas.triangles)
             };
@@ -2509,6 +2598,7 @@ impl Mounts {
         };
         list.begin_pass("edits", false);
         recorder.record(list, &mut todo, &mut self.edit_scratch)?;
+        record_page_copies(list, &without_motion);
         list.end_pass();
         Ok(())
     }
@@ -3029,6 +3119,7 @@ impl Mounts {
                     non_opaque: m.non_opaque.clone(),
                     finest_level: m.levels.first().map(|&(_, first, count)| (first, count)),
                 }),
+                skin: m.skin_record,
             });
             self.mesh_owners
                 .insert(id, (mount, res.meshes.len() as u32 - 1));
