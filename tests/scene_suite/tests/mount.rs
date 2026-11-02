@@ -3190,6 +3190,7 @@ fn the_resolve_writes_the_color_a_neural_set_decodes() {
                 },
                 lens: Lens::default(),
                 render_extent: glam::UVec2::splat(EXTENT),
+                output_extent: glam::UVec2::splat(EXTENT),
                 jitter: Vec2::ZERO,
                 reset_history: true,
                 mip_bias: 0.0,

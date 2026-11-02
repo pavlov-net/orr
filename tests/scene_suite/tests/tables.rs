@@ -473,7 +473,8 @@ fn view_constants_project_and_reconstruct_render_positions() {
     let history = scenes.create_view_history().unwrap();
     let camera = DVec3::new(-12_345.5, 210.0, 8_000.75);
     let rotation = (DQuat::from_rotation_y(0.7) * DQuat::from_rotation_x(-0.2)).as_quat();
-    let extent = UVec2::new(1920, 1080);
+    // A render size an upscaler rounds to; the output's aspect ratio is 16:9.
+    let extent = UVec2::new(853, 480);
     let jitter = Vec2::new(0.3, -0.4);
     let list = [s];
     let mut f = scenes.begin_frame(&frame(&list)).unwrap();
@@ -491,6 +492,7 @@ fn view_constants_project_and_reconstruct_render_positions() {
             },
             lens: Lens::default(),
             render_extent: extent,
+            output_extent: UVec2::new(1280, 720),
             jitter,
             reset_history: true,
             mip_bias: 0.0,
@@ -514,6 +516,9 @@ fn view_constants_project_and_reconstruct_render_positions() {
     assert_eq!(Vec3::from_slice(&vc.eye_render[..3]), eye);
     let rows = |m: [[f32; 4]; 4]| glam::Mat4::from_cols_array_2d(&m).transpose();
     let clip = rows(vc.clip_from_view_jittered);
+    let unjittered = rows(vc.clip_from_view);
+    let aspect = unjittered.y_axis.y.abs() / unjittered.x_axis.x;
+    assert!((aspect - 16.0 / 9.0).abs() < 1e-5, "aspect {aspect}");
 
     // A point on the view axis lands at the image center plus the jitter, so each sample
     // sits at its pixel center minus the jitter.
@@ -597,6 +602,7 @@ fn exposure_slots_alternate_per_render_of_a_view() {
                     },
                     lens: Lens::default(),
                     render_extent: UVec2::new(64, 64),
+                    output_extent: UVec2::new(64, 64),
                     jitter: Vec2::ZERO,
                     reset_history: false,
                     mip_bias: 0.0,
@@ -674,6 +680,7 @@ fn copies_are_placed_relative_to_the_eye_from_cells() {
             },
             lens: Lens::default(),
             render_extent: UVec2::new(64, 64),
+            output_extent: UVec2::new(64, 64),
             jitter: Vec2::ZERO,
             reset_history: false,
             mip_bias: 0.0,

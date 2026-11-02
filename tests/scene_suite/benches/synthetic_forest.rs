@@ -941,6 +941,7 @@ fn view_desc(
         },
         lens: Lens::default(),
         render_extent: UVec2::from(args.extent),
+        output_extent: UVec2::from(args.extent),
         jitter: Vec2::ZERO,
         reset_history: frame <= 3,
         mip_bias: 0.0,

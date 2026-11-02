@@ -88,8 +88,8 @@ pub enum Error {
     Lighting(#[from] LightingError),
     #[error(transparent)]
     Output(#[from] OutputError),
-    /// A view's explicit render extent has another aspect ratio than its output extent, which
-    /// the projection would stretch.
+    /// A view's explicit render extent has another aspect ratio than its output extent, so its
+    /// pixels would not be square.
     #[error("render extent {render:?} does not keep the aspect ratio of the output {output:?}")]
     RenderAspect { render: [u32; 2], output: [u32; 2] },
     /// The view's target is the display, and the frame has none or its window has no area.
@@ -896,6 +896,7 @@ impl<'a> Frame<'a> {
             projection: view.projection,
             lens: view.lens,
             render_extent: UVec2::from(render),
+            output_extent: UVec2::from(extent),
             jitter: Vec2::from(jitter),
             reset_history: view.reset_history,
             mip_bias,

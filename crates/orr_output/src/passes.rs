@@ -212,10 +212,11 @@ impl OutputView {
         lens: &Lens,
         projection: &Projection,
         render_extent: [u32; 2],
+        output_extent: [u32; 2],
     ) -> Option<DofHoleMask> {
         self.dof
             .as_ref()?
-            .hole_mask(lens, projection, render_extent)
+            .hole_mask(lens, projection, render_extent, output_extent)
     }
 
     /// The roots frame `frame` records with. Its slot was last used by frame

@@ -436,6 +436,7 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
                 },
                 lens: Lens::default(),
                 render_extent: UVec2::from(render),
+                output_extent: UVec2::from(extent),
                 jitter: Vec2::from(jitter),
                 reset_history: reset,
                 mip_bias,

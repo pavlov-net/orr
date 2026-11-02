@@ -78,6 +78,7 @@ fn empty_frames_and_scene_frames_submit_in_order() {
             },
             lens: Lens::default(),
             render_extent: UVec2::new(1280, 720),
+            output_extent: UVec2::new(1280, 720),
             jitter: Vec2::ZERO,
             reset_history: false,
             mip_bias: 0.0,

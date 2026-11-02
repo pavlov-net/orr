@@ -461,13 +461,14 @@ impl DofTargets {
         lens: &Lens,
         projection: &Projection,
         extent: [u32; 2],
+        output_extent: [u32; 2],
     ) -> Option<DofHoleMask> {
         let dof = lens.depth_of_field?;
         let holes = self
             .holes
             .as_ref()
             .filter(|h| h.written && h.extent == extent)?;
-        let clip = projection.clip_from_view(UVec2::from(extent));
+        let clip = projection.clip_from_view(UVec2::from(output_extent));
         let focal_mm = 0.5 * lens.sensor_width_mm * clip.x_axis.x.abs();
         Some(DofHoleMask {
             mask: holes.mask.sampled,

@@ -308,6 +308,7 @@ impl DisplayFrame<'_> {
                 rotation: view.rotation,
                 projection: view.projection,
                 extent: view.render_extent.to_array(),
+                output: view.output_extent.to_array(),
             },
             jitter: view.jitter.to_array(),
             reset: view.reset_history,
