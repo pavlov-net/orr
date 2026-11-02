@@ -833,7 +833,12 @@ fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
                 c.extend(&mut part_bounds[usize::from(c.record.part)], cx.grid);
             }
         }
-        for (bytes, n) in paginate(clusters, cx.stride) {
+        let paged = paginate(clusters, cx.stride);
+        let stored = paged
+            .par_iter()
+            .map(|(bytes, _)| store_page(bytes))
+            .collect::<Result<Vec<_>>>()?;
+        for ((bytes, n), stored) in paged.into_iter().zip(stored) {
             page_info.push(PageInfo {
                 blob: pages.len() as u32 + 1,
                 resident_len: bytes.len() as u32,
@@ -841,7 +846,7 @@ fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
                 _pad: 0,
                 deps: Span::default(),
             });
-            pages.push(store_page(&bytes)?);
+            pages.push(stored);
         }
         if li + 1 == level_count {
             pinned_pages = pages.len() as u32;
