@@ -1959,9 +1959,7 @@ pub struct Paths {
 
 impl Paths {
     pub fn new(kernels: &KernelSet, entry: PathEntry, settings: ViewLighting) -> Self {
-        let mut list = render().command_list().unwrap();
-        let tables = BsdfTables::new(device(), &mut list).unwrap();
-        crate::run(list);
+        let tables = BsdfTables::new(device()).unwrap();
         Self {
             kernels: LightingKernels::new(device(), kernels, &tables, entry).unwrap(),
             _tables: tables,

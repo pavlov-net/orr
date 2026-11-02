@@ -64,8 +64,8 @@ pub use orr_scene::{
 };
 
 use orr_gpu::{
-    CommandList, Device, Format, GpuPtr, Hazards, KernelSet, OutputFormat, QueueKind, ShaderModule,
-    Stages, StorageImageIndex, TextureDesc, TextureIndex, TextureUsage, TimelinePoint,
+    CommandList, Device, Format, GpuPtr, Hazards, KernelSet, OutputFormat, ShaderModule, Stages,
+    StorageImageIndex, TextureDesc, TextureIndex, TextureUsage, TimelinePoint,
 };
 use orr_lighting::{BsdfTables, LightingKernels, LightingView, SceneLighting, ScenePass, ViewPass};
 use orr_math::{DVec3, Quat, UVec2, Vec2};
@@ -401,10 +401,7 @@ impl Renderer {
         desc.kernels
             .check(&builtin_modules())
             .map_err(SceneError::from)?;
-        let render = gpu.queue(QueueKind::Render).expect("render queue");
-        let mut list = render.command_list()?;
-        let tables = BsdfTables::new(gpu, &mut list)?;
-        render.submit(vec![list], &[])?;
+        let tables = BsdfTables::new(gpu)?;
         Ok(Self {
             scenes: Scenes::new(gpu, &desc)?,
             lighting: Lighting {

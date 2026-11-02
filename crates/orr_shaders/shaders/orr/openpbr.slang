@@ -15,7 +15,8 @@ __exported import orr.openpbr_bsdf;
 
 import orr.abi;
 
-[vk::constant_id(104)] const uint openpbr_lut_slot = 0;
+// `orr_shaders::abi::OPENPBR_LUT_SLOT`, where orr_lighting's tables stay.
+[vk::constant_id(104)] const uint openpbr_lut_slot = 1;
 
 // The table sizes of openpbr_data_constants.h.
 static const int SIZE = 32;

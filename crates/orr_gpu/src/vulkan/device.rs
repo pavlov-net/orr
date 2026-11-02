@@ -6,6 +6,7 @@ use std::mem::ManuallyDrop;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Duration;
 
 use ash::vk;
 use ash::vk::TaggedStructure as _;
@@ -234,6 +235,15 @@ pub struct Device {
     pub(crate) shared: Arc<Shared>,
     queues: Arc<[Option<Queue>; MAX_TIMELINES]>,
 }
+
+impl PartialEq for Device {
+    /// Whether both handles are clones of one device.
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+}
+
+impl Eq for Device {}
 
 /// One queue to create: its kind, family and index in the family.
 struct QueuePlan {
@@ -812,6 +822,11 @@ impl Device {
     /// The queue of `kind`, if the device created one.
     pub fn queue(&self, kind: QueueKind) -> Option<&Queue> {
         self.queues[kind.index()].as_ref()
+    }
+
+    /// Blocks until everything submitted so far, on every queue, has completed.
+    pub fn wait_submitted(&self, timeout: Duration) -> Result<(), Error> {
+        self.shared.wait_submitted(timeout)
     }
 
     /// A TLAS with one inactive instance: every ray misses it. For kernels with nothing to

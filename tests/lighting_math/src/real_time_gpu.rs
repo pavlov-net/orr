@@ -211,13 +211,7 @@ fn context() -> &'static Context {
             ..DeviceDesc::default()
         })
         .expect("Vulkan device");
-        let queue = device.queue(QueueKind::Render).expect("render queue");
-        let mut list = queue.command_list().expect("command list");
-        let tables = BsdfTables::new(&device, &mut list).expect("BSDF tables");
-        let point = queue.submit(vec![list], &[]).expect("submit");
-        queue
-            .wait(point, Duration::from_secs(10))
-            .expect("table upload");
+        let tables = BsdfTables::new(&device).expect("BSDF tables");
         let spec = Spec {
             openpbr_lut_slot: tables.first_slot(),
             ..Spec::default()
