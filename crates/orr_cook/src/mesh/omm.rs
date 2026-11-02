@@ -7,7 +7,7 @@ use orr_pack::mesh::{
 };
 use serde::Deserialize;
 
-use super::maps::{Opacity, Ranges, Raster, wrapped, wrapped_runs};
+use super::maps::{FAIL, Opacity, PASS, Passes, Ranges, Raster};
 
 const STATES: OpacityStates = OpacityStates::Four;
 
@@ -64,11 +64,7 @@ pub(crate) struct OmmAlpha {
     w: u32,
     h: u32,
     sides: Sides,
-    passes: Passes,
 }
-
-const PASS: u8 = 1;
-const FAIL: u8 = 2;
 
 /// Tiles of `TILE`, `TILE`², ... texels a side, finest first: per tile, which sides of the
 /// cutoff its texels are on (`PASS`, `FAIL` or both).
@@ -154,43 +150,6 @@ impl Sides {
     }
 }
 
-/// Per row of the opacity mip 0, how many of its first `x` texels pass the cutoff, for
-/// every `x` up to the row's width.
-struct Passes {
-    prefix: Vec<u16>,
-}
-
-impl Passes {
-    fn new(mip0: &Raster, cutoff: f32) -> Self {
-        let w = mip0.w as usize;
-        let mut prefix = Vec::with_capacity((w + 1) * mip0.h as usize);
-        for row in mip0.texels.chunks_exact(w) {
-            let mut n = 0u16;
-            prefix.push(0);
-            for &t in row {
-                n += u16::from(t >= cutoff);
-                prefix.push(n);
-            }
-        }
-        Self { prefix }
-    }
-
-    /// Which sides of the cutoff the texels `mip0.footprint(uv)` visits are on.
-    fn footprint(&self, mip0: &Raster, uv: [[f32; 2]; 3]) -> u8 {
-        let mut sides = 0;
-        mip0.footprint_runs(uv, |y, first, last| {
-            let stride = mip0.w as usize + 1;
-            let row = &self.prefix[wrapped(y, mip0.h, mip0.wrap[1]) * stride..];
-            wrapped_runs(first, last, mip0.w, mip0.wrap[0], |a, b| {
-                let pass = usize::from(row[b + 1] - row[a]);
-                sides |= if pass > 0 { PASS } else { 0 } | if pass <= b - a { FAIL } else { 0 };
-                sides != PASS | FAIL
-            })
-        });
-        sides
-    }
-}
-
 impl OmmAlpha {
     /// Largest texture side the rasterizer takes.
     pub(crate) const MAX_SIZE: u32 = 16384;
@@ -208,7 +167,6 @@ impl OmmAlpha {
             w: mip0.w,
             h: mip0.h,
             sides,
-            passes: Passes::new(mip0, cutoff),
         })
     }
 
@@ -275,7 +233,7 @@ pub(crate) fn cluster_omm(
     if tris.is_empty() {
         return None;
     }
-    let mip0 = match opacity {
+    let (mip0, passes) = match opacity {
         Opacity::Constant(pass) => {
             return Some(ClusterOmm {
                 indices: vec![
@@ -287,7 +245,7 @@ pub(crate) fn cluster_omm(
                 max_level: s.max_level,
             });
         }
-        Opacity::Texture { mip0, .. } => mip0,
+        Opacity::Texture { mip0, passes, .. } => (mip0, passes),
         Opacity::Unknown => return None,
     };
     let alpha = alpha?;
@@ -330,7 +288,7 @@ pub(crate) fn cluster_omm(
         for (i, &source) in m.sources.iter().enumerate() {
             let uv = tris[source as usize].map(|v| uvs[usize::from(v)]);
             let entry = &mut data[entry(i)];
-            known_states_hold(entry, levels[i], uv, mip0, alpha);
+            known_states_hold(entry, levels[i], uv, mip0, passes, &alpha.sides);
         }
     }
     let _z = crate::profile::zone!("omm.compact");
@@ -362,7 +320,8 @@ fn known_states_hold(
     level: u8,
     uv: [[f32; 2]; 3],
     mip0: &Raster,
-    alpha: &OmmAlpha,
+    passes: &Passes,
+    tiles: &Sides,
 ) {
     // Micro-triangles in the order meshoptimizer rasterizes them: children 0 and 2 keep
     // the winding, 1 and 3 flip it. A triangle whose footprint stays on one side of the
@@ -373,7 +332,8 @@ fn known_states_hold(
         level: u8,
         tri: [[f32; 2]; 3],
         mip0: &Raster,
-        alpha: &OmmAlpha,
+        passes: &Passes,
+        tiles: &Sides,
     ) {
         // Only known states change, so a run of unknown ones needs no footprint.
         if !any_known(data, index << (2 * level), 1 << (2 * level)) {
@@ -382,25 +342,25 @@ fn known_states_hold(
         // Tiles on one side settle the footprint they hold without walking its texels.
         // The tiles rarely settle a footprint narrower than 16 of them; the runs are cheaper.
         let ranges = mip0.footprint_ranges(tri);
-        let tiles = || ranges.and_then(|r| alpha.sides.uniform(&r));
+        let uniform = || ranges.and_then(|r| tiles.uniform(&r));
         let wide = ranges.is_some_and(|r| r.iter().any(|r| r.len() > 16 * Sides::TILE));
         let mut sides = wide
-            .then(tiles)
+            .then(uniform)
             .flatten()
-            .unwrap_or_else(|| alpha.passes.footprint(mip0, tri));
+            .unwrap_or_else(|| passes.footprint(mip0, tri, PASS | FAIL));
         // An empty footprint keeps the side its tiles are on.
         if sides == 0 {
-            sides = tiles().unwrap_or(0);
+            sides = uniform().unwrap_or(0);
         }
         if sides == PASS | FAIL && level > 0 {
             let [c0, c1, c2] = tri;
             let mid = |a: [f32; 2], b: [f32; 2]| [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
             let (c01, c12, c20) = (mid(c0, c1), mid(c1, c2), mid(c2, c0));
             let l = level - 1;
-            visit(data, index * 4, l, [c0, c01, c20], mip0, alpha);
-            visit(data, index * 4 + 1, l, [c20, c12, c01], mip0, alpha);
-            visit(data, index * 4 + 2, l, [c01, c1, c12], mip0, alpha);
-            visit(data, index * 4 + 3, l, [c12, c20, c2], mip0, alpha);
+            visit(data, index * 4, l, [c0, c01, c20], mip0, passes, tiles);
+            visit(data, index * 4 + 1, l, [c20, c12, c01], mip0, passes, tiles);
+            visit(data, index * 4 + 2, l, [c01, c1, c12], mip0, passes, tiles);
+            visit(data, index * 4 + 3, l, [c12, c20, c2], mip0, passes, tiles);
             return;
         }
         let first = index << (2 * level);
@@ -417,7 +377,7 @@ fn known_states_hold(
             }
         }
     }
-    visit(data, 0, level, uv, mip0, alpha);
+    visit(data, 0, level, uv, mip0, passes, tiles);
 }
 
 /// A page's micromap region and where its clusters' indices start in it.
@@ -491,7 +451,7 @@ pub(crate) fn page_region(clusters: &[Option<&ClusterOmm>]) -> Region {
 #[cfg(test)]
 mod tests {
     use super::{FAIL, OmmAlpha, PASS, remap};
-    use crate::mesh::maps::{Raster, wrapped, wrapped_runs};
+    use crate::mesh::maps::Raster;
     use crate::texture::Wrap;
 
     #[test]
@@ -541,131 +501,6 @@ mod tests {
                 settled > 500,
                 "{wrap:?}: tiles settled {settled} footprints"
             );
-        }
-    }
-
-    #[test]
-    fn footprint_runs_visit_the_texels_whose_grown_squares_meet_the_triangle() {
-        // The footprint by its definition: every texel in the box, tested on its own.
-        fn reference(r: &Raster, uv: [[f32; 2]; 3]) -> Vec<(usize, usize)> {
-            let p = uv.map(|t| r.texel_pos(t));
-            let lo = [0, 1].map(|a| p.iter().map(|q| q[a]).fold(f64::INFINITY, f64::min));
-            let hi = [0, 1].map(|a| p.iter().map(|q| q[a]).fold(f64::NEG_INFINITY, f64::max));
-            let (w, h) = (f64::from(r.w), f64::from(r.h));
-            if hi[0] - lo[0] > 2.0 * w || hi[1] - lo[1] > 2.0 * h {
-                return (0..r.h as usize)
-                    .flat_map(|y| (0..r.w as usize).map(move |x| (x, y)))
-                    .collect();
-            }
-            let edges = [0, 1, 2].map(|i| {
-                let (a, b) = (p[i], p[(i + 1) % 3]);
-                let n = [b[1] - a[1], a[0] - b[0]];
-                let c = p[(i + 2) % 3];
-                let side = n[0] * (c[0] - a[0]) + n[1] * (c[1] - a[1]);
-                let s = if side > 0.0 { -1.0 } else { 1.0 };
-                [s * n[0], s * n[1], -s * (n[0] * a[0] + n[1] * a[1])]
-            });
-            let mut out = Vec::new();
-            for y in (lo[1].floor() as i64 - 2)..=(hi[1].floor() as i64 + 2) {
-                for x in (lo[0].floor() as i64 - 2)..=(hi[0].floor() as i64 + 2) {
-                    let (x0, x1) = ((x - 1) as f64, (x + 2) as f64);
-                    let (y0, y1) = ((y - 1) as f64, (y + 2) as f64);
-                    if x1 < lo[0] || x0 > hi[0] || y1 < lo[1] || y0 > hi[1] {
-                        continue;
-                    }
-                    let corners = [[x0, y0], [x1, y0], [x0, y1], [x1, y1]];
-                    let outside = edges.iter().any(|e| {
-                        corners
-                            .iter()
-                            .all(|c| e[0] * c[0] + e[1] * c[1] + e[2] > 0.0)
-                    });
-                    if !outside {
-                        out.push((wrapped(x, r.w, r.wrap[0]), wrapped(y, r.h, r.wrap[1])));
-                    }
-                }
-            }
-            out
-        }
-        let (w, h) = (23u32, 17u32);
-        let texels: Vec<f32> = (0..w * h)
-            .map(|i| ((i % w) as f32 * 0.4).sin() * ((i / w) as f32 * 0.3).cos() + 0.3)
-            .collect();
-        let mut seed = 7u32;
-        let mut next = move || {
-            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            seed as f32 / u32::MAX as f32 * 3.0 - 1.0
-        };
-        let wraps = [Wrap::Repeat, Wrap::Clamp, Wrap::Mirror];
-        for wrap in wraps.iter().flat_map(|&a| wraps.map(|b| [a, b])) {
-            let raster = Raster {
-                w,
-                h,
-                texels: texels.clone(),
-                wrap,
-                uv: [0.0; 6],
-            };
-            let alpha = OmmAlpha::new(&raster, 0.5).unwrap();
-            // Coincident corners, axis-aligned edges, corners on texel corners, a span of
-            // exactly two periods, then random triangles.
-            let (tw, th) = (1.0 / w as f32, 1.0 / h as f32);
-            let mut tris = vec![
-                [[0.3, 0.4]; 3],
-                [[0.3, 0.4], [0.3, 0.4], [0.6, 0.45]],
-                [[0.1, 0.2], [0.5, 0.2], [0.1, 0.7]],
-                [
-                    [3.0 * tw, 2.0 * th],
-                    [9.0 * tw, 2.0 * th],
-                    [3.0 * tw, 8.0 * th],
-                ],
-                [[-1.0, 0.1], [1.0, 0.1], [0.0, 0.3]],
-                [[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]],
-            ];
-            for k in 0..3000 {
-                let size = [2.5, 0.5, 0.05, 0.005][k % 4];
-                let o = [next(), next()];
-                tris.push([0, 1, 2].map(|_| [o[0] + next() * size, o[1] + next() * size]));
-            }
-            for tri in tris {
-                let want = reference(&raster, tri);
-                let mut got = Vec::new();
-                raster.footprint_runs(tri, |y, first, last| {
-                    let row = wrapped(y, h, wrap[1]);
-                    got.extend((first..=last).map(|x| (wrapped(x, w, wrap[0]), row)));
-                    true
-                });
-                assert_eq!(got, want, "{wrap:?} {tri:?}");
-                let walked = want.iter().fold(0, |s, &(x, y)| {
-                    s | if texels[y * w as usize + x] >= 0.5 {
-                        PASS
-                    } else {
-                        FAIL
-                    }
-                });
-                assert_eq!(
-                    alpha.passes.footprint(&raster, tri),
-                    walked,
-                    "{wrap:?} {tri:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn wrapped_runs_hold_exactly_the_wrapped_indices() {
-        for wrap in [Wrap::Repeat, Wrap::Clamp, Wrap::Mirror] {
-            for (first, last) in [(-9, -7), (-3, 2), (0, 4), (3, 9), (-12, 14), (6, 30)] {
-                let mut want: Vec<usize> = (first..=last).map(|v| wrapped(v, 5, wrap)).collect();
-                let mut got = Vec::new();
-                wrapped_runs(first, last, 5, wrap, |a, b| {
-                    got.extend(a..=b);
-                    true
-                });
-                for v in [&mut want, &mut got] {
-                    v.sort_unstable();
-                    v.dedup();
-                }
-                assert_eq!(got, want, "{wrap:?} {first}..={last}");
-            }
         }
     }
 

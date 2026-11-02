@@ -14,6 +14,53 @@ pub(crate) struct Raster {
     pub uv: [f32; 6],
 }
 
+/// The side of the opacity cutoff a texel is on: at or over it.
+pub(crate) const PASS: u8 = 1;
+/// Under it.
+pub(crate) const FAIL: u8 = 2;
+
+/// Per row of an opacity mip, how many of its first `x` texels pass the cutoff, for every
+/// `x` up to the row's width.
+pub(crate) struct Passes {
+    prefix: Vec<u16>,
+}
+
+impl Passes {
+    pub(crate) fn new(mip: &Raster, cutoff: f32) -> Self {
+        assert!(
+            mip.w <= u32::from(u16::MAX),
+            "opacity texture over 65535 texels wide"
+        );
+        let w = mip.w as usize;
+        let mut prefix = Vec::with_capacity((w + 1) * mip.h as usize);
+        for row in mip.texels.chunks_exact(w) {
+            let mut n = 0u16;
+            prefix.push(0);
+            for &t in row {
+                n += u16::from(t >= cutoff);
+                prefix.push(n);
+            }
+        }
+        Self { prefix }
+    }
+
+    /// Which sides of the cutoff the texels `mip.footprint(uv)` visits are on, as `PASS`
+    /// and `FAIL` bits; stops once it has seen every side in `stop`.
+    pub(crate) fn footprint(&self, mip: &Raster, uv: [[f32; 2]; 3], stop: u8) -> u8 {
+        let mut sides = 0;
+        let stride = mip.w as usize + 1;
+        mip.footprint_runs(uv, |y, first, last| {
+            let row = &self.prefix[wrapped(y, mip.h, mip.wrap[1]) * stride..];
+            wrapped_runs(first, last, mip.w, mip.wrap[0], |a, b| {
+                let pass = usize::from(row[b + 1] - row[a]);
+                sides |= if pass > 0 { PASS } else { 0 } | if pass <= b - a { FAIL } else { 0 };
+                sides & stop != stop
+            })
+        });
+        sides
+    }
+}
+
 /// Up to two inclusive index ranges; an empty one has its start past its end.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Ranges(pub [[usize; 2]; 2]);
@@ -293,6 +340,7 @@ pub(crate) enum Opacity {
         mip0: Raster,
         cutoff: f32,
         uv_set: usize,
+        passes: Passes,
     },
     /// The opacity is not known to the cook: every triangle is alpha-tested.
     Unknown,
@@ -310,14 +358,7 @@ impl Opacity {
     pub(crate) fn opaque(&self, uv: [[f32; 2]; 3]) -> bool {
         match self {
             Self::Constant(pass) => *pass,
-            Self::Texture { mip0, cutoff, .. } => {
-                let mut pass = true;
-                mip0.footprint(uv, |t| {
-                    pass = t >= *cutoff;
-                    pass
-                });
-                pass
-            }
+            Self::Texture { mip0, passes, .. } => passes.footprint(mip0, uv, FAIL) & FAIL == 0,
             Self::Unknown => false,
         }
     }
@@ -369,5 +410,135 @@ impl Displacement {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn footprint_runs_visit_the_texels_whose_grown_squares_meet_the_triangle() {
+        // The footprint by its definition: every texel in the box, tested on its own.
+        fn reference(r: &Raster, uv: [[f32; 2]; 3]) -> Vec<(usize, usize)> {
+            let p = uv.map(|t| r.texel_pos(t));
+            let lo = [0, 1].map(|a| p.iter().map(|q| q[a]).fold(f64::INFINITY, f64::min));
+            let hi = [0, 1].map(|a| p.iter().map(|q| q[a]).fold(f64::NEG_INFINITY, f64::max));
+            let (w, h) = (f64::from(r.w), f64::from(r.h));
+            if hi[0] - lo[0] > 2.0 * w || hi[1] - lo[1] > 2.0 * h {
+                return (0..r.h as usize)
+                    .flat_map(|y| (0..r.w as usize).map(move |x| (x, y)))
+                    .collect();
+            }
+            let edges = [0, 1, 2].map(|i| {
+                let (a, b) = (p[i], p[(i + 1) % 3]);
+                let n = [b[1] - a[1], a[0] - b[0]];
+                let c = p[(i + 2) % 3];
+                let side = n[0] * (c[0] - a[0]) + n[1] * (c[1] - a[1]);
+                let s = if side > 0.0 { -1.0 } else { 1.0 };
+                [s * n[0], s * n[1], -s * (n[0] * a[0] + n[1] * a[1])]
+            });
+            let mut out = Vec::new();
+            for y in (lo[1].floor() as i64 - 2)..=(hi[1].floor() as i64 + 2) {
+                for x in (lo[0].floor() as i64 - 2)..=(hi[0].floor() as i64 + 2) {
+                    let (x0, x1) = ((x - 1) as f64, (x + 2) as f64);
+                    let (y0, y1) = ((y - 1) as f64, (y + 2) as f64);
+                    if x1 < lo[0] || x0 > hi[0] || y1 < lo[1] || y0 > hi[1] {
+                        continue;
+                    }
+                    let corners = [[x0, y0], [x1, y0], [x0, y1], [x1, y1]];
+                    let outside = edges.iter().any(|e| {
+                        corners
+                            .iter()
+                            .all(|c| e[0] * c[0] + e[1] * c[1] + e[2] > 0.0)
+                    });
+                    if !outside {
+                        out.push((wrapped(x, r.w, r.wrap[0]), wrapped(y, r.h, r.wrap[1])));
+                    }
+                }
+            }
+            out
+        }
+        let (w, h) = (23u32, 17u32);
+        let texels: Vec<f32> = (0..w * h)
+            .map(|i| ((i % w) as f32 * 0.4).sin() * ((i / w) as f32 * 0.3).cos() + 0.3)
+            .collect();
+        let mut seed = 7u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed as f32 / u32::MAX as f32 * 3.0 - 1.0
+        };
+        let wraps = [Wrap::Repeat, Wrap::Clamp, Wrap::Mirror];
+        for wrap in wraps.iter().flat_map(|&a| wraps.map(|b| [a, b])) {
+            let raster = Raster {
+                w,
+                h,
+                texels: texels.clone(),
+                wrap,
+                uv: [0.0; 6],
+            };
+            let passes = Passes::new(&raster, 0.5);
+            // Coincident corners, axis-aligned edges, corners on texel corners, a span of
+            // exactly two periods, then random triangles.
+            let (tw, th) = (1.0 / w as f32, 1.0 / h as f32);
+            let mut tris = vec![
+                [[0.3, 0.4]; 3],
+                [[0.3, 0.4], [0.3, 0.4], [0.6, 0.45]],
+                [[0.1, 0.2], [0.5, 0.2], [0.1, 0.7]],
+                [
+                    [3.0 * tw, 2.0 * th],
+                    [9.0 * tw, 2.0 * th],
+                    [3.0 * tw, 8.0 * th],
+                ],
+                [[-1.0, 0.1], [1.0, 0.1], [0.0, 0.3]],
+                [[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]],
+            ];
+            for k in 0..3000 {
+                let size = [2.5, 0.5, 0.05, 0.005][k % 4];
+                let o = [next(), next()];
+                tris.push([0, 1, 2].map(|_| [o[0] + next() * size, o[1] + next() * size]));
+            }
+            for tri in tris {
+                let want = reference(&raster, tri);
+                let mut got = Vec::new();
+                raster.footprint_runs(tri, |y, first, last| {
+                    let row = wrapped(y, h, wrap[1]);
+                    got.extend((first..=last).map(|x| (wrapped(x, w, wrap[0]), row)));
+                    true
+                });
+                assert_eq!(got, want, "{wrap:?} {tri:?}");
+                let walked = want.iter().fold(0, |s, &(x, y)| {
+                    s | if texels[y * w as usize + x] >= 0.5 {
+                        PASS
+                    } else {
+                        FAIL
+                    }
+                });
+                assert_eq!(
+                    passes.footprint(&raster, tri, PASS | FAIL),
+                    walked,
+                    "{wrap:?} {tri:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_runs_hold_exactly_the_wrapped_indices() {
+        for wrap in [Wrap::Repeat, Wrap::Clamp, Wrap::Mirror] {
+            for (first, last) in [(-9, -7), (-3, 2), (0, 4), (3, 9), (-12, 14), (6, 30)] {
+                let mut want: Vec<usize> = (first..=last).map(|v| wrapped(v, 5, wrap)).collect();
+                let mut got = Vec::new();
+                wrapped_runs(first, last, 5, wrap, |a, b| {
+                    got.extend(a..=b);
+                    true
+                });
+                for v in [&mut want, &mut got] {
+                    v.sort_unstable();
+                    v.dedup();
+                }
+                assert_eq!(got, want, "{wrap:?} {first}..={last}");
+            }
+        }
     }
 }

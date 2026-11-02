@@ -34,7 +34,7 @@ use crate::cache::Cache;
 use crate::import::{Placed, Scene};
 use crate::instances::{self, Catalog, ModelFacts};
 use crate::key::{self, Key};
-use crate::mesh::maps::{Displacement, Opacity, Raster};
+use crate::mesh::maps::{Displacement, Opacity, Passes, Raster};
 use crate::mesh::{
     self, DisplacementSpec, DisplacementTexture, MapSpec, MeshData, MeshInput, MeshSource,
     NormalSpec, OpacitySpec, PartData, Pivots, SectionData, SectionMaps,
@@ -2179,11 +2179,21 @@ fn section_maps(
                 uv,
                 uv_set,
                 ..
-            } => Some(Opacity::Texture {
-                mip0: read(unit, false, *wrap, *uv, 1)?.remove(0),
-                cutoff: *cutoff,
-                uv_set: *uv_set,
-            }),
+            } => {
+                let mip0 = read(unit, false, *wrap, *uv, 1)?.remove(0);
+                if mip0.w > u32::from(u16::MAX) {
+                    return Err(Error::Texture {
+                        asset: unit.clone(),
+                        message: format!("opacity texture {} texels wide, over 65535", mip0.w),
+                    });
+                }
+                Some(Opacity::Texture {
+                    passes: Passes::new(&mip0, *cutoff),
+                    mip0,
+                    cutoff: *cutoff,
+                    uv_set: *uv_set,
+                })
+            }
         };
         let displacement = match &s.maps.displacement {
             None => None,
