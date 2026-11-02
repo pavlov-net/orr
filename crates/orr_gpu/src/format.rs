@@ -12,6 +12,8 @@ pub enum Format {
     Rgba8Uint,
     Bgra8Unorm,
     Bgra8Srgb,
+    /// 16-bit texels of four 4-bit channels: alpha in the top bits, then red, green, blue.
+    A4r4g4b4Unorm,
     R16Unorm,
     R16Float,
     R16Uint,
@@ -57,7 +59,7 @@ impl Format {
         use Format::*;
         match self {
             R8Unorm | R8Snorm | R8Uint => 1,
-            Rg8Unorm | Rg8Snorm | R16Unorm | R16Float | R16Uint | D16Unorm => 2,
+            Rg8Unorm | Rg8Snorm | A4r4g4b4Unorm | R16Unorm | R16Float | R16Uint | D16Unorm => 2,
             Rgba8Unorm | Rgba8Srgb | Rgba8Snorm | Rgba8Uint | Bgra8Unorm | Bgra8Srgb
             | Rg16Unorm | Rg16Float | Rg16Uint | R32Float | R32Uint | R32Sint
             | A2b10g10r10Unorm | B10g11r11Ufloat | E5b9g9r9Ufloat | D32Float | D32FloatS8Uint => 4,

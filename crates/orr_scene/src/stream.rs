@@ -41,6 +41,7 @@ use crate::edit::Mirror;
 use crate::loading::{BlobSource, Loading, Msg, decoded, landed, read_stored};
 use crate::memory::{Block, Pool, PoolSlot};
 use crate::mount::{Apply, page_infos};
+use crate::neural::NeuralLink;
 use crate::residency::{
     HOLD_FRAMES, Key, Limits, Plan, Priority, Residency, ResidencyClass, ResidencyStats, UnitDesc,
 };
@@ -250,6 +251,18 @@ struct MountStreams {
     textures: Vec<TexResidency>,
     mesh_pages: Vec<Vec<u32>>,
     mesh_streams: Vec<Arc<MeshStream>>,
+    neural: Vec<NeuralStreams>,
+}
+
+/// A texture a neural set stands in for.
+struct NeuralStreams {
+    index: u32,
+    /// The mount wrote the stream table entry for it, since it does not stream.
+    own: bool,
+    /// The index in `textures` of the set's latents when they stream.
+    latents: Option<usize>,
+    /// The latent mip of each color mip.
+    latent_mips: Vec<u32>,
 }
 
 impl MountStreams {
@@ -510,12 +523,15 @@ impl Streaming {
         }
     }
 
-    /// Adds a mount's units and points the stream table at its streamed textures.
+    /// Adds a mount's units, points the stream table at its streamed textures and at the
+    /// records of textures that a neural set stands in for and that do not stream, and
+    /// writes their neural records.
     pub(crate) fn register(
         &mut self,
         mount: MountId,
         source: Arc<BlobSource>,
         units: MountUnits,
+        neural: &[(u32, &NeuralLink)],
         w: &mut Apply<'_>,
     ) -> Result<()> {
         let mut textures: Vec<TexResidency> = Vec::with_capacity(units.textures.len());
@@ -556,6 +572,7 @@ impl Streaming {
                 cells: s.grid.cells(),
                 first_cell: t.first_cell,
                 tail_mip: s.grid.tail_mip(),
+                neural: s.neural,
             };
             w.put(s.record, &[record])?;
             w.put(self.streams.offset(u64::from(s.index.0)), &[s.record])?;
@@ -569,6 +586,35 @@ impl Streaming {
             self.fine
                 .insert((mount, init.mesh), MeshFine { init, slots });
         }
+        let mut linked = Vec::with_capacity(neural.len());
+        for &(index, n) in neural {
+            w.put(n.record, &[n.gpu])?;
+            let own = n.own.address().0 != 0;
+            if own {
+                let record = TextureStreamGpu {
+                    map: GpuPtr::NULL,
+                    feedback: GpuPtr::NULL,
+                    cells: [0; 2],
+                    first_cell: 0,
+                    tail_mip: 0,
+                    neural: n.record,
+                };
+                w.put(n.own, &[record])?;
+                w.put(self.streams.offset(u64::from(index)), &[n.own])?;
+            }
+            let latents = n.latents.as_ref().map(|l| {
+                textures
+                    .iter()
+                    .position(|t| Arc::ptr_eq(&t.stream, l))
+                    .expect("streamed latents are the mount's")
+            });
+            linked.push(NeuralStreams {
+                index,
+                own,
+                latents,
+                latent_mips: n.latent_mips.clone(),
+            });
+        }
         self.mounts.insert(
             mount,
             MountStreams {
@@ -579,6 +625,7 @@ impl Streaming {
                 textures,
                 mesh_pages: units.mesh_pages,
                 mesh_streams: units.mesh_streams,
+                neural: linked,
             },
         );
         Ok(())
@@ -643,6 +690,8 @@ impl Streaming {
             self.nulls.push(t.stream.index.0);
             self.retired_cells.push((frame, t.first_cell));
         }
+        self.nulls
+            .extend(m.neural.iter().filter(|n| n.own).map(|n| n.index));
         for id in std::mem::take(&mut self.queued) {
             let b = self.blobs[id as usize].as_mut().expect("queued blob");
             let BlobState::Queued(r) = &b.state else {
@@ -693,23 +742,33 @@ impl Streaming {
     }
 
     /// Requests every tile of mips `finest..` of `mount`'s streamed texture at heap index
-    /// `index` for the next step.
+    /// `index` for the next step, and for a texture a neural set stands in for, the tiles of
+    /// the latent mips that its color mips from `finest` on read.
     pub(crate) fn prefetch_texture(&mut self, mount: MountId, index: u32, finest: u32) {
-        let Some(t) = self
-            .mounts
-            .get(&mount)
-            .and_then(|m| m.textures.iter().find(|t| t.stream.index.0 == index))
-        else {
+        let Some(m) = self.mounts.get(&mount) else {
             return;
         };
+        let mut wanted = Vec::new();
+        if let Some(t) = m.textures.iter().position(|t| t.stream.index.0 == index) {
+            wanted.push((t, finest));
+        }
+        if let Some(n) = m.neural.iter().find(|n| n.index == index)
+            && let Some(k) = n.latents
+        {
+            let mips = &n.latent_mips;
+            wanted.push((k, mips[(finest as usize).min(mips.len() - 1)]));
+        }
         let p = Priority {
             error: 0.0,
             cell_distance: 0,
         };
-        let g = &t.stream.grid;
-        for tile in (0..g.tile_count()).filter(|&tile| g.tile(tile).mip >= finest) {
-            let unit = t.first_unit + tile;
-            self.residency.request(Key { mount, unit }, p);
+        for (t, finest) in wanted {
+            let t = &m.textures[t];
+            let g = &t.stream.grid;
+            for tile in (0..g.tile_count()).filter(|&tile| g.tile(tile).mip >= finest) {
+                let unit = t.first_unit + tile;
+                self.residency.request(Key { mount, unit }, p);
+            }
         }
     }
 

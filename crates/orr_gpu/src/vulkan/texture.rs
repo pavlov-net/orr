@@ -683,6 +683,7 @@ pub(crate) fn vk_format(f: Format) -> vk::Format {
         Rgba8Uint => V::R8G8B8A8_UINT,
         Bgra8Unorm => V::B8G8R8A8_UNORM,
         Bgra8Srgb => V::B8G8R8A8_SRGB,
+        A4r4g4b4Unorm => V::A4R4G4B4_UNORM_PACK16,
         R16Unorm => V::R16_UNORM,
         R16Float => V::R16_SFLOAT,
         R16Uint => V::R16_UINT,

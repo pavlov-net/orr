@@ -1,11 +1,13 @@
 // `texture_footprint` averaged over `taps` points of the R2 sequence per footprint, so its
-// mean stands for the filter's expected value; through `streams` when it is not null.
+// mean stands for the filter's expected value; through `streams` when it is not null, with
+// the neural sets that stand in for textures decoded.
 #include "orr/root.h"
 import orr.abi;
 import orr.random;
 import material;
 
 export static const bool TEXTURE_FEEDBACK = true;
+export static const bool NEURAL_TEXTURES = true;
 
 struct Footprint
 {
@@ -40,6 +42,8 @@ void mean(uint3 id: SV_DispatchThreadID)
     for (uint n = 0; n < root.taps; n++)
     {
         UvFootprint f = { p.uv, p.dx, p.dy, p.hardware != 0 ? float2(-1.0) : r2(n) };
+        texture_unprepare();
+        texture_prepare(root.texture, f, root.streams);
         sum += texture_footprint(root.texture, root.sampler, f, root.streams);
     }
     root.out[id.x] = sum / float(root.taps);

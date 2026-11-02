@@ -29,6 +29,7 @@ use crate::mount::{
     Apply, ClipRef, InstancePage, LoadState, MountId, MountTask, Mounts, PackSource, PageId,
     SkeletonRef, TableSizes,
 };
+use crate::neural::{NeuralTextures, Precision};
 use crate::pipelines::{PipelineId, Pipelines, ReloadReport};
 use crate::producer::{self, Job, ProducerKernels, ProducerStats, ProducerUpdate, Readback};
 use crate::ptlas::{FrameInputs, PtlasPipelines, RtStats};
@@ -202,6 +203,8 @@ pub struct RendererDesc {
     pub generated_resolve: bool,
     /// Tessellation: the longest generated edge, in pixels at the scene focus.
     pub dice_pixels: f32,
+    /// Whether textures that a pack's neural texture sets stand in for decode from the sets.
+    pub neural_textures: NeuralTextures,
 }
 
 impl Default for RendererDesc {
@@ -221,6 +224,7 @@ impl Default for RendererDesc {
             alias_view_targets: true,
             generated_resolve: true,
             dice_pixels: 2.0,
+            neural_textures: NeuralTextures::Fastest,
         }
     }
 }
@@ -380,6 +384,8 @@ pub struct Scenes {
     loading: Arc<Loading>,
     loading_thread: Option<JoinHandle<()>>,
     sampler: SamplerIndex,
+    /// The precision mounts decode neural texture sets at; none when they sample BC.
+    neural: Option<Precision>,
 }
 
 /// Puts `value` in the first free entry of `slots` and returns its index.
@@ -464,6 +470,7 @@ impl Scenes {
             loading,
             loading_thread: Some(thread),
             sampler,
+            neural: crate::neural::precision(device, desc.neural_textures),
             device: device.clone(),
             kernels: desc.kernels,
             pipelines,
@@ -549,6 +556,7 @@ impl Scenes {
             &self.loading,
             &self.device,
             self.sampler,
+            self.neural,
             cancel,
             &self.core.accel,
         );
@@ -694,7 +702,9 @@ impl Scenes {
 
     /// The cooked texture `id` of mount `m`, for consumer data that samples it. A texture the
     /// pack's materials bind streams by tile: sample it through `texture_footprint` with
-    /// [`Scenes::texture_streams`], which never reads a tile that is not resident.
+    /// [`Scenes::texture_streams`], which never reads a tile that is not resident. A texture
+    /// a neural set stands in for reads its own texels, and decodes from the set in kernels
+    /// that prepare it (`texture_prepare`).
     pub fn texture(&self, m: MountId, id: AssetId) -> Result<TextureIndex> {
         self.core.mounts.lookup(m, id, |r| &r.textures)
     }

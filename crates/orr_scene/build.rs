@@ -1,6 +1,7 @@
 //! Compiles orr_scene's Slang kernels against orr_pack's and orr_gpu's shader roots and
-//! publishes all three, with the Rust types of orr_scene's Slang structs, and writes the
-//! tessellation pattern table.
+//! publishes all three, with the Rust types of orr_scene's Slang structs, sets
+//! `cfg(orr_neural)` when the shaders decode neural textures, and writes the tessellation
+//! pattern table.
 
 use std::env;
 use std::fs;
@@ -59,8 +60,14 @@ fn main() {
             .publish_types("::orr_scene")
             .compile()
     });
+    println!("cargo::rustc-check-cfg=cfg(orr_neural)");
     match out {
-        Ok(out) => println!("cargo:shader_dirs={}", out.shader_dirs),
+        Ok(out) => {
+            println!("cargo:shader_dirs={}", out.shader_dirs);
+            if out.neural {
+                println!("cargo::rustc-cfg=orr_neural");
+            }
+        }
         Err(e) => panic!("{e}"),
     }
 }

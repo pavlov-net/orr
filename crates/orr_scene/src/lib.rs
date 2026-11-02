@@ -47,6 +47,7 @@ mod material;
 mod medium_proxy;
 pub mod memory;
 mod mount;
+mod neural;
 mod pattern;
 mod pipelines;
 mod producer;
@@ -89,6 +90,7 @@ pub use loading::Loading;
 pub use material::{BoundTexture, MaterialId, MaterialWriter, material_flags};
 pub use medium_proxy::{MediumProxy, MediumProxyId, ProxyDensity, VolumeRef};
 pub use mount::{ClipRef, InstancePage, LoadState, MountId, PackSource, PageId, SkeletonRef};
+pub use neural::NeuralTextures;
 pub use pipelines::{PipelineId, ReloadReport};
 pub use producer::{
     ClusterTopology, Opacity, OriginPolicy, ProducerDesc, ProducerId, ProducerStats, ProducerUpdate,
@@ -106,10 +108,11 @@ pub use scenes::{
 pub use shaders::types::{
     BlasJob, ClusterRef, ClusterWork, CutGpu, CutKey, DecalBinGpu, DecalGpu, EditGpu, EditGroupGpu,
     EmissiveGpu, FeedbackGpu, GBufferGpu, GeneratedClusterGpu, GroupGpu, InstanceGpu, LightGpu,
-    MaskGpu, MaterialGpu, MediumProxyGpu, MeshGpu, MeshLevel, ModelGpu, NodeItem, PartGpu,
-    PartListGpu, ProducerBatch, ProducerClusterGpu, ProducerGpu, ProducerStateGpu, RasterGpu,
-    RasterRoot, RtCutGpu, SceneRoot, SkinMeshGpu, SkinStateGpu, SkinnedGpu, SkyStats, SlotCutGpu,
-    SlotStateGpu, TessStateGpu, TextureFeedbackGpu, TextureStreamGpu, TopologyGpu, VisibleCluster,
+    MaskGpu, MaterialGpu, MediumProxyGpu, MeshGpu, MeshLevel, ModelGpu, NeuralMipGpu, NeuralSetGpu,
+    NeuralTextureGpu, NodeItem, PartGpu, PartListGpu, ProducerBatch, ProducerClusterGpu,
+    ProducerGpu, ProducerStateGpu, RasterGpu, RasterRoot, RtCutGpu, SceneRoot, SkinMeshGpu,
+    SkinStateGpu, SkinnedGpu, SkyStats, SlotCutGpu, SlotStateGpu, TessStateGpu, TextureFeedbackGpu,
+    TextureStreamGpu, TopologyGpu, VisibleCluster,
 };
 pub use skin::{SkinStats, SkinnedDesc};
 pub use stream::{BlobId, BlobTarget};

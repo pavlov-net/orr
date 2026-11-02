@@ -4,6 +4,7 @@ module material;
 
 import orr.abi;
 import orr.color;
+__exported import neural_texture;
 
 // `MaterialGpu.flags`.
 public static const uint MATERIAL_ALPHA_TESTED = 1 << 0;
@@ -58,7 +59,8 @@ public struct TextureFeedbackGpu
 
 // A streamed texture's residency. Per tile of mip 0 in each layer, `map` holds the finest
 // mip resident under it and its eight neighbors; mips from `tail_mip` on are always
-// resident.
+// resident. `map` is null for a texture that does not stream but has a record for
+// `neural`: the neural set that stands in for it.
 public struct TextureStreamGpu
 {
     public uint* map;
@@ -66,6 +68,16 @@ public struct TextureStreamGpu
     public uint2 cells;                     // mip 0 tiles per axis
     public uint first_cell;                 // of layer 0 in the feedback cells
     public uint tail_mip;
+    public NeuralTextureGpu* neural;        // null when no set stands in for the texture
+}
+
+// The channels of a neural set that stand in for a texture: `count` of them (1 to 4) from
+// `first` on.
+public struct NeuralTextureGpu
+{
+    public NeuralSetGpu* set;
+    public uint first;
+    public uint count;
 }
 
 public struct MaterialGpu
@@ -118,7 +130,7 @@ public struct MaterialGpu
     public float transmission_dispersion_scale;
     public float transmission_dispersion_abbe_number;
     public uint64_t data;                   // consumer data for the linked surface; 0 = the scene's
-    public TextureStreamGpu** texture_streams; // by heap index, null where it does not stream; orr sets it
+    public TextureStreamGpu** texture_streams; // by heap index, null where it neither streams nor has a neural set; orr sets it
     public float uv_transforms[72];         // per slot a-1 b c d e-1 f: u' = a u + b v + c, v' = d u + e v + f; 0 = identity
 }
 
@@ -127,12 +139,29 @@ public struct MaterialGpu
 // which keeps the code inlined at every tap of the large ray-tracing kernels small.
 public extern static const bool TEXTURE_FEEDBACK = false;
 
-// The streamed texture behind heap index `t` in `streams`, or null when it does not stream.
-public TextureStreamGpu* texture_stream(TextureStreamGpu** streams, TextureIndex t)
+// Whether kernels decode the neural sets that stand in for textures. A kernel that exports
+// `NEURAL_TEXTURES = true` decodes them in `texture_prepare` (or `material_prepare`), which
+// holds the decoder once; its later taps of those textures at the prepared uv read the
+// decoded values. Every other tap reads the texture's own entry, so the decoder stays out of
+// the tap sites of large kernels.
+public extern static const bool NEURAL_TEXTURES = false;
+
+// The record of heap index `t` in `streams`, or null when the texture neither streams nor has
+// a neural set standing in for it.
+TextureStreamGpu* texture_record(TextureStreamGpu** streams, TextureIndex t)
 {
     if (streams == nullptr || t.index == IMAGE_NONE)
         return nullptr;
     return streams[t.index];
+}
+
+// The streamed texture behind heap index `t` in `streams`, or null when it does not stream.
+public TextureStreamGpu* texture_stream(TextureStreamGpu** streams, TextureIndex t)
+{
+    TextureStreamGpu* s = texture_record(streams, t);
+    if (s != nullptr && s.map == nullptr)
+        return nullptr;
+    return s;
 }
 
 // The finest mip resident at `uv` of `layer` of streamed texture `s`, after reporting `lod`
@@ -213,6 +242,17 @@ int bspline_offset(float f, float u)
     return u < w0 ? -1 : u < w0 + w1 ? 0 : u < 1.0 - w3 ? 1 : 2;
 }
 
+// The share of footprint `f` on a mip 0 of `size` texels that the stochastic filter takes
+// bicubic: 1 where the footprint is under half a texel along both of its axes, falling to 0
+// at one texel.
+float bicubic_share(UvFootprint f, float2 size)
+{
+    float2 dx = f.dx * size;
+    float2 dy = f.dy * size;
+    float major = sqrt(max(dot(dx, dx), dot(dy, dy)));
+    return saturate(2.0 - 2.0 * major);
+}
+
 // The stochastic filter's texel for footprint `f` on a mip 0 of `size` texels: true, with
 // `texel_uv` at the center of the texel `f.tap` picks, where the filter takes one texel in
 // place of hardware filtering. Its expected value is the cubic B-spline filtered texture
@@ -224,10 +264,7 @@ public bool stochastic_texel(UvFootprint f, float2 size, out float2 texel_uv)
     texel_uv = f.uv;
     if (f.tap.x < 0.0)
         return false;
-    float2 dx = f.dx * size;
-    float2 dy = f.dy * size;
-    float major = sqrt(max(dot(dx, dx), dot(dy, dy)));
-    float share = saturate(2.0 - 2.0 * major);
+    float share = bicubic_share(f, size);
     if (f.tap.x >= share)
         return false;
     float2 x = f.uv * size - 0.5;
@@ -238,14 +275,141 @@ public bool stochastic_texel(UvFootprint f, float2 size, out float2 texel_uv)
     return true;
 }
 
+// The first color mip of neural set `n` whose latents are at or coarser than latent mip
+// `latent`, else its last.
+uint neural_finest_mip(NeuralSetGpu* n, uint latent)
+{
+    for (uint m = 0; m + 1 < n.mips; m++)
+    {
+        if (n.color_mips[m].latent_mip >= int(latent))
+            return m;
+    }
+    return n.mips - 1;
+}
+
+// The texture neural set `t.set` stands in for, over footprint `f`. Each texel read runs
+// the decoder: with a tap, one texel, the one `stochastic_texel` picks under magnification,
+// else one picked by the trilinear weights of the footprint's longer axis; without, the
+// bilinear weights of four texels of the nearest mip. Mips read no finer than the latents'
+// resident tiles (their record in `streams`).
+float4 neural_footprint(NeuralTextureGpu* t, UvFootprint f, TextureStreamGpu** streams)
+{
+    NeuralSetGpu* n = t.set;
+    float2 size = float2(n.size);
+    float2 dx = f.dx * size;
+    float2 dy = f.dy * size;
+    float top = float(n.mips - 1);
+    float lod = clamp(0.5 * log2(max(max(dot(dx, dx), dot(dy, dy)), 1e-16)), 0.0, top);
+    uint finest = 0;
+    TextureStreamGpu* latents = texture_stream(streams, n.latents);
+    if (latents != nullptr)
+    {
+        float want = float(n.color_mips[uint(lod)].latent_mip);
+        float resident = 0.0;
+        for (uint layer = 0; layer < n.latent_layers; layer++)
+            resident = max(resident, texture_stream_clamp(latents, f.uv, layer, want));
+        finest = neural_finest_mip(n, uint(resident));
+    }
+    // Up to four texels and their weights, decoded in one loop.
+    int2 texel;
+    uint mip;
+    float2 w = float2(0.0);
+    uint taps = 1;
+    float2 texel_uv;
+    if (f.tap.x < 0.0)
+    {
+        mip = max(uint(lod + 0.5), finest);
+        float2 x = f.uv * float2(max(n.size >> mip, uint2(1))) - 0.5;
+        float2 below = floor(x);
+        texel = int2(below);
+        w = x - below;
+        taps = 4;
+    }
+    else if (finest == 0 && stochastic_texel(f, size, texel_uv))
+    {
+        mip = 0;
+        texel = int2(floor(texel_uv * size));
+    }
+    else
+    {
+        // The tap's x past the bicubic share picks the mip by the level's fraction, then
+        // both uniforms pick the texel by the mip's bilinear weights.
+        float2 u = f.tap;
+        float share = finest == 0 ? bicubic_share(f, size) : 0.0;
+        u.x = (u.x - share) / (1.0 - share);
+        mip = uint(lod);
+        float step = lod - float(mip);
+        if (u.x < step)
+        {
+            mip = min(mip + 1, n.mips - 1);
+            u.x = u.x / step;
+        }
+        else
+        {
+            u.x = (u.x - step) / (1.0 - step);
+        }
+        mip = max(mip, finest);
+        float2 x = f.uv * float2(max(n.size >> mip, uint2(1))) - 0.5;
+        float2 below = floor(x);
+        texel = int2(below) + int2(u.x < x.x - below.x ? 1 : 0, u.y < x.y - below.y ? 1 : 0);
+    }
+    float4 v = float4(0.0);
+    for (uint k = 0; k < taps; k++)
+    {
+        int2 o = int2(k & 1, k >> 1);
+        float2 b = select(o == 1, w, 1.0 - w);
+        float weight = taps == 1 ? 1.0 : b.x * b.y;
+        v += weight * neural_texel(n, texel + o, mip, t.first, t.count);
+    }
+    return v;
+}
+
+// Texture slots this invocation decoded with `texture_prepare`: heap index, uv and value.
+static const uint PREPARED_MAX = 12;
+static uint prepared_count = 0;
+static uint prepared_index[PREPARED_MAX] = {};
+static float2 prepared_uv[PREPARED_MAX] = {};
+static float4 prepared_value[PREPARED_MAX] = {};
+
+// Forgets what `texture_prepare` decoded.
+public void texture_unprepare()
+{
+    prepared_count = 0;
+}
+
+// With `NEURAL_TEXTURES`, in builds with neural decoding: decodes `t` over `f` when a neural
+// set stands in for it (`neural_footprint`), for this invocation's later `texture_footprint`
+// taps of `t` at `f.uv`, up to PREPARED_MAX textures.
+public void texture_prepare(TextureIndex t, UvFootprint f, TextureStreamGpu** streams)
+{
+#if defined(ORR_NEURAL_BUILD)
+    TextureStreamGpu* record = texture_record(streams, t);
+    if (!NEURAL_TEXTURES || record == nullptr || record.neural == nullptr || prepared_count == PREPARED_MAX)
+        return;
+    prepared_index[prepared_count] = t.index;
+    prepared_uv[prepared_count] = f.uv;
+    prepared_value[prepared_count] = neural_footprint(record.neural, f, streams);
+    prepared_count++;
+#endif
+}
+
 // `t` read through sampler `s` over footprint `f`: one stochastic texel under
 // magnification, else the sampler's filtering. Streamed textures (`streams`, from
 // `MaterialGpu.texture_streams`; null for none) read no finer than their resident tiles and,
-// with `TEXTURE_FEEDBACK`, report the level they want.
+// with `TEXTURE_FEEDBACK`, report the level they want. A texture this invocation prepared at
+// `f.uv` (`texture_prepare`) reads its decoded value.
 public float4 texture_footprint(TextureIndex t, SamplerIndex s, UvFootprint f, TextureStreamGpu** streams)
 {
-    Texture2D<float4> texture = t.get<Texture2D<float4>>();
+    if (NEURAL_TEXTURES)
+    {
+        for (uint k = 0; k < prepared_count; k++)
+        {
+            if (prepared_index[k] == t.index && all(prepared_uv[k] == f.uv))
+                return prepared_value[k];
+        }
+    }
     TextureStreamGpu* stream = texture_stream(streams, t);
+    Texture2D<float4> texture = t.get<Texture2D<float4>>();
     float min_lod = 0.0;
     if (f.tap.x >= 0.0 || stream != nullptr)
     {
@@ -327,6 +491,23 @@ public float4 material_texture(MaterialGpu* m, uint slot, UvFootprint uv[2], flo
     float4 v = texture_footprint(t, m.sampler, material_footprint(m, slot, f), m.texture_streams);
     uint c = material_channel(m, slot);
     return c == 0 ? v : c == 1 ? float4(v.yzw, 1.0) : c == 2 ? float4(v.zw, 0.0, 1.0) : float4(v.w, 0.0, 0.0, 1.0);
+}
+
+// Prepares (`texture_prepare`) every slot of `m` that a neural set stands in for over the
+// footprint of the uv set it reads, for the taps of one surface evaluation.
+public void material_prepare(MaterialGpu* m, UvFootprint uv[2])
+{
+    texture_unprepare();
+    if (!NEURAL_TEXTURES)
+        return;
+    for (uint slot = 0; slot < 12; slot++)
+    {
+        TextureIndex t = m.textures[slot];
+        if (t.index == IMAGE_NONE)
+            continue;
+        UvFootprint f = material_uv_set(m, slot) == 1 ? uv[1] : uv[0];
+        texture_prepare(t, material_footprint(m, slot, f), m.texture_streams);
+    }
 }
 
 // Linear Rec.2020 `factor` times color slot `slot`'s texel over footprints `uv`, in linear

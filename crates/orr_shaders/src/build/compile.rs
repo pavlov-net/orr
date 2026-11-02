@@ -38,6 +38,7 @@ pub struct Build {
     fp_precise: bool,
     asserts: bool,
     omm: bool,
+    neural: bool,
     metal_check: bool,
     precompile: bool,
     allowed: BTreeSet<Lint>,
@@ -68,6 +69,9 @@ const LIBRARY_TYPES: &[(&str, &str)] = &[("AliasEntry", "::orr_shaders::AliasEnt
 /// The session option of builds with micromaps, which `orr/root.h` and `orr.trace` test.
 const OMM_OPTION: &str = "-DORR_OMM_BUILD";
 
+/// The session option of builds with neural texture decoding, which `material` tests.
+const NEURAL_OPTION: &str = "-DORR_NEURAL_BUILD";
+
 /// What [`Build::compile`] produced.
 #[derive(Debug)]
 pub struct Output {
@@ -88,6 +92,8 @@ pub struct Output {
     pub types: Option<PathBuf>,
     /// The build was with opacity micromaps ([`Build::omm`]).
     pub omm: bool,
+    /// The build decodes neural textures ([`Build::neural`]).
+    pub neural: bool,
 }
 
 impl Build {
@@ -115,6 +121,7 @@ impl Build {
             fp_precise: false,
             asserts: flag("ORR_SHADER_ASSERTS", !release && !capture),
             omm: flag("ORR_SHADER_OMM", !capture),
+            neural: flag("ORR_SHADER_NEURAL", true),
             metal_check: env::var_os("ORR_METAL_CHECK").is_some_and(|v| v == "1"),
             precompile: env::var_os("ORR_SHADER_PRECOMPILE").is_none_or(|v| v != "0"),
             allowed: BTreeSet::new(),
@@ -237,6 +244,15 @@ impl Build {
     /// `ORR_SHADER_OMM=0` or `1` overrides the default. The Metal check builds without.
     pub fn omm(mut self, on: bool) -> Self {
         self.omm = on;
+        self
+    }
+
+    /// Builds with neural texture decoding: kernels that sample materials decode neural
+    /// texture sets with cooperative vectors, so pipelines from them need a device with
+    /// cooperative vectors. On by default; `ORR_SHADER_NEURAL=0` or `1` overrides it. The
+    /// Metal check builds without.
+    pub fn neural(mut self, on: bool) -> Self {
+        self.neural = on;
         self
     }
 
@@ -621,6 +637,7 @@ impl Build {
             link_points: link_points_path,
             types: types_path,
             omm: self.omm,
+            neural: self.neural,
         })
     }
 
@@ -705,6 +722,9 @@ impl Build {
         }
         if self.omm {
             options.push(OMM_OPTION.into());
+        }
+        if self.neural {
+            options.push(NEURAL_OPTION.into());
         }
         options
     }
@@ -912,6 +932,7 @@ fn print_cargo<'a>(
             "ORR_SHADER_ASSERTS",
             "ORR_SHADER_DEBUG_INFO",
             "ORR_SHADER_OMM",
+            "ORR_SHADER_NEURAL",
             "ORR_SHADER_CAPTURE",
         ] {
             println!("cargo:rerun-if-env-changed={var}");
