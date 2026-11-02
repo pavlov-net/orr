@@ -2,8 +2,8 @@
 //! Markdown table of nanoseconds per call: prepare, eval, sample, and eval plus sample, for
 //! each harness material and for all of them mixed across neighboring threads.
 //!
-//! `openpbr-bench [--validation]`. Timings are GPU timestamps around each dispatch, the
-//! median of five after one warm-up; run without the validation layer for numbers.
+//! Timings are GPU timestamps around each dispatch, the median of five after one warm-up; run
+//! without the validation layer for numbers.
 
 use std::time::Duration;
 
@@ -22,10 +22,8 @@ const RUNS: usize = 5;
 
 fn main() {
     openpbr_ref::log_to_stderr();
-    let validation = std::env::args().any(|a| a == "--validation");
     let device = Device::new(&DeviceDesc {
         name: "openpbr-bench",
-        validation,
         ..DeviceDesc::default()
     })
     .expect("Vulkan device");
@@ -108,13 +106,11 @@ fn main() {
         );
         print!("{out}");
     }
-    if validation {
-        assert_eq!(
-            device.validation_messages(),
-            0,
-            "validation messages (see the log)"
-        );
-    }
+    assert_eq!(
+        device.validation_messages(),
+        0,
+        "validation messages (see the log)"
+    );
 }
 
 /// The median GPU time of `RUNS` dispatches after one warm-up.
