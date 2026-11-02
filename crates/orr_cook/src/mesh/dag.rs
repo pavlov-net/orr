@@ -13,12 +13,12 @@
 //! clusters of all its parts at rest pose, its errors raised by the merge error. A copy
 //! draws one stage or the other as a whole, so the stages need no crack-free join.
 //!
-//! `clodBuild` runs through the FFI: with border dilation it moves positions in place, so
-//! the output callback copies each cluster's positions as emitted and snaps them to the
-//! mesh grid.
+//! Each DAG is `clodBuild` as ported in [`super::clod`], one level's groups in parallel.
+//! Border dilation moves positions in place, so each group's clusters take their positions
+//! as the group is emitted and snap them to the mesh grid.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::os::raw::{c_int, c_void};
+use std::os::raw::c_int;
 
 use meshopt::ffi;
 use orr_pack::mesh::{
@@ -320,17 +320,7 @@ struct Options {
     regularize: bool,
 }
 
-struct Output<'a> {
-    groups: Vec<DagGroup>,
-    welded: &'a [u32],
-    sections: &'a [u8],
-    positions: *const f32,
-    snap: &'a Snap,
-    local_vertices: Vec<u32>,
-    local_triangles: Vec<u8>,
-}
-
-/// Groups as `clodBuild` emits them, in emission order.
+/// The DAG groups of one stage, in emission order.
 fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
     let mut positions: Vec<f32> = input
         .cells
@@ -352,36 +342,16 @@ fn build(input: &Input, w: &Welded, snap: &Snap, o: Options) -> Vec<DagGroup> {
     config.simplify_dilate_borders = o.dilate;
     config.simplify_regularize = o.regularize;
     config.optimize_clusters = false;
-    let positions_ptr = positions.as_mut_ptr();
-    let mesh = ffi::clodMesh {
-        indices: input.indices.as_ptr(),
-        index_count: input.indices.len(),
-        vertex_count: input.cells.len(),
-        vertex_positions: positions_ptr,
-        vertex_positions_stride: 12,
-        vertex_attributes: normals.as_ptr(),
-        vertex_attributes_stride: 12,
-        vertex_lock: input.lock.as_ptr(),
-        attribute_weights: weights.as_ptr(),
-        attribute_count: weights.len(),
-        attribute_protect_mask: 0,
-    };
     let max_indices = usize::from(o.limits.max_triangles) * 3;
-    let mut out = Output {
-        groups: Vec::new(),
-        welded: &input.welded,
-        sections: &input.sections,
-        positions: positions_ptr,
-        snap,
-        local_vertices: vec![0; max_indices],
-        local_triangles: vec![0; max_indices],
+    let mesh = super::clod::Mesh {
+        indices: &input.indices,
+        attributes: &normals,
+        weights: &weights,
+        lock: &input.lock,
     };
-    // SAFETY: every pointer in `mesh` refers to a live buffer of `vertex_count` vertices or
-    // `index_count` indices that outlives the call; `vertex_positions` comes from a mutable
-    // buffer, which border dilation writes through, and `emit` reads it only through the
-    // same pointer. `emit` matches `clodOutput` and receives `out` as its context.
-    unsafe { ffi::clodBuild(config, mesh, (&raw mut out).cast(), Some(emit)) };
-    out.groups
+    super::clod::build(&config, mesh, &mut positions, |e| {
+        group_of(&e, &input.welded, &input.sections, snap, max_indices)
+    })
 }
 
 /// The partition target whose largest partitions (a third over the target) hold at most
@@ -394,35 +364,34 @@ fn partition_size(group_max: usize) -> usize {
     p
 }
 
-unsafe extern "C" fn emit(
-    ctx: *mut c_void,
-    group: ffi::clodGroup,
-    clusters: *const ffi::clodCluster,
-    count: usize,
-) -> c_int {
-    // SAFETY: `ctx` is the `Output` `build` passed, alive for the whole call.
-    let o = unsafe { &mut *ctx.cast::<Output<'_>>() };
-    // SAFETY: `clusters` points at `count` clusters for this call.
-    let clusters = unsafe { std::slice::from_raw_parts(clusters, count) };
-    let index = o.groups.len();
-    let mut out = Vec::with_capacity(count);
-    for c in clusters {
-        assert!(
-            c.index_count <= o.local_vertices.len(),
-            "cluster over its limits"
-        );
-        // SAFETY: `indices` holds `index_count` entries; the local buffers hold that many.
+/// A group as the DAG keeps it: each cluster cut by section, its vertices as welded
+/// vertices at grid positions snapped from `positions`.
+fn group_of(
+    e: &super::clod::Emitted<'_>,
+    welded: &[u32],
+    sections: &[u8],
+    snap: &Snap,
+    max_indices: usize,
+) -> DagGroup {
+    let positions = e.positions;
+    let mut local_vertices = vec![0u32; max_indices];
+    let mut local_triangles = vec![0u8; max_indices];
+    let mut out = Vec::new();
+    for k in e.clusters {
+        let (refined, indices) = (k.refined, k.corners(e.indices));
+        assert!(indices.len() <= max_indices, "cluster over its limits");
+        // SAFETY: the local buffers hold `indices.len()` entries.
         let n = unsafe {
-            ffi::clodLocalIndices(
-                o.local_vertices.as_mut_ptr(),
-                o.local_triangles.as_mut_ptr(),
-                c.indices,
-                c.index_count,
+            ffi::meshopt_extractMeshletIndices(
+                local_vertices.as_mut_ptr(),
+                local_triangles.as_mut_ptr(),
+                indices.as_ptr(),
+                indices.len(),
             )
         };
-        let local = &o.local_vertices[..n];
-        let tris = &o.local_triangles[..c.index_count];
-        let section_of = |t: &[u8]| o.sections[local[usize::from(t[0])] as usize];
+        let local = &local_vertices[..n];
+        let tris = &local_triangles[..indices.len()];
+        let section_of = |t: &[u8]| sections[local[usize::from(t[0])] as usize];
         // One cluster per section: a triangle's corners all lie in one section.
         let mut pieces: Vec<(u8, Vec<u32>, Vec<u8>)> = Vec::new();
         if tris
@@ -459,27 +428,22 @@ unsafe extern "C" fn emit(
             let cells = used
                 .iter()
                 .map(|&v| {
-                    // SAFETY: `v` is below `vertex_count`, and positions hold 3 floats per
-                    // vertex.
-                    let p = unsafe {
-                        let p = o.positions.add(v as usize * 3);
-                        [*p, *p.add(1), *p.add(2)]
-                    };
-                    o.snap.cell(p)
+                    let p = &positions[v as usize * 3..v as usize * 3 + 3];
+                    snap.cell([p[0], p[1], p[2]])
                 })
                 .collect();
             out.push(DagCluster {
-                verts: used.iter().map(|&v| o.welded[v as usize]).collect(),
+                verts: used.iter().map(|&v| welded[v as usize]).collect(),
                 cells,
                 tris,
-                refined: c.refined,
+                refined,
                 section,
             });
         }
     }
-    let b = group.simplified;
-    o.groups.push(DagGroup {
-        depth: group.depth as u32,
+    let b = e.bounds;
+    DagGroup {
+        depth: e.depth,
         sphere: Sphere {
             center: b.center,
             radius: b.radius,
@@ -490,8 +454,7 @@ unsafe extern "C" fn emit(
             b.error
         },
         clusters: out,
-    });
-    index as c_int
+    }
 }
 
 /// Hierarchy nodes of one stage over its groups, by stage group index, and the root: a
