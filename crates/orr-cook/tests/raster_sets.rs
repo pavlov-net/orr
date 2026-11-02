@@ -176,7 +176,6 @@ fn external_pyramid_cooks_exactly() {
         reduction,
         srgb: false,
         compress: None,
-        quality: Default::default(),
     };
     let imported_path = work.join("imported.orr");
     let report = cook(

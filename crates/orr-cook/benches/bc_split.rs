@@ -13,7 +13,10 @@ use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, ArchiveWriter, BcLayout, BlobIn, Class, Filter, Hash32, Target};
 use rayon::prelude::*;
 
-const ZSTD_LEVEL: i32 = orr_cook::ZSTD_LEVEL_DEFAULT;
+/// The zstd level of a cook at the default quality.
+fn zstd_level() -> i32 {
+    orr_cook::zstd_level(orr_cook::Quality::Fast)
+}
 
 fn files(dir: &Path, out: &mut Vec<PathBuf>) {
     for e in std::fs::read_dir(dir).unwrap() {
@@ -32,7 +35,7 @@ type Texture = Vec<(Vec<u8>, bool, u32)>;
 /// The textures stored with `filter` (blob 0 never takes it), and their stored payload bytes.
 fn store(textures: &[Texture], filter: Filter) -> (Archive, u64) {
     let mut w = ArchiveWriter::create(Target::Memory).unwrap();
-    w.set_zstd_level(ZSTD_LEVEL);
+    w.set_zstd_level(zstd_level());
     let mut stored = 0;
     for (i, t) in textures.iter().enumerate() {
         let encoded: Vec<_> = t
@@ -45,7 +48,7 @@ fn store(textures: &[Texture], filter: Filter) -> (Archive, u64) {
                     chunk_len: *chunk_len,
                     ..BlobIn::new(bytes)
                 }
-                .encode(ZSTD_LEVEL, None)
+                .encode(zstd_level(), None)
                 .unwrap()
             })
             .collect();

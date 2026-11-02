@@ -14,8 +14,9 @@ use orr_pack::texture::{
 use orr_pack::{ArchiveWriter, AssetId, BcLayout, BlobIn, Class, Filter, Hash32, Span};
 use serde::Deserialize;
 
+use ctt::Quality;
 pub(crate) use encode::{Encoding, encode as encode_chains};
-pub(crate) use load::{Source, decode_blocks};
+pub(crate) use load::{Blocks, Source, decode_blocks, decode_channel};
 pub(crate) use mips::{MipSpec, Toksvig};
 
 use crate::{Error, Result};
@@ -25,11 +26,11 @@ use crate::{Error, Result};
 #[serde(default, deny_unknown_fields)]
 pub struct TextureSettings {
     pub usage: Usage,
-    /// Alpha-tested coverage cutoff. With it, every mip's alpha is scaled so the fraction of
-    /// the texture at or above the cutoff matches mip 0. Applies to the alpha of
-    /// [`Usage::ColorAlpha`] and [`Usage::Linear4`] and to the value of [`Usage::Linear1`].
+    /// Alpha-tested coverage cutoff. With it, every mip the cook makes has its alpha scaled
+    /// so the fraction of the texture at or above the cutoff matches mip 0; mips kept from
+    /// the source stay as they are. Applies to the alpha of [`Usage::ColorAlpha`] and
+    /// [`Usage::Linear4`] and to the value of [`Usage::Linear1`].
     pub alpha_cutoff: Option<f32>,
-    pub quality: Quality,
     /// Largest mip 0 edge; larger mips are dropped. For [`Usage::Environment`] the map edge,
     /// rounded down to a power of two (1024 when unset).
     pub max_size: Option<u32>,
@@ -53,7 +54,6 @@ impl Default for TextureSettings {
         Self {
             usage: Usage::Color,
             alpha_cutoff: None,
-            quality: Quality::Release,
             max_size: None,
             atlas_grid: None,
             primaries: None,
@@ -114,17 +114,6 @@ pub enum DataFormat {
     R32f,
     Rg32f,
     Rgba32f,
-}
-
-/// Encoder effort.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Quality {
-    /// For development cooks.
-    Fast,
-    /// For release cooks.
-    #[default]
-    Release,
 }
 
 /// Colour primaries.
@@ -335,7 +324,11 @@ pub(crate) fn chains(layers: Vec<Img>, plan: &Plan, first: usize) -> Result<Vec<
 
 /// Mip chains, encoding and layout for `layers` (mip 0 each, values linear).
 pub(crate) fn build(layers: Vec<Img>, plan: &Plan) -> Result<Built, String> {
-    let mut chains = chains(layers, plan, 0)?;
+    finish(chains(layers, plan, 0)?, plan)
+}
+
+/// Encoding and layout for the mip chains of `layers` (values linear, normals unit).
+pub(crate) fn finish(mut chains: Vec<Vec<Img>>, plan: &Plan) -> Result<Built, String> {
     if plan.mips.normal {
         for p in chains.iter_mut().flatten().flat_map(|m| &mut m.px) {
             p[0] = normal::encode(p[0]);
@@ -447,9 +440,14 @@ pub(crate) fn add(w: &mut ArchiveWriter, name: &str, key: Hash32, t: &Built) -> 
 }
 
 /// Cooks `Source::Texture`: one texture entry from one image file.
-pub(crate) fn cook_file(asset: &str, bytes: &[u8], s: &TextureSettings) -> Result<Built> {
+pub(crate) fn cook_file(
+    asset: &str,
+    bytes: &[u8],
+    s: &TextureSettings,
+    quality: Quality,
+) -> Result<Built> {
     load::open(bytes)
-        .and_then(|src| cook_source(src, s))
+        .and_then(|src| cook_source(src, s, quality))
         .map(|b| b.with_split(s.bc_split))
         .map_err(|message| Error::Texture {
             asset: asset.into(),
@@ -457,10 +455,13 @@ pub(crate) fn cook_file(asset: &str, bytes: &[u8], s: &TextureSettings) -> Resul
         })
 }
 
-/// The encoders, for cook keys; their crate versions enter through [`crate::key`].
-pub(crate) const ENCODERS: &str = "bc7e for BC7, intel for BC4 BC5 BC6H";
+/// The encoders and their preset, for cook keys; their crate versions enter through
+/// [`crate::key`].
+pub(crate) fn encoders(quality: Quality) -> String {
+    format!("bc7e for BC7, intel for BC4 BC5 BC6H, preset {quality:?}")
+}
 
-fn cook_source(mut src: Source, s: &TextureSettings) -> Result<Built, String> {
+fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result<Built, String> {
     let primaries = s.primaries.or(src.primaries).unwrap_or(Primaries::Rec709);
     if let Usage::Environment {
         light_threshold,
@@ -468,37 +469,9 @@ fn cook_source(mut src: Source, s: &TextureSettings) -> Result<Built, String> {
     } = s.usage
     {
         load::decode_layers(&mut src)?;
-        return env::cook(src, s, primaries, light_threshold, max_lights);
+        return env::cook(src, s, primaries, light_threshold, max_lights, quality);
     }
     let encoding = Encoding::of(s.usage);
-    if let Some(b) = &src.blocks
-        && b.vk_format == encoding.vk_format()
-        && b.complete()
-        && s.atlas_grid.is_none()
-        && s.alpha_cutoff.is_none()
-    {
-        // Every mip as stored, without those over the size limit.
-        let mut size = [b.w, b.h];
-        let levels: Vec<Vec<Vec<u8>>> = b
-            .levels
-            .iter()
-            .map(|l| {
-                let kept = kept_mips(l.clone(), b.w, b.h, s.max_size);
-                size = kept.0;
-                kept.1
-            })
-            .collect();
-        return Ok(layout(
-            b.vk_format,
-            size,
-            src.cube,
-            primaries,
-            f32::NAN,
-            Vec::new(),
-            &levels,
-        ));
-    }
-    load::decode_layers(&mut src)?;
     let coverage = match (s.alpha_cutoff, s.usage) {
         (None, _) => None,
         (Some(c), Usage::ColorAlpha | Usage::Linear4) => Some((3, c)),
@@ -510,23 +483,17 @@ fn cook_source(mut src: Source, s: &TextureSettings) -> Result<Built, String> {
         Usage::Color | Usage::ColorAlpha | Usage::Hdr | Usage::Data(DataFormat::Rgba8Srgb)
     );
     let normal = s.usage == Usage::Normal;
-    let layers = src
-        .layers
-        .into_iter()
-        .map(|mut l| {
-            for p in &mut l.px {
-                if colour && src.srgb {
-                    for c in &mut p[..3] {
-                        *c = srgb_to_linear(*c);
-                    }
-                }
-                if normal {
-                    *p = [p[0] * 2.0 - 1.0, p[1] * 2.0 - 1.0, p[2] * 2.0 - 1.0, 1.0];
-                }
+    let srgb = src.srgb;
+    let linear = |p: &mut [f32; 4]| {
+        if colour && srgb {
+            for c in &mut p[..3] {
+                *c = srgb_to_linear(*c);
             }
-            l
-        })
-        .collect();
+        }
+        if normal {
+            *p = [p[0] * 2.0 - 1.0, p[1] * 2.0 - 1.0, p[2] * 2.0 - 1.0, 1.0];
+        }
+    };
     let plan = Plan {
         encoding,
         cube: src.cube,
@@ -538,10 +505,78 @@ fn cook_source(mut src: Source, s: &TextureSettings) -> Result<Built, String> {
             normal,
             coverage,
         },
-        quality: s.quality,
+        quality,
         max_size: s.max_size,
         toksvig: None,
         lights: Vec::new(),
     };
+    // A source with every mip in a block format keeps its mips, unless they are remade.
+    let remakes = crate::quality::remakes_mips(quality);
+    if let Some(b) = src
+        .blocks
+        .as_ref()
+        .filter(|b| b.complete() && s.atlas_grid.is_none())
+    {
+        if b.vk_format == encoding.vk_format() && (coverage.is_none() || !remakes) {
+            let (w, h) = (b.w, b.h);
+            let size = mip_size(w, h, skipped_mips(w, h, s.max_size));
+            let levels: Vec<Vec<Vec<u8>>> = src
+                .blocks
+                .take()
+                .expect("blocks")
+                .levels
+                .into_iter()
+                .map(|l| kept_mips(l, w, h, s.max_size).1)
+                .collect();
+            return Ok(layout(
+                encoding.vk_format(),
+                size,
+                src.cube,
+                primaries,
+                coverage.map_or(f32::NAN, |c| c.1),
+                Vec::new(),
+                &levels,
+            ));
+        }
+        if !remakes {
+            let chains = source_chains(b, s.max_size, |mut p| {
+                linear(&mut p);
+                if normal { mips::normalized(p) } else { p }
+            })?;
+            return finish(chains, &plan);
+        }
+    }
+    load::decode_layers(&mut src)?;
+    let layers = src
+        .layers
+        .into_iter()
+        .map(|mut l| {
+            l.px.iter_mut().for_each(linear);
+            l
+        })
+        .collect();
     build(layers, &plan)
+}
+
+/// Every layer's mips of `b` as stored, without those over `max_size`, decoded and passed
+/// texel by texel through `f`.
+fn source_chains(
+    b: &Blocks,
+    max_size: Option<u32>,
+    f: impl Fn([f32; 4]) -> [f32; 4] + Sync,
+) -> Result<Vec<Vec<Img>>, String> {
+    let skip = skipped_mips(b.w, b.h, max_size) as usize;
+    b.levels
+        .iter()
+        .map(|l| {
+            l.iter()
+                .enumerate()
+                .skip(skip)
+                .map(|(m, bytes)| {
+                    let [w, h] = mip_size(b.w, b.h, m as u32);
+                    load::decode_blocks_with(b.vk_format, w, h, bytes, &f)
+                })
+                .collect()
+        })
+        .collect()
 }

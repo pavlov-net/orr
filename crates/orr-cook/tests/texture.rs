@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use orr_color::RgbPrimaries;
 use orr_cook::{
-    ArchiveSpec, AssetSpec, GltfSettings, InputChannels, Manifest, Primaries, Quality, Source,
-    TextureOverride, TextureRules, TextureSettings, Usage,
+    ArchiveSpec, AssetSpec, CookOptions, GltfSettings, InputChannels, Manifest, Primaries, Quality,
+    Source, TextureOverride, TextureRules, TextureSettings, Usage,
 };
 use orr_pack::material::{Material, slot};
 use orr_pack::model::ModelInfo;
@@ -21,6 +21,10 @@ fn dir(name: &str) -> PathBuf {
 }
 
 fn cook(assets: Vec<AssetSpec>) -> Archive {
+    cook_at(assets, CookOptions::default().quality)
+}
+
+fn cook_at(assets: Vec<AssetSpec>, quality: Quality) -> Archive {
     let cooked = orr_cook::cook(
         &Manifest {
             archives: vec![ArchiveSpec {
@@ -30,7 +34,10 @@ fn cook(assets: Vec<AssetSpec>) -> Archive {
                 assets,
             }],
         },
-        &Default::default(),
+        &CookOptions {
+            quality,
+            ..Default::default()
+        },
     )
     .unwrap();
     Archive::from_memory(std::sync::Arc::clone(&cooked.memory[0])).unwrap()
@@ -170,14 +177,7 @@ fn bc7_mip0_keeps_the_source() {
     };
     let path = d.join("colour.png");
     write_png(&path, w, h, px);
-    let a = cook(vec![texture(
-        &path,
-        "colour",
-        TextureSettings {
-            quality: Quality::Fast,
-            ..TextureSettings::default()
-        },
-    )]);
+    let a = cook(vec![texture(&path, "colour", TextureSettings::default())]);
     let (info, levels) = mips(&a, "colour");
     let hd = info.header;
     assert_eq!(
@@ -222,7 +222,6 @@ fn bc_split_keeps_the_blocks() {
                 .map(|(i, bc_split)| {
                     let settings = TextureSettings {
                         usage,
-                        quality: Quality::Fast,
                         bc_split,
                         ..TextureSettings::default()
                     };
@@ -300,7 +299,7 @@ fn bc6h_cube_from_ktx2_round_trips() {
                 encoder: ctt::encoders::Encoder::Intel(Default::default()),
             }),
             container: ctt::Container::ktx2(),
-            quality: ctt::Quality::Fast,
+            quality: Quality::Fast,
             mipmap: true,
             ..Default::default()
         },
@@ -452,7 +451,6 @@ fn environment_map_resamples_back_to_the_source() {
                 light_threshold: None,
                 max_lights: 4,
             },
-            quality: Quality::Fast,
             ..TextureSettings::default()
         },
     )]);
@@ -530,7 +528,6 @@ fn environment_lights_keep_energy_and_direction() {
                 max_lights: 4,
             },
             max_size: Some(n),
-            quality: Quality::Fast,
             ..TextureSettings::default()
         },
     )]);
@@ -701,24 +698,35 @@ fn chain_bytes(format: u32, w: u32, h: u32) -> u64 {
         .sum()
 }
 
-/// A KTX2 of `w` x `h` RGBA8 texels in `format` with every mip, and its mips as blocks.
+/// A KTX2 of `w` x `h` RGBA8 texels `f(mip, x, y)` in `format` with every mip, and its mips
+/// as blocks.
 fn ktx2(
     w: u32,
     h: u32,
     format: ctt::Format,
-    f: impl Fn(u32, u32) -> [u8; 4],
+    f: impl Fn(u32, u32, u32) -> [u8; 4],
 ) -> (Vec<u8>, Vec<Vec<u8>>) {
-    let texels: Vec<u8> = (0..w * h).flat_map(|i| f(i % w, i / w)).collect();
+    let mips: Vec<([u32; 2], Vec<u8>)> = (0..orr_pack::texture::full_mip_count(w, h))
+        .map(|m| {
+            let [mw, mh] = orr_pack::texture::mip_size(w, h, m);
+            let texels = (0..mw * mh).flat_map(|i| f(m, i % mw, i / mw)).collect();
+            ([mw, mh], texels)
+        })
+        .collect();
     let srgb = format == ctt::Format::BC7_SRGB_BLOCK;
     let image = ctt::ImageRef {
-        surfaces: vec![vec![ctt::SurfaceRef {
-            data: &texels,
-            width: w,
-            height: h,
-            depth: 1,
-            stride: w * 4,
-            slice_stride: 0,
-        }]],
+        surfaces: vec![
+            mips.iter()
+                .map(|([mw, mh], texels)| ctt::SurfaceRef {
+                    data: texels,
+                    width: *mw,
+                    height: *mh,
+                    depth: 1,
+                    stride: mw * 4,
+                    slice_stride: 0,
+                })
+                .collect(),
+        ],
         kind: ctt::TextureKind::Texture2D,
         desc: ctt::FormatDesc {
             format: if srgb {
@@ -744,8 +752,8 @@ fn ktx2(
         ctt::ConvertSettings {
             format: Some(ctt::TargetFormat::Compressed { format, encoder }),
             container: ctt::Container::ktx2(),
-            quality: ctt::Quality::Fast,
-            mipmap: true,
+            quality: Quality::Fast,
+            mipmap: false,
             ..Default::default()
         },
     )
@@ -760,29 +768,33 @@ fn ktx2(
 }
 
 /// BCn images that already hold what the material wants keep their blocks: every mip, or
-/// mip 0 where the cook makes the other mips (Toksvig roughness). An opaque material's base
-/// color keeps its alpha, which nothing reads as opacity. Two-channel images hold
-/// roughness and metalness in red and green, and overrides name other channels.
+/// at qualities that remake mips, mip 0 where the cook makes the other mips (Toksvig
+/// roughness). Below those, a texture made from other channels of BCn images encodes the
+/// images' own mips. An opaque material's base color keeps its alpha, which nothing reads
+/// as opacity. Two-channel images hold roughness and metalness in red and green, and
+/// overrides name other channels.
 #[test]
 fn bcn_material_textures_keep_their_blocks() {
     let d = dir("bcn-pass");
     let n = 64;
     let wave =
         |x: u32, y: u32, k: u32| (128.0 + 100.0 * ((x * k + y * 3) as f32 * 0.21).sin()) as u8;
-    let (color, color_blocks) = ktx2(n, n, ctt::Format::BC7_SRGB_BLOCK, |x, y| {
-        [wave(x, y, 1), wave(x, y, 2), wave(x, y, 3), wave(y, x, 4)]
+    // Alpha below mip 0 is not what filtering mip 0 gives.
+    let (color, color_blocks) = ktx2(n, n, ctt::Format::BC7_SRGB_BLOCK, |m, x, y| {
+        let a = if m == 0 { (2 * (x + y)) as u8 } else { 200 };
+        [wave(x, y, 1), wave(x, y, 2), wave(x, y, 3), a]
     });
-    let (normal, normal_blocks) = ktx2(n, n, ctt::Format::BC5_UNORM_BLOCK, |x, y| {
+    let (normal, normal_blocks) = ktx2(n, n, ctt::Format::BC5_UNORM_BLOCK, |_, x, y| {
         [wave(x, y, 5), wave(y, x, 4), 255, 255]
     });
-    let (rm, rm_blocks) = ktx2(n, n, ctt::Format::BC5_UNORM_BLOCK, |x, y| {
+    let (rm, rm_blocks) = ktx2(n, n, ctt::Format::BC5_UNORM_BLOCK, |_, x, y| {
         [wave(x, y, 2), wave(y, x, 7), 0, 255]
     });
-    let (specular, specular_blocks) = ktx2(n, n, ctt::Format::BC4_UNORM_BLOCK, |x, y| {
+    let (specular, specular_blocks) = ktx2(n, n, ctt::Format::BC4_UNORM_BLOCK, |_, x, y| {
         [wave(x, y, 6), 0, 0, 255]
     });
     // Constant metalness: roughness alone, a BC4 taken from the red half of the BC5.
-    let (rough, rough_blocks) = ktx2(n, n, ctt::Format::BC5_UNORM_BLOCK, |x, y| {
+    let (rough, rough_blocks) = ktx2(n, n, ctt::Format::BC5_UNORM_BLOCK, |_, x, y| {
         [wave(x, y, 3), 0, 0, 255]
     });
     let path = d.join("bcn.glb");
@@ -798,6 +810,7 @@ fn bcn_material_textures_keep_their_blocks() {
             r#"{"pbrMetallicRoughness":{"metallicRoughnessTexture":{"index":4}},
                 "normalTexture":{"index":1}}"#
                 .into(),
+            r#"{"pbrMetallicRoughness":{"baseColorTexture":{"index":0}},"alphaMode":"MASK"}"#.into(),
         ],
         &[color, normal, rm, specular, rough],
     );
@@ -812,35 +825,63 @@ fn bcn_material_textures_keep_their_blocks() {
             ..TextureOverride::default()
         },
     )];
-    let a = cook(vec![AssetSpec {
-        name: "g".into(),
-        source: Source::Gltf {
-            path,
-            settings: GltfSettings {
-                textures: TextureRules {
-                    overrides,
-                    ..TextureRules::default()
+    for quality in [Quality::Fast, Quality::Slow] {
+        let remade = quality == Quality::Slow;
+        let a = cook_at(
+            vec![AssetSpec {
+                name: "g".into(),
+                source: Source::Gltf {
+                    path: path.clone(),
+                    settings: GltfSettings {
+                        textures: TextureRules {
+                            overrides: overrides.clone(),
+                            ..TextureRules::default()
+                        },
+                        ..GltfSettings::default()
+                    },
                 },
-                ..GltfSettings::default()
-            },
-        },
-    }]);
+            }],
+            quality,
+        );
+        bcn_material_checks(
+            &a,
+            remade,
+            [
+                &color_blocks,
+                &normal_blocks,
+                &rm_blocks,
+                &specular_blocks,
+                &rough_blocks,
+            ],
+        );
+    }
+}
+
+fn bcn_material_checks(a: &Archive, remade: bool, blocks: [&Vec<Vec<u8>>; 5]) {
+    let [
+        color_blocks,
+        normal_blocks,
+        rm_blocks,
+        specular_blocks,
+        rough_blocks,
+    ] = blocks;
+    let n = 64;
     let material = |i: usize| {
         let e = a
             .find(AssetId::from_name(&format!("g/material/{i}")))
             .unwrap();
-        Material::from_bytes(&read_blob(&a, e, 0)).unwrap()
+        Material::from_bytes(&read_blob(a, e, 0)).unwrap()
     };
     let (m0, m1) = (material(0), material(1));
     let name = |t: AssetId| a.name(a.find(t).unwrap()).to_string();
     let all = |t: AssetId, want: &[Vec<u8>]| {
-        let (info, levels) = mips(&a, &name(t));
+        let (info, levels) = mips(a, &name(t));
         assert_eq!(info.header.mip_count as usize, want.len());
         assert_eq!(levels[0], want, "{}", name(t));
     };
-    all(m0.textures[slot::BASE_COLOR].texture, &color_blocks);
-    all(m0.textures[slot::NORMAL].texture, &normal_blocks);
-    all(m1.textures[slot::SPECULAR_WEIGHT].texture, &specular_blocks);
+    all(m0.textures[slot::BASE_COLOR].texture, color_blocks);
+    all(m0.textures[slot::NORMAL].texture, normal_blocks);
+    all(m1.textures[slot::SPECULAR_WEIGHT].texture, specular_blocks);
     assert_eq!(m1.textures[slot::SPECULAR_WEIGHT].channels, 0);
     // Without a normal map every mip passes; with one, mip 0 does.
     let rough = |m: &Material| {
@@ -848,21 +889,25 @@ fn bcn_material_textures_keep_their_blocks() {
         assert_eq!(b.0.texture, b.1.texture);
         (
             (b.0.channels, b.1.channels),
-            mips(&a, &name(b.0.texture)).1.remove(0),
+            mips(a, &name(b.0.texture)).1.remove(0),
         )
     };
     let (channels, levels) = rough(&m1);
     assert_eq!((channels, levels), ((0, 1), rm_blocks.clone()));
     let (channels, levels) = rough(&m0);
     assert_eq!(channels, (0, 1));
-    assert_eq!(levels[0], rm_blocks[0]);
-    assert_ne!(
-        levels[1], rm_blocks[1],
-        "Toksvig raises roughness below mip 0"
-    );
+    if remade {
+        assert_eq!(levels[0], rm_blocks[0]);
+        assert_ne!(
+            levels[1], rm_blocks[1],
+            "Toksvig raises roughness below mip 0"
+        );
+    } else {
+        assert_eq!(levels, *rm_blocks);
+    }
     let m2 = material(2);
     assert_eq!(m2.textures[slot::METALNESS].texture, AssetId::NONE);
-    let (info, levels) = mips(&a, &name(m2.textures[slot::ROUGHNESS].texture));
+    let (info, levels) = mips(a, &name(m2.textures[slot::ROUGHNESS].texture));
     assert_eq!(info.header.vk_format, vk::BC4_UNORM);
     assert_eq!(levels[0].len(), rough_blocks.len());
     let red: Vec<u8> = rough_blocks[0]
@@ -871,6 +916,17 @@ fn bcn_material_textures_keep_their_blocks() {
         .copied()
         .collect();
     assert_eq!(levels[0][0], red);
+    // Opacity from the base color's alpha: the source's own alpha mips unless remade.
+    let m3 = material(3);
+    let (info, levels) = mips(a, &name(m3.textures[slot::OPACITY].texture));
+    assert_eq!(info.header.vk_format, vk::BC4_UNORM);
+    assert_eq!(info.header.alpha_cutoff, 0.5);
+    let s = n / 2;
+    let err = decode(vk::BC4_UNORM, s, s, &levels[0][1])
+        .iter()
+        .map(|t| (t[0] - 200.0 / 255.0).abs())
+        .fold(0.0, f32::max);
+    assert_eq!(err < 0.05, !remade, "{err}");
 }
 
 #[test]
@@ -919,13 +975,7 @@ fn gltf_materials_cook_their_canonical_channel_set() {
         name: "quad".into(),
         source: Source::Gltf {
             path: path.clone(),
-            settings: GltfSettings {
-                textures: TextureRules {
-                    quality: Quality::Fast,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
+            settings: GltfSettings::default(),
         },
     }]);
     let model = a.find(AssetId::from_name("quad")).unwrap();
@@ -1019,7 +1069,6 @@ fn a_constant_color_folds_into_its_factor_in_the_image_primaries() {
             path,
             settings: GltfSettings {
                 textures: TextureRules {
-                    quality: Quality::Fast,
                     overrides: vec![(
                         "image 0".into(),
                         TextureOverride {

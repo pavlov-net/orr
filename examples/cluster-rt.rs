@@ -26,8 +26,8 @@ use orr::{
     SceneLightingSettings, TextureFilter, TransformGroupDesc, ViewDesc, ViewTarget,
 };
 use orr_cook::{
-    ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSettings, Quality, Source,
-    TextureSettings, Usage,
+    ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSettings, Source, TextureSettings,
+    Usage,
 };
 use orr_math::camera::rh::view;
 use orr_math::{DVec3, UVec2, Vec2, Vec3};
@@ -401,7 +401,6 @@ fn cook() -> Arc<[u8]> {
                         path: rings.clone(),
                         settings: TextureSettings {
                             usage: Usage::Linear1,
-                            quality: Quality::Fast,
                             ..TextureSettings::default()
                         },
                     },

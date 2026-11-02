@@ -12,7 +12,7 @@ use bytemuck::Pod;
 use glam::{DVec3, Quat, Vec2, Vec3};
 use orr_cook::{
     ArchiveSpec, AssetSpec, Instances, LodMode, Manifest, MaterialPatch, MeshInput, MeshSettings,
-    Placement, PrototypeSpec, Quality, Source, TextureSettings,
+    Placement, PrototypeSpec, Source, TextureSettings,
 };
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{MeshHeader, MeshInfo, Node, NodePage, decode_page};
@@ -156,7 +156,6 @@ fn cook(tint: f32) -> Arc<[u8]> {
                     source: Source::Texture {
                         path: albedo_png().clone(),
                         settings: TextureSettings {
-                            quality: Quality::Fast,
                             ..TextureSettings::default()
                         },
                     },

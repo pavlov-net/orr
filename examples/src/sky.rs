@@ -7,7 +7,7 @@ use orr::orr_gpu::{AddressMode, Allocation, Device, Filter, MemoryKind, SamplerD
 use orr::orr_lighting::EnvironmentMapGpu;
 use orr::orr_pack::AssetId;
 use orr::{MountId, Renderer};
-use orr_cook::{AssetSpec, Quality, Source, TextureSettings, Usage};
+use orr_cook::{AssetSpec, Source, TextureSettings, Usage};
 use orr_math::Vec3;
 
 /// A sky with its sun along unit `sun`, written to a temp file for the cook to read.
@@ -55,7 +55,6 @@ impl Sky {
                         light_threshold: None,
                         max_lights: 0,
                     },
-                    quality: Quality::Fast,
                     ..TextureSettings::default()
                 },
             },

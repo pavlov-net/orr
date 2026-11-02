@@ -170,7 +170,6 @@ fn cooked_bytes_match_their_cook_versions() {
                             reduction: Reduction::Mean,
                             srgb: false,
                             compress: None,
-                            quality: Default::default(),
                         }],
                     }),
                 },

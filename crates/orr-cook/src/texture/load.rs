@@ -1,12 +1,15 @@
 //! Image files to float texels: PNG, JPEG, WebP, Radiance HDR and OpenEXR through `image`,
-//! KTX2 and DDS through ctt's readers, block-compressed texels decoded with bcdec. Formats are
-//! recognized by their bytes.
+//! KTX2 and DDS through ctt's readers, block-compressed texels decoded with bcdec. KTX2 files
+//! of BCn blocks, plain or zstd-compressed, are read here instead, each level decompressed
+//! once straight into its blocks. Formats are recognized by their bytes.
 
-use std::io::Cursor;
+use std::borrow::Cow;
+use std::io::{BufReader, Cursor, Read};
 
 use ctt::input::{InputOverrides, decode_container};
 use ctt::{ColorSpace, FormatExt, TextureKind};
 use orr_pack::texture::{FormatInfo, full_mip_count, mip_size, vk};
+use rayon::prelude::*;
 
 use super::{Img, Primaries};
 
@@ -70,43 +73,217 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Source, String> {
     if bytes.starts_with(KTX1) {
         return Err("KTX1 images are not supported; convert them to KTX2".into());
     }
+    if let Some(k) = Ktx2Blocks::of(bytes) {
+        return k.open();
+    }
     match decode_container(bytes, InputOverrides::default()).map_err(|e| e.to_string())? {
         Some(image) => container(image),
         None => file(bytes),
     }
 }
 
-/// Per channel, the lowest and highest value of mip 0 of layer 0, decoded block by block
-/// until every channel the format stores spans more than `spread`.
-pub(crate) fn block_range(b: &Blocks, spread: f32) -> Result<[(f32, f32); 4], String> {
-    let f = FormatInfo::of(b.vk_format).ok_or("unknown format")?;
-    let (bw, bh) = (b.w.div_ceil(4) as usize, b.h.div_ceil(4) as usize);
-    let data = &b.levels[0][0];
-    if data.len() != bw * bh * f.bytes as usize {
-        return Err("compressed mip size".into());
+/// What [`open`] tells of a KTX2 file of BCn blocks holding one 2D image, with the range of
+/// its mip 0 as [`block_range`] finds it, decompressing only as much as the range needs.
+pub(crate) struct Scan {
+    pub w: u32,
+    pub h: u32,
+    pub vk_format: u32,
+    /// Every mip down to 1x1 is present.
+    pub complete: bool,
+    pub srgb: bool,
+    pub rg: bool,
+    pub range: [(f32, f32); 4],
+}
+
+/// The [`Scan`] of a KTX2 file of BCn blocks; `None` for every other file.
+pub(crate) fn scan_ktx2(bytes: &[u8], spread: f32) -> Option<Result<Scan, String>> {
+    Ktx2Blocks::of(bytes).map(|k| k.scan(spread))
+}
+
+/// A KTX2 file whose levels hold BCn blocks, stored plain or with zstd.
+struct Ktx2Blocks<'a> {
+    reader: ktx2::Reader<&'a [u8]>,
+    header: ktx2::Header,
+    format: ktx2::Format,
+    info: FormatInfo,
+    zstd: bool,
+}
+
+impl<'a> Ktx2Blocks<'a> {
+    /// The file as such, or `None` when ctt's reader takes it (and reports its errors):
+    /// other formats, 3D textures, and levels whose sizes do not match the header.
+    fn of(bytes: &'a [u8]) -> Option<Self> {
+        let reader = ktx2::Reader::new(bytes).ok()?;
+        let h = reader.header();
+        let format = h.format?;
+        let info = FormatInfo::of(format.value()).filter(|f| f.block == 4)?;
+        let zstd = match h.supercompression_scheme {
+            None => false,
+            Some(ktx2::SupercompressionScheme::Zstandard) => true,
+            Some(_) => return None,
+        };
+        let (w, hh) = (h.pixel_width, h.pixel_height);
+        let plain = w > 0
+            && hh > 0
+            && h.pixel_depth == 0
+            && (h.face_count == 1 || h.face_count == 6 && w == hh)
+            && h.level_count.max(1) <= full_mip_count(w, hh);
+        let k = plain.then_some(Self {
+            reader,
+            header: h,
+            format,
+            info,
+            zstd,
+        })?;
+        let images = u64::from(h.layer_count.max(1)) * u64::from(h.face_count);
+        let sized = k.reader.levels().enumerate().all(|(m, level)| {
+            let stored = if zstd {
+                level.uncompressed_byte_length
+            } else {
+                level.data.len() as u64
+            };
+            Some(stored) == (k.image_bytes(m as u32) as u64).checked_mul(images)
+        });
+        sized.then_some(k)
     }
+
+    fn vk_format(&self) -> u32 {
+        self.format.value()
+    }
+
+    /// Bytes of one image of level `m`.
+    fn image_bytes(&self, m: u32) -> usize {
+        let [w, h] = mip_size(self.header.pixel_width, self.header.pixel_height, m);
+        self.info.mip_bytes(w, h)
+    }
+
+    fn srgb(&self) -> bool {
+        self.format.normalize().1 == ColorSpace::Srgb
+    }
+
+    fn open(self) -> Result<Source, String> {
+        let h = &self.header;
+        let cube = h.face_count == 6;
+        if cube && h.layer_count > 1 {
+            return Err("cube arrays are not supported".into());
+        }
+        // Each level holds every layer's faces in turn.
+        let images = h.layer_count.max(1) as usize * h.face_count as usize;
+        let mut levels = vec![Vec::new(); images];
+        for (m, level) in self.reader.levels().enumerate() {
+            let size = self.image_bytes(m as u32);
+            let data = if self.zstd {
+                let data = zstd::bulk::decompress(level.data, size * images)
+                    .map_err(|e| format!("KTX2 level {m}: {e}"))?;
+                if data.len() != size * images {
+                    return Err(format!("KTX2 level {m} holds {} bytes", data.len()));
+                }
+                Cow::Owned(data)
+            } else {
+                Cow::Borrowed(level.data)
+            };
+            if images == 1 {
+                levels[0].push(data.into_owned());
+            } else {
+                for (l, image) in levels.iter_mut().zip(data.chunks_exact(size)) {
+                    l.push(image.to_vec());
+                }
+            }
+        }
+        Ok(Source {
+            layers: Vec::new(),
+            cube,
+            srgb: self.srgb(),
+            primaries: None,
+            rg: two_channels(self.vk_format()),
+            blocks: Some(Blocks {
+                vk_format: self.vk_format(),
+                w: h.pixel_width,
+                h: h.pixel_height,
+                levels,
+            }),
+        })
+    }
+
+    fn scan(self, spread: f32) -> Result<Scan, String> {
+        let h = &self.header;
+        if h.face_count != 1 || h.layer_count > 1 {
+            return Err("not a 2D image".into());
+        }
+        let (w, hh) = (h.pixel_width, h.pixel_height);
+        let level = self.reader.levels().next().ok_or("KTX2 without levels")?;
+        let vk_format = self.vk_format();
+        let range = if self.zstd {
+            // Whole chunks per decompress call, not one block at a time.
+            let d =
+                zstd::stream::read::Decoder::with_buffer(level.data).map_err(|e| e.to_string())?;
+            block_range(
+                vk_format,
+                w,
+                hh,
+                &mut BufReader::with_capacity(1 << 16, d),
+                spread,
+            )?
+        } else {
+            block_range(vk_format, w, hh, &mut &level.data[..], spread)?
+        };
+        Ok(Scan {
+            w,
+            h: hh,
+            vk_format,
+            complete: h.level_count.max(1) == full_mip_count(w, hh),
+            srgb: self.srgb(),
+            rg: two_channels(vk_format),
+            range,
+        })
+    }
+}
+
+/// Whether blocks of `vk_format` hold two channels, red and green.
+fn two_channels(vk_format: u32) -> bool {
+    matches!(vk_format, vk::BC5_UNORM | vk::BC5_SNORM)
+}
+
+/// Per channel, the lowest and highest value of a `w` x `h` mip of `vk_format` blocks read
+/// from `data`, decoded block by block until every channel the format stores spans more
+/// than `spread`.
+pub(crate) fn block_range(
+    vk_format: u32,
+    w: u32,
+    h: u32,
+    data: &mut impl Read,
+    spread: f32,
+) -> Result<[(f32, f32); 4], String> {
+    let f = FormatInfo::of(vk_format).ok_or("unknown format")?;
+    let bw = w.div_ceil(4) as usize;
+    let blocks = bw * h.div_ceil(4) as usize;
     // Channels past these hold the same value in every block of the format.
-    let stored = match b.vk_format {
+    let stored = match vk_format {
         vk::BC4_UNORM => 1,
         vk::BC5_UNORM => 2,
         vk::BC6H_UFLOAT | vk::BC6H_SFLOAT => 3,
         _ => 4,
     };
-    let bc7 = matches!(b.vk_format, vk::BC7_UNORM | vk::BC7_SRGB);
+    let bc7 = matches!(vk_format, vk::BC7_UNORM | vk::BC7_SRGB);
     let mut range = [(f32::MAX, f32::MIN); 4];
-    for (i, block) in data.chunks_exact(f.bytes as usize).enumerate() {
+    let mut buf = [0; 16];
+    let block = &mut buf[..f.bytes as usize];
+    for i in 0..blocks {
         if range[..stored].iter().all(|r| r.1 - r.0 > spread) {
             break;
         }
+        data.read_exact(block)
+            .map_err(|_| "compressed mip size".to_string())?;
+        let block = &*block;
         // Once color varies, only alpha is left to find, and opaque BC7 blocks give 1.
         if bc7 && bc7_opaque(block) && range[..3].iter().all(|r| r.1 - r.0 > spread) {
             range[3] = (range[3].0.min(1.0), range[3].1.max(1.0));
             continue;
         }
-        let texels = decode_block(b.vk_format, block)?;
+        let texels = decode_block(vk_format, block)?;
         let (bx, by) = (i % bw * 4, i / bw * 4);
         for (k, t) in texels.iter().enumerate() {
-            if bx + k % 4 < b.w as usize && by + k / 4 < b.h as usize {
+            if bx + k % 4 < w as usize && by + k / 4 < h as usize {
                 for (r, v) in range.iter_mut().zip(t) {
                     *r = (r.0.min(*v), r.1.max(*v));
                 }
@@ -170,7 +347,7 @@ fn container(image: ctt::Image) -> Result<Source, String> {
                 h,
                 levels,
             }),
-            rg: matches!(vk_format, vk::BC5_UNORM | vk::BC5_SNORM),
+            rg: two_channels(vk_format),
         });
     }
     // Uncompressed: ctt converts to f32 RGBA in the file's colour space.
@@ -274,25 +451,66 @@ fn png_cicp(bytes: &[u8]) -> Result<Option<png::CodingIndependentCodePoints>, St
 
 /// Decodes one layer's BCn mip to float texels (unorm values in 0..1, BC6H as floats).
 pub(crate) fn decode_blocks(vk_format: u32, w: u32, h: u32, data: &[u8]) -> Result<Img, String> {
-    let f = FormatInfo::of(vk_format).ok_or("unknown format")?;
-    let (bw, bh) = (w.div_ceil(4) as usize, h.div_ceil(4) as usize);
-    if data.len() != bw * bh * f.bytes as usize {
+    decode_blocks_with(vk_format, w, h, data, |t| t)
+}
+
+/// [`decode_blocks`] with each texel passed through `f`.
+pub(crate) fn decode_blocks_with(
+    vk_format: u32,
+    w: u32,
+    h: u32,
+    data: &[u8],
+    f: impl Fn([f32; 4]) -> [f32; 4] + Sync,
+) -> Result<Img, String> {
+    let mut out = Img::new(w, h);
+    decode_rows(vk_format, w, h, data, &mut out.px, f)?;
+    Ok(out)
+}
+
+/// Channel `c` of one layer's BCn mip, decoded as [`decode_blocks`] decodes it.
+pub(crate) fn decode_channel(
+    vk_format: u32,
+    w: u32,
+    h: u32,
+    data: &[u8],
+    c: usize,
+) -> Result<Vec<f32>, String> {
+    let mut out = vec![0.0; w as usize * h as usize];
+    decode_rows(vk_format, w, h, data, &mut out, |t| t[c])?;
+    Ok(out)
+}
+
+/// Decodes a `w` x `h` mip of blocks into row-major `out`, one row of blocks per task, each
+/// texel through `f`.
+fn decode_rows<T: Send>(
+    vk_format: u32,
+    w: u32,
+    h: u32,
+    data: &[u8],
+    out: &mut [T],
+    f: impl Fn([f32; 4]) -> T + Sync,
+) -> Result<(), String> {
+    let info = FormatInfo::of(vk_format).ok_or("unknown format")?;
+    if data.len() != info.mip_bytes(w, h) {
         return Err("compressed mip size".into());
     }
-    let mut out = Img::new(w, h);
-    for by in 0..bh {
-        for bx in 0..bw {
-            let block = &data[(by * bw + bx) * f.bytes as usize..][..f.bytes as usize];
-            let texels = decode_block(vk_format, block)?;
-            for (i, t) in texels.iter().enumerate() {
-                let (x, y) = (bx * 4 + i % 4, by * 4 + i / 4);
-                if x < w as usize && y < h as usize {
-                    out.px[y * w as usize + x] = *t;
+    let (w, bytes) = (w as usize, info.bytes as usize);
+    let bw = w.div_ceil(4);
+    out.par_chunks_mut(4 * w)
+        .zip(data.par_chunks(bw * bytes))
+        .try_for_each(|(rows, blocks)| {
+            for (bx, block) in blocks.chunks_exact(bytes).enumerate() {
+                let texels = decode_block(vk_format, block)?;
+                for (i, t) in texels.into_iter().enumerate() {
+                    let (x, y) = (bx * 4 + i % 4, i / 4);
+                    if x < w && y * w < rows.len() {
+                        rows[y * w + x] = f(t);
+                    }
                 }
             }
-        }
-    }
-    Ok(out)
+            Ok::<_, String>(())
+        })?;
+    Ok(())
 }
 
 fn decode_block(vk_format: u32, block: &[u8]) -> Result<[[f32; 4]; 16], String> {

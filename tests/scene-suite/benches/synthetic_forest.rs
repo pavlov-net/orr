@@ -26,7 +26,7 @@ use orr::{
     TransformGroupDesc, ViewDesc, ViewHistoryId, ViewTarget,
 };
 use orr_cook::{
-    ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshParts, MeshSettings, Quality, Source,
+    ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshParts, MeshSettings, Source,
     TextureSettings, Usage,
 };
 use orr_math::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
@@ -476,7 +476,6 @@ fn cook() -> Arc<[u8]> {
             path: leaf_mask(),
             settings: TextureSettings {
                 usage: Usage::Linear1,
-                quality: Quality::Fast,
                 ..TextureSettings::default()
             },
         },

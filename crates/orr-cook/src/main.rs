@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
-use orr_cook::{CookOptions, Manifest, Outcome};
+use orr_cook::{CookOptions, Manifest, Outcome, Quality};
 use orr_pack::clip::ClipHeader;
 use orr_pack::instance::{InstancePageInfo, InstanceRecord};
 use orr_pack::mesh::{Cluster, MeshHeader, MeshInfo, Node, PageHeader, cluster_resident_len};
@@ -15,7 +15,8 @@ use orr_pack::{Archive, Class, Codec, Entry};
 
 const USAGE: &str = "usage:
   orr-cook build <manifest.toml> [--jobs N] [--force] [--cache DIR] [--cache-cap BYTES]
-                 [--working-set BYTES] [--zstd-level L] [--report r.json]
+                 [--working-set BYTES] [--quality Q] [--zstd-level L] [--report r.json]
+      Q: ultrafast, veryfast, fast (the default), basic, slow or veryslow
   orr-cook inspect <archive> [--class C] [--name N]
   orr-cook verify <archive>
   orr-cook bench-decode <archive>";
@@ -57,8 +58,19 @@ fn build(args: &[String]) -> Result<bool> {
             "--cache" => opts.cache = Some(it.next().ok_or(USAGE)?.into()),
             "--cache-cap" => opts.cache_cap = Some(number(it.next())?),
             "--working-set" => opts.working_set = number(it.next())?,
+            "--quality" => {
+                opts.quality = match it.next().map(String::as_str) {
+                    Some("ultrafast") => Quality::UltraFast,
+                    Some("veryfast") => Quality::VeryFast,
+                    Some("fast") => Quality::Fast,
+                    Some("basic") => Quality::Basic,
+                    Some("slow") => Quality::Slow,
+                    Some("veryslow") => Quality::VerySlow,
+                    _ => return Err(USAGE.into()),
+                };
+            }
             "--zstd-level" => {
-                opts.zstd_level = it.next().ok_or(USAGE)?.parse().map_err(|_| USAGE)?;
+                opts.zstd_level = Some(it.next().ok_or(USAGE)?.parse().map_err(|_| USAGE)?);
             }
             "--report" => opts.report = Some(it.next().ok_or(USAGE)?.into()),
             _ if manifest.is_none() => manifest = Some(Path::new(a)),

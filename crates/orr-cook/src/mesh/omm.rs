@@ -5,6 +5,7 @@ use meshopt::{AlphaTexture, OpacityStates};
 use orr_pack::mesh::{
     MicromapEntry, OMM_OPAQUE, OMM_STATE_OPAQUE, OMM_STATE_UNKNOWN_TRANSPARENT, OMM_TRANSPARENT,
 };
+use rayon::prelude::*;
 use serde::Deserialize;
 
 use super::maps::{FAIL, Opacity, PASS, Passes, Ranges, Raster};
@@ -86,12 +87,16 @@ impl Sides {
     fn new(alpha: &[u8], w: usize, h: usize) -> Self {
         let (mut cols, mut rows) = (w.div_ceil(Self::TILE), h.div_ceil(Self::TILE));
         let mut flags = vec![0u8; cols * rows];
-        for (y, row) in alpha.chunks_exact(w).enumerate() {
-            let out = &mut flags[y / Self::TILE * cols..][..cols];
-            for (x, &a) in row.iter().enumerate() {
-                out[x / Self::TILE] |= if a >= 128 { PASS } else { FAIL };
-            }
-        }
+        flags
+            .par_chunks_mut(cols)
+            .zip(alpha.par_chunks(w * Self::TILE))
+            .for_each(|(out, band)| {
+                for row in band.chunks_exact(w) {
+                    for (x, &a) in row.iter().enumerate() {
+                        out[x / Self::TILE] |= if a >= 128 { PASS } else { FAIL };
+                    }
+                }
+            });
         let mut levels = vec![SideLevel {
             tile: Self::TILE,
             cols,
@@ -160,7 +165,7 @@ impl OmmAlpha {
         if mip0.w > Self::MAX_SIZE || mip0.h > Self::MAX_SIZE {
             return None;
         }
-        let alpha: Vec<u8> = mip0.texels.iter().map(|&t| remap(t, cutoff)).collect();
+        let alpha: Vec<u8> = mip0.texels.par_iter().map(|&t| remap(t, cutoff)).collect();
         let sides = Sides::new(&alpha, mip0.w as usize, mip0.h as usize);
         Some(Self {
             alpha,

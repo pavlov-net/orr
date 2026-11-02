@@ -9,6 +9,7 @@
 use std::collections::HashSet;
 use std::f32::consts::{PI, TAU};
 
+use ctt::Quality;
 use orr_pack::texture::{ExtractedLight, octahedral};
 use rayon::prelude::*;
 
@@ -24,6 +25,7 @@ pub(super) fn cook(
     primaries: Primaries,
     light_threshold: Option<f32>,
     max_lights: u8,
+    quality: Quality,
 ) -> Result<super::Built, String> {
     if src.srgb {
         for l in &mut src.layers {
@@ -64,7 +66,7 @@ pub(super) fn cook(
             normal: false,
             coverage: None,
         },
-        quality: s.quality,
+        quality,
         max_size: None,
         toksvig: None,
         lights,
