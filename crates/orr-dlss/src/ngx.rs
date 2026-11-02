@@ -840,7 +840,8 @@ impl Fg {
                 NVSDK_NGX_DLSSG_Parameter_BackbufferFormat,
                 format.as_raw() as u32,
             );
-            ui(NVSDK_NGX_DLSSG_Parameter_DynamicResolution, 0);
+            // Depth and motion come at the render size, which may change between evaluates.
+            ui(NVSDK_NGX_DLSSG_Parameter_DynamicResolution, 1);
             ui(NVSDK_NGX_DLSSG_Parameter_AsyncCreateEnabled, 1);
             ui(
                 NVSDK_NGX_DLSSG_Parameter_UserInterfaceRecompositionEnabled,
