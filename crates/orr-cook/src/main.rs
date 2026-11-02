@@ -20,6 +20,9 @@ const USAGE: &str = "usage:
   orr-cook verify <archive>
   orr-cook bench-decode <archive>";
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {

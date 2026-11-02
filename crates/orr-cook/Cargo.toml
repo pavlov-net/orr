@@ -24,6 +24,9 @@ gltf = { version = "=1.4.1", default-features = false, features = ["utils", "nam
 half.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "hdr", "exr"] }
 meshopt = "=0.7.0"
+# The binary's global allocator: it keeps freed pages, where the Windows heap returns large
+# buffers and faults them in again on the next job. Exact pin: it builds its C sources.
+mimalloc = { version = "=0.1.52", default-features = false }
 # Exact pin: no stable API before 1.0, and its composition shapes cooked meshes.
 openusd = "=0.8.0"
 orr-math.workspace = true
