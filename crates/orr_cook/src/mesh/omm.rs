@@ -205,6 +205,8 @@ pub(crate) struct ClusterOmm {
     pub levels: Vec<u8>,
     /// Entry states back to back, in entry order.
     pub data: Vec<u8>,
+    /// The `max_level` its entries were measured under.
+    pub max_level: u8,
 }
 
 impl ClusterOmm {
@@ -239,6 +241,7 @@ pub(crate) fn cluster_omm(
                 ],
                 levels: Vec::new(),
                 data: Vec::new(),
+                max_level: s.max_level,
             });
         }
         Opacity::Texture { mip0, cutoff, .. } => (mip0, *cutoff),
@@ -251,6 +254,9 @@ pub(crate) fn cluster_omm(
         .iter()
         .map(|&p| mip0.mapped(p).map(|x| x as f32))
         .collect();
+    // An entry's states depend only on its source triangle and level, so a lower attempt
+    // takes the entries whose level did not change from the one before.
+    let mut previous: Vec<Option<(u8, Vec<u8>)>> = vec![None; tris.len()];
     let mut level = s.max_level;
     loop {
         let m =
@@ -259,12 +265,19 @@ pub(crate) fn cluster_omm(
         let (mut offsets, size) = meshopt::opacity_map_layout(&levels, STATES);
         let mut data = vec![0; size];
         for (i, &source) in m.sources.iter().enumerate() {
-            let uv = tris[source as usize].map(|v| uvs[usize::from(v)]);
-            let at = tris[source as usize].map(|v| mapped[usize::from(v)]);
             let len = meshopt::opacity_map_entry_size(levels[i], STATES);
             let entry = &mut data[offsets[i] as usize..][..len];
-            meshopt::opacity_map_rasterize(entry, levels[i], STATES, &at, &alpha.texture());
-            known_states_hold(entry, levels[i], uv, mip0, cutoff, &alpha.sides);
+            let known = &mut previous[source as usize];
+            match known {
+                Some((l, states)) if *l == levels[i] => entry.copy_from_slice(states),
+                _ => {
+                    let uv = tris[source as usize].map(|v| uvs[usize::from(v)]);
+                    let at = tris[source as usize].map(|v| mapped[usize::from(v)]);
+                    meshopt::opacity_map_rasterize(entry, levels[i], STATES, &at, &alpha.texture());
+                    known_states_hold(entry, levels[i], uv, mip0, cutoff, &alpha.sides);
+                    *known = Some((levels[i], entry.to_vec()));
+                }
+            }
         }
         let mut indices = m.indices;
         meshopt::opacity_map_compact(&mut data, &mut levels, &mut offsets, &mut indices, STATES);
@@ -272,6 +285,7 @@ pub(crate) fn cluster_omm(
             indices,
             levels,
             data,
+            max_level: level,
         };
         if level == 0 || omm.bytes() <= s.cluster_bytes_max as usize {
             return Some(omm);
