@@ -644,7 +644,7 @@ public float producer_cluster_weight(SceneRoot* s, uint entry, uint c)
     MaterialGpu* mat = cluster_material(s, s.producers[entry], k);
     if (mat == nullptr)
         return 0.0;
-    float y = luminance_rec2020(material_emission(mat));
+    float y = luminance_rec2020(material_light_emission(mat));
     return y > 0.0 ? y * cluster_area(b, k, m) : 0.0;
 }
 
@@ -720,7 +720,7 @@ LightSample emissive_sample(LightSetGpu* set, uint entry, float4 u, float probab
     float b0 = 1.0 - su;
     float b1 = u.w * su;
     float3 p = b0 * p0 + b1 * p1 + (1.0 - b0 - b1) * p2;
-    float3 l = material_emission(mat);
+    float3 l = material_light_emission(mat);
     LightSample r = light_sample(LIGHT_SAMPLE_EMISSIVE, s.light_capacity + entry, render_point(anchor, m, p),
                                  normalize(n), l, probability * luminance_rec2020(l) / e.total);
     if ((mat.flags & MATERIAL_DOUBLE_SIDED) != 0)

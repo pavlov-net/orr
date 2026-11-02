@@ -1,11 +1,11 @@
 //! The opaque path kernel on the bed's analytic scenes: the furnace, convergence, the three
 //! estimators against each other, pixel subsets, directional lights, ray counts, ray
 //! origins, the thin lens and the background layer behind foreground, linked surfaces at
-//! every hit, and the raygen against the compute entry.
+//! every hit, the raygen against the compute entry, and emissive particles as lights.
 
 use lighting_suite::bed::{
     Accumulated, Analytic, BUMPY_FLOOR, Bed, EXTENT, FLOOR, FURNACE_RADIANCE, Item, MIRROR, NEAR,
-    PANEL, Paths, SKY, SMOOTH_FLOOR, SUN, Spec, TROUGH, WHITE_SPHERE,
+    PANEL, Particle, ParticleLook, Paths, SKY, SMOOTH_FLOOR, SUN, Spec, TROUGH, WHITE_SPHERE,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::{
@@ -17,7 +17,7 @@ use orr_lighting::{
     ReferenceSettings, SceneLightingSettings, ThinLens, ViewLighting,
 };
 use orr_math::{DVec3, Mat3, Vec3};
-use orr_scene::RendererDesc;
+use orr_scene::{Opacity, RendererDesc};
 
 fn paths(settings: ViewLighting) -> Paths {
     Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
@@ -818,5 +818,50 @@ fn light_feedback_and_local_samplers_keep_direct_light_unbiased() {
     {
         assert_close(&format!("quarter {q}"), g, p, 0.04);
     }
+    assert_clean();
+}
+
+/// The floor in front of an emissive particle of opacity 0.5 is lit as in front of an opaque
+/// emitter of half its emission: light sampling takes the particle's emission at its opacity,
+/// and the rays leaving the floor meet it there, weighted against light sampling.
+#[test]
+fn an_emissive_particle_lights_as_an_emitter_of_its_opacity() {
+    let spec = Spec {
+        copies: vec![at(FLOOR, Mat3::IDENTITY, Vec3::ZERO)],
+        lights: Vec::new(),
+        environment: None,
+        eye: Vec3::new(0.0, 2.0, 4.0),
+        target: Vec3::ZERO,
+        fov_y: 0.8,
+        focus: None,
+    };
+    let quad = [Particle {
+        center: Vec3::new(0.0, 0.6, -1.0),
+        size: 0.5,
+    }];
+    let paths = paths(ViewLighting::default());
+    let [w, h] = EXTENT;
+    let floor = |emission: f32, opacity: f32, class: Opacity| {
+        let mut bed = Bed::with(spec.clone());
+        let look = ParticleLook {
+            albedo: [0.0; 3],
+            emission: [emission; 3],
+            opacity,
+            anisotropy: 0.0,
+        };
+        bed.set_particles(&quad, look, class);
+        let a = render_paths(&mut bed, &paths, 32, 1);
+        let rows = &a.mean[((h - 16) * w) as usize..];
+        let mut sum = [0.0f64; 3];
+        for p in rows {
+            for c in 0..3 {
+                sum[c] += f64::from(p[c]);
+            }
+        }
+        sum.map(|s| s / rows.len() as f64)
+    };
+    let particle = floor(2000.0, 0.5, Opacity::Particle);
+    let opaque = floor(1000.0, 1.0, Opacity::Opaque);
+    assert_close("floor", particle, opaque, 0.03);
     assert_clean();
 }

@@ -629,6 +629,8 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             alive = false;
         Hit h = (Hit)0;
         float3 positions[3] = { float3(0.0), float3(0.0), float3(0.0) };
+        // The particles in front of the ray's hit, premultiplied.
+        float4 particles = float4(0.0);
         // A dispersive layer with live companions adds no direct light: its BSDF differs by
         // wavelength, and its rays reach lights at full weight.
         bool split = dispersive && spectral.companions();
@@ -752,10 +754,17 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
                     skip_direct = true;
                 cone.spread += spread;
                 uint mask = ray.chain || interior.count > 0 ? MASK_OPAQUE | MASK_DIELECTRIC : MASK_OPAQUE;
+                // Rays leaving a layer or a scatter, and the first vertex's, see particles.
+                if (ray.chain || depth == 0)
+                    mask |= MASK_PARTICLE;
                 HitContext context = hit_context(HIT_SECONDARY, depth + 1, cone, 0.0);
                 LayerAccept<S> a = { s, v, ray.dir, context, pcg(seed ^ (depth + 1)), PRESENCE_DRAWN };
+                LocalLights* ray_local = nullptr;
+                if (ray.local)
+                    ray_local = pixel_local_lights(r, pixel);
+                ParticleEmission<LayerAccept<S> > pe = { s, set, ray_local, ray.dir, ray.normal, one_technique ? 0.0 : ray.pdf, ray.run, a };
                 rays++;
-                h = trace_closest(s.tlas, path_ray(ray.origin, ray.dir, positive_infinity()), mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+                h = trace_resolve_translucent(s.tlas, path_ray(ray.origin, ray.dir, positive_infinity()), mask, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, pe, PARTICLE_CANDIDATES, particles, positions);
             }
         }
         C.point(alive ? path_key(s, h) : coherence_key(false, 0, 0), KEY_BITS);
@@ -783,6 +792,11 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             continue;
         }
         depth++;
+
+        // While the path skips direct light, particles add no emission, as producer hits do.
+        if (count_bsdf && counted && !skip_direct)
+            radiance += spectral.color(throughput * particles.rgb);
+        throughput *= 1.0 - particles.a;
 
         // The segment: an interior's Beer or scatter, else the linked medium.
         float t = h.hit ? h.t : positive_infinity();
@@ -889,7 +903,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             float w = 1.0;
             if (weigh && producer)
             {
-                float lum = luminance_rec2020(material_emission(s.materials + sh.surface.material));
+                float lum = luminance_rec2020(material_light_emission(s.materials + sh.surface.material));
                 w = power_heuristic(ray.pdf, ray.run * nee_emissive_pdf(set, ray_local, ray.normal, entry, lum, t, dot(sh.surface.geometric_normal, ray.dir)));
             }
             radiance += spectral.color(throughput * b.emission() * w);

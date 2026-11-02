@@ -298,6 +298,50 @@ public struct Alpha<S : ISurface> : IAnyHit
     }
 }
 
+// Most candidates a ray that resolves particles visits.
+public static const uint PARTICLE_CANDIDATES = 64;
+
+// Particles on a BSDF ray, as `trace_resolve_translucent` layers them: each particle
+// candidate is a layer of its emission at its opacity, unexposed, weighed by the power
+// heuristic against the light set's sampling of its entry where `pdf` (the ray's density,
+// 0 for none) is above 0. `other` decides every other candidate.
+public struct ParticleEmission<A : IAnyHit> : ITranslucent
+{
+    public SceneRoot* scene;
+    public LightSetGpu* set;
+    public LocalLights* local;
+    public float3 dir;
+    public float3 normal;           // the vertex's shading normal, zero in a medium
+    public float pdf;
+    public float run;               // the vertex's next-event probability
+    public A other;
+
+    public float4 layer(Candidate c)
+    {
+        uint material;
+        float3 n;
+        float3 e;
+        float a;
+        if (c.custom_index != CLASS_PARTICLE || c.cluster_id < 0
+            || !resolve_particle(scene, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, material, n, e, a))
+            return float4(0.0);
+        a = saturate(a);
+        float w = 1.0;
+        uint entry;
+        if (pdf > 0.0 && any(e > 0.0) && hit_producer(scene, c.instance_index, entry))
+        {
+            float l = luminance_rec2020(material_light_emission(scene.materials + material));
+            w = power_heuristic(pdf, run * nee_emissive_pdf(set, local, normal, entry, l, c.t, dot(n, dir)));
+        }
+        return float4(e * (a * w), a);
+    }
+
+    public bool accept(Candidate c)
+    {
+        return c.custom_index != CLASS_PARTICLE && other.accept(c);
+    }
+}
+
 public RayDesc path_ray(float3 origin, float3 dir, float t_max)
 {
     RayDesc r;
@@ -603,6 +647,8 @@ public interface IPathRecord
     // Whether its subsurface vertices may walk; where they do not, their subsurface share is
     // diffuse reflection.
     bool walks();
+    // Whether the ray leaving x1 resolves particles by their emission.
+    bool particles();
     // Vertex `x`, prepared as `b`, reached with `throughput` once the path's radiance (its
     // emission included) was `radiance`; next-event estimation and a BSDF ray follow it.
     [mutating]
@@ -638,6 +684,11 @@ public struct ViewPath : IPathRecord
     }
 
     public bool walks()
+    {
+        return true;
+    }
+
+    public bool particles()
     {
         return true;
     }
@@ -687,6 +738,11 @@ public struct CacheUpdate : IPathRecord
 
     // The cache holds the zero mean free path limit of subsurface surfaces.
     public bool walks()
+    {
+        return false;
+    }
+
+    public bool particles()
     {
         return false;
     }
@@ -770,6 +826,8 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
             local = x1_local;
         Hit h = (Hit)0;
         float3 positions[3] = { float3(0.0), float3(0.0), float3(0.0) };
+        // The particles in front of the ray's hit, premultiplied.
+        float4 particles = float4(0.0);
         bool walking = false;
         WalkExit walk = (WalkExit)0;
         // Constant false for records that never walk, so their kernels hold no exit code.
@@ -832,7 +890,14 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
                 cone.spread += spread;
                 Alpha<S> a = { s, v, ray.dir, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0) };
                 rays++;
-                h = trace_closest(s.tlas, path_ray(ray.origin, ray.dir, positive_infinity()), MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+                RayDesc rd = path_ray(ray.origin, ray.dir, positive_infinity());
+                if (depth == 0 && record.particles())
+                {
+                    ParticleEmission<Alpha<S> > pe = { s, set, local, ray.dir, ray.normal, one_technique ? 0.0 : ray.pdf, ray.run, a };
+                    h = trace_resolve_translucent(s.tlas, rd, MASK_OPAQUE | MASK_PARTICLE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, pe, PARTICLE_CANDIDATES, particles, positions);
+                }
+                else
+                    h = trace_closest(s.tlas, rd, MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
             }
         }
         C.point(alive ? path_key(s, h) : coherence_key(false, 0, 0), KEY_BITS);
@@ -860,6 +925,9 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
         }
         depth++;
 
+        if (count_bsdf && counted)
+            radiance += throughput * particles.rgb;
+        throughput *= 1.0 - particles.a;
         bool weigh = !one_technique && ray.pdf > 0.0;
         if (!h.hit)
         {
@@ -919,7 +987,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
             float w = 1.0;
             if (weigh && hit_producer(s, h.instance_index, entry))
             {
-                float l = luminance_rec2020(material_emission(s.materials + sh.surface.material));
+                float l = luminance_rec2020(material_light_emission(s.materials + sh.surface.material));
                 float cos_light = dot(sh.surface.geometric_normal, ray.dir);
                 w = power_heuristic(ray.pdf, ray.run * nee_emissive_pdf(set, local, ray.normal, entry, l, t, cos_light));
             }

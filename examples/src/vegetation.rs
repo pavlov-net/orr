@@ -1615,7 +1615,7 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                 let slot = id % slots;
                 let glow = &scene.glow;
                 let roots = &mut glow_roots;
-                let mut particles = |pass: &mut TransparencyPass<'_, '_>| {
+                let mut particles = |pass: &mut TransparencyPass<'_, '_>, _| {
                     roots.as_mut_slice().expect("particle roots")[slot as usize] = glow::Root {
                         scene: pass.scene,
                         view: pass.view,

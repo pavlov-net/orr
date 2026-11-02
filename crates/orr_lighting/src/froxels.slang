@@ -488,25 +488,52 @@ float3 froxel_source<M : IMedium>(LightSetGpu* set, FroxelLights lights, MediumP
     return m.emission + m.sigma_s * light;
 }
 
-// The froxel of a `grid` of columns, rows and slices, seen from view `v`, that holds
-// render-space point `x`; false outside the volume.
-public bool froxel_at(uint3 grid, ViewConstants* v, float near_range, float3 x, out uint3 f)
+// The column coordinate (column k's ray at k) of render-space point `x` in a `grid` of
+// columns and rows seen from view `v`, and its distance from the eye; false behind the eye.
+bool froxel_column(uint2 grid, ViewConstants* v, float3 x, out float2 c, out float t)
 {
-    f = uint3(0);
+    c = float2(0.0);
     float3 relative = x - v.eye_render.xyz;
-    float t = length(relative);
+    t = length(relative);
     float3 d = mul(v.view_from_world_rotation, float4(relative, 0.0));
-    if (!(d.z < 0.0) || !(t < near_range))
+    if (!(d.z < 0.0))
         return false;
     // The inverse of `unjittered_ray`.
     float4x4 m = v.clip_from_view;
     float2 q = d.xy / -d.z;
     float2 ndc = float2(q.x * m[0][0] - m[0][2], q.y * m[1][1] - m[1][2]);
-    float2 c = round((ndc * 0.5 + 0.5) * float2(v.extent) / froxel_spacing(v.extent, grid.xy));
+    c = (ndc * 0.5 + 0.5) * float2(v.extent) / froxel_spacing(v.extent, grid);
+    return true;
+}
+
+// The froxel of a `grid` of columns, rows and slices, seen from view `v`, that holds
+// render-space point `x`; false outside the volume.
+public bool froxel_at(uint3 grid, ViewConstants* v, float near_range, float3 x, out uint3 f)
+{
+    f = uint3(0);
+    float2 c;
+    float t;
+    if (!froxel_column(grid.xy, v, x, c, t) || !(t < near_range))
+        return false;
+    c = round(c);
     if (any(c < 0.0) || any(c > float2(grid.xy) - 1.0))
         return false;
     f = uint3(uint2(c), min(uint(froxel_slice(t, grid.z, near_range)), grid.z - 1));
     return true;
+}
+
+// The texture coordinates of render-space point `x` in the froxel volume of a `grid` seen
+// from view `v`, which filtered lookups read between froxel centers; false outside the
+// volume.
+public bool froxel_coord(uint3 grid, ViewConstants* v, float near_range, float3 x, out float3 coord)
+{
+    coord = float3(0.0);
+    float2 c;
+    float t;
+    if (!froxel_column(grid.xy, v, x, c, t) || !(t < near_range))
+        return false;
+    coord = float3((c + 0.5) / float2(grid.xy), froxel_slice(t, grid.z, near_range) / float(grid.z));
+    return all(c >= -0.5) && all(c <= float2(grid.xy) - 0.5);
 }
 
 // The light the linked medium `M` scatters toward `origin` along the `t` m segment from it
@@ -588,23 +615,35 @@ public void froxel_integrate<M : IMedium>(FroxelRoot r, uint2 column)
     }
 }
 
-// The froxels' in-scatter (pre-exposed) and transmittance from the eye to distance `t` along
-// the ray through `pixel`.
-float3 froxel_fog(FroxelRoot r, uint2 pixel, float t, out float3 transmittance)
+// The in-scatter (pre-exposed) and transmittance from the eye to distance `t` (clamped to
+// `near_range`) along the ray through image point `p`, in render pixels, of a view's
+// `integrated` froxels of `grid`, `integrated_rgb` holding rgb transmittance (NONE for its
+// luminance), read through linear sampler `sampler`.
+public float3 integrated_fog(TextureIndex integrated, TextureIndex integrated_rgb, SamplerIndex sampler, uint3 grid, uint2 extent, float near_range, float2 p, float t, out float3 transmittance)
 {
-    float c = froxel_slice(t, r.slices, r.scene.near_range);
-    float2 xy = column_coord(r, float2(pixel) + 0.5);
+    float c = froxel_slice(t, grid.z, near_range);
+    float2 xy = (p / froxel_spacing(extent, grid.xy) + 0.5) / float2(grid.xy);
     // Texel k holds the far boundary of slice k, slice coordinate k + 1.
-    float3 coord = float3(xy, max(c - 0.5, 0.5) / float(r.slices));
-    SamplerState s = r.sampler.get();
-    float4 fog = r.integrated_sampled.get<Texture3D<float4>>().SampleLevel(s, coord, 0.0);
-    transmittance = r.chromatic != 0
-        ? r.integrated_rgb_sampled.get<Texture3D<float4>>().SampleLevel(s, coord, 0.0).rgb
+    float3 coord = float3(xy, max(c - 0.5, 0.5) / float(grid.z));
+    SamplerState s = sampler.get();
+    float4 fog = integrated.get<Texture3D<float4>>().SampleLevel(s, coord, 0.0);
+    transmittance = integrated_rgb.index != IMAGE_NONE
+        ? integrated_rgb.get<Texture3D<float4>>().SampleLevel(s, coord, 0.0).rgb
         : float3(fog.a);
     // Before the first boundary, toward nothing at the eye.
     float w = saturate(c);
     transmittance = lerp(float3(1.0), transmittance, w);
     return fog.rgb * w;
+}
+
+// The froxels' in-scatter (pre-exposed) and transmittance from the eye to distance `t` along
+// the ray through `pixel`.
+float3 froxel_fog(FroxelRoot r, uint2 pixel, float t, out float3 transmittance)
+{
+    TextureIndex rgb = r.integrated_rgb_sampled;
+    if (r.chromatic == 0)
+        rgb.index = IMAGE_NONE;
+    return integrated_fog(r.integrated_sampled, rgb, r.sampler, uint3(r.columns, r.rows, r.slices), r.view.extent, r.scene.near_range, float2(pixel) + 0.5, t, transmittance);
 }
 
 // The reference camera segment: in-scatter (unexposed) over `t` m from the eye along `dir`

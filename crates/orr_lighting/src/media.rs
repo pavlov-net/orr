@@ -9,7 +9,9 @@ use orr_scene::orr_gpu::{
 
 use crate::scene::{FRAME_SLOTS, Ring};
 use crate::shaders::media::{apply, froxel};
-use crate::shaders::types::{FroxelLights, FroxelRoot, FroxelVolume, MediaStatsGpu};
+use crate::shaders::types::{
+    FroxelLights, FroxelRoot, FroxelVolume, LayerGuide, MediaStatsGpu, ParticleLighting,
+};
 use crate::view::{LightingDebugView, LightingView, ViewLighting, ViewPass};
 use crate::{Error, KernelSet, SceneLighting, pipeline};
 
@@ -176,6 +178,8 @@ pub(crate) struct MediaView {
     roots: Ring<FroxelRoot>,
     apply_roots: Ring<FroxelRoot>,
     volume_roots: Ring<FroxelVolume>,
+    particles: Ring<ParticleLighting>,
+    particle_frames: [Option<u64>; FRAME_SLOTS],
 }
 
 impl MediaView {
@@ -200,6 +204,8 @@ impl MediaView {
             roots: Ring::new(device, "froxel roots")?,
             apply_roots: Ring::new(device, "media apply roots")?,
             volume_roots: Ring::new(device, "froxel volumes")?,
+            particles: Ring::new(device, "particle lighting")?,
+            particle_frames: [None; FRAME_SLOTS],
         })
     }
 
@@ -227,18 +233,14 @@ impl MediaView {
         }
     }
 
-    /// RGBA16F, this frame's isotropic incident radiance per froxel (unexposed, nits) and the
-    /// visibility of the first shadowed light in A.
-    pub(crate) fn incident(&self) -> Option<TextureIndex> {
-        self.volumes
-            .as_ref()
-            .map(|v| v.incident[self.current].sampled)
-    }
-
-    /// RGBA16F, per froxel the pre-exposed in-scatter from the eye to its far boundary and
-    /// the luminance of the transmittance over it.
-    pub(crate) fn integrated(&self) -> Option<TextureIndex> {
-        self.volumes.as_ref().map(|v| v.integrated.sampled)
+    /// The particle lighting media apply of `frame` wrote; null when it recorded none.
+    pub(crate) fn particle_lighting(&self, frame: u64) -> GpuPtr<ParticleLighting> {
+        let slot = (frame % FRAME_SLOTS as u64) as usize;
+        if self.particle_frames[slot] == Some(frame) {
+            self.particles.at(slot)
+        } else {
+            GpuPtr::NULL
+        }
     }
 }
 
@@ -331,6 +333,42 @@ impl MediaKernels {
             reference: u32::from(lighting.reference.is_some()),
             segment_steps: settings.segment_steps,
             dof_background: StorageImageIndex::NONE,
+        }
+    }
+
+    /// What transparency hooks light and fog particles with after media apply of `pass`:
+    /// this frame's froxels where `media` holds them.
+    fn particle_lighting(
+        &self,
+        media: &MediaView,
+        scene: &SceneLighting,
+        pass: &ViewPass,
+        layers: GpuPtr<LayerGuide>,
+    ) -> ParticleLighting {
+        let v = media.volumes.as_ref();
+        let [columns, rows, slices] = v.map_or([0; 3], |v| v.shape.grid);
+        let current = |p: &[Volume; 2]| p[media.current].sampled;
+        ParticleLighting {
+            scene: pass.scene,
+            view: pass.view,
+            set: scene.light_set(),
+            cache: scene.world_cache(pass.frame),
+            lights: media.lights.gpu(),
+            layers,
+            incident: v.map_or(TextureIndex::NONE, |v| current(&v.incident)),
+            visibility: v
+                .and_then(|v| v.visibility.as_ref())
+                .map_or(TextureIndex::NONE, current),
+            integrated: v.map_or(TextureIndex::NONE, |v| v.integrated.sampled),
+            integrated_rgb: v
+                .and_then(|v| v.integrated_rgb.as_ref())
+                .map_or(TextureIndex::NONE, |t| t.sampled),
+            sampler: self.sampler,
+            columns,
+            rows,
+            slices,
+            frame: pass.sample_index,
+            seed: pass.seed,
         }
     }
 
@@ -439,6 +477,10 @@ impl MediaKernels {
         let layers = view.layer_guides(pass.frame);
         let dof_background = view.dof_background_store(pass.frame);
         let media = &mut view.media;
+        let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
+        media.particle_frames[slot] = Some(pass.frame);
+        let particles = self.particle_lighting(media, scene, pass, layers);
+        media.particles.write(slot, particles);
         if media.volumes.is_none() {
             return;
         }
@@ -454,7 +496,6 @@ impl MediaKernels {
             | LightingDebugView::Subsurface => MEDIA_OFF,
             _ => MEDIA_COMPOSE,
         };
-        let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         let root = FroxelRoot {
             layers,
             dof_background,

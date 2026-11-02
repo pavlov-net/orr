@@ -22,8 +22,12 @@
 //! ([`ViewLighting::pixel_fraction`]), into the view's [`LightingView`] radiance and light
 //! feedback with the settings of [`ViewLighting`]; [`LightingKernels::record_dielectric`]
 //! traces each pixel's first dielectric or presence layer and its path over that radiance;
-//! [`LightingKernels::record_media_apply`] composes the froxels with the radiance; and
-//! [`LightingKernels::record_guides`] writes the view's ray reconstruction guides. The `path`
+//! [`LightingKernels::record_media_apply`] composes the froxels with the radiance and leaves
+//! [`LightingView::particle_lighting`], with which transparency hooks light and fog blended
+//! particles (the `particle_lighting` module, or [`ParticleDraw`] for producer particle
+//! entries); and [`LightingKernels::record_guides`] writes the view's ray reconstruction
+//! guides. Rays leaving the first vertex and dielectric vertices see particles by their
+//! emission, and shadow rays by what their opacity lets through. The `path`
 //! module holds the opaque path, `dielectric` the dielectric one and `froxels` the froxel
 //! passes, for kernels that trace more. Both paths walk the interior of a subsurface surface
 //! at its first vertex on the path (see [`ViewLighting::sss_depth`]); `subsurface` holds the
@@ -32,6 +36,7 @@
 mod bsdf;
 mod environment;
 mod media;
+mod particles;
 mod scene;
 mod subsurface;
 mod view;
@@ -42,6 +47,7 @@ pub use environment::{ENVIRONMENT_SIZE, EnvironmentMapGpu};
 pub use media::{FROXEL_TILE, MAX_FROXEL_SHADOWED_LIGHTS, MediaSettings, MediaStats};
 pub use orr_scene::orr_gpu::KernelSet;
 pub use orr_scene::{Cone, DirectionalLight, DiscProfile, Light, LightId, PathEntry};
+pub use particles::ParticleDraw;
 pub use scene::{
     FRAME_SLOTS, LIGHT_TILE_SIZE, LIGHT_TILES, LightingStats, SceneLighting, SceneLightingSettings,
     ScenePass, WorldCacheSettings,
@@ -49,7 +55,7 @@ pub use scene::{
 pub use shaders::types::{
     CapTail, DirectionalState, EmissiveSelection, EnvironmentGpu, FroxelLights, FroxelRoot,
     GuideRoot, LayerGuide, LightSample, LightSetGpu, LightSetStats, LocalLights, MediaStatsGpu,
-    PathRoot, WorldCacheGpu,
+    ParticleLighting, PathRoot, WorldCacheGpu,
 };
 pub use subsurface::{CapTailTable, SSS_STEPS, SubsurfaceDepth};
 pub use view::{
@@ -71,6 +77,8 @@ pub mod shaders {
 pub enum Error {
     #[error(transparent)]
     Gpu(#[from] orr_scene::orr_gpu::Error),
+    #[error(transparent)]
+    Scene(#[from] orr_scene::Error),
     #[error("invalid lighting settings: {0}")]
     Settings(&'static str),
     /// A replacement kernel does not match the module it replaces.
