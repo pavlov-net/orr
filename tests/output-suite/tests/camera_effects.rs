@@ -505,7 +505,7 @@ mod depth_of_field {
                 depth_of_field: dof,
                 ..Lens::default()
             };
-            let mask = self.output.dof_hole_mask(&lens, &projection(), OUT);
+            let mask = self.output.dof_hole_mask(&lens, &projection(), OUT, OUT);
             let background = match mask.filter(|_| self.holes) {
                 Some(mask) => {
                     let root = &mut self.root.as_mut_slice().unwrap()[0];
@@ -705,10 +705,13 @@ mod depth_of_field {
         };
         b.render(Scene::Foreground, Some(dof), DofPath::AfterRr);
         let with_holes = b.output.depth_of_field_bytes();
-        let mask = b.output.dof_hole_mask(&lens, &projection(), OUT).unwrap();
+        let mask = b
+            .output
+            .dof_hole_mask(&lens, &projection(), OUT, OUT)
+            .unwrap();
         assert!(
             b.output
-                .dof_hole_mask(&lens, &projection(), [OUT[0] / 2, OUT[1]])
+                .dof_hole_mask(&lens, &projection(), [OUT[0] / 2, OUT[1]], OUT)
                 .is_none()
         );
         let expected = 0.5 * (0.5 * SENSOR_MM / TAN_X) / dof.f_number / 1000.0;
@@ -739,7 +742,11 @@ mod depth_of_field {
         );
         b.holes = false;
         b.render(Scene::Foreground, Some(dof), DofPath::AfterRr);
-        assert!(b.output.dof_hole_mask(&lens, &projection(), OUT).is_none());
+        assert!(
+            b.output
+                .dof_hole_mask(&lens, &projection(), OUT, OUT)
+                .is_none()
+        );
         assert!(b.output.depth_of_field_bytes() < with_holes);
         assert_clean();
     }

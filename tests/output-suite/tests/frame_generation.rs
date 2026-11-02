@@ -254,6 +254,7 @@ fn frame_generation_presents_generated_images_before_each_frame() {
             },
             lens: Lens::default(),
             render_extent: UVec2::from(extent),
+            output_extent: UVec2::from(extent),
             jitter: Vec2::ZERO,
             // The bar jumps back when it wraps.
             reset_history: i % PHASE == 0 || (i as f32 * SPEED) % travel < SPEED,

@@ -242,6 +242,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                 },
                 lens: Lens::default(),
                 render_extent: UVec2::from(extent),
+                output_extent: UVec2::from(extent),
                 jitter: Vec2::ZERO,
                 reset_history: i == 0,
                 mip_bias: 0.0,

@@ -133,13 +133,16 @@ pub(crate) struct FgCameraState {
     /// World from view.
     pub(crate) rotation: Quat,
     pub(crate) projection: Projection,
+    /// The render extent, of the depth and motion.
     pub(crate) extent: [u32; 2],
+    /// The output extent, whose aspect ratio the projection takes.
+    pub(crate) output: [u32; 2],
 }
 
 impl FgCameraState {
     fn clip_from_view(&self) -> DMat4 {
         self.projection
-            .clip_from_view(self.extent.into())
+            .clip_from_view(self.output.into())
             .as_dmat4()
     }
 
@@ -177,7 +180,7 @@ pub(crate) fn fg_camera(cur: &FgCameraState, prev: &FgCameraState, anchor: DVec3
         near: cur.projection.near,
         far: FG_FAR_M,
         fov_y: cur.projection.fov_y,
-        aspect: cur.extent[0] as f32 / cur.extent[1].max(1) as f32,
+        aspect: cur.output[0] as f32 / cur.output[1].max(1) as f32,
     }
 }
 
@@ -362,6 +365,7 @@ mod tests {
             rotation: Quat::from_rotation_y(0.3),
             projection,
             extent: [1600, 900],
+            output: [1600, 900],
         };
         let cur = FgCameraState {
             position: prev.position + DVec3::new(0.4, 0.1, -0.7),

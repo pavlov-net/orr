@@ -1780,6 +1780,7 @@ impl Bed {
             },
             lens: Lens::default(),
             render_extent: UVec2::from(EXTENT),
+            output_extent: UVec2::from(EXTENT),
             jitter: Vec2::ZERO,
             reset_history: cut,
             mip_bias: 0.0,

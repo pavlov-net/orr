@@ -87,7 +87,8 @@ pub struct Projection {
 }
 
 impl Projection {
-    /// Clip from view for an image of `extent`, unjittered: Vulkan clip space with y down.
+    /// Clip from view for an output image of `extent`, unjittered: Vulkan clip space with y
+    /// down. Only its aspect ratio matters.
     pub fn clip_from_view(&self, extent: UVec2) -> Mat4 {
         clip_from_view(self, extent)
     }
@@ -180,6 +181,9 @@ pub struct ViewDesc {
     pub projection: Projection,
     pub lens: Lens,
     pub render_extent: UVec2,
+    /// The extent of the image the view ends up in, whose aspect ratio the projection takes.
+    /// An upscaler's render extent only rounds to it.
+    pub output_extent: UVec2,
     /// Render pixels: each sample sits at its pixel centre minus the jitter, y down.
     pub jitter: Vec2,
     /// A camera cut: the previous camera is taken to be this one.
@@ -301,7 +305,7 @@ pub(crate) fn view_constants(
     frame: u64,
     delta_time: f32,
 ) -> ViewConstants {
-    let clip = clip_from_view(&desc.projection, desc.render_extent);
+    let clip = clip_from_view(&desc.projection, desc.output_extent);
     let clip_jittered = jittered(clip, desc.jitter, desc.render_extent);
     let current = Camera {
         scene: desc.scene,
