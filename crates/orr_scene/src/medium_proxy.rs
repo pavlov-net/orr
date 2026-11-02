@@ -65,8 +65,8 @@ pub enum ProxyDensity {
 }
 
 /// A box of participating medium. Shadow rays take its transmittance, marching its density
-/// along their span inside the box; camera, path and cache rays do not see it. Its volume
-/// space sits in the world at `position`, turned by `rotation` and scaled by `scale`.
+/// along their span inside the box, and media apply marches it along camera rays; path and
+/// cache rays do not see it. Its volume space sits in the world at `position`, turned by `rotation` and scaled by `scale`.
 /// Coefficients are linear Rec.2020.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MediumProxy {

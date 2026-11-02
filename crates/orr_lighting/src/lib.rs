@@ -29,8 +29,8 @@
 //! [`LightingKernels::record_guides`] writes the view's ray reconstruction guides. Rays
 //! leaving the first vertex and dielectric vertices see particles by their emission, and
 //! shadow rays by what their opacity lets through. The `path` module holds the opaque path,
-//! `dielectric` the dielectric one and `froxels` the froxel passes, for kernels that trace
-//! more. Both paths walk the interior of a subsurface surface at its first vertex on the path
+//! `dielectric` the dielectric one, `froxels` the froxel passes and `camera_media` media
+//! apply, for kernels that trace more. Both paths walk the interior of a subsurface surface at its first vertex on the path
 //! (see [`ViewLighting::sss_depth`]); `subsurface` holds the walk.
 
 mod bsdf;
@@ -44,7 +44,9 @@ mod world_cache;
 
 pub use bsdf::BsdfTables;
 pub use environment::{ENVIRONMENT_SIZE, EnvironmentMapGpu};
-pub use media::{AERIAL_SIZE, FROXEL_TILE, MAX_FROXEL_SHADOWED_LIGHTS, MediaSettings, MediaStats};
+pub use media::{
+    AERIAL_SIZE, FROXEL_TILE, MAX_FROXEL_SHADOWED_LIGHTS, MAX_PROXY_RAYS, MediaSettings, MediaStats,
+};
 pub use orr_scene::orr_gpu::KernelSet;
 pub use orr_scene::{Cone, DirectionalLight, DiscProfile, Light, LightId, PathEntry};
 pub use particles::ParticleDraw;
@@ -54,8 +56,8 @@ pub use scene::{
 };
 pub use shaders::types::{
     CapTail, DirectionalState, EmissiveSelection, EnvironmentGpu, FroxelLights, FroxelRoot,
-    GuideRoot, LayerGuide, LightSample, LightSetGpu, LightSetStats, LocalLights, MediaStatsGpu,
-    ParticleLighting, PathRoot, WorldCacheGpu,
+    GuideRoot, LayerGuide, LightSample, LightSetGpu, LightSetStats, LocalLights, MediaApplyRoot,
+    MediaStatsGpu, ParticleLighting, PathRoot, WorldCacheGpu,
 };
 pub use subsurface::{CapTailTable, SSS_STEPS, SubsurfaceDepth};
 pub use view::{

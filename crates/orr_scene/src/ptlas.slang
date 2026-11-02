@@ -1021,7 +1021,7 @@ void proxy_write(uint3 id: SV_DispatchThreadID)
     {
         Placement pl;
         pl.linear = transpose(float3x3(p.axis_x, p.axis_y, p.axis_z));
-        pl.translation = float3((p.cell - s.origin_cell.xyz) << uint(s.origin_cell.w)) + p.offset;
+        pl.translation = proxy_render_center(s, p);
         pl.scale = max(length(p.axis_x), max(length(p.axis_y), length(p.axis_z)));
         w = instance_write(w.instance_index, global_partition(), pl, float3(-1.0), float3(1.0), root.proxy_blas, CLASS_MEDIUM);
     }

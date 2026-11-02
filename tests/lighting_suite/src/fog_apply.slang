@@ -3,9 +3,9 @@
 import media;
 import media_types;
 import surface;
-import froxels;
+import camera_media;
 
-ORR_ROOT(FroxelRoot);
+ORR_ROOT(MediaApplyRoot);
 
 [shader("compute")]
 [numthreads(8, 8, 1)]

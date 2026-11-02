@@ -860,9 +860,11 @@ impl LightingKernels {
     /// segment to its surface, plus the in-scatter over it, from the froxels to the scene's
     /// `near_range`, the aerial-perspective LUT to [`MediaSettings::ap_range`] and a march
     /// past it. Sky pixels take the froxels' whole range; the environment carries the medium
-    /// beyond. The reference marches the segment per pixel instead. Also writes the frame's
-    /// [`LightingView::particle_lighting`] for the transparency hook after it. Orders nothing
-    /// after it.
+    /// beyond. Medium proxies the camera ray crosses, at most the nearest 4 per pixel, are
+    /// marched per pixel at their voxel spacing, lit by the froxels' isotropic light and
+    /// [`MediaSettings::proxy_shadow_rays`] shadow rays. The reference marches the segment per pixel instead. Also writes the
+    /// frame's [`LightingView::particle_lighting`] for the transparency hook after it. Orders
+    /// nothing after it.
     pub fn record_media_apply(
         &self,
         list: &mut CommandList<'_>,

@@ -188,8 +188,9 @@ public struct FroxelLights
     public uint count;
     // 1 when the lights differ from the last frame's: their visibility history restarts.
     public uint changed;
+    // Medium proxies in the view's frustum this frame; 0 spares media apply its ray per pixel.
+    public uint proxies;
     public uint _pad0;
-    public uint _pad1;
 }
 
 // One frame's froxel volume of a view, for passes that read it after its integration.

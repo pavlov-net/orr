@@ -10,7 +10,8 @@ use orr_scene::orr_gpu::{
 use crate::scene::{FRAME_SLOTS, Ring};
 use crate::shaders::media::{aerial, apply, froxel};
 use crate::shaders::types::{
-    FroxelLights, FroxelRoot, FroxelVolume, LayerGuide, MediaStatsGpu, ParticleLighting,
+    FroxelLights, FroxelRoot, FroxelVolume, LayerGuide, MediaApplyRoot, MediaStatsGpu,
+    ParticleLighting,
 };
 use crate::view::{LightingDebugView, LightingView, ViewLighting, ViewPass};
 use crate::{Error, KernelSet, SceneLighting, pipeline};
@@ -25,7 +26,11 @@ pub const AERIAL_SIZE: u32 = 32;
 /// `MAX_FROXEL_SHADOWED_LIGHTS`).
 pub const MAX_FROXEL_SHADOWED_LIGHTS: u32 = 4;
 
-/// `froxels`' `MEDIA_*`.
+/// Most shadow rays per light a camera ray traces over a stretch of medium proxies
+/// (`camera_media`'s `MAX_PROXY_RAYS`).
+pub const MAX_PROXY_RAYS: u32 = 8;
+
+/// `camera_media`'s `MEDIA_*`.
 const MEDIA_COMPOSE: u32 = 0;
 const MEDIA_INSCATTER: u32 = 1;
 const MEDIA_FROXELS: u32 = 2;
@@ -43,7 +48,9 @@ pub struct MediaSettings {
     /// march past it. At most `near_range` turns the LUT off.
     pub ap_range: f32,
     /// Steps of the in-scatter march on path segments of 500 m or more, on camera segments
-    /// past `ap_range`, and of the reference's camera segment.
+    /// past `ap_range`, and of the reference's camera segment. Also the most steps a camera
+    /// ray takes over a stretch through medium proxies, which it otherwise marches at their
+    /// voxel spacing.
     pub segment_steps: u32,
     /// The froxels' transmittance per channel instead of its luminance.
     pub chromatic_transmittance: bool,
@@ -51,6 +58,11 @@ pub struct MediaSettings {
     /// traces a shadow ray, at most [`MAX_FROXEL_SHADOWED_LIGHTS`]; the others light the
     /// froxels unshadowed and isotropically.
     pub froxel_shadowed_lights: u32,
+    /// Shadow rays per shadowed light a camera ray traces over each stretch through medium
+    /// proxies, at most [`MAX_PROXY_RAYS`]; its steps take visibility between the two nearest,
+    /// so a proxy smaller than a froxel keeps its self-shadowing. 0 takes the froxels'
+    /// visibility inside them, and one ray per stretch past them.
+    pub proxy_shadow_rays: u32,
 }
 
 impl Default for MediaSettings {
@@ -61,6 +73,7 @@ impl Default for MediaSettings {
             segment_steps: 16,
             chromatic_transmittance: false,
             froxel_shadowed_lights: 1,
+            proxy_shadow_rays: 8,
         }
     }
 }
@@ -73,6 +86,8 @@ pub struct MediaStats {
     pub active_froxels: u32,
     /// Rays the froxels traced.
     pub froxel_rays: u32,
+    /// Medium proxies in the view's frustum.
+    pub visible_proxies: u32,
 }
 
 /// One 3D target with its storage and sampled views.
@@ -195,7 +210,7 @@ pub(crate) struct MediaView {
     stats: Allocation<MediaStatsGpu>,
     frames: [Option<u64>; FRAME_SLOTS],
     roots: Ring<FroxelRoot>,
-    apply_roots: Ring<FroxelRoot>,
+    apply_roots: Ring<MediaApplyRoot>,
     volume_roots: Ring<FroxelVolume>,
     particles: Ring<ParticleLighting>,
     particle_frames: [Option<u64>; FRAME_SLOTS],
@@ -209,8 +224,8 @@ impl MediaView {
             ids: [u32::MAX; 4],
             count: 0,
             changed: 0,
+            proxies: 0,
             _pad0: 0,
-            _pad1: 0,
         };
         Ok(Self {
             volumes: None,
@@ -237,6 +252,7 @@ impl MediaView {
                 frame,
                 active_froxels: s.active,
                 froxel_rays: s.rays,
+                visible_proxies: s.proxies,
             }
         })
     }
@@ -299,8 +315,6 @@ impl MediaKernels {
         scene: &SceneLighting,
         pass: &ViewPass,
         lighting: &ViewLighting,
-        radiance: StorageImageIndex,
-        mode: u32,
     ) -> FroxelRoot {
         let settings = &lighting.media;
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
@@ -328,7 +342,6 @@ impl MediaKernels {
             cache: scene.world_cache(pass.frame),
             lights: media.lights.gpu(),
             stats: media.stats.gpu().offset(slot as u64),
-            layers: GpuPtr::NULL,
             sigma: v.sigma.store,
             words: v.words.store,
             incident: v.incident[cur].store,
@@ -339,7 +352,6 @@ impl MediaKernels {
             integrated_rgb,
             integrated_sampled: v.integrated.sampled,
             integrated_rgb_sampled,
-            radiance,
             sampler: self.sampler,
             columns,
             rows,
@@ -351,10 +363,6 @@ impl MediaKernels {
             seed: pass.seed,
             history: media.history,
             chromatic: u32::from(v.shape.chromatic),
-            mode,
-            reference: u32::from(lighting.reference.is_some()),
-            segment_steps: settings.segment_steps,
-            dof_background: StorageImageIndex::NONE,
             aerial: v.aerial.store,
             aerial_rgb,
             aerial_sampled: v.aerial.sampled,
@@ -362,7 +370,6 @@ impl MediaKernels {
             ap_range: settings.ap_range,
             _pad0: 0,
             _pad1: 0,
-            _pad2: 0,
         }
     }
 
@@ -450,14 +457,7 @@ impl MediaKernels {
         media.current = 1 - media.current;
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         media.frames[slot] = Some(pass.frame);
-        let root = self.root(
-            media,
-            scene,
-            pass,
-            lighting,
-            StorageImageIndex::NONE,
-            MEDIA_COMPOSE,
-        );
+        let root = self.root(media, scene, pass, lighting);
         media.volume_roots.write(
             slot,
             FroxelVolume {
@@ -524,8 +524,8 @@ impl MediaKernels {
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         media.particle_frames[slot] = Some(pass.frame);
         let particles = self.particle_lighting(media, scene, pass, lighting, layers);
-        media.particles.write(slot, particles);
-        if media.volumes.is_none() {
+        let particles = media.particles.write(slot, particles);
+        if media.frames[slot] != Some(pass.frame) {
             return;
         }
         let mode = match lighting.debug_view {
@@ -540,12 +540,20 @@ impl MediaKernels {
             | LightingDebugView::Subsurface => MEDIA_OFF,
             _ => MEDIA_COMPOSE,
         };
-        let root = FroxelRoot {
-            layers,
-            dof_background,
-            ..self.root(media, scene, pass, lighting, radiance, mode)
-        };
-        let root = media.apply_roots.write(slot, root);
+        let root = media.apply_roots.write(
+            slot,
+            MediaApplyRoot {
+                froxels: media.roots.at(slot),
+                lighting: particles,
+                layers,
+                radiance,
+                dof_background,
+                mode,
+                reference: u32::from(lighting.reference.is_some()),
+                segment_steps: lighting.media.segment_steps,
+                proxy_rays: lighting.media.proxy_shadow_rays.min(MAX_PROXY_RAYS),
+            },
+        );
         let [w, h] = extent;
         list.begin_pass("media apply", false);
         list.dispatch(&self.apply, root, [w.div_ceil(8), h.div_ceil(8), 1]);

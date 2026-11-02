@@ -1,14 +1,15 @@
-// Media apply: the froxels' in-scatter and transmittance composed with every pixel's
-// radiance, or with the reference, the camera segment marched per pixel.
+// Media apply: the froxels' in-scatter and transmittance and a march through the medium proxies
+// the pixel's ray crosses, composed with every pixel's radiance, or with the reference, the
+// camera segment marched per pixel.
 #include "orr/root.h"
 import media;
 import surface;
-import froxels;
+import camera_media;
 
 extern struct Surface : ISurface = StandardSurface;
 extern struct Medium : IMedium = NoMedium;
 
-ORR_ROOT(FroxelRoot);
+ORR_ROOT(MediaApplyRoot);
 
 [shader("compute")]
 [numthreads(8, 8, 1)]

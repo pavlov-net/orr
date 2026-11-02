@@ -136,14 +136,8 @@ public struct ShadowCandidates<S : ISurface, M : IMedium> : ICandidate
     {
         float3 o = c.object_origin;
         float3 d = c.object_direction;
-        float3 inv = select(d != 0.0, 1.0 / d, float3(1e30));
-        float3 a = (-1.0 - o) * inv;
-        float3 b = (1.0 - o) * inv;
-        float3 lo = min(a, b);
-        float3 hi = max(a, b);
-        float t0 = max(max(lo.x, max(lo.y, lo.z)), 0.0);
-        float t1 = min(min(hi.x, min(hi.y, hi.z)), t_max);
-        if (!(t1 > t0))
+        float t0, t1;
+        if (!proxy_span(o, d, t_max, t0, t1))
             return float3(1.0);
         MediumProxyGpu p = scene_proxy(scene, c.instance_index);
         if (p.volume == nullptr)
@@ -151,28 +145,29 @@ public struct ShadowCandidates<S : ISurface, M : IMedium> : ICandidate
         uint3 key = uint3(asuint(origin.x) ^ (c.instance_index * 0x9E3779B9u), asuint(origin.y) ^ (c.primitive_index * 0x85EBCA6Bu), asuint(origin.z) ^ scene.frame_index);
         float jitter = unit_float(pcg3d(key).x);
         float h = max(proxy_voxel_step(p, d), (t1 - t0) / float(PROXY_STEPS));
-        // Steps sit at t0 + (k + jitter) h; `next` is the first k not yet taken.
-        uint next = 0;
-        float3 tau = float3(0.0);
-        float t = t0;
-        // The cap on cells only guards against a walk that stops advancing.
-        for (uint cell = 0; cell < 4 * PROXY_STEPS && t < t1; cell++)
-        {
-            float t_exit;
-            float m = proxy_majorant_span(p, o, d, t, t_exit);
-            float end = min(max(t_exit, t + 1e-5 * (t1 - t0)), t1);
-            uint k = max(next, uint(max(ceil((t - t0) / h - jitter), 0.0)));
-            for (; m > 0.0 && k < PROXY_STEPS + 1; k++)
-            {
-                float x = t0 + (float(k) + jitter) * h;
-                if (x >= end)
-                    break;
-                tau += proxy_medium(p, o + d * x).sigma_t * h;
-            }
-            next = k;
-            t = end;
-        }
-        return exp(-max(tau, 0.0));
+        ProxyDepth depth = { p, o, d, float3(0.0) };
+        proxy_march(t0, t1, h, jitter, depth);
+        return exp(-max(depth.tau, 0.0));
+    }
+}
+
+// Sums a proxy's optical depth over the steps of its march.
+struct ProxyDepth : IProxyStep
+{
+    MediumProxyGpu proxy;
+    float3 origin;
+    float3 direction;
+    float3 tau;
+
+    float majorant(float t, out float t_exit)
+    {
+        return proxy_majorant_span(proxy, origin, direction, t, t_exit);
+    }
+
+    [mutating]
+    void step(float t, float h)
+    {
+        tau += proxy_medium(proxy, origin + direction * t).sigma_t * h;
     }
 }
 

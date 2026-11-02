@@ -1,7 +1,8 @@
 // A view's froxel volume (`media`'s layout): each frame `froxel_inject` writes the linked
 // medium per froxel, `froxel_light` the light reaching the froxels in front of the view's
 // surfaces, blended over frames, and `froxel_integrate` the in-scatter and transmittance
-// from the eye along each column; `media_apply` composes them with every pixel's radiance.
+// from the eye along each column; media apply (`camera_media`) composes them with every
+// pixel's radiance.
 //
 // A froxel's light is isotropic incident radiance (the world cache's ambient on two opposed
 // normals and resampled tile lights, one shadow ray) plus one visibility per shadowed
@@ -27,12 +28,10 @@ import visibility;
 import media;
 import light_sampling;
 import world_cache;
-import path;
 import shadow;
 
 // Separates the froxels' samples from the paths' of the same pixel.
 public static const uint FROXEL_STREAM = 0x85EBCA6B;
-public static const uint MEDIA_STREAM = 0xC2B2AE35;
 
 // A froxel's history keeps at least this share of each frame's sample.
 public static const float FROXEL_BLEND = 1.0 / 16.0;
@@ -49,12 +48,6 @@ public static const float FROXEL_ORDER_HYSTERESIS = 2.0;
 // Largest incident radiance a froxel stores, nits (RGBA16F).
 public static const float FROXEL_INCIDENT_MAX = 65000.0;
 
-// `FroxelRoot.mode`: what media apply writes.
-public static const uint MEDIA_COMPOSE = 0;
-public static const uint MEDIA_INSCATTER = 1;   // the in-scatter alone
-public static const uint MEDIA_FROXELS = 2;     // transmittance in r, slice coordinate / slices in g, a column checker in b
-public static const uint MEDIA_OFF = 3;         // radiance left as the paths wrote it
-
 // One frame's froxel counts, read back by the CPU.
 public struct MediaStatsGpu
 {
@@ -62,8 +55,9 @@ public struct MediaStatsGpu
     public uint active;
     // Rays the light pass traced.
     public uint rays;
+    // Medium proxies in the view's frustum.
+    public uint proxies;
     public uint _pad0;
-    public uint _pad1;
 }
 
 public struct FroxelRoot
@@ -75,7 +69,6 @@ public struct FroxelRoot
     public WorldCacheGpu* cache;
     public FroxelLights* lights;
     public MediaStatsGpu* stats;
-    public LayerGuide* layers;                  // media apply's: the dielectric dispatch's layer memory, null for none
     public StorageImageIndex sigma;             // froxel_material, RGBA16F
     public StorageImageIndex words;             // froxel_material, RGBA32_UINT
     public StorageImageIndex incident;          // this frame's, RGBA16F
@@ -86,7 +79,6 @@ public struct FroxelRoot
     public StorageImageIndex integrated_rgb;    // RGBA8, with `chromatic`
     public TextureIndex integrated_sampled;
     public TextureIndex integrated_rgb_sampled;
-    public StorageImageIndex radiance;          // the view's, RGBA16F
     public SamplerIndex sampler;                // linear, clamped
     public uint columns;
     public uint rows;
@@ -96,10 +88,6 @@ public struct FroxelRoot
     public uint seed;
     public uint history;                        // frames the history holds; 0 starts it over
     public uint chromatic;                      // rgb transmittance
-    public uint mode;                           // MEDIA_*
-    public uint reference;                      // 1: media apply marches the camera segment
-    public uint segment_steps;                  // steps of that march, and of the march past `ap_range`
-    public StorageImageIndex dof_background;    // media apply's: the opaque dispatch's background layer, NONE for none
     public StorageImageIndex aerial;            // the aerial-perspective LUT, RGBA16F
     public StorageImageIndex aerial_rgb;        // its rgb transmittance, RGBA16F, with `chromatic`
     public TextureIndex aerial_sampled;
@@ -107,7 +95,6 @@ public struct FroxelRoot
     public float ap_range;                      // m, the view's; the LUT's far end
     public uint _pad0;
     public uint _pad1;
-    public uint _pad2;
 }
 
 // The view-space ray through point `p` of the view's unjittered image, in render pixels,
@@ -215,8 +202,30 @@ bool froxel_history_coord(FroxelRoot r, float3 p, out float3 coord)
     return all(coord >= 0.0) && all(coord <= 1.0) && length(relative) <= r.scene.near_range;
 }
 
+// Whether proxy `p`'s box can reach view `v`'s image: false when all its corners lie outside
+// one side of the frustum, with room for the view's jitter.
+bool proxy_in_frustum(SceneRoot* s, ViewConstants* v, MediumProxyGpu p)
+{
+    float3 center = proxy_render_center(s, p) - v.eye_render.xyz;
+    uint outside = 0x1F;
+    for (uint i = 0; i < 8; i++)
+    {
+        float3 corner = center;
+        corner += ((i & 1u) != 0 ? 1.0 : -1.0) * p.axis_x;
+        corner += ((i & 2u) != 0 ? 1.0 : -1.0) * p.axis_y;
+        corner += ((i & 4u) != 0 ? 1.0 : -1.0) * p.axis_z;
+        float3 d = mul(v.view_from_world_rotation, float4(corner, 0.0));
+        float4 c = mul(v.clip_from_view, float4(d, 1.0));
+        float w = 1.01 * c.w;
+        uint sides = (c.x > w ? 1u : 0u) | (c.x < -w ? 2u : 0u) | (c.y > w ? 4u : 0u) | (c.y < -w ? 8u : 0u) | (c.w <= 0.0 ? 16u : 0u);
+        outside &= sides;
+    }
+    return outside == 0;
+}
+
 // The view's shadowed directional lights this frame: the brightest by selection weight,
-// kept in order until another light outweighs one of them by FROXEL_ORDER_HYSTERESIS.
+// kept in order until another light outweighs one of them by FROXEL_ORDER_HYSTERESIS. Also
+// counts the medium proxies in the view's frustum.
 public void froxel_order(FroxelRoot r)
 {
     LightSetGpu* set = r.set;
@@ -280,6 +289,15 @@ public void froxel_order(FroxelRoot r)
     out.count = count;
     out.changed = changed ? 1 : 0;
     *r.stats = (MediaStatsGpu)0;
+    uint proxies = 0;
+    for (uint i = 0; i < r.scene.proxy_capacity; i++)
+    {
+        MediumProxyGpu p = r.scene.proxies[i];
+        if ((p.flags & PROXY_LIVE) != 0 && proxy_in_frustum(r.scene, r.view, p))
+            proxies++;
+    }
+    out.proxies = proxies;
+    r.stats.proxies = proxies;
 }
 
 // Writes froxel `f`'s medium.
@@ -492,11 +510,7 @@ float3 froxel_source<M : IMedium>(LightSetGpu* set, FroxelLights lights, MediumP
             light += directional_illuminance(set, id) * vis * M.phase(data, m, dot(to_light, dir))
                 * M.transmittance(data, x, to_light, positive_infinity());
     }
-    for (uint j = 0; j < set.directional_count; j++)
-    {
-        uint id = set.directional_ids[j];
-        light += directional_illuminance(set, id) * M.multiple_scattering(data, x, set.scene.lights[id].direction);
-    }
+    light += multiple_scattered<M>(set, x);
     return m.emission + m.sigma_s * light;
 }
 
@@ -717,140 +731,4 @@ public void aerial_build<M : IMedium>(FroxelRoot r, uint2 column)
             r.aerial_rgb.get<RWTexture3D<float4>>()[texel] = float4(transmittance, 1.0);
         d0 = d1;
     }
-}
-
-// The froxels' in-scatter (pre-exposed) and transmittance from the eye to distance `t` along
-// the ray through `pixel`.
-float3 froxel_fog(FroxelRoot r, uint2 pixel, float t, out float3 transmittance)
-{
-    return integrated_fog(r.integrated_sampled, r.integrated_rgb_sampled, r.sampler, uint3(r.columns, r.rows, r.slices), r.view.extent, r.scene.near_range, float2(pixel) + 0.5, t, transmittance);
-}
-
-// The reference camera segment: in-scatter (unexposed) over `t` m from the eye along `dir`
-// in `steps` jittered steps, each lit by one next-event candidate with its shadow ray and
-// by the medium's multiple scattering; transmittance exactly.
-float3 reference_fog<S : ISurface, M : IMedium>(FroxelRoot r, uint2 pixel, float3 dir, float t, out float3 transmittance)
-{
-    SceneRoot* s = r.scene;
-    LightSetGpu* set = r.set;
-    uint64_t data = s.medium;
-    float3 eye = r.view.eye_render.xyz;
-    Sampler rng = Sampler(pixel, r.frame, r.seed ^ MEDIA_STREAM);
-    uint steps = max(r.segment_steps, 1u);
-    float dt = t / float(steps);
-    float3 inscatter = float3(0.0);
-    for (uint k = 0; k < steps; k++)
-    {
-        float d = (float(k) + rng.next()) * dt;
-        float3 x = eye + dir * d;
-        MediumPoint m = M.sample(data, x);
-        NeeVertex nv = { x, float3(0.0), pixel, nullptr };
-        ResolvedLightSample c = nee_candidate(set, nv, rng);
-        float3 source = m.emission;
-        if (any(m.sigma_s > 0.0))
-        {
-            if (c.pdf > 0.0)
-            {
-                float3 l = c.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, c.light, c.dir) : c.radiance;
-                float t_max = isfinite(c.distance) ? c.distance * (1.0 - 1e-4) : c.distance;
-                RayCone cone = { 0.0, 0.0 };
-                float3 vis = visibility<S, M>(s, r.view, x, c.dir, t_max, RAY_FLAG_NONE, hit_context(HIT_SECONDARY, 1, cone, 0.0), c.kind != LIGHT_SAMPLE_ENVIRONMENT, set.shadow_overflows);
-                source += m.sigma_s * M.phase(data, m, dot(c.dir, dir)) * l * vis / c.pdf;
-            }
-            for (uint j = 0; j < set.directional_count; j++)
-            {
-                uint id = set.directional_ids[j];
-                source += m.sigma_s * directional_illuminance(set, id) * M.multiple_scattering(data, x, s.lights[id].direction);
-            }
-        }
-        inscatter += medium_transmittance<M>(data, eye, dir, d) * source * dt;
-    }
-    transmittance = medium_transmittance<M>(data, eye, dir, t);
-    return inscatter;
-}
-
-// The in-scatter (pre-exposed) and transmittance from the scene's `near_range` to `t` m along
-// unit `dir`, the ray through `pixel`: the aerial-perspective LUT to `ap_range`, then
-// `segment_inscatter` past it.
-float3 far_fog<M : IMedium>(FroxelRoot r, uint2 pixel, float3 dir, float t, out float3 transmittance)
-{
-    ViewConstants* v = r.view;
-    float near_range = r.scene.near_range;
-    float ap_range = max(r.ap_range, near_range);
-    transmittance = float3(1.0);
-    float3 inscatter = float3(0.0);
-    if (ap_range > near_range)
-        inscatter = aerial_fog(r.aerial_sampled, r.aerial_rgb_sampled, r.sampler, v.extent, near_range, ap_range, float2(pixel) + 0.5, t, transmittance);
-    if (t > ap_range)
-    {
-        Sampler rng = Sampler(pixel, r.frame, r.seed ^ MEDIA_STREAM);
-        float3 through;
-        float3 past = segment_inscatter<M>(r.set, v.eye_render.xyz + dir * ap_range, dir, t - ap_range, r.segment_steps, rng.next(), through);
-        inscatter += transmittance * past * v.exposure[v.exposure_slot].pre_exposure;
-        transmittance *= through;
-    }
-    return inscatter;
-}
-
-// The camera segment's in-scatter (pre-exposed) and transmittance over `t` m along the ray
-// through `pixel`: the froxels to the scene's `near_range` and, on surfaces, `far_fog` past
-// it. Sky pixels (`t` infinite) take the froxels alone; the environment carries the rest. The
-// reference marches the whole segment, to `near_range` on sky pixels.
-float3 camera_fog<S : ISurface, M : IMedium>(FroxelRoot r, uint2 pixel, float t, out float3 transmittance)
-{
-    ViewConstants* v = r.view;
-    float near_range = r.scene.near_range;
-    bool sky = isinf(t);
-    float2 uv = (float2(pixel) + 0.5) / float2(v.extent);
-    float3 dir = render_direction(v, view_direction(v, uv));
-    if (r.reference != 0)
-        return reference_fog<S, M>(r, pixel, dir, sky ? near_range : t, transmittance) * v.exposure[v.exposure_slot].pre_exposure;
-    float3 inscatter = froxel_fog(r, pixel, min(t, near_range), transmittance);
-    if (!sky && t > near_range)
-    {
-        float3 through;
-        inscatter += transmittance * far_fog<M>(r, pixel, dir, t, through);
-        transmittance *= through;
-    }
-    return inscatter;
-}
-
-// Media apply for `pixel`: L = S + T x L over the camera segment to the pixel's surface, or
-// the dielectric or presence layer it shades; sky pixels take the froxels' whole range, and
-// pixels whose eye lies in an interior nothing. Marked pixels of the background layer take
-// the same over the segment to their layer's depth.
-public void media_apply<S : ISurface, M : IMedium>(FroxelRoot r, uint2 pixel)
-{
-    ViewConstants* v = r.view;
-    if (r.mode == MEDIA_OFF || any(pixel >= v.extent))
-        return;
-    RWTexture2D<float4> radiance = r.radiance.get<RWTexture2D<float4>>();
-    float4 l = radiance[pixel];
-    float depth = r.gbuffer.depth.get<Texture2D<float>>().Load(int3(pixel, 0));
-    float2 uv = (float2(pixel) + 0.5) / float2(v.extent);
-    float t = depth > 0.0 ? length(view_position(v, uv, depth)) : positive_infinity();
-    float end = r.layers != nullptr ? layer_guide(r.layers, r.gbuffer.extent, pixel).medium_end : 0.0;
-    if (end != 0.0)
-        t = max(end, 0.0);
-    float3 transmittance;
-    float3 inscatter = camera_fog<S, M>(r, pixel, t, transmittance);
-    float4 out = float4(apply_hdr_ceiling(inscatter + transmittance * l.rgb), l.a);
-    if (r.mode == MEDIA_INSCATTER)
-        out.rgb = apply_hdr_ceiling(inscatter);
-    else if (r.mode == MEDIA_FROXELS)
-    {
-        uint2 column = uint2(round((float2(pixel) + 0.5) / column_spacing(r)));
-        out.rgb = float3(luminance_rec2020(transmittance), froxel_slice(t, r.slices, r.scene.near_range) / float(r.slices), float((column.x + column.y) & 1));
-    }
-    radiance[pixel] = out;
-
-    if (r.mode != MEDIA_COMPOSE || r.dof_background.index == IMAGE_NONE)
-        return;
-    RWTexture2D<float4> layer = r.dof_background.get<RWTexture2D<float4>>();
-    float4 b = layer[pixel];
-    if (b.a < 0.0)
-        return;
-    float tb = end < 0.0 ? 0.0 : b.a > 0.0 ? length(view_position(v, uv, b.a)) : positive_infinity();
-    inscatter = camera_fog<S, M>(r, pixel, tb, transmittance);
-    layer[pixel] = float4(apply_hdr_ceiling(inscatter + transmittance * b.rgb), b.a);
 }

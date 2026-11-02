@@ -6,11 +6,14 @@
 //! froxels, and long path segments' march against a fine one. Blended particles: in shade
 //! against in sun inside and beyond the froxel volume, fogged by the single scattering in
 //! front of them and through the aerial-perspective LUT past the froxels, and steady at a
-//! still camera.
+//! still camera. Medium proxies on the camera ray: a plume against the reference march and, per
+//! pixel, against a fine march of its grid; overlapping boxes, surfaces inside boxes and eyes
+//! inside boxes against Beer's law, inside and past the froxels; sky pixels past the froxels;
+//! and proxies off screen.
 
 use lighting_suite::bed::{
-    Accumulated, Bed, CANOPY, EXTENT, FLOOR, GLASS_SPHERE, Item, LEAF, MIRROR, Particle,
-    ParticleLook, Paths, SKY, SUN, Spec, WHITE_SPHERE, pixel_of,
+    Accumulated, Bed, CANOPY, EXTENT, FLOOR, GLASS_SPHERE, Item, LEAF, MIRROR, PLUME, Particle,
+    ParticleLook, Paths, SKY, SUN, Spec, WHITE_SPHERE, look, pixel_of, plume_volume,
 };
 use lighting_suite::shaders::{
     fog_aerial, fog_apply, fog_directional, fog_froxel, fog_particles, froxel_lookup, froxel_probe,
@@ -23,10 +26,10 @@ use orr_lighting::{
     AERIAL_SIZE, DirectionalLight, DiscProfile, Light, LightId, LightingDebugView, MediaSettings,
     PathEntry, ReferenceSettings, ViewLighting,
 };
-use orr_math::{Mat3, Vec3};
-use orr_scene::{Opacity, RendererDesc};
-use std::cell::RefCell;
-use std::sync::OnceLock;
+use orr_math::{DVec3, Mat3, Quat, Vec3};
+use orr_pack::volume::GridSampler;
+use orr_scene::{MediumProxy, MediumProxyId, Opacity, ProxyDensity, RendererDesc};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 /// Kernels with the stock height fog linked as the medium (`media_types.slang`).
 fn fog_kernels() -> &'static KernelSet {
@@ -109,6 +112,21 @@ fn foggy(
     (bed, data)
 }
 
+/// The fog kernels' paths, compiled once for the whole binary.
+fn fog_paths() -> MutexGuard<'static, Paths> {
+    static PATHS: OnceLock<Mutex<Paths>> = OnceLock::new();
+    PATHS
+        .get_or_init(|| {
+            Mutex::new(Paths::new(
+                fog_kernels(),
+                PathEntry::Fastest,
+                ViewLighting::default(),
+            ))
+        })
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
 fn settings(reference: bool, media: MediaSettings) -> ViewLighting {
     ViewLighting {
         media,
@@ -128,17 +146,14 @@ fn inscatter(bed: &mut Bed, reference: bool, media: MediaSettings, frames: u32) 
     } else {
         media
     };
-    // Each test thread compiles the kernels once.
-    thread_local! {
-        static PATHS: RefCell<Option<Paths>> = const { RefCell::new(None) };
-    }
-    PATHS.with_borrow_mut(|paths| {
-        let paths = paths.get_or_insert_with(|| {
-            Paths::new(fog_kernels(), PathEntry::Fastest, ViewLighting::default())
-        });
-        paths.settings = settings(reference, media);
-        bed.accumulate(frames, 3, &mut |list, f| paths.record(list, f))
-    })
+    shown(bed, settings(reference, media), frames)
+}
+
+/// What media apply writes under `lighting` over `frames` frames.
+fn shown(bed: &mut Bed, lighting: ViewLighting, frames: u32) -> Accumulated {
+    let mut paths = fog_paths();
+    paths.settings = lighting;
+    bed.accumulate(frames, 3, &mut |list, f| paths.record(list, f))
 }
 
 /// Mean luminance of each 8 x 8 block.
@@ -684,7 +699,8 @@ fn particles_in_fog_take_the_fog_in_front_of_them() {
         look,
         Opacity::Particle,
     );
-    let paths = Paths::new(fog_kernels(), PathEntry::Fastest, ViewLighting::default());
+    let mut paths = fog_paths();
+    paths.settings = ViewLighting::default();
     let a = bed.accumulate(16, 3, &mut |list, f| paths.record(list, f));
     let got = luminance(a.around(pixel_of(&bed.spec, target), 2));
     let sigma = f64::from(fog.density) * (-f64::from(eye.y) / f64::from(fog.falloff_height)).exp();
@@ -729,7 +745,8 @@ fn particles_past_the_froxels_take_the_aerial_transmittance() {
         look,
         Opacity::Particle,
     );
-    let paths = Paths::new(fog_kernels(), PathEntry::Fastest, ViewLighting::default());
+    let mut paths = fog_paths();
+    paths.settings = ViewLighting::default();
     let a = bed.accumulate(4, 3, &mut |list, f| paths.record(list, f));
     let got = luminance(a.around(pixel_of(&bed.spec, target), 2));
     let sigma = f64::from(fog.density) * (-f64::from(eye.y) / f64::from(fog.falloff_height)).exp();
@@ -763,7 +780,8 @@ fn particles_stay_steady_at_a_still_camera() {
         WHITE_PARTICLES,
         Opacity::Particle,
     );
-    let paths = Paths::new(fog_kernels(), PathEntry::Fastest, ViewLighting::default());
+    let mut paths = fog_paths();
+    paths.settings = ViewLighting::default();
     let mut frames = Vec::new();
     for k in 0..48 {
         let a = bed.follow(spec.eye, spec.target, k, &mut |list, f| {
@@ -781,5 +799,302 @@ fn particles_stay_steady_at_a_still_camera() {
         "frame to frame the particle changes by {:.2}% around {mean:.1}",
         100.0 * change
     );
+    assert_clean();
+}
+
+/// No medium outside the proxies.
+const CLEAR: Fog = Fog {
+    density: 0.0,
+    base_height: 0.0,
+    falloff_height: 100.0,
+};
+
+/// Transmittance from the eye per pixel, in the froxel debug view's red channel.
+fn camera_transmittance(bed: &mut Bed, frames: u32) -> Vec<f64> {
+    let lighting = ViewLighting {
+        debug_view: LightingDebugView::Froxels,
+        ..ViewLighting::default()
+    };
+    shown(bed, lighting, frames)
+        .mean
+        .iter()
+        .map(|p| f64::from(p[0]))
+        .collect()
+}
+
+fn plume_proxy(bed: &Bed, extinction: f32) -> MediumProxy {
+    let v = bed.volume(PLUME);
+    MediumProxy {
+        position: DVec3::ZERO,
+        rotation: Quat::IDENTITY,
+        scale: 1.0,
+        density: v.density(v.grid("density").unwrap()),
+        extinction: Vec3::splat(extinction),
+        albedo: Vec3::splat(0.9),
+        anisotropy: 0.3,
+    }
+}
+
+fn plume_view(fog: &Fog) -> (Bed, Allocation<[f32; 4]>) {
+    foggy(
+        fog,
+        Vec::new(),
+        vec![directional(40.0, 60.0, 1_000.0)],
+        None,
+        Vec3::new(0.0, 1.5, 5.0),
+        Vec3::new(0.0, 1.5, 0.0),
+    )
+}
+
+/// The plume in haze under a sun: each 8 x 8 block's in-scatter within 5% of the reference
+/// camera march, whose steps trace their own shadow rays.
+#[test]
+fn a_plume_on_the_camera_ray_matches_the_reference_march() {
+    let (mut bed, _fog) = plume_view(&HAZE);
+    let proxy = plume_proxy(&bed, 1.0);
+    bed.set_medium_proxy(MediumProxyId(0), Some(proxy));
+    let media = MediaSettings {
+        segment_steps: 32,
+        ..MediaSettings::default()
+    };
+    let froxels = inscatter(&mut bed, false, media, 32);
+    let reference = inscatter(&mut bed, true, media, 32);
+    let (worst, mean) = block_errors(&froxels, &reference);
+    assert!(
+        worst < 0.05,
+        "a block's in-scatter is {worst:.3} off the reference (mean {mean:.3})"
+    );
+    assert_clean();
+}
+
+/// The plume's transmittance per pixel within 5% of a fine march of its cooked grid along the
+/// pixel's ray, with detail inside an 8 x 8 tile that the froxels could not hold.
+#[test]
+fn a_plume_keeps_detail_finer_than_a_froxel() {
+    let (mut bed, _fog) = plume_view(&CLEAR);
+    let proxy = plume_proxy(&bed, 1.5);
+    bed.set_medium_proxy(MediumProxyId(0), Some(proxy));
+    let got = camera_transmittance(&mut bed, 32);
+
+    let (info, pages) = plume_volume();
+    let sampler = GridSampler::new(&info, 0, &pages).unwrap();
+    let [w, h] = EXTENT;
+    let to_world = look(bed.spec.eye, bed.spec.target);
+    let tan = (0.5 * bed.spec.fov_y).tan();
+    let aspect = w as f32 / h as f32;
+    let dt = 5e-3;
+    let want: Vec<f64> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            let ndc = [
+                (x as f32 + 0.5) / w as f32 * 2.0 - 1.0,
+                1.0 - (y as f32 + 0.5) / h as f32 * 2.0,
+            ];
+            let dir = (to_world * Vec3::new(ndc[0] * tan * aspect, ndc[1] * tan, -1.0)).normalize();
+            let tau: f64 = (0..800)
+                .map(|k| {
+                    let p = bed.spec.eye + dir * (3.0 + (k as f32 + 0.5) * dt);
+                    f64::from(sampler.sample(p.to_array()).max(0.0))
+                })
+                .sum::<f64>()
+                * f64::from(dt);
+            (-1.5 * tau).exp()
+        })
+        .collect();
+
+    let mut worst = (0.0f64, 0, 0.0, 0.0);
+    for (i, (g, t)) in got.iter().zip(&want).enumerate() {
+        let e = (g - t).abs() / t.max(0.05);
+        if e > worst.0 {
+            worst = (e, i, *g, *t);
+        }
+    }
+    assert!(
+        worst.0 <= 0.05,
+        "pixel {}: transmittance {:.4}, a fine march's {:.4}",
+        worst.1,
+        worst.2,
+        worst.3
+    );
+    let tile_spread = (0..h / 8)
+        .flat_map(|ty| (0..w / 8).map(move |tx| (tx, ty)))
+        .map(|(tx, ty)| {
+            let tile = (0..64).map(|k| want[((ty * 8 + k / 8) * w + tx * 8 + k % 8) as usize]);
+            let (lo, hi) = tile.fold((1.0f64, 0.0f64), |(l, h), v| (l.min(v), h.max(v)));
+            hi - lo
+        })
+        .fold(0.0f64, f64::max);
+    assert!(tile_spread > 0.2, "the widest tile spans {tile_spread:.3}");
+    assert_clean();
+}
+
+fn box_proxy(z: f32, half_z: f32, extinction: f32, albedo: f32) -> MediumProxy {
+    MediumProxy {
+        position: DVec3::new(0.0, 2.0, f64::from(z)),
+        rotation: Quat::IDENTITY,
+        scale: 1.0,
+        density: ProxyDensity::Uniform {
+            half_extent: Vec3::new(4.0, 4.0, half_z),
+        },
+        extinction: Vec3::splat(extinction),
+        albedo: Vec3::splat(albedo),
+        anisotropy: 0.0,
+    }
+}
+
+/// Transmittance at the middle of the view.
+fn middle_transmittance(a: &[f64]) -> f64 {
+    let [w, h] = EXTENT;
+    a[(h / 2 * w + w / 2) as usize]
+}
+
+/// Boxes of [8, 12] m at extinction 0.2 and [11, 15] m at 0.1 along the center ray, in haze:
+/// Beer's law over their spans and the haze's own, whether they overlap a surface or the eye
+/// and whether they lie inside or past the froxels.
+#[test]
+fn proxy_boxes_on_the_camera_ray_take_beer_law() {
+    let sigma = f64::from(HAZE.density) * (-2.0 / f64::from(HAZE.falloff_height)).exp();
+    let sun = vec![directional(30.0, 20.0, 1_000.0)];
+    let boxes = [
+        box_proxy(-10.0, 2.0, 0.2, 0.5),
+        box_proxy(-13.0, 2.0, 0.1, 0.5),
+    ];
+    let cases = [
+        // Surface past the boxes, from outside and from inside the first, inside and past the
+        // froxels.
+        (
+            20.0,
+            vec![
+                (256.0, 0.0, 0.2 * 4.0 + 0.1 * 4.0),
+                (4.0, 0.0, 0.2 * 4.0 + 0.1 * 4.0),
+                (256.0, -10.0, 0.2 * 2.0 + 0.1 * 4.0),
+            ],
+        ),
+        // Surface inside their overlap.
+        (
+            11.5,
+            vec![
+                (256.0, 0.0, 0.2 * 3.5 + 0.1 * 0.5),
+                (4.0, 0.0, 0.2 * 3.5 + 0.1 * 0.5),
+            ],
+        ),
+    ];
+    for (surface, views) in cases {
+        let radius = 0.15 * surface;
+        let copy = Item {
+            model: WHITE_SPHERE,
+            linear: Mat3::from_diagonal(Vec3::splat(radius)),
+            at: Vec3::new(0.0, 2.0, -(surface + radius)),
+        };
+        let eye = Vec3::new(0.0, 2.0, 0.0);
+        let target = Vec3::new(0.0, 2.0, -10.0);
+        let (mut bed, _fog) = foggy(&HAZE, vec![copy], sun.clone(), None, eye, target);
+        for (k, b) in boxes.iter().enumerate() {
+            bed.set_medium_proxy(MediumProxyId(k as u32), Some(*b));
+        }
+        for (near_range, eye_z, tau) in views {
+            bed.set_near_range(near_range);
+            bed.spec.eye = Vec3::new(0.0, 2.0, eye_z);
+            bed.spec.target = bed.spec.eye - Vec3::Z * 10.0;
+            let got = middle_transmittance(&camera_transmittance(&mut bed, 8));
+            let distance = f64::from(surface + eye_z);
+            let want = (-tau - sigma * distance).exp();
+            assert!(
+                (got - want).abs() <= 0.01 * want,
+                "near_range {near_range}, eye at {eye_z}, surface at {surface}: {got:.4}, wanted {want:.4}"
+            );
+        }
+    }
+    assert_clean();
+}
+
+/// A box lit by a sun in haze, in front of a surface: the in-scatter at the middle of the view
+/// within 5% of the reference march inside the froxels, and within 10% past them, where the
+/// aerial-perspective LUT's haze takes no shadow from the box.
+#[test]
+fn a_proxy_box_lights_like_the_reference_inside_and_past_the_froxels() {
+    let eye = Vec3::new(0.0, 2.0, 0.0);
+    let target = Vec3::new(0.0, 2.0, -10.0);
+    let sun = vec![directional(30.0, 20.0, 1_000.0)];
+    let (mut bed, _fog) = foggy(&HAZE, vec![distant(20.0)], sun, None, eye, target);
+    bed.set_medium_proxy(MediumProxyId(0), Some(box_proxy(-10.0, 2.0, 0.3, 0.9)));
+    let media = MediaSettings {
+        segment_steps: 32,
+        ..MediaSettings::default()
+    };
+    for (near_range, tolerance) in [(256.0, 0.05), (4.0, 0.1)] {
+        bed.set_near_range(near_range);
+        let got = middle_blocks(&inscatter(&mut bed, false, media, 16));
+        let reference = middle_blocks(&inscatter(&mut bed, true, media, 32));
+        for (g, r) in got.iter().zip(&reference) {
+            assert!(
+                (g - r).abs() < tolerance * r,
+                "near_range {near_range}: in-scatter {g:.2}, the reference's {r:.2}"
+            );
+        }
+    }
+    assert_clean();
+}
+
+/// On sky pixels the environment holds the medium past `near_range`. A box past it that lets
+/// everything through leaves the in-scatter as without it, and a black box that lets nothing
+/// through ends it as a surface at its near face does, with no light through.
+#[test]
+fn sky_pixels_past_the_froxels_keep_the_medium_in_front_of_a_box() {
+    let eye = Vec3::new(0.0, 2.0, 0.0);
+    let target = Vec3::new(0.0, 2.0, -10.0);
+    let sun = vec![directional(30.0, 20.0, 1_000.0)];
+    let near_range = 4.0;
+    let middle = |bed: &mut Bed, proxy: Option<MediumProxy>| {
+        bed.set_near_range(near_range);
+        bed.set_medium_proxy(MediumProxyId(0), proxy);
+        let s = middle_blocks(&inscatter(bed, false, MediaSettings::default(), 16));
+        let t = middle_transmittance(&camera_transmittance(bed, 4));
+        (s[0], t)
+    };
+    let (mut open_sky, _fog) = foggy(&HAZE, Vec::new(), sun.clone(), None, eye, target);
+    let (open, open_t) = middle(&mut open_sky, None);
+    let (clear, clear_t) = middle(&mut open_sky, Some(box_proxy(-30.0, 10.0, 1e-7, 0.0)));
+    assert!(
+        (clear - open).abs() <= 0.01 * open && (clear_t - open_t).abs() <= 0.01 * open_t,
+        "a clear box past the froxels: in-scatter {clear:.3} and transmittance {clear_t:.3}, without it {open:.3} and {open_t:.3}"
+    );
+    let (black, black_t) = middle(&mut open_sky, Some(box_proxy(-30.0, 10.0, 8.0, 0.0)));
+    let (mut wall, _fog) = foggy(&HAZE, vec![distant(20.0)], sun, None, eye, target);
+    let (surface, _) = middle(&mut wall, None);
+    assert!(
+        (black - surface).abs() <= 0.05 * surface && black_t < 1e-3,
+        "a black box at 20 m: in-scatter {black:.3} and transmittance {black_t:.5}, a surface there {surface:.3}"
+    );
+    assert_clean();
+}
+
+/// Proxies behind the eye or beside the view leave media apply without its ray; one on screen,
+/// or holding the eye, counts.
+#[test]
+fn only_proxies_in_the_frustum_count_as_visible() {
+    let (mut bed, _fog) = foggy(
+        &CLEAR,
+        Vec::new(),
+        Vec::new(),
+        Some(SKY),
+        Vec3::new(0.0, 2.0, 0.0),
+        Vec3::new(0.0, 2.0, -10.0),
+    );
+    let at = |x: f64, z: f64, half: f32| MediumProxy {
+        position: DVec3::new(x, 2.0, z),
+        ..box_proxy(0.0, half, 0.5, 0.5)
+    };
+    for (proxy, visible) in [
+        (at(0.0, 20.0, 2.0), 0),
+        (at(60.0, -10.0, 2.0), 0),
+        (at(0.0, -20.0, 2.0), 1),
+        (at(0.0, 0.0, 2.0), 1),
+    ] {
+        bed.set_medium_proxy(MediumProxyId(0), Some(proxy));
+        let _ = inscatter(&mut bed, false, MediaSettings::default(), 2);
+        let stats = bed.view().media_stats(bed.last_frame()).unwrap();
+        assert_eq!(stats.visible_proxies, visible, "{proxy:?}");
+    }
     assert_clean();
 }
