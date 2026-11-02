@@ -1,5 +1,7 @@
 //! Texture cook: import, mip chains, encoding, and the tiled archive layout.
 
+use std::sync::Arc;
+
 mod encode;
 mod env;
 mod load;
@@ -206,8 +208,13 @@ impl Img {
         }
     }
 
+    /// Bytes of the texels.
+    pub(crate) fn bytes(&self) -> u64 {
+        (self.px.len() * size_of::<[f32; 4]>()) as u64
+    }
+
     /// Bilinear resize; used to bring a packed texture's inputs to one size.
-    pub(crate) fn resized(self, w: u32, h: u32) -> Self {
+    pub(crate) fn resized(self: Arc<Self>, w: u32, h: u32) -> Arc<Self> {
         if (w, h) == (self.w, self.h) {
             return self;
         }
@@ -219,7 +226,7 @@ impl Img {
                 out.px[(y * w + x) as usize] = self.bilinear(sx, sy);
             }
         }
-        out
+        Arc::new(out)
     }
 
     /// Bilinear sample at texel coordinates (texel centers at integers), clamped at edges.

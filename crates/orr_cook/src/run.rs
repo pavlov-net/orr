@@ -32,10 +32,11 @@ use orr_pack::{
 
 use crate::assembly::{self, Assembly};
 use crate::cache::Cache;
+use crate::decoded::Decoded;
 use crate::import::{Placed, Scene};
 use crate::instances::{self, Catalog, ModelFacts};
 use crate::key::{self, Key};
-use crate::mesh::maps::{Displacement, Opacity, Passes, Raster};
+use crate::mesh::maps::{Displacement, Opacity, OpacityMap, Passes, Raster};
 use crate::mesh::{
     self, DisplacementSpec, DisplacementTexture, MapSpec, MeshData, MeshInput, MeshSource,
     NormalSpec, OpacitySpec, PartData, Pivots, SectionData, SectionMaps,
@@ -51,12 +52,15 @@ use crate::texture::material::{
     image_facts,
 };
 use crate::texture::neural::{self, NeuralJob};
-use crate::texture::{self, Wrap};
+use crate::texture::{self, Img, Wrap};
 use crate::volume::{self, VolumeReport};
 use crate::{
     CookOptions, Cooked, Error, GltfSettings, Instances, Manifest, MeshSettings, Placement,
     PrototypeSpec, Result, Source, TextureSettings, UsdSettings, mount,
 };
+
+/// Each cache of decoded data holds up to this part of the working set.
+const DECODED_SHARE: u64 = 16;
 
 /// Peak bytes of a subdivision cage cook per cage face, an estimate.
 const SUBD_BYTES_PER_FACE: u64 = 16 << 10;
@@ -81,6 +85,8 @@ pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
         zstd_level: opts
             .zstd_level
             .unwrap_or_else(|| crate::quality::zstd_level(opts.quality)),
+        images: Decoded::new(opts.working_set / DECODED_SHARE, Img::bytes),
+        opacity: Decoded::new(opts.working_set / DECODED_SHARE, OpacityMap::bytes),
     };
     let threads = rayon::current_num_threads();
     let mut run = Run::new(manifest, opts, &shared)?;
@@ -108,6 +114,10 @@ struct Shared {
     cache: Option<Cache>,
     quality: Quality,
     zstd_level: i32,
+    /// Source images by content hash and mip, for the texture jobs that read them.
+    images: Decoded<Img>,
+    /// Cooked opacity mips by cook key and cutoff, for the mesh jobs that read them.
+    opacity: Decoded<OpacityMap>,
 }
 
 struct Unit<'m> {
@@ -1103,6 +1113,7 @@ impl<'m, 's> Run<'m, 's> {
         's: 't,
     {
         let (mut running, mut bytes) = (0usize, 0u64);
+        let budget = self.opts.working_set - 2 * (self.opts.working_set / DECODED_SHARE);
         loop {
             while let Some(u) = self.local.pop() {
                 self.finish_local(u)?;
@@ -1134,7 +1145,7 @@ impl<'m, 's> Run<'m, 's> {
             );
             for u in candidates {
                 let ws = self.units[u].working_set;
-                if running >= jobs || (running > 0 && bytes + ws > self.opts.working_set) {
+                if running >= jobs || (running > 0 && bytes + ws > budget) {
                     break;
                 }
                 if self.ready.remove(&(Reverse(ws), u)) {
@@ -2166,6 +2177,7 @@ fn section_maps(
     sections: &[SectionData],
     archives: &HashMap<String, Arc<Archive>>,
     normals: bool,
+    opacity_maps: &Decoded<OpacityMap>,
 ) -> Result<Vec<SectionMaps>> {
     let _z = crate::profile::zone!("mesh.maps");
     let read = |unit: &str, all: bool, wrap, uv, channels| {
@@ -2186,22 +2198,36 @@ fn section_maps(
             OpacitySpec::Unknown => Some(Opacity::Unknown),
             OpacitySpec::Texture {
                 unit,
+                key,
                 cutoff,
                 wrap,
                 uv,
                 uv_set,
-                ..
             } => {
-                let mip0 = read(unit, false, *wrap, *uv, 1)?.remove(0);
-                if mip0.w > u32::from(u16::MAX) {
-                    return Err(Error::Texture {
-                        asset: unit.clone(),
-                        message: format!("opacity texture {} texels wide, over 65535", mip0.w),
-                    });
-                }
+                let map = opacity_maps.get((*key, cutoff.to_bits()), || {
+                    let mip0 = read(unit, false, *wrap, *uv, 1)?.remove(0);
+                    if mip0.w > u32::from(u16::MAX) {
+                        return Err(Error::Texture {
+                            asset: unit.clone(),
+                            message: format!("opacity texture {} texels wide, over 65535", mip0.w),
+                        });
+                    }
+                    Ok(OpacityMap {
+                        w: mip0.w,
+                        h: mip0.h,
+                        passes: Arc::new(Passes::new(&mip0, *cutoff)),
+                        texels: mip0.texels,
+                    })
+                })?;
                 Some(Opacity::Texture {
-                    passes: Passes::new(&mip0, *cutoff),
-                    mip0,
+                    mip0: Raster {
+                        w: map.w,
+                        h: map.h,
+                        texels: Arc::clone(&map.texels),
+                        wrap: *wrap,
+                        uv: *uv,
+                    },
+                    passes: Arc::clone(&map.passes),
                     cutoff: *cutoff,
                     uv_set: *uv_set,
                 })
@@ -2290,7 +2316,7 @@ fn texture_mips(
             out.push(Raster {
                 w,
                 h: hh,
-                texels,
+                texels: Arc::new(texels),
                 wrap,
                 uv,
             });
@@ -2341,7 +2367,7 @@ fn cook_unit(
             let data = source.load(name, &shared.memo)?;
             // Only the tangent check reads normal maps.
             let normals = data.tangents.is_some() && settings.tangent_error_max.is_some();
-            let maps = section_maps(&data.sections, &archives, normals)?;
+            let maps = section_maps(&data.sections, &archives, normals, &shared.opacity)?;
             drop(archives);
             let cooked = mesh::cook(name, &data, &settings, &maps)?;
             drop((data, maps));
@@ -2362,12 +2388,12 @@ fn cook_unit(
             w.add(name, class, orr_pack::mesh::SCHEMA, key, &blobs)?;
         }
         Work::Texture(job, images) => {
-            let built = job.run(&images)?;
+            let built = job.run(&images, &shared.images)?;
             drop(images);
             texture::add(&mut w, name, key, &built)?;
         }
         Work::Neural(set, images) => {
-            let built = set.run(&images)?;
+            let built = set.run(&images, &shared.images)?;
             drop(images);
             neural::add(&mut w, name, key, &built)?;
             detail.neural = Some(built.report);

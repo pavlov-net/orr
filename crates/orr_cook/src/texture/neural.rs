@@ -24,7 +24,8 @@ use orr_pack::{ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span};
 use serde::Deserialize;
 
 use super::material::{ImageFile, TextureJob};
-use super::{Built, Encoding, Primaries, linear_to_srgb};
+use super::{Built, Encoding, Img, Primaries, linear_to_srgb};
+use crate::decoded::Decoded;
 use crate::key::Key;
 use crate::report::{NeuralReport, NeuralTextureReport};
 use crate::{Error, Result};
@@ -212,7 +213,7 @@ impl NeuralJob {
         }
     }
 
-    pub(crate) fn run(&self, images: &[ImageFile]) -> Result<NeuralBuilt> {
+    pub(crate) fn run(&self, images: &[ImageFile], decoded: &Decoded<Img>) -> Result<NeuralBuilt> {
         let [w, h] = self.size;
         let mut layout = Vec::new();
         let mut first = 0u8;
@@ -224,7 +225,7 @@ impl NeuralJob {
         let chains: Vec<_> = self
             .members
             .iter()
-            .map(|m| m.job.chain(images))
+            .map(|m| m.job.chain(images, decoded))
             .collect::<Result<_>>()?;
         let mips = chains[0].len();
         if chains.iter().any(|c| c.len() != mips) {

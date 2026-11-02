@@ -2,6 +2,8 @@
 //! alpha-tested section are opaque, and the displacement mips that bound each cluster's
 //! displacement.
 
+use std::sync::Arc;
+
 use crate::texture::Wrap;
 use rayon::prelude::*;
 
@@ -10,7 +12,7 @@ use rayon::prelude::*;
 pub(crate) struct Raster {
     pub w: u32,
     pub h: u32,
-    pub texels: Vec<f32>,
+    pub texels: Arc<Vec<f32>>,
     pub wrap: [Wrap; 2],
     pub uv: [f32; 6],
 }
@@ -333,6 +335,21 @@ impl Raster {
     }
 }
 
+/// A cooked opacity texture's mip 0 and what its cutoff makes of it, for every section that
+/// reads it.
+pub(crate) struct OpacityMap {
+    pub w: u32,
+    pub h: u32,
+    pub texels: Arc<Vec<f32>>,
+    pub passes: Arc<Passes>,
+}
+
+impl OpacityMap {
+    pub(crate) fn bytes(&self) -> u64 {
+        (self.texels.len() * size_of::<f32>() + self.passes.prefix.len() * size_of::<u16>()) as u64
+    }
+}
+
 /// Which triangles of an alpha-tested section are opaque.
 pub(crate) enum Opacity {
     /// Every triangle passes, or none does.
@@ -343,7 +360,7 @@ pub(crate) enum Opacity {
         mip0: Raster,
         cutoff: f32,
         uv_set: usize,
-        passes: Passes,
+        passes: Arc<Passes>,
     },
     /// The opacity is not known to the cook: every triangle is alpha-tested.
     Unknown,
@@ -402,7 +419,7 @@ impl Displacement {
     /// Fails when a texel of any mip lies outside the declared range.
     pub(crate) fn check_range(&self) -> Result<(), String> {
         for (i, m) in self.mips.iter().enumerate() {
-            for &t in &m.texels {
+            for &t in m.texels.iter() {
                 let d = self.scale * t + self.offset;
                 if d < self.min || d > self.max {
                     return Err(format!(
@@ -476,7 +493,7 @@ mod tests {
             let raster = Raster {
                 w,
                 h,
-                texels: texels.clone(),
+                texels: Arc::new(texels.clone()),
                 wrap,
                 uv: [0.0; 6],
             };
