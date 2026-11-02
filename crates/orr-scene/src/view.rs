@@ -96,7 +96,8 @@ impl Projection {
 /// The lens the camera effects read.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Lens {
-    /// Focal length = sensor_width / (2 tan(fov_x / 2)).
+    /// Focal length = sensor_width / (2 tan(fov_x / 2)). With the output extent it also gives
+    /// the pixel pitch, which sets how many pixels glare reaches.
     pub sensor_width_mm: f32,
     /// Fraction of the frame interval the shutter is open; 0 = no motion blur.
     pub shutter: f32,
@@ -144,7 +145,7 @@ pub enum Focus {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Glare {
-    /// 1.0 = the fitted PSF energy.
+    /// 1.0 = the fitted PSF energy. The image's total energy is the same at any strength.
     pub strength: f32,
 }
 

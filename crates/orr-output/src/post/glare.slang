@@ -24,7 +24,7 @@ struct Root
     ViewConstants* view;
     // Per first level, F-number and entry: w0, then the band of each mip; xyz per channel.
     float4* tables;
-    // This frame's entries, bands times the strength.
+    // This frame's entries: 1 - the bands' sum, then the bands times the strength.
     float4* weights;
     // The radiance (mip 0) or the chain.
     TextureIndex source;
@@ -68,8 +68,8 @@ void write_weights()
             w = 0.0;
         else if (e == root.mips)
             w += folded;
-        if (e > 0)
-            w *= root.strength;
+        // The identity gives up what the bands take, so the energy stays 1 at any strength.
+        w = e == 0 ? 1.0 - root.strength * (1.0 - w) : root.strength * w;
         root.weights[e] = float4(w, 0.0);
     }
 }
