@@ -3,7 +3,6 @@
 
 use std::sync::OnceLock;
 
-use glam::DVec3;
 use orr::abi::{GpuPtr, SamplerIndex};
 use orr::orr_gpu::{
     ComputePipeline, Format, Hazards, MemoryKind, QueueKind, ShaderStage, SpecData, Stages,
@@ -17,6 +16,7 @@ use orr_atmosphere::presets::solar_disc;
 use orr_atmosphere::spectrum::{SOLAR_COLOR, SOLAR_ILLUMINANCE};
 use orr_atmosphere::{Atmosphere, AtmosphereGpu, AtmosphereState, MAX_EXTRA_VIEWS};
 use orr_lighting::{LightingStats, SceneLighting, SceneLightingSettings, ScenePass};
+use orr_math::DVec3;
 use orr_scene::testing::{device, read_buffer, wait};
 
 /// Generated kernel modules and types of the suite's Slang.

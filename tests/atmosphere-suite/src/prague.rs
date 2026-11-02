@@ -8,8 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
-use glam::DVec3;
 use orr_atmosphere::spectrum::{SOLAR_ILLUMINANCE, SPECTRAL};
+use orr_math::DVec3;
 
 const PLANET_RADIUS: f64 = 6_378_000.0;
 /// The model lifts the eye this far before evaluating it, m.

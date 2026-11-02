@@ -7,11 +7,8 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[allow(dead_code, unreachable_pub)]
-#[path = "src/colour.rs"]
-mod colour;
-
-use colour::{LUMINOUS_EFFICACY, XYZ_TO_REC2020};
+use orr_color::{LUMINOUS_EFFICACY, RgbPrimaries};
+use orr_math::DVec3;
 use orr_shaders::build::Build;
 
 /// Wavelength groups in the LUT passes; each is `BINS / SPECTRAL_GROUPS` adjacent 10 nm bins.
@@ -29,7 +26,6 @@ const DATA_DIR: &str = "precomputed_atmospheric_scattering";
 fn main() {
     println!("cargo:rerun-if-env-changed=ORR_SKY_DATA");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/colour.rs");
     assert_eq!(
         BINS % SPECTRAL_GROUPS,
         0,
@@ -67,9 +63,10 @@ fn main() {
         })
         .collect();
     // Rec.2020 color matching functions.
+    let xyz_to_rec2020 = RgbPrimaries::REC2020.xyz_to_rgb();
     let rbar: Vec<[f64; 3]> = cmf
         .iter()
-        .map(|&c| colour::mul(&XYZ_TO_REC2020, c))
+        .map(|&c| (xyz_to_rec2020 * DVec3::from(c)).to_array())
         .collect();
 
     let illuminance: f64 = (0..BINS)
@@ -177,7 +174,12 @@ fn main() {
 fn compile_kernels() {
     let src = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("src");
     let roots = env::var("DEP_ORR_SHADER_DIRS").expect("orr's shader roots");
-    let out = Build::new().and_then(|b| b.kernels(&src).roots(&roots).compile());
+    let out = Build::new().and_then(|b| {
+        b.kernels(&src)
+            .roots(&roots)
+            .include(orr_color::SHADER_DIR)
+            .compile()
+    });
     match out {
         Ok(out) => println!("cargo:shader_dirs={}", out.shader_dirs),
         Err(e) => panic!("{e}"),

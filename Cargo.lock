@@ -110,10 +110,11 @@ dependencies = [
 name = "atmosphere-suite"
 version = "0.0.1"
 dependencies = [
- "glam 0.34.1",
  "orr",
  "orr-atmosphere",
+ "orr-color",
  "orr-lighting",
+ "orr-math",
  "orr-scene",
  "orr-shaders",
 ]
@@ -1979,8 +1980,9 @@ dependencies = [
 name = "orr-atmosphere"
 version = "0.0.1"
 dependencies = [
- "glam 0.34.1",
  "orr",
+ "orr-color",
+ "orr-math",
  "orr-shaders",
 ]
 

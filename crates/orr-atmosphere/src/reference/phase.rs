@@ -2,7 +2,7 @@
 
 use std::f64::consts::PI;
 
-use glam::DVec3;
+use orr_math::DVec3;
 
 pub(super) fn rayleigh(cos: f64) -> f64 {
     3.0 / (16.0 * PI) * (1.0 + cos * cos)

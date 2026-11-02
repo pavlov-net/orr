@@ -20,14 +20,18 @@
 mod medium;
 mod phase;
 
-use glam::DVec3;
+use std::sync::LazyLock;
+
+use orr_color::RgbPrimaries;
+use orr_math::{DMat3, DVec3};
 
 use self::medium::{COMPONENTS, Columns, Densities, Leg, Profile, Ray};
 use self::phase::{FogPhase, Rng};
 use crate::Atmosphere;
 use crate::block::{ozone_peak, rec2020};
-use crate::colour::{REC2020_TO_XYZ, mul};
 use crate::spectrum::{self, Bands, rgb_at};
+
+static REC2020_TO_XYZ: LazyLock<DMat3> = LazyLock::new(|| RgbPrimaries::REC2020.rgb_to_xyz());
 
 /// Interactions after which a path ends.
 const MAX_INTERACTIONS: u32 = 256;
@@ -265,7 +269,7 @@ impl Run<'_> {
 
     /// CIE XYZ of per-channel values.
     pub fn xyz(&self, values: &[f64]) -> [f64; 3] {
-        mul(&REC2020_TO_XYZ, self.rec2020(values))
+        (*REC2020_TO_XYZ * DVec3::from(self.rec2020(values))).to_array()
     }
 
     /// Transmittance from `origin` along `dir` over `t` meters (infinite: to space, zero
@@ -394,7 +398,7 @@ impl Run<'_> {
             .chans
             .iter()
             .zip(&tint)
-            .map(|(ch, t)| mul(&REC2020_TO_XYZ, ch.rec2020).map(|w| w * t))
+            .map(|(ch, t)| (*REC2020_TO_XYZ * DVec3::from(ch.rec2020) * *t).to_array())
             .collect();
         let (mut sum, mut sum_xyz, mut sum_xyz2) = (vec![0.0; n], [0.0; 3], [0.0; 3]);
         let mut samples = 0u32;

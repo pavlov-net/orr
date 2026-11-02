@@ -3,11 +3,11 @@
 //! The LUT passes against the f64 reference in the same wavelength groups.
 
 use atmosphere_suite::{Probe, Rig, dir, probe, solar_rec2020};
-use glam::{DVec3, Vec3};
-use orr_atmosphere::colour::luminance;
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference};
 use orr_atmosphere::spectrum::{SOLAR_ILLUMINANCE, SPECTRAL_GROUPS};
 use orr_atmosphere::{Atmosphere, HeightFog, SKY_VIEW_SIZE, TRANSMITTANCE_SIZE};
+use orr_color::luminance;
+use orr_math::{DVec3, Vec3};
 use orr_scene::testing::assert_clean;
 
 const EYE: DVec3 = DVec3::new(0.0, 2.0, 0.0);

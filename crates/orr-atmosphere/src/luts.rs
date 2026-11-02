@@ -1,6 +1,5 @@
 //! One atmosphere's GPU state and the LUT passes recorded at the scene compute point.
 
-use glam::DVec3;
 use orr::abi::{GpuAddress, SamplerIndex, StorageImageIndex, TextureIndex};
 use orr::orr_gpu::{
     AddressMode, Allocation, ComputePipeline, Device, Filter, Format, Hazards, MemoryKind,
@@ -8,6 +7,7 @@ use orr::orr_gpu::{
     TimelinePoint, ViewDesc,
 };
 use orr::{LightId, Result, SceneCompute};
+use orr_math::DVec3;
 use orr_shaders::bytemuck::Zeroable;
 
 use crate::block::{self, PASSES};

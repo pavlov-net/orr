@@ -1,10 +1,10 @@
 #![allow(clippy::print_stderr)]
 
-use glam::{DVec3, Vec3};
-use orr_atmosphere::colour::{REC2020_TO_XYZ, delta_uv, mul};
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference, Run};
 use orr_atmosphere::spectrum::{SOLAR_COLOR, SOLAR_ILLUMINANCE};
 use orr_atmosphere::{Aerosol, Atmosphere, HeightFog};
+use orr_color::{delta_uv, luminance};
+use orr_math::{DVec3, Vec3};
 
 fn earth() -> Atmosphere {
     Atmosphere::earth(DVec3::ZERO, Vec3::Y)
@@ -20,7 +20,7 @@ fn dir(elevation: f64, azimuth: f64) -> DVec3 {
 fn solar_illuminance_from_spectrum() {
     let error = (SOLAR_ILLUMINANCE - 132_600.0).abs() / 132_600.0;
     assert!(error < 1e-3, "{SOLAR_ILLUMINANCE} lx");
-    let y = mul(&REC2020_TO_XYZ, SOLAR_COLOR)[1];
+    let y = luminance(SOLAR_COLOR);
     assert!((y - 1.0).abs() < 1e-6, "solar color luminance {y}");
 }
 
