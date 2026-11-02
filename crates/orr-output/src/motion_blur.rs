@@ -27,7 +27,7 @@ pub struct MotionBlurPass<'a> {
     pub extent: [u32; 2],
     /// The render's view constants: the render extent and jitter.
     pub view: GpuPtr<ViewConstants>,
-    /// `Lens::shutter`: the fraction of the rendered-frame interval the shutter is open.
+    /// `Lens::shutter`: the fraction of the time between presented images the shutter is open.
     pub shutter: f32,
     /// Frames generated after this one; 0 with frame generation off.
     pub generated: u32,

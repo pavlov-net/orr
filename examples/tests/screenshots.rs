@@ -42,21 +42,22 @@ use examples::average::Average;
 use examples::mesh::MeshBuilder;
 use examples::scene::{FOV_Y, Showcase, TARGET, orbit_eye};
 use examples::{
-    Capture, Options, Workers, assert_clean, device, enable_dlss, fixed_time, mount_at,
+    Capture, Options, Workers, affine, assert_clean, device, enable_dlss, fixed_time, mount_at,
 };
 use orr::orr_gpu::{ClearColor, ColorAttachment, ColorLoad, Format, Rendering};
-use orr::orr_gpu::{QueueKind, TextureDesc, TextureMemory, TextureUsage};
+use orr::orr_gpu::{QueueKind, Texture, TextureDesc, TextureMemory, TextureUsage, TimelinePoint};
 use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    Affine3, DlssMode, DlssQuality, FrameDesc, GroupWriter, HookPass, InstanceFlags, InstancesDesc,
-    Lens, LitView, PackSource, Projection, Reconstruction, ReferenceSettings, Renderer,
-    RendererDesc, SceneId, ScreenshotRequest, TextureFilter, ThinLens, TransformGroupDesc,
-    TransparencyPass, ViewHistoryId, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    Affine3, DlssMode, DlssQuality, Exposure, FrameDesc, GroupWriter, HookPass, InstanceFlags,
+    InstancesDesc, Lens, LitView, OutputDebug, PackSource, PathEntry, Projection, Reconstruction,
+    ReferenceSettings, Renderer, RendererDesc, SceneDesc, SceneId, Screenshot, ScreenshotRequest,
+    TextureFilter, ThinLens, TransformGroupDesc, TransformGroupId, TransparencyPass, ViewHistoryId,
+    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source};
 use orr_math::camera::rh::view;
-use orr_math::{DVec3, Vec3};
+use orr_math::{DVec3, Mat3, Quat, Vec3};
 use orr_scene::testing::{Image, Pixels, Tolerance, check, flip};
 
 /// A smaller forest than the bench's, so the debug build renders it in reasonable time.
@@ -202,6 +203,37 @@ fn super_resolution_matches_the_native_render() {
     assert_clean();
 }
 
+/// A texture a view of `extent` can target.
+fn view_target(extent: [u32; 2]) -> Texture {
+    device()
+        .create_texture(
+            &TextureDesc::d2(
+                Format::Rgba8Unorm,
+                extent[0],
+                extent[1],
+                TextureUsage::STORAGE | TextureUsage::SAMPLED,
+            ),
+            TextureMemory::Dedicated,
+            "view target",
+        )
+        .expect("target")
+}
+
+/// Waits for `last`, the id and end point of a run's last frame, and returns its screenshot.
+fn last_screenshot(
+    renderer: &mut Renderer,
+    history: ViewHistoryId,
+    last: Option<(u64, TimelinePoint)>,
+) -> Screenshot {
+    let (id, point) = last.expect("a frame");
+    device()
+        .queue(QueueKind::Render)
+        .expect("render queue")
+        .wait(point, Duration::from_secs(30))
+        .expect("wait");
+    renderer.screenshots(history, id).pop().expect("screenshot")
+}
+
 /// Radians per frame of an orbiting camera.
 const ORBIT_STEP: f64 = 0.01;
 
@@ -286,18 +318,7 @@ impl StillShowcase {
         let mut average = settings
             .average
             .then(|| Average::new(&mut self.renderer, gpu, frames_in_flight, 16));
-        let target = gpu
-            .create_texture(
-                &TextureDesc::d2(
-                    Format::Rgba8Unorm,
-                    extent[0],
-                    extent[1],
-                    TextureUsage::STORAGE | TextureUsage::SAMPLED,
-                ),
-                TextureMemory::Dedicated,
-                "still showcase target",
-            )
-            .expect("target");
+        let target = view_target(extent);
         let listed = [self.showcase.scene];
         let mut last = None;
         let (mut render_extent, mut mode) = ([0; 2], None);
@@ -347,13 +368,20 @@ impl StillShowcase {
             };
             let rendered = f
                 .render_view(
-                    &still_view(
-                        self.showcase.scene,
-                        self.history,
-                        eye,
-                        i == 0,
-                        ViewTarget::Texture(&target),
-                    ),
+                    &LitView {
+                        // The runs are compared with a still image.
+                        lens: Lens {
+                            shutter: 0.0,
+                            ..Lens::default()
+                        },
+                        ..still_view(
+                            self.showcase.scene,
+                            self.history,
+                            eye,
+                            i == 0,
+                            ViewTarget::Texture(&target),
+                        )
+                    },
                     &ViewLighting {
                         reference: settings.reference.then(|| ReferenceSettings {
                             lens: Some(ThinLens {
@@ -371,16 +399,7 @@ impl StillShowcase {
             mode = rendered.reconstruction;
             last = Some((id, f.end().expect("end frame")));
         }
-        let (id, point) = last.expect("a frame");
-        gpu.queue(QueueKind::Render)
-            .expect("render queue")
-            .wait(point, Duration::from_secs(30))
-            .expect("wait");
-        let shot = self
-            .renderer
-            .screenshots(self.history, id)
-            .pop()
-            .expect("screenshot");
+        let shot = last_screenshot(&mut self.renderer, self.history, last);
         StillRun {
             capture: Capture::from_screenshot(&shot),
             render_extent,
@@ -689,6 +708,410 @@ fn render_view_runs_ray_reconstruction() {
     );
 
     drop(still);
+    device().collect_garbage();
+    assert_clean();
+}
+
+/// The EV100 at which the lamp exposes to 0.5.
+const LAMP_EV100: f32 = 14.0;
+/// m along the view axis from the camera to the center of the lamp, a 1 m cube.
+const LAMP_DISTANCE: f64 = 30.0;
+const LAMP_FOV_Y: f32 = 1.0;
+
+/// What one run of [`Lamp::run`] does.
+#[derive(Clone, Copy)]
+struct LampSettings {
+    /// m per frame along x; the lamp reaches x = 0 on the last frame.
+    lamp: f64,
+    /// m per frame along x; the camera reaches x = 0 on the last frame.
+    camera: f64,
+    shutter: f32,
+    /// The last frame is a camera cut.
+    cut: bool,
+    /// Renders the accumulation reference.
+    reference: bool,
+    /// Sets hooks that draw nothing.
+    hooks: bool,
+    reconstruction: Reconstruction,
+}
+
+impl LampSettings {
+    fn closed(self) -> Self {
+        Self {
+            shutter: 0.0,
+            ..self
+        }
+    }
+
+    /// Pixels the blur should reach to each side of a point of the lamp's near face in an
+    /// image `height` tall.
+    fn half_length(self, height: u32) -> f64 {
+        let focal = 0.5 * f64::from(height) / (0.5 * f64::from(LAMP_FOV_Y)).tan();
+        let speed = (self.lamp - self.camera).abs();
+        0.5 * f64::from(self.shutter) * speed * focal / (LAMP_DISTANCE - 0.5)
+    }
+}
+
+/// Where the light of an image lies, in pixels.
+#[derive(Debug)]
+struct Spread {
+    energy: f64,
+    center: [f64; 2],
+    variance: [f64; 2],
+}
+
+impl Spread {
+    /// Of the green channel of a linear RGBA image `width` wide.
+    fn of(rgba: &[f32], width: u32) -> Self {
+        let lit = || {
+            rgba.chunks_exact(4).enumerate().map(|(i, p)| {
+                let at = [i % width as usize, i / width as usize].map(|n| n as f64 + 0.5);
+                (at, f64::from(p[1]))
+            })
+        };
+        let energy: f64 = lit().map(|(_, v)| v).sum();
+        let center = [0, 1].map(|k| lit().map(|(at, v)| at[k] * v).sum::<f64>() / energy);
+        let variance = [0, 1].map(|k| {
+            let moment: f64 = lit().map(|(at, v)| (at[k] - center[k]).powi(2) * v).sum();
+            moment / energy
+        });
+        Self {
+            energy,
+            center,
+            variance,
+        }
+    }
+
+    /// The half width of the box that, convolved along x with the light of `sharp`, gives this
+    /// image's variance: a box of width w adds w^2 / 12.
+    fn half_length(&self, sharp: &Spread) -> f64 {
+        (3.0 * (self.variance[0] - sharp.variance[0]))
+            .max(0.0)
+            .sqrt()
+    }
+}
+
+/// A lamp on black in front of a camera, on one renderer.
+struct Lamp {
+    scene: SceneId,
+    group: TransformGroupId,
+    history: ViewHistoryId,
+    frame: u64,
+    /// The extent the last run rendered at.
+    render_extent: [u32; 2],
+    _workers: Workers,
+    renderer: Renderer,
+}
+
+impl Lamp {
+    fn new() -> Self {
+        let gpu = device();
+        let desc = RendererDesc {
+            path_entry: PathEntry::Compute,
+            ..RendererDesc::default()
+        };
+        let mut renderer = Renderer::new(gpu, desc).expect("renderer");
+        let workers = Workers::new(renderer.loading(), 1);
+        let mut mesh = MeshBuilder::default();
+        mesh.cuboid(0, Vec3::splat(-0.5), Vec3::splat(0.5), 1);
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(
+                Target::Memory,
+                vec![AssetSpec {
+                    name: "lamp".into(),
+                    source: Source::Mesh {
+                        mesh: mesh.finish(),
+                        materials: vec![Material {
+                            base_color: [0.0; 3],
+                            emission_color: [1.0; 3],
+                            emission_luminance: 0.5
+                                / orr::orr_output::exposure_from_ev100(LAMP_EV100),
+                            ..Material::default()
+                        }],
+                        settings: MeshSettings::default(),
+                    },
+                }],
+            )],
+        };
+        let pack = orr_cook::cook(&manifest, &Default::default())
+            .expect("cook")
+            .memory
+            .remove(0);
+        let (mount, mut frame) = mount_at(&mut renderer, PackSource::Memory(pack), 1);
+        let model = renderer
+            .model(mount, AssetId::from_name("lamp"))
+            .expect("lamp");
+        let scene = renderer
+            .create_scene(&SceneDesc::default(), &Default::default())
+            .expect("scene");
+        let history = renderer.create_view_history().expect("view history");
+        frame += 1;
+        let listed = [scene];
+        let f = renderer
+            .begin_frame(FrameDesc {
+                time: fixed_time(frame),
+                scenes: &listed,
+                display: None,
+            })
+            .expect("begin frame");
+        let mut w = f.scene(scene).expect("scene writer");
+        let group = w
+            .create_transform_group(&TransformGroupDesc {
+                count: 1,
+                writer: GroupWriter::Cpu,
+                anchor: DVec3::ZERO,
+            })
+            .expect("transform group");
+        w.transforms(group, 0, 1)
+            .expect("transforms")
+            .fill(Affine3::IDENTITY);
+        w.add_instances(&InstancesDesc {
+            model,
+            copies: 1,
+            transforms: group,
+            first: 0,
+            pose: None,
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 1000.0,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .expect("instances");
+        w.set_focus(DVec3::ZERO);
+        drop(w);
+        f.end().expect("end frame");
+        Self {
+            scene,
+            group,
+            history,
+            frame,
+            render_extent: [0; 2],
+            _workers: workers,
+            renderer,
+        }
+    }
+
+    /// Renders `frames` frames into a texture of `extent`, with a cut on the first, and returns
+    /// the last frame's linear RGBA.
+    fn run(&mut self, extent: [u32; 2], frames: u32, settings: LampSettings) -> Vec<f32> {
+        let target = view_target(extent);
+        let listed = [self.scene];
+        let mut last = None;
+        for i in 0..frames {
+            self.frame += 1;
+            let behind = f64::from(frames - 1 - i);
+            let final_frame = i + 1 == frames;
+            let mut f = self
+                .renderer
+                .begin_frame(FrameDesc {
+                    time: fixed_time(self.frame),
+                    scenes: &listed,
+                    display: None,
+                })
+                .expect("begin frame");
+            let id = f.id();
+            let x = -settings.lamp * behind;
+            f.scene(self.scene)
+                .expect("scene writer")
+                .transforms(self.group, 0, 1)
+                .expect("transforms")
+                .fill(affine(Mat3::IDENTITY, Vec3::new(x as f32, 0.0, 0.0)));
+            f.update_scenes(&mut |_| {}).expect("update scenes");
+            let mut scene_referred = |_: &mut HookPass<'_, '_>| {};
+            let mut display_linear = |_: &mut HookPass<'_, '_>| {};
+            let mut hooks = ViewHooks::default();
+            if settings.hooks {
+                hooks.scene_referred = Some(&mut scene_referred);
+                hooks.display_linear = Some(&mut display_linear);
+            }
+            let rendered = f
+                .render_view(
+                    &LitView {
+                        scene: self.scene,
+                        history: self.history,
+                        position: DVec3::new(-settings.camera * behind, 0.0, LAMP_DISTANCE),
+                        rotation: Quat::IDENTITY,
+                        projection: Projection {
+                            fov_y: LAMP_FOV_Y,
+                            near: 0.05,
+                        },
+                        lens: Lens {
+                            shutter: settings.shutter,
+                            glare: None,
+                            ..Lens::default()
+                        },
+                        reset_history: i == 0 || (settings.cut && final_frame),
+                        texture_filter: TextureFilter::Hardware,
+                        target: ViewTarget::Texture(&target),
+                    },
+                    &ViewLighting {
+                        reference: settings.reference.then(ReferenceSettings::default),
+                        ..ViewLighting::default()
+                    },
+                    &ViewOutput {
+                        exposure: Exposure::Manual { ev100: LAMP_EV100 },
+                        debug: OutputDebug::Linear,
+                        reconstruction: settings.reconstruction,
+                        screenshot: final_frame
+                            .then_some(ScreenshotRequest::Display { include_ui: false }),
+                        ..ViewOutput::default()
+                    },
+                    &mut hooks,
+                )
+                .expect("render view");
+            self.render_extent = rendered.render_extent;
+            last = Some((id, f.end().expect("end frame")));
+        }
+        last_screenshot(&mut self.renderer, self.history, last).rgba
+    }
+
+    /// Renders like [`Self::run`] and panics unless the image is `sharp` smeared along x by the
+    /// distance `settings` asks for, within the relative `tolerance` in length, in energy and
+    /// in spread across the motion. Returns the image.
+    fn streak(
+        &mut self,
+        name: &str,
+        extent: [u32; 2],
+        frames: u32,
+        settings: LampSettings,
+        sharp: &[f32],
+        tolerance: f64,
+    ) -> Vec<f32> {
+        let image = self.run(extent, frames, settings);
+        let got = Spread::of(&image, extent[0]);
+        let sharp = Spread::of(sharp, extent[0]);
+        let length = got.half_length(&sharp);
+        let want = settings.half_length(extent[1]);
+        log::info!("{name}: half length {length:.2} of {want:.2}, {got:?}, sharp {sharp:?}");
+        assert!(
+            (length / want - 1.0).abs() < tolerance,
+            "{name}: half length {length:.2} of {want:.2}"
+        );
+        assert!(
+            (got.variance[1] / sharp.variance[1] - 1.0).abs() < tolerance,
+            "{name}: blur across the motion: {got:?}, sharp {sharp:?}"
+        );
+        assert!(
+            (got.center[0] - sharp.center[0]).abs() < 0.1,
+            "{name}: the streak is not centered on the frame: {got:?}, sharp {sharp:?}"
+        );
+        assert!(
+            (got.energy / sharp.energy - 1.0).abs() < tolerance,
+            "{name}: energy changes: {got:?}, sharp {sharp:?}"
+        );
+        image
+    }
+}
+
+/// The streak at half the output size under ray reconstruction, where NGX offers it, measured
+/// in output pixels.
+fn check_blur_under_ray_reconstruction(lamp: &mut Lamp, moving: LampSettings) {
+    if !enable_dlss(&mut lamp.renderer) {
+        log::warn!("skipped ray reconstruction: NGX offers none here");
+        return;
+    }
+    let extent = [640, 360];
+    let frames = 16;
+    let moving = LampSettings {
+        reconstruction: Reconstruction::Quality(DlssQuality::Performance),
+        ..moving
+    };
+    let sharp = lamp.run(extent, frames, moving.closed());
+    assert_eq!(lamp.render_extent, [320, 180]);
+    // Its energy moves by about 8% from one run to the next. Half the length, which render
+    // pixels in place of output pixels would give, is still far outside this.
+    let tolerance = 0.15;
+    lamp.streak(
+        "ray reconstruction",
+        extent,
+        frames,
+        moving,
+        &sharp,
+        tolerance,
+    );
+}
+
+/// `render_view` smears a moving lamp along its motion by the distance the shutter says, in
+/// output pixels at any render extent, leaves still views alone to the byte, and shows no blur
+/// where motion vectors or the view's purpose rule it out.
+#[test]
+fn render_view_blurs_what_moves_while_the_shutter_is_open() {
+    let _serial = serial();
+    let mut lamp = Lamp::new();
+    let extent = [320, 240];
+    let frames = 4;
+    let moving = LampSettings {
+        lamp: 3.0,
+        camera: 0.0,
+        shutter: 0.5,
+        cut: false,
+        reference: false,
+        hooks: false,
+        reconstruction: Reconstruction::Off,
+    };
+    let sharp = lamp.run(extent, frames, moving.closed());
+    let lit = sharp.chunks_exact(4).filter(|p| p[1] > 0.0).count();
+    assert_eq!(lit, 8 * 8, "a sharp lamp is its near face");
+
+    // Without ray reconstruction the images repeat exactly.
+    let tolerance = 0.04;
+    let blurred = lamp.streak("lamp", extent, frames, moving, &sharp, tolerance);
+    let quarter = LampSettings {
+        shutter: 0.25,
+        ..moving
+    };
+    lamp.streak(
+        "quarter shutter",
+        extent,
+        frames,
+        quarter,
+        &sharp,
+        tolerance,
+    );
+    // Below the camera jump distance, which would count as a cut.
+    let camera = LampSettings {
+        lamp: 0.0,
+        camera: 1.5,
+        shutter: 1.0,
+        ..moving
+    };
+    lamp.streak("camera", extent, frames, camera, &sharp, tolerance);
+
+    let hooked = LampSettings {
+        hooks: true,
+        ..moving
+    };
+    assert!(
+        lamp.run(extent, frames, hooked) == blurred,
+        "hooks that draw nothing change the blur"
+    );
+    let still = LampSettings {
+        lamp: 0.0,
+        ..moving
+    };
+    assert!(
+        lamp.run(extent, frames, still) == sharp,
+        "the open shutter changes a still view"
+    );
+    let cut = LampSettings {
+        cut: true,
+        ..moving
+    };
+    assert!(lamp.run(extent, frames, cut) == sharp, "a cut smears");
+    let reference = LampSettings {
+        reference: true,
+        ..moving
+    };
+    let accumulated = Spread::of(&lamp.run(extent, frames, reference), extent[0]);
+    let sharp_spread = Spread::of(&sharp, extent[0]);
+    assert!(
+        accumulated.half_length(&sharp_spread) < 1.0,
+        "the reference smears: {accumulated:?}, sharp {sharp_spread:?}"
+    );
+
+    check_blur_under_ray_reconstruction(&mut lamp, moving);
+    drop(lamp);
     device().collect_garbage();
     assert_clean();
 }
