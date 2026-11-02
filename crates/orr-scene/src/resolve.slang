@@ -14,8 +14,9 @@ import sequence;
 import surface;
 import visibility;
 
-// Its taps drive texture streaming.
+// Its taps drive texture streaming and decode the neural sets that stand in for textures.
 export static const bool TEXTURE_FEEDBACK = true;
+export static const bool NEURAL_TEXTURES = true;
 
 extern struct Surface : ISurface = StandardSurface;
 
@@ -132,6 +133,7 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     if (active)
     {
         hit = primary_hit(s, v, vc, visibility_triangle(w), float2(pixel) + 0.5);
+        material_prepare(s.materials + vc.material, hit.input.uv);
         g = Surface.surface(hit.input, offset);
         offset = max(offset, 0.0);
     }

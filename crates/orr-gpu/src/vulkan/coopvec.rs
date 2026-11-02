@@ -5,7 +5,6 @@ use ash::vk;
 
 use super::command::CommandList;
 use super::device::{Device, Shared};
-use super::memory::Allocation;
 use crate::{ComponentType, Error, GpuAddress};
 
 /// Matrices start at multiples of this many bytes. The driver neither faults nor reports
@@ -192,26 +191,22 @@ impl Device {
             .map(|b| b as u64)
     }
 
-    /// Converts the matrix in host memory `src` into mapped `dst` at `offset` (a multiple of
-    /// [`MATRIX_ALIGN`] from the allocation's address), on the calling thread. Returns the
-    /// bytes written. Needs cooperative vectors.
+    /// Converts the matrix in host memory `src` into the start of host memory `dst`, which
+    /// is at a multiple of [`MATRIX_ALIGN`], on the calling thread. Returns the bytes
+    /// written. Needs cooperative vectors.
     pub fn convert_matrix(
         &self,
         c: &MatrixConversion,
         src: &[u8],
-        dst: &mut Allocation<u8>,
-        offset: u64,
+        dst: &mut [u8],
     ) -> Result<u64, Error> {
         let shared = &self.shared;
-        check_aligned(dst.gpu().address().0 + offset);
+        check_aligned(dst.as_ptr() as u64);
         let mut bytes = shared.matrix_bytes(c.rows, c.columns, &c.dst_format)?;
-        let size = dst.size();
-        let mapped = dst
-            .as_mut_slice()
-            .ok_or_else(|| Error::Invalid("matrix destination is not mapped".into()))?;
-        if offset + bytes as u64 > size {
+        if bytes > dst.len() {
             return Err(Error::Invalid(format!(
-                "{bytes} matrix bytes at offset {offset} in an allocation of {size}"
+                "{bytes} matrix bytes in a destination of {}",
+                dst.len()
             )));
         }
         let mut info = info(c.rows, c.columns, &c.src_format, &c.dst_format);
@@ -221,7 +216,7 @@ impl Device {
         };
         info.p_dst_size = &mut bytes;
         info.dst_data = vk::DeviceOrHostAddressKHR {
-            host_address: mapped[offset as usize..].as_mut_ptr().cast(),
+            host_address: dst.as_mut_ptr().cast(),
         };
         // SAFETY: both host ranges are live and hold the sizes given.
         unsafe { shared.coop_fn().convert_cooperative_vector_matrix(&info) }

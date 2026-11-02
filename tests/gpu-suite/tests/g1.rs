@@ -438,8 +438,7 @@ fn coopvec_case(
         .convert_matrix(
             &conversion,
             orr_shaders::bytemuck::cast_slice(weights),
-            &mut on_host,
-            128,
+            &mut on_host.as_mut_slice().unwrap()[128..],
         )
         .unwrap();
     assert_eq!(written, bytes);

@@ -21,7 +21,7 @@ use orr_gpu::{
 use crate::memory::{PoolSlot, RangeAllocator};
 use crate::mount::Apply;
 use crate::upload::Record;
-use crate::{MountId, Result, TextureFeedbackGpu, TextureStreamGpu};
+use crate::{MountId, NeuralTextureGpu, Result, TextureFeedbackGpu, TextureStreamGpu};
 
 /// How a streamed texture's tiles are numbered: by layer, then mip finest first, then row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,6 +151,8 @@ pub(crate) struct TexStream {
     pub(crate) map: GpuPtr<u32>,
     /// Mip tails bound (one per layer, or one for the image) and their memory.
     pub(crate) tails: Option<(u32, Allocation<u8>)>,
+    /// The neural set standing in for the texture; null for none.
+    pub(crate) neural: GpuPtr<NeuralTextureGpu>,
 }
 
 /// The residency map of one layer from its finest resident mips: each cell takes the

@@ -4,6 +4,7 @@ use std::borrow::Cow;
 
 const OP_CAPABILITY: u32 = 17;
 const CAPABILITY_ABORT: u32 = 5120;
+const CAPABILITY_COOPERATIVE_VECTOR: u32 = 5394;
 const OP_ENTRY_POINT: u32 = 15;
 const OP_VARIABLE: u32 = 59;
 const STORAGE_TASK_PAYLOAD: u32 = 5402;
@@ -21,11 +22,21 @@ fn instructions(code: &[u32]) -> impl Iterator<Item = (usize, &[u32])> {
     })
 }
 
-/// Whether the module declares `AbortKHR`, which needs `shaderAbort`.
-pub(super) fn aborts(code: &[u32]) -> bool {
+/// Whether the module declares capability `cap`.
+fn declares(code: &[u32], cap: u32) -> bool {
     instructions(code)
         .take_while(|(_, inst)| inst[0] & 0xffff == OP_CAPABILITY)
-        .any(|(_, inst)| inst.get(1) == Some(&CAPABILITY_ABORT))
+        .any(|(_, inst)| inst.get(1) == Some(&cap))
+}
+
+/// Whether the module declares `AbortKHR`, which needs `shaderAbort`.
+pub(super) fn aborts(code: &[u32]) -> bool {
+    declares(code, CAPABILITY_ABORT)
+}
+
+/// Whether the module declares `CooperativeVectorNV`, which needs cooperative vectors.
+pub(super) fn cooperative_vectors(code: &[u32]) -> bool {
+    declares(code, CAPABILITY_COOPERATIVE_VECTOR)
 }
 
 /// The interface ids of entry point `name`.

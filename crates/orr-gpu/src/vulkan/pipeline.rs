@@ -169,6 +169,11 @@ impl<'a> StageParts<'a> {
         } else {
             Cow::Borrowed(s.spirv)
         };
+        if shared.caps.cooperative_vector.is_empty() && spirv::cooperative_vectors(&code) {
+            return Err(Error::Shader(format!(
+                "{name}: the module uses cooperative vectors, which the device has none of; build the shaders with ORR_SHADER_NEURAL=0"
+            )));
+        }
         if !shared.caps.shader_abort && spirv::aborts(&code) {
             return Err(Error::Shader(format!(
                 "{name}: the module was built with asserts, which need shaderAbort, and the device has none; build the shaders with ORR_SHADER_ASSERTS=0, or ORR_SHADER_CAPTURE=1 for a capture session"

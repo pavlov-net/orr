@@ -23,7 +23,7 @@ orr-shaders.workspace = true
 bytemuck.workspace = true
 glam.workspace = true
 orr-math.workspace = true
-half = "2.7"
+half = { workspace = true, features = ["bytemuck"] }
 rustc-hash.workspace = true
 thiserror.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "exr"], optional = true }

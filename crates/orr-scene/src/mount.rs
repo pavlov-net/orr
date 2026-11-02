@@ -1,8 +1,8 @@
 //! Packs mounted from a file or from memory. The loading side reads and places every asset
 //! of a pack except what streams on request: the hierarchy pages below a mesh's top page, a
 //! large DAG mesh's finer pages, instance pages' records and the tiles above the mip tails of
-//! the textures its materials bind. The render thread takes the finished batch at step 1 and
-//! applies its tables with the frame's scatter.
+//! the textures its materials bind and of neural sets' latents. The render thread takes the
+//! finished batch at step 1 and applies its tables with the frame's scatter.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -20,6 +20,7 @@ use orr_pack::instance::{InstancePageInfo, InstanceRecord};
 use orr_pack::material::Material;
 use orr_pack::mesh::{Cluster, Group, MeshHeader, MeshInfo, NodePage, PageHeader, PageView, Part};
 use orr_pack::model::ModelInfo;
+use orr_pack::neural::{Constants, Fp8Network, NeuralInfo, NeuralTexture};
 use orr_pack::subd::{Page as SubdPage, SubdInfo};
 use orr_pack::texture::{TextureHeader, TextureInfo};
 use orr_pack::volume::VolumeInfo;
@@ -38,6 +39,7 @@ use crate::loading::{ArchiveFile, BlobSource, Loading, Msg, decoded, read_stored
 use crate::material::{BoundTexture, MaterialId, MaterialTable, candidate_class};
 use crate::medium_proxy::VolumeRef;
 use crate::memory::{Block, RangeAllocator, UploadWindow};
+use crate::neural::{self, NeuralLink, Precision};
 use crate::residency::{ResidencyClass, Start, UnitDesc};
 use crate::scene::{ModelCpu, ModelId, SkinShape};
 use crate::shaders::types::SubdCageGpu;
@@ -50,8 +52,8 @@ use crate::tiles::{TexStream, TileGrid};
 use crate::traverse::{PAGED_DEPTH, PageFeedback};
 use crate::upload::Record;
 use crate::{
-    ClusterRef, EditGroupGpu, Error, MaskGpu, MaterialGpu, MeshGpu, ModelGpu, PartGpu, Result,
-    SkinMeshGpu, TextureStreamGpu, material_flags,
+    ClusterRef, EditGroupGpu, Error, MaskGpu, MaterialGpu, MeshGpu, ModelGpu, NeuralSetGpu,
+    NeuralTextureGpu, PartGpu, Result, SkinMeshGpu, TextureStreamGpu, material_flags,
 };
 
 /// Where a pack's bytes come from.
@@ -93,6 +95,8 @@ pub(crate) struct PlacedTexture {
     bytes: u64,
     /// How a streamed texture's tiles load; none for whole textures.
     stream: Option<Arc<TexStream>>,
+    /// The neural set that stands in for the texture.
+    neural: Option<NeuralLink>,
 }
 
 struct PlacedMesh {
@@ -252,6 +256,16 @@ struct Placed {
     clips: Vec<(AssetId, ClipRef)>,
     cages: Vec<PlacedCage>,
     volumes: Vec<(AssetId, VolumeRef)>,
+    neural: Vec<PlacedNeural>,
+}
+
+/// A neural texture set: its weights in a block of the mount, and its record, written by
+/// the render thread once its latents are placed.
+struct PlacedNeural {
+    id: AssetId,
+    latents: AssetId,
+    record: GpuPtr<NeuralSetGpu>,
+    gpu: NeuralSetGpu,
 }
 
 /// One mount on the loading side, shared by its jobs and reads.
@@ -263,6 +277,8 @@ pub(crate) struct MountTask {
     staged: bool,
     host_copy: bool,
     sampler: SamplerIndex,
+    /// The precision neural sets decode at; none when textures sample their BC entries.
+    neural: Option<Precision>,
     cancel: Arc<AtomicBool>,
     outstanding: AtomicUsize,
     error: Mutex<Option<Error>>,
@@ -281,6 +297,7 @@ impl MountTask {
         loading: &Arc<Loading>,
         device: &Device,
         sampler: SamplerIndex,
+        neural: Option<Precision>,
         cancel: Arc<AtomicBool>,
         accel: &Arc<AccelShared>,
     ) -> Self {
@@ -292,6 +309,7 @@ impl MountTask {
             staged: !caps.rebar,
             host_copy: caps.host_image_copy,
             sampler,
+            neural,
             cancel,
             // The chain from the archive's first read to the placement plan.
             outstanding: AtomicUsize::new(1),
@@ -555,8 +573,20 @@ fn open_index(
     plan(t, archive)
 }
 
-/// The textures the pack's materials bind, from the materials' blobs resident in the mount
-/// section.
+/// Entry `e`'s blob 0 when it is resident in the mount section.
+fn mount_blob0(archive: &Archive, e: &orr_pack::Entry) -> Result<Option<Vec<u8>>> {
+    let Some(&b) = archive.blobs(e).first() else {
+        return Ok(None);
+    };
+    let Some(stored) = archive.stored(&b, None) else {
+        return Ok(None);
+    };
+    let mut bytes = vec![0; b.raw_len as usize];
+    archive.decode(&b, None, stored, &mut bytes)?;
+    Ok(Some(bytes))
+}
+
+/// The textures the pack's materials bind.
 fn material_textures(archive: &Archive) -> Result<HashSet<AssetId>> {
     let mut bound = HashSet::new();
     for e in archive
@@ -564,25 +594,70 @@ fn material_textures(archive: &Archive) -> Result<HashSet<AssetId>> {
         .iter()
         .filter(|e| e.class == Class::Material as u16)
     {
-        let Some(&b) = archive.blobs(e).first() else {
-            continue;
-        };
-        let Some(stored) = archive.stored(&b, None) else {
-            continue;
-        };
-        let mut bytes = vec![0; b.raw_len as usize];
-        archive.decode(&b, None, stored, &mut bytes)?;
-        let m = Material::from_bytes(&bytes)?;
-        bound.extend(m.textures.iter().map(|t| t.texture));
+        if let Some(bytes) = mount_blob0(archive, e)? {
+            let m = Material::from_bytes(&bytes)?;
+            bound.extend(m.textures.iter().map(|t| t.texture));
+        }
     }
     Ok(bound)
 }
 
-/// Queues the reads of every asset the mount makes resident.
+/// A neural texture set the mount decodes.
+struct DecodedSet {
+    entry: usize,
+    id: AssetId,
+    info: NeuralInfo,
+    /// The blob of the weights it reads, and their constants.
+    blob: u32,
+    constants: Constants,
+}
+
+/// The pack's neural texture sets: those the mount decodes, none without `decode`, and the
+/// latents of the others, which nothing reads.
+fn neural_sets(archive: &Archive, decode: bool) -> Result<(Vec<DecodedSet>, HashSet<AssetId>)> {
+    let mut sets = Vec::new();
+    let mut unread = HashSet::new();
+    for (entry, e) in archive.entries().iter().enumerate() {
+        if e.class != Class::NeuralTextureSet as u16 {
+            continue;
+        }
+        let e = archive.expect(e.id, e.class, orr_pack::neural::SCHEMA)?;
+        let Some(bytes) = mount_blob0(archive, e)? else {
+            continue;
+        };
+        let info = NeuralInfo::parse(&bytes)?;
+        match neural::readable(&info).filter(|_| decode) {
+            Some((row, constants)) => sets.push(DecodedSet {
+                entry,
+                id: e.id,
+                blob: row.blob,
+                constants,
+                info,
+            }),
+            None => {
+                unread.insert(info.header.latents);
+            }
+        }
+    }
+    Ok((sets, unread))
+}
+
+/// Queues the reads of every asset the mount makes resident. With neural decoding, the
+/// textures in a readable set's table get a link to the set, which kernels that decode
+/// read in place of the texture, and the set's latents stream like the textures materials
+/// bind. Latents of sets the mount does not decode stay out of it.
 fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
     let archive = Arc::new(archive);
     let _ = t.archive.set(Arc::clone(&archive));
-    let bound = material_textures(&archive)?;
+    let mut bound = material_textures(&archive)?;
+    let (sets, unread_latents) = neural_sets(&archive, t.neural.is_some())?;
+    let mut linked: HashMap<AssetId, (AssetId, NeuralTexture)> = HashMap::new();
+    for s in &sets {
+        bound.insert(s.info.header.latents);
+        for tex in &s.info.textures {
+            linked.entry(tex.texture).or_insert((s.id, *tex));
+        }
+    }
     for (i, e) in archive.entries().iter().enumerate() {
         let Some(class) = Class::from_u16(e.class) else {
             continue;
@@ -607,8 +682,14 @@ fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
         match class {
             Class::Mesh => fetch(t, i, 0, move |t, b| place_mesh(t, i, id, b)),
             Class::Texture => {
+                if unread_latents.contains(&id) {
+                    continue;
+                }
                 let stream = bound.contains(&id);
-                fetch(t, i, 0, move |t, b| place_texture(t, i, id, b, stream));
+                let neural = linked.get(&id).copied();
+                fetch(t, i, 0, move |t, b| {
+                    place_texture(t, i, id, b, stream, neural)
+                });
             }
             Class::Material => fetch(t, i, 0, move |t, b| {
                 let m = Material::from_bytes(b)?;
@@ -627,6 +708,38 @@ fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
             _ => fetch(t, i, 0, move |t, b| place_page(t, i, id, b)),
         }
     }
+    for s in sets {
+        fetch(t, s.entry, s.blob as usize, move |t, b| {
+            place_neural(t, &s, b)
+        });
+    }
+    Ok(())
+}
+
+/// A neural texture set's decoder weights, converted into the device's layout in a block of
+/// their own that also holds the set's record.
+fn place_neural(t: &Arc<MountTask>, s: &DecodedSet, blob: &[u8]) -> Result<()> {
+    let p = t.neural.expect("sets are read with neural decoding");
+    let net = Fp8Network::parse(blob)?;
+    let mut w = neural::device_weights(&t.device, &s.info, &s.constants, &net, p)?;
+    let record_at = w.len as u64;
+    let record_bytes = size_of::<NeuralSetGpu>() as u64;
+    let block = t.block(record_at + record_bytes, "neural texture set")?;
+    assert!(
+        block.gpu().is_multiple_of(orr_gpu::MATRIX_ALIGN),
+        "neural weights at {:#x}",
+        block.gpu()
+    );
+    t.write(block, 0, &w.bytes.as_slice()[..w.len])?;
+    w.record.weights = block.gpu();
+    w.record.sampler = t.sampler;
+    t.placed.lock().unwrap().neural.push(PlacedNeural {
+        id: s.id,
+        latents: s.info.header.latents,
+        // SAFETY: the record's bytes in the set's block.
+        record: unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu() + record_at)) },
+        gpu: w.record,
+    });
     Ok(())
 }
 
@@ -1017,6 +1130,7 @@ fn gpu_format(vk_format: u32) -> Option<orr_gpu::Format> {
         vk::R8G8_UNORM => F::Rg8Unorm,
         vk::R8G8B8A8_UNORM => F::Rgba8Unorm,
         vk::R8G8B8A8_SRGB => F::Rgba8Srgb,
+        vk::A4R4G4B4_UNORM_PACK16 => F::A4r4g4b4Unorm,
         vk::R16_UNORM => F::R16Unorm,
         vk::R16_SFLOAT => F::R16Float,
         vk::R16G16_UNORM => F::Rg16Unorm,
@@ -1044,14 +1158,16 @@ fn gpu_format(vk_format: u32) -> Option<orr_gpu::Format> {
 
 /// A texture from blob 0: streamed when `stream` and it has mips above a mip tail, which
 /// stays resident as the floor the residency clamp falls back to; else whole with every mip
-/// copied in from its blob. Textures streamed are those the pack's materials bind, which
-/// kernels sample through the footprint function's residency clamp.
+/// copied in from its blob. Textures streamed are those the pack's materials bind and neural
+/// sets' latents, which kernels sample through the footprint function's residency clamp. With
+/// `neural`, the texture links to the set that stands in for it.
 fn place_texture(
     t: &Arc<MountTask>,
     entry: usize,
     id: AssetId,
     blob0: &[u8],
     stream: bool,
+    neural: Option<(AssetId, NeuralTexture)>,
 ) -> Result<()> {
     let info = Arc::new(TextureInfo::parse(blob0)?);
     let h = info.header;
@@ -1068,8 +1184,9 @@ fn place_texture(
         layers: u32::from(h.layers),
         usage: TextureUsage::SAMPLED,
     };
+    let mut neural = neural.map(|n| neural_link(t, n)).transpose()?;
     let has_tail = (1..h.mip_count).contains(&h.tail_first_mip);
-    if stream && has_tail && place_streamed(t, entry, id, &info, &desc)? {
+    if stream && has_tail && place_streamed(t, entry, id, &info, &desc, &mut neural)? {
         return Ok(());
     }
     if t.host_copy {
@@ -1090,6 +1207,7 @@ fn place_texture(
         staged: !t.host_copy,
         bytes: t.device.texture_requirements(&desc).0,
         stream: None,
+        neural,
     });
     for blob in 1..h.blob_count() {
         let (info, texture) = (Arc::clone(&info), Arc::clone(&texture));
@@ -1115,15 +1233,46 @@ fn place_texture(
     Ok(())
 }
 
+/// A neural link of its own for a texture that set `set` stands in for, its record (and the
+/// texture's own stream record, should it not stream) in a block of their own.
+fn neural_link(t: &Arc<MountTask>, (set, tex): (AssetId, NeuralTexture)) -> Result<NeuralLink> {
+    let record_bytes = size_of::<NeuralTextureGpu>() as u64;
+    let block = t.block(
+        record_bytes + size_of::<TextureStreamGpu>() as u64,
+        "neural texture record",
+    )?;
+    // SAFETY: both records are the block's bytes.
+    let (record, own) = unsafe {
+        (
+            GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu())),
+            GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu() + record_bytes)),
+        )
+    };
+    Ok(NeuralLink {
+        set,
+        record,
+        own,
+        gpu: NeuralTextureGpu {
+            set: GpuPtr::NULL,
+            first: u32::from(tex.first_channel),
+            count: u32::from(tex.channel_count.min(4)),
+        },
+        latents: None,
+        latent_mips: Vec::new(),
+    })
+}
+
 /// A streamed texture: a sparse image whose mip tails are bound at mount and filled from
-/// the last blob, and whose tiles above them stream. False, placing nothing, when the
-/// device's tile layout differs from the cooked one.
+/// the last blob, and whose tiles above them stream; its stream record points at `neural`,
+/// which it takes. False, placing nothing, when the device's tile layout differs from the
+/// cooked one.
 fn place_streamed(
     t: &Arc<MountTask>,
     entry: usize,
     id: AssetId,
     info: &Arc<TextureInfo>,
     desc: &TextureDesc,
+    neural: &mut Option<NeuralLink>,
 ) -> Result<bool> {
     let h = info.header;
     let texture = t
@@ -1138,6 +1287,7 @@ fn place_streamed(
         return Ok(false);
     }
     let texture = Arc::new(texture);
+    let neural = neural.take();
     let tail = u32::from(h.tail_first_mip);
     let grid = TileGrid::new(
         (0..tail).map(|m| layout.tiles(desc, m)).collect(),
@@ -1182,6 +1332,7 @@ fn place_streamed(
         record,
         map,
         tails,
+        neural: neural.as_ref().map_or(GpuPtr::NULL, |n| n.record),
     });
     t.placed.lock().unwrap().textures.push(PlacedTexture {
         id,
@@ -1191,6 +1342,10 @@ fn place_streamed(
         staged: true,
         bytes: tail_bytes,
         stream: Some(stream),
+        neural: neural.map(|n| NeuralLink {
+            own: GpuPtr::NULL,
+            ..n
+        }),
     });
     if tail < desc.mips {
         let info = Arc::clone(info);
@@ -1310,6 +1465,7 @@ pub(crate) struct Resolved {
     clips: Vec<(AssetId, ClipRef)>,
     cages: Vec<PlacedCage>,
     volumes: Vec<(AssetId, VolumeRef)>,
+    neural: Vec<PlacedNeural>,
     accel: MountAccel,
     /// Resident cluster id ranges taken for the mount's meshes.
     cluster_ranges: Vec<(u32, u32)>,
@@ -1496,9 +1652,47 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
         clips: p.clips,
         cages: p.cages,
         volumes: p.volumes,
+        neural: p.neural,
         accel: MountAccel::default(),
         cluster_ranges: Vec::new(),
     })
+}
+
+/// Points each neural set at its latents and each linked texture at its set.
+fn link_neural(r: &mut Resolved) -> Result<()> {
+    let missing = |id| Error::Pack(orr_pack::Error::Missing(id));
+    for n in &mut r.neural {
+        let latents = r
+            .textures
+            .iter()
+            .find(|t| t.id == n.latents)
+            .ok_or_else(|| missing(n.latents))?;
+        let d = latents.texture.desc();
+        if d.format != orr_gpu::Format::A4r4g4b4Unorm || d.layers != n.gpu.latent_layers {
+            return Err(orr_pack::Error::Malformed("neural set latents").into());
+        }
+        n.gpu.latents = latents.index;
+    }
+    let streams: HashMap<AssetId, Option<Arc<TexStream>>> = r
+        .textures
+        .iter()
+        .map(|t| (t.id, t.stream.clone()))
+        .collect();
+    for t in &mut r.textures {
+        let Some(l) = &mut t.neural else { continue };
+        let n = r
+            .neural
+            .iter()
+            .find(|n| n.id == l.set)
+            .ok_or_else(|| missing(l.set))?;
+        l.latents.clone_from(&streams[&n.latents]);
+        l.latent_mips = n.gpu.color_mips[..n.gpu.mips as usize]
+            .iter()
+            .map(|m| m.latent_mip as u32)
+            .collect();
+        l.gpu.set = n.record;
+    }
+    Ok(())
 }
 
 /// Takes resident cluster ids for every mesh of `r` and builds their acceleration
@@ -1672,6 +1866,7 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<MountTask>) 
     let result = state
         .and_then(|()| resolve(task.source(), placed, task.sampler))
         .and_then(|mut r| {
+            link_neural(&mut r)?;
             let tails = bind_tails(device, &r.textures)?;
             let copied = submit_copies(device, &copies, &r.textures, tails)?;
             let built = build_accel(device, &task.accel, &mut r, copied);
@@ -3044,6 +3239,12 @@ impl Mounts {
             placed_textures: r.textures,
         };
         let resolved = (r.materials, r.meshes, r.models, r.pages, r.cages);
+        for n in &r.neural {
+            if let Err(e) = w.put(n.record, &[n.gpu]) {
+                self.release(res, w.device, w.materials);
+                return Err(e);
+            }
+        }
         let result = self.fill(mount, &r.source, &mut res, resolved, w);
         match result {
             Ok(()) => Ok(res),
@@ -3244,8 +3445,13 @@ impl Mounts {
         for (&(i, _), &unit) in page_entries.iter().zip(&units.page_units) {
             self.page_keys[i as usize] = Some((mount, unit));
         }
+        let neural: Vec<(u32, &NeuralLink)> = res
+            .placed_textures
+            .iter()
+            .filter_map(|t| Some((t.index.0, t.neural.as_ref()?)))
+            .collect();
         self.streaming
-            .register(mount, Arc::clone(source), units, w)?;
+            .register(mount, Arc::clone(source), units, &neural, w)?;
         Ok(())
     }
 

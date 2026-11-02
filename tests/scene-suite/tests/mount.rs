@@ -1,7 +1,7 @@
 //! Packs mounted from files and from memory: every asset placed on the loading side and
 //! read back equal to the archive's CPU decode, lookups by mount, the threads lent to the
-//! loading side, failures, the archive handles, and hierarchy pages streamed on request
-//! and on the traversal's feedback.
+//! loading side, failures, the archive handles, hierarchy pages streamed on request and on
+//! the traversal's feedback, and textures decoded from neural texture sets.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -30,8 +30,8 @@ use orr_scene::testing::{
 use orr_scene::{
     Affine3, BoundTexture, Budgets, EmissiveGpu, Error, FrameDesc, FrameTime, GroupWriter,
     InstanceFlags, InstancesDesc, LoadState, MaterialGpu, MeshGpu, ModelGpu, ModelId, MountId,
-    PackSource, RendererDesc, ResidencyClass, SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes,
-    TransformGroupDesc, material_flags,
+    NeuralTextures, PackSource, RendererDesc, ResidencyClass, SceneDesc, SceneId, SceneRoot,
+    SceneWriter, Scenes, TransformGroupDesc, material_flags,
 };
 use scene_suite::Workers;
 
@@ -1124,76 +1124,104 @@ fn tiled_texels(t: usize, mip: u32, layer: u32) -> Vec<u8> {
         .collect()
 }
 
-/// A memory pack of the `TILED` textures, laid out as the cook lays out a texture (blob 0
-/// and the mip tail resident from mount, one 64 KiB tile per chunk in each mip blob above
-/// the tail, edge tiles padded), a material binding each, and a consumer asset.
-fn tiled_pack() -> &'static Arc<[u8]> {
+/// Adds texture entry `name` laid out as the cook lays out a texture: blob 0 and the mip
+/// tail resident from mount, one 64 KiB tile per chunk in each mip blob above the tail,
+/// edge tiles padded. `texels(mip, layer)` are a mip's tight texels. Returns the first mip
+/// of the tail.
+fn add_texture(
+    w: &mut ArchiveWriter,
+    name: &str,
+    vk_format: u32,
+    [width, height]: [u32; 2],
+    layers: u32,
+    cube: bool,
+    texels: impl Fn(u32, u32) -> Vec<u8>,
+) -> u32 {
     use orr_pack::texture::{
         FormatInfo, TILE_BYTES, TextureHeader, TextureInfo, full_mip_count, tail_first_mip, tile,
-        vk,
     };
+    let f = FormatInfo::of(vk_format).unwrap();
+    let mips = full_mip_count(width, height);
+    let tail = tail_first_mip(f, width, height, mips);
+    let header = TextureHeader {
+        vk_format,
+        width,
+        height,
+        layers: layers as u16,
+        kind: if cube {
+            TextureHeader::CUBE
+        } else {
+            TextureHeader::D2
+        },
+        mip_count: mips as u8,
+        tail_first_mip: tail as u8,
+        primaries: TextureHeader::REC709,
+        _pad: [0; 2],
+        alpha_cutoff: f32::NAN,
+        lights: Span::default(),
+    };
+    let head = TextureInfo {
+        header,
+        lights: Vec::new(),
+    }
+    .to_bytes();
+    let mut mip_blobs = Vec::new();
+    for mip in 0..tail {
+        let [mw, mh] = header.mip_size(mip);
+        let mut out = Vec::new();
+        for layer in 0..layers {
+            tile(f, mw, mh, &texels(mip, layer), &mut out);
+        }
+        mip_blobs.push(out);
+    }
+    let tail_blob: Vec<u8> = (tail..mips)
+        .flat_map(|mip| {
+            (0..layers)
+                .flat_map(|layer| texels(mip, layer))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut blobs = vec![BlobIn {
+        mount: true,
+        ..BlobIn::new(&head)
+    }];
+    blobs.extend(mip_blobs.iter().map(|b| BlobIn {
+        chunk_len: TILE_BYTES as u32,
+        ..BlobIn::new(b)
+    }));
+    blobs.push(BlobIn {
+        mount: true,
+        ..BlobIn::new(&tail_blob)
+    });
+    w.add(
+        name,
+        Class::Texture as u16,
+        orr_pack::texture::SCHEMA,
+        orr_pack::Hash32([0; 32]),
+        &blobs,
+    )
+    .unwrap();
+    tail
+}
+
+/// A memory pack of the `TILED` textures ([`add_texture`]), a material binding each, and a
+/// consumer asset.
+fn tiled_pack() -> &'static Arc<[u8]> {
+    use orr_pack::texture::vk;
     static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
     PACK.get_or_init(|| {
-        let f = FormatInfo::of(vk::R8G8B8A8_UNORM).unwrap();
         let mut w = ArchiveWriter::create(Target::Memory).unwrap();
         for (t, &(name, width, height, layers, cube)) in TILED.iter().enumerate() {
-            let mips = full_mip_count(width, height);
-            let tail = tail_first_mip(f, width, height, mips);
-            assert_eq!(tail, 2, "{name} streams two mips");
-            let header = TextureHeader {
-                vk_format: vk::R8G8B8A8_UNORM,
-                width,
-                height,
-                layers: layers as u16,
-                kind: if cube {
-                    TextureHeader::CUBE
-                } else {
-                    TextureHeader::D2
-                },
-                mip_count: mips as u8,
-                tail_first_mip: tail as u8,
-                primaries: TextureHeader::REC709,
-                _pad: [0; 2],
-                alpha_cutoff: f32::NAN,
-                lights: Span::default(),
-            };
-            let head = TextureInfo {
-                header,
-                lights: Vec::new(),
-            }
-            .to_bytes();
-            let mut mip_blobs = Vec::new();
-            for mip in 0..tail {
-                let [mw, mh] = header.mip_size(mip);
-                let mut out = Vec::new();
-                for layer in 0..layers {
-                    tile(f, mw, mh, &tiled_texels(t, mip, layer), &mut out);
-                }
-                mip_blobs.push(out);
-            }
-            let tail_blob: Vec<u8> = (tail..mips)
-                .flat_map(|mip| (0..layers).flat_map(move |layer| tiled_texels(t, mip, layer)))
-                .collect();
-            let mut blobs = vec![BlobIn {
-                mount: true,
-                ..BlobIn::new(&head)
-            }];
-            blobs.extend(mip_blobs.iter().map(|b| BlobIn {
-                chunk_len: TILE_BYTES as u32,
-                ..BlobIn::new(b)
-            }));
-            blobs.push(BlobIn {
-                mount: true,
-                ..BlobIn::new(&tail_blob)
-            });
-            w.add(
+            let tail = add_texture(
+                &mut w,
                 name,
-                Class::Texture as u16,
-                orr_pack::texture::SCHEMA,
-                orr_pack::Hash32([0; 32]),
-                &blobs,
-            )
-            .unwrap();
+                vk::R8G8B8A8_UNORM,
+                [width, height],
+                layers,
+                cube,
+                |mip, layer| tiled_texels(t, mip, layer),
+            );
+            assert_eq!(tail, 2, "{name} streams two mips");
         }
         // The textures stream because a material binds them.
         for (name, ..) in TILED {
@@ -2410,5 +2438,861 @@ fn tiles_apart_from_their_textures_others_move_beside_them_and_stay_exact() {
     stream_tiles(&mut scenes, m, &[0], budget);
     assert_tiled(&scenes, dev, m, 0, 0..9);
     assert_eq!(scenes.residency().failed, 0);
+    assert_clean();
+}
+
+/// The neural pack's set: color mip 0 size, the latents' mip 0 size and layers.
+const NEURAL_SIZE: [u32; 2] = [1024, 512];
+const LATENT_SIZE: [u32; 2] = [512, 256];
+const LATENT_LAYERS: u32 = 2;
+const NEURAL_SET: &str = "neural/set";
+const NEURAL_LATENTS: &str = "neural/set/latents";
+/// The textures the set stands in for: base color (sRGB, channels 0..3) and a normal map
+/// (channels 3..5).
+const NEURAL_BASE: &str = "neural/base";
+const NEURAL_NORMAL: &str = "neural/normal";
+
+fn mix(i: u32) -> u32 {
+    let mut x = i.wrapping_mul(0x9e37_79b9) ^ 0x85eb_ca6b;
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7feb_352d);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846c_a68b);
+    x ^ x >> 16
+}
+
+fn uniform(i: u32) -> f32 {
+    (mix(i) >> 8) as f32 / (1u32 << 24) as f32
+}
+
+/// Latent texels of `mip` of `layer`: A4R4G4B4, little-endian.
+fn latent_texels(mip: u32, layer: u32) -> Vec<u8> {
+    let [w, h] = orr_pack::texture::mip_size(LATENT_SIZE[0], LATENT_SIZE[1], mip);
+    (0..w * h)
+        .flat_map(|i| (mix(i ^ mip << 24 ^ layer << 28) as u16).to_le_bytes())
+        .collect()
+}
+
+fn latent_mips() -> u32 {
+    orr_pack::texture::full_mip_count(LATENT_SIZE[0], LATENT_SIZE[1])
+}
+
+fn neural_constants() -> orr_pack::neural::Constants {
+    use orr_pack::neural::{ColorMip, Constants};
+    let mips = orr_pack::texture::full_mip_count(NEURAL_SIZE[0], NEURAL_SIZE[1]);
+    let mut c: Constants = bytemuck::Zeroable::zeroed();
+    for m in 0..mips {
+        c.color_mips[m as usize] = ColorMip {
+            latent_mip: m.saturating_sub(1).min(latent_mips() - 2) as i32,
+            position_lod: m as f32 / 4.0,
+            position_scale: 0.125 / (1u32 << m.min(3)) as f32,
+            _pad: 0,
+        };
+    }
+    c.width = NEURAL_SIZE[0] as i32;
+    c.height = NEURAL_SIZE[1] as i32;
+    c.mips = mips as i32;
+    c.valid_channels = 0x1f;
+    c.color_spaces = 0b01_01_01;
+    c
+}
+
+/// Random weights: hidden matrices of E4M3 values within 0.25, small FP16 biases, and an
+/// output layer centered on 0.5.
+fn neural_net() -> orr_pack::neural::Fp8Network {
+    use orr_pack::neural::{Fp8Network, LAYERS, OUTPUTS, e4m3_to_f32};
+    let mut seed = 0x51u32;
+    let mut next = || {
+        seed += 1;
+        mix(seed)
+    };
+    let hidden = std::array::from_fn(|l| {
+        let (rows, cols) = LAYERS[l];
+        let m = (0..rows * cols)
+            .map(|_| {
+                loop {
+                    let b = next() as u8;
+                    let v = e4m3_to_f32(b);
+                    if v.abs() <= 0.25 {
+                        break b;
+                    }
+                }
+            })
+            .collect();
+        let b = (0..rows)
+            .map(|_| half::f16::from_f32((next() >> 8) as f32 / (1u32 << 24) as f32 - 0.5))
+            .collect();
+        (m, b)
+    });
+    let output = (0..OUTPUTS * LAYERS[3].1)
+        .map(|_| (next() % 255) as i32 - 127)
+        .map(|v| v as i8)
+        .collect();
+    let scale: Vec<f32> = (0..OUTPUTS)
+        .map(|r| 1.0 / (40_000.0 + 1000.0 * r as f32))
+        .collect();
+    let bias = scale.iter().map(|s| (0.5 / s) as i32).collect();
+    Fp8Network {
+        hidden,
+        output,
+        scale,
+        bias,
+    }
+}
+
+/// A memory pack of one neural set standing in for a base color and a normal map, their BC
+/// entries, the set's latents and a material binding both textures.
+fn neural_pack() -> &'static Arc<[u8]> {
+    use orr_pack::neural::{NeuralHeader, NeuralInfo, NeuralTexture, NeuralWeights};
+    use orr_pack::texture::vk;
+    static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
+    PACK.get_or_init(|| {
+        let mut w = ArchiveWriter::create(Target::Memory).unwrap();
+        let tail = add_texture(
+            &mut w,
+            NEURAL_LATENTS,
+            vk::A4R4G4B4_UNORM_PACK16,
+            LATENT_SIZE,
+            LATENT_LAYERS,
+            false,
+            latent_texels,
+        );
+        assert_eq!(tail, 2, "the latents stream two mips");
+        for (name, format, channels) in [
+            (NEURAL_BASE, vk::R8G8B8A8_SRGB, 4),
+            (NEURAL_NORMAL, vk::R8G8_UNORM, 2),
+        ] {
+            add_texture(&mut w, name, format, NEURAL_SIZE, 1, false, |mip, _| {
+                let [mw, mh] = orr_pack::texture::mip_size(NEURAL_SIZE[0], NEURAL_SIZE[1], mip);
+                (0..mw * mh * channels).map(|i| bc_texel(i, mip)).collect()
+            });
+        }
+        let constants = neural_constants();
+        let info = NeuralInfo {
+            header: NeuralHeader {
+                library: [0, 10, 0],
+                _pad: 0,
+                interface: 0,
+                file_schema: 0,
+                width: NEURAL_SIZE[0],
+                height: NEURAL_SIZE[1],
+                mip_count: constants.mips as u8,
+                channel_count: 5,
+                latent_features: (4 * LATENT_LAYERS) as u8,
+                _pad1: 0,
+                bits_per_pixel: 0.0,
+                latents: AssetId::from_name(NEURAL_LATENTS),
+                textures: Span::default(),
+                weights: Span::default(),
+            },
+            textures: vec![
+                NeuralTexture {
+                    texture: AssetId::from_name(NEURAL_BASE),
+                    first_channel: 0,
+                    channel_count: 3,
+                    stored: NeuralTexture::SRGB,
+                    _pad: 0,
+                    psnr: 40.0,
+                },
+                NeuralTexture {
+                    texture: AssetId::from_name(NEURAL_NORMAL),
+                    first_channel: 3,
+                    channel_count: 2,
+                    stored: NeuralTexture::NORMAL,
+                    _pad: 0,
+                    psnr: 40.0,
+                },
+            ],
+            weights: vec![(
+                NeuralWeights {
+                    kind: NeuralWeights::GENERIC_FP8,
+                    blob: 1,
+                    converted_bytes: 0,
+                    constants: Span::default(),
+                },
+                bytemuck::bytes_of(&constants).to_vec(),
+            )],
+        };
+        let head = info.to_bytes();
+        let weights = neural_net().to_bytes();
+        w.add(
+            NEURAL_SET,
+            Class::NeuralTextureSet as u16,
+            orr_pack::neural::SCHEMA,
+            orr_pack::Hash32([0; 32]),
+            &[
+                BlobIn {
+                    mount: true,
+                    ..BlobIn::new(&head)
+                },
+                BlobIn {
+                    mount: true,
+                    ..BlobIn::new(&weights)
+                },
+            ],
+        )
+        .unwrap();
+        let mut m = Material::default();
+        m.textures[slot::BASE_COLOR].texture = AssetId::from_name(NEURAL_BASE);
+        m.textures[slot::NORMAL].texture = AssetId::from_name(NEURAL_NORMAL);
+        w.add(
+            "neural/material",
+            Class::Material as u16,
+            orr_pack::material::SCHEMA,
+            orr_pack::Hash32([0; 32]),
+            &[BlobIn {
+                mount: true,
+                ..BlobIn::new(bytemuck::bytes_of(&m))
+            }],
+        )
+        .unwrap();
+        w.finish().unwrap().unwrap()
+    })
+}
+
+/// Byte `i` of mip `mip` of the neural pack's BC entries.
+fn bc_texel(i: u32, mip: u32) -> u8 {
+    mix(i.wrapping_add(mip << 26)) as u8
+}
+
+/// `x` rounded to the nearest E4M3 value, ties to even, as cooperative vectors convert;
+/// values past 448 saturate.
+fn to_e4m3(x: f32) -> f32 {
+    let a = x.abs().min(448.0);
+    if a == 0.0 {
+        return 0.0;
+    }
+    let e = a.log2().floor().max(-6.0);
+    let step = 2f32.powi(e as i32 - 3);
+    let q = a / step;
+    let f = q.floor();
+    let d = q - f;
+    let r = if d > 0.5 || (d == 0.5 && f % 2.0 == 1.0) {
+        f + 1.0
+    } else {
+        f
+    };
+    (r * step).min(448.0).copysign(x)
+}
+
+fn to_f16(x: f32) -> f32 {
+    half::f16::from_f32(x).to_f32()
+}
+
+/// The set's decoder on the CPU, as the kernels run it: FP16 vectors, the hidden layers'
+/// inputs converted to E4M3 with `fp8`, the output layer's scale folded into FP16 weights.
+struct NeuralCpu {
+    net: orr_pack::neural::Fp8Network,
+    constants: orr_pack::neural::Constants,
+    /// Per latent mip and layer, the texels.
+    latents: Vec<Vec<Vec<u16>>>,
+    fp8: bool,
+}
+
+impl NeuralCpu {
+    fn new(fp8: bool) -> Self {
+        let latents = (0..latent_mips())
+            .map(|mip| {
+                (0..LATENT_LAYERS)
+                    .map(|layer| {
+                        latent_texels(mip, layer)
+                            .chunks_exact(2)
+                            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        Self {
+            net: neural_net(),
+            constants: neural_constants(),
+            latents,
+            fp8,
+        }
+    }
+
+    /// Features 0..4 of `layer` of latent mip `mip` filtered bilinearly at `uv`, repeating.
+    fn latent(&self, mip: u32, layer: u32, uv: [f32; 2]) -> [f32; 4] {
+        let [w, h] = orr_pack::texture::mip_size(LATENT_SIZE[0], LATENT_SIZE[1], mip);
+        let texels = &self.latents[mip as usize][layer as usize];
+        let x = uv[0] * w as f32 - 0.5;
+        let y = uv[1] * h as f32 - 0.5;
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+        let at = |dx: i32, dy: i32| {
+            let tx = (x0 as i32 + dx).rem_euclid(w as i32) as u32;
+            let ty = (y0 as i32 + dy).rem_euclid(h as i32) as u32;
+            let t = texels[(ty * w + tx) as usize];
+            // Blue, green, red, alpha: the order the decoder reads features in.
+            [t & 15, t >> 4 & 15, t >> 8 & 15, t >> 12].map(|v| f32::from(v) / 15.0)
+        };
+        let (a, b, c, d) = (at(0, 0), at(1, 0), at(0, 1), at(1, 1));
+        std::array::from_fn(|k| {
+            let top = a[k] + (b[k] - a[k]) * fx;
+            let bottom = c[k] + (d[k] - c[k]) * fx;
+            top + (bottom - top) * fy
+        })
+    }
+
+    fn layer(&self, l: usize, x: &[f32]) -> Vec<f32> {
+        use orr_pack::neural::{LAYERS, e4m3_to_f32};
+        let (rows, cols) = LAYERS[l];
+        let x: Vec<f32> = x
+            .iter()
+            .map(|&v| if self.fp8 { to_e4m3(v) } else { v })
+            .collect();
+        let (m, b) = &self.net.hidden[l];
+        (0..rows)
+            .map(|r| {
+                let sum: f32 = (0..cols).map(|c| e4m3_to_f32(m[r * cols + c]) * x[c]).sum();
+                let y = to_f16(sum + b[r].to_f32());
+                let third = to_f16(1.0 / 3.0);
+                to_f16(y.min(3.0) * to_f16(to_f16(y * third) + 0.5).clamp(0.0, 1.0))
+            })
+            .collect()
+    }
+
+    /// The outputs at `texel` (repeating) of color mip `mip`, sRGB channels decoded.
+    fn decode(&self, texel: [i32; 2], mip: u32) -> [f32; 16] {
+        use orr_pack::neural::{LAYERS, OUTPUTS};
+        let [w, h] = orr_pack::texture::mip_size(NEURAL_SIZE[0], NEURAL_SIZE[1], mip);
+        let tx = texel[0].rem_euclid(w as i32);
+        let ty = texel[1].rem_euclid(h as i32);
+        let uv = [(tx as f32 + 0.5) / w as f32, (ty as f32 + 0.5) / h as f32];
+        let c = self.constants.color_mips[mip as usize];
+        let mut x = vec![0.0f32; orr_pack::neural::INPUTS];
+        for level in 0..2 {
+            for layer in 0..LATENT_LAYERS {
+                let f = self.latent(c.latent_mip as u32 + level, layer, uv);
+                for k in 0..4 {
+                    x[(16 * level + 4 * layer) as usize + k] = to_f16(f[k] * 2.0 - 1.0);
+                }
+            }
+        }
+        let mut p = [tx as f32 * c.position_scale, ty as f32 * c.position_scale];
+        for wave in 0..3 {
+            let e = [
+                p[0].fract(),
+                p[1].fract(),
+                (p[0] + 0.25).fract(),
+                (p[1] + 0.25).fract(),
+            ];
+            for k in 0..4 {
+                x[32 + 4 * wave + k] = to_f16(e[k] * 2.0 - 1.0);
+            }
+            p = [p[0] * 2.0, p[1] * 2.0];
+        }
+        x[44] = to_f16(c.position_lod);
+        x[45] = to_f16(c.position_lod);
+        let h0 = self.layer(0, &x);
+        let h1 = self.layer(1, &h0);
+        let h2 = self.layer(2, &h1);
+        let q: Vec<f32> = h2
+            .iter()
+            .map(|&v| (v * 80.0 - 113.0).round().clamp(-128.0, 127.0))
+            .collect();
+        let cols = LAYERS[3].1;
+        let n = &self.net;
+        std::array::from_fn(|r| {
+            if r >= OUTPUTS {
+                return 0.0;
+            }
+            let s = n.scale[r];
+            let sum: f32 = (0..cols)
+                .map(|c| to_f16(f32::from(n.output[r * cols + c]) * s) * q[c])
+                .sum();
+            let v = to_f16(sum + to_f16(n.bias[r] as f32 * s));
+            if r < 3 {
+                orr_color::srgb_decode(f64::from(v.clamp(0.0, 1.0))) as f32
+            } else {
+                v
+            }
+        })
+    }
+
+    /// Channels `first..first + count` as a texture reads them, at `texel` of `mip`.
+    fn texel(&self, texel: [i32; 2], mip: u32, first: usize, count: usize) -> [f32; 4] {
+        let o = self.decode(texel, mip);
+        std::array::from_fn(|k| {
+            if k < count {
+                o[first + k]
+            } else if k == 3 {
+                1.0
+            } else {
+                0.0
+            }
+        })
+    }
+
+    /// Bilinear over the texels of `mip` around `uv`.
+    fn bilinear(&self, uv: [f32; 2], mip: u32, first: usize, count: usize) -> [f32; 4] {
+        let [w, h] = orr_pack::texture::mip_size(NEURAL_SIZE[0], NEURAL_SIZE[1], mip);
+        let x = uv[0] * w as f32 - 0.5;
+        let y = uv[1] * h as f32 - 0.5;
+        let (x0, y0) = (x.floor(), y.floor());
+        let (fx, fy) = (x - x0, y - y0);
+        let at = |dx: i32, dy: i32| self.texel([x0 as i32 + dx, y0 as i32 + dy], mip, first, count);
+        let (a, b, c, d) = (at(0, 0), at(1, 0), at(0, 1), at(1, 1));
+        std::array::from_fn(|k| {
+            let top = a[k] + (b[k] - a[k]) * fx;
+            let bottom = c[k] + (d[k] - c[k]) * fx;
+            top + (bottom - top) * fy
+        })
+    }
+
+    /// The cubic B-spline filter of mip 0 at `uv`.
+    fn bicubic(&self, uv: [f32; 2], first: usize, count: usize) -> [f32; 4] {
+        let [w, h] = NEURAL_SIZE;
+        let x = uv[0] * w as f32 - 0.5;
+        let y = uv[1] * h as f32 - 0.5;
+        let (x0, y0) = (x.floor(), y.floor());
+        let weights = |t: f32| {
+            let g = 1.0 - t;
+            [
+                g * g * g / 6.0,
+                (4.0 - 6.0 * t * t + 3.0 * t * t * t) / 6.0,
+                (1.0 + 3.0 * t + 3.0 * t * t - 3.0 * t * t * t) / 6.0,
+                t * t * t / 6.0,
+            ]
+        };
+        let (wx, wy) = (weights(x - x0), weights(y - y0));
+        let mut out = [0.0f32; 4];
+        for (j, wy) in wy.iter().enumerate() {
+            for (i, wx) in wx.iter().enumerate() {
+                let v = self.texel(
+                    [x0 as i32 + i as i32 - 1, y0 as i32 + j as i32 - 1],
+                    0,
+                    first,
+                    count,
+                );
+                for k in 0..4 {
+                    out[k] += wx * wy * v[k];
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Runs the texture filter kernel once over `footprints` of `texture` with `taps` taps each.
+fn neural_taps(
+    scenes: &mut Scenes,
+    texture: TextureIndex,
+    footprints: &[scene_suite::shaders::texture_filter::Footprint],
+    taps: u32,
+) -> Vec<[f32; 4]> {
+    use orr_scene::orr_gpu::{AddressMode, Filter, MemoryKind, SamplerDesc};
+    use scene_suite::pipeline;
+    use scene_suite::shaders::texture_filter::{self, Footprint, Root};
+    let dev = device();
+    let mut input = dev
+        .gpu_malloc::<Footprint>(MemoryKind::Upload, footprints.len() as u64, "footprints")
+        .unwrap();
+    input.as_mut_slice().unwrap().copy_from_slice(footprints);
+    let out = dev
+        .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, footprints.len() as u64, "taps")
+        .unwrap();
+    let mut root = dev
+        .gpu_malloc::<Root>(MemoryKind::Upload, 1, "texture filter root")
+        .unwrap();
+    root.as_mut_slice().unwrap()[0] = Root {
+        footprints: input.gpu(),
+        out: out.gpu(),
+        texture,
+        sampler: dev
+            .sampler(&SamplerDesc {
+                mag: Filter::Nearest,
+                min: Filter::Nearest,
+                mip: Filter::Nearest,
+                address: [AddressMode::ClampToEdge; 3],
+                ..SamplerDesc::default()
+            })
+            .unwrap(),
+        count: footprints.len() as u32,
+        taps,
+        streams: scenes.texture_streams(),
+        pad: 0,
+    };
+    let p = pipeline(&texture_filter::MODULE, "mean");
+    let mut f = scenes
+        .begin_frame(&FrameDesc {
+            time: FrameTime::default(),
+            scenes: &[],
+            low_latency: None,
+        })
+        .unwrap();
+    let list = f.list().unwrap();
+    list.dispatch(&p, root.gpu(), [footprints.len().div_ceil(64) as u32, 1, 1]);
+    list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+    let point = f.end(&[]).unwrap();
+    dev.queue(QueueKind::Render)
+        .unwrap()
+        .wait(point, Duration::from_secs(10))
+        .unwrap();
+    out.as_slice().unwrap().to_vec()
+}
+
+/// Footprints one mip 0 texel wide at the centers of a spread of mip 0 texels, read with
+/// hardware filtering.
+fn texel_centers() -> Vec<scene_suite::shaders::texture_filter::Footprint> {
+    let [w, h] = NEURAL_SIZE;
+    (0..2048u32)
+        .map(|i| {
+            let (x, y) = (mix(2 * i) % w, mix(2 * i + 1) % h);
+            scene_suite::shaders::texture_filter::Footprint {
+                uv: [(x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32],
+                dx: [1.0 / w as f32, 0.0],
+                dy: [0.0, 1.0 / h as f32],
+                hardware: 1,
+                pad: 0,
+            }
+        })
+        .collect()
+}
+
+/// The largest and mean absolute difference over every channel.
+fn differences(got: &[[f32; 4]], want: &[[f32; 4]]) -> (f32, f32) {
+    let d: Vec<f32> = got
+        .iter()
+        .zip(want)
+        .flat_map(|(g, w)| (0..4).map(move |k| (g[k] - w[k]).abs()))
+        .collect();
+    let max = d.iter().copied().fold(0.0, f32::max);
+    (max, d.iter().sum::<f32>() / d.len() as f32)
+}
+
+/// Mounts the neural pack with `mode` and runs frames until it is ready.
+fn mount_neural(mode: NeuralTextures) -> (Scenes, Workers, MountId) {
+    let desc = RendererDesc {
+        neural_textures: mode,
+        ..RendererDesc::default()
+    };
+    let mut scenes = Scenes::new(device(), &desc).unwrap();
+    let workers = Workers::start(&scenes, 2);
+    let m = scenes.mount(PackSource::Memory(Arc::clone(neural_pack())));
+    ready(&mut scenes, m);
+    (scenes, workers, m)
+}
+
+/// Prefetches every latent tile through `textures` until none is loading.
+fn stream_latents(scenes: &mut Scenes, m: MountId, textures: &[TextureIndex]) {
+    let start = Instant::now();
+    for frames in 1.. {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "latent tiles pending"
+        );
+        for &t in textures {
+            scenes.prefetch_texture(m, t, 0);
+        }
+        frame(scenes);
+        let r = *scenes.residency();
+        if frames > 1 && r.loads == 0 && r.class(ResidencyClass::Textures).loading_bytes == 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn textures_a_neural_set_stands_in_for_decode_like_the_cpu_decoder_and_stream_only_the_latents() {
+    let _serial = serial();
+    let fp8 = device().caps().shader_float8;
+    for (mode, fp8) in [
+        (NeuralTextures::Fp16, false),
+        (NeuralTextures::Fastest, fp8),
+    ] {
+        let (mut scenes, _workers, m) = mount_neural(mode);
+        let base = scenes.texture(m, AssetId::from_name(NEURAL_BASE)).unwrap();
+        let normal = scenes
+            .texture(m, AssetId::from_name(NEURAL_NORMAL))
+            .unwrap();
+        let cpu = NeuralCpu::new(fp8);
+        let footprints = texel_centers();
+        let want = |mip: u32, first: usize, count: usize| -> Vec<[f32; 4]> {
+            footprints
+                .iter()
+                .map(|f| cpu.bilinear(f.uv, mip, first, count))
+                .collect()
+        };
+        // FP8 inputs differ from the CPU's where filtering rounds a value across an E4M3
+        // step, which moves single outputs; their mean stays small.
+        let (max_allowed, mean_allowed) = if fp8 { (0.15, 4e-3) } else { (0.02, 1e-3) };
+        let close = |got: &[[f32; 4]], want: &[[f32; 4]]| {
+            let (max, mean) = differences(got, want);
+            (max < max_allowed && mean < mean_allowed, max, mean)
+        };
+        // Before any latent tile streams, taps read the color mips over the latents' tail:
+        // latent mip 2 is first read by color mip 3.
+        let (ok, max, mean) = close(
+            &neural_taps(&mut scenes, base, &footprints, 1),
+            &want(3, 0, 3),
+        );
+        assert!(
+            ok,
+            "{mode:?}: base color over the tail differs by {max} at most, {mean} on average"
+        );
+        // The taps' feedback streams the latent tiles they want, and no tile of the BC
+        // entries, whose mip 0 alone is larger than every latent mip.
+        for (texture, first, count, what) in [(base, 0, 3, "base color"), (normal, 3, 2, "normal")]
+        {
+            let finest = want(0, first, count);
+            let start = Instant::now();
+            loop {
+                let (ok, max, mean) =
+                    close(&neural_taps(&mut scenes, texture, &footprints, 1), &finest);
+                if ok {
+                    break;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(30),
+                    "{mode:?}: {what} at mip 0 still differs by {max} at most, {mean} on average"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let resident = scenes
+            .residency()
+            .class(ResidencyClass::Textures)
+            .resident_bytes;
+        let bc_mip0 = u64::from(NEURAL_SIZE[0] * NEURAL_SIZE[1]) * 4;
+        assert!(
+            resident < bc_mip0 / 2,
+            "{mode:?}: {resident} bytes of textures resident, under the BC base color's mip 0"
+        );
+    }
+    assert_clean();
+}
+
+#[test]
+fn the_resolve_writes_the_color_a_neural_set_decodes() {
+    use orr_color::RgbPrimaries;
+    use orr_color::srgb_encode;
+    use orr_scene::{Lens, Projection, TextureFilter, ViewDesc};
+
+    const EXTENT: u32 = 128;
+    let _serial = serial();
+    let (mut scenes, _workers, m) = mount_neural(NeuralTextures::Fp16);
+    let mesh = MeshInput {
+        positions: vec![
+            Vec3::new(-1.0, -1.0, 0.0),
+            Vec3::new(1.0, -1.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(-1.0, 1.0, 0.0),
+        ],
+        normals: vec![Vec3::Z; 4],
+        uvs: Some(vec![
+            Vec2::new(0.0, 1.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(0.0, 0.0),
+        ]),
+        indices: vec![0, 1, 2, 0, 2, 3],
+        sections: vec![Span { first: 0, count: 6 }],
+        ..MeshInput::default()
+    };
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(
+            Target::Memory,
+            vec![AssetSpec {
+                name: "quad".into(),
+                source: Source::Mesh {
+                    mesh,
+                    materials: vec![Material::default()],
+                    settings: MeshSettings::default(),
+                },
+            }],
+        )],
+    };
+    let quad_pack = orr_cook::cook(&manifest, &Default::default())
+        .unwrap()
+        .memory
+        .remove(0);
+    let quad_mount = scenes.mount(PackSource::Memory(quad_pack));
+    ready(&mut scenes, quad_mount);
+    let model = scenes
+        .model(quad_mount, AssetId::from_name("quad"))
+        .unwrap();
+    let material = scenes
+        .material(m, AssetId::from_name("neural/material"))
+        .unwrap();
+    let scene = scenes.create_scene(&SceneDesc::default()).unwrap();
+    let history = scenes.create_view_history().unwrap();
+    let list = [scene];
+    let desc = FrameDesc {
+        time: FrameTime::default(),
+        scenes: &list,
+        low_latency: None,
+    };
+    {
+        let f = scenes.begin_frame(&desc).unwrap();
+        let mut s = f.scene(scene).unwrap();
+        s.material_sets(0, 1).unwrap()[0] = material;
+        let group = s
+            .create_transform_group(&TransformGroupDesc {
+                count: 1,
+                writer: GroupWriter::Cpu,
+                anchor: DVec3::ZERO,
+            })
+            .unwrap();
+        s.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY;
+        s.add_instances(&InstancesDesc {
+            model,
+            copies: 1,
+            transforms: group,
+            first: 0,
+            pose: None,
+            material_set: Some(0),
+            flags: InstanceFlags::RASTER,
+            rt_range: 0.0,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .unwrap();
+        drop(s);
+        orr_scene::testing::wait(f.end(&[]).unwrap());
+    }
+    // A pixel covers two mip 0 texels along u and one along v, so the view reads color mip 1.
+    let half_tan = 0.45f32.tan();
+    let eye = 2.0 * EXTENT as f32 / (NEURAL_SIZE[0] as f32 * half_tan);
+    let cpu = NeuralCpu::new(false);
+    let to_rec2020 = RgbPrimaries::REC709
+        .matrix_to(RgbPrimaries::REC2020)
+        .as_mat3();
+    let word = |c: [f32; 4]| {
+        let linear = to_rec2020 * (Vec3::new(c[0], c[1], c[2]) * Material::default().base_color[0]);
+        linear
+            .to_array()
+            .map(|v| srgb_encode(f64::from(v.clamp(0.0, 1.0))) as f32)
+    };
+    let want: Vec<[f32; 3]> = (0..EXTENT * EXTENT)
+        .map(|i| {
+            let at = |p: u32| (2.0 * (p as f32 + 0.5) / EXTENT as f32 - 1.0) * eye * half_tan;
+            let uv = [0.5 * (at(i % EXTENT) + 1.0), 0.5 * (at(i / EXTENT) + 1.0)];
+            word(cpu.bilinear(uv, 1, 0, 3))
+        })
+        .collect();
+    let start = Instant::now();
+    loop {
+        let mut f = scenes.begin_frame(&desc).unwrap();
+        f.scene(scene)
+            .unwrap()
+            .set_focus(DVec3::new(0.0, 0.0, f64::from(eye)), 1000.0);
+        let view = f
+            .raster_view(&ViewDesc {
+                scene,
+                history,
+                position: DVec3::new(0.0, 0.0, f64::from(eye)),
+                rotation: Quat::IDENTITY,
+                projection: Projection {
+                    fov_y: 0.9,
+                    near: 0.05,
+                },
+                lens: Lens::default(),
+                render_extent: glam::UVec2::splat(EXTENT),
+                jitter: Vec2::ZERO,
+                reset_history: true,
+                mip_bias: 0.0,
+                texture_filter: TextureFilter::Hardware,
+            })
+            .unwrap();
+        orr_scene::testing::wait(f.end(&[]).unwrap());
+        let bytes = read_texture_on(
+            device(),
+            &view.gbuf_a,
+            &TextureRegion::whole_mip(view.gbuf_a.desc(), 0),
+        );
+        let a: Vec<[u32; 4]> = bytemuck::pod_collect_to_vec(&bytes);
+        let got: Vec<[f32; 3]> = a
+            .iter()
+            .map(|w| [0, 8, 16].map(|s| ((w[0] >> s) & 255) as f32 / 255.0))
+            .collect();
+        let d: Vec<f32> = got
+            .iter()
+            .zip(&want)
+            .flat_map(|(g, w)| (0..3).map(move |k| (g[k] - w[k]).abs()))
+            .collect();
+        let max = d.iter().copied().fold(0.0, f32::max);
+        let mean = d.iter().sum::<f32>() / d.len() as f32;
+        if max < 0.03 && mean < 4e-3 {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the resolve's base color differs from the decoded texels by {max} at most, {mean} on average"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_clean();
+}
+
+#[test]
+fn stochastic_taps_of_a_neural_texture_average_to_its_filters() {
+    use scene_suite::shaders::texture_filter::Footprint;
+    let _serial = serial();
+    let (mut scenes, _workers, m) = mount_neural(NeuralTextures::Fp16);
+    let base = scenes.texture(m, AssetId::from_name(NEURAL_BASE)).unwrap();
+    stream_latents(&mut scenes, m, &[base]);
+    let cpu = NeuralCpu::new(false);
+    let [w, h] = NEURAL_SIZE.map(|v| v as f32);
+    let at = |i: u32, texels: f32| Footprint {
+        uv: [uniform(3 * i), uniform(3 * i + 1)],
+        dx: [texels / w, 0.0],
+        dy: [0.0, texels / h],
+        hardware: 0,
+        pad: 0,
+    };
+    // A quarter texel: the bicubic B-spline of mip 0. Two texels: bilinear mip 1. Three:
+    // trilinear between mips 1 and 2 by log2(3).
+    type Filter<'a> = &'a dyn Fn([f32; 2]) -> [f32; 4];
+    let cases: [(f32, Filter<'_>); 3] = [
+        (0.25, &|uv| cpu.bicubic(uv, 0, 3)),
+        (2.0, &|uv| cpu.bilinear(uv, 1, 0, 3)),
+        (3.0, &|uv| {
+            let t = 3f32.log2() - 1.0;
+            let (a, b) = (cpu.bilinear(uv, 1, 0, 3), cpu.bilinear(uv, 2, 0, 3));
+            std::array::from_fn(|k| a[k] + (b[k] - a[k]) * t)
+        }),
+    ];
+    for (texels, filter) in cases {
+        let footprints: Vec<Footprint> = (0..64).map(|i| at(i, texels)).collect();
+        let got = neural_taps(&mut scenes, base, &footprints, 4096);
+        let want: Vec<[f32; 4]> = footprints.iter().map(|f| filter(f.uv)).collect();
+        let (max, mean) = differences(&got, &want);
+        assert!(
+            max < 0.02 && mean < 4e-3,
+            "a footprint {texels} texels wide averages {max} from its filter at most, {mean} on average"
+        );
+    }
+    assert_clean();
+}
+
+#[test]
+fn with_neural_textures_off_textures_sample_their_bc_entries() {
+    let _serial = serial();
+    let (mut scenes, _workers, m) = mount_neural(NeuralTextures::Off);
+    assert!(
+        scenes
+            .texture(m, AssetId::from_name(NEURAL_LATENTS))
+            .is_err(),
+        "the latents of a set the mount does not decode stay out of it"
+    );
+    let normal = scenes
+        .texture(m, AssetId::from_name(NEURAL_NORMAL))
+        .unwrap();
+    stream_latents(&mut scenes, m, &[normal]);
+    let footprints = texel_centers();
+    let got = neural_taps(&mut scenes, normal, &footprints, 1);
+    let [w, _] = NEURAL_SIZE;
+    for (f, g) in footprints.iter().zip(&got) {
+        let x = (f.uv[0] * NEURAL_SIZE[0] as f32) as u32;
+        let y = (f.uv[1] * NEURAL_SIZE[1] as f32) as u32;
+        let i = 2 * (y * w + x);
+        let want = [bc_texel(i, 0), bc_texel(i + 1, 0)].map(|b| f32::from(b) / 255.0);
+        assert!(
+            (g[0] - want[0]).abs() < 1e-3 && (g[1] - want[1]).abs() < 1e-3,
+            "the normal map reads its BC texels: {g:?} against {want:?}"
+        );
+    }
     assert_clean();
 }

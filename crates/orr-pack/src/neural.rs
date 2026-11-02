@@ -170,7 +170,153 @@ impl NeuralInfo {
     }
 }
 
+/// The LibNTC major and minor version whose network the constants below describe; sets of
+/// other versions hold another network.
+pub const LIBRARY: [u16; 2] = [0, 10];
+
+/// The decoder network's layers as (outputs, inputs): three hidden layers with the clamped
+/// HGELU activation, then the output layer. Smaller networks in a set are padded with zero
+/// weights to these sizes.
+pub const LAYERS: [(usize, usize); 4] = [(64, 48), (48, 64), (32, 48), (16, 32)];
+
+/// The network's inputs: the features of two latent mips, [`FEATURES`] each (zero past the
+/// set's `latent_features`), then [`POSITION_WAVES`] four-value position encodings, then the
+/// color mip's position level twice, then zeros.
+pub const INPUTS: usize = 48;
+pub const FEATURES: usize = 16;
+pub const POSITION_WAVES: usize = 3;
+/// Output channels of the network.
+pub const OUTPUTS: usize = 16;
+
+/// The clamped HGELU activation `min(x, ACTIVATION_MAX) * saturate(x / 3 + 0.5)`. The last
+/// hidden layer's outputs are then quantized for the output layer's 8-bit weights:
+/// `round(QUANT_STEP * y + QUANT_BIAS)`, which spans -128 to 127.
+pub const ACTIVATION_MAX: f32 = 3.0;
+pub const QUANT_STEP: f32 = 80.0;
+pub const QUANT_BIAS: f32 = -113.0;
+
+/// Color mips per set, at most.
+pub const MAX_MIPS: usize = 16;
+
+/// Where color mip `m`'s texels read the latents: latent mips `latent_mip` and
+/// `latent_mip + 1`, and the position encoding of `texel * position_scale` with level
+/// `position_lod`. A negative `latent_mip` marks a mip the set does not hold.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
+pub struct ColorMip {
+    pub latent_mip: i32,
+    pub position_lod: f32,
+    pub position_scale: f32,
+    pub _pad: i32,
+}
+
+/// LibNTC's `NtcTextureSetConstants` ([`CONSTANTS_BYTES`]).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
+pub struct Constants {
+    pub color_mips: [ColorMip; MAX_MIPS],
+    /// Byte offsets of each layer's weights, biases and scales in the row's weight blob, in
+    /// the layout of the row's weight type.
+    pub weight_offsets: [i32; 4],
+    pub bias_offsets: [i32; 4],
+    pub scale_offsets: [i32; 4],
+    pub width: i32,
+    pub height: i32,
+    pub mips: i32,
+    pub _pad0: i32,
+    /// Bit per output channel holding texture data.
+    pub valid_channels: u32,
+    /// Two bits per output channel: 0 linear, 1 sRGB, 2 hybrid log-gamma.
+    pub color_spaces: u32,
+    pub _pad1: [i32; 2],
+}
+
+impl Constants {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        read(bytes, 0).ok_or(Error::Malformed("neural set constants"))
+    }
+}
+
+/// The 8-bit float with 4 exponent and 3 mantissa bits (E4M3, no infinities; `0x7f` and
+/// `0xff` are NaN) that FP8 weights are stored as.
+pub fn e4m3_to_f32(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+    let e = i32::from(b >> 3 & 15);
+    let m = f32::from(b & 7);
+    if e == 15 && b & 7 == 7 {
+        return f32::NAN;
+    }
+    if e == 0 {
+        return sign * m / 8.0 * 2f32.powi(-6);
+    }
+    sign * (1.0 + m / 8.0) * 2f32.powi(e - 7)
+}
+
+/// The weights of a [`NeuralWeights::GENERIC_FP8`] or [`NeuralWeights::COOP_VEC_FP8`] row:
+/// row-major E4M3 matrices with FP16 biases for the hidden layers, then a row-major Int8
+/// matrix whose rows scale by FP32 `scale` after adding Int32 `bias` for the output layer.
+/// The blob holds the four matrices, then the hidden biases, then the scales, then the
+/// output biases.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Fp8Network {
+    pub hidden: [(Vec<u8>, Vec<half::f16>); 3],
+    pub output: Vec<i8>,
+    pub scale: Vec<f32>,
+    pub bias: Vec<i32>,
+}
+
+impl Fp8Network {
+    /// Blob bytes.
+    pub const BYTES: usize = {
+        let mut n = 0;
+        let mut i = 0;
+        while i < 4 {
+            n += LAYERS[i].0 * LAYERS[i].1;
+            i += 1;
+        }
+        n + 2 * (LAYERS[0].0 + LAYERS[1].0 + LAYERS[2].0) + 8 * OUTPUTS
+    };
+
+    pub fn parse(blob: &[u8]) -> Result<Self> {
+        if blob.len() != Self::BYTES {
+            return Err(Error::Malformed("neural set weights"));
+        }
+        let mut at = 0;
+        let mut take = |n: usize| {
+            let b = &blob[at..at + n];
+            at += n;
+            b
+        };
+        let matrices: [&[u8]; 4] = std::array::from_fn(|l| take(LAYERS[l].0 * LAYERS[l].1));
+        let hidden = std::array::from_fn(|l| {
+            let biases = bytemuck::pod_collect_to_vec(take(2 * LAYERS[l].0));
+            (matrices[l].to_vec(), biases)
+        });
+        Ok(Self {
+            hidden,
+            output: bytemuck::cast_slice(matrices[3]).to_vec(),
+            scale: bytemuck::pod_collect_to_vec(take(4 * OUTPUTS)),
+            bias: bytemuck::pod_collect_to_vec(take(4 * OUTPUTS)),
+        })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::BYTES);
+        for (m, _) in &self.hidden {
+            out.extend_from_slice(m);
+        }
+        out.extend_from_slice(bytemuck::cast_slice(&self.output));
+        for (_, b) in &self.hidden {
+            out.extend_from_slice(bytemuck::cast_slice(b));
+        }
+        out.extend_from_slice(bytemuck::cast_slice(&self.scale));
+        out.extend_from_slice(bytemuck::cast_slice(&self.bias));
+        out
+    }
+}
+
 const _: () = {
+    assert!(size_of::<Constants>() == CONSTANTS_BYTES);
     assert!(size_of::<NeuralHeader>() == 64);
     assert!(size_of::<NeuralTexture>() == 24);
     assert!(size_of::<NeuralWeights>() == 24);
@@ -221,5 +367,33 @@ mod tests {
         assert_eq!(back.textures, info.textures);
         assert_eq!(back.weights[0].1, info.weights[0].1);
         assert_eq!(back.weights[0].0.blob, 1);
+    }
+
+    #[test]
+    fn e4m3_decodes_normals_subnormals_and_nan() {
+        assert_eq!(e4m3_to_f32(0x38), 1.0);
+        assert_eq!(e4m3_to_f32(0xc0), -2.0);
+        assert_eq!(e4m3_to_f32(0x7e), 448.0);
+        assert_eq!(e4m3_to_f32(0x01), 2f32.powi(-9));
+        assert!(e4m3_to_f32(0x7f).is_nan());
+    }
+
+    #[test]
+    fn fp8_weights_round_trip() {
+        let n = Fp8Network {
+            hidden: std::array::from_fn(|l| {
+                let (rows, cols) = LAYERS[l];
+                (
+                    (0..rows * cols).map(|i| (i * 7 + l) as u8).collect(),
+                    (0..rows).map(|i| half::f16::from_f32(i as f32)).collect(),
+                )
+            }),
+            output: (0..OUTPUTS * LAYERS[3].1).map(|i| i as i8).collect(),
+            scale: (0..OUTPUTS).map(|i| i as f32 * 0.5).collect(),
+            bias: (0..OUTPUTS as i32).map(|i| -i).collect(),
+        };
+        let bytes = n.to_bytes();
+        assert_eq!(bytes.len(), Fp8Network::BYTES);
+        assert_eq!(Fp8Network::parse(&bytes).unwrap(), n);
     }
 }
