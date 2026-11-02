@@ -92,8 +92,17 @@ pub(crate) fn block_range(b: &Blocks, spread: f32) -> Result<[(f32, f32); 4], St
         vk::BC6H_UFLOAT | vk::BC6H_SFLOAT => 3,
         _ => 4,
     };
+    let bc7 = matches!(b.vk_format, vk::BC7_UNORM | vk::BC7_SRGB);
     let mut range = [(f32::MAX, f32::MIN); 4];
     for (i, block) in data.chunks_exact(f.bytes as usize).enumerate() {
+        if range[..stored].iter().all(|r| r.1 - r.0 > spread) {
+            break;
+        }
+        // Once color varies, only alpha is left to find, and opaque BC7 blocks give 1.
+        if bc7 && bc7_opaque(block) && range[..3].iter().all(|r| r.1 - r.0 > spread) {
+            range[3] = (range[3].0.min(1.0), range[3].1.max(1.0));
+            continue;
+        }
         let texels = decode_block(b.vk_format, block)?;
         let (bx, by) = (i % bw * 4, i / bw * 4);
         for (k, t) in texels.iter().enumerate() {
@@ -103,11 +112,16 @@ pub(crate) fn block_range(b: &Blocks, spread: f32) -> Result<[(f32, f32); 4], St
                 }
             }
         }
-        if range[..stored].iter().all(|r| r.1 - r.0 > spread) {
-            break;
-        }
     }
     Ok(range)
+}
+
+/// Whether every texel of a BC7 block decodes with alpha 255: modes 0 to 3 store no
+/// alpha, and a mode 6 block whose alpha endpoints and p-bits are all ones holds 255 at
+/// both ends.
+fn bc7_opaque(block: &[u8]) -> bool {
+    let bits = u64::from_le_bytes(block[..8].try_into().expect("16-byte block"));
+    block[0] & 0x0f != 0 || (block[0] & 0x7f == 0x40 && bits >> 49 == 0x7fff && block[8] & 1 == 1)
 }
 
 fn container(image: ctt::Image) -> Result<Source, String> {
@@ -325,4 +339,40 @@ fn decode_block(vk_format: u32, block: &[u8]) -> Result<[[f32; 4]; 16], String> 
         }
         _ => return Err(format!("format {vk_format} does not decode on the CPU")),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opaque_bc7_blocks_decode_with_alpha_255() {
+        let mut seed = 3u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u8
+        };
+        let mut opaque = 0;
+        for k in 0..200_000 {
+            let mut block: [u8; 16] = std::array::from_fn(|_| next());
+            // Every mode, and mode 6 blocks with their alpha bits mostly set.
+            let mode = k % 8;
+            block[0] = (block[0] & !(((2u16 << mode) - 1) as u8)) | (1 << mode);
+            if mode == 6 && k % 3 != 0 {
+                block[6] |= 0xfe;
+                block[7] = 0xff;
+                block[8] |= u8::from(k % 5 != 0);
+            }
+            let mut out = [0u8; 64];
+            bcdec_rs::bc7(&block, &mut out, 16);
+            let decoded = out.chunks_exact(4).all(|t| t[3] == 255);
+            if bc7_opaque(&block) {
+                opaque += 1;
+                assert!(decoded, "{block:02x?}");
+            }
+        }
+        assert!(opaque > 80_000);
+    }
 }
