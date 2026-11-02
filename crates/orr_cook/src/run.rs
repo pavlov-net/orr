@@ -121,9 +121,9 @@ enum Work<'m> {
         schema: u16,
         blobs: Vec<(Vec<u8>, bool)>,
     },
-    /// The mesh, its settings and its sections' cooked maps, read from the texture units
-    /// it waits for when it starts.
-    Mesh(MeshSource, MeshSettings, Vec<SectionMaps>),
+    /// The mesh, its settings and the archives holding the cooked texture units its
+    /// sections read, by unit name, filled when it starts.
+    Mesh(MeshSource, MeshSettings, HashMap<String, Arc<Archive>>),
     Texture(TextureJob, Arc<Vec<ImageFile>>),
     Neural(NeuralJob, Arc<Vec<ImageFile>>),
     TextureFile(PathBuf, Hash32, TextureSettings),
@@ -145,7 +145,7 @@ enum State {
     Waiting,
     Running,
     Done(Done),
-    /// Where its entries are, kept while a mesh that reads them has not started.
+    /// Where its entries are, kept while a mesh that reads them has not finished.
     Written(Option<From>),
 }
 
@@ -172,7 +172,7 @@ enum From {
 
 /// The archive a file target replaces, with its entries by cook key.
 struct Old {
-    archive: Archive,
+    archive: Arc<Archive>,
     by_key: HashMap<Hash32, Vec<usize>>,
 }
 
@@ -297,8 +297,10 @@ struct Run<'m, 's> {
     local: Vec<usize>,
     pending: Vec<usize>,
     dependents: Vec<Vec<usize>>,
-    /// Per unit: mesh units that read its texture and have not started.
+    /// Per unit: mesh units that read its texture and have not finished.
     map_users: Vec<usize>,
+    /// Per running mesh unit: the texture units it reads, one per read.
+    map_reads: HashMap<usize, Vec<usize>>,
     window: u64,
 }
 
@@ -331,6 +333,7 @@ impl<'m, 's> Run<'m, 's> {
             pending: Vec::new(),
             dependents: Vec::new(),
             map_users: Vec::new(),
+            map_reads: HashMap::new(),
             window: 0,
         };
         for (a, spec) in manifest.archives.iter().enumerate() {
@@ -364,7 +367,10 @@ impl<'m, 's> Run<'m, 's> {
                         for (i, e) in archive.entries().iter().enumerate() {
                             by_key.entry(e.cook_key).or_default().push(i);
                         }
-                        Old { archive, by_key }
+                        Old {
+                            archive: Arc::new(archive),
+                            by_key,
+                        }
                     })
                 }
                 _ => None,
@@ -1125,6 +1131,9 @@ impl<'m, 's> Run<'m, 's> {
             };
             running -= 1;
             bytes -= self.units[u].working_set;
+            if let Some(reads) = self.map_reads.remove(&u) {
+                self.release_maps(reads);
+            }
             let (from, seconds, detail) = r.unwrap_or_else(|p| resume_unwind(p))?;
             self.details.insert(u, detail);
             self.done(u, from, None, Outcome::Cooked, seconds)?;
@@ -1143,68 +1152,45 @@ impl<'m, 's> Run<'m, 's> {
         }
     }
 
-    /// The cooked maps a mesh unit's sections read, from the texture units it waited for.
-    fn section_maps(&mut self, u: usize, sections: &[SectionData]) -> Result<Vec<SectionMaps>> {
+    /// The archives holding the cooked texture units a mesh unit's sections read.
+    fn map_archives(
+        &mut self,
+        u: usize,
+        sections: &[SectionData],
+    ) -> Result<HashMap<String, Arc<Archive>>> {
         let a = self.units[u].archive;
-        let mut users = Vec::new();
-        let mut read = |unit: &str, all: bool, wrap, uv, channels| -> Result<Vec<Raster>> {
+        let units = || sections.iter().flat_map(|s| s.maps.units());
+        let reads = units().map(|t| self.by_name[&(a, t.to_owned())]).collect();
+        self.map_reads.insert(u, reads);
+        let mut archives = HashMap::new();
+        for unit in units() {
+            if archives.contains_key(unit) {
+                continue;
+            }
             let t = self.by_name[&(a, unit.to_owned())];
-            users.push(t);
             let from = match &self.units[t].state {
                 State::Done(d) => &d.from,
                 State::Written(Some(f)) => f,
                 _ => unreachable!("a mesh starts after the textures it reads"),
             };
-            self.with_archive(a, from, |arc| {
-                texture_mips(arc, AssetId::from_name(unit), all, wrap, uv, channels)
-            })?
-        };
-        let mut out = Vec::with_capacity(sections.len());
-        for s in sections {
-            let opacity = match &s.maps.opacity {
-                OpacitySpec::None => None,
-                OpacitySpec::Constant(pass) => Some(Opacity::Constant(*pass)),
-                OpacitySpec::Unknown => Some(Opacity::Unknown),
-                OpacitySpec::Texture {
-                    unit,
-                    cutoff,
-                    wrap,
-                    uv,
-                    uv_set,
-                    ..
-                } => Some(Opacity::Texture {
-                    mip0: read(unit, false, *wrap, *uv, 1)?.remove(0),
-                    cutoff: *cutoff,
-                    uv_set: *uv_set,
-                }),
+            let archive = match from {
+                From::Memory(arc) => Arc::clone(arc),
+                From::Old => Arc::clone(
+                    &self.old[a]
+                        .as_ref()
+                        .expect("linked from the old archive")
+                        .archive,
+                ),
+                From::Cache(path) | From::Scratch(path) => Arc::new(Archive::open(path)?),
             };
-            let displacement = match &s.maps.displacement {
-                None => None,
-                Some(d) => Some(Displacement {
-                    scale: d.scale,
-                    offset: d.offset,
-                    min: d.min,
-                    max: d.max,
-                    mips: match &d.texture {
-                        Some(t) => read(&t.unit, true, t.wrap, t.uv, 1)?,
-                        None => Vec::new(),
-                    },
-                    uv_set: d.texture.as_ref().map_or(0, |t| t.uv_set),
-                }),
-            };
-            let normal = match &s.maps.normal {
-                NormalSpec::Texture { unit, wrap, uv, .. } => {
-                    read(unit, false, *wrap, *uv, 2)?.try_into().ok()
-                }
-                _ => None,
-            };
-            out.push(SectionMaps {
-                opacity,
-                displacement,
-                normal,
-            });
+            archives.insert(unit.to_owned(), archive);
         }
-        for t in users {
+        Ok(archives)
+    }
+
+    /// Lets go of the texture units a finished mesh unit read.
+    fn release_maps(&mut self, reads: Vec<usize>) {
+        for t in reads {
             self.map_users[t] -= 1;
             if self.map_users[t] == 0
                 && matches!(self.units[t].state, State::Written(_))
@@ -1214,7 +1200,6 @@ impl<'m, 's> Run<'m, 's> {
                 self.release(&from);
             }
         }
-        Ok(out)
     }
 
     fn spawn(&mut self, scope: &rayon::Scope<'m>, tx: &mpsc::Sender<Msg>, u: usize)
@@ -1233,7 +1218,7 @@ impl<'m, 's> Run<'m, 's> {
             }
         }
         if let Work::Mesh(data, _, maps) = &mut work {
-            match self.section_maps(u, data.sections()) {
+            match self.map_archives(u, data.sections()) {
                 Ok(m) => *maps = m,
                 Err(e) => {
                     let _ = tx.send(Msg::Unit(u, Ok(Err(e))));
@@ -2062,7 +2047,7 @@ fn geometry_units(
             key,
             working_set: triangles * MESH_BYTES_PER_TRIANGLE,
             triangles,
-            work: Work::Mesh(m.mesh, m.settings, Vec::new()),
+            work: Work::Mesh(m.mesh, m.settings, HashMap::new()),
             deps: m.deps,
         });
     }
@@ -2137,6 +2122,69 @@ fn subd_units(
         (AssetId::NONE, None),
     ));
     Ok(units)
+}
+
+/// The cooked maps a mesh's sections read, from the archives holding their texture units.
+fn section_maps(
+    sections: &[SectionData],
+    archives: &HashMap<String, Arc<Archive>>,
+) -> Result<Vec<SectionMaps>> {
+    let read = |unit: &str, all: bool, wrap, uv, channels| {
+        texture_mips(
+            &archives[unit],
+            AssetId::from_name(unit),
+            all,
+            wrap,
+            uv,
+            channels,
+        )
+    };
+    let mut out = Vec::with_capacity(sections.len());
+    for s in sections {
+        let opacity = match &s.maps.opacity {
+            OpacitySpec::None => None,
+            OpacitySpec::Constant(pass) => Some(Opacity::Constant(*pass)),
+            OpacitySpec::Unknown => Some(Opacity::Unknown),
+            OpacitySpec::Texture {
+                unit,
+                cutoff,
+                wrap,
+                uv,
+                uv_set,
+                ..
+            } => Some(Opacity::Texture {
+                mip0: read(unit, false, *wrap, *uv, 1)?.remove(0),
+                cutoff: *cutoff,
+                uv_set: *uv_set,
+            }),
+        };
+        let displacement = match &s.maps.displacement {
+            None => None,
+            Some(d) => Some(Displacement {
+                scale: d.scale,
+                offset: d.offset,
+                min: d.min,
+                max: d.max,
+                mips: match &d.texture {
+                    Some(t) => read(&t.unit, true, t.wrap, t.uv, 1)?,
+                    None => Vec::new(),
+                },
+                uv_set: d.texture.as_ref().map_or(0, |t| t.uv_set),
+            }),
+        };
+        let normal = match &s.maps.normal {
+            NormalSpec::Texture { unit, wrap, uv, .. } => {
+                read(unit, false, *wrap, *uv, 2)?.try_into().ok()
+            }
+            _ => None,
+        };
+        out.push(SectionMaps {
+            opacity,
+            displacement,
+            normal,
+        });
+    }
+    Ok(out)
 }
 
 /// Mip 0, or every mip with `all`, of a cooked texture: per mip, its first `channels`
@@ -2235,7 +2283,9 @@ fn cook_unit(
                 .collect();
             w.add(name, class, schema, key, &blobs)?;
         }
-        Work::Mesh(source, settings, maps) => {
+        Work::Mesh(source, settings, archives) => {
+            let maps = section_maps(source.sections(), &archives)?;
+            drop(archives);
             let data = source.load(name, &shared.memo)?;
             let cooked = mesh::cook(name, &data, &settings, &maps)?;
             drop((data, maps));
