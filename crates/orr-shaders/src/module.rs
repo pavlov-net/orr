@@ -174,9 +174,8 @@ macro_rules! aligned_spirv {
         #[repr(C, align(4))]
         struct Aligned<B: ?Sized>(B);
         static ALIGNED: &Aligned<[u8]> = &Aligned(*include_bytes!($path));
-        const _: () = assert!(cfg!(target_endian = "little"));
         // SAFETY: the bytes are 4-aligned, their length is checked to be whole words, and
-        // SPIR-V files are little-endian words.
+        // the crate only builds for little-endian targets, the byte order of orr's SPIR-V.
         unsafe {
             assert!(ALIGNED.0.len() % 4 == 0);
             ::core::slice::from_raw_parts(ALIGNED.0.as_ptr().cast::<u32>(), ALIGNED.0.len() / 4)

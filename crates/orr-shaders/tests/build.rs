@@ -700,7 +700,7 @@ const OP_EXT_INST: u32 = 12;
 
 /// The SPIR-V literal string in `words`, up to its nul.
 fn literal(words: &[u32]) -> String {
-    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let bytes: &[u8] = bytemuck::cast_slice(words);
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }

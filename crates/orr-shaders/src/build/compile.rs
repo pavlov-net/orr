@@ -1156,14 +1156,13 @@ fn compile_one(
     let debug_info = match &compiled.debug {
         Some(debug) => {
             let path = job.spv.with_extension("dbg.spv");
-            write(&path, &words_to_bytes(debug))?;
+            write(&path, bytemuck::cast_slice(debug))?;
             Some(path)
         }
         None => None,
     };
-    let words = compiled.words;
-    let bytes = words_to_bytes(&words);
-    write(&job.spv, &bytes)?;
+    let bytes: &[u8] = bytemuck::cast_slice(&compiled.words);
+    write(&job.spv, bytes)?;
     let metal = match settings.metal {
         Some(metal_options) => {
             let session = global.session(metal_options).map_err(slang_err)?;
@@ -1181,7 +1180,7 @@ fn compile_one(
         inputs: compiled.inputs,
         spv: job.spv.clone(),
         debug_info,
-        hash: hash64(&bytes),
+        hash: hash64(bytes),
         links: job
             .links
             .iter()
@@ -1387,10 +1386,6 @@ pub(super) fn interface_hash(model: &Model) -> u64 {
 pub(super) fn hash64(bytes: &[u8]) -> u64 {
     let h = blake3::hash(bytes);
     u64::from_le_bytes(h.as_bytes()[..8].try_into().expect("8 bytes"))
-}
-
-pub(super) fn words_to_bytes(words: &[u32]) -> Vec<u8> {
-    words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
 /// `dir`, else `OUT_DIR`.

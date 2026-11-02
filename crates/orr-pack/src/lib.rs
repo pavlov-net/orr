@@ -22,6 +22,9 @@ pub mod texture;
 pub mod volume;
 mod writer;
 
+// The formats are little-endian, and code using them casts plain data without swapping.
+const _: () = assert!(cfg!(target_endian = "little"));
+
 use std::fmt;
 use std::path::PathBuf;
 

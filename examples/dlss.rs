@@ -525,16 +525,9 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
             .wait(point, Duration::from_secs(10))
             .expect("wait");
     }
-    let capture = readback.filter(|_| last.is_some()).map(|out| Capture {
-        width: SR_HEADLESS_EXTENT[0],
-        height: SR_HEADLESS_EXTENT[1],
-        rgba8: out
-            .as_slice()
-            .expect("readback")
-            .iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect(),
-    });
+    let capture = readback
+        .filter(|_| last.is_some())
+        .map(|out| Capture::from_readback(SR_HEADLESS_EXTENT, &out));
     drop(sr);
     drop(showcase);
     drop(display);

@@ -107,19 +107,14 @@ fn instructions(words: &[u32]) -> impl Iterator<Item = (usize, Inst<'_>)> {
 
 /// A nul-terminated literal string, and the words after it.
 fn string(words: &[u32]) -> (String, &[u32]) {
-    let mut bytes = Vec::new();
-    for (i, w) in words.iter().enumerate() {
-        for b in w.to_le_bytes() {
-            if b == 0 {
-                return (
-                    String::from_utf8_lossy(&bytes).into_owned(),
-                    &words[i + 1..],
-                );
-            }
-            bytes.push(b);
-        }
+    let bytes: &[u8] = bytemuck::cast_slice(words);
+    match bytes.iter().position(|&b| b == 0) {
+        Some(len) => (
+            String::from_utf8_lossy(&bytes[..len]).into_owned(),
+            &words[len / 4 + 1..],
+        ),
+        None => (String::from_utf8_lossy(bytes).into_owned(), &[]),
     }
-    (String::from_utf8_lossy(&bytes).into_owned(), &[])
 }
 
 /// A 64-bit atomic instruction.
