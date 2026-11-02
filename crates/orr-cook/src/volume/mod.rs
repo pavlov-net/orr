@@ -18,7 +18,7 @@ use orr_pack::{Aabb, ArchiveWriter, BlobIn, Class, Hash32, Span};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::key::{Key, ZSTD_LEVEL};
+use crate::key::Key;
 use crate::state::{Memo, read_checked};
 use crate::{Error, Result, mount};
 
@@ -514,6 +514,7 @@ pub(crate) fn cook(
     let head = info.to_bytes();
     let majorant_bytes: &[u8] = bytemuck::cast_slice(&majorants);
     let gdeflate = w.gdeflate();
+    let level = w.zstd_level();
     let mut report = VolumeReport {
         voxel_size: src.voxel_size,
         bricks,
@@ -545,7 +546,7 @@ pub(crate) fn cook(
                 let pages: Vec<&[u8]> = bytes.chunks(page_bytes).collect();
                 let encoded = pages
                     .par_iter()
-                    .map(|p| BlobIn::new(p).encode(ZSTD_LEVEL, gdeflate.as_deref()))
+                    .map(|p| BlobIn::new(p).encode(level, gdeflate.as_deref()))
                     .collect::<orr_pack::Result<Vec<_>>>()?;
                 for (p, enc) in pages.iter().zip(&encoded) {
                     r.raw += p.len() as u64;

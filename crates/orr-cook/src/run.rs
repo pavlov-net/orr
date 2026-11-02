@@ -31,7 +31,7 @@ use crate::assembly::{self, Assembly};
 use crate::cache::Cache;
 use crate::import::{Placed, Scene};
 use crate::instances::{self, Catalog, ModelFacts};
-use crate::key::{self, Key, ZSTD_LEVEL};
+use crate::key::{self, Key};
 use crate::mesh::maps::{Displacement, Opacity, Raster};
 use crate::mesh::{
     self, DisplacementSpec, DisplacementTexture, MapSpec, MeshData, MeshInput, MeshSource,
@@ -72,6 +72,7 @@ pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
     let shared = Shared {
         memo: Memo::default(),
         cache: opts.cache.as_deref().map(Cache::new).transpose()?,
+        zstd_level: opts.zstd_level,
     };
     let threads = pool.current_num_threads();
     let mut run = Run::new(manifest, opts, &shared)?;
@@ -95,6 +96,7 @@ pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
 struct Shared {
     memo: Memo,
     cache: Option<Cache>,
+    zstd_level: i32,
 }
 
 struct Unit<'m> {
@@ -547,7 +549,7 @@ impl<'m, 's> Run<'m, 's> {
             .str(&path.to_string_lossy())
             .debug(&kind)
             .finish();
-        let identity = key::stored_as(identity, self.codecs[a].is_some());
+        let identity = self.stored(a, identity);
         if let Some(record) = previous.get(&identity)
             && self.link_record(a, asset, record)?
         {
@@ -645,6 +647,11 @@ impl<'m, 's> Run<'m, 's> {
         self.add_assemblies(a, record.assemblies.iter().cloned());
         self.records[a].push(record.clone());
         Ok(true)
+    }
+
+    /// The key archive `a` stores an entry of key `key` under.
+    fn stored(&self, a: usize, key: Hash32) -> Hash32 {
+        key::stored_as(key, self.opts.zstd_level, self.codecs[a].is_some())
     }
 
     /// The entries holding `key`: in the replaced archive, else in the cache.
@@ -800,7 +807,7 @@ impl<'m, 's> Run<'m, 's> {
         let mut keys = Vec::new();
         let mut deps = Vec::new();
         for nu in units {
-            let key = key::stored_as(nu.key, self.codecs[a].is_some());
+            let key = self.stored(a, nu.key);
             keys.push(key);
             deps.push(nu.deps);
             self.add(Unit {
@@ -923,7 +930,7 @@ impl<'m, 's> Run<'m, 's> {
             let mut deps: Vec<usize> = meshes.iter().map(|m| m.1).collect();
             deps.sort_unstable();
             deps.dedup();
-            let key = key::stored_as(key.finish(), self.codecs[a].is_some());
+            let key = self.stored(a, key.finish());
             if let Some((ra, r)) = record {
                 self.records[ra][r].units.push(key);
             }
@@ -1061,7 +1068,7 @@ impl<'m, 's> Run<'m, 's> {
                 None
             } else {
                 let mut w = ArchiveWriter::create(self.manifest.archives[a].output.clone())?;
-                w.set_zstd_level(ZSTD_LEVEL);
+                w.set_zstd_level(self.opts.zstd_level);
                 Some(w)
             });
         }
@@ -2273,7 +2280,7 @@ fn cook_unit(
         .map(|c| c.path(key))
         .or(scratch.clone());
     let mut w = ArchiveWriter::create(path.clone().map_or(Target::Memory, Target::File))?;
-    w.set_zstd_level(ZSTD_LEVEL);
+    w.set_zstd_level(shared.zstd_level);
     w.set_gdeflate(gdeflate);
     match work {
         Work::Blobs { schema, blobs } => {

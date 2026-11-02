@@ -1,14 +1,12 @@
 //! Cook keys: a hash of everything that shapes an entry's bytes.
 //!
-//! A key covers the class's cook version, the zstd library and level, the libraries of the
-//! class (locked versions from `Cargo.lock`, build script), the entry name and the parts the
+//! A key covers the class's cook version, the zstd library, the libraries of the class
+//! (locked versions from `Cargo.lock`, build script), the entry name and the parts the
 //! caller adds: settings, input content hashes and the keys of the entries it depends on.
-//! Keys of GDeflate archives also cover the encoder's commit and level.
+//! The key an archive stores also covers the zstd level, and for GDeflate archives the
+//! encoder's commit and level.
 
 use orr_pack::{Class, Hash32};
-
-/// zstd level of every cooked blob.
-pub(crate) const ZSTD_LEVEL: i32 = 19;
 
 /// GDeflate level of the payload blobs of GDeflate archives.
 pub(crate) const GDEFLATE_LEVEL: i32 = 12;
@@ -62,7 +60,6 @@ impl Key {
         let mut k = Self(blake3::Hasher::new());
         k.0.update(&class.to_le_bytes());
         k.0.update(&version(class).to_le_bytes());
-        k.0.update(&ZSTD_LEVEL.to_le_bytes());
         k.0.update(&zstd::zstd_safe::version_number().to_le_bytes());
         k.str(env!("ORR_COOK_ZSTD_LIBS")).str(libraries).str(name)
     }
@@ -92,18 +89,18 @@ impl Key {
     }
 }
 
-/// The key of an entry in an archive with or without GDeflate payload blobs; zstd archives
-/// keep `key` as it is.
-pub(crate) fn stored_as(key: Hash32, gdeflate: bool) -> Hash32 {
+/// The key of an entry in an archive of blobs at zstd level `zstd_level`, with or without
+/// GDeflate payload blobs.
+pub(crate) fn stored_as(key: Hash32, zstd_level: i32, gdeflate: bool) -> Hash32 {
+    let k = Key(blake3::Hasher::new()).bytes(&zstd_level.to_le_bytes());
     if !gdeflate {
-        return key;
+        return k.hash(key).finish();
     }
     #[cfg(feature = "gdeflate")]
     let commit = crate::gdeflate::COMMIT;
     #[cfg(not(feature = "gdeflate"))]
     let commit = "";
-    Key(blake3::Hasher::new())
-        .str("gdeflate")
+    k.str("gdeflate")
         .str(commit)
         .bytes(&GDEFLATE_LEVEL.to_le_bytes())
         .hash(key)

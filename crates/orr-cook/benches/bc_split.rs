@@ -13,7 +13,7 @@ use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, ArchiveWriter, BcLayout, BlobIn, Class, Filter, Hash32, Target};
 use rayon::prelude::*;
 
-const ZSTD_LEVEL: i32 = 19;
+const ZSTD_LEVEL: i32 = orr_cook::ZSTD_LEVEL_DEFAULT;
 
 fn files(dir: &Path, out: &mut Vec<PathBuf>) {
     for e in std::fs::read_dir(dir).unwrap() {

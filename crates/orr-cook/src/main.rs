@@ -15,7 +15,7 @@ use orr_pack::{Archive, Class, Codec, Entry};
 
 const USAGE: &str = "usage:
   orr-cook build <manifest.toml> [--jobs N] [--force] [--cache DIR] [--cache-cap BYTES]
-                 [--working-set BYTES] [--report r.json]
+                 [--working-set BYTES] [--zstd-level L] [--report r.json]
   orr-cook inspect <archive> [--class C] [--name N]
   orr-cook verify <archive>
   orr-cook bench-decode <archive>";
@@ -54,6 +54,9 @@ fn build(args: &[String]) -> Result<bool> {
             "--cache" => opts.cache = Some(it.next().ok_or(USAGE)?.into()),
             "--cache-cap" => opts.cache_cap = Some(number(it.next())?),
             "--working-set" => opts.working_set = number(it.next())?,
+            "--zstd-level" => {
+                opts.zstd_level = it.next().ok_or(USAGE)?.parse().map_err(|_| USAGE)?;
+            }
             "--report" => opts.report = Some(it.next().ok_or(USAGE)?.into()),
             _ if manifest.is_none() => manifest = Some(Path::new(a)),
             _ => return Err(USAGE.into()),

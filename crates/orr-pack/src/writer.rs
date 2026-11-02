@@ -301,6 +301,11 @@ impl ArchiveWriter {
         self.zstd_level = level;
     }
 
+    /// The zstd level set by [`Self::set_zstd_level`], for [`BlobIn::encode`].
+    pub fn zstd_level(&self) -> i32 {
+        self.zstd_level
+    }
+
     /// GDeflate codec for blobs added from now on (default none). With one, payload blobs
     /// added as zstd are stored as GDeflate pages without a filter, and blobs added as
     /// GDeflate are accepted.
