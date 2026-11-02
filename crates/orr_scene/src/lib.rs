@@ -28,6 +28,7 @@
 
 mod accel;
 mod arena;
+mod clas_pool;
 mod decals;
 mod emissive;
 mod lights;
@@ -120,6 +121,8 @@ pub mod tessellation {
 
 /// orr_scene's compiled-in kernel modules.
 pub use shaders::MODULES;
+/// The root of the CLAS pool's `allocate` kernel.
+pub use shaders::clas_pool::PoolRoot;
 
 /// orr_scene's compiled kernels and the Rust types of its Slang structs.
 mod shaders {

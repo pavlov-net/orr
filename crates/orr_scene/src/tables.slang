@@ -217,8 +217,8 @@ public struct MaskGpu
     public uint64_t* blas;
 }
 
-// A mesh made resident from a mounted pack. Page and node page addresses are 0 until
-// their data is resident.
+// A mesh made resident from a mounted pack. Page and node page addresses are 0 while
+// their data is not resident.
 public struct MeshGpu
 {
     public uint8_t* info;          // blob 0: MeshHeader and its tables (orr_pack.mesh)
@@ -249,8 +249,9 @@ public struct MeshGpu
     public uint* roots;            // DAG mode: MeshHeader.roots
     public uint* node_stamps;      // per node page: the last frame the traversal reported it
     public uint root_count;
-    public uint _pad;
+    public uint pinned_pages;      // pages resident from mount; the others stream when `page_stamps` is set
     public SkinMeshGpu* skin;      // MESH_SKIN meshes: what skinned copies build from, else null
+    public uint* page_stamps;      // per page: the last frame the traversal reported it; null when every page is resident
 }
 
 // What skinned copies of a MESH_SKIN mesh read: each cluster's place in a copy's vertex

@@ -40,20 +40,23 @@ const WAIT: Duration = Duration::from_secs(60);
 
 /// The loading side's acceleration-structure kernels.
 pub(crate) struct AccelKernels {
-    clas: ComputePipeline,
+    pub clas: ComputePipeline,
     records: ComputePipeline,
+    /// The CLAS pool's allocator.
+    pub allocate: ComputePipeline,
 }
 
 impl AccelKernels {
     pub(crate) fn new(device: &Device, kernels: &KernelSet) -> Result<Self> {
-        let module = kernels.module(&accel::MODULE)?;
-        let pipeline = |entry| -> Result<ComputePipeline> {
+        let pipeline = |m, entry| -> Result<ComputePipeline> {
+            let module = kernels.module(m)?;
             let stage = ShaderStage::new(module, entry, SpecData::default())?;
             Ok(device.create_compute_pipeline(&stage, module.name)?)
         };
         Ok(Self {
-            clas: pipeline("clas")?,
-            records: pipeline("records")?,
+            clas: pipeline(&accel::MODULE, "clas")?,
+            records: pipeline(&accel::MODULE, "records")?,
+            allocate: pipeline(&crate::shaders::clas_pool::MODULE, "allocate")?,
         })
     }
 }
@@ -65,6 +68,8 @@ pub(crate) struct AccelLimits {
     pub clas_triangles: u32,
     /// Micromaps one submit builds.
     pub micromaps: u32,
+    /// Bytes of pages a DAG mesh keeps resident whole; above it its pages stream.
+    pub mesh_resident_max: u64,
 }
 
 /// What the loading side keeps of a cluster as its page decodes.
@@ -85,6 +90,23 @@ pub(crate) struct ClusterInfo {
 }
 
 impl ClusterInfo {
+    /// A cluster of a page not resident: no triangles, and never in a cut.
+    pub(crate) fn absent(page: u32, local: u32) -> Self {
+        Self {
+            page,
+            local,
+            vertex_count: 0,
+            tri_count: 0,
+            section: 0,
+            part: 0,
+            flags: 0,
+            micromap: false,
+            self_error: f32::INFINITY,
+            parent_error: 0.0,
+            deformation_bound: 0.0,
+        }
+    }
+
     pub(crate) fn new(page: u32, local: u32, c: &Cluster) -> Self {
         Self {
             page,
@@ -126,6 +148,9 @@ pub(crate) struct MeshInput<'a> {
     pub cluster_base: u32,
     /// The mesh's part table.
     pub parts: &'a [Part],
+    /// The smallest error of a cut whose clusters are all resident: 0 unless the mesh's
+    /// pages stream.
+    pub min_cut: f32,
 }
 
 /// A mesh's animated parts: those of its clusters with `ANIMATED_PART`, from the lowest
@@ -280,7 +305,9 @@ pub(crate) fn cut_hash(clusters: &[u32]) -> [u32; 2] {
 /// Discrete meshes cache their levels. DAG meshes cache cuts at fixed thresholds: a cut
 /// takes every cluster whose own error is at or under the threshold and whose parent's is
 /// over it, from the merged stage once the threshold reaches the merge error. Copies whose
-/// traversed cut equals one trace it, as do distant copies and posed ones.
+/// traversed cut equals one trace it, as do distant copies and posed ones. A mesh whose
+/// pages stream caches only cuts at or above `min_cut`, whose clusters sit in its pinned
+/// pages.
 pub(crate) fn cuts(m: &MeshInput<'_>) -> Vec<(f32, Vec<u32>)> {
     if !m.levels.is_empty() {
         return m
@@ -303,11 +330,13 @@ pub(crate) fn cuts(m: &MeshInput<'_>) -> Vec<(f32, Vec<u32>)> {
         .map(|c| c.self_error)
         .filter(|&e| finite(e))
         .fold(0.0, f32::max);
-    let mut thresholds = vec![0.0f32];
+    let mut thresholds = vec![m.min_cut];
     if smallest.is_finite() {
         let mut t = smallest;
         while thresholds.len() < DAG_CUTS {
-            thresholds.push(t);
+            if t > m.min_cut {
+                thresholds.push(t);
+            }
             if t >= largest {
                 break;
             }
@@ -653,6 +682,9 @@ pub(crate) fn build(
         let mut members: Vec<(usize, usize)> = Vec::new();
         for (mi, m) in meshes.iter().enumerate() {
             for (ci, c) in m.clusters.iter().enumerate() {
+                if c.tri_count == 0 {
+                    continue;
+                }
                 let uses = omm
                     && c.micromap
                     && !m.non_opaque[c.section as usize]
@@ -662,13 +694,13 @@ pub(crate) fn build(
                 }
             }
         }
-        for batch in batches(meshes, &members, limits.clas_triangles) {
+        for batch in batches(&tri_counts(meshes, &members), limits.clas_triangles) {
             build_clas(
                 &mut step,
                 k,
                 meshes,
                 &micromap_of,
-                batch,
+                &members[batch],
                 ClusterBuild::Clas { omm: with_omm },
                 &mut clas,
                 &mut accel.blocks,
@@ -688,13 +720,13 @@ pub(crate) fn build(
         .filter(|(_, m)| skinned(m))
         .flat_map(|(mi, m)| (0..m.clusters.len()).map(move |ci| (mi, ci)))
         .collect();
-    for batch in batches(meshes, &members, limits.clas_triangles) {
+    for batch in batches(&tri_counts(meshes, &members), limits.clas_triangles) {
         build_clas(
             &mut step,
             k,
             meshes,
             &micromap_of,
-            batch,
+            &members[batch],
             ClusterBuild::Template,
             &mut templates,
             &mut accel.blocks,
@@ -1081,28 +1113,22 @@ fn mask_slots(lists: Vec<Option<Vec<u64>>>) -> Vec<(Vec<u64>, Vec<u32>)> {
     out
 }
 
-/// Consecutive runs of `members` of at most `BATCH_CLUSTERS` clusters and `triangles`
-/// triangles (a larger cluster alone).
-fn batches<'m>(
-    meshes: &[MeshInput<'_>],
-    members: &'m [(usize, usize)],
-    triangles: u32,
-) -> Vec<&'m [(usize, usize)]> {
+/// Consecutive runs of clusters of triangle counts `tris`, at most `BATCH_CLUSTERS` clusters
+/// and `triangles` triangles each (a larger cluster alone).
+pub(crate) fn batches(tris: &[u32], triangles: u32) -> Vec<std::ops::Range<usize>> {
     let mut out = Vec::new();
     let mut start = 0;
-    while start < members.len() {
+    while start < tris.len() {
         let mut end = start;
-        let mut tris = 0;
-        while end < members.len() && end - start < BATCH_CLUSTERS {
-            let (mi, ci) = members[end];
-            let t = meshes[mi].clusters[ci].tri_count;
-            if end > start && tris + t > triangles {
+        let mut sum = 0;
+        while end < tris.len() && end - start < BATCH_CLUSTERS {
+            if end > start && sum + tris[end] > triangles {
                 break;
             }
-            tris += t;
+            sum += tris[end];
             end += 1;
         }
-        out.push(&members[start..end]);
+        out.push(start..end);
         start = end;
     }
     out
@@ -1110,11 +1136,111 @@ fn batches<'m>(
 
 /// What one batch of [`build_clas`] builds.
 #[derive(Clone, Copy)]
-enum ClusterBuild {
+pub(crate) enum ClusterBuild {
     /// CLAS, with micromaps when `omm`.
     Clas { omm: bool },
     /// Cluster templates, without micromaps.
     Template,
+}
+
+/// One cluster of a CLAS or template build.
+pub(crate) struct ClasSource<'a> {
+    /// The resident address of its page.
+    pub page: u64,
+    /// Its page's micromap, or 0.
+    pub micromap: u64,
+    pub cluster: &'a ClusterInfo,
+    pub cluster_id: u32,
+    pub step: f32,
+    pub truncate_bits: u32,
+    pub non_opaque: bool,
+}
+
+/// The `clas` kernel's jobs and the implicit build of one batch.
+pub(crate) struct ClasBatch {
+    pub jobs: Vec<ClasJob>,
+    pub desc: RtasOpDesc,
+    pub vertices: u32,
+    pub triangles: u32,
+}
+
+pub(crate) fn clas_batch<'a>(
+    sources: impl Iterator<Item = ClasSource<'a>>,
+    build: ClusterBuild,
+) -> ClasBatch {
+    let with_omm = matches!(build, ClusterBuild::Clas { omm: true });
+    let template = matches!(build, ClusterBuild::Template);
+    let mut jobs = Vec::new();
+    let (mut vertices, mut triangles) = (0u32, 0u32);
+    let (mut max_tris, mut max_verts, mut min_truncate) = (1, 1, u32::MAX);
+    for s in sources {
+        let c = s.cluster;
+        let mut flags = 0;
+        if s.non_opaque {
+            flags |= CLAS_NON_OPAQUE;
+        }
+        if with_omm {
+            flags |= CLAS_MICROMAP;
+        }
+        if template {
+            flags |= CLAS_TEMPLATE;
+        }
+        jobs.push(ClasJob {
+            // SAFETY: the page stays resident while its CLAS build runs.
+            page: unsafe { GpuPtr::from_address(GpuAddress(s.page)) },
+            micromap: s.micromap,
+            local: c.local,
+            cluster_id: s.cluster_id,
+            vertex_first: vertices,
+            triangle_first: triangles,
+            step: s.step,
+            truncate_bits: s.truncate_bits,
+            flags,
+            _pad: 0,
+        });
+        vertices += c.vertex_count;
+        triangles += c.tri_count;
+        max_tris = max_tris.max(c.tri_count);
+        max_verts = max_verts.max(c.vertex_count);
+        min_truncate = min_truncate.min(s.truncate_bits);
+    }
+    let mut flags = RtasFlags::FAST_TRACE | RtasFlags::ALLOW_DATA_ACCESS;
+    if with_omm {
+        flags |= RtasFlags::ALLOW_OMM;
+    }
+    let desc = RtasOpDesc {
+        op: if template {
+            RtasOp::BuildTemplates
+        } else {
+            RtasOp::BuildClas
+        },
+        mode: RtasMode::Implicit,
+        flags,
+        vertex_format: ClusterVertexFormat::F32x3,
+        limits: RtasLimits::Cluster(ClusterLimits {
+            max_args: jobs.len() as u32,
+            max_tris_per_cluster: max_tris,
+            max_verts_per_cluster: max_verts,
+            max_total_tris: triangles,
+            max_total_verts: vertices,
+            max_geometry_index: 0,
+            max_geometries_per_cluster: 1,
+            min_truncate_bits: min_truncate,
+        }),
+    };
+    ClasBatch {
+        jobs,
+        desc,
+        vertices,
+        triangles,
+    }
+}
+
+fn tri_counts(meshes: &[MeshInput<'_>], members: &[(usize, usize)]) -> Vec<u32> {
+    members
+        .iter()
+        .map(|&(mi, ci)| meshes[mi].clusters[ci].tri_count)
+        .collect()
 }
 
 /// One CLAS or template batch: build, read the sizes back and move into a block of its own.
@@ -1130,74 +1256,32 @@ fn build_clas(
     keep: &mut Vec<Allocation<u8>>,
 ) -> Result<()> {
     let caps = step.device.caps();
-    let with_omm = matches!(build, ClusterBuild::Clas { omm: true });
     let template = matches!(build, ClusterBuild::Template);
-    let mut jobs = Vec::with_capacity(batch.len());
-    let (mut vertices, mut triangles) = (0u32, 0u32);
-    let (mut max_tris, mut max_verts, mut min_truncate) = (1, 1, u32::MAX);
-    for &(mi, ci) in batch {
+    let sources = batch.iter().map(|&(mi, ci)| {
         let m = &meshes[mi];
         let c = &m.clusters[ci];
-        let mut flags = 0;
-        if m.non_opaque[c.section as usize] {
-            flags |= CLAS_NON_OPAQUE;
-        }
-        if with_omm {
-            flags |= CLAS_MICROMAP;
-        }
-        if template {
-            flags |= CLAS_TEMPLATE;
-        }
-        // Skinned positions are off the position grid, so templates keep every bit.
-        let truncate = if template {
-            0
-        } else {
-            u32::from(m.header.clas_truncate_bits)
-        };
-        jobs.push(ClasJob {
-            // SAFETY: the page is resident in the mount's block.
-            page: unsafe { GpuPtr::from_address(GpuAddress(m.pages[c.page as usize])) },
+        ClasSource {
+            page: m.pages[c.page as usize],
             micromap: micromaps[mi][c.page as usize],
-            local: c.local,
+            cluster: c,
             cluster_id: m.cluster_base + ci as u32,
-            vertex_first: vertices,
-            triangle_first: triangles,
             step: m.header.step(),
-            truncate_bits: truncate,
-            flags,
-            _pad: 0,
-        });
-        vertices += c.vertex_count;
-        triangles += c.tri_count;
-        max_tris = max_tris.max(c.tri_count);
-        max_verts = max_verts.max(c.vertex_count);
-        min_truncate = min_truncate.min(truncate);
-    }
+            // Skinned positions are off the position grid, so templates keep every bit.
+            truncate_bits: if template {
+                0
+            } else {
+                u32::from(m.header.clas_truncate_bits)
+            },
+            non_opaque: m.non_opaque[c.section as usize],
+        }
+    });
+    let ClasBatch {
+        jobs,
+        desc,
+        vertices,
+        triangles,
+    } = clas_batch(sources, build);
     let n = jobs.len() as u32;
-    let mut flags = RtasFlags::FAST_TRACE | RtasFlags::ALLOW_DATA_ACCESS;
-    if with_omm {
-        flags |= RtasFlags::ALLOW_OMM;
-    }
-    let desc = RtasOpDesc {
-        op: if template {
-            RtasOp::BuildTemplates
-        } else {
-            RtasOp::BuildClas
-        },
-        mode: RtasMode::Implicit,
-        flags,
-        vertex_format: ClusterVertexFormat::F32x3,
-        limits: RtasLimits::Cluster(ClusterLimits {
-            max_args: n,
-            max_tris_per_cluster: max_tris,
-            max_verts_per_cluster: max_verts,
-            max_total_tris: triangles,
-            max_total_verts: vertices,
-            max_geometry_index: 0,
-            max_geometries_per_cluster: 1,
-            min_truncate_bits: min_truncate,
-        }),
-    };
     let (addresses, sizes) = implicit(step, &desc, n, |step, records, count| {
         let root = AccelRoot {
             clas: step.upload(&jobs, "CLAS jobs")?,

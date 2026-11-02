@@ -48,6 +48,9 @@ const ARGS_GATHER: u64 = 3 * ARGS_PASSES as u64;
 const ARGS_JOBS: u64 = ARGS_GATHER + 3;
 const ARGS_TOTAL: u64 = ARGS_JOBS + 3;
 const TRAVERSE_FOCUS: u32 = 1;
+/// `cut.slang` `FEEDBACK_TOUCH` and `FEEDBACK_MESH_PAGE`.
+const FEEDBACK_TOUCH: u32 = 1;
+const FEEDBACK_MESH_PAGE: u32 = 2;
 /// Passes of one traversal over a hierarchy whose depth is not known at mount.
 pub(crate) const PAGED_DEPTH: u32 = 32;
 /// Feedback records one frame keeps.
@@ -106,12 +109,13 @@ impl CutStats {
     }
 }
 
-/// A node page the traversal needed (a request) or read (a touch), with the projected
-/// error in pixels it would refine.
+/// A node page or streamed mesh page the traversal needed (a request) or read (a touch),
+/// with the projected error in pixels it would refine.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct NodePageFeedback {
+pub(crate) struct PageFeedback {
     pub mesh: u32,
     pub page: u32,
+    pub mesh_page: bool,
     pub request: bool,
     pub error: f32,
 }
@@ -331,16 +335,17 @@ impl Cuts {
         stats.add(&self.readback(slot)[..COUNTERS]);
     }
 
-    /// The node pages the frame that used readback slot `slot` requested or read.
-    pub(crate) fn feedback(&self, slot: usize) -> Vec<NodePageFeedback> {
+    /// The pages the frame that used readback slot `slot` requested or read.
+    pub(crate) fn feedback(&self, slot: usize) -> Vec<PageFeedback> {
         let data = self.readback(slot);
         let n = (data[CUT_FEEDBACK] as usize).min(FEEDBACK as usize);
         data[COUNTERS..COUNTERS + 4 * n]
             .chunks_exact(4)
-            .map(|r| NodePageFeedback {
+            .map(|r| PageFeedback {
                 mesh: r[0],
                 page: r[1],
-                request: r[2] == 0,
+                mesh_page: r[2] & FEEDBACK_MESH_PAGE != 0,
+                request: r[2] & FEEDBACK_TOUCH == 0,
                 error: f32::from_bits(r[3]),
             })
             .collect()

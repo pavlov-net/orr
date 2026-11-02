@@ -22,20 +22,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use orr_gpu::{
-    CommandList, Device, GpuAddress, GpuPtr, MemoryKind, QueueKind, SparseBinds, Texture,
+    CommandList, Device, GpuAddress, GpuPtr, MemoryKind, Micromap, QueueKind, SparseBinds, Texture,
     TextureRegion, TileBind, TimelinePoint,
 };
+use orr_pack::mesh::{MeshHeader, PageView};
 use orr_pack::{Blob, Codec};
 
+use crate::accel::{AccelShared, ClusterInfo, PageMicromap};
+use crate::clas_pool::{self, ClasPool, NO_UNIT, PageBuild, PoolBatch};
 use crate::loading::{BlobSource, Loading, Msg, decoded, landed, read_stored};
-use crate::memory::{Pool, PoolSlot};
-use crate::mount::Apply;
+use crate::memory::{Block, Pool, PoolSlot};
+use crate::mount::{Apply, PAGE, page_infos};
 use crate::residency::{
     Key, Limits, Plan, Priority, Residency, ResidencyClass, ResidencyStats, UnitDesc,
 };
 use crate::tiles::{TexResidency, TexStream, TextureFeedback};
 use crate::upload::Record;
-use crate::{Budgets, Error, LoadState, MountId, Result, TextureStreamGpu};
+use crate::{Budgets, ClusterRef, Error, LoadState, MountId, Result, TextureStreamGpu};
 
 /// How a streamed unit loads.
 #[derive(Clone, Copy, Debug)]
@@ -50,6 +53,33 @@ pub(crate) enum StreamUnit {
     },
     /// Tile `tile` of the mount's streamed texture `texture`.
     Tile { texture: u32, tile: u32 },
+    /// Page `page` of the mount's streamed mesh `mesh`.
+    MeshPage { mesh: u32, page: u32 },
+}
+
+/// A mesh whose pages past its pinned ones stream: how they load and where they land.
+pub(crate) struct MeshStream {
+    pub entry: u32,
+    pub header: MeshHeader,
+    pub pages: Vec<StreamedPage>,
+    /// The mesh's page table.
+    pub table: GpuPtr<u64>,
+    /// The entry of mesh cluster 0 in the resident cluster table, and its cluster id.
+    pub clusters: GpuPtr<ClusterRef>,
+    pub cluster_base: u32,
+    /// Sections whose every triangle is non-opaque.
+    pub non_opaque: Vec<bool>,
+}
+
+/// One page of a [`MeshStream`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StreamedPage {
+    pub blob: u32,
+    /// Resident bytes.
+    pub bytes: u32,
+    /// Its first mesh cluster and cluster count.
+    pub first: u32,
+    pub clusters: u32,
 }
 
 /// Where a requested blob lands: consumer memory that stays alive until the blob is ready
@@ -79,6 +109,10 @@ pub(crate) struct MountUnits {
     pub node_pages: Vec<Vec<u32>>,
     /// The mount's streamed textures and the unit of each one's first tile.
     pub textures: Vec<(Arc<TexStream>, u32)>,
+    /// The unit of each page of each mesh.
+    pub mesh_pages: Vec<Vec<u32>>,
+    /// The mount's meshes whose pages stream, as `MeshPage` units name them.
+    pub mesh_streams: Vec<Arc<MeshStream>>,
 }
 
 struct MountStreams {
@@ -88,6 +122,8 @@ struct MountStreams {
     meshes: Vec<Vec<u32>>,
     node_pages: Vec<Vec<u32>>,
     textures: Vec<TexResidency>,
+    mesh_pages: Vec<Vec<u32>>,
+    mesh_streams: Vec<Arc<MeshStream>>,
 }
 
 impl MountStreams {
@@ -106,6 +142,34 @@ impl MountStreams {
 enum Placed {
     Pool(PoolSlot, GpuPtr<u64>),
     Tile(PoolSlot),
+    MeshPage(MeshPlaced),
+}
+
+/// A streamed mesh page: its slot, its clusters' CLAS units and its micromap.
+struct MeshPlaced {
+    slot: PoolSlot,
+    stream: Arc<MeshStream>,
+    page: u32,
+    clas: Vec<(u32, u32)>,
+    micromap: Option<(Micromap, PoolSlot)>,
+}
+
+impl MeshPlaced {
+    /// Its page table entry and its clusters' entries in the resident cluster table.
+    fn entries(&self) -> (GpuPtr<u64>, GpuPtr<ClusterRef>, u32) {
+        let p = self.stream.pages[self.page as usize];
+        (
+            self.stream.table.offset(u64::from(self.page)),
+            self.stream.clusters.offset(u64::from(p.first)),
+            p.clusters,
+        )
+    }
+}
+
+/// A streamed page's CLAS and micromap, freed once no frame reads them.
+struct ClasFree {
+    clas: Vec<(u32, u32)>,
+    micromap: Option<(Micromap, PoolSlot)>,
 }
 
 /// A bound tile to unbind and free.
@@ -136,6 +200,11 @@ struct UserBlob {
 
 pub(crate) struct Streaming {
     residency: Residency,
+    accel: Arc<AccelShared>,
+    /// Streamed pages' CLAS; none without cluster acceleration structures.
+    clas: Option<Arc<Mutex<ClasPool>>>,
+    /// CLAS freed once the frame has completed.
+    retired_clas: Vec<(u64, ClasFree)>,
     pool: Arc<Mutex<Pool>>,
     staging: Arc<Mutex<Pool>>,
     tiles: Arc<Mutex<Pool>>,
@@ -165,6 +234,7 @@ impl Streaming {
     pub(crate) fn new(
         device: &Device,
         b: &Budgets,
+        accel: &Arc<AccelShared>,
         streams: GpuPtr<GpuPtr<TextureStreamGpu>>,
         fif: u32,
     ) -> Result<Self> {
@@ -179,7 +249,17 @@ impl Streaming {
         } else {
             MemoryKind::DeviceLocal
         };
+        let caps = device.caps();
+        let clas = if caps.cluster.max_tris > 0 && caps.cluster.max_partitions > 0 {
+            let pool = ClasPool::new(device, b.clas_pool, b.stream_block)?;
+            Some(Arc::new(Mutex::new(pool)))
+        } else {
+            None
+        };
         Ok(Self {
+            accel: Arc::clone(accel),
+            clas,
+            retired_clas: Vec::new(),
             residency: Residency::new(Limits {
                 budgets,
                 io_requests: b.io_requests,
@@ -291,6 +371,8 @@ impl Streaming {
                 meshes: units.meshes,
                 node_pages: units.node_pages,
                 textures,
+                mesh_pages: units.mesh_pages,
+                mesh_streams: units.mesh_streams,
             },
         );
         Ok(())
@@ -312,6 +394,14 @@ impl Streaming {
         for k in gone {
             match self.resident.remove(&k).expect("resident") {
                 Placed::Pool(slot, _) => self.retired.push((frame, slot)),
+                Placed::MeshPage(p) => {
+                    self.retired.push((frame, p.slot));
+                    let free = ClasFree {
+                        clas: p.clas,
+                        micromap: p.micromap,
+                    };
+                    self.retired_clas.push((frame, free));
+                }
                 Placed::Tile(slot) => {
                     let (t, tile) = m.tile(k.unit);
                     let free = TileFree {
@@ -377,20 +467,27 @@ impl Streaming {
         }
     }
 
-    /// Node page `page` of mesh `mesh` of `mount`: requested for the next step with the
-    /// projected error it would refine, or read by a traversal in `frame`.
-    pub(crate) fn node_page(
+    /// Node page or mesh page `page` of mesh `mesh` of `mount`: requested for the next step
+    /// with the projected error it would refine, or read by a traversal in `frame`.
+    pub(crate) fn page(
         &mut self,
         mount: MountId,
         mesh: u32,
         page: u32,
+        mesh_page: bool,
         request: Option<f32>,
         frame: u64,
     ) {
         let Some(&unit) = self
             .mounts
             .get(&mount)
-            .and_then(|m| m.node_pages.get(mesh as usize))
+            .and_then(|m| {
+                if mesh_page {
+                    m.mesh_pages.get(mesh as usize)
+                } else {
+                    m.node_pages.get(mesh as usize)
+                }
+            })
             .and_then(|p| p.get(page as usize))
         else {
             return;
@@ -525,8 +622,12 @@ impl Streaming {
                 }
             }
             drop(staging);
+            let clas = match batch.clas {
+                Some(c) => self.replay(c),
+                None => Vec::new(),
+            };
             for l in batch.loads {
-                self.landed(l, frame, w)?;
+                self.landed(l, &clas, frame, w)?;
             }
         }
         let slot = (frame % u64::from(self.fif)) as usize;
@@ -535,12 +636,27 @@ impl Streaming {
             w.put(self.streams.offset(u64::from(index)), &[GpuPtr::NULL])?;
         }
         self.residency.react(w.device.memory_report().pressure());
+        if let Some(c) = &self.clas {
+            let bytes = c.lock().unwrap().bound_bytes();
+            self.residency.note_clas_pool(bytes);
+        }
         let Plan { loads, evictions } = self.residency.plan(frame);
         for k in evictions {
             match self.resident.remove(&k).expect("evicted unit is resident") {
                 Placed::Pool(slot, table) => {
                     w.put(table, &[0])?;
                     self.retired.push((frame - 1, slot));
+                }
+                Placed::MeshPage(p) => {
+                    let (table, refs, count) = p.entries();
+                    w.put(table, &[0])?;
+                    w.put(refs, &vec![bytemuck::Zeroable::zeroed(); count as usize])?;
+                    self.retired.push((frame - 1, p.slot));
+                    let free = ClasFree {
+                        clas: p.clas,
+                        micromap: p.micromap,
+                    };
+                    self.retired_clas.push((frame - 1, free));
                 }
                 Placed::Tile(slot) => {
                     let m = self.mounts.get_mut(&k.mount).expect("mounted");
@@ -591,6 +707,10 @@ impl Streaming {
                         stream: Arc::clone(&m.textures[texture as usize].stream),
                         tile,
                     },
+                    StreamUnit::MeshPage { mesh, page } => LoadKind::MeshPage {
+                        stream: Arc::clone(&m.mesh_streams[mesh as usize]),
+                        page,
+                    },
                 };
                 StreamLoad {
                     what: What::Unit(key),
@@ -621,8 +741,14 @@ impl Streaming {
                 },
             });
         }
-        if !loads.is_empty() || !self.unbinds.is_empty() {
+        let clas_waits = self
+            .clas
+            .as_ref()
+            .is_some_and(|c| c.lock().unwrap().pending());
+        if !loads.is_empty() || !self.unbinds.is_empty() || clas_waits {
             let task = StreamTask {
+                accel: Arc::clone(&self.accel),
+                clas: self.clas.clone(),
                 pool: Arc::clone(&self.pool),
                 staging: Arc::clone(&self.staging),
                 tiles: Arc::clone(&self.tiles),
@@ -638,12 +764,33 @@ impl Streaming {
         Ok(points)
     }
 
-    fn landed(&mut self, l: Landed, frame: u64, w: &mut Apply<'_>) -> Result<()> {
+    /// Replays a landed batch's CLAS work on the pool's reference; returns the unit and the
+    /// unit count of each of its CLAS.
+    fn replay(&mut self, batch: PoolBatch) -> Vec<(u32, u32)> {
+        let pool = self.clas.as_ref().expect("a CLAS batch has its pool");
+        let (placed, held) = pool.lock().unwrap().replay(batch);
+        let mut staging = self.staging.lock().unwrap();
+        for slot in held {
+            staging.free(slot);
+        }
+        placed
+    }
+
+    fn landed(
+        &mut self,
+        mut l: Landed,
+        clas: &[(u32, u32)],
+        frame: u64,
+        w: &mut Apply<'_>,
+    ) -> Result<()> {
         let ok = l.result.is_ok();
+        if let (What::Unit(key), Some(Placed::MeshPage(_))) = (l.what, &l.placed) {
+            return self.mesh_landed(key, l, clas, frame, w);
+        }
         match l.what {
             What::Unit(key) => {
                 let live = self.residency.landed(key, ok, frame);
-                match (live && ok, l.placed) {
+                match (live && ok, l.placed.take()) {
                     (true, Some(Placed::Pool(slot, table))) => {
                         w.put(table, &[l.gpu])?;
                         self.resident.insert(key, Placed::Pool(slot, table));
@@ -656,6 +803,7 @@ impl Streaming {
                         self.resident.insert(key, Placed::Tile(slot));
                     }
                     (_, Some(Placed::Pool(slot, _))) => self.pool.lock().unwrap().free(slot),
+                    (_, Some(Placed::MeshPage(_))) => unreachable!("mesh pages land apart"),
                     (_, Some(Placed::Tile(slot))) => {
                         let (stream, tile) = l.tile.expect("a tile load names its tile");
                         self.unbinds.push(TileFree {
@@ -691,6 +839,88 @@ impl Streaming {
         Ok(())
     }
 
+    /// A streamed mesh page whose CLAS have built: its page table entry and its clusters'
+    /// entries are written, or with a CLAS the pool could not place its load is canceled to
+    /// run again later.
+    fn mesh_landed(
+        &mut self,
+        key: Key,
+        mut l: Landed,
+        clas: &[(u32, u32)],
+        frame: u64,
+        w: &mut Apply<'_>,
+    ) -> Result<()> {
+        let Some(Placed::MeshPage(mut p)) = l.placed.take() else {
+            unreachable!("a mesh page load")
+        };
+        let mesh = l.mesh.take();
+        let units: Vec<(u32, u32)> = match (&mesh, &self.clas) {
+            (Some(m), Some(_)) => m.slots.iter().map(|&s| clas[s as usize]).collect(),
+            _ => Vec::new(),
+        };
+        p.micromap = mesh.and_then(|m| m.micromap);
+        p.clas = units
+            .iter()
+            .copied()
+            .filter(|&(u, _)| u != NO_UNIT)
+            .collect();
+        let placed = l.result.is_ok() && units.iter().all(|&(u, _)| u != NO_UNIT);
+        let live = if !self.mounts.contains_key(&key.mount) {
+            false
+        } else if l.result.is_ok() && !placed {
+            self.residency.cancel(key);
+            false
+        } else {
+            self.residency.landed(key, l.result.is_ok(), frame)
+        };
+        if !(live && placed) {
+            self.free_now(p);
+            return Ok(());
+        }
+        let (table, refs, count) = p.entries();
+        let first = p.stream.pages[p.page as usize].first;
+        let pool = self.clas.as_ref().map(|c| c.lock().unwrap());
+        let entries: Vec<ClusterRef> = (0..count)
+            .map(|i| ClusterRef {
+                // SAFETY: the page is resident in its slot until it is evicted, which writes
+                // these entries null first.
+                page: unsafe { GpuPtr::from_address(GpuAddress(l.gpu)) },
+                local: i,
+                mesh_cluster: first + i,
+                clas: match (&pool, units.get(i as usize)) {
+                    (Some(pool), Some(&(u, _))) => pool.address(u),
+                    _ => 0,
+                },
+            })
+            .collect();
+        drop(pool);
+        w.put(table, &[l.gpu])?;
+        w.put(refs, &entries)?;
+        self.resident.insert(key, Placed::MeshPage(p));
+        Ok(())
+    }
+
+    /// Frees a mesh page no frame has read.
+    fn free_now(&mut self, p: MeshPlaced) {
+        self.pool.lock().unwrap().free(p.slot);
+        self.free_clas(ClasFree {
+            clas: p.clas,
+            micromap: p.micromap,
+        });
+    }
+
+    fn free_clas(&mut self, f: ClasFree) {
+        let Some(pool) = &self.clas else { return };
+        let mut pool = pool.lock().unwrap();
+        for (u, n) in f.clas {
+            pool.free(u, n);
+        }
+        if let Some((micromap, slot)) = f.micromap {
+            drop(micromap);
+            pool.micromaps.free(slot);
+        }
+    }
+
     /// Copies frame `frame`'s texture feedback back after every tap of the frame on `list`.
     pub(crate) fn record_feedback(&self, list: &mut CommandList<'_>, frame: u64) {
         let slot = (frame % u64::from(self.fif)) as usize;
@@ -709,6 +939,13 @@ impl Streaming {
             !done
         });
         drop(pool);
+        let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired_clas)
+            .into_iter()
+            .partition(|(f, _)| *f <= completed);
+        self.retired_clas = keep;
+        for (_, f) in done {
+            self.free_clas(f);
+        }
         let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired_tiles)
             .into_iter()
             .partition(|(f, _)| *f <= completed);
@@ -746,6 +983,10 @@ enum LoadKind {
         blob: Blob,
         target: BlobTarget,
     },
+    MeshPage {
+        stream: Arc<MeshStream>,
+        page: u32,
+    },
 }
 
 struct StreamLoad {
@@ -770,6 +1011,8 @@ enum Copy {
 
 /// One step's loads on the loading side.
 pub(crate) struct StreamTask {
+    accel: Arc<AccelShared>,
+    clas: Option<Arc<Mutex<ClasPool>>>,
     pool: Arc<Mutex<Pool>>,
     staging: Arc<Mutex<Pool>>,
     tiles: Arc<Mutex<Pool>>,
@@ -793,13 +1036,25 @@ pub(crate) struct Landed {
     /// The staging slot and its address.
     staging: Option<PoolSlot>,
     staged_at: u64,
+    /// A mesh page's clusters as it decoded, and what its CLAS build made.
+    mesh: Option<MeshLanded>,
     result: Result<(), Arc<Error>>,
+}
+
+/// What a streamed mesh page decoded to and its CLAS build.
+struct MeshLanded {
+    clusters: Vec<ClusterInfo>,
+    region: Option<PageMicromap>,
+    /// The results index of each cluster's CLAS.
+    slots: Vec<u32>,
+    micromap: Option<(Micromap, PoolSlot)>,
 }
 
 /// A stream task's loads, handed to the render thread once its GPU work has landed.
 pub(crate) struct StreamBatch {
     pub points: Vec<TimelinePoint>,
     loads: Vec<Landed>,
+    clas: Option<PoolBatch>,
 }
 
 impl StreamBatch {
@@ -823,6 +1078,7 @@ impl StreamTask {
             tile: None,
             staging: None,
             staged_at: 0,
+            mesh: None,
             result: Err(Arc::new(e)),
         });
     }
@@ -832,6 +1088,7 @@ impl StreamTask {
         match placed {
             Some(Placed::Pool(slot, _)) => self.pool.lock().unwrap().free(slot),
             Some(Placed::Tile(slot)) => self.tiles.lock().unwrap().free(slot),
+            Some(Placed::MeshPage(p)) => self.pool.lock().unwrap().free(p.slot),
             None => {}
         }
         if let Some(s) = staging {
@@ -840,8 +1097,8 @@ impl StreamTask {
     }
 }
 
-/// The blob and chunk a load reads, and the length it decodes to.
-fn source_of(load: &StreamLoad) -> Result<(Blob, Option<u32>, u64)> {
+/// The blob and chunk a load reads, the length it decodes to and the bytes it lands in.
+fn source_of(load: &StreamLoad) -> Result<(Blob, Option<u32>, u64, u64)> {
     let a = &load.source.archive;
     let entry_blob = |entry: u32, blob: u32| {
         a.entries()
@@ -852,10 +1109,18 @@ fn source_of(load: &StreamLoad) -> Result<(Blob, Option<u32>, u64)> {
             ))
     };
     let tile_bytes = orr_pack::texture::TILE_BYTES as u32;
-    let (b, chunk, len) = match &load.kind {
+    let (b, chunk, len, slot) = match &load.kind {
         LoadKind::Pool {
             entry, blob, bytes, ..
-        } => (entry_blob(*entry, *blob)?, None, u64::from(*bytes)),
+        } => {
+            let len = u64::from(*bytes);
+            (entry_blob(*entry, *blob)?, None, len, len)
+        }
+        LoadKind::MeshPage { stream, page } => {
+            let p = stream.pages[*page as usize];
+            let b = entry_blob(stream.entry, p.blob)?;
+            (b, None, u64::from(b.raw_len), u64::from(p.bytes))
+        }
         LoadKind::Tile { stream, tile } => {
             let g = &stream.grid;
             let t = g.tile(*tile);
@@ -865,7 +1130,8 @@ fn source_of(load: &StreamLoad) -> Result<(Blob, Option<u32>, u64)> {
             if chunk >= u32::from(b.chunk_count) || b.chunk_len(chunk) != tile_bytes {
                 return Err(orr_pack::Error::Malformed("texture tile chunk").into());
             }
-            (b, Some(chunk), u64::from(tile_bytes))
+            let len = u64::from(tile_bytes);
+            (b, Some(chunk), len, len)
         }
         LoadKind::User { blob, target } => {
             let len = u64::from(blob.raw_len);
@@ -878,13 +1144,13 @@ fn source_of(load: &StreamLoad) -> Result<(Blob, Option<u32>, u64)> {
             if !fits {
                 return Err(orr_pack::Error::Malformed("blob does not fit its target").into());
             }
-            (*blob, None, len)
+            (*blob, None, len, len)
         }
     };
     if b.codec() == Codec::GDeflate {
         return Err(orr_pack::Error::GDeflate.into());
     }
-    Ok((b, chunk, len))
+    Ok((b, chunk, len, slot))
 }
 
 /// Places a stream task's loads on the loading thread: memory for each, then its read.
@@ -892,7 +1158,7 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
     // Each texture's last tile slot, so its next tile goes beside it.
     let mut near: HashMap<*const TexStream, PoolSlot> = HashMap::new();
     for (i, load) in task.loads.iter().enumerate() {
-        let (b, chunk, len) = match source_of(load) {
+        let (b, chunk, len, slot_len) = match source_of(load) {
             Ok(s) => s,
             Err(e) => {
                 task.fail(load.what, e);
@@ -903,6 +1169,29 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
             LoadKind::Pool { table, .. } => {
                 match task.pool.lock().unwrap().alloc(&task.device, len, None) {
                     Ok((slot, block)) => (Some(Placed::Pool(slot, *table)), Some(block)),
+                    Err(e) => {
+                        task.fail(load.what, e);
+                        continue;
+                    }
+                }
+            }
+            LoadKind::MeshPage { stream, page } => {
+                match task
+                    .pool
+                    .lock()
+                    .unwrap()
+                    .alloc(&task.device, slot_len, None)
+                {
+                    Ok((slot, block)) => {
+                        let p = MeshPlaced {
+                            slot,
+                            stream: Arc::clone(stream),
+                            page: *page,
+                            clas: Vec::new(),
+                            micromap: None,
+                        };
+                        (Some(Placed::MeshPage(p)), Some(block))
+                    }
                     Err(e) => {
                         task.fail(load.what, e);
                         continue;
@@ -932,7 +1221,12 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
         // Bytes go straight into a mapped pool slot, else into the staging pool.
         let staging = match block.filter(|b| b.cpu().is_some()) {
             Some(_) => None,
-            None => match task.staging.lock().unwrap().alloc(&task.device, len, None) {
+            None => match task
+                .staging
+                .lock()
+                .unwrap()
+                .alloc(&task.device, slot_len, None)
+            {
                 Ok(s) => Some(s),
                 Err(e) => {
                     task.free(placed, None);
@@ -950,12 +1244,17 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
             chunk,
             Box::new(move |stored| {
                 let load = &t.loads[i];
+                let mut mesh = None;
                 let result = stored.and_then(|stored| {
                     decoded(&load.source.archive, &b, chunk, stored, |bytes| {
                         if bytes.len() as u64 != len {
                             return Err(orr_pack::Error::Malformed("streamed blob length").into());
                         }
                         let dst = staging.map_or_else(|| block.expect("a pool slot"), |s| s.1);
+                        if let LoadKind::MeshPage { stream, page } = &load.kind {
+                            mesh = Some(decode_page(stream, *page, bytes, &dst, slot_len)?);
+                            return Ok(());
+                        }
                         let wrote = dst.write_mapped(0, bytes);
                         assert!(wrote, "a mapped slot");
                         Ok(())
@@ -971,17 +1270,20 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
                     },
                     staging: staging.map(|s| s.0),
                     staged_at: staging.map_or(0, |s| s.1.gpu()),
+                    mesh,
                     result: result.map_err(Arc::new),
                 };
                 if landed.result.is_err() {
                     t.free(landed.placed.take(), landed.staging.take());
                 } else if let Some((_, s)) = staging {
                     let copy = match (&load.kind, block) {
-                        (LoadKind::Pool { .. }, Some(block)) => Some(Copy::Buffer {
-                            src: s.gpu(),
-                            dst: block.gpu(),
-                            bytes: len,
-                        }),
+                        (LoadKind::Pool { .. } | LoadKind::MeshPage { .. }, Some(block)) => {
+                            Some(Copy::Buffer {
+                                src: s.gpu(),
+                                dst: block.gpu(),
+                                bytes: slot_len,
+                            })
+                        }
                         (LoadKind::User { target, .. }, _) => Some(match target {
                             BlobTarget::Buffer { at, .. } => Copy::Buffer {
                                 src: s.gpu(),
@@ -1008,31 +1310,63 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
     task.end(loading);
 }
 
+/// Expands a streamed mesh page's stored bytes into `dst` (`len` bytes) and reads its
+/// clusters.
+fn decode_page(
+    stream: &MeshStream,
+    page: u32,
+    stored: &[u8],
+    dst: &Block,
+    len: u64,
+) -> Result<MeshLanded> {
+    PAGE.with_borrow_mut(|resident| {
+        resident.resize(len as usize, 0);
+        orr_pack::mesh::decode_page(stored, resident)?;
+        let view = PageView::new(resident, &stream.header)?;
+        if view.cluster_count() != stream.pages[page as usize].clusters {
+            return Err(orr_pack::Error::Malformed("streamed page cluster count").into());
+        }
+        let (clusters, region) = page_infos(&view, resident, page);
+        let wrote = dst.write_mapped(0, resident);
+        assert!(wrote, "a mapped slot");
+        Ok(MeshLanded {
+            clusters,
+            region,
+            slots: Vec::new(),
+            micromap: None,
+        })
+    })
+}
+
 /// Ends a stream task on the loading thread: unbinds the evicted tiles and binds the new
-/// ones, copies the tiles in on the loading queue, submits the other copies and hands the
-/// batch to the render thread.
+/// ones, copies the tiles in on the loading queue, submits the other copies, builds the
+/// streamed mesh pages' CLAS and hands the batch to the render thread.
 pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<StreamTask>) {
     let mut loads = std::mem::take(&mut *task.done.lock().unwrap());
     let copies = std::mem::take(&mut *task.copies.lock().unwrap());
-    let points = match submit(device, task, &loads, &copies) {
+    let (points, clas) = match submit(device, task, &mut loads, &copies) {
         Ok(p) => p,
         Err(e) => {
             let e = Arc::new(e);
             for l in &mut loads {
                 l.result = Err(Arc::clone(&e));
             }
-            Vec::new()
+            (Vec::new(), None)
         }
     };
-    loading.push_stream(StreamBatch { points, loads });
+    loading.push_stream(StreamBatch {
+        points,
+        loads,
+        clas,
+    });
 }
 
 fn submit(
     device: &Device,
     task: &StreamTask,
-    loads: &[Landed],
+    loads: &mut [Landed],
     copies: &[Copy],
-) -> Result<Vec<TimelinePoint>> {
+) -> Result<(Vec<TimelinePoint>, Option<PoolBatch>)> {
     let mut points = Vec::new();
     let bound: Vec<(&Arc<TexStream>, u32, PoolSlot, u64)> = loads
         .iter()
@@ -1112,7 +1446,72 @@ fn submit(
         }
         points.push(queue.submit(vec![list], &[])?);
     }
-    Ok(points)
+    let clas = match &task.clas {
+        Some(pool) => build_clas(device, task, pool, loads, &mut points)?,
+        None => None,
+    };
+    Ok((points, clas))
+}
+
+/// Builds the CLAS of a batch's streamed mesh pages on the loading queue after its other
+/// work, and applies the pool's queued frees and takes; none when there is neither.
+fn build_clas(
+    device: &Device,
+    task: &StreamTask,
+    pool: &Mutex<ClasPool>,
+    loads: &mut [Landed],
+    points: &mut Vec<TimelinePoint>,
+) -> Result<Option<PoolBatch>> {
+    let mut pool = pool.lock().unwrap();
+    let pages: Vec<usize> = (0..loads.len())
+        .filter(|&i| loads[i].result.is_ok() && loads[i].mesh.is_some())
+        .collect();
+    if pages.is_empty() && !pool.pending() {
+        return Ok(None);
+    }
+    let builds: Vec<PageBuild<'_>> = pages
+        .iter()
+        .map(|&i| {
+            let l = &loads[i];
+            let Some(Placed::MeshPage(p)) = &l.placed else {
+                unreachable!("a mesh page load")
+            };
+            let m = l.mesh.as_ref().expect("decoded");
+            let header = &p.stream.header;
+            PageBuild {
+                page: l.gpu,
+                clusters: &m.clusters,
+                cluster_base: p.stream.cluster_base + p.stream.pages[p.page as usize].first,
+                micromap: m.region,
+                step: header.step(),
+                truncate_bits: u32::from(header.clas_truncate_bits),
+                non_opaque: &p.stream.non_opaque,
+            }
+        })
+        .collect();
+    let queue = first_queue(device, &[QueueKind::Loading, QueueKind::Render]);
+    let mut list = queue.command_list()?;
+    let k = &task.accel.kernels;
+    let triangles = task.accel.limits.clas_triangles;
+    let out = clas_pool::build_pages(
+        &mut pool,
+        device,
+        k,
+        &mut list,
+        &builds,
+        triangles,
+        &task.staging,
+    )?;
+    drop(builds);
+    let mut wait = points.clone();
+    wait.extend(out.bind);
+    points.push(queue.submit(vec![list], &wait)?);
+    for ((&i, slots), micromap) in pages.iter().zip(out.slots).zip(out.micromaps) {
+        let m = loads[i].mesh.as_mut().expect("decoded");
+        m.slots = slots;
+        m.micromap = micromap;
+    }
+    Ok(Some(out.batch))
 }
 
 fn first_queue<'d>(device: &'d Device, kinds: &[QueueKind]) -> &'d orr_gpu::Queue {
