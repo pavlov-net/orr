@@ -24,8 +24,10 @@
 //! textures have no factor.
 
 use std::borrow::Cow;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ctt::Quality;
 use orr_color::RgbPrimaries;
@@ -36,10 +38,11 @@ use orr_pack::{AssetId, Class, Hash32};
 use rayon::prelude::*;
 use serde::Deserialize;
 
-use super::load::{self, Source};
+use super::load::{self, Blocks, Source};
 use super::mips::{MipSpec, Toksvig, normalized};
 use super::neural::{self, NeuralJob, NeuralSettings};
 use super::{Built, DataFormat, Encoding, Img, MipFilter, Plan, Primaries, Wrap, srgb_to_linear};
+use crate::decoded::Decoded;
 use crate::key::Key;
 use crate::state::{self, Memo};
 use crate::{Error, Result};
@@ -372,8 +375,8 @@ pub(crate) struct TextureJob {
     pub key: Hash32,
     asset: String,
     pack: Pack,
-    /// Source images, sorted.
-    images: Vec<usize>,
+    /// Source images, sorted, with their content hashes.
+    images: Vec<(usize, Hash32)>,
     size: [u32; 2],
     quality: Quality,
     max_size: Option<u32>,
@@ -1066,6 +1069,7 @@ impl<'a> Packer<'a> {
             .bytes(&recipe)
             .finish();
         let id = AssetId::from_name(&name);
+        let job_images = images.iter().map(|&i| (i, self.image(i).hash)).collect();
         self.made.insert(same, id);
         self.by_id.insert(id, self.jobs.len());
         self.jobs.push(TextureJob {
@@ -1073,7 +1077,7 @@ impl<'a> Packer<'a> {
             key,
             asset: self.asset.into(),
             pack: p,
-            images,
+            images: job_images,
             size,
             quality: self.quality,
             max_size,
@@ -1111,22 +1115,30 @@ impl TextureJob {
     /// Estimated peak bytes: 8 per compressed source byte for the decoded sources, 48 per
     /// output texel for the packed image and its chain.
     pub(crate) fn working_set(&self, images: &[ImageFile]) -> u64 {
-        let sources: u64 = self.images.iter().map(|&i| images[i].len() * 8).sum();
+        let sources: u64 = self.images.iter().map(|&(i, _)| images[i].len() * 8).sum();
         sources + u64::from(self.size[0]) * u64::from(self.size[1]) * 48
     }
 
-    pub(crate) fn run(&self, images: &[ImageFile]) -> Result<Built> {
+    pub(crate) fn run(&self, images: &[ImageFile], decoded: &Decoded<Img>) -> Result<Built> {
         let fail = |e: String| self.fail(format!("texture {}: {e}", self.pack.role));
         let built = match self.pass {
-            Some(pass) => self.pass_through(pass, images).map_err(fail)?,
-            None => super::finish(vec![self.chain(images)?], &self.plan(None)).map_err(fail)?,
+            Some(pass) => self.pass_through(pass, images, decoded).map_err(fail)?,
+            None => {
+                let chain = self.chain(images, decoded)?;
+                super::finish(vec![chain], &self.plan(None)).map_err(fail)?
+            }
         };
         Ok(built.with_split(self.bc_split))
     }
 
     /// The texture from the source's blocks: every mip as stored (without those over
     /// `max_size`), or mip 0 as stored and the rest made from it.
-    fn pass_through(&self, pass: Pass, images: &[ImageFile]) -> Result<Built, String> {
+    fn pass_through(
+        &self,
+        pass: Pass,
+        images: &[ImageFile],
+        decoded: &Decoded<Img>,
+    ) -> Result<Built, String> {
         let src = {
             let _z = crate::profile::zone!("texture.open");
             let bytes = images[pass.image].bytes().map_err(|e| e.to_string())?;
@@ -1156,7 +1168,7 @@ impl TextureJob {
         } else {
             let first = half(&b.levels[0][0]);
             let (img, plan) = self
-                .prepare(images, Some((pass.image, src)))
+                .prepare(images, decoded, Some((pass.image, src)))
                 .map_err(|e| e.to_string())?;
             // Mip 0 keeps the source's blocks.
             let mut chain = super::chains(vec![img], &plan, 1)?.remove(0);
@@ -1178,11 +1190,11 @@ impl TextureJob {
     }
 
     /// The mip chain [`Self::run`] encodes.
-    pub(crate) fn chain(&self, images: &[ImageFile]) -> Result<Vec<Img>> {
+    pub(crate) fn chain(&self, images: &[ImageFile], decoded: &Decoded<Img>) -> Result<Vec<Img>> {
         if self.source_mips {
-            return self.source_chain(images);
+            return self.source_chain(images, decoded);
         }
-        let (img, plan) = self.prepare(images, None)?;
+        let (img, plan) = self.prepare(images, decoded, None)?;
         super::chains(vec![img], &plan, 0)
             .map(|mut c| c.remove(0))
             .map_err(|e| self.fail(format!("texture {}: {e}", self.pack.role)))
@@ -1214,69 +1226,68 @@ impl TextureJob {
     fn prepare(
         &self,
         images: &[ImageFile],
+        decoded: &Decoded<Img>,
         mut opened: Option<(usize, Source)>,
     ) -> Result<(Img, Plan)> {
         let _z = crate::profile::zone!("texture.prepare");
         let fail = |message: String| self.fail(message);
-        let mut decoded = HashMap::new();
-        for &i in &self.images {
-            let img = match opened.take_if(|o| o.0 == i) {
+        let mut sources = HashMap::new();
+        for &(i, hash) in &self.images {
+            let opened = opened.take_if(|o| o.0 == i);
+            let img = decoded.get((hash, 0), || match opened {
                 Some((_, mut src)) => {
                     load::decode_layers(&mut src).map_err(&fail)?;
-                    src.layers.remove(0)
+                    Ok(src.layers.remove(0))
                 }
-                None => decode(&images[i].bytes()?).map(|d| d.0).map_err(&fail)?,
-            };
-            decoded.insert(i, img.resized(self.size[0], self.size[1]));
+                None => decode(&images[i].bytes()?).map(|d| d.0).map_err(&fail),
+            })?;
+            sources.insert(i, img.resized(self.size[0], self.size[1]));
         }
-        let img = self.pack(&decoded, self.size);
+        let img = self.pack(&sources, self.size);
         let toksvig = self.pack.toksvig.as_ref().map(|(channel, r, scale)| {
-            let mut n = decoded
-                .remove(&r.image)
-                .expect("the normal map is a source image");
-            for t in &mut n.px {
-                *t = [
+            let n = &sources[&r.image];
+            let px = n.px.iter().map(|t| {
+                [
                     (2.0 * t[0] - 1.0) * scale,
                     (2.0 * t[1] - 1.0) * scale,
                     2.0 * t[2] - 1.0,
                     1.0,
-                ];
-            }
+                ]
+            });
             Toksvig {
                 channel: *channel,
-                normals: n,
+                normals: Img {
+                    w: n.w,
+                    h: n.h,
+                    px: px.collect(),
+                },
             }
         });
-        drop(decoded);
         Ok((img, self.plan(toksvig)))
     }
 
     /// The packed chain from the source images' own mips, without those over `max_size`.
-    fn source_chain(&self, images: &[ImageFile]) -> Result<Vec<Img>> {
+    fn source_chain(&self, images: &[ImageFile], decoded: &Decoded<Img>) -> Result<Vec<Img>> {
         let _z = crate::profile::zone!("texture.source_mips");
         let fail = |message: String| self.fail(message);
-        let mut sources = Vec::with_capacity(self.images.len());
-        for &i in &self.images {
-            let src = load::open(&images[i].bytes()?).map_err(&fail)?;
-            let b = src
-                .blocks
-                .ok_or_else(|| fail("the image no longer holds blocks".into()))?;
-            if [b.w, b.h] != self.size || !b.complete() {
-                return Err(fail("the image's mips changed".into()));
-            }
-            sources.push((i, b));
-        }
+        let mut sources = HashMap::new();
         let [w, h] = self.size;
         (super::skipped_mips(w, h, self.max_size)..full_mip_count(w, h))
             .map(|m| {
                 let [mw, mh] = mip_size(w, h, m);
-                let mut decoded = HashMap::new();
-                for (i, b) in &sources {
-                    let img = load::decode_blocks(b.vk_format, mw, mh, &b.levels[0][m as usize])
-                        .map_err(&fail)?;
-                    decoded.insert(*i, img);
+                let mut mips = HashMap::new();
+                for &(i, hash) in &self.images {
+                    let img = decoded.get((hash, m), || {
+                        if let Entry::Vacant(e) = sources.entry(i) {
+                            e.insert(self.source_blocks(images, i)?);
+                        }
+                        let b: &Blocks = &sources[&i];
+                        load::decode_blocks(b.vk_format, mw, mh, &b.levels[0][m as usize])
+                            .map_err(&fail)
+                    })?;
+                    mips.insert(i, img);
                 }
-                let mut img = self.pack(&decoded, [mw, mh]);
+                let mut img = self.pack(&mips, [mw, mh]);
                 if self.pack.normal {
                     img.px.par_iter_mut().for_each(|p| *p = normalized(*p));
                 }
@@ -1285,8 +1296,20 @@ impl TextureJob {
             .collect()
     }
 
+    /// The blocks of source image `i`, which must still hold every mip at the texture's size.
+    fn source_blocks(&self, images: &[ImageFile], i: usize) -> Result<Blocks> {
+        let src = load::open(&images[i].bytes()?).map_err(|m| self.fail(m))?;
+        let b = src
+            .blocks
+            .ok_or_else(|| self.fail("the image no longer holds blocks".into()))?;
+        if [b.w, b.h] != self.size || !b.complete() {
+            return Err(self.fail("the image's mips changed".into()));
+        }
+        Ok(b)
+    }
+
     /// The packed texture of `decoded` source images, each `w` x `h`.
-    fn pack(&self, decoded: &HashMap<usize, Img>, [w, h]: [u32; 2]) -> Img {
+    fn pack(&self, decoded: &HashMap<usize, Arc<Img>>, [w, h]: [u32; 2]) -> Img {
         let mut img = Img::new(w, h);
         for (c, ch) in self.pack.channels.iter().enumerate() {
             match *ch {

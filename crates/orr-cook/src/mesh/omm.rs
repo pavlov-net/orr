@@ -477,7 +477,7 @@ mod tests {
         let mut raster = Raster {
             w,
             h,
-            texels,
+            texels: std::sync::Arc::new(texels),
             wrap: [Wrap::Repeat; 2],
             uv: [0.0; 6],
         };
