@@ -15,6 +15,8 @@ const PACK_TYPES: &[(&str, &str)] = &[
         "::orr_pack::instance::InstancePageHeader",
     ),
     ("InstanceRecord", "::orr_pack::instance::InstanceRecord"),
+    ("VolumeGpu", "::orr_pack::volume::VolumeGpu"),
+    ("VolumeGridGpu", "::orr_pack::volume::VolumeGridGpu"),
 ];
 
 fn main() {

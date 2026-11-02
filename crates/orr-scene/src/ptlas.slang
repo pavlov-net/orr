@@ -9,7 +9,10 @@
 // `commands` the build's one command per record type. `producer_want` and `producer_emit`
 // do the same for producer entries: an entry's instance at `producer_base + id`, in the
 // global partition, is rewritten as mandatory work every frame it builds, moves or the
-// render origin moves, and null-written when it has nothing to trace.
+// render origin moves, and null-written when it has nothing to trace. `proxy_write` writes
+// the instances of the medium proxies set or cleared since the last build, and of every set
+// one when the render origin moves, at `proxy_base + id` in the global partition, as
+// mandatory work.
 //
 // A traced copy inside its animation range whose cut has animated part clusters holds a
 // run of part instances, one per animated part: its body instance traces the cut's body
@@ -149,10 +152,12 @@ public struct PtlasRoot
     public uint slots;            // slots to walk
     public uint budget;           // rebuilt instances beyond mandatory work
     public uint flags;            // PTLAS_*
-    public uint _pad0;
+    public uint proxies;          // medium proxies set
     public TranslateJob* translate_jobs;
     public uint translate_count;
-    public uint _pad;
+    public uint proxy_job_count;
+    public uint* proxy_jobs;      // medium proxies whose instance this frame writes
+    public uint64_t proxy_blas;   // the BLAS every medium proxy traces
 }
 ORR_ROOT(PtlasRoot);
 
@@ -164,7 +169,7 @@ uint global_partition()
 uint partition_cost(uint p)
 {
     PtlasGpu* t = root.ptlas;
-    return p < t.partition_count ? t.partitions[p].count : max(t.counters[COUNTER_GLOBAL] + t.counters[COUNTER_PRODUCERS], 1u);
+    return p < t.partition_count ? t.partitions[p].count : max(t.counters[COUNTER_GLOBAL] + t.counters[COUNTER_PRODUCERS] + root.proxies, 1u);
 }
 
 // Integer cell distance of a partition from the focus.
@@ -971,6 +976,38 @@ void producer_emit(uint3 id: SV_DispatchThreadID)
     if (!write && was)
         InterlockedAdd(t.counters[COUNTER_PRODUCERS], uint(-1));
     st.rt_flags = write ? PRODUCER_RT_WRITTEN : 0;
+}
+
+// One thread per medium proxy job: its instance written over the proxy BLAS in render space,
+// or null-written once it is cleared. Runs beside `want`, so its charge is in before the
+// cutoff.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void proxy_write(uint3 id: SV_DispatchThreadID)
+{
+    SceneRoot* s = root.scene;
+    PtlasGpu* t = root.ptlas;
+    if (id.x >= root.proxy_job_count)
+        return;
+    if (id.x == 0)
+        charge_write(global_partition(), true);
+    uint e = root.proxy_jobs[id.x];
+    uint index;
+    if (!reserve(COUNTER_WRITES, t.write_capacity, 1, index))
+        return;
+    MediumProxyGpu p = s.proxies[e];
+    PtlasWrite w = (PtlasWrite)0;
+    w.instance_index = s.proxy_base + e;
+    w.partition = PTLAS_GLOBAL_PARTITION;
+    if ((p.flags & PROXY_LIVE) != 0)
+    {
+        Placement pl;
+        pl.linear = transpose(float3x3(p.axis_x, p.axis_y, p.axis_z));
+        pl.translation = float3((p.cell - s.origin_cell.xyz) << uint(s.origin_cell.w)) + p.offset;
+        pl.scale = max(length(p.axis_x), max(length(p.axis_y), length(p.axis_z)));
+        w = instance_write(w.instance_index, global_partition(), pl, float3(-1.0), float3(1.0), root.proxy_blas, CLASS_MEDIUM);
+    }
+    store((uint64_t)t.writes, index, w);
 }
 
 [shader("compute")]

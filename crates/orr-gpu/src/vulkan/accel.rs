@@ -56,6 +56,13 @@ pub enum ClassicGeometry {
         end_caps: LssEndCaps,
         opaque: bool,
     },
+    /// `count` axis-aligned boxes, each `[min x, min y, min z, max x, max y, max z]`. Rays
+    /// see each box they cross as a procedural candidate whose primitive index is the box's.
+    Aabbs {
+        boxes: GpuPtr<[f32; 6]>,
+        count: u32,
+        opaque: bool,
+    },
     /// `capacity` [`ClassicInstance`] records at `records`; a record with BLAS address 0 is
     /// inactive and invisible to every ray.
     Instances { records: GpuAddress, capacity: u32 },
@@ -278,6 +285,20 @@ fn with_geometry<R>(
                 ..Default::default()
             };
             f(&[g], segment_count)
+        }
+        ClassicGeometry::Aabbs {
+            boxes,
+            count,
+            opaque,
+        } => {
+            let aabbs = vk::AccelerationStructureGeometryAabbsDataKHR::default()
+                .data(address(boxes.address()))
+                .stride(24);
+            let g = vk::AccelerationStructureGeometryKHR::default()
+                .geometry_type(vk::GeometryTypeKHR::AABBS)
+                .geometry(vk::AccelerationStructureGeometryDataKHR { aabbs })
+                .flags(geometry_flags(opaque));
+            f(&[g], count)
         }
         ClassicGeometry::Instances { records, capacity } => {
             let instances =

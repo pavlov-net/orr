@@ -33,6 +33,7 @@ mod emissive;
 mod lights;
 mod loading;
 mod material;
+mod medium_proxy;
 pub mod memory;
 mod mount;
 mod pattern;
@@ -61,6 +62,7 @@ mod world;
 
 pub use orr_gpu;
 pub use orr_pack;
+pub use orr_pack::volume::{VolumeGpu, VolumeGridGpu};
 pub use orr_shaders::{PathEntry, abi};
 
 pub use arena::{
@@ -72,6 +74,7 @@ pub use emissive::{EmissiveSpan, ModelEmission, emissive_spans};
 pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId};
 pub use loading::Loading;
 pub use material::{BoundTexture, MaterialId, MaterialWriter, material_flags};
+pub use medium_proxy::{MediumProxy, MediumProxyId, ProxyDensity, VolumeRef};
 pub use mount::{ClipRef, InstancePage, LoadState, MountId, PackSource, PageId, SkeletonRef};
 pub use pipelines::{PipelineId, ReloadReport};
 pub use producer::{
@@ -89,7 +92,7 @@ pub use scenes::{
 pub use shaders::types::{
     BlasJob, ClusterRef, ClusterWork, CutGpu, CutKey, DecalBinGpu, DecalGpu, EmissiveGpu,
     FeedbackGpu, GBufferGpu, GeneratedClusterGpu, GroupGpu, InstanceGpu, LightGpu, MaskGpu,
-    MaterialGpu, MeshGpu, MeshLevel, ModelGpu, NodeItem, PartGpu, ProducerBatch,
+    MaterialGpu, MediumProxyGpu, MeshGpu, MeshLevel, ModelGpu, NodeItem, PartGpu, ProducerBatch,
     ProducerClusterGpu, ProducerGpu, ProducerStateGpu, RasterGpu, RasterRoot, RtCutGpu, SceneRoot,
     SkinMeshGpu, SkinStateGpu, SkinnedGpu, SkyStats, SlotCutGpu, SlotStateGpu, TessStateGpu,
     TextureFeedbackGpu, TextureStreamGpu, TopologyGpu, VisibleCluster,

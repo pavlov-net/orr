@@ -2,9 +2,9 @@
 // and presence layers multiplies what each non-opaque candidate lets through, committing
 // none: a dielectric passes its unbent transmission and the Beer transmittance of its
 // interior over the distance the ray spends inside, a presence layer or particle 1 minus its
-// opacity, a medium proxy a short march of the linked medium inside its box. Alpha-tested
+// opacity, a medium proxy a short march of its own medium inside its box. Alpha-tested
 // candidates pass or stop the ray by the alpha test, and an opaque hit stops it. The linked
-// medium's own transmittance covers the medium outside proxies.
+// medium's transmittance covers the scene's medium, which proxies add to.
 module shadow;
 
 import orr.abi;
@@ -23,8 +23,9 @@ public static const uint SHADOW_MASK = MASK_OPAQUE | MASK_PARTICLE | MASK_MEDIUM
 // Alpha-tested candidates do not count.
 public static const uint SHADOW_CANDIDATES = 16;
 
-// Jittered steps of a medium proxy's march.
-public static const uint PROXY_STEPS = 8;
+// Steps a medium proxy's march takes at most over the ray's span inside it; spans longer than
+// this many voxels step farther than a voxel.
+public static const uint PROXY_STEPS = 64;
 
 // The IOR outside every interior.
 public static const float AMBIENT_IOR = 1.0;
@@ -126,8 +127,11 @@ public struct ShadowCandidates<S : ISurface, M : IMedium> : ICandidate
         return bsdf_straight_transmission(sh.surface.bsdf, n, dir, AMBIENT_IOR);
     }
 
-    // A medium proxy is the cube [-1, 1]^3 in its instance's object space: the march covers
-    // the ray's span inside it.
+    // A medium proxy is the cube [-1, 1]^3 in its instance's object space. The ray's span
+    // inside it takes Beer's law for a proxy without a volume. With one, a march at the
+    // volume's voxel spacing (farther past PROXY_STEPS voxels), jittered once per ray, sums
+    // the optical depth over the majorant cells that are not empty and skips the rest. The
+    // object ray shares the ray's t, and `dir` is unit, so t is in meters.
     float3 proxy(Candidate c)
     {
         float3 o = c.object_origin;
@@ -141,12 +145,33 @@ public struct ShadowCandidates<S : ISurface, M : IMedium> : ICandidate
         float t1 = min(min(hi.x, min(hi.y, hi.z)), t_max);
         if (!(t1 > t0))
             return float3(1.0);
+        MediumProxyGpu p = scene_proxy(scene, c.instance_index);
+        if (p.volume == nullptr)
+            return exp(-max(p.extinction, 0.0) * (t1 - t0));
         uint3 key = uint3(asuint(origin.x) ^ (c.instance_index * 0x9E3779B9u), asuint(origin.y) ^ (c.primitive_index * 0x85EBCA6Bu), asuint(origin.z) ^ scene.frame_index);
         float jitter = unit_float(pcg3d(key).x);
-        float dt = (t1 - t0) / float(PROXY_STEPS);
+        float h = max(proxy_voxel_step(p, d), (t1 - t0) / float(PROXY_STEPS));
+        // Steps sit at t0 + (k + jitter) h; `next` is the first k not yet taken.
+        uint next = 0;
         float3 tau = float3(0.0);
-        for (uint k = 0; k < PROXY_STEPS; k++)
-            tau += M.sample(scene.medium, origin + dir * (t0 + (float(k) + jitter) * dt)).sigma_t * dt;
+        float t = t0;
+        // The cap on cells only guards against a walk that stops advancing.
+        for (uint cell = 0; cell < 4 * PROXY_STEPS && t < t1; cell++)
+        {
+            float t_exit;
+            float m = proxy_majorant_span(p, o, d, t, t_exit);
+            float end = min(max(t_exit, t + 1e-5 * (t1 - t0)), t1);
+            uint k = max(next, uint(max(ceil((t - t0) / h - jitter), 0.0)));
+            for (; m > 0.0 && k < PROXY_STEPS + 1; k++)
+            {
+                float x = t0 + (float(k) + jitter) * h;
+                if (x >= end)
+                    break;
+                tau += proxy_medium(p, o + d * x).sigma_t * h;
+            }
+            next = k;
+            t = end;
+        }
         return exp(-max(tau, 0.0));
     }
 }

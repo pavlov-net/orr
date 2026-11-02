@@ -20,6 +20,7 @@ use orr_pack::mesh::{Cluster, MeshHeader, MeshInfo, NodePage, PageHeader, PageVi
 use orr_pack::model::ModelInfo;
 use orr_pack::subd::{Page as SubdPage, SubdInfo};
 use orr_pack::texture::{TextureHeader, TextureInfo};
+use orr_pack::volume::VolumeInfo;
 use orr_pack::{Aabb, Archive, AssetId, Class, Codec};
 
 use crate::accel::{
@@ -28,6 +29,7 @@ use crate::accel::{
 use crate::emissive::{EmissiveSpan, ModelEmission, indexed_spans};
 use crate::loading::{ArchiveFile, BlobSource, Loading, Msg, decoded, read_stored};
 use crate::material::{BoundTexture, MaterialId, MaterialTable, candidate_class};
+use crate::medium_proxy::VolumeRef;
 use crate::memory::{Block, RangeAllocator, UploadWindow};
 use crate::residency::{ResidencyClass, Start, UnitDesc};
 use crate::scene::{ModelCpu, ModelId, SkinShape};
@@ -213,6 +215,7 @@ struct Placed {
     skeletons: Vec<(AssetId, SkeletonRef)>,
     clips: Vec<(AssetId, ClipRef)>,
     cages: Vec<PlacedCage>,
+    volumes: Vec<(AssetId, VolumeRef)>,
 }
 
 /// One mount on the loading side, shared by its jobs and reads.
@@ -555,6 +558,7 @@ fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
                 | Class::Skeleton
                 | Class::Clip
                 | Class::Subd
+                | Class::Volume
         ) {
             continue;
         }
@@ -580,7 +584,48 @@ fn plan(t: &Arc<MountTask>, archive: Archive) -> Result<()> {
             Class::Skeleton => fetch(t, i, 0, move |t, b| place_skeleton(t, id, b)),
             Class::Clip => fetch(t, i, 0, move |t, b| place_clip(t, i, id, b)),
             Class::Subd => fetch(t, i, 0, move |t, b| place_subd(t, i, id, b)),
+            Class::Volume => fetch(t, i, 0, move |t, b| place_volume(t, i, id, b)),
             _ => fetch(t, i, 0, move |t, b| place_page(t, i, id, b)),
+        }
+    }
+    Ok(())
+}
+
+/// A volume's blob 0, then its majorants and every page, into one block laid out by
+/// `VolumeInfo::resident_layout`.
+fn place_volume(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Result<()> {
+    let info = VolumeInfo::parse(blob0)?;
+    let layout = info.resident_layout();
+    let block = t.block(layout.size, "volume")?;
+    t.write(block, 0, &info.resident_head(&layout, block.gpu()))?;
+    let r = VolumeRef {
+        // SAFETY: the record is resident at the start of the mount's block.
+        volume: unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu())) },
+        bounds: info.header.bounds,
+        grids: info.names.clone().into(),
+    };
+    t.placed.lock().unwrap().volumes.push((id, r));
+    let cells = info.header.majorant_cells.iter().product::<u32>() as usize;
+    let majorant_bytes = 4 * cells * info.grids.len();
+    let at = layout.majorants;
+    fetch(t, entry, 1, move |t, b| {
+        if b.len() != majorant_bytes {
+            return Err(orr_pack::Error::Malformed("volume majorants").into());
+        }
+        t.write(block, at, b)
+    });
+    for (g, grid) in info.grids.iter().enumerate() {
+        let per_page = grid.bricks_per_page();
+        let count = grid.bricks.count as usize;
+        for p in 0..grid.pages.count as usize {
+            let bytes = (count - p * per_page).min(per_page) * grid.brick_bytes();
+            let at = layout.page(&info, g, p);
+            fetch(t, entry, grid.pages.first as usize + p, move |t, b| {
+                if b.len() != bytes {
+                    return Err(orr_pack::Error::Malformed("volume page").into());
+                }
+                t.write(block, at, b)
+            });
         }
     }
     Ok(())
@@ -1160,6 +1205,7 @@ pub(crate) struct Resolved {
     skeletons: Vec<(AssetId, SkeletonRef)>,
     clips: Vec<(AssetId, ClipRef)>,
     cages: Vec<PlacedCage>,
+    volumes: Vec<(AssetId, VolumeRef)>,
     accel: MountAccel,
     /// Resident cluster id ranges taken for the mount's meshes.
     cluster_ranges: Vec<(u32, u32)>,
@@ -1330,6 +1376,7 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
         skeletons: p.skeletons,
         clips: p.clips,
         cages: p.cages,
+        volumes: p.volumes,
         accel: MountAccel::default(),
         cluster_ranges: Vec::new(),
     })
@@ -1539,6 +1586,7 @@ pub(crate) struct Resident {
     pub pages: HashMap<AssetId, PageId>,
     pub skeletons: HashMap<AssetId, SkeletonRef>,
     pub clips: HashMap<AssetId, ClipRef>,
+    pub volumes: HashMap<AssetId, VolumeRef>,
     /// Where the mount's blobs are read from, for requested blobs.
     source: Arc<BlobSource>,
     meshes: Vec<u32>,
@@ -1898,7 +1946,7 @@ impl Mounts {
             .unwrap_or_default()
     }
 
-    pub(crate) fn lookup<T: Copy>(
+    pub(crate) fn lookup<T: Clone>(
         &self,
         m: MountId,
         id: AssetId,
@@ -1906,7 +1954,7 @@ impl Mounts {
     ) -> Result<T> {
         table(self.resident(m)?)
             .get(&id)
-            .copied()
+            .cloned()
             .ok_or(Error::Missing {
                 mount: m,
                 asset: id,
@@ -2036,6 +2084,7 @@ impl Mounts {
             pages: HashMap::new(),
             skeletons: r.skeletons.into_iter().collect(),
             clips: r.clips.into_iter().collect(),
+            volumes: r.volumes.into_iter().collect(),
             source: Arc::clone(&r.source),
             meshes: Vec::new(),
             rt: Vec::new(),
