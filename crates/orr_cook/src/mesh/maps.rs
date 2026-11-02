@@ -3,6 +3,7 @@
 //! displacement.
 
 use crate::texture::Wrap;
+use rayon::prelude::*;
 
 /// One mip of one channel, row-major, with the sampler's edge modes and the material
 /// slot's uv transform (`Material::uv_transforms` form).
@@ -32,15 +33,17 @@ impl Passes {
             "opacity texture over 65535 texels wide"
         );
         let w = mip.w as usize;
-        let mut prefix = Vec::with_capacity((w + 1) * mip.h as usize);
-        for row in mip.texels.chunks_exact(w) {
-            let mut n = 0u16;
-            prefix.push(0);
-            for &t in row {
-                n += u16::from(t >= cutoff);
-                prefix.push(n);
-            }
-        }
+        let mut prefix = vec![0; (w + 1) * mip.h as usize];
+        prefix
+            .par_chunks_mut(w + 1)
+            .zip(mip.texels.par_chunks(w))
+            .for_each(|(out, row)| {
+                let mut n = 0u16;
+                for (o, &t) in out[1..].iter_mut().zip(row) {
+                    n += u16::from(t >= cutoff);
+                    *o = n;
+                }
+            });
         Self { prefix }
     }
 

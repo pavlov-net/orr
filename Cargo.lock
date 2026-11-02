@@ -2072,6 +2072,7 @@ dependencies = [
  "gltf",
  "half",
  "image",
+ "ktx2",
  "libc",
  "libloading 0.9.0",
  "meshopt",

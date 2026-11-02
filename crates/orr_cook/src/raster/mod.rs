@@ -12,6 +12,7 @@ mod texel;
 
 use std::path::{Path, PathBuf};
 
+use ctt::Quality;
 use orr_pack::raster::{self, RasterLayer, RasterSetHeader, RasterSetInfo, TileKey, morton};
 use orr_pack::{ArchiveWriter, BlobIn, Class, EncodedBlob, Filter, GDeflate, Hash32, Span};
 use rayon::prelude::*;
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::key::Key;
 use crate::state::{Memo, read_checked};
-use crate::texture::{Encoding, Quality, encode_chains};
+use crate::texture::{Encoding, encode_chains};
 use crate::{Result, mount};
 use input::{Level, Scratch, Sidecar, TilePattern, WholeRaster, raster_error};
 pub use texel::{RasterFormat, Reduction};
@@ -62,9 +63,6 @@ pub struct RasterLayerSpec {
     /// Stores tiles as BCn through the texture encoders instead of the exact texels.
     #[serde(default)]
     pub compress: Option<RasterCompression>,
-    /// BCn encoder effort.
-    #[serde(default)]
-    pub quality: Quality,
 }
 
 fn default_border() -> u16 {
@@ -144,6 +142,7 @@ pub struct RasterReport {
 pub(crate) struct Plan {
     set: RasterSet,
     layers: Vec<LayerInput>,
+    quality: Quality,
 }
 
 #[derive(Debug)]
@@ -165,7 +164,7 @@ pub(crate) struct Planned {
 }
 
 /// Resolves and hashes the inputs of a raster set and computes its key.
-pub(crate) fn plan(asset: &str, set: &RasterSet, memo: &Memo) -> Result<Planned> {
+pub(crate) fn plan(asset: &str, set: &RasterSet, memo: &Memo, quality: Quality) -> Result<Planned> {
     let fail = |m: String| raster_error(asset, m);
     if set.layers.is_empty() {
         return Err(fail("a raster set needs a layer".into()));
@@ -194,7 +193,7 @@ pub(crate) fn plan(asset: &str, set: &RasterSet, memo: &Memo) -> Result<Planned>
             l.reduction,
             l.srgb,
             l.compress,
-            l.quality,
+            l.compress.map(|_| crate::texture::encoders(quality)),
         ));
         let input = match &l.input {
             RasterInput::Whole { path, tile_size } => {
@@ -273,6 +272,7 @@ pub(crate) fn plan(asset: &str, set: &RasterSet, memo: &Memo) -> Result<Planned>
         plan: Plan {
             set: set.clone(),
             layers,
+            quality,
         },
         key: key.finish(),
         files,
@@ -492,7 +492,9 @@ pub(crate) fn cook(
                 let batch = &tiles[at..end];
                 let raws: Vec<Vec<u8>> = batch
                     .par_iter()
-                    .map(|(t, src)| tile_bytes(asset, &layers[usize::from(t.layer)], src))
+                    .map(|(t, src)| {
+                        tile_bytes(asset, &layers[usize::from(t.layer)], src, plan.quality)
+                    })
                     .collect::<Result<_>>()?;
                 let encoded: Vec<Encoded> = raws
                     .par_iter()
@@ -540,7 +542,7 @@ fn tile_key(layer: usize, lod: u32, x: u32, y: u32) -> TileKey {
 }
 
 /// A tile's stored bytes: its texels, or BC blocks for a compressed layer.
-fn tile_bytes(asset: &str, l: &Layer, src: &TileSource) -> Result<Vec<u8>> {
+fn tile_bytes(asset: &str, l: &Layer, src: &TileSource, quality: Quality) -> Result<Vec<u8>> {
     let r = &l.record;
     let texels = match src {
         TileSource::Level(lod, x, y) => {
@@ -561,7 +563,7 @@ fn tile_bytes(asset: &str, l: &Layer, src: &TileSource) -> Result<Vec<u8>> {
         .format
         .stored()
         .to_img(l.spec.srgb, r.tile_texels(), &texels);
-    let mut out = encode_chains(c.encoding(), l.spec.quality, &[vec![img]])
+    let mut out = encode_chains(c.encoding(), quality, &[vec![img]])
         .map_err(|m| raster_error(asset, format!("layer {}: {m}", l.spec.name)))?;
     Ok(out.remove(0).remove(0))
 }

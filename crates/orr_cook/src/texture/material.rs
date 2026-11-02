@@ -3,12 +3,14 @@
 //!
 //! - Base color: BC7 sRGB (RGB). Under `MASK` and `BLEND`, base alpha times the opacity
 //!   factor becomes a BC4 opacity texture, with alpha-coverage mips at the cutoff under
-//!   `MASK`.
+//!   `MASK` unless it keeps its source's mips.
 //! - Normal: BC5, with the glTF normal scale applied.
 //! - Roughness and metalness share a BC5 (BC4 when only one varies); occlusion gets a BC4.
 //!   Factors are folded into these texels and the material's factors set to 1.
 //! - Roughness takes the normal map's variance per mip (Toksvig), so a material with a normal
-//!   map gets a roughness texture even when its roughness is constant.
+//!   map gets a roughness texture even when its roughness is constant. At the quality levels
+//!   that keep source mips, roughness that keeps them, and roughness beside a normal map
+//!   that keeps them, takes none.
 //! - Emission and subsurface color: BC7 sRGB.
 //! - Specular weight (the specular texture's alpha), coat and transmission weights (red):
 //!   BC4 each. Coat and transmission factors are folded into their texels and set to 1;
@@ -25,20 +27,19 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use ctt::Quality;
 use orr_color::RgbPrimaries;
 use orr_math::DVec3;
 use orr_pack::material::{Material, TextureBinding, slot};
-use orr_pack::texture::mip_size;
+use orr_pack::texture::{full_mip_count, mip_size};
 use orr_pack::{AssetId, Class, Hash32};
 use rayon::prelude::*;
 use serde::Deserialize;
 
 use super::load::{self, Source};
-use super::mips::{MipSpec, Toksvig};
+use super::mips::{MipSpec, Toksvig, normalized};
 use super::neural::{self, NeuralJob, NeuralSettings};
-use super::{
-    Built, DataFormat, Encoding, Img, MipFilter, Plan, Primaries, Quality, Wrap, srgb_to_linear,
-};
+use super::{Built, DataFormat, Encoding, Img, MipFilter, Plan, Primaries, Wrap, srgb_to_linear};
 use crate::key::Key;
 use crate::state::{self, Memo};
 use crate::{Error, Result};
@@ -47,7 +48,6 @@ use crate::{Error, Result};
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TextureRules {
-    pub quality: Quality,
     /// Largest mip 0 edge of every texture.
     pub max_size: Option<u32>,
     pub filter: MipFilter,
@@ -63,7 +63,6 @@ pub struct TextureRules {
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TextureOverride {
-    pub quality: Option<Quality>,
     pub max_size: Option<u32>,
     pub atlas_grid: Option<[u16; 2]>,
     pub primaries: Option<Primaries>,
@@ -268,15 +267,34 @@ pub(crate) fn image_facts(
 /// The facts of one image file's bytes.
 fn facts_of(bytes: &[u8], hash: Hash32) -> Result<ImageFacts, String> {
     let _z = crate::profile::zone!("texture.facts");
+    // A channel is constant when it spans at most one UNORM8 step.
+    const SPREAD: f32 = 1.0 / 255.0 + 1e-6;
+    let constant = |range: [(f32, f32); 4]| {
+        range.map(|(lo, hi)| (hi - lo <= SPREAD).then_some(0.5 * (lo + hi)))
+    };
+    if let Some(scan) = load::scan_ktx2(bytes, SPREAD) {
+        let s = scan?;
+        return Ok(ImageFacts {
+            w: s.w,
+            h: s.h,
+            srgb: s.srgb,
+            primaries: None,
+            constant: constant(s.range),
+            hash,
+            blocks: Some((s.vk_format, s.complete)),
+            rg: s.rg,
+        });
+    }
     let src = load::open(bytes)?;
     if src.cube || src.layers.len() > 1 || src.blocks.as_ref().is_some_and(|b| b.levels.len() != 1)
     {
         return Err("not a 2D image".into());
     }
-    // A channel is constant when it spans at most one UNORM8 step.
-    const SPREAD: f32 = 1.0 / 255.0 + 1e-6;
     let (w, h, range) = match &src.blocks {
-        Some(b) => (b.w, b.h, load::block_range(b, SPREAD)?),
+        Some(b) => {
+            let range = load::block_range(b.vk_format, b.w, b.h, &mut &b.levels[0][0][..], SPREAD)?;
+            (b.w, b.h, range)
+        }
         None => {
             let img = &src.layers[0];
             let range = std::array::from_fn(|c| {
@@ -287,13 +305,12 @@ fn facts_of(bytes: &[u8], hash: Hash32) -> Result<ImageFacts, String> {
             (img.w, img.h, range)
         }
     };
-    let constant = range.map(|(lo, hi)| (hi - lo <= SPREAD).then_some(0.5 * (lo + hi)));
     Ok(ImageFacts {
         w,
         h,
         srgb: src.srgb,
         primaries: src.primaries,
-        constant,
+        constant: constant(range),
         hash,
         blocks: src.blocks.as_ref().map(|b| (b.vk_format, b.complete())),
         rg: src.rg,
@@ -307,6 +324,7 @@ pub(crate) struct Packer<'a> {
     images: &'a [ImageFile],
     facts: &'a HashMap<usize, ImageFacts>,
     rules: &'a TextureRules,
+    quality: Quality,
     made: HashMap<Hash32, AssetId>,
     pub jobs: Vec<TextureJob>,
     /// Job index of each planned texture.
@@ -365,6 +383,8 @@ pub(crate) struct TextureJob {
     bc_split: Option<bool>,
     /// Keeps the source's blocks.
     pass: Option<Pass>,
+    /// Encodes the source images' own mips instead of making them from mip 0.
+    source_mips: bool,
 }
 
 /// A planned texture and, per packed channel, the channel of the texture that holds it.
@@ -401,12 +421,14 @@ impl<'a> Packer<'a> {
         images: &'a [ImageFile],
         facts: &'a HashMap<usize, ImageFacts>,
         rules: &'a TextureRules,
+        quality: Quality,
     ) -> Self {
         Self {
             asset,
             images,
             facts,
             rules,
+            quality,
             made: HashMap::new(),
             jobs: Vec::new(),
             by_id: HashMap::new(),
@@ -550,7 +572,10 @@ impl<'a> Packer<'a> {
                     },
                 )?;
                 bind(m, slot::NORMAL, id, 0, r);
-                if consts.iter().any(Option::is_none) {
+                // A normal map whose source mips the cook keeps instead of remaking them adds
+                // no Toksvig roughness.
+                let toksvig = !self.jobs[self.by_id[&id.id]].source_mips;
+                if toksvig && consts.iter().any(Option::is_none) {
                     normal_packed = Some((*r, scale[0]));
                 }
             }
@@ -849,13 +874,15 @@ impl<'a> Packer<'a> {
     /// source channel that holds it; `None` when it needs its texels made. The image's blocks
     /// must be the pack's format (or a BC5 whose half a BC4 takes), with every mip, each
     /// packed channel a source channel as stored. Mip 0 alone passes when the pack makes its
-    /// other mips from it (Toksvig roughness, alpha coverage) and keeps its full size.
+    /// other mips from it (Toksvig roughness, alpha coverage unless `source_mips`) and keeps
+    /// its full size.
     fn passes(
         &self,
         p: &Pack,
         size: [u32; 2],
         grid: Option<[u16; 2]>,
         skipped: bool,
+        source_mips: bool,
     ) -> Option<(Pass, [u8; 4])> {
         use orr_pack::texture::vk;
         let count = match p.encoding {
@@ -938,7 +965,7 @@ impl<'a> Packer<'a> {
         if half.is_some() {
             channels[0] = 0;
         }
-        let derived = p.toksvig.is_some() || p.coverage.is_some();
+        let derived = p.toksvig.is_some() || p.coverage.is_some() && !source_mips;
         if !complete || derived && skipped {
             return None;
         }
@@ -953,7 +980,7 @@ impl<'a> Packer<'a> {
     }
 
     /// Plans one pack, or returns the one an identical pack planned before.
-    fn make(&mut self, suffix: &str, p: Pack) -> Result<Made> {
+    fn make(&mut self, suffix: &str, mut p: Pack) -> Result<Made> {
         let mut images: Vec<usize> = p
             .channels
             .iter()
@@ -962,28 +989,37 @@ impl<'a> Packer<'a> {
                 Channel::Constant(_) | Channel::Unused => None,
             })
             .collect();
-        if let Some((_, r, _)) = &p.toksvig {
-            images.push(r.image);
-        }
         images.sort_unstable();
         images.dedup();
-        let mut quality = self.rules.quality;
-        let mut max_size = self.rules.max_size;
-        let mut grid = None;
-        let mut primaries = None;
-        let mut bc_split = self.rules.bc_split;
-        for (pattern, o) in &self.rules.overrides {
-            if images
-                .iter()
-                .any(|&i| self.images[i].name.contains(pattern.as_str()))
-            {
-                quality = o.quality.unwrap_or(quality);
-                max_size = o.max_size.or(max_size);
-                grid = o.atlas_grid.or(grid);
-                primaries = o.primaries.or(primaries);
-                bc_split = o.bc_split.or(bc_split);
-            }
+        // Unless mips are remade, channels whose images all hold every mip as blocks at one
+        // size keep those mips, without Toksvig roughness or alpha coverage.
+        let kept = |i: usize| {
+            let f = self.image(i);
+            f.blocks.is_some_and(|b| b.1).then_some((f.w, f.h))
+        };
+        let kept_size = images.first().and_then(|&i| kept(i));
+        let source_mips = !crate::quality::remakes_mips(self.quality)
+            && !p.shrink
+            && kept_size.is_some()
+            && images.iter().all(|&i| kept(i) == kept_size)
+            && self.overridden(&images, |o| o.atlas_grid).is_none();
+        if source_mips {
+            p.toksvig = None;
         }
+        if let Some((_, r, _)) = &p.toksvig
+            && !images.contains(&r.image)
+        {
+            images.push(r.image);
+            images.sort_unstable();
+        }
+        let max_size = self
+            .overridden(&images, |o| o.max_size)
+            .or(self.rules.max_size);
+        let grid = self.overridden(&images, |o| o.atlas_grid);
+        let primaries = self.overridden(&images, |o| o.primaries);
+        let bc_split = self
+            .overridden(&images, |o| o.bc_split)
+            .or(self.rules.bc_split);
         let mut size = [1u32, 1];
         for &i in &images {
             let f = self.image(i);
@@ -998,10 +1034,10 @@ impl<'a> Packer<'a> {
             primaries.unwrap_or(Primaries::Rec709)
         };
         let skipped = super::skipped_mips(size[0], size[1], max_size) > 0;
-        let pass = self.passes(&p, size, grid, skipped);
+        let pass = self.passes(&p, size, grid, skipped, source_mips);
 
         let mut recipe = format!(
-            "{} {:?} {:?} {:?} {:?} {:?} {quality:?} {max_size:?} {grid:?} {primaries:?} {bc_split:?} {:?} {:?} {:?}",
+            "{} {:?} {:?} {:?} {:?} {:?} {max_size:?} {grid:?} {primaries:?} {bc_split:?} {:?} {:?} {:?} {source_mips}",
             p.role,
             p.encoding,
             p.channels,
@@ -1026,7 +1062,7 @@ impl<'a> Packer<'a> {
             _ => format!("{}/texture/{suffix}/{}", self.asset, p.role),
         };
         let key = Key::new(Class::Texture, &name)
-            .str(super::ENCODERS)
+            .str(&super::encoders(self.quality))
             .bytes(&recipe)
             .finish();
         let id = AssetId::from_name(&name);
@@ -1039,15 +1075,35 @@ impl<'a> Packer<'a> {
             pack: p,
             images,
             size,
-            quality,
+            quality: self.quality,
             max_size,
             grid,
             primaries,
             filter: self.rules.filter,
             bc_split,
             pass: pass.map(|p| p.0),
+            source_mips,
         });
         Ok(Made { id, channels })
+    }
+}
+
+impl Packer<'_> {
+    /// The last value `field` sets among the overrides that match any of `images`.
+    fn overridden<T>(
+        &self,
+        images: &[usize],
+        field: impl Fn(&TextureOverride) -> Option<T>,
+    ) -> Option<T> {
+        self.rules
+            .overrides
+            .iter()
+            .filter(|(pattern, _)| {
+                images
+                    .iter()
+                    .any(|&i| self.images[i].name.contains(pattern.as_str()))
+            })
+            .fold(None, |v, (_, o)| field(o).or(v))
     }
 }
 
@@ -1063,10 +1119,7 @@ impl TextureJob {
         let fail = |e: String| self.fail(format!("texture {}: {e}", self.pack.role));
         let built = match self.pass {
             Some(pass) => self.pass_through(pass, images).map_err(fail)?,
-            None => {
-                let (img, plan) = self.prepare(images, None)?;
-                super::build(vec![img], &plan).map_err(fail)?
-            }
+            None => super::finish(vec![self.chain(images)?], &self.plan(None)).map_err(fail)?,
         };
         Ok(built.with_split(self.bc_split))
     }
@@ -1126,6 +1179,9 @@ impl TextureJob {
 
     /// The mip chain [`Self::run`] encodes.
     pub(crate) fn chain(&self, images: &[ImageFile]) -> Result<Vec<Img>> {
+        if self.source_mips {
+            return self.source_chain(images);
+        }
         let (img, plan) = self.prepare(images, None)?;
         super::chains(vec![img], &plan, 0)
             .map(|mut c| c.remove(0))
@@ -1173,32 +1229,11 @@ impl TextureJob {
             };
             decoded.insert(i, img.resized(self.size[0], self.size[1]));
         }
-        let p = &self.pack;
-        let mut img = Img::new(self.size[0], self.size[1]);
-        for (c, ch) in p.channels.iter().enumerate() {
-            match *ch {
-                Channel::Constant(v) => img.px.iter_mut().for_each(|t| t[c] = v),
-                Channel::Unused => img.px.iter_mut().for_each(|t| t[c] = 1.0),
-                Channel::Image {
-                    image,
-                    channel,
-                    srgb,
-                    a,
-                    b,
-                } => {
-                    for (t, s) in img.px.iter_mut().zip(&decoded[&image].px) {
-                        let v = if srgb {
-                            srgb_to_linear(s[channel])
-                        } else {
-                            s[channel]
-                        };
-                        t[c] = a + b * v;
-                    }
-                }
-            }
-        }
-        let toksvig = p.toksvig.as_ref().map(|(channel, r, scale)| {
-            let mut n = decoded[&r.image].clone();
+        let img = self.pack(&decoded, self.size);
+        let toksvig = self.pack.toksvig.as_ref().map(|(channel, r, scale)| {
+            let mut n = decoded
+                .remove(&r.image)
+                .expect("the normal map is a source image");
             for t in &mut n.px {
                 *t = [
                     (2.0 * t[0] - 1.0) * scale,
@@ -1213,7 +1248,78 @@ impl TextureJob {
             }
         });
         drop(decoded);
-        let plan = Plan {
+        Ok((img, self.plan(toksvig)))
+    }
+
+    /// The packed chain from the source images' own mips, without those over `max_size`.
+    fn source_chain(&self, images: &[ImageFile]) -> Result<Vec<Img>> {
+        let _z = crate::profile::zone!("texture.source_mips");
+        let fail = |message: String| self.fail(message);
+        let mut sources = Vec::with_capacity(self.images.len());
+        for &i in &self.images {
+            let src = load::open(&images[i].bytes()?).map_err(&fail)?;
+            let b = src
+                .blocks
+                .ok_or_else(|| fail("the image no longer holds blocks".into()))?;
+            if [b.w, b.h] != self.size || !b.complete() {
+                return Err(fail("the image's mips changed".into()));
+            }
+            sources.push((i, b));
+        }
+        let [w, h] = self.size;
+        (super::skipped_mips(w, h, self.max_size)..full_mip_count(w, h))
+            .map(|m| {
+                let [mw, mh] = mip_size(w, h, m);
+                let mut decoded = HashMap::new();
+                for (i, b) in &sources {
+                    let img = load::decode_blocks(b.vk_format, mw, mh, &b.levels[0][m as usize])
+                        .map_err(&fail)?;
+                    decoded.insert(*i, img);
+                }
+                let mut img = self.pack(&decoded, [mw, mh]);
+                if self.pack.normal {
+                    img.px.par_iter_mut().for_each(|p| *p = normalized(*p));
+                }
+                Ok(img)
+            })
+            .collect()
+    }
+
+    /// The packed texture of `decoded` source images, each `w` x `h`.
+    fn pack(&self, decoded: &HashMap<usize, Img>, [w, h]: [u32; 2]) -> Img {
+        let mut img = Img::new(w, h);
+        for (c, ch) in self.pack.channels.iter().enumerate() {
+            match *ch {
+                Channel::Constant(v) => img.px.par_iter_mut().for_each(|t| t[c] = v),
+                Channel::Unused => img.px.par_iter_mut().for_each(|t| t[c] = 1.0),
+                Channel::Image {
+                    image,
+                    channel,
+                    srgb,
+                    a,
+                    b,
+                } => {
+                    img.px
+                        .par_iter_mut()
+                        .zip(&decoded[&image].px)
+                        .for_each(|(t, s)| {
+                            let v = if srgb {
+                                srgb_to_linear(s[channel])
+                            } else {
+                                s[channel]
+                            };
+                            t[c] = a + b * v;
+                        });
+                }
+            }
+        }
+        img
+    }
+
+    /// How the texture cooks, with Toksvig roughness from `toksvig`.
+    fn plan(&self, toksvig: Option<Toksvig>) -> Plan {
+        let p = &self.pack;
+        Plan {
             encoding: p.encoding,
             cube: false,
             primaries: self.primaries,
@@ -1228,7 +1334,6 @@ impl TextureJob {
             max_size: self.max_size,
             toksvig,
             lights: Vec::new(),
-        };
-        Ok((img, plan))
+        }
     }
 }

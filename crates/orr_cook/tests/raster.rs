@@ -64,7 +64,6 @@ fn layer(name: &str, input: RasterInput) -> RasterLayerSpec {
         reduction: Reduction::Mean,
         srgb: false,
         compress: None,
-        quality: Default::default(),
     }
 }
 

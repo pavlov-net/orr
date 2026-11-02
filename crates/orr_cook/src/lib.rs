@@ -60,9 +60,30 @@
 //! that does not compress is stored raw. The codec is NVIDIA's libdeflate fork, built with
 //! the `gdeflate` feature (module `gdeflate`).
 //!
+//! [`CookOptions::quality`] sets how much work the cook spends, on ctt's preset scale. The
+//! level is the preset of every BCn encode, sets the zstd level of every blob ([`zstd_level`];
+//! [`CookOptions::zstd_level`] overrides it), and decides what happens to textures whose
+//! source images hold every mip in a block format:
+//!
+//! | Quality | zstd | Mips of block-compressed sources with every mip |
+//! | --- | --- | --- |
+//! | `UltraFast`, `VeryFast`, `Fast` (the default) | 1 | kept |
+//! | `Basic` | 6 | kept |
+//! | `Slow` | 19 | made from mip 0 |
+//! | `VerySlow` | 22 | made from mip 0 |
+//!
+//! Kept mips are the source's own: its blocks pass through when the texture has the
+//! source's format, and are decoded and encoded again when it does not. They get no
+//! alpha-coverage scaling, so alpha-tested surfaces can thin out in the distance, and no
+//! Toksvig roughness, so distant specular highlights can shimmer; a normal map that keeps its
+//! mips adds Toksvig roughness to no texture, so a constant roughness stays a factor.
+//! Textures whose sources lack mips or are not block-compressed make their mips the same way
+//! at every level. Mesh processing does not depend on the level.
+//!
 //! The cook is incremental. Every entry carries a cook key: a hash of its class's cook
-//! version, the libraries that shape its bytes, its name, its settings, the content of its
-//! inputs and the keys of the entries it depends on. An entry whose key matches an entry of
+//! version, the libraries that shape its bytes, its name, its settings, the quality level
+//! where it shapes the entry, the content of its inputs and the keys of the entries it
+//! depends on. An entry whose key matches an entry of
 //! the archive being replaced, or of the cache ([`CookOptions::cache`]), is copied from there
 //! without cooking; an archive whose entries all match is left as it is. A file archive
 //! keeps `<archive>.cookstate` beside it: the hash of each input file by size and time, and
@@ -85,6 +106,7 @@ mod materialx;
 mod mesh;
 mod patch;
 mod profile;
+mod quality;
 mod raster;
 mod report;
 mod run;
@@ -103,11 +125,13 @@ use orr_pack::{BlobIn, Target};
 use serde::Deserialize;
 
 pub use assembly::AssemblySettings;
+pub use ctt::Quality;
 pub use gltf::GltfLayout;
 pub use import::{NodeSelect, PartAttribute, SHEAR_MAX};
 pub use instances::{Instances, Placement, PrototypeSpec, SectionSpec};
 pub use mesh::{LodMode, MeshInput, MeshParts, MeshSettings, OmmSettings, StaticDisplacement};
 pub use patch::{MaterialPatch, MeshPatch};
+pub use quality::zstd_level;
 pub use raster::{
     RasterCompression, RasterFormat, RasterInput, RasterLayerReport, RasterLayerSpec, RasterReport,
     RasterSet, Reduction,
@@ -121,7 +145,7 @@ pub use skin::ClipSettings;
 pub use subd::{Boundary, CageInput, Corner, Crease, FaceVarying, SubdSettings, UvLinear};
 pub use texture::material::{InputChannels, TextureOverride, TextureRules};
 pub use texture::neural::NeuralSettings;
-pub use texture::{DataFormat, MipFilter, Primaries, Quality, TextureSettings, Usage, Wrap};
+pub use texture::{DataFormat, MipFilter, Primaries, TextureSettings, Usage, Wrap};
 pub use usd::{Subdivision, UsdSettings, VariantSelection};
 pub use volume::{
     Block, GridInput, GridVoxels, VolumeFormat, VolumeGridReport, VolumeGridSpec, VolumeGrids,
@@ -293,13 +317,11 @@ pub struct CookOptions {
     /// Bytes of finished entries that may wait for their turn to be written; past it only
     /// the jobs the next entries wait on start.
     pub reorder_window: u64,
-    /// zstd level of every cooked blob: [`ZSTD_LEVEL_DEFAULT`] cooks fast, up to 22 gives
-    /// smaller archives at a much slower cook.
-    pub zstd_level: i32,
+    /// How much work the cook spends; the crate documentation lists what each level does.
+    pub quality: Quality,
+    /// zstd level of every cooked blob, up to 22; `None` takes the quality's level.
+    pub zstd_level: Option<i32>,
 }
-
-/// The default [`CookOptions::zstd_level`].
-pub const ZSTD_LEVEL_DEFAULT: i32 = 6;
 
 impl Default for CookOptions {
     fn default() -> Self {
@@ -311,7 +333,8 @@ impl Default for CookOptions {
             cache_cap: None,
             working_set: alloc::physical_memory() / 2,
             reorder_window: 1 << 30,
-            zstd_level: ZSTD_LEVEL_DEFAULT,
+            quality: Quality::Fast,
+            zstd_level: None,
         }
     }
 }

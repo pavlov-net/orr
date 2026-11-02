@@ -5,12 +5,12 @@ use ctt::encoders::Encoder;
 use ctt::encoders::bc7enc::Bc7encSettings;
 use ctt::{
     AlphaMode, ColorSpace, Container, ConvertSettings, Format, FormatDesc, ImageRef,
-    PipelineOutput, SurfaceRef, TargetFormat, TextureKind,
+    PipelineOutput, Quality, SurfaceRef, TargetFormat, TextureKind,
 };
 use half::f16;
 use orr_pack::texture::{FormatInfo, vk};
 
-use super::{DataFormat, Img, Quality, Usage, linear_to_srgb};
+use super::{DataFormat, Img, Usage, linear_to_srgb};
 
 /// Stored format of a cooked texture.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -134,11 +134,7 @@ fn raw(d: DataFormat, m: &Img) -> Vec<u8> {
 
 /// ctt encoder, preset and input layout for each BCn encoding: bc7e for BC7, Intel ISPC
 /// for BC4, BC5 and BC6H. Encoders are always named, never picked automatically.
-fn bc(e: Encoding, q: Quality, chains: &[Vec<Img>]) -> Result<Vec<Vec<Vec<u8>>>, String> {
-    let quality = match q {
-        Quality::Fast => ctt::Quality::Fast,
-        Quality::Release => ctt::Quality::Slow,
-    };
+fn bc(e: Encoding, quality: Quality, chains: &[Vec<Img>]) -> Result<Vec<Vec<Vec<u8>>>, String> {
     let (target, encoder) = match e {
         Encoding::Bc7Srgb => (
             Format::BC7_SRGB_BLOCK,

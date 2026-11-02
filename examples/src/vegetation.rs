@@ -43,7 +43,7 @@ use orr::{
     TextureFilter, TransformGroupDesc, TransformGroupId, TransparencyPass, ViewDesc, ViewHistoryId,
     ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
-use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Quality, Source};
+use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source};
 use orr_cook::{TextureSettings, Usage};
 use orr_math::camera::rh::view;
 use orr_math::{DVec3, Mat3, UVec2, Vec2, Vec3};
@@ -486,7 +486,6 @@ fn cook(settings: &Settings) -> Arc<[u8]> {
             path,
             settings: TextureSettings {
                 usage,
-                quality: Quality::Fast,
                 ..TextureSettings::default()
             },
         },

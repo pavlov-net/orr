@@ -70,7 +70,7 @@ fn cell_mip(w: u32, h: u32, [gx, gy]: [u32; 2]) -> bool {
     w.is_multiple_of(gx) && h.is_multiple_of(gy) && w / gx >= 4 && h / gy >= 4
 }
 
-fn normalized(p: [f32; 4]) -> [f32; 4] {
+pub(crate) fn normalized(p: [f32; 4]) -> [f32; 4] {
     let l = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
     if l > 0.0 {
         [p[0] / l, p[1] / l, p[2] / l, p[3]]

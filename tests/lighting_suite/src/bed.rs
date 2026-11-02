@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use orr_cook::{
     ArchiveSpec, AssetSpec, GridInput, GridVoxels, LodMode, Manifest, MeshInput, MeshSettings,
-    Quality, Source, TextureSettings, Usage, VolumeGrids, VolumeInput, VolumeSettings,
+    Source, TextureSettings, Usage, VolumeGrids, VolumeInput, VolumeSettings,
 };
 use orr_gpu::{
     Allocation, CommandList, ComputePipeline, Format, GpuAddress, GpuPtr, Hazards, KernelSet,
@@ -845,7 +845,6 @@ fn cook() -> Arc<[u8]> {
                         path: rings_png(),
                         settings: TextureSettings {
                             usage: Usage::Linear1,
-                            quality: Quality::Fast,
                             ..TextureSettings::default()
                         },
                     },
@@ -906,7 +905,6 @@ fn cook() -> Arc<[u8]> {
                         path: bumps_png(),
                         settings: TextureSettings {
                             usage: Usage::Normal,
-                            quality: Quality::Fast,
                             ..TextureSettings::default()
                         },
                     },

@@ -19,7 +19,7 @@ use glam::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_color::RgbPrimaries;
 use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, LodMode, Manifest, MeshInput, MeshParts, MeshSettings,
-    Primaries, Quality, Source, TextureSettings, Usage,
+    Primaries, Source, TextureSettings, Usage,
 };
 use orr_gpu::{
     GpuPtr, Hazards, KernelSet, MemoryKind, QueueKind, SamplerIndex, ShaderModule, Stages, Texture,
@@ -816,7 +816,6 @@ fn cook() -> Arc<[u8]> {
             path,
             settings: TextureSettings {
                 usage,
-                quality: Quality::Fast,
                 ..TextureSettings::default()
             },
         },
@@ -924,7 +923,6 @@ fn cook() -> Arc<[u8]> {
                 path: green.clone(),
                 settings: TextureSettings {
                     usage: Usage::Color,
-                    quality: Quality::Fast,
                     primaries: Some(primaries),
                     ..TextureSettings::default()
                 },

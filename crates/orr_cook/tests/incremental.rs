@@ -11,7 +11,7 @@ use glam::{DVec3, Quat, Vec3};
 use orr_cook::{
     ArchiveSpec, AssemblySettings, AssetSpec, CookOptions, Cooked, DataFormat, GltfSettings,
     Instances, LodMode, Manifest, MipFilter, Outcome, Placement, PrototypeSpec, Quality, Source,
-    TextureRules, TextureSettings, Usage,
+    TextureSettings, Usage,
 };
 use orr_pack::{Archive, AssetId, Class, Target};
 
@@ -86,14 +86,7 @@ fn write_scene(d: &Path) {
     std::fs::write(d.join("quad.gltf"), json).unwrap();
 }
 
-fn tex_settings(quality: Quality) -> TextureSettings {
-    TextureSettings {
-        quality,
-        ..Default::default()
-    }
-}
-
-fn assets(d: &Path, tex_quality: Quality) -> Vec<AssetSpec> {
+fn assets(d: &Path, tex_filter: MipFilter) -> Vec<AssetSpec> {
     let records = (0..6)
         .map(|i| Placement {
             position: DVec3::new(f64::from(i) * 300.0 - 700.0, 2.0, f64::from(i % 2) * 300.0),
@@ -107,20 +100,17 @@ fn assets(d: &Path, tex_quality: Quality) -> Vec<AssetSpec> {
             name: "quad".into(),
             source: Source::Gltf {
                 path: d.join("quad.gltf"),
-                settings: GltfSettings {
-                    textures: TextureRules {
-                        quality: Quality::Fast,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
+                settings: GltfSettings::default(),
             },
         },
         AssetSpec {
             name: "tex".into(),
             source: Source::Texture {
                 path: d.join("tex.png"),
-                settings: tex_settings(tex_quality),
+                settings: TextureSettings {
+                    filter: tex_filter,
+                    ..Default::default()
+                },
             },
         },
         AssetSpec {
@@ -146,9 +136,9 @@ fn assets(d: &Path, tex_quality: Quality) -> Vec<AssetSpec> {
     ]
 }
 
-fn manifest(d: &Path, output: Target, tex_quality: Quality) -> Manifest {
+fn manifest(d: &Path, output: Target, tex_filter: MipFilter) -> Manifest {
     Manifest {
-        archives: vec![ArchiveSpec::new(output, assets(d, tex_quality))],
+        archives: vec![ArchiveSpec::new(output, assets(d, tex_filter))],
     }
 }
 
@@ -191,7 +181,7 @@ fn same_inputs_give_the_same_bytes() {
     let d = dir("incremental-same");
     write_scene(&d);
     let memory = |o: &CookOptions| {
-        orr_cook::cook(&manifest(&d, Target::Memory, Quality::Fast), o)
+        orr_cook::cook(&manifest(&d, Target::Memory, MipFilter::Kaiser), o)
             .unwrap()
             .memory
             .remove(0)
@@ -210,8 +200,8 @@ fn same_inputs_give_the_same_bytes() {
     // The same assets in two archives cook once and give both archives the same bytes.
     let twice = Manifest {
         archives: vec![
-            ArchiveSpec::new(Target::Memory, assets(&d, Quality::Fast)),
-            ArchiveSpec::new(Target::Memory, assets(&d, Quality::Fast)),
+            ArchiveSpec::new(Target::Memory, assets(&d, MipFilter::Kaiser)),
+            ArchiveSpec::new(Target::Memory, assets(&d, MipFilter::Kaiser)),
         ],
     };
     let cache = CookOptions {
@@ -225,7 +215,7 @@ fn same_inputs_give_the_same_bytes() {
 
     let file = d.join("out.orr");
     orr_cook::cook(
-        &manifest(&d, Target::File(file.clone()), Quality::Fast),
+        &manifest(&d, Target::File(file.clone()), MipFilter::Kaiser),
         &opts(3),
     )
     .unwrap();
@@ -233,7 +223,7 @@ fn same_inputs_give_the_same_bytes() {
     // With the window full, units wait in a scratch directory, gone after the cook.
     let spilled = d.join("spilled.orr");
     orr_cook::cook(
-        &manifest(&d, Target::File(spilled.clone()), Quality::Fast),
+        &manifest(&d, Target::File(spilled.clone()), MipFilter::Kaiser),
         &CookOptions {
             jobs: 8,
             reorder_window: 0,
@@ -265,7 +255,7 @@ fn cache_links_equal_a_fresh_cook() {
         cache: Some(cache.clone()),
         ..Default::default()
     };
-    let m = manifest(&d, Target::Memory, Quality::Fast);
+    let m = manifest(&d, Target::Memory, MipFilter::Kaiser);
     let fresh = orr_cook::cook(&m, &opts(0)).unwrap();
     let first = orr_cook::cook(&m, &with_cache).unwrap();
     assert_eq!(names(&first, Outcome::Cooked).len(), entry_count(&first));
@@ -278,7 +268,7 @@ fn cache_links_equal_a_fresh_cook() {
     // A file cook from the cache, as after an interrupted run, writes the same bytes.
     let file = d.join("out.orr");
     let resumed = orr_cook::cook(
-        &manifest(&d, Target::File(file.clone()), Quality::Fast),
+        &manifest(&d, Target::File(file.clone()), MipFilter::Kaiser),
         &with_cache,
     )
     .unwrap();
@@ -298,22 +288,22 @@ fn rebuilds_cook_only_what_changed() {
     let d = dir("incremental-rebuild");
     write_scene(&d);
     let file = d.join("out.orr");
-    let cook = |q: Quality| {
-        orr_cook::cook(&manifest(&d, Target::File(file.clone()), q), &opts(0)).unwrap()
+    let cook = |f: MipFilter| {
+        orr_cook::cook(&manifest(&d, Target::File(file.clone()), f), &opts(0)).unwrap()
     };
-    let fresh = |q: Quality| {
-        orr_cook::cook(&manifest(&d, Target::Memory, q), &opts(0))
+    let fresh = |f: MipFilter| {
+        orr_cook::cook(&manifest(&d, Target::Memory, f), &opts(0))
             .unwrap()
             .memory
             .remove(0)
     };
 
-    let first = cook(Quality::Fast);
+    let first = cook(MipFilter::Kaiser);
     assert_eq!(names(&first, Outcome::Cooked).len(), entry_count(&first));
     let bytes = std::fs::read(&file).unwrap();
 
     // Nothing changed: every entry matches and the archive is left alone.
-    let again = cook(Quality::Fast);
+    let again = cook(MipFilter::Kaiser);
     assert!(!again.report.archives[0].written);
     assert_eq!(names(&again, Outcome::Archive).len(), entry_count(&again));
     assert_eq!(bytes, std::fs::read(&file).unwrap());
@@ -330,28 +320,28 @@ fn rebuilds_cook_only_what_changed() {
     ] {
         set_mtime(&d.join(f), past);
     }
-    let touched = cook(Quality::Fast);
+    let touched = cook(MipFilter::Kaiser);
     assert!(!touched.report.archives[0].written);
     assert!(names(&touched, Outcome::Cooked).is_empty());
 
     // One image of material 1: only its texture cooks.
     write_png(&d.join("c.png"), 64, 9);
-    let image = cook(Quality::Fast);
+    let image = cook(MipFilter::Kaiser);
     assert!(image.report.archives[0].written);
     assert_eq!(
         names(&image, Outcome::Cooked),
         set(&["quad/texture/1/base_color"])
     );
-    assert_eq!(*fresh(Quality::Fast), *std::fs::read(&file).unwrap());
+    assert_eq!(*fresh(MipFilter::Kaiser), *std::fs::read(&file).unwrap());
 
     // Settings of one texture source.
-    let settings = cook(Quality::Release);
+    let settings = cook(MipFilter::Box);
     assert_eq!(names(&settings, Outcome::Cooked), set(&["tex"]));
-    assert_eq!(*fresh(Quality::Release), *std::fs::read(&file).unwrap());
+    assert_eq!(*fresh(MipFilter::Box), *std::fs::read(&file).unwrap());
 
     // Geometry: the mesh, then what depends on it: the model and the instance pages.
     write_bin(&d.join("quad.bin"), 2.0);
-    let geometry = cook(Quality::Release);
+    let geometry = cook(MipFilter::Box);
     let cooked = names(&geometry, Outcome::Cooked);
     let pages: BTreeSet<String> = cooked
         .iter()
@@ -364,15 +354,31 @@ fn rebuilds_cook_only_what_changed() {
     assert_eq!(cooked, expected);
     let all_pages = geometry.report.assets[3].entries.len();
     assert_eq!(cooked.len(), 2 + all_pages);
-    assert_eq!(*fresh(Quality::Release), *std::fs::read(&file).unwrap());
+    assert_eq!(*fresh(MipFilter::Box), *std::fs::read(&file).unwrap());
+
+    // Another quality at the same zstd level cooks every texture anew, and what reads
+    // them; the user entry links.
+    let o = CookOptions {
+        quality: Quality::Slow,
+        zstd_level: Some(orr_cook::zstd_level(opts(0).quality)),
+        ..opts(0)
+    };
+    let m = manifest(&d, Target::File(file.clone()), MipFilter::Box);
+    let slow = names(&orr_cook::cook(&m, &o).unwrap(), Outcome::Cooked);
+    let textures = slow
+        .iter()
+        .filter(|n| *n == "tex" || n.contains("/texture/"))
+        .count();
+    assert_eq!(textures, 5);
+    assert!(!slow.contains("data"));
 
     // Another zstd level stores every blob anew: nothing links.
     let level = CookOptions {
-        zstd_level: 19,
+        zstd_level: Some(19),
         ..opts(0)
     };
     let recompressed = orr_cook::cook(
-        &manifest(&d, Target::File(file.clone()), Quality::Release),
+        &manifest(&d, Target::File(file.clone()), MipFilter::Box),
         &level,
     )
     .unwrap();
@@ -387,7 +393,7 @@ fn recook_replaces_an_archive_a_reader_holds() {
     let d = dir("incremental-reader");
     write_scene(&d);
     let file = d.join("out.orr");
-    let m = manifest(&d, Target::File(file.clone()), Quality::Fast);
+    let m = manifest(&d, Target::File(file.clone()), MipFilter::Kaiser);
     orr_cook::cook(&m, &opts(0)).unwrap();
     let old_bytes = std::fs::read(&file).unwrap();
     // std opens files with delete sharing.
@@ -434,7 +440,7 @@ gdeflate = true
 
 [[archive.asset]]
 name = "quad"
-gltf = { path = "quad.gltf", settings = { textures = { quality = "fast" }, mesh = { position_step_log2 = -10, lod = { discrete = { errors = [0.01, 0.1] } }, merge_level = 2 }, models = [{ node = "quad" }], joined = ["quad"], parts_from_attribute = { name = "_ID", parts = 4, by_section = true }, mesh_overrides = [["quad", { max_vertices = 64 }]], material_overrides = [["", { surface = 2, subsurface_radius = 0.01 }]] } }
+gltf = { path = "quad.gltf", settings = { textures = { max_size = 32 }, mesh = { position_step_log2 = -10, lod = { discrete = { errors = [0.01, 0.1] } }, merge_level = 2 }, models = [{ node = "quad" }], joined = ["quad"], parts_from_attribute = { name = "_ID", parts = 4, by_section = true }, mesh_overrides = [["quad", { max_vertices = 64 }]], material_overrides = [["", { surface = 2, subsurface_radius = 0.01 }]] } }
 
 [[archive.asset]]
 name = "tex"
@@ -469,7 +475,7 @@ material = { base_color = [0.5, 0.25, 0.125], surface = 4 }
         panic!("gltf");
     };
     assert_eq!(*p, d.join("quad.gltf"));
-    assert_eq!(settings.textures.quality, Quality::Fast);
+    assert_eq!(settings.textures.max_size, Some(32));
     assert_eq!(settings.mesh.position_step_log2, -10);
     assert_eq!(settings.mesh.max_triangles, 128);
     assert_eq!(
@@ -542,7 +548,8 @@ fn accessors_past_their_views_fail_to_import() {
     );
     assert_ne!(json, bad);
     std::fs::write(&gltf, bad).unwrap();
-    let err = orr_cook::cook(&manifest(&d, Target::Memory, Quality::Fast), &opts(1)).unwrap_err();
+    let err =
+        orr_cook::cook(&manifest(&d, Target::Memory, MipFilter::Kaiser), &opts(1)).unwrap_err();
     assert!(
         matches!(&err, orr_cook::Error::Import { message, .. } if message.contains("runs past")),
         "{err}"
@@ -572,7 +579,7 @@ fn gdeflate_archives_store_payload_pages() {
         (x >> 24) as u8
     }));
     let spec = |output, gdeflate| {
-        let mut assets = assets(&d, Quality::Fast);
+        let mut assets = assets(&d, MipFilter::Kaiser);
         assets.push(AssetSpec {
             name: "pages".into(),
             source: Source::User {

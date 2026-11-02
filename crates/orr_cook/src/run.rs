@@ -20,6 +20,7 @@ use std::sync::{Arc, mpsc};
 use std::thread::Scope;
 use std::time::Instant;
 
+use ctt::Quality;
 use glam::{Vec2, Vec3, Vec4};
 
 use orr_pack::material::{Material, slot};
@@ -50,7 +51,7 @@ use crate::texture::material::{
     image_facts,
 };
 use crate::texture::neural::{self, NeuralJob};
-use crate::texture::{self, ENCODERS, Wrap};
+use crate::texture::{self, Wrap};
 use crate::volume::{self, VolumeReport};
 use crate::{
     CookOptions, Cooked, Error, GltfSettings, Instances, Manifest, MeshSettings, Placement,
@@ -76,7 +77,10 @@ pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
     let shared = Shared {
         memo: Memo::default(),
         cache: opts.cache.as_deref().map(Cache::new).transpose()?,
-        zstd_level: opts.zstd_level,
+        quality: opts.quality,
+        zstd_level: opts
+            .zstd_level
+            .unwrap_or_else(|| crate::quality::zstd_level(opts.quality)),
     };
     let threads = rayon::current_num_threads();
     let mut run = Run::new(manifest, opts, &shared)?;
@@ -102,6 +106,7 @@ pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
 struct Shared {
     memo: Memo,
     cache: Option<Cache>,
+    quality: Quality,
     zstd_level: i32,
 }
 
@@ -442,7 +447,7 @@ impl<'m, 's> Run<'m, 's> {
                 let hash = self.shared.memo.hash(path)?;
                 self.input(a, index, path);
                 let key = Key::new(Class::Texture, name)
-                    .str(ENCODERS)
+                    .str(&texture::encoders(self.shared.quality))
                     .debug(settings)
                     .hash(hash)
                     .finish();
@@ -480,7 +485,7 @@ impl<'m, 's> Run<'m, 's> {
                 self.add_units(a, index, vec![unit]);
             }
             Source::Raster(set) => {
-                let planned = raster::plan(name, set, &self.shared.memo)?;
+                let planned = raster::plan(name, set, &self.shared.memo, self.shared.quality)?;
                 for f in &planned.files {
                     self.input(a, index, f);
                 }
@@ -554,6 +559,7 @@ impl<'m, 's> Run<'m, 's> {
             .hash(key::salt())
             .str(&path.to_string_lossy())
             .debug(&kind)
+            .debug(&self.shared.quality)
             .finish();
         let identity = self.stored(a, identity);
         if let Some(record) = previous.get(&identity)
@@ -657,7 +663,7 @@ impl<'m, 's> Run<'m, 's> {
 
     /// The key archive `a` stores an entry of key `key` under.
     fn stored(&self, a: usize, key: Hash32) -> Hash32 {
-        key::stored_as(key, self.opts.zstd_level, self.codecs[a].is_some())
+        key::stored_as(key, self.shared.zstd_level, self.codecs[a].is_some())
     }
 
     /// The entries holding `key`: in the replaced archive, else in the cache.
@@ -795,8 +801,7 @@ impl<'m, 's> Run<'m, 's> {
                 let imp = &self.imports[i];
                 let (name, path, kind) = (imp.name, imp.path, imp.kind);
                 scope.spawn(move || {
-                    let r =
-                        catch_unwind(AssertUnwindSafe(|| import(name, path, kind, &shared.memo)));
+                    let r = catch_unwind(AssertUnwindSafe(|| import(name, path, kind, shared)));
                     let _ = tx.send(Msg::Import(i, r));
                 });
             }
@@ -1079,7 +1084,7 @@ impl<'m, 's> Run<'m, 's> {
                 None
             } else {
                 let mut w = ArchiveWriter::create(self.manifest.archives[a].output.clone())?;
-                w.set_zstd_level(self.opts.zstd_level);
+                w.set_zstd_level(self.shared.zstd_level);
                 Some(w)
             });
         }
@@ -1576,7 +1581,8 @@ fn texture_file_working_set(path: &Path) -> u64 {
 }
 
 /// Imports a scene or material document and plans its units.
-fn import(name: &str, path: &Path, kind: ImportKind<'_>, memo: &Memo) -> Result<Imported> {
+fn import(name: &str, path: &Path, kind: ImportKind<'_>, shared: &Shared) -> Result<Imported> {
+    let memo = &shared.memo;
     let (scene, rules) = match kind {
         ImportKind::Gltf(s) => (crate::gltf::import(name, path, memo, s)?, &s.textures),
         ImportKind::Usd(s) => (crate::usd::import(name, path, s)?, &s.textures),
@@ -1585,7 +1591,7 @@ fn import(name: &str, path: &Path, kind: ImportKind<'_>, memo: &Memo) -> Result<
             textures,
         ),
     };
-    plan_scene(name, scene, rules, memo)
+    plan_scene(name, scene, rules, memo, shared.quality)
 }
 
 /// The entry name of material `suffix` of asset `name`.
@@ -1599,7 +1605,13 @@ fn material_name(name: &str, suffix: &str) -> String {
 
 /// Plans an imported scene's units: the skeletons and clips, the packed textures, the
 /// materials, and a mesh and a model per model.
-fn plan_scene(name: &str, mut src: Scene, rules: &TextureRules, memo: &Memo) -> Result<Imported> {
+fn plan_scene(
+    name: &str,
+    mut src: Scene,
+    rules: &TextureRules,
+    memo: &Memo,
+    quality: Quality,
+) -> Result<Imported> {
     let mut units = Vec::new();
     let mut skeletons = Vec::with_capacity(src.skeletons.len());
     for sk in std::mem::take(&mut src.skeletons) {
@@ -1659,7 +1671,7 @@ fn plan_scene(name: &str, mut src: Scene, rules: &TextureRules, memo: &Memo) -> 
             });
         }
     }
-    let mut packer = Packer::new(name, &src.images, &facts, rules);
+    let mut packer = Packer::new(name, &src.images, &facts, rules, quality);
     // Per material: its id, key and cooked parameters.
     let mut materials = Vec::new();
     for m in &src.materials {
@@ -2251,29 +2263,34 @@ fn texture_mips(
         }
         let bytes = info.mip_texels(&blob.1, mip, 0)?;
         let [w, hh] = h.mip_size(mip);
-        let px: Vec<[f32; 4]> = match h.vk_format {
-            orr_pack::texture::vk::R16_UNORM => bytes
-                .chunks_exact(2)
-                .map(|c| {
-                    [
-                        f32::from(u16::from_le_bytes([c[0], c[1]])) / 65535.0,
-                        0.0,
-                        0.0,
-                        1.0,
-                    ]
-                })
-                .collect(),
+        let unread = |_| orr_pack::Error::Malformed("texture format the mesh cook reads");
+        let planes: Vec<Vec<f32>> = match h.vk_format {
+            orr_pack::texture::vk::R16_UNORM => {
+                let r: Vec<f32> = bytes
+                    .chunks_exact(2)
+                    .map(|b| f32::from(u16::from_le_bytes([b[0], b[1]])) / 65535.0)
+                    .collect();
+                let n = r.len();
+                let mut planes = vec![r];
+                planes.extend([0.0, 0.0, 1.0].map(|v| vec![v; n]));
+                planes.truncate(channels);
+                planes
+            }
+            f if channels == 1 => {
+                vec![texture::decode_channel(f, w, hh, &bytes, 0).map_err(unread)?]
+            }
             f => {
-                texture::decode_blocks(f, w, hh, &bytes)
-                    .map_err(|_| orr_pack::Error::Malformed("texture format the mesh cook reads"))?
-                    .px
+                let px = texture::decode_blocks(f, w, hh, &bytes).map_err(unread)?.px;
+                (0..channels)
+                    .map(|c| px.iter().map(|p| p[c]).collect())
+                    .collect()
             }
         };
-        for c in 0..channels {
+        for texels in planes {
             out.push(Raster {
                 w,
                 h: hh,
-                texels: px.iter().map(|p| p[c]).collect(),
+                texels,
                 wrap,
                 uv,
             });
@@ -2357,7 +2374,7 @@ fn cook_unit(
         }
         Work::TextureFile(path, hash, settings) => {
             let bytes = state::read_checked(&path, hash)?;
-            let built = texture::cook_file(name, &bytes, &settings)?;
+            let built = texture::cook_file(name, &bytes, &settings, shared.quality)?;
             texture::add(&mut w, name, key, &built)?;
         }
         Work::Subd(data, materials, settings) => {
