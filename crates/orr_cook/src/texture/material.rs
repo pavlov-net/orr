@@ -25,7 +25,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use orr_color::{RgbPrimaries, vec_f32};
+use orr_color::RgbPrimaries;
+use orr_math::DVec3;
 use orr_pack::material::{Material, TextureBinding, slot};
 use orr_pack::texture::mip_size;
 use orr_pack::{AssetId, Class, Hash32};
@@ -787,9 +788,9 @@ impl<'a> Packer<'a> {
                 Primaries::Rec709 => std::array::from_fn(|c| target[c] * texel[c]),
                 p => {
                     let (rec709, p) = (RgbPrimaries::REC709, orr_color::Primaries::from(p).rgb());
-                    let f = orr_color::mul(&rec709.matrix_to(p), target.map(f64::from));
-                    let product = std::array::from_fn(|c| f[c] * f64::from(texel[c]));
-                    vec_f32(orr_color::mul(&p.matrix_to(rec709), product))
+                    let f = rec709.matrix_to(p) * DVec3::from(target.map(f64::from));
+                    let product = f * DVec3::from(texel.map(f64::from));
+                    (p.matrix_to(rec709) * product).as_vec3().to_array()
                 }
             };
             return Ok(());

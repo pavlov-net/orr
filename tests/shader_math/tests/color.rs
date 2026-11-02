@@ -1,128 +1,145 @@
-use glam::{DMat3, DVec3};
+use orr_color::RgbPrimaries;
+use orr_math::{DMat3, DVec3};
 use shader_math::stats::Rng;
 use shader_math::*;
-
-/// RGB to XYZ from primaries and white point chromaticities.
-fn rgb_to_xyz(primaries: [[f64; 2]; 3], white: [f64; 2]) -> DMat3 {
-    let xyz = |[x, y]: [f64; 2]| DVec3::new(x / y, 1.0, (1.0 - x - y) / y);
-    let p = DMat3::from_cols(xyz(primaries[0]), xyz(primaries[1]), xyz(primaries[2]));
-    let s = p.inverse() * xyz(white);
-    DMat3::from_cols(p.x_axis * s.x, p.y_axis * s.y, p.z_axis * s.z)
-}
-
-const D65: [f64; 2] = [0.3127, 0.3290];
-const REC709: [[f64; 2]; 3] = [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]];
-const P3: [[f64; 2]; 3] = [[0.680, 0.320], [0.265, 0.690], [0.150, 0.060]];
-const REC2020: [[f64; 2]; 3] = [[0.708, 0.292], [0.170, 0.797], [0.131, 0.046]];
 
 fn d3(v: [f32; 3]) -> DVec3 {
     DVec3::from(v.map(f64::from))
 }
 
+/// The functions of one Slang color module: `orr.color`, or orr_color's `orr_color.*`.
+struct Module {
+    name: &'static str,
+    matrix: fn(usize) -> [f32; 9],
+    luminance_rec709: fn([f32; 3]) -> f32,
+    luminance_rec2020: fn([f32; 3]) -> f32,
+    srgb_encode: fn([f32; 3]) -> [f32; 3],
+    srgb_decode: fn([f32; 3]) -> [f32; 3],
+    pq_encode: fn([f32; 3]) -> [f32; 3],
+    pq_decode: fn([f32; 3]) -> [f32; 3],
+}
+
+const MODULES: [Module; 2] = [
+    Module {
+        name: "orr.color",
+        matrix: color_matrix,
+        luminance_rec709,
+        luminance_rec2020,
+        srgb_encode,
+        srgb_decode,
+        pq_encode,
+        pq_decode,
+    },
+    Module {
+        name: "orr_color",
+        matrix: color::matrix,
+        luminance_rec709: color::luminance_rec709,
+        luminance_rec2020: color::luminance_rec2020,
+        srgb_encode: color::srgb_encode,
+        srgb_decode: color::srgb_decode,
+        pq_encode: color::pq_encode,
+        pq_decode: color::pq_decode,
+    },
+];
+
 #[test]
-fn matrices_derive_from_the_primaries() {
+fn matrices_and_luminance_match_orr_color() {
     let (r709, p3, r2020) = (
-        rgb_to_xyz(REC709, D65),
-        rgb_to_xyz(P3, D65),
-        rgb_to_xyz(REC2020, D65),
+        RgbPrimaries::REC709,
+        RgbPrimaries::DISPLAY_P3,
+        RgbPrimaries::REC2020,
     );
     let want = [
-        r709,
-        r709.inverse(),
-        r2020,
-        r2020.inverse(),
-        p3,
-        p3.inverse(),
-        r2020.inverse() * r709,
-        r709.inverse() * r2020,
-        r2020.inverse() * p3,
-        p3.inverse() * r2020,
+        r709.rgb_to_xyz(),
+        r709.xyz_to_rgb(),
+        r2020.rgb_to_xyz(),
+        r2020.xyz_to_rgb(),
+        p3.rgb_to_xyz(),
+        p3.xyz_to_rgb(),
+        r709.matrix_to(r2020),
+        r2020.matrix_to(r709),
+        p3.matrix_to(r2020),
+        r2020.matrix_to(p3),
     ];
-    for (i, w) in want.iter().enumerate() {
-        let got = color_matrix(i);
-        for r in 0..3 {
-            for c in 0..3 {
-                let (g, e) = (f64::from(got[3 * r + c]), w.row(r)[c]);
+    for m in MODULES {
+        for (i, w) in want.iter().enumerate() {
+            let got = DMat3::from_cols_array(&(m.matrix)(i).map(f64::from)).transpose();
+            let close = (got - *w)
+                .to_cols_array()
+                .iter()
+                .zip(w.to_cols_array())
+                .all(|(d, e)| d.abs() <= 1e-7 * e.abs().max(1.0));
+            assert!(close, "{} {}: {got} vs {w}", m.name, COLOR_MATRICES[i]);
+        }
+        let w709 = r709.luminance_weights();
+        let mut rng = Rng::new(40);
+        for _ in 0..1000 {
+            let c = [rng.f32(), rng.f32(), rng.f32()];
+            let y709 = w709.dot(d3(c));
+            let y2020 = orr_color::luminance(d3(c));
+            assert!((f64::from((m.luminance_rec709)(c)) - y709).abs() < 1e-6);
+            assert!((f64::from((m.luminance_rec2020)(c)) - y2020).abs() < 1e-6);
+        }
+    }
+}
+
+#[test]
+fn transfer_functions_match_orr_color() {
+    for m in MODULES {
+        for i in 0..=4096 {
+            let x = f64::from(i) / 4096.0;
+            let c = [x as f32, (x * 0.5) as f32, (-x * 0.01) as f32];
+            let (e, d) = ((m.srgb_encode)(c), (m.srgb_decode)(c));
+            for k in 0..3 {
+                let v = f64::from(c[k]);
+                let (name, e, d) = (m.name, f64::from(e[k]), f64::from(d[k]));
                 assert!(
-                    (g - e).abs() <= 1e-7 * e.abs().max(1.0),
-                    "{} [{r}][{c}]: {g} vs {e}",
-                    COLOR_MATRICES[i]
+                    (e - orr_color::srgb_encode(v)).abs() < 1e-6,
+                    "{name} sRGB encode {v}"
+                );
+                assert!(
+                    (d - orr_color::srgb_decode(v)).abs() < 1e-6,
+                    "{name} sRGB decode {v}"
                 );
             }
         }
+        let (mut worst_signal, mut worst_trip) = (0.0f64, 0.0f64);
+        for i in 0..=4096 {
+            let nits = 10f64.powf(-3.0 + 7.0 * f64::from(i) / 4096.0);
+            let s = (m.pq_encode)([nits as f32; 3])[0];
+            worst_signal = worst_signal.max((f64::from(s) - orr_color::pq_encode(nits)).abs());
+            let back = (m.pq_decode)([s; 3])[0];
+            let exact = orr_color::pq_decode(f64::from(s));
+            worst_trip = worst_trip.max((f64::from(back) - exact).abs() / exact);
+        }
+        // In f32 the exponent 78.8 amplifies rounding in the encode, and 1 / 0.159 the
+        // cancellation in the decode: 1.3e-5 of signal (0.013 of a 10-bit code) and 3.6e-5
+        // relative at worst.
+        assert!(
+            worst_signal < 2e-5,
+            "{} PQ signal error {worst_signal}",
+            m.name
+        );
+        assert!(worst_trip < 5e-5, "{} PQ decode error {worst_trip}", m.name);
     }
-    let mut rng = Rng::new(40);
-    for _ in 0..1000 {
-        let c = [rng.f32(), rng.f32(), rng.f32()];
-        assert!((f64::from(luminance_rec709(c)) - r709.row(1).dot(d3(c))).abs() < 1e-6);
-        assert!((f64::from(luminance_rec2020(c)) - r2020.row(1).dot(d3(c))).abs() < 1e-6);
-    }
-}
-
-fn srgb_encode_ref(x: f64) -> f64 {
-    if x <= 0.003_130_8 {
-        12.92 * x
-    } else {
-        1.055 * x.powf(1.0 / 2.4) - 0.055
-    }
-}
-
-fn srgb_decode_ref(x: f64) -> f64 {
-    if x <= 0.040_45 {
-        x / 12.92
-    } else {
-        ((x + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-const PQ_M1: f64 = 2610.0 / 16384.0;
-const PQ_M2: f64 = 2523.0 / 4096.0 * 128.0;
-const PQ_C1: f64 = 3424.0 / 4096.0;
-const PQ_C2: f64 = 2413.0 / 4096.0 * 32.0;
-const PQ_C3: f64 = 2392.0 / 4096.0 * 32.0;
-
-fn pq_encode_ref(nits: f64) -> f64 {
-    let y = (nits / 10000.0).clamp(0.0, 1.0).powf(PQ_M1);
-    ((PQ_C1 + PQ_C2 * y) / (1.0 + PQ_C3 * y)).powf(PQ_M2)
-}
-
-fn pq_decode_ref(e: f64) -> f64 {
-    let p = e.clamp(0.0, 1.0).powf(1.0 / PQ_M2);
-    10000.0 * ((p - PQ_C1).max(0.0) / (PQ_C2 - PQ_C3 * p)).powf(1.0 / PQ_M1)
 }
 
 #[test]
-fn transfer_functions_match_their_standards() {
+fn hlg_matches_orr_color() {
     for i in 0..=4096 {
-        let x = f64::from(i) / 4096.0;
-        let c = [x as f32, (x * 0.5) as f32, (-x * 0.01) as f32];
-        let (e, d) = (srgb_encode(c), srgb_decode(c));
-        for k in 0..3 {
-            let v = f64::from(c[k]);
-            assert!(
-                (f64::from(e[k]) - srgb_encode_ref(v)).abs() < 1e-6,
-                "srgb encode {v}"
-            );
-            assert!(
-                (f64::from(d[k]) - srgb_decode_ref(v)).abs() < 1e-6,
-                "srgb decode {v}"
-            );
-        }
+        let x = 1.2 * f64::from(i) / 4096.0;
+        let e = color::hlg_encode([x as f32; 3])[0];
+        assert!(
+            (f64::from(e) - orr_color::hlg_encode(x)).abs() < 1e-6,
+            "encode {x}"
+        );
+        let d = color::hlg_decode([x as f32; 3])[0];
+        let want = orr_color::hlg_decode(x);
+        assert!(
+            (f64::from(d) - want).abs() < 2e-6 * want.max(1.0),
+            "decode {x}"
+        );
     }
-    let (mut worst_signal, mut worst_trip) = (0.0f64, 0.0f64);
-    for i in 0..=4096 {
-        let nits = 10f64.powf(-3.0 + 7.0 * f64::from(i) / 4096.0);
-        let s = pq_encode([nits as f32; 3])[0];
-        worst_signal = worst_signal.max((f64::from(s) - pq_encode_ref(nits)).abs());
-        let back = pq_decode([s; 3])[0];
-        let exact = pq_decode_ref(f64::from(s));
-        worst_trip = worst_trip.max((f64::from(back) - exact).abs() / exact);
-    }
-    // In f32 the exponent 78.8 amplifies rounding in the encode, and 1 / 0.159 the
-    // cancellation in the decode: 1.3e-5 of signal (0.013 of a 10-bit code) and 3.6e-5
-    // relative at worst.
-    assert!(worst_signal < 2e-5, "PQ signal error {worst_signal}");
-    assert!(worst_trip < 5e-5, "PQ decode error {worst_trip}");
 }
 
 fn ictcp_ref(nits: DVec3) -> DVec3 {
@@ -133,7 +150,12 @@ fn ictcp_ref(nits: DVec3) -> DVec3 {
         2048.0, 6610.0, 17933.0, 2048.0, -13613.0, -17390.0, 0.0, 7003.0, -543.0,
     ]) / 4096.0;
     let l = lms * nits;
-    ictcp * DVec3::new(pq_encode_ref(l.x), pq_encode_ref(l.y), pq_encode_ref(l.z))
+    ictcp
+        * DVec3::new(
+            orr_color::pq_encode(l.x),
+            orr_color::pq_encode(l.y),
+            orr_color::pq_encode(l.z),
+        )
 }
 
 #[test]
@@ -232,7 +254,7 @@ fn gamut_compression_matches_rgc_and_keeps_order() {
 
 #[test]
 fn gamut_compression_brings_rec2020_inside_rec709() {
-    let to709 = rgb_to_xyz(REC709, D65).inverse() * rgb_to_xyz(REC2020, D65);
+    let to709 = RgbPrimaries::REC2020.matrix_to(RgbPrimaries::REC709);
     // The Rec.2020 cube's faces, where every distance limit is reached.
     let n = 400;
     let mut worst = f64::MAX;

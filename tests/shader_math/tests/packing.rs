@@ -402,7 +402,7 @@ fn rotations_decode_like_orr_pack() {
         let angle = 2.0 * dot.abs().min(1.0).acos().to_degrees();
         assert!(angle <= 0.17, "{q:?} -> {d:?}: {angle} deg");
         let m = instance_rotation(code, false);
-        let r = glam::DMat3::from_quat(glam::DQuat::from_array(d));
+        let r = orr_math::DMat3::from_quat(orr_math::DQuat::from_array(d));
         for i in 0..3 {
             for (j, w) in r.row(i).to_array().into_iter().enumerate() {
                 assert!((f64::from(m[3 * i + j]) - w).abs() < 1e-6);
@@ -424,9 +424,9 @@ fn exact_axis_rotations_are_the_24_proper_rotations() {
             m.iter().all(|&v| v == 0.0 || v == 1.0 || v == -1.0),
             "{index}: {m:?}"
         );
-        let r = glam::Mat3::from_cols_array(&m).transpose();
+        let r = orr_math::Mat3::from_cols_array(&m).transpose();
         assert_eq!(r.determinant(), 1.0, "{index}");
-        assert_eq!(r * r.transpose(), glam::Mat3::IDENTITY, "{index}");
+        assert_eq!(r * r.transpose(), orr_math::Mat3::IDENTITY, "{index}");
         assert!(!seen.contains(&m), "{index} repeats");
         seen.push(m);
     }

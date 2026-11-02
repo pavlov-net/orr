@@ -1038,10 +1038,9 @@ fn a_constant_color_folds_into_its_factor_in_the_image_primaries() {
     let m = Material::from_bytes(&read_blob(&a, a.find(model.materials[0]).unwrap(), 0)).unwrap();
     assert_eq!(m.textures[slot::EMISSION].texture, AssetId::NONE);
     let (rec709, p3) = (RgbPrimaries::REC709, RgbPrimaries::DISPLAY_P3);
-    let factor = orr_color::mul(&rec709.matrix_to(p3), [2.0, 1.0, 0.5]);
+    let factor = rec709.matrix_to(p3) * orr_math::DVec3::new(2.0, 1.0, 0.5);
     let texel = texel.map(|c| orr_color::srgb_decode(f64::from(c) / 255.0));
-    let product = std::array::from_fn(|c| factor[c] * texel[c]);
-    let want = orr_color::mul(&p3.matrix_to(rec709), product);
+    let want = p3.matrix_to(rec709) * (factor * orr_math::DVec3::from(texel));
     for c in 0..3 {
         assert!(
             (f64::from(m.emission_color[c]) - want[c]).abs() < 1e-4,

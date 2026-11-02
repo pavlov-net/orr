@@ -1,5 +1,6 @@
-//! orr's Slang math libraries compiled for the CPU (`slang/math.slang`), with safe
-//! wrappers for the tests, and the statistics the sampling tests use.
+//! orr's and orr_color's Slang math compiled for the CPU (`slang/math.slang`,
+//! `slang/color.slang`), with safe wrappers for the tests, and the statistics the sampling
+//! tests use.
 
 pub mod stats;
 
@@ -116,6 +117,16 @@ mod ffi {
         pub(crate) fn orr_ictcp_from_rec2020(c: *const f32, out: *mut f32);
         pub(crate) fn orr_rec2020_from_ictcp(c: *const f32, out: *mut f32);
         pub(crate) fn orr_gamut_compress(c: *const f32, out: *mut f32);
+
+        pub(crate) fn orr_color_primaries_matrix(which: u32, out: *mut f32);
+        pub(crate) fn orr_color_luminance_rec709(c: *const f32) -> f32;
+        pub(crate) fn orr_color_luminance_rec2020(c: *const f32) -> f32;
+        pub(crate) fn orr_color_srgb_encode(c: *const f32, out: *mut f32);
+        pub(crate) fn orr_color_srgb_decode(c: *const f32, out: *mut f32);
+        pub(crate) fn orr_color_pq_encode(c: *const f32, out: *mut f32);
+        pub(crate) fn orr_color_pq_decode(c: *const f32, out: *mut f32);
+        pub(crate) fn orr_color_hlg_encode(c: *const f32, out: *mut f32);
+        pub(crate) fn orr_color_hlg_decode(c: *const f32, out: *mut f32);
     }
 }
 
@@ -443,4 +454,60 @@ pub fn rec2020_from_ictcp(ictcp: V3) -> V3 {
 }
 pub fn gamut_compress(c: V3) -> V3 {
     out!(V3, |o| ffi::orr_gamut_compress(c.as_ptr(), o.as_mut_ptr()))
+}
+
+/// orr_color's Slang modules (`orr_color.*`). The functions at the crate root are
+/// `orr.color`'s.
+pub mod color {
+    use super::{M3, V3, ffi};
+
+    /// Matrix `which` of [`COLOR_MATRICES`](super::COLOR_MATRICES), row-major.
+    pub fn matrix(which: usize) -> M3 {
+        out!(M3, |o| ffi::orr_color_primaries_matrix(
+            which as u32,
+            o.as_mut_ptr()
+        ))
+    }
+    pub fn luminance_rec709(c: V3) -> f32 {
+        call!(ffi::orr_color_luminance_rec709(c.as_ptr()))
+    }
+    pub fn luminance_rec2020(c: V3) -> f32 {
+        call!(ffi::orr_color_luminance_rec2020(c.as_ptr()))
+    }
+    pub fn srgb_encode(c: V3) -> V3 {
+        out!(V3, |o| ffi::orr_color_srgb_encode(
+            c.as_ptr(),
+            o.as_mut_ptr()
+        ))
+    }
+    pub fn srgb_decode(c: V3) -> V3 {
+        out!(V3, |o| ffi::orr_color_srgb_decode(
+            c.as_ptr(),
+            o.as_mut_ptr()
+        ))
+    }
+    pub fn pq_encode(nits: V3) -> V3 {
+        out!(V3, |o| ffi::orr_color_pq_encode(
+            nits.as_ptr(),
+            o.as_mut_ptr()
+        ))
+    }
+    pub fn pq_decode(signal: V3) -> V3 {
+        out!(V3, |o| ffi::orr_color_pq_decode(
+            signal.as_ptr(),
+            o.as_mut_ptr()
+        ))
+    }
+    pub fn hlg_encode(c: V3) -> V3 {
+        out!(V3, |o| ffi::orr_color_hlg_encode(
+            c.as_ptr(),
+            o.as_mut_ptr()
+        ))
+    }
+    pub fn hlg_decode(signal: V3) -> V3 {
+        out!(V3, |o| ffi::orr_color_hlg_decode(
+            signal.as_ptr(),
+            o.as_mut_ptr()
+        ))
+    }
 }

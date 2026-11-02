@@ -1,4 +1,4 @@
-use glam::DVec3;
+use orr_math::DVec3;
 use orr_shaders::AliasEntry;
 use shader_math::stats::{Rng, SphereGrid, chi_square_p};
 use shader_math::*;

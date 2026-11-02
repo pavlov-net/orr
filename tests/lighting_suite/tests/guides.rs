@@ -29,8 +29,7 @@ fn rgb(p: [f32; 4]) -> Vec3 {
 /// A material color as the G-buffer holds it: Rec.709 converted to Rec.2020.
 fn rec2020(c: [f32; 3]) -> Vec3 {
     let m = RgbPrimaries::REC709.matrix_to(RgbPrimaries::REC2020);
-    let c = c.map(f64::from);
-    Vec3::from_array(m.map(|r| (r[0] * c[0] + r[1] * c[1] + r[2] * c[2]) as f32))
+    (m * orr_math::DVec3::from(c.map(f64::from))).as_vec3()
 }
 
 /// Within one 8-bit step and `slack` of `want` in every channel.

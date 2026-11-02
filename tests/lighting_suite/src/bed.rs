@@ -348,7 +348,7 @@ fn plume() -> AssetSpec {
 pub fn water_transmission() -> [f64; 3] {
     let color = WATER_SIGMA.map(|s| f64::from(-s).exp());
     let m = orr_color::RgbPrimaries::REC709.matrix_to(orr_color::RgbPrimaries::REC2020);
-    std::array::from_fn(|r| (0..3).map(|k| m[r][k] * color[k]).sum())
+    (m * DVec3::from(color)).to_array()
 }
 
 /// Unpolarized Fresnel reflectance into a medium `eta` times denser at incidence cosine `c`.

@@ -3986,15 +3986,8 @@ fn a_color_factor_multiplies_its_texel_in_the_texture_primaries() {
     let texel = TINT_TEXEL.map(|c| f64::from(srgb_decode(f32::from(c) / 255.0)));
     for (range, &(model, primaries)) in placed.ranges.iter().zip(&TINTED) {
         let p = orr_color::Primaries::from(primaries).rgb();
-        let factor = orr_color::mul(
-            &RgbPrimaries::REC709.matrix_to(p),
-            TINT_FACTOR.map(f64::from),
-        );
-        let product = std::array::from_fn(|c| factor[c] * texel[c]);
-        let want = Vec3::from(orr_color::vec_f32(orr_color::mul(
-            &p.matrix_to(RgbPrimaries::REC2020),
-            product,
-        )));
+        let factor = RgbPrimaries::REC709.matrix_to(p) * DVec3::from(TINT_FACTOR.map(f64::from));
+        let want = (p.matrix_to(RgbPrimaries::REC2020) * (factor * DVec3::from(texel))).as_vec3();
         let id = range.first + 1;
         let i = g.ids.iter().position(|&p| p == id).expect("drawn");
         let raster = decode_core(g.a[i], g.b[i]).base_color;

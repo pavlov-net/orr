@@ -1,11 +1,11 @@
 //! The global material table and its writer.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use bytemuck::{Pod, Zeroable};
-use orr_color::{RgbPrimaries, mat_f32, mul_f32};
+use orr_color::RgbPrimaries;
 use orr_gpu::{Allocation, Device, GpuPtr, MemoryKind, SamplerIndex, TextureIndex};
 use orr_pack::material::{Material, slot};
 use orr_pack::texture::TextureHeader;
@@ -75,11 +75,13 @@ pub(crate) fn candidate_class(flags: impl IntoIterator<Item = u32>) -> Option<u8
     classes.all(|c| c == first).then_some(first)
 }
 
-const REC709_TO_REC2020: [[f32; 3]; 3] =
-    mat_f32(RgbPrimaries::REC709.matrix_to(RgbPrimaries::REC2020));
-
 fn rec2020(c: [f32; 3]) -> [f32; 3] {
-    mul_f32(&REC709_TO_REC2020, c)
+    static REC709_TO_REC2020: LazyLock<orr_math::Mat3> = LazyLock::new(|| {
+        RgbPrimaries::REC709
+            .matrix_to(RgbPrimaries::REC2020)
+            .as_mat3()
+    });
+    (*REC709_TO_REC2020 * orr_math::Vec3::from(c)).to_array()
 }
 
 impl MaterialGpu {
