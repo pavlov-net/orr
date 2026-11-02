@@ -7,9 +7,8 @@
 //! and borders with other sections move alike. Normals become the area-weighted face
 //! normals at each position. The baked sections are then simplified to `target_error`.
 
-use std::collections::HashMap;
-
 use orr_math::{DVec3, Vec3};
+use rustc_hash::FxHashMap;
 
 use super::lod::{self, Parts, Welded};
 use super::{Grid, SectionMaps, StaticDisplacement};
@@ -30,7 +29,7 @@ pub(crate) fn bake(
     split(w, parts, &baked, d.max_edge);
 
     // Mean displacement and normal per position over the baked vertices.
-    let mut at: HashMap<[u32; 3], (f64, DVec3, u32)> = HashMap::new();
+    let mut at: FxHashMap<[u32; 3], (f64, DVec3, u32)> = FxHashMap::default();
     for (s, r) in w.sections.iter().enumerate() {
         let Some(disp) = maps[s].displacement.as_ref().filter(|_| baked[s]) else {
             continue;
@@ -60,7 +59,7 @@ pub(crate) fn bake(
 /// `max_edge`; triangle parts follow their source triangle.
 fn split(w: &mut Welded, parts: &mut Parts, baked: &[bool], max_edge: f32) {
     let max2 = f64::from(max_edge) * f64::from(max_edge);
-    let mut midpoints: HashMap<(u32, u32), u32> = HashMap::new();
+    let mut midpoints: FxHashMap<(u32, u32), u32> = FxHashMap::default();
     let mut indices = Vec::with_capacity(w.indices.len());
     let mut of_triangle = Vec::with_capacity(parts.of_triangle.len());
     let mut sections = Vec::with_capacity(w.sections.len());
@@ -145,7 +144,7 @@ fn midpoint(w: &mut Welded, a: u32, b: u32) -> u32 {
 /// Normals of the baked sections' vertices: the area-weighted face normals at their
 /// position.
 fn smooth_normals(w: &mut Welded, baked: &[bool]) {
-    let mut sums: HashMap<[u32; 3], DVec3> = HashMap::new();
+    let mut sums: FxHashMap<[u32; 3], DVec3> = FxHashMap::default();
     let p = |w: &Welded, v: u32| Vec3::from(w.positions[v as usize]).as_dvec3();
     for (s, r) in w.sections.iter().enumerate() {
         if !baked[s] {

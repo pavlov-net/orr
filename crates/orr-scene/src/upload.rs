@@ -6,9 +6,10 @@
 //! records that write one field of each table entry (strided, or masked bits of a word)
 //! follow in their own dispatches when there are any.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use orr_gpu::{CommandList, ComputePipeline, Device, GpuAddress, GpuPtr, Hazards, Stages};
+use rustc_hash::FxHashMap;
 
 use crate::Result;
 use crate::memory::UploadWindow;
@@ -160,8 +161,8 @@ pub(crate) fn trim(mut records: Vec<Record>) -> [Vec<Record>; 3] {
     let mut words = Intervals::default();
     // Strided coverage per lattice (stride, first word mod stride), in lattice indices
     // (word / stride): full writes and masked writes.
-    let mut full: HashMap<(u32, u64), Intervals> = HashMap::new();
-    let mut masked: HashMap<(u32, u64), Intervals> = HashMap::new();
+    let mut full: FxHashMap<(u32, u64), Intervals> = FxHashMap::default();
+    let mut masked: FxHashMap<(u32, u64), Intervals> = FxHashMap::default();
     let mut passes = [Vec::new(), Vec::new(), Vec::new()];
     for r in records.into_iter().filter(|r| r.count > 0) {
         let a = r.dst / 4;

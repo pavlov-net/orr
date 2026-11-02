@@ -23,7 +23,7 @@
 //! holding those pages locked until no copy uses the cut, and moves tiles of a texture that
 //! lost one back beside its others.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -33,6 +33,7 @@ use orr_gpu::{
 };
 use orr_pack::mesh::{MeshHeader, StoredPage};
 use orr_pack::{Blob, Codec};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::accel::{self, AccelShared, Animated, ClusterInfo, FineCut, PageMicromap};
 use crate::clas_pool::{self, ClasPool, NO_UNIT, PageBuild, PoolBatch};
@@ -351,8 +352,8 @@ pub(crate) struct Streaming {
     fine_locked: u64,
     /// Finer cuts freed once the frame has completed.
     retired_cuts: Vec<(u64, FineCut)>,
-    mounts: HashMap<MountId, MountStreams>,
-    resident: HashMap<Key, Placed>,
+    mounts: FxHashMap<MountId, MountStreams>,
+    resident: FxHashMap<Key, Placed>,
     /// Pool slots freed once the frame has completed.
     retired: Vec<(u64, PoolSlot)>,
     /// Tiles unbound once the frame has completed.
@@ -361,7 +362,7 @@ pub(crate) struct Streaming {
     unbinds: Vec<TileFree>,
     /// Tiles evicted and not yet unbound by a task sent to the loading side; they do not
     /// load again until then, so their unbind never lands after a new bind.
-    unbinding: HashSet<Key>,
+    unbinding: FxHashSet<Key>,
     feedback: TextureFeedback,
     /// Feedback cells freed once the frame has completed.
     retired_cells: Vec<(u64, u32)>,
@@ -437,12 +438,12 @@ impl Streaming {
             fine: HashMap::new(),
             fine_locked: 0,
             retired_cuts: Vec::new(),
-            mounts: HashMap::new(),
-            resident: HashMap::new(),
+            mounts: FxHashMap::default(),
+            resident: FxHashMap::default(),
             retired: Vec::new(),
             retired_tiles: Vec::new(),
             unbinds: Vec::new(),
-            unbinding: HashSet::new(),
+            unbinding: FxHashSet::default(),
             feedback: TextureFeedback::new(
                 device,
                 b.texture_feedback_cells,

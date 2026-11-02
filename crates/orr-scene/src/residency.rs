@@ -15,7 +15,9 @@
 //! shrinks step by step and units past their hold are evicted down to it; below 80% the
 //! budgets grow back.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+
+use rustc_hash::FxHashMap;
 
 use crate::MountId;
 
@@ -198,7 +200,7 @@ pub(crate) struct Residency {
     limits: Limits,
     /// The share of `limits.budgets` that loads and evictions plan under.
     scale: f64,
-    mounts: HashMap<MountId, Vec<Unit>>,
+    mounts: FxHashMap<MountId, Vec<Unit>>,
     /// Resident units that are not pinned, by last touch, per class.
     lru: [BTreeSet<(u64, Key)>; CLASSES],
     /// Resident plus loading bytes per class.
@@ -206,7 +208,7 @@ pub(crate) struct Residency {
     loading_bytes: [u64; CLASSES],
     resident_units: [u32; CLASSES],
     in_flight: (u32, u64),
-    requests: HashMap<Key, Priority>,
+    requests: FxHashMap<Key, Priority>,
     failed: u32,
     stats: ResidencyStats,
 }
@@ -216,13 +218,13 @@ impl Residency {
         let mut r = Self {
             limits,
             scale: 1.0,
-            mounts: HashMap::new(),
+            mounts: FxHashMap::default(),
             lru: Default::default(),
             used: [0; CLASSES],
             loading_bytes: [0; CLASSES],
             resident_units: [0; CLASSES],
             in_flight: (0, 0),
-            requests: HashMap::new(),
+            requests: FxHashMap::default(),
             failed: 0,
             stats: ResidencyStats::default(),
         };

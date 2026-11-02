@@ -27,8 +27,8 @@ use orr_pack::mesh::{
 };
 use orr_pack::{Aabb, Span, Sphere};
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::hash;
 use super::lod::{self, Parts, Welded};
 use super::{Built, ClusterData, Ctx, Grid, MeshSettings, store_page, write_page};
 
@@ -242,11 +242,11 @@ pub(crate) fn stages(
 fn borders<'a>(
     w: &Welded,
     stages: impl Iterator<Item = &'a [Corner]> + Clone,
-) -> (hash::Set<[i32; 3]>, hash::Set<[i32; 3]>) {
+) -> (FxHashSet<[i32; 3]>, FxHashSet<[i32; 3]>) {
     let shared = lod::shared_cells(stages.clone().map(|c| c.iter().map(|&(_, cell, _)| cell)));
     let mut seams = lod::seam_cells(w, stages.clone().flatten().map(|&(v, cell, _)| (v, cell)));
     for corners in stages {
-        let mut section_of: hash::Map<[i32; 3], u8> = hash::Map::default();
+        let mut section_of: FxHashMap<[i32; 3], u8> = FxHashMap::default();
         for &(_, cell, section) in corners {
             if *section_of.entry(cell).or_insert(section) != section {
                 seams.insert(cell);
@@ -261,10 +261,10 @@ fn borders<'a>(
 fn input<K: std::hash::Hash + Eq>(
     corners: &[Corner],
     key: impl Fn(u32, [i32; 3], u8) -> K,
-    shared: &hash::Set<[i32; 3]>,
-    seams: &hash::Set<[i32; 3]>,
+    shared: &FxHashSet<[i32; 3]>,
+    seams: &FxHashSet<[i32; 3]>,
 ) -> Input {
-    let mut local_of: hash::Map<K, u32> = hash::Map::default();
+    let mut local_of: FxHashMap<K, u32> = FxHashMap::default();
     let mut input = Input {
         welded: Vec::new(),
         cells: Vec::new(),

@@ -11,9 +11,10 @@
 //! the result does not depend on index order.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 
 use orr_math::{DMat3, DQuat, DVec3, Mat3, Quat, Vec3};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::instances::{Instances, Placement, PrototypeSpec, SectionSpec};
@@ -197,7 +198,7 @@ fn pieces(m: &MeshData, min: u32) -> Vec<Piece> {
             parent[ra.max(rb) as usize] = ra.min(rb);
         }
     };
-    let mut by_pos: HashMap<[u32; 3], u32> = HashMap::with_capacity(n);
+    let mut by_pos = FxHashMap::with_capacity_and_hasher(n, FxBuildHasher);
     for (v, p) in m.positions.iter().enumerate() {
         let first = *by_pos.entry(bits(*p)).or_insert(v as u32);
         join(&mut parent, first, v as u32);
@@ -209,8 +210,8 @@ fn pieces(m: &MeshData, min: u32) -> Vec<Piece> {
         }
     }
     let animated = |v: u32| m.parts.as_ref().is_some_and(|p| p.values[v as usize] != 0);
-    let mut tris_of: HashMap<u32, Vec<Tri>> = HashMap::new();
-    let mut skip: HashSet<u32> = HashSet::new();
+    let mut tris_of: FxHashMap<u32, Vec<Tri>> = FxHashMap::default();
+    let mut skip: FxHashSet<u32> = FxHashSet::default();
     for (s, sec) in m.sections.iter().enumerate() {
         for c in m.indices[sec.indices.clone()].chunks_exact(3) {
             let r = root(&mut parent, c[0]);
@@ -300,12 +301,12 @@ fn piece(m: &MeshData, mut tris: Vec<Tri>) -> Piece {
 struct PointGrid<'a> {
     cell: f64,
     points: &'a [DVec3],
-    map: HashMap<[i64; 3], Vec<u32>>,
+    map: FxHashMap<[i64; 3], Vec<u32>>,
 }
 
 impl<'a> PointGrid<'a> {
     fn new(points: &'a [DVec3], cell: f64) -> Self {
-        let mut map: HashMap<[i64; 3], Vec<u32>> = HashMap::new();
+        let mut map: FxHashMap<[i64; 3], Vec<u32>> = FxHashMap::default();
         for (i, p) in points.iter().enumerate() {
             map.entry(cell_of(*p, cell)).or_default().push(i as u32);
         }
@@ -443,7 +444,7 @@ fn matches(m: &MeshData, a: &Piece, b: &Piece, r: DQuat, tol: f64) -> bool {
     let cell = 2.0 * tol;
     let pos = |v: u32| point(m, v);
     let centroid = |p: [DVec3; 3]| (p[0] + p[1] + p[2]) / 3.0;
-    let mut map: HashMap<[i64; 3], Vec<u32>> = HashMap::new();
+    let mut map: FxHashMap<[i64; 3], Vec<u32>> = FxHashMap::default();
     for (i, t) in b.tris.iter().enumerate() {
         map.entry(cell_of(centroid(t.v.map(pos)), cell))
             .or_default()
@@ -500,7 +501,7 @@ fn matches(m: &MeshData, a: &Piece, b: &Piece, r: DQuat, tol: f64) -> bool {
 /// The canonical piece as a mesh about its centroid, with the source section of each of
 /// its sections.
 fn unit_mesh(m: &MeshData, p: &Piece) -> (MeshData, Vec<u16>) {
-    let mut remap: HashMap<u32, u32> = HashMap::new();
+    let mut remap: FxHashMap<u32, u32> = FxHashMap::default();
     let mut out = MeshData {
         positions: Vec::new(),
         normals: Vec::new(),
@@ -851,7 +852,7 @@ mod tests {
     /// Whether `a` and `b` hold the same triangles, corners within `tol` in some rotation.
     fn same_set(a: &TriSet, b: &TriSet, tol: f32) -> bool {
         let key = |t: &[Vec3; 3]| ((t[0] + t[1] + t[2]) / 3.0 / 0.01).floor().as_ivec3();
-        let mut grid: HashMap<IVec3, Vec<usize>> = HashMap::new();
+        let mut grid: FxHashMap<IVec3, Vec<usize>> = FxHashMap::default();
         for (j, (_, t)) in b.iter().enumerate() {
             grid.entry(key(t)).or_default().push(j);
         }

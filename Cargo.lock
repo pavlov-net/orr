@@ -2112,6 +2112,7 @@ dependencies = [
  "png 0.18.1",
  "rayon",
  "roxmltree 0.21.2",
+ "rustc-hash",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -2254,6 +2255,7 @@ dependencies = [
  "orr-math",
  "orr-pack",
  "orr-shaders",
+ "rustc-hash",
  "thiserror 2.0.21",
 ]
 

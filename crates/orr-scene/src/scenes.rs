@@ -15,6 +15,7 @@ use orr_gpu::{
 };
 use orr_pack::AssetId;
 use orr_shaders::PathEntry;
+use rustc_hash::FxHashMap;
 
 use crate::accel::{AccelKernels, AccelLimits, AccelShared};
 use crate::arena::{ArenaReport, ArenaRequest, ViewArena, ViewStep};
@@ -1099,7 +1100,7 @@ impl Core {
     /// Wants the records of every placed page for this step, nearest a focus first, as far as
     /// the instance page budget holds them; the others are left to leave after their hold.
     fn request_pages(&mut self) {
-        let mut wanted: HashMap<u32, f64> = HashMap::new();
+        let mut wanted: FxHashMap<u32, f64> = FxHashMap::default();
         let edge = f64::from(1u32 << self.cell_log2);
         for scene in self.scenes.iter().flatten() {
             let cpu = scene.cpu.lock().unwrap();

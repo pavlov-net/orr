@@ -5,8 +5,8 @@
 
 use meshopt::{SimplifyOptions, SimplifyVertex, ffi};
 
-use super::hash;
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// A sphere and the simplification error of the geometry it bounds.
 #[derive(Copy, Clone)]
@@ -389,7 +389,7 @@ fn boundary_area(
     indices: &[u32],
     locks: &[u8],
     remap: &[u32],
-    edges: &mut hash::Set<u64>,
+    edges: &mut FxHashSet<u64>,
 ) -> f32 {
     edges.clear();
     let edge = |t: &[u32], e: usize| {
@@ -442,7 +442,7 @@ fn dilate_borders(
     bounds: &mut Bounds,
 ) {
     let _z = crate::profile::zone!("clod.dilate");
-    let mut edges = hash::Set::default();
+    let mut edges = FxHashSet::default();
     let old_area = boundary_area(positions.read(), merged, locks, remap, &mut edges);
     if old_area == 0.0 {
         return;
@@ -451,7 +451,7 @@ fn dilate_borders(
     if new_area >= old_area || new_area < old_area / 4.0 {
         return;
     }
-    let mut offsets: hash::Map<u32, [f32; 4]> = hash::Map::default();
+    let mut offsets: FxHashMap<u32, [f32; 4]> = FxHashMap::default();
     let mut perimeter = 0.0f32;
     let at = |v: u32| positions.get(v as usize);
     for t in simplified.chunks_exact(3) {

@@ -24,6 +24,7 @@ bytemuck.workspace = true
 glam.workspace = true
 orr-math.workspace = true
 half = "2.7"
+rustc-hash.workspace = true
 thiserror.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "exr"], optional = true }
 nv-flip = { version = "0.1.2", optional = true }
