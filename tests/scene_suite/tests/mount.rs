@@ -142,9 +142,9 @@ fn cook(tint: f32) -> Arc<[u8]> {
     };
     let records = (0..6)
         .map(|i| Placement {
-            position: DVec3::new(f64::from(i) * 9.0, 0.0, 3.0),
-            rotation: Quat::from_rotation_y(i as f32),
-            scale: Vec3::ONE,
+            position: DVec3::new(f64::from(i) * 9.0, 0.0, 3.0).to_array(),
+            rotation: Quat::from_rotation_y(i as f32).to_array(),
+            scale: [1.0; 3],
             prototype: 0,
         })
         .collect();

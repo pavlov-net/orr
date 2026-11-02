@@ -2068,7 +2068,6 @@ dependencies = [
  "bytemuck",
  "cc",
  "ctt",
- "glam 0.34.1",
  "gltf",
  "half",
  "image",

@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 
-use glam::{Mat3, Mat4, Quat, Vec3};
+use orr_math::{Mat3, Mat4, Quat, Vec3};
 use orr_pack::Affine3;
 use orr_pack::AssetId;
 use orr_pack::clip::{Clip, ClipHeader};
@@ -115,7 +115,7 @@ impl Skeleton {
                 if !graph.in_scene[i] {
                     return Err(format!("skin {s}: joint node {i} is not in the scene"));
                 }
-                if m.row(3).distance(glam::Vec4::W) > 1e-5 || !m.is_finite() {
+                if m.row(3).distance(orr_math::Vec4::W) > 1e-5 || !m.is_finite() {
                     return Err(format!(
                         "skin {s}: inverse bind of node {i} is not an affine transform"
                     ));

@@ -240,7 +240,7 @@ fn mesh_set_cooks_as_dags() {
         let source = tris(dag_read::Cut::Uniform(0.0));
         if !source.is_empty() {
             let b = d.info.header.bounds;
-            let center = glam::Vec3::from(b.min).lerp(glam::Vec3::from(b.max), 0.5);
+            let center = orr_math::Vec3::from(b.min).lerp(orr_math::Vec3::from(b.max), 0.5);
             let size = (0..3).map(|k| b.max[k] - b.min[k]).fold(0.0, f32::max) * 1.05;
             let view = (center, size);
             let base = dag_read::coverage(&source, view, 512);

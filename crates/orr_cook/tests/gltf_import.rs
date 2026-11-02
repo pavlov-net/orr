@@ -284,7 +284,8 @@ fn rigid_skin(path: &Path, blend: Option<usize>) -> (Vec<u32>, Vec<usize>) {
             _ => [1.0, 0.0, 0.0, 0.0],
         })
         .collect();
-    let ib = |t: [f32; 3]| glam::Mat4::from_translation(-glam::Vec3::from(t)).to_cols_array();
+    let ib =
+        |t: [f32; 3]| orr_math::Mat4::from_translation(-orr_math::Vec3::from(t)).to_cols_array();
     let binds = [ib([0.0, 0.0, 0.25]), ib([0.5, 0.0, 0.0])];
     let mut g = Glb::default();
     let pa = g.floats(&pos, "VEC3");
@@ -1394,7 +1395,7 @@ fn instanced(path: &Path, instances: &[([f32; 3], [f32; 4], [f32; 3])]) {
 fn gpu_instancing_becomes_instance_pages() {
     let d = dir("gltf-instancing");
     let path = d.join("forest.glb");
-    let q = glam::Quat::from_rotation_y(0.7).to_array();
+    let q = orr_math::Quat::from_rotation_y(0.7).to_array();
     let instances = [
         ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0]),
         ([3.0, 0.5, -2.0], q, [2.0, 2.0, 2.0]),
@@ -1435,15 +1436,15 @@ fn gpu_instancing_becomes_instance_pages() {
     }
     placed.sort_by(|a, b| a.0[0].total_cmp(&b.0[0]));
     for ((p, x), (t, r, s)) in placed.iter().zip(&instances) {
-        let r = glam::Quat::from_array(*r);
-        let want_p = glam::Vec3::from(*t) + glam::Vec3::new(10.0, 0.0, 0.0);
-        let want_x = r * glam::Vec3::X * s[0];
+        let r = orr_math::Quat::from_array(*r);
+        let want_p = orr_math::Vec3::from(*t) + orr_math::Vec3::new(10.0, 0.0, 0.0);
+        let want_x = r * orr_math::Vec3::X * s[0];
         assert!(
-            (glam::Vec3::from(*p) - want_p).abs().max_element() < 0.01,
+            (orr_math::Vec3::from(*p) - want_p).abs().max_element() < 0.01,
             "{p:?} {want_p}"
         );
         assert!(
-            (glam::Vec3::from(*x) - want_x).abs().max_element() < 0.01,
+            (orr_math::Vec3::from(*x) - want_x).abs().max_element() < 0.01,
             "{x:?} {want_x}"
         );
     }
@@ -1472,7 +1473,7 @@ fn gpu_instancing_becomes_instance_pages() {
 }
 
 /// Every placement of `model` in the archive's instance pages, in world space.
-fn placements(a: &Archive, model: &str) -> Vec<glam::Mat4> {
+fn placements(a: &Archive, model: &str) -> Vec<orr_math::Mat4> {
     let id = AssetId::from_name(model);
     let mut out = Vec::new();
     for e in a
@@ -1490,13 +1491,13 @@ fn placements(a: &Archive, model: &str) -> Vec<glam::Mat4> {
                 continue;
             }
             let r = m.rows;
-            let col = |c: usize| glam::Vec4::new(r[0][c], r[1][c], r[2][c], 0.0);
+            let col = |c: usize| orr_math::Vec4::new(r[0][c], r[1][c], r[2][c], 0.0);
             let t = [0, 1, 2].map(|k| r[k][3] + cell[k] as f32 * 256.0);
-            out.push(glam::Mat4::from_cols(
+            out.push(orr_math::Mat4::from_cols(
                 col(0),
                 col(1),
                 col(2),
-                glam::Vec4::new(t[0], t[1], t[2], 1.0),
+                orr_math::Vec4::new(t[0], t[1], t[2], 1.0),
             ));
         }
     }
@@ -1520,7 +1521,7 @@ fn meshes_layout_places_each_mesh_and_bakes_shears() {
     let ib = g.indices(&[0, 2, 1]);
     let instances = [[2.0f32, 0.0, 0.0], [0.0, 0.0, 7.0]];
     let it = g.floats(&instances, "VEC3");
-    let q = glam::Quat::from_rotation_y(0.6);
+    let q = orr_math::Quat::from_rotation_y(0.6);
     let qa = q.to_array();
     g.write_split(
         &path,
@@ -1545,7 +1546,7 @@ fn meshes_layout_places_each_mesh_and_bakes_shears() {
     };
     let (a, _) = cook(&path, settings).unwrap();
 
-    let close = |got: &[glam::Mat4], want: &[glam::Mat4]| {
+    let close = |got: &[orr_math::Mat4], want: &[orr_math::Mat4]| {
         assert_eq!(got.len(), want.len());
         for w in want {
             assert!(
@@ -1554,29 +1555,33 @@ fn meshes_layout_places_each_mesh_and_bakes_shears() {
             );
         }
     };
-    let t = glam::Mat4::from_translation;
-    let shear = glam::Mat4::from_scale(glam::Vec3::new(2.0, 1.0, 1.0)) * glam::Mat4::from_quat(q);
+    let t = orr_math::Mat4::from_translation;
+    let shear = orr_math::Mat4::from_scale(orr_math::Vec3::new(2.0, 1.0, 1.0))
+        * orr_math::Mat4::from_quat(q);
     // A mirrored copy is placed as it is, not baked.
     close(
         &placements(&a, "g/mesh/0"),
         &[
-            t(glam::Vec3::new(5.0, 0.0, 0.0)),
-            glam::Mat4::from_scale_rotation_translation(
-                glam::Vec3::new(-1.0, 2.0, 1.0),
+            t(orr_math::Vec3::new(5.0, 0.0, 0.0)),
+            orr_math::Mat4::from_scale_rotation_translation(
+                orr_math::Vec3::new(-1.0, 2.0, 1.0),
                 q,
-                glam::Vec3::ZERO,
+                orr_math::Vec3::ZERO,
             ),
         ],
     );
     close(
         &placements(&a, "g/mesh/1"),
         &[
-            t(glam::Vec3::new(2.0, 3.0, 0.0)),
-            t(glam::Vec3::new(0.0, 3.0, 7.0)),
+            t(orr_math::Vec3::new(2.0, 3.0, 0.0)),
+            t(orr_math::Vec3::new(0.0, 3.0, 7.0)),
         ],
     );
     // The sheared copy holds its linear transform in its geometry.
-    close(&placements(&a, "g/mesh/1/baked/0"), &[glam::Mat4::IDENTITY]);
+    close(
+        &placements(&a, "g/mesh/1/baked/0"),
+        &[orr_math::Mat4::IDENTITY],
+    );
     let baked = mesh_of(&a, "g/mesh/1/baked/0/mesh", 0);
     let corners: Vec<[f32; 3]> = baked
         .clusters
@@ -1584,11 +1589,11 @@ fn meshes_layout_places_each_mesh_and_bakes_shears() {
         .flat_map(|c| c.2.iter().flatten().copied())
         .collect();
     for p in quad {
-        let want = shear.transform_point3(glam::Vec3::from(p));
+        let want = shear.transform_point3(orr_math::Vec3::from(p));
         assert!(
             corners
                 .iter()
-                .any(|c| (glam::Vec3::from(*c) - want).abs().max_element() < 1e-3),
+                .any(|c| (orr_math::Vec3::from(*c) - want).abs().max_element() < 1e-3),
             "{want} missing"
         );
     }
@@ -1625,8 +1630,8 @@ fn library_quad(
     texture: &str,
     pixels: impl Fn(u32, u32) -> u8,
 ) -> Archive {
-    use glam::{Vec2, Vec3};
     use orr_cook::{MeshInput, TextureSettings, Usage};
+    use orr_math::{Vec2, Vec3};
     let path = dir(&format!("library-{texture}")).join("t.png");
     std::fs::write(&path, png(64, 64, |x, y| [pixels(x, y); 4])).unwrap();
     let quad = MeshInput {
