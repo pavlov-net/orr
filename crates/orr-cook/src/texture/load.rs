@@ -596,6 +596,49 @@ fn decode_block(vk_format: u32, block: &[u8]) -> Result<[[f32; 4]; 16], String> 
 mod tests {
     use super::*;
 
+    /// 32x32, each quadrant a flat color and alpha, from libwebp at quality 90 with lossless
+    /// alpha: a VP8X file with ALPH and VP8 chunks.
+    const LOSSY_WEBP: &str = concat!(
+        "524946469e00000057454250565038580a000000100000001f00001f0000414c5048140000000120",
+        "d2b6b132a9777e383c161113703ddd1bba2f56503820640000005005009d012a200020003e291086",
+        "42a1a10dfa000c01425a00274ca11c0de01f801fb01feab9c3340bb01fb019df617016898000fef6",
+        "9597fe74f49d257ff5b2ff05592a462084c37acf1af816dfeb454dfd8886267da1eeffda136acacd",
+        "97545137c000",
+    );
+
+    #[test]
+    fn lossy_webp_decodes_its_colors_and_alpha() {
+        let bytes: Vec<u8> = (0..LOSSY_WEBP.len() / 2)
+            .map(|i| u8::from_str_radix(&LOSSY_WEBP[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        let src = decode(&bytes).unwrap();
+        assert!(src.srgb && !src.rg && src.blocks.is_none() && !is_animated(&bytes));
+        let img = &src.layers[0];
+        assert_eq!((img.w, img.h), (32, 32));
+        let quadrants: [[u8; 4]; 4] = [
+            [200, 40, 40, 255],
+            [40, 200, 40, 128],
+            [40, 40, 200, 255],
+            [220, 220, 60, 32],
+        ];
+        for y in 0..32usize {
+            for x in 0..32usize {
+                // Chroma is stored at half size, so colors blend across quadrant edges.
+                if x.abs_diff(16) < 4 || y.abs_diff(16) < 4 {
+                    continue;
+                }
+                let want = quadrants[usize::from(y >= 16) * 2 + usize::from(x >= 16)];
+                let got = img.px[y * 32 + x].map(|c| c * 255.0);
+                for c in 0..3 {
+                    let error = (got[c] - f32::from(want[c])).abs();
+                    assert!(error <= 6.0, "({x}, {y}) channel {c}: {got:?} for {want:?}");
+                }
+                // The alpha chunk is lossless.
+                assert_eq!(got[3].round(), f32::from(want[3]), "({x}, {y})");
+            }
+        }
+    }
+
     #[test]
     fn opaque_bc7_blocks_decode_with_alpha_255() {
         let mut seed = 3u64;
