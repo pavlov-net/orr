@@ -37,8 +37,8 @@ struct Seen
     float roughness[3];
     uint material[3];
     uint triangle[3];      // mesh cluster << 7 | primitive
+    float footprint[3];    // the uv area of the first uv set's footprint
     uint hit;              // bits 0-2: each of the three found the point
-    uint pad[3];
 }
 
 // The context two hits report through the probe surface.
@@ -105,6 +105,11 @@ Found trace(SceneRoot* s, ViewConstants* v, float3 origin, float3 d, float t_max
 SurfaceHit resolve(SceneRoot* s, ViewConstants* v, float3 d, Found f, HitContext context)
 {
     return resolve_hit<Surface>(s, v, d, f.hit.instance_index, uint(f.hit.cluster_id), f.hit.primitive_index, f.hit.barycentrics, f.positions, false, context);
+}
+
+float uv_area(UvFootprint f)
+{
+    return abs(f.dx.x * f.dy.y - f.dx.y * f.dy.x);
 }
 
 float3 pixel_direction(ViewConstants* v, uint2 pixel)
@@ -184,6 +189,7 @@ void same_point(uint3 id: SV_DispatchThreadID)
         o.roughness[0] = a.bsdf.specular_roughness;
         o.material[0] = vc.material;
         o.triangle[0] = (vc.cluster << 7) | visibility_triangle(w);
+        o.footprint[0] = uv_area(p.input.uv[0]);
         o.hit = 1;
 
         RayCone cone = camera_cone(v);
@@ -199,6 +205,7 @@ void same_point(uint3 id: SV_DispatchThreadID)
             o.roughness[1] = b.surface.bsdf.specular_roughness;
             o.material[1] = b.surface.material;
             o.triangle[1] = (b.surface.cluster << 7) | b.surface.primitive;
+            o.footprint[1] = uv_area(b.uv[0]);
             o.hit |= 2;
         }
 
@@ -222,6 +229,7 @@ void same_point(uint3 id: SV_DispatchThreadID)
             o.roughness[2] = c.surface.bsdf.specular_roughness;
             o.material[2] = c.surface.material;
             o.triangle[2] = (c.surface.cluster << 7) | c.surface.primitive;
+            o.footprint[2] = uv_area(c.uv[0]);
             o.hit |= 4;
         }
     }

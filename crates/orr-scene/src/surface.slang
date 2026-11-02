@@ -16,6 +16,12 @@ __exported import view;
 public static const uint HIT_PRIMARY = 0;   // the material resolve and the dielectric camera ray's first hit
 public static const uint HIT_SECONDARY = 1; // every other ray hit
 
+// What a hit's texture footprint is scaled by: the view's mip bias at primary hits.
+public float footprint_bias(uint kind, ViewConstants* v)
+{
+    return kind == HIT_PRIMARY && v != nullptr ? exp2(v.mip_bias) : 1.0;
+}
+
 public struct HitContext
 {
     public uint kind;          // HIT_*
@@ -220,9 +226,7 @@ public DecalLayer surface_decals(SurfaceInput i)
     float3 ng = i.geometric_normal;
     float3 x, y;
     orthonormal_basis(d, x, y);
-    float width = i.context.cone_width;
-    if (i.context.kind == HIT_PRIMARY && i.view != nullptr)
-        width *= exp2(i.view.mip_bias);
+    float width = i.context.cone_width * footprint_bias(i.context.kind, i.view);
     float dn = dot(d, ng);
     dn = abs(dn) < 1e-6 ? (dn < 0.0 ? -1e-6 : 1e-6) : dn;
     float3 px = (x - d * (dot(x, ng) / dn)) * width;
