@@ -1,11 +1,14 @@
 [package]
 name = "orr-color"
-description = "Color constants for orr: primaries, RGB and XYZ matrices, luminance and transfer functions."
+description = "Color for orr: primaries, RGB and XYZ matrices, luminance and transfer functions, in Rust and Slang."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[dependencies]
+orr-math.workspace = true
 
 [lints]
 workspace = true

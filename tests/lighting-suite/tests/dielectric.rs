@@ -513,8 +513,7 @@ fn wavelengths() -> impl Iterator<Item = f64> {
 /// the sampled wavelengths: the color matching functions times the inverse of the round
 /// trip's integral.
 fn spectral_colors() -> impl Fn(f64) -> DVec3 {
-    let m = orr_color::RgbPrimaries::REC2020.xyz_to_rgb();
-    let to_rgb = DMat3::from_cols_array_2d(&m).transpose();
+    let to_rgb = orr_color::RgbPrimaries::REC2020.xyz_to_rgb();
     let rgb = move |nm: f64| to_rgb * cie_xyz(nm);
     let basis = move |nm: f64| {
         let c = rgb(nm).max(DVec3::ZERO);

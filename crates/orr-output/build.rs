@@ -213,7 +213,7 @@ fn spectral(constants: &Path, d65: &Path) -> Vec<(f64, [f64; 3])> {
                 .iter()
                 .find(|&&(nm, _)| nm == r[0])
                 .unwrap_or_else(|| panic!("D65 has no {} nm", r[0]));
-            let rgb = orr_color::mul(&to_rec2020, [r[1], r[2], r[3]]);
+            let rgb = to_rec2020.mul_vec3([r[1], r[2], r[3]].into()).to_array();
             (r[0] / 1000.0, rgb.map(|c| c * s))
         })
         .collect();

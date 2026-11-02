@@ -1,4 +1,4 @@
-use glam::{Affine3A, Mat3, Quat, Vec3};
+use orr_math::{Affine3A, Mat3, Quat, Vec3};
 use shader_maths::stats::Rng;
 use shader_maths::*;
 

@@ -1987,6 +1987,9 @@ dependencies = [
 [[package]]
 name = "orr-color"
 version = "0.0.1"
+dependencies = [
+ "orr-math",
+]
 
 [[package]]
 name = "orr-cook"
@@ -2909,7 +2912,8 @@ name = "shader-maths"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
- "glam 0.34.1",
+ "orr-color",
+ "orr-math",
  "orr-pack",
  "orr-shaders",
 ]
