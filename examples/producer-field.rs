@@ -23,7 +23,7 @@ use orr::orr_pack::material::Material;
 use orr::{
     Affine3, BoundTexture, ClusterTopology, Display, DisplayRequest, FrameDesc, FrameTime,
     GroupWriter, Lens, MaterialGpu, ProducerId, Projection, Renderer, RendererDesc, SceneDesc,
-    SceneLightingSettings, TextureFilter, TransformGroupDesc, ViewDesc, ViewTarget,
+    SceneLightingSettings, TextureFilter, TransformGroupDesc, ViewDesc,
 };
 use orr_math::camera::rh::view;
 use orr_math::{DVec3, UVec2, Vec2, Vec3};
@@ -329,11 +329,6 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                 reset_history: i == 0,
                 mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
-                target: if options.headless {
-                    ViewTarget::AfterRr
-                } else {
-                    ViewTarget::Display
-                },
             })
             .expect("raster view");
 

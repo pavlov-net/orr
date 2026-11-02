@@ -10,13 +10,15 @@
 //! default is NGX's recommended mode (4x Dynamic on RTX 50). `--cycle` steps every few
 //! seconds through 2x, 4x, Dynamic and off, with SDR, PQ and scRGB requests, to show frame
 //! generation turning on and off at run time. Without frame generation the scene renders
-//! without it.
+//! without it. DLSS ray reconstruction denoises the scene at the mode that suits the output
+//! size.
 //!
-//! `dlss --sr [--dlaa | --quality | --balanced | --performance | --ultra-performance]
+//! `dlss --sr [--auto | --dlaa | --quality | --balanced | --performance | --ultra-performance]
 //! [--native] [--clusters] [--headless] [--frames N] [--out file.png]` shows DLSS super
 //! resolution instead: the same scene as a raster debug view, its G-buffer shaded by the
 //! sun and sky alone (or colored by cluster with `--clusters`), rendered at the mode's
-//! render size (Quality by default) and upscaled to the window. `--native` renders it at
+//! render size and upscaled to the window; by default the mode suits the window's size, which
+//! below 1920 x 1080 is DLAA at the window's own size. `--native` renders it at
 //! the output size without SR. Headless runs render 960 x 540 for 64 frames unless told
 //! otherwise and write the last frame as a PNG.
 
@@ -34,9 +36,9 @@ use orr::orr_output::Image;
 use orr::orr_output::orr_dlss::raw::Ngx;
 use orr::orr_output::orr_dlss::{Quality, SrInputs, SuperResolution};
 use orr::{
-    Display, DisplayRequest, DlssSdk, FrameDesc, FrameGenerationMode, FrameTime, Lens, Projection,
-    Renderer, RendererDesc, TextureFilter, ViewDesc, ViewHooks, ViewLighting, ViewOutput,
-    ViewTarget,
+    Display, DisplayRequest, DlssSdk, FrameDesc, FrameGenerationMode, FrameTime, Lens, LitView,
+    Projection, Renderer, RendererDesc, TextureFilter, ViewDesc, ViewHooks, ViewLighting,
+    ViewOutput, ViewTarget,
 };
 use orr_math::camera::rh::view;
 use orr_math::{UVec2, Vec2, Vec3};
@@ -134,6 +136,9 @@ fn run(options: &Options) {
     display.set_ui_per_present(options.has("--ui-per-present"));
 
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
+    if let Some(sdk) = &sdk {
+        renderer.set_dlss(sdk.clone());
+    }
     let _workers = Workers::new(renderer.loading(), 2);
     let showcase = Showcase::load(&mut renderer, gpu);
     let scene = showcase.scene;
@@ -211,7 +216,7 @@ fn run(options: &Options) {
             ..ViewHooks::default()
         };
         f.render_view(
-            &ViewDesc {
+            &LitView {
                 scene,
                 history,
                 position: eye.as_dvec3(),
@@ -221,10 +226,7 @@ fn run(options: &Options) {
                     near: 0.05,
                 },
                 lens: Lens::default(),
-                render_extent: UVec2::from(extent),
-                jitter: Vec2::ZERO,
                 reset_history: i == 0,
-                mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
                 target: ViewTarget::Display,
             },
@@ -268,17 +270,18 @@ pub(crate) struct SrRun {
     pub preset: Option<char>,
 }
 
-/// The SR mode the flags name; Quality without one.
+/// The SR quality the flags name; the default without one.
 fn sr_quality(options: &Options) -> Quality {
     [
         ("--dlaa", Quality::Dlaa),
+        ("--quality", Quality::Quality),
         ("--balanced", Quality::Balanced),
         ("--performance", Quality::Performance),
         ("--ultra-performance", Quality::UltraPerformance),
     ]
     .into_iter()
     .find(|(flag, _)| options.has(flag))
-    .map_or(Quality::Quality, |(_, q)| q)
+    .map_or(Quality::default(), |(_, q)| q)
 }
 
 /// `image`, remade at `extent` when it holds none or one of another size; true when made.
@@ -438,7 +441,6 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
                 reset_history: reset,
                 mip_bias,
                 texture_filter: TextureFilter::Hardware,
-                target: ViewTarget::AfterRr,
             })
             .expect("raster view");
 

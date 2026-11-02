@@ -8,7 +8,8 @@
 //! scene compute every frame; raster and ray tracing both take them. A joint node's glTF
 //! extras may hold wind hints, `{"wind": {"stiffness": s, "flutter": f}}` with both in
 //! 0..1; without them a joint bends more the deeper it is in the skeleton. The camera
-//! frames the tree's bounds and orbits it, or with `--still` stays put.
+//! frames the tree's bounds and orbits it, or with `--still` stays put. Where NGX is available
+//! DLSS ray reconstruction denoises it at the mode that suits the output size.
 //!
 //! `tree-viewer <file.glb | file.gltf | archive.orr> [--model NAME] [--node PATTERN]
 //! [--part-attribute NAME] [--still] [--frames N] [--headless] [--out file.png]`: `--node`
@@ -30,7 +31,8 @@ use examples::shaders::tree_wind;
 use examples::sky::{self, Sky};
 use examples::window::Window;
 use examples::{
-    Capture, Options, Workers, assert_clean, device, entry_head, fixed_time, mount_all_at,
+    Capture, Options, Workers, assert_clean, device, enable_dlss, entry_head, fixed_time,
+    mount_all_at,
 };
 use orr::orr_gpu::{
     Format, MemoryKind, QueueKind, SpecData, TextureDesc, TextureMemory, TextureUsage,
@@ -43,8 +45,8 @@ use orr::orr_pack::skeleton::{MAX_JOINTS, NO_PARENT, SkeletonInfo};
 use orr::orr_pack::{Archive, AssetId, Class, Target};
 use orr::{
     Affine3, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
-    InstancesDesc, Lens, LightId, PackSource, Pose, Projection, Renderer, RendererDesc, SceneDesc,
-    SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc, ViewDesc,
+    InstancesDesc, Lens, LightId, LitView, PackSource, Pose, Projection, Renderer, RendererDesc,
+    SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc,
     ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{
@@ -52,7 +54,7 @@ use orr_cook::{
     PartAttribute, Source,
 };
 use orr_math::camera::rh::view;
-use orr_math::{DVec3, Mat4, UVec2, Vec2, Vec3, Vec4};
+use orr_math::{DVec3, Mat4, Vec2, Vec3, Vec4};
 
 const TREE: &str = "tree";
 const GROUND: &str = "ground";
@@ -424,6 +426,7 @@ fn run(options: &Options) -> Option<Capture> {
         .expect("display")
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
+    enable_dlss(&mut renderer);
     let _workers = Workers::new(renderer.loading(), 2);
     let surroundings = cook_surroundings((radius * 8.0).max(40.0));
     let (mounts, mut frame) = mount_all_at(
@@ -634,7 +637,7 @@ fn run(options: &Options) -> Option<Capture> {
             ..ViewOutput::default()
         };
         f.render_view(
-            &ViewDesc {
+            &LitView {
                 scene,
                 history,
                 position: eye.as_dvec3(),
@@ -644,10 +647,7 @@ fn run(options: &Options) -> Option<Capture> {
                     near: 0.05,
                 },
                 lens: Lens::default(),
-                render_extent: UVec2::from(extent),
-                jitter: Vec2::ZERO,
                 reset_history: i == 0,
-                mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
                 target,
             },

@@ -24,15 +24,15 @@ use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
     Affine3, DirectionalLight, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter,
-    HookPass, InstanceFlags, InstancesDesc, Lens, Light, LightId, PackSource, Projection, Renderer,
-    RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
-    TransformGroupDesc, ViewDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    HookPass, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, PackSource, Projection,
+    Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
+    TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_atmosphere::presets::{LUNAR_ANGULAR_RADIUS, lunar_albedo, lunar_disc, solar_disc};
 use orr_atmosphere::{Atmosphere, AtmosphereState, HeightFog};
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshSettings, Source};
 use orr_math::camera::rh::view;
-use orr_math::{DVec3, UVec2, Vec2, Vec3};
+use orr_math::{DVec3, Vec3};
 
 const NEAR: &str = "near";
 const FAR: &str = "far";
@@ -321,7 +321,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             ..ViewHooks::default()
         };
         f.render_view(
-            &ViewDesc {
+            &LitView {
                 scene,
                 history,
                 position: EYE.as_dvec3(),
@@ -331,10 +331,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                     near: 0.05,
                 },
                 lens: Lens::default(),
-                render_extent: UVec2::from(extent),
-                jitter: Vec2::ZERO,
                 reset_history: i == 0,
-                mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
                 target,
             },

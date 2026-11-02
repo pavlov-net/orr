@@ -7,7 +7,7 @@ use orr_scene::{
     Affine3, CopyVariant, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstanceGpu,
     InstanceRange, InstancesDesc, Lens, Light, LightGpu, MaterialGpu, MaterialId, ModelId, Pose,
     Projection, RendererDesc, SceneDesc, SceneId, SceneRoot, Scenes, SlotStateGpu, TextureFilter,
-    TransformGroupDesc, TransformGroupId, ViewConstants, ViewDesc, ViewTarget, WorldPos,
+    TransformGroupDesc, TransformGroupId, ViewConstants, ViewDesc, WorldPos,
 };
 use scene_suite::pipeline;
 use scene_suite::shaders::{placement, reconstruct};
@@ -495,7 +495,6 @@ fn view_constants_project_and_reconstruct_render_positions() {
             reset_history: true,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
-            target: ViewTarget::AfterRr,
         })
         .unwrap();
 
@@ -602,7 +601,6 @@ fn exposure_slots_alternate_per_render_of_a_view() {
                     reset_history: false,
                     mip_bias: 0.0,
                     texture_filter: TextureFilter::Hardware,
-                    target: ViewTarget::AfterRr,
                 })
                 .unwrap();
             wait(f.end(&[]).unwrap());
@@ -680,7 +678,6 @@ fn copies_are_placed_relative_to_the_eye_from_cells() {
             reset_history: false,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
-            target: ViewTarget::AfterRr,
         })
         .unwrap();
     wait(f.end(&[]).unwrap());

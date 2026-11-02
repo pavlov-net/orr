@@ -2,7 +2,8 @@
 //! a glowing panel on a ground, under a cooked sky and a 100 klx sun. Each frame traces one
 //! path per pixel, auto exposure meters and adapts to the result, and on Windows an egui
 //! overlay shows the exposure. The camera orbits the scene; a still camera averages its
-//! frames in a scene-referred hook.
+//! frames in a scene-referred hook. Windowed runs denoise with DLSS ray reconstruction where
+//! NGX is available.
 //!
 //! `viewer [--still] [--frames N] [--headless] [--out file.png]`. Headless runs keep the
 //! camera still, render 480 x 270 for 120 frames unless told otherwise and write the last
@@ -15,22 +16,22 @@ use examples::average::Average;
 use examples::overlay::Overlay;
 use examples::scene::{FOV_Y, Showcase, TARGET, orbit_eye};
 use examples::window::Window;
-use examples::{Capture, Options, Workers, assert_clean, device, fixed_time};
+use examples::{Capture, Options, Workers, assert_clean, device, enable_dlss, fixed_time};
 use orr::orr_gpu::{Format, QueueKind, TextureDesc, TextureMemory, TextureUsage, TimelinePoint};
 use orr::{
-    Display, DisplayRequest, ExposureTelemetry, FrameDesc, FrameTime, HookPass, Lens, Projection,
-    Renderer, RendererDesc, ResolvedDisplay, ScreenshotRequest, TextureFilter, ViewDesc, ViewHooks,
-    ViewLighting, ViewOutput, ViewTarget,
+    Display, DisplayRequest, ExposureTelemetry, FrameDesc, FrameTime, HookPass, Lens, LitView,
+    Projection, Renderer, RendererDesc, ResolvedDisplay, ScreenshotRequest, TextureFilter,
+    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
+use orr_math::Vec3;
 use orr_math::camera::rh::view;
-use orr_math::{UVec2, Vec2, Vec3};
 
 const HEADLESS_EXTENT: [u32; 2] = [480, 270];
 const HEADLESS_FRAMES: u64 = 120;
 /// Radians per second.
 const ORBIT_RATE: f64 = 0.2;
 /// Where a still camera stands on the orbit, radians.
-const STILL_ANGLE: f64 = 1.3;
+pub(crate) const STILL_ANGLE: f64 = 1.3;
 /// Frames a still camera renders before it starts averaging, while exposure settles.
 const ACCUMULATE_AFTER: u64 = 30;
 
@@ -61,6 +62,9 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         .expect("display")
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
+    if !options.headless {
+        enable_dlss(&mut renderer);
+    }
     let _workers = Workers::new(renderer.loading(), 2);
     let showcase = Showcase::load(&mut renderer, gpu);
     let scene = showcase.scene;
@@ -161,7 +165,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             ..ViewHooks::default()
         };
         f.render_view(
-            &ViewDesc {
+            &LitView {
                 scene,
                 history,
                 position: eye.as_dvec3(),
@@ -171,10 +175,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                     near: 0.05,
                 },
                 lens: Lens::default(),
-                render_extent: UVec2::from(extent),
-                jitter: Vec2::ZERO,
                 reset_history: i == 0,
-                mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
                 target,
             },

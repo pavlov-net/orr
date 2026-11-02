@@ -245,7 +245,8 @@ const OVERLAY: &str = "transparency overlay";
 const CULL: Span = Span::new(ViewStep::Raster, ViewStep::Raster);
 /// The G-buffer and what `load_gsurface` and the transparency point read beside it.
 const GBUFFER: Span = Span::new(ViewStep::Raster, ViewStep::Transparency);
-const OVERLAY_SPAN: Span = Span::new(ViewStep::Transparency, ViewStep::Transparency);
+/// Ray reconstruction may composite the overlay itself.
+const OVERLAY_SPAN: Span = Span::new(ViewStep::Transparency, ViewStep::Rr);
 
 /// The raster's targets in the view's arena, taken at one layout.
 struct Transient {

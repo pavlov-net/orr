@@ -40,7 +40,7 @@ use orr_scene::{
     ProducerClusterGpu, ProducerDesc, ProducerId, ProducerStateGpu, ProducerStats, ProducerUpdate,
     Projection, RasterView, RendererDesc, SceneDesc, SceneId, SceneWriter, Scenes, SubdDesc,
     TessellationStats, TextureFilter, TransformGroupDesc, TransformGroupId, TransparencyPass,
-    ViewDesc, ViewHistoryId, ViewTarget, VisibleCluster, material_flags, tessellation,
+    ViewDesc, ViewHistoryId, VisibleCluster, material_flags, tessellation,
 };
 use orr_shaders::bytemuck::Zeroable;
 use scene_suite::shaders::{
@@ -278,7 +278,6 @@ impl Field {
                 reset_history: self.frame <= 2,
                 mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
-                target: ViewTarget::AfterRr,
             })
             .unwrap();
         if let Some((radiance, hook)) = hook {
@@ -991,7 +990,6 @@ impl Plane {
                 reset_history: self.frame <= 2,
                 mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
-                target: ViewTarget::AfterRr,
             })
             .unwrap();
         self.frame += 1;
@@ -2161,7 +2159,6 @@ impl CageScene {
                 reset_history: self.frame <= 2,
                 mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
-                target: ViewTarget::AfterRr,
             })
             .unwrap();
         self.frame += 1;
@@ -2576,7 +2573,6 @@ impl<'d> Strands<'d> {
                 reset_history: first,
                 mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
-                target: ViewTarget::AfterRr,
             })
             .unwrap();
         finish(self.d, f);

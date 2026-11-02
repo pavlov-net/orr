@@ -46,7 +46,9 @@ pub use hooks::{
     ChainImages, DistortionField, HookInputs, HookPass, HookPoint, Hooks, Image, hook_requests,
 };
 pub use motion_blur::{MOTION_BLUR_MAX_RADIUS, MotionBlurPass};
-pub use orr_dlss::{self, DlssSdk, Support as DlssSupport};
+pub use orr_dlss::{
+    self, DlssSdk, Mode as DlssMode, Quality as DlssQuality, Support as DlssSupport,
+};
 pub use orr_scene::orr_gpu::{HdrMetadata, LowLatency, OutputFormat, PresentMode};
 pub use passes::{
     CapturePass, ComposePass, ComposeRoot, ComposeSource, ExposurePass, HookInputsPass,
@@ -55,7 +57,7 @@ pub use passes::{
 pub use present::{Display, DisplayFrame, Presented, UI_PASS};
 pub use screenshot::{Primaries, Screenshot, ScreenshotRequest};
 pub use ui::{UiLayer, UiPass};
-pub use view::{GlareMethod, OutputDebug, PostQuality, ViewOutput};
+pub use view::{GlareMethod, OutputDebug, PostQuality, Reconstruction, ViewOutput};
 pub use white_balance::{
     AutoWhiteBalance, D65_XY, WHITE_BALANCE_CCT, WHITE_BALANCE_DUV, cct_duv_from_xy,
     xy_from_cct_duv,

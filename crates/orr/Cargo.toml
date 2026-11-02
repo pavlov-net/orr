@@ -18,6 +18,7 @@ pcl-stats = ["orr_output/pcl-stats"]
 orr_scene.workspace = true
 orr_lighting.workspace = true
 orr_output.workspace = true
+orr_math.workspace = true
 thiserror.workspace = true
 
 [build-dependencies]

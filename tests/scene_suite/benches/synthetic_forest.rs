@@ -23,7 +23,7 @@ use orr::{
     Affine3, Budgets, Display, FrameDesc, FrameStats, FrameTime, GroupWriter, InstanceFlags,
     InstanceRange, InstancesDesc, Lens, LoadState, Loading, ModelId, MountId, PackSource,
     Projection, RasterView, Renderer, RendererDesc, SceneDesc, SceneId, TextureFilter,
-    TransformGroupDesc, ViewDesc, ViewHistoryId, ViewTarget,
+    TransformGroupDesc, ViewDesc, ViewHistoryId,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshParts, MeshSettings, Source,
@@ -923,13 +923,13 @@ impl Forest {
     }
 }
 
-fn view_desc<'a>(
+fn view_desc(
     scene: SceneId,
     history: ViewHistoryId,
     args: &Args,
     shot: &Shot,
     frame: u64,
-) -> ViewDesc<'a> {
+) -> ViewDesc {
     ViewDesc {
         scene,
         history,
@@ -945,7 +945,6 @@ fn view_desc<'a>(
         reset_history: frame <= 3,
         mip_bias: 0.0,
         texture_filter: TextureFilter::Hardware,
-        target: ViewTarget::AfterRr,
     }
 }
 

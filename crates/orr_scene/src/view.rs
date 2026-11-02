@@ -163,19 +163,9 @@ pub struct LensDistortion {
     pub chromatic_aberration: f32,
 }
 
-/// Where a view's image goes.
-#[derive(Clone, Copy)]
-pub enum ViewTarget<'a> {
-    /// The frame's display.
-    Display,
-    Texture(&'a Texture),
-    /// Headless: the view stops after ray reconstruction.
-    AfterRr,
-}
-
 /// One camera rendering one scene this frame.
 #[derive(Clone, Copy)]
-pub struct ViewDesc<'a> {
+pub struct ViewDesc {
     /// Must be listed in the frame.
     pub scene: SceneId,
     pub history: ViewHistoryId,
@@ -194,7 +184,6 @@ pub struct ViewDesc<'a> {
     pub mip_bias: f32,
     /// How the view filters material textures.
     pub texture_filter: TextureFilter,
-    pub target: ViewTarget<'a>,
 }
 
 /// What a view's raster half hands to the passes after it. Depth, motion and the HZB stay
@@ -300,7 +289,7 @@ pub(crate) fn jittered(clip_from_view: Mat4, jitter: Vec2, extent: UVec2) -> Mat
 
 /// Builds the view's constants and moves its history on to this frame.
 pub(crate) fn view_constants(
-    desc: &ViewDesc<'_>,
+    desc: &ViewDesc,
     history: &mut ViewHistory,
     origin_cell: IVec3,
     cell_log2: u32,
