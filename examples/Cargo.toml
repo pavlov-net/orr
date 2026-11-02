@@ -17,6 +17,7 @@ orr-cook.workspace = true
 orr-math.workspace = true
 orr-color.workspace = true
 orr-shaders.workspace = true
+orr-atmosphere.workspace = true
 bytemuck.workspace = true
 env_logger.workspace = true
 log.workspace = true
@@ -69,6 +70,10 @@ path = "dielectrics.rs"
 [[example]]
 name = "many-lights"
 path = "many-lights.rs"
+
+[[example]]
+name = "sky"
+path = "sky.rs"
 
 [[example]]
 name = "dense-vegetation"

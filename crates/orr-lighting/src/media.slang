@@ -94,10 +94,15 @@ public float height_fog_optical_depth(float density, float base_height, float fa
     float k = dir_y / falloff_height;
     if (isinf(t))
         return k > 0.0 ? start / k : (start > 0.0 ? positive_infinity() : 0.0);
-    // integral of exp(-k s) over [0, t] = t (1 - exp(-x)) / x with x = k t.
     float x = k * t;
-    float f = abs(x) < 1e-3 ? 1.0 - x * (0.5 - x / 6.0) : (1.0 - exp(-x)) / x;
-    return start * t * f;
+    if (abs(x) < 1e-3)
+        return start * t * (1.0 - x * (0.5 - x / 6.0));
+    // The difference of the two ends: far above the layer the start is 0 and exp(-x) infinite,
+    // a NaN product. Far below it both ends overflow, and the depth with them.
+    if (isinf(start))
+        return start;
+    float end = height_fog_extinction(density, base_height, falloff_height, h0 + dir_y * t);
+    return (start - end) / k;
 }
 
 public float height_fog_transmittance(float density, float base_height, float falloff_height,

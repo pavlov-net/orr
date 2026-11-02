@@ -4,9 +4,9 @@
 //! [`Atmosphere`] describes the medium. [`AtmosphereState`] holds one atmosphere's GPU
 //! state: its LUTs, recorded at the scene compute point, and the [`AtmosphereGpu`] block
 //! the Slang module `atmosphere` reads (`DEP_ORR_ATMOSPHERE_SHADER_DIRS`), whose
-//! `AtmosphereSky` links into orr's kernels as the environment. [`presets`] holds example
-//! lights, [`spectrum`] the build-time spectral coefficients and
-//! [`reference`](mod@reference) an f64 spectral integrator that the GPU passes are checked
+//! `AtmosphereSky` and `AtmosphereMedium` link into orr's kernels as the environment and the
+//! medium. [`presets`] holds example lights, [`spectrum`] the build-time spectral coefficients
+//! and [`reference`](mod@reference) an f64 spectral integrator that the GPU passes are checked
 //! against.
 
 mod block;

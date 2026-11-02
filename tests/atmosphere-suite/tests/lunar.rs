@@ -3,7 +3,7 @@
 //! `lunar_disc` against ROLO's level and the reference: a Lambertian disc of the lunar albedo
 //! at 5 deg phase, a high moon's illuminance at the ground, and the moonlit sky's color.
 
-use atmosphere_suite::{Probe, Rig, SUN, dir, probe, sky_radiance, uniform_texture};
+use atmosphere_suite::{Probe, Rig, SUN, dir, earth, probe, sky_radiance, uniform_texture};
 use orr::abi::TextureIndex;
 use orr::{DirectionalLight, DiscProfile, LightId};
 use orr_atmosphere::Atmosphere;
@@ -20,10 +20,6 @@ const MOON: LightId = LightId(1);
 const ROLO_5_DEG: f64 = 0.30;
 /// `SceneRoot::near_range` by default.
 const NEAR_RANGE: f64 = 256.0;
-
-fn earth() -> Atmosphere {
-    Atmosphere::earth(DVec3::ZERO, Vec3::Y)
-}
 
 fn rec2020(light: &DirectionalLight) -> [f64; 3] {
     (RgbPrimaries::REC709.matrix_to(RgbPrimaries::REC2020) * light.illuminance.as_dvec3())

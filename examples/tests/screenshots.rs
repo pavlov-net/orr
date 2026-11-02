@@ -28,6 +28,9 @@ mod rigid_parts;
 #[path = "../skinned.rs"]
 mod skinned;
 #[allow(dead_code)]
+#[path = "../sky.rs"]
+mod sky;
+#[allow(dead_code)]
 #[path = "../viewer.rs"]
 mod viewer;
 
@@ -87,6 +90,13 @@ fn cluster_rt_matches_its_references() {
     let cluster_rt = |rest: &[&str]| cluster_rt::run(&headless(rest)).expect("headless capture");
     compare("cluster-rt", cluster_rt(&[]));
     compare("cluster-rt-clusters", cluster_rt(&["--clusters"]));
+    assert_clean();
+}
+
+#[test]
+fn sky_matches_its_reference() {
+    let _serial = serial();
+    compare("sky", sky::run(&headless(&[])).expect("headless capture"));
     assert_clean();
 }
 

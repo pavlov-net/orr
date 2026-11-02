@@ -110,6 +110,7 @@ dependencies = [
 name = "atmosphere-suite"
 version = "0.0.1"
 dependencies = [
+ "lighting-suite",
  "orr",
  "orr-atmosphere",
  "orr-color",
@@ -814,6 +815,7 @@ dependencies = [
  "env_logger",
  "log",
  "orr",
+ "orr-atmosphere",
  "orr-color",
  "orr-cook",
  "orr-egui",

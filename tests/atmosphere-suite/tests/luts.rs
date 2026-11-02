@@ -2,35 +2,18 @@
 
 //! The LUT passes against the f64 reference in the same wavelength groups.
 
-use atmosphere_suite::{Probe, Rig, dir, probe, solar_rec2020};
+use atmosphere_suite::{Probe, Rig, dir, earth, foggy, probe, solar_rec2020};
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference};
 use orr_atmosphere::spectrum::{SOLAR_ILLUMINANCE, SPECTRAL_GROUPS};
-use orr_atmosphere::{Atmosphere, HeightFog, SKY_VIEW_SIZE, TRANSMITTANCE_SIZE};
+use orr_atmosphere::{SKY_VIEW_SIZE, TRANSMITTANCE_SIZE};
 use orr_color::luminance;
-use orr_math::{DVec3, Vec3};
+use orr_math::DVec3;
 use orr_scene::testing::assert_clean;
 
 const EYE: DVec3 = DVec3::new(0.0, 2.0, 0.0);
 /// `SceneRoot::near_range` by default: the sky-view LUTs start there.
 const NEAR_RANGE: f64 = 256.0;
 const PASSES: u32 = SPECTRAL_GROUPS as u32 / 3;
-
-fn earth() -> Atmosphere {
-    Atmosphere::earth(DVec3::ZERO, Vec3::Y)
-}
-
-fn foggy() -> Atmosphere {
-    Atmosphere {
-        height_fog: Some(HeightFog {
-            density: 1e-4,
-            falloff_height: 300.0,
-            base_height: 0.0,
-            albedo: Vec3::splat(0.9),
-            droplet_diameter: 10.0,
-        }),
-        ..earth()
-    }
-}
 
 #[test]
 fn transmittance_lut_matches_reference() {

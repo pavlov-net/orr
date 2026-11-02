@@ -17,6 +17,7 @@ orr-math.workspace = true
 
 [dev-dependencies]
 orr-color.workspace = true
+lighting-suite.workspace = true
 
 [build-dependencies]
 orr-shaders = { workspace = true, features = ["build"] }

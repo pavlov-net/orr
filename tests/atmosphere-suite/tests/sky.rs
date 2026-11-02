@@ -5,13 +5,13 @@
 //! `near_range`, the fold of several lights and its fades, and lighting's bake of the linked
 //! sky.
 
-use atmosphere_suite::{Probe, Rig, SUN, dir, probe, sky_radiance};
+use atmosphere_suite::{Probe, Rig, SUN, dir, earth, foggy, probe, sky_radiance};
 use orr::abi::TextureIndex;
 use orr::{DirectionalLight, DiscProfile, LightId};
 use orr_atmosphere::presets::solar_disc;
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference};
 use orr_atmosphere::spectrum::{SOLAR_COLOR, SOLAR_ILLUMINANCE};
-use orr_atmosphere::{Atmosphere, FoldGpu, HeightFog, MAX_FOLDED_LIGHTS, SKY_VIEW_SIZE};
+use orr_atmosphere::{Atmosphere, FoldGpu, MAX_FOLDED_LIGHTS, SKY_VIEW_SIZE};
 use orr_color::{RgbPrimaries, luminance};
 use orr_lighting::ENVIRONMENT_SIZE;
 use orr_math::{DVec3, Vec3};
@@ -20,23 +20,6 @@ use orr_scene::testing::{assert_clean, read_buffer};
 const EYE: DVec3 = DVec3::new(0.0, 2.0, 0.0);
 /// `SceneRoot::near_range` by default.
 const NEAR_RANGE: f64 = 256.0;
-
-fn earth() -> Atmosphere {
-    Atmosphere::earth(DVec3::ZERO, Vec3::Y)
-}
-
-fn foggy() -> Atmosphere {
-    Atmosphere {
-        height_fog: Some(HeightFog {
-            density: 1e-4,
-            falloff_height: 300.0,
-            base_height: 0.0,
-            albedo: Vec3::splat(0.9),
-            droplet_diameter: 10.0,
-        }),
-        ..earth()
-    }
-}
 
 fn rgb(c: [f32; 4]) -> [f64; 3] {
     [c[0].into(), c[1].into(), c[2].into()]

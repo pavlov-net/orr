@@ -1,6 +1,7 @@
 // Probes of the atmosphere module: LUT parameterization round trips, altitudes, LUT texels,
 // the sky-view LUT integrated over the upper hemisphere, `AtmosphereSky` directly and as
-// lighting bakes it, the night background, and a light's disc seen through the atmosphere.
+// lighting bakes it, the night background, a light's disc seen through the atmosphere, and
+// `AtmosphereMedium` as lighting's segments and froxels read it.
 #include "orr/root.h"
 import orr.math;
 import orr_color.luminance;
@@ -257,11 +258,10 @@ void disc(uint lane: SV_GroupIndex)
                                                                      l.direction, positive_infinity()), 0.0);
 }
 
-// Per input (altitude in x, phase cosine in y), the atmosphere's in-scatter per unit
-// illuminance, sigma_s x phase summed over its three components (Rayleigh, aerosol, fog):
-// output 2i exactly, output 2i + 1 through lighting's froxel material encoding, with the
-// RGBA16F target's rounding, with the fog's and the aerosol's shares as its two triples
-// and Rayleigh, the flattest phase, as the rest.
+// Per input (altitude in x, phase cosine in y), `AtmosphereMedium`'s in-scatter per unit
+// illuminance, sigma_s x phase: output 2i exactly, summed over its three components (Rayleigh,
+// aerosol, fog), output 2i + 1 through lighting's froxel material encoding, with the RGBA16F
+// target's rounding.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void froxel_packing(uint3 id: SV_DispatchThreadID)
@@ -272,21 +272,47 @@ void froxel_packing(uint3 id: SV_DispatchThreadID)
     float h = root.input[id.x].x;
     float c = root.input[id.x].y;
     float3 d = atmosphere_densities(a, h);
-    float3 rayleigh = a.rayleigh.rgb * d.x;
-    float3 aerosol = a.aerosol_scattering.rgb * d.y;
-    float3 fog = atmosphere_fog_extinction(a, h) * a.fog_albedo.rgb;
-    float pr = rayleigh_phase(c);
-    float pa = cornette_shanks_phase(a.aerosol_asymmetry, c);
-    float pf = fog_phase(a.fog_diameter, c);
-    MediumPoint m = {};
-    m.sigma_s = rayleigh + aerosol + fog;
-    m.sigma_t = m.sigma_s;
-    m.phase_share = fog / m.sigma_s;
-    m.phase_share_second = aerosol / m.sigma_s;
-    FroxelMaterial f = froxel_material(m);
+    float3 exact = a.rayleigh.rgb * d.x * rayleigh_phase(c)
+        + a.aerosol_scattering.rgb * d.y * cornette_shanks_phase(a.aerosol_asymmetry, c)
+        + atmosphere_fog_extinction(a, h) * a.fog_albedo.rgb * fog_phase(a.fog_diameter, c);
+    uint64_t data = (uint64_t)a;
+    float3 up = a.up.xyz;
+    float3 top = atmosphere_top_render(a);
+    FroxelMaterial f = froxel_material(AtmosphereMedium.sample(data, top + up * h));
     f.sigma = f16tof32(f32tof16(f.sigma));
     MediumPoint p = froxel_point(f, false);
-    float3 rest = max(1.0 - p.phase_share - p.phase_share_second, 0.0);
-    root.output[2 * id.x] = float4(rayleigh * pr + aerosol * pa + fog * pf, 0.0);
-    root.output[2 * id.x + 1] = float4(p.sigma_s * (p.phase_share * pf + p.phase_share_second * pa + rest * pr), 0.0);
+    root.output[2 * id.x] = float4(exact, 0.0);
+    root.output[2 * id.x + 1] = float4(p.sigma_s * AtmosphereMedium.phase(data, p, c), 0.0);
+}
+
+// `AtmosphereMedium.transmittance`: per input pair (origin and `t` in w; direction).
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void medium_transmittance_along(uint3 id: SV_DispatchThreadID)
+{
+    if (id.x >= root.count)
+        return;
+    float4 origin = root.input[2 * id.x];
+    float3 dir = root.input[2 * id.x + 1].xyz;
+    root.output[id.x] = float4(AtmosphereMedium.transmittance((uint64_t)root.atmosphere, origin.xyz, dir, origin.w), 0.0);
+}
+
+// `segment_inscatter` through `AtmosphereMedium` in `layer` steps, averaged over 16 jitters, per
+// input pair (origin and `t` in w; direction): output 2i the in-scatter, 2i + 1 the
+// transmittance over the segment.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void medium_segment(uint3 id: SV_DispatchThreadID)
+{
+    if (id.x >= root.count)
+        return;
+    LightSetGpu* set = (LightSetGpu*)root.set;
+    float4 origin = root.input[2 * id.x];
+    float3 dir = root.input[2 * id.x + 1].xyz;
+    float3 through;
+    float3 mean = float3(0.0);
+    for (uint k = 0; k < 16; k++)
+        mean += segment_inscatter<AtmosphereMedium>(set, origin.xyz, dir, origin.w, root.layer, (float(k) + 0.5) / 16.0, through);
+    root.output[2 * id.x] = float4(mean / 16.0, 0.0);
+    root.output[2 * id.x + 1] = float4(through, 0.0);
 }

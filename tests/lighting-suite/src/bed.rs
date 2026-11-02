@@ -29,8 +29,8 @@ use orr_scene::{
     Affine3, ClusterTopology, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc,
     Lens, LoadState, Loading, MaterialGpu, MaterialId, MediumProxy, MediumProxyId, MountId,
     Opacity, PackSource, ProducerDesc, ProducerId, ProducerUpdate, Projection, RasterView,
-    RendererDesc, SceneDesc, SceneId, Scenes, TextureFilter, TransformGroupDesc, TransformGroupId,
-    ViewArena, ViewDesc, ViewHistoryId, ViewTarget, VolumeRef, material_flags,
+    RendererDesc, SceneCompute, SceneDesc, SceneId, Scenes, TextureFilter, TransformGroupDesc,
+    TransformGroupId, ViewArena, ViewDesc, ViewHistoryId, ViewTarget, VolumeRef, material_flags,
 };
 use orr_shaders::bytemuck::Zeroable;
 
@@ -238,6 +238,8 @@ pub const FURNACE_RADIANCE: [f32; 3] = [1000.0; 3];
 // Models of the bed's pack.
 pub const FLOOR: &str = "floor";
 pub const WHITE_SPHERE: &str = "white sphere";
+/// A unit sphere with no reflection at all, so only the medium in front of it shows.
+pub const BLACK_SPHERE: &str = "black sphere";
 pub const CORNELL: &str = "cornell box";
 pub const TALL_BOX: &str = "tall box";
 pub const SHORT_BOX: &str = "short box";
@@ -899,6 +901,11 @@ fn cook() -> Arc<[u8]> {
                     vec![diffuse([1.0; 3])],
                 ),
                 model(
+                    BLACK_SPHERE,
+                    mesh(|b| b.sphere(0, 24, 1.0)),
+                    vec![diffuse([0.0; 3])],
+                ),
+                model(
                     CORNELL,
                     cornell,
                     vec![
@@ -1083,6 +1090,9 @@ pub fn pixel_of(spec: &Spec, p: Vec3) -> Vec2 {
     let ndc = Vec2::new(q.x / (-q.z * t * aspect), q.y / (-q.z * t));
     Vec2::new(0.5 + 0.5 * ndc.x, 0.5 - 0.5 * ndc.y) * Vec2::new(EXTENT[0] as f32, EXTENT[1] as f32)
 }
+
+/// Scene compute work a bed runs every frame before its scene pass.
+pub type SceneComputeHook = Box<dyn FnMut(&mut SceneCompute<'_, '_>)>;
 
 /// Bytes of root memory each frame's kernels may put.
 const ROOT_BYTES: u64 = 64 * 1024;
@@ -1340,6 +1350,8 @@ pub struct Bed {
     light_writes: Vec<(LightId, Option<Light>)>,
     proxy_writes: Vec<(MediumProxyId, Option<MediumProxy>)>,
     medium: Option<GpuAddress>,
+    environment: Option<GpuAddress>,
+    scene_compute: Option<SceneComputeHook>,
     /// Frames add the background layer instead of the radiance.
     background_layer: bool,
     kernels: &'static KernelSet,
@@ -1360,6 +1372,11 @@ impl Bed {
     /// The bed for `spec` on a renderer created with `renderer`; orr-lighting's modules are
     /// replaced from its kernels too.
     pub fn with_renderer(spec: Spec, renderer: &RendererDesc) -> Self {
+        Self::with_rt_range(spec, renderer, 1000.0)
+    }
+
+    /// As [`Self::with_renderer`], with the copies ray traced from up to `rt_range` m away.
+    pub fn with_rt_range(spec: Spec, renderer: &RendererDesc, rt_range: f32) -> Self {
         let kernels = renderer.kernels;
         let d = device();
         let mut scenes = Scenes::new(d, renderer).unwrap();
@@ -1452,7 +1469,7 @@ impl Bed {
                 pose: None,
                 material_set: None,
                 flags: InstanceFlags::RASTER | InstanceFlags::RAY,
-                rt_range: 1000.0,
+                rt_range,
                 animation_range: 0.0,
                 user_tag: i as u32,
             })
@@ -1515,6 +1532,8 @@ impl Bed {
             light_writes: Vec::new(),
             proxy_writes: Vec::new(),
             medium: None,
+            environment: None,
+            scene_compute: None,
             background_layer: false,
             kernels,
             particle_group,
@@ -1682,6 +1701,16 @@ impl Bed {
             .unwrap_or_else(|e| panic!("volume {name}: {e}"))
     }
 
+    /// Gives the scene's linked environment the data at `data` from the next frame on.
+    pub fn set_environment(&mut self, data: GpuAddress) {
+        self.environment = Some(data);
+    }
+
+    /// Runs `hook` at the scene compute point of every frame from the next on.
+    pub fn set_scene_compute(&mut self, hook: SceneComputeHook) {
+        self.scene_compute = Some(hook);
+    }
+
     /// Gives the scene's linked medium the data at `data` from the next frame on.
     pub fn set_medium(&mut self, data: GpuAddress) {
         self.medium = Some(data);
@@ -1756,7 +1785,11 @@ impl Bed {
             texture_filter: TextureFilter::Hardware,
             target: ViewTarget::AfterRr,
         };
-        if !self.light_writes.is_empty() || !self.proxy_writes.is_empty() || self.medium.is_some() {
+        if !self.light_writes.is_empty()
+            || !self.proxy_writes.is_empty()
+            || self.medium.is_some()
+            || self.environment.is_some()
+        {
             let mut w = f.scene(self.scene).unwrap();
             for (id, l) in self.light_writes.drain(..) {
                 w.set_light(id, l.as_ref()).unwrap();
@@ -1767,10 +1800,20 @@ impl Bed {
             if let Some(data) = self.medium.take() {
                 w.set_medium(data);
             }
+            if let Some(data) = self.environment.take() {
+                w.set_environment(data);
+            }
         }
-        if let Some(p) = &self.particles {
+        if self.scene_compute.is_some() || self.particles.is_some() {
+            let (hook, particles) = (&mut self.scene_compute, &self.particles);
             let eye = [eye.x, eye.y, eye.z, 0.0];
             f.update_scenes(&mut |c| {
+                if let Some(hook) = hook {
+                    hook(c);
+                }
+                let Some(p) = particles else {
+                    return;
+                };
                 let root = c
                     .put_root(&particle_quads::Root {
                         scene: c.root,

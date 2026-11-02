@@ -116,7 +116,8 @@ public struct AtmosphereGpu
     public TextureIndex sky_view[MAX_SKY_VIEWS];
     // How much of each sky-view LUT a view reads, the rest from the focus LUT (entry 0).
     public float sky_view_weight[MAX_SKY_VIEWS];
-    // Scales the multiple scattering the sky-view LUTs add: 1, or 0 for single scattering.
+    // Scales the multiple scattering the sky-view LUTs and the medium add: 1, or 0 for single
+    // scattering.
     public float multiple_scattering_scale;
     // Non-zero: the fold sets every weight to its target instead of fading.
     public uint fold_reset;
@@ -203,6 +204,64 @@ public float atmosphere_fog_extinction(AtmosphereGpu* a, float h)
     if (a.fog_density <= 0.0)
         return 0.0;
     return height_fog_extinction(a.fog_density, a.fog_base, a.fog_falloff, h);
+}
+
+// Extinction at altitude h above the ground plane, 1/m, in the medium's Rec.2020 bands.
+public float3 atmosphere_extinction(AtmosphereGpu* a, float h)
+{
+    float3 d = atmosphere_densities(a, h);
+    return a.rayleigh.rgb * d.x + a.aerosol_extinction.rgb * d.y + a.ozone.rgb * d.z
+        + atmosphere_fog_extinction(a, h);
+}
+
+// Larger columns than this stop all light at any wavelength; holding them finite keeps a zero
+// coefficient's product with them zero.
+static const float LARGEST_COLUMN = 1e30;
+
+// Integral of exp(-h / scale) over t finite meters from altitude h0, where the altitude
+// changes by d per meter.
+float exponential_column(float scale, float h0, float d, float t)
+{
+    return min(height_fog_optical_depth(1.0, 0.0, scale, h0, d, t), LARGEST_COLUMN);
+}
+
+// Integral of the ozone tent over t meters from altitude h0, where the altitude changes by d
+// per meter: each side of the tent is linear, so its mean over a piece is its middle value.
+float ozone_column(AtmosphereGpu* a, float h0, float d, float t)
+{
+    float h1 = h0 + d * t;
+    float lo = min(h0, h1);
+    float hi = max(h0, h1);
+    float peak = a.ozone_peak;
+    float width = a.ozone_half_width;
+    if (!(hi > lo))
+        return t * max(0.0, 1.0 - abs(h0 - peak) / width);
+    float sum = 0.0;
+    float knots[3] = { peak - width, peak, peak + width };
+    for (uint i = 0; i < 2; ++i)
+    {
+        float from = max(lo, knots[i]);
+        float to = min(hi, knots[i + 1]);
+        if (to > from)
+            sum += (to - from) / (hi - lo) * (1.0 - abs(0.5 * (from + to) - peak) / width);
+    }
+    return t * sum;
+}
+
+// Optical depth over t finite meters from `p_render` along unit `dir`, in the medium's Rec.2020
+// bands: altitude above the ground plane is linear in distance, so every layer has a closed
+// form.
+public float3 atmosphere_optical_depth(AtmosphereGpu* a, float3 p_render, float3 dir, float t)
+{
+    float h = atmosphere_altitude(a, p_render);
+    float d = dot(dir, a.up.xyz);
+    float fog = 0.0;
+    if (a.fog_density > 0.0)
+        fog = height_fog_optical_depth(a.fog_density, a.fog_base, a.fog_falloff, h, d, t);
+    return a.rayleigh.rgb * exponential_column(a.rayleigh_scale, h, d, t)
+        + a.aerosol_extinction.rgb * (exponential_column(a.aerosol_scale, h, d, t) / a.aerosol_scale)
+        + a.ozone.rgb * ozone_column(a, h, d, t)
+        + fog;
 }
 
 public float rayleigh_phase(float cos_theta)
@@ -414,10 +473,12 @@ public float3 atmosphere_lut_multiple_scattering(AtmosphereGpu* a, float h, floa
 }
 
 // Rec.2020 transmittance to space of sunlight, fog included, from altitude h above the
-// sphere along zenith cosine mu: 0 when the ray hits the ground.
+// sphere along zenith cosine mu: 0 when the ray hits the ground. An altitude outside the
+// atmosphere reads as its nearer end. Light reddened past Rec.2020 clamps to it.
 public float3 atmosphere_transmittance_to_space(AtmosphereGpu* a, float h, float mu)
 {
-    return atmosphere_light_transmittance(a, h, mu, a.group_passes);
+    float inside = clamp(h, 0.0, a.top_radius - a.planet_radius);
+    return max(atmosphere_light_transmittance(a, inside, mu, a.group_passes), 0.0);
 }
 
 // The sky-view LUT whose eye altitude is nearest the ground-plane altitude h.
@@ -491,5 +552,58 @@ public struct AtmosphereSky : IEnvironment
         float3 l = sky_view_radiance(a, i, dir);
         float w = a.sky_view_weight[i];
         return w < 1.0 ? lerp(sky_view_radiance(a, 0, dir), l, w) : l;
+    }
+}
+
+// The planet's medium as orr's medium link point reads it. Altitude is height above the flat
+// ground plane and coefficients are the three solar-weighted Rec.2020 bands. The phase has three
+// components: fog in `phase_share`, aerosol in `phase_share_second` and Rayleigh, the flattest,
+// as the rest, which takes the rounding of the froxels' shares. Toward lights, `transmittance`
+// reads the spherical transmittance LUT at the point's altitude. Link it with
+// `Build::link(LinkPoint::Medium, ..)`.
+public struct AtmosphereMedium : IMedium
+{
+    public static MediumPoint sample(uint64_t data, float3 p_render)
+    {
+        AtmosphereGpu* a = (AtmosphereGpu*)data;
+        float h = atmosphere_altitude(a, p_render);
+        float3 d = atmosphere_densities(a, h);
+        float3 rayleigh = a.rayleigh.rgb * d.x;
+        float3 aerosol = a.aerosol_scattering.rgb * d.y;
+        float3 fog = atmosphere_fog_extinction(a, h) * a.fog_albedo.rgb;
+        MediumPoint m = {};
+        m.sigma_s = rayleigh + aerosol + fog;
+        m.sigma_t = atmosphere_extinction(a, h);
+        bool3 scatters = m.sigma_s > 0.0;
+        m.phase_share = select(scatters, fog / m.sigma_s, float3(0.0));
+        m.phase_share_second = select(scatters, aerosol / m.sigma_s, float3(0.0));
+        return m;
+    }
+
+    public static float3 phase(uint64_t data, MediumPoint m, float cos_theta)
+    {
+        AtmosphereGpu* a = (AtmosphereGpu*)data;
+        float3 rest = max(1.0 - m.phase_share - m.phase_share_second, 0.0);
+        float3 p = m.phase_share_second * cornette_shanks_phase(a.aerosol_asymmetry, cos_theta)
+            + rest * rayleigh_phase(cos_theta);
+        if (a.fog_density > 0.0)
+            p += m.phase_share * fog_phase(a.fog_diameter, cos_theta);
+        return p;
+    }
+
+    public static float3 multiple_scattering(uint64_t data, float3 p_render, float3 dir_to_light)
+    {
+        AtmosphereGpu* a = (AtmosphereGpu*)data;
+        float h = atmosphere_altitude(a, p_render);
+        return a.multiple_scattering_scale
+            * atmosphere_lut_multiple_scattering(a, h, dot(dir_to_light, a.up.xyz), a.group_passes);
+    }
+
+    public static float3 transmittance(uint64_t data, float3 origin, float3 dir, float t)
+    {
+        AtmosphereGpu* a = (AtmosphereGpu*)data;
+        if (isinf(t))
+            return atmosphere_transmittance_to_space(a, atmosphere_altitude(a, origin), dot(dir, a.up.xyz));
+        return exp(-atmosphere_optical_depth(a, origin, dir, t));
     }
 }

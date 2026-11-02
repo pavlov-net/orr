@@ -1092,5 +1092,6 @@ public float3 segment_inscatter<M : IMedium>(LightSetGpu* set, float3 origin, fl
         float3 source = medium_source<M>(set, m, x, dir);
         march_step(m.sigma_t, source, dt, inscatter, transmittance);
     }
+    transmittance = medium_transmittance<M>(data, origin, dir, t);
     return inscatter;
 }

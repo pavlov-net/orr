@@ -26,6 +26,7 @@ orr-memory = { path = "crates/orr-memory", version = "0.0.1" }
 orr-pack = { path = "crates/orr-pack" }
 orr-scene = { path = "crates/orr-scene" }
 orr-shaders = { path = "crates/orr-shaders" }
+lighting-suite = { path = "tests/lighting-suite" }
 gpu-suite = { path = "tests/gpu-suite" }
 openpbr-ref = { path = "tests/openpbr-ref" }
 shader-maths = { path = "tests/shader-maths" }
