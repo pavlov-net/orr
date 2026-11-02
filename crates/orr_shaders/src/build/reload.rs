@@ -248,6 +248,12 @@ fn recompile(
     {
         return Err(format!("{}: {}", module.name, compile::no_omm_mode(entry)));
     }
+    if compiled.model.inline_root != (module.inline_root > 0) {
+        return Err(format!(
+            "{}: rebuild required: its root moved in or out of the push data",
+            module.name
+        ));
+    }
     if compiled.model.omm != module.omm {
         return Err(format!(
             "{}: rebuild required: the opacity-micromap mode of its entry points changed",

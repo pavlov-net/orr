@@ -558,15 +558,13 @@ fn raygen_and_compute_entries_trace_one_ptlas() {
     let (w, h) = (cl::W, cl::H);
     let outs =
         [0, 1].map(|_| readback::<clusters::ClusterHit>(u64::from(w * h), "abi cluster hits"));
-    let roots = outs.each_ref().map(|out| {
-        b.upload(&[clusters::Root {
-            out: out.gpu(),
-            scene: tlas,
-            width: w,
-            height: h,
-            pad0: 0,
-            pad1: 0,
-        }])
+    let roots = outs.each_ref().map(|out| clusters::Root {
+        out: out.gpu(),
+        scene: tlas,
+        width: w,
+        height: h,
+        pad0: 0,
+        pad1: 0,
     });
     let [gx, gy, _] = compute.workgroup();
     let list = b.list();
@@ -575,8 +573,8 @@ fn raygen_and_compute_entries_trace_one_ptlas() {
         Stages::COMPUTE | Stages::RAY,
         Hazards::ACCEL_STRUCT,
     );
-    list.dispatch(&compute, roots[0], [w.div_ceil(gx), h.div_ceil(gy), 1]);
-    list.dispatch_rays(&rays, roots[1], [w, h, 1]);
+    list.dispatch_inline(&compute, &roots[0], [w.div_ceil(gx), h.div_ceil(gy), 1]);
+    list.dispatch_rays(&rays, &roots[1], [w, h, 1]);
     list.barrier(
         Stages::COMPUTE | Stages::RAY,
         Stages::HOST,

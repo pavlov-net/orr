@@ -7,7 +7,7 @@ struct Root
     Tlas scene;
     float4* out;
 }
-[[vk::binding(0, 0)]] ConstantBuffer<Root> root;
+ORR_ROOT_INLINE(Root);
 
 interface ICoherence
 {

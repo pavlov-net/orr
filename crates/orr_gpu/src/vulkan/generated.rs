@@ -323,6 +323,11 @@ impl Device {
     ) -> Result<ExecutionSet, Error> {
         let shared = &self.shared;
         shared.check_set(stages.len(), name)?;
+        if stages.iter().any(|s| s.inline_root > 0) {
+            return Err(Error::Shader(format!(
+                "{name}: a sequence pushes a root's address, so a set cannot hold ORR_ROOT_INLINE kernels"
+            )));
+        }
         let pipelines = shared.indirect_pipelines(stages, name, |s, flags, name| {
             shared.create_compute(s, flags, name)
         })?;

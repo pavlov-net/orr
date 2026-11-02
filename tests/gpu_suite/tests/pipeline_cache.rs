@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use gpu_suite::shaders::cached;
+use gpu_suite::shaders::{cached, cached_rays};
 use gpu_suite::{log_to_stderr, require};
 use orr_gpu::{
     ClearColor, ColorAttachment, ColorLoad, ColorTarget, ComputePipeline, Device, DeviceDesc,
@@ -37,8 +37,10 @@ struct Set {
     compute: ComputePipeline,
     mesh: MeshPipeline,
     raygen: Option<RayDispatchPipeline>,
-    /// Whether the compute and the mesh pipeline came from the cache, when created alone.
-    cached: [bool; 2],
+    /// Whether the compute, mesh and ray-dispatch pipelines came from the cache, when created
+    /// alone; the last is true on a device without ray dispatch, and where a hit is not known to
+    /// be reported for one: only NVIDIA's driver has been measured.
+    cached: [bool; 3],
 }
 
 impl Set {
@@ -65,11 +67,22 @@ impl Set {
                 "cached mesh",
             )
             .unwrap();
-        let cached = [after_compute > before, hits() > after_compute];
+        let after_mesh = hits();
         let raygen = d.caps().ray_dispatch.then(|| {
-            d.create_ray_dispatch_pipeline(&stage("raygen_main"), "cached raygen")
+            let spec = cached_rays::Spec { value }.bytes();
+            let data = SpecData {
+                entries: cached_rays::Spec::ENTRIES,
+                bytes: &spec,
+            };
+            let stage = ShaderStage::new(&cached_rays::MODULE, "raygen_main", data).unwrap();
+            d.create_ray_dispatch_pipeline(&stage, "cached raygen")
                 .unwrap()
         });
+        let cached = [
+            after_compute > before,
+            after_mesh > after_compute,
+            raygen.is_none() || !d.caps().device_name.contains("NVIDIA") || hits() > after_mesh,
+        ];
         Set {
             value,
             compute,
@@ -109,7 +122,12 @@ impl Set {
         list.discard(&tex);
         list.dispatch(&self.compute, root.gpu(), [1, 1, 1]);
         if let Some(r) = &self.raygen {
-            list.dispatch_rays(r, root.gpu(), [1, 1, 1]);
+            let rays_root = cached_rays::Root {
+                out: out.gpu(),
+                pad0: 0,
+                pad1: 0,
+            };
+            list.dispatch_rays(r, &rays_root, [1, 1, 1]);
         }
         list.begin_rendering(&Rendering {
             extent: [4, 4],
@@ -186,14 +204,12 @@ fn round_trip_and_refuse_foreign_files() {
     assert_clean(&d);
     drop((set, d));
 
-    // 621.01 reports cache hits for compute and mesh pipelines but never for ray-dispatch
-    // pipelines, so only the first two are asserted.
     let d = open(path);
     assert!(d.pipeline_cache_report().loaded);
     let set = Set::new(&d, 1);
     assert_eq!(
         set.cached,
-        [true, true],
+        [true, true, true],
         "warm: {:?}",
         d.pipeline_cache_report()
     );
@@ -268,7 +284,7 @@ fn a_file_the_driver_refuses_is_replaced() {
     let set = Set::new(&d, 1);
     assert_eq!(
         set.cached,
-        [true, true],
+        [true, true, true],
         "after replacing: {:?}",
         d.pipeline_cache_report()
     );
@@ -320,10 +336,7 @@ fn concurrent_creation() {
         let created = 8 * sets[0].0.kinds();
         assert_eq!(report.hits + report.misses, created);
         if warm {
-            assert!(
-                report.hits >= 16,
-                "compute and mesh pipelines warm: {report:?}"
-            );
+            assert!(report.hits >= 16, "compute and mesh warm: {report:?}");
         }
         d.save_pipeline_cache().unwrap();
         assert_clean(&d);

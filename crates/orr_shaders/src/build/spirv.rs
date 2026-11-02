@@ -60,6 +60,7 @@ pub(crate) mod decoration {
 }
 
 pub(crate) const STORAGE_UNIFORM: u32 = 2;
+pub(crate) const STORAGE_PUSH_CONSTANT: u32 = 9;
 pub(crate) const STORAGE_PHYSICAL: u32 = 5349;
 const EXECUTION_MODE_OMM_ID: u32 = 6031;
 
@@ -315,13 +316,18 @@ impl Module {
             .is_some_and(|v| v.iter().any(|(d, _)| *d == which))
     }
 
-    /// The struct type of the uniform block at descriptor set 0, binding 0.
-    pub(crate) fn root_block(&self) -> Option<u32> {
+    /// The struct type of the push-constant block for an inline root, else of the uniform block
+    /// at descriptor set 0, binding 0.
+    pub(crate) fn root_block(&self, inline: bool) -> Option<u32> {
         self.variables.iter().find_map(|&(id, ptr, storage)| {
-            if storage != STORAGE_UNIFORM
-                || self.decoration(id, decoration::DESCRIPTOR_SET) != Some(&[0])
-                || self.decoration(id, decoration::BINDING) != Some(&[0])
-            {
+            let found = if inline {
+                storage == STORAGE_PUSH_CONSTANT
+            } else {
+                storage == STORAGE_UNIFORM
+                    && self.decoration(id, decoration::DESCRIPTOR_SET) == Some(&[0])
+                    && self.decoration(id, decoration::BINDING) == Some(&[0])
+            };
+            if !found {
                 return None;
             }
             match self.types.get(&ptr)? {

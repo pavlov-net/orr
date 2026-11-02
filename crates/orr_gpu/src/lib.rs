@@ -1,10 +1,11 @@
 //! orr's GPU interface: one device with GPU memory reached by address, a texture heap,
-//! compute, mesh and ray-dispatch pipelines whose only parameter is a root pointer, stage
-//! barriers and timeline submits.
+//! compute, mesh and ray-dispatch pipelines whose only parameter is a root, stage barriers and
+//! timeline submits.
 //!
-//! Shaders read everything through the root: [`CommandList::dispatch`],
-//! [`CommandList::draw_mesh_tasks`] and [`CommandList::dispatch_rays`] push the [`GpuPtr`]
-//! of a root struct in GPU memory;
+//! Shaders read everything through the root: [`CommandList::dispatch`] and
+//! [`CommandList::draw_mesh_tasks`] push the [`GpuPtr`] of a root struct in GPU memory, and
+//! [`CommandList::dispatch_rays`] and [`CommandList::dispatch_inline`] push the struct itself,
+//! for kernels that declare `ORR_ROOT_INLINE`;
 //! buffers are pointers inside it, textures and samplers are heap slots ([`TextureIndex`],
 //! [`StorageImageIndex`], [`SamplerIndex`]) and acceleration structures are [`Tlas`]
 //! addresses. Textures stay in one layout for their whole life; [`CommandList::discard`]

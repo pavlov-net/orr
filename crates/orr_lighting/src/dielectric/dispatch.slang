@@ -15,7 +15,7 @@ extern struct Surface : ISurface = StandardSurface;
 extern struct Environment : IEnvironment = EnvironmentMap;
 extern struct Medium : IMedium = NoMedium;
 
-ORR_ROOT(PathRoot);
+ORR_ROOT_INLINE(PathRoot);
 
 // A row of LAYER_TILE^2 rays per listed tile.
 [shader("raygeneration")]

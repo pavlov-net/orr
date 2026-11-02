@@ -23,7 +23,7 @@ struct Root
     uint pad0;
     uint pad1;
 }
-ORR_ROOT(Root);
+ORR_ROOT_INLINE(Root);
 
 void body<C : ICoherence>(uint2 index)
 {

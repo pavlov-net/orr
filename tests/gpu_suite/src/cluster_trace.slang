@@ -21,7 +21,7 @@ struct Root
     uint mode;
     uint pad;
 }
-ORR_ROOT(Root);
+ORR_ROOT_INLINE(Root);
 
 // Counts candidates and keeps the nearest in the ray's record; with MODE_ALPHA it commits
 // only where `(cluster + primitive) % 3 != 0`.
