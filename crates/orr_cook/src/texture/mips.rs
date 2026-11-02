@@ -33,8 +33,12 @@ pub(crate) fn chain(base: Img, spec: &MipSpec) -> Vec<Img> {
             *p = normalized(*p);
         }
     }
-    let mut out = raw_chain(base, spec);
+    let mut out = {
+        let _z = crate::profile::zone!("mips.downsample");
+        raw_chain(base, spec)
+    };
     if spec.normal {
+        let _z = crate::profile::zone!("mips.renormalize");
         for m in &mut out[1..] {
             for p in &mut m.px {
                 *p = normalized(*p);
@@ -42,6 +46,7 @@ pub(crate) fn chain(base: Img, spec: &MipSpec) -> Vec<Img> {
         }
     }
     if let Some((channel, cutoff)) = spec.coverage {
+        let _z = crate::profile::zone!("mips.coverage");
         match_coverage(&mut out, channel, cutoff, spec.grid);
     }
     out
@@ -593,6 +598,7 @@ impl Toksvig {
     /// of the averaged unit normals, `var = (1 - r) / r` and `alpha'^2 = alpha^2 + 2 var`,
     /// where `alpha` is roughness squared.
     pub(crate) fn apply(&self, chain: &mut [Img], spec: &MipSpec) -> Result<(), String> {
+        let _z = crate::profile::zone!("mips.toksvig");
         let (w, h) = (chain[0].w, chain[0].h);
         if (self.normals.w, self.normals.h) != (w, h) {
             return Err("Toksvig normals differ in size from the roughness texture".into());

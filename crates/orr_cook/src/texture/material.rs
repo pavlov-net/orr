@@ -267,6 +267,7 @@ pub(crate) fn image_facts(
 
 /// The facts of one image file's bytes.
 fn facts_of(bytes: &[u8], hash: Hash32) -> Result<ImageFacts, String> {
+    let _z = crate::profile::zone!("texture.facts");
     let src = load::open(bytes)?;
     if src.cube || src.layers.len() > 1 || src.blocks.as_ref().is_some_and(|b| b.levels.len() != 1)
     {
@@ -1073,9 +1074,11 @@ impl TextureJob {
     /// The texture from the source's blocks: every mip as stored (without those over
     /// `max_size`), or mip 0 as stored and the rest made from it.
     fn pass_through(&self, pass: Pass, images: &[ImageFile]) -> Result<Built, String> {
-        let bytes = images[pass.image].bytes().map_err(|e| e.to_string())?;
-        let src = load::open(&bytes)?;
-        drop(bytes);
+        let src = {
+            let _z = crate::profile::zone!("texture.open");
+            let bytes = images[pass.image].bytes().map_err(|e| e.to_string())?;
+            load::open(&bytes)?
+        };
         let b = src
             .blocks
             .as_ref()
@@ -1156,6 +1159,7 @@ impl TextureJob {
         images: &[ImageFile],
         mut opened: Option<(usize, Source)>,
     ) -> Result<(Img, Plan)> {
+        let _z = crate::profile::zone!("texture.prepare");
         let fail = |message: String| self.fail(message);
         let mut decoded = HashMap::new();
         for &i in &self.images {

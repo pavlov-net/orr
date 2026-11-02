@@ -29,6 +29,7 @@ pub(crate) struct Welded {
 impl Welded {
     /// Welds `m`, without its tangents unless `tangents`.
     pub(crate) fn new(m: &MeshData, tangents: bool) -> Self {
+        let _z = crate::profile::zone!("mesh.weld");
         let n = m.positions.len();
         let stored = m.tangents.as_ref().filter(|_| tangents);
         let mut streams = vec![
@@ -96,6 +97,7 @@ pub(crate) struct Parts {
 
 impl Parts {
     pub(crate) fn new(w: &Welded, m: &MeshData, grid: &Grid) -> Result<Self, String> {
+        let _z = crate::profile::zone!("mesh.parts");
         let triangles = w.indices.len() / 3;
         let part = |pivot, joint| Part {
             bounds: Aabb::EMPTY,

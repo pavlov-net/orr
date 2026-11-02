@@ -39,9 +39,14 @@ thiserror.workspace = true
 tiff = "0.11"
 vdb-rs = "0.6"
 toml = "0.9"
+# Exact pins: the bundled client speaks the protocol of Tracy 0.14.1 and only its tools.
+tracy-client = { version = "=0.19.0", optional = true }
+tracy-client-sys = { version = "=0.30.1", optional = true }
 zstd.workspace = true
 
 [features]
+# CPU zones, plots and thread names for the Tracy profiler.
+tracy = ["dep:tracy-client", "dep:tracy-client-sys"]
 # Neural texture sets through RTXNTC's LibNTC (NVIDIA RTX SDK license, never vendored): the
 # headers of the checkout at ORR_NTC_SDK at build time, the library loaded when a set cooks.
 ntc = ["dep:libloading", "dep:cc", "dep:orr_shaders"]

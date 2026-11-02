@@ -18,6 +18,7 @@ const LEAF: usize = 4;
 
 /// Sets `min_thickness` on the clusters of subsurface sections.
 pub(super) fn assign(clusters: Vec<&mut ClusterData>, grid: &Grid, sections: &[SectionData]) {
+    let _z = crate::profile::zone!("dag.thickness");
     let subsurface = |c: &ClusterData| sections[usize::from(c.record.section)].subsurface;
     if !clusters.iter().any(|c| subsurface(c)) {
         return;

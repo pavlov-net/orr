@@ -159,6 +159,7 @@ impl OmmAlpha {
 
     /// `None` for a texture wider or taller than [`Self::MAX_SIZE`].
     pub(crate) fn new(mip0: &Raster, cutoff: f32) -> Option<Self> {
+        let _z = crate::profile::zone!("mesh.omm_alpha");
         if mip0.w > Self::MAX_SIZE || mip0.h > Self::MAX_SIZE {
             return None;
         }
@@ -251,6 +252,7 @@ pub(crate) fn cluster_omm(
         Opacity::Unknown => return None,
     };
     let alpha = alpha?;
+    let _z = crate::profile::zone!("omm.cluster");
     let corners: Vec<u32> = tris.iter().flatten().map(|&v| u32::from(v)).collect();
     // The rasterizer reads the texture at the uvs the material samples it at.
     let mapped: Vec<[f32; 2]> = uvs
@@ -271,14 +273,28 @@ pub(crate) fn cluster_omm(
     };
     let mut levels = m.levels;
     let mut data = vec![0; size];
-    for (i, &source) in m.sources.iter().enumerate() {
-        let uv = tris[source as usize].map(|v| uvs[usize::from(v)]);
-        let at = tris[source as usize].map(|v| mapped[usize::from(v)]);
-        let len = meshopt::opacity_map_entry_size(levels[i], STATES);
-        let entry = &mut data[offsets[i] as usize..][..len];
-        meshopt::opacity_map_rasterize(entry, levels[i], STATES, &at, &alpha.texture());
-        known_states_hold(entry, levels[i], uv, mip0, cutoff, &alpha.sides);
+    // Rasterizing and checking run as two passes so a profile shows each.
+    let entry = |i: usize| {
+        let at = offsets[i] as usize;
+        at..at + meshopt::opacity_map_entry_size(levels[i], STATES)
+    };
+    {
+        let _z = crate::profile::zone!("omm.rasterize");
+        for (i, &source) in m.sources.iter().enumerate() {
+            let at = tris[source as usize].map(|v| mapped[usize::from(v)]);
+            let entry = &mut data[entry(i)];
+            meshopt::opacity_map_rasterize(entry, levels[i], STATES, &at, &alpha.texture());
+        }
     }
+    {
+        let _z = crate::profile::zone!("omm.check");
+        for (i, &source) in m.sources.iter().enumerate() {
+            let uv = tris[source as usize].map(|v| uvs[usize::from(v)]);
+            let entry = &mut data[entry(i)];
+            known_states_hold(entry, levels[i], uv, mip0, cutoff, &alpha.sides);
+        }
+    }
+    let _z = crate::profile::zone!("omm.compact");
     let mut indices = m.indices;
     meshopt::opacity_map_compact(&mut data, &mut levels, &mut offsets, &mut indices, STATES);
     Some(ClusterOmm {
