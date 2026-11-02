@@ -75,6 +75,17 @@ pub fn device() -> &'static Device {
     })
 }
 
+/// Gives `renderer` DLSS ray reconstruction where NGX offers it; returns whether it does.
+pub fn enable_dlss(renderer: &mut Renderer) -> bool {
+    match DlssSdk::new(device(), PROJECT_ID) {
+        Ok(sdk) => renderer.set_dlss(sdk),
+        Err(e) => {
+            log::warn!("no DLSS: {e}");
+            false
+        }
+    }
+}
+
 /// Panics if the validation layer has reported anything.
 pub fn assert_clean() {
     let messages = device().validation_messages();

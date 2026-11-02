@@ -30,7 +30,7 @@ use orr_scene::{
     Lens, LoadState, Loading, MaterialGpu, MaterialId, MediumProxy, MediumProxyId, MountId,
     Opacity, PackSource, ProducerDesc, ProducerId, ProducerUpdate, Projection, RasterView,
     RendererDesc, SceneCompute, SceneDesc, SceneId, Scenes, TextureFilter, TransformGroupDesc,
-    TransformGroupId, ViewArena, ViewDesc, ViewHistoryId, ViewTarget, VolumeRef, material_flags,
+    TransformGroupId, ViewArena, ViewDesc, ViewHistoryId, VolumeRef, material_flags,
 };
 use orr_shaders::bytemuck::Zeroable;
 
@@ -1106,7 +1106,7 @@ pub struct BedFrame<'a> {
     pub frame: u64,
     pub view: &'a RasterView,
     /// The view as the frame rendered it.
-    pub desc: ViewDesc<'static>,
+    pub desc: ViewDesc,
     pub lighting: &'a SceneLighting,
     /// The radiance target the kernel writes, at [`EXTENT`].
     pub target: &'a mut LightingView,
@@ -1502,7 +1502,7 @@ impl Bed {
         let mut arena = ViewArena::new(d, false);
         let mut list = render().command_list().unwrap();
         arena
-            .layout(&LightingView::requests(EXTENT), &mut list)
+            .layout(&LightingView::requests(EXTENT, false), &mut list)
             .unwrap();
         let point = render().submit(vec![list], &[]).unwrap();
         render().wait(point, Duration::from_secs(10)).unwrap();
@@ -1783,7 +1783,6 @@ impl Bed {
             reset_history: cut,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
-            target: ViewTarget::AfterRr,
         };
         if !self.light_writes.is_empty()
             || !self.proxy_writes.is_empty()
@@ -2054,7 +2053,7 @@ impl SpareView {
         let mut arena = ViewArena::new(d, false);
         let mut list = render().command_list().unwrap();
         arena
-            .layout(&LightingView::requests(EXTENT), &mut list)
+            .layout(&LightingView::requests(EXTENT, false), &mut list)
             .unwrap();
         let point = render().submit(vec![list], &[]).unwrap();
         render().wait(point, Duration::from_secs(10)).unwrap();

@@ -37,16 +37,16 @@ use orr::orr_pack::{Archive, AssetId, Target};
 use orr::{
     Affine3, BoundTexture, ClusterTopology, CopyVariant, DirectionalLight, DiscProfile, Display,
     DisplayRequest, FrameDesc, FrameStats, FrameTime, GroupWriter, InstanceFlags, InstancesDesc,
-    Lens, Light, LightId, LightingStats, LoadState, MaterialGpu, ModelId, MountId, Opacity,
-    PackSource, PipelineId, Pose, ProducerDesc, ProducerId, ProducerUpdate, Projection, Renderer,
-    RendererDesc, SceneCompute, SceneDesc, SceneId, SceneLightingSettings, ScreenshotRequest,
-    TextureFilter, TransformGroupDesc, TransformGroupId, TransparencyPass, ViewDesc, ViewHistoryId,
-    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    Lens, Light, LightId, LightingStats, LitView, LoadState, MaterialGpu, ModelId, MountId,
+    Opacity, PackSource, PipelineId, Pose, ProducerDesc, ProducerId, ProducerUpdate, Projection,
+    Renderer, RendererDesc, SceneCompute, SceneDesc, SceneId, SceneLightingSettings,
+    ScreenshotRequest, TextureFilter, TransformGroupDesc, TransformGroupId, TransparencyPass,
+    ViewHistoryId, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source};
 use orr_cook::{TextureSettings, Usage};
 use orr_math::camera::rh::view;
-use orr_math::{DVec3, Mat3, UVec2, Vec2, Vec3};
+use orr_math::{DVec3, Mat3, Vec3};
 
 use crate::field::{Grass, Heights, Slab, Terrain, blade_triangles, patch_triangles};
 use crate::mesh::MeshBuilder;
@@ -1656,7 +1656,7 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                 };
                 let rendered = f
                     .render_view(
-                        &ViewDesc {
+                        &LitView {
                             scene: scene.scene,
                             history: scene.history,
                             position: eye.as_dvec3(),
@@ -1666,10 +1666,7 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                                 near: 0.1,
                             },
                             lens: Lens::default(),
-                            render_extent: UVec2::from(extent),
-                            jitter: Vec2::ZERO,
                             reset_history: i == 0,
-                            mip_bias: 0.0,
                             texture_filter: TextureFilter::Hardware,
                             target: view_target,
                         },

@@ -21,13 +21,13 @@ use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
     Affine3, Cone, DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc, FrameTime,
-    GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LightId, PackSource, Projection,
-    Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
-    TransformGroupDesc, ViewDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, PackSource,
+    Projection, Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest,
+    TextureFilter, TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshSettings, Source};
 use orr_math::camera::rh::view;
-use orr_math::{DVec3, UVec2, Vec2, Vec3};
+use orr_math::{DVec3, Vec3};
 
 const TOWN: &str = "town";
 
@@ -339,7 +339,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             ..ViewOutput::default()
         };
         f.render_view(
-            &ViewDesc {
+            &LitView {
                 scene,
                 history,
                 position: eye.as_dvec3(),
@@ -349,10 +349,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                     near: 0.05,
                 },
                 lens: Lens::default(),
-                render_extent: UVec2::from(extent),
-                jitter: Vec2::ZERO,
                 reset_history: i == 0,
-                mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
                 target,
             },

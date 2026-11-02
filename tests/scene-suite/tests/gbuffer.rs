@@ -44,8 +44,8 @@ use orr_scene::{
     InstanceRange, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId, ModelId, MountId,
     PackSource, Pose, Projection, RasterGpu, RasterView, RendererDesc, SceneCompute, SceneDesc,
     SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc, SkinnedGpu, SlotCutGpu,
-    TextureFilter, TransformGroupDesc, TransformGroupId, ViewDesc, ViewHistoryId, ViewTarget,
-    VisibleCluster, material_flags,
+    TextureFilter, TransformGroupDesc, TransformGroupId, ViewDesc, ViewHistoryId, VisibleCluster,
+    material_flags,
 };
 use orr_scene::{Budgets, InstancePageRef, PageId};
 use scene_suite::shaders::{codec, fracture, pose, skin_pose, surface_at, trace};
@@ -1355,7 +1355,6 @@ fn render(
             reset_history: reset,
             mip_bias: 0.0,
             texture_filter: w.texture_filter,
-            target: ViewTarget::AfterRr,
         })
         .unwrap();
     wait(f.end(&[]).unwrap());
@@ -2079,7 +2078,6 @@ fn software_and_hardware_raster_draw_the_same_visibility_buffer() {
                         reset_history: true,
                         mip_bias: 0.0,
                         texture_filter: TextureFilter::Hardware,
-                        target: ViewTarget::AfterRr,
                     })
                     .unwrap();
                 wait(f.end(&[]).unwrap());
@@ -2232,7 +2230,6 @@ fn shoot_with(
             reset_history: shot.reset,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
-            target: ViewTarget::AfterRr,
         })
         .unwrap();
     wait(f.end(&[]).unwrap());
@@ -3585,7 +3582,6 @@ fn shoot_rigs_edited(
             reset_history: shot.reset,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
-            target: ViewTarget::AfterRr,
         })
         .unwrap();
     wait(f.end(&[]).unwrap());
@@ -4981,7 +4977,6 @@ fn a_pose_kernel_samples_clips_on_the_gpu_like_the_cpu() {
             reset_history: true,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
-            target: ViewTarget::AfterRr,
         })
         .unwrap();
     wait(f.end(&[]).unwrap());
@@ -5317,7 +5312,6 @@ fn shoot_edits_with(
             reset_history: shot.reset,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
-            target: ViewTarget::AfterRr,
         })
         .unwrap();
     wait(f.end(&[]).unwrap());

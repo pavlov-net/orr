@@ -1813,7 +1813,7 @@ impl<'a> Frame<'a> {
     /// scene into the visibility buffer, resolves the G-buffer, depth, motion and HZB, and
     /// moves its history on. Lays out the view's arena with the raster's transient targets
     /// alone and enters [`ViewStep::Raster`].
-    pub fn raster_view(&mut self, view: &ViewDesc<'_>) -> Result<RasterView> {
+    pub fn raster_view(&mut self, view: &ViewDesc) -> Result<RasterView> {
         self.raster_view_with(view, &[])
     }
 
@@ -1821,7 +1821,7 @@ impl<'a> Frame<'a> {
     /// follow it, laid out in the view's arena beside the raster's.
     pub fn raster_view_with(
         &mut self,
-        view: &ViewDesc<'_>,
+        view: &ViewDesc,
         requests: &[ArenaRequest],
     ) -> Result<RasterView> {
         self.ensure_updated()?;
@@ -1945,6 +1945,27 @@ impl<'a> Frame<'a> {
         radiance: StorageImageIndex,
         hook: &mut dyn FnMut(&mut TransparencyPass<'_, '_>),
     ) -> Result<()> {
+        self.transparency_point(view, Some(radiance), hook)?;
+        Ok(())
+    }
+
+    /// [`Self::transparency`] without the composite: returns the overlay, premultiplied
+    /// RGBA16F at the render extent with coverage in alpha, for ray reconstruction to
+    /// composite after denoising. It holds its contents through [`ViewStep::Rr`].
+    pub fn transparency_overlay(
+        &mut self,
+        view: &RasterView,
+        hook: &mut dyn FnMut(&mut TransparencyPass<'_, '_>),
+    ) -> Result<Arc<orr_gpu::Texture>> {
+        self.transparency_point(view, None, hook)
+    }
+
+    fn transparency_point(
+        &mut self,
+        view: &RasterView,
+        radiance: Option<StorageImageIndex>,
+        hook: &mut dyn FnMut(&mut TransparencyPass<'_, '_>),
+    ) -> Result<Arc<orr_gpu::Texture>> {
         self.ensure_updated()?;
         let device = self.device;
         let composite = self.pipelines.get(self.pipelines.own.composite);
@@ -1991,24 +2012,28 @@ impl<'a> Frame<'a> {
             device,
             window,
         });
-        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-        let root = window.put_root(
-            device,
-            &CompositeRoot {
-                overlay: overlay_index,
-                radiance,
-                width: extent[0],
-                height: extent[1],
-            },
-        )?;
-        list.dispatch(
-            composite,
-            root,
-            [extent[0].div_ceil(8), extent[1].div_ceil(8), 1],
-        );
-        list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
+        if let Some(radiance) = radiance {
+            list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+            let root = window.put_root(
+                device,
+                &CompositeRoot {
+                    overlay: overlay_index,
+                    radiance,
+                    width: extent[0],
+                    height: extent[1],
+                },
+            )?;
+            list.dispatch(
+                composite,
+                root,
+                [extent[0].div_ceil(8), extent[1].div_ceil(8), 1],
+            );
+            list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
+        } else {
+            list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
+        }
         self.step("transparency");
-        Ok(())
+        Ok(overlay_texture)
     }
 
     /// The frame's command list and the arena of view `history`, as its last

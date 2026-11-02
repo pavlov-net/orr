@@ -2061,6 +2061,7 @@ name = "orr"
 version = "0.0.1"
 dependencies = [
  "orr-lighting",
+ "orr-math",
  "orr-output",
  "orr-scene",
  "orr-shaders",

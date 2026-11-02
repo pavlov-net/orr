@@ -2,6 +2,8 @@
 //! history, the world cache's update paths, the opaque path dispatch, the dielectric dispatch
 //! and the guide resolve.
 
+use std::sync::Arc;
+
 use orr_math::{DVec3, Quat};
 use orr_scene::orr_gpu::{
     self, Allocation, CommandList, ComputePipeline, Device, DispatchArgs, Format, GpuPtr, Hazards,
@@ -301,11 +303,10 @@ const SPECULAR_MOTION: &str = "specular motion";
 const RR_DEPTH: &str = "rr depth";
 const RR_MOTION: &str = "rr motion";
 
-/// The radiance lives until the end of the frame: the passes after ray reconstruction and
-/// the consumer read it.
-const RADIANCE_SPAN: Span = Span::new(ViewStep::Lighting, ViewStep::After);
-/// The guides and lighting's depth and motion are ray reconstruction's inputs.
-const GUIDE_SPAN: Span = Span::new(ViewStep::Lighting, ViewStep::Rr);
+/// What the passes after ray reconstruction and the consumer read.
+const TO_FRAME_END: Span = Span::new(ViewStep::Lighting, ViewStep::After);
+/// What only ray reconstruction reads.
+const TO_RECONSTRUCTION: Span = Span::new(ViewStep::Lighting, ViewStep::Rr);
 
 /// The view's targets in its arena, taken at one layout.
 struct Targets {
@@ -375,19 +376,26 @@ pub struct LightingView {
 }
 
 impl LightingView {
-    /// The targets a view's arena holds for its [`LightingView`] at `extent`.
-    pub fn requests(extent: [u32; 2]) -> Vec<ArenaRequest> {
+    /// The targets a view's arena holds for its [`LightingView`] at `extent`. With
+    /// `reconstructed`, ray reconstruction's output replaces the radiance after it, and later
+    /// passes read lighting's depth and motion.
+    pub fn requests(extent: [u32; 2], reconstructed: bool) -> Vec<ArenaRequest> {
+        let (radiance, surface) = if reconstructed {
+            (TO_RECONSTRUCTION, TO_FRAME_END)
+        } else {
+            (TO_FRAME_END, TO_RECONSTRUCTION)
+        };
         let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
         let d2 = |format| TextureDesc::d2(format, extent[0], extent[1], usage);
-        let guide = |name, format| ArenaRequest::texture(name, d2(format), GUIDE_SPAN);
+        let guide = |name, format| ArenaRequest::texture(name, d2(format), TO_RECONSTRUCTION);
         vec![
-            ArenaRequest::texture(RADIANCE, d2(Format::Rgba16Float), RADIANCE_SPAN),
+            ArenaRequest::texture(RADIANCE, d2(Format::Rgba16Float), radiance),
             guide(DIFFUSE_ALBEDO, Format::Rgba8Unorm),
             guide(SPECULAR_ALBEDO, Format::Rgba8Unorm),
             guide(NORMAL_ROUGHNESS, Format::Rgba16Float),
             guide(SPECULAR_MOTION, Format::Rg16Float),
-            guide(RR_DEPTH, Format::R32Float),
-            guide(RR_MOTION, Format::Rg16Float),
+            ArenaRequest::texture(RR_DEPTH, d2(Format::R32Float), surface),
+            ArenaRequest::texture(RR_MOTION, d2(Format::Rg16Float), surface),
         ]
     }
 
@@ -486,7 +494,7 @@ impl LightingView {
         &mut self,
         frame: u64,
         scene: &SceneLighting,
-        desc: &ViewDesc<'_>,
+        desc: &ViewDesc,
         exposure_cut: bool,
         lighting: &ViewLighting,
     ) -> bool {
@@ -546,13 +554,21 @@ impl LightingView {
     }
 
     /// R32F reverse-Z device depth, 0 on sky pixels.
-    pub fn depth(&self) -> &Texture {
+    pub fn depth(&self) -> &Arc<Texture> {
         self.targets.depth.texture()
     }
 
+    pub fn depth_index(&self) -> TextureIndex {
+        self.targets.depth.sampled()
+    }
+
     /// RG16F, previous uv minus current uv, unjittered.
-    pub fn motion(&self) -> &Texture {
+    pub fn motion(&self) -> &Arc<Texture> {
         self.targets.motion.texture()
+    }
+
+    pub fn motion_index(&self) -> TextureIndex {
+        self.targets.motion.sampled()
     }
 
     /// RGBA16F, the background layer behind out-of-focus foreground as the last opaque

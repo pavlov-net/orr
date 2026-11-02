@@ -11,9 +11,10 @@ use glam::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr::{
     Affine3, ArenaReport, Budgets, DirectionalLight, DiscProfile, Exposure, FrameDesc, FrameTime,
     Glare, GlareMethod, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, Light, LightId,
-    LoadState, MountId, OutputDebug, PackSource, PathEntry, PipelineId, PostQuality, Projection,
-    ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId, TextureFilter, TransformGroupDesc,
-    TransparencyPass, ViewDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    LitView, LoadState, MountId, OutputDebug, PackSource, PathEntry, PipelineId, PostQuality,
+    Projection, ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId, TextureFilter,
+    TransformGroupDesc, TransparencyPass, ViewDesc, ViewHooks, ViewLighting, ViewOutput,
+    ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source};
 use orr_gpu::{
@@ -81,7 +82,6 @@ fn empty_frames_and_scene_frames_submit_in_order() {
             reset_history: false,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
-            target: ViewTarget::AfterRr,
         })
         .unwrap();
         last = Some(f.end().unwrap());
@@ -498,7 +498,7 @@ fn hooked_frames(pack: &Arc<[u8]>, alias: bool) -> (Vec<Vec<u8>>, ArenaReport) {
         };
         let eye = DVec3::new(0.2 * f64::from(i), 2.0, 4.0);
         f.render_view(
-            &ViewDesc {
+            &LitView {
                 scene,
                 history,
                 position: eye,
@@ -508,10 +508,7 @@ fn hooked_frames(pack: &Arc<[u8]>, alias: bool) -> (Vec<Vec<u8>>, ArenaReport) {
                     near: 0.05,
                 },
                 lens: Lens::default(),
-                render_extent: UVec2::new(w, h),
-                jitter: Vec2::ZERO,
                 reset_history: false,
-                mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
                 target: ViewTarget::Texture(&image),
             },
@@ -638,7 +635,7 @@ fn render_view_runs_the_glare_its_lens_asks_for() {
         f.update_scenes(&mut |_| {}).unwrap();
         let eye = DVec3::new(0.0, 0.0, 30.0);
         f.render_view(
-            &ViewDesc {
+            &LitView {
                 scene,
                 history,
                 position: eye,
@@ -648,10 +645,7 @@ fn render_view_runs_the_glare_its_lens_asks_for() {
                     near: 0.05,
                 },
                 lens,
-                render_extent: UVec2::new(w, h),
-                jitter: Vec2::ZERO,
                 reset_history: false,
-                mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
                 target: ViewTarget::Texture(&image),
             },

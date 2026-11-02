@@ -23,7 +23,7 @@ use orr::orr_pack::{AssetId, Target};
 use orr::{
     Affine3, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
     InstancesDesc, Lens, LoadState, PackSource, Projection, Renderer, RendererDesc, SceneDesc,
-    SceneLightingSettings, TextureFilter, TransformGroupDesc, ViewDesc, ViewTarget,
+    SceneLightingSettings, TextureFilter, TransformGroupDesc, ViewDesc,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSettings, Source, TextureSettings,
@@ -246,11 +246,6 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                 reset_history: i == 0,
                 mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
-                target: if options.headless {
-                    ViewTarget::AfterRr
-                } else {
-                    ViewTarget::Display
-                },
             })
             .expect("raster view");
 

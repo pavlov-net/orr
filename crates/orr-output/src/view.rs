@@ -1,5 +1,6 @@
 //! What output does with one view each frame.
 
+use orr_dlss::Quality;
 use orr_scene::LensDistortion;
 
 use crate::{
@@ -7,9 +8,30 @@ use crate::{
     ScreenshotRequest,
 };
 
+/// How a lit view goes through DLSS ray reconstruction when the renderer has it. Without it, or
+/// under a lighting debug view or the accumulation reference, the view renders one noisy path
+/// per pixel at the output extent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reconstruction {
+    /// No ray reconstruction: the view renders at the output extent.
+    Off,
+    /// At the render size NGX gives this quality for the output extent.
+    Quality(Quality),
+    /// At this render size, which keeps the output's aspect ratio. NVIDIA documents only the
+    /// sizes of the modes for ray reconstruction, so NGX may refuse others.
+    RenderExtent([u32; 2]),
+}
+
+impl Default for Reconstruction {
+    fn default() -> Self {
+        Self::Quality(Quality::default())
+    }
+}
+
 /// Output's settings for one view, passed with each render of it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ViewOutput {
+    pub reconstruction: Reconstruction,
     pub exposure: Exposure,
     /// Off by default.
     pub white_balance: Option<AutoWhiteBalance>,

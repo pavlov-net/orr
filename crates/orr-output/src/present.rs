@@ -294,7 +294,7 @@ impl DisplayFrame<'_> {
     /// images, and the next one that has it starts frame generation afresh.
     pub fn frame_generation(
         &mut self,
-        view: &SceneView<'_>,
+        view: &SceneView,
         depth: &Arc<Texture>,
         motion: &Arc<Texture>,
         not_rendering_scene: bool,
