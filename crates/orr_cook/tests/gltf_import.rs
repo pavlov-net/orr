@@ -1856,3 +1856,48 @@ fn hidden_nodes_hide_their_subtrees() {
         [1.0, 0.0, 1.0]
     );
 }
+
+#[test]
+fn a_model_pattern_that_matches_only_hidden_nodes_says_so() {
+    let d = dir("gltf-select-hidden");
+    let path = d.join("hidden.glb");
+    let mut g = Glb::default();
+    let (pos, _, idx) = grid(1, |_, _| 0.0);
+    let pa = g.floats(&pos, "VEC3");
+    let ia = g.indices(&idx);
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,1]}}],
+"nodes":[{{"name":"shown","mesh":0,"children":[3]}},
+ {{"name":"off","mesh":0,"visible":false,"children":[2]}},
+ {{"name":"off_child","mesh":0}},{{"name":"kid","mesh":0}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa}}},"indices":{ia}}}]}}]"#
+        ),
+    );
+    let error = |patterns: &[&str]| {
+        let settings = GltfSettings {
+            models: patterns
+                .iter()
+                .map(|p| NodeSelect { node: (*p).into() })
+                .collect(),
+            ..Default::default()
+        };
+        cook(&path, settings).map(|_| ()).unwrap_err().to_string()
+    };
+    let hidden = error(&["off"]);
+    assert!(
+        hidden.contains(r#"matches only hidden nodes: ["off", "off_child"]"#),
+        "{hidden}"
+    );
+    let nested = error(&["shown", "kid"]);
+    assert!(
+        nested.contains(r#"matches only nodes inside other selected models: ["kid"]"#),
+        "{nested}"
+    );
+    let missing = error(&["nothing"]);
+    assert!(
+        missing.contains("matches no node") && !missing.contains("hidden"),
+        "{missing}"
+    );
+}

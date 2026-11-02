@@ -1151,13 +1151,7 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
         if node.is_none() && building.groups.values().all(Vec::is_empty) && !instanced.is_empty() {
             continue;
         }
-        let name = node.map(|n| {
-            doc.nodes()
-                .nth(n)
-                .and_then(|d| d.name())
-                .unwrap_or_default()
-                .to_string()
-        });
+        let name = node.map(|n| node_name(doc, n).to_string());
         if let Some(name) = &name {
             b.name(name)?;
         }
@@ -1231,6 +1225,14 @@ fn shown_nodes(json: &serde_json::Value, graph: &Graph) -> Vec<usize> {
     shown
 }
 
+/// The name of node `i`, empty when it has none.
+fn node_name(doc: &gltf::Document, i: usize) -> &str {
+    doc.nodes()
+        .nth(i)
+        .and_then(|d| d.name())
+        .unwrap_or_default()
+}
+
 /// The models to build and, per visible glTF node, the model it belongs to.
 fn select_models(
     doc: &gltf::Document,
@@ -1258,11 +1260,7 @@ fn select_models(
             owner[i] = Some(m);
             continue;
         }
-        let name = doc
-            .nodes()
-            .nth(i)
-            .and_then(|d| d.name())
-            .unwrap_or_default();
+        let name = node_name(doc, i);
         let mut hit = false;
         for (s, sel) in settings.models.iter().enumerate() {
             if name.contains(sel.node.as_str()) {
@@ -1281,10 +1279,31 @@ fn select_models(
         models.push(building(Some(i), graph.world[i].inverse()));
     }
     if let Some(s) = matched.iter().position(|m| !m) {
-        return Err(format!(
-            "model pattern {:?} matches no node",
-            settings.models[s].node
-        ));
+        let pattern = settings.models[s].node.as_str();
+        let names = |hidden: bool| -> Vec<&str> {
+            let matching = graph
+                .order
+                .iter()
+                .map(|&n| (n, node_name(doc, n)))
+                .filter(|(n, name)| name.contains(pattern) && shown.contains(n) != hidden);
+            matching.map(|(_, name)| name).collect()
+        };
+        let (nested, hidden) = (names(false), names(true));
+        let mut only = Vec::new();
+        if !nested.is_empty() {
+            only.push(format!("nodes inside other selected models: {nested:?}"));
+        }
+        if !hidden.is_empty() {
+            only.push(format!("hidden nodes: {hidden:?}"));
+        }
+        return Err(if only.is_empty() {
+            format!("model pattern {pattern:?} matches no node")
+        } else {
+            format!(
+                "model pattern {pattern:?} matches only {}",
+                only.join(" and ")
+            )
+        });
     }
     Ok((models, owner))
 }
