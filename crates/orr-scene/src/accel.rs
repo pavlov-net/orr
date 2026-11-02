@@ -47,6 +47,9 @@ pub(crate) struct AccelKernels {
     /// Streamed mesh pages from their stored form: the copy pass, then the cluster decode.
     pub page_copy: ComputePipeline,
     pub page_decode: ComputePipeline,
+    /// An edit's rebuild: the culling data of its clusters, then their CLAS addresses.
+    pub edit_bounds: ComputePipeline,
+    pub edit_refs: ComputePipeline,
 }
 
 impl AccelKernels {
@@ -62,6 +65,8 @@ impl AccelKernels {
             allocate: pipeline(&crate::shaders::clas_pool::MODULE, "allocate")?,
             page_copy: pipeline(&crate::shaders::page_decode::MODULE, "copy")?,
             page_decode: pipeline(&crate::shaders::page_decode::MODULE, "decode")?,
+            edit_bounds: pipeline(&crate::shaders::edit::MODULE, "bounds")?,
+            edit_refs: pipeline(&crate::shaders::edit::MODULE, "refs")?,
         })
     }
 }
@@ -156,6 +161,8 @@ pub(crate) struct MeshInput<'a> {
     /// The smallest error of a cut whose clusters are all resident: 0 unless the mesh's
     /// pages stream.
     pub min_cut: f32,
+    /// Thresholds of the finer cuts built once their streamed pages are resident, finest first.
+    pub fine: &'a [f32],
 }
 
 /// A mesh's animated parts: those of its clusters with `ANIMATED_PART`, from the lowest
@@ -241,6 +248,8 @@ pub(crate) struct MeshCuts {
     pub animated: Animated,
     /// The sections of every animated part.
     pub animated_sections: u32,
+    /// The finer cuts at the start of the table.
+    pub fine: u32,
     pub rt: MeshRt,
 }
 
@@ -306,6 +315,33 @@ pub(crate) fn cut_hash(clusters: &[u32]) -> [u32; 2] {
     })
 }
 
+/// The thresholds of the finer cuts of a mesh whose streamed groups reach down to `min_cut`:
+/// level 0, then its smallest group error and powers of 4 above it, finest first.
+pub(crate) fn fine_thresholds(errors: impl Iterator<Item = f32>, min_cut: f32) -> Vec<f32> {
+    let smallest = errors
+        .filter(|e| e.is_finite() && *e > 0.0)
+        .fold(f32::INFINITY, f32::min);
+    let mut out = vec![0.0];
+    let mut t = smallest;
+    while smallest.is_finite() && t < min_cut && out.len() < DAG_CUTS {
+        out.push(t);
+        t *= 4.0;
+    }
+    out
+}
+
+/// The mesh clusters of the cut at threshold `t`: the clusters whose own error is at or under
+/// it and whose parent's is over it, from the merged stage once `t` reaches the merge error.
+pub(crate) fn cut_clusters(clusters: &[ClusterInfo], t: f32, merge: f32) -> Vec<u32> {
+    let merged = t >= merge;
+    (0..clusters.len() as u32)
+        .filter(|&i| {
+            let c = &clusters[i as usize];
+            ((c.flags & Cluster::MERGED) != 0) == merged && c.self_error <= t && c.parent_error > t
+        })
+        .collect()
+}
+
 /// The clusters of each cut a mesh caches, finest first, with the largest error in it.
 /// Discrete meshes cache their levels. DAG meshes cache cuts at fixed thresholds: a cut
 /// takes every cluster whose own error is at or under the threshold and whose parent's is
@@ -350,15 +386,7 @@ pub(crate) fn cuts(m: &MeshInput<'_>) -> Vec<(f32, Vec<u32>)> {
     }
     let mut out: Vec<(f32, Vec<u32>)> = Vec::new();
     for t in thresholds {
-        let merged = t >= merge;
-        let selected: Vec<u32> = (0..m.clusters.len() as u32)
-            .filter(|&i| {
-                let c = &m.clusters[i as usize];
-                ((c.flags & Cluster::MERGED) != 0) == merged
-                    && c.self_error <= t
-                    && c.parent_error > t
-            })
-            .collect();
+        let selected = cut_clusters(m.clusters, t, merge);
         let error = selected
             .iter()
             .map(|&i| m.clusters[i as usize].self_error)
@@ -369,6 +397,89 @@ pub(crate) fn cuts(m: &MeshInput<'_>) -> Vec<(f32, Vec<u32>)> {
         out.push((error, selected));
     }
     out
+}
+
+/// The queue acceleration structure builds outside a frame run on.
+fn build_queue(device: &Device) -> QueueKind {
+    [QueueKind::Loading, QueueKind::Render]
+        .into_iter()
+        .find(|&q| device.queue(q).is_some())
+        .expect("the render queue always exists")
+}
+
+/// Records the build of the micromap of the page at `page`; none when its region is empty.
+fn page_micromap(
+    step: &mut Step<'_>,
+    page: u64,
+    region: &PageMicromap,
+) -> Result<Option<(Micromap, Allocation<u8>)>> {
+    let usage: Vec<MicromapUsage> = region
+        .usage
+        .iter()
+        .enumerate()
+        .filter(|&(_, &n)| n > 0)
+        .map(|(level, &count)| MicromapUsage {
+            count,
+            level: level as u32,
+            format: OmmFormat::FourState,
+        })
+        .collect();
+    if usage.is_empty() {
+        return Ok(None);
+    }
+    let at = GpuAddress(page + u64::from(region.offset));
+    let desc = MicromapDesc {
+        flags: RtasFlags::FAST_TRACE,
+        usage: &usage,
+        data: at,
+        // SAFETY: the entries start the page's micromap region.
+        triangles: unsafe { GpuPtr::<MicromapTriangle>::from_address(at) },
+    };
+    let device = step.device;
+    let sizes = device.micromap_sizes(&desc);
+    let block = device.gpu_malloc_with_priority::<u8>(
+        MemoryKind::DeviceLocal,
+        MemoryPriority::High,
+        sizes.result_max,
+        "micromap",
+    )?;
+    let micromap = device.create_micromap(sizes.result_max, &block, 0)?;
+    let scratch = step.block(MemoryKind::DeviceLocal, sizes.scratch, "omm scratch")?;
+    step.list()
+        .build_micromap(&desc, &micromap, scratch.address());
+    Ok(Some((micromap, block)))
+}
+
+/// Per page, its micromap and storage if it has one, and the point the last build signals.
+pub(crate) type PageMicromaps = (
+    Vec<Option<(Micromap, Allocation<u8>)>>,
+    Option<TimelinePoint>,
+);
+
+/// Builds the micromap of each page with a micromap region on the loading queue after `wait`,
+/// at most `per_submit` a submit.
+pub(crate) fn page_micromaps(
+    device: &Device,
+    pages: &[(u64, Option<PageMicromap>)],
+    per_submit: u32,
+    wait: Option<TimelinePoint>,
+) -> Result<PageMicromaps> {
+    let caps = device.caps();
+    let mut out: Vec<Option<(Micromap, Allocation<u8>)>> = pages.iter().map(|_| None).collect();
+    if !(caps.omm && caps.cluster.omm_in_clusters) || pages.iter().all(|p| p.1.is_none()) {
+        return Ok((out, None));
+    }
+    let mut step = Step::new(device, build_queue(device), wait)?;
+    let mut built = 0;
+    for (o, (page, region)) in out.iter_mut().zip(pages) {
+        let Some(region) = region else { continue };
+        *o = page_micromap(&mut step, *page, region)?;
+        built += u32::from(o.is_some());
+        if built > 0 && built % per_submit.max(1) == 0 {
+            step.submit()?;
+        }
+    }
+    Ok((out, Some(step.submit()?)))
 }
 
 /// One list on the loading queue, the memory it reads and the point to wait first.
@@ -620,11 +731,7 @@ pub(crate) fn build(
             point: None,
         });
     }
-    let kind = [QueueKind::Loading, QueueKind::Render]
-        .into_iter()
-        .find(|&q| device.queue(q).is_some())
-        .expect("render queue");
-    let mut step = Step::new(device, kind, wait)?;
+    let mut step = Step::new(device, build_queue(device), wait)?;
 
     // Micromaps, one per page with a micromap region, at most `limits.micromaps` a submit.
     let omm = caps.omm && caps.cluster.omm_in_clusters;
@@ -634,39 +741,9 @@ pub(crate) fn build(
         for (mi, m) in meshes.iter().enumerate() {
             for (p, region) in m.micromaps.iter().enumerate() {
                 let Some(region) = region else { continue };
-                let usage: Vec<MicromapUsage> = region
-                    .usage
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &n)| n > 0)
-                    .map(|(level, &count)| MicromapUsage {
-                        count,
-                        level: level as u32,
-                        format: OmmFormat::FourState,
-                    })
-                    .collect();
-                if usage.is_empty() {
+                let Some((micromap, block)) = page_micromap(&mut step, m.pages[p], region)? else {
                     continue;
-                }
-                let at = GpuAddress(m.pages[p] + u64::from(region.offset));
-                let desc = MicromapDesc {
-                    flags: RtasFlags::FAST_TRACE,
-                    usage: &usage,
-                    data: at,
-                    // SAFETY: the entries start the page's micromap region.
-                    triangles: unsafe { GpuPtr::<MicromapTriangle>::from_address(at) },
                 };
-                let sizes = device.micromap_sizes(&desc);
-                let block = device.gpu_malloc_with_priority::<u8>(
-                    MemoryKind::DeviceLocal,
-                    MemoryPriority::High,
-                    sizes.result_max,
-                    "micromap",
-                )?;
-                let micromap = device.create_micromap(sizes.result_max, &block, 0)?;
-                let scratch = step.block(MemoryKind::DeviceLocal, sizes.scratch, "omm scratch")?;
-                step.list()
-                    .build_micromap(&desc, &micromap, scratch.address());
                 micromap_of[mi][p] = micromap.address().0;
                 accel.micromaps.push((micromap, block));
                 built += 1;
@@ -738,15 +815,8 @@ pub(crate) fn build(
         )?;
     }
 
-    // One cluster BLAS per cut over the moved CLAS; a cut with animated part clusters also
-    // one over its body (when not empty) and one per animated part with clusters in it.
-    let mut jobs = Vec::new();
-    let mut lists: Vec<u64> = Vec::new();
-    let mut job = |clusters: &[u32], clas: &[u64]| {
-        jobs.push((lists.len(), clusters.len() as u32));
-        lists.extend(clusters.iter().map(|&c| clas[c as usize]));
-        jobs.len() - 1
-    };
+    // One cluster BLAS per cut over the moved CLAS.
+    let mut jobs = BlasJobs::default();
     let mut plans = Vec::new();
     let mut per_mesh = Vec::with_capacity(meshes.len());
     for (mi, m) in meshes.iter().enumerate() {
@@ -754,77 +824,10 @@ pub(crate) fn build(
         let cs = cuts(m);
         per_mesh.push((cs.len() as u32, animated));
         for (error, clusters) in cs {
-            let rest = job(&clusters, &clas[mi]);
-            let mut parts = vec![Vec::new(); animated.count as usize];
-            let mut body = Vec::new();
-            for &c in &clusters {
-                match animated.index(&m.clusters[c as usize]) {
-                    Some(j) => parts[j].push(c),
-                    None => body.push(c),
-                }
-            }
-            let parted = parts.iter().any(|p| !p.is_empty());
-            let (body, parts) = if parted {
-                let body = (!body.is_empty()).then(|| job(&body, &clas[mi]));
-                let parts: Vec<Option<usize>> = parts
-                    .iter()
-                    .map(|p| (!p.is_empty()).then(|| job(p, &clas[mi])))
-                    .collect();
-                (body, Some(parts))
-            } else {
-                (Some(rest), None)
-            };
-            plans.push(CutPlan {
-                error,
-                clusters,
-                rest,
-                body,
-                parts,
-            });
+            plans.push(jobs.plan_cut(error, clusters, m.clusters, animated, &clas[mi]));
         }
     }
-    let address_list = step.upload(&lists, "BLAS CLAS addresses")?;
-    let blas_jobs: Vec<AddressJob> = jobs
-        .iter()
-        .map(|&(first, count)| AddressJob {
-            address: address_list.address().0 + 8 * first as u64,
-            count,
-            _pad: 0,
-        })
-        .collect();
-    let n = blas_jobs.len() as u32;
-    let desc = RtasOpDesc {
-        op: RtasOp::BuildClusterBlas,
-        mode: RtasMode::Implicit,
-        flags: RtasFlags::FAST_TRACE,
-        vertex_format: ClusterVertexFormat::F32x3,
-        limits: RtasLimits::Blas(BlasLimits {
-            max_args: n,
-            max_clas_per_blas: jobs.iter().map(|j| j.1).max().unwrap_or(1),
-            max_total_clas: lists.len() as u32,
-        }),
-    };
-    let (addresses, sizes) = implicit(&mut step, &desc, n, |step, records, count| {
-        let root = AccelRoot {
-            addresses: step.upload(&blas_jobs, "BLAS jobs")?,
-            records,
-            record_count: count,
-            count: n,
-            op: ACCEL_BLAS,
-            ..bytemuck::Zeroable::zeroed()
-        };
-        step.dispatch(&k.records, &root, n.div_ceil(64))
-    })?;
-    let align = u64::from(caps.cluster.align_blas);
-    let blas = pack(
-        &mut step,
-        k,
-        MoveKind::ClusterBlas,
-        align,
-        &addresses,
-        &sizes,
-        &mut accel.blocks,
-    )?;
+    let blas = jobs.build(&mut step, k, &mut accel.blocks)?;
     let point = step.submit()?;
 
     let part_rows: usize = plans
@@ -835,9 +838,14 @@ pub(crate) fn build(
         device.gpu_malloc::<u64>(MemoryKind::Upload, part_rows.max(1) as u64, "part BLAS")?;
     let at = |j: Option<usize>| j.map_or(0, |j| blas[j]);
     let mut row = 0;
-    let records: Vec<RtCutGpu> = plans
-        .iter()
-        .map(|p| {
+    let mut records: Vec<RtCutGpu> = Vec::with_capacity(plans.len());
+    let mut remaining = plans.iter();
+    for (m, &(count, _)) in meshes.iter().zip(&per_mesh) {
+        records.extend(m.fine.iter().map(|&t| RtCutGpu {
+            error: t,
+            ..bytemuck::Zeroable::zeroed()
+        }));
+        for p in remaining.by_ref().take(count as usize) {
             let parts = match &p.parts {
                 None => GpuPtr::NULL,
                 Some(parts) => {
@@ -850,16 +858,16 @@ pub(crate) fn build(
                     part_blas.gpu().offset((row - parts.len()) as u64)
                 }
             };
-            RtCutGpu {
+            records.push(RtCutGpu {
                 blas: blas[p.rest],
                 error: p.error,
                 clusters: p.clusters.len() as u32,
                 body: at(p.body),
                 parts,
                 hash: cut_hash(&p.clusters),
-            }
-        })
-        .collect();
+            });
+        }
+    }
     let mut table = device.gpu_malloc::<RtCutGpu>(
         MemoryKind::Upload,
         records.len().max(1) as u64,
@@ -891,12 +899,14 @@ pub(crate) fn build(
         .zip(&per_part)
         .map(|(((m, clas), &(count, animated)), parts_of)| {
             let mine: Vec<CutPlan> = plans.by_ref().take(count as usize).collect();
+            let fine = m.fine.len() as u32;
             let c = MeshCuts {
                 table: table.gpu().offset(first),
-                count,
+                count: fine + count,
                 parts: parts.gpu().offset(first_part),
                 animated,
                 animated_sections: parts_of.iter().fold(0, |s, p| s | p.sections),
+                fine,
                 rt: MeshRt {
                     clas: clas.clone(),
                     sections: m.clusters.iter().map(|c| c.section).collect(),
@@ -905,11 +915,15 @@ pub(crate) fn build(
                         .iter()
                         .map(|c| animated.index(c).is_some())
                         .collect(),
-                    parted: mine.iter().map(|p| p.parts.is_some()).collect(),
-                    cuts: mine.into_iter().map(|p| p.clusters).collect(),
+                    parted: std::iter::repeat_n(false, fine as usize)
+                        .chain(mine.iter().map(|p| p.parts.is_some()))
+                        .collect(),
+                    cuts: std::iter::repeat_n(Vec::new(), fine as usize)
+                        .chain(mine.into_iter().map(|p| p.clusters))
+                        .collect(),
                 },
             };
-            first += u64::from(count);
+            first += u64::from(fine + count);
             first_part += u64::from(animated.count);
             c
         })
@@ -923,6 +937,177 @@ pub(crate) fn build(
         templates,
         point: Some(point),
     })
+}
+
+/// The cluster BLAS of a build: each one's run of CLAS addresses.
+#[derive(Default)]
+struct BlasJobs {
+    jobs: Vec<(usize, u32)>,
+    lists: Vec<u64>,
+}
+
+impl BlasJobs {
+    fn add(&mut self, clusters: &[u32], clas: &[u64]) -> usize {
+        self.jobs.push((self.lists.len(), clusters.len() as u32));
+        self.lists
+            .extend(clusters.iter().map(|&c| clas[c as usize]));
+        self.jobs.len() - 1
+    }
+
+    /// The BLAS of a cut: over its clusters; with animated part clusters also over its body
+    /// (when not empty) and one per animated part with clusters in it.
+    fn plan_cut(
+        &mut self,
+        error: f32,
+        clusters: Vec<u32>,
+        infos: &[ClusterInfo],
+        animated: Animated,
+        clas: &[u64],
+    ) -> CutPlan {
+        let rest = self.add(&clusters, clas);
+        let mut parts = vec![Vec::new(); animated.count as usize];
+        let mut body = Vec::new();
+        for &c in &clusters {
+            match animated.index(&infos[c as usize]) {
+                Some(j) => parts[j].push(c),
+                None => body.push(c),
+            }
+        }
+        let parted = parts.iter().any(|p| !p.is_empty());
+        let (body, parts) = if parted {
+            let body = (!body.is_empty()).then(|| self.add(&body, clas));
+            let parts: Vec<Option<usize>> = parts
+                .iter()
+                .map(|p| (!p.is_empty()).then(|| self.add(p, clas)))
+                .collect();
+            (body, Some(parts))
+        } else {
+            (Some(rest), None)
+        };
+        CutPlan {
+            error,
+            clusters,
+            rest,
+            body,
+            parts,
+        }
+    }
+
+    /// Builds every BLAS, moved into a block of exactly their size that `keep` takes; returns
+    /// their addresses.
+    fn build(
+        &self,
+        step: &mut Step<'_>,
+        k: &AccelKernels,
+        keep: &mut Vec<Allocation<u8>>,
+    ) -> Result<Vec<u64>> {
+        let address_list = step.upload(&self.lists, "BLAS CLAS addresses")?;
+        let blas_jobs: Vec<AddressJob> = self
+            .jobs
+            .iter()
+            .map(|&(first, count)| AddressJob {
+                address: address_list.address().0 + 8 * first as u64,
+                count,
+                _pad: 0,
+            })
+            .collect();
+        let n = blas_jobs.len() as u32;
+        let desc = RtasOpDesc {
+            op: RtasOp::BuildClusterBlas,
+            mode: RtasMode::Implicit,
+            flags: RtasFlags::FAST_TRACE,
+            vertex_format: ClusterVertexFormat::F32x3,
+            limits: RtasLimits::Blas(BlasLimits {
+                max_args: n,
+                max_clas_per_blas: self.jobs.iter().map(|j| j.1).max().unwrap_or(1),
+                max_total_clas: self.lists.len() as u32,
+            }),
+        };
+        let (addresses, sizes) = implicit(step, &desc, n, |step, records, count| {
+            let root = AccelRoot {
+                addresses: step.upload(&blas_jobs, "BLAS jobs")?,
+                records,
+                record_count: count,
+                count: n,
+                op: ACCEL_BLAS,
+                ..bytemuck::Zeroable::zeroed()
+            };
+            step.dispatch(&k.records, &root, n.div_ceil(64))
+        })?;
+        let align = u64::from(step.device.caps().cluster.align_blas);
+        pack(
+            step,
+            k,
+            MoveKind::ClusterBlas,
+            align,
+            &addresses,
+            &sizes,
+            keep,
+        )
+    }
+}
+
+/// A finer cached cut of a streaming mesh, built after its pages landed.
+pub(crate) struct FineCut {
+    /// Its table record.
+    pub record: RtCutGpu,
+    /// Its BLAS and the table of its parts' BLAS.
+    _blocks: Vec<Allocation<u8>>,
+    _parts: Option<Allocation<u64>>,
+}
+
+/// Builds the BLAS of a finer cut over `clusters` on the loading queue. Returns its record
+/// and the point the build signals.
+pub(crate) fn build_fine_cut(
+    device: &Device,
+    k: &AccelKernels,
+    clusters: Vec<u32>,
+    infos: &[ClusterInfo],
+    animated: Animated,
+    clas: &[u64],
+) -> Result<(FineCut, TimelinePoint)> {
+    let mut step = Step::new(device, build_queue(device), None)?;
+    let error = clusters
+        .iter()
+        .map(|&i| infos[i as usize].self_error)
+        .fold(0.0, f32::max);
+    let mut jobs = BlasJobs::default();
+    let p = jobs.plan_cut(error, clusters, infos, animated, clas);
+    let mut blocks = Vec::new();
+    let blas = jobs.build(&mut step, k, &mut blocks)?;
+    let point = step.submit()?;
+    let at = |j: Option<usize>| j.map_or(0, |j| blas[j]);
+    let mut part_table = None;
+    let parts = match &p.parts {
+        None => GpuPtr::NULL,
+        Some(parts) => {
+            let mut a =
+                device.gpu_malloc::<u64>(MemoryKind::Upload, parts.len() as u64, "part BLAS")?;
+            let out = a.as_mut_slice().expect("upload is mapped");
+            for (o, &j) in out.iter_mut().zip(parts) {
+                *o = at(j);
+            }
+            let gpu = a.gpu();
+            part_table = Some(a);
+            gpu
+        }
+    };
+    let record = RtCutGpu {
+        blas: blas[p.rest],
+        error: p.error,
+        clusters: p.clusters.len() as u32,
+        body: at(p.body),
+        parts,
+        hash: cut_hash(&p.clusters),
+    };
+    Ok((
+        FineCut {
+            record,
+            _blocks: blocks,
+            _parts: part_table,
+        },
+        point,
+    ))
 }
 
 /// One traced cut's BLAS jobs.

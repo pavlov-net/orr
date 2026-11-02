@@ -19,6 +19,7 @@ use orr_pack::mesh::{MeshHeader, MeshInfo, Node, NodePage, decode_page};
 use orr_pack::model::ModelInfo;
 use orr_pack::texture::TextureInfo;
 use orr_pack::{Archive, ArchiveWriter, AssetId, BlobIn, Class, Entry, Span, Target};
+use orr_scene::PageId;
 use orr_scene::orr_gpu::{
     Device, DeviceDesc, GpuAddress, GpuPtr, Hazards, QueueKind, QueueRequest, Stages, Texture,
     TextureIndex, TextureRegion,
@@ -250,15 +251,32 @@ fn ready_whole(scenes: &mut Scenes, m: MountId, a: &Archive) {
         .filter(|e| e.class == Class::Texture as u16)
         .map(|e| scenes.texture(m, e.id).unwrap())
         .collect();
+    let pages: Vec<PageId> = a
+        .entries()
+        .iter()
+        .filter(|e| e.class == Class::InstancePage as u16)
+        .map(|e| scenes.instance_page(m, e.id).unwrap())
+        .collect();
     let start = Instant::now();
     for frames in 1.. {
         assert!(start.elapsed() < Duration::from_secs(60), "tiles pending");
         for &t in &textures {
             scenes.prefetch_texture(m, t, 0);
         }
+        for &p in &pages {
+            scenes.prefetch_page(p, 0);
+        }
         frame(scenes);
         let r = *scenes.residency();
-        if frames > 1 && r.loads == 0 && r.class(ResidencyClass::Textures).loading_bytes == 0 {
+        let landed = pages.iter().all(|&p| {
+            let page = scenes.page(p).unwrap();
+            page.record_count == 0 || page.records != GpuPtr::NULL
+        });
+        if frames > 1
+            && landed
+            && r.loads == 0
+            && r.class(ResidencyClass::Textures).loading_bytes == 0
+        {
             return;
         }
         std::thread::sleep(Duration::from_millis(1));
@@ -2157,5 +2175,240 @@ fn the_clas_pool_allocator_places_like_a_first_fit_reference() {
             placed.as_slice()
         );
     }
+    assert_clean();
+}
+
+/// A streaming sheet's budgets: everything resident fits, nothing keeps whole.
+fn streaming_desc() -> RendererDesc {
+    RendererDesc {
+        budgets: Budgets {
+            mesh_resident_max: 0,
+            ..Budgets::default()
+        },
+        // Every copy traces a cached cut.
+        rt_merge_pixels: 1e9,
+        ..RendererDesc::default()
+    }
+}
+
+#[test]
+fn finer_cached_cuts_build_once_wanted_lock_their_pages_and_leave_after_their_hold() {
+    let _serial = serial();
+    let dev = device();
+    if dev.caps().cluster.max_tris == 0 || dev.caps().cluster.max_partitions == 0 {
+        return;
+    }
+    let gpu = Gpu(dev);
+    let mut scenes = Scenes::new(dev, &streaming_desc()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let m = scenes.mount(PackSource::Memory(Arc::clone(sheet_pack())));
+    ready(&mut scenes, m);
+    let model = scenes.model(m, AssetId::from_name(SHEET)).unwrap();
+    let scene = scenes.create_scene(&SceneDesc::default()).unwrap();
+    let mut group = None;
+    streamed_frame(&mut scenes, scene, |s| {
+        group = Some(place_copies(s, &[model]));
+    });
+    let group = group.unwrap();
+    let (mesh, _) = mesh_of(&scenes, &gpu, model);
+    assert!(mesh.fine_cuts > 0, "a streaming mesh has finer cuts");
+    let built = |scenes: &Scenes| -> Vec<orr_scene::RtCutGpu> {
+        let (mesh, _) = mesh_of(scenes, &gpu, model);
+        let cuts: Vec<orr_scene::RtCutGpu> = gpu.values(mesh.rt_cuts, mesh.fine_cuts);
+        cuts.into_iter().filter(|c| c.blas != 0).collect()
+    };
+    let start = Instant::now();
+    while built(&scenes).is_empty() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "no finer cut was built"
+        );
+        streamed_frame(&mut scenes, scene, |_| {});
+    }
+    for c in built(&scenes) {
+        assert!(c.clusters > 0, "a built cut holds clusters");
+    }
+    // The copy leaves: once its hold passes the cut goes, and its pages may evict.
+    streamed_frame(&mut scenes, scene, |s| move_copy(s, group, 0, 800.0));
+    let start = Instant::now();
+    while !built(&scenes).is_empty() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the finer cut never left"
+        );
+        streamed_frame(&mut scenes, scene, |_| {});
+    }
+    assert_eq!(scenes.residency().failed, 0);
+}
+
+#[test]
+fn an_edit_of_a_streaming_mesh_follows_its_landings_and_evictions() {
+    let _serial = serial();
+    let dev = device();
+    let gpu = Gpu(dev);
+    let bytes = sheet_pack();
+    let a = Archive::from_memory(Arc::clone(bytes)).unwrap();
+    let e = entry(&a, AssetId::from_name("kit/sheet/mesh"));
+    let info = MeshInfo::parse(&blob(&a, e, 0)).unwrap();
+    let unit = |p: &orr_pack::mesh::PageInfo| u64::from(p.resident_len).next_multiple_of(256);
+    let pinned = info.header.pinned_pages as usize;
+    let pinned_bytes: u64 = info.pages[..pinned].iter().map(unit).sum();
+    let streamed_bytes: u64 = info.pages[pinned..].iter().map(unit).sum();
+    let mut scenes = Scenes::new(
+        dev,
+        &RendererDesc {
+            budgets: Budgets {
+                mesh_resident_max: 0,
+                mesh_page_pool: 2 * pinned_bytes + streamed_bytes,
+                ..Budgets::default()
+            },
+            ..RendererDesc::default()
+        },
+    )
+    .unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let mounts = [
+        scenes.mount(PackSource::Memory(Arc::clone(bytes))),
+        scenes.mount(PackSource::Memory(Arc::clone(bytes))),
+    ];
+    let [source, other] = mounts.map(|m| {
+        ready(&mut scenes, m);
+        scenes.model(m, AssetId::from_name(SHEET)).unwrap()
+    });
+    let touched = [[0.0f32, 0.0, 0.0, 0.05]];
+    let edit = scenes
+        .create_edit(&orr_scene::EditDesc {
+            model: source,
+            touched: Some(&touched),
+            bounds: None,
+        })
+        .unwrap();
+    let start = Instant::now();
+    while !matches!(scenes.edit_state(edit), LoadState::Ready) {
+        assert!(start.elapsed() < Duration::from_secs(60), "edit pending");
+        frame(&mut scenes);
+    }
+    let model = scenes.edit(edit).unwrap().model;
+    let scene = scenes.create_scene(&SceneDesc::default()).unwrap();
+    streamed_frame(&mut scenes, scene, |s| {
+        place_copies(s, &[model]);
+    });
+    // Per page of the edit: a copy of its own, or what the source holds.
+    let copies = |scenes: &Scenes| -> Vec<usize> {
+        let (_, src) = mesh_of(scenes, &gpu, source);
+        let (_, own) = mesh_of(scenes, &gpu, model);
+        (0..src.len())
+            .filter(|&p| {
+                if own[p] == src[p] {
+                    return false;
+                }
+                assert!(own[p] != 0, "page {p}: a copy is always resident");
+                true
+            })
+            .collect()
+    };
+    let streamed_shared = |scenes: &Scenes, held: &[usize]| {
+        let (_, src) = mesh_of(scenes, &gpu, source);
+        (pinned..src.len())
+            .filter(|p| !held.contains(p) && src[*p] != 0)
+            .count()
+    };
+    let held = copies(&scenes);
+    assert!(!held.is_empty(), "the edit holds copies");
+    assert!(
+        held.len() < info.pages.len(),
+        "the edit shares untouched pages"
+    );
+    // The source's pages land: the edit's table follows them.
+    let start = Instant::now();
+    while streamed_shared(&scenes, &held) == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the source's pages never landed"
+        );
+        scenes.prefetch(source, 0);
+        streamed_frame(&mut scenes, scene, |_| {});
+        assert_eq!(copies(&scenes), held, "a landing reached the edit's table");
+    }
+    // Another mesh's pages push them out after their hold: the edit keeps its copies and
+    // its shared entries go null with the source's.
+    let start = Instant::now();
+    while streamed_shared(&scenes, &held) > 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the source's pages never left"
+        );
+        scenes.prefetch(other, 0);
+        streamed_frame(&mut scenes, scene, |_| {});
+        assert_eq!(
+            copies(&scenes),
+            held,
+            "an eviction reached the edit's table"
+        );
+    }
+    scenes.destroy_edit(edit);
+    assert_eq!(scenes.residency().failed, 0);
+}
+
+#[test]
+fn tiles_apart_from_their_textures_others_move_beside_them_and_stay_exact() {
+    let _serial = serial();
+    let bytes = tiled_pack();
+    let dev = device();
+    let layouts: Vec<(u64, u64)> = (0..TILED.len()).map(|t| tiled_layout(dev, t)).collect();
+    let tile = orr_pack::texture::TILE_BYTES as u64;
+    let tails: u64 = layouts.iter().map(|l| l.1).sum();
+    // Room for the flat texture's tiles, a few of the cube's and some others.
+    let budget = tails + (layouts[0].0 + 14) * tile;
+    let desc = RendererDesc {
+        budgets: Budgets {
+            texture_pool: budget,
+            ..Budgets::default()
+        },
+        ..RendererDesc::default()
+    };
+    let mut scenes = Scenes::new(dev, &desc).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let m = scenes.mount(PackSource::Memory(Arc::clone(bytes)));
+    ready(&mut scenes, m);
+    let index =
+        |scenes: &Scenes, t: usize| scenes.texture(m, AssetId::from_name(TILED[t].0)).unwrap();
+    let (a, b) = (index(&scenes, 0), index(&scenes, 2));
+    // Mips one at a time, alternating, so each texture's tiles lie in several runs.
+    let settle = |scenes: &mut Scenes, wanted: &[(TextureIndex, u32)]| {
+        let start = Instant::now();
+        for frames in 1.. {
+            assert!(start.elapsed() < Duration::from_secs(60), "tiles pending");
+            for &(t, finest) in wanted {
+                scenes.prefetch_texture(m, t, finest);
+            }
+            frame(scenes);
+            let r = *scenes.residency();
+            let pool = *r.class(ResidencyClass::Textures);
+            if frames > 1 && r.loads == 0 && r.dropped == 0 && pool.loading_bytes == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    settle(&mut scenes, &[(a, 1)]);
+    settle(&mut scenes, &[(b, 1)]);
+    settle(&mut scenes, &[(a, 0)]);
+    // The array's coarser tiles push out the cube's and then some of the flat texture's; what
+    // stays of that texture sits in two runs, and once the cube's slots are free it moves.
+    let array = index(&scenes, 1);
+    let start = Instant::now();
+    while scenes.residency().tiles_moved == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "no tile apart from its texture's others moved"
+        );
+        scenes.prefetch_texture(m, array, 1);
+        frame(&mut scenes);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    stream_tiles(&mut scenes, m, &[0], budget);
+    assert_tiled(&scenes, dev, m, 0, 0..9);
+    assert_eq!(scenes.residency().failed, 0);
     assert_clean();
 }

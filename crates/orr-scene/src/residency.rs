@@ -91,6 +91,8 @@ pub struct ResidencyStats {
     pub failed: u32,
     /// Bytes bound in the CLAS pool that streamed mesh pages build into.
     pub clas_pool_bytes: u64,
+    /// Texture tiles moved beside their texture's other tiles since the start.
+    pub tiles_moved: u32,
 }
 
 impl ResidencyStats {
@@ -166,7 +168,8 @@ struct Unit {
     deps: Vec<u32>,
     state: State,
     pinned: bool,
-    locked: bool,
+    /// Cached acceleration structures referencing it.
+    locks: u32,
     /// Units in `Loading` or `Resident` that depend on this one.
     dependents: u32,
     touched: u64,
@@ -279,7 +282,7 @@ impl Residency {
                 deps: u.deps.clone(),
                 state: State::Absent,
                 pinned: u.start == Start::Pinned,
-                locked: u.start == Start::Locked,
+                locks: u32::from(u.start == Start::Locked),
                 dependents: 0,
                 touched: 0,
             })
@@ -378,6 +381,54 @@ impl Residency {
             lru.insert((frame, k));
         }
         u.touched = frame;
+    }
+
+    /// Keeps resident `k` from being evicted until as many [`Residency::unlock`]s: a cached
+    /// acceleration structure references it.
+    pub(crate) fn lock(&mut self, k: Key) {
+        let u = self
+            .mounts
+            .get_mut(&k.mount)
+            .and_then(|m| m.get_mut(k.unit as usize))
+            .expect("a unit of a mount");
+        debug_assert_eq!(u.state, State::Resident);
+        u.locks += 1;
+    }
+
+    pub(crate) fn unlock(&mut self, k: Key) {
+        if let Some(u) = self
+            .mounts
+            .get_mut(&k.mount)
+            .and_then(|m| m.get_mut(k.unit as usize))
+        {
+            u.locks -= 1;
+        }
+    }
+
+    pub(crate) fn note_tile_move(&mut self) {
+        self.stats.tiles_moved += 1;
+    }
+
+    /// Whether resident `k` can leave now, unused for `cold` frames with nothing depending on
+    /// it, for a move.
+    pub(crate) fn movable(&self, k: Key, frame: u64, cold: u64) -> bool {
+        self.unit(k).is_some_and(|u| {
+            u.state == State::Resident
+                && !u.pinned
+                && u.locks == 0
+                && u.dependents == 0
+                && u.touched + cold < frame
+        })
+    }
+
+    /// Whether `k` is absent, so that a request can start its load.
+    pub(crate) fn absent(&self, k: Key) -> bool {
+        self.unit(k).is_some_and(|u| u.state == State::Absent)
+    }
+
+    /// Whether `k` is resident.
+    pub(crate) fn resident(&self, k: Key) -> bool {
+        self.unit(k).is_some_and(|u| u.state == State::Resident)
     }
 
     /// Takes back the load of `k` a plan started: absent again, its bytes released, and
@@ -591,7 +642,7 @@ impl Residency {
                 break;
             }
             let u = self.unit(k).expect("resident unit");
-            if !u.locked && u.dependents == 0 && !held.contains(&k) {
+            if u.locks == 0 && u.dependents == 0 && !held.contains(&k) {
                 victims.push(k);
                 over = over.saturating_sub(u.bytes);
             }
@@ -599,7 +650,8 @@ impl Residency {
         (victims, over)
     }
 
-    fn evict(&mut self, k: Key) {
+    /// Takes resident `k` out now; it loads again on request.
+    pub(crate) fn evict(&mut self, k: Key) {
         let units = self.mounts.get_mut(&k.mount).expect("mounted");
         let u = &mut units[k.unit as usize];
         let c = u.class as usize;

@@ -10,7 +10,7 @@ use orr_gpu::{
 };
 
 use crate::Result;
-use crate::shaders::{animation, emissive, transparency, upload, world};
+use crate::shaders::{animation, emissive, instance_page, transparency, upload, world};
 
 /// A compute pipeline of [`crate::Scenes::compute_pipeline`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -83,6 +83,7 @@ pub(crate) struct Own {
     pub(crate) emissive_producers: PipelineId,
     pub(crate) animate: PipelineId,
     pub(crate) composite: PipelineId,
+    pub(crate) expand_page: PipelineId,
 }
 
 pub(crate) struct Pipelines {
@@ -102,6 +103,7 @@ impl Pipelines {
             own: Own {
                 scatter: PipelineId(0),
                 rebase: PipelineId(0),
+                expand_page: PipelineId(0),
                 emissive_instances: PipelineId(0),
                 emissive_producers: PipelineId(0),
                 animate: PipelineId(0),
@@ -112,6 +114,7 @@ impl Pipelines {
         p.own = Own {
             scatter: p.create(device, kernels, &upload::MODULE, "scatter", none)?,
             rebase: p.create(device, kernels, &world::MODULE, "rebase_lights", none)?,
+            expand_page: p.create(device, kernels, &instance_page::MODULE, "expand", none)?,
             emissive_instances: p.create(device, kernels, &emissive::MODULE, "instances", none)?,
             emissive_producers: p.create(device, kernels, &emissive::MODULE, "producers", none)?,
             animate: p.create(device, kernels, &animation::MODULE, "animate", none)?,

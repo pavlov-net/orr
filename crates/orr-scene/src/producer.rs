@@ -924,7 +924,7 @@ impl Scratch {
 }
 
 /// Scratch alignment of every build here; classic builds need at most 256.
-fn scratch_align(device: &Device) -> u64 {
+pub(crate) fn scratch_align(device: &Device) -> u64 {
     u64::from(device.caps().cluster.align_scratch).max(256)
 }
 

@@ -40,6 +40,14 @@ impl RangeAllocator {
         Some(start)
     }
 
+    /// Whether `at..at + count` is all free.
+    pub fn is_free(&self, at: u32, count: u32) -> bool {
+        self.free
+            .range(..=at)
+            .next_back()
+            .is_some_and(|(&start, &end)| start <= at && at + count <= end)
+    }
+
     /// Takes `at..at + count`; false when it is not all free.
     pub fn take(&mut self, at: u32, count: u32) -> bool {
         let Some((&start, &end)) = self.free.range(..=at).next_back() else {
@@ -173,9 +181,9 @@ struct PoolBlock {
 /// A range of a [`Pool`]: its block, first unit and unit count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PoolSlot {
-    block: u32,
-    first: u32,
-    units: u32,
+    pub(crate) block: u32,
+    pub(crate) first: u32,
+    pub(crate) units: u32,
 }
 
 impl Pool {
@@ -248,6 +256,14 @@ impl Pool {
             units,
         };
         Ok((slot, memory))
+    }
+
+    /// Whether the units right after `slot`, as many as it holds, are free.
+    pub(crate) fn free_after(&self, slot: PoolSlot) -> bool {
+        self.blocks
+            .get(slot.block as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|b| b.ranges.is_free(slot.first + slot.units, slot.units))
     }
 
     /// The allocation `slot` lies in and its offset there, for sparse binds.

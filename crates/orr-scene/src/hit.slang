@@ -28,7 +28,7 @@ public bool placement(GroupGpu* g, uint8_t* transforms, uint index, int3 cell, f
     p = (Placement)0;
     if (transforms == nullptr || index >= g.count)
         return false;
-    float3x4 m = ((float3x4*)transforms)[index];
+    float3x4 m = group_entry(g, transforms, index);
     if (all(m[0] == 0.0) && all(m[1] == 0.0) && all(m[2] == 0.0))
         return false;
     p.linear = affine_linear(m);

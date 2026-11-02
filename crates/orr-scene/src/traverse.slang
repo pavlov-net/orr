@@ -74,6 +74,53 @@ float focus_error(Placement p, float4 sphere, float error)
     return error * p.scale / d * root.focus_offset.w;
 }
 
+// Adds mesh cluster `mesh_cluster` to the ray-tracing cut of slot `c`, `work` its entry's slot.
+void gather_cluster(CutGpu* cut, SlotCutGpu* c, uint work, uint mesh_cluster)
+{
+    uint e;
+    InterlockedAdd(cut.counters[CUT_ENTRIES], 1, e);
+    if (e >= cut.entry_capacity)
+    {
+        InterlockedAdd(cut.counters[CUT_ENTRIES_DROPPED], 1);
+        InterlockedOr(c.flags, CUT_RT_LOST);
+        return;
+    }
+    cut.entries[e] = uint2(work, mesh_cluster);
+    uint2 h = cluster_hash(mesh_cluster);
+    InterlockedAdd(c.rt_count, 1);
+    InterlockedAdd(c.rt_hash.x, h.x);
+    InterlockedAdd(c.rt_hash.y, h.y);
+}
+
+// Whether `mesh` is an edit that holds what `sphere` covers at level 0.
+bool edit_pins(MeshGpu* mesh, float4 sphere)
+{
+    EditGpu* e = mesh.edit;
+    if (e == nullptr)
+        return false;
+    if (e.whole != 0)
+        return true;
+    for (uint i = 0; i < e.sphere_count; i++)
+    {
+        float4 t = e.spheres[i];
+        float3 d = sphere.xyz - t.xyz;
+        float r = sphere.w + t.w;
+        if (dot(d, d) <= r * r)
+            return true;
+    }
+    return false;
+}
+
+// `focus_error`, infinite where an edit pins the sphere so that coarser clusters are never
+// taken there. A cluster's parent test and its parent group's own test read one sphere, so
+// the cut stays watertight around what is pinned.
+float cut_error(MeshGpu* mesh, Placement p, float4 sphere, float error)
+{
+    if (error > 0.0 && edit_pins(mesh, sphere))
+        return asfloat(0x7f800000u);
+    return focus_error(p, sphere, error);
+}
+
 // What scales a slot's errors and thresholds this frame.
 struct Lod
 {
@@ -87,7 +134,7 @@ Lod slot_lod(SceneRoot* s, InstanceGpu inst, uint slot, SlotCutGpu c, bool retry
     Lod l;
     float debug = 1.0;
     l.level = -1;
-    uint d = inst.debug_lod;
+    uint d = s.meshes[s.models[inst.model].mesh].edit != nullptr ? 0 : inst.debug_lod;
     if ((d & DEBUG_LOD_LEVEL) != 0)
         l.level = int(d & 0xff);
     else if (d != 0)
@@ -135,27 +182,39 @@ float projected_cut(RtCutGpu* cuts, uint k, float scale, float distance)
     return cuts[k].error * scale / max(distance, 1e-3) * root.focus_offset.w;
 }
 
-// The coarsest cached cut whose error at `distance` stays at or under `limit` pixels.
-uint coarsest_cut(MeshGpu* mesh, float scale, float distance, float limit)
+// The coarsest built cached cut from `lowest` on whose error at `distance` stays at or under
+// `limit` pixels, or else the finest built one.
+uint coarsest_cut(MeshGpu* mesh, float scale, float distance, float limit, uint lowest)
 {
-    for (uint k = mesh.rt_cut_count; k > 1; k--)
+    uint built = mesh.rt_cut_count - 1;
+    for (uint k = mesh.rt_cut_count; k > lowest; k--)
     {
-        if (projected_cut(mesh.rt_cuts, k - 1, scale, distance) <= limit)
-            return k - 1;
+        uint c = k - 1;
+        if (c < mesh.fine_cuts && mesh.rt_cuts[c].blas == 0)
+            continue;
+        built = c;
+        if (projected_cut(mesh.rt_cuts, c, scale, distance) <= limit)
+            return c;
     }
-    return 0;
+    return built;
+}
+
+// The first cached cut a copy of `inst` may trace: a finer cut has no section-mask BLAS.
+uint lowest_cut(MeshGpu* mesh, InstanceGpu inst)
+{
+    return (inst.variant >> 16) != 0 ? mesh.fine_cuts : 0;
 }
 
 // The cached cut a slot traces at `distance`, kept within 15% of its error from the one its
 // PTLAS instance holds when that instance holds the same chain step.
-uint cached_cut(MeshGpu* mesh, SlotStateGpu st, float scale, float distance, float limit)
+uint cached_cut(MeshGpu* mesh, SlotStateGpu st, float scale, float distance, float limit, uint lowest)
 {
-    uint fresh = coarsest_cut(mesh, scale, distance, limit);
+    uint fresh = coarsest_cut(mesh, scale, distance, limit, lowest);
     bool written = (st.rt_flags & RT_WRITTEN) != 0 && ((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) == chain_near(st);
-    if (!written || !has_focus() || st.rt_lod >= mesh.rt_cut_count)
+    if (!written || !has_focus() || st.rt_lod >= mesh.rt_cut_count || st.rt_lod < lowest || mesh.rt_cuts[st.rt_lod].blas == 0)
         return fresh;
     uint current = st.rt_lod;
-    uint coarser = coarsest_cut(mesh, scale, distance, limit / RT_HYSTERESIS);
+    uint coarser = coarsest_cut(mesh, scale, distance, limit / RT_HYSTERESIS, lowest);
     if (coarser > current)
         return coarser;
     if (projected_cut(mesh.rt_cuts, current, scale, distance) > limit * RT_HYSTERESIS)
@@ -304,7 +363,13 @@ void init(uint3 id: SV_DispatchThreadID)
     float range = float(inst.rt_range) * ((st.rt_flags & RT_IN_RANGE) != 0 ? RT_HYSTERESIS : 1.0);
     bool ray = (inst.flags & INSTANCE_RAY) != 0 && mesh.rt_cut_count > 0 && (!has_focus() || distance <= range);
     if (ray)
-        c.rt_cut = cached_cut(mesh, st, p.scale * l.scale[1], distance, l.threshold[1]);
+        c.rt_cut = cached_cut(mesh, st, p.scale * l.scale[1], distance, l.threshold[1], lowest_cut(mesh, inst));
+    // The BLAS of a finer cut stay while a slot's PTLAS instance or this frame's cut names them.
+    bool holds = (st.rt_flags & RT_WRITTEN) != 0 && ((st.rt_flags >> RT_STEP_SHIFT) & CHAIN_STEP_MASK) == near;
+    if (holds)
+        touch_cut(s, cut, mesh, model.mesh, st.rt_lod);
+    if (ray)
+        touch_cut(s, cut, mesh, model.mesh, c.rt_cut);
 
     // A fading copy also draws its far step and traces a cached cut of it.
     if (st.fade != 0)
@@ -315,7 +380,12 @@ void init(uint3 id: SV_DispatchThreadID)
         float4 far_sphere = model_sphere(far_model);
         float far_distance = has_focus() ? max(length(place(p, far_sphere.xyz)) - far_sphere.w * p.scale, 0.0) : 0.0;
         if (ray && far_mesh.rt_cut_count > 0)
-            c.far_cut = coarsest_cut(far_mesh, p.scale * l.scale[1], far_distance, l.threshold[1]);
+        {
+            c.far_cut = coarsest_cut(far_mesh, p.scale * l.scale[1], far_distance, l.threshold[1], 0);
+            touch_cut(s, cut, far_mesh, far_model.mesh, c.far_cut);
+            touch_cut(s, cut, far_mesh, far_model.mesh, (st.rt_flags >> RT_FAR_CUT_SHIFT) & 0xff);
+            want_cut(s, cut, far_mesh, far_model.mesh, p.scale * l.scale[1], far_distance, l.threshold[1], 0);
+        }
         if (raster)
             raster_roots(s, cut, slot | COPY_FAR, far, far_model, far_mesh, p, far_sphere, l, 0);
     }
@@ -329,20 +399,39 @@ void init(uint3 id: SV_DispatchThreadID)
         }
         if (ray && l.level >= 0)
             c.rt_cut = min(uint(l.level), mesh.rt_cut_count - 1);
+        // An edit's copies trace their one level, whose CLAS rebuild: no cached cut holds them.
+        bool gather = ray && mesh.edit != nullptr;
+        if (gather)
+            c.flags |= CUT_TRAVERSED;
         cut.slots[slot] = c;
+        for (uint g = 0; gather && g < mesh.edit.group_count; g++)
+        {
+            EditGroupGpu held = mesh.edit.groups[g];
+            uint8_t* data = (uint8_t*)mesh.pages[held.page];
+            uint mesh_first = mesh.page_clusters[held.page] + held.first_cluster;
+            for (uint i = 0; i < held.cluster_count; i++)
+            {
+                if (!section_hidden(inst, load_cluster(data, held.first_cluster + i).section))
+                    gather_cluster(cut, cut.slots + slot, slot, mesh_first + i);
+            }
+        }
         return;
     }
 
     // DAG: copies posed in ray tracing and steps past the first trace cached cuts; distant
-    // ones their model's merged cut; the rest a cut gathered here.
+    // ones their model's merged cut; the rest a cut gathered here. An edit's copies always
+    // gather: cached cuts hold unedited CLAS. Past the frame's budget they go untraced, their
+    // one cached cut holding no BLAS.
     bool cached = (st.rt_flags & RT_ANIMATED) != 0 || near > 0;
     bool distant = has_focus() && radius * root.focus_offset.w / max(distance, FOCUS_NEAR) < root.merge_pixels;
-    bool gather = ray && !cached && (!distant || l.level >= 0);
+    bool gather = ray && (mesh.edit != nullptr || (!cached && (!distant || l.level >= 0)));
     if (ray && !cached && !gather)
     {
         c.flags |= CUT_DISTANT;
         InterlockedMin(cut.model_cut[inst.model], c.rt_cut);
     }
+    if (ray && !gather)
+        want_cut(s, cut, mesh, model.mesh, p.scale * l.scale[1], distance, l.threshold[1], lowest_cut(mesh, inst));
     if (gather)
         c.flags |= CUT_TRAVERSED;
     if (raster)
@@ -481,6 +570,37 @@ void report(SceneRoot* s, CutGpu* cut, uint* stamps, uint mesh_index, uint page,
     cut.feedback[at] = f;
 }
 
+// Reports finer cut `k` of a streaming mesh in use.
+void touch_cut(SceneRoot* s, CutGpu* cut, MeshGpu* mesh, uint mesh_index, uint k)
+{
+    if (k < mesh.fine_cuts)
+        report(s, cut, mesh.cut_stamps, mesh_index, k, FEEDBACK_TOUCH | FEEDBACK_CUT, 0.0);
+}
+
+// Asks for the finer cut of a streaming mesh that would serve a copy tracing a cached cut, when
+// no built cut does. From `lowest` on, no finer cut can serve it.
+void want_cut(SceneRoot* s, CutGpu* cut, MeshGpu* mesh, uint mesh_index, float scale, float distance, float limit, uint lowest)
+{
+    if (mesh.fine_cuts == 0 || lowest >= mesh.fine_cuts || !has_focus())
+        return;
+    float have = projected_cut(mesh.rt_cuts, mesh.fine_cuts, scale, distance);
+    if (have <= limit)
+        return;
+    uint target = 0;
+    for (uint k = mesh.fine_cuts; k > 0; k--)
+    {
+        if (projected_cut(mesh.rt_cuts, k - 1, scale, distance) <= limit)
+        {
+            target = k - 1;
+            break;
+        }
+    }
+    if (mesh.rt_cuts[target].blas != 0)
+        touch_cut(s, cut, mesh, mesh_index, target);
+    else
+        report(s, cut, mesh.cut_stamps + mesh.fine_cuts, mesh_index, target, FEEDBACK_REQUEST | FEEDBACK_CUT, have);
+}
+
 // Node page `page`, unless it is pinned.
 void report_node_page(SceneRoot* s, CutGpu* cut, MeshGpu* mesh, uint mesh_index, uint page, uint kind, float error)
 {
@@ -519,12 +639,12 @@ float coarsen(SlotCutGpu* c, Placement p, Lod l, uint mask, float4 sphere, float
 }
 
 // Whether cluster `cl` of a group at `depth` with error `group_error` is in cut `k`.
-bool selected(Placement p, Cluster cl, Lod l, uint k, uint depth, float group_error)
+bool selected(MeshGpu* mesh, Placement p, Cluster cl, Lod l, uint k, uint depth, float group_error)
 {
     if (l.level >= 0)
         return int(depth) == l.level || (int(depth) < l.level && isinf(group_error));
-    float self_e = focus_error(p, cl.self_sphere, cl.self_error * l.scale[k]);
-    float parent_e = focus_error(p, cl.parent_sphere, cl.parent_error * l.scale[k]);
+    float self_e = cut_error(mesh, p, cl.self_sphere, cl.self_error * l.scale[k]);
+    float parent_e = cut_error(mesh, p, cl.parent_sphere, cl.parent_error * l.scale[k]);
     return self_e <= l.threshold[k] && parent_e > l.threshold[k];
 }
 
@@ -582,7 +702,7 @@ void traverse(uint3 id: SV_DispatchThreadID)
             uint m = 0;
             for (uint k = 0; k < 2; k++)
             {
-                bool enter = l.level >= 0 || focus_error(p, child.sphere, child.max_error * l.scale[k]) > l.threshold[k];
+                bool enter = l.level >= 0 || cut_error(mesh, p, child.sphere, child.max_error * l.scale[k]) > l.threshold[k];
                 if ((mask & (1u << k)) != 0 && enter)
                     m |= 1u << k;
             }
@@ -597,6 +717,9 @@ void traverse(uint3 id: SV_DispatchThreadID)
     }
 
     Group g = ((Group*)mesh.groups)[node.group];
+    // An edit of the whole mesh takes only level 0, whose pages it holds.
+    if (mesh.edit != nullptr && mesh.edit.whole != 0 && g.depth != 0)
+        return;
     uint8_t* data = (uint8_t*)mesh.pages[g.page];
     if (data == nullptr)
     {
@@ -616,24 +739,11 @@ void traverse(uint3 id: SV_DispatchThreadID)
         for (uint i = run; i < end; i++)
         {
             Cluster cl = load_cluster(data, g.first_cluster + i);
-            if ((mask & 1) != 0 && selected(p, cl, l, 0, g.depth, g.error))
+            if ((mask & 1) != 0 && selected(mesh, p, cl, l, 0, g.depth, g.error))
                 raster_mask |= 1u << (i - run);
-            if ((mask & 2) != 0 && selected(p, cl, l, 1, g.depth, g.error))
+            if ((mask & 2) != 0 && !section_hidden(inst, cl.section) && selected(mesh, p, cl, l, 1, g.depth, g.error))
             {
-                uint e;
-                InterlockedAdd(cut.counters[CUT_ENTRIES], 1, e);
-                if (e >= cut.entry_capacity)
-                {
-                    InterlockedAdd(cut.counters[CUT_ENTRIES_DROPPED], 1);
-                    InterlockedOr(c.flags, CUT_RT_LOST);
-                    continue;
-                }
-                uint mesh_cluster = mesh_first + i;
-                cut.entries[e] = uint2(slot | (retry ? WORK_RETRY : 0), mesh_cluster);
-                uint2 h = cluster_hash(mesh_cluster);
-                InterlockedAdd(c.rt_count, 1);
-                InterlockedAdd(c.rt_hash.x, h.x);
-                InterlockedAdd(c.rt_hash.y, h.y);
+                gather_cluster(cut, c, slot | (retry ? WORK_RETRY : 0), mesh_first + i);
             }
         }
         if (raster_mask != 0)

@@ -68,6 +68,34 @@ impl MeshBuilder {
         }
     }
 
+    /// [`Self::quad`] with its surface raised along its normal by `height(u, v)`.
+    pub fn relief(
+        &mut self,
+        section: usize,
+        corners: [Vec3; 4],
+        n: u32,
+        height: impl Fn(f32, f32) -> f32,
+    ) {
+        let normal = (corners[1] - corners[0])
+            .cross(corners[3] - corners[0])
+            .normalize();
+        let first = self.positions.len() as u32;
+        for j in 0..=n {
+            for i in 0..=n {
+                let (u, v) = (i as f32 / n as f32, j as f32 / n as f32);
+                let p = corners[0]
+                    .lerp(corners[1], u)
+                    .lerp(corners[3].lerp(corners[2], u), v);
+                self.vertex(p + normal * height(u, v), normal, Vec2::new(u, 1.0 - v));
+            }
+        }
+        for j in 0..n {
+            for i in 0..n {
+                self.cell(section, first + j * (n + 1) + i, n + 1);
+            }
+        }
+    }
+
     /// An axis-aligned box from `min` to `max`, each face in `n` x `n` cells.
     pub fn cuboid(&mut self, section: usize, min: Vec3, max: Vec3, n: u32) {
         let c = |x: f32, y: f32, z: f32| Vec3::new(x, y, z);

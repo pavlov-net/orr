@@ -98,6 +98,7 @@ public struct CutKey
 public static const uint FEEDBACK_REQUEST = 0;   // a page the traversal needed
 public static const uint FEEDBACK_TOUCH = 1;     // a resident page it read
 public static const uint FEEDBACK_MESH_PAGE = 2; // with either: a mesh page, else a node page
+public static const uint FEEDBACK_CUT = 4;       // with either: a finer cached cut of a streaming mesh, in `page`
 
 // What the traversal tells the loading side, read back once the frame completes.
 public struct FeedbackGpu
