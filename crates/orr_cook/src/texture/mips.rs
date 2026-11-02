@@ -29,9 +29,7 @@ pub(crate) struct Toksvig {
 pub(crate) fn chain(base: Img, spec: &MipSpec) -> Vec<Img> {
     let mut base = base;
     if spec.normal {
-        for p in &mut base.px {
-            *p = normalized(*p);
-        }
+        base.px.par_iter_mut().for_each(|p| *p = normalized(*p));
     }
     let mut out = {
         let _z = crate::profile::zone!("mips.downsample");
@@ -40,9 +38,7 @@ pub(crate) fn chain(base: Img, spec: &MipSpec) -> Vec<Img> {
     if spec.normal {
         let _z = crate::profile::zone!("mips.renormalize");
         for m in &mut out[1..] {
-            for p in &mut m.px {
-                *p = normalized(*p);
-            }
+            m.px.par_iter_mut().for_each(|p| *p = normalized(*p));
         }
     }
     if let Some((channel, cutoff)) = spec.coverage {
@@ -594,10 +590,15 @@ fn coverage_scale(c: &Coverage, target: f32) -> f32 {
 }
 
 impl Toksvig {
-    /// Adds the normal variance of each mip to the roughness channel: with `r` the length
-    /// of the averaged unit normals, `var = (1 - r) / r` and `alpha'^2 = alpha^2 + 2 var`,
-    /// where `alpha` is roughness squared.
-    pub(crate) fn apply(&self, chain: &mut [Img], spec: &MipSpec) -> Result<(), String> {
+    /// Adds the normal variance of each mip from mip `first` on to the roughness channel:
+    /// with `r` the length of the averaged unit normals, `var = (1 - r) / r` and
+    /// `alpha'^2 = alpha^2 + 2 var`, where `alpha` is roughness squared.
+    pub(crate) fn apply(
+        &self,
+        chain: &mut [Img],
+        spec: &MipSpec,
+        first: usize,
+    ) -> Result<(), String> {
         let _z = crate::profile::zone!("mips.toksvig");
         let (w, h) = (chain[0].w, chain[0].h);
         if (self.normals.w, self.normals.h) != (w, h) {
@@ -611,19 +612,17 @@ impl Toksvig {
             coverage: None,
         };
         let mut base = self.normals.clone();
-        for p in &mut base.px {
-            *p = normalized(*p);
-        }
+        base.px.par_iter_mut().for_each(|p| *p = normalized(*p));
         let raw = raw_chain(base, &normal_spec);
-        for (m, n) in chain.iter_mut().zip(&raw) {
-            for (p, v) in m.px.iter_mut().zip(&n.px) {
+        for (m, n) in chain.iter_mut().zip(&raw).skip(first) {
+            m.px.par_iter_mut().zip(&n.px).for_each(|(p, v)| {
                 let r = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
                     .sqrt()
                     .clamp(1e-4, 1.0);
                 let var = (1.0 - r) / r;
                 let rough = p[self.channel].clamp(0.0, 1.0);
                 p[self.channel] = (rough.powi(4) + 2.0 * var).powf(0.25).min(1.0);
-            }
+            });
         }
         Ok(())
     }
@@ -928,7 +927,7 @@ mod tests {
             channel: 0,
             normals,
         }
-        .apply(&mut c, &s)
+        .apply(&mut c, &s, 0)
         .unwrap();
         let analytic = (base_rough.powi(4) + 2.0 * a * a).powf(0.25);
         assert!(

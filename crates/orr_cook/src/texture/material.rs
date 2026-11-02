@@ -1105,12 +1105,13 @@ impl TextureJob {
             let (img, plan) = self
                 .prepare(images, Some((pass.image, src)))
                 .map_err(|e| e.to_string())?;
-            let chain = super::chains(vec![img], &plan)?.remove(0);
-            let mut mips =
-                super::encode_chains(plan.encoding, plan.quality, &[chain[1..].to_vec()])?
-                    .remove(0);
+            // Mip 0 keeps the source's blocks.
+            let mut chain = super::chains(vec![img], &plan, 1)?.remove(0);
+            let size = [chain[0].w, chain[0].h];
+            chain.remove(0);
+            let mut mips = super::encode_chains(plan.encoding, plan.quality, &[chain])?.remove(0);
             mips.insert(0, first);
-            ([chain[0].w, chain[0].h], mips)
+            (size, mips)
         };
         Ok(super::layout(
             self.pack.encoding.vk_format(),
@@ -1126,7 +1127,7 @@ impl TextureJob {
     /// The mip chain [`Self::run`] encodes.
     pub(crate) fn chain(&self, images: &[ImageFile]) -> Result<Vec<Img>> {
         let (img, plan) = self.prepare(images, None)?;
-        super::chains(vec![img], &plan)
+        super::chains(vec![img], &plan, 0)
             .map(|mut c| c.remove(0))
             .map_err(|e| self.fail(format!("texture {}: {e}", self.pack.role)))
     }
