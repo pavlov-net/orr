@@ -272,8 +272,10 @@ fn facts_of(bytes: &[u8], hash: Hash32) -> Result<ImageFacts, String> {
     {
         return Err("not a 2D image".into());
     }
+    // A channel is constant when it spans at most one UNORM8 step.
+    const SPREAD: f32 = 1.0 / 255.0 + 1e-6;
     let (w, h, range) = match &src.blocks {
-        Some(b) => (b.w, b.h, load::block_range(b)?),
+        Some(b) => (b.w, b.h, load::block_range(b, SPREAD)?),
         None => {
             let img = &src.layers[0];
             let range = std::array::from_fn(|c| {
@@ -284,7 +286,7 @@ fn facts_of(bytes: &[u8], hash: Hash32) -> Result<ImageFacts, String> {
             (img.w, img.h, range)
         }
     };
-    let constant = range.map(|(lo, hi)| (hi - lo <= 1.0 / 255.0 + 1e-6).then_some(0.5 * (lo + hi)));
+    let constant = range.map(|(lo, hi)| (hi - lo <= SPREAD).then_some(0.5 * (lo + hi)));
     Ok(ImageFacts {
         w,
         h,

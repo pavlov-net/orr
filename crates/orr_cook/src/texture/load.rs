@@ -76,14 +76,22 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Source, String> {
     }
 }
 
-/// Per channel, the lowest and highest value of mip 0 of layer 0, decoded block by block.
-pub(crate) fn block_range(b: &Blocks) -> Result<[(f32, f32); 4], String> {
+/// Per channel, the lowest and highest value of mip 0 of layer 0, decoded block by block
+/// until every channel the format stores spans more than `spread`.
+pub(crate) fn block_range(b: &Blocks, spread: f32) -> Result<[(f32, f32); 4], String> {
     let f = FormatInfo::of(b.vk_format).ok_or("unknown format")?;
     let (bw, bh) = (b.w.div_ceil(4) as usize, b.h.div_ceil(4) as usize);
     let data = &b.levels[0][0];
     if data.len() != bw * bh * f.bytes as usize {
         return Err("compressed mip size".into());
     }
+    // Channels past these hold the same value in every block of the format.
+    let stored = match b.vk_format {
+        vk::BC4_UNORM => 1,
+        vk::BC5_UNORM => 2,
+        vk::BC6H_UFLOAT | vk::BC6H_SFLOAT => 3,
+        _ => 4,
+    };
     let mut range = [(f32::MAX, f32::MIN); 4];
     for (i, block) in data.chunks_exact(f.bytes as usize).enumerate() {
         let texels = decode_block(b.vk_format, block)?;
@@ -94,6 +102,9 @@ pub(crate) fn block_range(b: &Blocks) -> Result<[(f32, f32); 4], String> {
                     *r = (r.0.min(*v), r.1.max(*v));
                 }
             }
+        }
+        if range[..stored].iter().all(|r| r.1 - r.0 > spread) {
+            break;
         }
     }
     Ok(range)

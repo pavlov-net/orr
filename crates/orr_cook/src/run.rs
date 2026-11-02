@@ -2146,6 +2146,7 @@ fn subd_units(
 fn section_maps(
     sections: &[SectionData],
     archives: &HashMap<String, Arc<Archive>>,
+    normals: bool,
 ) -> Result<Vec<SectionMaps>> {
     let read = |unit: &str, all: bool, wrap, uv, channels| {
         texture_mips(
@@ -2191,7 +2192,7 @@ fn section_maps(
             }),
         };
         let normal = match &s.maps.normal {
-            NormalSpec::Texture { unit, wrap, uv, .. } => {
+            NormalSpec::Texture { unit, wrap, uv, .. } if normals => {
                 read(unit, false, *wrap, *uv, 2)?.try_into().ok()
             }
             _ => None,
@@ -2302,9 +2303,11 @@ fn cook_unit(
             w.add(name, class, schema, key, &blobs)?;
         }
         Work::Mesh(source, settings, archives) => {
-            let maps = section_maps(source.sections(), &archives)?;
-            drop(archives);
             let data = source.load(name, &shared.memo)?;
+            // Only the tangent check reads normal maps.
+            let normals = data.tangents.is_some() && settings.tangent_error_max.is_some();
+            let maps = section_maps(&data.sections, &archives, normals)?;
+            drop(archives);
             let cooked = mesh::cook(name, &data, &settings, &maps)?;
             drop((data, maps));
             detail.warnings = cooked.warnings;
