@@ -9,7 +9,8 @@
 //! still camera. Medium proxies on the camera ray: a plume against the reference march and, per
 //! pixel, against a fine march of its grid; overlapping boxes, surfaces inside boxes and eyes
 //! inside boxes against Beer's law, inside and past the froxels; sky pixels past the froxels;
-//! and proxies off screen.
+//! and proxies off screen. Smoke: its opacity on the camera ray, and a column across a shaft
+//! against the reference march.
 
 use lighting_suite::bed::{
     Accumulated, Bed, CANOPY, EXTENT, FLOOR, GLASS_SPHERE, Item, LEAF, MIRROR, PLUME, Particle,
@@ -1095,6 +1096,133 @@ fn only_proxies_in_the_frustum_count_as_visible() {
         let _ = inscatter(&mut bed, false, MediaSettings::default(), 2);
         let stats = bed.view().media_stats(bed.last_frame()).unwrap();
         assert_eq!(stats.visible_proxies, visible, "{proxy:?}");
+    }
+    assert_clean();
+}
+
+fn smoke_look(opacity: f32, albedo: f32) -> ParticleLook {
+    ParticleLook {
+        albedo: [albedo; 3],
+        emission: [0.0; 3],
+        opacity,
+        anisotropy: 0.0,
+    }
+}
+
+/// Smoke between the eye and the fog behind it takes from the camera ray what its opacity takes:
+/// a sheet wider than the view, two of them, and specks far smaller than a froxel, whose share
+/// of each 8 x 8 block is what they let through on average.
+#[test]
+fn smoke_takes_its_opacity_from_the_camera_ray() {
+    let eye = Vec3::new(0.0, 1.5, 5.0);
+    let target = Vec3::new(0.0, 1.5, 0.0);
+    for (distances, wanted) in [(vec![4.0], 0.6), (vec![4.0, 6.0], 0.36)] {
+        let (mut bed, _fog) = foggy(&CLEAR, Vec::new(), Vec::new(), None, eye, target);
+        let sheets: Vec<Particle> = distances
+            .iter()
+            .map(|&d| Particle {
+                center: eye + (target - eye).normalize() * d,
+                size: 40.0,
+            })
+            .collect();
+        bed.set_particles(&sheets, smoke_look(0.4, 0.0), Opacity::Smoke);
+        let got = middle_transmittance(&camera_transmittance(&mut bed, 1));
+        assert!(
+            (got - wanted).abs() < 0.01,
+            "{} sheets let through {got:.3}, not {wanted}",
+            distances.len()
+        );
+    }
+
+    // In a square 8 m away, 2 m across, a grid of specks 2 cm across.
+    let n = 40;
+    let half = 0.01;
+    let specks: Vec<Particle> = (0..n * n)
+        .map(|i| Particle {
+            center: Vec3::new(
+                ((i % n) as f32 + 0.5) / n as f32 * 2.0 - 1.0,
+                1.5 + ((i / n) as f32 + 0.5) / n as f32 * 2.0 - 1.0,
+                -3.0,
+            ),
+            size: half,
+        })
+        .collect();
+    let opacity = 0.8;
+    let (mut bed, _fog) = foggy(&CLEAR, Vec::new(), Vec::new(), None, eye, target);
+    bed.set_particles(&specks, smoke_look(opacity, 0.0), Opacity::Smoke);
+    let got = middle_transmittance(&camera_transmittance(&mut bed, 1));
+    let share = f64::from((2.0 * half) * (2.0 * half) * (n * n) as f32 / 4.0);
+    let wanted = 1.0 - share * f64::from(opacity);
+    assert!(
+        (got - wanted).abs() < 0.01,
+        "specks covering {share:.3} let through {got:.3}, not {wanted:.3}"
+    );
+    assert_clean();
+}
+
+/// A column of smoke crossing a shaft under the canopy, against the reference camera march, which
+/// takes each sheet on the ray with its own shadow ray. Averaged over the height of the view inside
+/// the column, in-scatter is within 5%: froxels blur the sun's hard pattern on the sheets over
+/// their columns, so single blocks there are not. Beside it every block is. Black smoke darkens
+/// the shaft behind it; white smoke adds to it.
+#[test]
+fn smoke_across_a_shaft_matches_the_reference_march() {
+    let eye = Vec3::new(0.0, 2.0, 0.0);
+    let target = Vec3::new(0.0, 3.0, -10.0);
+    let sun = vec![directional(10.0, 90.0, 1_000.0)];
+    let canopy = vec![at(CANOPY, Vec3::new(0.0, 6.0, 0.0))];
+    let dir = (target - eye).normalize();
+    let half = 0.1;
+    let column: Vec<Particle> = (0..16)
+        .map(|k| 3.0 + 0.25 * k as f32)
+        .flat_map(|d| {
+            (-8..=8).map(move |y| Particle {
+                center: eye + dir * d + Vec3::Y * (y as f32 * 2.0 * half * d / 5.0),
+                size: half * d / 5.0,
+            })
+        })
+        .collect();
+    let (mut clear, _fog) = foggy(&DENSE, canopy.clone(), sun.clone(), None, eye, target);
+    clear.spec.fov_y = 0.1;
+    let open = block_luminance(&inscatter(&mut clear, false, MediaSettings::default(), 64));
+    // The column covers about a third of the view's width around its center.
+    let w = (EXTENT[0] / 8) as usize;
+    let inside = |b: usize| (2 * (b % w) + 1).abs_diff(w) <= 1;
+    let beside = |b: usize| (2 * (b % w) + 1).abs_diff(w) >= 12;
+    let inside_mean = |v: &[f64]| {
+        let kept: Vec<f64> = (0..v.len()).filter(|&b| inside(b)).map(|b| v[b]).collect();
+        kept.iter().sum::<f64>() / kept.len() as f64
+    };
+    for (albedo, name) in [(0.0, "black"), (0.8, "white")] {
+        let (mut bed, _fog) = foggy(&DENSE, canopy.clone(), sun.clone(), None, eye, target);
+        bed.spec.fov_y = 0.1;
+        bed.set_particles(&column, smoke_look(0.15, albedo), Opacity::Smoke);
+        let froxels = block_luminance(&inscatter(&mut bed, false, MediaSettings::default(), 64));
+        let reference = block_luminance(&inscatter(&mut bed, true, MediaSettings::default(), 256));
+        let (f, r) = (inside_mean(&froxels), inside_mean(&reference));
+        assert!(
+            (f - r).abs() < 0.05 * r,
+            "{name} smoke: in-scatter inside the column is {f:.3e}, the reference's {r:.3e}"
+        );
+        for b in (0..froxels.len()).filter(|&b| beside(b)) {
+            let (f, r) = (froxels[b], reference[b]);
+            assert!(
+                (f - r).abs() < 0.05 * r.max(1e-9),
+                "{name} smoke: block {b} beside the column is {f:.3e}, the reference's {r:.3e}"
+            );
+        }
+        let without = inside_mean(&open);
+        if albedo == 0.0 {
+            assert!(
+                f < 0.8 * without,
+                "black smoke leaves {f:.3e} of {without:.3e}"
+            );
+        } else {
+            assert!(
+                f > without,
+                "white smoke gives {f:.3e}, without it {without:.3e}"
+            );
+        }
     }
     assert_clean();
 }

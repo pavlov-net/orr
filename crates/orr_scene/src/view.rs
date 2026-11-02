@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use glam::{DVec3, IVec3, Mat3, Mat4, Quat, UVec2, Vec2, Vec4};
-use orr_gpu::{Allocation, GpuPtr, Texture};
+use orr_gpu::{Allocation, DispatchArgs, GpuPtr, Texture};
 
 use crate::arena::ViewArena;
 use crate::raster::ViewTargets;
@@ -222,11 +222,14 @@ pub struct RasterView {
     /// of room (`Budgets::visible_clusters`, `Budgets::cluster_work`), 1, cluster work
     /// items asked for, mesh-shader opaque and alpha draws, software-rastered clusters, and
     /// visible particle clusters; entry 16 counts the visible dielectric and presence
-    /// clusters that drew into `targets.layer_tiles`.
+    /// clusters that drew into `targets.layer_tiles`, and entry 17 the visible smoke clusters.
     pub counts: GpuPtr<u32>,
     /// The view's raster state: `gbuffer` and the culling lists, the particle list among
     /// them.
     pub raster: GpuPtr<crate::RasterGpu>,
+    /// Workgroups of one per cluster of `raster`'s smoke list, when the scene holds a smoke
+    /// entry.
+    pub smoke_args: Option<GpuPtr<DispatchArgs>>,
     /// The view history it rendered with.
     pub history: ViewHistoryId,
     /// The scene's sky statistics, which lighting's scene pass writes and exposure reads.

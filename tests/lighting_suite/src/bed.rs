@@ -1121,6 +1121,8 @@ impl BedFrame<'_> {
             scene: self.view.scene,
             view: self.view.view,
             gbuffer: self.view.gbuffer,
+            raster: self.view.raster,
+            smoke_args: self.view.smoke_args,
             sample_index: self.index,
             seed: self.seed,
             dof_background: None,
@@ -1544,9 +1546,10 @@ impl Bed {
     }
 
     /// Gives the bed's particle entry `particles` of `look` from the next frame on, traced
-    /// and drawn as `opacity` says (`Opacity::Particle` for particles); each frame emits them
-    /// and draws particle entries at the transparency point after the frame's kernel, lit by
-    /// the lighting view's particle lighting of that frame, where it wrote one.
+    /// and drawn as `opacity` says (`Opacity::Particle` for particles, `Opacity::Smoke` for
+    /// smoke); each frame emits them and draws particle entries at the transparency point after
+    /// the frame's kernel, lit by the lighting view's particle lighting of that frame, where it
+    /// wrote one.
     pub fn set_particles(&mut self, particles: &[Particle], look: ParticleLook, opacity: Opacity) {
         self.frame += 1;
         let list = [self.scene];
@@ -1565,7 +1568,7 @@ impl Bed {
         m.emission_color = look.emission;
         m.emission_luminance = 1.0;
         m.flags = material_flags::DOUBLE_SIDED;
-        if opacity == Opacity::Particle {
+        if matches!(opacity, Opacity::Particle | Opacity::Smoke) {
             m.flags |= material_flags::PRESENCE;
         }
         if look.emission.iter().any(|&e| e > 0.0) {

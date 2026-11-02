@@ -27,7 +27,8 @@ public static const uint COUNT_OPAQUE_BASE = 13;     // list entries the first p
 public static const uint COUNT_ALPHA_BASE = 14;
 public static const uint COUNT_SOFTWARE_BASE = 15;
 public static const uint COUNT_COVERAGE = 16;        // visible dielectric and presence clusters
-public static const uint COUNTS = 17;
+public static const uint COUNT_SMOKE = 17;          // visible smoke clusters
+public static const uint COUNTS = 18;
 
 // `RasterGpu.flags`.
 public static const uint RASTER_OCCLUSION = 1; // the first pass tests the previous frame's HZB
@@ -46,12 +47,13 @@ public struct RasterGpu
 {
     public GBufferGpu gbuffer;       // what later passes read
     public ClusterWork* work;        // what the second pass retests
-    public uint* args;               // workgroups x, y, z: work, opaque, alpha, software, particles, coverage
+    public uint* args;               // workgroups x, y, z: work, opaque, alpha, software, particles, coverage, smoke
     public uint* opaque;             // visible clusters with opaque triangles, hardware path
     public uint* alpha;              // visible clusters with alpha-tested triangles, hardware path
     public uint* software;           // visible clusters of the software raster
     public uint* particles;          // visible clusters of particle entries, for the transparency point
     public uint* coverage;           // visible dielectric and presence clusters, for the layer tiles
+    public uint* smoke;              // visible clusters of smoke entries, for the froxels
     public uint* counts;             // COUNT_*
     public uint* slot_visibility;    // per instance slot: SLOT_*
     public uint* bin_args;           // per surface bin: x, y, z; then the resolve's sequence count
@@ -83,7 +85,8 @@ public static const uint ARGS_ALPHA = 6;
 public static const uint ARGS_SOFTWARE = 9;
 public static const uint ARGS_PARTICLES = 12;
 public static const uint ARGS_COVERAGE = 15;
-public static const uint ARGS = 18;
+public static const uint ARGS_SMOKE = 18;
+public static const uint ARGS = 21;
 
 // Workgroup grids cover `n` groups in rows of GRID_X, the smallest maximum Vulkan allows.
 public static const uint GRID_X = 65535;

@@ -1880,7 +1880,11 @@ impl<'a> Frame<'a> {
                 core.cell_log2,
             )
             .to_array();
-        let slots = scene.cpu.lock().unwrap().ptlas.high_water;
+        let (slots, smoke) = {
+            let cpu = scene.cpu.lock().unwrap();
+            let smoke = cpu.producers.iter().flatten().any(|p| p.smoke);
+            (cpu.ptlas.high_water, smoke)
+        };
         let producer_capacity = scene.desc.producer_capacity;
         let sizes = TargetSizes {
             extent: view.render_extent.to_array(),
@@ -1952,6 +1956,7 @@ impl<'a> Frame<'a> {
             hzb: Arc::clone(&targets.hzb.texture),
             counts: targets.counts(),
             raster,
+            smoke_args: smoke.then(|| targets.smoke_args()),
             history: view.history,
             sky_stats,
             focus,

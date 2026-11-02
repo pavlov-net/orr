@@ -11,8 +11,8 @@ use orr_scene::orr_gpu::{
     StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory, TextureUsage,
 };
 use orr_scene::{
-    ArenaRequest, ArenaTexture, GBufferGpu, MaterialId, SceneId, SceneRoot, Span, ViewArena,
-    ViewConstants, ViewDesc, ViewStep,
+    ArenaRequest, ArenaTexture, GBufferGpu, MaterialId, RasterGpu, SceneId, SceneRoot, Span,
+    ViewArena, ViewConstants, ViewDesc, ViewStep,
 };
 
 use crate::media::{MediaKernels, MediaSettings, MediaStats, MediaView};
@@ -662,6 +662,11 @@ pub struct ViewPass {
     pub view: GpuPtr<ViewConstants>,
     /// The view's G-buffer at the [`LightingView`]'s extent.
     pub gbuffer: GpuPtr<GBufferGpu>,
+    /// The view's raster state, whose smoke list the froxels read.
+    pub raster: GpuPtr<RasterGpu>,
+    /// [`orr_scene::RasterView::smoke_args`]; the view keeps the memory smoke takes only while
+    /// this is set.
+    pub smoke_args: Option<GpuPtr<DispatchArgs>>,
     /// The frame's index in every pixel's sample sequence; consecutive frames take
     /// consecutive indices.
     pub sample_index: u32,

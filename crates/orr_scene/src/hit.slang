@@ -800,16 +800,30 @@ public float resolve_coverage<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
 // candidate.
 public bool resolve_particle(SceneRoot* s, uint instance_index, uint cluster_id, uint primitive, float2 bary, out uint material, out float3 normal, out float3 emission, out float opacity)
 {
-    material = MATERIAL_NONE;
-    normal = float3(0.0);
     emission = float3(0.0);
     opacity = 0.0;
+    SurfaceInput i;
+    if (!particle_candidate(s, instance_index, cluster_id, primitive, bary, material, normal, i))
+        return false;
+    MaterialGpu* m = s.materials + material;
+    emission = material_color(m, TEXTURE_EMISSION, i.uv, material_emission(m));
+    opacity = material_opacity(i);
+    return true;
+}
+
+// The material, unit render-space front-face normal and textures' input of a triangle candidate
+// of a particle or smoke entry, from its batch. False for any other candidate.
+bool particle_candidate(SceneRoot* s, uint instance_index, uint cluster_id, uint primitive, float2 bary, out uint material, out float3 normal, out SurfaceInput i)
+{
+    material = MATERIAL_NONE;
+    normal = float3(0.0);
+    i = (SurfaceInput)0;
     uint entry;
     if (!hit_producer(s, instance_index, entry))
         return false;
     ProducerGpu p = s.producers[entry];
     ProducerBatch b = s.batches[entry];
-    if (p.opacity != PRODUCER_PARTICLE || cluster_id >= emitted_clusters(b))
+    if ((p.opacity != PRODUCER_PARTICLE && p.opacity != PRODUCER_SMOKE) || cluster_id >= emitted_clusters(b))
         return false;
     ProducerClusterGpu k = b.clusters[cluster_id];
     material = producer_material(p, k);
@@ -822,16 +836,47 @@ public bool resolve_particle(SceneRoot* s, uint instance_index, uint cluster_id,
     float3 e1 = mul(pl.linear, t.position[1] - t.position[0]);
     float3 e2 = mul(pl.linear, t.position[2] - t.position[0]);
     normal = safe_normalize(cross(e1, e2), float3(0.0, 0.0, 1.0));
+    float2 uv = (1.0 - bary.x - bary.y) * t.attributes[0].uv[0] + bary.x * t.attributes[1].uv[0] + bary.y * t.attributes[2].uv[0];
+    i = particle_input(s, material, uv);
+    return true;
+}
+
+// What a particle material's textures read at `uv`, with no filter footprint.
+public SurfaceInput particle_input(SceneRoot* s, uint material, float2 uv)
+{
     SurfaceInput i = (SurfaceInput)0;
     i.scene = s;
     i.material = material;
-    i.uv[0].uv = (1.0 - bary.x - bary.y) * t.attributes[0].uv[0] + bary.x * t.attributes[1].uv[0]
-        + bary.y * t.attributes[2].uv[0];
+    i.uv[0].uv = uv;
     i.uv[0].tap = float2(-1.0);
     i.uv[1] = i.uv[0];
-    MaterialGpu* m = s.materials + material;
+    return i;
+}
+
+// A smoke particle's base color, emission in nits and opacity at input `i`.
+public void smoke_look(SurfaceInput i, out float3 albedo, out float3 emission, out float opacity)
+{
+    MaterialGpu* m = i.scene.materials + i.material;
+    albedo = m.base_weight * material_color(m, TEXTURE_BASE_COLOR, i.uv, m.base_color);
     emission = material_color(m, TEXTURE_EMISSION, i.uv, material_emission(m));
-    opacity = material_opacity(i);
+    opacity = saturate(material_opacity(i));
+}
+
+// The look of a triangle candidate of a smoke entry at its hit; false for any other candidate.
+public bool resolve_smoke(SceneRoot* s, uint instance_index, uint cluster_id, uint primitive, float2 bary, out float3 albedo, out float3 emission, out float opacity)
+{
+    albedo = float3(0.0);
+    emission = float3(0.0);
+    opacity = 0.0;
+    uint entry;
+    if (!hit_producer(s, instance_index, entry) || s.producers[entry].opacity != PRODUCER_SMOKE)
+        return false;
+    uint material;
+    float3 normal;
+    SurfaceInput i;
+    if (!particle_candidate(s, instance_index, cluster_id, primitive, bary, material, normal, i))
+        return false;
+    smoke_look(i, albedo, emission, opacity);
     return true;
 }
 

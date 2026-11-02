@@ -8,7 +8,7 @@ use orr_scene::orr_gpu::{
 };
 
 use crate::scene::{FRAME_SLOTS, Ring};
-use crate::shaders::media::{aerial, apply, froxel};
+use crate::shaders::media::{aerial, apply, froxel, smoke};
 use crate::shaders::types::{
     FroxelLights, FroxelRoot, FroxelVolume, LayerGuide, MediaApplyRoot, MediaStatsGpu,
     ParticleLighting,
@@ -29,6 +29,9 @@ pub const MAX_FROXEL_SHADOWED_LIGHTS: u32 = 4;
 /// Most shadow rays per light a camera ray traces over a stretch of medium proxies
 /// (`camera_media`'s `MAX_PROXY_RAYS`).
 pub const MAX_PROXY_RAYS: u32 = 8;
+
+/// `froxels`' `SMOKE_WORDS`.
+const SMOKE_WORDS: u32 = 7;
 
 /// `camera_media`'s `MEDIA_*`.
 const MEDIA_COMPOSE: u32 = 0;
@@ -63,6 +66,9 @@ pub struct MediaSettings {
     /// so a proxy smaller than a froxel keeps its self-shadowing. 0 takes the froxels'
     /// visibility inside them, and one ray per stretch past them.
     pub proxy_shadow_rays: u32,
+    /// Henyey-Greenstein parameter of smoke particles' response to the froxels' shadowed
+    /// directional lights.
+    pub smoke_anisotropy: f32,
 }
 
 impl Default for MediaSettings {
@@ -74,6 +80,7 @@ impl Default for MediaSettings {
             chromatic_transmittance: false,
             froxel_shadowed_lights: 1,
             proxy_shadow_rays: 8,
+            smoke_anisotropy: 0.0,
         }
     }
 }
@@ -104,6 +111,8 @@ struct Shape {
     /// Shadowed lights past the first, which take `visibility` channels.
     extra: u32,
     chromatic: bool,
+    /// The scene holds a smoke entry.
+    smoke: bool,
 }
 
 /// A view's froxel targets: `froxel_material`, `froxel_incident` and `froxel_visibility`
@@ -120,6 +129,8 @@ struct Volumes {
     integrated_rgb: Option<Volume>,
     aerial: Volume,
     aerial_rgb: Option<Volume>,
+    /// `froxels`' `SMOKE_WORDS` per froxel.
+    smoke: Option<Allocation<u32>>,
 }
 
 impl Volumes {
@@ -182,6 +193,13 @@ impl Volumes {
             },
             aerial,
             aerial_rgb,
+            smoke: if shape.smoke {
+                let [columns, rows, slices] = shape.grid;
+                let words = u64::from(SMOKE_WORDS) * u64::from(columns * rows * slices);
+                Some(device.gpu_malloc(MemoryKind::DeviceLocal, words, "froxel smoke")?)
+            } else {
+                None
+            },
             device: device.clone(),
             shape,
             slots,
@@ -283,6 +301,7 @@ impl MediaView {
 pub(crate) struct MediaKernels {
     order: ComputePipeline,
     inject: ComputePipeline,
+    smoke: ComputePipeline,
     light: ComputePipeline,
     integrate: ComputePipeline,
     aerial: ComputePipeline,
@@ -295,6 +314,7 @@ impl MediaKernels {
         Ok(Self {
             order: pipeline(device, kernels, &froxel::MODULE, "order")?,
             inject: pipeline(device, kernels, &froxel::MODULE, "inject")?,
+            smoke: pipeline(device, kernels, &smoke::MODULE, "main")?,
             light: pipeline(device, kernels, &froxel::MODULE, "light")?,
             integrate: pipeline(device, kernels, &froxel::MODULE, "integrate")?,
             aerial: pipeline(device, kernels, &aerial::MODULE, "main")?,
@@ -342,6 +362,8 @@ impl MediaKernels {
             cache: scene.world_cache(pass.frame),
             lights: media.lights.gpu(),
             stats: media.stats.gpu().offset(slot as u64),
+            raster: pass.raster,
+            smoke: v.smoke.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
             sigma: v.sigma.store,
             words: v.words.store,
             incident: v.incident[cur].store,
@@ -368,8 +390,8 @@ impl MediaKernels {
             aerial_sampled: v.aerial.sampled,
             aerial_rgb_sampled,
             ap_range: settings.ap_range,
+            smoke_anisotropy: settings.smoke_anisotropy,
             _pad0: 0,
-            _pad1: 0,
         }
     }
 
@@ -442,6 +464,7 @@ impl MediaKernels {
             ],
             extra: shadowed.saturating_sub(1),
             chromatic: settings.chromatic_transmittance,
+            smoke: pass.smoke_args.is_some(),
         };
         let mut fresh = false;
         if media.volumes.as_ref().is_none_or(|v| v.shape != shape) {
@@ -475,7 +498,7 @@ impl MediaKernels {
         let root = media.roots.write(slot, root);
         let [columns, rows, slices] = shape.grid;
         list.begin_pass("froxels", false);
-        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
         list.dispatch(&self.order, root, [1, 1, 1]);
         list.dispatch(
             &self.inject,
@@ -483,6 +506,10 @@ impl MediaKernels {
             [columns.div_ceil(4), rows.div_ceil(4), slices.div_ceil(4)],
         );
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        if let Some(args) = pass.smoke_args {
+            list.dispatch_indirect(&self.smoke, root, args);
+            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        }
         list.dispatch(&self.light, root, [columns, rows, 1]);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         list.dispatch(

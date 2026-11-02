@@ -19,6 +19,7 @@ public static const uint PRODUCER_ALPHA_TESTED = 1;
 public static const uint PRODUCER_DIELECTRIC = 2;
 public static const uint PRODUCER_PRESENCE = 3;
 public static const uint PRODUCER_PARTICLE = 4;
+public static const uint PRODUCER_SMOKE = 5;
 
 // One cluster topology of an entry: triangles as u8x3 cluster-local corners.
 public struct TopologyGpu

@@ -1,6 +1,7 @@
 // The clusters of particle producer entries a view's culling kept, for transparency hooks:
 // one mesh workgroup per cluster of the view's particle list. The pixel stage finds its
-// surface with `primary_hit` on the cluster, user words included.
+// surface with `primary_hit` on the cluster, user words included. Smoke entries' clusters are
+// listed apart, for the froxels.
 module particles;
 
 import orr.abi;
@@ -22,10 +23,21 @@ public bool particle_draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint3 gr
 {
     d = (ParticleDraw)0;
     uint index = grid_index(group);
-    if (index >= r.counts[COUNT_PARTICLES])
-        return false;
-    d.visible = r.particles[index];
-    d.vc = r.gbuffer.clusters[d.visible];
+    return index < r.counts[COUNT_PARTICLES] && listed_draw(s, v, r, r.particles[index], d);
+}
+
+// The draw of workgroup `group` of the smoke clusters; false past the list.
+public bool smoke_draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint3 group, out ParticleDraw d)
+{
+    d = (ParticleDraw)0;
+    uint index = grid_index(group);
+    return index < r.counts[COUNT_SMOKE] && listed_draw(s, v, r, r.smoke[index], d);
+}
+
+bool listed_draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint visible, inout ParticleDraw d)
+{
+    d.visible = visible;
+    d.vc = r.gbuffer.clusters[visible];
     uint entry;
     if (!visible_producer(s, d.vc, entry))
         return false;

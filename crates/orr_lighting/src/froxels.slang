@@ -4,6 +4,10 @@
 // from the eye along each column; media apply (`camera_media`) composes them with every
 // pixel's radiance.
 //
+// A smoke entry's triangles add to `FroxelRoot.smoke`, kept apart from the linked medium because
+// they scatter with their own phase function and because the integrate alone reads them: other
+// rays see those triangles themselves, as shadow rays do through their opacity.
+//
 // A froxel's light is isotropic incident radiance (the world cache's ambient on two opposed
 // normals and resampled tile lights, one shadow ray) plus one visibility per shadowed
 // directional light, so the phase function applies per view direction at integration.
@@ -48,6 +52,12 @@ public static const float FROXEL_ORDER_HYSTERESIS = 2.0;
 // Largest incident radiance a froxel stores, nits (RGBA16F).
 public static const float FROXEL_INCIDENT_MAX = 65000.0;
 
+// `FroxelRoot.smoke` holds these 32-bit words per froxel, added to atomically: the optical depth
+// of the smoke in it, that optical depth times albedo (rgb) and times emission in nits (rgb).
+public static const uint SMOKE_WORDS = 7;
+public static const float SMOKE_DEPTH_SCALE = 65536.0;
+public static const float SMOKE_EMISSION_SCALE = 1024.0;
+
 // One frame's froxel counts, read back by the CPU.
 public struct MediaStatsGpu
 {
@@ -69,6 +79,8 @@ public struct FroxelRoot
     public WorldCacheGpu* cache;
     public FroxelLights* lights;
     public MediaStatsGpu* stats;
+    public RasterGpu* raster;
+    public uint* smoke;                         // SMOKE_WORDS per froxel; null without smoke entries
     public StorageImageIndex sigma;             // froxel_material, RGBA16F
     public StorageImageIndex words;             // froxel_material, RGBA32_UINT
     public StorageImageIndex incident;          // this frame's, RGBA16F
@@ -93,13 +105,13 @@ public struct FroxelRoot
     public TextureIndex aerial_sampled;
     public TextureIndex aerial_rgb_sampled;
     public float ap_range;                      // m, the view's; the LUT's far end
+    public float smoke_anisotropy;              // the view's
     public uint _pad0;
-    public uint _pad1;
 }
 
 // The view-space ray through point `p` of the view's unjittered image, in render pixels,
 // scaled to z = -1.
-float3 unjittered_ray(ViewConstants* v, float2 p)
+public float3 unjittered_ray(ViewConstants* v, float2 p)
 {
     float2 ndc = p / float2(v.extent) * 2.0 - 1.0;
     float4x4 m = v.clip_from_view;
@@ -300,7 +312,13 @@ public void froxel_order(FroxelRoot r)
     r.stats.proxies = proxies;
 }
 
-// Writes froxel `f`'s medium.
+// The first of froxel `f`'s words in `FroxelRoot.smoke`.
+public uint smoke_index(FroxelRoot r, uint3 f)
+{
+    return SMOKE_WORDS * (f.x + r.columns * (f.y + r.rows * f.z));
+}
+
+// Writes froxel `f`'s medium and clears its smoke.
 public void froxel_inject<M : IMedium>(FroxelRoot r, uint3 f)
 {
     Sampler rng = froxel_sampler(r, f);
@@ -308,6 +326,12 @@ public void froxel_inject<M : IMedium>(FroxelRoot r, uint3 f)
     FroxelMaterial m = froxel_material(M.sample(r.scene.medium, x));
     r.sigma.get<RWTexture3D<float4>>()[f] = m.sigma;
     r.words.get<RWTexture3D<uint4>>()[f] = m.words;
+    if (r.smoke != nullptr)
+    {
+        uint first = smoke_index(r, f);
+        for (uint i = 0; i < SMOKE_WORDS; i++)
+            r.smoke[first + i] = 0;
+    }
 }
 
 bool froxel_shadowed(FroxelLights* lights, uint id)
@@ -496,26 +520,42 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column, 
 
 // Light point `x` of a froxel, sampled as `m`, emits and scatters back along unit `dir` per
 // m: its emission, its isotropic `incident` light, the shadowed `lights` by the visibility in
-// `incident.a` and `more`, and every directional light's multiple scattering.
-float3 froxel_source<M : IMedium>(LightSetGpu* set, FroxelLights lights, MediumPoint m, float4 incident, float4 more, float3 x, float3 dir)
+// `incident.a` and `more`, and every directional light's multiple scattering. Its smoke's
+// `smoke_scatter` takes the same light with a Henyey-Greenstein response of `anisotropy`.
+float3 froxel_source<M : IMedium>(LightSetGpu* set, FroxelLights lights, MediumPoint m, float3 smoke_scatter, float anisotropy, float4 incident, float4 more, float3 x, float3 dir)
 {
     uint64_t data = set.scene.medium;
-    float3 light = incident.rgb;
+    float3 medium_light = float3(0.0);
+    float3 smoke_light = float3(0.0);
     for (uint j = 0; j < lights.count; j++)
     {
         uint id = lights.ids[j];
         float3 to_light = set.scene.lights[id].direction;
         float vis = j == 0 ? incident.a : more[j - 1];
         if (vis > 0.0)
-            light += directional_illuminance(set, id) * vis * M.phase(data, m, dot(to_light, dir))
-                * M.transmittance(data, x, to_light, positive_infinity());
+        {
+            float cos_theta = dot(to_light, dir);
+            float3 arriving = directional_illuminance(set, id) * vis * M.transmittance(data, x, to_light, positive_infinity());
+            medium_light += arriving * M.phase(data, m, cos_theta);
+            smoke_light += arriving * hg_phase(anisotropy, cos_theta);
+        }
     }
-    light += multiple_scattered<M>(set, x);
-    return m.emission + m.sigma_s * light;
+    float3 isotropic = incident.rgb + multiple_scattered<M>(set, x);
+    return m.emission + m.sigma_s * (isotropic + medium_light) + smoke_scatter * (isotropic + smoke_light);
 }
 
-// The column coordinate (column k's ray at k) of render-space point `x` in a `grid` of
-// columns and rows seen from view `v`, and its distance from the eye; false behind the eye.
+// The column coordinate (column k's ray at k) of view-space point `d` with `d.z` < 0, in a
+// `grid` of columns and rows seen from view `v`: the inverse of `unjittered_ray`.
+public float2 view_column(uint2 grid, ViewConstants* v, float3 d)
+{
+    float4x4 m = v.clip_from_view;
+    float2 q = d.xy / -d.z;
+    float2 ndc = float2(q.x * m[0][0] - m[0][2], q.y * m[1][1] - m[1][2]);
+    return (ndc * 0.5 + 0.5) * float2(v.extent) / froxel_spacing(v.extent, grid);
+}
+
+// The column coordinate of render-space point `x` in a `grid` of columns and rows seen from
+// view `v`, and its distance from the eye; false behind the eye.
 bool froxel_column(uint2 grid, ViewConstants* v, float3 x, out float2 c, out float t)
 {
     c = float2(0.0);
@@ -524,11 +564,7 @@ bool froxel_column(uint2 grid, ViewConstants* v, float3 x, out float2 c, out flo
     float3 d = mul(v.view_from_world_rotation, float4(relative, 0.0));
     if (!(d.z < 0.0))
         return false;
-    // The inverse of `unjittered_ray`.
-    float4x4 m = v.clip_from_view;
-    float2 q = d.xy / -d.z;
-    float2 ndc = float2(q.x * m[0][0] - m[0][2], q.y * m[1][1] - m[1][2]);
-    c = (ndc * 0.5 + 0.5) * float2(v.extent) / froxel_spacing(v.extent, grid);
+    c = view_column(grid, v, d);
     return true;
 }
 
@@ -593,7 +629,7 @@ public float3 froxel_segment_inscatter<M : IMedium>(FroxelVolume* volume, ViewCo
             m = froxel_point(fm, volume.chromatic != 0);
             float4 incident = volume.incident.get<RWTexture3D<float4>>()[f];
             float4 more = lights.count > 1 ? volume.visibility.get<RWTexture3D<float4>>()[f] : float4(1.0);
-            source = any(m.sigma_s > 0.0) ? froxel_source<M>(set, lights, m, incident, more, x, dir) : m.emission;
+            source = any(m.sigma_s > 0.0) ? froxel_source<M>(set, lights, m, float3(0.0), 0.0, incident, more, x, dir) : m.emission;
         }
         else
         {
@@ -628,14 +664,23 @@ public void froxel_integrate<M : IMedium>(FroxelRoot r, uint2 column)
         float3 x = eye + dir * (0.5 * (t0 + t1));
         FroxelMaterial fm = { r.sigma.get<RWTexture3D<float4>>()[f], r.words.get<RWTexture3D<uint4>>()[f] };
         MediumPoint m = froxel_point(fm, chromatic);
+        float dt = t1 - t0;
+        float3 smoke_scatter = float3(0.0);
+        if (r.smoke != nullptr)
+        {
+            uint* w = r.smoke + smoke_index(r, f);
+            m.sigma_t += float(w[0]) / (SMOKE_DEPTH_SCALE * dt);
+            smoke_scatter = float3(w[1], w[2], w[3]) / (SMOKE_DEPTH_SCALE * dt);
+            m.emission += float3(w[4], w[5], w[6]) / (SMOKE_EMISSION_SCALE * dt);
+        }
         float3 source = m.emission;
-        if (any(m.sigma_s > 0.0))
+        if (any(m.sigma_s > 0.0) || any(smoke_scatter > 0.0))
         {
             float4 incident = r.incident.get<RWTexture3D<float4>>()[f];
             float4 more = lights.count > 1 ? r.visibility.get<RWTexture3D<float4>>()[f] : float4(1.0);
-            source = froxel_source<M>(set, lights, m, incident, more, x, dir);
+            source = froxel_source<M>(set, lights, m, smoke_scatter, r.smoke_anisotropy, incident, more, x, dir);
         }
-        march_step(m.sigma_t, source, t1 - t0, inscatter, transmittance);
+        march_step(m.sigma_t, source, dt, inscatter, transmittance);
         r.integrated.get<RWTexture3D<float4>>()[f] = float4(apply_hdr_ceiling(inscatter * pre_exposure), luminance_rec2020(transmittance));
         if (chromatic)
             r.integrated_rgb.get<RWTexture3D<float4>>()[f] = float4(transmittance, 1.0);

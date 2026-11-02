@@ -959,6 +959,8 @@ impl<'a> Frame<'a> {
             scene: raster.scene,
             view: raster.view,
             gbuffer: raster.gbuffer,
+            raster: raster.raster,
+            smoke_args: raster.smoke_args,
             sample_index: state.samples,
             seed: 0,
             dof_background: None,
