@@ -17,10 +17,9 @@
 //! [--native] [--clusters] [--headless] [--frames N] [--out file.png]` shows DLSS super
 //! resolution instead: the same scene as a raster debug view, its G-buffer shaded by the
 //! sun and sky alone (or colored by cluster with `--clusters`), rendered at the mode's
-//! render size and upscaled to the window; by default the mode suits the window's size, which
-//! below 1920 x 1080 is DLAA at the window's own size. `--native` renders it at
-//! the output size without SR. Headless runs render 960 x 540 for 64 frames unless told
-//! otherwise and write the last frame as a PNG.
+//! render size and upscaled to the window; by default the mode suits the window's size.
+//! `--native` renders it at the output size without SR. Headless runs output 960 x 540 for 64
+//! frames unless told otherwise and write the last frame as a PNG.
 
 use std::time::{Duration, Instant};
 

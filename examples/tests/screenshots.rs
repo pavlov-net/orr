@@ -401,8 +401,14 @@ fn render_view_runs_ray_reconstruction() {
         (
             [1280, 720],
             Reconstruction::default(),
-            [1280, 720],
-            Some(DlssMode::Dlaa),
+            [853, 480],
+            Some(DlssMode::Quality),
+        ),
+        (
+            [64, 32],
+            Reconstruction::default(),
+            [43, 21],
+            Some(DlssMode::Quality),
         ),
         (
             hd,

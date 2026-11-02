@@ -77,13 +77,11 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// The default mode of the RTX UI Developer Guidelines' table for an output of this many
-    /// pixels: Quality from 1920 x 1080 up to 2560 x 1440, Performance up to 3840 x 2160,
-    /// Ultra Performance above. Below 1920 x 1080 the table turns DLSS off; this returns
-    /// DLAA, which does not upscale either and still denoises a path traced view.
+    /// The mode for an output of this many pixels: Quality up to 2560 x 1440, Performance up to
+    /// 3840 x 2160, Ultra Performance above. From 1920 x 1080 up these are the defaults of the
+    /// RTX UI Developer Guidelines' table.
     pub fn for_output([width, height]: [u32; 2]) -> Self {
         match u64::from(width) * u64::from(height) {
-            p if p < 1920 * 1080 => Self::Dlaa,
             p if p <= 2560 * 1440 => Self::Quality,
             p if p <= 3840 * 2160 => Self::Performance,
             _ => Self::UltraPerformance,
@@ -141,9 +139,7 @@ mod tests {
     #[test]
     fn auto_follows_the_output_resolution_at_each_boundary() {
         for (output, mode) in [
-            ([1919, 1080], Mode::Dlaa),
-            ([1920, 1079], Mode::Dlaa),
-            ([1920, 1080], Mode::Quality),
+            ([1919, 1080], Mode::Quality),
             ([2560, 1080], Mode::Quality),
             ([2560, 1440], Mode::Quality),
             ([2561, 1440], Mode::Performance),

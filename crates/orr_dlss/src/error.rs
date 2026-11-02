@@ -9,6 +9,9 @@ pub enum DlssError {
     /// NGX does not offer the feature on this device.
     #[error("{0} is not supported on this device")]
     Unsupported(&'static str),
+    /// NGX does not offer this mode at this output size.
+    #[error("NGX does not offer {mode:?} at an output of {output:?}")]
+    ModeUnavailable { mode: crate::Mode, output: [u32; 2] },
     /// An NGX call failed.
     #[error("{call} failed: NGX result {result:#x}")]
     Ngx { call: &'static str, result: u32 },

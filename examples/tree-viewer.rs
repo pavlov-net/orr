@@ -14,7 +14,7 @@
 //! `tree-viewer <file.glb | file.gltf | archive.orr> [--model NAME] [--node PATTERN]
 //! [--part-attribute NAME] [--still] [--frames N] [--headless] [--out file.png]`: `--node`
 //! cooks each glTF node whose name holds the pattern as its own model (not with skins),
-//! `--model` picks the archive's model (default: the first by name). Headless runs render
+//! `--model` picks the archive's model (default: the first by name). Headless runs output
 //! 480 x 270 for 120 frames unless told otherwise and write the last frame as a PNG.
 
 use std::collections::HashMap;
