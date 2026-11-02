@@ -5,9 +5,10 @@
 //! A copy takes one cut a frame by its distance from the scene focus, the same for raster
 //! and ray tracing. Its vertex arrays hold every vertex of its mesh, by mesh cluster, so a
 //! cut change needs nothing moved; previous positions come from the palette group's previous
-//! transforms, so motion follows the palette. The frame's instantiated CLAS and BLAS land in
-//! blocks sized for `SceneDesc::skinned_clusters`; frames run in order on the render queue,
-//! so a frame's builds never overlap the traces of the frame before.
+//! transforms and, on an edit's copies, last frame's rest positions, so motion follows both.
+//! The frame's instantiated CLAS and BLAS land in blocks sized for
+//! `SceneDesc::skinned_clusters`; frames run in order on the render queue, so a frame's builds
+//! never overlap the traces of the frame before.
 
 use orr_gpu::{
     Allocation, BlasLimits, ClusterLimits, ClusterVertexFormat, CommandList, Device, DispatchArgs,

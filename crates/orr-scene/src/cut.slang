@@ -12,6 +12,7 @@ public static const uint CUT_DISTANT = 4;       // it traces its model's merged 
 public static const uint CUT_RETRY_RASTER = 8;  // a non-resident node stopped its raster cut
 public static const uint CUT_RETRY_RT = 16;     // a non-resident node stopped its ray-tracing cut
 public static const uint CUT_OWNER = 32;        // it builds the BLAS its equal cuts share
+public static const uint CUT_PARTS = 64;        // its gathered cut builds a body BLAS and one per animated part
 
 // A copy keeps its ray-tracing range, and its cached cut, within this factor.
 public static const float RT_HYSTERESIS = 1.15;
@@ -51,7 +52,8 @@ public static const uint CUT_MERGED = 15;             // slots tracing their mod
 public static const uint CUT_REQUESTS = 16;           // node pages requested
 public static const uint CUT_RETRIES = 17;            // slots the second traversal ran on
 public static const uint CUT_FEEDBACK = 18;           // feedback records written
-public static const uint CUT_COUNTERS = 19;
+public static const uint CUT_PART_LISTS = 19;         // entries of `part_lists` handed out
+public static const uint CUT_COUNTERS = 20;
 
 // One instance slot's cuts this frame.
 public struct SlotCutGpu
@@ -66,6 +68,7 @@ public struct SlotCutGpu
     public uint coarsen[2];        // raster, ray tracing: the error scale (f32 bits) that keeps every node it needs resident
     public uint owner;             // the slot whose BLAS it traces
     public uint far_cut;           // while its copy fades: the cached cut of its far step
+    public uint rt_parts;          // CUT_PARTS with RT_CUT_BUILT: its body's entry in `part_lists`, each animated part's after it
 }
 
 // A hierarchy node one traversal pass visits for a slot.
@@ -82,6 +85,16 @@ public struct BlasJob
 {
     public uint first;
     public uint count;
+}
+
+// The clusters of a gathered cut that go to one BLAS of a CUT_PARTS slot: `count` CLAS addresses
+// at `first` in `CutGpu.clas`, built by `job` when any.
+public struct PartListGpu
+{
+    public uint first;
+    public uint count;
+    public uint fill;              // addresses written so far
+    public uint job;
 }
 
 // A slot's gathered ray-tracing cut in the frame's table of equal cuts.
@@ -125,6 +138,7 @@ public struct CutGpu
     public uint* args;             // dispatch grids of the passes
     public FeedbackGpu* feedback;
     public uint8_t* records;       // cluster BLAS build records, by job
+    public PartListGpu* part_lists;
     public uint queue_capacity;
     public uint candidate_capacity;
     public uint entry_capacity;
@@ -133,4 +147,6 @@ public struct CutGpu
     public uint key_mask;
     public uint model_capacity;
     public uint feedback_capacity;
+    public uint part_list_capacity;
+    public uint _pad;
 }

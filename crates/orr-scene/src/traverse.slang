@@ -12,7 +12,9 @@
 // traversal replaces the slot's output for that cut. `assign`, `share` and `link` then give
 // each gathered ray-tracing cut a cached cut equal to it, the BLAS another slot with an
 // equal cut builds, a BLAS of its own within the frame's budget, or else its cached cut;
-// `gather` writes the CLAS addresses each built BLAS takes and `jobs` its build record.
+// `gather` writes the CLAS addresses each built BLAS takes and `jobs` its build record. A posed
+// copy of an edit builds a BLAS for its body and one per animated part with clusters in the cut:
+// `split` counts them and `place` gives them their jobs and CLAS ranges.
 #include "orr/root.h"
 import orr.abi;
 import orr.math;
@@ -158,6 +160,14 @@ bool focus_placement(SceneRoot* s, InstanceGpu inst, out Placement p)
 {
     GroupGpu* g = s.groups + inst.group;
     return placement(g, g.current, inst.group_index, root.focus_cell.xyz, root.focus_offset.xyz, uint(s.origin_cell.w), p);
+}
+
+// Whether a copy gathers one BLAS per animated part: an edit's copy taking its pose, which no
+// cached cut can serve, with some animated part shown.
+bool gathers_parts(MeshGpu* mesh, InstanceGpu inst, SlotStateGpu st)
+{
+    return mesh.edit != nullptr && mesh.animated_parts > 0 && (st.rt_flags & RT_ANIMATED) != 0
+        && (mesh.animated_sections & ~(inst.variant >> 16)) != 0;
 }
 
 // The placement of stage part `part` of slot copy `copy`: posed when the copy takes its pose
@@ -402,7 +412,7 @@ void init(uint3 id: SV_DispatchThreadID)
         // An edit's copies trace their one level, whose CLAS rebuild: no cached cut holds them.
         bool gather = ray && mesh.edit != nullptr;
         if (gather)
-            c.flags |= CUT_TRAVERSED;
+            c.flags |= CUT_TRAVERSED | (gathers_parts(mesh, inst, st) ? CUT_PARTS : 0);
         cut.slots[slot] = c;
         for (uint g = 0; gather && g < mesh.edit.group_count; g++)
         {
@@ -433,7 +443,7 @@ void init(uint3 id: SV_DispatchThreadID)
     if (ray && !gather)
         want_cut(s, cut, mesh, model.mesh, p.scale * l.scale[1], distance, l.threshold[1], lowest_cut(mesh, inst));
     if (gather)
-        c.flags |= CUT_TRAVERSED;
+        c.flags |= CUT_TRAVERSED | (gathers_parts(mesh, inst, st) ? CUT_PARTS : 0);
     if (raster)
         c.flags |= CUT_RASTER;
     cut.slots[slot] = c;
@@ -813,6 +823,12 @@ void retry(uint3 id: SV_DispatchThreadID)
     }
 }
 
+// What a slot's cut is keyed by besides its clusters: its mesh, and whether it splits by part.
+uint key_mesh(SlotCutGpu c, uint mesh)
+{
+    return mesh | ((c.flags & CUT_PARTS) != 0 ? 0x80000000u : 0);
+}
+
 uint key_bucket(SlotCutGpu c, uint mesh)
 {
     uint h = c.rt_hash.x ^ (c.rt_hash.y * 0x9e3779b1u) ^ (c.rt_count * 0x85ebca6bu) ^ (mesh * 0xc2b2ae35u);
@@ -869,7 +885,8 @@ void assign(uint3 id: SV_DispatchThreadID)
             }
         }
     }
-    uint b = key_bucket(c, mesh_index);
+    uint key = key_mesh(c, mesh_index);
+    uint b = key_bucket(c, key);
     for (uint i = 0; i < KEY_PROBES; i++)
     {
         uint prev;
@@ -878,7 +895,7 @@ void assign(uint3 id: SV_DispatchThreadID)
         {
             cut.keys[b].hash = c.rt_hash;
             cut.keys[b].count = c.rt_count;
-            cut.keys[b].mesh = mesh_index;
+            cut.keys[b].mesh = key;
             return;
         }
         b = (b + 1) & cut.key_mask;
@@ -901,12 +918,13 @@ void share(uint3 id: SV_DispatchThreadID)
     if ((c.flags & CUT_TRAVERSED) == 0)
         return;
     uint mesh_index = s.models[s.instances[slot].model].mesh;
-    uint b = key_bucket(c, mesh_index);
+    uint key = key_mesh(c, mesh_index);
+    uint b = key_bucket(c, key);
     uint owner = slot;
     for (uint i = 0; i < KEY_PROBES; i++)
     {
         CutKey k = cut.keys[b];
-        if (k.owner != 0 && k.count == c.rt_count && k.mesh == mesh_index && all(k.hash == c.rt_hash))
+        if (k.owner != 0 && k.count == c.rt_count && k.mesh == key && all(k.hash == c.rt_hash))
         {
             owner = k.owner - 1;
             break;
@@ -923,6 +941,24 @@ void share(uint3 id: SV_DispatchThreadID)
     if (first + c.rt_count > cut.clas_capacity)
     {
         fall_back(cut, slot);
+        return;
+    }
+    if ((c.flags & CUT_PARTS) != 0)
+    {
+        uint n = 1 + s.meshes[mesh_index].animated_parts;
+        uint lists;
+        InterlockedAdd(cut.counters[CUT_PART_LISTS], n, lists);
+        if (lists + n > cut.part_list_capacity)
+        {
+            fall_back(cut, slot);
+            return;
+        }
+        for (uint i = 0; i < n; i++)
+            cut.part_lists[lists + i] = (PartListGpu)0;
+        c.flags |= CUT_OWNER;
+        c.rt_first = first;
+        c.rt_parts = lists;
+        cut.slots[slot] = c;
         return;
     }
     uint job;
@@ -942,6 +978,92 @@ void share(uint3 id: SV_DispatchThreadID)
     c.rt_first = first;
     c.rt_fill = 0;
     cut.slots[slot] = c;
+}
+
+// Which of a CUT_PARTS slot's lists mesh cluster `mesh_cluster` goes to: 0 the body, else
+// 1 + its animated part.
+uint part_list(SceneRoot* s, MeshGpu* mesh, uint mesh_cluster)
+{
+    ClusterRef r = s.clusters[mesh.cluster_base + mesh_cluster];
+    Cluster cl = load_cluster(r.page, r.local);
+    bool animated = (cl.flags & CLUSTER_ANIMATED_PART) != 0 && cl.part >= mesh.first_animated;
+    return animated ? 1 + cl.part - mesh.first_animated : 0;
+}
+
+// Whether entry `e` of the frame's cut clusters counts for the slot's output: the second
+// traversal's replaces the first's.
+bool entry_current(uint2 e, SlotCutGpu c)
+{
+    return ((e.x & WORK_RETRY) != 0) == ((c.flags & CUT_RETRY_RT) != 0);
+}
+
+// One thread per gathered cluster: counts it in its CUT_PARTS slot's list.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void split(uint3 id: SV_DispatchThreadID)
+{
+    SceneRoot* s = root.scene;
+    CutGpu* cut = root.cut;
+    if (id.x >= min(cut.counters[CUT_ENTRIES], cut.entry_capacity))
+        return;
+    uint2 e = cut.entries[id.x];
+    uint slot = e.x & ~WORK_RETRY;
+    SlotCutGpu c = cut.slots[slot];
+    if ((c.flags & (CUT_OWNER | CUT_PARTS)) != (CUT_OWNER | CUT_PARTS) || !entry_current(e, c))
+        return;
+    MeshGpu* mesh = s.meshes + s.models[s.instances[slot].model].mesh;
+    InterlockedAdd(cut.part_lists[c.rt_parts + part_list(s, mesh, e.y)].count, 1);
+}
+
+// One thread per slot: a CUT_PARTS owner's lists take their CLAS ranges and, all of them or
+// else none, their jobs.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void place_lists(uint3 id: SV_DispatchThreadID)
+{
+    uint slot = id.x;
+    if (slot >= root.slots)
+        return;
+    SceneRoot* s = root.scene;
+    CutGpu* cut = root.cut;
+    SlotCutGpu c = cut.slots[slot];
+    if ((c.flags & (CUT_OWNER | CUT_PARTS)) != (CUT_OWNER | CUT_PARTS))
+        return;
+    uint n = 1 + s.meshes[s.models[s.instances[slot].model].mesh].animated_parts;
+    uint wanted = 0;
+    for (uint i = 0; i < n; i++)
+        wanted += cut.part_lists[c.rt_parts + i].count > 0 ? 1 : 0;
+    uint job = cut.counters[CUT_JOBS];
+    while (job + wanted <= cut.job_capacity)
+    {
+        uint prev;
+        InterlockedCompareExchange(cut.counters[CUT_JOBS], job, job + wanted, prev);
+        if (prev == job)
+            break;
+        job = prev;
+    }
+    if (job + wanted > cut.job_capacity)
+    {
+        cut.slots[slot].flags = c.flags & ~CUT_OWNER;
+        fall_back(cut, slot);
+        return;
+    }
+    uint at = c.rt_first;
+    for (uint i = 0; i < n; i++)
+    {
+        PartListGpu* l = cut.part_lists + c.rt_parts + i;
+        uint count = l.count;
+        l.first = at;
+        at += count;
+        if (count == 0)
+            continue;
+        l.job = job;
+        BlasJob j;
+        j.first = l.first;
+        j.count = count;
+        cut.jobs[job++] = j;
+    }
+    cut.slots[slot].rt_cut = RT_CUT_BUILT;
 }
 
 // Slots sharing another's cut trace its BLAS, or their cached cut when it builds none.
@@ -964,6 +1086,7 @@ void link(uint3 id: SV_DispatchThreadID)
     }
     cut.slots[slot].rt_cut = RT_CUT_BUILT;
     cut.slots[slot].rt_job = o.rt_job;
+    cut.slots[slot].rt_parts = o.rt_parts;
     InterlockedAdd(cut.counters[CUT_SHARED], 1);
 }
 
@@ -1000,15 +1123,26 @@ void gather(uint3 id: SV_DispatchThreadID)
     SlotCutGpu c = cut.slots[slot];
     if ((c.flags & CUT_OWNER) == 0)
         return;
-    bool retry = (e.x & WORK_RETRY) != 0;
-    if (retry != ((c.flags & CUT_RETRY_RT) != 0))
-        return;
-    uint k;
-    InterlockedAdd(cut.slots[slot].rt_fill, 1, k);
-    if (k >= c.rt_count)
+    if (!entry_current(e, c))
         return;
     MeshGpu* mesh = s.meshes + s.models[s.instances[slot].model].mesh;
-    cut.clas[c.rt_first + k] = s.clusters[mesh.cluster_base + e.y].clas;
+    uint k;
+    uint first = c.rt_first;
+    uint count = c.rt_count;
+    if ((c.flags & CUT_PARTS) != 0)
+    {
+        PartListGpu* l = cut.part_lists + c.rt_parts + part_list(s, mesh, e.y);
+        first = l.first;
+        count = l.count;
+        InterlockedAdd(l.fill, 1, k);
+    }
+    else
+    {
+        InterlockedAdd(cut.slots[slot].rt_fill, 1, k);
+    }
+    if (k >= count)
+        return;
+    cut.clas[first + k] = s.clusters[mesh.cluster_base + e.y].clas;
 }
 
 // One thread per BLAS built this frame: its cluster BLAS record.

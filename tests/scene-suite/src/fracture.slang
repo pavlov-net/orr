@@ -40,6 +40,11 @@ void main(uint3 id: SV_DispatchThreadID)
             if (stripe != int(root.piece))
                 store_triangle(page, h, c, t, uint3(v.x));
         }
+        if (root.lift < 0.0)
+        {
+            store_anchor(page, h, g.first_cluster + k, c.anchor - int3(0, int(ceil(-root.lift / step)), 0));
+            c = load_cluster(page, g.first_cluster + k);
+        }
         if (root.lift != 0.0)
         {
             for (uint i = 0; i < c.vertex_count; i++)

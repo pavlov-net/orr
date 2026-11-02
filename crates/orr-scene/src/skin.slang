@@ -3,7 +3,8 @@
 // lists the clusters of the cut its section mask shows as work items and writes the
 // cluster BLAS record over their CLAS; `args` sizes `skin`, which skins one cluster per
 // workgroup with this frame's and last frame's palettes (positions, previous positions,
-// normals, tangents, the cluster's box and the copy's bounds) and writes the instantiation
+// normals, tangents, the cluster's box and the copy's bounds; an edit's copies take last frame's
+// rest positions for its previous positions) and writes the instantiation
 // of its cluster template; after the builds `finish` keeps each copy's BLAS. A copy
 // skins its clusters whether or not a view shows it; one inside `rt_range` is traced.
 #include "orr/root.h"
@@ -201,6 +202,16 @@ groupshared uint box_lo[3];
 groupshared uint box_hi[3];
 
 // One workgroup per work item: the cluster's vertices, one per thread.
+// Vertices stay inside the cluster's rest box grown by its deformation bound, which its
+// template's instantiations require; a pose beyond the cooked bound flattens there in
+// raster and ray tracing alike.
+void skin_limits(Cluster c, float step, out float3 lo, out float3 hi)
+{
+    float bound = float(c.deformation_bound);
+    lo = bound > 0.0 ? grid_position(c.anchor, uint3(0), step) - bound : float3(-1e30);
+    hi = bound > 0.0 ? grid_position(c.anchor, uint3(c.local_max[0], c.local_max[1], c.local_max[2]), step) + bound : float3(1e30);
+}
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void skin(uint group: SV_GroupID, uint t: SV_GroupThreadID)
@@ -216,7 +227,8 @@ void skin(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     uint page = cluster_page(mesh, c);
     uint8_t* data = (uint8_t*)mesh.pages[page];
     PageHeader h = load_page_header(data);
-    Cluster cl = load_cluster(data, c - mesh.page_clusters[page]);
+    uint local = c - mesh.page_clusters[page];
+    Cluster cl = load_cluster(data, local);
     GroupGpu* palette = s.groups + k.palette_group;
     uint base = sm.vertex_first[c];
     if (t < 3)
@@ -226,14 +238,15 @@ void skin(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     }
     GroupMemoryBarrierWithGroupSync();
     bool tangents = (mesh.attributes & MESH_TANGENT) != 0;
-    // Vertices stay inside the cluster's rest box grown by its deformation bound, which its
-    // template's instantiations require; a pose beyond the cooked bound flattens there in
-    // raster and ray tracing alike.
-    float bound = float(cl.deformation_bound);
-    float3 rest_lo = grid_position(cl.anchor, uint3(0), mesh.position_step) - bound;
-    float3 rest_hi = grid_position(cl.anchor, uint3(cl.local_max[0], cl.local_max[1], cl.local_max[2]), mesh.position_step) + bound;
-    float3 limit_lo = bound > 0.0 ? rest_lo : float3(-1e30);
-    float3 limit_hi = bound > 0.0 ? rest_hi : float3(1e30);
+    float3 limit_lo, limit_hi;
+    skin_limits(cl, mesh.position_step, limit_lo, limit_hi);
+    // An edit's kernel may have moved the rest positions this frame; last frame's positions
+    // come from the rest pose and box it had then.
+    uint8_t* before = previous_page(mesh, data);
+    PageHeader was_header = load_page_header(before);
+    Cluster was = load_cluster(before, local);
+    float3 was_lo, was_hi;
+    skin_limits(was, mesh.position_step, was_lo, was_hi);
     for (uint i = t; i < cl.vertex_count; i += 64)
     {
         float3 x = load_position(data, h, cl, i, mesh.position_step);
@@ -241,7 +254,8 @@ void skin(uint group: SV_GroupID, uint t: SV_GroupThreadID)
         float3x4 m = blend(palette, k, a, false);
         float3 q = clamp(transform_point(m, x), limit_lo, limit_hi);
         k.positions[base + i] = q;
-        k.previous[base + i] = clamp(transform_point(blend(palette, k, a, true), x), limit_lo, limit_hi);
+        float3 x_was = before != data ? load_position(before, was_header, was, i, mesh.position_step) : x;
+        k.previous[base + i] = clamp(transform_point(blend(palette, k, a, true), x_was), was_lo, was_hi);
         k.normals[base + i] = oct_encode_unorm16(transform_normal(m, a.normal));
         if (tangents)
         {

@@ -420,6 +420,21 @@ public void skinned_corners(SkinnedGpu k, MeshGpu* mesh, uint8_t* page, Cluster 
     }
 }
 
+// Gives the corners of triangle `triangle` of cluster `local` of `page` their positions before
+// this frame's kernels, when `page` is one of `mesh`'s edited pages; false for any other page.
+public bool edited_corners(MeshGpu* mesh, uint8_t* page, uint local, uint triangle, inout Corners t)
+{
+    uint8_t* before = previous_page(mesh, page);
+    if (before == page)
+        return false;
+    PageHeader h = load_page_header(before);
+    Cluster was = load_cluster(before, local);
+    uint3 v = load_triangle(page, load_page_header(page), load_cluster(page, local), triangle);
+    for (uint j = 0; j < 3; j++)
+        t.position[j] = load_position(before, h, was, v[j], mesh.position_step);
+    return true;
+}
+
 // The world cell and the offset in it of the point `relative` from `cell` + `offset`.
 public void world_cell(int3 cell, float3 offset, float3 relative, uint cell_log2, out int3 out_cell, out float3 out_offset)
 {
@@ -562,7 +577,7 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
     uint attributes;
     Placement pl;
     uint entry;
-    bool skinned = false;
+    bool deformed = false;
     bool producer = hit_producer(s, instance_index, entry);
     bool strand = producer && s.producers[entry].strands != 0;
     if (strand)
@@ -616,9 +631,11 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
         Cluster c = load_cluster(r.page, r.local);
         corners = load_corners(r.page, c, primitive, mesh);
         SkinnedGpu k;
-        skinned = copy_skin(s, inst, k);
-        if (skinned)
+        deformed = copy_skin(s, inst, k);
+        if (deformed)
             skinned_corners(k, mesh, r.page, c, r.mesh_cluster, primitive, previous, corners);
+        else if (previous)
+            deformed = edited_corners(mesh, r.page, r.local, primitive, corners);
         material = section_material(s, inst, model, c.section);
         attributes = mesh.attributes;
         GroupGpu* g = s.groups + inst.group;
@@ -643,7 +660,7 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
         return false;
     MaterialGpu* m = s.materials + material;
     if (!strand)
-        hit_triangle(i, d, corners, t, fetched, skinned, previous, attributes, m, pl, primitive, bary, context);
+        hit_triangle(i, d, corners, t, fetched, deformed, previous, attributes, m, pl, primitive, bary, context);
     i.uv[0].tap = i.uv[1].tap = context.tap;
     i.context = context;
     i.material = material;
@@ -661,10 +678,10 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
 
 // The triangle geometry of a hit at barycentrics `bary` of triangle `primitive` with
 // `corners`, the fetched positions `t` replacing theirs where they are this frame's.
-void hit_triangle(inout SurfaceInput i, float3 d, Corners corners, Corners t, bool fetched, bool skinned, bool previous, uint attributes, MaterialGpu* m, Placement pl, uint primitive, float2 bary, HitContext context)
+void hit_triangle(inout SurfaceInput i, float3 d, Corners corners, Corners t, bool fetched, bool deformed, bool previous, uint attributes, MaterialGpu* m, Placement pl, uint primitive, float2 bary, HitContext context)
 {
-    // A skinned copy's fetched positions are this frame's.
-    if (fetched && !(skinned && previous))
+    // A deformed copy's fetched positions are this frame's.
+    if (fetched && !(deformed && previous))
         corners.position = t.position;
 
     // Barycentric steps of the cone's footprint: two directions across the ray, carried
@@ -818,8 +835,8 @@ public bool resolve_particle(SceneRoot* s, uint instance_index, uint cluster_id,
 }
 
 // The render-space position last frame of the point a ray hit: the previous transform for
-// rigid content, the previous positions of producer batches that keep them. False where the
-// hit does not resolve.
+// rigid content, the previous positions of producer batches that keep them, of skinned copies
+// and of the vertices kernels move in an edit. False where the hit does not resolve.
 public bool hit_previous_position(SceneRoot* s, float3 d, uint instance_index, uint cluster_id, uint primitive, float2 bary, out float3 position)
 {
     position = float3(0.0);

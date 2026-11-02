@@ -586,9 +586,9 @@ impl Scenes {
         }
     }
 
-    /// Starts an edit of a mesh without skinning: a new model the consumer's kernels
-    /// change at the scene compute point (see [`EditRef`]). Its pages read on the loading
-    /// side, and [`Scenes::edit`] succeeds once [`Scenes::edit_state`] is `Ready`.
+    /// Starts an edit of a mesh: a new model the consumer's kernels change at the scene
+    /// compute point (see [`EditRef`]). Its pages read on the loading side, and
+    /// [`Scenes::edit`] succeeds once [`Scenes::edit_state`] is `Ready`.
     pub fn create_edit(&mut self, desc: &EditDesc<'_>) -> Result<EditId> {
         self.core
             .mounts
@@ -1211,10 +1211,18 @@ impl<'a> Frame<'a> {
     /// clusters' culling data and CLAS rebuild right after it. False, with nothing to
     /// rebuild: the frame's [`Budgets::edit_triangles`] is spent or the edit is not ready,
     /// and the kernels must leave the edit unchanged this frame so that raster and ray
-    /// tracing keep agreeing. Call it before [`Frame::update_scenes`].
+    /// tracing keep agreeing. Vertices they move take motion from where they were the frame
+    /// before. Call it before [`Frame::update_scenes`].
     pub fn edit_dirty(&mut self, id: EditId) -> bool {
         assert!(!self.updated, "edits are marked before update_scenes");
-        self.core.mounts.edit_dirty(id)
+        self.core.mounts.edit_dirty(id, true)
+    }
+
+    /// Like [`edit_dirty`](Self::edit_dirty), but what kernels change has no motion this
+    /// frame: a vertex that jumps leaves no history to smear.
+    pub fn edit_dirty_without_motion(&mut self, id: EditId) -> bool {
+        assert!(!self.updated, "edits are marked before update_scenes");
+        self.core.mounts.edit_dirty(id, false)
     }
 
     /// What hot reload applied at this frame's step 1; always empty without the
@@ -1547,6 +1555,7 @@ impl<'a> Frame<'a> {
             list.end_pass();
             list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         }
+        core.mounts.record_edit_history(&mut list);
         for &(scene, root, batches, focus, _) in &roots {
             let mut sc = SceneCompute {
                 cmd: &mut list,
@@ -1644,6 +1653,7 @@ impl<'a> Frame<'a> {
                 passes: hierarchy.depth,
                 paged: hierarchy.paged,
                 max_clas: hierarchy.max_clusters,
+                parted_edits: core.mounts.has_parted_edit(),
                 slot: (self.id % u64::from(core.fif)) as usize,
             };
             let cuts = cpu.cuts.as_mut().expect("made with the root");

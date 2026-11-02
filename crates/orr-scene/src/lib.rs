@@ -107,9 +107,9 @@ pub use shaders::types::{
     BlasJob, ClusterRef, ClusterWork, CutGpu, CutKey, DecalBinGpu, DecalGpu, EditGpu, EditGroupGpu,
     EmissiveGpu, FeedbackGpu, GBufferGpu, GeneratedClusterGpu, GroupGpu, InstanceGpu, LightGpu,
     MaskGpu, MaterialGpu, MediumProxyGpu, MeshGpu, MeshLevel, ModelGpu, NodeItem, PartGpu,
-    ProducerBatch, ProducerClusterGpu, ProducerGpu, ProducerStateGpu, RasterGpu, RasterRoot,
-    RtCutGpu, SceneRoot, SkinMeshGpu, SkinStateGpu, SkinnedGpu, SkyStats, SlotCutGpu, SlotStateGpu,
-    TessStateGpu, TextureFeedbackGpu, TextureStreamGpu, TopologyGpu, VisibleCluster,
+    PartListGpu, ProducerBatch, ProducerClusterGpu, ProducerGpu, ProducerStateGpu, RasterGpu,
+    RasterRoot, RtCutGpu, SceneRoot, SkinMeshGpu, SkinStateGpu, SkinnedGpu, SkyStats, SlotCutGpu,
+    SlotStateGpu, TessStateGpu, TextureFeedbackGpu, TextureStreamGpu, TopologyGpu, VisibleCluster,
 };
 pub use skin::{SkinStats, SkinnedDesc};
 pub use stream::{BlobId, BlobTarget};
@@ -195,7 +195,7 @@ pub enum Error {
     UnknownEdit(EditId),
     #[error("{0:?} does not exist")]
     UnknownPage(PageId),
-    /// Skinned meshes and edits themselves cannot be edited.
+    /// An edit cannot be edited, nor a model without a mesh.
     #[error("{model:?} cannot be edited: {reason}")]
     NotEditable {
         model: ModelId,
