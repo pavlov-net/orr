@@ -1,12 +1,9 @@
 //! Welding, part assignment and the discrete levels of a mesh.
 
-use std::collections::HashMap;
-
-use super::hash;
-
 use meshopt::{SimplifyOptions, SimplifyVertex, VertexDataAdapter, VertexStream};
 use orr_pack::Aabb;
 use orr_pack::mesh::Part;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::maps::Displacement;
 use super::{Grid, MeshData, MeshSettings, Pivots, Skin};
@@ -290,9 +287,9 @@ pub(crate) fn pieces(w: &Welded, parts: &Parts) -> Vec<Piece> {
 pub(crate) fn seam_cells(
     w: &Welded,
     corners: impl IntoIterator<Item = (u32, [i32; 3])>,
-) -> hash::Set<[i32; 3]> {
-    let mut first: hash::Map<[i32; 3], u32> = hash::Map::default();
-    let mut seams = hash::Set::default();
+) -> FxHashSet<[i32; 3]> {
+    let mut first: FxHashMap<[i32; 3], u32> = FxHashMap::default();
+    let mut seams = FxHashSet::default();
     for (v, cell) in corners {
         let f = *first.entry(cell).or_insert(v);
         let (f, v) = (f as usize, v as usize);
@@ -306,9 +303,9 @@ pub(crate) fn seam_cells(
 /// Grid positions used by more than one piece: part and section borders.
 pub(crate) fn shared_cells<P: IntoIterator<Item = [i32; 3]>>(
     pieces: impl IntoIterator<Item = P>,
-) -> hash::Set<[i32; 3]> {
-    let mut owner: hash::Map<[i32; 3], usize> = hash::Map::default();
-    let mut shared = hash::Set::default();
+) -> FxHashSet<[i32; 3]> {
+    let mut owner: FxHashMap<[i32; 3], usize> = FxHashMap::default();
+    let mut shared = FxHashSet::default();
     for (pi, cells) in pieces.into_iter().enumerate() {
         for c in cells {
             if *owner.entry(c).or_insert(pi) != pi {
@@ -323,8 +320,8 @@ pub(crate) fn shared_cells<P: IntoIterator<Item = [i32; 3]>>(
 /// seam.
 pub(crate) fn vertex_flags(
     cell: [i32; 3],
-    shared: &hash::Set<[i32; 3]>,
-    seams: &hash::Set<[i32; 3]>,
+    shared: &FxHashSet<[i32; 3]>,
+    seams: &FxHashSet<[i32; 3]>,
 ) -> SimplifyVertex {
     let mut f = SimplifyVertex::None;
     if shared.contains(&cell) {
@@ -342,13 +339,13 @@ pub(crate) fn simplify(
     indices: &[u32],
     w: &Welded,
     grid: &Grid,
-    shared: &hash::Set<[i32; 3]>,
-    seams: &hash::Set<[i32; 3]>,
+    shared: &FxHashSet<[i32; 3]>,
+    seams: &FxHashSet<[i32; 3]>,
     target: f32,
     sloppy: bool,
 ) -> (Vec<u32>, f32) {
     // A compact vertex buffer of the piece, so the simplifier's work follows its size.
-    let mut local_of: HashMap<u32, u32> = HashMap::new();
+    let mut local_of: FxHashMap<u32, u32> = FxHashMap::default();
     let mut global = Vec::new();
     let local: Vec<u32> = indices
         .iter()
@@ -417,7 +414,7 @@ pub(crate) fn displacement_seams(
         return Vec::new();
     };
     let tolerance = (d.max - d.min) / 1024.0;
-    let mut uvs: HashMap<[i32; 3], Vec<[f32; 2]>> = HashMap::new();
+    let mut uvs: FxHashMap<[i32; 3], Vec<[f32; 2]>> = FxHashMap::default();
     for t in w.section_triangles(s) {
         for v in t {
             let e = uvs.entry(grid.cells[v as usize]).or_default();
@@ -460,7 +457,7 @@ pub(crate) fn displacement_seams(
 
 /// Edges of section `s` used by one triangle, by grid position.
 pub(crate) fn border_edges(w: &Welded, grid: &Grid, s: usize) -> usize {
-    let mut uses: HashMap<([i32; 3], [i32; 3]), u32> = HashMap::new();
+    let mut uses: FxHashMap<([i32; 3], [i32; 3]), u32> = FxHashMap::default();
     for t in w.section_triangles(s) {
         let c = t.map(|v| grid.cells[v as usize]);
         for i in 0..3 {

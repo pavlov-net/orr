@@ -21,6 +21,7 @@ ctt = { version = "=0.6.1", default-features = false, features = ["encoder-bc7en
 libloading = { workspace = true, optional = true }
 gltf = { version = "=1.4.1", default-features = false, features = ["utils", "names", "extras", "KHR_materials_emissive_strength", "KHR_materials_ior"] }
 half.workspace = true
+rustc-hash.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "hdr", "exr"] }
 ktx2 = "0.5"
 meshopt = "=0.7.0"

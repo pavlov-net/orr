@@ -8,7 +8,7 @@
 //! Producer entries and medium proxies (from `proxy_base`) sit in the global partition and
 //! their writes are mandatory.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use orr_gpu::{
@@ -17,6 +17,7 @@ use orr_gpu::{
     RtasOpDesc, Stages, Tlas, partition_translation,
 };
 use orr_math::IVec3;
+use rustc_hash::FxHashMap;
 
 use crate::Result;
 use crate::memory::UploadWindow;
@@ -185,7 +186,7 @@ pub(crate) struct Ptlas {
     partitions: Vec<PartitionCpu>,
     free: Vec<u32>,
     /// The partition of each cell that takes its next copies.
-    open: HashMap<IVec3, u32>,
+    open: FxHashMap<IVec3, u32>,
     slot_partition: Vec<u32>,
     /// Instances each slot's copy counts in its partition.
     slot_cost: Vec<u32>,
@@ -238,7 +239,7 @@ impl Ptlas {
                 })
                 .collect(),
             free: (0..partitions).rev().collect(),
-            open: HashMap::new(),
+            open: FxHashMap::default(),
             slot_partition: vec![PARTITION_NONE; desc.instance_capacity as usize],
             slot_cost: vec![0; desc.instance_capacity as usize],
             changed: BTreeSet::new(),

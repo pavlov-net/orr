@@ -24,6 +24,7 @@ use orr_pack::subd::{Page as SubdPage, SubdInfo};
 use orr_pack::texture::{TextureHeader, TextureInfo};
 use orr_pack::volume::VolumeInfo;
 use orr_pack::{Aabb, Archive, AssetId, Class, Codec};
+use rustc_hash::FxHashMap;
 
 use crate::accel::{
     self, AccelShared, ClusterInfo, MaskBlas, MeshInput, MeshRt, MountAccel, PageMicromap,
@@ -1861,9 +1862,9 @@ pub(crate) struct Mounts {
     retired: Vec<(u64, Resident)>,
     pub streaming: Streaming,
     /// The mount and mesh of each resident model.
-    owners: HashMap<ModelId, (MountId, u32)>,
+    owners: FxHashMap<ModelId, (MountId, u32)>,
     /// The mount and mesh of each resident mesh id.
-    mesh_owners: HashMap<u32, (MountId, u32)>,
+    mesh_owners: FxHashMap<u32, (MountId, u32)>,
     /// Section-mask BLAS by mesh id.
     masks: HashMap<u32, MeshMasks>,
     /// Scratch of mask builds, freed once their frame has completed.
@@ -2153,8 +2154,8 @@ impl Mounts {
             page_keys: Vec::new(),
             retired: Vec::new(),
             streaming: Streaming::new(device, budgets, accel, streams, fif)?,
-            owners: HashMap::new(),
-            mesh_owners: HashMap::new(),
+            owners: FxHashMap::default(),
+            mesh_owners: FxHashMap::default(),
             masks: HashMap::new(),
             transient: Vec::new(),
             edits: Vec::new(),
