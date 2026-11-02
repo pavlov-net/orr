@@ -8,8 +8,8 @@
 //! Accessors are read here, including the normalized and unnormalized integer forms
 //! `KHR_mesh_quantization` allows and sparse accessors. A texture's `EXT_texture_webp` image
 //! replaces its core `source`, so a texture may carry only the extension's source. An asset
-//! whose `minVersion` is not glTF 2.0 or 2.1, or without one whose `version` has a major other than
-//! 2, is refused.
+//! whose `minVersion` is not glTF 2.0 or 2.1, or without one whose `version` has a major other
+//! than 2, is refused, as is a document whose `weights` arrays do not match its morph targets.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -83,6 +83,38 @@ fn check_version(asset: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// The morph targets of a mesh: as many as its first primitive that has any. The other
+/// primitives that have any must have as many, and a `weights` array holds one per target.
+fn check_morph_weights(doc: &gltf::Document) -> Result<(), String> {
+    let targets = |mesh: &gltf::Mesh<'_>| {
+        let counts = mesh.primitives().map(|p| p.morph_targets().len());
+        counts.max().unwrap_or(0)
+    };
+    let check = |what: &str, index: usize, weights: Option<&[f32]>, n: usize| match weights {
+        Some(w) if w.len() != n => Err(format!(
+            "{what} {index}: {} weights for {n} morph targets",
+            w.len()
+        )),
+        _ => Ok(()),
+    };
+    for mesh in doc.meshes() {
+        let n = targets(&mesh);
+        let mut counts = mesh.primitives().map(|p| p.morph_targets().len());
+        if counts.any(|c| c != 0 && c != n) {
+            return Err(format!(
+                "mesh {}: primitives differ in their morph target counts",
+                mesh.index()
+            ));
+        }
+        check("mesh", mesh.index(), mesh.weights(), n)?;
+    }
+    for node in doc.nodes() {
+        let n = node.mesh().map_or(0, |m| targets(&m));
+        check("node", node.index(), node.weights(), n)?;
+    }
+    Ok(())
+}
+
 /// Opens a `.gltf` or `.glb` file's bytes; buffer URIs resolve against `dir`.
 pub(crate) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
     let (json_bytes, mut bin) = if bytes.starts_with(b"glTF") {
@@ -108,6 +140,7 @@ pub(crate) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
     }
     let root: gltf::json::Root = serde_json::from_value(json.clone()).map_err(|e| e.to_string())?;
     let doc = gltf::Document::from_json(root).map_err(|e| e.to_string())?;
+    check_morph_weights(&doc)?;
     let mut buffers = Vec::new();
     for b in doc.buffers() {
         let j = &json["buffers"][b.index()];

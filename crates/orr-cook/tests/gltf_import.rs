@@ -1744,6 +1744,93 @@ fn morph_targets_cook_at_each_nodes_default_weights() {
 }
 
 #[test]
+fn weights_that_do_not_match_the_morph_targets_are_refused() {
+    let d = dir("gltf-morph-counts");
+    let (pos, _, idx) = grid(1, |_, _| 0.0);
+    let path = d.join("morph.glb");
+    let refusal = |nodes: &str, meshes: &str| {
+        let mut g = Glb::default();
+        let pa = g.floats(&pos, "VEC3");
+        let da = g.floats(&vec![[0.0f32, 1.0, 0.0]; pos.len()], "VEC3");
+        let ia = g.indices(&idx);
+        let prim = |targets: usize| {
+            let target = format!(r#"{{"POSITION":{da}}}"#);
+            let targets = vec![target; targets].join(",");
+            format!(r#"{{"attributes":{{"POSITION":{pa}}},"indices":{ia},"targets":[{targets}]}}"#)
+        };
+        let meshes = meshes
+            .replace(
+                "PLAIN",
+                &format!(r#"{{"attributes":{{"POSITION":{pa}}},"indices":{ia}}}"#),
+            )
+            .replace("ONE", &prim(1))
+            .replace("TWO", &prim(2));
+        g.write(
+            &path,
+            &format!(
+                r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{nodes}],"meshes":[{meshes}]"#
+            ),
+        );
+        cook(&path, GltfSettings::default())
+            .err()
+            .map(|e| e.to_string())
+    };
+    let mesh_node = r#"{"mesh":0}"#;
+    // A primitive without targets beside one with them is valid, and takes no weights.
+    assert_eq!(
+        refusal(mesh_node, r#"{"primitives":[PLAIN,ONE],"weights":[0.5]}"#),
+        None
+    );
+    assert_eq!(
+        refusal(
+            r#"{"mesh":0,"weights":[0.5,0.5]}"#,
+            r#"{"primitives":[TWO]}"#
+        ),
+        None
+    );
+    for (nodes, meshes, want) in [
+        (
+            mesh_node,
+            r#"{"primitives":[TWO],"weights":[0.5]}"#,
+            "mesh 0: 1 weights for 2",
+        ),
+        (
+            mesh_node,
+            r#"{"primitives":[ONE],"weights":[0.5,0.5]}"#,
+            "mesh 0: 2 weights for 1",
+        ),
+        (
+            mesh_node,
+            r#"{"primitives":[PLAIN],"weights":[0.5]}"#,
+            "mesh 0: 1 weights for 0",
+        ),
+        (
+            r#"{"mesh":0,"weights":[1.0]}"#,
+            r#"{"primitives":[TWO]}"#,
+            "node 0: 1 weights for 2",
+        ),
+        (
+            r#"{"mesh":0,"weights":[1.0]}"#,
+            r#"{"primitives":[PLAIN]}"#,
+            "node 0: 1 weights for 0",
+        ),
+        (
+            r#"{"weights":[1.0]}"#,
+            r#"{"primitives":[ONE]}"#,
+            "node 0: 1 weights for 0",
+        ),
+        (
+            mesh_node,
+            r#"{"primitives":[ONE,TWO]}"#,
+            "mesh 0: primitives differ",
+        ),
+    ] {
+        let got = refusal(nodes, meshes).unwrap_or_else(|| panic!("{nodes} {meshes} cooked"));
+        assert!(got.contains(want), "{got}");
+    }
+}
+
+#[test]
 fn hidden_nodes_hide_their_subtrees() {
     let d = dir("gltf-visibility");
     let path = d.join("hidden.glb");
