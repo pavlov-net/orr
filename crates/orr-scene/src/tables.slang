@@ -412,6 +412,12 @@ public MediumProxyGpu scene_proxy(SceneRoot* s, uint instance_index)
     return s.proxies[instance_index - s.proxy_base];
 }
 
+// Render-space center of proxy `p`'s box.
+public float3 proxy_render_center(SceneRoot* s, MediumProxyGpu p)
+{
+    return float3((p.cell - s.origin_cell.xyz) << uint(s.origin_cell.w)) + p.offset;
+}
+
 // The slot a copy names.
 public uint copy_slot(uint copy)
 {

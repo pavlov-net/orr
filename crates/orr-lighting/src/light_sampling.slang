@@ -1075,6 +1075,19 @@ public float3 medium_source<M : IMedium>(LightSetGpu* set, MediumPoint m, float3
     return source;
 }
 
+// Multiply-scattered radiance per unit `sigma_s` at point `x` of the linked medium `M`, from
+// every directional light.
+public float3 multiple_scattered<M : IMedium>(LightSetGpu* set, float3 x)
+{
+    float3 light = float3(0.0);
+    for (uint j = 0; j < set.directional_count; j++)
+    {
+        uint id = set.directional_ids[j];
+        light += directional_illuminance(set, id) * M.multiple_scattering(set.scene.medium, x, set.scene.lights[id].direction);
+    }
+    return light;
+}
+
 // Light the linked medium `M` scatters toward `origin` along the `t` m segment from `origin`
 // along unit `dir`, from every directional light and the medium's own emission, marched in
 // `steps` steps offset by `jitter` in [0, 1); `transmittance` is the segment's. Traces no

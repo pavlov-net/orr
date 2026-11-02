@@ -1,4 +1,4 @@
-// Medium proxies: boxes of participating medium that shadow rays take transmittance through
+// Medium proxies: boxes of participating medium that shadow and camera rays march through
 // (TLAS mask MASK_MEDIUM, candidate class CLASS_MEDIUM). A proxy's PTLAS instance places the
 // cube [-1, 1]^3 of its object space; the cube maps onto a box of the proxy's volume space,
 // where its density is a grid of a resident volume, or 1 without one.
@@ -88,4 +88,58 @@ public float proxy_majorant_span(MediumProxyGpu p, float3 o, float3 d, float t, 
     float3 u0 = (proxy_volume_point(p, o) - v.origin) * v.inv_voxel_size;
     float3 du = p.box_half * d * v.inv_voxel_size;
     return e * max(volume_majorant_span(v, p.grid, u0, du, t, t_exit), 0.0);
+}
+
+// The span [t0, t1] of the object-space ray `o + d * t` inside the cube [-1, 1]^3, from 0 to
+// at most `t_max`; false where the ray misses it.
+public bool proxy_span(float3 o, float3 d, float t_max, out float t0, out float t1)
+{
+    float3 inv = select(d != 0.0, 1.0 / d, float3(1e30));
+    float3 a = (-1.0 - o) * inv;
+    float3 b = (1.0 - o) * inv;
+    float3 lo = min(a, b);
+    float3 hi = max(a, b);
+    t0 = max(max(lo.x, max(lo.y, lo.z)), 0.0);
+    t1 = min(min(hi.x, min(hi.y, hi.z)), t_max);
+    return t1 > t0;
+}
+
+// What a `proxy_march` walks and steps through.
+public interface IProxyStep
+{
+    // At least the largest channel of `sigma_t` along the stretch from `t` that one majorant cell
+    // covers, and the t at which it ends.
+    float majorant(float t, out float t_exit);
+    // A step of `h` at `t` along the ray.
+    [mutating]
+    void step(float t, float h);
+}
+
+// Majorant cells a march walks at most; the cap only guards against a walk that stops advancing.
+static const uint PROXY_MARCH_CELLS = 256;
+
+// Marches over [t0, t1] in steps of `h` at `t0 + (k + jitter) * h`, skipping the steps in empty
+// majorant cells.
+public void proxy_march<V : IProxyStep>(float t0, float t1, float h, float jitter, inout V visit)
+{
+    // `next` is the first k not yet taken.
+    uint next = 0;
+    uint steps = uint(ceil((t1 - t0) / h)) + 1;
+    float t = t0;
+    for (uint cell = 0; cell < PROXY_MARCH_CELLS && t < t1; cell++)
+    {
+        float t_exit;
+        float m = visit.majorant(t, t_exit);
+        float end = min(max(t_exit, t + 1e-5 * (t1 - t0)), t1);
+        uint k = max(next, uint(max(ceil((t - t0) / h - jitter), 0.0)));
+        for (; m > 0.0 && k < steps; k++)
+        {
+            float x = t0 + (float(k) + jitter) * h;
+            if (x >= end)
+                break;
+            visit.step(x, h);
+        }
+        next = k;
+        t = end;
+    }
 }
