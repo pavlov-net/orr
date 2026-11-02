@@ -1722,6 +1722,88 @@ fn motion_vectors_reproject_the_previous_frame() {
     assert_clean();
 }
 
+#[test]
+fn a_change_of_aspect_adds_no_motion() {
+    let _serial = serial();
+    let mut w = World::new(&KernelSet {
+        modules: &[],
+        surfaces: 0,
+    });
+    let placed = place(&mut w, &showcase());
+    let eye = Vec3::new(0.3, 2.6, 5.5);
+    let target = Vec3::new(0.0, 0.6, 0.0);
+    let mut frame = 0;
+    let mut motion_at = |extent: [u32; 2], eye: Vec3, reset_history: bool| {
+        frame += 1;
+        let list = [placed.scene];
+        let mut f = w
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(frame),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        f.scene(placed.scene).unwrap().set_focus(eye.as_dvec3());
+        let view = f
+            .raster_view(&ViewDesc {
+                scene: placed.scene,
+                history: placed.history,
+                position: eye.as_dvec3(),
+                rotation: look(eye, target),
+                projection: Projection {
+                    fov_y: 0.9,
+                    near: 0.1,
+                },
+                lens: Lens::default(),
+                render_extent: UVec2::from(extent),
+                output_extent: UVec2::from(extent),
+                jitter: Vec2::new(0.25, -0.125),
+                reset_history,
+                mip_bias: 0.0,
+                texture_filter: TextureFilter::Hardware,
+            })
+            .unwrap();
+        wait(f.end(&[]).unwrap());
+        texels::<[u16; 2]>(&view.motion)
+            .iter()
+            .map(|m| Vec2::from(m.map(|bits| half::f16::from_bits(bits).to_f32())))
+            .collect::<Vec<_>>()
+    };
+    const WIDE: [u32; 2] = [320, 180];
+    const NARROW: [u32; 2] = [240, 180];
+    fn largest(motion: impl IntoIterator<Item = Vec2>) -> f32 {
+        motion.into_iter().fold(0.0, |m, v| {
+            assert!(v.is_finite(), "motion {v}");
+            m.max(v.abs().max_element())
+        })
+    }
+
+    motion_at(WIDE, eye, true);
+    let resized = largest(motion_at(NARROW, eye, false));
+    assert!(
+        resized < 1e-5,
+        "a still camera moves {resized} of the image"
+    );
+
+    // A moving camera reports the same motion whether or not the extent changed with it.
+    let moved = eye + Vec3::new(0.4, 0.0, 0.0);
+    motion_at(NARROW, eye, true);
+    let steady = motion_at(NARROW, moved, false);
+    motion_at(WIDE, eye, true);
+    let across = motion_at(NARROW, moved, false);
+    assert!(
+        largest(steady.iter().copied()) > 0.01,
+        "the camera moves too little to test"
+    );
+    let apart = largest(steady.iter().zip(&across).map(|(a, b)| *a - *b));
+    assert!(
+        apart < 1e-3,
+        "the resize moves motion by {apart} of the image"
+    );
+    assert_clean();
+}
+
 /// The raster error code most pixels of copy `id` carry.
 fn error_code(frame: &Frame, id: u32) -> u32 {
     let mut codes: Vec<u32> = frame

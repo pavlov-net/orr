@@ -312,8 +312,8 @@ pub(crate) struct ViewTargets {
     pub motion: Target,
     pub hzb: Target,
     transient: Transient,
-    /// The scene the HZB holds the last render of.
-    pub hzb_scene: Option<SceneId>,
+    /// The scene and output extent the HZB holds the last render of.
+    pub hzb_view: Option<(SceneId, [u32; 2])>,
 }
 
 fn tiles(extent: [u32; 2]) -> [u32; 2] {
@@ -435,7 +435,7 @@ impl ViewTargets {
             motion: Target::d2(device, Format::Rg16Float, s.extent, "motion")?,
             hzb,
             transient: Transient::take(arena),
-            hzb_scene: None,
+            hzb_view: None,
         };
         for target in [&t.depth, &t.motion, &t.hzb] {
             list.discard(&target.texture);
