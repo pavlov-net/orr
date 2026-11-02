@@ -986,7 +986,7 @@ fn traverse_frame(
         .unwrap();
     {
         let mut s = f.scene(scene).unwrap();
-        s.set_focus(DVec3::new(0.0, 3.0, 0.0), 1000.0);
+        s.set_focus(DVec3::new(0.0, 3.0, 0.0));
         write(&mut s);
     }
     f.end(&[]).unwrap();
@@ -1842,7 +1842,7 @@ fn streamed_frame(
         .unwrap();
     {
         let mut s = f.scene(scene).unwrap();
-        s.set_focus(DVec3::new(0.0, 3.0, 0.0), 1000.0);
+        s.set_focus(DVec3::new(0.0, 3.0, 0.0));
         write(&mut s);
     }
     let mut root = GpuPtr::NULL;
@@ -3177,7 +3177,7 @@ fn the_resolve_writes_the_color_a_neural_set_decodes() {
         let mut f = scenes.begin_frame(&desc).unwrap();
         f.scene(scene)
             .unwrap()
-            .set_focus(DVec3::new(0.0, 0.0, f64::from(eye)), 1000.0);
+            .set_focus(DVec3::new(0.0, 0.0, f64::from(eye)));
         let view = f
             .raster_view(&ViewDesc {
                 scene,

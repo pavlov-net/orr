@@ -229,7 +229,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         };
         f.scene(scene)
             .expect("scene writer")
-            .set_focus(eye.as_dvec3(), extent[1] as f32 / FOV_Y);
+            .set_focus(eye.as_dvec3());
         let view = f
             .raster_view(&ViewDesc {
                 scene,

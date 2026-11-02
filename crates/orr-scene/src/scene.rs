@@ -405,6 +405,9 @@ pub(crate) struct SkinRange {
     pub live: u32,
 }
 
+/// What a scene chooses geometry for before any view has asked ([`crate::Frame::request_detail`]).
+const DEFAULT_PIXELS_PER_RADIAN: f32 = 1000.0;
+
 pub(crate) struct SceneCpu {
     pub slots: RangeAllocator,
     /// The model of each slot handed out.
@@ -426,7 +429,12 @@ pub(crate) struct SceneCpu {
     /// Index = TransformGroupId; entry 0 is the null group.
     pub groups: Vec<Option<Group>>,
     pub records: Vec<Record>,
-    pub focus: Option<(DVec3, f32)>,
+    pub focus: Option<DVec3>,
+    /// What the scene's per-frame work chooses geometry for, from the requests the last
+    /// update took.
+    pub pixels_per_radian: f32,
+    /// The largest request since the last update.
+    pub requested_detail: Option<f32>,
     pub origin_cell: IVec3,
     pub environment: u64,
     pub medium: u64,
@@ -483,6 +491,13 @@ pub(crate) struct Scene {
 /// 32-bit words in `bytes`.
 fn words(bytes: usize) -> u32 {
     (bytes / 4) as u32
+}
+
+impl SceneCpu {
+    /// The focus and the pixels per radian of the scene's per-frame work.
+    pub(crate) fn focus_detail(&self) -> Option<(DVec3, f32)> {
+        self.focus.map(|f| (f, self.pixels_per_radian))
+    }
 }
 
 impl Scene {
@@ -568,6 +583,8 @@ impl Scene {
                 groups: vec![None],
                 records,
                 focus: None,
+                pixels_per_radian: DEFAULT_PIXELS_PER_RADIAN,
+                requested_detail: None,
                 origin_cell: IVec3::ZERO,
                 environment: 0,
                 medium: 0,
@@ -1641,9 +1658,8 @@ impl<'f> SceneWriter<'f> {
         self.scene.cpu.lock().unwrap().surface_data = data.0;
     }
 
-    /// The primary view's camera and pixels per radian (render height / vertical fov):
-    /// the eye of the scene's per-frame work and the anchor of its render origin.
-    pub fn set_focus(&mut self, focus: DVec3, pixels_per_radian: f32) {
-        self.scene.cpu.lock().unwrap().focus = Some((focus, pixels_per_radian));
+    /// The eye of the scene's per-frame work and the anchor of its render origin.
+    pub fn set_focus(&mut self, focus: DVec3) {
+        self.scene.cpu.lock().unwrap().focus = Some(focus);
     }
 }

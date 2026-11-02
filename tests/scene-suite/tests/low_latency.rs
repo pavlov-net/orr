@@ -65,7 +65,7 @@ fn every_frame_id_gets_a_complete_ordered_report() {
             f.latency_marker(ConsumerMarker::SimulationStart);
             f.scene(s)
                 .unwrap()
-                .set_focus(DVec3::new(i as f64, 0.0, 0.0), 1000.0);
+                .set_focus(DVec3::new(i as f64, 0.0, 0.0));
             f.latency_marker(ConsumerMarker::SimulationEnd);
             f.update_scenes(&mut |_| {}).unwrap();
             let id = f.id();

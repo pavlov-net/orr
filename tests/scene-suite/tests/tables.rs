@@ -452,13 +452,13 @@ fn lights_move_with_the_render_origin() {
         w.set_light(orr_scene::LightId(0), Some(&light)).unwrap();
         w.set_light(orr_scene::LightId(1), Some(&rect)).unwrap();
         w.set_light(orr_scene::LightId(2), Some(&sun)).unwrap();
-        w.set_focus(far + DVec3::new(10.0, 0.0, 0.0), 1000.0);
+        w.set_focus(far + DVec3::new(10.0, 0.0, 0.0));
     });
     assert_eq!(origin_of(&root), DVec3::new(19_968.0, 0.0, -9_216.0));
     check(&root);
     // A focus 2 km away moves the origin and the lights without rewriting them.
     let root = run_frame(&mut scenes, s, |w| {
-        w.set_focus(far + DVec3::new(2000.0, 0.0, 0.0), 1000.0);
+        w.set_focus(far + DVec3::new(2000.0, 0.0, 0.0));
     });
     assert_eq!(origin_of(&root).x, 22_016.0);
     check(&root);
@@ -477,7 +477,7 @@ fn view_constants_project_and_reconstruct_render_positions() {
     let jitter = Vec2::new(0.3, -0.4);
     let list = [s];
     let mut f = scenes.begin_frame(&frame(&list)).unwrap();
-    f.scene(s).unwrap().set_focus(camera, 1000.0);
+    f.scene(s).unwrap().set_focus(camera);
     f.update_scenes(&mut |_| {}).unwrap();
     let view = f
         .raster_view(&ViewDesc {
@@ -659,7 +659,7 @@ fn copies_are_placed_relative_to_the_eye_from_cells() {
             user_tag: 0,
         })
         .unwrap();
-        w.set_focus(camera, 1000.0);
+        w.set_focus(camera);
     }
     f.update_scenes(&mut |_| {}).unwrap();
     let view = f

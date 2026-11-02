@@ -164,7 +164,7 @@ impl Rig {
                 w.set_light(*id, Some(&Light::Directional(*l))).unwrap();
                 self.lights.push(*id);
             }
-            w.set_focus(focus, 1000.0);
+            w.set_focus(focus);
             w.set_environment(self.sky.data());
             w.set_medium(self.sky.data());
         }

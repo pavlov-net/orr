@@ -39,17 +39,24 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use examples::average::Average;
+use examples::mesh::MeshBuilder;
 use examples::scene::{FOV_Y, Showcase, TARGET, orbit_eye};
-use examples::{Capture, Options, Workers, assert_clean, device, enable_dlss, fixed_time};
+use examples::{
+    Capture, Options, Workers, assert_clean, device, enable_dlss, fixed_time, mount_at,
+};
 use orr::orr_gpu::{ClearColor, ColorAttachment, ColorLoad, Format, Rendering};
 use orr::orr_gpu::{QueueKind, TextureDesc, TextureMemory, TextureUsage};
+use orr::orr_pack::material::Material;
+use orr::orr_pack::{AssetId, Target};
 use orr::{
-    DlssMode, DlssQuality, FrameDesc, HookPass, Lens, LitView, Projection, Reconstruction,
-    ReferenceSettings, Renderer, RendererDesc, ScreenshotRequest, TextureFilter, ThinLens,
+    Affine3, DlssMode, DlssQuality, FrameDesc, GroupWriter, HookPass, InstanceFlags, InstancesDesc,
+    Lens, LitView, PackSource, Projection, Reconstruction, ReferenceSettings, Renderer,
+    RendererDesc, SceneId, ScreenshotRequest, TextureFilter, ThinLens, TransformGroupDesc,
     TransparencyPass, ViewHistoryId, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
-use orr_math::Vec3;
+use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source};
 use orr_math::camera::rh::view;
+use orr_math::{DVec3, Vec3};
 use orr_scene::testing::{Image, Pixels, Tolerance, check, flip};
 
 /// A smaller forest than the bench's, so the debug build renders it in reasonable time.
@@ -220,6 +227,30 @@ struct StillSettings {
     orbit: bool,
 }
 
+/// The showcase's camera at `eye`.
+fn still_view<'a>(
+    scene: SceneId,
+    history: ViewHistoryId,
+    eye: Vec3,
+    reset_history: bool,
+    target: ViewTarget<'a>,
+) -> LitView<'a> {
+    LitView {
+        scene,
+        history,
+        position: eye.as_dvec3(),
+        rotation: view::look_at_quat(eye, TARGET, Vec3::Y).inverse(),
+        projection: Projection {
+            fov_y: FOV_Y,
+            near: 0.05,
+        },
+        lens: Lens::default(),
+        reset_history,
+        texture_filter: TextureFilter::Hardware,
+        target,
+    }
+}
+
 /// The showcase's scene and a still camera, on one renderer: its pipelines take long to compile
 /// in a debug build with the validation layer.
 struct StillShowcase {
@@ -285,10 +316,7 @@ impl StillShowcase {
             let id = f.id();
             f.scene(self.showcase.scene)
                 .expect("scene writer")
-                .set_focus(eye.as_dvec3(), extent[1] as f32 / FOV_Y);
-            if i == 0 {
-                f.list().expect("frame list").discard(&target);
-            }
+                .set_focus(eye.as_dvec3());
             let output = ViewOutput {
                 reconstruction: settings.reconstruction,
                 screenshot: (i + 1 == frames)
@@ -319,20 +347,13 @@ impl StillShowcase {
             };
             let rendered = f
                 .render_view(
-                    &LitView {
-                        scene: self.showcase.scene,
-                        history: self.history,
-                        position: eye.as_dvec3(),
-                        rotation: view::look_at_quat(eye, TARGET, Vec3::Y).inverse(),
-                        projection: Projection {
-                            fov_y: FOV_Y,
-                            near: 0.05,
-                        },
-                        lens: Lens::default(),
-                        reset_history: i == 0,
-                        texture_filter: TextureFilter::Hardware,
-                        target: ViewTarget::Texture(&target),
-                    },
+                    &still_view(
+                        self.showcase.scene,
+                        self.history,
+                        eye,
+                        i == 0,
+                        ViewTarget::Texture(&target),
+                    ),
                     &ViewLighting {
                         reference: settings.reference.then(|| ReferenceSettings {
                             lens: Some(ThinLens {
@@ -366,6 +387,171 @@ impl StillShowcase {
             mode,
         }
     }
+
+    /// Adds a sphere simplified as a cluster DAG, whose cut follows the detail asked for; the
+    /// showcase's own meshes have one level.
+    fn add_dag_sphere(&mut self) {
+        const NAME: &str = "dag sphere";
+        let mut sphere = MeshBuilder::default();
+        sphere.sphere(0, TARGET + Vec3::new(0.0, 1.0, 3.0), 1.0, 96);
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(
+                Target::Memory,
+                vec![AssetSpec {
+                    name: NAME.into(),
+                    source: Source::Mesh {
+                        mesh: sphere.finish(),
+                        materials: vec![Material::default()],
+                        settings: MeshSettings {
+                            lod: LodMode::Dag,
+                            ..MeshSettings::default()
+                        },
+                    },
+                }],
+            )],
+        };
+        let pack = orr_cook::cook(&manifest, &Default::default())
+            .expect("cook")
+            .memory
+            .remove(0);
+        let (mount, frame) = mount_at(&mut self.renderer, PackSource::Memory(pack), self.frame + 1);
+        let model = self
+            .renderer
+            .model(mount, AssetId::from_name(NAME))
+            .expect("model");
+        self.frame = frame + 1;
+        let listed = [self.showcase.scene];
+        let f = self
+            .renderer
+            .begin_frame(FrameDesc {
+                time: fixed_time(self.frame),
+                scenes: &listed,
+                display: None,
+            })
+            .expect("begin frame");
+        let mut w = f.scene(self.showcase.scene).expect("scene writer");
+        let group = w
+            .create_transform_group(&TransformGroupDesc {
+                count: 1,
+                writer: GroupWriter::Cpu,
+                anchor: DVec3::ZERO,
+            })
+            .expect("transform group");
+        w.transforms(group, 0, 1)
+            .expect("transforms")
+            .fill(Affine3::IDENTITY);
+        w.add_instances(&InstancesDesc {
+            model,
+            copies: 1,
+            transforms: group,
+            first: 0,
+            pose: None,
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 1000.0,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .expect("instances");
+        drop(w);
+        f.end().expect("end frame");
+    }
+
+    /// The raster candidate clusters the scene's traversal chooses for these views of the still
+    /// camera, rendered together with their reconstruction requests, and prepared before the
+    /// scene update or not.
+    fn detail(&mut self, views: &[([u32; 2], Reconstruction)], prepared: bool) -> u32 {
+        const FRAMES: u32 = 8;
+        let scene = self.showcase.scene;
+        let listed = [scene];
+        let histories: Vec<ViewHistoryId> = views
+            .iter()
+            .map(|_| self.renderer.create_view_history().expect("view history"))
+            .collect();
+        let eye = orbit_eye(viewer::STILL_ANGLE);
+        let lighting = ViewLighting::default();
+        let mut last = None;
+        for i in 0..FRAMES {
+            self.frame += 1;
+            let mut f = self
+                .renderer
+                .begin_frame(FrameDesc {
+                    time: fixed_time(self.frame),
+                    scenes: &listed,
+                    display: None,
+                })
+                .expect("begin frame");
+            f.scene(scene)
+                .expect("scene writer")
+                .set_focus(eye.as_dvec3());
+            let lit: Vec<(LitView<'_>, ViewOutput)> = views
+                .iter()
+                .zip(&histories)
+                .map(|(&(extent, reconstruction), &history)| {
+                    let target = ViewTarget::Radiance { extent };
+                    let view = still_view(scene, history, eye, i == 0, target);
+                    let output = ViewOutput {
+                        reconstruction,
+                        ..ViewOutput::default()
+                    };
+                    (view, output)
+                })
+                .collect();
+            if prepared {
+                for (view, output) in &lit {
+                    f.prepare_view(view, &lighting, output).expect("prepare");
+                }
+                f.update_scenes(&mut |_| {}).expect("update scenes");
+            }
+            for (view, output) in &lit {
+                f.render_view(view, &lighting, output, &mut ViewHooks::default())
+                    .expect("render view");
+            }
+            last = Some(f.end().expect("end frame"));
+        }
+        device()
+            .queue(QueueKind::Render)
+            .expect("render queue")
+            .wait(last.expect("a frame"), Duration::from_secs(30))
+            .expect("wait");
+        let detail = self.renderer.stats().cuts.candidate_clusters;
+        for history in histories {
+            self.renderer.destroy_view_history(history);
+        }
+        detail
+    }
+}
+
+/// A scene chooses its geometry for the render size of its sharpest view: upscaling to any
+/// output chooses what a native render at the render size does, with the view prepared before
+/// the scene update or not, and a second, smaller view changes nothing.
+#[test]
+fn scene_detail_follows_the_render_size_of_its_sharpest_view() {
+    let _serial = serial();
+    let mut still = StillShowcase::new();
+    still.add_dag_sphere();
+    let off = Reconstruction::Off;
+    let (small, large) = ([160, 90], [640, 360]);
+    // Loads the pages the larger view's cut takes.
+    still.detail(&[(large, off)], false);
+    let native = still.detail(&[(large, off)], false);
+    let coarse = still.detail(&[(small, off)], false);
+    assert!(
+        native > coarse,
+        "clusters: {native} at {large:?}, {coarse} at {small:?}"
+    );
+    assert_eq!(still.detail(&[(large, off)], true), native);
+    let both = [(small, off), (large, off)];
+    assert_eq!(still.detail(&both, true), native);
+    assert_eq!(still.detail(&both, false), native);
+    if enable_dlss(&mut still.renderer) {
+        let upscaled = [([960, 540], Reconstruction::Quality(DlssQuality::Quality))];
+        assert_eq!(still.detail(&upscaled, false), native);
+        assert_eq!(still.detail(&upscaled, true), native);
+    } else {
+        log::warn!("no upscaled case: NGX offers no ray reconstruction here");
+    }
+    assert_clean();
 }
 
 /// `render_view` through DLSS ray reconstruction on one renderer: each request renders at the

@@ -954,7 +954,9 @@ impl Plane {
             if let Some(desc) = desc {
                 w.set_producer(PLANE, Some(desc)).unwrap();
             }
-            w.set_focus(focus.as_dvec3(), EXTENT[1] as f32 / fov_y);
+            w.set_focus(focus.as_dvec3());
+            f.request_detail(self.scene, EXTENT[1] as f32 / fov_y)
+                .unwrap();
         }
         let emit = desc.is_some();
         let g = self.gpu.each_ref().map(orr_gpu::Allocation::gpu);
@@ -2143,7 +2145,9 @@ impl CageScene {
         {
             let mut w = f.scene(self.scene).unwrap();
             write(&mut w);
-            w.set_focus(focus.as_dvec3(), EXTENT[1] as f32 / fov_y);
+            w.set_focus(focus.as_dvec3());
+            f.request_detail(self.scene, EXTENT[1] as f32 / fov_y)
+                .unwrap();
         }
         f.update_scenes(&mut |_| {}).unwrap();
         let view = f

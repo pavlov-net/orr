@@ -295,7 +295,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         };
         {
             let mut w = f.scene(scene).expect("scene writer");
-            w.set_focus(EYE.as_dvec3(), extent[1] as f32 / FOV_Y);
+            w.set_focus(EYE.as_dvec3());
             let lit = lights(degrees, moon_albedo);
             for (id, light) in [SUN, SECOND_SUN, MOON].into_iter().zip(lit) {
                 w.set_light(id, Some(&Light::Directional(light)))
@@ -305,41 +305,36 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         if i == 0 {
             sky.skip_fades();
         }
-        f.update_scenes(&mut |c| sky.record(c, &[]).expect("sky passes"))
-            .expect("update scenes");
-        if let Some(t) = headless_target.as_ref().filter(|_| i == 0) {
-            f.list().expect("frame list").discard(t);
-        }
+        let view = LitView {
+            scene,
+            history,
+            position: EYE.as_dvec3(),
+            rotation: view::look_at_quat(EYE, TARGET, Vec3::Y).inverse(),
+            projection: Projection {
+                fov_y: FOV_Y,
+                near: 0.05,
+            },
+            lens: Lens::default(),
+            reset_history: i == 0,
+            texture_filter: TextureFilter::Hardware,
+            target,
+        };
         let output = ViewOutput {
             screenshot: (capture && final_frame)
                 .then_some(ScreenshotRequest::Display { include_ui: false }),
             ..ViewOutput::default()
         };
+        f.prepare_view(&view, &ViewLighting::default(), &output)
+            .expect("prepare view");
+        f.update_scenes(&mut |c| sky.record(c, &[]).expect("sky passes"))
+            .expect("update scenes");
         let mut average = average.hook(&f, i, extent);
         let mut hooks = ViewHooks {
             scene_referred: still.then_some(&mut average as &mut dyn FnMut(&mut HookPass<'_, '_>)),
             ..ViewHooks::default()
         };
-        f.render_view(
-            &LitView {
-                scene,
-                history,
-                position: EYE.as_dvec3(),
-                rotation: view::look_at_quat(EYE, TARGET, Vec3::Y).inverse(),
-                projection: Projection {
-                    fov_y: FOV_Y,
-                    near: 0.05,
-                },
-                lens: Lens::default(),
-                reset_history: i == 0,
-                texture_filter: TextureFilter::Hardware,
-                target,
-            },
-            &ViewLighting::default(),
-            &output,
-            &mut hooks,
-        )
-        .expect("render view");
+        f.render_view(&view, &ViewLighting::default(), &output, &mut hooks)
+            .expect("render view");
         last = Some((id, f.end().expect("end frame")));
     }
 

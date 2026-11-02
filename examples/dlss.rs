@@ -203,7 +203,7 @@ fn run(options: &Options) {
         overlay.layout(extent, time, &text);
         f.scene(scene)
             .expect("scene writer")
-            .set_focus(eye.as_dvec3(), extent[1] as f32 / FOV_Y);
+            .set_focus(eye.as_dvec3());
         let width = f64::from(extent[0]);
         let mut ui = |pass: &mut orr::UiPass<'_, '_>| {
             overlay.paint(pass, id);
@@ -423,7 +423,7 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
         };
         f.scene(scene)
             .expect("scene writer")
-            .set_focus(eye.as_dvec3(), render[1] as f32 / FOV_Y);
+            .set_focus(eye.as_dvec3());
         let view = f
             .raster_view(&ViewDesc {
                 scene,
