@@ -196,74 +196,82 @@ impl Shared {
         };
         let bias = r.depth_bias.unwrap_or_default();
         let dynamic = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        self.create_pipeline(extra, name, "vkCreateGraphicsPipelines", |cache, next| {
-            let mut stage_chains: Vec<_> = parts.iter().map(|(_, p)| p.chain()).collect();
-            let stages: Vec<_> = stage_chains
-                .iter_mut()
-                .zip(&parts)
-                .map(|(c, (stage, _))| c.info(*stage))
-                .collect();
-            let viewport = vk::PipelineViewportStateCreateInfo::default()
-                .viewport_count(1)
-                .scissor_count(1);
-            let mut conservative =
-                vk::PipelineRasterizationConservativeStateCreateInfoEXT::default()
-                    .conservative_rasterization_mode(
-                        vk::ConservativeRasterizationModeEXT::OVERESTIMATE,
-                    );
-            let mut raster = vk::PipelineRasterizationStateCreateInfo::default()
-                .polygon_mode(match r.fill {
-                    Fill::Solid => vk::PolygonMode::FILL,
-                    Fill::Lines => vk::PolygonMode::LINE,
-                })
-                .cull_mode(match r.cull {
-                    Cull::None => vk::CullModeFlags::NONE,
-                    Cull::Front => vk::CullModeFlags::FRONT,
-                    Cull::Back => vk::CullModeFlags::BACK,
-                })
-                .front_face(match r.front_face {
-                    FrontFace::CounterClockwise => vk::FrontFace::COUNTER_CLOCKWISE,
-                    FrontFace::Clockwise => vk::FrontFace::CLOCKWISE,
-                })
-                .depth_bias_enable(r.depth_bias.is_some())
-                .depth_bias_constant_factor(bias.constant)
-                .depth_bias_slope_factor(bias.slope)
-                .depth_bias_clamp(bias.clamp)
-                .line_width(1.0);
-            if r.conservative {
-                raster = raster.push(&mut conservative);
-            }
-            let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-                .rasterization_samples(vk::SampleCountFlags::from_raw(d.samples));
-            let depth =
-                d.depth
-                    .map_or_else(vk::PipelineDepthStencilStateCreateInfo::default, |t| {
-                        vk::PipelineDepthStencilStateCreateInfo::default()
-                            .depth_test_enable(true)
-                            .depth_write_enable(t.write)
-                            .depth_compare_op(vk_compare(t.compare))
-                    });
-            let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blends);
-            let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
-            let mut rendering = vk::PipelineRenderingCreateInfo::default()
-                .color_attachment_formats(&colors)
-                .depth_attachment_format(depth_format)
-                .stencil_attachment_format(stencil_format);
-            rendering.p_next = next;
-            let mut info = vk::GraphicsPipelineCreateInfo::default()
-                .stages(&stages)
-                .viewport_state(&viewport)
-                .rasterization_state(&raster)
-                .multisample_state(&multisample)
-                .depth_stencil_state(&depth)
-                .color_blend_state(&blend)
-                .dynamic_state(&dynamic);
-            info.p_next = std::ptr::from_ref(&rendering).cast();
-            // SAFETY: valid create info; the SPIR-V was validated by the shader build.
-            unsafe { self.device.create_graphics_pipelines(cache, &[info], None) }
-                .map(|p| p[0])
-                .map_err(|(_, e)| e)
-        })
+        let stages: Vec<_> = parts.iter().map(|(_, p)| p).collect();
+        self.create_pipeline(
+            &stages,
+            extra,
+            name,
+            "vkCreateGraphicsPipelines",
+            |cache, next| {
+                let mut stage_chains: Vec<_> = parts.iter().map(|(_, p)| p.chain()).collect();
+                let stages: Vec<_> = stage_chains
+                    .iter_mut()
+                    .zip(&parts)
+                    .map(|(c, (stage, _))| c.info(*stage))
+                    .collect();
+                let viewport = vk::PipelineViewportStateCreateInfo::default()
+                    .viewport_count(1)
+                    .scissor_count(1);
+                let mut conservative =
+                    vk::PipelineRasterizationConservativeStateCreateInfoEXT::default()
+                        .conservative_rasterization_mode(
+                            vk::ConservativeRasterizationModeEXT::OVERESTIMATE,
+                        );
+                let mut raster = vk::PipelineRasterizationStateCreateInfo::default()
+                    .polygon_mode(match r.fill {
+                        Fill::Solid => vk::PolygonMode::FILL,
+                        Fill::Lines => vk::PolygonMode::LINE,
+                    })
+                    .cull_mode(match r.cull {
+                        Cull::None => vk::CullModeFlags::NONE,
+                        Cull::Front => vk::CullModeFlags::FRONT,
+                        Cull::Back => vk::CullModeFlags::BACK,
+                    })
+                    .front_face(match r.front_face {
+                        FrontFace::CounterClockwise => vk::FrontFace::COUNTER_CLOCKWISE,
+                        FrontFace::Clockwise => vk::FrontFace::CLOCKWISE,
+                    })
+                    .depth_bias_enable(r.depth_bias.is_some())
+                    .depth_bias_constant_factor(bias.constant)
+                    .depth_bias_slope_factor(bias.slope)
+                    .depth_bias_clamp(bias.clamp)
+                    .line_width(1.0);
+                if r.conservative {
+                    raster = raster.push(&mut conservative);
+                }
+                let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+                    .rasterization_samples(vk::SampleCountFlags::from_raw(d.samples));
+                let depth =
+                    d.depth
+                        .map_or_else(vk::PipelineDepthStencilStateCreateInfo::default, |t| {
+                            vk::PipelineDepthStencilStateCreateInfo::default()
+                                .depth_test_enable(true)
+                                .depth_write_enable(t.write)
+                                .depth_compare_op(vk_compare(t.compare))
+                        });
+                let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blends);
+                let dynamic =
+                    vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
+                let mut rendering = vk::PipelineRenderingCreateInfo::default()
+                    .color_attachment_formats(&colors)
+                    .depth_attachment_format(depth_format)
+                    .stencil_attachment_format(stencil_format);
+                rendering.p_next = next;
+                let mut info = vk::GraphicsPipelineCreateInfo::default()
+                    .stages(&stages)
+                    .viewport_state(&viewport)
+                    .rasterization_state(&raster)
+                    .multisample_state(&multisample)
+                    .depth_stencil_state(&depth)
+                    .color_blend_state(&blend)
+                    .dynamic_state(&dynamic);
+                info.p_next = std::ptr::from_ref(&rendering).cast();
+                // SAFETY: valid create info; the SPIR-V was validated by the shader build.
+                unsafe { self.device.create_graphics_pipelines(cache, &[info], None) }
+                    .map(|p| p[0])
+                    .map_err(|(_, e)| e)
+            },
+        )
     }
 }
 

@@ -276,6 +276,27 @@ fn a_file_the_driver_refuses_is_replaced() {
     assert_clean(&d);
 }
 
+/// Threads asking for one pipeline at once compile it once.
+#[test]
+fn one_pipeline_requested_at_once_compiles_once() {
+    let path = cache_path("at_once");
+    let d = open(&path);
+    let spec = cached::Spec { value: 77 }.bytes();
+    let data = SpecData {
+        entries: cached::Spec::ENTRIES,
+        bytes: &spec,
+    };
+    let stage = ShaderStage::new(&cached::MODULE, "compute_main", data).unwrap();
+    std::thread::scope(|s| {
+        for _ in 0..8 {
+            s.spawn(|| d.create_compute_pipeline(&stage, "at once").unwrap());
+        }
+    });
+    let report = d.pipeline_cache_report();
+    assert_eq!((report.misses, report.hits), (1, 7), "{report:?}");
+    assert_clean(&d);
+}
+
 #[test]
 fn concurrent_creation() {
     let path = cache_path("concurrent");

@@ -2,15 +2,17 @@
 //! file holds the device identity, the cache data and a checksum; a file from another device,
 //! driver or format, or one the driver refuses, is ignored and rebuilt.
 
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::Instant;
 
 use ash::vk;
 
 use super::device::{Device, Shared};
+use super::pipeline::StageParts;
 use crate::Error;
 
 /// What the pipeline cache loaded and how creation has used it.
@@ -99,6 +101,29 @@ pub(crate) struct PipelineCache {
     misses: AtomicU32,
     /// Held while saving; the misses counted when the file was last written.
     saved: Mutex<u32>,
+    /// The stages being compiled now: a thread asking for the same ones waits, then gets them
+    /// from the driver's or this cache without compiling. Pipelines that differ only in other
+    /// state wait for each other too.
+    compiling: Mutex<HashSet<blake3::Hash>>,
+    compiled: Condvar,
+}
+
+/// Marks stages as compiling until dropped.
+struct Compiling<'a> {
+    cache: &'a PipelineCache,
+    stages: blake3::Hash,
+}
+
+impl Drop for Compiling<'_> {
+    fn drop(&mut self) {
+        let mut compiling = self
+            .cache
+            .compiling
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        compiling.remove(&self.stages);
+        self.cache.compiled.notify_all();
+    }
 }
 
 impl PipelineCache {
@@ -123,6 +148,8 @@ impl PipelineCache {
             hits: AtomicU32::new(0),
             misses: AtomicU32::new(0),
             saved: Mutex::new(0),
+            compiling: Mutex::default(),
+            compiled: Condvar::new(),
         };
         let Some(path) = path else { return cache };
         let file = match std::fs::read(path) {
@@ -183,6 +210,25 @@ impl PipelineCache {
         cache
     }
 
+    /// Waits until no other thread is compiling `stages`, then marks them as compiling.
+    fn compiling(&self, stages: blake3::Hash) -> Compiling<'_> {
+        let mut compiling = self
+            .compiling
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while compiling.contains(&stages) {
+            compiling = self
+                .compiled
+                .wait(compiling)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        compiling.insert(stages);
+        Compiling {
+            cache: self,
+            stages,
+        }
+    }
+
     pub(crate) fn destroy(&mut self, device: &ash::Device) {
         // SAFETY: no pipeline creation is running; the device is being destroyed. Null is
         // ignored.
@@ -192,18 +238,25 @@ impl PipelineCache {
 }
 
 impl Shared {
-    /// Creates a pipeline through the cache with `extra` creation flags. `create` builds the
-    /// create info with `next` as its `p_next` (creation flags, then creation feedback) and
-    /// calls the create function with `cache`.
+    /// Creates a pipeline through the cache with `extra` creation flags, one at a time per set
+    /// of `stages`. `create` builds the create info with `next` as its `p_next` (creation flags,
+    /// then creation feedback) and calls the create function with `cache`.
     pub(super) fn create_pipeline(
         &self,
+        stages: &[&StageParts<'_>],
         extra: vk::PipelineCreateFlags2,
         name: &str,
         call: &'static str,
         create: impl FnOnce(vk::PipelineCache, *const c_void) -> Result<vk::Pipeline, vk::Result>,
     ) -> Result<vk::Pipeline, Error> {
-        let start = Instant::now();
         let cache = &self.pipeline_cache;
+        let mut key = blake3::Hasher::new();
+        for s in stages {
+            s.key(&mut key);
+        }
+        key.update(&extra.as_raw().to_le_bytes());
+        let compiling = cache.compiling(key.finalize());
+        let start = Instant::now();
         let mut feedback = vk::PipelineCreationFeedback::default();
         let mut feedback_info = vk::PipelineCreationFeedbackCreateInfo::default()
             .pipeline_creation_feedback(&mut feedback);
@@ -220,6 +273,7 @@ impl Shared {
             // what it must write.
             if hit { &cache.hits } else { &cache.misses }.fetch_add(1, Ordering::Release);
         }
+        drop(compiling);
         self.created(raw, name, start);
         Ok(raw)
     }
