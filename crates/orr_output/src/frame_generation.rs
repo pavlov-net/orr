@@ -148,7 +148,7 @@ impl FgCameraState {
 
     /// Whether `prev` can be reprojected to this camera.
     pub(crate) fn continues(&self, prev: &Self) -> bool {
-        self.scene == prev.scene && self.extent == prev.extent
+        self.scene == prev.scene && self.extent == prev.extent && self.output == prev.output
     }
 }
 

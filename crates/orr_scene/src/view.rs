@@ -20,6 +20,8 @@ pub struct ViewConstants {
     pub clip_from_view_jittered: [[f32; 4]; 4],
     /// Inverse of `clip_from_view_jittered`.
     pub view_from_clip: [[f32; 4]; 4],
+    /// Last frame's projection at this frame's output aspect, unjittered: a change of aspect
+    /// moves nothing, while a change of field of view does.
     pub prev_clip_from_view: [[f32; 4]; 4],
     /// Rows of the rotation; the translation column is 0.
     pub view_from_world_rotation: [[f32; 4]; 3],
@@ -210,7 +212,8 @@ pub struct RasterView {
     pub targets: GBufferGpu,
     /// D32, reverse Z: 0 where nothing was drawn.
     pub depth: Arc<Texture>,
-    /// RG16F: previous uv minus current uv.
+    /// RG16F: previous uv minus current uv, both at this frame's output aspect. An image kept
+    /// from before a change of output extent is framed differently and needs a reset.
     pub motion: Arc<Texture>,
     pub gbuf_a: Arc<Texture>,
     pub gbuf_b: Arc<Texture>,
@@ -238,19 +241,11 @@ pub struct RasterView {
     pub focus: [f32; 3],
 }
 
-#[derive(Clone, Copy)]
-struct Camera {
-    scene: SceneId,
-    position: DVec3,
-    rotation: Quat,
-    clip_from_view: Mat4,
-}
-
 pub(crate) struct ViewHistory {
     pub exposure: Allocation<ExposureState>,
     /// The exposure slot the view's next render reads.
     slot: u32,
-    previous: Option<Camera>,
+    previous: Option<ViewDesc>,
     pub targets: Option<ViewTargets>,
     /// The transient targets of the view's render, orr_scene's and the later passes'.
     pub arena: ViewArena,
@@ -310,17 +305,11 @@ pub(crate) fn view_constants(
 ) -> ViewConstants {
     let clip = clip_from_view(&desc.projection, desc.output_extent);
     let clip_jittered = jittered(clip, desc.jitter, desc.render_extent);
-    let current = Camera {
-        scene: desc.scene,
-        position: desc.position,
-        rotation: desc.rotation,
-        clip_from_view: clip,
-    };
     let previous = match history.previous {
         Some(p) if p.scene == desc.scene && !desc.reset_history => p,
-        _ => current,
+        _ => *desc,
     };
-    history.previous = Some(current);
+    history.previous = Some(*desc);
     let exposure_slot = history.slot;
     history.slot ^= 1;
 
@@ -335,7 +324,7 @@ pub(crate) fn view_constants(
         clip_from_view: rows4(clip),
         clip_from_view_jittered: rows4(clip_jittered),
         view_from_clip: rows4(clip_jittered.inverse()),
-        prev_clip_from_view: rows4(previous.clip_from_view),
+        prev_clip_from_view: rows4(clip_from_view(&previous.projection, desc.output_extent)),
         view_from_world_rotation: rotation_rows(view_from_world),
         prev_view_from_world_rotation: rotation_rows(prev_view_from_world),
         eye_render: eye.relative_to(origin, cell_log2).extend(0.0).to_array(),

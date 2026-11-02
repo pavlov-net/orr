@@ -10,6 +10,7 @@ use orr_color::RgbPrimaries;
 use orr_gpu::KernelSet;
 use orr_lighting::{GuideKind, Light, LightingDebugView, PathEntry, ViewLighting};
 use orr_math::{Mat3, Quat, Vec2, Vec3};
+use orr_scene::ViewDesc;
 
 fn paths(settings: ViewLighting) -> Paths {
     Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
@@ -449,5 +450,16 @@ fn history_resets_on_each_of_its_sources() {
             .begin(f.frame, f.lighting, &f.desc, false, &lighting);
     });
     assert!(reset, "a camera cut");
+    assert!(!frame(&mut bed, eye, false, lighting));
+    let target = bed.spec.target;
+    let mut reset = false;
+    bed.follow(eye, target, 0, &mut |_, f| {
+        let desc = ViewDesc {
+            output_extent: f.desc.output_extent + 1,
+            ..f.desc
+        };
+        reset = f.target.begin(f.frame, f.lighting, &desc, false, &lighting);
+    });
+    assert!(reset, "a new output extent");
     assert_clean();
 }

@@ -29,7 +29,7 @@ public struct ViewConstants
     public float4x4 clip_from_view;
     public float4x4 clip_from_view_jittered;
     public float4x4 view_from_clip;           // inverse of clip_from_view_jittered
-    public float4x4 prev_clip_from_view;
+    public float4x4 prev_clip_from_view;      // last frame's projection at this frame's aspect
     public float3x4 view_from_world_rotation;  // translation column 0
     public float3x4 prev_view_from_world_rotation;
     public float4 eye_render;                 // camera in render space, w 0

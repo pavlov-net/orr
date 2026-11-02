@@ -11,8 +11,8 @@ use orr_scene::orr_gpu::{
     StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory, TextureUsage,
 };
 use orr_scene::{
-    ArenaRequest, ArenaTexture, GBufferGpu, MaterialId, RasterGpu, SceneId, SceneRoot, Span,
-    ViewArena, ViewConstants, ViewDesc, ViewStep,
+    ArenaRequest, ArenaTexture, GBufferGpu, MaterialId, RasterGpu, SceneRoot, Span, ViewArena,
+    ViewConstants, ViewDesc, ViewStep,
 };
 
 use crate::media::{MediaKernels, MediaSettings, MediaStats, MediaView};
@@ -366,7 +366,7 @@ pub struct LightingView {
     local_roots: Ring<local::Root>,
     guide_roots: Ring<GuideRoot>,
     frost_roots: Ring<FrostRoot>,
-    previous: Option<(SceneId, DVec3, Quat)>,
+    previous: Option<ViewDesc>,
     history_reset: bool,
     pub(crate) media: MediaView,
     dof: Option<DofLayer>,
@@ -480,10 +480,11 @@ impl LightingView {
 
     /// Starts the view's frame `frame` and settles its history reset. A camera cut
     /// (`desc.reset_history`), output's exposure cut, a camera jump past
-    /// `lighting.guides.camera_jump` since the view's last frame, a change of scene, the
-    /// view's first frame and [`SceneLighting::reset_history`] before the scene's pass of
-    /// `frame` each set it. Call once per frame, after the scene's [`SceneLighting::record`]
-    /// and before the view's lighting records; returns [`Self::history_reset`].
+    /// `lighting.guides.camera_jump` since the view's last frame, a change of scene or output
+    /// extent, the view's first frame and [`SceneLighting::reset_history`] before the scene's
+    /// pass of `frame` each set it. Call once per frame, after the scene's
+    /// [`SceneLighting::record`] and before the view's lighting records; returns
+    /// [`Self::history_reset`].
     pub fn begin(
         &mut self,
         frame: u64,
@@ -492,17 +493,17 @@ impl LightingView {
         exposure_cut: bool,
         lighting: &ViewLighting,
     ) -> bool {
-        let current = (desc.position, desc.rotation);
-        let continues = self.previous.is_some_and(|(id, position, rotation)| {
-            id == desc.scene
+        let continues = self.previous.is_some_and(|p| {
+            p.scene == desc.scene
+                && p.output_extent == desc.output_extent
                 && !lighting
                     .guides
                     .camera_jump
-                    .jumps((position, rotation), current)
+                    .jumps((p.position, p.rotation), (desc.position, desc.rotation))
         });
         self.history_reset =
             !continues || desc.reset_history || exposure_cut || scene.resets_history(frame);
-        self.previous = Some((desc.scene, desc.position, desc.rotation));
+        self.previous = Some(*desc);
         self.history_reset
     }
 

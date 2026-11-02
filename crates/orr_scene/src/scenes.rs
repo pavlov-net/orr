@@ -1922,8 +1922,8 @@ impl<'a> Frame<'a> {
             t => *t = Some(ViewTargets::new(device, sizes, &history.arena, list)?),
         }
         let targets = history.targets.as_mut().expect("view targets");
-        let occlusion =
-            targets.hzb_scene.replace(view.scene) == Some(view.scene) && !view.reset_history;
+        let hzb_view = (view.scene, view.output_extent.to_array());
+        let occlusion = targets.hzb_view.replace(hzb_view) == Some(hzb_view) && !view.reset_history;
         let targets = &*targets;
         let seen = constants;
         let constants = window.put(device, &constants)?;
@@ -2340,7 +2340,10 @@ fn seen_by(
         return Ok(None);
     };
     let raster = match &history.targets {
-        Some(t) if t.hzb_scene == Some(id) && t.sizes.extent == seen.constants.extent => {
+        Some(t)
+            if t.hzb_view.is_some_and(|(scene, _)| scene == id)
+                && t.sizes.extent == seen.constants.extent =>
+        {
             window.put(device, &t.hzb_record())?
         }
         _ => GpuPtr::NULL,
