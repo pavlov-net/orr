@@ -202,6 +202,51 @@ fn bc7_mip0_keeps_the_source() {
     assert!(db > 40.0, "BC7 mip 0 PSNR {db:.1} dB");
 }
 
+/// Data textures keep one mip unless asked for more, at the size limit; a texture asked for
+/// no mips keeps only its source's mip 0.
+#[test]
+fn textures_keep_the_mips_their_usage_or_settings_ask_for() {
+    let d = dir("mips");
+    let (w, h) = (300, 200);
+    let px = |x: u32, y: u32| [(x * 7) as u8, (y * 3) as u8, (x ^ y) as u8, (x + y) as u8];
+    let path = d.join("data.png");
+    write_png(&path, w, h, px);
+    let (color, color_blocks) = ktx2(64, 64, ctt::Format::BC7_SRGB_BLOCK, |m, x, y| {
+        [(x * 4) as u8, (y * 4) as u8, (m * 40) as u8, 255]
+    });
+    let color_path = d.join("color.ktx2");
+    std::fs::write(&color_path, color).unwrap();
+    let data = |max_size, mips| TextureSettings {
+        usage: Usage::Data(orr_cook::DataFormat::Rgba8),
+        max_size,
+        mips,
+        ..TextureSettings::default()
+    };
+    let a = cook(vec![
+        texture(&path, "one", data(None, None)),
+        texture(&path, "all", data(None, Some(true))),
+        texture(&path, "small", data(Some(128), None)),
+        texture(
+            &color_path,
+            "color",
+            TextureSettings {
+                mips: Some(false),
+                ..TextureSettings::default()
+            },
+        ),
+    ]);
+    let (info, levels) = mips(&a, "one");
+    assert_eq!(info.header.mip_count, 1);
+    let texels: Vec<u8> = (0..w * h).flat_map(|i| px(i % w, i / w)).collect();
+    assert_eq!(levels[0][0], texels);
+    assert_eq!(mips(&a, "all").0.header.mip_count, 9);
+    let small = mips(&a, "small").0.header;
+    assert_eq!((small.width, small.height, small.mip_count), (75, 50, 1));
+    let (info, levels) = mips(&a, "color");
+    assert_eq!(info.header.mip_count, 1);
+    assert_eq!(levels[0][0], color_blocks[0]);
+}
+
 #[test]
 fn bc_split_keeps_the_blocks() {
     let d = dir("bc-split");

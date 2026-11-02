@@ -1,5 +1,5 @@
 //! Texture class: blob 0 holds a [`TextureHeader`] and its light table ([`TextureInfo`]);
-//! then one blob per mip above the tail, finest first; then the mip tail.
+//! then one blob per mip above the tail, finest first; then the mip tail, if there is one.
 //!
 //! - A mip blob holds 64 KiB tiles in the Vulkan standard 2D sparse block shape
 //!   ([`tile_shape`]), layer by layer, each layer's tiles row-major. A tile's block rows are
@@ -7,8 +7,9 @@
 //!   padded with zeros, so every tile copies with a row length and image height of the full
 //!   tile. Each tile is one chunk.
 //! - The tail starts at the first mip smaller than one tile in either axis
-//!   ([`tail_first_mip`]). It is one blob holding every tail mip, finest first, each mip's
-//!   layers in order, each layer's block rows tightly packed.
+//!   ([`tail_first_mip`]); a texture whose every mip is at least a tile has none. It is one
+//!   blob holding every tail mip, finest first, each mip's layers in order, each layer's
+//!   block rows tightly packed.
 //! - Cube textures have six layers in the Vulkan face order +X, -X, +Y, -Y, +Z, -Z.
 //! - Environment maps are 2D equal-area octahedral maps ([`octahedral`]).
 
@@ -34,7 +35,7 @@ pub struct TextureHeader {
     /// [`Self::D2`] or [`Self::CUBE`].
     pub kind: u8,
     pub mip_count: u8,
-    /// Mips from this one down share the last blob.
+    /// Mips from this one down share the last blob; `mip_count` when there is no tail.
     pub tail_first_mip: u8,
     /// Source primaries of colour texels: [`Self::REC709`], [`Self::DISPLAY_P3`] or
     /// [`Self::REC2020`].

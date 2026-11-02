@@ -47,6 +47,10 @@ pub struct TextureSettings {
     /// Store BCn blocks split into endpoint and index streams, which zstd compresses
     /// better. `None` takes the format's default.
     pub bc_split: Option<bool>,
+    /// Whether the texture has a mip chain under mip 0; `None` takes the usage's default
+    /// ([`Usage::has_mips`]). Without one the texture is the first mip, of the source or
+    /// made, that fits `max_size`. [`Usage::Environment`] maps always have one.
+    pub mips: Option<bool>,
 }
 
 impl Default for TextureSettings {
@@ -60,6 +64,7 @@ impl Default for TextureSettings {
             filter: MipFilter::Kaiser,
             wrap: [Wrap::Repeat; 2],
             bc_split: None,
+            mips: None,
         }
     }
 }
@@ -95,6 +100,15 @@ pub enum Usage {
     },
     /// Uncompressed, the source channels the format holds.
     Data(DataFormat),
+}
+
+impl Usage {
+    /// Whether textures of this usage have mips unless their settings say otherwise: all
+    /// but [`Usage::Data`], where filtering would blend texels (lookup tables, ids) into
+    /// values the data never held.
+    pub fn has_mips(self) -> bool {
+        !matches!(self, Self::Data(_))
+    }
 }
 
 /// Uncompressed formats for [`Usage::Data`].
@@ -250,6 +264,8 @@ pub(crate) struct Plan {
     pub mips: MipSpec,
     pub quality: Quality,
     pub max_size: Option<u32>,
+    /// Mips down to 1x1; without them the texture is the first mip that fits `max_size`.
+    pub full_chain: bool,
     pub toksvig: Option<Toksvig>,
     pub lights: Vec<ExtractedLight>,
 }
@@ -290,6 +306,16 @@ pub(crate) fn kept_mips(
     (mip_size(w, h, skip), mips.split_off(skip as usize))
 }
 
+/// Mips a `w` x `h` texture keeps: down to 1x1 with `full_chain`, else down to the first
+/// that fits `max_size`.
+pub(crate) fn kept_mip_count(w: u32, h: u32, max_size: Option<u32>, full_chain: bool) -> u32 {
+    if full_chain {
+        full_mip_count(w, h)
+    } else {
+        skipped_mips(w, h, max_size) + 1
+    }
+}
+
 /// Mips dropped from the top of a `w` x `h` chain so mip 0 fits `max_size`.
 pub(crate) fn skipped_mips(w: u32, h: u32, max_size: Option<u32>) -> u32 {
     max_size.map_or(0, |max| {
@@ -306,11 +332,12 @@ pub(crate) fn chains(layers: Vec<Img>, plan: &Plan, first: usize) -> Result<Vec<
     if layers.iter().any(|l| (l.w, l.h) != (w, h)) {
         return Err("layers differ in size".into());
     }
+    let skip = skipped_mips(w, h, plan.max_size) as usize;
+    let count = kept_mip_count(w, h, plan.max_size, plan.full_chain);
     let mut chains: Vec<Vec<Img>> = layers
         .into_iter()
-        .map(|l| mips::chain(l, &plan.mips))
+        .map(|l| mips::chain(l, &plan.mips, count))
         .collect();
-    let skip = skipped_mips(w, h, plan.max_size) as usize;
     if let Some(t) = &plan.toksvig {
         for c in &mut chains {
             t.apply(c, &plan.mips, skip + first)?;
@@ -468,8 +495,17 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         max_lights,
     } = s.usage
     {
+        if s.mips == Some(false) {
+            return Err("environment maps have mips".into());
+        }
         load::decode_layers(&mut src)?;
         return env::cook(src, s, primaries, light_threshold, max_lights, quality);
+    }
+    let full_chain = s.mips.unwrap_or(s.usage.has_mips());
+    let kept_levels = |b: &Blocks| kept_mip_count(b.w, b.h, s.max_size, full_chain) as usize;
+    if let Some(b) = &mut src.blocks {
+        let n = kept_levels(b);
+        b.levels.iter_mut().for_each(|l| l.truncate(n));
     }
     let encoding = Encoding::of(s.usage);
     let coverage = match (s.alpha_cutoff, s.usage) {
@@ -507,6 +543,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         },
         quality,
         max_size: s.max_size,
+        full_chain,
         toksvig: None,
         lights: Vec::new(),
     };
@@ -515,7 +552,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
     if let Some(b) = src
         .blocks
         .as_ref()
-        .filter(|b| b.complete() && s.atlas_grid.is_none())
+        .filter(|b| b.levels[0].len() == kept_levels(b) && s.atlas_grid.is_none())
     {
         if b.vk_format == encoding.vk_format() && (coverage.is_none() || !remakes) {
             let (w, h) = (b.w, b.h);

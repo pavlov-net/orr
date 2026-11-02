@@ -1388,6 +1388,98 @@ fn streamed_texture_tiles_load_exact_and_evict_after_their_hold() {
     assert_clean();
 }
 
+/// A texture of one mip larger than a tile, which has no mip tail to stand in for tiles not
+/// yet loaded, places whole even where a material binds it.
+#[test]
+fn a_texture_without_a_mip_tail_places_whole() {
+    use orr_pack::texture::{FormatInfo, TextureHeader, tail_first_mip, tile, vk};
+    let _serial = serial();
+    let (name, width, height, ..) = TILED[0];
+    let f = FormatInfo::of(vk::R8G8B8A8_UNORM).unwrap();
+    assert_eq!(tail_first_mip(f, width, height, 1), 1, "no mip tail");
+    let header = TextureHeader {
+        vk_format: vk::R8G8B8A8_UNORM,
+        width,
+        height,
+        layers: 1,
+        kind: TextureHeader::D2,
+        mip_count: 1,
+        tail_first_mip: 1,
+        primaries: TextureHeader::REC709,
+        _pad: [0; 2],
+        alpha_cutoff: f32::NAN,
+        lights: Span::default(),
+    };
+    let head = TextureInfo {
+        header,
+        lights: Vec::new(),
+    }
+    .to_bytes();
+    let texels = tiled_texels(0, 0, 0);
+    let mut tiles = Vec::new();
+    tile(f, width, height, &texels, &mut tiles);
+    let mut m = Material::default();
+    m.textures[slot::BASE_COLOR].texture = AssetId::from_name(name);
+    let mut w = ArchiveWriter::create(Target::Memory).unwrap();
+    let blobs = [
+        BlobIn {
+            mount: true,
+            ..BlobIn::new(&head)
+        },
+        BlobIn {
+            chunk_len: orr_pack::texture::TILE_BYTES as u32,
+            ..BlobIn::new(&tiles)
+        },
+    ];
+    let key = orr_pack::Hash32([0; 32]);
+    w.add(
+        name,
+        Class::Texture as u16,
+        orr_pack::texture::SCHEMA,
+        key,
+        &blobs,
+    )
+    .unwrap();
+    let material = [BlobIn {
+        mount: true,
+        ..BlobIn::new(bytemuck::bytes_of(&m))
+    }];
+    w.add(
+        "material",
+        Class::Material as u16,
+        orr_pack::material::SCHEMA,
+        key,
+        &material,
+    )
+    .unwrap();
+    let pack = w.finish().unwrap().unwrap();
+
+    let dev = device();
+    let mut scenes = Scenes::new(dev, &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let gpu = Gpu(dev);
+    let mount = scenes.mount(PackSource::Memory(pack));
+    ready(&mut scenes, mount);
+    let index = scenes.texture(mount, AssetId::from_name(name)).unwrap();
+    let record: GpuPtr<orr_scene::TextureStreamGpu> =
+        gpu.value(scenes.texture_streams().offset(u64::from(index.0)));
+    assert!(record == GpuPtr::NULL, "the texture does not stream");
+    let texture = mounted_texture(&scenes, mount, AssetId::from_name(name)).unwrap();
+    let region = TextureRegion {
+        mip: 0,
+        base_layer: 0,
+        layers: 1,
+        offset: [0; 3],
+        extent: [width, height, 1],
+    };
+    assert!(gpu.texture(&texture, &region) == texels);
+    scenes.unmount(mount);
+    for _ in 0..4 {
+        frame(&mut scenes);
+    }
+    assert_clean();
+}
+
 #[test]
 fn taps_of_a_streamed_texture_read_its_resident_mips_and_load_the_tiles_they_want() {
     use orr_scene::orr_gpu::{AddressMode, Filter, MemoryKind, SamplerDesc};

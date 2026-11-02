@@ -1330,6 +1330,7 @@ impl TextureJob {
                 normal: p.normal,
                 coverage: p.coverage,
             },
+            full_chain: true,
             quality: self.quality,
             max_size: self.max_size,
             toksvig,
