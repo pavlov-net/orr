@@ -20,7 +20,7 @@ use crate::shaders::guides::{frost, resolve};
 use crate::shaders::light_sampling::local;
 use crate::shaders::path::opaque;
 use crate::shaders::types::{
-    FrostRoot, GuideRoot, LayerGuide, LayerTilesRoot, LocalLights, PathRoot,
+    FrostRoot, GuideRoot, LayerGuide, LayerTilesRoot, LocalLights, ParticleLighting, PathRoot,
 };
 use crate::shaders::world_cache::update;
 use crate::subsurface::{CapTailTable, SSS_STEPS, SubsurfaceDepth};
@@ -600,18 +600,11 @@ impl LightingView {
         self.media.stats(frame)
     }
 
-    /// RGBA16F 3D, the froxels' isotropic incident radiance (unexposed, nits) as the last
-    /// [`LightingKernels::record_media`] wrote it, with the visibility of the first shadowed
-    /// directional light in A; `None` before the first.
-    pub fn froxel_incident(&self) -> Option<TextureIndex> {
-        self.media.incident()
-    }
-
-    /// RGBA16F 3D, per froxel the pre-exposed in-scatter from the eye to its far boundary in
-    /// RGB and the luminance of the transmittance in A; `None` before the first
-    /// [`LightingKernels::record_media`].
-    pub fn froxel_integrated(&self) -> Option<TextureIndex> {
-        self.media.integrated()
+    /// The light and fog transparency hooks of `frame` shade particles with, through
+    /// [`crate::ParticleDraw`] or their own `particle_shade`; written by
+    /// [`LightingKernels::record_media_apply`], null when that frame recorded none.
+    pub fn particle_lighting(&self, frame: u64) -> GpuPtr<ParticleLighting> {
+        self.media.particle_lighting(frame)
     }
 }
 
@@ -849,7 +842,8 @@ impl LightingKernels {
     /// that wrote the radiance: each pixel's radiance x the transmittance over its camera
     /// segment, plus the in-scatter over it, to its surface or the scene's `near_range`,
     /// whichever is nearer (sky pixels take the whole range). The reference marches the
-    /// segment per pixel instead. Orders nothing after it.
+    /// segment per pixel instead. Also writes the frame's [`LightingView::particle_lighting`]
+    /// for the transparency hook after it. Orders nothing after it.
     pub fn record_media_apply(
         &self,
         list: &mut CommandList<'_>,

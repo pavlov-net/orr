@@ -2,16 +2,16 @@
 //! rough refraction, the glass furnace, single scattering against a CPU integral, an albedo-1
 //! medium, presence layers, a camera inside water, layer guides under camera rotation,
 //! the frosted-glass term of rough glass, dispersion: a white line through a prism against a
-//! CPU model, a dispersive furnace, and paths without dispersive hits, and the layer tiles
-//! against tracing every tile.
+//! CPU model, a dispersive furnace, and paths without dispersive hits, the layer tiles
+//! against tracing every tile, and an emissive particle seen through glass.
 
 use lighting_suite::bed::{
     Accumulated, Analytic, Bed, CLOUD_SPHERE, Capture, DISPERSIVE_SPHERE, EMITTER_LUMINANCE,
     EXTENT, FLOOR, FURNACE_RADIANCE, FrostGuide, GLASS_SPHERE, Item, LIGHT_FLOOR, LINE,
     LINE_HALF_HEIGHT, LINE_HALF_WIDTH, MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, PRESENCE_VEIL,
-    PRESENCE_VEIL_OPACITY, PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR, Paths, ROUGH_SLAB,
-    SMOOTH_FLOOR, SUN, SpareView, Spec, TINTED_SLAB, WATER_BOX, fresnel, prism_corners,
-    water_transmission,
+    PRESENCE_VEIL_OPACITY, PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR, Particle, ParticleLook,
+    Paths, ROUGH_SLAB, SMOOTH_FLOOR, SUN, SpareView, Spec, TINTED_SLAB, WATER_BOX, fresnel,
+    prism_corners, water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
 use lighting_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
@@ -20,7 +20,8 @@ use orr_lighting::{
     DirectionalLight, DiscProfile, Light, LightingDebugView, PathEntry, ReferenceSettings,
     ViewLighting,
 };
-use orr_math::{DMat3, DVec3, Mat3, Vec3};
+use orr_math::{DMat3, DVec3, Mat3, Vec2, Vec3};
+use orr_scene::Opacity;
 
 /// `MATERIAL_NONE`.
 const NONE: u32 = u32::MAX;
@@ -65,16 +66,7 @@ fn from_above(copies: Vec<Item>, lights: Vec<Light>, height: f32) -> Spec {
 /// Mean rgb of the `side` x `side` pixels at the image's center.
 fn center(a: &Accumulated, side: u32) -> [f64; 3] {
     let [w, h] = EXTENT;
-    let mut sum = [0.0f64; 3];
-    for y in (h - side) / 2..(h + side) / 2 {
-        for x in (w - side) / 2..(w + side) / 2 {
-            let p = a.mean[(y * w + x) as usize];
-            for c in 0..3 {
-                sum[c] += f64::from(p[c]);
-            }
-        }
-    }
-    sum.map(|s| s / f64::from(side * side))
+    a.around(Vec2::new(w as f32, h as f32) * 0.5, side / 2)
 }
 
 /// Mean rgb over the pixels a surface or layer was drawn on.
@@ -799,5 +791,40 @@ fn layer_tiles_trace_what_every_tile_traces() {
             }
         }
     }
+    assert_clean();
+}
+
+/// An emissive particle under the tinted slab, seen from above through it and beside it: the
+/// slab passes the particle's light by its Fresnel and Beer share, as the dielectric path
+/// meets the particle by its emission, and the transparency hook draws none of it over the
+/// slab.
+#[test]
+fn particles_behind_glass_show_through_it() {
+    let look = ParticleLook {
+        albedo: [0.0; 3],
+        emission: [1000.0; 3],
+        opacity: 0.5,
+        anisotropy: 0.0,
+    };
+    let particle = [Particle {
+        center: Vec3::new(0.0, 0.1, 0.0),
+        size: 2.0,
+    }];
+    let paths = paths(reference(2));
+    let seen = |slab: bool| {
+        let mut copies = vec![at(FLOOR, Vec3::new(0.0, -50.0, 0.0))];
+        if slab {
+            copies.push(at(TINTED_SLAB, Vec3::new(0.0, 0.5, 0.0)));
+        }
+        let mut bed = Bed::with(from_above(copies, Vec::new(), 3.0));
+        bed.set_particles(&particle, look, Opacity::Particle);
+        center(&render_paths(&mut bed, &paths, 16), 8)
+    };
+    let open = seen(false);
+    let through = seen(true);
+    assert_close("beside the slab", open, [500.0; 3], 0.01);
+    let (f, t) = (fresnel(1.5, 1.0), 0.5);
+    let share = (1.0 - f) * (1.0 - f) * t / (1.0 - f * f * t * t);
+    assert_close("through the slab", through, open.map(|v| v * share), 0.03);
     assert_clean();
 }

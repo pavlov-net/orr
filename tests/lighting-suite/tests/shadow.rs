@@ -1,11 +1,13 @@
 //! The shadow product on a real ray-query candidate loop: dielectric slabs and water against
 //! Fresnel and Beer's law for receivers above, below and inside them, presence layers by
-//! their opacity, the candidate limit, and a smoke volume's medium proxy against a fine
-//! march of its cooked grid; only rays with the medium mask bit see proxies.
+//! their opacity, the candidate limit, particles by what their opacity lets through, and a
+//! smoke volume's medium proxy against a fine march of its cooked grid; only rays with the
+//! medium mask bit see proxies.
 
 use lighting_suite::bed::{
-    Bed, FLOOR, Item, PLUME, PRESENCE_VEIL, PRESENCE_VEIL_OPACITY, SLAB_THICKNESS, SUN, Spec,
-    TINTED_SLAB, WATER_BOX, fresnel, plume_volume, water_transmission,
+    Bed, FLOOR, Item, PLUME, PRESENCE_VEIL, PRESENCE_VEIL_OPACITY, PRODUCER_CAPACITY, Particle,
+    ParticleLook, SLAB_THICKNESS, SUN, Spec, TINTED_SLAB, WATER_BOX, fresnel, plume_volume,
+    water_transmission,
 };
 use lighting_suite::shaders::{proxy_rays, shadow_probe};
 use lighting_suite::{assert_clean, pipeline, readback, upload};
@@ -13,7 +15,7 @@ use orr_gpu::{Allocation, Hazards, Stages};
 use orr_lighting::Light;
 use orr_math::{DVec3, Mat3, Quat, Vec3};
 use orr_pack::volume::GridSampler;
-use orr_scene::{MediumProxy, MediumProxyId, ProxyDensity, SceneDesc};
+use orr_scene::{MediumProxy, MediumProxyId, Opacity, ProxyDensity, SceneDesc};
 
 fn at(model: &'static str, at: Vec3) -> Item {
     Item {
@@ -314,7 +316,7 @@ fn only_rays_with_the_medium_mask_see_medium_proxies() {
     let id = MediumProxyId(3);
     bed.set_medium_proxy(id, Some(proxy));
     let d = SceneDesc::default();
-    let proxy_base = d.instance_capacity + d.part_capacity + d.producer_capacity;
+    let proxy_base = d.instance_capacity + d.part_capacity + PRODUCER_CAPACITY;
     let origins: Vec<Vec3> = (0..256)
         .map(|k| {
             Vec3::new(
@@ -381,5 +383,40 @@ fn only_rays_with_the_medium_mask_see_medium_proxies() {
         seen.iter().all(|s| s.count == 0),
         "a cleared proxy is traced"
     );
+    assert_clean();
+}
+
+/// Sunlight through one particle square of opacity 0.3, and through two behind each other,
+/// keeps 1 - 0.3 of itself per particle.
+#[test]
+fn particles_shadow_by_one_minus_their_opacity() {
+    let opacity = 0.3;
+    let look = ParticleLook {
+        albedo: [0.5; 3],
+        emission: [0.0; 3],
+        opacity,
+        anisotropy: 0.0,
+    };
+    let origins: Vec<Vec3> = (0..16)
+        .map(|k| Vec3::new(-0.75 + 0.1 * k as f32, 1.0, -0.5))
+        .collect();
+    for count in [1, 2] {
+        let mut bed = Bed::with(spec(vec![at(FLOOR, Vec3::ZERO)]));
+        let particles: Vec<Particle> = (0..count)
+            .map(|k| Particle {
+                center: Vec3::new(0.0, 2.0, 0.5 * k as f32),
+                size: 3.0,
+            })
+            .collect();
+        bed.set_particles(&particles, look, Opacity::Particle);
+        let t = trace_on(&mut bed, &origins, SUN.direction_to_light, 1);
+        let wanted = (1.0 - f64::from(opacity)).powi(count);
+        assert_all(
+            &format!("{count} particles"),
+            &t.transmittance,
+            [wanted; 3],
+            2e-3,
+        );
+    }
     assert_clean();
 }

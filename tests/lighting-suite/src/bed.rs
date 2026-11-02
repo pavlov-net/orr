@@ -18,21 +18,23 @@ use orr_gpu::{
 };
 use orr_lighting::{
     BsdfTables, DirectionalLight, DiscProfile, DofBackgroundPass, EnvironmentMapGpu, Light,
-    LightId, LightingKernels, LightingView, PathEntry, SceneLighting, SceneLightingSettings,
-    ScenePass, ViewLighting, ViewPass,
+    LightId, LightingKernels, LightingView, ParticleDraw, PathEntry, SceneLighting,
+    SceneLightingSettings, ScenePass, ViewLighting, ViewPass,
 };
 use orr_math::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
 use orr_pack::{AssetId, Span, Target};
 use orr_scene::testing::{FlipError, Image, Pixels, flip};
 use orr_scene::{
-    FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens, LoadState, Loading,
-    MaterialId, MediumProxy, MediumProxyId, MountId, PackSource, Projection, RasterView,
-    RendererDesc, SceneDesc, SceneId, Scenes, TextureFilter, TransformGroupDesc, ViewArena,
-    ViewDesc, ViewHistoryId, ViewTarget, VolumeRef,
+    Affine3, ClusterTopology, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc,
+    Lens, LoadState, Loading, MaterialGpu, MaterialId, MediumProxy, MediumProxyId, MountId,
+    Opacity, PackSource, ProducerDesc, ProducerId, ProducerUpdate, Projection, RasterView,
+    RendererDesc, SceneDesc, SceneId, Scenes, TextureFilter, TransformGroupDesc, TransformGroupId,
+    ViewArena, ViewDesc, ViewHistoryId, ViewTarget, VolumeRef, material_flags,
 };
+use orr_shaders::bytemuck::Zeroable;
 
-use crate::shaders::{accumulate, exposure, flat_color, guide_read};
+use crate::shaders::{accumulate, exposure, flat_color, guide_read, particle_quads};
 use crate::{TestTexture, affine, device, linear_clamp, pipeline, render, texture, upload};
 
 /// Render extent of every bed view.
@@ -185,6 +187,43 @@ pub struct Spec {
     pub fov_y: f32,
     pub focus: Option<(Vec3, f32)>,
 }
+
+/// A particle of the bed's particle entry: a square of half edge `size` m around `center`,
+/// facing the camera.
+#[derive(Clone, Copy, Debug)]
+pub struct Particle {
+    pub center: Vec3,
+    pub size: f32,
+}
+
+/// What the bed's particles are made of: albedo (linear Rec.2020), emission (nits), opacity
+/// and the Henyey-Greenstein parameter of their response to directional light.
+#[derive(Clone, Copy, Debug)]
+pub struct ParticleLook {
+    pub albedo: [f32; 3],
+    pub emission: [f32; 3],
+    pub opacity: f32,
+    pub anisotropy: f32,
+}
+
+/// The bed's particle entry: its particles, the producer kernel that emits them each frame
+/// and the stock draw at the transparency point.
+struct Particles {
+    list: Allocation<[f32; 4]>,
+    count: u32,
+    emit: ComputePipeline,
+    draw: ParticleDraw,
+    anisotropy: f32,
+}
+
+/// The producer entry of the bed's particles.
+const PARTICLES: ProducerId = ProducerId(0);
+
+/// `SceneDesc::producer_capacity` of every bed scene.
+pub const PRODUCER_CAPACITY: u32 = 1;
+
+/// A particle square's two triangles.
+const PARTICLE_QUAD: [[u8; 3]; 2] = [[0, 1, 2], [0, 2, 3]];
 
 pub const SUN: DirectionalLight = DirectionalLight {
     direction_to_light: Vec3::new(0.35043832, 0.8760958, 0.26282874),
@@ -1036,6 +1075,15 @@ pub fn look(eye: Vec3, target: Vec3) -> Quat {
     Quat::from_mat3(&Mat3::from_cols(right, back.cross(right), back))
 }
 
+/// The image point, in pixels from the top left, where `spec`'s camera sees `p`.
+pub fn pixel_of(spec: &Spec, p: Vec3) -> Vec2 {
+    let q = look(spec.eye, spec.target).inverse() * (p - spec.eye);
+    let t = (0.5 * spec.fov_y).tan();
+    let aspect = EXTENT[0] as f32 / EXTENT[1] as f32;
+    let ndc = Vec2::new(q.x / (-q.z * t * aspect), q.y / (-q.z * t));
+    Vec2::new(0.5 + 0.5 * ndc.x, 0.5 - 0.5 * ndc.y) * Vec2::new(EXTENT[0] as f32, EXTENT[1] as f32)
+}
+
 /// Bytes of root memory each frame's kernels may put.
 const ROOT_BYTES: u64 = 64 * 1024;
 
@@ -1100,6 +1148,26 @@ pub struct Accumulated {
 }
 
 impl Accumulated {
+    /// Mean rgb of the `2 half` x `2 half` pixels around image point `at`.
+    pub fn around(&self, at: Vec2, half: u32) -> [f64; 3] {
+        let [w, h] = EXTENT;
+        let (cx, cy) = (at.x.round() as u32, at.y.round() as u32);
+        assert!(
+            cx >= half && cy >= half && cx + half <= w && cy + half <= h,
+            "{at} near the edge"
+        );
+        let mut sum = [0.0f64; 3];
+        for y in cy - half..cy + half {
+            for x in cx - half..cx + half {
+                let p = self.mean[(y * w + x) as usize];
+                for c in 0..3 {
+                    sum[c] += f64::from(p[c]);
+                }
+            }
+        }
+        sum.map(|s| s / f64::from(4 * half * half))
+    }
+
     /// The mean as a linear float image.
     pub fn image(&self) -> Image {
         Image {
@@ -1274,6 +1342,9 @@ pub struct Bed {
     medium: Option<GpuAddress>,
     /// Frames add the background layer instead of the radiance.
     background_layer: bool,
+    kernels: &'static KernelSet,
+    particle_group: TransformGroupId,
+    particles: Option<Particles>,
     _workers: Workers,
 }
 
@@ -1322,6 +1393,7 @@ impl Bed {
 
         let desc = SceneDesc {
             light_capacity: spec.lights.len().max(8) as u32,
+            producer_capacity: PRODUCER_CAPACITY,
             ..SceneDesc::default()
         };
         let scene = scenes.create_scene(&desc).unwrap();
@@ -1386,6 +1458,14 @@ impl Bed {
             })
             .unwrap();
         }
+        let particle_group = w
+            .create_transform_group(&TransformGroupDesc {
+                count: 1,
+                writer: GroupWriter::Cpu,
+                anchor: DVec3::ZERO,
+            })
+            .unwrap();
+        w.transforms(particle_group, 0, 1).unwrap()[0] = Affine3::IDENTITY;
         for (i, l) in spec.lights.iter().enumerate() {
             w.set_light(LightId(i as u32), Some(l)).unwrap();
         }
@@ -1436,8 +1516,78 @@ impl Bed {
             proxy_writes: Vec::new(),
             medium: None,
             background_layer: false,
+            kernels,
+            particle_group,
+            particles: None,
             _workers: workers,
         }
+    }
+
+    /// Gives the bed's particle entry `particles` of `look` from the next frame on, traced
+    /// and drawn as `opacity` says (`Opacity::Particle` for particles); each frame emits them
+    /// and draws particle entries at the transparency point after the frame's kernel, lit by
+    /// the lighting view's particle lighting of that frame, where it wrote one.
+    pub fn set_particles(&mut self, particles: &[Particle], look: ParticleLook, opacity: Opacity) {
+        self.frame += 1;
+        let list = [self.scene];
+        let f = self
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(self.frame),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        let mut m = MaterialGpu::zeroed();
+        m.base_color = look.albedo;
+        m.base_weight = 1.0;
+        m.geometry_opacity = look.opacity;
+        m.emission_color = look.emission;
+        m.emission_luminance = 1.0;
+        m.flags = material_flags::DOUBLE_SIDED;
+        if opacity == Opacity::Particle {
+            m.flags |= material_flags::PRESENCE;
+        }
+        if look.emission.iter().any(|&e| e > 0.0) {
+            m.flags |= material_flags::EMISSIVE;
+        }
+        let material = f.materials().create(&m).unwrap();
+        let count = particles.len() as u32;
+        let topology = [ClusterTopology {
+            vertex_count: 4,
+            triangles: &PARTICLE_QUAD,
+        }];
+        f.scene(self.scene)
+            .unwrap()
+            .set_producer(
+                PARTICLES,
+                Some(&ProducerDesc {
+                    max_clusters: count.max(1),
+                    max_vertices: 4 * count.max(1),
+                    update: ProducerUpdate::EveryFrame,
+                    topologies: &topology,
+                    materials: &[material],
+                    transform: (self.particle_group, 0),
+                    opacity,
+                    ..ProducerDesc::default()
+                }),
+            )
+            .unwrap();
+        let point = f.end(&[]).unwrap();
+        render().wait(point, Duration::from_secs(10)).unwrap();
+        let mut list = device()
+            .gpu_malloc::<[f32; 4]>(MemoryKind::Upload, u64::from(count.max(1)), "bed particles")
+            .unwrap();
+        for (o, p) in list.as_mut_slice().unwrap().iter_mut().zip(particles) {
+            *o = [p.center.x, p.center.y, p.center.z, p.size];
+        }
+        self.particles = Some(Particles {
+            list,
+            count,
+            emit: pipeline(&particle_quads::MODULE, "main"),
+            draw: ParticleDraw::new(device(), self.kernels).unwrap(),
+            anisotropy: look.anisotropy,
+        });
     }
 
     /// Runs `frames` frames of the scene, each recording `kernel` after the scene pass and
@@ -1513,6 +1663,11 @@ impl Bed {
     /// Sets light `id` from the next frame on.
     pub fn set_light(&mut self, id: LightId, light: Option<Light>) {
         self.light_writes.push((id, light));
+    }
+
+    /// The froxel volume's depth from the next frame on, m (`SceneRoot::near_range`).
+    pub fn set_near_range(&mut self, near_range: f32) {
+        self.scenes.set_near_range(self.scene, near_range).unwrap();
     }
 
     /// Sets medium proxy `id` from the next frame on.
@@ -1613,6 +1768,24 @@ impl Bed {
                 w.set_medium(data);
             }
         }
+        if let Some(p) = &self.particles {
+            let eye = [eye.x, eye.y, eye.z, 0.0];
+            f.update_scenes(&mut |c| {
+                let root = c
+                    .put_root(&particle_quads::Root {
+                        scene: c.root,
+                        particles: p.list.gpu(),
+                        eye,
+                        producer: PARTICLES.0,
+                        count: p.count,
+                        _pad: 0,
+                    })
+                    .unwrap();
+                c.cmd
+                    .dispatch(&p.emit, root, [p.count.div_ceil(64).max(1), 1, 1]);
+            })
+            .unwrap();
+        }
         let view = f.raster_view(&desc).unwrap();
         let id = f.id();
         self.last_id = id;
@@ -1640,6 +1813,15 @@ impl Bed {
                 roots: &mut self.roots,
             },
         );
+        if let Some(p) = &self.particles {
+            let lighting = self.target.particle_lighting(id);
+            let radiance = self.target.radiance_storage();
+            f.transparency(&view, radiance, &mut |pass| {
+                p.draw.record(pass, lighting, p.anisotropy).unwrap();
+            })
+            .unwrap();
+        }
+        let list = f.list().unwrap();
         list.barrier(
             Stages::COMPUTE | Stages::RAY,
             Stages::COMPUTE,

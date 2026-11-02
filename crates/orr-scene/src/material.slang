@@ -183,6 +183,14 @@ public float3 material_emission(MaterialGpu* m)
     return (m.flags & MATERIAL_EMISSIVE) != 0 ? m.emission_color * m.emission_luminance : float3(0.0);
 }
 
+// What `m` emits as a light, in nits: `material_emission`, times `geometry_opacity` for
+// presence materials, which rays see in that share.
+public float3 material_light_emission(MaterialGpu* m)
+{
+    float3 e = material_emission(m);
+    return (m.flags & MATERIAL_PRESENCE) != 0 ? e * saturate(m.geometry_opacity) : e;
+}
+
 // Where a texture lookup reads: uv and its change per render pixel along x and y, with any
 // level-of-detail bias already applied, and the two uniforms in [0, 1) that pick the
 // stochastic filter's texel. A negative `tap.x` takes hardware filtering only.

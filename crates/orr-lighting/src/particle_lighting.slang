@@ -1,0 +1,164 @@
+// Light and fog for blended particles drawn at the transparency point. Inside the view's
+// froxel volume a particle takes the froxels' isotropic incident light and the visibility of
+// their shadowed directional lights; beyond it, the world cache's light on two opposed faces,
+// one shadow ray from its point toward each shadowed light and the other directional lights
+// unshadowed. Its fog is the froxels' in-scatter and transmittance from the eye, so a particle
+// writes a x (C x T + S) into the overlay, which composites over radiance that media apply
+// already fogged.
+module particle_lighting;
+
+import orr.abi;
+import orr.math;
+import orr.color;
+import orr.random;
+import orr.trace;
+import hit;
+import visibility;
+import media;
+import light_sampling;
+import world_cache;
+import path;
+import shadow;
+import froxels;
+
+// Separates particles' samples from the paths' of the same pixel.
+public static const uint PARTICLE_STREAM = 0x68E31DA4;
+
+// What a view's transparency hooks light and fog particles with, for one frame.
+public struct ParticleLighting
+{
+    public SceneRoot* scene;
+    public ViewConstants* view;
+    public LightSetGpu* set;
+    public WorldCacheGpu* cache;
+    public FroxelLights* lights;        // the froxels' shadowed directional lights
+    public LayerGuide* layers;          // the dielectric dispatch's layer memory, null for none
+    public TextureIndex incident;       // froxel_incident; NONE without froxels
+    public TextureIndex visibility;     // the shadowed lights past the first
+    public TextureIndex integrated;     // froxel_integrated
+    public TextureIndex integrated_rgb; // rgb transmittance; NONE for its luminance
+    public SamplerIndex sampler;        // linear, clamped
+    public uint columns;
+    public uint rows;
+    public uint slices;
+    public uint frame;
+    public uint seed;
+}
+
+// Radiance a particle of unit albedo at render-space `x` scatters toward the eye along unit
+// `to_eye`, unexposed, with a Henyey-Greenstein response of `anisotropy` to directional
+// light; the rest scatters isotropically. Draws two sampler dimensions.
+public float3 particle_light<S : ISurface, M : IMedium>(ParticleLighting* l, float3 x, float3 to_eye, float anisotropy, inout Sampler rng)
+{
+    SceneRoot* s = l.scene;
+    LightSetGpu* set = l.set;
+    uint64_t data = s.medium;
+    FroxelLights lights = *l.lights;
+    float3 coord;
+    bool inside = l.incident.index != IMAGE_NONE
+        && froxel_coord(uint3(l.columns, l.rows, l.slices), l.view, s.near_range, x, coord);
+    float vis[MAX_FROXEL_SHADOWED_LIGHTS];
+    float3 light;
+    if (inside)
+    {
+        SamplerState ss = l.sampler.get();
+        float4 incident = l.incident.get<Texture3D<float4>>().SampleLevel(ss, coord, 0.0);
+        float4 more = lights.count > 1 ? l.visibility.get<Texture3D<float4>>().SampleLevel(ss, coord, 0.0) : float4(1.0);
+        light = incident.rgb;
+        vis[0] = incident.a;
+        vis[1] = more.x;
+        vis[2] = more.y;
+        vis[3] = more.z;
+        rng.next2();
+    }
+    else
+    {
+        light = particle_irradiance(l.cache, s, x, to_eye, rng) * (0.5 * INV_PI);
+        float offset = T_MIN_BASE * (1.0 + length(x - l.view.eye_render.xyz) * T_MIN_SCALE);
+        RayCone cone = { 0.0, 0.0 };
+        for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
+        {
+            vis[j] = 1.0;
+            if (j >= lights.count)
+                continue;
+            float3 to_light = s.lights[lights.ids[j]].direction;
+            float3 t = visibility<S, M>(s, l.view, x + to_light * offset, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), false, set.shadow_overflows);
+            vis[j] = (t.x + t.y + t.z) / 3.0;
+        }
+    }
+    for (uint k = 0; k < set.directional_count; k++)
+    {
+        uint id = set.directional_ids[k];
+        float v = 1.0;
+        bool shadowed = false;
+        for (uint j = 0; j < lights.count; j++)
+        {
+            if (lights.ids[j] == id)
+            {
+                v = vis[j];
+                shadowed = true;
+            }
+        }
+        // Inside the volume the incident term holds the unshadowed lights.
+        if ((inside && !shadowed) || !(v > 0.0))
+            continue;
+        float3 to_light = s.lights[id].direction;
+        light += directional_illuminance(set, id) * v * hg_phase(anisotropy, dot(-to_light, to_eye))
+            * M.transmittance(data, x, to_light, positive_infinity());
+    }
+    return light;
+}
+
+// The in-scatter (pre-exposed) and transmittance from the eye to distance `t` along the ray
+// through image point `p`, in render pixels: the froxels' up to the scene's `near_range`.
+public float3 particle_fog(ParticleLighting* l, float2 p, float t, out float3 transmittance)
+{
+    transmittance = float3(1.0);
+    if (l.integrated.index == IMAGE_NONE)
+        return float3(0.0);
+    return integrated_fog(l.integrated, l.integrated_rgb, l.sampler, uint3(l.columns, l.rows, l.slices), l.view.extent, l.scene.near_range, p, t, transmittance);
+}
+
+// The overlay value, premultiplied and pre-exposed, of a particle fragment at image point `p`
+// (render pixels, `SV_Position.xy`) and render-space `x`, of `albedo`, `emission` (nits,
+// unexposed), `opacity` and directional response `anisotropy`: opacity x (C x T + S), with C
+// its light and emission and T and S its fog. Nothing behind the dielectric or presence layer
+// the pixel shades, which shows what lies behind it through its own rays; no fog where the eye
+// lies in an interior.
+public float4 particle_shade<S : ISurface, M : IMedium>(ParticleLighting* l, float2 p, float3 x, float3 albedo, float3 emission, float opacity, float anisotropy)
+{
+    ViewConstants* v = l.view;
+    float3 to_eye = v.eye_render.xyz - x;
+    float t = length(to_eye);
+    to_eye /= max(t, 1e-30);
+    float end = 0.0;
+    if (l.layers != nullptr)
+        end = layer_guide(l.layers, v.extent, min(uint2(p), v.extent - 1)).medium_end;
+    if (end > 0.0 && t > end)
+        return float4(0.0);
+    float3 transmittance = float3(1.0);
+    float3 fog = float3(0.0);
+    if (!(end < 0.0))
+        fog = particle_fog(l, p, t, transmittance);
+    Sampler rng = Sampler(uint2(p), l.frame, l.seed ^ PARTICLE_STREAM);
+    float3 c = albedo * particle_light<S, M>(l, x, to_eye, anisotropy, rng) + emission;
+    float a = saturate(opacity);
+    float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
+    return float4(apply_hdr_ceiling(a * (c * pre_exposure * transmittance + fog)), a);
+}
+
+// The stock particle draw's fragment at image point `p` of triangle `primitive` of the view's
+// visible cluster `visible` (`RasterGpu` `raster`'s): `particle_shade` with the surface's base
+// color as albedo, its emission, and the material's opacity for presence materials, else the
+// surface's coverage.
+public float4 particle_fragment<S : ISurface, M : IMedium>(ParticleLighting* l, RasterGpu* raster, uint visible, uint primitive, float2 p, float anisotropy)
+{
+    VisibleCluster vc = raster.gbuffer.clusters[visible];
+    PrimaryHit hit = primary_hit(l.scene, l.view, vc, primitive, p);
+    SurfaceInput i = hit.input;
+    float offset;
+    GSurface g = S.surface(i, offset);
+    bool presence = (l.scene.materials[i.material].flags & MATERIAL_PRESENCE) != 0;
+    float opacity = presence ? material_opacity(i) : S.coverage(i);
+    return particle_shade<S, M>(l, p, i.position, g.bsdf.base_color, g.bsdf.emission, opacity, anisotropy);
+}

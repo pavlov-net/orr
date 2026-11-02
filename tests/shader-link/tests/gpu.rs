@@ -248,6 +248,7 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
             "light_sampling/directional",
             "media/apply",
             "media/froxel",
+            "media/particle_draw",
             "path/opaque",
             "world_cache/update"
         ]

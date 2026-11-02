@@ -775,6 +775,48 @@ public float resolve_coverage<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
     return S.coverage(h.input);
 }
 
+// What a triangle candidate of a particle producer entry shows rays that take particles by
+// their emission alone: its material, its unit render-space front-face normal, the emission
+// there in nits, unexposed (the emission texture where bound), and its opacity
+// (`material_opacity`), both at the hit's uv from the entry's batch. False for any other
+// candidate.
+public bool resolve_particle(SceneRoot* s, uint instance_index, uint cluster_id, uint primitive, float2 bary, out uint material, out float3 normal, out float3 emission, out float opacity)
+{
+    material = MATERIAL_NONE;
+    normal = float3(0.0);
+    emission = float3(0.0);
+    opacity = 0.0;
+    uint entry;
+    if (!hit_producer(s, instance_index, entry))
+        return false;
+    ProducerGpu p = s.producers[entry];
+    ProducerBatch b = s.batches[entry];
+    if (p.opacity != PRODUCER_PARTICLE || cluster_id >= emitted_clusters(b))
+        return false;
+    ProducerClusterGpu k = b.clusters[cluster_id];
+    material = producer_material(p, k);
+    if (material == MATERIAL_NONE)
+        return false;
+    Placement pl;
+    if (!producer_placement(s, p, false, s.origin_cell.xyz, float3(0.0), uint(s.origin_cell.w), pl))
+        return false;
+    Corners t = producer_triangle(b, k, primitive, false).corners;
+    float3 e1 = mul(pl.linear, t.position[1] - t.position[0]);
+    float3 e2 = mul(pl.linear, t.position[2] - t.position[0]);
+    normal = safe_normalize(cross(e1, e2), float3(0.0, 0.0, 1.0));
+    SurfaceInput i = (SurfaceInput)0;
+    i.scene = s;
+    i.material = material;
+    i.uv[0].uv = (1.0 - bary.x - bary.y) * t.attributes[0].uv[0] + bary.x * t.attributes[1].uv[0]
+        + bary.y * t.attributes[2].uv[0];
+    i.uv[0].tap = float2(-1.0);
+    i.uv[1] = i.uv[0];
+    MaterialGpu* m = s.materials + material;
+    emission = material_color(m, TEXTURE_EMISSION, i.uv, material_emission(m));
+    opacity = material_opacity(i);
+    return true;
+}
+
 // The render-space position last frame of the point a ray hit: the previous transform for
 // rigid content, the previous positions of producer batches that keep them. False where the
 // hit does not resolve.

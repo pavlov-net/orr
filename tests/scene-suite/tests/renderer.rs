@@ -448,7 +448,7 @@ fn hooked_frames(pack: &Arc<[u8]>, alias: bool) -> (Vec<Vec<u8>>, ArenaReport) {
             f.list().unwrap().discard(&image);
         }
         let hooked = i == 1 || i == 2;
-        let mut transparency = |_: &mut TransparencyPass<'_, '_>| {};
+        let mut transparency = |_: &mut TransparencyPass<'_, '_>, _| {};
         let mut scene_referred = |_: &mut HookPass<'_, '_>| {};
         let mut display_linear = |_: &mut HookPass<'_, '_>| {};
         let mut hooks = if hooked {

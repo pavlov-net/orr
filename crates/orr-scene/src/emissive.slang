@@ -54,7 +54,7 @@ void instances(uint3 id: SV_DispatchThreadID)
         area = e.model_area * pow(abs(determinant(m)), 2.0 / 3.0);
         // Chain steps past the first add no light; a fading copy shows its model in part.
         area *= step_presence(s.slot_state[e.source], 0);
-        power = material_emission(s.materials + material) * area;
+        power = material_light_emission(s.materials + material) * area;
     }
     e.power = power;
     e.area = area;
@@ -86,7 +86,7 @@ void producers(uint3 entry: SV_GroupID, uint3 thread: SV_GroupThreadID)
         ProducerClusterGpu k = b.clusters[c];
         if (k.material >= p.material_count)
             continue;
-        float3 l = material_emission(s.materials + p.materials[k.material]);
+        float3 l = material_light_emission(s.materials + p.materials[k.material]);
         if (all(l == 0.0))
             continue;
         float a = 0.0;

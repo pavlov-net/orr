@@ -28,8 +28,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use orr_lighting::{
-    self, Error as LightingError, LightingDebugView, LightingStats, MediaSettings, PathEntry,
-    ReferenceSettings, SceneLightingSettings, ThinLens, ViewLighting, WorldCacheSettings,
+    self, Error as LightingError, LightingDebugView, LightingStats, MediaSettings, ParticleDraw,
+    ParticleLighting, PathEntry, ReferenceSettings, SceneLightingSettings, ThinLens, ViewLighting,
+    WorldCacheSettings,
 };
 #[cfg(windows)]
 pub use orr_output::DisplayWatch;
@@ -106,13 +107,20 @@ pub struct FrameDesc<'a> {
     pub display: Option<&'a mut Display>,
 }
 
+/// A view's transparency hook: draws into the pass's overlay, lighting and fogging particles
+/// with the view's [`ParticleLighting`] of the frame.
+pub type TransparencyHook<'a> =
+    dyn FnMut(&mut TransparencyPass<'_, '_>, GpuPtr<ParticleLighting>) + 'a;
+
 /// The consumer passes a view runs, each once per `render_view` that sets it.
 #[derive(Default)]
 pub struct ViewHooks<'a> {
-    /// Into the view's transparency overlay after its opaque and dielectric lighting, at the
-    /// render extent; the overlay is composited over the radiance before `scene_referred`.
+    /// Into the view's transparency overlay after its opaque and dielectric lighting and
+    /// media apply, at the render extent, with the view's [`ParticleLighting`] for this
+    /// frame, which [`ParticleDraw`] and a hook's own `particle_shade` light and fog
+    /// particles with; the overlay is composited over the radiance before `scene_referred`.
     /// Particle producer entries are drawn here or not at all for primary visibility.
-    pub transparency: Option<&'a mut dyn FnMut(&mut TransparencyPass<'_, '_>)>,
+    pub transparency: Option<&'a mut TransparencyHook<'a>>,
     /// On the view's pre-exposed radiance before metering, at the output extent; compute
     /// work in [`Frame::output_list`].
     pub scene_referred: Option<&'a mut dyn FnMut(&mut HookPass<'_, '_>)>,
@@ -744,8 +752,9 @@ impl<'a> Frame<'a> {
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         let (radiance, radiance_store) = (paths.radiance_index(), paths.radiance_storage());
         if let Some(hook) = hooks.transparency.as_mut() {
+            let particles = paths.particle_lighting(id);
             self.scenes
-                .transparency(&raster, radiance_store, &mut **hook)?;
+                .transparency(&raster, radiance_store, &mut |pass| hook(pass, particles))?;
         }
         let (list, arena) = self.scenes.output_list_and_arena(view.history)?;
         arena.enter(ViewStep::SceneReferred, list);

@@ -1,14 +1,15 @@
 //! The froxel volume: the slice mapping, the froxel lookup of points, froxel in-scatter
 //! against the reference camera march in open haze and under a canopy, silhouettes against
 //! fogged sky, camera segments ending at dielectric layers, and directional lights past the
-//! shadowed ones.
+//! shadowed ones. Blended particles: in shade against in sun inside and beyond the froxel
+//! volume, fogged by the single scattering in front of them, and steady at a still camera.
 
 use lighting_suite::bed::{
-    Accumulated, Bed, CANOPY, EXTENT, FLOOR, GLASS_SPHERE, Item, LEAF, MIRROR, Paths, SKY, Spec,
-    WHITE_SPHERE,
+    Accumulated, Bed, CANOPY, EXTENT, FLOOR, GLASS_SPHERE, Item, LEAF, MIRROR, Particle,
+    ParticleLook, Paths, SKY, SUN, Spec, WHITE_SPHERE, pixel_of,
 };
 use lighting_suite::shaders::{
-    fog_apply, fog_directional, fog_froxel, froxel_lookup, froxel_probe,
+    fog_apply, fog_directional, fog_froxel, fog_particles, froxel_lookup, froxel_probe,
 };
 use lighting_suite::{assert_clean, finish, kernels, pipeline, readback, render, upload};
 use orr_color::luminance;
@@ -18,7 +19,7 @@ use orr_lighting::{
     ReferenceSettings, ViewLighting,
 };
 use orr_math::{Mat3, Vec3};
-use orr_scene::RendererDesc;
+use orr_scene::{Opacity, RendererDesc};
 use std::cell::RefCell;
 use std::sync::OnceLock;
 
@@ -30,6 +31,7 @@ fn fog_kernels() -> &'static KernelSet {
             (&fog_froxel::MODULE, "media/froxel"),
             (&fog_apply::MODULE, "media/apply"),
             (&fog_directional::MODULE, "light_sampling/directional"),
+            (&fog_particles::MODULE, "media/particle_draw"),
         ])
     })
 }
@@ -445,6 +447,144 @@ fn camera_segments_end_at_dielectric_layers() {
     assert!(
         (ratio - 3.0).abs() < 0.15,
         "in-scatter to the glass at 15 m is {ratio:.3} times that at 5 m"
+    );
+    assert_clean();
+}
+
+/// White particles 0.4 m across facing the camera, opaque.
+const WHITE_PARTICLES: ParticleLook = ParticleLook {
+    albedo: [0.8; 3],
+    emission: [0.0; 3],
+    opacity: 1.0,
+    anisotropy: 0.0,
+};
+
+/// Two particles 3 m apart over the floor under the sun and the sky, the right one in the
+/// shadow of a white sphere 3 m toward the sun from it.
+fn sun_and_shade() -> (Spec, [Vec3; 2]) {
+    let (lit, shaded) = (Vec3::new(-1.5, 1.0, 0.0), Vec3::new(1.5, 1.0, 0.0));
+    let blocker = shaded + SUN.direction_to_light * 3.0;
+    let spec = Spec {
+        copies: vec![at(FLOOR, Vec3::ZERO), at(WHITE_SPHERE, blocker)],
+        lights: vec![Light::Directional(SUN)],
+        environment: Some(SKY),
+        eye: Vec3::new(0.0, 1.2, 6.0),
+        target: Vec3::new(0.0, 1.0, 0.0),
+        fov_y: 0.8,
+        focus: None,
+    };
+    (spec, [lit, shaded])
+}
+
+/// A particle in the shadow of a sphere is darker than one in the sun, lit by the froxels
+/// inside their range and by its own shadow ray and the world cache beyond it.
+#[test]
+fn particles_in_shade_are_darker_than_in_the_sun() {
+    let paths = Paths::new(
+        &KernelSet::default(),
+        PathEntry::Fastest,
+        ViewLighting::default(),
+    );
+    for near_range in [256.0, 2.0] {
+        let (spec, points) = sun_and_shade();
+        let mut bed = Bed::with(spec.clone());
+        bed.set_near_range(near_range);
+        let particles = points.map(|center| Particle { center, size: 0.2 });
+        bed.set_particles(&particles, WHITE_PARTICLES, Opacity::Particle);
+        let a = bed.accumulate(16, 5, &mut |list, f| paths.record(list, f));
+        let [lit, shaded] = points.map(|p| luminance(a.around(pixel_of(&spec, p), 2)));
+        assert!(
+            lit > 0.0 && shaded < 0.6 * lit,
+            "near_range {near_range}: in the sun {lit:.1}, in the shade {shaded:.1}"
+        );
+    }
+    assert_clean();
+}
+
+/// An emissive opaque particle 40 m away in height fog under a uniform sky: what reaches the
+/// eye from it is its emission through the fog's transmittance plus the sky's single
+/// scattering over the segment in front of it, L (1 - T), not its emission pasted over the
+/// fogged sky.
+#[test]
+fn particles_in_fog_take_the_fog_in_front_of_them() {
+    let fog = Fog {
+        density: 0.02,
+        base_height: 0.0,
+        falloff_height: 100.0,
+    };
+    let eye = Vec3::new(0.0, 1.0, 0.0);
+    let target = Vec3::new(0.0, 1.0, -40.0);
+    let emission = 2000.0f32;
+    let (mut bed, _fog) = foggy(&fog, Vec::new(), Vec::new(), Some(SKY), eye, target);
+    let look = ParticleLook {
+        albedo: [0.0; 3],
+        emission: [emission; 3],
+        opacity: 1.0,
+        anisotropy: 0.0,
+    };
+    bed.set_particles(
+        &[Particle {
+            center: target,
+            size: 1.0,
+        }],
+        look,
+        Opacity::Particle,
+    );
+    let paths = Paths::new(fog_kernels(), PathEntry::Fastest, ViewLighting::default());
+    let a = bed.accumulate(16, 3, &mut |list, f| paths.record(list, f));
+    let got = luminance(a.around(pixel_of(&bed.spec, target), 2));
+    let sigma = f64::from(fog.density) * (-f64::from(eye.y) / f64::from(fog.falloff_height)).exp();
+    let transmittance = (-sigma * 40.0).exp();
+    let sky = luminance(SKY.map(f64::from));
+    let inscatter = sky * (1.0 - transmittance);
+    let wanted = f64::from(emission) * transmittance + inscatter;
+    assert!(
+        (got - wanted).abs() <= 0.05 * wanted,
+        "fogged particle {got:.1}, wanted {wanted:.1}: emission through the fog {:.1}, in-scatter {inscatter:.1}",
+        f64::from(emission) * transmittance
+    );
+    assert_clean();
+}
+
+/// At a still camera a sunlit particle in haze does not flicker: from one frame to the next it
+/// changes by under 1% (root mean square), the noise its froxels' blended light keeps, even while
+/// its level still drifts slowly.
+#[test]
+fn particles_stay_steady_at_a_still_camera() {
+    let (spec, [lit, _]) = sun_and_shade();
+    let (mut bed, _fog) = foggy(
+        &HAZE,
+        spec.copies.clone(),
+        spec.lights.clone(),
+        spec.environment,
+        spec.eye,
+        spec.target,
+    );
+    bed.set_particles(
+        &[Particle {
+            center: lit,
+            size: 0.2,
+        }],
+        WHITE_PARTICLES,
+        Opacity::Particle,
+    );
+    let paths = Paths::new(fog_kernels(), PathEntry::Fastest, ViewLighting::default());
+    let mut frames = Vec::new();
+    for k in 0..48 {
+        let a = bed.follow(spec.eye, spec.target, k, &mut |list, f| {
+            paths.record(list, f);
+        });
+        if k >= 32 {
+            frames.push(luminance(a.around(pixel_of(&spec, lit), 2)));
+        }
+    }
+    let mean = frames.iter().sum::<f64>() / frames.len() as f64;
+    let steps = frames.windows(2).map(|w| (w[1] - w[0]) * (w[1] - w[0]));
+    let change = (steps.sum::<f64>() / (frames.len() - 1) as f64).sqrt() / mean;
+    assert!(
+        change < 0.01,
+        "frame to frame the particle changes by {:.2}% around {mean:.1}",
+        100.0 * change
     );
     assert_clean();
 }
