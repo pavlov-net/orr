@@ -204,9 +204,9 @@ impl Img {
     }
 
     /// Bilinear resize; used to bring a packed texture's inputs to one size.
-    pub(crate) fn resized(&self, w: u32, h: u32) -> Self {
+    pub(crate) fn resized(self, w: u32, h: u32) -> Self {
         if (w, h) == (self.w, self.h) {
-            return self.clone();
+            return self;
         }
         let mut out = Self::new(w, h);
         for y in 0..h {
