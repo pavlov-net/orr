@@ -8,7 +8,8 @@
 //! Accessors are read here, including the normalized and unnormalized integer forms
 //! `KHR_mesh_quantization` allows and sparse accessors. A texture's `EXT_texture_webp` image
 //! replaces its core `source`, so a texture may carry only the extension's source. An asset
-//! whose `minVersion` is above glTF 2.1 is refused.
+//! whose `minVersion` is not glTF 2.0 or 2.1, or without one whose `version` has a major other than
+//! 2, is refused.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -63,6 +64,25 @@ pub(crate) struct Document {
     pub buffers: Vec<Buffer>,
 }
 
+/// Whether the cook reads this asset: its `minVersion` when it has one, else its `version`.
+fn check_version(asset: &Value) -> Result<(), String> {
+    let parse = |v: &Value| {
+        let (major, minor) = v.as_str()?.split_once('.')?;
+        Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?))
+    };
+    if let Some(v) = asset.get("minVersion") {
+        if parse(v).is_none_or(|m| m.0 != 2 || m.1 > 1) {
+            return Err(format!("asset minVersion {v} is not glTF 2.0 or 2.1"));
+        }
+    } else if parse(&asset["version"]).is_none_or(|v| v.0 != 2) {
+        return Err(format!(
+            "asset version {} is not a glTF 2 version",
+            asset["version"]
+        ));
+    }
+    Ok(())
+}
+
 /// Opens a `.gltf` or `.glb` file's bytes; buffer URIs resolve against `dir`.
 pub(crate) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
     let (json_bytes, mut bin) = if bytes.starts_with(b"glTF") {
@@ -75,17 +95,7 @@ pub(crate) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
         (bytes.to_vec(), None)
     };
     let mut json: Value = serde_json::from_slice(&json_bytes).map_err(|e| e.to_string())?;
-    if let Some(v) = json["asset"].get("minVersion") {
-        let min = v.as_str().and_then(|s| {
-            let (major, minor) = s.split_once('.')?;
-            Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?))
-        });
-        if min.is_none_or(|m| m > (2, 1)) {
-            return Err(format!(
-                "asset minVersion {v} is not a glTF version up to 2.1"
-            ));
-        }
-    }
+    check_version(&json["asset"])?;
     if let Some(Value::Array(required)) = json.get_mut("extensionsRequired") {
         required.retain(|e| !e.as_str().is_some_and(|n| COOK_EXTENSIONS.contains(&n)));
     }
@@ -475,12 +485,25 @@ fn decode_view(e: &Value, src: &[u8], length: usize) -> Result<Vec<u8>, String> 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn min_version_above_2_1_is_refused() {
+    fn min_version_other_than_2_0_or_2_1_is_refused() {
         let opens = |min: &str| {
             let json = format!(r#"{{"asset":{{"version":"2.1","minVersion":"{min}"}}}}"#);
             super::open(json.as_bytes(), std::path::Path::new("")).is_ok()
         };
         assert!(opens("2.0") && opens("2.1"));
-        assert!(!opens("2.2") && !opens("2.10") && !opens("3.0") && !opens("2"));
+        assert!(!opens("2.2") && !opens("2.10") && !opens("3.0") && !opens("2") && !opens("1.0"));
+    }
+
+    #[test]
+    fn version_major_other_than_2_is_refused_without_min_version() {
+        let opens = |asset: &str| {
+            let json = format!(r#"{{"asset":{asset}}}"#);
+            super::open(json.as_bytes(), std::path::Path::new("")).is_ok()
+        };
+        assert!(opens(r#"{"version":"2.0"}"#) && opens(r#"{"version":"2.9"}"#));
+        assert!(!opens(r#"{"version":"1.0"}"#) && !opens(r#"{"version":"3.0"}"#));
+        assert!(!opens(r#"{"version":"2"}"#) && !opens(r#"{"version":2.0}"#) && !opens("{}"));
+        // A newer asset that a reader of 2.0 can load.
+        assert!(opens(r#"{"version":"3.0","minVersion":"2.0"}"#));
     }
 }
