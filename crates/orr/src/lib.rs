@@ -10,7 +10,7 @@
 //! 3. [`Frame::update_scenes`] applies every write and runs the consumer's scene compute.
 //! 4. [`Frame::render_view`] once per view records its raster half,
 //! 5. then the view's lighting and output: the scene's lighting pass before its first view,
-//!    one path per pixel, the hooks, exposure, tonemap, the UI and compose. A consumer may
+//!    one path per pixel, the hooks, exposure, glare, tonemap, the UI and compose. A consumer may
 //!    instead shade the G-buffer [`Frame::raster_view`] returns with its own kernels in
 //!    [`Frame::list`] and show the result with [`Frame::compose`].
 //! 6. [`Frame::end`] records the display's frame generation, submits the frame and hands
@@ -38,9 +38,9 @@ pub use orr_output::{self, Error as OutputError};
 pub use orr_output::{
     AutoExposure, AutoWhiteBalance, CalibrationPattern, CompensationCurve, Display, DisplayFeed,
     DisplayInfo, DisplayRequest, DlssSdk, DlssSupport, Exposure, ExposureTelemetry,
-    FrameGenerationMode, Grade, Gt7Params, HookPass, LocalExposure, MeterWeights, OutputDebug,
-    Physiological, Presented, Primaries, ResolvedDisplay, Screenshot, ScreenshotRequest,
-    SkyTelemetry, UiPass, ViewOutput,
+    FrameGenerationMode, GlareMethod, Grade, Gt7Params, HookPass, LocalExposure, MeterWeights,
+    OutputDebug, Physiological, PostQuality, Presented, Primaries, ResolvedDisplay, Screenshot,
+    ScreenshotRequest, SkyTelemetry, UiPass, ViewOutput,
 };
 pub use orr_scene::Error as SceneError;
 pub use orr_scene::{self, RasterView};
@@ -69,8 +69,8 @@ use orr_gpu::{
 use orr_lighting::{BsdfTables, LightingKernels, LightingView, SceneLighting, ScenePass, ViewPass};
 use orr_output::{
     CapturePass, ChainImages, ComposePass, ComposeRoot, ComposeSource, DisplayFrame, ExposurePass,
-    HookInputsPass, HookPoint, Hooks, Image, OutputKernels, OutputView, SceneCapturePass,
-    TonemapPass, UI_PASS,
+    GlarePass, HookInputsPass, HookPoint, Hooks, Image, OutputKernels, OutputView,
+    SceneCapturePass, TonemapPass, UI_PASS,
 };
 use orr_scene::{ArenaRequest, Scenes};
 
@@ -681,8 +681,8 @@ impl<'a> Frame<'a> {
     /// radiance, then the dielectric dispatch over it, which traces each pixel's first
     /// dielectric or presence layer; media apply over each pixel's camera segment;
     /// `hooks.scene_referred`; a scene-referred screenshot; metering and adaptation; then,
-    /// unless the view stops there, tonemap, `hooks.display_linear`, `hooks.ui`, compose and
-    /// a display screenshot.
+    /// unless the view stops there, the lens's glare, tonemap, `hooks.display_linear`,
+    /// `hooks.ui`, compose and a display screenshot.
     ///
     /// The target decides the output: the display's backbuffer at its window's extent; a
     /// texture with storage usage (RGBA8 or RGBA16F), written SDR-encoded with paper white
@@ -871,6 +871,21 @@ impl<'a> Frame<'a> {
                 output,
             },
         )?;
+        // A view that stops after exposure shows no glare and holds no chain for it.
+        let glare = kernels.glare(
+            list,
+            &mut state.output,
+            &GlarePass {
+                source: chain.rr_output,
+                extent,
+                view: raster.view,
+                sensor_width_mm: view.lens.sensor_width_mm,
+                glare: view.lens.glare.filter(|_| tonemapped),
+                display: &resolved,
+                frame: id,
+                output,
+            },
+        )?;
         if !tonemapped {
             arena.enter(ViewStep::After, list);
             return Ok(RenderedView {
@@ -892,7 +907,7 @@ impl<'a> Frame<'a> {
                 display: &resolved,
                 output,
                 hook_source: set.display_linear.then_some(radiance_store),
-                glare: None,
+                glare,
                 distortion,
                 frame: id,
             },

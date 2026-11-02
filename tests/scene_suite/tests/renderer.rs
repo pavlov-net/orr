@@ -1,6 +1,6 @@
 //! The frame through `orr::Renderer`: frames with no scene and no view, a scene frame with
-//! a view, a consumer pipeline that hot reload replaces, and views whose transient targets
-//! share memory.
+//! a view, a consumer pipeline that hot reload replaces, views whose transient targets share
+//! memory, and the glare a view's lens asks for.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 
 use glam::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr::{
-    Affine3, ArenaReport, Budgets, DirectionalLight, DiscProfile, FrameDesc, FrameTime,
-    GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, Light, LightId, LoadState,
-    PackSource, PathEntry, PipelineId, Projection, ReloadReport, Renderer, RendererDesc, SceneDesc,
-    SceneId, TextureFilter, TransformGroupDesc, TransparencyPass, ViewDesc, ViewHooks,
-    ViewLighting, ViewOutput, ViewTarget,
+    Affine3, ArenaReport, Budgets, DirectionalLight, DiscProfile, Exposure, FrameDesc, FrameTime,
+    Glare, GlareMethod, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, Light, LightId,
+    LoadState, MountId, OutputDebug, PackSource, PathEntry, PipelineId, PostQuality, Projection,
+    ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId, TextureFilter, TransformGroupDesc,
+    TransparencyPass, ViewDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source};
 use orr_gpu::{
@@ -261,15 +261,8 @@ fn quad(m: &mut MeshInput, corners: [Vec3; 4], normal: Vec3) {
     m.indices.extend(order.map(|i| first + i));
 }
 
-/// A pack of an 8 m floor and a 1 m box.
-fn floor_and_box() -> Arc<[u8]> {
-    let mut floor = MeshInput::default();
-    let corners = [(-4.0, -4.0), (4.0, -4.0), (4.0, 4.0), (-4.0, 4.0)];
-    quad(
-        &mut floor,
-        corners.map(|(x, z)| Vec3::new(x, 0.0, z)),
-        Vec3::Y,
-    );
+/// A 1 m cube centered on the origin.
+fn cube() -> MeshInput {
     let mut cube = MeshInput::default();
     for axis in 0..3 {
         for sign in [-1.0f32, 1.0] {
@@ -279,7 +272,12 @@ fn floor_and_box() -> Arc<[u8]> {
             quad(&mut cube, [c - u - v, c + u - v, c + u + v, c - u + v], n);
         }
     }
-    let model = |name: &str, mut mesh: MeshInput, base_color| {
+    cube
+}
+
+/// A pack of `models`, each a mesh with one material.
+fn pack_of<const N: usize>(models: [(&str, MeshInput, Material); N]) -> Arc<[u8]> {
+    let model = |(name, mut mesh, material): (&str, MeshInput, Material)| {
         mesh.sections = vec![Span {
             first: 0,
             count: mesh.indices.len() as u32,
@@ -288,11 +286,7 @@ fn floor_and_box() -> Arc<[u8]> {
             name: name.into(),
             source: Source::Mesh {
                 mesh,
-                materials: vec![Material {
-                    base_color,
-                    specular_roughness: 0.5,
-                    ..Material::default()
-                }],
+                materials: vec![material],
                 settings: MeshSettings::default(),
             },
         }
@@ -300,16 +294,50 @@ fn floor_and_box() -> Arc<[u8]> {
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(
             Target::Memory,
-            vec![
-                model("floor", floor, [0.5; 3]),
-                model("box", cube, [0.8, 0.2, 0.1]),
-            ],
+            models.into_iter().map(model).collect(),
         )],
     };
     orr_cook::cook(&manifest, &Default::default())
         .unwrap()
         .memory
         .remove(0)
+}
+
+/// A pack of an 8 m floor and a 1 m box.
+fn floor_and_box() -> Arc<[u8]> {
+    let mut floor = MeshInput::default();
+    let corners = [(-4.0, -4.0), (4.0, -4.0), (4.0, 4.0), (-4.0, 4.0)];
+    quad(
+        &mut floor,
+        corners.map(|(x, z)| Vec3::new(x, 0.0, z)),
+        Vec3::Y,
+    );
+    let diffuse = |base_color| Material {
+        base_color,
+        specular_roughness: 0.5,
+        ..Material::default()
+    };
+    pack_of([
+        ("floor", floor, diffuse([0.5; 3])),
+        ("box", cube(), diffuse([0.8, 0.2, 0.1])),
+    ])
+}
+
+/// The EV100 at which [`lamp`] exposes to 0.5.
+const LAMP_EV100: f32 = 14.0;
+
+/// A pack of a 1 m cube that only emits.
+fn lamp() -> Arc<[u8]> {
+    pack_of([(
+        "lamp",
+        cube(),
+        Material {
+            base_color: [0.0; 3],
+            emission_color: [1.0; 3],
+            emission_luminance: 0.5 / orr::orr_output::exposure_from_ev100(LAMP_EV100),
+            ..Material::default()
+        },
+    )])
 }
 
 /// World from view for a camera at `eye` looking at the origin, y up.
@@ -324,6 +352,29 @@ fn time(frame: u32) -> FrameTime {
         absolute: f64::from(frame) / 60.0,
         delta: 1.0 / 60.0,
     }
+}
+
+/// Mounts `pack` and runs empty frames from `frame` on until it has loaded; something must
+/// be running the loading jobs.
+fn mount_pack(r: &mut Renderer, pack: &Arc<[u8]>, frame: &mut u32) -> MountId {
+    let mount = r.mount(PackSource::Memory(Arc::clone(pack)));
+    let start = Instant::now();
+    while matches!(r.mount_state(mount), LoadState::Pending) {
+        *frame += 1;
+        let f = r
+            .begin_frame(FrameDesc {
+                time: time(*frame),
+                scenes: &[],
+                display: None,
+            })
+            .unwrap();
+        wait(f.end().unwrap());
+        assert!(start.elapsed() < Duration::from_secs(60), "mount pending");
+    }
+    if let LoadState::Failed(e) = r.mount_state(mount) {
+        panic!("mount failed: {e}");
+    }
+    mount
 }
 
 /// Four frames of `pack`'s floor and box through `render_view` into an RGBA16F texture, the
@@ -348,24 +399,8 @@ fn hooked_frames(pack: &Arc<[u8]>, alias: bool) -> (Vec<Vec<u8>>, ArenaReport) {
         let l = Arc::clone(&loading);
         std::thread::spawn(move || l.run_worker())
     };
-    let mount = r.mount(PackSource::Memory(Arc::clone(pack)));
-    let start = Instant::now();
     let mut frame = 0;
-    while matches!(r.mount_state(mount), LoadState::Pending) {
-        frame += 1;
-        let f = r
-            .begin_frame(FrameDesc {
-                time: time(frame),
-                scenes: &[],
-                display: None,
-            })
-            .unwrap();
-        wait(f.end().unwrap());
-        assert!(start.elapsed() < Duration::from_secs(60), "mount pending");
-    }
-    if let LoadState::Failed(e) = r.mount_state(mount) {
-        panic!("mount failed: {e}");
-    }
+    let mount = mount_pack(&mut r, pack, &mut frame);
     let models = ["floor", "box"].map(|name| r.model(mount, AssetId::from_name(name)).unwrap());
     let scene = r
         .create_scene(
@@ -518,5 +553,207 @@ fn aliased_view_targets_render_the_same_images_in_less_memory() {
         report.bytes < report.unaliased_bytes,
         "aliasing saves nothing: {report:?}"
     );
+    assert_clean();
+}
+
+#[test]
+fn render_view_runs_the_glare_its_lens_asks_for() {
+    let d = device();
+    let desc = RendererDesc {
+        path_entry: PathEntry::Compute,
+        ..RendererDesc::default()
+    };
+    let mut r = Renderer::new(d, desc).unwrap();
+    let loading = r.loading();
+    let worker = {
+        let l = Arc::clone(&loading);
+        std::thread::spawn(move || l.run_worker())
+    };
+    let mut frame = 0;
+    let mount = mount_pack(&mut r, &lamp(), &mut frame);
+    let lamp = r.model(mount, AssetId::from_name("lamp")).unwrap();
+    let scene = r
+        .create_scene(&SceneDesc::default(), &Default::default())
+        .unwrap();
+    let history = r.create_view_history().unwrap();
+    let [w, h] = [320u32, 240];
+    let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
+    let image = d
+        .create_texture(
+            &TextureDesc::d2(Format::Rgba16Float, w, h, usage),
+            TextureMemory::Dedicated,
+            "view image",
+        )
+        .unwrap();
+
+    frame += 1;
+    let listed = [scene];
+    let mut f = r
+        .begin_frame(FrameDesc {
+            time: time(frame),
+            scenes: &listed,
+            display: None,
+        })
+        .unwrap();
+    let mut s = f.scene(scene).unwrap();
+    let group = s
+        .create_transform_group(&TransformGroupDesc {
+            count: 1,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    s.transforms(group, 0, 1)
+        .unwrap()
+        .copy_from_slice(&[Affine3::IDENTITY]);
+    s.add_instances(&InstancesDesc {
+        model: lamp,
+        copies: 1,
+        transforms: group,
+        first: 0,
+        pose: None,
+        material_set: None,
+        flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+        rt_range: 1000.0,
+        animation_range: 0.0,
+        user_tag: 0,
+    })
+    .unwrap();
+    s.set_focus(DVec3::ZERO, 100.0);
+    drop(s);
+    f.update_scenes(&mut |_| {}).unwrap();
+    f.list().unwrap().discard(&image);
+    wait(f.end().unwrap());
+
+    // A 1 m lamp seen from 30 m on a black background, without GT7.
+    let mut render = |lens, post, ev100| {
+        frame += 1;
+        let mut f = r
+            .begin_frame(FrameDesc {
+                time: time(frame),
+                scenes: &listed,
+                display: None,
+            })
+            .unwrap();
+        f.update_scenes(&mut |_| {}).unwrap();
+        let eye = DVec3::new(0.0, 0.0, 30.0);
+        f.render_view(
+            &ViewDesc {
+                scene,
+                history,
+                position: eye,
+                rotation: look_at_origin(eye),
+                projection: Projection {
+                    fov_y: 1.0,
+                    near: 0.05,
+                },
+                lens,
+                render_extent: UVec2::new(w, h),
+                jitter: Vec2::ZERO,
+                reset_history: false,
+                mip_bias: 0.0,
+                texture_filter: TextureFilter::Hardware,
+                target: ViewTarget::Texture(&image),
+            },
+            &ViewLighting::default(),
+            &ViewOutput {
+                exposure: Exposure::Manual { ev100 },
+                post,
+                debug: OutputDebug::Linear,
+                ..ViewOutput::default()
+            },
+            &mut ViewHooks::default(),
+        )
+        .unwrap();
+        f.end().unwrap()
+    };
+    // The image's linear green channel, row by row, once `point` has completed.
+    let read = |point| -> Vec<f64> {
+        wait(point);
+        let texels = read_texture(&image, &TextureRegion::whole_mip(image.desc(), 0));
+        bytemuck::pod_collect_to_vec::<u8, [u16; 4]>(&texels)
+            .iter()
+            .map(|t| orr_color::srgb_decode(f64::from(half::f16::from_bits(t[1]).to_f32())))
+            .collect()
+    };
+    // 3 mm over 320 pixels is the pixel pitch glare's fit takes as its reference.
+    let bare = Lens {
+        sensor_width_mm: 3.0,
+        glare: None,
+        ..Lens::default()
+    };
+    let on = Lens {
+        glare: Some(Glare { strength: 1.0 }),
+        ..bare
+    };
+    let bands = PostQuality::default();
+    let fft = PostQuality {
+        glare: GlareMethod::Fft,
+        ..bands
+    };
+    // The first frames settle the pre-exposure, which the radiance's rounding depends on.
+    for _ in 0..3 {
+        render(bare, bands, LAMP_EV100);
+    }
+    let off = read(render(bare, bands, LAMP_EV100));
+    let glared = read(render(on, bands, LAMP_EV100));
+    let double = Lens {
+        glare: Some(Glare { strength: 2.0 }),
+        ..on
+    };
+    let doubled = read(render(double, bands, LAMP_EV100));
+    let wide = Lens {
+        sensor_width_mm: 36.0,
+        ..on
+    };
+    let coarse = read(render(wide, bands, LAMP_EV100));
+    let convolved = read(render(on, fft, LAMP_EV100));
+    // One stop darker this frame: glare must read the exposure this frame's adapt wrote.
+    let darker = read(render(on, bands, LAMP_EV100 + 1.0));
+    // Glare turned on and off with frames in flight: each off frame frees a chain they use.
+    for i in 0..4 {
+        let lens = if i % 2 == 0 { on } else { bare };
+        render(lens, bands, LAMP_EV100);
+    }
+    let off_again = read(render(bare, bands, LAMP_EV100));
+    loading.stop_workers();
+    worker.join().unwrap();
+
+    let energy = off.iter().sum::<f64>();
+    let total = |image: &[f64]| image.iter().sum::<f64>();
+    let halo = |image: &[f64]| -> f64 {
+        let unlit = image.iter().zip(&off).filter(|(_, off)| **off == 0.0);
+        unlit.map(|(v, _)| v).sum()
+    };
+    let near = |a: f64, b: f64, tolerance: f64| (a / b - 1.0).abs() < tolerance;
+    let peak = off.iter().copied().fold(0.0, f64::max);
+    assert!(near(peak, 0.5, 1e-3), "the lamp exposes to {peak}");
+    // The lamp's near face, 29.5 m away, is 7.4 pixels across, centered on a pixel corner.
+    let lit = off.iter().filter(|&&v| v > 0.0).count();
+    assert_eq!(lit, 8 * 8, "light outside the lamp without glare");
+    assert!(off == off_again, "turning glare off leaves it in the image");
+
+    let base = halo(&glared);
+    assert!(base > 0.05 * energy, "halo of {base} from energy {energy}");
+    for (name, image, want) in [
+        ("bands", &glared, energy),
+        ("strength 2", &doubled, energy),
+        ("FFT", &convolved, energy),
+        ("coarse pixels", &coarse, energy),
+        ("a stop darker", &darker, 0.5 * energy),
+    ] {
+        let got = total(image);
+        assert!(near(got, want, 0.01), "{name}: energy {got} of {want}");
+    }
+    let (twice, far, fft_halo) = (halo(&doubled), halo(&coarse), halo(&convolved));
+    assert!(
+        near(twice, 2.0 * base, 0.01),
+        "strength 2: {twice} of {base}"
+    );
+    assert!(
+        far < 0.25 * base,
+        "pixels 12 times coarser: {far} of {base}"
+    );
+    assert!(near(fft_halo, base, 0.05), "FFT: {fft_halo} of {base}");
     assert_clean();
 }
