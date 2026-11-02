@@ -701,10 +701,20 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
     let mut page_info = Vec::with_capacity(page_groups.len());
     let mut page_deps = Vec::new();
     let mut group_table: Vec<Group> = vec![bytemuck::Zeroable::zeroed(); groups.len()];
-    for (p, members) in page_groups.iter().enumerate() {
-        let clusters: Vec<&ClusterData> =
-            members.iter().flat_map(|&g| &groups[g].clusters).collect();
-        let bytes = write_page(&clusters, cx.stride);
+    // Per page: its resident length, its cluster count and its stored bytes.
+    let built: Vec<(usize, usize, Vec<u8>)> = page_groups
+        .par_iter()
+        .map(|members| {
+            let clusters: Vec<&ClusterData> =
+                members.iter().flat_map(|&g| &groups[g].clusters).collect();
+            let bytes = write_page(&clusters, cx.stride);
+            let stored = store_page(&bytes).map_err(|e| e.to_string())?;
+            Ok((bytes.len(), clusters.len(), stored))
+        })
+        .collect::<Result<_, String>>()?;
+    for (p, (members, (resident_len, cluster_count, stored))) in
+        page_groups.iter().zip(built).enumerate()
+    {
         let mut deps: Vec<u32> = members
             .iter()
             .flat_map(|&g| into[g].iter().copied())
@@ -718,8 +728,8 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
         );
         page_info.push(PageInfo {
             blob: p as u32 + 1,
-            resident_len: bytes.len() as u32,
-            cluster_count: clusters.len() as u16,
+            resident_len: resident_len as u32,
+            cluster_count: cluster_count as u16,
             _pad: 0,
             deps: Span {
                 first: page_deps.len() as u32,
@@ -727,7 +737,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
             },
         });
         page_deps.extend(deps);
-        pages.push(store_page(&bytes).map_err(|e| e.to_string())?);
+        pages.push(stored);
         let mut first_cluster = 0u16;
         for &gi in members {
             let g = &groups[gi];
@@ -855,11 +865,12 @@ fn fit(cx: &Ctx<'_>, clusters: &mut [ClusterData]) -> Result<(), String> {
             ));
         }
         cap /= 2;
-        for c in clusters.iter_mut() {
-            if c.omm.is_some() {
+        clusters
+            .par_iter_mut()
+            .filter(|c| c.omm.is_some())
+            .for_each(|c| {
                 c.omm = if cap >= 64 { cx.omm(c, cap) } else { None };
-            }
-        }
+            });
     }
     clusters.iter_mut().for_each(|c| c.uvs = Vec::new());
     Ok(())
