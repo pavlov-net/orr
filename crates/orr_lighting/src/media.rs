@@ -1,5 +1,5 @@
-//! Per-view participating media: the froxel volume to the scene's `near_range` and media
-//! apply.
+//! Per-view participating media: the froxel volume to the scene's `near_range`, the
+//! aerial-perspective LUT past it, and media apply.
 
 use orr_scene::orr_gpu::{
     self, AddressMode, Allocation, CommandList, ComputePipeline, Device, Filter, Format, GpuPtr,
@@ -8,7 +8,7 @@ use orr_scene::orr_gpu::{
 };
 
 use crate::scene::{FRAME_SLOTS, Ring};
-use crate::shaders::media::{apply, froxel};
+use crate::shaders::media::{aerial, apply, froxel};
 use crate::shaders::types::{
     FroxelLights, FroxelRoot, FroxelVolume, LayerGuide, MediaStatsGpu, ParticleLighting,
 };
@@ -17,6 +17,9 @@ use crate::{Error, KernelSet, SceneLighting, pipeline};
 
 /// Pixels per side of a froxel column's tile (`media`'s `FROXEL_TILE`).
 pub const FROXEL_TILE: u32 = 8;
+
+/// Columns, rows and shells of the aerial-perspective LUT (`media`'s `AERIAL_SIZE`).
+pub const AERIAL_SIZE: u32 = 32;
 
 /// Most directional lights the froxels trace shadow rays toward (`media`'s
 /// `MAX_FROXEL_SHADOWED_LIGHTS`).
@@ -35,8 +38,12 @@ const MAX_HISTORY: u32 = 64;
 pub struct MediaSettings {
     /// Froxel slices from the eye to the scene's `near_range`, at least 1.
     pub slices: u32,
-    /// Steps of the in-scatter march on path segments of 500 m or more, and of the
-    /// reference's camera segment.
+    /// Far end of the aerial-perspective LUT, in m from the eye; surfaces past the scene's
+    /// `near_range` take their camera segment's medium from the LUT up to it and from a
+    /// march past it. At most `near_range` turns the LUT off.
+    pub ap_range: f32,
+    /// Steps of the in-scatter march on path segments of 500 m or more, on camera segments
+    /// past `ap_range`, and of the reference's camera segment.
     pub segment_steps: u32,
     /// The froxels' transmittance per channel instead of its luminance.
     pub chromatic_transmittance: bool,
@@ -50,6 +57,7 @@ impl Default for MediaSettings {
     fn default() -> Self {
         Self {
             slices: 64,
+            ap_range: 128_000.0,
             segment_steps: 16,
             chromatic_transmittance: false,
             froxel_shadowed_lights: 1,
@@ -84,7 +92,7 @@ struct Shape {
 }
 
 /// A view's froxel targets: `froxel_material`, `froxel_incident` and `froxel_visibility`
-/// with their histories, `froxel_integrated`.
+/// with their histories, `froxel_integrated`; and its `aerial` LUT.
 struct Volumes {
     device: Device,
     shape: Shape,
@@ -95,17 +103,18 @@ struct Volumes {
     visibility: Option<[Volume; 2]>,
     integrated: Volume,
     integrated_rgb: Option<Volume>,
+    aerial: Volume,
+    aerial_rgb: Option<Volume>,
 }
 
 impl Volumes {
     fn new(device: &Device, list: &mut CommandList<'_>, shape: Shape) -> Result<Self, Error> {
         let mut slots = Vec::new();
-        let [w, h, d] = shape.grid;
-        let mut volume = |format, name: &str| -> Result<Volume, Error> {
+        let mut sized = |extent, format, name: &str| -> Result<Volume, Error> {
             let desc = TextureDesc {
                 kind: TextureKind::D3,
                 format,
-                extent: [w, h, d],
+                extent,
                 mips: 1,
                 layers: 1,
                 usage: TextureUsage::SAMPLED | TextureUsage::STORAGE,
@@ -122,6 +131,14 @@ impl Volumes {
                 _texture: texture,
             })
         };
+        let lut = [AERIAL_SIZE; 3];
+        let aerial = sized(lut, Format::Rgba16Float, "aerial perspective")?;
+        let aerial_rgb = if shape.chromatic {
+            Some(sized(lut, Format::Rgba16Float, "aerial perspective rgb")?)
+        } else {
+            None
+        };
+        let mut volume = |format, name: &str| sized(shape.grid, format, name);
         let visibility_format = match shape.extra {
             1 => Format::R8Unorm,
             2 => Format::Rg8Unorm,
@@ -148,6 +165,8 @@ impl Volumes {
             } else {
                 None
             },
+            aerial,
+            aerial_rgb,
             device: device.clone(),
             shape,
             slots,
@@ -250,6 +269,7 @@ pub(crate) struct MediaKernels {
     inject: ComputePipeline,
     light: ComputePipeline,
     integrate: ComputePipeline,
+    aerial: ComputePipeline,
     apply: ComputePipeline,
     sampler: SamplerIndex,
 }
@@ -261,6 +281,7 @@ impl MediaKernels {
             inject: pipeline(device, kernels, &froxel::MODULE, "inject")?,
             light: pipeline(device, kernels, &froxel::MODULE, "light")?,
             integrate: pipeline(device, kernels, &froxel::MODULE, "integrate")?,
+            aerial: pipeline(device, kernels, &aerial::MODULE, "main")?,
             apply: pipeline(device, kernels, &apply::MODULE, "main")?,
             sampler: device.sampler(&SamplerDesc {
                 mag: Filter::Linear,
@@ -292,12 +313,13 @@ impl MediaKernels {
             .map_or((StorageImageIndex::NONE, TextureIndex::NONE), |p| {
                 (p[cur].store, p[prev].sampled)
             });
-        let (integrated_rgb, integrated_rgb_sampled) = v
-            .integrated_rgb
-            .as_ref()
-            .map_or((StorageImageIndex::NONE, TextureIndex::NONE), |t| {
+        let pair = |t: Option<&Volume>| {
+            t.map_or((StorageImageIndex::NONE, TextureIndex::NONE), |t| {
                 (t.store, t.sampled)
-            });
+            })
+        };
+        let (integrated_rgb, integrated_rgb_sampled) = pair(v.integrated_rgb.as_ref());
+        let (aerial_rgb, aerial_rgb_sampled) = pair(v.aerial_rgb.as_ref());
         FroxelRoot {
             scene: pass.scene,
             view: pass.view,
@@ -333,16 +355,25 @@ impl MediaKernels {
             reference: u32::from(lighting.reference.is_some()),
             segment_steps: settings.segment_steps,
             dof_background: StorageImageIndex::NONE,
+            aerial: v.aerial.store,
+            aerial_rgb,
+            aerial_sampled: v.aerial.sampled,
+            aerial_rgb_sampled,
+            ap_range: settings.ap_range,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         }
     }
 
     /// What transparency hooks light and fog particles with after media apply of `pass`:
-    /// this frame's froxels where `media` holds them.
+    /// this frame's froxels and aerial-perspective LUT where `media` holds them.
     fn particle_lighting(
         &self,
         media: &MediaView,
         scene: &SceneLighting,
         pass: &ViewPass,
+        lighting: &ViewLighting,
         layers: GpuPtr<LayerGuide>,
     ) -> ParticleLighting {
         let v = media.volumes.as_ref();
@@ -369,11 +400,18 @@ impl MediaKernels {
             slices,
             frame: pass.sample_index,
             seed: pass.seed,
+            aerial: v.map_or(TextureIndex::NONE, |v| v.aerial.sampled),
+            aerial_rgb: v
+                .and_then(|v| v.aerial_rgb.as_ref())
+                .map_or(TextureIndex::NONE, |t| t.sampled),
+            ap_range: lighting.media.ap_range,
+            _pad0: 0,
         }
     }
 
-    /// Records the froxel passes of `pass` after the scene's [`SceneLighting::record`] and
-    /// the view's raster half; their outputs are visible to later compute and ray stages.
+    /// Records the froxel passes and the aerial-perspective LUT of `pass` after the scene's
+    /// [`SceneLighting::record`] and the view's raster half; their outputs are visible to
+    /// later compute and ray stages.
     pub(crate) fn record(
         &self,
         list: &mut CommandList<'_>,
@@ -452,6 +490,12 @@ impl MediaKernels {
             root,
             [columns.div_ceil(8), rows.div_ceil(8), 1],
         );
+        list.end_pass();
+        list.begin_pass("aerial perspective", false);
+        if lighting.media.ap_range > near_range {
+            let groups = AERIAL_SIZE.div_ceil(8);
+            list.dispatch(&self.aerial, root, [groups, groups, 1]);
+        }
         list.barrier(
             Stages::COMPUTE,
             Stages::COMPUTE | Stages::RAY | Stages::HOST,
@@ -479,7 +523,7 @@ impl MediaKernels {
         let media = &mut view.media;
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         media.particle_frames[slot] = Some(pass.frame);
-        let particles = self.particle_lighting(media, scene, pass, layers);
+        let particles = self.particle_lighting(media, scene, pass, lighting, layers);
         media.particles.write(slot, particles);
         if media.volumes.is_none() {
             return;

@@ -1,22 +1,27 @@
 //! The froxel volume: the slice mapping, the froxel lookup of points, froxel in-scatter
 //! against the reference camera march in open haze and under a canopy, silhouettes against
-//! fogged sky, camera segments ending at dielectric layers, and directional lights past the
-//! shadowed ones. Blended particles: in shade against in sun inside and beyond the froxel
-//! volume, fogged by the single scattering in front of them, and steady at a still camera.
+//! fogged sky and distant surfaces, camera segments ending at dielectric layers, and
+//! directional lights past the shadowed ones. Aerial perspective: its slice mapping,
+//! surfaces at 1, 5 and 30 km against the reference march, no seam where it meets the
+//! froxels, and long path segments' march against a fine one. Blended particles: in shade
+//! against in sun inside and beyond the froxel volume, fogged by the single scattering in
+//! front of them and through the aerial-perspective LUT past the froxels, and steady at a
+//! still camera.
 
 use lighting_suite::bed::{
     Accumulated, Bed, CANOPY, EXTENT, FLOOR, GLASS_SPHERE, Item, LEAF, MIRROR, Particle,
     ParticleLook, Paths, SKY, SUN, Spec, WHITE_SPHERE, pixel_of,
 };
 use lighting_suite::shaders::{
-    fog_apply, fog_directional, fog_froxel, fog_particles, froxel_lookup, froxel_probe,
+    fog_aerial, fog_apply, fog_directional, fog_froxel, fog_particles, froxel_lookup, froxel_probe,
+    segment_probe,
 };
 use lighting_suite::{assert_clean, finish, kernels, pipeline, readback, render, upload};
 use orr_color::luminance;
 use orr_gpu::{Allocation, Hazards, KernelSet, Stages};
 use orr_lighting::{
-    DirectionalLight, DiscProfile, Light, LightId, LightingDebugView, MediaSettings, PathEntry,
-    ReferenceSettings, ViewLighting,
+    AERIAL_SIZE, DirectionalLight, DiscProfile, Light, LightId, LightingDebugView, MediaSettings,
+    PathEntry, ReferenceSettings, ViewLighting,
 };
 use orr_math::{Mat3, Vec3};
 use orr_scene::{Opacity, RendererDesc};
@@ -29,6 +34,7 @@ fn fog_kernels() -> &'static KernelSet {
     SET.get_or_init(|| {
         kernels(&[
             (&fog_froxel::MODULE, "media/froxel"),
+            (&fog_aerial::MODULE, "media/aerial"),
             (&fog_apply::MODULE, "media/apply"),
             (&fog_directional::MODULE, "light_sampling/directional"),
             (&fog_particles::MODULE, "media/particle_draw"),
@@ -166,44 +172,51 @@ fn block_errors(a: &Accumulated, reference: &Accumulated) -> (f64, f64) {
     (worst, errors.iter().sum::<f64>() / errors.len() as f64)
 }
 
+/// The froxels' slices over [0, `near_range`] and the aerial-perspective LUT's over
+/// [`near_range`, `ap_range`]: each distance to its slice coordinate and back.
 #[test]
 fn slices_map_distances_and_back() {
-    let near_range = 256.0f32;
-    let distances: Vec<f32> = (0..=1000)
-        .map(|k| near_range * (k as f32 / 1000.0))
-        .collect();
-    let input = upload(&distances, "distances");
-    let out = readback::<[f32; 2]>(distances.len() as u64, "slices");
-    let root = upload(
-        &[froxel_probe::Root {
-            distances: input.gpu(),
-            out: out.gpu(),
-            count: distances.len() as u32,
-            slices: 64,
-            near_range,
-            _pad0: 0,
-        }],
-        "froxel probe root",
-    );
-    let p = pipeline(&froxel_probe::MODULE, "main");
-    let mut list = render().command_list().unwrap();
-    list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-    list.dispatch(
-        &p,
-        root.gpu(),
-        [(distances.len() as u32).div_ceil(64), 1, 1],
-    );
-    finish(list);
-    for (t, [c, back]) in distances.iter().zip(out.as_slice().unwrap()) {
-        let expected = 64.0 * (t / near_range).sqrt();
-        assert!(
-            (c - expected).abs() < 1e-4,
-            "{t} m maps to slice {c}, not {expected}"
+    let (near_range, ap_range) = (256.0f32, 128_000.0f32);
+    for (entry, start, end, slices) in [
+        ("main", 0.0, near_range, 64),
+        ("aerial", near_range, ap_range, AERIAL_SIZE),
+    ] {
+        let distances: Vec<f32> = (0..=1000)
+            .map(|k| start + (end - start) * (k as f32 / 1000.0))
+            .collect();
+        let input = upload(&distances, "distances");
+        let out = readback::<[f32; 2]>(distances.len() as u64, "slices");
+        let root = upload(
+            &[froxel_probe::Root {
+                distances: input.gpu(),
+                out: out.gpu(),
+                count: distances.len() as u32,
+                slices,
+                near_range,
+                ap_range,
+            }],
+            "froxel probe root",
         );
-        assert!(
-            (back - t).abs() <= 1e-4 * near_range,
-            "{t} m comes back as {back}"
+        let p = pipeline(&froxel_probe::MODULE, entry);
+        let mut list = render().command_list().unwrap();
+        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+        list.dispatch(
+            &p,
+            root.gpu(),
+            [(distances.len() as u32).div_ceil(64), 1, 1],
         );
+        finish(list);
+        for (t, [c, back]) in distances.iter().zip(out.as_slice().unwrap()) {
+            let expected = slices as f32 * ((t - start) / (end - start)).sqrt();
+            assert!(
+                (c - expected).abs() < 1e-4 * slices as f32,
+                "{entry}: {t} m maps to slice {c}, not {expected}"
+            );
+            assert!(
+                (back - t).abs() <= 1e-4 * end,
+                "{entry}: {t} m comes back as {back}"
+            );
+        }
     }
     assert_clean();
 }
@@ -284,47 +297,53 @@ fn canopy_shafts_match_the_reference_march() {
     assert_clean();
 }
 
-/// An alpha-tested leaf and an opaque square against fogged sky, lit by a sun and the sky's
-/// environment: the sky pixels within two pixels of their silhouettes take the in-scatter
-/// they take without them.
+/// An alpha-tested leaf and an opaque square against fogged sky and against a sphere 1 km
+/// away, lit by a sun and the sky's environment: the pixels within two pixels of their
+/// silhouettes take the in-scatter they take without them.
 #[test]
 fn silhouettes_against_fog_have_no_halos() {
     let eye = Vec3::new(0.0, 2.0, 0.0);
     let target = Vec3::new(0.0, 2.0, -10.0);
     let sun = vec![directional(30.0, 20.0, 1_000.0)];
-    let copies = vec![
+    let front = [
         at(LEAF, Vec3::new(-1.2, 2.0, -6.0)),
         at(MIRROR, Vec3::new(1.4, 2.0, -6.0)),
     ];
-    let (mut bed, _fog) = foggy(&HAZE, copies, sun.clone(), Some(SKY), eye, target);
-    let a = inscatter(&mut bed, false, MediaSettings::default(), 32);
-    let (mut bed, _fog) = foggy(&HAZE, Vec::new(), sun, Some(SKY), eye, target);
-    let sky = inscatter(&mut bed, false, MediaSettings::default(), 32);
+    let fogged = |copies: Vec<Item>| {
+        let (mut bed, _fog) = foggy(&HAZE, copies, sun.clone(), Some(SKY), eye, target);
+        inscatter(&mut bed, false, MediaSettings::default(), 32)
+    };
+    let a = fogged(front.to_vec());
     let [w, h] = EXTENT;
-    let surface = |x: i32, y: i32| {
+    let on = |x: i32, y: i32| {
         (0..w as i32).contains(&x)
             && (0..h as i32).contains(&y)
             && a.mean[(y as u32 * w + x as u32) as usize][3] > 0.5
     };
     let lum = |p: [f32; 4]| luminance([p[0], p[1], p[2]].map(f64::from));
-    let mut worst = 0.0f64;
-    let mut checked = 0;
-    for y in 0..h as i32 {
-        for x in 0..w as i32 {
-            let beside = (-2..=2).any(|dy| (-2..=2).any(|dx| surface(x + dx, y + dy)));
-            if surface(x, y) || !beside {
-                continue;
+    for background in [None, Some(distant(1_000.0))] {
+        let with = fogged(front.iter().copied().chain(background).collect());
+        let without = fogged(background.into_iter().collect());
+        let mut worst = 0.0f64;
+        let mut checked = 0;
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                let beside = (-2..=2).any(|dy| (-2..=2).any(|dx| on(x + dx, y + dy)));
+                if on(x, y) || !beside {
+                    continue;
+                }
+                let i = (y as u32 * w + x as u32) as usize;
+                let open = lum(without.mean[i]);
+                worst = worst.max((lum(with.mean[i]) - open).abs() / open);
+                checked += 1;
             }
-            let i = (y as u32 * w + x as u32) as usize;
-            worst = worst.max((lum(a.mean[i]) - lum(sky.mean[i])).abs() / lum(sky.mean[i]));
-            checked += 1;
         }
+        assert!(checked > 100, "{checked} pixels beside the silhouettes");
+        assert!(
+            worst < 0.03,
+            "{background:?}: beside a silhouette the in-scatter is {worst:.3} off its own without it"
+        );
     }
-    assert!(checked > 100, "{checked} sky pixels beside the silhouettes");
-    assert!(
-        worst < 0.03,
-        "sky beside a silhouette is {worst:.3} off the open sky"
-    );
     assert_clean();
 }
 
@@ -451,6 +470,141 @@ fn camera_segments_end_at_dielectric_layers() {
     assert_clean();
 }
 
+/// Haze for kilometers: extinction 3e-5 /m at the ground, falling by e every km.
+const AIR: Fog = Fog {
+    density: 3e-5,
+    base_height: 0.0,
+    falloff_height: 1000.0,
+};
+
+/// A white sphere whose near face lies `distance` m straight ahead of an eye at (0, 2, 0)
+/// looking along -z, filling the middle of the view.
+fn distant(distance: f32) -> Item {
+    let radius = 0.15 * distance;
+    Item {
+        model: WHITE_SPHERE,
+        linear: Mat3::from_diagonal(Vec3::splat(radius)),
+        at: Vec3::new(0.0, 2.0, -(distance + radius)),
+    }
+}
+
+/// Mean luminance of the four 8 x 8 blocks at the middle of the image.
+fn middle_blocks(a: &Accumulated) -> [f64; 4] {
+    let blocks = block_luminance(a);
+    let (columns, rows) = (EXTENT[0] / 8, EXTENT[1] / 8);
+    let at = |bx: u32, by: u32| blocks[(by * columns + bx) as usize];
+    let (x, y) = (columns / 2, rows / 2);
+    [at(x - 1, y - 1), at(x, y - 1), at(x - 1, y), at(x, y)]
+}
+
+/// Surfaces 1, 5 and 30 km away in haze thinning with altitude, under a sun at 20 degrees
+/// beside the view: the in-scatter in front of them, the froxels' to `near_range` and the
+/// aerial-perspective LUT's past it, within 5% of the reference camera march per 8 x 8 block
+/// at the middle of the view.
+#[test]
+fn distant_surfaces_match_the_reference_march() {
+    let eye = Vec3::new(0.0, 2.0, 0.0);
+    let target = Vec3::new(0.0, 2.0, -10.0);
+    let sun = vec![directional(20.0, 100.0, 1_000.0)];
+    for distance in [1_000.0, 5_000.0, 30_000.0] {
+        let copies = vec![distant(distance)];
+        let (mut bed, _fog) = foggy(&AIR, copies, sun.clone(), None, eye, target);
+        let lut = middle_blocks(&inscatter(&mut bed, false, MediaSettings::default(), 16));
+        let reference = middle_blocks(&inscatter(&mut bed, true, MediaSettings::default(), 256));
+        for (l, r) in lut.iter().zip(&reference) {
+            assert!(
+                (l - r).abs() < 0.05 * r,
+                "at {distance} m a block's in-scatter is {l:.2}, the reference's {r:.2}"
+            );
+        }
+    }
+    assert_clean();
+}
+
+/// Surfaces a quarter meter either side of `near_range` in haze under a sun: the in-scatter
+/// in front of them, from the froxels alone and from the froxels and the aerial-perspective
+/// LUT, within 1% of each other.
+#[test]
+fn aerial_perspective_meets_the_froxels_without_a_seam() {
+    let eye = Vec3::new(0.0, 2.0, 0.0);
+    let target = Vec3::new(0.0, 2.0, -10.0);
+    let sun = vec![directional(20.0, 100.0, 1_000.0)];
+    let near_range = 256.0;
+    let [inside, past] = [near_range - 0.25, near_range + 0.25].map(|d| {
+        let (mut bed, _fog) = foggy(&HAZE, vec![distant(d)], sun.clone(), None, eye, target);
+        middle_blocks(&inscatter(&mut bed, false, MediaSettings::default(), 16))
+    });
+    for (a, b) in inside.iter().zip(&past) {
+        assert!(
+            (b - a).abs() < 0.01 * a,
+            "in-scatter {a:.3} just inside near_range, {b:.3} just past it"
+        );
+    }
+    assert_clean();
+}
+
+/// Path segments from a mirror on the ground up to terrain 5 and 20 km away, rising at 0.5 to
+/// 5 degrees, in haze thinning with altitude under a low sun: `segment_inscatter`'s march,
+/// averaged over its jitter, within 5% of a fine march of the same segment.
+#[test]
+fn long_segments_match_a_fine_march() {
+    let (mut bed, _fog) = foggy(
+        &AIR,
+        Vec::new(),
+        vec![directional(10.0, 20.0, 1_000.0)],
+        None,
+        Vec3::new(0.0, 2.0, 0.0),
+        Vec3::new(0.0, 2.0, -10.0),
+    );
+    let mut segments = Vec::new();
+    for t in [5_000.0f32, 20_000.0] {
+        for elevation in [0.5f32, 2.0, 5.0] {
+            let e = elevation.to_radians();
+            segments.push(segment_probe::MarchSegment {
+                origin: [0.0, 0.0, -50.0],
+                t,
+                dir: [0.0, e.sin(), -e.cos()],
+                _pad: 0.0,
+            });
+        }
+    }
+    let input = upload(&segments, "segments");
+    let out = readback::<[f32; 4]>(2 * segments.len() as u64, "segment in-scatter");
+    let p = pipeline(&segment_probe::MODULE, "main");
+    let mut roots = Vec::new();
+    bed.accumulate(1, 0, &mut |list, f| {
+        let root = upload(
+            &[segment_probe::Root {
+                set: f.lighting.light_set(),
+                segments: input.gpu(),
+                out: out.gpu(),
+                count: segments.len() as u32,
+                steps: MediaSettings::default().segment_steps,
+                jitters: 64,
+                fine_steps: 4096,
+                _pad0: 0,
+                _pad1: 0,
+            }],
+            "segment probe root",
+        );
+        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+        list.dispatch(&p, root.gpu(), [1, 1, 1]);
+        roots.push(root);
+    });
+    let lum = |p: [f32; 4]| luminance([p[0], p[1], p[2]].map(f64::from));
+    for (s, pair) in segments.iter().zip(out.as_slice().unwrap().chunks(2)) {
+        let (march, fine) = (lum(pair[0]), lum(pair[1]));
+        assert!(fine > 0.0);
+        assert!(
+            (march - fine).abs() < 0.05 * fine,
+            "over {} m rising {:.3}: the march gives {march:.3}, the fine march {fine:.3}",
+            s.t,
+            s.dir[1]
+        );
+    }
+    assert_clean();
+}
+
 /// White particles 0.4 m across facing the camera, opaque.
 const WHITE_PARTICLES: ParticleLook = ParticleLook {
     albedo: [0.8; 3],
@@ -542,6 +696,47 @@ fn particles_in_fog_take_the_fog_in_front_of_them() {
         (got - wanted).abs() <= 0.05 * wanted,
         "fogged particle {got:.1}, wanted {wanted:.1}: emission through the fog {:.1}, in-scatter {inscatter:.1}",
         f64::from(emission) * transmittance
+    );
+    assert_clean();
+}
+
+/// An emissive opaque particle 40 m away in height fog with nothing lit, the froxels ending at
+/// 16 m: what reaches the eye is its emission through the fog's transmittance, the froxels'
+/// to 16 m and the aerial-perspective LUT's past it.
+#[test]
+fn particles_past_the_froxels_take_the_aerial_transmittance() {
+    let fog = Fog {
+        density: 0.02,
+        base_height: 0.0,
+        falloff_height: 100.0,
+    };
+    let eye = Vec3::new(0.0, 1.0, 0.0);
+    let target = Vec3::new(0.0, 1.0, -40.0);
+    let emission = 2000.0f32;
+    let (mut bed, _fog) = foggy(&fog, Vec::new(), Vec::new(), None, eye, target);
+    bed.set_near_range(16.0);
+    let look = ParticleLook {
+        albedo: [0.0; 3],
+        emission: [emission; 3],
+        opacity: 1.0,
+        anisotropy: 0.0,
+    };
+    bed.set_particles(
+        &[Particle {
+            center: target,
+            size: 1.0,
+        }],
+        look,
+        Opacity::Particle,
+    );
+    let paths = Paths::new(fog_kernels(), PathEntry::Fastest, ViewLighting::default());
+    let a = bed.accumulate(4, 3, &mut |list, f| paths.record(list, f));
+    let got = luminance(a.around(pixel_of(&bed.spec, target), 2));
+    let sigma = f64::from(fog.density) * (-f64::from(eye.y) / f64::from(fog.falloff_height)).exp();
+    let wanted = f64::from(emission) * (-sigma * 40.0).exp();
+    assert!(
+        (got - wanted).abs() <= 0.03 * wanted,
+        "fogged particle {got:.1}, its emission through the fog {wanted:.1}"
     );
     assert_clean();
 }

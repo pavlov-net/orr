@@ -16,22 +16,22 @@
 //! Each view, [`LightingView::begin`] settles the frame's history reset; after the view's
 //! raster half, [`LightingKernels::record_media`] fills the view's froxel volume with the
 //! linked medium, the light reaching it and its integral along the view's rays to the
-//! scene's `near_range`; [`LightingKernels::record_opaque`] traces the world cache's update
-//! paths, builds a local light sampler per screen tile from the view's last light feedback,
-//! and traces one path per G-buffer pixel, or per a random share of them
-//! ([`ViewLighting::pixel_fraction`]), into the view's [`LightingView`] radiance and light
-//! feedback with the settings of [`ViewLighting`]; [`LightingKernels::record_dielectric`]
-//! traces each pixel's first dielectric or presence layer and its path over that radiance;
-//! [`LightingKernels::record_media_apply`] composes the froxels with the radiance and leaves
-//! [`LightingView::particle_lighting`], with which transparency hooks light and fog blended
-//! particles (the `particle_lighting` module, or [`ParticleDraw`] for producer particle
-//! entries); and [`LightingKernels::record_guides`] writes the view's ray reconstruction
-//! guides. Rays leaving the first vertex and dielectric vertices see particles by their
-//! emission, and shadow rays by what their opacity lets through. The `path`
-//! module holds the opaque path, `dielectric` the dielectric one and `froxels` the froxel
-//! passes, for kernels that trace more. Both paths walk the interior of a subsurface surface
-//! at its first vertex on the path (see [`ViewLighting::sss_depth`]); `subsurface` holds the
-//! walk.
+//! scene's `near_range`, and the view's aerial-perspective LUT past it;
+//! [`LightingKernels::record_opaque`] traces the world cache's update paths, builds a local
+//! light sampler per screen tile from the view's last light feedback, and traces one path per
+//! G-buffer pixel, or per a random share of them ([`ViewLighting::pixel_fraction`]), into the
+//! view's [`LightingView`] radiance and light feedback with the settings of [`ViewLighting`];
+//! [`LightingKernels::record_dielectric`] traces each pixel's first dielectric or presence
+//! layer and its path over that radiance; [`LightingKernels::record_media_apply`] composes
+//! the froxels and the LUT with the radiance and leaves [`LightingView::particle_lighting`],
+//! with which transparency hooks light and fog blended particles (the `particle_lighting`
+//! module, or [`ParticleDraw`] for producer particle entries); and
+//! [`LightingKernels::record_guides`] writes the view's ray reconstruction guides. Rays
+//! leaving the first vertex and dielectric vertices see particles by their emission, and
+//! shadow rays by what their opacity lets through. The `path` module holds the opaque path,
+//! `dielectric` the dielectric one and `froxels` the froxel passes, for kernels that trace
+//! more. Both paths walk the interior of a subsurface surface at its first vertex on the path
+//! (see [`ViewLighting::sss_depth`]); `subsurface` holds the walk.
 
 mod bsdf;
 mod environment;
@@ -44,7 +44,7 @@ mod world_cache;
 
 pub use bsdf::BsdfTables;
 pub use environment::{ENVIRONMENT_SIZE, EnvironmentMapGpu};
-pub use media::{FROXEL_TILE, MAX_FROXEL_SHADOWED_LIGHTS, MediaSettings, MediaStats};
+pub use media::{AERIAL_SIZE, FROXEL_TILE, MAX_FROXEL_SHADOWED_LIGHTS, MediaSettings, MediaStats};
 pub use orr_scene::orr_gpu::KernelSet;
 pub use orr_scene::{Cone, DirectionalLight, DiscProfile, Light, LightId, PathEntry};
 pub use particles::ParticleDraw;

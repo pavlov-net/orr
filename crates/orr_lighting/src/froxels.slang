@@ -6,6 +6,10 @@
 // A froxel's light is isotropic incident radiance (the world cache's ambient on two opposed
 // normals and resampled tile lights, one shadow ray) plus one visibility per shadowed
 // directional light, so the phase function applies per view direction at integration.
+//
+// Past `near_range`, `aerial_build` writes the aerial-perspective LUT (`media`'s layout) from
+// the linked medium and the directional lights, unshadowed; media apply composes surfaces
+// beyond `near_range` through it to the view's `ap_range` and marches the rest.
 module froxels;
 
 import orr.abi;
@@ -94,8 +98,16 @@ public struct FroxelRoot
     public uint chromatic;                      // rgb transmittance
     public uint mode;                           // MEDIA_*
     public uint reference;                      // 1: media apply marches the camera segment
-    public uint segment_steps;                  // steps of that march
+    public uint segment_steps;                  // steps of that march, and of the march past `ap_range`
     public StorageImageIndex dof_background;    // media apply's: the opaque dispatch's background layer, NONE for none
+    public StorageImageIndex aerial;            // the aerial-perspective LUT, RGBA16F
+    public StorageImageIndex aerial_rgb;        // its rgb transmittance, RGBA16F, with `chromatic`
+    public TextureIndex aerial_sampled;
+    public TextureIndex aerial_rgb_sampled;
+    public float ap_range;                      // m, the view's; the LUT's far end
+    public uint _pad0;
+    public uint _pad1;
+    public uint _pad2;
 }
 
 // The view-space ray through point `p` of the view's unjittered image, in render pixels,
@@ -621,29 +633,96 @@ public void froxel_integrate<M : IMedium>(FroxelRoot r, uint2 column)
 // luminance), read through linear sampler `sampler`.
 public float3 integrated_fog(TextureIndex integrated, TextureIndex integrated_rgb, SamplerIndex sampler, uint3 grid, uint2 extent, float near_range, float2 p, float t, out float3 transmittance)
 {
-    float c = froxel_slice(t, grid.z, near_range);
     float2 xy = (p / froxel_spacing(extent, grid.xy) + 0.5) / float2(grid.xy);
-    // Texel k holds the far boundary of slice k, slice coordinate k + 1.
-    float3 coord = float3(xy, max(c - 0.5, 0.5) / float(grid.z));
+    return shell_fog(integrated, integrated_rgb, sampler, xy, froxel_slice(t, grid.z, near_range), grid.z, transmittance);
+}
+
+// The in-scatter (pre-exposed) and transmittance a volume of `shells` squared shells holds at
+// texture coordinates `xy` and slice coordinate `c`: in-scatter in rgb and transmittance's
+// luminance in a of `inscatter`, rgb transmittance in `rgb` (NONE for the luminance), texel k
+// holding the far boundary of shell k, slice coordinate k + 1. Inside a shell the optical
+// depth grows linearly with distance and the in-scatter with it, as through a homogeneous
+// shell, so dense shells keep their transmittance.
+float3 shell_fog(TextureIndex inscatter, TextureIndex rgb, SamplerIndex sampler, float2 xy, float c, uint shells, out float3 transmittance)
+{
+    // Shell k and the share of its distance before c; boundary distances grow as c^2.
+    float k = min(floor(c), float(shells) - 1.0);
+    float f = saturate((c * c - k * k) / (2.0 * k + 1.0));
     SamplerState s = sampler.get();
-    float4 fog = integrated.get<Texture3D<float4>>().SampleLevel(s, coord, 0.0);
-    transmittance = integrated_rgb.index != IMAGE_NONE
-        ? integrated_rgb.get<Texture3D<float4>>().SampleLevel(s, coord, 0.0).rgb
-        : float3(fog.a);
-    // Before the first boundary, toward nothing at the eye.
-    float w = saturate(c);
-    transmittance = lerp(float3(1.0), transmittance, w);
-    return fog.rgb * w;
+    Texture3D<float4> fog = inscatter.get<Texture3D<float4>>();
+    bool chromatic = rgb.index != IMAGE_NONE;
+    float4 lo = float4(0.0, 0.0, 0.0, 1.0);
+    float3 t_lo = float3(1.0);
+    if (k > 0.0)
+    {
+        float3 coord = float3(xy, (k - 0.5) / float(shells));
+        lo = fog.SampleLevel(s, coord, 0.0);
+        t_lo = chromatic ? rgb.get<Texture3D<float4>>().SampleLevel(s, coord, 0.0).rgb : float3(lo.a);
+    }
+    float3 coord = float3(xy, (k + 0.5) / float(shells));
+    float4 hi = fog.SampleLevel(s, coord, 0.0);
+    float3 t_hi = chromatic ? rgb.get<Texture3D<float4>>().SampleLevel(s, coord, 0.0).rgb : float3(hi.a);
+    float3 ratio = clamp(t_hi / max(t_lo, 1e-30), 1e-30, 1.0);
+    float3 part = pow(ratio, float3(f));
+    transmittance = t_lo * part;
+    float3 share = select(ratio < 0.9999, (1.0 - part) / (1.0 - ratio), float3(f));
+    return lo.rgb + (hi.rgb - lo.rgb) * share;
+}
+
+// The in-scatter (pre-exposed) and transmittance from the scene's `near_range` to distance
+// `t` (clamped to [near_range, ap_range]) along the ray through image point `p`, in render
+// pixels, of a view's `aerial` LUT, `aerial_rgb` holding rgb transmittance (NONE for its
+// luminance), read through linear sampler `sampler`.
+public float3 aerial_fog(TextureIndex aerial, TextureIndex aerial_rgb, SamplerIndex sampler, uint2 extent, float near_range, float ap_range, float2 p, float t, out float3 transmittance)
+{
+    float2 xy = (p / froxel_spacing(extent, uint2(AERIAL_SIZE)) + 0.5) / float(AERIAL_SIZE);
+    return shell_fog(aerial, aerial_rgb, sampler, xy, aerial_slice(t, near_range, ap_range), AERIAL_SIZE, transmittance);
+}
+
+// March steps per shell of the aerial-perspective LUT.
+static const uint AERIAL_STEPS = 8;
+
+// The aerial-perspective LUT's column `column`: each shell marched through the linked medium
+// `M` lit by every directional light, unshadowed, and its multiple scattering, weighted by the
+// exact transmittance from `near_range`; each texel holds the shells up to its own, in-scatter
+// pre-exposed in rgb and transmittance's luminance in a of `aerial`, rgb transmittance in
+// `aerial_rgb` with `chromatic`.
+public void aerial_build<M : IMedium>(FroxelRoot r, uint2 column)
+{
+    ViewConstants* v = r.view;
+    uint64_t data = r.scene.medium;
+    float near_range = r.scene.near_range;
+    float3 dir = unjittered_direction(v, float2(column) * froxel_spacing(v.extent, uint2(AERIAL_SIZE)));
+    float3 start = v.eye_render.xyz + dir * near_range;
+    float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
+    float3 inscatter = float3(0.0);
+    float d0 = 0.0;
+    for (uint k = 0; k < AERIAL_SIZE; k++)
+    {
+        float d1 = aerial_distance(float(k + 1), near_range, r.ap_range) - near_range;
+        float dt = (d1 - d0) / float(AERIAL_STEPS);
+        for (uint j = 0; j < AERIAL_STEPS; j++)
+        {
+            float d = d0 + float(j) * dt;
+            float3 x = start + dir * (d + 0.5 * dt);
+            MediumPoint m = M.sample(data, x);
+            float3 through = medium_transmittance<M>(data, start, dir, d);
+            march_step(m.sigma_t, medium_source<M>(r.set, m, x, dir), dt, inscatter, through);
+        }
+        float3 transmittance = medium_transmittance<M>(data, start, dir, d1);
+        uint3 texel = uint3(column, k);
+        r.aerial.get<RWTexture3D<float4>>()[texel] = float4(apply_hdr_ceiling(inscatter * pre_exposure), luminance_rec2020(transmittance));
+        if (r.chromatic != 0)
+            r.aerial_rgb.get<RWTexture3D<float4>>()[texel] = float4(transmittance, 1.0);
+        d0 = d1;
+    }
 }
 
 // The froxels' in-scatter (pre-exposed) and transmittance from the eye to distance `t` along
 // the ray through `pixel`.
 float3 froxel_fog(FroxelRoot r, uint2 pixel, float t, out float3 transmittance)
 {
-    TextureIndex rgb = r.integrated_rgb_sampled;
-    if (r.chromatic == 0)
-        rgb.index = IMAGE_NONE;
-    return integrated_fog(r.integrated_sampled, rgb, r.sampler, uint3(r.columns, r.rows, r.slices), r.view.extent, r.scene.near_range, float2(pixel) + 0.5, t, transmittance);
+    return integrated_fog(r.integrated_sampled, r.integrated_rgb_sampled, r.sampler, uint3(r.columns, r.rows, r.slices), r.view.extent, r.scene.near_range, float2(pixel) + 0.5, t, transmittance);
 }
 
 // The reference camera segment: in-scatter (unexposed) over `t` m from the eye along `dir`
@@ -689,23 +768,56 @@ float3 reference_fog<S : ISurface, M : IMedium>(FroxelRoot r, uint2 pixel, float
     return inscatter;
 }
 
-// The camera segment's in-scatter and transmittance over `t` m along the ray through
-// `pixel`.
+// The in-scatter (pre-exposed) and transmittance from the scene's `near_range` to `t` m along
+// unit `dir`, the ray through `pixel`: the aerial-perspective LUT to `ap_range`, then
+// `segment_inscatter` past it.
+float3 far_fog<M : IMedium>(FroxelRoot r, uint2 pixel, float3 dir, float t, out float3 transmittance)
+{
+    ViewConstants* v = r.view;
+    float near_range = r.scene.near_range;
+    float ap_range = max(r.ap_range, near_range);
+    transmittance = float3(1.0);
+    float3 inscatter = float3(0.0);
+    if (ap_range > near_range)
+        inscatter = aerial_fog(r.aerial_sampled, r.aerial_rgb_sampled, r.sampler, v.extent, near_range, ap_range, float2(pixel) + 0.5, t, transmittance);
+    if (t > ap_range)
+    {
+        Sampler rng = Sampler(pixel, r.frame, r.seed ^ MEDIA_STREAM);
+        float3 through;
+        float3 past = segment_inscatter<M>(r.set, v.eye_render.xyz + dir * ap_range, dir, t - ap_range, r.segment_steps, rng.next(), through);
+        inscatter += transmittance * past * v.exposure[v.exposure_slot].pre_exposure;
+        transmittance *= through;
+    }
+    return inscatter;
+}
+
+// The camera segment's in-scatter (pre-exposed) and transmittance over `t` m along the ray
+// through `pixel`: the froxels to the scene's `near_range` and, on surfaces, `far_fog` past
+// it. Sky pixels (`t` infinite) take the froxels alone; the environment carries the rest. The
+// reference marches the whole segment, to `near_range` on sky pixels.
 float3 camera_fog<S : ISurface, M : IMedium>(FroxelRoot r, uint2 pixel, float t, out float3 transmittance)
 {
     ViewConstants* v = r.view;
-    if (r.reference == 0)
-        return froxel_fog(r, pixel, t, transmittance);
+    float near_range = r.scene.near_range;
+    bool sky = isinf(t);
     float2 uv = (float2(pixel) + 0.5) / float2(v.extent);
     float3 dir = render_direction(v, view_direction(v, uv));
-    return reference_fog<S, M>(r, pixel, dir, t, transmittance) * v.exposure[v.exposure_slot].pre_exposure;
+    if (r.reference != 0)
+        return reference_fog<S, M>(r, pixel, dir, sky ? near_range : t, transmittance) * v.exposure[v.exposure_slot].pre_exposure;
+    float3 inscatter = froxel_fog(r, pixel, min(t, near_range), transmittance);
+    if (!sky && t > near_range)
+    {
+        float3 through;
+        inscatter += transmittance * far_fog<M>(r, pixel, dir, t, through);
+        transmittance *= through;
+    }
+    return inscatter;
 }
 
 // Media apply for `pixel`: L = S + T x L over the camera segment to the pixel's surface, or
-// the dielectric or presence layer it shades, or the scene's `near_range`, whichever is
-// nearer; sky pixels take the whole range, and pixels whose eye lies in an interior none.
-// Marked pixels of the background layer take the same over the segment to their layer's
-// depth.
+// the dielectric or presence layer it shades; sky pixels take the froxels' whole range, and
+// pixels whose eye lies in an interior nothing. Marked pixels of the background layer take
+// the same over the segment to their layer's depth.
 public void media_apply<S : ISurface, M : IMedium>(FroxelRoot r, uint2 pixel)
 {
     ViewConstants* v = r.view;
@@ -719,7 +831,6 @@ public void media_apply<S : ISurface, M : IMedium>(FroxelRoot r, uint2 pixel)
     float end = r.layers != nullptr ? layer_guide(r.layers, r.gbuffer.extent, pixel).medium_end : 0.0;
     if (end != 0.0)
         t = max(end, 0.0);
-    t = min(t, r.scene.near_range);
     float3 transmittance;
     float3 inscatter = camera_fog<S, M>(r, pixel, t, transmittance);
     float4 out = float4(apply_hdr_ceiling(inscatter + transmittance * l.rgb), l.a);
@@ -738,8 +849,7 @@ public void media_apply<S : ISurface, M : IMedium>(FroxelRoot r, uint2 pixel)
     float4 b = layer[pixel];
     if (b.a < 0.0)
         return;
-    float tb = b.a > 0.0 ? length(view_position(v, uv, b.a)) : positive_infinity();
-    tb = end < 0.0 ? 0.0 : min(tb, r.scene.near_range);
+    float tb = end < 0.0 ? 0.0 : b.a > 0.0 ? length(view_position(v, uv, b.a)) : positive_infinity();
     inscatter = camera_fog<S, M>(r, pixel, tb, transmittance);
     layer[pixel] = float4(apply_hdr_ceiling(inscatter + transmittance * b.rgb), b.a);
 }
