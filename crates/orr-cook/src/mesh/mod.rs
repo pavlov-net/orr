@@ -26,8 +26,8 @@ mod thickness;
 use std::ops::Range;
 use std::sync::Arc;
 
-use glam::{Vec2, Vec3};
 use meshopt::VertexDataAdapter;
+use orr_math::{Vec2, Vec3};
 use orr_pack::material::Material;
 use orr_pack::mesh::{
     Cluster, Level, MeshHeader, MeshInfo, OMM_ALIGN, PAGE_MAX, PageHeader, PageInfo, Part,
@@ -146,7 +146,7 @@ pub struct MeshInput {
     pub positions: Vec<Vec3>,
     pub normals: Vec<Vec3>,
     /// xyz and bitangent sign.
-    pub tangents: Option<Vec<glam::Vec4>>,
+    pub tangents: Option<Vec<orr_math::Vec4>>,
     pub uvs: Option<Vec<Vec2>>,
     /// Uv set 1, which material slots on set 1 read.
     pub uvs1: Option<Vec<Vec2>>,

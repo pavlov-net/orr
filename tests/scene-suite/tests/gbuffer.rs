@@ -959,9 +959,10 @@ fn cook() -> Arc<[u8]> {
                     x + 2.0 + 3.0 * f64::from(i % 4),
                     1.0,
                     2.0 + 3.0 * f64::from(i / 4),
-                ),
-                rotation: Quat::from_rotation_y(i as f32 * 0.7),
-                scale: Vec3::ONE,
+                )
+                .to_array(),
+                rotation: Quat::from_rotation_y(i as f32 * 0.7).to_array(),
+                scale: [1.0; 3],
                 prototype: (i % 2) as u16,
             })
             .collect()

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use glam::{Mat4, Vec3};
 use orr_cook::{ArchiveSpec, AssetSpec, GltfSettings, Manifest, MeshSettings, Source};
+use orr_math::{Mat4, Vec3};
 use orr_pack::material::Material;
 use orr_pack::mesh::{self, MeshInfo, PageView, Section};
 use orr_pack::model::ModelInfo;

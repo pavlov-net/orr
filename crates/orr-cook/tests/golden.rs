@@ -9,12 +9,12 @@ mod common;
 #[path = "common/skinned.rs"]
 mod common_skinned;
 
-use glam::{DVec3, Quat, Vec3};
 use orr_cook::{
     ArchiveSpec, AssetSpec, DataFormat, GltfSettings, GridInput, GridVoxels, Instances, LodMode,
     Manifest, MeshSettings, MipFilter, Placement, PrototypeSpec, RasterInput, RasterLayerSpec,
     RasterSet, Reduction, Source, TextureSettings, Usage, VolumeGrids, VolumeInput,
 };
+use orr_math::{DVec3, Quat, Vec3};
 use orr_pack::{Archive, Class, Target};
 
 const USER: u16 = Class::USER_FIRST + 1;
@@ -91,13 +91,15 @@ fn cooked_bytes_match_their_cook_versions() {
     .unwrap();
     let records = (0..40)
         .map(|i| Placement {
-            position: DVec3::new(f64::from(i) * 37.25 - 600.0, 1.5, f64::from(i % 7) * 90.0),
-            rotation: if i % 2 == 0 {
+            position: DVec3::new(f64::from(i) * 37.25 - 600.0, 1.5, f64::from(i % 7) * 90.0)
+                .to_array(),
+            rotation: (if i % 2 == 0 {
                 Quat::IDENTITY
             } else {
                 Quat::from_xyzw(0.0, 0.6, 0.0, 0.8)
-            },
-            scale: Vec3::ONE,
+            })
+            .to_array(),
+            scale: Vec3::ONE.to_array(),
             prototype: 0,
         })
         .collect();

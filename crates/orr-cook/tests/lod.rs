@@ -3,10 +3,10 @@
 
 use std::collections::HashSet;
 
-use glam::{Vec2, Vec3};
 use orr_cook::{
     ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshParts, MeshSettings, Source,
 };
+use orr_math::{Vec2, Vec3};
 use orr_pack::material::Material;
 use orr_pack::mesh::{self, Cluster, MeshInfo, PageView};
 use orr_pack::{Aabb, Archive, AssetId, Span, Target};

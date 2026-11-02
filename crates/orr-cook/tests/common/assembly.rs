@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use glam::{EulerRot, Quat, Vec3};
+use orr_math::{EulerRot, Quat, Vec3};
 
 pub(crate) const UNIT_TRIANGLES: u32 = 240;
 
@@ -39,7 +39,7 @@ pub(crate) fn write(path: &Path, copies: usize, sheet: bool) -> Vec<Vec3> {
             nrm.push((q * Vec3::Z).to_array());
             uv.push(*u);
         }
-        let (mut sum, mut area) = (glam::DVec3::ZERO, 0.0);
+        let (mut sum, mut area) = (orr_math::DVec3::ZERO, 0.0);
         for t in &tris {
             let p = t.map(|v| Vec3::from(pos[(base + v) as usize]).as_dvec3());
             let a = 0.5 * (p[1] - p[0]).cross(p[2] - p[0]).length();

@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use glam::{DVec3, Vec3};
+use orr_math::{DVec3, Vec3};
 
 use super::lod::{self, Parts, Welded};
 use super::{Grid, SectionMaps, StaticDisplacement};

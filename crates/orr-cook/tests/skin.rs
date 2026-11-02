@@ -15,10 +15,10 @@ mod common_skinned;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use glam::{Mat3, Mat4, Quat, Vec3, Vec4};
 use gltf::animation::util::ReadOutputs;
 use gltf::animation::{Interpolation, Property};
 use orr_cook::{ArchiveSpec, AssetSpec, GltfSettings, LodMode, Manifest, MeshSettings, Source};
+use orr_math::{Mat3, Mat4, Quat, Vec3, Vec4};
 use orr_pack::clip::Clip;
 use orr_pack::mesh::{self, Cluster, MeshHeader, MeshInfo, PageView};
 use orr_pack::model::ModelInfo;

@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use bytemuck::Zeroable;
-use glam::{DVec3, Quat, Vec3};
+use orr_math::{DVec3, Quat, Vec3};
 use orr_pack::instance::{
     self, InstancePageHeader, InstancePageInfo, InstanceRecord, MAX_HIDDEN_SECTION, MAX_POSE,
     MAX_RECORDS, PARTITION_INSTANCES, Prototype, SectionOverride,
@@ -35,13 +35,28 @@ pub struct Instances {
 #[serde(deny_unknown_fields)]
 pub struct Placement {
     /// World position, metres.
-    pub position: DVec3,
-    pub rotation: Quat,
+    pub position: [f64; 3],
+    /// Quaternion, `[x, y, z, w]`.
+    pub rotation: [f32; 4],
     /// Per-axis scale, applied before the rotation; no component zero. An odd number of
     /// negative components mirrors the copy.
-    pub scale: Vec3,
+    pub scale: [f32; 3],
     /// Index into [`Instances::prototypes`].
     pub prototype: u16,
+}
+
+impl Placement {
+    pub(crate) fn position(&self) -> DVec3 {
+        DVec3::from(self.position)
+    }
+
+    pub(crate) fn rotation(&self) -> Quat {
+        Quat::from_array(self.rotation)
+    }
+
+    pub(crate) fn scale(&self) -> Vec3 {
+        Vec3::from(self.scale)
+    }
 }
 
 /// A model as the records place it.
@@ -109,14 +124,14 @@ pub(crate) fn cook(
     let mut cells: BTreeMap<[i32; 3], Vec<usize>> = BTreeMap::new();
     let mut rel = Vec::with_capacity(src.records.len());
     for (i, p) in src.records.iter().enumerate() {
-        let c = (p.position / edge).floor();
+        let c = (p.position() / edge).floor();
         if c.abs().max_element() > f64::from(i32::MAX) {
             return Err(fail(
                 name,
                 format!("placement {i} is outside the cell range"),
             ));
         }
-        rel.push(p.position - c * edge);
+        rel.push(p.position() - c * edge);
         cells.entry(c.as_ivec3().to_array()).or_default().push(i);
     }
 
@@ -255,16 +270,16 @@ fn check_records(name: &str, src: &Instances) -> Result<()> {
                 format!("placement {i} names prototype {}", p.prototype),
             ));
         }
-        if !p.position.is_finite() {
+        if !p.position().is_finite() {
             return Err(fail(name, format!("placement {i} position is not finite")));
         }
-        if !(p.scale.is_finite() && p.scale.abs().min_element() > 0.0) {
+        if !(p.scale().is_finite() && p.scale().abs().min_element() > 0.0) {
             return Err(fail(
                 name,
-                format!("placement {i} scale {} is zero on an axis", p.scale),
+                format!("placement {i} scale {} is zero on an axis", p.scale()),
             ));
         }
-        if !(p.rotation.is_finite() && p.rotation.length_squared() > 1e-12) {
+        if !(p.rotation().is_finite() && p.rotation().length_squared() > 1e-12) {
             return Err(fail(
                 name,
                 format!("placement {i} rotation is not a rotation"),
@@ -281,9 +296,9 @@ pub(crate) fn input_hash(src: &Instances, cell_log2: u8) -> Hash32 {
     h.update(&[cell_log2, u8::from(src.joined)]);
     h.update(format!("{:?}", src.prototypes).as_bytes());
     for p in &src.records {
-        h.update(bytemuck::cast_slice(&p.position.to_array()));
-        h.update(bytemuck::cast_slice(&p.rotation.to_array()));
-        h.update(bytemuck::cast_slice(&p.scale.to_array()));
+        h.update(bytemuck::cast_slice(&p.position));
+        h.update(bytemuck::cast_slice(&p.rotation));
+        h.update(bytemuck::cast_slice(&p.scale));
         h.update(&p.prototype.to_le_bytes());
     }
     h.update(&src.user_stride.to_le_bytes());
@@ -405,7 +420,7 @@ fn build_page(
     } else {
         set_scale_range(
             &mut header,
-            members.iter().map(|&i| src.records[i].scale.abs()),
+            members.iter().map(|&i| src.records[i].scale().abs()),
         );
         quantise_positions(&mut header, rel, members)
     };
@@ -413,7 +428,7 @@ fn build_page(
     let mut records = Vec::with_capacity(members.len());
     for (n, &i) in members.iter().enumerate() {
         let p = &src.records[i];
-        let (rotation, mirror) = proper_rotation(p.rotation, p.scale);
+        let (rotation, mirror) = proper_rotation(p.rotation(), p.scale());
         let q = rotation.to_array();
         let exact = instance::exact_axis_index(q);
         let (rot, mut scale) = match exact {
@@ -430,14 +445,14 @@ fn build_page(
                     format!("joined placement {i} rotation is not a multiple of 90 degrees"),
                 ));
             }
-            if (p.scale - Vec3::ONE).abs().max_element() > 1e-6 {
+            if (p.scale() - Vec3::ONE).abs().max_element() > 1e-6 {
                 return Err(fail(
                     name,
-                    format!("joined placement {i} has scale {}, not 1", p.scale),
+                    format!("joined placement {i} has scale {}, not 1", p.scale()),
                 ));
             }
         } else {
-            for (a, s) in p.scale.abs().to_array().into_iter().enumerate() {
+            for (a, s) in p.scale().abs().to_array().into_iter().enumerate() {
                 scale |= scale_code(&header, s) << (10 * a);
             }
         }

@@ -5,7 +5,7 @@
 //! shading normal `material_normal` gives from the stored tangent and from the derived one,
 //! and takes the 99th percentile of the angle between them.
 
-use glam::Vec3;
+use orr_math::Vec3;
 use orr_pack::texture::normal;
 use rayon::prelude::*;
 

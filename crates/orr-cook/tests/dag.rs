@@ -12,12 +12,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use dag_read::{Cut, Dag, coverage, covers_once, load, read};
-use glam::{Vec2, Vec3};
 use glb::Glb;
 use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, LodMode, Manifest, MeshInput, MeshParts, MeshSettings,
     Source, StaticDisplacement,
 };
+use orr_math::{Vec2, Vec3};
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{Cluster, MeshHeader, NodePage};
 use orr_pack::model::ModelInfo;

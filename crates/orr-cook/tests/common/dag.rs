@@ -1,7 +1,7 @@
 //! Readers for cooked DAG meshes: clusters with their triangles, cuts by the cluster rule
 //! and through the hierarchy, and coverage counts of projected triangles.
 
-use glam::{Vec2, Vec3};
+use orr_math::{Vec2, Vec3};
 use orr_pack::mesh::{
     self, Cluster, Group, MeshHeader, MeshInfo, NODE_PAGE_MAX, Node, PAGE_MAX, PageView,
 };

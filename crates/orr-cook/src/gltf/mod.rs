@@ -56,9 +56,9 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use glam::{Mat3, Mat4, Vec3};
 use gltf::image::Source as ImageSource;
 use gltf::mesh::{Mode, Semantic};
+use orr_math::{Mat3, Mat4, Vec3};
 use orr_pack::Hash32;
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -704,7 +704,7 @@ impl Imported<'_> {
                         });
                     baked[k].1.push(Placed {
                         position: m.w_axis.truncate().as_dvec3(),
-                        rotation: glam::Quat::IDENTITY,
+                        rotation: orr_math::Quat::IDENTITY,
                         scale: Vec3::ONE,
                     });
                 }
@@ -914,8 +914,8 @@ fn node_transforms(src: &Data<'_>, graph: &Graph, n: usize) -> Result<Vec<Mat4>,
             let t = t
                 .as_ref()
                 .map_or(Vec3::ZERO, |v| Vec3::from_slice(&v[3 * i..]));
-            let r = r.as_ref().map_or(glam::Quat::IDENTITY, |v| {
-                glam::Quat::from_slice(&v[4 * i..]).normalize()
+            let r = r.as_ref().map_or(orr_math::Quat::IDENTITY, |v| {
+                orr_math::Quat::from_slice(&v[4 * i..]).normalize()
             });
             let s = sc
                 .as_ref()

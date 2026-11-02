@@ -16,10 +16,10 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use glam::{DQuat, DVec3, Quat, Vec3};
 use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, Instances, Manifest, Placement, PrototypeSpec, Source,
 };
+use orr_math::{DQuat, DVec3, Quat, Vec3};
 use orr_pack::instance::{self, InstancePageInfo};
 use orr_pack::{Archive, Class, Target};
 
@@ -115,9 +115,10 @@ fn scatter_set_cooks_within_its_error_bounds() {
                 records: recs
                     .iter()
                     .map(|r| Placement {
-                        position: DVec3::new(r.f[0].into(), r.f[1].into(), r.f[2].into()),
-                        rotation: Quat::from_xyzw(r.f[3], r.f[4], r.f[5], r.f[6]),
-                        scale: Vec3::new(r.f[7], r.f[8], r.f[9]),
+                        position: DVec3::new(r.f[0].into(), r.f[1].into(), r.f[2].into())
+                            .to_array(),
+                        rotation: Quat::from_xyzw(r.f[3], r.f[4], r.f[5], r.f[6]).to_array(),
+                        scale: Vec3::new(r.f[7], r.f[8], r.f[9]).to_array(),
                         prototype: ids[&r.prototype],
                     })
                     .collect(),
@@ -201,7 +202,7 @@ fn scatter_set_cooks_within_its_error_bounds() {
             }
             let q = DQuat::from_xyzw(r.f[3].into(), r.f[4].into(), r.f[5].into(), r.f[6].into())
                 .normalize();
-            let d = DQuat::from_mat3(&glam::DMat3::from_cols(cols[0], cols[1], cols[2]));
+            let d = DQuat::from_mat3(&orr_math::DMat3::from_cols(cols[0], cols[1], cols[2]));
             rot_err = rot_err.max(q.angle_between(d).to_degrees());
         }
         pages += 1;

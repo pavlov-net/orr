@@ -7,12 +7,12 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use glam::{DVec3, Quat, Vec3};
 use orr_cook::{
     ArchiveSpec, AssemblySettings, AssetSpec, CookOptions, Cooked, DataFormat, GltfSettings,
     Instances, LodMode, Manifest, MipFilter, Outcome, Placement, PrototypeSpec, Quality, Source,
     TextureSettings, Usage,
 };
+use orr_math::{DVec3, Quat, Vec3};
 use orr_pack::{Archive, AssetId, Class, Target};
 
 fn dir(name: &str) -> PathBuf {
@@ -89,9 +89,10 @@ fn write_scene(d: &Path) {
 fn assets(d: &Path, tex_filter: MipFilter) -> Vec<AssetSpec> {
     let records = (0..6)
         .map(|i| Placement {
-            position: DVec3::new(f64::from(i) * 300.0 - 700.0, 2.0, f64::from(i % 2) * 300.0),
-            rotation: Quat::from_rotation_y(i as f32),
-            scale: Vec3::splat(1.0 + i as f32 * 0.1),
+            position: DVec3::new(f64::from(i) * 300.0 - 700.0, 2.0, f64::from(i % 2) * 300.0)
+                .to_array(),
+            rotation: Quat::from_rotation_y(i as f32).to_array(),
+            scale: Vec3::splat(1.0 + i as f32 * 0.1).to_array(),
             prototype: 0,
         })
         .collect();
@@ -519,7 +520,7 @@ material = { base_color = [0.5, 0.25, 0.125], surface = 4 }
     let Source::Instances(i) = &a.assets[4].source else {
         panic!("instances");
     };
-    assert_eq!(i.records[0].position, DVec3::new(1.0, 2.0, 3.0));
+    assert_eq!(i.records[0].position, [1.0, 2.0, 3.0]);
     assert!(i.prototypes[0].sections[0].hidden);
     let Source::Material(paint) = &a.assets[5].source else {
         panic!("material");
@@ -659,9 +660,9 @@ fn linked_imports_still_expand_assemblies() {
         settings.mesh.assemblies = Some(AssemblySettings::default());
         let records = (0..n)
             .map(|i| Placement {
-                position: DVec3::new(10.0 * i as f64, 0.0, 5.0),
-                rotation: Quat::from_rotation_y(i as f32),
-                scale: Vec3::ONE,
+                position: DVec3::new(10.0 * i as f64, 0.0, 5.0).to_array(),
+                rotation: Quat::from_rotation_y(i as f32).to_array(),
+                scale: [1.0; 3],
                 prototype: 0,
             })
             .collect();

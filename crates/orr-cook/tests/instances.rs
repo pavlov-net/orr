@@ -4,11 +4,11 @@ mod common_assembly;
 
 use std::path::{Path, PathBuf};
 
-use glam::{DVec3, Quat, Vec3};
 use orr_cook::{
     ArchiveSpec, AssemblySettings, AssetSpec, Error, GltfSettings, Instances, Manifest, Placement,
     PrototypeSpec, SectionSpec, Source,
 };
+use orr_math::{DVec3, Quat, Vec3};
 use orr_pack::instance::{self, InstancePageInfo, InstanceRecord};
 use orr_pack::{Archive, AssetId, Class, Entry, Target};
 
@@ -103,10 +103,10 @@ fn rotation(rng: &mut Rng) -> Quat {
 fn angle_deg(a: Quat, rows: [[f32; 4]; 3]) -> f64 {
     let col =
         |c: usize| DVec3::new(rows[0][c].into(), rows[1][c].into(), rows[2][c].into()).normalize();
-    let m = glam::DMat3::from_cols(col(0), col(1), col(2));
+    let m = orr_math::DMat3::from_cols(col(0), col(1), col(2));
     a.as_dquat()
         .normalize()
-        .angle_between(glam::DQuat::from_mat3(&m))
+        .angle_between(orr_math::DQuat::from_mat3(&m))
         .to_degrees()
 }
 
@@ -123,14 +123,15 @@ fn fixture_page_decodes_within_its_error_bounds() {
     let n = 6000;
     let records: Vec<Placement> = (0..n)
         .map(|i| Placement {
-            position: corner
+            position: (corner
                 + DVec3::new(
                     rng.range(3.0, 250.0),
                     rng.range(10.0, 40.0),
                     rng.range(0.0, 256.0),
-                ),
-            rotation: rotation(&mut rng),
-            scale: if i % 3 == 0 {
+                ))
+            .to_array(),
+            rotation: rotation(&mut rng).to_array(),
+            scale: (if i % 3 == 0 {
                 Vec3::splat(rng.range(0.5, 2.0) as f32)
             } else {
                 Vec3::new(
@@ -138,7 +139,8 @@ fn fixture_page_decodes_within_its_error_bounds() {
                     rng.range(0.6, 1.8) as f32,
                     rng.range(0.6, 1.8) as f32,
                 )
-            },
+            })
+            .to_array(),
             prototype: (i % 3) as u16,
         })
         .collect();
@@ -229,7 +231,7 @@ fn fixture_page_decodes_within_its_error_bounds() {
             assert!(rel <= scale_half_step.exp2() - 1.0 + 1e-5, "scale {rel}");
             assert!(rel <= 0.002, "scale {rel}");
         }
-        let err = angle_deg(p.rotation, m.rows);
+        let err = angle_deg(Quat::from_array(p.rotation), m.rows);
         assert!(err <= 0.17, "rotation {err} deg");
         if raw[k].exact_axis() {
             assert!(err < 1e-4);
@@ -256,17 +258,18 @@ fn cells_split_placements_and_large_cells_split_into_pages() {
                 rng.range(0.0, 256.0),
                 rng.range(0.0, 50.0),
                 rng.range(0.0, 256.0),
-            ),
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
+            )
+            .to_array(),
+            rotation: Quat::IDENTITY.to_array(),
+            scale: [1.0; 3],
             prototype: 0,
         });
     }
     for x in [-0.5, -256.0, -256.5] {
         records.push(Placement {
-            position: DVec3::new(x, -1.0, 3.0),
-            rotation: Quat::from_rotation_y(0.3),
-            scale: Vec3::splat(2.0),
+            position: DVec3::new(x, -1.0, 3.0).to_array(),
+            rotation: Quat::from_rotation_y(0.3).to_array(),
+            scale: Vec3::splat(2.0).to_array(),
             prototype: 0,
         });
     }
@@ -315,9 +318,10 @@ fn joined_pages_decode_exactly() {
                 100.0 + f64::from(i % 20) * 1.5 + 37.0 * step,
                 f64::from(i / 20) * 0.75,
                 -20.0 - f64::from(i % 7) * 2.0,
-            ),
-            rotation: turn,
-            scale: Vec3::ONE,
+            )
+            .to_array(),
+            rotation: turn.to_array(),
+            scale: [1.0; 3],
             prototype: 0,
         });
     }
@@ -339,8 +343,8 @@ fn joined_pages_decode_exactly() {
     let mut want: Vec<[u32; 12]> = records
         .iter()
         .map(|p| {
-            let r = glam::Mat3::from_quat(p.rotation);
-            let t = p.position - corner;
+            let r = orr_math::Mat3::from_quat(Quat::from_array(p.rotation));
+            let t = DVec3::from(p.position) - corner;
             let rows = [0, 1, 2].map(|i| {
                 // + 0.0 turns the rounded -0.0 entries into the 0.0 the decode writes.
                 let row = r.row(i).to_array().map(|v| v.round() + 0.0);
@@ -360,18 +364,20 @@ fn joined_pages_decode_exactly() {
         f(&mut bad.records[7]);
         matches!(cook_instances(bad), Err(Error::Instances { .. }))
     };
-    assert!(fails(&|p| p.position.x += step * 0.25));
-    assert!(fails(&|p| p.scale.y = 1.01));
-    assert!(fails(&|p| p.rotation = Quat::from_rotation_y(0.2)));
+    assert!(fails(&|p| p.position[0] += step * 0.25));
+    assert!(fails(&|p| p.scale[1] = 1.01));
+    assert!(fails(
+        &|p| p.rotation = Quat::from_rotation_y(0.2).to_array()
+    ));
 }
 
 #[test]
 fn prototypes_outside_the_format_fail_with_named_errors() {
     let one = |p: PrototypeSpec| Instances {
         records: vec![Placement {
-            position: DVec3::splat(1.0),
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
+            position: DVec3::splat(1.0).to_array(),
+            rotation: Quat::IDENTITY.to_array(),
+            scale: [1.0; 3],
             prototype: 0,
         }],
         prototypes: vec![p],
@@ -479,9 +485,9 @@ fn assemblies_place_their_units_through_instance_sources() {
         records: placements
             .iter()
             .map(|&(position, rotation, scale)| Placement {
-                position,
-                rotation,
-                scale,
+                position: position.to_array(),
+                rotation: rotation.to_array(),
+                scale: scale.to_array(),
                 prototype: 0,
             })
             .collect(),
@@ -594,7 +600,7 @@ fn assemblies_place_their_units_through_instance_sources() {
     let r = cook_with_report(vec![assembly_model(&path), paint.clone(), scatter(joined)]);
     assert!(matches!(r, Err(Error::Instances { .. })), "{:?}", r.err());
     let mut uneven = src.clone();
-    uneven.records[0].scale = Vec3::new(1.0, 2.0, 1.0);
+    uneven.records[0].scale = [1.0, 2.0, 1.0];
     let r = cook_with_report(vec![assembly_model(&path), paint, scatter(uneven)]);
     assert!(matches!(r, Err(Error::Instances { .. })), "{:?}", r.err());
 }

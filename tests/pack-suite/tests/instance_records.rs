@@ -163,9 +163,10 @@ fn scattered(rng: &mut Rng) -> Vec<Placement> {
                     rng.range(-300.0, 500.0),
                     rng.range(-20.0, 60.0),
                     rng.range(-100.0, 100.0),
-                ),
-                rotation,
-                scale,
+                )
+                .to_array(),
+                rotation: rotation.to_array(),
+                scale: scale.to_array(),
                 prototype: 0,
             }
         })
@@ -181,10 +182,12 @@ fn joined() -> Vec<Placement> {
                 100.0 + f64::from(i % 20) * 1.25 + 37.0 * step,
                 f64::from(i / 20) * 0.75 - 3.0,
                 -20.0 - f64::from(i % 7) * 2.0 + 5.0 * step,
-            ),
-            rotation: Quat::from_rotation_y((90.0 * (i % 4) as f32).to_radians())
-                * Quat::from_rotation_z((90.0 * (i % 3) as f32).to_radians()),
-            scale: Vec3::ONE,
+            )
+            .to_array(),
+            rotation: (Quat::from_rotation_y((90.0 * (i % 4) as f32).to_radians())
+                * Quat::from_rotation_z((90.0 * (i % 3) as f32).to_radians()))
+            .to_array(),
+            scale: [1.0; 3],
             prototype: 0,
         })
         .collect()

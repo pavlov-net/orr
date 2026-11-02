@@ -21,7 +21,7 @@ use std::thread::Scope;
 use std::time::Instant;
 
 use ctt::Quality;
-use glam::{Vec2, Vec3, Vec4};
+use orr_math::{Vec2, Vec3, Vec4};
 
 use orr_pack::material::{Material, slot};
 use orr_pack::model::{ModelHeader, ModelInfo};
@@ -1809,9 +1809,9 @@ fn scene_instances(name: &str, models: &[(String, Vec<Placed>)]) -> Vec<Instance
                     ..PrototypeSpec::default()
                 });
                 src.records.extend(placed.iter().map(|q| Placement {
-                    position: q.position,
-                    rotation: q.rotation,
-                    scale: q.scale,
+                    position: q.position.to_array(),
+                    rotation: q.rotation.to_array(),
+                    scale: q.scale.to_array(),
                     prototype: p as u16,
                 }));
             }

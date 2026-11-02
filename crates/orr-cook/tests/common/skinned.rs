@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use glam::{Mat4, Quat, Vec3};
+use orr_math::{Mat4, Quat, Vec3};
 
 const ROOT_T: [f32; 3] = [1.0, 0.0, 0.0];
 const ROOT_R: [f32; 4] = [0.707_106_77, 0.0, 0.0, 0.707_106_77];
