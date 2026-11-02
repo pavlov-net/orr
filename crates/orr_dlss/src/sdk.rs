@@ -14,7 +14,7 @@ use orr_gpu::{
 };
 
 use crate::raw::FgCamera;
-use crate::{DlssError, Quality, Support, Uuid, raw};
+use crate::{DlssError, Mode, Quality, Support, Uuid, raw};
 
 /// Serializes every NGX call this layer makes; NGX is not thread-safe.
 static NGX: Mutex<()> = Mutex::new(());
@@ -255,6 +255,30 @@ impl RayReconstruction {
             |ngx, cmd| unsafe { raw::RayReconstruction::new(ngx, cmd, output, quality, preset) },
         )
         .map(Self)
+    }
+
+    /// [`new`](Self::new) at `render`, with the mode nearest it. NVIDIA documents only the
+    /// render sizes of the modes for ray reconstruction, so NGX may refuse others.
+    pub fn with_render_size(
+        sdk: &DlssSdk,
+        render: [u32; 2],
+        output: [u32; 2],
+        preset: Option<u32>,
+    ) -> Result<Self, DlssError> {
+        Owned::create(
+            sdk,
+            |_| {},
+            // SAFETY: as in `new`.
+            |ngx, cmd| unsafe {
+                raw::RayReconstruction::with_render_size(ngx, cmd, render, output, preset)
+            },
+        )
+        .map(Self)
+    }
+
+    /// The mode the feature was created with.
+    pub fn mode(&self) -> Mode {
+        self.0.get().mode()
     }
 
     /// Render resolution, fixed for the feature's lifetime.

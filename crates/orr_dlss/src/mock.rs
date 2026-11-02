@@ -3,7 +3,7 @@
 //! be created. Without it, initialization fails.
 
 use crate::raw::{FgInputs, Image, RrInputs, SrInputs, Upscaler, Vulkan};
-use crate::{DlssError, Quality, Support, Uuid};
+use crate::{DlssError, Mode, Support, Uuid};
 use ash::vk;
 use std::ffi::CString;
 
@@ -46,20 +46,13 @@ impl Ngx {
         0
     }
 
-    /// NGX's published scale factors.
     pub(crate) fn render_size(
         &self,
         output: [u32; 2],
-        quality: Quality,
+        mode: Mode,
         _upscaler: Upscaler,
     ) -> Result<[u32; 2], DlssError> {
-        let scale = match quality {
-            Quality::Dlaa => 1.0,
-            Quality::Quality => 2.0 / 3.0,
-            Quality::Balanced => 0.58,
-            Quality::Performance => 0.5,
-            Quality::UltraPerformance => 1.0 / 3.0,
-        };
+        let scale = mode.scale();
         Ok(output.map(|o| ((f64::from(o) * scale).round() as u32).max(1)))
     }
 }
@@ -75,7 +68,7 @@ impl Upscale {
         _upscaler: Upscaler,
         _render: [u32; 2],
         _output: [u32; 2],
-        _quality: Quality,
+        _mode: Mode,
         _preset: Option<u32>,
     ) -> Result<Self, DlssError> {
         Ok(Self {
