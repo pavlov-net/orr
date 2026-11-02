@@ -3,7 +3,7 @@
 
 use std::sync::OnceLock;
 
-use orr::abi::{GpuPtr, SamplerIndex};
+use orr::abi::GpuPtr;
 use orr::orr_gpu::{
     ComputePipeline, Format, Hazards, MemoryKind, QueueKind, ShaderStage, SpecData, Stages,
     Texture, TextureDesc, TextureIndex, TextureMemory, TextureRegion, TextureUsage, ViewDesc,
@@ -14,9 +14,9 @@ use orr::{
 };
 use orr_atmosphere::presets::solar_disc;
 use orr_atmosphere::spectrum::{SOLAR_COLOR, SOLAR_ILLUMINANCE};
-use orr_atmosphere::{Atmosphere, AtmosphereGpu, AtmosphereState, MAX_EXTRA_VIEWS};
+use orr_atmosphere::{Atmosphere, AtmosphereGpu, AtmosphereState, HeightFog, MAX_EXTRA_VIEWS};
 use orr_lighting::{LightingStats, SceneLighting, SceneLightingSettings, ScenePass};
-use orr_math::DVec3;
+use orr_math::{DVec3, Vec3};
 use orr_scene::testing::{device, read_buffer, wait};
 
 /// Generated kernel modules and types of the suite's Slang.
@@ -24,7 +24,8 @@ pub mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
 }
 
-/// orr's kernels with `AtmosphereSky` linked as the environment.
+/// orr's kernels with `AtmosphereSky` linked as the environment and `AtmosphereMedium` as the
+/// medium.
 pub mod linked {
     include!(concat!(env!("OUT_DIR"), "/linked/orr_kernels.rs"));
 }
@@ -34,6 +35,25 @@ use shaders::probe::{MODULE, Root};
 pub mod prague;
 
 pub const SUN: LightId = LightId(0);
+
+/// The Earth defaults with its planet top at the origin.
+pub fn earth() -> Atmosphere {
+    Atmosphere::earth(DVec3::ZERO, Vec3::Y)
+}
+
+/// [`earth`] with a layer of height fog.
+pub fn foggy() -> Atmosphere {
+    Atmosphere {
+        height_fog: Some(HeightFog {
+            density: 1e-4,
+            falloff_height: 300.0,
+            base_height: 0.0,
+            albedo: Vec3::splat(0.9),
+            droplet_diameter: 10.0,
+        }),
+        ..earth()
+    }
+}
 
 /// Unit direction at an elevation and an azimuth from +x toward +z, in degrees.
 pub fn dir(elevation: f64, azimuth: f64) -> DVec3 {
@@ -74,8 +94,7 @@ impl Rig {
         let scene = renderer
             .create_scene(&SceneDesc::default(), &Default::default())
             .unwrap();
-        let mut sky =
-            AtmosphereState::new(device(), atmosphere, SamplerIndex(7), MAX_EXTRA_VIEWS).unwrap();
+        let mut sky = AtmosphereState::new(device(), atmosphere, MAX_EXTRA_VIEWS).unwrap();
         sky.set_lights(&[SUN]);
         Self {
             renderer,

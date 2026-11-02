@@ -1,5 +1,5 @@
 //! Builds the suite's probe kernels against orr_atmosphere's shader root, and orr's kernels
-//! with `AtmosphereSky` linked as the environment.
+//! with `AtmosphereSky` linked as the environment and `AtmosphereMedium` as the medium.
 
 use std::env;
 use std::path::PathBuf;
@@ -32,6 +32,7 @@ fn main() {
                 .link_points(&points)
                 .out_dir(out.join("linked"))
                 .link(LinkPoint::Environment, "sky", &module, "AtmosphereSky")
+                .link(LinkPoint::Medium, "air", &module, "AtmosphereMedium")
                 .compile()
         });
     if let Err(e) = result {

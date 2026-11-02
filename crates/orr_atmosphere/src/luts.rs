@@ -1,6 +1,6 @@
 //! One atmosphere's GPU state and the LUT passes recorded at the scene compute point.
 
-use orr::abi::{GpuAddress, SamplerIndex, StorageImageIndex, TextureIndex};
+use orr::abi::{GpuAddress, StorageImageIndex, TextureIndex};
 use orr::orr_gpu::{
     AddressMode, Allocation, ComputePipeline, Device, Filter, Format, Hazards, MemoryKind,
     SamplerDesc, ShaderStage, SpecData, Stages, Texture, TextureDesc, TextureMemory, TextureUsage,
@@ -163,31 +163,23 @@ fn check(desc: &Atmosphere) {
 }
 
 impl AtmosphereState {
-    /// Allocates the LUTs, their heap slots and the block, writes `sampler` (a slot the state
-    /// keeps) and creates the pipelines on the calling thread. Nothing is allocated after
-    /// this. `extra_views`, at most [`MAX_EXTRA_VIEWS`], is how many sky-view LUTs it
-    /// holds for views other than the focus view.
-    pub fn new(
-        device: &Device,
-        desc: &Atmosphere,
-        sampler: SamplerIndex,
-        extra_views: u32,
-    ) -> Result<Self> {
+    /// Allocates the LUTs, their heap slots and the block, and creates the pipelines on the
+    /// calling thread. Nothing is allocated after this. `extra_views`, at most
+    /// [`MAX_EXTRA_VIEWS`], is how many sky-view LUTs it holds for views other than the focus
+    /// view.
+    pub fn new(device: &Device, desc: &Atmosphere, extra_views: u32) -> Result<Self> {
         check(desc);
         assert!(
             extra_views <= MAX_EXTRA_VIEWS,
             "at most {MAX_EXTRA_VIEWS} extra views"
         );
-        device.write_sampler(
-            sampler,
-            &SamplerDesc {
-                mag: Filter::Linear,
-                min: Filter::Linear,
-                mip: Filter::Nearest,
-                address: [AddressMode::Repeat; 3],
-                ..SamplerDesc::default()
-            },
-        );
+        let sampler = device.sampler(&SamplerDesc {
+            mag: Filter::Linear,
+            min: Filter::Linear,
+            mip: Filter::Nearest,
+            address: [AddressMode::Repeat; 3],
+            ..SamplerDesc::default()
+        })?;
         let layers = PASSES as u32 + 1;
         let transmittance = Lut::new(
             device,
@@ -300,7 +292,9 @@ impl AtmosphereState {
         self.record.fold_reset = 1;
     }
 
-    /// The block's address, for `SceneWriter::set_environment` and `set_medium`.
+    /// The block's address, for `SceneWriter::set_environment` and `set_medium`. Kernels
+    /// linked to this crate's types read it unconditionally, so a scene using them has it set
+    /// from its first frame, with [`record`](Self::record) running every frame before them.
     pub fn data(&self) -> GpuAddress {
         self.block.gpu().address()
     }

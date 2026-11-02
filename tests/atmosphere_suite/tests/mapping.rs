@@ -3,10 +3,8 @@
 //! LUT parameterization round trips, f32 altitudes and lighting's froxel material encoding of
 //! the medium on the GPU.
 
-use atmosphere_suite::{Probe, Rig, dir, probe};
-use orr_atmosphere::{
-    Atmosphere, HeightFog, MULTIPLE_SCATTERING_SIZE, SKY_VIEW_SIZE, TRANSMITTANCE_SIZE,
-};
+use atmosphere_suite::{Probe, Rig, dir, foggy, probe};
+use orr_atmosphere::{Atmosphere, MULTIPLE_SCATTERING_SIZE, SKY_VIEW_SIZE, TRANSMITTANCE_SIZE};
 use orr_math::{DVec3, Vec3};
 use orr_scene::testing::{assert_clean, read_buffer};
 
@@ -156,17 +154,7 @@ fn altitudes_against_f64() {
 /// unencoded medium's, per channel.
 #[test]
 fn froxel_material_keeps_three_component_inscatter() {
-    let atmosphere = Atmosphere {
-        height_fog: Some(HeightFog {
-            density: 1e-4,
-            falloff_height: 300.0,
-            base_height: 0.0,
-            albedo: Vec3::splat(0.9),
-            droplet_diameter: 10.0,
-        }),
-        ..Atmosphere::earth(DVec3::ZERO, Vec3::Y)
-    };
-    let mut rig = Rig::new(&atmosphere);
+    let mut rig = Rig::new(&foggy());
     rig.frame(Some(dir(30.0, 0.0)), DVec3::new(0.0, 2.0, 0.0));
     let mut input = Vec::new();
     for h in [2.0f32, 50.0, 300.0, 1000.0, 3000.0] {

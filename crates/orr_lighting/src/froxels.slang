@@ -551,7 +551,8 @@ public bool froxel_coord(uint3 grid, ViewConstants* v, float near_range, float3 
 // The light the linked medium `M` scatters toward `origin` along the `t` m segment from it
 // along unit `dir`, marched as `segment_inscatter` does, except that steps inside `volume`
 // (null for none), the froxels of view `v`, take their froxel's medium and light, so the
-// shadowed directional lights carry their visibility.
+// shadowed directional lights carry their visibility, and `transmittance` is the march's, with
+// the froxels' medium in it.
 public float3 froxel_segment_inscatter<M : IMedium>(FroxelVolume* volume, ViewConstants* v, LightSetGpu* set, float3 origin, float3 dir, float t, uint steps, float jitter, out float3 transmittance)
 {
     uint64_t data = set.scene.medium;

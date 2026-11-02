@@ -31,6 +31,12 @@ pub mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
 }
 
+/// orr's kernels with `AtmosphereSky` linked as the environment and `AtmosphereMedium` as the
+/// medium.
+pub mod linked {
+    include!(concat!(env!("OUT_DIR"), "/linked/orr_kernels.rs"));
+}
+
 /// The examples' NGX project id.
 pub const PROJECT_ID: Uuid = Uuid::from_u128(0x5d1e_7a40_c2b9_4f86_9e3d_61a0_b8f2_47c5);
 
