@@ -735,7 +735,9 @@ impl Ctx<'_> {
         c
     }
 
-    /// Micromaps of an alpha-tested cluster from its stored uvs, at most `bytes_max`.
+    /// Micromaps of an alpha-tested cluster from its stored uvs, at most `bytes_max`. A
+    /// smaller cap than the one that made `c`'s micromaps never takes a higher level, so
+    /// measuring starts at their level.
     fn omm(&self, c: &ClusterData, bytes_max: u32) -> Option<ClusterOmm> {
         let o = self.s.omm.as_ref()?;
         let section = usize::from(c.record.section);
@@ -743,6 +745,7 @@ impl Ctx<'_> {
         let alpha = &c.tris.as_chunks::<3>().0[usize::from(c.record.alpha_first)..];
         let s = OmmSettings {
             cluster_bytes_max: bytes_max,
+            max_level: c.omm.as_ref().map_or(o.max_level, |m| m.max_level),
             ..o.clone()
         };
         omm::cluster_omm(opacity, self.omm_alpha[section].as_ref(), &c.uvs, alpha, &s)
