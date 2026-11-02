@@ -1148,7 +1148,6 @@ impl TextureJob {
         }
     }
 
-    /// The packed mip 0 and how it cooks.
     /// The packed mip 0 and how it cooks; `opened` is one source image already opened.
     fn prepare(
         &self,

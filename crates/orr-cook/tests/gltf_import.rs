@@ -890,8 +890,8 @@ fn micromap_states_never_contradict_the_alpha_test() {
             .iter()
             .find(|e| e.name == "g/mesh")
             .unwrap();
-        // The 1 KiB cap leaves the cards at low levels, mostly unknown.
-        let unknown_max = if omm == capped { 1.0 } else { 0.5 };
+        // The 1 KiB cap leaves the cards at low levels, about 0.6 of them unknown.
+        let unknown_max = if omm == capped { 0.65 } else { 0.5 };
         for l in &entry.mesh.as_ref().unwrap().levels {
             assert!(l.omm_triangles > 0 && l.omm_bytes > 0);
             assert!(
