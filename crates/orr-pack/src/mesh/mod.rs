@@ -24,7 +24,7 @@ mod omm;
 
 use bytemuck::{Pod, Zeroable};
 
-pub use codec::{decode_page, encode_page};
+pub use codec::{check_stored_page, decode_page, encode_page};
 pub use omm::*;
 
 use crate::blob::{put_table, read, table};

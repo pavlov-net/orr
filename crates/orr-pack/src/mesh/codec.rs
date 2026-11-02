@@ -103,15 +103,83 @@ pub fn encode_page(page: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decodes a stored page (from [`crate::Archive::decode`] or [`crate::Archive::read`]) into
-/// `dst` in the resident layout. Every cluster's ranges, streams and triangle corners are
-/// checked; a page that fails any check is rejected.
-pub fn decode_page(stored: &[u8], dst: &mut [u8]) -> Result<PageLayout> {
+/// A stored page's header and cluster records, and each cluster's vertex and triangle
+/// streams as `[start, split, end]` byte offsets.
+struct Stored {
+    h: PageHeader,
+    clusters: Vec<Cluster>,
+    streams: Vec<[usize; 3]>,
+    streams_end: usize,
+}
+
+/// Checks everything of a stored page that [`decode_page`] checks before it decodes the
+/// streams: header, regions, stream table, every cluster's ranges and stream offsets, and
+/// each vertex stream's codec version.
+fn check_stored(stored: &[u8]) -> Result<Stored> {
     let bad = |what| Err(Error::Malformed(what));
     let Some(h) = read::<PageHeader>(stored, 0) else {
         return bad("page shorter than its header");
     };
     let (slots, tris_len) = layout(&h)?;
+    let n = h.cluster_count as usize;
+    let table = h.positions_offset as usize;
+    let offset = |i: usize| read::<u32>(stored, table + 4 * i).map(|o| o as usize);
+    let Some(streams_end) = offset(2 * n) else {
+        return bad("page stream table");
+    };
+    if offset(0) != Some(table + (2 * n + 1) * 4)
+        || streams_end > stored.len()
+        || stored.len() - streams_end != (h.len - h.omm_offset) as usize
+    {
+        return bad("page stream table");
+    }
+    let stride = 8 + h.attr_stride as usize;
+    let mut clusters = Vec::with_capacity(n);
+    let mut streams = Vec::with_capacity(n);
+    for i in 0..n {
+        let c = cluster(stored, i);
+        check_cluster(&c, clusters.last(), slots, tris_len)?;
+        let [a, b, e] = [2 * i, 2 * i + 1, 2 * i + 2].map(|j| offset(j).unwrap_or(0));
+        if !(a <= b && b <= e && e <= streams_end)
+            || usize::from(c.vertex_count) > MAX_VERTICES
+            || stride > MAX_VERTEX_BYTES
+        {
+            return bad("cluster streams");
+        }
+        if a == b || stored[a] != VERTEX_CODEC_HEADER {
+            return bad("cluster vertex stream");
+        }
+        clusters.push(c);
+        streams.push([a, b, e]);
+    }
+    Ok(Stored {
+        h,
+        clusters,
+        streams,
+        streams_end,
+    })
+}
+
+/// Checks a stored page as far as it can without decoding its streams, as a caller of
+/// `orr_pack/page_codec.slang` does before handing the page to the GPU: a page that passes
+/// can still fail there on a stream's contents. Returns its header and cluster records,
+/// which the resident page holds unchanged.
+pub fn check_stored_page(stored: &[u8]) -> Result<(PageHeader, Vec<Cluster>)> {
+    let s = check_stored(stored)?;
+    Ok((s.h, s.clusters))
+}
+
+/// Decodes a stored page (from [`crate::Archive::decode`] or [`crate::Archive::read`]) into
+/// `dst` in the resident layout. Every cluster's ranges, streams and triangle corners are
+/// checked; a page that fails any check is rejected.
+pub fn decode_page(stored: &[u8], dst: &mut [u8]) -> Result<PageLayout> {
+    let bad = |what| Err(Error::Malformed(what));
+    let Stored {
+        h,
+        clusters,
+        streams,
+        streams_end,
+    } = check_stored(stored)?;
     let len = h.len as usize;
     if dst.len() < len {
         return Err(Error::BufferSize {
@@ -119,19 +187,7 @@ pub fn decode_page(stored: &[u8], dst: &mut [u8]) -> Result<PageLayout> {
             have: dst.len(),
         });
     }
-    let n = h.cluster_count as usize;
     let records_end = h.positions_offset as usize;
-    let table = records_end;
-    let offset = |i: usize| read::<u32>(stored, table + 4 * i).map(|o| o as usize);
-    let Some(streams_end) = offset(2 * n) else {
-        return bad("page stream table");
-    };
-    if offset(0) != Some(table + (2 * n + 1) * 4)
-        || streams_end > stored.len()
-        || stored.len() - streams_end != len - h.omm_offset as usize
-    {
-        return bad("page stream table");
-    }
     let dst = &mut dst[..len];
     dst[..records_end].copy_from_slice(&stored[..records_end]);
     dst[records_end..h.omm_offset as usize].fill(0);
@@ -141,24 +197,9 @@ pub fn decode_page(stored: &[u8], dst: &mut [u8]) -> Result<PageLayout> {
     let attr_stride = h.attr_stride as usize;
     let mut vertices = [0u8; MAX_VERTICES * MAX_VERTEX_BYTES];
     let mut tris = [0u8; 256 * 3];
-    for i in 0..n {
-        let c = cluster(stored, i);
-        let prev = i.checked_sub(1).map(|p| cluster(stored, p));
-        check_cluster(&c, prev.as_ref(), slots, tris_len)?;
+    for (c, [a, b, e]) in clusters.iter().zip(streams) {
         let (v0, vn) = (c.vertex_first as usize, usize::from(c.vertex_count));
         let tn = usize::from(c.tri_count);
-        let (a, b, e) = (
-            offset(2 * i).unwrap_or(0),
-            offset(2 * i + 1).unwrap_or(0),
-            offset(2 * i + 2).unwrap_or(0),
-        );
-        if !(a <= b && b <= e && e <= streams_end) || vn > MAX_VERTICES || stride > MAX_VERTEX_BYTES
-        {
-            return bad("cluster streams");
-        }
-        if a == b || stored[a] != VERTEX_CODEC_HEADER {
-            return bad("cluster vertex stream");
-        }
         // SAFETY: `vertices` holds MAX_VERTICES vertices of up to MAX_VERTEX_BYTES, and the
         // decoder reads only the `b - a` bytes of the stream; it is safe on any input.
         let rc = unsafe {

@@ -44,6 +44,9 @@ pub(crate) struct AccelKernels {
     records: ComputePipeline,
     /// The CLAS pool's allocator.
     pub allocate: ComputePipeline,
+    /// Streamed mesh pages from their stored form: the copy pass, then the cluster decode.
+    pub page_copy: ComputePipeline,
+    pub page_decode: ComputePipeline,
 }
 
 impl AccelKernels {
@@ -57,6 +60,8 @@ impl AccelKernels {
             clas: pipeline(&accel::MODULE, "clas")?,
             records: pipeline(&accel::MODULE, "records")?,
             allocate: pipeline(&crate::shaders::clas_pool::MODULE, "allocate")?,
+            page_copy: pipeline(&crate::shaders::page_decode::MODULE, "copy")?,
+            page_decode: pipeline(&crate::shaders::page_decode::MODULE, "decode")?,
         })
     }
 }

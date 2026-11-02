@@ -11,31 +11,34 @@
 //! blocks sit at low priority so the OS pages them out before anything else.
 //!
 //! On the loading side a unit's blob, or a tile's chunk, is read through its mount's path
-//! and decoded on a worker: hierarchy pages into their stream pool slot (or the staging
-//! pool and a copy), texture tiles and user blobs into the staging pool. When a task's last
-//! read ends, the loading thread unbinds the tiles evicted since the last task and binds
-//! the new ones in one sparse bind, copies the tiles in on the loading queue, submits the
-//! other copies, and hands the batch to the render thread.
+//! and decompressed on a worker: hierarchy pages into their stream pool slot (or the
+//! staging pool and a copy), texture tiles, user blobs and mesh pages, still in their
+//! stored form, into the staging pool. When a task's last read ends, the loading thread
+//! unbinds the tiles evicted since the last task and binds the new ones in one sparse bind,
+//! copies the tiles in and decodes the mesh pages into their stream pool slots on the
+//! loading queue, submits the other copies, builds the mesh pages' CLAS and hands the batch
+//! to the render thread, which drops the pages whose decode failed.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use orr_gpu::{
-    CommandList, Device, GpuAddress, GpuPtr, MemoryKind, Micromap, QueueKind, SparseBinds, Texture,
-    TextureRegion, TileBind, TimelinePoint,
+    CommandList, Device, GpuAddress, GpuPtr, Hazards, MemoryKind, Micromap, QueueKind, SparseBinds,
+    Stages, Texture, TextureRegion, TileBind, TimelinePoint,
 };
-use orr_pack::mesh::{MeshHeader, PageView};
+use orr_pack::mesh::{MeshHeader, StoredPage};
 use orr_pack::{Blob, Codec};
 
 use crate::accel::{AccelShared, ClusterInfo, PageMicromap};
 use crate::clas_pool::{self, ClasPool, NO_UNIT, PageBuild, PoolBatch};
 use crate::loading::{BlobSource, Loading, Msg, decoded, landed, read_stored};
 use crate::memory::{Block, Pool, PoolSlot};
-use crate::mount::{Apply, PAGE, page_infos};
+use crate::mount::{Apply, page_infos};
 use crate::residency::{
     Key, Limits, Plan, Priority, Residency, ResidencyClass, ResidencyStats, UnitDesc,
 };
+use crate::shaders::page_decode::PageDecodeRoot;
 use crate::tiles::{TexResidency, TexStream, TextureFeedback};
 use crate::upload::Record;
 use crate::{Budgets, ClusterRef, Error, LoadState, MountId, Result, TextureStreamGpu};
@@ -613,9 +616,13 @@ impl Streaming {
         w: &mut Apply<'_>,
     ) -> Result<Vec<TimelinePoint>> {
         let mut points = Vec::new();
-        for batch in loading.take_streams(w.device) {
+        for mut batch in loading.take_streams(w.device) {
             points.extend(batch.points);
             let mut staging = self.staging.lock().unwrap();
+            if let Some(d) = batch.decode {
+                d.fail_pages(&mut batch.loads);
+                staging.free(d.slot);
+            }
             for l in &batch.loads {
                 if let Some(s) = l.staging {
                     staging.free(s);
@@ -756,6 +763,7 @@ impl Streaming {
                 outstanding: AtomicUsize::new(1),
                 done: Mutex::new(Vec::with_capacity(loads.len())),
                 copies: Mutex::new(Vec::new()),
+                decodes: Mutex::new(Vec::new()),
                 unbinds: std::mem::take(&mut self.unbinds),
                 loads,
             };
@@ -1023,6 +1031,8 @@ pub(crate) struct StreamTask {
     outstanding: AtomicUsize,
     done: Mutex<Vec<Landed>>,
     copies: Mutex<Vec<Copy>>,
+    /// The staged mesh pages to decode, and each one's cluster count.
+    decodes: Mutex<Vec<(StoredPage, u32)>>,
 }
 
 /// A finished load.
@@ -1041,10 +1051,12 @@ pub(crate) struct Landed {
     result: Result<(), Arc<Error>>,
 }
 
-/// What a streamed mesh page decoded to and its CLAS build.
+/// A streamed mesh page's clusters as its records name them, its decode and its CLAS build.
 struct MeshLanded {
     clusters: Vec<ClusterInfo>,
     region: Option<PageMicromap>,
+    /// Its page in the batch's [`PageDecodes`].
+    decode: u32,
     /// The results index of each cluster's CLAS.
     slots: Vec<u32>,
     micromap: Option<(Micromap, PoolSlot)>,
@@ -1055,6 +1067,37 @@ pub(crate) struct StreamBatch {
     pub points: Vec<TimelinePoint>,
     loads: Vec<Landed>,
     clas: Option<PoolBatch>,
+    decode: Option<PageDecodes>,
+}
+
+/// A batch's mesh page decode: the page records, the status word of each page and the
+/// kernels' root, in one staging slot.
+struct PageDecodes {
+    slot: PoolSlot,
+    block: Block,
+    status_at: u64,
+    count: u32,
+}
+
+impl PageDecodes {
+    /// Fails the landed mesh pages whose decode set a status bit.
+    fn fail_pages(&self, loads: &mut [Landed]) {
+        let mut status = vec![0u32; self.count as usize];
+        let ok = self
+            .block
+            .read_mapped(self.status_at, bytemuck::cast_slice_mut(&mut status));
+        assert!(ok, "the decode status is mapped");
+        for l in loads {
+            let failed = l
+                .mesh
+                .as_ref()
+                .is_some_and(|m| status[m.decode as usize] != 0);
+            if failed && l.result.is_ok() {
+                let e = orr_pack::Error::Malformed("streamed mesh page streams");
+                l.result = Err(Arc::new(e.into()));
+            }
+        }
+    }
 }
 
 impl StreamBatch {
@@ -1218,22 +1261,27 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
             }
             LoadKind::User { .. } => (None, None),
         };
-        // Bytes go straight into a mapped pool slot, else into the staging pool.
-        let staging = match block.filter(|b| b.cpu().is_some()) {
-            Some(_) => None,
-            None => match task
+        // Bytes go straight into a mapped pool slot, else into the staging pool; mesh pages
+        // stage their stored form for the decode.
+        let mesh_page = matches!(load.kind, LoadKind::MeshPage { .. });
+        let direct = !mesh_page && block.is_some_and(|b| b.cpu().is_some());
+        let staged_len = if mesh_page { len } else { slot_len };
+        let staging = if direct {
+            None
+        } else {
+            let slot = task
                 .staging
                 .lock()
                 .unwrap()
-                .alloc(&task.device, slot_len, None)
-            {
+                .alloc(&task.device, staged_len, None);
+            match slot {
                 Ok(s) => Some(s),
                 Err(e) => {
                     task.free(placed, None);
                     task.fail(load.what, e);
                     continue;
                 }
-            },
+            }
         };
         task.outstanding.fetch_add(1, Ordering::AcqRel);
         let t = Arc::clone(task);
@@ -1252,7 +1300,8 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
                         }
                         let dst = staging.map_or_else(|| block.expect("a pool slot"), |s| s.1);
                         if let LoadKind::MeshPage { stream, page } = &load.kind {
-                            mesh = Some(decode_page(stream, *page, bytes, &dst, slot_len)?);
+                            let to = (block.expect("a pool slot").gpu(), slot_len);
+                            mesh = Some(stage_page(stream, *page, bytes, &dst, to, &t.decodes)?);
                             return Ok(());
                         }
                         let wrote = dst.write_mapped(0, bytes);
@@ -1277,13 +1326,11 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
                     t.free(landed.placed.take(), landed.staging.take());
                 } else if let Some((_, s)) = staging {
                     let copy = match (&load.kind, block) {
-                        (LoadKind::Pool { .. } | LoadKind::MeshPage { .. }, Some(block)) => {
-                            Some(Copy::Buffer {
-                                src: s.gpu(),
-                                dst: block.gpu(),
-                                bytes: slot_len,
-                            })
-                        }
+                        (LoadKind::Pool { .. }, Some(block)) => Some(Copy::Buffer {
+                            src: s.gpu(),
+                            dst: block.gpu(),
+                            bytes: slot_len,
+                        }),
                         (LoadKind::User { target, .. }, _) => Some(match target {
                             BlobTarget::Buffer { at, .. } => Copy::Buffer {
                                 src: s.gpu(),
@@ -1310,31 +1357,44 @@ pub(crate) fn start(loading: &Arc<Loading>, task: &Arc<StreamTask>) {
     task.end(loading);
 }
 
-/// Expands a streamed mesh page's stored bytes into `dst` (`len` bytes) and reads its
-/// clusters.
-fn decode_page(
+/// Writes a streamed mesh page's stored bytes into its staging slot `staged` and queues
+/// their decode into the pool slot at `to` (address and bytes); reads its clusters from its
+/// records, which the decode copies unchanged.
+fn stage_page(
     stream: &MeshStream,
     page: u32,
     stored: &[u8],
-    dst: &Block,
-    len: u64,
+    staged: &Block,
+    to: (u64, u64),
+    decodes: &Mutex<Vec<(StoredPage, u32)>>,
 ) -> Result<MeshLanded> {
-    PAGE.with_borrow_mut(|resident| {
-        resident.resize(len as usize, 0);
-        orr_pack::mesh::decode_page(stored, resident)?;
-        let view = PageView::new(resident, &stream.header)?;
-        if view.cluster_count() != stream.pages[page as usize].clusters {
-            return Err(orr_pack::Error::Malformed("streamed page cluster count").into());
-        }
-        let (clusters, region) = page_infos(&view, resident, page);
-        let wrote = dst.write_mapped(0, resident);
-        assert!(wrote, "a mapped slot");
-        Ok(MeshLanded {
-            clusters,
-            region,
-            slots: Vec::new(),
-            micromap: None,
-        })
+    let (h, records) = orr_pack::mesh::check_stored_page(stored)?;
+    if h.attr_stride != stream.header.attr_stride() {
+        return Err(orr_pack::Error::Malformed("page attribute stride").into());
+    }
+    if h.cluster_count != stream.pages[page as usize].clusters {
+        return Err(orr_pack::Error::Malformed("streamed page cluster count").into());
+    }
+    if u64::from(h.len) > to.1 {
+        return Err(orr_pack::Error::Malformed("streamed page length").into());
+    }
+    let wrote = staged.write_mapped(0, stored);
+    assert!(wrote, "a mapped staging slot");
+    let (clusters, region) = page_infos(&h, records, page);
+    let record = StoredPage {
+        stored: staged.gpu(),
+        resident: to.0,
+        stored_len: stored.len() as u32,
+        resident_capacity: to.1 as u32,
+    };
+    let mut decodes = decodes.lock().unwrap();
+    decodes.push((record, h.cluster_count));
+    Ok(MeshLanded {
+        clusters,
+        region,
+        decode: decodes.len() as u32 - 1,
+        slots: Vec::new(),
+        micromap: None,
     })
 }
 
@@ -1344,7 +1404,8 @@ fn decode_page(
 pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<StreamTask>) {
     let mut loads = std::mem::take(&mut *task.done.lock().unwrap());
     let copies = std::mem::take(&mut *task.copies.lock().unwrap());
-    let (points, clas) = match submit(device, task, &mut loads, &copies) {
+    let mut decode = None;
+    let (points, clas) = match submit(device, task, &mut loads, &copies, &mut decode) {
         Ok(p) => p,
         Err(e) => {
             let e = Arc::new(e);
@@ -1358,16 +1419,21 @@ pub(crate) fn finish(loading: &Loading, device: &Device, task: &Arc<StreamTask>)
         points,
         loads,
         clas,
+        decode,
     });
 }
 
+/// Submits a task's GPU work. `decode` takes the mesh page decode as soon as it is
+/// submitted, so its slot returns whatever fails after it.
 fn submit(
     device: &Device,
     task: &StreamTask,
     loads: &mut [Landed],
     copies: &[Copy],
+    decode: &mut Option<PageDecodes>,
 ) -> Result<(Vec<TimelinePoint>, Option<PoolBatch>)> {
     let mut points = Vec::new();
+    *decode = decode_pages(device, task, &mut points)?;
     let bound: Vec<(&Arc<TexStream>, u32, PoolSlot, u64)> = loads
         .iter()
         .filter(|l| l.result.is_ok())
@@ -1514,6 +1580,53 @@ fn build_clas(
     Ok(Some(out.batch))
 }
 
+/// Decodes the task's staged mesh pages into their pool slots on the loading queue.
+fn decode_pages(
+    device: &Device,
+    task: &StreamTask,
+    points: &mut Vec<TimelinePoint>,
+) -> Result<Option<PageDecodes>> {
+    let pages = std::mem::take(&mut *task.decodes.lock().unwrap());
+    if pages.is_empty() {
+        return Ok(None);
+    }
+    let n = pages.len() as u64;
+    let status_at = (n * size_of::<StoredPage>() as u64).next_multiple_of(16);
+    let root_at = status_at + (4 * n).next_multiple_of(16);
+    let bytes = root_at + size_of::<PageDecodeRoot>() as u64;
+    let (slot, block) = task.staging.lock().unwrap().alloc(device, bytes, None)?;
+    let records: Vec<StoredPage> = pages.iter().map(|&(p, _)| p).collect();
+    let root = PageDecodeRoot {
+        pages: address(block.gpu()),
+        status: address(block.gpu() + status_at),
+    };
+    let wrote = block.write_mapped(0, bytemuck::cast_slice(&records))
+        && block.write_mapped(status_at, &vec![0; 4 * n as usize])
+        && block.write_mapped(root_at, bytemuck::bytes_of(&root));
+    assert!(wrote, "a mapped staging slot");
+    let dwords = pages
+        .iter()
+        .map(|(p, _)| p.resident_capacity / 4)
+        .max()
+        .unwrap_or(0);
+    let clusters = pages.iter().map(|&(_, c)| c).max().unwrap_or(0);
+    let rows = n as u32;
+    let queue = first_queue(device, &[QueueKind::Loading, QueueKind::Render]);
+    let mut list = queue.command_list()?;
+    let k = &task.accel.kernels;
+    let root = address::<PageDecodeRoot>(block.gpu() + root_at);
+    list.dispatch(&k.page_copy, root, [dwords.div_ceil(256), rows, 1]);
+    list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+    list.dispatch(&k.page_decode, root, [clusters.max(1), rows, 1]);
+    points.push(queue.submit(vec![list], &[])?);
+    Ok(Some(PageDecodes {
+        slot,
+        block,
+        status_at,
+        count: rows,
+    }))
+}
+
 fn first_queue<'d>(device: &'d Device, kinds: &[QueueKind]) -> &'d orr_gpu::Queue {
     kinds
         .iter()
@@ -1521,8 +1634,8 @@ fn first_queue<'d>(device: &'d Device, kinds: &[QueueKind]) -> &'d orr_gpu::Queu
         .expect("the render queue always exists")
 }
 
-/// A device address a stream task copies from or to.
-fn address(at: u64) -> GpuPtr<u8> {
+/// A device address a stream task copies from or to, or a decode reads.
+fn address<T>(at: u64) -> GpuPtr<T> {
     // SAFETY: the address lies in a staging slot, a pool slot or a consumer target, which
     // the task holds until its batch has landed.
     unsafe { GpuPtr::from_address(GpuAddress(at)) }

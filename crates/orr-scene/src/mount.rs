@@ -877,7 +877,10 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
                 t.write(block, at, resident)?;
                 let view = PageView::new(resident, &header)?;
                 let emissive = finest_emissive(&view, first, finest);
-                let (infos, micromap) = page_infos(&view, resident, p as u32);
+                let h: PageHeader =
+                    bytemuck::pod_read_unaligned(&resident[..size_of::<PageHeader>()]);
+                let records = (0..view.cluster_count()).map(|i| view.cluster(i));
+                let (infos, micromap) = page_infos(&h, records, p as u32);
                 let clusters: Vec<(u32, ClusterInfo)> = (first..).zip(infos).collect();
                 let mut placed = t.placed.lock().unwrap();
                 let m = &mut placed.meshes[mesh];
@@ -921,16 +924,17 @@ fn streams_pages(info: &MeshInfo, resident_max: u64) -> bool {
         && bytes > resident_max
 }
 
-/// A decoded page's clusters as the loading side keeps them, and its micromap region.
+/// A page's clusters as the loading side keeps them, and its micromap region, from its
+/// header and cluster records.
 pub(crate) fn page_infos(
-    view: &PageView<'_>,
-    resident: &[u8],
+    h: &PageHeader,
+    clusters: impl IntoIterator<Item = Cluster>,
     page: u32,
 ) -> (Vec<ClusterInfo>, Option<PageMicromap>) {
-    let clusters = (0..view.cluster_count())
-        .map(|i| ClusterInfo::new(page, i, &view.cluster(i)))
+    let clusters = (0..)
+        .zip(clusters)
+        .map(|(i, c)| ClusterInfo::new(page, i, &c))
         .collect();
-    let h: PageHeader = bytemuck::pod_read_unaligned(&resident[..size_of::<PageHeader>()]);
     let micromap =
         (h.omm_offset < h.len && h.omm_usage.iter().any(|&n| n > 0)).then_some(PageMicromap {
             offset: h.omm_offset,
