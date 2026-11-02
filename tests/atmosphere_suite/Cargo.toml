@@ -13,7 +13,10 @@ orr_atmosphere.workspace = true
 orr_lighting.workspace = true
 orr_scene = { workspace = true, features = ["testing"] }
 orr_shaders.workspace = true
-glam.workspace = true
+orr_math.workspace = true
+
+[dev-dependencies]
+orr_color.workspace = true
 
 [build-dependencies]
 orr_shaders = { workspace = true, features = ["build"] }

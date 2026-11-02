@@ -4,14 +4,14 @@
 //! at 5 deg phase, a high moon's illuminance at the ground, and the moonlit sky's color.
 
 use atmosphere_suite::{Probe, Rig, SUN, dir, probe, sky_radiance, uniform_texture};
-use glam::{DVec3, Vec3};
 use orr::abi::TextureIndex;
 use orr::{DirectionalLight, DiscProfile, LightId};
 use orr_atmosphere::Atmosphere;
-use orr_atmosphere::color::{REC709_TO_REC2020, REC2020_TO_XYZ, delta_uv, luminance, mul};
 use orr_atmosphere::presets::{LUNAR_ALBEDO, lunar_disc, lunar_reflectance, solar_disc};
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference};
 use orr_atmosphere::spectrum::SPECTRAL;
+use orr_color::{RgbPrimaries, delta_uv, luminance};
+use orr_math::{DQuat, DVec3, Vec3};
 use orr_scene::testing::{assert_clean, read_buffer};
 
 const EYE: DVec3 = DVec3::new(0.0, 2.0, 0.0);
@@ -26,17 +26,15 @@ fn earth() -> Atmosphere {
 }
 
 fn rec2020(light: &DirectionalLight) -> [f64; 3] {
-    mul(
-        &REC709_TO_REC2020,
-        light.illuminance.to_array().map(f64::from),
-    )
+    (RgbPrimaries::REC709.matrix_to(RgbPrimaries::REC2020) * light.illuminance.as_dvec3())
+        .to_array()
 }
 
 /// The sun direction that puts a moon at `moon` at 5 deg phase: 5 deg off the point opposite
 /// the moon, below the horizon for a moon above it.
 fn full_moon(moon: DVec3) -> DVec3 {
     let axis = moon.cross(DVec3::Y).try_normalize().unwrap_or(DVec3::X);
-    glam::DQuat::from_axis_angle(axis, 5f64.to_radians()) * -moon
+    DQuat::from_axis_angle(axis, 5f64.to_radians()) * -moon
 }
 
 /// The phase curve and a uniform texture of the lunar albedo with zero illuminance both
@@ -167,6 +165,7 @@ fn moonlit_sky_color() {
         dir(-10.0, 0.0),
     ];
     let mut worst = 0.0f64;
+    let to_xyz = RgbPrimaries::REC2020.rgb_to_xyz();
     for elevation in [20.0, 45.0, 75.0] {
         let moon_dir = dir(elevation, 0.0);
         let sun = solar_disc(full_moon(moon_dir).as_vec3());
@@ -184,7 +183,7 @@ fn moonlit_sky_color() {
         };
         for (d, got) in views.iter().zip(&gpu) {
             let expected = spectral.xyz(&spectral.sky(EYE, *d, &light, NEAR_RANGE, &single).values);
-            let error = delta_uv(mul(&REC2020_TO_XYZ, *got), expected);
+            let error = delta_uv(to_xyz * DVec3::from(*got), expected);
             worst = worst.max(error);
         }
         eprintln!("moon at {elevation} deg: worst Delta u'v' {worst:.4}");

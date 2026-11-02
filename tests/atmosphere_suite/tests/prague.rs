@@ -9,11 +9,11 @@
 
 use atmosphere_suite::prague::Prague;
 use atmosphere_suite::{Rig, dir, sky_radiance};
-use glam::{DVec3, Vec3};
-use orr_atmosphere::color::{REC2020_TO_XYZ, delta_uv, mul};
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference};
 use orr_atmosphere::spectrum::{SOLAR_COLOR, SOLAR_ILLUMINANCE, SPECTRAL};
 use orr_atmosphere::{Aerosol, Atmosphere};
+use orr_color::{RgbPrimaries, delta_uv};
+use orr_math::{DVec3, Vec3};
 use orr_scene::testing::assert_clean;
 
 const EYE: DVec3 = DVec3::new(0.0, 2.0, 0.0);
@@ -102,6 +102,7 @@ fn zenith_and_band(xyz: &[[f64; 3]], views: &[(DVec3, f64)]) -> [[f64; 3]; 2] {
 /// with Prague at every preset and node; returns the worst relative luminance error and
 /// Delta u'v' over the zenith and the horizon band.
 fn compare(mut sky: impl FnMut(&Atmosphere, f64, &[DVec3]) -> Vec<[f64; 3]>) -> (f64, f64) {
+    let to_xyz = RgbPrimaries::REC2020.rgb_to_xyz();
     let prague = Prague::load();
     for e in ELEVATIONS {
         assert!(
@@ -120,7 +121,7 @@ fn compare(mut sky: impl FnMut(&Atmosphere, f64, &[DVec3]) -> Vec<[f64; 3]>) -> 
         for elevation in ELEVATIONS {
             let views = views(dir(elevation, 0.0));
             let dirs: Vec<DVec3> = views.iter().map(|v| v.0).collect();
-            let xyz = |rgb: &[f64; 3]| mul(&REC2020_TO_XYZ, *rgb);
+            let xyz = |rgb: &[f64; 3]| (to_xyz * DVec3::from(*rgb)).to_array();
             let ours: Vec<_> = sky(&atmosphere, elevation, &dirs).iter().map(xyz).collect();
             let theirs: Vec<_> = dirs
                 .iter()

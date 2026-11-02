@@ -4,11 +4,11 @@
 
 use std::f64::consts::PI;
 
-use glam::Vec3;
 use orr::abi::TextureIndex;
 use orr::{DirectionalLight, DiscProfile, LightId};
+use orr_color::{RgbPrimaries, luminance};
+use orr_math::{DVec3, Vec3};
 
-use crate::color::{REC709_TO_REC2020, REC2020_TO_REC709, luminance, mul};
 use crate::spectrum::{SOLAR_COLOR, SOLAR_ILLUMINANCE, SPECTRAL};
 
 /// Angular radius of the solar disc, rad.
@@ -17,13 +17,11 @@ pub const SOLAR_ANGULAR_RADIUS: f32 = 4.652e-3;
 /// A sun: a limb-darkened disc of [`SOLAR_ANGULAR_RADIUS`] giving the solar spectrum's
 /// top-of-atmosphere illuminance (132.6 klx) in its color.
 pub fn solar_disc(direction_to_light: Vec3) -> DirectionalLight {
-    let rec709 = mul(
-        &REC2020_TO_REC709,
-        SOLAR_COLOR.map(|c| c * SOLAR_ILLUMINANCE),
-    );
+    let to_rec709 = RgbPrimaries::REC2020.matrix_to(RgbPrimaries::REC709);
+    let rec709 = to_rec709 * (DVec3::from(SOLAR_COLOR) * SOLAR_ILLUMINANCE);
     DirectionalLight {
         direction_to_light: direction_to_light.normalize(),
-        illuminance: Vec3::from(rec709.map(|c| c as f32)),
+        illuminance: rec709.as_vec3(),
         angular_radius: SOLAR_ANGULAR_RADIUS,
         disc: DiscProfile::LimbDarkened,
     }
@@ -92,18 +90,16 @@ pub fn lunar_disc(
         if matches!(light.disc, DiscProfile::Textured { .. }) {
             continue;
         }
-        let e = luminance(mul(
-            &REC709_TO_REC2020,
-            light.illuminance.to_array().map(f64::from),
-        ));
+        let e = luminance(crate::block::rec2020(light.illuminance));
         let cos = f64::from(direction.dot(light.direction_to_light.normalize()));
         let alpha = 180.0 - cos.clamp(-1.0, 1.0).acos().to_degrees();
         lux += e * solid_angle * lunar_phase(alpha) / PI;
     }
-    let rec709 = mul(&REC2020_TO_REC709, lunar_color().map(|c| c * lux));
+    let to_rec709 = RgbPrimaries::REC2020.matrix_to(RgbPrimaries::REC709);
+    let rec709 = to_rec709 * (DVec3::from(lunar_color()) * lux);
     DirectionalLight {
         direction_to_light: direction,
-        illuminance: Vec3::from(rec709.map(|c| c as f32)),
+        illuminance: rec709.as_vec3(),
         angular_radius: LUNAR_ANGULAR_RADIUS,
         disc: DiscProfile::Textured {
             albedo,

@@ -4,7 +4,7 @@
 #include "orr/root.h"
 import orr.abi;
 import orr.math;
-import orr.color;
+import orr_color.luminance;
 import tables;
 import lights;
 import media;

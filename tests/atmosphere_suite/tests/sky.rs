@@ -6,15 +6,15 @@
 //! sky.
 
 use atmosphere_suite::{Probe, Rig, SUN, dir, probe, sky_radiance};
-use glam::{DVec3, Vec3};
 use orr::abi::TextureIndex;
 use orr::{DirectionalLight, DiscProfile, LightId};
-use orr_atmosphere::color::{REC2020_TO_REC709, luminance, mul};
 use orr_atmosphere::presets::solar_disc;
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference};
 use orr_atmosphere::spectrum::{SOLAR_COLOR, SOLAR_ILLUMINANCE};
 use orr_atmosphere::{Atmosphere, FoldGpu, HeightFog, MAX_FOLDED_LIGHTS, SKY_VIEW_SIZE};
+use orr_color::{RgbPrimaries, luminance};
 use orr_lighting::ENVIRONMENT_SIZE;
+use orr_math::{DVec3, Vec3};
 use orr_scene::testing::{assert_clean, read_buffer};
 
 const EYE: DVec3 = DVec3::new(0.0, 2.0, 0.0);
@@ -496,9 +496,10 @@ fn textured_candidate_folds_its_disc_integral() {
     let textured = lut(&rig);
     let states = rig.lighting.as_ref().unwrap().directional_states();
     let integral = read_buffer(states, 2)[1].integral;
-    let rec709 = mul(&REC2020_TO_REC709, integral.map(f64::from));
+    let rec709 = RgbPrimaries::REC2020.matrix_to(RgbPrimaries::REC709)
+        * DVec3::from(integral.map(f64::from));
     let uniform = DirectionalLight {
-        illuminance: Vec3::from(rec709.map(|c| c as f32)),
+        illuminance: rec709.as_vec3(),
         disc: DiscProfile::Uniform,
         ..moon
     };

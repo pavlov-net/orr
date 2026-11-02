@@ -10,7 +10,6 @@
 //! against.
 
 mod block;
-pub mod color;
 mod luts;
 pub mod presets;
 pub mod reference;
@@ -19,7 +18,7 @@ pub mod spectrum;
 pub use luts::{AtmosphereState, MULTIPLE_SCATTERING_SIZE, SKY_VIEW_SIZE, TRANSMITTANCE_SIZE};
 pub use shaders::types::{AtmosphereGpu, AtmosphereGroups, FoldGpu};
 
-use glam::{DVec3, Vec3};
+use orr_math::{DVec3, Vec3};
 
 /// Generated kernel modules and the Rust types of the crate's Slang structs.
 pub mod shaders {

@@ -11,9 +11,12 @@ links = "orr_atmosphere"
 [dependencies]
 orr.workspace = true
 orr_shaders.workspace = true
-glam.workspace = true
+orr_color.workspace = true
+orr_math.workspace = true
 
 [build-dependencies]
+orr_color.workspace = true
+orr_math.workspace = true
 orr_shaders = { workspace = true, features = ["build"] }
 
 [lints]

@@ -1,6 +1,6 @@
 //! Density profiles, rays through them, and optical-depth integration.
 
-use glam::DVec3;
+use orr_math::DVec3;
 
 use super::Geometry;
 use crate::Atmosphere;

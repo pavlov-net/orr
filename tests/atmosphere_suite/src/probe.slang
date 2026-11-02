@@ -3,7 +3,7 @@
 // lighting bakes it, the night background, and a light's disc seen through the atmosphere.
 #include "orr/root.h"
 import orr.math;
-import orr.color;
+import orr_color.luminance;
 import lights;
 import media;
 import environment;

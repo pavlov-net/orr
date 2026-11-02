@@ -4,10 +4,10 @@
 //! the medium on the GPU.
 
 use atmosphere_suite::{Probe, Rig, dir, probe};
-use glam::{DVec3, Vec3};
 use orr_atmosphere::{
     Atmosphere, HeightFog, MULTIPLE_SCATTERING_SIZE, SKY_VIEW_SIZE, TRANSMITTANCE_SIZE,
 };
+use orr_math::{DVec3, Vec3};
 use orr_scene::testing::{assert_clean, read_buffer};
 
 fn texels(size: [u32; 2]) -> u32 {
