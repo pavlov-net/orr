@@ -140,6 +140,30 @@ public struct GBufferGpu
     public uint2 extent;
     public uint hzb_mips;
     public uint _pad;
+    // Per LAYER_TILE pixel tile in rows of extent.x / LAYER_TILE rounded up: nonzero where a
+    // dielectric or presence cluster rastered in front of the opaque depth. Then one word,
+    // nonzero when such a cluster may lie between the eye and the near plane. Null without
+    // the layer raster.
+    public uint* layer_tiles;
+}
+
+// Pixels per side of a `GBufferGpu.layer_tiles` tile.
+public static const uint LAYER_TILE = 8;
+
+public uint layer_tile_columns(uint2 extent)
+{
+    return (extent.x + LAYER_TILE - 1) / LAYER_TILE;
+}
+
+public uint layer_tile_count(uint2 extent)
+{
+    return layer_tile_columns(extent) * ((extent.y + LAYER_TILE - 1) / LAYER_TILE);
+}
+
+// The index of the tile holding `pixel`.
+public uint layer_tile(uint2 extent, uint2 pixel)
+{
+    return (pixel.y / LAYER_TILE) * layer_tile_columns(extent) + pixel.x / LAYER_TILE;
 }
 
 public struct GBufferWords

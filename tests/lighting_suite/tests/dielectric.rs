@@ -1,18 +1,20 @@
 //! The dielectric dispatch on the bed: the interior list, Beer transmittance through a slab,
 //! rough refraction, the glass furnace, single scattering against a CPU integral, an albedo-1
 //! medium, presence layers, a camera inside water, layer guides under camera rotation,
-//! the frosted-glass term of rough glass, and dispersion: a white line through a prism
-//! against a CPU model, a dispersive furnace, and paths without dispersive hits.
+//! the frosted-glass term of rough glass, dispersion: a white line through a prism against a
+//! CPU model, a dispersive furnace, and paths without dispersive hits, and the layer tiles
+//! against tracing every tile.
 
 use lighting_suite::bed::{
-    Accumulated, Analytic, Bed, CLOUD_SPHERE, DISPERSIVE_SPHERE, EMITTER_LUMINANCE, EXTENT, FLOOR,
-    FURNACE_RADIANCE, FrostGuide, GLASS_SPHERE, Item, LIGHT_FLOOR, LINE, LINE_HALF_HEIGHT,
-    LINE_HALF_WIDTH, MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, PRESENCE_VEIL, PRESENCE_VEIL_OPACITY,
-    PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR, Paths, ROUGH_SLAB, SMOOTH_FLOOR, SUN, Spec,
-    TINTED_SLAB, WATER_BOX, fresnel, prism_corners, water_transmission,
+    Accumulated, Analytic, Bed, CLOUD_SPHERE, Capture, DISPERSIVE_SPHERE, EMITTER_LUMINANCE,
+    EXTENT, FLOOR, FURNACE_RADIANCE, FrostGuide, GLASS_SPHERE, Item, LIGHT_FLOOR, LINE,
+    LINE_HALF_HEIGHT, LINE_HALF_WIDTH, MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, PRESENCE_VEIL,
+    PRESENCE_VEIL_OPACITY, PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR, Paths, ROUGH_SLAB,
+    SMOOTH_FLOOR, SUN, SpareView, Spec, TINTED_SLAB, WATER_BOX, fresnel, prism_corners,
+    water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
-use lighting_suite::{assert_clean, pipeline, readback, render, run, upload};
+use lighting_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::{
     DirectionalLight, DiscProfile, Light, LightingDebugView, PathEntry, ReferenceSettings,
@@ -689,6 +691,113 @@ fn a_white_line_seen_through_a_prism_splits_by_the_abbe_number() {
             (a - b).abs() <= 0.03 * b,
             "{what} light {a}, in the model {b}"
         );
+    }
+    assert_clean();
+}
+
+/// Tracing only the tiles the layers rastered into, and those beside them, leaves the
+/// radiance, the guides and the frosted-glass term bit for bit as tracing every tile does,
+/// on scenes whose layers cover part of the image, through the compute and raygen entries,
+/// both into views of their own in the same frame. The reference's paths read no cache, so
+/// they repeat exactly within a frame.
+#[test]
+fn layer_tiles_trace_what_every_tile_traces() {
+    const TILES: u64 = (EXTENT[0].div_ceil(8) * EXTENT[1].div_ceil(8)) as u64;
+    let scenes = [
+        Analytic::DielectricSlab.spec(),
+        from_above(
+            vec![
+                at(SMOOTH_FLOOR, Vec3::ZERO),
+                at(LIGHT_FLOOR, Vec3::new(1.0, 0.01, 0.0)),
+                at(ROUGH_SLAB, Vec3::new(0.0, 0.5, 0.0)),
+            ],
+            Vec::new(),
+            5.0,
+        ),
+        from_above(
+            vec![
+                at(LIGHT_FLOOR, Vec3::ZERO),
+                at(PRESENCE_VEIL, Vec3::new(0.0, 0.5, 0.0)),
+            ],
+            Vec::new(),
+            16.0,
+        ),
+        from_above(
+            vec![
+                at(FLOOR, Vec3::ZERO),
+                at(GLASS_SPHERE, Vec3::new(0.4, 0.5, -0.3)),
+            ],
+            vec![Light::Directional(SUN)],
+            16.0,
+        ),
+    ];
+    let mut entries = vec![PathEntry::Compute];
+    if require(
+        device().caps().ray_dispatch,
+        "the raygen entry needs ray dispatch",
+    ) {
+        entries.push(PathEntry::RayDispatch);
+    }
+    for entry in entries {
+        let paths = |every_tile| {
+            let mut p = Paths::new(&KernelSet::default(), entry, reference(2));
+            p.frost_guide = Some(FrostGuide::new(0.25));
+            p.every_tile = every_tile;
+            p
+        };
+        let (tiled, every) = (paths(false), paths(true));
+        for (s, spec) in scenes.iter().enumerate() {
+            let what = format!("{entry:?} scene {s}");
+            let marks = readback::<u32>(TILES + 1, "layer tiles");
+            let mut bed = Bed::with(spec.clone());
+            let mut spare = SpareView::new();
+            let (a, b) = (Capture::new(bed.view()), Capture::new(&spare.view));
+            let done = Stages::COMPUTE | Stages::RAY | Stages::TRANSFER;
+            bed.accumulate(1, 1, &mut |list, f| {
+                list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());
+                list.copy(
+                    marks.gpu().cast(),
+                    f.view.targets.layer_tiles.cast(),
+                    4 * (TILES + 1),
+                );
+                tiled.record(list, f);
+                every.record_on(list, f, &mut spare.view);
+                list.barrier(done, Stages::COMPUTE | Stages::TRANSFER, Hazards::empty());
+                a.record(list, f.target);
+                b.record(list, &spare.view);
+            });
+            let marked = marks.as_slice().unwrap()[..TILES as usize]
+                .iter()
+                .filter(|&&m| m != 0)
+                .count();
+            assert!(
+                marked > 0 && marked < TILES as usize,
+                "{what}: layers marked {marked} of {TILES} tiles"
+            );
+            let differ = a
+                .radiance()
+                .iter()
+                .zip(b.radiance())
+                .filter(|(x, y)| x != y)
+                .count();
+            assert_eq!(differ, 0, "{what}: radiance differs on {differ} pixels");
+            let frost = |p: &Paths| p.frost_guide.as_ref().unwrap().read();
+            assert!(
+                frost(&tiled) == frost(&every),
+                "{what}: frosted-glass term differs"
+            );
+            let (ga, gb) = (a.guides(), b.guides());
+            for (name, x, y) in [
+                ("diffuse albedo", &ga.diffuse_albedo, &gb.diffuse_albedo),
+                ("specular albedo", &ga.specular_albedo, &gb.specular_albedo),
+                ("normal", &ga.normal_roughness, &gb.normal_roughness),
+                ("specular motion", &ga.specular_motion, &gb.specular_motion),
+                ("depth", &ga.depth, &gb.depth),
+                ("motion", &ga.motion, &gb.motion),
+            ] {
+                assert!(x == y, "{what}: {name} guide differs");
+            }
+        }
     }
     assert_clean();
 }

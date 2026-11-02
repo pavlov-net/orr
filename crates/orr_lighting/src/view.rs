@@ -4,9 +4,9 @@
 
 use orr_math::{DVec3, Quat};
 use orr_scene::orr_gpu::{
-    self, Allocation, CommandList, ComputePipeline, Device, Format, GpuPtr, Hazards,
-    RayDispatchPipeline, ShaderModule, ShaderStage, SpecData, Stages, StorageImageIndex, Texture,
-    TextureDesc, TextureIndex, TextureMemory, TextureUsage,
+    self, Allocation, CommandList, ComputePipeline, Device, DispatchArgs, Format, GpuPtr, Hazards,
+    MemoryKind, RayDispatchPipeline, ShaderModule, ShaderStage, SpecData, Stages,
+    StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory, TextureUsage,
 };
 use orr_scene::{
     ArenaRequest, ArenaTexture, GBufferGpu, MaterialId, SceneId, SceneRoot, Span, ViewArena,
@@ -15,11 +15,13 @@ use orr_scene::{
 
 use crate::media::{MediaKernels, MediaSettings, MediaStats, MediaView};
 use crate::scene::{FRAME_SLOTS, Ring, device_local};
-use crate::shaders::dielectric::dispatch;
+use crate::shaders::dielectric::{dispatch, tiles};
 use crate::shaders::guides::{frost, resolve};
 use crate::shaders::light_sampling::local;
 use crate::shaders::path::opaque;
-use crate::shaders::types::{FrostRoot, GuideRoot, LayerGuide, LocalLights, PathRoot};
+use crate::shaders::types::{
+    FrostRoot, GuideRoot, LayerGuide, LayerTilesRoot, LocalLights, PathRoot,
+};
 use crate::shaders::world_cache::update;
 use crate::subsurface::{CapTailTable, SSS_STEPS, SubsurfaceDepth};
 use crate::{BsdfTables, Error, KernelSet, PathEntry, SceneLighting, module, pipeline};
@@ -351,8 +353,9 @@ pub struct LightingView {
     local: Allocation<LocalLights>,
     local_tiles: [u32; 2],
     slots: Vec<u32>,
-    /// Each pixel's first layer for the guide resolve, and the frame the dielectric dispatch
-    /// last wrote it, and whether that dispatch kept the frosted-glass term's inputs.
+    /// The dielectric dispatch's layer memory: each pixel's first layer for the guide
+    /// resolve, the tiles it traced and its arguments (`traced_tiles` in `path.slang`); the
+    /// frame the dispatch last wrote it, and whether it kept the frosted-glass term's inputs.
     layers: Allocation<LayerGuide>,
     layers_frame: Option<u64>,
     layers_frost: bool,
@@ -360,6 +363,7 @@ pub struct LightingView {
     path: Option<(u64, PathRoot)>,
     roots: Ring<PathRoot>,
     dielectric_roots: Ring<PathRoot>,
+    layer_tile_roots: Ring<LayerTilesRoot>,
     update_roots: Ring<PathRoot>,
     local_roots: Ring<local::Root>,
     guide_roots: Ring<GuideRoot>,
@@ -432,11 +436,7 @@ impl LightingView {
             u64::from(local_tiles[0]) * u64::from(local_tiles[1]),
             "local light samplers",
         )?;
-        let layers = device_local(
-            device,
-            u64::from(extent[0]) * u64::from(extent[1]),
-            "layer guides",
-        )?;
+        let layers = device_local(device, LayerMemory::new(extent).guides, "layer guides")?;
         Ok(Self {
             device: device.clone(),
             extent,
@@ -452,6 +452,7 @@ impl LightingView {
             path: None,
             roots: Ring::new(device, "path roots")?,
             dielectric_roots: Ring::new(device, "dielectric roots")?,
+            layer_tile_roots: Ring::new(device, "layer tile roots")?,
             update_roots: Ring::new(device, "update path roots")?,
             local_roots: Ring::new(device, "local light sampler roots")?,
             guide_roots: Ring::new(device, "guide roots")?,
@@ -622,6 +623,34 @@ impl Drop for LightingView {
     }
 }
 
+/// Where the parts of a view's layer memory lie (`traced_tiles` in `path.slang`).
+struct LayerMemory {
+    /// Guides of room the memory takes.
+    guides: u64,
+    /// Bytes from its start to the dispatch's tile count, then its compute workgroups and
+    /// its ray extent.
+    args: u64,
+}
+
+impl LayerMemory {
+    fn new([w, h]: [u32; 2]) -> Self {
+        let tiles = u64::from(w.div_ceil(LAYER_TILE)) * u64::from(h.div_ceil(LAYER_TILE));
+        let guide = size_of::<LayerGuide>() as u64;
+        let args = guide * u64::from(w) * u64::from(h) + 8 * tiles;
+        Self {
+            guides: (args + 4 * 7).div_ceil(guide),
+            args,
+        }
+    }
+}
+
+/// Pixels per side of a tile of the dielectric dispatch (`LAYER_TILE`).
+const LAYER_TILE: u32 = 8;
+
+/// `LayerTilesRoot.flags` (`dielectric.slang`).
+const LAYER_TILES_EVERYWHERE: u32 = 1 << 0;
+const LAYER_TILES_FROST: u32 = 1 << 1;
+
 /// What the opaque dispatch and the guide resolve read for one view and frame.
 #[derive(Clone, Copy, Debug)]
 pub struct ViewPass {
@@ -682,6 +711,21 @@ impl PathPipeline {
         })
     }
 
+    /// Runs the kernel over the workgroups `groups` holds, or as rays over the extent `rays`
+    /// holds.
+    fn record_indirect<R>(
+        &self,
+        list: &mut CommandList,
+        root: GpuPtr<R>,
+        groups: GpuPtr<DispatchArgs>,
+        rays: GpuPtr<DispatchArgs>,
+    ) {
+        match self {
+            Self::Compute(p) => list.dispatch_indirect(p, root, groups),
+            Self::Rays(p) => list.dispatch_rays_indirect(p, root, rays),
+        }
+    }
+
     /// Runs the kernel over `extent` invocations.
     fn record<R>(&self, list: &mut CommandList, root: GpuPtr<R>, extent: [u32; 2]) {
         let [w, h] = extent;
@@ -699,6 +743,10 @@ impl PathPipeline {
 pub struct LightingKernels {
     opaque: PathPipeline,
     dielectric: PathPipeline,
+    layer_tiles: ComputePipeline,
+    layer_args: ComputePipeline,
+    /// A zero word that starts each frame's tile count.
+    zero: Allocation<u32>,
     update: PathPipeline,
     guides: ComputePipeline,
     frost: ComputePipeline,
@@ -761,9 +809,14 @@ impl LightingKernels {
         };
         let stage = ShaderStage::new(module(kernels, &resolve::MODULE)?, "main", spec)?;
         let guides = device.create_compute_pipeline(&stage, "guide resolve")?;
+        let mut zero = device.gpu_malloc::<u32>(MemoryKind::Upload, 1, "zero")?;
+        zero.as_mut_slice().expect("mapped")[0] = 0;
         Ok(Self {
             opaque,
             dielectric,
+            layer_tiles: pipeline(device, kernels, &tiles::MODULE, "tiles")?,
+            layer_args: pipeline(device, kernels, &tiles::MODULE, "args")?,
+            zero,
             update,
             guides,
             frost: pipeline(device, kernels, &frost::MODULE, "main")?,
@@ -975,10 +1028,13 @@ impl LightingKernels {
     }
 
     /// Records the dielectric dispatch of `pass` after [`Self::record_opaque`] of the same
-    /// view and frame, ordered after it, with its path settings: per pixel, a camera ray
-    /// against the dielectric mask up to the opaque depth finds the first dielectric or
-    /// presence layer, whose path replaces the pixel's radiance, and leaves the layer's guide
-    /// for [`Self::record_guides`]. Pixels whose eye lies inside
+    /// view and frame, ordered after it, with its path settings: per pixel of the 8 x 8 tiles
+    /// the G-buffer's layer tiles mark and of the tiles beside them, a camera ray against the
+    /// dielectric mask up to the opaque depth finds the first dielectric or presence layer,
+    /// whose path replaces the pixel's radiance, and leaves the layer's guide for
+    /// [`Self::record_guides`]. Every tile is traced while a layer may lie before the near
+    /// plane, while [`ViewLighting::camera_medium`] is set and when the G-buffer has no layer
+    /// tiles. Pixels whose eye lies inside
     /// [`ViewLighting::camera_medium`] trace their path through it from the G-buffer's surface
     /// too. Outside the reference, segments between layers read the froxels of
     /// [`Self::record_media`] of the same frame where it ran. Camera rays are pinhole rays
@@ -1024,10 +1080,50 @@ impl LightingKernels {
                 ..path
             },
         );
+        let mut tile_flags = 0;
+        if lighting.camera_medium.is_some() {
+            tile_flags |= LAYER_TILES_EVERYWHERE;
+        }
+        if pass.frosted_glass {
+            tile_flags |= LAYER_TILES_FROST;
+        }
+        let tiles_root = view.layer_tile_roots.write(
+            slot,
+            LayerTilesRoot {
+                gbuffer: pass.gbuffer,
+                layers: view.layers.gpu(),
+                radiance: view.targets.radiance.storage(0),
+                flags: tile_flags,
+                _pad0: 0,
+                _pad1: 0,
+            },
+        );
         view.layers_frame = Some(pass.frame);
         view.layers_frost = pass.frosted_glass;
+        let args = view
+            .layers
+            .gpu()
+            .cast::<u8>()
+            .offset(LayerMemory::new(view.extent).args);
         list.begin_pass("dielectric paths", false);
-        self.dielectric.record(list, root, view.extent);
+        list.barrier(
+            Stages::COMPUTE | Stages::RAY,
+            Stages::TRANSFER,
+            Hazards::empty(),
+        );
+        list.copy(args, self.zero.gpu().cast(), 4);
+        list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
+        let [tx, ty] = view.extent.map(|e| e.div_ceil(LAYER_TILE));
+        list.dispatch(&self.layer_tiles, tiles_root, [tx, ty, 1]);
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        list.dispatch(&self.layer_args, tiles_root, [1, 1, 1]);
+        list.barrier(
+            Stages::COMPUTE,
+            Stages::COMPUTE | Stages::RAY,
+            Hazards::DRAW_ARGUMENTS,
+        );
+        self.dielectric
+            .record_indirect(list, root, args.offset(4).cast(), args.offset(16).cast());
         list.end_pass();
     }
 

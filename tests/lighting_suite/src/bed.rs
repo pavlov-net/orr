@@ -1147,6 +1147,110 @@ pub struct GuideImages {
     pub motion: Vec<[f32; 4]>,
 }
 
+/// A bed view's radiance and guide targets read at one point of a frame's list.
+pub struct Capture {
+    slots: Vec<u32>,
+    root: Allocation<guide_read::Root>,
+    read: ComputePipeline,
+    guides: Allocation<[f32; 4]>,
+    radiance: Allocation<[u16; 4]>,
+}
+
+impl Capture {
+    pub fn new(view: &LightingView) -> Self {
+        let d = device();
+        let textures = [
+            view.diffuse_albedo(),
+            view.specular_albedo(),
+            view.normal_roughness(),
+            view.specular_motion(),
+            view.depth(),
+            view.motion(),
+        ];
+        let slots: Vec<u32> = textures
+            .iter()
+            .map(|_| d.alloc_image_slot().unwrap())
+            .collect();
+        let index: Vec<_> = textures
+            .iter()
+            .zip(&slots)
+            .map(|(t, &slot)| d.write_sampled(slot, t, &orr_gpu::ViewDesc::default()))
+            .collect();
+        let guides = crate::readback::<[f32; 4]>(PIXELS * 6, "guide readback");
+        let root = upload(
+            &[guide_read::Root {
+                diffuse_albedo: index[0],
+                specular_albedo: index[1],
+                normal_roughness: index[2],
+                specular_motion: index[3],
+                depth: index[4],
+                motion: index[5],
+                out: guides.gpu(),
+                width: EXTENT[0],
+                count: PIXELS as u32,
+                _pad0: 0,
+            }],
+            "guide read root",
+        );
+        Self {
+            slots,
+            root,
+            read: pipeline(&guide_read::MODULE, "main"),
+            guides,
+            radiance: crate::readback::<[u16; 4]>(PIXELS, "radiance readback"),
+        }
+    }
+
+    /// Copies the targets as the work before it in `list` leaves them; order that work
+    /// before compute and transfer.
+    pub fn record(&self, list: &mut CommandList<'_>, view: &LightingView) {
+        list.dispatch(
+            &self.read,
+            self.root.gpu(),
+            [PIXELS.div_ceil(64) as u32, 1, 1],
+        );
+        let radiance = view.radiance();
+        list.copy_from_texture(
+            self.radiance.gpu().cast(),
+            radiance,
+            &TextureRegion::whole_mip(radiance.desc(), 0),
+        );
+        list.barrier(
+            Stages::COMPUTE | Stages::TRANSFER,
+            Stages::HOST,
+            Hazards::empty(),
+        );
+    }
+
+    /// The guides as the last completed recording read them.
+    pub fn guides(&self) -> GuideImages {
+        let v = self.guides.as_slice().unwrap();
+        let plane = |k: usize| (0..PIXELS as usize).map(|i| v[i * 6 + k]).collect();
+        GuideImages {
+            diffuse_albedo: plane(0),
+            specular_albedo: plane(1),
+            normal_roughness: plane(2),
+            specular_motion: plane(3),
+            depth: plane(4),
+            motion: plane(5),
+        }
+    }
+
+    /// The RGBA16F radiance's bits as the last completed recording read them, in rows of
+    /// [`EXTENT`].
+    pub fn radiance(&self) -> &[[u16; 4]] {
+        self.radiance.as_slice().unwrap()
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        for &slot in &self.slots {
+            device().free_image_slot_after_submitted(slot);
+        }
+    }
+}
+
 /// One analytic scene mounted, placed and viewed, ready to accumulate frames.
 pub struct Bed {
     pub spec: Spec,
@@ -1449,59 +1553,16 @@ impl Bed {
 
     /// Reads the guide targets of the last frame.
     pub fn guides(&self) -> GuideImages {
-        let d = device();
-        let t = &self.target;
-        let textures = [
-            t.diffuse_albedo(),
-            t.specular_albedo(),
-            t.normal_roughness(),
-            t.specular_motion(),
-            t.depth(),
-            t.motion(),
-        ];
-        let slots: Vec<u32> = textures
-            .iter()
-            .map(|_| d.alloc_image_slot().unwrap())
-            .collect();
-        let index: Vec<_> = textures
-            .iter()
-            .zip(&slots)
-            .map(|(t, &slot)| d.write_sampled(slot, t, &orr_gpu::ViewDesc::default()))
-            .collect();
-        let out = crate::readback::<[f32; 4]>(PIXELS * 6, "guide readback");
-        let read = pipeline(&guide_read::MODULE, "main");
+        let capture = Capture::new(&self.target);
         let mut list = render().command_list().unwrap();
-        let root = upload(
-            &[guide_read::Root {
-                diffuse_albedo: index[0],
-                specular_albedo: index[1],
-                normal_roughness: index[2],
-                specular_motion: index[3],
-                depth: index[4],
-                motion: index[5],
-                out: out.gpu(),
-                width: EXTENT[0],
-                count: PIXELS as u32,
-                _pad0: 0,
-            }],
-            "guide read root",
+        list.barrier(
+            Stages::ALL,
+            Stages::COMPUTE | Stages::TRANSFER,
+            Hazards::empty(),
         );
-        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-        list.dispatch(&read, root.gpu(), [PIXELS.div_ceil(64) as u32, 1, 1]);
+        capture.record(&mut list, &self.target);
         crate::finish(list);
-        for slot in slots {
-            d.free_image_slot_after_submitted(slot);
-        }
-        let v = out.as_slice().unwrap();
-        let plane = |k: usize| (0..PIXELS as usize).map(|i| v[i * 6 + k]).collect();
-        GuideImages {
-            diffuse_albedo: plane(0),
-            specular_albedo: plane(1),
-            normal_roughness: plane(2),
-            specular_motion: plane(3),
-            depth: plane(4),
-            motion: plane(5),
-        }
+        capture.guides()
     }
 
     fn run_frame(
@@ -1669,6 +1730,9 @@ pub struct Paths {
     pub dof_background: Option<DofBackgroundPass>,
     /// The depth-of-field guide every frame adds the frosted-glass term into.
     pub frost_guide: Option<FrostGuide>,
+    /// The kernels read a G-buffer without layer tiles, so the dielectric dispatch traces
+    /// every tile, as a full-screen dispatch does.
+    pub every_tile: bool,
 }
 
 impl Paths {
@@ -1682,6 +1746,7 @@ impl Paths {
             settings,
             dof_background: None,
             frost_guide: None,
+            every_tile: false,
         }
     }
 
@@ -1689,34 +1754,97 @@ impl Paths {
     /// dielectric dispatch, media apply, the guide resolve and, with a frost guide, the
     /// frosted-glass term.
     pub fn record(&self, list: &mut CommandList<'_>, f: &mut BedFrame<'_>) {
-        let pass = ViewPass {
+        let pass = self.view_pass(f);
+        self.record_into(list, f, &pass, None);
+    }
+
+    /// As [`Self::record`], into `target` instead of the frame's view.
+    pub fn record_on(
+        &self,
+        list: &mut CommandList<'_>,
+        f: &mut BedFrame<'_>,
+        target: &mut LightingView,
+    ) {
+        let pass = self.view_pass(f);
+        self.record_into(list, f, &pass, Some(target));
+    }
+
+    fn view_pass(&self, f: &mut BedFrame<'_>) -> ViewPass {
+        let mut pass = ViewPass {
             dof_background: self.dof_background,
             frosted_glass: self.frost_guide.is_some(),
             ..f.pass()
         };
-        f.target
-            .begin(f.frame, f.lighting, &f.desc, false, &self.settings);
+        if self.every_tile {
+            let mut g = f.view.targets;
+            g.layer_tiles = GpuPtr::NULL;
+            pass.gbuffer = f.put(&g);
+        }
+        pass
+    }
+
+    fn record_into(
+        &self,
+        list: &mut CommandList<'_>,
+        f: &mut BedFrame<'_>,
+        pass: &ViewPass,
+        target: Option<&mut LightingView>,
+    ) {
+        let target = match target {
+            Some(t) => t,
+            None => &mut *f.target,
+        };
+        let (lighting, settings) = (f.lighting, &self.settings);
+        target.begin(f.frame, lighting, &f.desc, false, settings);
         self.kernels
-            .record_media(list, f.lighting, f.target, &pass, &self.settings)
+            .record_media(list, lighting, target, pass, settings)
             .unwrap();
         self.kernels
-            .record_opaque(list, f.lighting, f.target, &pass, &self.settings)
+            .record_opaque(list, lighting, target, pass, settings)
             .unwrap();
         let paths = Stages::COMPUTE | Stages::RAY;
         list.barrier(paths, paths, Hazards::empty());
-        self.kernels
-            .record_dielectric(list, f.target, &pass, &self.settings);
+        self.kernels.record_dielectric(list, target, pass, settings);
         list.barrier(paths, Stages::COMPUTE, Hazards::empty());
         self.kernels
-            .record_media_apply(list, f.lighting, f.target, &pass, &self.settings);
+            .record_media_apply(list, lighting, target, pass, settings);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        self.kernels
-            .record_guides(list, f.target, &pass, &self.settings);
+        self.kernels.record_guides(list, target, pass, settings);
         if let Some(g) = &self.frost_guide {
             g.fill(list);
             self.kernels
-                .record_frosted_glass(list, f.target, &pass, g.store);
+                .record_frosted_glass(list, target, pass, g.store);
         }
+    }
+}
+
+/// A lighting view at [`EXTENT`] besides a bed's own, for kernels that record into a second
+/// set of targets in the same frame.
+pub struct SpareView {
+    pub view: LightingView,
+    _arena: ViewArena,
+}
+
+impl SpareView {
+    pub fn new() -> Self {
+        let d = device();
+        let mut arena = ViewArena::new(d, false);
+        let mut list = render().command_list().unwrap();
+        arena
+            .layout(&LightingView::requests(EXTENT), &mut list)
+            .unwrap();
+        let point = render().submit(vec![list], &[]).unwrap();
+        render().wait(point, Duration::from_secs(10)).unwrap();
+        Self {
+            view: LightingView::new(d, &arena).unwrap(),
+            _arena: arena,
+        }
+    }
+}
+
+impl Default for SpareView {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

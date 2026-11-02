@@ -26,7 +26,7 @@ pub struct Caps {
     pub generated_commands: bool,
     /// Ray-dispatch pipelines (`VK_KHR_ray_tracing_pipeline` with invocation reordering):
     /// [`crate::Device::create_ray_dispatch_pipeline`] and
-    /// [`crate::CommandList::dispatch_rays`].
+    /// [`crate::CommandList::dispatch_rays`] and [`crate::CommandList::dispatch_rays_indirect`].
     pub ray_dispatch: bool,
     /// The device reorders invocations at coherence points in hardware. Without it
     /// reordering is a no-op and kernels run their compute entry. False without

@@ -515,8 +515,9 @@ pub(crate) fn select(
         return Err("swapchainMaintenance1".to_owned());
     }
 
-    opt.ray_dispatch &=
-        q.ray_pipeline.ray_tracing_pipeline != 0 && q.reorder.ray_tracing_invocation_reorder != 0;
+    opt.ray_dispatch &= q.ray_pipeline.ray_tracing_pipeline != 0
+        && q.ray_pipeline.ray_tracing_pipeline_trace_rays_indirect != 0
+        && q.reorder.ray_tracing_invocation_reorder != 0;
     opt.lss &= q.lss.linear_swept_spheres != 0;
     opt.device_address_commands &= q.address_commands.device_address_commands != 0;
     // Micromap builds take their addresses through device address commands.
@@ -619,6 +620,7 @@ pub(crate) fn select(
     e.cluster.cluster_acceleration_structure = 1;
     e.ptlas.partitioned_acceleration_structure = 1;
     e.ray_pipeline.ray_tracing_pipeline = 1;
+    e.ray_pipeline.ray_tracing_pipeline_trace_rays_indirect = 1;
     e.reorder.ray_tracing_invocation_reorder = 1;
     e.lss.linear_swept_spheres = 1;
     e.omm.micromap = 1;

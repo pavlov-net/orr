@@ -2,6 +2,7 @@
 module tables;
 
 import orr.abi;
+import orr.trace;
 __exported import cut;
 __exported import decal;
 __exported import medium_proxy;
@@ -17,6 +18,20 @@ public static const uint INSTANCE_CAST_ONLY = 4;
 // Set by orr on copies from `add_skinned`: `pose_group` is the palette group and
 // `pose_index` the copy's entry in `SceneRoot.skinned`.
 public static const uint INSTANCE_SKINNED = 8;
+
+// Whether candidate class `c` is a dielectric or presence layer's: its clusters raster into
+// the layer tiles instead of the visibility buffer.
+public bool layer_class(uint c)
+{
+    return c == CLASS_DIELECTRIC || c == CLASS_PRESENCE;
+}
+
+// Whether a dielectric or presence copy with instance flags `flags` may meet camera rays,
+// which trace every one the TLAS holds.
+public bool layer_traced(uint flags)
+{
+    return (flags & (INSTANCE_RASTER | INSTANCE_RAY)) != 0;
+}
 
 // `InstanceGpu.material_base` when the copy uses its model's section materials.
 public static const uint NO_MATERIAL_SET = 0xffffffff;

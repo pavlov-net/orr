@@ -1,6 +1,7 @@
-// The dielectric dispatch: per pixel, the first dielectric or presence layer before the
-// opaque depth and its path, and the pixel's layer guide. The raygen entry reorders lanes at
-// each coherence point; the compute entry runs the same body without reordering.
+// The dielectric dispatch: per pixel of the listed tiles, the first dielectric or presence
+// layer before the opaque depth and its path, and the pixel's layer guide. The raygen entry
+// reorders lanes at each coherence point; the compute entry runs the same body without
+// reordering.
 #include "orr/root.h"
 import orr.coherence;
 import environment;
@@ -8,6 +9,7 @@ import media;
 import surface;
 import path;
 import dielectric;
+import visibility;
 
 extern struct Surface : ISurface = StandardSurface;
 extern struct Environment : IEnvironment = EnvironmentMap;
@@ -15,18 +17,25 @@ extern struct Medium : IMedium = NoMedium;
 
 ORR_ROOT(PathRoot);
 
+// A row of LAYER_TILE^2 rays per listed tile.
 [shader("raygeneration")]
 void raygen_main()
 {
     ORR_OMM(raygen_main);
-    dielectric_body<Reorder, Surface, Environment, Medium>(root, DispatchRaysIndex().xy);
+    uint2 id = DispatchRaysIndex().xy;
+    uint2 pixel = layer_tile_pixel(root, id.y, uint2(id.x % LAYER_TILE, id.x / LAYER_TILE));
+    if (all(pixel < root.gbuffer.extent))
+        dielectric_body<Reorder, Surface, Environment, Medium>(root, pixel);
 }
 
+// Two workgroups per listed tile, its upper and lower half.
 [shader("compute")]
 [numthreads(8, 4, 1)]
-void compute_main(uint3 id: SV_DispatchThreadID)
+void compute_main(uint3 group: SV_GroupID, uint3 id: SV_GroupThreadID)
 {
     ORR_OMM(compute_main);
-    if (all(id.xy < root.gbuffer.extent))
-        dielectric_body<NoReorder, Surface, Environment, Medium>(root, id.xy);
+    uint g = grid_index(group);
+    uint2 pixel = layer_tile_pixel(root, g >> 1, id.xy + uint2(0, 4 * (g & 1)));
+    if (all(pixel < root.gbuffer.extent))
+        dielectric_body<NoReorder, Surface, Environment, Medium>(root, pixel);
 }
