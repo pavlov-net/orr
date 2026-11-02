@@ -17,7 +17,7 @@
 //! Border dilation moves positions in place, so each group's clusters take their positions
 //! as the group is emitted and snap them to the mesh grid.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::os::raw::c_int;
 
 use meshopt::ffi;
@@ -28,6 +28,7 @@ use orr_pack::mesh::{
 use orr_pack::{Aabb, Span, Sphere};
 use rayon::prelude::*;
 
+use super::hash;
 use super::lod::{self, Parts, Welded};
 use super::{Built, ClusterData, Ctx, Grid, MeshSettings, store_page, write_page};
 
@@ -238,11 +239,11 @@ pub(crate) fn stages(
 fn borders<'a>(
     w: &Welded,
     stages: impl Iterator<Item = &'a [Corner]> + Clone,
-) -> (HashSet<[i32; 3]>, HashSet<[i32; 3]>) {
+) -> (hash::Set<[i32; 3]>, hash::Set<[i32; 3]>) {
     let shared = lod::shared_cells(stages.clone().map(|c| c.iter().map(|&(_, cell, _)| cell)));
     let mut seams = lod::seam_cells(w, stages.clone().flatten().map(|&(v, cell, _)| (v, cell)));
     for corners in stages {
-        let mut section_of: HashMap<[i32; 3], u8> = HashMap::new();
+        let mut section_of: hash::Map<[i32; 3], u8> = hash::Map::default();
         for &(_, cell, section) in corners {
             if *section_of.entry(cell).or_insert(section) != section {
                 seams.insert(cell);
@@ -257,10 +258,10 @@ fn borders<'a>(
 fn input<K: std::hash::Hash + Eq>(
     corners: &[Corner],
     key: impl Fn(u32, [i32; 3], u8) -> K,
-    shared: &HashSet<[i32; 3]>,
-    seams: &HashSet<[i32; 3]>,
+    shared: &hash::Set<[i32; 3]>,
+    seams: &hash::Set<[i32; 3]>,
 ) -> Input {
-    let mut local_of: HashMap<K, u32> = HashMap::new();
+    let mut local_of: hash::Map<K, u32> = hash::Map::default();
     let mut input = Input {
         welded: Vec::new(),
         cells: Vec::new(),

@@ -16,6 +16,7 @@
 mod clod;
 mod dag;
 mod displace;
+mod hash;
 mod lod;
 pub(crate) mod maps;
 mod omm;

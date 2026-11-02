@@ -1,6 +1,8 @@
 //! Welding, part assignment and the discrete levels of a mesh.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
+use super::hash;
 
 use meshopt::{SimplifyOptions, SimplifyVertex, VertexDataAdapter, VertexStream};
 use orr_pack::Aabb;
@@ -286,9 +288,9 @@ pub(crate) fn pieces(w: &Welded, parts: &Parts) -> Vec<Piece> {
 pub(crate) fn seam_cells(
     w: &Welded,
     corners: impl IntoIterator<Item = (u32, [i32; 3])>,
-) -> HashSet<[i32; 3]> {
-    let mut first: HashMap<[i32; 3], u32> = HashMap::new();
-    let mut seams = HashSet::new();
+) -> hash::Set<[i32; 3]> {
+    let mut first: hash::Map<[i32; 3], u32> = hash::Map::default();
+    let mut seams = hash::Set::default();
     for (v, cell) in corners {
         let f = *first.entry(cell).or_insert(v);
         let (f, v) = (f as usize, v as usize);
@@ -302,9 +304,9 @@ pub(crate) fn seam_cells(
 /// Grid positions used by more than one piece: part and section borders.
 pub(crate) fn shared_cells<P: IntoIterator<Item = [i32; 3]>>(
     pieces: impl IntoIterator<Item = P>,
-) -> HashSet<[i32; 3]> {
-    let mut owner: HashMap<[i32; 3], usize> = HashMap::new();
-    let mut shared = HashSet::new();
+) -> hash::Set<[i32; 3]> {
+    let mut owner: hash::Map<[i32; 3], usize> = hash::Map::default();
+    let mut shared = hash::Set::default();
     for (pi, cells) in pieces.into_iter().enumerate() {
         for c in cells {
             if *owner.entry(c).or_insert(pi) != pi {
@@ -319,8 +321,8 @@ pub(crate) fn shared_cells<P: IntoIterator<Item = [i32; 3]>>(
 /// seam.
 pub(crate) fn vertex_flags(
     cell: [i32; 3],
-    shared: &HashSet<[i32; 3]>,
-    seams: &HashSet<[i32; 3]>,
+    shared: &hash::Set<[i32; 3]>,
+    seams: &hash::Set<[i32; 3]>,
 ) -> SimplifyVertex {
     let mut f = SimplifyVertex::None;
     if shared.contains(&cell) {
@@ -338,8 +340,8 @@ pub(crate) fn simplify(
     indices: &[u32],
     w: &Welded,
     grid: &Grid,
-    shared: &HashSet<[i32; 3]>,
-    seams: &HashSet<[i32; 3]>,
+    shared: &hash::Set<[i32; 3]>,
+    seams: &hash::Set<[i32; 3]>,
     target: f32,
     sloppy: bool,
 ) -> (Vec<u32>, f32) {
