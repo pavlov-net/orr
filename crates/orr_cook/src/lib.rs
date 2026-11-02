@@ -291,7 +291,13 @@ pub struct CookOptions {
     /// Bytes of finished entries that may wait for their turn to be written; past it only
     /// the jobs the next entries wait on start.
     pub reorder_window: u64,
+    /// zstd level of every cooked blob: [`ZSTD_LEVEL_DEFAULT`] cooks fast, up to 22 gives
+    /// smaller archives at a much slower cook.
+    pub zstd_level: i32,
 }
+
+/// The default [`CookOptions::zstd_level`].
+pub const ZSTD_LEVEL_DEFAULT: i32 = 6;
 
 impl Default for CookOptions {
     fn default() -> Self {
@@ -303,6 +309,7 @@ impl Default for CookOptions {
             cache_cap: None,
             working_set: alloc::physical_memory() / 2,
             reorder_window: 1 << 30,
+            zstd_level: ZSTD_LEVEL_DEFAULT,
         }
     }
 }

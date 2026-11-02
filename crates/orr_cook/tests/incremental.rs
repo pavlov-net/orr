@@ -365,6 +365,21 @@ fn rebuilds_cook_only_what_changed() {
     let all_pages = geometry.report.assets[3].entries.len();
     assert_eq!(cooked.len(), 2 + all_pages);
     assert_eq!(*fresh(Quality::Release), *std::fs::read(&file).unwrap());
+
+    // Another zstd level stores every blob anew: nothing links.
+    let level = CookOptions {
+        zstd_level: 19,
+        ..opts(0)
+    };
+    let recompressed = orr_cook::cook(
+        &manifest(&d, Target::File(file.clone()), Quality::Release),
+        &level,
+    )
+    .unwrap();
+    assert_eq!(
+        names(&recompressed, Outcome::Cooked).len(),
+        entry_count(&recompressed)
+    );
 }
 
 #[test]

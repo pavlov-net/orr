@@ -17,7 +17,7 @@ use orr_pack::{ArchiveWriter, BlobIn, Class, EncodedBlob, Filter, GDeflate, Hash
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::key::{Key, ZSTD_LEVEL};
+use crate::key::Key;
 use crate::state::{Memo, read_checked};
 use crate::texture::{Encoding, Quality, encode_chains};
 use crate::{Result, mount};
@@ -473,6 +473,7 @@ pub(crate) fn cook(
         })
         .collect();
     let gdeflate = w.gdeflate();
+    let level = w.zstd_level();
     w.add_streamed(
         asset,
         Class::RasterSet as u16,
@@ -497,7 +498,12 @@ pub(crate) fn cook(
                     .par_iter()
                     .zip(batch)
                     .map(|(raw, (t, _))| {
-                        encode(raw, &layers[usize::from(t.layer)], gdeflate.as_deref())
+                        encode(
+                            raw,
+                            &layers[usize::from(t.layer)],
+                            level,
+                            gdeflate.as_deref(),
+                        )
                     })
                     .collect::<Result<_>>()?;
                 for ((enc, raw), (t, _)) in encoded.iter().zip(&raws).zip(batch) {
@@ -568,8 +574,13 @@ struct Encoded<'a> {
 
 /// zstd, and for lossless layers of multi-byte texels also zstd over byte planes; the
 /// smaller one is kept. With a GDeflate codec, GDeflate pages alone.
-fn encode<'a>(raw: &'a [u8], l: &Layer, gdeflate: Option<&dyn GDeflate>) -> Result<Encoded<'a>> {
-    let plain = BlobIn::new(raw).encode(ZSTD_LEVEL, gdeflate)?;
+fn encode<'a>(
+    raw: &'a [u8],
+    l: &Layer,
+    level: i32,
+    gdeflate: Option<&dyn GDeflate>,
+) -> Result<Encoded<'a>> {
+    let plain = BlobIn::new(raw).encode(level, gdeflate)?;
     let zstd = plain.stored_len();
     if !l.tries_byte_planes() || gdeflate.is_some() {
         return Ok(Encoded {
@@ -582,7 +593,7 @@ fn encode<'a>(raw: &'a [u8], l: &Layer, gdeflate: Option<&dyn GDeflate>) -> Resu
         filter: Filter::BytePlanes4,
         ..BlobIn::new(raw)
     }
-    .encode(ZSTD_LEVEL, None)?;
+    .encode(level, None)?;
     let p = planes.stored_len();
     Ok(Encoded {
         best: if p < zstd { planes } else { plain },
