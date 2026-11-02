@@ -693,7 +693,7 @@ public void media_apply<S : ISurface, M : IMedium>(FroxelRoot r, uint2 pixel)
     }
     radiance[pixel] = out;
 
-    if (r.mode != MEDIA_COMPOSE || r.dof_background.index == DOF_NONE)
+    if (r.mode != MEDIA_COMPOSE || r.dof_background.index == IMAGE_NONE)
         return;
     RWTexture2D<float4> layer = r.dof_background.get<RWTexture2D<float4>>();
     float4 b = layer[pixel];

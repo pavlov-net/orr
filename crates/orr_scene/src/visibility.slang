@@ -59,7 +59,7 @@ public struct RasterGpu
     public float* depth;             // per pixel: resolved reverse-Z depth
     public StorageImageIndex a;
     public StorageImageIndex b;
-    public StorageImageIndex x;      // index TEXTURE_NONE without the extended target
+    public StorageImageIndex x;      // index IMAGE_NONE without the extended target
     public StorageImageIndex motion;
     public StorageImageIndex hzb[16]; // per mip
     public uint tiles_x;             // 8 x 8 tiles per row

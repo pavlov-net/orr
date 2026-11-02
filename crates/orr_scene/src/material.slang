@@ -39,8 +39,6 @@ public static const uint TEXTURE_DISPLACEMENT = 9;
 public static const uint TEXTURE_COAT = 10;
 public static const uint TEXTURE_TRANSMISSION = 11;
 
-// `TextureIndex.index` of an unbound slot.
-public static const uint TEXTURE_NONE = 0xffffffff;
 // A material id that names no material.
 public static const uint MATERIAL_NONE = 0xffffffff;
 
@@ -132,7 +130,7 @@ public extern static const bool TEXTURE_FEEDBACK = false;
 // The streamed texture behind heap index `t` in `streams`, or null when it does not stream.
 public TextureStreamGpu* texture_stream(TextureStreamGpu** streams, TextureIndex t)
 {
-    if (streams == nullptr || t.index == TEXTURE_NONE)
+    if (streams == nullptr || t.index == IMAGE_NONE)
         return nullptr;
     return streams[t.index];
 }
@@ -261,7 +259,7 @@ public float4 texture_footprint(TextureIndex t, SamplerIndex s, UvFootprint f, T
 
 public bool material_bound(MaterialGpu* m, uint slot)
 {
-    return m.textures[slot].index != TEXTURE_NONE;
+    return m.textures[slot].index != IMAGE_NONE;
 }
 
 // The first channel `slot` reads.
@@ -315,7 +313,7 @@ public uint material_uv_set(MaterialGpu* m, uint slot)
 public float4 material_texture(MaterialGpu* m, uint slot, UvFootprint uv[2], float4 fallback)
 {
     TextureIndex t = m.textures[slot];
-    if (t.index == TEXTURE_NONE)
+    if (t.index == IMAGE_NONE)
         return fallback;
     UvFootprint f = material_uv_set(m, slot) == 1 ? uv[1] : uv[0];
     float4 v = texture_footprint(t, m.sampler, material_footprint(m, slot, f), m.texture_streams);

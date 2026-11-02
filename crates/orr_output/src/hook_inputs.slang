@@ -5,8 +5,6 @@
 import orr.abi;
 import view;
 
-static const uint NO_IMAGE = 0xffffffff;
-
 struct Root
 {
     // The render extent and jitter.
@@ -15,10 +13,10 @@ struct Root
     TextureIndex rr_motion;
     StorageImageIndex depth;
     StorageImageIndex motion;
-    // NO_IMAGE without a `scene_referred` hook.
+    // IMAGE_NONE without a `scene_referred` hook.
     TextureIndex copy_source;
     StorageImageIndex copy_target;
-    // Half the output extent, rounded up; NO_IMAGE while the field is off.
+    // Half the output extent, rounded up; IMAGE_NONE while the field is off.
     StorageImageIndex field;
     uint width;
     uint height;
@@ -41,11 +39,11 @@ void main(uint3 id: SV_DispatchThreadID)
     float2 motion = root.rr_motion.get<Texture2D<float2>>().Load(int3(r, 0));
     root.depth.get<RWTexture2D<float>>()[id.xy] = depth;
     root.motion.get<RWTexture2D<float2>>()[id.xy] = motion;
-    if (root.copy_source.index != NO_IMAGE)
+    if (root.copy_source.index != IMAGE_NONE)
     {
         float4 c = root.copy_source.get<Texture2D<float4>>().Load(int3(id.xy, 0));
         root.copy_target.get<RWTexture2D<float4>>()[id.xy] = c;
     }
-    if (root.field.index != NO_IMAGE && all((id.xy & 1) == 0))
+    if (root.field.index != IMAGE_NONE && all((id.xy & 1) == 0))
         root.field.get<RWTexture2D<float4>>()[id.xy >> 1] = 0.0;
 }

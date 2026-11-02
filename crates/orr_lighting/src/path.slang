@@ -66,9 +66,6 @@ public static const uint UPDATE_STREAM = 0x9E3779B9;
 // Separates the background layer's samples from the opaque path's of the same pixel.
 public static const uint DOF_STREAM = 0x165667B1;
 
-// `PathRoot.dof_background` and `dof_mask` when the layer is off.
-public static const uint DOF_NONE = 0xffffffff;
-
 // Vertices of an update path that add samples to the cache.
 public static const uint UPDATE_VERTICES = 4;
 
@@ -1054,7 +1051,7 @@ public void opaque_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
     r.feedback.get<RWTexture2D<uint2>>()[pixel] = uint2(feedback, asuint(surface ? x1.camera_distance : 0.0));
     if ((r.light_flags & LIGHT_FEEDBACK_COUNT) != 0 && feedback != NO_LIGHT)
         count_feedback(set, feedback);
-    if (r.dof_background.index != DOF_NONE)
+    if (r.dof_background.index != IMAGE_NONE)
         r.dof_background.get<RWTexture2D<float4>>()[pixel] = background_texel<C, S, E, M>(r, pixel);
 }
 

@@ -13,8 +13,6 @@ static const uint SOURCE_LINEAR = 0;
 static const uint SOURCE_ENCODED = 1;
 static const uint SOURCE_BLACK = 2;
 
-static const uint NO_TEXTURE = 0xffffffff;
-
 struct Root
 {
     // Row-major float RGBA captures; null for compose, which writes `target`.
@@ -66,7 +64,7 @@ void main(uint3 id: SV_DispatchThreadID)
     if (any(id.xy >= uint2(root.width, root.height)))
         return;
     float4 ui = 0.0;
-    if (root.ui.index != NO_TEXTURE)
+    if (root.ui.index != IMAGE_NONE)
         ui = load_clamped(root.ui, id.xy);
     float3 linear = 0.0;
     if (root.source_kind != SOURCE_BLACK)

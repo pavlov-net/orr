@@ -101,6 +101,14 @@ pub(crate) struct SlotAllocator {
 }
 
 impl SlotAllocator {
+    /// Image slots, which never include slot 0: it is [`TextureIndex::NONE`].
+    pub(crate) fn images() -> Self {
+        Self {
+            next: TextureIndex::NONE.0 + 1,
+            free: Vec::new(),
+        }
+    }
+
     pub(crate) fn take(&mut self, capacity: u32) -> Option<u32> {
         if let Some(slot) = self.free.pop() {
             return Some(slot);
@@ -190,7 +198,7 @@ impl Heaps {
         Ok(Heaps {
             resource,
             sampler,
-            slots: Mutex::default(),
+            slots: Mutex::new(SlotAllocator::images()),
             shared_samplers: Mutex::default(),
         })
     }
@@ -214,7 +222,8 @@ impl Device {
         self.shared.heaps().resource.slots
     }
 
-    /// Takes a free image slot. Sampled and storage views share the slot space.
+    /// Takes a free image slot, never [`TextureIndex::NONE`]. Sampled and storage views
+    /// share the slot space.
     pub fn alloc_image_slot(&self) -> Result<u32, Error> {
         let heaps = self.shared.heaps();
         heaps
@@ -239,6 +248,7 @@ impl Device {
 
     /// Returns `slot` to the free list once `after` has completed.
     pub fn free_image_slot(&self, slot: u32, after: TimelinePoint) {
+        assert_ne!(slot, TextureIndex::NONE.0, "freeing the empty image slot");
         self.shared
             .defer(self.shared.after_point(after), Item::ImageSlot(slot));
     }
@@ -246,6 +256,7 @@ impl Device {
     /// Returns `slot` to the free list once everything submitted so far has completed, as
     /// dropping a [`Texture`] does.
     pub fn free_image_slot_after_submitted(&self, slot: u32) {
+        assert_ne!(slot, TextureIndex::NONE.0, "freeing the empty image slot");
         self.shared.defer_after_submitted(Item::ImageSlot(slot));
     }
 
@@ -324,7 +335,20 @@ impl Device {
 
 #[cfg(test)]
 mod tests {
+    use bytemuck::Zeroable;
+
     use super::SlotAllocator;
+    use crate::{StorageImageIndex, TextureIndex};
+
+    #[test]
+    fn zeroed_image_indices_name_a_slot_the_heap_never_hands_out() {
+        assert_eq!(TextureIndex::zeroed(), TextureIndex::NONE);
+        assert_eq!(StorageImageIndex::zeroed(), StorageImageIndex::NONE);
+        let mut a = SlotAllocator::images();
+        let run = a.take_run(3, 8).unwrap();
+        let rest: Vec<u32> = std::iter::from_fn(|| a.take(8)).collect();
+        assert_eq!((run, rest), (1, vec![4, 5, 6, 7]));
+    }
 
     #[test]
     fn runs_are_consecutive_and_reuse_freed_runs() {

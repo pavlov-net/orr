@@ -10,6 +10,10 @@ module abi;
 
 import orr.debug;
 
+// The slot index of no image in `TextureIndex` and `StorageImageIndex`. The heap never hands
+// out slot 0, so a zeroed record names no image.
+public static const uint IMAGE_NONE = 0;
+
 // A sampled image view in the resource heap. Sampled and storage views share one slot
 // space.
 public struct TextureIndex

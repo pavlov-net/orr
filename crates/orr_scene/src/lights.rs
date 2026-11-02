@@ -95,7 +95,6 @@ pub(crate) fn light_gpu(light: &Light, origin_cell: IVec3, cell_log2: u32) -> Li
     let mut g = LightGpu::zeroed();
     g.cone_cos_inner = -1.0;
     g.cone_cos_outer = -1.0;
-    g.albedo = TextureIndex::NONE;
     g.lit_by = [u32::MAX; 4];
     let mut place = |p: DVec3| {
         let w = WorldPos::new(p, cell_log2);

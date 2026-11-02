@@ -301,7 +301,7 @@ float3 textured_shape(SceneRoot* scene, LightGpu l, float3 right, float3 up, flo
         if (s.kind == LIGHT_DIRECTIONAL && s.disc != DISC_TEXTURED)
             lit += s.color * max(0.0, dot(n, s.direction));
     }
-    if (l.albedo.index == 0xffffffffu)
+    if (l.albedo.index == IMAGE_NONE)
         return lit * INV_PI;
     Texture2D<float4> albedo = l.albedo.get<Texture2D<float4>>();
     uint2 size;
