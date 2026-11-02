@@ -253,47 +253,275 @@ fn rects(img: &Img, cells: Option<[u32; 2]>) -> Vec<Rect> {
 }
 
 /// Sub-samples per texel axis for the coverage metric.
-const SUB: u32 = 4;
+const SUB: usize = 4;
 
-/// Calls `f` with every coverage sub-sample of `channel` in row `y` of `r`, after scaling
-/// texels by `scale` and clamping them to 1: 4x4 bilinear samples per texel, clamped to
-/// the rectangle.
-fn row_samples(img: &Img, r: Rect, y: u32, channel: usize, scale: f32, mut f: impl FnMut(f32)) {
-    let at = |x: i64, y: i64| {
-        let x = x.clamp(i64::from(r.x), i64::from(r.x + r.w) - 1) as usize;
-        let y = y.clamp(i64::from(r.y), i64::from(r.y + r.h) - 1) as usize;
-        (img.px[y * img.w as usize + x][channel] * scale).min(1.0)
-    };
-    for x in r.x..r.x + r.w {
-        for j in 0..SUB {
-            for i in 0..SUB {
-                let px = x as f32 + (i as f32 + 0.5) / SUB as f32 - 0.5;
-                let py = y as f32 + (j as f32 + 0.5) / SUB as f32 - 0.5;
-                let (x0, y0) = (px.floor(), py.floor());
-                let (fx, fy) = (px - x0, py - y0);
-                let (x0, y0) = (x0 as i64, y0 as i64);
-                let top = at(x0, y0) * (1.0 - fx) + at(x0 + 1, y0) * fx;
-                let bot = at(x0, y0 + 1) * (1.0 - fx) + at(x0 + 1, y0 + 1) * fx;
-                f(top * (1.0 - fy) + bot * fy);
+/// Per sub-sample position along an axis, at -3/8, -1/8, 1/8 and 3/8 texel from the
+/// texel's center: the bilinear weight of the second texel of its pair, and where the pair
+/// starts in the texel's 3x3 neighborhood.
+const TAPS: [(f32, usize); SUB] = [(0.625, 0), (0.875, 0), (0.125, 1), (0.375, 1)];
+
+/// A texel's 3x3 neighborhood, scaled and clamped to [0, 1].
+type Neighborhood = [[f32; 3]; 3];
+
+/// The bilinear sub-sample values of a neighborhood's center texel, row by row.
+fn subsamples(a: &Neighborhood) -> [f32; SUB * SUB] {
+    let h = a.map(|row| TAPS.map(|(f, x0)| row[x0] * (1.0 - f) + row[x0 + 1] * f));
+    std::array::from_fn(|k| {
+        let (i, (f, y0)) = (k % SUB, TAPS[k / SUB]);
+        h[y0][i] * (1.0 - f) + h[y0 + 1][i] * f
+    })
+}
+
+/// The sub-samples at or over `cutoff`, one bit each.
+fn mask(values: &[f32; SUB * SUB], cutoff: f32) -> u16 {
+    values
+        .iter()
+        .enumerate()
+        .fold(0, |m, (k, &v)| m | (u16::from(v >= cutoff) << k))
+}
+
+/// `v` and its neighbors in `lo..lo + len`, clamped to that range.
+fn around(v: u32, lo: u32, len: u32) -> [u32; 3] {
+    [v.max(lo + 1) - 1, v, (v + 1).min(lo + len - 1)]
+}
+
+/// One texel's sub-samples still undecided in a coverage search.
+#[derive(Copy, Clone)]
+struct Pending {
+    /// Texel index in the image.
+    texel: u32,
+    /// Sub-samples not yet known to reach or miss the cutoff.
+    mask: u16,
+    /// Sub-samples of `mask` that reach the cutoff at the scale last tested.
+    hit: u16,
+}
+
+/// The coverage of one rectangle of a channel: 4x4 bilinear sub-samples per texel, clamped
+/// to the rectangle, after scaling texels and clamping them to [0, 1]. A sub-sample that
+/// reaches the cutoff at one scale reaches it at every larger scale.
+struct Coverage<'a> {
+    img: &'a Img,
+    r: Rect,
+    channel: usize,
+    cutoff: f32,
+    /// Every sub-sample of a neighborhood whose values are all at or over `all_hit` reaches
+    /// the cutoff; none does when they are all at or under `none_hit`. A bilinear sum of
+    /// non-negative values rounds four times, each within a relative 2^-24.
+    all_hit: f32,
+    none_hit: f32,
+}
+
+impl<'a> Coverage<'a> {
+    fn new(img: &'a Img, r: Rect, channel: usize, cutoff: f32) -> Self {
+        // Far below 1, weighted values can fall subnormal and lose more precision.
+        let (all_hit, none_hit) = if cutoff >= 1e-30 {
+            (cutoff * (1.0 + 1e-6), cutoff * (1.0 - 1e-6))
+        } else {
+            (f32::INFINITY, f32::NEG_INFINITY)
+        };
+        Self {
+            img,
+            r,
+            channel,
+            cutoff,
+            all_hit,
+            none_hit,
+        }
+    }
+
+    fn samples(&self) -> u64 {
+        u64::from(self.r.w * self.r.h) * (SUB * SUB) as u64
+    }
+
+    fn reaches(&self, hits: u64, goal: f32) -> bool {
+        hits as f32 / self.samples() as f32 >= goal
+    }
+
+    /// Texel `i` of the image at `scale`; NaN reads as 1.
+    #[expect(clippy::manual_clamp, reason = "clamp keeps NaN")]
+    fn scaled(&self, i: u32, scale: f32) -> f32 {
+        (self.img.px[i as usize][self.channel] * scale)
+            .min(1.0)
+            .max(0.0)
+    }
+
+    /// The sub-samples of a neighborhood's center texel at or over the cutoff, one bit
+    /// each, and whether some scale could make any of them reach it.
+    fn hits(&self, a: &Neighborhood) -> (u16, bool) {
+        let (lo, hi) = a
+            .iter()
+            .flatten()
+            .fold((f32::INFINITY, 0.0f32), |(lo, hi), &v| {
+                (lo.min(v), hi.max(v))
+            });
+        if lo >= self.all_hit {
+            (u16::MAX, true)
+        } else if hi <= self.none_hit {
+            (0, hi > 0.0)
+        } else {
+            (mask(&subsamples(a), self.cutoff), true)
+        }
+    }
+
+    /// The neighborhood of texel `x`, `y` at `scale`.
+    fn neighborhood(&self, x: u32, y: u32, scale: f32) -> Neighborhood {
+        let r = self.r;
+        let xs = around(x, r.x, r.w);
+        around(y, r.y, r.h).map(|y| xs.map(|x| self.scaled(y * self.img.w + x, scale)))
+    }
+
+    /// Calls `f` with the neighborhood of each texel of row `y` at `scale`, left to right.
+    fn row(&self, y: u32, scale: f32, mut f: impl FnMut(u32, &Neighborhood)) {
+        let r = self.r;
+        let scaled = around(y, r.y, r.h).map(|y| {
+            let at = y * self.img.w + r.x;
+            (at..at + r.w)
+                .map(|i| self.scaled(i, scale))
+                .collect::<Vec<f32>>()
+        });
+        for i in 0..r.w {
+            let xs = around(i, 0, r.w).map(|x| x as usize);
+            f(r.x + i, &scaled.each_ref().map(|s| xs.map(|x| s[x])));
+        }
+    }
+
+    /// Sub-samples reaching the cutoff at `scale`.
+    fn count(&self, scale: f32) -> u64 {
+        let r = self.r;
+        (r.y..r.y + r.h)
+            .into_par_iter()
+            .map(|y| {
+                let mut hits = 0;
+                self.row(y, scale, |_, a| {
+                    hits += u64::from(self.hits(a).0.count_ones());
+                });
+                hits
+            })
+            .sum()
+    }
+
+    /// Histogram of the unscaled sub-sample values.
+    fn histogram(&self, bins: usize) -> Vec<u32> {
+        let r = self.r;
+        let bin = |a: f32| ((a * (bins - 1) as f32) as usize).min(bins - 1);
+        // Rows per partial histogram, so each counts about a million samples.
+        let rows = (1 << 16) / r.w as usize + 1;
+        let add = |mut a: Vec<u32>, b: Vec<u32>| {
+            a.iter_mut().zip(b).for_each(|(a, b)| *a += b);
+            a
+        };
+        (r.y..r.y + r.h)
+            .into_par_iter()
+            .with_min_len(rows)
+            .fold(
+                || vec![0u32; bins],
+                |mut hist, y| {
+                    self.row(y, 1.0, |_, a| {
+                        // Bilinear weights summing to 1 keep 0 and 1 exact.
+                        let v = a[0][0];
+                        if (v == 0.0 || v == 1.0) && a.iter().flatten().all(|&a| a == v) {
+                            hist[bin(v)] += (SUB * SUB) as u32;
+                        } else {
+                            subsamples(a).iter().for_each(|&v| hist[bin(v)] += 1);
+                        }
+                    });
+                    hist
+                },
+            )
+            .reduce(|| vec![0u32; bins], add)
+    }
+
+    /// The hits at `scale`, and the sub-samples that miss there but reach the cutoff at a
+    /// larger scale.
+    fn start(&self, scale: f32) -> (u64, Vec<Pending>) {
+        let r = self.r;
+        (r.y..r.y + r.h)
+            .into_par_iter()
+            .fold(
+                || (0u64, Vec::new()),
+                |(mut hits, mut pending), y| {
+                    self.row(y, scale, |x, a| {
+                        let (hit, reachable) = self.hits(a);
+                        hits += u64::from(hit.count_ones());
+                        if hit != u16::MAX && reachable {
+                            pending.push(Pending {
+                                texel: y * self.img.w + x,
+                                mask: !hit,
+                                hit,
+                            });
+                        }
+                    });
+                    (hits, pending)
+                },
+            )
+            .reduce(
+                || (0, Vec::new()),
+                |(h, mut a), (g, mut b)| {
+                    a.append(&mut b);
+                    (h + g, a)
+                },
+            )
+    }
+
+    /// The smallest scale from `from` on, to bisection precision, whose coverage reaches
+    /// `goal`, and the hits at it. Each test counts only the sub-samples not already known
+    /// to hit at the bracket's low end or to miss at its high end.
+    fn first(&self, from: f32, goal: f32) -> (f32, u64) {
+        let (mut known, mut pending) = self.start(from);
+        if self.reaches(known, goal) {
+            return (from, known);
+        }
+        let w = self.img.w;
+        let mut test = |scale: f32| {
+            let hit: u64 = pending
+                .par_iter_mut()
+                .with_min_len(1024)
+                .map(|p| {
+                    let a = self.neighborhood(p.texel % w, p.texel / w, scale);
+                    p.hit = self.hits(&a).0 & p.mask;
+                    u64::from(p.hit.count_ones())
+                })
+                .sum();
+            let hits = known + hit;
+            let reached = self.reaches(hits, goal);
+            if !reached {
+                known = hits;
+            }
+            pending.retain_mut(|p| {
+                p.mask = if reached { p.hit } else { p.mask & !p.hit };
+                p.mask != 0
+            });
+            (reached, hits)
+        };
+        let (mut lo, mut hi) = (from, from * 2.0);
+        let mut at_hi = loop {
+            let (reached, hits) = test(hi);
+            if reached {
+                break hits;
+            }
+            if hi > 1e6 {
+                return (hi, hits);
+            }
+            lo = hi;
+            hi *= 2.0;
+        };
+        for _ in 0..24 {
+            let mid = 0.5 * (lo + hi);
+            let (reached, hits) = test(mid);
+            if reached {
+                hi = mid;
+                at_hi = hits;
+            } else {
+                lo = mid;
             }
         }
+        (hi, at_hi)
     }
 }
 
 fn rect_coverage(img: &Img, r: Rect, channel: usize, cutoff: f32) -> f32 {
-    scaled_coverage(img, r, channel, cutoff, 1.0)
-}
-
-fn scaled_coverage(img: &Img, r: Rect, channel: usize, cutoff: f32, scale: f32) -> f32 {
-    let hit: u64 = (r.y..r.y + r.h)
-        .into_par_iter()
-        .map(|y| {
-            let mut hit = 0;
-            row_samples(img, r, y, channel, scale, |a| hit += u64::from(a >= cutoff));
-            hit
-        })
-        .sum();
-    hit as f32 / (u64::from(r.w * r.h) * u64::from(SUB * SUB)) as f32
+    let c = Coverage::new(img, r, channel, cutoff);
+    c.count(1.0) as f32 / c.samples() as f32
 }
 
 /// Scales the coverage channel of every mip after the first so its coverage at `cutoff`
@@ -314,7 +542,7 @@ fn match_coverage(chain: &mut [Img], channel: usize, cutoff: f32, grid: Option<[
             _ => vec![whole],
         };
         for (r, target) in rects(img, cells).into_iter().zip(targets) {
-            let scale = coverage_scale(img, r, channel, cutoff, target);
+            let scale = coverage_scale(&Coverage::new(img, r, channel, cutoff), target);
             for y in r.y..r.y + r.h {
                 for x in r.x..r.x + r.w {
                     let p = &mut img.px[(y * img.w + x) as usize][channel];
@@ -325,34 +553,17 @@ fn match_coverage(chain: &mut [Img], channel: usize, cutoff: f32, grid: Option<[
     });
 }
 
-/// The smallest alpha scale whose coverage at `cutoff` inside `r` reaches `target`.
-fn coverage_scale(img: &Img, r: Rect, channel: usize, cutoff: f32, target: f32) -> f32 {
-    if target <= 0.0 || cutoff <= 0.0 {
+/// The smallest alpha scale whose coverage reaches `target`.
+fn coverage_scale(c: &Coverage, target: f32) -> f32 {
+    if target <= 0.0 || c.cutoff <= 0.0 {
         return 1.0;
     }
     // Before texels clamp to 1, coverage at scale s counts samples with a >= cutoff / s, so
     // a histogram gives the scale directly. Clamping only lowers coverage, so that scale is
     // a lower bound; where it falls short, bisect above it.
     const BINS: usize = 1 << 16;
-    let hist = (r.y..r.y + r.h)
-        .into_par_iter()
-        .fold(
-            || vec![0u32; BINS],
-            |mut hist, y| {
-                row_samples(img, r, y, channel, 1.0, |a| {
-                    hist[((a.clamp(0.0, 1.0) * (BINS - 1) as f32) as usize).min(BINS - 1)] += 1;
-                });
-                hist
-            },
-        )
-        .reduce(
-            || vec![0u32; BINS],
-            |mut a, b| {
-                a.iter_mut().zip(b).for_each(|(a, b)| *a += b);
-                a
-            },
-        );
-    let n = u64::from(r.w * r.h) * u64::from(SUB * SUB);
+    let hist = c.histogram(BINS);
+    let n = c.samples();
     let want = (f64::from(target) * n as f64).round() as u64;
     let mut above = 0u64;
     let mut bin = BINS;
@@ -361,33 +572,19 @@ fn coverage_scale(img: &Img, r: Rect, channel: usize, cutoff: f32, target: f32) 
         above += u64::from(hist[bin]);
     }
     let threshold = (bin as f32 / (BINS - 1) as f32).max(1.0 / (BINS - 1) as f32);
-    let first = |from: f32, goal: f32| {
-        let reaches = |s: f32| scaled_coverage(img, r, channel, cutoff, s) >= goal;
-        if reaches(from) {
-            return from;
-        }
-        let (mut lo, mut hi) = (from, from * 2.0);
-        while !reaches(hi) {
-            if hi > 1e6 {
-                return hi;
-            }
-            lo = hi;
-            hi *= 2.0;
-        }
-        for _ in 0..24 {
-            let mid = 0.5 * (lo + hi);
-            if reaches(mid) { hi = mid } else { lo = mid }
-        }
-        hi
-    };
     // Every scale from `low` up to the next sample's crossing gives the same coverage; the
     // middle of that range keeps texels away from the cutoff, so encoding does not flip them.
-    let low = first(cutoff / threshold, target);
-    let reached = scaled_coverage(img, r, channel, cutoff, low);
+    let (low, hits) = c.first(c.cutoff / threshold, target);
+    let reached = hits as f32 / n as f32;
     if reached >= 1.0 {
         return low;
     }
-    let next = first(low, reached + 0.5 / n as f32);
+    let goal = reached + 0.5 / n as f32;
+    let next = if c.reaches(hits, goal) {
+        low
+    } else {
+        c.first(low, goal).0
+    };
     (low * next).sqrt()
 }
 
@@ -508,6 +705,109 @@ mod tests {
                     "{filter:?} mip {m}: coverage {got} against {target}, unscaled {}",
                     coverage(raw, 3, 0.5)
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn pruned_search_matches_testing_every_sample() {
+        // The search with every sub-sample counted at every step.
+        let full = |c: &Coverage, from: f32, goal: f32| -> f32 {
+            let reaches = |s: f32| c.reaches(c.count(s), goal);
+            if reaches(from) {
+                return from;
+            }
+            let (mut lo, mut hi) = (from, from * 2.0);
+            while !reaches(hi) {
+                if hi > 1e6 {
+                    return hi;
+                }
+                lo = hi;
+                hi *= 2.0;
+            }
+            for _ in 0..24 {
+                let mid = 0.5 * (lo + hi);
+                if reaches(mid) { hi = mid } else { lo = mid }
+            }
+            hi
+        };
+        let base = foliage(256, 128, 5);
+        let chain = raw_chain(base, &spec(MipFilter::Kaiser));
+        for img in &chain[1..] {
+            let c = Coverage::new(img, rects(img, None)[0], 3, 0.5);
+            for goal in [0.05, 0.3, 0.6, 0.97] {
+                for from in [0.1, 0.9, 1.3] {
+                    let (a, b) = (c.first(from, goal).0, full(&c, from, goal));
+                    assert_eq!(a.to_bits(), b.to_bits(), "{}x{} at {goal}", img.w, img.h);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn neighborhood_bounds_agree_with_subsamples() {
+        let mut rng = Rng(9);
+        let img = Img::new(1, 1);
+        for cutoff in [0.5, 0.3333, 0.75, 1e-3, 1e-29] {
+            let c = Coverage::new(&img, rects(&img, None)[0], 0, cutoff);
+            for i in 0..60_000 {
+                // Values on either side of the shortcut's thresholds, mixed ones, or
+                // anywhere in [0, 1].
+                let a: Neighborhood = std::array::from_fn(|_| {
+                    std::array::from_fn(|_| {
+                        let steps = (rng.next() * 32.0) as u32;
+                        match i % 4 {
+                            0 => f32::from_bits(cutoff.to_bits() + steps),
+                            1 => f32::from_bits(cutoff.to_bits() - steps),
+                            2 if rng.next() < 0.9 => f32::from_bits(cutoff.to_bits() + 16),
+                            2 => f32::from_bits(cutoff.to_bits() - 1),
+                            _ => rng.next().min(1.0),
+                        }
+                    })
+                });
+                let direct = mask(&subsamples(&a), cutoff);
+                assert_eq!(c.hits(&a).0, direct, "{cutoff}: {a:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn sub_samples_are_bilinear_samples_clamped_to_the_rectangle() {
+        // The metric itself: SUB x SUB bilinear samples per texel at texel coordinates
+        // (centers at integers), reading scaled texels clamped to [0, 1] and to the rectangle.
+        let img = foliage(37, 13, 4);
+        let reference = |r: Rect, scale: f32, cutoff: f32| -> u64 {
+            let at = |x: i64, y: i64| {
+                let x = x.clamp(i64::from(r.x), i64::from(r.x + r.w) - 1) as usize;
+                let y = y.clamp(i64::from(r.y), i64::from(r.y + r.h) - 1) as usize;
+                (img.px[y * img.w as usize + x][3] * scale).clamp(0.0, 1.0)
+            };
+            let mut hits = 0;
+            for y in r.y..r.y + r.h {
+                for x in r.x..r.x + r.w {
+                    for j in 0..SUB as u32 {
+                        for i in 0..SUB as u32 {
+                            let px = x as f32 + (i as f32 + 0.5) / SUB as f32 - 0.5;
+                            let py = y as f32 + (j as f32 + 0.5) / SUB as f32 - 0.5;
+                            let (fx, fy) = (px - px.floor(), py - py.floor());
+                            let (x0, y0) = (px.floor() as i64, py.floor() as i64);
+                            let top = at(x0, y0) * (1.0 - fx) + at(x0 + 1, y0) * fx;
+                            let bot = at(x0, y0 + 1) * (1.0 - fx) + at(x0 + 1, y0 + 1) * fx;
+                            hits += u64::from(top * (1.0 - fy) + bot * fy >= cutoff);
+                        }
+                    }
+                }
+            }
+            hits
+        };
+        let rects = [(0, 0, 37, 13), (5, 3, 9, 7), (36, 0, 1, 13), (2, 12, 20, 1)]
+            .map(|(x, y, w, h)| Rect { x, y, w, h });
+        for r in rects {
+            for scale in [1.0, 0.7, 1.9] {
+                for cutoff in [0.5, 0.3333] {
+                    let c = Coverage::new(&img, r, 3, cutoff);
+                    assert_eq!(c.count(scale), reference(r, scale, cutoff));
+                }
             }
         }
     }
