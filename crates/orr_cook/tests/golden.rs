@@ -28,7 +28,7 @@ const GOLDEN: &[(u16, u32, &str)] = &[
     ),
     (
         Class::Material as u16,
-        3,
+        4,
         "c40267fb7c0247572ce851189f3b8432f2ca942e3c195c7d10d4de3ff1d7ed7b",
     ),
     (
@@ -38,7 +38,7 @@ const GOLDEN: &[(u16, u32, &str)] = &[
     ),
     (
         Class::Texture as u16,
-        5,
+        6,
         "d83172baa2c2d7e66fa9860f32a19a099ffbea2bdfec9eb8a788b2b4ea7abf93",
     ),
     (
@@ -48,7 +48,7 @@ const GOLDEN: &[(u16, u32, &str)] = &[
     ),
     (
         Class::RasterSet as u16,
-        1,
+        2,
         "552868a7a913b6a2812e5d834cbba45fb4613839e85d744cfdc358ab53dba9be",
     ),
     (

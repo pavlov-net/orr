@@ -152,11 +152,11 @@ impl Primaries {
 
     /// Luminance weights of linear RGB in these primaries.
     fn luminance(self) -> [f32; 3] {
-        match self {
-            Self::Rec709 => [0.2126, 0.7152, 0.0722],
-            Self::DisplayP3 => [0.2290, 0.6917, 0.0793],
-            Self::Rec2020 => [0.2627, 0.6780, 0.0593],
-        }
+        orr_color::Primaries::from(self)
+            .rgb()
+            .luminance_weights()
+            .as_vec3()
+            .to_array()
     }
 }
 
@@ -247,20 +247,12 @@ impl Img {
 }
 
 pub(crate) fn srgb_to_linear(v: f32) -> f32 {
-    if v <= 0.04045 {
-        v / 12.92
-    } else {
-        ((v + 0.055) / 1.055).powf(2.4)
-    }
+    orr_color::srgb_decode(f64::from(v)) as f32
 }
 
+/// The sRGB encoding of `v`, clamped to 0..1 first.
 pub(crate) fn linear_to_srgb(v: f32) -> f32 {
-    let v = v.clamp(0.0, 1.0);
-    if v <= 0.003_130_8 {
-        v * 12.92
-    } else {
-        1.055 * v.powf(1.0 / 2.4) - 0.055
-    }
+    orr_color::srgb_encode(f64::from(v.clamp(0.0, 1.0))) as f32
 }
 
 /// What to cook from prepared linear layers.
