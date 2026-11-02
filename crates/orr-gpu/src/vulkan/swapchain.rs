@@ -295,7 +295,7 @@ impl LowLatency {
 
 /// An acquired swapchain image. Submit the work that writes it with
 /// [`crate::Queue::submit_present`], then hand it to [`Swapchain::present`]; every acquired
-/// frame is presented.
+/// frame is presented, or handed to [`Swapchain::discard`] when its submit fails.
 pub struct SwapchainFrame {
     texture: Arc<Texture>,
     storage: StorageImageIndex,
@@ -735,6 +735,19 @@ impl Swapchain {
         Ok(id)
     }
 
+    /// Presents `frame` with undefined contents, for a frame whose own work failed to
+    /// submit, so that its slot and swapchain are freed as after any present.
+    pub fn discard(&mut self, frame: SwapchainFrame) -> Result<(), Error> {
+        if !frame.submitted.get() {
+            let queue = self
+                .device
+                .queue(QueueKind::Present)
+                .expect("presenting devices have the Present queue");
+            queue.submit_present(Vec::new(), &[], &frame)?;
+        }
+        self.present(frame, None).map(drop)
+    }
+
     /// The window's client extent as the surface reports it.
     fn surface_extent(&self) -> Result<[u32; 2], Error> {
         // SAFETY: the surface and physical device are live.
@@ -828,6 +841,27 @@ impl Swapchain {
         let mut usage = vk::ImageUsageFlags::STORAGE
             | vk::ImageUsageFlags::TRANSFER_DST
             | vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        let missing = if !caps.supported_usage_flags.contains(usage) {
+            Some(format!("{:?} images", usage & !caps.supported_usage_flags))
+        } else if !caps
+            .supported_transforms
+            .contains(vk::SurfaceTransformFlagsKHR::IDENTITY)
+        {
+            Some("the identity transform".to_string())
+        } else if !caps
+            .supported_composite_alpha
+            .contains(vk::CompositeAlphaFlagsKHR::OPAQUE)
+        {
+            Some("opaque composite alpha".to_string())
+        } else {
+            None
+        };
+        if let Some(missing) = missing {
+            return Err(Error::Unsupported {
+                device: shared.caps.device_name.clone(),
+                missing: format!("{missing} on this window's surface"),
+            });
+        }
         usage |= caps.supported_usage_flags & vk::ImageUsageFlags::TRANSFER_SRC;
         let old = self
             .current

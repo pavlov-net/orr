@@ -1065,13 +1065,14 @@ impl Presenter {
         for (k, ((source, ui), (root, last))) in
             sources.into_iter().zip(roots.iter_mut()).enumerate()
         {
-            let Some(image) = self.swapchain.acquire()? else {
-                break;
-            };
+            // Everything that can fail before the submit runs before the acquire.
             if let Some(p) = last.take() {
                 queue.wait(p, ROOT_TIMEOUT)?;
             }
             let mut list = queue.command_list()?;
+            let Some(image) = self.swapchain.acquire()? else {
+                break;
+            };
             self.compose.record(
                 &mut list,
                 root,
@@ -1083,7 +1084,15 @@ impl Presenter {
                     display: &job.display,
                 },
             );
-            let point = queue.submit_present(vec![list], &[job.after], &image)?;
+            let point = match queue.submit_present(vec![list], &[job.after], &image) {
+                Ok(point) => point,
+                Err(e) => {
+                    if let Err(d) = self.swapchain.discard(image) {
+                        log::warn!("discarding a swapchain image: {d}");
+                    }
+                    return Err(e);
+                }
+            };
             *last = Some(point);
             points.push(point);
             presented.encoding = image.format();
