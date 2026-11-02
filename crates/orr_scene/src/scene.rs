@@ -12,6 +12,7 @@ use crate::decals::{Decal, DecalId, Listing, decal_gpu, listing, table_sizes};
 use crate::emissive::{ModelEmission, Run, Runs};
 use crate::lights::{EMISSIVE_INSTANCE, EMISSIVE_PRODUCER, Light, LightId, light_gpu};
 use crate::material::MaterialId;
+use crate::medium_proxy::{MediumProxy, MediumProxyId, proxy_gpu};
 use crate::memory::{RangeAllocator, UploadWindow};
 use crate::producer::{self, Producer, ProducerDesc, ProducerId, ProducerUpdate};
 use crate::ptlas::Ptlas;
@@ -23,9 +24,9 @@ use crate::upload::{Op, Record};
 use crate::view::ViewHistoryId;
 use crate::world::WorldPos;
 use crate::{
-    DecalBinGpu, DecalGpu, EmissiveGpu, Error, GroupGpu, InstanceGpu, LightGpu, ProducerBatch,
-    ProducerGpu, ProducerStateGpu, Result, SceneRoot, SkinStateGpu, SkinnedGpu, SkyStats,
-    SlotStateGpu, TessStateGpu, ViewConstants,
+    DecalBinGpu, DecalGpu, EmissiveGpu, Error, GroupGpu, InstanceGpu, LightGpu, MediumProxyGpu,
+    ProducerBatch, ProducerGpu, ProducerStateGpu, Result, SceneRoot, SkinStateGpu, SkinnedGpu,
+    SkyStats, SlotStateGpu, TessStateGpu, ViewConstants,
 };
 
 /// A scene in [`crate::Scenes`].
@@ -61,6 +62,9 @@ pub struct SceneDesc {
     pub skinned_clusters: u32,
     /// Decals: every `DecalId` is below it.
     pub decal_capacity: u32,
+    /// Medium proxies: every `MediumProxyId` is below it. They trace from the PTLAS global
+    /// partition.
+    pub medium_proxy_capacity: u32,
 }
 
 impl Default for SceneDesc {
@@ -79,6 +83,7 @@ impl Default for SceneDesc {
             skinned_capacity: 256,
             skinned_clusters: 8192,
             decal_capacity: 1024,
+            medium_proxy_capacity: 64,
         }
     }
 }
@@ -250,6 +255,7 @@ pub(crate) struct Tables {
     pub decals: Allocation<DecalGpu>,
     pub decal_bins: Allocation<DecalBinGpu>,
     pub decal_refs: Allocation<u32>,
+    pub proxies: Allocation<MediumProxyGpu>,
 }
 
 pub(crate) struct Group {
@@ -418,6 +424,7 @@ impl Scene {
             decals: device.gpu_malloc(dl, n(desc.decal_capacity), "decals")?,
             decal_bins: device.gpu_malloc(dl, n(decal_slots), "decal bins")?,
             decal_refs: device.gpu_malloc(dl, n(decal_refs), "decal runs")?,
+            proxies: device.gpu_malloc(dl, n(desc.medium_proxy_capacity), "medium proxies")?,
         };
         // Tables start zeroed: empty slots, the null group, no lights. These apply before
         // any write (sequence 0).
@@ -448,6 +455,7 @@ impl Scene {
             zero(tables.skinned.gpu().address(), tables.skinned.size()),
             zero(tables.skin_state.gpu().address(), tables.skin_state.size()),
             zero(tables.decals.gpu().address(), tables.decals.size()),
+            zero(tables.proxies.gpu().address(), tables.proxies.size()),
         ];
         Ok(Self {
             desc: *desc,
@@ -1208,6 +1216,29 @@ impl<'f> SceneWriter<'f> {
         }
         self.write(
             self.scene.tables.decals.gpu().offset(u64::from(id.0)),
+            record,
+        )
+    }
+
+    /// Sets or clears medium proxy `id`, from this frame on.
+    pub fn set_medium_proxy(
+        &mut self,
+        id: MediumProxyId,
+        proxy: Option<&MediumProxy>,
+    ) -> Result<()> {
+        assert!(
+            id.0 < self.scene.desc.medium_proxy_capacity,
+            "{id:?} outside the medium proxy table"
+        );
+        let record = proxy.map_or(MediumProxyGpu::zeroed(), |p| proxy_gpu(p, self.cell_log2));
+        self.scene
+            .cpu
+            .lock()
+            .unwrap()
+            .ptlas
+            .set_proxy(id.0, proxy.is_some());
+        self.write(
+            self.scene.tables.proxies.gpu().offset(u64::from(id.0)),
             record,
         )
     }

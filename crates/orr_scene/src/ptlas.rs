@@ -5,7 +5,8 @@
 //! global partition until their transform has rested for 30 frames. The `ptlas` kernels
 //! decide each frame's writes, null writes, BLAS updates and part runs on the GPU and spend
 //! the frame's budget of rebuilt instances from the focus outward, mandatory work first.
-//! Producer entries sit in the global partition and their writes are mandatory.
+//! Producer entries and medium proxies (from `proxy_base`) sit in the global partition and
+//! their writes are mandatory.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -117,6 +118,7 @@ pub(crate) struct PtlasPipelines {
     emit: PipelineId,
     producer_want: PipelineId,
     producer_emit: PipelineId,
+    proxy_write: PipelineId,
     translate: PipelineId,
     commands: PipelineId,
 }
@@ -138,6 +140,7 @@ impl PtlasPipelines {
             emit: c("emit")?,
             producer_want: c("producer_want")?,
             producer_emit: c("producer_emit")?,
+            proxy_write: c("proxy_write")?,
             translate: c("translate")?,
             commands: c("commands")?,
         })
@@ -172,8 +175,13 @@ pub(crate) struct Ptlas {
     max_per_partition: u32,
     part_capacity: u32,
     producer_capacity: u32,
-    /// Copies the global partition takes; producer entries come on top.
+    /// Copies the global partition takes; producer entries and medium proxies come on top.
     global_copies: u32,
+    /// Per medium proxy, whether it is set.
+    proxy_live: Vec<bool>,
+    proxies_live: u32,
+    /// Medium proxies set or cleared since the last build.
+    proxy_dirty: BTreeSet<u32>,
     partitions: Vec<PartitionCpu>,
     free: Vec<u32>,
     /// The partition of each cell that takes its next copies.
@@ -203,12 +211,16 @@ impl Ptlas {
         let partitions = desc.ptlas_partitions;
         Ok(Self {
             limits: PtlasLimits {
-                instances: desc.instance_capacity + desc.part_capacity + desc.producer_capacity,
+                instances: desc.instance_capacity
+                    + desc.part_capacity
+                    + desc.producer_capacity
+                    + desc.medium_proxy_capacity,
                 partitions,
                 max_per_partition: desc.partition_instances,
                 global_instances: desc.global_instances
                     + desc.producer_capacity
-                    + desc.skinned_capacity,
+                    + desc.skinned_capacity
+                    + desc.medium_proxy_capacity,
                 max_ops: 3,
                 translation: true,
             },
@@ -216,6 +228,9 @@ impl Ptlas {
             part_capacity: desc.part_capacity,
             producer_capacity: desc.producer_capacity,
             global_copies: desc.global_instances,
+            proxy_live: vec![false; desc.medium_proxy_capacity as usize],
+            proxies_live: 0,
+            proxy_dirty: BTreeSet::new(),
             partitions: (0..partitions)
                 .map(|_| PartitionCpu {
                     cell: IVec3::ZERO,
@@ -298,6 +313,18 @@ impl Ptlas {
         }
     }
 
+    /// Marks medium proxy `id` set or cleared; its instance is written at the next build.
+    pub(crate) fn set_proxy(&mut self, id: u32, live: bool) {
+        let was = std::mem::replace(&mut self.proxy_live[id as usize], live);
+        self.proxies_live = self.proxies_live + u32::from(live) - u32::from(was);
+        self.proxy_dirty.insert(id);
+    }
+
+    /// Whether a medium proxy is set or awaits its null write.
+    pub(crate) fn has_proxy_work(&self) -> bool {
+        self.proxies_live > 0 || !self.proxy_dirty.is_empty()
+    }
+
     /// Frees the partitions emptied in frames at or before `completed`.
     pub(crate) fn retire(&mut self, completed: u64) {
         let partitions = &self.partitions;
@@ -313,7 +340,7 @@ impl Ptlas {
     }
 
     /// The scene's TLAS for the frame about to record, after making the PTLAS storage the
-    /// first time a slot has been handed out or a producer entry is set.
+    /// first time a slot has been handed out or a producer entry or medium proxy is set.
     pub(crate) fn tlas(
         &mut self,
         device: &Device,
@@ -321,7 +348,9 @@ impl Ptlas {
         producers: bool,
     ) -> Result<Option<Tlas>> {
         let caps = device.caps();
-        if caps.cluster.max_partitions == 0 || (self.high_water == 0 && !producers) {
+        if caps.cluster.max_partitions == 0
+            || (self.high_water == 0 && !producers && self.proxies_live == 0)
+        {
             return Ok(None);
         }
         if self.storage.is_none() {
@@ -509,6 +538,20 @@ impl Ptlas {
             out.copy_from_slice(&jobs);
             src
         };
+        // Set proxies are rewritten into the new render space on a rebase.
+        let mut proxies = std::mem::take(&mut self.proxy_dirty);
+        if f.rebased {
+            proxies
+                .extend((0..self.proxy_live.len() as u32).filter(|&i| self.proxy_live[i as usize]));
+        }
+        let proxies: Vec<u32> = proxies.into_iter().collect();
+        let proxy_jobs = if proxies.is_empty() {
+            GpuPtr::NULL
+        } else {
+            let (src, out) = window.slice::<u32>(device, proxies.len() as u32)?;
+            out.copy_from_slice(&proxies);
+            src
+        };
         let root = PtlasRoot {
             scene: f.scene,
             ptlas: s.record.gpu(),
@@ -517,10 +560,12 @@ impl Ptlas {
             slots: self.high_water,
             budget: f.budget,
             flags: if f.rebased { PTLAS_REBASE } else { 0 } | if s.built { 0 } else { PTLAS_FIRST },
-            _pad0: 0,
+            proxies: self.proxies_live,
             translate_jobs,
             translate_count: jobs.len() as u32,
-            _pad: 0,
+            proxy_job_count: proxies.len() as u32,
+            proxy_jobs,
+            proxy_blas: f.proxy_blas.0,
         };
         let root = window.put_root(device, &root)?;
         let groups = |n: u32| [n.div_ceil(64).max(1), 1, 1];
@@ -539,6 +584,9 @@ impl Ptlas {
         list.dispatch(p.get(k.want), root, groups(self.high_water));
         if self.producer_capacity > 0 {
             list.dispatch(p.get(k.producer_want), root, groups(self.producer_capacity));
+        }
+        if !proxies.is_empty() {
+            list.dispatch(p.get(k.proxy_write), root, groups(proxies.len() as u32));
         }
         step(list);
         list.dispatch(p.get(k.cutoff), root, [1, 1, 1]);
@@ -589,6 +637,8 @@ pub(crate) struct FrameInputs {
     pub cell_log2: u32,
     pub rebased: bool,
     pub budget: u32,
+    /// The BLAS medium proxies trace; 0 while the scene has none.
+    pub proxy_blas: GpuAddress,
     /// The frame's readback slot.
     pub slot: usize,
 }

@@ -17,7 +17,12 @@ pub mod shaders {
 
 /// Runs `module`'s `main` once over `groups` workgroups with `root` and waits for it.
 pub fn dispatch<R>(module: &'static ShaderModule, root: GpuPtr<R>, groups: u32) {
-    let stage = ShaderStage::new(module, "main", SpecData::default()).unwrap();
+    dispatch_entry(module, "main", root, groups);
+}
+
+/// Runs `module`'s `entry` once over `groups` workgroups with `root` and waits for it.
+pub fn dispatch_entry<R>(module: &'static ShaderModule, entry: &str, root: GpuPtr<R>, groups: u32) {
+    let stage = ShaderStage::new(module, entry, SpecData::default()).unwrap();
     let p = device()
         .create_compute_pipeline(&stage, module.name)
         .unwrap();

@@ -8,8 +8,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use orr_cook::{
-    ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSettings, Quality, Source,
-    TextureSettings, Usage,
+    ArchiveSpec, AssetSpec, GridInput, GridVoxels, LodMode, Manifest, MeshInput, MeshSettings,
+    Quality, Source, TextureSettings, Usage, VolumeGrids, VolumeInput, VolumeSettings,
 };
 use orr_gpu::{
     Allocation, CommandList, ComputePipeline, Format, GpuAddress, GpuPtr, Hazards, KernelSet,
@@ -27,8 +27,9 @@ use orr_pack::{AssetId, Span, Target};
 use orr_scene::testing::{FlipError, Image, Pixels, flip};
 use orr_scene::{
     FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens, LoadState, Loading,
-    MaterialId, MountId, PackSource, Projection, RasterView, RendererDesc, SceneDesc, SceneId,
-    Scenes, TextureFilter, TransformGroupDesc, ViewArena, ViewDesc, ViewHistoryId, ViewTarget,
+    MaterialId, MediumProxy, MediumProxyId, MountId, PackSource, Projection, RasterView,
+    RendererDesc, SceneDesc, SceneId, Scenes, TextureFilter, TransformGroupDesc, ViewArena,
+    ViewDesc, ViewHistoryId, ViewTarget, VolumeRef,
 };
 
 use crate::shaders::{accumulate, exposure, flat_color, guide_read};
@@ -271,6 +272,77 @@ pub const CLOUD_SPHERE: &str = "cloud sphere";
 /// is exp(-[`WATER_SIGMA`]) in Rec.709.
 pub const WATER_BOX: &str = "water box";
 pub const WATER_SIGMA: [f32; 3] = [0.4, 0.2, 0.1];
+
+/// A smoke plume: the cooked volume's grid `density`, a column about 1.5 m across and 3 m
+/// tall on 0.1 m voxels, base at the origin, thinning upward and broken into puffs under
+/// 0.5 m.
+pub const PLUME: &str = "plume";
+const PLUME_MIN: [i32; 3] = [-12, 0, -12];
+const PLUME_SIZE: [u32; 3] = [24, 30, 24];
+const PLUME_VOXEL: f32 = 0.1;
+
+/// The plume's input density at voxel `i`.
+fn plume_density(i: [i32; 3]) -> f32 {
+    let p = i.map(|c| c as f32 * PLUME_VOXEL);
+    let radius = 0.75 - 0.15 * p[1] / 3.0;
+    let r = (p[0] * p[0] + p[2] * p[2]).sqrt();
+    let core = (1.0 - r / radius).clamp(0.0, 1.0);
+    let puffs = 0.55 + 0.45 * (7.1 * p[0] + 3.0 * p[1]).sin() * (5.3 * p[2] - 4.1 * p[1]).sin();
+    2.0 * core.powf(0.7) * puffs * (1.0 - p[1] / 3.2)
+}
+
+/// The cooked plume: blob 0 parsed and the density grid's decoded pages.
+pub fn plume_volume() -> (orr_pack::volume::VolumeInfo, Vec<Vec<u8>>) {
+    let a = orr_pack::Archive::from_memory(Arc::clone(pack())).unwrap();
+    let e = a
+        .expect(AssetId::from_name(PLUME), orr_pack::Class::Volume as u16, 1)
+        .unwrap();
+    let blobs = a.blobs(e);
+    let read = |b: u32| {
+        let mut v = vec![0; blobs[b as usize].raw_len as usize];
+        a.read(&blobs[b as usize], &mut v).unwrap();
+        v
+    };
+    let info = orr_pack::volume::VolumeInfo::parse(&read(0)).unwrap();
+    let g = info.grids[0].pages;
+    let pages = (g.first..g.first + g.count).map(read).collect();
+    (info, pages)
+}
+
+fn plume() -> AssetSpec {
+    let n = PLUME_SIZE.map(|s| s as i32);
+    let mut values = Vec::new();
+    for z in 0..n[2] {
+        for y in 0..n[1] {
+            for x in 0..n[0] {
+                values.push(plume_density([
+                    PLUME_MIN[0] + x,
+                    PLUME_MIN[1] + y,
+                    PLUME_MIN[2] + z,
+                ]));
+            }
+        }
+    }
+    AssetSpec {
+        name: PLUME.into(),
+        source: Source::Volume {
+            input: VolumeInput::Grids(VolumeGrids {
+                origin: [0.0; 3],
+                voxel_size: [PLUME_VOXEL; 3],
+                grids: vec![GridInput {
+                    name: "density".into(),
+                    background: 0.0,
+                    voxels: GridVoxels::Dense {
+                        min: PLUME_MIN,
+                        size: PLUME_SIZE,
+                        values,
+                    },
+                }],
+            }),
+            settings: VolumeSettings::default(),
+        },
+    }
+}
 
 /// The water box's transmission color over 1 m in the linear Rec.2020 the kernels work in.
 pub fn water_transmission() -> [f64; 3] {
@@ -921,6 +993,7 @@ fn cook() -> Arc<[u8]> {
             ]
             .into_iter()
             .chain(walk_slabs)
+            .chain([plume()])
             .collect(),
         )],
     };
@@ -1095,6 +1168,7 @@ pub struct Bed {
     frame: u64,
     last_id: u64,
     light_writes: Vec<(LightId, Option<Light>)>,
+    proxy_writes: Vec<(MediumProxyId, Option<MediumProxy>)>,
     medium: Option<GpuAddress>,
     /// Frames add the background layer instead of the radiance.
     background_layer: bool,
@@ -1257,6 +1331,7 @@ impl Bed {
             frame,
             last_id: 0,
             light_writes: Vec::new(),
+            proxy_writes: Vec::new(),
             medium: None,
             background_layer: false,
             _workers: workers,
@@ -1336,6 +1411,18 @@ impl Bed {
     /// Sets light `id` from the next frame on.
     pub fn set_light(&mut self, id: LightId, light: Option<Light>) {
         self.light_writes.push((id, light));
+    }
+
+    /// Sets medium proxy `id` from the next frame on.
+    pub fn set_medium_proxy(&mut self, id: MediumProxyId, proxy: Option<MediumProxy>) {
+        self.proxy_writes.push((id, proxy));
+    }
+
+    /// The bed's cooked volume `name`.
+    pub fn volume(&self, name: &str) -> VolumeRef {
+        self.scenes
+            .volume(self.mount, AssetId::from_name(name))
+            .unwrap_or_else(|e| panic!("volume {name}: {e}"))
     }
 
     /// Gives the scene's linked medium the data at `data` from the next frame on.
@@ -1455,10 +1542,13 @@ impl Bed {
             texture_filter: TextureFilter::Hardware,
             target: ViewTarget::AfterRr,
         };
-        if !self.light_writes.is_empty() || self.medium.is_some() {
+        if !self.light_writes.is_empty() || !self.proxy_writes.is_empty() || self.medium.is_some() {
             let mut w = f.scene(self.scene).unwrap();
             for (id, l) in self.light_writes.drain(..) {
                 w.set_light(id, l.as_ref()).unwrap();
+            }
+            for (id, p) in self.proxy_writes.drain(..) {
+                w.set_medium_proxy(id, p.as_ref()).unwrap();
             }
             if let Some(data) = self.medium.take() {
                 w.set_medium(data);

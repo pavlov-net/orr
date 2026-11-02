@@ -4,6 +4,7 @@ module tables;
 import orr.abi;
 __exported import cut;
 __exported import decal;
+__exported import medium_proxy;
 import material;
 import lights;
 import producer;
@@ -344,7 +345,16 @@ public struct SceneRoot
     public uint decal_globals;       // decals too large for bins, listed first in `decal_refs`
     public uint decal_bin_slots;     // a power of two; 0 without binned decals
     public uint decal_bin_log2;      // bins are 2^decal_bin_log2 m cubes on the world cell grid
+    public uint proxy_base;          // PTLAS index of medium proxy 0
+    public MediumProxyGpu* proxies;  // by MediumProxyId
+    public uint proxy_capacity;
     public uint _pad;
+}
+
+// The medium proxy a PTLAS instance index of class CLASS_MEDIUM names.
+public MediumProxyGpu scene_proxy(SceneRoot* s, uint instance_index)
+{
+    return s.proxies[instance_index - s.proxy_base];
 }
 
 // The slot a copy names.

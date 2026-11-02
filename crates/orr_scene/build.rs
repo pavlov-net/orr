@@ -52,6 +52,8 @@ fn main() {
             .roots(&gpu)
             .extern_type("ViewConstants", "crate::ViewConstants")
             .extern_type("ExposureState", "crate::ExposureState")
+            .extern_type("VolumeGpu", "crate::VolumeGpu")
+            .extern_type("VolumeGridGpu", "crate::VolumeGridGpu")
             .publish_types("::orr_scene")
             .compile()
     });

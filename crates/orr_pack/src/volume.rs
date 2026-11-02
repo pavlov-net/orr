@@ -15,6 +15,12 @@
 //! sample in the cell can return. The blobs after them are pages of at most 64 KiB, grid by
 //! grid: page `p` of a grid holds its bricks `p n` to `p n + n - 1` in table order, brick
 //! `p n + s` at byte `s * brick_bytes`, with `n = 65536 / brick_bytes`.
+//!
+//! Resident on the GPU ([`ResidentLayout`]), a volume is one [`VolumeGpu`] record, its
+//! [`VolumeGridGpu`] records, per grid a slot table (the position of every lattice brick
+//! among the grid's bricks, x fastest, [`NO_BRICK`] where absent), the majorants, and per
+//! grid its decoded pages back to back, so brick `s` sits at byte `s * brick_bytes`.
+//! `orr_pack.volume` samples it as [`GridSampler`] does.
 
 use bytemuck::{Pod, Zeroable};
 use half::f16;
@@ -40,6 +46,12 @@ pub const MAJORANT_CELL: u32 = 4;
 
 /// Largest page.
 pub const PAGE_BYTES: usize = 64 << 10;
+
+/// A slot table's entry for an absent brick.
+pub const NO_BRICK: u32 = u32::MAX;
+
+/// Alignment of each part of a resident volume.
+const RESIDENT_ALIGN: u64 = 256;
 
 /// Blob 0 header. Spans name tables in blob 0: `first` is a byte offset, `count` a record
 /// count.
@@ -95,6 +107,68 @@ pub struct VolumeGrid {
 pub struct VolumeBrick {
     pub coord: [u16; 3],
     pub _pad: u16,
+}
+
+/// A resident volume's record: its lattice and its grids.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct VolumeGpu {
+    pub origin: [f32; 3],
+    pub grid_count: u32,
+    pub inv_voxel_size: [f32; 3],
+    pub _pad0: u32,
+    pub brick_min: [i32; 3],
+    pub _pad1: u32,
+    pub bricks: [u32; 3],
+    pub _pad2: u32,
+    pub majorant_cells: [u32; 3],
+    pub _pad3: u32,
+    pub bounds_min: [f32; 3],
+    pub _pad4: u32,
+    pub bounds_max: [f32; 3],
+    pub _pad5: u32,
+    /// Address of `grid_count` [`VolumeGridGpu`] records.
+    pub grids: u64,
+}
+
+/// One grid of a resident volume.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct VolumeGridGpu {
+    /// Address of the grid's bricks in table order, back to back.
+    pub bricks: u64,
+    /// Address of the slot table: per lattice brick, x fastest, its position among the
+    /// grid's bricks or [`NO_BRICK`].
+    pub slots: u64,
+    /// Address of the grid's majorants, one f32 per cell, x fastest.
+    pub majorants: u64,
+    pub vk_format: u32,
+    pub scale: f32,
+    pub offset: f32,
+    pub background: f32,
+}
+
+/// Byte offsets of the parts of a resident volume from its start, each aligned to 256
+/// bytes. The [`VolumeGpu`] record is at 0.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResidentLayout {
+    pub size: u64,
+    /// The [`VolumeGridGpu`] records.
+    pub grids: u64,
+    /// Per grid, its slot table.
+    pub slots: Vec<u64>,
+    /// Blob 1 as stored.
+    pub majorants: u64,
+    /// Per grid, its first brick.
+    pub bricks: Vec<u64>,
+}
+
+impl ResidentLayout {
+    /// Offset of decoded page `page` of grid `grid`.
+    pub fn page(&self, info: &VolumeInfo, grid: usize, page: usize) -> u64 {
+        let g = &info.grids[grid];
+        self.bricks[grid] + (page * g.bricks_per_page() * g.brick_bytes()) as u64
+    }
 }
 
 impl VolumeGrid {
@@ -349,6 +423,83 @@ impl VolumeInfo {
         let h = &self.header;
         [0, 1, 2].map(|a| (p[a] - h.origin[a]) / h.voxel_size[a])
     }
+
+    /// The slot table of `grid`: per lattice brick, x fastest, its position among the
+    /// grid's bricks or [`NO_BRICK`].
+    pub fn brick_slots(&self, grid: usize) -> Vec<u32> {
+        let n = self.header.bricks.map(|b| b as usize);
+        let mut slots = vec![NO_BRICK; n[0] * n[1] * n[2]];
+        for (s, b) in self.grid_bricks(grid).iter().enumerate() {
+            let c = b.coord.map(usize::from);
+            slots[c[0] + n[0] * (c[1] + n[1] * c[2])] = s as u32;
+        }
+        slots
+    }
+
+    /// Where a resident copy keeps each part.
+    pub fn resident_layout(&self) -> ResidentLayout {
+        let mut size = 0u64;
+        let mut place = |bytes: u64| {
+            let at = size;
+            size += bytes.max(1).next_multiple_of(RESIDENT_ALIGN);
+            at
+        };
+        place(size_of::<VolumeGpu>() as u64);
+        let grids = place((self.grids.len() * size_of::<VolumeGridGpu>()) as u64);
+        let lattice = u64::from(self.header.bricks.iter().product::<u32>());
+        let slots = self.grids.iter().map(|_| place(4 * lattice)).collect();
+        let cells = u64::from(self.header.majorant_cells.iter().product::<u32>());
+        let majorants = place(4 * cells * self.grids.len() as u64);
+        let bricks = self
+            .grids
+            .iter()
+            .map(|g| place(u64::from(g.bricks.count) * g.brick_bytes() as u64))
+            .collect();
+        ResidentLayout {
+            size,
+            grids,
+            slots,
+            majorants,
+            bricks,
+        }
+    }
+
+    /// The first `layout.majorants` bytes of a resident copy at address `base`: its records
+    /// and every slot table.
+    pub fn resident_head(&self, layout: &ResidentLayout, base: u64) -> Vec<u8> {
+        let h = &self.header;
+        let mut out = vec![0; layout.majorants as usize];
+        let record = VolumeGpu {
+            origin: h.origin,
+            grid_count: self.grids.len() as u32,
+            inv_voxel_size: h.voxel_size.map(|s| 1.0 / s),
+            brick_min: h.brick_min,
+            bricks: h.bricks,
+            majorant_cells: h.majorant_cells,
+            bounds_min: h.bounds.min,
+            bounds_max: h.bounds.max,
+            grids: base + layout.grids,
+            ..Zeroable::zeroed()
+        };
+        out[..size_of::<VolumeGpu>()].copy_from_slice(bytemuck::bytes_of(&record));
+        for (i, g) in self.grids.iter().enumerate() {
+            let r = VolumeGridGpu {
+                bricks: base + layout.bricks[i],
+                slots: base + layout.slots[i],
+                majorants: base + layout.majorants + 4 * u64::from(g.majorant),
+                vk_format: g.vk_format,
+                scale: g.scale,
+                offset: g.offset,
+                background: g.background,
+            };
+            let at = layout.grids as usize + i * size_of::<VolumeGridGpu>();
+            out[at..at + size_of::<VolumeGridGpu>()].copy_from_slice(bytemuck::bytes_of(&r));
+            let slots = self.brick_slots(i);
+            let at = layout.slots[i] as usize;
+            out[at..at + 4 * slots.len()].copy_from_slice(bytemuck::cast_slice(&slots));
+        }
+        out
+    }
 }
 
 /// Reads one grid's voxels and samples from its decoded pages, as a shader would: the
@@ -357,8 +508,7 @@ pub struct GridSampler<'a> {
     info: &'a VolumeInfo,
     grid: &'a VolumeGrid,
     pages: &'a [Vec<u8>],
-    /// Position in the grid's bricks of every brick of the lattice, x fastest; `u32::MAX`
-    /// where absent.
+    /// [`VolumeInfo::brick_slots`].
     slots: Vec<u32>,
 }
 
@@ -376,17 +526,11 @@ impl<'a> GridSampler<'a> {
         if short {
             return Err(Error::Malformed("volume pages"));
         }
-        let n = info.header.bricks.map(|b| b as usize);
-        let mut slots = vec![u32::MAX; n[0] * n[1] * n[2]];
-        for (s, b) in info.grid_bricks(grid).iter().enumerate() {
-            let c = b.coord.map(usize::from);
-            slots[c[0] + n[0] * (c[1] + n[1] * c[2])] = s as u32;
-        }
         Ok(Self {
             info,
             grid: g,
             pages,
-            slots,
+            slots: info.brick_slots(grid),
         })
     }
 
@@ -397,7 +541,7 @@ impl<'a> GridSampler<'a> {
             return None;
         }
         let slot = self.slots[(b[0] + n[0] * (b[1] + n[1] * b[2])) as usize];
-        if slot == u32::MAX {
+        if slot == NO_BRICK {
             return None;
         }
         let per_page = self.grid.bricks_per_page();
@@ -460,4 +604,6 @@ const _: () = {
     assert!(size_of::<VolumeHeader>() == 112);
     assert!(size_of::<VolumeGrid>() == 56);
     assert!(size_of::<VolumeBrick>() == 8);
+    assert!(size_of::<VolumeGpu>() == 120);
+    assert!(size_of::<VolumeGridGpu>() == 40);
 };

@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use glam::{DVec3, Vec3};
 use orr_gpu::{
     Allocation, ClearColor, ColorAttachment, ColorLoad, CommandList, ComputePipeline, Device,
-    GpuPtr, Hazards, KernelSet, LatencyMarker, LowLatency, MemoryKind, PassResult, QueueKind,
-    Rendering, SamplerDesc, SamplerIndex, ShaderModule, SpecData, Stages, StorageImageIndex,
-    TextureIndex, TimelinePoint,
+    GpuAddress, GpuPtr, Hazards, KernelSet, LatencyMarker, LowLatency, MemoryKind, PassResult,
+    QueueKind, Rendering, SamplerDesc, SamplerIndex, ShaderModule, SpecData, Stages,
+    StorageImageIndex, TextureIndex, TimelinePoint,
 };
 use orr_pack::AssetId;
 use orr_shaders::PathEntry;
@@ -22,6 +22,7 @@ use crate::decals::{self, build_bins};
 use crate::emissive::ModelEmission;
 use crate::loading::{self, Loading, Msg};
 use crate::material::{MaterialId, MaterialTable, MaterialWriter};
+use crate::medium_proxy::{ProxyBlas, VolumeRef};
 use crate::memory::{PreprocessArenas, RangeAllocator, UploadWindow};
 use crate::mount::{
     Apply, ClipRef, InstancePage, LoadState, MountId, MountTask, Mounts, PackSource, PageId,
@@ -344,6 +345,8 @@ struct Core {
     ptlas: PtlasPipelines,
     /// Scratch of every scene's PTLAS build; the builds of a frame run one after another.
     ptlas_scratch: Mutex<Option<Allocation<u8>>>,
+    /// Made at the first traced frame with a medium proxy.
+    proxy_blas: Option<ProxyBlas>,
     producers: ProducerKernels,
     skin: SkinKernels,
     /// Scratch of producer builds, grown to the largest frame's.
@@ -487,6 +490,7 @@ impl Scenes {
                 accel,
                 ptlas,
                 ptlas_scratch: Mutex::new(None),
+                proxy_blas: None,
                 producers,
                 skin,
                 producer_scratch: Mutex::new(None),
@@ -612,6 +616,12 @@ impl Scenes {
     /// The model `id` of mount `m`.
     pub fn model(&self, m: MountId, id: AssetId) -> Result<ModelId> {
         self.core.mounts.lookup(m, id, |r| &r.models)
+    }
+
+    /// The volume `id` of mount `m`, for medium proxies and kernels that sample it through
+    /// `orr_pack.volume`.
+    pub fn volume(&self, m: MountId, id: AssetId) -> Result<VolumeRef> {
+        self.core.mounts.lookup(m, id, |r| &r.volumes)
     }
 
     /// The skeleton `id` of mount `m`, for pose kernels that fill skinned palettes.
@@ -1269,6 +1279,11 @@ impl<'a> Frame<'a> {
                 decal_globals: cpu.decal_globals,
                 decal_bin_slots: cpu.decal_bin_slots,
                 decal_bin_log2: decals::bin_log2(core.cell_log2),
+                proxy_base: scene.desc.instance_capacity
+                    + scene.desc.part_capacity
+                    + scene.desc.producer_capacity,
+                proxies: t.proxies.gpu(),
+                proxy_capacity: scene.desc.medium_proxy_capacity,
                 _pad: 0,
             };
             let src = window.put(device, &root)?;
@@ -1432,6 +1447,17 @@ impl<'a> Frame<'a> {
             )?;
         }
         if !traced.is_empty() {
+            let proxies = traced.iter().any(|&(id, _)| {
+                core.scene(id)
+                    .is_ok_and(|s| s.cpu.lock().unwrap().ptlas.has_proxy_work())
+            });
+            if proxies && core.proxy_blas.is_none() {
+                core.proxy_blas = Some(ProxyBlas::new(device)?);
+            }
+            let proxy_blas = core
+                .proxy_blas
+                .as_mut()
+                .map_or(GpuAddress(0), |b| b.record(&mut list));
             let mut scratch = core.ptlas_scratch.lock().unwrap();
             let need = traced
                 .iter()
@@ -1465,6 +1491,7 @@ impl<'a> Frame<'a> {
                     cell_log2: core.cell_log2,
                     rebased,
                     budget: core.budgets.ptlas_rebuilt,
+                    proxy_blas,
                     slot: (self.id % u64::from(core.fif)) as usize,
                 };
                 let kernels = &core.ptlas;
