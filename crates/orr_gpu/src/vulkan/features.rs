@@ -407,9 +407,7 @@ pub(crate) fn select(
         occupancy_priority: present(ash::nv::compute_occupancy_priority::NAME),
         generated_commands: present(ash::ext::device_generated_commands::NAME),
         // Aftermath hides the extension.
-        ray_tracing_validation: cfg!(debug_assertions)
-            && !aftermath
-            && present(RAY_TRACING_VALIDATION),
+        ray_tracing_validation: !aftermath && present(RAY_TRACING_VALIDATION),
         checkpoints: breadcrumbs && present(ash::nv::device_diagnostic_checkpoints::NAME),
         aftermath: aftermath
             && present(ash::nv::device_diagnostic_checkpoints::NAME)

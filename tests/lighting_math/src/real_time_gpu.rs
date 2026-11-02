@@ -18,9 +18,9 @@ const CHUNK: usize = 1 << 18;
 pub const MAX_MATERIALS: usize = 1 << 16;
 
 /// orr_lighting's `bsdf` in a Vulkan compute kernel (`gpu/bsdf_cases.slang`) reading the
-/// tables from [`BsdfTables`]. Every instance shares one device, created with validation on
-/// by the first [`RealTimeGpu::new`]; batch calls run in dispatches of up to 262,144 cases,
-/// one at a time across threads.
+/// tables from [`BsdfTables`]. Every instance shares one device, created by the first
+/// [`RealTimeGpu::new`]; batch calls run in dispatches of up to 262,144 cases, one at a time
+/// across threads.
 pub struct RealTimeGpu {
     inputs: Inputs,
     view: V3,
@@ -208,7 +208,6 @@ fn context() -> &'static Context {
         log_to_stderr();
         let device = Device::new(&DeviceDesc {
             name: "lighting_math",
-            validation: true,
             ..DeviceDesc::default()
         })
         .expect("Vulkan device");

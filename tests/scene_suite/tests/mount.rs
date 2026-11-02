@@ -623,7 +623,6 @@ fn staged_device() -> Device {
     let _ = device();
     let staged = Device::new(&DeviceDesc {
         name: "orr-test-staged",
-        validation: true,
         queues: QueueRequest {
             render_compute: true,
             async_compute: true,

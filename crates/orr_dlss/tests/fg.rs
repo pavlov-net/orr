@@ -32,8 +32,6 @@ fn device() -> Device {
     Device::new(&DeviceDesc {
         name: "orr_dlss fg tests",
         hooks: Some(&hooks),
-        validation: std::env::var("VK_INSTANCE_LAYERS")
-            .is_ok_and(|v| v.contains("KHRONOS_validation")),
         queues: QueueRequest {
             render_compute: true,
             ..QueueRequest::default()

@@ -6,7 +6,8 @@
 //!
 //! `cargo bench -p scene_suite --bench synthetic_forest -- [--validate] [--trees N]
 //! [--extent WxH] [--frames N] [--ptlas-cap-ms MS]`, through `.tools/gpu-run.ps1`.
-//! `--validate` runs a small forest with the validation layer on and fails on any message.
+//! `--validate` runs a small forest and fails on any validation message; the layer loads
+//! through `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`.
 #![allow(clippy::print_stdout)]
 
 use std::path::PathBuf;
@@ -1308,7 +1309,6 @@ fn main() {
     let device: &'static Device = Box::leak(Box::new(
         Device::new(&DeviceDesc {
             name: "synthetic forest",
-            validation: args.validate,
             queues: QueueRequest {
                 render_compute: true,
                 async_compute: true,

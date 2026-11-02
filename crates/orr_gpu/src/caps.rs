@@ -88,8 +88,8 @@ pub struct Caps {
     /// Conservative rasterization (`VK_EXT_conservative_rasterization`) for
     /// [`crate::RasterState::conservative`].
     pub conservative_raster: bool,
-    /// `VK_NV_ray_tracing_validation` checks acceleration-structure builds and traces;
-    /// debug builds only.
+    /// `VK_NV_ray_tracing_validation` checks acceleration-structure builds and traces; the
+    /// driver offers it when `NV_ALLOW_RAYTRACING_VALIDATION=1` is set in the environment.
     pub ray_tracing_validation: bool,
     /// Present ids and waits (`VK_KHR_present_id2`, `VK_KHR_present_wait2`):
     /// [`crate::Swapchain::wait_presented`] works. Devices without the Present queue have

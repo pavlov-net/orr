@@ -690,7 +690,6 @@ fn address_commands_match_buffer_commands() {
     let with = address_command_workload(d);
     let without = Device::new(&DeviceDesc {
         name: "gpu_suite buffer commands",
-        validation: true,
         skip_extensions: &[ash::khr::device_address_commands::NAME],
         ..DeviceDesc::default()
     })
