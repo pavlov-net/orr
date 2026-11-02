@@ -34,7 +34,7 @@ fn interface<'a>(code: &'a [u32], name: &[u8]) -> Option<&'a [u32]> {
         if inst[0] & 0xffff != OP_ENTRY_POINT || inst.len() < 3 {
             return None;
         }
-        let text: Vec<u8> = inst[3..].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let text: &[u8] = bytemuck::cast_slice(&inst[3..]);
         let len = text.iter().position(|&b| b == 0)?;
         let words = len / 4 + 1;
         (text[..len] == *name).then(|| &inst[3 + words..])

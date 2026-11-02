@@ -17,6 +17,7 @@ orr_cook.workspace = true
 orr_math.workspace = true
 orr_color.workspace = true
 orr_shaders.workspace = true
+bytemuck.workspace = true
 log.workspace = true
 png.workspace = true
 winit = "0.30.13"

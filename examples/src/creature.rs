@@ -16,11 +16,6 @@ pub const PERIOD: f32 = 2.0;
 /// The farthest any vertex moves from its rest position in the clip, rounded up, m.
 pub const REACH: f32 = 2.5;
 
-/// The little-endian bytes of 4-byte values.
-fn le(values: impl Iterator<Item = [u8; 4]>) -> Vec<u8> {
-    values.flatten().collect()
-}
-
 /// The rotation of joint `j` (from 1 up) relative to its parent `t` seconds into the wave.
 fn bend(j: usize, t: f32) -> Quat {
     let phase = std::f32::consts::TAU * t / PERIOD - 0.9 * j as f32;
@@ -100,12 +95,12 @@ pub fn write_glb(path: &Path, rings: u32, sides: u32, radius: f32, color: [f32; 
     let mut accessors = vec![
         format!(
             r#"{{"bufferView":{},"componentType":5126,"count":{vertices},"type":"VEC3","min":[{lo},0,{lo}],"max":[{radius},{HEIGHT},{radius}]}}"#,
-            add(&le(positions.iter().map(|f| f.to_le_bytes()))),
+            add(bytemuck::cast_slice(&positions)),
             lo = -radius,
         ),
         format!(
             r#"{{"bufferView":{},"componentType":5126,"count":{vertices},"type":"VEC3"}}"#,
-            add(&le(normals.iter().map(|f| f.to_le_bytes())))
+            add(bytemuck::cast_slice(&normals))
         ),
         format!(
             r#"{{"bufferView":{},"componentType":5121,"count":{vertices},"type":"VEC4"}}"#,
@@ -113,20 +108,20 @@ pub fn write_glb(path: &Path, rings: u32, sides: u32, radius: f32, color: [f32; 
         ),
         format!(
             r#"{{"bufferView":{},"componentType":5126,"count":{vertices},"type":"VEC4"}}"#,
-            add(&le(weights.iter().map(|f| f.to_le_bytes())))
+            add(bytemuck::cast_slice(&weights))
         ),
         format!(
             r#"{{"bufferView":{},"componentType":5125,"count":{},"type":"SCALAR"}}"#,
-            add(&le(indices.iter().map(|i| i.to_le_bytes()))),
+            add(bytemuck::cast_slice(&indices)),
             indices.len()
         ),
         format!(
             r#"{{"bufferView":{},"componentType":5126,"count":{JOINTS},"type":"MAT4"}}"#,
-            add(&le(inverse_binds.iter().map(|f| f.to_le_bytes())))
+            add(bytemuck::cast_slice(&inverse_binds))
         ),
         format!(
             r#"{{"bufferView":{},"componentType":5126,"count":{keys},"type":"SCALAR","min":[0],"max":[{PERIOD}]}}"#,
-            add(&le(times.iter().map(|f| f.to_le_bytes())))
+            add(bytemuck::cast_slice(&times))
         ),
     ];
     let mut samplers = Vec::new();
@@ -135,7 +130,7 @@ pub fn write_glb(path: &Path, rings: u32, sides: u32, radius: f32, color: [f32; 
         let rotations: Vec<f32> = times.iter().flat_map(|&t| bend(j, t).to_array()).collect();
         accessors.push(format!(
             r#"{{"bufferView":{},"componentType":5126,"count":{keys},"type":"VEC4"}}"#,
-            add(&le(rotations.iter().map(|f| f.to_le_bytes())))
+            add(bytemuck::cast_slice(&rotations))
         ));
         samplers.push(format!(
             r#"{{"input":6,"output":{},"interpolation":"LINEAR"}}"#,

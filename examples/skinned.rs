@@ -362,16 +362,9 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             .wait(point, Duration::from_secs(10))
             .expect("wait");
     }
-    let captured = readback.filter(|_| last.is_some()).map(|out| Capture {
-        width: HEADLESS_EXTENT[0],
-        height: HEADLESS_EXTENT[1],
-        rgba8: out
-            .as_slice()
-            .expect("readback")
-            .iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect(),
-    });
+    let captured = readback
+        .filter(|_| last.is_some())
+        .map(|out| Capture::from_readback(HEADLESS_EXTENT, &out));
     drop(image);
     drop(display);
     drop(renderer);

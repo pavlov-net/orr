@@ -106,8 +106,8 @@ fn tiff_format<R: Read + Seek>(d: &mut Decoder<R>) -> std::result::Result<Raster
 fn result_bytes(r: DecodingResult) -> std::result::Result<Vec<u8>, String> {
     Ok(match r {
         DecodingResult::U8(v) => v,
-        DecodingResult::U16(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
-        DecodingResult::F32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        DecodingResult::U16(v) => bytemuck::cast_slice(&v).to_vec(),
+        DecodingResult::F32(v) => bytemuck::cast_slice(&v).to_vec(),
         _ => return Err("unsupported TIFF sample type".into()),
     })
 }

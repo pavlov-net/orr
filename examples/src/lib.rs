@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use orr::orr_gpu::{Device, DeviceDesc, QueueRequest};
+use orr::orr_gpu::{Allocation, Device, DeviceDesc, QueueRequest};
 use orr::orr_output::orr_dlss::Uuid;
 use orr::orr_pack::{Archive, AssetId};
 use orr::{
@@ -163,6 +163,15 @@ pub struct Capture {
 }
 
 impl Capture {
+    /// A capture of packed RGBA8 words read back from an image.
+    pub fn from_readback(extent: [u32; 2], words: &Allocation<u32>) -> Self {
+        Capture {
+            width: extent[0],
+            height: extent[1],
+            rgba8: bytemuck::cast_slice(words.as_slice().expect("readback")).to_vec(),
+        }
+    }
+
     /// A display screenshot (linear, relative to paper white) encoded as sRGB.
     pub fn from_screenshot(shot: &Screenshot) -> Self {
         let rgba8 = shot

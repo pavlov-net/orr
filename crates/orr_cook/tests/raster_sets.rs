@@ -69,8 +69,8 @@ fn tiff_texels(path: &Path) -> (Vec<u8>, u32, &'static str) {
     let ct = d.colortype().unwrap();
     let bytes = match d.read_image().unwrap() {
         DecodingResult::U8(v) => v,
-        DecodingResult::U16(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
-        DecodingResult::F32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        DecodingResult::U16(v) => bytemuck::cast_slice(&v).to_vec(),
+        DecodingResult::F32(v) => bytemuck::cast_slice(&v).to_vec(),
         _ => panic!("{}: sample type", path.display()),
     };
     match ct {

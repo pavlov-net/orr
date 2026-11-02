@@ -9,6 +9,9 @@
 //! `hot-reload` feature adds [`Watcher`], which recompiles compiled-in modules from their
 //! sources at run time.
 
+// orr's SPIR-V is little-endian words, and code using it casts them without swapping.
+const _: () = assert!(cfg!(target_endian = "little"));
+
 pub mod abi;
 mod alias;
 #[cfg(feature = "build")]

@@ -254,7 +254,7 @@ fn recompile(
             module.name
         ));
     }
-    let hash = compile::hash64(&compile::words_to_bytes(&compiled.words));
+    let hash = compile::hash64(bytemuck::cast_slice(&compiled.words));
     if hash == w.hash {
         return Ok(None);
     }
