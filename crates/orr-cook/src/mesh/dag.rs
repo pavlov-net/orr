@@ -115,6 +115,7 @@ pub(crate) fn stages(
     limits: impl Fn(u8) -> Limits + Sync,
     skinned: bool,
 ) -> Vec<Stage> {
+    let _z = crate::profile::zone!("dag.stages");
     let snap = Snap {
         step: grid.step(),
         min: [0, 1, 2].map(|a| grid.cells.iter().map(|c| c[a]).min().unwrap_or(0)),
@@ -149,6 +150,7 @@ pub(crate) fn stages(
     let mut stages: Vec<Stage> = pieces
         .par_iter()
         .map(|(part, sections, corners)| {
+            let _z = crate::profile::zone!("dag.build_stage");
             let input = input(corners, |v, _, section| (v, section), &shared, &seams);
             Stage {
                 part: *part,
@@ -211,6 +213,7 @@ pub(crate) fn stages(
     let merged: Vec<Stage> = sources
         .par_iter()
         .map(|(sections, corners)| {
+            let _z = crate::profile::zone!("dag.build_merged_stage");
             let input = input(
                 corners,
                 |v, cell, section| (cell, attrs(v), section),
@@ -562,6 +565,7 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
     let mut groups: Vec<Cooked> = flat
         .par_iter()
         .map(|&(si, g)| {
+            let _z = crate::profile::zone!("dag.group_clusters");
             let st = &stages[si];
             let clusters = g
                 .clusters
@@ -594,15 +598,19 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
         .collect();
     drop(flat);
     cx.omm_all(groups.iter_mut().flat_map(|g| &mut g.clusters).collect());
-    groups
-        .par_iter_mut()
-        .try_for_each(|g| fit(cx, &mut g.clusters))?;
+    {
+        let _z = crate::profile::zone!("dag.fit");
+        groups
+            .par_iter_mut()
+            .try_for_each(|g| fit(cx, &mut g.clusters))?;
+    }
     super::thickness::assign(
         groups.iter_mut().flat_map(|g| &mut g.clusters).collect(),
         cx.grid,
         cx.sections,
     );
 
+    let _z = crate::profile::zone!("dag.pages");
     // Terminal groups first and on pages of their own, then merged stages, then coarse to
     // fine.
     let terminal = |g: &Cooked| g.error == f32::INFINITY;

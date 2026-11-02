@@ -67,9 +67,11 @@ const MESH_BYTES_PER_TRIANGLE: u64 = 480;
 pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
     let start = Instant::now();
     crate::alloc::install_meshopt_arena();
+    crate::profile::start();
     // A pool built earlier in the process stays; the cook runs on whichever is there.
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(opts.jobs)
+        .start_handler(|i| crate::profile::name_thread(&format!("rayon {i}")))
         .build_global();
     let shared = Shared {
         memo: Memo::default(),
@@ -771,6 +773,7 @@ impl<'m, 's> Run<'m, 's> {
         'm: 't,
         's: 't,
     {
+        let _z = crate::profile::zone!("import");
         let size: Vec<u64> = self
             .imports
             .iter()
@@ -1136,6 +1139,8 @@ impl<'m, 's> Run<'m, 's> {
                     self.spawn(scope, tx, u);
                 }
             }
+            crate::profile::plot!("jobs running", running as f64);
+            crate::profile::plot!("jobs working set GiB", bytes as f64 / f64::from(1 << 30));
             assert!(
                 running > 0 || !self.local.is_empty(),
                 "the cook has nothing to run and entries left to write"
@@ -1254,7 +1259,9 @@ impl<'m, 's> Run<'m, 's> {
             .filter(|_| self.window > self.opts.reorder_window);
         let (tx, shared) = (tx.clone(), self.shared);
         scope.spawn(move || {
+            crate::profile::name_thread("cook job");
             let r = catch_unwind(AssertUnwindSafe(|| {
+                let _z = crate::profile::zone!("job", &name);
                 let start = Instant::now();
                 let (from, detail) =
                     cook_unit(shared, &name, class, key, gdeflate, spill.as_deref(), work)?;
@@ -1347,6 +1354,7 @@ impl<'m, 's> Run<'m, 's> {
 
     /// Writes every unit that is next in its archive's order and done.
     fn write_ready(&mut self) -> Result<()> {
+        let _z = crate::profile::zone!("archive.write");
         for a in 0..self.order.len() {
             while let Some(&u) = self.order[a].get(self.cursor[a]) {
                 if !matches!(self.units[u].state, State::Done(_)) {
@@ -2148,6 +2156,7 @@ fn section_maps(
     archives: &HashMap<String, Arc<Archive>>,
     normals: bool,
 ) -> Result<Vec<SectionMaps>> {
+    let _z = crate::profile::zone!("mesh.maps");
     let read = |unit: &str, all: bool, wrap, uv, channels| {
         texture_mips(
             &archives[unit],
@@ -2323,6 +2332,7 @@ fn cook_unit(
                 mount: i == 0,
                 ..BlobIn::new(p)
             }));
+            let _z = crate::profile::zone!("archive.add");
             w.add(name, class, orr_pack::mesh::SCHEMA, key, &blobs)?;
         }
         Work::Texture(job, images) => {
@@ -2364,7 +2374,11 @@ fn cook_unit(
             detail.volume = Some(volume::cook(&mut w, name, key, &plan)?);
         }
     }
-    let from = match (w.finish()?, path) {
+    let finished = {
+        let _z = crate::profile::zone!("archive.finish");
+        w.finish()?
+    };
+    let from = match (finished, path) {
         (Some(bytes), _) => From::Memory(Arc::new(Archive::from_memory(bytes)?)),
         (None, Some(path)) if scratch.is_some() => From::Scratch(path),
         (None, Some(path)) => From::Cache(path),

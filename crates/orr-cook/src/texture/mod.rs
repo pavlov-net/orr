@@ -414,6 +414,7 @@ pub(crate) fn layout(
 /// Adds a cooked texture: blob 0 and the tail in the mount section, one 64 KiB tile per
 /// chunk in the mip blobs. Every blob after blob 0 takes the texture's filter.
 pub(crate) fn add(w: &mut ArchiveWriter, name: &str, key: Hash32, t: &Built) -> Result<AssetId> {
+    let _z = crate::profile::zone!("archive.add");
     let head = t.info.to_bytes();
     let tail = t.info.header.tail_first_mip < t.info.header.mip_count;
     let mut blobs = vec![BlobIn {

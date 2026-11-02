@@ -71,6 +71,7 @@ pub(crate) fn encode(
     q: Quality,
     chains: &[Vec<Img>],
 ) -> Result<Vec<Vec<Vec<u8>>>, String> {
+    let _z = crate::profile::zone!("texture.encode");
     let f = FormatInfo::of(e.vk_format()).expect("known format");
     let out = match e {
         Encoding::Raw(d) => chains

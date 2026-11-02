@@ -48,6 +48,7 @@ pub(crate) fn check(
     maps: &[SectionMaps],
     max_deg: f32,
 ) -> TangentCheck {
+    let _z = crate::profile::zone!("mesh.tangent_check");
     let mut hist = vec![0.0f64; BINS];
     let mut texels = 0u64;
     for (sec, sm) in m.sections.iter().zip(maps) {

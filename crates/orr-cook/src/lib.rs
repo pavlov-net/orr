@@ -84,6 +84,7 @@ mod manifest;
 mod materialx;
 mod mesh;
 mod patch;
+mod profile;
 mod raster;
 mod report;
 mod run;

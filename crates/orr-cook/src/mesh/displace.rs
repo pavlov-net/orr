@@ -22,6 +22,7 @@ pub(crate) fn bake(
     maps: &[SectionMaps],
     d: &StaticDisplacement,
 ) -> Vec<bool> {
+    let _z = crate::profile::zone!("mesh.displace");
     let baked: Vec<bool> = maps.iter().map(SectionMaps::bakes).collect();
     if !baked.iter().any(|&b| b) {
         return baked;
@@ -182,6 +183,7 @@ pub(crate) fn simplify(
     baked: &[bool],
     target: f32,
 ) {
+    let _z = crate::profile::zone!("mesh.displace_simplify");
     if target <= 0.0 {
         return;
     }

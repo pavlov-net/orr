@@ -258,6 +258,7 @@ impl MeshSource {
     /// The mesh, read now if it is lazy; a lazy mesh whose triangles no longer match its
     /// sections fails as changed.
     pub(crate) fn load(self, asset: &str, memo: &Memo) -> Result<MeshData> {
+        let _z = crate::profile::zone!("mesh.load");
         match self {
             Self::Data(m) => Ok(*m),
             Self::Lazy(l) => {
@@ -500,6 +501,7 @@ pub(crate) fn cook(
     s: &MeshSettings,
     maps: &[SectionMaps],
 ) -> Result<CookedMesh> {
+    let _z = crate::profile::zone!("mesh.cook");
     let fail = |message: String| Error::Mesh {
         asset: asset.into(),
         message,
@@ -696,6 +698,7 @@ impl Ctx<'_> {
         cells: &[[i32; 3]],
         mut tris: Vec<u8>,
     ) -> ClusterData {
+        let _z = crate::profile::zone!("mesh.cluster");
         let w = self.w;
         let mut order: Vec<u32> = (0..verts.len() as u32).collect();
         meshopt::optimize_meshlet_level(&mut order, &mut tris, 3);
@@ -755,6 +758,7 @@ impl Ctx<'_> {
 
     fn omm_all(&self, clusters: Vec<&mut ClusterData>) {
         if let Some(o) = &self.s.omm {
+            let _z = crate::profile::zone!("omm");
             clusters.into_par_iter().for_each(|c| {
                 c.omm = self.omm(c, o.cluster_bytes_max);
             });
@@ -901,7 +905,11 @@ fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
 /// The stored form of a resident page, checked to decode to the same bytes: micromaps
 /// follow the stored corner order.
 fn store_page(bytes: &[u8]) -> Result<Vec<u8>> {
-    let stored = orr_pack::mesh::encode_page(bytes)?;
+    let stored = {
+        let _z = crate::profile::zone!("page.encode");
+        orr_pack::mesh::encode_page(bytes)?
+    };
+    let _z = crate::profile::zone!("page.verify");
     let mut decoded = vec![0; bytes.len()];
     orr_pack::mesh::decode_page(&stored, &mut decoded)?;
     assert!(decoded == bytes, "a cooked page decodes to itself");

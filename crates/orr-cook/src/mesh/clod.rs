@@ -118,6 +118,7 @@ fn clusterize(
     indices: &[u32],
     refined: i32,
 ) {
+    let _z = crate::profile::zone!("clod.clusterize");
     // SAFETY: plain bound query.
     let max =
         unsafe { ffi::meshopt_buildMeshletsBound(indices.len(), c.max_vertices, c.min_triangles) };
@@ -196,6 +197,7 @@ fn partition(
     indices: &[u32],
     remap: &[u32],
 ) -> Vec<u32> {
+    let _z = crate::profile::zone!("clod.partition");
     if clusters.len() <= c.partition_size {
         return vec![0, clusters.len() as u32];
     }
@@ -336,6 +338,7 @@ fn simplify(
     target: usize,
     error: &mut f32,
 ) -> Vec<u32> {
+    let _z = crate::profile::zone!("clod.simplify");
     let mut options = SimplifyOptions::Sparse | SimplifyOptions::ErrorAbsolute;
     options.set(SimplifyOptions::ErrorClamped, c.simplify_error_clamped);
     options.set(SimplifyOptions::Permissive, c.simplify_permissive);
@@ -438,6 +441,7 @@ fn dilate_borders(
     remap: &[u32],
     bounds: &mut Bounds,
 ) {
+    let _z = crate::profile::zone!("clod.dilate");
     let mut edges = hash::Set::default();
     let old_area = boundary_area(positions.read(), merged, locks, remap, &mut edges);
     if old_area == 0.0 {
@@ -567,6 +571,7 @@ pub(crate) fn build<G: Send>(
 
     let mut depth = 0u32;
     while clusters.len() > 1 {
+        let _z = crate::profile::zone!("clod.level");
         let offsets = partition(&mut clusters, c, positions.read(), &cluster_indices, &remap);
         lock_boundary(
             &mut locks,
@@ -600,6 +605,7 @@ pub(crate) fn build<G: Send>(
                     &mut error,
                 );
                 let emitted = |bounds: Bounds| {
+                    let _z = crate::profile::zone!("clod.emit");
                     emit(Emitted {
                         depth,
                         bounds,
