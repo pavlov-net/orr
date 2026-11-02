@@ -6,6 +6,7 @@
 // position and motion, projected-space NDF filtering of the roughness, and the G-buffer
 // written.
 #include "orr/root.h"
+import orr.abi;
 import orr.math;
 import orr_pack.mesh;
 import producer;
@@ -201,7 +202,7 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     float4 previous = mul(v.prev_clip_from_view, float4(mul(v.prev_view_from_world_rotation, float4(prev_relative, 0.0)), 1.0));
     float2 motion = (previous.xy / previous.w - current.xy / current.w) * 0.5;
 
-    bool extended = r.x.index != TEXTURE_NONE;
+    bool extended = r.x.index != IMAGE_NONE;
     GBufferWords words = encode_gsurface(g, extended);
     r.a.get<RWTexture2D<uint4>>()[pixel] = words.a;
     r.b.get<RWTexture2D<uint2>>()[pixel] = words.b;

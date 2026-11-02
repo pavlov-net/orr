@@ -44,7 +44,6 @@ static const float HISTORY_WEIGHT = 0.9;
 // trusted over the mirrored fill once it holds HOLE_TRUST.
 static const float HOLE_SAMPLES = 32.0;
 static const float HOLE_TRUST = 4.0;
-static const uint NONE = 0xffffffff;
 
 public struct LensState
 {
@@ -379,12 +378,12 @@ float2 previous_uv(int2 q, float depth)
 // camera's motion at the layer's depth; pixels without data this frame restart.
 void accumulate_holes(int2 q)
 {
-    if (root.holes_store.index == NONE)
+    if (root.holes_store.index == IMAGE_NONE)
         return;
     RWTexture2D<float4> holes = root.holes_store.get<RWTexture2D<float4>>();
     float n = 0.0;
     float4 ray = 0.0;
-    if (root.background.index != NONE)
+    if (root.background.index != IMAGE_NONE)
         ray = ray_background(q, n);
     if (n == 0.0)
     {
@@ -656,7 +655,7 @@ float2 ring_offset(uint ring, uint j, float spacing, float jitter)
 float3 hidden(float2 uv, out float trust)
 {
     trust = 0.0;
-    if (root.holes.index == NONE)
+    if (root.holes.index == IMAGE_NONE)
         return 0.0;
     float4 h = root.holes.get<Texture2D<float4>>().SampleLevel(root.point.get(), uv, 0.0);
     trust = saturate(h.a / HOLE_TRUST);
@@ -1030,6 +1029,6 @@ void composite(uint3 id: SV_DispatchThreadID)
     float3 backdrop = lerp(near, back, saturate((radius - SLIGHT_LOW) / (SLIGHT_HIGH - SLIGHT_LOW)));
     float3 c = front.rgb + (1.0 - front.a) * backdrop;
     root.target.get<RWTexture2D<float4>>()[p] = float4(c, src.a);
-    if (root.guide.index != 0xffffffff)
+    if (root.guide.index != IMAGE_NONE)
         root.guide.get<RWTexture2D<float>>()[p] = guide_luminance(c) - guide_luminance(src.rgb);
 }

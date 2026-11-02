@@ -16,8 +16,6 @@ static const uint DEBUG_LINEAR = 1;
 static const uint DEBUG_PATTERN = 2;
 static const uint DEBUG_EXPOSURE_HEATMAP = 3;
 
-static const uint NO_IMAGE = 0xffffffff;
-
 public struct TonemapConstants
 {
     public Gt7Curve curve;
@@ -128,7 +126,7 @@ void write_field(TonemapConstants* k, uint2 t, float2 size)
     float2 f = (lens_forward(k, p, c, hd) - p) / size;
     float4 at_f = 0.0;
     float4 here = 0.0;
-    if (root.field_source.index != NO_IMAGE)
+    if (root.field_source.index != IMAGE_NONE)
     {
         Texture2D<float4> previous = root.field_source.get<Texture2D<float4>>();
         at_f = previous.SampleLevel(root.linear.get(), uv + f, 0.0);
@@ -232,7 +230,7 @@ void main(uint3 id: SV_DispatchThreadID)
             radiance = source.Load(int3(id.xy, 0)).rgb;
         float3 exposed = radiance * scale;
         float3 glared = exposed;
-        if (root.glare.index != NO_IMAGE)
+        if (root.glare.index != IMAGE_NONE)
         {
             Texture2D<float4> chain = root.glare.get<Texture2D<float4>>();
             SamplerState linear = root.linear.get();
@@ -267,9 +265,9 @@ void main(uint3 id: SV_DispatchThreadID)
             c = gt7_display_linear(graded, k.curve, k.sdr != 0);
     }
     root.target.get<RWTexture2D<float4>>()[id.xy] = float4(c, 1.0);
-    if (k.distortion == 0 && root.hook_source.index != NO_IMAGE)
+    if (k.distortion == 0 && root.hook_source.index != IMAGE_NONE)
         root.hook_source.get<RWTexture2D<float4>>()[id.xy] = float4(c, 1.0);
-    if (root.field.index != NO_IMAGE && all((id.xy & 1) == 0))
+    if (root.field.index != IMAGE_NONE && all((id.xy & 1) == 0))
         write_field(k, id.xy >> 1, float2(root.width, root.height));
 }
 

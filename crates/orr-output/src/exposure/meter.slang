@@ -33,8 +33,6 @@ struct Root
 }
 ORR_ROOT(Root);
 
-static const uint NO_TEXTURE = 0xffffffff;
-
 static groupshared uint weights[HISTOGRAM_BINS];
 static groupshared uint offsets[HISTOGRAM_BINS];
 static groupshared uint xs[HISTOGRAM_BINS];
@@ -79,7 +77,7 @@ void main(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint lane: SV_
         float3 xyz = mul(REC2020_TO_XYZ, rgb) / cur.pre_exposure;
         float y = xyz.y;
         uint weight = 1;
-        if (root.mask.index != NO_TEXTURE)
+        if (root.mask.index != IMAGE_NONE)
         {
             Texture2D<float4> mask = root.mask.get<Texture2D<float4>>();
             uint w, h;

@@ -134,7 +134,7 @@ public struct GBufferGpu
     public TextureIndex depth;      // D32, sampled
     public TextureIndex a;
     public TextureIndex b;
-    public TextureIndex x;          // TEXTURE_NONE while no resident material needs it
+    public TextureIndex x;          // IMAGE_NONE while no resident material needs it
     public TextureIndex motion;
     public TextureIndex hzb;        // R32F: farthest reverse-Z depth per texel, mip 0 at extent
     public uint2 extent;
@@ -395,7 +395,7 @@ public GSurface load_gsurface(SceneRoot* scene, ViewConstants* view, GBufferGpu*
     w.b = g.b.get<Texture2D<uint2>>().Load(int3(pixel, 0));
     w.x = uint4(0);
     uint flags = w.a.w >> 24;
-    if ((flags & GBUFFER_EXTENDED) != 0 && g.x.index != TEXTURE_NONE)
+    if ((flags & GBUFFER_EXTENDED) != 0 && g.x.index != IMAGE_NONE)
         w.x = g.x.get<Texture2D<uint4>>().Load(int3(pixel, 0));
     GSurface s = decode_gsurface(w, scene.materials + c.material);
     float depth = g.depth.get<Texture2D<float>>().Load(int3(pixel, 0));

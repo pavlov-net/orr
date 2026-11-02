@@ -344,7 +344,7 @@ fn snapshot(scenes: &Scenes, gpu: &Gpu<'_>, m: MountId, a: &Archive) -> Vec<Vec<
         got.texture_streams = GpuPtr::NULL;
         for t in &mut got.textures {
             if *t != TextureIndex::NONE {
-                *t = TextureIndex(textures.iter().position(|(_, i)| i == t).unwrap() as u32);
+                *t = TextureIndex(1 + textures.iter().position(|(_, i)| i == t).unwrap() as u32);
             }
         }
         bytemuck::bytes_of(&got).to_vec()

@@ -70,7 +70,7 @@ unsafe impl<T> Zeroable for GpuPtr<T> {}
 // SAFETY: as above; `fn() -> T` keeps the type Send, Sync and 'static regardless of `T`.
 unsafe impl<T: 'static> Pod for GpuPtr<T> {}
 
-macro_rules! slot {
+macro_rules! image_slot {
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
         #[repr(transparent)]
@@ -78,25 +78,27 @@ macro_rules! slot {
         pub struct $name(pub u32);
 
         impl $name {
-            /// No slot.
-            pub const NONE: Self = Self(u32::MAX);
+            /// No image: slot 0, which the heap never hands out, so a zeroed record names no
+            /// image.
+            pub const NONE: Self = Self(0);
         }
     };
 }
 
-slot!(
+image_slot!(
     /// A sampled image view's slot in the resource heap.
     TextureIndex
 );
-slot!(
+image_slot!(
     /// A storage image view's slot in the resource heap; shares the slot space of
     /// [`TextureIndex`].
     StorageImageIndex
 );
-slot!(
-    /// A sampler's slot in the sampler heap.
-    SamplerIndex
-);
+
+/// A sampler's slot in the sampler heap.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Pod, Zeroable)]
+pub struct SamplerIndex(pub u32);
 
 /// The device address of a TLAS or partitioned TLAS. Never 0 when traced.
 #[repr(transparent)]
