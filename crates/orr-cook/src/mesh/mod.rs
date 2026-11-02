@@ -13,6 +13,7 @@
 //! Alpha-tested clusters put opaque triangles first and carry opacity micromaps over the
 //! rest. Clusters of subsurface sections carry their minimum thickness ([`thickness`]).
 
+mod clod;
 mod dag;
 mod displace;
 mod lod;
