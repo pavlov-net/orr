@@ -8,6 +8,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
+orr-color.workspace = true
+orr-math.workspace = true
 orr-output = { path = "../../crates/orr-output" }
 orr-scene = { workspace = true, features = ["testing"] }
 orr-shaders.workspace = true
@@ -18,7 +20,6 @@ half = "2.7"
 orr.workspace = true
 output-maths = { path = "../output-maths" }
 orr-egui = { path = "../../crates/orr-egui" }
-orr-math.workspace = true
 egui = { version = "0.37", default-features = false, features = ["monochrome_emoji_fonts"] }
 egui_demo_lib = "0.37"
 log.workspace = true

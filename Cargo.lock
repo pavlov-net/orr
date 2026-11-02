@@ -1093,10 +1093,11 @@ version = "0.0.1"
 dependencies = [
  "ash",
  "blake3",
- "glam 0.34.1",
  "half",
  "log",
+ "orr-color",
  "orr-gpu",
+ "orr-math",
  "orr-shaders",
  "raw-window-handle",
  "windows",
@@ -2048,6 +2049,7 @@ version = "0.0.1"
 dependencies = [
  "bytemuck",
  "egui",
+ "orr-color",
  "orr-gpu",
  "orr-shaders",
 ]
@@ -2181,6 +2183,7 @@ name = "output-maths"
 version = "0.0.1"
 dependencies = [
  "cc",
+ "orr-color",
  "orr-output",
  "orr-shaders",
 ]
@@ -2196,6 +2199,7 @@ dependencies = [
  "half",
  "log",
  "orr",
+ "orr-color",
  "orr-egui",
  "orr-math",
  "orr-output",

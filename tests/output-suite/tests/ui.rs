@@ -4,6 +4,7 @@
 //! every encoding.
 
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use egui::epaint::{ImageDelta, Mesh, Vertex};
 use egui::{
@@ -11,11 +12,12 @@ use egui::{
     Pos2, RawInput, Rect, TextureId, TextureOptions, TexturesDelta, Ui, pos2, vec2,
 };
 use half::f16;
+use orr_color::{RgbPrimaries, SCRGB_WHITE_NITS, pq_decode, pq_encode, srgb_decode, srgb_encode};
 use orr_egui::Painter;
+use orr_math::{DMat3, DVec3};
 use orr_output::{
     CapturePass, ComposePass, ComposeRoot, ComposeSource, DisplayRequest, OutputFormat,
-    OutputKernels, OutputView, ResolvedDisplay, UiLayer, pq_decode, pq_encode, srgb_decode,
-    srgb_encode,
+    OutputKernels, OutputView, ResolvedDisplay, UiLayer,
 };
 use orr_scene::orr_gpu::{
     Allocation, Format, Hazards, MemoryKind, QueueKind, Stages, StorageImageIndex, Texture,
@@ -24,21 +26,6 @@ use orr_scene::orr_gpu::{
 use orr_scene::testing::{
     Image, Pixels, Tolerance, assert_clean, check, device, read_texture, wait,
 };
-
-const REC709_TO_REC2020: [[f64; 3]; 3] = [
-    [0.627_403_9, 0.329_283_0, 0.043_313_1],
-    [0.069_097_3, 0.919_540_4, 0.011_362_3],
-    [0.016_391_4, 0.088_013_3, 0.895_595_3],
-];
-const REC2020_TO_REC709: [[f64; 3]; 3] = [
-    [1.660_491_0, -0.587_641_1, -0.072_849_9],
-    [-0.124_550_5, 1.132_899_9, -0.008_349_4],
-    [-0.018_150_8, -0.100_578_9, 1.118_729_7],
-];
-
-fn mul(m: &[[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
-    m.map(|r| r[0] * v[0] + r[1] * v[1] + r[2] * v[2])
-}
 
 fn reference(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -152,8 +139,12 @@ fn decode(signal: [f64; 3], d: &ResolvedDisplay) -> [f64; 3] {
     let pw = f64::from(d.paper_white_nits);
     match d.encoding {
         OutputFormat::Sdr => signal.map(srgb_decode),
-        OutputFormat::Hdr10Pq => mul(&REC2020_TO_REC709, signal.map(pq_decode)).map(|v| v / pw),
-        OutputFormat::ScRgb => signal.map(|v| v * 80.0 / pw),
+        OutputFormat::Hdr10Pq => {
+            static M: LazyLock<DMat3> =
+                LazyLock::new(|| RgbPrimaries::REC2020.matrix_to(RgbPrimaries::REC709));
+            (*M * DVec3::from(signal.map(pq_decode)) / pw).to_array()
+        }
+        OutputFormat::ScRgb => signal.map(|v| v * SCRGB_WHITE_NITS / pw),
     }
 }
 
@@ -161,8 +152,14 @@ fn encode(linear: [f64; 3], d: &ResolvedDisplay) -> [f64; 3] {
     let pw = f64::from(d.paper_white_nits);
     match d.encoding {
         OutputFormat::Sdr => linear.map(|v| srgb_encode(v.clamp(0.0, 1.0))),
-        OutputFormat::Hdr10Pq => mul(&REC709_TO_REC2020, linear).map(|v| pq_encode(v * pw)),
-        OutputFormat::ScRgb => linear.map(|v| v * pw / 80.0),
+        OutputFormat::Hdr10Pq => {
+            static M: LazyLock<DMat3> =
+                LazyLock::new(|| RgbPrimaries::REC709.matrix_to(RgbPrimaries::REC2020));
+            (*M * DVec3::from(linear))
+                .to_array()
+                .map(|v| pq_encode(v * pw))
+        }
+        OutputFormat::ScRgb => linear.map(|v| v * pw / SCRGB_WHITE_NITS),
     }
 }
 

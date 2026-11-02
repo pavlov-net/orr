@@ -19,8 +19,8 @@ fn pq_round_trips_in_f64() {
 
 #[test]
 fn encoders_match_orr_color() {
-    // orr.color is f32: its PQ signal is within 1.3e-5 of ST 2084 and its decode within
-    // 3.6e-5 relative of the exact decode.
+    // orr_color.transfer is f32: its PQ signal is within 1.3e-5 of ST 2084 and its decode
+    // within 3.6e-5 relative of the exact decode.
     for i in 0..=4096 {
         let nits = 10f64.powf(-3.0 + 7.0 * f64::from(i) / 4096.0);
         let s = slang::pq_encode(nits as f32);

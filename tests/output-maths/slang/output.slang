@@ -2,7 +2,7 @@
 import gt7;
 import exposure;
 import display;
-import orr.color;
+import orr_color.transfer;
 
 export __extern_cpp void orr_gt7_tonemap(Gt7Curve* curve, float* rgb, float* out, uint count)
 {

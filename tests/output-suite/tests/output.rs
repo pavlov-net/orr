@@ -258,7 +258,7 @@ fn sdr_pq_and_scrgb_match_cpu_target() {
         .chunks_exact(8)
         .map(|t| [0, 2, 4].map(|o| f16::from_le_bytes([t[o], t[o + 1]]).to_f32()))
         .collect();
-    let scrgb_nits = |v: f32| f64::from(v) * 80.0;
+    let scrgb_nits = |v: f32| f64::from(v) * orr_color::SCRGB_WHITE_NITS;
     // One RGBA16F step in the display-linear image and one in the backbuffer.
     let two_steps = |r: f32| r.abs() / 512.0 + 1e-6;
     check(

@@ -7,6 +7,7 @@ use orr_gpu::{
     ClassicKind, GpuPtr, Hazards, InstanceFlags, MemoryKind, RtasFlags, ShaderStage, SpecData,
     Stages,
 };
+use orr_math::Vec3;
 
 const WIDTH: u32 = 1024;
 const HEIGHT: u32 = 768;
@@ -30,26 +31,6 @@ impl Lcg {
 }
 
 type V3 = [f32; 3];
-
-fn add(a: V3, b: V3) -> V3 {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-
-fn scale(a: V3, s: f32) -> V3 {
-    [a[0] * s, a[1] * s, a[2] * s]
-}
-
-fn cross(a: V3, b: V3) -> V3 {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-fn normalize(a: V3) -> V3 {
-    scale(a, 1.0 / (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt())
-}
 
 /// A ground quad, a trunk and a crown of leaf quads, each as unindexed triangles. Leaf
 /// quads are two triangles, corners (0,0) (1,0) (1,1) then (0,0) (1,1) (0,1), as the
@@ -82,23 +63,26 @@ fn meshes(rng: &mut Lcg) -> [(Vec<V3>, bool); 3] {
     let mut leaves = Vec::new();
     for _ in 0..LEAVES {
         let center = loop {
-            let p = [
+            let p = Vec3::new(
                 rng.range(-1.0, 1.0),
                 rng.range(-1.0, 1.0),
                 rng.range(-1.0, 1.0),
-            ];
-            if p.iter().map(|v| v * v).sum::<f32>() <= 1.0 {
-                break add(scale(p, 2.5), [0.0, 6.0, 0.0]);
+            );
+            if p.length_squared() <= 1.0 {
+                break p * 2.5 + Vec3::new(0.0, 6.0, 0.0);
             }
         };
-        let u = normalize([
+        let u = Vec3::new(
             rng.range(-1.0, 1.0),
             rng.range(-1.0, 1.0),
             rng.range(-1.0, 1.0),
-        ]);
-        let w = normalize(cross(u, [rng.range(-1.0, 1.0), 1.0, rng.range(-1.0, 1.0)]));
-        let (u, v) = (scale(u, 0.6), scale(cross(w, u), 0.6));
-        let corner = |a: f32, b: f32| add(center, add(scale(u, a - 0.5), scale(v, b - 0.5)));
+        )
+        .normalize();
+        let w = u
+            .cross(Vec3::new(rng.range(-1.0, 1.0), 1.0, rng.range(-1.0, 1.0)))
+            .normalize();
+        let (u, v) = (u * 0.6, w.cross(u) * 0.6);
+        let corner = |a: f32, b: f32| (center + (u * (a - 0.5) + v * (b - 0.5))).to_array();
         let (c00, c10, c11, c01) = (
             corner(0.0, 0.0),
             corner(1.0, 0.0),
@@ -246,19 +230,19 @@ struct Run {
 impl Run {
     fn new(scene: &Scene, bounces: u32) -> Run {
         let pixels = u64::from(WIDTH * HEIGHT);
-        let fwd = normalize([0.0, -0.05, 1.0]);
-        let right = normalize(cross([0.0, 1.0, 0.0], fwd));
-        let up = cross(fwd, right);
-        let sun = normalize([0.4, 0.8, 0.3]);
+        let fwd = Vec3::new(0.0, -0.05, 1.0).normalize();
+        let right = Vec3::Y.cross(fwd).normalize();
+        let up = fwd.cross(right);
+        let sun = Vec3::new(0.4, 0.8, 0.3).normalize();
         let rad = readback::<[f32; 4]>(pixels, "parity radiance");
         let hash = readback::<u32>(pixels, "parity hashes");
         let root = upload(
             &[paths::Root {
                 cam_pos: [0.0, 2.5, -45.0, 30.0f32.to_radians().tan()],
-                cam_fwd: [fwd[0], fwd[1], fwd[2], WIDTH as f32 / HEIGHT as f32],
-                cam_right: [right[0], right[1], right[2], 0.0],
-                cam_up: [up[0], up[1], up[2], 0.0],
-                sun: [sun[0], sun[1], sun[2], 3.0],
+                cam_fwd: [fwd.x, fwd.y, fwd.z, WIDTH as f32 / HEIGHT as f32],
+                cam_right: [right.x, right.y, right.z, 0.0],
+                cam_up: [up.x, up.y, up.z, 0.0],
+                sun: [sun.x, sun.y, sun.z, 3.0],
                 out_rad: rad.gpu(),
                 out_hash: hash.gpu(),
                 transforms: scene.transforms.gpu(),

@@ -12,6 +12,7 @@ orr-output = { path = "../../crates/orr-output" }
 orr-shaders.workspace = true
 
 [build-dependencies]
+orr-color.workspace = true
 cc = "1.2"
 orr-shaders = { workspace = true, features = ["build"] }
 
