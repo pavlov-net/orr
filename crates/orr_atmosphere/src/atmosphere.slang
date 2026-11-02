@@ -322,7 +322,7 @@ public void atmosphere_multiple_scattering_point(AtmosphereGpu* a, float2 unit, 
     h = unit.y * (a.top_radius - a.planet_radius);
 }
 
-// The sky-view LUT's frame: zenith `up`, longitude measured from `t` towards `b`.
+// The sky-view LUT's frame: zenith `up`, longitude measured from `t` toward `b`.
 void sky_view_frame(AtmosphereGpu* a, out float3 t, out float3 b)
 {
     orthonormal_basis(a.up.xyz, t, b);
@@ -335,7 +335,7 @@ float horizon_zenith_angle(AtmosphereGpu* a, float h)
 }
 
 // Sky-view texture coordinates of `dir` from a LUT eye at altitude h. Latitude is warped
-// quadratically towards the horizon, which sits at v = 0.5 between two rows; longitude is
+// quadratically toward the horizon, which sits at v = 0.5 between two rows; longitude is
 // absolute and wraps.
 public float2 atmosphere_sky_view_uv(AtmosphereGpu* a, float h, float3 dir)
 {

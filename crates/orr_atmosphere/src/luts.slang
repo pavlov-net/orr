@@ -46,7 +46,7 @@ float3 light_groups(AtmosphereGroups g, float3 color)
                   dot(g.light_weight[2].xyz, color));
 }
 
-// The sample point and length of step i of n over [t0, t1], denser towards t0.
+// The sample point and length of step i of n over [t0, t1], denser toward t0.
 float2 step_at(float t0, float t1, uint i, uint n)
 {
     float u0 = float(i) / float(n);

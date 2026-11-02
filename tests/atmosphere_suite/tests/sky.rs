@@ -258,9 +258,8 @@ fn composition_error(multiple: bool, precision: &Precision, eyes: &[DVec3]) -> f
                         groups.segment(eye, *d, NEAR_RANGE, &light, Geometry::Sphere, precision);
                     let near_inscatter = nits(&near.inscatter.values);
                     let t = groups.rec2020(&near.transmittance);
-                    let composed: [f64; 3] = std::array::from_fn(|c| {
-                        near_inscatter[c] + t[c] / SOLAR_COLOR[c] * lut[c]
-                    });
+                    let composed: [f64; 3] =
+                        std::array::from_fn(|c| near_inscatter[c] + t[c] / SOLAR_COLOR[c] * lut[c]);
                     let y = luminance(full);
                     let error = (0..3)
                         .map(|c| (composed[c] - full[c]).abs() / full[c].abs().max(0.05 * y))

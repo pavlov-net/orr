@@ -1,4 +1,4 @@
-// Orthographic rays over the unit square towards +z; writes the hit's custom index plus one,
+// Orthographic rays over the unit square toward +z; writes the hit's custom index plus one,
 // or zero on a miss. `main` reads the TLAS address from the root, `main_ptr` through a
 // pointer in the root.
 #include "orr/root.h"

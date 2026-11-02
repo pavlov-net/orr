@@ -476,7 +476,7 @@ impl Gpu {
     }
 
     pub fn submit_wait(&self) {
-        // SAFETY: the command buffer is recording; the queue is idle afterwards.
+        // SAFETY: the command buffer is recording; the queue is idle afterward.
         unsafe {
             self.device.end_command_buffer(self.cmd).unwrap();
             let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(self.cmd)];

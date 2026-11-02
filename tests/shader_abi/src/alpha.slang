@@ -1,4 +1,4 @@
-// Orthographic rays over the unit square towards +z with the cluster probe's alpha test on
+// Orthographic rays over the unit square toward +z with the cluster probe's alpha test on
 // non-opaque triangles. Per ray: hit, instance index, primitive and cluster id.
 #include "orr/root.h"
 import orr.abi;
