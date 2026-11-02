@@ -36,8 +36,9 @@ impl log::Log for StderrLog {
 pub fn device() -> &'static Device {
     static DEVICE: OnceLock<Device> = OnceLock::new();
     DEVICE.get_or_init(|| {
-        let _ = log::set_logger(&StderrLog);
-        log::set_max_level(log::LevelFilter::Info);
+        if log::set_logger(&StderrLog).is_ok() {
+            log::set_max_level(log::LevelFilter::Info);
+        }
         let desc = DeviceDesc {
             name: "orr-test",
             queues: QueueRequest {

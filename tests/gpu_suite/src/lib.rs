@@ -26,27 +26,13 @@ pub mod parity {
     include!(concat!(env!("OUT_DIR"), "/parity/orr_shaders.rs"));
 }
 
-struct StderrLog;
-
-impl log::Log for StderrLog {
-    fn enabled(&self, m: &log::Metadata<'_>) -> bool {
-        m.level() <= log::Level::Info
-    }
-
-    #[allow(clippy::print_stderr)]
-    fn log(&self, r: &log::Record<'_>) {
-        if self.enabled(r.metadata()) {
-            eprintln!("{} {}", r.level(), r.args());
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-/// Logs info and above to stderr.
+/// Logs info and above to stderr, with `RUST_LOG` adding to or overriding that.
 pub fn log_to_stderr() {
-    let _ = log::set_logger(&StderrLog);
-    log::set_max_level(log::LevelFilter::Info);
+    let _ = env_logger::Builder::new()
+        .parse_filters("info")
+        .parse_default_env()
+        .is_test(true)
+        .try_init();
 }
 
 static DEVICE: OnceLock<Device> = OnceLock::new();

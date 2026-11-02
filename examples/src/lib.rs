@@ -31,23 +31,6 @@ pub mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
 }
 
-struct StderrLog;
-
-impl log::Log for StderrLog {
-    fn enabled(&self, m: &log::Metadata<'_>) -> bool {
-        m.level() <= log::Level::Info
-    }
-
-    #[allow(clippy::print_stderr)]
-    fn log(&self, r: &log::Record<'_>) {
-        if self.enabled(r.metadata()) {
-            eprintln!("{} {}", r.level(), r.args());
-        }
-    }
-
-    fn flush(&self) {}
-}
-
 /// The examples' NGX project id.
 pub const PROJECT_ID: Uuid = Uuid::from_u128(0x5d1e_7a40_c2b9_4f86_9e3d_61a0_b8f2_47c5);
 
@@ -59,13 +42,16 @@ pub fn request_perf_counters() {
 static PERF_COUNTERS: AtomicBool = AtomicBool::new(false);
 
 /// The process's device, created on first use with every queue, NGX's extensions where
-/// NGX offers them, and validation when the environment enables the layer. Logs to stderr.
+/// NGX offers them, and validation when the environment enables the layer. Logs info and
+/// above to stderr, with `RUST_LOG` adding to or overriding that.
 pub fn device() -> &'static Device {
     static DEVICE: OnceLock<Device> = OnceLock::new();
     DEVICE.get_or_init(|| {
-        if log::set_logger(&StderrLog).is_ok() {
-            log::set_max_level(log::LevelFilter::Info);
-        }
+        let _ = env_logger::Builder::new()
+            .parse_filters("info")
+            .parse_default_env()
+            .is_test(true)
+            .try_init();
         let hooks = DlssSdk::device_hooks(PROJECT_ID);
         let desc = DeviceDesc {
             name: "orr-examples",

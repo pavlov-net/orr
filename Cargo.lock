@@ -729,6 +729,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "env_filter"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "900d271a03799a1ee8d1ca9b19893b48ca674a9284fefcfb85f05e74ed314217"
+dependencies = [
+ "log",
+ "regex",
+]
+
+[[package]]
+name = "env_logger"
+version = "0.11.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de671bd27a75a797dc9ae289ba1e77276e75e2026408aab65185384e2d5cd3f6"
+dependencies = [
+ "env_filter",
+ "log",
+]
+
+[[package]]
 name = "epaint"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -791,6 +811,7 @@ version = "0.0.1"
 dependencies = [
  "bytemuck",
  "egui",
+ "env_logger",
  "log",
  "orr",
  "orr_color",
@@ -1109,6 +1130,7 @@ version = "0.0.1"
 dependencies = [
  "ash",
  "blake3",
+ "env_logger",
  "half",
  "log",
  "orr_color",
@@ -1994,7 +2016,7 @@ name = "openpbr_ref"
 version = "0.0.1"
 dependencies = [
  "cc",
- "log",
+ "env_logger",
  "orr_gpu",
  "orr_math",
  "orr_shaders",
