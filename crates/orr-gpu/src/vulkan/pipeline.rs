@@ -207,6 +207,14 @@ impl<'a> StageParts<'a> {
         })
     }
 
+    /// Adds the stage's code, entry and specialization to `hasher`.
+    pub(super) fn key(&self, hasher: &mut blake3::Hasher) {
+        hasher.update(&(self.code.len() as u64).to_le_bytes());
+        hasher.update(bytemuck::cast_slice(&self.code));
+        hasher.update(self.entry.to_bytes_with_nul());
+        hasher.update(self.spec);
+    }
+
     pub(super) fn chain(&self) -> StageChain<'_> {
         StageChain {
             module: vk::ShaderModuleCreateInfo::default().code(&self.code),
@@ -263,21 +271,28 @@ impl Shared {
         name: &str,
     ) -> Result<vk::Pipeline, Error> {
         let parts = StageParts::new(self, s, Stage::Compute, name)?;
-        self.create_pipeline(extra, name, "vkCreateComputePipelines", |cache, next| {
-            let mut stage = parts.chain();
-            let mut info = vk::ComputePipelineCreateInfo::default()
-                .stage(stage.info(vk::ShaderStageFlags::COMPUTE));
-            info.p_next = next;
-            // SAFETY: valid create info; the SPIR-V was validated by the shader build.
-            unsafe { self.device.create_compute_pipelines(cache, &[info], None) }
-                .map(|p| p[0])
-                .map_err(|(_, e)| e)
-        })
+        self.create_pipeline(
+            &[&parts],
+            extra,
+            name,
+            "vkCreateComputePipelines",
+            |cache, next| {
+                let mut stage = parts.chain();
+                let mut info = vk::ComputePipelineCreateInfo::default()
+                    .stage(stage.info(vk::ShaderStageFlags::COMPUTE));
+                info.p_next = next;
+                // SAFETY: valid create info; the SPIR-V was validated by the shader build.
+                unsafe { self.device.create_compute_pipelines(cache, &[info], None) }
+                    .map(|p| p[0])
+                    .map_err(|(_, e)| e)
+            },
+        )
     }
 }
 
 impl Device {
-    /// Creates a compute pipeline from a compute entry point.
+    /// Creates a compute pipeline from a compute entry point. Threads asking for one pipeline at
+    /// once compile it once: the others wait for it.
     pub fn create_compute_pipeline(
         &self,
         s: &ShaderStage<'_>,

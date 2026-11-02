@@ -112,6 +112,7 @@ impl Device {
             .any_hit_shader(vk::SHADER_UNUSED_KHR)
             .intersection_shader(vk::SHADER_UNUSED_KHR)];
         let raw = shared.create_pipeline(
+            &[&parts],
             vk::PipelineCreateFlags2::empty(),
             name,
             "vkCreateRayTracingPipelinesKHR",
