@@ -110,6 +110,7 @@ dependencies = [
 name = "atmosphere-suite"
 version = "0.0.1"
 dependencies = [
+ "half",
  "lighting-suite",
  "orr",
  "orr-atmosphere",

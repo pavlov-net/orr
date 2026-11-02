@@ -1258,17 +1258,6 @@ struct Frame {
     counts: Vec<u32>,
 }
 
-fn f16(bits: u16) -> f32 {
-    let sign = if bits >> 15 == 1 { -1.0 } else { 1.0 };
-    let e = i32::from((bits >> 10) & 31);
-    let m = f32::from(bits & 1023);
-    sign * match e {
-        0 => m * 2f32.powi(-24),
-        31 => f32::INFINITY,
-        _ => (1.0 + m / 1024.0) * 2f32.powi(e - 15),
-    }
-}
-
 fn texels<T: bytemuck::Pod>(t: &Texture) -> Vec<T> {
     let bytes = read_texture(t, &TextureRegion::whole_mip(t.desc(), 0));
     bytemuck::pod_collect_to_vec(&bytes)
@@ -1300,14 +1289,18 @@ fn read_back(view: &RasterView) -> Frame {
             }
         })
         .collect();
-    let motion: Vec<[u16; 2]> = texels(&view.motion);
+    let motion: Vec<[f32; 2]> = texels::<[u16; 2]>(&view.motion)
+        .iter()
+        .map(|m| m.map(|bits| half::f16::from_bits(bits).to_f32()))
+        .collect();
+    assert!(motion.iter().flatten().all(|v| !v.is_nan()), "NaN motion");
     Frame {
         view: view.clone(),
         a: texels(&view.gbuf_a),
         b: texels(&view.gbuf_b),
         x: view.gbuf_x.as_ref().map(|x| texels(x)),
         depth: texels(&view.depth),
-        motion: motion.iter().map(|m| m.map(f16)).collect(),
+        motion,
         ids,
         clusters: mesh_clusters,
         counts,

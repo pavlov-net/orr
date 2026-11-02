@@ -574,17 +574,6 @@ fn clusters_and_vertices_past_capacity_are_dropped_and_counted() {
     assert_clean();
 }
 
-fn half(bits: u16) -> f32 {
-    let sign = if bits >> 15 == 1 { -1.0 } else { 1.0 };
-    let e = i32::from((bits >> 10) & 31);
-    let m = f32::from(bits & 1023);
-    sign * match e {
-        0 => m * 2f32.powi(-24),
-        31 => f32::INFINITY,
-        _ => (1.0 + m / 1024.0) * 2f32.powi(e - 15),
-    }
-}
-
 #[test]
 fn particles_are_drawn_only_at_the_transparency_point_and_traced_only_under_their_mask() {
     if !traced(true) {
@@ -720,7 +709,8 @@ fn particles_are_drawn_only_at_the_transparency_point_and_traced_only_under_thei
     let (bad, covered) = disagree(
         &three,
         image.iter().map(|p| {
-            let c = p.map(half);
+            let c = p.map(|bits| half::f16::from_bits(bits).to_f32());
+            assert!(c.iter().all(|v| !v.is_nan()), "NaN overlay");
             (c[0] > 0.0).then_some([c[0], c[1], c[2], 0.0])
         }),
     );
