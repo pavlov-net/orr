@@ -36,14 +36,89 @@ pub use sdk::{
 };
 pub use uuid::Uuid;
 
-/// Ratio of output to render resolution. `Dlaa` renders at output resolution.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// The smallest output width and height DLSS takes.
+pub const MIN_OUTPUT: [u32; 2] = [64, 32];
+
+/// What a caller asks DLSS for: a [`Mode`], or the one that suits the output resolution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Quality {
+    /// [`Mode::for_output`].
+    #[default]
+    Auto,
     Dlaa,
     Quality,
     Balanced,
     Performance,
     UltraPerformance,
+}
+
+impl Quality {
+    /// The mode this asks for at `output`.
+    pub fn resolve(self, output: [u32; 2]) -> Mode {
+        match self {
+            Self::Auto => Mode::for_output(output),
+            Self::Dlaa => Mode::Dlaa,
+            Self::Quality => Mode::Quality,
+            Self::Balanced => Mode::Balanced,
+            Self::Performance => Mode::Performance,
+            Self::UltraPerformance => Mode::UltraPerformance,
+        }
+    }
+}
+
+/// Ratio of output to render resolution, as NGX takes it. `Dlaa` renders at output resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Mode {
+    Dlaa,
+    Quality,
+    Balanced,
+    Performance,
+    UltraPerformance,
+}
+
+impl Mode {
+    /// The default mode of the RTX UI Developer Guidelines' table for an output of this many
+    /// pixels: Quality from 1920 x 1080 up to 2560 x 1440, Performance up to 3840 x 2160,
+    /// Ultra Performance above. Below 1920 x 1080 the table turns DLSS off; this returns
+    /// DLAA, which does not upscale either and still denoises a path traced view.
+    pub fn for_output([width, height]: [u32; 2]) -> Self {
+        match u64::from(width) * u64::from(height) {
+            p if p < 1920 * 1080 => Self::Dlaa,
+            p if p <= 2560 * 1440 => Self::Quality,
+            p if p <= 3840 * 2160 => Self::Performance,
+            _ => Self::UltraPerformance,
+        }
+    }
+
+    /// The mode whose nominal scale is closest to rendering at `render` for `output`.
+    pub(crate) fn for_render_size(render: [u32; 2], output: [u32; 2]) -> Self {
+        let scale = f64::from(render[0]) / f64::from(output[0]);
+        [
+            Self::Dlaa,
+            Self::Quality,
+            Self::Balanced,
+            Self::Performance,
+            Self::UltraPerformance,
+        ]
+        .into_iter()
+        .min_by(|a, b| {
+            (a.scale() - scale)
+                .abs()
+                .total_cmp(&(b.scale() - scale).abs())
+        })
+        .expect("the list is not empty")
+    }
+
+    /// NGX's published ratio of render to output resolution on each axis.
+    pub(crate) fn scale(self) -> f64 {
+        match self {
+            Self::Dlaa => 1.0,
+            Self::Quality => 2.0 / 3.0,
+            Self::Balanced => 0.58,
+            Self::Performance => 0.5,
+            Self::UltraPerformance => 1.0 / 3.0,
+        }
+    }
 }
 
 /// What NGX offers on a device.
@@ -57,4 +132,41 @@ pub struct Support {
     pub fg: bool,
     /// Most generated frames per rendered frame; 0 without frame generation.
     pub max_generated: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Mode, Quality};
+
+    #[test]
+    fn auto_follows_the_output_resolution_at_each_boundary() {
+        for (output, mode) in [
+            ([1919, 1080], Mode::Dlaa),
+            ([1920, 1079], Mode::Dlaa),
+            ([1920, 1080], Mode::Quality),
+            ([2560, 1080], Mode::Quality),
+            ([2560, 1440], Mode::Quality),
+            ([2561, 1440], Mode::Performance),
+            ([3440, 1440], Mode::Performance),
+            ([3840, 2160], Mode::Performance),
+            ([3841, 2160], Mode::UltraPerformance),
+            ([u32::MAX, u32::MAX], Mode::UltraPerformance),
+        ] {
+            assert_eq!(Quality::default().resolve(output), mode, "{output:?}");
+        }
+    }
+
+    #[test]
+    fn a_render_size_picks_the_nearest_mode() {
+        let output = [3840, 2160];
+        for (render, mode) in [
+            ([3840, 2160], Mode::Dlaa),
+            ([2560, 1440], Mode::Quality),
+            ([2227, 1253], Mode::Balanced),
+            ([1920, 1080], Mode::Performance),
+            ([1280, 720], Mode::UltraPerformance),
+        ] {
+            assert_eq!(Mode::for_render_size(render, output), mode, "{render:?}");
+        }
+    }
 }

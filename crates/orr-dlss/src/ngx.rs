@@ -1,6 +1,6 @@
 use crate::raw::{FgInputs, Image, RrInputs, SrInputs, Upscaler, Vulkan};
 use crate::sys::*;
-use crate::{DlssError, Quality, Support, Uuid};
+use crate::{DlssError, Mode, Support, Uuid};
 use ash::vk::{self, Handle, TaggedStructure};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::PathBuf;
@@ -379,10 +379,10 @@ impl Ngx {
     pub(crate) fn render_size(
         &self,
         output: [u32; 2],
-        quality: Quality,
+        mode: Mode,
         upscaler: Upscaler,
     ) -> Result<[u32; 2], DlssError> {
-        if quality == Quality::Dlaa {
+        if mode == Mode::Dlaa {
             return Ok(output);
         }
         let support = self.support();
@@ -408,7 +408,7 @@ impl Ngx {
             NVSDK_NGX_Parameter_SetI(
                 self.caps,
                 key(NVSDK_NGX_Parameter_PerfQualityValue),
-                perf_quality(quality),
+                perf_quality(mode),
             );
             NVSDK_NGX_Parameter_SetI(self.caps, key(NVSDK_NGX_Parameter_RTXValue), 0);
         }
@@ -443,42 +443,40 @@ impl Upscaler {
     }
 }
 
-fn perf_quality(quality: Quality) -> NVSDK_NGX_PerfQuality_Value {
-    match quality {
-        Quality::Dlaa => NVSDK_NGX_PerfQuality_Value_NVSDK_NGX_PerfQuality_Value_DLAA,
-        Quality::Quality => NVSDK_NGX_PerfQuality_Value_NVSDK_NGX_PerfQuality_Value_MaxQuality,
-        Quality::Balanced => NVSDK_NGX_PerfQuality_Value_NVSDK_NGX_PerfQuality_Value_Balanced,
-        Quality::Performance => NVSDK_NGX_PerfQuality_Value_NVSDK_NGX_PerfQuality_Value_MaxPerf,
-        Quality::UltraPerformance => {
+fn perf_quality(mode: Mode) -> NVSDK_NGX_PerfQuality_Value {
+    match mode {
+        Mode::Dlaa => NVSDK_NGX_PerfQuality_Value_NVSDK_NGX_PerfQuality_Value_DLAA,
+        Mode::Quality => NVSDK_NGX_PerfQuality_Value_NVSDK_NGX_PerfQuality_Value_MaxQuality,
+        Mode::Balanced => NVSDK_NGX_PerfQuality_Value_NVSDK_NGX_PerfQuality_Value_Balanced,
+        Mode::Performance => NVSDK_NGX_PerfQuality_Value_NVSDK_NGX_PerfQuality_Value_MaxPerf,
+        Mode::UltraPerformance => {
             NVSDK_NGX_PerfQuality_Value_NVSDK_NGX_PerfQuality_Value_UltraPerformance
         }
     }
 }
 
-fn preset_key(upscaler: Upscaler, quality: Quality) -> &'static [u8] {
-    match (upscaler, quality) {
-        (Upscaler::Rr, Quality::Dlaa) => {
-            NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA
-        }
-        (Upscaler::Rr, Quality::Quality) => {
+fn preset_key(upscaler: Upscaler, mode: Mode) -> &'static [u8] {
+    match (upscaler, mode) {
+        (Upscaler::Rr, Mode::Dlaa) => NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA,
+        (Upscaler::Rr, Mode::Quality) => {
             NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality
         }
-        (Upscaler::Rr, Quality::Balanced) => {
+        (Upscaler::Rr, Mode::Balanced) => {
             NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced
         }
-        (Upscaler::Rr, Quality::Performance) => {
+        (Upscaler::Rr, Mode::Performance) => {
             NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance
         }
-        (Upscaler::Rr, Quality::UltraPerformance) => {
+        (Upscaler::Rr, Mode::UltraPerformance) => {
             NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance
         }
-        (Upscaler::Sr, Quality::Dlaa) => NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA,
-        (Upscaler::Sr, Quality::Quality) => NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
-        (Upscaler::Sr, Quality::Balanced) => NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced,
-        (Upscaler::Sr, Quality::Performance) => {
+        (Upscaler::Sr, Mode::Dlaa) => NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA,
+        (Upscaler::Sr, Mode::Quality) => NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
+        (Upscaler::Sr, Mode::Balanced) => NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced,
+        (Upscaler::Sr, Mode::Performance) => {
             NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance
         }
-        (Upscaler::Sr, Quality::UltraPerformance) => {
+        (Upscaler::Sr, Mode::UltraPerformance) => {
             NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance
         }
     }
@@ -533,7 +531,7 @@ impl Upscale {
         upscaler: Upscaler,
         render: [u32; 2],
         output: [u32; 2],
-        quality: Quality,
+        mode: Mode,
         preset: Option<u32>,
     ) -> Result<Self, DlssError> {
         let support = ngx.support();
@@ -569,7 +567,7 @@ impl Upscale {
             ui(NVSDK_NGX_Parameter_Height, render[1]);
             ui(NVSDK_NGX_Parameter_OutWidth, output[0]);
             ui(NVSDK_NGX_Parameter_OutHeight, output[1]);
-            i(NVSDK_NGX_Parameter_PerfQualityValue, perf_quality(quality));
+            i(NVSDK_NGX_Parameter_PerfQualityValue, perf_quality(mode));
             i(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, flags);
             i(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
             if upscaler == Upscaler::Rr {
@@ -587,7 +585,7 @@ impl Upscale {
                 );
             }
             if let Some(preset) = preset {
-                ui(preset_key(upscaler, quality), preset);
+                ui(preset_key(upscaler, mode), preset);
             }
             // Names the device: NGX refuses to guess once several devices have it running.
             NVSDK_NGX_VULKAN_CreateFeature1(
