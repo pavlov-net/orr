@@ -14,6 +14,23 @@ pub(crate) struct Raster {
     pub uv: [f32; 6],
 }
 
+/// Up to two inclusive index ranges; an empty one has its start past its end.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct Ranges(pub [[usize; 2]; 2]);
+
+impl Ranges {
+    fn all(n: u32) -> Self {
+        Self([[0, n as usize - 1], [1, 0]])
+    }
+}
+
+/// The lower and upper corners of `p`'s bounding box.
+fn bounds(p: &[[f64; 2]; 3]) -> ([f64; 2], [f64; 2]) {
+    let lo = [0, 1].map(|a| p.iter().map(|q| q[a]).fold(f64::INFINITY, f64::min));
+    let hi = [0, 1].map(|a| p.iter().map(|q| q[a]).fold(f64::NEG_INFINITY, f64::max));
+    (lo, hi)
+}
+
 impl Raster {
     /// Mesh uv `p` in texels of this mip, after the uv transform.
     pub(crate) fn texel_pos(&self, p: [f32; 2]) -> [f64; 2] {
@@ -71,8 +88,7 @@ impl Raster {
     pub(crate) fn footprint(&self, uv: [[f32; 2]; 3], mut f: impl FnMut(f32) -> bool) {
         let size = [f64::from(self.w), f64::from(self.h)];
         let p = uv.map(|t| self.texel_pos(t));
-        let lo = [0, 1].map(|a| p.iter().map(|q| q[a]).fold(f64::INFINITY, f64::min));
-        let hi = [0, 1].map(|a| p.iter().map(|q| q[a]).fold(f64::NEG_INFINITY, f64::max));
+        let (lo, hi) = bounds(&p);
         if (0..2).any(|a| hi[a] - lo[a] > 2.0 * size[a]) {
             self.texels.iter().all(|&t| f(t));
             return;
@@ -103,6 +119,49 @@ impl Raster {
                     return;
                 }
             }
+        }
+    }
+
+    /// Per axis, the texel indices that hold every texel [`Self::footprint`] visits for `uv`,
+    /// as one or two inclusive ranges; `None` for coordinates that are not finite.
+    pub(crate) fn footprint_ranges(&self, uv: [[f32; 2]; 3]) -> Option<[Ranges; 2]> {
+        let (lo, hi) = bounds(&uv.map(|t| self.texel_pos(t)));
+        if !(lo.iter().chain(&hi).all(|c| c.is_finite())) {
+            return None;
+        }
+        let size = [self.w, self.h];
+        if (0..2).any(|a| hi[a] - lo[a] > 2.0 * f64::from(size[a])) {
+            return Some(size.map(Ranges::all));
+        }
+        Some([0, 1].map(|a| {
+            let (first, last) = (lo[a].floor() as i64 - 2, hi[a].floor() as i64 + 2);
+            self.wrapped_range(first, last, size[a], self.wrap[a])
+        }))
+    }
+
+    /// The indices `first..=last` wrap to.
+    fn wrapped_range(&self, first: i64, last: i64, n: u32, wrap: Wrap) -> Ranges {
+        let len = i64::from(n);
+        match wrap {
+            Wrap::Clamp => Ranges([
+                [self.wrapped(first, n, wrap), self.wrapped(last, n, wrap)],
+                [1, 0],
+            ]),
+            _ if last - first + 1 >= len => Ranges::all(n),
+            Wrap::Repeat => {
+                let a = first.rem_euclid(len);
+                let b = a + (last - first);
+                if b < len {
+                    Ranges([[a as usize, b as usize], [1, 0]])
+                } else {
+                    Ranges([[a as usize, n as usize - 1], [0, (b - len) as usize]])
+                }
+            }
+            Wrap::Mirror if first.div_euclid(len) == last.div_euclid(len) => {
+                let (a, b) = (self.wrapped(first, n, wrap), self.wrapped(last, n, wrap));
+                Ranges([[a.min(b), a.max(b)], [1, 0]])
+            }
+            Wrap::Mirror => Ranges::all(n),
         }
     }
 
