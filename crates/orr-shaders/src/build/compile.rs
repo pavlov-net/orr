@@ -460,6 +460,7 @@ impl Build {
             plans.insert(name.clone(), module_plans);
             models.insert(name.clone(), model);
         }
+        let mut linked_plans: HashMap<String, HashMap<String, Plan>> = HashMap::new();
         for (name, record) in &linked_modules {
             let module_plans = plan(name, &record.model)?;
             lints.extend(lint::model_lints(
@@ -468,6 +469,7 @@ impl Build {
                 &module_plans,
                 &lib_dir,
             ));
+            linked_plans.insert(name.clone(), module_plans);
         }
 
         lints.retain(|l| !self.allowed.contains(&l.lint));
@@ -526,7 +528,6 @@ impl Build {
         write(&out_dir.join("orr_shaders.rs"), rust.as_bytes())?;
 
         let no_owners = HashMap::new();
-        let no_plans = HashMap::new();
         let linked_out: Vec<Kernel<'_>> = linked_modules
             .iter()
             .map(|(name, record)| Kernel {
@@ -537,7 +538,7 @@ impl Build {
                 interface: interface_hash(&record.model),
                 model: &record.model,
                 owners: &no_owners,
-                plans: &no_plans,
+                plans: &linked_plans[name],
             })
             .collect();
         let rust = codegen::kernel_set(&linked_out, &link::ids(&links), &manifest_path);
@@ -1394,7 +1395,7 @@ pub(super) fn interface_hash(model: &Model) -> u64 {
             other => out.push_str(&format!("{other:?}")),
         }
     }
-    let mut text = String::new();
+    let mut text = format!("inline {}|", model.inline_root);
     if let Some(root) = &model.root {
         walk(&Ty::Struct(root.clone()), model, &mut Vec::new(), &mut text);
     }

@@ -362,10 +362,7 @@ pub struct LightingView {
     layers_frost: bool,
     /// The frame and path settings of the last opaque dispatch.
     path: Option<(u64, PathRoot)>,
-    roots: Ring<PathRoot>,
-    dielectric_roots: Ring<PathRoot>,
     layer_tile_roots: Ring<LayerTilesRoot>,
-    update_roots: Ring<PathRoot>,
     local_roots: Ring<local::Root>,
     guide_roots: Ring<GuideRoot>,
     frost_roots: Ring<FrostRoot>,
@@ -458,10 +455,7 @@ impl LightingView {
             layers_frame: None,
             layers_frost: false,
             path: None,
-            roots: Ring::new(device, "path roots")?,
-            dielectric_roots: Ring::new(device, "dielectric roots")?,
             layer_tile_roots: Ring::new(device, "layer tile roots")?,
-            update_roots: Ring::new(device, "update path roots")?,
             local_roots: Ring::new(device, "local light sampler roots")?,
             guide_roots: Ring::new(device, "guide roots")?,
             frost_roots: Ring::new(device, "frosted glass roots")?,
@@ -722,26 +716,26 @@ impl PathPipeline {
 
     /// Runs the kernel over the workgroups `groups` holds, or as rays over the extent `rays`
     /// holds.
-    fn record_indirect<R>(
+    fn record_indirect(
         &self,
         list: &mut CommandList,
-        root: GpuPtr<R>,
+        root: &PathRoot,
         groups: GpuPtr<DispatchArgs>,
         rays: GpuPtr<DispatchArgs>,
     ) {
         match self {
-            Self::Compute(p) => list.dispatch_indirect(p, root, groups),
+            Self::Compute(p) => list.dispatch_indirect_inline(p, root, groups),
             Self::Rays(p) => list.dispatch_rays_indirect(p, root, rays),
         }
     }
 
     /// Runs the kernel over `extent` invocations.
-    fn record<R>(&self, list: &mut CommandList, root: GpuPtr<R>, extent: [u32; 2]) {
+    fn record(&self, list: &mut CommandList, root: &PathRoot, extent: [u32; 2]) {
         let [w, h] = extent;
         match self {
             Self::Compute(p) => {
                 let [gx, gy, _] = p.workgroup();
-                list.dispatch(p, root, [w.div_ceil(gx), h.div_ceil(gy), 1]);
+                list.dispatch_inline(p, root, [w.div_ceil(gx), h.div_ceil(gy), 1]);
             }
             Self::Rays(p) => list.dispatch_rays(p, root, [w, h, 1]),
         }
@@ -1018,26 +1012,22 @@ impl LightingKernels {
             _pad1: 0,
             _pad2: 0,
         };
-        let root = view.roots.write(slot, path_root);
         view.path = Some((pass.frame, path_root));
         if !reference {
-            let update_root = view.update_roots.write(
-                slot,
-                PathRoot {
-                    mode: 0,
-                    local: GpuPtr::NULL,
-                    light_flags: 0,
-                    dof_background: StorageImageIndex::NONE,
-                    ..path_root
-                },
-            );
+            let update_root = PathRoot {
+                mode: 0,
+                local: GpuPtr::NULL,
+                light_flags: 0,
+                dof_background: StorageImageIndex::NONE,
+                ..path_root
+            };
             list.begin_pass("world cache update paths", false);
             self.update
-                .record(list, update_root, view.extent.map(|e| e.div_ceil(block)));
+                .record(list, &update_root, view.extent.map(|e| e.div_ceil(block)));
             list.end_pass();
         }
         list.begin_pass("opaque paths", false);
-        self.opaque.record(list, root, view.extent);
+        self.opaque.record(list, &path_root, view.extent);
         list.end_pass();
         Ok(())
     }
@@ -1082,19 +1072,16 @@ impl LightingKernels {
         if pass.frosted_glass {
             flags |= DIELECTRIC_FROST;
         }
-        let root = view.dielectric_roots.write(
-            slot,
-            PathRoot {
-                light_flags: 0,
-                dof_background: StorageImageIndex::NONE,
-                layers: view.layers.gpu(),
-                froxels,
-                dielectric_depth: lighting.dielectric_depth,
-                camera_medium: lighting.camera_medium.map_or(NO_MATERIAL, |m| m.0),
-                dielectric_flags: flags,
-                ..path
-            },
-        );
+        let root = PathRoot {
+            light_flags: 0,
+            dof_background: StorageImageIndex::NONE,
+            layers: view.layers.gpu(),
+            froxels,
+            dielectric_depth: lighting.dielectric_depth,
+            camera_medium: lighting.camera_medium.map_or(NO_MATERIAL, |m| m.0),
+            dielectric_flags: flags,
+            ..path
+        };
         let mut tile_flags = 0;
         if lighting.camera_medium.is_some() {
             tile_flags |= LAYER_TILES_EVERYWHERE;
@@ -1138,7 +1125,7 @@ impl LightingKernels {
             Hazards::DRAW_ARGUMENTS,
         );
         self.dielectric
-            .record_indirect(list, root, args.offset(4).cast(), args.offset(16).cast());
+            .record_indirect(list, &root, args.offset(4).cast(), args.offset(16).cast());
         list.end_pass();
     }
 

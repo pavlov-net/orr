@@ -83,6 +83,12 @@ fn every_lint_has_a_failing_fixture() {
              [shader(\"compute\")] [numthreads(1, 1, 1)] void main() { root.out[0] = root.v.x + root.n; }\n"
                 .into(),
         ),
+        (
+            Lint::InlineRoot,
+            "struct Root { float* out; uint n; uint pad; }\n[[vk::binding(0, 0)]] ConstantBuffer<Root> root;\n\
+             [shader(\"raygeneration\")] void main() { root.out[0] = float(root.n); }\n"
+                .into(),
+        ),
         (Lint::ImplicitPadding, rec_root("uint a; uint64_t b;")),
         (Lint::Bool, rec_root("uint a; bool b;")),
         (
@@ -233,6 +239,18 @@ fn spirv_validation_runs_in_process() {
     }
 }
 
+/// A root held in the push data is reflected like a bound one.
+#[test]
+fn an_inline_root_generates_its_rust_type() {
+    let src = "struct Root { float4* out; uint count; uint pad; }\n\
+        #include \"orr/root.h\"\nORR_ROOT_INLINE(Root);\n\
+        [shader(\"compute\")] [numthreads(1, 1, 1)] void main() { root.out[root.count] = float4(0.0); }\n";
+    let dir = fixture("inline-root", &[("src/k.slang", src)]);
+    build(&dir).compile().unwrap_or_else(|e| panic!("{e}"));
+    let rust = fs::read_to_string(dir.join("out/orr_shaders.rs")).unwrap();
+    assert!(rust.contains("pub struct Root"), "{rust}");
+}
+
 #[test]
 fn metal_check_compares_layouts_and_finds_invalid_msl() {
     // Gap-free under C layout, but Metal puts `v` at its native alignment, 16.
@@ -306,7 +324,7 @@ fn omm_builds_declare_the_mode_on_every_ray_query_entry() {
     let src = |compute_mode: &str| {
         format!(
             "#include \"orr/root.h\"\nimport orr.abi;\nimport orr.trace;\n\
-            struct Root {{ uint* out; Tlas scene; }}\nORR_ROOT(Root);\n\
+            struct Root {{ uint* out; Tlas scene; }}\nORR_ROOT_INLINE(Root);\n\
             void body(uint2 i) {{\n\
             RayDesc r; r.Origin = float3(i, 0); r.Direction = float3(0, 0, 1); r.TMin = 0; r.TMax = 1;\n\
             Hit h = trace_closest(root.scene, r, MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, AcceptAll());\n\

@@ -71,6 +71,8 @@ impl RecordBlock {
 /// Dropping it destroys it once everything submitted before the drop has completed.
 pub struct RayDispatchPipeline {
     pub(crate) raw: vk::Pipeline,
+    /// The size of the root the kernel holds in the push data.
+    pub(crate) inline_root: u32,
     /// The raygen region of the shader table: this pipeline's record.
     pub(crate) raygen: vk::StridedDeviceAddressRegionKHR,
     slot: u32,
@@ -88,8 +90,10 @@ impl Drop for RayDispatchPipeline {
 impl Device {
     /// Creates a ray-dispatch pipeline from a raygen entry point: one raygen stage, a
     /// raygen-only shader table (no miss, hit or callable records), recursion depth 0 and
-    /// the root mapped as for compute. The entry traces with ray query; it cannot call
-    /// `TraceRay` or reorder a hit object. Fails unless `Caps::ray_dispatch`.
+    /// the root held in the push data: the kernel declares `ORR_ROOT_INLINE`, since on the NVIDIA
+    /// drivers measured a ray-dispatch pipeline with a mapped root never hits a pipeline cache.
+    /// The entry traces with ray query; it cannot call `TraceRay` or reorder a hit object. Fails
+    /// unless `Caps::ray_dispatch`.
     pub fn create_ray_dispatch_pipeline(
         &self,
         s: &ShaderStage<'_>,
@@ -105,6 +109,11 @@ impl Device {
             });
         };
         let parts = StageParts::new(shared, s, Stage::RayGen, name)?;
+        if s.inline_root == 0 {
+            return Err(Error::Shader(format!(
+                "{name}: a ray-dispatch kernel declares its root with ORR_ROOT_INLINE"
+            )));
+        }
         let groups = [vk::RayTracingShaderGroupCreateInfoKHR::default()
             .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
             .general_shader(0)
@@ -163,6 +172,7 @@ impl Device {
             );
         }
         Ok(RayDispatchPipeline {
+            inline_root: s.inline_root,
             raw,
             raygen: vk::StridedDeviceAddressRegionKHR {
                 device_address: records.raw.address + offset,

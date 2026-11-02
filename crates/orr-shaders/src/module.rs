@@ -11,6 +11,9 @@ pub struct ShaderModule {
     /// Built with opacity micromaps: its entry points declare the micromap execution mode,
     /// so its pipelines need a device with micromaps.
     pub omm: bool,
+    /// The size of the root the kernel holds in the push data (`ORR_ROOT_INLINE`); 0 for a root
+    /// in GPU memory (`ORR_ROOT`).
+    pub inline_root: u32,
     /// The absolute path of `spirv`'s separated debug info (`<name>.dbg.spv`); empty when the
     /// debug info is embedded or off.
     pub debug_info: &'static str,

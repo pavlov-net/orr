@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use super::layout::Plan;
 use super::model::{Model, Scalar, Ty};
+use crate::Stage;
+use crate::abi::MAX_INLINE_ROOT_BYTES;
 
 /// A rule the build checks on every module. [`Build::allow`](super::Build::allow) turns
 /// one off.
@@ -40,6 +42,10 @@ pub enum Lint {
     /// A struct is generated only by the crate whose shader root declares it; others map
     /// it with [`Build::extern_type`](super::Build::extern_type).
     Ownership,
+    /// A kernel with a raygen entry declares its root with `ORR_ROOT_INLINE`, whose kernels have
+    /// only compute and raygen entries and a root of at most
+    /// [`MAX_INLINE_ROOT_BYTES`](crate::abi::MAX_INLINE_ROOT_BYTES).
+    InlineRoot,
     /// In builds with micromaps ([`Build::omm`](super::Build::omm)), every entry point of a
     /// module that traces rays declares the opacity-micromap execution mode with
     /// `ORR_OMM(entry)` from `orr/root.h`.
@@ -240,9 +246,36 @@ pub(crate) fn model_lints(
             format!("{place}; `root` is the only parameter"),
         );
     }
+    if model.inline_root {
+        for e in &model.entries {
+            if !matches!(e.stage, Stage::Compute | Stage::RayGen) {
+                push(
+                    Lint::InlineRoot,
+                    format!(
+                        "entry point {} is a {:?} entry, which cannot use ORR_ROOT_INLINE",
+                        e.name, e.stage
+                    ),
+                );
+            }
+        }
+    } else if let Some(e) = model.entries.iter().find(|e| e.stage == Stage::RayGen) {
+        push(
+            Lint::InlineRoot,
+            format!(
+                "raygen entry point {}: a ray-dispatch kernel declares its root with ORR_ROOT_INLINE",
+                e.name
+            ),
+        );
+    }
     if let Some(root) = &model.root {
         let def = &model.structs[root];
         let size = plans[root].size;
+        if model.inline_root && size as usize > MAX_INLINE_ROOT_BYTES {
+            push(
+                Lint::InlineRoot,
+                format!("inline root {root} is {size} bytes, over {MAX_INLINE_ROOT_BYTES}"),
+            );
+        }
         if !size.is_multiple_of(16) {
             push(
                 Lint::RootLayout,

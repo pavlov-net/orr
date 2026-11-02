@@ -14,8 +14,8 @@ use super::queue::{ListResources, MAX_PASSES, Queue};
 use super::ray::RayDispatchPipeline;
 use super::texture::{Texture, indirect_copy_format, vk_extent, vk_offset};
 use crate::{
-    Caps, ClearColor, ColorLoad, DepthLoad, Error, GpuAddress, GpuPtr, Hazards, Stages,
-    TextureLayers, TextureRegion, TextureUsage,
+    Caps, ClearColor, ColorLoad, DepthLoad, Error, GpuAddress, GpuPtr, Hazards,
+    MAX_INLINE_ROOT_BYTES, Stages, TextureLayers, TextureRegion, TextureUsage,
 };
 
 /// What device address commands are told about every `gpu_malloc` and sparse range: their
@@ -346,6 +346,33 @@ impl<'q> CommandList<'q> {
     }
 
     pub(crate) fn bind(&mut self, point: vk::PipelineBindPoint, pipeline: vk::Pipeline, root: u64) {
+        self.bind_data(point, pipeline, &root.to_le_bytes());
+    }
+
+    /// Binds `pipeline` and pushes `root`, which must be the size `inline_root` of the kernel's
+    /// root.
+    fn bind_inline<R: Pod>(
+        &mut self,
+        point: vk::PipelineBindPoint,
+        pipeline: vk::Pipeline,
+        inline_root: u32,
+        root: &R,
+    ) {
+        assert_eq!(
+            size_of::<R>(),
+            inline_root as usize,
+            "the root pushed is not the size of the kernel's inline root"
+        );
+        const {
+            assert!(
+                size_of::<R>() <= MAX_INLINE_ROOT_BYTES,
+                "an inline root is larger than the push data every run can use"
+            );
+        };
+        self.bind_data(point, pipeline, bytemuck::bytes_of(root));
+    }
+
+    fn bind_data(&mut self, point: vk::PipelineBindPoint, pipeline: vk::Pipeline, data: &[u8]) {
         let cmd = self.cmd();
         if self.rebind_heaps {
             self.queue
@@ -359,10 +386,9 @@ impl<'q> CommandList<'q> {
             unsafe { self.device().cmd_bind_pipeline(cmd, point, pipeline) };
             self.bound = pipeline;
         }
-        let data = root.to_le_bytes();
         let push = vk::PushDataInfoEXT {
             offset: 0,
-            data: vk::HostAddressRangeConstEXT::default().address(&data),
+            data: vk::HostAddressRangeConstEXT::default().address(data),
             ..Default::default()
         };
         // SAFETY: recording; heaps are bound.
@@ -371,7 +397,22 @@ impl<'q> CommandList<'q> {
 
     /// Runs `p` over `groups` workgroups with `root` as its root pointer.
     pub fn dispatch<R>(&mut self, p: &ComputePipeline, root: GpuPtr<R>, groups: [u32; 3]) {
+        assert_eq!(
+            p.inline_root, 0,
+            "dispatch_inline runs ORR_ROOT_INLINE kernels"
+        );
         self.bind(vk::PipelineBindPoint::COMPUTE, p.raw, root.address().0);
+        self.dispatch_bound(groups);
+    }
+
+    /// As [`Self::dispatch`], for a kernel declared with `ORR_ROOT_INLINE`: `root` is pushed with
+    /// the dispatch.
+    pub fn dispatch_inline<R: Pod>(&mut self, p: &ComputePipeline, root: &R, groups: [u32; 3]) {
+        self.bind_inline(vk::PipelineBindPoint::COMPUTE, p.raw, p.inline_root, root);
+        self.dispatch_bound(groups);
+    }
+
+    fn dispatch_bound(&mut self, groups: [u32; 3]) {
         // SAFETY: recording with a compute pipeline bound.
         unsafe {
             self.device()
@@ -379,12 +420,13 @@ impl<'q> CommandList<'q> {
         };
     }
 
-    /// Runs `p`'s raygen entry once per element of `extent` with `root` as its root pointer.
-    pub fn dispatch_rays<R>(&mut self, p: &RayDispatchPipeline, root: GpuPtr<R>, extent: [u32; 3]) {
-        self.bind(
+    /// Runs `p`'s raygen entry once per element of `extent`, with `root` pushed with the dispatch.
+    pub fn dispatch_rays<R: Pod>(&mut self, p: &RayDispatchPipeline, root: &R, extent: [u32; 3]) {
+        self.bind_inline(
             vk::PipelineBindPoint::RAY_TRACING_KHR,
             p.raw,
-            root.address().0,
+            p.inline_root,
+            root,
         );
         let rt = self
             .queue
@@ -411,16 +453,17 @@ impl<'q> CommandList<'q> {
 
     /// Runs `p`'s raygen entry once per element of the extent `args` holds on the GPU
     /// (width, height, depth).
-    pub fn dispatch_rays_indirect<R>(
+    pub fn dispatch_rays_indirect<R: Pod>(
         &mut self,
         p: &RayDispatchPipeline,
-        root: GpuPtr<R>,
+        root: &R,
         args: GpuPtr<DispatchArgs>,
     ) {
-        self.bind(
+        self.bind_inline(
             vk::PipelineBindPoint::RAY_TRACING_KHR,
             p.raw,
-            root.address().0,
+            p.inline_root,
+            root,
         );
         let rt = self
             .queue
@@ -642,7 +685,26 @@ impl<'q> CommandList<'q> {
         root: GpuPtr<R>,
         args: GpuPtr<DispatchArgs>,
     ) {
+        assert_eq!(
+            p.inline_root, 0,
+            "dispatch_indirect_inline runs ORR_ROOT_INLINE kernels"
+        );
         self.bind(vk::PipelineBindPoint::COMPUTE, p.raw, root.address().0);
+        self.dispatch_indirect_bound(args);
+    }
+
+    /// As [`Self::dispatch_indirect`], for a kernel declared with `ORR_ROOT_INLINE`.
+    pub fn dispatch_indirect_inline<R: Pod>(
+        &mut self,
+        p: &ComputePipeline,
+        root: &R,
+        args: GpuPtr<DispatchArgs>,
+    ) {
+        self.bind_inline(vk::PipelineBindPoint::COMPUTE, p.raw, p.inline_root, root);
+        self.dispatch_indirect_bound(args);
+    }
+
+    fn dispatch_indirect_bound(&mut self, args: GpuPtr<DispatchArgs>) {
         let shared = &self.queue.shared;
         let bytes = size_of::<DispatchArgs>() as u64;
         if let Some(dac) = &shared.dac_fn {

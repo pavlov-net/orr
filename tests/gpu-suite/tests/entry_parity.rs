@@ -224,7 +224,7 @@ fn sky_hash() -> u32 {
 struct Run {
     rad: Allocation<[f32; 4]>,
     hash: Allocation<u32>,
-    root: Allocation<paths::Root>,
+    root: paths::Root,
 }
 
 impl Run {
@@ -236,24 +236,21 @@ impl Run {
         let sun = Vec3::new(0.4, 0.8, 0.3).normalize();
         let rad = readback::<[f32; 4]>(pixels, "parity radiance");
         let hash = readback::<u32>(pixels, "parity hashes");
-        let root = upload(
-            &[paths::Root {
-                cam_pos: [0.0, 2.5, -45.0, 30.0f32.to_radians().tan()],
-                cam_fwd: [fwd.x, fwd.y, fwd.z, WIDTH as f32 / HEIGHT as f32],
-                cam_right: [right.x, right.y, right.z, 0.0],
-                cam_up: [up.x, up.y, up.z, 0.0],
-                sun: [sun.x, sun.y, sun.z, 3.0],
-                out_rad: rad.gpu(),
-                out_hash: hash.gpu(),
-                transforms: scene.transforms.gpu(),
-                scene: scene.tlas.tlas(),
-                width: WIDTH,
-                height: HEIGHT,
-                frame: 3,
-                bounces,
-            }],
-            "parity root",
-        );
+        let root = paths::Root {
+            cam_pos: [0.0, 2.5, -45.0, 30.0f32.to_radians().tan()],
+            cam_fwd: [fwd.x, fwd.y, fwd.z, WIDTH as f32 / HEIGHT as f32],
+            cam_right: [right.x, right.y, right.z, 0.0],
+            cam_up: [up.x, up.y, up.z, 0.0],
+            sun: [sun.x, sun.y, sun.z, 3.0],
+            out_rad: rad.gpu(),
+            out_hash: hash.gpu(),
+            transforms: scene.transforms.gpu(),
+            scene: scene.tlas.tlas(),
+            width: WIDTH,
+            height: HEIGHT,
+            frame: 3,
+            bounces,
+        };
         Run { rad, hash, root }
     }
 }
@@ -330,8 +327,8 @@ fn raygen_and_compute_entries_trace_the_same_paths() {
     let [gx, gy, _] = compute.workgroup();
     let mut list = render().command_list().unwrap();
     for (c, r) in &runs {
-        list.dispatch(&compute, c.root.gpu(), [WIDTH / gx, HEIGHT / gy, 1]);
-        list.dispatch_rays(&rays, r.root.gpu(), [WIDTH, HEIGHT, 1]);
+        list.dispatch_inline(&compute, &c.root, [WIDTH / gx, HEIGHT / gy, 1]);
+        list.dispatch_rays(&rays, &r.root, [WIDTH, HEIGHT, 1]);
     }
     list.barrier(
         Stages::COMPUTE | Stages::RAY,

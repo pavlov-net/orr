@@ -821,35 +821,19 @@ impl Builder {
         mode: u32,
     ) -> Allocation<u32> {
         let out = readback::<u32>(u64::from(W * H) * REC as u64, "rays");
-        let root = self.trace_root(tlas, mode, out.gpu());
+        let root = trace_root(tlas, mode, out.gpu());
         let list = self.list.as_mut().unwrap();
         list.barrier(Stages::ALL, Stages::RAY, Hazards::ACCEL_STRUCT);
-        list.dispatch_rays(p, root, [W, H, 1]);
+        list.dispatch_rays(p, &root, [W, H, 1]);
         list.barrier(Stages::RAY, Stages::HOST, Hazards::empty());
         out
     }
 
-    fn trace_root(
-        &mut self,
-        tlas: Tlas,
-        mode: u32,
-        out: GpuPtr<u32>,
-    ) -> GpuPtr<cluster_trace::Root> {
-        self.upload(&[cluster_trace::Root {
-            out,
-            scene: tlas,
-            width: W,
-            height: H,
-            mode,
-            pad: 0,
-        }])
-    }
-
     pub fn trace_into(&mut self, tlas: Tlas, mode: u32, out: GpuPtr<u32>) {
-        let root = self.trace_root(tlas, mode, out);
+        let root = trace_root(tlas, mode, out);
         let list = self.list.as_mut().unwrap();
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::ACCEL_STRUCT);
-        list.dispatch(&self.trace, root, [W / 8, H / 8, 1]);
+        list.dispatch_inline(&self.trace, &root, [W / 8, H / 8, 1]);
         list.barrier(
             Stages::COMPUTE,
             Stages::HOST | Stages::AS_BUILD,
@@ -1123,5 +1107,16 @@ pub fn move_desc(n: u32, max_bytes: u64) -> RtasOpDesc {
             kind: MoveKind::Clas,
             no_overlap: true,
         }),
+    }
+}
+
+fn trace_root(tlas: Tlas, mode: u32, out: GpuPtr<u32>) -> cluster_trace::Root {
+    cluster_trace::Root {
+        out,
+        scene: tlas,
+        width: W,
+        height: H,
+        mode,
+        pad: 0,
     }
 }

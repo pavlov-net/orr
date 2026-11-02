@@ -10,7 +10,7 @@ import path;
 extern struct Surface : ISurface = StandardSurface;
 extern struct Medium : IMedium = NoMedium;
 
-ORR_ROOT(PathRoot);
+ORR_ROOT_INLINE(PathRoot);
 
 [shader("raygeneration")]
 void raygen_main()

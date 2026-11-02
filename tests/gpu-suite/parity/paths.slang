@@ -30,7 +30,7 @@ struct Root
     uint frame;
     uint bounces;
 }
-ORR_ROOT(Root);
+ORR_ROOT_INLINE(Root);
 
 // Leaf quads are two triangles; the leaf is an ellipse inside the quad.
 struct LeafAlpha : IAnyHit

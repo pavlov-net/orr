@@ -21,6 +21,8 @@ pub struct ShaderStage<'a> {
     pub spirv: &'a [u32],
     /// `spirv` declares the opacity-micromap execution mode, which needs `Caps::omm`.
     pub omm: bool,
+    /// The size of the root the kernel holds in the push data; 0 for a root in GPU memory.
+    pub inline_root: u32,
     /// The path of `spirv`'s separated debug info, handed to Aftermath; empty for none.
     pub debug_info: &'a str,
     pub entry: &'a EntryPoint,
@@ -36,6 +38,7 @@ impl<'a> ShaderStage<'a> {
         Ok(Self {
             spirv: module.spirv,
             omm: module.omm,
+            inline_root: module.inline_root,
             debug_info: module.debug_info,
             entry,
             spec,
@@ -63,6 +66,8 @@ fn root_mapping() -> vk::DescriptorSetAndBindingMappingEXT<'static> {
 /// has completed.
 pub struct ComputePipeline {
     pub(crate) raw: vk::Pipeline,
+    /// The size of the root the kernel holds in the push data; 0 for a root in GPU memory.
+    pub(crate) inline_root: u32,
     workgroup: [u32; 3],
     shared: Arc<Shared>,
 }
@@ -133,6 +138,8 @@ pub(super) struct StageParts<'a> {
     code: Cow<'a, [u32]>,
     entry: &'a CStr,
     mappings: [vk::DescriptorSetAndBindingMappingEXT<'static>; 1],
+    /// The root is in the push data, so the stage carries no mapping.
+    inline_root: bool,
     map_entries: Vec<vk::SpecializationMapEntry>,
     spec: &'a [u8],
 }
@@ -141,6 +148,7 @@ pub(super) struct StageParts<'a> {
 pub(super) struct StageChain<'p> {
     module: vk::ShaderModuleCreateInfo<'p>,
     mapping: vk::ShaderDescriptorSetAndBindingMappingInfoEXT<'p>,
+    inline_root: bool,
     spec: vk::SpecializationInfo<'p>,
     entry: &'p CStr,
 }
@@ -190,6 +198,7 @@ impl<'a> StageParts<'a> {
             }
         }
         Ok(Self {
+            inline_root: s.inline_root > 0,
             code,
             entry: s.entry.name,
             mappings: [root_mapping()],
@@ -224,6 +233,7 @@ impl<'a> StageParts<'a> {
                 .map_entries(&self.map_entries)
                 .data(self.spec),
             entry: self.entry,
+            inline_root: self.inline_root,
         }
     }
 }
@@ -241,7 +251,12 @@ impl StageChain<'_> {
         } else {
             info.specialization_info(&self.spec)
         };
-        info.push(&mut self.module).push(&mut self.mapping)
+        let info = info.push(&mut self.module);
+        if self.inline_root {
+            info
+        } else {
+            info.push(&mut self.mapping)
+        }
     }
 }
 
@@ -302,6 +317,7 @@ impl Device {
             raw: self
                 .shared
                 .create_compute(s, vk::PipelineCreateFlags2::empty(), name)?,
+            inline_root: s.inline_root,
             workgroup: s.entry.workgroup,
             shared: Arc::clone(&self.shared),
         })

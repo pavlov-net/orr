@@ -102,6 +102,10 @@ image_slot!(
     StorageImageIndex
 );
 
+/// The largest root a kernel can hold in the push data (`ORR_ROOT_INLINE`): the 256 bytes every
+/// device with descriptor heaps offers, less the last 8, which GPU-assisted validation uses.
+pub const MAX_INLINE_ROOT_BYTES: usize = 248;
+
 /// A sampler's slot in the sampler heap.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Pod, Zeroable)]
