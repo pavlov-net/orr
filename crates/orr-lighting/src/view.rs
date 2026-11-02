@@ -823,10 +823,11 @@ impl LightingKernels {
     /// view's raster half and [`LightingView::begin`]: picks the shadowed directional lights,
     /// writes the linked medium into the froxels, the light reaching those in front of the
     /// view's surfaces (blended with their reprojected history) and each column's in-scatter
-    /// and transmittance. The outputs are visible to later compute and ray stages. Makes the
-    /// view's froxel targets at its first call and when the extent or the media settings
-    /// that shape them change; a history reset, a new `near_range` and new targets restart
-    /// the froxel history.
+    /// and transmittance, then the aerial-perspective LUT from `near_range` to
+    /// [`MediaSettings::ap_range`]. The outputs are visible to later compute and ray stages.
+    /// Makes the view's froxel targets at its first call and when the extent or the media
+    /// settings that shape them change; a history reset, a new `near_range` and new targets
+    /// restart the froxel history.
     pub fn record_media(
         &self,
         list: &mut CommandList<'_>,
@@ -840,10 +841,12 @@ impl LightingKernels {
 
     /// Records media apply into `view`'s radiance after [`Self::record_media`] and the paths
     /// that wrote the radiance: each pixel's radiance x the transmittance over its camera
-    /// segment, plus the in-scatter over it, to its surface or the scene's `near_range`,
-    /// whichever is nearer (sky pixels take the whole range). The reference marches the
-    /// segment per pixel instead. Also writes the frame's [`LightingView::particle_lighting`]
-    /// for the transparency hook after it. Orders nothing after it.
+    /// segment to its surface, plus the in-scatter over it, from the froxels to the scene's
+    /// `near_range`, the aerial-perspective LUT to [`MediaSettings::ap_range`] and a march
+    /// past it. Sky pixels take the froxels' whole range; the environment carries the medium
+    /// beyond. The reference marches the segment per pixel instead. Also writes the frame's
+    /// [`LightingView::particle_lighting`] for the transparency hook after it. Orders nothing
+    /// after it.
     pub fn record_media_apply(
         &self,
         list: &mut CommandList<'_>,

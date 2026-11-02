@@ -2,9 +2,10 @@
 // froxel volume a particle takes the froxels' isotropic incident light and the visibility of
 // their shadowed directional lights; beyond it, the world cache's light on two opposed faces,
 // one shadow ray from its point toward each shadowed light and the other directional lights
-// unshadowed. Its fog is the froxels' in-scatter and transmittance from the eye, so a particle
-// writes a x (C x T + S) into the overlay, which composites over radiance that media apply
-// already fogged.
+// unshadowed. Its fog is the in-scatter and transmittance from the eye, the froxels' to the
+// scene's `near_range` and the aerial-perspective LUT's past it, so a particle writes
+// a x (C x T + S) into the overlay, which composites over radiance that media apply already
+// fogged.
 module particle_lighting;
 
 import orr.abi;
@@ -43,6 +44,10 @@ public struct ParticleLighting
     public uint slices;
     public uint frame;
     public uint seed;
+    public TextureIndex aerial;         // the aerial-perspective LUT
+    public TextureIndex aerial_rgb;     // its rgb transmittance; NONE for its luminance
+    public float ap_range;              // m, the LUT's far end
+    public uint _pad0;
 }
 
 // Radiance a particle of unit albedo at render-space `x` scatters toward the eye along unit
@@ -109,14 +114,33 @@ public float3 particle_light<S : ISurface, M : IMedium>(ParticleLighting* l, flo
     return light;
 }
 
-// The in-scatter (pre-exposed) and transmittance from the eye to distance `t` along the ray
-// through image point `p`, in render pixels: the froxels' up to the scene's `near_range`.
-public float3 particle_fog(ParticleLighting* l, float2 p, float t, out float3 transmittance)
+// The in-scatter (pre-exposed) and transmittance from the eye to render-space `x` along the
+// ray through image point `p`, in render pixels: the froxels' to the scene's `near_range`,
+// the aerial-perspective LUT's to `ap_range` and the linked medium `M`'s transmittance past
+// it.
+public float3 particle_fog<M : IMedium>(ParticleLighting* l, float2 p, float3 x, out float3 transmittance)
 {
     transmittance = float3(1.0);
     if (l.integrated.index == IMAGE_NONE)
         return float3(0.0);
-    return integrated_fog(l.integrated, l.integrated_rgb, l.sampler, uint3(l.columns, l.rows, l.slices), l.view.extent, l.scene.near_range, p, t, transmittance);
+    ViewConstants* v = l.view;
+    float near_range = l.scene.near_range;
+    float3 eye = v.eye_render.xyz;
+    float t = length(x - eye);
+    float3 fog = integrated_fog(l.integrated, l.integrated_rgb, l.sampler, uint3(l.columns, l.rows, l.slices), v.extent, near_range, p, t, transmittance);
+    if (!(t > near_range))
+        return fog;
+    float ap_range = max(l.ap_range, near_range);
+    float3 far = float3(1.0);
+    if (ap_range > near_range)
+        fog += transmittance * aerial_fog(l.aerial, l.aerial_rgb, l.sampler, v.extent, near_range, ap_range, p, t, far);
+    if (t > ap_range)
+    {
+        float3 dir = (x - eye) / t;
+        far *= medium_transmittance<M>(l.scene.medium, eye + dir * ap_range, dir, t - ap_range);
+    }
+    transmittance *= far;
+    return fog;
 }
 
 // The overlay value, premultiplied and pre-exposed, of a particle fragment at image point `p`
@@ -139,7 +163,7 @@ public float4 particle_shade<S : ISurface, M : IMedium>(ParticleLighting* l, flo
     float3 transmittance = float3(1.0);
     float3 fog = float3(0.0);
     if (!(end < 0.0))
-        fog = particle_fog(l, p, t, transmittance);
+        fog = particle_fog<M>(l, p, x, transmittance);
     Sampler rng = Sampler(uint2(p), l.frame, l.seed ^ PARTICLE_STREAM);
     float3 c = albedo * particle_light<S, M>(l, x, to_eye, anisotropy, rng) + emission;
     float a = saturate(opacity);

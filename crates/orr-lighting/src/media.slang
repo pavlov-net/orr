@@ -1,6 +1,6 @@
 // Participating media: the medium link point, the stock height-fog functions implementations
-// call, the transmittance every lighting segment uses, and the froxel volume's layout and
-// material encoding.
+// call, the transmittance every lighting segment uses, the froxel volume's layout and
+// material encoding, and the aerial-perspective LUT's layout.
 module media;
 
 import orr.abi;
@@ -219,6 +219,26 @@ public float froxel_distance(float c, uint slices, float near_range)
 public float froxel_slice(float t, uint slices, float near_range)
 {
     return float(slices) * sqrt(saturate(t / near_range));
+}
+
+// The aerial-perspective LUT: AERIAL_SIZE x AERIAL_SIZE columns along unjittered rays spread
+// evenly from one image edge to the other, as the froxels' are, each cut into AERIAL_SIZE
+// shells of distance from the eye between the scene's `near_range` and the view's
+// `ap_range`, squared toward the far end: slice coordinate c in [0, AERIAL_SIZE] lies at
+// near_range + (ap_range - near_range) (c / AERIAL_SIZE)^2.
+public static const uint AERIAL_SIZE = 32;
+
+// Distance from the eye of aerial slice coordinate `c`.
+public float aerial_distance(float c, float near_range, float ap_range)
+{
+    float u = c / float(AERIAL_SIZE);
+    return near_range + (ap_range - near_range) * u * u;
+}
+
+// Aerial slice coordinate of distance `t`, clamped to the LUT.
+public float aerial_slice(float t, float near_range, float ap_range)
+{
+    return float(AERIAL_SIZE) * sqrt(saturate((t - near_range) / (ap_range - near_range)));
 }
 
 // A froxel's medium: `sigma` (RGBA16F) holds sigma_s rgb and the luminance of sigma_t, both
