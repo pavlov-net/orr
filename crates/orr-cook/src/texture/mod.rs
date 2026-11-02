@@ -311,8 +311,8 @@ pub(crate) fn skipped_mips(w: u32, h: u32, max_size: Option<u32>) -> u32 {
 }
 
 /// The mip chains of `layers` (mip 0 each, values linear) as they are encoded: filtered,
-/// with Toksvig roughness, without the mips over `max_size`.
-pub(crate) fn chains(layers: Vec<Img>, plan: &Plan) -> Result<Vec<Vec<Img>>, String> {
+/// without the mips over `max_size`, with Toksvig roughness from kept mip `first` on.
+pub(crate) fn chains(layers: Vec<Img>, plan: &Plan, first: usize) -> Result<Vec<Vec<Img>>, String> {
     let (w, h) = (layers[0].w, layers[0].h);
     if layers.iter().any(|l| (l.w, l.h) != (w, h)) {
         return Err("layers differ in size".into());
@@ -321,12 +321,12 @@ pub(crate) fn chains(layers: Vec<Img>, plan: &Plan) -> Result<Vec<Vec<Img>>, Str
         .into_iter()
         .map(|l| mips::chain(l, &plan.mips))
         .collect();
+    let skip = skipped_mips(w, h, plan.max_size) as usize;
     if let Some(t) = &plan.toksvig {
         for c in &mut chains {
-            t.apply(c, &plan.mips)?;
+            t.apply(c, &plan.mips, skip + first)?;
         }
     }
-    let skip = skipped_mips(w, h, plan.max_size) as usize;
     for c in &mut chains {
         c.drain(..skip);
     }
@@ -335,7 +335,7 @@ pub(crate) fn chains(layers: Vec<Img>, plan: &Plan) -> Result<Vec<Vec<Img>>, Str
 
 /// Mip chains, encoding and layout for `layers` (mip 0 each, values linear).
 pub(crate) fn build(layers: Vec<Img>, plan: &Plan) -> Result<Built, String> {
-    let mut chains = chains(layers, plan)?;
+    let mut chains = chains(layers, plan, 0)?;
     if plan.mips.normal {
         for p in chains.iter_mut().flatten().flat_map(|m| &mut m.px) {
             p[0] = normal::encode(p[0]);
