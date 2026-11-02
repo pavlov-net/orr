@@ -9,12 +9,21 @@ use std::time::{Duration, Instant};
 use gpu_suite::shaders::swapchain_fill;
 use gpu_suite::window::Window;
 use gpu_suite::{assert_clean, device, fill_frame, pipeline};
+use orr_color::{Chromaticity, RgbPrimaries};
 use orr_gpu::{HdrMetadata, OutputFormat, PresentMode, QueueKind, Swapchain, SwapchainDesc};
+
+const fn chromaticity(c: Chromaticity) -> [f32; 2] {
+    [c.x as f32, c.y as f32]
+}
 
 /// Rec.2020 primaries, D65 white, a 1000-nit peak.
 const METADATA: HdrMetadata = HdrMetadata {
-    primaries: [[0.708, 0.292], [0.170, 0.797], [0.131, 0.046]],
-    white: [0.3127, 0.3290],
+    primaries: [
+        chromaticity(RgbPrimaries::REC2020.red),
+        chromaticity(RgbPrimaries::REC2020.green),
+        chromaticity(RgbPrimaries::REC2020.blue),
+    ],
+    white: chromaticity(RgbPrimaries::REC2020.white),
     max_luminance: 1000.0,
     min_luminance: 0.005,
     max_cll: 1000.0,

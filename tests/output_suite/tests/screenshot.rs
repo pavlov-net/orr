@@ -2,15 +2,14 @@
 //! pre-exposure, display captures hold the tonemapped image, and every capture carries the
 //! id of the frame it holds.
 
+use orr_color::RgbPrimaries;
+use orr_math::DVec3;
 use orr_output::{DisplayRequest, OutputFormat, Primaries, ScreenshotRequest, ViewOutput};
 use orr_scene::testing::assert_clean;
 use output_suite::{Harness, natural_image};
 
-const REC2020_Y: [f64; 3] = [0.262_700_2, 0.677_998_1, 0.059_301_7];
-const REC709_Y: [f64; 3] = [0.212_639, 0.715_168_7, 0.072_192_3];
-
-fn luminance(p: &[f32], y: [f64; 3]) -> f64 {
-    (0..3).map(|c| y[c] * f64::from(p[c])).sum()
+fn luminance(p: &[f32], weights: DVec3) -> f64 {
+    weights.dot(DVec3::new(p[0].into(), p[1].into(), p[2].into()))
 }
 
 #[test]
@@ -57,9 +56,12 @@ fn captures_carry_their_frames() {
         };
         assert!(shot.scene_referred);
         let (primaries, y) = if rec709 {
-            (Primaries::Rec709, REC709_Y)
+            (Primaries::Rec709, RgbPrimaries::REC709.luminance_weights())
         } else {
-            (Primaries::Rec2020, REC2020_Y)
+            (
+                Primaries::Rec2020,
+                RgbPrimaries::REC2020.luminance_weights(),
+            )
         };
         assert_eq!(shot.primaries, primaries);
         for (i, p) in shot.rgba.chunks_exact(4).enumerate() {

@@ -1,5 +1,6 @@
 //! Auto and manual exposure on the GPU against CPU models of the meter and adapt.
 
+use orr_color::Chromaticity;
 use orr_output::{
     AutoExposure, CalibrationPattern, DisplayRequest, Exposure, ExposureTelemetry, Grade, MID_GRAY,
     MeterWeights, OutputDebug, OutputFormat, Physiological, ViewOutput, ev100_from_exposure,
@@ -138,7 +139,7 @@ fn gray_sky(dome_ev100: f32, card_ev100: f32) -> SkyStats {
     let illuminance = luminance_from_ev100(card_ev100) * std::f32::consts::PI / MID_GRAY;
     SkyStats {
         dome_luminance: luminance_from_ev100(dome_ev100),
-        dome_xy: [0.3127, 0.3290],
+        dome_xy: [Chromaticity::D65.x as f32, Chromaticity::D65.y as f32],
         _pad: 0.0,
         directional: [illuminance, illuminance, illuminance, 0.0],
     }

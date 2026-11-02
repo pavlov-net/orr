@@ -14,6 +14,7 @@ orr_shaders.workspace = true
 bytemuck.workspace = true
 
 [build-dependencies]
+orr_color.workspace = true
 orr_shaders = { workspace = true, features = ["build"] }
 
 [lints]

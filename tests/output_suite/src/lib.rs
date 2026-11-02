@@ -1,7 +1,11 @@
 //! Headless GPU tests of orr_output; the tests live in `tests/`. [`Harness`] drives one view
 //! frame by frame as a renderer would, with a synthetic image in place of lighting.
 
+use std::sync::LazyLock;
+
 use half::f16;
+use orr_color::{Chromaticity, RgbPrimaries};
+use orr_math::{DMat3, DVec3};
 use orr_output::{
     CapturePass, ComposeSource, DisplayRequest, ExposurePass, ExposureTelemetry, GlareComposite,
     GlareMethod, GlarePass, OutputFormat, OutputKernels, OutputView, ResolvedDisplay,
@@ -394,40 +398,21 @@ pub fn keyed(metered_ev100: f64, stops: f64) -> f64 {
     -(1.2 * 0.18 * stops.exp2() / luminance).log2()
 }
 
-/// `orr.color`'s matrices, rows.
-pub const REC2020_TO_XYZ: [[f64; 3]; 3] = [
-    [0.636958048, 0.144616904, 0.168880975],
-    [0.262700212, 0.677998072, 0.0593017165],
-    [0.0, 0.028072693, 1.06098506],
-];
-pub const XYZ_TO_REC2020: [[f64; 3]; 3] = [
-    [1.71665119, -0.355670784, -0.253366281],
-    [-0.666684352, 1.61648124, 0.0157685458],
-    [0.0176398574, -0.0427706133, 0.942103121],
-];
-pub const REC709_TO_XYZ: [[f64; 3]; 3] = [
-    [0.412390799, 0.357584339, 0.180480788],
-    [0.212639006, 0.715168679, 0.0721923154],
-    [0.0193308187, 0.11919478, 0.950532152],
-];
-
-pub fn mul3(m: &[[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
-    m.map(|r| r[0] * v[0] + r[1] * v[1] + r[2] * v[2])
+/// The xy chromaticity of a CIE XYZ color.
+pub fn xy_from_xyz(xyz: DVec3) -> [f64; 2] {
+    let c = Chromaticity::from_xyz(xyz);
+    [c.x, c.y]
 }
 
-pub fn xy_from_xyz(c: [f64; 3]) -> [f64; 2] {
-    let s = c[0] + c[1] + c[2];
-    [c[0] / s, c[1] / s]
-}
-
-/// XYZ of chromaticity `xy` at luminance 1.
-fn xyz_from_xy(xy: [f64; 2]) -> [f64; 3] {
-    [xy[0] / xy[1], 1.0, (1.0 - xy[0] - xy[1]) / xy[1]]
+/// CIE XYZ of chromaticity `xy` at luminance 1.
+fn xyz_from_xy(xy: [f64; 2]) -> DVec3 {
+    Chromaticity::new(xy[0], xy[1]).to_xyz(1.0)
 }
 
 /// Linear Rec.2020 of chromaticity `xy` at luminance 1.
 pub fn rec2020_from_xy(xy: [f64; 2]) -> [f32; 3] {
-    mul3(&XYZ_TO_REC2020, xyz_from_xy(xy)).map(|c| c as f32)
+    static XYZ_TO_REC2020: LazyLock<DMat3> = LazyLock::new(|| RgbPrimaries::REC2020.xyz_to_rgb());
+    (*XYZ_TO_REC2020 * xyz_from_xy(xy)).as_vec3().to_array()
 }
 
 /// The CPU model of adapt's white point range: `xy` unchanged inside it, else rebuilt at the
@@ -455,12 +440,13 @@ pub fn white_target(
     virtual_light_nits: f64,
     sky: &SkyStats,
 ) -> [f64; 2] {
+    let to_xyz = RgbPrimaries::REC2020.rgb_to_xyz();
     let mut lit: Vec<(f64, [f64; 2])> = pixels
         .iter()
         .filter(|p| p.0 > 0.0)
         .map(|&(l, c)| {
-            let xyz = mul3(&REC2020_TO_XYZ, c.map(|c| f64::from(l) * f64::from(c)));
-            (xyz[1], xy_from_xyz(xyz))
+            let xyz = to_xyz * DVec3::from(c.map(|c| f64::from(l) * f64::from(c)));
+            (xyz.y, xy_from_xyz(xyz))
         })
         .collect();
     lit.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -498,12 +484,10 @@ pub fn white_target(
             sky.dome_xy.map(f64::from),
         );
     }
-    let e = mul3(
-        &REC2020_TO_XYZ,
-        [sky.directional[0], sky.directional[1], sky.directional[2]].map(f64::from),
-    );
-    if e[1] > 0.0 {
-        let card = 0.18 * e[1] / std::f64::consts::PI;
+    let e = to_xyz
+        * DVec3::from([sky.directional[0], sky.directional[1], sky.directional[2]].map(f64::from));
+    if e.y > 0.0 {
+        let card = 0.18 * e.y / std::f64::consts::PI;
         add(f64::from(weights.directional), card, xy_from_xyz(e));
     }
     white_in_range([sum[0] / sum[2], sum[1] / sum[2]])
@@ -511,27 +495,15 @@ pub fn white_target(
 
 /// The CPU model of `cat16_rec2020` in `orr.color`: the matrix on linear Rec.2020 that
 /// adapts white `from` to white `to`.
-pub fn cat16_rec2020(from: [f64; 2], to: [f64; 2]) -> [[f64; 3]; 3] {
-    const M: [[f64; 3]; 3] = [
-        [0.401288, 0.650173, -0.051461],
-        [-0.250268, 1.204414, 0.045854],
-        [-0.002079, 0.048952, 0.953127],
-    ];
-    const M_INV: [[f64; 3]; 3] = [
-        [1.8620678551, -1.0112546305, 0.1491867754],
-        [0.3875265432, 0.6214474419, -0.0089739852],
-        [-0.0158414988, -0.034122938, 1.0499644369],
-    ];
-    let (s, d) = (mul3(&M, xyz_from_xy(from)), mul3(&M, xyz_from_xy(to)));
-    let column = |i: usize| {
-        let mut e = [0.0; 3];
-        e[i] = 1.0;
-        let lms = mul3(&M, mul3(&REC2020_TO_XYZ, e));
-        let gained = [0, 1, 2].map(|k| lms[k] * d[k] / s[k]);
-        mul3(&XYZ_TO_REC2020, mul3(&M_INV, gained))
-    };
-    let cols = [column(0), column(1), column(2)];
-    std::array::from_fn(|r| std::array::from_fn(|c| cols[c][r]))
+pub fn cat16_rec2020(from: [f64; 2], to: [f64; 2]) -> DMat3 {
+    let m = DMat3::from_rows(
+        DVec3::new(0.401288, 0.650173, -0.051461),
+        DVec3::new(-0.250268, 1.204414, 0.045854),
+        DVec3::new(-0.002079, 0.048952, 0.953127),
+    );
+    let gain = DMat3::from_diagonal((m * xyz_from_xy(to)) / (m * xyz_from_xy(from)));
+    let p = RgbPrimaries::REC2020;
+    p.xyz_to_rgb() * m.inverse() * gain * m * p.rgb_to_xyz()
 }
 
 /// CIE 1960 uv of `xy`.

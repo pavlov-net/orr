@@ -1,5 +1,9 @@
 //! Auto white balance on the GPU against the CPU model of adapt's white point and CAT16.
 
+use std::sync::LazyLock;
+
+use orr_color::RgbPrimaries;
+use orr_math::{DMat3, DVec2, DVec3};
 use orr_output::{
     AutoWhiteBalance, D65_XY, DisplayRequest, Exposure, ExposureTelemetry, MeterWeights,
     OutputDebug, OutputFormat, ResolvedDisplay, ViewOutput, WHITE_BALANCE_CCT, WHITE_BALANCE_DUV,
@@ -8,8 +12,7 @@ use orr_output::{
 use orr_scene::SkyStats;
 use orr_scene::testing::assert_clean;
 use output_suite::{
-    Harness, REC709_TO_XYZ, REC2020_TO_XYZ, cat16_rec2020, mul3, rec2020_from_xy, uv_from_xy,
-    white_target, xy_from_xyz,
+    Harness, cat16_rec2020, rec2020_from_xy, uv_from_xy, white_target, xy_from_xyz,
 };
 
 const SIDE: u32 = 64;
@@ -52,7 +55,7 @@ fn settle(h: &mut Harness, output: &ViewOutput, display: &ResolvedDisplay) -> Ex
 }
 
 fn distance(a: [f64; 2], b: [f64; 2]) -> f64 {
-    (a[0] - b[0]).hypot(a[1] - b[1])
+    DVec2::from(a).distance(DVec2::from(b))
 }
 
 fn xy(v: [f32; 2]) -> [f64; 2] {
@@ -60,8 +63,9 @@ fn xy(v: [f32; 2]) -> [f64; 2] {
 }
 
 /// The XYZ of a display-linear Rec.709 texel.
-fn shown_xyz(p: [f32; 4]) -> [f64; 3] {
-    mul3(&REC709_TO_XYZ, [p[0], p[1], p[2]].map(f64::from))
+fn shown_xyz(p: [f32; 4]) -> DVec3 {
+    static TO_XYZ: LazyLock<DMat3> = LazyLock::new(|| RgbPrimaries::REC709.rgb_to_xyz());
+    *TO_XYZ * DVec3::from([p[0], p[1], p[2]].map(f64::from))
 }
 
 fn no_sky() -> SkyStats {
@@ -202,11 +206,12 @@ fn white_point_and_correction_match_the_cpu_model() {
 
     // Each patch shows as CAT16 from the white point to D65 of its exposed radiance.
     let m = cat16_rec2020(got, d65());
+    let to_xyz = RgbPrimaries::REC2020.rgb_to_xyz();
     let s = f64::from(exposure_from_ev100(t.adapted_ev100));
     let image = h.display_linear();
     for (p, (nits, color)) in image.iter().zip(&pixels) {
         let exposed = color.map(|c| f64::from(c * nits) * s);
-        let want = mul3(&REC2020_TO_XYZ, mul3(&m, exposed));
+        let want = to_xyz * (m * DVec3::from(exposed));
         let shown = shown_xyz(*p);
         for c in 0..3 {
             assert!(

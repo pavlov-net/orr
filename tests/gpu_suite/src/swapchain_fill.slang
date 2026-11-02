@@ -2,7 +2,8 @@
 // white, color bars, a ramp to 10x paper white and a moving bar that shows tearing.
 #include "orr/root.h"
 import orr.abi;
-import orr.color;
+import orr_color.primaries;
+import orr_color.transfer;
 
 struct Root
 {
@@ -51,6 +52,6 @@ void fill_main(uint3 id: SV_DispatchThreadID)
     else if (root.encoding == 1)
         o = pq_encode(mul(REC709_TO_REC2020, c) * root.paper_white_nits);
     else
-        o = c * (root.paper_white_nits / 80.0);
+        o = c * (root.paper_white_nits / SCRGB_WHITE_NITS);
     root.target.get<RWTexture2D<float4>>()[id.xy] = float4(o, 1.0);
 }

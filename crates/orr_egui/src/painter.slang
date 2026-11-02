@@ -3,7 +3,7 @@
 // in gamma space like egui's reference painters.
 #include "orr/root.h"
 import orr.abi;
-import orr.color;
+import orr_color.transfer;
 
 // egui's `Vertex`: position in points, texture coordinates, premultiplied sRGBA bytes.
 struct EguiVertex

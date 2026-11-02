@@ -22,12 +22,14 @@ windows = { version = "0.62.2", features = [
 ] }
 
 [dev-dependencies]
+orr_color.workspace = true
 ash.workspace = true
 blake3.workspace = true
-glam.workspace = true
+orr_math.workspace = true
 half = { version = "2.7", features = ["bytemuck"] }
 
 [build-dependencies]
+orr_color.workspace = true
 orr_shaders = { workspace = true, features = ["build"] }
 
 [lints]

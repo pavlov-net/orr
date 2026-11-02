@@ -2,7 +2,8 @@
 //! field against lens-disc references, glare against its CPU model and PSF, and lens
 //! distortion against its analytic map.
 
-use orr_output::{ChainImages, MotionBlurPass, OutputKernels, OutputView, ViewOutput, srgb_encode};
+use orr_color::srgb_encode;
+use orr_output::{ChainImages, MotionBlurPass, OutputKernels, OutputView, ViewOutput};
 use orr_scene::ViewConstants;
 use orr_scene::orr_gpu::{
     Allocation, ComputePipeline, Format, Hazards, MemoryKind, QueueKind, ShaderStage, SpecData,
@@ -274,8 +275,9 @@ fn closed_shutter_and_history_reset_record_nothing() {
 
 /// Depth of field on both paths against lens-disc accumulation references.
 mod depth_of_field {
+    use orr_color::srgb_encode;
     use orr_output::{
-        ChainImages, DepthOfFieldPass, DofPath, OutputKernels, OutputView, ViewOutput, srgb_encode,
+        ChainImages, DepthOfFieldPass, DofPath, OutputKernels, OutputView, ViewOutput,
     };
     use orr_scene::orr_gpu::{
         Allocation, ComputePipeline, Format, GpuPtr, Hazards, MemoryKind, QueueKind, ShaderStage,
@@ -851,12 +853,14 @@ mod depth_of_field {
 /// they are fitted to; FFT glare against direct convolution with its kernel, and its kernel
 /// against the PSF.
 mod glare {
+    use orr_color::{RgbPrimaries, srgb_encode};
+    use orr_math::DVec3;
     use orr_output::{
-        Exposure, GlareMethod, OutputDebug, OutputFormat, ResolvedDisplay, ViewOutput, srgb_encode,
+        Exposure, GlareMethod, OutputDebug, OutputFormat, ResolvedDisplay, ViewOutput,
     };
     use orr_scene::Glare;
     use orr_scene::testing::{Image, Pixels, assert_clean, flip};
-    use output_suite::{Harness, REC709_TO_XYZ, XYZ_TO_REC2020, mul3, read_rgba16f};
+    use output_suite::{Harness, read_rgba16f};
 
     #[allow(dead_code, unreachable_pub)]
     mod pyramid {
@@ -939,13 +943,11 @@ mod glare {
         for _ in 0..3 {
             telemetry = h.frame(1.0, out, Some(display));
         }
+        let to_rec2020 = RgbPrimaries::REC709.matrix_to(RgbPrimaries::REC2020);
         let rec2020 = h
             .display_linear()
             .iter()
-            .map(|p| {
-                let c = [p[0], p[1], p[2]].map(f64::from);
-                mul3(&XYZ_TO_REC2020, mul3(&REC709_TO_XYZ, c))
-            })
+            .map(|p| (to_rec2020 * DVec3::from([p[0], p[1], p[2]].map(f64::from))).to_array())
             .collect();
         let exposure = f64::from(orr_output::exposure_from_ev100(telemetry.adapted_ev100));
         (rec2020, exposure, f64::from(telemetry.pre_exposure))
@@ -1717,6 +1719,8 @@ mod glare {
 /// Lens distortion and chromatic aberration in tonemap's gather, and the distortion field it
 /// writes, against the analytic map.
 mod lens_distortion {
+    use orr_color::RgbPrimaries;
+    use orr_math::DVec3;
     use orr_output::{
         DistortionField, Exposure, ExposurePass, OutputDebug, OutputFormat, OutputKernels,
         OutputView, ResolvedDisplay, TonemapPass, ViewOutput,
@@ -1727,7 +1731,7 @@ mod lens_distortion {
     };
     use orr_scene::testing::{assert_clean, device, read_texture, wait};
     use orr_scene::{ExposureState, LensDistortion, SkyStats, ViewConstants};
-    use output_suite::{LensModel, REC709_TO_XYZ, XYZ_TO_REC2020, mul3, read_rgba16f};
+    use output_suite::{LensModel, read_rgba16f};
 
     /// Not a multiple of the 8-pixel group, and odd high, so the field rounds up.
     const OUT: [u32; 2] = [484, 271];
@@ -1876,13 +1880,14 @@ mod lens_distortion {
                 field,
             );
             wait(queue.submit(vec![list], &[]).unwrap());
+            let to_rec2020 = RgbPrimaries::REC709.matrix_to(RgbPrimaries::REC2020);
             read_texture(&self.target, &whole)
                 .chunks_exact(16)
                 .map(|p| {
                     let c: [f64; 3] = std::array::from_fn(|i| {
                         f64::from(f32::from_le_bytes(p[4 * i..4 * i + 4].try_into().unwrap()))
                     });
-                    mul3(&XYZ_TO_REC2020, mul3(&REC709_TO_XYZ, c))
+                    (to_rec2020 * DVec3::from(c)).to_array()
                 })
                 .collect()
         }
