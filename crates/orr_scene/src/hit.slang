@@ -571,6 +571,7 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
 {
     h = (HitInput)0;
     uint cell_log2 = uint(s.origin_cell.w);
+    float bias = footprint_bias(context.kind, v);
     SurfaceInput i = (SurfaceInput)0;
     Corners corners = (Corners)0;
     uint material;
@@ -590,7 +591,7 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
         uint segment = strand_segment(cluster_id, primitive);
         float3 object = cluster_id == SWEPT_CLUSTER ? t.position[0]
             : (1.0 - bary.x - bary.y) * t.position[0] + bary.x * t.position[1] + bary.y * t.position[2];
-        if (!strand_geometry(i, b, segment, object, pl, previous, context.cone_width))
+        if (!strand_geometry(i, b, segment, object, pl, previous, context.cone_width * bias))
             return false;
         material = strand_material(p);
         attributes = 0;
@@ -660,7 +661,7 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
         return false;
     MaterialGpu* m = s.materials + material;
     if (!strand)
-        hit_triangle(i, d, corners, t, fetched, deformed, previous, attributes, m, pl, primitive, bary, context);
+        hit_triangle(i, d, corners, t, fetched, deformed, previous, attributes, m, pl, primitive, bary, context, bias);
     i.uv[0].tap = i.uv[1].tap = context.tap;
     i.context = context;
     i.material = material;
@@ -678,7 +679,7 @@ bool hit_input(SceneRoot* s, ViewConstants* v, float3 d, uint instance_index, ui
 
 // The triangle geometry of a hit at barycentrics `bary` of triangle `primitive` with
 // `corners`, the fetched positions `t` replacing theirs where they are this frame's.
-void hit_triangle(inout SurfaceInput i, float3 d, Corners corners, Corners t, bool fetched, bool deformed, bool previous, uint attributes, MaterialGpu* m, Placement pl, uint primitive, float2 bary, HitContext context)
+void hit_triangle(inout SurfaceInput i, float3 d, Corners corners, Corners t, bool fetched, bool deformed, bool previous, uint attributes, MaterialGpu* m, Placement pl, uint primitive, float2 bary, HitContext context, float bias)
 {
     // A deformed copy's fetched positions are this frame's.
     if (fetched && !(deformed && previous))
@@ -705,7 +706,7 @@ void hit_triangle(inout SurfaceInput i, float3 d, Corners corners, Corners t, bo
     float2 bx = float2(dot(cross(x * w, e2), n), dot(cross(e1, x * w), n)) / nn;
     float2 by = float2(dot(cross(yp * w, e2), n), dot(cross(e1, yp * w), n)) / nn;
 
-    triangle_geometry(i, corners, attributes, m, pl, bary, bx, by, d, 1.0);
+    triangle_geometry(i, corners, attributes, m, pl, bary, bx, by, d, bias);
     i.primitive = primitive;
     i.barycentrics = bary;
 }

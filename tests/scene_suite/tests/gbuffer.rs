@@ -2173,6 +2173,7 @@ struct Shot {
     reset: bool,
     frame: u32,
     jitter: Vec2,
+    mip_bias: f32,
 }
 
 impl Shot {
@@ -2185,6 +2186,7 @@ impl Shot {
             reset: frame <= 1,
             frame,
             jitter: Vec2::new(0.25, -0.125),
+            mip_bias: 0.0,
         }
     }
 }
@@ -2234,7 +2236,7 @@ fn shoot_with(
             render_extent: UVec2::from(EXTENT),
             jitter: shot.jitter,
             reset_history: shot.reset,
-            mip_bias: 0.0,
+            mip_bias: shot.mip_bias,
             texture_filter: TextureFilter::Hardware,
         })
         .unwrap();
@@ -2578,6 +2580,49 @@ fn a_surface_that_ignores_its_context_sees_one_point_the_same_from_every_ray() {
         compared as f64 > 0.9 * covered as f64,
         "{compared} of {covered} covered pixels seen by all three rays"
     );
+    assert_clean();
+}
+
+/// The view's mip bias reaches the texture footprint of the material resolve and of a camera
+/// ray's first hit alike, and leaves other rays' hits alone.
+#[test]
+fn mip_bias_scales_the_footprints_of_primary_hits_alone() {
+    let _serial = serial();
+    let mut w = World::new(&linked::KERNELS);
+    let items = [Item {
+        model: "steady ground",
+        linear: Mat3::IDENTITY,
+        at: Vec3::ZERO,
+    }];
+    let placed = place(&mut w, &items);
+    let module = linked::KERNELS.module(&trace::MODULE).unwrap();
+    let mut seen = |frame, mip_bias| {
+        let shot = Shot {
+            mip_bias,
+            ..Shot::at(DVec3::new(0.0, 2.5, 4.5), DVec3::new(0.0, 0.5, 0.0), frame)
+        };
+        let g = shoot(&mut w, &placed, &shot);
+        rays(&g.view, module, "same_point", 0).seen
+    };
+    let plain = seen(1, 0.0);
+    let bias = -2.0f32;
+    let biased = seen(2, bias);
+    let primary = 4.0f32.powf(bias);
+    let mut compared = 0usize;
+    for (a, b) in plain.iter().zip(&biased) {
+        if a.hit != 7 || b.hit != 7 || a.triangle != b.triangle || a.footprint.contains(&0.0) {
+            continue;
+        }
+        compared += 1;
+        for (k, want) in [primary, primary, 1.0].into_iter().enumerate() {
+            let ratio = b.footprint[k] / a.footprint[k];
+            assert!(
+                (ratio / want - 1.0).abs() < 0.01,
+                "ray {k}: footprint scaled by {ratio}, want {want}"
+            );
+        }
+    }
+    assert!(compared > 1000, "{compared} pixels compared");
     assert_clean();
 }
 
@@ -3225,6 +3270,7 @@ fn motion_vectors_do_not_change_when_the_render_origin_moves() {
                 reset: i == 1,
                 frame: i,
                 jitter: Vec2::new(0.25, -0.125),
+                mip_bias: 0.0,
             };
             let g = shoot(&mut w, &placed, &shot);
             let root: Vec<SceneRoot> = read_buffer(g.view.scene, 1);
