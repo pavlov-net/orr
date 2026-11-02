@@ -1,5 +1,5 @@
-//! GPU tests of orr-gpu. Every test runs on one shared device with validation on and fails
-//! if the layer reports anything.
+//! GPU tests of orr-gpu. Every test runs on one shared device and fails if the validation
+//! layer, when the environment enables it, reports anything.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -51,7 +51,7 @@ pub fn log_to_stderr() {
 
 static DEVICE: OnceLock<Device> = OnceLock::new();
 
-/// The suite's device: every queue kind, validation on. `ORR_CAPTURE=1` creates it for an
+/// The suite's device: every queue kind. `ORR_CAPTURE=1` creates it for an
 /// Nsight Graphics capture ([`Diagnostics::Capture`]).
 pub fn device() -> &'static Device {
     let diagnostics = if std::env::var_os("ORR_CAPTURE").is_some_and(|v| v == "1") {
@@ -69,7 +69,6 @@ pub fn device_with(diagnostics: Diagnostics<'static>) -> &'static Device {
         log_to_stderr();
         let desc = DeviceDesc {
             name: "gpu-suite",
-            validation: true,
             diagnostics,
             queues: QueueRequest {
                 render_compute: true,

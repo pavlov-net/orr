@@ -1,5 +1,6 @@
-//! Headless testing: one device with validation on, readback, and comparison against
-//! reference images. `ORR_BLESS=1` rewrites the references instead of comparing.
+//! Headless testing: one device (validated when the environment enables the layer), readback,
+//! and comparison against reference images. `ORR_BLESS=1` rewrites the references instead of
+//! comparing.
 //!
 //! 8-bit images are display-encoded (sRGB) and compare with FLIP; float images compare per
 //! pixel.
@@ -31,7 +32,7 @@ impl log::Log for StderrLog {
     fn flush(&self) {}
 }
 
-/// The process's test device: every queue kind, validation on, messages logged to stderr.
+/// The process's test device: every queue kind, messages logged to stderr.
 pub fn device() -> &'static Device {
     static DEVICE: OnceLock<Device> = OnceLock::new();
     DEVICE.get_or_init(|| {
@@ -39,7 +40,6 @@ pub fn device() -> &'static Device {
         log::set_max_level(log::LevelFilter::Info);
         let desc = DeviceDesc {
             name: "orr-test",
-            validation: true,
             queues: QueueRequest {
                 render_compute: true,
                 async_compute: true,

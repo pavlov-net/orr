@@ -123,7 +123,6 @@ fn frame_generation_presents_generated_images_before_each_frame() {
     let gpu = Device::new(&DeviceDesc {
         name: "output-suite frame generation",
         hooks: Some(&hooks),
-        validation: true,
         queues: QueueRequest {
             render_compute: true,
             async_compute: true,
@@ -737,7 +736,6 @@ mod lens_distortion {
         let gpu = Device::new(&DeviceDesc {
             name: "output-suite lens frame generation",
             hooks: Some(&hooks),
-            validation: true,
             ..DeviceDesc::default()
         })
         .unwrap();

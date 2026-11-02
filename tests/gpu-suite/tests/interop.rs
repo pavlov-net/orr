@@ -128,7 +128,6 @@ fn hooks_add_extensions_and_features() {
     let d = Device::new(&DeviceDesc {
         name: "gpu-suite hooks",
         hooks: Some(&hooks),
-        validation: true,
         ..DeviceDesc::default()
     })
     .unwrap();

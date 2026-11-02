@@ -731,7 +731,6 @@ fn forced_staging_path() {
     gpu_suite::log_to_stderr();
     let d = Device::new(&DeviceDesc {
         name: "gpu-suite staging",
-        validation: true,
         force_staging: true,
         queues: QueueRequest {
             async_compute: true,

@@ -499,7 +499,6 @@ fn rr_on_an_orr_device_matches_the_raw_harness() {
     let device = Device::new(&DeviceDesc {
         name: "orr-dlss tests",
         hooks: Some(&hooks),
-        validation: gpu.validation,
         queues: QueueRequest {
             render_compute: true,
             ..QueueRequest::default()

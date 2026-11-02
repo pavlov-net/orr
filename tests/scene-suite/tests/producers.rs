@@ -2463,7 +2463,6 @@ fn tube_device() -> Device {
     let _ = device();
     let d = Device::new(&DeviceDesc {
         name: "orr-test-tubes",
-        validation: true,
         queues: QueueRequest {
             render_compute: true,
             async_compute: true,

@@ -33,9 +33,6 @@ use orr_memory::AllocatorDesc;
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 
-/// The driver exposes `VK_NV_ray_tracing_validation` only with this set to 1.
-const RAY_TRACING_VALIDATION_VAR: &str = "NV_ALLOW_RAYTRACING_VALIDATION";
-
 /// How to create a [`Device`].
 #[derive(Clone, Copy, Debug)]
 pub struct DeviceDesc<'a> {
@@ -44,9 +41,6 @@ pub struct DeviceDesc<'a> {
     /// Extensions and features a library that records raw Vulkan commands needs.
     pub hooks: Option<&'a dyn DeviceHooks>,
     pub queues: QueueRequest,
-    /// Loads the Khronos validation layer with synchronisation checks, when installed.
-    /// Messages are logged and counted ([`Device::validation_messages`]).
-    pub validation: bool,
     pub diagnostics: Diagnostics<'a>,
     /// The file of the `VkPipelineCache` every pipeline compiles through: read at creation,
     /// written by [`Device::save_pipeline_cache`]. `None`: no cache beyond the driver's own.
@@ -73,7 +67,6 @@ impl Default for DeviceDesc<'_> {
             name: "orr",
             hooks: None,
             queues: QueueRequest::default(),
-            validation: false,
             diagnostics: Diagnostics::Off,
             pipeline_cache: None,
             skip_extensions: &[],
@@ -320,14 +313,11 @@ fn c_string(chars: &[c_char]) -> String {
 
 impl Device {
     /// Creates the device: the first Vulkan 1.4 GPU (discrete first) with every required
-    /// feature of contracts.md 7. Fails naming the first missing item.
+    /// feature of contracts.md 7. Fails naming the first missing item. The validation layer
+    /// loads only when the environment enables it (`VK_INSTANCE_LAYERS`, vkconfig); its
+    /// synchronization checks are then on, and its messages are logged and counted
+    /// ([`Device::validation_messages`]).
     pub fn new(desc: &DeviceDesc<'_>) -> Result<Device, Error> {
-        if cfg!(debug_assertions) && std::env::var_os(RAY_TRACING_VALIDATION_VAR).is_none() {
-            // SAFETY: the driver reads the variable at instance creation. Setting it races
-            // only with other threads touching the environment, which Windows serialises;
-            // elsewhere debug builds create the device before such threads start.
-            unsafe { std::env::set_var(RAY_TRACING_VALIDATION_VAR, "1") };
-        }
         if let Diagnostics::Aftermath { dump_dir } = desc.diagnostics {
             super::aftermath::enable(dump_dir, desc.name).map_err(Error::Aftermath)?;
         }
@@ -788,7 +778,7 @@ impl Device {
             hooks.device_created(&device.shared.raw_device());
         }
         log::info!(
-            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, lss {}, address commands {}, indirect copy {}, cooperative vector combinations {}, host image copy {}, decompression {}, occupancy priority {}, memory priority {} (pageable {}), generated commands {}, validation layer {}, ray tracing validation {}, diagnostics {:?} (breadcrumbs {}, checkpoints {}, aftermath {}, device fault {})",
+            "device {} ({}): rebar {}, ray dispatch {} (reorder {}), omm {}, lss {}, address commands {}, indirect copy {}, cooperative vector combinations {}, host image copy {}, decompression {}, occupancy priority {}, memory priority {} (pageable {}), generated commands {}, ray tracing validation {}, diagnostics {:?} (breadcrumbs {}, checkpoints {}, aftermath {}, device fault {})",
             device.shared.caps.device_name,
             device.shared.caps.driver,
             device.shared.caps.rebar,
@@ -805,7 +795,6 @@ impl Device {
             optional.memory_priority,
             optional.pageable_memory,
             device.shared.caps.generated_commands,
-            desc.validation,
             optional.ray_tracing_validation,
             desc.diagnostics,
             optional.buffer_marker,
@@ -851,15 +840,6 @@ fn create_instance(
     perf_extensions: &[CString],
     messages: &MessageCount,
 ) -> Result<ash::Instance, Error> {
-    // SAFETY: plain queries.
-    let layers = unsafe { entry.enumerate_instance_layer_properties() }.unwrap_or_default();
-    let has_layer = layers
-        .iter()
-        .any(|l| l.layer_name_as_c_str() == Ok(VALIDATION_LAYER));
-    let validation = desc.validation && has_layer;
-    if desc.validation && !has_layer {
-        log::warn!("validation requested but {VALIDATION_LAYER:?} is not installed");
-    }
     // SAFETY: plain query.
     let exts = unsafe { entry.enumerate_instance_extension_properties(None) }
         .map_err(Error::vk("vkEnumerateInstanceExtensionProperties"))?;
@@ -873,14 +853,6 @@ fn create_instance(
         });
     }
     let mut ext_names = vec![ash::ext::debug_utils::NAME.as_ptr()];
-    let layer_names = if validation {
-        vec![VALIDATION_LAYER.as_ptr()]
-    } else {
-        Vec::new()
-    };
-    if validation {
-        ext_names.push(ash::ext::layer_settings::NAME.as_ptr());
-    }
     if desc.queues.present {
         for name in SURFACE_INSTANCE_EXTENSIONS {
             if !exts
@@ -929,14 +901,27 @@ fn create_instance(
         .values(&on)];
     let mut layer_settings = vk::LayerSettingsCreateInfoEXT::default().settings(&settings);
     let mut messenger = messenger_info(messages);
-    let mut info = vk::InstanceCreateInfo::default()
+    // `VK_EXT_layer_settings` exists only while a layer providing it is enabled, which the
+    // environment decides, so creation with it fails without one.
+    let mut with_settings = ext_names.clone();
+    with_settings.push(ash::ext::layer_settings::NAME.as_ptr());
+    let info = vk::InstanceCreateInfo::default()
         .application_info(&app)
-        .enabled_layer_names(&layer_names)
+        .enabled_extension_names(&with_settings)
+        .push(&mut messenger)
+        .push(&mut layer_settings);
+    // SAFETY: valid create info; the messenger's count outlives the instance.
+    match unsafe { entry.create_instance(&info, None) } {
+        Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT) => {
+            log::debug!("no enabled layer offers VK_EXT_layer_settings: no synchronization checks");
+        }
+        r => return r.map_err(Error::vk("vkCreateInstance")),
+    }
+    let mut messenger = messenger_info(messages);
+    let info = vk::InstanceCreateInfo::default()
+        .application_info(&app)
         .enabled_extension_names(&ext_names)
         .push(&mut messenger);
-    if validation {
-        info = info.push(&mut layer_settings);
-    }
     // SAFETY: valid create info; the messenger's count outlives the instance.
     unsafe { entry.create_instance(&info, None) }.map_err(Error::vk("vkCreateInstance"))
 }

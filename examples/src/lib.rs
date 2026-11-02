@@ -59,8 +59,7 @@ pub fn request_perf_counters() {
 static PERF_COUNTERS: AtomicBool = AtomicBool::new(false);
 
 /// The process's device, created on first use with every queue, NGX's extensions where
-/// NGX offers them, and the validation messenger on (the layer itself loads through
-/// `VK_INSTANCE_LAYERS`). Logs to stderr.
+/// NGX offers them, and validation when the environment enables the layer. Logs to stderr.
 pub fn device() -> &'static Device {
     static DEVICE: OnceLock<Device> = OnceLock::new();
     DEVICE.get_or_init(|| {
@@ -71,7 +70,6 @@ pub fn device() -> &'static Device {
         let desc = DeviceDesc {
             name: "orr-examples",
             hooks: Some(&hooks),
-            validation: true,
             queues: QueueRequest {
                 render_compute: true,
                 async_compute: true,

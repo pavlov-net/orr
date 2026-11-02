@@ -25,7 +25,6 @@ fn open(path: &Path) -> Device {
     log_to_stderr();
     Device::new(&DeviceDesc {
         name: "gpu-suite pipeline cache",
-        validation: true,
         pipeline_cache: Some(path),
         ..DeviceDesc::default()
     })

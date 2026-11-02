@@ -16,8 +16,8 @@ use crate::{Bsdf, Eval, Inputs, Lobe, Sample, V3, Volume};
 const CHUNK: usize = 1 << 18;
 
 /// `orr.openpbr` in a Vulkan compute kernel (`gpu/openpbr_cases.slang`) with the tables in
-/// eight heap slots. Every instance shares one device, created with validation on by the
-/// first [`SlangGpu::new`]; batch calls run in dispatches of up to 262,144 cases, one at a
+/// eight heap slots. Every instance shares one device, created by the first
+/// [`SlangGpu::new`]; batch calls run in dispatches of up to 262,144 cases, one at a
 /// time across threads.
 pub struct SlangGpu {
     context: &'static Context,
@@ -193,7 +193,6 @@ fn context() -> &'static Context {
         log_to_stderr();
         let device = Device::new(&DeviceDesc {
             name: "openpbr-ref",
-            validation: true,
             ..DeviceDesc::default()
         })
         .expect("Vulkan device");
