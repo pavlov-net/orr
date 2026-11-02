@@ -58,22 +58,11 @@ impl Reader<'_> {
     }
 
     fn half(&mut self) -> f32 {
-        half_to_f32(u16::from_le_bytes(self.take()))
+        half::f16::from_le_bytes(self.take()).to_f32()
     }
 
     fn skip(&mut self, n: usize) {
         self.0 = &self.0[n..];
-    }
-}
-
-fn half_to_f32(h: u16) -> f32 {
-    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let exponent = i32::from((h >> 10) & 0x1f);
-    let mantissa = f32::from(h & 0x3ff);
-    sign * match exponent {
-        0 => mantissa * 2f32.powi(-24),
-        31 => f32::INFINITY,
-        e => (1.0 + mantissa / 1024.0) * 2f32.powi(e - 15),
     }
 }
 
