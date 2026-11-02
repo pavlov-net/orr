@@ -1,7 +1,7 @@
 //! Mip chains in linear float: separable box or Kaiser downsampling, per atlas cell where
 //! cells allow, normal renormalization, alpha-coverage scaling and Toksvig roughness.
 
-use orr_pack::texture::{full_mip_count, mip_size};
+use orr_pack::texture::mip_size;
 use rayon::prelude::*;
 
 use super::{Img, MipFilter, Wrap};
@@ -25,15 +25,15 @@ pub(crate) struct Toksvig {
     pub normals: Img,
 }
 
-/// The full chain from `base` down to 1x1, finished as `spec` asks.
-pub(crate) fn chain(base: Img, spec: &MipSpec) -> Vec<Img> {
+/// The first `count` mips from `base`, finished as `spec` asks.
+pub(crate) fn chain(base: Img, spec: &MipSpec, count: u32) -> Vec<Img> {
     let mut base = base;
     if spec.normal {
         base.px.par_iter_mut().for_each(|p| *p = normalized(*p));
     }
     let mut out = {
         let _z = crate::profile::zone!("mips.downsample");
-        raw_chain(base, spec)
+        raw_chain(base, spec, count)
     };
     if spec.normal {
         let _z = crate::profile::zone!("mips.renormalize");
@@ -48,9 +48,9 @@ pub(crate) fn chain(base: Img, spec: &MipSpec) -> Vec<Img> {
     out
 }
 
-/// Each mip filtered from the one above it, before renormalizing or coverage scaling.
-fn raw_chain(base: Img, spec: &MipSpec) -> Vec<Img> {
-    let count = full_mip_count(base.w, base.h);
+/// The first `count` mips, each filtered from the one above it, before renormalizing or
+/// coverage scaling.
+fn raw_chain(base: Img, spec: &MipSpec, count: u32) -> Vec<Img> {
     let (w, h) = (base.w, base.h);
     let mut raw = vec![base];
     for m in 1..count {
@@ -613,7 +613,7 @@ impl Toksvig {
         };
         let mut base = self.normals.clone();
         base.px.par_iter_mut().for_each(|p| *p = normalized(*p));
-        let raw = raw_chain(base, &normal_spec);
+        let raw = raw_chain(base, &normal_spec, chain.len() as u32);
         for (m, n) in chain.iter_mut().zip(&raw).skip(first) {
             m.px.par_iter_mut().zip(&n.px).for_each(|(p, v)| {
                 let r = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
@@ -630,8 +630,15 @@ impl Toksvig {
 
 #[cfg(test)]
 mod tests {
+    use orr_pack::texture::full_mip_count;
+
     use super::*;
     use crate::texture::{linear_to_srgb, srgb_to_linear};
+
+    fn full_chain(base: Img, spec: &MipSpec) -> Vec<Img> {
+        let count = full_mip_count(base.w, base.h);
+        chain(base, spec, count)
+    }
 
     fn coverage(img: &Img, channel: usize, cutoff: f32) -> f32 {
         let r = Rect {
@@ -698,8 +705,8 @@ mod tests {
             s.coverage = Some((3, 0.5));
             let base = foliage(256, 128, 7);
             let target = coverage(&base, 3, 0.5);
-            let plain = raw_chain(base.clone(), &spec(filter));
-            let c = chain(base, &s);
+            let plain = raw_chain(base.clone(), &spec(filter), full_mip_count(base.w, base.h));
+            let c = full_chain(base, &s);
             for (m, (img, raw)) in c.iter().zip(&plain).enumerate().skip(1) {
                 if img.w.min(img.h) < 4 {
                     break;
@@ -737,7 +744,8 @@ mod tests {
             hi
         };
         let base = foliage(256, 128, 5);
-        let chain = raw_chain(base, &spec(MipFilter::Kaiser));
+        let count = full_mip_count(base.w, base.h);
+        let chain = raw_chain(base, &spec(MipFilter::Kaiser), count);
         for img in &chain[1..] {
             let c = Coverage::new(img, rects(img, None)[0], 3, 0.5);
             for goal in [0.05, 0.3, 0.6, 0.97] {
@@ -837,7 +845,7 @@ mod tests {
         let mut s = spec(MipFilter::Kaiser);
         s.grid = Some([4, 2]);
         s.coverage = Some((3, 0.5));
-        let (a, b) = (chain(make(0.0), &s), chain(make(1.0), &s));
+        let (a, b) = (full_chain(make(0.0), &s), full_chain(make(1.0), &s));
         let cell0 = foliage(w, h, 3);
         let mut cells_checked = 0;
         for (m, (ia, ib)) in a.iter().zip(&b).enumerate() {
@@ -888,7 +896,7 @@ mod tests {
             *p = [srgb_to_linear(v); 4];
         }
         for filter in [MipFilter::Box, MipFilter::Kaiser] {
-            let c = chain(img.clone(), &spec(filter));
+            let c = full_chain(img.clone(), &spec(filter));
             for m in &c[1..] {
                 let mean = m.px.iter().map(|p| p[0]).sum::<f32>() / m.px.len() as f32;
                 assert!(
@@ -922,7 +930,7 @@ mod tests {
             *p = [base_rough, 0.0, 0.0, 1.0];
         }
         let s = spec(MipFilter::Box);
-        let mut c = chain(img, &s);
+        let mut c = full_chain(img, &s);
         Toksvig {
             channel: 0,
             normals,

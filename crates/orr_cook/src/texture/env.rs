@@ -66,6 +66,7 @@ pub(super) fn cook(
             normal: false,
             coverage: None,
         },
+        full_chain: true,
         quality,
         max_size: None,
         toksvig: None,

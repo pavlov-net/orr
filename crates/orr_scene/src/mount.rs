@@ -995,9 +995,10 @@ fn gpu_format(vk_format: u32) -> Option<orr_gpu::Format> {
     })
 }
 
-/// A texture from blob 0: streamed when `stream` and it has mips above its tail, else whole
-/// with every mip copied in from its blob. Textures streamed are those the pack's materials
-/// bind, which kernels sample through the footprint function's residency clamp.
+/// A texture from blob 0: streamed when `stream` and it has mips above a mip tail, which
+/// stays resident as the floor the residency clamp falls back to; else whole with every mip
+/// copied in from its blob. Textures streamed are those the pack's materials bind, which
+/// kernels sample through the footprint function's residency clamp.
 fn place_texture(
     t: &Arc<MountTask>,
     entry: usize,
@@ -1020,7 +1021,8 @@ fn place_texture(
         layers: u32::from(h.layers),
         usage: TextureUsage::SAMPLED,
     };
-    if stream && h.tail_first_mip > 0 && place_streamed(t, entry, id, &info, &desc)? {
+    let has_tail = (1..h.mip_count).contains(&h.tail_first_mip);
+    if stream && has_tail && place_streamed(t, entry, id, &info, &desc)? {
         return Ok(());
     }
     if t.host_copy {

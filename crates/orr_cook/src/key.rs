@@ -15,7 +15,7 @@ pub(crate) const GDEFLATE_LEVEL: i32 = 12;
 /// for the same inputs; the golden test fails until it is bumped.
 pub(crate) const VERSIONS: &[(Class, u32)] = &[
     (Class::Mesh, 10),
-    (Class::Texture, 4),
+    (Class::Texture, 5),
     (Class::Material, 3),
     (Class::Model, 3),
     (Class::InstancePage, 3),
