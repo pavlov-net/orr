@@ -224,7 +224,8 @@ pub enum Source {
         #[serde(default)]
         textures: TextureRules,
     },
-    /// An image file: PNG, JPEG, Radiance HDR, OpenEXR, KTX2 or DDS.
+    /// An image file: PNG, JPEG, WebP, Radiance HDR, OpenEXR, KTX2 or DDS. Of an animated WebP
+    /// the first frame cooks, with a warning in the report.
     Texture {
         path: PathBuf,
         #[serde(default)]

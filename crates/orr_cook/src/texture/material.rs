@@ -208,6 +208,8 @@ pub(crate) struct ImageFacts {
     blocks: Option<(u32, bool)>,
     /// The file holds two channels, red and green.
     rg: bool,
+    /// The file is animated; only its first frame is read.
+    pub animated: bool,
 }
 
 /// Decodes a 2D image: its only layer and the file's color facts.
@@ -286,6 +288,7 @@ fn facts_of(bytes: &[u8], hash: Hash32) -> Result<ImageFacts, String> {
             hash,
             blocks: Some((s.vk_format, s.complete)),
             rg: s.rg,
+            animated: false,
         });
     }
     let src = load::open(bytes)?;
@@ -317,6 +320,7 @@ fn facts_of(bytes: &[u8], hash: Hash32) -> Result<ImageFacts, String> {
         hash,
         blocks: src.blocks.as_ref().map(|b| (b.vk_format, b.complete())),
         rg: src.rg,
+        animated: load::is_animated(bytes),
     })
 }
 

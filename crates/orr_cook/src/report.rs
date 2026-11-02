@@ -41,6 +41,10 @@ pub struct AssetReport {
     /// Models of the asset whose meshes repeat rigid units.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub assemblies: Vec<AssemblyReport>,
+    /// Input the cook accepted but flags, on every cook whether its entries cook or link:
+    /// animated WebP images, of which the first frame cooks.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// A model cut into repeated units and the rest.
@@ -88,7 +92,7 @@ pub struct EntryReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume: Option<VolumeReport>,
     /// Content the cook accepted but flags: displacement that differs across uv seams,
-    /// subsurface materials on open meshes.
+    /// subsurface materials on open meshes. Reported only when the entry cooks.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }

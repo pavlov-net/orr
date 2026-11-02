@@ -18,7 +18,7 @@ use serde::Deserialize;
 
 use ctt::Quality;
 pub(crate) use encode::{Encoding, encode as encode_chains};
-pub(crate) use load::{Blocks, Source, decode_blocks, decode_channel};
+pub(crate) use load::{Blocks, Source, decode_blocks, decode_channel, file_header};
 pub(crate) use mips::{MipSpec, Toksvig};
 
 use crate::{Error, Result};
@@ -282,6 +282,11 @@ pub(crate) struct Built {
     pub info: TextureInfo,
     pub blobs: Vec<Vec<u8>>,
     pub filter: Filter,
+}
+
+/// The report's warning for a source that reads the animated image `image`.
+pub(crate) fn first_frame_warning(image: &str) -> String {
+    format!("image {image} is animated; only its first frame is cooked")
 }
 
 impl Built {

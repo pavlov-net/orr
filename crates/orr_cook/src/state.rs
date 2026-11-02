@@ -144,6 +144,9 @@ pub(crate) struct Record {
     /// The source's models with assemblies, which its linked units do not hold.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assemblies: Vec<Assembly>,
+    /// What the report says of the source, which its linked units do not hold.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// A file an importer read and the hash of the bytes it read.
