@@ -1648,3 +1648,422 @@ fn requested_blobs_land_in_consumer_buffers_and_images_under_their_budget() {
     );
     assert_clean();
 }
+
+const SHEET: &str = "kit/sheet";
+
+/// A pack holding one DAG model over a fine grid with a plain material, whose pages past
+/// its pinned coarsest ones stream once `Budgets::mesh_resident_max` is below its size.
+fn sheet_pack() -> &'static Arc<[u8]> {
+    static PACK: OnceLock<Arc<[u8]>> = OnceLock::new();
+    PACK.get_or_init(|| {
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(
+                Target::Memory,
+                vec![AssetSpec {
+                    name: SHEET.into(),
+                    source: Source::Mesh {
+                        mesh: grid(160),
+                        materials: vec![Material::default(), Material::default()],
+                        settings: MeshSettings {
+                            lod: LodMode::Dag,
+                            ..MeshSettings::default()
+                        },
+                    },
+                }],
+            )],
+        };
+        orr_cook::cook(&manifest, &Default::default())
+            .unwrap()
+            .memory
+            .remove(0)
+    })
+}
+
+/// The mesh of `model`: its record, its page table and every streamed page's index.
+fn mesh_of(scenes: &Scenes, gpu: &Gpu<'_>, model: ModelId) -> (MeshGpu, Vec<u64>) {
+    let (models, meshes, _) = global_tables(scenes);
+    let model: ModelGpu = gpu.value(models.offset(u64::from(model.0)));
+    let mesh: MeshGpu = gpu.value(meshes.offset(u64::from(model.mesh)));
+    let pages = gpu.values(mesh.pages, mesh.page_count);
+    (mesh, pages)
+}
+
+/// Runs one frame of `scene` with its focus 3 m above the origin, after `write`; returns
+/// the scene root of the frame and the cut figures of the last completed frame.
+fn streamed_frame(
+    scenes: &mut Scenes,
+    scene: SceneId,
+    write: impl FnOnce(&mut SceneWriter<'_>),
+) -> (GpuPtr<SceneRoot>, orr_scene::CutStats) {
+    let list = [scene];
+    let mut f = scenes
+        .begin_frame(&FrameDesc {
+            time: FrameTime::default(),
+            scenes: &list,
+            low_latency: None,
+        })
+        .unwrap();
+    {
+        let mut s = f.scene(scene).unwrap();
+        s.set_focus(DVec3::new(0.0, 3.0, 0.0), 1000.0);
+        write(&mut s);
+    }
+    let mut root = GpuPtr::NULL;
+    f.update_scenes(&mut |c| root = c.root).unwrap();
+    f.end(&[]).unwrap();
+    (root, scenes.stats().cuts)
+}
+
+/// Places one traced copy of each of `models` at `positions`.
+fn place_copies(s: &mut SceneWriter<'_>, models: &[ModelId]) -> orr_scene::TransformGroupId {
+    let group = s
+        .create_transform_group(&TransformGroupDesc {
+            count: models.len() as u32,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    s.transforms(group, 0, models.len() as u32)
+        .unwrap()
+        .fill(Affine3::IDENTITY);
+    for (i, &model) in models.iter().enumerate() {
+        s.add_instances(&InstancesDesc {
+            model,
+            copies: 1,
+            transforms: group,
+            first: i as u32,
+            pose: None,
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 1000.0,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .unwrap();
+    }
+    group
+}
+
+/// Moves copy `i` of `group` to `x` m along the x axis.
+fn move_copy(s: &mut SceneWriter<'_>, group: orr_scene::TransformGroupId, i: u32, x: f32) {
+    let mut t = Affine3::IDENTITY;
+    t.rows[0][3] = x;
+    s.transforms(group, i, 1).unwrap()[0] = t;
+}
+
+#[test]
+fn streamed_mesh_pages_stop_the_cut_at_resident_groups_and_evict_beside_traced_copies() {
+    let _serial = serial();
+    let staged = staged_device();
+    for dev in [device(), &staged] {
+        stream_sheets(dev);
+    }
+    assert_eq!(
+        staged.validation_messages(),
+        0,
+        "validation messages (see the log)"
+    );
+    assert_clean();
+}
+
+/// Two mounts of [`sheet_pack`] under a mesh page budget that holds one mount's streamed
+/// pages: the near copy streams its pages in on the traversal's requests, then the other
+/// mount's pages take their place.
+fn stream_sheets(dev: &Device) {
+    let bytes = sheet_pack();
+    let a = Archive::from_memory(Arc::clone(bytes)).unwrap();
+    let e = entry(&a, AssetId::from_name("kit/sheet/mesh"));
+    let info = MeshInfo::parse(&blob(&a, e, 0)).unwrap();
+    let pinned = info.header.pinned_pages as usize;
+    assert!(pinned < info.pages.len(), "the sheet has streamed pages");
+    let unit = |p: &orr_pack::mesh::PageInfo| u64::from(p.resident_len).next_multiple_of(256);
+    let pinned_bytes: u64 = info.pages[..pinned].iter().map(unit).sum();
+    let streamed_bytes: u64 = info.pages[pinned..].iter().map(unit).sum();
+    // Both mounts' pinned pages and one mount's streamed pages.
+    let budget = 2 * pinned_bytes + streamed_bytes;
+    let desc = RendererDesc {
+        budgets: Budgets {
+            mesh_resident_max: 0,
+            mesh_page_pool: budget,
+            ..Budgets::default()
+        },
+        ..RendererDesc::default()
+    };
+    let gpu = Gpu(dev);
+    let traced = dev.caps().cluster.max_tris > 0;
+    let mut scenes = Scenes::new(dev, &desc).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let mounts = [
+        scenes.mount(PackSource::Memory(Arc::clone(bytes))),
+        scenes.mount(PackSource::Memory(Arc::clone(bytes))),
+    ];
+    let models = mounts.map(|m| {
+        ready(&mut scenes, m);
+        scenes.model(m, AssetId::from_name(SHEET)).unwrap()
+    });
+    for &m in &models {
+        let (mesh, pages) = mesh_of(&scenes, &gpu, m);
+        assert_ne!(mesh.page_stamps, GpuPtr::NULL);
+        assert!(
+            pages[..pinned].iter().all(|&p| p != 0),
+            "pinned pages placed"
+        );
+        assert!(
+            pages[pinned..].iter().all(|&p| p == 0),
+            "streamed pages wait"
+        );
+    }
+    let scene = scenes.create_scene(&SceneDesc::default()).unwrap();
+    let mut group = None;
+    streamed_frame(&mut scenes, scene, |s| {
+        group = Some(place_copies(s, &models));
+        move_copy(s, group.unwrap(), 1, 800.0);
+    });
+    let group = group.unwrap();
+
+    // Before its fine groups land the near copy draws its coarser clusters, never nothing.
+    let start = Instant::now();
+    let (mut requests, mut drawn) = (0, Vec::new());
+    let mut idle = 0;
+    while idle < 8 {
+        assert!(start.elapsed() < Duration::from_secs(60), "pages pending");
+        let (_, c) = streamed_frame(&mut scenes, scene, |_| {});
+        requests += c.page_requests;
+        drawn.push(c.candidate_clusters);
+        let r = *scenes.residency();
+        idle = if r.loads == 0 && r.class(ResidencyClass::MeshPages).loading_bytes == 0 {
+            idle + 1
+        } else {
+            0
+        };
+    }
+    assert!(requests > 0, "the traversal requested pages");
+    assert!(
+        drawn.iter().skip(2).all(|&n| n > 0),
+        "drawn while streaming: {drawn:?}"
+    );
+    let (_, near) = mesh_of(&scenes, &gpu, models[0]);
+    let landed: Vec<usize> = (pinned..near.len()).filter(|&p| near[p] != 0).collect();
+    assert!(!landed.is_empty(), "streamed pages landed");
+    for &p in &landed {
+        let stored = blob(&a, e, info.pages[p].blob as usize);
+        let mut resident = vec![0; info.pages[p].resident_len as usize];
+        decode_page(&stored, &mut resident).unwrap();
+        assert_eq!(gpu.bytes(near[p], resident.len()), resident, "page {p}");
+    }
+    assert!(
+        *drawn.last().unwrap() > drawn[2],
+        "finer once resident: {drawn:?}"
+    );
+    // The rest of its pages on request.
+    let start = Instant::now();
+    while mesh_of(&scenes, &gpu, models[0]).1.contains(&0) {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "prefetch pending"
+        );
+        scenes.prefetch(models[0], 0);
+        streamed_frame(&mut scenes, scene, |_| {});
+    }
+    let (root, _) = streamed_frame(&mut scenes, scene, |_| {});
+    let root: SceneRoot = gpu.value(root);
+    let (mesh, _) = mesh_of(&scenes, &gpu, models[0]);
+    let first = landed[0];
+    let firsts: Vec<u32> = gpu.values(mesh.page_clusters, mesh.page_count + 1);
+    let refs: Vec<orr_scene::ClusterRef> = gpu.values(
+        root.clusters
+            .offset(u64::from(mesh.cluster_base + firsts[first])),
+        firsts[first + 1] - firsts[first],
+    );
+    for r in &refs {
+        assert_eq!(r.page.address().0, near[first]);
+        assert_eq!(r.clas != 0, traced, "CLAS built for traced devices");
+    }
+    if traced {
+        assert!(scenes.residency().clas_pool_bytes > 0, "the CLAS pool grew");
+    }
+
+    // The far copy keeps tracing its cached cut while its pages move in near the focus and
+    // the near copy's streamed pages give way after their hold.
+    streamed_frame(&mut scenes, scene, |s| {
+        move_copy(s, group, 0, 800.0);
+        move_copy(s, group, 1, 0.0);
+    });
+    let start = Instant::now();
+    loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the second mount's pages never streamed in"
+        );
+        scenes.prefetch(models[1], 0);
+        streamed_frame(&mut scenes, scene, |_| {});
+        let pool = *scenes.residency().class(ResidencyClass::MeshPages);
+        assert!(pool.resident_bytes + pool.loading_bytes <= budget);
+        if !mesh_of(&scenes, &gpu, models[1]).1.contains(&0) {
+            break;
+        }
+    }
+    let (_, first_mount) = mesh_of(&scenes, &gpu, models[0]);
+    assert!(
+        first_mount[pinned..].iter().all(|&p| p == 0),
+        "the first mount's streamed pages were evicted"
+    );
+    for _ in 0..4 {
+        streamed_frame(&mut scenes, scene, |_| {});
+    }
+    assert_eq!(scenes.residency().failed, 0);
+}
+
+#[test]
+fn the_clas_pool_allocator_places_like_a_first_fit_reference() {
+    use orr_scene::memory::RangeAllocator;
+    use orr_scene::orr_gpu::{MemoryKind, RtasOp};
+    const PAGES: u32 = 12;
+    const WORDS: u32 = 16;
+    const UNITS: u32 = 32 * WORDS;
+    const N: usize = 96;
+    let dev = device();
+    let module = orr_scene::MODULES
+        .iter()
+        .find(|m| m.name == "clas_pool")
+        .unwrap();
+    let pipeline = scene_suite::pipeline(module, "allocate");
+    let up = MemoryKind::Upload;
+    let bits = dev
+        .gpu_malloc::<u32>(MemoryKind::DeviceLocal, u64::from(PAGES * WORDS), "bits")
+        .unwrap();
+    let summary = dev
+        .gpu_malloc::<[u32; 2]>(MemoryKind::DeviceLocal, u64::from(PAGES), "runs")
+        .unwrap();
+    let mut frees = dev
+        .gpu_malloc::<[u32; 2]>(up, (N + PAGES as usize) as u64, "frees")
+        .unwrap();
+    let mut takes = dev.gpu_malloc::<u32>(up, 16, "takes").unwrap();
+    let taken = dev.gpu_malloc::<u32>(up, 16, "taken").unwrap();
+    let mut sizes = dev.gpu_malloc::<u32>(up, N as u64, "sizes").unwrap();
+    let mut sources = dev.gpu_malloc::<u64>(up, N as u64, "sources").unwrap();
+    let units = dev.gpu_malloc::<u32>(up, N as u64, "units").unwrap();
+    let destinations = dev.gpu_malloc::<u64>(up, N as u64, "destinations").unwrap();
+    let stride = u64::from(dev.rtas_args_stride(RtasOp::Move));
+    let moves = dev
+        .gpu_malloc::<u8>(up, stride * N as u64, "moves")
+        .unwrap();
+    let count = dev.gpu_malloc::<u32>(up, 1, "move count").unwrap();
+    let mut root = dev
+        .gpu_malloc::<orr_scene::PoolRoot>(up, 1, "root")
+        .unwrap();
+    let base = 1u64 << 40;
+
+    let mut reference = RangeAllocator::new(PAGES * UNITS);
+    assert!(reference.take(0, PAGES * UNITS));
+    let mut bound = [false; PAGES as usize];
+    let mut live: Vec<(u32, u32)> = Vec::new();
+    let mut rand = {
+        let mut x = 0x2545_f491u32;
+        move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        }
+    };
+    let render = dev.queue(QueueKind::Render).unwrap();
+    for round in 0..40 {
+        // Bind some pages, free some CLAS, ask to take some pages, then allocate.
+        let mut free_list: Vec<[u32; 2]> = Vec::new();
+        for p in 0..PAGES {
+            if !bound[p as usize] && rand() % 4 == 0 {
+                bound[p as usize] = true;
+                free_list.push([p * UNITS, UNITS]);
+            }
+        }
+        live.retain(|&(u, n)| {
+            let keep = rand() % 3 != 0;
+            if !keep {
+                free_list.push([u, n]);
+            }
+            keep
+        });
+        let take_list: Vec<u32> = (0..PAGES)
+            .filter(|&p| bound[p as usize] && rand() % 5 == 0)
+            .collect();
+        let size_list: Vec<u32> = (0..N).map(|_| 128 + rand() % 6000).collect();
+        for &[f, n] in &free_list {
+            reference.free(f, n);
+        }
+        let expect_taken: Vec<u32> = take_list
+            .iter()
+            .map(|&p| {
+                let t = reference.take(p * UNITS, UNITS);
+                if t {
+                    bound[p as usize] = false;
+                }
+                u32::from(t)
+            })
+            .collect();
+        let expect_units: Vec<u32> = size_list
+            .iter()
+            .map(|&s| {
+                let need = s.div_ceil(128);
+                reference
+                    .alloc(need)
+                    .inspect(|&u| live.push((u, need)))
+                    .unwrap_or(u32::MAX)
+            })
+            .collect();
+
+        frees.as_mut_slice().unwrap()[..free_list.len()].copy_from_slice(&free_list);
+        takes.as_mut_slice().unwrap()[..take_list.len()].copy_from_slice(&take_list);
+        sizes.as_mut_slice().unwrap().copy_from_slice(&size_list);
+        for (i, s) in sources.as_mut_slice().unwrap().iter_mut().enumerate() {
+            *s = 0x1000 * (i as u64 + 1);
+        }
+        root.as_mut_slice().unwrap()[0] = orr_scene::PoolRoot {
+            bits: bits.gpu(),
+            summary: summary.gpu().cast(),
+            frees: frees.gpu().cast(),
+            takes: takes.gpu(),
+            taken: taken.gpu(),
+            sizes: sizes.gpu(),
+            sources: sources.gpu(),
+            units: units.gpu(),
+            destinations: destinations.gpu(),
+            moves: moves.gpu(),
+            move_count: count.gpu(),
+            base,
+            pages: PAGES,
+            words: WORDS,
+            free_count: free_list.len() as u32,
+            take_count: take_list.len() as u32,
+            clas_count: N as u32,
+            flags: u32::from(round == 0),
+            _pad: 0,
+        };
+        let mut list = render.command_list().unwrap();
+        list.dispatch(&pipeline, root.gpu(), [1, 1, 1]);
+        list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+        orr_scene::testing::wait(render.submit(vec![list], &[]).unwrap());
+
+        assert_eq!(
+            &taken.as_slice().unwrap()[..take_list.len()],
+            expect_taken.as_slice(),
+            "takes of round {round}"
+        );
+        assert_eq!(
+            units.as_slice().unwrap(),
+            expect_units.as_slice(),
+            "units of round {round}"
+        );
+        let placed: Vec<u64> = expect_units
+            .iter()
+            .filter(|&&u| u != u32::MAX)
+            .map(|&u| base + 128 * u64::from(u))
+            .collect();
+        assert_eq!(count.as_slice().unwrap()[0] as usize, placed.len());
+        assert_eq!(
+            &destinations.as_slice().unwrap()[..placed.len()],
+            placed.as_slice()
+        );
+    }
+    assert_clean();
+}

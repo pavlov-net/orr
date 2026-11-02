@@ -92,6 +92,11 @@ pub struct Budgets {
     pub ptlas_rebuilt: u32,
     /// Bytes of resident mesh pages.
     pub mesh_page_pool: u64,
+    /// Bytes of pages a DAG mesh keeps resident from mount; the pages of a larger one past
+    /// its pinned coarsest pages stream on the traversal's requests.
+    pub mesh_resident_max: u64,
+    /// Bytes of the address range streamed pages' CLAS take, bound in pages as they need.
+    pub clas_pool: u64,
     /// Bytes of resident hierarchy pages.
     pub hierarchy_page_pool: u64,
     /// Bytes of resident textures: whole textures, streamed textures' mip tails and tiles.
@@ -131,6 +136,8 @@ impl Default for Budgets {
             micromap_pages: 64,
             ptlas_rebuilt: 250_000,
             mesh_page_pool: 3 << 30,
+            mesh_resident_max: 1 << 20,
+            clas_pool: 1 << 30,
             hierarchy_page_pool: 256 << 20,
             texture_pool: 4 << 30,
             instance_page_pool: 256 << 20,
@@ -397,6 +404,7 @@ impl Scenes {
             limits: AccelLimits {
                 clas_triangles: b.stream_clas_triangles,
                 micromaps: b.micromap_pages,
+                mesh_resident_max: b.mesh_resident_max,
             },
             cluster_ids: Mutex::new(RangeAllocator::new(b.resident_clusters)),
             cluster_capacity: b.resident_clusters,
@@ -874,7 +882,7 @@ impl Scenes {
                     f.stats.skin.add(&skin.figures(slot));
                 }
             }
-            core.mounts.node_feedback(&feedback, frame);
+            core.mounts.page_feedback(&feedback, frame);
             core.mounts.streaming.texture_feedback(slot, f.id);
             core.completed_frame = f.id;
             core.stats = f.stats;

@@ -6,12 +6,13 @@
 // `traverse` runs one level: an internal node pushes the children whose projected error
 // exceeds a cut's threshold, a leaf applies the cluster rule to its group's clusters and
 // writes raster candidate items and ray-tracing cut clusters. A child in a non-resident
-// node page stops the cut at its parent: the slot's errors for that cut are scaled so the
-// parent is not entered, the page is requested, and with `retry` a second traversal
-// replaces the slot's output for that cut. `assign`, `share` and `link` then give each
-// gathered ray-tracing cut a cached cut equal to it, the BLAS another slot with an equal cut
-// builds, a BLAS of its own within the frame's budget, or else its cached cut; `gather`
-// writes the CLAS addresses each built BLAS takes and `jobs` its build record.
+// node page stops the cut at its parent, and a leaf whose group's mesh page is not resident
+// stops it at the coarser clusters the group simplifies into: the slot's errors for that
+// cut are scaled so neither is entered, the page is requested, and with `retry` a second
+// traversal replaces the slot's output for that cut. `assign`, `share` and `link` then give
+// each gathered ray-tracing cut a cached cut equal to it, the BLAS another slot with an
+// equal cut builds, a BLAS of its own within the frame's budget, or else its cached cut;
+// `gather` writes the CLAS addresses each built BLAS takes and `jobs` its build record.
 #include "orr/root.h"
 import orr.abi;
 import orr.math;
@@ -458,16 +459,15 @@ bool node_at(MeshGpu* mesh, uint node, out Node* at, out uint page)
     return true;
 }
 
-// Tells the loading side about node page `page` once a frame.
-void report(SceneRoot* s, CutGpu* cut, MeshGpu* mesh, uint mesh_index, uint page, uint kind, float error)
+// Tells the loading side about page `page` once a frame, `stamps` holding the frame each
+// page was last reported.
+void report(SceneRoot* s, CutGpu* cut, uint* stamps, uint mesh_index, uint page, uint kind, float error)
 {
-    if (page == 0xffffffff || ((NodePage*)mesh.node_table)[page].parent_page == NODE_PAGE_TOP)
-        return;
     uint old;
-    InterlockedExchange(mesh.node_stamps[page], s.frame_index, old);
+    InterlockedExchange(stamps[page], s.frame_index, old);
     if (old == s.frame_index)
         return;
-    if (kind == FEEDBACK_REQUEST)
+    if ((kind & FEEDBACK_TOUCH) == 0)
         InterlockedAdd(cut.counters[CUT_REQUESTS], 1);
     uint at;
     InterlockedAdd(cut.counters[CUT_FEEDBACK], 1, at);
@@ -479,6 +479,43 @@ void report(SceneRoot* s, CutGpu* cut, MeshGpu* mesh, uint mesh_index, uint page
     f.kind = kind;
     f.error = error;
     cut.feedback[at] = f;
+}
+
+// Node page `page`, unless it is pinned.
+void report_node_page(SceneRoot* s, CutGpu* cut, MeshGpu* mesh, uint mesh_index, uint page, uint kind, float error)
+{
+    if (page == 0xffffffff || ((NodePage*)mesh.node_table)[page].parent_page == NODE_PAGE_TOP)
+        return;
+    report(s, cut, mesh.node_stamps, mesh_index, page, kind, error);
+}
+
+// Mesh page `page`, if it streams.
+void report_mesh_page(SceneRoot* s, CutGpu* cut, MeshGpu* mesh, uint mesh_index, uint page, uint kind, float error)
+{
+    if (mesh.page_stamps == nullptr || page < mesh.pinned_pages)
+        return;
+    report(s, cut, mesh.page_stamps, mesh_index, page, kind | FEEDBACK_MESH_PAGE, error);
+}
+
+// Scales the slot's errors so that, in the cuts of `mask`, nothing of projected error
+// `error` over `sphere` is entered, and marks those cuts for retry. Returns the largest
+// projected error.
+float coarsen(SlotCutGpu* c, Placement p, Lod l, uint mask, float4 sphere, float error)
+{
+    float worst = 0.0;
+    for (uint k = 0; k < 2; k++)
+    {
+        if ((mask & (1u << k)) == 0)
+            continue;
+        float e = focus_error(p, sphere, error * l.scale[k]);
+        worst = max(worst, e);
+        if (isfinite(e) && e > 0.0)
+        {
+            InterlockedMin(c.coarsen[k], asuint(0.999 * l.threshold[k] / e));
+            InterlockedOr(c.flags, k == 0 ? CUT_RETRY_RASTER : CUT_RETRY_RT);
+        }
+    }
+    return worst;
 }
 
 // Whether cluster `cl` of a group at `depth` with error `group_error` is in cut `k`.
@@ -534,23 +571,11 @@ void traverse(uint3 id: SV_DispatchThreadID)
             // The cut stops here: the slot's errors scale so this node is not entered.
             if (retry)
                 return;
-            float worst = 0.0;
-            for (uint k = 0; k < 2; k++)
-            {
-                if ((mask & (1u << k)) == 0)
-                    continue;
-                float e = focus_error(p, node.sphere, node.max_error * l.scale[k]);
-                worst = max(worst, e);
-                if (isfinite(e) && e > 0.0)
-                {
-                    InterlockedMin(c.coarsen[k], asuint(0.999 * l.threshold[k] / e));
-                    InterlockedOr(c.flags, k == 0 ? CUT_RETRY_RASTER : CUT_RETRY_RT);
-                }
-            }
-            report(s, cut, mesh, model.mesh, child_page, FEEDBACK_REQUEST, worst);
+            float worst = coarsen(c, p, l, mask, node.sphere, node.max_error);
+            report_node_page(s, cut, mesh, model.mesh, child_page, FEEDBACK_REQUEST, worst);
             return;
         }
-        report(s, cut, mesh, model.mesh, child_page, FEEDBACK_TOUCH, 0.0);
+        report_node_page(s, cut, mesh, model.mesh, child_page, FEEDBACK_TOUCH, 0.0);
         for (uint i = 0; i < node.child_count; i++)
         {
             Node child = children[i];
@@ -574,7 +599,15 @@ void traverse(uint3 id: SV_DispatchThreadID)
     Group g = ((Group*)mesh.groups)[node.group];
     uint8_t* data = (uint8_t*)mesh.pages[g.page];
     if (data == nullptr)
+    {
+        // The cut stops at the coarser clusters this group simplifies into.
+        if (retry)
+            return;
+        float worst = coarsen(c, p, l, mask, g.simplified, g.error);
+        report_mesh_page(s, cut, mesh, model.mesh, g.page, FEEDBACK_REQUEST, worst);
         return;
+    }
+    report_mesh_page(s, cut, mesh, model.mesh, g.page, FEEDBACK_TOUCH, 0.0);
     uint mesh_first = mesh.page_clusters[g.page] + g.first_cluster;
     for (uint run = 0; run < g.cluster_count; run += 32)
     {

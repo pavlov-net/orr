@@ -135,6 +135,23 @@ impl Block {
         }
         true
     }
+
+    /// Copies `out.len()` bytes from `at` of a mapped block; false, reading nothing, for an
+    /// unmapped one.
+    pub(crate) fn read_mapped(&self, at: u64, out: &mut [u8]) -> bool {
+        assert!(at + out.len() as u64 <= self.size, "read outside its block");
+        let Some(p) = self.cpu else { return false };
+        // SAFETY: the assert above keeps the read inside the block's mapping, which outlives
+        // its readers; the GPU work that wrote it has completed.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (p as *const u8).add(at as usize),
+                out.as_mut_ptr(),
+                out.len(),
+            );
+        }
+        true
+    }
 }
 
 /// A streamed class's memory: blocks of one kind, sub-allocated in units of a fixed size. A

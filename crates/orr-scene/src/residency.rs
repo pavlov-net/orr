@@ -89,6 +89,8 @@ pub struct ResidencyStats {
     pub dropped: u32,
     /// Units whose read or decode failed since the mount; they are not requested again.
     pub failed: u32,
+    /// Bytes bound in the CLAS pool that streamed mesh pages build into.
+    pub clas_pool_bytes: u64,
 }
 
 impl ResidencyStats {
@@ -227,6 +229,10 @@ impl Residency {
 
     pub(crate) fn stats(&self) -> &ResidencyStats {
         &self.stats
+    }
+
+    pub(crate) fn note_clas_pool(&mut self, bytes: u64) {
+        self.stats.clas_pool_bytes = bytes;
     }
 
     /// The budget of class `c` under the current memory pressure.

@@ -95,14 +95,15 @@ public struct CutKey
 }
 
 // `FeedbackGpu.kind`.
-public static const uint FEEDBACK_REQUEST = 0;   // a node page the traversal needed
-public static const uint FEEDBACK_TOUCH = 1;     // a resident node page it read
+public static const uint FEEDBACK_REQUEST = 0;   // a page the traversal needed
+public static const uint FEEDBACK_TOUCH = 1;     // a resident page it read
+public static const uint FEEDBACK_MESH_PAGE = 2; // with either: a mesh page, else a node page
 
 // What the traversal tells the loading side, read back once the frame completes.
 public struct FeedbackGpu
 {
     public uint mesh;              // in SceneRoot.meshes
-    public uint page;              // node page of the mesh
+    public uint page;              // node page or mesh page of the mesh
     public uint kind;              // FEEDBACK_*
     public float error;            // pixels the page's nodes would refine
 }
