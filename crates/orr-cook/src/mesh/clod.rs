@@ -3,10 +3,9 @@
 //! positions it needs and moves only its own vertices when it dilates borders; groups come
 //! out in the order the original emits them, with the same numbering.
 
-use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasherDefault, Hasher};
-
 use meshopt::{SimplifyOptions, SimplifyVertex, ffi};
+
+use super::hash;
 use rayon::prelude::*;
 
 /// A sphere and the simplification error of the geometry it bounds.
@@ -71,32 +70,6 @@ impl Positions {
 
 const LOCK: u8 = SimplifyVertex::Lock.bits();
 const PROTECT: u8 = SimplifyVertex::Protect.bits();
-
-/// `HashSet`/`HashMap` hashing of integer keys by one multiply, as clusterlod.h's tables.
-#[derive(Default)]
-struct Mix(u64);
-
-impl Hasher for Mix {
-    fn finish(&self) -> u64 {
-        self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = self.0 << 8 | u64::from(b);
-        }
-    }
-
-    fn write_u32(&mut self, v: u32) {
-        self.0 = u64::from(v);
-    }
-
-    fn write_u64(&mut self, v: u64) {
-        self.0 = v;
-    }
-}
-
-type Fast = BuildHasherDefault<Mix>;
 
 fn bounds_compute(positions: &[f32], indices: &[u32], error: f32) -> Bounds {
     // SAFETY: `indices` refer to vertices of `positions`.
@@ -413,7 +386,7 @@ fn boundary_area(
     indices: &[u32],
     locks: &[u8],
     remap: &[u32],
-    edges: &mut HashSet<u64, Fast>,
+    edges: &mut hash::Set<u64>,
 ) -> f32 {
     edges.clear();
     let edge = |t: &[u32], e: usize| {
@@ -465,7 +438,7 @@ fn dilate_borders(
     remap: &[u32],
     bounds: &mut Bounds,
 ) {
-    let mut edges = HashSet::default();
+    let mut edges = hash::Set::default();
     let old_area = boundary_area(positions.read(), merged, locks, remap, &mut edges);
     if old_area == 0.0 {
         return;
@@ -474,7 +447,7 @@ fn dilate_borders(
     if new_area >= old_area || new_area < old_area / 4.0 {
         return;
     }
-    let mut offsets: HashMap<u32, [f32; 4], Fast> = HashMap::default();
+    let mut offsets: hash::Map<u32, [f32; 4]> = hash::Map::default();
     let mut perimeter = 0.0f32;
     let at = |v: u32| positions.get(v as usize);
     for t in simplified.chunks_exact(3) {
