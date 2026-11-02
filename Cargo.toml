@@ -79,6 +79,10 @@ opt-level = 3
 [profile.dev.package.orr-pack]
 opt-level = 3
 
+# Examples and tests cook content in process.
+[profile.dev.package.orr-cook]
+opt-level = 3
+
 # The spectral reference integrator runs in tests.
 [profile.dev.package.orr-atmosphere]
 opt-level = 3
