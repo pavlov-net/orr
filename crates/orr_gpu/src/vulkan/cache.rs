@@ -1,6 +1,6 @@
 //! The disk pipeline cache: one `VkPipelineCache` that every pipeline compiles through. The
 //! file holds the device identity, the cache data and a checksum; a file from another device,
-//! driver or format is ignored and rebuilt.
+//! driver or format, or one the driver refuses, is ignored and rebuilt.
 
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -102,7 +102,8 @@ pub(crate) struct PipelineCache {
 }
 
 impl PipelineCache {
-    /// Opens the cache at `path`. A missing, damaged or foreign file starts it empty.
+    /// Opens the cache at `path`. A missing, damaged or foreign file starts it empty; so does one
+    /// the driver refuses, which is removed.
     pub(crate) fn open(
         device: &ash::Device,
         props: &vk::PhysicalDeviceProperties,
@@ -140,14 +141,35 @@ impl PipelineCache {
             }
             None => &[],
         };
-        let info = vk::PipelineCacheCreateInfo::default().initial_data(initial);
-        // SAFETY: the data was written by vkGetPipelineCacheData for this device and driver;
-        // the driver checks its own header too.
-        match unsafe { device.create_pipeline_cache(&info, None) } {
-            Ok(pc) => {
-                cache.cache = pc;
-                cache.loaded = !initial.is_empty();
+        let create = |data: &[u8]| {
+            let info = vk::PipelineCacheCreateInfo::default().initial_data(data);
+            // SAFETY: the data is empty or passed the checks above, so it came from
+            // vkGetPipelineCacheData on this device and driver; the driver checks its own header
+            // too.
+            unsafe { device.create_pipeline_cache(&info, None) }
+        };
+        // Running out of memory says nothing about the file, which stays for the next run.
+        let oom = [
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+        ];
+        let created = match create(initial) {
+            Err(e) if !initial.is_empty() && !oom.contains(&e) => {
+                log::warn!(
+                    "pipeline cache {}: the driver refused the file ({e:?})",
+                    path.display()
+                );
+                cache.rejected = Some(format!("the driver refused it ({e:?})"));
+                let _ = std::fs::remove_file(path);
+                create(&[])
             }
+            other => {
+                cache.loaded = other.is_ok() && !initial.is_empty();
+                other
+            }
+        };
+        match created {
+            Ok(pc) => cache.cache = pc,
             Err(e) => log::warn!("pipeline cache: vkCreatePipelineCache failed ({e:?})"),
         }
         match &cache.rejected {

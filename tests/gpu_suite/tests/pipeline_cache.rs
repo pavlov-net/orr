@@ -1,11 +1,11 @@
-//! The disk pipeline cache: warm loads, files from another driver or device and creation
-//! from several threads.
+//! The disk pipeline cache: warm loads, files from another driver or device, files the driver
+//! refuses and creation from several threads.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use gpu_suite::log_to_stderr;
 use gpu_suite::shaders::cached;
+use gpu_suite::{log_to_stderr, require};
 use orr_gpu::{
     ClearColor, ColorAttachment, ColorLoad, ColorTarget, ComputePipeline, Device, DeviceDesc,
     Format, Hazards, MemoryKind, MeshPipeline, MeshPipelineDesc, QueueKind, RayDispatchPipeline,
@@ -145,7 +145,12 @@ fn rewrite_header(path: &Path, offset: usize, f: impl FnOnce(u32) -> u32) {
     let field = &mut bytes[offset..offset + 4];
     let v = f(u32::from_le_bytes(field.try_into().unwrap()));
     field.copy_from_slice(&v.to_le_bytes());
-    let body = bytes.len() - 32;
+    write_checksummed(path, bytes);
+}
+
+/// Writes a cache file after fixing its trailing checksum.
+fn write_checksummed(path: &Path, mut bytes: Vec<u8>) {
+    let body = bytes.len() - CHECKSUM;
     let sum = blake3::hash(&bytes[..body]);
     bytes[body..].copy_from_slice(sum.as_bytes());
     std::fs::write(path, bytes).unwrap();
@@ -154,6 +159,9 @@ fn rewrite_header(path: &Path, offset: usize, f: impl FnOnce(u32) -> u32) {
 /// Header offsets of the device id and driver version.
 const DEVICE_ID: usize = 16;
 const DRIVER_VERSION: usize = 20;
+/// Bytes before the cache data: magic, format, vendor, device, driver version, cache UUID.
+const HEADER: usize = 24 + 16;
+const CHECKSUM: usize = 32;
 
 fn assert_clean(d: &Device) {
     assert_eq!(
@@ -211,6 +219,61 @@ fn round_trip_and_refuse_foreign_files() {
         drop((set, d));
         std::fs::write(path, saved).unwrap();
     }
+}
+
+/// A file with good headers and a good checksum whose cache data the driver refuses is removed:
+/// the device starts empty, and the run after the next save hits. Valid usage does not allow data
+/// like this, so the test runs only where the driver is known to return an error for it.
+#[test]
+fn a_file_the_driver_refuses_is_replaced() {
+    let path = &cache_path("refused");
+    let d = open(path);
+    if !require(
+        d.caps().device_name.contains("NVIDIA"),
+        "only NVIDIA's driver is known to refuse bad cache data",
+    ) {
+        return;
+    }
+    let set = Set::new(&d, 1);
+    d.save_pipeline_cache().unwrap();
+    drop((set, d));
+
+    let mut bytes = std::fs::read(path).unwrap();
+    let body = bytes.len() - CHECKSUM;
+    let driver_header = u32::from_le_bytes(bytes[HEADER..HEADER + 4].try_into().unwrap()) as usize;
+    for (i, byte) in bytes[HEADER + driver_header..body].iter_mut().enumerate() {
+        *byte = (i * 31) as u8;
+    }
+    write_checksummed(path, bytes);
+
+    let d = open(path);
+    let report = d.pipeline_cache_report();
+    assert!(!report.loaded);
+    assert!(
+        report
+            .rejected
+            .as_deref()
+            .is_some_and(|r| r.contains("refused")),
+        "{report:?}"
+    );
+    assert!(!path.exists());
+    let set = Set::new(&d, 1);
+    set.check(&d);
+    d.save_pipeline_cache().unwrap();
+    assert_clean(&d);
+    drop((set, d));
+
+    let d = open(path);
+    assert!(d.pipeline_cache_report().loaded);
+    let set = Set::new(&d, 1);
+    assert_eq!(
+        set.cached,
+        [true, true],
+        "after replacing: {:?}",
+        d.pipeline_cache_report()
+    );
+    set.check(&d);
+    assert_clean(&d);
 }
 
 #[test]
