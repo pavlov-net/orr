@@ -1845,6 +1845,7 @@ fn stream_sheets(dev: &Device) {
     let (_, near) = mesh_of(&scenes, &gpu, models[0]);
     let landed: Vec<usize> = (pinned..near.len()).filter(|&p| near[p] != 0).collect();
     assert!(!landed.is_empty(), "streamed pages landed");
+    // Streamed pages decode on the loading queue into the bytes of the CPU decode.
     for &p in &landed {
         let stored = blob(&a, e, info.pages[p].blob as usize);
         let mut resident = vec![0; info.pages[p].resident_len as usize];

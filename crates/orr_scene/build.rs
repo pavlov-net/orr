@@ -45,11 +45,13 @@ fn main() {
     println!("cargo:rerun-if-changed=src/pattern.rs");
     write_patterns(&out_dir);
     let pack = env::var("DEP_ORR_PACK_SHADER_DIRS").expect("orr_pack shader roots");
+    let pack_types = env::var("DEP_ORR_PACK_TYPES").expect("orr_pack type map");
     let gpu = env::var("DEP_ORR_GPU_SHADER_DIRS").expect("orr_gpu shader roots");
     let out = Build::new().and_then(|b| {
         b.kernels(&src)
             .roots(&pack)
             .roots(&gpu)
+            .types(&pack_types)
             .extern_type("ViewConstants", "crate::ViewConstants")
             .extern_type("ExposureState", "crate::ExposureState")
             .extern_type("VolumeGpu", "crate::VolumeGpu")
