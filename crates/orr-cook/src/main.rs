@@ -100,6 +100,16 @@ fn build(args: &[String]) -> Result<bool> {
             if a.written { "" } else { ", unchanged" }
         )?;
     }
+    for a in &cooked.report.assets {
+        for w in &a.warnings {
+            writeln!(out, "warning: {}: {w}", a.name)?;
+        }
+        for e in &a.entries {
+            for w in &e.warnings {
+                writeln!(out, "warning: {}: {w}", e.name)?;
+            }
+        }
+    }
     for a in cooked.report.assets.iter().flat_map(|a| &a.assemblies) {
         writeln!(
             out,

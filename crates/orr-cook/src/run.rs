@@ -59,7 +59,8 @@ use crate::{
     PrototypeSpec, Result, Source, TextureSettings, UsdSettings, mount,
 };
 
-/// Each cache of decoded data holds up to this part of the working set.
+/// Each of the two caches of decoded data holds up to this part of the working set, which
+/// the jobs' estimates leave free.
 const DECODED_SHARE: u64 = 16;
 
 /// Peak bytes of a subdivision cage cook per cage face, an estimate.
@@ -252,6 +253,8 @@ struct Imported {
     /// then `<asset>/instances/<k>` for each further 65536 models.
     instances: Vec<Instances>,
     assemblies: Vec<Assembly>,
+    /// For the asset's report and its record.
+    warnings: Vec<String>,
 }
 
 /// An instance source waiting for the keys of the models it places.
@@ -456,6 +459,11 @@ impl<'m, 's> Run<'m, 's> {
             Source::Texture { path, settings } => {
                 let hash = self.shared.memo.hash(path)?;
                 self.input(a, index, path);
+                let header = texture::file_header(path);
+                if header.is_some_and(|h| h.1) {
+                    let warning = texture::first_frame_warning(name);
+                    self.assets[index].warnings.push(warning);
+                }
                 let key = Key::new(Class::Texture, name)
                     .str(&texture::encoders(self.shared.quality))
                     .debug(settings)
@@ -465,7 +473,7 @@ impl<'m, 's> Run<'m, 's> {
                     name,
                     Class::Texture as u16,
                     key,
-                    texture_file_working_set(path),
+                    texture_file_working_set(path, header.map(|h| h.0)),
                     Work::TextureFile(path.clone(), hash, settings.clone()),
                 );
                 self.add_units(a, index, vec![unit]);
@@ -667,6 +675,9 @@ impl<'m, 's> Run<'m, 's> {
             self.input(a, asset, &f.path);
         }
         self.add_assemblies(a, record.assemblies.iter().cloned());
+        self.assets[asset]
+            .warnings
+            .extend_from_slice(&record.warnings);
         self.records[a].push(record.clone());
         Ok(true)
     }
@@ -878,11 +889,15 @@ impl<'m, 's> Run<'m, 's> {
             self.input(a, asset, &f.path);
         }
         self.add_assemblies(a, imported.assemblies.iter().cloned());
+        self.assets[asset]
+            .warnings
+            .extend_from_slice(&imported.warnings);
         self.records[a].push(Record {
             identity,
             files: imported.files,
             units: keys,
             assemblies: imported.assemblies,
+            warnings: imported.warnings,
         });
         for (k, src) in imported.instances.into_iter().enumerate() {
             let base = format!("{}/instances", self.assets[asset].name);
@@ -1580,15 +1595,11 @@ fn subd_facts(a: &Archive, e: &orr_pack::Entry) -> Option<(Aabb, ModelFacts)> {
 }
 
 /// Estimated peak of a texture cook: 64 B per source texel when the header gives the size.
-fn texture_file_working_set(path: &Path) -> u64 {
-    image::ImageReader::open(path)
-        .and_then(image::ImageReader::with_guessed_format)
-        .ok()
-        .and_then(|r| r.into_dimensions().ok())
-        .map_or_else(
-            || std::fs::metadata(path).map_or(0, |m| m.len() * 64),
-            |(w, h)| u64::from(w) * u64::from(h) * 64,
-        )
+fn texture_file_working_set(path: &Path, size: Option<[u32; 2]>) -> u64 {
+    size.map_or_else(
+        || std::fs::metadata(path).map_or(0, |m| m.len() * 64),
+        |[w, h]| u64::from(w) * u64::from(h) * 64,
+    )
 }
 
 /// Imports a scene or material document and plans its units.
@@ -1670,6 +1681,11 @@ fn plan_scene(
     used.sort_unstable();
     used.dedup();
     let facts: HashMap<usize, ImageFacts> = image_facts(name, &mut src.images, &used, memo)?;
+    let warnings = used
+        .iter()
+        .filter(|i| facts[*i].animated)
+        .map(|&i| texture::first_frame_warning(&src.images[i].name))
+        .collect();
     for i in &used {
         if let ImageData::File {
             path,
@@ -1776,6 +1792,7 @@ fn plan_scene(
         units,
         instances,
         assemblies,
+        warnings,
     })
 }
 

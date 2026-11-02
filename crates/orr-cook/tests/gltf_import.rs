@@ -1196,6 +1196,122 @@ fn webp_textures_replace_their_core_source() {
     }
 }
 
+/// An animated WebP of 16x16 frames from lossless stills, canvas flags on, frames not blended.
+fn animated_webp(frames: &[Vec<u8>]) -> Vec<u8> {
+    let chunk = |tag: &[u8; 4], data: &[u8]| {
+        let mut c = tag.to_vec();
+        c.extend((data.len() as u32).to_le_bytes());
+        c.extend(data);
+        c.resize(c.len().next_multiple_of(2), 0);
+        c
+    };
+    // Canvas and frame sizes are stored minus one, in 24 bits.
+    let size = [15, 0, 0, 15, 0, 0];
+    let mut body = b"WEBP".to_vec();
+    body.extend(chunk(b"VP8X", &[&[0x02, 0, 0, 0][..], &size].concat()));
+    body.extend(chunk(b"ANIM", &[0; 6]));
+    for still in frames {
+        // A still is RIFF, its size and WEBP, then the frame's chunk.
+        let duration = [100, 0, 0];
+        let frame = [&[0; 6][..], &size, &duration, &[0x02], &still[12..]].concat();
+        body.extend(chunk(b"ANMF", &frame));
+    }
+    let mut file = b"RIFF".to_vec();
+    file.extend((body.len() as u32).to_le_bytes());
+    file.extend(body);
+    file
+}
+
+#[test]
+fn animated_webp_warns_on_every_cook() {
+    let d = dir("gltf-webp-animated");
+    let still = |v: u8, ramp: u8| {
+        encode(image::ImageFormat::WebP, 16, 16, |x, _| {
+            [v + ramp * x as u8, 0, 0, 255]
+        })
+    };
+    let glb = |name: &str, webp: &[u8]| {
+        let mut g = Glb::default();
+        let prims = per_material(&mut g, 1);
+        let image = g.image(webp);
+        let path = d.join(name);
+        g.write(
+            &path,
+            &format!(
+                r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+"meshes":[{{"primitives":[{prims}]}}],
+"extensionsUsed":["EXT_texture_webp","KHR_materials_clearcoat"],
+"extensionsRequired":["EXT_texture_webp"],
+"materials":[{{"extensions":{{"KHR_materials_clearcoat":{{"clearcoatFactor":1.0,"clearcoatTexture":{{"index":0}}}}}}}}],
+"textures":[{{"extensions":{{"EXT_texture_webp":{{"source":0}}}}}}],
+"images":[{{"name":"flip","bufferView":{image},"mimeType":"image/webp"}}]"#
+            ),
+        );
+        path
+    };
+    let webp = animated_webp(&[still(40, 1), still(200, 1)]);
+    let varied = glb("varied.glb", &webp);
+    // A flat first frame folds into the material's factor, with no texture to carry a warning.
+    let flat = glb("flat.glb", &animated_webp(&[still(40, 0), still(200, 1)]));
+    let (file, quiet) = (d.join("animated.webp"), d.join("still.webp"));
+    std::fs::write(&file, &webp).unwrap();
+    std::fs::write(&quiet, still(40, 1)).unwrap();
+
+    let (a, _) = cook(&varied, GltfSettings::default()).unwrap();
+    let mip = texture_mip(&a, "g/texture/0/coat", 0);
+    for x in 0..16u8 {
+        let want = f32::from(40 + x) / 255.0;
+        let got = mip.texel(x.into(), 3);
+        assert!((got - want).abs() <= 4.0 / 255.0, "texel {x}: {got}");
+    }
+
+    let gltf = |name: &str, path: &Path| AssetSpec {
+        name: name.into(),
+        source: Source::Gltf {
+            path: path.into(),
+            settings: GltfSettings::default(),
+        },
+    };
+    let texture = |name: &str, path: &Path| AssetSpec {
+        name: name.into(),
+        source: Source::Texture {
+            path: path.into(),
+            settings: Default::default(),
+        },
+    };
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(
+            Target::File(d.join("out.orr")),
+            vec![
+                gltf("varied", &varied),
+                gltf("flat", &flat),
+                texture("file", &file),
+                texture("still", &quiet),
+            ],
+        )],
+    };
+    let warning =
+        |image: &str| format!("image {image} is animated; only its first frame is cooked");
+    // The second cook links every entry from the first's archive.
+    for outcome in [orr_cook::Outcome::Cooked, orr_cook::Outcome::Archive] {
+        let report = orr_cook::cook(&manifest, &Default::default())
+            .unwrap()
+            .report;
+        let assets = &report.assets;
+        assert!(
+            assets
+                .iter()
+                .flat_map(|a| &a.entries)
+                .all(|e| e.outcome == outcome)
+        );
+        assert_eq!(assets[0].warnings, [warning("flip")], "{outcome:?}");
+        assert_eq!(assets[1].warnings, [warning("flip")], "{outcome:?}");
+        assert!(!assets[1].entries.iter().any(|e| e.class == "texture"));
+        assert_eq!(assets[2].warnings, [warning("file")], "{outcome:?}");
+        assert!(assets[3].warnings.is_empty());
+    }
+}
+
 #[test]
 fn a_texture_on_texcoord_1_binds_uv_set_1_and_the_mesh_stores_it() {
     let d = dir("gltf-texcoord-1");

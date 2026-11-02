@@ -1,13 +1,17 @@
 //! Image files to float texels: PNG, JPEG, WebP, Radiance HDR and OpenEXR through `image`,
 //! KTX2 and DDS through ctt's readers, block-compressed texels decoded with bcdec. KTX2 files
 //! of BCn blocks, plain or zstd-compressed, are read here instead, each level decompressed
-//! once straight into its blocks. Formats are recognized by their bytes.
+//! once straight into its blocks. Formats are recognized by their bytes. An animated WebP
+//! decodes to its first frame.
 
 use std::borrow::Cow;
-use std::io::{BufReader, Cursor, Read};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek};
+use std::path::Path;
 
 use ctt::input::{InputOverrides, decode_container};
 use ctt::{ColorSpace, FormatExt, TextureKind};
+use image::ImageDecoder;
+use image::codecs::webp::WebPDecoder;
 use orr_pack::texture::{FormatInfo, full_mip_count, mip_size, vk};
 use rayon::prelude::*;
 
@@ -440,6 +444,35 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
         blocks: None,
         rg: false,
     })
+}
+
+/// An image's size and whether it is an animated WebP, from its headers; `None` when `image`
+/// does not read the file, and decoding it reports why.
+fn header<R: BufRead + Seek>(reader: image::ImageReader<R>) -> Option<([u32; 2], bool)> {
+    if reader.format() == Some(image::ImageFormat::WebP) {
+        let d = WebPDecoder::new(reader.into_inner()).ok()?;
+        let (w, h) = d.dimensions();
+        return Some(([w, h], d.has_animation()));
+    }
+    let (w, h) = reader.into_dimensions().ok()?;
+    Some(([w, h], false))
+}
+
+/// [`header`] of the image file at `path`.
+pub(crate) fn file_header(path: &Path) -> Option<([u32; 2], bool)> {
+    image::ImageReader::open(path)
+        .and_then(image::ImageReader::with_guessed_format)
+        .ok()
+        .and_then(header)
+}
+
+/// Whether an image file's bytes are an animated WebP.
+pub(crate) fn is_animated(bytes: &[u8]) -> bool {
+    image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(header)
+        .is_some_and(|h| h.1)
 }
 
 fn png_cicp(bytes: &[u8]) -> Result<Option<png::CodingIndependentCodePoints>, String> {
