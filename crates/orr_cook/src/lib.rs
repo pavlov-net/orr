@@ -276,8 +276,9 @@ pub struct GltfSettings {
 /// How [`cook`] runs.
 #[derive(Clone, Debug)]
 pub struct CookOptions {
-    /// Jobs that run at once and threads of the rayon pool, which the cook builds as the
-    /// global pool unless the process already has one; 0 uses one per core.
+    /// Threads of the rayon pool, which the cook builds as the global pool unless the
+    /// process already has one; 0 uses one per core. Half as many cook jobs run at once, at
+    /// least one.
     pub jobs: usize,
     /// Cook every entry, ignoring the cache, the archive being replaced and the cookstate.
     pub force: bool,

@@ -78,10 +78,7 @@ pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
         cache: opts.cache.as_deref().map(Cache::new).transpose()?,
         zstd_level: opts.zstd_level,
     };
-    let threads = match opts.jobs {
-        0 => std::thread::available_parallelism().map_or(1, usize::from),
-        n => n,
-    };
+    let threads = rayon::current_num_threads();
     let mut run = Run::new(manifest, opts, &shared)?;
     // Jobs run on threads of their own and their parallel loops on the pool, so a pool
     // thread waiting on one job's loop never starts another job on its stack.
@@ -758,7 +755,9 @@ impl<'m, 's> Run<'m, 's> {
         self.instance_units()?;
         self.link_all()?;
         self.open_writers()?;
-        self.cook_all(scope, threads, &tx, &rx)
+        // Half as many jobs as threads: their parallel loops take the rest, and more jobs
+        // at once cost more CPU time and memory without finishing sooner.
+        self.cook_all(scope, (threads / 2).max(1), &tx, &rx)
     }
 
     /// Imports every changed scene source, largest file first.
@@ -1090,7 +1089,7 @@ impl<'m, 's> Run<'m, 's> {
     fn cook_all<'t>(
         &mut self,
         scope: &'t Scope<'t, '_>,
-        threads: usize,
+        jobs: usize,
         tx: &mpsc::Sender<Msg>,
         rx: &mpsc::Receiver<Msg>,
     ) -> Result<()>
@@ -1130,7 +1129,7 @@ impl<'m, 's> Run<'m, 's> {
             );
             for u in candidates {
                 let ws = self.units[u].working_set;
-                if running >= threads || (running > 0 && bytes + ws > self.opts.working_set) {
+                if running >= jobs || (running > 0 && bytes + ws > self.opts.working_set) {
                     break;
                 }
                 if self.ready.remove(&(Reverse(ws), u)) {
