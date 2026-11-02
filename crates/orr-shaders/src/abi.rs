@@ -85,6 +85,13 @@ macro_rules! image_slot {
     };
 }
 
+/// The first of the image slots the OpenPBR tables stay in on every device. A fixed slot keeps
+/// the specialization constant of the kernels that read them, and so their pipelines, the same
+/// across table sets and runs.
+pub const OPENPBR_LUT_SLOT: u32 = 1;
+/// How many image slots the OpenPBR tables take.
+pub const OPENPBR_LUT_SLOTS: u32 = 8;
+
 image_slot!(
     /// A sampled image view's slot in the resource heap.
     TextureIndex

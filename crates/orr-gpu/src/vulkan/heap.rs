@@ -10,7 +10,8 @@ use super::garbage::{Item, RawBuffer};
 use super::memory::MemoryKind;
 use super::texture::{Texture, vk_address_mode, vk_compare, vk_filter, vk_mipmap_mode};
 use crate::{
-    Error, SamplerDesc, SamplerIndex, StorageImageIndex, TextureIndex, TimelinePoint, ViewDesc,
+    Error, OPENPBR_LUT_SLOT, OPENPBR_LUT_SLOTS, SamplerDesc, SamplerIndex, StorageImageIndex,
+    TextureIndex, TimelinePoint, ViewDesc,
 };
 
 /// Descriptor sizes and limits of one heap.
@@ -101,10 +102,11 @@ pub(crate) struct SlotAllocator {
 }
 
 impl SlotAllocator {
-    /// Image slots, which never include slot 0: it is [`TextureIndex::NONE`].
+    /// Image slots, which never include slot 0, [`TextureIndex::NONE`], or the slots reserved for
+    /// the OpenPBR tables.
     pub(crate) fn images() -> Self {
         Self {
-            next: TextureIndex::NONE.0 + 1,
+            next: OPENPBR_LUT_SLOT + OPENPBR_LUT_SLOTS,
             free: Vec::new(),
         }
     }
@@ -133,7 +135,7 @@ impl SlotAllocator {
             self.free.drain(i..i + n);
             return Some(first);
         }
-        (capacity - self.next >= count).then(|| {
+        (capacity.saturating_sub(self.next) >= count).then(|| {
             self.next += count;
             self.next - count
         })
@@ -142,6 +144,14 @@ impl SlotAllocator {
     pub(crate) fn release(&mut self, slot: u32) {
         self.free.push(slot);
     }
+}
+
+/// Panics unless the heap could have handed out `slot`.
+fn assert_freeable(slot: u32) {
+    assert!(
+        slot >= OPENPBR_LUT_SLOT + OPENPBR_LUT_SLOTS,
+        "freeing the empty or a reserved image slot: {slot}"
+    );
 }
 
 pub(crate) struct Heaps {
@@ -248,7 +258,7 @@ impl Device {
 
     /// Returns `slot` to the free list once `after` has completed.
     pub fn free_image_slot(&self, slot: u32, after: TimelinePoint) {
-        assert_ne!(slot, TextureIndex::NONE.0, "freeing the empty image slot");
+        assert_freeable(slot);
         self.shared
             .defer(self.shared.after_point(after), Item::ImageSlot(slot));
     }
@@ -256,7 +266,7 @@ impl Device {
     /// Returns `slot` to the free list once everything submitted so far has completed, as
     /// dropping a [`Texture`] does.
     pub fn free_image_slot_after_submitted(&self, slot: u32) {
-        assert_ne!(slot, TextureIndex::NONE.0, "freeing the empty image slot");
+        assert_freeable(slot);
         self.shared.defer_after_submitted(Item::ImageSlot(slot));
     }
 
@@ -345,9 +355,9 @@ mod tests {
         assert_eq!(TextureIndex::zeroed(), TextureIndex::NONE);
         assert_eq!(StorageImageIndex::zeroed(), StorageImageIndex::NONE);
         let mut a = SlotAllocator::images();
-        let run = a.take_run(3, 8).unwrap();
-        let rest: Vec<u32> = std::iter::from_fn(|| a.take(8)).collect();
-        assert_eq!((run, rest), (1, vec![4, 5, 6, 7]));
+        let run = a.take_run(3, 16).unwrap();
+        let rest: Vec<u32> = std::iter::from_fn(|| a.take(16)).collect();
+        assert_eq!((run, rest), (9, vec![12, 13, 14, 15]));
     }
 
     #[test]

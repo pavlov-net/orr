@@ -729,6 +729,27 @@ impl Shared {
         .map_err(|e| self.vk_error("vkWaitSemaphores", e))
     }
 
+    /// Blocks until everything submitted so far, on every timeline, has completed.
+    pub(crate) fn wait_submitted(&self, timeout: Duration) -> Result<(), Error> {
+        let (timelines, values): (Vec<u32>, Vec<u64>) = (0u32..)
+            .zip(self.submitted())
+            .filter(|&(_, value)| value > 0)
+            .unzip();
+        let semaphores: Vec<vk::Semaphore> = timelines
+            .iter()
+            .map(|&t| self.timeline(t).semaphore)
+            .collect();
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        // SAFETY: the semaphores are live.
+        unsafe {
+            self.device
+                .wait_semaphores(&info, timeout.as_nanos().min(u128::from(u64::MAX)) as u64)
+        }
+        .map_err(|e| self.vk_error("vkWaitSemaphores", e))
+    }
+
     /// A calibration whose tick arithmetic wraps at `mask`, the caller's valid timestamp bits.
     fn calibration(&self, mask: u64) -> Option<Calibration> {
         let calibrated = self.calibrated_fn.as_ref()?;
