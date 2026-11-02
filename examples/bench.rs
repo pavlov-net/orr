@@ -182,7 +182,7 @@ fn spreads(series: BTreeMap<&'static str, Vec<f64>>) -> Value {
 }
 
 /// `RasterView::counts` by name; the fourth word is a constant 1.
-const RASTER_COUNTS: [(usize, &str); 12] = [
+const RASTER_COUNTS: [(usize, &str); 13] = [
     (0, "visible_clusters"),
     (1, "visible_dropped"),
     (2, "second_pass_work_dropped"),
@@ -195,6 +195,7 @@ const RASTER_COUNTS: [(usize, &str); 12] = [
     (10, "occluded_clusters"),
     (11, "second_pass_clusters"),
     (12, "hidden_clusters"),
+    (17, "smoke_clusters"),
 ];
 
 fn script_report(script: Script, samples: &[Sample]) -> Value {

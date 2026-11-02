@@ -83,6 +83,12 @@ pub enum Opacity {
     /// Traced by shadow and indirect rays; drawn for primary visibility at the
     /// transparency point.
     Particle,
+    /// Traced as [`Self::Particle`], but drawn for primary visibility through the views' froxel
+    /// volumes: each triangle adds its opacity as extinction over the froxels it covers, with
+    /// its base color as scattering albedo and its emission. Smoke therefore looks soft, at the
+    /// froxels' resolution, and shows only inside the scene's `near_range`; a hook's blended
+    /// particles behind it are fogged by it.
+    Smoke,
 }
 
 impl Opacity {
@@ -97,7 +103,7 @@ impl Opacity {
             Self::Opaque | Self::AlphaTested => 0,
             Self::Dielectric => 1,
             Self::Presence => 2,
-            Self::Particle => 3,
+            Self::Particle | Self::Smoke => 3,
         }
     }
 
@@ -299,6 +305,7 @@ pub(crate) struct Accel {
 /// A set entry's GPU memory and what the frame needs of it.
 pub(crate) struct Producer {
     pub update: ProducerUpdate,
+    pub smoke: bool,
     pub max_clusters: u32,
     pub max_vertices: u32,
     pub max_segments: u32,
@@ -838,6 +845,7 @@ pub(crate) fn build(
         static_at: base.cast(),
         producer: Producer {
             update: desc.update,
+            smoke: desc.opacity == Opacity::Smoke,
             max_clusters: desc.max_clusters,
             max_vertices: desc.max_vertices,
             max_segments: desc.max_segments,

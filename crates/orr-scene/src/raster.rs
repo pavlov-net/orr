@@ -29,15 +29,16 @@ use crate::{
 const RASTER_OCCLUSION: u32 = 1;
 
 /// `RasterGpu.counts` entries and `RasterGpu.args` offsets (`visibility.slang`).
-const COUNTS: u64 = 17;
+const COUNTS: u64 = 18;
 const COUNT_DRAWS: u64 = 3;
-const ARGS: u64 = 18;
+const ARGS: u64 = 21;
 const ARGS_WORK: u64 = 0;
 const ARGS_OPAQUE: u64 = 3;
 const ARGS_ALPHA: u64 = 6;
 const ARGS_SOFTWARE: u64 = 9;
 const ARGS_PARTICLES: u64 = 12;
 const ARGS_COVERAGE: u64 = 15;
+const ARGS_SMOKE: u64 = 18;
 const MAX_HZB_MIPS: u32 = 16;
 /// Pixels per side of a resolve tile and of a layer tile (`LAYER_TILE` in `gbuffer.slang`).
 const TILE: u32 = 8;
@@ -231,6 +232,7 @@ const ALPHA: &str = "alpha clusters";
 const SOFTWARE: &str = "software clusters";
 const PARTICLES: &str = "particle clusters";
 const COVERAGE: &str = "coverage clusters";
+const SMOKE: &str = "smoke clusters";
 const LAYER_TILES: &str = "layer tiles";
 const BIN_ARGS: &str = "bin args";
 const BIN_TILES: &str = "bin tiles";
@@ -258,6 +260,7 @@ struct Transient {
     alpha: ArenaBuffer,
     software: ArenaBuffer,
     particles: ArenaBuffer,
+    smoke: ArenaBuffer,
     coverage: ArenaBuffer,
     layer_tiles: ArenaBuffer,
     bin_args: ArenaBuffer,
@@ -283,6 +286,7 @@ impl Transient {
             alpha: buffer(ALPHA),
             software: buffer(SOFTWARE),
             particles: buffer(PARTICLES),
+            smoke: buffer(SMOKE),
             coverage: buffer(COVERAGE),
             layer_tiles: buffer(LAYER_TILES),
             bin_args: buffer(BIN_ARGS),
@@ -338,6 +342,7 @@ impl ViewTargets {
                 GBUFFER,
             ),
             ArenaRequest::buffer(PARTICLES, list, GBUFFER),
+            ArenaRequest::buffer(SMOKE, list, GBUFFER),
             // Then the word marking every tile.
             ArenaRequest::buffer(
                 LAYER_TILES,
@@ -495,6 +500,7 @@ impl ViewTargets {
             software: t.software.gpu(),
             particles: t.particles.gpu(),
             coverage: t.coverage.gpu(),
+            smoke: t.smoke.gpu(),
             counts: self.counts(),
             slot_visibility: self.slot_visibility.gpu(),
             bin_args: t.bin_args.gpu(),
@@ -545,6 +551,11 @@ impl ViewTargets {
             self.args.gpu().offset(ARGS_PARTICLES).cast(),
             self.counts().offset(COUNT_DRAWS),
         )
+    }
+
+    /// Workgroups of one per visible smoke cluster.
+    pub(crate) fn smoke_args(&self) -> GpuPtr<DispatchArgs> {
+        self.args.gpu().offset(ARGS_SMOKE).cast()
     }
 
     /// `RasterGpu.counts` ([`crate::RasterView::counts`]).

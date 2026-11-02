@@ -2,7 +2,8 @@
 // linked medium to the scene's `near_range`, the aerial-perspective LUT and a march hold it past
 // that. Medium proxies the camera ray crosses are marched per pixel over its spans inside them,
 // each step lit by the froxels' isotropic light (past them, the world cache's) and by shadow rays
-// from a few points of the span, and seen through the linked medium in front of it.
+// from a few points of the span, and seen through the linked medium in front of it. Smoke comes
+// with the froxels; the reference takes each smoke triangle on the ray in turn.
 module camera_media;
 
 import orr.abi;
@@ -374,11 +375,70 @@ Fog proxy_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 p
     return out;
 }
 
+// Smoke triangles the reference's camera ray takes, the nearest; farther ones are not drawn on
+// that pixel.
+static const uint REFERENCE_SHEETS = 64;
+
+// One smoke triangle on a camera ray.
+struct SmokeSheet
+{
+    float t;
+    float opacity;
+    float3 albedo;
+    float3 emission;
+}
+
+// Keeps the nearest smoke triangle of a camera ray.
+struct NearestSheet : ICandidate
+{
+    SceneRoot* scene;
+    SmokeSheet sheet = (SmokeSheet)0;
+
+    bool positions(Candidate c)
+    {
+        return false;
+    }
+
+    [mutating]
+    float3 transmittance(Candidate c, out bool counted)
+    {
+        counted = false;
+        SmokeSheet s;
+        if (c.triangle && c.custom_index == CLASS_PARTICLE && c.cluster_id >= 0 && c.t < sheet.t
+            && resolve_smoke(scene, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, s.albedo, s.emission, s.opacity))
+        {
+            s.t = c.t;
+            sheet = s;
+        }
+        return float3(1.0);
+    }
+}
+
+// The first smoke triangle of the ray from the eye along `dir` between `after` and `t_max`, at
+// infinity if none. One ray per triangle, because a list of them in this kernel's locals (3 KB)
+// loses the device: the driver then page-faults on stack writes of other compute kernels.
+SmokeSheet next_sheet(FroxelRoot f, float3 dir, float after, float t_max)
+{
+    NearestSheet nearest = { f.scene, (SmokeSheet)0 };
+    nearest.sheet.t = positive_infinity();
+    if (f.smoke == nullptr || !(after < t_max))
+        return nearest.sheet;
+    RayDesc ray;
+    ray.Origin = f.view.eye_render.xyz;
+    ray.Direction = dir;
+    ray.TMin = after;
+    ray.TMax = t_max;
+    bool overflow;
+    trace_transmittance(f.scene.tlas, ray, MASK_PARTICLE, RAY_FLAG_NONE, nearest, 0, overflow);
+    return nearest.sheet;
+}
+
 // The reference camera segment: in-scatter (pre-exposed) over `t` m from the eye along `dir`,
 // to the scene's `near_range` in the linked medium on sky pixels and to the end of the spans
 // in the proxies. Jittered steps at the proxies' voxel spacing, at most `segment_steps` per
 // stretch, each lit by one next-event candidate with its shadow ray and by the linked
-// medium's multiple scattering; the linked medium's transmittance exactly.
+// medium's multiple scattering, with the smoke triangles between them lit the same way and
+// seen through by what their opacity lets through; the linked medium's transmittance exactly.
 Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 pixel, float3 dir, float t, ProxySpans spans)
 {
     SceneRoot* s = f.scene;
@@ -388,6 +448,10 @@ Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uin
     Sampler rng = Sampler(pixel, f.frame, f.seed ^ MEDIA_STREAM);
     float linked_end = isinf(t) ? s.near_range : t;
     float end = isinf(t) ? max(linked_end, spans.end()) : t;
+    float sheets_end = min(end, s.near_range);
+    SmokeSheet sheet = (SmokeSheet)0;
+    float sheet_after = 0.0;
+    uint sheets = 0;
     float3 inscatter = float3(0.0);
     float3 through = float3(1.0);
     float x = 0.0;
@@ -398,12 +462,23 @@ Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uin
         float h = spans.step_size(s, active, next - x, r.segment_steps);
         uint steps = uint(ceil((next - x) / h - 1e-3));
         h = (next - x) / float(max(steps, 1u));
-        for (uint k = 0; k < steps; k++)
+        uint k = 0;
+        float step_at = steps > 0 ? x + rng.next() * h : next;
+        // One call site each: a linked surface and shadow ray compile once per call.
+        while (true)
         {
-            float d = x + (float(k) + rng.next()) * h;
+            if (sheet_after >= 0.0)
+            {
+                sheet = next_sheet(f, dir, sheets < REFERENCE_SHEETS ? sheet_after : sheets_end, sheets_end);
+                sheet_after = -1.0;
+            }
+            if (!(k < steps || sheet.t < next))
+                break;
+            bool at_sheet = sheet.t < step_at;
+            float d = at_sheet ? sheet.t : step_at;
             float3 p = eye + dir * d;
             MediumPoint m = (MediumPoint)0;
-            if (d < linked_end)
+            if (!at_sheet && d < linked_end)
                 m = M.sample(data, p);
             NeeVertex nv = { p, float3(0.0), pixel, nullptr };
             ResolvedLightSample c = nee_candidate(set, nv, rng);
@@ -411,17 +486,28 @@ Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uin
             float3 sigma_t = float3(0.0);
             float3 sigma_s = m.sigma_s;
             float3 scatter = any(m.sigma_s > 0.0) ? m.sigma_s * M.phase(data, m, cos_theta) : float3(0.0);
-            for (uint i = 0; i < spans.count; i++)
-            {
-                if (((active >> i) & 1u) == 0)
-                    continue;
-                ProxySpan span = spans.spans[i];
-                ProxyMedium pm = proxy_medium(scene_proxy(s, span.instance), span.origin + span.direction * d);
-                sigma_t += pm.sigma_t;
-                sigma_s += pm.sigma_s;
-                scatter += pm.sigma_s * hg_phase(pm.anisotropy, cos_theta);
-            }
             float3 source = m.emission;
+            float3 origin = p;
+            if (at_sheet)
+            {
+                sigma_s = sheet.opacity * sheet.albedo;
+                scatter = sigma_s * hg_phase(f.smoke_anisotropy, cos_theta);
+                source = sheet.opacity * sheet.emission;
+                origin += c.dir * T_MIN_BASE * (1.0 + d * T_MIN_SCALE);
+            }
+            else
+            {
+                for (uint i = 0; i < spans.count; i++)
+                {
+                    if (((active >> i) & 1u) == 0)
+                        continue;
+                    ProxySpan span = spans.spans[i];
+                    ProxyMedium pm = proxy_medium(scene_proxy(s, span.instance), span.origin + span.direction * d);
+                    sigma_t += pm.sigma_t;
+                    sigma_s += pm.sigma_s;
+                    scatter += pm.sigma_s * hg_phase(pm.anisotropy, cos_theta);
+                }
+            }
             if (any(sigma_s > 0.0))
             {
                 if (c.pdf > 0.0)
@@ -429,12 +515,23 @@ Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uin
                     float3 l = c.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, c.light, c.dir) : c.radiance;
                     float t_max = isfinite(c.distance) ? c.distance * (1.0 - 1e-4) : c.distance;
                     RayCone cone = { 0.0, 0.0 };
-                    float3 vis = visibility<S, M>(s, f.view, p, c.dir, t_max, RAY_FLAG_NONE, hit_context(HIT_SECONDARY, 1, cone, 0.0), c.kind != LIGHT_SAMPLE_ENVIRONMENT, set.shadow_overflows);
+                    float3 vis = visibility<S, M>(s, f.view, origin, c.dir, t_max, RAY_FLAG_NONE, hit_context(HIT_SECONDARY, 1, cone, 0.0), c.kind != LIGHT_SAMPLE_ENVIRONMENT, set.shadow_overflows);
                     source += scatter * l * vis / c.pdf;
                 }
                 source += sigma_s * multiple_scattered<M>(set, p);
             }
-            march_step(sigma_t, source * medium_transmittance<M>(data, eye, dir, min(d, linked_end)), h, inscatter, through);
+            source *= medium_transmittance<M>(data, eye, dir, min(d, linked_end));
+            if (at_sheet)
+            {
+                inscatter += through * source;
+                through *= 1.0 - sheet.opacity;
+                sheet_after = d + T_MIN_BASE * (1.0 + d * T_MIN_SCALE);
+                sheets++;
+                continue;
+            }
+            march_step(sigma_t, source, h, inscatter, through);
+            k++;
+            step_at = k < steps ? x + (float(k) + rng.next()) * h : next;
         }
         x = next;
     }

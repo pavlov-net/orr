@@ -378,6 +378,7 @@ void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         return;
     ProducerGpu p = s.producers[entry];
     bool particle = p.opacity == PRODUCER_PARTICLE;
+    bool smoke = p.opacity == PRODUCER_SMOKE;
     bool layer = p.opacity == PRODUCER_DIELECTRIC || p.opacity == PRODUCER_PRESENCE;
     if (!(layer ? layer_traced(p.flags) : (p.flags & INSTANCE_RASTER) != 0 && (p.flags & INSTANCE_CAST_ONLY) == 0))
         return;
@@ -414,7 +415,7 @@ void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         // Diced clusters that displacement stretches past the software raster's limit
         // split their triangles between the two paths by size.
         float size;
-        bool fits = r.software_pixels > 0.0 && !particle && !layer && screen_size(v, pl, lo, hi, size);
+        bool fits = r.software_pixels > 0.0 && !particle && !smoke && !layer && screen_size(v, pl, lo, hi, size);
         bool software = fits && size <= software_limit(r);
         bool by_size = fits && !software && p.tessellated != 0;
         VisibleCluster vc;
@@ -426,6 +427,11 @@ void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         uint visible;
         if (!add_visible(r, vc, visible))
             continue;
+        if (smoke)
+        {
+            append(r, COUNT_SMOKE, r.smoke, visible);
+            continue;
+        }
         if (particle || layer)
         {
             append(r, particle ? COUNT_PARTICLES : COUNT_COVERAGE, particle ? r.particles : r.coverage, visible);
@@ -452,4 +458,5 @@ void raster_args(uint3 id: SV_DispatchThreadID)
     write_grid(r.args + ARGS_SOFTWARE, r.counts[COUNT_SOFTWARE] - r.counts[COUNT_SOFTWARE_BASE]);
     write_grid(r.args + ARGS_PARTICLES, r.counts[COUNT_PARTICLES]);
     write_grid(r.args + ARGS_COVERAGE, r.counts[COUNT_COVERAGE]);
+    write_grid(r.args + ARGS_SMOKE, r.counts[COUNT_SMOKE]);
 }
