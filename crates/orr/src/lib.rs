@@ -12,8 +12,8 @@
 //!    first [`Frame::render_view`] runs it when the consumer did not.
 //! 4. [`Frame::render_view`] once per view records its raster half,
 //! 5. then the view's lighting and output: the scene's lighting pass before its first view,
-//!    one path per pixel, DLSS ray reconstruction, the hooks, exposure, glare, tonemap, the UI
-//!    and compose. A consumer may
+//!    one path per pixel, DLSS ray reconstruction, the hooks, exposure, motion blur, glare,
+//!    tonemap, the UI and compose. A consumer may
 //!    instead shade the G-buffer [`Frame::raster_view`] returns with its own kernels in
 //!    [`Frame::list`] and show the result with [`Frame::compose`].
 //! 6. [`Frame::end`] records the display's frame generation, submits the frame and hands
@@ -74,7 +74,7 @@ use orr_math::{DVec3, Quat, UVec2, Vec2};
 use orr_output::orr_dlss::{MIN_OUTPUT as DLSS_MIN_OUTPUT, RayReconstruction, RrInputs};
 use orr_output::{
     CapturePass, ChainImages, ComposePass, ComposeRoot, ComposeSource, DisplayFrame, ExposurePass,
-    GlarePass, HookInputsPass, HookPoint, Hooks, Image, OutputKernels, OutputView,
+    GlarePass, HookInputsPass, HookPoint, Hooks, Image, MotionBlurPass, OutputKernels, OutputView,
     SceneCapturePass, TonemapPass, UI_PASS,
 };
 use orr_scene::{ArenaRequest, Scenes};
@@ -186,8 +186,8 @@ pub struct RenderedView {
     /// The mode ray reconstruction ran in; `None` when it did not run.
     pub reconstruction: Option<DlssMode>,
     /// RGBA16F linear Rec.2020 pre-exposed radiance at the output extent, as ray
-    /// reconstruction, or lighting without it, and `hooks.scene_referred` left it. With a
-    /// `display_linear` hook it holds that hook's source instead.
+    /// reconstruction, or lighting without it, `hooks.scene_referred` and motion blur left it.
+    /// With a `display_linear` hook it holds that hook's source instead.
     pub radiance: TextureIndex,
     /// RGBA16F display-linear Rec.709, 1.0 = paper white, at the output extent; `NONE`
     /// when the view stopped after exposure.
@@ -372,8 +372,9 @@ const RECONSTRUCTED: &str = "reconstructed radiance";
 
 /// A view image at the output `extent`, from step `first` to the end of the frame: ray
 /// reconstruction's output, which every later pass reads in place of lighting's radiance, or
-/// the display-linear image, tonemap's target and from the scene-referred hook on the hook
-/// chain's second image. The consumer may read either after the render.
+/// the display-linear image, from the scene-referred hook on the second image of the chain that
+/// hooks, motion blur and tonemap alternate over. The consumer may read either after the
+/// render.
 fn output_image_request(name: &'static str, extent: [u32; 2], first: ViewStep) -> ArenaRequest {
     ArenaRequest::texture(
         name,
@@ -848,8 +849,15 @@ impl<'a> Frame<'a> {
     /// radiance, then the dielectric dispatch over it, which traces each pixel's first
     /// dielectric or presence layer; media apply over each pixel's camera segment; the
     /// transparency hook; DLSS ray reconstruction; `hooks.scene_referred`; a scene-referred
-    /// screenshot; metering and adaptation; then, unless the view stops there, the lens's glare,
-    /// tonemap, `hooks.display_linear`, `hooks.ui`, compose and a display screenshot.
+    /// screenshot; metering and adaptation; then, unless the view stops there, motion blur, the
+    /// lens's glare, tonemap, `hooks.display_linear`, `hooks.ui`, compose and a display
+    /// screenshot.
+    ///
+    /// Motion blur smears the radiance along each pixel's motion over the fraction
+    /// `lens.shutter` of the time between presented images, centered on the frame. A frame that
+    /// resets the view's history, such as a camera cut or a camera jump past
+    /// `lighting.guides.camera_jump`, shows none, nor do the accumulation reference and
+    /// `lighting.debug_view`.
     ///
     /// The target decides the output extent. `output.reconstruction` and the output extent
     /// decide the render extent, the jitter and the texture level-of-detail bias while the
@@ -867,10 +875,10 @@ impl<'a> Frame<'a> {
         let (extent, render) = self.resolve_view(view, lighting, output)?;
         let id = self.scenes.id();
         let sdr = DisplayRequest::default().resolve(&[OutputFormat::Sdr], None, false);
-        let mut display = match view.target {
-            ViewTarget::Display => self.display.as_deref_mut().and_then(Display::frame),
-            _ => None,
-        };
+        let frame = self.display.as_deref_mut().and_then(Display::frame);
+        // Whatever the view's target: the consumer may compose a texture into the display.
+        let generated = frame.as_ref().map_or(0, |f| f.generated);
+        let mut display = frame.filter(|_| matches!(view.target, ViewTarget::Display));
         let resolved = display.as_ref().map_or(sdr, |f| f.display);
         let tonemapped = !matches!(view.target, ViewTarget::Radiance { .. });
 
@@ -988,7 +996,7 @@ impl<'a> Frame<'a> {
             list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         }
         let (list, arena) = self.scenes.output_list_and_arena(view.history)?;
-        let (radiance, radiance_store) = match state.reconstruction.as_mut() {
+        let (rr_output, rr_output_store) = match state.reconstruction.as_mut() {
             Some(r) => {
                 arena.enter(ViewStep::Rr, list);
                 let target = arena.texture(RECONSTRUCTED).expect("requested above");
@@ -1021,9 +1029,9 @@ impl<'a> Frame<'a> {
         };
         arena.enter(ViewStep::SceneReferred, list);
         let linear = arena.texture(VIEW_LINEAR).expect("requested above").clone();
-        let chain = ChainImages {
-            rr_output: radiance,
-            rr_output_store: radiance_store,
+        let mut chain = ChainImages {
+            rr_output,
+            rr_output_store,
             linear: linear.sampled(),
             linear_store: linear.storage(0),
         };
@@ -1082,7 +1090,7 @@ impl<'a> Frame<'a> {
                 list,
                 &mut state.output,
                 &SceneCapturePass {
-                    source: radiance,
+                    source: chain.rr_output,
                     extent,
                     view: raster.view,
                     rec709,
@@ -1096,7 +1104,7 @@ impl<'a> Frame<'a> {
             list,
             &mut state.output,
             &ExposurePass {
-                source: radiance,
+                source: chain.rr_output,
                 extent,
                 view: raster.view,
                 sky: raster.sky_stats,
@@ -1104,7 +1112,27 @@ impl<'a> Frame<'a> {
                 output,
             },
         )?;
-        // A view that stops after exposure shows no glare and holds no chain for it.
+        // A view that stops after exposure shows no camera effects and holds none of their images.
+        // The accumulation reference and debug views take no motion blur.
+        let blurs = tonemapped
+            && lighting.reference.is_none()
+            && lighting.debug_view == LightingDebugView::None;
+        kernels.motion_blur(
+            list,
+            &mut state.output,
+            &MotionBlurPass {
+                rr_depth,
+                rr_motion,
+                extent,
+                view: raster.view,
+                shutter: if blurs { view.lens.shutter } else { 0.0 },
+                generated,
+                history_reset: paths.history_reset(),
+                frame: id,
+                output,
+            },
+            &mut chain,
+        )?;
         let glare = kernels.glare(
             list,
             &mut state.output,
@@ -1125,7 +1153,7 @@ impl<'a> Frame<'a> {
                 raster,
                 render_extent: render,
                 reconstruction,
-                radiance,
+                radiance: chain.rr_output,
                 linear: TextureIndex::NONE,
             });
         }
@@ -1135,7 +1163,7 @@ impl<'a> Frame<'a> {
             list,
             state.output.roots(id),
             &TonemapPass {
-                source: radiance,
+                source: chain.rr_output,
                 target: chain.linear_store,
                 extent,
                 view: raster.view,
@@ -1204,7 +1232,7 @@ impl<'a> Frame<'a> {
             raster,
             render_extent: render,
             reconstruction,
-            radiance,
+            radiance: chain.rr_output,
             linear: chain.linear,
         })
     }

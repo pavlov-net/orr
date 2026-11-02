@@ -27,7 +27,7 @@ pub enum ViewStep {
     Rr,
     /// Hook inputs, the scene-referred hook and the scene-referred screenshot.
     SceneReferred,
-    /// Metering, adaptation and glare.
+    /// Metering, adaptation, motion blur and glare.
     Exposure,
     Tonemap,
     /// The display-linear hook.

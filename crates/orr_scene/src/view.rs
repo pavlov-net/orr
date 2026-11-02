@@ -105,7 +105,7 @@ pub struct Lens {
     /// Focal length = sensor_width / (2 tan(fov_x / 2)). With the output extent it also gives
     /// the pixel pitch, which sets how many pixels glare reaches.
     pub sensor_width_mm: f32,
-    /// Fraction of the frame interval the shutter is open; 0 = no motion blur.
+    /// Fraction of the time between presented images the shutter is open; 0 = no motion blur.
     pub shutter: f32,
     pub depth_of_field: Option<DepthOfField>,
     pub glare: Option<Glare>,
