@@ -1,7 +1,8 @@
 //! Packs mounted from a file or from memory. The loading side reads and places every asset
-//! of a pack except the hierarchy pages below a mesh's top page and the tiles above the mip
-//! tails of the textures its materials bind, which stream on request; the render thread
-//! takes the finished batch at step 1 and applies its tables with the frame's scatter.
+//! of a pack except what streams on request: the hierarchy pages below a mesh's top page, a
+//! large DAG mesh's finer pages, instance pages' records and the tiles above the mip tails of
+//! the textures its materials bind. The render thread takes the finished batch at step 1 and
+//! applies its tables with the frame's scatter.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -14,9 +15,10 @@ use orr_gpu::{
     TimelinePoint, ViewDesc,
 };
 use orr_io::{AlignedBuf, Read, SECTOR};
+use orr_math::{DVec3, IVec3, Vec3};
 use orr_pack::instance::{InstancePageInfo, InstanceRecord};
 use orr_pack::material::Material;
-use orr_pack::mesh::{Cluster, MeshHeader, MeshInfo, NodePage, PageHeader, PageView, Part};
+use orr_pack::mesh::{Cluster, Group, MeshHeader, MeshInfo, NodePage, PageHeader, PageView, Part};
 use orr_pack::model::ModelInfo;
 use orr_pack::subd::{Page as SubdPage, SubdInfo};
 use orr_pack::texture::{TextureHeader, TextureInfo};
@@ -25,6 +27,10 @@ use orr_pack::{Aabb, Archive, AssetId, Class, Codec};
 
 use crate::accel::{
     self, AccelShared, ClusterInfo, MaskBlas, MeshInput, MeshRt, MountAccel, PageMicromap,
+};
+use crate::edit::{
+    self, ClasInputs, EDIT_SPHERES, EditBatch, EditClas, EditDesc, EditDone, EditId, EditLoaded,
+    EditRecorder, EditRef, EditSource, EditTables, EditTask, Mirror,
 };
 use crate::emissive::{EmissiveSpan, ModelEmission, indexed_spans};
 use crate::loading::{ArchiveFile, BlobSource, Loading, Msg, decoded, read_stored};
@@ -35,14 +41,16 @@ use crate::residency::{ResidencyClass, Start, UnitDesc};
 use crate::scene::{ModelCpu, ModelId, SkinShape};
 use crate::shaders::types::SubdCageGpu;
 use crate::skin;
-use crate::stream::{MeshStream, MountUnits, StreamUnit, StreamedPage, Streaming};
+use crate::stream::{
+    FineInit, MeshStream, MountUnits, PoolTarget, StreamUnit, StreamedPage, Streaming,
+};
 use crate::subd::{self, CageShape, CageTables, ModelCage};
 use crate::tiles::{TexStream, TileGrid};
 use crate::traverse::{PAGED_DEPTH, PageFeedback};
 use crate::upload::Record;
 use crate::{
-    ClusterRef, Error, MaskGpu, MaterialGpu, MeshGpu, ModelGpu, Result, TextureStreamGpu,
-    material_flags,
+    ClusterRef, EditGroupGpu, Error, MaskGpu, MaterialGpu, MeshGpu, ModelGpu, Result,
+    TextureStreamGpu, material_flags,
 };
 
 /// Where a pack's bytes come from.
@@ -121,6 +129,13 @@ struct PlacedMesh {
     streamed: Option<(Vec<StreamedPage>, u64)>,
     /// The smallest error of a cut whose clusters all sit in pinned pages.
     min_cut: f32,
+    /// What edits of the mesh read: its groups, and every page's blob, bytes and clusters.
+    groups: Vec<Group>,
+    all_pages: Vec<StreamedPage>,
+    /// Thresholds of its finer cached cuts where its pages stream, and their stamps in the
+    /// mesh's block.
+    fine: Vec<f32>,
+    cut_stamps: u64,
 }
 
 /// The levels of a hierarchy whose nodes are numbered breadth first from `roots`.
@@ -169,21 +184,36 @@ pub struct ClipRef {
     pub duration: f32,
 }
 
-/// A resident instance page: its tables on the CPU, its records and consumer data on the
-/// GPU, valid until its pack is unmounted.
+/// A mounted instance page: its tables on the CPU, valid until its pack is unmounted. Its
+/// records stream: placed in a scene, or requested with [`crate::Scenes::prefetch_page`] or
+/// [`crate::Scenes::prefetch_region`], they land in the instance page pool. Its consumer data
+/// (blob 2) is requested with [`crate::Scenes::request_blob`].
 #[derive(Debug)]
 pub struct InstancePage {
     pub info: InstancePageInfo,
+    /// Null while the records are not resident.
     pub records: GpuPtr<InstanceRecord>,
     pub record_count: u32,
-    /// `info.header.user_stride` bytes per record; null when the stride is 0.
-    pub user: GpuPtr<u8>,
+    /// The mount holding it, whose models its prototypes name first.
+    pub mount: MountId,
 }
 
 struct PlacedPage {
     id: AssetId,
-    page: InstancePage,
-    bytes: u64,
+    info: InstancePageInfo,
+    record_count: u32,
+    entry: u32,
+    bytes: u32,
+}
+
+/// A prototype of an instance page, resolved to this run's ids.
+pub(crate) struct PagePrototype {
+    pub model: ModelId,
+    /// Its section materials where it overrides any.
+    pub sets: Option<Vec<MaterialId>>,
+    pub mask: u16,
+    pub pose: u8,
+    pub flags: u32,
 }
 
 pub(crate) enum StagedCopy {
@@ -240,6 +270,8 @@ pub(crate) struct MountTask {
     ring: OnceLock<bool>,
     placed: Mutex<Placed>,
     accel: Arc<AccelShared>,
+    /// The device builds cluster acceleration structures.
+    traced: bool,
 }
 
 impl MountTask {
@@ -268,6 +300,7 @@ impl MountTask {
             ring: OnceLock::new(),
             placed: Mutex::new(Placed::default()),
             accel: Arc::clone(accel),
+            traced: caps.cluster.max_tris > 0 && caps.cluster.max_partitions > 0,
         }
     }
 
@@ -375,7 +408,7 @@ pub(crate) fn write(
     }))
 }
 
-fn staging(device: &Device, bytes: &[u8]) -> Result<Allocation<u8>> {
+pub(crate) fn staging(device: &Device, bytes: &[u8]) -> Result<Allocation<u8>> {
     let mut src =
         device.gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, "loading staging")?;
     src.as_mut_slice()
@@ -752,6 +785,18 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
     let page_clusters_at = place(4 * (info.pages.len() as u64 + 1));
     let stamps_at = place(4 * info.node_pages.len() as u64);
     let page_stamps_at = streams.then(|| place(4 * info.pages.len() as u64));
+    let min_cut = info
+        .groups
+        .iter()
+        .filter(|g| g.page as usize >= pinned && g.error.is_finite())
+        .map(|g| g.error)
+        .fold(0.0, f32::max);
+    let fine = if streams && t.traced {
+        accel::fine_thresholds(info.groups.iter().map(|g| g.error), min_cut)
+    } else {
+        Vec::new()
+    };
+    let cut_stamps_at = place(8 * fine.len() as u64);
     let page_at: Vec<u64> = info.pages[..pinned]
         .iter()
         .map(|p| place(u64::from(p.resident_len)))
@@ -807,7 +852,7 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
         page_clusters_at,
         bytemuck::cast_slice(&page_clusters),
     )?;
-    let streamed_pages: Vec<StreamedPage> = info
+    let all_pages: Vec<StreamedPage> = info
         .pages
         .iter()
         .zip(&firsts)
@@ -819,19 +864,16 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
         })
         .collect();
     // Clusters of streamed pages are known once they load; until then they take no cut.
-    let absent: Vec<(u32, ClusterInfo)> = streamed_pages[pinned..]
+    let absent: Vec<(u32, ClusterInfo)> = all_pages[pinned..]
         .iter()
         .zip(pinned as u32..)
         .flat_map(|(p, page)| {
             (0..p.clusters).map(move |i| (p.first + i, ClusterInfo::absent(page, i)))
         })
         .collect();
-    let min_cut = info
-        .groups
-        .iter()
-        .filter(|g| g.page as usize >= pinned && g.error.is_finite())
-        .map(|g| g.error)
-        .fold(0.0, f32::max);
+    if !fine.is_empty() {
+        t.write(block, cut_stamps_at, &vec![0u8; 8 * fine.len()])?;
+    }
     let finest = info.levels.first().map(|l| l.clusters);
     let level_ranges = info
         .levels
@@ -863,8 +905,12 @@ fn place_mesh(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
             parts: info.parts.clone(),
             node_stamps: block.gpu() + stamps_at,
             depth,
-            streamed: page_stamps_at.map(|at| (streamed_pages, block.gpu() + at)),
+            streamed: page_stamps_at.map(|at| (all_pages.clone(), block.gpu() + at)),
             min_cut,
+            groups: info.groups.clone(),
+            all_pages,
+            fine,
+            cut_stamps: block.gpu() + cut_stamps_at,
         });
         placed.meshes.len() - 1
     };
@@ -1174,12 +1220,11 @@ fn place_streamed(
     Ok(true)
 }
 
-/// An instance page: blob 0 stays on the CPU; records and consumer data go into one block.
+/// An instance page: blob 0 stays on the CPU; its records stream.
 fn place_page(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Result<()> {
     let info = InstancePageInfo::parse(blob0)?;
     let a = t.archive();
     let blobs = a.blobs(&a.entries()[entry]);
-    let user_stride = u64::from(info.header.user_stride);
     let records_len = blobs.get(1).map_or(0, |b| u64::from(b.raw_len));
     let record_count = records_len / size_of::<InstanceRecord>() as u64;
     if !records_len.is_multiple_of(size_of::<InstanceRecord>() as u64)
@@ -1187,38 +1232,13 @@ fn place_page(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
     {
         return Err(orr_pack::Error::Malformed("instance records").into());
     }
-    let user_len = record_count * user_stride;
-    let user_at = records_len.next_multiple_of(256);
-    let bytes = (user_at + user_len).max(16);
-    let block = t.block(bytes, "instance page")?;
-    let page = InstancePage {
+    t.placed.lock().unwrap().pages.push(PlacedPage {
+        id,
         info,
-        // SAFETY: the block holds the records from its start.
-        records: unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu())) },
         record_count: record_count as u32,
-        user: if user_stride == 0 {
-            GpuPtr::NULL
-        } else {
-            // SAFETY: the block holds the consumer data from `user_at`.
-            unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(block.gpu() + user_at)) }
-        },
-    };
-    t.placed
-        .lock()
-        .unwrap()
-        .pages
-        .push(PlacedPage { id, page, bytes });
-    if record_count > 0 {
-        fetch(t, entry, 1, move |t, records| t.write(block, 0, records));
-    }
-    if user_len > 0 {
-        fetch(t, entry, 2, move |t, user| {
-            if user.len() as u64 != user_len {
-                return Err(orr_pack::Error::Malformed("instance consumer data").into());
-            }
-            t.write(block, user_at, user)
-        });
-    }
+        entry: entry as u32,
+        bytes: records_len as u32,
+    });
     Ok(())
 }
 
@@ -1257,6 +1277,10 @@ struct ResolvedMesh {
     streamed: Option<Vec<StreamedPage>>,
     min_cut: f32,
     non_opaque: Vec<bool>,
+    groups: Vec<Group>,
+    all_pages: Vec<StreamedPage>,
+    fine: Vec<f32>,
+    animated: accel::Animated,
 }
 
 struct ResolvedModel {
@@ -1379,6 +1403,10 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
                         page_stamps: m.streamed.as_ref().map_or(GpuPtr::NULL, |(_, at)| {
                             GpuPtr::from_address(orr_gpu::GpuAddress(*at))
                         }),
+                        edit: GpuPtr::NULL,
+                        cut_stamps: GpuPtr::from_address(orr_gpu::GpuAddress(m.cut_stamps)),
+                        fine_cuts: 0,
+                        _pad_cuts: 0,
                     }
                 },
                 page_addresses,
@@ -1395,6 +1423,10 @@ fn resolve(source: BlobSource, p: Placed, sampler: SamplerIndex) -> Result<Resol
                 streamed: m.streamed.map(|(pages, _)| pages),
                 min_cut: m.min_cut,
                 non_opaque: Vec::new(),
+                groups: m.groups,
+                all_pages: m.all_pages,
+                fine: m.fine,
+                animated: accel::Animated::default(),
             }
         })
         .collect();
@@ -1519,6 +1551,7 @@ fn build_accel(
             cluster_base: m.gpu.cluster_base,
             parts: &m.parts,
             min_cut: m.min_cut,
+            fine: &m.fine,
         })
         .collect();
     let refs: Vec<Vec<ClusterRef>> = inputs.iter().map(accel::cluster_refs).collect();
@@ -1550,6 +1583,8 @@ fn build_accel(
         m.gpu.first_animated = cuts.animated.first;
         m.gpu.animated_parts = cuts.animated.count;
         m.gpu.animated_sections = cuts.animated_sections;
+        m.gpu.fine_cuts = cuts.fine;
+        m.animated = cuts.animated;
         m.rt = cuts.rt;
     }
     Ok(built.point)
@@ -1679,12 +1714,71 @@ pub(crate) struct Resident {
     rt: Vec<MeshRt>,
     /// Per mesh of `meshes`: the levels of its hierarchy (None when paged) and its clusters.
     hierarchy: Vec<(Option<u32>, u32)>,
+    /// Per mesh of `meshes`: what an edit starts from.
+    edit_sources: Vec<EditMesh>,
+    /// The record of each model.
+    model_gpus: HashMap<ModelId, ModelGpu>,
+    /// The material of each section of each model.
+    model_materials: HashMap<ModelId, Vec<MaterialId>>,
     page_ranges: Vec<(u32, u32)>,
     material_ranges: Vec<(u32, u32)>,
     cluster_ranges: Vec<(u32, u32)>,
     _blocks: Vec<Allocation<u8>>,
     _accel: MountAccel,
     placed_textures: Vec<PlacedTexture>,
+}
+
+/// A mesh's record, resident page addresses and the source of its edits.
+struct EditMesh {
+    gpu: MeshGpu,
+    addresses: Vec<u64>,
+    source: Arc<EditSource>,
+}
+
+/// An edit on the render thread.
+enum EditEntry {
+    Pending(EditPending),
+    Live(Box<EditLive>),
+    Failed(Arc<Error>),
+}
+
+/// The table ranges an edit holds.
+#[derive(Clone)]
+struct EditIds {
+    cluster_base: u32,
+    clusters: u32,
+    mesh: Option<u32>,
+    pages_at: Option<u32>,
+    page_count: u32,
+    model: Option<u32>,
+}
+
+/// What an edit's landing still needs.
+struct EditPending {
+    model: ModelId,
+    mount: MountId,
+    mesh: u32,
+    own: Vec<u32>,
+    groups: Vec<EditGroupGpu>,
+    spheres: Option<Vec<[f32; 4]>>,
+    bounds: Option<Aabb>,
+    cancel: Arc<AtomicBool>,
+}
+
+/// A landed edit.
+struct EditLive {
+    model: ModelId,
+    mesh: u32,
+    mesh_gpu: GpuPtr<MeshGpu>,
+    mount: MountId,
+    source_mesh: u32,
+    ids: EditIds,
+    tables: EditTables,
+    group_count: u32,
+    clas: EditClas,
+    dirty: bool,
+    mirror: Arc<Mirror>,
+    _loaded: EditLoaded,
 }
 
 /// The traversal's view of the resident hierarchies.
@@ -1723,6 +1817,8 @@ pub(crate) struct Mounts {
     page_ranges: RangeAllocator,
     sizes: TableSizes,
     pub pages: Vec<Option<InstancePage>>,
+    /// By page: the mount and unit of its records.
+    page_keys: Vec<Option<(MountId, u32)>>,
     retired: Vec<(u64, Resident)>,
     pub streaming: Streaming,
     /// The mount and mesh of each resident model.
@@ -1733,6 +1829,15 @@ pub(crate) struct Mounts {
     masks: HashMap<u32, MeshMasks>,
     /// Scratch of mask builds, freed once their frame has completed.
     transient: Vec<(u64, Vec<Allocation<u8>>)>,
+    edits: Vec<Option<EditEntry>>,
+    /// Edits destroyed, freed once that frame has completed.
+    retired_edits: Vec<(u64, Box<EditLive>)>,
+    /// Triangles this frame's edits may still rebuild.
+    edit_room: u32,
+    /// No edit has rebuilt this frame yet.
+    edit_first: bool,
+    /// The rebuilds' positions and build scratch, reused every frame.
+    edit_scratch: Option<Allocation<u8>>,
 }
 
 /// Section-mask BLAS a mesh can hold, at most.
@@ -1791,14 +1896,14 @@ type ResolvedTables = (
 /// stream, each after the pages it depends on, in a mesh whose pages stream, and are locked
 /// otherwise (the mount's acceleration structures reference every cluster). A mesh's top
 /// node page is pinned and its other node pages stream, each after its parent page.
-/// Whole textures, streamed textures' mip tails and instance pages are pinned; a streamed
-/// texture's tiles stream, each after the coarser tile covering it.
+/// Whole textures and streamed textures' mip tails are pinned; a streamed texture's tiles
+/// stream, each after the coarser tile covering it, and instance pages' records stream.
 fn units(
     meshes: &[ResolvedMesh],
     tables: &[GpuPtr<u64>],
     clusters: GpuPtr<ClusterRef>,
     textures: &[PlacedTexture],
-    pages: &[PlacedPage],
+    pages: &[(u32, &PlacedPage)],
 ) -> Result<MountUnits> {
     let malformed = |what| Error::Pack(orr_pack::Error::Malformed(what));
     let mut units = Vec::new();
@@ -1806,7 +1911,8 @@ fn units(
     let mut node_pages = Vec::with_capacity(meshes.len());
     let mut mesh_pages = Vec::with_capacity(meshes.len());
     let mut mesh_streams = Vec::new();
-    for (m, table) in meshes.iter().zip(tables) {
+    let mut fine = Vec::new();
+    for (mesh, (m, table)) in (0u32..).zip(meshes.iter().zip(tables)) {
         let base = units.len() as u32;
         let mut mesh_streamed = Vec::new();
         let stream = m.streamed.as_ref().map(|pages| {
@@ -1818,8 +1924,41 @@ fn units(
                 clusters: clusters.offset(u64::from(m.gpu.cluster_base)),
                 cluster_base: m.gpu.cluster_base,
                 non_opaque: m.non_opaque.clone(),
+                mesh,
+                pinned: m.header.pinned_pages,
+                mirrors: Mutex::new(Vec::new()),
             })
         });
+        if let (Some(s), true) = (&stream, m.gpu.fine_cuts > 0) {
+            let pages = m
+                .fine
+                .iter()
+                .map(|&t| {
+                    let mut pages: Vec<u32> = m
+                        .groups
+                        .iter()
+                        .filter(|g| g.error > t && g.page >= m.header.pinned_pages)
+                        .map(|g| g.page)
+                        .collect();
+                    pages.sort_unstable();
+                    pages.dedup();
+                    pages
+                })
+                .collect();
+            let mut clas = m.rt.clas.clone();
+            clas.resize(m.clusters.len(), 0);
+            fine.push(FineInit {
+                mesh,
+                stream: Arc::clone(s),
+                table: m.gpu.rt_cuts,
+                thresholds: m.fine.clone(),
+                pages,
+                merge: m.header.merge_error,
+                animated: m.animated,
+                clusters: m.clusters.clone(),
+                clas,
+            });
+        }
         let stream_index = mesh_streams.len() as u32;
         for (p, (bytes, deps)) in m.page_units.iter().enumerate() {
             if deps.iter().any(|&d| d as usize >= p) {
@@ -1861,7 +2000,7 @@ fn units(
                     entry: m.entry,
                     blob,
                     bytes,
-                    table: table.offset(u64::from(m.gpu.page_count) + n as u64),
+                    target: PoolTarget::Table(table.offset(u64::from(m.gpu.page_count) + n as u64)),
                 };
                 mesh_streamed.push(units.len() as u32);
                 (Start::Absent, vec![nodes + parent], Some(stream))
@@ -1902,12 +2041,30 @@ fn units(
         }
         streams.push((Arc::clone(s), first));
     }
-    units.extend(
-        pages
-            .iter()
-            .map(|p| pinned(ResidencyClass::InstancePages, p.bytes)),
-    );
+    let mut page_units = Vec::with_capacity(pages.len());
+    for &(id, p) in pages {
+        page_units.push(units.len() as u32);
+        if p.record_count == 0 {
+            units.push(pinned(ResidencyClass::InstancePages, 0));
+            continue;
+        }
+        let unit = UnitDesc {
+            class: ResidencyClass::InstancePages,
+            bytes: u64::from(p.bytes).next_multiple_of(256),
+            deps: Vec::new(),
+            start: Start::Absent,
+        };
+        let load = StreamUnit::Pool {
+            entry: p.entry,
+            blob: 1,
+            bytes: p.bytes,
+            target: PoolTarget::InstancePage(id),
+        };
+        units.push((unit, Some(load)));
+    }
     Ok(MountUnits {
+        fine,
+        page_units,
         units,
         meshes: streamed,
         node_pages,
@@ -1954,19 +2111,558 @@ impl Mounts {
             page_ranges: RangeAllocator::new(sizes.page_table),
             sizes,
             pages: Vec::new(),
+            page_keys: Vec::new(),
             retired: Vec::new(),
             streaming: Streaming::new(device, budgets, accel, streams, fif)?,
             owners: HashMap::new(),
             mesh_owners: HashMap::new(),
             masks: HashMap::new(),
             transient: Vec::new(),
+            edits: Vec::new(),
+            retired_edits: Vec::new(),
+            edit_room: 0,
+            edit_first: true,
+            edit_scratch: None,
         })
+    }
+
+    /// Starts an edit of `desc.model` on the loading side.
+    pub(crate) fn create_edit(
+        &mut self,
+        desc: &EditDesc<'_>,
+        loading: &Arc<Loading>,
+        device: &Device,
+    ) -> Result<EditId> {
+        let model = desc.model;
+        let refuse = |reason| Err(Error::NotEditable { model, reason });
+        let Some(&(mount, mesh)) = self.owners.get(&model) else {
+            return refuse("the model has no resident mesh");
+        };
+        let r = self.resident(mount)?;
+        if !r.models.values().any(|&m| m == model) {
+            return refuse("the model is an edit");
+        }
+        let m = &r.edit_sources[mesh as usize];
+        if m.source.header.attributes & MeshHeader::SKIN != 0 {
+            return refuse("its mesh is skinned");
+        }
+        let (spheres, (own, groups)) = match m.source.finest_level {
+            Some(level) => (None, edit::plan_level(&m.source.pages, level)),
+            None => {
+                let spheres = desc.touched.filter(|t| t.len() <= EDIT_SPHERES);
+                (spheres, edit::plan(&m.source.groups, spheres))
+            }
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let task = EditTask {
+            id: EditId(self.edits.len() as u32),
+            loading: Arc::downgrade(loading),
+            device: device.clone(),
+            source: Arc::clone(&r.source),
+            stream: Arc::clone(&m.source),
+            own: own.clone(),
+            cancel: Arc::clone(&cancel),
+            micromaps_per_submit: self.accel.limits.micromaps,
+            done: Mutex::new(EditDone::default()),
+            outstanding: AtomicUsize::new(1),
+        };
+        let id = task.id;
+        self.edits.push(Some(EditEntry::Pending(EditPending {
+            model,
+            mount,
+            mesh,
+            own,
+            groups,
+            spheres: spheres.map(<[_]>::to_vec),
+            bounds: desc.bounds,
+            cancel,
+        })));
+        loading.send(Msg::Edit(Arc::new(task)));
+        Ok(id)
+    }
+
+    pub(crate) fn edit_state(&self, id: EditId) -> LoadState {
+        match self.edits.get(id.0 as usize).and_then(Option::as_ref) {
+            Some(EditEntry::Pending(_)) => LoadState::Pending,
+            Some(EditEntry::Live(e)) if !e.clas.built => LoadState::Pending,
+            Some(EditEntry::Live(_)) => LoadState::Ready,
+            Some(EditEntry::Failed(e)) => LoadState::Failed(Arc::clone(e)),
+            None => LoadState::Failed(Arc::new(Error::UnknownEdit(id))),
+        }
+    }
+
+    pub(crate) fn edit(&self, id: EditId) -> Result<EditRef> {
+        match self.edits.get(id.0 as usize).and_then(Option::as_ref) {
+            Some(EditEntry::Live(e)) if e.clas.built => Ok(EditRef {
+                model: e.model,
+                mesh: e.mesh_gpu,
+                groups: e.tables.groups,
+                group_count: e.group_count,
+            }),
+            _ => Err(Error::UnknownEdit(id)),
+        }
+    }
+
+    /// Takes a landed edit's ids and table ranges and writes its tables.
+    pub(crate) fn land_edit(&mut self, batch: EditBatch, w: &mut Apply<'_>) {
+        let slot = &mut self.edits[batch.id.0 as usize];
+        let Some(EditEntry::Pending(pending)) = slot.take() else {
+            return;
+        };
+        let entry = match batch.result {
+            Err(e) => EditEntry::Failed(e),
+            Ok(loaded) => match self.place_edit(pending, loaded, w) {
+                Ok(live) => EditEntry::Live(Box::new(live)),
+                Err(e) => EditEntry::Failed(Arc::new(e)),
+            },
+        };
+        self.edits[batch.id.0 as usize] = Some(entry);
+    }
+
+    fn place_edit(
+        &mut self,
+        p: EditPending,
+        loaded: EditLoaded,
+        w: &mut Apply<'_>,
+    ) -> Result<EditLive> {
+        let source = &self.resident(p.mount)?.edit_sources[p.mesh as usize];
+        let page_count = source.gpu.page_count;
+        let clusters: u32 = source.source.pages.iter().map(|q| q.clusters).sum();
+        let ids = EditIds {
+            cluster_base: self
+                .accel
+                .cluster_ids
+                .lock()
+                .unwrap()
+                .alloc(clusters)
+                .ok_or(capacity("resident clusters", self.accel.cluster_capacity))?,
+            clusters,
+            mesh: self.mesh_ids.alloc(1),
+            pages_at: self.page_ranges.alloc(page_count),
+            page_count,
+            model: self.model_ids.alloc(1),
+        };
+        let placed = match (ids.mesh, ids.pages_at, ids.model) {
+            (Some(mesh), Some(start), Some(model)) => {
+                self.write_edit(&p, loaded, &ids, (mesh, start, model), w)
+            }
+            _ => Err(capacity("meshes, mesh pages or models", self.sizes.meshes)),
+        };
+        if placed.is_err() {
+            self.free_edit_ids(&ids);
+        }
+        placed
+    }
+
+    fn free_edit_ids(&mut self, ids: &EditIds) {
+        self.accel
+            .cluster_ids
+            .lock()
+            .unwrap()
+            .free(ids.cluster_base, ids.clusters);
+        if let Some(mesh) = ids.mesh {
+            self.mesh_ids.free(mesh, 1);
+        }
+        if let Some(start) = ids.pages_at {
+            self.page_ranges.free(start, ids.page_count);
+        }
+        if let Some(model) = ids.model {
+            self.model_ids.free(model, 1);
+        }
+    }
+
+    /// Writes a landed edit's tables under the ids it took.
+    fn write_edit(
+        &mut self,
+        p: &EditPending,
+        loaded: EditLoaded,
+        ids: &EditIds,
+        (mesh, start, model): (u32, u32, u32),
+        w: &mut Apply<'_>,
+    ) -> Result<EditLive> {
+        let r = self.resident(p.mount)?;
+        let source = &r.edit_sources[p.mesh as usize];
+        let stream = Arc::clone(&source.source);
+        let src_gpu = source.gpu;
+        let addresses = source.addresses.clone();
+        let src_clas = r.rt[p.mesh as usize].clas.clone();
+        let src_model = r.model_gpus[&p.model];
+        let page_count = ids.page_count;
+        let n = ids.clusters;
+        let base = ids.cluster_base;
+        let tables = EditTables::new(
+            w.device,
+            p.spheres.as_deref(),
+            &p.groups,
+            page_count,
+            src_gpu.page_stamps.address().0 != 0,
+        )?;
+        let table = self.page_table.gpu().offset(u64::from(start));
+        let clusters = self.clusters.gpu().offset(u64::from(base));
+
+        let mut own = vec![false; page_count as usize];
+        for &q in &p.own {
+            own[q as usize] = true;
+        }
+        let at_own = |q: u32| p.own.binary_search(&q).ok();
+        let mut page_table = vec![0u64; page_count as usize];
+        let mut refs: Vec<ClusterRef> = vec![bytemuck::Zeroable::zeroed(); n as usize];
+        for (q, info) in stream.pages.iter().enumerate() {
+            let q32 = q as u32;
+            let range = info.first as usize..(info.first + info.clusters) as usize;
+            let (address, clas): (u64, Vec<u64>) = match at_own(q32) {
+                Some(k) => (loaded.addresses[k], vec![0; info.clusters as usize]),
+                None => match self.streaming.streamed_page(p.mount, p.mesh, q32) {
+                    Some(Some(state)) => state,
+                    Some(None) => (0, Vec::new()),
+                    None => (
+                        addresses[q],
+                        range
+                            .clone()
+                            .map(|c| src_clas.get(c).copied().unwrap_or(0))
+                            .collect(),
+                    ),
+                },
+            };
+            page_table[q] = address;
+            if address == 0 {
+                continue;
+            }
+            for (local, c) in range.enumerate() {
+                refs[c] = ClusterRef {
+                    // SAFETY: the page stays resident while the entry names it: the edit's
+                    // block, or a source page whose eviction nulls this entry.
+                    page: unsafe { GpuPtr::from_address(orr_gpu::GpuAddress(address)) },
+                    local: local as u32,
+                    mesh_cluster: c as u32,
+                    clas: clas.get(local).copied().unwrap_or(0),
+                };
+            }
+        }
+        w.put(table, &page_table)?;
+        w.put(clusters, &refs)?;
+
+        let micromap = |k: usize| {
+            loaded.micromaps[k]
+                .as_ref()
+                .map_or(0, |(m, _)| m.address().0)
+        };
+        let clas = EditClas::new(
+            w.device,
+            &ClasInputs {
+                pages: (0..p.own.len())
+                    .map(|k| (loaded.addresses[k], micromap(k), &loaded.clusters[k][..]))
+                    .collect(),
+                cluster_bases: p
+                    .own
+                    .iter()
+                    .map(|&q| base + stream.pages[q as usize].first)
+                    .collect(),
+                header: &stream.header,
+                non_opaque: &stream.non_opaque,
+                whole: p.spheres.is_none(),
+                clas_triangles: self.accel.limits.clas_triangles,
+            },
+        )?;
+
+        // The source's model record says how many sections its roots hold; the merged stage
+        // would bypass what the edit pins.
+        let gpu = MeshGpu {
+            pages: table,
+            cluster_base: base,
+            merge_error: f32::INFINITY,
+            root_count: src_gpu
+                .root_count
+                .min(src_gpu.part_count * src_model.section_count),
+            level_count: src_gpu.level_count.min(1),
+            rt_cuts: tables.rt_cut,
+            rt_cut_count: 1,
+            parts: GpuPtr::NULL,
+            masks: GpuPtr::NULL,
+            mask_count: 0,
+            first_animated: 0,
+            animated_parts: 0,
+            animated_sections: 0,
+            page_stamps: tables.stamps,
+            edit: tables.edit,
+            cut_stamps: GpuPtr::NULL,
+            fine_cuts: 0,
+            ..src_gpu
+        };
+        let mesh_gpu = self.meshes.gpu().offset(u64::from(mesh));
+        w.put(mesh_gpu, &[gpu])?;
+        let bounds = p.bounds.unwrap_or(Aabb {
+            min: src_model.bounds_min,
+            max: src_model.bounds_max,
+        });
+        let record = ModelGpu {
+            mesh,
+            bounds_min: bounds.min,
+            bounds_max: bounds.max,
+            chain_count: 0,
+            ..src_model
+        };
+        w.put(self.models.gpu().offset(u64::from(model)), &[record])?;
+        let id = ModelId(model);
+        let i = id.0 as usize;
+        if w.emission.len() <= i {
+            w.emission.resize(i + 1, None);
+        }
+        if w.model_cpu.len() <= i {
+            w.model_cpu.resize(i + 1, ModelCpu::default());
+        }
+        if w.cages.len() <= i {
+            w.cages.resize(i + 1, None);
+        }
+        w.emission[i] = w.emission[p.model.0 as usize].clone();
+        w.model_cpu[i] = ModelCpu {
+            animated_parts: 0,
+            edit: true,
+            ..w.model_cpu[p.model.0 as usize]
+        };
+        w.cages[i] = None;
+        self.owners.insert(id, (p.mount, p.mesh));
+        self.mesh_owners.insert(mesh, (p.mount, p.mesh));
+        let mirror = Arc::new(Mirror {
+            table,
+            clusters,
+            own,
+        });
+        self.streaming.add_mirror(p.mount, p.mesh, &mirror);
+        Ok(EditLive {
+            model: id,
+            mesh,
+            mesh_gpu,
+            mount: p.mount,
+            source_mesh: p.mesh,
+            ids: ids.clone(),
+            group_count: p.groups.len() as u32,
+            tables,
+            clas,
+            dirty: false,
+            mirror,
+            _loaded: loaded,
+        })
+    }
+
+    /// Opens the frame's edit budget of `triangles`.
+    pub(crate) fn begin_edits(&mut self, triangles: u32) {
+        self.edit_room = triangles;
+        self.edit_first = true;
+    }
+
+    /// Whether an edit of `triangles` may rebuild this frame, within the frame's budget.
+    fn admit_edit(room: &mut u32, first: &mut bool, triangles: u32) -> bool {
+        if !*first && triangles > *room {
+            return false;
+        }
+        *room = room.saturating_sub(triangles);
+        *first = false;
+        true
+    }
+
+    pub(crate) fn edit_dirty(&mut self, id: EditId) -> bool {
+        let Some(Some(EditEntry::Live(e))) = self.edits.get_mut(id.0 as usize) else {
+            return false;
+        };
+        if !e.clas.built {
+            return false;
+        }
+        if e.dirty {
+            return true;
+        }
+        let admitted =
+            Self::admit_edit(&mut self.edit_room, &mut self.edit_first, e.clas.triangles);
+        e.dirty = admitted;
+        admitted
+    }
+
+    /// Records this frame's edit rebuilds after the scene compute point: the dirty edits and
+    /// those not yet built.
+    pub(crate) fn record_edits(
+        &mut self,
+        device: &Device,
+        window: &UploadWindow,
+        list: &mut orr_gpu::CommandList<'_>,
+    ) -> Result<()> {
+        let (room, first) = (&mut self.edit_room, &mut self.edit_first);
+        let mut todo: Vec<&mut EditClas> = Vec::new();
+        for e in self.edits.iter_mut().flatten() {
+            let EditEntry::Live(e) = e else { continue };
+            let build = if e.clas.built {
+                std::mem::take(&mut e.dirty)
+            } else {
+                Self::admit_edit(room, first, e.clas.triangles)
+            };
+            if build {
+                todo.push(&mut e.clas);
+            }
+        }
+        if todo.is_empty() {
+            return Ok(());
+        }
+        let recorder = EditRecorder {
+            device,
+            window,
+            kernels: &self.accel.kernels,
+            clusters: self.clusters.gpu(),
+        };
+        list.begin_pass("edits", false);
+        recorder.record(list, &mut todo, &mut self.edit_scratch)?;
+        list.end_pass();
+        Ok(())
+    }
+
+    /// Ends an edit once `frame` has completed.
+    pub(crate) fn destroy_edit(
+        &mut self,
+        id: EditId,
+        frame: u64,
+        emission: &mut [Option<ModelEmission>],
+        cages: &mut [Option<ModelCage>],
+    ) {
+        let Some(slot) = self.edits.get_mut(id.0 as usize) else {
+            return;
+        };
+        match slot.take() {
+            Some(EditEntry::Pending(p)) => p.cancel.store(true, Ordering::Relaxed),
+            Some(EditEntry::Live(e)) => {
+                if let Some(x) = emission.get_mut(e.model.0 as usize) {
+                    *x = None;
+                }
+                if let Some(x) = cages.get_mut(e.model.0 as usize) {
+                    *x = None;
+                }
+                self.streaming
+                    .remove_mirror(e.mount, e.source_mesh, &e.mirror);
+                self.owners.remove(&e.model);
+                self.retired_edits.push((frame, e));
+            }
+            Some(EditEntry::Failed(_)) | None => {}
+        }
     }
 
     /// Requests every streamed unit of `model`'s mesh for the next step 1.
     pub(crate) fn prefetch(&mut self, model: ModelId, cell_distance: u32) {
         if let Some(&(mount, mesh)) = self.owners.get(&model) {
             self.streaming.prefetch(mount, mesh, cell_distance);
+        }
+    }
+
+    /// The prototypes of page `id`: their models looked up in the page's mount, then in the
+    /// other ready mounts, and their overrides.
+    pub(crate) fn page_prototypes(&self, id: PageId) -> Result<Vec<PagePrototype>> {
+        let page = self
+            .pages
+            .get(id.0 as usize)
+            .and_then(Option::as_ref)
+            .ok_or(Error::UnknownPage(id))?;
+        let home = self.resident(page.mount)?;
+        let others = self.entries.iter().flatten().filter_map(|e| match e {
+            Entry::Ready(r) => Some(&**r),
+            _ => None,
+        });
+        let search: Vec<&Resident> = std::iter::once(home).chain(others).collect();
+        page.info
+            .prototypes
+            .iter()
+            .map(|p| {
+                let missing = || Error::Missing {
+                    mount: page.mount,
+                    asset: p.model,
+                };
+                let (r, model) = search
+                    .iter()
+                    .find_map(|r| r.models.get(&p.model).map(|&m| (*r, m)))
+                    .ok_or_else(missing)?;
+                let overrides = page.info.sections_of(p);
+                let mut mask = 0u16;
+                let mut sets = None;
+                let base = &r.model_materials[&model];
+                for (s, o) in overrides.iter().enumerate() {
+                    if o.hidden != 0 && s < 16 {
+                        mask |= 1 << s;
+                    }
+                    if o.material != AssetId::NONE {
+                        let m = search
+                            .iter()
+                            .find_map(|r| r.materials.get(&o.material))
+                            .ok_or(Error::Missing {
+                                mount: page.mount,
+                                asset: o.material,
+                            })?;
+                        let set = sets.get_or_insert_with(|| base.clone());
+                        if s >= set.len() {
+                            return Err(Error::Pack(orr_pack::Error::Malformed(
+                                "prototype overrides past its model's sections",
+                            )));
+                        }
+                        set[s] = *m;
+                    }
+                }
+                let pose = u8::try_from(p.pose).map_err(|_| {
+                    Error::Pack(orr_pack::Error::Malformed("prototype pose past 255"))
+                })?;
+                Ok(PagePrototype {
+                    model,
+                    sets,
+                    mask,
+                    pose,
+                    flags: p.flags,
+                })
+            })
+            .collect()
+    }
+
+    /// The box of page `id` in world space, as a center and radius.
+    pub(crate) fn page_sphere(&self, id: u32, cell_log2: u32) -> Option<(DVec3, f64)> {
+        let h = self.pages.get(id as usize)?.as_ref()?.info.header;
+        let cell = IVec3::from_array(h.cell).as_dvec3() * f64::from(1u32 << cell_log2);
+        let half = Vec3::from_array(h.extent).as_dvec3() * 0.5;
+        Some((
+            cell + Vec3::from_array(h.origin).as_dvec3() + half,
+            half.length(),
+        ))
+    }
+
+    /// The bytes page `id`'s records take in the instance page pool.
+    pub(crate) fn page_bytes(&self, id: u32) -> u64 {
+        self.pages
+            .get(id as usize)
+            .and_then(Option::as_ref)
+            .map_or(0, |p| {
+                (u64::from(p.record_count) * size_of::<InstanceRecord>() as u64)
+                    .next_multiple_of(256)
+            })
+    }
+
+    /// Requests the records of page `id` for the next step.
+    pub(crate) fn request_page(&mut self, id: u32, cell_distance: u32) {
+        if let Some(Some((mount, unit))) = self.page_keys.get(id as usize).copied() {
+            self.streaming.request_unit(mount, unit, cell_distance);
+        }
+    }
+
+    /// Requests the records of the pages meeting the sphere and every streamed unit of the
+    /// models they place, nearer pages first, for the next step.
+    pub(crate) fn prefetch_region(&mut self, center: DVec3, radius: f64, cell_log2: u32) {
+        let edge = f64::from(1u32 << cell_log2);
+        for id in 0..self.pages.len() as u32 {
+            let Some((c, r)) = self.page_sphere(id, cell_log2) else {
+                continue;
+            };
+            let gap = (c.distance(center) - r - radius).max(0.0);
+            if gap > 0.0 {
+                continue;
+            }
+            let cells = (c.distance(center) / edge) as u32;
+            self.request_page(id, cells);
+            let Ok(protos) = self.page_prototypes(PageId(id)) else {
+                continue;
+            };
+            for p in protos {
+                self.prefetch(p.model, cells);
+            }
         }
     }
 
@@ -2014,6 +2710,11 @@ impl Mounts {
     pub(crate) fn page_feedback(&mut self, feedback: &[PageFeedback], frame: u64) {
         for f in feedback {
             if let Some(&(mount, mesh)) = self.mesh_owners.get(&f.mesh) {
+                if f.cut {
+                    self.streaming
+                        .fine_cut(mount, mesh, f.page, f.request, frame);
+                    continue;
+                }
                 let request = f.request.then_some(f.error);
                 self.streaming
                     .page(mount, mesh, f.page, f.mesh_page, request, frame);
@@ -2051,6 +2752,34 @@ impl Mounts {
         self.owners
             .get(&model)
             .is_some_and(|&(m, _)| self.resident(m).is_ok())
+    }
+
+    /// The pages of ready mount `m`; none for other mounts.
+    pub(crate) fn pages_of(&self, m: MountId) -> Vec<PageId> {
+        self.resident(m)
+            .map(|r| r.pages.values().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Ends every edit of mount `m`'s meshes with it.
+    fn destroy_edits_of(
+        &mut self,
+        m: MountId,
+        frame: u64,
+        emission: &mut [Option<ModelEmission>],
+        cages: &mut [Option<ModelCage>],
+    ) {
+        let of: Vec<EditId> = (0..self.edits.len())
+            .filter(|&i| match &self.edits[i] {
+                Some(EditEntry::Pending(p)) => p.mount == m,
+                Some(EditEntry::Live(e)) => e.mount == m,
+                _ => false,
+            })
+            .map(|i| EditId(i as u32))
+            .collect();
+        for id in of {
+            self.destroy_edit(id, frame, emission, cages);
+        }
     }
 
     /// The models of ready mount `m`; none for other mounts.
@@ -2092,6 +2821,7 @@ impl Mounts {
         emission: &mut [Option<ModelEmission>],
         cages: &mut [Option<ModelCage>],
     ) {
+        self.destroy_edits_of(m, frame, emission, cages);
         let Some(slot) = self.entries.get_mut(m.0 as usize) else {
             return;
         };
@@ -2128,6 +2858,14 @@ impl Mounts {
             self.release(r, device, materials);
         }
         self.transient.retain(|(f, _)| *f > completed);
+        let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired_edits)
+            .into_iter()
+            .partition(|(f, _)| *f <= completed);
+        self.retired_edits = keep;
+        for (_, e) in done {
+            self.mesh_owners.remove(&e.mesh);
+            self.free_edit_ids(&e.ids);
+        }
     }
 
     fn release(&mut self, r: Resident, device: &Device, materials: &MaterialTable) {
@@ -2151,6 +2889,7 @@ impl Mounts {
         }
         for id in r.pages.values() {
             self.pages[id.0 as usize] = None;
+            self.page_keys[id.0 as usize] = None;
         }
         for t in &r.placed_textures {
             device.free_image_slot_after_submitted(t.index.0);
@@ -2203,6 +2942,9 @@ impl Mounts {
             meshes: Vec::new(),
             rt: Vec::new(),
             hierarchy: Vec::new(),
+            edit_sources: Vec::new(),
+            model_gpus: HashMap::new(),
+            model_materials: HashMap::new(),
             page_ranges: Vec::new(),
             material_ranges: Vec::new(),
             cluster_ranges: r.cluster_ranges,
@@ -2276,6 +3018,18 @@ impl Mounts {
             )?;
             res.rt.push(m.rt.clone());
             res.hierarchy.push((m.depth, m.gpu.cluster_count));
+            res.edit_sources.push(EditMesh {
+                gpu,
+                addresses: m.page_addresses.clone(),
+                source: Arc::new(EditSource {
+                    entry: m.entry,
+                    header: m.header,
+                    groups: m.groups.clone(),
+                    pages: m.all_pages.clone(),
+                    non_opaque: m.non_opaque.clone(),
+                    finest_level: m.levels.first().map(|&(_, first, count)| (first, count)),
+                }),
+            });
             self.mesh_owners
                 .insert(id, (mount, res.meshes.len() as u32 - 1));
             mesh_ids.push(id);
@@ -2307,6 +3061,8 @@ impl Mounts {
                 ..bytemuck::Zeroable::zeroed()
             };
             w.put(self.models.gpu().offset(u64::from(id.0)), &[gpu])?;
+            res.model_gpus.insert(id, gpu);
+            res.model_materials.insert(id, section_materials.clone());
             let i = id.0 as usize;
             if w.emission.len() <= i {
                 w.emission.resize(i + 1, None);
@@ -2358,6 +3114,7 @@ impl Mounts {
                     mesh_materials.iter().map(|&k| materials[k].1.flags),
                 ),
                 cage_only: false,
+                edit: false,
             };
             let spans = &mesh.spans;
             w.emission[i] = (!spans.is_empty()).then(|| ModelEmission {
@@ -2366,26 +3123,37 @@ impl Mounts {
                 spans: spans.clone(),
             });
         }
+        let mut page_entries = Vec::with_capacity(pages.len());
+        for p in &pages {
+            let i = match self.pages.iter().position(Option::is_none) {
+                Some(i) => i,
+                None => {
+                    self.pages.push(None);
+                    self.page_keys.push(None);
+                    self.pages.len() - 1
+                }
+            };
+            self.pages[i] = Some(InstancePage {
+                info: p.info.clone(),
+                records: GpuPtr::NULL,
+                record_count: p.record_count,
+                mount,
+            });
+            res.pages.insert(p.id, PageId(i as u32));
+            page_entries.push((i as u32, p));
+        }
         let units = units(
             &meshes,
             &tables,
             self.clusters.gpu(),
             &res.placed_textures,
-            &pages,
+            &page_entries,
         )?;
+        for (&(i, _), &unit) in page_entries.iter().zip(&units.page_units) {
+            self.page_keys[i as usize] = Some((mount, unit));
+        }
         self.streaming
             .register(mount, Arc::clone(source), units, w)?;
-        for p in pages {
-            let i = match self.pages.iter().position(Option::is_none) {
-                Some(i) => i,
-                None => {
-                    self.pages.push(None);
-                    self.pages.len() - 1
-                }
-            };
-            self.pages[i] = Some(p.page);
-            res.pages.insert(p.id, PageId(i as u32));
-        }
         Ok(())
     }
 
@@ -2413,6 +3181,10 @@ impl Mounts {
             let Ok(r) = self.resident(mount) else {
                 continue;
             };
+            // An edit's copies gather their cuts without their hidden sections.
+            if !r.models.values().any(|&m| m == model) {
+                continue;
+            }
             let id = r.meshes[mesh as usize];
             let rt = &r.rt[mesh as usize];
             let built = self.masks.get(&id).map_or(&[][..], |m| &m.built[..]);
@@ -2492,5 +3264,7 @@ impl Mounts {
             self.release(r, device, materials);
         }
         self.transient.clear();
+        self.edits.clear();
+        self.retired_edits.clear();
     }
 }

@@ -47,18 +47,19 @@ pub use orr_scene::{self, RasterView};
 pub use orr_scene::{
     Affine3, ArenaReport, ArenaTarget, BlobId, BlobTarget, BoundTexture, Budgets, ClassStats,
     ClipRef, ClusterRef, ClusterTopology, Cone, ConsumerMarker, CopyVariant, Decal, DecalChannels,
-    DecalId, DepthOfField, DirectionalLight, DiscProfile, EmissiveGpu, EmissiveSpan, ExposureState,
-    Focus, FrameStats, FrameTime, Glare, GroupGpu, GroupWriter, InstanceFlags, InstanceGpu,
-    InstancePage, InstanceRange, InstancesDesc, Lens, LensDistortion, Light, LightGpu, LightId,
-    LoadState, Loading, MaterialGpu, MaterialId, MaterialWriter, MeshGpu, ModelEmission, ModelGpu,
-    ModelId, MountId, Opacity, OriginPolicy, PackSource, PageId, PipelineId, Pose, ProducerBatch,
-    ProducerClusterGpu, ProducerDesc, ProducerGpu, ProducerId, ProducerStats, ProducerUpdate,
-    Projection, REBASE_GRID_LOG2, RasterGpu, ReloadReport, RendererDesc, ResidencyClass,
-    ResidencyStats, RtCutGpu, RtStats, SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter,
-    SkeletonRef, SkinStats, SkinnedDesc, SkyStats, SlotStateGpu, Span, TextureFeedbackGpu,
-    TextureFilter, TextureStreamGpu, TopologyGpu, TransformGroupDesc, TransformGroupId,
-    TransparencyPass, ViewConstants, ViewDesc, ViewHistoryId, ViewStep, ViewTarget, WorldPos, abi,
-    material_flags, orr_gpu, orr_pack,
+    DecalId, DepthOfField, DirectionalLight, DiscProfile, EditDesc, EditGroupGpu, EditId, EditRef,
+    EmissiveGpu, EmissiveSpan, ExposureState, Focus, FrameStats, FrameTime, Glare, GroupGpu,
+    GroupWriter, InstanceFlags, InstanceGpu, InstancePage, InstancePageRef, InstanceRange,
+    InstancesDesc, Lens, LensDistortion, Light, LightGpu, LightId, LoadState, Loading, MaterialGpu,
+    MaterialId, MaterialWriter, MeshGpu, ModelEmission, ModelGpu, ModelId, MountId, Opacity,
+    OriginPolicy, PackSource, PageId, PipelineId, Pose, ProducerBatch, ProducerClusterGpu,
+    ProducerDesc, ProducerGpu, ProducerId, ProducerStats, ProducerUpdate, Projection,
+    REBASE_GRID_LOG2, RasterGpu, ReloadReport, RendererDesc, ResidencyClass, ResidencyStats,
+    RtCutGpu, RtStats, SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter, SkeletonRef,
+    SkinStats, SkinnedDesc, SkyStats, SlotStateGpu, Span, TextureFeedbackGpu, TextureFilter,
+    TextureStreamGpu, TopologyGpu, TransformGroupDesc, TransformGroupId, TransparencyPass,
+    ViewConstants, ViewDesc, ViewHistoryId, ViewStep, ViewTarget, WorldPos, abi, material_flags,
+    orr_gpu, orr_pack,
 };
 
 use orr_gpu::{
@@ -460,6 +461,38 @@ impl Renderer {
         self.scenes.page(id)
     }
 
+    /// Wants the records of instance page `id` resident from the next frame on. Requests last
+    /// one frame.
+    pub fn prefetch_page(&mut self, id: PageId, cell_distance: u32) {
+        self.scenes.prefetch_page(id, cell_distance);
+    }
+
+    /// Wants the instance pages meeting the sphere, and the streamed units of the models they
+    /// place, resident from the next frame on. Requests last one frame.
+    pub fn prefetch_region(&mut self, center: orr_scene::DVec3, radius: f32) {
+        self.scenes.prefetch_region(center, radius);
+    }
+
+    /// Starts an edit of a mesh without skinning: a new model whose touched pages kernels
+    /// write at the scene compute point. Poll [`Renderer::edit_state`].
+    pub fn create_edit(&mut self, desc: &EditDesc<'_>) -> Result<EditId> {
+        Ok(self.scenes.create_edit(desc)?)
+    }
+
+    pub fn edit_state(&self, id: EditId) -> LoadState {
+        self.scenes.edit_state(id)
+    }
+
+    /// What kernels and instances need of a ready edit.
+    pub fn edit(&self, id: EditId) -> Result<EditRef> {
+        Ok(self.scenes.edit(id)?)
+    }
+
+    /// Ends an edit once every frame so far has completed; remove its copies first.
+    pub fn destroy_edit(&mut self, id: EditId) {
+        self.scenes.destroy_edit(id);
+    }
+
     pub fn texture(&self, m: MountId, id: orr_pack::AssetId) -> Result<TextureIndex> {
         Ok(self.scenes.texture(m, id)?)
     }
@@ -609,6 +642,12 @@ impl<'a> Frame<'a> {
     /// Step 2: the writer of a scene listed in this frame. One per scene at a time; Send.
     pub fn scene(&self, id: SceneId) -> Result<SceneWriter<'_>> {
         Ok(self.scenes.scene(id)?)
+    }
+
+    /// Step 2: tells orr that kernels change edit `id` at this frame's scene compute point.
+    /// False: this frame cannot rebuild it, and the kernels must leave it unchanged.
+    pub fn edit_dirty(&mut self, id: EditId) -> bool {
+        self.scenes.edit_dirty(id)
     }
 
     /// Step 2: a material writer; Send.

@@ -14,8 +14,10 @@ use crate::lights::{EMISSIVE_INSTANCE, EMISSIVE_PRODUCER, Light, LightId, light_
 use crate::material::MaterialId;
 use crate::medium_proxy::{MediumProxy, MediumProxyId, proxy_gpu};
 use crate::memory::{RangeAllocator, UploadWindow};
+use crate::mount::{Mounts, PageId};
 use crate::producer::{self, Producer, ProducerDesc, ProducerId, ProducerUpdate};
 use crate::ptlas::Ptlas;
+use crate::shaders::instance_page::PagePrototypeGpu;
 use crate::skin::{CopyArrays, SkinFrame, SkinnedDesc};
 use crate::subd::{self, ModelCage, SubdBuild, SubdDesc};
 use crate::tessellate::Patterns;
@@ -28,6 +30,9 @@ use crate::{
     ProducerBatch, ProducerGpu, ProducerStateGpu, Result, SceneRoot, SkinStateGpu, SkinnedGpu,
     SkyStats, SlotStateGpu, TessStateGpu, ViewConstants,
 };
+
+/// `tables.slang` `GROUP_QUANTIZED_PAGE`.
+const GROUP_QUANTIZED_PAGE: u32 = 1;
 
 /// A scene in [`crate::Scenes`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -65,6 +70,9 @@ pub struct SceneDesc {
     /// Medium proxies: every `MediumProxyId` is below it. They trace from the PTLAS global
     /// partition.
     pub medium_proxy_capacity: u32,
+    /// `MaterialId` entries for the sets of cooked page prototypes that override materials,
+    /// after the material-set table's `material_set_capacity` entries.
+    pub page_material_sets: u32,
 }
 
 impl Default for SceneDesc {
@@ -84,6 +92,7 @@ impl Default for SceneDesc {
             skinned_clusters: 8192,
             decal_capacity: 1024,
             medium_proxy_capacity: 64,
+            page_material_sets: 4096,
         }
     }
 }
@@ -120,6 +129,9 @@ pub enum GroupWriter {
     /// writer rewrites every transform each such frame. A kernel removes an entry's motion
     /// (a teleport) by writing the same transform to `previous` as well.
     Gpu,
+    /// A cooked instance page's records, from [`SceneWriter::add_instance_page`]. Its copies
+    /// are hidden while the page is not resident.
+    Page,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -201,6 +213,25 @@ pub struct Pose {
     pub stride: u32,
 }
 
+/// A cooked instance page placed in a scene with [`SceneWriter::add_instance_page`].
+#[derive(Clone, Copy, Debug)]
+pub struct InstancePageRef<'a> {
+    pub page: PageId,
+    /// Where copies of each model take their part poses; the copy's index in its pose block
+    /// is its record index. Models not listed take none.
+    pub poses: &'a [(ModelId, Pose)],
+    /// Replaces a prototype's material set by a base in the scene's material-set table.
+    pub material_sets: &'a [(u16, u32)],
+    /// A copy's flags are its prototype's and these; a prototype's flags of 0 take these.
+    pub flags: InstanceFlags,
+    /// m from the scene focus within which the copies are traced.
+    pub rt_range: f32,
+    /// m from the scene focus within which the copies take their pose.
+    pub animation_range: f32,
+    /// Never read by orr.
+    pub user_tag: u32,
+}
+
 /// Per-copy variety: pose variant, material set and hidden sections (bit set = hidden).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
@@ -263,16 +294,49 @@ pub(crate) struct Group {
     pub count: u32,
     pub anchor: WorldPos,
     /// `current` and the other buffer; GPU groups swap them every updated frame.
-    pub buffers: [Allocation<u8>; 2],
+    pub buffers: Vec<Allocation<u8>>,
     pub current: usize,
     /// `GroupGpu::previous` points at the current buffer.
     pub previous_is_current: bool,
     pub created_frame: u64,
     pub written: bool,
+    /// A page group's record; its buffers are empty.
+    pub page: Option<PageGroup>,
+}
+
+/// What a cooked page's transform group holds.
+#[derive(Clone, Copy)]
+pub(crate) struct PageGroup {
+    pub page: PageId,
+    /// Where its records are resident; 0: not resident, which hides its copies.
+    pub records: u64,
+    /// `records` changed since the group record was last written.
+    pub changed: bool,
+    pub origin: [f32; 3],
+    pub extent: [f32; 3],
+    pub log2_scale_min: f32,
+    pub log2_scale_max: f32,
 }
 
 impl Group {
     pub(crate) fn record(&self) -> GroupGpu {
+        if let Some(p) = &self.page {
+            // SAFETY: the records stay resident while this record names them: their eviction
+            // and their pack's unmount write it null first.
+            let records = unsafe { GpuPtr::from_address(GpuAddress(p.records)) };
+            return GroupGpu {
+                current: records,
+                previous: records,
+                count: self.count,
+                format: GROUP_QUANTIZED_PAGE,
+                anchor_cell: self.anchor.cell.to_array(),
+                anchor_offset: self.anchor.offset.to_array(),
+                origin: p.origin,
+                extent: p.extent,
+                log2_scale_min: p.log2_scale_min,
+                log2_scale_max: p.log2_scale_max,
+            };
+        }
         let current = self.buffers[self.current].gpu();
         let previous = if self.previous_is_current {
             current
@@ -305,6 +369,24 @@ pub(crate) struct ModelCpu {
     pub skin: Option<SkinShape>,
     /// It has a subdivision cage and no mesh.
     pub cage_only: bool,
+    /// It is an edit of another model's mesh.
+    pub edit: bool,
+}
+
+/// A cooked page placed in a scene: its prototypes until its records first land, which write
+/// its slots, and what its removal frees.
+pub(crate) struct PagePlacement {
+    pub range: InstanceRange,
+    pub group: TransformGroupId,
+    pub page: PageId,
+    pub prototypes: Allocation<u8>,
+    pub prototype_count: u32,
+    pub spans: GpuPtr<EmissiveGpu>,
+    pub first_entry: u32,
+    pub entry_stride: u32,
+    pub expanded: bool,
+    /// Its prototypes' entries of the page part of the material-set table.
+    pub sets: (u32, u32),
 }
 
 /// The vertex and cluster counts of a skinned mesh.
@@ -372,6 +454,14 @@ pub(crate) struct SceneCpu {
     pub decals_changed: bool,
     pub decal_bin_slots: u32,
     pub decal_globals: u32,
+    /// The last frame `update_scenes` updated the scene.
+    pub last_update: u64,
+    /// Cooked pages placed in the scene.
+    pub pages: Vec<PagePlacement>,
+    /// Pages removed in a frame, freed once that frame has completed.
+    pub pages_removed: Vec<(u64, PagePlacement)>,
+    /// Entries of the page part of the material-set table, from `material_set_capacity`.
+    pub page_sets: RangeAllocator,
 }
 
 /// A view of a scene: its history, the frame and its constants.
@@ -405,7 +495,11 @@ impl Scene {
             instances: device.gpu_malloc(dl, n(desc.instance_capacity), "instances")?,
             slot_state: device.gpu_malloc(dl, n(desc.instance_capacity), "slot state")?,
             groups: device.gpu_malloc(dl, n(desc.group_capacity), "transform groups")?,
-            material_sets: device.gpu_malloc(dl, n(desc.material_set_capacity), "material sets")?,
+            material_sets: device.gpu_malloc(
+                dl,
+                n(desc.material_set_capacity + desc.page_material_sets),
+                "material sets",
+            )?,
             lights: device.gpu_malloc(dl, n(desc.light_capacity), "lights")?,
             emissive: device.gpu_malloc(
                 dl,
@@ -491,6 +585,10 @@ impl Scene {
                 decals_changed: false,
                 decal_bin_slots: 0,
                 decal_globals: 0,
+                last_update: 0,
+                pages: Vec::new(),
+                pages_removed: Vec::new(),
+                page_sets: RangeAllocator::new(desc.page_material_sets),
             }),
             writing: AtomicBool::new(false),
         })
@@ -516,6 +614,7 @@ pub struct SceneWriter<'f> {
     /// Subdivision cages by `ModelId`.
     pub(crate) cages: &'f [Option<ModelCage>],
     pub(crate) patterns: &'f Patterns,
+    pub(crate) mounts: &'f Mounts,
 }
 
 impl Drop for SceneWriter<'_> {
@@ -564,11 +663,12 @@ impl<'f> SceneWriter<'f> {
             writer: desc.writer,
             count: desc.count,
             anchor: WorldPos::new(desc.anchor, self.cell_log2),
-            buffers: [a?, b?],
+            buffers: vec![a?, b?],
             current: 0,
             previous_is_current: true,
             created_frame: self.frame,
             written: false,
+            page: None,
         };
         let record = group.record();
         let zero = Record::fill(
@@ -682,6 +782,12 @@ impl<'f> SceneWriter<'f> {
             .get(desc.model.0 as usize)
             .and_then(Option::as_ref)
             .filter(|m| !m.spans.is_empty());
+        // An edit's copies stay at rest pose: its clusters take no part transforms.
+        let edit = self
+            .model_cpu
+            .get(desc.model.0 as usize)
+            .is_some_and(|m| m.edit);
+        let pose = desc.pose.filter(|_| !edit);
         let (first, entry, partitions, table) = {
             let cpu = &mut *self.scene.cpu.lock().unwrap();
             let first = cpu.slots.alloc(desc.copies).ok_or(Error::Capacity {
@@ -717,7 +823,7 @@ impl<'f> SceneWriter<'f> {
                 .model_cpu
                 .get(desc.model.0 as usize)
                 .map_or(0, |m| m.animated_parts);
-            let cost = 1 + if desc.pose.is_some() { parts } else { 0 };
+            let cost = 1 + if pose.is_some() { parts } else { 0 };
             cpu.slot_models[first as usize..(first + desc.copies) as usize].fill(desc.model.0);
             let partitions = cpu.ptlas.place(first, desc.copies, cell, cost);
             (first, entry, partitions, cpu.ptlas.slot_table.gpu())
@@ -750,7 +856,7 @@ impl<'f> SceneWriter<'f> {
             first,
             count: desc.copies,
         };
-        let pose = desc.pose.unwrap_or(Pose {
+        let pose = pose.unwrap_or(Pose {
             group: TransformGroupId(0),
             index: 0,
             variants: 0,
@@ -784,20 +890,288 @@ impl<'f> SceneWriter<'f> {
         Ok(range)
     }
 
+    /// One slot per record of a cooked instance page, partitioned as the cook laid them out,
+    /// in a transform group of its own over the page's records. The page's records load on
+    /// the loading side: the scene wants them every frame, nearest the focus first, within
+    /// the instance page budget, and its copies are hidden while they are not resident. The
+    /// range stays valid as the page leaves and returns. Its slots take their records from the
+    /// page's prototypes the first time the records land, so their variants, flags and other
+    /// per-copy settings come from the page.
+    pub fn add_instance_page(&mut self, r: &InstancePageRef<'_>) -> Result<InstanceRange> {
+        let page = self
+            .mounts
+            .pages
+            .get(r.page.0 as usize)
+            .and_then(Option::as_ref)
+            .ok_or(Error::UnknownPage(r.page))?;
+        let count = page.record_count;
+        let protos = self.mounts.page_prototypes(r.page)?;
+        let header = page.info.header;
+        let set_entries: u32 = protos
+            .iter()
+            .map(|p| p.sets.as_ref().map_or(0, |s| s.len() as u32))
+            .sum();
+        let empty = ModelCpu::default();
+        let model_cpu = |model: ModelId| self.model_cpu.get(model.0 as usize).unwrap_or(&empty);
+        let classes = protos
+            .iter()
+            .map(|p| {
+                model_cpu(p.model)
+                    .candidate_class
+                    .ok_or(Error::MixedClasses(p.model))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Every copy of the page takes room for the emissive spans of the most emissive model.
+        let spans_of = |model: ModelId| {
+            self.models
+                .get(model.0 as usize)
+                .and_then(Option::as_ref)
+                .map_or(&[][..], |m| &m.spans[..])
+        };
+        let stride = protos
+            .iter()
+            .map(|p| spans_of(p.model).len() as u32)
+            .max()
+            .unwrap_or(0);
+        let span_total: usize = protos.iter().map(|p| spans_of(p.model).len()).sum();
+        let copy_bytes = (protos.len() * size_of::<PagePrototypeGpu>()) as u64;
+        let spans_at = copy_bytes.next_multiple_of(16);
+        let span_bytes = (span_total * size_of::<EmissiveGpu>()) as u64;
+        let mut table = self.device.gpu_malloc::<u8>(
+            MemoryKind::Upload,
+            (spans_at + span_bytes).max(16),
+            "page prototypes",
+        )?;
+
+        let cpu = &mut *self.scene.cpu.lock().unwrap();
+        let group_id = (1..cpu.groups.len())
+            .find(|&i| cpu.groups[i].is_none())
+            .unwrap_or(cpu.groups.len()) as u32;
+        if group_id >= self.scene.desc.group_capacity {
+            return Err(Error::Capacity {
+                what: "transform groups",
+                capacity: self.scene.desc.group_capacity,
+            });
+        }
+        let first = cpu.slots.alloc(count).ok_or(Error::Capacity {
+            what: "instances",
+            capacity: self.scene.desc.instance_capacity,
+        })?;
+        let Some(set_base) = cpu.page_sets.alloc(set_entries) else {
+            cpu.slots.free(first, count);
+            return Err(Error::Capacity {
+                what: "page material sets",
+                capacity: self.scene.desc.page_material_sets,
+            });
+        };
+        let entry = if stride > 0 {
+            let Some(e) = cpu.emissive.alloc(count * stride) else {
+                cpu.slots.free(first, count);
+                cpu.page_sets.free(set_base, set_entries);
+                return Err(Error::Capacity {
+                    what: "emissive list entries",
+                    capacity: self.scene.desc.emissive_capacity,
+                });
+            };
+            cpu.emissive_runs.insert(
+                first,
+                Run {
+                    copies: count,
+                    entry: e,
+                    spans: stride,
+                },
+            );
+            let at = self.emissive_entry(e).address().0;
+            let n = count * stride * words(size_of::<EmissiveGpu>());
+            cpu.records.push(Record::fill(self.next_seq(), at, n, 0));
+            e
+        } else {
+            0
+        };
+
+        let mut copies = Vec::with_capacity(protos.len());
+        let mut spans: Vec<EmissiveGpu> = Vec::with_capacity(span_total);
+        let mut at_set = self.scene.desc.material_set_capacity + set_base;
+        for ((index, p), &class) in protos.iter().enumerate().zip(&classes) {
+            let cooked_base = match &p.sets {
+                Some(set) => {
+                    let values: Vec<u32> = set.iter().map(|m| m.0).collect();
+                    let (src, out) = self.window.slice::<u32>(self.device, values.len() as u32)?;
+                    out.copy_from_slice(&values);
+                    let dst = self.scene.tables.material_sets.gpu();
+                    cpu.records.push(Record::values(
+                        self.next_seq(),
+                        dst.offset(u64::from(at_set)).cast::<u32>(),
+                        src,
+                        values.len() as u32,
+                    ));
+                    at_set += values.len() as u32;
+                    at_set - values.len() as u32
+                }
+                None => u32::MAX,
+            };
+            let base = r
+                .material_sets
+                .iter()
+                .find(|(q, _)| usize::from(*q) == index)
+                .map_or(cooked_base, |&(_, b)| b);
+            let pose = r
+                .poses
+                .iter()
+                .find(|(m, _)| *m == p.model)
+                .map(|&(_, q)| q)
+                .filter(|_| !model_cpu(p.model).edit);
+            let flags = if p.flags == 0 {
+                r.flags.0
+            } else {
+                p.flags as u8 & r.flags.0
+            };
+            if p.mask != 0 {
+                cpu.masks.insert((p.model, p.mask));
+            }
+            let first_span = spans.len() as u32;
+            if let Some(m) = self.models.get(p.model.0 as usize).and_then(Option::as_ref) {
+                spans.extend(m.spans.iter().map(|s| EmissiveGpu {
+                    kind: EMISSIVE_INSTANCE,
+                    first_cluster: s.first_cluster,
+                    cluster_count: s.cluster_count,
+                    section: u32::from(s.section),
+                    sections: m.sections,
+                    material: m.materials[usize::from(s.section)].0,
+                    model_area: s.area,
+                    ..Zeroable::zeroed()
+                }));
+            }
+            copies.push(PagePrototypeGpu {
+                instance: InstanceGpu {
+                    group: group_id,
+                    group_index: 0,
+                    model: p.model.0,
+                    material_base: base,
+                    pose_group: pose.map_or(0, |q| q.group.0),
+                    pose_index: pose.map_or(0, |q| q.index),
+                    first_part: u32::MAX,
+                    rt_range: half::f16::from_f32(r.rt_range).to_bits(),
+                    animation_range: half::f16::from_f32(r.animation_range).to_bits(),
+                    flags: flags & InstanceFlags::CONSUMER,
+                    candidate_class: class,
+                    pose_variants: pose.map_or(0, |q| q.variants as u16),
+                    pose_stride: pose.map_or(0, |q| q.stride as u16),
+                    debug_lod: 0,
+                    user_tag: r.user_tag,
+                    variant: u32::from(p.pose) | u32::from(p.mask) << 16,
+                },
+                first_span,
+                span_count: spans.len() as u32 - first_span,
+                _pad: [0; 2],
+            });
+        }
+        let out = table.as_mut_slice().expect("upload is mapped");
+        out[..copy_bytes as usize].copy_from_slice(bytemuck::cast_slice(&copies));
+        out[spans_at as usize..(spans_at + span_bytes) as usize]
+            .copy_from_slice(bytemuck::cast_slice(&spans));
+        let spans_gpu = table.gpu().offset(spans_at).cast();
+        let mut ends: Vec<u32> = page.info.partitions.iter().map(|&p| u32::from(p)).collect();
+        ends.push(count);
+        let mut runs: Vec<u32> = ends
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .filter(|&n| n > 0)
+            .collect();
+        if runs.is_empty() && count > 0 {
+            runs.push(count);
+        }
+        let cell = IVec3::from_array(header.cell);
+        let partitions = cpu.ptlas.place_runs(first, &runs, cell);
+        let group = Group {
+            writer: GroupWriter::Page,
+            count,
+            anchor: WorldPos {
+                cell,
+                offset: orr_math::Vec3::ZERO,
+            },
+            buffers: Vec::new(),
+            current: 0,
+            previous_is_current: true,
+            created_frame: self.frame,
+            written: false,
+            page: Some(PageGroup {
+                page: r.page,
+                records: page.records.address().0,
+                changed: false,
+                origin: header.origin,
+                extent: header.extent,
+                log2_scale_min: header.log2_scale_min,
+                log2_scale_max: header.log2_scale_max,
+            }),
+        };
+        let record = group.record();
+        let at = group_id as usize;
+        if at == cpu.groups.len() {
+            cpu.groups.push(Some(group));
+        } else {
+            cpu.groups[at] = Some(group);
+        }
+        let range = InstanceRange { first, count };
+        let seq = self.next_seq();
+        let n = count * words(size_of::<InstanceGpu>());
+        cpu.records
+            .push(Record::fill(seq, self.instance_word(first, 0), n, 0));
+        let slot_table = cpu.ptlas.slot_table.gpu();
+        cpu.pages.push(PagePlacement {
+            range,
+            group: TransformGroupId(group_id),
+            page: r.page,
+            prototypes: table,
+            prototype_count: copies.len() as u32,
+            spans: spans_gpu,
+            first_entry: entry,
+            entry_stride: stride,
+            expanded: false,
+            sets: (set_base, set_entries),
+        });
+        let (src, out) = self.window.slice::<u32>(self.device, count)?;
+        out.copy_from_slice(&partitions);
+        cpu.records.push(Record::values(
+            self.next_seq(),
+            slot_table.offset(u64::from(first)),
+            src,
+            count,
+        ));
+        let (src, out) = self.window.slice::<GroupGpu>(self.device, 1)?;
+        out[0] = record;
+        cpu.records.push(Record::values(
+            self.next_seq(),
+            self.scene.tables.groups.gpu().offset(u64::from(group_id)),
+            src,
+            1,
+        ));
+        Self::reset_slot_state_with(&self.scene.tables, self.next_seq(), range, &mut cpu.records);
+        Ok(range)
+    }
+
     /// Zeroes the slot state of new slots. The fields from `part_run` on describe runs the
     /// PTLAS kernels still release.
     fn reset_slot_state(&self, range: InstanceRange) {
-        let state = self
-            .scene
-            .tables
+        let mut records = Vec::new();
+        Self::reset_slot_state_with(&self.scene.tables, self.next_seq(), range, &mut records);
+        self.scene.cpu.lock().unwrap().records.append(&mut records);
+    }
+
+    fn reset_slot_state_with(
+        tables: &Tables,
+        seq: u64,
+        range: InstanceRange,
+        records: &mut Vec<Record>,
+    ) {
+        let state = tables
             .slot_state
             .gpu()
             .offset(u64::from(range.first))
             .address()
             .0;
-        let seq = self.next_seq();
         for word in 0..words(std::mem::offset_of!(SlotStateGpu, part_run)) {
-            self.push(Record {
+            records.push(Record {
                 seq,
                 dst: state + 4 * u64::from(word),
                 count: range.count,
@@ -971,6 +1345,10 @@ impl<'f> SceneWriter<'f> {
         out.copy_from_slice(variants);
         let cpu = &mut *self.scene.cpu.lock().unwrap();
         let slot = (range.first + first) as usize;
+        assert!(
+            !cpu.pages.iter().any(|p| p.range.first == range.first),
+            "copies of a cooked page take their variants from the page"
+        );
         for (v, &model) in variants.iter().zip(&cpu.slot_models[slot..]) {
             let sections = self.model_cpu.get(model as usize).map_or(0, |m| m.sections);
             let mask = u32::from(v.section_mask) & ((1 << sections.min(16)) - 1);
@@ -1026,6 +1404,14 @@ impl<'f> SceneWriter<'f> {
             .push(Record::fill(seq, self.instance_word(range.first, 0), n, 0));
         cpu.removed.push((self.frame, range));
         cpu.ptlas.remove(range.first, range.count, self.frame);
+        if let Some(i) = cpu.pages.iter().position(|p| p.range == range) {
+            let p = cpu.pages.swap_remove(i);
+            cpu.groups[p.group.0 as usize] = None;
+            let at = self.scene.tables.groups.gpu().offset(u64::from(p.group.0));
+            let n = words(size_of::<GroupGpu>());
+            cpu.records.push(Record::fill(seq, at.address().0, n, 0));
+            cpu.pages_removed.push((self.frame, p));
+        }
         let end = range.first + range.count;
         let mut i = 0;
         while i < cpu.skins.len() {

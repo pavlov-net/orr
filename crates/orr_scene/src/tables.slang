@@ -3,6 +3,7 @@ module tables;
 
 import orr.abi;
 import orr.trace;
+import orr_pack.instance;
 __exported import cut;
 __exported import decal;
 __exported import medium_proxy;
@@ -217,8 +218,29 @@ public struct MaskGpu
     public uint64_t* blas;
 }
 
-// A mesh made resident from a mounted pack. Page and node page addresses are 0 while
-// their data is not resident.
+// A DAG group an edit holds at level 0, for the consumer kernel that writes it: clusters
+// `first_cluster..first_cluster + cluster_count` of mesh page `page`.
+public struct EditGroupGpu
+{
+    public uint page;
+    public uint first_cluster;
+    public uint cluster_count;
+    public uint _pad;
+}
+
+// What an edit's mesh pins to level 0: the whole mesh, or what meets its spheres (mesh space).
+public struct EditGpu
+{
+    public float4* spheres;
+    public EditGroupGpu* groups;   // the groups held at level 0
+    public uint sphere_count;
+    public uint group_count;
+    public uint whole;             // not 0: every cluster
+    public uint _pad;
+}
+
+// A mesh made resident from a mounted pack, or an edit of one. Page and node page addresses
+// are 0 while their data is not resident.
 public struct MeshGpu
 {
     public uint8_t* info;          // blob 0: MeshHeader and its tables (orr_pack.mesh)
@@ -252,6 +274,10 @@ public struct MeshGpu
     public uint pinned_pages;      // pages resident from mount; the others stream when `page_stamps` is set
     public SkinMeshGpu* skin;      // MESH_SKIN meshes: what skinned copies build from, else null
     public uint* page_stamps;      // per page: the last frame the traversal reported it; null when every page is resident
+    public EditGpu* edit;          // an edit's mesh: what stays at level 0; its copies always gather their cut
+    public uint* cut_stamps;       // per finer cut: the last frame it was reported in use, then wanted
+    public uint fine_cuts;         // the first `fine_cuts` cached cuts need streamed pages: built once wanted, BLAS 0 until then
+    public uint _pad_cuts;
 }
 
 // What skinned copies of a MESH_SKIN mesh read: each cluster's place in a copy's vertex
@@ -498,15 +524,23 @@ public uint cluster_page(MeshGpu* mesh, uint cluster)
     return lo;
 }
 
-// Transform `index` of `group` as a row-major [R | t] relative to the group's anchor.
+// Entry `index` of `transforms` (`group`'s current or previous buffer) as a row-major [R | t]
+// relative to the group's anchor.
+public float3x4 group_entry(GroupGpu* group, uint8_t* transforms, uint index)
+{
+    if (group.format == GROUP_QUANTIZED_PAGE)
+        return decode_record(group.origin, group.extent, group.log2_scale_min, group.log2_scale_max, ((InstanceRecord*)transforms)[index]);
+    return ((float3x4*)transforms)[index];
+}
+
 public float3x4 group_transform(GroupGpu* group, uint index)
 {
-    return ((float3x4*)group.current)[index];
+    return group_entry(group, group.current, index);
 }
 
 public float3x4 previous_group_transform(GroupGpu* group, uint index)
 {
-    return ((float3x4*)group.previous)[index];
+    return group_entry(group, group.previous, index);
 }
 
 // An order-free hash of a set of mesh clusters: the sum of two hashes of each.

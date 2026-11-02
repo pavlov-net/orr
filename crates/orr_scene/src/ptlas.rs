@@ -283,6 +283,42 @@ impl Ptlas {
             .collect()
     }
 
+    /// Places a cooked page's slots: `runs` consecutive slot counts from `first`, each run a
+    /// partition of its own in `cell`, split where it would pass the partition limit. The
+    /// cook sized each run for the page's PTLAS instances, part runs included.
+    pub(crate) fn place_runs(&mut self, first: u32, runs: &[u32], cell: IVec3) -> Vec<u32> {
+        let total: u32 = runs.iter().sum();
+        self.high_water = self.high_water.max(first + total);
+        let mut out = Vec::with_capacity(total as usize);
+        let mut slot = first;
+        for &run in runs {
+            let mut left = run;
+            while left > 0 {
+                let n = left.min(self.max_per_partition.max(1));
+                left -= n;
+                let p = self.free.pop();
+                if let Some(p) = p {
+                    let part = &mut self.partitions[p as usize];
+                    part.cell = cell;
+                    part.count = n;
+                    self.assigned.insert(p);
+                    self.changed.insert(p);
+                }
+                for s in slot..slot + n {
+                    self.slot_cost[s as usize] = 1;
+                    let at = p.unwrap_or(PARTITION_NONE);
+                    self.slot_partition[s as usize] = at;
+                    out.push(at);
+                }
+                if p.is_none() {
+                    self.unplaced += n;
+                }
+                slot += n;
+            }
+        }
+        out
+    }
+
     /// Takes slots `first..first + count` for skinned copies, which the PTLAS kernels write
     /// into the global partition; the GPU slot table holds no partition for them.
     pub(crate) fn place_skinned(&mut self, first: u32, count: u32) {

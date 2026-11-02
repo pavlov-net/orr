@@ -31,30 +31,27 @@ public struct InstanceRecord
     public uint scale;
 }
 
-public float3 decode_instance_position(InstancePageHeader h, InstanceRecord r)
-{
-    float3 q = float3(float(r.pos[0]), float(r.pos[1]), float(r.pos[2]));
-    return h.origin + q * (h.extent / 65535.0);
-}
-
-public float3 decode_instance_scale(InstancePageHeader h, InstanceRecord r)
-{
-    uint3 code = uint3(r.scale, r.scale >> 10, r.scale >> 20) & 1023;
-    float range = h.log2_scale_max - h.log2_scale_min;
-    return exp2(h.log2_scale_min + range * (float3(code) / 1023.0));
-}
-
-// Cell-relative transform of a record: rows [R * diag(scale) | translation], the x scale
-// negative on a mirrored record.
-public float3x4 decode_instance(InstancePageHeader h, InstanceRecord r)
+// Cell-relative transform of a record in a page of box `origin`, `extent` and scale range
+// `log2_scale_min..log2_scale_max`: rows [R * diag(scale) | translation], the x scale negative
+// on a mirrored record.
+public float3x4 decode_record(float3 origin, float3 extent, float log2_scale_min, float log2_scale_max, InstanceRecord r)
 {
     float3x3 m = instance_rotation(r.rot, (r.scale & EXACT_AXIS) != 0);
-    float3 s = decode_instance_scale(h, r);
+    uint3 code = uint3(r.scale, r.scale >> 10, r.scale >> 20) & 1023;
+    float range = log2_scale_max - log2_scale_min;
+    float3 s = exp2(log2_scale_min + range * (float3(code) / 1023.0));
     if ((r.scale & MIRROR) != 0)
         s.x = -s.x;
-    float3 t = decode_instance_position(h, r);
+    float3 q = float3(float(r.pos[0]), float(r.pos[1]), float(r.pos[2]));
+    float3 t = origin + q * (extent / 65535.0);
     return float3x4(
         float4(m[0] * s, t.x),
         float4(m[1] * s, t.y),
         float4(m[2] * s, t.z));
+}
+
+// Cell-relative transform of a record of a page with header `h`.
+public float3x4 decode_instance(InstancePageHeader h, InstanceRecord r)
+{
+    return decode_record(h.origin, h.extent, h.log2_scale_min, h.log2_scale_max, r);
 }

@@ -37,7 +37,7 @@ use crate::reload::Reloader;
 use crate::residency::ResidencyStats;
 use crate::scene::{GroupWriter, ModelCpu, ModelId, Scene, SceneDesc, SceneId, SceneWriter};
 use crate::shaders::transparency::CompositeRoot;
-use crate::shaders::{animation, emissive, world as world_kernel};
+use crate::shaders::{animation, emissive, instance_page, world as world_kernel};
 use crate::skin::{SkinFrame, SkinKernels, SkinStats};
 use crate::subd::ModelCage;
 use crate::tessellate::{self, Patterns, SeenBy, TessKernels, TessellationStats};
@@ -48,7 +48,8 @@ use crate::upload::{Record, scatter};
 use crate::view::{RasterView, ViewDesc, ViewHistory, ViewHistoryId, view_constants};
 use crate::world::{WorldPos, needs_rebase, origin_for};
 use crate::{
-    BlobId, BlobTarget, Error, ExposureState, ProducerBatch, Result, SceneRoot, TextureStreamGpu,
+    BlobId, BlobTarget, EditDesc, EditId, EditRef, Error, ExposureState, ProducerBatch, Result,
+    SceneRoot, TextureStreamGpu,
 };
 
 /// Pool sizes and per-frame limits.
@@ -81,6 +82,9 @@ pub struct Budgets {
     pub rt_cut_blas: u32,
     /// Entries in the resident cluster table: every cluster of every resident mesh.
     pub resident_clusters: u32,
+    /// Triangles of edited clusters whose CLAS rebuild in one frame, at most; a first edit
+    /// past it still rebuilds alone.
+    pub edit_triangles: u32,
     /// Triangles one CLAS build on the loading queue takes, at most. On 621.01 an implicit
     /// build of about 413k triangles in 3,875 clusters of up to 256 vertices faults the
     /// device while 270k builds, so the default stays under that.
@@ -132,6 +136,7 @@ impl Default for Budgets {
             rt_cut_clusters: 1 << 18,
             rt_cut_blas: 1024,
             resident_clusters: 1 << 21,
+            edit_triangles: 1 << 18,
             stream_clas_triangles: 1 << 18,
             micromap_pages: 64,
             ptlas_rebuilt: 250_000,
@@ -560,6 +565,9 @@ impl Scenes {
     pub fn unmount(&mut self, m: MountId) {
         let frame = self.core.next_frame - 1;
         let core = &mut self.core;
+        for page in core.mounts.pages_of(m) {
+            core.land_page(page.0, 0);
+        }
         let gone = core.mounts.models_of(m);
         core.mounts
             .unmount(m, frame, &mut core.models, &mut core.cages);
@@ -576,6 +584,34 @@ impl Scenes {
                 core.write_chain(model, &[]);
             }
         }
+    }
+
+    /// Starts an edit of a mesh without skinning: a new model the consumer's kernels
+    /// change at the scene compute point (see [`EditRef`]). Its pages read on the loading
+    /// side, and [`Scenes::edit`] succeeds once [`Scenes::edit_state`] is `Ready`.
+    pub fn create_edit(&mut self, desc: &EditDesc<'_>) -> Result<EditId> {
+        self.core
+            .mounts
+            .create_edit(desc, &self.loading, &self.device)
+    }
+
+    /// The progress of an edit; `Failed` with [`Error::UnknownEdit`] once destroyed.
+    pub fn edit_state(&self, id: EditId) -> LoadState {
+        self.core.mounts.edit_state(id)
+    }
+
+    /// What kernels and instances need of a ready edit.
+    pub fn edit(&self, id: EditId) -> Result<EditRef> {
+        self.core.mounts.edit(id)
+    }
+
+    /// Ends an edit. Its copies must be removed first; its memory is freed once every frame
+    /// submitted so far has completed.
+    pub fn destroy_edit(&mut self, id: EditId) {
+        let frame = self.core.next_frame - 1;
+        let core = &mut self.core;
+        core.mounts
+            .destroy_edit(id, frame, &mut core.models, &mut core.cages);
     }
 
     /// Gives every copy of `model` up to 3 farther models, each with the distance from the
@@ -604,6 +640,14 @@ impl Scenes {
                 .is_some_and(|m| m.skin.is_some());
             if skinned {
                 return invalid("a farther model is skinned");
+            }
+            let edit = self
+                .core
+                .model_cpu
+                .get(step.0 as usize)
+                .is_some_and(|m| m.edit);
+            if edit {
+                return invalid("a farther model is an edit");
             }
             if !(distance.is_finite() && distance > last) {
                 return invalid("switch distances must be finite, positive and ascending");
@@ -674,6 +718,22 @@ impl Scenes {
             .mounts
             .streaming
             .prefetch_texture(m, texture.0, finest);
+    }
+
+    /// Wants the records of instance page `id` resident from the next frame on. Requests last
+    /// one frame.
+    pub fn prefetch_page(&mut self, id: PageId, cell_distance: u32) {
+        self.core.mounts.request_page(id.0, cell_distance);
+    }
+
+    /// Wants the records of every mounted instance page meeting the sphere, and the streamed
+    /// units of the models they place, resident from the next frame on, nearer first. Requests
+    /// last one frame and rank after what the frames' traversals request.
+    pub fn prefetch_region(&mut self, center: DVec3, radius: f32) {
+        let log2 = self.core.cell_log2;
+        self.core
+            .mounts
+            .prefetch_region(center, f64::from(radius), log2);
     }
 
     /// The stream table `MaterialGpu::texture_streams` points at, for kernels that sample
@@ -909,6 +969,14 @@ impl Scenes {
                 !done
             });
             cpu.retired.retain(|(frame, _)| *frame > completed);
+            let sets = &mut cpu.page_sets;
+            cpu.pages_removed.retain(|(frame, p)| {
+                let done = *frame <= completed;
+                if done {
+                    sets.free(p.sets.0, p.sets.1);
+                }
+                !done
+            });
             cpu.skins_removed.retain(|&(frame, first, count, _)| {
                 let done = frame <= completed;
                 if done {
@@ -923,6 +991,18 @@ impl Scenes {
         self.device.collect_garbage();
         let slot = (frame % u64::from(core.fif)) as usize;
         core.windows[slot].reset();
+        core.request_pages();
+        // Scenes report what they hold in their updates; a skipped scene's last one bounds it.
+        let settled = core
+            .scenes
+            .iter()
+            .flatten()
+            .filter_map(|s| {
+                let cpu = s.cpu.lock().unwrap();
+                (cpu.ptlas.high_water > 0).then_some(cpu.last_update)
+            })
+            .min()
+            .unwrap_or(frame);
         let mut apply = Apply {
             device: &self.device,
             window: &core.windows[slot],
@@ -938,11 +1018,21 @@ impl Scenes {
             loading_points.extend(batch.point);
             core.mounts.apply(batch, &mut apply);
         }
-        loading_points.extend(
-            core.mounts
-                .streaming
-                .step(frame, &self.loading, &mut apply)?,
-        );
+        for batch in self.loading.take_edits(&self.device) {
+            loading_points.extend(batch.point);
+            core.mounts.land_edit(batch, &mut apply);
+        }
+        loading_points.extend(core.mounts.streaming.step(
+            frame,
+            settled,
+            &self.loading,
+            &mut apply,
+        )?);
+        core.mounts.begin_edits(core.budgets.edit_triangles);
+        let events = core.mounts.streaming.take_page_events();
+        for (page, records) in events {
+            core.land_page(page, records);
+        }
         #[cfg(feature = "hot-reload")]
         let reloads = self
             .reloader
@@ -1006,6 +1096,57 @@ impl Core {
         }
     }
 
+    /// Wants the records of every placed page for this step, nearest a focus first, as far as
+    /// the instance page budget holds them; the others are left to leave after their hold.
+    fn request_pages(&mut self) {
+        let mut wanted: HashMap<u32, f64> = HashMap::new();
+        let edge = f64::from(1u32 << self.cell_log2);
+        for scene in self.scenes.iter().flatten() {
+            let cpu = scene.cpu.lock().unwrap();
+            for p in &cpu.pages {
+                let Some((center, radius)) = self.mounts.page_sphere(p.page.0, self.cell_log2)
+                else {
+                    continue;
+                };
+                let distance = cpu
+                    .focus
+                    .map_or(0.0, |(f, _)| (f.distance(center) - radius).max(0.0));
+                let e = wanted.entry(p.page.0).or_insert(f64::INFINITY);
+                *e = e.min(distance);
+            }
+        }
+        let mut pages: Vec<(u32, f64)> = wanted.into_iter().collect();
+        pages.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        let budget = self.mounts.streaming.instance_page_budget();
+        let mut bytes = 0;
+        for (page, distance) in pages {
+            bytes += self.mounts.page_bytes(page);
+            if bytes > budget {
+                break;
+            }
+            self.mounts.request_page(page, (distance / edge) as u32);
+        }
+    }
+
+    /// Points the page groups of `page` in every scene at its records, or hides their copies.
+    fn land_page(&mut self, page: u32, records: u64) {
+        if let Some(Some(p)) = self.mounts.pages.get_mut(page as usize) {
+            // SAFETY: the records stay resident until the event that writes this null.
+            p.records = unsafe { GpuPtr::from_address(GpuAddress(records)) };
+        }
+        for scene in self.scenes.iter().flatten() {
+            let mut cpu = scene.cpu.lock().unwrap();
+            for g in cpu.groups.iter_mut().flatten() {
+                if let Some(q) = &mut g.page
+                    && q.page.0 == page
+                {
+                    q.records = records;
+                    q.changed = true;
+                }
+            }
+        }
+    }
+
     fn scene(&self, id: SceneId) -> Result<&Scene> {
         self.scenes
             .get(id.0 as usize)
@@ -1066,6 +1207,16 @@ impl<'a> Frame<'a> {
         self.pipelines.get(id)
     }
 
+    /// Tells orr that kernels change edit `id` at this frame's scene compute point, so its
+    /// clusters' culling data and CLAS rebuild right after it. False, with nothing to
+    /// rebuild: the frame's [`Budgets::edit_triangles`] is spent or the edit is not ready,
+    /// and the kernels must leave the edit unchanged this frame so that raster and ray
+    /// tracing keep agreeing. Call it before [`Frame::update_scenes`].
+    pub fn edit_dirty(&mut self, id: EditId) -> bool {
+        assert!(!self.updated, "edits are marked before update_scenes");
+        self.core.mounts.edit_dirty(id)
+    }
+
     /// What hot reload applied at this frame's step 1; always empty without the
     /// `hot-reload` feature.
     pub fn reloads(&self) -> &[ReloadReport] {
@@ -1094,6 +1245,7 @@ impl<'a> Frame<'a> {
             model_cpu: &self.core.model_cpu,
             cages: &self.core.cages,
             patterns: &self.core.patterns,
+            mounts: &self.core.mounts,
         })
     }
 
@@ -1154,6 +1306,7 @@ impl<'a> Frame<'a> {
         for &id in &self.listed {
             let scene = core.scene(id)?;
             let cpu = &mut *scene.cpu.lock().unwrap();
+            cpu.last_update = self.id;
             records.append(&mut cpu.records);
             masks.extend(std::mem::take(&mut cpu.masks));
             for p in cpu.producers.iter().flatten() {
@@ -1199,6 +1352,7 @@ impl<'a> Frame<'a> {
                 let before = g.record();
                 let fresh = g.created_frame == self.id;
                 match g.writer {
+                    GroupWriter::Page => {}
                     GroupWriter::Cpu => {
                         if g.written && !fresh {
                             copies.push((
@@ -1217,7 +1371,11 @@ impl<'a> Frame<'a> {
                 }
                 g.written = false;
                 let after = g.record();
-                if bytemuck::bytes_of(&before) != bytemuck::bytes_of(&after) {
+                let landed = g
+                    .page
+                    .as_mut()
+                    .is_some_and(|p| std::mem::take(&mut p.changed));
+                if landed || bytemuck::bytes_of(&before) != bytemuck::bytes_of(&after) {
                     let src = window.put(device, &after)?;
                     let dst = scene.tables.groups.gpu().offset(index as u64);
                     records.push(Record::values(core.next_seq(), dst, src, 1));
@@ -1268,7 +1426,8 @@ impl<'a> Frame<'a> {
                 instance_capacity: scene.desc.instance_capacity,
                 group_capacity: scene.desc.group_capacity,
                 light_capacity: scene.desc.light_capacity,
-                material_set_capacity: scene.desc.material_set_capacity,
+                material_set_capacity: scene.desc.material_set_capacity
+                    + scene.desc.page_material_sets,
                 producer_capacity: scene.desc.producer_capacity,
                 emissive_capacity: scene.desc.emissive_capacity,
                 near_range: cpu.near_range,
@@ -1346,6 +1505,48 @@ impl<'a> Frame<'a> {
             list.end_pass();
             list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         }
+        let mut expansions = Vec::new();
+        for &id in &self.listed {
+            let scene = core.scene(id)?;
+            let root = scene.tables.root.gpu();
+            let mut cpu = scene.cpu.lock().unwrap();
+            let cpu = &mut *cpu;
+            for p in cpu.pages.iter_mut().filter(|p| !p.expanded) {
+                let records = cpu.groups[p.group.0 as usize]
+                    .as_ref()
+                    .and_then(|g| g.page.as_ref())
+                    .map_or(0, |g| g.records);
+                if records == 0 {
+                    continue;
+                }
+                p.expanded = true;
+                expansions.push(instance_page::PageExpandRoot {
+                    scene: root,
+                    // SAFETY: the records stay resident through this frame: their eviction is
+                    // written at step 1 before the event that hides them.
+                    records: unsafe { GpuPtr::from_address(GpuAddress(records)) },
+                    prototypes: p.prototypes.gpu().cast(),
+                    spans: p.spans,
+                    first_slot: p.range.first,
+                    count: p.range.count,
+                    prototype_count: p.prototype_count,
+                    first_entry: p.first_entry,
+                    entry_stride: p.entry_stride,
+                    _pad0: 0,
+                    _pad1: 0,
+                });
+            }
+        }
+        if !expansions.is_empty() {
+            list.begin_pass("instance pages", false);
+            for r in &expansions {
+                let ptr = window.put_root(device, r)?;
+                let p = self.pipelines.get(own.expand_page);
+                list.dispatch(p, ptr, [r.count.div_ceil(64), 1, 1]);
+            }
+            list.end_pass();
+            list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
+        }
         for &(scene, root, batches, focus, _) in &roots {
             let mut sc = SceneCompute {
                 cmd: &mut list,
@@ -1361,6 +1562,7 @@ impl<'a> Frame<'a> {
             compute(&mut sc);
             list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
         }
+        core.mounts.record_edits(device, window, &mut list)?;
         record_producers(
             device,
             core,

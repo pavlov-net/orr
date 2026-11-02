@@ -11,8 +11,9 @@ use orr_io::{AlignedBuf, ReadFile, Ring, Wake};
 use orr_gpu::Device;
 use orr_pack::{Archive, Blob};
 
+use crate::edit::{self, EditBatch, EditTask};
 use crate::mount::{Batch, MountTask, finish, start};
-use crate::stream::{self, StreamBatch, StreamTask};
+use crate::stream::{self, CutBatch, CutTask, StreamBatch, StreamTask};
 use crate::{Error, PackSource, Result};
 
 pub(crate) type Job = Box<dyn FnOnce() + Send>;
@@ -27,6 +28,12 @@ pub(crate) enum Msg {
     Stream(Arc<StreamTask>),
     /// Every read of the stream task has finished.
     StreamDone(Arc<StreamTask>),
+    /// A finer cached cut to build.
+    Cut(CutTask),
+    /// An edit's pages to read and place.
+    Edit(Arc<EditTask>),
+    /// Every read of the edit has finished.
+    EditDone(Arc<EditTask>),
     Stop,
 }
 
@@ -45,6 +52,8 @@ pub struct Loading {
     wake: Wake,
     batches: Mutex<Vec<Batch>>,
     streams: Mutex<Vec<StreamBatch>>,
+    edits: Mutex<Vec<EditBatch>>,
+    cuts: Mutex<Vec<CutBatch>>,
     pub(crate) positioned: bool,
 }
 
@@ -61,6 +70,8 @@ impl Loading {
             wake: Wake::default(),
             batches: Mutex::new(Vec::new()),
             streams: Mutex::new(Vec::new()),
+            edits: Mutex::new(Vec::new()),
+            cuts: Mutex::new(Vec::new()),
             positioned,
         }
     }
@@ -126,23 +137,40 @@ impl Loading {
 
     /// Takes every batch whose loading-queue work has completed, without waiting.
     pub(crate) fn take_batches(&self, device: &Device) -> Vec<Batch> {
-        let mut all = self.batches.lock().unwrap();
-        let (done, rest): (Vec<_>, Vec<_>) = all.drain(..).partition(|b| b.landed(device));
-        *all = rest;
-        done
+        take_landed(&self.batches, |b| b.landed(device))
     }
 
     pub(crate) fn push_stream(&self, batch: StreamBatch) {
         self.streams.lock().unwrap().push(batch);
     }
 
+    pub(crate) fn push_cut(&self, batch: CutBatch) {
+        self.cuts.lock().unwrap().push(batch);
+    }
+
+    /// Takes every finer cut whose build has completed, without waiting.
+    pub(crate) fn take_cuts(&self, device: &Device) -> Vec<CutBatch> {
+        take_landed(&self.cuts, |b| b.landed(device))
+    }
+
+    pub(crate) fn push_edit(&self, batch: EditBatch) {
+        self.edits.lock().unwrap().push(batch);
+    }
+
+    /// Takes every edit whose copies have completed, without waiting.
+    pub(crate) fn take_edits(&self, device: &Device) -> Vec<EditBatch> {
+        take_landed(&self.edits, |b| b.landed(device))
+    }
+
     /// Takes every stream batch whose copies have completed, without waiting.
     pub(crate) fn take_streams(&self, device: &Device) -> Vec<StreamBatch> {
-        let mut all = self.streams.lock().unwrap();
-        let (done, rest): (Vec<_>, Vec<_>) = all.drain(..).partition(|b| b.landed(device));
-        *all = rest;
-        done
+        take_landed(&self.streams, |b| b.landed(device))
     }
+}
+
+/// Takes the items of `list` that `landed` holds for, in order.
+fn take_landed<T>(list: &Mutex<Vec<T>>, landed: impl Fn(&T) -> bool) -> Vec<T> {
+    list.lock().unwrap().extract_if(.., |b| landed(b)).collect()
 }
 
 /// Whether the work signaling `point` has completed; true without one.
@@ -273,6 +301,9 @@ pub(crate) fn thread(loading: Arc<Loading>, device: Device) {
                 Msg::Done(task) => finish(&loading, &device, &task),
                 Msg::Stream(task) => stream::start(&loading, &task),
                 Msg::StreamDone(task) => stream::finish(&loading, &device, &task),
+                Msg::Cut(task) => stream::build_cut(&loading, &device, task),
+                Msg::Edit(task) => edit::start(&task),
+                Msg::EditDone(task) => edit::finish(&loading, &device, &task),
             }
         }
         if let Some(r) = &mut ring {

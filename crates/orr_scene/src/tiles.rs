@@ -18,7 +18,7 @@ use orr_gpu::{
     TextureIndex,
 };
 
-use crate::memory::RangeAllocator;
+use crate::memory::{PoolSlot, RangeAllocator};
 use crate::mount::Apply;
 use crate::upload::Record;
 use crate::{MountId, Result, TextureFeedbackGpu, TextureStreamGpu};
@@ -171,6 +171,35 @@ pub(crate) fn dilate(finest: &[u32], [cx, cy]: [u32; 2]) -> Vec<u32> {
         }
     }
     out
+}
+
+/// Which tile of a texture moves next so that its tiles sit in contiguous slots, and the slot
+/// it should follow: a tile `movable` allows from the smallest other run of adjacent slots, to
+/// the end of the largest run that has room after it. None once one run holds them, or when
+/// nothing can move.
+pub(crate) fn compaction_move(
+    tiles: &[(u32, PoolSlot)],
+    movable: impl Fn(u32) -> bool,
+    room_after: impl Fn(PoolSlot) -> bool,
+) -> Option<(u32, PoolSlot)> {
+    let mut sorted: Vec<(u32, PoolSlot)> = tiles.to_vec();
+    sorted.sort_by_key(|(_, s)| (s.block, s.first));
+    let mut runs: Vec<&[(u32, PoolSlot)]> = sorted
+        .chunk_by(|a, b| a.1.block == b.1.block && a.1.first + a.1.units == b.1.first)
+        .collect();
+    if runs.len() < 2 {
+        return None;
+    }
+    runs.sort_by_key(|r| r.len());
+    let at = runs.iter().rposition(|r| room_after(r[r.len() - 1].1))?;
+    let target = runs[at].last()?.1;
+    let from = runs
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != at)
+        .flat_map(|(_, r)| r.iter().rev())
+        .find(|(t, _)| movable(*t))?;
+    Some((from.0, target))
 }
 
 /// The render thread's view of one streamed texture.
@@ -340,6 +369,44 @@ impl TextureFeedback {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_moves_the_smallest_runs_tiles_to_the_end_of_the_largest() {
+        let slot = |block, first| PoolSlot {
+            block,
+            first,
+            units: 1,
+        };
+        let tiles = [
+            (0, slot(0, 0)),
+            (1, slot(0, 1)),
+            (2, slot(0, 2)),
+            (3, slot(0, 5)),
+            (4, slot(1, 0)),
+            (5, slot(1, 1)),
+        ];
+        let room = |_| true;
+        let (tile, after) = compaction_move(&tiles, |_| true, room).unwrap();
+        assert_eq!(tile, 3, "the run of one moves first");
+        assert_eq!(after, slot(0, 2));
+        let (tile, _) = compaction_move(&tiles, |t| t != 3, room).unwrap();
+        assert_eq!(tile, 5, "a run that cannot move leaves the next smallest");
+        assert!(
+            compaction_move(&tiles[..3], |_| true, room).is_none(),
+            "one run"
+        );
+        assert!(
+            compaction_move(&tiles, |t| t < 3, room).is_none(),
+            "nothing movable"
+        );
+        let (tile, after) = compaction_move(&tiles, |_| true, |s| s != slot(0, 2)).unwrap();
+        assert_eq!(tile, 3, "the next largest run with room takes it");
+        assert_eq!(after, slot(1, 1));
+        assert!(
+            compaction_move(&tiles, |_| true, |_| false).is_none(),
+            "no room anywhere"
+        );
+    }
 
     #[test]
     fn tiles_number_by_layer_mip_and_row_and_depend_on_the_coarser_tile() {

@@ -9,6 +9,8 @@
 //! through the frame's feedback. Ray-tracing cuts of distant copies are their model's merged
 //! cut; the cuts of near copies are matched against their mesh's cached cuts, shared between
 //! copies with equal cuts, and otherwise built as cluster BLAS within the frame's budget.
+//! Copies tracing a cached cut of a streaming mesh ask for the finer cut that would serve
+//! them; an edit's copies always gather, with what it touches held at level 0.
 
 use orr_gpu::{
     Allocation, BlasLimits, ClusterVertexFormat, CommandList, Device, DispatchArgs, GpuAddress,
@@ -48,9 +50,10 @@ const ARGS_GATHER: u64 = 3 * ARGS_PASSES as u64;
 const ARGS_JOBS: u64 = ARGS_GATHER + 3;
 const ARGS_TOTAL: u64 = ARGS_JOBS + 3;
 const TRAVERSE_FOCUS: u32 = 1;
-/// `cut.slang` `FEEDBACK_TOUCH` and `FEEDBACK_MESH_PAGE`.
+/// `cut.slang` `FEEDBACK_TOUCH`, `FEEDBACK_MESH_PAGE` and `FEEDBACK_CUT`.
 const FEEDBACK_TOUCH: u32 = 1;
 const FEEDBACK_MESH_PAGE: u32 = 2;
+const FEEDBACK_CUT: u32 = 4;
 /// Passes of one traversal over a hierarchy whose depth is not known at mount.
 pub(crate) const PAGED_DEPTH: u32 = 32;
 /// Feedback records one frame keeps.
@@ -116,6 +119,8 @@ pub(crate) struct PageFeedback {
     pub mesh: u32,
     pub page: u32,
     pub mesh_page: bool,
+    /// `page` is a finer cached cut of a streaming mesh.
+    pub cut: bool,
     pub request: bool,
     pub error: f32,
 }
@@ -345,6 +350,7 @@ impl Cuts {
                 mesh: r[0],
                 page: r[1],
                 mesh_page: r[2] & FEEDBACK_MESH_PAGE != 0,
+                cut: r[2] & FEEDBACK_CUT != 0,
                 request: r[2] & FEEDBACK_TOUCH == 0,
                 error: f32::from_bits(r[3]),
             })

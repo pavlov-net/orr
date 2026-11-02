@@ -22,6 +22,15 @@
 //! [`Scenes::residency`] reports what is resident. Consumers stream their own blobs into
 //! their own memory with [`Scenes::request_blob`].
 //!
+//! A cooked instance page is placed with [`SceneWriter::add_instance_page`]; its records
+//! stream as well, nearest a scene's focus first, and its copies are hidden while they are not
+//! resident. [`Scenes::prefetch_region`] asks ahead for what a region holds.
+//!
+//! An edit ([`Scenes::create_edit`]) is a model of its own over pages of its own, which
+//! consumer kernels change at the scene compute point: its triangles and positions, split by
+//! fracture or moved by damage, for raster and ray tracing alike. Mark it with
+//! [`Frame::edit_dirty`] in the frames that change it.
+//!
 //! A model's subdivision cage is placed copy by copy as a tessellated producer entry
 //! ([`SceneWriter::set_subd`]): every frame the tessellator dices its limit surface at
 //! rates from the scene focus, for raster and ray tracing alike.
@@ -30,6 +39,7 @@ mod accel;
 mod arena;
 mod clas_pool;
 mod decals;
+mod edit;
 mod emissive;
 mod lights;
 mod loading;
@@ -62,6 +72,7 @@ mod view;
 mod world;
 
 pub use orr_gpu;
+pub use orr_math::DVec3;
 pub use orr_pack;
 pub use orr_pack::volume::{VolumeGpu, VolumeGridGpu};
 pub use orr_shaders::{PathEntry, abi};
@@ -71,6 +82,7 @@ pub use arena::{
     ViewStep,
 };
 pub use decals::{Decal, DecalChannels, DecalId};
+pub use edit::{EditDesc, EditId, EditRef};
 pub use emissive::{EmissiveSpan, ModelEmission, emissive_spans};
 pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId};
 pub use loading::Loading;
@@ -84,19 +96,20 @@ pub use producer::{
 pub use ptlas::RtStats;
 pub use residency::{ClassStats, ResidencyClass, ResidencyStats};
 pub use scene::{
-    Affine3, CopyVariant, DebugLod, GroupWriter, InstanceFlags, InstanceRange, InstancesDesc,
-    ModelId, Pose, SceneDesc, SceneId, SceneWriter, TransformGroupDesc, TransformGroupId,
+    Affine3, CopyVariant, DebugLod, GroupWriter, InstanceFlags, InstancePageRef, InstanceRange,
+    InstancesDesc, ModelId, Pose, SceneDesc, SceneId, SceneWriter, TransformGroupDesc,
+    TransformGroupId,
 };
 pub use scenes::{
     Budgets, ConsumerMarker, Frame, FrameDesc, FrameStats, RendererDesc, SceneCompute, Scenes,
 };
 pub use shaders::types::{
-    BlasJob, ClusterRef, ClusterWork, CutGpu, CutKey, DecalBinGpu, DecalGpu, EmissiveGpu,
-    FeedbackGpu, GBufferGpu, GeneratedClusterGpu, GroupGpu, InstanceGpu, LightGpu, MaskGpu,
-    MaterialGpu, MediumProxyGpu, MeshGpu, MeshLevel, ModelGpu, NodeItem, PartGpu, ProducerBatch,
-    ProducerClusterGpu, ProducerGpu, ProducerStateGpu, RasterGpu, RasterRoot, RtCutGpu, SceneRoot,
-    SkinMeshGpu, SkinStateGpu, SkinnedGpu, SkyStats, SlotCutGpu, SlotStateGpu, TessStateGpu,
-    TextureFeedbackGpu, TextureStreamGpu, TopologyGpu, VisibleCluster,
+    BlasJob, ClusterRef, ClusterWork, CutGpu, CutKey, DecalBinGpu, DecalGpu, EditGpu, EditGroupGpu,
+    EmissiveGpu, FeedbackGpu, GBufferGpu, GeneratedClusterGpu, GroupGpu, InstanceGpu, LightGpu,
+    MaskGpu, MaterialGpu, MediumProxyGpu, MeshGpu, MeshLevel, ModelGpu, NodeItem, PartGpu,
+    ProducerBatch, ProducerClusterGpu, ProducerGpu, ProducerStateGpu, RasterGpu, RasterRoot,
+    RtCutGpu, SceneRoot, SkinMeshGpu, SkinStateGpu, SkinnedGpu, SkyStats, SlotCutGpu, SlotStateGpu,
+    TessStateGpu, TextureFeedbackGpu, TextureStreamGpu, TopologyGpu, VisibleCluster,
 };
 pub use skin::{SkinStats, SkinnedDesc};
 pub use stream::{BlobId, BlobTarget};
@@ -178,6 +191,16 @@ pub enum Error {
     NoMesh(ModelId),
     #[error("{0:?} has no subdivision cage")]
     NoCage(ModelId),
+    #[error("{0:?} does not exist")]
+    UnknownEdit(EditId),
+    #[error("{0:?} does not exist")]
+    UnknownPage(PageId),
+    /// Skinned meshes and edits themselves cannot be edited.
+    #[error("{model:?} cannot be edited: {reason}")]
+    NotEditable {
+        model: ModelId,
+        reason: &'static str,
+    },
     #[error("chain of {model:?}: {reason}")]
     InvalidChain {
         model: ModelId,

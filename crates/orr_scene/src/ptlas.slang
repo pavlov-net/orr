@@ -208,7 +208,7 @@ uint mix(uint h, uint v)
 // A hash of what a write puts in the PTLAS besides the BLAS: transform, model and class.
 uint2 instance_key(GroupGpu* g, InstanceGpu inst)
 {
-    float3x4 m = ((float3x4*)g.current)[inst.group_index];
+    float3x4 m = group_transform(g, inst.group_index);
     uint a = 0x811c9dc5u;
     uint b = 0x01000193u;
     for (uint r = 0; r < 3; r++)
@@ -228,8 +228,8 @@ bool moved(GroupGpu* g, uint index)
 {
     if (g.previous == g.current)
         return false;
-    float3x4 a = ((float3x4*)g.current)[index];
-    float3x4 b = ((float3x4*)g.previous)[index];
+    float3x4 a = group_transform(g, index);
+    float3x4 b = previous_group_transform(g, index);
     return any(a[0] != b[0]) || any(a[1] != b[1]) || any(a[2] != b[2]);
 }
 

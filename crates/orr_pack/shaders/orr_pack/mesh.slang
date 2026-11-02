@@ -40,6 +40,9 @@ public struct PageHeader
     public uint _pad2[3];
 }
 
+// A `Cluster.cone` that culls nothing: cutoff 1 in its top byte.
+public static const uint CONE_NONE = 0x7f000000u;
+
 // 144 B. Spheres are (center, radius) in mesh space.
 public struct Cluster
 {
@@ -48,7 +51,7 @@ public struct Cluster
     public float4 parent_sphere;
     public float parent_error;
     public float4 cull_sphere;
-    public uint cone;              // snorm8 axis xyz, cutoff w
+    public uint cone;              // snorm8 axis xyz, cutoff w; CONE_NONE culls nothing
     public int3 anchor;            // grid steps
     public uint vertex_first;
     public uint tri_first;         // bytes from tris_offset
@@ -123,9 +126,15 @@ public PageHeader load_page_header(uint8_t* page)
     return *(PageHeader*)page;
 }
 
+// Where cluster `cluster` of a page is stored.
+public Cluster* cluster_at(uint8_t* page, uint cluster)
+{
+    return (Cluster*)(page + 96) + cluster;
+}
+
 public Cluster load_cluster(uint8_t* page, uint cluster)
 {
-    return ((Cluster*)(page + 96))[cluster];
+    return *cluster_at(page, cluster);
 }
 
 // Grid offsets of a vertex from the cluster's anchor.
@@ -190,4 +199,31 @@ public int load_omm_index(uint8_t* page, PageHeader h, Cluster c, uint t)
 {
     int16_t* p = (int16_t*)(page + h.omm_offset + c.omm_first);
     return int(p[t - c.alpha_first]);
+}
+
+// Writes the cluster-local corners of triangle `t`. Pointing two corners at one vertex removes
+// the triangle from raster and ray tracing.
+public void store_triangle(uint8_t* page, PageHeader h, Cluster c, uint t, uint3 corners)
+{
+    uint8_t* p = page + h.tris_offset + c.tri_first + t * 3;
+    p[0] = uint8_t(corners.x);
+    p[1] = uint8_t(corners.y);
+    p[2] = uint8_t(corners.z);
+}
+
+// Writes a vertex's grid offsets from the cluster's anchor.
+public void store_local(uint8_t* page, PageHeader h, Cluster c, uint i, uint3 local)
+{
+    uint16_t* p = (uint16_t*)(page + h.positions_offset) + (c.vertex_first + i) * 3;
+    p[0] = uint16_t(local.x);
+    p[1] = uint16_t(local.y);
+    p[2] = uint16_t(local.z);
+}
+
+// Moves a vertex to the grid point nearest mesh-space `position`, within the 65,536 grid steps
+// above the cluster's anchor. A move farther than that stops at their edge.
+public void store_position(uint8_t* page, PageHeader h, Cluster c, uint i, float3 position, float step)
+{
+    int3 at = int3(round(position / step)) - c.anchor;
+    store_local(page, h, c, i, uint3(clamp(at, int3(0), int3(65535))));
 }

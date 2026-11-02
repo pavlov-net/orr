@@ -2,8 +2,9 @@
 //! with the texture pool at half the bytes the panels' textures take fully resident. Each
 //! panel model has its own 1024 x 1024 cooked texture; only its mip tail loads at mount, and
 //! its tiles stream on the frames' texture feedback and leave once the camera has passed.
-//! Each frame checks the texture pool against its budget; once a second the run logs
-//! residency.
+//! Each panel's mesh is a DAG whose finer groups stream too, under a mesh page pool that holds
+//! the coarsest pages and a quarter of the others. Each frame checks both pools against their
+//! budgets; once a second the run logs residency.
 //!
 //! `streaming-stress [--frames N] [--headless] [--out file.png]`. Headless runs render
 //! 960 x 540 for 240 frames unless told otherwise and write the last frame as a PNG.
@@ -19,14 +20,17 @@ use orr::orr_gpu::{
     Device, Format, QueueKind, TextureDesc, TextureKind, TextureMemory, TextureUsage, TimelinePoint,
 };
 use orr::orr_pack::material::{Material, slot};
-use orr::orr_pack::{AssetId, Target};
+use orr::orr_pack::mesh::MeshInfo;
+use orr::orr_pack::{Archive, AssetId, Class, Target};
 use orr::{
     Affine3, Budgets, DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc, FrameTime,
     GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LightId, PackSource, Projection,
     Renderer, RendererDesc, ResidencyClass, SceneDesc, SceneLightingSettings, ScreenshotRequest,
     TextureFilter, TransformGroupDesc, ViewDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
-use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshSettings, Source, TextureSettings, Usage};
+use orr_cook::{
+    ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source, TextureSettings, Usage,
+};
 use orr_math::camera::rh::view;
 use orr_math::{DVec3, UVec2, Vec2, Vec3};
 
@@ -41,6 +45,8 @@ const TEXTURE_SIZE: u32 = 1024;
 /// Panels per side of the corridor and their spacing along it, m.
 const PANELS: usize = 48;
 const SPACING: f32 = 3.0;
+/// Cells per side of a panel's mesh, whose finer DAG groups stream.
+const PANEL_CELLS: u32 = 128;
 /// m/s along the corridor.
 const SPEED: f32 = 2.8;
 /// Unit direction to the sun.
@@ -123,8 +129,9 @@ fn cook() -> Arc<[u8]> {
             ..Material::default()
         };
         m.textures[slot::BASE_COLOR].texture = AssetId::from_name(&texture(i));
-        let mut quad = MeshBuilder::default();
-        quad.quad(
+        let mut relief = MeshBuilder::default();
+        let phase = i as f32;
+        relief.relief(
             0,
             [
                 Vec3::new(0.0, 0.0, -1.2),
@@ -132,14 +139,18 @@ fn cook() -> Arc<[u8]> {
                 Vec3::new(0.0, 2.4, 1.2),
                 Vec3::new(0.0, 2.4, -1.2),
             ],
-            4,
+            PANEL_CELLS,
+            |u, v| 0.06 * ((u * 9.0 + phase).sin() * (v * 7.0).cos()),
         );
         assets.push(AssetSpec {
             name: panel(i),
             source: Source::Mesh {
-                mesh: quad.finish(),
+                mesh: relief.finish(),
                 materials: vec![m],
-                settings: MeshSettings::default(),
+                settings: MeshSettings {
+                    lod: LodMode::Dag,
+                    ..MeshSettings::default()
+                },
             },
         });
     }
@@ -178,6 +189,27 @@ fn cook() -> Arc<[u8]> {
     pack
 }
 
+/// Bytes of the pack's mesh pages: those pinned from mount and those that stream.
+fn mesh_bytes(pack: &Arc<[u8]>) -> (u64, u64) {
+    let a = Archive::from_memory(Arc::clone(pack)).expect("archive");
+    let (mut pinned, mut streamed) = (0, 0);
+    for e in a.entries().iter().filter(|e| e.class == Class::Mesh as u16) {
+        let b = a.blobs(e)[0];
+        let mut bytes = vec![0; b.raw_len as usize];
+        a.read(&b, &mut bytes).expect("mesh blob");
+        let info = MeshInfo::parse(&bytes).expect("mesh info");
+        for (p, page) in info.pages.iter().enumerate() {
+            let n = u64::from(page.resident_len).next_multiple_of(256);
+            if (p as u32) < info.header.pinned_pages || !info.levels.is_empty() {
+                pinned += n;
+            } else {
+                streamed += n;
+            }
+        }
+    }
+    (pinned, streamed)
+}
+
 /// Bytes one panel texture takes resident: its mip tail alone, and every tile above it
 /// with the tail.
 fn texture_bytes(gpu: &Device) -> (u64, u64) {
@@ -207,12 +239,17 @@ fn texture_bytes(gpu: &Device) -> (u64, u64) {
 pub(crate) fn run(options: &Options) -> Option<Capture> {
     let gpu = device();
     let pack = cook();
+    let (mesh_pinned, mesh_streamed) = mesh_bytes(&pack);
+    assert!(mesh_streamed > 0, "the panels' meshes stream");
+    let mesh_budget = mesh_pinned + mesh_streamed / 4;
     let (tail, whole) = texture_bytes(gpu);
     // Every mip tail stays; the tiles get half the bytes they would take.
     let budget = TEXTURES as u64 * (tail + (whole - tail) / 2);
     let desc = RendererDesc {
         budgets: Budgets {
             texture_pool: budget,
+            mesh_page_pool: mesh_budget,
+            mesh_resident_max: 0,
             ..Budgets::default()
         },
         ..RendererDesc::default()
@@ -346,6 +383,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     let started = Instant::now();
     let mut previous = 0.0;
     let mut last: Option<(u64, TimelinePoint)> = None;
+    let mut mesh_high = 0;
     for i in 0.. {
         if frames.is_some_and(|n| i >= n) {
             break;
@@ -431,10 +469,20 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             "the texture pool holds {} of its {budget} bytes",
             pool.resident_bytes + pool.loading_bytes
         );
+        let meshes = *r.class(ResidencyClass::MeshPages);
+        assert!(
+            meshes.resident_bytes + meshes.loading_bytes <= mesh_budget,
+            "the mesh page pool holds {} of its {mesh_budget} bytes",
+            meshes.resident_bytes + meshes.loading_bytes
+        );
+        mesh_high = mesh_high.max(meshes.resident_bytes);
         if i % 60 == 0 {
             log::info!(
-                "{:.1} m: texture pool {:.1} of {:.1} MiB ({} units, {:.1} MiB loading), {} loads, {} evictions, {} dropped",
+                "{:.1} m: mesh pages {:.1} of {:.1} MiB, CLAS {:.1} MiB, texture pool {:.1} of {:.1} MiB ({} units, {:.1} MiB loading), {} loads, {} evictions, {} dropped",
                 along,
+                meshes.resident_bytes as f64 / f64::from(1 << 20),
+                mesh_budget as f64 / f64::from(1 << 20),
+                r.clas_pool_bytes as f64 / f64::from(1 << 20),
                 pool.resident_bytes as f64 / f64::from(1 << 20),
                 budget as f64 / f64::from(1 << 20),
                 pool.resident_units,
@@ -446,6 +494,9 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         }
     }
 
+    if options.headless {
+        assert!(mesh_high > mesh_pinned, "no streamed mesh page landed");
+    }
     if let Some(d) = display.as_ref() {
         d.wait_idle();
     }

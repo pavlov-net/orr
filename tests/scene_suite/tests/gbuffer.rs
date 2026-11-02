@@ -8,7 +8,9 @@
 //! far-from-origin and rebase invariance, the PTLAS budget, posed rigid parts in raster
 //! and ray tracing with their motion, hiding, section masks, material sets and color factors
 //! multiplied in their texture's primaries, the DAG traversal's cuts, two-pass occlusion and
-//! `debug_lod`, and the stochastic texture filter against CPU bicubic and bilinear filters.
+//! `debug_lod`, the stochastic texture filter against CPU bicubic and bilinear filters, a
+//! fractured model's pieces and partial edits, cooked instance pages against the same copies
+//! placed at run time, and a streaming mesh's finer cached cuts.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -18,14 +20,15 @@ use std::time::{Duration, Instant};
 use glam::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_color::RgbPrimaries;
 use orr_cook::{
-    ArchiveSpec, AssetSpec, GltfSettings, LodMode, Manifest, MeshInput, MeshParts, MeshSettings,
-    Primaries, Source, TextureSettings, Usage,
+    ArchiveSpec, AssetSpec, GltfSettings, Instances, LodMode, Manifest, MeshInput, MeshParts,
+    MeshSettings, Placement, Primaries, PrototypeSpec, SectionSpec, Source, TextureSettings, Usage,
 };
 use orr_gpu::{
     GpuPtr, Hazards, KernelSet, MemoryKind, QueueKind, SamplerIndex, ShaderModule, Stages, Texture,
     TextureRegion,
 };
 use orr_pack::clip::Clip;
+use orr_pack::instance::InstanceRecord;
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{Cluster, Group, MeshInfo, PageView, decode_page};
 use orr_pack::model::ModelInfo;
@@ -36,13 +39,15 @@ use orr_scene::testing::{
 };
 use orr_scene::{
     Affine3, BoundTexture, ClusterWork, CopyVariant, CutGpu, DebugLod, Decal, DecalChannels,
-    DecalId, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstanceRange, InstancesDesc, Lens,
-    LoadState, MaterialGpu, MaterialId, ModelId, MountId, PackSource, Pose, Projection, RasterGpu,
-    RasterView, RendererDesc, SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes, SkinStateGpu,
-    SkinnedDesc, SkinnedGpu, SlotCutGpu, TextureFilter, TransformGroupDesc, TransformGroupId,
-    ViewDesc, ViewHistoryId, ViewTarget, VisibleCluster, material_flags,
+    DecalId, EditDesc, EditId, EditRef, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
+    InstanceRange, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId, ModelId, MountId,
+    PackSource, Pose, Projection, RasterGpu, RasterView, RendererDesc, SceneDesc, SceneId,
+    SceneRoot, SceneWriter, Scenes, SkinStateGpu, SkinnedDesc, SkinnedGpu, SlotCutGpu,
+    TextureFilter, TransformGroupDesc, TransformGroupId, ViewDesc, ViewHistoryId, ViewTarget,
+    VisibleCluster, material_flags,
 };
-use scene_suite::shaders::{codec, pose, skin_pose, surface_at, trace};
+use orr_scene::{Budgets, InstancePageRef, PageId};
+use scene_suite::shaders::{codec, fracture, pose, skin_pose, surface_at, trace};
 use scene_suite::{Workers, linked, pipeline};
 
 const EXTENT: [u32; 2] = [160, 96];
@@ -946,6 +951,45 @@ fn cook() -> Arc<[u8]> {
     second_quad.uvs1 = second_quad.uvs.take();
     second_quad.uvs = Some(vec![Vec2::new(0.25, 0.5); 4]);
     tinted.push(model("second uv", second_quad, vec![second], one()));
+    // Two pages of placed balls, a world cell apart, the second prototype without its lamp.
+    let placements = |x: f64| -> Vec<Placement> {
+        (0..12)
+            .map(|i| Placement {
+                position: DVec3::new(
+                    x + 2.0 + 3.0 * f64::from(i % 4),
+                    1.0,
+                    2.0 + 3.0 * f64::from(i / 4),
+                ),
+                rotation: Quat::from_rotation_y(i as f32 * 0.7),
+                scale: Vec3::ONE,
+                prototype: (i % 2) as u16,
+            })
+            .collect()
+    };
+    tinted.push(AssetSpec {
+        name: "rows".into(),
+        source: Source::Instances(Instances {
+            records: [placements(0.0), placements(4096.0)].concat(),
+            prototypes: vec![
+                PrototypeSpec {
+                    model: "ball".into(),
+                    ..PrototypeSpec::default()
+                },
+                PrototypeSpec {
+                    model: "ball".into(),
+                    sections: vec![
+                        SectionSpec::default(),
+                        SectionSpec {
+                            material: None,
+                            hidden: true,
+                        },
+                    ],
+                    ..PrototypeSpec::default()
+                },
+            ],
+            ..Instances::default()
+        }),
+    });
     // A representation chain: a DAG ball, then three coarser balls, each its own color.
     for (step, (rings, color)) in CHAIN_SHAPES.into_iter().enumerate() {
         let m = Material {
@@ -1022,6 +1066,14 @@ fn cook() -> Arc<[u8]> {
                     }),
                     vec![metal],
                     LodMode::Dag,
+                ),
+                model(
+                    "discrete ground",
+                    grid(96, 8.0, 2.0, |x, z| {
+                        0.15 * (x * 1.3).sin() * (z * 0.9).cos()
+                    }),
+                    vec![metal],
+                    LodMode::Discrete { errors: vec![0.05] },
                 ),
             ]
             .into_iter()
@@ -3216,9 +3268,9 @@ fn motion_vectors_do_not_change_when_the_render_origin_moves() {
 fn ptlas_work_past_the_budget_waits_and_lands_nearest_first() {
     let _serial = serial();
     let mut w = World::with(&RendererDesc {
-        budgets: orr_scene::Budgets {
+        budgets: Budgets {
             ptlas_rebuilt: 50,
-            ..orr_scene::Budgets::default()
+            ..Budgets::default()
         },
         ..RendererDesc::default()
     });
@@ -5135,5 +5187,717 @@ fn stochastic_texture_taps_average_to_the_bicubic_filter_under_magnification() {
         }
     }
     d.free_image_slot_after_submitted(slot);
+    assert_clean();
+}
+
+// --- Runtime edits ----------------------------------------------------------------------------
+
+/// Renders a frame in which `edits` (edit, stripe of `pieces`, lift) change at the scene
+/// compute point.
+fn shoot_edits(
+    w: &mut World,
+    placed: &Placed,
+    shot: &Shot,
+    edits: &[(EditId, u32, u32, f32)],
+) -> Frame {
+    let list = [placed.scene];
+    let refs: Vec<EditRef> = edits.iter().map(|e| w.scenes.edit(e.0).unwrap()).collect();
+    let p = pipeline(&fracture::MODULE, "main");
+    let mut f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(shot.frame),
+            scenes: &list,
+            low_latency: None,
+        })
+        .unwrap();
+    {
+        let mut s = f.scene(placed.scene).unwrap();
+        s.set_focus(shot.focus.unwrap_or(shot.eye), PIXELS_PER_RADIAN);
+        for &(i, t) in &shot.moved {
+            s.transforms(placed.group, i, 1).unwrap()[0] = t;
+        }
+    }
+    for e in edits {
+        assert!(
+            f.edit_dirty(e.0),
+            "the frame's rebuild budget takes the edit"
+        );
+    }
+    f.update_scenes(&mut |c| {
+        for (e, r) in edits.iter().zip(&refs) {
+            let root = c
+                .put_root(&fracture::Root {
+                    mesh: r.mesh,
+                    groups: r.groups,
+                    piece: e.1,
+                    pieces: e.2,
+                    min_x: -4.0,
+                    size_x: 8.0,
+                    lift: e.3,
+                    _pad: 0,
+                    _pad2: 0,
+                })
+                .unwrap();
+            c.cmd.dispatch(&p, root, [r.group_count, 1, 1]);
+            c.cmd
+                .barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        }
+    })
+    .unwrap();
+    let view = f
+        .raster_view(&ViewDesc {
+            scene: placed.scene,
+            history: placed.history,
+            position: shot.eye,
+            rotation: look(Vec3::ZERO, (shot.target - shot.eye).as_vec3()),
+            projection: Projection {
+                fov_y: 0.9,
+                near: 0.1,
+            },
+            lens: Lens::default(),
+            render_extent: UVec2::from(EXTENT),
+            jitter: shot.jitter,
+            reset_history: shot.reset,
+            mip_bias: 0.0,
+            texture_filter: TextureFilter::Hardware,
+            target: ViewTarget::AfterRr,
+        })
+        .unwrap();
+    wait(f.end(&[]).unwrap());
+    read_back(&view)
+}
+
+/// Runs frames until every edit of `edits` is ready.
+fn settle_edits(w: &mut World, edits: &[EditId]) {
+    let start = Instant::now();
+    loop {
+        let f = w
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(0),
+                scenes: &[],
+                low_latency: None,
+            })
+            .unwrap();
+        wait(f.end(&[]).unwrap());
+        if edits
+            .iter()
+            .all(|&e| matches!(w.scenes.edit_state(e), LoadState::Ready))
+        {
+            return;
+        }
+        for &e in edits {
+            if let LoadState::Failed(x) = w.scenes.edit_state(e) {
+                panic!("edit failed: {x}");
+            }
+        }
+        assert!(start.elapsed() < Duration::from_secs(60), "edit pending");
+    }
+}
+
+/// A scene of the source model then `models`, in one group whose transforms start hidden.
+fn place_models(w: &mut World, models: &[ModelId]) -> Placed {
+    let scene = w.scenes.create_scene(&SceneDesc::default()).unwrap();
+    let history = w.scenes.create_view_history().unwrap();
+    let list = [scene];
+    let f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(0),
+            scenes: &list,
+            low_latency: None,
+        })
+        .unwrap();
+    let mut s = f.scene(scene).unwrap();
+    let group = s
+        .create_transform_group(&TransformGroupDesc {
+            count: models.len() as u32,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    let ranges = models
+        .iter()
+        .enumerate()
+        .map(|(i, &model)| {
+            s.add_instances(&InstancesDesc {
+                model,
+                copies: 1,
+                transforms: group,
+                first: i as u32,
+                pose: None,
+                material_set: None,
+                flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+                rt_range: 1000.0,
+                animation_range: 0.0,
+                user_tag: i as u32,
+            })
+            .unwrap()
+        })
+        .collect();
+    drop(s);
+    wait(f.end(&[]).unwrap());
+    Placed {
+        scene,
+        ranges,
+        group,
+        history,
+        count: models.len() as u32,
+    }
+}
+
+#[test]
+fn a_fractured_dag_model_draws_and_traces_alike_every_frame() {
+    fracture_model("dag ground");
+}
+
+#[test]
+fn a_fractured_discrete_model_draws_and_traces_alike_every_frame() {
+    fracture_model("discrete ground");
+}
+
+/// Splits `model`, 8 m wide in x, into four edits that move apart and are lifted, checking
+/// raster and rays against each other every frame.
+fn fracture_model(model: &str) {
+    const PIECES: u32 = 4;
+    let _serial = serial();
+    let mut w = finest_world();
+    let source = w.model(model);
+    let edits: Vec<EditId> = (0..PIECES)
+        .map(|_| {
+            w.scenes
+                .create_edit(&EditDesc {
+                    model: source,
+                    touched: None,
+                    bounds: None,
+                })
+                .unwrap()
+        })
+        .collect();
+    settle_edits(&mut w, &edits);
+    let mut models = vec![source];
+    models.extend(edits.iter().map(|&e| w.scenes.edit(e).unwrap().model));
+    let placed = place_models(&mut w, &models);
+    let linear = Mat3::from_rotation_x(0.9);
+    let at = Vec3::new(0.0, 0.0, -6.0);
+    let shown = affine(linear, at);
+    let hidden = Affine3 {
+        rows: [[0.0; 4]; 3],
+    };
+    let eye = DVec3::new(0.0, 0.5, 2.0);
+    let target = DVec3::new(0.0, 0.0, -6.0);
+    let shot = |frame: u32, moved: Vec<(u32, Affine3)>| {
+        let mut s = Shot::at(eye, target, frame);
+        s.moved = moved;
+        s
+    };
+    let slot = |i: usize| placed.ranges[i].first + 1;
+    let check_parity = |g: &Frame, what: &str| {
+        let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+        let (matched, covered) = parity(g, &r, 1e-3);
+        let total = r.traced.len();
+        assert!(covered > total / 8, "{what}: {covered} of {total} covered");
+        assert!(
+            matched as f64 >= 0.995 * total as f64,
+            "{what}: {matched} of {total} pixels agree"
+        );
+    };
+
+    // The model itself, then one unwritten edit: the same pixels at the same depth.
+    let mut moved: Vec<(u32, Affine3)> = (0..=PIECES).map(|i| (i, hidden)).collect();
+    moved[0].1 = shown;
+    let base = shoot(&mut w, &placed, &shot(1, moved.clone()));
+    check_parity(&base, "the model");
+    moved[0].1 = hidden;
+    moved[1].1 = shown;
+    let whole = shoot(&mut w, &placed, &shot(2, moved.clone()));
+    check_parity(&whole, "an unwritten edit");
+    let same = (0..base.depth.len())
+        .filter(|&i| (base.depth[i] - whole.depth[i]).abs() <= 1e-4 * base.depth[i].max(1e-6))
+        .count();
+    assert!(
+        same as f64 >= 0.995 * base.depth.len() as f64,
+        "{same} of {} depths equal the model's",
+        base.depth.len()
+    );
+
+    // The split, in place: the pieces together cover what the model covered, each its stripe.
+    let split: Vec<(EditId, u32, u32, f32)> = edits
+        .iter()
+        .enumerate()
+        .map(|(i, &e)| (e, i as u32, PIECES, 0.0))
+        .collect();
+    let mut moved: Vec<(u32, Affine3)> = (1..=PIECES).map(|i| (i, shown)).collect();
+    moved.push((0, hidden));
+    let g = shoot_edits(&mut w, &placed, &shot(3, moved), &split);
+    check_parity(&g, "the split");
+    let same = (0..base.depth.len())
+        .filter(|&i| (base.depth[i] - g.depth[i]).abs() <= 1e-4 * base.depth[i].max(1e-6))
+        .count();
+    assert!(
+        same as f64 >= 0.99 * base.depth.len() as f64,
+        "{same} of {} depths equal the model's after the split",
+        base.depth.len()
+    );
+    for i in 1..=PIECES as usize {
+        let n = g.ids.iter().filter(|&&id| id == slot(i)).count();
+        assert!(n > 100, "piece {i} covers {n} pixels");
+    }
+
+    // The pieces move apart over frames: raster and rays agree on every one.
+    let mut last = 0;
+    for step in 1..=6u32 {
+        let spread = 0.15 * step as f32;
+        let moved: Vec<(u32, Affine3)> = (1..=PIECES)
+            .map(|i| {
+                let side = i as f32 - 0.5 - 0.5 * PIECES as f32;
+                let t = at + Vec3::new(side * spread, 0.0, 0.0);
+                (i, affine(linear, t))
+            })
+            .collect();
+        let g = shoot(&mut w, &placed, &shot(3 + step, moved));
+        check_parity(&g, &format!("step {step}"));
+        let gaps = (0..g.ids.len())
+            .filter(|&i| base.ids[i] != 0 && g.ids[i] == 0)
+            .count();
+        assert!(gaps >= last, "step {step}: {gaps} gap pixels after {last}");
+        last = gaps;
+        for i in 1..=PIECES as usize {
+            let n = g.ids.iter().filter(|&&id| id == slot(i)).count();
+            assert!(n > 100, "step {step}: piece {i} covers {n} pixels");
+        }
+    }
+    assert!(last > 200, "the pieces opened {last} gap pixels");
+
+    // A piece lifted by its kernel: culling data and CLAS follow the new positions.
+    let moved: Vec<(u32, Affine3)> = (1..=PIECES).map(|i| (i, shown)).collect();
+    let flat = shoot(&mut w, &placed, &shot(10, moved.clone()));
+    let g = shoot_edits(
+        &mut w,
+        &placed,
+        &shot(11, moved),
+        &[(edits[1], 1, PIECES, 0.8)],
+    );
+    check_parity(&g, "the lift");
+    let changed = (0..g.ids.len())
+        .filter(|&i| flat.ids[i] != g.ids[i])
+        .count();
+    assert!(changed > 100, "the lift changed {changed} pixels");
+    let edit_stats = w.scenes.stats().cuts;
+    assert_eq!(
+        edit_stats.rt_fallback, 0,
+        "every piece fits the BLAS budget"
+    );
+
+    for e in edits {
+        w.scenes.destroy_edit(e);
+    }
+    assert_clean();
+}
+
+#[test]
+fn a_partial_edit_holds_what_it_touches_at_level_0_and_the_rest_keeps_its_detail() {
+    let _serial = serial();
+    let mut w = World::with(&RendererDesc {
+        raster_error_pixels: 4.0,
+        rt_error_pixels: 4.0,
+        ..RendererDesc::default()
+    });
+    let source = w.model("dag ground");
+    let touched = [[-2.0f32, 0.0, -2.0, 1.0]];
+    let edit = w
+        .scenes
+        .create_edit(&EditDesc {
+            model: source,
+            touched: Some(&touched),
+            bounds: None,
+        })
+        .unwrap();
+    settle_edits(&mut w, &[edit]);
+    let model = w.scenes.edit(edit).unwrap().model;
+    let placed = place_models(&mut w, &[source, model]);
+    let linear = Mat3::from_rotation_x(1.1);
+    let at = Vec3::new(0.0, 0.0, -14.0);
+    let hidden = Affine3 {
+        rows: [[0.0; 4]; 3],
+    };
+    let eye = DVec3::new(0.0, 0.5, 0.0);
+    let target = DVec3::new(0.0, 0.0, -14.0);
+    let mut sh = Shot::at(eye, target, 1);
+    sh.moved = vec![(0, affine(linear, at)), (1, hidden)];
+    let base = shoot(&mut w, &placed, &sh);
+    let mut sh = Shot::at(eye, target, 2);
+    sh.moved = vec![(0, hidden), (1, affine(linear, at))];
+    let g = shoot(&mut w, &placed, &sh);
+    let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+    let (matched, covered) = parity(&g, &r, 2e-2);
+    assert!(covered > r.traced.len() / 8, "{covered} pixels covered");
+    assert!(
+        matched as f64 >= 0.98 * r.traced.len() as f64,
+        "{matched} of {} pixels agree",
+        r.traced.len()
+    );
+    let base_covered = base.ids.iter().filter(|&&id| id != 0).count();
+    assert!(
+        covered.abs_diff(base_covered) * 50 < base_covered,
+        "cracks: {covered} pixels covered against the source's {base_covered}"
+    );
+    let cpu = CpuMesh::of("dag ground");
+    let t = Vec3::new(touched[0][0], touched[0][1], touched[0][2]);
+    let (mut inside, mut outside_coarse) = (0, 0);
+    for &c in g.clusters.iter().filter(|&&c| c != 0) {
+        let cluster = c - 1;
+        let p = cpu.firsts.partition_point(|&f| f <= cluster) - 1;
+        let view = PageView::new(&cpu.pages[p], &cpu.header).unwrap();
+        let k = view.cluster(cluster - cpu.firsts[p]);
+        let center = Vec3::from(k.cull_sphere.center);
+        let reach = k.cull_sphere.radius;
+        let distance = center.distance(t);
+        if distance < touched[0][3] {
+            inside += 1;
+            assert_eq!(k.self_error, 0.0, "a cluster inside the sphere is coarser");
+        } else if distance > touched[0][3] + reach && k.self_error > 0.0 {
+            outside_coarse += 1;
+        }
+    }
+    assert!(inside > 50, "{inside} pixels inside the sphere");
+    assert!(
+        outside_coarse > 500,
+        "{outside_coarse} coarser pixels outside the sphere"
+    );
+    w.scenes.destroy_edit(edit);
+    assert_clean();
+}
+
+// --- Cooked instance pages ----------------------------------------------------------------------
+
+/// The mounted pages of the pack, by the cell they sit in.
+fn row_pages(
+    w: &World,
+) -> Vec<(
+    PageId,
+    orr_pack::instance::InstancePageInfo,
+    Vec<InstanceRecord>,
+)> {
+    let a = Archive::from_memory(Arc::clone(pack())).unwrap();
+    let mut out = Vec::new();
+    for e in a.entries() {
+        if e.class != orr_pack::Class::InstancePage as u16 {
+            continue;
+        }
+        let id = w.scenes.instance_page(w.mount, e.id).unwrap();
+        let info = orr_pack::instance::InstancePageInfo::parse(&blob(&a, e, 0)).unwrap();
+        let records: Vec<InstanceRecord> = bytemuck::pod_collect_to_vec(&blob(&a, e, 1));
+        out.push((id, info, records));
+    }
+    out.sort_by_key(|p| p.1.header.cell[0]);
+    out
+}
+
+fn add_page(s: &mut SceneWriter<'_>, page: PageId) -> InstanceRange {
+    s.add_instance_page(&InstancePageRef {
+        page,
+        poses: &[],
+        material_sets: &[],
+        flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+        rt_range: 1000.0,
+        animation_range: 0.0,
+        user_tag: 7,
+    })
+    .unwrap()
+}
+
+/// A scene without copies yet.
+fn empty_placed(w: &mut World, write: impl FnOnce(&mut SceneWriter<'_>)) -> Placed {
+    let scene = w.scenes.create_scene(&SceneDesc::default()).unwrap();
+    let history = w.scenes.create_view_history().unwrap();
+    let list = [scene];
+    let f = w
+        .scenes
+        .begin_frame(&FrameDesc {
+            time: time(0),
+            scenes: &list,
+            low_latency: None,
+        })
+        .unwrap();
+    let mut s = f.scene(scene).unwrap();
+    let group = s
+        .create_transform_group(&TransformGroupDesc {
+            count: 1,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    write(&mut s);
+    drop(s);
+    wait(f.end(&[]).unwrap());
+    Placed {
+        scene,
+        ranges: Vec::new(),
+        group,
+        history,
+        count: 0,
+    }
+}
+
+#[test]
+fn a_cooked_page_draws_and_traces_like_its_placements() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let pages = row_pages(&w);
+    let (near, near_info, near_records) = &pages[0];
+    let far = pages.last().unwrap().0;
+    assert_ne!(*near, far, "the pack has a page per cell");
+    let eye = DVec3::new(9.0, 6.0, 26.0);
+    let target = DVec3::new(9.0, 1.0, 8.0);
+
+    // The same copies placed at run time, section masks as the page's prototypes hide them.
+    let runtime = {
+        let ball = w.model("ball");
+        let scene = w.scenes.create_scene(&SceneDesc::default()).unwrap();
+        let history = w.scenes.create_view_history().unwrap();
+        let list = [scene];
+        let f = w
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(0),
+                scenes: &list,
+                low_latency: None,
+            })
+            .unwrap();
+        let mut s = f.scene(scene).unwrap();
+        let group = s
+            .create_transform_group(&TransformGroupDesc {
+                count: near_records.len() as u32,
+                writer: GroupWriter::Cpu,
+                anchor: DVec3::ZERO,
+            })
+            .unwrap();
+        let mut ranges = Vec::new();
+        for (i, r) in near_records.iter().enumerate() {
+            let m = orr_pack::instance::decode_record(&near_info.header, r);
+            s.transforms(group, i as u32, 1).unwrap()[0] = Affine3 { rows: m.rows };
+            let range = s
+                .add_instances(&InstancesDesc {
+                    model: ball,
+                    copies: 1,
+                    transforms: group,
+                    first: i as u32,
+                    pose: None,
+                    material_set: None,
+                    flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+                    rt_range: 1000.0,
+                    animation_range: 0.0,
+                    user_tag: 7,
+                })
+                .unwrap();
+            let hidden = near_info
+                .sections_of(&near_info.prototypes[r.prototype as usize])
+                .iter()
+                .enumerate()
+                .fold(0u16, |m, (k, o)| m | (u16::from(o.hidden != 0) << k));
+            s.copy_variants(
+                range,
+                0,
+                &[CopyVariant {
+                    pose: 0,
+                    material_set: 0,
+                    section_mask: hidden,
+                }],
+            )
+            .unwrap();
+            ranges.push(range);
+        }
+        drop(s);
+        wait(f.end(&[]).unwrap());
+        Placed {
+            scene,
+            ranges,
+            group,
+            history,
+            count: near_records.len() as u32,
+        }
+    };
+    let base = shoot(&mut w, &runtime, &Shot::at(eye, target, 1));
+    let base = {
+        // The section-mask BLAS exist from the second frame.
+        let _ = base;
+        shoot(&mut w, &runtime, &Shot::at(eye, target, 2))
+    };
+
+    let mut range = None;
+    let placed = empty_placed(&mut w, |s| range = Some(add_page(s, *near)));
+    let range = range.unwrap();
+    assert_eq!(range.count as usize, near_records.len());
+    let start = Instant::now();
+    let mut frame = 2;
+    let g = loop {
+        frame += 1;
+        let g = shoot(&mut w, &placed, &Shot::at(eye, target, frame));
+        if frame > 4 && g.ids.iter().any(|&id| id != 0) {
+            break shoot(&mut w, &placed, &Shot::at(eye, target, frame + 1));
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the page never landed"
+        );
+    };
+    let n = g.depth.len();
+    let same = (0..n)
+        .filter(|&i| (base.depth[i] - g.depth[i]).abs() <= 1e-4 * base.depth[i].max(1e-6))
+        .count();
+    assert!(
+        same as f64 >= 0.995 * n as f64,
+        "{same} of {n} depths equal the runtime copies'"
+    );
+    let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+    let (matched, covered) = parity(&g, &r, 1e-3);
+    assert!(covered > 200, "{covered} pixels covered");
+    assert!(
+        matched as f64 >= 0.995 * n as f64,
+        "{matched} of {n} pixels agree"
+    );
+    assert_clean();
+}
+
+#[test]
+fn instance_pages_come_nearest_first_under_their_budget_and_their_ranges_stay_valid() {
+    let _serial = serial();
+    let bytes: Vec<u64> = {
+        let a = Archive::from_memory(Arc::clone(pack())).unwrap();
+        a.entries()
+            .iter()
+            .filter(|e| e.class == orr_pack::Class::InstancePage as u16)
+            .map(|e| u64::from(a.blobs(e)[1].raw_len).next_multiple_of(256))
+            .collect()
+    };
+    // Room for one page of records.
+    let mut w = World::with(&RendererDesc {
+        raster_error_pixels: 1e-3,
+        rt_error_pixels: 1e-3,
+        budgets: Budgets {
+            instance_page_pool: bytes.iter().copied().max().unwrap(),
+            ..Budgets::default()
+        },
+        ..RendererDesc::default()
+    });
+    let pages = row_pages(&w);
+    let near = pages[0].0;
+    let far = pages.last().unwrap().0;
+    let mut ranges = (None, None);
+    let placed = empty_placed(&mut w, |s| {
+        ranges = (Some(add_page(s, near)), Some(add_page(s, far)));
+    });
+    let (near_range, far_range) = (ranges.0.unwrap(), ranges.1.unwrap());
+    let in_range = |g: &Frame, r: InstanceRange| {
+        g.ids
+            .iter()
+            .filter(|&&id| id > r.first && id <= r.first + r.count)
+            .count()
+    };
+    let near_eye = DVec3::new(9.0, 6.0, 26.0);
+    let near_at = DVec3::new(9.0, 1.0, 8.0);
+    let far_x = 4096.0;
+    let far_eye = DVec3::new(far_x + 9.0, 6.0, 26.0);
+    let far_at = DVec3::new(far_x + 9.0, 1.0, 8.0);
+    let mut frame = 0;
+    let mut shot_until = |w: &mut World, eye, at, r: InstanceRange, other: InstanceRange| {
+        let start = Instant::now();
+        loop {
+            frame += 1;
+            let g = shoot(w, &placed, &Shot::at(eye, at, frame));
+            let pool = *w
+                .scenes
+                .residency()
+                .class(orr_scene::ResidencyClass::InstancePages);
+            assert!(pool.resident_bytes + pool.loading_bytes <= pool.budget);
+            if in_range(&g, r) > 100 {
+                assert_eq!(in_range(&g, other), 0, "the other page's range draws");
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(60),
+                "the page never landed"
+            );
+        }
+    };
+    shot_until(&mut w, near_eye, near_at, near_range, far_range);
+    assert!(
+        w.scenes.page(far).unwrap().records.address().0 == 0,
+        "budget holds one page"
+    );
+    // Moving away, the near page leaves after its hold and the far one takes its place.
+    shot_until(&mut w, far_eye, far_at, far_range, near_range);
+    assert!(
+        w.scenes.page(near).unwrap().records.address().0 == 0,
+        "the near page left"
+    );
+    // Back again: the same range draws without being placed anew.
+    shot_until(&mut w, near_eye, near_at, near_range, far_range);
+    assert_clean();
+}
+
+#[test]
+fn prefetch_regions_load_the_pages_they_meet() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let pages = row_pages(&w);
+    let near = pages[0].0;
+    let far = pages.last().unwrap().0;
+    let start = Instant::now();
+    while w.scenes.page(near).unwrap().records.address().0 == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the region never landed"
+        );
+        w.scenes.prefetch_region(DVec3::new(9.0, 1.0, 8.0), 10.0);
+        let f = w
+            .scenes
+            .begin_frame(&FrameDesc {
+                time: time(0),
+                scenes: &[],
+                low_latency: None,
+            })
+            .unwrap();
+        wait(f.end(&[]).unwrap());
+    }
+    assert!(
+        w.scenes.page(far).unwrap().records.address().0 == 0,
+        "the region stays away from the far page"
+    );
+    assert_clean();
+}
+
+#[test]
+fn a_streaming_mesh_traces_its_finer_cached_cuts_where_the_raster_draws() {
+    let _serial = serial();
+    let mut w = World::with(&RendererDesc {
+        budgets: Budgets {
+            mesh_resident_max: 0,
+            ..Budgets::default()
+        },
+        rt_merge_pixels: 1e9,
+        raster_error_pixels: 1e-3,
+        rt_error_pixels: 1e-3,
+        ..RendererDesc::default()
+    });
+    let items = dag_items();
+    let placed = place(&mut w, &items);
+    let eye = DVec3::new(0.3, 1.2, 4.0);
+    let target = DVec3::new(0.0, 0.0, -10.0);
+    let mut last = None;
+    for frame in 1..=240 {
+        last = Some(shoot(&mut w, &placed, &Shot::at(eye, target, frame)));
+    }
+    let g = last.unwrap();
+    let r = rays(&g.view, &trace::MODULE, "pixels", 0);
+    let (matched, _) = parity(&g, &r, 3e-2);
+    let total = r.traced.len();
+    assert!(
+        matched as f64 >= 0.97 * total as f64,
+        "{matched} of {total} pixels agree"
+    );
+    assert_eq!(w.scenes.residency().failed, 0);
     assert_clean();
 }
