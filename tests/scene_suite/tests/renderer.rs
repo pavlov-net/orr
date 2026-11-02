@@ -65,7 +65,7 @@ fn empty_frames_and_scene_frames_submit_in_order() {
             .unwrap();
         f.scene(s)
             .unwrap()
-            .set_focus(DVec3::new(f64::from(i) * 700.0, 0.0, 0.0), 1000.0);
+            .set_focus(DVec3::new(f64::from(i) * 700.0, 0.0, 0.0));
         f.update_scenes(&mut |_| {}).unwrap();
         f.raster_view(&ViewDesc {
             scene: s,
@@ -476,12 +476,9 @@ fn hooked_frames(pack: &Arc<[u8]>, alias: bool) -> (Vec<Vec<u8>>, ArenaReport) {
             };
             s.set_light(LightId(0), Some(&Light::Directional(sun)))
                 .unwrap();
-            s.set_focus(DVec3::ZERO, 100.0);
+            s.set_focus(DVec3::ZERO);
         }
         f.update_scenes(&mut |_| {}).unwrap();
-        if i == 0 {
-            f.list().unwrap().discard(&image);
-        }
         let hooked = i == 1 || i == 2;
         let mut transparency = |_: &mut TransparencyPass<'_, '_>, _| {};
         let mut scene_referred = |_: &mut HookPass<'_, '_>| {};
@@ -616,10 +613,9 @@ fn render_view_runs_the_glare_its_lens_asks_for() {
         user_tag: 0,
     })
     .unwrap();
-    s.set_focus(DVec3::ZERO, 100.0);
+    s.set_focus(DVec3::ZERO);
     drop(s);
     f.update_scenes(&mut |_| {}).unwrap();
-    f.list().unwrap().discard(&image);
     wait(f.end().unwrap());
 
     // A 1 m lamp seen from 30 m on a black background, without GT7.

@@ -1333,7 +1333,9 @@ fn render(
         .unwrap();
     {
         let mut s = f.scene(placed.scene).unwrap();
-        s.set_focus(eye.as_dvec3(), VIEW_PIXELS_PER_RADIAN);
+        s.set_focus(eye.as_dvec3());
+        f.request_detail(placed.scene, VIEW_PIXELS_PER_RADIAN)
+            .unwrap();
         for (i, c) in moved.iter().enumerate() {
             s.transforms(placed.group, i as u32, 1).unwrap()[0] = affine(c.linear, c.at);
         }
@@ -2059,9 +2061,12 @@ fn software_and_hardware_raster_draw_the_same_visibility_buffer() {
                         low_latency: None,
                     })
                     .unwrap();
-                f.scene(placed.scene)
-                    .unwrap()
-                    .set_focus(eye.as_dvec3(), VIEW_PIXELS_PER_RADIAN);
+                {
+                    let mut w = f.scene(placed.scene).unwrap();
+                    w.set_focus(eye.as_dvec3());
+                    f.request_detail(placed.scene, VIEW_PIXELS_PER_RADIAN)
+                        .unwrap();
+                }
                 let view = f
                     .raster_view(&ViewDesc {
                         scene: placed.scene,
@@ -2207,7 +2212,8 @@ fn shoot_with(
     {
         let mut s = f.scene(placed.scene).unwrap();
         if let Some(focus) = shot.focus {
-            s.set_focus(focus, PIXELS_PER_RADIAN);
+            s.set_focus(focus);
+            f.request_detail(placed.scene, PIXELS_PER_RADIAN).unwrap();
         }
         for &(i, t) in &shot.moved {
             s.transforms(placed.group, i, 1).unwrap()[0] = t;
@@ -3282,7 +3288,8 @@ fn ptlas_work_past_the_budget_waits_and_lands_nearest_first() {
             .unwrap();
         if frame == 1 {
             let mut s = f.scene(scene).unwrap();
-            s.set_focus(DVec3::new(5.0, 1.0, 5.0), PIXELS_PER_RADIAN);
+            s.set_focus(DVec3::new(5.0, 1.0, 5.0));
+            f.request_detail(scene, PIXELS_PER_RADIAN).unwrap();
             // Three cells of 40 copies, 0, 2 and 5 cells from the focus.
             for cell in [0.0, 2.0, 5.0] {
                 let g = s
@@ -3431,7 +3438,8 @@ fn place_rigs_of(
         })
         .unwrap();
     let mut s = f.scene(scene).unwrap();
-    s.set_focus(DVec3::ZERO, PIXELS_PER_RADIAN);
+    s.set_focus(DVec3::ZERO);
+    f.request_detail(scene, PIXELS_PER_RADIAN).unwrap();
     let group = s
         .create_transform_group(&TransformGroupDesc {
             count,
@@ -3535,7 +3543,9 @@ fn shoot_rigs_edited(
     {
         let mut s = f.scene(rigs.placed.scene).unwrap();
         if let Some(focus) = shot.focus {
-            s.set_focus(focus, PIXELS_PER_RADIAN);
+            s.set_focus(focus);
+            f.request_detail(rigs.placed.scene, PIXELS_PER_RADIAN)
+                .unwrap();
         }
         for &(i, m) in &shot.moved {
             s.transforms(rigs.placed.group, i, 1).unwrap()[0] = m;
@@ -5280,7 +5290,8 @@ fn shoot_edits_with(
         .unwrap();
     {
         let mut s = f.scene(placed.scene).unwrap();
-        s.set_focus(shot.focus.unwrap_or(shot.eye), PIXELS_PER_RADIAN);
+        s.set_focus(shot.focus.unwrap_or(shot.eye));
+        f.request_detail(placed.scene, PIXELS_PER_RADIAN).unwrap();
         for &(i, t) in &shot.moved {
             s.transforms(placed.group, i, 1).unwrap()[0] = t;
         }

@@ -91,6 +91,11 @@ impl Projection {
     pub fn clip_from_view(&self, extent: UVec2) -> Mat4 {
         clip_from_view(self, extent)
     }
+
+    /// Pixels per radian at the center of an image `height` pixels tall.
+    pub fn pixels_per_radian(&self, height: u32) -> f32 {
+        0.5 * height as f32 / (0.5 * self.fov_y).tan()
+    }
 }
 
 /// The lens the camera effects read.
@@ -179,8 +184,8 @@ pub struct ViewDesc {
     pub jitter: Vec2,
     /// A camera cut: the previous camera is taken to be this one.
     pub reset_history: bool,
-    /// Texture level-of-detail bias for an upscaled image: log2(render width / output
-    /// width), 0 without upscaling.
+    /// Added to the level of detail of primary-hit texture lookups, as an upscaler asks for
+    /// its render size; 0 without one.
     pub mip_bias: f32,
     /// How the view filters material textures.
     pub texture_filter: TextureFilter,

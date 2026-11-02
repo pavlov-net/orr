@@ -147,10 +147,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         };
         f.scene(scene)
             .expect("scene writer")
-            .set_focus(eye.as_dvec3(), extent[1] as f32 / FOV_Y);
-        if let Some(t) = headless_target.as_ref().filter(|_| i == 0) {
-            f.list().expect("frame list").discard(t);
-        }
+            .set_focus(eye.as_dvec3());
         let output = ViewOutput {
             screenshot: (capture && final_frame).then_some(ScreenshotRequest::Display {
                 include_ui: !options.headless,

@@ -311,8 +311,17 @@ impl<'q> CommandList<'q> {
     /// Puts `t` in `GENERAL` with undefined contents. Required before a texture's first use
     /// and whenever its placed memory held another resource.
     pub fn discard(&mut self, t: &Texture) {
+        self.discard_after(t, vk::PipelineStageFlags2::NONE);
+    }
+
+    /// [`Self::discard`] for a texture earlier commands may still be using: it waits for them.
+    pub fn discard_after_use(&mut self, t: &Texture) {
+        self.discard_after(t, vk::PipelineStageFlags2::ALL_COMMANDS);
+    }
+
+    fn discard_after(&mut self, t: &Texture, src: vk::PipelineStageFlags2) {
         let b = [vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::NONE)
+            .src_stage_mask(src)
             .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
             .old_layout(vk::ImageLayout::UNDEFINED)

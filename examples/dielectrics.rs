@@ -293,43 +293,38 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         };
         f.scene(scene)
             .expect("scene writer")
-            .set_focus(eye.as_dvec3(), extent[1] as f32 / FOV_Y);
-        f.update_scenes(&mut |c| pond.record(c, POND, slab_kernel, t as f32))
-            .expect("update scenes");
-        if let Some(t) = headless_target.as_ref().filter(|_| i == 0) {
-            f.list().expect("frame list").discard(t);
-        }
-        let mut average = average.hook(&f, i, extent);
-        let mut hooks = ViewHooks {
-            scene_referred: average_frames
-                .then_some(&mut average as &mut dyn FnMut(&mut HookPass<'_, '_>)),
-            ..ViewHooks::default()
+            .set_focus(eye.as_dvec3());
+        let view = LitView {
+            scene,
+            history,
+            position: eye.as_dvec3(),
+            rotation: view::look_at_quat(eye, target, Vec3::Y).inverse(),
+            projection: Projection {
+                fov_y: FOV_Y,
+                near: 0.05,
+            },
+            lens: Lens::default(),
+            reset_history: i == 0,
+            texture_filter: TextureFilter::Hardware,
+            target: view_target,
         };
         let output = ViewOutput {
             screenshot: (capture && final_frame)
                 .then_some(ScreenshotRequest::Display { include_ui: false }),
             ..ViewOutput::default()
         };
-        f.render_view(
-            &LitView {
-                scene,
-                history,
-                position: eye.as_dvec3(),
-                rotation: view::look_at_quat(eye, target, Vec3::Y).inverse(),
-                projection: Projection {
-                    fov_y: FOV_Y,
-                    near: 0.05,
-                },
-                lens: Lens::default(),
-                reset_history: i == 0,
-                texture_filter: TextureFilter::Hardware,
-                target: view_target,
-            },
-            &lighting,
-            &output,
-            &mut hooks,
-        )
-        .expect("render view");
+        f.prepare_view(&view, &lighting, &output)
+            .expect("prepare view");
+        f.update_scenes(&mut |c| pond.record(c, POND, slab_kernel, t as f32))
+            .expect("update scenes");
+        let mut average = average.hook(&f, i, extent);
+        let mut hooks = ViewHooks {
+            scene_referred: average_frames
+                .then_some(&mut average as &mut dyn FnMut(&mut HookPass<'_, '_>)),
+            ..ViewHooks::default()
+        };
+        f.render_view(&view, &lighting, &output, &mut hooks)
+            .expect("render view");
         last = Some((id, f.end().expect("end frame")));
     }
 

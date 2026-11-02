@@ -1490,7 +1490,8 @@ impl Bed {
             w.set_environment(data.gpu().address());
         }
         if let Some((at, pixels_per_radian)) = spec.focus {
-            w.set_focus(at.as_dvec3(), pixels_per_radian);
+            w.set_focus(at.as_dvec3());
+            f.request_detail(scene, pixels_per_radian).unwrap();
         }
         drop(w);
         let point = f.end(&[]).unwrap();

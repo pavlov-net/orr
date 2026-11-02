@@ -180,14 +180,14 @@ pub struct RendererDesc {
     /// Archive reads are positioned reads on workers even where the system's completion
     /// ring (IoRing, io_uring) is available.
     pub positioned_reads: bool,
-    /// Raster LOD: the largest cluster error drawn, in pixels at the scene focus.
+    /// Raster LOD: the largest cluster error drawn, in render pixels at the scene focus.
     pub raster_error_pixels: f32,
-    /// Ray-tracing LOD: the largest cluster error traced, in pixels at the scene focus.
+    /// Ray-tracing LOD: the largest cluster error traced, in render pixels at the scene focus.
     pub rt_error_pixels: f32,
     /// Copies no view drew last frame trace at this many times `rt_error_pixels`.
     pub culled_error_scale: f32,
-    /// Copies whose bounding sphere projects to a radius under this many pixels at the focus
-    /// trace their model's merged cut: the finest cached cut any of them needs. 0 turns
+    /// Copies whose bounding sphere projects to a radius under this many render pixels at the
+    /// focus trace their model's merged cut: the finest cached cut any of them needs. 0 turns
     /// merging off.
     pub rt_merge_pixels: f32,
     /// Clusters whose screen rect's longer side is at most this many render pixels raster
@@ -201,7 +201,7 @@ pub struct RendererDesc {
     /// skips empty bins, on devices with `Caps::generated_commands`; off, or without them,
     /// it records one indirect dispatch per bin.
     pub generated_resolve: bool,
-    /// Tessellation: the longest generated edge, in pixels at the scene focus.
+    /// Tessellation: the longest generated edge, in render pixels at the scene focus.
     pub dice_pixels: f32,
     /// Whether textures that a pack's neural texture sets stand in for decode from the sets.
     pub neural_textures: NeuralTextures,
@@ -286,7 +286,7 @@ pub struct SceneCompute<'a, 'q> {
     /// The scene's producer batches, indexed by `ProducerId`.
     pub batches: GpuPtr<ProducerBatch>,
     pub time: FrameTime,
-    /// The scene focus and its pixels per radian, as last set.
+    /// The scene focus and the render pixels per radian this update chooses geometry for.
     pub focus: Option<(DVec3, f32)>,
     device: &'a Device,
     window: &'a UploadWindow,
@@ -1121,7 +1121,7 @@ impl Core {
                 };
                 let distance = cpu
                     .focus
-                    .map_or(0.0, |(f, _)| (f.distance(center) - radius).max(0.0));
+                    .map_or(0.0, |f| (f.distance(center) - radius).max(0.0));
                 let e = wanted.entry(p.page.0).or_insert(f64::INFINITY);
                 *e = e.min(distance);
             }
@@ -1242,6 +1242,20 @@ impl<'a> Frame<'a> {
         &self.reloads
     }
 
+    /// Asks `update_scenes` to choose the scene's geometry for a view of this many render
+    /// pixels per radian ([`crate::Projection::pixels_per_radian`]); once this frame's update
+    /// has run, the next frame's. The largest request wins; an update without a request keeps
+    /// the value of the one before it, at first 1000.
+    pub fn request_detail(&self, id: SceneId, pixels_per_radian: f32) -> Result<()> {
+        let scene = self.core.scene(id)?;
+        let mut cpu = scene.cpu.lock().unwrap();
+        let largest = cpu
+            .requested_detail
+            .map_or(pixels_per_radian, |r| r.max(pixels_per_radian));
+        cpu.requested_detail = Some(largest);
+        Ok(())
+    }
+
     /// Step 2: the writer of listed scene `id`. One writer per scene at a time.
     pub fn scene(&self, id: SceneId) -> Result<SceneWriter<'_>> {
         if !self.listed.contains(&id) {
@@ -1334,8 +1348,11 @@ impl<'a> Frame<'a> {
                     records.push(Record::fill(core.next_seq(), at, 4, 0));
                 }
             }
+            if let Some(detail) = cpu.requested_detail.take() {
+                cpu.pixels_per_radian = detail;
+            }
             let mut rebase = false;
-            if let Some((focus, _)) = cpu.focus
+            if let Some(focus) = cpu.focus
                 && needs_rebase(cpu.origin_cell, focus, core.cell_log2)
             {
                 cpu.origin_cell = origin_for(focus, core.cell_log2);
@@ -1477,7 +1494,13 @@ impl<'a> Frame<'a> {
             if tlas.is_some() {
                 traced.push((id, rebase));
             }
-            roots.push((id, t.root.gpu(), t.batches.gpu(), cpu.focus, scene.desc));
+            roots.push((
+                id,
+                t.root.gpu(),
+                t.batches.gpu(),
+                cpu.focus_detail(),
+                scene.desc,
+            ));
         }
 
         if !masks.is_empty() {
@@ -1707,7 +1730,7 @@ impl<'a> Frame<'a> {
             for &(id, rebased) in &traced {
                 let scene = core.scene(id)?;
                 let cpu = &mut *scene.cpu.lock().unwrap();
-                let (focus_cell, focus_offset) = match cpu.focus {
+                let (focus_cell, focus_offset) = match cpu.focus_detail() {
                     Some((f, ppr)) => {
                         let w = WorldPos::new(f, core.cell_log2);
                         (w.cell.extend(1).to_array(), w.offset.extend(ppr).to_array())
@@ -1844,7 +1867,7 @@ impl<'a> Frame<'a> {
         let scene = core.scene(view.scene)?;
         let (origin, focus) = {
             let cpu = scene.cpu.lock().unwrap();
-            (cpu.origin_cell, cpu.focus.map_or(view.position, |f| f.0))
+            (cpu.origin_cell, cpu.focus.unwrap_or(view.position))
         };
         let root = scene.tables.root.gpu();
         let sky_stats = scene.tables.sky_stats.gpu();
@@ -2181,7 +2204,7 @@ fn record_producers(
         if !cpu.producers.iter().flatten().any(|p| p.tess.is_some()) {
             continue;
         }
-        let focus = cpu.focus.map(|(f, ppr)| {
+        let focus = cpu.focus_detail().map(|(f, ppr)| {
             let w = WorldPos::new(f, core.cell_log2);
             (w.cell.extend(1).to_array(), w.offset.extend(ppr).to_array())
         });

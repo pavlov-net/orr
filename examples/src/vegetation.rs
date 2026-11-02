@@ -1599,19 +1599,38 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                 .expect("begin frame");
             let id = f.id();
             let point = 'frame: {
-                let (extent, view_target) = match (&headless_target, f.display()) {
-                    (Some(t), _) => (settings.extent, ViewTarget::Texture(t)),
-                    (None, Some((_, extent))) => (extent, ViewTarget::Display),
+                let view_target = match (&headless_target, f.display()) {
+                    (Some(t), _) => ViewTarget::Texture(t),
+                    (None, Some(_)) => ViewTarget::Display,
                     (None, None) => break 'frame f.end().expect("end frame"),
                 };
                 f.scene(scene.scene)
                     .expect("scene writer")
-                    .set_focus(eye.as_dvec3(), extent[1] as f32 / FOV_Y);
+                    .set_focus(eye.as_dvec3());
+                let output = ViewOutput {
+                    screenshot: (options.headless && final_frame)
+                        .then_some(ScreenshotRequest::Display { include_ui: false }),
+                    ..ViewOutput::default()
+                };
+                let lit = LitView {
+                    scene: scene.scene,
+                    history: scene.history,
+                    position: eye.as_dvec3(),
+                    rotation: view::look_at_quat(eye, target, Vec3::Y).inverse(),
+                    projection: Projection {
+                        fov_y: FOV_Y,
+                        near: 0.1,
+                    },
+                    lens: Lens::default(),
+                    reset_history: i == 0,
+                    texture_filter: TextureFilter::Hardware,
+                    target: view_target,
+                };
+                let lighting = ViewLighting::default();
+                f.prepare_view(&lit, &lighting, &output)
+                    .expect("prepare view");
                 f.update_scenes(&mut |c| scene.record(c, eye, t as f32, previous as f32))
                     .expect("update scenes");
-                if let Some(tex) = headless_target.as_ref().filter(|_| clock == 1) {
-                    f.list().expect("frame list").discard(tex);
-                }
                 let slot = id % slots;
                 let glow = &scene.glow;
                 let roots = &mut glow_roots;
@@ -1649,31 +1668,8 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                     transparency: Some(&mut particles),
                     ..ViewHooks::default()
                 };
-                let output = ViewOutput {
-                    screenshot: (options.headless && final_frame)
-                        .then_some(ScreenshotRequest::Display { include_ui: false }),
-                    ..ViewOutput::default()
-                };
                 let rendered = f
-                    .render_view(
-                        &LitView {
-                            scene: scene.scene,
-                            history: scene.history,
-                            position: eye.as_dvec3(),
-                            rotation: view::look_at_quat(eye, target, Vec3::Y).inverse(),
-                            projection: Projection {
-                                fov_y: FOV_Y,
-                                near: 0.1,
-                            },
-                            lens: Lens::default(),
-                            reset_history: i == 0,
-                            texture_filter: TextureFilter::Hardware,
-                            target: view_target,
-                        },
-                        &ViewLighting::default(),
-                        &output,
-                        &mut hooks,
-                    )
+                    .render_view(&lit, &lighting, &output, &mut hooks)
                     .expect("render view");
                 let list = f.list().expect("frame list");
                 list.barrier(Stages::ALL, Stages::TRANSFER, Hazards::empty());

@@ -880,7 +880,7 @@ impl Forest {
             .unwrap();
         {
             let mut s = f.scene(self.scene).unwrap();
-            s.set_focus(shot.focus.as_dvec3(), args.extent[1] as f32 / FOV_Y);
+            s.set_focus(shot.focus.as_dvec3());
             for &(tree, on) in &shot.flags {
                 let flags = if on {
                     InstanceFlags::RASTER | InstanceFlags::RAY
@@ -1242,9 +1242,7 @@ fn cpu_sweep(device: &'static Device, pack: &Arc<[u8]>, args: &Args) {
                     display: Some(&mut display),
                 })
                 .unwrap();
-            f.scene(forest.scene)
-                .unwrap()
-                .set_focus(eye.as_dvec3(), a.extent[1] as f32 / FOV_Y);
+            f.scene(forest.scene).unwrap().set_focus(eye.as_dvec3());
             f.raster_view(&view_desc(
                 forest.scene,
                 forest.history,

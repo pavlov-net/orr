@@ -300,7 +300,24 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         };
         f.scene(scene)
             .expect("scene writer")
-            .set_focus(eye.as_dvec3(), extent[1] as f32 / FOV_Y);
+            .set_focus(eye.as_dvec3());
+        let desc = ViewDesc {
+            scene,
+            history,
+            position: eye.as_dvec3(),
+            rotation: view::look_at_quat(eye, target, Vec3::Y).inverse(),
+            projection: Projection {
+                fov_y: FOV_Y,
+                near: 0.05,
+            },
+            lens: Lens::default(),
+            render_extent: UVec2::from(extent),
+            jitter: Vec2::ZERO,
+            reset_history: i == 0,
+            mip_bias: 0.0,
+            texture_filter: TextureFilter::Hardware,
+        };
+        f.prepare_raster_view(&desc).expect("prepare view");
         let wind_root = |root| wind::Root {
             scene: root,
             branches: branches.gpu(),
@@ -321,24 +338,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             );
         })
         .expect("update scenes");
-        let view = f
-            .raster_view(&ViewDesc {
-                scene,
-                history,
-                position: eye.as_dvec3(),
-                rotation: view::look_at_quat(eye, target, Vec3::Y).inverse(),
-                projection: Projection {
-                    fov_y: FOV_Y,
-                    near: 0.05,
-                },
-                lens: Lens::default(),
-                render_extent: UVec2::from(extent),
-                jitter: Vec2::ZERO,
-                reset_history: i == 0,
-                mip_bias: 0.0,
-                texture_filter: TextureFilter::Hardware,
-            })
-            .expect("raster view");
+        let view = f.raster_view(&desc).expect("raster view");
 
         let fresh = image
             .as_ref()
