@@ -21,7 +21,7 @@ pub struct OmmSettings {
     /// triangle to `max_level`.
     pub target_edge: f32,
     /// Largest micromap block of one cluster (its indices, entries and states), at most
-    /// 64 KiB. A cluster over it is measured again one level lower until it fits.
+    /// 64 KiB. A cluster takes the highest level whose block fits it before compaction.
     pub cluster_bytes_max: u32,
 }
 
@@ -212,10 +212,13 @@ pub(crate) struct ClusterOmm {
 impl ClusterOmm {
     /// The most bytes the cluster adds to its page's micromap region.
     pub(crate) fn bytes(&self) -> usize {
-        (2 * self.indices.len()).next_multiple_of(4)
-            + size_of::<MicromapEntry>() * self.levels.len()
-            + self.data.len()
+        block_bytes(self.indices.len(), self.levels.len(), self.data.len())
     }
+}
+
+/// Bytes of a micromap block of `triangles` indices and `entries` entries of `data` bytes.
+fn block_bytes(triangles: usize, entries: usize, data: usize) -> usize {
+    (2 * triangles).next_multiple_of(4) + size_of::<MicromapEntry>() * entries + data
 }
 
 /// Micromaps of a cluster's alpha-tested triangles: `tris` in stored corner order over the
@@ -254,44 +257,36 @@ pub(crate) fn cluster_omm(
         .iter()
         .map(|&p| mip0.mapped(p).map(|x| x as f32))
         .collect();
-    // An entry's states depend only on its source triangle and level, so a lower attempt
-    // takes the entries whose level did not change from the one before.
-    let mut previous: Vec<Option<(u8, Vec<u8>)>> = vec![None; tris.len()];
+    // The highest level whose block fits the cap before compaction, which only shrinks it.
     let mut level = s.max_level;
-    loop {
+    let (m, mut offsets, size) = loop {
         let m =
             meshopt::opacity_map_measure(&corners, &mapped, alpha.w, alpha.h, level, s.target_edge);
-        let mut levels = m.levels;
-        let (mut offsets, size) = meshopt::opacity_map_layout(&levels, STATES);
-        let mut data = vec![0; size];
-        for (i, &source) in m.sources.iter().enumerate() {
-            let len = meshopt::opacity_map_entry_size(levels[i], STATES);
-            let entry = &mut data[offsets[i] as usize..][..len];
-            let known = &mut previous[source as usize];
-            match known {
-                Some((l, states)) if *l == levels[i] => entry.copy_from_slice(states),
-                _ => {
-                    let uv = tris[source as usize].map(|v| uvs[usize::from(v)]);
-                    let at = tris[source as usize].map(|v| mapped[usize::from(v)]);
-                    meshopt::opacity_map_rasterize(entry, levels[i], STATES, &at, &alpha.texture());
-                    known_states_hold(entry, levels[i], uv, mip0, cutoff, &alpha.sides);
-                    *known = Some((levels[i], entry.to_vec()));
-                }
-            }
-        }
-        let mut indices = m.indices;
-        meshopt::opacity_map_compact(&mut data, &mut levels, &mut offsets, &mut indices, STATES);
-        let omm = ClusterOmm {
-            indices,
-            levels,
-            data,
-            max_level: level,
-        };
-        if level == 0 || omm.bytes() <= s.cluster_bytes_max as usize {
-            return Some(omm);
+        let (offsets, size) = meshopt::opacity_map_layout(&m.levels, STATES);
+        let bytes = block_bytes(tris.len(), m.levels.len(), size);
+        if level == 0 || bytes <= s.cluster_bytes_max as usize {
+            break (m, offsets, size);
         }
         level -= 1;
+    };
+    let mut levels = m.levels;
+    let mut data = vec![0; size];
+    for (i, &source) in m.sources.iter().enumerate() {
+        let uv = tris[source as usize].map(|v| uvs[usize::from(v)]);
+        let at = tris[source as usize].map(|v| mapped[usize::from(v)]);
+        let len = meshopt::opacity_map_entry_size(levels[i], STATES);
+        let entry = &mut data[offsets[i] as usize..][..len];
+        meshopt::opacity_map_rasterize(entry, levels[i], STATES, &at, &alpha.texture());
+        known_states_hold(entry, levels[i], uv, mip0, cutoff, &alpha.sides);
     }
+    let mut indices = m.indices;
+    meshopt::opacity_map_compact(&mut data, &mut levels, &mut offsets, &mut indices, STATES);
+    Some(ClusterOmm {
+        indices,
+        levels,
+        data,
+        max_level: level,
+    })
 }
 
 /// Whether micro-triangles `first..first + count` of a four-state entry hold a known state.
