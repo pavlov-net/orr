@@ -18,6 +18,7 @@ orr-math.workspace = true
 orr-color.workspace = true
 orr-shaders.workspace = true
 bytemuck.workspace = true
+env_logger.workspace = true
 log.workspace = true
 png.workspace = true
 winit = "0.30.13"

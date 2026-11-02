@@ -316,25 +316,12 @@ impl Drop for Luts {
     }
 }
 
-struct StderrLog;
-
-impl log::Log for StderrLog {
-    fn enabled(&self, m: &log::Metadata<'_>) -> bool {
-        m.level() <= log::Level::Warn
-    }
-
-    #[allow(clippy::print_stderr)]
-    fn log(&self, r: &log::Record<'_>) {
-        if self.enabled(r.metadata()) {
-            eprintln!("{} {}", r.level(), r.args());
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-/// Logs warnings and errors, validation messages among them, to stderr.
+/// Logs warnings and errors, validation messages among them, to stderr, with `RUST_LOG`
+/// adding to or overriding that.
 pub fn log_to_stderr() {
-    let _ = log::set_logger(&StderrLog);
-    log::set_max_level(log::LevelFilter::Warn);
+    let _ = env_logger::Builder::new()
+        .parse_filters("warn")
+        .parse_default_env()
+        .is_test(true)
+        .try_init();
 }

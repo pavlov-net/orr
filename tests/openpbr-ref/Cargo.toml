@@ -9,12 +9,12 @@ publish = false
 
 [features]
 # `SlangGpu`, the GPU suite, `openpbr-report --gpu` and `openpbr-bench`; need a Vulkan device.
-gpu = ["dep:orr-gpu", "dep:log"]
+gpu = ["dep:orr-gpu", "dep:env_logger"]
 
 [dependencies]
 orr-shaders = { workspace = true, features = ["openpbr"] }
 orr-gpu = { workspace = true, optional = true }
-log = { workspace = true, optional = true }
+env_logger = { workspace = true, optional = true }
 shader-maths.workspace = true
 orr-math.workspace = true
 
