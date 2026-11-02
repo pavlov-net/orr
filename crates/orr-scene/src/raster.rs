@@ -1,7 +1,8 @@
 //! A view's raster half: instance and cluster culling over the scene's raster candidate
 //! cut, the mesh-shader and software raster into the visibility buffer, both in two passes
-//! around an HZB of the first, the material resolve per surface bin into the G-buffer and
-//! motion, the final HZB, and the depth target.
+//! around an HZB of the first, the dielectric and presence clusters into the layer tiles, the
+//! material resolve per surface bin into the G-buffer and motion, the final HZB, and the
+//! depth target.
 
 use std::alloc::Layout;
 use std::sync::Arc;
@@ -28,15 +29,17 @@ use crate::{
 const RASTER_OCCLUSION: u32 = 1;
 
 /// `RasterGpu.counts` entries and `RasterGpu.args` offsets (`visibility.slang`).
-const COUNTS: u64 = 16;
+const COUNTS: u64 = 17;
 const COUNT_DRAWS: u64 = 3;
-const ARGS: u64 = 15;
+const ARGS: u64 = 18;
 const ARGS_WORK: u64 = 0;
 const ARGS_OPAQUE: u64 = 3;
 const ARGS_ALPHA: u64 = 6;
 const ARGS_SOFTWARE: u64 = 9;
 const ARGS_PARTICLES: u64 = 12;
+const ARGS_COVERAGE: u64 = 15;
 const MAX_HZB_MIPS: u32 = 16;
+/// Pixels per side of a resolve tile and of a layer tile (`LAYER_TILE` in `gbuffer.slang`).
 const TILE: u32 = 8;
 
 /// How the material resolve runs its bins.
@@ -61,6 +64,7 @@ pub(crate) struct RasterPipelines {
     raster_args: PipelineId,
     opaque: MeshPipeline,
     alpha: MeshPipeline,
+    coverage: MeshPipeline,
     software: PipelineId,
     classify: PipelineId,
     resolve: Resolve,
@@ -125,6 +129,7 @@ impl RasterPipelines {
             raster_args: compute(&cull::MODULE, "raster_args")?,
             opaque: mesh("cluster_mesh", "opaque_pixel", None)?,
             alpha: mesh("cluster_mesh", "alpha_pixel", None)?,
+            coverage: mesh("coverage_mesh", "coverage_pixel", None)?,
             software: compute(&raster::MODULE, "software")?,
             classify: compute(&resolve::MODULE, "classify")?,
             resolve,
@@ -225,6 +230,8 @@ const OPAQUE: &str = "opaque clusters";
 const ALPHA: &str = "alpha clusters";
 const SOFTWARE: &str = "software clusters";
 const PARTICLES: &str = "particle clusters";
+const COVERAGE: &str = "coverage clusters";
+const LAYER_TILES: &str = "layer tiles";
 const BIN_ARGS: &str = "bin args";
 const BIN_TILES: &str = "bin tiles";
 const BIN_SEQUENCES: &str = "bin sequences";
@@ -250,6 +257,8 @@ struct Transient {
     alpha: ArenaBuffer,
     software: ArenaBuffer,
     particles: ArenaBuffer,
+    coverage: ArenaBuffer,
+    layer_tiles: ArenaBuffer,
     bin_args: ArenaBuffer,
     bin_tiles: ArenaBuffer,
     bin_sequences: ArenaBuffer,
@@ -273,6 +282,8 @@ impl Transient {
             alpha: buffer(ALPHA),
             software: buffer(SOFTWARE),
             particles: buffer(PARTICLES),
+            coverage: buffer(COVERAGE),
+            layer_tiles: buffer(LAYER_TILES),
             bin_args: buffer(BIN_ARGS),
             bin_tiles: buffer(BIN_TILES),
             bin_sequences: buffer(BIN_SEQUENCES),
@@ -326,6 +337,12 @@ impl ViewTargets {
                 GBUFFER,
             ),
             ArenaRequest::buffer(PARTICLES, list, GBUFFER),
+            // Then the word marking every tile.
+            ArenaRequest::buffer(
+                LAYER_TILES,
+                4 * (u64::from(tx) * u64::from(ty) + 1),
+                GBUFFER,
+            ),
             ArenaRequest::texture(GBUF_A, d2(Format::Rgba32Uint), GBUFFER),
             ArenaRequest::texture(GBUF_B, d2(Format::Rg32Uint), GBUFFER),
             ArenaRequest::buffer(
@@ -336,6 +353,7 @@ impl ViewTargets {
             ArenaRequest::buffer(OPAQUE, list, CULL),
             ArenaRequest::buffer(ALPHA, list, CULL),
             ArenaRequest::buffer(SOFTWARE, list, CULL),
+            ArenaRequest::buffer(COVERAGE, list, CULL),
             // Then the sequence count.
             ArenaRequest::buffer(BIN_ARGS, 12 * u64::from(s.bins) + 4, CULL),
             ArenaRequest::buffer(
@@ -442,6 +460,7 @@ impl ViewTargets {
             extent: self.sizes.extent,
             hzb_mips: self.hzb.storage.len() as u32,
             _pad: 0,
+            layer_tiles: t.layer_tiles.gpu(),
         }
     }
 
@@ -474,6 +493,7 @@ impl ViewTargets {
             alpha: t.alpha.gpu(),
             software: t.software.gpu(),
             particles: t.particles.gpu(),
+            coverage: t.coverage.gpu(),
             counts: self.counts(),
             slot_visibility: self.slot_visibility.gpu(),
             bin_args: t.bin_args.gpu(),
@@ -636,7 +656,10 @@ pub(crate) fn record(
     let slot_groups = [slots.div_ceil(64).max(1), 1, 1];
 
     list.begin_pass("cull", false);
-    let cleared = pixels.max(3 * s.bins + 1).max(COUNTS as u32);
+    let cleared = pixels
+        .max(3 * s.bins + 1)
+        .max(COUNTS as u32)
+        .max(tx * ty + 1);
     list.dispatch(pipelines.get(p.clear), r0, [cleared.div_ceil(64), 1, 1]);
     list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
     list.dispatch(pipelines.get(p.instances), r0, slot_groups);
@@ -659,6 +682,19 @@ pub(crate) fn record(
         draw(list);
         list.end_pass();
     }
+
+    // Dielectric and presence clusters against the final visibility buffer.
+    list.begin_pass("layer tiles", false);
+    list.barrier(
+        raster_stages | Stages::COMPUTE,
+        raster_stages,
+        Hazards::DRAW_ARGUMENTS,
+    );
+    list.begin_rendering(&rendering);
+    list.draw_mesh_tasks_indirect_count(&p.coverage, r0, mesh_args(ARGS_COVERAGE), draws, 1);
+    list.end_rendering();
+    list.end_pass();
+    list.barrier(raster_stages, Stages::COMPUTE, Hazards::empty());
 
     list.begin_pass("resolve", false);
     list.dispatch(pipelines.get(p.classify), r0, [tx * ty, 1, 1]);

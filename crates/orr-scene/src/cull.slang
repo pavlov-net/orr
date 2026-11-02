@@ -3,9 +3,10 @@
 // the frustum and, in the first pass, the previous frame's HZB; `cap` sizes the cluster pass
 // to the candidate cut or to the work the first pass left; `clusters` culls each item's
 // clusters (section mask, frustum, back-face cone, HZB) and sorts the survivors into the
-// hardware opaque, hardware alpha and software lists; `producers` culls the clusters
-// producer entries emitted this frame by their vertex boxes into the same lists, particle
-// entries into the particle list; `raster_args` sizes the raster to the lists' new entries.
+// hardware opaque, hardware alpha and software lists, and those of dielectric and presence
+// copies into the coverage list; `producers` culls the clusters producer entries emitted
+// this frame by their vertex boxes into the same lists, particle entries into the particle
+// list; `raster_args` sizes the raster to the lists' new entries.
 // Between the passes the HZB is rebuilt from the first pass's visibility buffer.
 // Clusters of animated parts are culled where their pose places them; whole copies by their
 // model's rest bounds, and posed copies only by their clusters' HZB tests. Skinned copies
@@ -22,8 +23,8 @@ import visibility;
 
 ORR_ROOT(RasterRoot);
 
-// One thread per pixel; the first threads also reset the counters, the draw arguments and
-// the resolve's sequence count.
+// One thread per pixel; the first threads also reset the counters, the draw arguments, the
+// resolve's sequence count and the layer tiles.
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void clear(uint3 id: SV_DispatchThreadID)
@@ -36,6 +37,21 @@ void clear(uint3 id: SV_DispatchThreadID)
         r.counts[id.x] = id.x == COUNT_DRAWS ? 1 : 0;
     if (id.x <= 3 * r.bins)
         r.bin_args[id.x] = id.x % 3 == 0 ? 0 : 1;
+    if (id.x <= layer_tile_count(r.gbuffer.extent))
+        r.gbuffer.layer_tiles[id.x] = 0;
+}
+
+// Whether the sphere at eye-relative `center` of `radius` m passes the frustum test. A
+// dielectric or presence (`layer`) sphere that reaches between the eye and the near plane
+// passes and marks every tile.
+bool frustum_visible(ViewConstants* v, RasterGpu* r, bool layer, float3 center, float radius)
+{
+    if (layer && near_eye(v, center, radius))
+    {
+        r.gbuffer.layer_tiles[layer_tile_count(r.gbuffer.extent)] = 1;
+        return true;
+    }
+    return sphere_visible(v, center, radius);
 }
 
 // One thread per instance slot with raster candidates. The first pass (`root.value` 0)
@@ -78,7 +94,7 @@ void instances(uint3 id: SV_DispatchThreadID)
     }
     float3 center = place(p, 0.5 * (lo + hi));
     float radius = 0.5 * length(hi - lo) * p.scale;
-    if (!sphere_visible(v, center, radius))
+    if (!frustum_visible(v, r, layer_class(inst.candidate_class), center, radius))
         return;
     // Posed parts may leave the rest bounds; their clusters are tested one by one.
     bool posed = (s.slot_state[slot].rt_flags & RT_ANIMATED) != 0;
@@ -127,16 +143,20 @@ float displacement_reach(Cluster c)
     return max(abs(float(c.displacement_min)), abs(float(c.displacement_max)));
 }
 
-// Whether cluster `c` of `inst` survives frustum, cone and section culling.
-bool cluster_visible(ViewConstants* v, InstanceGpu inst, Placement p, Cluster c, MaterialGpu* m)
+// Whether cluster `c` of `inst` survives frustum, cone and section culling. Rays meet both
+// sides of dielectric and presence surfaces, so their clusters skip the cone.
+bool cluster_visible(ViewConstants* v, RasterGpu* r, InstanceGpu inst, Placement p, Cluster c, MaterialGpu* m)
 {
     if (section_hidden(inst, c.section))
         return false;
     float reach = displacement_reach(c);
     float3 center = place(p, c.cull_sphere.xyz);
     float radius = (c.cull_sphere.w + reach) * p.scale;
-    if (!sphere_visible(v, center, radius))
+    bool layer = layer_class(inst.candidate_class);
+    if (!frustum_visible(v, r, layer, center, radius))
         return false;
+    if (layer)
+        return true;
     // Back-face cone, as meshoptimizer's cluster bounds define it, under uniform scale only.
     float4 cone = float4(int4(int(c.cone << 24) >> 24, int(c.cone << 16) >> 24, int(c.cone << 8) >> 24, int(c.cone) >> 24)) / 127.0;
     bool single = (m.flags & MATERIAL_DOUBLE_SIDED) == 0;
@@ -188,8 +208,9 @@ void append(RasterGpu* r, uint count, uint* list, uint visible)
     list[slot] = visible;
 }
 
-// Hands cluster `local` of page `page_index` of slot copy `copy` to the raster lists.
-void draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint copy, MeshGpu* mesh, uint8_t* page, uint page_index, uint local, Cluster c, Placement p, float3 lo, float3 hi, uint material, MaterialGpu* m)
+// Hands cluster `local` of page `page_index` of slot copy `copy` (record `inst`) to the
+// raster lists.
+void draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint copy, InstanceGpu inst, MeshGpu* mesh, uint8_t* page, uint page_index, uint local, Cluster c, Placement p, float3 lo, float3 hi, uint material, MaterialGpu* m)
 {
     VisibleCluster vc;
     vc.page = page;
@@ -201,6 +222,11 @@ void draw(SceneRoot* s, ViewConstants* v, RasterGpu* r, uint copy, MeshGpu* mesh
     if (!add_visible(r, vc, visible))
         return;
     s.slot_state[copy_slot(copy)].last_visible_frame = s.frame_index;
+    if (layer_class(inst.candidate_class))
+    {
+        append(r, COUNT_COVERAGE, r.coverage, visible);
+        return;
+    }
     if (small_on_screen(v, p, lo, hi, r))
     {
         append(r, COUNT_SOFTWARE, r.software, visible);
@@ -279,7 +305,7 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
             else
                 cluster_box(mesh, c, lo, hi);
             shown = material != MATERIAL_NONE
-                && (skinned ? skinned_visible(v, inst, p, c, lo, hi) : cluster_visible(v, inst, p, c, s.materials + material));
+                && (skinned ? skinned_visible(v, inst, p, c, lo, hi) : cluster_visible(v, r, inst, p, c, s.materials + material));
         }
         if (shown)
         {
@@ -317,7 +343,7 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
                 lo = grid_position(c.anchor, uint3(0), mesh.position_step);
                 hi = grid_position(c.anchor, uint3(c.local_max[0], c.local_max[1], c.local_max[2]), mesh.position_step);
             }
-            draw(s, v, r, copy, mesh, page, w.page, local, c, p, lo, hi, material, s.materials + material);
+            draw(s, v, r, copy, inst, mesh, page, w.page, local, c, p, lo, hi, material, s.materials + material);
         }
     }
     GroupMemoryBarrierWithGroupSync();
@@ -338,7 +364,7 @@ void clusters(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
 
 // One workgroup per producer entry, its threads over the clusters it emitted. Opaque and
 // alpha-tested entries join the raster lists; particle entries the particle list;
-// dielectric and presence entries are traced only. A strand entry's clusters are its
+// dielectric and presence entries the coverage list. A strand entry's clusters are its
 // segments in groups of STRAND_GROUP, drawn as ribbons.
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -351,10 +377,9 @@ void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
     if (entry >= s.producer_capacity)
         return;
     ProducerGpu p = s.producers[entry];
-    if ((p.flags & INSTANCE_RASTER) == 0 || (p.flags & INSTANCE_CAST_ONLY) != 0)
-        return;
     bool particle = p.opacity == PRODUCER_PARTICLE;
-    if (!particle && p.opacity != PRODUCER_OPAQUE && p.opacity != PRODUCER_ALPHA_TESTED)
+    bool layer = p.opacity == PRODUCER_DIELECTRIC || p.opacity == PRODUCER_PRESENCE;
+    if (!(layer ? layer_traced(p.flags) : (p.flags & INSTANCE_RASTER) != 0 && (p.flags & INSTANCE_CAST_ONLY) == 0))
         return;
     Placement pl;
     if (!producer_placement(s, p, false, v.eye_cell.xyz, v.eye_offset.xyz, uint(v.eye_cell.w), pl))
@@ -384,12 +409,12 @@ void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
             continue;
         float3 center = place(pl, 0.5 * (lo + hi));
         float radius = 0.5 * length(hi - lo) * pl.scale;
-        if (!sphere_visible(v, center, radius))
+        if (!frustum_visible(v, r, layer, center, radius))
             continue;
         // Diced clusters that displacement stretches past the software raster's limit
         // split their triangles between the two paths by size.
         float size;
-        bool fits = r.software_pixels > 0.0 && !particle && screen_size(v, pl, lo, hi, size);
+        bool fits = r.software_pixels > 0.0 && !particle && !layer && screen_size(v, pl, lo, hi, size);
         bool software = fits && size <= software_limit(r);
         bool by_size = fits && !software && p.tessellated != 0;
         VisibleCluster vc;
@@ -401,9 +426,9 @@ void producers(uint3 group: SV_GroupID, uint thread: SV_GroupThreadID)
         uint visible;
         if (!add_visible(r, vc, visible))
             continue;
-        if (particle)
+        if (particle || layer)
         {
-            append(r, COUNT_PARTICLES, r.particles, visible);
+            append(r, particle ? COUNT_PARTICLES : COUNT_COVERAGE, particle ? r.particles : r.coverage, visible);
             continue;
         }
         if (software || by_size)
@@ -426,4 +451,5 @@ void raster_args(uint3 id: SV_DispatchThreadID)
     write_grid(r.args + ARGS_ALPHA, r.counts[COUNT_ALPHA] - r.counts[COUNT_ALPHA_BASE]);
     write_grid(r.args + ARGS_SOFTWARE, r.counts[COUNT_SOFTWARE] - r.counts[COUNT_SOFTWARE_BASE]);
     write_grid(r.args + ARGS_PARTICLES, r.counts[COUNT_PARTICLES]);
+    write_grid(r.args + ARGS_COVERAGE, r.counts[COUNT_COVERAGE]);
 }

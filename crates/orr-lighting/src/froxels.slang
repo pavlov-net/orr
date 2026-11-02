@@ -71,7 +71,7 @@ public struct FroxelRoot
     public WorldCacheGpu* cache;
     public FroxelLights* lights;
     public MediaStatsGpu* stats;
-    public LayerGuide* layers;                  // media apply's: the dielectric dispatch's, null for none
+    public LayerGuide* layers;                  // media apply's: the dielectric dispatch's layer memory, null for none
     public StorageImageIndex sigma;             // froxel_material, RGBA16F
     public StorageImageIndex words;             // froxel_material, RGBA32_UINT
     public StorageImageIndex incident;          // this frame's, RGBA16F
@@ -677,7 +677,7 @@ public void media_apply<S : ISurface, M : IMedium>(FroxelRoot r, uint2 pixel)
     float depth = r.gbuffer.depth.get<Texture2D<float>>().Load(int3(pixel, 0));
     float2 uv = (float2(pixel) + 0.5) / float2(v.extent);
     float t = depth > 0.0 ? length(view_position(v, uv, depth)) : positive_infinity();
-    float end = r.layers != nullptr ? r.layers[pixel.y * r.gbuffer.extent.x + pixel.x].medium_end : 0.0;
+    float end = r.layers != nullptr ? layer_guide(r.layers, r.gbuffer.extent, pixel).medium_end : 0.0;
     if (end != 0.0)
         t = max(end, 0.0);
     t = min(t, r.scene.near_range);

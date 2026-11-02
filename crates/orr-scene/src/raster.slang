@@ -5,7 +5,9 @@
 // triangles the other leaves: overlap between them is harmless, a gap would be a hole.
 // Alpha-tested triangles keep a pixel by each surface's coverage. Strand segments draw as
 // ribbons facing the eye that cover their swept spheres. Pixel stages write only the
-// visibility buffer. `depth` copies the resolved depth into the depth target.
+// visibility buffer, except `coverage_pixel`: dielectric and presence clusters draw every
+// triangle, both faces, into the layer tiles where they lie in front of the opaque depth.
+// `depth` copies the resolved depth into the depth target.
 #include "orr/root.h"
 import orr.atomic;
 import orr.math;
@@ -233,6 +235,59 @@ void cluster_mesh(
         primitives[thread] = cluster_primitive(d, thread, k);
         triangles[thread] = k;
     }
+}
+
+// One workgroup per entry of the coverage list, drawing all the cluster's triangles.
+[shader("mesh")]
+[numthreads(128, 1, 1)]
+[outputtopology("triangle")]
+void coverage_mesh(
+    uint3 group: SV_GroupID,
+    uint thread: SV_GroupThreadID,
+    out indices uint3 triangles[128],
+    out vertices Vertex vertices[256],
+    out primitives Primitive primitives[128])
+{
+    RasterGpu* r = root.raster;
+    uint index = grid_index(group);
+    if (index >= r.counts[COUNT_COVERAGE])
+    {
+        SetMeshOutputCounts(0, 0);
+        return;
+    }
+    uint visible = r.coverage[index];
+    ClusterDraw d = cluster_draw(visible, false);
+    SetMeshOutputCounts(d.vertex_count, d.tri_count);
+    for (uint i = thread; i < d.vertex_count; i += 128)
+        vertices[i] = cluster_vertex(d, visible, i);
+    if (thread < d.tri_count)
+    {
+        Primitive o;
+        o.triangle = thread;
+        o.cull = false;
+        primitives[thread] = o;
+        triangles[thread] = draw_triangle(d, thread);
+    }
+}
+
+// Share of reverse-Z depth a layer fragment may lie behind the opaque depth and still mark
+// its tile.
+static const float LAYER_DEPTH_SLACK = 1e-3;
+
+// Marks the pixel's layer tile where the fragment lies in front of the opaque depth, or
+// within the slack that keeps a layer resting on an opaque surface.
+[shader("pixel")]
+void coverage_pixel(Vertex v)
+{
+    RasterGpu* r = root.raster;
+    uint2 pixel = uint2(v.position.xy);
+    uint2 extent = r.gbuffer.extent;
+    float opaque = visibility_depth(r.gbuffer.visibility[pixel.y * extent.x + pixel.x]);
+    if (v.position.z < opaque * (1.0 - LAYER_DEPTH_SLACK))
+        return;
+    uint* tile = r.gbuffer.layer_tiles + layer_tile(extent, pixel);
+    if (*tile == 0)
+        *tile = 1;
 }
 
 void write_pixel(uint2 pixel, float depth, uint visible, uint triangle)

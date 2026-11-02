@@ -222,7 +222,8 @@ pub struct RasterView {
     /// Visible clusters written, then visible clusters and cluster work dropped for want
     /// of room (`Budgets::visible_clusters`, `Budgets::cluster_work`), 1, cluster work
     /// items asked for, mesh-shader opaque and alpha draws, software-rastered clusters, and
-    /// visible particle clusters.
+    /// visible particle clusters; entry 16 counts the visible dielectric and presence
+    /// clusters that drew into `targets.layer_tiles`.
     pub counts: GpuPtr<u32>,
     /// The view's raster state: `gbuffer` and the culling lists, the particle list among
     /// them.

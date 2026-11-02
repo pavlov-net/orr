@@ -400,6 +400,40 @@ impl<'q> CommandList<'q> {
         };
     }
 
+    /// Runs `p`'s raygen entry once per element of the extent `args` holds on the GPU
+    /// (width, height, depth).
+    pub fn dispatch_rays_indirect<R>(
+        &mut self,
+        p: &RayDispatchPipeline,
+        root: GpuPtr<R>,
+        args: GpuPtr<DispatchArgs>,
+    ) {
+        self.bind(
+            vk::PipelineBindPoint::RAY_TRACING_KHR,
+            p.raw,
+            root.address().0,
+        );
+        let rt = self
+            .queue
+            .shared
+            .rt_fn
+            .as_ref()
+            .expect("a ray-dispatch pipeline exists");
+        let empty = vk::StridedDeviceAddressRegionKHR::default();
+        // SAFETY: recording with a ray-tracing pipeline bound; its raygen record is live
+        // while the pipeline is, and the arguments are the caller's live allocation.
+        unsafe {
+            rt.cmd_trace_rays_indirect(
+                self.cmd(),
+                &p.raygen,
+                &empty,
+                &empty,
+                &empty,
+                args.address().0,
+            );
+        };
+    }
+
     /// Starts drawing into `r`'s attachments, which stay in `GENERAL`. Viewport and scissor
     /// cover the extent. Order earlier writes to the attachments with a barrier before
     /// `COLOR_OUT` and `DEPTH`.

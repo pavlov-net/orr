@@ -1,7 +1,8 @@
-// Dielectric and presence surfaces. After the opaque dispatch, one camera ray per pixel
-// against the dielectric mask, up to the opaque depth, finds the pixel's first layer. A
-// presence layer passes the ray on with probability 1 - opacity; a hit layer becomes the
-// pixel's first vertex and its path replaces the opaque path's radiance. Fresnel picks
+// Dielectric and presence surfaces. After the opaque dispatch, one camera ray per pixel of
+// the tiles the layers rastered into, and of the tiles beside them, against the dielectric
+// mask, up to the opaque depth, finds the pixel's first layer. A presence layer passes the
+// ray on with probability 1 - opacity; a hit layer becomes the pixel's first vertex and its
+// path replaces the opaque path's radiance. Fresnel picks
 // reflection or refraction per path; refracted rays are traced through masks 0 and 7, and
 // further layer hits are path vertices up to `dielectric_depth`. Nested dielectrics keep an
 // interior list of material ids, innermost last: the IOR outside an interface is the
@@ -53,6 +54,85 @@ public static const uint DIELECTRIC_FROST = 1 << 3;       // layer guides keep `
 
 // The stream of a dispersive path's hero wavelength.
 public static const uint WAVELENGTH_STREAM = 0xD3A2646C;
+
+// `LayerTilesRoot.flags`.
+public static const uint LAYER_TILES_EVERYWHERE = 1 << 0; // the eye lies in a medium: trace every tile
+public static const uint LAYER_TILES_FROST = 1 << 1;      // keep `background` on tiles left untraced
+
+// What picks the tiles the dielectric dispatch traces.
+public struct LayerTilesRoot
+{
+    public GBufferGpu* gbuffer;
+    public LayerGuide* layers;          // the dispatch's layer memory (`traced_tiles`)
+    public StorageImageIndex radiance;  // RGBA16F at the G-buffer's extent, read with LAYER_TILES_FROST
+    public uint flags;                  // LAYER_TILES_*
+    public uint _pad0;
+    public uint _pad1;
+}
+
+groupshared bool tile_traced;
+
+// One workgroup of LAYER_TILE^2 threads per tile: a tile is traced when it or one beside it
+// holds a layer, or everywhere when a layer may lie before the near plane, the eye lies in a
+// medium or the G-buffer has no layer tiles. Traced tiles join the list. With
+// LAYER_TILES_FROST, untraced tiles keep their pixels' `background`.
+public void layer_tiles_body(LayerTilesRoot r, uint2 tile, uint thread)
+{
+    uint2 extent = r.gbuffer.extent;
+    uint columns = layer_tile_columns(extent);
+    uint count = layer_tile_count(extent);
+    uint rows = count / columns;
+    uint index = tile.y * columns + tile.x;
+    if (thread == 0)
+    {
+        uint* marks = r.gbuffer.layer_tiles;
+        bool traced = marks == nullptr || (r.flags & LAYER_TILES_EVERYWHERE) != 0 || marks[count] != 0;
+        for (int dy = -1; dy <= 1 && !traced; dy++)
+        {
+            for (int dx = -1; dx <= 1 && !traced; dx++)
+            {
+                int2 t = int2(tile) + int2(dx, dy);
+                if (all(t >= 0) && t.x < int(columns) && t.y < int(rows))
+                    traced = marks[uint(t.y) * columns + uint(t.x)] != 0;
+            }
+        }
+        traced_tiles(r.layers, extent)[index] = traced ? 1 : 0;
+        if (traced)
+        {
+            uint at;
+            InterlockedAdd(layer_tile_args(r.layers, extent)[0], 1, at);
+            layer_tile_list(r.layers, extent)[at] = index;
+        }
+        tile_traced = traced;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    uint2 pixel = tile * LAYER_TILE + uint2(thread % LAYER_TILE, thread / LAYER_TILE);
+    if (tile_traced || (r.flags & LAYER_TILES_FROST) == 0 || any(pixel >= extent))
+        return;
+    float3 opaque = r.radiance.get<RWTexture2D<float4>>()[pixel].rgb;
+    r.layers[pixel.y * extent.x + pixel.x].background = guide_luminance(opaque);
+}
+
+// Sizes the dispatch to the listed tiles: two 8 x 4 workgroups per tile for its compute entry,
+// LAYER_TILE^2 rays wide and a row per tile for its raygen entry.
+public void layer_args_body(LayerTilesRoot r)
+{
+    uint* args = layer_tile_args(r.layers, r.gbuffer.extent);
+    uint n = args[0];
+    write_grid(args + 1, 2 * n);
+    args[4] = LAYER_TILE * LAYER_TILE;
+    args[5] = n;
+    args[6] = 1;
+}
+
+// The pixel of invocation `lane` (row-major in its tile) of listed tile `entry`.
+public uint2 layer_tile_pixel(PathRoot r, uint entry, uint2 lane)
+{
+    uint2 extent = r.gbuffer.extent;
+    uint columns = layer_tile_columns(extent);
+    uint index = layer_tile_list(r.layers, extent)[entry];
+    return uint2(index % columns, index / columns) * LAYER_TILE + lane;
+}
 
 // The dielectric materials whose interiors hold a point, innermost last.
 public struct Interior

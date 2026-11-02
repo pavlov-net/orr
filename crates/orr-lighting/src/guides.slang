@@ -39,8 +39,7 @@ public struct GuideRoot
     public SceneRoot* scene;
     public ViewConstants* view;
     public GBufferGpu* gbuffer;
-    // One per pixel in rows of the G-buffer's width, from this frame's dielectric dispatch;
-    // null for none.
+    // This frame's dielectric dispatch's layer memory (`traced_tiles`); null for none.
     public LayerGuide* layers;
     public StorageImageIndex radiance;          // RGBA16F, written only for a GUIDE_* debug view
     public StorageImageIndex diffuse_albedo;    // RGBA8
@@ -62,7 +61,8 @@ public struct GuideRoot
 // `guide_luminance(after - before)` for each blur.
 public struct FrostRoot
 {
-    // From a dielectric dispatch with DIELECTRIC_FROST, in rows of `width`.
+    // The layer memory (`traced_tiles`) of a dielectric dispatch with DIELECTRIC_FROST at
+    // `width` x `height`, which keeps every pixel's `background`.
     public LayerGuide* layers;
     public StorageImageIndex guide;     // R16F
     public uint width;
@@ -80,7 +80,7 @@ static const uint FROST_TAPS = 24;
 
 public void frost_body(FrostRoot r, uint2 pixel)
 {
-    LayerGuide own = r.layers[pixel.y * r.width + pixel.x];
+    LayerGuide own = layer_guide(r.layers, uint2(r.width, r.height), pixel);
     float radius = f16tof32(own.frost & 0xffff);
     float weight = f16tof32(own.frost >> 16);
     if (radius < 0.5 || weight <= 0.0)
@@ -253,7 +253,7 @@ public void guide_body<S : ISurface>(GuideRoot r, uint2 pixel)
     }
     if (r.layers != nullptr)
     {
-        LayerGuide l = r.layers[pixel.y * gb.extent.x + pixel.x];
+        LayerGuide l = layer_guide(r.layers, gb.extent, pixel);
         if (l.weight > 0.0)
         {
             float w = l.weight;

@@ -114,9 +114,9 @@ public struct PathRoot
     public StorageImageIndex feedback;
     public uint local_columns;
     public uint light_flags;            // LIGHT_*
-    // The dielectric dispatch's: one layer guide per pixel in rows of the G-buffer's width,
-    // the view's froxels this frame (null for none), the layer vertices a path may have, the
-    // dielectric whose interior holds the eye (MATERIAL_NONE for none) and DIELECTRIC_* flags.
+    // The dielectric dispatch's: its layer memory (`traced_tiles`), the view's froxels this
+    // frame (null for none), the layer vertices a path may have, the dielectric whose
+    // interior holds the eye (MATERIAL_NONE for none) and DIELECTRIC_* flags.
     public LayerGuide* layers;
     public FroxelVolume* froxels;
     public uint dielectric_depth;
@@ -159,13 +159,41 @@ public struct LayerGuide
     // the pixel shades; 0: at the G-buffer's surface or the sky; below 0: nowhere, the eye
     // lies in an interior.
     public float medium_end;
-    // With DIELECTRIC_FROST: `guide_luminance` of the radiance the opaque dispatch left the
-    // pixel, which the frosted-glass term blurs.
+    // With DIELECTRIC_FROST, on every pixel whether its tile was traced or not:
+    // `guide_luminance` of the radiance the opaque dispatch left the pixel, which the
+    // frosted-glass term blurs.
     public float background;
     // With DIELECTRIC_FROST on a pixel whose dominant layer is rough transmission: half
     // floats of the blur its lobes give the background, as a radius in pixels (low), and of
     // the transmission's `guide_luminance` (high); 0 elsewhere.
     public uint frost;
+}
+
+// The dielectric dispatch's memory at G-buffer extent `extent`, from `LayerGuide*`: a guide
+// per pixel in rows of extent.x; then per LAYER_TILE tile, in rows, a word that is nonzero
+// where this frame's dispatch traced the tile and wrote its guides; then the tile indices it
+// traces; then their count, its compute workgroups and its ray extent.
+public uint* traced_tiles(LayerGuide* layers, uint2 extent)
+{
+    return (uint*)(layers + extent.x * extent.y);
+}
+
+public uint* layer_tile_list(LayerGuide* layers, uint2 extent)
+{
+    return traced_tiles(layers, extent) + layer_tile_count(extent);
+}
+
+public uint* layer_tile_args(LayerGuide* layers, uint2 extent)
+{
+    return layer_tile_list(layers, extent) + layer_tile_count(extent);
+}
+
+// The guide of `pixel` as this frame's dispatch left it; no layer where it did not trace.
+public LayerGuide layer_guide(LayerGuide* layers, uint2 extent, uint2 pixel)
+{
+    if (traced_tiles(layers, extent)[layer_tile(extent, pixel)] == 0)
+        return (LayerGuide)0;
+    return layers[pixel.y * extent.x + pixel.x];
 }
 
 // A path vertex: its surface, where the path came from and how rays leave it.

@@ -26,7 +26,8 @@ public static const uint COUNT_HIDDEN = 12;          // clusters both passes fou
 public static const uint COUNT_OPAQUE_BASE = 13;     // list entries the first pass drew
 public static const uint COUNT_ALPHA_BASE = 14;
 public static const uint COUNT_SOFTWARE_BASE = 15;
-public static const uint COUNTS = 16;
+public static const uint COUNT_COVERAGE = 16;        // visible dielectric and presence clusters
+public static const uint COUNTS = 17;
 
 // `RasterGpu.flags`.
 public static const uint RASTER_OCCLUSION = 1; // the first pass tests the previous frame's HZB
@@ -45,11 +46,12 @@ public struct RasterGpu
 {
     public GBufferGpu gbuffer;       // what later passes read
     public ClusterWork* work;        // what the second pass retests
-    public uint* args;               // workgroups x, y, z: work, opaque, alpha, software, particles
+    public uint* args;               // workgroups x, y, z: work, opaque, alpha, software, particles, coverage
     public uint* opaque;             // visible clusters with opaque triangles, hardware path
     public uint* alpha;              // visible clusters with alpha-tested triangles, hardware path
     public uint* software;           // visible clusters of the software raster
     public uint* particles;          // visible clusters of particle entries, for the transparency point
+    public uint* coverage;           // visible dielectric and presence clusters, for the layer tiles
     public uint* counts;             // COUNT_*
     public uint* slot_visibility;    // per instance slot: SLOT_*
     public uint* bin_args;           // per surface bin: x, y, z; then the resolve's sequence count
@@ -80,7 +82,8 @@ public static const uint ARGS_OPAQUE = 3;
 public static const uint ARGS_ALPHA = 6;
 public static const uint ARGS_SOFTWARE = 9;
 public static const uint ARGS_PARTICLES = 12;
-public static const uint ARGS = 15;
+public static const uint ARGS_COVERAGE = 15;
+public static const uint ARGS = 18;
 
 // Workgroup grids cover `n` groups in rows of GRID_X, the smallest maximum Vulkan allows.
 public static const uint GRID_X = 65535;
@@ -159,6 +162,16 @@ public bool sphere_visible(ViewConstants* v, float3 center, float radius)
             return false;
     }
     return true;
+}
+
+// Whether the sphere at eye-relative `center` of `radius` reaches the space between the eye
+// and the near plane, which the frustum test leaves out.
+public bool near_eye(ViewConstants* v, float3 center, float radius)
+{
+    float4x4 m = v.clip_from_view;
+    float near = m[2][3];
+    float corner = near * sqrt(1.0 + 1.0 / (m[0][0] * m[0][0]) + 1.0 / (m[1][1] * m[1][1]));
+    return length(center) - radius < 1.01 * corner;
 }
 
 // Pixel coordinates of clip-space `clip`, as the viewport places them.
