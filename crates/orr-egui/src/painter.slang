@@ -24,7 +24,7 @@ struct Root
     uint triangles;
     TextureIndex texture;
     SamplerIndex sampler;
-    // 1: the texture holds linear colour, encoded to sRGB after filtering; 0: it holds
+    // 1: the texture holds linear color, encoded to sRGB after filtering; 0: it holds
     // egui's sRGB-encoded bytes, filtered as they are.
     uint linear;
     uint _pad0;

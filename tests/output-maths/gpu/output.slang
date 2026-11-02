@@ -1,4 +1,4 @@
-// Calls orr-output's maths, so the build compiles them to SPIR-V (validated) and MSL under
+// Calls orr-output's math, so the build compiles it to SPIR-V (validated) and MSL under
 // the lints and generates the Rust layout of Gt7Curve.
 #include "orr/root.h"
 import gt7;

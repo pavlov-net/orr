@@ -1,4 +1,4 @@
-//! Compiles orr's maths libraries for the CPU through `slang/maths.slang`, and for SPIR-V
+//! Compiles orr's math libraries for the CPU through `slang/maths.slang`, and for SPIR-V
 //! and Metal through `gpu/maths.slang`, which calls every function under the lints.
 
 use std::path::PathBuf;

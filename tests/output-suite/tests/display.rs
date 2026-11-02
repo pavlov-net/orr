@@ -30,7 +30,7 @@ fn hdr_on(sdr_white_nits: f32) -> DisplayInfo {
 struct Renderer {
     kernels: OutputKernels,
     roots: Vec<ComposeRoot>,
-    /// A display-linear grey, smaller than the window: compose stretches its edge.
+    /// A display-linear gray, smaller than the window: compose stretches its edge.
     linear: (Texture, TextureIndex),
     frame: u64,
     last_present_id: u64,

@@ -81,7 +81,7 @@ fn meshes(rng: &mut Lcg) -> [(Vec<V3>, bool); 3] {
     }
     let mut leaves = Vec::new();
     for _ in 0..LEAVES {
-        let centre = loop {
+        let center = loop {
             let p = [
                 rng.range(-1.0, 1.0),
                 rng.range(-1.0, 1.0),
@@ -98,7 +98,7 @@ fn meshes(rng: &mut Lcg) -> [(Vec<V3>, bool); 3] {
         ]);
         let w = normalize(cross(u, [rng.range(-1.0, 1.0), 1.0, rng.range(-1.0, 1.0)]));
         let (u, v) = (scale(u, 0.6), scale(cross(w, u), 0.6));
-        let corner = |a: f32, b: f32| add(centre, add(scale(u, a - 0.5), scale(v, b - 0.5)));
+        let corner = |a: f32, b: f32| add(center, add(scale(u, a - 0.5), scale(v, b - 0.5)));
         let (c00, c10, c11, c01) = (
             corner(0.0, 0.0),
             corner(1.0, 0.0),

@@ -1,4 +1,4 @@
-// Specialisation constants with explicit ids; a literal workgroup size.
+// Specialization constants with explicit ids; a literal workgroup size.
 [vk::constant_id(0)] const uint GROUP_LIMIT = 64;
 [vk::constant_id(1)] const float SCALE = 1.5;
 [vk::constant_id(2)] const bool ALPHA_TEST = true;

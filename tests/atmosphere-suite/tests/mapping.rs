@@ -15,7 +15,7 @@ fn texels(size: [u32; 2]) -> u32 {
 }
 
 #[test]
-fn lut_parameterisations_round_trip() {
+fn lut_parameterizations_round_trip() {
     let atmosphere = Atmosphere::earth(DVec3::ZERO, Vec3::Y);
     let mut rig = Rig::new(&atmosphere);
     rig.frame(Some(dir(30.0, 0.0)), DVec3::new(0.0, 2.0, 0.0));
@@ -98,7 +98,7 @@ fn altitudes_against_f64() {
     let up = up.as_dvec3().normalize();
     let east = up.cross(DVec3::Z).normalize();
     let north = east.cross(up);
-    let centre = top - up * radius;
+    let center = top - up * radius;
 
     let mut world = Vec::new();
     for i in 0..=16 {
@@ -140,7 +140,7 @@ fn altitudes_against_f64() {
         let (mut plane, mut sphere) = (0.0f64, 0.0f64);
         for (p, o) in world.iter().zip(&out) {
             plane = plane.max((f64::from(o[0]) - (*p - top).dot(up)).abs());
-            sphere = sphere.max((f64::from(o[1]) - ((*p - centre).length() - radius)).abs());
+            sphere = sphere.max((f64::from(o[1]) - ((*p - center).length() - radius)).abs());
         }
         assert!(
             plane < 1.0 && sphere < 1.0,

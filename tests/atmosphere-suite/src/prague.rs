@@ -97,8 +97,8 @@ fn read(path: &Path) -> Vec<u8> {
     })
 }
 
-/// `name`'s initialiser in C++ source: everything between `=` and `;`.
-fn initialiser<'a>(src: &'a str, name: &str) -> &'a str {
+/// `name`'s initializer in C++ source: everything between `=` and `;`.
+fn initializer<'a>(src: &'a str, name: &str) -> &'a str {
     let start = src
         .find(&format!("double {name}"))
         .unwrap_or_else(|| panic!("{name} not in the model's source"));
@@ -156,10 +156,10 @@ impl Prague {
             r.skip(config_bytes * per_albedo * (albedos.len() - 1));
         }
 
-        let table = numbers(initialiser(source, "SUN_RAD_TABLE[]"));
-        let table_start = numbers(initialiser(source, "SUN_RAD_START"))[0];
-        assert_eq!(numbers(initialiser(source, "SUN_RAD_STEP")), [1.0]);
-        let sun_radius = numbers(initialiser(source, "SUN_RADIUS"))[0];
+        let table = numbers(initializer(source, "SUN_RAD_TABLE[]"));
+        let table_start = numbers(initializer(source, "SUN_RAD_START"))[0];
+        assert_eq!(numbers(initializer(source, "SUN_RAD_STEP")), [1.0]);
+        let sun_radius = numbers(initializer(source, "SUN_RADIUS"))[0];
         let disc = std::f64::consts::TAU * (1.0 - sun_radius.cos());
         let solar = (0..channels)
             .map(|c| {

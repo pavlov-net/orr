@@ -9,7 +9,7 @@ pub fn jitter_phases(render: [u32; 2], output: [u32; 2]) -> u32 {
 /// at index `frame % phases + 1`, minus 0.5.
 ///
 /// NGX's offset is the negative of the sample offset: the projection places each pixel's
-/// sample at the pixel centre minus this value on both axes, with y pointing down.
+/// sample at the pixel center minus this value on both axes, with y pointing down.
 pub fn jitter(frame: u64, phases: u32) -> [f32; 2] {
     let i = (frame % u64::from(phases)) as u32 + 1;
     [halton(i, 2) - 0.5, halton(i, 3) - 0.5]

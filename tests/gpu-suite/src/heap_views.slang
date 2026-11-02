@@ -1,5 +1,5 @@
 // Writes a pattern through a storage view, then point-samples it through a sampled view of
-// the same texture at texel centres.
+// the same texture at texel centers.
 #include "orr/root.h"
 import orr.abi;
 

@@ -80,7 +80,7 @@ pub fn chi_square_p(observed: &[f64], expected: &[f64]) -> f64 {
     gamma_q((cells - 1) as f64 / 2.0, stat / 2.0)
 }
 
-/// The regularised upper incomplete gamma function Q(a, x).
+/// The regularized upper incomplete gamma function Q(a, x).
 pub fn gamma_q(a: f64, x: f64) -> f64 {
     if x <= 0.0 {
         return 1.0;

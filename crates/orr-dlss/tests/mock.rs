@@ -1,4 +1,4 @@
-//! The `mock` backend: no features supported, and ray reconstruction upscales colour.
+//! The `mock` backend: no features supported, and ray reconstruction upscales color.
 #![cfg(feature = "mock")]
 
 mod harness;
@@ -61,7 +61,7 @@ fn mock_rr_upscales_color_bilinearly() {
 
     let got = f16_values(gpu.bytes(readback), (output[0] * output[1] * 4) as usize);
     for x in 0..output[0] {
-        // Pixel centres map through the 2x scale; the edges clamp.
+        // Pixel centers map through the 2x scale; the edges clamp.
         let src = ((x as f32 + 0.5) * 0.5 - 0.5).clamp(0.0, (render[0] - 1) as f32);
         let want = src / 16.0;
         let have = got[(x * 4) as usize];

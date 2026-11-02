@@ -40,13 +40,13 @@ float3 to_rec2020(AtmosphereGroups g, float3 v)
     return float3(dot(g.rec2020[0].xyz, v), dot(g.rec2020[1].xyz, v), dot(g.rec2020[2].xyz, v));
 }
 
-float3 light_groups(AtmosphereGroups g, float3 colour)
+float3 light_groups(AtmosphereGroups g, float3 color)
 {
-    return float3(dot(g.light_weight[0].xyz, colour), dot(g.light_weight[1].xyz, colour),
-                  dot(g.light_weight[2].xyz, colour));
+    return float3(dot(g.light_weight[0].xyz, color), dot(g.light_weight[1].xyz, color),
+                  dot(g.light_weight[2].xyz, color));
 }
 
-// The sample point and length of step i of n over [t0, t1], denser towards t0.
+// The sample point and length of step i of n over [t0, t1], denser toward t0.
 float2 step_at(float t0, float t1, uint i, uint n)
 {
     float u0 = float(i) / float(n);
@@ -216,7 +216,7 @@ void transmittance(uint3 id: SV_DispatchThreadID)
         lut[uint3(id.xy, p)] = float4(t, 1.0);
         rgb += to_rec2020(g, t);
     }
-    lut[uint3(id.xy, a.group_passes)] = float4(rgb / a.solar_colour.xyz, 1.0);
+    lut[uint3(id.xy, a.group_passes)] = float4(rgb / a.solar_color.xyz, 1.0);
 }
 
 static groupshared float3 second_order[64];
@@ -295,7 +295,7 @@ void multiple_scattering(uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
         GroupMemoryBarrierWithGroupSync();
     }
     if (lane == 0)
-        lut[uint3(group.xy, a.group_passes)] = float4(rgb / a.solar_colour.xyz, 1.0);
+        lut[uint3(group.xy, a.group_passes)] = float4(rgb / a.solar_color.xyz, 1.0);
 }
 
 static groupshared float3 irradiance[64];
@@ -442,21 +442,21 @@ void sky_view(uint3 id: SV_DispatchThreadID)
     float start = min(scene.near_range, end);
 
     FoldGpu* f = a.fold;
-    float3 colour[MAX_FOLDED_LIGHTS];
+    float3 color[MAX_FOLDED_LIGHTS];
     Lights lights;
     lights.count = f.folded_count;
     for (uint l = 0; l < lights.count; ++l)
     {
         uint slot = f.folded[l];
         lights.direction[l] = normalize(scene.lights[a.candidates[slot]].direction);
-        colour[l] = f.illuminance[slot].rgb * f.weight[slot];
+        color[l] = f.illuminance[slot].rgb * f.weight[slot];
     }
     float3 rgb = float3(0.0);
     for (uint p = 0; p < a.group_passes; ++p)
     {
         AtmosphereGroups g = a.groups[p];
         for (uint l = 0; l < lights.count; ++l)
-            lights.groups[l] = light_groups(g, colour[l]);
+            lights.groups[l] = light_groups(g, color[l]);
         rgb += to_rec2020(g, march(a, p, h0, dir, start, end, ground, SKY_VIEW_STEPS, lights,
                                    a.multiple_scattering_scale));
     }

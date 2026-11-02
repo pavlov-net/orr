@@ -189,7 +189,7 @@ fn sky_view_multiple_scattering_error() {
 /// atmosphere.
 #[test]
 fn ground_irradiance_below_top_of_atmosphere() {
-    let colour = solar_rec2020().map(|c| c as f32);
+    let color = solar_rec2020().map(|c| c as f32);
     for atmosphere in [earth(), foggy()] {
         let mut rig = Rig::new(&atmosphere);
         for elevation in [2.0, 5.0, 30.0, 60.0, 90.0] {
@@ -204,7 +204,7 @@ fn ground_irradiance_below_top_of_atmosphere() {
                     count: 1 << 16,
                     input: &[[0.0, 0.0, 0.0, 0.0]],
                     light: [sun.x as f32, sun.y as f32, sun.z as f32, 0.0],
-                    colour: [colour[0], colour[1], colour[2], 0.0],
+                    color: [color[0], color[1], color[2], 0.0],
                     ..Probe::default()
                 },
             );

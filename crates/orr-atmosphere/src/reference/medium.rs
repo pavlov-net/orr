@@ -311,14 +311,14 @@ impl Leg {
 }
 
 /// A ray in the local frame: the ground plane is y = 0 with +y up, and the planet's
-/// centre is at (0, -radius, 0).
+/// center is at (0, -radius, 0).
 #[derive(Clone, Copy)]
 pub(super) struct Ray {
     pub(super) origin: DVec3,
     pub(super) dir: DVec3,
     geometry: Geometry,
     radius: f64,
-    /// Origin relative to the planet centre.
+    /// Origin relative to the planet center.
     q: DVec3,
 }
 

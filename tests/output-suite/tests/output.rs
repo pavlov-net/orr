@@ -18,7 +18,7 @@ use output_maths::{encode_display, gt7_display_linear};
 const WIDTH: u32 = 1024;
 const EV100: f32 = 12.0;
 
-/// Linear Rec.2020 hues, one per row: grey, the Rec.2020 primaries and secondaries, the
+/// Linear Rec.2020 hues, one per row: gray, the Rec.2020 primaries and secondaries, the
 /// Rec.709 red and a warm tone.
 const HUES: [[f32; 3]; 8] = [
     [1.0, 1.0, 1.0],
@@ -170,7 +170,7 @@ fn reference(display: &ResolvedDisplay) -> Vec<[f32; 3]> {
 }
 
 /// How far a channel may differ in nits, as a fraction of the texel's brightest channel,
-/// where code values do not bound it. Channels near zero in saturated colours come out of
+/// where code values do not bound it. Channels near zero in saturated colors come out of
 /// cancellations: GT7's ICtCp step in f32 and Rec.709 to Rec.2020 in compose, which turns
 /// one RGBA16F step of the brightest Rec.709 channel (2^-11 of it) into up to 1e-3 of it.
 const NITS_TOLERANCE: f64 = 1e-3;
@@ -241,12 +241,12 @@ fn sdr_pq_and_scrgb_match_cpu_target() {
         .collect();
     let pq_nits = |v: f32| pq_decode(f64::from(v));
     check("PQ", &got, &reference(&pq), 1023.0, |_| 1.0, pq_nits);
-    // The brightest grey sits at the display's peak.
+    // The brightest gray sits at the display's peak.
     let peak = pq_encode(1000.0) as f32 * 1023.0;
     let white = got[WIDTH as usize - 1];
     assert!(
         white.iter().all(|&c| (c - peak).abs() < 1.0),
-        "PQ grey at 1e3 x paper white: {white:?}, peak code {peak}"
+        "PQ gray at 1e3 x paper white: {white:?}, peak code {peak}"
     );
 
     let scrgb = DisplayRequest {

@@ -1,4 +1,4 @@
-// C entry points over orr's maths libraries for the CPU tests. Vectors and matrices pass
+// C entry points over orr's math libraries for the CPU tests. Vectors and matrices pass
 // as float arrays; matrices are row-major.
 import orr.math;
 import orr.packing;

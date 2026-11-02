@@ -19,14 +19,14 @@ use output_suite::shaders::{dump, field_offset, hook_line, swirl};
 
 const OUT: [u32; 2] = [240, 136];
 const RENDER: [u32; 2] = [160, 68];
-/// No output pixel centre lands within 0.15 render pixels of a sample boundary.
+/// No output pixel center lands within 0.15 render pixels of a sample boundary.
 const JITTER: [f32; 2] = [0.3125, -0.4375];
 
 /// Reverse-Z depth of the render image: far geometry, with a near box.
 const FAR: f32 = 0.01;
 const NEAR: f32 = 0.5;
 const LINE_DEPTH: f32 = 0.1;
-const LINE_COLOUR: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
+const LINE_COLOR: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
 
 fn render_depth(x: u32, y: u32) -> f32 {
     if (50..110).contains(&x) && (20..45).contains(&y) {
@@ -41,7 +41,7 @@ fn render_motion(x: u32, y: u32) -> [f32; 2] {
     [x as f32 / 256.0, -(y as f32) / 512.0]
 }
 
-/// The render pixel whose jittered sample is nearest the centre of output pixel `p`.
+/// The render pixel whose jittered sample is nearest the center of output pixel `p`.
 fn render_pixel(p: [u32; 2]) -> [u32; 2] {
     std::array::from_fn(|a| {
         let at = (p[a] as f32 + 0.5) * RENDER[a] as f32 / OUT[a] as f32 + JITTER[a];
@@ -419,7 +419,7 @@ fn debug_line_is_hidden_by_nearer_geometry() {
             "motion at {p:?}"
         );
         let expected = if on_line(p) && line_visible(p) {
-            LINE_COLOUR
+            LINE_COLOR
         } else {
             radiance(p[0], p[1])
         };
@@ -434,7 +434,7 @@ fn debug_line_is_hidden_by_nearer_geometry() {
     for (i, p) in pixels(OUT).enumerate() {
         if on_line(p) {
             assert_eq!(
-                linear[i] == LINE_COLOUR,
+                linear[i] == LINE_COLOR,
                 line_visible(p),
                 "display_linear line at {p:?}"
             );

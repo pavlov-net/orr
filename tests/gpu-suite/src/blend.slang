@@ -1,4 +1,4 @@
-// A quad over the whole target in one constant colour, for blend and scissor checks.
+// A quad over the whole target in one constant color, for blend and scissor checks.
 #include "orr/root.h"
 
 struct Root

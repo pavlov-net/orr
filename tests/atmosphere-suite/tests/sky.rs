@@ -12,7 +12,7 @@ use orr::{DirectionalLight, DiscProfile, LightId};
 use orr_atmosphere::colour::{REC2020_TO_REC709, luminance, mul};
 use orr_atmosphere::presets::solar_disc;
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference};
-use orr_atmosphere::spectrum::{SOLAR_COLOUR, SOLAR_ILLUMINANCE};
+use orr_atmosphere::spectrum::{SOLAR_COLOR, SOLAR_ILLUMINANCE};
 use orr_atmosphere::{Atmosphere, FoldGpu, HeightFog, MAX_FOLDED_LIGHTS, SKY_VIEW_SIZE};
 use orr_lighting::ENVIRONMENT_SIZE;
 use orr_scene::testing::{assert_clean, read_buffer};
@@ -152,7 +152,7 @@ fn night_background() {
     let reference = Reference::new(&atmosphere);
     let groups = reference.run(Channels::Groups);
     let t = groups.rec2020(&groups.transmittance(EYE, DVec3::Y, NEAR_RANGE, Geometry::Sphere));
-    let ground = luminance(std::array::from_fn(|c| zenith[c] * t[c] / SOLAR_COLOUR[c]));
+    let ground = luminance(std::array::from_fn(|c| zenith[c] * t[c] / SOLAR_COLOR[c]));
     eprintln!("night zenith at the ground {ground:.4e} cd/m^2");
     assert!(
         (ground / 2e-4 - 1.0).abs() < 0.1,
@@ -258,9 +258,8 @@ fn composition_error(multiple: bool, precision: &Precision, eyes: &[DVec3]) -> f
                         groups.segment(eye, *d, NEAR_RANGE, &light, Geometry::Sphere, precision);
                     let near_inscatter = nits(&near.inscatter.values);
                     let t = groups.rec2020(&near.transmittance);
-                    let composed: [f64; 3] = std::array::from_fn(|c| {
-                        near_inscatter[c] + t[c] / SOLAR_COLOUR[c] * lut[c]
-                    });
+                    let composed: [f64; 3] =
+                        std::array::from_fn(|c| near_inscatter[c] + t[c] / SOLAR_COLOR[c] * lut[c]);
                     let y = luminance(full);
                     let error = (0..3)
                         .map(|c| (composed[c] - full[c]).abs() / full[c].abs().max(0.05 * y))
@@ -383,11 +382,11 @@ fn crossing_the_view_thresholds() {
     assert_clean();
 }
 
-/// A light of `colour` x the sun's illuminance from `direction`.
-fn tinted(direction: DVec3, colour: Vec3) -> DirectionalLight {
+/// A light of `color` x the sun's illuminance from `direction`.
+fn tinted(direction: DVec3, color: Vec3) -> DirectionalLight {
     let sun = solar_disc(direction.as_vec3());
     DirectionalLight {
-        illuminance: sun.illuminance * colour,
+        illuminance: sun.illuminance * color,
         ..sun
     }
 }

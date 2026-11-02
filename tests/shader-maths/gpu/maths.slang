@@ -1,4 +1,4 @@
-// Calls every function of orr's maths libraries, so the build compiles them to SPIR-V
+// Calls every function of orr's math libraries, so the build compiles them to SPIR-V
 // (validated) and MSL under the lints.
 #include "orr/root.h"
 import orr.math;
@@ -54,10 +54,10 @@ void main(uint3 id: SV_DispatchThreadID)
     float3 c = mul(REC2020_TO_REC709, mul(P3_TO_REC2020, mul(XYZ_TO_P3, mul(REC709_TO_XYZ, abs(n)))));
     c = mul(XYZ_TO_REC709, mul(REC2020_TO_XYZ, mul(REC709_TO_REC2020, gamut_compress(c))));
     c = mul(XYZ_TO_REC2020, mul(P3_TO_XYZ, mul(REC2020_TO_P3, c)));
-    float3 colour = srgb_decode(srgb_encode(c)) + pq_decode(pq_encode(c)) + rec2020_from_ictcp(ictcp_from_rec2020(c))
+    float3 color = srgb_decode(srgb_encode(c)) + pq_decode(pq_encode(c)) + rec2020_from_ictcp(ictcp_from_rec2020(c))
         + luminance_rec709(c) + luminance_rec2020(c);
 
     float4 hashes = float4(pcg4d(uint4(id, 1))) + float4(r2(id.x), owen_sobol4(id.x, hash_combine(id.y, 3)).xy)
         + float4(unit_float(pcg(id.x)), float(sobol(id.x, 2)), float(nested_uniform_scramble(id.x, 9)), s.next());
-    root.out[id.x] = float4(world + packed + sampled + colour, PI) + hashes;
+    root.out[id.x] = float4(world + packed + sampled + color, PI) + hashes;
 }

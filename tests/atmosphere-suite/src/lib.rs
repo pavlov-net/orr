@@ -14,7 +14,7 @@ use orr::{
     SceneId, SceneRoot,
 };
 use orr_atmosphere::presets::solar_disc;
-use orr_atmosphere::spectrum::{SOLAR_COLOUR, SOLAR_ILLUMINANCE};
+use orr_atmosphere::spectrum::{SOLAR_COLOR, SOLAR_ILLUMINANCE};
 use orr_atmosphere::{Atmosphere, AtmosphereGpu, AtmosphereState, MAX_EXTRA_VIEWS};
 use orr_lighting::{LightingStats, SceneLighting, SceneLightingSettings, ScenePass};
 use orr_scene::testing::{device, read_buffer, wait};
@@ -43,7 +43,7 @@ pub fn dir(elevation: f64, azimuth: f64) -> DVec3 {
 
 /// The sun above the atmosphere: Rec.2020 lux.
 pub fn solar_rec2020() -> [f64; 3] {
-    SOLAR_COLOUR.map(|c| c * SOLAR_ILLUMINANCE)
+    SOLAR_COLOR.map(|c| c * SOLAR_ILLUMINANCE)
 }
 
 /// A renderer with orr's kernels linked to the sky, one scene and one atmosphere whose
@@ -210,7 +210,7 @@ pub struct Probe<'a> {
     pub input: &'a [[f32; 4]],
     pub layer: u32,
     pub light: [f32; 4],
-    pub colour: [f32; 4],
+    pub color: [f32; 4],
     /// Lighting's light set.
     pub set: u64,
 }
@@ -244,7 +244,7 @@ pub fn probe(
         count: p.count,
         layer: p.layer,
         light: p.light,
-        colour: p.colour,
+        color: p.color,
         set: p.set,
         _pad0: 0,
     };

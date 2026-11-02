@@ -9,17 +9,17 @@ use orr::abi::TextureIndex;
 use orr::{DirectionalLight, DiscProfile, LightId};
 
 use crate::colour::{REC709_TO_REC2020, REC2020_TO_REC709, luminance, mul};
-use crate::spectrum::{SOLAR_COLOUR, SOLAR_ILLUMINANCE, SPECTRAL};
+use crate::spectrum::{SOLAR_COLOR, SOLAR_ILLUMINANCE, SPECTRAL};
 
 /// Angular radius of the solar disc, rad.
 pub const SOLAR_ANGULAR_RADIUS: f32 = 4.652e-3;
 
 /// A sun: a limb-darkened disc of [`SOLAR_ANGULAR_RADIUS`] giving the solar spectrum's
-/// top-of-atmosphere illuminance (132.6 klx) in its colour.
+/// top-of-atmosphere illuminance (132.6 klx) in its color.
 pub fn solar_disc(direction_to_light: Vec3) -> DirectionalLight {
     let rec709 = mul(
         &REC2020_TO_REC709,
-        SOLAR_COLOUR.map(|c| c * SOLAR_ILLUMINANCE),
+        SOLAR_COLOR.map(|c| c * SOLAR_ILLUMINANCE),
     );
     DirectionalLight {
         direction_to_light: direction_to_light.normalize(),
@@ -42,8 +42,8 @@ pub fn lunar_reflectance(lambda: f64) -> f64 {
     1.0 + 1.47e-3 * (lambda - 590.0)
 }
 
-/// Moonlight's colour, linear Rec.2020 per lux (luminance 1).
-pub fn lunar_colour() -> [f64; 3] {
+/// Moonlight's color, linear Rec.2020 per lux (luminance 1).
+pub fn lunar_color() -> [f64; 3] {
     let mut c = [0.0; 3];
     for (w, lambda) in SPECTRAL.rec2020.iter().zip(SPECTRAL.wavelength) {
         for (c, w) in c.iter_mut().zip(w) {
@@ -54,11 +54,11 @@ pub fn lunar_colour() -> [f64; 3] {
     c.map(|c| c / y)
 }
 
-/// A lunar albedo texture's colour, linear Rec.2020 as a `Textured` disc reads it: mean
-/// [`LUNAR_ALBEDO`] under sunlight, coloured so a sunlit disc emits [`lunar_colour`].
+/// A lunar albedo texture's color, linear Rec.2020 as a `Textured` disc reads it: mean
+/// [`LUNAR_ALBEDO`] under sunlight, colored so a sunlit disc emits [`lunar_color`].
 pub fn lunar_albedo() -> [f64; 3] {
-    let c = lunar_colour();
-    std::array::from_fn(|i| LUNAR_ALBEDO * c[i] / SOLAR_COLOUR[i])
+    let c = lunar_color();
+    std::array::from_fn(|i| LUNAR_ALBEDO * c[i] / SOLAR_COLOR[i])
 }
 
 /// The Moon's disc-equivalent reflectance at phase angle `alpha` (deg): Krisciunas and
@@ -100,7 +100,7 @@ pub fn lunar_disc(
         let alpha = 180.0 - cos.clamp(-1.0, 1.0).acos().to_degrees();
         lux += e * solid_angle * lunar_phase(alpha) / PI;
     }
-    let rec709 = mul(&REC2020_TO_REC709, lunar_colour().map(|c| c * lux));
+    let rec709 = mul(&REC2020_TO_REC709, lunar_color().map(|c| c * lux));
     DirectionalLight {
         direction_to_light: direction,
         illuminance: Vec3::from(rec709.map(|c| c as f32)),

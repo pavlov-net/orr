@@ -55,11 +55,11 @@ pub fn enable_features(vulkan_1_4: &mut vk::PhysicalDeviceVulkan14Features<'_>) 
     vulkan_1_4.push_descriptor = vk::TRUE;
 }
 
-/// NGX initialised on one device.
+/// NGX initialized on one device.
 pub struct Ngx(imp::Ngx);
 
 impl Ngx {
-    /// Initialises NGX with the application's project ID.
+    /// Initializes NGX with the application's project ID.
     ///
     /// # Safety
     ///
@@ -155,7 +155,7 @@ pub struct RrInputs<'a> {
     pub normal_roughness: &'a Image,
     /// Motion of reflected surfaces, in the same units as `motion`.
     pub specular_motion: &'a Image,
-    /// Premultiplied colour with coverage in alpha, composited after denoising.
+    /// Premultiplied color with coverage in alpha, composited after denoising.
     pub transparency: Option<&'a Image>,
     pub depth_of_field_guide: Option<&'a Image>,
     pub output: &'a Image,

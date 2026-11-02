@@ -1,4 +1,4 @@
-//! orr-output's Slang maths compiled for the CPU (`slang/output.slang`), with safe wrappers
+//! orr-output's Slang math compiled for the CPU (`slang/output.slang`), with safe wrappers
 //! for the tests, and Polyphony's GT7 sample as the reference.
 
 use orr_output::{Gt7Curve, OutputFormat};

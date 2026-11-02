@@ -299,7 +299,7 @@ fn white_furnace() {
 /// `bsdf_collapse` keeps the directional albedo of the full lobes within 2%.
 #[test]
 fn collapse_keeps_the_directional_albedo() {
-    let coloured = Inputs {
+    let colored = Inputs {
         base_color: [0.5, 0.2, 0.1],
         coat_weight: 1.0,
         coat_roughness: 0.1,
@@ -312,7 +312,7 @@ fn collapse_keeps_the_directional_albedo() {
         .into_iter()
         .filter(|m| m.inputs.coat_weight > 0.0 || m.inputs.fuzz_weight > 0.0)
         .map(|m| (m.name, m.inputs))
-        .chain([("coloured coat and fuzz", coloured)])
+        .chain([("colored coat and fuzz", colored)])
         .collect();
     let (mut full, mut collapsed) = (RealTime::new(), RealTime::collapsed());
     let mut failures = Vec::new();

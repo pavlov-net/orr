@@ -1,6 +1,6 @@
 [package]
 name = "shader-maths"
-description = "orr's Slang maths libraries compiled for the CPU and checked against references."
+description = "orr's Slang math libraries compiled for the CPU and checked against references."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

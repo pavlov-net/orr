@@ -1,7 +1,7 @@
 #![allow(clippy::print_stderr)]
 
 //! `lunar_disc` against ROLO's level and the reference: a Lambertian disc of the lunar albedo
-//! at 5 deg phase, a high moon's illuminance at the ground, and the moonlit sky's colour.
+//! at 5 deg phase, a high moon's illuminance at the ground, and the moonlit sky's color.
 
 use atmosphere_suite::{Probe, Rig, SUN, dir, probe, sky_radiance, uniform_texture};
 use glam::{DVec3, Vec3};
@@ -53,8 +53,8 @@ fn lunar_albedo_matches_the_phase_curve() {
     );
     let curve_lux = luminance(rec2020(&curve));
 
-    let grey = LUNAR_ALBEDO as f32;
-    let albedo = uniform_texture([grey, grey, grey, 1.0], "lunar albedo");
+    let gray = LUNAR_ALBEDO as f32;
+    let albedo = uniform_texture([gray, gray, gray, 1.0], "lunar albedo");
     let lambertian = DirectionalLight {
         illuminance: Vec3::ZERO,
         disc: DiscProfile::Textured {
@@ -139,11 +139,11 @@ fn high_moon_at_the_ground() {
     assert_clean();
 }
 
-/// The sky lit by the moon alone has the colour of the spectral reference lit by the lunar
+/// The sky lit by the moon alone has the color of the spectral reference lit by the lunar
 /// spectrum: the solar-weighted groups hold for moonlight. Single scattering on both sides
 /// (the multiple-scattering model's error is atmosphere.md 6's), no night background.
 #[test]
-fn moonlit_sky_colour() {
+fn moonlit_sky_color() {
     let atmosphere = Atmosphere {
         night_background: false,
         ..earth()

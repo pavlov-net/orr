@@ -1,4 +1,4 @@
-// A screen warp: rotates the source about the image centre by an angle that falls to zero
+// A screen warp: rotates the source about the image center by an angle that falls to zero
 // at `radius`, sampled bilinearly with clamped edges.
 #include "orr/root.h"
 import orr.abi;

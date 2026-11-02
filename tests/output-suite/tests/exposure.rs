@@ -27,20 +27,20 @@ fn settle(h: &mut Harness, scale: f32, output: &ViewOutput) -> ExposureTelemetry
 }
 
 /// Exposed stops away from MID_GREY of luminance `nits` at telemetry `t`.
-fn stops_from_mid_grey(nits: f32, t: &ExposureTelemetry) -> f32 {
+fn stops_from_mid_gray(nits: f32, t: &ExposureTelemetry) -> f32 {
     (nits * exposure_from_ev100(t.adapted_ev100) / MID_GREY).log2()
 }
 
 #[test]
-fn uniform_field_converges_to_mid_grey_after_a_cut() {
+fn uniform_field_converges_to_mid_gray_after_a_cut() {
     let mut h = Harness::new(SIDE, SIDE);
     // Alternating extremes, so a cut's first frame is lit with a pre-exposure many stops off:
     // the bright scenes clip at the HDR ceiling and the dark ones underflow RGBA16F.
     for nits in [1e-4f32, 1e5, 1e-2, 1e3, 1e-3, 1e4, 0.1, 100.0, 1.0, 10.0] {
         h.set_image(&vec![nits; h.pixels()]);
         let t = settle(&mut h, 1.0, &ViewOutput::default());
-        let off = stops_from_mid_grey(nits, &t);
-        assert!(off.abs() < 0.01, "{nits} cd/m2: {off} stops from mid grey");
+        let off = stops_from_mid_gray(nits, &t);
+        assert!(off.abs() < 0.01, "{nits} cd/m2: {off} stops from mid gray");
     }
     assert_clean();
 }
@@ -48,7 +48,7 @@ fn uniform_field_converges_to_mid_grey_after_a_cut() {
 #[test]
 fn bright_and_dark_scenes_fit_rgba16f() {
     let mut h = Harness::new(SIDE, SIDE);
-    // Grey cards under 100,000 lux and 0.1 lux, spread +-8 stops.
+    // Gray cards under 100,000 lux and 0.1 lux, spread +-8 stops.
     for lux in [1e5f32, 0.1] {
         let card = MID_GREY * lux / std::f32::consts::PI;
         let nits = natural_image(h.pixels(), ev100_from_luminance(card), 2.0);
@@ -67,7 +67,7 @@ fn bright_and_dark_scenes_fit_rgba16f() {
 }
 
 #[test]
-fn black_first_frames_do_not_initialise() {
+fn black_first_frames_do_not_initialize() {
     let mut h = Harness::new(SIDE, SIDE);
     let nits = 50.0;
     h.set_image(&vec![nits; h.pixels()]);
@@ -82,8 +82,8 @@ fn black_first_frames_do_not_initialise() {
     let t = h.frame(1.0, &auto, None);
     assert_eq!(t.adapted_ev100, t.target_ev100);
     let t = h.frame(1.0, &auto, None);
-    let off = stops_from_mid_grey(nits, &t);
-    assert!(off.abs() < 0.01, "{off} stops from mid grey");
+    let off = stops_from_mid_gray(nits, &t);
+    assert!(off.abs() < 0.01, "{off} stops from mid gray");
     assert_clean();
 }
 
@@ -134,7 +134,7 @@ fn adaptation_follows_the_analytic_curve() {
     assert_clean();
 }
 
-fn grey_sky(dome_ev100: f32, card_ev100: f32) -> SkyStats {
+fn gray_sky(dome_ev100: f32, card_ev100: f32) -> SkyStats {
     let illuminance = luminance_from_ev100(card_ev100) * std::f32::consts::PI / MID_GREY;
     SkyStats {
         dome_luminance: luminance_from_ev100(dome_ev100),
@@ -151,7 +151,7 @@ fn references_match_the_cpu_mix() {
     let metered = window_mean_ev100(&nits, FILTER);
     h.set_image(&nits);
     let (dome, card) = (14.0f32, 4.0f32);
-    let sky = grey_sky(dome, card);
+    let sky = gray_sky(dome, card);
     h.set_sky(sky);
     let weights = MeterWeights {
         histogram: 1.0,
@@ -305,7 +305,7 @@ fn debug_views() {
     let nits = 100.0f32;
     h.set_image(&vec![nits; h.pixels()]);
     let display = DisplayRequest::default().resolve(&[OutputFormat::Hdr10Pq], None, false);
-    // Half a stop above mid grey: an eighth of the way from green to red, at 85%.
+    // Half a stop above mid gray: an eighth of the way from green to red, at 85%.
     let ev100 = ev100_from_exposure(MID_GREY * 0.5f32.exp2() / nits);
     let heatmap = ViewOutput {
         exposure: Exposure::Manual { ev100 },

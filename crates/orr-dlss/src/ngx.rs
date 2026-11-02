@@ -298,7 +298,7 @@ impl Ngx {
         };
         check("NVSDK_NGX_VULKAN_Init_with_ProjectID", r)?;
         let mut caps = ptr::null_mut();
-        // SAFETY: NGX is initialised.
+        // SAFETY: NGX is initialized.
         let r = unsafe { NVSDK_NGX_VULKAN_GetCapabilityParameters(&mut caps) };
         let this = Self {
             device,
@@ -551,7 +551,7 @@ impl Upscale {
             return Err(DlssError::Unsupported(upscaler.name()));
         }
         let mut params = ptr::null_mut();
-        // SAFETY: NGX is initialised.
+        // SAFETY: NGX is initialized.
         check("NVSDK_NGX_VULKAN_AllocateParameters", unsafe {
             NVSDK_NGX_VULKAN_AllocateParameters(&mut params)
         })?;
@@ -820,7 +820,7 @@ impl Fg {
             return Err(DlssError::Unsupported("frame generation"));
         }
         let mut params = ptr::null_mut();
-        // SAFETY: NGX is initialised.
+        // SAFETY: NGX is initialized.
         check("NVSDK_NGX_VULKAN_AllocateParameters", unsafe {
             NVSDK_NGX_VULKAN_AllocateParameters(&mut params)
         })?;

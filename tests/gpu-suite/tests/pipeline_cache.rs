@@ -32,7 +32,7 @@ fn open(path: &Path) -> Device {
     .unwrap()
 }
 
-/// One pipeline of each kind, all specialised on `value`.
+/// One pipeline of each kind, all specialized on `value`.
 struct Set {
     value: u32,
     compute: ComputePipeline,

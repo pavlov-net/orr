@@ -638,7 +638,7 @@ fn raygen_and_compute_entries_trace_one_ptlas() {
     assert_clean();
 }
 
-/// Even layers of a stack are half-transparent grey, odd ones pass; an opaque triangle sits
+/// Even layers of a stack are half-transparent gray, odd ones pass; an opaque triangle sits
 /// in the stack's left half behind at most four layers.
 fn candidate_scene() -> (Cluster, Cluster) {
     let n = 11;

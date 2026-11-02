@@ -1,6 +1,6 @@
 // Cost of `orr.openpbr` on the GPU: every thread prepares a material seen from a random view
 // above the surface, then makes `calls` calls of eval, sample or both on random numbers and
-// writes a sum of the results so that no call is optimised away.
+// writes a sum of the results so that no call is optimized away.
 #include "orr/root.h"
 import orr.openpbr;
 import orr.random;
@@ -15,7 +15,7 @@ struct Root
     Inputs* materials;
     float* sink;
     uint material_count;
-    // Whole 64-thread groups share a material when nonzero; otherwise neighbouring threads
+    // Whole 64-thread groups share a material when nonzero; otherwise neighboring threads
     // take different ones.
     uint coherent;
     uint calls;

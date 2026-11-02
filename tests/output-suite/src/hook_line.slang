@@ -16,7 +16,7 @@ struct Root
 }
 ORR_ROOT(Root);
 
-static const float4 LINE_COLOUR = float4(1.0, 0.0, 1.0, 1.0);
+static const float4 LINE_COLOR = float4(1.0, 0.0, 1.0, 1.0);
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -26,5 +26,5 @@ void main(uint3 id: SV_DispatchThreadID)
         return;
     float depth = root.depth.get<Texture2D<float>>().Load(int3(id.xy, 0));
     if (root.line_depth >= depth)
-        root.image.get<RWTexture2D<float4>>()[id.xy] = LINE_COLOUR;
+        root.image.get<RWTexture2D<float4>>()[id.xy] = LINE_COLOR;
 }

@@ -26,7 +26,7 @@ struct Root
 }
 ORR_ROOT(Root);
 
-// Even primitives are half-transparent grey layers, odd ones pass through.
+// Even primitives are half-transparent gray layers, odd ones pass through.
 struct Layers : ICandidate, ITranslucent
 {
     bool positions(Candidate c)

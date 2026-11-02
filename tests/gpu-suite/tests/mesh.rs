@@ -1,4 +1,4 @@
-//! Mesh pipelines: a G-buffer pass against a CPU rasteriser, blending and scissors.
+//! Mesh pipelines: a G-buffer pass against a CPU rasterizer, blending and scissors.
 
 use gpu_suite::shaders::{blend, gbuffer, tiles};
 use gpu_suite::{assert_clean, device, readback, render, run, upload};
@@ -58,8 +58,8 @@ fn triangles() -> Vec<gbuffer::Triangle> {
         .collect()
 }
 
-/// The front-most visible triangle at each pixel centre: `Some(None)` for background,
-/// `None` where a pixel centre lies within 0.01 px of a visible triangle's edge.
+/// The front-most visible triangle at each pixel center: `Some(None)` for background,
+/// `None` where a pixel center lies within 0.01 px of a visible triangle's edge.
 fn reference(tris: &[gbuffer::Triangle]) -> Vec<Option<Option<usize>>> {
     let to_px = |v: [f32; 4]| [(v[0] + 1.0) * 0.5 * W as f32, (v[1] + 1.0) * 0.5 * H as f32];
     let mut out = vec![Some(None); (W * H) as usize];

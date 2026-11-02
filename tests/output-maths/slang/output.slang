@@ -1,4 +1,4 @@
-// C entry points over orr-output's maths for the CPU tests.
+// C entry points over orr-output's math for the CPU tests.
 import gt7;
 import exposure;
 import display;

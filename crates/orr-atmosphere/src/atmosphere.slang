@@ -1,5 +1,5 @@
 // Planetary sky and atmosphere: the data block every atmosphere pass reads, its geometry,
-// the LUT parameterisations and lookups.
+// the LUT parameterizations and lookups.
 //
 // Two altitudes exist. The medium's is height above the flat ground plane through the
 // planet top point. The LUTs are spherical: each sits at one altitude above the sphere of
@@ -74,12 +74,12 @@ public struct AtmosphereGpu
     // Sky irradiance on the ground per unit spectral irradiance of a light: entry
     // `i * group_passes + pass` for the light's zenith cosine -1 + 2 i / (GROUND_SIZE - 1).
     public float4* ground_irradiance;
-    // The planet top point: whole metres and the rest.
-    public int4 top_metres;
+    // The planet top point: whole meters and the rest.
+    public int4 top_meters;
     public float4 top_offset;
     public float4 up;
     // Linear Rec.2020 of sunlight above the atmosphere, luminance 1.
-    public float4 solar_colour;
+    public float4 solar_color;
     // The medium's three solar-weighted Rec.2020 bands, in the units of `AtmosphereGroups`.
     public float4 rayleigh;
     public float4 aerosol_extinction;
@@ -133,7 +133,7 @@ public SceneRoot* atmosphere_scene(AtmosphereGpu* a)
 public float3 atmosphere_top_render(AtmosphereGpu* a)
 {
     int4 origin = atmosphere_scene(a).origin_cell;
-    return float3(a.top_metres.xyz - (origin.xyz << origin.w)) + a.top_offset.xyz;
+    return float3(a.top_meters.xyz - (origin.xyz << origin.w)) + a.top_offset.xyz;
 }
 
 // Height above the ground plane.
@@ -142,7 +142,7 @@ public float atmosphere_altitude(AtmosphereGpu* a, float3 p_render)
     return dot(p_render - atmosphere_top_render(a), a.up.xyz);
 }
 
-// Height above the sphere, in a form that keeps render-space precision far from the centre.
+// Height above the sphere, in a form that keeps render-space precision far from the center.
 public float atmosphere_spherical_altitude(AtmosphereGpu* a, float3 p_render)
 {
     float3 q = p_render - atmosphere_top_render(a);
@@ -245,7 +245,7 @@ float chapman_up(float r, float mu, float scale)
 }
 
 // Altitude of the lowest point of the ray from altitude h along zenith cosine mu < 0, where
-// it is tangent to a sphere about the planet centre.
+// it is tangent to a sphere about the planet center.
 public float atmosphere_tangent_altitude(AtmosphereGpu* a, float h, float mu)
 {
     float r = a.planet_radius + h;
@@ -272,8 +272,8 @@ public float atmosphere_fog_optical_depth_to_space(AtmosphereGpu* a, float h, fl
         - here * chapman_up(r, -mu, scale);
 }
 
-// LUT parameterisations. Each maps a point to unit coordinates in [0, 1]^2 whose texel
-// centres sit at 0 and 1; `lut_coord` turns them into texture coordinates.
+// LUT parameterizations. Each maps a point to unit coordinates in [0, 1]^2 whose texel
+// centers sit at 0 and 1; `lut_coord` turns them into texture coordinates.
 
 public float2 atmosphere_lut_coord(float2 unit, uint2 size)
 {
@@ -322,7 +322,7 @@ public void atmosphere_multiple_scattering_point(AtmosphereGpu* a, float2 unit, 
     h = unit.y * (a.top_radius - a.planet_radius);
 }
 
-// The sky-view LUT's frame: zenith `up`, longitude measured from `t` towards `b`.
+// The sky-view LUT's frame: zenith `up`, longitude measured from `t` toward `b`.
 void sky_view_frame(AtmosphereGpu* a, out float3 t, out float3 b)
 {
     orthonormal_basis(a.up.xyz, t, b);
@@ -335,7 +335,7 @@ float horizon_zenith_angle(AtmosphereGpu* a, float h)
 }
 
 // Sky-view texture coordinates of `dir` from a LUT eye at altitude h. Latitude is warped
-// quadratically towards the horizon, which sits at v = 0.5 between two rows; longitude is
+// quadratically toward the horizon, which sits at v = 0.5 between two rows; longitude is
 // absolute and wraps.
 public float2 atmosphere_sky_view_uv(AtmosphereGpu* a, float h, float3 dir)
 {
@@ -452,7 +452,7 @@ float3 sky_view_lookup(AtmosphereGpu* a, uint i, float3 dir)
 static const float AIRGLOW_ALTITUDE = 90000.0;
 
 // Night background radiance before extinction seen from altitude h above the sphere along
-// zenith cosine mu, nits of a neutral colour: two thirds airglow from a thin layer with van
+// zenith cosine mu, nits of a neutral color: two thirds airglow from a thin layer with van
 // Rhijn brightening toward the horizon, one third zodiacal light and starlight, uniform.
 public float atmosphere_night_background(AtmosphereGpu* a, float h, float mu)
 {

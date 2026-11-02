@@ -322,7 +322,7 @@ fn small_float(v: u32, m: u32) -> f64 {
 }
 
 #[test]
-fn packed_float_colour_round_trips() {
+fn packed_float_color_round_trips() {
     // Every finite code decodes to its value and encodes back to itself.
     for c in 0..(31u32 << 6) {
         let p = c | c << 11 | (c >> 1) << 22;

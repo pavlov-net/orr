@@ -69,9 +69,9 @@ fn no_sky() -> SkyStats {
 }
 
 #[test]
-fn tungsten_lit_grey_shows_as_d65() {
+fn tungsten_lit_gray_shows_as_d65() {
     let mut h = Harness::new(SIDE, SIDE);
-    h.colour = rec2020_from_xy(A_XY);
+    h.color = rec2020_from_xy(A_XY);
     let nits = 100.0;
     h.set_image(&vec![nits; h.pixels()]);
     let display = hdr();
@@ -82,7 +82,7 @@ fn tungsten_lit_grey_shows_as_d65() {
             ..balanced(AutoWhiteBalance::default())
         };
         let t = settle(&mut h, &output, &display);
-        let model = white_target(&[(nits, h.colour)], FILTER, HISTOGRAM_ONLY, 1.0, &no_sky());
+        let model = white_target(&[(nits, h.color)], FILTER, HISTOGRAM_ONLY, 1.0, &no_sky());
         let white = xy(t.white_point_xy);
         assert!(distance(white, model) < 5e-4, "{white:?} against {model:?}");
         for p in h.display_linear() {
@@ -102,17 +102,17 @@ fn d65_field_is_left_unchanged() {
         [0.0, 0.0, 1.0],
         [1.0, 0.6, 0.4],
     ];
-    // Grey at 100 cd/m2, and in the top 5% of luminance (outside the filter) saturated
-    // colours, which show whether the matrix is the identity.
-    let coloured = h.pixels() / 20;
+    // Gray at 100 cd/m2, and in the top 5% of luminance (outside the filter) saturated
+    // colors, which show whether the matrix is the identity.
+    let colored = h.pixels() / 20;
     let mut nits = vec![100.0; h.pixels()];
-    let mut colours = vec![[1.0; 3]; h.pixels()];
-    for i in 0..coloured {
+    let mut colors = vec![[1.0; 3]; h.pixels()];
+    for i in 0..colored {
         nits[i] = 1000.0;
-        colours[i] = hues[i % hues.len()];
+        colors[i] = hues[i % hues.len()];
     }
     h.set_image(&nits);
-    h.set_colours(Some(&colours));
+    h.set_colors(Some(&colors));
     let display = hdr();
     let output = balanced(AutoWhiteBalance::default());
     let plain = ViewOutput {
@@ -149,10 +149,10 @@ fn white_point_and_correction_match_the_cpu_model() {
     ];
     for field in fields {
         let field = xy(field);
-        h.colour = rec2020_from_xy(field);
+        h.color = rec2020_from_xy(field);
         h.set_image(&vec![100.0; h.pixels()]);
         let t = settle(&mut h, &balanced(AutoWhiteBalance::default()), &display);
-        let model = white_target(&[(100.0, h.colour)], FILTER, HISTOGRAM_ONLY, 1.0, &no_sky());
+        let model = white_target(&[(100.0, h.color)], FILTER, HISTOGRAM_ONLY, 1.0, &no_sky());
         let white = xy(t.white_point_xy);
         assert!(distance(white, model) < 5e-4, "{white:?} against {model:?}");
         let (cct, duv) = cct_duv_from_xy(t.white_point_xy);
@@ -162,7 +162,7 @@ fn white_point_and_correction_match_the_cpu_model() {
         assert!(on_bound, "{field:?} held at {cct} K, Duv {duv}");
     }
 
-    // Four patches of their own colour and luminance, with the sky's dome and directional
+    // Four patches of their own color and luminance, with the sky's dome and directional
     // light mixed in.
     let patches = [
         (30.0f32, xy_from_cct_duv(2700.0, 0.004)),
@@ -176,7 +176,7 @@ fn white_point_and_correction_match_the_cpu_model() {
     };
     let pixels: Vec<(f32, [f32; 3])> = (0..h.pixels()).map(pixel).collect();
     h.set_image(&pixels.iter().map(|p| p.0).collect::<Vec<_>>());
-    h.set_colours(Some(&pixels.iter().map(|p| p.1).collect::<Vec<_>>()));
+    h.set_colors(Some(&pixels.iter().map(|p| p.1).collect::<Vec<_>>()));
     let sun = rec2020_from_xy(xy(xy_from_cct_duv(5000.0, 0.0))).map(|c| 5e4 * c);
     let sky = SkyStats {
         dome_luminance: 3000.0,
@@ -204,8 +204,8 @@ fn white_point_and_correction_match_the_cpu_model() {
     let m = cat16_rec2020(got, d65());
     let s = f64::from(exposure_from_ev100(t.adapted_ev100));
     let image = h.display_linear();
-    for (p, (nits, colour)) in image.iter().zip(&pixels) {
-        let exposed = colour.map(|c| f64::from(c * nits) * s);
+    for (p, (nits, color)) in image.iter().zip(&pixels) {
+        let exposed = color.map(|c| f64::from(c * nits) * s);
         let want = mul3(&REC2020_TO_XYZ, mul3(&m, exposed));
         let shown = shown_xyz(*p);
         for c in 0..3 {
@@ -231,7 +231,7 @@ fn white_point_adapts_at_its_speed_holds_in_the_dark_and_snaps_on_a_cut() {
     let mut prev = settle(&mut h, &output, &display);
     assert!(distance(xy(prev.white_point_xy), d65()) < 1e-4);
 
-    h.colour = rec2020_from_xy(A_XY);
+    h.color = rec2020_from_xy(A_XY);
     let k = 1.0 - (-f64::from(speed * h.dt)).exp();
     for f in 0..30 {
         let t = h.frame(1.0, &output, Some(&display));
@@ -255,7 +255,7 @@ fn white_point_adapts_at_its_speed_holds_in_the_dark_and_snaps_on_a_cut() {
     let t = h.frame(0.0, &output, Some(&display));
     assert_eq!(t.white_point_xy, prev.white_point_xy);
 
-    h.colour = [1.0; 3];
+    h.color = [1.0; 3];
     let cut = ViewOutput {
         cut: true,
         ..output.clone()

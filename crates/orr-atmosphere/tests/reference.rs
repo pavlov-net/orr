@@ -3,7 +3,7 @@
 use glam::{DVec3, Vec3};
 use orr_atmosphere::colour::{REC2020_TO_XYZ, delta_uv, mul};
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference, Run};
-use orr_atmosphere::spectrum::{SOLAR_COLOUR, SOLAR_ILLUMINANCE};
+use orr_atmosphere::spectrum::{SOLAR_COLOR, SOLAR_ILLUMINANCE};
 use orr_atmosphere::{Aerosol, Atmosphere, HeightFog};
 
 fn earth() -> Atmosphere {
@@ -20,8 +20,8 @@ fn dir(elevation: f64, azimuth: f64) -> DVec3 {
 fn solar_illuminance_from_spectrum() {
     let error = (SOLAR_ILLUMINANCE - 132_600.0).abs() / 132_600.0;
     assert!(error < 1e-3, "{SOLAR_ILLUMINANCE} lx");
-    let y = mul(&REC2020_TO_XYZ, SOLAR_COLOUR)[1];
-    assert!((y - 1.0).abs() < 1e-6, "solar colour luminance {y}");
+    let y = mul(&REC2020_TO_XYZ, SOLAR_COLOR)[1];
+    assert!((y - 1.0).abs() < 1e-6, "solar color luminance {y}");
 }
 
 /// Uniform fog filling the atmosphere and nothing else.
@@ -114,7 +114,7 @@ fn sky_directions() -> [DVec3; 5] {
 const EYE: DVec3 = DVec3::new(0.0, 2.0, 0.0);
 
 #[test]
-fn groups_match_spectral_colour() {
+fn groups_match_spectral_color() {
     let reference = Reference::new(&earth());
     let (spectral, groups) = (
         reference.run(Channels::Spectral),
@@ -190,7 +190,7 @@ fn zenith_blue_red_ratio() {
 }
 
 /// The three Rec.2020 bands of the medium's `sample` and finite `t` against spectral on
-/// horizontal segments: prints the worst in-scatter and transmitted-sunlight colour error
+/// horizontal segments: prints the worst in-scatter and transmitted-sunlight color error
 /// per light elevation and length over the aerosol presets (atmosphere.md 6).
 #[test]
 #[ignore = "measurement: run with --ignored --nocapture"]

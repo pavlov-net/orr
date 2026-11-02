@@ -112,7 +112,7 @@ fn bounded_ggx_vndf_matches_its_density() {
     }
 }
 
-/// Checks samples on a planar shape parameterised by (s, t) in [0, 1]^2 against a solid
+/// Checks samples on a planar shape parameterized by (s, t) in [0, 1]^2 against a solid
 /// angle density of `1 / solid_angle`: maps each sample to (s, t), and compares the
 /// histogram with the density carried to (s, t) by `jacobian`, the area per unit (s, t) at
 /// a point. Returns the solid angle measured by integrating over the shape.

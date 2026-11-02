@@ -50,7 +50,7 @@ fn main() {
     let constants = read(&constants_path);
 
     // G173 ETR averaged over [l, l + 10 nm), W m^-2 nm^-1, and ozone cross sections at
-    // 233 K averaged the same way, m^2; both labelled with the bin's first wavelength.
+    // 233 K averaged the same way, m^2; both labeled with the bin's first wavelength.
     let solar = parse_array(&demo, "kSolarIrradiance[48]");
     let ozone = parse_array(&demo, "kOzoneCrossSection[48]");
     // Rows of (wavelength, x, y, z) every 5 nm from 360 nm.
@@ -58,7 +58,7 @@ fn main() {
     assert_eq!((solar.len(), ozone.len(), cie.len()), (BINS, BINS, 380));
 
     let lambda: Vec<f64> = (0..BINS).map(|i| FIRST_NM + BIN_NM * i as f64).collect();
-    // Each bin's colour matching functions are sampled at its labelled wavelength.
+    // Each bin's color matching functions are sampled at its labeled wavelength.
     let cmf: Vec<[f64; 3]> = (0..BINS)
         .map(|i| {
             let row = 2 * i;
@@ -66,7 +66,7 @@ fn main() {
             [cie[4 * row + 1], cie[4 * row + 2], cie[4 * row + 3]]
         })
         .collect();
-    // Rec.2020 colour matching functions.
+    // Rec.2020 color matching functions.
     let rbar: Vec<[f64; 3]> = cmf
         .iter()
         .map(|&c| colour::mul(&XYZ_TO_REC2020, c))
@@ -75,11 +75,11 @@ fn main() {
     let illuminance: f64 = (0..BINS)
         .map(|i| LUMINOUS_EFFICACY * BIN_NM * solar[i] * cmf[i][1])
         .sum();
-    // Each bin's Rec.2020 colour per lux of top-of-atmosphere solar illuminance.
+    // Each bin's Rec.2020 color per lux of top-of-atmosphere solar illuminance.
     let bin_rec2020: Vec<[f64; 3]> = (0..BINS)
         .map(|i| rbar[i].map(|r| LUMINOUS_EFFICACY * BIN_NM * solar[i] * r / illuminance))
         .collect();
-    let solar_colour = [0, 1, 2].map(|c| bin_rec2020.iter().map(|w| w[c]).sum::<f64>());
+    let solar_color = [0, 1, 2].map(|c| bin_rec2020.iter().map(|w| w[c]).sum::<f64>());
 
     let rayleigh: Vec<f64> = lambda
         .iter()
@@ -127,7 +127,7 @@ fn main() {
         (0..3)
             .map(|c| {
                 let mut rec2020 = [0.0; 3];
-                rec2020[c] = solar_colour[c];
+                rec2020[c] = solar_color[c];
                 band(&|i| solar[i] * rbar[i][c], rec2020)
             })
             .collect(),
@@ -150,10 +150,10 @@ fn main() {
     writeln!(out, "pub const SOLAR_ILLUMINANCE: f64 = {illuminance:?};").unwrap();
     writeln!(
         out,
-        "/// Linear Rec.2020 colour of sunlight above the atmosphere, luminance 1."
+        "/// Linear Rec.2020 color of sunlight above the atmosphere, luminance 1."
     )
     .unwrap();
-    writeln!(out, "pub const SOLAR_COLOUR: [f64; 3] = {solar_colour:?};").unwrap();
+    writeln!(out, "pub const SOLAR_COLOR: [f64; 3] = {solar_color:?};").unwrap();
     spectral.write(&mut out, "SPECTRAL", "BINS", "The 10 nm bins.");
     groups.write(
         &mut out,

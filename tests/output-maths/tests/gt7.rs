@@ -1,7 +1,7 @@
 use orr_output::{GT7_REFERENCE_NITS, Gt7Curve, Gt7Params};
 use output_maths::{gt7_reference, gt7_tonemap};
 
-/// 4096 samples per channel and on the grey axis, log-spaced over 1e-4..1e4 frame-buffer
+/// 4096 samples per channel and on the gray axis, log-spaced over 1e-4..1e4 frame-buffer
 /// units (0.01 nits to 1e6 nits), with zero first.
 fn ramps() -> Vec<[f32; 3]> {
     let mut v = Vec::new();

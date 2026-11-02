@@ -16,7 +16,7 @@ use orr_gpu::{
 use crate::raw::FgCamera;
 use crate::{DlssError, Quality, Support, Uuid, raw};
 
-/// Serialises every NGX call this layer makes; NGX is not thread-safe.
+/// Serializes every NGX call this layer makes; NGX is not thread-safe.
 static NGX: Mutex<()> = Mutex::new(());
 
 fn ngx_lock() -> MutexGuard<'static, ()> {
@@ -78,7 +78,7 @@ impl Drop for NgxInstance {
     }
 }
 
-/// NGX initialised on an orr-gpu device. Every NGX call made through this API is serialised
+/// NGX initialized on an orr-gpu device. Every NGX call made through this API is serialized
 /// across threads. Clones share the NGX instance.
 #[derive(Clone)]
 pub struct DlssSdk {
@@ -92,7 +92,7 @@ impl DlssSdk {
         DlssDeviceHooks { project_id }
     }
 
-    /// Initialises NGX on `gpu`, which was created with [`DlssSdk::device_hooks`].
+    /// Initializes NGX on `gpu`, which was created with [`DlssSdk::device_hooks`].
     pub fn new(gpu: &Device, project_id: Uuid) -> Result<Self, DlssError> {
         let device = vulkan::raw_device(gpu);
         let _ngx = ngx_lock();
@@ -220,7 +220,7 @@ pub struct RrInputs<'a> {
     pub normal_roughness: &'a Texture,
     /// Motion of reflected surfaces, in the same units as `motion`.
     pub specular_motion: &'a Texture,
-    /// Premultiplied colour with coverage in alpha, composited after denoising.
+    /// Premultiplied color with coverage in alpha, composited after denoising.
     pub transparency: Option<&'a Texture>,
     pub depth_of_field_guide: Option<&'a Texture>,
     pub output: &'a Texture,

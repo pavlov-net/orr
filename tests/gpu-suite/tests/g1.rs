@@ -238,7 +238,7 @@ fn trace(scene: Tlas, entry: &str) -> Vec<u32> {
     out.as_slice().unwrap().to_vec()
 }
 
-/// Pixels whose centre is inside the triangle hit; those within 1e-3 of an edge are skipped.
+/// Pixels whose center is inside the triangle hit; those within 1e-3 of an edge are skipped.
 fn check_triangle(got: &[u32]) {
     let (w, h) = (1024usize, 1024usize);
     let mut wrong = 0;

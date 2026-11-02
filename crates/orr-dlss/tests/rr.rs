@@ -107,7 +107,7 @@ fn static_inputs(render: [u32; 2], overlay: Option<([u32; 4], [f32; 4])>) -> [Ve
     ]
 }
 
-/// Uploads the static inputs and returns the targets and the colour staging buffer.
+/// Uploads the static inputs and returns the targets and the color staging buffer.
 fn targets(
     gpu: &mut Gpu,
     render: [u32; 2],
@@ -331,7 +331,7 @@ fn transparency_layer_is_composited_after_denoising() {
     let layered = create(&gpu, &ngx, output, Quality::Performance);
     let render = plain.render_size();
     assert_eq!(render, [960, 540]);
-    // Premultiplied colour, coverage 0.5.
+    // Premultiplied color, coverage 0.5.
     let overlay = [0.3, 0.1, 0.05, 0.5];
     let rect = [300, 150, 600, 400];
     let (t, staging) = targets(&mut gpu, render, Some((rect, overlay)));

@@ -249,7 +249,7 @@ fn malloc<T: Pod>(device: &Device, kind: MemoryKind, count: usize, name: &str) -
 /// [`LUTS`] as textures with sampled views in consecutive heap slots, the layout
 /// `orr.openpbr` reads in heap mode.
 pub struct Luts {
-    /// The value of specialisation constant `openpbr_lut_slot`.
+    /// The value of specialization constant `openpbr_lut_slot`.
     pub first_slot: u32,
     device: Device,
     _textures: Vec<Texture>,

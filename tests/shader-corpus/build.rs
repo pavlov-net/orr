@@ -1,4 +1,4 @@
-//! Compiles the corpus. It probes compiler behaviour, so it uses the tokens and layouts the
+//! Compiles the corpus. It probes compiler behavior, so it uses the tokens and layouts the
 //! lints and the MSL check keep out of real kernels.
 
 use std::env;

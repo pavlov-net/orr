@@ -1,4 +1,4 @@
-// Probes of the atmosphere module: LUT parameterisation round trips, altitudes, LUT texels,
+// Probes of the atmosphere module: LUT parameterization round trips, altitudes, LUT texels,
 // the sky-view LUT integrated over the upper hemisphere, `AtmosphereSky` directly and as
 // lighting bakes it, the night background, and a light's disc seen through the atmosphere.
 #include "orr/root.h"
@@ -21,7 +21,7 @@ struct Root
     // Light direction and the LUT eye's altitude in w.
     float4 light;
     // The light's Rec.2020 illuminance.
-    float4 colour;
+    float4 color;
     // Lighting's `LightSetGpu`, for `disc`.
     uint64_t set;
     uint64_t _pad0;
@@ -132,7 +132,7 @@ float3 group_sum(uint lane, float3 e)
 }
 
 // Irradiance on a horizontal surface at the eye `input[0]` (render space): output 0 is the
-// sky-view LUT over the upper hemisphere (`count` directions), output 1 the light `colour`
+// sky-view LUT over the upper hemisphere (`count` directions), output 1 the light `color`
 // through the atmosphere; both Rec.2020 lux.
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -159,7 +159,7 @@ void irradiance(uint lane: SV_GroupIndex)
     float h = atmosphere_spherical_altitude(a, eye);
     root.output[0] = float4(e * (TWO_PI / float(root.count)), 0.0);
     root.output[1] =
-        float4(root.colour.rgb * atmosphere_transmittance_to_space(a, h, mu) * max(mu, 0.0), 0.0);
+        float4(root.color.rgb * atmosphere_transmittance_to_space(a, h, mu) * max(mu, 0.0), 0.0);
 }
 
 // `AtmosphereSky.radiance` along each direction `input[i]` from the eye `light.xyz` (render

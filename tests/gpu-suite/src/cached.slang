@@ -1,4 +1,4 @@
-// One entry per pipeline kind, each writing its specialisation constant, for the pipeline
+// One entry per pipeline kind, each writing its specialization constant, for the pipeline
 // cache tests.
 #include "orr/root.h"
 

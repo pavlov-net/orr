@@ -14,7 +14,7 @@
 //! planet.
 //!
 //! Positions are in a local frame: the ground plane is y = 0 with +y up and the planet's
-//! centre is at (0, -planet_radius, 0). `planet_top` and `up` of the [`Atmosphere`] are
+//! center is at (0, -planet_radius, 0). `planet_top` and `up` of the [`Atmosphere`] are
 //! not used. Lights are directional and have no disc.
 
 mod medium;
@@ -41,7 +41,7 @@ const LOBE_FLOOR: f64 = 0.035;
 /// How altitude follows from position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Geometry {
-    /// Altitude above the spherical planet; the zenith points away from its centre.
+    /// Altitude above the spherical planet; the zenith points away from its center.
     Sphere,
     /// Altitude above the flat ground plane, zenith +y everywhere: the medium's model.
     /// Light transmittance still comes from the spherical planet at that altitude.
@@ -66,7 +66,7 @@ pub struct Light {
     /// Unit direction toward the light.
     pub direction: DVec3,
     /// The light's spectrum over the solar spectrum at a wavelength in nm, up to a constant.
-    /// A group or band takes it at its centre wavelength.
+    /// A group or band takes it at its center wavelength.
     pub tint: fn(f64) -> f64,
 }
 
@@ -268,7 +268,7 @@ impl Run<'_> {
         mul(&REC2020_TO_XYZ, self.rec2020(values))
     }
 
-    /// Transmittance from `origin` along `dir` over `t` metres (infinite: to space, zero
+    /// Transmittance from `origin` along `dir` over `t` meters (infinite: to space, zero
     /// when the ray reaches the ground), by numerical integration of the optical depth.
     pub fn transmittance(&self, origin: DVec3, dir: DVec3, t: f64, geometry: Geometry) -> Vec<f64> {
         let p = &self.reference.profile;
@@ -285,7 +285,7 @@ impl Run<'_> {
     }
 
     /// Sky radiance seen from `eye` along `dir` on the spherical planet, arriving at the
-    /// point `start` metres along the ray, from the medium beyond it. Below the horizon it
+    /// point `start` meters along the ray, from the medium beyond it. Below the horizon it
     /// includes the virtual ground and the medium in front of it.
     pub fn sky(
         &self,
@@ -302,7 +302,7 @@ impl Run<'_> {
             .0
     }
 
-    /// In-scatter toward `origin` and transmittance along `length` metres of `dir`. A
+    /// In-scatter toward `origin` and transmittance along `length` meters of `dir`. A
     /// segment that reaches the ground stops there and gets no light from it.
     pub fn segment(
         &self,
@@ -348,7 +348,7 @@ impl Run<'_> {
                 for g in groups {
                     let t = (-dot(&g.ext, &column)).exp();
                     for (c, o) in out.iter_mut().enumerate() {
-                        *o += t * g.rec2020[c] / spectrum::SOLAR_COLOUR[c];
+                        *o += t * g.rec2020[c] / spectrum::SOLAR_COLOR[c];
                     }
                 }
             }
@@ -576,7 +576,7 @@ impl Run<'_> {
         }
         let share = 1.0 / usable.len() as f64;
         // Half the events follow the channels' own distributions, half are a distance drawn
-        // uniformly over the first UNIFORM_SPAN metres of the leg.
+        // uniformly over the first UNIFORM_SPAN meters of the leg.
         let span = (range.1 - range.0).min(UNIFORM_SPAN);
         let t = if rng.next() < 0.5 {
             let j = usable[((rng.next() * usable.len() as f64) as usize).min(usable.len() - 1)];

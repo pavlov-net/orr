@@ -1,4 +1,4 @@
-//! orr's Slang maths libraries compiled for the CPU (`slang/maths.slang`), with safe
+//! orr's Slang math libraries compiled for the CPU (`slang/maths.slang`), with safe
 //! wrappers for the tests, and the statistics the sampling tests use.
 
 pub mod stats;
@@ -394,7 +394,7 @@ pub fn sample_alias(table: &[AliasEntry], u: f32) -> u32 {
     call!(ffi::orr_sample_alias(table.as_ptr(), table.len() as u32, u))
 }
 
-/// The colour matrices of `orr.color`, in [`color_matrix`] order.
+/// The color matrices of `orr.color`, in [`color_matrix`] order.
 pub const COLOR_MATRICES: [&str; 10] = [
     "REC709_TO_XYZ",
     "XYZ_TO_REC709",

@@ -2,18 +2,18 @@
 //! cross sections at 233 K and the CIE 1931 2-deg observer.
 //!
 //! Three sets describe the same medium at different spectral resolution: [`SPECTRAL`]
-//! (48 bins of 10 nm, 360-830 nm, each at its labelled wavelength), [`GROUPS`]
+//! (48 bins of 10 nm, 360-830 nm, each at its labeled wavelength), [`GROUPS`]
 //! ([`SPECTRAL_GROUPS`] runs of adjacent bins, solar-weighted means) and [`RGB`] (the three
-//! Rec.2020 channels, weighted by the solar spectrum times each channel's colour matching
+//! Rec.2020 channels, weighted by the solar spectrum times each channel's color matching
 //! function). Group and band coefficients are means over their bins; their `rec2020` rows
-//! sum to [`SOLAR_COLOUR`].
+//! sum to [`SOLAR_COLOR`].
 
 include!(concat!(env!("OUT_DIR"), "/spectrum.rs"));
 
 /// Per-band coefficients of the medium.
 #[derive(Clone, Copy, Debug)]
 pub struct Bands<const N: usize> {
-    /// Centre wavelength, nm: the bin's wavelength, or the weighted mean over a band.
+    /// Center wavelength, nm: the bin's wavelength, or the weighted mean over a band.
     pub wavelength: [f64; N],
     /// Rayleigh scattering of Earth's sea-level air, 1/m.
     pub rayleigh: [f64; N],
@@ -21,7 +21,7 @@ pub struct Bands<const N: usize> {
     pub ozone_cross_section: [f64; N],
     /// Mean of `(lambda / 550 nm)^-alpha` over the band, at `alpha = i * ANGSTROM_STEP`.
     pub aerosol: [[f64; N]; ANGSTROM_STEPS],
-    /// The band's share of a solar-coloured light, linear Rec.2020 per lux of
+    /// The band's share of a solar-colored light, linear Rec.2020 per lux of
     /// top-of-atmosphere illuminance.
     pub rec2020: [[f64; 3]; N],
 }
@@ -37,12 +37,12 @@ impl<const N: usize> Bands<N> {
     }
 }
 
-/// A Rec.2020 colour's value at wavelength `lambda` (nm): linear between the [`RGB`]
-/// bands' centre wavelengths, constant beyond the outer two. At a band's centre it is that
+/// A Rec.2020 color's value at wavelength `lambda` (nm): linear between the [`RGB`]
+/// bands' center wavelengths, constant beyond the outer two. At a band's center it is that
 /// channel's value.
 ///
-/// Colours given per channel (an albedo, or a light's colour relative to
-/// [`SOLAR_COLOUR`]) enter a group or spectral run through this.
+/// Colors given per channel (an albedo, or a light's color relative to
+/// [`SOLAR_COLOR`]) enter a group or spectral run through this.
 pub fn rgb_at(lambda: f64, rgb: [f64; 3]) -> f64 {
     let [lr, lg, lb] = RGB.wavelength;
     if lambda <= lb {

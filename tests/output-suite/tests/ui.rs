@@ -120,7 +120,7 @@ impl Drop for Target {
     }
 }
 
-/// Signals of an image in `format`, normalised: [0, 1] code values, or floats for scRGB.
+/// Signals of an image in `format`, normalized: [0, 1] code values, or floats for scRGB.
 fn signals(bytes: &[u8], format: Format) -> Vec<[f64; 4]> {
     match format {
         Format::Bgra8Unorm => bytes
@@ -168,7 +168,7 @@ fn encode(linear: [f64; 3], d: &ResolvedDisplay) -> [f64; 3] {
 
 /// Whether `got` matches `want` for `d`: every channel within one code value (two RGBA16F
 /// steps for scRGB), or within 1e-3 of the texel's brightest channel once decoded to nits.
-/// The second clause covers channels near zero in saturated colours, which come out of the
+/// The second clause covers channels near zero in saturated colors, which come out of the
 /// Rec.709 / Rec.2020 cancellations in f32.
 fn matches(got: [f64; 3], want: [f64; 3], d: &ResolvedDisplay) -> bool {
     let nits = |s: [f64; 3]| decode(s, d).map(|v| v * f64::from(d.paper_white_nits));
@@ -493,7 +493,7 @@ fn painter_draws_textures_clips_and_split_meshes() {
             pos2(x0 + 12.0, 2.0),
             Color32::WHITE,
         );
-        // A solid quad tinted by a premultiplied vertex colour, clipped to its middle.
+        // A solid quad tinted by a premultiplied vertex color, clipped to its middle.
         let mut solid = Mesh::with_texture(TextureId::Managed(3));
         quad(
             &mut solid,

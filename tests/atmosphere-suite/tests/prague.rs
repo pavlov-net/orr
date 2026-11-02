@@ -12,7 +12,7 @@ use atmosphere_suite::{Rig, dir, sky_radiance};
 use glam::{DVec3, Vec3};
 use orr_atmosphere::colour::{REC2020_TO_XYZ, delta_uv, mul};
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference};
-use orr_atmosphere::spectrum::{SOLAR_COLOUR, SOLAR_ILLUMINANCE, SPECTRAL};
+use orr_atmosphere::spectrum::{SOLAR_COLOR, SOLAR_ILLUMINANCE, SPECTRAL};
 use orr_atmosphere::{Aerosol, Atmosphere};
 use orr_scene::testing::assert_clean;
 
@@ -182,7 +182,7 @@ fn sky_against_prague() {
                 let inscatter = groups.rec2020(&s.inscatter.values);
                 let t = groups.rec2020(&s.transmittance);
                 std::array::from_fn(|c| {
-                    inscatter[c] * SOLAR_ILLUMINANCE + t[c] / SOLAR_COLOUR[c] * lut[c]
+                    inscatter[c] * SOLAR_ILLUMINANCE + t[c] / SOLAR_COLOR[c] * lut[c]
                 })
             })
             .collect()

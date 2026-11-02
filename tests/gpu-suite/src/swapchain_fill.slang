@@ -1,5 +1,5 @@
-// Writes a test card into a swapchain image in its output encoding: a grey ramp to paper
-// white, colour bars, a ramp to 10x paper white and a moving bar that shows tearing.
+// Writes a test card into a swapchain image in its output encoding: a gray ramp to paper
+// white, color bars, a ramp to 10x paper white and a moving bar that shows tearing.
 #include "orr/root.h"
 import orr.abi;
 import orr.color;

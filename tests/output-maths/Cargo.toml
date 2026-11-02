@@ -1,6 +1,6 @@
 [package]
 name = "output-maths"
-description = "orr-output's GT7, exposure and encoding maths on the CPU, checked against references."
+description = "orr-output's GT7, exposure and encoding math on the CPU, checked against references."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

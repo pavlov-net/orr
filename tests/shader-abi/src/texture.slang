@@ -1,4 +1,4 @@
-// Heap views: point samples of a sampled view at texel centres, and writes through a storage
+// Heap views: point samples of a sampled view at texel centers, and writes through a storage
 // view of the same image.
 #include "orr/root.h"
 import orr.abi;

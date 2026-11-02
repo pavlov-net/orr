@@ -1,6 +1,6 @@
 //! Times `orr.openpbr` on the GPU (`gpu/openpbr_bench.slang`, heap LUTs) and prints a
 //! Markdown table of nanoseconds per call: prepare, eval, sample, and eval plus sample, for
-//! each harness material and for all of them mixed across neighbouring threads.
+//! each harness material and for all of them mixed across neighboring threads.
 //!
 //! `openpbr-bench [--validation]`. Timings are GPU timestamps around each dispatch, the
 //! median of five after one warm-up; run without the validation layer for numbers.

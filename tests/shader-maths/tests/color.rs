@@ -254,6 +254,6 @@ fn gamut_compression_brings_rec2020_inside_rec709() {
     }
     assert!(
         worst > -1e-6,
-        "a Rec.2020 colour stays outside Rec.709: {worst}"
+        "a Rec.2020 color stays outside Rec.709: {worst}"
     );
 }

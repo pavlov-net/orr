@@ -6,13 +6,13 @@ use orr::WorldPos;
 
 use crate::colour::{REC709_TO_REC2020, luminance, mul};
 use crate::shaders::types::{AtmosphereGpu, AtmosphereGroups};
-use crate::spectrum::{GROUPS, RGB, SOLAR_COLOUR, SPECTRAL_GROUPS, rgb_at};
+use crate::spectrum::{GROUPS, RGB, SOLAR_COLOR, SPECTRAL_GROUPS, rgb_at};
 use crate::{Atmosphere, DOBSON_UNIT};
 
 /// LUT passes per frame: the wavelength groups three at a time.
 pub(crate) const PASSES: usize = SPECTRAL_GROUPS / 3;
 
-/// A linear Rec.709 colour in linear Rec.2020.
+/// A linear Rec.709 color in linear Rec.2020.
 pub(crate) fn rec2020(c: Vec3) -> [f64; 3] {
     mul(&REC709_TO_REC2020, c.as_dvec3().to_array())
 }
@@ -51,7 +51,7 @@ fn zenith_transmittance(a: &Atmosphere) -> [f64; 3] {
                 GROUPS.rec2020[k][c] * (-depth).exp()
             })
             .sum::<f64>()
-            / SOLAR_COLOUR[c]
+            / SOLAR_COLOR[c]
     })
 }
 
@@ -81,13 +81,13 @@ pub(crate) fn groups(a: &Atmosphere) -> [AtmosphereGroups; PASSES] {
             fog_albedo: per(&|k| rgb_at(GROUPS.wavelength[k], fog)),
             ground_albedo: per(&|k| rgb_at(GROUPS.wavelength[k], ground)),
             rec2020: std::array::from_fn(|c| per(&|k| GROUPS.rec2020[k][c])),
-            // A light's colour over the solar colour, carried into the group as `rgb_at` does.
+            // A light's color over the solar color, carried into the group as `rgb_at` does.
             light_weight: std::array::from_fn(|j| {
                 let k = 3 * p + j;
                 xyz(std::array::from_fn(|c| {
                     let mut unit = [0.0; 3];
                     unit[c] = 1.0;
-                    rgb_at(GROUPS.wavelength[k], unit) / SOLAR_COLOUR[c]
+                    rgb_at(GROUPS.wavelength[k], unit) / SOLAR_COLOR[c]
                 }))
             }),
         }
@@ -102,10 +102,10 @@ pub(crate) fn medium(a: &Atmosphere, out: &mut AtmosphereGpu) {
     let density = f64::from(a.rayleigh.density);
     let ozone = ozone_peak(a);
     let band = |f: &dyn Fn(usize) -> f64| xyz(std::array::from_fn(f));
-    out.top_metres = top.cell.extend(0).to_array();
+    out.top_meters = top.cell.extend(0).to_array();
     out.top_offset = top.offset.extend(0.0).to_array();
     out.up = a.up.normalize().extend(0.0).to_array();
-    out.solar_colour = xyz(SOLAR_COLOUR);
+    out.solar_color = xyz(SOLAR_COLOR);
     out.rayleigh = band(&|c| RGB.rayleigh[c] * density);
     out.aerosol_extinction = band(&|c| aod * RGB.aerosol_factor(c, alpha));
     out.aerosol_scattering = band(&|c| {

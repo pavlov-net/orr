@@ -292,12 +292,12 @@ impl Gpu {
     }
 
     /// Validation messages reported so far, across every device in the process, leaving out
-    /// synchronisation hazards on NGX's own resources.
+    /// synchronization hazards on NGX's own resources.
     pub fn validation_messages() -> u32 {
         MESSAGES.load(Ordering::Relaxed)
     }
 
-    /// Synchronisation hazards on NGX's own resources reported so far.
+    /// Synchronization hazards on NGX's own resources reported so far.
     pub fn ngx_hazards() -> u32 {
         NGX_HAZARDS.load(Ordering::Relaxed)
     }
@@ -476,7 +476,7 @@ impl Gpu {
     }
 
     pub fn submit_wait(&self) {
-        // SAFETY: the command buffer is recording; the queue is idle afterwards.
+        // SAFETY: the command buffer is recording; the queue is idle afterward.
         unsafe {
             self.device.end_command_buffer(self.cmd).unwrap();
             let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(self.cmd)];

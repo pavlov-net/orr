@@ -2,10 +2,10 @@
 //! shader, blending in gamma space like egui's reference painters.
 //!
 //! The UI layer is an RGBA8 UNORM texture with `COLOR` usage holding premultiplied,
-//! sRGB-encoded colour. Managed egui textures live in the texture heap as RGBA8 UNORM
+//! sRGB-encoded color. Managed egui textures live in the texture heap as RGBA8 UNORM
 //! textures with one mip holding egui's sRGB-encoded bytes, so filtering happens in gamma
 //! space as egui expects. `TextureId::User(n)` draws image slot `n` directly: it holds linear
-//! colour (an sRGB format decodes in the sampler), filtered linearly, clamped and encoded to
+//! color (an sRGB format decodes in the sampler), filtered linearly, clamped and encoded to
 //! sRGB. Paint callbacks are not drawn.
 
 use std::collections::HashMap;

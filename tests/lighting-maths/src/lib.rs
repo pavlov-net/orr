@@ -323,34 +323,34 @@ pub fn edge_case(rng: &mut Rng, i: usize) -> (Inputs, V3) {
             _ => rng.f32(),
         }
     }
-    fn colour(rng: &mut Rng) -> V3 {
+    fn color(rng: &mut Rng) -> V3 {
         [unit(rng), unit(rng), unit(rng)]
     }
     let angle = rng.range(0.0, std::f32::consts::TAU);
     let inputs = Inputs {
         base_weight: unit(rng),
-        base_color: colour(rng),
+        base_color: color(rng),
         base_diffuse_roughness: unit(rng),
         base_metalness: unit(rng),
         subsurface_weight: unit(rng),
-        subsurface_color: colour(rng),
+        subsurface_color: color(rng),
         subsurface_scatter_anisotropy: rng.range(-1.0, 1.0),
         specular_weight: unit(rng),
-        specular_color: colour(rng),
+        specular_color: color(rng),
         specular_roughness: unit(rng),
         specular_roughness_anisotropy: unit(rng),
         specular_ior: [1.0, 1.0001, 1.5, 3.0][(rng.next_u32() % 4) as usize],
         specular_rotation: [angle.cos(), angle.sin()],
         coat_weight: unit(rng),
-        coat_color: colour(rng),
+        coat_color: color(rng),
         coat_roughness: unit(rng),
         coat_ior: [1.0, 1.6, 3.0][(rng.next_u32() % 3) as usize],
         coat_darkening: unit(rng),
         fuzz_weight: unit(rng),
-        fuzz_color: colour(rng),
+        fuzz_color: color(rng),
         fuzz_roughness: unit(rng),
         transmission_weight: unit(rng),
-        transmission_color: colour(rng),
+        transmission_color: color(rng),
         thin_film_weight: unit(rng),
         thin_film_thickness: unit(rng),
         emission_luminance: 10.0,

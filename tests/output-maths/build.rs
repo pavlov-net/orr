@@ -1,4 +1,4 @@
-//! Compiles orr-output's Slang maths for the CPU through `slang/output.slang`, and for
+//! Compiles orr-output's Slang math for the CPU through `slang/output.slang`, and for
 //! SPIR-V and Metal through `gpu/output.slang`; links Polyphony's GT7 sample as the
 //! reference. `GT7_SAMPLE` names its directory, else `.tools/display/gt7` in the nearest
 //! directory above the crate that has it (where `tools/fetch-slang.sh` puts it).

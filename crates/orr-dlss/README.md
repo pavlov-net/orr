@@ -5,7 +5,7 @@ Vulkan, without Streamline.
 
 ## Building
 
-The DLSS SDK is not part of this crate. Download it from NVIDIA under its licence and set
+The DLSS SDK is not part of this crate. Download it from NVIDIA under its license and set
 `DLSS_SDK` to the absolute path of the copy. The build generates bindings from its headers
 with bindgen, so it needs clang and the Vulkan SDK headers (`VULKAN_SDK`).
 
@@ -42,10 +42,10 @@ SDK the crate was built against, and every build looks in `$DLSS_SDK` at run tim
   `nvngx_dlssd.dll` (ray reconstruction) and `nvngx_dlssg.dll` (frame generation) from the SDK
   beside the executable. Never ship the `dev` DLLs.
 - When code-signing, append your signature; never strip NVIDIA's.
-- Include the copyright and licence notices listed in section 9.5 of the DLSS programming
+- Include the copyright and license notices listed in section 9.5 of the DLSS programming
   guide that comes with the SDK.
 - The SDK's `LICENSE.txt` (section 1c) allows distributing the SDK's files in object code
   inside an application, except developer tools meant for internal use.
-- The licence requires notice to NVIDIA before a commercial release (section 4), and NVIDIA
+- The license requires notice to NVIDIA before a commercial release (section 4), and NVIDIA
   marks on the splash screen, the about box and the credits (section 7.1b).
-- NGX is initialised with your project ID (a UUID you choose) and the custom engine type.
+- NGX is initialized with your project ID (a UUID you choose) and the custom engine type.

@@ -33,8 +33,8 @@ pub struct Harness {
     constants: Allocation<ViewConstants>,
     synth_root: Allocation<synth::Root>,
     luminance: Allocation<f32>,
-    colours: Allocation<f32>,
-    per_pixel_colour: bool,
+    colors: Allocation<f32>,
+    per_pixel_color: bool,
     sky: Allocation<SkyStats>,
     radiance: Texture,
     linear: Texture,
@@ -46,8 +46,8 @@ pub struct Harness {
     frame: u64,
     /// Seconds per frame.
     pub dt: f32,
-    /// Linear Rec.2020 colour the luminance multiplies; grey by default.
-    pub colour: [f32; 3],
+    /// Linear Rec.2020 color the luminance multiplies; gray by default.
+    pub color: [f32; 3],
     /// The lens's glare, run before tonemap; off by default.
     pub glare: Option<Glare>,
     pub sensor_width_mm: f32,
@@ -108,10 +108,10 @@ impl Harness {
             luminance: gpu
                 .gpu_malloc(MemoryKind::Upload, pixels, "luminance")
                 .unwrap(),
-            colours: gpu
-                .gpu_malloc(MemoryKind::Upload, 3 * pixels, "colours")
+            colors: gpu
+                .gpu_malloc(MemoryKind::Upload, 3 * pixels, "colors")
                 .unwrap(),
-            per_pixel_colour: false,
+            per_pixel_color: false,
             sky,
             radiance,
             linear,
@@ -122,7 +122,7 @@ impl Harness {
             extent: [width, height],
             frame: 0,
             dt: 1.0 / 30.0,
-            colour: [1.0; 3],
+            color: [1.0; 3],
             glare: None,
             sensor_width_mm: 36.0,
             composite: None,
@@ -138,15 +138,15 @@ impl Harness {
         self.luminance.as_mut_slice().unwrap().copy_from_slice(nits);
     }
 
-    /// Gives each pixel its own linear Rec.2020 colour, row by row, in place of `colour`;
-    /// `None` goes back to `colour`.
-    pub fn set_colours(&mut self, colours: Option<&[[f32; 3]]>) {
-        self.per_pixel_colour = colours.is_some();
-        if let Some(colours) = colours {
-            self.colours
+    /// Gives each pixel its own linear Rec.2020 color, row by row, in place of `color`;
+    /// `None` goes back to `color`.
+    pub fn set_colors(&mut self, colors: Option<&[[f32; 3]]>) {
+        self.per_pixel_color = colors.is_some();
+        if let Some(colors) = colors {
+            self.colors
                 .as_mut_slice()
                 .unwrap()
-                .copy_from_slice(colours.as_flattened());
+                .copy_from_slice(colors.as_flattened());
         }
     }
 
@@ -174,11 +174,11 @@ impl Harness {
         constants.delta_time = self.dt;
         self.constants.as_mut_slice().unwrap()[0] = constants;
         let view = self.constants.gpu();
-        let [r, g, b] = self.colour;
+        let [r, g, b] = self.color;
         self.synth_root.as_mut_slice().unwrap()[0] = synth::Root {
             luminance: self.luminance.gpu(),
-            colours: if self.per_pixel_colour {
-                self.colours.gpu()
+            colors: if self.per_pixel_color {
+                self.colors.gpu()
             } else {
                 GpuPtr::NULL
             },
@@ -444,7 +444,7 @@ pub fn white_in_range(xy: [f64; 2]) -> [f64; 2] {
     }
 }
 
-/// The CPU model of adapt's white point target: each pixel `(luminance, Rec.2020 colour)`
+/// The CPU model of adapt's white point target: each pixel `(luminance, Rec.2020 color)`
 /// between the `filter` percentiles of luminance (edges counted fractionally), the sky's dome
 /// and directional light, and the virtual D65 light, averaged in Yxy by luminance times
 /// weight, then held in range.
