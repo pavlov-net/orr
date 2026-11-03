@@ -337,6 +337,39 @@ fn a_file_the_driver_refuses_is_replaced() {
     assert_clean(&d);
 }
 
+/// A file with good headers whose cache data names another device in the driver's own header is
+/// not reported as loaded, and the next save replaces it. A driver may ignore such data or
+/// refuse it.
+#[test]
+fn a_file_the_driver_ignores_is_replaced() {
+    let path = &cache_path("ignored");
+    let d = open(path);
+    let set = Set::new(&d, 1);
+    let n = set.kinds();
+    d.save_pipeline_cache().unwrap();
+    drop((set, d));
+
+    let mut bytes = std::fs::read(path).unwrap();
+    // The cache UUID in VkPipelineCacheHeaderVersionOne.
+    bytes[HEADER + 16] ^= 1;
+    write_checksummed(path, bytes);
+
+    let d = open(path);
+    let report = d.pipeline_cache_report();
+    assert!(!report.loaded, "{report:?}");
+    assert!(report.rejected.is_some(), "{report:?}");
+    let set = Set::new(&d, 1);
+    let report = d.pipeline_cache_report();
+    assert_eq!((report.hits, report.misses), (0, n), "{report:?}");
+    set.check(&d);
+    d.save_pipeline_cache().unwrap();
+    assert_clean(&d);
+    drop((set, d));
+
+    let d = open(path);
+    assert!(d.pipeline_cache_report().loaded);
+}
+
 /// Threads asking for one pipeline at once compile it once.
 #[test]
 fn one_pipeline_requested_at_once_compiles_once() {
