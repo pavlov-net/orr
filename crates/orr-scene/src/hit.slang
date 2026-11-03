@@ -800,10 +800,13 @@ public float resolve_coverage<S : ISurface>(SceneRoot* s, ViewConstants* v, floa
 // candidate.
 public bool resolve_particle(SceneRoot* s, uint instance_index, uint cluster_id, uint primitive, float2 bary, out uint material, out float3 normal, out float3 emission, out float opacity)
 {
+    material = MATERIAL_NONE;
+    normal = float3(0.0);
     emission = float3(0.0);
     opacity = 0.0;
+    uint entry;
     SurfaceInput i;
-    if (!particle_candidate(s, instance_index, cluster_id, primitive, bary, material, normal, i))
+    if (!hit_producer(s, instance_index, entry) || !particle_candidate(s, entry, cluster_id, primitive, bary, material, normal, i))
         return false;
     MaterialGpu* m = s.materials + material;
     emission = material_color(m, TEXTURE_EMISSION, i.uv, material_emission(m));
@@ -812,15 +815,12 @@ public bool resolve_particle(SceneRoot* s, uint instance_index, uint cluster_id,
 }
 
 // The material, unit render-space front-face normal and textures' input of a triangle candidate
-// of a particle or smoke entry, from its batch. False for any other candidate.
-bool particle_candidate(SceneRoot* s, uint instance_index, uint cluster_id, uint primitive, float2 bary, out uint material, out float3 normal, out SurfaceInput i)
+// of producer entry `entry`, from its batch. False unless the entry holds particles or smoke.
+bool particle_candidate(SceneRoot* s, uint entry, uint cluster_id, uint primitive, float2 bary, out uint material, out float3 normal, out SurfaceInput i)
 {
     material = MATERIAL_NONE;
     normal = float3(0.0);
     i = (SurfaceInput)0;
-    uint entry;
-    if (!hit_producer(s, instance_index, entry))
-        return false;
     ProducerGpu p = s.producers[entry];
     ProducerBatch b = s.batches[entry];
     if ((p.opacity != PRODUCER_PARTICLE && p.opacity != PRODUCER_SMOKE) || cluster_id >= emitted_clusters(b))
@@ -874,7 +874,7 @@ public bool resolve_smoke(SceneRoot* s, uint instance_index, uint cluster_id, ui
     uint material;
     float3 normal;
     SurfaceInput i;
-    if (!particle_candidate(s, instance_index, cluster_id, primitive, bary, material, normal, i))
+    if (!particle_candidate(s, entry, cluster_id, primitive, bary, material, normal, i))
         return false;
     smoke_look(i, albedo, emission, opacity);
     return true;
