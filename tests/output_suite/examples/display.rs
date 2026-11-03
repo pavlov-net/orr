@@ -72,7 +72,7 @@ fn main() {
         .unwrap_or(60);
     let gpu = device();
     let render = gpu.queue(QueueKind::Render).unwrap();
-    let mut window = Window::new("orr display", 1280, 720);
+    let mut window = Window::new("orr display", 1920, 1080);
     let mut display = Display::new(
         gpu,
         window.window_handle(),

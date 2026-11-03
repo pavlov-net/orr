@@ -15,7 +15,7 @@
 //! [--part-attribute NAME] [--still] [--no-glare] [--no-motion-blur] [--frames N] [--headless]
 //! [--out file.png]`: `--node` cooks each glTF node whose name holds the pattern as its own
 //! model (not with skins), `--model` picks the archive's model (default: the first by name).
-//! Headless runs output 480 x 270 for 120 frames unless told otherwise and write the last frame
+//! Headless runs output 1920 x 1080 for 120 frames unless told otherwise and write the last frame
 //! as a PNG. With the window focused, `G` switches glare and `B` motion blur; the title says
 //! which are on.
 
@@ -62,7 +62,7 @@ const TREE: &str = "tree";
 const GROUND: &str = "ground";
 const SKY: &str = "sky";
 
-const HEADLESS_EXTENT: [u32; 2] = [480, 270];
+const HEADLESS_EXTENT: [u32; 2] = [1920, 1080];
 const HEADLESS_FRAMES: u64 = 120;
 /// The frame id the scene is created in, after the packs have mounted.
 const FIRST_FRAME: u64 = 500;
@@ -416,7 +416,7 @@ fn run(options: &Options) -> Option<Capture> {
 
     let mut switches = LensSwitches::new(options);
     let title = |s: &LensSwitches| format!("orr tree-viewer: {s}");
-    let mut window = (!options.headless).then(|| Window::new(&title(&switches), 1280, 720));
+    let mut window = (!options.headless).then(|| Window::new(&title(&switches), 1920, 1080));
     let desc = RendererDesc::default();
     let mut display = window.as_ref().map(|w| {
         Display::new(

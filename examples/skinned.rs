@@ -65,7 +65,7 @@ fn main() {
 /// Runs the example; headless runs return their last frame.
 pub(crate) fn run(options: &Options) -> Option<Capture> {
     let gpu = device();
-    let mut window = (!options.headless).then(|| Window::new("orr skinned", 1280, 720));
+    let mut window = (!options.headless).then(|| Window::new("orr skinned", 1920, 1080));
     let desc = RendererDesc::default();
     let mut display = window.as_ref().map(|w| {
         Display::new(

@@ -37,7 +37,7 @@ fn main() {
         .unwrap_or(12);
     let d = device();
     let queue = d.queue(QueueKind::Present).unwrap();
-    let mut window = Window::new("swapchain", 1280, 720);
+    let mut window = Window::new("swapchain", 1920, 1080);
     let mut sc = Swapchain::new(
         d,
         window.window_handle(),

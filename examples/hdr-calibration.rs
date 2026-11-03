@@ -84,7 +84,7 @@ mod run {
         }
 
         let gpu = device();
-        let mut window = Window::new("orr hdr calibration", 1280, 720);
+        let mut window = Window::new("orr hdr calibration", 1920, 1080);
         let desc = RendererDesc::default();
         let requests = requests();
         let mut display = Display::new(
@@ -121,7 +121,7 @@ mod run {
             if *display.request() != request {
                 display.set_request(&request);
                 let size = if step % 2 == 0 {
-                    [1280, 720]
+                    [1920, 1080]
                 } else {
                     [960, 600]
                 };
