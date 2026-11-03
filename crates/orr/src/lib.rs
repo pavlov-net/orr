@@ -856,9 +856,13 @@ impl<'a> Frame<'a> {
     ///
     /// Motion blur smears the radiance along each pixel's motion over the fraction
     /// `lens.shutter` of the time between presented images, centered on the frame. A camera cut
-    /// (`view.reset_history`) shows none, nor do the accumulation reference and
-    /// `lighting.debug_view`. A camera that jumps without declaring a cut blurs up to the longest
-    /// streak, [`orr_output::MOTION_BLUR_MAX_RADIUS`] of the output width each way.
+    /// (`view.reset_history`) shows none. A camera that jumps without declaring a cut blurs up to
+    /// the longest streak, [`orr_output::MOTION_BLUR_MAX_RADIUS`] of the output width each way.
+    ///
+    /// A `lighting.debug_view` shows neither motion blur nor glare, since it is not the final
+    /// image. The accumulation reference shows glare but no motion blur: each of its frames is
+    /// ground truth and a caller simulates the shutter by stepping time, so blurring it here would
+    /// blur it twice.
     ///
     /// The target decides the output extent. `output.reconstruction` and the output extent
     /// decide the render extent, the jitter and the texture level-of-detail bias while the
@@ -1116,10 +1120,9 @@ impl<'a> Frame<'a> {
             },
         )?;
         // A view that stops after exposure shows no camera effects and holds none of their images.
-        // The accumulation reference and debug views take no motion blur.
-        let blurs = tonemapped
-            && lighting.reference.is_none()
-            && lighting.debug_view == LightingDebugView::None;
+        let look = lighting.debug_view == LightingDebugView::None;
+        // Depth of field takes this rule too once it runs here: the reference traces its own lens.
+        let blurs = tonemapped && look && lighting.reference.is_none();
         kernels.motion_blur(
             list,
             &mut state.output,
@@ -1144,7 +1147,7 @@ impl<'a> Frame<'a> {
                 extent,
                 view: raster.view,
                 sensor_width_mm: view.lens.sensor_width_mm,
-                glare: view.lens.glare.filter(|_| tonemapped),
+                glare: view.lens.glare.filter(|_| tonemapped && look),
                 display: &resolved,
                 frame: id,
                 output,
