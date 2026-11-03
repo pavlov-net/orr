@@ -302,6 +302,7 @@ impl Shared {
         let parts = StageParts::new(self, s, Stage::Compute, name)?;
         self.create_pipeline(
             &[&parts],
+            &[],
             extra,
             name,
             "vkCreateComputePipelines",

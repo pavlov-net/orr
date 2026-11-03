@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime};
 use gpu_suite::shaders::{cached, cached_rays};
 use gpu_suite::{log_to_stderr, require};
 use orr_gpu::{
-    ClearColor, ColorAttachment, ColorLoad, ColorTarget, ComputePipeline, Device, DeviceDesc,
-    Error, Format, Hazards, MemoryKind, MeshPipeline, MeshPipelineDesc, QueueKind,
+    ClearColor, ColorAttachment, ColorLoad, ColorTarget, ComputePipeline, Cull, Device, DeviceDesc,
+    Error, Format, Hazards, MemoryKind, MeshPipeline, MeshPipelineDesc, QueueKind, RasterState,
     RayDispatchPipeline, Rendering, ShaderStage, SpecData, Stages, TextureDesc, TextureMemory,
     TextureRegion, TextureUsage,
 };
@@ -388,6 +388,46 @@ fn one_pipeline_requested_at_once_compiles_once() {
     });
     let report = d.pipeline_cache_report();
     assert_eq!((report.misses, report.hits), (1, 7), "{report:?}");
+    assert_clean(&d);
+}
+
+/// Threads asking for mesh pipelines with one set of stages and two raster states compile each
+/// state once. Only NVIDIA's driver is known to keep the states apart in its cache.
+#[test]
+fn mesh_pipelines_that_differ_in_state_compile_apart() {
+    let d = open(&cache_path("mesh_state"));
+    if !require(
+        d.caps().device_name.contains("NVIDIA"),
+        "only NVIDIA's driver is known to cache each cull mode apart",
+    ) {
+        return;
+    }
+    let spec = cached::Spec { value: 88 }.bytes();
+    let data = SpecData {
+        entries: cached::Spec::ENTRIES,
+        bytes: &spec,
+    };
+    let stage = |e| ShaderStage::new(&cached::MODULE, e, data).unwrap();
+    let colors = [ColorTarget::new(Format::R32Uint)];
+    std::thread::scope(|s| {
+        for cull in [Cull::None, Cull::Back] {
+            let desc = MeshPipelineDesc {
+                pixel: Some(stage("pixel_main")),
+                colors: &colors,
+                raster: RasterState {
+                    cull,
+                    ..RasterState::default()
+                },
+                ..MeshPipelineDesc::new(stage("mesh_main"))
+            };
+            for _ in 0..4 {
+                let d = &d;
+                s.spawn(move || d.create_mesh_pipeline(&desc, "mesh state").unwrap());
+            }
+        }
+    });
+    let report = d.pipeline_cache_report();
+    assert_eq!((report.misses, report.hits), (2, 6), "{report:?}");
     assert_clean(&d);
 }
 

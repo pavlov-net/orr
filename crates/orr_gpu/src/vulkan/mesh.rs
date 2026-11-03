@@ -196,8 +196,10 @@ impl Shared {
         };
         let bias = r.depth_bias.unwrap_or_default();
         let dynamic = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let state = format!("{:?}", (d.colors, d.depth, d.raster, d.samples));
         self.create_pipeline(
             &parts.iter().map(|(_, p)| p).collect::<Vec<_>>(),
+            state.as_bytes(),
             extra,
             name,
             "vkCreateGraphicsPipelines",
