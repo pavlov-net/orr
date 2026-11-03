@@ -42,7 +42,7 @@ use examples::average::Average;
 use examples::mesh::MeshBuilder;
 use examples::scene::{FOV_Y, Showcase, TARGET, orbit_eye};
 use examples::{
-    Capture, Options, Workers, affine, assert_clean, device, enable_dlss, fixed_time, mount_at,
+    Capture, Options, Workers, assert_clean, device, enable_dlss, fixed_time, mount_at,
 };
 use orr::orr_gpu::{ClearColor, ColorAttachment, ColorLoad, Format, Rendering};
 use orr::orr_gpu::{QueueKind, Texture, TextureDesc, TextureMemory, TextureUsage, TimelinePoint};
@@ -947,7 +947,7 @@ impl Lamp {
                 .expect("scene writer")
                 .transforms(self.group, 0, 1)
                 .expect("transforms")
-                .fill(affine(Mat3::IDENTITY, Vec3::new(x as f32, 0.0, 0.0)));
+                .fill(Affine3::new(Mat3::IDENTITY, Vec3::new(x as f32, 0.0, 0.0)));
             if skipped {
                 f.scene(self.scene)
                     .expect("scene writer")

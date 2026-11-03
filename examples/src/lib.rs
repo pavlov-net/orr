@@ -11,10 +11,9 @@ use orr::orr_gpu::{Allocation, Device, DeviceDesc, QueueRequest};
 use orr::orr_output::orr_dlss::Uuid;
 use orr::orr_pack::{Archive, AssetId};
 use orr::{
-    Affine3, DlssSdk, FrameDesc, FrameTime, Lens, LoadState, Loading, MountId, PackSource,
-    Renderer, Screenshot,
+    DlssSdk, FrameDesc, FrameTime, Lens, LoadState, Loading, MountId, PackSource, Renderer,
+    Screenshot,
 };
-use orr_math::{Mat3, Vec3};
 
 pub mod average;
 pub mod creature;
@@ -23,6 +22,7 @@ pub mod mesh;
 pub mod overlay;
 pub mod scene;
 pub mod sky;
+pub mod sun_shade;
 pub mod vegetation;
 pub mod window;
 
@@ -266,17 +266,6 @@ impl Capture {
         enc.write_header()
             .and_then(|mut w| w.write_image_data(&self.rgba8))
             .unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
-    }
-}
-
-/// Rows [R | t] of rotation `m` and translation `t`.
-pub fn affine(m: Mat3, t: Vec3) -> Affine3 {
-    let r = |i: usize| {
-        let row = m.row(i);
-        [row.x, row.y, row.z, t[i]]
-    };
-    Affine3 {
-        rows: [r(0), r(1), r(2)],
     }
 }
 

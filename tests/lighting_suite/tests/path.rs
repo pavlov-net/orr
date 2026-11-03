@@ -6,6 +6,7 @@
 use lighting_suite::bed::{
     Accumulated, Analytic, BUMPY_FLOOR, Bed, EXTENT, FLOOR, FURNACE_RADIANCE, Item, MIRROR, NEAR,
     PANEL, Particle, ParticleLook, Paths, SKY, SMOOTH_FLOOR, SUN, Spec, TROUGH, WHITE_SPHERE,
+    luminance, reference,
 };
 use lighting_suite::shaders::origins;
 use lighting_suite::{
@@ -27,23 +28,11 @@ fn render_paths(bed: &mut Bed, paths: &Paths, frames: u32, seed: u32) -> Accumul
     bed.accumulate(frames, seed, &mut |list, f| paths.record(list, f))
 }
 
-fn reference(max_bounces: u32) -> ViewLighting {
-    ViewLighting {
-        max_bounces,
-        reference: Some(ReferenceSettings::default()),
-        ..ViewLighting::default()
-    }
-}
-
 fn debug(view: LightingDebugView, max_bounces: u32) -> ViewLighting {
     ViewLighting {
         debug_view: view,
         ..reference(max_bounces)
     }
-}
-
-fn luminance(p: &[f32; 4]) -> f64 {
-    0.2627 * f64::from(p[0]) + 0.6780 * f64::from(p[1]) + 0.0593 * f64::from(p[2])
 }
 
 /// Mean rgb over the pixels that pass `keep`.

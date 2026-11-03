@@ -53,7 +53,7 @@ use crate::mesh::MeshBuilder;
 use crate::shaders::{fireflies, glow, grass, slab, sway, terrain};
 use crate::sky::{self, Sky};
 use crate::window::Window;
-use crate::{Capture, Options, Workers, affine, device, entry_head, fixed_time, gray_png};
+use crate::{Capture, Options, Workers, device, entry_head, fixed_time, gray_png};
 
 /// The tile's side, m; it spans -TILE / 2 to TILE / 2 on x and z.
 const TILE: f32 = 1024.0;
@@ -790,7 +790,7 @@ fn plant(settings: &Settings, models: usize, heights: &dyn Fn(f32, f32) -> f32) 
         let cell = cell_of(x, z);
         let turn = Mat3::from_rotation_y(rng.range(0.0, std::f32::consts::TAU));
         let at = Vec3::new(x, heights(x, z) - 0.1, z) - anchor(cell);
-        let t = affine(turn * rng.range(0.8, 1.2), at);
+        let t = Affine3::new(turn * rng.range(0.8, 1.2), at);
         match stands
             .iter_mut()
             .find(|s| s.cell == cell && s.model == model)
@@ -1468,7 +1468,7 @@ pub struct Sample {
 }
 
 /// Words of `RasterView::counts` read back.
-pub const COUNTS: usize = 16;
+pub const COUNTS: usize = 18;
 /// Frames of each script whose figures are left out, while histories and exposure settle.
 const WARM_UP: u64 = 20;
 

@@ -9,10 +9,9 @@ use orr_gpu::{
     TextureUsage, ViewDesc,
 };
 use orr_lighting::{SceneLighting, SceneLightingSettings, ScenePass};
-use orr_math::{Mat3, Vec3};
 use orr_scene::{
-    Affine3, FrameDesc, FrameTime, LightGpu, MaterialWriter, RendererDesc, SceneCompute, SceneDesc,
-    SceneId, SceneRoot, SceneWriter, Scenes,
+    FrameDesc, FrameTime, LightGpu, MaterialWriter, RendererDesc, SceneCompute, SceneDesc, SceneId,
+    SceneRoot, SceneWriter, Scenes,
 };
 
 pub use gpu_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
@@ -219,17 +218,6 @@ impl TestScene {
             self.root_value().lights,
             u64::from(self.desc.light_capacity),
         )
-    }
-}
-
-/// `m` followed by the translation `t`.
-pub fn affine(m: Mat3, t: Vec3) -> Affine3 {
-    let r = |i: usize| {
-        let row = m.row(i);
-        [row.x, row.y, row.z, t[i]]
-    };
-    Affine3 {
-        rows: [r(0), r(1), r(2)],
     }
 }
 

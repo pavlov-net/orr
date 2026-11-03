@@ -1152,17 +1152,6 @@ impl World {
     }
 }
 
-fn affine(m: Mat3, t: Vec3) -> Affine3 {
-    let c = m.to_cols_array_2d();
-    Affine3 {
-        rows: [
-            [c[0][0], c[1][0], c[2][0], t.x],
-            [c[0][1], c[1][1], c[2][1], t.y],
-            [c[0][2], c[1][2], c[2][2], t.z],
-        ],
-    }
-}
-
 /// World from view for a camera at `eye` looking at `target`, y up.
 fn look(eye: Vec3, target: Vec3) -> Quat {
     let back = (eye - target).normalize();
@@ -1215,7 +1204,7 @@ fn place_at(w: &mut World, copies: &[Item], anchor: DVec3, rt_range: f32) -> Pla
         })
         .unwrap();
     for (i, (c, model)) in copies.iter().zip(models).enumerate() {
-        s.transforms(group, i as u32, 1).unwrap()[0] = affine(c.linear, c.at);
+        s.transforms(group, i as u32, 1).unwrap()[0] = Affine3::new(c.linear, c.at);
         let range = s
             .add_instances(&InstancesDesc {
                 model,
@@ -1337,7 +1326,7 @@ fn render(
         f.request_detail(placed.scene, VIEW_PIXELS_PER_RADIAN)
             .unwrap();
         for (i, c) in moved.iter().enumerate() {
-            s.transforms(placed.group, i as u32, 1).unwrap()[0] = affine(c.linear, c.at);
+            s.transforms(placed.group, i as u32, 1).unwrap()[0] = Affine3::new(c.linear, c.at);
         }
         assert!(moved.is_empty() || moved.len() as u32 == placed.count);
     }
@@ -3370,10 +3359,13 @@ fn motion_vectors_do_not_change_when_the_render_origin_moves() {
         let wobble = (f64::from(i) * 0.7).sin();
         let eye = DVec3::new(x, 2.0 + 0.1 * wobble, 4.0);
         let moved = vec![
-            (0, affine(Mat3::IDENTITY, Vec3::new(x as f32, 0.0, 0.0))),
+            (
+                0,
+                Affine3::new(Mat3::IDENTITY, Vec3::new(x as f32, 0.0, 0.0)),
+            ),
             (
                 1,
-                affine(
+                Affine3::new(
                     Mat3::from_rotation_y(0.1 * i as f32),
                     Vec3::new(x as f32 - 1.0 + 0.2 * wobble as f32, 0.9, -0.5),
                 ),
@@ -3472,7 +3464,7 @@ fn ptlas_work_past_the_budget_waits_and_lands_nearest_first() {
                     })
                     .unwrap();
                 for (i, t) in s.transforms(g, 0, 40).unwrap().iter_mut().enumerate() {
-                    *t = affine(Mat3::IDENTITY, Vec3::new(i as f32 * 2.0, 0.0, 0.0));
+                    *t = Affine3::new(Mat3::IDENTITY, Vec3::new(i as f32 * 2.0, 0.0, 0.0));
                 }
                 s.add_instances(&InstancesDesc {
                     model,
@@ -3632,7 +3624,7 @@ fn place_rigs_of(
         .iter_mut()
         .zip(&centers)
     {
-        *t = affine(Mat3::IDENTITY, c);
+        *t = Affine3::new(Mat3::IDENTITY, c);
     }
     let r = s
         .add_instances(&InstancesDesc {
@@ -4136,7 +4128,7 @@ fn rewriting_a_material_set_changes_only_the_copies_that_name_it() {
     let mut ranges = Vec::new();
     for (i, set) in [Some(0), Some(1), None].into_iter().enumerate() {
         s.transforms(group, i as u32, 1).unwrap()[0] =
-            affine(Mat3::IDENTITY, Vec3::new(i as f32 * 1.2 - 1.2, 0.0, 0.0));
+            Affine3::new(Mat3::IDENTITY, Vec3::new(i as f32 * 1.2 - 1.2, 0.0, 0.0));
         ranges.push(
             s.add_instances(&InstancesDesc {
                 model: plain,
@@ -4892,14 +4884,14 @@ fn worm_rig() -> (SkeletonInfo, Clip) {
 
 /// The worm's skinning matrices `t` seconds into its clip, as orr_pack's CPU reference
 /// samples and chains them.
-fn worm_palette(t: f32) -> Vec<orr_pack::Affine3> {
+fn worm_palette(t: f32) -> Vec<Affine3> {
     let (skeleton, clip) = worm_rig();
     let n = skeleton.joint_count();
     let mut locals = vec![Trs::IDENTITY; n];
     clip.sample(t, &mut locals);
-    let mut model = vec![orr_pack::Affine3::IDENTITY; n];
+    let mut model = vec![Affine3::IDENTITY; n];
     skeleton.model_pose(&locals, &mut model);
-    let mut palette = vec![orr_pack::Affine3::IDENTITY; n];
+    let mut palette = vec![Affine3::IDENTITY; n];
     skeleton.palette(&model, &mut palette);
     palette
 }
@@ -4953,7 +4945,7 @@ fn place_worms_of(w: &mut World, model: ModelId, copies: &[(Mat3, Vec3)], gpu: b
         .unwrap();
     let out = s.transforms(group, 0, n).unwrap();
     for (o, &(m, t)) in out.iter_mut().zip(copies) {
-        *o = affine(m, t);
+        *o = Affine3::new(m, t);
     }
     let range = s
         .add_skinned(&SkinnedDesc {
@@ -5023,12 +5015,7 @@ fn skinned_entry(view: &RasterView, entry: u32) -> (SkinnedGpu, SkinStateGpu, Ve
 
 /// The largest distance between `positions` (a copy's vertex array) and the CPU skin of the
 /// mesh's vertices in `clusters` by `palette`.
-fn skin_error(
-    mesh: &CpuMesh,
-    positions: &[Vec3],
-    clusters: &[u32],
-    palette: &[orr_pack::Affine3],
-) -> f32 {
+fn skin_error(mesh: &CpuMesh, positions: &[Vec3], clusters: &[u32], palette: &[Affine3]) -> f32 {
     let mut first = Vec::new();
     let mut total = 0u32;
     for page in &mesh.pages {
@@ -5643,7 +5630,7 @@ fn fracture_model(model: &str) {
     let placed = place_models(&mut w, &models);
     let linear = Mat3::from_rotation_x(0.9);
     let at = Vec3::new(0.0, 0.0, -6.0);
-    let shown = affine(linear, at);
+    let shown = Affine3::new(linear, at);
     let hidden = Affine3 {
         rows: [[0.0; 4]; 3],
     };
@@ -5715,7 +5702,7 @@ fn fracture_model(model: &str) {
             .map(|i| {
                 let side = i as f32 - 0.5 - 0.5 * PIECES as f32;
                 let t = at + Vec3::new(side * spread, 0.0, 0.0);
-                (i, affine(linear, t))
+                (i, Affine3::new(linear, t))
             })
             .collect();
         let g = shoot(&mut w, &placed, &shot(3 + step, moved));
@@ -5838,19 +5825,19 @@ fn vertices_a_kernel_moves_have_motion_for_the_frame_they_move() {
         shoot(
             &mut w,
             &placed,
-            &shot(1, vec![(0, affine(linear, at)), (1, hidden)]),
+            &shot(1, vec![(0, Affine3::new(linear, at)), (1, hidden)]),
         );
         let rigid = shoot(
             &mut w,
             &placed,
-            &shot(2, vec![(0, affine(linear, at + up))]),
+            &shot(2, vec![(0, Affine3::new(linear, at + up))]),
         );
         assert!(largest_motion(&rigid) > 1.0, "{name}: the lift shows");
 
         shoot(
             &mut w,
             &placed,
-            &shot(3, vec![(0, hidden), (1, affine(linear, at))]),
+            &shot(3, vec![(0, hidden), (1, Affine3::new(linear, at))]),
         );
         let quiet = shoot(&mut w, &placed, &shot(4, Vec::new()));
         assert!(
@@ -6246,10 +6233,10 @@ fn a_partial_edit_holds_what_it_touches_at_level_0_and_the_rest_keeps_its_detail
     let eye = DVec3::new(0.0, 0.5, 0.0);
     let target = DVec3::new(0.0, 0.0, -14.0);
     let mut sh = Shot::at(eye, target, 1);
-    sh.moved = vec![(0, affine(linear, at)), (1, hidden)];
+    sh.moved = vec![(0, Affine3::new(linear, at)), (1, hidden)];
     let base = shoot(&mut w, &placed, &sh);
     let mut sh = Shot::at(eye, target, 2);
-    sh.moved = vec![(0, hidden), (1, affine(linear, at))];
+    sh.moved = vec![(0, hidden), (1, Affine3::new(linear, at))];
     let g = shoot(&mut w, &placed, &sh);
     let r = rays(&g.view, &trace::MODULE, "pixels", 0);
     let (matched, covered) = parity(&g, &r, 2e-2);

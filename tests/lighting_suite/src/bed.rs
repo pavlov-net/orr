@@ -3,7 +3,8 @@
 //! frames and compared with FLIP.
 
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::ptr;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -19,8 +20,8 @@ use orr_gpu::{
 };
 use orr_lighting::{
     BsdfTables, DirectionalLight, DiscProfile, DofBackgroundPass, EnvironmentMapGpu, Light,
-    LightId, LightingKernels, LightingView, ParticleDraw, PathEntry, SceneLighting,
-    SceneLightingSettings, ScenePass, ViewLighting, ViewPass,
+    LightId, LightingKernels, LightingView, ParticleDraw, PathEntry, ReferenceSettings,
+    SceneLighting, SceneLightingSettings, ScenePass, ViewLighting, ViewPass,
 };
 use orr_math::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
@@ -36,7 +37,7 @@ use orr_scene::{
 use orr_shaders::bytemuck::Zeroable;
 
 use crate::shaders::{accumulate, exposure, flat_color, guide_read, particle_quads};
-use crate::{TestTexture, affine, device, linear_clamp, pipeline, render, texture, upload};
+use crate::{TestTexture, device, linear_clamp, pipeline, render, texture, upload};
 
 /// Render extent of every bed view.
 pub const EXTENT: [u32; 2] = [128, 96];
@@ -1535,7 +1536,7 @@ impl Bed {
             })
             .unwrap();
         for (i, (c, &model)) in spec.copies.iter().zip(&models).enumerate() {
-            w.transforms(group, i as u32, 1).unwrap()[0] = affine(c.linear, c.at);
+            w.transforms(group, i as u32, 1).unwrap()[0] = Affine3::new(c.linear, c.at);
             w.add_instances(&InstancesDesc {
                 model,
                 copies: 1,
@@ -2023,10 +2024,24 @@ impl FlatColor {
     }
 }
 
+/// Settings of the reference integrator with `max_bounces`.
+pub fn reference(max_bounces: u32) -> ViewLighting {
+    ViewLighting {
+        max_bounces,
+        reference: Some(ReferenceSettings::default()),
+        ..ViewLighting::default()
+    }
+}
+
+/// Luminance of a pixel of linear Rec.2020 radiance.
+pub fn luminance(p: &[f32; 4]) -> f64 {
+    orr_color::luminance(DVec3::new(p[0].into(), p[1].into(), p[2].into()))
+}
+
 /// orr_lighting's opaque dispatch and guide resolve recording into bed frames with
 /// `settings`.
 pub struct Paths {
-    kernels: LightingKernels,
+    kernels: &'static LightingKernels,
     pub settings: ViewLighting,
     /// The background layer request of every frame.
     pub dof_background: Option<DofBackgroundPass>,
@@ -2040,10 +2055,36 @@ pub struct Paths {
 }
 
 impl Paths {
+    /// The kernels of a set and entry compile once per process and stay: under the validation
+    /// layer each compile takes minutes.
     pub fn new(kernels: &KernelSet, entry: PathEntry, settings: ViewLighting) -> Self {
-        let tables = BsdfTables::new(device()).unwrap();
+        type Key = (Vec<usize>, PathEntry);
+        static COMPILED: Mutex<Vec<(Key, &'static OnceLock<LightingKernels>)>> =
+            Mutex::new(Vec::new());
+        let key = (
+            kernels
+                .modules
+                .iter()
+                .map(|m| ptr::from_ref(*m).addr())
+                .collect(),
+            entry,
+        );
+        let mut compiled = COMPILED.lock().unwrap_or_else(PoisonError::into_inner);
+        let slot = match compiled.iter().find(|(k, _)| *k == key) {
+            Some((_, slot)) => *slot,
+            None => {
+                let slot: &'static OnceLock<_> = Box::leak(Box::default());
+                compiled.push((key, slot));
+                slot
+            }
+        };
+        drop(compiled);
+        let kernels = slot.get_or_init(|| {
+            let tables = BsdfTables::new(device()).unwrap();
+            LightingKernels::new(device(), kernels, &tables, entry).unwrap()
+        });
         Self {
-            kernels: LightingKernels::new(device(), kernels, &tables, entry).unwrap(),
+            kernels,
             settings,
             dof_background: None,
             frost_guide: None,

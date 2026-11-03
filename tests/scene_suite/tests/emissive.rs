@@ -34,16 +34,6 @@ fn emitting(color: [f32; 3], luminance: f32) -> MaterialGpu {
     m
 }
 
-fn affine(m: Mat3, t: Vec3) -> Affine3 {
-    let r = |i: usize| {
-        let row = m.row(i);
-        [row.x, row.y, row.z, t[i]]
-    };
-    Affine3 {
-        rows: [r(0), r(1), r(2)],
-    }
-}
-
 fn entries(root: &SceneRoot) -> Vec<EmissiveGpu> {
     read_buffer(
         root.emissive,
@@ -126,7 +116,7 @@ fn instance_spans_follow_scale_material_sets_hidden_sections_and_removal() {
         })
         .unwrap();
     for (t, m) in w.transforms(g, 0, 5).unwrap().iter_mut().zip(scales) {
-        *t = affine(m, Vec3::new(1.0, 2.0, 3.0));
+        *t = Affine3::new(m, Vec3::new(1.0, 2.0, 3.0));
     }
     let desc = |model, copies, material_set| InstancesDesc {
         model: ModelId(model),
@@ -351,8 +341,8 @@ fn producer_power_follows_emitted_clusters_every_frame() {
                 })
                 .unwrap();
             w.transforms(group, 0, 2).unwrap().copy_from_slice(&[
-                affine(linear, Vec3::new(4.0, 0.0, -2.0)),
-                affine(Mat3::IDENTITY, Vec3::ZERO),
+                Affine3::new(linear, Vec3::new(4.0, 0.0, -2.0)),
+                Affine3::new(Mat3::IDENTITY, Vec3::ZERO),
             ]);
         },
         &[],
@@ -442,7 +432,7 @@ fn producer_power_follows_emitted_clusters_every_frame() {
     let root = run(
         &mut scenes,
         &mut |w| {
-            w.transforms(group, 0, 1).unwrap()[0] = affine(Mat3::IDENTITY, Vec3::ZERO);
+            w.transforms(group, 0, 1).unwrap()[0] = Affine3::new(Mat3::IDENTITY, Vec3::ZERO);
         },
         &[(ProducerId(1), 20, 1.0)],
     );

@@ -11,6 +11,7 @@ use lighting_suite::{
     TestScene, TestTexture, assert_clean, compute_barrier, copy_back, finish, kernels,
     linear_clamp, pipeline, read, readback, render, texture, upload,
 };
+use orr_color::RgbPrimaries;
 use orr_gpu::{GpuAddress, KernelSet, TextureIndex};
 use orr_lighting::{
     DirectionalLight, DirectionalState, DiscProfile, EnvironmentMapGpu, Light, LightId,
@@ -26,13 +27,6 @@ const DIRECTIONAL: &str = "light_sampling/directional";
 /// The slab's extinction and height (`media_types.slang`).
 const SLAB_SIGMA_T: [f64; 3] = [2e-4, 4e-4, 8e-4];
 const SLAB_HEIGHT: f64 = 1000.0;
-
-/// `REC2020_TO_XYZ` of `orr.color`.
-const REC2020_TO_XYZ: [[f64; 3]; 3] = [
-    [0.636958048, 0.144616904, 0.168880975],
-    [0.262700212, 0.677998072, 0.0593017165],
-    [0.0, 0.028072693, 1.06098506],
-];
 
 const SUN_RADIUS: f32 = 4.65e-3;
 
@@ -332,7 +326,7 @@ fn sky_stats_match_a_uniform_environment_and_a_slab() {
     );
 
     let c = v3(c);
-    let xyz = DVec3::from_array(REC2020_TO_XYZ.map(|row| DVec3::from_array(row).dot(c)));
+    let xyz = RgbPrimaries::REC2020.rgb_to_xyz() * c;
     let xy = [xyz.x / xyz.element_sum(), xyz.y / xyz.element_sum()];
     assert!(
         (f64::from(sky.dome_luminance) / xyz.y - 1.0).abs() < 1e-5,

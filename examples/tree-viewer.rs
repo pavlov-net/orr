@@ -247,7 +247,7 @@ fn wind_hints(path: &Path) -> HashMap<String, Hint> {
 }
 
 /// The model-space origin of a joint's bind space, from its inverse bind.
-fn bind_origin(inverse_bind: &orr::orr_pack::Affine3) -> Vec3 {
+fn bind_origin(inverse_bind: &Affine3) -> Vec3 {
     let [r0, r1, r2] = inverse_bind.rows.map(Vec4::from);
     Mat4::from_cols(r0, r1, r2, Vec4::W)
         .transpose()

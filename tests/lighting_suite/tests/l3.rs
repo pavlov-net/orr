@@ -7,8 +7,8 @@ use bytemuck::Zeroable;
 use glam::{DVec3, Mat3, Vec3};
 use lighting_suite::shaders::{emit, hotspot_bake, nee_probe, procedural_bake, tile_probe};
 use lighting_suite::{
-    TestScene, affine, assert_clean, compute_barrier, finish, kernels, pipeline, read, readback,
-    render, upload,
+    TestScene, assert_clean, compute_barrier, finish, kernels, pipeline, read, readback, render,
+    upload,
 };
 use orr_gpu::{ComputePipeline, GpuAddress, GpuPtr, Hazards, KernelSet, Stages};
 use orr_lighting::{
@@ -26,11 +26,8 @@ use shader_math::stats::chi_square_p;
 const BAKE: &str = "environment/bake";
 const SAMPLES: u32 = LIGHT_TILES * LIGHT_TILE_SIZE;
 
-/// Luminance of linear Rec.2020 (`orr.color`).
-const Y2020: [f64; 3] = [0.262700212, 0.677998072, 0.0593017165];
-
 fn y2020(c: [f32; 3]) -> f64 {
-    (0..3).map(|i| Y2020[i] * f64::from(c[i])).sum()
+    orr_color::luminance(DVec3::new(c[0].into(), c[1].into(), c[2].into()))
 }
 
 /// Records the scene pass alone, as frame `frame`.
@@ -463,8 +460,8 @@ fn emissive_producer_tiles_match_the_density_and_irradiance() {
     // only its double-sided quads light the receiver.
     let flip = Mat3::from_rotation_x(PI as f32);
     let transforms = [
-        affine(Mat3::IDENTITY, Vec3::new(0.0, 2.0, 0.0)),
-        affine(flip, Vec3::new(0.0, 2.5, 0.0)),
+        Affine3::new(Mat3::IDENTITY, Vec3::new(0.0, 2.0, 0.0)),
+        Affine3::new(flip, Vec3::new(0.0, 2.5, 0.0)),
     ];
     let quads = [
         Quads {
@@ -865,7 +862,7 @@ fn producer_power_equals_area_times_luminance_after_it_moves() {
                 w,
                 &materials,
                 DVec3::new(3000.0, 10.0, 7000.0),
-                &[affine(linear, Vec3::new(4.0, 0.0, -2.0))],
+                &[Affine3::new(linear, Vec3::new(4.0, 0.0, -2.0))],
                 ProducerUpdate::EveryFrame,
             );
         },

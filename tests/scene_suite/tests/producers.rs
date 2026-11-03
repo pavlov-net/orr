@@ -2420,7 +2420,7 @@ fn a_skinned_cage_poses_before_it_dices_and_moves_from_last_frames_pose() {
     );
     assert_closed(&g);
     let posed = |angle: f32| {
-        let palette = arm_palette(angle).map(|a| orr_pack::Affine3 { rows: a.rows });
+        let palette = arm_palette(angle).map(|a| Affine3 { rows: a.rows });
         let points = info.skinned_points(&palette);
         LimitSurface::new(&info, &pages, &points)
     };

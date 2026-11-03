@@ -4,6 +4,7 @@
 
 use lighting_suite::bed::{
     Accumulated, Analytic, BARE_LEAF, Bed, Item, LEAF, Paths, RINGS_LEAF, SUN, Spec, VEIL,
+    luminance,
 };
 use lighting_suite::shaders::alpha_probe;
 use lighting_suite::{assert_clean, device, linked, pipeline, readback, require, upload};
@@ -236,10 +237,6 @@ fn fractional_linked_coverage_lets_that_share_of_rays_through() {
 
 fn direct(bed: &mut Bed, paths: &Paths, seed: u32) -> Accumulated {
     bed.accumulate(32, seed, &mut |list, f| paths.record(list, f))
-}
-
-fn luminance(p: &[f32; 4]) -> f64 {
-    0.2627 * f64::from(p[0]) + 0.6780 * f64::from(p[1]) + 0.0593 * f64::from(p[2])
 }
 
 /// The alpha quad scene with `model` for its quad.

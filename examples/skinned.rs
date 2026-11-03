@@ -15,17 +15,17 @@ use std::time::{Duration, Instant};
 
 use examples::creature;
 use examples::mesh::MeshBuilder;
-use examples::shaders::{capture, pose, sun_shadow};
+use examples::shaders::pose;
+use examples::sun_shade::SunShade;
 use examples::window::Window;
-use examples::{Capture, Options, Workers, affine, assert_clean, device, fixed_time, mount_at};
-use orr::orr_gpu::{Format, Hazards, MemoryKind, QueueKind, SpecData, Stages, TimelinePoint};
-use orr::orr_output::Image;
+use examples::{Capture, Options, Workers, assert_clean, device, fixed_time, mount_at};
+use orr::orr_gpu::{QueueKind, SpecData, TimelinePoint};
 use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens,
-    PackSource, Projection, Renderer, RendererDesc, SceneDesc, SceneLightingSettings, SkinnedDesc,
-    TextureFilter, TransformGroupDesc, ViewDesc,
+    Affine3, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
+    InstancesDesc, Lens, PackSource, Projection, Renderer, RendererDesc, SceneDesc,
+    SceneLightingSettings, SkinnedDesc, TextureFilter, TransformGroupDesc, ViewDesc,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, LodMode, Manifest, MeshInput, MeshSettings, Source,
@@ -43,9 +43,6 @@ const FIRST_FRAME: u64 = 60;
 const FOV_Y: f32 = 0.9;
 /// Unit direction to the sun.
 const SUN: Vec3 = Vec3::new(-0.512_092_8, 0.716_929_9, 0.473_016_4);
-/// Sun illuminance and sky radiance, relative to paper white.
-const SUN_ILLUMINANCE: f32 = 3.0;
-const SKY: [f32; 3] = [0.18, 0.24, 0.34];
 /// Copies per side of the field, and the spacing between them in m.
 const SIDE: u32 = 10;
 const SPACING: f32 = 1.6;
@@ -151,9 +148,9 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             (z - (SIDE - 1) as f32 * 0.5 + 0.6 * jitter(8)) * SPACING,
         );
         let scale = 0.8 + 0.4 * (jitter(24) + 0.5);
-        *t = affine(Mat3::from_rotation_y(jitter(16) * 6.0) * scale, at);
+        *t = Affine3::new(Mat3::from_rotation_y(jitter(16) * 6.0) * scale, at);
     }
-    transforms[copies as usize] = affine(Mat3::IDENTITY, Vec3::ZERO);
+    transforms[copies as usize] = Affine3::new(Mat3::IDENTITY, Vec3::ZERO);
     w.add_skinned(&SkinnedDesc {
         model: tentacle,
         copies,
@@ -186,25 +183,13 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     let poser = renderer
         .compute_pipeline(&pose::MODULE, "main", SpecData::default())
         .expect("pose pipeline");
-    let shade = renderer
-        .compute_pipeline(&sun_shadow::MODULE, "main", SpecData::default())
-        .expect("shade pipeline");
-    let encode = renderer
-        .compute_pipeline(&capture::MODULE, "main", SpecData::default())
-        .expect("capture pipeline");
-    let slots = u64::from(desc.frames_in_flight);
-    let mut roots = gpu
-        .gpu_malloc::<sun_shadow::Root>(MemoryKind::Upload, slots, "skinned roots")
-        .expect("roots");
-    let mut capture_root = gpu
-        .gpu_malloc::<capture::Root>(MemoryKind::Upload, 1, "skinned capture root")
-        .expect("capture root");
-    let pixels = u64::from(HEADLESS_EXTENT[0] * HEADLESS_EXTENT[1]);
-    let readback = options.headless.then(|| {
-        gpu.gpu_malloc::<u32>(MemoryKind::Readback, pixels, "skinned capture")
-            .expect("readback")
-    });
-    let mut image: Option<Image> = None;
+    let mut shading = SunShade::new(
+        &mut renderer,
+        "skinned",
+        desc.frames_in_flight,
+        options.headless.then_some(HEADLESS_EXTENT),
+        SUN,
+    );
 
     let frames = options
         .frames
@@ -295,56 +280,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         .expect("update scenes");
         let view = f.raster_view(&desc).expect("raster view");
 
-        let fresh = image
-            .as_ref()
-            .is_none_or(|im| im.texture().desc().extent[..2] != extent);
-        if fresh {
-            image = Some(
-                Image::new(gpu, Format::Rgba16Float, extent, "skinned shaded").expect("image"),
-            );
-        }
-        let target = image.as_ref().expect("image");
-        let slot = f.id() % slots;
-        roots.as_mut_slice().expect("roots")[slot as usize] = sun_shadow::Root {
-            scene: view.scene,
-            view: view.view,
-            gbuffer: view.gbuffer,
-            target: target.storage,
-            mode: 0,
-            sun: [SUN.x, SUN.y, SUN.z, SUN_ILLUMINANCE],
-            sky: [SKY[0], SKY[1], SKY[2], 1.0],
-        };
-        let (shade, encode) = (f.pipeline(shade), f.pipeline(encode));
-        let list = f.list().expect("frame list");
-        if fresh {
-            list.discard(target.texture());
-        }
-        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-        list.begin_pass("sun shadow", false);
-        list.dispatch(
-            shade,
-            roots.gpu().offset(slot),
-            [extent[0].div_ceil(8), extent[1].div_ceil(8), 1],
-        );
-        list.end_pass();
-        if let Some(out) = readback.as_ref().filter(|_| final_frame) {
-            capture_root.as_mut_slice().expect("capture root")[0] = capture::Root {
-                pixels: out.gpu(),
-                source: target.sampled,
-                width: extent[0],
-                height: extent[1],
-                pad0: 0,
-                pad1: 0,
-            };
-            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-            list.dispatch(
-                encode,
-                capture_root.gpu(),
-                [extent[0].div_ceil(8), extent[1].div_ceil(8), 1],
-            );
-            list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
-        }
-        f.compose(target.sampled).expect("compose");
+        shading.record(&mut f, &view, extent, 0, final_frame);
         last = Some(f.end().expect("end frame"));
     }
 
@@ -357,10 +293,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             .wait(point, Duration::from_secs(10))
             .expect("wait");
     }
-    let captured = readback
-        .filter(|_| last.is_some())
-        .map(|out| Capture::from_readback(HEADLESS_EXTENT, &out));
-    drop(image);
+    let captured = shading.capture().filter(|_| last.is_some());
     drop(display);
     drop(renderer);
     drop(window);

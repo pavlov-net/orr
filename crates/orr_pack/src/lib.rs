@@ -29,6 +29,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use bytemuck::{Pod, Zeroable};
+use orr_math::{Mat3, Vec3};
 
 pub use archive::{Archive, StoredRange};
 pub use bc_split::BcLayout;
@@ -110,7 +111,7 @@ impl Aabb {
 
 /// An affine transform as three rows `[R | t]`, 48 B.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct Affine3 {
     pub rows: [[f32; 4]; 3],
 }
@@ -123,6 +124,16 @@ impl Affine3 {
             [0.0, 0.0, 1.0, 0.0],
         ],
     };
+
+    /// `m` followed by the translation `t`.
+    pub fn new(m: Mat3, t: Vec3) -> Self {
+        Self {
+            rows: std::array::from_fn(|i| {
+                let row = m.row(i);
+                [row.x, row.y, row.z, t[i]]
+            }),
+        }
+    }
 
     pub fn transform_point(&self, p: [f32; 3]) -> [f32; 3] {
         self.rows

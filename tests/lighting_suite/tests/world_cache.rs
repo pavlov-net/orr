@@ -4,7 +4,7 @@
 
 use bytemuck::Zeroable;
 use lighting_suite::bed::{
-    Accumulated, Analytic, Bed, CORNELL, EMITTER, FLOOR, Item, Paths, Spec, WHITE_SPHERE,
+    Accumulated, Analytic, Bed, CORNELL, EMITTER, FLOOR, Item, Paths, Spec, WHITE_SPHERE, reference,
 };
 use lighting_suite::shaders::cache_probe;
 use lighting_suite::{TestScene, assert_clean, finish, pipeline, readback, render, upload};
@@ -12,7 +12,7 @@ use orr_color::luminance;
 use orr_gpu::{ComputePipeline, GpuPtr, Hazards, KernelSet, Stages};
 use orr_lighting::{
     DirectionalLight, DiscProfile, Light, LightId, LightingDebugView, LightingStats, PathEntry,
-    ReferenceSettings, SceneLighting, SceneLightingSettings, ViewLighting, WorldCacheSettings,
+    SceneLighting, SceneLightingSettings, ViewLighting, WorldCacheSettings,
 };
 use orr_math::{Mat3, Vec3};
 use orr_scene::{SceneDesc, SceneWriter};
@@ -475,14 +475,6 @@ fn a_cell_whose_light_doubles_catches_up_within_a_second() {
 
 fn realtime() -> ViewLighting {
     ViewLighting::default()
-}
-
-fn reference(max_bounces: u32) -> ViewLighting {
-    ViewLighting {
-        max_bounces,
-        reference: Some(ReferenceSettings::default()),
-        ..ViewLighting::default()
-    }
 }
 
 fn paths(settings: ViewLighting) -> Paths {

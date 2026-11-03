@@ -13,11 +13,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use examples::mesh::MeshBuilder;
-use examples::shaders::{capture, sun_shadow};
+use examples::sun_shade::SunShade;
 use examples::window::Window;
 use examples::{Capture, Options, Workers, assert_clean, device, fixed_time, gray_png};
-use orr::orr_gpu::{Format, Hazards, MemoryKind, QueueKind, SpecData, Stages, TimelinePoint};
-use orr::orr_output::Image;
+use orr::orr_gpu::{QueueKind, TimelinePoint};
 use orr::orr_pack::material::{Material, slot};
 use orr::orr_pack::{AssetId, Target};
 use orr::{
@@ -41,9 +40,6 @@ const HEADLESS_FRAMES: u64 = 120;
 const FOV_Y: f32 = 0.8;
 /// Unit direction to the sun.
 const SUN: Vec3 = Vec3::new(-0.453_413_4, 0.654_930_5, 0.604_551_3);
-/// Sun illuminance and sky radiance, relative to paper white.
-const SUN_ILLUMINANCE: f32 = 3.0;
-const SKY: [f32; 3] = [0.18, 0.24, 0.34];
 const TARGET: Vec3 = Vec3::new(0.4, 1.0, 0.0);
 /// Radians per second.
 const ORBIT_RATE: f64 = 0.25;
@@ -158,25 +154,13 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     drop(w);
     f.end().expect("end frame");
 
-    let shade = renderer
-        .compute_pipeline(&sun_shadow::MODULE, "main", SpecData::default())
-        .expect("shade pipeline");
-    let encode = renderer
-        .compute_pipeline(&capture::MODULE, "main", SpecData::default())
-        .expect("capture pipeline");
-    let slots = u64::from(desc.frames_in_flight);
-    let mut roots = gpu
-        .gpu_malloc::<sun_shadow::Root>(MemoryKind::Upload, slots, "cluster-rt roots")
-        .expect("roots");
-    let mut capture_root = gpu
-        .gpu_malloc::<capture::Root>(MemoryKind::Upload, 1, "cluster-rt capture root")
-        .expect("capture root");
-    let pixels = u64::from(HEADLESS_EXTENT[0] * HEADLESS_EXTENT[1]);
-    let readback = options.headless.then(|| {
-        gpu.gpu_malloc::<u32>(MemoryKind::Readback, pixels, "cluster-rt capture")
-            .expect("readback")
-    });
-    let mut image: Option<Image> = None;
+    let mut shading = SunShade::new(
+        &mut renderer,
+        "cluster-rt",
+        desc.frames_in_flight,
+        options.headless.then_some(HEADLESS_EXTENT),
+        SUN,
+    );
 
     let frames = options
         .frames
@@ -249,56 +233,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             })
             .expect("raster view");
 
-        let fresh = image
-            .as_ref()
-            .is_none_or(|im| im.texture().desc().extent[..2] != extent);
-        if fresh {
-            image = Some(
-                Image::new(gpu, Format::Rgba16Float, extent, "cluster-rt shaded").expect("image"),
-            );
-        }
-        let target = image.as_ref().expect("image");
-        let slot = f.id() % slots;
-        roots.as_mut_slice().expect("roots")[slot as usize] = sun_shadow::Root {
-            scene: view.scene,
-            view: view.view,
-            gbuffer: view.gbuffer,
-            target: target.storage,
-            mode: u32::from(clusters),
-            sun: [SUN.x, SUN.y, SUN.z, SUN_ILLUMINANCE],
-            sky: [SKY[0], SKY[1], SKY[2], 1.0],
-        };
-        let (shade, encode) = (f.pipeline(shade), f.pipeline(encode));
-        let list = f.list().expect("frame list");
-        if fresh {
-            list.discard(target.texture());
-        }
-        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-        list.begin_pass("sun shadow", false);
-        list.dispatch(
-            shade,
-            roots.gpu().offset(slot),
-            [extent[0].div_ceil(8), extent[1].div_ceil(8), 1],
-        );
-        list.end_pass();
-        if let Some(out) = readback.as_ref().filter(|_| final_frame) {
-            capture_root.as_mut_slice().expect("capture root")[0] = capture::Root {
-                pixels: out.gpu(),
-                source: target.sampled,
-                width: extent[0],
-                height: extent[1],
-                pad0: 0,
-                pad1: 0,
-            };
-            list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-            list.dispatch(
-                encode,
-                capture_root.gpu(),
-                [extent[0].div_ceil(8), extent[1].div_ceil(8), 1],
-            );
-            list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
-        }
-        f.compose(target.sampled).expect("compose");
+        shading.record(&mut f, &view, extent, u32::from(clusters), final_frame);
         last = Some(f.end().expect("end frame"));
     }
 
@@ -311,10 +246,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             .wait(point, Duration::from_secs(10))
             .expect("wait");
     }
-    let captured = readback
-        .filter(|_| last.is_some())
-        .map(|out| Capture::from_readback(HEADLESS_EXTENT, &out));
-    drop(image);
+    let captured = shading.capture().filter(|_| last.is_some());
     drop(display);
     drop(renderer);
     drop(window);

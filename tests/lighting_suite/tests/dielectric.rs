@@ -12,14 +12,13 @@ use lighting_suite::bed::{
     LINE_HALF_HEIGHT, LINE_HALF_WIDTH, MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, OverlayFrontLayer,
     PRESENCE_VEIL, PRESENCE_VEIL_OPACITY, PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR,
     Particle, ParticleLook, Paths, ROUGH_SLAB, SLAB_THICKNESS, SMOOTH_FLOOR, SUN, SpareView, Spec,
-    TINTED_SLAB, WATER_BOX, fresnel, prism_corners, water_transmission,
+    TINTED_SLAB, WATER_BOX, fresnel, prism_corners, reference, water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
 use lighting_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::{
-    DirectionalLight, DiscProfile, Light, LightingDebugView, PathEntry, ReferenceSettings,
-    ViewLighting,
+    DirectionalLight, DiscProfile, Light, LightingDebugView, PathEntry, ViewLighting,
 };
 use orr_math::{DMat3, DVec3, Mat3, Vec2, Vec3};
 use orr_scene::Opacity;
@@ -147,14 +146,6 @@ fn the_front_layer_is_the_nearest_overlay_or_see_through_layer() {
 
 fn paths(settings: ViewLighting) -> Paths {
     Paths::new(&KernelSet::default(), PathEntry::Compute, settings)
-}
-
-fn reference(max_bounces: u32) -> ViewLighting {
-    ViewLighting {
-        max_bounces,
-        reference: Some(ReferenceSettings::default()),
-        ..ViewLighting::default()
-    }
 }
 
 fn render_paths(bed: &mut Bed, paths: &Paths, frames: u32) -> Accumulated {

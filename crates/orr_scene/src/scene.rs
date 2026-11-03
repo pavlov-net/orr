@@ -97,22 +97,7 @@ impl Default for SceneDesc {
     }
 }
 
-/// A 3x4 row-major affine transform, rows [R | t].
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
-pub struct Affine3 {
-    pub rows: [[f32; 4]; 3],
-}
-
-impl Affine3 {
-    pub const IDENTITY: Self = Self {
-        rows: [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-        ],
-    };
-}
+pub use orr_pack::Affine3;
 
 /// A transform group in one scene. Group 0 is the null group: it holds nothing and hides
 /// whatever names it.

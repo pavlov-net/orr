@@ -12,6 +12,7 @@ use lighting_math::{
 use openpbr_ref::harness::{self, Estimate, integrate_cells};
 use openpbr_ref::materials::{Material, VIEW_COSINES, grid, view};
 use openpbr_ref::report::{Counts, TABLE_TOLERANCE, evaluate};
+use openpbr_ref::walk::fresnel;
 use openpbr_ref::{Bsdf, Inputs, Lobe, Reference};
 use shader_math::stats::{Rng, SphereGrid};
 
@@ -498,19 +499,6 @@ fn finite_for_any_parameters_and_directions() {
             }
         }
     }
-}
-
-/// Unpolarized Fresnel reflectance from a medium into one `eta` times denser at incidence
-/// cosine `c`; 1 past the critical angle.
-fn fresnel(eta: f64, c: f64) -> f64 {
-    let s2 = (1.0 - c * c) / (eta * eta);
-    if s2 >= 1.0 {
-        return 1.0;
-    }
-    let t = (1.0 - s2).sqrt();
-    let rs = (c - eta * t) / (c + eta * t);
-    let rp = (t - eta * c) / (t + eta * c);
-    0.5 * (rs * rs + rp * rp)
 }
 
 /// A smooth dielectric seen from either side at several angles, in air and in water:
