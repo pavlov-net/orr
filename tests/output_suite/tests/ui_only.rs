@@ -31,6 +31,7 @@ fn ui_only_frames_present_egui_over_black() {
     .unwrap();
     // The test asks for encodings the OS may have off.
     display.set_feed(None);
+    let hdr = output_suite::offers_hdr(&display);
     let mut renderer = Renderer::new(gpu, desc).unwrap();
     let mut painter = Painter::new(gpu, desc.frames_in_flight).unwrap();
     let ctx = Context::default();
@@ -41,7 +42,7 @@ fn ui_only_frames_present_egui_over_black() {
     let mut pending = TexturesDelta::default();
     for i in 0..FRAMES {
         window.pump();
-        if i == FRAMES / 2 {
+        if i == FRAMES / 2 && hdr {
             display.set_request(&DisplayRequest {
                 encoding: Some(OutputFormat::Hdr10Pq),
                 ..sdr
@@ -97,7 +98,7 @@ fn ui_only_frames_present_egui_over_black() {
             assert!(present_id > last_present_id, "present ids increase");
             last_present_id = present_id;
             assert_eq!(p.extent, [w, h]);
-            let encoding = if i < FRAMES / 2 {
+            let encoding = if i < FRAMES / 2 || !hdr {
                 OutputFormat::Sdr
             } else {
                 OutputFormat::Hdr10Pq
