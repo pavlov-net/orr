@@ -58,12 +58,22 @@ pub struct DisplayInfo {
 
 /// The latest `DisplayInfo` and a count that rises each time it changes. Clones share one
 /// value; any thread may read or write it.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DisplayFeed(Arc<Mutex<(u64, DisplayInfo)>>);
 
 impl DisplayFeed {
     pub fn new(info: DisplayInfo) -> Self {
         Self(Arc::new(Mutex::new((0, info))))
+    }
+
+    /// For a window whose OS report is unknown: Windows lists PQ with HDR on or off, and PQ on
+    /// an SDR desktop looks dim and washed out, so it resolves to SDR.
+    #[cfg(windows)]
+    pub(crate) fn hdr_off() -> Self {
+        Self::new(DisplayInfo {
+            os_hdr_on: Some(false),
+            ..DisplayInfo::default()
+        })
     }
 
     /// Stores `info`, raising the count if it differs from the current value.

@@ -183,7 +183,7 @@ impl DisplayWatch {
             windows_core::Result::Ok(())
         })?;
         let info = display_information(hwnd)?;
-        let feed = DisplayFeed::default();
+        let feed = DisplayFeed::hdr_off();
         let reader = Reader {
             hwnd: hwnd.0 as isize,
             feed: feed.clone(),

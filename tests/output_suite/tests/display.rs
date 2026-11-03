@@ -3,6 +3,8 @@
 //! change, the extent following window resizes, and both present modes.
 #![cfg(windows)]
 
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use gpu_suite::window::Window;
 use orr_output::{
     ComposePass, ComposeRoot, ComposeSource, Display, DisplayFeed, DisplayInfo, DisplayRequest,
@@ -15,6 +17,12 @@ use orr_scene::orr_gpu::{
 use orr_scene::testing::{assert_clean, device, wait};
 
 const FRAMES_IN_FLIGHT: u32 = 2;
+
+/// The tests share the windows' closed flag and the GPU; one runs at a time.
+fn serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// What the window's monitor reports with HDR on.
 fn hdr_on(sdr_white_nits: f32) -> DisplayInfo {
@@ -126,8 +134,58 @@ impl Renderer {
     }
 }
 
+/// A window's raw handles on their way to another thread.
+struct Handles<T>(T);
+
+// SAFETY: a Win32 window handle is a plain id, which any thread may name.
+unsafe impl<T> Send for Handles<T> {}
+
+impl<T> Handles<T> {
+    fn get(self) -> T {
+        self.0
+    }
+}
+
+#[test]
+fn a_display_that_cannot_watch_the_os_presents_sdr() {
+    let _serial = serial();
+    let gpu = device();
+    let mut window = Window::new("orr display", 640, 400);
+    let handles = Handles((window.window_handle(), window.display_handle()));
+    // Off the window's thread, where the watch fails.
+    let mut display = std::thread::spawn(move || {
+        let (window, display) = handles.get();
+        Display::new(
+            gpu,
+            window,
+            display,
+            &DisplayRequest::default(),
+            FRAMES_IN_FLIGHT,
+        )
+        .unwrap()
+    })
+    .join()
+    .unwrap();
+    let mut r = Renderer::new();
+    window.pump();
+    let d = r.frame(&mut display, true, false);
+    assert_eq!(d.encoding, OutputFormat::Sdr);
+
+    // Asked to ignore the OS, the surface's formats decide, and Windows lists PQ.
+    display.set_feed(None);
+    window.pump();
+    let d = r.frame(&mut display, true, false);
+    assert_eq!(d.encoding, OutputFormat::Hdr10Pq);
+
+    drop(display);
+    drop(window);
+    gpu.collect_garbage();
+    assert_clean();
+}
+
 #[test]
 fn display_follows_feed_request_and_window() {
+    let _serial = serial();
     let gpu = device();
     let mut window = Window::new("orr display", 640, 400);
     let feed = DisplayFeed::new(hdr_on(200.0));
@@ -152,6 +210,7 @@ fn display_follows_feed_request_and_window() {
     // It watches the OS on its own, and follows what the OS says.
     let os = display.feed().expect("watches the OS").latest().1;
     assert!(os.os_hdr_on.is_some());
+    assert!(os.min_nits.is_some(), "a report from the OS: {os:?}");
     let d = frames(&mut display, &mut window, 1);
     if os.os_hdr_on == Some(false) {
         assert_eq!(d.encoding, OutputFormat::Sdr);
