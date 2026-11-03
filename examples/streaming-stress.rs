@@ -255,7 +255,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         },
         ..RendererDesc::default()
     };
-    let mut window = (!options.headless).then(|| Window::new("orr streaming stress", 1280, 720));
+    let mut window = (!options.headless).then(|| Window::new("orr streaming stress", 1920, 1080));
     let mut display = window.as_ref().map(|w| {
         Display::new(
             gpu,

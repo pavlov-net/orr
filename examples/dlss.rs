@@ -113,7 +113,7 @@ fn cycle(
 
 fn run(options: &Options) {
     let gpu = device();
-    let mut window = Window::new("orr dlss", 1600, 900);
+    let mut window = Window::new("orr dlss", 1920, 1080);
     let desc = RendererDesc::default();
     let request = |encoding: Option<OutputFormat>, hdr: bool| DisplayRequest {
         hdr,
@@ -381,7 +381,7 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
             }
         }
     };
-    let mut window = (!options.headless).then(|| Window::new("orr dlss sr", 1600, 900));
+    let mut window = (!options.headless).then(|| Window::new("orr dlss sr", 1920, 1080));
     let desc = RendererDesc::default();
     let mut display = window.as_ref().map(|w| {
         Display::new(

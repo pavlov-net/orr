@@ -1476,7 +1476,7 @@ const WARM_UP: u64 = 20;
 /// headless runs capture the last frame of the last script.
 pub fn run(options: &Options, settings: &Settings) -> Run {
     let gpu = device();
-    let mut window = (!options.headless).then(|| Window::new("orr dense vegetation", 1280, 720));
+    let mut window = (!options.headless).then(|| Window::new("orr dense vegetation", 1920, 1080));
     let desc = renderer_desc(settings);
     let mut display = window.as_ref().map(|w| {
         Display::new(
