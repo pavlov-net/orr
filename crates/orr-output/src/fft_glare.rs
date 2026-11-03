@@ -42,8 +42,8 @@ pub(crate) struct FftLayout {
     size: [u32; 2],
     /// log2 of the padded row and column lengths.
     log2: [u32; 2],
-    /// The kernel's radius in pixels: a quarter of the image's longer side, as far as the
-    /// padding allows.
+    /// The kernel's radius in pixels: 4/9 of the image's height, a quarter of the width at
+    /// 16:9, as far as the padding allows.
     radius: u32,
     first_level: u32,
 }
@@ -53,7 +53,7 @@ impl FftLayout {
     /// or tall for the transforms or too small for a kernel of `MIN_RADIUS`.
     pub(crate) fn new(extent: [u32; 2], first_level: u32) -> Option<Self> {
         let size = extent.map(|n| (n >> first_level).max(1));
-        let share = size[0].max(size[1]).div_ceil(4);
+        let share = (4 * size[1]).div_ceil(9);
         let room = |n: u32| {
             let padded = (n + 2 * share).next_power_of_two().min(MAX_LENGTH);
             padded.saturating_sub(n) / 2

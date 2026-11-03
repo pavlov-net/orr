@@ -936,7 +936,7 @@ mod glare {
     /// The harness's view at `extent` with the reference pixel pitch, glare `strength`.
     fn harness(extent: [u32; 2], glare: Option<f32>) -> Harness {
         let mut h = Harness::new(extent[0], extent[1]);
-        h.sensor_width_mm = (data::REFERENCE_PITCH_UM * f64::from(extent[0]) / 1000.0) as f32;
+        h.sensor_height_mm = (data::REFERENCE_PITCH_UM * f64::from(extent[1]) / 1000.0) as f32;
         h.glare = glare.map(|strength| Glare { strength });
         h
     }
@@ -1369,6 +1369,32 @@ mod glare {
         assert_clean();
     }
 
+    /// At one height and sensor, bands and FFT take the same weights at any width.
+    #[test]
+    fn weights_ignore_the_aspect_ratio() {
+        let ev = ev_at(4);
+        // The reference pitch at the height below, whatever the width.
+        let sensor_mm = (data::REFERENCE_PITCH_UM * 128.0 / 1000.0) as f32;
+        let weights_at = |extent: [u32; 2], out: &ViewOutput| {
+            let mut h = Harness::new(extent[0], extent[1]);
+            h.glare = Some(Glare { strength: 1.0 });
+            h.sensor_height_mm = sensor_mm;
+            let nits = vec![1.0; (extent[0] * extent[1]) as usize];
+            settle(&mut h, &nits, out, &sdr());
+            weights(&h)
+        };
+        let bands = output(ev, OutputDebug::None);
+        let wide = weights_at([512, 128], &bands);
+        assert_eq!(wide, weights_at([128, 128], &bands));
+        assert_weights(&wide, &expected_weights(1, data::F_NUMBERS[4], 7), "bands");
+        let fft = fft_output(ev, OutputDebug::None, 1);
+        assert_eq!(
+            weights_at([512, 128], &fft)[0],
+            weights_at([128, 128], &fft)[0]
+        );
+        assert_clean();
+    }
+
     /// Distance from `center` along its row to the last pixel at or above `level` (green,
     /// display-linear).
     fn reach(image: &[[f32; 4]], width: u32, center: [u32; 2], level: f32) -> u32 {
@@ -1471,11 +1497,11 @@ mod glare {
         }
     }
 
-    /// The FFT's image size and kernel radius for `extent`: a quarter of the longer side of
-    /// the image at its resolution, as far as power-of-two padding up to 4096 allows.
+    /// The FFT's image size and kernel radius for `extent`: 4/9 of the image's height at its
+    /// resolution, as far as power-of-two padding up to 4096 allows.
     fn fft_layout(extent: [u32; 2], first_level: u32) -> ([u32; 2], i64) {
         let size = extent.map(|n| n >> first_level);
-        let share = size[0].max(size[1]).div_ceil(4);
+        let share = (4 * size[1]).div_ceil(9);
         let room = |n: u32| ((n + 2 * share).next_power_of_two().min(4096) - n) / 2;
         (size, i64::from(share.min(room(size[0])).min(room(size[1]))))
     }

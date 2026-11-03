@@ -888,9 +888,9 @@ fn render_view_runs_the_glare_its_lens_asks_for() {
             .map(|t| orr_color::srgb_decode(f64::from(half::f16::from_bits(t[1]).to_f32())))
             .collect()
     };
-    // 3 mm over 320 pixels is the pixel pitch glare's fit takes as its reference.
+    // 2.25 mm over 240 pixels is the pixel pitch glare's fit takes as its reference.
     let bare = Lens {
-        sensor_width_mm: 3.0,
+        sensor_height_mm: 2.25,
         glare: None,
         ..Lens::default()
     };
@@ -914,11 +914,11 @@ fn render_view_runs_the_glare_its_lens_asks_for() {
         ..on
     };
     let doubled = read(render(double, bands, LAMP_EV100));
-    let wide = Lens {
-        sensor_width_mm: 36.0,
+    let coarse_lens = Lens {
+        sensor_height_mm: 27.0,
         ..on
     };
-    let coarse = read(render(wide, bands, LAMP_EV100));
+    let coarse = read(render(coarse_lens, bands, LAMP_EV100));
     let convolved = read(render(on, fft, LAMP_EV100));
     // One stop darker this frame: glare must read the exposure this frame's adapt wrote.
     let darker = read(render(on, bands, LAMP_EV100 + 1.0));
