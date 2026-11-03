@@ -305,14 +305,13 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             },
             lens: Lens::default(),
             camera_cut: false,
+            not_rendering_scene: false,
+            screenshot: (capture && final_frame)
+                .then_some(ScreenshotRequest::Display { include_ui: false }),
             texture_filter: TextureFilter::Hardware,
             target: view_target,
         };
-        let output = ViewOutput {
-            screenshot: (capture && final_frame)
-                .then_some(ScreenshotRequest::Display { include_ui: false }),
-            ..ViewOutput::default()
-        };
+        let output = ViewOutput::default();
         f.prepare_view(&view, &lighting, &output)
             .expect("prepare view");
         f.update_scenes(&mut |c| pond.record(c, POND, slab_kernel, t as f32))

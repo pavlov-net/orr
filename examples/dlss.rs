@@ -285,6 +285,8 @@ fn run(options: &Options) {
                     },
                     lens: switches.lens(),
                     camera_cut: false,
+                    not_rendering_scene: false,
+                    screenshot: None,
                     texture_filter: TextureFilter::Hardware,
                     target: ViewTarget::Display,
                 },

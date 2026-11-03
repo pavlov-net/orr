@@ -1610,11 +1610,7 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                 f.scene(scene.scene)
                     .expect("scene writer")
                     .set_focus(eye.as_dvec3());
-                let output = ViewOutput {
-                    screenshot: (options.headless && final_frame)
-                        .then_some(ScreenshotRequest::Display { include_ui: false }),
-                    ..ViewOutput::default()
-                };
+                let output = ViewOutput::default();
                 let lit = LitView {
                     scene: scene.scene,
                     history: scene.history,
@@ -1626,6 +1622,9 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                     },
                     lens: Lens::default(),
                     camera_cut: i == 0,
+                    not_rendering_scene: false,
+                    screenshot: (options.headless && final_frame)
+                        .then_some(ScreenshotRequest::Display { include_ui: false }),
                     texture_filter: TextureFilter::Hardware,
                     target: view_target,
                 };

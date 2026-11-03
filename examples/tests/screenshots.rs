@@ -279,6 +279,8 @@ fn still_view<'a>(
         },
         lens: Lens::default(),
         camera_cut,
+        not_rendering_scene: false,
+        screenshot: None,
         texture_filter: TextureFilter::Hardware,
         target,
     }
@@ -342,8 +344,6 @@ impl StillShowcase {
                 .set_focus(eye.as_dvec3());
             let output = ViewOutput {
                 reconstruction: settings.reconstruction,
-                screenshot: (i + 1 == frames)
-                    .then_some(ScreenshotRequest::Display { include_ui: false }),
                 ..ViewOutput::default()
             };
             let mut sum = average.as_mut().map(|a| a.hook(&f, extent));
@@ -376,6 +376,8 @@ impl StillShowcase {
                             shutter: 0.0,
                             ..Lens::default()
                         },
+                        screenshot: (i + 1 == frames)
+                            .then_some(ScreenshotRequest::Display { include_ui: false }),
                         ..still_view(
                             self.showcase.scene,
                             self.history,
@@ -959,6 +961,9 @@ impl Lamp {
                             ..Lens::default()
                         },
                         camera_cut: i == 0 || (settings.cut && final_frame),
+                        not_rendering_scene: false,
+                        screenshot: final_frame
+                            .then_some(ScreenshotRequest::Display { include_ui: false }),
                         texture_filter: TextureFilter::Hardware,
                         target: ViewTarget::Texture(&target),
                     },
@@ -971,8 +976,6 @@ impl Lamp {
                         exposure: Exposure::Manual { ev100: LAMP_EV100 },
                         debug: OutputDebug::Linear,
                         reconstruction: settings.reconstruction,
-                        screenshot: final_frame
-                            .then_some(ScreenshotRequest::Display { include_ui: false }),
                         ..ViewOutput::default()
                     },
                     &mut hooks,

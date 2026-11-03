@@ -57,6 +57,7 @@ pub struct Harness {
     pub sensor_width_mm: f32,
     composite: Option<(GlareComposite, GlareMethod)>,
     cut_next: bool,
+    screenshot_next: Option<ScreenshotRequest>,
 }
 
 impl Harness {
@@ -132,6 +133,7 @@ impl Harness {
             sensor_width_mm: 36.0,
             composite: None,
             cut_next: false,
+            screenshot_next: None,
         }
     }
 
@@ -165,10 +167,14 @@ impl Harness {
         self.cut_next = true;
     }
 
+    /// Makes the next [`Self::frame`] take this screenshot: a scene-referred one before the
+    /// exposure passes, a display one (without UI) after tonemap.
+    pub fn screenshot_next(&mut self, request: ScreenshotRequest) {
+        self.screenshot_next = Some(request);
+    }
+
     /// Runs one frame with the image's luminance times `scale`: the exposure passes, then
-    /// tonemap when `display` is set, and `output.screenshot`, a scene-referred one before
-    /// the exposure passes and a display one (without UI) after tonemap. Returns the frame's
-    /// telemetry.
+    /// tonemap when `display` is set. Returns the frame's telemetry.
     pub fn frame(
         &mut self,
         scale: f32,
@@ -177,6 +183,7 @@ impl Harness {
     ) -> ExposureTelemetry {
         let gpu = device();
         self.frame += 1;
+        let screenshot = self.screenshot_next.take();
         let mut constants: ViewConstants = bytemuck::Zeroable::zeroed();
         constants.exposure = self.exposure.gpu();
         constants.exposure_slot = (self.frame % 2) as u32;
@@ -212,7 +219,7 @@ impl Harness {
         let groups = [self.extent[0].div_ceil(8), self.extent[1].div_ceil(8), 1];
         list.dispatch(&self.synth, self.synth_root.gpu(), groups);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        if let Some(ScreenshotRequest::SceneReferred { rec709 }) = output.screenshot {
+        if let Some(ScreenshotRequest::SceneReferred { rec709 }) = screenshot {
             let sdr = DisplayRequest::default().resolve(&[OutputFormat::Sdr], None, false);
             self.kernels
                 .capture_scene_referred(
@@ -281,7 +288,7 @@ impl Harness {
                 },
                 None,
             );
-            if let Some(ScreenshotRequest::Display { .. }) = output.screenshot {
+            if let Some(ScreenshotRequest::Display { .. }) = screenshot {
                 list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
                 self.kernels
                     .capture(

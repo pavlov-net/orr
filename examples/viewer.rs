@@ -148,12 +148,6 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         f.scene(scene)
             .expect("scene writer")
             .set_focus(eye.as_dvec3());
-        let output = ViewOutput {
-            screenshot: (capture && final_frame).then_some(ScreenshotRequest::Display {
-                include_ui: !options.headless,
-            }),
-            ..ViewOutput::default()
-        };
         let mut average = average.hook(&f, extent);
         let mut ui = |pass: &mut orr::UiPass<'_, '_>| overlay.paint(pass, id);
         let mut hooks = ViewHooks {
@@ -173,11 +167,15 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                 },
                 lens: Lens::default(),
                 camera_cut: false,
+                not_rendering_scene: false,
+                screenshot: (capture && final_frame).then_some(ScreenshotRequest::Display {
+                    include_ui: !options.headless,
+                }),
                 texture_filter: TextureFilter::Hardware,
                 target,
             },
             &ViewLighting::default(),
-            &output,
+            &ViewOutput::default(),
             &mut hooks,
         )
         .expect("render view");
