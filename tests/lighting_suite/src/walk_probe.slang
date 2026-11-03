@@ -23,9 +23,9 @@ struct SlabTrace : IWalkTrace
         return h;
     }
 
-    bool own(Hit h)
+    WalkMeet meet(Hit h, float3 origin, float3 dir, float3 positions[3], inout Sampler rng)
     {
-        return true;
+        return WalkMeet(WALK_BOUNDARY);
     }
 }
 
@@ -73,7 +73,7 @@ void main(uint3 id: SV_DispatchThreadID)
     {
         Sampler rng = Sampler(uint2(lane, index), i, root.seed);
         uint rays = 0;
-        WalkExit e = walk_subsurface(slab, float3(0.0), float3(0.0, 0.0, -1.0), volume, root.tail, c.max_steps, rng, rays);
+        WalkExit e = walk_subsurface(slab, float3(0.0), float3(0.0, 0.0, -1.0), volume, root.tail, c.max_steps, 1.0, rng, rays);
         if (!all(isfinite(e.throughput)))
             bad += 1.0;
         else if (e.kind == WALK_CAP || (e.kind == WALK_BOUNDARY && e.dir.z > 0.0))

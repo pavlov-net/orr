@@ -49,8 +49,9 @@ pub struct ViewLighting {
     /// Whether dielectrics with a dispersion (an Abbe number and a dispersion scale above 0)
     /// split light by wavelength. Off, they refract at their IOR at 587.6 nm.
     pub dispersion: bool,
-    /// Steps of a subsurface walk before it stops and keeps the share it would yet carry
-    /// out, clamped to [`SSS_STEPS`](crate::SSS_STEPS).
+    /// Steps of a walk through a subsurface material or a dense dielectric interior before it
+    /// stops and keeps the share it would yet carry out, clamped to
+    /// [`SSS_STEPS`](crate::SSS_STEPS).
     pub sss_max_steps: u32,
     /// Which subsurface vertices of a path walk.
     pub sss_depth: SubsurfaceDepth,
@@ -174,8 +175,8 @@ pub enum LightingDebugView {
     /// The froxel volume: each pixel's media transmittance in red, its depth as a share of
     /// the froxel slices in green, and a checker of the froxel columns in blue.
     Froxels,
-    /// Light leaving through subsurface walks: what each walk's exit and the path after it
-    /// add.
+    /// Light leaving through walks of subsurface materials and dielectric interiors: what each
+    /// walk's exit and the path after it add.
     Subsurface,
 }
 

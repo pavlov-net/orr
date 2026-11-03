@@ -387,7 +387,7 @@ fn cook() -> Arc<[u8]> {
         specular_roughness: 0.15,
         transmission_color: [0.35, 0.7, 0.45],
         transmission_depth: 0.1,
-        transmission_scatter: [0.5, 0.8, 0.6],
+        transmission_scatter: [0.5, 0.3, 0.45],
         transmission_scatter_anisotropy: 0.3,
         ..glass
     };
