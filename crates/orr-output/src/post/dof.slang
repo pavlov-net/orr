@@ -371,7 +371,7 @@ float2 previous_uv(int2 q, float depth)
     float4 previous = mul(v.prev_clip_from_view, float4(mul(v.prev_view_from_world_rotation, float4(relative, 0.0)), w));
     // Unjittered on both sides, so a still camera reprojects `uv` onto itself.
     float4 current = mul(v.clip_from_view, float4(p, w));
-    return uv + (previous.xy / previous.w - current.xy / current.w) * 0.5;
+    return uv + motion_between(previous, current);
 }
 
 // Lighting's background layer under `q` added to its accumulation, reprojected by the

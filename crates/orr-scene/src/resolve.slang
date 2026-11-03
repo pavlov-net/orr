@@ -30,7 +30,7 @@ float2 sky_motion(ViewConstants* v, float3 d)
 {
     float4 cur = mul(v.clip_from_view, float4(view_from_relative(v, d), 0.0));
     float4 prev = mul(v.prev_clip_from_view, float4(mul(v.prev_view_from_world_rotation, float4(d, 0.0)), 0.0));
-    return (prev.xy / prev.w - cur.xy / cur.w) * 0.5;
+    return motion_between(prev, cur);
 }
 
 uint surface_bin(RasterGpu* r, uint surface)
@@ -211,7 +211,7 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     }
     float3 prev_relative = place(prev, object) + v.eye_motion.xyz;
     float4 previous = mul(v.prev_clip_from_view, float4(mul(v.prev_view_from_world_rotation, float4(prev_relative, 0.0)), 1.0));
-    float2 motion = (previous.xy / previous.w - current.xy / current.w) * 0.5;
+    float2 motion = motion_between(previous, current);
 
     bool extended = r.x.index != IMAGE_NONE;
     GBufferWords words = encode_gsurface(g, extended);
