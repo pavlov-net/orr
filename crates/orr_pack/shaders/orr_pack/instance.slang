@@ -2,7 +2,7 @@
 // #[repr(C)] layouts; decode_instance follows orr_pack::instance::decode_record.
 module instance;
 
-import orr.packing;
+import orr_shaders.packing;
 
 public static const uint EXACT_AXIS = 1u << 30;
 // The x scale is negated: the copy is mirrored.

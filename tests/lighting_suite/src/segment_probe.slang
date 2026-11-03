@@ -1,9 +1,9 @@
 // `segment_inscatter` through the stock height fog on given segments: its march averaged
 // over evenly spread jitters, and a fine march of the same segment.
-#include "orr/root.h"
-import media;
-import media_types;
-import light_sampling;
+#include "orr_shaders/root.h"
+import orr_lighting.media;
+import lighting_suite.media_types;
+import orr_lighting.light_sampling;
 
 struct MarchSegment
 {

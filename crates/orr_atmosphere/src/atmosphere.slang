@@ -7,11 +7,11 @@
 // above that sphere.
 module atmosphere;
 
-import orr.abi;
-import orr.math;
-import tables;
-import media;
-import environment;
+import orr_shaders.abi;
+import orr_shaders.math;
+import orr_scene.tables;
+import orr_lighting.media;
+import orr_lighting.environment;
 
 public static const uint MAX_SKY_LIGHTS = 16;
 public static const uint MAX_FOLDED_LIGHTS = 8;

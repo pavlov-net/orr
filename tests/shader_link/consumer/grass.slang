@@ -1,5 +1,5 @@
 // A surface without coverage: the interface's body applies.
-import surface;
+import orr_scene.surface;
 
 struct Grass : ISurface
 {

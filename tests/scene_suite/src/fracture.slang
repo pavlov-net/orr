@@ -1,8 +1,8 @@
 // Keeps the triangles of one stripe of an edit's held groups and removes the others, and lifts
 // what it keeps by `lift`.
-#include "orr/root.h"
+#include "orr_shaders/root.h"
 import orr_pack.mesh;
-import tables;
+import orr_scene.tables;
 
 struct Root
 {

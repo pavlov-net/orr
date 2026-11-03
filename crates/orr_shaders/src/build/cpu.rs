@@ -5,6 +5,7 @@ use std::sync::Arc;
 use super::Error;
 use super::compile::{canonical, out_dir, read, write};
 use super::link::{self, Link, LinkPoint};
+use super::roots::{self, Root};
 use super::slang::{GlobalSession, Library};
 
 /// Options of the C++ session; include roots follow.
@@ -36,7 +37,7 @@ const OPTIONS: &[&str] = &[
 pub struct CpuLibrary {
     lib: Arc<Library>,
     sources: Vec<PathBuf>,
-    includes: Vec<PathBuf>,
+    includes: Vec<Root>,
     defines: Vec<String>,
     links: Vec<Link>,
     out_dir: Option<PathBuf>,
@@ -48,7 +49,7 @@ impl CpuLibrary {
         Ok(Self {
             lib: super::toolchain::load()?,
             sources: Vec::new(),
-            includes: vec![PathBuf::from(orr_color::SHADER_DIR)],
+            includes: vec![Root::plain(orr_color::SHADER_DIR)],
             defines: Vec::new(),
             links: Vec::new(),
             out_dir: None,
@@ -64,7 +65,13 @@ impl CpuLibrary {
     /// One more import root. [`LIB_DIR`](crate::LIB_DIR) and `orr_color`'s Slang root are always
     /// present, and so is [`openpbr_dir`](super::openpbr_dir) when it is found.
     pub fn include(mut self, dir: impl AsRef<Path>) -> Self {
-        self.includes.push(dir.as_ref().to_path_buf());
+        self.includes.push(Root::plain(dir.as_ref()));
+        self
+    }
+
+    /// One more import root whose modules are imported as `<prefix>.<path>`.
+    pub fn include_as(mut self, prefix: &str, dir: impl AsRef<Path>) -> Self {
+        self.includes.push(Root::prefixed(prefix, dir.as_ref()));
         self
     }
 
@@ -101,20 +108,18 @@ impl CpuLibrary {
             .map(PathBuf::from)
             .ok_or(Error::NoManifestDir)?;
         let out_dir = out_dir(self.out_dir.as_deref())?;
-        let links = link::resolve(&self.links)?;
-        let link_dirs = link::module_dirs(&links);
-        let mut options: Vec<String> = OPTIONS.iter().map(|s| (*s).to_owned()).collect();
-        for dir in self
+        let mut import_roots = self
             .includes
             .iter()
-            .chain(&link_dirs)
-            .map(PathBuf::as_path)
-            .chain([Path::new(crate::LIB_DIR)])
-        {
-            options.extend(["-I".to_owned(), canonical(dir)?.display().to_string()]);
-        }
-        if let Ok(dir) = super::openpbr_dir() {
-            options.extend(["-I".to_owned(), dir.display().to_string()]);
+            .map(Root::canonical)
+            .collect::<Result<Vec<_>, Error>>()?;
+        import_roots.push(Root::plain(canonical(Path::new(crate::LIB_DIR))?));
+        import_roots.extend(super::openpbr_dir().ok().map(Root::plain));
+        let links = link::resolve(&self.links, &import_roots)?;
+        import_roots.extend(link::module_dirs(&links));
+        let mut options: Vec<String> = OPTIONS.iter().map(|s| (*s).to_owned()).collect();
+        for root in import_roots.iter().filter(|r| r.prefix.is_none()) {
+            options.extend(["-I".to_owned(), root.dir.display().to_string()]);
         }
         for define in &self.defines {
             options.extend(["-D".to_owned(), define.clone()]);
@@ -135,6 +140,8 @@ impl CpuLibrary {
         for source in &self.sources {
             let path = canonical(&manifest.join(source))?;
             let text = read(&path)?;
+            roots::load_prefixed(&session, &import_roots, &[(&path, &text)], |_| false)
+                .map_err(compile_err)?;
             let stem = path
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -151,6 +158,8 @@ impl CpuLibrary {
             else {
                 continue;
             };
+            roots::load_prefixed(&session, &import_roots, &[(&m.path, &m.source)], |_| false)
+                .map_err(compile_err)?;
             let module = session
                 .load(&m.module, &m.path, &m.source)
                 .map_err(compile_err)?;
@@ -189,10 +198,10 @@ impl CpuLibrary {
         #[allow(clippy::print_stdout)]
         {
             for input in inputs {
-                println!("cargo:rerun-if-changed={}", input.display());
+                println!("cargo::rerun-if-changed={}", input.display());
             }
-            println!("cargo:rerun-if-env-changed=ORR_SLANGC");
-            println!("cargo:rerun-if-env-changed=ORR_OPENPBR_BSDF");
+            println!("cargo::rerun-if-env-changed=ORR_SLANGC");
+            println!("cargo::rerun-if-env-changed=ORR_OPENPBR_BSDF");
         }
         Ok(())
     }

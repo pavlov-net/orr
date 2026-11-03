@@ -17,11 +17,11 @@
 // Row spectra hold nx / 2 + 1 complex values per row and channel, the rest being their
 // conjugates. Past the image, rows and columns repeat its last one out to the kernel's
 // radius and, wrapped around, its first one; the rest are zero.
-#include "orr/root.h"
-import orr.abi;
-import orr.math;
-import view;
-import glare_lens;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.math;
+import orr_scene.view;
+import orr_output.glare_lens;
 
 static const uint THREADS = 256;
 // The longest transform: rows of up to 4096 pixels take 2048-point complex FFTs, columns

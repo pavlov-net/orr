@@ -2,12 +2,12 @@
 // layout), with each bin's chromaticity sums on request, and on request into local
 // exposure's grid. Pixels that are black or not finite are left out of both, and masked out
 // ones out of the histogram.
-#include "orr/root.h"
-import orr.abi;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
 import orr_color.chromaticity;
 import orr_color.primaries;
-import view;
-import exposure;
+import orr_scene.view;
+import orr_output.exposure;
 
 struct Root
 {

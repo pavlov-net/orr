@@ -1,7 +1,7 @@
 // Reads the linked environment and medium through their data addresses.
-#include "orr/root.h"
-import environment;
-import media;
+#include "orr_shaders/root.h"
+import orr_lighting.environment;
+import orr_lighting.media;
 
 extern struct Environment : IEnvironment = EnvironmentMap;
 extern struct Medium : IMedium = NoMedium;

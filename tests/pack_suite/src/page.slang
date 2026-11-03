@@ -1,8 +1,8 @@
 // Reads a resident mesh page through orr_pack.mesh: one workgroup per cluster, one thread
 // per vertex and triangle slot.
-#include "orr/root.h"
+#include "orr_shaders/root.h"
 import orr_pack.mesh;
-import orr.packing;
+import orr_shaders.packing;
 
 struct VertexOut
 {

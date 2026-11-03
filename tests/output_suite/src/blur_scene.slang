@@ -5,8 +5,8 @@
 // particles as the front layer over the surface;
 // `reference` writes the radiance averaged over `subframes` times spread across the open
 // shutter, centered on time 0.
-#include "orr/root.h"
-import orr.abi;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
 
 static const uint WHEEL = 0;
 static const uint PAN = 1;

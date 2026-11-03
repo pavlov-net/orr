@@ -2,9 +2,9 @@
 // is false prints `<file>:<line>: <message>` with `args` (printf format) and aborts with the
 // same text, without the arguments, which loses the device. Otherwise the check compiles
 // out. `message` is a string literal: `abort` takes only literals. Macros do not cross
-// `import`, so kernels include this file: `#include "orr/debug.h"`.
+// `import`, so kernels include this file: `#include "orr_shaders/debug.h"`.
 #pragma once
-import orr.debug;
+import orr_shaders.debug;
 
 #define ORR_STRINGIFY_(x) #x
 #define ORR_STRINGIFY(x) ORR_STRINGIFY_(x)

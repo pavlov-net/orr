@@ -1,13 +1,13 @@
 // Shadow and bounce rays through alpha-tested and linked-coverage geometry, as the path
 // kernel traces them: per ray whether it was stopped, and how many candidates the alpha
 // test was asked about.
-#include "orr/root.h"
-import orr.trace;
-import hit;
-import media;
-import path;
-import shadow;
-import rings;
+#include "orr_shaders/root.h"
+import orr_shaders.trace;
+import orr_scene.hit;
+import orr_lighting.media;
+import orr_lighting.path;
+import orr_lighting.shadow;
+import lighting_suite.rings;
 
 // The kernel's surface switch as a build linking `Rings` as surface 2 and `Veil` as 3
 // makes it.

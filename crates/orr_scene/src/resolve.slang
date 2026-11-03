@@ -5,14 +5,14 @@
 // pixel's surface through the linked `Surface` switch, the depth offset applied to depth,
 // position and motion, projected-space NDF filtering of the roughness, and the G-buffer
 // written.
-#include "orr/root.h"
-import orr.abi;
-import orr.math;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.math;
 import orr_pack.mesh;
-import producer;
-import sequence;
-import surface;
-import visibility;
+import orr_scene.producer;
+import orr_gpu.sequence;
+import orr_scene.surface;
+import orr_scene.visibility;
 
 // Its taps drive texture streaming and decode the neural sets that stand in for textures.
 export static const bool TEXTURE_FEEDBACK = true;

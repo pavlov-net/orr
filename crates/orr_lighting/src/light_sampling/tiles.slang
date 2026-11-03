@@ -1,16 +1,16 @@
 // The light set's selection, per-entry cluster CDFs and presampled light tiles, after the
 // environment's pyramid and the directional pass.
-#include "orr/root.h"
-import orr.math;
+#include "orr_shaders/root.h"
+import orr_shaders.math;
 import orr_color.chromaticity;
 import orr_color.luminance;
 import orr_color.primaries;
-import lights;
-import producer;
-import tables;
-import view;
-import environment;
-import light_sampling;
+import orr_scene.lights;
+import orr_scene.producer;
+import orr_scene.tables;
+import orr_scene.view;
+import orr_lighting.environment;
+import orr_lighting.light_sampling;
 
 struct Root
 {

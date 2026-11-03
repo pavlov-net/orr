@@ -6,7 +6,7 @@
 // snorm is round(clamp(x, -1, 1) x max) and decodes as max(q / max, -1).
 module packing;
 
-import orr.math;
+import orr_shaders.math;
 
 // Octahedral normals.
 //

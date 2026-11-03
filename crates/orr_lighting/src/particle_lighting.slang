@@ -8,19 +8,19 @@
 // fogged.
 module particle_lighting;
 
-import orr.abi;
-import orr.atomic;
-import orr.math;
-import orr.random;
-import orr.trace;
-import hit;
-import visibility;
-import media;
-import light_sampling;
-import world_cache;
-import path;
-import shadow;
-import froxels;
+import orr_shaders.abi;
+import orr_shaders.atomic;
+import orr_shaders.math;
+import orr_shaders.random;
+import orr_shaders.trace;
+import orr_scene.hit;
+import orr_scene.visibility;
+import orr_lighting.media;
+import orr_lighting.light_sampling;
+import orr_lighting.world_cache;
+import orr_lighting.path;
+import orr_lighting.shadow;
+import orr_lighting.froxels;
 
 // Separates particles' samples from the paths' of the same pixel.
 public static const uint PARTICLE_STREAM = 0x68E31DA4;

@@ -1,4 +1,4 @@
-//! Runs the OpenPBR harness on `orr.openpbr` against adobe/openpbr-bsdf's C++ and writes the
+//! Runs the OpenPBR harness on `orr_shaders.openpbr` against adobe/openpbr-bsdf's C++ and writes the
 //! Markdown report to the path given, or to stdout. Exits 1 if a gate fails.
 //!
 //! `openpbr-report [--gpu] [out.md]`: the candidate is the Slang C++ build (array LUTs), or
@@ -28,7 +28,7 @@ fn main() {
 
 fn on_cpu() -> Results {
     evaluate(
-        "orr.openpbr (Slang C++ target, array LUTs)",
+        "orr_shaders.openpbr (Slang C++ target, array LUTs)",
         openpbr_ref::SlangCpu::new,
         Reference::new,
         true,
@@ -39,7 +39,7 @@ fn on_cpu() -> Results {
 #[cfg(feature = "gpu")]
 fn on_gpu() -> Results {
     let results = evaluate(
-        "orr.openpbr (Vulkan compute, heap LUTs)",
+        "orr_shaders.openpbr (Vulkan compute, heap LUTs)",
         openpbr_ref::SlangGpu::new,
         Reference::new,
         true,

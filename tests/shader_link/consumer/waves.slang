@@ -1,4 +1,4 @@
-import displacement;
+import orr_scene.displacement;
 
 struct Waves : IDisplacement
 {

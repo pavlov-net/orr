@@ -3,17 +3,17 @@
 // the G-buffer's motion. A pixel whose reprojected surface lay at another distance from the
 // camera was hidden then, and adds nothing; the sampler's share falls with the tile's
 // surfaces that found no feedback.
-#include "orr/root.h"
-import orr.abi;
-import orr.math;
-import lights;
-import material;
-import producer;
-import tables;
-import view;
-import gbuffer;
-import environment;
-import light_sampling;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.math;
+import orr_scene.lights;
+import orr_scene.material;
+import orr_scene.producer;
+import orr_scene.tables;
+import orr_scene.view;
+import orr_scene.gbuffer;
+import orr_lighting.environment;
+import orr_lighting.light_sampling;
 
 // A reprojected pixel's last camera distance must lie within this share of the distance a
 // static surface would have had.

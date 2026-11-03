@@ -1,11 +1,11 @@
-// Cost of `orr.openpbr` on the GPU: every thread prepares a material seen from a random view
+// Cost of `orr_shaders.openpbr` on the GPU: every thread prepares a material seen from a random view
 // above the surface, then makes `calls` calls of eval, sample or both on random numbers and
 // writes a sum of the results so that no call is optimized away.
-#include "orr/root.h"
-import orr.openpbr;
-import orr.random;
-import orr.sampling;
-import openpbr_inputs;
+#include "orr_shaders/root.h"
+import orr_shaders.openpbr;
+import orr_shaders.random;
+import orr_shaders.sampling;
+import openpbr_ref.openpbr_inputs;
 
 static const uint EVAL = 1;
 static const uint SAMPLE = 2;

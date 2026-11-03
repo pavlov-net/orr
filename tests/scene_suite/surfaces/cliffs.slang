@@ -1,6 +1,6 @@
 // Terraces along u with walls a few centimeters wide: displacement id 2 in the suite's
 // linked kernels, `cliffs` in the tessellation tests.
-import displacement;
+import orr_scene.displacement;
 
 struct Cliffs : IDisplacement
 {

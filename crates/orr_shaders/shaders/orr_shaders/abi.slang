@@ -8,7 +8,7 @@
 // attributes, not per-primitive inputs. Workgroup sizes are literals.
 module abi;
 
-import orr.debug;
+import orr_shaders.debug;
 
 // The slot index of no image in `TextureIndex` and `StorageImageIndex`. The heap never hands
 // out slot 0, so a zeroed record names no image.
@@ -60,7 +60,7 @@ public struct SamplerIndex
     }
 }
 
-// A TLAS or PTLAS device address. Traced only through `orr.trace`.
+// A TLAS or PTLAS device address. Traced only through `orr_shaders.trace`.
 public struct Tlas
 {
     public uint64_t address;

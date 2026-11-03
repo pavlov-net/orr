@@ -9,24 +9,24 @@
 // added to its path, for the next frame's light selection and local samplers.
 module path;
 
-import orr.abi;
-import orr.math;
+import orr_shaders.abi;
+import orr_shaders.math;
 import orr_color.luminance;
-import orr.random;
-import orr.sampling;
-import orr.trace;
-import orr.coherence;
+import orr_shaders.random;
+import orr_shaders.sampling;
+import orr_shaders.trace;
+import orr_shaders.coherence;
 import orr_pack.mesh;
-import hit;
-import visibility;
-import bsdf;
-import media;
-import environment;
-import lights;
-import light_sampling;
-import world_cache;
-import subsurface;
-import shadow;
+import orr_scene.hit;
+import orr_scene.visibility;
+import orr_lighting.bsdf;
+import orr_lighting.media;
+import orr_lighting.environment;
+import orr_scene.lights;
+import orr_lighting.light_sampling;
+import orr_lighting.world_cache;
+import orr_lighting.subsurface;
+import orr_lighting.shadow;
 
 // `PathRoot.mode`: what the radiance image holds.
 public static const uint PATH_FULL = 0;

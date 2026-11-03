@@ -13,18 +13,20 @@ mod model;
 mod precompile;
 #[cfg(feature = "hot-reload")]
 mod reload;
+mod roots;
 mod slang;
 mod spirv;
 mod sys;
 mod toolchain;
 
-pub use compile::{Build, DebugInfo, Output, reexport_types};
+pub use compile::{Build, DebugInfo, Output, publish_union};
 pub use cpu::CpuLibrary;
 pub use link::LinkPoint;
 pub use lint::{Lint, LintError};
 use locate::SLANG_VERSION;
 #[cfg(feature = "hot-reload")]
 pub use reload::{Reload, Watcher};
+pub use roots::module_file;
 use toolchain::SLANGC_OPTIONS;
 
 use std::path::{Path, PathBuf};
@@ -83,6 +85,10 @@ pub enum Error {
         "CARGO_MANIFEST_DIR is unset; orr_shaders::build runs from a cargo build script or test"
     )]
     NoManifestDir,
+    /// [`Build::dep`] or [`publish_union`] names a crate that publishes nothing: it is not a
+    /// direct dependency, or has no such `links` value.
+    #[error("{var} is unset; the build needs a direct dependency that publishes it")]
+    NoDep { var: String },
     /// `OUT_DIR` is unset and [`Build::out_dir`] was not called.
     #[error("OUT_DIR is unset; run from a build script or call Build::out_dir")]
     NoOutDir,
@@ -137,7 +143,7 @@ pub fn parse_cpp_array(src: &str, name: &str) -> Vec<f64> {
         .collect()
 }
 
-/// The adobe/openpbr-bsdf checkout that `orr.openpbr` includes: `ORR_OPENPBR_BSDF` when
+/// The adobe/openpbr-bsdf checkout that `orr_shaders.openpbr` includes: `ORR_OPENPBR_BSDF` when
 /// set, else `.tools/openpbr-bsdf` in or above `CARGO_MANIFEST_DIR`, where
 /// `tools/fetch-slang.sh` puts it.
 pub fn openpbr_dir() -> Result<PathBuf, Error> {
@@ -155,8 +161,8 @@ pub fn openpbr_dir() -> Result<PathBuf, Error> {
 #[allow(clippy::print_stdout)]
 pub fn fetched(var: &str, relative: impl AsRef<Path>) -> Result<PathBuf, Error> {
     let relative = relative.as_ref();
-    println!("cargo:rerun-if-env-changed={var}");
-    println!("cargo:rerun-if-env-changed=ORR_TOOLS");
+    println!("cargo::rerun-if-env-changed={var}");
+    println!("cargo::rerun-if-env-changed=ORR_TOOLS");
     let start = env::var_os("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
         .ok_or(Error::NoManifestDir)?;
@@ -178,7 +184,7 @@ pub fn fetched(var: &str, relative: impl AsRef<Path>) -> Result<PathBuf, Error> 
         relative: relative.to_owned(),
         searched_from: start,
     })?;
-    println!("cargo:rerun-if-changed={}", path.display());
+    println!("cargo::rerun-if-changed={}", path.display());
     Ok(path)
 }
 

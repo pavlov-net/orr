@@ -1,9 +1,9 @@
 // Draws the clusters of a cut straight from their resident pages, one mesh workgroup per
 // cluster, projected along y onto a square of xz. Each pixel adds 1 for a front-facing
 // triangle and subtracts 1 for a back-facing one, so a crack-free sheet sums to one sign.
-#include "orr/root.h"
+#include "orr_shaders/root.h"
 import orr_pack.mesh;
-import orr.packing;
+import orr_shaders.packing;
 
 struct Draw
 {

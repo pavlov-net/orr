@@ -1,8 +1,8 @@
 // orr_lighting's aerial-perspective LUT through the stock height fog.
-#include "orr/root.h"
-import media;
-import media_types;
-import froxels;
+#include "orr_shaders/root.h"
+import orr_lighting.media;
+import lighting_suite.media_types;
+import orr_lighting.froxels;
 
 ORR_ROOT(FroxelRoot);
 

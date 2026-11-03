@@ -8,14 +8,14 @@
 // visibility buffer, except `coverage_pixel`: dielectric and presence clusters draw every
 // triangle, both faces, into the layer tiles where they lie in front of the opaque depth.
 // `depth` copies the resolved depth into the depth target.
-#include "orr/root.h"
-import orr.atomic;
-import orr.math;
-import orr.random;
+#include "orr_shaders/root.h"
+import orr_shaders.atomic;
+import orr_shaders.math;
+import orr_shaders.random;
 import orr_pack.mesh;
-import producer;
-import surface;
-import visibility;
+import orr_scene.producer;
+import orr_scene.surface;
+import orr_scene.visibility;
 
 extern struct Surface : ISurface = StandardSurface;
 

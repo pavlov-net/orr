@@ -1,7 +1,7 @@
 // C entry points over orr_output's math for the CPU tests.
-import gt7;
-import exposure;
-import display;
+import orr_output.gt7;
+import orr_output.exposure;
+import orr_output.display;
 import orr_color.transfer;
 
 export __extern_cpp void orr_gt7_tonemap(Gt7Curve* curve, float* rgb, float* out, uint count)

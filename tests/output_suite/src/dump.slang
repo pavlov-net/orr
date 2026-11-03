@@ -1,6 +1,6 @@
 // Copies a sampled image into a buffer as four floats per texel, row by row.
-#include "orr/root.h"
-import orr.abi;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
 
 struct Root
 {

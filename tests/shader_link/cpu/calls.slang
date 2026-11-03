@@ -1,10 +1,10 @@
 // C entry points that call the linked types through the same declarations the renderer's
 // kernels use.
-import surface;
-import displacement;
-import environment;
-import media;
-import orr.coherence;
+import orr_scene.surface;
+import orr_scene.displacement;
+import orr_lighting.environment;
+import orr_lighting.media;
+import orr_shaders.coherence;
 
 extern struct Surface : ISurface = StandardSurface;
 extern struct Displace : IDisplacement = TextureDisplacement;

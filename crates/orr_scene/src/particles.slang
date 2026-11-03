@@ -4,9 +4,9 @@
 // listed apart, for the froxels.
 module particles;
 
-import orr.abi;
-import producer;
-__exported import visibility;
+import orr_shaders.abi;
+import orr_scene.producer;
+__exported import orr_scene.visibility;
 
 // A particle cluster's draw: its visible cluster, batch and entry-to-eye placement.
 public struct ParticleDraw

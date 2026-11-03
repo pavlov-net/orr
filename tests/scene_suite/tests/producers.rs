@@ -56,7 +56,7 @@ const PARTICLE_WORD: u32 = 100;
 const MAX_BLADES: u32 = 256;
 /// The words surface's id in the suite's linked kernels.
 const WORDS_SURFACE: u32 = 4;
-/// `orr.trace` masks.
+/// `orr_shaders.trace` masks.
 const MASK_OPAQUE: u32 = 1;
 const MASK_PARTICLE: u32 = 2;
 

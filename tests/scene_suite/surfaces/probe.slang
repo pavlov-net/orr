@@ -2,7 +2,7 @@
 // the cone width, specular roughness the cone spread.
 module probe;
 
-import surface;
+import orr_scene.surface;
 
 public struct Probe : ISurface
 {

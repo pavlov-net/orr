@@ -98,7 +98,7 @@ impl Opacity {
         self as u32
     }
 
-    /// `orr.trace` `CLASS_*`.
+    /// `orr_shaders.trace` `CLASS_*`.
     fn class(self) -> u32 {
         match self {
             Self::Opaque | Self::AlphaTested => 0,

@@ -1,10 +1,10 @@
 // `texture_footprint` averaged over `taps` points of the R2 sequence per footprint, so its
 // mean stands for the filter's expected value; through `streams` when it is not null, with
 // the neural sets that stand in for textures decoded.
-#include "orr/root.h"
-import orr.abi;
-import orr.random;
-import material;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.random;
+import orr_scene.material;
 
 export static const bool TEXTURE_FEEDBACK = true;
 export static const bool NEURAL_TEXTURES = true;

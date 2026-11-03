@@ -1,6 +1,6 @@
 // One bin of the device-generated commands test, specialized per bin: it writes a word
 // naming the bin and the item into each of the bin's items.
-#include "orr/root.h"
+#include "orr_shaders/root.h"
 
 struct Root
 {

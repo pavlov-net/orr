@@ -1,9 +1,9 @@
 // Rays traced with one mask through the scene's PTLAS: per ray the procedural candidates it
 // met, the last one's instance and class, and the object-space point where that ray enters
 // the candidate's cube [-1, 1]^3.
-#include "orr/root.h"
-import orr.trace;
-import hit;
+#include "orr_shaders/root.h"
+import orr_shaders.trace;
+import orr_scene.hit;
 
 struct Seen
 {

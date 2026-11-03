@@ -1,7 +1,7 @@
 // Adds one frame's radiance image into the accumulation's running sum; the first frame sets
 // it.
-#include "orr/root.h"
-import orr.abi;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
 
 struct Root
 {

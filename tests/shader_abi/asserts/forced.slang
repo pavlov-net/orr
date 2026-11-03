@@ -1,6 +1,6 @@
 // Asserts that `*root.flag` is set; the test leaves it at 0.
-#include "orr/debug.h"
-#include "orr/root.h"
+#include "orr_shaders/debug.h"
+#include "orr_shaders/root.h"
 
 struct Root
 {

@@ -1,9 +1,9 @@
 // orr_lighting's media apply through the stock height fog.
-#include "orr/root.h"
-import media;
-import media_types;
-import surface;
-import camera_media;
+#include "orr_shaders/root.h"
+import orr_lighting.media;
+import lighting_suite.media_types;
+import orr_scene.surface;
+import orr_lighting.camera_media;
 
 ORR_ROOT(MediaApplyRoot);
 

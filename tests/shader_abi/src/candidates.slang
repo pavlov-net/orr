@@ -1,8 +1,8 @@
 // Shadow transmittance and translucent resolve over the same rays: per ray the product,
 // the overflow flag, the hit and the composited layers.
-#include "orr/root.h"
-import orr.abi;
-import orr.trace;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.trace;
 
 struct CandidateResult
 {

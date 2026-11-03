@@ -1,8 +1,8 @@
 // egui meshes into the UI layer. Each mesh workgroup draws 32 triangles of one mesh, pulling
 // their vertices through the root's pointers; the pixel stage filters, multiplies and blends
 // in gamma space like egui's reference painters.
-#include "orr/root.h"
-import orr.abi;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
 import orr_color.transfer;
 
 // egui's `Vertex`: position in points, texture coordinates, premultiplied sRGBA bytes.

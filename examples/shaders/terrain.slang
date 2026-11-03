@@ -2,10 +2,10 @@
 // vertices, places them on the height raster with their normals and uv, and emits the
 // patch as the grid topology. Patches inside the hole, a square another entry covers, emit
 // nothing. The patch index is the cluster's user word.
-#include "orr/root.h"
-import field;
-import producer;
-import tables;
+#include "orr_shaders/root.h"
+import examples.field;
+import orr_scene.producer;
+import orr_scene.tables;
 
 struct Root
 {

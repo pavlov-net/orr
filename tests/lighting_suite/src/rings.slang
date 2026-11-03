@@ -2,7 +2,7 @@
 // rings texture worked out from the uv, `Veil` a quarter of every triangle.
 module rings;
 
-import surface;
+import orr_scene.surface;
 
 // The texel count a side of the bed's rings texture.
 static const float RINGS_TEXELS = 128.0;

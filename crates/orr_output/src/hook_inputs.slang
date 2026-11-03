@@ -1,9 +1,9 @@
 // Hook inputs at output resolution: depth and motion taken from the render pixel under each
 // output pixel with the frame's jitter, the copy of the chain image a `scene_referred` hook
 // reads as its source, and the distortion field cleared to identity. One dispatch.
-#include "orr/root.h"
-import orr.abi;
-import view;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_scene.view;
 
 struct Root
 {

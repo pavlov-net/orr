@@ -7,14 +7,14 @@
 // medium's transmittance covers the scene's medium, which proxies add to.
 module shadow;
 
-import orr.abi;
-import orr.math;
-import orr.random;
-import orr.trace;
-import orr.openpbr;
-import hit;
-import bsdf;
-import media;
+import orr_shaders.abi;
+import orr_shaders.math;
+import orr_shaders.random;
+import orr_shaders.trace;
+import orr_shaders.openpbr;
+import orr_scene.hit;
+import orr_lighting.bsdf;
+import orr_lighting.media;
 
 // The mask shadow rays trace.
 public static const uint SHADOW_MASK = MASK_OPAQUE | MASK_PARTICLE | MASK_MEDIUM | MASK_DIELECTRIC;

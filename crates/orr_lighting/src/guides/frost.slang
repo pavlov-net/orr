@@ -1,6 +1,6 @@
 // The frosted-glass term of one view.
-#include "orr/root.h"
-import guides;
+#include "orr_shaders/root.h"
+import orr_lighting.guides;
 
 ORR_ROOT(FrostRoot);
 

@@ -1,7 +1,7 @@
 // A bright bar crossing a dark background: display-linear color, reverse-Z depth with the
 // bar nearer, and the bar's motion (previous UV minus current UV), for frame generation.
-#include "orr/root.h"
-import orr.abi;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
 
 struct Root
 {

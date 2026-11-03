@@ -1,9 +1,9 @@
 // Lights a test image as lighting would: radiance = color * luminance * scale, pre-exposed
 // with the view's current exposure slot and capped at the HDR ceiling. The color is per
 // pixel when `colors` is set.
-#include "orr/root.h"
-import orr.abi;
-import view;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_scene.view;
 
 struct Root
 {

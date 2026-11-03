@@ -1,9 +1,9 @@
 // Writes a cooked instance page's slots from its records once they are resident: each record
 // takes its prototype's instance record and emissive list entries.
-#include "orr/root.h"
+#include "orr_shaders/root.h"
 import orr_pack.instance;
-import lights;
-import tables;
+import orr_scene.lights;
+import orr_scene.tables;
 
 // A prototype of a placed page: what each of its copies takes.
 public struct PagePrototypeGpu

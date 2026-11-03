@@ -16,18 +16,14 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     cap_tail_table(&out_dir.join("cap_tail.rs"));
     let src = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("src");
-    let scene = env::var("DEP_ORR_SCENE_SHADER_DIRS").expect("orr_scene shader roots");
-    let types = env::var("DEP_ORR_SCENE_TYPES").expect("orr_scene type map");
     let out = Build::new().and_then(|b| {
         b.kernels(&src)
-            .roots(&scene)
-            .types(&types)
+            .dep("orr_scene")
             .publish_types("::orr_lighting::types")
             .compile()
     });
-    match out {
-        Ok(out) => println!("cargo:shader_dirs={}", out.shader_dirs),
-        Err(e) => panic!("{e}"),
+    if let Err(e) = out {
+        panic!("{e}");
     }
 }
 

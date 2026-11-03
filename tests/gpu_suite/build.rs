@@ -6,34 +6,15 @@ use std::path::PathBuf;
 
 use orr_shaders::build::{Build, DebugInfo};
 
-/// The `rtas` records the kernels use, mirrored in `orr_gpu::rtas`.
-const RTAS_RECORDS: &[&str] = &[
-    "ClasBuild",
-    "TemplateBuild",
-    "Instantiate",
-    "ClusterBlas",
-    "Move",
-    "PtlasWrite",
-    "PtlasUpdate",
-    "PtlasTranslate",
-    "PtlasCommand",
-];
-
 fn main() {
     let dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    let gpu = env::var("DEP_ORR_GPU_SHADER_DIRS").expect("orr_gpu shader roots");
     let built = Build::new()
         .and_then(|b| {
-            let mut b = b
-                .kernels(dir.join("src"))
-                .roots(&gpu)
+            b.kernels(dir.join("src"))
+                .dep("orr_gpu")
                 .debug_info(DebugInfo::Embedded)
-                .metal_check(false);
-            for t in RTAS_RECORDS {
-                b = b.extern_type(t, &format!("::orr_gpu::rtas::{t}"));
-            }
-            b.extern_type("ClassicInstance", "::orr_gpu::ClassicInstance")
+                .metal_check(false)
                 .compile()
         })
         .and_then(|_| {

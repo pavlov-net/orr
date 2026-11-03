@@ -1,12 +1,12 @@
 // A GGX mirror lit by one directional light: per thread, sums of the next-event estimate
 // (cone sampling) and of the BSDF-sampled estimate (bounded VNDF) of reflected luminance.
-#include "orr/root.h"
-import orr.math;
-import orr.random;
+#include "orr_shaders/root.h"
+import orr_shaders.math;
+import orr_shaders.random;
 import orr_color.luminance;
-import orr.sampling;
-import media;
-import light_sampling;
+import orr_shaders.sampling;
+import orr_lighting.media;
+import orr_lighting.light_sampling;
 
 struct Root
 {

@@ -3,12 +3,12 @@
 // that BSDF misses and next-event estimation read.
 module environment;
 
-import orr.abi;
-import orr.math;
+import orr_shaders.abi;
+import orr_shaders.math;
 import orr_color.luminance;
 import orr_color.primaries;
-import orr.sampling;
-import tables;
+import orr_shaders.sampling;
+import orr_scene.tables;
 
 // An environment linked into orr's kernels. `data` is the address the scene was given for
 // it. Radiance in nits, linear Rec.2020, without directional light discs.

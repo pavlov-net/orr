@@ -1,5 +1,5 @@
 // A medium whose parameters live at the address the scene was given.
-import media;
+import orr_lighting.media;
 
 struct AirData
 {

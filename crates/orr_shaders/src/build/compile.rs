@@ -14,6 +14,7 @@ use super::link::{self, KernelPoints, Link, LinkModule, LinkPoint, LinkPoints};
 use super::lint::{self, Lint, LintError};
 use super::model::{self, Model, StructDef, Ty};
 use super::precompile::{self, Precompiled};
+use super::roots::{self, Root};
 use super::slang::{GlobalSession, Library, Session};
 use super::{Error, SLANG_VERSION, SLANGC_OPTIONS, metal, spirv};
 
@@ -22,8 +23,7 @@ use super::{Error, SLANG_VERSION, SLANGC_OPTIONS, metal, spirv};
 /// ```no_run
 /// # fn main() -> Result<(), orr_shaders::build::Error> {
 /// let src = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src");
-/// let out = orr_shaders::build::Build::new()?.kernels(&src).compile()?;
-/// println!("cargo:shader_dirs={}", out.shader_dirs);
+/// orr_shaders::build::Build::new()?.kernels(&src).compile()?;
 /// # Ok(())
 /// # }
 /// ```
@@ -32,7 +32,9 @@ use super::{Error, SLANG_VERSION, SLANGC_OPTIONS, metal, spirv};
 pub struct Build {
     lib: Arc<Library>,
     kernels: Option<PathBuf>,
-    includes: Vec<PathBuf>,
+    prefix: Option<String>,
+    includes: Vec<Root>,
+    deps: Vec<String>,
     externs: BTreeMap<String, String>,
     debug_info: DebugInfo,
     fp_precise: bool,
@@ -66,17 +68,19 @@ pub enum DebugInfo {
 /// Structs of orr's shared libraries and the default-feature Rust types they map to.
 const LIBRARY_TYPES: &[(&str, &str)] = &[("AliasEntry", "::orr_shaders::AliasEntry")];
 
-/// The session option of builds with micromaps, which `orr/root.h` and `orr.trace` test.
+/// The session option of builds with micromaps, which `orr_shaders/root.h` and
+/// `orr_shaders.trace` test.
 const OMM_OPTION: &str = "-DORR_OMM_BUILD";
 
-/// The session option of builds with neural texture decoding, which `material` tests.
+/// The session option of builds with neural texture decoding, which `orr_scene.material`
+/// tests.
 const NEURAL_OPTION: &str = "-DORR_NEURAL_BUILD";
 
 /// What [`Build::compile`] produced.
 #[derive(Debug)]
 pub struct Output {
-    /// The crate's shader root followed by every root it was given, `;`-separated, for
-    /// `cargo:shader_dirs`.
+    /// The crate's shader root followed by every root it was given, `;`-separated, each
+    /// `<prefix>=<dir>` or `<dir>`. `compile` prints it as `cargo::metadata=shader_dirs`.
     pub shader_dirs: String,
     /// The modules compiled by this run, linked kernels as `linked/<kernel>`; the others
     /// were up to date.
@@ -85,10 +89,10 @@ pub struct Output {
     pub manifest: PathBuf,
     /// `link_points.json`: the kernels of this build and of every file given to
     /// [`Build::link_points`] that declare a link point. `compile` prints it as
-    /// `cargo:link_points`.
+    /// `cargo::metadata=link_points`.
     pub link_points: PathBuf,
     /// `types.json`, with [`Build::publish_types`]: the Rust type of every struct this
-    /// build generated or mapped. `compile` prints it as `cargo:types`.
+    /// build generated or mapped. `compile` prints it as `cargo::metadata=types`.
     pub types: Option<PathBuf>,
     /// The build was with opacity micromaps ([`Build::omm`]).
     pub omm: bool,
@@ -106,7 +110,9 @@ impl Build {
         Ok(Self {
             lib: super::toolchain::load()?,
             kernels: None,
-            includes: vec![PathBuf::from(orr_color::SHADER_DIR)],
+            prefix: None,
+            includes: vec![Root::plain(orr_color::SHADER_DIR)],
+            deps: Vec::new(),
             externs: LIBRARY_TYPES
                 .iter()
                 .map(|(s, r)| ((*s).to_owned(), (*r).to_owned()))
@@ -134,23 +140,46 @@ impl Build {
     }
 
     /// The crate's shader root. Every `.slang` file under it that contains `[shader(`
-    /// becomes one module.
+    /// becomes one module. The crate's files import each other, and dependents import them,
+    /// as `<crate>.<path>`: `src/media/froxel.slang` under `orr_lighting` is
+    /// `orr_lighting.media.froxel`, and `<crate>` has `_` where the package name has `-`.
     pub fn kernels(mut self, root: impl AsRef<Path>) -> Self {
         self.kernels = Some(root.as_ref().to_path_buf());
         self
     }
 
-    /// One more import root. [`LIB_DIR`](crate::LIB_DIR) and `orr_color`'s Slang root are always
-    /// present, and so is [`openpbr_dir`](super::openpbr_dir) when it is found.
+    /// The name [`kernels`](Self::kernels)' root is imported under, instead of the package name.
+    pub fn prefix(mut self, prefix: &str) -> Self {
+        self.prefix = Some(prefix.to_owned());
+        self
+    }
+
+    /// One more import root whose modules are imported by their path under it.
+    /// [`LIB_DIR`](crate::LIB_DIR) and `orr_color`'s Slang root are always present, and so is
+    /// [`openpbr_dir`](super::openpbr_dir) when it is found.
     pub fn include(mut self, dir: impl AsRef<Path>) -> Self {
-        self.includes.push(dir.as_ref().to_path_buf());
+        self.includes.push(Root::plain(dir.as_ref()));
+        self
+    }
+
+    /// One more import root whose modules are imported as `<prefix>.<path>`.
+    pub fn include_as(mut self, prefix: &str, dir: impl AsRef<Path>) -> Self {
+        self.includes.push(Root::prefixed(prefix, dir.as_ref()));
         self
     }
 
     /// Every root in a `DEP_*_SHADER_DIRS` value (`;`-separated).
     pub fn roots(mut self, list: &str) -> Self {
-        self.includes
-            .extend(list.split(';').filter(|s| !s.is_empty()).map(PathBuf::from));
+        self.includes.extend(roots::parse_list(list));
+        self
+    }
+
+    /// Everything the direct dependency with `links = "<links>"` publishes: its shader roots,
+    /// the Rust types of its Slang structs, as [`types`](Self::types) maps them, and its link
+    /// points, as [`link_points`](Self::link_points) reads them. A dependency's types and
+    /// link points are optional. Repeatable.
+    pub fn dep(mut self, links: &str) -> Self {
+        self.deps.push(links.to_owned());
         self
     }
 
@@ -170,8 +199,8 @@ impl Build {
     /// displacements become one `switch` on the input's id: ids run from 1 in call order,
     /// id 0 and unknown ids call the default type, and `orr_kernels.rs` holds the ids as
     /// `surface::<NAME>` and `displacement::<NAME>`. Environment and medium take one call
-    /// each at most. `module` is imported by its file stem, so its directory joins the
-    /// include path.
+    /// each at most. A `module` under a prefixed root is imported by its name there; any other
+    /// is imported by its file stem, and its directory joins the include path.
     pub fn link(
         mut self,
         point: LinkPoint,
@@ -225,7 +254,7 @@ impl Build {
         self
     }
 
-    /// Links `orr.debug`'s `ASSERTS = true`, so `orr_assert` and checks such as `Tlas.get()`
+    /// Links `orr_shaders.debug`'s `ASSERTS = true`, so `orr_assert` and checks such as `Tlas.get()`
     /// on address 0 abort. Pipelines from modules that abort need a device with
     /// `shaderAbort`. On by default unless the profile is `release` or the build is for a
     /// capture session (`ORR_SHADER_CAPTURE=1`), whose devices leave `shaderAbort` off;
@@ -235,7 +264,7 @@ impl Build {
         self
     }
 
-    /// Builds with opacity micromaps: `ORR_OMM(entry)` from `orr/root.h` declares the
+    /// Builds with opacity micromaps: `ORR_OMM(entry)` from `orr_shaders/root.h` declares the
     /// micromap execution mode on the entry points of ray-query modules, and
     /// `RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE` reaches the ray queries. Pipelines from
     /// these modules need a device with micromaps. Without, both drop out and alpha-tested
@@ -288,9 +317,22 @@ impl Build {
     /// `orr_shaders.rs`, the `.spv` files, `shaders.manifest.json` and `link_points.json` to
     /// the output directory. With [`link`](Self::link) calls it also compiles the linked
     /// kernels under `linked/`; `orr_kernels.rs` holds their `KERNELS` set, empty without
-    /// links. Prints `rerun-if-changed` lines and `cargo:link_points`.
+    /// links. Prints `rerun-if-changed` lines and `cargo::metadata=link_points`.
     pub fn compile(mut self) -> Result<Output, Error> {
         let started = Instant::now();
+        for dep in std::mem::take(&mut self.deps) {
+            let var = |what: &str| env::var(dep_var(&dep, what));
+            let dirs = var("SHADER_DIRS").map_err(|_| Error::NoDep {
+                var: dep_var(&dep, "SHADER_DIRS"),
+            })?;
+            self = self.roots(&dirs);
+            if let Ok(types) = var("TYPES") {
+                self = self.types(&types);
+            }
+            if let Ok(points) = var("LINK_POINTS") {
+                self = self.link_points(&points);
+            }
+        }
         for path in &self.type_maps {
             for (slang, rust) in read_types(path)? {
                 self.externs.entry(slang).or_insert(rust);
@@ -299,25 +341,31 @@ impl Build {
         let out_dir = out_dir(self.out_dir.as_deref())?;
         let lib_dir = canonical_lossy(Path::new(crate::LIB_DIR));
         let own_root = self.kernels.as_deref().map(canonical).transpose()?;
-        let mut roots: Vec<PathBuf> = own_root.iter().cloned().collect();
-        for dir in &self.includes {
-            let dir = canonical(dir)?;
-            if !roots.contains(&dir) && dir != lib_dir {
-                roots.push(dir);
+        let prefix = self
+            .prefix
+            .clone()
+            .or_else(|| Some(env::var("CARGO_PKG_NAME").ok()?.replace('-', "_")));
+        let mut roots: Vec<Root> = own_root
+            .iter()
+            .map(|dir| Root {
+                prefix: prefix.clone(),
+                dir: dir.clone(),
+            })
+            .collect();
+        for root in &self.includes {
+            let root = root.canonical()?;
+            if !roots.contains(&root) && root.dir != lib_dir {
+                roots.push(root);
             }
         }
-        let shader_dirs = roots
-            .iter()
-            .map(|r| r.display().to_string())
-            .collect::<Vec<_>>()
-            .join(";");
+        let shader_dirs = roots::format_list(&roots);
         if lib_dir.is_dir() {
-            roots.push(lib_dir.clone());
+            roots.push(Root::plain(&lib_dir));
         }
-        let mut include_dirs = roots.clone();
-        include_dirs.extend(super::openpbr_dir().ok());
+        let mut lint_roots = roots.clone();
+        roots.extend(super::openpbr_dir().ok().map(Root::plain));
 
-        let links = link::resolve(&self.links)?;
+        let links = link::resolve(&self.links, &roots)?;
         let mut listed = LinkPoints::default();
         for path in &self.link_points {
             listed.merge(LinkPoints::read(path)?);
@@ -333,7 +381,10 @@ impl Build {
                     own_points.kernels.push(KernelPoints {
                         name: name.clone(),
                         path: path.clone(),
-                        root: root.clone(),
+                        root: Root {
+                            prefix: prefix.clone(),
+                            dir: root.clone(),
+                        },
                         points,
                     });
                 }
@@ -355,27 +406,26 @@ impl Build {
         let Run {
             modules,
             mut compiled,
-        } = self.run(&tool, &include_dirs, &records, jobs)?;
+        } = self.run(&tool, &roots, &records, jobs)?;
 
         // The listed kernels compiled once more with the linked types.
         let mut linked_modules = BTreeMap::new();
-        let mut lint_roots = roots.clone();
-        let mut linked_dirs = include_dirs.clone();
+        let mut linked_roots = roots.clone();
         if !links.is_empty() {
             let jobs = linked_jobs(&links, &listed, &out_dir)?;
             let module_dirs = link::module_dirs(&links);
             let kernel_roots = listed.kernels.iter().map(|k| &k.root);
-            for dir in module_dirs.iter().chain(kernel_roots) {
-                if !linked_dirs.contains(dir) {
-                    linked_dirs.push(dir.clone());
+            for root in module_dirs.iter().chain(kernel_roots) {
+                if !linked_roots.contains(root) {
+                    linked_roots.push(root.clone());
                 }
             }
-            for dir in module_dirs {
-                if !lint_roots.contains(&dir) {
-                    lint_roots.push(dir);
+            for root in module_dirs {
+                if !lint_roots.contains(&root) {
+                    lint_roots.push(root);
                 }
             }
-            let run = self.run(&tool, &linked_dirs, &records, jobs)?;
+            let run = self.run(&tool, &linked_roots, &records, jobs)?;
             linked_modules = run.modules;
             compiled.extend(run.compiled.into_iter().map(|n| format!("linked/{n}")));
         }
@@ -423,14 +473,14 @@ impl Build {
                         }
                         None => Owner::Types,
                         Some(file) => {
-                            let root = roots.iter().find(|r| file.starts_with(r));
+                            let root = roots.iter().find(|r| file.starts_with(&r.dir));
                             lints.push(LintError {
                                 lint: Lint::Ownership,
                                 module: name.clone(),
                                 message: format!(
                                     "struct {s} is declared in {} under {}; map it with .extern_type({s:?}, \"<crate>::<path>::{}\")",
                                     file.display(),
-                                    root.map_or("no shader root".to_owned(), |r| format!("shader root {}", r.display())),
+                                    root.map_or("no shader root".to_owned(), |r| format!("shader root {}", r.dir.display())),
                                     codegen::rust_name(s)
                                 ),
                             });
@@ -547,8 +597,10 @@ impl Build {
         let manifest = Manifest {
             slang: SLANG_VERSION.to_owned(),
             library: self.lib.path.clone(),
-            options: self.options(&include_dirs),
-            linked_options: self.options(&linked_dirs),
+            options: self.options(&include_dirs(&roots)),
+            linked_options: self.options(&include_dirs(&linked_roots)),
+            roots: roots.clone(),
+            linked_roots,
             asserts: self.asserts,
             omm: self.omm,
             modules: modules
@@ -610,11 +662,12 @@ impl Build {
             None => None,
         };
 
-        let mut watched = roots;
+        let mut watched: Vec<PathBuf> = roots.into_iter().map(|r| r.dir).collect();
         watched.extend(self.link_points.iter().cloned());
         watched.extend(links.iter().map(|l| l.module.clone()));
         watched.extend(self.type_maps.iter().cloned());
         print_cargo(
+            &shader_dirs,
             &watched,
             modules.values().chain(linked_modules.values()),
             &link_points_path,
@@ -624,7 +677,7 @@ impl Build {
             #[allow(clippy::print_stdout)]
             {
                 println!(
-                    "cargo:warning=orr_shaders: {} of {} modules compiled in {:.2} s",
+                    "cargo::warning=orr_shaders: {} of {} modules compiled in {:.2} s",
                     compiled.len(),
                     modules.len() + linked_modules.len(),
                     started.elapsed().as_secs_f64()
@@ -647,30 +700,27 @@ impl Build {
     fn run(
         &self,
         tool: &str,
-        include_dirs: &[PathBuf],
+        roots: &[Root],
         records: &Path,
         jobs: Vec<Job>,
     ) -> Result<Run, Error> {
-        let options = self.options(include_dirs);
+        let include_dirs = include_dirs(roots);
+        let options = self.options(&include_dirs);
         let (precompiled, kernel_options) = if self.precompile && !jobs.is_empty() {
+            let root_list = roots::format_list(roots);
+            let identity = format!("{}\n{root_list}", options.join("\n"));
             let dir = records
                 .join("modules")
-                .join(format!("{:016x}", hash64(options.join("\n").as_bytes())));
-            let mut key_parts = vec![tool];
+                .join(format!("{:016x}", hash64(identity.as_bytes())));
+            let mut key_parts = vec![tool, root_list.as_str()];
             key_parts.extend(options.iter().map(String::as_str));
             let mut sources = Vec::new();
             for job in &jobs {
                 sources.push((job.path.clone(), read(&job.path)?));
                 sources.extend(job.links.iter().map(|l| (l.path.clone(), l.source.clone())));
             }
-            let precompiled = precompile::precompile(
-                &self.lib,
-                &options,
-                &key_parts,
-                include_dirs,
-                &sources,
-                &dir,
-            )?;
+            let precompiled =
+                precompile::precompile(&self.lib, &options, &key_parts, roots, &sources, &dir)?;
             let mut dirs = vec![canonical_lossy(&dir)];
             dirs.extend(include_dirs.iter().cloned());
             (precompiled, self.options(&dirs))
@@ -679,7 +729,7 @@ impl Build {
         };
         let metal_options = self
             .metal_check
-            .then(|| metal_session_options(include_dirs));
+            .then(|| metal_session_options(&include_dirs));
         let settings = Settings {
             tool,
             options: &kernel_options,
@@ -687,7 +737,7 @@ impl Build {
             asserts: self.asserts,
             separate_debug: self.debug_info == DebugInfo::Separate,
             precompiled: &precompiled,
-            include_dirs,
+            roots,
         };
         let mut modules = BTreeMap::new();
         let mut todo = Vec::new();
@@ -732,6 +782,20 @@ impl Build {
     }
 }
 
+/// The search paths of `roots`: those without a prefix.
+fn include_dirs(roots: &[Root]) -> Vec<PathBuf> {
+    roots
+        .iter()
+        .filter(|r| r.prefix.is_none())
+        .map(|r| r.dir.clone())
+        .collect()
+}
+
+/// The environment variable that holds what the dependency with `links = "<links>"` published.
+fn dep_var(links: &str, what: &str) -> String {
+    format!("DEP_{}_{what}", links.to_uppercase().replace('-', "_"))
+}
+
 fn metal_session_options(include_dirs: &[PathBuf]) -> Vec<String> {
     let mut o: Vec<String> = metal::OPTIONS.iter().map(|s| (*s).to_owned()).collect();
     for dir in include_dirs {
@@ -752,8 +816,8 @@ fn linked_jobs(links: &[Link], listed: &LinkPoints, out_dir: &Path) -> Result<Ve
         return Err(Error::Link {
             message: format!(
                 "the {} point is linked, but no kernel in the link-points files declares it \
-                 (they list {} kernels); pass the renderer's DEP_ORR_LINK_POINTS to \
-                 Build::link_points",
+                 (they list {} kernels); name the renderer's crate with Build::dep, or pass its \
+                 link points to Build::link_points",
                 l.point.label(),
                 listed.kernels.len()
             ),
@@ -813,6 +877,10 @@ pub(super) struct Manifest {
     pub(super) options: Vec<String>,
     /// The source options of the linked kernels.
     pub(super) linked_options: Vec<String>,
+    /// The import roots of the crate's own kernels.
+    pub(super) roots: Vec<Root>,
+    /// The import roots of the linked kernels.
+    pub(super) linked_roots: Vec<Root>,
     pub(super) asserts: bool,
     pub(super) omm: bool,
     pub(super) modules: Vec<ManifestModule>,
@@ -878,8 +946,8 @@ pub(super) struct Settings<'a> {
     /// `options` hold `-separate-debug-info`.
     pub(super) separate_debug: bool,
     pub(super) precompiled: &'a Precompiled,
-    /// The import roots, read only with precompiled modules.
-    pub(super) include_dirs: &'a [PathBuf],
+    /// The import roots.
+    pub(super) roots: &'a [Root],
 }
 
 impl Settings<'_> {
@@ -909,6 +977,7 @@ struct Job {
 }
 
 fn print_cargo<'a>(
+    shader_dirs: &str,
     watched: &[PathBuf],
     modules: impl Iterator<Item = &'a Record>,
     link_points: &Path,
@@ -920,12 +989,13 @@ fn print_cargo<'a>(
     }
     #[allow(clippy::print_stdout)]
     {
-        println!("cargo:link_points={}", link_points.display());
+        println!("cargo::metadata=shader_dirs={shader_dirs}");
+        println!("cargo::metadata=link_points={}", link_points.display());
         if let Some(types) = types {
-            println!("cargo:types={}", types.display());
+            println!("cargo::metadata=types={}", types.display());
         }
         for l in lines {
-            println!("cargo:rerun-if-changed={}", l.display());
+            println!("cargo::rerun-if-changed={}", l.display());
         }
         for var in [
             "ORR_SLANGC",
@@ -939,7 +1009,7 @@ fn print_cargo<'a>(
             "ORR_SHADER_NEURAL",
             "ORR_SHADER_CAPTURE",
         ] {
-            println!("cargo:rerun-if-env-changed={var}");
+            println!("cargo::rerun-if-env-changed={var}");
         }
     }
 }
@@ -1023,6 +1093,11 @@ fn cache_key(settings: &Settings<'_>, job: &Job, inputs: &[PathBuf]) -> Option<S
     h.update(SLANG_VERSION.as_bytes());
     for o in settings.key_parts() {
         h.update(o.as_bytes());
+        h.update(&[0]);
+    }
+    // Prefixed roots are in no option, and an import's file depends on them.
+    for root in settings.roots {
+        h.update(root.entry().as_bytes());
         h.update(&[0]);
     }
     h.update(job.path.to_string_lossy().as_bytes());
@@ -1251,6 +1326,16 @@ pub(super) fn compile_kernel(
         module: unit.name.to_owned(),
         diagnostics,
     };
+    let mut sources = vec![(unit.path, unit.source)];
+    sources.extend(
+        unit.links
+            .iter()
+            .map(|l| (l.path.as_path(), l.source.as_str())),
+    );
+    roots::load_prefixed(session, settings.roots, &sources, |name| {
+        settings.precompiled.holds(name)
+    })
+    .map_err(compile_err)?;
     let module = session
         .load(&unit.name.replace('/', "."), unit.path, unit.source)
         .map_err(compile_err)?;
@@ -1292,7 +1377,7 @@ pub(super) fn compile_kernel(
             settings.precompiled.is_empty()
                 || p == unit.path
                 || unit.links.iter().any(|l| p == &l.path)
-                || settings.include_dirs.iter().any(|d| p.starts_with(d))
+                || settings.roots.iter().any(|r| p.starts_with(&r.dir))
         })
         .chain(settings.precompiled.inputs(session))
         .collect();
@@ -1348,6 +1433,13 @@ fn metal_issues(
     }
     let text = metal::without_raygen(source);
     let compiled = (|| {
+        let mut sources = vec![(job.path.as_path(), text.as_ref())];
+        sources.extend(
+            job.links
+                .iter()
+                .map(|l| (l.path.as_path(), l.source.as_str())),
+        );
+        roots::load_prefixed(session, settings.roots, &sources, |_| false)?;
         let module = session.load(&job.name.replace('/', "."), &job.path, &text)?;
         let extra = link_modules(session, settings, &job.links)?;
         let program = session.link(&module, &extra, |e| entries.contains(e))?;
@@ -1369,7 +1461,7 @@ fn metal_issues(
 /// The [`Lint::Micromap`] message for `entry`.
 pub(super) fn no_omm_mode(entry: &str) -> String {
     format!(
-        "entry point {entry} traces rays without the opacity-micromap mode; begin it with `ORR_OMM({entry});` from orr/root.h"
+        "entry point {entry} traces rays without the opacity-micromap mode; begin it with `ORR_OMM({entry});` from orr_shaders/root.h"
     )
 }
 
@@ -1472,33 +1564,52 @@ fn write_types(path: &Path, types: &BTreeMap<String, String>) -> Result<(), Erro
     )
 }
 
-/// Republishes the types of dependencies this crate re-exports: every `types.json` in
-/// `list` (`DEP_*_TYPES` values joined by `;`), with each Rust path under a `moves` entry's
-/// first path (`::dep`) moved to its second (`::my_crate::dep`), merged into
-/// `OUT_DIR/types.json` and printed as `cargo:types`.
-pub fn reexport_types(list: &str, moves: &[(&str, &str)]) -> Result<PathBuf, Error> {
-    let mut merged = BTreeMap::new();
-    for path in list.split(';').filter(|s| !s.is_empty()).map(Path::new) {
-        for (slang, rust) in read_types(path)? {
-            let moved = moves.iter().find_map(|(from, to)| {
-                let rest = rust.strip_prefix(from.trim_end_matches("::"))?;
-                rest.starts_with("::")
-                    .then(|| format!("{}{rest}", to.trim_end_matches("::")))
-            });
-            merged.insert(slang, moved.unwrap_or(rust));
+/// Publishes the union of what the direct dependencies with the `links` values `deps` publish,
+/// for a crate that re-exports them, so its dependents read one dependency. Each `(from, to)`
+/// of `moved` rewrites a type's Rust path under `from` (`::dep`) to `to` (`::my_crate::dep`).
+pub fn publish_union(deps: &[&str], moved: &[(&str, &str)]) -> Result<(), Error> {
+    let mut roots: Vec<Root> = Vec::new();
+    let mut points = Vec::new();
+    let mut types = BTreeMap::new();
+    let required = |links: &str, what: &str| {
+        let var = dep_var(links, what);
+        env::var(&var).map_err(|_| Error::NoDep { var })
+    };
+    for &dep in deps {
+        for root in roots::parse_list(&required(dep, "SHADER_DIRS")?) {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
         }
-        #[allow(clippy::print_stdout)]
-        {
-            println!("cargo:rerun-if-changed={}", path.display());
+        points.push(required(dep, "LINK_POINTS")?);
+        let list = required(dep, "TYPES")?;
+        for path in list.split(';').filter(|s| !s.is_empty()).map(Path::new) {
+            for (slang, rust) in read_types(path)? {
+                let rust = moved
+                    .iter()
+                    .find_map(|(from, to)| {
+                        let rest = rust.strip_prefix(from.trim_end_matches("::"))?;
+                        rest.starts_with("::")
+                            .then(|| format!("{}{rest}", to.trim_end_matches("::")))
+                    })
+                    .unwrap_or(rust);
+                types.insert(slang, rust);
+            }
+            #[allow(clippy::print_stdout)]
+            {
+                println!("cargo::rerun-if-changed={}", path.display());
+            }
         }
     }
     let path = out_dir(None)?.join("types.json");
-    write_types(&path, &merged)?;
+    write_types(&path, &types)?;
     #[allow(clippy::print_stdout)]
     {
-        println!("cargo:types={}", path.display());
+        println!("cargo::metadata=shader_dirs={}", roots::format_list(&roots));
+        println!("cargo::metadata=link_points={}", points.join(";"));
+        println!("cargo::metadata=types={}", path.display());
     }
-    Ok(path)
+    Ok(())
 }
 
 pub(super) fn read(path: &Path) -> Result<String, Error> {

@@ -9,11 +9,11 @@
 // defined the tables are compiled in instead (CPU tests).
 module openpbr;
 
-__exported import orr.openpbr_bsdf;
+__exported import orr_shaders.openpbr_bsdf;
 
 #ifndef ORR_OPENPBR_ARRAY_LUTS
 
-import orr.abi;
+import orr_shaders.abi;
 
 // `orr_shaders::abi::OPENPBR_LUT_SLOT`, where orr_lighting's tables stay.
 [vk::constant_id(104)] const uint openpbr_lut_slot = 1;

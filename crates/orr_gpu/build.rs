@@ -1,18 +1,41 @@
-//! Compiles orr_gpu's own kernels and publishes its shader root, which holds the `rtas` and
-//! `sequence` libraries, sets `cfg(orr_omm)` when the shaders are built with micromaps, and
-//! generates the Nsight Perf SDK bindings that counter frames use when the SDK is found.
+//! Compiles orr_gpu's own kernels, publishes its shader root, which holds the `rtas` and
+//! `sequence` libraries, and the Rust types of the `rtas` records, sets `cfg(orr_omm)` when the
+//! shaders are built with micromaps, and generates the Nsight Perf SDK bindings that counter
+//! frames use when the SDK is found.
 
 use std::env;
 use std::path::{Path, PathBuf};
 
 use orr_shaders::build::Build;
 
+/// The `rtas` records, mirrored in `crate::rtas`.
+const RTAS_RECORDS: &[&str] = &[
+    "ClasBuild",
+    "TemplateBuild",
+    "Instantiate",
+    "ClusterBlas",
+    "Move",
+    "PtlasWrite",
+    "PtlasUpdate",
+    "PtlasTranslate",
+    "PtlasCommand",
+];
+
 fn main() {
     let src = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("src");
     println!("cargo::rustc-check-cfg=cfg(orr_omm)");
-    match Build::new().and_then(|b| b.kernels(&src).compile()) {
+    let built = Build::new().and_then(|b| {
+        RTAS_RECORDS
+            .iter()
+            .fold(b.kernels(&src), |b, t| {
+                b.extern_type(t, &format!("crate::rtas::{t}"))
+            })
+            .extern_type("ClassicInstance", "crate::ClassicInstance")
+            .publish_types("::orr_gpu")
+            .compile()
+    });
+    match built {
         Ok(out) => {
-            println!("cargo:shader_dirs={}", out.shader_dirs);
             if out.omm {
                 println!("cargo::rustc-cfg=orr_omm");
             }

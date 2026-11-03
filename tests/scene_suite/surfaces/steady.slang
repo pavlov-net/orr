@@ -1,7 +1,7 @@
 // A surface that depends only on where the hit is on the mesh, never on its context or ray.
 module steady;
 
-import surface;
+import orr_scene.surface;
 
 public struct Steady : ISurface
 {

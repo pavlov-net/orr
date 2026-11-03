@@ -1,9 +1,9 @@
 // The CLAS templates of the tessellation patterns: one thread per pattern and opacity
 // writes its template build record over the moment-curve positions, opaque templates first.
-#include "orr/root.h"
-import orr.abi;
-import rtas;
-import tessellation;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_gpu.rtas;
+import orr_scene.tessellation;
 
 public struct TemplatesRoot
 {

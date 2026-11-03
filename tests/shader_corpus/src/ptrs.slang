@@ -1,6 +1,6 @@
 // Pointee kinds: scalar, vector, 3-vector, 64-bit, pointer to pointer, half, matrix,
 // generic pointer and unsized array.
-import records;
+import shader_corpus.records;
 
 struct S
 {

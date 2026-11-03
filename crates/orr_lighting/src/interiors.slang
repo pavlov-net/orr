@@ -2,12 +2,12 @@
 // Rays that look for those surfaces share `LayerAccept`.
 module interiors;
 
-import orr.abi;
-import orr.math;
-import orr.random;
-import orr.trace;
-import hit;
-import visibility;
+import orr_shaders.abi;
+import orr_shaders.math;
+import orr_shaders.random;
+import orr_shaders.trace;
+import orr_scene.hit;
+import orr_scene.visibility;
 
 // Interior list entries a path keeps.
 public static const uint INTERIOR_ENTRIES = 4;

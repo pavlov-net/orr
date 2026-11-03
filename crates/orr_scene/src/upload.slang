@@ -1,7 +1,7 @@
 // Applies a frame's upload records: each record writes a run of 32-bit words from the
 // upload window (or a constant) into a scene table. Thread t handles word t - first of the
 // record whose run holds it; records are sorted by `first` and do not overlap.
-#include "orr/root.h"
+#include "orr_shaders/root.h"
 
 static const uint SCATTER_COPY = 0;
 static const uint SCATTER_FILL = 1;

@@ -36,7 +36,7 @@ fn main() {
         .find(|p| p.exists());
     let mut locked = Vec::new();
     if let Some(lock) = lock {
-        println!("cargo:rerun-if-changed={}", lock.display());
+        println!("cargo::rerun-if-changed={}", lock.display());
         let text = std::fs::read_to_string(&lock).expect("Cargo.lock");
         let mut name = None;
         for line in text.lines() {
@@ -57,24 +57,24 @@ fn main() {
         v.join(", ")
     };
     println!(
-        "cargo:rustc-env=ORR_COOK_ZSTD_LIBS={}",
+        "cargo::rustc-env=ORR_COOK_ZSTD_LIBS={}",
         versions(&|n| ZSTD.contains(&n))
     );
     println!(
-        "cargo:rustc-env=ORR_COOK_MESH_LIBS={}",
+        "cargo::rustc-env=ORR_COOK_MESH_LIBS={}",
         versions(&|n| MESH.contains(&n))
     );
     let texture = |n: &str| n == "ctt" || n.starts_with("ctt-") || TEXTURE.contains(&n);
     println!(
-        "cargo:rustc-env=ORR_COOK_TEXTURE_LIBS={}",
+        "cargo::rustc-env=ORR_COOK_TEXTURE_LIBS={}",
         versions(&texture)
     );
     println!(
-        "cargo:rustc-env=ORR_COOK_RASTER_LIBS={}",
+        "cargo::rustc-env=ORR_COOK_RASTER_LIBS={}",
         versions(&|n| n == "tiff" || texture(n))
     );
     println!(
-        "cargo:rustc-env=ORR_COOK_VOLUME_LIBS={}",
+        "cargo::rustc-env=ORR_COOK_VOLUME_LIBS={}",
         versions(&|n| VOLUME.contains(&n))
     );
 }
@@ -98,16 +98,16 @@ fn ntc() {
     let header = sdk.join("include/libntc/ntc.h");
     let schema = sdk.join("src/JsonFileFormat.h");
     for f in [&header, &schema] {
-        println!("cargo:rerun-if-changed={}", f.display());
+        println!("cargo::rerun-if-changed={}", f.display());
     }
     let read =
         |f: &Path| std::fs::read_to_string(f).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
     let interface = constant(&read(&header), "uint32_t InterfaceVersion =", &header);
     let schema_version = constant(&read(&schema), "uint32_t SchemaVersion =", &schema);
-    println!("cargo:rustc-env=ORR_COOK_NTC_SDK={}", sdk.display());
-    println!("cargo:rustc-env=ORR_COOK_NTC_INTERFACE={interface}");
-    println!("cargo:rustc-env=ORR_COOK_NTC_SCHEMA={schema_version}");
-    println!("cargo:rerun-if-changed=src/texture/ntc.cpp");
+    println!("cargo::rustc-env=ORR_COOK_NTC_SDK={}", sdk.display());
+    println!("cargo::rustc-env=ORR_COOK_NTC_INTERFACE={interface}");
+    println!("cargo::rustc-env=ORR_COOK_NTC_SCHEMA={schema_version}");
+    println!("cargo::rerun-if-changed=src/texture/ntc.cpp");
     cc::Build::new()
         .cpp(true)
         .std("c++17")
@@ -139,8 +139,8 @@ fn subd() {
         src.display(),
         OPENSUBDIV.1
     );
-    println!("cargo:rustc-env=ORR_COOK_SUBD_LIBS=OpenSubdiv {number}");
-    println!("cargo:rerun-if-changed=src/subd/osd.cpp");
+    println!("cargo::rustc-env=ORR_COOK_SUBD_LIBS=OpenSubdiv {number}");
+    println!("cargo::rerun-if-changed=src/subd/osd.cpp");
     let mut files = Vec::new();
     for dir in ["sdc", "vtr", "far"] {
         let dir = src.join("opensubdiv").join(dir);
@@ -175,7 +175,7 @@ fn constant_define(text: &str, name: &str, file: &Path) -> String {
 
 #[cfg(not(feature = "subd"))]
 fn subd() {
-    println!("cargo:rustc-env=ORR_COOK_SUBD_LIBS=");
+    println!("cargo::rustc-env=ORR_COOK_SUBD_LIBS=");
 }
 
 #[cfg(feature = "gdeflate")]
@@ -184,7 +184,7 @@ fn gdeflate() {
         orr_shaders::build::fetched("ORR_GDEFLATE", "libdeflate-gdeflate").unwrap_or_else(|e| {
             panic!("the gdeflate feature needs a NVIDIA/libdeflate gdeflate checkout: {e}")
         });
-    println!("cargo:rustc-env=ORR_COOK_GDEFLATE={}", commit(&src));
+    println!("cargo::rustc-env=ORR_COOK_GDEFLATE={}", commit(&src));
     let cpu = if cfg!(any(target_arch = "aarch64", target_arch = "arm")) {
         "lib/arm/cpu_features.c"
     } else {
@@ -199,7 +199,7 @@ fn gdeflate() {
         cpu,
     ];
     for f in files {
-        println!("cargo:rerun-if-changed={}", src.join(f).display());
+        println!("cargo::rerun-if-changed={}", src.join(f).display());
     }
     cc::Build::new()
         .include(&src)
@@ -215,7 +215,7 @@ fn commit(checkout: &Path) -> String {
     let read = |f: &Path| std::fs::read_to_string(f).map(|s| s.trim().to_owned());
     let head = read(&git.join("HEAD"))
         .unwrap_or_else(|e| panic!("{} is not a git checkout: {e}", checkout.display()));
-    println!("cargo:rerun-if-changed={}", git.join("HEAD").display());
+    println!("cargo::rerun-if-changed={}", git.join("HEAD").display());
     let Some(name) = head.strip_prefix("ref: ") else {
         return head;
     };

@@ -1,8 +1,8 @@
 // Writes indirect copy lists: page `i` of `dst_pages` from page `page_source[i]` of
 // `src_pages`, and tile `i` (x, y, mip, staging slot in `tiles`) from its staging slot.
 // Page entries past the page count copy nothing and name the guard page after the last.
-#include "orr/root.h"
-import copy;
+#include "orr_shaders/root.h"
+import orr_gpu.copy;
 
 struct Root
 {

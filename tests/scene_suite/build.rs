@@ -12,14 +12,7 @@ use orr_shaders::build::{Build, LinkPoint};
 
 fn main() {
     let dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let roots = env::var("DEP_ORR_SCENE_SHADER_DIRS").expect("orr_scene shader roots");
-    let types = env::var("DEP_ORR_SCENE_TYPES").expect("orr_scene type map");
-    let result = Build::new().and_then(|b| {
-        b.kernels(dir.join("src"))
-            .roots(&roots)
-            .types(&types)
-            .compile()
-    });
+    let result = Build::new().and_then(|b| b.kernels(dir.join("src")).dep("orr_scene").compile());
     let own_points = match result {
         Ok(out) => out.link_points,
         Err(e) => panic!("{e}"),
@@ -29,7 +22,7 @@ fn main() {
     let hot = out.join("hot-src");
     fs::create_dir_all(&hot).unwrap();
     let src = dir.join("hot/fill.slang");
-    println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo::rerun-if-changed={}", src.display());
     let text = fs::read_to_string(&src).unwrap();
     let copy = hot.join("fill.slang");
     // Rewritten only when it differs, so an unchanged copy does not rerun this script.
@@ -41,14 +34,11 @@ fn main() {
         panic!("{e}");
     }
 
-    let points = env::var("DEP_ORR_SCENE_LINK_POINTS").expect("orr_scene link points");
     let surface = |name: &str| dir.join(format!("surfaces/{name}.slang"));
     let result = Build::new().and_then(|b| {
-        b.roots(&roots)
-            .include(dir.join("src"))
-            .link_points(&points)
+        b.dep("orr_scene")
+            .include_as("scene_suite", dir.join("src"))
             .link_points(&own_points.display().to_string())
-            .types(&types)
             .out_dir(out.join("linked"))
             .link(
                 LinkPoint::Surface,

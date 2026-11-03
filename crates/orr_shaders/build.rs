@@ -8,7 +8,7 @@
 mod locate;
 
 fn main() {
-    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo::rerun-if-changed=build.rs");
     #[cfg(feature = "build")]
     bindings();
     #[cfg(feature = "openpbr")]
@@ -41,7 +41,7 @@ fn openpbr_luts() {
     use std::fs;
     use std::path::PathBuf;
 
-    println!("cargo:rerun-if-env-changed=ORR_OPENPBR_BSDF");
+    println!("cargo::rerun-if-env-changed=ORR_OPENPBR_BSDF");
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let dir = locate::find_openpbr(env::var_os("ORR_OPENPBR_BSDF"), &manifest).unwrap_or_else(|| {
         panic!(
@@ -55,7 +55,7 @@ fn openpbr_luts() {
     let mut luts = String::from("[\n");
     for (id, (stem, extent, rgba)) in OPENPBR_LUTS.into_iter().enumerate() {
         let path = dir.join("impl/data").join(format!("openpbr_{stem}_data.h"));
-        println!("cargo:rerun-if-changed={}", path.display());
+        println!("cargo::rerun-if-changed={}", path.display());
         let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let values = lut_values(&text);
         let texels = extent.iter().product::<u32>() as usize;
@@ -98,7 +98,7 @@ fn openpbr_luts() {
     fs::write(&rs, luts).unwrap_or_else(|e| panic!("{}: {e}", rs.display()));
 
     let license = dir.join("LICENSE");
-    println!("cargo:rerun-if-changed={}", license.display());
+    println!("cargo::rerun-if-changed={}", license.display());
     fs::copy(&license, out.join("LICENSE"))
         .unwrap_or_else(|e| panic!("{}: {e}", license.display()));
 }
@@ -129,7 +129,7 @@ fn bindings() {
     use std::env;
     use std::path::PathBuf;
 
-    println!("cargo:rerun-if-env-changed=ORR_SLANGC");
+    println!("cargo::rerun-if-env-changed=ORR_SLANGC");
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let slangc = match locate::find_slangc(env::var_os("ORR_SLANGC"), &manifest) {
         Ok(path) => path,
@@ -146,7 +146,7 @@ fn bindings() {
     };
     let include = locate::release_dir(&slangc).join("include");
     let tag = include.join("slang-tag-version.h");
-    println!("cargo:rerun-if-changed={}", tag.display());
+    println!("cargo::rerun-if-changed={}", tag.display());
     let found = std::fs::read_to_string(&tag)
         .ok()
         .and_then(|s| {
@@ -163,7 +163,7 @@ fn bindings() {
         );
     }
     let header = include.join("slang.h");
-    println!("cargo:rerun-if-changed={}", header.display());
+    println!("cargo::rerun-if-changed={}", header.display());
 
     let bindings = bindgen::Builder::default()
         .header(header.to_string_lossy())

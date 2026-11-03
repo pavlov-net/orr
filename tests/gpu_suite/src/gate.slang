@@ -1,6 +1,6 @@
 // Spins until the host sets `*flag`, then writes 1 to `*out`; gives up after a bounded
 // number of polls and writes 0.
-#include "orr/root.h"
+#include "orr_shaders/root.h"
 
 struct Root
 {

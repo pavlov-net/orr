@@ -176,10 +176,10 @@ fn recompile(
 ) -> Result<Option<Reload>, String> {
     let manifest = &*w.manifest;
     let entry = &manifest.modules[w.index];
-    let mut options = if entry.linked {
-        manifest.linked_options.clone()
+    let (mut options, roots) = if entry.linked {
+        (manifest.linked_options.clone(), &manifest.linked_roots)
     } else {
-        manifest.options.clone()
+        (manifest.options.clone(), &manifest.roots)
     };
     options.retain(|o| o != "-separate-debug-info");
     let session = global.session(&options)?;
@@ -204,7 +204,7 @@ fn recompile(
         asserts: manifest.asserts,
         separate_debug: false,
         precompiled: &precompiled,
-        include_dirs: &[],
+        roots,
     };
     let unit = Unit {
         name: &entry.name,

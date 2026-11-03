@@ -1,6 +1,6 @@
 // Loads a box of texels of one mip of a texture through a sampled view.
-#include "orr/root.h"
-import orr.abi;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
 
 struct Root
 {

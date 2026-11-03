@@ -2,11 +2,11 @@
 // hit; `same_point` resolves each pixel's visible point three ways, as the material resolve
 // does, from a camera ray and from a ray arriving from elsewhere; `cones` follows a camera
 // ray to its hit and a mirror ray from there to the next, with their ray cones.
-#include "orr/root.h"
-import orr.math;
-import orr.trace;
-import hit;
-import visibility;
+#include "orr_shaders/root.h"
+import orr_shaders.math;
+import orr_shaders.trace;
+import orr_scene.hit;
+import orr_scene.visibility;
 
 extern struct Surface : ISurface = StandardSurface;
 

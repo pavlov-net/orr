@@ -1,6 +1,6 @@
 // dst[i] = src[i] * 3 + 1: one link of a chain of dispatches ordered across queues.
-#include "orr/root.h"
-import orr.abi;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
 
 struct Root
 {

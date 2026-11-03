@@ -3,7 +3,7 @@
 // unit solid angle.
 module sampling;
 
-import orr.math;
+import orr_shaders.math;
 
 // Concentric mapping of the unit square onto the unit disk (Shirley and Chiu 1997).
 public float2 sample_disk_concentric(float2 u)

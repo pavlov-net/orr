@@ -4,7 +4,7 @@
 // device addresses; vertex positions are f32x3 with a 12-byte stride.
 module rtas;
 
-import orr.debug;
+import orr_shaders.debug;
 
 // `ClasBuild.flags`: the micromap index may name `OMM_INDEX_DISABLE` per triangle.
 public static const uint CLUSTER_ALLOW_DISABLE_OMM = 1;

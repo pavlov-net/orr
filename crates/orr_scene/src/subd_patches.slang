@@ -5,13 +5,13 @@
 // `stencils` applies the cage's stencils to them for its page points; `fill` evaluates each
 // base vertex on the limit surface (its position on the patch every vertex at its cage
 // point shares, so they agree bit for bit) and writes the patch clusters and counts.
-#include "orr/root.h"
-import orr.abi;
-import orr.math;
-import orr.packing;
-import producer;
-import subd_cage;
-import tables;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.math;
+import orr_shaders.packing;
+import orr_scene.producer;
+import orr_scene.subd_cage;
+import orr_scene.tables;
 
 public struct SubdRoot
 {

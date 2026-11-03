@@ -9,9 +9,9 @@
 //! frames: each pixel of an opaque dispatch names one of the lights that added to its path,
 //! chosen in proportion to what each added. Kernels reach the result through
 //! [`SceneLighting::light_set`], [`SceneLighting::world_cache`] and the Slang modules
-//! `light_sampling`, `world_cache`, `environment` and `media` under this crate's shader root
-//! (`DEP_ORR_LIGHTING_SHADER_DIRS`). Kernels that shade with the real-time OpenPBR BSDF
-//! import `bsdf` and read [`BsdfTables`].
+//! `orr_lighting.light_sampling`, `orr_lighting.world_cache`, `orr_lighting.environment` and
+//! `orr_lighting.media` (`DEP_ORR_LIGHTING_SHADER_DIRS`). Kernels that shade with the real-time
+//! OpenPBR BSDF import `orr_lighting.bsdf` and read [`BsdfTables`].
 //!
 //! Each view, [`LightingView::begin`] settles the frame's history reset; after the view's
 //! raster half, [`LightingKernels::record_media`] fills the view's froxel volume with the

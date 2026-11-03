@@ -1,7 +1,7 @@
 // Calls every surface method through the linked switch.
-#include "orr/root.h"
-import surface;
-import orr.coherence;
+#include "orr_shaders/root.h"
+import orr_scene.surface;
+import orr_shaders.coherence;
 
 extern struct Surface : ISurface = StandardSurface;
 

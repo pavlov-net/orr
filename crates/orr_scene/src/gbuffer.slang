@@ -6,13 +6,13 @@
 // (RGBA32_UINT) holds subsurface and lobe scalars where `GBUFFER_EXTENDED` is set.
 module gbuffer;
 
-import orr.abi;
+import orr_shaders.abi;
 import orr_color.transfer;
-import orr.math;
-import orr.packing;
-import material;
-import tables;
-import view;
+import orr_shaders.math;
+import orr_shaders.packing;
+import orr_scene.material;
+import orr_scene.tables;
+import orr_scene.view;
 
 // `BsdfParams.flags`.
 public static const uint BSDF_THIN_WALLED = 1 << 0;

@@ -7,7 +7,7 @@ module spectrum;
 
 import orr_color.chromaticity;
 import orr_color.primaries;
-import orr.openpbr;
+import orr_shaders.openpbr;
 
 public static const float WAVELENGTH_MIN = 360.0;   // nm
 public static const float WAVELENGTH_MAX = 830.0;

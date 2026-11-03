@@ -4,11 +4,11 @@
 // `tile_max` take the largest half vector per TILE x TILE tile, `neighbors` the largest that
 // can reach each tile and the spread of directions around it, and `gather` blurs `source`
 // into `target`.
-#include "orr/root.h"
-import orr.abi;
-import orr.random;
-import view;
-import overlay_front;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.random;
+import orr_scene.view;
+import orr_output.overlay_front;
 
 static const uint TILE = 20;
 // Relative depth difference over which a sample goes from behind to in front.

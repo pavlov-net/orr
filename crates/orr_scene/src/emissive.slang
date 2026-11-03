@@ -1,11 +1,11 @@
 // The power of every emissive list entry this frame: luminance x area, the area in
 // render space. Runs after scene compute, so it sees this frame's transforms and
 // producer clusters.
-#include "orr/root.h"
-import lights;
-import material;
-import producer;
-import tables;
+#include "orr_shaders/root.h"
+import orr_scene.lights;
+import orr_scene.material;
+import orr_scene.producer;
+import orr_scene.tables;
 
 struct Root
 {

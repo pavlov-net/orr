@@ -1,8 +1,8 @@
 // orr_lighting's dielectric interior list over a script of crossings: each step crosses
 // material `m` from its front (`front` 1) or back and records the list, innermost last, and
 // the innermost entry other than the step's material.
-#include "orr/root.h"
-import interiors;
+#include "orr_shaders/root.h"
+import orr_lighting.interiors;
 
 struct Crossing
 {

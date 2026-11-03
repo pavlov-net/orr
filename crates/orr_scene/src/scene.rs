@@ -345,7 +345,7 @@ impl Group {
 pub(crate) struct ModelCpu {
     pub(crate) sections: u32,
     pub(crate) animated_parts: u32,
-    /// The `orr.trace` candidate class its copies take; `None` where its sections mix
+    /// The `orr_shaders.trace` candidate class its copies take; `None` where its sections mix
     /// dielectric or presence materials with others.
     pub(crate) candidate_class: Option<u8>,
     /// Its skeleton's joints; 0 without a skeleton.

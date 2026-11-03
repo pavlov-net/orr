@@ -35,19 +35,15 @@ const GLARE_BLADES: u32 = 6;
 fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    let scene = env::var("DEP_ORR_SCENE_SHADER_DIRS").unwrap_or_default();
     let out = Build::new().and_then(|b| {
         b.kernels(manifest.join("src"))
-            .roots(&scene)
+            .dep("orr_scene")
             .extern_type("Gt7Curve", "crate::Gt7Curve")
-            .extern_type("ViewConstants", "::orr_scene::ViewConstants")
-            .extern_type("ExposureState", "::orr_scene::ExposureState")
-            .extern_type("SkyStats", "::orr_scene::SkyStats")
+            .publish_types("::orr_output")
             .compile()
     });
-    match out {
-        Ok(out) => println!("cargo:shader_dirs={}", out.shader_dirs),
-        Err(e) => panic!("{e}"),
+    if let Err(e) = out {
+        panic!("{e}");
     }
     glare(&manifest, &out_dir);
     #[cfg(feature = "pcl-stats")]
@@ -56,7 +52,7 @@ fn main() {
 
 #[cfg(feature = "pcl-stats")]
 fn pcl_stats(manifest: &Path) {
-    println!("cargo:rerun-if-env-changed=REFLEX_SDK");
+    println!("cargo::rerun-if-env-changed=REFLEX_SDK");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
@@ -68,20 +64,20 @@ fn pcl_stats(manifest: &Path) {
     let header = include.join("pclstats.h");
     assert!(header.is_file(), "{} not found", header.display());
     let shim = manifest.join("src/pcl_stats.cpp");
-    println!("cargo:rerun-if-changed={}", header.display());
-    println!("cargo:rerun-if-changed={}", shim.display());
+    println!("cargo::rerun-if-changed={}", header.display());
+    println!("cargo::rerun-if-changed={}", shim.display());
     cc::Build::new()
         .cpp(true)
         .file(shim)
         .include(include)
         .compile("orr_pcl_stats");
-    println!("cargo:rustc-link-lib=advapi32");
-    println!("cargo:rustc-link-lib=user32");
+    println!("cargo::rustc-link-lib=advapi32");
+    println!("cargo::rustc-link-lib=user32");
 }
 
 fn glare(manifest: &Path, out_dir: &Path) {
-    println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=build");
+    println!("cargo::rerun-if-changed=build.rs");
+    println!("cargo::rerun-if-changed=build");
     let sky = fetched("ORR_SKY_DATA", "precomputed_atmospheric_scattering")
         .unwrap_or_else(|e| panic!("{e}"));
     let d65 = fetched("ORR_CIE_D65", "cie/CIE_std_illum_D65.csv").unwrap_or_else(|e| panic!("{e}"));
@@ -191,8 +187,11 @@ fn glare(manifest: &Path, out_dir: &Path) {
     .unwrap();
     let psf_path = out_dir.join("glare_psf.rs");
     write(&psf_path, &rs);
-    println!("cargo:glare_psf={}", psf_path.display());
-    println!("cargo:glare_model={}", manifest.join("build").display());
+    println!("cargo::metadata=glare_psf={}", psf_path.display());
+    println!(
+        "cargo::metadata=glare_model={}",
+        manifest.join("build").display()
+    );
 }
 
 /// Per wavelength (um), each Rec.2020 channel's share of a D65 white: D65 times the

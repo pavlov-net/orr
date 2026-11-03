@@ -1,9 +1,9 @@
 // Sampling the baked environment: a histogram of `environment_sample` over equal-area
 // latitude-longitude bins, and the bins' probabilities integrated from `environment_pdf`.
-#include "orr/root.h"
-import orr.math;
-import orr.random;
-import environment;
+#include "orr_shaders/root.h"
+import orr_shaders.math;
+import orr_shaders.random;
+import orr_lighting.environment;
 
 static const uint BINS_PHI = 32;
 static const uint BINS_Y = 16;

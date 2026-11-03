@@ -1,5 +1,5 @@
 // A surface that overrides coverage and echoes its hit context.
-import surface;
+import orr_scene.surface;
 
 struct GroundBlend : ISurface
 {

@@ -1,9 +1,9 @@
 // Orthographic rays over the unit square toward +z; writes the hit's custom index plus one,
 // or zero on a miss. `main` reads the TLAS address from the root, `main_ptr` through a
 // pointer in the root.
-#include "orr/root.h"
-import orr.abi;
-import orr.trace;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.trace;
 
 struct Root
 {

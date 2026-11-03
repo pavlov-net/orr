@@ -1,8 +1,8 @@
 // Orthographic rays over the unit square toward +z with the cluster probe's alpha test on
 // non-opaque triangles. Per ray: hit, instance index, primitive and cluster id.
-#include "orr/root.h"
-import orr.abi;
-import orr.trace;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.trace;
 
 struct Root
 {

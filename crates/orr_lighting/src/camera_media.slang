@@ -7,23 +7,23 @@
 // smoke triangle on the ray in turn.
 module camera_media;
 
-import orr.abi;
-import orr.math;
+import orr_shaders.abi;
+import orr_shaders.math;
 import orr_color.luminance;
-import orr.random;
-import orr.trace;
-import lights;
-import tables;
-import view;
-import gbuffer;
-import hit;
-import visibility;
-import media;
-import light_sampling;
-import path;
-import shadow;
-import froxels;
-import particle_lighting;
+import orr_shaders.random;
+import orr_shaders.trace;
+import orr_scene.lights;
+import orr_scene.tables;
+import orr_scene.view;
+import orr_scene.gbuffer;
+import orr_scene.hit;
+import orr_scene.visibility;
+import orr_lighting.media;
+import orr_lighting.light_sampling;
+import orr_lighting.path;
+import orr_lighting.shadow;
+import orr_lighting.froxels;
+import orr_lighting.particle_lighting;
 
 // Separates media apply's samples from the paths' of the same pixel.
 static const uint MEDIA_STREAM = 0xC2B2AE35;

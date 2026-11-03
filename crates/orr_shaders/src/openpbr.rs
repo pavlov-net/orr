@@ -1,11 +1,11 @@
-//! The lookup tables and specialization constants of `orr.openpbr`, the OpenPBR 1.1.1
+//! The lookup tables and specialization constants of `orr_shaders.openpbr`, the OpenPBR 1.1.1
 //! reference BSDF from adobe/openpbr-bsdf.
 //!
-//! Kernels that import `orr.openpbr` read the tables from eight consecutive heap slots, in
+//! Kernels that import `orr_shaders.openpbr` read the tables from eight consecutive heap slots, in
 //! [`LUTS`] order, starting at the slot given by specialization constant [`SPEC_LUT_SLOT`].
 //! The shader filters them itself with texel loads, so no sampler is involved and any view
 //! of the listed format works. The data is derived from openpbr-bsdf, which is under the
-//! Apache License 2.0: binaries that embed it or kernels built from `orr.openpbr` carry
+//! Apache License 2.0: binaries that embed it or kernels built from `orr_shaders.openpbr` carry
 //! [`LICENSE`].
 
 /// The texel format of a table.

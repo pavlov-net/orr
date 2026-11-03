@@ -1,4 +1,4 @@
-//! Kernels over `orr.abi`, `orr.trace`, `orr.coherence` and `orr.atomic`, built with the MSL
+//! Kernels over `orr_shaders.abi`, `orr_shaders.trace`, `orr_shaders.coherence` and `orr_shaders.atomic`, built with the MSL
 //! check: the build passing is the check. The kernels under `asserts` link `ASSERTS = true`.
 //! The tests under `tests/` run them on the GPU against CPU references.
 

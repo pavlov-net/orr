@@ -3,7 +3,7 @@
 // cut it traces (one of its mesh's cached cuts, or a cluster BLAS built this frame).
 module cut;
 
-import orr.abi;
+import orr_shaders.abi;
 
 // `SlotCutGpu.flags`.
 public static const uint CUT_RASTER = 1;        // the slot has raster candidates this frame

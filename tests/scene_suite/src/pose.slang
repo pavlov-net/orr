@@ -2,9 +2,9 @@
 // rig, whose part p > 0 is a box standing at grid cell (p % 16, p / 16) of a 2 m plate.
 // `slide` moves every box along x by `amplitude * sin(time)`; `sway` tilts each box about
 // its base, phase-offset per pose block and part.
-#include "orr/root.h"
-import orr.math;
-import tables;
+#include "orr_shaders/root.h"
+import orr_shaders.math;
+import orr_scene.tables;
 
 static const uint RIG_PARTS = 256;
 

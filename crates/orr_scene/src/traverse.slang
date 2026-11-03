@@ -15,14 +15,14 @@
 // `gather` writes the CLAS addresses each built BLAS takes and `jobs` its build record. A posed
 // copy of an edit builds a BLAS for its body and one per animated part with clusters in the cut:
 // `split` counts them and `place` gives them their jobs and CLAS ranges.
-#include "orr/root.h"
-import orr.abi;
-import orr.math;
-import orr.trace;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.math;
+import orr_shaders.trace;
 import orr_pack.mesh;
-import rtas;
-import hit;
-import tables;
+import orr_gpu.rtas;
+import orr_scene.hit;
+import orr_scene.tables;
 
 // `TraverseRoot.flags`.
 static const uint TRAVERSE_FOCUS = 1;   // the scene has a focus

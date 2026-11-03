@@ -2,10 +2,10 @@
 // each a small octahedron of six vertices, on slow loops around fixed homes within `radius`
 // of the swarm's center, and emits the cluster as the octahedra topology. Last frame's
 // positions go to the batch's previous buffer.
-#include "orr/root.h"
-import field;
-import producer;
-import tables;
+#include "orr_shaders/root.h"
+import examples.field;
+import orr_scene.producer;
+import orr_scene.tables;
 
 struct Root
 {

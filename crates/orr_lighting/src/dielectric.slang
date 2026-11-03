@@ -22,29 +22,29 @@
 // like and how far its lobes blur it.
 module dielectric;
 
-import orr.abi;
-import orr.math;
+import orr_shaders.abi;
+import orr_shaders.math;
 import orr_color.luminance;
-import orr.random;
-import orr.sampling;
-import orr.trace;
-import orr.coherence;
-import orr.openpbr;
-import hit;
-import visibility;
-import bsdf;
-import media;
-import environment;
-import lights;
-import light_sampling;
-import world_cache;
-import path;
-import shadow;
-import interiors;
-import subsurface;
-import guides;
-import froxels;
-import spectrum;
+import orr_shaders.random;
+import orr_shaders.sampling;
+import orr_shaders.trace;
+import orr_shaders.coherence;
+import orr_shaders.openpbr;
+import orr_scene.hit;
+import orr_scene.visibility;
+import orr_lighting.bsdf;
+import orr_lighting.media;
+import orr_lighting.environment;
+import orr_scene.lights;
+import orr_lighting.light_sampling;
+import orr_lighting.world_cache;
+import orr_lighting.path;
+import orr_lighting.shadow;
+import orr_lighting.interiors;
+import orr_lighting.subsurface;
+import orr_lighting.guides;
+import orr_lighting.froxels;
+import orr_lighting.spectrum;
 
 // Separates the dielectric dispatch's samples from the opaque path's of the same pixel.
 public static const uint DIELECTRIC_STREAM = 0x85EBCA6B;

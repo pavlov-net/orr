@@ -1,7 +1,7 @@
 // A compute pass paints a texture through a storage view; a mesh pass draws a textured,
 // lit cube that samples it through a sampled view.
-#include "orr/root.h"
-import orr.abi;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
 
 struct CubeVertex
 {

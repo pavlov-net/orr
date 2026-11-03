@@ -6,18 +6,18 @@
 // also draw from the lights that fed back in their screen tile.
 module light_sampling;
 
-import orr.abi;
-import orr.math;
+import orr_shaders.abi;
+import orr_shaders.math;
 import orr_color.luminance;
-import orr.packing;
-import orr.random;
-import lights;
-import material;
-import producer;
-import tables;
-import view;
-import media;
-import environment;
+import orr_shaders.packing;
+import orr_shaders.random;
+import orr_scene.lights;
+import orr_scene.material;
+import orr_scene.producer;
+import orr_scene.tables;
+import orr_scene.view;
+import orr_lighting.media;
+import orr_lighting.environment;
 
 // Presampled light tiles: `TILE_COUNT` tiles of `TILE_SIZE` samples, redrawn every frame.
 public static const uint TILE_COUNT = 128;

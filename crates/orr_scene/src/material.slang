@@ -2,9 +2,9 @@
 // units.
 module material;
 
-import orr.abi;
+import orr_shaders.abi;
 import orr_color.primaries;
-__exported import neural_texture;
+__exported import orr_scene.neural_texture;
 
 // `MaterialGpu.flags`.
 public static const uint MATERIAL_ALPHA_TESTED = 1 << 0;

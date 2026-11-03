@@ -1,6 +1,6 @@
 // Calls every function of orr_color's Slang modules, so the build compiles them to SPIR-V
 // (validated) and MSL under the lints.
-#include "orr/root.h"
+#include "orr_shaders/root.h"
 import orr_color.primaries;
 import orr_color.luminance;
 import orr_color.transfer;

@@ -4,13 +4,13 @@
 // surface id 0 and every id nothing links.
 module surface;
 
-import orr.abi;
-import orr.math;
+import orr_shaders.abi;
+import orr_shaders.math;
 import orr_pack.normal_map;
-__exported import gbuffer;
-__exported import material;
-__exported import tables;
-__exported import view;
+__exported import orr_scene.gbuffer;
+__exported import orr_scene.material;
+__exported import orr_scene.tables;
+__exported import orr_scene.view;
 
 // `HitContext.kind`.
 public static const uint HIT_PRIMARY = 0;   // the material resolve and the dielectric camera ray's first hit

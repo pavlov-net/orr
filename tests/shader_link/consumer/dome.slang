@@ -1,4 +1,4 @@
-import environment;
+import orr_lighting.environment;
 
 struct Dome : IEnvironment
 {

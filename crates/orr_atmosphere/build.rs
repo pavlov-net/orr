@@ -24,8 +24,8 @@ const RAYLEIGH_1UM: f64 = 1.24062e-6;
 const DATA_DIR: &str = "precomputed_atmospheric_scattering";
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=ORR_SKY_DATA");
-    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo::rerun-if-env-changed=ORR_SKY_DATA");
+    println!("cargo::rerun-if-changed=build.rs");
     assert_eq!(
         BINS % SPECTRAL_GROUPS,
         0,
@@ -40,8 +40,8 @@ fn main() {
     let root = data_dir();
     let demo_path = root.join("atmosphere/demo/demo.cc");
     let constants_path = root.join("atmosphere/constants.h");
-    println!("cargo:rerun-if-changed={}", demo_path.display());
-    println!("cargo:rerun-if-changed={}", constants_path.display());
+    println!("cargo::rerun-if-changed={}", demo_path.display());
+    println!("cargo::rerun-if-changed={}", constants_path.display());
     let demo = read(&demo_path);
     let constants = read(&constants_path);
 
@@ -174,11 +174,14 @@ fn main() {
 
 fn compile_kernels() {
     let src = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("src");
-    let roots = env::var("DEP_ORR_SHADER_DIRS").expect("orr's shader roots");
-    let out = Build::new().and_then(|b| b.kernels(&src).roots(&roots).compile());
-    match out {
-        Ok(out) => println!("cargo:shader_dirs={}", out.shader_dirs),
-        Err(e) => panic!("{e}"),
+    let out = Build::new().and_then(|b| {
+        b.kernels(&src)
+            .dep("orr")
+            .publish_types("::orr_atmosphere")
+            .compile()
+    });
+    if let Err(e) = out {
+        panic!("{e}");
     }
 }
 

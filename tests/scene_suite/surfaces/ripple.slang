@@ -1,6 +1,6 @@
 // Ripples along the normal as a function of uv: displacement id 1 in the suite's linked
 // kernels, `ripple` in the tessellation tests.
-import displacement;
+import orr_scene.displacement;
 
 struct Ripple : IDisplacement
 {

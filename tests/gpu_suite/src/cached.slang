@@ -1,6 +1,6 @@
 // The compute and mesh pipeline entries of the pipeline cache tests, each writing its
 // specialization constant; ray dispatch needs an inline root, so it has `cached_rays`.
-#include "orr/root.h"
+#include "orr_shaders/root.h"
 
 struct Root
 {

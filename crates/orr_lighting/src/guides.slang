@@ -7,15 +7,15 @@
 // roughness trace the mirror direction and reproject the reflection's virtual point.
 module guides;
 
-import orr.abi;
-import orr.math;
+import orr_shaders.abi;
+import orr_shaders.math;
 import orr_color.luminance;
-import orr.trace;
-import media;
-import hit;
-import visibility;
-import bsdf;
-import path;
+import orr_shaders.trace;
+import orr_lighting.media;
+import orr_scene.hit;
+import orr_scene.visibility;
+import orr_lighting.bsdf;
+import orr_lighting.path;
 
 // `GuideRoot.debug`: which guide the radiance image shows.
 public static const uint GUIDE_NONE = 0;

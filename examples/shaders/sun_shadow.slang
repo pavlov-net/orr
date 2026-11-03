@@ -1,18 +1,18 @@
 // Shades a view's G-buffer under a sun and a uniform sky. Each lit pixel traces one shadow
 // ray toward the sun through the scene's TLAS; alpha-tested triangles cast shadows through
 // their material's coverage. Writes display-linear Rec.709, 1.0 at paper white.
-#include "orr/root.h"
-import orr.abi;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
 import orr_color.primaries;
-import orr.math;
-import orr.trace;
-import gbuffer;
-import hit;
-import material;
-import surface;
-import tables;
-import view;
-import visibility;
+import orr_shaders.math;
+import orr_shaders.trace;
+import orr_scene.gbuffer;
+import orr_scene.hit;
+import orr_scene.material;
+import orr_scene.surface;
+import orr_scene.tables;
+import orr_scene.view;
+import orr_scene.visibility;
 
 extern struct Surface : ISurface = StandardSurface;
 

@@ -2,10 +2,10 @@
 // cluster of entry `entry`, the pixel's hit is found again with `primary_hit`, and its color
 // is darkened toward the blade's root by the vertex words (height along the blade, 0 to
 // 65535) and shifted per clump by the cluster word.
-#include "orr/root.h"
-import orr.abi;
-import surface;
-import visibility;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_scene.surface;
+import orr_scene.visibility;
 
 struct Root
 {

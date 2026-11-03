@@ -2,12 +2,12 @@
 // it in extended sRGB relative to paper white (egui's gamma blending in SDR). Screenshot
 // capture: the same result as display-linear Rec.709 floats, or the scene-referred radiance in
 // cd/m2.
-#include "orr/root.h"
-import orr.abi;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
 import orr_color.primaries;
 import orr_color.transfer;
-import view;
-import display;
+import orr_scene.view;
+import orr_output.display;
 
 // What `source` holds.
 static const uint SOURCE_LINEAR = 0;

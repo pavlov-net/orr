@@ -1,6 +1,6 @@
 [package]
 name = "openpbr_ref"
-description = "The OpenPBR reference BSDF: adobe/openpbr-bsdf's C++ build, orr.openpbr through Slang's C++ target and, with feature gpu, on the GPU, with the harness that checks a BSDF against them."
+description = "The OpenPBR reference BSDF: adobe/openpbr-bsdf's C++ build, orr_shaders.openpbr through Slang's C++ target and, with feature gpu, on the GPU, with the harness that checks a BSDF against them."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -2,10 +2,10 @@
 // `eye_reach` find what the interior at the near plane holds of each column, `inject` writes the
 // linked medium per froxel, `light` the light reaching it, `integrate` each column's
 // in-scatter and transmittance.
-#include "orr/root.h"
-import media;
-import surface;
-import froxels;
+#include "orr_shaders/root.h"
+import orr_lighting.media;
+import orr_scene.surface;
+import orr_lighting.froxels;
 
 extern struct Surface : ISurface = StandardSurface;
 extern struct Medium : IMedium = NoMedium;

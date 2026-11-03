@@ -173,7 +173,7 @@ fn shading_normal(n: Vec3, t: Vec3, sign: f32, v: Vec3) -> Vec3 {
     (t * v.x + b * v.y + n * v.z).normalize_or(n)
 }
 
-/// `orr.math`'s `orthonormal_basis`: a tangent and bitangent of unit `n`.
+/// `orr_shaders.math`'s `orthonormal_basis`: a tangent and bitangent of unit `n`.
 fn orthonormal_basis(n: Vec3) -> (Vec3, Vec3) {
     let s = if n.z >= 0.0 { 1.0 } else { -1.0 };
     let a = -1.0 / (s + n.z);

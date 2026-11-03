@@ -2,12 +2,12 @@
 // geometry helpers they share.
 module visibility;
 
-import orr.abi;
-import orr.math;
-import orr.packing;
+import orr_shaders.abi;
+import orr_shaders.math;
+import orr_shaders.packing;
 import orr_pack.mesh;
-import producer;
-__exported import hit;
+import orr_scene.producer;
+__exported import orr_scene.hit;
 
 // `RasterGpu.counts` entries.
 public static const uint COUNT_VISIBLE = 0;          // visible clusters written

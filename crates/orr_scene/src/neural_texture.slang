@@ -2,9 +2,9 @@
 // runs the set's decoder network over its latents with cooperative vectors.
 module neural_texture;
 
-import orr.abi;
+import orr_shaders.abi;
 import orr_color.transfer;
-import orr.coopvec;
+import orr_shaders.coopvec;
 import orr_pack.neural;
 
 // Where a color mip's texels read the latents (orr_pack::neural::ColorMip).

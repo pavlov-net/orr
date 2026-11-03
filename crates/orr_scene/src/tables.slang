@@ -1,16 +1,16 @@
 // The scene tables every pass reads through one `SceneRoot` pointer.
 module tables;
 
-import orr.abi;
-import orr.trace;
+import orr_shaders.abi;
+import orr_shaders.trace;
 import orr_pack.instance;
-__exported import cut;
-__exported import decal;
-__exported import medium_proxy;
-import material;
-import lights;
-import producer;
-import view;
+__exported import orr_scene.cut;
+__exported import orr_scene.decal;
+__exported import orr_scene.medium_proxy;
+import orr_scene.material;
+import orr_scene.lights;
+import orr_scene.producer;
+import orr_scene.view;
 
 // `InstanceGpu.flags`.
 public static const uint INSTANCE_RASTER = 1;
@@ -56,7 +56,7 @@ public struct InstanceGpu
     public half rt_range;      // m from the scene focus
     public half animation_range;
     public uint8_t flags;      // INSTANCE_*
-    public uint8_t candidate_class; // orr.trace CLASS_*
+    public uint8_t candidate_class; // orr_shaders.trace CLASS_*
     public uint16_t pose_variants;
     public uint16_t pose_stride;
     public uint16_t debug_lod; // 0 none; DEBUG_LOD_LEVEL | level; else the f16 bits of an error threshold scale

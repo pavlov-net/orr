@@ -2,14 +2,14 @@
 // layer before the opaque depth and its path, and the pixel's layer guide. The raygen entry
 // reorders lanes at each coherence point; the compute entry runs the same body without
 // reordering.
-#include "orr/root.h"
-import orr.coherence;
-import environment;
-import media;
-import surface;
-import path;
-import dielectric;
-import visibility;
+#include "orr_shaders/root.h"
+import orr_shaders.coherence;
+import orr_lighting.environment;
+import orr_lighting.media;
+import orr_scene.surface;
+import orr_lighting.path;
+import orr_lighting.dielectric;
+import orr_scene.visibility;
 
 extern struct Surface : ISurface = StandardSurface;
 extern struct Environment : IEnvironment = EnvironmentMap;

@@ -15,14 +15,14 @@
 // same home and check share a cell; for any lookup that is about one chance in 2^29.
 module world_cache;
 
-import orr.abi;
-import orr.math;
+import orr_shaders.abi;
+import orr_shaders.math;
 import orr_color.luminance;
-import orr.packing;
-import orr.random;
-import tables;
-import view;
-import bsdf;
+import orr_shaders.packing;
+import orr_shaders.random;
+import orr_scene.tables;
+import orr_scene.view;
+import orr_lighting.bsdf;
 
 // Slots a key may occupy after its home slot's: lookups scan all of them.
 public static const uint CACHE_PROBE = 8;

@@ -16,13 +16,13 @@
 // - `median_background`, `median_foreground`: 3x3 medians.
 // - `sprite_mesh`, `sprite_pixel`: highlight sprites added onto both layers.
 // - `composite`: full resolution, writing `target` and, on the guide path, `guide`.
-#include "orr/root.h"
-import orr.abi;
-import orr.math;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.math;
 import orr_color.luminance;
-import orr.random;
-import view;
-import overlay_front;
+import orr_shaders.random;
+import orr_scene.view;
+import orr_output.overlay_front;
 
 // Half-resolution pixels across a CoC tile.
 static const uint TILE = 8;

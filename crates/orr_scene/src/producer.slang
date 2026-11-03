@@ -3,10 +3,10 @@
 // raster and hit resolution share.
 module producer;
 
-import orr.abi;
-import orr.math;
-import orr.packing;
-__exported import tessellation;
+import orr_shaders.abi;
+import orr_shaders.math;
+import orr_shaders.packing;
+__exported import orr_scene.tessellation;
 
 // `ProducerClusterGpu.topology` of a directly built cluster.
 public static const uint DIRECT_CLUSTER = 0xffff;
@@ -76,7 +76,7 @@ public struct ProducerGpu
     public uint flags;           // INSTANCE_*
     public uint user_tag;
     public uint opacity;         // PRODUCER_*
-    public uint class_id;        // orr.trace CLASS_*
+    public uint class_id;        // orr_shaders.trace CLASS_*
     public uint origin;          // gbuffer ORIGIN_*
     public uint displacement;    // linked IDisplacement id; 0: the material's texture
     public uint tessellated;     // 1: clusters are base patches for the tessellator

@@ -11,15 +11,15 @@
 // Clusters of animated parts are culled where their pose places them; whole copies by their
 // model's rest bounds, and posed copies only by their clusters' HZB tests. Skinned copies
 // and their clusters are culled by the boxes of this frame's skinned vertices.
-#include "orr/root.h"
-import orr.packing;
-import orr.trace;
+#include "orr_shaders/root.h"
+import orr_shaders.packing;
+import orr_shaders.trace;
 import orr_pack.mesh;
-import gbuffer;
-import producer;
-import tables;
-import view;
-import visibility;
+import orr_scene.gbuffer;
+import orr_scene.producer;
+import orr_scene.tables;
+import orr_scene.view;
+import orr_scene.visibility;
 
 ORR_ROOT(RasterRoot);
 

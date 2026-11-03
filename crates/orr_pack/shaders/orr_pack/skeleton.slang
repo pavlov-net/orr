@@ -4,7 +4,7 @@
 // module holds no bindings. Records are read as 4-byte words, as the blobs align them.
 module skeleton;
 
-import orr.math;
+import orr_shaders.math;
 
 // `SkeletonHeader.parents` entry of a root joint.
 public static const uint NO_PARENT = 0xffff;

@@ -1,8 +1,8 @@
 // A producer: `count` quads, cluster c of edge `size x (1 + c % 3)` at x = 2c, material
 // c % 3. Even clusters use topology 0, odd ones their own triangles.
-#include "orr/root.h"
-import producer;
-import tables;
+#include "orr_shaders/root.h"
+import orr_scene.producer;
+import orr_scene.tables;
 
 struct Root
 {

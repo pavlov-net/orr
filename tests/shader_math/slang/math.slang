@@ -1,9 +1,9 @@
 // C entry points over orr's math libraries for the CPU tests. Vectors and matrices pass
 // as float arrays; matrices are row-major.
-import orr.math;
-import orr.packing;
-import orr.random;
-import orr.sampling;
+import orr_shaders.math;
+import orr_shaders.packing;
+import orr_shaders.random;
+import orr_shaders.sampling;
 
 float3 load3(float* p) { return float3(p[0], p[1], p[2]); }
 float4 load4(float* p) { return float4(p[0], p[1], p[2], p[3]); }

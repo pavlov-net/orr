@@ -2,14 +2,14 @@
 // white point: reads the view's current exposure slot, writes the next one, the white
 // balance matrix, local exposure's pivot and the telemetry, and clears the histogram for the
 // next frame.
-#include "orr/root.h"
-import orr.abi;
-import orr.math;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.math;
 import orr_color.chromaticity;
 import orr_color.luminance;
 import orr_color.primaries;
-import view;
-import exposure;
+import orr_scene.view;
+import orr_output.exposure;
 
 static const uint MODE_MANUAL = 0;
 static const uint MODE_AUTO = 1;

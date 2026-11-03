@@ -7,15 +7,15 @@
 // rest positions for its previous positions) and writes the instantiation
 // of its cluster template; after the builds `finish` keeps each copy's BLAS. A copy
 // skins its clusters whether or not a view shows it; one inside `rt_range` is traced.
-#include "orr/root.h"
-import orr.abi;
-import orr.math;
-import orr.packing;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.math;
+import orr_shaders.packing;
 import orr_pack.mesh;
-import producer;
-import rtas;
-import hit;
-import tables;
+import orr_scene.producer;
+import orr_gpu.rtas;
+import orr_scene.hit;
+import orr_scene.tables;
 
 // `SkinFrameGpu.counters`.
 public static const uint SKIN_WORK = 0;      // work items asked for, then those handed out

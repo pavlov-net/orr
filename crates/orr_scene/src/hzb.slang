@@ -2,9 +2,9 @@
 // the raster passes and by the resolve's classify after them); each further mip holds the
 // farthest depth (the smallest value) of the texels it covers, three wide where the finer
 // mip has an odd size.
-#include "orr/root.h"
-import gbuffer;
-import visibility;
+#include "orr_shaders/root.h"
+import orr_scene.gbuffer;
+import orr_scene.visibility;
 
 ORR_ROOT(RasterRoot);
 

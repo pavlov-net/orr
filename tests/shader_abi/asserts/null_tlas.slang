@@ -1,7 +1,7 @@
 // Traces `root.scene`, which the test leaves at address 0: `Tlas.get()` aborts.
-#include "orr/root.h"
-import orr.abi;
-import orr.trace;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.trace;
 
 struct Root
 {

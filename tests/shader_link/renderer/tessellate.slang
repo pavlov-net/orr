@@ -1,6 +1,6 @@
 // Displaces through the linked switch.
-#include "orr/root.h"
-import displacement;
+#include "orr_shaders/root.h"
+import orr_scene.displacement;
 
 extern struct Displace : IDisplacement = TextureDisplacement;
 

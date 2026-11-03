@@ -2,16 +2,16 @@
 // directions over equal-solid-angle bins in a cone around an axis, the bins' probabilities
 // integrated from the tiles' density, a check of each sample's density, and each sample's
 // estimate of the irradiance on a surface facing the axis.
-#include "orr/root.h"
-import orr.math;
-import orr.random;
+#include "orr_shaders/root.h"
+import orr_shaders.math;
+import orr_shaders.random;
 import orr_color.luminance;
-import lights;
-import material;
-import producer;
-import tables;
-import environment;
-import light_sampling;
+import orr_scene.lights;
+import orr_scene.material;
+import orr_scene.producer;
+import orr_scene.tables;
+import orr_lighting.environment;
+import orr_lighting.light_sampling;
 
 struct Root
 {

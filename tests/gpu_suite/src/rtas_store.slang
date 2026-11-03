@@ -1,7 +1,7 @@
 // Stores record `i` of every rtas type at index `i` of its own output array, and the
 // partition translations of `cells`.
-#include "orr/root.h"
-import rtas;
+#include "orr_shaders/root.h"
+import orr_gpu.rtas;
 
 struct Translation
 {

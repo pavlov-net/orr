@@ -7,8 +7,8 @@
 // mask marks, one lens ray per frame that starts past the mask's depth. With `layered` the depth
 // is the first layer of half coverage or more, as lighting's dominant layer, and the front
 // layer holds the nearest layer in front of it above 0.1 coverage and those layers' coverage.
-#include "orr/root.h"
-import orr.abi;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
 
 static const uint FOREGROUND = 0;
 static const uint BACKGROUND = 1;

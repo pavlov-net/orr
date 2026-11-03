@@ -1,8 +1,8 @@
 // The lens both glare methods model: its F-number from the adapted exposure, the exposure
 // tonemap applies to the radiance they read, and the part of it they spread.
 module glare_lens;
-import view;
-import exposure;
+import orr_scene.view;
+import orr_output.exposure;
 
 public static const float GLARE_F_MIN = 4.0;
 public static const float GLARE_F_MAX = 22.0;

@@ -1,11 +1,11 @@
 // The opaque dispatch: one path per G-buffer pixel. The raygen entry reorders lanes at each
 // coherence point; the compute entry runs the same body without reordering.
-#include "orr/root.h"
-import orr.coherence;
-import environment;
-import media;
-import surface;
-import path;
+#include "orr_shaders/root.h"
+import orr_shaders.coherence;
+import orr_lighting.environment;
+import orr_lighting.media;
+import orr_scene.surface;
+import orr_lighting.path;
 
 extern struct Surface : ISurface = StandardSurface;
 extern struct Environment : IEnvironment = EnvironmentMap;

@@ -15,7 +15,7 @@ use crate::{Bsdf, Eval, Inputs, Lobe, Sample, V3, Volume};
 /// Cases per dispatch; larger batches run in several.
 const CHUNK: usize = 1 << 18;
 
-/// `orr.openpbr` in a Vulkan compute kernel (`gpu/openpbr_cases.slang`) with the tables in
+/// `orr_shaders.openpbr` in a Vulkan compute kernel (`gpu/openpbr_cases.slang`) with the tables in
 /// eight heap slots. Every instance shares one device, created by the first
 /// [`SlangGpu::new`]; batch calls run in dispatches of up to 262,144 cases, one at a
 /// time across threads.
@@ -246,7 +246,7 @@ fn malloc<T: Pod>(device: &Device, kind: MemoryKind, count: usize, name: &str) -
 }
 
 /// [`LUTS`] as textures with sampled views in consecutive heap slots, the layout
-/// `orr.openpbr` reads in heap mode.
+/// `orr_shaders.openpbr` reads in heap mode.
 pub struct Luts {
     /// The value of specialization constant `openpbr_lut_slot`.
     pub first_slot: u32,

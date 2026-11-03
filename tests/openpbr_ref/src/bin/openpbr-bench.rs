@@ -1,4 +1,4 @@
-//! Times `orr.openpbr` on the GPU (`gpu/openpbr_bench.slang`, heap LUTs) and prints a
+//! Times `orr_shaders.openpbr` on the GPU (`gpu/openpbr_bench.slang`, heap LUTs) and prints a
 //! Markdown table of nanoseconds per call: prepare, eval, sample, and eval plus sample, for
 //! each harness material and for all of them mixed across neighboring threads.
 //!
@@ -102,7 +102,7 @@ fn main() {
     #[allow(clippy::print_stdout)]
     {
         println!(
-            "orr.openpbr on {THREADS} threads, {CALLS} calls each: ns per thread for prepare, per call otherwise.\n"
+            "orr_shaders.openpbr on {THREADS} threads, {CALLS} calls each: ns per thread for prepare, per call otherwise.\n"
         );
         print!("{out}");
     }

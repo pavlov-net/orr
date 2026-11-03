@@ -4,9 +4,9 @@
 // displacement texture and serves id 0 and every id nothing links.
 module displacement;
 
-import orr.abi;
-__exported import material;
-__exported import tables;
+import orr_shaders.abi;
+__exported import orr_scene.material;
+__exported import orr_scene.tables;
 
 // One point of a tessellated patch before displacement. Positions and normals are in the
 // entry's space.

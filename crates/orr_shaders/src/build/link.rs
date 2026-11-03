@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Error;
 use super::lint::tokens;
+use super::roots::Root;
 
 /// A link-time extension point of orr's kernels. A kernel uses a point when its source
 /// declares `extern struct <Name> : I<Point> = <Default>;`.
@@ -95,10 +96,10 @@ impl LinkPoint {
     /// The module that declares the interface.
     fn module(self) -> &'static str {
         match self {
-            Self::Surface => "surface",
-            Self::Displacement => "displacement",
-            Self::Environment => "environment",
-            Self::Medium => "media",
+            Self::Surface => "orr_scene.surface",
+            Self::Displacement => "orr_scene.displacement",
+            Self::Environment => "orr_lighting.environment",
+            Self::Medium => "orr_lighting.media",
         }
     }
 
@@ -127,6 +128,8 @@ pub(super) struct Link {
     pub(crate) name: String,
     pub(super) module: PathBuf,
     pub(super) ty: String,
+    /// The name `module` is imported by when it is under a prefixed root; set by [`resolve`].
+    import: Option<String>,
 }
 
 impl Link {
@@ -136,14 +139,17 @@ impl Link {
             name: name.to_owned(),
             module: module.to_path_buf(),
             ty: ty.to_owned(),
+            import: None,
         }
     }
 
     fn import(&self) -> String {
-        self.module
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default()
+        self.import.clone().unwrap_or_else(|| {
+            self.module
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
     }
 }
 
@@ -160,7 +166,7 @@ pub(super) struct KernelPoints {
     /// The kernel's path under its root, without extension.
     pub(crate) name: String,
     pub(crate) path: PathBuf,
-    pub(super) root: PathBuf,
+    pub(super) root: Root,
     pub(super) points: Vec<Declared>,
 }
 
@@ -205,15 +211,17 @@ pub(super) fn declared(src: &str) -> Vec<Declared> {
     out
 }
 
-/// The `link` calls with their module paths resolved against `CARGO_MANIFEST_DIR`, after
-/// checking names, ids and counts.
-pub(super) fn resolve(links: &[Link]) -> Result<Vec<Link>, Error> {
+/// The `link` calls with their module paths resolved against `CARGO_MANIFEST_DIR` and their
+/// import names against `roots`, after checking names, ids and counts.
+pub(super) fn resolve(links: &[Link], roots: &[Root]) -> Result<Vec<Link>, Error> {
     check(links)?;
     links
         .iter()
         .map(|l| {
+            let module = resolve_module(&l.module)?;
             Ok(Link {
-                module: resolve_module(&l.module)?,
+                import: roots.iter().find_map(|r| r.module_name(&module)),
+                module,
                 ..l.clone()
             })
         })
@@ -368,11 +376,12 @@ fn source(decl: &Declared, linked: &[&Link], key_bits: u32) -> String {
     out
 }
 
-/// The directories of the linked modules, for the include path.
-pub(super) fn module_dirs(links: &[Link]) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = links
+/// The directories of the linked modules imported by their file stems, as import roots.
+pub(super) fn module_dirs(links: &[Link]) -> Vec<Root> {
+    let mut dirs: Vec<Root> = links
         .iter()
-        .filter_map(|l| l.module.parent().map(Path::to_path_buf))
+        .filter(|l| l.import.is_none())
+        .filter_map(|l| l.module.parent().map(Root::plain))
         .collect();
     dirs.sort();
     dirs.dedup();
@@ -398,7 +407,7 @@ mod tests {
     #[test]
     fn declared_points_skip_comments() {
         let src = "// extern struct Old : ISurface = StandardSurface;\n\
-                   import surface;\nextern struct Surface : ISurface = StandardSurface;\n\
+                   import orr_scene.surface;\nextern struct Surface : ISurface = StandardSurface;\n\
                    extern struct Medium : IMedium = NoMedium;\n";
         assert_eq!(
             declared(src),

@@ -10,12 +10,12 @@
 // with a coherence point between them.
 module subsurface;
 
-import orr.abi;
-import orr.random;
-import orr.trace;
-import hit;
-import bsdf;
-import media;
+import orr_shaders.abi;
+import orr_shaders.random;
+import orr_shaders.trace;
+import orr_scene.hit;
+import orr_lighting.bsdf;
+import orr_lighting.media;
 
 // `Walk.kind` and `WalkMeet.kind`.
 public static const uint WALK_NONE = 0;     // nothing leaves

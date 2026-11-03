@@ -1,8 +1,8 @@
 // A producer: `count` square emitters of edge `size`, quad c at `origin + c x step` in the
 // xz plane facing -y, material c % 3.
-#include "orr/root.h"
-import producer;
-import tables;
+#include "orr_shaders/root.h"
+import orr_scene.producer;
+import orr_scene.tables;
 
 struct Root
 {

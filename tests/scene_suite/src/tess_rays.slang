@@ -1,9 +1,9 @@
 // Per pixel, the distance from the eye to what the raster shows of producer entries and to
 // what the camera ray through the pixel's center hits.
-#include "orr/root.h"
-import orr.trace;
-import hit;
-import visibility;
+#include "orr_shaders/root.h"
+import orr_shaders.trace;
+import orr_scene.hit;
+import orr_scene.visibility;
 
 extern struct Surface : ISurface = StandardSurface;
 

@@ -3,7 +3,7 @@
 // without a layer).
 module overlay_front;
 
-import orr.abi;
+import orr_shaders.abi;
 
 public float weight_at(TextureIndex weight, int2 pixel)
 {

@@ -4,13 +4,13 @@
 // shares, and ray-cone helpers for the `HitContext` callers pass.
 module hit;
 
-import orr.abi;
-import orr.math;
-import orr.packing;
-import orr.random;
+import orr_shaders.abi;
+import orr_shaders.math;
+import orr_shaders.packing;
+import orr_shaders.random;
 import orr_pack.mesh;
-import producer;
-__exported import surface;
+import orr_scene.producer;
+__exported import orr_scene.surface;
 
 // An instance's transform as hits and the raster use it: mesh space to a frame centered
 // on an eye or on the render origin.
@@ -713,7 +713,7 @@ void hit_triangle(inout SurfaceInput i, float3 d, Corners corners, Corners t, bo
 
 // The surface at a ray hit through linked surface `S` (the kernel's `Surface`): the
 // committed hit's instance index, cluster id, primitive, barycentrics and fetched
-// object-space positions (`orr.trace`'s: on a swept-sphere hit the first is the hit point),
+// object-space positions (`orr_shaders.trace`'s: on a swept-sphere hit the first is the hit point),
 // the unit render-space ray direction `d`, and the caller's context. `previous` places the
 // hit with the previous frame's transforms. `v` is passed on to the surface and may be null.
 // On a strand entry the surface's `cluster` is the segment and its `primitive` 0.

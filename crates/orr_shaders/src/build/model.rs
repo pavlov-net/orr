@@ -100,7 +100,7 @@ impl Scalar {
     }
 }
 
-/// The heap-slot and TLAS types of `orr.abi`, recognized by struct name.
+/// The heap-slot and TLAS types of `orr_shaders.abi`, recognized by struct name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(super) enum Handle {
     Texture,

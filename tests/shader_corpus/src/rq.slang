@@ -1,7 +1,7 @@
 // Inline ray query from compute: TLAS by address, candidate alpha-test loop, cluster ids and
 // position fetch.
-#include "orr/root.h"
-import handles;
+#include "orr_shaders/root.h"
+import shader_corpus.handles;
 
 struct Root
 {

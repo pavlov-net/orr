@@ -4,7 +4,7 @@
 // bindings.
 module mesh;
 
-import orr.packing;
+import orr_shaders.packing;
 
 // Largest resident page, bytes.
 public static const uint PAGE_MAX = 128 << 10;

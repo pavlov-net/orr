@@ -1,7 +1,7 @@
-// One 16x16 matrix times one FP16 vector per thread through orr.coopvec, plus a bias when
+// One 16x16 matrix times one FP16 vector per thread through orr_shaders.coopvec, plus a bias when
 // `bias` is not 0. One entry per weight type.
-#include "orr/root.h"
-import orr.coopvec;
+#include "orr_shaders/root.h"
+import orr_shaders.coopvec;
 
 struct Root
 {

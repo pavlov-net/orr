@@ -5,7 +5,7 @@
 //! compiles a crate's Slang kernels in process with the pinned Slang release, checks their
 //! layout and ABI rules, and generates Rust for their roots, records and modules. The
 //! `openpbr` feature adds [`openpbr`]: the lookup tables and specialization constants of
-//! `orr.openpbr`, derived from adobe/openpbr-bsdf under the Apache License 2.0. The
+//! `orr_shaders.openpbr`, derived from adobe/openpbr-bsdf under the Apache License 2.0. The
 //! `hot-reload` feature adds [`Watcher`], which recompiles compiled-in modules from their
 //! sources at run time.
 
@@ -25,7 +25,7 @@ pub use alias::AliasEntry;
 pub use build::{Reload, Watcher};
 pub use module::{EntryPoint, KernelMismatch, KernelSet, Mismatch, PathEntry, ShaderModule, Stage};
 
-/// The directory of orr's shared Slang libraries, imported as `orr.<name>`.
+/// The directory of orr's shared Slang libraries, imported as `orr_shaders.<name>`.
 pub const LIB_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders");
 
 #[doc(hidden)]

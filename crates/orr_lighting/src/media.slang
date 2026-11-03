@@ -3,10 +3,10 @@
 // material encoding, and the aerial-perspective LUT's layout.
 module media;
 
-import orr.abi;
-import orr.math;
+import orr_shaders.abi;
+import orr_shaders.math;
 import orr_color.luminance;
-import orr.packing;
+import orr_shaders.packing;
 
 // One point of a medium. Coefficients are per meter in linear Rec.2020.
 public struct MediumPoint

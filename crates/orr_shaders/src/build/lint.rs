@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::layout::Plan;
 use super::model::{Model, Scalar, Ty};
+use super::roots::Root;
 use crate::Stage;
 use crate::abi::MAX_INLINE_ROOT_BYTES;
 
@@ -13,7 +14,7 @@ use crate::abi::MAX_INLINE_ROOT_BYTES;
 #[non_exhaustive]
 pub enum Lint {
     /// `root` is the only shader parameter besides specialization constants and the Metal
-    /// bindings of `orr/abi.slang`: no other globals, no entry-point uniforms.
+    /// bindings of `orr_shaders/abi.slang`: no other globals, no entry-point uniforms.
     SingleRoot,
     /// Root size is a multiple of 16; members are 32/64-bit scalars, 4-vectors, matrices
     /// with 4-wide rows, heap slots, TLAS addresses and pointers, each at its native
@@ -27,17 +28,18 @@ pub enum Lint {
     /// Specialization constants take explicit ids (`[vk::constant_id(N)]`).
     SpecIds,
     /// `DescriptorHandle`, `getDescriptorFromHandle` and `RaytracingAccelerationStructure(`
-    /// appear only in `orr/abi.slang`.
+    /// appear only in `orr_shaders/abi.slang`.
     HeapTokens,
-    /// `RayQuery` appears only in `orr/trace.slang`.
+    /// `RayQuery` appears only in `orr_shaders/trace.slang`.
     RayQuery,
-    /// `ReorderThread` and `HitObject` appear only in `orr/coherence.slang`.
+    /// `ReorderThread` and `HitObject` appear only in `orr_shaders/coherence.slang`.
     Reorder,
-    /// Cooperative-vector names appear only in `orr/coopvec.slang`.
+    /// Cooperative-vector names appear only in `orr_shaders/coopvec.slang`.
     CoopVec,
     /// Every 64-bit atomic is a max whose result is unused.
     Atomic64,
-    /// No two shader roots define the same top-level import name.
+    /// No two shader roots define the same top-level import name: a prefix, or a file or
+    /// directory directly under a root without one.
     DuplicateImport,
     /// A struct is generated only by the crate whose shader root declares it; others map
     /// it with [`Build::extern_type`](super::Build::extern_type).
@@ -48,7 +50,7 @@ pub enum Lint {
     InlineRoot,
     /// In builds with micromaps ([`Build::omm`](super::Build::omm)), every entry point of a
     /// module that traces rays declares the opacity-micromap execution mode with
-    /// `ORR_OMM(entry)` from `orr/root.h`.
+    /// `ORR_OMM(entry)` from `orr_shaders/root.h`.
     Micromap,
     /// The module's compute and mesh-pipeline entries emit MSL, lay out roots and pointees
     /// as the SPIR-V does, and the MSL has none of the constructs Metal rejects: 64-bit
@@ -94,28 +96,28 @@ const TOKEN_RULES: &[TokenRule] = &[
         exact: &["DescriptorHandle", "getDescriptorFromHandle"],
         prefixes: &[],
         calls: &["RaytracingAccelerationStructure"],
-        home: Some("orr/abi.slang"),
+        home: Some("orr_shaders/abi.slang"),
     },
     TokenRule {
         lint: Lint::RayQuery,
         exact: &["RayQuery"],
         prefixes: &[],
         calls: &[],
-        home: Some("orr/trace.slang"),
+        home: Some("orr_shaders/trace.slang"),
     },
     TokenRule {
         lint: Lint::Reorder,
         exact: &["ReorderThread", "HitObject"],
         prefixes: &[],
         calls: &[],
-        home: Some("orr/coherence.slang"),
+        home: Some("orr_shaders/coherence.slang"),
     },
     TokenRule {
         lint: Lint::CoopVec,
         exact: &[],
         prefixes: &["CoopVec", "coopVec", "OpCooperativeVector"],
         calls: &[],
-        home: Some("orr/coopvec.slang"),
+        home: Some("orr_shaders/coopvec.slang"),
     },
     TokenRule {
         lint: Lint::SpecIds,
@@ -232,7 +234,7 @@ pub(super) fn model_lints(
             message,
         });
     };
-    let abi = lib_dir.join("orr/abi.slang");
+    let abi = lib_dir.join("orr_shaders/abi.slang");
     for p in &model.stray_params {
         if p.file.as_deref().is_some_and(|f| same_file(f, &abi)) {
             continue;
@@ -329,7 +331,7 @@ pub(super) fn model_lints(
         push(
             Lint::Atomic64,
             format!(
-                "64-bit atomic (opcode {op}) is not a max with its result unused; use orr.atomic"
+                "64-bit atomic (opcode {op}) is not a max with its result unused; use orr_shaders.atomic"
             ),
         );
     }
@@ -371,26 +373,28 @@ fn describe(ty: &Ty) -> String {
 }
 
 /// Top-level import names (files and directories holding Slang) of each root.
-pub(super) fn duplicate_imports(roots: &[PathBuf]) -> Vec<LintError> {
+pub(super) fn duplicate_imports(roots: &[Root]) -> Vec<LintError> {
     let mut seen: BTreeMap<String, &Path> = BTreeMap::new();
     let mut out = Vec::new();
-    for root in roots {
-        let Ok(entries) = std::fs::read_dir(root) else {
-            continue;
+    for Root { prefix, dir: root } in roots {
+        let mut names: Vec<String> = match prefix {
+            Some(prefix) => vec![prefix.clone()],
+            None => std::fs::read_dir(root)
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .filter_map(|e| {
+                    let path = e.path();
+                    if path.is_dir() {
+                        holds_slang(&path).then(|| e.file_name().to_string_lossy().into_owned())
+                    } else if is_slang(&path) {
+                        path.file_stem().map(|s| s.to_string_lossy().into_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
         };
-        let mut names: Vec<String> = entries
-            .filter_map(Result::ok)
-            .filter_map(|e| {
-                let path = e.path();
-                if path.is_dir() {
-                    holds_slang(&path).then(|| e.file_name().to_string_lossy().into_owned())
-                } else if is_slang(&path) {
-                    path.file_stem().map(|s| s.to_string_lossy().into_owned())
-                } else {
-                    None
-                }
-            })
-            .collect();
         names.sort();
         names.dedup();
         for name in names {

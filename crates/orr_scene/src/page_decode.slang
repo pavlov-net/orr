@@ -1,7 +1,7 @@
 // Streamed mesh pages decoded on the loading queue from their stored form into their pool
 // slots: `copy` over every page's resident dwords, then `decode` with one workgroup per
 // cluster. Group y is the page; each page's status collects both passes' bits.
-#include "orr/root.h"
+#include "orr_shaders/root.h"
 import orr_pack.page_codec;
 
 public struct PageDecodeRoot

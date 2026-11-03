@@ -1,9 +1,9 @@
-// `orr.openpbr` with heap LUTs on the GPU: prepare, eval, pdf, one sample, the interior
+// `orr_shaders.openpbr` with heap LUTs on the GPU: prepare, eval, pdf, one sample, the interior
 // medium and the emission per case, the same calls as the CPU entry points in
 // slang/openpbr_cpu.slang.
-#include "orr/root.h"
-import orr.openpbr;
-import openpbr_inputs;
+#include "orr_shaders/root.h"
+import orr_shaders.openpbr;
+import openpbr_ref.openpbr_inputs;
 
 struct Case
 {

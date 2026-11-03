@@ -1,4 +1,4 @@
-//! The tables the `bsdf` module reads on the GPU.
+//! The tables the `orr_lighting.bsdf` module reads on the GPU.
 
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
@@ -16,10 +16,10 @@ use crate::Error;
 const WAIT: Duration = Duration::from_secs(60);
 
 /// `orr_shaders::openpbr::LUTS` as textures with sampled views in the reserved heap slots from
-/// `OPENPBR_LUT_SLOT`, the layout `bsdf` (through `orr.openpbr`) reads, and where specialization
-/// constant `openpbr_lut_slot` (104) points by default. Keep a set alive while kernels that import
-/// `bsdf` run. Every set on a device shares one upload, freed once everything submitted before the
-/// last set's drop has completed.
+/// `OPENPBR_LUT_SLOT`, the layout `orr_lighting.bsdf` (through `orr_shaders.openpbr`) reads, and
+/// where specialization constant `openpbr_lut_slot` (104) points by default. Keep a set alive while
+/// kernels that import `orr_lighting.bsdf` run. Every set on a device shares one upload, freed once
+/// everything submitted before the last set's drop has completed.
 #[derive(Clone)]
 pub struct BsdfTables {
     _live: Arc<Live>,

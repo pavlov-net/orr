@@ -1,5 +1,5 @@
 // Task, mesh and pixel entries in one module; a groupshared payload; whole-struct output.
-import handles;
+import shader_corpus.handles;
 
 struct Root
 {

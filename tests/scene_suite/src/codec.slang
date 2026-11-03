@@ -1,8 +1,8 @@
 // G-buffer packing: each case's surface through `encode_gsurface` with the extended target,
 // the words kept, then `decode_gsurface` back into a case.
-#include "orr/root.h"
-import gbuffer;
-import material;
+#include "orr_shaders/root.h"
+import orr_scene.gbuffer;
+import orr_scene.material;
 
 struct Case
 {

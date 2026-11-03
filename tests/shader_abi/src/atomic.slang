@@ -1,6 +1,6 @@
 // 64-bit max through a pointer: every value lands in slot `i % slots`.
-#include "orr/root.h"
-import orr.atomic;
+#include "orr_shaders/root.h"
+import orr_shaders.atomic;
 
 struct Root
 {

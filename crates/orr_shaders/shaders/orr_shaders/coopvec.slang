@@ -10,7 +10,7 @@
 // storage only: in memory, vectors are plain arrays.
 module coopvec;
 
-#include "orr/debug.h"
+#include "orr_shaders/debug.h"
 
 // An FP16 vector of N elements.
 public typealias Vector<let N : int> = CoopVec<half, N>;

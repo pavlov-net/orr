@@ -1,6 +1,6 @@
 // A root with every member kind: pointers, heap slots, TLAS, matrix, 64-bit scalar.
-import handles;
-import records;
+import shader_corpus.handles;
+import shader_corpus.records;
 
 struct View
 {

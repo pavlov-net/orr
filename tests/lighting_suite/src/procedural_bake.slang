@@ -1,7 +1,7 @@
 // The environment bake with a procedural sky: a gradient over a darker ground and a hot
 // spot of 3 deg radius.
-#include "orr/root.h"
-import environment;
+#include "orr_shaders/root.h"
+import orr_lighting.environment;
 
 struct ProceduralSky : IEnvironment
 {

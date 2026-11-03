@@ -1,12 +1,12 @@
 // The world cache's resolve, once per frame in the scene pass: `begin` settles the global
 // light rescale, `resolve` blends every cell's samples into its resolved value and evicts
 // stale cells, `finish` writes the frame's statistics.
-#include "orr/root.h"
+#include "orr_shaders/root.h"
 import orr_color.luminance;
-import orr.packing;
-import tables;
-import view;
-import world_cache;
+import orr_shaders.packing;
+import orr_scene.tables;
+import orr_scene.view;
+import orr_lighting.world_cache;
 
 struct Root
 {

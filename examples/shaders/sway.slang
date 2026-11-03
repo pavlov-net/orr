@@ -3,9 +3,9 @@
 // pose, so branches stay on the trunk and twigs on their branches; with `all_parts` off only
 // the parts on the body flutter and deeper ones ride along. Block b runs `b * phase_step`
 // radians ahead. Part 0, the body, is never posed.
-#include "orr/root.h"
-import orr.math;
-import tables;
+#include "orr_shaders/root.h"
+import orr_shaders.math;
+import orr_scene.tables;
 
 // A part's base, its parent part (0: the body) and the horizontal axis it tilts about, in
 // mesh space; a part with a zero axis does not flutter.

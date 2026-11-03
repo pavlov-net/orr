@@ -1,11 +1,11 @@
 // Shadow rays from a list of origins along one direction, as next-event estimation traces
 // them: per ray the shadow product, written or with `add` added to what is there, and how
 // many rays ran past the candidate limit.
-#include "orr/root.h"
-import orr.trace;
-import hit;
-import media;
-import shadow;
+#include "orr_shaders/root.h"
+import orr_shaders.trace;
+import orr_scene.hit;
+import orr_lighting.media;
+import orr_lighting.shadow;
 
 struct Root
 {

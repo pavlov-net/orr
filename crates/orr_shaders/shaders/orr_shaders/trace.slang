@@ -6,7 +6,7 @@
 // their cluster id is -1. Their primitive index is the segment's.
 module trace;
 
-import orr.abi;
+import orr_shaders.abi;
 
 // TLAS instance mask bits.
 public static const uint MASK_OPAQUE = 0x01;     // opaque and alpha-tested geometry

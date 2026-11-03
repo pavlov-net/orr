@@ -10,8 +10,8 @@
 // the same weights and, interpolated with `precise`, the same positions.
 module tessellation;
 
-import orr.abi;
-__exported import subd_cage;
+import orr_shaders.abi;
+__exported import orr_scene.subd_cage;
 
 public static const uint MAX_DICE = 9;
 public static const uint BARY_ONE = 1u << 30;

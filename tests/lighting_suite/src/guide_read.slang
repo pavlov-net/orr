@@ -1,6 +1,6 @@
 // Copies a view's six guide targets into one buffer, six RGBA values per pixel.
-#include "orr/root.h"
-import orr.abi;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
 
 struct Root
 {

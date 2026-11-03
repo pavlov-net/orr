@@ -1,7 +1,7 @@
 // An unlit surface that shows its hit's path depth: red at depths 0 and 1, green from 2 on.
 module context;
 
-import surface;
+import orr_scene.surface;
 
 public static const float3 NEAR = float3(40.0, 4.0, 4.0);
 public static const float3 FAR = float3(4.0, 40.0, 4.0);

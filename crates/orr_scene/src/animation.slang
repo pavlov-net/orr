@@ -11,9 +11,9 @@
 // takes its pose, every such copy without a focus, skinned copies aside, and only while its
 // nearer step is the model itself. The raster poses the clusters of animated parts of these
 // copies; the PTLAS kernels give the traced ones part runs.
-#include "orr/root.h"
-import tables;
-import hit;
+#include "orr_shaders/root.h"
+import orr_scene.tables;
+import orr_scene.hit;
 
 public static const float ANIMATION_HYSTERESIS = 1.15;
 

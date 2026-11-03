@@ -1,10 +1,10 @@
 // Directional discs: the cosine-weighted integral of `directional_disc` over each directional
 // light's cone through the slab.
-#include "orr/root.h"
-import orr.math;
-import lights;
-import light_sampling;
-import media_types;
+#include "orr_shaders/root.h"
+import orr_shaders.math;
+import orr_scene.lights;
+import orr_lighting.light_sampling;
+import lighting_suite.media_types;
 
 struct Root
 {

@@ -1,7 +1,7 @@
 // The scene's light table, indexed by LightId.
 module lights;
 
-import orr.abi;
+import orr_shaders.abi;
 
 // `LightGpu.kind`.
 public static const uint LIGHT_NONE = 0;

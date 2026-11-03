@@ -1,10 +1,10 @@
 // Froxel lookup: a point between each froxel's column rays and inside its slice, back to the
 // froxel holding it.
-#include "orr/root.h"
-import media;
-import view;
-import visibility;
-import froxels;
+#include "orr_shaders/root.h"
+import orr_lighting.media;
+import orr_scene.view;
+import orr_scene.visibility;
+import orr_lighting.froxels;
 
 struct Root
 {

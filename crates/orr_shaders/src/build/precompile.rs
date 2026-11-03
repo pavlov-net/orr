@@ -13,6 +13,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::compile::{canonical_lossy, write};
+use super::roots::{self, Root, beside, imports};
 use super::slang::{GlobalSession, Library, Session};
 use super::{Error, SLANG_VERSION};
 
@@ -34,6 +35,11 @@ impl Precompiled {
             .collect();
         used.sort();
         used
+    }
+
+    /// Whether a module of this import name is precompiled.
+    pub(crate) fn holds(&self, name: &str) -> bool {
+        self.modules.values().any(|r| r.name == name)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -72,8 +78,8 @@ struct ModuleRecord {
 /// Precompiles every library module that `sources` import, directly or through other
 /// libraries, into `dir`, reusing the modules whose records are current.
 ///
-/// `sources` are the files the build compiles (path and text); `include_dirs` the session's
-/// search paths, which `dir` must not be among; `key_parts` everything besides the inputs
+/// `sources` are the files the build compiles (path and text); `roots` the import roots, whose
+/// search paths must not hold `dir`; `key_parts` everything besides the inputs
 /// that changes a module. A module is precompiled only where every importer resolves its
 /// name to the file the search paths give, since the precompiled copy wins over a file
 /// beside the importer. A module that fails to compile is left to load from source, so the
@@ -82,11 +88,11 @@ pub(super) fn precompile(
     lib: &Arc<Library>,
     options: &[String],
     key_parts: &[&str],
-    include_dirs: &[PathBuf],
+    roots: &[Root],
     sources: &[(PathBuf, String)],
     dir: &Path,
 ) -> Result<Precompiled, Error> {
-    let candidates = libraries(include_dirs, sources);
+    let candidates = libraries(roots, sources);
     fs::create_dir_all(dir).map_err(|source| Error::Io {
         path: dir.to_path_buf(),
         source,
@@ -127,12 +133,10 @@ pub(super) fn precompile(
         for (i, (name, file, out, record)) in stale.into_iter().enumerate() {
             let _ = fs::remove_file(&out);
             let importer = format!("orr_precompile_{i}");
-            let module = session
-                .load(
-                    &importer,
-                    &importers.join(format!("{importer}.slang")),
-                    &format!("import {name};\n"),
-                )
+            let text = format!("import {name};\n");
+            let path = importers.join(format!("{importer}.slang"));
+            let module = roots::load_prefixed(&session, roots, &[(&path, &text)], |_| false)
+                .and_then(|()| session.load(&importer, &path, &text))
                 .ok()
                 .and_then(|_| {
                     session
@@ -222,9 +226,9 @@ fn remove_others(dir: &Path, keep: &BTreeMap<PathBuf, ModuleRecord>) {
 }
 
 /// The library modules reachable from `sources` by dotted `import` names, by name, with
-/// the file the search paths give for each.
-fn libraries(include_dirs: &[PathBuf], sources: &[(PathBuf, String)]) -> Vec<(String, PathBuf)> {
-    let search = |name: &str| resolve(None, name, include_dirs);
+/// the file the import roots give for each.
+fn libraries(roots: &[Root], sources: &[(PathBuf, String)]) -> Vec<(String, PathBuf)> {
+    let search = |name: &str| roots::find(roots, name);
     // name -> (searched file, imported names); `None` when an importer sees another file.
     let mut found: BTreeMap<String, Option<(PathBuf, Vec<String>)>> = BTreeMap::new();
     let mut queue: VecDeque<(PathBuf, String)> = sources.iter().cloned().collect();
@@ -233,7 +237,7 @@ fn libraries(include_dirs: &[PathBuf], sources: &[(PathBuf, String)]) -> Vec<(St
         let here = importer.parent();
         for name in imports(&text) {
             let searched = search(name);
-            let seen = resolve(here, name, include_dirs);
+            let seen = beside(here, name).or_else(|| searched.clone());
             let usable = searched.is_some() && seen == searched;
             match found.get_mut(name) {
                 Some(entry) if !usable => *entry = None,
@@ -280,52 +284,4 @@ fn libraries(include_dirs: &[PathBuf], sources: &[(PathBuf, String)]) -> Vec<(St
         .into_iter()
         .filter_map(|(name, e)| e.map(|(file, _)| (name, file)))
         .collect()
-}
-
-/// The file an import of `name` loads: beside the importer, else on the first search path
-/// that has it.
-fn resolve(importer_dir: Option<&Path>, name: &str, include_dirs: &[PathBuf]) -> Option<PathBuf> {
-    let mut rel = PathBuf::from_iter(name.split('.'));
-    rel.set_extension("slang");
-    importer_dir
-        .into_iter()
-        .chain(include_dirs.iter().map(PathBuf::as_path))
-        .map(|d| d.join(&rel))
-        .find(|p| p.is_file())
-        .map(|p| canonical_lossy(&p))
-}
-
-/// The dotted module names of a source's `import` declarations.
-fn imports(text: &str) -> Vec<&str> {
-    text.lines()
-        .filter_map(|line| {
-            let line = line.split("//").next()?.trim();
-            let line = line
-                .strip_prefix("__exported ")
-                .or_else(|| line.strip_prefix("public "))
-                .unwrap_or(line)
-                .trim_start();
-            let name = line
-                .strip_prefix("import ")?
-                .trim()
-                .strip_suffix(';')?
-                .trim();
-            name.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
-                .then_some(name)
-                .filter(|n| !n.is_empty())
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn import_declarations() {
-        let text = "import orr.abi;\n  __exported import orr.openpbr_bsdf;\npublic import lights; // x\n\
-            // import gone;\nimport \"orr/path\";\nimport a.b; import c;\nimplementing x;\n";
-        assert_eq!(imports(text), ["orr.abi", "orr.openpbr_bsdf", "lights"]);
-    }
 }

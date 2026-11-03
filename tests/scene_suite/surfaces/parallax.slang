@@ -3,8 +3,8 @@
 // z = -DEPTH - SLOPE x in the card's object space, within HALF of its axis in x and y.
 module parallax;
 
-import orr.math;
-import surface;
+import orr_shaders.math;
+import orr_scene.surface;
 
 static const float SLOPE = 0.3;
 static const float DEPTH = 0.2;

@@ -1,8 +1,8 @@
 // A view's aerial-perspective LUT: each column's in-scatter and transmittance from the
 // scene's `near_range` to the view's `ap_range`.
-#include "orr/root.h"
-import media;
-import froxels;
+#include "orr_shaders/root.h"
+import orr_lighting.media;
+import orr_lighting.froxels;
 
 extern struct Medium : IMedium = NoMedium;
 

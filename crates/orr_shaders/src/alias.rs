@@ -1,6 +1,6 @@
 use bytemuck::{Pod, Zeroable};
 
-/// One bin of an alias table, `orr.sampling`'s `AliasEntry`: bin i keeps itself with
+/// One bin of an alias table, `orr_shaders.sampling`'s `AliasEntry`: bin i keeps itself with
 /// `probability`, else yields `alias`. `sample_alias` draws from a table in GPU memory.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug, Default, Pod, Zeroable)]

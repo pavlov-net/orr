@@ -14,13 +14,13 @@ fn main() {
     let result = CpuLibrary::new()
         .and_then(|b| {
             b.source("slang/output.slang")
-                .include(&output_src)
+                .include_as("orr_output", &output_src)
                 .compile("output_math")
         })
         .and_then(|()| Build::new())
         .and_then(|b| {
             b.kernels(manifest.join("gpu"))
-                .include(&output_src)
+                .include_as("orr_output", &output_src)
                 .extern_type("Gt7Curve", "orr_output::Gt7Curve")
                 .metal_check(true)
                 .compile()
@@ -29,8 +29,8 @@ fn main() {
         panic!("{e}");
     }
 
-    println!("cargo:rerun-if-env-changed=GT7_SAMPLE");
-    println!("cargo:rerun-if-changed=cpp/gt7_reference.cpp");
+    println!("cargo::rerun-if-env-changed=GT7_SAMPLE");
+    println!("cargo::rerun-if-changed=cpp/gt7_reference.cpp");
     let sample = env::var_os("GT7_SAMPLE")
         .filter(|d| !d.is_empty())
         .map(PathBuf::from)
@@ -47,7 +47,7 @@ fn main() {
             )
         });
     println!(
-        "cargo:rerun-if-changed={}",
+        "cargo::rerun-if-changed={}",
         sample.join("gt7_tone_mapping.cpp").display()
     );
     cc::Build::new()

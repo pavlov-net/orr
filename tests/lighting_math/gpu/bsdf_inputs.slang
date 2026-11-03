@@ -1,6 +1,6 @@
 // The harness's `Inputs` as `BsdfParams`, the way a material resolve fills them.
-import bsdf;
-import openpbr_inputs;
+import orr_lighting.bsdf;
+import openpbr_ref.openpbr_inputs;
 
 BsdfParams bsdf_params(Inputs m)
 {

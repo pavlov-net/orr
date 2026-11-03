@@ -49,7 +49,11 @@ const ORR_LINKS: [(LinkPoint, &str, &str, &str); 2] = [
 ];
 
 fn renderer(src: &Path, out: &Path) -> Result<Output, Error> {
-    Build::new()?.kernels(src).out_dir(out).compile()
+    Build::new()?
+        .kernels(src)
+        .include(src)
+        .out_dir(out)
+        .compile()
 }
 
 fn consumer(
@@ -85,10 +89,13 @@ fn fixture_consumer(renderer: &Output, out: &Path, link: bool) -> Result<Output,
 fn edited_orr(roots: &str, src: &Path, out: &Path) -> Result<Output, Error> {
     let (lighting, others): (Vec<&str>, Vec<&str>) = roots
         .split(';')
-        .partition(|r| Path::new(r).join("environment/bake.slang").is_file());
+        .partition(|r| r.starts_with("orr_lighting="));
     let [lighting] = lighting[..] else {
-        panic!("one orr root holds the environment bake: {roots}");
+        panic!("one orr root is orr_lighting's: {roots}");
     };
+    let lighting = lighting
+        .strip_prefix("orr_lighting=")
+        .expect("just matched");
     copy_slang(Path::new(lighting), src, &|name, text| {
         if name == "environment.slang" {
             let edited = text.replace(
@@ -105,6 +112,7 @@ fn edited_orr(roots: &str, src: &Path, out: &Path) -> Result<Output, Error> {
     let scene = env::var("DEP_ORR_TYPES").expect("orr's type map");
     Build::new()?
         .kernels(src)
+        .prefix("orr_lighting")
         .roots(&others.join(";"))
         .types(&scene)
         .out_dir(out)
@@ -166,7 +174,7 @@ fn main() {
         })
     });
     println!(
-        "cargo:rerun-if-changed={}",
+        "cargo::rerun-if-changed={}",
         manifest.join("consumer").display()
     );
 

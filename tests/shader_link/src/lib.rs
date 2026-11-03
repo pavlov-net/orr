@@ -121,7 +121,7 @@ pub fn medium(data: &AirData, t: f32) -> [f32; 10] {
     out
 }
 
-/// `orr.coherence`'s `KEY_BITS` in the CPU build.
+/// `orr_shaders.coherence`'s `KEY_BITS` in the CPU build.
 pub fn key_bits() -> u32 {
     // SAFETY: no arguments.
     unsafe { ffi::link_key_bits() }

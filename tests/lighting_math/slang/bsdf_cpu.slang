@@ -1,9 +1,9 @@
 // C entry points over orr_lighting's `bsdf` (array LUTs) and `spectrum` for the CPU harness.
 // Directions are in the shading frame (normal +z) and pass as float arrays.
-import bsdf;
-import spectrum;
-import bsdf_inputs;
-import openpbr_inputs;
+import orr_lighting.bsdf;
+import orr_lighting.spectrum;
+import lighting_math.bsdf_inputs;
+import openpbr_ref.openpbr_inputs;
 
 float3 load3(float* p) { return float3(p[0], p[1], p[2]); }
 void store3(float* p, float3 v) { p[0] = v.x; p[1] = v.y; p[2] = v.z; }

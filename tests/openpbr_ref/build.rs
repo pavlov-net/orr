@@ -1,4 +1,4 @@
-//! Builds the two CPU BSDFs the harness compares, `orr.openpbr` through Slang's C++ target
+//! Builds the two CPU BSDFs the harness compares, `orr_shaders.openpbr` through Slang's C++ target
 //! (`slang/openpbr_cpu.slang`, array LUTs) and adobe/openpbr-bsdf's own C++ with GLM
 //! (`cpp/reference.cpp`), and compiles the GPU kernels under `gpu/` to SPIR-V.
 //!
@@ -18,14 +18,14 @@ fn main() {
     CpuLibrary::new()
         .and_then(|b| {
             b.source("slang/openpbr_cpu.slang")
-                .include(manifest.join("gpu"))
+                .include_as("openpbr_ref", manifest.join("gpu"))
                 .define("ORR_OPENPBR_ARRAY_LUTS", "1")
                 .compile("openpbr_slang")
         })
         .unwrap_or_else(|e| fail(e));
 
-    println!("cargo:rerun-if-changed=cpp/reference.cpp");
-    println!("cargo:rerun-if-env-changed=ORR_GLM");
+    println!("cargo::rerun-if-changed=cpp/reference.cpp");
+    println!("cargo::rerun-if-env-changed=ORR_GLM");
     cc::Build::new()
         .cpp(true)
         .std("c++17")

@@ -2,11 +2,11 @@
 // culling data to the triangles it now holds, after the consumer kernel wrote its page;
 // `refs` puts each built CLAS's address into the resident cluster table, or each built
 // template's into the edit's skin table.
-#include "orr/root.h"
-import orr.abi;
-import orr.packing;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.packing;
 import orr_pack.mesh;
-import tables;
+import orr_scene.tables;
 
 // One rebuilt cluster.
 public struct EditJob

@@ -3,7 +3,7 @@
 // kind.
 module words;
 
-import surface;
+import orr_scene.surface;
 
 public struct Words : ISurface
 {

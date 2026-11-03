@@ -1,10 +1,10 @@
 // orr_lighting's particle draw through the stock height fog.
-#include "orr/root.h"
-import media;
-import surface;
-import particles;
-import particle_lighting;
-import media_types;
+#include "orr_shaders/root.h"
+import orr_lighting.media;
+import orr_scene.surface;
+import orr_scene.particles;
+import orr_lighting.particle_lighting;
+import lighting_suite.media_types;
 
 struct ParticleRoot
 {

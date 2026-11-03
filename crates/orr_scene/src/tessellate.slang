@@ -14,20 +14,20 @@
 // cut it alike: its undisplaced world length in pixels at the scene focus over the dice rate,
 // times the entry's rate scale, over 15 where last frame's first view of the scene saw
 // neither the edge in its frustum nor in front of its HZB.
-#include "orr/root.h"
-import orr.abi;
-import orr.atomic;
-import orr.math;
-import orr.packing;
-import producer;
-import rtas;
-import tables;
-import tessellation;
-import visibility;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.atomic;
+import orr_shaders.math;
+import orr_shaders.packing;
+import orr_scene.producer;
+import orr_gpu.rtas;
+import orr_scene.tables;
+import orr_scene.tessellation;
+import orr_scene.visibility;
 
 // Its taps drive texture streaming.
 export static const bool TEXTURE_FEEDBACK = true;
-__exported import displacement;
+__exported import orr_scene.displacement;
 
 extern struct Displace : IDisplacement = TextureDisplacement;
 

@@ -56,7 +56,7 @@ impl BoundTexture {
     };
 }
 
-/// The `orr.trace` candidate class of a model whose sections have material flags `flags`:
+/// The `orr_shaders.trace` candidate class of a model whose sections have material flags `flags`:
 /// 1 (dielectric) where every section is `DIELECTRIC`, 2 (presence) where every section is
 /// `PRESENCE` and none `DIELECTRIC`, 0 (opaque) where none is either; `None` for a mix.
 pub(crate) fn candidate_class(flags: impl IntoIterator<Item = u32>) -> Option<u8> {

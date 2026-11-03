@@ -168,7 +168,7 @@ pub(super) fn msl_issues(msl: &str) -> Vec<String> {
                 .any(|w| t.contains(w))
         {
             out.push(format!(
-                "MSL line {line_no}: a 64-bit fetch atomic, which Metal lacks (use orr.atomic)"
+                "MSL line {line_no}: a 64-bit fetch atomic, which Metal lacks (use orr_shaders.atomic)"
             ));
         }
         if let Some(params) = entry_parameters(t) {

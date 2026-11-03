@@ -1,7 +1,7 @@
 // Media for the tests: a homogeneous slab and the stock height fog.
 module media_types;
 
-import media;
+import orr_lighting.media;
 
 // Extinction `sigma_t` per meter for altitudes y in [0, height], nothing elsewhere.
 public struct Slab : IMedium

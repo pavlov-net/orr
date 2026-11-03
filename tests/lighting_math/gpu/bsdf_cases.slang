@@ -1,9 +1,9 @@
 // orr_lighting's `bsdf` with heap LUTs on the GPU: per case every call the CPU entry points in
 // slang/bsdf_cpu.slang make, on the case's material and view.
-#include "orr/root.h"
-import bsdf;
-import bsdf_inputs;
-import openpbr_inputs;
+#include "orr_shaders/root.h"
+import orr_lighting.bsdf;
+import lighting_math.bsdf_inputs;
+import openpbr_ref.openpbr_inputs;
 
 struct BsdfCase
 {

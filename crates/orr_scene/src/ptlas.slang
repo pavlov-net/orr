@@ -31,13 +31,13 @@
 // steps, a part instance of its own (a run of one, named in `part_slots` with COPY_FAR)
 // traces the farther step's cached cut, and both are written non-opaque so hits test the
 // fade. Chain work is mandatory, so ray tracing changes step in the frame the raster does.
-#include "orr/root.h"
-import orr.abi;
-import orr.math;
-import orr.trace;
-import rtas;
-import hit;
-import producer;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.math;
+import orr_shaders.trace;
+import orr_gpu.rtas;
+import orr_scene.hit;
+import orr_scene.producer;
 
 public static const uint PARTITION_NONE = 0xffffffff;
 public static const uint DISTANCE_BUCKETS = 64;

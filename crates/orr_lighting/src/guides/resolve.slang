@@ -1,7 +1,7 @@
 // The guide resolve: every ray reconstruction guide of one view.
-#include "orr/root.h"
-import surface;
-import guides;
+#include "orr_shaders/root.h"
+import orr_scene.surface;
+import orr_lighting.guides;
 
 extern struct Surface : ISurface = StandardSurface;
 

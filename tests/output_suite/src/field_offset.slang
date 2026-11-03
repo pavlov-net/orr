@@ -1,7 +1,7 @@
 // Composes a uniform screen shift into the distortion field: the previous field plus the
 // shift in RG and minus it in BA.
-#include "orr/root.h"
-import orr.abi;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
 
 struct Root
 {

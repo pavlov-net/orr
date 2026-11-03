@@ -353,7 +353,7 @@ fn lists_recorded_on_two_threads() {
 }
 
 /// 16x16 weights converted into the inference layout, on the GPU and on the host, multiply
-/// FP16 vectors through `orr.coopvec` as a CPU matmul does, at every 64-byte placement of
+/// FP16 vectors through `orr_shaders.coopvec` as a CPU matmul does, at every 64-byte placement of
 /// the matrix and with a bias. FP16 weights always; E4M3 and E5M2 weights where the device
 /// has 8-bit floats.
 #[test]

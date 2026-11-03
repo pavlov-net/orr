@@ -1,4 +1,4 @@
-// adobe/openpbr-bsdf compiled as one module; kernels import `orr.openpbr`, which re-exports
+// adobe/openpbr-bsdf compiled as one module; kernels import `orr_shaders.openpbr`, which re-exports
 // it. The module imports nothing: in a module with an import, Slang 2026.20 ignores
 // `#pragma warning(disable)` for flow-analysis diagnostics.
 
@@ -25,7 +25,7 @@
 [vk::constant_id(102)] const bool openpbr_enable_translucency = true;
 [vk::constant_id(103)] const bool openpbr_enable_metallic = true;
 
-// Defined in orr/openpbr.slang.
+// Defined in orr_shaders/openpbr.slang.
 extern float4 orr_openpbr_sample_2d(int id, float2 uv);
 extern float4 orr_openpbr_sample_3d(int id, float3 uvw);
 #define OPENPBR_USE_TEXTURE_LUTS 1

@@ -1,6 +1,6 @@
 // The ray-dispatch entry of the pipeline cache tests, writing its specialization constant plus
 // one.
-#include "orr/root.h"
+#include "orr_shaders/root.h"
 
 struct Root
 {

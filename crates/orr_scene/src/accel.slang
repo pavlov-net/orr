@@ -3,11 +3,11 @@
 // stores its CLAS build, or with CLAS_TEMPLATE its cluster template build over the rest
 // positions, bounded by its rest box grown by its deformation bound; `records` stores
 // cluster BLAS and move records from address jobs.
-#include "orr/root.h"
-import orr.abi;
-import orr.packing;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.packing;
 import orr_pack.mesh;
-import rtas;
+import orr_gpu.rtas;
 
 // `ClasJob.flags`.
 public static const uint CLAS_MICROMAP = 1;   // alpha-tested triangles take the page's micromap

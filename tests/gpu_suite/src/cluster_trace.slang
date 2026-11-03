@@ -2,9 +2,9 @@
 // raygen entry. Writes a 20-word record per ray: hit, custom index, instance index, cluster
 // id, primitive, geometry index, t, non-opaque candidates seen, the nearest candidate's
 // cluster id and primitive, the hit triangle's positions, and 0x600d.
-#include "orr/root.h"
-import orr.abi;
-import orr.trace;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_shaders.trace;
 
 static const uint MODE_FORCE_NON_OPAQUE = 1;
 static const uint MODE_ALPHA = 2;

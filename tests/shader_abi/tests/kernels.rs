@@ -17,7 +17,7 @@ use orr_math::Vec2;
 use shader_abi::shaders::{alpha, atomic, candidates, clusters, mesh, pattern, texture};
 
 const EDGE: f32 = 2e-4;
-/// `RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE` of `orr.trace`.
+/// `RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE` of `orr_shaders.trace`.
 const FORCE_OPACITY_MICROMAP_2_STATE: u32 = 0x400;
 const SIZE: u32 = 256;
 

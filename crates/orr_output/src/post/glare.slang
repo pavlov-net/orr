@@ -11,11 +11,11 @@
 //
 // The CPU model in `build/pyramid.rs` follows these taps and sample positions exactly, on the
 // plane of what `glare_extract` takes from each pixel.
-#include "orr/root.h"
-import orr.abi;
-import view;
-import glare_lens;
-import tent;
+#include "orr_shaders/root.h"
+import orr_shaders.abi;
+import orr_scene.view;
+import orr_output.glare_lens;
+import orr_output.tent;
 
 static const uint ENTRIES = 9;
 static const uint F_NUMBERS = 10;

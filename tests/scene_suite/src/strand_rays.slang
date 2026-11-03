@@ -1,11 +1,11 @@
 // What the raster and traced rays see of strand entry `entry`. Mode 0, per view pixel: the
 // visibility buffer's primary hit and the traced camera ray's hit. Mode 1, per cell of a
 // grid on the ground: the fraction of `RAYS` shadow rays toward a disk light that miss.
-#include "orr/root.h"
-import orr.math;
-import orr.trace;
-import hit;
-import visibility;
+#include "orr_shaders/root.h"
+import orr_shaders.math;
+import orr_shaders.trace;
+import orr_scene.hit;
+import orr_scene.visibility;
 
 struct Seen
 {

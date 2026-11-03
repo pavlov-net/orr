@@ -25,23 +25,23 @@
 // beyond `near_range` through it to the view's `ap_range` and marches the rest.
 module froxels;
 
-import orr.abi;
-import orr.math;
+import orr_shaders.abi;
+import orr_shaders.math;
 import orr_color.luminance;
-import orr.random;
-import orr.sampling;
-import orr.trace;
-import lights;
-import tables;
-import view;
-import gbuffer;
-import hit;
-import visibility;
-import media;
-import light_sampling;
-import world_cache;
-import shadow;
-import interiors;
+import orr_shaders.random;
+import orr_shaders.sampling;
+import orr_shaders.trace;
+import orr_scene.lights;
+import orr_scene.tables;
+import orr_scene.view;
+import orr_scene.gbuffer;
+import orr_scene.hit;
+import orr_scene.visibility;
+import orr_lighting.media;
+import orr_lighting.light_sampling;
+import orr_lighting.world_cache;
+import orr_lighting.shadow;
+import orr_lighting.interiors;
 
 // Separates the froxels' samples from the paths' of the same pixel.
 public static const uint FROXEL_STREAM = 0x85EBCA6B;

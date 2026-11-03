@@ -1,7 +1,7 @@
-// C entry points over `orr.openpbr` (array LUTs) for the CPU harness, one for one with
+// C entry points over `orr_shaders.openpbr` (array LUTs) for the CPU harness, one for one with
 // cpp/reference.cpp. Directions are in the shading frame (normal +z) and pass as float arrays.
-import orr.openpbr;
-import openpbr_inputs;
+import orr_shaders.openpbr;
+import openpbr_ref.openpbr_inputs;
 
 float3 load3(float* p) { return float3(p[0], p[1], p[2]); }
 void store3(float* p, float3 v) { p[0] = v.x; p[1] = v.y; p[2] = v.z; }
