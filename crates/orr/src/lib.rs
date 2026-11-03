@@ -1079,10 +1079,10 @@ impl<'a> Frame<'a> {
     /// render) shows none. A camera that jumps without declaring a cut blurs up to
     /// the longest streak, [`orr_output::MOTION_BLUR_MAX_RADIUS`] of the output width each way.
     ///
-    /// A `lighting.debug_view` shows neither motion blur nor glare, since it is not the final
-    /// image. The accumulation reference shows glare but no motion blur: each of its frames is
-    /// ground truth and a caller simulates the shutter by stepping time, so blurring it here would
-    /// blur it twice.
+    /// A `lighting.debug_view` shows no motion blur, glare or lens distortion, since it is not
+    /// the final image. The accumulation reference shows glare but no motion blur: each of its
+    /// frames is ground truth and a caller simulates the shutter by stepping time, so blurring it
+    /// here would blur it twice.
     ///
     /// The target decides the output extent. `output.reconstruction` and the output extent
     /// decide the render extent, the jitter and the texture level-of-detail bias while the
@@ -1278,7 +1278,9 @@ impl<'a> Frame<'a> {
         if let Some(frame) = display.as_mut() {
             frame.frame_generation(&desc, depth, motion, view.not_rendering_scene);
         }
-        let distortion = output.lens_distortion(view.lens.distortion);
+        // A debug view is not the final image, so it shows no camera effects.
+        let look = lighting.debug_view == LightingDebugView::None;
+        let distortion = output.lens_distortion(view.lens.distortion.filter(|_| look));
         let field_on = distortion.is_some() || (output.distortion_field && set.any());
         let mut field = match display.as_mut() {
             Some(frame) if field_on => Some(frame.distortion_field()?),
@@ -1338,8 +1340,7 @@ impl<'a> Frame<'a> {
                 output,
             },
         )?;
-        // A view that stops after exposure shows no camera effects and holds none of their images.
-        let look = lighting.debug_view == LightingDebugView::None;
+        // A view that stops after exposure holds none of the camera effects' images.
         // Depth of field takes this rule too once it runs here: the reference traces its own lens.
         let blurs = tonemapped && look && lighting.reference.is_none();
         kernels.motion_blur(
