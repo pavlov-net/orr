@@ -18,5 +18,8 @@ meshopt.workspace = true
 thiserror.workspace = true
 zstd.workspace = true
 
+[dev-dependencies]
+orr_color.workspace = true
+
 [lints]
 workspace = true

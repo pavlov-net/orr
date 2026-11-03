@@ -1,13 +1,13 @@
 //! The emissive list: instance spans and producer entries, their power summed on the GPU.
 
-use glam::{DMat3, DVec3, Mat3, Vec3};
 use orr_gpu::{GpuPtr, MemoryKind};
+use orr_math::{Affine3, DMat3, DVec3, Mat3, Vec3};
 use orr_scene::testing::{assert_clean, device, read_buffer, set_model_emission, wait};
 use orr_scene::{
-    Affine3, ClusterTopology, CopyVariant, EmissiveGpu, EmissiveSpan, FrameDesc, FrameTime,
-    GroupWriter, InstanceFlags, InstanceRange, InstancesDesc, MaterialGpu, MaterialId,
-    ModelEmission, ModelId, ProducerDesc, ProducerId, ProducerUpdate, RendererDesc, SceneDesc,
-    SceneId, SceneRoot, Scenes, TransformGroupDesc, TransformGroupId, material_flags,
+    ClusterTopology, CopyVariant, EmissiveGpu, EmissiveSpan, FrameDesc, FrameTime, GroupWriter,
+    InstanceFlags, InstanceRange, InstancesDesc, MaterialGpu, MaterialId, ModelEmission, ModelId,
+    ProducerDesc, ProducerId, ProducerUpdate, RendererDesc, SceneDesc, SceneId, SceneRoot, Scenes,
+    TransformGroupDesc, TransformGroupId, material_flags,
 };
 use orr_shaders::bytemuck::Zeroable;
 use scene_suite::pipeline;
@@ -116,7 +116,7 @@ fn instance_spans_follow_scale_material_sets_hidden_sections_and_removal() {
         })
         .unwrap();
     for (t, m) in w.transforms(g, 0, 5).unwrap().iter_mut().zip(scales) {
-        *t = Affine3::new(m, Vec3::new(1.0, 2.0, 3.0));
+        *t = Affine3::from_mat3_translation(m, Vec3::new(1.0, 2.0, 3.0)).into();
     }
     let desc = |model, copies, material_set| InstancesDesc {
         model: ModelId(model),
@@ -341,8 +341,8 @@ fn producer_power_follows_emitted_clusters_every_frame() {
                 })
                 .unwrap();
             w.transforms(group, 0, 2).unwrap().copy_from_slice(&[
-                Affine3::new(linear, Vec3::new(4.0, 0.0, -2.0)),
-                Affine3::new(Mat3::IDENTITY, Vec3::ZERO),
+                Affine3::from_mat3_translation(linear, Vec3::new(4.0, 0.0, -2.0)).into(),
+                Affine3::IDENTITY.into(),
             ]);
         },
         &[],
@@ -432,7 +432,7 @@ fn producer_power_follows_emitted_clusters_every_frame() {
     let root = run(
         &mut scenes,
         &mut |w| {
-            w.transforms(group, 0, 1).unwrap()[0] = Affine3::new(Mat3::IDENTITY, Vec3::ZERO);
+            w.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
         },
         &[(ProducerId(1), 20, 1.0)],
     );

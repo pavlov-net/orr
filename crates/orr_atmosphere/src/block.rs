@@ -1,11 +1,9 @@
 //! An [`Atmosphere`] as the GPU reads it: the medium fields of [`AtmosphereGpu`] and the
 //! per-group coefficients of the LUT passes.
 
-use std::sync::LazyLock;
-
 use orr::WorldPos;
-use orr_color::{RgbPrimaries, luminance};
-use orr_math::{DMat3, DVec3, Vec3};
+use orr_color::luminance;
+use orr_math::{DVec3, Vec3};
 
 use crate::shaders::types::{AtmosphereGpu, AtmosphereGroups};
 use crate::spectrum::{GROUPS, RGB, SOLAR_COLOR, SPECTRAL_GROUPS, rgb_at};
@@ -16,9 +14,7 @@ pub(crate) const PASSES: usize = SPECTRAL_GROUPS / 3;
 
 /// A linear Rec.709 color in linear Rec.2020.
 pub(crate) fn rec2020(c: Vec3) -> [f64; 3] {
-    static REC709_TO_REC2020: LazyLock<DMat3> =
-        LazyLock::new(|| RgbPrimaries::REC709.matrix_to(RgbPrimaries::REC2020));
-    (*REC709_TO_REC2020 * c.as_dvec3()).to_array()
+    orr_color::rec709_to_rec2020(c).to_array()
 }
 
 fn xyz(v: [f64; 3]) -> [f32; 4] {

@@ -4,6 +4,11 @@ module primaries;
 
 public static const float2 D65_XY = float2(0.3127, 0.329);
 
+// The primaries ids stored in cooked textures, orr_color::Primaries.
+public static const uint PRIMARIES_REC709 = 0;
+public static const uint PRIMARIES_DISPLAY_P3 = 1;
+public static const uint PRIMARIES_REC2020 = 2;
+
 public static const float3x3 REC709_TO_XYZ = float3x3(
     0.4123908, 0.35758433, 0.1804808,
     0.212639, 0.71516865, 0.07219232,

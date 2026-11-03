@@ -3,7 +3,7 @@
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference, Run};
 use orr_atmosphere::spectrum::{SOLAR_COLOR, SOLAR_ILLUMINANCE};
 use orr_atmosphere::{Aerosol, Atmosphere, HeightFog};
-use orr_color::{delta_uv, luminance};
+use orr_color::{delta_uv_1976, luminance};
 use orr_math::{DVec3, Vec3};
 
 fn earth() -> Atmosphere {
@@ -145,7 +145,7 @@ fn groups_match_spectral_color_at(elevations: &[f64]) {
             .collect();
         let max = sky
             .iter()
-            .map(|(s, g)| delta_uv(s.xyz, g.xyz))
+            .map(|(s, g)| delta_uv_1976(s.xyz, g.xyz))
             .fold(0.0, f64::max);
         let zenith = sky[0].0.xyz[1] * SOLAR_ILLUMINANCE;
         let samples = sky
@@ -157,7 +157,11 @@ fn groups_match_spectral_color_at(elevations: &[f64]) {
             run.xyz(&run.transmittance(EYE, light.direction, f64::INFINITY, Geometry::Sphere))
         };
         let (ds, dg) = (direct(&spectral), direct(&groups));
-        let direct_duv = if ds[1] > 0.0 { delta_uv(ds, dg) } else { 0.0 };
+        let direct_duv = if ds[1] > 0.0 {
+            delta_uv_1976(ds, dg)
+        } else {
+            0.0
+        };
         eprintln!(
             "light {elevation:>5} deg: sky max du'v' {max:.4}, direct {direct_duv:.4}, zenith {zenith:.4e} cd/m^2, {samples} paths"
         );
@@ -231,8 +235,8 @@ fn rgb_bands_on_segments() {
                     let s =
                         spectral.segment(EYE, view, length, &light, Geometry::Plane, &precision);
                     let r = rgb.segment(EYE, view, length, &light, Geometry::Plane, &precision);
-                    inscatter = inscatter.max(delta_uv(s.inscatter.xyz, r.inscatter.xyz));
-                    transmitted = transmitted.max(delta_uv(
+                    inscatter = inscatter.max(delta_uv_1976(s.inscatter.xyz, r.inscatter.xyz));
+                    transmitted = transmitted.max(delta_uv_1976(
                         spectral.xyz(&s.transmittance),
                         rgb.xyz(&r.transmittance),
                     ));

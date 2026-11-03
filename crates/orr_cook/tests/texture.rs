@@ -8,6 +8,7 @@ use orr_cook::{
     ArchiveSpec, AssetSpec, CookOptions, GltfSettings, InputChannels, Manifest, Primaries, Quality,
     Source, TextureOverride, TextureRules, TextureSettings, Usage,
 };
+use orr_math::Vec3;
 use orr_pack::material::{Material, slot};
 use orr_pack::model::ModelInfo;
 use orr_pack::texture::{FormatInfo, TILE_BYTES, TextureInfo, octahedral, tile_grid, vk};
@@ -400,7 +401,7 @@ fn sky(dir: [f32; 3]) -> [f32; 3] {
         [0.25, 0.2, 0.15]
     };
     let blob = |c: [f32; 3], k: f32, s: f32| {
-        let d = dir[0] * c[0] + dir[1] * c[1] + dir[2] * c[2];
+        let d = Vec3::from(dir).dot(Vec3::from(c));
         s * (k * (d - 1.0)).exp()
     };
     let a = blob([0.6, 0.3, -0.74], 40.0, 3.0);
@@ -531,14 +532,11 @@ fn environment_lights_keep_energy_and_direction() {
             [300.0, 320.0, 360.0],
         ),
     ];
-    let discs = discs.map(|(c, r, v)| {
-        let l = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
-        (c.map(|x| x / l), r, v)
-    });
+    let discs = discs.map(|(c, r, v)| (Vec3::from(c).normalize(), r, v));
     let radiance = |dir: [f32; 3]| {
         let mut v = [0.4, 0.6, 1.0];
         for (c, r, e) in &discs {
-            let cos = dir[0] * c[0] + dir[1] * c[1] + dir[2] * c[2];
+            let cos = Vec3::from(dir).dot(*c);
             if cos >= r.cos() {
                 v = *e;
             }
@@ -622,7 +620,7 @@ fn environment_lights_keep_energy_and_direction() {
     let half_texel = 0.5 * (4.0 * PI / (n * n) as f32).sqrt();
     for (l, (c, r, e)) in info.lights.iter().zip(&discs) {
         let d = l.direction_to_light;
-        let cos = (d[0] * c[0] + d[1] * c[1] + d[2] * c[2]).min(1.0);
+        let cos = Vec3::from(d).dot(*c).min(1.0);
         assert!(
             cos.acos() <= half_texel,
             "light off its disc by {} rad",
@@ -1050,7 +1048,7 @@ fn gltf_materials_cook_their_canonical_channel_set() {
             "roughness is folded into its texture"
         );
         assert_eq!(m.geometry_opacity, 1.0);
-        let want = 2.0 * ((128.0f32 / 255.0 + 0.055) / 1.055).powf(2.4);
+        let want = 2.0 * orr_color::srgb_decode(128.0 / 255.0) as f32;
         assert!((m.emission_color[1] - want).abs() < 1e-4);
         assert_eq!(m.emission_color[0], 2.0);
         assert_eq!(m.emission_color[2], 0.0);

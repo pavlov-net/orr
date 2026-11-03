@@ -5,10 +5,6 @@ import orr.math;
 import orr.packing;
 import orr.random;
 import orr.sampling;
-import orr.color;
-import orr_color.luminance;
-import orr_color.primaries;
-import orr_color.transfer;
 
 struct Root
 {
@@ -54,13 +50,7 @@ void main(uint3 id: SV_DispatchThreadID)
         + l * ggx_vndf_bounded_pdf(n, l, float2(0.3, 0.5)) * mis_power(u.x, u.y) * mis_balance(u.x, u.y)
         + float(sample_alias(root.aliases, root.alias_count, u.x)) * uniform_sphere_pdf();
 
-    float3 c = mul(REC2020_TO_REC709, mul(P3_TO_REC2020, mul(XYZ_TO_P3, mul(REC709_TO_XYZ, abs(n)))));
-    c = mul(XYZ_TO_REC709, mul(REC2020_TO_XYZ, mul(REC709_TO_REC2020, gamut_compress(c))));
-    c = mul(XYZ_TO_REC2020, mul(P3_TO_XYZ, mul(REC2020_TO_P3, c)));
-    float3 color = srgb_decode(srgb_encode(c)) + pq_decode(pq_encode(c)) + rec2020_from_ictcp(ictcp_from_rec2020(c))
-        + luminance_rec709(c) + luminance_rec2020(c);
-
     float4 hashes = float4(pcg4d(uint4(id, 1))) + float4(r2(id.x), owen_sobol4(id.x, hash_combine(id.y, 3)).xy)
         + float4(unit_float(pcg(id.x)), float(sobol(id.x, 2)), float(nested_uniform_scramble(id.x, 9)), s.next());
-    root.out[id.x] = float4(world + packed + sampled + color, PI) + hashes;
+    root.out[id.x] = float4(world + packed + sampled, PI) + hashes;
 }

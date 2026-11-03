@@ -434,9 +434,9 @@ fn composed_stage_cooks_instancer_cage_skin_and_openpbr() {
         let half_step = DVec3::from(h.extent.map(|e| f64::from(e) / 65535.0 / 2.0));
         let (cell, records) = orr_pack::instance::decode(&head, &bytes).unwrap();
         for (_, m) in records {
-            let col = |c: usize| DVec3::from([0, 1, 2].map(|k| f64::from(m.rows[k][c])));
-            let p = col(3) + DVec3::from(cell.map(f64::from)) * 256.0;
-            placed.push((p, [col(0), col(1), col(2)], half_step));
+            let p = m.translation.as_dvec3() + DVec3::from(cell.map(f64::from)) * 256.0;
+            let axes = [0, 1, 2].map(|c| m.matrix3.col(c).as_dvec3());
+            placed.push((p, axes, half_step));
         }
     }
     assert_eq!(placed.len(), 2, "the invisible id is dropped");

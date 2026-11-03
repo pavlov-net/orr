@@ -3,12 +3,12 @@
 //! sampling.
 
 use bytemuck::{Pod, Zeroable};
-use orr_scene::SceneRoot;
 use orr_scene::orr_gpu::{
     Allocation, CommandList, ComputePipeline, Device, Format, GpuPtr, Hazards, MemoryKind,
     SamplerIndex, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
     TextureUsage, ViewDesc,
 };
+use orr_scene::{AffineRows, SceneRoot};
 
 use crate::shaders::environment::{bake, pyramid};
 use crate::shaders::types::EnvironmentGpu;
@@ -35,7 +35,7 @@ pub struct EnvironmentMapGpu {
     /// The cooked map's `TextureHeader::primaries`; texels convert to Rec.2020 at sampling.
     pub primaries: u32,
     /// Rotates world directions into map space, rows `[R | 0]`.
-    pub from_world: [[f32; 4]; 3],
+    pub from_world: AffineRows,
 }
 
 pub(crate) struct EnvironmentBake {

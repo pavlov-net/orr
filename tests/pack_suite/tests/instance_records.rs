@@ -1,20 +1,20 @@
 //! `orr_pack.instance`'s `decode_instance` on the GPU against `orr_pack::instance::
 //! decode_record`: bit for bit on joined pages, within the GPU's rounding elsewhere.
 
-use glam::{DVec3, Quat, Vec2, Vec3};
 use orr_cook::{
     ArchiveSpec, AssetSpec, Instances, Manifest, MeshInput, Placement, PrototypeSpec, Source,
 };
 use orr_gpu::MemoryKind;
+use orr_math::{DVec3, Quat, Vec2, Vec3};
 use orr_pack::instance::{self, InstancePageHeader, InstancePageInfo, InstanceRecord};
 use orr_pack::material::Material;
-use orr_pack::{Affine3, Archive, Class, Span, Target};
+use orr_pack::{AffineRows, Archive, Class, Span, Target};
 use orr_scene::testing::{assert_clean, device};
 use pack_suite::shaders::instances;
 use pack_suite::{dispatch, read};
 
 /// The GPU decode of every record.
-fn decode_on_gpu(header: &InstancePageHeader, records: &[InstanceRecord]) -> Vec<Affine3> {
+fn decode_on_gpu(header: &InstancePageHeader, records: &[InstanceRecord]) -> Vec<AffineRows> {
     let d = device();
     let mut h = d
         .gpu_malloc::<InstancePageHeader>(MemoryKind::Upload, 1, "header")
@@ -46,7 +46,7 @@ fn decode_on_gpu(header: &InstancePageHeader, records: &[InstanceRecord]) -> Vec
     out.as_slice()
         .unwrap()
         .chunks_exact(3)
-        .map(|m| Affine3 {
+        .map(|m| AffineRows {
             rows: [m[0], m[1], m[2]],
         })
         .collect()
@@ -62,7 +62,7 @@ struct Spread {
 }
 
 impl Spread {
-    fn add(&mut self, header: &InstancePageHeader, gpu: &Affine3, cpu: &Affine3) {
+    fn add(&mut self, header: &InstancePageHeader, gpu: &AffineRows, cpu: &AffineRows) {
         let scale = (0..3)
             .flat_map(|r| (0..3).map(move |c| cpu.rows[r][c].abs()))
             .fold(f32::MIN_POSITIVE, f32::max);
@@ -95,7 +95,7 @@ impl Spread {
 fn check_page(header: &InstancePageHeader, records: &[InstanceRecord], spread: &mut Spread) {
     let gpu = decode_on_gpu(header, records);
     for (g, r) in gpu.iter().zip(records) {
-        spread.add(header, g, &instance::decode_record(header, r));
+        spread.add(header, g, &instance::decode_record(header, r).into());
     }
 }
 
@@ -250,7 +250,7 @@ fn cooked_pages_decode_alike() {
             joined_pages += 1;
             let gpu = decode_on_gpu(&header, &records);
             for (i, (g, r)) in gpu.iter().zip(&records).enumerate() {
-                let cpu = instance::decode_record(&header, r);
+                let cpu = AffineRows::from(instance::decode_record(&header, r));
                 assert_eq!(
                     bytemuck::cast::<_, [u32; 12]>(g.rows),
                     bytemuck::cast::<_, [u32; 12]>(cpu.rows),

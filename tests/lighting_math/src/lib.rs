@@ -9,6 +9,7 @@ use std::ffi::c_void;
 
 use openpbr_ref::fit::Fit;
 use openpbr_ref::{Bsdf, Eval, Inputs, Lobe, Sample, Volume};
+use orr_math::Vec3;
 use shader_math::stats::Rng;
 
 /// `gpu/` compiled to SPIR-V: `bsdf_cases` runs the same calls with heap LUTs.
@@ -365,16 +366,14 @@ pub fn edge_case(rng: &mut Rng, i: usize) -> (Inputs, V3) {
         2 => view[2] = -1e-6,
         _ => {}
     }
-    let len = view.iter().map(|x| x * x).sum::<f32>().sqrt();
-    (inputs, view.map(|x| x / len))
+    (inputs, Vec3::from(view).normalize().to_array())
 }
 
 /// A random light direction, one in four in the surface plane.
 pub fn edge_direction(rng: &mut Rng) -> V3 {
     let wi = rng.unit();
     if rng.next_u32().is_multiple_of(4) {
-        let len = (wi[0] * wi[0] + wi[1] * wi[1]).sqrt();
-        [wi[0] / len, wi[1] / len, 0.0]
+        Vec3::new(wi[0], wi[1], 0.0).normalize().to_array()
     } else {
         wi
     }

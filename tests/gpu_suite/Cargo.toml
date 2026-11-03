@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 orr_gpu.workspace = true
+orr_math.workspace = true
 orr_shaders.workspace = true
 env_logger.workspace = true
 log.workspace = true
@@ -26,7 +27,6 @@ windows = { version = "0.62.2", features = [
 orr_color.workspace = true
 ash.workspace = true
 blake3.workspace = true
-orr_math.workspace = true
 half = { workspace = true, features = ["bytemuck"] }
 
 [build-dependencies]

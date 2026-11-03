@@ -21,13 +21,13 @@ use orr::orr_gpu::{MemoryKind, QueueKind, SpecData, TimelinePoint};
 use orr::orr_pack::Target;
 use orr::orr_pack::material::Material;
 use orr::{
-    Affine3, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
-    InstancesDesc, Lens, LoadState, PackSource, Pose, Projection, Renderer, RendererDesc,
-    SceneDesc, SceneLightingSettings, TextureFilter, TransformGroupDesc, ViewDesc,
+    Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens,
+    LoadState, PackSource, Pose, Projection, Renderer, RendererDesc, SceneDesc,
+    SceneLightingSettings, TextureFilter, TransformGroupDesc, ViewDesc,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSettings, Source};
 use orr_math::camera::rh::view;
-use orr_math::{DVec3, Mat3, UVec2, Vec2, Vec3};
+use orr_math::{Affine3, DVec3, Mat3, UVec2, Vec2, Vec3};
 
 const TREE: &str = "tree";
 const GROUND: &str = "ground";
@@ -167,9 +167,9 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             0.0,
             (z - (SIDE - 1) as f32 * 0.5 + jitter(8)) * SPACING,
         );
-        *t = Affine3::new(Mat3::from_rotation_y(jitter(16) * 6.0), at);
+        *t = Affine3::from_mat3_translation(Mat3::from_rotation_y(jitter(16) * 6.0), at).into();
     }
-    transforms[copies as usize] = Affine3::IDENTITY;
+    transforms[copies as usize] = Affine3::IDENTITY.into();
     w.add_instances(&InstancesDesc {
         model: tree,
         copies,

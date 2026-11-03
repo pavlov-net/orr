@@ -21,7 +21,6 @@ orr_io.workspace = true
 orr_pack.workspace = true
 orr_shaders.workspace = true
 bytemuck.workspace = true
-glam.workspace = true
 orr_math.workspace = true
 half = { workspace = true, features = ["bytemuck"] }
 rustc-hash.workspace = true

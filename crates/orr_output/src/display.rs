@@ -1,14 +1,12 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
+use orr_color::{PQ_MAX_NITS, RgbPrimaries};
 use orr_scene::orr_gpu::{HdrMetadata, OutputFormat, PresentMode};
 
 /// GT7's SDR calibration: SDR paper white and peak, and the default HDR paper white.
 const SDR_WHITE_NITS: f32 = 250.0;
 const DEFAULT_PEAK_NITS: f32 = 1000.0;
-const MAX_NITS: f32 = 10000.0;
-
-const REC2020_PRIMARIES: [[f32; 2]; 3] = [[0.708, 0.292], [0.170, 0.797], [0.131, 0.046]];
-const D65: [f32; 2] = [0.3127, 0.3290];
+const MAX_NITS: f32 = PQ_MAX_NITS as f32;
 
 /// What the consumer asks of a display. Luminance requests (from the consumer's calibration)
 /// override what the OS reports.
@@ -180,9 +178,10 @@ impl ResolvedDisplay {
     /// Mastering metadata for HDR encodings: Rec.2020 primaries, D65, the resolved peak and
     /// black, MaxCLL at the resolved peak, MaxFALL unknown. `None` for SDR.
     pub fn hdr_metadata(&self) -> Option<HdrMetadata> {
+        let p = RgbPrimaries::REC2020;
         (self.encoding != OutputFormat::Sdr).then_some(HdrMetadata {
-            primaries: REC2020_PRIMARIES,
-            white: D65,
+            primaries: [p.red, p.green, p.blue].map(Into::into),
+            white: p.white.into(),
             max_luminance: self.peak_nits,
             min_luminance: self.black_nits,
             max_cll: self.peak_nits,

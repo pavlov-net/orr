@@ -23,16 +23,16 @@ use orr_lighting::{
     LightId, LightingKernels, LightingView, ParticleDraw, PathEntry, ReferenceSettings,
     SceneLighting, SceneLightingSettings, ScenePass, ViewLighting, ViewPass,
 };
-use orr_math::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
+use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
 use orr_pack::{AssetId, Span, Target};
 use orr_scene::testing::{FlipError, Image, Pixels, flip};
 use orr_scene::{
-    Affine3, ClusterTopology, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc,
-    Lens, LoadState, Loading, MaterialGpu, MaterialId, MediumProxy, MediumProxyId, MountId,
-    Opacity, PackSource, ProducerDesc, ProducerId, ProducerUpdate, Projection, RasterView,
-    RendererDesc, SceneCompute, SceneDesc, SceneId, Scenes, TextureFilter, TransformGroupDesc,
-    TransformGroupId, ViewArena, ViewDesc, ViewHistoryId, VolumeRef, material_flags,
+    ClusterTopology, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens,
+    LoadState, Loading, MaterialGpu, MaterialId, MediumProxy, MediumProxyId, MountId, Opacity,
+    PackSource, ProducerDesc, ProducerId, ProducerUpdate, Projection, RasterView, RendererDesc,
+    SceneCompute, SceneDesc, SceneId, Scenes, TextureFilter, TransformGroupDesc, TransformGroupId,
+    ViewArena, ViewDesc, ViewHistoryId, VolumeRef, material_flags,
 };
 use orr_shaders::bytemuck::Zeroable;
 
@@ -395,8 +395,7 @@ fn plume() -> AssetSpec {
 /// The water box's transmission color over 1 m in the linear Rec.2020 the kernels work in.
 pub fn water_transmission() -> [f64; 3] {
     let color = WATER_SIGMA.map(|s| f64::from(-s).exp());
-    let m = orr_color::RgbPrimaries::REC709.matrix_to(orr_color::RgbPrimaries::REC2020);
-    (m * DVec3::from(color)).to_array()
+    orr_color::rec709_to_rec2020(color).to_array()
 }
 
 /// A smooth dielectric's dense scattering interior, per m in Rec.709.
@@ -425,12 +424,12 @@ impl DenseInterior {
     /// Extinction and single-scattering albedo in linear Rec.2020, as the cook converts the
     /// material's colors.
     pub fn rec2020(&self) -> (DVec3, DVec3) {
-        let m = orr_color::RgbPrimaries::REC709.matrix_to(orr_color::RgbPrimaries::REC2020);
+        use orr_color::rec709_to_rec2020;
         let d = f64::from(self.depth);
         let color = DVec3::from(self.sigma_t.map(|s| (f64::from(-s) * d).exp()));
         let scatter = DVec3::from(self.sigma_s.map(|s| f64::from(s) * d));
-        let extinction = DVec3::from((m * color).to_array().map(|c| -c.ln() / d));
-        (extinction, (m * scatter) / d / extinction)
+        let extinction = DVec3::from(rec709_to_rec2020(color).to_array().map(|c| -c.ln() / d));
+        (extinction, rec709_to_rec2020(scatter) / d / extinction)
     }
 }
 
@@ -1148,9 +1147,7 @@ fn time(frame: u64) -> FrameTime {
 
 /// World from view for a camera at `eye` looking at `target`, y up.
 pub fn look(eye: Vec3, target: Vec3) -> Quat {
-    let back = (eye - target).normalize();
-    let right = Vec3::Y.cross(back).normalize();
-    Quat::from_mat3(&Mat3::from_cols(right, back.cross(right), back))
+    orr_math::camera::rh::view::look_at_quat(eye, target, Vec3::Y).inverse()
 }
 
 /// The image point, in pixels from the top left, where `spec`'s camera sees `p`.
@@ -1499,11 +1496,7 @@ impl Bed {
                     sampler: linear_clamp(),
                     intensity: 1.0,
                     primaries: orr_color::Primaries::Rec2020.id().into(),
-                    from_world: [
-                        [1.0, 0.0, 0.0, 0.0],
-                        [0.0, 1.0, 0.0, 0.0],
-                        [0.0, 0.0, 1.0, 0.0],
-                    ],
+                    from_world: Affine3::IDENTITY.into(),
                 }],
                 "bed environment data",
             );
@@ -1536,7 +1529,8 @@ impl Bed {
             })
             .unwrap();
         for (i, (c, &model)) in spec.copies.iter().zip(&models).enumerate() {
-            w.transforms(group, i as u32, 1).unwrap()[0] = Affine3::new(c.linear, c.at);
+            w.transforms(group, i as u32, 1).unwrap()[0] =
+                Affine3::from_mat3_translation(c.linear, c.at).into();
             w.add_instances(&InstancesDesc {
                 model,
                 copies: 1,
@@ -1558,7 +1552,7 @@ impl Bed {
                 anchor: DVec3::ZERO,
             })
             .unwrap();
-        w.transforms(particle_group, 0, 1).unwrap()[0] = Affine3::IDENTITY;
+        w.transforms(particle_group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
         for (i, l) in spec.lights.iter().enumerate() {
             w.set_light(LightId(i as u32), Some(l)).unwrap();
         }

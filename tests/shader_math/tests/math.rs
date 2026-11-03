@@ -1,4 +1,5 @@
-use orr_math::{Affine3A, Mat3, Quat, Vec3};
+use orr_math::{Affine3, Mat3, Quat, Vec3};
+use orr_pack::AffineRows;
 use shader_math::stats::Rng;
 use shader_math::*;
 
@@ -8,26 +9,11 @@ fn close(a: &[f32], b: &[f32], tol: f32) -> bool {
         .all(|(x, y)| (x - y).abs() <= tol * (1.0 + y.abs()))
 }
 
-fn rows(m: &Affine3A) -> [f32; 12] {
-    let r = Mat3::from(m.matrix3);
-    let t = m.translation;
-    [
-        r.row(0).x,
-        r.row(0).y,
-        r.row(0).z,
-        t.x,
-        r.row(1).x,
-        r.row(1).y,
-        r.row(1).z,
-        t.y,
-        r.row(2).x,
-        r.row(2).y,
-        r.row(2).z,
-        t.z,
-    ]
+fn rows(m: &Affine3) -> [f32; 12] {
+    bytemuck::cast(AffineRows::from(*m).rows)
 }
 
-fn random_affine(rng: &mut Rng) -> Affine3A {
+fn random_affine(rng: &mut Rng) -> Affine3 {
     let q = Quat::from_array([
         rng.range(-1.0, 1.0),
         rng.range(-1.0, 1.0),
@@ -48,7 +34,7 @@ fn random_affine(rng: &mut Rng) -> Affine3A {
         rng.range(-100.0, 100.0),
         rng.range(-100.0, 100.0),
     );
-    Affine3A::from_scale_rotation_translation(scale, q, t)
+    Affine3::from_scale_rotation_translation(scale, q, t)
 }
 
 #[test]
@@ -129,7 +115,7 @@ fn quaternions_and_affines_match_glam() {
             1e-5
         ));
         let n = Vec3::from(rng.unit());
-        let want = (Mat3::from(a.matrix3).inverse().transpose() * n).normalize();
+        let want = (a.matrix3.inverse().transpose() * n).normalize();
         assert!(
             close(&transform_normal(ra, n.into()), &want.to_array(), 1e-4),
             "{a:?} {n}"

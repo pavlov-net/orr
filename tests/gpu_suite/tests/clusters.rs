@@ -17,6 +17,7 @@ use orr_gpu::{
     MicromapTriangle, MicromapUsage, OmmFormat, PageBind, RtasFlags, RtasLimits, RtasMode, RtasOp,
     RtasOpDesc, ShaderStage, SpecData, Stages, Tlas,
 };
+use orr_math::Vec2;
 
 /// The reference of a front instance over every cluster but the last and a back instance
 /// over the last.
@@ -628,11 +629,11 @@ fn lss_reference(front: &RefInst, segs: &[Segment], x: u32, y: u32) -> Option<Wa
     };
     let p = [(x as f32 + 0.5) / W as f32, (y as f32 + 0.5) / H as f32];
     for (i, s) in segs.iter().enumerate() {
-        let d = [s.b[0] - s.a[0], s.b[1] - s.a[1]];
-        let len = (d[0] * d[0] + d[1] * d[1]).sqrt();
-        let u = ((p[0] - s.a[0]) * d[0] + (p[1] - s.a[1]) * d[1]) / (len * len);
-        let q = [s.a[0] + u * d[0] - p[0], s.a[1] + u * d[1] - p[1]];
-        let dist = (q[0] * q[0] + q[1] * q[1]).sqrt();
+        let (a, b) = (Vec2::from(s.a), Vec2::from(s.b));
+        let d = b - a;
+        let len = d.length();
+        let u = (Vec2::from(p) - a).dot(d) / (len * len);
+        let dist = (a + u * d - Vec2::from(p)).length();
         let near_end = (u * len).abs() < LSS_EDGE || ((u - 1.0) * len).abs() < LSS_EDGE;
         let inside = (0.0..=1.0).contains(&u);
         if (near_end && dist < s.r + LSS_EDGE) || (inside && (dist - s.r).abs() < LSS_EDGE) {

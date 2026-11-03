@@ -23,15 +23,15 @@ use orr::orr_gpu::{QueueKind, SpecData, TimelinePoint};
 use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    Affine3, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
-    InstancesDesc, Lens, PackSource, Projection, Renderer, RendererDesc, SceneDesc,
-    SceneLightingSettings, SkinnedDesc, TextureFilter, TransformGroupDesc, ViewDesc,
+    Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens,
+    PackSource, Projection, Renderer, RendererDesc, SceneDesc, SceneLightingSettings, SkinnedDesc,
+    TextureFilter, TransformGroupDesc, ViewDesc,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, LodMode, Manifest, MeshInput, MeshSettings, Source,
 };
 use orr_math::camera::rh::view;
-use orr_math::{DVec3, Mat3, UVec2, Vec2, Vec3};
+use orr_math::{Affine3, DVec3, Mat3, UVec2, Vec2, Vec3};
 
 const CREATURE: &str = "tentacle";
 const GROUND: &str = "ground";
@@ -148,9 +148,10 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             (z - (SIDE - 1) as f32 * 0.5 + 0.6 * jitter(8)) * SPACING,
         );
         let scale = 0.8 + 0.4 * (jitter(24) + 0.5);
-        *t = Affine3::new(Mat3::from_rotation_y(jitter(16) * 6.0) * scale, at);
+        *t = Affine3::from_mat3_translation(Mat3::from_rotation_y(jitter(16) * 6.0) * scale, at)
+            .into();
     }
-    transforms[copies as usize] = Affine3::new(Mat3::IDENTITY, Vec3::ZERO);
+    transforms[copies as usize] = Affine3::IDENTITY.into();
     w.add_skinned(&SkinnedDesc {
         model: tentacle,
         copies,

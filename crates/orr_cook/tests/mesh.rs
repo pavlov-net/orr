@@ -204,10 +204,6 @@ fn key(section: u8, p: [[f32; 3]; 3]) -> (TriKey, usize) {
     )
 }
 
-fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-    Vec3::from(a).dot(Vec3::from(b))
-}
-
 /// Cooks the fixture at a scale and checks the grid, clusters, attributes and materials
 /// against values computed here from the source.
 fn check_fixture(scale: f32, translation: [f32; 3]) {
@@ -363,10 +359,10 @@ fn check_fixture(scale: f32, translation: [f32; 3]) {
                 let corners = [corners[r], corners[(r + 1) % 3], corners[(r + 2) % 3]];
                 for (&v, &src_v) in corners.iter().zip(&verts) {
                     let (p, sv) = (&prims[sec], src_v as usize);
-                    assert!(dot(view.normal(&c, v), p.nrm[sv]) > 0.99999);
+                    assert!(Vec3::from(view.normal(&c, v)).dot(Vec3::from(p.nrm[sv])) > 0.99999);
                     let tan = view.tangent(&c, v).unwrap();
                     let st = p.tan[sv];
-                    assert!(dot([tan[0], tan[1], tan[2]], [st[0], st[1], st[2]]) > 0.99999);
+                    assert!(Vec3::from_slice(&tan).dot(Vec3::from_slice(&st)) > 0.99999);
                     assert_eq!(tan[3], st[3]);
                     let uv = view.uv(&c, v, 0);
                     for ((got, want), scale) in uv.iter().zip(p.uv[sv]).zip(c.uv_scale[0]) {

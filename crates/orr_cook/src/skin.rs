@@ -20,8 +20,7 @@
 
 use std::collections::HashMap;
 
-use orr_math::{Mat3, Mat4, Quat, Vec3};
-use orr_pack::Affine3;
+use orr_math::{Affine3, Mat3, Mat4, Quat};
 use orr_pack::AssetId;
 use orr_pack::clip::{Clip, ClipHeader};
 use orr_pack::skeleton::{MAX_JOINTS, NO_PARENT, SkeletonInfo, Trs, slerp};
@@ -163,7 +162,7 @@ impl Skeleton {
                 .copied()
                 .unwrap_or_else(|| graph.world[n].inverse());
             inverse_binds.push(ib);
-            info.inverse_binds.push(affine(&ib));
+            info.inverse_binds.push(Affine3::from_mat4(ib));
             info.names.push(node.name().unwrap_or_default().to_string());
         }
         let skins = skins
@@ -443,16 +442,18 @@ fn span(channels: &[Channel]) -> (f64, f64) {
 /// rotations are their linear parts with normalized columns.
 fn pose_error(a: &Affine3, b: &Affine3) -> (f32, f32) {
     let rot = |m: &Affine3| {
-        Mat3::from_cols_array_2d(&[0, 1, 2].map(|c| {
-            Vec3::from([0, 1, 2].map(|r| m.rows[r][c]))
-                .normalize_or_zero()
-                .to_array()
-        }))
+        Mat3::from_cols(
+            m.matrix3.x_axis.normalize_or_zero(),
+            m.matrix3.y_axis.normalize_or_zero(),
+            m.matrix3.z_axis.normalize_or_zero(),
+        )
     };
     let d = rot(a).transpose() * rot(b);
     let cos = ((d.x_axis.x + d.y_axis.y + d.z_axis.z - 1.0) / 2.0).clamp(-1.0, 1.0);
-    let t = |m: &Affine3| Vec3::from([0, 1, 2].map(|r| m.rows[r][3]));
-    (t(a).distance(t(b)), cos.acos().to_degrees())
+    (
+        a.translation.distance(b.translation),
+        cos.acos().to_degrees(),
+    )
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -583,12 +584,6 @@ pub(crate) fn close(a: &Mat4, b: &Mat4) -> bool {
         .iter()
         .zip(b.to_cols_array())
         .all(|(x, y)| (x - y).abs() <= tol)
-}
-
-pub(crate) fn affine(m: &Mat4) -> Affine3 {
-    Affine3 {
-        rows: std::array::from_fn(|i| m.row(i).to_array()),
-    }
 }
 
 /// One `JOINTS_n`/`WEIGHTS_n` pair of a primitive.

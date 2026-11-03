@@ -1,6 +1,7 @@
 //! Mip chains in linear float: separable box or Kaiser downsampling, per atlas cell where
 //! cells allow, normal renormalization, alpha-coverage scaling and Toksvig roughness.
 
+use orr_math::Vec3;
 use orr_pack::texture::mip_size;
 use rayon::prelude::*;
 
@@ -71,9 +72,10 @@ fn cell_mip(w: u32, h: u32, [gx, gy]: [u32; 2]) -> bool {
 }
 
 pub(crate) fn normalized(p: [f32; 4]) -> [f32; 4] {
-    let l = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+    let n = Vec3::from_slice(&p);
+    let l = n.length();
     if l > 0.0 {
-        [p[0] / l, p[1] / l, p[2] / l, p[3]]
+        (n / l).extend(p[3]).to_array()
     } else {
         [0.0, 0.0, 1.0, p[3]]
     }
@@ -616,9 +618,7 @@ impl Toksvig {
         let raw = raw_chain(base, &normal_spec, chain.len() as u32);
         for (m, n) in chain.iter_mut().zip(&raw).skip(first) {
             m.px.par_iter_mut().zip(&n.px).for_each(|(p, v)| {
-                let r = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
-                    .sqrt()
-                    .clamp(1e-4, 1.0);
+                let r = Vec3::from_slice(v).length().clamp(1e-4, 1.0);
                 let var = (1.0 - r) / r;
                 let rough = p[self.channel].clamp(0.0, 1.0);
                 p[self.channel] = (rough.powi(4) + 2.0 * var).powf(0.25).min(1.0);

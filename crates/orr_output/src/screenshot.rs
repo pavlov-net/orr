@@ -4,7 +4,8 @@ use std::fs::File;
 use std::io::{self, BufWriter};
 use std::path::Path;
 
-use orr_color::{pq_encode, srgb_encode};
+use orr_color::{Chromaticity, PQ_MAX_NITS, Primaries, RgbPrimaries, pq_encode, srgb_encode};
+use orr_math::DVec3;
 
 /// A capture of one view, made in the frame that asks for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,13 +15,6 @@ pub enum ScreenshotRequest {
     /// After `hooks.scene_referred`, before camera effects: absolute luminance in cd/m2,
     /// linear Rec.2020, or Rec.709 with `rec709`. EXR only.
     SceneReferred { rec709: bool },
-}
-
-/// The primaries of a capture's linear RGB; both use the D65 white.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Primaries {
-    Rec709,
-    Rec2020,
 }
 
 /// A captured image, read back one to three frames after the frame it holds.
@@ -82,10 +76,12 @@ impl Screenshot {
     pub fn save_png_pq(&self, path: &Path) -> io::Result<()> {
         self.display_only("PQ PNG")?;
         let pw = f64::from(self.paper_white_nits);
+        let to_rec2020 = self.primaries.rgb().matrix_to(RgbPrimaries::REC2020);
         let nits: Vec<[f64; 3]> = self
             .pixels()
             .map(|p| {
-                mul(&REC709_TO_REC2020, p.map(f64::from)).map(|c| (c * pw).clamp(0.0, 10000.0))
+                let rec2020 = to_rec2020 * DVec3::from(p.map(f64::from));
+                rec2020.to_array().map(|c| (c * pw).clamp(0.0, PQ_MAX_NITS))
             })
             .collect();
         let data: Vec<u8> = nits
@@ -122,16 +118,13 @@ impl Screenshot {
             (p[0], p[1], p[2])
         });
         let mut image = Image::from_channels((w, h), channels);
-        let (r, g, b) = match self.primaries {
-            Primaries::Rec709 => ([0.64, 0.33], [0.30, 0.60], [0.15, 0.06]),
-            Primaries::Rec2020 => ([0.708, 0.292], [0.170, 0.797], [0.131, 0.046]),
-        };
-        let xy = |c: [f32; 2]| Vec2(c[0], c[1]);
+        let p = self.primaries.rgb();
+        let xy = |c: Chromaticity| Vec2(c.x as f32, c.y as f32);
         image.attributes.chromaticities = Some(exr::meta::attribute::Chromaticities {
-            red: xy(r),
-            green: xy(g),
-            blue: xy(b),
-            white: xy([0.3127, 0.3290]),
+            red: xy(p.red),
+            green: xy(p.green),
+            blue: xy(p.blue),
+            white: xy(p.white),
         });
         image.layer_data.attributes.white_luminance = Some(if self.scene_referred {
             1.0
@@ -191,26 +184,4 @@ fn pq_icc_profile() -> io::Result<Vec<u8>> {
         full_range: true,
     });
     profile.encode().map_err(io::Error::other)
-}
-
-const REC709_TO_REC2020: [[f64; 3]; 3] = [
-    [
-        0.627_403_895_934_699,
-        0.329_283_038_377_884,
-        0.043_313_065_687_417,
-    ],
-    [
-        0.069_097_289_358_232,
-        0.919_540_395_075_458,
-        0.011_362_315_566_310,
-    ],
-    [
-        0.016_391_438_875_150,
-        0.088_013_307_877_226,
-        0.895_595_253_247_624,
-    ],
-];
-
-fn mul(m: &[[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
-    m.map(|r| r[0] * v[0] + r[1] * v[1] + r[2] * v[2])
 }

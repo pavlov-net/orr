@@ -1,48 +1,10 @@
-//! Chromaticities, RGB primaries and the matrices between RGB spaces and CIE XYZ.
+//! RGB primaries and the matrices between RGB spaces and CIE XYZ.
 
-use orr_math::{DMat3, DVec2, DVec3};
+use std::sync::LazyLock;
 
-/// A CIE 1931 xy chromaticity.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct Chromaticity {
-    pub x: f64,
-    pub y: f64,
-}
+use orr_math::{DMat3, DVec3};
 
-impl Chromaticity {
-    /// CIE standard illuminant D65, the white of Rec.709, Display P3 and Rec.2020.
-    pub const D65: Self = Self::new(0.3127, 0.3290);
-    /// The ACES white, close to CIE illuminant D60.
-    pub const D60: Self = Self::new(0.32168, 0.33767);
-
-    pub const fn new(x: f64, y: f64) -> Self {
-        Self { x, y }
-    }
-
-    /// The chromaticity of a CIE XYZ color.
-    pub fn from_xyz(xyz: DVec3) -> Self {
-        let s = xyz.element_sum();
-        Self::new(xyz.x / s, xyz.y / s)
-    }
-
-    /// CIE XYZ of this chromaticity at luminance (Y) `luminance`.
-    pub const fn to_xyz(self, luminance: f64) -> DVec3 {
-        let s = luminance / self.y;
-        DVec3::new(self.x * s, luminance, (1.0 - self.x - self.y) * s)
-    }
-}
-
-/// CIE 1976 u'v' chromaticity of a CIE XYZ color.
-pub fn uv(xyz: impl Into<DVec3>) -> DVec2 {
-    let xyz = xyz.into();
-    let d = xyz.x + 15.0 * xyz.y + 3.0 * xyz.z;
-    DVec2::new(4.0 * xyz.x / d, 9.0 * xyz.y / d)
-}
-
-/// Distance between the u'v' chromaticities of two CIE XYZ colors.
-pub fn delta_uv(a: impl Into<DVec3>, b: impl Into<DVec3>) -> f64 {
-    uv(a).distance(uv(b))
-}
+use crate::Chromaticity;
 
 /// The chromaticities of an RGB space's primaries and of its white, the color of
 /// `(1, 1, 1)`.
@@ -108,6 +70,13 @@ impl RgbPrimaries {
     }
 }
 
+/// Linear Rec.709 to linear Rec.2020.
+pub fn rec709_to_rec2020(rec709: impl Into<DVec3>) -> DVec3 {
+    static MATRIX: LazyLock<DMat3> =
+        LazyLock::new(|| RgbPrimaries::REC709.matrix_to(RgbPrimaries::REC2020));
+    *MATRIX * rec709.into()
+}
+
 /// The Bradford chromatic adaptation from white `src` to white `dst`, on CIE XYZ.
 fn bradford(src: Chromaticity, dst: Chromaticity) -> DMat3 {
     let cone = DMat3::from_rows(
@@ -115,12 +84,22 @@ fn bradford(src: Chromaticity, dst: Chromaticity) -> DMat3 {
         DVec3::new(-0.7502, 1.7135, 0.0367),
         DVec3::new(0.0389, -0.0685, 1.0296),
     );
+    adaptation(cone, src, dst)
+}
+
+/// Full adaptation from white `src` to white `dst` in the cone space `cone`, on CIE XYZ.
+pub(crate) fn adaptation(cone: DMat3, src: Chromaticity, dst: Chromaticity) -> DMat3 {
     let gain = (cone * dst.to_xyz(1.0)) / (cone * src.to_xyz(1.0));
     cone.inverse() * DMat3::from_diagonal(gain) * cone
 }
 
 /// The primaries ids stored in cooked textures.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
 #[repr(u8)]
 pub enum Primaries {
     Rec709 = 0,
@@ -252,5 +231,13 @@ mod tests {
         let d65 = Chromaticity::D65;
         let want = format!("D65_XY = float2({:?}, {:?});", d65.x as f32, d65.y as f32);
         assert!(SLANG.contains(&want), "{want}");
+        for (name, p) in [
+            ("REC709", Primaries::Rec709),
+            ("DISPLAY_P3", Primaries::DisplayP3),
+            ("REC2020", Primaries::Rec2020),
+        ] {
+            let want = format!("PRIMARIES_{name} = {};", p.id());
+            assert!(SLANG.contains(&want), "{want}");
+        }
     }
 }

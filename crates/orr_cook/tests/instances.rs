@@ -8,9 +8,9 @@ use orr_cook::{
     ArchiveSpec, AssemblySettings, AssetSpec, Error, GltfSettings, Instances, Manifest, Placement,
     PrototypeSpec, SectionSpec, Source,
 };
-use orr_math::{DVec3, Quat, Vec3};
+use orr_math::{DVec3, Mat3, Quat, Vec3};
 use orr_pack::instance::{self, InstancePageInfo, InstanceRecord};
-use orr_pack::{Archive, AssetId, Class, Entry, Target};
+use orr_pack::{AffineRows, Archive, AssetId, Class, Entry, Target};
 
 struct Rng(u64);
 impl Rng {
@@ -100,9 +100,8 @@ fn rotation(rng: &mut Rng) -> Quat {
 
 /// Angle between a rotation and the rotation of a decoded linear part, its columns
 /// normalized to take out the scale.
-fn angle_deg(a: Quat, rows: [[f32; 4]; 3]) -> f64 {
-    let col =
-        |c: usize| DVec3::new(rows[0][c].into(), rows[1][c].into(), rows[2][c].into()).normalize();
+fn angle_deg(a: Quat, linear: Mat3) -> f64 {
+    let col = |c: usize| linear.col(c).as_dvec3().normalize();
     let m = orr_math::DMat3::from_cols(col(0), col(1), col(2));
     a.as_dquat()
         .normalize()
@@ -216,22 +215,20 @@ fn fixture_page_decodes_within_its_error_bounds() {
         assert_eq!(prototype, p.prototype);
         for a in 0..3 {
             let want = p.position[a] - corner[a];
-            let err = (f64::from(m.rows[a][3]) - want).abs();
+            let got = m.translation[a];
+            let err = (f64::from(got) - want).abs();
             assert!(
-                err <= step[a] * 0.5 + f64::from(ulp(m.rows[a][3])),
+                err <= step[a] * 0.5 + f64::from(ulp(got)),
                 "axis {a}: {err} m"
             );
         }
-        let decoded_scale =
-            Vec3::from_array([0, 1, 2].map(|c| {
-                (m.rows[0][c].powi(2) + m.rows[1][c].powi(2) + m.rows[2][c].powi(2)).sqrt()
-            }));
+        let decoded_scale = Vec3::from_array([0, 1, 2].map(|c| m.matrix3.col(c).length()));
         for a in 0..3 {
             let rel = (f64::from(decoded_scale[a]) / f64::from(p.scale[a]) - 1.0).abs();
             assert!(rel <= scale_half_step.exp2() - 1.0 + 1e-5, "scale {rel}");
             assert!(rel <= 0.002, "scale {rel}");
         }
-        let err = angle_deg(Quat::from_array(p.rotation), m.rows);
+        let err = angle_deg(Quat::from_array(p.rotation), m.matrix3);
         assert!(err <= 0.17, "rotation {err} deg");
         if raw[k].exact_axis() {
             assert!(err < 1e-4);
@@ -294,12 +291,7 @@ fn cells_split_placements_and_large_cells_split_into_pages() {
         let (cell, decoded) = instance::decode(&head, &recs).unwrap();
         let corner = DVec3::from(cell.map(f64::from)) * 256.0;
         for (_, m) in decoded {
-            let world = corner
-                + DVec3::new(
-                    m.rows[0][3].into(),
-                    m.rows[1][3].into(),
-                    m.rows[2][3].into(),
-                );
+            let world = corner + m.translation.as_dvec3();
             assert_eq!((world / 256.0).floor().as_ivec3().to_array(), cell);
         }
     }
@@ -338,12 +330,12 @@ fn joined_pages_decode_exactly() {
     assert_eq!(cell, [0, 0, -1]);
     let corner = DVec3::new(0.0, 0.0, -256.0);
     let mut got: Vec<[u32; 12]> = decoded
-        .map(|(_, m)| bytemuck::cast::<[[f32; 4]; 3], [u32; 12]>(m.rows))
+        .map(|(_, m)| bytemuck::cast::<[[f32; 4]; 3], [u32; 12]>(AffineRows::from(m).rows))
         .collect();
     let mut want: Vec<[u32; 12]> = records
         .iter()
         .map(|p| {
-            let r = orr_math::Mat3::from_quat(Quat::from_array(p.rotation));
+            let r = Mat3::from_quat(Quat::from_array(p.rotation));
             let t = DVec3::from(p.position) - corner;
             let rows = [0, 1, 2].map(|i| {
                 // + 0.0 turns the rounded -0.0 entries into the 0.0 the decode writes.
@@ -560,12 +552,7 @@ fn assemblies_place_their_units_through_instance_sources() {
                 assert_eq!(sections.len(), 1);
                 assert_eq!(sections[0].material, AssetId::from_name("paint"));
                 assert_eq!(sections[0].hidden, 0);
-                let t = DVec3::new(
-                    m.rows[0][3].into(),
-                    m.rows[1][3].into(),
-                    m.rows[2][3].into(),
-                );
-                found.push((t + corner).as_vec3());
+                found.push((m.translation.as_dvec3() + corner).as_vec3());
             }
         }
         assert_eq!(body, if sheet { placements.len() } else { 0 });

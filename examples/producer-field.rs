@@ -21,12 +21,12 @@ use orr::orr_gpu::{
 use orr::orr_output::Image;
 use orr::orr_pack::material::Material;
 use orr::{
-    Affine3, BoundTexture, ClusterTopology, Display, DisplayRequest, FrameDesc, FrameTime,
-    GroupWriter, Lens, MaterialGpu, ProducerId, Projection, Renderer, RendererDesc, SceneDesc,
+    BoundTexture, ClusterTopology, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter,
+    Lens, MaterialGpu, ProducerId, Projection, Renderer, RendererDesc, SceneDesc,
     SceneLightingSettings, TextureFilter, TransformGroupDesc, ViewDesc,
 };
 use orr_math::camera::rh::view;
-use orr_math::{DVec3, UVec2, Vec2, Vec3};
+use orr_math::{Affine3, DVec3, UVec2, Vec2, Vec3};
 
 use examples::Capture;
 
@@ -196,7 +196,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             anchor: DVec3::ZERO,
         })
         .expect("transform group");
-    w.transforms(group, 0, 1).expect("transforms")[0] = Affine3::IDENTITY;
+    w.transforms(group, 0, 1).expect("transforms")[0] = Affine3::IDENTITY.into();
     let (soil, blades, water_material) = ([soil], [blades], [water_material]);
     w.set_producer(
         TERRAIN,

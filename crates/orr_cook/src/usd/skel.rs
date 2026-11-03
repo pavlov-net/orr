@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 
 use openusd::usd;
-use orr_math::{DMat4, DQuat, DVec3};
+use orr_math::{Affine3, DMat4, DQuat, DVec3};
 use orr_pack::clip::Clip;
 use orr_pack::skeleton::{MAX_JOINTS, NO_PARENT, SkeletonInfo, Trs};
 
@@ -114,8 +114,9 @@ impl Skel {
             };
             info.rest
                 .push(trs(local, &|| format!("{path} joint {}", joints[i]))?);
-            info.inverse_binds
-                .push(skin::affine(&(to_model * binds[i]).inverse().as_mat4()));
+            info.inverse_binds.push(Affine3::from_mat4(
+                (to_model * binds[i]).inverse().as_mat4(),
+            ));
         }
         Ok(Self {
             info,

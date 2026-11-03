@@ -5,6 +5,7 @@
 // its value on average.
 module spectrum;
 
+import orr_color.chromaticity;
 import orr_color.primaries;
 import orr.openpbr;
 
@@ -19,21 +20,6 @@ public static const float3x3 SPECTRUM_TO_REC2020 = float3x3(
     1.151455483e-02, -3.223699765e-03, -2.811293073e-04,
     -3.931714443e-03, 1.422114913e-02, -5.150260166e-05,
     -3.080867227e-04, -8.290504610e-04, 1.145013428e-02);
-
-float lobe(float x, float mean, float below, float above)
-{
-    float t = (x - mean) / (x < mean ? below : above);
-    return exp(-0.5 * t * t);
-}
-
-// The CIE 1931 2-deg color matching functions at `nm`.
-public float3 cie_xyz(float nm)
-{
-    float x = 1.056 * lobe(nm, 599.8, 37.9, 31.0) + 0.362 * lobe(nm, 442.0, 16.0, 26.7) - 0.065 * lobe(nm, 501.1, 20.4, 26.2);
-    float y = 0.821 * lobe(nm, 568.8, 46.9, 40.5) + 0.286 * lobe(nm, 530.9, 16.3, 31.1);
-    float z = 1.217 * lobe(nm, 437.0, 11.8, 36.0) + 0.681 * lobe(nm, 459.0, 26.0, 13.8);
-    return float3(x, y, z);
-}
 
 // The Rec.2020 color matching functions at `nm`.
 public float3 spectrum_rec2020(float nm)

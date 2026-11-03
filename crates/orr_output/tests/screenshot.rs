@@ -4,17 +4,12 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 
-use orr_color::{pq_decode, pq_encode, srgb_encode};
+use orr_color::{PQ_MAX_NITS, RgbPrimaries, pq_decode, pq_encode, rec709_to_rec2020, srgb_encode};
+use orr_math::Vec3;
 use orr_output::{Primaries, Screenshot};
 
 const W: u32 = 100;
 const H: u32 = 100;
-
-const REC709_TO_REC2020: [[f64; 3]; 3] = [
-    [0.627_403_9, 0.329_283_0, 0.043_313_1],
-    [0.069_097_3, 0.919_540_4, 0.011_362_3],
-    [0.016_391_4, 0.088_013_3, 0.895_595_3],
-];
 
 fn path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -65,10 +60,9 @@ fn rec2020_nits(shot: &Screenshot) -> Vec<[f64; 3]> {
     shot.rgba
         .chunks_exact(4)
         .map(|p| {
-            REC709_TO_REC2020.map(|r| {
-                let c = r[0] * f64::from(p[0]) + r[1] * f64::from(p[1]) + r[2] * f64::from(p[2]);
-                (c * pw).clamp(0.0, 10000.0)
-            })
+            rec709_to_rec2020(Vec3::from_slice(p))
+                .to_array()
+                .map(|c| (c * pw).clamp(0.0, PQ_MAX_NITS))
         })
         .collect()
 }
@@ -182,7 +176,11 @@ fn exr_holds_scene_referred_nits() {
         shot.rgba
     );
     let chroma = image.attributes.chromaticities.unwrap();
-    assert_eq!((chroma.red.0, chroma.red.1), (0.708, 0.292));
-    assert_eq!((chroma.white.0, chroma.white.1), (0.3127, 0.3290));
+    let (red, white) = (RgbPrimaries::REC2020.red, RgbPrimaries::REC2020.white);
+    assert_eq!((chroma.red.0, chroma.red.1), (red.x as f32, red.y as f32));
+    assert_eq!(
+        (chroma.white.0, chroma.white.1),
+        (white.x as f32, white.y as f32)
+    );
     assert_eq!(image.layer_data.attributes.white_luminance, Some(1.0));
 }

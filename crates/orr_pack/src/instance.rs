@@ -15,9 +15,10 @@
 //! [`decode`] is the reference both for the GPU decode and for consumers' CPU queries.
 
 use bytemuck::{Pod, Zeroable};
+use orr_math::{Affine3, DMat3, DQuat, DVec4, Mat3, Quat, Vec3};
 
 use crate::blob::{put_table, read, table};
-use crate::{Affine3, AssetId, Error, Result, Span};
+use crate::{AssetId, Error, Result, Span};
 
 pub const SCHEMA: u16 = 1;
 
@@ -198,18 +199,20 @@ pub fn decode<'a>(
     ))
 }
 
-/// Cell-relative transform of one record: rows `[R * diag(scale) | translation]`, the x
-/// scale negative on a mirrored record.
+/// Cell-relative transform of one record: `R * diag(scale)` and the translation, the x scale
+/// negative on a mirrored record.
 pub fn decode_record(h: &InstancePageHeader, r: &InstanceRecord) -> Affine3 {
-    let t = decode_position(h, r.pos);
     let mut s = r.scale_codes().map(|c| decode_scale(h, c));
     if r.mirror() {
         s[0] = -s[0];
     }
     let m = instance_rotation(r.rot, r.exact_axis());
-    Affine3 {
-        rows: [0, 1, 2].map(|i| [m[i][0] * s[0], m[i][1] * s[1], m[i][2] * s[2], t[i]]),
-    }
+    Affine3::from_cols(
+        m.x_axis * s[0],
+        m.y_axis * s[1],
+        m.z_axis * s[2],
+        Vec3::from(decode_position(h, r.pos)),
+    )
 }
 
 pub fn decode_position(h: &InstancePageHeader, pos: [u16; 3]) -> [f32; 3] {
@@ -244,9 +247,8 @@ pub fn decode_rotation(r: u32) -> [f32; 4] {
 /// Smallest-three code of a rotation (x, y, z, w; any length but zero, either sign): of the
 /// codes nearest the stored components, the one whose decode is closest to `q`.
 pub fn encode_rotation(q: [f32; 4]) -> u32 {
-    let q = q.map(f64::from);
-    let len = q.iter().map(|c| c * c).sum::<f64>().sqrt();
-    let q = q.map(|c| c / len);
+    let q = DVec4::from(q.map(f64::from));
+    let q = (q / q.length()).to_array();
     let largest = (0..4)
         .rev()
         .max_by(|&a, &b| q[a].abs().total_cmp(&q[b].abs()))
@@ -284,10 +286,10 @@ const AXIS_PERMUTATIONS: [[usize; 3]; 6] = [
 ];
 const AXIS_PARITY: [f32; 6] = [1.0, -1.0, -1.0, 1.0, 1.0, -1.0];
 
-/// The matrix (rows) of exact axis rotation `index`, 0..24: `index = permutation * 4 +
+/// The matrix of exact axis rotation `index`, 0..24: `index = permutation * 4 +
 /// signs`, bit 0 of `signs` negating row 0, bit 1 row 1, and row 2's sign making the
 /// determinant +1. Index 0 is the identity.
-pub fn axis_rotation(index: u32) -> [[f32; 3]; 3] {
+pub fn axis_rotation(index: u32) -> Mat3 {
     let p = (index >> 2) as usize % 6;
     let s0 = if index & 1 != 0 { -1.0 } else { 1.0 };
     let s1 = if index & 2 != 0 { -1.0 } else { 1.0 };
@@ -296,63 +298,23 @@ pub fn axis_rotation(index: u32) -> [[f32; 3]; 3] {
     for i in 0..3 {
         m[i][AXIS_PERMUTATIONS[p][i]] = sign[i];
     }
-    m
+    Mat3::from_cols_array_2d(&m).transpose()
 }
 
 /// The exact axis rotation whose matrix every entry of `q`'s rotation matrix is within
 /// 1e-6 of.
 pub fn exact_axis_index(q: [f32; 4]) -> Option<u32> {
-    let m = quat_matrix_f64(q.map(f64::from));
-    (0..24).find(|&i| {
-        let a = axis_rotation(i);
-        (0..3).all(|r| (0..3).all(|c| (m[r][c] - f64::from(a[r][c])).abs() <= 1e-6))
-    })
+    let m = DMat3::from_quat(DQuat::from_array(q.map(f64::from)).normalize());
+    (0..24).find(|&i| m.abs_diff_eq(axis_rotation(i).as_dmat3(), 1e-6))
 }
 
-/// Rotation matrix (rows) of a record's `rot` word.
-pub fn instance_rotation(rot: u32, exact_axis: bool) -> [[f32; 3]; 3] {
+/// Rotation matrix of a record's `rot` word.
+pub fn instance_rotation(rot: u32, exact_axis: bool) -> Mat3 {
     if exact_axis {
         axis_rotation(rot)
     } else {
-        quat_matrix(decode_rotation(rot))
+        Mat3::from_quat(Quat::from_array(decode_rotation(rot)))
     }
-}
-
-/// Rotation matrix (rows) of a unit quaternion (x, y, z, w), in the operation order the
-/// GPU decode uses.
-pub fn quat_matrix(q: [f32; 4]) -> [[f32; 3]; 3] {
-    let [x, y, z, w] = q;
-    let (x2, y2, z2) = (x + x, y + y, z + z);
-    let (xx, yy, zz) = (x * x2, y * y2, z * z2);
-    let (xy, xz, yz) = (x * y2, x * z2, y * z2);
-    let (wx, wy, wz) = (w * x2, w * y2, w * z2);
-    [
-        [1.0 - yy - zz, xy - wz, xz + wy],
-        [xy + wz, 1.0 - xx - zz, yz - wx],
-        [xz - wy, yz + wx, 1.0 - xx - yy],
-    ]
-}
-
-fn quat_matrix_f64(q: [f64; 4]) -> [[f64; 3]; 3] {
-    let len2: f64 = q.iter().map(|c| c * c).sum();
-    let [x, y, z, w] = q.map(|c| c / len2.sqrt());
-    [
-        [
-            1.0 - 2.0 * (y * y + z * z),
-            2.0 * (x * y - w * z),
-            2.0 * (x * z + w * y),
-        ],
-        [
-            2.0 * (x * y + w * z),
-            1.0 - 2.0 * (x * x + z * z),
-            2.0 * (y * z - w * x),
-        ],
-        [
-            2.0 * (x * z - w * y),
-            2.0 * (y * z + w * x),
-            1.0 - 2.0 * (x * x + y * y),
-        ],
-    ]
 }
 
 /// Morton code of a quantized position: bit `3 * b + a` holds bit `b` of axis `a`.

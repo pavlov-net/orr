@@ -1,4 +1,5 @@
 use bytemuck::Zeroable;
+use orr_math::DVec4;
 use orr_pack::mesh::{self, Cluster, MeshHeader, PageHeader, PageView};
 use shader_math::stats::Rng;
 use shader_math::*;
@@ -382,10 +383,10 @@ fn rotations_decode_like_orr_pack() {
     let mut rng = Rng::new(6);
     for _ in 0..200_000 {
         let q = loop {
-            let v = [0; 4].map(|_: u8| f64::from(rng.range(-1.0, 1.0)));
-            let l = v.iter().map(|c| c * c).sum::<f64>().sqrt();
+            let v = DVec4::from([0; 4].map(|_: u8| f64::from(rng.range(-1.0, 1.0))));
+            let l = v.length();
             if l > 1e-3 && l <= 1.0 {
-                break v.map(|c| c / l);
+                break (v / l).to_array();
             }
         };
         let code = orr_pack::instance::encode_rotation(q.map(|c| c as f32));
@@ -398,7 +399,7 @@ fn rotations_decode_like_orr_pack() {
             );
         }
         let d = d.map(f64::from);
-        let dot: f64 = (0..4).map(|i| q[i] * d[i]).sum();
+        let dot = DVec4::from(q).dot(DVec4::from(d));
         let angle = 2.0 * dot.abs().min(1.0).acos().to_degrees();
         assert!(angle <= 0.17, "{q:?} -> {d:?}: {angle} deg");
         let m = instance_rotation(code, false);
@@ -418,7 +419,9 @@ fn exact_axis_rotations_are_the_24_proper_rotations() {
         let m = instance_rotation(index, true);
         assert_eq!(
             m,
-            bytemuck::cast::<[[f32; 3]; 3], [f32; 9]>(orr_pack::instance::axis_rotation(index))
+            orr_pack::instance::axis_rotation(index)
+                .transpose()
+                .to_cols_array()
         );
         assert!(
             m.iter().all(|&v| v == 0.0 || v == 1.0 || v == -1.0),

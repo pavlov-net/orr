@@ -822,7 +822,7 @@ impl<'a> Packer<'a> {
             *target = match self.color_primaries(r.image) {
                 Primaries::Rec709 => std::array::from_fn(|c| target[c] * texel[c]),
                 p => {
-                    let (rec709, p) = (RgbPrimaries::REC709, orr_color::Primaries::from(p).rgb());
+                    let (rec709, p) = (RgbPrimaries::REC709, p.rgb());
                     let f = rec709.matrix_to(p) * DVec3::from(target.map(f64::from));
                     let product = f * DVec3::from(texel.map(f64::from));
                     (p.matrix_to(rec709) * product).as_vec3().to_array()

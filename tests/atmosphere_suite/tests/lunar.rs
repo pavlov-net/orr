@@ -10,7 +10,7 @@ use orr_atmosphere::Atmosphere;
 use orr_atmosphere::presets::{LUNAR_ALBEDO, lunar_disc, lunar_reflectance, solar_disc};
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference};
 use orr_atmosphere::spectrum::SPECTRAL;
-use orr_color::{RgbPrimaries, delta_uv, luminance};
+use orr_color::{RgbPrimaries, delta_uv_1976, luminance};
 use orr_math::{DQuat, DVec3, Vec3};
 use orr_scene::testing::{assert_clean, read_buffer};
 
@@ -22,8 +22,7 @@ const ROLO_5_DEG: f64 = 0.30;
 const NEAR_RANGE: f64 = 256.0;
 
 fn rec2020(light: &DirectionalLight) -> [f64; 3] {
-    (RgbPrimaries::REC709.matrix_to(RgbPrimaries::REC2020) * light.illuminance.as_dvec3())
-        .to_array()
+    orr_color::rec709_to_rec2020(light.illuminance).to_array()
 }
 
 /// The sun direction that puts a moon at `moon` at 5 deg phase: 5 deg off the point opposite
@@ -179,7 +178,7 @@ fn moonlit_sky_color() {
         };
         for (d, got) in views.iter().zip(&gpu) {
             let expected = spectral.xyz(&spectral.sky(EYE, *d, &light, NEAR_RANGE, &single).values);
-            let error = delta_uv(to_xyz * DVec3::from(*got), expected);
+            let error = delta_uv_1976(to_xyz * DVec3::from(*got), expected);
             worst = worst.max(error);
         }
         eprintln!("moon at {elevation} deg: worst Delta u'v' {worst:.4}");

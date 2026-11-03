@@ -7,9 +7,10 @@
 //! Mesh joint indices index this skeleton.
 
 use bytemuck::{Pod, Zeroable};
+use orr_math::{Affine3, Quat, Vec3};
 
 use crate::blob::{put_table, read, table};
-use crate::{Affine3, Error, Result, Span};
+use crate::{AffineRows, Error, Result, Span};
 
 pub const SCHEMA: u16 = 1;
 
@@ -30,7 +31,7 @@ pub struct SkeletonHeader {
     pub parents: Span,
     /// Rest [`Trs`] per joint, relative to its parent.
     pub rest: Span,
-    /// [`Affine3`] per joint: model space to the joint's bind space.
+    /// [`AffineRows`] per joint: model space to the joint's bind space.
     pub inverse_binds: Span,
     /// u64 [`name_hash`] per joint.
     pub name_hashes: Span,
@@ -56,35 +57,11 @@ impl Trs {
     };
 
     pub fn to_affine(&self) -> Affine3 {
-        let [x, y, z, w] = self.rotation;
-        let r = [
-            [
-                1.0 - 2.0 * (y * y + z * z),
-                2.0 * (x * y - w * z),
-                2.0 * (x * z + w * y),
-            ],
-            [
-                2.0 * (x * y + w * z),
-                1.0 - 2.0 * (x * x + z * z),
-                2.0 * (y * z - w * x),
-            ],
-            [
-                2.0 * (x * z - w * y),
-                2.0 * (y * z + w * x),
-                1.0 - 2.0 * (x * x + y * y),
-            ],
-        ];
-        let s = self.scale;
-        Affine3 {
-            rows: std::array::from_fn(|i| {
-                [
-                    r[i][0] * s[0],
-                    r[i][1] * s[1],
-                    r[i][2] * s[2],
-                    self.translation[i],
-                ]
-            }),
-        }
+        Affine3::from_scale_rotation_translation(
+            Vec3::from(self.scale),
+            Quat::from_array(self.rotation),
+            Vec3::from(self.translation),
+        )
     }
 
     /// Translation and scale lerped, rotation slerped on the shorter arc.
@@ -165,7 +142,10 @@ impl SkeletonInfo {
         Ok(Self {
             parents,
             rest: table(blob, h.rest)?,
-            inverse_binds: table(blob, h.inverse_binds)?,
+            inverse_binds: table::<AffineRows>(blob, h.inverse_binds)?
+                .into_iter()
+                .map(Affine3::from)
+                .collect(),
             names,
         })
     }
@@ -180,7 +160,8 @@ impl SkeletonInfo {
         let mut out = vec![0; size_of::<SkeletonHeader>()];
         let parents = put_table(&mut out, &self.parents);
         let rest = put_table(&mut out, &self.rest);
-        let inverse_binds = put_table(&mut out, &self.inverse_binds);
+        let binds: Vec<AffineRows> = self.inverse_binds.iter().map(|&b| b.into()).collect();
+        let inverse_binds = put_table(&mut out, &binds);
         let hashes: Vec<u64> = self.names.iter().map(|s| name_hash(s)).collect();
         let name_hashes = put_table(&mut out, &hashes);
         let names_at = out.len().next_multiple_of(4);
@@ -227,7 +208,7 @@ impl SkeletonInfo {
             let local = locals[j].to_affine();
             out[j] = match p {
                 NO_PARENT => local,
-                p => out[usize::from(p)].mul(&local),
+                p => out[usize::from(p)] * local,
             };
         }
     }
@@ -235,7 +216,7 @@ impl SkeletonInfo {
     /// Skinning matrices from model-space joint transforms: `model[j] x inverse_binds[j]`.
     pub fn palette(&self, model: &[Affine3], out: &mut [Affine3]) {
         for (j, ib) in self.inverse_binds.iter().enumerate() {
-            out[j] = model[j].mul(ib);
+            out[j] = model[j] * *ib;
         }
     }
 }

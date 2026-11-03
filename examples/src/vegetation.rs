@@ -34,7 +34,7 @@ use orr::orr_pack::mesh::MeshInfo;
 use orr::orr_pack::model::ModelInfo;
 use orr::orr_pack::{Archive, AssetId, Target};
 use orr::{
-    Affine3, BoundTexture, ClusterTopology, CompilingKernels, CopyVariant, DirectionalLight,
+    AffineRows, BoundTexture, ClusterTopology, CompilingKernels, CopyVariant, DirectionalLight,
     DiscProfile, Display, DisplayRequest, FrameDesc, FrameStats, FrameTime, GroupWriter,
     InstanceFlags, InstancesDesc, Lens, Light, LightId, LightingStats, LitView, LoadState,
     MaterialGpu, ModelId, MountId, Opacity, PackSource, PipelineId, Pose, ProducerDesc, ProducerId,
@@ -47,7 +47,7 @@ use orr_atmosphere::{Atmosphere, AtmosphereState, MAX_SKY_LIGHTS};
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source};
 use orr_cook::{TextureSettings, Usage};
 use orr_math::camera::rh::view;
-use orr_math::{DVec3, Mat3, Vec3};
+use orr_math::{Affine3, DVec3, Mat3, Vec3};
 
 use crate::field::{Grass, Heights, Slab, Terrain, blade_triangles, patch_triangles};
 use crate::linked::KERNELS;
@@ -727,7 +727,7 @@ fn moon_direction(i: u32) -> Vec3 {
 struct Stand {
     model: usize,
     cell: (i32, i32),
-    at: Vec<Affine3>,
+    at: Vec<AffineRows>,
 }
 
 /// A tree model's GPU-written pose group and what its pose kernel reads.
@@ -792,7 +792,7 @@ fn plant(settings: &Settings, models: usize, heights: &dyn Fn(f32, f32) -> f32) 
         let cell = cell_of(x, z);
         let turn = Mat3::from_rotation_y(rng.range(0.0, std::f32::consts::TAU));
         let at = Vec3::new(x, heights(x, z) - 0.1, z) - anchor(cell);
-        let t = Affine3::new(turn * rng.range(0.8, 1.2), at);
+        let t = Affine3::from_mat3_translation(turn * rng.range(0.8, 1.2), at).into();
         match stands
             .iter_mut()
             .find(|s| s.cell == cell && s.model == model)
@@ -1130,7 +1130,7 @@ impl DenseVegetation {
                     anchor: DVec3::ZERO,
                 })
                 .expect("transform group");
-            w.transforms(world, 0, 1).expect("transforms")[0] = Affine3::IDENTITY;
+            w.transforms(world, 0, 1).expect("transforms")[0] = Affine3::IDENTITY.into();
 
             let animated = settings.part_animation;
             for (i, t) in trees.iter().enumerate() {

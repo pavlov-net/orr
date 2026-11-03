@@ -20,15 +20,15 @@ use orr::orr_gpu::{Format, QueueKind, TextureDesc, TextureMemory, TextureUsage, 
 use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    Affine3, CompilingKernels, Cone, DirectionalLight, DiscProfile, Display, DisplayRequest,
-    FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView,
+    CompilingKernels, Cone, DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc,
+    FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView,
     PackSource, Projection, Renderer, RendererDesc, SceneDesc, SceneLightingSettings,
     ScreenshotRequest, TextureFilter, TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput,
     ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshSettings, Source};
 use orr_math::camera::rh::view;
-use orr_math::{DVec3, Vec3};
+use orr_math::{Affine3, DVec3, Vec3};
 
 const TOWN: &str = "town";
 
@@ -239,7 +239,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             anchor: DVec3::ZERO,
         })
         .expect("transform group");
-    w.transforms(group, 0, 1).expect("transforms")[0] = Affine3::IDENTITY;
+    w.transforms(group, 0, 1).expect("transforms")[0] = Affine3::IDENTITY.into();
     w.add_instances(&InstancesDesc {
         model,
         copies: 1,

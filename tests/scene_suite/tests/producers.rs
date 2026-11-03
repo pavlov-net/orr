@@ -17,7 +17,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use glam::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_cook::{
     ArchiveSpec, AssetSpec, CageInput, Corner, Crease, FaceVarying, Manifest, Source, SubdSettings,
     Subdivision, UsdSettings,
@@ -28,6 +27,7 @@ use orr_gpu::{
     RasterState, Rendering, SamplerDesc, ShaderStage, SpecData, Stages, StorageImageIndex, Texture,
     TextureDesc, TextureIndex, TextureMemory, TextureRegion, TextureUsage,
 };
+use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::AssetId;
 use orr_pack::subd::{Page as SubdPage, SubdInfo};
 use orr_scene::testing::{
@@ -35,8 +35,8 @@ use orr_scene::testing::{
     wait_on,
 };
 use orr_scene::{
-    Affine3, ClusterTopology, Frame, FrameDesc, FrameTime, GeneratedClusterGpu, GroupWriter, Lens,
-    LoadState, MaterialGpu, MaterialId, ModelId, MountId, Opacity, PackSource, ProducerBatch,
+    AffineRows, ClusterTopology, Frame, FrameDesc, FrameTime, GeneratedClusterGpu, GroupWriter,
+    Lens, LoadState, MaterialGpu, MaterialId, ModelId, MountId, Opacity, PackSource, ProducerBatch,
     ProducerClusterGpu, ProducerDesc, ProducerId, ProducerStateGpu, ProducerStats, ProducerUpdate,
     Projection, RasterView, RendererDesc, SceneDesc, SceneId, SceneWriter, Scenes, SubdDesc,
     TessellationStats, TextureFilter, TransformGroupDesc, TransformGroupId, TransparencyPass,
@@ -119,9 +119,7 @@ fn cast(origin: Vec3, d: Vec3, blades: &[(u32, f32, f32)]) -> Option<(u32, usize
 }
 
 fn look(eye: Vec3, target: Vec3) -> Quat {
-    let back = (eye - target).normalize();
-    let right = Vec3::Y.cross(back).normalize();
-    Quat::from_mat3(&Mat3::from_cols(right, back.cross(right), back))
+    orr_math::camera::rh::view::look_at_quat(eye, target, Vec3::Y).inverse()
 }
 
 /// One emitting entry this frame: blades, time, first-row z and cluster-word base.
@@ -195,7 +193,7 @@ impl Field {
                 anchor: DVec3::ZERO,
             })
             .unwrap();
-        w.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY;
+        w.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
         drop(w);
         wait(f.end(&[]).unwrap());
         Self {
@@ -894,7 +892,7 @@ impl Plane {
                 anchor: DVec3::ZERO,
             })
             .unwrap();
-        w.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY;
+        w.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
         drop(w);
         wait(f.end(&[]).unwrap());
         Self {
@@ -1896,7 +1894,7 @@ impl LimitSurface {
         for dz in -1..=1 {
             for dy in -1..=1 {
                 for dx in -1..=1 {
-                    let key = (c + glam::IVec3::new(dx, dy, dz)).to_array();
+                    let key = (c + orr_math::IVec3::new(dx, dy, dz)).to_array();
                     for &(p, spot) in self.cells.get(&key).into_iter().flatten() {
                         near.push((p.distance(x), spot));
                     }
@@ -2244,9 +2242,8 @@ fn subdivision_cages_dice_closed_at_mixed_rates_on_their_limit_surface_in_raster
                 })
                 .unwrap();
             let t = w.transforms(group, 0, 2).unwrap();
-            t[0] = Affine3::IDENTITY;
-            t[1] = Affine3::IDENTITY;
-            t[1].rows[2][3] = RIPPLED_Z;
+            t[0] = Affine3::IDENTITY.into();
+            t[1] = Affine3::from_translation(Vec3::new(0.0, 0.0, RIPPLED_Z)).into();
             w.set_subd(SMOOTH, Some(&desc(group, 0, 0))).unwrap();
             w.set_subd(RIPPLED, Some(&desc(group, 1, RIPPLE))).unwrap();
         },
@@ -2354,13 +2351,10 @@ fn subdivision_cages_dice_closed_at_mixed_rates_on_their_limit_surface_in_raster
 fn arm_palette(angle: f32) -> [Affine3; 2] {
     let r = Mat3::from_rotation_z(angle);
     let pivot = Vec3::new(0.0, 1.0, 0.0);
-    let t = pivot - r * pivot;
-    let c = r.to_cols_array_2d();
-    let mut tip = Affine3::IDENTITY;
-    for (i, row) in tip.rows.iter_mut().enumerate() {
-        *row = [c[0][i], c[1][i], c[2][i], t[i]];
-    }
-    [Affine3::IDENTITY, tip]
+    [
+        Affine3::IDENTITY,
+        Affine3::from_mat3_translation(r, pivot - r * pivot),
+    ]
 }
 
 #[test]
@@ -2383,10 +2377,10 @@ fn a_skinned_cage_poses_before_it_dices_and_moves_from_last_frames_pose() {
                 .unwrap()
             };
             ids = (make(w, 1), make(w, 2));
-            w.transforms(ids.0, 0, 1).unwrap()[0] = Affine3::IDENTITY;
+            w.transforms(ids.0, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
             w.transforms(ids.1, 0, 2)
                 .unwrap()
-                .copy_from_slice(&arm_palette(angles[0]));
+                .copy_from_slice(&arm_palette(angles[0]).map(AffineRows::from));
             let desc = SubdDesc {
                 model,
                 transform: (ids.0, 0),
@@ -2405,7 +2399,7 @@ fn a_skinned_cage_poses_before_it_dices_and_moves_from_last_frames_pose() {
         |w| {
             w.transforms(ids.1, 0, 2)
                 .unwrap()
-                .copy_from_slice(&arm_palette(angles[1]));
+                .copy_from_slice(&arm_palette(angles[1]).map(AffineRows::from));
         },
         eye,
         target,
@@ -2420,7 +2414,7 @@ fn a_skinned_cage_poses_before_it_dices_and_moves_from_last_frames_pose() {
     );
     assert_closed(&g);
     let posed = |angle: f32| {
-        let palette = arm_palette(angle).map(|a| Affine3 { rows: a.rows });
+        let palette = arm_palette(angle);
         let points = info.skinned_points(&palette);
         LimitSurface::new(&info, &pages, &points)
     };
@@ -2507,7 +2501,7 @@ impl<'d> Strands<'d> {
                 anchor: DVec3::ZERO,
             })
             .unwrap();
-        w.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY;
+        w.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
         w.set_producer(
             STRANDS,
             Some(&ProducerDesc {

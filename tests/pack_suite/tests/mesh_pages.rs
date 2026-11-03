@@ -6,9 +6,9 @@
 
 use std::path::PathBuf;
 
-use glam::{Vec2, Vec3, Vec4};
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshParts, MeshSettings};
 use orr_gpu::MemoryKind;
+use orr_math::{Vec2, Vec3, Vec4};
 use orr_pack::material::Material;
 use orr_pack::mesh::{self, Cluster, MeshHeader, MeshInfo, PageHeader, PageView};
 use orr_pack::{Archive, AssetId, Span, Target};

@@ -3,7 +3,8 @@
 // (1.0 = 100 nits); the result is linear Rec.2020 scaled by `output_scale`.
 module gt7;
 
-import orr.color;
+import orr_color.gamut;
+import orr_color.ictcp;
 import orr_color.primaries;
 
 // Nits of frame-buffer value 1.0.

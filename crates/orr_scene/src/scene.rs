@@ -5,8 +5,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytemuck::{Pod, Zeroable};
-use glam::{DVec3, IVec3};
 use orr_gpu::{Allocation, Device, GpuAddress, GpuPtr, MemoryKind};
+use orr_math::{DVec3, IVec3};
 
 use crate::decals::{Decal, DecalId, Listing, decal_gpu, listing, table_sizes};
 use crate::emissive::{ModelEmission, Run, Runs};
@@ -97,7 +97,7 @@ impl Default for SceneDesc {
     }
 }
 
-pub use orr_pack::Affine3;
+pub use orr_pack::AffineRows;
 
 /// A transform group in one scene. Group 0 is the null group: it holds nothing and hides
 /// whatever names it.
@@ -655,7 +655,7 @@ impl<'f> SceneWriter<'f> {
         &mut self,
         desc: &TransformGroupDesc,
     ) -> Result<TransformGroupId> {
-        let bytes = u64::from(desc.count.max(1)) * size_of::<Affine3>() as u64;
+        let bytes = u64::from(desc.count.max(1)) * size_of::<AffineRows>() as u64;
         let buffers = [0, 1].map(|_| {
             self.device
                 .gpu_malloc::<u8>(MemoryKind::DeviceLocal, bytes, "transforms")
@@ -702,7 +702,7 @@ impl<'f> SceneWriter<'f> {
         group: TransformGroupId,
         first: u32,
         count: u32,
-    ) -> Result<&'f mut [Affine3]> {
+    ) -> Result<&'f mut [AffineRows]> {
         self.write_transforms(group, first, count, false)
     }
 
@@ -714,7 +714,7 @@ impl<'f> SceneWriter<'f> {
         group: TransformGroupId,
         first: u32,
         count: u32,
-    ) -> Result<&'f mut [Affine3]> {
+    ) -> Result<&'f mut [AffineRows]> {
         self.write_transforms(group, first, count, true)
     }
 
@@ -724,7 +724,7 @@ impl<'f> SceneWriter<'f> {
         first: u32,
         count: u32,
         without_motion: bool,
-    ) -> Result<&'f mut [Affine3]> {
+    ) -> Result<&'f mut [AffineRows]> {
         let (current, previous) = {
             let mut cpu = self.scene.cpu.lock().unwrap();
             let g = cpu
@@ -743,10 +743,10 @@ impl<'f> SceneWriter<'f> {
                 g.count
             );
             g.written = true;
-            let at = |b: &Allocation<u8>| b.gpu().cast::<Affine3>().offset(u64::from(first));
+            let at = |b: &Allocation<u8>| b.gpu().cast::<AffineRows>().offset(u64::from(first));
             (at(&g.buffers[g.current]), at(&g.buffers[1 - g.current]))
         };
-        let (src, out) = self.window.slice::<Affine3>(self.device, count)?;
+        let (src, out) = self.window.slice::<AffineRows>(self.device, count)?;
         self.push(Record::values(self.next_seq(), current, src, count));
         // The current-to-previous copy runs before the scatter, so this lands on top of it.
         if without_motion {

@@ -23,16 +23,16 @@ use orr::orr_gpu::{
 use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    Affine3, CompilingKernels, DirectionalLight, Display, DisplayRequest, FrameDesc, FrameTime,
-    GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, PackSource,
-    Projection, Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest,
-    TextureFilter, TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    CompilingKernels, DirectionalLight, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter,
+    HookPass, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, PackSource, Projection,
+    Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
+    TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_atmosphere::presets::{LUNAR_ANGULAR_RADIUS, lunar_albedo, lunar_disc, solar_disc};
 use orr_atmosphere::{Atmosphere, AtmosphereState, HeightFog};
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshSettings, Source};
 use orr_math::camera::rh::view;
-use orr_math::{DVec3, Vec3};
+use orr_math::{Affine3, DVec3, Vec3};
 
 const NEAR: &str = "near";
 const FAR: &str = "far";
@@ -210,7 +210,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             anchor: DVec3::ZERO,
         })
         .expect("transform group");
-    w.transforms(group, 0, 1).expect("transforms")[0] = Affine3::IDENTITY;
+    w.transforms(group, 0, 1).expect("transforms")[0] = Affine3::IDENTITY.into();
     for (model, tag) in [(near, 0), (far, 1)] {
         w.add_instances(&InstancesDesc {
             model,

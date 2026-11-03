@@ -4,7 +4,8 @@
 // next frame.
 #include "orr/root.h"
 import orr.abi;
-import orr.color;
+import orr.math;
+import orr_color.chromaticity;
 import orr_color.luminance;
 import orr_color.primaries;
 import view;
@@ -102,7 +103,6 @@ struct Root
 }
 ORR_ROOT(Root);
 
-static const float PI = 3.14159265358979;
 
 // The 64-bit sum whose low word is at `low`.
 float wide(uint* low)
@@ -318,7 +318,7 @@ void main()
         white_target_xy = white_target(p, m, sky);
         next.white_point_xy = snap || !white_set
             ? white_target_xy
-            : xy_from_uv(lerp(uv_from_xy(cur.white_point_xy), uv_from_xy(white_target_xy),
+            : xy_from_uv_1960(lerp(uv_1960_from_xy(cur.white_point_xy), uv_1960_from_xy(white_target_xy),
                               1.0 - exp(-p.white_speed * dt)));
     }
     else if (cut)

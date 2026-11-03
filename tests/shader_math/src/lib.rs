@@ -107,17 +107,6 @@ mod ffi {
         ) -> f32;
         pub(crate) fn orr_sample_alias(table: *const AliasEntry, count: u32, u: f32) -> u32;
 
-        pub(crate) fn orr_color_matrix(which: u32, out: *mut f32);
-        pub(crate) fn orr_luminance_rec709(c: *const f32) -> f32;
-        pub(crate) fn orr_luminance_rec2020(c: *const f32) -> f32;
-        pub(crate) fn orr_srgb_encode(c: *const f32, out: *mut f32);
-        pub(crate) fn orr_srgb_decode(c: *const f32, out: *mut f32);
-        pub(crate) fn orr_pq_encode(c: *const f32, out: *mut f32);
-        pub(crate) fn orr_pq_decode(c: *const f32, out: *mut f32);
-        pub(crate) fn orr_ictcp_from_rec2020(c: *const f32, out: *mut f32);
-        pub(crate) fn orr_rec2020_from_ictcp(c: *const f32, out: *mut f32);
-        pub(crate) fn orr_gamut_compress(c: *const f32, out: *mut f32);
-
         pub(crate) fn orr_color_primaries_matrix(which: u32, out: *mut f32);
         pub(crate) fn orr_color_luminance_rec709(c: *const f32) -> f32;
         pub(crate) fn orr_color_luminance_rec2020(c: *const f32) -> f32;
@@ -127,6 +116,21 @@ mod ffi {
         pub(crate) fn orr_color_pq_decode(c: *const f32, out: *mut f32);
         pub(crate) fn orr_color_hlg_encode(c: *const f32, out: *mut f32);
         pub(crate) fn orr_color_hlg_decode(c: *const f32, out: *mut f32);
+        pub(crate) fn orr_color_ictcp_from_rec2020(c: *const f32, out: *mut f32);
+        pub(crate) fn orr_color_rec2020_from_ictcp(c: *const f32, out: *mut f32);
+        pub(crate) fn orr_color_gamut_compress(c: *const f32, out: *mut f32);
+        pub(crate) fn orr_color_cct_from_xy(xy: *const f32) -> f32;
+        pub(crate) fn orr_color_duv_from_xy(xy: *const f32, cct: f32) -> f32;
+        pub(crate) fn orr_color_planckian_xy(cct: f32, out: *mut f32);
+        pub(crate) fn orr_color_xy_from_cct_duv(cct: f32, duv: f32, out: *mut f32);
+        pub(crate) fn orr_color_uv_1960_from_xy(xy: *const f32, out: *mut f32);
+        pub(crate) fn orr_color_xy_from_uv_1960(uv: *const f32, out: *mut f32);
+        pub(crate) fn orr_color_cat16_rec2020(
+            from_xy: *const f32,
+            to_xy: *const f32,
+            out: *mut f32,
+        );
+        pub(crate) fn orr_color_cie_xyz(nm: f32, out: *mut f32);
     }
 }
 
@@ -405,63 +409,25 @@ pub fn sample_alias(table: &[AliasEntry], u: f32) -> u32 {
     call!(ffi::orr_sample_alias(table.as_ptr(), table.len() as u32, u))
 }
 
-/// The color matrices of `orr.color`, in [`color_matrix`] order.
-pub const COLOR_MATRICES: [&str; 10] = [
-    "REC709_TO_XYZ",
-    "XYZ_TO_REC709",
-    "REC2020_TO_XYZ",
-    "XYZ_TO_REC2020",
-    "P3_TO_XYZ",
-    "XYZ_TO_P3",
-    "REC709_TO_REC2020",
-    "REC2020_TO_REC709",
-    "P3_TO_REC2020",
-    "REC2020_TO_P3",
-];
-/// Matrix `which` of [`COLOR_MATRICES`], row-major.
-pub fn color_matrix(which: usize) -> M3 {
-    out!(M3, |o| ffi::orr_color_matrix(which as u32, o.as_mut_ptr()))
-}
-pub fn luminance_rec709(c: V3) -> f32 {
-    call!(ffi::orr_luminance_rec709(c.as_ptr()))
-}
-pub fn luminance_rec2020(c: V3) -> f32 {
-    call!(ffi::orr_luminance_rec2020(c.as_ptr()))
-}
-pub fn srgb_encode(c: V3) -> V3 {
-    out!(V3, |o| ffi::orr_srgb_encode(c.as_ptr(), o.as_mut_ptr()))
-}
-pub fn srgb_decode(c: V3) -> V3 {
-    out!(V3, |o| ffi::orr_srgb_decode(c.as_ptr(), o.as_mut_ptr()))
-}
-pub fn pq_encode(nits: V3) -> V3 {
-    out!(V3, |o| ffi::orr_pq_encode(nits.as_ptr(), o.as_mut_ptr()))
-}
-pub fn pq_decode(signal: V3) -> V3 {
-    out!(V3, |o| ffi::orr_pq_decode(signal.as_ptr(), o.as_mut_ptr()))
-}
-pub fn ictcp_from_rec2020(nits: V3) -> V3 {
-    out!(V3, |o| ffi::orr_ictcp_from_rec2020(
-        nits.as_ptr(),
-        o.as_mut_ptr()
-    ))
-}
-pub fn rec2020_from_ictcp(ictcp: V3) -> V3 {
-    out!(V3, |o| ffi::orr_rec2020_from_ictcp(
-        ictcp.as_ptr(),
-        o.as_mut_ptr()
-    ))
-}
-pub fn gamut_compress(c: V3) -> V3 {
-    out!(V3, |o| ffi::orr_gamut_compress(c.as_ptr(), o.as_mut_ptr()))
-}
-
-/// orr_color's Slang modules (`orr_color.*`). The functions at the crate root are
-/// `orr.color`'s.
+/// orr_color's Slang modules (`orr_color.*`).
 pub mod color {
     use super::{M3, V3, ffi};
 
-    /// Matrix `which` of [`COLOR_MATRICES`](super::COLOR_MATRICES), row-major.
+    /// The matrices of `orr_color.primaries`, in [`matrix`] order.
+    pub const MATRICES: [&str; 10] = [
+        "REC709_TO_XYZ",
+        "XYZ_TO_REC709",
+        "REC2020_TO_XYZ",
+        "XYZ_TO_REC2020",
+        "P3_TO_XYZ",
+        "XYZ_TO_P3",
+        "REC709_TO_REC2020",
+        "REC2020_TO_REC709",
+        "P3_TO_REC2020",
+        "REC2020_TO_P3",
+    ];
+
+    /// Matrix `which` of [`MATRICES`], row-major.
     pub fn matrix(which: usize) -> M3 {
         out!(M3, |o| ffi::orr_color_primaries_matrix(
             which as u32,
@@ -509,5 +475,64 @@ pub mod color {
             signal.as_ptr(),
             o.as_mut_ptr()
         ))
+    }
+    pub fn ictcp_from_rec2020(nits: V3) -> V3 {
+        out!(V3, |o| ffi::orr_color_ictcp_from_rec2020(
+            nits.as_ptr(),
+            o.as_mut_ptr()
+        ))
+    }
+    pub fn rec2020_from_ictcp(ictcp: V3) -> V3 {
+        out!(V3, |o| ffi::orr_color_rec2020_from_ictcp(
+            ictcp.as_ptr(),
+            o.as_mut_ptr()
+        ))
+    }
+    pub fn gamut_compress(c: V3) -> V3 {
+        out!(V3, |o| ffi::orr_color_gamut_compress(
+            c.as_ptr(),
+            o.as_mut_ptr()
+        ))
+    }
+    pub fn cct_from_xy(xy: [f32; 2]) -> f32 {
+        call!(ffi::orr_color_cct_from_xy(xy.as_ptr()))
+    }
+    pub fn duv_from_xy(xy: [f32; 2], cct: f32) -> f32 {
+        call!(ffi::orr_color_duv_from_xy(xy.as_ptr(), cct))
+    }
+    pub fn planckian_xy(cct: f32) -> [f32; 2] {
+        out!([f32; 2], |o| ffi::orr_color_planckian_xy(
+            cct,
+            o.as_mut_ptr()
+        ))
+    }
+    pub fn xy_from_cct_duv(cct: f32, duv: f32) -> [f32; 2] {
+        out!([f32; 2], |o| ffi::orr_color_xy_from_cct_duv(
+            cct,
+            duv,
+            o.as_mut_ptr()
+        ))
+    }
+    pub fn uv_1960_from_xy(xy: [f32; 2]) -> [f32; 2] {
+        out!([f32; 2], |o| ffi::orr_color_uv_1960_from_xy(
+            xy.as_ptr(),
+            o.as_mut_ptr()
+        ))
+    }
+    pub fn xy_from_uv_1960(uv: [f32; 2]) -> [f32; 2] {
+        out!([f32; 2], |o| ffi::orr_color_xy_from_uv_1960(
+            uv.as_ptr(),
+            o.as_mut_ptr()
+        ))
+    }
+    pub fn cat16_rec2020(from_xy: [f32; 2], to_xy: [f32; 2]) -> M3 {
+        out!(M3, |o| ffi::orr_color_cat16_rec2020(
+            from_xy.as_ptr(),
+            to_xy.as_ptr(),
+            o.as_mut_ptr()
+        ))
+    }
+    pub fn cie_xyz(nm: f32) -> V3 {
+        out!(V3, |o| ffi::orr_color_cie_xyz(nm, o.as_mut_ptr()))
     }
 }

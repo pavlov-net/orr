@@ -30,17 +30,17 @@ use orr::orr_lighting::EnvironmentMapGpu;
 use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    Affine3, BoundTexture, ClusterTopology, CompilingKernels, DirectionalLight, DiscProfile,
-    Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, HookPass, InstanceFlags,
-    InstancesDesc, Lens, Light, LightId, LitView, MaterialGpu, MountId, PackSource, ProducerId,
-    Projection, Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest,
-    TextureFilter, TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    BoundTexture, ClusterTopology, CompilingKernels, DirectionalLight, DiscProfile, Display,
+    DisplayRequest, FrameDesc, FrameTime, GroupWriter, HookPass, InstanceFlags, InstancesDesc,
+    Lens, Light, LightId, LitView, MaterialGpu, MountId, PackSource, ProducerId, Projection,
+    Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
+    TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source, TextureSettings, Usage,
 };
 use orr_math::camera::rh::view;
-use orr_math::{DVec3, Vec3};
+use orr_math::{Affine3, DVec3, Vec3};
 
 const HEADLESS_EXTENT: [u32; 2] = [480, 270];
 const HEADLESS_FRAMES: u64 = 120;
@@ -192,7 +192,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         .expect("transform group");
     w.transforms(group, 0, models.len() as u32 + 1)
         .expect("transforms")
-        .fill(Affine3::IDENTITY);
+        .fill(Affine3::IDENTITY.into());
     for (i, &model) in models.iter().enumerate() {
         w.add_instances(&InstancesDesc {
             model,
@@ -526,11 +526,7 @@ fn sky_environment(
             .expect("sky sampler"),
         intensity: 1.0,
         primaries: orr_color::Primaries::Rec709.id().into(),
-        from_world: [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-        ],
+        from_world: Affine3::IDENTITY.into(),
     };
     environment
 }

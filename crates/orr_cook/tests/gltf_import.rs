@@ -1429,9 +1429,8 @@ fn gpu_instancing_becomes_instance_pages() {
         let (cell, records) = orr_pack::instance::decode(&head, &bytes).unwrap();
         let edge = 256.0;
         for (_, m) in records {
-            let p = [0, 1, 2].map(|k| m.rows[k][3] + cell[k] as f32 * edge);
-            let x = [0, 1, 2].map(|k| m.rows[k][0]);
-            placed.push((p, x));
+            let p = m.translation + orr_math::IVec3::from(cell).as_vec3() * edge;
+            placed.push((p.to_array(), m.matrix3.x_axis.to_array()));
         }
     }
     placed.sort_by(|a, b| a.0[0].total_cmp(&b.0[0]));
@@ -1486,19 +1485,12 @@ fn placements(a: &Archive, model: &str) -> Vec<orr_math::Mat4> {
         let info = orr_pack::instance::InstancePageInfo::parse(&head).unwrap();
         let bytes = read(a, &blobs[1]);
         let (cell, records) = orr_pack::instance::decode(&head, &bytes).unwrap();
-        for (p, m) in records {
+        for (p, mut m) in records {
             if info.prototypes[usize::from(p)].model != id {
                 continue;
             }
-            let r = m.rows;
-            let col = |c: usize| orr_math::Vec4::new(r[0][c], r[1][c], r[2][c], 0.0);
-            let t = [0, 1, 2].map(|k| r[k][3] + cell[k] as f32 * 256.0);
-            out.push(orr_math::Mat4::from_cols(
-                col(0),
-                col(1),
-                col(2),
-                orr_math::Vec4::new(t[0], t[1], t[2], 1.0),
-            ));
+            m.translation += orr_math::IVec3::from(cell).as_vec3() * 256.0;
+            out.push(m.into());
         }
     }
     out

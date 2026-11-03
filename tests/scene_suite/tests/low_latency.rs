@@ -6,13 +6,13 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use glam::DVec3;
 use gpu_suite::check_latency_reports;
 use gpu_suite::window::Window;
 use orr::{
     ConsumerMarker, Display, DisplayRequest, FrameDesc, FrameTime, Renderer, RendererDesc,
     SceneDesc,
 };
+use orr_math::DVec3;
 use orr_scene::testing::{assert_clean, device, wait};
 
 const FRAMES: u64 = 1000;

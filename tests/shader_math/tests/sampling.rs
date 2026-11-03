@@ -1,4 +1,4 @@
-use orr_math::DVec3;
+use orr_math::{DVec3, Vec3};
 use orr_shaders::AliasEntry;
 use shader_math::stats::{Rng, SphereGrid, chi_square_p};
 use shader_math::*;
@@ -30,7 +30,7 @@ fn check_directions(
     let mut observed = vec![0.0; grid.cells() + 1];
     for _ in 0..SAMPLES {
         let d = sample([rng.f32(), rng.f32()]);
-        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        let len = Vec3::from(d).length();
         assert!(
             (len - 1.0).abs() < 1e-4,
             "{name}: sample {d:?} is not unit length"

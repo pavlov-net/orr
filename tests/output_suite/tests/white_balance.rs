@@ -2,18 +2,16 @@
 
 use std::sync::LazyLock;
 
-use orr_color::RgbPrimaries;
+use orr_color::{Chromaticity, RgbPrimaries, cat16_rec2020};
 use orr_math::{DMat3, DVec2, DVec3};
 use orr_output::{
-    AutoWhiteBalance, D65_XY, DisplayRequest, Exposure, ExposureTelemetry, MeterWeights,
-    OutputDebug, OutputFormat, ResolvedDisplay, ViewOutput, WHITE_BALANCE_CCT, WHITE_BALANCE_DUV,
-    cct_duv_from_xy, exposure_from_ev100, xy_from_cct_duv,
+    AutoWhiteBalance, DisplayRequest, Exposure, ExposureTelemetry, MeterWeights, OutputDebug,
+    OutputFormat, ResolvedDisplay, ViewOutput, WHITE_BALANCE_CCT, WHITE_BALANCE_DUV,
+    exposure_from_ev100,
 };
 use orr_scene::SkyStats;
 use orr_scene::testing::assert_clean;
-use output_suite::{
-    Harness, cat16_rec2020, rec2020_from_xy, uv_from_xy, white_target, xy_from_xyz,
-};
+use output_suite::{Harness, rec2020_from_xy, white_target, xy_from_xyz};
 
 const SIDE: u32 = 64;
 const FILTER: (f64, f64) = (0.10, 0.90);
@@ -26,7 +24,16 @@ const HISTOGRAM_ONLY: MeterWeights = MeterWeights {
 };
 
 fn d65() -> [f64; 2] {
-    D65_XY.map(f64::from)
+    Chromaticity::D65.into()
+}
+
+/// The chromaticity at `cct` kelvin and `duv` from the Planckian locus.
+fn xy_at(cct: f64, duv: f64) -> [f64; 2] {
+    Chromaticity::from_cct_duv(cct, duv).into()
+}
+
+fn uv_1960(xy: [f32; 2]) -> DVec2 {
+    Chromaticity::from(xy).uv_1960()
 }
 
 fn hdr() -> ResolvedDisplay {
@@ -143,20 +150,22 @@ fn white_point_and_correction_match_the_cpu_model() {
     let display = hdr();
     // Clamped: below and above the CCT range, and above and below the Duv limit.
     let fields = [
-        xy_from_cct_duv(1800.0, 0.0),
-        xy_from_cct_duv(9000.0, 0.0),
-        xy_from_cct_duv(5000.0, 0.08),
-        xy_from_cct_duv(4000.0, -0.08),
+        xy_at(1800.0, 0.0),
+        xy_at(9000.0, 0.0),
+        xy_at(5000.0, 0.08),
+        xy_at(4000.0, -0.08),
     ];
     for field in fields {
-        let field = xy(field);
         h.color = rec2020_from_xy(field);
         h.set_image(&vec![100.0; h.pixels()]);
         let t = settle(&mut h, &balanced(AutoWhiteBalance::default()), &display);
         let model = white_target(&[(100.0, h.color)], FILTER, HISTOGRAM_ONLY, 1.0, &no_sky());
         let white = xy(t.white_point_xy);
         assert!(distance(white, model) < 5e-4, "{white:?} against {model:?}");
-        let (cct, duv) = cct_duv_from_xy(t.white_point_xy);
+        let held = Chromaticity::from(t.white_point_xy);
+        let cct = held.cct();
+        let duv = held.duv(cct) as f32;
+        let cct = cct as f32;
         let on_bound = (cct - WHITE_BALANCE_CCT.start()).abs() < 10.0
             || (cct - WHITE_BALANCE_CCT.end()).abs() < 10.0
             || (duv.abs() - WHITE_BALANCE_DUV).abs() < 1e-3;
@@ -166,19 +175,19 @@ fn white_point_and_correction_match_the_cpu_model() {
     // Four patches of their own color and luminance, with the sky's dome and directional
     // light mixed in.
     let patches = [
-        (30.0f32, xy_from_cct_duv(2700.0, 0.004)),
+        (30.0f32, xy_at(2700.0, 0.004)),
         (120.0, [0.30, 0.34]),
         (500.0, [0.35, 0.37]),
         (2000.0, [0.28, 0.29]),
     ];
     let pixel = |i: usize| {
         let (nits, xy) = patches[i * patches.len() / (SIDE * SIDE) as usize];
-        (nits, rec2020_from_xy(xy.map(f64::from)))
+        (nits, rec2020_from_xy(xy))
     };
     let pixels: Vec<(f32, [f32; 3])> = (0..h.pixels()).map(pixel).collect();
     h.set_image(&pixels.iter().map(|p| p.0).collect::<Vec<_>>());
     h.set_colors(Some(&pixels.iter().map(|p| p.1).collect::<Vec<_>>()));
-    let sun = rec2020_from_xy(xy(xy_from_cct_duv(5000.0, 0.0))).map(|c| 5e4 * c);
+    let sun = rec2020_from_xy(xy_at(5000.0, 0.0)).map(|c| 5e4 * c);
     let sky = SkyStats {
         dome_luminance: 3000.0,
         dome_xy: [0.27, 0.28],
@@ -202,7 +211,7 @@ fn white_point_and_correction_match_the_cpu_model() {
     assert!(distance(got, model) < 5e-4, "{got:?} against {model:?}");
 
     // Each patch shows as CAT16 from the white point to D65 of its exposed radiance.
-    let m = cat16_rec2020(got, d65());
+    let m = cat16_rec2020(got.into(), Chromaticity::D65);
     let to_xyz = RgbPrimaries::REC2020.rgb_to_xyz();
     let s = f64::from(exposure_from_ev100(t.adapted_ev100));
     let image = h.display_linear();
@@ -237,17 +246,11 @@ fn white_point_adapts_at_its_speed_holds_in_the_dark_and_snaps_on_a_cut() {
     let k = 1.0 - (-f64::from(speed * h.dt)).exp();
     for f in 0..30 {
         let t = h.frame(1.0, &output, Some(&display));
-        let (from, to) = (
-            uv_from_xy(xy(prev.white_point_xy)),
-            uv_from_xy(xy(t.white_target_xy)),
-        );
-        let want = [
-            from[0] + k * (to[0] - from[0]),
-            from[1] + k * (to[1] - from[1]),
-        ];
-        let got = uv_from_xy(xy(t.white_point_xy));
+        let (from, to) = (uv_1960(prev.white_point_xy), uv_1960(t.white_target_xy));
+        let want = from + k * (to - from);
+        let got = uv_1960(t.white_point_xy);
         assert!(
-            distance(got, want) < 2e-5,
+            got.distance(want) < 2e-5,
             "frame {f}: {got:?} against {want:?}"
         );
         prev = t;

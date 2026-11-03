@@ -12,7 +12,6 @@ links = "orr_lighting"
 orr_scene.workspace = true
 orr_math.workspace = true
 orr_shaders = { workspace = true, features = ["openpbr"] }
-glam.workspace = true
 bytemuck.workspace = true
 thiserror.workspace = true
 log.workspace = true

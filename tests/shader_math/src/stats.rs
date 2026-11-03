@@ -2,6 +2,8 @@
 
 use std::f64::consts::PI;
 
+use orr_math::Vec3;
+
 /// SplitMix64; fixed seeds keep every test deterministic.
 pub struct Rng(u64);
 
@@ -45,10 +47,9 @@ impl Rng {
                 self.range(-1.0, 1.0),
                 self.range(-1.0, 1.0),
             ];
-            let l2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-            if (1e-4..=1.0).contains(&l2) {
-                let l = l2.sqrt();
-                return v.map(|c| c / l);
+            let v = Vec3::from(v);
+            if (1e-4..=1.0).contains(&v.length_squared()) {
+                return v.normalize().to_array();
             }
         }
     }

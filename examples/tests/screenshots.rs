@@ -50,16 +50,16 @@ use orr::orr_gpu::{QueueKind, Texture, TextureDesc, TextureMemory, TextureUsage,
 use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    Affine3, DlssMode, DlssQuality, Exposure, FrameDesc, Glare, GroupWriter, HookPass,
-    InstanceFlags, InstancesDesc, Lens, LensDistortion, LightingDebugView, LitView, OutputDebug,
-    PackSource, PathEntry, Projection, Reconstruction, ReferenceSettings, Renderer, RendererDesc,
-    SceneDesc, SceneId, Screenshot, ScreenshotRequest, TextureFilter, ThinLens, TransformGroupDesc,
+    DlssMode, DlssQuality, Exposure, FrameDesc, Glare, GroupWriter, HookPass, InstanceFlags,
+    InstancesDesc, Lens, LensDistortion, LightingDebugView, LitView, OutputDebug, PackSource,
+    PathEntry, Projection, Reconstruction, ReferenceSettings, Renderer, RendererDesc, SceneDesc,
+    SceneId, Screenshot, ScreenshotRequest, TextureFilter, ThinLens, TransformGroupDesc,
     TransformGroupId, TransparencyPass, ViewHistoryId, ViewHooks, ViewLighting, ViewOutput,
     ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source};
 use orr_math::camera::rh::view;
-use orr_math::{DVec3, Mat3, Quat, Vec3};
+use orr_math::{Affine3, DVec3, Quat, Vec3};
 use orr_scene::testing::{Image, Pixels, Tolerance, check, flip};
 
 /// A smaller forest than the bench's, so the debug build renders it in reasonable time.
@@ -472,7 +472,7 @@ impl StillShowcase {
             .expect("transform group");
         w.transforms(group, 0, 1)
             .expect("transforms")
-            .fill(Affine3::IDENTITY);
+            .fill(Affine3::IDENTITY.into());
         w.add_instances(&InstancesDesc {
             model,
             copies: 1,
@@ -900,7 +900,7 @@ impl Lamp {
             .expect("transform group");
         w.transforms(group, 0, 1)
             .expect("transforms")
-            .fill(Affine3::IDENTITY);
+            .fill(Affine3::IDENTITY.into());
         w.add_instances(&InstancesDesc {
             model,
             copies: 1,
@@ -953,7 +953,7 @@ impl Lamp {
                 .expect("scene writer")
                 .transforms(self.group, 0, 1)
                 .expect("transforms")
-                .fill(Affine3::new(Mat3::IDENTITY, Vec3::new(x as f32, 0.0, 0.0)));
+                .fill(Affine3::from_translation(Vec3::new(x as f32, 0.0, 0.0)).into());
             if skipped {
                 f.scene(self.scene)
                     .expect("scene writer")

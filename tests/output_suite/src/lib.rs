@@ -427,32 +427,34 @@ pub fn keyed(metered_ev100: f64, stops: f64) -> f64 {
 
 /// The xy chromaticity of a CIE XYZ color.
 pub fn xy_from_xyz(xyz: DVec3) -> [f64; 2] {
-    let c = Chromaticity::from_xyz(xyz);
-    [c.x, c.y]
-}
-
-/// CIE XYZ of chromaticity `xy` at luminance 1.
-fn xyz_from_xy(xy: [f64; 2]) -> DVec3 {
-    Chromaticity::new(xy[0], xy[1]).to_xyz(1.0)
+    Chromaticity::from_xyz(xyz).into()
 }
 
 /// Linear Rec.2020 of chromaticity `xy` at luminance 1.
 pub fn rec2020_from_xy(xy: [f64; 2]) -> [f32; 3] {
     static XYZ_TO_REC2020: LazyLock<DMat3> = LazyLock::new(|| RgbPrimaries::REC2020.xyz_to_rgb());
-    (*XYZ_TO_REC2020 * xyz_from_xy(xy)).as_vec3().to_array()
+    (*XYZ_TO_REC2020 * Chromaticity::from(xy).to_xyz(1.0))
+        .as_vec3()
+        .to_array()
 }
 
 /// The CPU model of adapt's white point range: `xy` unchanged inside it, else rebuilt at the
 /// clamped CCT and Duv.
 pub fn white_in_range(xy: [f64; 2]) -> [f64; 2] {
     use orr_output::{WHITE_BALANCE_CCT, WHITE_BALANCE_DUV};
-    let (cct, duv) = orr_output::cct_duv_from_xy(xy.map(|c| c as f32));
-    let c = cct.clamp(*WHITE_BALANCE_CCT.start(), *WHITE_BALANCE_CCT.end());
-    let d = duv.clamp(-WHITE_BALANCE_DUV, WHITE_BALANCE_DUV);
+    let p = Chromaticity::from(xy);
+    let cct = p.cct();
+    let duv = p.duv(cct);
+    let c = cct.clamp(
+        f64::from(*WHITE_BALANCE_CCT.start()),
+        f64::from(*WHITE_BALANCE_CCT.end()),
+    );
+    let limit = f64::from(WHITE_BALANCE_DUV);
+    let d = duv.clamp(-limit, limit);
     if (c, d) == (cct, duv) {
         xy
     } else {
-        orr_output::xy_from_cct_duv(c, d).map(f64::from)
+        Chromaticity::from_cct_duv(c, d).into()
     }
 }
 
@@ -499,7 +501,7 @@ pub fn white_target(
             sum[2] + weight * y,
         ];
     };
-    add(1.0, virtual_light_nits, orr_output::D65_XY.map(f64::from));
+    add(1.0, virtual_light_nits, Chromaticity::D65.into());
     if count > 0.0 {
         let mean_xy = [yxy[0] / yxy[2], yxy[1] / yxy[2]];
         add(f64::from(weights.histogram), yxy[2] / count, mean_xy);
@@ -518,25 +520,6 @@ pub fn white_target(
         add(f64::from(weights.directional), card, xy_from_xyz(e));
     }
     white_in_range([sum[0] / sum[2], sum[1] / sum[2]])
-}
-
-/// The CPU model of `cat16_rec2020` in `orr.color`: the matrix on linear Rec.2020 that
-/// adapts white `from` to white `to`.
-pub fn cat16_rec2020(from: [f64; 2], to: [f64; 2]) -> DMat3 {
-    let m = DMat3::from_rows(
-        DVec3::new(0.401288, 0.650173, -0.051461),
-        DVec3::new(-0.250268, 1.204414, 0.045854),
-        DVec3::new(-0.002079, 0.048952, 0.953127),
-    );
-    let gain = DMat3::from_diagonal((m * xyz_from_xy(to)) / (m * xyz_from_xy(from)));
-    let p = RgbPrimaries::REC2020;
-    p.xyz_to_rgb() * m.inverse() * gain * m * p.rgb_to_xyz()
-}
-
-/// CIE 1960 uv of `xy`.
-pub fn uv_from_xy(xy: [f64; 2]) -> [f64; 2] {
-    let d = -2.0 * xy[0] + 12.0 * xy[1] + 3.0;
-    [4.0 * xy[0] / d, 6.0 * xy[1] / d]
 }
 
 /// The lens map of `orr_scene::LensDistortion` in f64, in output pixels with pixel centers

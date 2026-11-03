@@ -49,11 +49,6 @@ fn cube() -> Vec<basics::CubeVertex> {
     out
 }
 
-/// Row-major rows, as Slang's `float4x4` reads them.
-fn rows(m: Mat4) -> [[f32; 4]; 4] {
-    m.transpose().to_cols_array_2d()
-}
-
 fn main() {
     let options = Options::from_args();
     let capture = run(&options);
@@ -164,8 +159,8 @@ pub(crate) fn run(options: &Options) -> Capture {
         let angle = frame as f32 * 0.03;
         let model = Mat4::from_rotation_y(angle) * Mat4::from_rotation_x(angle * 0.6);
         roots.as_mut_slice().unwrap()[slot] = basics::Root {
-            clip_from_object: rows(projection * view * model),
-            world_from_object: rows(model),
+            clip_from_object: (projection * view * model).transpose().to_cols_array_2d(),
+            world_from_object: model.transpose().to_cols_array_2d(),
             vertices: vertices.gpu(),
             texture,
             sampler,

@@ -1,10 +1,10 @@
 //! Scene tables, uploads, groups, lights and views against what was written.
 
-use glam::{DQuat, DVec3, Quat, UVec2, Vec2, Vec3, Vec4};
 use orr_gpu::{GpuPtr, Hazards, MemoryKind, Stages};
+use orr_math::{DQuat, DVec3, Quat, UVec2, Vec2, Vec3, Vec4};
 use orr_scene::testing::{assert_clean, device, read_buffer, wait};
 use orr_scene::{
-    Affine3, CopyVariant, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstanceGpu,
+    AffineRows, CopyVariant, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstanceGpu,
     InstanceRange, InstancesDesc, Lens, Light, LightGpu, MaterialGpu, MaterialId, ModelId, Pose,
     Projection, RendererDesc, SceneDesc, SceneId, SceneRoot, Scenes, SlotStateGpu, TextureFilter,
     TransformGroupDesc, TransformGroupId, ViewConstants, ViewDesc, WorldPos,
@@ -23,9 +23,9 @@ fn frame<'a>(scenes: &'a [SceneId]) -> FrameDesc<'a> {
     }
 }
 
-fn transform(i: u32, salt: f32) -> Affine3 {
+fn transform(i: u32, salt: f32) -> AffineRows {
     let f = i as f32;
-    Affine3 {
+    AffineRows {
         rows: [
             [1.0, 0.0, salt, f * 0.5],
             [0.0, 1.0, 0.0, -f],
@@ -275,8 +275,9 @@ fn transforms_land_in_one_scatter_from_one_or_four_threads() {
 
     let root: SceneRoot = read_buffer(root, 1)[0];
     let records = read_buffer(root.groups, 3);
-    let one = read_buffer::<Affine3>(records[groups[0].0 as usize].current.cast(), u64::from(N));
-    let four = read_buffer::<Affine3>(records[groups[1].0 as usize].current.cast(), u64::from(N));
+    let one = read_buffer::<AffineRows>(records[groups[0].0 as usize].current.cast(), u64::from(N));
+    let four =
+        read_buffer::<AffineRows>(records[groups[1].0 as usize].current.cast(), u64::from(N));
     assert!(
         one.iter()
             .enumerate()
@@ -310,8 +311,8 @@ fn previous_transforms_follow_writes() {
     };
     let read = |root: &SceneRoot, g: TransformGroupId| {
         let r = read_buffer(root.groups.offset(u64::from(g.0)), 1)[0];
-        let cur = read_buffer::<Affine3>(r.current.cast(), 4);
-        let prev = read_buffer::<Affine3>(r.previous.cast(), 4);
+        let cur = read_buffer::<AffineRows>(r.current.cast(), 4);
+        let prev = read_buffer::<AffineRows>(r.previous.cast(), 4);
         (r.current == r.previous, cur, prev)
     };
     let expect = |salt: f32| (0..4).map(|i| transform(i, salt)).collect::<Vec<_>>();
@@ -442,10 +443,8 @@ fn lights_move_with_the_render_origin() {
         assert_eq!((l[0].kind, l[1].kind, l[2].kind), (2, 3, 1));
         assert_eq!(l[2].position, [0.0; 3]);
         // Rec.709 red in Rec.2020.
-        assert!(
-            (l[0].color[0] - 0.627_403_9).abs() < 1e-6
-                && (l[0].color[1] - 0.069_097_29).abs() < 1e-6
-        );
+        let rec709_red = orr_color::rec709_to_rec2020(DVec3::X).as_vec3();
+        assert!(Vec3::from(l[0].color).abs_diff_eq(rec709_red, 1e-6));
     };
     // The lights are written against the old origin and the focus moves in the same frame.
     let root = run_frame(&mut scenes, s, |w| {
@@ -509,12 +508,12 @@ fn view_constants_project_and_reconstruct_render_positions() {
     };
     let root: SceneRoot = read_buffer(view.scene, 1)[0];
     let origin = WorldPos {
-        cell: glam::IVec3::from_slice(&root.origin_cell[..3]),
+        cell: orr_math::IVec3::from_slice(&root.origin_cell[..3]),
         offset: Vec3::ZERO,
     };
     let eye = WorldPos::new(camera, 8).relative_to(origin, 8);
     assert_eq!(Vec3::from_slice(&vc.eye_render[..3]), eye);
-    let rows = |m: [[f32; 4]; 4]| glam::Mat4::from_cols_array_2d(&m).transpose();
+    let rows = |m: [[f32; 4]; 4]| orr_math::Mat4::from_cols_array_2d(&m).transpose();
     let clip = rows(vc.clip_from_view_jittered);
     let unjittered = rows(vc.clip_from_view);
     let aspect = unjittered.y_axis.y.abs() / unjittered.x_axis.x;

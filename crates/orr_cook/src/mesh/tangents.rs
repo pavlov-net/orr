@@ -5,7 +5,7 @@
 //! shading normal `material_normal` gives from the stored tangent and from the derived one,
 //! and takes the 99th percentile of the angle between them.
 
-use orr_math::Vec3;
+use orr_math::{DVec2, Vec3};
 use orr_pack::texture::normal;
 use rayon::prelude::*;
 
@@ -190,10 +190,8 @@ fn orthonormal_basis(n: Vec3) -> (Vec3, Vec3) {
 /// triangle covering no center samples its centroid.
 fn texel_centers(map: &Raster, uv: [[f32; 2]; 3], mut f: impl FnMut(Vec3, f64)) {
     let size = [f64::from(map.w), f64::from(map.h)];
-    let p = uv.map(|t| map.texel_pos(t));
-    let cross = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
-        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
-    };
+    let p = uv.map(|t| DVec2::from(map.texel_pos(t)));
+    let cross = |a: DVec2, b: DVec2, c: DVec2| (b - a).perp_dot(c - a);
     let area2 = cross(p[0], p[1], p[2]);
     let mut any = false;
     if area2 != 0.0 {
@@ -225,8 +223,9 @@ fn texel_centers(map: &Raster, uv: [[f32; 2]; 3], mut f: impl FnMut(Vec3, f64)) 
             let mut col = ((x0 / step) - 0.5).ceil();
             while (col + 0.5) * step <= x1 {
                 let x = (col + 0.5) * step;
-                let b1 = cross(p[0], [x, y], p[2]) / area2;
-                let b2 = cross(p[0], p[1], [x, y]) / area2;
+                let q = DVec2::new(x, y);
+                let b1 = cross(p[0], q, p[2]) / area2;
+                let b2 = cross(p[0], p[1], q) / area2;
                 let w = Vec3::new((1.0 - b1 - b2) as f32, b1 as f32, b2 as f32);
                 f(w.max(Vec3::ZERO) / w.max(Vec3::ZERO).element_sum(), weight);
                 any = true;

@@ -12,7 +12,7 @@ use atmosphere_suite::{Rig, dir, sky_radiance};
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference};
 use orr_atmosphere::spectrum::{SOLAR_COLOR, SOLAR_ILLUMINANCE, SPECTRAL};
 use orr_atmosphere::{Aerosol, Atmosphere};
-use orr_color::{RgbPrimaries, delta_uv};
+use orr_color::{RgbPrimaries, delta_uv_1976};
 use orr_math::{DVec3, Vec3};
 use orr_scene::testing::assert_clean;
 
@@ -132,7 +132,7 @@ fn compare(mut sky: impl FnMut(&Atmosphere, f64, &[DVec3]) -> Vec<[f64; 3]>) -> 
             let mut line = format!("{name:>19} ({vis:5.1} km), light {elevation:6.2} deg:");
             for ((label, o), p) in ["zenith", "horizon band"].iter().zip(ours).zip(theirs) {
                 let luminance = o[1] / p[1] - 1.0;
-                let uv = delta_uv(o, p);
+                let uv = delta_uv_1976(o, p);
                 line += &format!(
                     " {label} {:.3e} cd/m^2 ({:+.1}%, u'v' {uv:.4})",
                     p[1],

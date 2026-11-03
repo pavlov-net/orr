@@ -7,8 +7,13 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# `Deserialize` for `Primaries`.
+serde = ["dep:serde"]
+
 [dependencies]
 orr_math.workspace = true
+serde = { workspace = true, features = ["derive"], optional = true }
 
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 //! World positions as an integer cell plus an f32 offset, and the render origin.
 
-use glam::{DVec3, IVec3, Vec3};
+use orr_math::{DVec3, IVec3, Vec3};
 
 /// Render origins sit on a grid of 2^9 = 512 m, or on the cell grid when cells are larger.
 pub const REBASE_GRID_LOG2: u32 = 9;

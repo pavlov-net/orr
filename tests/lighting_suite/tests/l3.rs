@@ -4,7 +4,6 @@
 use std::f64::consts::PI;
 
 use bytemuck::Zeroable;
-use glam::{DVec3, Mat3, Vec3};
 use lighting_suite::shaders::{emit, hotspot_bake, nee_probe, procedural_bake, tile_probe};
 use lighting_suite::{
     TestScene, assert_clean, compute_barrier, finish, kernels, pipeline, read, readback, render,
@@ -15,11 +14,12 @@ use orr_lighting::{
     DirectionalLight, DiscProfile, EmissiveSelection, LIGHT_TILE_SIZE, LIGHT_TILES, Light, LightId,
     LightSample, LightSetGpu, SceneLighting, SceneLightingSettings, ScenePass,
 };
+use orr_math::{Affine3, DVec3, Mat3, Vec3};
 use orr_pack::texture::octahedral;
 use orr_scene::{
-    Affine3, ClusterTopology, Cone, EmissiveGpu, GroupWriter, InstanceFlags, MaterialGpu,
-    MaterialId, MaterialWriter, ProducerDesc, ProducerId, ProducerUpdate, SceneCompute, SceneDesc,
-    SceneWriter, TransformGroupDesc, material_flags,
+    ClusterTopology, Cone, EmissiveGpu, GroupWriter, InstanceFlags, MaterialGpu, MaterialId,
+    MaterialWriter, ProducerDesc, ProducerId, ProducerUpdate, SceneCompute, SceneDesc, SceneWriter,
+    TransformGroupDesc, material_flags,
 };
 use shader_math::stats::chi_square_p;
 
@@ -420,9 +420,10 @@ fn set_producers(
             anchor,
         })
         .unwrap();
-    w.transforms(g, 0, transforms.len() as u32)
-        .unwrap()
-        .copy_from_slice(transforms);
+    let out = w.transforms(g, 0, transforms.len() as u32).unwrap();
+    for (o, &t) in out.iter_mut().zip(transforms) {
+        *o = t.into();
+    }
     let topology = [ClusterTopology {
         vertex_count: 4,
         triangles: &[[0, 1, 2], [0, 2, 3]],
@@ -460,8 +461,8 @@ fn emissive_producer_tiles_match_the_density_and_irradiance() {
     // only its double-sided quads light the receiver.
     let flip = Mat3::from_rotation_x(PI as f32);
     let transforms = [
-        Affine3::new(Mat3::IDENTITY, Vec3::new(0.0, 2.0, 0.0)),
-        Affine3::new(flip, Vec3::new(0.0, 2.5, 0.0)),
+        Affine3::from_translation(Vec3::new(0.0, 2.0, 0.0)),
+        Affine3::from_mat3_translation(flip, Vec3::new(0.0, 2.5, 0.0)),
     ];
     let quads = [
         Quads {
@@ -862,7 +863,10 @@ fn producer_power_equals_area_times_luminance_after_it_moves() {
                 w,
                 &materials,
                 DVec3::new(3000.0, 10.0, 7000.0),
-                &[Affine3::new(linear, Vec3::new(4.0, 0.0, -2.0))],
+                &[Affine3::from_mat3_translation(
+                    linear,
+                    Vec3::new(4.0, 0.0, -2.0),
+                )],
                 ProducerUpdate::EveryFrame,
             );
         },

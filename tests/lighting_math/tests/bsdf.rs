@@ -14,6 +14,7 @@ use openpbr_ref::materials::{Material, VIEW_COSINES, grid, view};
 use openpbr_ref::report::{Counts, TABLE_TOLERANCE, evaluate};
 use openpbr_ref::walk::fresnel;
 use openpbr_ref::{Bsdf, Inputs, Lobe, Reference};
+use orr_math::Vec3;
 use shader_math::stats::{Rng, SphereGrid};
 
 /// Directional albedo accuracy the plan asks of the approximation, absolute.
@@ -616,9 +617,8 @@ fn delta_values_match_the_samples_that_drew_them() {
                         "{what}: {value:?}"
                     );
                 }
-                let off = [s.wi[0] + 0.01, s.wi[1], s.wi[2]];
-                let n = off.iter().map(|x| x * x).sum::<f32>().sqrt();
-                let (value, chance) = bsdf.delta_value(component, off.map(|x| x / n));
+                let off = Vec3::new(s.wi[0] + 0.01, s.wi[1], s.wi[2]).normalize();
+                let (value, chance) = bsdf.delta_value(component, off.to_array());
                 assert!(
                     chance == 0.0 && value == [0.0; 3],
                     "{what}: off the direction"

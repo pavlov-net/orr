@@ -1,5 +1,5 @@
-//! Color for orr: RGB primaries and the matrices between them and CIE XYZ, luminance, and
-//! the sRGB, PQ and HLG transfer functions.
+//! Color for orr: RGB primaries and the matrices between them and CIE XYZ, chromaticities,
+//! luminance, and the sRGB, PQ and HLG transfer functions.
 //!
 //! orr renders in linear Rec.2020. Matrices are [`DMat3`](orr_math::DMat3)s derived in f64
 //! from the chromaticities and act on linear RGB as `m * rgb`:
@@ -12,18 +12,22 @@
 //! let rec2020 = to_rec2020 * DVec3::new(1.0, 0.5, 0.25);
 //! ```
 //!
-//! The same constants and functions exist in Slang, in f32, as the modules
-//! `orr_color.primaries`, `orr_color.luminance` and `orr_color.transfer` under
-//! [`SHADER_DIR`], an import root of every shader build.
+//! Slang has the primaries, luminance, transfer and chromaticity functions in f32 as the
+//! modules `orr_color.primaries`, `orr_color.luminance`, `orr_color.transfer` and
+//! `orr_color.chromaticity`, without CIE 1976 u'v', and ICtCp (`orr_color.ictcp`) and SDR gamut
+//! compression (`orr_color.gamut`) besides, under [`SHADER_DIR`], an import root of every
+//! shader build.
 
 #![forbid(unsafe_code)]
 
+mod chromaticity;
 mod luminance;
 mod primaries;
 mod transfer;
 
+pub use chromaticity::{Chromaticity, cat16_rec2020, cie_xyz, delta_uv_1976, uv_1976};
 pub use luminance::{LUMINOUS_EFFICACY, luminance};
-pub use primaries::{Chromaticity, Primaries, RgbPrimaries, delta_uv, uv};
+pub use primaries::{Primaries, RgbPrimaries, rec709_to_rec2020};
 pub use transfer::{
     PQ_MAX_NITS, SCRGB_WHITE_NITS, hlg_decode, hlg_encode, pq_decode, pq_encode, srgb_decode,
     srgb_encode,

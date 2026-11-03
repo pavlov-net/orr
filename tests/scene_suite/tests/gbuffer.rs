@@ -18,7 +18,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use glam::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_color::RgbPrimaries;
 use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, Instances, LodMode, Manifest, MeshInput, MeshParts,
@@ -28,6 +27,7 @@ use orr_gpu::{
     ComputePipeline, GpuPtr, Hazards, KernelSet, MemoryKind, QueueKind, SamplerIndex, ShaderModule,
     Stages, Texture, TextureRegion,
 };
+use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::clip::Clip;
 use orr_pack::instance::InstanceRecord;
 use orr_pack::material::{Material, slot};
@@ -39,7 +39,7 @@ use orr_scene::testing::{
     Image, Pixels, Tolerance, assert_clean, check, device, flip, read_buffer, read_texture, wait,
 };
 use orr_scene::{
-    Affine3, BoundTexture, ClusterWork, CopyVariant, CutGpu, DebugLod, Decal, DecalChannels,
+    AffineRows, BoundTexture, ClusterWork, CopyVariant, CutGpu, DebugLod, Decal, DecalChannels,
     DecalId, EditDesc, EditId, EditRef, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
     InstanceRange, InstancesDesc, Lens, LoadState, MaterialGpu, MaterialId, ModelId, MountId,
     PackSource, Pose, Projection, RasterGpu, RasterView, RendererDesc, SceneCompute, SceneDesc,
@@ -1154,9 +1154,7 @@ impl World {
 
 /// World from view for a camera at `eye` looking at `target`, y up.
 fn look(eye: Vec3, target: Vec3) -> Quat {
-    let back = (eye - target).normalize();
-    let right = Vec3::Y.cross(back).normalize();
-    Quat::from_mat3(&Mat3::from_cols(right, back.cross(right), back))
+    orr_math::camera::rh::view::look_at_quat(eye, target, Vec3::Y).inverse()
 }
 
 /// One placed copy: model name, rotation and translation in world space.
@@ -1204,7 +1202,8 @@ fn place_at(w: &mut World, copies: &[Item], anchor: DVec3, rt_range: f32) -> Pla
         })
         .unwrap();
     for (i, (c, model)) in copies.iter().zip(models).enumerate() {
-        s.transforms(group, i as u32, 1).unwrap()[0] = Affine3::new(c.linear, c.at);
+        s.transforms(group, i as u32, 1).unwrap()[0] =
+            Affine3::from_mat3_translation(c.linear, c.at).into();
         let range = s
             .add_instances(&InstancesDesc {
                 model,
@@ -1326,7 +1325,8 @@ fn render(
         f.request_detail(placed.scene, VIEW_PIXELS_PER_RADIAN)
             .unwrap();
         for (i, c) in moved.iter().enumerate() {
-            s.transforms(placed.group, i as u32, 1).unwrap()[0] = Affine3::new(c.linear, c.at);
+            s.transforms(placed.group, i as u32, 1).unwrap()[0] =
+                Affine3::from_mat3_translation(c.linear, c.at).into();
         }
         assert!(moved.is_empty() || moved.len() as u32 == placed.count);
     }
@@ -2331,7 +2331,7 @@ fn shoot_computed(
             f.request_detail(placed.scene, PIXELS_PER_RADIAN).unwrap();
         }
         for &(i, t) in &shot.moved {
-            s.transforms(placed.group, i, 1).unwrap()[0] = t;
+            s.transforms(placed.group, i, 1).unwrap()[0] = t.into();
         }
         write(&mut s);
     }
@@ -3359,13 +3359,10 @@ fn motion_vectors_do_not_change_when_the_render_origin_moves() {
         let wobble = (f64::from(i) * 0.7).sin();
         let eye = DVec3::new(x, 2.0 + 0.1 * wobble, 4.0);
         let moved = vec![
-            (
-                0,
-                Affine3::new(Mat3::IDENTITY, Vec3::new(x as f32, 0.0, 0.0)),
-            ),
+            (0, Affine3::from_translation(Vec3::new(x as f32, 0.0, 0.0))),
             (
                 1,
-                Affine3::new(
+                Affine3::from_mat3_translation(
                     Mat3::from_rotation_y(0.1 * i as f32),
                     Vec3::new(x as f32 - 1.0 + 0.2 * wobble as f32, 0.9, -0.5),
                 ),
@@ -3464,7 +3461,7 @@ fn ptlas_work_past_the_budget_waits_and_lands_nearest_first() {
                     })
                     .unwrap();
                 for (i, t) in s.transforms(g, 0, 40).unwrap().iter_mut().enumerate() {
-                    *t = Affine3::new(Mat3::IDENTITY, Vec3::new(i as f32 * 2.0, 0.0, 0.0));
+                    *t = Affine3::from_translation(Vec3::new(i as f32 * 2.0, 0.0, 0.0)).into();
                 }
                 s.add_instances(&InstancesDesc {
                     model,
@@ -3624,7 +3621,7 @@ fn place_rigs_of(
         .iter_mut()
         .zip(&centers)
     {
-        *t = Affine3::new(Mat3::IDENTITY, c);
+        *t = Affine3::from_translation(c).into();
     }
     let r = s
         .add_instances(&InstancesDesc {
@@ -3712,7 +3709,7 @@ fn shoot_rigs_edited(
                 .unwrap();
         }
         for &(i, m) in &shot.moved {
-            s.transforms(rigs.placed.group, i, 1).unwrap()[0] = m;
+            s.transforms(rigs.placed.group, i, 1).unwrap()[0] = m.into();
         }
     }
     for e in edits {
@@ -3961,7 +3958,7 @@ fn a_zero_transform_or_the_null_group_hides_a_posed_copy_with_its_parts() {
         .unwrap();
     {
         let mut s = f.scene(rigs.placed.scene).unwrap();
-        s.transforms(rigs.placed.group, 0, 1).unwrap()[0] = Affine3::default();
+        s.transforms(rigs.placed.group, 0, 1).unwrap()[0] = Affine3::ZERO.into();
         s.remove(InstanceRange {
             first: first + 1,
             count: 1,
@@ -4128,7 +4125,7 @@ fn rewriting_a_material_set_changes_only_the_copies_that_name_it() {
     let mut ranges = Vec::new();
     for (i, set) in [Some(0), Some(1), None].into_iter().enumerate() {
         s.transforms(group, i as u32, 1).unwrap()[0] =
-            Affine3::new(Mat3::IDENTITY, Vec3::new(i as f32 * 1.2 - 1.2, 0.0, 0.0));
+            Affine3::from_translation(Vec3::new(i as f32 * 1.2 - 1.2, 0.0, 0.0)).into();
         ranges.push(
             s.add_instances(&InstancesDesc {
                 model: plain,
@@ -4235,7 +4232,7 @@ fn a_color_factor_multiplies_its_texel_in_the_texture_primaries() {
     let r = rays(&g.view, &trace::MODULE, "pixels", 1);
     let texel = TINT_TEXEL.map(|c| f64::from(srgb_decode(f32::from(c) / 255.0)));
     for (range, &(model, primaries)) in placed.ranges.iter().zip(&TINTED) {
-        let p = orr_color::Primaries::from(primaries).rgb();
+        let p = primaries.rgb();
         let factor = RgbPrimaries::REC709.matrix_to(p) * DVec3::from(TINT_FACTOR.map(f64::from));
         let want = (p.matrix_to(RgbPrimaries::REC2020) * (factor * DVec3::from(texel))).as_vec3();
         let id = range.first + 1;
@@ -4945,7 +4942,7 @@ fn place_worms_of(w: &mut World, model: ModelId, copies: &[(Mat3, Vec3)], gpu: b
         .unwrap();
     let out = s.transforms(group, 0, n).unwrap();
     for (o, &(m, t)) in out.iter_mut().zip(copies) {
-        *o = Affine3::new(m, t);
+        *o = Affine3::from_mat3_translation(m, t).into();
     }
     let range = s
         .add_skinned(&SkinnedDesc {
@@ -4982,7 +4979,7 @@ fn write_palette(s: &mut SceneWriter<'_>, worms: &Worms, t: f32, phase: f32) {
     let out = s.transforms(worms.palette, 0, n * worms.joints).unwrap();
     for (i, chunk) in out.chunks_mut(worms.joints as usize).enumerate() {
         for (o, p) in chunk.iter_mut().zip(worm_palette(t + i as f32 * phase)) {
-            o.rows = p.rows;
+            *o = p.into();
         }
     }
 }
@@ -5150,7 +5147,11 @@ fn a_pose_kernel_samples_clips_on_the_gpu_like_the_cpu() {
         let want = worm_palette(t + copy as f32 * phase);
         for (j, p) in want.iter().enumerate() {
             let g = got[copy * worms.joints as usize + j];
-            for (a, b) in g.iter().flatten().zip(p.rows.iter().flatten()) {
+            for (a, b) in g
+                .iter()
+                .flatten()
+                .zip(AffineRows::from(*p).rows.iter().flatten())
+            {
                 worst = worst.max((a - b).abs());
             }
         }
@@ -5252,7 +5253,7 @@ fn a_pose_jump_keeps_valid_previous_positions() {
             .transforms_without_motion(cpu.palette, 0, cpu.joints)
             .unwrap();
         for (o, p) in out.iter_mut().zip(worm_palette(from)) {
-            o.rows = p.rows;
+            *o = p.into();
         }
     });
     let reach = largest_motion(&declared);
@@ -5480,7 +5481,7 @@ fn shoot_edits_with(
         s.set_focus(shot.focus.unwrap_or(shot.eye));
         f.request_detail(placed.scene, PIXELS_PER_RADIAN).unwrap();
         for &(i, t) in &shot.moved {
-            s.transforms(placed.group, i, 1).unwrap()[0] = t;
+            s.transforms(placed.group, i, 1).unwrap()[0] = t.into();
         }
         write(&mut s);
     }
@@ -5630,10 +5631,8 @@ fn fracture_model(model: &str) {
     let placed = place_models(&mut w, &models);
     let linear = Mat3::from_rotation_x(0.9);
     let at = Vec3::new(0.0, 0.0, -6.0);
-    let shown = Affine3::new(linear, at);
-    let hidden = Affine3 {
-        rows: [[0.0; 4]; 3],
-    };
+    let shown = Affine3::from_mat3_translation(linear, at);
+    let hidden = Affine3::ZERO;
     let eye = DVec3::new(0.0, 0.5, 2.0);
     let target = DVec3::new(0.0, 0.0, -6.0);
     let shot = |frame: u32, moved: Vec<(u32, Affine3)>| {
@@ -5702,7 +5701,7 @@ fn fracture_model(model: &str) {
             .map(|i| {
                 let side = i as f32 - 0.5 - 0.5 * PIECES as f32;
                 let t = at + Vec3::new(side * spread, 0.0, 0.0);
-                (i, Affine3::new(linear, t))
+                (i, Affine3::from_mat3_translation(linear, t))
             })
             .collect();
         let g = shoot(&mut w, &placed, &shot(3 + step, moved));
@@ -5808,9 +5807,7 @@ fn vertices_a_kernel_moves_have_motion_for_the_frame_they_move() {
         let placed = place_models(&mut w, &[source, model]);
         let linear = Mat3::from_rotation_x(0.9);
         let at = Vec3::new(0.0, 0.0, -6.0);
-        let hidden = Affine3 {
-            rows: [[0.0; 4]; 3],
-        };
+        let hidden = Affine3::ZERO;
         let lift = 0.25;
         let up = linear * Vec3::Y * lift;
         let eye = DVec3::new(0.0, 0.5, 2.0);
@@ -5825,19 +5822,28 @@ fn vertices_a_kernel_moves_have_motion_for_the_frame_they_move() {
         shoot(
             &mut w,
             &placed,
-            &shot(1, vec![(0, Affine3::new(linear, at)), (1, hidden)]),
+            &shot(
+                1,
+                vec![(0, Affine3::from_mat3_translation(linear, at)), (1, hidden)],
+            ),
         );
         let rigid = shoot(
             &mut w,
             &placed,
-            &shot(2, vec![(0, Affine3::new(linear, at + up))]),
+            &shot(
+                2,
+                vec![(0, Affine3::from_mat3_translation(linear, at + up))],
+            ),
         );
         assert!(largest_motion(&rigid) > 1.0, "{name}: the lift shows");
 
         shoot(
             &mut w,
             &placed,
-            &shot(3, vec![(0, hidden), (1, Affine3::new(linear, at))]),
+            &shot(
+                3,
+                vec![(0, hidden), (1, Affine3::from_mat3_translation(linear, at))],
+            ),
         );
         let quiet = shoot(&mut w, &placed, &shot(4, Vec::new()));
         assert!(
@@ -6227,16 +6233,14 @@ fn a_partial_edit_holds_what_it_touches_at_level_0_and_the_rest_keeps_its_detail
     let placed = place_models(&mut w, &[source, model]);
     let linear = Mat3::from_rotation_x(1.1);
     let at = Vec3::new(0.0, 0.0, -14.0);
-    let hidden = Affine3 {
-        rows: [[0.0; 4]; 3],
-    };
+    let hidden = Affine3::ZERO;
     let eye = DVec3::new(0.0, 0.5, 0.0);
     let target = DVec3::new(0.0, 0.0, -14.0);
     let mut sh = Shot::at(eye, target, 1);
-    sh.moved = vec![(0, Affine3::new(linear, at)), (1, hidden)];
+    sh.moved = vec![(0, Affine3::from_mat3_translation(linear, at)), (1, hidden)];
     let base = shoot(&mut w, &placed, &sh);
     let mut sh = Shot::at(eye, target, 2);
-    sh.moved = vec![(0, hidden), (1, Affine3::new(linear, at))];
+    sh.moved = vec![(0, hidden), (1, Affine3::from_mat3_translation(linear, at))];
     let g = shoot(&mut w, &placed, &sh);
     let r = rays(&g.view, &trace::MODULE, "pixels", 0);
     let (matched, covered) = parity(&g, &r, 2e-2);
@@ -6385,7 +6389,7 @@ fn a_cooked_page_draws_and_traces_like_its_placements() {
         let mut ranges = Vec::new();
         for (i, r) in near_records.iter().enumerate() {
             let m = orr_pack::instance::decode_record(&near_info.header, r);
-            s.transforms(group, i as u32, 1).unwrap()[0] = Affine3 { rows: m.rows };
+            s.transforms(group, i as u32, 1).unwrap()[0] = m.into();
             let range = s
                 .add_instances(&InstancesDesc {
                     model: ball,

@@ -1463,6 +1463,7 @@ dependencies = [
  "openpbr_ref",
  "orr_gpu",
  "orr_lighting",
+ "orr_math",
  "orr_shaders",
  "shader_math",
 ]
@@ -1472,7 +1473,6 @@ name = "lighting_suite"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
- "glam 0.34.1",
  "gpu_suite",
  "half",
  "openpbr_ref",
@@ -2072,6 +2072,7 @@ name = "orr_color"
 version = "0.0.1"
 dependencies = [
  "orr_math",
+ "serde",
 ]
 
 [[package]]
@@ -2168,7 +2169,6 @@ name = "orr_lighting"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
- "glam 0.34.1",
  "log",
  "orr_math",
  "orr_scene",
@@ -2223,6 +2223,7 @@ dependencies = [
  "bytemuck",
  "half",
  "meshopt",
+ "orr_color",
  "orr_io",
  "orr_math",
  "thiserror 2.0.21",
@@ -2234,7 +2235,6 @@ name = "orr_scene"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
- "glam 0.34.1",
  "half",
  "image",
  "log",
@@ -2309,10 +2309,10 @@ name = "pack_suite"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
- "glam 0.34.1",
  "gpu_suite",
  "orr_cook",
  "orr_gpu",
+ "orr_math",
  "orr_pack",
  "orr_scene",
  "orr_shaders",
@@ -2858,7 +2858,6 @@ name = "scene_suite"
 version = "0.0.1"
 dependencies = [
  "bytemuck",
- "glam 0.34.1",
  "gpu_suite",
  "half",
  "log",
@@ -2969,6 +2968,7 @@ dependencies = [
  "gpu_suite",
  "log",
  "orr_gpu",
+ "orr_math",
  "orr_shaders",
 ]
 

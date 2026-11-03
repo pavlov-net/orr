@@ -23,12 +23,13 @@ mod codec;
 mod omm;
 
 use bytemuck::{Pod, Zeroable};
+use orr_math::{Affine3, Vec3};
 
 pub use codec::{check_stored_page, decode_page, encode_page};
 pub use omm::*;
 
 use crate::blob::{put_table, read, table};
-use crate::{Aabb, Affine3, Error, Result, Span, Sphere};
+use crate::{Aabb, Error, Result, Span, Sphere};
 
 pub const SCHEMA: u16 = 6;
 
@@ -629,16 +630,16 @@ pub fn skin(view: &PageView<'_>, c: &Cluster, palette: &[Affine3], out: &mut [[f
     assert!(view.has(MeshHeader::SKIN), "the mesh has no skin");
     let n = usize::from(c.vertex_count);
     for (v, o) in (0..).zip(&mut out[..n]) {
-        let p = view.position(c, v);
+        let p = Vec3::from(view.position(c, v));
         let joints = view.joints(c, v).unwrap();
         let weights = view.weights(c, v).unwrap();
-        *o = [0.0; 3];
+        let mut sum = Vec3::ZERO;
         for (j, w) in joints.into_iter().zip(weights) {
             if w > 0.0 {
-                let q = palette[usize::from(j)].transform_point(p);
-                (0..3).for_each(|a| o[a] += w * q[a]);
+                sum += w * palette[usize::from(j)].transform_point3(p);
             }
         }
+        *o = sum.to_array();
     }
 }
 

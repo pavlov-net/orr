@@ -20,6 +20,7 @@ use orr_gpu::{
     RayDispatchPipeline, RtasFlags, RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc, RtasSizes,
     Stages, TimelinePoint, Tlas,
 };
+use orr_math::{Mat4, Vec2};
 use orr_shaders::bytemuck::{Pod, Zeroable};
 
 use crate::shaders::{cluster_args, cluster_trace};
@@ -57,12 +58,9 @@ pub const FRONT_Z: f32 = 0.05;
 /// The 4-state values of the four micromap entries the OMM case builds (level 0).
 pub const OMM_STATES: [u8; 4] = [0, 1, 2, 3];
 
-pub fn translate(t: [f32; 3]) -> [[f32; 4]; 3] {
-    [
-        [1.0, 0.0, 0.0, t[0]],
-        [0.0, 1.0, 0.0, t[1]],
-        [0.0, 0.0, 1.0, t[2]],
-    ]
+fn translate(t: [f32; 3]) -> [[f32; 4]; 3] {
+    let m = Mat4::from_translation(t.into()).transpose();
+    [m.x_axis, m.y_axis, m.z_axis].map(|row| row.to_array())
 }
 
 /// One cluster as the CPU describes it.
@@ -300,14 +298,15 @@ struct Expect {
 }
 
 fn cross(a: [f32; 2], b: [f32; 2], p: [f32; 2]) -> f32 {
-    (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+    let a = Vec2::from(a);
+    (Vec2::from(b) - a).perp_dot(Vec2::from(p) - a)
 }
 
 fn seg_dist(a: [f32; 2], b: [f32; 2], p: [f32; 2]) -> f32 {
-    let (ex, ey) = (b[0] - a[0], b[1] - a[1]);
-    let t = (((p[0] - a[0]) * ex + (p[1] - a[1]) * ey) / (ex * ex + ey * ey)).clamp(0.0, 1.0);
-    let (dx, dy) = (p[0] - a[0] - t * ex, p[1] - a[1] - t * ey);
-    (dx * dx + dy * dy).sqrt()
+    let (a, b, p) = (Vec2::from(a), Vec2::from(b), Vec2::from(p));
+    let e = b - a;
+    let t = ((p - a).dot(e) / e.length_squared()).clamp(0.0, 1.0);
+    (p - a - t * e).length()
 }
 
 /// The reference for ray (x, y); `None` when it passes within EDGE_EPS of an edge.

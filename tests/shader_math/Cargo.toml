@@ -9,11 +9,11 @@ publish = false
 
 [dependencies]
 orr_shaders.workspace = true
+orr_math.workspace = true
 
 [dev-dependencies]
 bytemuck.workspace = true
 orr_color.workspace = true
-orr_math.workspace = true
 orr_pack.workspace = true
 
 [build-dependencies]

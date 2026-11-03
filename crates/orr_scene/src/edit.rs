@@ -14,6 +14,7 @@ use orr_gpu::{
     Allocation, CommandList, Device, GpuAddress, GpuPtr, Hazards, MemoryKind, Micromap, RtasIo,
     Stages, TimelinePoint,
 };
+use orr_math::Vec3;
 use orr_pack::Aabb;
 use orr_pack::mesh::{Cluster, Group, MeshHeader, PageHeader};
 
@@ -101,9 +102,8 @@ pub(crate) fn plan(
         spheres.is_none_or(|spheres| {
             spheres.iter().any(|t| {
                 let s = g.simplified;
-                let d = [s.center[0] - t[0], s.center[1] - t[1], s.center[2] - t[2]];
                 let r = s.radius + t[3];
-                d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= r * r
+                Vec3::from(s.center).distance_squared(Vec3::from_slice(t)) <= r * r
             })
         })
     };

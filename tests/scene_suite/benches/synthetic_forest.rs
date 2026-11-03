@@ -20,16 +20,16 @@ use orr::orr_gpu::{
     QueueKind, QueueRequest, ShaderStage, SpecData, Stages, TimelinePoint,
 };
 use orr::{
-    Affine3, Budgets, Display, FrameDesc, FrameStats, FrameTime, GroupWriter, InstanceFlags,
-    InstanceRange, InstancesDesc, Lens, LoadState, Loading, ModelId, MountId, PackSource,
-    Projection, RasterView, Renderer, RendererDesc, SceneDesc, SceneId, TextureFilter,
-    TransformGroupDesc, ViewDesc, ViewHistoryId,
+    Budgets, Display, FrameDesc, FrameStats, FrameTime, GroupWriter, InstanceFlags, InstanceRange,
+    InstancesDesc, Lens, LoadState, Loading, ModelId, MountId, PackSource, Projection, RasterView,
+    Renderer, RendererDesc, SceneDesc, SceneId, TextureFilter, TransformGroupDesc, ViewDesc,
+    ViewHistoryId,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshParts, MeshSettings, Source,
     TextureSettings, Usage,
 };
-use orr_math::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
+use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
 use orr_pack::{AssetId, Span, Target};
 use orr_scene::testing::read_buffer_on;
@@ -536,15 +536,7 @@ fn cell_of(x: f32, z: f32) -> (i32, i32) {
 }
 
 fn affine(m: Mat3, world: Vec3, cell: (i32, i32)) -> Affine3 {
-    let t = world - anchor(cell).as_vec3();
-    let c = m.to_cols_array_2d();
-    Affine3 {
-        rows: [
-            [c[0][0], c[1][0], c[2][0], t.x],
-            [c[0][1], c[1][1], c[2][1], t.y],
-            [c[0][2], c[1][2], c[2][2], t.z],
-        ],
-    }
+    Affine3::from_mat3_translation(m, world - anchor(cell).as_vec3())
 }
 
 /// Model indices: trees first by species and variant, then grass, then ground.
@@ -743,7 +735,7 @@ impl Forest {
                     .unwrap();
                 let transforms = s.transforms(group, 0, cell.len() as u32).unwrap();
                 for (t, c) in transforms.iter_mut().zip(cell) {
-                    *t = c.at;
+                    *t = c.at.into();
                 }
                 for (i, c) in cell.iter().enumerate() {
                     let range = s
@@ -818,9 +810,7 @@ fn path(args: &Args, i: u32, frames: u32) -> (Vec3, Vec3) {
 
 /// World from view for a camera at `eye` looking at `target`, y up.
 fn look(eye: Vec3, target: Vec3) -> Quat {
-    let back = (eye - target).normalize();
-    let right = Vec3::Y.cross(back).normalize();
-    Quat::from_mat3(&Mat3::from_cols(right, back.cross(right), back))
+    orr_math::camera::rh::view::look_at_quat(eye, target, Vec3::Y).inverse()
 }
 
 /// What one frame measured.

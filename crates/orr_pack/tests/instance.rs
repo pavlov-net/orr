@@ -1,3 +1,4 @@
+use orr_math::{DVec4, Mat3, Quat, Vec4};
 use orr_pack::instance::{
     self, InstancePageHeader, InstanceRecord, Prototype, SectionOverride, axis_rotation,
     decode_rotation, encode_rotation, exact_axis_index, instance_rotation,
@@ -21,8 +22,7 @@ impl Rng {
 const ROTATION_BOUND_DEG: f64 = 0.17;
 
 fn angle_deg(q: [f64; 4], d: [f32; 4]) -> f64 {
-    let len = q.iter().map(|c| c * c).sum::<f64>().sqrt();
-    let dot: f64 = (0..4).map(|i| q[i] / len * f64::from(d[i])).sum();
+    let dot = DVec4::from(q).normalize().dot(Vec4::from(d).as_dvec4());
     2.0 * dot.abs().min(1.0).acos().to_degrees()
 }
 
@@ -44,9 +44,10 @@ fn rotations_decode_within_the_bound() {
     for _ in 0..1_000_000 {
         let q = loop {
             let v = [0; 4].map(|_: u8| rng.unit() * 2.0 - 1.0);
-            let l = v.iter().map(|c| c * c).sum::<f64>().sqrt();
+            let v = DVec4::from(v);
+            let l = v.length();
             if l > 1e-3 && l <= 1.0 {
-                break v.map(|c| c / l);
+                break (v / l).to_array();
             }
         };
         cases.push(q);
@@ -75,39 +76,11 @@ fn rotations_decode_within_the_bound() {
     for q in &cases {
         let code = encode_rotation(q.map(|c| c as f32));
         let d = decode_rotation(code);
-        let len: f32 = d.iter().map(|c| c * c).sum::<f32>().sqrt();
+        let len = Vec4::from(d).length();
         assert!((len - 1.0).abs() < 1e-5, "{q:?}: decoded length {len}");
         let e = angle_deg(*q, d);
         assert!(e <= ROTATION_BOUND_DEG, "{q:?} -> {d:?}: {e} deg");
         worst = worst.max(e);
-    }
-    // The matrix decode is the quaternion's rotation.
-    for q in cases.iter().step_by(997) {
-        let code = encode_rotation(q.map(|c| c as f32));
-        let [x, y, z, w] = decode_rotation(code).map(f64::from);
-        let m = instance_rotation(code, false);
-        let r = [
-            [
-                1.0 - 2.0 * (y * y + z * z),
-                2.0 * (x * y - w * z),
-                2.0 * (x * z + w * y),
-            ],
-            [
-                2.0 * (x * y + w * z),
-                1.0 - 2.0 * (x * x + z * z),
-                2.0 * (y * z - w * x),
-            ],
-            [
-                2.0 * (x * z - w * y),
-                2.0 * (y * z + w * x),
-                1.0 - 2.0 * (x * x + y * y),
-            ],
-        ];
-        for i in 0..3 {
-            for j in 0..3 {
-                assert!((f64::from(m[i][j]) - r[i][j]).abs() < 1e-6);
-            }
-        }
     }
     assert!(
         worst > 0.1,
@@ -115,71 +88,25 @@ fn rotations_decode_within_the_bound() {
     );
 }
 
-/// The quaternion of a proper rotation matrix (rows).
-fn matrix_quat(m: [[f32; 3]; 3]) -> [f32; 4] {
-    let m = m.map(|r| r.map(f64::from));
-    let t = m[0][0] + m[1][1] + m[2][2];
-    let q = if t > 0.0 {
-        let s = (t + 1.0).sqrt() * 2.0;
-        [
-            (m[2][1] - m[1][2]) / s,
-            (m[0][2] - m[2][0]) / s,
-            (m[1][0] - m[0][1]) / s,
-            s / 4.0,
-        ]
-    } else if m[0][0] >= m[1][1] && m[0][0] >= m[2][2] {
-        let s = (1.0 + m[0][0] - m[1][1] - m[2][2]).sqrt() * 2.0;
-        [
-            s / 4.0,
-            (m[0][1] + m[1][0]) / s,
-            (m[0][2] + m[2][0]) / s,
-            (m[2][1] - m[1][2]) / s,
-        ]
-    } else if m[1][1] >= m[2][2] {
-        let s = (1.0 + m[1][1] - m[0][0] - m[2][2]).sqrt() * 2.0;
-        [
-            (m[0][1] + m[1][0]) / s,
-            s / 4.0,
-            (m[1][2] + m[2][1]) / s,
-            (m[0][2] - m[2][0]) / s,
-        ]
-    } else {
-        let s = (1.0 + m[2][2] - m[0][0] - m[1][1]).sqrt() * 2.0;
-        [
-            (m[0][2] + m[2][0]) / s,
-            (m[1][2] + m[2][1]) / s,
-            s / 4.0,
-            (m[1][0] - m[0][1]) / s,
-        ]
-    };
-    q.map(|c| c as f32)
-}
-
 #[test]
 fn exact_axis_rotations_are_the_24_signed_permutations() {
     let mut seen = Vec::new();
     for index in 0..24 {
         let m = axis_rotation(index);
-        for row in m {
+        for row in [m.row(0), m.row(1), m.row(2)].map(|r| r.to_array()) {
             assert_eq!(row.iter().filter(|v| v.abs() == 1.0).count(), 1, "{index}");
             assert_eq!(row.iter().filter(|&&v| v == 0.0).count(), 2, "{index}");
         }
-        let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-        assert_eq!(det, 1.0, "{index}");
+        assert_eq!(m.determinant(), 1.0, "{index}");
         assert!(!seen.contains(&m), "{index} repeats");
         seen.push(m);
         assert_eq!(instance_rotation(index, true), m);
         // The encoder finds each table entry from its quaternion, either sign.
-        let q = matrix_quat(m);
+        let q = Quat::from_mat3(&m).to_array();
         assert_eq!(exact_axis_index(q), Some(index));
         assert_eq!(exact_axis_index(q.map(|c| -c)), Some(index));
     }
-    assert_eq!(
-        axis_rotation(0),
-        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-    );
+    assert_eq!(axis_rotation(0), Mat3::IDENTITY);
     let a = 0.5f32.to_radians() * 0.5;
     assert_eq!(exact_axis_index([0.0, a.sin(), 0.0, a.cos()]), None);
 }

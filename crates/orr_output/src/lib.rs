@@ -45,6 +45,7 @@ pub use hooks::{
     ChainImages, DistortionField, HookInputs, HookPass, HookPoint, Hooks, Image, hook_requests,
 };
 pub use motion_blur::{MOTION_BLUR_MAX_RADIUS, MotionBlurPass};
+pub use orr_color::Primaries;
 pub use orr_dlss::{
     self, DlssSdk, Mode as DlssMode, Quality as DlssQuality, Support as DlssSupport,
 };
@@ -55,13 +56,10 @@ pub use passes::{
     OutputKernels, OutputRoots, OutputView, SceneCapturePass, TonemapPass,
 };
 pub use present::{Display, DisplayFrame, Presented, UI_PASS};
-pub use screenshot::{Primaries, Screenshot, ScreenshotRequest};
+pub use screenshot::{Screenshot, ScreenshotRequest};
 pub use ui::{UiLayer, UiPass};
 pub use view::{GlareMethod, OutputDebug, PostQuality, Reconstruction, ViewOutput};
-pub use white_balance::{
-    AutoWhiteBalance, D65_XY, WHITE_BALANCE_CCT, WHITE_BALANCE_DUV, cct_duv_from_xy,
-    xy_from_cct_duv,
-};
+pub use white_balance::{AutoWhiteBalance, WHITE_BALANCE_CCT, WHITE_BALANCE_DUV};
 
 /// Errors from orr_output.
 #[derive(Debug, thiserror::Error)]

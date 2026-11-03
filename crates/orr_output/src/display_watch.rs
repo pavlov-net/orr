@@ -484,7 +484,10 @@ mod tests {
             max_nits: 120.389,
             max_full_frame_nits: 120.389,
             sdr_white_nits: 80.0,
-            primaries_xy: [[0.64, 0.33], [0.30, 0.60], [0.15, 0.06], [0.3127, 0.3290]],
+            primaries_xy: {
+                let p = orr_color::RgbPrimaries::REC709;
+                [p.red, p.green, p.blue, p.white].map(Into::into)
+            },
         };
         let info = wcg.display_info(Some(144.0));
         assert_eq!(info.os_hdr_on, Some(false));

@@ -1,10 +1,11 @@
 //! Lights as the API takes them and their table records.
 
 use bytemuck::Zeroable;
-use glam::{DVec3, IVec3, Vec3};
 use orr_gpu::TextureIndex;
+use orr_math::{DVec3, IVec3, Vec3};
 
 use crate::LightGpu;
+use crate::material::rec2020;
 use crate::world::{WorldPos, render_position};
 
 /// A slot in a scene's light table, below `SceneDesc::light_capacity`.
@@ -79,17 +80,6 @@ pub(crate) const LIGHT_RECT: u32 = 3;
 pub(crate) const EMISSIVE_INSTANCE: u32 = 1;
 pub(crate) const EMISSIVE_PRODUCER: u32 = 2;
 
-/// Linear Rec.709 to linear Rec.2020 (rows), as `orr.color`'s `REC709_TO_REC2020`.
-const REC709_TO_REC2020: [[f32; 3]; 3] = [
-    [0.627_403_9, 0.329_283_04, 0.043_313_066],
-    [0.069_097_29, 0.919_540_4, 0.011_362_316],
-    [0.016_391_438, 0.088_013_31, 0.895_595_25],
-];
-
-pub(crate) fn rec709_to_rec2020(c: Vec3) -> [f32; 3] {
-    REC709_TO_REC2020.map(|row| Vec3::from(row).dot(c))
-}
-
 /// The table record of `light` in the render space of the origin at `origin_cell`.
 pub(crate) fn light_gpu(light: &Light, origin_cell: IVec3, cell_log2: u32) -> LightGpu {
     let mut g = LightGpu::zeroed();
@@ -107,7 +97,7 @@ pub(crate) fn light_gpu(light: &Light, origin_cell: IVec3, cell_log2: u32) -> Li
             g.kind = LIGHT_DIRECTIONAL;
             g.radius = d.angular_radius;
             g.direction = d.direction_to_light.normalize().to_array();
-            g.color = rec709_to_rec2020(d.illuminance);
+            g.color = rec2020(d.illuminance);
             match d.disc {
                 DiscProfile::Uniform => g.disc = 0,
                 DiscProfile::LimbDarkened => g.disc = 1,
@@ -128,7 +118,7 @@ pub(crate) fn light_gpu(light: &Light, origin_cell: IVec3, cell_log2: u32) -> Li
             place(position);
             g.kind = LIGHT_SPHERE;
             g.radius = radius;
-            g.color = rec709_to_rec2020(intensity);
+            g.color = rec2020(intensity);
             if let Some(c) = cone {
                 g.direction = c.direction.normalize().to_array();
                 g.cone_cos_inner = c.inner.cos();
@@ -145,7 +135,7 @@ pub(crate) fn light_gpu(light: &Light, origin_cell: IVec3, cell_log2: u32) -> Li
             g.kind = LIGHT_RECT;
             g.edge_x = edge_x.to_array();
             g.edge_y = edge_y.to_array();
-            g.color = rec709_to_rec2020(luminance);
+            g.color = rec2020(luminance);
         }
     }
     g

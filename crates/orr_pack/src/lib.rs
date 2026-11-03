@@ -29,7 +29,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use bytemuck::{Pod, Zeroable};
-use orr_math::{Mat3, Vec3};
+use orr_math::Affine3;
 
 pub use archive::{Archive, StoredRange};
 pub use bc_split::BcLayout;
@@ -109,48 +109,26 @@ impl Aabb {
     }
 }
 
-/// An affine transform as three rows `[R | t]`, 48 B.
+/// An affine transform as three rows `[R | t]`, 48 B: the layout GPU tables and cooked data
+/// store and shaders read as `float3x4`. Compute with [`Affine3`] and convert with `From`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
-pub struct Affine3 {
+#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
+pub struct AffineRows {
     pub rows: [[f32; 4]; 3],
 }
 
-impl Affine3 {
-    pub const IDENTITY: Self = Self {
-        rows: [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-        ],
-    };
-
-    /// `m` followed by the translation `t`.
-    pub fn new(m: Mat3, t: Vec3) -> Self {
+impl From<Affine3> for AffineRows {
+    fn from(a: Affine3) -> Self {
+        let [x, y, z, t] = a.to_cols_array_2d();
         Self {
-            rows: std::array::from_fn(|i| {
-                let row = m.row(i);
-                [row.x, row.y, row.z, t[i]]
-            }),
+            rows: [0, 1, 2].map(|i| [x[i], y[i], z[i], t[i]]),
         }
     }
+}
 
-    pub fn transform_point(&self, p: [f32; 3]) -> [f32; 3] {
-        self.rows
-            .map(|r| r[0] * p[0] + r[1] * p[1] + r[2] * p[2] + r[3])
-    }
-
-    /// `self x o`: `o` applies first.
-    pub fn mul(&self, o: &Self) -> Self {
-        let (a, b) = (&self.rows, &o.rows);
-        Self {
-            rows: std::array::from_fn(|i| {
-                std::array::from_fn(|j| {
-                    let t = if j == 3 { a[i][3] } else { 0.0 };
-                    a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j] + t
-                })
-            }),
-        }
+impl From<AffineRows> for Affine3 {
+    fn from(a: AffineRows) -> Self {
+        Self::from_cols_array_2d(&[0, 1, 2, 3].map(|c| a.rows.map(|r| r[c])))
     }
 }
 

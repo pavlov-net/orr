@@ -174,25 +174,19 @@ fn scatter_set_cooks_within_its_error_bounds() {
                 &recs_src[u32::from_le_bytes(user[4 * k..4 * k + 4].try_into().unwrap()) as usize];
             for ax in 0..3 {
                 let want = f64::from(r.f[ax]) - corner[ax];
-                let err = (f64::from(m.rows[ax][3]) - want).abs();
+                let got = m.translation[ax];
+                let err = (f64::from(got) - want).abs();
                 assert!(
-                    err <= half[ax] + f64::from(ulp(m.rows[ax][3])),
+                    err <= half[ax] + f64::from(ulp(got)),
                     "{name}: axis {ax} error {err}, want {want} got {} origin {:?} extent {:?}",
-                    m.rows[ax][3],
+                    got,
                     h.origin,
                     h.extent
                 );
-                pos_err = pos_err.max(err / (half[ax] + f64::from(ulp(m.rows[ax][3]))));
+                pos_err = pos_err.max(err / (half[ax] + f64::from(ulp(got))));
                 pos_abs = pos_abs.max(err);
             }
-            let col = |c: usize| {
-                DVec3::new(
-                    m.rows[0][c].into(),
-                    m.rows[1][c].into(),
-                    m.rows[2][c].into(),
-                )
-            };
-            let mut cols = [col(0), col(1), col(2)];
+            let mut cols = [0, 1, 2].map(|c| m.matrix3.col(c).as_dvec3());
             for (c, v) in cols.iter_mut().enumerate() {
                 let s = v.length();
                 let err = (s / f64::from(r.f[7 + c]) - 1.0).abs();

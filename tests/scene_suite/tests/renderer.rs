@@ -8,12 +8,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use glam::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr::{
-    Affine3, ArenaReport, Budgets, CompilingKernels, DirectionalLight, DiscProfile, Exposure,
-    FrameDesc, FrameTime, Glare, GlareMethod, GroupWriter, HookPass, InstanceFlags, InstancesDesc,
-    Lens, Light, LightId, LitView, LoadState, MountId, OutputDebug, PackSource, PathEntry,
-    PipelineId, PostQuality, Projection, ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId,
+    ArenaReport, Budgets, CompilingKernels, DirectionalLight, DiscProfile, Exposure, FrameDesc,
+    FrameTime, Glare, GlareMethod, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens,
+    Light, LightId, LitView, LoadState, MountId, OutputDebug, PackSource, PathEntry, PipelineId,
+    PostQuality, Projection, ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId,
     TextureFilter, TransformGroupDesc, TransparencyPass, ViewDesc, ViewHooks, ViewLighting,
     ViewOutput, ViewTarget,
 };
@@ -21,6 +20,7 @@ use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source
 use orr_gpu::{
     Format, GpuPtr, MemoryKind, SpecData, TextureDesc, TextureMemory, TextureRegion, TextureUsage,
 };
+use orr_math::{Affine3, DVec3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::material::Material;
 use orr_pack::{AssetId, Span, Target};
 use orr_scene::testing::{assert_clean, device, read_buffer, read_texture, wait};
@@ -344,13 +344,6 @@ fn lamp() -> Arc<[u8]> {
     )])
 }
 
-/// World from view for a camera at `eye` looking at the origin, y up.
-fn look_at_origin(eye: DVec3) -> Quat {
-    let back = eye.as_vec3().normalize();
-    let right = Vec3::Y.cross(back).normalize();
-    Quat::from_mat3(&Mat3::from_cols(right, back.cross(right), back))
-}
-
 fn time(frame: u32) -> FrameTime {
     FrameTime {
         absolute: f64::from(frame) / 60.0,
@@ -391,16 +384,10 @@ fn place_floor_and_box(f: &orr::Frame<'_>, scene: SceneId, models: [orr::ModelId
             anchor: DVec3::ZERO,
         })
         .unwrap();
-    let raised = Affine3 {
-        rows: [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.5],
-            [0.0, 0.0, 1.0, 0.0],
-        ],
-    };
+    let raised = Affine3::from_translation(Vec3::new(0.0, 0.5, 0.0));
     s.transforms(group, 0, 2)
         .unwrap()
-        .copy_from_slice(&[Affine3::IDENTITY, raised]);
+        .copy_from_slice(&[Affine3::IDENTITY.into(), raised.into()]);
     for (first, model) in models.into_iter().enumerate() {
         s.add_instances(&InstancesDesc {
             model,
@@ -438,7 +425,8 @@ fn view_of<'a>(
         scene,
         history,
         position: eye,
-        rotation: look_at_origin(eye),
+        rotation: orr_math::camera::rh::view::look_at_quat(eye.as_vec3(), Vec3::ZERO, Vec3::Y)
+            .inverse(),
         projection: Projection {
             fov_y: 1.0,
             near: 0.05,
@@ -831,7 +819,7 @@ fn render_view_runs_the_glare_its_lens_asks_for() {
         .unwrap();
     s.transforms(group, 0, 1)
         .unwrap()
-        .copy_from_slice(&[Affine3::IDENTITY]);
+        .copy_from_slice(&[Affine3::IDENTITY.into()]);
     s.add_instances(&InstancesDesc {
         model: lamp,
         copies: 1,

@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use glam::{DVec3, Vec3};
 use orr_gpu::{
     Allocation, ClearColor, ColorAttachment, ColorLoad, CommandList, ComputePipeline, Device,
     GpuAddress, GpuPtr, Hazards, KernelSet, LatencyMarker, LowLatency, MemoryKind, PassResult,
     QueueKind, Rendering, SamplerDesc, SamplerIndex, ShaderModule, SpecData, Stages,
     StorageImageIndex, TextureIndex, TimelinePoint,
 };
+use orr_math::{DVec3, Vec3};
 use orr_pack::AssetId;
 use orr_shaders::PathEntry;
 use rustc_hash::FxHashMap;

@@ -77,11 +77,6 @@ public uint equal_area_texel_of(float3 dir, uint n)
     return t.y * n + t.x;
 }
 
-// `TextureHeader` primaries of a cooked map.
-public static const uint PRIMARIES_REC709 = 0;
-public static const uint PRIMARIES_DISPLAY_P3 = 1;
-public static const uint PRIMARIES_REC2020 = 2;
-
 // Data of the default environment: a cooked equal-area octahedral HDR map.
 public struct EnvironmentMapGpu
 {

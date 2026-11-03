@@ -2,7 +2,6 @@
 
 use std::f64::consts::PI;
 
-use glam::{DVec3, Mat3, Vec3};
 use lighting_suite::shaders::{
     disc_probe, env_probe, fog_probe, glint, octahedral as mapping, procedural_bake,
     slab_directional, textured_probe,
@@ -17,6 +16,7 @@ use orr_lighting::{
     DirectionalLight, DirectionalState, DiscProfile, EnvironmentMapGpu, Light, LightId,
     SceneLighting,
 };
+use orr_math::{Affine3, DVec3, Mat3, Vec3};
 use orr_pack::texture::octahedral;
 use orr_scene::{LightGpu, SceneDesc};
 use shader_math::stats::{Rng, chi_square_p};
@@ -253,12 +253,8 @@ fn hdr_map_sampling_matches_its_density() {
             map: map.index,
             sampler: linear_clamp(),
             intensity: 2.0,
-            primaries: 0,
-            from_world: [
-                [r.x_axis.x, r.y_axis.x, r.z_axis.x, 0.0],
-                [r.x_axis.y, r.y_axis.y, r.z_axis.y, 0.0],
-                [r.x_axis.z, r.y_axis.z, r.z_axis.z, 0.0],
-            ],
+            primaries: orr_color::Primaries::Rec709.id().into(),
+            from_world: Affine3::from_mat3(r).into(),
         }],
         "hdr map data",
     );
@@ -285,12 +281,8 @@ fn sky_stats_match_a_uniform_environment_and_a_slab() {
             map: map.index,
             sampler: linear_clamp(),
             intensity: 1.0,
-            primaries: 2,
-            from_world: [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-            ],
+            primaries: orr_color::Primaries::Rec2020.id().into(),
+            from_world: Affine3::IDENTITY.into(),
         }],
         "uniform map data",
     );

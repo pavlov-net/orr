@@ -12,7 +12,10 @@ use egui::{
     Pos2, RawInput, Rect, TextureId, TextureOptions, TexturesDelta, Ui, pos2, vec2,
 };
 use half::f16;
-use orr_color::{RgbPrimaries, SCRGB_WHITE_NITS, pq_decode, pq_encode, srgb_decode, srgb_encode};
+use orr_color::{
+    RgbPrimaries, SCRGB_WHITE_NITS, pq_decode, pq_encode, rec709_to_rec2020, srgb_decode,
+    srgb_encode,
+};
 use orr_egui::Painter;
 use orr_math::{DMat3, DVec3};
 use orr_output::{
@@ -152,13 +155,9 @@ fn encode(linear: [f64; 3], d: &ResolvedDisplay) -> [f64; 3] {
     let pw = f64::from(d.paper_white_nits);
     match d.encoding {
         OutputFormat::Sdr => linear.map(|v| srgb_encode(v.clamp(0.0, 1.0))),
-        OutputFormat::Hdr10Pq => {
-            static M: LazyLock<DMat3> =
-                LazyLock::new(|| RgbPrimaries::REC709.matrix_to(RgbPrimaries::REC2020));
-            (*M * DVec3::from(linear))
-                .to_array()
-                .map(|v| pq_encode(v * pw))
-        }
+        OutputFormat::Hdr10Pq => rec709_to_rec2020(linear)
+            .to_array()
+            .map(|v| pq_encode(v * pw)),
         OutputFormat::ScRgb => linear.map(|v| v * pw / SCRGB_WHITE_NITS),
     }
 }
@@ -596,7 +595,7 @@ fn painter_draws_textures_clips_and_split_meshes() {
 }
 
 /// Whether a capture's display-linear `got` matches `want`: within 1e-3 of the texel's
-/// brightest channel, as `matches`. `orr.color`'s f32 PQ signal is within 1.3e-5 of ST 2084,
+/// brightest channel, as `matches`. `orr_color.transfer`'s f32 PQ signal is within 1.3e-5 of ST 2084,
 /// about 1.5e-4 in nits, and a capture over a PQ backbuffer decodes, encodes and decodes.
 fn capture_matches(got: &[f32], want: [f64; 3]) -> bool {
     let brightest = want.iter().fold(0.0, |m: f64, v| m.max(v.abs()));

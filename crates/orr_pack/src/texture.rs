@@ -37,8 +37,7 @@ pub struct TextureHeader {
     pub mip_count: u8,
     /// Mips from this one down share the last blob; `mip_count` when there is no tail.
     pub tail_first_mip: u8,
-    /// Source primaries of color texels: [`Self::REC709`], [`Self::DISPLAY_P3`] or
-    /// [`Self::REC2020`].
+    /// Source primaries of color texels: an `orr_color::Primaries` id.
     pub primaries: u8,
     pub _pad: [u8; 2],
     /// Cutoff the alpha-coverage mips were built for; NaN when not alpha-tested.
@@ -50,9 +49,6 @@ pub struct TextureHeader {
 impl TextureHeader {
     pub const D2: u8 = 0;
     pub const CUBE: u8 = 1;
-    pub const REC709: u8 = 0;
-    pub const DISPLAY_P3: u8 = 1;
-    pub const REC2020: u8 = 2;
 
     pub fn format(&self) -> Result<FormatInfo> {
         FormatInfo::of(self.vk_format).ok_or(Error::Malformed("texture format"))

@@ -12,6 +12,7 @@ orr_shaders.workspace = true
 
 [dev-dependencies]
 gpu_suite.workspace = true
+orr_math.workspace = true
 log.workspace = true
 orr_gpu.workspace = true
 

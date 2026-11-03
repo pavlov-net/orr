@@ -5,6 +5,7 @@
 
 use meshopt::{SimplifyOptions, SimplifyVertex, ffi};
 
+use orr_math::Vec3;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -414,19 +415,9 @@ fn boundary_area(
         if !border {
             continue;
         }
-        let p = |k: usize| {
-            let v = t[k] as usize * 3;
-            [positions[v], positions[v + 1], positions[v + 2]]
-        };
+        let p = |k: usize| Vec3::from_slice(&positions[t[k] as usize * 3..]);
         let (va, vb, vc) = (p(0), p(1), p(2));
-        let ab = [vb[0] - va[0], vb[1] - va[1], vb[2] - va[2]];
-        let ac = [vc[0] - va[0], vc[1] - va[1], vc[2] - va[2]];
-        let nt = [
-            ab[1] * ac[2] - ab[2] * ac[1],
-            ab[2] * ac[0] - ab[0] * ac[2],
-            ab[0] * ac[1] - ab[1] * ac[0],
-        ];
-        area += (nt[0] * nt[0] + nt[1] * nt[1] + nt[2] * nt[2]).sqrt() * 0.5;
+        area += (vb - va).cross(vc - va).length() * 0.5;
     }
     area
 }
@@ -463,14 +454,13 @@ fn dilate_borders(
             {
                 continue;
             }
-            let (va, vb, vc) = (at(ia), at(ib), at(ic));
-            let ev = [vb[0] - va[0], vb[1] - va[1], vb[2] - va[2]];
-            let el = (ev[0] * ev[0] + ev[1] * ev[1] + ev[2] * ev[2]).sqrt();
-            let cv = [va[0] - vc[0], va[1] - vc[1], va[2] - vc[2]];
-            let cp = (cv[0] * ev[0] + cv[1] * ev[1] + cv[2] * ev[2])
-                / if el > 0.0 { el * el } else { 1.0 };
-            let nv = [cv[0] - ev[0] * cp, cv[1] - ev[1] * cp, cv[2] - ev[2] * cp];
-            let nl = (nv[0] * nv[0] + nv[1] * nv[1] + nv[2] * nv[2]).sqrt();
+            let (va, vb, vc) = (Vec3::from(at(ia)), Vec3::from(at(ib)), Vec3::from(at(ic)));
+            let ev = vb - va;
+            let el = ev.length();
+            let cv = va - vc;
+            let cp = cv.dot(ev) / if el > 0.0 { el * el } else { 1.0 };
+            let nv = cv - ev * cp;
+            let nl = nv.length();
             let ns = if nl > 0.0 { el / nl } else { 0.0 };
             for v in [a, b] {
                 if locks[v as usize] & LOCK == 0 {
@@ -505,14 +495,8 @@ fn dilate_borders(
             *n = [0.0; 4];
             // SAFETY: `r` is unlocked, so the group's own.
             unsafe { positions.write(r as usize, vr) };
-            let d = [
-                vr[0] - bounds.center[0],
-                vr[1] - bounds.center[1],
-                vr[2] - bounds.center[2],
-            ];
-            bounds.radius = bounds
-                .radius
-                .max((d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt());
+            let d = Vec3::from(vr).distance(Vec3::from(bounds.center));
+            bounds.radius = bounds.radius.max(d);
         }
         // SAFETY: `i` shares `r`'s position, so it is unlocked and the group's own too.
         unsafe { positions.write(i as usize, vr) };

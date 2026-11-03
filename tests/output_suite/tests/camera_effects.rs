@@ -996,8 +996,7 @@ mod depth_of_field {
 /// they are fitted to; FFT glare against direct convolution with its kernel, and its kernel
 /// against the PSF.
 mod glare {
-    use orr_color::{RgbPrimaries, srgb_encode};
-    use orr_math::DVec3;
+    use orr_color::srgb_encode;
     use orr_output::{
         Exposure, GlareMethod, OutputDebug, OutputFormat, ResolvedDisplay, ViewOutput,
     };
@@ -1091,11 +1090,10 @@ mod glare {
         for _ in 0..3 {
             telemetry = h.frame(1.0, out, Some(display));
         }
-        let to_rec2020 = RgbPrimaries::REC709.matrix_to(RgbPrimaries::REC2020);
         let rec2020 = h
             .display_linear()
             .iter()
-            .map(|p| (to_rec2020 * DVec3::from([p[0], p[1], p[2]].map(f64::from))).to_array())
+            .map(|p| orr_color::rec709_to_rec2020([p[0], p[1], p[2]].map(f64::from)).to_array())
             .collect();
         let exposure = f64::from(orr_output::exposure_from_ev100(telemetry.adapted_ev100));
         (rec2020, exposure, f64::from(telemetry.pre_exposure))
@@ -1973,8 +1971,6 @@ mod glare {
 /// Lens distortion and chromatic aberration in tonemap's gather, and the distortion field it
 /// writes, against the analytic map.
 mod lens_distortion {
-    use orr_color::RgbPrimaries;
-    use orr_math::DVec3;
     use orr_output::{
         DistortionField, Exposure, ExposurePass, OutputDebug, OutputFormat, OutputKernels,
         OutputView, ResolvedDisplay, TonemapPass, ViewOutput,
@@ -2135,14 +2131,13 @@ mod lens_distortion {
                 field,
             );
             wait(queue.submit(vec![list], &[]).unwrap());
-            let to_rec2020 = RgbPrimaries::REC709.matrix_to(RgbPrimaries::REC2020);
             read_texture(&self.target, &whole)
                 .chunks_exact(16)
                 .map(|p| {
                     let c: [f64; 3] = std::array::from_fn(|i| {
                         f64::from(f32::from_le_bytes(p[4 * i..4 * i + 4].try_into().unwrap()))
                     });
-                    (to_rec2020 * DVec3::from(c)).to_array()
+                    orr_color::rec709_to_rec2020(c).to_array()
                 })
                 .collect()
         }

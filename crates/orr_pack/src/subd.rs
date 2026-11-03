@@ -13,10 +13,11 @@
 //! [`Page::limit`] is the reference evaluator.
 
 use bytemuck::{Pod, Zeroable};
+use orr_math::{Affine3, Vec3};
 
 use crate::blob::{put_table, read, table};
 use crate::mesh::Section;
-use crate::{Aabb, Affine3, Error, Result, Span};
+use crate::{Aabb, Error, Result, Span};
 
 pub const SCHEMA: u16 = 2;
 
@@ -187,15 +188,13 @@ impl SubdInfo {
             .iter()
             .zip(&self.skin)
             .map(|(&p, s)| {
-                let mut out = [0.0; 3];
+                let p = Vec3::from(p);
+                let mut out = Vec3::ZERO;
                 for (&j, &w) in s.joints.iter().zip(&s.weights) {
-                    let q = palette[usize::from(j)].transform_point(p);
-                    let w = f32::from(w) / 255.0;
-                    for k in 0..3 {
-                        out[k] += w * q[k];
-                    }
+                    let q = palette[usize::from(j)].transform_point3(p);
+                    out += f32::from(w) / 255.0 * q;
                 }
-                out
+                out.to_array()
             })
             .collect()
     }
@@ -377,14 +376,10 @@ pub struct Limit {
 impl Limit {
     /// The unit normal, oriented by the face winding; zero where the derivatives degenerate.
     pub fn normal(&self) -> [f32; 3] {
-        let (a, b) = (self.du, self.dv);
-        let n = [
-            a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0],
-        ];
-        let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-        if l > 0.0 { n.map(|c| c / l) } else { [0.0; 3] }
+        Vec3::from(self.du)
+            .cross(Vec3::from(self.dv))
+            .normalize_or_zero()
+            .to_array()
     }
 }
 

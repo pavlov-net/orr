@@ -592,20 +592,6 @@ fn paths_without_dispersive_hits_ignore_the_dispersion_setting() {
     assert_clean();
 }
 
-/// The CIE 1931 2-deg observer as the kernels fit it (Wyman, Sloan and Shirley's multi-lobe
-/// fit).
-fn cie_xyz(nm: f64) -> DVec3 {
-    let g = |mean: f64, below: f64, above: f64| {
-        let t = (nm - mean) / if nm < mean { below } else { above };
-        (-0.5 * t * t).exp()
-    };
-    DVec3::new(
-        1.056 * g(599.8, 37.9, 31.0) + 0.362 * g(442.0, 16.0, 26.7) - 0.065 * g(501.1, 20.4, 26.2),
-        0.821 * g(568.8, 46.9, 40.5) + 0.286 * g(530.9, 16.3, 31.1),
-        1.217 * g(437.0, 11.8, 36.0) + 0.681 * g(459.0, 26.0, 13.8),
-    )
-}
-
 /// The CPU model's wavelength step, nm, over 360-830 nm.
 const STEP_NM: f64 = 0.25;
 
@@ -618,7 +604,7 @@ fn wavelengths() -> impl Iterator<Item = f64> {
 /// trip's integral.
 fn spectral_colors() -> impl Fn(f64) -> DVec3 {
     let to_rgb = orr_color::RgbPrimaries::REC2020.xyz_to_rgb();
-    let rgb = move |nm: f64| to_rgb * cie_xyz(nm);
+    let rgb = move |nm: f64| to_rgb * orr_color::cie_xyz(nm);
     let basis = move |nm: f64| {
         let c = rgb(nm).max(DVec3::ZERO);
         c / c.element_sum()

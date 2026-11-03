@@ -1,3 +1,4 @@
+use orr_math::DVec3;
 use orr_pack::Span;
 use orr_pack::texture::{
     FormatInfo, TILE_BYTES, TextureHeader, TextureInfo, octahedral, tail_first_mip, tile,
@@ -84,7 +85,7 @@ fn header_rejects_a_wrong_tail() {
         kind: TextureHeader::D2,
         mip_count: 11,
         tail_first_mip: tail_first_mip(f, 1024, 512, 11) as u8,
-        primaries: TextureHeader::REC709,
+        primaries: orr_color::Primaries::Rec709.id(),
         _pad: [0; 2],
         alpha_cutoff: f32::NAN,
         lights: Span::default(),
@@ -112,14 +113,8 @@ fn octahedral_map_is_equal_area_and_invertible() {
     let sub = 16;
     let d = |s: f64, t: f64| octahedral::to_dir([s as f32, t as f32]).map(f64::from);
     let tri = |a: [f64; 3], b: [f64; 3], c: [f64; 3]| {
-        let u = [0, 1, 2].map(|k| b[k] - a[k]);
-        let v = [0, 1, 2].map(|k| c[k] - a[k]);
-        let x = [
-            u[1] * v[2] - u[2] * v[1],
-            u[2] * v[0] - u[0] * v[2],
-            u[0] * v[1] - u[1] * v[0],
-        ];
-        0.5 * (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt()
+        let a = DVec3::from(a);
+        0.5 * (DVec3::from(b) - a).cross(DVec3::from(c) - a).length()
     };
     let mut areas = Vec::new();
     for y in 0..n {

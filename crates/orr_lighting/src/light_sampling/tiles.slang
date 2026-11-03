@@ -2,6 +2,7 @@
 // environment's pyramid and the directional pass.
 #include "orr/root.h"
 import orr.math;
+import orr_color.chromaticity;
 import orr_color.luminance;
 import orr_color.primaries;
 import lights;
@@ -258,7 +259,7 @@ void select(uint lane: SV_GroupIndex)
     float sum = xyz.x + xyz.y + xyz.z;
     SkyStats sky;
     sky.dome_luminance = root.environment.mean.a;
-    sky.dome_xy = sum > 0.0 ? xyz.xy / sum : float2(0.3127, 0.3290);
+    sky.dome_xy = sum > 0.0 ? xy_from_xyz(xyz) : D65_XY;
     sky._pad = 0.0;
     sky.directional = set.directional_illuminance;
     *s.sky_stats = sky;

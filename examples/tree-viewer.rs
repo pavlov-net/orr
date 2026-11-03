@@ -47,10 +47,10 @@ use orr::orr_pack::model::ModelInfo;
 use orr::orr_pack::skeleton::{MAX_JOINTS, NO_PARENT, SkeletonInfo};
 use orr::orr_pack::{Archive, AssetId, Class, Target};
 use orr::{
-    Affine3, CompilingKernels, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter,
-    InstanceFlags, InstancesDesc, LightId, LitView, PackSource, Pose, Projection, Renderer,
-    RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
-    TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    CompilingKernels, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
+    InstancesDesc, LightId, LitView, PackSource, Pose, Projection, Renderer, RendererDesc,
+    SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc,
+    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_atmosphere::{Atmosphere, AtmosphereState};
 use orr_cook::{
@@ -58,7 +58,7 @@ use orr_cook::{
     PartAttribute, Source,
 };
 use orr_math::camera::rh::view;
-use orr_math::{DVec3, Mat4, Vec2, Vec3, Vec4};
+use orr_math::{Affine3, DVec3, Vec2, Vec3};
 
 const TREE: &str = "tree";
 const GROUND: &str = "ground";
@@ -249,16 +249,6 @@ fn wind_hints(path: &Path) -> HashMap<String, Hint> {
         .collect()
 }
 
-/// The model-space origin of a joint's bind space, from its inverse bind.
-fn bind_origin(inverse_bind: &Affine3) -> Vec3 {
-    let [r0, r1, r2] = inverse_bind.rows.map(Vec4::from);
-    Mat4::from_cols(r0, r1, r2, Vec4::W)
-        .transpose()
-        .inverse()
-        .w_axis
-        .truncate()
-}
-
 /// The tree's joints for the pose kernel and the joint each part follows. With a skeleton,
 /// its joints pivot at their bind positions and hang on their parents; without one, each
 /// part is a joint on the body. A joint bends by its flexibility (1 - stiffness, or its
@@ -287,7 +277,10 @@ fn rig(
     } else {
         let s = SkeletonInfo::parse(&head(archive, model.header.skeleton)).expect("skeleton");
         (
-            s.inverse_binds.iter().map(bind_origin).collect(),
+            s.inverse_binds
+                .iter()
+                .map(|ib| ib.inverse().translation)
+                .collect(),
             s.parents
                 .iter()
                 .map(|&p| (p != NO_PARENT).then_some(usize::from(p)))
@@ -490,7 +483,7 @@ fn run(options: &Options) -> Option<Capture> {
         .expect("transform group");
     w.transforms(group, 0, 2)
         .expect("transforms")
-        .fill(Affine3::IDENTITY);
+        .fill(Affine3::IDENTITY.into());
     let poses = w
         .create_transform_group(&TransformGroupDesc {
             count: parts,

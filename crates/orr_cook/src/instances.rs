@@ -675,16 +675,18 @@ fn check_joined(
     for (r, &n) in records.iter().zip(order) {
         let i = members[n];
         let m = instance::decode_record(h, r);
-        for (row, want) in m.rows.iter().zip(rel[i].to_array()) {
-            let t = f64::from(row[3]);
-            let exact = t / step == (t / step).round() && (t - want).abs() <= step * 1e-3;
-            let linear = row[..3].iter().all(|&v| v == 0.0 || v.abs() == 1.0);
-            if !exact || !linear {
-                return Err(fail(
-                    name,
-                    format!("joined placement {i} does not decode exactly onto the grid"),
-                ));
-            }
+        let linear = m
+            .matrix3
+            .to_cols_array()
+            .iter()
+            .all(|&v| v == 0.0 || v.abs() == 1.0);
+        let t = m.translation.as_dvec3();
+        let exact = t / step == (t / step).round() && t.abs_diff_eq(rel[i], step * 1e-3);
+        if !exact || !linear {
+            return Err(fail(
+                name,
+                format!("joined placement {i} does not decode exactly onto the grid"),
+            ));
         }
     }
     Ok(())

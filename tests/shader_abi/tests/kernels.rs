@@ -13,6 +13,7 @@ use orr_gpu::{
     RtasFlags, SamplerDesc, ShaderStage, SpecData, Stages, TextureDesc, TextureMemory,
     TextureRegion, TextureUsage, Tlas,
 };
+use orr_math::Vec2;
 use shader_abi::shaders::{alpha, atomic, candidates, clusters, mesh, pattern, texture};
 
 const EDGE: f32 = 2e-4;
@@ -36,13 +37,13 @@ fn ray_at(x: u32, y: u32, size: u32) -> [f32; 2] {
 
 /// The smallest signed distance from `p` to the edges of `v` (positive inside).
 fn edge_distance(v: [[f32; 2]; 3], p: [f32; 2]) -> f32 {
-    let area =
-        (v[1][0] - v[0][0]) * (v[2][1] - v[0][1]) - (v[1][1] - v[0][1]) * (v[2][0] - v[0][0]);
+    let v = v.map(Vec2::from);
+    let p = Vec2::from(p);
+    let area = (v[1] - v[0]).perp_dot(v[2] - v[0]);
     (0..3)
         .map(|e| {
             let (a, b) = (v[e], v[(e + 1) % 3]);
-            let cross = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
-            cross * area.signum() / (b[0] - a[0]).hypot(b[1] - a[1])
+            (b - a).perp_dot(p - a) * area.signum() / a.distance(b)
         })
         .fold(f32::INFINITY, f32::min)
 }

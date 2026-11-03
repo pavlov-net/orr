@@ -4,18 +4,18 @@
 
 use std::time::{Duration, Instant};
 
-use glam::DVec3;
 use orr_gpu::{GpuPtr, MemoryKind, QueueKind};
+use orr_math::DVec3;
 use orr_scene::testing::{assert_clean, device, read_buffer, wait};
 use orr_scene::{
-    Affine3, FrameDesc, FrameTime, GroupWriter, RendererDesc, SceneDesc, SceneRoot, Scenes,
+    AffineRows, FrameDesc, FrameTime, GroupWriter, RendererDesc, SceneDesc, SceneRoot, Scenes,
     TransformGroupDesc, TransformGroupId,
 };
 use scene_suite::pipeline;
 use scene_suite::shaders::gate;
 
-fn filled(salt: f32) -> Affine3 {
-    Affine3 {
+fn filled(salt: f32) -> AffineRows {
+    AffineRows {
         rows: [[salt; 4]; 3],
     }
 }
@@ -115,7 +115,7 @@ fn cpu_records_ahead_and_windows_wait_for_their_frame() {
     let root: SceneRoot = read_buffer(root, 1)[0];
     let records = read_buffer(root.groups, 4);
     for (g, salt) in groups.iter().zip([1.0, 2.0, 3.0]) {
-        let t = read_buffer::<Affine3>(records[g.0 as usize].current.cast(), 1024);
+        let t = read_buffer::<AffineRows>(records[g.0 as usize].current.cast(), 1024);
         assert!(t.iter().all(|t| *t == filled(salt)), "{g:?}");
     }
 

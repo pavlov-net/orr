@@ -15,7 +15,7 @@ orr_scene = { workspace = true, features = ["testing"] }
 orr_shaders.workspace = true
 
 [dev-dependencies]
-glam.workspace = true
+orr_math.workspace = true
 gpu_suite.workspace = true
 orr_cook = { workspace = true, features = ["gdeflate"] }
 png.workspace = true

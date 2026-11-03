@@ -9,11 +9,11 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytemuck::Pod;
-use glam::{DVec3, Quat, Vec2, Vec3};
 use orr_cook::{
     ArchiveSpec, AssetSpec, Instances, LodMode, Manifest, MaterialPatch, MeshInput, MeshSettings,
     Placement, PrototypeSpec, Source, TextureSettings,
 };
+use orr_math::{Affine3, DVec3, Quat, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{MeshHeader, MeshInfo, Node, NodePage, decode_page};
 use orr_pack::model::ModelInfo;
@@ -28,10 +28,10 @@ use orr_scene::testing::{
     assert_clean, device, global_tables, mounted_texture, read_buffer_on, read_texture_on,
 };
 use orr_scene::{
-    Affine3, BoundTexture, Budgets, EmissiveGpu, Error, FrameDesc, FrameTime, GroupWriter,
-    InstanceFlags, InstancesDesc, LoadState, MaterialGpu, MeshGpu, ModelGpu, ModelId, MountId,
-    NeuralTextures, PackSource, RendererDesc, ResidencyClass, SceneDesc, SceneId, SceneRoot,
-    SceneWriter, Scenes, TransformGroupDesc, material_flags,
+    BoundTexture, Budgets, EmissiveGpu, Error, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
+    InstancesDesc, LoadState, MaterialGpu, MeshGpu, ModelGpu, ModelId, MountId, NeuralTextures,
+    PackSource, RendererDesc, ResidencyClass, SceneDesc, SceneId, SceneRoot, SceneWriter, Scenes,
+    TransformGroupDesc, material_flags,
 };
 use scene_suite::Workers;
 
@@ -721,7 +721,7 @@ fn models_emit_and_unmounted_packs_free_after_frames_in_flight() {
             anchor: DVec3::ZERO,
         })
         .unwrap();
-    w.transforms(g, 0, 1).unwrap()[0] = Affine3::IDENTITY;
+    w.transforms(g, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
     w.add_instances(&InstancesDesc {
         model: panel,
         copies: 1,
@@ -1032,7 +1032,7 @@ fn the_traversal_requests_the_node_pages_it_needs_and_keeps_reading_them() {
                 anchor: DVec3::ZERO,
             })
             .unwrap();
-        s.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY;
+        s.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
         range = Some(
             s.add_instances(&InstancesDesc {
                 model: models[0],
@@ -1155,7 +1155,7 @@ fn add_texture(
         },
         mip_count: mips as u8,
         tail_first_mip: tail as u8,
-        primaries: TextureHeader::REC709,
+        primaries: orr_color::Primaries::Rec709.id(),
         _pad: [0; 2],
         alpha_cutoff: f32::NAN,
         lights: Span::default(),
@@ -1451,7 +1451,7 @@ fn a_texture_without_a_mip_tail_places_whole() {
         kind: TextureHeader::D2,
         mip_count: 1,
         tail_first_mip: 1,
-        primaries: TextureHeader::REC709,
+        primaries: orr_color::Primaries::Rec709.id(),
         _pad: [0; 2],
         alpha_cutoff: f32::NAN,
         lights: Span::default(),
@@ -1862,7 +1862,7 @@ fn place_copies(s: &mut SceneWriter<'_>, models: &[ModelId]) -> orr_scene::Trans
         .unwrap();
     s.transforms(group, 0, models.len() as u32)
         .unwrap()
-        .fill(Affine3::IDENTITY);
+        .fill(Affine3::IDENTITY.into());
     for (i, &model) in models.iter().enumerate() {
         s.add_instances(&InstancesDesc {
             model,
@@ -1883,9 +1883,8 @@ fn place_copies(s: &mut SceneWriter<'_>, models: &[ModelId]) -> orr_scene::Trans
 
 /// Moves copy `i` of `group` to `x` m along the x axis.
 fn move_copy(s: &mut SceneWriter<'_>, group: orr_scene::TransformGroupId, i: u32, x: f32) {
-    let mut t = Affine3::IDENTITY;
-    t.rows[0][3] = x;
-    s.transforms(group, i, 1).unwrap()[0] = t;
+    s.transforms(group, i, 1).unwrap()[0] =
+        Affine3::from_translation(Vec3::new(x, 0.0, 0.0)).into();
 }
 
 #[test]
@@ -3135,7 +3134,7 @@ fn the_resolve_writes_the_color_a_neural_set_decodes() {
                 anchor: DVec3::ZERO,
             })
             .unwrap();
-        s.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY;
+        s.transforms(group, 0, 1).unwrap()[0] = Affine3::IDENTITY.into();
         s.add_instances(&InstancesDesc {
             model,
             copies: 1,
@@ -3189,8 +3188,8 @@ fn the_resolve_writes_the_color_a_neural_set_decodes() {
                     near: 0.05,
                 },
                 lens: Lens::default(),
-                render_extent: glam::UVec2::splat(EXTENT),
-                output_extent: glam::UVec2::splat(EXTENT),
+                render_extent: orr_math::UVec2::splat(EXTENT),
+                output_extent: orr_math::UVec2::splat(EXTENT),
                 jitter: Vec2::ZERO,
                 camera_cut: true,
                 mip_bias: 0.0,

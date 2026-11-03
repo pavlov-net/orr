@@ -4,7 +4,6 @@
 //! a selected cluster's CLAS, built with the mesh's truncation, at the positions the page
 //! stores.
 
-use glam::{Vec2, Vec3};
 use gpu_suite::clusters::{self, Builder, data_flags};
 use gpu_suite::{assert_clean, device, readback, render, run, upload};
 use orr_cook::{
@@ -16,6 +15,7 @@ use orr_gpu::{
     ClassicInstance, GpuPtr, Hazards, InstanceFlags, MemoryKind, MeshPipeline, MeshPipelineDesc,
     Rendering, ShaderStage, SpecData, Stages,
 };
+use orr_math::{Vec2, Vec3};
 use orr_pack::material::Material;
 use orr_pack::mesh::{self, Cluster, MeshInfo, PageView};
 use orr_pack::{Archive, AssetId, Span, Sphere, Target};

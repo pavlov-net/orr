@@ -19,7 +19,7 @@
 #include "orr/root.h"
 import orr.abi;
 import orr.math;
-import orr.color;
+import orr_color.luminance;
 import orr.random;
 import view;
 import overlay_front;
@@ -89,7 +89,7 @@ struct Root
     TextureIndex overlay_weight;
     TextureIndex source;
     StorageImageIndex target;
-    // R16F `luminance(after - before)`; NONE after RR.
+    // R16F `guide_luminance(after - before)`; NONE after RR.
     StorageImageIndex guide;
     // Half resolution: setup, then the background gather, then the foreground layer.
     TextureIndex layer;
@@ -155,11 +155,6 @@ struct Root
     uint _pad1;
 }
 ORR_ROOT(Root);
-
-float luminance(float3 c)
-{
-    return dot(c, float3(0.25, 0.5, 0.25));
-}
 
 uint2 half_extent()
 {
@@ -476,8 +471,8 @@ void select(uint3 id: SV_DispatchThreadID, uint3 local: SV_GroupThreadID, uint3 
         }
         mean /= 16.0;
         float3 kept = c.rgb;
-        float l = luminance(c.rgb);
-        float lm = luminance(mean);
+        float l = guide_luminance(c.rgb);
+        float lm = guide_luminance(mean);
         if (abs(c.a) >= SCATTER_MIN_RADIUS && l > SCATTER_RATIO * lm && l - lm > SCATTER_EXCESS)
         {
             uint slot;
@@ -513,7 +508,7 @@ static groupshared float4 reduced[16][16];
 
 float karis(float3 c)
 {
-    return 1.0 / (1.0 + luminance(c));
+    return 1.0 / (1.0 + guide_luminance(c));
 }
 
 // Mips 1-4 of 32x32 texels of mip 0 per group.

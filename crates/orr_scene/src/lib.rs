@@ -98,7 +98,7 @@ pub use producer::{
 pub use ptlas::RtStats;
 pub use residency::{ClassStats, ResidencyClass, ResidencyStats};
 pub use scene::{
-    Affine3, CopyVariant, DebugLod, GroupWriter, InstanceFlags, InstancePageRef, InstanceRange,
+    AffineRows, CopyVariant, DebugLod, GroupWriter, InstanceFlags, InstancePageRef, InstanceRange,
     InstancesDesc, ModelId, Pose, SceneDesc, SceneId, SceneWriter, TransformGroupDesc,
     TransformGroupId,
 };

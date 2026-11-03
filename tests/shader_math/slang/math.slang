@@ -4,10 +4,6 @@ import orr.math;
 import orr.packing;
 import orr.random;
 import orr.sampling;
-import orr.color;
-import orr_color.luminance;
-import orr_color.primaries;
-import orr_color.transfer;
 
 float3 load3(float* p) { return float3(p[0], p[1], p[2]); }
 float4 load4(float* p) { return float4(p[0], p[1], p[2], p[3]); }
@@ -119,33 +115,3 @@ export __extern_cpp float orr_ggx_vndf_bounded_pdf(float* v, float* l, float ax,
 }
 
 export __extern_cpp uint orr_sample_alias(AliasEntry* table, uint count, float u) { return sample_alias(table, count, u); }
-
-// color
-
-export __extern_cpp void orr_color_matrix(uint which, float* out)
-{
-    float3x3 m;
-    switch (which)
-    {
-    case 0: m = REC709_TO_XYZ; break;
-    case 1: m = XYZ_TO_REC709; break;
-    case 2: m = REC2020_TO_XYZ; break;
-    case 3: m = XYZ_TO_REC2020; break;
-    case 4: m = P3_TO_XYZ; break;
-    case 5: m = XYZ_TO_P3; break;
-    case 6: m = REC709_TO_REC2020; break;
-    case 7: m = REC2020_TO_REC709; break;
-    case 8: m = P3_TO_REC2020; break;
-    default: m = REC2020_TO_P3; break;
-    }
-    store3x3(out, m);
-}
-export __extern_cpp float orr_luminance_rec709(float* c) { return luminance_rec709(load3(c)); }
-export __extern_cpp float orr_luminance_rec2020(float* c) { return luminance_rec2020(load3(c)); }
-export __extern_cpp void orr_srgb_encode(float* c, float* out) { store3(out, srgb_encode(load3(c))); }
-export __extern_cpp void orr_srgb_decode(float* c, float* out) { store3(out, srgb_decode(load3(c))); }
-export __extern_cpp void orr_pq_encode(float* c, float* out) { store3(out, pq_encode(load3(c))); }
-export __extern_cpp void orr_pq_decode(float* c, float* out) { store3(out, pq_decode(load3(c))); }
-export __extern_cpp void orr_ictcp_from_rec2020(float* c, float* out) { store3(out, ictcp_from_rec2020(load3(c))); }
-export __extern_cpp void orr_rec2020_from_ictcp(float* c, float* out) { store3(out, rec2020_from_ictcp(load3(c))); }
-export __extern_cpp void orr_gamut_compress(float* c, float* out) { store3(out, gamut_compress(load3(c))); }

@@ -519,9 +519,9 @@ public float3 material_color(MaterialGpu* m, uint slot, UvFootprint uv[2], float
         return factor;
     float3 texel = material_texture(m, slot, uv, float4(1.0)).rgb;
     uint primaries = (m.primaries >> (2 * slot)) & 3;
-    if (primaries == 0)
+    if (primaries == PRIMARIES_REC709)
         return mul(REC709_TO_REC2020, mul(REC2020_TO_REC709, factor) * texel);
-    if (primaries == 1)
+    if (primaries == PRIMARIES_DISPLAY_P3)
         return mul(P3_TO_REC2020, mul(REC2020_TO_P3, factor) * texel);
     return factor * texel;
 }

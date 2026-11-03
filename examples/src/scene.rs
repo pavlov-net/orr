@@ -9,13 +9,13 @@ use orr::orr_gpu::Device;
 use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    Affine3, FrameDesc, GroupWriter, InstanceFlags, InstancesDesc, Light, LightId, PackSource,
-    Renderer, SceneDesc, SceneId, SceneLightingSettings, TransformGroupDesc,
+    FrameDesc, GroupWriter, InstanceFlags, InstancesDesc, Light, LightId, PackSource, Renderer,
+    SceneDesc, SceneId, SceneLightingSettings, TransformGroupDesc,
 };
 use orr_atmosphere::presets::solar_disc;
 use orr_atmosphere::{Atmosphere, AtmosphereState};
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source};
-use orr_math::{DVec3, Vec3};
+use orr_math::{Affine3, DVec3, Vec3};
 
 use crate::mesh::MeshBuilder;
 use crate::{fixed_time, mount_at};
@@ -96,7 +96,7 @@ impl Showcase {
             .expect("transform group");
         w.transforms(group, 0, models.len() as u32)
             .expect("transforms")
-            .fill(Affine3::IDENTITY);
+            .fill(Affine3::IDENTITY.into());
         for (i, &model) in models.iter().enumerate() {
             w.add_instances(&InstancesDesc {
                 model,

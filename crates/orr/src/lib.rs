@@ -55,7 +55,7 @@ pub use orr_output::{
 pub use orr_scene::Error as SceneError;
 pub use orr_scene::{self, RasterView};
 pub use orr_scene::{
-    Affine3, ArenaReport, ArenaTarget, BlobId, BlobTarget, BoundTexture, Budgets, ClassStats,
+    AffineRows, ArenaReport, ArenaTarget, BlobId, BlobTarget, BoundTexture, Budgets, ClassStats,
     ClipRef, ClusterRef, ClusterTopology, Cone, ConsumerMarker, CopyVariant, Decal, DecalChannels,
     DecalId, DepthOfField, DirectionalLight, DiscProfile, EditDesc, EditGroupGpu, EditId, EditRef,
     EmissiveGpu, EmissiveSpan, ExposureState, Focus, FrameStats, FrameTime, Glare, GroupGpu,

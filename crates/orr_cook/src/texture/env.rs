@@ -52,7 +52,10 @@ pub(super) fn cook(
     };
     let mut map = octahedral_map(&input, n);
     let lights = match light_threshold {
-        Some(t) => extract_lights(&mut map, t, max_lights, primaries.luminance()),
+        Some(t) => {
+            let weights = primaries.rgb().luminance_weights().as_vec3().to_array();
+            extract_lights(&mut map, t, max_lights, weights)
+        }
         None => Vec::new(),
     };
     let plan = Plan {

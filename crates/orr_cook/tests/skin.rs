@@ -18,12 +18,12 @@ use std::path::{Path, PathBuf};
 use gltf::animation::util::ReadOutputs;
 use gltf::animation::{Interpolation, Property};
 use orr_cook::{ArchiveSpec, AssetSpec, GltfSettings, LodMode, Manifest, MeshSettings, Source};
-use orr_math::{Mat3, Mat4, Quat, Vec3, Vec4};
+use orr_math::{Affine3, Mat3, Mat4, Quat, Vec3, Vec4};
 use orr_pack::clip::Clip;
 use orr_pack::mesh::{self, Cluster, MeshHeader, MeshInfo, PageView};
 use orr_pack::model::ModelInfo;
 use orr_pack::skeleton::{NO_PARENT, SkeletonInfo, Trs};
-use orr_pack::{Affine3, Archive, AssetId, Class, Target};
+use orr_pack::{Archive, AssetId, Class, Target};
 
 const POSITION_MM: f64 = 0.5;
 const ROTATION_DEG: f64 = 0.1;
@@ -192,17 +192,6 @@ fn sample(times: &[f32], values: &[Vec4], interp: Interpolation, rot: bool, t: f
             )
         }
     }
-}
-
-fn mat4(a: &Affine3) -> Mat4 {
-    Mat4::from_cols_array_2d(&[0, 1, 2, 3].map(|j| {
-        [
-            a.rows[0][j],
-            a.rows[1][j],
-            a.rows[2][j],
-            if j == 3 { 1.0 } else { 0.0 },
-        ]
-    }))
 }
 
 /// Translation distance in mm and rotation angle in degrees between two transforms.
@@ -402,7 +391,7 @@ fn check(path: &Path, name: &str, settings: GltfSettings) -> (Cooked, Errors) {
     assert_ne!(info.header.attributes & MeshHeader::SKIN, 0);
 
     // Inverse binds: the source skins', the cooked ones for joints no skin names.
-    let mut ibm: Vec<Mat4> = skel.inverse_binds.iter().map(mat4).collect();
+    let mut ibm: Vec<Mat4> = skel.inverse_binds.iter().map(|&a| a.into()).collect();
     for skin in src.doc.skins() {
         if let Some(m) = skin.reader(src.buf()).read_inverse_bind_matrices() {
             for (joint, m) in skin.joints().zip(m) {
@@ -510,7 +499,7 @@ fn check(path: &Path, name: &str, settings: GltfSettings) -> (Cooked, Errors) {
             skel.model_pose(&locals, &mut pose);
             let world = src.world(&src.pose(&channels, start + t));
             for (j, &node) in nodes.iter().enumerate() {
-                let (p, r) = pose_error(&mat4(&pose[j]), &world[node]);
+                let (p, r) = pose_error(&Mat4::from(pose[j]), &world[node]);
                 err.position_mm = err.position_mm.max(p);
                 err.rotation_deg = err.rotation_deg.max(r);
             }

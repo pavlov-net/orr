@@ -20,16 +20,16 @@ use orr::orr_gpu::{QueueKind, TimelinePoint};
 use orr::orr_pack::material::{Material, slot};
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    Affine3, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
-    InstancesDesc, Lens, LoadState, PackSource, Projection, Renderer, RendererDesc, SceneDesc,
-    SceneLightingSettings, TextureFilter, TransformGroupDesc, ViewDesc,
+    Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens,
+    LoadState, PackSource, Projection, Renderer, RendererDesc, SceneDesc, SceneLightingSettings,
+    TextureFilter, TransformGroupDesc, ViewDesc,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSettings, Source, TextureSettings,
     Usage,
 };
 use orr_math::camera::rh::view;
-use orr_math::{DVec3, UVec2, Vec2, Vec3};
+use orr_math::{Affine3, DVec3, UVec2, Vec2, Vec3};
 
 const MODEL: &str = "knot and card";
 const GROUND: &str = "ground";
@@ -135,7 +135,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         .expect("transform group");
     w.transforms(group, 0, models.len() as u32)
         .expect("transforms")
-        .fill(Affine3::IDENTITY);
+        .fill(Affine3::IDENTITY.into());
     for (i, &model) in models.iter().enumerate() {
         w.add_instances(&InstancesDesc {
             model,

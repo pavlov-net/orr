@@ -3,8 +3,10 @@
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use glam::{DVec3, IVec3, Mat3, Mat4, Quat, UVec2, Vec2, Vec4};
 use orr_gpu::{Allocation, DispatchArgs, GpuPtr, Texture};
+use orr_math::camera::rh::proj::vulkan;
+use orr_math::{Affine3, DVec3, IVec3, Mat4, Quat, UVec2, Vec2, Vec4};
+use orr_pack::AffineRows;
 
 use crate::arena::ViewArena;
 use crate::raster::ViewTargets;
@@ -271,26 +273,10 @@ impl ViewHistory {
     }
 }
 
-fn rows4(m: Mat4) -> [[f32; 4]; 4] {
-    m.transpose().to_cols_array_2d()
-}
-
-fn rotation_rows(m: Mat3) -> [[f32; 4]; 3] {
-    let r = m.transpose().to_cols_array_2d();
-    r.map(|row| [row[0], row[1], row[2], 0.0])
-}
-
 /// `clip_from_view` for Vulkan clip space: reverse Z, infinite far, y down.
 pub(crate) fn clip_from_view(p: &Projection, extent: UVec2) -> Mat4 {
     let aspect = extent.x as f32 / extent.y.max(1) as f32;
-    let f = 1.0 / (0.5 * p.fov_y).tan();
-    let rows = [
-        [f / aspect, 0.0, 0.0, 0.0],
-        [0.0, -f, 0.0, 0.0],
-        [0.0, 0.0, 0.0, p.near],
-        [0.0, 0.0, -1.0, 0.0],
-    ];
-    Mat4::from_cols_array_2d(&rows).transpose()
+    vulkan::perspective_infinite_reverse(p.fov_y, aspect, p.near)
 }
 
 /// Shifts the image by `jitter` render pixels, so each sample lands at its pixel center
@@ -324,17 +310,17 @@ pub(crate) fn view_constants(
     let eye = WorldPos::new(desc.position, cell_log2);
     let origin = WorldPos {
         cell: origin_cell,
-        offset: glam::Vec3::ZERO,
+        offset: orr_math::Vec3::ZERO,
     };
-    let view_from_world = Mat3::from_quat(desc.rotation.inverse());
-    let prev_view_from_world = Mat3::from_quat(previous.rotation.inverse());
+    let rows = |m: Mat4| m.transpose().to_cols_array_2d();
+    let rotation_rows = |q: Quat| AffineRows::from(Affine3::from_quat(q.inverse())).rows;
     ViewConstants {
-        clip_from_view: rows4(clip),
-        clip_from_view_jittered: rows4(clip_jittered),
-        view_from_clip: rows4(clip_jittered.inverse()),
-        prev_clip_from_view: rows4(clip_from_view(&previous.projection, desc.output_extent)),
-        view_from_world_rotation: rotation_rows(view_from_world),
-        prev_view_from_world_rotation: rotation_rows(prev_view_from_world),
+        clip_from_view: rows(clip),
+        clip_from_view_jittered: rows(clip_jittered),
+        view_from_clip: rows(clip_jittered.inverse()),
+        prev_clip_from_view: rows(clip_from_view(&previous.projection, desc.output_extent)),
+        view_from_world_rotation: rotation_rows(desc.rotation),
+        prev_view_from_world_rotation: rotation_rows(previous.rotation),
         eye_render: eye.relative_to(origin, cell_log2).extend(0.0).to_array(),
         eye_motion: (desc.position - previous.position)
             .as_vec3()

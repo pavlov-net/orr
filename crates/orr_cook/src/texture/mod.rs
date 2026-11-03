@@ -9,6 +9,7 @@ pub(crate) mod material;
 mod mips;
 pub(crate) mod neural;
 
+pub use orr_color::Primaries;
 use orr_pack::texture::{
     ExtractedLight, FormatInfo, TILE_BYTES, TextureHeader, TextureInfo, full_mip_count, mip_size,
     normal, tail_first_mip, tile,
@@ -130,44 +131,6 @@ pub enum DataFormat {
     R32f,
     Rg32f,
     Rgba32f,
-}
-
-/// Color primaries.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Primaries {
-    Rec709,
-    DisplayP3,
-    Rec2020,
-}
-
-impl Primaries {
-    fn header(self) -> u8 {
-        match self {
-            Self::Rec709 => TextureHeader::REC709,
-            Self::DisplayP3 => TextureHeader::DISPLAY_P3,
-            Self::Rec2020 => TextureHeader::REC2020,
-        }
-    }
-
-    /// Luminance weights of linear RGB in these primaries.
-    fn luminance(self) -> [f32; 3] {
-        orr_color::Primaries::from(self)
-            .rgb()
-            .luminance_weights()
-            .as_vec3()
-            .to_array()
-    }
-}
-
-impl From<Primaries> for orr_color::Primaries {
-    fn from(p: Primaries) -> Self {
-        match p {
-            Primaries::Rec709 => Self::Rec709,
-            Primaries::DisplayP3 => Self::DisplayP3,
-            Primaries::Rec2020 => Self::Rec2020,
-        }
-    }
 }
 
 /// Mip downsampling filter, applied to linear values.
@@ -405,7 +368,7 @@ pub(crate) fn layout(
         },
         mip_count: mip_count as u8,
         tail_first_mip: tail as u8,
-        primaries: primaries.header(),
+        primaries: primaries.id(),
         _pad: [0; 2],
         alpha_cutoff,
         lights: Span::default(),

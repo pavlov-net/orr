@@ -23,8 +23,8 @@ use orr::orr_pack::material::{Material, slot};
 use orr::orr_pack::mesh::MeshInfo;
 use orr::orr_pack::{Archive, AssetId, Class, Target};
 use orr::{
-    Affine3, Budgets, CompilingKernels, DirectionalLight, DiscProfile, Display, DisplayRequest,
-    FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView,
+    Budgets, CompilingKernels, DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc,
+    FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView,
     PackSource, Projection, Renderer, RendererDesc, ResidencyClass, SceneDesc,
     SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc, ViewHooks,
     ViewLighting, ViewOutput, ViewTarget,
@@ -33,7 +33,7 @@ use orr_cook::{
     ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source, TextureSettings, Usage,
 };
 use orr_math::camera::rh::view;
-use orr_math::{DVec3, Vec3};
+use orr_math::{Affine3, DVec3, Mat3, Vec3};
 
 const HEADLESS_EXTENT: [u32; 2] = [960, 540];
 const HEADLESS_FRAMES: u64 = 240;
@@ -298,13 +298,10 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     for k in 0..PANELS {
         let z = -(k as f32) * SPACING;
         for (side, x, flip) in [(0, -1.6, 1.0f32), (1, 1.6, -1.0)] {
-            let t = Affine3 {
-                rows: [
-                    [flip, 0.0, 0.0, x],
-                    [0.0, 1.0, 0.0, 0.0],
-                    [0.0, 0.0, flip, z],
-                ],
-            };
+            let t = Affine3::from_mat3_translation(
+                Mat3::from_diagonal(Vec3::new(flip, 1.0, flip)),
+                Vec3::new(x, 0.0, z),
+            );
             placed.push((panels[(2 * k + side) % TEXTURES], t));
         }
     }
@@ -330,7 +327,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             .transforms(group, 0, placed.len() as u32)
             .expect("transforms");
         for (out, (_, t)) in transforms.iter_mut().zip(&placed) {
-            *out = *t;
+            *out = (*t).into();
         }
         for (i, &(model, _)) in placed.iter().enumerate() {
             w.add_instances(&InstancesDesc {
