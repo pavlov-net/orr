@@ -55,6 +55,18 @@ public struct GuideRoot
     public uint _pad2;
 }
 
+// A view's overlay front words, and the targets `guides/overlay_front` resolves them into.
+public struct OverlayFrontRoot
+{
+    public uint64_t* words;             // per pixel, in rows of `width`
+    public StorageImageIndex depth;     // R32F
+    public StorageImageIndex motion;    // RG16F
+    public uint width;
+    public uint height;
+    public uint _pad0;
+    public uint _pad1;
+}
+
 // The frosted-glass term: on each pixel whose dominant layer is rough transmission, the
 // transmission times the background's mean over the disc its lobes blur it by, less the
 // background there, added into ray reconstruction's depth-of-field guide, which holds

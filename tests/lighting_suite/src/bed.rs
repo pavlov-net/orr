@@ -1197,6 +1197,7 @@ impl BedFrame<'_> {
             seed: self.seed,
             dof_background: None,
             frosted_glass: false,
+            overlay_front: false,
             walking_materials: self.view.walking_materials,
         }
     }
@@ -2027,6 +2028,8 @@ pub struct Paths {
     pub dof_background: Option<DofBackgroundPass>,
     /// The depth-of-field guide every frame adds the frosted-glass term into.
     pub frost_guide: Option<FrostGuide>,
+    /// Every frame keeps the view's front layer, which [`Self::overlay_front`] reads.
+    pub overlay_front: bool,
     /// The kernels read a G-buffer without layer tiles, so the dielectric dispatch traces
     /// every tile, as a full-screen dispatch does.
     pub every_tile: bool,
@@ -2040,6 +2043,7 @@ impl Paths {
             settings,
             dof_background: None,
             frost_guide: None,
+            overlay_front: false,
             every_tile: false,
         }
     }
@@ -2067,6 +2071,7 @@ impl Paths {
         let mut pass = ViewPass {
             dof_background: self.dof_background,
             frosted_glass: self.frost_guide.is_some(),
+            overlay_front: self.overlay_front,
             ..f.pass()
         };
         if self.every_tile {
@@ -2109,6 +2114,43 @@ impl Paths {
             self.kernels
                 .record_frosted_glass(list, target, pass, g.store);
         }
+    }
+
+    /// Resolves the front layer of `bed`'s last frame and reads it: depth and motion per pixel,
+    /// in rows of [`EXTENT`] top to bottom.
+    pub fn overlay_front(&self, bed: &Bed) -> (Vec<f32>, Vec<[f32; 2]>) {
+        let view = bed.view();
+        let depth = view.overlay_depth().expect("the frame kept no front layer");
+        let motion = view
+            .overlay_motion()
+            .expect("the frame kept no front layer");
+        let depth_out = crate::readback::<f32>(PIXELS, "overlay depth readback");
+        let motion_out = crate::readback::<[u16; 2]>(PIXELS, "overlay motion readback");
+        let mut list = render().command_list().unwrap();
+        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+        self.kernels.record_overlay_front(&mut list, view);
+        list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
+        list.copy_from_texture(
+            depth_out.gpu().cast(),
+            depth,
+            &TextureRegion::whole_mip(depth.desc(), 0),
+        );
+        list.copy_from_texture(
+            motion_out.gpu().cast(),
+            motion,
+            &TextureRegion::whole_mip(motion.desc(), 0),
+        );
+        crate::finish(list);
+        let half = |b: u16| half::f16::from_bits(b).to_f32();
+        (
+            depth_out.as_slice().unwrap().to_vec(),
+            motion_out
+                .as_slice()
+                .unwrap()
+                .iter()
+                .map(|m| m.map(half))
+                .collect(),
+        )
     }
 }
 

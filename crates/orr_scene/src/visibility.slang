@@ -136,6 +136,13 @@ public float3 view_from_relative(ViewConstants* v, float3 x)
     return mul(v.view_from_world_rotation, float4(x, 0.0));
 }
 
+// Reverse-Z device depth of render-space point `p`, as the jittered projection places it.
+public float device_depth(ViewConstants* v, float3 p)
+{
+    float4 clip = mul(v.clip_from_view_jittered, float4(view_from_relative(v, p - v.eye_render.xyz), 1.0));
+    return clip.z / clip.w;
+}
+
 // Render pixels per radian at the image center.
 public float pixels_per_radian(ViewConstants* v)
 {
@@ -467,4 +474,53 @@ public PrimaryHit primary_hit(SceneRoot* s, ViewConstants* v, VisibleCluster vc,
     i.data = m.data != 0 ? m.data : s.surface_data;
     hit.input = i;
     return hit;
+}
+
+// Previous uv minus current uv, unjittered, of the point at eye-relative `relative` near `hit`
+// on triangle `triangle` of visible cluster `vc`: its previous position comes from the previous
+// transform of the same mesh-space point. A producer batch with previous positions, a skinned
+// copy skinned by last frame's palette, or an edit whose vertices a kernel moved, moves the
+// point by its vertices' motion too.
+public float2 visible_motion(SceneRoot* s, ViewConstants* v, VisibleCluster vc, PrimaryHit hit, uint triangle, float3 relative)
+{
+    float4 current = mul(v.clip_from_view, float4(view_from_relative(v, relative), 1.0));
+    Placement p = hit.placement;
+    float3 object = mul(linear_inverse(p.linear), relative - p.translation);
+    Placement prev;
+    if (!visible_placement(s, v, vc, true, prev))
+        prev = p;
+    uint entry;
+    bool deformed = false;
+    Corners c = (Corners)0;
+    SkinnedGpu k;
+    bool producer = visible_producer(s, vc, entry);
+    if (producer && s.producers[entry].strands != 0)
+    {
+        object += strand_motion(s.batches[entry], hit.input.cluster, hit.input.barycentrics.x);
+    }
+    else if (producer)
+    {
+        ProducerBatch pb = s.batches[entry];
+        deformed = pb.previous != nullptr;
+        if (deformed)
+            c = producer_triangle(pb, pb.clusters[vc.cluster], triangle, true).corners;
+    }
+    else
+    {
+        InstanceGpu inst = copy_record(s, vc.instance);
+        MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
+        deformed = copy_skin(s, inst, k);
+        if (deformed)
+            skinned_corners(k, mesh, vc.page, load_cluster(vc.page, vc.local), vc.cluster, triangle, true, c);
+        else
+            deformed = edited_corners(mesh, vc.page, vc.local, triangle, c);
+    }
+    if (deformed)
+    {
+        float2 bc = hit.input.barycentrics;
+        object += (1.0 - bc.x - bc.y) * c.position[0] + bc.x * c.position[1] + bc.y * c.position[2] - hit.object;
+    }
+    float3 prev_relative = place(prev, object) + v.eye_motion.xyz;
+    float4 previous = mul(v.prev_clip_from_view, float4(mul(v.prev_view_from_world_rotation, float4(prev_relative, 0.0)), 1.0));
+    return motion_between(previous, current);
 }

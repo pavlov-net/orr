@@ -140,8 +140,27 @@ public struct PathRoot
     public float* dof_focus;
     public float dof_aperture;
     public uint _pad0;
-    public uint _pad1;
-    public uint _pad2;
+    // The view's overlay front words (`overlay_front_word`), null while off.
+    public uint64_t* overlay_front;
+}
+
+// A pixel's front layer over the G-buffer: reverse-Z device depth in the high half, so the
+// larger word is the nearer layer whatever the motion, and half floats of the motion in the
+// low half; 0 for no layer.
+public uint64_t overlay_front_word(float depth, float2 motion)
+{
+    return (uint64_t(asuint(depth)) << 32) | uint64_t(f32tof16(motion.x) | (f32tof16(motion.y) << 16));
+}
+
+public float overlay_front_depth(uint64_t word)
+{
+    return asfloat(uint(word >> 32));
+}
+
+public float2 overlay_front_motion(uint64_t word)
+{
+    uint low = uint(word);
+    return float2(f16tof32(low & 0xffff), f16tof32(low >> 16));
 }
 
 // What the dielectric dispatch leaves the guide resolve of a pixel's first dielectric or

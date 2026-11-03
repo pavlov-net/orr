@@ -18,11 +18,12 @@ use orr_scene::{
 use crate::media::{MediaKernels, MediaSettings, MediaStats, MediaView};
 use crate::scene::{FRAME_SLOTS, Ring, device_local};
 use crate::shaders::dielectric::{dispatch, tiles};
-use crate::shaders::guides::{frost, resolve};
+use crate::shaders::guides::{frost, overlay_front, resolve};
 use crate::shaders::light_sampling::local;
 use crate::shaders::path::opaque;
 use crate::shaders::types::{
-    FrostRoot, GuideRoot, LayerGuide, LayerTilesRoot, LocalLights, ParticleLighting, PathRoot,
+    FrostRoot, GuideRoot, LayerGuide, LayerTilesRoot, LocalLights, OverlayFrontRoot,
+    ParticleLighting, PathRoot,
 };
 use crate::shaders::world_cache::update;
 use crate::subsurface::{CapTailTable, SSS_STEPS, SubsurfaceDepth};
@@ -265,41 +266,103 @@ struct Feedback {
     sampled: TextureIndex,
 }
 
-/// The background layer behind out-of-focus foreground and the frame the opaque dispatch
-/// last wrote it.
-struct DofLayer {
-    target: Target,
+/// A target the view holds only while a feature is on, with its own image slots.
+struct OptionalTarget {
+    texture: Texture,
+    store: StorageImageIndex,
     sampled: TextureIndex,
-    frame: u64,
     device: Device,
 }
 
-impl DofLayer {
-    fn new(device: &Device, extent: [u32; 2]) -> Result<Self, Error> {
+impl OptionalTarget {
+    fn new(device: &Device, format: Format, extent: [u32; 2], name: &str) -> Result<Self, Error> {
         let desc = TextureDesc::d2(
-            Format::Rgba16Float,
+            format,
             extent[0],
             extent[1],
             TextureUsage::SAMPLED | TextureUsage::STORAGE,
         );
-        let texture = device.create_texture(&desc, TextureMemory::Dedicated, "dof background")?;
+        let texture = device.create_texture(&desc, TextureMemory::Dedicated, name)?;
         let view = orr_gpu::ViewDesc::default();
         let store = device.write_storage(device.alloc_image_slot()?, &texture, &view);
         let sampled = device.write_sampled(device.alloc_image_slot()?, &texture, &view);
         Ok(Self {
-            target: Target { texture, store },
+            texture,
+            store,
             sampled,
-            frame: 0,
             device: device.clone(),
         })
     }
 }
 
-impl Drop for DofLayer {
+impl Drop for OptionalTarget {
     fn drop(&mut self) {
-        self.device
-            .free_image_slot_after_submitted(self.target.store.0);
+        self.device.free_image_slot_after_submitted(self.store.0);
         self.device.free_image_slot_after_submitted(self.sampled.0);
+    }
+}
+
+/// The background layer behind out-of-focus foreground and the frame the opaque dispatch
+/// last wrote it.
+struct DofLayer {
+    target: OptionalTarget,
+    frame: u64,
+}
+
+/// A pixel's front layer over the G-buffer: one 64-bit word per pixel, so that a fragment's
+/// depth and motion enter together and overlapping fragments in any order leave the nearest,
+/// and the targets the words resolve into.
+struct OverlayFront {
+    words: Allocation<u64>,
+    depth: OptionalTarget,
+    motion: OptionalTarget,
+    root: Allocation<OverlayFrontRoot>,
+    frame: u64,
+}
+
+impl OverlayFront {
+    fn new(device: &Device, extent: [u32; 2]) -> Result<Self, Error> {
+        let words = device_local(
+            device,
+            u64::from(extent[0]) * u64::from(extent[1]),
+            "overlay front words",
+        )?;
+        let depth = OptionalTarget::new(device, Format::R32Float, extent, "overlay depth")?;
+        let motion = OptionalTarget::new(device, Format::Rg16Float, extent, "overlay motion")?;
+        let mut root = device.gpu_malloc(MemoryKind::Upload, 1, "overlay front root")?;
+        root.as_mut_slice().expect("mapped")[0] = OverlayFrontRoot {
+            words: words.gpu(),
+            depth: depth.store,
+            motion: motion.store,
+            width: extent[0],
+            height: extent[1],
+            _pad0: 0,
+            _pad1: 0,
+        };
+        Ok(Self {
+            words,
+            depth,
+            motion,
+            root,
+            frame: 0,
+        })
+    }
+
+    fn dispatch(
+        &self,
+        list: &mut CommandList<'_>,
+        pipeline: &ComputePipeline,
+        name: &'static str,
+        [w, h]: [u32; 2],
+    ) {
+        let [gx, gy, _] = pipeline.workgroup();
+        list.begin_pass(name, false);
+        list.dispatch(
+            pipeline,
+            self.root.gpu(),
+            [w.div_ceil(gx), h.div_ceil(gy), 1],
+        );
+        list.end_pass();
     }
 }
 
@@ -381,6 +444,7 @@ pub struct LightingView {
     history_reset: bool,
     pub(crate) media: MediaView,
     dof: Option<DofLayer>,
+    overlay_front: Option<OverlayFront>,
 }
 
 impl LightingView {
@@ -475,6 +539,7 @@ impl LightingView {
             history_reset: true,
             media: MediaView::new(device)?,
             dof: None,
+            overlay_front: None,
         })
     }
 
@@ -587,7 +652,30 @@ impl LightingView {
     }
 
     pub fn dof_background_index(&self) -> Option<TextureIndex> {
-        self.dof.as_ref().map(|l| l.sampled)
+        self.dof.as_ref().map(|l| l.target.sampled)
+    }
+
+    /// R32F reverse-Z device depth of each pixel's front layer as
+    /// [`LightingKernels::record_overlay_front`] last wrote it: the nearest of the first
+    /// dielectric or presence layer where the dominant layer lies behind it, and overlay
+    /// fragments above 0.1 coverage; 0 on pixels with no such layer. `None` once an opaque
+    /// dispatch runs without [`ViewPass::overlay_front`].
+    pub fn overlay_depth(&self) -> Option<&Texture> {
+        self.overlay_front.as_ref().map(|f| &f.depth.texture)
+    }
+
+    pub fn overlay_depth_index(&self) -> Option<TextureIndex> {
+        self.overlay_front.as_ref().map(|f| f.depth.sampled)
+    }
+
+    /// RG16F, previous uv minus current uv, unjittered, of [`Self::overlay_depth`]'s layer; 0 on
+    /// pixels without one.
+    pub fn overlay_motion(&self) -> Option<&Texture> {
+        self.overlay_front.as_ref().map(|f| &f.motion.texture)
+    }
+
+    pub fn overlay_motion_index(&self) -> Option<TextureIndex> {
+        self.overlay_front.as_ref().map(|f| f.motion.sampled)
     }
 
     /// RG32_UINT: per pixel, the light feedback of the last opaque dispatch (a light's
@@ -614,6 +702,14 @@ impl LightingView {
             .as_ref()
             .filter(|l| l.frame == frame)
             .map_or(StorageImageIndex::NONE, |l| l.target.store)
+    }
+
+    /// The overlay front words when the opaque dispatch of `frame` cleared them.
+    pub(crate) fn overlay_front_words(&self, frame: u64) -> GpuPtr<u64> {
+        self.overlay_front
+            .as_ref()
+            .filter(|f| f.frame == frame)
+            .map_or(GpuPtr::NULL, |f| f.words.gpu())
     }
 
     /// The froxel counts of `frame`, once its submit has completed; `None` when that frame
@@ -690,6 +786,10 @@ pub struct ViewPass {
     /// The dielectric dispatch keeps what [`LightingKernels::record_frosted_glass`] reads:
     /// set while output's depth-of-field guide is on.
     pub frosted_glass: bool,
+    /// The view keeps a front layer for each pixel ([`LightingView::overlay_depth`]), which
+    /// [`LightingKernels::record_overlay_front`] resolves: set while output's
+    /// transparency-aware circle of confusion and velocity are on. `false` frees it.
+    pub overlay_front: bool,
     /// [`orr_scene::RasterView::walking_materials`].
     pub walking_materials: bool,
 }
@@ -769,6 +869,8 @@ struct SupportKernels {
     zero: Allocation<u32>,
     guides: ComputePipeline,
     frost: ComputePipeline,
+    overlay_clear: ComputePipeline,
+    overlay_resolve: ComputePipeline,
     local: ComputePipeline,
     media: MediaKernels,
     cap_tail: CapTailTable,
@@ -791,6 +893,8 @@ impl SupportKernels {
             zero,
             guides,
             frost: pipeline(device, kernels, &frost::MODULE, "main")?,
+            overlay_clear: pipeline(device, kernels, &overlay_front::MODULE, "clear")?,
+            overlay_resolve: pipeline(device, kernels, &overlay_front::MODULE, "resolve")?,
             local: pipeline(device, kernels, &local::MODULE, "main")?,
             media: MediaKernels::new(device, kernels)?,
             cap_tail: CapTailTable::new(device)?,
@@ -1023,6 +1127,7 @@ impl LightingKernels {
     /// traces none, never reads the cache, builds no local samplers and adds nothing to the
     /// scene's light feedback. With [`ViewPass::dof_background`] the dispatch also writes the
     /// view's background layer, made at the first such call; without it the layer is freed.
+    /// [`ViewPass::overlay_front`] clears the view's front layer the same way.
     pub fn record_opaque(
         &self,
         list: &mut CommandList<'_>,
@@ -1086,9 +1191,32 @@ impl LightingKernels {
         if pass.dof_background.is_none() {
             view.dof = None;
         } else if view.dof.is_none() {
-            let layer = DofLayer::new(&view.device, view.extent)?;
-            list.discard(&layer.target.texture);
-            view.dof = Some(layer);
+            let target = OptionalTarget::new(
+                &view.device,
+                Format::Rgba16Float,
+                view.extent,
+                "dof background",
+            )?;
+            list.discard(&target.texture);
+            view.dof = Some(DofLayer { target, frame: 0 });
+        }
+        if !pass.overlay_front {
+            view.overlay_front = None;
+        } else {
+            if view.overlay_front.is_none() {
+                let front = OverlayFront::new(&view.device, view.extent)?;
+                list.discard(&front.depth.texture);
+                list.discard(&front.motion.texture);
+                view.overlay_front = Some(front);
+            }
+            let front = view.overlay_front.as_mut().expect("made above");
+            front.frame = pass.frame;
+            front.dispatch(
+                list,
+                &self.support.overlay_clear,
+                "overlay front clear",
+                view.extent,
+            );
         }
         let (dof_background, dof_mask, dof_focus, dof_aperture) =
             match (pass.dof_background, view.dof.as_mut()) {
@@ -1158,8 +1286,7 @@ impl LightingKernels {
             dof_focus,
             dof_aperture,
             _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
+            overlay_front: GpuPtr::NULL,
         };
         view.path = Some((pass.frame, path_root));
         if !reference {
@@ -1196,7 +1323,9 @@ impl LightingKernels {
     /// [`Self::record_media`] of the same frame where it ran, and those froxels hold the camera
     /// segment through an interior, which media apply adds; without them the path samples it.
     /// Camera rays are pinhole rays whatever the reference's lens. With [`ViewPass::frosted_glass`] it also keeps each
-    /// pixel's background and rough-transmission blur for [`Self::record_frosted_glass`].
+    /// pixel's background and rough-transmission blur for [`Self::record_frosted_glass`]. With
+    /// [`ViewPass::overlay_front`], pixels whose dominant layer lies behind their first layer
+    /// take that first layer as their front layer.
     /// Records nothing without the opaque dispatch of `pass.frame`. Orders nothing after it.
     pub fn record_dielectric(
         &self,
@@ -1232,6 +1361,7 @@ impl LightingKernels {
             dielectric_depth: lighting.dielectric_depth,
             camera_medium: lighting.camera_medium.map_or(NO_MATERIAL, |m| m.0),
             dielectric_flags: flags,
+            overlay_front: view.overlay_front_words(pass.frame),
             ..path
         };
         let mut tile_flags = 0;
@@ -1332,6 +1462,21 @@ impl LightingKernels {
             [w.div_ceil(gx), h.div_ceil(gy), 1],
         );
         list.end_pass();
+    }
+
+    /// Resolves `view`'s front layer into [`LightingView::overlay_depth`] and
+    /// [`LightingView::overlay_motion`]. The caller orders it after the frame's dielectric
+    /// dispatch and transparency hook, whose fragments enter the layer through `particle_front`.
+    /// Records nothing without [`ViewPass::overlay_front`]. Orders nothing after it.
+    pub fn record_overlay_front(&self, list: &mut CommandList<'_>, view: &LightingView) {
+        if let Some(front) = &view.overlay_front {
+            front.dispatch(
+                list,
+                &self.support.overlay_resolve,
+                "overlay front",
+                view.extent,
+            );
+        }
     }
 
     /// Adds the frosted-glass term into `guide`, ray reconstruction's depth-of-field guide

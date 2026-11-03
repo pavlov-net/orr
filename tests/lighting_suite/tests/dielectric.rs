@@ -3,15 +3,16 @@
 //! medium, presence layers, a camera inside water, layer guides under camera rotation,
 //! the frosted-glass term of rough glass, dispersion: a white line through a prism against a
 //! CPU model, a dispersive furnace, and paths without dispersive hits, the layer tiles
-//! against tracing every tile, and an emissive particle seen through glass.
+//! against tracing every tile, an emissive particle seen through glass, and each pixel's front
+//! layer.
 
 use lighting_suite::bed::{
     Accumulated, Analytic, Bed, CLOUD_SPHERE, Capture, DISPERSIVE_SPHERE, EMITTER_LUMINANCE,
     EXTENT, FLOOR, FURNACE_RADIANCE, FrostGuide, GLASS_SPHERE, Item, LIGHT_FLOOR, LINE,
     LINE_HALF_HEIGHT, LINE_HALF_WIDTH, MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, PRESENCE_VEIL,
     PRESENCE_VEIL_OPACITY, PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR, Particle, ParticleLook,
-    Paths, ROUGH_SLAB, SMOOTH_FLOOR, SUN, SpareView, Spec, TINTED_SLAB, WATER_BOX, fresnel,
-    prism_corners, water_transmission,
+    Paths, ROUGH_SLAB, SLAB_THICKNESS, SMOOTH_FLOOR, SUN, SpareView, Spec, TINTED_SLAB, WATER_BOX,
+    fresnel, prism_corners, water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
 use lighting_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
@@ -25,6 +26,120 @@ use orr_scene::Opacity;
 
 /// `MATERIAL_NONE`.
 const NONE: u32 = u32::MAX;
+
+/// The front layer at the image's center after the camera turned for one frame, against the
+/// depth and motion of an opaque floor in its plane: over a floor at y = 0, a smooth glass
+/// slab's top or a veil of low coverage is the front layer, a particle above 0.1 coverage is
+/// when it is nearest, and glass in front of a particle keeps it. A particle under the floor
+/// or of low coverage, or a layer that is not there, leaves no front layer.
+#[test]
+fn the_front_layer_is_the_nearest_overlay_or_see_through_layer() {
+    let mut realtime = paths(ViewLighting::default());
+    realtime.overlay_front = true;
+    let eye = Vec3::new(0.0, 5.0, 0.01);
+    let turned = Vec3::new(0.15, 0.05, 0.0);
+    let spec = |copies| from_above(copies, Vec::new(), eye.y);
+    let [w, h] = EXTENT;
+    let pixels: Vec<usize> = (h / 2 - 4..h / 2 + 4)
+        .flat_map(|y| (w / 2 - 4..w / 2 + 4).map(move |x| (y * w + x) as usize))
+        .collect();
+    let front = |copies: Vec<Item>, particle: Option<(f32, f32)>| {
+        let mut bed = Bed::with(spec(copies));
+        if let Some((y, opacity)) = particle {
+            bed.set_particles(
+                &[Particle {
+                    center: Vec3::new(0.0, y, 0.0),
+                    size: 0.3,
+                }],
+                ParticleLook {
+                    albedo: [0.5; 3],
+                    emission: [0.0; 3],
+                    opacity,
+                    anisotropy: 0.0,
+                },
+                Opacity::Particle,
+            );
+        }
+        render_paths(&mut bed, &realtime, 1);
+        bed.follow(eye, turned, 1, &mut |list, f| realtime.record(list, f));
+        realtime.overlay_front(&bed)
+    };
+    // The depth and motion of an opaque floor at height y, as the G-buffer has them.
+    let plane = |y: f32| {
+        let mut bed = Bed::with(spec(vec![at(FLOOR, Vec3::new(0.0, y, 0.0))]));
+        render_paths(&mut bed, &realtime, 1);
+        bed.follow(eye, turned, 1, &mut |list, f| realtime.record(list, f));
+        let g = bed.guides();
+        (
+            g.depth.iter().map(|d| d[0]).collect::<Vec<_>>(),
+            g.motion.iter().map(|m| [m[0], m[1]]).collect::<Vec<_>>(),
+        )
+    };
+    let floor = at(FLOOR, Vec3::ZERO);
+    let slab = at(TINTED_SLAB, Vec3::new(0.0, 0.5, 0.0));
+    let veil = at(PRESENCE_VEIL, Vec3::new(0.0, 1.0, 0.0));
+    let slab_top = 0.5 + SLAB_THICKNESS * 0.5;
+
+    let is_plane = |what: &str, (depth, motion): (Vec<f32>, Vec<[f32; 2]>), y: f32| {
+        let (want_depth, want_motion) = plane(y);
+        for &i in &pixels {
+            assert!(
+                (depth[i] / want_depth[i] - 1.0).abs() < 1e-3,
+                "{what}: pixel {i} depth {} against {}",
+                depth[i],
+                want_depth[i]
+            );
+            let (m, want) = (motion[i], want_motion[i]);
+            assert!(
+                (m[0] - want[0]).abs() < 2e-4 && (m[1] - want[1]).abs() < 2e-4,
+                "{what}: pixel {i} motion {m:?} against {want:?}"
+            );
+        }
+        assert!(want_motion[pixels[0]][0].abs() > 1e-3, "the camera turned");
+    };
+    let is_empty = |what: &str, (depth, motion): (Vec<f32>, Vec<[f32; 2]>)| {
+        for &i in &pixels {
+            assert_eq!(depth[i], 0.0, "{what}: pixel {i}");
+            assert_eq!(motion[i], [0.0; 2], "{what}: pixel {i}");
+        }
+    };
+
+    is_empty("an opaque floor", front(vec![floor], None));
+    is_plane(
+        "glass with what lies behind dominant",
+        front(vec![floor, slab], None),
+        slab_top,
+    );
+    is_plane(
+        "a veil below half coverage",
+        front(vec![floor, veil], None),
+        1.0,
+    );
+    is_plane(
+        "a particle in the open",
+        front(vec![floor], Some((1.0, 0.5))),
+        1.0,
+    );
+    is_plane(
+        "a particle above glass",
+        front(vec![floor, slab], Some((1.5, 0.5))),
+        1.5,
+    );
+    is_plane(
+        "a particle below glass",
+        front(vec![floor, slab], Some((0.2, 0.5))),
+        slab_top,
+    );
+    is_empty(
+        "a particle under the floor",
+        front(vec![floor], Some((-1.0, 0.5))),
+    );
+    is_empty(
+        "a particle below the coverage",
+        front(vec![floor], Some((1.0, 0.05))),
+    );
+    assert_clean();
+}
 
 fn paths(settings: ViewLighting) -> Paths {
     Paths::new(&KernelSet::default(), PathEntry::Compute, settings)

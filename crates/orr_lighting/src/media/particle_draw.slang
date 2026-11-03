@@ -70,6 +70,7 @@ void particle_mesh(
 }
 
 [shader("pixel")]
+[earlydepthstencil]
 float4 particle_pixel(Vertex v, int primitive: SV_PrimitiveID) : SV_Target0
 {
     ORR_OMM(particle_pixel);

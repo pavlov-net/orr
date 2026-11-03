@@ -1064,13 +1064,6 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
     return radiance;
 }
 
-// Reverse-Z device depth of render-space point `p`, as the jittered projection places it.
-public float device_depth(ViewConstants* v, float3 p)
-{
-    float4 clip = mul(v.clip_from_view_jittered, float4(view_from_relative(v, p - v.eye_render.xyz), 1.0));
-    return clip.z / clip.w;
-}
-
 // The refracted direction of a ray along `dir` through layer `l`, without roughness: straight
 // through thin walls; false on total internal reflection.
 public bool layer_refraction(SceneRoot* s, LayerVertex l, Interior interior, float3 dir, out float3 out_dir)
@@ -1096,7 +1089,8 @@ public bool layer_refraction(SceneRoot* s, LayerVertex l, Interior interior, flo
 // Where transmission dominates, `frost` gets the blur the chain's rough interfaces give what
 // it reaches: each widens the ray by its roughness squared per m beyond it (half the cone
 // spread a rough lobe gives a path), and the widths add in quadrature.
-public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, Hit h, float3 dir, Interior interior, float coverage)
+// `front` is the layer's overlay front word where the dominant layer lies behind it, else 0.
+public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, Hit h, float3 dir, Interior interior, float coverage, out uint64_t front)
 {
     SceneRoot* s = r.scene;
     ViewConstants* v = r.view;
@@ -1129,6 +1123,7 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
         g.dominant = coverage >= 0.5 ? 1 : 0;
         g.depth = own_depth;
         g.motion = own_motion;
+        front = g.dominant == 0 ? overlay_front_word(own_depth, own_motion) : 0;
         return g;
     }
 
@@ -1203,6 +1198,7 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
     g.roughness = wr + wt > 0.0 ? (wr * own.roughness + wt * behind.roughness) / (wr + wt) : own.roughness;
     g.weight = 1.0;
     g.dominant = 1;
+    front = wr < wt ? overlay_front_word(own_depth, own_motion) : 0;
     if (wr >= wt)
     {
         g.depth = own_depth;
@@ -1321,7 +1317,10 @@ public void dielectric_body<C : ICoherence, S : ISurface, E : IEnvironment, M : 
         {
             l = layer_vertex(v, first_hit, dir);
             Bsdf b1 = prepare_vertex(s, l, interior, 0);
-            guide = layer_guides<S>(r, l, b1, first, dir, interior, coverage);
+            uint64_t front;
+            guide = layer_guides<S>(r, l, b1, first, dir, interior, coverage, front);
+            if (r.overlay_front != nullptr)
+                r.overlay_front[index] = front;
             emission = b1.emission();
             wr = luminance_rec2020(b1.albedo().specular + b1.albedo().diffuse);
             wt = luminance_rec2020(b1.albedo().transmission);

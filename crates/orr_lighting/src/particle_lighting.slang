@@ -9,6 +9,7 @@
 module particle_lighting;
 
 import orr.abi;
+import orr.atomic;
 import orr.math;
 import orr.color;
 import orr.random;
@@ -35,6 +36,7 @@ public struct ParticleLighting
     public FroxelLights* lights;        // the froxels' shadowed directional lights
     public EyeColumn* eye;              // per froxel column; null without froxels
     public LayerGuide* layers;          // the dielectric dispatch's layer memory, null for none
+    public uint64_t* overlay_front;     // per pixel of the view, its front layer; null for none
     public TextureIndex incident;       // froxel_incident; NONE without froxels
     public TextureIndex visibility;     // the shadowed lights past the first
     public TextureIndex integrated;     // froxel_integrated
@@ -225,10 +227,27 @@ public float4 particle_shade<S : ISurface, M : IMedium>(ParticleLighting* l, flo
     return float4(apply_hdr_ceiling(a * (c * pre_exposure * transmittance + fog)), a);
 }
 
+// Coverage above which an overlay fragment can be the pixel's front layer.
+static const float OVERLAY_FRONT_COVERAGE = 0.1;
+
+// Makes a fragment at image point `p` of triangle `primitive` of `hit`, visible cluster `vc`,
+// the pixel's front layer if its `coverage` passes OVERLAY_FRONT_COVERAGE and nothing nearer
+// holds the pixel. A pixel entry calling it declares [earlydepthstencil], or fragments behind
+// the opaque depth would write too.
+public void particle_front(ParticleLighting* l, VisibleCluster vc, PrimaryHit hit, uint primitive, float2 p, float coverage)
+{
+    if (l.overlay_front == nullptr || coverage <= OVERLAY_FRONT_COVERAGE)
+        return;
+    ViewConstants* v = l.view;
+    uint2 pixel = min(uint2(p), v.extent - 1);
+    float2 motion = visible_motion(l.scene, v, vc, hit, primitive, hit.relative);
+    atomic_max_u64(l.overlay_front + pixel.y * v.extent.x + pixel.x, overlay_front_word(device_depth(v, hit.input.position), motion));
+}
+
 // The stock particle draw's fragment at image point `p` of triangle `primitive` of the view's
 // visible cluster `visible` (`RasterGpu` `raster`'s): `particle_shade` with the surface's base
 // color as albedo, its emission, and the material's opacity for presence materials, else the
-// surface's coverage.
+// surface's coverage. The fragment also enters `particle_front`.
 public float4 particle_fragment<S : ISurface, M : IMedium>(ParticleLighting* l, RasterGpu* raster, uint visible, uint primitive, float2 p, float anisotropy)
 {
     VisibleCluster vc = raster.gbuffer.clusters[visible];
@@ -238,5 +257,7 @@ public float4 particle_fragment<S : ISurface, M : IMedium>(ParticleLighting* l, 
     GSurface g = S.surface(i, offset);
     bool presence = (l.scene.materials[i.material].flags & MATERIAL_PRESENCE) != 0;
     float opacity = presence ? material_opacity(i) : S.coverage(i);
-    return particle_shade<S, M>(l, p, i.position, g.bsdf.base_color, g.bsdf.emission, opacity, anisotropy);
+    float4 shaded = particle_shade<S, M>(l, p, i.position, g.bsdf.base_color, g.bsdf.emission, opacity, anisotropy);
+    particle_front(l, vc, hit, primitive, p, shaded.a);
+    return shaded;
 }

@@ -457,6 +457,7 @@ impl MediaKernels {
         pass: &ViewPass,
         lighting: &ViewLighting,
         layers: GpuPtr<LayerGuide>,
+        overlay_front: GpuPtr<u64>,
     ) -> ParticleLighting {
         let v = media.volumes.as_ref();
         let [columns, rows, slices] = v.map_or([0; 3], |v| v.shape.grid);
@@ -469,6 +470,7 @@ impl MediaKernels {
             lights: media.lights.gpu(),
             eye: v.map_or(GpuPtr::NULL, |v| v.eye.gpu()),
             layers,
+            overlay_front,
             incident: v.map_or(TextureIndex::NONE, |v| current(&v.incident)),
             visibility: v
                 .and_then(|v| v.visibility.as_ref())
@@ -622,10 +624,11 @@ impl MediaKernels {
         let radiance = view.radiance_storage();
         let layers = view.layer_guides(pass.frame);
         let dof_background = view.dof_background_store(pass.frame);
+        let overlay_front = view.overlay_front_words(pass.frame);
         let media = &mut view.media;
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         media.particle_frames[slot] = Some(pass.frame);
-        let particles = self.particle_lighting(media, scene, pass, lighting, layers);
+        let particles = self.particle_lighting(media, scene, pass, lighting, layers, overlay_front);
         let particles = media.particles.write(slot, particles);
         if media.frames[slot] != Some(pass.frame) {
             return;

@@ -14,7 +14,8 @@ use crate::{Error, KernelSet, module};
 /// Draws the visible clusters of a view's particle producer entries into its transparency
 /// overlay: each covered pixel in front of the opaque depth takes its surface's base color as
 /// albedo, its emission and its material's opacity, lit and fogged by `particle_lighting`'s
-/// `particle_shade`, blended premultiplied in the order the clusters arrive.
+/// `particle_shade`, blended premultiplied in the order the clusters arrive. Fragments above 0.1
+/// coverage also enter the view's front layer ([`crate::ViewPass::overlay_front`]) where it is on.
 pub struct ParticleDraw {
     pipeline: MeshPipeline,
 }

@@ -165,53 +165,10 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     ExposureState* exposure = v.exposure + v.exposure_slot;
     g.bsdf.emission = apply_hdr_ceiling(g.bsdf.emission * exposure.pre_exposure);
 
-    // Depth and motion of the offset point; its previous position from the previous
-    // transform of the same mesh-space point.
+    // Depth and motion of the offset point.
     float3 view_pos = view_from_relative(v, relative);
     float4 clip = mul(v.clip_from_view_jittered, float4(view_pos, 1.0));
-    float4 current = mul(v.clip_from_view, float4(view_pos, 1.0));
-    Placement p = hit.placement;
-    float3 object = mul(linear_inverse(p.linear), relative - p.translation);
-    Placement prev;
-    if (!visible_placement(s, v, vc, true, prev))
-        prev = p;
-    // A producer batch with previous positions, a skinned copy skinned by last frame's
-    // palette, or an edit whose vertices a kernel moved, moves the point by its vertices'
-    // motion too.
-    uint entry;
-    bool deformed = false;
-    Corners c = (Corners)0;
-    SkinnedGpu k;
-    bool producer = visible_producer(s, vc, entry);
-    if (producer && s.producers[entry].strands != 0)
-    {
-        object += strand_motion(s.batches[entry], hit.input.cluster, hit.input.barycentrics.x);
-    }
-    else if (producer)
-    {
-        ProducerBatch pb = s.batches[entry];
-        deformed = pb.previous != nullptr;
-        if (deformed)
-            c = producer_triangle(pb, pb.clusters[vc.cluster], visibility_triangle(w), true).corners;
-    }
-    else
-    {
-        InstanceGpu inst = copy_record(s, vc.instance);
-        MeshGpu* mesh = s.meshes + s.models[inst.model].mesh;
-        deformed = copy_skin(s, inst, k);
-        if (deformed)
-            skinned_corners(k, mesh, vc.page, load_cluster(vc.page, vc.local), vc.cluster, visibility_triangle(w), true, c);
-        else
-            deformed = edited_corners(mesh, vc.page, vc.local, visibility_triangle(w), c);
-    }
-    if (deformed)
-    {
-        float2 bc = hit.input.barycentrics;
-        object += (1.0 - bc.x - bc.y) * c.position[0] + bc.x * c.position[1] + bc.y * c.position[2] - hit.object;
-    }
-    float3 prev_relative = place(prev, object) + v.eye_motion.xyz;
-    float4 previous = mul(v.prev_clip_from_view, float4(mul(v.prev_view_from_world_rotation, float4(prev_relative, 0.0)), 1.0));
-    float2 motion = motion_between(previous, current);
+    float2 motion = visible_motion(s, v, vc, hit, visibility_triangle(w), relative);
 
     bool extended = r.x.index != IMAGE_NONE;
     GBufferWords words = encode_gsurface(g, extended);

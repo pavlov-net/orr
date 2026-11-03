@@ -1191,6 +1191,7 @@ impl<'a> Frame<'a> {
             seed: 0,
             dof_background: None,
             frosted_glass: false,
+            overlay_front: false,
             walking_materials: raster.walking_materials,
         };
         paths.begin(scene, &desc, lighting);
@@ -1216,6 +1217,7 @@ impl<'a> Frame<'a> {
                 self.scenes.transparency(&raster, store, &mut hook)?;
             }
         }
+        kernels.record_overlay_front(self.scenes.list()?, paths);
         if reconstructed || matches!(lighting.debug_view, LightingDebugView::Guide(_)) {
             let list = self.scenes.list()?;
             kernels.record_guides(list, paths, &pass, lighting);
