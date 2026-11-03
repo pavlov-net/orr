@@ -394,14 +394,11 @@ fn specular_motion_follows_the_mirror_image_under_camera_motion() {
 }
 
 /// One frame of `bed` from `eye` with no camera cut; whether the view's history resets.
-fn history_frame(bed: &mut Bed, eye: Vec3, exposure_cut: bool, lighting: ViewLighting) -> bool {
+fn history_frame(bed: &mut Bed, eye: Vec3, lighting: ViewLighting) -> bool {
     let target = bed.spec.target;
     let mut reset = None;
     bed.follow(eye, target, 0, &mut |_, f| {
-        reset = Some(
-            f.target
-                .begin(f.frame, f.lighting, &f.desc, exposure_cut, &lighting),
-        );
+        reset = Some(f.target.begin(f.frame, f.lighting, &f.desc, &lighting));
     });
     reset.unwrap()
 }
@@ -412,45 +409,36 @@ fn history_resets_on_each_of_its_sources() {
     let lighting = ViewLighting::default();
     let frame = history_frame;
     let eye = bed.spec.eye;
-    assert!(
-        frame(&mut bed, eye, false, lighting),
-        "the view's first frame"
-    );
-    assert!(!frame(&mut bed, eye, false, lighting));
-    assert!(frame(&mut bed, eye, true, lighting), "an exposure cut");
+    assert!(frame(&mut bed, eye, lighting), "the view's first frame");
+    assert!(!frame(&mut bed, eye, lighting));
     let debug = ViewLighting {
         debug_view: LightingDebugView::Guide(GuideKind::Normal),
         ..lighting
     };
     assert!(
-        !frame(&mut bed, eye + Vec3::X, false, debug),
+        !frame(&mut bed, eye + Vec3::X, debug),
         "a step under the jump distance, with another debug view"
     );
     let eye = eye + Vec3::new(3.5, 0.0, 0.0);
-    assert!(frame(&mut bed, eye, false, lighting), "a jump");
-    assert!(!frame(&mut bed, eye, false, lighting));
+    assert!(frame(&mut bed, eye, lighting), "a jump");
+    assert!(!frame(&mut bed, eye, lighting));
     let target = bed.spec.target;
     bed.spec.target = eye + Mat3::from_rotation_y(0.7) * (target - eye);
-    assert!(
-        frame(&mut bed, eye, false, lighting),
-        "a turn past 30 degrees"
-    );
-    assert!(!frame(&mut bed, eye, false, lighting));
+    assert!(frame(&mut bed, eye, lighting), "a turn past 30 degrees");
+    assert!(!frame(&mut bed, eye, lighting));
     bed.lighting.reset_history();
-    assert!(frame(&mut bed, eye, false, lighting), "a lighting reset");
+    assert!(frame(&mut bed, eye, lighting), "a lighting reset");
     assert!(
-        !frame(&mut bed, eye, false, lighting),
+        !frame(&mut bed, eye, lighting),
         "a lighting reset lasts one frame"
     );
     // `accumulate` cuts the camera on its first frame.
     let mut reset = false;
     bed.accumulate(1, 0, &mut |_, f| {
-        reset = f
-            .target
-            .begin(f.frame, f.lighting, &f.desc, false, &lighting);
+        reset = f.target.begin(f.frame, f.lighting, &f.desc, &lighting);
     });
     assert!(reset, "a camera cut");
-    assert!(!frame(&mut bed, eye, false, lighting));
+    assert!(!frame(&mut bed, eye, lighting));
     let target = bed.spec.target;
     let mut reset = false;
     bed.follow(eye, target, 0, &mut |_, f| {
@@ -458,7 +446,7 @@ fn history_resets_on_each_of_its_sources() {
             output_extent: f.desc.output_extent + 1,
             ..f.desc
         };
-        reset = f.target.begin(f.frame, f.lighting, &desc, false, &lighting);
+        reset = f.target.begin(f.frame, f.lighting, &desc, &lighting);
     });
     assert!(reset, "a new output extent");
     assert_clean();

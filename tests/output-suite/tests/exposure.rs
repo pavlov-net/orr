@@ -16,11 +16,8 @@ const FILTER: (f64, f64) = (0.10, 0.90);
 /// A cut, then four frames: enough for the view to find light through underflow, snap until
 /// two snaps agree, and adapt.
 fn settle(h: &mut Harness, scale: f32, output: &ViewOutput) -> ExposureTelemetry {
-    let cut = ViewOutput {
-        cut: true,
-        ..output.clone()
-    };
-    let mut t = h.frame(scale, &cut, None);
+    h.cut_next();
+    let mut t = h.frame(scale, output, None);
     for _ in 0..4 {
         t = h.frame(scale, output, None);
     }

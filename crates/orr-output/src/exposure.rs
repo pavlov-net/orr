@@ -63,7 +63,7 @@ impl Default for Exposure {
 /// Exposures are EV100 as [`ev100_from_exposure`] gives them. A scene metered at EV100 `m`
 /// with no compensation is exposed at `keyed_ev100(m, 0.0)`, about `m - 0.79`.
 ///
-/// A view's first metered frames, and the frames after a cut (`ViewOutput::cut`), snap to
+/// A view's first metered frames, and the frames after a camera cut, snap to
 /// the target until two snaps agree within half a stop. A frame with nothing to meter (all
 /// black) holds the exposure, so a black first frame leaves the view waiting for one with
 /// light.

@@ -1355,7 +1355,7 @@ fn render(
             render_extent: UVec2::from(EXTENT),
             output_extent: UVec2::from(EXTENT),
             jitter: Vec2::new(0.25, -0.125),
-            reset_history: reset,
+            camera_cut: reset,
             mip_bias: 0.0,
             texture_filter: w.texture_filter,
         })
@@ -1733,7 +1733,7 @@ fn a_change_of_aspect_adds_no_motion() {
     let eye = Vec3::new(0.3, 2.6, 5.5);
     let target = Vec3::new(0.0, 0.6, 0.0);
     let mut frame = 0;
-    let mut motion_at = |extent: [u32; 2], eye: Vec3, reset_history: bool| {
+    let mut motion_at = |extent: [u32; 2], eye: Vec3, camera_cut: bool| {
         frame += 1;
         let list = [placed.scene];
         let mut f = w
@@ -1759,7 +1759,7 @@ fn a_change_of_aspect_adds_no_motion() {
                 render_extent: UVec2::from(extent),
                 output_extent: UVec2::from(extent),
                 jitter: Vec2::new(0.25, -0.125),
-                reset_history,
+                camera_cut,
                 mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
             })
@@ -2193,7 +2193,7 @@ fn software_and_hardware_raster_draw_the_same_visibility_buffer() {
                         render_extent: UVec2::from(EXTENT),
                         output_extent: UVec2::from(EXTENT),
                         jitter: Vec2::new(0.25, -0.125),
-                        reset_history: true,
+                        camera_cut: true,
                         mip_bias: 0.0,
                         texture_filter: TextureFilter::Hardware,
                     })
@@ -2361,7 +2361,7 @@ fn shoot_computed(
             render_extent: UVec2::from(EXTENT),
             output_extent: UVec2::from(EXTENT),
             jitter: shot.jitter,
-            reset_history: shot.reset,
+            camera_cut: shot.reset,
             mip_bias: shot.mip_bias,
             texture_filter: TextureFilter::Hardware,
         })
@@ -3762,7 +3762,7 @@ fn shoot_rigs_edited(
             render_extent: UVec2::from(EXTENT),
             output_extent: UVec2::from(EXTENT),
             jitter: shot.jitter,
-            reset_history: shot.reset,
+            camera_cut: shot.reset,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
         })
@@ -5521,7 +5521,7 @@ fn shoot_edits_with(
             render_extent: UVec2::from(EXTENT),
             output_extent: UVec2::from(EXTENT),
             jitter: shot.jitter,
-            reset_history: shot.reset,
+            camera_cut: shot.reset,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
         })

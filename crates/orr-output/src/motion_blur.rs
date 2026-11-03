@@ -31,8 +31,8 @@ pub struct MotionBlurPass<'a> {
     pub shutter: f32,
     /// Frames generated after this one; 0 with frame generation off.
     pub generated: u32,
-    /// A declared camera cut: the frame's motion spans no time, so the pass records nothing.
-    pub cut: bool,
+    /// A camera cut: the frame's motion spans no time, so the pass records nothing.
+    pub camera_cut: bool,
     /// orr's frame id.
     pub frame: u64,
     pub output: &'a ViewOutput,

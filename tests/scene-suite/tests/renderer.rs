@@ -81,7 +81,7 @@ fn empty_frames_and_scene_frames_submit_in_order() {
             render_extent: UVec2::new(1280, 720),
             output_extent: UVec2::new(1280, 720),
             jitter: Vec2::ZERO,
-            reset_history: false,
+            camera_cut: false,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
         })
@@ -442,7 +442,7 @@ fn view_of<'a>(
             near: 0.05,
         },
         lens: Lens::default(),
-        reset_history: false,
+        camera_cut: false,
         texture_filter: TextureFilter::Hardware,
         target: ViewTarget::Texture(image),
     }
@@ -869,7 +869,7 @@ fn render_view_runs_the_glare_its_lens_asks_for() {
                     near: 0.05,
                 },
                 lens,
-                reset_history: false,
+                camera_cut: false,
                 texture_filter: TextureFilter::Hardware,
                 target: ViewTarget::Texture(&image),
             },

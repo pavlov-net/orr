@@ -149,7 +149,7 @@ impl Blur {
             view: self.constants.gpu(),
             shutter: SHUTTER,
             generated: 0,
-            cut: false,
+            camera_cut: false,
             frame: self.frame,
             output: &output,
         };
@@ -263,7 +263,7 @@ fn closed_shutter_and_a_cut_record_nothing() {
     let (sharp, names) = b.render(Scene::Pan, 1.0, |p| p.shutter = 0.0);
     assert!(names.is_empty(), "{names:?}");
     assert_eq!(b.output.motion_blur_bytes(), 0);
-    let (cut, names) = b.render(Scene::Pan, 1.0, |p| p.cut = true);
+    let (cut, names) = b.render(Scene::Pan, 1.0, |p| p.camera_cut = true);
     assert!(names.is_empty(), "{names:?}");
     assert!(cut == sharp);
     b.render(Scene::Pan, 1.0, |_| {});
@@ -1863,6 +1863,7 @@ mod lens_distortion {
                         extent: OUT,
                         view: self.constants.gpu(),
                         sky: self.sky.gpu(),
+                        camera_cut: false,
                         frame: self.frame,
                         output: &output,
                     },

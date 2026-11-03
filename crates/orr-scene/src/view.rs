@@ -188,8 +188,9 @@ pub struct ViewDesc {
     pub output_extent: UVec2,
     /// Render pixels: each sample sits at its pixel centre minus the jitter, y down.
     pub jitter: Vec2,
-    /// A camera cut: the previous camera is taken to be this one.
-    pub reset_history: bool,
+    /// A camera cut: the previous camera is taken to be this one; occlusion culling, frame
+    /// generation and lighting drop their history. A view's first render is a cut without it.
+    pub camera_cut: bool,
     /// Added to the level of detail of primary-hit texture lookups, as an upscaler asks for
     /// its render size; 0 without one.
     pub mip_bias: f32,
@@ -306,7 +307,7 @@ pub(crate) fn view_constants(
     let clip = clip_from_view(&desc.projection, desc.output_extent);
     let clip_jittered = jittered(clip, desc.jitter, desc.render_extent);
     let previous = match history.previous {
-        Some(p) if p.scene == desc.scene && !desc.reset_history => p,
+        Some(p) if p.scene == desc.scene && !desc.camera_cut => p,
         _ => *desc,
     };
     history.previous = Some(*desc);

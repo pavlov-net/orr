@@ -1929,7 +1929,7 @@ impl<'a> Frame<'a> {
         }
         let targets = history.targets.as_mut().expect("view targets");
         let hzb_view = (view.scene, view.output_extent.to_array());
-        let occlusion = targets.hzb_view.replace(hzb_view) == Some(hzb_view) && !view.reset_history;
+        let occlusion = targets.hzb_view.replace(hzb_view) == Some(hzb_view) && !view.camera_cut;
         let targets = &*targets;
         let seen = constants;
         let constants = window.put(device, &constants)?;

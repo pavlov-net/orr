@@ -43,11 +43,8 @@ fn balanced(white: AutoWhiteBalance) -> ViewOutput {
 
 /// A cut, then four frames, tonemapped.
 fn settle(h: &mut Harness, output: &ViewOutput, display: &ResolvedDisplay) -> ExposureTelemetry {
-    let cut = ViewOutput {
-        cut: true,
-        ..output.clone()
-    };
-    let mut t = h.frame(1.0, &cut, Some(display));
+    h.cut_next();
+    let mut t = h.frame(1.0, output, Some(display));
     for _ in 0..4 {
         t = h.frame(1.0, output, Some(display));
     }
@@ -261,11 +258,8 @@ fn white_point_adapts_at_its_speed_holds_in_the_dark_and_snaps_on_a_cut() {
     assert_eq!(t.white_point_xy, prev.white_point_xy);
 
     h.color = [1.0; 3];
-    let cut = ViewOutput {
-        cut: true,
-        ..output.clone()
-    };
-    let t = h.frame(1.0, &cut, Some(&display));
+    h.cut_next();
+    let t = h.frame(1.0, &output, Some(&display));
     assert_eq!(t.white_point_xy, t.white_target_xy);
     assert!(distance(xy(t.white_point_xy), d65()) < 1e-4);
     assert_clean();

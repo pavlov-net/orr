@@ -629,7 +629,7 @@ fn run(options: &Options) -> Option<Capture> {
                 near: 0.05,
             },
             lens: switches.lens(),
-            reset_history: i == 0,
+            camera_cut: false,
             texture_filter: TextureFilter::Hardware,
             target,
         };

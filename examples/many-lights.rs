@@ -354,7 +354,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                     near: 0.05,
                 },
                 lens: Lens::default(),
-                reset_history: i == 0,
+                camera_cut: false,
                 texture_filter: TextureFilter::Hardware,
                 target,
             },

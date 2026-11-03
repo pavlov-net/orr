@@ -56,6 +56,7 @@ pub struct Harness {
     pub glare: Option<Glare>,
     pub sensor_width_mm: f32,
     composite: Option<(GlareComposite, GlareMethod)>,
+    cut_next: bool,
 }
 
 impl Harness {
@@ -130,6 +131,7 @@ impl Harness {
             glare: None,
             sensor_width_mm: 36.0,
             composite: None,
+            cut_next: false,
         }
     }
 
@@ -156,6 +158,11 @@ impl Harness {
 
     pub fn set_sky(&mut self, sky: SkyStats) {
         self.sky.as_mut_slice().unwrap()[0] = sky;
+    }
+
+    /// Makes the next [`Self::frame`] a camera cut.
+    pub fn cut_next(&mut self) {
+        self.cut_next = true;
     }
 
     /// Runs one frame with the image's luminance times `scale`: the exposure passes, then
@@ -231,6 +238,7 @@ impl Harness {
                     extent: self.extent,
                     view,
                     sky: self.sky.gpu(),
+                    camera_cut: std::mem::take(&mut self.cut_next),
                     frame: self.frame,
                     output,
                 },

@@ -1625,7 +1625,7 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                         near: 0.1,
                     },
                     lens: Lens::default(),
-                    reset_history: i == 0,
+                    camera_cut: i == 0,
                     texture_filter: TextureFilter::Hardware,
                     target: view_target,
                 };

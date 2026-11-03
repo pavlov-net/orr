@@ -165,9 +165,10 @@ pub struct LitView<'a> {
     pub rotation: Quat,
     pub projection: Projection,
     pub lens: Lens,
-    /// A camera cut: the previous camera is taken to be this one, motion blur shows nothing and
-    /// frame generation resets. Pair it with `ViewOutput::cut`.
-    pub reset_history: bool,
+    /// A camera cut: the previous camera is taken to be this one; motion blur shows nothing,
+    /// frame generation, ray reconstruction and lighting drop their history, auto exposure and
+    /// white balance snap. A view's first render is a cut without it.
+    pub camera_cut: bool,
     /// How the view filters material textures.
     pub texture_filter: TextureFilter,
     pub target: ViewTarget<'a>,
@@ -349,7 +350,7 @@ impl ViewState {
             render_extent: UVec2::from(render),
             output_extent: UVec2::from(extent),
             jitter: Vec2::from(jitter),
-            reset_history: view.reset_history,
+            camera_cut: view.camera_cut,
             mip_bias,
             texture_filter: view.texture_filter,
         }
@@ -1023,7 +1024,7 @@ impl<'a> Frame<'a> {
     ///
     /// Motion blur smears the radiance along each pixel's motion over the fraction
     /// `lens.shutter` of the time between presented images, centered on the frame. A camera cut
-    /// (`view.reset_history`) shows none. A camera that jumps without declaring a cut blurs up to
+    /// (`view.camera_cut`) shows none. A camera that jumps without declaring a cut blurs up to
     /// the longest streak, [`orr_output::MOTION_BLUR_MAX_RADIUS`] of the output width each way.
     ///
     /// A `lighting.debug_view` shows neither motion blur nor glare, since it is not the final
@@ -1079,8 +1080,9 @@ impl<'a> Frame<'a> {
         let reconstructed = reconstruction.is_some();
         let mut desc = state.raster_desc(view, extent, render);
         let jitter = desc.jitter.to_array();
-        // Raster-only frames while the path kernels compile leave no history for lighting.
-        desc.reset_history |= state.lighting.is_none();
+        // A first lit render is a cut, whatever raster-only frames came before it while the path
+        // kernels compiled.
+        desc.camera_cut |= state.lighting.is_none();
 
         let set = Hooks {
             scene_referred: hooks.scene_referred.is_some(),
@@ -1136,7 +1138,7 @@ impl<'a> Frame<'a> {
             dof_background: None,
             frosted_glass: false,
         };
-        paths.begin(id, scene, &desc, output.cut, lighting);
+        paths.begin(id, scene, &desc, lighting);
         let traced = Stages::COMPUTE | Stages::RAY;
         list.barrier(Stages::ALL, traced, Hazards::empty());
         kernels.record_media(list, scene, paths, &pass, lighting)?;
@@ -1276,6 +1278,7 @@ impl<'a> Frame<'a> {
                 extent,
                 view: raster.view,
                 sky: raster.sky_stats,
+                camera_cut: desc.camera_cut,
                 frame: id,
                 output,
             },
@@ -1294,7 +1297,7 @@ impl<'a> Frame<'a> {
                 view: raster.view,
                 shutter: if blurs { view.lens.shutter } else { 0.0 },
                 generated,
-                cut: view.reset_history,
+                camera_cut: desc.camera_cut,
                 frame: id,
                 output,
             },

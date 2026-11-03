@@ -276,7 +276,7 @@ impl Field {
                 render_extent: UVec2::from(EXTENT),
                 output_extent: UVec2::from(EXTENT),
                 jitter: Vec2::ZERO,
-                reset_history: self.frame <= 2,
+                camera_cut: self.frame <= 2,
                 mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
             })
@@ -991,7 +991,7 @@ impl Plane {
                 render_extent: UVec2::from(EXTENT),
                 output_extent: UVec2::from(EXTENT),
                 jitter: Vec2::ZERO,
-                reset_history: self.frame <= 2,
+                camera_cut: self.frame <= 2,
                 mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
             })
@@ -2163,7 +2163,7 @@ impl CageScene {
                 render_extent: UVec2::from(EXTENT),
                 output_extent: UVec2::from(EXTENT),
                 jitter: Vec2::ZERO,
-                reset_history: self.frame <= 2,
+                camera_cut: self.frame <= 2,
                 mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
             })
@@ -2578,7 +2578,7 @@ impl<'d> Strands<'d> {
                 render_extent: UVec2::from(EXTENT),
                 output_extent: UVec2::from(EXTENT),
                 jitter: Vec2::ZERO,
-                reset_history: first,
+                camera_cut: first,
                 mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
             })
