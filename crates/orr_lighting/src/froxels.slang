@@ -310,6 +310,7 @@ public void froxel_order(FroxelRoot r)
     }
     out.proxies = proxies;
     r.stats.proxies = proxies;
+    out.far_smoke = 0;
 }
 
 // The first of froxel `f`'s words in `FroxelRoot.smoke`.

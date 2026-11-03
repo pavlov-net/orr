@@ -1,9 +1,10 @@
-// Adds the view's visible smoke clusters to the froxels: one workgroup per cluster. Each triangle
-// adds to the froxel of each column cell it covers, at the distance of the part it covers, an
-// optical depth that keeps the mean transmittance of the cell: -ln(1 - coverage x opacity), with
-// opacity, base color and emission read at the triangle's uv centroid. A cluster of two triangles
-// on a shared edge counts as one quad, since two disjoint parts of a cell let through
-// 1 - (c1 + c2) x opacity, not (1 - c1 x opacity) x (1 - c2 x opacity).
+// Adds the view's visible smoke clusters to the froxels, and notes whether any reaches past them
+// for media apply: one workgroup per cluster. Each triangle adds to the froxel of each column cell
+// it covers, at the distance of the part it covers, an optical depth that keeps the mean
+// transmittance of the cell: -ln(1 - coverage x opacity), with opacity, base color and emission
+// read at the triangle's uv centroid. A cluster of two triangles on a shared edge counts as one
+// quad, since two disjoint parts of a cell let through 1 - (c1 + c2) x opacity, not
+// (1 - c1 x opacity) x (1 - c2 x opacity).
 #include "orr/root.h"
 import media;
 import froxels;
@@ -81,14 +82,14 @@ void add_smoke(FroxelRoot r, uint3 f, float3 tint, float3 emission, float depth)
     }
 }
 
-// Adds view-space point `x` to `polygon` in column coordinates, and its distance from the eye to
-// the range [`lo`, `hi`].
+// Adds view-space point `x` to `polygon` in column coordinates, its depth to `lo`, which bounds
+// the polygon's distances from the eye from below, and its distance to `hi`, which bounds them
+// from above.
 void add_corner(FroxelRoot r, inout Polygon polygon, float3 x, inout float lo, inout float hi)
 {
     polygon.p[polygon.count++] = view_column(uint2(r.columns, r.rows), r.view, x);
-    float d = length(x);
-    lo = min(lo, d);
-    hi = max(hi, d);
+    lo = min(lo, -x.z);
+    hi = max(hi, length(x));
 }
 
 // Adds to the froxels the planar polygon with view-space corners `q`, `count` of them in order
@@ -109,7 +110,12 @@ void splat_polygon(FroxelRoot r, float3 q[4], uint count, float opacity, float3 
         if (a_in != b_in)
             add_corner(r, polygon, lerp(a, b, (a.z + SMOKE_NEAR) / (a.z - b.z)), lo, hi);
     }
+    float near_range = r.scene.near_range;
     if (polygon.count < 3)
+        return;
+    if (hi >= near_range)
+        InterlockedOr(r.lights.far_smoke, 1u);
+    if (!(lo < near_range))
         return;
     float2 low = polygon.p[0];
     float2 high = low;
@@ -121,7 +127,6 @@ void splat_polygon(FroxelRoot r, float3 q[4], uint count, float opacity, float3 
     int2 first = max(int2(floor(low + 0.5)), int2(0));
     int2 last = min(int2(floor(high + 0.5)), int2(r.columns, r.rows) - 1);
     float3 normal = cross(q[1] - q[0], q[2] - q[0]);
-    float near_range = r.scene.near_range;
     for (int y = first.y; y <= last.y; y++)
     {
         for (int x = first.x; x <= last.x; x++)

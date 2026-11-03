@@ -9,8 +9,8 @@
 //! still camera. Medium proxies on the camera ray: a plume against the reference march and, per
 //! pixel, against a fine march of its grid; overlapping boxes, surfaces inside boxes and eyes
 //! inside boxes against Beer's law, inside and past the froxels; sky pixels past the froxels;
-//! and proxies off screen. Smoke: its opacity on the camera ray, and a column across a shaft
-//! against the reference march.
+//! and proxies off screen. Smoke: its opacity on the camera ray, a column across a shaft against
+//! the reference march, and sheets past the froxels.
 
 use lighting_suite::bed::{
     Accumulated, Bed, CANOPY, EXTENT, FLOOR, GLASS_SPHERE, Item, LEAF, MIRROR, PLUME, Particle,
@@ -1221,6 +1221,48 @@ fn smoke_across_a_shaft_matches_the_reference_march() {
             assert!(
                 f > without,
                 "white smoke gives {f:.3e}, without it {without:.3e}"
+            );
+        }
+    }
+    assert_clean();
+}
+
+/// Smoke past `near_range`: sheets on sky pixels and in front of a surface let through what their
+/// opacity lets through, and a lit sheet in haze in front of a surface, or on the sky without
+/// haze, scatters what the reference march gives it.
+#[test]
+fn smoke_past_the_froxels_matches_the_reference_march() {
+    let eye = Vec3::new(0.0, 2.0, 0.0);
+    let target = Vec3::new(0.0, 2.0, -10.0);
+    let sun = vec![directional(30.0, 20.0, 1_000.0)];
+    let sheet = |d: f32| Particle {
+        center: Vec3::new(0.0, 2.0, -d),
+        size: 40.0,
+    };
+    for copies in [Vec::new(), vec![distant(20.0)]] {
+        for (distances, wanted) in [(vec![4.0], 0.6), (vec![4.0, 6.0], 0.36)] {
+            let (mut bed, _fog) = foggy(&CLEAR, copies.clone(), sun.clone(), None, eye, target);
+            bed.set_near_range(2.0);
+            let sheets: Vec<Particle> = distances.iter().map(|&d| sheet(d)).collect();
+            bed.set_particles(&sheets, smoke_look(0.4, 0.0), Opacity::Smoke);
+            let got = middle_transmittance(&camera_transmittance(&mut bed, 1));
+            assert!(
+                (got - wanted).abs() < 0.01,
+                "{} sheets let through {got:.3}, not {wanted}",
+                distances.len()
+            );
+        }
+    }
+    for (fog, copies) in [(&HAZE, vec![distant(20.0)]), (&CLEAR, Vec::new())] {
+        let (mut bed, _fog) = foggy(fog, copies, sun.clone(), None, eye, target);
+        bed.set_near_range(2.0);
+        bed.set_particles(&[sheet(6.0)], smoke_look(0.4, 0.8), Opacity::Smoke);
+        let got = middle_blocks(&inscatter(&mut bed, false, MediaSettings::default(), 16));
+        let reference = middle_blocks(&inscatter(&mut bed, true, MediaSettings::default(), 64));
+        for (g, r) in got.iter().zip(&reference) {
+            assert!(
+                (g - r).abs() < 0.05 * r,
+                "a block's in-scatter is {g:.2}, the reference's {r:.2}"
             );
         }
     }
