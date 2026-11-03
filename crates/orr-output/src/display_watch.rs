@@ -1,7 +1,9 @@
 #![allow(non_snake_case)]
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use raw_window_handle::RawWindowHandle;
 use windows::Foundation::{Point, TypedEventHandler};
@@ -20,13 +22,17 @@ use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW,
     MonitorFromWindow,
 };
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT, DispatcherQueueOptions,
     RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
-use windows::Win32::UI::WindowsAndMessaging::{WM_DISPLAYCHANGE, WM_WINDOWPOSCHANGED};
-use windows_core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, Ref};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetWindowThreadProcessId, KillTimer, RegisterWindowMessageW, SendNotifyMessageW, SetTimer,
+    WM_DISPLAYCHANGE, WM_NCDESTROY, WM_SETFOCUS, WM_TIMER, WM_WINDOWPOSCHANGED,
+};
+use windows_core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, Ref, w};
 
 use crate::{DisplayFeed, DisplayInfo, Error, Result};
 
@@ -39,52 +45,104 @@ unsafe trait IDisplayInformationStaticsInterop: IUnknown {
     fn GetForWindow(&self, window: HWND, riid: *const GUID, info: *mut *mut c_void) -> HRESULT;
 }
 
-const SUBCLASS_ID: usize = 0x6f72_725f_6477;
+/// Turning HDR on or off raises no event, so the watch also reads this often.
+const READ_INTERVAL_MS: u32 = 1000;
+
+/// How far the SDR white may move, as a share of its value, and still count as unchanged: each
+/// change moves the tone curve, and the reading drifts.
+const SDR_WHITE_TOLERANCE: f32 = 0.01;
 
 /// Watches the monitor a window is on and publishes what the OS reports for it to a
-/// `DisplayFeed`: on HDR, luminance and SDR white changes, on moves to another monitor and on
-/// display mode changes. With the `pcl-stats` feature it also receives the PC latency ping
-/// for the frames of every `Display`.
+/// `DisplayFeed`: once a second, when the window takes the focus, on moves to another monitor,
+/// on display mode changes and on the OS's color change event. With the `pcl-stats` feature it
+/// also receives the PC latency ping for the frames of every `Display`.
 ///
 /// Create it on the thread that owns the window and pumps its messages; changes arrive
-/// there. Drop it on that thread, before the window is destroyed. It uses the thread's
-/// dispatcher queue, creating one if the thread has none.
+/// there. It uses the thread's dispatcher queue, creating one if the thread has none. It reads
+/// through the window's message queue and adds no thread. It may be dropped on any thread, and
+/// before or after the window is destroyed; dropped on another thread, it stops when the
+/// window's thread next pumps its messages.
 pub struct DisplayWatch {
-    // Fields drop in order: hooks, then the queue, then the apartment.
-    _hooks: Hooks,
-    _queue: Option<QueueController>,
-    _apartment: Option<Apartment>,
+    hwnd: isize,
+    /// The address of the `Subclass`, which the window's thread owns.
+    id: usize,
 }
 
-struct Hooks {
-    hwnd: HWND,
-    token: i64,
-    subclass: Box<Subclass>,
-}
+/// The message that frees a `Subclass`, named by its id in `wparam`; 0 if none could be made.
+static STOP: LazyLock<u32> =
+    // SAFETY: a plain call with a constant name.
+    LazyLock::new(|| unsafe { RegisterWindowMessageW(w!("orr display watch stop")) });
 
+/// The watch's state on the window's thread, freed there by the `stop` message or when the
+/// window is destroyed. Its address is the id of the subclass and of the timer, so two watches
+/// of a window stay apart.
 struct Subclass {
-    info: DisplayInformation,
-    feed: DisplayFeed,
+    token: i64,
+    reader: Reader,
     monitor: Cell<HMONITOR>,
+    info: DisplayInformation,
+}
+
+/// Publishes what the OS reports for a window. A failed read keeps the last values, since the
+/// OS can refuse for a moment while a window moves between monitors.
+#[derive(Clone)]
+struct Reader {
+    hwnd: isize,
+    feed: DisplayFeed,
+    /// The last read failed, which is logged once.
+    failing: Arc<AtomicBool>,
+}
+
+impl Reader {
+    fn update(&self, info: &DisplayInformation) {
+        match read(info, HWND(self.hwnd as *mut c_void)) {
+            Ok(read) => {
+                self.failing.store(false, Ordering::Relaxed);
+                self.feed.set(steady(self.feed.latest().1, read));
+            }
+            Err(e) => {
+                if !self.failing.swap(true, Ordering::Relaxed) {
+                    log::warn!("reading AdvancedColorInfo failed: {e}");
+                }
+            }
+        }
+    }
+}
+
+/// `new` keeping the last SDR white while it stays within `SDR_WHITE_TOLERANCE` of `new`'s.
+fn steady(last: DisplayInfo, mut new: DisplayInfo) -> DisplayInfo {
+    if let (Some(old), Some(white)) = (last.sdr_white_nits, new.sdr_white_nits)
+        && (white - old).abs() <= SDR_WHITE_TOLERANCE * old
+    {
+        new.sdr_white_nits = last.sdr_white_nits;
+    }
+    new
 }
 
 struct QueueController(DispatcherQueueController);
 
 struct Apartment;
 
-impl DisplayWatch {
-    pub fn new(window: RawWindowHandle) -> Result<(Self, DisplayFeed)> {
-        let RawWindowHandle::Win32(handle) = window else {
-            return Err(Error::NotWin32Window);
-        };
-        let hwnd = HWND(handle.hwnd.get() as *mut c_void);
+/// What a thread needs for `GetForWindow`, kept until the thread ends: a queue shut down with
+/// the watch that made it would take the thread's other watches down with it.
+struct ThreadSetup {
+    // Fields drop in order: the queue, then the apartment.
+    _queue: Option<QueueController>,
+    _apartment: Option<Apartment>,
+}
 
-        // SAFETY: called on the window's thread; `Apartment` balances it on drop. An
-        // apartment of another kind already on the thread serves WinRT as well.
+thread_local! {
+    static THREAD_SETUP: RefCell<Option<ThreadSetup>> = const { RefCell::new(None) };
+}
+
+impl ThreadSetup {
+    fn new() -> windows_core::Result<Self> {
+        // SAFETY: `Apartment` balances it on this thread. An apartment of another kind already
+        // on the thread serves WinRT as well.
         let apartment = match unsafe { RoInitialize(RO_INIT_SINGLETHREADED) } {
             Ok(()) => Some(Apartment),
             Err(e) if e.code() == RPC_E_CHANGED_MODE => None,
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         };
         let queue = match DispatcherQueue::GetForCurrentThread() {
             Ok(_) => None,
@@ -100,67 +158,110 @@ impl DisplayWatch {
                 }?))
             }
         };
-        let info = display_information(hwnd)?;
-        let feed = DisplayFeed::new(read(&info, hwnd));
+        Ok(Self {
+            _queue: queue,
+            _apartment: apartment,
+        })
+    }
+}
 
-        let handler_feed = feed.clone();
-        let handler_hwnd = hwnd.0 as isize;
+impl DisplayWatch {
+    pub fn new(window: RawWindowHandle) -> Result<(Self, DisplayFeed)> {
+        let RawWindowHandle::Win32(handle) = window else {
+            return Err(Error::NotWin32Window);
+        };
+        let hwnd = HWND(handle.hwnd.get() as *mut c_void);
+        // SAFETY: plain queries; a stale window reads as another thread's.
+        if unsafe { GetWindowThreadProcessId(hwnd, None) != GetCurrentThreadId() } {
+            return Err(Error::NotWindowThread);
+        }
+
+        THREAD_SETUP.with_borrow_mut(|setup| {
+            if setup.is_none() {
+                *setup = Some(ThreadSetup::new()?);
+            }
+            windows_core::Result::Ok(())
+        })?;
+        let info = display_information(hwnd)?;
+        let feed = DisplayFeed::default();
+        let reader = Reader {
+            hwnd: hwnd.0 as isize,
+            feed: feed.clone(),
+            failing: Arc::default(),
+        };
+        reader.update(&info);
+
+        let handler = reader.clone();
         let token = info.AdvancedColorInfoChanged(&TypedEventHandler::new(
             move |sender: Ref<DisplayInformation>, _| {
                 if let Some(info) = sender.as_ref() {
-                    handler_feed.set(read(info, HWND(handler_hwnd as *mut c_void)));
+                    handler.update(info);
                 }
                 Ok(())
             },
         ))?;
 
-        let subclass = Box::new(Subclass {
-            info,
-            feed: feed.clone(),
+        let subclass = Box::into_raw(Box::new(Subclass {
+            token,
+            reader,
             // SAFETY: `hwnd` is a live window.
             monitor: Cell::new(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }),
-        });
-        // SAFETY: on the window's thread; the box outlives the subclass, which `Hooks`
-        // removes on drop.
-        let installed = unsafe {
-            SetWindowSubclass(
-                hwnd,
-                Some(subclass_proc),
-                SUBCLASS_ID,
-                &raw const *subclass as usize,
-            )
-        };
-        if !installed.as_bool() {
-            let _ = subclass.info.RemoveAdvancedColorInfoChanged(token);
-            return Err(windows_core::Error::from_thread().into());
+            info,
+        }));
+        let id = subclass as usize;
+        // SAFETY: on the window's thread; `Subclass`'s drop removes the subclass before the box
+        // goes away.
+        let installed = unsafe { SetWindowSubclass(hwnd, Some(subclass_proc), id, id) };
+        if *STOP == 0 || !installed.as_bool() {
+            let e = windows_core::Error::from_thread();
+            // SAFETY: the box made above, which nothing else holds now.
+            drop(unsafe { Box::from_raw(subclass) });
+            return Err(e.into());
         }
-
-        let hooks = Hooks {
-            hwnd,
-            token,
-            subclass,
-        };
+        // SAFETY: `hwnd` is a live window of this thread; `Subclass`'s drop kills the timer.
+        if unsafe { SetTimer(Some(hwnd), id, READ_INTERVAL_MS, None) } == 0 {
+            log::warn!(
+                "no display read timer, so an OS HDR change goes unseen: {}",
+                windows_core::Error::from_thread()
+            );
+        }
         Ok((
             Self {
-                _hooks: hooks,
-                _queue: queue,
-                _apartment: apartment,
+                hwnd: hwnd.0 as isize,
+                id,
             },
             feed,
         ))
     }
 }
 
-impl Drop for Hooks {
+impl Drop for DisplayWatch {
     fn drop(&mut self) {
-        // SAFETY: on the window's thread, removing the subclass `DisplayWatch::new` installed.
+        // This runs at once on the window's thread and does not wait on another: the window's
+        // thread may be waiting for this one. A destroyed window has freed the subclass already.
+        // SAFETY: a plain message call; `subclass_proc` checks the id before acting on it.
+        let _ = unsafe {
+            SendNotifyMessageW(
+                HWND(self.hwnd as *mut c_void),
+                *STOP,
+                WPARAM(self.id),
+                LPARAM(0),
+            )
+        };
+    }
+}
+
+impl Drop for Subclass {
+    fn drop(&mut self) {
+        let id = std::ptr::from_ref(self) as usize;
+        let hwnd = HWND(self.reader.hwnd as *mut c_void);
+        // SAFETY: on the window's thread, removing the timer and subclass `DisplayWatch::new`
+        // installed.
         unsafe {
-            let _ = RemoveWindowSubclass(self.hwnd, Some(subclass_proc), SUBCLASS_ID);
+            let _ = KillTimer(Some(hwnd), id);
+            let _ = RemoveWindowSubclass(hwnd, Some(subclass_proc), id);
         }
-        let _ = self
-            .subclass
-            .info
-            .RemoveAdvancedColorInfoChanged(self.token);
+        let _ = self.info.RemoveAdvancedColorInfoChanged(self.token);
     }
 }
 
@@ -172,8 +273,8 @@ impl Drop for QueueController {
 
 impl Drop for Apartment {
     fn drop(&mut self) {
-        // SAFETY: balances `RoInitialize` in `DisplayWatch::new` on the same thread, after the
-        // watch's WinRT objects are released.
+        // SAFETY: balances `RoInitialize` in `ThreadSetup::new` on the same thread, after the
+        // queue is released.
         unsafe { RoUninitialize() };
     }
 }
@@ -183,20 +284,36 @@ unsafe extern "system" fn subclass_proc(
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
-    _id: usize,
+    id: usize,
     data: usize,
 ) -> LRESULT {
     // SAFETY: `data` is the `Subclass` box, alive until the subclass is removed.
     let subclass = unsafe { &*(data as *const Subclass) };
+    if msg == *STOP && wparam.0 == id {
+        // SAFETY: the box is not used after this, and its drop removes the subclass.
+        drop(unsafe { Box::from_raw(data as *mut Subclass) });
+        return LRESULT(0);
+    }
+    if msg == WM_NCDESTROY {
+        // SAFETY: as above, and the rest of the window's handlers still run.
+        unsafe {
+            drop(Box::from_raw(data as *mut Subclass));
+            return DefSubclassProc(hwnd, msg, wparam, lparam);
+        }
+    }
     match msg {
-        WM_DISPLAYCHANGE => subclass.feed.set(read(&subclass.info, hwnd)),
+        WM_DISPLAYCHANGE | WM_SETFOCUS => subclass.reader.update(&subclass.info),
+        WM_TIMER if wparam.0 == id => {
+            subclass.reader.update(&subclass.info);
+            return LRESULT(0);
+        }
         #[cfg(feature = "pcl-stats")]
         m if crate::pcl_stats::is_ping(m) => crate::pcl_stats::ping(),
         WM_WINDOWPOSCHANGED => {
             // SAFETY: `hwnd` is the live subclassed window.
             let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
             if subclass.monitor.replace(monitor) != monitor {
-                subclass.feed.set(read(&subclass.info, hwnd));
+                subclass.reader.update(&subclass.info);
             }
         }
         _ => {}
@@ -217,19 +334,9 @@ fn display_information(hwnd: HWND) -> windows_core::Result<DisplayInformation> {
     }
 }
 
-/// Reads the window's monitor. Fields that fail to read are left unknown.
-fn read(info: &DisplayInformation, hwnd: HWND) -> DisplayInfo {
-    let refresh = refresh_hz(hwnd);
-    match AdvancedColor::new(info) {
-        Ok(color) => color.display_info(refresh),
-        Err(e) => {
-            log::warn!("reading AdvancedColorInfo failed: {e}");
-            DisplayInfo {
-                refresh_hz: refresh,
-                ..DisplayInfo::default()
-            }
-        }
-    }
+/// Reads the window's monitor.
+fn read(info: &DisplayInformation, hwnd: HWND) -> windows_core::Result<DisplayInfo> {
+    Ok(AdvancedColor::new(info)?.display_info(refresh_hz(hwnd)))
 }
 
 /// The fields of an `AdvancedColorInfo`.
@@ -352,6 +459,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sdr_white_stays_through_small_changes_only() {
+        let with = |nits: f32| DisplayInfo {
+            os_hdr_on: Some(true),
+            sdr_white_nits: Some(nits),
+            ..DisplayInfo::default()
+        };
+        assert_eq!(steady(with(200.0), with(201.0)), with(200.0));
+        assert_eq!(steady(with(200.0), with(203.0)), with(203.0));
+        assert_eq!(
+            steady(DisplayInfo::default(), with(200.0)),
+            with(200.0),
+            "a first reading stands"
+        );
+    }
+
+    #[test]
     fn advanced_color_mapping_on_captured_values() {
         // A profiled SDR display under automatic colour management, and an unprofiled one
         // reporting EDID.
@@ -385,13 +508,14 @@ mod tests {
         let hdr = AdvancedColor {
             kind: AdvancedColorKind::HighDynamicRange,
             min_nits: 0.005,
-            max_nits: 580.0,
+            max_nits: f32::NAN,
             max_full_frame_nits: 0.0,
             sdr_white_nits: 203.0,
             ..wcg
         };
         let info = hdr.display_info(Some(0.0));
         assert_eq!(info.os_hdr_on, Some(true));
+        assert_eq!(info.max_nits, None);
         assert_eq!(info.max_full_frame_nits, None);
         assert_eq!(info.refresh_hz, None);
     }

@@ -100,7 +100,6 @@ fn run(options: &Options) {
         window.window_handle(),
         window.display_handle(),
         &request(None),
-        None,
         desc.frames_in_flight,
     )
     .expect("display");
@@ -324,7 +323,6 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
             w.window_handle(),
             w.display_handle(),
             &DisplayRequest::default(),
-            None,
             desc.frames_in_flight,
         )
         .expect("display")

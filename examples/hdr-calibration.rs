@@ -1,13 +1,12 @@
-//! Calibration patterns through orr's frame on a real window, with the display watch's
-//! feed: for each display request in turn (follow the OS, SDR, PQ, PQ at a requested
-//! calibration, scRGB) it shows the peak, paper white and black patterns at the resolved
-//! luminance, with egui text naming the request, the resolved display and what the OS
-//! reports. The window changes size with each request. Toggling Windows HDR, moving the SDR
+//! Calibration patterns through orr's frame on a real window: for each display request in turn
+//! (follow the OS, SDR, PQ, PQ at a requested calibration, scRGB) it shows the peak, paper white
+//! and black patterns at the resolved luminance, with egui text naming the request, the resolved
+//! display and what the OS reports. The window changes size with each request. Toggling Windows HDR, moving the SDR
 //! content brightness slider or moving the window to another monitor re-resolves on the next
 //! frame.
 //!
 //! `hdr-calibration [frames per pattern] [--ignore-os]`: 120 frames per pattern by default.
-//! `--ignore-os` leaves the watch's feed out of the display, so the surface's formats alone
+//! `--ignore-os` takes the OS's report out of the display, so the surface's formats alone
 //! decide and PQ and scRGB present even with Windows HDR off.
 //!
 //! Built with `--features pcl-stats`, the NVIDIA overlay and FrameView report its PC latency.
@@ -29,8 +28,8 @@ mod run {
     use examples::{assert_clean, device};
     use orr::orr_gpu::{OutputFormat, QueueKind};
     use orr::{
-        CalibrationPattern, ConsumerMarker, Display, DisplayRequest, DisplayWatch, FrameDesc,
-        FrameTime, Renderer, RendererDesc, ResolvedDisplay,
+        CalibrationPattern, ConsumerMarker, Display, DisplayRequest, FrameDesc, FrameTime,
+        Renderer, RendererDesc, ResolvedDisplay,
     };
     use orr_egui::Painter;
 
@@ -86,7 +85,6 @@ mod run {
 
         let gpu = device();
         let mut window = Window::new("orr hdr calibration", 1280, 720);
-        let (_watch, feed) = DisplayWatch::new(window.window_handle()).expect("display watch");
         let desc = RendererDesc::default();
         let requests = requests();
         let mut display = Display::new(
@@ -94,10 +92,13 @@ mod run {
             window.window_handle(),
             window.display_handle(),
             &requests[0].1,
-            (!ignore_os).then(|| feed.clone()),
             desc.frames_in_flight,
         )
         .expect("display");
+        let feed = display.feed().cloned().expect("display watch");
+        if ignore_os {
+            display.set_feed(None);
+        }
         let mut renderer = Renderer::new(gpu, desc).expect("renderer");
         let mut painter = Painter::new(gpu, desc.frames_in_flight).expect("painter");
         let ctx = Context::default();

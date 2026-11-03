@@ -48,13 +48,17 @@ pub const UI_PASS: &str = "ui";
 /// frame generation on, the frame's generated images are presented before it, each with
 /// the UI composed over it, as one metered batch.
 ///
-/// The encoding and luminance are resolved at every `begin_frame` from the request, the
-/// feed's latest `DisplayInfo` and the formats the surface offers; an encoding change takes
+/// The encoding and luminance are resolved at every `begin_frame` from the request, what the
+/// OS last reported for the window and the formats the surface offers; an encoding change takes
 /// effect on that frame.
 pub struct Display {
     window: isize,
     request: DisplayRequest,
     feed: Option<DisplayFeed>,
+    /// What the last `begin_frame` logged.
+    logged: Option<(Option<bool>, ResolvedDisplay)>,
+    #[cfg(windows)]
+    _watch: Option<crate::DisplayWatch>,
     slots: Vec<Slot>,
     begun: Option<Begun>,
     latency: Option<LowLatency>,
@@ -345,15 +349,19 @@ pub struct Presented {
 }
 
 impl Display {
-    /// Creates the swapchain and starts the present thread. `frames_in_flight` matches the
-    /// renderer's. Fails if the device was created without `QueueRequest::present` or the
-    /// window is not a Win32 window.
+    /// Creates the swapchain, starts the present thread and watches what the OS reports for the
+    /// window. `frames_in_flight` matches the renderer's. Fails if the device was created
+    /// without `QueueRequest::present` or the window is not a Win32 window.
+    ///
+    /// Call it on the thread that owns the window and pumps its messages; the display can then
+    /// move to a render thread. If the OS cannot be watched, as when called on another thread, it
+    /// logs a warning and the surface's formats alone decide; a `DisplayWatch` on the window's
+    /// thread can then provide [`Self::set_feed`].
     pub fn new(
         gpu: &Device,
         window: RawWindowHandle,
         display: RawDisplayHandle,
         request: &DisplayRequest,
-        feed: Option<DisplayFeed>,
         frames_in_flight: u32,
     ) -> Result<Self> {
         let RawWindowHandle::Win32(handle) = window else {
@@ -402,10 +410,26 @@ impl Display {
         };
         #[cfg(all(windows, feature = "pcl-stats"))]
         let pcl_stats = latency.as_ref().map(crate::pcl_stats::Session::start);
+        #[cfg(windows)]
+        let (watch, feed) = match crate::DisplayWatch::new(window) {
+            Ok((watch, feed)) => (Some(watch), Some(feed)),
+            Err(e) => {
+                log::warn!(
+                    "not watching the OS's display state, so the surface's formats alone \
+                     decide the encoding: {e}"
+                );
+                (None, None)
+            }
+        };
+        #[cfg(not(windows))]
+        let feed = None;
         Ok(Self {
             window: handle.hwnd.get(),
             request: *request,
             feed,
+            logged: None,
+            #[cfg(windows)]
+            _watch: watch,
             slots: (0..n)
                 .map(|_| Slot {
                     backbuffer: None,
@@ -439,6 +463,19 @@ impl Display {
 
     pub fn request(&self) -> &DisplayRequest {
         &self.request
+    }
+
+    /// What the display resolves with: the OS's report for the window, unless
+    /// [`Self::set_feed`] replaced it. `None` when the OS could not be watched or after
+    /// `set_feed(None)`; a clone taken before then keeps following the OS.
+    pub fn feed(&self) -> Option<&DisplayFeed> {
+        self.feed.as_ref()
+    }
+
+    /// Replaces what the display resolves with from the next `begin_frame`. `None` ignores the
+    /// OS, so the surface's formats alone decide.
+    pub fn set_feed(&mut self, feed: Option<DisplayFeed>) {
+        self.feed = feed;
     }
 
     /// Replaces the request; the next `begin_frame` resolves with it. Changing only `vsync`
@@ -569,6 +606,11 @@ impl Display {
             info.and_then(|i| i.refresh_hz)
                 .map(|hz| 1.0 / f64::from(hz))
         });
+        let os_hdr_on = info.and_then(|i| i.os_hdr_on);
+        if self.logged != Some((os_hdr_on, display)) {
+            log::info!("display: OS HDR {os_hdr_on:?}, resolved {display:?}");
+            self.logged = Some((os_hdr_on, display));
+        }
         self.read_costs(compose);
         let generated = match &mut self.fg {
             Some(fg) => match (&mut fg.dynamic, fg.mode) {

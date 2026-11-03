@@ -1206,7 +1206,6 @@ fn cpu_sweep(device: &'static Device, pack: &Arc<[u8]>, args: &Args) {
             vsync: false,
             ..DisplayRequest::default()
         },
-        None,
         desc.frames_in_flight,
     )
     .unwrap();

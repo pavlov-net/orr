@@ -80,6 +80,9 @@ pub enum Error {
     #[error("frame generation mode {0:?} is out of range for this device")]
     FrameGenerationMode(FrameGenerationMode),
     #[cfg(windows)]
+    #[error("a display watch must be made on the thread that owns the window")]
+    NotWindowThread,
+    #[cfg(windows)]
     #[error("display watch: {0}")]
     Windows(#[from] windows_core::Error),
 }

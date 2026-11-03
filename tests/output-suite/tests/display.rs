@@ -136,7 +136,6 @@ fn display_follows_feed_request_and_window() {
         window.window_handle(),
         window.display_handle(),
         &DisplayRequest::default(),
-        Some(feed.clone()),
         FRAMES_IN_FLIGHT,
     )
     .unwrap();
@@ -150,6 +149,15 @@ fn display_follows_feed_request_and_window() {
         last.unwrap()
     };
 
+    // It watches the OS on its own, and follows what the OS says.
+    let os = display.feed().expect("watches the OS").latest().1;
+    assert!(os.os_hdr_on.is_some());
+    let d = frames(&mut display, &mut window, 1);
+    if os.os_hdr_on == Some(false) {
+        assert_eq!(d.encoding, OutputFormat::Sdr);
+    }
+
+    display.set_feed(Some(feed.clone()));
     let d = frames(&mut display, &mut window, 6);
     assert_eq!(d.encoding, OutputFormat::Hdr10Pq);
     assert_eq!(d.paper_white_nits, 200.0);

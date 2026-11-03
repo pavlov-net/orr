@@ -26,10 +26,11 @@ fn ui_only_frames_present_egui_over_black() {
         window.window_handle(),
         window.display_handle(),
         &sdr,
-        None,
         desc.frames_in_flight,
     )
     .unwrap();
+    // The test asks for encodings the OS may have off.
+    display.set_feed(None);
     let mut renderer = Renderer::new(gpu, desc).unwrap();
     let mut painter = Painter::new(gpu, desc.frames_in_flight).unwrap();
     let ctx = Context::default();

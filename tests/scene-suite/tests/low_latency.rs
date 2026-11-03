@@ -33,7 +33,6 @@ fn every_frame_id_gets_a_complete_ordered_report() {
             vsync: false,
             ..DisplayRequest::default()
         },
-        None,
         desc.frames_in_flight,
     )
     .unwrap();

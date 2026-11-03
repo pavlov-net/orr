@@ -149,10 +149,11 @@ fn frame_generation_presents_generated_images_before_each_frame() {
         window.window_handle(),
         window.display_handle(),
         &request(OutputFormat::Sdr),
-        None,
         desc.frames_in_flight,
     )
     .unwrap();
+    // The test asks for encodings the OS may have off.
+    display.set_feed(None);
     if let Err(e) = display.set_frame_generation(&sdk, FrameGenerationMode::Fixed(1)) {
         log::warn!("skipped: {e}");
         return;

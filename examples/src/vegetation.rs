@@ -1484,7 +1484,6 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
             w.window_handle(),
             w.display_handle(),
             &DisplayRequest::default(),
-            None,
             desc.frames_in_flight,
         )
         .expect("display")
