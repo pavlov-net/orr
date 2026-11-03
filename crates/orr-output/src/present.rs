@@ -355,8 +355,8 @@ impl Display {
     ///
     /// Call it on the thread that owns the window and pumps its messages; the display can then
     /// move to a render thread. If the OS cannot be watched, as when called on another thread, it
-    /// logs a warning and the surface's formats alone decide; a `DisplayWatch` on the window's
-    /// thread can then provide [`Self::set_feed`].
+    /// logs a warning and presents SDR; a `DisplayWatch` on the window's thread can then provide
+    /// [`Self::set_feed`].
     pub fn new(
         gpu: &Device,
         window: RawWindowHandle,
@@ -414,11 +414,8 @@ impl Display {
         let (watch, feed) = match crate::DisplayWatch::new(window) {
             Ok((watch, feed)) => (Some(watch), Some(feed)),
             Err(e) => {
-                log::warn!(
-                    "not watching the OS's display state, so the surface's formats alone \
-                     decide the encoding: {e}"
-                );
-                (None, None)
+                log::warn!("not watching the OS's display state, so presenting SDR: {e}");
+                (None, Some(DisplayFeed::hdr_off()))
             }
         };
         #[cfg(not(windows))]
@@ -466,8 +463,9 @@ impl Display {
     }
 
     /// What the display resolves with: the OS's report for the window, unless
-    /// [`Self::set_feed`] replaced it. `None` when the OS could not be watched or after
-    /// `set_feed(None)`; a clone taken before then keeps following the OS.
+    /// [`Self::set_feed`] replaced it. When the OS could not be watched it holds HDR off and
+    /// never changes. `None` after `set_feed(None)`; a clone of a watching feed taken before then
+    /// keeps following the OS.
     pub fn feed(&self) -> Option<&DisplayFeed> {
         self.feed.as_ref()
     }
