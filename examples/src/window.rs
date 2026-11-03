@@ -101,14 +101,23 @@ impl Window {
         let outstanding = renderer.paths_outstanding();
         if outstanding != self.compiling {
             self.compiling = outstanding;
-            let title = if outstanding == 0 {
-                self.title.clone()
-            } else {
-                format!("{} (compiling, {outstanding} kernels left)", self.title)
-            };
-            self.window().set_title(&title);
+            self.show_title();
         }
         self.pump()
+    }
+
+    /// Sets the title; [`Window::pump_showing_paths`] adds to it while kernels compile.
+    pub fn set_title(&mut self, title: &str) {
+        self.title = title.to_owned();
+        self.show_title();
+    }
+
+    fn show_title(&self) {
+        let title = match self.compiling {
+            0 => self.title.clone(),
+            n => format!("{} (compiling, {n} kernels left)", self.title),
+        };
+        self.window().set_title(&title);
     }
 
     /// Asks for a client area of `width` x `height` physical pixels.

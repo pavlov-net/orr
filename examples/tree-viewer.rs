@@ -12,10 +12,12 @@
 //! DLSS ray reconstruction denoises it at the mode that suits the output size.
 //!
 //! `tree-viewer <file.glb | file.gltf | archive.orr> [--model NAME] [--node PATTERN]
-//! [--part-attribute NAME] [--still] [--frames N] [--headless] [--out file.png]`: `--node`
-//! cooks each glTF node whose name holds the pattern as its own model (not with skins),
-//! `--model` picks the archive's model (default: the first by name). Headless runs output
-//! 480 x 270 for 120 frames unless told otherwise and write the last frame as a PNG.
+//! [--part-attribute NAME] [--still] [--no-glare] [--no-motion-blur] [--frames N] [--headless]
+//! [--out file.png]`: `--node` cooks each glTF node whose name holds the pattern as its own
+//! model (not with skins), `--model` picks the archive's model (default: the first by name).
+//! Headless runs output 480 x 270 for 120 frames unless told otherwise and write the last frame
+//! as a PNG. With the window focused, `G` switches glare and `B` motion blur; the title says
+//! which are on.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -31,8 +33,8 @@ use examples::shaders::tree_wind;
 use examples::sky::{self, Sky};
 use examples::window::Window;
 use examples::{
-    Capture, Options, Workers, assert_clean, device, enable_dlss, entry_head, fixed_time,
-    mount_all_at,
+    Capture, LensSwitches, Options, Workers, assert_clean, device, enable_dlss, entry_head,
+    fixed_time, mount_all_at,
 };
 use orr::orr_gpu::{
     Format, MemoryKind, QueueKind, SpecData, TextureDesc, TextureMemory, TextureUsage,
@@ -45,7 +47,7 @@ use orr::orr_pack::skeleton::{MAX_JOINTS, NO_PARENT, SkeletonInfo};
 use orr::orr_pack::{Archive, AssetId, Class, Target};
 use orr::{
     Affine3, CompilingKernels, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter,
-    InstanceFlags, InstancesDesc, Lens, LightId, LitView, PackSource, Pose, Projection, Renderer,
+    InstanceFlags, InstancesDesc, LightId, LitView, PackSource, Pose, Projection, Renderer,
     RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
     TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
@@ -73,8 +75,8 @@ const FLUTTER: f32 = 0.06;
 /// Radians per second.
 const ORBIT_RATE: f64 = 0.15;
 const USAGE: &str = "usage: tree-viewer <file.glb | file.gltf | archive.orr> [--model NAME] \
-    [--node PATTERN] [--part-attribute NAME] [--still] [--frames N] [--headless] \
-    [--out file.png]";
+    [--node PATTERN] [--part-attribute NAME] [--still] [--no-glare] [--no-motion-blur] \
+    [--frames N] [--headless] [--out file.png]";
 
 fn main() {
     let options = Options::from_args();
@@ -108,7 +110,7 @@ impl Args {
                 "--model" => model = Some(value()),
                 "--node" => node = Some(value()),
                 "--part-attribute" => part_attribute = Some(value()),
-                "--still" => {}
+                "--still" | "--no-glare" | "--no-motion-blur" => {}
                 _ if input.is_none() && !a.starts_with("--") => input = Some(PathBuf::from(a)),
                 _ => panic!("unknown argument {a}; {USAGE}"),
             }
@@ -412,7 +414,9 @@ fn run(options: &Options) -> Option<Capture> {
         joints.len()
     );
 
-    let mut window = (!options.headless).then(|| Window::new("orr tree-viewer", 1280, 720));
+    let mut switches = LensSwitches::new(options);
+    let title = |s: &LensSwitches| format!("orr tree-viewer: {s}");
+    let mut window = (!options.headless).then(|| Window::new(&title(&switches), 1280, 720));
     let desc = RendererDesc::default();
     let mut display = window.as_ref().map(|w| {
         Display::new(
@@ -562,10 +566,14 @@ fn run(options: &Options) -> Option<Capture> {
         if frames.is_some_and(|n| i >= n) {
             break;
         }
-        if let Some(w) = window.as_mut()
-            && !w.pump_showing_paths(&renderer)
-        {
-            break;
+        if let Some(w) = window.as_mut() {
+            if !w.pump_showing_paths(&renderer) {
+                break;
+            }
+            for key in w.take_keys() {
+                switches.press(key);
+                w.set_title(&title(&switches));
+            }
         }
         let final_frame = frames.is_some_and(|n| i + 1 == n);
         // Headless runs step a fixed clock, so they repeat exactly.
@@ -620,7 +628,7 @@ fn run(options: &Options) -> Option<Capture> {
                 fov_y: FOV_Y,
                 near: 0.05,
             },
-            lens: Lens::default(),
+            lens: switches.lens(),
             reset_history: i == 0,
             texture_filter: TextureFilter::Hardware,
             target,
