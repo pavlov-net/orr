@@ -47,7 +47,7 @@ const COOK_EXTENSIONS: &[&str] = &[
 const MESHOPT: [&str; 2] = ["EXT_meshopt_compression", "KHR_meshopt_compression"];
 
 /// Where a buffer's bytes are.
-pub(crate) enum Buffer {
+pub(super) enum Buffer {
     /// A meshopt fallback buffer: its views decode from other buffers.
     Fallback,
     /// The GLB binary chunk or a data URI, and its hash.
@@ -58,10 +58,10 @@ pub(crate) enum Buffer {
 
 /// A parsed glTF document. Buffer bytes are read by [`Data::load`].
 pub(crate) struct Document {
-    pub doc: gltf::Document,
+    pub(crate) doc: gltf::Document,
     /// The parsed JSON, for extensions the `gltf` crate does not model.
-    pub json: Value,
-    pub buffers: Vec<Buffer>,
+    pub(super) json: Value,
+    pub(super) buffers: Vec<Buffer>,
 }
 
 /// Whether the cook reads this asset: its `minVersion` when it has one, else its `version`.
@@ -116,7 +116,7 @@ fn check_morph_weights(doc: &gltf::Document) -> Result<(), String> {
 }
 
 /// Opens a `.gltf` or `.glb` file's bytes; buffer URIs resolve against `dir`.
-pub(crate) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
+pub(super) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
     let (json_bytes, mut bin) = if bytes.starts_with(b"glTF") {
         let glb = gltf::Glb::from_slice(bytes).map_err(|e| e.to_string())?;
         (
@@ -179,7 +179,7 @@ pub(crate) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
 }
 
 /// The bytes of a base64 data URI; `None` for any other URI.
-pub(crate) fn data_uri(uri: &str) -> Option<Result<Vec<u8>, String>> {
+pub(super) fn data_uri(uri: &str) -> Option<Result<Vec<u8>, String>> {
     let data = uri.strip_prefix("data:")?;
     Some(match data.split_once(";base64,") {
         Some((_, b64)) => base64::engine::general_purpose::STANDARD
@@ -227,7 +227,7 @@ impl Document {
 
     /// The buffer and byte range buffer view `v`'s stored bytes are read from: its own, or
     /// with meshopt compression the compressed stream's.
-    pub(crate) fn view_source(&self, v: usize) -> (usize, usize, usize) {
+    pub(super) fn view_source(&self, v: usize) -> (usize, usize, usize) {
         match self.meshopt(v) {
             Some(e) => (
                 field(e, "buffer"),
@@ -242,7 +242,7 @@ impl Document {
     }
 
     /// Adds the buffer views accessor `a` reads, sparse ones included.
-    pub(crate) fn accessor_views(a: &gltf::Accessor<'_>, out: &mut Vec<usize>) {
+    pub(super) fn accessor_views(a: &gltf::Accessor<'_>, out: &mut Vec<usize>) {
         out.extend(a.view().map(|v| v.index()));
         if let Some(s) = a.sparse() {
             out.push(s.indices().view().index());
@@ -253,13 +253,13 @@ impl Document {
 
 /// The bytes of some buffer views of a document, meshopt-compressed views decoded.
 pub(crate) struct Data<'d> {
-    pub doc: &'d Document,
+    pub(crate) doc: &'d Document,
     views: HashMap<usize, Vec<u8>>,
 }
 
 impl<'d> Data<'d> {
     /// Reads and decodes `views`, naming `asset` in errors.
-    pub(crate) fn load(
+    pub(super) fn load(
         doc: &'d Document,
         views: impl IntoIterator<Item = usize>,
         asset: &str,
@@ -318,7 +318,7 @@ impl<'d> Data<'d> {
     }
 
     /// The bytes of a loaded buffer view.
-    pub(crate) fn view(&self, v: &gltf::buffer::View<'_>) -> Result<&[u8], String> {
+    pub(super) fn view(&self, v: &gltf::buffer::View<'_>) -> Result<&[u8], String> {
         self.views
             .get(&v.index())
             .map(Vec::as_slice)
@@ -367,7 +367,7 @@ impl<'d> Data<'d> {
     }
 
     /// An index or other unsigned integer scalar accessor.
-    pub(crate) fn indices(&self, a: &gltf::Accessor<'_>) -> Result<Vec<u32>, String> {
+    pub(super) fn indices(&self, a: &gltf::Accessor<'_>) -> Result<Vec<u32>, String> {
         if a.dimensions() != Dimensions::Scalar
             || !matches!(a.data_type(), DataType::U8 | DataType::U16 | DataType::U32)
         {

@@ -72,23 +72,23 @@ pub struct EditRef {
 
 /// What an edit reads of its source mesh.
 pub(crate) struct EditSource {
-    pub entry: u32,
-    pub header: MeshHeader,
-    pub groups: Vec<Group>,
-    pub pages: Vec<StreamedPage>,
+    pub(crate) entry: u32,
+    pub(crate) header: MeshHeader,
+    pub(crate) groups: Vec<Group>,
+    pub(crate) pages: Vec<StreamedPage>,
     /// Sections whose every triangle is non-opaque.
-    pub non_opaque: Vec<bool>,
+    pub(crate) non_opaque: Vec<bool>,
     /// A discrete mesh's level 0: its first mesh cluster and cluster count.
-    pub finest_level: Option<(u32, u32)>,
+    pub(crate) finest_level: Option<(u32, u32)>,
 }
 
 /// An edit's page table and cluster entries, which a streaming source keeps in step for the
 /// pages the edit has no copy of.
 pub(crate) struct Mirror {
-    pub table: GpuPtr<u64>,
-    pub clusters: GpuPtr<ClusterRef>,
+    pub(crate) table: GpuPtr<u64>,
+    pub(crate) clusters: GpuPtr<ClusterRef>,
     /// By page: the edit holds a copy.
-    pub own: Vec<bool>,
+    pub(crate) own: Vec<bool>,
 }
 
 /// The pages an edit copies and the groups it holds at level 0: with `spheres`, every page
@@ -171,35 +171,35 @@ pub(crate) fn level0_clusters(
 
 /// An edit on the loading side: its pages' reads, decodes and copies.
 pub(crate) struct EditTask {
-    pub id: EditId,
-    pub loading: std::sync::Weak<Loading>,
-    pub device: Device,
-    pub source: Arc<BlobSource>,
-    pub stream: Arc<EditSource>,
-    pub own: Vec<u32>,
-    pub cancel: Arc<AtomicBool>,
-    pub micromaps_per_submit: u32,
-    pub done: Mutex<EditDone>,
-    pub outstanding: AtomicUsize,
+    pub(crate) id: EditId,
+    pub(crate) loading: std::sync::Weak<Loading>,
+    pub(crate) device: Device,
+    pub(crate) source: Arc<BlobSource>,
+    pub(crate) stream: Arc<EditSource>,
+    pub(crate) own: Vec<u32>,
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) micromaps_per_submit: u32,
+    pub(crate) done: Mutex<EditDone>,
+    pub(crate) outstanding: AtomicUsize,
 }
 
 /// What the jobs of an edit have made.
 #[derive(Default)]
 pub(crate) struct EditDone {
-    pub block: Option<(Allocation<u8>, Vec<u64>)>,
+    block: Option<(Allocation<u8>, Vec<u64>)>,
     /// The pages decoded, laid out as `block`.
-    pub staging: Option<Allocation<u8>>,
+    staging: Option<Allocation<u8>>,
     /// By own page.
-    pub clusters: Vec<Vec<ClusterInfo>>,
-    pub regions: Vec<Option<PageMicromap>>,
-    pub error: Option<Error>,
+    clusters: Vec<Vec<ClusterInfo>>,
+    regions: Vec<Option<PageMicromap>>,
+    error: Option<Error>,
 }
 
 /// A finished edit, handed to the render thread once its copies have landed.
 pub(crate) struct EditBatch {
-    pub id: EditId,
-    pub point: Option<TimelinePoint>,
-    pub result: Result<EditLoaded, Arc<Error>>,
+    pub(crate) id: EditId,
+    pub(crate) point: Option<TimelinePoint>,
+    pub(crate) result: Result<EditLoaded, Arc<Error>>,
 }
 
 impl EditBatch {
@@ -210,13 +210,13 @@ impl EditBatch {
 
 /// An edit's pages, resident in its block.
 pub(crate) struct EditLoaded {
-    pub block: Allocation<u8>,
+    pub(crate) block: Allocation<u8>,
     /// Bytes of the pages; their state before this frame's kernels follows them.
-    pub pages_bytes: u64,
+    pub(crate) pages_bytes: u64,
     /// By own page: its address, clusters and micromap.
-    pub addresses: Vec<u64>,
-    pub clusters: Vec<Vec<ClusterInfo>>,
-    pub micromaps: Vec<Option<(Micromap, Allocation<u8>)>>,
+    pub(crate) addresses: Vec<u64>,
+    pub(crate) clusters: Vec<Vec<ClusterInfo>>,
+    pub(crate) micromaps: Vec<Option<(Micromap, Allocation<u8>)>>,
 }
 
 impl EditTask {
@@ -385,24 +385,24 @@ pub(crate) struct EditClas {
     templates: GpuPtr<u64>,
     cluster_base: u32,
     /// Triangles one rebuild takes.
-    pub triangles: u32,
-    pub built: bool,
+    pub(crate) triangles: u32,
+    pub(crate) built: bool,
 }
 
 /// What [`EditClas::new`] builds from.
 pub(crate) struct ClasInputs<'a> {
     /// By own page: its address, micromap address (or 0) and clusters.
-    pub pages: Vec<(u64, u64, &'a [ClusterInfo])>,
+    pub(crate) pages: Vec<(u64, u64, &'a [ClusterInfo])>,
     /// The cluster id of each own page's first cluster.
-    pub cluster_bases: Vec<u32>,
-    pub header: &'a MeshHeader,
-    pub non_opaque: &'a [bool],
+    pub(crate) cluster_bases: Vec<u32>,
+    pub(crate) header: &'a MeshHeader,
+    pub(crate) non_opaque: &'a [bool],
     /// Clusters of coarser levels are built once only when the cut may take them.
-    pub whole: bool,
-    pub clas_triangles: u32,
+    pub(crate) whole: bool,
+    pub(crate) clas_triangles: u32,
     /// A skinned mesh's edit: the template table its level 0's builds fill.
-    pub templates: Option<GpuPtr<u64>>,
-    pub cluster_base: u32,
+    pub(crate) templates: Option<GpuPtr<u64>>,
+    pub(crate) cluster_base: u32,
 }
 
 impl EditClas {
@@ -500,10 +500,10 @@ impl EditClas {
 
 /// The frame's edit rebuilds: positions, flags and scratch regions of one grow-only block.
 pub(crate) struct EditRecorder<'a> {
-    pub device: &'a Device,
-    pub window: &'a UploadWindow,
-    pub kernels: &'a AccelKernels,
-    pub clusters: GpuPtr<ClusterRef>,
+    pub(crate) device: &'a Device,
+    pub(crate) window: &'a UploadWindow,
+    pub(crate) kernels: &'a AccelKernels,
+    pub(crate) clusters: GpuPtr<ClusterRef>,
 }
 
 impl EditRecorder<'_> {
@@ -669,37 +669,37 @@ impl EditRecorder<'_> {
 /// What a skinned mesh's edit changes of its skin table: its one cut is level 0, and its
 /// templates are its own.
 pub(crate) struct EditSkin<'a> {
-    pub source: SkinMeshGpu,
+    pub(crate) source: SkinMeshGpu,
     /// Level 0's mesh clusters, ascending.
-    pub cut: &'a [u32],
+    pub(crate) cut: &'a [u32],
 }
 
 /// What [`EditTables::new`] lays out.
 pub(crate) struct EditTablesDesc<'a> {
-    pub spheres: Option<&'a [[f32; 4]]>,
-    pub groups: &'a [EditGroupGpu],
+    pub(crate) spheres: Option<&'a [[f32; 4]]>,
+    pub(crate) groups: &'a [EditGroupGpu],
     /// The block of its pages and their bytes.
-    pub pages: (GpuPtr<u8>, u64),
-    pub page_count: u32,
-    pub clusters: u32,
-    pub stamps: bool,
+    pub(crate) pages: (GpuPtr<u8>, u64),
+    pub(crate) page_count: u32,
+    pub(crate) clusters: u32,
+    pub(crate) stamps: bool,
     /// Its animated parts, which share the box its edited triangles stay inside.
-    pub parts: &'a [PartGpu],
-    pub skin: Option<EditSkin<'a>>,
+    pub(crate) parts: &'a [PartGpu],
+    pub(crate) skin: Option<EditSkin<'a>>,
 }
 
 /// An edit's small tables in one mapped block: the pin spheres, the groups, the one empty
 /// cached cut its copies fall back on, its animated parts and, when its source streams or is
 /// skinned, its page stamps or skin table.
 pub(crate) struct EditTables {
-    pub _block: Allocation<u8>,
-    pub edit: GpuPtr<EditGpu>,
-    pub groups: GpuPtr<EditGroupGpu>,
-    pub rt_cut: GpuPtr<crate::RtCutGpu>,
-    pub stamps: GpuPtr<u32>,
-    pub parts: GpuPtr<PartGpu>,
-    pub skin: GpuPtr<SkinMeshGpu>,
-    pub templates: GpuPtr<u64>,
+    _block: Allocation<u8>,
+    pub(crate) edit: GpuPtr<EditGpu>,
+    pub(crate) groups: GpuPtr<EditGroupGpu>,
+    pub(crate) rt_cut: GpuPtr<crate::RtCutGpu>,
+    pub(crate) stamps: GpuPtr<u32>,
+    pub(crate) parts: GpuPtr<PartGpu>,
+    pub(crate) skin: GpuPtr<SkinMeshGpu>,
+    pub(crate) templates: GpuPtr<u64>,
 }
 
 impl EditTables {

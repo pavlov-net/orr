@@ -5,10 +5,12 @@ use std::io::{self, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::format::{HEADER_LEN, Layout, MAGIC, MOUNT_ALIGN, PAGE, codec_byte, hash_blob};
+use crate::format::{
+    FORMAT_VERSION, HEADER_LEN, Layout, MAGIC, MOUNT_ALIGN, PAGE, codec_byte, hash_blob,
+};
 use crate::{
-    Archive, AssetId, Blob, Chunk, Codec, Entry, Error, FORMAT_VERSION, Filter, GDEFLATE_PAGE,
-    GDeflate, Hash32, Header, Result, StrRef,
+    Archive, AssetId, Blob, Chunk, Codec, Entry, Error, Filter, GDEFLATE_PAGE, GDeflate, Hash32,
+    Header, Result, StrRef,
 };
 
 /// One blob to add.

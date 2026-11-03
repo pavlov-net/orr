@@ -141,11 +141,6 @@ impl Archive {
         })
     }
 
-    /// The file path; `None` for a memory archive.
-    pub fn path(&self) -> Option<&Path> {
-        self.file.as_ref().map(|(_, p)| p.as_path())
-    }
-
     pub fn header(&self) -> &Header {
         &self.header
     }

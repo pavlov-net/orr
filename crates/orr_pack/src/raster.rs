@@ -105,7 +105,7 @@ pub struct TileKey {
 
 impl TileKey {
     /// Table order: layer, LOD, then the Morton code of the tile.
-    pub fn order(&self) -> (u16, u8, u64) {
+    fn order(&self) -> (u16, u8, u64) {
         (self.layer, self.lod, morton(self.x, self.y))
     }
 }

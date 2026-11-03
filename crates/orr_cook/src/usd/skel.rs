@@ -24,12 +24,12 @@ use super::read::{PrimReader, matrix, quat};
 use crate::skin::{self, Channel, ClipSettings, Interpolation, Property};
 
 pub(super) struct Skel {
-    pub info: SkeletonInfo,
+    pub(super) info: SkeletonInfo,
     /// Joint paths as the skeleton names them.
     joints: Vec<String>,
     by_name: HashMap<String, u16>,
     /// Model space from skeleton space.
-    pub to_model: DMat4,
+    to_model: DMat4,
     /// Rest local transforms, as matrices.
     rest: Vec<DMat4>,
 }

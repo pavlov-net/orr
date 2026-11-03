@@ -131,9 +131,9 @@ fn hash(bin: IVec3, slots: u32) -> u32 {
 /// The bin table and run list of `decals` (by id): the global decals' ids first, then per
 /// bin a count followed by its decals' ids, ascending.
 pub(crate) struct Bins {
-    pub slots: Vec<DecalBinGpu>,
-    pub refs: Vec<u32>,
-    pub globals: u32,
+    pub(crate) slots: Vec<DecalBinGpu>,
+    pub(crate) refs: Vec<u32>,
+    pub(crate) globals: u32,
 }
 
 pub(crate) fn build_bins(decals: &[Option<Listing>]) -> Bins {

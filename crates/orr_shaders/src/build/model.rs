@@ -18,7 +18,7 @@ use super::sys;
 use crate::Stage;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) enum Scalar {
+pub(super) enum Scalar {
     Bool,
     I8,
     U8,
@@ -35,7 +35,7 @@ pub(crate) enum Scalar {
 
 impl Scalar {
     /// Bytes in memory; `bool` is stored as a 32-bit value.
-    pub(crate) fn size(self) -> u32 {
+    pub(super) fn size(self) -> u32 {
         match self {
             Self::I8 | Self::U8 => 1,
             Self::I16 | Self::U16 | Self::F16 => 2,
@@ -44,7 +44,7 @@ impl Scalar {
         }
     }
 
-    pub(crate) fn rust(self) -> &'static str {
+    pub(super) fn rust(self) -> &'static str {
         match self {
             Self::Bool | Self::U32 => "u32",
             Self::I8 => "i8",
@@ -102,7 +102,7 @@ impl Scalar {
 
 /// The heap-slot and TLAS types of `orr.abi`, recognized by struct name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) enum Handle {
+pub(super) enum Handle {
     Texture,
     StorageImage,
     Sampler,
@@ -120,7 +120,7 @@ impl Handle {
         })
     }
 
-    pub(crate) fn rust(self) -> &'static str {
+    pub(super) fn rust(self) -> &'static str {
         match self {
             Self::Texture => "::orr_shaders::abi::TextureIndex",
             Self::StorageImage => "::orr_shaders::abi::StorageImageIndex",
@@ -129,7 +129,7 @@ impl Handle {
         }
     }
 
-    pub(crate) fn scalar(self) -> Scalar {
+    pub(super) fn scalar(self) -> Scalar {
         if self == Self::Tlas {
             Scalar::U64
         } else {
@@ -139,7 +139,7 @@ impl Handle {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) enum Ty {
+pub(super) enum Ty {
     Scalar(Scalar),
     Vector(Scalar, u32),
     /// `rows` vectors of `cols` scalars in memory order when not `column_major`.
@@ -163,26 +163,26 @@ pub(crate) enum Ty {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Field {
     pub(crate) name: String,
-    pub(crate) ty: Ty,
-    pub(crate) offset: u32,
+    pub(super) ty: Ty,
+    pub(super) offset: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct StructDef {
+pub(super) struct StructDef {
     /// The Slang name, with generic arguments (`Gen<float>`).
     pub(crate) name: String,
     pub(crate) fields: Vec<Field>,
     /// The size in bytes when the SPIR-V states it (an array or pointer stride).
-    pub(crate) size: Option<u32>,
+    pub(super) size: Option<u32>,
     /// The file that declares it, when reflection finds the declaration.
     pub(crate) file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct SpecConstant {
+pub(super) struct SpecConstant {
     pub(crate) name: String,
     pub(crate) id: u32,
-    pub(crate) scalar: Scalar,
+    pub(super) scalar: Scalar,
     /// The default value's bits; a bool is 0 or 1.
     pub(crate) default: u64,
 }
@@ -190,8 +190,8 @@ pub(crate) struct SpecConstant {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Entry {
     pub(crate) name: String,
-    pub(crate) stage: Stage,
-    pub(crate) workgroup: [u32; 3],
+    pub(super) stage: Stage,
+    pub(super) workgroup: [u32; 3],
 }
 
 /// A global parameter other than the root and specialization constants, or an entry-point
@@ -199,26 +199,26 @@ pub(crate) struct Entry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StrayParam {
     pub(crate) name: String,
-    pub(crate) entry: Option<String>,
+    pub(super) entry: Option<String>,
     /// The file declaring a global parameter, when reflection finds it.
     pub(crate) file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Model {
+pub(super) struct Model {
     pub(crate) entries: Vec<Entry>,
-    pub(crate) root: Option<String>,
-    pub(crate) structs: BTreeMap<String, StructDef>,
-    pub(crate) spec: Vec<SpecConstant>,
+    pub(super) root: Option<String>,
+    pub(super) structs: BTreeMap<String, StructDef>,
+    pub(super) spec: Vec<SpecConstant>,
     pub(crate) stray_params: Vec<StrayParam>,
     /// 64-bit atomics other than a max whose result is unused, by opcode.
-    pub(crate) bad_atomics: Vec<u16>,
+    pub(super) bad_atomics: Vec<u16>,
     /// An entry point declares the opacity-micromap execution mode.
-    pub(crate) omm: bool,
+    pub(super) omm: bool,
     /// The root is held in the push data (`ORR_ROOT_INLINE`).
-    pub(crate) inline_root: bool,
+    pub(super) inline_root: bool,
     /// In a module that traces rays, the entry points without the opacity-micromap mode.
-    pub(crate) no_omm_mode: Vec<String>,
+    pub(super) no_omm_mode: Vec<String>,
 }
 
 /// # Safety
@@ -248,7 +248,7 @@ struct Decls {
 }
 
 /// Reads the model of a linked program. `layout` must stay alive for the call.
-pub(crate) fn extract(
+pub(super) fn extract(
     session: &Session,
     layout: *mut sys::SlangReflection,
     words: &[u32],

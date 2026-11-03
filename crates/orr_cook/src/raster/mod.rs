@@ -158,9 +158,9 @@ enum LayerInput {
 }
 
 pub(crate) struct Planned {
-    pub plan: Plan,
-    pub key: Hash32,
-    pub files: Vec<PathBuf>,
+    pub(crate) plan: Plan,
+    pub(crate) key: Hash32,
+    pub(crate) files: Vec<PathBuf>,
 }
 
 /// Resolves and hashes the inputs of a raster set and computes its key.

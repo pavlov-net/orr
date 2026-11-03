@@ -209,7 +209,7 @@ impl RayReconstruction {
     /// # Safety
     ///
     /// As [`new`](Self::new).
-    pub unsafe fn with_render_size(
+    pub(crate) unsafe fn with_render_size(
         ngx: &Ngx,
         cmd: vk::CommandBuffer,
         render: [u32; 2],
@@ -237,12 +237,12 @@ impl RayReconstruction {
             mode,
             render,
             output,
-            phases: crate::jitter_phases(render, output),
+            phases: crate::jitter::jitter_phases(render, output),
         })
     }
 
     /// The mode the feature was created with.
-    pub fn mode(&self) -> Mode {
+    pub(crate) fn mode(&self) -> Mode {
         self.mode
     }
 
@@ -251,18 +251,20 @@ impl RayReconstruction {
         self.render
     }
 
-    pub fn output_size(&self) -> [u32; 2] {
+    pub(crate) fn output_size(&self) -> [u32; 2] {
         self.output
     }
 
-    /// NGX's jitter offset for `frame` (see [`crate::jitter`]).
+    /// NGX's jitter offset for `frame`, in render pixels, each axis in [-0.5, 0.5). The
+    /// projection places each pixel's sample at the pixel center minus this value on both
+    /// axes, with y pointing down.
     pub fn jitter(&self, frame: u64) -> [f32; 2] {
-        crate::jitter(frame, self.phases)
+        crate::jitter::jitter(frame, self.phases)
     }
 
-    /// Texture LOD bias for the render resolution (see [`crate::mip_bias`]).
+    /// Texture LOD bias for the render resolution: `log2(render / output) - 1`.
     pub fn mip_bias(&self) -> f32 {
-        crate::mip_bias(self.render, self.output)
+        crate::jitter::mip_bias(self.render, self.output)
     }
 
     /// The preset NGX applied to this feature, read from `log`: [`Ngx::take_log`] from
@@ -273,7 +275,7 @@ impl RayReconstruction {
 
     /// Records the evaluation into `cmd`. Every image is in `GENERAL`, inputs at
     /// [`render_size`](Self::render_size), the output at
-    /// [`output_size`](Self::output_size).
+    /// the output size.
     ///
     /// A queue that has ever bound a descriptor heap needs [`ClassicBind::record`] earlier in
     /// `cmd`; without it NGX writes nothing. NGX leaves its own pipeline and descriptors
@@ -295,28 +297,29 @@ impl RayReconstruction {
 
 /// Super resolution inputs at render resolution, and the output at output resolution.
 #[derive(Clone, Copy)]
-pub struct SrInputs<'a> {
+#[cfg_attr(not(ngx), allow(dead_code))]
+pub(crate) struct SrInputs<'a> {
     /// HDR radiance, multiplied by `pre_exposure`.
-    pub color: &'a Image,
+    pub(crate) color: &'a Image,
     /// Reverse-Z device depth.
-    pub depth: &'a Image,
+    pub(crate) depth: &'a Image,
     /// Unjittered motion, previous UV minus current UV.
-    pub motion: &'a Image,
+    pub(crate) motion: &'a Image,
     /// 1x1; its first channel is the exposure that brings `color / pre_exposure` to the range
     /// the tonemapper takes (mid gray near 0.18). Presets J and K read it; L meters the color
     /// itself.
-    pub exposure: &'a Image,
+    pub(crate) exposure: &'a Image,
     /// The factor `color` was multiplied by, which NGX divides out.
-    pub pre_exposure: f32,
-    pub output: &'a Image,
+    pub(crate) pre_exposure: f32,
+    pub(crate) output: &'a Image,
     /// Drops the history.
-    pub reset: bool,
+    pub(crate) reset: bool,
     /// From [`SuperResolution::jitter`] for this frame.
-    pub jitter: [f32; 2],
+    pub(crate) jitter: [f32; 2],
 }
 
 /// One super resolution (or DLAA) feature at a fixed render and output size.
-pub struct SuperResolution {
+pub(crate) struct SuperResolution {
     inner: imp::Upscale,
     mode: Mode,
     render: [u32; 2],
@@ -332,7 +335,7 @@ impl SuperResolution {
     /// # Safety
     ///
     /// As [`RayReconstruction::new`].
-    pub unsafe fn new(
+    pub(crate) unsafe fn new(
         ngx: &Ngx,
         cmd: vk::CommandBuffer,
         output: [u32; 2],
@@ -349,32 +352,32 @@ impl SuperResolution {
             mode,
             render,
             output,
-            phases: crate::jitter_phases(render, output),
+            phases: crate::jitter::jitter_phases(render, output),
         })
     }
 
     /// Render resolution, fixed for the feature's lifetime.
-    pub fn render_size(&self) -> [u32; 2] {
+    pub(crate) fn render_size(&self) -> [u32; 2] {
         self.render
     }
 
-    pub fn output_size(&self) -> [u32; 2] {
+    pub(crate) fn output_size(&self) -> [u32; 2] {
         self.output
     }
 
-    /// NGX's jitter offset for `frame` (see [`crate::jitter`]).
-    pub fn jitter(&self, frame: u64) -> [f32; 2] {
-        crate::jitter(frame, self.phases)
+    /// NGX's jitter offset for `frame`.
+    pub(crate) fn jitter(&self, frame: u64) -> [f32; 2] {
+        crate::jitter::jitter(frame, self.phases)
     }
 
-    /// Texture LOD bias for the render resolution (see [`crate::mip_bias`]).
-    pub fn mip_bias(&self) -> f32 {
-        crate::mip_bias(self.render, self.output)
+    /// Texture LOD bias for the render resolution.
+    pub(crate) fn mip_bias(&self) -> f32 {
+        crate::jitter::mip_bias(self.render, self.output)
     }
 
     /// The preset NGX applied to this feature, read from `log`: [`Ngx::take_log`] from
     /// before the feature was created.
-    pub fn applied_preset(&self, log: &[String]) -> Option<char> {
+    pub(crate) fn applied_preset(&self, log: &[String]) -> Option<char> {
         applied_preset(log, Upscaler::Sr, self.mode)
     }
 
@@ -384,7 +387,7 @@ impl SuperResolution {
     /// # Safety
     ///
     /// As [`RayReconstruction::record`].
-    pub unsafe fn record(
+    pub(crate) unsafe fn record(
         &mut self,
         cmd: vk::CommandBuffer,
         inputs: &SrInputs<'_>,
@@ -396,9 +399,10 @@ impl SuperResolution {
 
 /// A buffer NGX writes, from its start.
 #[derive(Clone, Copy, Debug)]
-pub struct Buffer {
-    pub buffer: vk::Buffer,
-    pub size: u64,
+#[cfg_attr(not(ngx), allow(dead_code))]
+pub(crate) struct Buffer {
+    pub(crate) buffer: vk::Buffer,
+    pub(crate) size: u64,
 }
 
 /// The camera frame generation reprojects with. Matrices are column-vector matrices given
@@ -426,41 +430,41 @@ pub struct FgCamera {
 
 /// One frame generation evaluate: the rendered frame, its guides and the image to write.
 #[derive(Clone, Copy)]
-pub struct FgInputs<'a> {
+#[cfg_attr(not(ngx), allow(dead_code))]
+pub(crate) struct FgInputs<'a> {
     /// Display-encoded, without UI, in the feature's format and size.
-    pub backbuffer: &'a Image,
+    pub(crate) backbuffer: &'a Image,
     /// Reverse-Z device depth.
-    pub depth: &'a Image,
+    pub(crate) depth: &'a Image,
     /// Unjittered motion, previous UV minus current UV.
-    pub motion: &'a Image,
+    pub(crate) motion: &'a Image,
     /// RGBA16F bidirectional distortion field: RG the UV offset from a presented pixel to
     /// its undistorted position, BA the reverse.
-    pub distortion: Option<&'a Image>,
-    pub interpolated: &'a Image,
+    pub(crate) distortion: Option<&'a Image>,
+    pub(crate) interpolated: &'a Image,
     /// At least 4 bytes; NGX sets the first byte when the generated images of this frame
     /// should not be shown.
-    pub disable_interpolation: Option<Buffer>,
-    pub camera: &'a FgCamera,
+    pub(crate) disable_interpolation: Option<Buffer>,
+    pub(crate) camera: &'a FgCamera,
     /// NGX's jitter of the guides, in render pixels.
-    pub jitter: [f32; 2],
+    pub(crate) jitter: [f32; 2],
     /// Scales `motion` to pixels of the motion image.
-    pub mvec_scale: [f32; 2],
+    pub(crate) mvec_scale: [f32; 2],
     /// The previous frame is unrelated to this one.
-    pub reset: bool,
+    pub(crate) reset: bool,
     /// Increases by one each rendered frame, with frame generation on or off.
-    pub frame_id: u64,
+    pub(crate) frame_id: u64,
     /// Menus and loading screens.
-    pub not_rendering_scene: bool,
+    pub(crate) not_rendering_scene: bool,
     /// The backbuffer is PQ.
-    pub hdr: bool,
+    pub(crate) hdr: bool,
     /// Scales NGX's linearized depth, `1 / depth`; NGX's default is 1.
-    pub depth_scale: f32,
+    pub(crate) depth_scale: f32,
 }
 
 /// One frame generation feature at a fixed output size and backbuffer format.
-pub struct FrameGeneration {
+pub(crate) struct FrameGeneration {
     inner: imp::Fg,
-    output: [u32; 2],
     max_generated: u32,
 }
 
@@ -472,7 +476,7 @@ impl FrameGeneration {
     ///
     /// `cmd` is recording on a queue of `ngx`'s device. The feature is dropped before `ngx`,
     /// after the GPU has finished every command buffer that used it.
-    pub unsafe fn new(
+    pub(crate) unsafe fn new(
         ngx: &Ngx,
         cmd: vk::CommandBuffer,
         output: [u32; 2],
@@ -483,18 +487,8 @@ impl FrameGeneration {
         let inner = unsafe { imp::Fg::new(&ngx.0, cmd, output, format)? };
         Ok(Self {
             inner,
-            output,
             max_generated,
         })
-    }
-
-    pub fn output_size(&self) -> [u32; 2] {
-        self.output
-    }
-
-    /// The most images one rendered frame may generate (`MultiFrameCountMax`).
-    pub fn max_generated(&self) -> u32 {
-        self.max_generated
     }
 
     /// Records generated image `index` of `count` (1-based) between the previous
@@ -506,7 +500,7 @@ impl FrameGeneration {
     ///
     /// `cmd` is recording on a queue of the feature's device, and every image and buffer
     /// outlives its execution.
-    pub unsafe fn record(
+    pub(crate) unsafe fn record(
         &mut self,
         cmd: vk::CommandBuffer,
         inputs: &FgInputs<'_>,

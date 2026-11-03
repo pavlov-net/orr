@@ -71,7 +71,7 @@ pub struct ChainImages {
 
 impl ChainImages {
     /// The chain after a pass that read `rr_output` and wrote `linear`.
-    pub fn swapped(self) -> Self {
+    pub(crate) fn swapped(self) -> Self {
         Self {
             rr_output: self.linear,
             rr_output_store: self.linear_store,
@@ -174,10 +174,6 @@ impl DistortionField {
     /// The field as the last stage left it: what frame generation reads.
     pub fn current(&self) -> TextureIndex {
         self.images[self.current].sampled
-    }
-
-    pub fn bytes(&self) -> u64 {
-        self.images.iter().map(|i| i.bytes).sum()
     }
 
     /// The texture of [`DistortionField::current`], for a frame generation recorded by hand.

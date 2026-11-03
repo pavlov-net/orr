@@ -13,7 +13,8 @@
 //!
 //! [`DlssSdk`], [`RayReconstruction`], [`SuperResolution`] and [`FrameGeneration`] work on
 //! an orr_gpu device and record into its command lists, serializing every NGX call. [`raw`]
-//! works on ash handles; its caller keeps NGX calls on one thread at a time.
+//! holds the NGX instance and ray reconstruction on ash handles; its caller keeps NGX calls on
+//! one thread at a time.
 
 mod error;
 mod jitter;
@@ -28,7 +29,6 @@ mod ngx;
 mod sys;
 
 pub use error::DlssError;
-pub use jitter::{jitter, jitter_phases, mip_bias};
 pub use raw::FgCamera;
 pub use sdk::{
     DlssDeviceHooks, DlssSdk, FgInputs, FrameGeneration, RayReconstruction, RrInputs, SrInputs,
@@ -42,7 +42,8 @@ pub const MIN_OUTPUT: [u32; 2] = [64, 32];
 /// What a caller asks DLSS for: a [`Mode`], or the one that suits the output resolution.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Quality {
-    /// [`Mode::for_output`].
+    /// By output pixels: Quality up to 2560 x 1440, Performance up to 3840 x 2160, Ultra
+    /// Performance above.
     #[default]
     Auto,
     Dlaa,
@@ -80,7 +81,7 @@ impl Mode {
     /// The mode for an output of this many pixels: Quality up to 2560 x 1440, Performance up to
     /// 3840 x 2160, Ultra Performance above. From 1920 x 1080 up these are the defaults of the
     /// RTX UI Developer Guidelines' table.
-    pub fn for_output([width, height]: [u32; 2]) -> Self {
+    fn for_output([width, height]: [u32; 2]) -> Self {
         match u64::from(width) * u64::from(height) {
             p if p <= 2560 * 1440 => Self::Quality,
             p if p <= 3840 * 2160 => Self::Performance,
@@ -89,7 +90,7 @@ impl Mode {
     }
 
     /// The mode whose nominal scale is closest to rendering at `render` for `output`.
-    pub(crate) fn for_render_size(render: [u32; 2], output: [u32; 2]) -> Self {
+    fn for_render_size(render: [u32; 2], output: [u32; 2]) -> Self {
         let scale = f64::from(render[0]) / f64::from(output[0]);
         [
             Self::Dlaa,
@@ -108,7 +109,7 @@ impl Mode {
     }
 
     /// NGX's published ratio of render to output resolution on each axis.
-    pub(crate) fn scale(self) -> f64 {
+    fn scale(self) -> f64 {
         match self {
             Self::Dlaa => 1.0,
             Self::Quality => 2.0 / 3.0,

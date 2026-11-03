@@ -5,16 +5,16 @@ use ash::vk;
 
 /// Counts validation warnings and errors and logs each one.
 #[derive(Default)]
-pub(crate) struct MessageCount(AtomicU32);
+pub(super) struct MessageCount(AtomicU32);
 
 impl MessageCount {
-    pub(crate) fn get(&self) -> u32 {
+    pub(super) fn get(&self) -> u32 {
         self.0.load(Ordering::Relaxed)
     }
 }
 
 /// The messenger's create info; `count` must outlive the messenger.
-pub(crate) fn messenger_info(count: &MessageCount) -> vk::DebugUtilsMessengerCreateInfoEXT<'_> {
+pub(super) fn messenger_info(count: &MessageCount) -> vk::DebugUtilsMessengerCreateInfoEXT<'_> {
     vk::DebugUtilsMessengerCreateInfoEXT::default()
         .message_severity(
             vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
@@ -92,7 +92,7 @@ unsafe fn slice<'a, T>(p: *const T, n: u32) -> &'a [T] {
     }
 }
 
-pub(crate) fn name_object<H: vk::Handle>(
+pub(super) fn name_object<H: vk::Handle>(
     debug: &ash::ext::debug_utils::Device,
     handle: H,
     name: &str,

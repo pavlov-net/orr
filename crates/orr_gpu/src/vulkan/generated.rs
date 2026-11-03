@@ -67,10 +67,6 @@ pub struct ExecutionSet {
 }
 
 impl ExecutionSet {
-    pub fn kind(&self) -> SetKind {
-        self.kind
-    }
-
     /// Pipelines in the set.
     pub fn len(&self) -> u32 {
         self.pipelines.len() as u32

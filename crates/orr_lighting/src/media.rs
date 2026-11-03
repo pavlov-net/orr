@@ -18,7 +18,7 @@ use crate::view::{LightingDebugView, LightingView, NO_MATERIAL, ViewLighting, Vi
 use crate::{Error, KernelSet, SceneLighting, pipeline};
 
 /// Pixels per side of a froxel column's tile (`media`'s `FROXEL_TILE`).
-pub const FROXEL_TILE: u32 = 8;
+const FROXEL_TILE: u32 = 8;
 
 /// Columns, rows and shells of the aerial-perspective LUT (`media`'s `AERIAL_SIZE`).
 pub const AERIAL_SIZE: u32 = 32;

@@ -243,10 +243,6 @@ impl AtmosphereState {
         })
     }
 
-    pub fn desc(&self) -> &Atmosphere {
-        &self.desc
-    }
-
     /// Changes the medium; the next [`record`](Self::record) rebuilds every LUT.
     pub fn set(&mut self, desc: &Atmosphere) {
         check(desc);

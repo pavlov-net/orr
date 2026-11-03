@@ -71,7 +71,7 @@ impl Clip {
     }
 
     /// The joints' local transforms at frame `f`.
-    pub fn frame(&self, f: u32) -> &[Trs] {
+    fn frame(&self, f: u32) -> &[Trs] {
         let n = self.header.joint_count as usize;
         &self.samples[f as usize * n..][..n]
     }

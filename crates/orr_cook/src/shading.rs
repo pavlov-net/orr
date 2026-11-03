@@ -42,17 +42,17 @@ use crate::texture::material::{MaterialTextures, TexRef};
 /// A shading network: nodes and the connections between their inputs and outputs.
 #[derive(Default)]
 pub(crate) struct Network {
-    pub nodes: Vec<Node>,
+    pub(crate) nodes: Vec<Node>,
 }
 
 pub(crate) struct Node {
     /// Prim path or document name, for messages.
-    pub name: String,
+    pub(crate) name: String,
     /// MaterialX category (`image`, `open_pbr_surface`) or UsdShade id (`UsdUVTexture`).
-    pub kind: String,
+    pub(crate) kind: String,
     /// MaterialX output type (`float`, `color3`); empty for UsdShade nodes.
-    pub ty: String,
-    pub inputs: BTreeMap<String, Input>,
+    pub(crate) ty: String,
+    pub(crate) inputs: BTreeMap<String, Input>,
 }
 
 pub(crate) enum Input {
@@ -96,10 +96,10 @@ pub(crate) fn category(id: &str) -> &str {
 }
 
 pub(crate) struct Mapped {
-    pub material: Material,
-    pub textures: MaterialTextures,
+    pub(crate) material: Material,
+    pub(crate) textures: MaterialTextures,
     /// The uv transform every texture shares, when it is not the identity.
-    pub uv: Option<Affine2>,
+    pub(crate) uv: Option<Affine2>,
 }
 
 /// Which channels of a texture an input reads.

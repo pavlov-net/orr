@@ -21,10 +21,10 @@ use crate::{
 /// What device address commands are told about every `gpu_malloc` and sparse range: their
 /// buffers have storage usage. Sparse ranges may be partly bound, so none claims to be fully
 /// bound.
-pub(crate) const ADDRESS_FLAGS: vk::AddressCommandFlagsKHR =
+pub(super) const ADDRESS_FLAGS: vk::AddressCommandFlagsKHR =
     vk::AddressCommandFlagsKHR::STORAGE_BUFFER_USAGE;
 
-pub(crate) fn address_range(address: GpuAddress, size: u64) -> vk::DeviceAddressRangeKHR {
+pub(super) fn address_range(address: GpuAddress, size: u64) -> vk::DeviceAddressRangeKHR {
     vk::DeviceAddressRangeKHR {
         address: address.0,
         size,
@@ -106,20 +106,20 @@ impl TextureCopy {
     }
 }
 
-pub(crate) struct PassRecord {
-    pub id: u32,
-    pub name: &'static str,
-    pub stats: bool,
+pub(super) struct PassRecord {
+    pub(super) id: u32,
+    pub(super) name: &'static str,
+    pub(super) stats: bool,
     /// The pass opened a counter-frame range.
-    pub range: bool,
+    range: bool,
 }
 
 /// What a finished list hands to its submit.
-pub(crate) struct Finished {
-    pub res: ListResources,
-    pub passes: Vec<PassRecord>,
+pub(super) struct Finished {
+    pub(super) res: ListResources,
+    pub(super) passes: Vec<PassRecord>,
     /// Objects the list's commands use, destroyed once its submit completes.
-    pub keep: Vec<Item>,
+    pub(super) keep: Vec<Item>,
 }
 
 /// A one-shot command list for one queue. Record on any thread, then hand it to the queue's
@@ -136,7 +136,7 @@ pub struct CommandList<'q> {
     rebind_heaps: bool,
     keep: Vec<Item>,
     /// Compacted-size queries recorded so far.
-    pub(crate) compact_queries: u32,
+    pub(super) compact_queries: u32,
 }
 
 impl<'q> CommandList<'q> {
@@ -154,31 +154,31 @@ impl<'q> CommandList<'q> {
         }
     }
 
-    pub(crate) fn queue(&self) -> &'q Queue {
+    pub(super) fn queue(&self) -> &'q Queue {
         self.queue
     }
 
-    pub(crate) fn in_rendering(&self) -> bool {
+    pub(super) fn in_rendering(&self) -> bool {
         self.rendering.is_some()
     }
 
     /// Raw commands may have bound anything: the next heap-mode command rebinds the heaps,
     /// its pipeline and its root.
-    pub(crate) fn raw_recorded(&mut self) {
+    pub(super) fn raw_recorded(&mut self) {
         self.rebind_heaps = true;
         self.bound = vk::Pipeline::null();
     }
 
-    pub(crate) fn cmd(&self) -> vk::CommandBuffer {
+    pub(super) fn cmd(&self) -> vk::CommandBuffer {
         self.res().cmd
     }
 
-    pub(crate) fn res(&self) -> &ListResources {
+    pub(super) fn res(&self) -> &ListResources {
         self.res.as_ref().expect("command list already finished")
     }
 
     /// Upload memory holding `bytes`, alive until the list's submit completes.
-    pub(crate) fn keep_upload(&mut self, bytes: &[u8], name: &str) -> GpuAddress {
+    pub(super) fn keep_upload(&mut self, bytes: &[u8], name: &str) -> GpuAddress {
         let shared = &self.queue.shared;
         let (raw, mapped) = shared
             .create_buffer(
@@ -198,7 +198,7 @@ impl<'q> CommandList<'q> {
     }
 
     /// Dispatches an internal pipeline with `root` as its root pointer.
-    pub(crate) fn dispatch_raw(&mut self, p: vk::Pipeline, root: GpuAddress, groups: [u32; 3]) {
+    pub(super) fn dispatch_raw(&mut self, p: vk::Pipeline, root: GpuAddress, groups: [u32; 3]) {
         self.bind(vk::PipelineBindPoint::COMPUTE, p, root.0);
         // SAFETY: recording with a compute pipeline bound.
         unsafe {
@@ -212,7 +212,7 @@ impl<'q> CommandList<'q> {
     }
 
     /// Ends recording and hands the resources to the submit.
-    pub(crate) fn finish(mut self) -> Result<Finished, Error> {
+    pub(super) fn finish(mut self) -> Result<Finished, Error> {
         assert!(
             !self.open,
             "pass {:?} was not ended",
@@ -234,7 +234,7 @@ impl<'q> CommandList<'q> {
 
     /// Moves a swapchain image into `GENERAL` after its acquire (`acquired`), or into
     /// `PRESENT_SRC` after the last write before its present.
-    pub(crate) fn swapchain_barrier(&mut self, t: &Texture, acquired: bool) {
+    pub(super) fn swapchain_barrier(&mut self, t: &Texture, acquired: bool) {
         let all = vk::PipelineStageFlags2::ALL_COMMANDS;
         let rw = vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE;
         let b = vk::ImageMemoryBarrier2::default()
@@ -341,11 +341,11 @@ impl<'q> CommandList<'q> {
 
     /// The pipeline and push data a command changed behind the list's back: the next
     /// command binds and pushes its own.
-    pub(crate) fn pipeline_lost(&mut self) {
+    pub(super) fn pipeline_lost(&mut self) {
         self.bound = vk::Pipeline::null();
     }
 
-    pub(crate) fn bind(&mut self, point: vk::PipelineBindPoint, pipeline: vk::Pipeline, root: u64) {
+    pub(super) fn bind(&mut self, point: vk::PipelineBindPoint, pipeline: vk::Pipeline, root: u64) {
         self.bind_data(point, pipeline, &root.to_le_bytes());
     }
 

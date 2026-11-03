@@ -8,11 +8,11 @@ use super::model::{Model, Ty, text};
 use super::sys;
 
 /// Options of the Metal session; include roots follow.
-pub(crate) const OPTIONS: &[&str] = &["-target", "metal", "-matrix-layout-row-major"];
+pub(super) const OPTIONS: &[&str] = &["-target", "metal", "-matrix-layout-row-major"];
 
 /// Every difference between the Metal layout of the root and its pointees and the SPIR-V
 /// layout in `model`. `layout` must be the live Metal program layout.
-pub(crate) fn layout_issues(
+pub(super) fn layout_issues(
     api: &sys::SlangLib,
     layout: *mut sys::SlangReflection,
     model: &Model,
@@ -136,7 +136,7 @@ impl Walk<'_> {
 }
 
 /// Constructs in emitted MSL that Metal rejects.
-pub(crate) fn msl_issues(msl: &str) -> Vec<String> {
+pub(super) fn msl_issues(msl: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_struct: Option<&str> = None;
     let mut depth = 0i32;
@@ -191,7 +191,7 @@ pub(crate) fn msl_issues(msl: &str) -> Vec<String> {
 /// `source` with its `[shader("raygeneration")]` attributes blanked out, so a Metal session,
 /// which rejects raygen entries when it loads a module, sees those entries as plain
 /// functions. Line and column numbers stay the same.
-pub(crate) fn without_raygen(source: &str) -> String {
+pub(super) fn without_raygen(source: &str) -> String {
     let mut out = source.to_owned();
     let mut from = 0;
     while let Some(i) = out[from..].find("[shader(").map(|i| i + from) {

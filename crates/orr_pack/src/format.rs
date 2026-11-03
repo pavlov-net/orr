@@ -2,7 +2,7 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::{AssetId, Codec, Error, Filter, GDEFLATE_PAGE, Hash32, Result};
 
-pub const FORMAT_VERSION: u32 = 1;
+pub(crate) const FORMAT_VERSION: u32 = 1;
 pub(crate) const MAGIC: [u8; 8] = *b"ORRPACK\0";
 pub(crate) const PAGE: u64 = 4096;
 pub(crate) const MOUNT_ALIGN: usize = 16;

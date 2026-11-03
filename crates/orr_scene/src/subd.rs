@@ -69,39 +69,39 @@ impl Default for SubdDesc<'_> {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct CageShape {
     /// Patch clusters and base vertices of its patch batch.
-    pub clusters: u32,
-    pub vertices: u32,
+    pub(crate) clusters: u32,
+    pub(crate) vertices: u32,
     /// Page points, and cage points.
-    pub points: u32,
-    pub cage_points: u32,
-    pub sections: u32,
-    pub skinned: bool,
+    pub(crate) points: u32,
+    pub(crate) cage_points: u32,
+    pub(crate) sections: u32,
+    pub(crate) skinned: bool,
     /// The farthest the limit surface lies from its base triangles at rest, m.
-    pub deviation: f32,
+    pub(crate) deviation: f32,
 }
 
 /// A model's cage as its copies take it.
 #[derive(Clone, Debug)]
 pub(crate) struct ModelCage {
-    pub cage: GpuPtr<SubdCageGpu>,
+    pub(crate) cage: GpuPtr<SubdCageGpu>,
     /// Its rest page points.
-    pub points: GpuPtr<[f32; 3]>,
-    pub shape: CageShape,
+    pub(crate) points: GpuPtr<[f32; 3]>,
+    pub(crate) shape: CageShape,
     /// One per cage section.
-    pub materials: Vec<MaterialId>,
+    pub(crate) materials: Vec<MaterialId>,
     /// From the cage sections' materials; `None` where they mix dielectric or presence
     /// materials with others.
-    pub opacity: Option<Opacity>,
+    pub(crate) opacity: Option<Opacity>,
 }
 
 /// What a copy's tessellated entry is built with.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SubdBuild {
-    pub cage: GpuPtr<SubdCageGpu>,
-    pub points: GpuPtr<[f32; 3]>,
-    pub shape: CageShape,
+    pub(crate) cage: GpuPtr<SubdCageGpu>,
+    pub(crate) points: GpuPtr<[f32; 3]>,
+    pub(crate) shape: CageShape,
     /// Palette group, first entry and joints of a skinned copy.
-    pub palette: Option<(u32, u32, u32)>,
+    pub(crate) palette: Option<(u32, u32, u32)>,
 }
 
 /// Face coordinates are numerators over `ONE`, exact for patches up to 15 levels deep.
@@ -223,7 +223,7 @@ pub(crate) struct CageTables {
     stencil_weights: Vec<f32>,
     cage_points: Vec<[f32; 3]>,
     skin: Vec<[u32; 2]>,
-    pub shape: CageShape,
+    pub(crate) shape: CageShape,
 }
 
 /// Base triangles per patch cluster, at most; triangles of a patch stay in one cluster.

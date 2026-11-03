@@ -48,7 +48,7 @@ impl<'a> MeshPipelineDesc<'a> {
 /// [`crate::CommandList::begin_rendering`]. Dropping it destroys it once everything
 /// submitted before the drop has completed.
 pub struct MeshPipeline {
-    pub(crate) raw: vk::Pipeline,
+    pub(super) raw: vk::Pipeline,
     shared: Arc<Shared>,
 }
 
@@ -160,7 +160,7 @@ fn check(shared: &Shared, d: &MeshPipelineDesc<'_>, name: &str) -> Result<(), Er
 
 impl Shared {
     /// A mesh pipeline with `extra` creation flags.
-    pub(crate) fn create_mesh(
+    pub(super) fn create_mesh(
         &self,
         d: &MeshPipelineDesc<'_>,
         extra: vk::PipelineCreateFlags2,

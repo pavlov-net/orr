@@ -87,10 +87,10 @@ pub struct SectionSpec {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ModelFacts {
     /// PTLAS instances one copy costs: its body plus one per animated part.
-    pub instances: u32,
-    pub sections: u32,
+    pub(crate) instances: u32,
+    pub(crate) sections: u32,
     /// Grid step 2^k of the model's mesh; `i8::MIN` for a subdivision cage.
-    pub position_exponent: i8,
+    pub(crate) position_exponent: i8,
 }
 
 impl ModelFacts {

@@ -115,8 +115,8 @@ impl Default for SubdSettings {
 
 /// A cage with what the importer adds: skin influences per point.
 pub(crate) struct CageData {
-    pub cage: CageInput,
-    pub skin: Option<Vec<Influence>>,
+    pub(crate) cage: CageInput,
+    pub(crate) skin: Option<Vec<Influence>>,
 }
 
 impl CageData {
@@ -131,8 +131,8 @@ impl CageData {
 
 /// A cooked cage: blob 0 and the pages.
 pub(crate) struct Cooked {
-    pub info: SubdInfo,
-    pub pages: Vec<Vec<u8>>,
+    pub(crate) info: SubdInfo,
+    pub(crate) pages: Vec<Vec<u8>>,
 }
 
 /// Checks the cage against its section count.

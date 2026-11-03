@@ -18,14 +18,14 @@ use super::{Error, SLANG_VERSION};
 
 /// The precompiled modules of one option set.
 #[derive(Default)]
-pub(crate) struct Precompiled {
+pub(super) struct Precompiled {
     /// Each module file (canonical) with its record.
     modules: BTreeMap<PathBuf, ModuleRecord>,
 }
 
 impl Precompiled {
     /// The import names of the precompiled modules loaded into `session`.
-    pub(crate) fn used(&self, session: &Session) -> Vec<String> {
+    pub(super) fn used(&self, session: &Session) -> Vec<String> {
         let mut used: Vec<String> = session
             .loaded_modules()
             .iter()
@@ -41,7 +41,7 @@ impl Precompiled {
     }
 
     /// The files of the precompiled modules loaded into `session`.
-    pub(crate) fn inputs(&self, session: &Session) -> Vec<PathBuf> {
+    pub(super) fn inputs(&self, session: &Session) -> Vec<PathBuf> {
         session
             .loaded_modules()
             .iter()
@@ -51,7 +51,7 @@ impl Precompiled {
     }
 
     /// The source file of a precompiled module file, which keeps no declaration locations.
-    pub(crate) fn source(&self, module: &Path) -> Option<&Path> {
+    pub(super) fn source(&self, module: &Path) -> Option<&Path> {
         self.modules
             .get(&canonical_lossy(module))
             .map(|e| e.file.as_path())
@@ -78,7 +78,7 @@ struct ModuleRecord {
 /// name to the file the search paths give, since the precompiled copy wins over a file
 /// beside the importer. A module that fails to compile is left to load from source, so the
 /// kernel's compile reports the error.
-pub(crate) fn precompile(
+pub(super) fn precompile(
     lib: &Arc<Library>,
     options: &[String],
     key_parts: &[&str],

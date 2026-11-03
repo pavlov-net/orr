@@ -17,7 +17,7 @@ use crate::mount::{Batch, MountTask, finish, start};
 use crate::stream::{self, CutBatch, CutTask, StreamBatch, StreamTask};
 use crate::{Error, PackSource, Result};
 
-pub(crate) type Job = Box<dyn FnOnce() + Send>;
+type Job = Box<dyn FnOnce() + Send>;
 
 /// Messages to the loading thread.
 pub(crate) enum Msg {
@@ -130,7 +130,7 @@ pub struct Loading {
     streams: Mutex<Vec<StreamBatch>>,
     edits: Mutex<Vec<EditBatch>>,
     cuts: Mutex<Vec<CutBatch>>,
-    pub(crate) positioned: bool,
+    positioned: bool,
 }
 
 impl Loading {
@@ -294,8 +294,8 @@ pub(crate) fn landed(device: &Device, point: Option<orr_gpu::TimelinePoint>) -> 
 /// over the path later is never read through them.
 pub(crate) struct ArchiveFile {
     /// For `orr_pack::Archive`, taken once.
-    pub archive: Mutex<Option<File>>,
-    pub reads: Arc<ReadFile>,
+    pub(crate) archive: Mutex<Option<File>>,
+    pub(crate) reads: Arc<ReadFile>,
 }
 
 impl ArchiveFile {
@@ -310,13 +310,13 @@ impl ArchiveFile {
 /// Where a pack's blobs are read from: the archive, its file handles when it is a file,
 /// and whether reads go through the ring.
 pub(crate) struct BlobSource {
-    pub loading: Weak<Loading>,
-    pub archive: Arc<Archive>,
-    pub file: Option<Arc<ArchiveFile>>,
-    pub ring: bool,
+    pub(crate) loading: Weak<Loading>,
+    pub(crate) archive: Arc<Archive>,
+    pub(crate) file: Option<Arc<ArchiveFile>>,
+    pub(crate) ring: bool,
 }
 
-pub(crate) type Stored = Box<dyn FnOnce(Result<&[u8]>) + Send>;
+type Stored = Box<dyn FnOnce(Result<&[u8]>) + Send>;
 
 /// Reads the stored bytes of blob `b`, or of its chunk `chunk`, then hands them to `then` on
 /// a worker. A read error goes to `then` on the thread that saw it. Without a loading side

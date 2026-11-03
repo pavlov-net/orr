@@ -22,15 +22,15 @@ const BAND_BYTES: usize = 8 << 20;
 /// starting `offset` bytes into the file.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Sidecar {
-    pub width: u32,
-    pub height: u32,
-    pub format: RasterFormat,
+pub(super) struct Sidecar {
+    width: u32,
+    height: u32,
+    format: RasterFormat,
     #[serde(default)]
-    pub offset: u64,
+    pub(super) offset: u64,
 }
 
-pub(crate) fn raster_error(asset: &str, message: impl Into<String>) -> Error {
+pub(super) fn raster_error(asset: &str, message: impl Into<String>) -> Error {
     Error::Raster {
         asset: asset.into(),
         message: message.into(),
@@ -45,7 +45,7 @@ fn read_error(path: &Path, source: io::Error) -> Error {
 }
 
 /// Fails if the file's hash is not `hash`.
-pub(crate) fn check_hash(path: &Path, hash: Hash32) -> Result<()> {
+pub(super) fn check_hash(path: &Path, hash: Hash32) -> Result<()> {
     if hash_file(path)? != hash {
         return Err(Error::Changed {
             path: path.to_owned(),
@@ -54,7 +54,7 @@ pub(crate) fn check_hash(path: &Path, hash: Hash32) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn is_tiff(path: &Path) -> bool {
+pub(super) fn is_tiff(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
@@ -114,9 +114,9 @@ fn result_bytes(r: DecodingResult) -> std::result::Result<Vec<u8>, String> {
 
 /// A decoded TIFF tile: its size, input format and input texels.
 pub(crate) struct TiffTile {
-    pub size: [u32; 2],
-    pub format: RasterFormat,
-    pub texels: Vec<u8>,
+    pub(super) size: [u32; 2],
+    pub(super) format: RasterFormat,
+    pub(super) texels: Vec<u8>,
 }
 
 pub(crate) fn decode_tiff(path: &Path, bytes: &[u8]) -> Result<TiffTile> {
@@ -141,9 +141,9 @@ pub(crate) fn decode_tiff(path: &Path, bytes: &[u8]) -> Result<TiffTile> {
 }
 
 /// A whole raster read in bands of full rows.
-pub(crate) struct WholeRaster {
-    pub size: u32,
-    pub format: RasterFormat,
+pub(super) struct WholeRaster {
+    pub(super) size: u32,
+    pub(super) format: RasterFormat,
     source: Rows,
 }
 
@@ -163,7 +163,7 @@ enum Rows {
 }
 
 impl WholeRaster {
-    pub(crate) fn open(path: &Path, sidecar: Option<&Sidecar>) -> Result<Self> {
+    pub(super) fn open(path: &Path, sidecar: Option<&Sidecar>) -> Result<Self> {
         let file = File::open(path).map_err(|e| read_error(path, e))?;
         let file = BufReader::with_capacity(1 << 20, file);
         let fail = |m| import_error(path, m);
@@ -221,7 +221,7 @@ impl WholeRaster {
     }
 
     /// The next band of input rows, or `None` after the last row.
-    pub(crate) fn band(&mut self) -> Result<Option<Vec<u8>>> {
+    fn band(&mut self) -> Result<Option<Vec<u8>>> {
         let (size, bpp) = (self.size, self.format.bytes());
         let row = size as usize * bpp;
         match &mut self.source {
@@ -280,14 +280,14 @@ impl WholeRaster {
 }
 
 /// Files the cook writes while it runs, removed when dropped.
-pub(crate) struct Scratch {
+pub(super) struct Scratch {
     dir: PathBuf,
     stem: String,
     files: Vec<PathBuf>,
 }
 
 impl Scratch {
-    pub(crate) fn new(dir: &Path, key: Hash32) -> Self {
+    pub(super) fn new(dir: &Path, key: Hash32) -> Self {
         Self {
             dir: dir.to_owned(),
             stem: format!("orr_cook-{}-{}", crate::key::hex(key), std::process::id()),
@@ -323,17 +323,17 @@ impl Drop for Scratch {
 }
 
 /// One level of a layer as row-major stored texels in a file.
-pub(crate) struct Level {
+pub(super) struct Level {
     file: File,
     path: PathBuf,
     offset: u64,
-    pub size: u32,
+    size: u32,
     bpp: usize,
 }
 
 impl Level {
     /// The bordered tile `(x, y)`: level texels `x * tile - border` on, edges repeated.
-    pub(crate) fn tile(&self, tile: u32, border: u32, x: u32, y: u32) -> Result<Vec<u8>> {
+    pub(super) fn tile(&self, tile: u32, border: u32, x: u32, y: u32) -> Result<Vec<u8>> {
         let n = (tile + 2 * border) as usize;
         let bpp = self.bpp;
         let size = i64::from(self.size);
@@ -362,8 +362,8 @@ impl Level {
 
 /// The levels of a whole raster, coarsest first, and the value range of its texels.
 pub(crate) struct Levels {
-    pub levels: Vec<Level>,
-    pub range: [f32; 2],
+    pub(super) levels: Vec<Level>,
+    pub(super) range: [f32; 2],
 }
 
 /// Streams a whole raster once in row bands, writing each coarser level by `reduction`
@@ -480,7 +480,7 @@ fn read_exact_at(f: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
 /// A pattern over relative tile paths: `/`-separated components with `{lod}`, `{x}` and
 /// `{y}` (decimal numbers; a name used twice must match the same number) and `*` (any run
 /// of characters within a component).
-pub(crate) struct TilePattern {
+pub(super) struct TilePattern {
     components: Vec<Vec<Token>>,
 }
 
@@ -492,7 +492,7 @@ enum Token {
 }
 
 impl TilePattern {
-    pub(crate) fn parse(s: &str) -> std::result::Result<Self, String> {
+    pub(super) fn parse(s: &str) -> std::result::Result<Self, String> {
         let mut components = Vec::new();
         let mut seen = [false; 3];
         for c in s.split('/') {
@@ -528,7 +528,7 @@ impl TilePattern {
     }
 
     /// `[lod, x, y]` of a relative path, if it matches.
-    pub(crate) fn matches(&self, rel: &[String]) -> Option<[u32; 3]> {
+    pub(super) fn matches(&self, rel: &[String]) -> Option<[u32; 3]> {
         if rel.len() != self.components.len() {
             return None;
         }
@@ -575,7 +575,7 @@ fn match_tokens(t: &[Token], s: &[char], vars: &mut [Option<u32>; 3]) -> bool {
 }
 
 /// Every file under `root` with its path components relative to it.
-pub(crate) fn walk(root: &Path) -> Result<Vec<(PathBuf, Vec<String>)>> {
+pub(super) fn walk(root: &Path) -> Result<Vec<(PathBuf, Vec<String>)>> {
     let mut out = Vec::new();
     let mut stack = vec![(root.to_owned(), Vec::new())];
     while let Some((dir, rel)) = stack.pop() {

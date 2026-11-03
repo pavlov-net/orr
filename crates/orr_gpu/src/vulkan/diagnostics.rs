@@ -46,7 +46,7 @@ const TRAIL_PASSES: usize = SLOTS as usize / 2;
 /// Pass ids are unique in the process, so markers in a crash dump resolve to one pass.
 static NEXT_PASS: AtomicU32 = AtomicU32::new(1);
 
-pub(crate) fn next_pass_id() -> u32 {
+pub(super) fn next_pass_id() -> u32 {
     NEXT_PASS.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -55,14 +55,14 @@ fn marker(id: u32, end: bool) -> usize {
     (id as usize) << 1 | usize::from(end)
 }
 
-pub(crate) fn unmarker(token: usize) -> (u32, bool) {
+pub(super) fn unmarker(token: usize) -> (u32, bool) {
     ((token >> 1) as u32, token & 1 == 1)
 }
 
 /// GPU-written pass progress: per slot, the id of the last pass that began there and the
 /// last that ended there.
-pub(crate) struct Breadcrumbs {
-    pub raw: RawBuffer,
+pub(super) struct Breadcrumbs {
+    pub(super) raw: RawBuffer,
     words: NonNull<u32>,
     marker_fn: ash::amd::buffer_marker::Device,
 }
@@ -115,7 +115,7 @@ impl Breadcrumbs {
 }
 
 /// The passes of one submit.
-pub(crate) struct SubmitRecord {
+struct SubmitRecord {
     queue: QueueKind,
     value: u64,
     passes: Vec<(u32, &'static str)>,
@@ -123,7 +123,7 @@ pub(crate) struct SubmitRecord {
 
 /// The recent submits with passes, oldest first.
 #[derive(Default)]
-pub(crate) struct Trail {
+pub(super) struct Trail {
     records: VecDeque<SubmitRecord>,
     passes: usize,
 }
@@ -140,7 +140,7 @@ impl Trail {
 }
 
 /// Device fault entry points, KHR where offered.
-pub(crate) enum FaultFns {
+pub(super) enum FaultFns {
     Khr(ash::khr::device_fault::Device),
     Ext(ash::ext::device_fault::Device),
 }
@@ -239,7 +239,7 @@ impl From<vk::DeviceFaultAddressTypeKHR> for FaultAccess {
 
 /// Names the allocation holding `address`: a live one first, then the most recent freed
 /// one, then any within `precision` of it.
-pub(crate) fn describe_address(
+fn describe_address(
     live: &BTreeMap<u64, Range>,
     freed: &VecDeque<(u64, Range)>,
     address: u64,
@@ -280,7 +280,7 @@ const FAULT_TIMEOUT_NS: u64 = 2_000_000_000;
 
 impl Shared {
     /// Records a pass begin or end in the breadcrumb buffer and as a checkpoint.
-    pub(crate) fn mark_pass(&self, cmd: vk::CommandBuffer, id: u32, end: bool) {
+    pub(super) fn mark_pass(&self, cmd: vk::CommandBuffer, id: u32, end: bool) {
         if let Some(b) = self.breadcrumbs.get() {
             let (stage, word) = if end {
                 (vk::PipelineStageFlags2::ALL_COMMANDS, 1)
@@ -313,7 +313,7 @@ impl Shared {
     }
 
     /// Keeps the passes of a successful submit for reports.
-    pub(crate) fn record_submit(
+    pub(super) fn record_submit(
         &self,
         queue: QueueKind,
         value: u64,
@@ -336,12 +336,12 @@ impl Shared {
     }
 
     /// The name of pass `id`, if it is still in the trail.
-    pub(crate) fn pass_name(&self, id: u32) -> Option<&'static str> {
+    pub(super) fn pass_name(&self, id: u32) -> Option<&'static str> {
         self.trail.lock().unwrap().name(id)
     }
 
     /// Maps a failed Vulkan call to an error; a lost device is reported once.
-    pub(crate) fn vk_error(&self, call: &'static str, e: vk::Result) -> Error {
+    pub(super) fn vk_error(&self, call: &'static str, e: vk::Result) -> Error {
         if e == vk::Result::ERROR_DEVICE_LOST {
             self.device_lost()
         } else {
@@ -350,7 +350,7 @@ impl Shared {
     }
 
     /// Makes and logs the device-lost report the first time loss is seen.
-    pub(crate) fn device_lost(&self) -> Error {
+    fn device_lost(&self) -> Error {
         self.lost.get_or_init(|| {
             let report = self.diagnostics(true);
             log::error!("{report}");
@@ -600,15 +600,6 @@ impl Device {
             return r.clone();
         }
         self.shared.diagnostics(false)
-    }
-
-    /// Hands Aftermath the debug info of a stripped module, so crash dumps map its faults to
-    /// source lines. `stripped` is the SPIR-V pipelines are created from and `sidecar` its
-    /// separated debug info (`.dbg.spv`). Does nothing without `Caps::aftermath`.
-    pub fn add_shader_debug_info(&self, stripped: &[u32], sidecar: &[u8]) {
-        if self.shared.caps.aftermath {
-            super::aftermath::add_sidecar(stripped, sidecar);
-        }
     }
 }
 

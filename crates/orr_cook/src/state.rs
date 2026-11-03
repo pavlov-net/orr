@@ -137,24 +137,24 @@ fn read_error(path: &Path, source: std::io::Error) -> Error {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Record {
     #[serde(with = "hex_hash")]
-    pub identity: Hash32,
-    pub files: Vec<Input>,
+    pub(crate) identity: Hash32,
+    pub(crate) files: Vec<Input>,
     #[serde(with = "hex_hashes")]
-    pub units: Vec<Hash32>,
+    pub(crate) units: Vec<Hash32>,
     /// The source's models with assemblies, which its linked units do not hold.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub assemblies: Vec<Assembly>,
+    pub(crate) assemblies: Vec<Assembly>,
     /// What the report says of the source, which its linked units do not hold.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub warnings: Vec<String>,
+    pub(crate) warnings: Vec<String>,
 }
 
 /// A file an importer read and the hash of the bytes it read.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Input {
-    pub path: PathBuf,
+    pub(crate) path: PathBuf,
     #[serde(with = "hex_hash")]
-    pub hash: Hash32,
+    pub(crate) hash: Hash32,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -173,7 +173,7 @@ struct FileStat {
     hash: Hash32,
 }
 
-pub(crate) fn state_path(archive: &Path) -> PathBuf {
+fn state_path(archive: &Path) -> PathBuf {
     let mut s = archive.as_os_str().to_owned();
     s.push(".cookstate");
     s.into()

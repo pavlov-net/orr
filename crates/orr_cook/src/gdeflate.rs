@@ -12,7 +12,7 @@ use std::ptr::NonNull;
 use orr_pack::{Error, GDEFLATE_PAGE, GDeflate, Result};
 
 /// The libdeflate commit the codec is built from.
-pub const COMMIT: &str = env!("ORR_COOK_GDEFLATE");
+pub(crate) const COMMIT: &str = env!("ORR_COOK_GDEFLATE");
 
 #[repr(C)]
 struct InPage {
@@ -58,7 +58,7 @@ unsafe extern "system" {
 /// raises by two more packets per sub-stream only where `deflate_compress.c` is built as
 /// part of the GDeflate compressor. That copy is hidden, so the library links the plain
 /// DEFLATE bound and reports 256 bytes less; the output buffer takes the larger figure.
-pub fn page_bound() -> usize {
+fn page_bound() -> usize {
     // SAFETY: a null compressor asks for the bound across every level.
     let linked = unsafe {
         libdeflate_gdeflate_compress_bound(
@@ -88,10 +88,6 @@ impl Libdeflate {
             )));
         }
         Ok(Self { level })
-    }
-
-    pub fn level(&self) -> i32 {
-        self.level
     }
 }
 
@@ -235,14 +231,14 @@ mod tests {
         assert!(
             stored.len().is_multiple_of(4) && stored.len() <= page_bound(),
             "level {}: {} byte page stored in {} bytes (bound {})",
-            g.level(),
+            g.level,
             page.len(),
             stored.len(),
             page_bound()
         );
         let mut back = vec![0; page.len()];
         g.decompress(stored, &mut back).unwrap();
-        assert!(back == page, "level {} page differs", g.level());
+        assert!(back == page, "level {} page differs", g.level);
         stored.len()
     }
 

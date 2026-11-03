@@ -22,9 +22,8 @@ use crate::shaders::types::{
 use crate::subd::CageShape;
 use crate::{RasterGpu, Result, SceneRoot, TopologyGpu, ViewConstants};
 
-pub use crate::pattern::{
-    BARY_ONE, FACTOR_ONE, MAX_DICE, PATCH_ZEROS, PATTERNS, Pattern, factor_count,
-};
+pub(crate) use crate::pattern::PATTERNS;
+pub use crate::pattern::{BARY_ONE, Pattern};
 
 /// `patterns.bin`: the build script's pattern table.
 static TABLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/patterns.bin"));
@@ -40,16 +39,6 @@ const ARGS_DICE: u64 = 6;
 const ARGS_WELD: u64 = 9;
 /// `TessRoot.flags`.
 const TESS_FOCUS: u32 = 1;
-
-/// The table index of odd edge counts `n` (edges v0-v1, v1-v2, v2-v0), each 1 to
-/// [`MAX_DICE`]: what `GeneratedClusterGpu::pattern` holds.
-pub fn pattern_index(n: [u32; 3]) -> u32 {
-    assert!(
-        n.iter().all(|&x| x % 2 == 1 && x <= MAX_DICE),
-        "edge counts {n:?} are odd, 1 to {MAX_DICE}"
-    );
-    crate::pattern::index(n) as u32
-}
 
 /// The fixed-point edge factors packed in `GeneratedClusterGpu::factors`.
 pub fn unpack_factors(packed: [u32; 2]) -> [u32; 3] {
@@ -85,9 +74,9 @@ fn largest() -> (u32, u32) {
 pub(crate) struct Patterns {
     /// Table, topologies, the `PatternTable` record and template positions, written once.
     _memory: Allocation<u8>,
-    pub table: GpuPtr<PatternTable>,
-    pub topologies: GpuPtr<TopologyGpu>,
-    pub templates: GpuPtr<u64>,
+    table: GpuPtr<PatternTable>,
+    pub(crate) topologies: GpuPtr<TopologyGpu>,
+    pub(crate) templates: GpuPtr<u64>,
     _templates: Allocation<u64>,
     curve: GpuPtr<[f32; 3]>,
     /// The template build; none without cluster acceleration structures.
@@ -95,8 +84,8 @@ pub(crate) struct Patterns {
     /// Its records and result block, made at the first build.
     build: Mutex<Option<(Allocation<u8>, Op)>>,
     built: AtomicBool,
-    pub max_vertices: u32,
-    pub max_triangles: u32,
+    pub(crate) max_vertices: u32,
+    pub(crate) max_triangles: u32,
 }
 
 impl Patterns {
@@ -244,22 +233,22 @@ impl Patterns {
 /// A tessellated entry's work memory, from its producer allocation.
 #[derive(Clone, Copy)]
 pub(crate) struct EntryTess {
-    pub record: GpuPtr<TessGpu>,
-    pub args: GpuPtr<u32>,
-    pub weld_slots: u32,
+    pub(crate) record: GpuPtr<TessGpu>,
+    pub(crate) args: GpuPtr<u32>,
+    pub(crate) weld_slots: u32,
 }
 
 /// The pieces of a tessellated entry's allocation and its `TessGpu` record.
 pub(crate) struct Layout {
-    pub queue: [u64; 2],
-    pub dice: u64,
-    pub undisplaced: u64,
-    pub weld: u64,
-    pub weld_owner: u64,
-    pub counters: u64,
-    pub args: u64,
-    pub queue_capacity: u32,
-    pub weld_slots: u32,
+    queue: [u64; 2],
+    dice: u64,
+    undisplaced: u64,
+    weld: u64,
+    weld_owner: u64,
+    counters: u64,
+    pub(crate) args: u64,
+    queue_capacity: u32,
+    pub(crate) weld_slots: u32,
 }
 
 impl Layout {
@@ -370,22 +359,22 @@ impl TessKernels {
 /// Last frame's first view of a scene, which edge factors test for what it saw.
 #[derive(Clone, Copy)]
 pub(crate) struct SeenBy {
-    pub view: GpuPtr<ViewConstants>,
+    pub(crate) view: GpuPtr<ViewConstants>,
     /// Its HZB; null tests the frustum alone.
-    pub raster: GpuPtr<RasterGpu>,
+    pub(crate) raster: GpuPtr<RasterGpu>,
 }
 
 /// One tessellated entry this frame.
 pub(crate) struct Job {
-    pub scene: GpuPtr<SceneRoot>,
-    pub entry: u32,
-    pub tess: EntryTess,
-    pub state: GpuPtr<TessStateGpu>,
+    pub(crate) scene: GpuPtr<SceneRoot>,
+    pub(crate) entry: u32,
+    pub(crate) tess: EntryTess,
+    pub(crate) state: GpuPtr<TessStateGpu>,
     /// The scene focus as a cell, an offset and pixels per radian.
-    pub focus: Option<([i32; 4], [f32; 4])>,
-    pub seen: Option<SeenBy>,
+    pub(crate) focus: Option<([i32; 4], [f32; 4])>,
+    pub(crate) seen: Option<SeenBy>,
     /// A subdivision copy's record and its cage's sizes.
-    pub subd: Option<(GpuPtr<SubdCopyGpu>, CageShape)>,
+    pub(crate) subd: Option<(GpuPtr<SubdCopyGpu>, CageShape)>,
 }
 
 /// Records the template builds once, the fill of every subdivision copy's patch batch, then

@@ -57,7 +57,7 @@ const SEGMENT_RISE: f64 = 1.0;
 /// Density shapes in altitude, each relative to the component's own unit.
 pub(super) struct Profile {
     pub(super) radius: f64,
-    pub(super) top: f64,
+    top: f64,
     rayleigh_scale: f64,
     aerosol_scale: f64,
     ozone_peak: f64,
@@ -125,7 +125,7 @@ impl Profile {
 
     /// Splits `[t0, t1]` along `ray` into pieces over which the altitude changes by at most
     /// `SEGMENT_RISE` scale heights and which do not cross an ozone knot.
-    pub(super) fn segments<'a>(&'a self, ray: &'a Ray, t0: f64, t1: f64) -> Segments<'a> {
+    fn segments<'a>(&'a self, ray: &'a Ray, t0: f64, t1: f64) -> Segments<'a> {
         Segments {
             profile: self,
             ray,
@@ -150,12 +150,12 @@ impl Profile {
     }
 }
 
-pub(super) struct Segment {
-    pub(super) ta: f64,
-    pub(super) tb: f64,
+struct Segment {
+    ta: f64,
+    tb: f64,
 }
 
-pub(super) struct Segments<'a> {
+struct Segments<'a> {
     profile: &'a Profile,
     ray: &'a Ray,
     t: f64,
@@ -314,7 +314,7 @@ impl Leg {
 /// center is at (0, -radius, 0).
 #[derive(Clone, Copy)]
 pub(super) struct Ray {
-    pub(super) origin: DVec3,
+    origin: DVec3,
     pub(super) dir: DVec3,
     geometry: Geometry,
     radius: f64,

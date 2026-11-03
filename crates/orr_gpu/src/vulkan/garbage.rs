@@ -7,12 +7,12 @@ use super::device::Shared;
 use super::memory::MemoryKind;
 
 /// Timelines a device can have: one per queue kind.
-pub(crate) const MAX_TIMELINES: usize = 5;
+pub(super) const MAX_TIMELINES: usize = 5;
 
 /// Per timeline, the value that must complete before an item is destroyed (0: none).
-pub(crate) type After = [u64; MAX_TIMELINES];
+pub(super) type After = [u64; MAX_TIMELINES];
 
-pub(crate) enum Item {
+pub(super) enum Item {
     Buffer(RawBuffer),
     Image {
         image: vk::Image,
@@ -39,33 +39,33 @@ pub(crate) enum Item {
 }
 
 /// A buffer bound to memory from orr_gpu's pools, as `gpu_malloc` creates it.
-pub(crate) struct RawBuffer {
-    pub buffer: vk::Buffer,
-    pub allocation: orr_memory::Allocation,
-    pub kind: MemoryKind,
-    pub size: u64,
-    pub address: u64,
+pub(super) struct RawBuffer {
+    pub(super) buffer: vk::Buffer,
+    pub(super) allocation: orr_memory::Allocation,
+    pub(super) kind: MemoryKind,
+    pub(super) size: u64,
+    pub(super) address: u64,
 }
 
 impl RawBuffer {
     /// The memory and memory offset of byte `offset` of the buffer.
-    pub(crate) fn memory_at(&self, offset: u64) -> (vk::DeviceMemory, u64) {
+    pub(super) fn memory_at(&self, offset: u64) -> (vk::DeviceMemory, u64) {
         (self.allocation.memory, self.allocation.offset + offset)
     }
 }
 
 #[derive(Default)]
-pub(crate) struct Garbage {
+pub(super) struct Garbage {
     entries: Vec<(After, Item)>,
 }
 
 impl Garbage {
-    pub(crate) fn push(&mut self, after: After, item: Item) {
+    fn push(&mut self, after: After, item: Item) {
         self.entries.push((after, item));
     }
 
     /// Removes and returns the items whose points have all completed.
-    pub(crate) fn take_due(&mut self, completed: &After) -> Vec<Item> {
+    fn take_due(&mut self, completed: &After) -> Vec<Item> {
         let mut due = Vec::new();
         let mut i = 0;
         while i < self.entries.len() {
@@ -78,23 +78,23 @@ impl Garbage {
         due
     }
 
-    pub(crate) fn take_all(&mut self) -> Vec<Item> {
+    pub(super) fn take_all(&mut self) -> Vec<Item> {
         self.entries.drain(..).map(|(_, item)| item).collect()
     }
 }
 
 impl Shared {
     /// Destroys `item` once every timeline reaches its value in `after`.
-    pub(crate) fn defer(&self, after: After, item: Item) {
+    pub(super) fn defer(&self, after: After, item: Item) {
         self.garbage.lock().unwrap().push(after, item);
     }
 
     /// Destroys `item` once everything submitted so far has completed.
-    pub(crate) fn defer_after_submitted(&self, item: Item) {
+    pub(super) fn defer_after_submitted(&self, item: Item) {
         self.defer(self.submitted(), item);
     }
 
-    pub(crate) fn collect(&self) {
+    pub(super) fn collect(&self) {
         self.pools.next_frame();
         let completed = self.completed();
         let due = self.garbage.lock().unwrap().take_due(&completed);
@@ -103,7 +103,7 @@ impl Shared {
         }
     }
 
-    pub(crate) fn destroy(&self, item: Item) {
+    pub(super) fn destroy(&self, item: Item) {
         let d = &self.device;
         // SAFETY: every item is owned by the garbage list alone and no submitted work
         // references it any more.

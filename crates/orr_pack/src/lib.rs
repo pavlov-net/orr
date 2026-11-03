@@ -33,11 +33,8 @@ use orr_math::Affine3;
 
 pub use archive::{Archive, StoredRange};
 pub use bc_split::BcLayout;
-pub use format::{Blob, Chunk, Entry, FORMAT_VERSION, Header, StrRef};
+pub use format::{Blob, Chunk, Entry, Header, StrRef};
 pub use writer::{ArchiveWriter, BlobIn, EncodedBlob, EntryBlobs, Target};
-
-/// Root of this crate's Slang modules (`orr_pack.*`), for shader include paths.
-pub const SHADER_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders");
 
 /// Stable asset identity: the first 16 bytes of blake3 of the logical name.
 #[repr(transparent)]
@@ -77,7 +74,7 @@ impl Hash32 {
         Self(*blake3::hash(bytes).as_bytes())
     }
 
-    pub(crate) fn finish(h: &blake3::Hasher) -> Self {
+    fn finish(h: &blake3::Hasher) -> Self {
         Self(*h.finalize().as_bytes())
     }
 }

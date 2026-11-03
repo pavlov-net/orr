@@ -10,7 +10,7 @@ use super::model::{Model, Scalar, SpecConstant, StructDef, Ty};
 
 /// Where a struct's Rust type lives.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Owner {
+pub(super) enum Owner {
     /// The crate's `types` module.
     Types,
     /// The module of the kernel whose file declares it.
@@ -20,22 +20,22 @@ pub(crate) enum Owner {
 }
 
 /// One kernel module, ready to emit.
-pub(crate) struct Kernel<'a> {
+pub(super) struct Kernel<'a> {
     pub(crate) name: &'a str,
-    pub(crate) spv: &'a Path,
-    pub(crate) debug_info: Option<&'a Path>,
-    pub(crate) hash: u64,
+    pub(super) spv: &'a Path,
+    pub(super) debug_info: Option<&'a Path>,
+    pub(super) hash: u64,
     /// Shared by every entry point: they share the root and the constants.
-    pub(crate) interface: u64,
-    pub(crate) model: &'a Model,
-    pub(crate) owners: &'a HashMap<String, Owner>,
-    pub(crate) plans: &'a HashMap<String, Plan>,
+    pub(super) interface: u64,
+    pub(super) model: &'a Model,
+    pub(super) owners: &'a HashMap<String, Owner>,
+    pub(super) plans: &'a HashMap<String, Plan>,
 }
 
 /// The crate's `types` module contents and its extern checks.
-pub(crate) struct Shared<'a> {
-    pub(crate) types: BTreeMap<String, (&'a StructDef, &'a Plan)>,
-    pub(crate) externs: BTreeMap<String, (&'a StructDef, &'a Plan, String)>,
+pub(super) struct Shared<'a> {
+    pub(super) types: BTreeMap<String, (&'a StructDef, &'a Plan)>,
+    pub(super) externs: BTreeMap<String, (&'a StructDef, &'a Plan, String)>,
 }
 
 const ALLOW: &str = "#[allow(dead_code, non_camel_case_types, non_snake_case, unreachable_pub, unused_qualifications, clippy::all, clippy::pedantic)]";
@@ -96,7 +96,7 @@ pub(crate) fn generate(kernels: &[Kernel<'_>], shared: &Shared<'_>, manifest: &P
 
 /// `orr_kernels.rs`: `KERNELS` over the linked modules and the id constants of the
 /// switch points. Linked modules generate no Rust types; their roots are the renderer's.
-pub(crate) fn kernel_set(
+pub(super) fn kernel_set(
     kernels: &[Kernel<'_>],
     ids: &BTreeMap<LinkPoint, Vec<(&str, u8)>>,
     manifest: &Path,
@@ -343,7 +343,7 @@ fn emit_asserts(out: &mut String, path: &str, def: &StructDef, plan: &Plan) {
 }
 
 /// The Rust type for `ty` seen from a module `depth` levels below the include point.
-pub(crate) fn rust_type(
+fn rust_type(
     ty: &Ty,
     depth: usize,
     kernel: Option<&str>,
@@ -373,7 +373,7 @@ pub(crate) fn rust_type(
 }
 
 /// A Rust type name for a Slang struct name: generic arguments join with `_`.
-pub(crate) fn rust_name(slang: &str) -> String {
+pub(super) fn rust_name(slang: &str) -> String {
     let mut s: String = slang
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -401,7 +401,7 @@ fn field_ident(name: &str) -> String {
 }
 
 /// A module identifier for a kernel path component.
-pub(crate) fn ident(part: &str) -> String {
+fn ident(part: &str) -> String {
     let s: String = part
         .chars()
         .map(|c| {

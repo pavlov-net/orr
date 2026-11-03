@@ -10,17 +10,17 @@ use rayon::prelude::*;
 /// One mip of one channel, row-major, with the sampler's edge modes and the material
 /// slot's uv transform (`Material::uv_transforms` form).
 pub(crate) struct Raster {
-    pub w: u32,
-    pub h: u32,
-    pub texels: Arc<Vec<f32>>,
-    pub wrap: [Wrap; 2],
-    pub uv: [f32; 6],
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+    pub(crate) texels: Arc<Vec<f32>>,
+    pub(crate) wrap: [Wrap; 2],
+    pub(crate) uv: [f32; 6],
 }
 
 /// The side of the opacity cutoff a texel is on: at or over it.
-pub(crate) const PASS: u8 = 1;
+pub(super) const PASS: u8 = 1;
 /// Under it.
-pub(crate) const FAIL: u8 = 2;
+pub(super) const FAIL: u8 = 2;
 
 /// Per row of an opacity mip, how many of its first `x` texels pass the cutoff, for every
 /// `x` up to the row's width.
@@ -51,7 +51,7 @@ impl Passes {
 
     /// Which sides of the cutoff the texels `mip.footprint(uv)` visits are on, as `PASS`
     /// and `FAIL` bits; stops once it has seen every side in `stop`.
-    pub(crate) fn footprint(&self, mip: &Raster, uv: [[f32; 2]; 3], stop: u8) -> u8 {
+    pub(super) fn footprint(&self, mip: &Raster, uv: [[f32; 2]; 3], stop: u8) -> u8 {
         let mut sides = 0;
         let stride = mip.w as usize + 1;
         mip.footprint_runs(uv, |y, first, last| {
@@ -68,11 +68,11 @@ impl Passes {
 
 /// Up to two inclusive index ranges; an empty one has its start past its end.
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct Ranges(pub [[usize; 2]; 2]);
+pub(super) struct Ranges(pub(super) [[usize; 2]; 2]);
 
 impl Ranges {
     /// Indices the ranges hold, counting overlaps twice.
-    pub(crate) fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.0.iter().map(|r| (r[1] + 1).saturating_sub(r[0])).sum()
     }
 
@@ -112,7 +112,7 @@ fn narrow((a, b): (i64, i64), guess: f64, keep: impl Fn(i64) -> bool) -> Option<
 }
 
 /// Index `v` of an axis of `n` texels under `wrap`.
-pub(crate) fn wrapped(v: i64, n: u32, wrap: Wrap) -> usize {
+fn wrapped(v: i64, n: u32, wrap: Wrap) -> usize {
     let n = i64::from(n);
     (match wrap {
         Wrap::Repeat => v.rem_euclid(n),
@@ -126,7 +126,7 @@ pub(crate) fn wrapped(v: i64, n: u32, wrap: Wrap) -> usize {
 
 /// Calls `f` with index runs that together hold exactly the indices `first..=last` wraps
 /// to along an axis of `n` texels under `wrap`; stops when `f` returns false.
-pub(crate) fn wrapped_runs(
+fn wrapped_runs(
     first: i64,
     last: i64,
     n: u32,
@@ -156,13 +156,13 @@ fn bounds(p: &[[f64; 2]; 3]) -> ([f64; 2], [f64; 2]) {
 
 impl Raster {
     /// Mesh uv `p` in texels of this mip, after the uv transform.
-    pub(crate) fn texel_pos(&self, p: [f32; 2]) -> [f64; 2] {
+    pub(super) fn texel_pos(&self, p: [f32; 2]) -> [f64; 2] {
         let q = self.mapped(p);
         [q[0] * f64::from(self.w), q[1] * f64::from(self.h)]
     }
 
     /// Mesh uv `p` as the texture is sampled at.
-    pub(crate) fn mapped(&self, p: [f32; 2]) -> [f64; 2] {
+    pub(super) fn mapped(&self, p: [f32; 2]) -> [f64; 2] {
         let [a, b, c, d, e, f] = self.uv.map(f64::from);
         let (u, v) = (f64::from(p[0]), f64::from(p[1]));
         [(1.0 + a) * u + b * v + c, d * u + (1.0 + e) * v + f]
@@ -170,7 +170,7 @@ impl Raster {
 
     /// `material_normal_frame`: tangent-space normal `v` read from this normal map, turned
     /// into the mesh uv's frame by the normalized columns of the inverse uv transform.
-    pub(crate) fn normal_frame(&self, v: [f32; 3]) -> [f32; 3] {
+    pub(super) fn normal_frame(&self, v: [f32; 3]) -> [f32; 3] {
         let [a, b, _, d, e, _] = self.uv;
         let (a, e) = (1.0 + a, 1.0 + e);
         let det = a * e - b * d;
@@ -196,7 +196,7 @@ impl Raster {
     /// texels whose squares, grown by one texel on each side, overlap the triangle. Stops when
     /// `f` returns false. A triangle spanning more than two texture periods visits every
     /// texel.
-    pub(crate) fn footprint(&self, uv: [[f32; 2]; 3], mut f: impl FnMut(f32) -> bool) {
+    pub(super) fn footprint(&self, uv: [[f32; 2]; 3], mut f: impl FnMut(f32) -> bool) {
         let w = self.w as usize;
         self.footprint_runs(uv, |y, first, last| {
             let row = &self.texels[wrapped(y, self.h, self.wrap[1]) * w..][..w];
@@ -209,11 +209,7 @@ impl Raster {
     /// Calls `f` with the texels [`Self::footprint`] visits as runs along x, rows in order:
     /// each run's row and first and last texel, before wrapping. Stops when `f` returns
     /// false.
-    pub(crate) fn footprint_runs(
-        &self,
-        uv: [[f32; 2]; 3],
-        mut f: impl FnMut(i64, i64, i64) -> bool,
-    ) {
+    fn footprint_runs(&self, uv: [[f32; 2]; 3], mut f: impl FnMut(i64, i64, i64) -> bool) {
         let size = [f64::from(self.w), f64::from(self.h)];
         let p = uv.map(|t| self.texel_pos(t));
         let (lo, hi) = bounds(&p);
@@ -284,7 +280,7 @@ impl Raster {
 
     /// Per axis, the texel indices that hold every texel [`Self::footprint`] visits for `uv`,
     /// as one or two inclusive ranges; `None` for coordinates that are not finite.
-    pub(crate) fn footprint_ranges(&self, uv: [[f32; 2]; 3]) -> Option<[Ranges; 2]> {
+    pub(super) fn footprint_ranges(&self, uv: [[f32; 2]; 3]) -> Option<[Ranges; 2]> {
         let (lo, hi) = bounds(&uv.map(|t| self.texel_pos(t)));
         if !(lo.iter().chain(&hi).all(|c| c.is_finite())) {
             return None;
@@ -323,7 +319,7 @@ impl Raster {
     }
 
     /// Bilinear sample at `uv`, texel centers at half-integers.
-    pub(crate) fn sample(&self, uv: [f32; 2]) -> f32 {
+    pub(super) fn sample(&self, uv: [f32; 2]) -> f32 {
         let [x, y] = self.texel_pos(uv).map(|c| c - 0.5);
         let (x0, y0) = (x.floor(), y.floor());
         let (fx, fy) = ((x - x0) as f32, (y - y0) as f32);
@@ -338,10 +334,10 @@ impl Raster {
 /// A cooked opacity texture's mip 0 and what its cutoff makes of it, for every section that
 /// reads it.
 pub(crate) struct OpacityMap {
-    pub w: u32,
-    pub h: u32,
-    pub texels: Arc<Vec<f32>>,
-    pub passes: Arc<Passes>,
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+    pub(crate) texels: Arc<Vec<f32>>,
+    pub(crate) passes: Arc<Passes>,
 }
 
 impl OpacityMap {
@@ -368,14 +364,14 @@ pub(crate) enum Opacity {
 
 impl Opacity {
     /// The uv set [`Self::opaque`] takes its uvs from.
-    pub(crate) fn uv_set(&self) -> usize {
+    pub(super) fn uv_set(&self) -> usize {
         match self {
             Self::Texture { uv_set, .. } => *uv_set,
             _ => 0,
         }
     }
 
-    pub(crate) fn opaque(&self, uv: [[f32; 2]; 3]) -> bool {
+    pub(super) fn opaque(&self, uv: [[f32; 2]; 3]) -> bool {
         match self {
             Self::Constant(pass) => *pass,
             Self::Texture { mip0, passes, .. } => passes.footprint(mip0, uv, FAIL) & FAIL == 0,
@@ -386,19 +382,19 @@ impl Opacity {
 
 /// A section's displacement: `scale x texel + offset` meters, within the declared range.
 pub(crate) struct Displacement {
-    pub scale: f32,
-    pub offset: f32,
-    pub min: f32,
-    pub max: f32,
+    pub(crate) scale: f32,
+    pub(crate) offset: f32,
+    pub(crate) min: f32,
+    pub(crate) max: f32,
     /// Every mip of the texture, finest first; empty when the cook cannot read it, so
     /// clusters take the declared range.
-    pub mips: Vec<Raster>,
-    pub uv_set: usize,
+    pub(crate) mips: Vec<Raster>,
+    pub(crate) uv_set: usize,
 }
 
 impl Displacement {
     /// Displacement range over the triangles at every mip, meters.
-    pub(crate) fn bounds(&self, tris: impl Iterator<Item = [[f32; 2]; 3]> + Clone) -> [f32; 2] {
+    pub(super) fn bounds(&self, tris: impl Iterator<Item = [[f32; 2]; 3]> + Clone) -> [f32; 2] {
         if self.mips.is_empty() {
             return [self.min, self.max];
         }
@@ -417,7 +413,7 @@ impl Displacement {
     }
 
     /// Fails when a texel of any mip lies outside the declared range.
-    pub(crate) fn check_range(&self) -> Result<(), String> {
+    pub(super) fn check_range(&self) -> Result<(), String> {
         for (i, m) in self.mips.iter().enumerate() {
             for &t in m.texels.iter() {
                 let d = self.scale * t + self.offset;

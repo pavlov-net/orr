@@ -49,43 +49,43 @@ struct Input {
     indices: Vec<u32>,
 }
 
-pub(crate) struct DagCluster {
+struct DagCluster {
     /// Welded vertex per cluster vertex, for the attributes.
-    pub verts: Vec<u32>,
+    verts: Vec<u32>,
     /// Grid position per cluster vertex, as emitted.
-    pub cells: Vec<[i32; 3]>,
+    cells: Vec<[i32; 3]>,
     /// Cluster-local corners.
-    pub tris: Vec<u8>,
+    tris: Vec<u8>,
     /// The stage group whose simplification made the cluster; -1 for the stage's source.
-    pub refined: i32,
-    pub section: u8,
+    refined: i32,
+    section: u8,
 }
 
-pub(crate) struct DagGroup {
-    pub depth: u32,
+struct DagGroup {
+    depth: u32,
     /// Bounds and error of the geometry the group simplifies into; infinity when terminal.
-    pub sphere: Sphere,
-    pub error: f32,
-    pub clusters: Vec<DagCluster>,
+    sphere: Sphere,
+    error: f32,
+    clusters: Vec<DagCluster>,
 }
 
-pub(crate) struct Stage {
-    pub part: u8,
+struct Stage {
+    part: u8,
     /// The sections of the stage's class that have triangles, ascending.
-    pub sections: Vec<u8>,
-    pub merged: bool,
+    sections: Vec<u8>,
+    merged: bool,
     /// Error of the stage's source geometry: 0, or the merge error on a merged stage.
-    pub base: f32,
-    pub groups: Vec<DagGroup>,
+    base: f32,
+    groups: Vec<DagGroup>,
 }
 
 /// Cluster limits and options of one DAG.
 #[derive(Copy, Clone)]
-pub(crate) struct Limits {
-    pub max_vertices: u16,
-    pub max_triangles: u16,
+struct Limits {
+    max_vertices: u16,
+    max_triangles: u16,
     /// Most clusters one group may hold.
-    pub group_max: usize,
+    group_max: usize,
 }
 
 /// Grid snapping of emitted positions, clamped to the mesh's grid box.
@@ -106,7 +106,7 @@ impl Snap {
 
 /// Every stage of the mesh: the part stage per (part, class) with triangles, part-major,
 /// then the merged stage per class.
-pub(crate) fn stages(
+fn stages(
     w: &Welded,
     grid: &Grid,
     parts: &Parts,
@@ -463,7 +463,7 @@ fn group_of(
 
 /// Hierarchy nodes of one stage over its groups, by stage group index, and the root: a
 /// forest per depth, joined under one root when there are several.
-pub(crate) fn hierarchy(groups: &[DagGroup]) -> (Vec<ffi::clodNode>, usize) {
+fn hierarchy(groups: &[DagGroup]) -> (Vec<ffi::clodNode>, usize) {
     let mut depths: Vec<u32> = groups.iter().map(|g| g.depth).collect();
     depths.sort_unstable();
     depths.dedup();

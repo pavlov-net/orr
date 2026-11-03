@@ -24,7 +24,16 @@ mod sync;
 mod texture;
 
 #[cfg(not(target_vendor = "apple"))]
-pub mod vulkan;
+mod vulkan;
+
+/// Raw Vulkan handles, for SDKs that work on them.
+#[cfg(not(target_vendor = "apple"))]
+pub mod interop {
+    pub use crate::vulkan::{
+        Features, ImageHandles, RawCommandBuffer, RawDevice, ash, buffer_handle,
+        defer_after_submitted, image_handles, raw_device,
+    };
+}
 
 pub use caps::{Caps, ComponentType, CooperativeVectorCombination, Limits};
 pub use error::{Error, VkResult};

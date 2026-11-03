@@ -37,14 +37,14 @@ const CHECKSUM: usize = 32;
 /// What a cache file must match to be used.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Identity {
-    pub vendor: u32,
-    pub device: u32,
-    pub driver_version: u32,
-    pub cache_uuid: [u8; 16],
+    vendor: u32,
+    device: u32,
+    driver_version: u32,
+    cache_uuid: [u8; 16],
 }
 
 /// The file: identity, payload, then a BLAKE3 hash of everything before it.
-pub(crate) fn encode(id: &Identity, payload: &[u8]) -> Vec<u8> {
+fn encode(id: &Identity, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER + payload.len() + CHECKSUM);
     out.extend_from_slice(&MAGIC);
     for v in [FORMAT, id.vendor, id.device, id.driver_version] {
@@ -105,7 +105,7 @@ fn data_size(device: &ash::Device, cache: vk::PipelineCache) -> Option<usize> {
     (queried == vk::Result::SUCCESS).then_some(size)
 }
 
-pub(crate) struct PipelineCache {
+pub(super) struct PipelineCache {
     path: Option<PathBuf>,
     identity: Identity,
     /// Null without a path, or when the driver could not create it.
@@ -138,7 +138,7 @@ impl Drop for CompileGuard<'_> {
 impl PipelineCache {
     /// Opens the cache at `path`. A missing, damaged or foreign file starts it empty; so does one
     /// the driver refuses, which is removed, or ignores, which the next save replaces.
-    pub(crate) fn open(
+    pub(super) fn open(
         device: &ash::Device,
         props: &vk::PhysicalDeviceProperties,
         path: Option<&Path>,
@@ -247,7 +247,7 @@ impl PipelineCache {
         CompileGuard { cache: self, key }
     }
 
-    pub(crate) fn destroy(&mut self, device: &ash::Device) {
+    pub(super) fn destroy(&mut self, device: &ash::Device) {
         // SAFETY: no pipeline creation is running; the device is being destroyed. Null is
         // ignored.
         unsafe { device.destroy_pipeline_cache(self.cache, None) };

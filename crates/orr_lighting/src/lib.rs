@@ -45,19 +45,17 @@ mod world_cache;
 pub use bsdf::BsdfTables;
 pub use environment::{ENVIRONMENT_SIZE, EnvironmentMapGpu};
 pub use media::{
-    AERIAL_SIZE, FROXEL_TILE, MAX_FROXEL_SHADOWED_LIGHTS, MAX_PROXY_RAYS, MediaSettings, MediaStats,
+    AERIAL_SIZE, MAX_FROXEL_SHADOWED_LIGHTS, MAX_PROXY_RAYS, MediaSettings, MediaStats,
 };
-pub use orr_scene::orr_gpu::KernelSet;
-pub use orr_scene::{Cone, DirectionalLight, DiscProfile, Light, LightId, PathEntry};
+use orr_scene::orr_gpu::KernelSet;
+pub use orr_scene::{DirectionalLight, DiscProfile, Light, LightId, PathEntry};
 pub use particles::ParticleDraw;
 pub use scene::{
-    FRAME_SLOTS, LIGHT_TILE_SIZE, LIGHT_TILES, LightingStats, SceneLighting, SceneLightingSettings,
-    ScenePass, WorldCacheSettings,
+    LIGHT_TILE_SIZE, LIGHT_TILES, LightingStats, SceneLighting, SceneLightingSettings, ScenePass,
+    WorldCacheSettings,
 };
 pub use shaders::types::{
-    CapTail, DirectionalState, EmissiveSelection, EnvironmentGpu, EyeColumn, FroxelLights,
-    FroxelRoot, GuideRoot, LayerGuide, LightSample, LightSetGpu, LightSetStats, LocalLights,
-    MediaApplyRoot, MediaStatsGpu, ParticleLighting, PathRoot, WorldCacheGpu,
+    DirectionalState, EmissiveSelection, LightSample, LightSetGpu, ParticleLighting, WorldCacheGpu,
 };
 pub use subsurface::{CapTailTable, SSS_STEPS, SubsurfaceDepth};
 pub use view::{
@@ -69,8 +67,17 @@ pub use world_cache::{MAX_CAPACITY_LOG2, WorldCacheStats};
 
 use orr_scene::orr_gpu::{ComputePipeline, Device, ShaderModule, ShaderStage, SpecData};
 
+/// The Rust type of every Slang struct under orr_lighting's shader root, for the code that
+/// dependents' shader builds generate.
+pub mod types {
+    pub use crate::shaders::types::*;
+}
+
+/// orr_lighting's compiled-in kernel modules.
+pub use shaders::MODULES;
+
 /// Generated kernel modules and the Rust types of the crate's Slang structs.
-pub mod shaders {
+mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
 }
 

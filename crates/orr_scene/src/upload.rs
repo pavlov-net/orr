@@ -40,11 +40,11 @@ pub(crate) enum Op {
 /// same word, the one with the higher `seq` wins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Record {
-    pub seq: u64,
-    pub dst: u64,
-    pub count: u32,
-    pub stride: u32,
-    pub op: Op,
+    pub(crate) seq: u64,
+    pub(crate) dst: u64,
+    pub(crate) count: u32,
+    pub(crate) stride: u32,
+    pub(crate) op: Op,
 }
 
 impl Record {
@@ -156,7 +156,7 @@ fn subtract(ranges: Vec<(u64, u64)>, lo: u64, hi: u64) -> Vec<(u64, u64)> {
 /// masked writes), trimmed so that no two records of a pass write the same word and each
 /// word ends as if the records had applied in `seq` order. Strided records into one table
 /// use one stride and masked records into one word one mask.
-pub(crate) fn trim(mut records: Vec<Record>) -> [Vec<Record>; 3] {
+fn trim(mut records: Vec<Record>) -> [Vec<Record>; 3] {
     records.sort_by_key(|r| std::cmp::Reverse(r.seq));
     let mut words = Intervals::default();
     // Strided coverage per lattice (stride, first word mod stride), in lattice indices
@@ -217,9 +217,9 @@ pub(crate) fn trim(mut records: Vec<Record>) -> [Vec<Record>; 3] {
 /// Totals of one scatter.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ScatterTotals {
-    pub records: u32,
-    pub words: u64,
-    pub dispatches: u32,
+    pub(crate) records: u32,
+    pub(crate) words: u64,
+    pub(crate) dispatches: u32,
 }
 
 /// Writes one pass's GPU records and root into the window and dispatches it.

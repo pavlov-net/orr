@@ -28,15 +28,6 @@ pub struct ModelEmission {
     pub spans: Vec<EmissiveSpan>,
 }
 
-/// The EMISSIVE spans of `clusters`, a model's finest level in mesh cluster order from
-/// index `first`.
-pub fn emissive_spans(
-    first: u32,
-    clusters: impl IntoIterator<Item = Cluster>,
-) -> Vec<EmissiveSpan> {
-    indexed_spans((first..).zip(clusters))
-}
-
 /// The EMISSIVE spans of `clusters`, given with their mesh cluster indices in increasing
 /// order.
 pub(crate) fn indexed_spans(
@@ -67,9 +58,9 @@ pub(crate) fn indexed_spans(
 /// major, from instance entry `entry`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Run {
-    pub copies: u32,
-    pub entry: u32,
-    pub spans: u32,
+    pub(crate) copies: u32,
+    pub(crate) entry: u32,
+    pub(crate) spans: u32,
 }
 
 /// Runs by first slot.
@@ -144,7 +135,7 @@ mod tests {
             cluster(1, false, 8.0),
             cluster(1, true, 16.0),
         ];
-        let spans = emissive_spans(10, clusters);
+        let spans = indexed_spans((10..).zip(clusters));
         let got: Vec<_> = spans
             .iter()
             .map(|s| (s.section, s.first_cluster, s.cluster_count, s.area))

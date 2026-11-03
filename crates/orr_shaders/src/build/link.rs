@@ -110,7 +110,7 @@ impl LinkPoint {
         }
     }
 
-    pub(crate) fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::Surface => "surface",
             Self::Displacement => "displacement",
@@ -122,11 +122,11 @@ impl LinkPoint {
 
 /// One `Build::link` call.
 #[derive(Clone, Debug)]
-pub(crate) struct Link {
+pub(super) struct Link {
     pub(crate) point: LinkPoint,
     pub(crate) name: String,
-    pub(crate) module: PathBuf,
-    pub(crate) ty: String,
+    pub(super) module: PathBuf,
+    pub(super) ty: String,
 }
 
 impl Link {
@@ -149,36 +149,36 @@ impl Link {
 
 /// A point a kernel declares, with the name of its `extern struct`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct Declared {
+pub(super) struct Declared {
     pub(crate) point: LinkPoint,
     pub(crate) name: String,
 }
 
 /// One kernel file in `link_points.json`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub(crate) struct KernelPoints {
+pub(super) struct KernelPoints {
     /// The kernel's path under its root, without extension.
     pub(crate) name: String,
     pub(crate) path: PathBuf,
-    pub(crate) root: PathBuf,
-    pub(crate) points: Vec<Declared>,
+    pub(super) root: PathBuf,
+    pub(super) points: Vec<Declared>,
 }
 
 /// `link_points.json`: every kernel file that declares a link point.
 #[derive(Default, Serialize, Deserialize)]
-pub(crate) struct LinkPoints {
-    pub(crate) kernels: Vec<KernelPoints>,
+pub(super) struct LinkPoints {
+    pub(super) kernels: Vec<KernelPoints>,
 }
 
 impl LinkPoints {
-    pub(crate) fn read(path: &Path) -> Result<Self, Error> {
+    pub(super) fn read(path: &Path) -> Result<Self, Error> {
         serde_json::from_str(&super::compile::read(path)?).map_err(|e| Error::Link {
             message: format!("{} is not a link-points file: {e}", path.display()),
         })
     }
 
     /// Adds `other`'s kernels; a kernel file listed twice is kept once.
-    pub(crate) fn merge(&mut self, other: Self) {
+    pub(super) fn merge(&mut self, other: Self) {
         self.kernels.extend(other.kernels);
         self.kernels.sort();
         self.kernels.dedup();
@@ -186,7 +186,7 @@ impl LinkPoints {
 }
 
 /// The link points `src` declares.
-pub(crate) fn declared(src: &str) -> Vec<Declared> {
+pub(super) fn declared(src: &str) -> Vec<Declared> {
     let t = tokens(src);
     let mut out = Vec::new();
     for w in t.windows(4) {
@@ -207,7 +207,7 @@ pub(crate) fn declared(src: &str) -> Vec<Declared> {
 
 /// The `link` calls with their module paths resolved against `CARGO_MANIFEST_DIR`, after
 /// checking names, ids and counts.
-pub(crate) fn resolve(links: &[Link]) -> Result<Vec<Link>, Error> {
+pub(super) fn resolve(links: &[Link]) -> Result<Vec<Link>, Error> {
     check(links)?;
     links
         .iter()
@@ -255,7 +255,7 @@ fn check(links: &[Link]) -> Result<(), Error> {
 }
 
 /// The id constants of each switch point, in link order from 1.
-pub(crate) fn ids(links: &[Link]) -> BTreeMap<LinkPoint, Vec<(&str, u8)>> {
+pub(super) fn ids(links: &[Link]) -> BTreeMap<LinkPoint, Vec<(&str, u8)>> {
     let mut out: BTreeMap<LinkPoint, Vec<(&str, u8)>> = BTreeMap::new();
     for point in LinkPoint::ALL.into_iter().filter(|p| p.switch().is_some()) {
         out.insert(point, Vec::new());
@@ -271,7 +271,7 @@ pub(crate) fn ids(links: &[Link]) -> BTreeMap<LinkPoint, Vec<(&str, u8)>> {
 
 /// The width of the coherence key (contracts.md 3): 3 plus the bit length of the highest
 /// linked surface id.
-pub(crate) fn key_bits(links: &[Link]) -> u32 {
+fn key_bits(links: &[Link]) -> u32 {
     let surfaces = links
         .iter()
         .filter(|l| l.point == LinkPoint::Surface)
@@ -281,16 +281,16 @@ pub(crate) fn key_bits(links: &[Link]) -> u32 {
 
 /// A generated link module: one per point and declared name.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct LinkModule {
+pub(super) struct LinkModule {
     /// The Slang module name.
-    pub(crate) module: String,
+    pub(super) module: String,
     pub(crate) path: PathBuf,
-    pub(crate) source: String,
+    pub(super) source: String,
 }
 
 /// Writes the link module for `decl` under `dir` and returns it; `None` when nothing links
 /// to its point.
-pub(crate) fn write_module(
+pub(super) fn write_module(
     decl: &Declared,
     links: &[Link],
     dir: &Path,
@@ -369,7 +369,7 @@ fn source(decl: &Declared, linked: &[&Link], key_bits: u32) -> String {
 }
 
 /// The directories of the linked modules, for the include path.
-pub(crate) fn module_dirs(links: &[Link]) -> Vec<PathBuf> {
+pub(super) fn module_dirs(links: &[Link]) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = links
         .iter()
         .filter_map(|l| l.module.parent().map(Path::to_path_buf))

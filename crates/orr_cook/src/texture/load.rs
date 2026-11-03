@@ -18,46 +18,46 @@ use rayon::prelude::*;
 use super::{Img, Primaries};
 
 /// A decoded image file.
-pub(crate) struct Source {
+pub(super) struct Source {
     /// Mip 0 of each layer, values as stored: unorm data in 0..1, floats as they are.
-    pub layers: Vec<Img>,
+    pub(super) layers: Vec<Img>,
     /// Six layers in the Vulkan face order.
-    pub cube: bool,
+    pub(super) cube: bool,
     /// RGB values are sRGB-encoded.
-    pub srgb: bool,
+    pub(super) srgb: bool,
     /// Primaries the file is tagged with.
-    pub primaries: Option<Primaries>,
+    pub(super) primaries: Option<Primaries>,
     /// The block-compressed texels of a compressed file, kept so an encoding that matches
     /// can pass them through.
-    pub blocks: Option<Blocks>,
+    pub(super) blocks: Option<Blocks>,
     /// The file holds two channels, red and green.
-    pub rg: bool,
+    pub(super) rg: bool,
 }
 
-pub(crate) struct Blocks {
-    pub vk_format: u32,
-    pub w: u32,
-    pub h: u32,
+pub(super) struct Blocks {
+    pub(super) vk_format: u32,
+    pub(super) w: u32,
+    pub(super) h: u32,
     /// `levels[layer][mip]`, tight block rows.
-    pub levels: Vec<Vec<Vec<u8>>>,
+    pub(super) levels: Vec<Vec<Vec<u8>>>,
 }
 
 impl Blocks {
     /// Every mip down to 1x1 is present.
-    pub(crate) fn complete(&self) -> bool {
+    pub(super) fn complete(&self) -> bool {
         self.levels[0].len() as u32 == full_mip_count(self.w, self.h)
     }
 }
 
 /// Decodes an image file, recognized by its first bytes.
-pub(crate) fn decode(bytes: &[u8]) -> Result<Source, String> {
+pub(super) fn decode(bytes: &[u8]) -> Result<Source, String> {
     let mut src = open(bytes)?;
     decode_layers(&mut src)?;
     Ok(src)
 }
 
 /// Fills the layers of an opened block-compressed file with its decoded mip 0.
-pub(crate) fn decode_layers(src: &mut Source) -> Result<(), String> {
+pub(super) fn decode_layers(src: &mut Source) -> Result<(), String> {
     if let Some(b) = &src.blocks
         && src.layers.is_empty()
     {
@@ -72,7 +72,7 @@ pub(crate) fn decode_layers(src: &mut Source) -> Result<(), String> {
 
 /// Opens an image file like [`decode`], but leaves `layers` empty when the file holds
 /// block-compressed texels.
-pub(crate) fn open(bytes: &[u8]) -> Result<Source, String> {
+pub(super) fn open(bytes: &[u8]) -> Result<Source, String> {
     const KTX1: &[u8] = b"\xABKTX 11\xBB\r\n\x1A\n";
     if bytes.starts_with(KTX1) {
         return Err("KTX1 images are not supported; convert them to KTX2".into());
@@ -89,14 +89,14 @@ pub(crate) fn open(bytes: &[u8]) -> Result<Source, String> {
 /// What [`open`] tells of a KTX2 file of BCn blocks holding one 2D image, with the range of
 /// its mip 0 as [`block_range`] finds it, decompressing only as much as the range needs.
 pub(crate) struct Scan {
-    pub w: u32,
-    pub h: u32,
-    pub vk_format: u32,
+    pub(super) w: u32,
+    pub(super) h: u32,
+    pub(super) vk_format: u32,
     /// Every mip down to 1x1 is present.
-    pub complete: bool,
-    pub srgb: bool,
-    pub rg: bool,
-    pub range: [(f32, f32); 4],
+    pub(super) complete: bool,
+    pub(super) srgb: bool,
+    pub(super) rg: bool,
+    pub(super) range: [(f32, f32); 4],
 }
 
 /// The [`Scan`] of a KTX2 file of BCn blocks; `None` for every other file.
@@ -251,7 +251,7 @@ fn two_channels(vk_format: u32) -> bool {
 /// Per channel, the lowest and highest value of a `w` x `h` mip of `vk_format` blocks read
 /// from `data`, decoded block by block until every channel the format stores spans more
 /// than `spread`.
-pub(crate) fn block_range(
+pub(super) fn block_range(
     vk_format: u32,
     w: u32,
     h: u32,
@@ -467,7 +467,7 @@ pub(crate) fn file_header(path: &Path) -> Option<([u32; 2], bool)> {
 }
 
 /// Whether an image file's bytes are an animated WebP.
-pub(crate) fn is_animated(bytes: &[u8]) -> bool {
+pub(super) fn is_animated(bytes: &[u8]) -> bool {
     image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .ok()
@@ -488,7 +488,7 @@ pub(crate) fn decode_blocks(vk_format: u32, w: u32, h: u32, data: &[u8]) -> Resu
 }
 
 /// [`decode_blocks`] with each texel passed through `f`.
-pub(crate) fn decode_blocks_with(
+pub(super) fn decode_blocks_with(
     vk_format: u32,
     w: u32,
     h: u32,

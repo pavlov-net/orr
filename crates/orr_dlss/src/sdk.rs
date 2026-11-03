@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use ash::vk;
-use orr_gpu::vulkan::{self, Features};
+use orr_gpu::interop::{self, Features};
 use orr_gpu::{
     Allocation, CommandList, Device, DeviceHooks, Format, Hazards, MemoryKind, QueueKind, Stages,
     Texture, TextureDesc, TextureMemory, TextureRegion, TextureUsage,
@@ -94,7 +94,7 @@ impl DlssSdk {
 
     /// Initializes NGX on `gpu`, which was created with [`DlssSdk::device_hooks`].
     pub fn new(gpu: &Device, project_id: Uuid) -> Result<Self, DlssError> {
-        let device = vulkan::raw_device(gpu);
+        let device = interop::raw_device(gpu);
         let _ngx = ngx_lock();
         // SAFETY: the physical device belongs to the instance.
         let wanted =
@@ -173,7 +173,7 @@ impl<T: 'static> Owned<T> {
 
     /// The feature, and the raw buffer of `cmd`, which must record on the feature's device.
     fn record_on(&mut self, cmd: &mut CommandList<'_>, what: &str) -> (&mut T, vk::CommandBuffer) {
-        let device = vulkan::raw_device(&self.gpu).device.handle();
+        let device = interop::raw_device(&self.gpu).device.handle();
         let raw_cmd = cmd.vulkan_raw();
         assert_eq!(
             raw_cmd.device.handle(),
@@ -190,7 +190,7 @@ impl<T: 'static> Drop for Owned<T> {
     fn drop(&mut self) {
         let inner = self.inner.take();
         let ngx = Arc::clone(&self.ngx);
-        vulkan::defer_after_submitted(&self.gpu, move || {
+        interop::defer_after_submitted(&self.gpu, move || {
             {
                 let _ngx = ngx_lock();
                 // Locals drop in reverse order: the feature goes before the lock.
@@ -290,12 +290,14 @@ impl RayReconstruction {
         self.0.get().output_size()
     }
 
-    /// NGX's jitter offset for `frame` (see [`crate::jitter`]).
+    /// NGX's jitter offset for `frame`, in render pixels, each axis in [-0.5, 0.5). The
+    /// projection places each pixel's sample at the pixel center minus this value on both
+    /// axes, with y pointing down.
     pub fn jitter(&self, frame: u64) -> [f32; 2] {
         self.0.get().jitter(frame)
     }
 
-    /// Texture LOD bias for the render resolution (see [`crate::mip_bias`]).
+    /// Texture LOD bias for the render resolution: `log2(render / output) - 1`.
     pub fn mip_bias(&self) -> f32 {
         self.0.get().mip_bias()
     }
@@ -436,12 +438,14 @@ impl SuperResolution {
         self.feature.get().output_size()
     }
 
-    /// NGX's jitter offset for `frame` (see [`crate::jitter`]).
+    /// NGX's jitter offset for `frame`, in render pixels, each axis in [-0.5, 0.5). The
+    /// projection places each pixel's sample at the pixel center minus this value on both
+    /// axes, with y pointing down.
     pub fn jitter(&self, frame: u64) -> [f32; 2] {
         self.feature.get().jitter(frame)
     }
 
-    /// Texture LOD bias for the render resolution (see [`crate::mip_bias`]).
+    /// Texture LOD bias for the render resolution: `log2(render / output) - 1`.
     pub fn mip_bias(&self) -> f32 {
         self.feature.get().mip_bias()
     }
@@ -535,7 +539,7 @@ impl FrameGeneration {
     /// creating its resources on its own thread. Call it on the Render queue's owner
     /// thread.
     pub fn new(sdk: &DlssSdk, backbuffer: &Texture, hdr: bool) -> Result<Self, DlssError> {
-        let h = vulkan::image_handles(backbuffer)?;
+        let h = interop::image_handles(backbuffer)?;
         let output = [h.extent.width, h.extent.height];
         let feature = Owned::create(
             sdk,
@@ -548,15 +552,6 @@ impl FrameGeneration {
             hdr,
             format: h.format,
         })
-    }
-
-    pub fn output_size(&self) -> [u32; 2] {
-        self.feature.get().output_size()
-    }
-
-    /// The most images one rendered frame may generate (`MultiFrameCountMax`).
-    pub fn max_generated(&self) -> u32 {
-        self.feature.get().max_generated()
     }
 
     /// Records generated image `index` of `count` (1-based) into `cmd`, a list on a
@@ -581,7 +576,7 @@ impl FrameGeneration {
             .transpose()?;
         let interpolated = image(inputs.interpolated, "interpolated")?;
         let flag = inputs.disable_interpolation.map(|a| raw::Buffer {
-            buffer: vulkan::buffer_handle(a),
+            buffer: interop::buffer_handle(a),
             size: a.size(),
         });
         let raw_inputs = raw::FgInputs {
@@ -624,7 +619,7 @@ fn image(t: &Texture, name: &str) -> Result<raw::Image, DlssError> {
         d.mips == 1 && d.layers == 1 && d.extent[2] == 1,
         "NGX {name}: one 2D mip and layer, not {d:?}"
     );
-    let h = vulkan::image_handles(t)?;
+    let h = interop::image_handles(t)?;
     Ok(raw::Image {
         image: h.image,
         view: h.view,

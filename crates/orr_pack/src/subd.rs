@@ -156,7 +156,7 @@ impl SubdInfo {
     }
 
     /// The cage points of cage face `face`, counter-clockwise.
-    pub fn face_points(&self, face: u32) -> &[u32] {
+    fn face_points(&self, face: u32) -> &[u32] {
         let f = face as usize;
         &self.cage_corners[self.cage_faces[f] as usize..self.cage_faces[f + 1] as usize]
     }
@@ -306,7 +306,7 @@ impl PatchParam {
     }
 
     /// Whether face coordinates `(u, v)` lie in the patch.
-    pub fn contains(&self, u: f32, v: f32) -> bool {
+    fn contains(&self, u: f32, v: f32) -> bool {
         let n = f32::from(1u16 << self.levels());
         let (s, t) = (u * n - f32::from(self.u), v * n - f32::from(self.v));
         (0.0..=1.0).contains(&s) && (0.0..=1.0).contains(&t)
@@ -314,7 +314,7 @@ impl PatchParam {
 
     /// Weights of the patch's points and of their derivatives in face coordinates at face
     /// coordinates `(u, v)`; returns the point count.
-    pub fn basis(
+    fn basis(
         &self,
         u: f32,
         v: f32,
@@ -494,7 +494,7 @@ impl Page {
 
     /// The patch of face `face` (an index into [`Self::faces`]) that holds face coordinates
     /// `(u, v)` in `[0, 1]`.
-    pub fn patch_at(&self, face: usize, u: f32, v: f32) -> Option<usize> {
+    fn patch_at(&self, face: usize, u: f32, v: f32) -> Option<usize> {
         let s = self.faces.get(face)?.patches;
         (s.first as usize..(s.first + s.count) as usize)
             .find(|&p| self.patches[p].param.contains(u, v))

@@ -57,7 +57,7 @@ fn main() {
             .extern_type("ExposureState", "crate::ExposureState")
             .extern_type("VolumeGpu", "crate::VolumeGpu")
             .extern_type("VolumeGridGpu", "crate::VolumeGridGpu")
-            .publish_types("::orr_scene")
+            .publish_types("::orr_scene::types")
             .compile()
     });
     println!("cargo::rustc-check-cfg=cfg(orr_neural)");

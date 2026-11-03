@@ -119,7 +119,7 @@ pub(crate) fn mesh_table(
 /// `clusters` clusters: per copy, positions, previous positions, normals, tangents and
 /// cluster boxes.
 pub(crate) struct CopyArrays {
-    pub memory: Allocation<u8>,
+    memory: Allocation<u8>,
     stride: u64,
     vertices: u64,
 }
@@ -220,7 +220,7 @@ impl SkinStats {
 /// A scene's skinning memory, made the first frame it has skinned copies.
 pub(crate) struct SkinFrame {
     record: Allocation<SkinFrameGpu>,
-    pub work: GpuPtr<[u32; 2]>,
+    pub(crate) work: GpuPtr<[u32; 2]>,
     counters: GpuPtr<u32>,
     instantiate: Option<Op>,
     blas: Option<Op>,

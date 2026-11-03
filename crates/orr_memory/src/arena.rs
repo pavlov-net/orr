@@ -46,11 +46,6 @@ impl Arena {
     pub fn size(&self) -> u64 {
         self.size
     }
-
-    /// Bytes from the base to the end of the last range, alignment padding included.
-    pub fn used(&self) -> u64 {
-        self.used
-    }
 }
 
 #[cfg(test)]

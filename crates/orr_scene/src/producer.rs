@@ -99,7 +99,7 @@ impl Opacity {
     }
 
     /// `orr.trace` `CLASS_*`.
-    pub(crate) fn class(self) -> u32 {
+    fn class(self) -> u32 {
         match self {
             Self::Opaque | Self::AlphaTested => 0,
             Self::Dielectric => 1,
@@ -241,7 +241,7 @@ impl Op {
         })
     }
 
-    pub(crate) fn scratch(&self, device: &Device) -> u64 {
+    fn scratch(&self, device: &Device) -> u64 {
         device.rtas_sizes(&self.desc).scratch
     }
 
@@ -293,7 +293,7 @@ impl Swept {
 /// An entry's acceleration-structure builds; none where the device has no cluster
 /// acceleration structures. A swept-sphere entry has `swept` alone; a tube entry builds
 /// through its one template.
-pub(crate) struct Accel {
+struct Accel {
     record: GpuPtr<ProducerBuildGpu>,
     strands: bool,
     templates: Option<Op>,
@@ -305,21 +305,21 @@ pub(crate) struct Accel {
 
 /// A set entry's GPU memory and what the frame needs of it.
 pub(crate) struct Producer {
-    pub update: ProducerUpdate,
-    pub smoke: bool,
-    pub max_clusters: u32,
-    pub max_vertices: u32,
-    pub max_segments: u32,
+    pub(crate) update: ProducerUpdate,
+    pub(crate) smoke: bool,
+    max_clusters: u32,
+    max_vertices: u32,
+    max_segments: u32,
     /// Its templates have built.
-    pub templates_built: bool,
+    pub(crate) templates_built: bool,
     /// A `Static` entry has built.
-    pub built: bool,
+    pub(crate) built: bool,
     /// The counts its kernel emits against: the patch batch's for a tessellated entry.
-    pub emit_counts: GpuPtr<[u32; 4]>,
+    pub(crate) emit_counts: GpuPtr<[u32; 4]>,
     /// A tessellated entry's work memory.
-    pub tess: Option<EntryTess>,
+    pub(crate) tess: Option<EntryTess>,
     /// A subdivision copy's record and its cage's sizes.
-    pub subd: Option<(GpuPtr<SubdCopyGpu>, CageShape)>,
+    pub(crate) subd: Option<(GpuPtr<SubdCopyGpu>, CageShape)>,
     accel: Option<Accel>,
     /// Held while the entry is set.
     _memory: Allocation<u8>,
@@ -338,13 +338,13 @@ impl Producer {
 /// to the start of its memory (topology triangles and records, materials, template
 /// positions, the build and tessellation records), a multiple of 16 long.
 pub(crate) struct Built {
-    pub producer: Producer,
-    pub record: ProducerGpu,
-    pub batch: ProducerBatch,
+    pub(crate) producer: Producer,
+    pub(crate) record: ProducerGpu,
+    pub(crate) batch: ProducerBatch,
     /// A tessellated entry's patch batch; zero for others.
-    pub patches: ProducerBatch,
-    pub static_bytes: Vec<u8>,
-    pub static_at: GpuPtr<u32>,
+    pub(crate) patches: ProducerBatch,
+    pub(crate) static_bytes: Vec<u8>,
+    pub(crate) static_at: GpuPtr<u32>,
 }
 
 fn cluster_desc(op: RtasOp, args: u32, tris: u32, verts: u32) -> RtasOpDesc {
@@ -896,9 +896,9 @@ impl ProducerKernels {
 
 /// One entry building this frame.
 pub(crate) struct Job<'a> {
-    pub scene: GpuPtr<SceneRoot>,
-    pub entry: u32,
-    pub producer: &'a Producer,
+    pub(crate) scene: GpuPtr<SceneRoot>,
+    pub(crate) entry: u32,
+    pub(crate) producer: &'a Producer,
 }
 
 impl Job<'_> {
@@ -1129,9 +1129,9 @@ pub(crate) struct Readback {
 /// An entry's batch capacities, as `FrameStats` reports them.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Capacity {
-    pub clusters: u32,
-    pub vertices: u32,
-    pub segments: u32,
+    clusters: u32,
+    vertices: u32,
+    segments: u32,
 }
 
 impl Producer {

@@ -78,7 +78,7 @@ pub(super) fn cook(
     super::build(vec![map], &plan)
 }
 
-pub(crate) enum Input<'a> {
+enum Input<'a> {
     Equirect(&'a Img),
     /// Six faces, +X, -X, +Y, -Y, +Z, -Z.
     Cube(&'a [Img]),
@@ -86,7 +86,7 @@ pub(crate) enum Input<'a> {
 
 impl Input<'_> {
     /// Bilinear radiance along unit direction `d`.
-    pub(crate) fn sample(&self, d: [f32; 3]) -> [f32; 4] {
+    fn sample(&self, d: [f32; 3]) -> [f32; 4] {
         match self {
             Self::Equirect(img) => {
                 let theta = d[1].clamp(-1.0, 1.0).acos();
@@ -135,7 +135,7 @@ impl Input<'_> {
 }
 
 /// `n` x `n` equal-area octahedral map; each texel averages 4x4 stratified samples.
-pub(crate) fn octahedral_map(input: &Input, n: u32) -> Img {
+fn octahedral_map(input: &Input, n: u32) -> Img {
     let mut map = Img::new(n, n);
     map.px
         .par_chunks_mut(n as usize)

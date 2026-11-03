@@ -42,7 +42,7 @@ pub mod material_flags {
 }
 
 /// A texture bound to a cooked material: its heap index and its
-/// [`TextureHeader::primaries`].
+/// [`TextureHeader::primaries`](orr_pack::texture::TextureHeader::primaries).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BoundTexture {
     pub index: TextureIndex,
@@ -183,11 +183,11 @@ impl MaterialGpu {
 }
 
 pub(crate) struct MaterialTable {
-    pub table: Allocation<MaterialGpu>,
-    pub capacity: u32,
+    pub(crate) table: Allocation<MaterialGpu>,
+    capacity: u32,
     /// `TextureStreamGpu` addresses by heap index, 0 for textures that do not stream; every
     /// record written points `MaterialGpu::texture_streams` at it.
-    pub streams: Allocation<GpuPtr<TextureStreamGpu>>,
+    pub(crate) streams: Allocation<GpuPtr<TextureStreamGpu>>,
     ids: Mutex<RangeAllocator>,
     /// Materials whose pixels may use the extended G-buffer target.
     extended: Mutex<HashSet<u32>>,

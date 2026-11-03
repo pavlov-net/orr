@@ -562,11 +562,6 @@ impl Display {
         self.ui_per_present = on;
     }
 
-    /// Whether the UI is drawn once per presented image.
-    pub fn ui_per_present(&self) -> bool {
-        self.ui_per_present
-    }
-
     /// The frame-generation mode in use.
     pub fn frame_generation_mode(&self) -> FrameGenerationMode {
         self.fg

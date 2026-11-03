@@ -30,7 +30,7 @@ use crate::shaders::accel::{AccelRoot, ClasJob};
 use crate::shaders::clas_pool::PoolRoot;
 
 /// Bytes per allocation unit.
-pub(crate) const UNIT: u64 = 128;
+const UNIT: u64 = 128;
 /// `clas_pool.slang` constants.
 const POOL_INIT: u32 = 1;
 pub(crate) const NO_UNIT: u32 = u32::MAX;
@@ -82,7 +82,7 @@ pub(crate) struct ClasPool {
     initialized: bool,
     scratch: Option<Allocation<u8>>,
     /// Storage of streamed pages' micromaps.
-    pub micromaps: Pool,
+    pub(crate) micromaps: Pool,
 }
 
 impl ClasPool {
@@ -405,20 +405,20 @@ impl ClasPool {
 /// Built CLAS that the allocator places.
 #[derive(Clone, Copy)]
 pub(crate) struct Built {
-    pub sizes: GpuPtr<u32>,
-    pub sources: GpuPtr<u64>,
-    pub count: u32,
+    sizes: GpuPtr<u32>,
+    sources: GpuPtr<u64>,
+    count: u32,
     /// The largest total their implicit results take.
-    pub bytes: u64,
+    bytes: u64,
 }
 
 /// Where the allocator writes the moves.
 #[derive(Clone, Copy)]
-pub(crate) struct Moves {
-    pub records: GpuPtr<u8>,
-    pub destinations: GpuPtr<u64>,
-    pub count: GpuPtr<u32>,
-    pub scratch: u64,
+struct Moves {
+    records: GpuPtr<u8>,
+    destinations: GpuPtr<u64>,
+    count: GpuPtr<u32>,
+    scratch: u64,
 }
 
 /// Consecutive regions of one block.
@@ -458,14 +458,14 @@ fn ptr<T>(at: u64) -> GpuPtr<T> {
 
 /// One streamed page to build: its resident address, clusters and micromap region.
 pub(crate) struct PageBuild<'a> {
-    pub page: u64,
-    pub clusters: &'a [ClusterInfo],
+    pub(crate) page: u64,
+    pub(crate) clusters: &'a [ClusterInfo],
     /// The cluster id of the page's first cluster.
-    pub cluster_base: u32,
-    pub micromap: Option<PageMicromap>,
-    pub step: f32,
-    pub truncate_bits: u32,
-    pub non_opaque: &'a [bool],
+    pub(crate) cluster_base: u32,
+    pub(crate) micromap: Option<PageMicromap>,
+    pub(crate) step: f32,
+    pub(crate) truncate_bits: u32,
+    pub(crate) non_opaque: &'a [bool],
 }
 
 /// A batch's pool work and the staging that holds its outcome, replayed once it lands.
@@ -478,13 +478,13 @@ pub(crate) struct PoolBatch {
 
 /// What a streamed build keeps until its batch lands.
 pub(crate) struct BuildOut {
-    pub batch: PoolBatch,
+    pub(crate) batch: PoolBatch,
     /// Per page, its micromap and that micromap's storage.
-    pub micromaps: Vec<Option<(Micromap, PoolSlot)>>,
+    pub(crate) micromaps: Vec<Option<(Micromap, PoolSlot)>>,
     /// Per page, the results index of each of its clusters.
-    pub slots: Vec<Vec<u32>>,
+    pub(crate) slots: Vec<Vec<u32>>,
     /// The bind of the pages it grew the pool by.
-    pub bind: Option<TimelinePoint>,
+    pub(crate) bind: Option<TimelinePoint>,
 }
 
 /// Records on `list` the micromaps and CLAS of `pages`, at most `clas_triangles` triangles

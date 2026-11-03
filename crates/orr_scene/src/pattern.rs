@@ -21,23 +21,23 @@
 use std::collections::HashMap;
 
 /// The largest edge count: the pattern with 9 segments on every edge has 121 triangles.
-pub const MAX_DICE: u32 = 9;
+const MAX_DICE: u32 = 9;
 /// Barycentric 1.
 pub const BARY_ONE: u32 = 1 << 30;
 /// A pattern's own weights are multiples of this.
 const PATTERN_STEP: u32 = 1 << 6;
 /// Edge factor 1 in fixed point.
-pub const FACTOR_ONE: u32 = 4096;
+const FACTOR_ONE: u32 = 4096;
 /// Odd counts per edge.
 const COUNTS: u32 = MAX_DICE.div_ceil(2);
 /// Patterns in the table, one per triple of odd counts.
-pub const PATTERNS: usize = (COUNTS * COUNTS * COUNTS) as usize;
+pub(crate) const PATTERNS: usize = (COUNTS * COUNTS * COUNTS) as usize;
 
 /// Vertex keys: kind in bits 0-1, corner, edge or side in bits 2-3, ring in bits 4-7 and
 /// the index along the edge or side from bit 8.
-pub(crate) const KEY_CORNER: u32 = 0;
-pub(crate) const KEY_EDGE: u32 = 1;
-pub(crate) const KEY_RING: u32 = 2;
+const KEY_CORNER: u32 = 0;
+const KEY_EDGE: u32 = 1;
+const KEY_RING: u32 = 2;
 
 /// One pattern of the table: its counts, a key per vertex and triangles of cluster-local
 /// corners. A generated cluster's vertex `i` lies at pattern vertex `i` of its subpatch.
@@ -61,8 +61,8 @@ impl Pattern {
     }
 
     /// Each vertex's barycentrics in the patch triangle when the pattern dices a subpatch
-    /// with `corners` (`w1, w2` each) and corner `zeros` ([`PATCH_ZEROS`] and the
-    /// tessellator's `zeros` words), as the tessellator places them.
+    /// with `corners` (`w1, w2` each) and corner `zeros` (the tessellator's `zeros`
+    /// words), as the tessellator places them.
     pub fn place(&self, factors: [u32; 3], corners: [u32; 6], zeros: u32) -> Vec<[u32; 3]> {
         let w = self.weights(factors);
         let corners = [0, 1, 2].map(|i| {
@@ -77,14 +77,9 @@ impl Pattern {
     }
 }
 
-/// Which weights of each corner of a patch triangle are zero by construction: bit `j` of
-/// bits `3i..3i + 3` is set when corner `i`'s weight `j` is. Only points on a patch edge
-/// have a zero weight, and they have it exactly.
-pub const PATCH_ZEROS: u32 = 0b110 | 0b101 << 3 | 0b011 << 6;
-
 /// The zero weights of the pattern vertex with `key` from its subpatch's corner `zeros`:
 /// a corner's own, those shared by both ends of the subpatch edge it lies on, else none.
-pub(crate) fn vertex_zeros(key: u32, zeros: u32) -> u32 {
+fn vertex_zeros(key: u32, zeros: u32) -> u32 {
     let e = (key >> 2) & 3;
     let corner = |c: u32| (zeros >> (3 * c)) & 7;
     match key & 3 {
@@ -107,7 +102,7 @@ fn round_symmetric(s: u64) -> u32 {
 /// The point at subpatch weights `w` in the patch triangle's weights: composed with the
 /// subpatch's `corners`, then each weight that is not zero by construction (`zeros`) but
 /// rounds to zero takes a unit from the largest, so only points on a patch edge lie on it.
-pub(crate) fn place(w: [u32; 3], corners: [[u32; 3]; 3], zeros: u32) -> [u32; 3] {
+fn place(w: [u32; 3], corners: [[u32; 3]; 3], zeros: u32) -> [u32; 3] {
     let s = |k: usize| {
         (0..3)
             .map(|i| u64::from(w[i]) * u64::from(corners[i][k]))
@@ -126,13 +121,8 @@ pub(crate) fn place(w: [u32; 3], corners: [[u32; 3]; 3], zeros: u32) -> [u32; 3]
 }
 
 /// The odd segment count of fixed-point factor `q`, at least [`FACTOR_ONE`].
-pub fn factor_count(q: u32) -> u32 {
+fn factor_count(q: u32) -> u32 {
     2 * ((q + FACTOR_ONE - 1) / (2 * FACTOR_ONE)) + 1
-}
-
-/// The table index of odd edge counts `n`.
-pub(crate) fn index(n: [u32; 3]) -> usize {
-    (((n[0] / 2) * COUNTS + n[1] / 2) * COUNTS + n[2] / 2) as usize
 }
 
 /// The counts of table entry `i`.
@@ -180,7 +170,7 @@ fn edge_weight(s: u32, q: u32) -> u32 {
 }
 
 /// The barycentrics of the vertex with `key` at fixed-point edge `factors`.
-pub(crate) fn weights(key: u32, factors: [u32; 3]) -> [u32; 3] {
+fn weights(key: u32, factors: [u32; 3]) -> [u32; 3] {
     let e = ((key >> 2) & 3) as usize;
     let r = (key >> 4) & 15;
     let k = key >> 8;
@@ -318,6 +308,11 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    /// The table index of odd edge counts `n`.
+    fn index(n: [u32; 3]) -> usize {
+        (((n[0] / 2) * COUNTS + n[1] / 2) * COUNTS + n[2] / 2) as usize
+    }
 
     fn table() -> Vec<Pattern> {
         (0..PATTERNS).map(|i| generate(counts(i))).collect()

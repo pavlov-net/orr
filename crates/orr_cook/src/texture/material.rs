@@ -93,17 +93,17 @@ pub struct InputChannels {
 /// One image a material reads.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct TexRef {
-    pub image: usize,
+    pub(crate) image: usize,
     /// The source channel of a scalar input; color inputs read RGB.
-    pub channel: u8,
+    pub(crate) channel: u8,
     /// The channel read instead from an image that holds only red and green.
-    pub rg_channel: Option<u8>,
-    pub uv_set: u8,
-    pub wrap: [Wrap; 2],
+    pub(crate) rg_channel: Option<u8>,
+    pub(crate) uv_set: u8,
+    pub(crate) wrap: [Wrap; 2],
     /// The uv transform the texture is sampled with (`Material::uv_transforms` form).
-    pub uv: [f32; 6],
+    pub(crate) uv: [f32; 6],
     /// Whether color texels are sRGB-encoded; `None` takes the file's own encoding.
-    pub srgb: Option<bool>,
+    pub(crate) srgb: Option<bool>,
 }
 
 impl TexRef {
@@ -116,21 +116,21 @@ impl TexRef {
 /// The images one material reads, per input.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MaterialTextures {
-    pub base_color: Option<TexRef>,
+    pub(crate) base_color: Option<TexRef>,
     /// Read under `MASK` and `BLEND` only.
-    pub opacity: Option<TexRef>,
-    pub roughness: Option<TexRef>,
-    pub metalness: Option<TexRef>,
+    pub(crate) opacity: Option<TexRef>,
+    pub(crate) roughness: Option<TexRef>,
+    pub(crate) metalness: Option<TexRef>,
     /// With its scale per tangent axis; a negative scale flips the axis.
-    pub normal: Option<(TexRef, [f32; 2])>,
+    pub(crate) normal: Option<(TexRef, [f32; 2])>,
     /// With its strength.
-    pub occlusion: Option<(TexRef, f32)>,
-    pub emissive: Option<TexRef>,
-    pub specular: Option<TexRef>,
-    pub coat: Option<TexRef>,
-    pub transmission: Option<TexRef>,
-    pub subsurface_color: Option<TexRef>,
-    pub displacement: Option<TexRef>,
+    pub(crate) occlusion: Option<(TexRef, f32)>,
+    pub(crate) emissive: Option<TexRef>,
+    pub(crate) specular: Option<TexRef>,
+    pub(crate) coat: Option<TexRef>,
+    pub(crate) transmission: Option<TexRef>,
+    pub(crate) subsurface_color: Option<TexRef>,
+    pub(crate) displacement: Option<TexRef>,
 }
 
 impl MaterialTextures {
@@ -157,8 +157,8 @@ impl MaterialTextures {
 
 pub(crate) struct ImageFile {
     /// glTF image name, else its URI, else its index.
-    pub name: String,
-    pub data: ImageData,
+    pub(crate) name: String,
+    pub(crate) data: ImageData,
 }
 
 pub(crate) enum ImageData {
@@ -173,7 +173,7 @@ pub(crate) enum ImageData {
 
 impl ImageFile {
     /// The file's bytes; a file must not have changed since its facts were read.
-    pub(crate) fn bytes(&self) -> Result<Cow<'_, [u8]>> {
+    fn bytes(&self) -> Result<Cow<'_, [u8]>> {
         match &self.data {
             ImageData::Bytes(b) => Ok(Cow::Borrowed(b)),
             ImageData::File {
@@ -186,7 +186,7 @@ impl ImageFile {
         }
     }
 
-    pub(crate) fn len(&self) -> u64 {
+    fn len(&self) -> u64 {
         match &self.data {
             ImageData::Bytes(b) => b.len() as u64,
             ImageData::File { read, .. } => read.map_or(0, |r| r.1),
@@ -209,7 +209,7 @@ pub(crate) struct ImageFacts {
     /// The file holds two channels, red and green.
     rg: bool,
     /// The file is animated; only its first frame is read.
-    pub animated: bool,
+    pub(crate) animated: bool,
 }
 
 /// Decodes a 2D image: its only layer and the file's color facts.
@@ -333,12 +333,12 @@ pub(crate) struct Packer<'a> {
     rules: &'a TextureRules,
     quality: Quality,
     made: HashMap<Hash32, AssetId>,
-    pub jobs: Vec<TextureJob>,
+    pub(crate) jobs: Vec<TextureJob>,
     /// Job index of each planned texture.
     by_id: HashMap<AssetId, usize>,
     /// Member textures of each planned neural set.
     sets: HashSet<Vec<AssetId>>,
-    pub neural: Vec<NeuralJob>,
+    pub(crate) neural: Vec<NeuralJob>,
 }
 
 /// A texture to make from one or more source channels.
@@ -375,8 +375,8 @@ enum Channel {
 /// One packed texture to cook.
 #[derive(Clone)]
 pub(crate) struct TextureJob {
-    pub name: String,
-    pub key: Hash32,
+    pub(crate) name: String,
+    pub(crate) key: Hash32,
     asset: String,
     pack: Pack,
     /// Source images, sorted, with their content hashes.
@@ -1194,7 +1194,7 @@ impl TextureJob {
     }
 
     /// The mip chain [`Self::run`] encodes.
-    pub(crate) fn chain(&self, images: &[ImageFile], decoded: &Decoded<Img>) -> Result<Vec<Img>> {
+    pub(super) fn chain(&self, images: &[ImageFile], decoded: &Decoded<Img>) -> Result<Vec<Img>> {
         if self.source_mips {
             return self.source_chain(images, decoded);
         }
@@ -1205,17 +1205,17 @@ impl TextureJob {
     }
 
     /// Mip 0 size of the cooked texture.
-    pub(crate) fn cooked_size(&self) -> [u32; 2] {
+    pub(super) fn cooked_size(&self) -> [u32; 2] {
         let [w, h] = self.size;
         mip_size(w, h, super::skipped_mips(w, h, self.max_size))
     }
 
-    pub(crate) fn encoding(&self) -> Encoding {
+    pub(super) fn encoding(&self) -> Encoding {
         self.pack.encoding
     }
 
     /// Whether the texture holds a tangent-space normal map.
-    pub(crate) fn is_normal(&self) -> bool {
+    pub(super) fn is_normal(&self) -> bool {
         self.pack.normal
     }
 

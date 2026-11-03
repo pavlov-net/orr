@@ -65,9 +65,9 @@ fn root_mapping() -> vk::DescriptorSetAndBindingMappingEXT<'static> {
 /// A compute pipeline. Dropping it destroys it once everything submitted before the drop
 /// has completed.
 pub struct ComputePipeline {
-    pub(crate) raw: vk::Pipeline,
+    pub(super) raw: vk::Pipeline,
     /// The size of the root the kernel holds in the push data; 0 for a root in GPU memory.
-    pub(crate) inline_root_bytes: u32,
+    pub(super) inline_root_bytes: u32,
     workgroup: [u32; 3],
     shared: Arc<Shared>,
 }
@@ -293,7 +293,7 @@ impl Shared {
     }
 
     /// A compute pipeline with `extra` creation flags.
-    pub(crate) fn create_compute(
+    pub(super) fn create_compute(
         &self,
         s: &ShaderStage<'_>,
         extra: vk::PipelineCreateFlags2,

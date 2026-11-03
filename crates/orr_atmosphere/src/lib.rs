@@ -21,12 +21,12 @@ pub use shaders::types::{AtmosphereGpu, AtmosphereGroups, FoldGpu};
 use orr_math::{DVec3, Vec3};
 
 /// Generated kernel modules and the Rust types of the crate's Slang structs.
-pub mod shaders {
+mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
 }
 
 /// Molecules per m^2 in one Dobson unit.
-pub(crate) const DOBSON_UNIT: f64 = 2.687e20;
+const DOBSON_UNIT: f64 = 2.687e20;
 
 /// Directional lights a sky can choose its folded lights from.
 pub const MAX_SKY_LIGHTS: usize = 16;

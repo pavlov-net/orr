@@ -29,7 +29,7 @@ pub struct Bands<const N: usize> {
 impl<const N: usize> Bands<N> {
     /// Band `k`'s aerosol extinction relative to 550 nm for Angstrom exponent `alpha`,
     /// interpolated linearly in the table and clamped to its range (0 to 2.5).
-    pub fn aerosol_factor(&self, k: usize, alpha: f64) -> f64 {
+    pub(crate) fn aerosol_factor(&self, k: usize, alpha: f64) -> f64 {
         let x = (alpha / ANGSTROM_STEP).clamp(0.0, (ANGSTROM_STEPS - 1) as f64);
         let i = (x as usize).min(ANGSTROM_STEPS - 2);
         let f = x - i as f64;
@@ -43,7 +43,7 @@ impl<const N: usize> Bands<N> {
 ///
 /// Colors given per channel (an albedo, or a light's color relative to
 /// [`SOLAR_COLOR`]) enter a group or spectral run through this.
-pub fn rgb_at(lambda: f64, rgb: [f64; 3]) -> f64 {
+pub(crate) fn rgb_at(lambda: f64, rgb: [f64; 3]) -> f64 {
     let [lr, lg, lb] = RGB.wavelength;
     if lambda <= lb {
         rgb[2]

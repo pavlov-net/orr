@@ -213,7 +213,7 @@ fn blob_bytes(blob: &Com) -> &[u8] {
 }
 
 /// The text of an owned blob (diagnostics, names), which this releases.
-pub(crate) fn blob_text(blob: *mut c_void) -> String {
+pub(super) fn blob_text(blob: *mut c_void) -> String {
     Com::from_raw(blob)
         .map(|b| {
             String::from_utf8_lossy(blob_bytes(&b))
@@ -249,8 +249,8 @@ unsafe fn c_str<'a>(p: *const c_char) -> Option<&'a str> {
 }
 
 /// The loaded library and its exported functions.
-pub(crate) struct Library {
-    pub(crate) api: sys::SlangLib,
+pub(super) struct Library {
+    pub(super) api: sys::SlangLib,
     /// The file the library was loaded from.
     pub(crate) path: PathBuf,
     /// The directory holding the library and the downstream libraries it loads by name.
@@ -258,7 +258,7 @@ pub(crate) struct Library {
 }
 
 impl Library {
-    pub(crate) fn load(path: &Path) -> Result<Arc<Self>, libloading::Error> {
+    pub(super) fn load(path: &Path) -> Result<Arc<Self>, libloading::Error> {
         #[cfg(windows)]
         // SAFETY: loading the Slang library runs no initializers with preconditions;
         // altered search path makes its sibling DLLs resolve from its own directory.
@@ -283,7 +283,7 @@ impl Library {
         }))
     }
 
-    pub(crate) fn build_tag(&self) -> String {
+    pub(super) fn build_tag(&self) -> String {
         // SAFETY: returns a static string.
         unsafe { c_str(self.api.spGetBuildTagString()) }
             .unwrap_or_default()
@@ -292,9 +292,9 @@ impl Library {
 }
 
 /// One global session. Not thread-safe; each build thread creates its own.
-pub(crate) struct GlobalSession {
+pub(super) struct GlobalSession {
     com: Com,
-    pub(crate) lib: Arc<Library>,
+    lib: Arc<Library>,
 }
 
 impl GlobalSession {
@@ -336,13 +336,13 @@ impl GlobalSession {
     }
 
     /// A session configured by slangc command-line options.
-    pub(crate) fn session(&self, args: &[String]) -> Result<Session, String> {
+    pub(super) fn session(&self, args: &[String]) -> Result<Session, String> {
         self.session_with(args, false)
     }
 
     /// A session whose targets emit every `export`ed function, entry point or not: what
     /// slangc does for a source target given no entry points.
-    pub(crate) fn whole_program_session(&self, args: &[String]) -> Result<Session, String> {
+    pub(super) fn whole_program_session(&self, args: &[String]) -> Result<Session, String> {
         self.session_with(args, true)
     }
 
@@ -397,13 +397,13 @@ impl GlobalSession {
     }
 }
 
-pub(crate) struct Session {
+pub(super) struct Session {
     com: Com,
-    pub(crate) lib: Arc<Library>,
+    pub(super) lib: Arc<Library>,
 }
 
 /// A module loaded into a session.
-pub(crate) struct Module {
+pub(super) struct Module {
     com: Com,
 }
 
@@ -414,7 +414,7 @@ pub(crate) struct Program {
 
 impl Session {
     /// Loads a module from source. Errors carry Slang's diagnostics.
-    pub(crate) fn load(&self, name: &str, path: &Path, source: &str) -> Result<Module, String> {
+    pub(super) fn load(&self, name: &str, path: &Path, source: &str) -> Result<Module, String> {
         let name = CString::new(name).expect("module names have no nul");
         let path_c = CString::new(path.to_string_lossy().as_bytes()).expect("path has no nul");
         let source = CString::new(source).map_err(|_| "source contains a nul byte".to_owned())?;
@@ -497,7 +497,7 @@ impl Session {
     }
 
     /// Every module loaded into the session, the kernel and everything it imports.
-    pub(crate) fn loaded_modules(&self) -> Vec<Module> {
+    pub(super) fn loaded_modules(&self) -> Vec<Module> {
         // SAFETY: the vtable is ISession's; returned modules are owned by the session.
         unsafe {
             let v = self.com.vtbl::<SessionVtbl>();
@@ -509,7 +509,7 @@ impl Session {
     }
 
     /// The file and line that declare `decl`.
-    pub(crate) fn decl_location(
+    pub(super) fn decl_location(
         &self,
         decl: *mut sys::SlangReflectionDecl,
     ) -> Option<(PathBuf, u32)> {
@@ -531,7 +531,7 @@ impl Session {
 
 impl Module {
     /// The files this module was built from, its includes among them.
-    pub(crate) fn dependencies(&self) -> Vec<PathBuf> {
+    pub(super) fn dependencies(&self) -> Vec<PathBuf> {
         // SAFETY: the vtable is IModule's; paths live as long as the module.
         unsafe {
             let v = self.com.vtbl::<ModuleVtbl>();
@@ -555,7 +555,7 @@ impl Module {
         }
     }
 
-    pub(crate) fn reflection(&self) -> *mut sys::SlangReflectionDecl {
+    pub(super) fn reflection(&self) -> *mut sys::SlangReflectionDecl {
         // SAFETY: the vtable is IModule's.
         unsafe { (self.com.vtbl::<ModuleVtbl>().get_module_reflection)(self.com.as_ptr()) }
     }
@@ -598,13 +598,13 @@ impl Program {
     }
 
     /// The SPIR-V of the session's one target.
-    pub(crate) fn spirv(&self) -> Result<Vec<u32>, String> {
+    pub(super) fn spirv(&self) -> Result<Vec<u32>, String> {
         words(blob_bytes(&self.code()?))
     }
 
     /// The stripped SPIR-V and its separated debug info, for sessions built with
     /// `-separate-debug-info`.
-    pub(crate) fn spirv_separated(&self) -> Result<(Vec<u32>, Vec<u32>), String> {
+    pub(super) fn spirv_separated(&self) -> Result<(Vec<u32>, Vec<u32>), String> {
         // SAFETY: the vtables are ISlangUnknown's, IComponentType2's and
         // ICompileResult's; out parameters receive owned references.
         unsafe {
@@ -647,7 +647,7 @@ impl Program {
     }
 
     /// The program layout of the session's one target; valid while the program lives.
-    pub(crate) fn layout(&self) -> Result<*mut sys::SlangReflection, String> {
+    pub(super) fn layout(&self) -> Result<*mut sys::SlangReflection, String> {
         let mut diag = ptr::null_mut();
         // SAFETY: the vtable is IComponentType's.
         let layout = unsafe {

@@ -20,7 +20,7 @@ pub enum RasterFormat {
 
 impl RasterFormat {
     /// Bytes per input texel.
-    pub(crate) fn bytes(self) -> usize {
+    pub(super) fn bytes(self) -> usize {
         match self {
             Self::R8 => 1,
             Self::R16 | Self::Rg8 => 2,
@@ -29,7 +29,7 @@ impl RasterFormat {
         }
     }
 
-    pub(crate) fn stored(self) -> Texel {
+    pub(super) fn stored(self) -> Texel {
         match self {
             Self::R32f => Texel::R32f,
             Self::R16 => Texel::R16,
@@ -40,7 +40,7 @@ impl RasterFormat {
     }
 
     /// Input texels to stored texels, appended to `out`.
-    pub(crate) fn expand(self, src: &[u8], out: &mut Vec<u8>) {
+    pub(super) fn expand(self, src: &[u8], out: &mut Vec<u8>) {
         if self == Self::Rgb8 {
             out.reserve(src.len() / 3 * 4);
             for p in src.chunks_exact(3) {
@@ -52,7 +52,7 @@ impl RasterFormat {
     }
 
     /// Widens `range` to the finite channel values of input texels, UNORM normalized.
-    pub(crate) fn range(self, src: &[u8], range: &mut [f32; 2]) {
+    pub(super) fn range(self, src: &[u8], range: &mut [f32; 2]) {
         let mut add = |v: f32| {
             if v.is_finite() {
                 range[0] = range[0].min(v);
@@ -83,7 +83,7 @@ impl RasterFormat {
 
 /// Stored texel format.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Texel {
+pub(super) enum Texel {
     R32f,
     R16,
     R8,
@@ -92,7 +92,7 @@ pub(crate) enum Texel {
 }
 
 impl Texel {
-    pub(crate) fn bytes(self) -> usize {
+    pub(super) fn bytes(self) -> usize {
         match self {
             Self::R8 => 1,
             Self::R16 | Self::Rg8 => 2,
@@ -100,7 +100,7 @@ impl Texel {
         }
     }
 
-    pub(crate) fn vk_format(self, srgb: bool) -> u32 {
+    pub(super) fn vk_format(self, srgb: bool) -> u32 {
         match self {
             Self::R32f => vk::R32_SFLOAT,
             Self::R16 => vk::R16_UNORM,
@@ -112,7 +112,7 @@ impl Texel {
     }
 
     /// Linear float texels for the BCn encoders; sRGB color is decoded when `srgb`.
-    pub(crate) fn to_img(self, srgb: bool, size: u32, bytes: &[u8]) -> Img {
+    pub(super) fn to_img(self, srgb: bool, size: u32, bytes: &[u8]) -> Img {
         let unorm8 = |b: u8| f32::from(b) / 255.0;
         let color = |b: u8| {
             if srgb {
@@ -161,7 +161,7 @@ pub enum Reduction {
 }
 
 impl Reduction {
-    pub(crate) fn code(self) -> u8 {
+    pub(super) fn code(self) -> u8 {
         match self {
             Self::Mean => RasterLayer::MEAN,
             Self::Min => RasterLayer::MIN,
@@ -172,7 +172,7 @@ impl Reduction {
 }
 
 /// Reduces two rows of finer texels into one row of half the width.
-pub(crate) fn reduce_rows(
+pub(super) fn reduce_rows(
     t: Texel,
     r: Reduction,
     srgb: bool,

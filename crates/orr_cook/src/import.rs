@@ -39,61 +39,61 @@ pub struct PartAttribute {
 }
 
 pub(crate) struct Scene {
-    pub models: Vec<SceneModel>,
-    pub materials: Vec<SceneMaterial>,
-    pub images: Vec<ImageFile>,
-    pub skeletons: Vec<SceneSkeleton>,
+    pub(crate) models: Vec<SceneModel>,
+    pub(crate) materials: Vec<SceneMaterial>,
+    pub(crate) images: Vec<ImageFile>,
+    pub(crate) skeletons: Vec<SceneSkeleton>,
     /// Per instanced model: its name and its instances' scene-space placements.
-    pub instances: Vec<(String, Vec<Placed>)>,
+    pub(crate) instances: Vec<(String, Vec<Placed>)>,
     /// Every file read.
-    pub files: Vec<Input>,
+    pub(crate) files: Vec<Input>,
 }
 
 /// One placement: position, rotation and per-axis scale, applied before the rotation; a
 /// negative scale component mirrors.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Placed {
-    pub position: DVec3,
-    pub rotation: Quat,
-    pub scale: Vec3,
+    pub(crate) position: DVec3,
+    pub(crate) rotation: Quat,
+    pub(crate) scale: Vec3,
 }
 
 pub(crate) struct SceneSkeleton {
     /// Entry names `<asset>/<prefix>/skeleton` and `<asset>/<prefix>/clip/<clip>`; an empty
     /// prefix leaves its part out.
-    pub prefix: String,
-    pub info: SkeletonInfo,
+    pub(crate) prefix: String,
+    pub(crate) info: SkeletonInfo,
     /// Clips by name; their skeleton id is left for the planner to set.
-    pub clips: Vec<(String, Clip)>,
+    pub(crate) clips: Vec<(String, Clip)>,
 }
 
 pub(crate) struct SceneModel {
     /// The selected node's name; `None` for the whole scene.
-    pub node: Option<String>,
+    pub(crate) node: Option<String>,
     /// A mesh without sections cooks no mesh entry.
-    pub mesh: MeshSource,
-    pub subd: Option<SceneSubd>,
+    pub(crate) mesh: MeshSource,
+    pub(crate) subd: Option<SceneSubd>,
     /// Index into [`Scene::skeletons`] of a skinned mesh.
-    pub skeleton: Option<usize>,
-    pub settings: MeshSettings,
+    pub(crate) skeleton: Option<usize>,
+    pub(crate) settings: MeshSettings,
     /// Index into [`Scene::materials`] per mesh section.
-    pub materials: Vec<usize>,
+    pub(crate) materials: Vec<usize>,
 }
 
 /// A model's subdivision cage.
 pub(crate) struct SceneSubd {
-    pub cage: CageData,
+    pub(crate) cage: CageData,
     /// Index into [`Scene::materials`] per cage section.
-    pub materials: Vec<usize>,
-    pub settings: SubdSettings,
+    pub(crate) materials: Vec<usize>,
+    pub(crate) settings: SubdSettings,
 }
 
 pub(crate) struct SceneMaterial {
     /// Entry name suffix: `<asset>/material/<suffix>`, textures under
     /// `<asset>/texture/<suffix>/`; empty names the material `<asset>` itself.
-    pub suffix: String,
-    pub material: Material,
-    pub textures: MaterialTextures,
+    pub(crate) suffix: String,
+    pub(crate) material: Material,
+    pub(crate) textures: MaterialTextures,
 }
 
 /// Largest shear a placement drops: the largest entry of `linear - R diag(s)` over the

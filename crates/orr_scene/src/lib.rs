@@ -78,13 +78,10 @@ pub use orr_pack;
 pub use orr_pack::volume::{VolumeGpu, VolumeGridGpu};
 pub use orr_shaders::{PathEntry, abi};
 
-pub use arena::{
-    ArenaBuffer, ArenaKind, ArenaReport, ArenaRequest, ArenaTarget, ArenaTexture, Span, ViewArena,
-    ViewStep,
-};
+pub use arena::{ArenaReport, ArenaRequest, ArenaTarget, ArenaTexture, Span, ViewArena, ViewStep};
 pub use decals::{Decal, DecalChannels, DecalId};
 pub use edit::{EditDesc, EditId, EditRef};
-pub use emissive::{EmissiveSpan, ModelEmission, emissive_spans};
+pub use emissive::{EmissiveSpan, ModelEmission};
 pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId};
 pub use loading::{JobResult, Loading};
 pub use material::{BoundTexture, MaterialId, MaterialWriter, material_flags};
@@ -105,14 +102,16 @@ pub use scene::{
 pub use scenes::{
     Budgets, ConsumerMarker, Frame, FrameDesc, FrameStats, RendererDesc, SceneCompute, Scenes,
 };
+pub(crate) use shaders::types::{
+    BlasJob, CutKey, DecalBinGpu, DecalGpu, EditGpu, FeedbackGpu, GroupGpu, MaskGpu,
+    MediumProxyGpu, NeuralMipGpu, NeuralSetGpu, NeuralTextureGpu, NodeItem, PartGpu, PartListGpu,
+    ProducerGpu, RasterRoot, SkinMeshGpu, TessStateGpu, TextureFeedbackGpu, TopologyGpu,
+};
 pub use shaders::types::{
-    BlasJob, ClusterRef, ClusterWork, CutGpu, CutKey, DecalBinGpu, DecalGpu, EditGpu, EditGroupGpu,
-    EmissiveGpu, FeedbackGpu, GBufferGpu, GeneratedClusterGpu, GroupGpu, InstanceGpu, LightGpu,
-    MaskGpu, MaterialGpu, MediumProxyGpu, MeshGpu, MeshLevel, ModelGpu, NeuralMipGpu, NeuralSetGpu,
-    NeuralTextureGpu, NodeItem, PartGpu, PartListGpu, ProducerBatch, ProducerClusterGpu,
-    ProducerGpu, ProducerStateGpu, RasterGpu, RasterRoot, RtCutGpu, SceneRoot, SkinMeshGpu,
-    SkinStateGpu, SkinnedGpu, SkyStats, SlotCutGpu, SlotStateGpu, TessStateGpu, TextureFeedbackGpu,
-    TextureStreamGpu, TopologyGpu, VisibleCluster,
+    ClusterRef, ClusterWork, CutGpu, EditGroupGpu, EmissiveGpu, GBufferGpu, GeneratedClusterGpu,
+    InstanceGpu, LightGpu, MaterialGpu, MeshGpu, ModelGpu, ProducerBatch, ProducerClusterGpu,
+    ProducerStateGpu, RasterGpu, RtCutGpu, SceneRoot, SkinStateGpu, SkinnedGpu, SkyStats,
+    SlotCutGpu, SlotStateGpu, TextureStreamGpu, VisibleCluster,
 };
 pub use skin::{SkinStats, SkinnedDesc};
 pub use stream::{BlobId, BlobTarget};
@@ -125,14 +124,18 @@ pub use view::{
     DepthOfField, ExposureState, Focus, Glare, Lens, LensDistortion, Projection, RasterView,
     TextureFilter, ViewConstants, ViewDesc, ViewHistoryId,
 };
-pub use world::{REBASE_GRID_LOG2, WorldPos};
+pub use world::WorldPos;
 
 /// The tessellation pattern table that `GeneratedClusterGpu::pattern` indexes.
 pub mod tessellation {
-    pub use crate::tessellate::{
-        BARY_ONE, FACTOR_ONE, MAX_DICE, PATCH_ZEROS, PATTERNS, Pattern, factor_count, pattern,
-        pattern_index, unpack_factors,
-    };
+    pub use crate::tessellate::{BARY_ONE, Pattern, pattern, unpack_factors};
+}
+
+/// The Rust type of every Slang struct under orr_scene's shader root, for the code that dependents'
+/// shader builds generate.
+pub mod types {
+    pub use crate::shaders::types::*;
+    pub use crate::{ExposureState, ViewConstants, VolumeGpu, VolumeGridGpu};
 }
 
 /// orr_scene's compiled-in kernel modules.

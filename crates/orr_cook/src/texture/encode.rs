@@ -26,7 +26,7 @@ pub(crate) enum Encoding {
 }
 
 impl Encoding {
-    pub(crate) fn of(usage: Usage) -> Self {
+    pub(super) fn of(usage: Usage) -> Self {
         match usage {
             Usage::Color | Usage::ColorAlpha => Self::Bc7Srgb,
             Usage::Normal | Usage::Linear2 => Self::Bc5,

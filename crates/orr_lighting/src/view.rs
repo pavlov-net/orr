@@ -138,7 +138,7 @@ impl Default for CameraJump {
 impl CameraJump {
     /// Whether a camera moving from `previous` to `current`, each a position and a
     /// world-from-view rotation, jumps.
-    pub fn jumps(&self, previous: (DVec3, Quat), current: (DVec3, Quat)) -> bool {
+    fn jumps(&self, previous: (DVec3, Quat), current: (DVec3, Quat)) -> bool {
         previous.0.distance(current.0) > self.distance
             || previous.1.angle_between(current.1) > self.angle
     }
@@ -645,15 +645,11 @@ impl LightingView {
         self.targets.motion.sampled()
     }
 
-    /// RGBA16F, the background layer behind out-of-focus foreground as the last opaque
-    /// dispatch given a [`DofBackgroundPass`] wrote it: on each marked pixel, the pre-exposed
-    /// radiance its lens ray reaches past the mask's depth in RGB (with the camera segment's
-    /// media where media apply ran) and that hit's reverse-Z device depth in A, 0 for sky;
-    /// (0, 0, 0, -1) on unmarked pixels. `None` once a dispatch runs without one.
-    pub fn dof_background(&self) -> Option<&Texture> {
-        self.dof.as_ref().map(|l| &l.target.texture)
-    }
-
+    /// The sampled view of the RGBA16F background layer behind out-of-focus foreground, as the
+    /// last opaque dispatch given a [`DofBackgroundPass`] wrote it: on each marked pixel, the
+    /// pre-exposed radiance its lens ray reaches past the mask's depth in RGB (with the camera
+    /// segment's media where media apply ran) and that hit's reverse-Z device depth in A, 0 for
+    /// sky; (0, 0, 0, -1) on unmarked pixels. `None` once a dispatch runs without one.
     pub fn dof_background_index(&self) -> Option<TextureIndex> {
         self.dof.as_ref().map(|l| l.target.sampled)
     }
@@ -686,13 +682,6 @@ impl LightingView {
         self.overlay_front
             .as_ref()
             .map(|f| [f.depth.sampled, f.motion.sampled, f.weight.sampled])
-    }
-
-    /// RG32_UINT: per pixel, the light feedback of the last opaque dispatch (a light's
-    /// feedback id or `u32::MAX`) and its first vertex's camera distance in m as `f32` bits, 0
-    /// on sky pixels.
-    pub fn light_feedback(&self) -> &Texture {
-        &self.feedback[1 - self.feedback_index].target.texture
     }
 }
 
@@ -791,7 +780,7 @@ pub struct ViewPass {
     /// Separates sample sets of the same pixels and sample index.
     pub seed: u32,
     /// The opaque dispatch also traces the view's background layer
-    /// ([`LightingView::dof_background`]); `None` frees it.
+    /// ([`LightingView::dof_background_index`]); `None` frees it.
     pub dof_background: Option<DofBackgroundPass>,
     /// The dielectric dispatch keeps what [`LightingKernels::record_frosted_glass`] reads:
     /// set while output's depth-of-field guide is on.

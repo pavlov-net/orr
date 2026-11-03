@@ -37,7 +37,7 @@ impl Default for OmmSettings {
 }
 
 impl OmmSettings {
-    pub(crate) fn check(&self) -> Result<(), String> {
+    pub(super) fn check(&self) -> Result<(), String> {
         if self.max_level > 12 {
             return Err(format!("omm max_level {} is over 12", self.max_level));
         }
@@ -60,7 +60,7 @@ impl OmmSettings {
 /// The opacity mip 0 as UNORM8, remapped so the material cutoff lands on the fixed 0.5
 /// cutoff of meshoptimizer's rasterizer: a texel passes the cutoff exactly when its
 /// remapped value is at least 128.
-pub(crate) struct OmmAlpha {
+pub(super) struct OmmAlpha {
     alpha: Vec<u8>,
     w: u32,
     h: u32,
@@ -157,10 +157,10 @@ impl Sides {
 
 impl OmmAlpha {
     /// Largest texture side the rasterizer takes.
-    pub(crate) const MAX_SIZE: u32 = 16384;
+    pub(super) const MAX_SIZE: u32 = 16384;
 
     /// `None` for a texture wider or taller than [`Self::MAX_SIZE`].
-    pub(crate) fn new(mip0: &Raster, cutoff: f32) -> Option<Self> {
+    pub(super) fn new(mip0: &Raster, cutoff: f32) -> Option<Self> {
         let _z = crate::profile::zone!("mesh.omm_alpha");
         if mip0.w > Self::MAX_SIZE || mip0.h > Self::MAX_SIZE {
             return None;
@@ -201,20 +201,20 @@ fn remap(t: f32, cutoff: f32) -> u8 {
 
 /// Micromaps of one cluster's alpha-tested triangles.
 #[derive(Clone, Debug)]
-pub(crate) struct ClusterOmm {
+pub(super) struct ClusterOmm {
     /// Per alpha-tested triangle: an entry, or a special index.
-    pub indices: Vec<i32>,
+    indices: Vec<i32>,
     /// Subdivision level per entry.
-    pub levels: Vec<u8>,
+    levels: Vec<u8>,
     /// Entry states back to back, in entry order.
-    pub data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
     /// The `max_level` its entries were measured under.
-    pub max_level: u8,
+    pub(super) max_level: u8,
 }
 
 impl ClusterOmm {
     /// The most bytes the cluster adds to its page's micromap region.
-    pub(crate) fn bytes(&self) -> usize {
+    pub(super) fn bytes(&self) -> usize {
         block_bytes(self.indices.len(), self.levels.len(), self.data.len())
     }
 }
@@ -228,7 +228,7 @@ fn block_bytes(triangles: usize, entries: usize, data: usize) -> usize {
 /// cluster's stored vertex uvs. Known states never contradict the alpha test, a bilinear
 /// sample of `mip0` against the cutoff, anywhere on their micro-triangle. `None` when the
 /// opacity is unknown to the cook.
-pub(crate) fn cluster_omm(
+pub(super) fn cluster_omm(
     opacity: &Opacity,
     alpha: Option<&OmmAlpha>,
     uvs: &[[f32; 2]],
@@ -387,10 +387,10 @@ fn known_states_hold(
 
 /// A page's micromap region and where its clusters' indices start in it.
 pub(crate) struct Region {
-    pub bytes: Vec<u8>,
+    pub(super) bytes: Vec<u8>,
     /// Per cluster: its indices' offset in the region, or `None`.
-    pub omm_first: Vec<Option<u32>>,
-    pub usage: [u32; 13],
+    pub(super) omm_first: Vec<Option<u32>>,
+    pub(super) usage: [u32; 13],
 }
 
 /// Lays out a page's micromap region: the entries of all its clusters, deduplicated, then

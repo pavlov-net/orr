@@ -23,16 +23,16 @@ const CHUNK: usize = 1024;
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(crate) struct TangentCheck {
     /// Drop `TANGENT`.
-    pub derive: bool,
+    pub(crate) derive: bool,
     /// Degrees, the upper edge of its histogram bin; `None` when not compared.
-    pub angle_p99: Option<f32>,
+    pub(crate) angle_p99: Option<f32>,
     /// Samples compared.
-    pub texels: u64,
+    pub(crate) texels: u64,
 }
 
 impl TangentCheck {
     /// Stored tangents kept without comparing.
-    pub(crate) const KEPT: Self = Self {
+    pub(super) const KEPT: Self = Self {
         derive: false,
         angle_p99: None,
         texels: 0,
@@ -42,7 +42,7 @@ impl TangentCheck {
 /// Compares the shading of `m`'s stored tangents with derived ones on its normal maps;
 /// derives when the 99th-percentile angle is within `max_deg`. A section whose material
 /// reads the tangent beyond a readable normal map keeps the stored tangents.
-pub(crate) fn check(
+pub(super) fn check(
     m: &MeshData,
     tangents: &[[f32; 4]],
     maps: &[SectionMaps],

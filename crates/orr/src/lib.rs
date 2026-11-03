@@ -56,18 +56,15 @@ pub use orr_scene::Error as SceneError;
 pub use orr_scene::{self, RasterView};
 pub use orr_scene::{
     AffineRows, ArenaReport, ArenaTarget, BlobId, BlobTarget, BoundTexture, Budgets, ClassStats,
-    ClipRef, ClusterRef, ClusterTopology, Cone, ConsumerMarker, CopyVariant, Decal, DecalChannels,
-    DecalId, DepthOfField, DirectionalLight, DiscProfile, EditDesc, EditGroupGpu, EditId, EditRef,
-    EmissiveGpu, EmissiveSpan, ExposureState, Focus, FrameStats, FrameTime, Glare, GroupGpu,
-    GroupWriter, InstanceFlags, InstanceGpu, InstancePage, InstancePageRef, InstanceRange,
-    InstancesDesc, JobResult, Lens, LensDistortion, Light, LightGpu, LightId, LoadState, Loading,
-    MaterialGpu, MaterialId, MaterialWriter, MeshGpu, ModelEmission, ModelGpu, ModelId, MountId,
-    NeuralMipGpu, NeuralSetGpu, NeuralTextureGpu, NeuralTextures, Opacity, OriginPolicy,
-    PackSource, PageId, PipelineId, Pose, ProducerBatch, ProducerClusterGpu, ProducerDesc,
-    ProducerGpu, ProducerId, ProducerStats, ProducerUpdate, Projection, REBASE_GRID_LOG2,
-    RasterGpu, ReloadReport, RendererDesc, ResidencyClass, ResidencyStats, RtCutGpu, RtStats,
-    SceneCompute, SceneDesc, SceneId, SceneRoot, SkeletonRef, SkinStats, SkinnedDesc, SkyStats,
-    SlotStateGpu, Span, TextureFeedbackGpu, TextureFilter, TextureStreamGpu, TopologyGpu,
+    ClipRef, ClusterTopology, Cone, ConsumerMarker, CopyVariant, Decal, DecalChannels, DecalId,
+    DepthOfField, DirectionalLight, DiscProfile, EditDesc, EditId, EditRef, ExposureState, Focus,
+    FrameStats, FrameTime, Glare, GroupWriter, InstanceFlags, InstancePage, InstancePageRef,
+    InstanceRange, InstancesDesc, JobResult, Lens, LensDistortion, Light, LightId, LoadState,
+    Loading, MaterialGpu, MaterialId, MaterialWriter, ModelId, MountId, NeuralTextures, Opacity,
+    OriginPolicy, PackSource, PageId, PipelineId, Pose, ProducerBatch, ProducerDesc, ProducerId,
+    ProducerStats, ProducerUpdate, Projection, RasterGpu, ReloadReport, RendererDesc,
+    ResidencyClass, ResidencyStats, RtStats, SceneCompute, SceneDesc, SceneId, SceneRoot,
+    SkeletonRef, SkinStats, SkinnedDesc, SkyStats, Span, TextureFilter, TextureStreamGpu,
     TransformGroupDesc, TransformGroupId, TransparencyPass, ViewConstants, ViewDesc, ViewHistoryId,
     ViewStep, WorldPos, abi, material_flags, orr_gpu, orr_pack,
 };
@@ -560,7 +557,7 @@ fn output_image_request(name: &'static str, extent: [u32; 2], first: ViewStep) -
 fn builtin_modules() -> Vec<&'static ShaderModule> {
     orr_scene::MODULES
         .iter()
-        .chain(orr_lighting::shaders::MODULES)
+        .chain(orr_lighting::MODULES)
         .copied()
         .collect()
 }

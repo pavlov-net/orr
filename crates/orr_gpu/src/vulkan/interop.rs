@@ -60,8 +60,8 @@ pub struct Features<'a> {
     pub vulkan_1_3: &'a mut vk::PhysicalDeviceVulkan13Features<'static>,
     pub vulkan_1_4: &'a mut vk::PhysicalDeviceVulkan14Features<'static>,
     /// Structure types orr already chains.
-    pub(crate) chained: Vec<vk::StructureType>,
-    pub(crate) extra: Vec<Box<dyn Any>>,
+    pub(super) chained: Vec<vk::StructureType>,
+    pub(super) extra: Vec<Box<dyn Any>>,
 }
 
 impl Features<'_> {
@@ -96,14 +96,6 @@ pub struct RawDevice<'a> {
 }
 
 impl RawDevice<'_> {
-    pub fn get_instance_proc_addr(&self) -> vk::PFN_vkGetInstanceProcAddr {
-        self.entry.static_fn().get_instance_proc_addr
-    }
-
-    pub fn get_device_proc_addr(&self) -> vk::PFN_vkGetDeviceProcAddr {
-        self.instance.fp_v1_0().get_device_proc_addr
-    }
-
     pub fn has_extension(&self, name: &CStr) -> bool {
         self.extensions.iter().any(|e| e.as_c_str() == name)
     }
@@ -115,7 +107,7 @@ pub fn raw_device(device: &Device) -> RawDevice<'_> {
 }
 
 impl Shared {
-    pub(crate) fn raw_device(&self) -> RawDevice<'_> {
+    pub(super) fn raw_device(&self) -> RawDevice<'_> {
         let render = QueueKind::Render.index();
         RawDevice {
             entry: &self.entry,
@@ -222,7 +214,7 @@ pub fn defer_after_submitted(device: &Device, release: impl FnOnce() + Send + 's
 /// A static one-binding classic descriptor set with an immutable sampler. Binding it on the
 /// compute bind point before NGX lets NGX write its outputs on a queue that has bound
 /// descriptor heaps.
-pub(crate) struct ClassicBind {
+pub(super) struct ClassicBind {
     sampler: vk::Sampler,
     set_layout: vk::DescriptorSetLayout,
     layout: vk::PipelineLayout,
@@ -317,7 +309,7 @@ impl ClassicBind {
     /// # Safety
     ///
     /// No pending command buffer uses the set.
-    pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
+    pub(super) unsafe fn destroy(&self, device: &ash::Device) {
         // SAFETY: forwarded from the caller; destroying null handles is a no-op.
         unsafe {
             device.destroy_descriptor_pool(self.pool, None);

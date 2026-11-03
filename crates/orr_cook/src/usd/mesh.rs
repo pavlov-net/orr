@@ -14,21 +14,21 @@ use crate::subd::{Boundary, CageInput, Corner, Crease, FaceVarying, UvLinear};
 
 /// The authored topology and attributes of one mesh prim.
 pub(super) struct MeshPrim {
-    pub counts: Vec<usize>,
-    pub indices: Vec<usize>,
-    pub points: Vec<DVec3>,
-    pub normals: Option<Primvar>,
-    pub uvs: Option<Primvar>,
-    pub uvs1: Option<Primvar>,
-    pub left_handed: bool,
-    pub holes: Vec<usize>,
-    pub scheme: String,
-    pub double_sided: bool,
-    pub creases: Vec<Crease>,
-    pub corners: Vec<Corner>,
-    pub boundary: Boundary,
-    pub uv_linear: UvLinear,
-    pub smooth_triangles: bool,
+    pub(super) counts: Vec<usize>,
+    indices: Vec<usize>,
+    pub(super) points: Vec<DVec3>,
+    normals: Option<Primvar>,
+    uvs: Option<Primvar>,
+    uvs1: Option<Primvar>,
+    left_handed: bool,
+    holes: Vec<usize>,
+    pub(super) scheme: String,
+    pub(super) double_sided: bool,
+    creases: Vec<Crease>,
+    corners: Vec<Corner>,
+    boundary: Boundary,
+    uv_linear: UvLinear,
+    smooth_triangles: bool,
 }
 
 impl MeshPrim {
@@ -166,26 +166,26 @@ pub(super) type Influence = ([u8; 4], [u8; 4]);
 /// One model's welded vertices and its triangles per scene material.
 #[derive(Default)]
 pub(super) struct Welder {
-    pub positions: Vec<[f32; 3]>,
-    pub normals: Vec<[f32; 3]>,
-    pub uvs: Vec<[f32; 2]>,
-    pub uvs1: Vec<[f32; 2]>,
-    pub joints: Vec<[u8; 4]>,
-    pub weights: Vec<[u8; 4]>,
-    pub groups: BTreeMap<usize, Vec<u32>>,
+    pub(super) positions: Vec<[f32; 3]>,
+    pub(super) normals: Vec<[f32; 3]>,
+    pub(super) uvs: Vec<[f32; 2]>,
+    pub(super) uvs1: Vec<[f32; 2]>,
+    pub(super) joints: Vec<[u8; 4]>,
+    pub(crate) weights: Vec<[u8; 4]>,
+    pub(super) groups: BTreeMap<usize, Vec<u32>>,
     /// Scene materials drawn on a mesh without the uv set 1 primvar.
-    pub missing_uv1: BTreeSet<usize>,
+    pub(super) missing_uv1: BTreeSet<usize>,
     seen: HashMap<[u32; 16], u32>,
 }
 
 /// How a mesh's faces land in a model.
 pub(super) struct Placing<'a> {
     /// Model space from the mesh's points.
-    pub transform: DMat4,
+    pub(super) transform: DMat4,
     /// Scene material and uv transform per face.
-    pub face_material: &'a dyn Fn(usize) -> (usize, Option<Affine2>),
+    pub(super) face_material: &'a dyn Fn(usize) -> (usize, Option<Affine2>),
     /// Influences per point when skinned.
-    pub skin: Option<&'a [Influence]>,
+    pub(super) skin: Option<&'a [Influence]>,
 }
 
 impl Welder {
@@ -286,10 +286,10 @@ impl Welder {
 /// One model's subdivision cage, appended mesh by mesh, in model space and right-handed.
 #[derive(Default)]
 pub(super) struct CageBuilder {
-    pub cage: CageInput,
-    pub skin: Vec<SkinInfluence>,
+    pub(super) cage: CageInput,
+    pub(super) skin: Vec<SkinInfluence>,
     /// Scene material per face.
-    pub materials: Vec<usize>,
+    pub(super) materials: Vec<usize>,
     uvs: HashMap<[u32; 2], u32>,
     /// The first mesh's path, naming the rules every other must share.
     first: Option<String>,
@@ -478,7 +478,7 @@ fn smooth_normals(mesh: &MeshPrim) -> Vec<DVec3> {
 
 /// Triangles of a polygon as corner triplets, wound like the polygon: a fan for triangles
 /// and convex quads, ear clipping otherwise (a fan where clipping finds no ear).
-pub(super) fn triangulate(pts: &[DVec3]) -> Vec<[usize; 3]> {
+fn triangulate(pts: &[DVec3]) -> Vec<[usize; 3]> {
     let n = pts.len();
     if n == 3 {
         return vec![[0, 1, 2]];

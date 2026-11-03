@@ -19,7 +19,7 @@ use crate::{AssetId, Error, Result, Span};
 pub const SCHEMA: u16 = 1;
 
 /// Bytes of LibNTC's `NtcTextureSetConstants`.
-pub const CONSTANTS_BYTES: usize = 336;
+const CONSTANTS_BYTES: usize = 336;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
@@ -89,7 +89,7 @@ pub struct NeuralWeights {
     /// optimal matrix layout; 0 otherwise.
     pub converted_bytes: u64,
     /// The `NtcTextureSetConstants` for these weights: a byte range of blob 0
-    /// ([`CONSTANTS_BYTES`] long).
+    /// (336 bytes long).
     pub constants: Span,
 }
 
@@ -179,21 +179,12 @@ pub const LIBRARY: [u16; 2] = [0, 10];
 /// weights to these sizes.
 pub const LAYERS: [(usize, usize); 4] = [(64, 48), (48, 64), (32, 48), (16, 32)];
 
-/// The network's inputs: the features of two latent mips, [`FEATURES`] each (zero past the
-/// set's `latent_features`), then [`POSITION_WAVES`] four-value position encodings, then the
-/// color mip's position level twice, then zeros.
+/// The network's inputs: the features of two latent mips, 16 each (zero past the set's
+/// `latent_features`), then 3 four-value position encodings, then the color mip's position
+/// level twice, then zeros.
 pub const INPUTS: usize = 48;
-pub const FEATURES: usize = 16;
-pub const POSITION_WAVES: usize = 3;
 /// Output channels of the network.
 pub const OUTPUTS: usize = 16;
-
-/// The clamped HGELU activation `min(x, ACTIVATION_MAX) * saturate(x / 3 + 0.5)`. The last
-/// hidden layer's outputs are then quantized for the output layer's 8-bit weights:
-/// `round(QUANT_STEP * y + QUANT_BIAS)`, which spans -128 to 127.
-pub const ACTIVATION_MAX: f32 = 3.0;
-pub const QUANT_STEP: f32 = 80.0;
-pub const QUANT_BIAS: f32 = -113.0;
 
 /// Color mips per set, at most.
 pub const MAX_MIPS: usize = 16;
@@ -210,7 +201,7 @@ pub struct ColorMip {
     pub _pad: i32,
 }
 
-/// LibNTC's `NtcTextureSetConstants` ([`CONSTANTS_BYTES`]).
+/// LibNTC's `NtcTextureSetConstants`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct Constants {

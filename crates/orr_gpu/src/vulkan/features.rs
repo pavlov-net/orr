@@ -29,7 +29,7 @@ const SURFACE_EXTENSIONS: &[&CStr] = &[
 ];
 
 /// Instance extensions of devices that present.
-pub(crate) const SURFACE_INSTANCE_EXTENSIONS: &[&CStr] = &[
+pub(super) const SURFACE_INSTANCE_EXTENSIONS: &[&CStr] = &[
     ash::khr::surface::NAME,
     #[cfg(windows)]
     ash::khr::win32_surface::NAME,
@@ -53,98 +53,98 @@ const CLUSTER_SPEC_VERSION: u32 = 4;
 
 /// Optional extensions found on the device.
 #[derive(Default, Clone, Copy)]
-pub(crate) struct Optional {
-    pub ray_dispatch: bool,
+pub(super) struct Optional {
+    pub(super) ray_dispatch: bool,
     /// `VK_NV_ray_tracing_linear_swept_spheres`, with `VK_KHR_ray_tracing_pipeline` enabled
     /// beside it even where ray dispatch is off.
-    pub lss: bool,
-    pub omm: bool,
-    pub device_address_commands: bool,
-    pub indirect_copy: bool,
-    pub unified_image_layouts: bool,
-    pub memory_budget: bool,
-    pub memory_priority: bool,
+    pub(super) lss: bool,
+    pub(super) omm: bool,
+    pub(super) device_address_commands: bool,
+    pub(super) indirect_copy: bool,
+    pub(super) unified_image_layouts: bool,
+    pub(super) memory_budget: bool,
+    pub(super) memory_priority: bool,
     /// `VK_EXT_pageable_device_local_memory`, only beside `memory_priority`.
-    pub pageable_memory: bool,
-    pub shader_abort: bool,
-    pub cooperative_vector: bool,
-    pub shader_float8: bool,
-    pub memory_decompression: bool,
-    pub calibrated_timestamps: bool,
-    pub frame_boundary: bool,
-    pub executable_info: bool,
-    pub host_image_copy: bool,
-    pub conservative_raster: bool,
-    pub occupancy_priority: bool,
-    pub generated_commands: bool,
-    pub ray_tracing_validation: bool,
+    pub(super) pageable_memory: bool,
+    pub(super) shader_abort: bool,
+    pub(super) cooperative_vector: bool,
+    pub(super) shader_float8: bool,
+    pub(super) memory_decompression: bool,
+    pub(super) calibrated_timestamps: bool,
+    pub(super) frame_boundary: bool,
+    pub(super) executable_info: bool,
+    pub(super) host_image_copy: bool,
+    pub(super) conservative_raster: bool,
+    pub(super) occupancy_priority: bool,
+    pub(super) generated_commands: bool,
+    pub(super) ray_tracing_validation: bool,
     /// `VK_NV_device_diagnostic_checkpoints`.
-    pub checkpoints: bool,
+    pub(super) checkpoints: bool,
     /// `VK_NV_device_diagnostics_config`, configured for Aftermath.
-    pub aftermath: bool,
+    pub(super) aftermath: bool,
     /// `VK_AMD_buffer_marker`, for the breadcrumb buffer.
-    pub buffer_marker: bool,
+    pub(super) buffer_marker: bool,
     /// `VK_KHR_device_fault`.
-    pub device_fault: bool,
+    pub(super) device_fault: bool,
     /// `VK_EXT_device_fault`, where the KHR extension is off.
-    pub device_fault_ext: bool,
+    pub(super) device_fault_ext: bool,
     /// The device presents: swapchain and swapchain_maintenance1 are enabled.
-    pub surface: bool,
-    pub present_wait: bool,
-    pub low_latency: bool,
-    pub present_metering: bool,
-    pub present_timing: bool,
-    pub hdr_metadata: bool,
+    pub(super) surface: bool,
+    pub(super) present_wait: bool,
+    pub(super) low_latency: bool,
+    pub(super) present_metering: bool,
+    pub(super) present_timing: bool,
+    pub(super) hdr_metadata: bool,
 }
 
 /// Exposed only when `NV_ALLOW_RAYTRACING_VALIDATION=1` is set before instance creation.
-pub(crate) const RAY_TRACING_VALIDATION: &CStr = c"VK_NV_ray_tracing_validation";
+const RAY_TRACING_VALIDATION: &CStr = c"VK_NV_ray_tracing_validation";
 
 /// Every feature struct orr reads or enables, chained through raw pointers.
 #[derive(Default)]
 pub(crate) struct FeatureChain {
-    pub core: vk::PhysicalDeviceFeatures2<'static>,
-    pub v11: vk::PhysicalDeviceVulkan11Features<'static>,
-    pub v12: vk::PhysicalDeviceVulkan12Features<'static>,
-    pub v13: vk::PhysicalDeviceVulkan13Features<'static>,
-    pub v14: vk::PhysicalDeviceVulkan14Features<'static>,
-    pub heap: vk::PhysicalDeviceDescriptorHeapFeaturesEXT<'static>,
-    pub untyped: vk::PhysicalDeviceShaderUntypedPointersFeaturesKHR<'static>,
-    pub accel: vk::PhysicalDeviceAccelerationStructureFeaturesKHR<'static>,
-    pub ray_query: vk::PhysicalDeviceRayQueryFeaturesKHR<'static>,
-    pub position_fetch: vk::PhysicalDeviceRayTracingPositionFetchFeaturesKHR<'static>,
-    pub mesh: vk::PhysicalDeviceMeshShaderFeaturesEXT<'static>,
-    pub ray_pipeline: vk::PhysicalDeviceRayTracingPipelineFeaturesKHR<'static>,
-    pub reorder: vk::PhysicalDeviceRayTracingInvocationReorderFeaturesEXT<'static>,
-    pub lss: vk::PhysicalDeviceRayTracingLinearSweptSpheresFeaturesNV<'static>,
-    pub cluster: vk::PhysicalDeviceClusterAccelerationStructureFeaturesNV<'static>,
-    pub ptlas: vk::PhysicalDevicePartitionedAccelerationStructureFeaturesNV<'static>,
-    pub omm: vk::PhysicalDeviceOpacityMicromapFeaturesKHR<'static>,
-    pub address_commands: vk::PhysicalDeviceDeviceAddressCommandsFeaturesKHR<'static>,
-    pub indirect_copy: vk::PhysicalDeviceCopyMemoryIndirectFeaturesKHR<'static>,
-    pub unified: vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR<'static>,
-    pub abort: vk::PhysicalDeviceShaderAbortFeaturesKHR<'static>,
-    pub constant_data: vk::PhysicalDeviceShaderConstantDataFeaturesKHR<'static>,
-    pub coop: vk::PhysicalDeviceCooperativeVectorFeaturesNV<'static>,
-    pub replicated: vk::PhysicalDeviceShaderReplicatedCompositesFeaturesEXT<'static>,
-    pub float8: vk::PhysicalDeviceShaderFloat8FeaturesEXT<'static>,
-    pub decompression: vk::PhysicalDeviceMemoryDecompressionFeaturesEXT<'static>,
-    pub frame_boundary: vk::PhysicalDeviceFrameBoundaryFeaturesEXT<'static>,
-    pub occupancy: vk::PhysicalDeviceComputeOccupancyPriorityFeaturesNV<'static>,
-    pub generated: vk::PhysicalDeviceDeviceGeneratedCommandsFeaturesEXT<'static>,
-    pub executable: vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR<'static>,
-    pub rt_validation: vk::PhysicalDeviceRayTracingValidationFeaturesNV<'static>,
-    pub swapchain_maintenance: vk::PhysicalDeviceSwapchainMaintenance1FeaturesKHR<'static>,
-    pub present_id2: vk::PhysicalDevicePresentId2FeaturesKHR<'static>,
-    pub present_wait2: vk::PhysicalDevicePresentWait2FeaturesKHR<'static>,
-    pub present_metering: vk::PhysicalDevicePresentMeteringFeaturesNV<'static>,
-    pub present_timing: vk::PhysicalDevicePresentTimingFeaturesEXT<'static>,
-    pub fault: vk::PhysicalDeviceFaultFeaturesKHR<'static>,
-    pub fault_ext: vk::PhysicalDeviceFaultFeaturesEXT<'static>,
-    pub priority: vk::PhysicalDeviceMemoryPriorityFeaturesEXT<'static>,
-    pub pageable: vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT<'static>,
+    core: vk::PhysicalDeviceFeatures2<'static>,
+    v11: vk::PhysicalDeviceVulkan11Features<'static>,
+    v12: vk::PhysicalDeviceVulkan12Features<'static>,
+    v13: vk::PhysicalDeviceVulkan13Features<'static>,
+    v14: vk::PhysicalDeviceVulkan14Features<'static>,
+    heap: vk::PhysicalDeviceDescriptorHeapFeaturesEXT<'static>,
+    untyped: vk::PhysicalDeviceShaderUntypedPointersFeaturesKHR<'static>,
+    accel: vk::PhysicalDeviceAccelerationStructureFeaturesKHR<'static>,
+    ray_query: vk::PhysicalDeviceRayQueryFeaturesKHR<'static>,
+    position_fetch: vk::PhysicalDeviceRayTracingPositionFetchFeaturesKHR<'static>,
+    mesh: vk::PhysicalDeviceMeshShaderFeaturesEXT<'static>,
+    ray_pipeline: vk::PhysicalDeviceRayTracingPipelineFeaturesKHR<'static>,
+    reorder: vk::PhysicalDeviceRayTracingInvocationReorderFeaturesEXT<'static>,
+    lss: vk::PhysicalDeviceRayTracingLinearSweptSpheresFeaturesNV<'static>,
+    cluster: vk::PhysicalDeviceClusterAccelerationStructureFeaturesNV<'static>,
+    ptlas: vk::PhysicalDevicePartitionedAccelerationStructureFeaturesNV<'static>,
+    omm: vk::PhysicalDeviceOpacityMicromapFeaturesKHR<'static>,
+    address_commands: vk::PhysicalDeviceDeviceAddressCommandsFeaturesKHR<'static>,
+    indirect_copy: vk::PhysicalDeviceCopyMemoryIndirectFeaturesKHR<'static>,
+    unified: vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR<'static>,
+    abort: vk::PhysicalDeviceShaderAbortFeaturesKHR<'static>,
+    constant_data: vk::PhysicalDeviceShaderConstantDataFeaturesKHR<'static>,
+    coop: vk::PhysicalDeviceCooperativeVectorFeaturesNV<'static>,
+    replicated: vk::PhysicalDeviceShaderReplicatedCompositesFeaturesEXT<'static>,
+    float8: vk::PhysicalDeviceShaderFloat8FeaturesEXT<'static>,
+    decompression: vk::PhysicalDeviceMemoryDecompressionFeaturesEXT<'static>,
+    frame_boundary: vk::PhysicalDeviceFrameBoundaryFeaturesEXT<'static>,
+    occupancy: vk::PhysicalDeviceComputeOccupancyPriorityFeaturesNV<'static>,
+    generated: vk::PhysicalDeviceDeviceGeneratedCommandsFeaturesEXT<'static>,
+    executable: vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR<'static>,
+    rt_validation: vk::PhysicalDeviceRayTracingValidationFeaturesNV<'static>,
+    swapchain_maintenance: vk::PhysicalDeviceSwapchainMaintenance1FeaturesKHR<'static>,
+    present_id2: vk::PhysicalDevicePresentId2FeaturesKHR<'static>,
+    present_wait2: vk::PhysicalDevicePresentWait2FeaturesKHR<'static>,
+    present_metering: vk::PhysicalDevicePresentMeteringFeaturesNV<'static>,
+    present_timing: vk::PhysicalDevicePresentTimingFeaturesEXT<'static>,
+    fault: vk::PhysicalDeviceFaultFeaturesKHR<'static>,
+    fault_ext: vk::PhysicalDeviceFaultFeaturesEXT<'static>,
+    priority: vk::PhysicalDeviceMemoryPriorityFeaturesEXT<'static>,
+    pageable: vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT<'static>,
     /// Device creation only.
-    pub diagnostics_config: vk::DeviceDiagnosticsConfigCreateInfoNV<'static>,
+    diagnostics_config: vk::DeviceDiagnosticsConfigCreateInfoNV<'static>,
 }
 
 impl FeatureChain {
@@ -256,7 +256,7 @@ impl FeatureChain {
         unsafe { (**chain.last().unwrap()).p_next = std::ptr::null_mut() };
     }
 
-    pub(crate) fn head(&mut self) -> *mut c_void {
+    pub(super) fn head(&mut self) -> *mut c_void {
         std::ptr::from_mut(&mut self.core).cast()
     }
 
@@ -278,7 +278,7 @@ impl FeatureChain {
 
     /// Lets `hooks` set feature bits and add structs, which are chained after orr's. The
     /// returned boxes hold the added structs and must outlive device creation.
-    pub(crate) fn hook(
+    pub(super) fn hook(
         &mut self,
         hooks: &dyn DeviceHooks,
         adapter: vk::PhysicalDevice,
@@ -318,17 +318,17 @@ impl FeatureChain {
 }
 
 /// What a physical device offers orr: the extensions to enable and the features to turn on.
-pub(crate) struct Selection {
-    pub extensions: Vec<&'static CStr>,
+pub(super) struct Selection {
+    pub(super) extensions: Vec<&'static CStr>,
     /// Every extension the device offers.
     offered: Vec<vk::ExtensionProperties>,
-    pub optional: Optional,
+    pub(super) optional: Optional,
     /// Boxed so the chain's pointers stay valid.
-    pub enable: Box<FeatureChain>,
+    pub(super) enable: Box<FeatureChain>,
 }
 
 impl Selection {
-    pub(crate) fn offers(&self, name: &CStr) -> bool {
+    pub(super) fn offers(&self, name: &CStr) -> bool {
         has(&self.offered, name).is_some()
     }
 }
@@ -343,7 +343,7 @@ fn has(list: &[vk::ExtensionProperties], name: &CStr) -> Option<u32> {
 /// leaving out the optional extensions named in `skip`. `surface` adds the extensions and
 /// features presenting needs; `diagnostics` the ones its mode uses. The error names the
 /// first missing item.
-pub(crate) fn select(
+pub(super) fn select(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
     skip: &[&CStr],
@@ -764,7 +764,7 @@ pub(crate) fn select(
 }
 
 /// Maps a selection failure on the chosen device to the error `Device::new` returns.
-pub(crate) fn unsupported(device: &str, missing: String) -> Error {
+pub(super) fn unsupported(device: &str, missing: String) -> Error {
     Error::Unsupported {
         device: device.to_owned(),
         missing,

@@ -17,8 +17,8 @@ use crate::{Error, Stage};
 const RECORDS: u32 = 4096;
 
 /// The block of raygen shader-table records, one per ray-dispatch pipeline.
-pub(crate) struct RecordBlock {
-    pub raw: RawBuffer,
+pub(super) struct RecordBlock {
+    pub(super) raw: RawBuffer,
     ptr: NonNull<u8>,
     handle_bytes: usize,
     /// Record size and stride: the handle rounded up to the base alignment.
@@ -62,7 +62,7 @@ impl RecordBlock {
         })
     }
 
-    pub(crate) fn release(&self, slot: u32) {
+    pub(super) fn release(&self, slot: u32) {
         self.slots.lock().unwrap().release(slot);
     }
 }
@@ -70,11 +70,11 @@ impl RecordBlock {
 /// A ray-dispatch pipeline: one raygen entry run by [`crate::CommandList::dispatch_rays`].
 /// Dropping it destroys it once everything submitted before the drop has completed.
 pub struct RayDispatchPipeline {
-    pub(crate) raw: vk::Pipeline,
+    pub(super) raw: vk::Pipeline,
     /// The size of the root the kernel holds in the push data.
-    pub(crate) inline_root_bytes: u32,
+    pub(super) inline_root_bytes: u32,
     /// The raygen region of the shader table: this pipeline's record.
-    pub(crate) raygen: vk::StridedDeviceAddressRegionKHR,
+    pub(super) raygen: vk::StridedDeviceAddressRegionKHR,
     slot: u32,
     shared: Arc<Shared>,
 }

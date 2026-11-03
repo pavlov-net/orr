@@ -141,13 +141,13 @@ pub(crate) struct Plan<'m> {
 }
 
 pub(crate) struct Planned<'m> {
-    pub plan: Plan<'m>,
-    pub key: Hash32,
-    pub working_set: u64,
-    pub file: Option<PathBuf>,
+    pub(crate) plan: Plan<'m>,
+    pub(crate) key: Hash32,
+    pub(crate) working_set: u64,
+    pub(crate) file: Option<PathBuf>,
 }
 
-pub(crate) fn volume_error(asset: &str, message: impl Into<String>) -> Error {
+fn volume_error(asset: &str, message: impl Into<String>) -> Error {
     Error::Volume {
         asset: asset.into(),
         message: message.into(),
@@ -213,10 +213,10 @@ pub(crate) fn plan<'m>(
 }
 
 /// One input grid as 8^3 blocks with a value other than its background.
-pub(crate) struct SourceGrid<'a> {
-    pub name: String,
-    pub background: f32,
-    pub blocks: HashMap<[i32; 3], Cow<'a, Block>>,
+struct SourceGrid<'a> {
+    name: String,
+    background: f32,
+    blocks: HashMap<[i32; 3], Cow<'a, Block>>,
 }
 
 impl SourceGrid<'_> {
@@ -233,10 +233,10 @@ impl SourceGrid<'_> {
 }
 
 /// Grids sharing one lattice.
-pub(crate) struct SourceVolume<'a> {
-    pub origin: [f32; 3],
-    pub voxel_size: [f32; 3],
-    pub grids: Vec<SourceGrid<'a>>,
+struct SourceVolume<'a> {
+    origin: [f32; 3],
+    voxel_size: [f32; 3],
+    grids: Vec<SourceGrid<'a>>,
 }
 
 fn from_memory<'a>(asset: &str, g: &'a VolumeGrids) -> Result<SourceVolume<'a>> {

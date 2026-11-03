@@ -9,23 +9,23 @@ use super::maps::Displacement;
 use super::{Grid, MeshData, MeshSettings, Pivots, Skin};
 
 /// The mesh with identical vertices merged; sections keep their index ranges.
-pub(crate) struct Welded {
-    pub positions: Vec<[f32; 3]>,
-    pub normals: Vec<[f32; 3]>,
-    pub tangents: Option<Vec<[f32; 4]>>,
+pub(super) struct Welded {
+    pub(super) positions: Vec<[f32; 3]>,
+    pub(super) normals: Vec<[f32; 3]>,
+    pub(super) tangents: Option<Vec<[f32; 4]>>,
     /// Per uv set, a uv per vertex.
-    pub uvs: Vec<Vec<[f32; 2]>>,
-    pub skin: Option<Skin>,
-    pub values: Option<Vec<u16>>,
-    pub pivots: Option<Vec<[f32; 3]>>,
-    pub indices: Vec<u32>,
+    pub(super) uvs: Vec<Vec<[f32; 2]>>,
+    pub(super) skin: Option<Skin>,
+    pub(super) values: Option<Vec<u16>>,
+    pub(super) pivots: Option<Vec<[f32; 3]>>,
+    pub(super) indices: Vec<u32>,
     /// Section index range per section.
-    pub sections: Vec<std::ops::Range<usize>>,
+    pub(super) sections: Vec<std::ops::Range<usize>>,
 }
 
 impl Welded {
     /// Welds `m`, without its tangents unless `tangents`.
-    pub(crate) fn new(m: &MeshData, tangents: bool) -> Self {
+    pub(super) fn new(m: &MeshData, tangents: bool) -> Self {
         let _z = crate::profile::zone!("mesh.weld");
         let n = m.positions.len();
         let stored = m.tangents.as_ref().filter(|_| tangents);
@@ -83,17 +83,17 @@ impl Welded {
 }
 
 /// The part table and each triangle's part.
-pub(crate) struct Parts {
+pub(super) struct Parts {
     /// Pivot and joint per part; bounds are filled from the clusters.
-    pub table: Vec<Part>,
+    pub(super) table: Vec<Part>,
     /// Part value is not 0.
-    pub animated: Vec<bool>,
+    pub(super) animated: Vec<bool>,
     /// Part of each triangle, in [`Welded::indices`] order.
-    pub of_triangle: Vec<u8>,
+    pub(super) of_triangle: Vec<u8>,
 }
 
 impl Parts {
-    pub(crate) fn new(w: &Welded, m: &MeshData, grid: &Grid) -> Result<Self, String> {
+    pub(super) fn new(w: &Welded, m: &MeshData, grid: &Grid) -> Result<Self, String> {
         let _z = crate::profile::zone!("mesh.parts");
         let triangles = w.indices.len() / 3;
         let part = |pivot, joint| Part {
@@ -183,17 +183,17 @@ impl Parts {
 /// Triangles of one part and section at one level, or of a section's merged stage.
 #[derive(Clone)]
 pub(crate) struct Piece {
-    pub part: u8,
-    pub section: u8,
-    pub merged: bool,
-    pub indices: Vec<u32>,
+    pub(super) part: u8,
+    pub(super) section: u8,
+    pub(super) merged: bool,
+    pub(super) indices: Vec<u32>,
 }
 
 pub(crate) struct LevelGeometry {
     /// Error from the source, meters; 0 at level 0.
-    pub error: f32,
+    pub(super) error: f32,
     /// Sorted by part, then section.
-    pub pieces: Vec<Piece>,
+    pub(super) pieces: Vec<Piece>,
 }
 
 pub(crate) fn levels(
@@ -284,7 +284,7 @@ pub(crate) fn pieces(w: &Welded, parts: &Parts) -> Vec<Piece> {
 
 /// Grid positions where corners (welded vertex, grid position) with different uvs, in
 /// either set, meet.
-pub(crate) fn seam_cells(
+pub(super) fn seam_cells(
     w: &Welded,
     corners: impl IntoIterator<Item = (u32, [i32; 3])>,
 ) -> FxHashSet<[i32; 3]> {
@@ -301,7 +301,7 @@ pub(crate) fn seam_cells(
 }
 
 /// Grid positions used by more than one piece: part and section borders.
-pub(crate) fn shared_cells<P: IntoIterator<Item = [i32; 3]>>(
+pub(super) fn shared_cells<P: IntoIterator<Item = [i32; 3]>>(
     pieces: impl IntoIterator<Item = P>,
 ) -> FxHashSet<[i32; 3]> {
     let mut owner: FxHashMap<[i32; 3], usize> = FxHashMap::default();
@@ -318,7 +318,7 @@ pub(crate) fn shared_cells<P: IntoIterator<Item = [i32; 3]>>(
 
 /// Simplifier flags of a vertex at `cell`: locked on a shared position, protected on a
 /// seam.
-pub(crate) fn vertex_flags(
+pub(super) fn vertex_flags(
     cell: [i32; 3],
     shared: &FxHashSet<[i32; 3]>,
     seams: &FxHashSet<[i32; 3]>,
@@ -335,7 +335,7 @@ pub(crate) fn vertex_flags(
 
 /// Simplifies one piece to an absolute error, with sloppy simplification where permissive
 /// keeps more than three quarters when `sloppy`; returns its indices and the error reached.
-pub(crate) fn simplify(
+pub(super) fn simplify(
     indices: &[u32],
     w: &Welded,
     grid: &Grid,
@@ -404,7 +404,7 @@ pub(crate) fn simplify(
 
 /// Warnings for vertices on a uv seam of section `s` whose displacement differs between
 /// its uvs by more than 1/1024 of the declared range.
-pub(crate) fn displacement_seams(
+pub(super) fn displacement_seams(
     w: &Welded,
     grid: &Grid,
     s: usize,
@@ -456,7 +456,7 @@ pub(crate) fn displacement_seams(
 }
 
 /// Edges of section `s` used by one triangle, by grid position.
-pub(crate) fn border_edges(w: &Welded, grid: &Grid, s: usize) -> usize {
+pub(super) fn border_edges(w: &Welded, grid: &Grid, s: usize) -> usize {
     let mut uses: FxHashMap<([i32; 3], [i32; 3]), u32> = FxHashMap::default();
     for t in w.section_triangles(s) {
         let c = t.map(|v| grid.cells[v as usize]);

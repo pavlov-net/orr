@@ -199,7 +199,7 @@ fn load() -> Result<Library, String> {
 
 /// Enables crash dumps into `dump_dir` before the device is created. The library is
 /// enabled once per process; later devices move the dump directory.
-pub(crate) fn enable(dump_dir: &Path, app: &str) -> Result<(), String> {
+pub(super) fn enable(dump_dir: &Path, app: &str) -> Result<(), String> {
     std::fs::create_dir_all(dump_dir).map_err(|e| format!("{}: {e}", dump_dir.display()))?;
     let mut first = false;
     let lib = LIBRARY
@@ -239,7 +239,7 @@ pub(crate) fn enable(dump_dir: &Path, app: &str) -> Result<(), String> {
 }
 
 /// Lets crash dumps resolve the device's pass markers.
-pub(crate) fn add_device(shared: Weak<Shared>) {
+pub(super) fn add_device(shared: Weak<Shared>) {
     if let Some(s) = state().as_mut() {
         s.devices.retain(|d| d.strong_count() > 0);
         s.devices.push(shared);
@@ -254,7 +254,7 @@ fn spirv(words: &[u32]) -> SpirvCode {
 }
 
 /// Keeps a module pipelines are created from, for the decoder's shader lookup.
-pub(crate) fn add_shader(code: &[u32]) {
+pub(super) fn add_shader(code: &[u32]) {
     let Some(lib) = library() else { return };
     let mut hash = ShaderHash(0);
     // SAFETY: `code` is a SPIR-V module of the stated size.
@@ -269,7 +269,7 @@ pub(crate) fn add_shader(code: &[u32]) {
 }
 
 /// Keeps a stripped module's separated debug info under the debug name Aftermath asks for.
-pub(crate) fn add_sidecar(stripped: &[u32], sidecar: &[u8]) {
+pub(super) fn add_sidecar(stripped: &[u32], sidecar: &[u8]) {
     let Some(lib) = library() else { return };
     add_shader(stripped);
     let full = SpirvCode {
@@ -292,7 +292,7 @@ pub(crate) fn add_sidecar(stripped: &[u32], sidecar: &[u8]) {
 /// After device loss: waits for Aftermath's dump, decodes it to JSON beside it with the
 /// driver's shader debug info and the shaders and sidecars it names, and returns the dump's
 /// path.
-pub(crate) fn wait_for_dump() -> Option<PathBuf> {
+pub(super) fn wait_for_dump() -> Option<PathBuf> {
     let lib = library()?;
     let start = Instant::now();
     let mut status = STATUS_NOT_STARTED;

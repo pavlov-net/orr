@@ -304,9 +304,9 @@ pub struct SwapchainFrame {
     raw: vk::SwapchainKHR,
     generation: u64,
     slot: usize,
-    pub(crate) acquire: vk::Semaphore,
-    pub(crate) present: vk::Semaphore,
-    pub(crate) submitted: Cell<bool>,
+    pub(super) acquire: vk::Semaphore,
+    pub(super) present: vk::Semaphore,
+    pub(super) submitted: Cell<bool>,
 }
 
 impl SwapchainFrame {
@@ -328,11 +328,6 @@ impl SwapchainFrame {
     pub fn extent(&self) -> [u32; 2] {
         let e = self.texture.desc().extent;
         [e[0], e[1]]
-    }
-
-    /// The image's index in its swapchain.
-    pub fn index(&self) -> u32 {
-        self.index
     }
 }
 

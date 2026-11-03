@@ -25,7 +25,7 @@ struct HeapLayout {
 
 /// One heap buffer and how it is bound.
 pub(crate) struct HeapBuffer {
-    pub raw: RawBuffer,
+    pub(super) raw: RawBuffer,
     ptr: NonNull<u8>,
     stride: u64,
     slots: u32,
@@ -96,7 +96,7 @@ impl HeapBuffer {
 /// Free slots below a capacity: never-used slots count up from `next`; freed ones are reused
 /// first.
 #[derive(Default)]
-pub(crate) struct SlotAllocator {
+pub(super) struct SlotAllocator {
     next: u32,
     free: Vec<u32>,
 }
@@ -104,14 +104,14 @@ pub(crate) struct SlotAllocator {
 impl SlotAllocator {
     /// Image slots, which never include slot 0, [`TextureIndex::NONE`], or the slots reserved for
     /// the OpenPBR tables.
-    pub(crate) fn images() -> Self {
+    fn images() -> Self {
         Self {
             next: FIRST_FREE_IMAGE_SLOT,
             free: Vec::new(),
         }
     }
 
-    pub(crate) fn take(&mut self, capacity: u32) -> Option<u32> {
+    pub(super) fn take(&mut self, capacity: u32) -> Option<u32> {
         if let Some(slot) = self.free.pop() {
             return Some(slot);
         }
@@ -122,7 +122,7 @@ impl SlotAllocator {
     }
 
     /// The first of `count` consecutive slots: a run of freed ones, else never-used ones.
-    pub(crate) fn take_run(&mut self, count: u32, capacity: u32) -> Option<u32> {
+    fn take_run(&mut self, count: u32, capacity: u32) -> Option<u32> {
         assert!(count > 0, "a run of no slots");
         let n = count as usize;
         self.free.sort_unstable();
@@ -141,7 +141,7 @@ impl SlotAllocator {
         })
     }
 
-    pub(crate) fn release(&mut self, slot: u32) {
+    pub(super) fn release(&mut self, slot: u32) {
         self.free.push(slot);
     }
 }
@@ -154,9 +154,9 @@ fn assert_freeable(slot: u32) {
     );
 }
 
-pub(crate) struct Heaps {
-    pub resource: HeapBuffer,
-    pub sampler: HeapBuffer,
+pub(super) struct Heaps {
+    pub(crate) resource: HeapBuffer,
+    pub(crate) sampler: HeapBuffer,
     slots: Mutex<SlotAllocator>,
     /// Samplers [`Device::sampler`] has written, from the top slot down.
     shared_samplers: Mutex<Vec<SamplerDesc>>,
@@ -213,7 +213,7 @@ impl Heaps {
         })
     }
 
-    pub(crate) fn bind(&self, heap_fn: &ash::ext::descriptor_heap::Device, cmd: vk::CommandBuffer) {
+    pub(super) fn bind(&self, heap_fn: &ash::ext::descriptor_heap::Device, cmd: vk::CommandBuffer) {
         // SAFETY: `cmd` is recording on a graphics or compute queue; both heaps are live.
         unsafe {
             heap_fn.cmd_bind_resource_heap(cmd, &self.resource.bind_info());
@@ -221,7 +221,7 @@ impl Heaps {
         }
     }
 
-    pub(crate) fn release_image_slot(&self, slot: u32) {
+    pub(super) fn release_image_slot(&self, slot: u32) {
         self.slots.lock().unwrap().release(slot);
     }
 }

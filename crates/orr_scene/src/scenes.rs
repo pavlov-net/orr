@@ -818,10 +818,6 @@ impl Scenes {
         &self.device
     }
 
-    pub fn cell_log2(&self) -> u32 {
-        self.core.cell_log2
-    }
-
     /// A new scene with empty tables.
     pub fn create_scene(&mut self, desc: &SceneDesc) -> Result<SceneId> {
         let scene = Scene::new(&self.device, desc)?;
@@ -1273,7 +1269,6 @@ impl<'a> Frame<'a> {
             return Err(Error::WriterTaken(id));
         }
         Ok(SceneWriter {
-            id,
             scene,
             device: self.device,
             window: &self.core.windows[self.window],

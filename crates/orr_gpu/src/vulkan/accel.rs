@@ -143,10 +143,6 @@ impl ClassicAs {
         self.address
     }
 
-    pub fn kind(&self) -> ClassicKind {
-        self.kind
-    }
-
     /// The address as a [`Tlas`]; only for a TLAS.
     pub fn tlas(&self) -> Tlas {
         assert_eq!(self.kind, ClassicKind::Tlas, "a BLAS is not a Tlas");
@@ -705,14 +701,14 @@ impl Device {
 }
 
 /// The empty TLAS's handles; destroyed with the device.
-pub(crate) struct EmptyTlas {
-    pub accel: vk::AccelerationStructureKHR,
-    pub storage: RawBuffer,
-    pub address: u64,
+pub(super) struct EmptyTlas {
+    pub(super) accel: vk::AccelerationStructureKHR,
+    pub(super) storage: RawBuffer,
+    pub(super) address: u64,
 }
 
 /// Builds a TLAS with one inactive instance on the render queue and waits for it.
-pub(crate) fn build_empty_tlas(device: &Device) -> Result<EmptyTlas, Error> {
+pub(super) fn build_empty_tlas(device: &Device) -> Result<EmptyTlas, Error> {
     let start = Instant::now();
     let mut instances =
         device.gpu_malloc::<ClassicInstance>(MemoryKind::Upload, 1, "orr empty TLAS instance")?;

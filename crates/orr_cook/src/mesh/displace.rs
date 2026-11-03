@@ -15,7 +15,7 @@ use super::{Grid, SectionMaps, StaticDisplacement};
 
 /// Splits and displaces every section with a readable displacement texture; returns which
 /// sections were baked.
-pub(crate) fn bake(
+pub(super) fn bake(
     w: &mut Welded,
     parts: &mut Parts,
     maps: &[SectionMaps],
@@ -175,7 +175,7 @@ fn smooth_normals(w: &mut Welded, baked: &[bool]) {
 
 /// Simplifies each (part, section) piece of the baked sections to `target` meters, with
 /// grid positions shared with any other piece locked and uv seams kept.
-pub(crate) fn simplify(
+pub(super) fn simplify(
     w: &mut Welded,
     parts: &mut Parts,
     grid: &Grid,

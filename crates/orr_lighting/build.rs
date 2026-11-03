@@ -22,7 +22,7 @@ fn main() {
         b.kernels(&src)
             .roots(&scene)
             .types(&types)
-            .publish_types("::orr_lighting::shaders::types")
+            .publish_types("::orr_lighting::types")
             .compile()
     });
     match out {

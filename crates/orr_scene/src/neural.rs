@@ -89,9 +89,9 @@ fn srgb_channels(info: &NeuralInfo) -> u32 {
 /// A set's decoder weights as the device multiplies them (`len` bytes of `bytes`, a multiple
 /// of 16), and the set's record without its weights' address, latents and sampler.
 pub(crate) struct DeviceWeights {
-    pub bytes: AlignedBuf,
-    pub len: usize,
-    pub record: NeuralSetGpu,
+    pub(crate) bytes: AlignedBuf,
+    pub(crate) len: usize,
+    pub(crate) record: NeuralSetGpu,
 }
 
 /// Every layer is padded with zero weights and biases to this width, so that kernels run
@@ -215,13 +215,13 @@ pub(crate) fn device_weights(
 
 /// A texture's link to the neural set that stands in for it.
 pub(crate) struct NeuralLink {
-    pub set: AssetId,
-    pub record: GpuPtr<NeuralTextureGpu>,
+    pub(crate) set: AssetId,
+    pub(crate) record: GpuPtr<NeuralTextureGpu>,
     /// The texture's own stream record when it does not stream, else null.
-    pub own: GpuPtr<TextureStreamGpu>,
+    pub(crate) own: GpuPtr<TextureStreamGpu>,
     /// The record's contents; `set` is filled in once the set is placed.
-    pub gpu: NeuralTextureGpu,
+    pub(crate) gpu: NeuralTextureGpu,
     /// The set's latents when they stream, and the latent mip of each color mip.
-    pub latents: Option<Arc<TexStream>>,
-    pub latent_mips: Vec<u32>,
+    pub(crate) latents: Option<Arc<TexStream>>,
+    pub(crate) latent_mips: Vec<u32>,
 }

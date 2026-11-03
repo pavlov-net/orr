@@ -19,8 +19,9 @@ use serde::Deserialize;
 
 use ctt::Quality;
 pub(crate) use encode::{Encoding, encode as encode_chains};
-pub(crate) use load::{Blocks, Source, decode_blocks, decode_channel, file_header};
-pub(crate) use mips::{MipSpec, Toksvig};
+use load::{Blocks, Source};
+pub(crate) use load::{decode_blocks, decode_channel, file_header};
+use mips::{MipSpec, Toksvig};
 
 use crate::{Error, Result};
 
@@ -157,13 +158,13 @@ pub enum Wrap {
 /// Linear float RGBA texels, row-major.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Img {
-    pub w: u32,
-    pub h: u32,
-    pub px: Vec<[f32; 4]>,
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+    pub(crate) px: Vec<[f32; 4]>,
 }
 
 impl Img {
-    pub(crate) fn new(w: u32, h: u32) -> Self {
+    fn new(w: u32, h: u32) -> Self {
         Self {
             w,
             h,
@@ -177,7 +178,7 @@ impl Img {
     }
 
     /// Bilinear resize; used to bring a packed texture's inputs to one size.
-    pub(crate) fn resized(self: Arc<Self>, w: u32, h: u32) -> Arc<Self> {
+    fn resized(self: Arc<Self>, w: u32, h: u32) -> Arc<Self> {
         if (w, h) == (self.w, self.h) {
             return self;
         }
@@ -193,7 +194,7 @@ impl Img {
     }
 
     /// Bilinear sample at texel coordinates (texel centers at integers), clamped at edges.
-    pub(crate) fn bilinear(&self, x: f32, y: f32) -> [f32; 4] {
+    fn bilinear(&self, x: f32, y: f32) -> [f32; 4] {
         let (x0, y0) = (x.floor(), y.floor());
         let (fx, fy) = (x - x0, y - y0);
         let cx = |v: f32| (v as i64).clamp(0, i64::from(self.w) - 1) as usize;
@@ -219,24 +220,24 @@ pub(crate) fn linear_to_srgb(v: f32) -> f32 {
 }
 
 /// What to cook from prepared linear layers.
-pub(crate) struct Plan {
-    pub encoding: Encoding,
-    pub cube: bool,
-    pub primaries: Primaries,
-    pub mips: MipSpec,
-    pub quality: Quality,
-    pub max_size: Option<u32>,
+struct Plan {
+    encoding: Encoding,
+    cube: bool,
+    primaries: Primaries,
+    mips: MipSpec,
+    quality: Quality,
+    max_size: Option<u32>,
     /// Mips down to 1x1; without them the texture is the first mip that fits `max_size`.
-    pub full_chain: bool,
-    pub toksvig: Option<Toksvig>,
-    pub lights: Vec<ExtractedLight>,
+    full_chain: bool,
+    toksvig: Option<Toksvig>,
+    lights: Vec<ExtractedLight>,
 }
 
 /// A cooked texture: blob 0 and the blobs after it, stored with `filter`.
 pub(crate) struct Built {
-    pub info: TextureInfo,
-    pub blobs: Vec<Vec<u8>>,
-    pub filter: Filter,
+    info: TextureInfo,
+    blobs: Vec<Vec<u8>>,
+    filter: Filter,
 }
 
 /// The report's warning for a source that reads the animated image `image`.
@@ -247,7 +248,7 @@ pub(crate) fn first_frame_warning(image: &str) -> String {
 impl Built {
     /// Stores the blocks split, or not, as `bc_split` asks; `None` takes the format's
     /// default.
-    pub(crate) fn with_split(mut self, bc_split: Option<bool>) -> Self {
+    fn with_split(mut self, bc_split: Option<bool>) -> Self {
         let layout = BcLayout::of(self.info.header.vk_format);
         self.filter = match layout {
             Some(l) if bc_split.unwrap_or_else(|| split_by_default(l)) => Filter::BcSplit(l),
@@ -263,7 +264,7 @@ fn split_by_default(_: BcLayout) -> bool {
 }
 
 /// The mips of a stored `w` x `h` chain that fit `max_size`, and the size of the first.
-pub(crate) fn kept_mips(
+fn kept_mips(
     mut mips: Vec<Vec<u8>>,
     w: u32,
     h: u32,
@@ -275,7 +276,7 @@ pub(crate) fn kept_mips(
 
 /// Mips a `w` x `h` texture keeps: down to 1x1 with `full_chain`, else down to the first
 /// that fits `max_size`.
-pub(crate) fn kept_mip_count(w: u32, h: u32, max_size: Option<u32>, full_chain: bool) -> u32 {
+fn kept_mip_count(w: u32, h: u32, max_size: Option<u32>, full_chain: bool) -> u32 {
     if full_chain {
         full_mip_count(w, h)
     } else {
@@ -284,7 +285,7 @@ pub(crate) fn kept_mip_count(w: u32, h: u32, max_size: Option<u32>, full_chain: 
 }
 
 /// Mips dropped from the top of a `w` x `h` chain so mip 0 fits `max_size`.
-pub(crate) fn skipped_mips(w: u32, h: u32, max_size: Option<u32>) -> u32 {
+fn skipped_mips(w: u32, h: u32, max_size: Option<u32>) -> u32 {
     max_size.map_or(0, |max| {
         (0..full_mip_count(w, h))
             .take_while(|&m| mip_size(w, h, m).into_iter().any(|e| e > max.max(1)))
@@ -294,7 +295,7 @@ pub(crate) fn skipped_mips(w: u32, h: u32, max_size: Option<u32>) -> u32 {
 
 /// The mip chains of `layers` (mip 0 each, values linear) as they are encoded: filtered,
 /// without the mips over `max_size`, with Toksvig roughness from kept mip `first` on.
-pub(crate) fn chains(layers: Vec<Img>, plan: &Plan, first: usize) -> Result<Vec<Vec<Img>>, String> {
+fn chains(layers: Vec<Img>, plan: &Plan, first: usize) -> Result<Vec<Vec<Img>>, String> {
     let (w, h) = (layers[0].w, layers[0].h);
     if layers.iter().any(|l| (l.w, l.h) != (w, h)) {
         return Err("layers differ in size".into());
@@ -317,12 +318,12 @@ pub(crate) fn chains(layers: Vec<Img>, plan: &Plan, first: usize) -> Result<Vec<
 }
 
 /// Mip chains, encoding and layout for `layers` (mip 0 each, values linear).
-pub(crate) fn build(layers: Vec<Img>, plan: &Plan) -> Result<Built, String> {
+fn build(layers: Vec<Img>, plan: &Plan) -> Result<Built, String> {
     finish(chains(layers, plan, 0)?, plan)
 }
 
 /// Encoding and layout for the mip chains of `layers` (values linear, normals unit).
-pub(crate) fn finish(mut chains: Vec<Vec<Img>>, plan: &Plan) -> Result<Built, String> {
+fn finish(mut chains: Vec<Vec<Img>>, plan: &Plan) -> Result<Built, String> {
     if plan.mips.normal {
         for p in chains.iter_mut().flatten().flat_map(|m| &mut m.px) {
             p[0] = normal::encode(p[0]);
@@ -344,7 +345,7 @@ pub(crate) fn finish(mut chains: Vec<Vec<Img>>, plan: &Plan) -> Result<Built, St
 }
 
 /// Archive blobs of an encoded texture: `levels[layer][mip]` holds tight block rows.
-pub(crate) fn layout(
+fn layout(
     vk_format: u32,
     [w, h]: [u32; 2],
     cube: bool,

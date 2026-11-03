@@ -18,7 +18,7 @@ use crate::{Error, KernelSet, pipeline};
 
 /// Frames whose scene-pass roots and statistics are kept apart, so the CPU can write one
 /// frame's while the GPU still reads earlier ones.
-pub const FRAME_SLOTS: usize = 3;
+pub(crate) const FRAME_SLOTS: usize = 3;
 
 /// Presampled light tiles redrawn each frame, and samples per tile (`light_sampling`'s
 /// `TILE_COUNT` and `TILE_SIZE`).

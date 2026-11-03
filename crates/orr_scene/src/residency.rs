@@ -34,7 +34,7 @@ const SCALE_STEP: f64 = 0.95;
 const MIN_SCALE: f64 = 0.125;
 
 /// Residency classes.
-pub(crate) const CLASSES: usize = 5;
+const CLASSES: usize = 5;
 
 /// A residency class: one pool and one byte budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -57,7 +57,7 @@ impl ResidencyClass {
         Self::UserBlobs,
     ];
 
-    pub(crate) fn name(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
             Self::MeshPages => "mesh page pool",
             Self::HierarchyPages => "hierarchy page pool",
@@ -107,9 +107,9 @@ impl ResidencyStats {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Priority {
     /// Projected error in pixels that the unit would remove; 0 for hints.
-    pub error: f32,
+    pub(crate) error: f32,
     /// Integer world-cell distance from the focus.
-    pub cell_distance: u32,
+    pub(crate) cell_distance: u32,
 }
 
 impl Priority {
@@ -132,8 +132,8 @@ impl Priority {
 /// A unit of a mount, by its index in the mount's unit list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Key {
-    pub mount: MountId,
-    pub unit: u32,
+    pub(crate) mount: MountId,
+    pub(crate) unit: u32,
 }
 
 /// How a unit starts when its mount registers it.
@@ -149,11 +149,11 @@ pub(crate) enum Start {
 
 #[derive(Clone, Debug)]
 pub(crate) struct UnitDesc {
-    pub class: ResidencyClass,
-    pub bytes: u64,
+    pub(crate) class: ResidencyClass,
+    pub(crate) bytes: u64,
     /// Units of the same mount that must be resident first.
-    pub deps: Vec<u32>,
-    pub start: Start,
+    pub(crate) deps: Vec<u32>,
+    pub(crate) start: Start,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,9 +181,9 @@ struct Unit {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Plan {
     /// Units to read, each after the units it depends on.
-    pub loads: Vec<Key>,
+    pub(crate) loads: Vec<Key>,
     /// Units no longer resident from this step on.
-    pub evictions: Vec<Key>,
+    pub(crate) evictions: Vec<Key>,
 }
 
 /// The budgets and limits a [`Residency`] plans under.
@@ -191,9 +191,9 @@ pub(crate) struct Plan {
 pub(crate) struct Limits {
     /// By [`ResidencyClass::ALL`] order, without memory pressure. Pinned and locked units
     /// must fit them.
-    pub budgets: [u64; CLASSES],
-    pub io_requests: u32,
-    pub io_bytes: u64,
+    pub(crate) budgets: [u64; CLASSES],
+    pub(crate) io_requests: u32,
+    pub(crate) io_bytes: u64,
 }
 
 pub(crate) struct Residency {

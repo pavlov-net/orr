@@ -104,11 +104,11 @@ impl InstanceRecord {
         self.scale & Self::EXACT_AXIS != 0
     }
 
-    pub fn mirror(&self) -> bool {
+    fn mirror(&self) -> bool {
         self.scale & Self::MIRROR != 0
     }
 
-    pub fn scale_codes(&self) -> [u32; 3] {
+    fn scale_codes(&self) -> [u32; 3] {
         [0, 10, 20].map(|s| (self.scale >> s) & 1023)
     }
 }
@@ -332,7 +332,7 @@ pub fn morton(pos: [u16; 3]) -> u64 {
 }
 
 /// Levels of a Morton code: 16 levels of 3 bits each.
-pub const MORTON_LEVELS: u32 = 16;
+const MORTON_LEVELS: u32 = 16;
 
 /// Splits records sorted by Morton `codes` into the largest Morton-prefix cells whose summed
 /// `costs` fit in `max`, returning each cell's first record. `None` when the records of one

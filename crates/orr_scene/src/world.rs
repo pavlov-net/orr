@@ -3,7 +3,7 @@
 use orr_math::{DVec3, IVec3, Vec3};
 
 /// Render origins sit on a grid of 2^9 = 512 m, or on the cell grid when cells are larger.
-pub const REBASE_GRID_LOG2: u32 = 9;
+pub(crate) const REBASE_GRID_LOG2: u32 = 9;
 
 /// A world position: cell `cell` of edge 2^cell_log2 m plus `offset` inside it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -21,10 +21,6 @@ impl WorldPos {
             cell: cell.as_ivec3(),
             offset: (p - cell * edge).as_vec3(),
         }
-    }
-
-    pub fn to_dvec3(self, cell_log2: u32) -> DVec3 {
-        self.cell.as_dvec3() * f64::from(1u32 << cell_log2) + self.offset.as_dvec3()
     }
 
     /// The translation from `from` to `self` as kernels compute it: the cell part is exact

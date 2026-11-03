@@ -198,10 +198,10 @@ pub(crate) struct Ptlas {
     emptied: Vec<(u64, u32)>,
     unplaced: u32,
     /// Slots below it have been handed out at some time.
-    pub high_water: u32,
-    pub partition_table: Allocation<PartitionGpu>,
-    pub slot_table: Allocation<u32>,
-    pub part_slots: Allocation<u32>,
+    pub(crate) high_water: u32,
+    partition_table: Allocation<PartitionGpu>,
+    pub(crate) slot_table: Allocation<u32>,
+    pub(crate) part_slots: Allocation<u32>,
     storage: Option<Storage>,
 }
 
@@ -667,17 +667,17 @@ impl Ptlas {
 
 /// What one frame's PTLAS work reads from the frame.
 pub(crate) struct FrameInputs {
-    pub scene: GpuPtr<crate::SceneRoot>,
-    pub focus_cell: [i32; 4],
-    pub focus_offset: [f32; 4],
-    pub origin_cell: IVec3,
-    pub cell_log2: u32,
-    pub rebased: bool,
-    pub budget: u32,
+    pub(crate) scene: GpuPtr<crate::SceneRoot>,
+    pub(crate) focus_cell: [i32; 4],
+    pub(crate) focus_offset: [f32; 4],
+    pub(crate) origin_cell: IVec3,
+    pub(crate) cell_log2: u32,
+    pub(crate) rebased: bool,
+    pub(crate) budget: u32,
     /// The BLAS medium proxies trace; 0 while the scene has none.
-    pub proxy_blas: GpuAddress,
+    pub(crate) proxy_blas: GpuAddress,
     /// The frame's readback slot.
-    pub slot: usize,
+    pub(crate) slot: usize,
 }
 
 fn desc(limits: PtlasLimits) -> RtasOpDesc {

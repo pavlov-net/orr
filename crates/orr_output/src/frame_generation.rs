@@ -188,7 +188,7 @@ pub(crate) fn fg_camera(cur: &FgCameraState, prev: &FgCameraState, anchor: DVec3
 /// `None` when it cannot tell; always true off Windows.
 #[cfg(windows)]
 pub(crate) fn hardware_scheduling(gpu: &Device) -> Option<bool> {
-    use orr_scene::orr_gpu::vulkan::{self, ash::vk};
+    use orr_scene::orr_gpu::interop::{self, ash::vk};
     use vk::TaggedStructure as _;
     use windows::Wdk::Graphics::Direct3D::{
         D3DKMT_CLOSEADAPTER, D3DKMT_OPENADAPTERFROMLUID, D3DKMT_QUERYADAPTERINFO,
@@ -197,7 +197,7 @@ pub(crate) fn hardware_scheduling(gpu: &Device) -> Option<bool> {
     };
     use windows::Win32::Foundation::LUID;
 
-    let raw = vulkan::raw_device(gpu);
+    let raw = interop::raw_device(gpu);
     let mut id = vk::PhysicalDeviceIDProperties::default();
     let mut props = vk::PhysicalDeviceProperties2::default().push(&mut id);
     // SAFETY: a query on the device's live physical device.

@@ -29,7 +29,7 @@ pub(crate) struct TileGrid {
     /// Tiles per axis of each mip above the tail.
     pub(crate) grids: Vec<[u32; 2]>,
     /// First tile of each mip within a layer, then the tiles of one layer.
-    pub(crate) mip_first: Vec<u32>,
+    mip_first: Vec<u32>,
     pub(crate) layers: u32,
 }
 
@@ -59,7 +59,7 @@ impl TileGrid {
         self.grids.len() as u32
     }
 
-    pub(crate) fn layer_tiles(&self) -> u32 {
+    fn layer_tiles(&self) -> u32 {
         *self.mip_first.last().expect("a first tile per mip")
     }
 
@@ -119,7 +119,7 @@ impl TileGrid {
 
     /// The finest resident mip at each mip 0 tile of `layer` (`resident` by tile index),
     /// before the neighbors are taken in.
-    pub(crate) fn finest(&self, resident: &[bool], layer: u32) -> Vec<u32> {
+    fn finest(&self, resident: &[bool], layer: u32) -> Vec<u32> {
         let [cx, cy] = self.cells();
         let mut out = Vec::with_capacity((cx * cy) as usize);
         for y in 0..cy {
@@ -158,7 +158,7 @@ pub(crate) struct TexStream {
 /// The residency map of one layer from its finest resident mips: each cell takes the
 /// coarsest of itself and its eight neighbors, so filtering across a tile edge reads only
 /// resident tiles.
-pub(crate) fn dilate(finest: &[u32], [cx, cy]: [u32; 2]) -> Vec<u32> {
+fn dilate(finest: &[u32], [cx, cy]: [u32; 2]) -> Vec<u32> {
     let at = |x: u32, y: u32| finest[(y * cx + x) as usize];
     let mut out = Vec::with_capacity(finest.len());
     for y in 0..cy {

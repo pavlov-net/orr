@@ -171,17 +171,17 @@ pub struct MeshParts {
 
 /// A mesh ready to cook: one vertex array, index ranges per section.
 pub(crate) struct MeshData {
-    pub positions: Vec<[f32; 3]>,
-    pub normals: Vec<[f32; 3]>,
-    pub tangents: Option<Vec<[f32; 4]>>,
+    pub(crate) positions: Vec<[f32; 3]>,
+    pub(crate) normals: Vec<[f32; 3]>,
+    pub(crate) tangents: Option<Vec<[f32; 4]>>,
     /// Per uv set, one or two, a uv per vertex.
-    pub uvs: Vec<Vec<[f32; 2]>>,
-    pub indices: Vec<u32>,
-    pub sections: Vec<SectionData>,
-    pub skin: Option<Skin>,
-    pub parts: Option<PartData>,
+    pub(crate) uvs: Vec<Vec<[f32; 2]>>,
+    pub(crate) indices: Vec<u32>,
+    pub(crate) sections: Vec<SectionData>,
+    pub(crate) skin: Option<Skin>,
+    pub(crate) parts: Option<PartData>,
     /// The grid step may not be finer than `2^min_exponent` m (models joined crack-free).
-    pub min_exponent: Option<i8>,
+    pub(crate) min_exponent: Option<i8>,
 }
 
 /// The hash of a mesh with geometry hash `geometry` and these sections.
@@ -205,17 +205,17 @@ pub(crate) enum MeshSource {
     Lazy(LazyMesh),
 }
 
-pub(crate) type LoadMesh = dyn Fn(&Memo) -> Result<MeshData> + Send + Sync;
+type LoadMesh = dyn Fn(&Memo) -> Result<MeshData> + Send + Sync;
 
 /// A mesh read when its cook starts.
 pub(crate) struct LazyMesh {
     /// Sections of the mesh `load` returns; the plan sets their maps.
-    pub sections: Vec<SectionData>,
-    pub triangles: u64,
+    pub(crate) sections: Vec<SectionData>,
+    pub(crate) triangles: u64,
     /// Hash of everything `load` reads, besides the sections.
-    pub source: Hash32,
+    pub(crate) source: Hash32,
     /// Reads the mesh; its sections are left empty.
-    pub load: Arc<LoadMesh>,
+    pub(crate) load: Arc<LoadMesh>,
 }
 
 impl MeshSource {
@@ -282,18 +282,18 @@ impl MeshSource {
 
 /// Per vertex: four skeleton joints and their unorm8 weights, summing to 255.
 pub(crate) struct Skin {
-    pub joints: Vec<[u8; 4]>,
-    pub weights: Vec<[u8; 4]>,
+    pub(crate) joints: Vec<[u8; 4]>,
+    pub(crate) weights: Vec<[u8; 4]>,
 }
 
 /// Rigid parts from a per-vertex value.
 pub(crate) struct PartData {
-    pub values: Vec<u16>,
-    pub count: u16,
-    pub by_section: bool,
-    pub pivots: Pivots,
+    pub(crate) values: Vec<u16>,
+    pub(crate) count: u16,
+    pub(crate) by_section: bool,
+    pub(crate) pivots: Pivots,
     /// `Part::joint` per value; the value itself without it.
-    pub joints: Option<Vec<u16>>,
+    pub(crate) joints: Option<Vec<u16>>,
 }
 
 pub(crate) enum Pivots {
@@ -304,12 +304,12 @@ pub(crate) enum Pivots {
 
 #[derive(Clone)]
 pub(crate) struct SectionData {
-    pub indices: Range<usize>,
+    pub(crate) indices: Range<usize>,
     /// [`Section`] flags.
-    pub flags: u8,
+    pub(crate) flags: u8,
     /// The material scatters below the surface (not thin-walled, no transmission).
-    pub subsurface: bool,
-    pub maps: MapSpec,
+    pub(crate) subsurface: bool,
+    pub(crate) maps: MapSpec,
 }
 
 /// Whether material `m` binds a texture on uv set 1.
@@ -351,10 +351,10 @@ impl SectionData {
 /// The cooked textures a section's clusters depend on.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MapSpec {
-    pub opacity: OpacitySpec,
-    pub displacement: Option<DisplacementSpec>,
-    pub normal: NormalSpec,
-    pub uv1: bool,
+    pub(crate) opacity: OpacitySpec,
+    pub(crate) displacement: Option<DisplacementSpec>,
+    pub(crate) normal: NormalSpec,
+    pub(crate) uv1: bool,
 }
 
 /// What a section's material reads the vertex tangent for.
@@ -396,22 +396,22 @@ pub(crate) enum OpacitySpec {
 
 #[derive(Clone, Debug)]
 pub(crate) struct DisplacementSpec {
-    pub scale: f32,
-    pub offset: f32,
-    pub min: f32,
-    pub max: f32,
-    pub texture: Option<DisplacementTexture>,
+    pub(crate) scale: f32,
+    pub(crate) offset: f32,
+    pub(crate) min: f32,
+    pub(crate) max: f32,
+    pub(crate) texture: Option<DisplacementTexture>,
 }
 
 /// The cooked displacement texture: its unit, key and edge modes, and the uv transform and
 /// uv set it reads.
 #[derive(Clone, Debug)]
 pub(crate) struct DisplacementTexture {
-    pub unit: String,
-    pub key: Hash32,
-    pub wrap: [Wrap; 2],
-    pub uv: [f32; 6],
-    pub uv_set: usize,
+    pub(crate) unit: String,
+    pub(crate) key: Hash32,
+    pub(crate) wrap: [Wrap; 2],
+    pub(crate) uv: [f32; 6],
+    pub(crate) uv_set: usize,
 }
 
 impl MapSpec {
@@ -468,15 +468,15 @@ impl MapSpec {
 /// What a section's cluster build reads, resolved from its [`MapSpec`].
 #[derive(Default)]
 pub(crate) struct SectionMaps {
-    pub opacity: Option<Opacity>,
-    pub displacement: Option<Displacement>,
+    pub(crate) opacity: Option<Opacity>,
+    pub(crate) displacement: Option<Displacement>,
     /// Mip 0 of the [`NormalSpec::Texture`] map, stored x and y.
-    pub normal: Option<[Raster; 2]>,
+    pub(crate) normal: Option<[Raster; 2]>,
 }
 
 impl SectionMaps {
     /// Static displacement bakes this section into the geometry.
-    pub(crate) fn bakes(&self) -> bool {
+    fn bakes(&self) -> bool {
         self.displacement
             .as_ref()
             .is_some_and(|d| !d.mips.is_empty())
@@ -484,14 +484,14 @@ impl SectionMaps {
 }
 
 pub(crate) struct CookedMesh {
-    pub info: MeshInfo,
+    pub(crate) info: MeshInfo,
     /// Stored page blobs, in [`MeshInfo::pages`] order.
-    pub pages: Vec<Vec<u8>>,
+    pub(crate) pages: Vec<Vec<u8>>,
     /// Node page blobs, in [`MeshInfo::node_pages`] order; the first is the top page.
-    pub node_pages: Vec<Vec<u8>>,
-    pub warnings: Vec<String>,
+    pub(crate) node_pages: Vec<Vec<u8>>,
+    pub(crate) warnings: Vec<String>,
     /// The tangent check of a mesh with tangents.
-    pub tangents: Option<TangentCheck>,
+    pub(crate) tangents: Option<TangentCheck>,
 }
 
 pub(crate) fn cook(
@@ -1146,11 +1146,11 @@ pub(crate) fn grid_exponent(positions: &[[f32; 3]], step_log2: i8) -> i8 {
 }
 
 /// The mesh grid: every position as an integer multiple of `2^k` meters.
-pub(crate) struct Grid {
-    pub k: i8,
+struct Grid {
+    k: i8,
     truncate_bits: u8,
-    pub cells: Vec<[i32; 3]>,
-    pub floats: Vec<[f32; 3]>,
+    cells: Vec<[i32; 3]>,
+    floats: Vec<[f32; 3]>,
 }
 
 impl Grid {
@@ -1191,7 +1191,7 @@ impl Grid {
         })
     }
 
-    pub(crate) fn step(&self) -> f64 {
+    fn step(&self) -> f64 {
         2f64.powi(i32::from(self.k))
     }
 }
@@ -1421,7 +1421,7 @@ impl MeshData {
 
     /// Hash of everything the mesh cook reads but its settings and the cooked textures,
     /// which enter through their keys.
-    pub(crate) fn hash(&self) -> Hash32 {
+    fn hash(&self) -> Hash32 {
         let mut h = blake3::Hasher::new();
         let mut part = |b: &[u8]| {
             h.update(&(b.len() as u64).to_le_bytes());

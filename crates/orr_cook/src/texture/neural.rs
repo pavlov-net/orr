@@ -77,8 +77,8 @@ struct Member {
 
 /// A neural set to cook.
 pub(crate) struct NeuralJob {
-    pub name: String,
-    pub key: Hash32,
+    pub(crate) name: String,
+    pub(crate) key: Hash32,
     asset: String,
     members: Vec<Member>,
     size: [u32; 2],
@@ -99,7 +99,7 @@ fn channels(job: &TextureJob) -> Option<(u8, u8)> {
 
 /// The set of a material's textures (`jobs` in slot order, opacity left out); `None` when
 /// none can join.
-pub(crate) fn plan(
+pub(super) fn plan(
     asset: &str,
     suffix: &str,
     jobs: &[&TextureJob],
@@ -183,7 +183,7 @@ pub(crate) struct NeuralBuilt {
     info: NeuralInfo,
     weights: Vec<Vec<u8>>,
     latents: Built,
-    pub report: NeuralReport,
+    pub(crate) report: NeuralReport,
 }
 
 /// LibNTC compresses one set at a time on the GPU.
@@ -191,7 +191,7 @@ static GPU: Mutex<()> = Mutex::new(());
 
 impl NeuralJob {
     /// Ids of the member textures, which identify the set.
-    pub(crate) fn members(&self) -> Vec<AssetId> {
+    pub(super) fn members(&self) -> Vec<AssetId> {
         self.members
             .iter()
             .map(|m| AssetId::from_name(&m.job.name))
@@ -431,10 +431,10 @@ mod libntc {
     /// A texture's channels in the set.
     #[repr(C)]
     pub(super) struct Texture {
-        pub first_channel: i32,
-        pub channel_count: i32,
-        pub srgb: i32,
-        pub format: i32,
+        pub(super) first_channel: i32,
+        pub(super) channel_count: i32,
+        pub(super) srgb: i32,
+        pub(super) format: i32,
     }
 
     #[cfg_attr(
@@ -442,49 +442,49 @@ mod libntc {
         expect(dead_code, reason = "without LibNTC no set is planned")
     )]
     pub(super) struct Request<'a> {
-        pub size: [u32; 2],
-        pub channels: usize,
+        pub(super) size: [u32; 2],
+        pub(super) channels: usize,
         /// Per mip, texels of `channels` values, linear.
-        pub mips: &'a [Vec<f32>],
+        pub(super) mips: &'a [Vec<f32>],
         /// Per channel, whether the network stores it as sRGB.
-        pub srgb: &'a [bool],
-        pub textures: &'a [Texture],
-        pub target_psnr: f32,
-        pub max_bits_per_pixel: f32,
-        pub training_steps: u32,
-        pub seed: u32,
-        pub cuda_device: i32,
+        pub(super) srgb: &'a [bool],
+        pub(super) textures: &'a [Texture],
+        pub(super) target_psnr: f32,
+        pub(super) max_bits_per_pixel: f32,
+        pub(super) training_steps: u32,
+        pub(super) seed: u32,
+        pub(super) cuda_device: i32,
     }
 
     pub(super) struct Weights {
-        pub kind: u32,
-        pub data: Vec<u8>,
-        pub converted_bytes: u64,
-        pub constants: Vec<u8>,
+        pub(super) kind: u32,
+        pub(super) data: Vec<u8>,
+        pub(super) converted_bytes: u64,
+        pub(super) constants: Vec<u8>,
     }
 
     pub(super) struct Compressed {
-        pub latent_size: [u32; 2],
-        pub latent_features: u8,
+        pub(super) latent_size: [u32; 2],
+        pub(super) latent_features: u8,
         /// `latents[layer][mip]`, rows tight.
-        pub latents: Vec<Vec<Vec<u8>>>,
-        pub weights: Vec<Weights>,
+        pub(super) latents: Vec<Vec<Vec<u8>>>,
+        pub(super) weights: Vec<Weights>,
         /// Mip 0 output, `channels` values per texel, sRGB channels encoded.
-        pub decoded: Vec<f32>,
-        pub bits_per_pixel: f32,
-        pub psnr: f32,
-        pub runs: u32,
+        pub(super) decoded: Vec<f32>,
+        pub(super) bits_per_pixel: f32,
+        pub(super) psnr: f32,
+        pub(super) runs: u32,
     }
 
     /// The loaded library's versions.
     pub(super) struct Library {
         /// Major, minor, point.
-        pub version: [u16; 3],
-        pub interface: u32,
+        pub(super) version: [u16; 3],
+        pub(super) interface: u32,
         /// NTC file schema version of the build's checkout.
-        pub schema: u32,
+        pub(super) schema: u32,
         /// Library, interface and schema versions, for cook keys.
-        pub key: String,
+        pub(super) key: String,
     }
 
     #[cfg(feature = "ntc")]
@@ -606,16 +606,16 @@ mod libntc {
             let lib = unsafe { libloading::Library::new(&path) }.map_err(fail)?;
             let get = |name: &str| -> Result<*const c_void, String> {
                 // SAFETY: the symbol is only called through its declared signature.
-                unsafe { lib.get::<*const c_void>(name) }
+                unsafe { lib.get::<*const c_void>(name.as_bytes()) }
                     .map(|s| *s)
                     .map_err(fail)
             };
             // SAFETY: both are `extern "C"` functions of these signatures in ntc.h.
             let (iface, version) = unsafe {
                 let iface: libloading::Symbol<unsafe extern "C" fn() -> u32> =
-                    lib.get("GetInterfaceVersion").map_err(fail)?;
+                    lib.get(b"GetInterfaceVersion").map_err(fail)?;
                 let version: libloading::Symbol<unsafe extern "C" fn() -> VersionInfo> =
-                    lib.get("GetLibraryVersion").map_err(fail)?;
+                    lib.get(b"GetLibraryVersion").map_err(fail)?;
                 (iface(), version())
             };
             let built = env!("ORR_COOK_NTC_INTERFACE");

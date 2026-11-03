@@ -72,9 +72,9 @@ pub struct Cone {
 }
 
 /// `LightGpu::kind`.
-pub(crate) const LIGHT_DIRECTIONAL: u32 = 1;
-pub(crate) const LIGHT_SPHERE: u32 = 2;
-pub(crate) const LIGHT_RECT: u32 = 3;
+const LIGHT_DIRECTIONAL: u32 = 1;
+const LIGHT_SPHERE: u32 = 2;
+const LIGHT_RECT: u32 = 3;
 
 /// `EmissiveGpu::kind`.
 pub(crate) const EMISSIVE_INSTANCE: u32 = 1;

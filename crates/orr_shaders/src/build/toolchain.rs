@@ -9,7 +9,7 @@ use super::slang::Library;
 /// The compiler options every kernel is built with, in slangc's command-line form. The
 /// build hands them to the Slang library unchanged; per-module options (include roots,
 /// debug info, floating-point mode) follow them.
-pub const SLANGC_OPTIONS: &[&str] = &[
+pub(super) const SLANGC_OPTIONS: &[&str] = &[
     "-target",
     "spirv",
     "-profile",
@@ -35,7 +35,7 @@ pub const SLANGC_OPTIONS: &[&str] = &[
 /// directories from `CARGO_MANIFEST_DIR` upward are searched for
 /// `.tools/slang-2026.20/bin/slangc`, where `tools/fetch-slang.sh` puts it. The library is
 /// loaded from the same release: `bin/` on Windows, `lib/` elsewhere.
-pub(crate) fn load() -> Result<Arc<Library>, Error> {
+pub(super) fn load() -> Result<Arc<Library>, Error> {
     let start = env::var_os("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
         .ok_or(Error::NoManifestDir)?;
@@ -50,7 +50,7 @@ pub(crate) fn load() -> Result<Arc<Library>, Error> {
 }
 
 /// Loads the Slang library at `path` and checks that it is exactly [`SLANG_VERSION`].
-pub(crate) fn load_library(path: &Path) -> Result<Arc<Library>, Error> {
+pub(super) fn load_library(path: &Path) -> Result<Arc<Library>, Error> {
     let lib = Library::load(path).map_err(|source| Error::LibraryLoad {
         path: path.to_path_buf(),
         source,

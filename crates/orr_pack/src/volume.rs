@@ -45,7 +45,7 @@ pub const BRICK_TEXEL_COUNT: usize = (BRICK_TEXELS * BRICK_TEXELS * BRICK_TEXELS
 pub const MAJORANT_CELL: u32 = 4;
 
 /// Largest page.
-pub const PAGE_BYTES: usize = 64 << 10;
+const PAGE_BYTES: usize = 64 << 10;
 
 /// A slot table's entry for an absent brick.
 pub const NO_BRICK: u32 = u32::MAX;
@@ -205,7 +205,7 @@ impl VolumeGrid {
         })
     }
 
-    pub fn texel_bytes(&self) -> usize {
+    fn texel_bytes(&self) -> usize {
         if self.vk_format == vk::R8_UNORM { 1 } else { 2 }
     }
 
@@ -219,7 +219,7 @@ impl VolumeGrid {
     }
 
     /// The texel bits of `v`: the unorm byte, or the half's bits.
-    pub fn code(&self, v: f32) -> u16 {
+    fn code(&self, v: f32) -> u16 {
         if self.vk_format == vk::R8_UNORM {
             if self.scale == 0.0 {
                 return 0;
@@ -388,7 +388,7 @@ impl VolumeInfo {
     }
 
     /// The bricks of `grid`, in table order.
-    pub fn grid_bricks(&self, grid: usize) -> &[VolumeBrick] {
+    fn grid_bricks(&self, grid: usize) -> &[VolumeBrick] {
         let s = self.grids[grid].bricks;
         &self.bricks[s.first as usize..(s.first + s.count) as usize]
     }
@@ -426,7 +426,7 @@ impl VolumeInfo {
 
     /// The slot table of `grid`: per lattice brick, x fastest, its position among the
     /// grid's bricks or [`NO_BRICK`].
-    pub fn brick_slots(&self, grid: usize) -> Vec<u32> {
+    fn brick_slots(&self, grid: usize) -> Vec<u32> {
         let n = self.header.bricks.map(|b| b as usize);
         let mut slots = vec![NO_BRICK; n[0] * n[1] * n[2]];
         for (s, b) in self.grid_bricks(grid).iter().enumerate() {

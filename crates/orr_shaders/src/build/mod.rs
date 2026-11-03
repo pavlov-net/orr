@@ -22,10 +22,10 @@ pub use compile::{Build, DebugInfo, Output, reexport_types};
 pub use cpu::CpuLibrary;
 pub use link::LinkPoint;
 pub use lint::{Lint, LintError};
-pub use locate::SLANG_VERSION;
+use locate::SLANG_VERSION;
 #[cfg(feature = "hot-reload")]
 pub use reload::{Reload, Watcher};
-pub use toolchain::SLANGC_OPTIONS;
+use toolchain::SLANGC_OPTIONS;
 
 use std::path::{Path, PathBuf};
 use std::{env, io};
@@ -68,7 +68,7 @@ pub enum Error {
         path: PathBuf,
         source: libloading::Error,
     },
-    /// The Slang library reports a version other than [`SLANG_VERSION`].
+    /// The Slang library reports a version other than the one orr needs.
     #[error(
         "Slang library at {} is version {found:?}; orr needs exactly {SLANG_VERSION} (run tools/fetch-slang.sh or point ORR_SLANGC at a {SLANG_VERSION} release)",
         path.display()

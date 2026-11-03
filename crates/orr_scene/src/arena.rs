@@ -66,18 +66,18 @@ impl Span {
         Self { first, last }
     }
 
-    pub fn contains(&self, step: ViewStep) -> bool {
+    fn contains(&self, step: ViewStep) -> bool {
         self.first <= step && step <= self.last
     }
 
-    pub fn overlaps(&self, other: &Span) -> bool {
+    fn overlaps(&self, other: &Span) -> bool {
         self.first <= other.last && other.first <= self.last
     }
 }
 
 /// What a target is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ArenaKind {
+enum ArenaKind {
     /// Sampled through one view of every mip and, with `STORAGE` usage, written through a
     /// storage view per mip.
     Texture(TextureDesc),
@@ -88,9 +88,9 @@ pub enum ArenaKind {
 /// One target of a view's arena. Names are unique within an arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArenaRequest {
-    pub name: &'static str,
-    pub kind: ArenaKind,
-    pub span: Span,
+    name: &'static str,
+    kind: ArenaKind,
+    span: Span,
 }
 
 impl ArenaRequest {
@@ -102,7 +102,7 @@ impl ArenaRequest {
         }
     }
 
-    pub const fn buffer(name: &'static str, bytes: u64, span: Span) -> Self {
+    pub(crate) const fn buffer(name: &'static str, bytes: u64, span: Span) -> Self {
         Self {
             name,
             kind: ArenaKind::Buffer { bytes },
@@ -196,13 +196,13 @@ impl ArenaTexture {
 
 /// A buffer of a [`ViewArena`], checked like [`ArenaTexture`].
 #[derive(Clone)]
-pub struct ArenaBuffer {
+pub(crate) struct ArenaBuffer {
     gpu: GpuPtr<u8>,
     place: Place,
 }
 
 impl ArenaBuffer {
-    pub fn gpu<T>(&self) -> GpuPtr<T> {
+    pub(crate) fn gpu<T>(&self) -> GpuPtr<T> {
         self.place.check();
         self.gpu.cast()
     }
@@ -426,7 +426,7 @@ impl ViewArena {
     }
 
     /// The buffer `name`, if the layout holds one.
-    pub fn buffer(&self, name: &str) -> Option<&ArenaBuffer> {
+    pub(crate) fn buffer(&self, name: &str) -> Option<&ArenaBuffer> {
         self.entries.iter().find_map(|e| match &e.made {
             Made::Buffer(b) if e.request.name == name => Some(b),
             _ => None,

@@ -10,7 +10,7 @@ use crate::Result;
 use crate::shaders::exposure::local_grid::{self, Root};
 
 /// Pixels across a grid cell (`LOCAL_CELL` in `exposure.slang`).
-pub(crate) const LOCAL_CELL: u32 = 32;
+const LOCAL_CELL: u32 = 32;
 /// Bins per cell (`LOCAL_BINS` in `exposure.slang`).
 pub(crate) const LOCAL_BINS: u32 = 16;
 /// Threads per group of the grid's kernels (`GROUP` in `local_grid.slang`).

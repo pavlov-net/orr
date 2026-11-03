@@ -35,7 +35,7 @@ pub const OMM_STATE_UNKNOWN_TRANSPARENT: u8 = 2;
 pub const OMM_STATE_UNKNOWN_OPAQUE: u8 = 3;
 
 /// Highest subdivision level a page may hold.
-pub const OMM_MAX_LEVEL: u16 = 12;
+const OMM_MAX_LEVEL: u16 = 12;
 
 /// One micromap of a page, laid out as `VkMicromapTriangleEXT`.
 #[repr(C)]
@@ -54,7 +54,7 @@ impl MicromapEntry {
 }
 
 /// Bytes of one 4-state micromap at `level`: 2 bits for each of its `4^level` micro-triangles.
-pub fn micromap_len(level: u16) -> usize {
+fn micromap_len(level: u16) -> usize {
     (1usize << (2 * level)).div_ceil(4)
 }
 

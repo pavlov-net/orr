@@ -12,9 +12,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 /// A sphere and the simplification error of the geometry it bounds.
 #[derive(Copy, Clone)]
 pub(crate) struct Bounds {
-    pub center: [f32; 3],
-    pub radius: f32,
-    pub error: f32,
+    pub(super) center: [f32; 3],
+    pub(super) radius: f32,
+    pub(super) error: f32,
 }
 
 /// One cluster: its corners in `indices[index_offset..][..index_count]`.
@@ -23,22 +23,22 @@ pub(crate) struct Cluster {
     index_offset: usize,
     index_count: usize,
     /// The group whose simplification made it, or -1.
-    pub refined: i32,
+    pub(super) refined: i32,
     bounds: Bounds,
 }
 
 impl Cluster {
-    pub(crate) fn corners<'a>(&self, indices: &'a [u32]) -> &'a [u32] {
+    pub(super) fn corners<'a>(&self, indices: &'a [u32]) -> &'a [u32] {
         &indices[self.index_offset..self.index_offset + self.index_count]
     }
 }
 
 /// The mesh `build` reads besides its positions: 3 floats of attributes per vertex.
-pub(crate) struct Mesh<'a> {
-    pub indices: &'a [u32],
-    pub attributes: &'a [f32],
-    pub weights: &'a [f32],
-    pub lock: &'a [u8],
+pub(super) struct Mesh<'a> {
+    pub(super) indices: &'a [u32],
+    pub(super) attributes: &'a [f32],
+    pub(crate) weights: &'a [f32],
+    pub(super) lock: &'a [u8],
 }
 
 /// Positions that groups of one level write at disjoint unlocked vertices.
@@ -505,17 +505,17 @@ fn dilate_borders(
 
 /// What a group's emission gets: its depth and bounds, its clusters, their corners and
 /// the positions as they are when it is emitted.
-pub(crate) struct Emitted<'a> {
-    pub depth: u32,
-    pub bounds: Bounds,
-    pub clusters: &'a [Cluster],
-    pub indices: &'a [u32],
-    pub positions: &'a [f32],
+pub(super) struct Emitted<'a> {
+    pub(super) depth: u32,
+    pub(crate) bounds: Bounds,
+    pub(crate) clusters: &'a [Cluster],
+    pub(super) indices: &'a [u32],
+    pub(super) positions: &'a [f32],
 }
 
 /// Builds the DAG of `mesh` under `c`, calling `emit` once per group with its index fixed
 /// by emission order, and returns the emitted values in that order.
-pub(crate) fn build<G: Send>(
+pub(super) fn build<G: Send>(
     c: &ffi::clodConfig,
     mesh: Mesh<'_>,
     positions: &mut [f32],

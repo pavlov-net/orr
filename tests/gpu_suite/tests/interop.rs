@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use ash::vk;
 use gpu_suite::shaders::heap_views;
 use gpu_suite::{assert_clean, device, log_to_stderr, pipeline, readback, render, run, upload};
-use orr_gpu::vulkan::{self, Features, RawDevice};
+use orr_gpu::interop::{self, Features, RawDevice};
 use orr_gpu::{
     Device, DeviceDesc, DeviceHooks, Filter, Format, Hazards, SamplerDesc, SamplerIndex, Stages,
     TextureDesc, TextureMemory, TextureUsage, ViewDesc,
@@ -58,9 +58,9 @@ fn heap_commands_after_raw_commands() {
     let sample = pipeline(&heap_views::MODULE, "sample_main");
     let groups = [w.div_ceil(8), h.div_ceil(4), 1];
     let value = [0.25, -2.0, 7.5, 1.0];
-    let handles = vulkan::image_handles(&tex).unwrap();
+    let handles = interop::image_handles(&tex).unwrap();
     assert_eq!(
-        vulkan::image_handles(&tex).unwrap().view,
+        interop::image_handles(&tex).unwrap().view,
         handles.view,
         "the view is made once"
     );

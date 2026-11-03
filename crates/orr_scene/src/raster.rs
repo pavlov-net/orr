@@ -73,7 +73,7 @@ pub(crate) struct RasterPipelines {
     reduce: PipelineId,
     depth: MeshPipeline,
     /// Surface bins: linked surfaces plus `StandardSurface`.
-    pub bins: u32,
+    pub(crate) bins: u32,
 }
 
 impl RasterPipelines {
@@ -162,9 +162,9 @@ impl RasterPipelines {
 /// A per-view texture kept between frames, with a sampled view and, unless it is the depth
 /// target, storage views of each mip.
 pub(crate) struct Target {
-    pub texture: Arc<Texture>,
-    pub sampled: TextureIndex,
-    pub storage: Vec<StorageImageIndex>,
+    pub(crate) texture: Arc<Texture>,
+    pub(crate) sampled: TextureIndex,
+    storage: Vec<StorageImageIndex>,
     device: Device,
 }
 
@@ -214,13 +214,13 @@ impl Drop for Target {
 /// Sizes of a view's raster buffers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TargetSizes {
-    pub extent: [u32; 2],
-    pub extended: bool,
-    pub visible_clusters: u32,
-    pub work: u32,
-    pub bins: u32,
+    pub(crate) extent: [u32; 2],
+    pub(crate) extended: bool,
+    pub(crate) visible_clusters: u32,
+    pub(crate) work: u32,
+    pub(crate) bins: u32,
     /// The scene's instance slots.
-    pub slots: u32,
+    pub(crate) slots: u32,
 }
 
 /// Arena names of the raster's transient targets.
@@ -304,16 +304,16 @@ impl Transient {
 /// One view history's raster targets, kept while its extent and sizes hold: the ones read
 /// after the view's render or by its next frame, and the transient ones of its arena.
 pub(crate) struct ViewTargets {
-    pub sizes: TargetSizes,
+    pub(crate) sizes: TargetSizes,
     slot_visibility: Allocation<u32>,
     /// Workgroup args (`ARGS`), then counts.
     args: Allocation<u32>,
-    pub depth: Target,
-    pub motion: Target,
-    pub hzb: Target,
+    pub(crate) depth: Target,
+    pub(crate) motion: Target,
+    pub(crate) hzb: Target,
     transient: Transient,
     /// The scene and output extent the HZB holds the last render of.
-    pub hzb_view: Option<(SceneId, [u32; 2])>,
+    pub(crate) hzb_view: Option<(SceneId, [u32; 2])>,
 }
 
 fn tiles(extent: [u32; 2]) -> [u32; 2] {

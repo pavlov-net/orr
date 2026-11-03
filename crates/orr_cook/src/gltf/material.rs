@@ -57,7 +57,7 @@ fn extension<'a>(json: &'a Value, m: &gltf::Material<'_>, name: &str) -> Option<
     raw(json, m)?["extensions"].get(name)
 }
 
-pub(crate) fn material(json: &Value, m: &gltf::Material<'_>) -> Material {
+pub(super) fn material(json: &Value, m: &gltf::Material<'_>) -> Material {
     let ext = |name| extension(json, m, name);
     let pbr = m.pbr_metallic_roughness();
     let [r, g, b, a] = pbr.base_color_factor();
@@ -183,7 +183,7 @@ fn uv_transform(info: &Value) -> ([f32; 6], u32) {
     (uv, coord(t).or(coord(info)).unwrap_or(0))
 }
 
-pub(crate) fn textures(
+pub(super) fn textures(
     doc: &gltf::Document,
     json: &Value,
     m: &gltf::Material<'_>,

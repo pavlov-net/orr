@@ -127,7 +127,7 @@ const TOKEN_RULES: &[TokenRule] = &[
 ];
 
 /// Identifiers with their line and whether `(` follows, outside comments and strings.
-pub(crate) fn tokens(src: &str) -> Vec<(&str, u32, bool)> {
+pub(super) fn tokens(src: &str) -> Vec<(&str, u32, bool)> {
     let b = src.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -176,7 +176,7 @@ pub(crate) fn tokens(src: &str) -> Vec<(&str, u32, bool)> {
 }
 
 /// Token lints over one source file.
-pub(crate) fn source_lints(path: &Path, src: &str, lib_dir: &Path) -> Vec<LintError> {
+pub(super) fn source_lints(path: &Path, src: &str, lib_dir: &Path) -> Vec<LintError> {
     let mut out = Vec::new();
     for (token, line, call) in tokens(src) {
         for rule in TOKEN_RULES {
@@ -218,7 +218,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 /// Lints read from a compiled module's model and the generated layout.
-pub(crate) fn model_lints(
+pub(super) fn model_lints(
     module: &str,
     model: &Model,
     plans: &HashMap<String, Plan>,
@@ -371,7 +371,7 @@ fn describe(ty: &Ty) -> String {
 }
 
 /// Top-level import names (files and directories holding Slang) of each root.
-pub(crate) fn duplicate_imports(roots: &[PathBuf]) -> Vec<LintError> {
+pub(super) fn duplicate_imports(roots: &[PathBuf]) -> Vec<LintError> {
     let mut seen: BTreeMap<String, &Path> = BTreeMap::new();
     let mut out = Vec::new();
     for root in roots {

@@ -60,7 +60,7 @@ const UV: c_int = 6;
 /// Points as stencils over the cage: point `i` is the sum of `weights[t] x cage[indices[t]]`
 /// for `t` in `offsets[i]..offsets[i + 1]`. The first points are the cage's own.
 pub(super) struct Stencils {
-    pub(super) offsets: Vec<u32>,
+    offsets: Vec<u32>,
     pub(super) indices: Vec<u32>,
     pub(super) weights: Vec<f32>,
 }
@@ -252,7 +252,7 @@ pub(super) fn refine(cage: &CageInput, settings: &SubdSettings) -> Result<Refine
 
 /// Limit positions and uvs.
 #[cfg(test)]
-pub(super) type Samples = (Vec<[f32; 3]>, Vec<[f32; 2]>);
+type Samples = (Vec<[f32; 3]>, Vec<[f32; 2]>);
 
 /// OpenSubdiv's own limit positions and uvs at ptex locations `(face, s, t)`.
 #[cfg(test)]

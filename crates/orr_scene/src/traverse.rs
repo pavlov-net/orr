@@ -118,13 +118,13 @@ impl CutStats {
 /// with the projected error in pixels it would refine.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PageFeedback {
-    pub mesh: u32,
-    pub page: u32,
-    pub mesh_page: bool,
+    pub(crate) mesh: u32,
+    pub(crate) page: u32,
+    pub(crate) mesh_page: bool,
     /// `page` is a finer cached cut of a streaming mesh.
-    pub cut: bool,
-    pub request: bool,
-    pub error: f32,
+    pub(crate) cut: bool,
+    pub(crate) request: bool,
+    pub(crate) error: f32,
 }
 
 pub(crate) struct CutPipelines {
@@ -170,12 +170,12 @@ impl CutPipelines {
 /// Capacities of a scene's cut tables.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CutSizes {
-    pub slots: u32,
-    pub queue: u32,
-    pub candidates: u32,
-    pub rt_clusters: u32,
-    pub rt_blas: u32,
-    pub models: u32,
+    pub(crate) slots: u32,
+    pub(crate) queue: u32,
+    pub(crate) candidates: u32,
+    pub(crate) rt_clusters: u32,
+    pub(crate) rt_blas: u32,
+    pub(crate) models: u32,
 }
 
 impl CutSizes {
@@ -217,23 +217,23 @@ pub(crate) struct Cuts {
 
 /// What one frame's traversal of a scene reads.
 pub(crate) struct CutInputs {
-    pub scene: GpuPtr<SceneRoot>,
-    pub focus: Option<([i32; 4], [f32; 4])>,
-    pub raster_pixels: f32,
-    pub rt_pixels: f32,
-    pub culled_scale: f32,
-    pub merge_pixels: f32,
-    pub slots: u32,
+    pub(crate) scene: GpuPtr<SceneRoot>,
+    pub(crate) focus: Option<([i32; 4], [f32; 4])>,
+    pub(crate) raster_pixels: f32,
+    pub(crate) rt_pixels: f32,
+    pub(crate) culled_scale: f32,
+    pub(crate) merge_pixels: f32,
+    pub(crate) slots: u32,
     /// Passes of one traversal: the deepest resident hierarchy's levels.
-    pub passes: u32,
+    pub(crate) passes: u32,
     /// A resident mesh has a paged hierarchy: the second traversal runs.
-    pub paged: bool,
+    pub(crate) paged: bool,
     /// CLAS in the largest cut a mesh can trace.
-    pub max_clas: u32,
+    pub(crate) max_clas: u32,
     /// A copy of an edit may gather one BLAS per animated part.
-    pub parted_edits: bool,
+    pub(crate) parted_edits: bool,
     /// The frame's readback slot.
-    pub slot: usize,
+    pub(crate) slot: usize,
 }
 
 impl Cuts {

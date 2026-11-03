@@ -165,7 +165,7 @@ impl DisplayRequest {
         }
     }
 
-    pub fn present_mode(&self) -> PresentMode {
+    pub(crate) fn present_mode(&self) -> PresentMode {
         if self.vsync {
             PresentMode::Fifo
         } else {
@@ -177,7 +177,7 @@ impl DisplayRequest {
 impl ResolvedDisplay {
     /// Mastering metadata for HDR encodings: Rec.2020 primaries, D65, the resolved peak and
     /// black, MaxCLL at the resolved peak, MaxFALL unknown. `None` for SDR.
-    pub fn hdr_metadata(&self) -> Option<HdrMetadata> {
+    pub(crate) fn hdr_metadata(&self) -> Option<HdrMetadata> {
         let p = RgbPrimaries::REC2020;
         (self.encoding != OutputFormat::Sdr).then_some(HdrMetadata {
             primaries: [p.red, p.green, p.blue].map(Into::into),

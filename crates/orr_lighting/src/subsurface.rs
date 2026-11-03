@@ -24,7 +24,7 @@ pub const SSS_STEPS: std::ops::RangeInclusive<u32> =
     CAP_TAIL_CAPS[0]..=CAP_TAIL_CAPS[CAP_TAIL_CAPS.len() - 1];
 
 /// The subsurface walk's cap tail table on the GPU, which every walk reads through
-/// [`PathRoot::cap_tail`](crate::PathRoot::cap_tail): what a walk stopped at its step cap
+/// [`PathRoot::cap_tail`](crate::types::PathRoot::cap_tail): what a walk stopped at its step cap
 /// would yet carry out, by single-scattering albedo, anisotropy, cap and the IOR of the
 /// surface it meets.
 pub struct CapTailTable {
@@ -59,7 +59,7 @@ impl CapTailTable {
         })
     }
 
-    /// The table's header, for [`PathRoot::cap_tail`](crate::PathRoot::cap_tail).
+    /// The table's header, for [`PathRoot::cap_tail`](crate::types::PathRoot::cap_tail).
     pub fn gpu(&self) -> GpuPtr<CapTail> {
         self.header.gpu()
     }

@@ -61,7 +61,7 @@ pub struct DepthOfFieldPass<'a> {
     /// read.
     pub render_extent: [u32; 2],
     /// With `PostQuality::dof_ray_hole_fill`: lighting's background layer this frame, traced
-    /// from the [`DofHoleMask`] the view returned before it (`LightingView::dof_background`).
+    /// from the [`DofHoleMask`] the view returned before it (`LightingView::dof_background_index`).
     /// `None`, and any layer in the frame after a history reset, leaves the mirrored fill.
     pub background: Option<TextureIndex>,
 }
@@ -316,11 +316,11 @@ fn tiles(half: [u32; 2]) -> [u32; 2] {
 /// The guide path's render-resolution images.
 pub(crate) struct GuideTargets {
     pub(crate) color: Image,
-    pub(crate) guide: Image,
+    guide: Image,
 }
 
 /// Ray-traced hole filling's images, while `PostQuality::dof_ray_hole_fill` is on.
-pub(crate) struct HoleTargets {
+struct HoleTargets {
     /// R16F at the render extent: [`DofHoleMask::mask`].
     mask: Image,
     /// Half resolution: lighting's background layer accumulated, RGB radiance and A its
@@ -373,7 +373,7 @@ pub(crate) struct DofTargets {
     path: DofPath,
     extent: [u32; 2],
     half: [u32; 2],
-    pub(crate) fresh: bool,
+    fresh: bool,
     device: Device,
 }
 

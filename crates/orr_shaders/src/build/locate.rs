@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 /// The Slang release orr builds with. The check is exact: precompiled Slang modules load
 /// only in the compiler version that wrote them.
-pub const SLANG_VERSION: &str = "2026.20";
+pub(crate) const SLANG_VERSION: &str = "2026.20";
 
 pub(crate) enum Missing {
     /// `ORR_SLANGC` is set but is not the absolute path of an existing file.

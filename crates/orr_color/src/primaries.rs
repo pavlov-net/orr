@@ -113,16 +113,6 @@ impl Primaries {
         self as u8
     }
 
-    /// The primaries of a stored id, or `None` for an unknown id.
-    pub const fn from_id(id: u8) -> Option<Self> {
-        match id {
-            0 => Some(Self::Rec709),
-            1 => Some(Self::DisplayP3),
-            2 => Some(Self::Rec2020),
-            _ => None,
-        }
-    }
-
     /// The chromaticities of these primaries.
     pub const fn rgb(self) -> RgbPrimaries {
         match self {

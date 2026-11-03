@@ -11,9 +11,10 @@ use orr_scene::orr_gpu::{
 use orr_scene::{Glare, ViewConstants};
 
 use crate::fft_glare::FftGlareTargets;
+use crate::gt7::GT7_SDR_NITS;
 use crate::passes::groups;
 use crate::shaders::post::glare::{self, Root};
-use crate::{GT7_SDR_NITS, Image, ResolvedDisplay, Result, ViewOutput};
+use crate::{Image, ResolvedDisplay, Result, ViewOutput};
 
 include!(concat!(env!("OUT_DIR"), "/glare_tables.rs"));
 

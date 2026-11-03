@@ -29,7 +29,7 @@ const PTLAS_ALIGN: u32 = 256;
 /// moved object plus 16, past the end of a smaller block into whatever follows it.
 const MOVE_SCRATCH_PER_OBJECT: u64 = 32;
 
-pub(crate) fn cluster_caps(
+pub(super) fn cluster_caps(
     p: &vk::PhysicalDeviceClusterAccelerationStructurePropertiesNV<'_>,
     pt: &vk::PhysicalDevicePartitionedAccelerationStructurePropertiesNV<'_>,
     omm: bool,
@@ -386,9 +386,9 @@ impl CommandList<'_> {
 
 /// The debug PTLAS check: its pipeline and the count of rejected builds the GPU adds to.
 /// Destroyed with the device.
-pub(crate) struct RtasCheck {
-    pub pipeline: vk::Pipeline,
-    pub failures: RawBuffer,
+pub(super) struct RtasCheck {
+    pub(super) pipeline: vk::Pipeline,
+    pub(super) failures: RawBuffer,
     counter: NonNull<u32>,
     reported: AtomicU32,
 }
@@ -450,7 +450,7 @@ impl RtasCheck {
     }
 
     /// Rejected builds so far; logs the ones not reported before.
-    pub(crate) fn failures(&self) -> u32 {
+    pub(super) fn failures(&self) -> u32 {
         // SAFETY: the mapping lives as long as `self`; the GPU only adds to it.
         let n = unsafe { self.counter.as_ptr().read_volatile() };
         let before = self.reported.swap(n, Ordering::Relaxed);

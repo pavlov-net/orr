@@ -201,13 +201,13 @@ impl Build {
     }
 
     /// Publishes this crate's Rust types for its Slang structs to dependents, which read
-    /// them with [`types`](Self::types). `crate_path` names the crate as dependents do
-    /// (`::my_crate`): the generated structs must be re-exported at its root, and an
-    /// `extern_type` path starting with `crate::` is published under it. Mapped types from
+    /// them with [`types`](Self::types). `path` names the module dependents find them in
+    /// (`::my_crate::types`): the generated structs must be re-exported there, as must every
+    /// `extern_type` path starting with `crate::`, which is published under it. Mapped types from
     /// [`types`](Self::types) are published too, so a dependent of this crate needs no
     /// other map.
-    pub fn publish_types(mut self, crate_path: &str) -> Self {
-        self.publish_types = Some(crate_path.trim_end_matches("::").to_owned());
+    pub fn publish_types(mut self, path: &str) -> Self {
+        self.publish_types = Some(path.trim_end_matches("::").to_owned());
         self
     }
 
@@ -585,13 +585,13 @@ impl Build {
         )?;
 
         let types_path = match &self.publish_types {
-            Some(crate_path) => {
+            Some(module) => {
                 let mut published: BTreeMap<String, String> = self
                     .externs
                     .iter()
                     .map(|(slang, rust)| {
                         let rust = match rust.strip_prefix("crate::") {
-                            Some(rest) => format!("{crate_path}::{rest}"),
+                            Some(rest) => format!("{module}::{rest}"),
                             None => rust.clone(),
                         };
                         (slang.clone(), rust)
@@ -600,7 +600,7 @@ impl Build {
                 for slang in shared.types.keys() {
                     published.insert(
                         slang.clone(),
-                        format!("{crate_path}::{}", codegen::rust_name(slang)),
+                        format!("{module}::{}", codegen::rust_name(slang)),
                     );
                 }
                 let path = out_dir.join("types.json");
@@ -824,15 +824,15 @@ pub(super) struct ManifestModule {
     pub(super) kernel: PathBuf,
     /// Compiled with this build's linked types; goes into `KERNELS`.
     pub(super) linked: bool,
-    pub(super) spv: PathBuf,
+    spv: PathBuf,
     /// The separated debug info of `spv`.
-    pub(super) debug_info: Option<PathBuf>,
+    debug_info: Option<PathBuf>,
     pub(super) hash: u64,
     pub(super) inputs: Vec<PathBuf>,
     /// The generated link modules composed with the kernel.
     pub(super) links: Vec<LinkFile>,
     /// The library modules the compile loaded precompiled, by import name.
-    pub(super) precompiled: Vec<String>,
+    precompiled: Vec<String>,
 }
 
 /// A generated link module as the manifest lists it.
@@ -1233,12 +1233,12 @@ pub(super) struct Compiled {
     /// With separated debug info: stripped, its strings restored.
     pub(super) words: Vec<u32>,
     /// The separated debug info, when `settings.separate_debug` is set.
-    pub(super) debug: Option<Vec<u32>>,
+    debug: Option<Vec<u32>>,
     pub(super) model: Model,
     /// Every file the kernel and its link modules read.
     pub(super) inputs: Vec<PathBuf>,
     /// The library modules loaded precompiled.
-    pub(super) precompiled: Vec<String>,
+    precompiled: Vec<String>,
 }
 
 /// Compiles `unit` in `session`, which holds `settings.options`, and reads its model.
@@ -1472,20 +1472,20 @@ fn write_types(path: &Path, types: &BTreeMap<String, String>) -> Result<(), Erro
     )
 }
 
-/// Republishes the types of a dependency this crate re-exports: every `types.json` in
-/// `list` (a `DEP_*_TYPES` value), with each Rust path under `from` (`::dep`) moved to
-/// `to` (`::my_crate::dep`), merged into `OUT_DIR/types.json` and printed as
-/// `cargo:types`.
-pub fn reexport_types(list: &str, from: &str, to: &str) -> Result<PathBuf, Error> {
-    let (from, to) = (from.trim_end_matches("::"), to.trim_end_matches("::"));
+/// Republishes the types of dependencies this crate re-exports: every `types.json` in
+/// `list` (`DEP_*_TYPES` values joined by `;`), with each Rust path under a `moves` entry's
+/// first path (`::dep`) moved to its second (`::my_crate::dep`), merged into
+/// `OUT_DIR/types.json` and printed as `cargo:types`.
+pub fn reexport_types(list: &str, moves: &[(&str, &str)]) -> Result<PathBuf, Error> {
     let mut merged = BTreeMap::new();
     for path in list.split(';').filter(|s| !s.is_empty()).map(Path::new) {
         for (slang, rust) in read_types(path)? {
-            let rust = match rust.strip_prefix(from) {
-                Some(rest) if rest.starts_with("::") => format!("{to}{rest}"),
-                _ => rust,
-            };
-            merged.insert(slang, rust);
+            let moved = moves.iter().find_map(|(from, to)| {
+                let rest = rust.strip_prefix(from.trim_end_matches("::"))?;
+                rest.starts_with("::")
+                    .then(|| format!("{}{rest}", to.trim_end_matches("::")))
+            });
+            merged.insert(slang, moved.unwrap_or(rust));
         }
         #[allow(clippy::print_stdout)]
         {

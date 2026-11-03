@@ -252,13 +252,13 @@ pub struct RasterView {
 }
 
 pub(crate) struct ViewHistory {
-    pub exposure: Allocation<ExposureState>,
+    pub(crate) exposure: Allocation<ExposureState>,
     /// The exposure slot the view's next render reads.
     slot: u32,
     previous: Option<ViewDesc>,
-    pub targets: Option<ViewTargets>,
+    pub(crate) targets: Option<ViewTargets>,
     /// The transient targets of the view's render, orr_scene's and the later passes'.
-    pub arena: ViewArena,
+    pub(crate) arena: ViewArena,
 }
 
 impl ViewHistory {
@@ -274,14 +274,14 @@ impl ViewHistory {
 }
 
 /// `clip_from_view` for Vulkan clip space: reverse Z, infinite far, y down.
-pub(crate) fn clip_from_view(p: &Projection, extent: UVec2) -> Mat4 {
+fn clip_from_view(p: &Projection, extent: UVec2) -> Mat4 {
     let aspect = extent.x as f32 / extent.y.max(1) as f32;
     vulkan::perspective_infinite_reverse(p.fov_y, aspect, p.near)
 }
 
 /// Shifts the image by `jitter` render pixels, so each sample lands at its pixel center
 /// minus the jitter.
-pub(crate) fn jittered(clip_from_view: Mat4, jitter: Vec2, extent: UVec2) -> Mat4 {
+fn jittered(clip_from_view: Mat4, jitter: Vec2, extent: UVec2) -> Mat4 {
     let ndc = jitter * 2.0 / extent.as_vec2();
     let mut shift = Mat4::IDENTITY;
     shift.w_axis = Vec4::new(ndc.x, ndc.y, 0.0, 1.0);

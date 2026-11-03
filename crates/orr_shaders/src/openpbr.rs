@@ -17,16 +17,6 @@ pub enum LutFormat {
     Rgba32Float,
 }
 
-impl LutFormat {
-    /// Bytes per texel.
-    pub const fn texel_size(self) -> usize {
-        match self {
-            Self::R16Unorm => 2,
-            Self::Rgba32Float => 16,
-        }
-    }
-}
-
 /// One table: texels in x-fastest order, little-endian.
 #[derive(Clone, Copy, Debug)]
 pub struct Lut {

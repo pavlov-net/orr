@@ -82,99 +82,99 @@ impl Default for DeviceDesc<'_> {
 /// State every object of one device shares. Objects hold it through an `Arc`, so it is
 /// destroyed after the last of them.
 pub(crate) struct Shared {
-    pub entry: ash::Entry,
-    pub instance: ash::Instance,
-    pub physical: vk::PhysicalDevice,
-    pub device: ash::Device,
-    pub heap_fn: ash::ext::descriptor_heap::Device,
-    pub accel_fn: ash::khr::acceleration_structure::Device,
-    pub cluster_fn: ash::nv::cluster_acceleration_structure::Device,
-    pub ptlas_fn: ash::nv::partitioned_acceleration_structure::Device,
+    pub(super) entry: ash::Entry,
+    pub(super) instance: ash::Instance,
+    pub(super) physical: vk::PhysicalDevice,
+    pub(super) device: ash::Device,
+    pub(super) heap_fn: ash::ext::descriptor_heap::Device,
+    pub(super) accel_fn: ash::khr::acceleration_structure::Device,
+    pub(super) cluster_fn: ash::nv::cluster_acceleration_structure::Device,
+    pub(super) ptlas_fn: ash::nv::partitioned_acceleration_structure::Device,
     /// With `Caps::device_address_commands`.
-    pub dac_fn: Option<ash::khr::device_address_commands::Device>,
+    pub(super) dac_fn: Option<ash::khr::device_address_commands::Device>,
     /// With `Caps::indirect_copy`.
-    pub indirect_copy_fn: Option<ash::khr::copy_memory_indirect::Device>,
+    pub(super) indirect_copy_fn: Option<ash::khr::copy_memory_indirect::Device>,
     /// With `Caps::memory_decompression`.
-    pub decompress_fn: Option<ash::ext::memory_decompression::Device>,
+    pub(super) decompress_fn: Option<ash::ext::memory_decompression::Device>,
     /// With cooperative vectors (`Caps::cooperative_vector` not empty).
-    pub coop_fn: Option<ash::nv::cooperative_vector::Device>,
+    pub(super) coop_fn: Option<ash::nv::cooperative_vector::Device>,
     /// With `Caps::occupancy_priority`.
-    pub occupancy_fn: Option<ash::nv::compute_occupancy_priority::Device>,
+    pub(super) occupancy_fn: Option<ash::nv::compute_occupancy_priority::Device>,
     /// With `Caps::generated_commands`.
-    pub generated_fn: Option<ash::ext::device_generated_commands::Device>,
-    pub mesh_fn: ash::ext::mesh_shader::Device,
-    pub rt_fn: Option<ash::khr::ray_tracing_pipeline::Device>,
-    pub debug_fn: ash::ext::debug_utils::Device,
-    pub calibrated_fn: Option<ash::khr::calibrated_timestamps::Device>,
-    pub exec_fn: Option<ash::khr::pipeline_executable_properties::Device>,
+    pub(super) generated_fn: Option<ash::ext::device_generated_commands::Device>,
+    pub(super) mesh_fn: ash::ext::mesh_shader::Device,
+    pub(super) rt_fn: Option<ash::khr::ray_tracing_pipeline::Device>,
+    pub(super) debug_fn: ash::ext::debug_utils::Device,
+    pub(super) calibrated_fn: Option<ash::khr::calibrated_timestamps::Device>,
+    pub(super) exec_fn: Option<ash::khr::pipeline_executable_properties::Device>,
     /// On devices with the Present queue.
-    pub present_fn: Option<PresentFns>,
+    pub(super) present_fn: Option<PresentFns>,
     messenger: (ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT),
     messages: Box<MessageCount>,
-    pub caps: Caps,
-    pub pipeline_cache: PipelineCache,
-    pub heap_props: vk::PhysicalDeviceDescriptorHeapPropertiesEXT<'static>,
-    pub as_scratch_align: u32,
-    pub memory: MemoryTypes,
+    pub(super) caps: Caps,
+    pub(super) pipeline_cache: PipelineCache,
+    pub(super) heap_props: vk::PhysicalDeviceDescriptorHeapPropertiesEXT<'static>,
+    pub(super) as_scratch_align: u32,
+    pub(super) memory: MemoryTypes,
     /// The allocator and its pools; dropped in `Drop` before the device.
-    pub pools: ManuallyDrop<Pools>,
+    pub(super) pools: ManuallyDrop<Pools>,
     /// Distinct queue families of the created queues; buffers and images share across them.
-    pub families: Vec<u32>,
-    pub timelines: [Option<Timeline>; MAX_TIMELINES],
+    pub(super) families: Vec<u32>,
+    pub(super) timelines: [Option<Timeline>; MAX_TIMELINES],
     heaps: OnceLock<Heaps>,
     /// Raygen shader-table records; with `Caps::ray_dispatch` only.
-    pub records: OnceLock<RecordBlock>,
+    pub(super) records: OnceLock<RecordBlock>,
     empty_tlas: OnceLock<EmptyTlas>,
     /// The debug PTLAS check, created by the first PTLAS build of a debug build.
-    pub rtas_check: OnceLock<RtasCheck>,
+    pub(super) rtas_check: OnceLock<RtasCheck>,
     /// `gpu_malloc` and sparse buffers by start address.
-    pub buffers: RwLock<BTreeMap<u64, Range>>,
+    pub(super) buffers: RwLock<BTreeMap<u64, Range>>,
     /// The most recently freed ranges, oldest first.
-    pub freed: Mutex<VecDeque<(u64, Range)>>,
-    pub usage: Usage,
+    pub(super) freed: Mutex<VecDeque<(u64, Range)>>,
+    pub(super) usage: Usage,
     /// Usage of every `gpu_malloc` buffer.
-    pub buffer_usage: vk::BufferUsageFlags,
-    pub garbage: Mutex<Garbage>,
-    pub results: Mutex<VecDeque<(TimelinePoint, Vec<PassResult>)>>,
+    pub(super) buffer_usage: vk::BufferUsageFlags,
+    pub(super) garbage: Mutex<Garbage>,
+    pub(super) results: Mutex<VecDeque<(TimelinePoint, Vec<PassResult>)>>,
     /// With `Caps::perf_counters`.
-    pub perf: Option<Perf>,
-    pub calibration: Mutex<Option<Calibration>>,
-    pub checkpoint_fn: Option<ash::nv::device_diagnostic_checkpoints::Device>,
-    pub fault_fn: Option<FaultFns>,
+    pub(super) perf: Option<Perf>,
+    pub(super) calibration: Mutex<Option<Calibration>>,
+    pub(super) checkpoint_fn: Option<ash::nv::device_diagnostic_checkpoints::Device>,
+    pub(super) fault_fn: Option<FaultFns>,
     /// With `Caps::breadcrumbs`.
-    pub breadcrumbs: OnceLock<Breadcrumbs>,
-    pub trail: Mutex<Trail>,
+    pub(super) breadcrumbs: OnceLock<Breadcrumbs>,
+    pub(super) trail: Mutex<Trail>,
     /// The report made when device loss was first seen.
-    pub lost: OnceLock<DiagnosticsReport>,
+    pub(super) lost: OnceLock<DiagnosticsReport>,
     /// The raw queue of each created kind.
-    pub queue_handles: [Option<vk::Queue>; MAX_TIMELINES],
+    pub(super) queue_handles: [Option<vk::Queue>; MAX_TIMELINES],
     /// The family of each created kind's queue.
-    pub families_by_kind: [u32; MAX_TIMELINES],
+    pub(super) families_by_kind: [u32; MAX_TIMELINES],
     /// Every enabled device extension.
-    pub extensions: Vec<CString>,
+    pub(super) extensions: Vec<CString>,
     classic_bind: OnceLock<ClassicBind>,
 }
 
 /// Surface and swapchain entry points of a device that presents.
-pub(crate) struct PresentFns {
-    pub surface: ash::khr::surface::Instance,
-    pub win32: ash::khr::win32_surface::Instance,
-    pub caps2: ash::khr::get_surface_capabilities2::Instance,
-    pub swapchain: ash::khr::swapchain::Device,
-    pub wait2: Option<ash::khr::present_wait2::Device>,
-    pub latency: Option<ash::nv::low_latency2::Device>,
-    pub hdr: Option<ash::ext::hdr_metadata::Device>,
-    pub timing: Option<ash::ext::present_timing::Device>,
+pub(super) struct PresentFns {
+    pub(super) surface: ash::khr::surface::Instance,
+    pub(super) win32: ash::khr::win32_surface::Instance,
+    pub(super) caps2: ash::khr::get_surface_capabilities2::Instance,
+    pub(super) swapchain: ash::khr::swapchain::Device,
+    pub(super) wait2: Option<ash::khr::present_wait2::Device>,
+    pub(super) latency: Option<ash::nv::low_latency2::Device>,
+    pub(super) hdr: Option<ash::ext::hdr_metadata::Device>,
+    pub(super) timing: Option<ash::ext::present_timing::Device>,
 }
 
 impl Shared {
-    pub(crate) fn classic_bind(&self) -> &ClassicBind {
+    pub(super) fn classic_bind(&self) -> &ClassicBind {
         self.classic_bind
             .get()
             .expect("the classic bind exists once the device is created")
     }
 
-    pub(crate) fn heaps(&self) -> &Heaps {
+    pub(super) fn heaps(&self) -> &Heaps {
         self.heaps
             .get()
             .expect("heaps exist once the device is created")
@@ -232,7 +232,7 @@ impl Drop for Shared {
 /// device.
 #[derive(Clone)]
 pub struct Device {
-    pub(crate) shared: Arc<Shared>,
+    pub(super) shared: Arc<Shared>,
     queues: Arc<[Option<Queue>; MAX_TIMELINES]>,
     /// Added to the flags of pipelines created through this handle.
     pub(super) creation_flags: vk::PipelineCreateFlags2,

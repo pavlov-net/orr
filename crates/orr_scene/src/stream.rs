@@ -82,21 +82,21 @@ pub(crate) enum StreamUnit {
 
 /// A mesh whose pages past its pinned ones stream: how they load and where they land.
 pub(crate) struct MeshStream {
-    pub entry: u32,
-    pub header: MeshHeader,
-    pub pages: Vec<StreamedPage>,
+    pub(crate) entry: u32,
+    pub(crate) header: MeshHeader,
+    pub(crate) pages: Vec<StreamedPage>,
     /// The mesh's page table.
-    pub table: GpuPtr<u64>,
+    pub(crate) table: GpuPtr<u64>,
     /// The entry of mesh cluster 0 in the resident cluster table, and its cluster id.
-    pub clusters: GpuPtr<ClusterRef>,
-    pub cluster_base: u32,
+    pub(crate) clusters: GpuPtr<ClusterRef>,
+    pub(crate) cluster_base: u32,
     /// Sections whose every triangle is non-opaque.
-    pub non_opaque: Vec<bool>,
+    pub(crate) non_opaque: Vec<bool>,
     /// Its index in its mount, and the first page that streams.
-    pub mesh: u32,
-    pub pinned: u32,
+    pub(crate) mesh: u32,
+    pub(crate) pinned: u32,
     /// Edits of the mesh, whose tables follow its landings and evictions.
-    pub mirrors: Mutex<Vec<Arc<Mirror>>>,
+    pub(crate) mirrors: Mutex<Vec<Arc<Mirror>>>,
 }
 
 impl MeshStream {
@@ -112,28 +112,28 @@ impl MeshStream {
 /// One page of a [`MeshStream`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StreamedPage {
-    pub blob: u32,
+    pub(crate) blob: u32,
     /// Resident bytes.
-    pub bytes: u32,
+    pub(crate) bytes: u32,
     /// Its first mesh cluster and cluster count.
-    pub first: u32,
-    pub clusters: u32,
+    pub(crate) first: u32,
+    pub(crate) clusters: u32,
 }
 
 /// What a streaming mesh's finer cached cuts are built from.
 pub(crate) struct FineInit {
-    pub mesh: u32,
-    pub stream: Arc<MeshStream>,
+    pub(crate) mesh: u32,
+    pub(crate) stream: Arc<MeshStream>,
     /// The table entries of its finer cuts, finest first, and their thresholds.
-    pub table: GpuPtr<RtCutGpu>,
-    pub thresholds: Vec<f32>,
+    pub(crate) table: GpuPtr<RtCutGpu>,
+    pub(crate) thresholds: Vec<f32>,
     /// For each threshold, the streamed pages holding a group whose error is over it.
-    pub pages: Vec<Vec<u32>>,
-    pub merge: f32,
-    pub animated: Animated,
+    pub(crate) pages: Vec<Vec<u32>>,
+    pub(crate) merge: f32,
+    pub(crate) animated: Animated,
     /// By mesh cluster: as known so far, and its CLAS.
-    pub clusters: Vec<ClusterInfo>,
-    pub clas: Vec<u64>,
+    pub(crate) clusters: Vec<ClusterInfo>,
+    pub(crate) clas: Vec<u64>,
 }
 
 enum FineState {
@@ -225,21 +225,21 @@ pub struct BlobId(pub u32);
 /// A mount's units as the stream step sees them.
 pub(crate) struct MountUnits {
     /// The unit of each instance page.
-    pub page_units: Vec<u32>,
+    pub(crate) page_units: Vec<u32>,
     /// Every unit, and how to load the ones that start absent.
-    pub units: Vec<(UnitDesc, Option<StreamUnit>)>,
+    pub(crate) units: Vec<(UnitDesc, Option<StreamUnit>)>,
     /// Streamed units of each mesh.
-    pub meshes: Vec<Vec<u32>>,
+    pub(crate) meshes: Vec<Vec<u32>>,
     /// The unit of each node page of each mesh.
-    pub node_pages: Vec<Vec<u32>>,
+    pub(crate) node_pages: Vec<Vec<u32>>,
     /// The mount's streamed textures and the unit of each one's first tile.
-    pub textures: Vec<(Arc<TexStream>, u32)>,
+    pub(crate) textures: Vec<(Arc<TexStream>, u32)>,
     /// The unit of each page of each mesh.
-    pub mesh_pages: Vec<Vec<u32>>,
+    pub(crate) mesh_pages: Vec<Vec<u32>>,
     /// The mount's meshes whose pages stream, as `MeshPage` units name them.
-    pub mesh_streams: Vec<Arc<MeshStream>>,
+    pub(crate) mesh_streams: Vec<Arc<MeshStream>>,
     /// Those of them with finer cached cuts.
-    pub fine: Vec<FineInit>,
+    pub(crate) fine: Vec<FineInit>,
 }
 
 struct MountStreams {
@@ -324,7 +324,7 @@ struct ClasFree {
 }
 
 /// A bound tile to unbind and free.
-pub(crate) struct TileFree {
+struct TileFree {
     key: Key,
     stream: Arc<TexStream>,
     tile: u32,
@@ -1617,7 +1617,7 @@ pub(crate) struct StreamTask {
 }
 
 /// A finished load.
-pub(crate) struct Landed {
+struct Landed {
     what: What,
     placed: Option<Placed>,
     /// The pool unit's address.
@@ -1645,7 +1645,7 @@ struct MeshLanded {
 
 /// A stream task's loads, handed to the render thread once its GPU work has landed.
 pub(crate) struct StreamBatch {
-    pub points: Vec<TimelinePoint>,
+    points: Vec<TimelinePoint>,
     loads: Vec<Landed>,
     clas: Option<PoolBatch>,
     decode: Option<PageDecodes>,

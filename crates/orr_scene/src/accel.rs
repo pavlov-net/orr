@@ -40,16 +40,16 @@ const WAIT: Duration = Duration::from_secs(60);
 
 /// The loading side's acceleration-structure kernels.
 pub(crate) struct AccelKernels {
-    pub clas: ComputePipeline,
+    pub(crate) clas: ComputePipeline,
     records: ComputePipeline,
     /// The CLAS pool's allocator.
-    pub allocate: ComputePipeline,
+    pub(crate) allocate: ComputePipeline,
     /// Streamed mesh pages from their stored form: the copy pass, then the cluster decode.
-    pub page_copy: ComputePipeline,
-    pub page_decode: ComputePipeline,
+    pub(crate) page_copy: ComputePipeline,
+    pub(crate) page_decode: ComputePipeline,
     /// An edit's rebuild: the culling data of its clusters, then their CLAS addresses.
-    pub edit_bounds: ComputePipeline,
-    pub edit_refs: ComputePipeline,
+    pub(crate) edit_bounds: ComputePipeline,
+    pub(crate) edit_refs: ComputePipeline,
 }
 
 impl AccelKernels {
@@ -75,28 +75,28 @@ impl AccelKernels {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AccelLimits {
     /// Triangles one CLAS batch builds.
-    pub clas_triangles: u32,
+    pub(crate) clas_triangles: u32,
     /// Micromaps one submit builds.
-    pub micromaps: u32,
+    pub(crate) micromaps: u32,
     /// Bytes of pages a DAG mesh keeps resident whole; above it its pages stream.
-    pub mesh_resident_max: u64,
+    pub(crate) mesh_resident_max: u64,
 }
 
 /// What the loading side keeps of a cluster as its page decodes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ClusterInfo {
-    pub page: u32,
-    pub local: u32,
-    pub vertex_count: u32,
-    pub tri_count: u32,
-    pub section: u8,
-    pub part: u8,
-    pub flags: u8,
-    pub micromap: bool,
-    pub self_error: f32,
-    pub parent_error: f32,
+    pub(crate) page: u32,
+    local: u32,
+    pub(crate) vertex_count: u32,
+    pub(crate) tri_count: u32,
+    pub(crate) section: u8,
+    part: u8,
+    pub(crate) flags: u8,
+    pub(crate) micromap: bool,
+    pub(crate) self_error: f32,
+    parent_error: f32,
     /// m a skinned vertex may move from its rest position.
-    pub deformation_bound: f32,
+    pub(crate) deformation_bound: f32,
 }
 
 impl ClusterInfo {
@@ -137,44 +137,44 @@ impl ClusterInfo {
 /// A page's micromap region: its offset in the page and the entries per subdivision level.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PageMicromap {
-    pub offset: u32,
-    pub usage: [u32; 13],
+    pub(crate) offset: u32,
+    pub(crate) usage: [u32; 13],
 }
 
 /// One resident mesh as the build sees it.
 pub(crate) struct MeshInput<'a> {
-    pub header: &'a MeshHeader,
+    pub(crate) header: &'a MeshHeader,
     /// Resident page addresses.
-    pub pages: &'a [u64],
+    pub(crate) pages: &'a [u64],
     /// By mesh cluster index.
-    pub clusters: &'a [ClusterInfo],
+    pub(crate) clusters: &'a [ClusterInfo],
     /// By page; `None` where the page has no micromap region.
-    pub micromaps: &'a [Option<PageMicromap>],
+    pub(crate) micromaps: &'a [Option<PageMicromap>],
     /// Discrete levels, finest first: error and mesh cluster range. Empty in DAG mode.
-    pub levels: &'a [(f32, u32, u32)],
+    pub(crate) levels: &'a [(f32, u32, u32)],
     /// Sections whose every triangle is non-opaque (linked coverage).
-    pub non_opaque: &'a [bool],
+    pub(crate) non_opaque: &'a [bool],
     /// Cluster id of mesh cluster 0.
-    pub cluster_base: u32,
+    pub(crate) cluster_base: u32,
     /// The mesh's part table.
-    pub parts: &'a [Part],
+    pub(crate) parts: &'a [Part],
     /// The smallest error of a cut whose clusters are all resident: 0 unless the mesh's
     /// pages stream.
-    pub min_cut: f32,
+    pub(crate) min_cut: f32,
     /// Thresholds of the finer cuts built once their streamed pages are resident, finest first.
-    pub fine: &'a [f32],
+    pub(crate) fine: &'a [f32],
 }
 
 /// A mesh's animated parts: those of its clusters with `ANIMATED_PART`, from the lowest
 /// such part to the last of the part table.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Animated {
-    pub first: u32,
-    pub count: u32,
+    pub(crate) first: u32,
+    pub(crate) count: u32,
 }
 
 impl Animated {
-    pub(crate) fn of(clusters: &[ClusterInfo], part_count: u32) -> Self {
+    fn of(clusters: &[ClusterInfo], part_count: u32) -> Self {
         let parts = part_count.max(1);
         let first = clusters
             .iter()
@@ -203,12 +203,12 @@ impl Animated {
 /// of each cut.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MeshRt {
-    pub clas: Vec<u64>,
-    pub sections: Vec<u8>,
-    pub animated: Vec<bool>,
-    pub cuts: Vec<Vec<u32>>,
+    pub(crate) clas: Vec<u64>,
+    sections: Vec<u8>,
+    animated: Vec<bool>,
+    pub(crate) cuts: Vec<Vec<u32>>,
     /// Per cut: it has animated part clusters, so its body BLAS differs from its rest one.
-    pub parted: Vec<bool>,
+    parted: Vec<bool>,
 }
 
 impl MeshRt {
@@ -242,15 +242,15 @@ impl MeshRt {
 /// A mesh's traced cuts and animated parts: their records' place in the mount's tables.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MeshCuts {
-    pub table: GpuPtr<RtCutGpu>,
-    pub count: u32,
-    pub parts: GpuPtr<PartGpu>,
-    pub animated: Animated,
+    pub(crate) table: GpuPtr<RtCutGpu>,
+    pub(crate) count: u32,
+    pub(crate) parts: GpuPtr<PartGpu>,
+    pub(crate) animated: Animated,
     /// The sections of every animated part.
-    pub animated_sections: u32,
+    pub(crate) animated_sections: u32,
     /// The finer cuts at the start of the table.
-    pub fine: u32,
-    pub rt: MeshRt,
+    pub(crate) fine: u32,
+    pub(crate) rt: MeshRt,
 }
 
 /// The acceleration structures of a mount, kept alive while it is resident.
@@ -258,7 +258,7 @@ pub(crate) struct MeshCuts {
 pub(crate) struct MountAccel {
     blocks: Vec<Allocation<u8>>,
     /// The skin tables of the mount's skinned meshes.
-    pub skins: Vec<Allocation<u8>>,
+    pub(crate) skins: Vec<Allocation<u8>>,
     micromaps: Vec<(Micromap, Allocation<u8>)>,
     cuts: Option<Allocation<RtCutGpu>>,
     part_blas: Option<Allocation<u64>>,
@@ -269,10 +269,10 @@ pub(crate) struct MountAccel {
 /// limits and the resident cluster ids, which the loading side takes and the render thread
 /// frees with their mount.
 pub(crate) struct AccelShared {
-    pub kernels: AccelKernels,
-    pub limits: AccelLimits,
-    pub cluster_ids: Mutex<RangeAllocator>,
-    pub cluster_capacity: u32,
+    pub(crate) kernels: AccelKernels,
+    pub(crate) limits: AccelLimits,
+    pub(crate) cluster_ids: Mutex<RangeAllocator>,
+    pub(crate) cluster_capacity: u32,
 }
 
 /// The resident cluster table entries of a mesh's clusters; their CLAS once built.
@@ -308,7 +308,7 @@ fn cluster_hash(mesh_cluster: u32) -> [u32; 2] {
 }
 
 /// The order-free hash the traversal gives a set of mesh clusters.
-pub(crate) fn cut_hash(clusters: &[u32]) -> [u32; 2] {
+fn cut_hash(clusters: &[u32]) -> [u32; 2] {
     clusters.iter().fold([0, 0], |h, &c| {
         let k = cluster_hash(c);
         [h[0].wrapping_add(k[0]), h[1].wrapping_add(k[1])]
@@ -451,7 +451,7 @@ fn page_micromap(
 }
 
 /// Per page, its micromap and storage if it has one, and the point the last build signals.
-pub(crate) type PageMicromaps = (
+type PageMicromaps = (
     Vec<Option<(Micromap, Allocation<u8>)>>,
     Option<TimelinePoint>,
 );
@@ -697,13 +697,13 @@ fn implicit(
 
 /// What [`build`] made.
 pub(crate) struct Built {
-    pub accel: MountAccel,
+    pub(crate) accel: MountAccel,
     /// By mesh.
-    pub cuts: Vec<MeshCuts>,
+    pub(crate) cuts: Vec<MeshCuts>,
     /// By mesh: the cluster template of each cluster of a skinned mesh; empty otherwise.
-    pub templates: Vec<Vec<u64>>,
+    pub(crate) templates: Vec<Vec<u64>>,
     /// The point the last move signals; none when nothing was built.
-    pub point: Option<TimelinePoint>,
+    pub(crate) point: Option<TimelinePoint>,
 }
 
 /// Builds the micromaps, CLAS and cut BLAS of `meshes` on the loading queue after `wait`.
@@ -1050,7 +1050,7 @@ impl BlasJobs {
 /// A finer cached cut of a streaming mesh, built after its pages landed.
 pub(crate) struct FineCut {
     /// Its table record.
-    pub record: RtCutGpu,
+    pub(crate) record: RtCutGpu,
     /// Its BLAS and the table of its parts' BLAS.
     _blocks: Vec<Allocation<u8>>,
     _parts: Option<Allocation<u64>>,
@@ -1150,7 +1150,7 @@ fn part_records(m: &MeshInput<'_>, animated: Animated) -> Vec<PartGpu> {
 /// The BLAS of one (mesh, section mask): a block of their implicit results and the table
 /// `MaskGpu::blas` points at.
 pub(crate) struct MaskBlas {
-    pub table: Allocation<u64>,
+    pub(crate) table: Allocation<u64>,
     /// Shared by the masks of one build; none when every slot is empty.
     _block: Option<Arc<Allocation<u8>>>,
 }
@@ -1336,22 +1336,22 @@ pub(crate) enum ClusterBuild {
 /// One cluster of a CLAS or template build.
 pub(crate) struct ClasSource<'a> {
     /// The resident address of its page.
-    pub page: u64,
+    pub(crate) page: u64,
     /// Its page's micromap, or 0.
-    pub micromap: u64,
-    pub cluster: &'a ClusterInfo,
-    pub cluster_id: u32,
-    pub step: f32,
-    pub truncate_bits: u32,
-    pub non_opaque: bool,
+    pub(crate) micromap: u64,
+    pub(crate) cluster: &'a ClusterInfo,
+    pub(crate) cluster_id: u32,
+    pub(crate) step: f32,
+    pub(crate) truncate_bits: u32,
+    pub(crate) non_opaque: bool,
 }
 
 /// The `clas` kernel's jobs and the implicit build of one batch.
 pub(crate) struct ClasBatch {
-    pub jobs: Vec<ClasJob>,
-    pub desc: RtasOpDesc,
-    pub vertices: u32,
-    pub triangles: u32,
+    pub(crate) jobs: Vec<ClasJob>,
+    pub(crate) desc: RtasOpDesc,
+    pub(crate) vertices: u32,
+    pub(crate) triangles: u32,
 }
 
 pub(crate) fn clas_batch<'a>(

@@ -13,8 +13,12 @@ fn main() {
     };
     println!("cargo:shader_dirs={}", joined("SHADER_DIRS"));
     println!("cargo:link_points={}", joined("LINK_POINTS"));
-    let types = var("DEP_ORR_SCENE_TYPES");
-    if let Err(e) = orr_shaders::build::reexport_types(&types, "::orr_scene", "::orr::orr_scene") {
+    let moves = [
+        ("::orr_scene", "::orr::orr_scene"),
+        ("::orr_lighting", "::orr::orr_lighting"),
+        ("::orr_pack", "::orr::orr_pack"),
+    ];
+    if let Err(e) = orr_shaders::build::reexport_types(&joined("TYPES"), &moves) {
         panic!("{e}");
     }
 }

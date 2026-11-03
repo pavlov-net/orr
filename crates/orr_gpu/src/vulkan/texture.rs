@@ -12,7 +12,7 @@ use super::garbage::Item;
 use super::memory::{Allocation, MemoryKind, memory_error, sharing};
 use crate::{
     AddressMode, CompareOp, Error, Filter, Format, SparseLayout, TextureDesc, TextureKind,
-    TextureRegion, TextureUsage, TimelinePoint, ViewDesc, ViewKind,
+    TextureRegion, TextureUsage, ViewDesc, ViewKind,
 };
 
 /// Where a texture's memory comes from.
@@ -35,31 +35,30 @@ pub enum TextureMemory<'a> {
 }
 
 /// Where a sparse texture's mip tails sit in its opaque range.
-pub(crate) struct SparseTail {
-    pub offset: u64,
-    pub stride: u64,
-    pub size: u64,
+pub(super) struct SparseTail {
+    pub(super) offset: u64,
+    pub(super) stride: u64,
+    pub(super) size: u64,
 }
 
 /// An image and its memory. It has no layout state: [`crate::CommandList::discard`] puts it
 /// in `GENERAL` before first use, and it stays there.
 ///
-/// Dropping it destroys it once everything submitted before the drop has completed;
-/// [`Device::free_texture`] names the point instead.
+/// Dropping it destroys it once everything submitted before the drop has completed.
 pub struct Texture {
-    pub(crate) image: vk::Image,
+    pub(super) image: vk::Image,
     memory: Option<orr_memory::Allocation>,
     /// The view rendering writes through: mip 0, layer 0. Null without `COLOR` or `DEPTH`
     /// usage.
     attachment: vk::ImageView,
     /// Every mip and layer; made by the first `vulkan::image_handles`.
-    pub(crate) full_view: OnceLock<vk::ImageView>,
+    pub(super) full_view: OnceLock<vk::ImageView>,
     desc: TextureDesc,
     /// False for a swapchain image: the swapchain owns it and drops this texture once its
     /// presents have completed.
     owns_image: bool,
     /// With [`TextureMemory::Sparse`].
-    pub(crate) sparse: Option<(SparseLayout, SparseTail)>,
+    pub(super) sparse: Option<(SparseLayout, SparseTail)>,
     shared: Arc<Shared>,
 }
 
@@ -68,7 +67,7 @@ impl Texture {
         &self.desc
     }
 
-    pub(crate) fn shared(&self) -> &Shared {
+    pub(super) fn shared(&self) -> &Shared {
         &self.shared
     }
 
@@ -85,7 +84,7 @@ impl Texture {
     }
 
     /// The view rendering writes through; panics unless the texture has `usage`.
-    pub(crate) fn attachment(&self, usage: TextureUsage) -> vk::ImageView {
+    pub(super) fn attachment(&self, usage: TextureUsage) -> vk::ImageView {
         assert!(
             self.desc.usage.contains(usage),
             "a {:?} attachment needs a texture with {usage:?} usage",
@@ -94,14 +93,14 @@ impl Texture {
         self.attachment
     }
 
-    pub(crate) fn full_range(&self) -> vk::ImageSubresourceRange {
+    pub(super) fn full_range(&self) -> vk::ImageSubresourceRange {
         vk::ImageSubresourceRange::default()
             .aspect_mask(aspect(self.desc.format))
             .level_count(self.desc.mips)
             .layer_count(self.desc.layers)
     }
 
-    pub(crate) fn layers(&self, region: &TextureRegion) -> vk::ImageSubresourceLayers {
+    pub(super) fn layers(&self, region: &TextureRegion) -> vk::ImageSubresourceLayers {
         vk::ImageSubresourceLayers::default()
             .aspect_mask(data_aspect(self.desc.format))
             .mip_level(region.mip)
@@ -109,7 +108,7 @@ impl Texture {
             .layer_count(region.layers)
     }
 
-    pub(crate) fn view_info(&self, v: &ViewDesc) -> vk::ImageViewCreateInfo<'static> {
+    pub(super) fn view_info(&self, v: &ViewDesc) -> vk::ImageViewCreateInfo<'static> {
         let d = &self.desc;
         let mips = if v.mips == 0 {
             d.mips - v.base_mip
@@ -150,7 +149,7 @@ impl Texture {
     }
 
     /// A swapchain image as a texture; the swapchain keeps the image.
-    pub(crate) fn swapchain_image(
+    pub(super) fn swapchain_image(
         shared: &Arc<Shared>,
         image: vk::Image,
         desc: &TextureDesc,
@@ -241,7 +240,7 @@ fn data_aspect(format: Format) -> vk::ImageAspectFlags {
     }
 }
 
-pub(crate) fn image_info<'a>(
+pub(super) fn image_info<'a>(
     desc: &TextureDesc,
     sparse: bool,
     families: &'a [u32],
@@ -426,7 +425,7 @@ fn host_check(t: &Texture, region: &TextureRegion, len: usize) -> Result<(), Err
     Ok(())
 }
 
-pub(crate) fn vk_offset(r: &TextureRegion) -> vk::Offset3D {
+pub(super) fn vk_offset(r: &TextureRegion) -> vk::Offset3D {
     vk::Offset3D {
         x: r.offset[0] as i32,
         y: r.offset[1] as i32,
@@ -434,7 +433,7 @@ pub(crate) fn vk_offset(r: &TextureRegion) -> vk::Offset3D {
     }
 }
 
-pub(crate) fn vk_extent(r: &TextureRegion) -> vk::Extent3D {
+pub(super) fn vk_extent(r: &TextureRegion) -> vk::Extent3D {
     vk::Extent3D {
         width: r.extent[0],
         height: r.extent[1],
@@ -442,7 +441,7 @@ pub(crate) fn vk_extent(r: &TextureRegion) -> vk::Extent3D {
     }
 }
 
-pub(crate) fn indirect_copy_format(shared: &Shared, format: Format) -> bool {
+pub(super) fn indirect_copy_format(shared: &Shared, format: Format) -> bool {
     if !shared.caps.indirect_copy || format.is_depth() {
         return false;
     }
@@ -652,23 +651,9 @@ impl Device {
         unsafe { self.shared.device.copy_image_to_memory(&info) }
             .map_err(Error::vk("vkCopyImageToMemory"))
     }
-
-    /// Destroys `t` once `after` has completed.
-    pub fn free_texture(&self, t: Texture, after: TimelinePoint) {
-        assert!(t.owns_image, "a swapchain image is not freed by its user");
-        let mut t = std::mem::ManuallyDrop::new(t);
-        let item = Item::Image {
-            image: t.image,
-            memory: t.memory.take(),
-            views: t.views(),
-        };
-        // SAFETY: `t` is never used or dropped again; its Arc is released exactly once.
-        unsafe { std::ptr::drop_in_place(&mut t.shared) };
-        self.shared.defer(self.shared.after_point(after), item);
-    }
 }
 
-pub(crate) fn vk_format(f: Format) -> vk::Format {
+pub(super) fn vk_format(f: Format) -> vk::Format {
     use Format::*;
     use vk::Format as V;
     match f {
@@ -722,21 +707,21 @@ pub(crate) fn vk_format(f: Format) -> vk::Format {
     }
 }
 
-pub(crate) fn vk_filter(f: Filter) -> vk::Filter {
+pub(super) fn vk_filter(f: Filter) -> vk::Filter {
     match f {
         Filter::Nearest => vk::Filter::NEAREST,
         Filter::Linear => vk::Filter::LINEAR,
     }
 }
 
-pub(crate) fn vk_mipmap_mode(f: Filter) -> vk::SamplerMipmapMode {
+pub(super) fn vk_mipmap_mode(f: Filter) -> vk::SamplerMipmapMode {
     match f {
         Filter::Nearest => vk::SamplerMipmapMode::NEAREST,
         Filter::Linear => vk::SamplerMipmapMode::LINEAR,
     }
 }
 
-pub(crate) fn vk_address_mode(a: AddressMode) -> vk::SamplerAddressMode {
+pub(super) fn vk_address_mode(a: AddressMode) -> vk::SamplerAddressMode {
     match a {
         AddressMode::Repeat => vk::SamplerAddressMode::REPEAT,
         AddressMode::MirroredRepeat => vk::SamplerAddressMode::MIRRORED_REPEAT,
@@ -745,7 +730,7 @@ pub(crate) fn vk_address_mode(a: AddressMode) -> vk::SamplerAddressMode {
     }
 }
 
-pub(crate) fn vk_compare(c: CompareOp) -> vk::CompareOp {
+pub(super) fn vk_compare(c: CompareOp) -> vk::CompareOp {
     match c {
         CompareOp::Never => vk::CompareOp::NEVER,
         CompareOp::Less => vk::CompareOp::LESS,

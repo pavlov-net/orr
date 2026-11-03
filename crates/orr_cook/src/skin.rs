@@ -30,11 +30,11 @@ use crate::gltf::data::Data;
 
 /// The default scene's node tree: parent and world transform of each glTF node in it.
 pub(crate) struct Graph {
-    pub parent: Vec<Option<usize>>,
-    pub world: Vec<Mat4>,
-    pub in_scene: Vec<bool>,
+    pub(crate) parent: Vec<Option<usize>>,
+    pub(crate) world: Vec<Mat4>,
+    in_scene: Vec<bool>,
     /// Scene nodes depth first, parents before children, in document order.
-    pub order: Vec<usize>,
+    pub(crate) order: Vec<usize>,
 }
 
 impl Graph {
@@ -67,7 +67,7 @@ impl Graph {
 }
 
 pub(crate) struct Skeleton {
-    pub info: SkeletonInfo,
+    pub(crate) info: SkeletonInfo,
     /// glTF node per joint.
     nodes: Vec<usize>,
     joint_of: HashMap<usize, u16>,
@@ -474,12 +474,12 @@ pub(crate) enum Interpolation {
 /// One animated property of one joint, keyed in seconds.
 pub(crate) struct Channel {
     /// Skeleton joint.
-    pub joint: usize,
-    pub property: Property,
-    pub interpolation: Interpolation,
-    pub times: Vec<f32>,
+    pub(crate) joint: usize,
+    pub(crate) property: Property,
+    pub(crate) interpolation: Interpolation,
+    pub(crate) times: Vec<f32>,
     /// xyz(w); three per key (in-tangent, value, out-tangent) for cubic splines.
-    pub values: Vec<[f32; 4]>,
+    pub(crate) values: Vec<[f32; 4]>,
 }
 
 impl Channel {

@@ -41,7 +41,7 @@ impl RangeAllocator {
     }
 
     /// Whether `at..at + count` is all free.
-    pub fn is_free(&self, at: u32, count: u32) -> bool {
+    fn is_free(&self, at: u32, count: u32) -> bool {
         self.free
             .range(..=at)
             .next_back()
@@ -106,7 +106,7 @@ impl Block {
     }
 
     /// `size` bytes from `at` in this block.
-    pub(crate) fn sub(&self, at: u64, size: u64) -> Self {
+    fn sub(&self, at: u64, size: u64) -> Self {
         assert!(at + size <= self.size, "sub-block outside its block");
         Self {
             gpu: self.gpu + at,

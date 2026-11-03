@@ -72,7 +72,7 @@ impl MemoryPriority {
 
 /// Usage every `gpu_malloc` buffer carries, so any block can hold any kind of data. The
 /// shader-binding-table bit needs the ray-tracing pipeline extension.
-pub(crate) fn buffer_usage(ray_dispatch: bool) -> vk::BufferUsageFlags {
+pub(super) fn buffer_usage(ray_dispatch: bool) -> vk::BufferUsageFlags {
     use vk::BufferUsageFlags as U;
     let usage = U::STORAGE_BUFFER
         | U::UNIFORM_BUFFER
@@ -90,17 +90,17 @@ pub(crate) fn buffer_usage(ray_dispatch: bool) -> vk::BufferUsageFlags {
 }
 
 /// The memory type behind each [`MemoryKind`].
-pub(crate) struct MemoryTypes {
-    pub types: [u32; 3],
-    pub properties: vk::PhysicalDeviceMemoryProperties,
+pub(super) struct MemoryTypes {
+    types: [u32; 3],
+    properties: vk::PhysicalDeviceMemoryProperties,
 }
 
 impl MemoryTypes {
-    pub(crate) fn of(&self, kind: MemoryKind) -> u32 {
+    pub(super) fn of(&self, kind: MemoryKind) -> u32 {
         self.types[kind.index()]
     }
 
-    pub(crate) fn heap_size(&self, kind: MemoryKind) -> u64 {
+    pub(super) fn heap_size(&self, kind: MemoryKind) -> u64 {
         let ty = self.properties.memory_types[self.of(kind) as usize];
         self.properties.memory_heaps[ty.heap_index as usize].size
     }
@@ -115,7 +115,7 @@ impl MemoryTypes {
     /// device-local and host-visible when `allow_rebar` and such a type covers VRAM
     /// (resizable BAR), else host memory, leaving the small BAR heap alone. Returns the types
     /// and whether Upload covers VRAM.
-    pub(crate) fn select(
+    pub(super) fn select(
         properties: vk::PhysicalDeviceMemoryProperties,
         buffer_bits: u32,
         image_bits: u32,
@@ -158,7 +158,7 @@ impl MemoryTypes {
 
 /// Bytes and allocation count per kind.
 #[derive(Default)]
-pub(crate) struct Usage {
+pub(super) struct Usage {
     bytes: [AtomicU64; 3],
     count: [AtomicU64; 3],
 }
@@ -196,7 +196,7 @@ unsafe impl<T: Send> Send for Allocation<T> {}
 unsafe impl<T: Sync> Sync for Allocation<T> {}
 
 impl<T> Allocation<T> {
-    pub fn kind(&self) -> MemoryKind {
+    pub(super) fn kind(&self) -> MemoryKind {
         self.raw.kind
     }
 
@@ -228,12 +228,12 @@ impl<T> Allocation<T> {
         self.size == 0
     }
 
-    pub(crate) fn raw(&self) -> &RawBuffer {
+    pub(super) fn raw(&self) -> &RawBuffer {
         &self.raw
     }
 
     /// Gives up ownership without freeing anything.
-    pub(crate) fn into_raw(self) -> RawBuffer {
+    pub(super) fn into_raw(self) -> RawBuffer {
         let mut this = ManuallyDrop::new(self);
         // SAFETY: `this` is never used or dropped again; the buffer is taken and the Arc
         // released exactly once.
@@ -319,17 +319,17 @@ pub struct HeapReport {
 }
 
 /// A registered address range.
-pub(crate) struct Range {
-    pub end: u64,
-    pub buffer: vk::Buffer,
-    pub name: Box<str>,
+pub(super) struct Range {
+    pub(super) end: u64,
+    pub(super) buffer: vk::Buffer,
+    pub(super) name: Box<str>,
 }
 
 /// Freed ranges kept for fault reports.
 const FREED_KEPT: usize = 256;
 
 /// Concurrent sharing across `families` when there is more than one.
-pub(crate) fn sharing(families: &[u32]) -> (vk::SharingMode, &[u32]) {
+pub(super) fn sharing(families: &[u32]) -> (vk::SharingMode, &[u32]) {
     if families.len() > 1 {
         (vk::SharingMode::CONCURRENT, families)
     } else {
@@ -349,8 +349,8 @@ const PLACEMENT_MIN_BYTES: u64 = 64 << 10;
 /// The allocator and its pools: per kind one buffer pool per priority and one pool of
 /// transient arena blocks, image pools apart from buffer pools, and render targets apart
 /// from both.
-pub(crate) struct Pools {
-    pub allocator: Allocator,
+pub(super) struct Pools {
+    pub(super) allocator: Allocator,
     /// By priority, then kind.
     buffers: [[Pool; 3]; 3],
     transient: [Pool; 3],
@@ -419,7 +419,7 @@ impl Pools {
 
     /// The pool and flags of a texture of `bytes`: render targets get their own memory at
     /// frame priority, large textures their own memory.
-    pub(crate) fn image(
+    pub(super) fn image(
         &self,
         host_copy: bool,
         target: bool,
@@ -437,13 +437,13 @@ impl Pools {
         }
     }
 
-    pub(crate) fn next_frame(&self) {
+    pub(super) fn next_frame(&self) {
         let frame = self.frame.fetch_add(1, Ordering::Relaxed) + 1;
         self.allocator.set_frame(frame);
     }
 }
 
-pub(crate) fn memory_error(e: orr_memory::Error) -> Error {
+pub(super) fn memory_error(e: orr_memory::Error) -> Error {
     match e {
         orr_memory::Error::Vulkan { call, result } => Error::vk(call)(result),
     }
@@ -451,7 +451,7 @@ pub(crate) fn memory_error(e: orr_memory::Error) -> Error {
 
 impl Shared {
     /// Creates a buffer in the normal-priority pool of `kind`, mapped when host-visible.
-    pub(crate) fn create_buffer(
+    pub(super) fn create_buffer(
         &self,
         kind: MemoryKind,
         size: u64,
@@ -540,14 +540,14 @@ impl Shared {
         Ok((raw, mapped))
     }
 
-    pub(crate) fn unregister_buffer(&self, b: &RawBuffer) {
+    pub(super) fn unregister_buffer(&self, b: &RawBuffer) {
         self.unregister_range(b.address);
         self.usage.sub(b.kind, b.size);
     }
 
     /// Records `size` bytes at `address` as `buffer`, for [`Shared::locate`] and fault
     /// reports.
-    pub(crate) fn register_range(&self, address: u64, size: u64, buffer: vk::Buffer, name: &str) {
+    pub(super) fn register_range(&self, address: u64, size: u64, buffer: vk::Buffer, name: &str) {
         let range = Range {
             end: address + size,
             buffer,
@@ -557,7 +557,7 @@ impl Shared {
     }
 
     /// Forgets the range at `address`; fault reports still name it among recent frees.
-    pub(crate) fn unregister_range(&self, address: u64) {
+    pub(super) fn unregister_range(&self, address: u64) {
         let Some(range) = self.buffers.write().unwrap().remove(&address) else {
             return;
         };
@@ -569,7 +569,7 @@ impl Shared {
     }
 
     /// The buffer holding `bytes` bytes at `address`, and the offset into it.
-    pub(crate) fn locate(&self, address: GpuAddress, bytes: u64) -> (vk::Buffer, u64) {
+    pub(super) fn locate(&self, address: GpuAddress, bytes: u64) -> (vk::Buffer, u64) {
         let map = self.buffers.read().unwrap();
         let found = map.range(..=address.0).next_back().and_then(|(&start, r)| {
             (address.0 + bytes <= r.end).then_some((r.buffer, address.0 - start))
@@ -582,7 +582,7 @@ impl Shared {
         })
     }
 
-    pub(crate) fn report(&self) -> MemoryReport {
+    fn report(&self) -> MemoryReport {
         let kinds = MemoryKind::ALL.map(|k| MemoryUsage {
             bytes: self.usage.bytes[k.index()].load(Ordering::Relaxed),
             allocations: self.usage.count[k.index()].load(Ordering::Relaxed),
@@ -695,7 +695,6 @@ struct Ring {
     /// The current arena, over mapped addresses for host arenas and device addresses for
     /// device arenas.
     arena: RefCell<Arena>,
-    kind: MemoryKind,
     name: Box<str>,
     shared: Arc<Shared>,
 }
@@ -756,7 +755,6 @@ impl Ring {
             blocks,
             current: 0,
             arena: RefCell::new(Arena::new(0, bytes)),
-            kind,
             name: name.into(),
             shared: Arc::clone(shared),
         };
@@ -871,10 +869,6 @@ impl Device {
 }
 
 impl HostArenas {
-    pub fn kind(&self) -> MemoryKind {
-        self.ring.kind
-    }
-
     /// `layout.size()` bytes from the current arena at a multiple of `layout.align()`; up to
     /// 256 bytes of alignment the device address is aligned the same. Fails when the arena
     /// has no room left.

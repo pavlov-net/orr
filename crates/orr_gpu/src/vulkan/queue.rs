@@ -15,10 +15,10 @@ use super::swapchain::SwapchainFrame;
 use crate::{Error, TimelinePoint};
 
 /// Passes one command list can time.
-pub(crate) const MAX_PASSES: u32 = 256;
+pub(super) const MAX_PASSES: u32 = 256;
 
 /// The stages that may write an acquired swapchain image; the acquire wait blocks them.
-pub(crate) const SWAPCHAIN_WRITE_STAGES: vk::PipelineStageFlags2 =
+pub(super) const SWAPCHAIN_WRITE_STAGES: vk::PipelineStageFlags2 =
     vk::PipelineStageFlags2::from_raw(
         vk::PipelineStageFlags2::COMPUTE_SHADER.as_raw()
             | vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT.as_raw()
@@ -41,7 +41,7 @@ pub enum QueueKind {
 }
 
 impl QueueKind {
-    pub(crate) const ALL: [QueueKind; MAX_TIMELINES] = [
+    pub(super) const ALL: [QueueKind; MAX_TIMELINES] = [
         QueueKind::Render,
         QueueKind::Compute,
         QueueKind::Loading,
@@ -49,7 +49,7 @@ impl QueueKind {
         QueueKind::Present,
     ];
 
-    pub(crate) fn index(self) -> usize {
+    pub(super) fn index(self) -> usize {
         self as usize
     }
 }
@@ -68,20 +68,20 @@ pub struct QueueRequest {
 }
 
 /// A queue's timeline semaphore and the last value submitted to it.
-pub(crate) struct Timeline {
-    pub semaphore: vk::Semaphore,
-    pub submitted: AtomicU64,
+pub(super) struct Timeline {
+    pub(super) semaphore: vk::Semaphore,
+    pub(super) submitted: AtomicU64,
 }
 
 /// The pool, buffer and query pools one command list records with. Each list owns its pool,
 /// so recording and ending on different threads needs no pool lock.
 pub(crate) struct ListResources {
-    pub pool: vk::CommandPool,
-    pub cmd: vk::CommandBuffer,
-    pub timestamps: vk::QueryPool,
-    pub stats: vk::QueryPool,
+    pool: vk::CommandPool,
+    pub(super) cmd: vk::CommandBuffer,
+    pub(super) timestamps: vk::QueryPool,
+    pub(super) stats: vk::QueryPool,
     /// Compacted sizes of classic acceleration structures; on graphics and compute queues.
-    pub compacted: vk::QueryPool,
+    pub(super) compacted: vk::QueryPool,
 }
 
 struct Pending {
@@ -98,22 +98,22 @@ struct Pools {
 
 /// One device queue with its own timeline.
 pub struct Queue {
-    pub(crate) kind: QueueKind,
-    pub(crate) family: u32,
+    pub(super) kind: QueueKind,
+    pub(super) family: u32,
     raw: vk::Queue,
     /// Held for every queue operation. True while the last operation on the timeline is a
     /// sparse bind, which the next submit waits for: binds are not ordered with submits.
     submit_lock: Mutex<bool>,
     pools: Mutex<Pools>,
     /// The family takes sparse binds.
-    pub(crate) sparse: bool,
+    sparse: bool,
     /// Graphics or compute: heaps bind and pipeline statistics work.
-    pub(crate) shaders: bool,
+    pub(super) shaders: bool,
     /// Graphics: task, mesh and pixel statistics.
-    pub(crate) graphics: bool,
+    pub(super) graphics: bool,
     /// Valid timestamp bits; 0 when the family has no timestamps.
-    pub(crate) timestamp_mask: u64,
-    pub(crate) shared: Arc<Shared>,
+    timestamp_mask: u64,
+    pub(super) shared: Arc<Shared>,
 }
 
 /// Measurements of one pass between [`CommandList::begin_pass`] and
@@ -167,16 +167,16 @@ impl Queue {
         }
     }
 
-    pub fn kind(&self) -> QueueKind {
+    pub(super) fn kind(&self) -> QueueKind {
         self.kind
     }
 
-    pub(crate) fn raw(&self) -> vk::Queue {
+    pub(super) fn raw(&self) -> vk::Queue {
         self.raw
     }
 
     /// Held around every call that uses the raw queue.
-    pub(crate) fn lock_submits(&self) -> std::sync::MutexGuard<'_, bool> {
+    pub(super) fn lock_submits(&self) -> std::sync::MutexGuard<'_, bool> {
         self.submit_lock.lock().unwrap()
     }
 
@@ -316,7 +316,7 @@ impl Queue {
     }
 
     /// Returns an unsubmitted list's resources for reuse.
-    pub(crate) fn recycle(&self, res: ListResources) {
+    pub(super) fn recycle(&self, res: ListResources) {
         self.pools.lock().unwrap().free.push(res);
     }
 
@@ -470,7 +470,7 @@ impl Queue {
     }
 
     /// Runs `f` with the raw queue while no other operation uses it.
-    pub(crate) fn with_raw<R>(&self, f: impl FnOnce(vk::Queue) -> R) -> R {
+    pub(super) fn with_raw<R>(&self, f: impl FnOnce(vk::Queue) -> R) -> R {
         let _guard = self.submit_lock.lock().unwrap();
         f(self.raw)
     }
@@ -488,7 +488,7 @@ impl Queue {
 
     /// Queues sparse binds after everything submitted to this queue so far; its next submit
     /// waits for them. The returned point completes once they are bound.
-    pub(crate) fn bind_sparse(
+    pub(super) fn bind_sparse(
         &self,
         buffers: &[vk::SparseBufferMemoryBindInfo<'_>],
         opaque: &[vk::SparseImageOpaqueMemoryBindInfo<'_>],
@@ -648,7 +648,7 @@ impl Drop for Queue {
 
 /// A GPU tick paired with the CPU instant it was read at.
 #[derive(Clone, Copy)]
-pub(crate) struct Calibration {
+pub(super) struct Calibration {
     ticks: u64,
     at: Instant,
     period_ns: f64,
@@ -675,13 +675,13 @@ impl Calibration {
 const CALIBRATION_AGE: Duration = Duration::from_secs(1);
 
 impl Shared {
-    pub(crate) fn timeline(&self, index: u32) -> &Timeline {
+    pub(super) fn timeline(&self, index: u32) -> &Timeline {
         self.timelines[index as usize]
             .as_ref()
             .expect("a timeline of a queue the device did not create")
     }
 
-    pub(crate) fn completed_value(&self, index: u32) -> u64 {
+    fn completed_value(&self, index: u32) -> u64 {
         // SAFETY: the semaphore is live.
         unsafe {
             self.device
@@ -691,7 +691,7 @@ impl Shared {
     }
 
     /// Per timeline, everything submitted so far.
-    pub(crate) fn submitted(&self) -> After {
+    pub(super) fn submitted(&self) -> After {
         std::array::from_fn(|i| {
             self.timelines[i]
                 .as_ref()
@@ -699,7 +699,7 @@ impl Shared {
         })
     }
 
-    pub(crate) fn completed(&self) -> After {
+    pub(super) fn completed(&self) -> After {
         std::array::from_fn(|i| {
             if self.timelines[i].is_some() {
                 self.completed_value(i as u32)
@@ -709,19 +709,19 @@ impl Shared {
         })
     }
 
-    pub(crate) fn after_point(&self, p: TimelinePoint) -> After {
+    pub(super) fn after_point(&self, p: TimelinePoint) -> After {
         let mut after = [0; MAX_TIMELINES];
         after[p.timeline as usize] = p.value;
         after
     }
 
-    pub(crate) fn wait(&self, point: TimelinePoint, timeout: Duration) -> Result<(), Error> {
+    pub(super) fn wait(&self, point: TimelinePoint, timeout: Duration) -> Result<(), Error> {
         let semaphore = self.timeline(point.timeline).semaphore;
         self.wait_values(&[semaphore], &[point.value], timeout)
     }
 
     /// Blocks until everything submitted so far, on every timeline, has completed.
-    pub(crate) fn wait_submitted(&self, timeout: Duration) -> Result<(), Error> {
+    pub(super) fn wait_submitted(&self, timeout: Duration) -> Result<(), Error> {
         let (semaphores, values): (Vec<_>, Vec<_>) = self
             .timelines
             .iter()

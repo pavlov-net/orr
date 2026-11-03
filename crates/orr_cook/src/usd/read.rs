@@ -21,8 +21,8 @@ pub(super) const SESSION: &str = "orr_cook_session.usda";
 /// Files the stage read, with the hash of the bytes it was served.
 #[derive(Default)]
 pub(super) struct Reads {
-    pub files: BTreeMap<PathBuf, Hash32>,
-    pub session: String,
+    files: BTreeMap<PathBuf, Hash32>,
+    pub(super) session: String,
 }
 
 /// The default resolver, recording every file it serves and serving the session layer.
@@ -260,8 +260,8 @@ pub(super) fn quat(wxyz: &[f64]) -> DQuat {
 
 /// Reads attributes of one prim at one time.
 pub(super) struct PrimReader<'a> {
-    pub prim: &'a usd::Prim,
-    pub time: usd::TimeCode,
+    pub(super) prim: &'a usd::Prim,
+    pub(super) time: usd::TimeCode,
 }
 
 impl PrimReader<'_> {
@@ -392,15 +392,15 @@ pub(super) enum Interp {
 
 /// A primvar's elements (of `width` numbers each), its interpolation and indices.
 pub(super) struct Primvar {
-    pub values: Vec<f64>,
-    pub width: usize,
-    pub interp: Interp,
-    pub indices: Option<Vec<i64>>,
+    values: Vec<f64>,
+    width: usize,
+    pub(super) interp: Interp,
+    pub(super) indices: Option<Vec<i64>>,
 }
 
 impl Primvar {
     /// Element `i` of the primvar's domain (point, face or face-vertex, by interpolation).
-    pub(super) fn get(&self, i: usize) -> Option<&[f64]> {
+    fn get(&self, i: usize) -> Option<&[f64]> {
         let i = match &self.indices {
             Some(ix) => usize::try_from(*ix.get(i)?).ok()?,
             None => i,

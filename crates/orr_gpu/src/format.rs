@@ -76,7 +76,7 @@ impl Format {
         if self.is_compressed() { 4 } else { 1 }
     }
 
-    pub const fn is_compressed(self) -> bool {
+    const fn is_compressed(self) -> bool {
         use Format::*;
         matches!(
             self,
@@ -95,14 +95,14 @@ impl Format {
         )
     }
 
-    pub const fn is_depth(self) -> bool {
+    pub(crate) const fn is_depth(self) -> bool {
         matches!(
             self,
             Format::D16Unorm | Format::D32Float | Format::D32FloatS8Uint
         )
     }
 
-    pub const fn has_stencil(self) -> bool {
+    pub(crate) const fn has_stencil(self) -> bool {
         matches!(self, Format::D32FloatS8Uint)
     }
 

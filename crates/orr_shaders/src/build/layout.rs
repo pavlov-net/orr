@@ -6,22 +6,22 @@ use super::model::{StructDef, Ty};
 
 /// One member of a generated struct, in order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Slot {
+pub(super) enum Slot {
     Field(usize),
     /// Explicit padding bytes where the SPIR-V leaves a gap.
     Pad(u32),
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Plan {
-    pub(crate) slots: Vec<Slot>,
-    pub(crate) size: u32,
-    pub(crate) align: u32,
+pub(super) struct Plan {
+    pub(super) slots: Vec<Slot>,
+    pub(super) size: u32,
+    align: u32,
 }
 
 impl Plan {
     /// Gaps the SPIR-V leaves: (field after the gap or `None` at the end, bytes).
-    pub(crate) fn gaps<'a>(&self, def: &'a StructDef) -> Vec<(Option<&'a str>, u32)> {
+    pub(super) fn gaps<'a>(&self, def: &'a StructDef) -> Vec<(Option<&'a str>, u32)> {
         let mut out = Vec::new();
         for (i, slot) in self.slots.iter().enumerate() {
             if let Slot::Pad(n) = *slot {
@@ -39,14 +39,14 @@ impl Plan {
 /// A place where the Rust layout cannot match the SPIR-V.
 #[derive(Debug)]
 pub(crate) struct Mismatch {
-    pub(crate) structure: String,
-    pub(crate) field: String,
-    pub(crate) message: String,
+    pub(super) structure: String,
+    pub(super) field: String,
+    pub(super) message: String,
 }
 
-pub(crate) struct Planner<'a> {
+pub(super) struct Planner<'a> {
     structs: &'a BTreeMap<String, StructDef>,
-    pub(crate) plans: HashMap<String, Plan>,
+    plans: HashMap<String, Plan>,
 }
 
 impl<'a> Planner<'a> {

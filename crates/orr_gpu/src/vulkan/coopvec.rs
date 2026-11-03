@@ -51,7 +51,7 @@ pub struct MatrixConversion {
     pub dst_format: MatrixFormat,
 }
 
-pub(crate) fn component(t: vk::ComponentTypeKHR) -> ComponentType {
+pub(super) fn component(t: vk::ComponentTypeKHR) -> ComponentType {
     use vk::ComponentTypeKHR as C;
     match t {
         C::FLOAT16 => ComponentType::F16,

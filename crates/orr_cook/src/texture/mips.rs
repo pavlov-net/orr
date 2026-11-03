@@ -7,27 +7,27 @@ use rayon::prelude::*;
 
 use super::{Img, MipFilter, Wrap};
 
-pub(crate) struct MipSpec {
-    pub filter: MipFilter,
-    pub wrap: [Wrap; 2],
+pub(super) struct MipSpec {
+    pub(super) filter: MipFilter,
+    pub(super) wrap: [Wrap; 2],
     /// Atlas cells per axis.
-    pub grid: Option<[u32; 2]>,
+    pub(super) grid: Option<[u32; 2]>,
     /// RGB holds a unit vector: filter unnormalized, store renormalized.
-    pub normal: bool,
+    pub(super) normal: bool,
     /// Channel and cutoff of alpha-tested coverage.
-    pub coverage: Option<(usize, f32)>,
+    pub(super) coverage: Option<(usize, f32)>,
 }
 
 /// Normal variance from a normal map added to a roughness channel of a packed texture.
-pub(crate) struct Toksvig {
+pub(super) struct Toksvig {
     /// Channel holding perceptual roughness.
-    pub channel: usize,
+    pub(super) channel: usize,
     /// Normal map mip 0 at the packed texture's size, unit vectors in RGB.
-    pub normals: Img,
+    pub(super) normals: Img,
 }
 
 /// The first `count` mips from `base`, finished as `spec` asks.
-pub(crate) fn chain(base: Img, spec: &MipSpec, count: u32) -> Vec<Img> {
+pub(super) fn chain(base: Img, spec: &MipSpec, count: u32) -> Vec<Img> {
     let mut base = base;
     if spec.normal {
         base.px.par_iter_mut().for_each(|p| *p = normalized(*p));
@@ -71,7 +71,7 @@ fn cell_mip(w: u32, h: u32, [gx, gy]: [u32; 2]) -> bool {
     w.is_multiple_of(gx) && h.is_multiple_of(gy) && w / gx >= 4 && h / gy >= 4
 }
 
-pub(crate) fn normalized(p: [f32; 4]) -> [f32; 4] {
+pub(super) fn normalized(p: [f32; 4]) -> [f32; 4] {
     let n = Vec3::from_slice(&p);
     let l = n.length();
     if l > 0.0 {
@@ -83,7 +83,7 @@ pub(crate) fn normalized(p: [f32; 4]) -> [f32; 4] {
 
 /// Resamples `src` to `dw` x `dh`. With `cells`, each atlas cell resamples alone with its
 /// edges clamped; otherwise the whole image resamples with `wrap`.
-pub(crate) fn downsample(
+fn downsample(
     src: &Img,
     dw: u32,
     dh: u32,
@@ -595,7 +595,7 @@ impl Toksvig {
     /// Adds the normal variance of each mip from mip `first` on to the roughness channel:
     /// with `r` the length of the averaged unit normals, `var = (1 - r) / r` and
     /// `alpha'^2 = alpha^2 + 2 var`, where `alpha` is roughness squared.
-    pub(crate) fn apply(
+    pub(super) fn apply(
         &self,
         chain: &mut [Img],
         spec: &MipSpec,

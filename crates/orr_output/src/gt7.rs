@@ -5,7 +5,7 @@ use orr_color::pq_encode;
 /// Nits of GT7 frame-buffer value 1.0.
 pub const GT7_REFERENCE_NITS: f32 = 100.0;
 /// SDR paper white and peak in nits. GT7's curve parameters assume this SDR white.
-pub const GT7_SDR_NITS: f32 = 250.0;
+pub(crate) const GT7_SDR_NITS: f32 = 250.0;
 
 /// GT7's tone-mapping parameters. The defaults are Polyphony's reference values.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -61,7 +61,7 @@ pub struct Gt7Curve {
 impl Gt7Curve {
     /// GT7 for a display with `peak_nits` and `paper_white_nits`. The tone mapper's output
     /// is display-linear: 1.0 = paper white, up to `peak_nits / paper_white_nits`. SDR uses
-    /// [`GT7_SDR_NITS`] for both; HDR peaks below it are raised to it.
+    /// 250 nits for both; HDR peaks below that are raised to it.
     pub fn new(params: &Gt7Params, peak_nits: f32, paper_white_nits: f32) -> Self {
         let peak = peak_nits.max(GT7_SDR_NITS) / GT7_REFERENCE_NITS;
         let k = (params.linear_section - 1.0) / (params.alpha - 1.0);

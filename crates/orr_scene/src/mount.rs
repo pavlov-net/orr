@@ -213,12 +213,12 @@ struct PlacedPage {
 
 /// A prototype of an instance page, resolved to this run's ids.
 pub(crate) struct PagePrototype {
-    pub model: ModelId,
+    pub(crate) model: ModelId,
     /// Its section materials where it overrides any.
-    pub sets: Option<Vec<MaterialId>>,
-    pub mask: u16,
-    pub pose: u8,
-    pub flags: u32,
+    pub(crate) sets: Option<Vec<MaterialId>>,
+    pub(crate) mask: u16,
+    pub(crate) pose: u8,
+    pub(crate) flags: u32,
 }
 
 pub(crate) enum StagedCopy {
@@ -270,7 +270,7 @@ struct PlacedNeural {
 
 /// One mount on the loading side, shared by its jobs and reads.
 pub(crate) struct MountTask {
-    pub id: MountId,
+    id: MountId,
     loading: Weak<Loading>,
     device: Device,
     /// Writes go through staging and copies (no resizable BAR).
@@ -412,12 +412,7 @@ impl MountTask {
 
 /// `bytes` into `block` at `at`: one sequential write into mapped memory, or into staging
 /// and the copy that moves it.
-pub(crate) fn write(
-    device: &Device,
-    block: Block,
-    at: u64,
-    bytes: &[u8],
-) -> Result<Option<StagedCopy>> {
+fn write(device: &Device, block: Block, at: u64, bytes: &[u8]) -> Result<Option<StagedCopy>> {
     if bytes.is_empty() || block.write_mapped(at, bytes) {
         return Ok(None);
     }
@@ -427,7 +422,7 @@ pub(crate) fn write(
     }))
 }
 
-pub(crate) fn staging(device: &Device, bytes: &[u8]) -> Result<Allocation<u8>> {
+fn staging(device: &Device, bytes: &[u8]) -> Result<Allocation<u8>> {
     let mut src =
         device.gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, "loading staging")?;
     src.as_mut_slice()
@@ -1400,10 +1395,10 @@ fn place_page(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
 
 /// A finished mount, handed to the render thread once its loading-queue work has landed.
 pub(crate) struct Batch {
-    pub mount: MountId,
+    mount: MountId,
     /// The point its staged copies signal; none when nothing was staged.
-    pub point: Option<TimelinePoint>,
-    pub result: Result<Resolved, Arc<Error>>,
+    pub(crate) point: Option<TimelinePoint>,
+    result: Result<Resolved, Arc<Error>>,
 }
 
 impl Batch {
@@ -1453,7 +1448,7 @@ struct ResolvedModel {
 }
 
 /// A mount's assets with every reference between them resolved inside the pack.
-pub(crate) struct Resolved {
+struct Resolved {
     source: Arc<BlobSource>,
     blocks: Vec<Allocation<u8>>,
     textures: Vec<PlacedTexture>,
@@ -1903,13 +1898,13 @@ enum Entry {
 
 /// What a ready mount holds: its lookups and everything to free when it is unmounted.
 pub(crate) struct Resident {
-    pub models: HashMap<AssetId, ModelId>,
-    pub textures: HashMap<AssetId, TextureIndex>,
-    pub materials: HashMap<AssetId, MaterialId>,
-    pub pages: HashMap<AssetId, PageId>,
-    pub skeletons: HashMap<AssetId, SkeletonRef>,
-    pub clips: HashMap<AssetId, ClipRef>,
-    pub volumes: HashMap<AssetId, VolumeRef>,
+    pub(crate) models: HashMap<AssetId, ModelId>,
+    pub(crate) textures: HashMap<AssetId, TextureIndex>,
+    pub(crate) materials: HashMap<AssetId, MaterialId>,
+    pub(crate) pages: HashMap<AssetId, PageId>,
+    pub(crate) skeletons: HashMap<AssetId, SkeletonRef>,
+    pub(crate) clips: HashMap<AssetId, ClipRef>,
+    pub(crate) volumes: HashMap<AssetId, VolumeRef>,
     /// Where the mount's blobs are read from, for requested blobs.
     source: Arc<BlobSource>,
     meshes: Vec<u32>,
@@ -2020,42 +2015,42 @@ fn record_page_copies(
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Hierarchy {
     /// Levels of the deepest hierarchy; paged ones count as `PAGED_DEPTH`.
-    pub depth: u32,
+    pub(crate) depth: u32,
     /// Some resident mesh has a paged hierarchy.
-    pub paged: bool,
+    pub(crate) paged: bool,
     /// Clusters of the largest resident mesh.
-    pub max_clusters: u32,
+    pub(crate) max_clusters: u32,
 }
 
 /// Capacities of the global model and mesh tables.
 #[derive(Clone, Copy)]
 pub(crate) struct TableSizes {
-    pub models: u32,
-    pub meshes: u32,
-    pub model_materials: u32,
-    pub page_table: u32,
+    pub(crate) models: u32,
+    pub(crate) meshes: u32,
+    pub(crate) model_materials: u32,
+    pub(crate) page_table: u32,
 }
 
 /// The render thread's mounts and the global model and mesh tables they fill.
 pub(crate) struct Mounts {
     entries: Vec<Option<Entry>>,
-    pub models: Allocation<ModelGpu>,
+    pub(crate) models: Allocation<ModelGpu>,
     model_ids: RangeAllocator,
-    pub meshes: Allocation<MeshGpu>,
+    pub(crate) meshes: Allocation<MeshGpu>,
     mesh_ids: RangeAllocator,
     /// The resident cluster table, by cluster id.
-    pub clusters: Allocation<ClusterRef>,
+    pub(crate) clusters: Allocation<ClusterRef>,
     accel: Arc<AccelShared>,
     model_materials: Allocation<u32>,
     model_material_ranges: RangeAllocator,
     page_table: Allocation<u64>,
     page_ranges: RangeAllocator,
     sizes: TableSizes,
-    pub pages: Vec<Option<InstancePage>>,
+    pub(crate) pages: Vec<Option<InstancePage>>,
     /// By page: the mount and unit of its records.
     page_keys: Vec<Option<(MountId, u32)>>,
     retired: Vec<(u64, Resident)>,
-    pub streaming: Streaming,
+    pub(crate) streaming: Streaming,
     /// The mount and mesh of each resident model.
     owners: FxHashMap<ModelId, (MountId, u32)>,
     /// The mount and mesh of each resident mesh id.
@@ -2086,16 +2081,16 @@ struct MeshMasks {
 
 /// What applying a batch writes into: the frame's records and the global tables.
 pub(crate) struct Apply<'a> {
-    pub device: &'a Device,
-    pub window: &'a UploadWindow,
-    pub seq: &'a AtomicU64,
-    pub records: &'a mut Vec<Record>,
-    pub materials: &'a MaterialTable,
-    pub emission: &'a mut Vec<Option<ModelEmission>>,
+    pub(crate) device: &'a Device,
+    pub(crate) window: &'a UploadWindow,
+    pub(crate) seq: &'a AtomicU64,
+    pub(crate) records: &'a mut Vec<Record>,
+    pub(crate) materials: &'a MaterialTable,
+    pub(crate) emission: &'a mut Vec<Option<ModelEmission>>,
     /// Sections and animated parts by `ModelId`.
-    pub model_cpu: &'a mut Vec<ModelCpu>,
+    pub(crate) model_cpu: &'a mut Vec<ModelCpu>,
     /// Subdivision cages by `ModelId`.
-    pub cages: &'a mut Vec<Option<ModelCage>>,
+    pub(crate) cages: &'a mut Vec<Option<ModelCage>>,
 }
 
 impl Apply<'_> {

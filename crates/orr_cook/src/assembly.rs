@@ -38,37 +38,37 @@ impl Default for AssemblySettings {
 /// A unit copy in its model's space: `rotation * unit + translation`.
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct UnitPlacement {
-    pub unit: u32,
-    pub rotation: [f32; 4],
-    pub translation: [f32; 3],
+    pub(crate) unit: u32,
+    rotation: [f32; 4],
+    translation: [f32; 3],
 }
 
 /// A mesh cut into its repeated units and the rest.
 pub(crate) struct Split {
     /// Per unit: its mesh in unit space and the source section of each of its sections.
-    pub units: Vec<(MeshData, Vec<u16>)>,
-    pub placements: Vec<UnitPlacement>,
+    pub(crate) units: Vec<(MeshData, Vec<u16>)>,
+    pub(crate) placements: Vec<UnitPlacement>,
     /// Every source section, without the units' triangles.
-    pub remainder: MeshData,
+    pub(crate) remainder: MeshData,
 }
 
 /// What instance sources need to expand placements of model `model`; kept in the cookstate
 /// with the source's record.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Assembly {
-    pub model: String,
-    pub units: Vec<Unit>,
-    pub placements: Vec<UnitPlacement>,
+    pub(crate) model: String,
+    pub(crate) units: Vec<Unit>,
+    pub(crate) placements: Vec<UnitPlacement>,
     /// Triangles of the source mesh and of the model's own mesh after the split.
-    pub source_triangles: u64,
-    pub kept_triangles: u64,
+    pub(crate) source_triangles: u64,
+    pub(crate) kept_triangles: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Unit {
-    pub model: String,
-    pub sections: Vec<u16>,
-    pub triangles: u32,
+    pub(crate) model: String,
+    pub(crate) sections: Vec<u16>,
+    pub(crate) triangles: u32,
 }
 
 /// A triangle: its section and corners, the corner with the smallest position first.
@@ -606,7 +606,7 @@ fn remainder(m: &MeshData, mut removed: Vec<Vec<[u32; 3]>>) -> MeshData {
 
 /// A placement of a unit copy from a placement of its model; `None` when a non-uniform
 /// scale meets a unit rotation that does not map axes to axes.
-pub(crate) fn compose(p: &Placement, u: &UnitPlacement) -> Option<Placement> {
+fn compose(p: &Placement, u: &UnitPlacement) -> Option<Placement> {
     let mut r = Quat::from_array(u.rotation);
     let s = p.scale();
     let a = s.abs();

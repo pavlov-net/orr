@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 const MAGIC: u32 = 0x0723_0203;
 const HEADER_WORDS: usize = 5;
 
-pub(crate) mod op {
+pub(super) mod op {
     pub(crate) const NAME: u16 = 5;
     pub(crate) const MEMBER_NAME: u16 = 6;
     pub(crate) const STRING: u16 = 7;
@@ -49,7 +49,7 @@ pub(crate) mod op {
     pub(crate) const SWITCH: u16 = 251;
 }
 
-pub(crate) mod decoration {
+pub(super) mod decoration {
     pub(crate) const SPEC_ID: u32 = 1;
     pub(crate) const ROW_MAJOR: u32 = 4;
     pub(crate) const ARRAY_STRIDE: u32 = 6;
@@ -59,9 +59,9 @@ pub(crate) mod decoration {
     pub(crate) const OFFSET: u32 = 35;
 }
 
-pub(crate) const STORAGE_UNIFORM: u32 = 2;
+const STORAGE_UNIFORM: u32 = 2;
 const STORAGE_PUSH_CONSTANT: u32 = 9;
-pub(crate) const STORAGE_PHYSICAL: u32 = 5349;
+pub(super) const STORAGE_PHYSICAL: u32 = 5349;
 const EXECUTION_MODE_OMM_ID: u32 = 6031;
 
 /// (decoration, literal operands) pairs.
@@ -69,7 +69,7 @@ type Decorations = Vec<(u32, Vec<u32>)>;
 
 /// A SPIR-V type.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Type {
+pub(super) enum Type {
     Bool,
     Int { width: u32, signed: bool },
     Float { width: u32 },
@@ -121,27 +121,27 @@ fn string(words: &[u32]) -> (String, &[u32]) {
 /// A 64-bit atomic instruction.
 #[derive(Clone, Debug)]
 pub(crate) struct Atomic64 {
-    pub(crate) op: u16,
-    pub(crate) result_used: bool,
+    pub(super) op: u16,
+    pub(super) result_used: bool,
 }
 
 /// The parts of a module the build reads.
 #[derive(Default, Debug)]
-pub(crate) struct Module {
-    pub(crate) names: HashMap<u32, String>,
+pub(super) struct Module {
+    pub(super) names: HashMap<u32, String>,
     decorations: HashMap<u32, Decorations>,
     member_decorations: HashMap<(u32, u32), Decorations>,
-    pub(crate) types: HashMap<u32, Type>,
+    pub(super) types: HashMap<u32, Type>,
     constants: HashMap<u32, u64>,
     /// Result type and literal words of spec constants; booleans carry one word, 0 or 1.
     spec_constants: HashMap<u32, (u32, Vec<u32>)>,
     variables: Vec<(u32, u32, u32)>,
     /// Entry point function ids and names.
-    pub(crate) entries: Vec<(u32, String)>,
+    pub(super) entries: Vec<(u32, String)>,
     /// Entry points with the opacity-micromap execution mode.
-    pub(crate) omm_entries: HashSet<u32>,
+    pub(super) omm_entries: HashSet<u32>,
     pub(crate) atomics64: Vec<Atomic64>,
-    pub(crate) ray_query: bool,
+    pub(super) ray_query: bool,
 }
 
 impl Module {
@@ -294,7 +294,7 @@ impl Module {
         }
     }
 
-    pub(crate) fn decoration(&self, id: u32, which: u32) -> Option<&[u32]> {
+    pub(super) fn decoration(&self, id: u32, which: u32) -> Option<&[u32]> {
         self.decorations
             .get(&id)?
             .iter()
@@ -302,7 +302,7 @@ impl Module {
             .map(|(_, v)| v.as_slice())
     }
 
-    pub(crate) fn member_decoration(&self, id: u32, member: u32, which: u32) -> Option<u32> {
+    pub(super) fn member_decoration(&self, id: u32, member: u32, which: u32) -> Option<u32> {
         self.member_decorations
             .get(&(id, member))?
             .iter()
@@ -310,7 +310,7 @@ impl Module {
             .and_then(|(_, v)| v.first().copied())
     }
 
-    pub(crate) fn member_has(&self, id: u32, member: u32, which: u32) -> bool {
+    pub(super) fn member_has(&self, id: u32, member: u32, which: u32) -> bool {
         self.member_decorations
             .get(&(id, member))
             .is_some_and(|v| v.iter().any(|(d, _)| *d == which))
@@ -318,7 +318,7 @@ impl Module {
 
     /// The struct type of the push-constant block for an inline root, else of the uniform block
     /// at descriptor set 0, binding 0.
-    pub(crate) fn root_block(&self, inline: bool) -> Option<u32> {
+    pub(super) fn root_block(&self, inline: bool) -> Option<u32> {
         self.variables.iter().find_map(|&(id, ptr, storage)| {
             let found = if inline {
                 storage == STORAGE_PUSH_CONSTANT
@@ -338,7 +338,7 @@ impl Module {
     }
 
     /// Spec constant id to (scalar type id, literal words).
-    pub(crate) fn spec_defaults(&self) -> HashMap<u32, (u32, Vec<u32>)> {
+    pub(super) fn spec_defaults(&self) -> HashMap<u32, (u32, Vec<u32>)> {
         self.spec_constants
             .iter()
             .filter_map(|(id, value)| {
@@ -386,7 +386,7 @@ fn takes_literals(o: u16) -> bool {
 /// `stripped` with the strings of `full` that its instructions still name. Slang's
 /// `-separate-debug-info` moves every `OpString` but the build identifier's to the sidecar,
 /// so a stripped `printf` names a format the module no longer defines.
-pub(crate) fn restore_strings(stripped: Vec<u32>, full: &[u32]) -> Vec<u32> {
+pub(super) fn restore_strings(stripped: Vec<u32>, full: &[u32]) -> Vec<u32> {
     let defined: HashSet<u32> = instructions(&stripped)
         .filter(|(_, i)| i.op == op::STRING)
         .map(|(_, i)| i.args[0])

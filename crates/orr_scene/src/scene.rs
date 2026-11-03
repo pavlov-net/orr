@@ -249,58 +249,58 @@ pub struct InstancesDesc {
 }
 
 pub(crate) struct Tables {
-    pub root: Allocation<SceneRoot>,
-    pub instances: Allocation<InstanceGpu>,
-    pub slot_state: Allocation<SlotStateGpu>,
-    pub groups: Allocation<GroupGpu>,
-    pub material_sets: Allocation<MaterialId>,
-    pub lights: Allocation<LightGpu>,
+    pub(crate) root: Allocation<SceneRoot>,
+    pub(crate) instances: Allocation<InstanceGpu>,
+    pub(crate) slot_state: Allocation<SlotStateGpu>,
+    pub(crate) groups: Allocation<GroupGpu>,
+    pub(crate) material_sets: Allocation<MaterialId>,
+    pub(crate) lights: Allocation<LightGpu>,
     /// Producer entries first, then instance spans.
-    pub emissive: Allocation<EmissiveGpu>,
-    pub producers: Allocation<ProducerGpu>,
-    pub batches: Allocation<ProducerBatch>,
+    pub(crate) emissive: Allocation<EmissiveGpu>,
+    pub(crate) producers: Allocation<ProducerGpu>,
+    pub(crate) batches: Allocation<ProducerBatch>,
     /// Tessellated entries' patch batches, zero for others.
-    pub patches: Allocation<ProducerBatch>,
-    pub tess_state: Allocation<TessStateGpu>,
+    pub(crate) patches: Allocation<ProducerBatch>,
+    pub(crate) tess_state: Allocation<TessStateGpu>,
     /// Cluster, vertex and segment count of each producer batch, and a spare word.
-    pub producer_counts: Allocation<[u32; 4]>,
-    pub producer_state: Allocation<ProducerStateGpu>,
-    pub sky_stats: Allocation<SkyStats>,
-    pub skinned: Allocation<SkinnedGpu>,
-    pub skin_state: Allocation<SkinStateGpu>,
-    pub decals: Allocation<DecalGpu>,
-    pub decal_bins: Allocation<DecalBinGpu>,
-    pub decal_refs: Allocation<u32>,
-    pub proxies: Allocation<MediumProxyGpu>,
+    pub(crate) producer_counts: Allocation<[u32; 4]>,
+    pub(crate) producer_state: Allocation<ProducerStateGpu>,
+    pub(crate) sky_stats: Allocation<SkyStats>,
+    pub(crate) skinned: Allocation<SkinnedGpu>,
+    pub(crate) skin_state: Allocation<SkinStateGpu>,
+    pub(crate) decals: Allocation<DecalGpu>,
+    pub(crate) decal_bins: Allocation<DecalBinGpu>,
+    pub(crate) decal_refs: Allocation<u32>,
+    pub(crate) proxies: Allocation<MediumProxyGpu>,
 }
 
 pub(crate) struct Group {
-    pub writer: GroupWriter,
-    pub count: u32,
-    pub anchor: WorldPos,
+    pub(crate) writer: GroupWriter,
+    count: u32,
+    anchor: WorldPos,
     /// `current` and the other buffer; GPU groups swap them every updated frame.
-    pub buffers: Vec<Allocation<u8>>,
-    pub current: usize,
+    pub(crate) buffers: Vec<Allocation<u8>>,
+    pub(crate) current: usize,
     /// `GroupGpu::previous` points at the current buffer.
-    pub previous_is_current: bool,
-    pub created_frame: u64,
-    pub written: bool,
+    pub(crate) previous_is_current: bool,
+    pub(crate) created_frame: u64,
+    pub(crate) written: bool,
     /// A page group's record; its buffers are empty.
-    pub page: Option<PageGroup>,
+    pub(crate) page: Option<PageGroup>,
 }
 
 /// What a cooked page's transform group holds.
 #[derive(Clone, Copy)]
 pub(crate) struct PageGroup {
-    pub page: PageId,
+    pub(crate) page: PageId,
     /// Where its records are resident; 0: not resident, which hides its copies.
-    pub records: u64,
+    pub(crate) records: u64,
     /// `records` changed since the group record was last written.
-    pub changed: bool,
-    pub origin: [f32; 3],
-    pub extent: [f32; 3],
-    pub log2_scale_min: f32,
-    pub log2_scale_max: f32,
+    pub(crate) changed: bool,
+    origin: [f32; 3],
+    extent: [f32; 3],
+    log2_scale_min: f32,
+    log2_scale_max: f32,
 }
 
 impl Group {
@@ -343,134 +343,134 @@ impl Group {
 /// What writers know of a resident model.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ModelCpu {
-    pub sections: u32,
-    pub animated_parts: u32,
+    pub(crate) sections: u32,
+    pub(crate) animated_parts: u32,
     /// The `orr.trace` candidate class its copies take; `None` where its sections mix
     /// dielectric or presence materials with others.
-    pub candidate_class: Option<u8>,
+    pub(crate) candidate_class: Option<u8>,
     /// Its skeleton's joints; 0 without a skeleton.
-    pub joints: u32,
+    pub(crate) joints: u32,
     /// Set when its mesh is skinned.
-    pub skin: Option<SkinShape>,
+    pub(crate) skin: Option<SkinShape>,
     /// It has a subdivision cage and no mesh.
-    pub cage_only: bool,
+    pub(crate) cage_only: bool,
     /// It is an edit of another model's mesh.
-    pub edit: bool,
+    pub(crate) edit: bool,
 }
 
 /// A cooked page placed in a scene: its prototypes until its records first land, which write
 /// its slots, and what its removal frees.
 pub(crate) struct PagePlacement {
-    pub range: InstanceRange,
-    pub group: TransformGroupId,
-    pub page: PageId,
-    pub prototypes: Allocation<u8>,
-    pub prototype_count: u32,
-    pub spans: GpuPtr<EmissiveGpu>,
-    pub first_entry: u32,
-    pub entry_stride: u32,
-    pub expanded: bool,
+    pub(crate) range: InstanceRange,
+    pub(crate) group: TransformGroupId,
+    pub(crate) page: PageId,
+    pub(crate) prototypes: Allocation<u8>,
+    pub(crate) prototype_count: u32,
+    pub(crate) spans: GpuPtr<EmissiveGpu>,
+    pub(crate) first_entry: u32,
+    pub(crate) entry_stride: u32,
+    pub(crate) expanded: bool,
     /// Its prototypes' entries of the page part of the material-set table.
-    pub sets: (u32, u32),
+    pub(crate) sets: (u32, u32),
 }
 
 /// The vertex and cluster counts of a skinned mesh.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SkinShape {
-    pub vertices: u32,
-    pub clusters: u32,
+    pub(crate) vertices: u32,
+    pub(crate) clusters: u32,
 }
 
 /// The copies of one `add_skinned` call: their slots, skinned-copy entries and vertex arrays.
-pub(crate) struct SkinRange {
-    pub slots: InstanceRange,
-    pub entry: u32,
-    pub arrays: CopyArrays,
+struct SkinRange {
+    slots: InstanceRange,
+    entry: u32,
+    arrays: CopyArrays,
     /// Copies not yet removed.
-    pub live: u32,
+    live: u32,
 }
 
 /// What a scene chooses geometry for before any view has asked ([`crate::Frame::request_detail`]).
 const DEFAULT_PIXELS_PER_RADIAN: f32 = 1000.0;
 
 pub(crate) struct SceneCpu {
-    pub slots: RangeAllocator,
+    pub(crate) slots: RangeAllocator,
     /// The model of each slot handed out.
-    pub slot_models: Vec<u32>,
+    slot_models: Vec<u32>,
     /// Section masks copies name since the last frame: their BLAS build if missing.
-    pub masks: HashSet<(ModelId, u16)>,
+    pub(crate) masks: HashSet<(ModelId, u16)>,
     /// Ranges removed in a frame, freed once that frame has completed.
-    pub removed: Vec<(u64, InstanceRange)>,
+    pub(crate) removed: Vec<(u64, InstanceRange)>,
     /// Instance entries of the emissive list, counted after the producer entries.
-    pub emissive: RangeAllocator,
-    pub emissive_runs: Runs,
+    pub(crate) emissive: RangeAllocator,
+    emissive_runs: Runs,
     /// Entry ranges removed in a frame, freed once that frame has completed.
-    pub emissive_removed: Vec<(u64, u32, u32)>,
-    pub producers: Vec<Option<Producer>>,
+    pub(crate) emissive_removed: Vec<(u64, u32, u32)>,
+    pub(crate) producers: Vec<Option<Producer>>,
     /// Memory of replaced or cleared producer entries, freed once that frame has completed.
-    pub retired: Vec<(u64, Producer)>,
+    pub(crate) retired: Vec<(u64, Producer)>,
     /// Producer figures copied back each frame; made at the first update.
-    pub producer_readback: Option<producer::Readback>,
+    pub(crate) producer_readback: Option<producer::Readback>,
     /// Index = TransformGroupId; entry 0 is the null group.
-    pub groups: Vec<Option<Group>>,
-    pub records: Vec<Record>,
-    pub focus: Option<DVec3>,
+    pub(crate) groups: Vec<Option<Group>>,
+    pub(crate) records: Vec<Record>,
+    pub(crate) focus: Option<DVec3>,
     /// What the scene's per-frame work chooses geometry for, from the requests the last
     /// update took.
-    pub pixels_per_radian: f32,
+    pub(crate) pixels_per_radian: f32,
     /// The largest request since the last update.
-    pub requested_detail: Option<f32>,
-    pub origin_cell: IVec3,
-    pub environment: u64,
-    pub medium: u64,
-    pub surface_data: u64,
-    pub near_range: f32,
-    pub ptlas: Ptlas,
+    pub(crate) requested_detail: Option<f32>,
+    pub(crate) origin_cell: IVec3,
+    pub(crate) environment: u64,
+    pub(crate) medium: u64,
+    pub(crate) surface_data: u64,
+    pub(crate) near_range: f32,
+    pub(crate) ptlas: Ptlas,
     /// Made at the scene's first update.
-    pub cuts: Option<Cuts>,
+    pub(crate) cuts: Option<Cuts>,
     /// Skinned-copy entries.
-    pub skinned: RangeAllocator,
+    pub(crate) skinned: RangeAllocator,
     /// One past the highest skinned-copy entry handed out.
-    pub skinned_high_water: u32,
-    pub skins: Vec<SkinRange>,
+    pub(crate) skinned_high_water: u32,
+    skins: Vec<SkinRange>,
     /// Entry ranges and vertex arrays of removed skinned copies, freed once that frame has
     /// completed.
-    pub skins_removed: Vec<(u64, u32, u32, Option<CopyArrays>)>,
+    pub(crate) skins_removed: Vec<(u64, u32, u32, Option<CopyArrays>)>,
     /// Made at the first update with skinned copies.
-    pub skin_frame: Option<SkinFrame>,
+    pub(crate) skin_frame: Option<SkinFrame>,
     /// The first view `raster_view` rendered of the scene in its last frame, which the
     /// tessellator's edge factors test for what it saw.
-    pub seen_by: Option<LastView>,
+    pub(crate) seen_by: Option<LastView>,
     /// Where each decal is listed, by `DecalId`.
-    pub decals: Vec<Option<Listing>>,
+    pub(crate) decals: Vec<Option<Listing>>,
     /// Set when a decal changed since the bin table was last written.
-    pub decals_changed: bool,
-    pub decal_bin_slots: u32,
-    pub decal_globals: u32,
+    pub(crate) decals_changed: bool,
+    pub(crate) decal_bin_slots: u32,
+    pub(crate) decal_globals: u32,
     /// The last frame `update_scenes` updated the scene.
-    pub last_update: u64,
+    pub(crate) last_update: u64,
     /// Cooked pages placed in the scene.
-    pub pages: Vec<PagePlacement>,
+    pub(crate) pages: Vec<PagePlacement>,
     /// Pages removed in a frame, freed once that frame has completed.
-    pub pages_removed: Vec<(u64, PagePlacement)>,
+    pub(crate) pages_removed: Vec<(u64, PagePlacement)>,
     /// Entries of the page part of the material-set table, from `material_set_capacity`.
-    pub page_sets: RangeAllocator,
+    pub(crate) page_sets: RangeAllocator,
 }
 
 /// A view of a scene: its history, the frame and its constants.
 #[derive(Clone, Copy)]
 pub(crate) struct LastView {
-    pub history: ViewHistoryId,
-    pub frame: u64,
-    pub constants: ViewConstants,
+    pub(crate) history: ViewHistoryId,
+    pub(crate) frame: u64,
+    pub(crate) constants: ViewConstants,
 }
 
 pub(crate) struct Scene {
-    pub desc: SceneDesc,
-    pub tables: Tables,
-    pub cpu: Mutex<SceneCpu>,
+    pub(crate) desc: SceneDesc,
+    pub(crate) tables: Tables,
+    pub(crate) cpu: Mutex<SceneCpu>,
     /// Set while a writer for this scene is alive.
-    pub writing: AtomicBool,
+    pub(crate) writing: AtomicBool,
 }
 
 /// 32-bit words in `bytes`.
@@ -602,7 +602,6 @@ impl Scene {
 /// scenes' writers, and disjoint pieces of one returned slice, can be filled on different
 /// threads.
 pub struct SceneWriter<'f> {
-    pub(crate) id: SceneId,
     pub(crate) scene: &'f Scene,
     pub(crate) device: &'f Device,
     pub(crate) window: &'f UploadWindow,
@@ -626,10 +625,6 @@ impl Drop for SceneWriter<'_> {
 }
 
 impl<'f> SceneWriter<'f> {
-    pub fn id(&self) -> SceneId {
-        self.id
-    }
-
     /// Window space for `count` values of `T`, recorded as a copy to `dst`.
     fn upload<T: Pod>(&self, dst: GpuPtr<T>, count: u32) -> Result<&'f mut [T]> {
         let (src, out) = self.window.slice::<T>(self.device, count)?;
