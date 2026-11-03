@@ -1,4 +1,5 @@
-//! One tree asset swaying in the wind, path traced on a ground under a cooked sky and a sun.
+//! One tree asset swaying in the wind, path traced on a ground under `orr_atmosphere`'s sky and
+//! medium and a sun.
 //! The tree is a glTF file, cooked in process into an archive under the OS temp directory
 //! (kept up to date by the cook's own state, so later runs start at once), or an archive
 //! cooked earlier. Its rigid parts come from a rigid skin (each vertex on one joint; the
@@ -27,10 +28,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use examples::linked::KERNELS;
 use examples::mesh::MeshBuilder;
-use examples::scene::{FOV_Y, SUN, sun};
+use examples::scene::{FOV_Y, sun};
 use examples::shaders::tree_wind;
-use examples::sky::{self, Sky};
 use examples::window::Window;
 use examples::{
     Capture, LensSwitches, Options, Workers, assert_clean, device, enable_dlss, entry_head,
@@ -51,6 +52,7 @@ use orr::{
     RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
     TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
+use orr_atmosphere::{Atmosphere, AtmosphereState};
 use orr_cook::{
     ArchiveSpec, AssetSpec, CookOptions, GltfSettings, Manifest, MeshSettings, NodeSelect,
     PartAttribute, Source,
@@ -60,7 +62,8 @@ use orr_math::{DVec3, Mat4, Vec2, Vec3, Vec4};
 
 const TREE: &str = "tree";
 const GROUND: &str = "ground";
-const SKY: &str = "sky";
+/// The ground's color, which the atmosphere's ground carries on to the horizon.
+const SOIL: [f32; 3] = [0.32, 0.28, 0.22];
 
 const HEADLESS_EXTENT: [u32; 2] = [1920, 1080];
 const HEADLESS_FRAMES: u64 = 120;
@@ -348,10 +351,10 @@ fn rig(
     (joints, part_joints)
 }
 
-/// The ground, `half` m to each side, and the sky, cooked into an in-memory pack.
+/// The ground, `half` m to each side, cooked into an in-memory pack.
 fn cook_surroundings(half: f32) -> Arc<[u8]> {
     let soil = Material {
-        base_color: [0.32, 0.28, 0.22],
+        base_color: SOIL,
         specular_roughness: 0.9,
         ..Material::default()
     };
@@ -366,21 +369,17 @@ fn cook_surroundings(half: f32) -> Arc<[u8]> {
         ],
         16,
     );
-    let sky = Sky::new("tree-viewer", SUN);
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(
             Target::Memory,
-            vec![
-                sky.asset(SKY),
-                AssetSpec {
-                    name: GROUND.into(),
-                    source: Source::Mesh {
-                        mesh: floor.finish(),
-                        materials: vec![soil],
-                        settings: MeshSettings::default(),
-                    },
+            vec![AssetSpec {
+                name: GROUND.into(),
+                source: Source::Mesh {
+                    mesh: floor.finish(),
+                    materials: vec![soil],
+                    settings: MeshSettings::default(),
                 },
-            ],
+            }],
         )],
     };
     orr_cook::cook(&manifest, &Default::default())
@@ -417,7 +416,10 @@ fn run(options: &Options) -> Option<Capture> {
     let mut switches = LensSwitches::new(options);
     let title = |s: &LensSwitches| format!("orr tree-viewer: {s}");
     let mut window = (!options.headless).then(|| Window::new(&title(&switches), 1920, 1080));
-    let desc = RendererDesc::default();
+    let desc = RendererDesc {
+        kernels: &KERNELS,
+        ..RendererDesc::default()
+    };
     let mut display = window.as_ref().map(|w| {
         Display::new(
             gpu,
@@ -443,7 +445,13 @@ fn run(options: &Options) -> Option<Capture> {
     let ground = renderer
         .model(mounts[1], AssetId::from_name(GROUND))
         .expect("ground model");
-    let environment = sky::environment(&renderer, gpu, mounts[1], SKY);
+    let atmosphere = Atmosphere {
+        ground_albedo: Vec3::from(SOIL),
+        ..Atmosphere::earth(DVec3::ZERO, Vec3::Y)
+    };
+    let mut sky = AtmosphereState::new(gpu, &atmosphere, 0).expect("atmosphere");
+    sky.set_lights(&[LightId(0)]);
+    sky.skip_fades();
 
     let scene = renderer
         .create_scene(
@@ -518,7 +526,8 @@ fn run(options: &Options) -> Option<Capture> {
         .expect("instances");
     }
     w.set_light(LightId(0), Some(&sun())).expect("sun");
-    w.set_environment(environment.gpu().address());
+    w.set_environment(sky.data());
+    w.set_medium(sky.data());
     drop(w);
     f.end().expect("end frame");
 
@@ -640,6 +649,7 @@ fn run(options: &Options) -> Option<Capture> {
         f.prepare_view(&view, &ViewLighting::default(), &output)
             .expect("prepare view");
         f.update_scenes(&mut |c| {
+            sky.record(c, &[]).expect("sky passes");
             let root = c
                 .put_root(&tree_wind::Root {
                     scene: c.root,
@@ -680,7 +690,7 @@ fn run(options: &Options) -> Option<Capture> {
         .and_then(|(id, _)| renderer.screenshots(history, id).pop())
         .map(|shot| Capture::from_screenshot(&shot));
     drop(headless_target);
-    drop(environment);
+    drop(sky);
     drop(display);
     drop(renderer);
     drop(window);

@@ -1,7 +1,7 @@
 //! A cooked scene path traced by orr: a gold knot, a glossy and a mirror sphere, a block and
-//! a glowing panel on a ground, under a cooked sky and a 100 klx sun. Each frame traces one
-//! path per pixel, auto exposure meters and adapts to the result, and on Windows an egui
-//! overlay shows the exposure. The camera orbits the scene; a still camera averages its
+//! a glowing panel on a ground, under `orr_atmosphere`'s sky and medium and a sun. Each frame
+//! traces one path per pixel, auto exposure meters and adapts to the result, and on Windows an
+//! egui overlay shows the exposure. The camera orbits the scene; a still camera averages its
 //! frames in a scene-referred hook. Windowed runs denoise with DLSS ray reconstruction where
 //! NGX is available.
 //!
@@ -13,6 +13,7 @@
 use std::time::{Duration, Instant};
 
 use examples::average::Average;
+use examples::linked::KERNELS;
 use examples::overlay::Overlay;
 use examples::scene::{FOV_Y, Showcase, TARGET, orbit_eye};
 use examples::window::Window;
@@ -49,7 +50,10 @@ fn main() {
 pub(crate) fn run(options: &Options) -> Option<Capture> {
     let gpu = device();
     let mut window = (!options.headless).then(|| Window::new("orr viewer", 1920, 1080));
-    let desc = RendererDesc::default();
+    let desc = RendererDesc {
+        kernels: &KERNELS,
+        ..RendererDesc::default()
+    };
     let mut display = window.as_ref().map(|w| {
         Display::new(
             gpu,
@@ -65,7 +69,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         enable_dlss(&mut renderer);
     }
     let _workers = Workers::new(renderer.loading(), 2 + CompilingKernels::JOBS);
-    let showcase = Showcase::load(&mut renderer, gpu);
+    let mut showcase = Showcase::load(&mut renderer, gpu);
     let scene = showcase.scene;
     let history = renderer.create_view_history().expect("view history");
     options.wait_for_paths(&mut renderer);
@@ -148,6 +152,29 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         f.scene(scene)
             .expect("scene writer")
             .set_focus(eye.as_dvec3());
+        let view = LitView {
+            scene,
+            history,
+            position: eye.as_dvec3(),
+            rotation: view::look_at_quat(eye, TARGET, Vec3::Y).inverse(),
+            projection: Projection {
+                fov_y: FOV_Y,
+                near: 0.05,
+            },
+            lens: Lens::default(),
+            camera_cut: false,
+            not_rendering_scene: false,
+            screenshot: (capture && final_frame).then_some(ScreenshotRequest::Display {
+                include_ui: !options.headless,
+            }),
+            texture_filter: TextureFilter::Hardware,
+            target,
+        };
+        let output = ViewOutput::default();
+        f.prepare_view(&view, &ViewLighting::default(), &output)
+            .expect("prepare view");
+        f.update_scenes(&mut |c| showcase.sky.record(c, &[]).expect("sky passes"))
+            .expect("update scenes");
         let mut average = average.hook(&f, extent);
         let mut ui = |pass: &mut orr::UiPass<'_, '_>| overlay.paint(pass, id);
         let mut hooks = ViewHooks {
@@ -155,30 +182,8 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             ui: Some(&mut ui),
             ..ViewHooks::default()
         };
-        f.render_view(
-            &LitView {
-                scene,
-                history,
-                position: eye.as_dvec3(),
-                rotation: view::look_at_quat(eye, TARGET, Vec3::Y).inverse(),
-                projection: Projection {
-                    fov_y: FOV_Y,
-                    near: 0.05,
-                },
-                lens: Lens::default(),
-                camera_cut: false,
-                not_rendering_scene: false,
-                screenshot: (capture && final_frame).then_some(ScreenshotRequest::Display {
-                    include_ui: !options.headless,
-                }),
-                texture_filter: TextureFilter::Hardware,
-                target,
-            },
-            &ViewLighting::default(),
-            &ViewOutput::default(),
-            &mut hooks,
-        )
-        .expect("render view");
+        f.render_view(&view, &ViewLighting::default(), &output, &mut hooks)
+            .expect("render view");
         last = Some((id, f.end().expect("end frame")));
     }
 

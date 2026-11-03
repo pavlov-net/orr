@@ -12,6 +12,7 @@
 //! keep the camera still, render 480 x 270 for 120 frames unless told otherwise and write the
 //! last frame as a PNG.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,23 +20,25 @@ use examples::average::Average;
 use examples::field::{Slab, patch_triangles};
 use examples::mesh::MeshBuilder;
 use examples::shaders::slab;
-use examples::sky::{self, Sky};
 use examples::window::Window;
 use examples::{Capture, Options, Workers, assert_clean, device, fixed_time, mount_at};
 use orr::orr_gpu::{
-    Format, QueueKind, SamplerIndex, SpecData, TextureDesc, TextureMemory, TextureUsage,
-    TimelinePoint,
+    AddressMode, Allocation, Device, Filter, Format, MemoryKind, QueueKind, SamplerDesc,
+    SamplerIndex, SpecData, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
 };
+use orr::orr_lighting::EnvironmentMapGpu;
 use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
     Affine3, BoundTexture, ClusterTopology, CompilingKernels, DirectionalLight, DiscProfile,
     Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, HookPass, InstanceFlags,
-    InstancesDesc, Lens, Light, LightId, LitView, MaterialGpu, PackSource, ProducerId, Projection,
-    Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
-    TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    InstancesDesc, Lens, Light, LightId, LitView, MaterialGpu, MountId, PackSource, ProducerId,
+    Projection, Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest,
+    TextureFilter, TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
-use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source};
+use orr_cook::{
+    ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source, TextureSettings, Usage,
+};
 use orr_math::camera::rh::view;
 use orr_math::{DVec3, Vec3};
 
@@ -134,7 +137,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             .model(mount, AssetId::from_name(name))
             .unwrap_or_else(|e| panic!("model {name}: {e}"))
     });
-    let environment = sky::environment(&renderer, gpu, mount, SKY);
+    let environment = sky_environment(&renderer, gpu, mount);
     let slab_kernel = renderer
         .compute_pipeline(&slab::MODULE, "main", SpecData::default())
         .expect("slab pipeline");
@@ -439,13 +442,28 @@ fn cook() -> Arc<[u8]> {
             settings: MeshSettings::default(),
         },
     };
-    let sky = Sky::new("dielectrics", SUN);
+    let dir = std::env::temp_dir().join(format!("orr-dielectrics-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let sky = dir.join("sky.hdr");
+    write_sky(&sky);
     let [g, pool, glass_name, amber_name, jade_name] = MODELS;
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(
             Target::Memory,
             vec![
-                sky.asset(SKY),
+                AssetSpec {
+                    name: SKY.into(),
+                    source: Source::Texture {
+                        path: sky,
+                        settings: TextureSettings {
+                            usage: Usage::Environment {
+                                light_threshold: None,
+                                max_lights: 0,
+                            },
+                            ..TextureSettings::default()
+                        },
+                    },
+                },
                 mesh(g, around.finish(), vec![ground]),
                 mesh(pool, walls.finish(), vec![tiles, ball]),
                 mesh(glass_name, sphere.finish(), vec![glass]),
@@ -454,8 +472,88 @@ fn cook() -> Arc<[u8]> {
             ],
         )],
     };
-    orr_cook::cook(&manifest, &Default::default())
+    let pack = orr_cook::cook(&manifest, &Default::default())
         .expect("cook")
         .memory
-        .remove(0)
+        .remove(0);
+    let _ = std::fs::remove_dir_all(&dir);
+    pack
+}
+
+/// Writes a gradient from a bright horizon to a blue zenith with a glow around the sun, over a
+/// dim ground, as a 1024 x 512 equirectangular Radiance HDR file.
+fn write_sky(path: &Path) {
+    let (w, h) = (1024u32, 512u32);
+    let mut bytes = format!("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y {h} +X {w}\n").into_bytes();
+    for y in 0..h {
+        for x in 0..w {
+            let (theta, phi) = (
+                (y as f32 + 0.5) / h as f32 * std::f32::consts::PI,
+                (x as f32 + 0.5) / w as f32 * std::f32::consts::TAU - std::f32::consts::PI,
+            );
+            let d = Vec3::new(
+                theta.sin() * phi.sin(),
+                theta.cos(),
+                -theta.sin() * phi.cos(),
+            );
+            bytes.extend(rgbe(sky_radiance(d)));
+        }
+    }
+    std::fs::write(path, bytes).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+}
+
+/// The environment record of the sky cooked into `mount`, for `SceneWriter::set_environment`.
+fn sky_environment(
+    renderer: &Renderer,
+    gpu: &Device,
+    mount: MountId,
+) -> Allocation<EnvironmentMapGpu> {
+    let mut environment = gpu
+        .gpu_malloc::<EnvironmentMapGpu>(MemoryKind::Upload, 1, "sky environment")
+        .expect("environment");
+    environment.as_mut_slice().expect("environment")[0] = EnvironmentMapGpu {
+        map: renderer
+            .texture(mount, AssetId::from_name(SKY))
+            .expect("sky texture"),
+        sampler: gpu
+            .sampler(&SamplerDesc {
+                mag: Filter::Linear,
+                min: Filter::Linear,
+                mip: Filter::Linear,
+                address: [AddressMode::ClampToEdge; 3],
+                ..SamplerDesc::default()
+            })
+            .expect("sky sampler"),
+        intensity: 1.0,
+        primaries: orr_color::Primaries::Rec709.id().into(),
+        from_world: [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ],
+    };
+    environment
+}
+
+/// Sky radiance in nits, linear Rec.709, along unit direction `d`.
+fn sky_radiance(d: Vec3) -> Vec3 {
+    let glow = 6.0 * (60.0 * (d.dot(SUN) - 1.0)).exp();
+    if d.y < 0.0 {
+        return Vec3::new(0.55, 0.52, 0.48) * 6000.0;
+    }
+    let horizon = Vec3::new(0.85, 0.9, 1.0) * 5000.0;
+    let zenith = Vec3::new(0.2, 0.38, 1.0) * 4000.0;
+    horizon.lerp(zenith, d.y.sqrt()) * (1.0 + glow)
+}
+
+/// Radiance's shared-exponent encoding of `c`.
+fn rgbe(c: Vec3) -> [u8; 4] {
+    let v = c.max_element();
+    if v < 1e-30 {
+        return [0; 4];
+    }
+    let e = v.log2().floor() as i32 + 1;
+    let scale = 256.0 / 2f32.powi(e);
+    let m = |x: f32| (x * scale).clamp(0.0, 255.0) as u8;
+    [m(c.x), m(c.y), m(c.z), (e + 128) as u8]
 }

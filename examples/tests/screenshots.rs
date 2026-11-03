@@ -39,6 +39,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use examples::average::Average;
+use examples::linked::KERNELS;
 use examples::mesh::MeshBuilder;
 use examples::scene::{FOV_Y, Showcase, TARGET, orbit_eye};
 use examples::{
@@ -301,7 +302,10 @@ struct StillShowcase {
 impl StillShowcase {
     fn new() -> Self {
         let gpu = device();
-        let desc = RendererDesc::default();
+        let desc = RendererDesc {
+            kernels: &KERNELS,
+            ..RendererDesc::default()
+        };
         let mut renderer = Renderer::new(gpu, desc).expect("renderer");
         let workers = Workers::new(renderer.loading(), 2);
         let showcase = Showcase::load(&mut renderer, gpu);
@@ -351,6 +355,35 @@ impl StillShowcase {
                     .map_or_else(Exposure::default, |ev100| Exposure::Manual { ev100 }),
                 ..ViewOutput::default()
             };
+            let lighting = ViewLighting {
+                reference: settings.reference.then(|| ReferenceSettings {
+                    lens: Some(ThinLens {
+                        aperture_radius: 1e-4,
+                        focus_distance: eye.distance(TARGET),
+                    }),
+                }),
+                ..ViewLighting::default()
+            };
+            let view = LitView {
+                // The runs are compared with a still image.
+                lens: Lens {
+                    shutter: 0.0,
+                    ..Lens::default()
+                },
+                screenshot: (i + 1 == frames)
+                    .then_some(ScreenshotRequest::Display { include_ui: false }),
+                ..still_view(
+                    self.showcase.scene,
+                    self.history,
+                    eye,
+                    i == 0,
+                    ViewTarget::Texture(&target),
+                )
+            };
+            f.prepare_view(&view, &lighting, &output)
+                .expect("prepare view");
+            f.update_scenes(&mut |c| self.showcase.sky.record(c, &[]).expect("sky passes"))
+                .expect("update scenes");
             let mut sum = average.as_mut().map(|a| a.hook(&f, extent));
             let mut overlay = |pass: &mut TransparencyPass<'_, '_>, _| {
                 pass.cmd.begin_rendering(&Rendering {
@@ -374,35 +407,7 @@ impl StillShowcase {
                 ..ViewHooks::default()
             };
             let rendered = f
-                .render_view(
-                    &LitView {
-                        // The runs are compared with a still image.
-                        lens: Lens {
-                            shutter: 0.0,
-                            ..Lens::default()
-                        },
-                        screenshot: (i + 1 == frames)
-                            .then_some(ScreenshotRequest::Display { include_ui: false }),
-                        ..still_view(
-                            self.showcase.scene,
-                            self.history,
-                            eye,
-                            i == 0,
-                            ViewTarget::Texture(&target),
-                        )
-                    },
-                    &ViewLighting {
-                        reference: settings.reference.then(|| ReferenceSettings {
-                            lens: Some(ThinLens {
-                                aperture_radius: 1e-4,
-                                focus_distance: eye.distance(TARGET),
-                            }),
-                        }),
-                        ..ViewLighting::default()
-                    },
-                    &output,
-                    &mut hooks,
-                )
+                .render_view(&view, &lighting, &output, &mut hooks)
                 .expect("render view");
             render_extent = rendered.render_extent;
             mode = rendered.reconstruction;
@@ -529,8 +534,9 @@ impl StillShowcase {
                 for (view, output) in &lit {
                     f.prepare_view(view, &lighting, output).expect("prepare");
                 }
-                f.update_scenes(&mut |_| {}).expect("update scenes");
             }
+            f.update_scenes(&mut |c| self.showcase.sky.record(c, &[]).expect("sky passes"))
+                .expect("update scenes");
             for (view, output) in &lit {
                 f.render_view(view, &lighting, output, &mut ViewHooks::default())
                     .expect("render view");
@@ -646,7 +652,7 @@ fn render_view_runs_ray_reconstruction() {
     // Where auto exposure settles on the converged image. Each run's camera cut would snap it to
     // that run's own meter, and FLIP adds 0.02 for the 0.04 stops that leaves.
     let off = StillSettings {
-        ev100: Some(14.82),
+        ev100: Some(15.62),
         ..with(Reconstruction::Off)
     };
     let truth = still.run(
@@ -688,14 +694,14 @@ fn render_view_runs_ray_reconstruction() {
         "against the converged image: noisy {noisy:?}, still {denoised_error:?}, \
          moving {moving:?}, averaged in the hook {summed:?}"
     );
-    // Measured mean 0.059 still and 0.060 moving; the jitter sign flipped gives 0.063 and 0.065,
-    // and one path per pixel without ray reconstruction 0.109. The rest of the error is the
+    // Measured mean 0.050 still and 0.053 moving; the jitter sign flipped gives 0.054 and 0.056,
+    // and one path per pixel without ray reconstruction 0.096. The rest of the error is the
     // fireflies in the converged image.
     assert!(
-        denoised_error.mean < 0.061,
+        denoised_error.mean < 0.052,
         "noisy {noisy:?}, still {denoised_error:?}"
     );
-    assert!(moving.mean < 0.063, "noisy {noisy:?}, moving {moving:?}");
+    assert!(moving.mean < 0.055, "noisy {noisy:?}, moving {moving:?}");
     assert!(
         summed.mean < noisy.mean * 0.75,
         "noisy {noisy:?}, averaged {summed:?}"

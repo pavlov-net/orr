@@ -1,13 +1,13 @@
 //! The dense vegetation test scene: a 1 km heightfield tile of grid-patch producer clusters,
 //! a forest of trees with rigid parts and discrete levels swaying inside their animation
 //! range, procedural grass in a meadow, a wave-displaced dielectric pond, emissive particles
-//! drawn at the transparency point, a low limb-darkened sun and a textured moon it lights,
-//! all path traced through `render_view`. Trees come from cooked archives in
-//! `$ORR_CONTENT/cooked`, or with `--synthetic` from stand-in trees of four species and three
-//! variants cooked in process. Past 150, 400 and 1000 m from the focus each tree switches to
-//! a coarser stand-in of its species (`tree S far 1` to `3` in the same pack), cross-fading
-//! between them. Camera scripts walk, turn, look from above, fly through it and fly out from
-//! it on a fixed clock, so runs repeat; each frame's figures go into a [`Report`].
+//! drawn at the transparency point, a low limb-darkened sun and a textured moon it lights, in
+//! `orr_atmosphere`'s sky and medium, all path traced through `render_view`. Trees come from
+//! cooked archives in `$ORR_CONTENT/cooked`, or with `--synthetic` from stand-in trees of four
+//! species and three variants cooked in process. Past 150, 400 and 1000 m from the focus each
+//! tree switches to a coarser stand-in of its species (`tree S far 1` to `3` in the same pack),
+//! cross-fading between them. Camera scripts walk, turn, look from above, fly through it and fly
+//! out from it on a fixed clock, so runs repeat; each frame's figures go into a [`Report`].
 //!
 //! Switches (all optional):
 //! `--synthetic`, `--trees N`, `--species N`, `--grass-density D` (blades per m^2),
@@ -29,7 +29,6 @@ use orr::orr_gpu::{
     MeshPipeline, MeshPipelineDesc, QueueKind, RasterState, Rendering, SamplerIndex, ShaderStage,
     SpecData, Stages, Texture, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
 };
-use orr::orr_lighting::EnvironmentMapGpu;
 use orr::orr_pack::material::{Material, slot};
 use orr::orr_pack::mesh::MeshInfo;
 use orr::orr_pack::model::ModelInfo;
@@ -43,15 +42,17 @@ use orr::{
     SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc, TransformGroupId,
     TransparencyPass, ViewHistoryId, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
+use orr_atmosphere::presets::solar_disc;
+use orr_atmosphere::{Atmosphere, AtmosphereState, MAX_SKY_LIGHTS};
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source};
 use orr_cook::{TextureSettings, Usage};
 use orr_math::camera::rh::view;
 use orr_math::{DVec3, Mat3, Vec3};
 
 use crate::field::{Grass, Heights, Slab, Terrain, blade_triangles, patch_triangles};
+use crate::linked::KERNELS;
 use crate::mesh::MeshBuilder;
 use crate::shaders::{fireflies, glow, grass, slab, sway, terrain};
-use crate::sky::{self, Sky};
 use crate::window::Window;
 use crate::{Capture, Options, Workers, device, entry_head, fixed_time, gray_png};
 
@@ -89,17 +90,16 @@ const GRASS: ProducerId = ProducerId(2);
 const WATER: ProducerId = ProducerId(3);
 const PARTICLES: ProducerId = ProducerId(4);
 
-const SKY: &str = "dense vegetation sky";
 const MOON: &str = "dense vegetation moon";
 const LEAF: &str = "tex/leaf";
 
 /// The sun: low in the south-west, ahead and left of the walk.
 const SUN_ELEVATION: f32 = 0.2;
 const SUN_AZIMUTH: f32 = 2.6;
-const SUN_ILLUMINANCE: Vec3 = Vec3::new(60_000.0, 52_000.0, 42_000.0);
-const SUN_RADIUS: f32 = 0.004_65;
 const MOON_ILLUMINANCE: Vec3 = Vec3::new(0.3, 0.3, 0.3);
 const MOON_RADIUS: f32 = 0.004_5;
+/// The terrain's color, which the atmosphere's ground carries on to the horizon.
+const SOIL: [f32; 3] = [0.3, 0.26, 0.18];
 
 /// A camera script, on a fixed 60 Hz clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -473,11 +473,10 @@ fn tree(species: u32, variant: u32) -> orr_cook::MeshInput {
     m.finish()
 }
 
-/// The pack every run cooks in process: the sky, the moon's albedo and, with `--synthetic`,
+/// The pack every run cooks in process: the moon's albedo and, with `--synthetic`,
 /// the stand-in trees under their leaf mask.
 fn cook(settings: &Settings) -> Arc<[u8]> {
     let started = Instant::now();
-    let sky = Sky::new("dense-vegetation", sun_direction(0));
     let dir = std::env::temp_dir().join(format!("orr-dense-vegetation-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let texture = |name: &str, path: PathBuf, usage: Usage| AssetSpec {
@@ -513,7 +512,6 @@ fn cook(settings: &Settings) -> Arc<[u8]> {
         }
     });
     let mut assets = vec![
-        sky.asset(SKY),
         texture(MOON, moon, Usage::Color),
         texture(LEAF, leaf, Usage::Linear1),
     ];
@@ -686,6 +684,10 @@ fn ground(x: f32, z: f32) -> f32 {
         - 3.0 * (-(dx * dx + dz * dz) / (2.0 * 70.0 * 70.0)).exp()
 }
 
+/// Height of the atmosphere's ground plane, m: below the lowest [`ground`] can reach, 4 + 1.5 +
+/// 0.4 + 3 m under 0, so no eye or surface lies under it.
+const AIR_FLOOR: f64 = -9.0;
+
 /// The water's level: over the basin's floor.
 fn water_level() -> f32 {
     ground(POND[0], POND[1]) + 1.8
@@ -754,7 +756,7 @@ struct DenseVegetation {
     glow: MeshPipeline,
     stream_pack: Option<PackSource>,
     streaming: Option<MountId>,
-    _environment: Allocation<EnvironmentMapGpu>,
+    sky: AtmosphereState,
 }
 
 struct Kernels {
@@ -862,6 +864,7 @@ const FIRST_FRAME: u64 = 1000;
 /// The renderer's settings for `settings`.
 fn renderer_desc(settings: &Settings) -> RendererDesc {
     RendererDesc {
+        kernels: &KERNELS,
         cell_log2: CELL_LOG2,
         software_raster_pixels: settings.sw_raster_px,
         raster_error_pixels: if settings.lod0_only {
@@ -1059,7 +1062,19 @@ impl DenseVegetation {
                 "dense vegetation particles",
             )
             .expect("particle pipeline");
-        let environment = sky::environment(renderer, gpu, extras_mount, SKY);
+        let atmosphere = Atmosphere {
+            ground_albedo: Vec3::from(SOIL),
+            ..Atmosphere::earth(DVec3::new(0.0, AIR_FLOOR, 0.0), Vec3::Y)
+        };
+        let mut sky = AtmosphereState::new(gpu, &atmosphere, 0).expect("atmosphere");
+        // The suns come first, brightest first, so stopping at the limit keeps the lights the
+        // sky folds in.
+        let candidates: Vec<LightId> = (0..lights + textured)
+            .take(MAX_SKY_LIGHTS)
+            .map(LightId)
+            .collect();
+        sky.set_lights(&candidates);
+        sky.skip_fades();
         let moon = renderer
             .texture(extras_mount, AssetId::from_name(MOON))
             .expect("moon texture");
@@ -1080,7 +1095,7 @@ impl DenseVegetation {
             let mut create = |m: Material| mats.create(&material(m)).expect("material");
             (
                 create(Material {
-                    base_color: [0.3, 0.26, 0.18],
+                    base_color: SOIL,
                     specular_roughness: 0.9,
                     ..Material::default()
                 }),
@@ -1272,16 +1287,10 @@ impl DenseVegetation {
 
             let sun = LightId(0);
             for i in 0..lights {
-                w.set_light(
-                    LightId(i),
-                    Some(&Light::Directional(DirectionalLight {
-                        direction_to_light: sun_direction(i),
-                        illuminance: SUN_ILLUMINANCE / (1 + i) as f32,
-                        angular_radius: SUN_RADIUS,
-                        disc: DiscProfile::LimbDarkened,
-                    })),
-                )
-                .expect("sun");
+                let mut light = solar_disc(sun_direction(i));
+                light.illuminance /= (1 + i) as f32;
+                w.set_light(LightId(i), Some(&Light::Directional(light)))
+                    .expect("sun");
             }
             for i in 0..textured {
                 w.set_light(
@@ -1304,7 +1313,8 @@ impl DenseVegetation {
                 )
                 .expect("moon");
             }
-            w.set_environment(environment.gpu().address());
+            w.set_environment(sky.data());
+            w.set_medium(sky.data());
         }
         let land_kernel = kernels.terrain;
         f.update_scenes(&mut |c| {
@@ -1338,12 +1348,13 @@ impl DenseVegetation {
             glow,
             stream_pack: settings.stream_load.then_some(stream_pack).flatten(),
             streaming: None,
-            _environment: environment,
+            sky,
         }
     }
 
     /// Records the scene's kernels for a camera at `eye` at times `t` and `previous`.
-    fn record(&self, c: &mut SceneCompute<'_, '_>, eye: Vec3, t: f32, previous: f32) {
+    fn record(&mut self, c: &mut SceneCompute<'_, '_>, eye: Vec3, t: f32, previous: f32) {
+        self.sky.record(c, &[]).expect("sky passes");
         self.grass.record(
             c,
             GRASS,

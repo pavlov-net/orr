@@ -29,6 +29,7 @@
 
 use std::time::{Duration, Instant};
 
+use examples::linked::KERNELS;
 use examples::overlay::Overlay;
 use examples::scene::{FOV_Y, SUN, Showcase, TARGET, orbit_eye};
 use examples::shaders::{capture, sun_shadow};
@@ -114,7 +115,10 @@ fn cycle(
 fn run(options: &Options) {
     let gpu = device();
     let mut window = Window::new("orr dlss", 1920, 1080);
-    let desc = RendererDesc::default();
+    let desc = RendererDesc {
+        kernels: &KERNELS,
+        ..RendererDesc::default()
+    };
     let request = |encoding: Option<OutputFormat>, hdr: bool| DisplayRequest {
         hdr,
         encoding,
@@ -173,7 +177,7 @@ fn run(options: &Options) {
         renderer.set_dlss(sdk.clone());
     }
     let _workers = Workers::new(renderer.loading(), 2 + CompilingKernels::JOBS);
-    let showcase = Showcase::load(&mut renderer, gpu);
+    let mut showcase = Showcase::load(&mut renderer, gpu);
     let scene = showcase.scene;
     let history = renderer.create_view_history().expect("view history");
     options.wait_for_paths(&mut renderer);
@@ -262,6 +266,30 @@ fn run(options: &Options) {
         f.scene(scene)
             .expect("scene writer")
             .set_focus(eye.as_dvec3());
+        let view = LitView {
+            scene,
+            history,
+            position: eye.as_dvec3(),
+            rotation: view::look_at_quat(eye, TARGET, Vec3::Y).inverse(),
+            projection: Projection {
+                fov_y: FOV_Y,
+                near: 0.05,
+            },
+            lens: switches.lens(),
+            camera_cut: false,
+            not_rendering_scene: false,
+            screenshot: None,
+            texture_filter: TextureFilter::Hardware,
+            target: ViewTarget::Display,
+        };
+        let output = ViewOutput {
+            reconstruction,
+            ..ViewOutput::default()
+        };
+        f.prepare_view(&view, &ViewLighting::default(), &output)
+            .expect("prepare view");
+        f.update_scenes(&mut |c| showcase.sky.record(c, &[]).expect("sky passes"))
+            .expect("update scenes");
         let width = f64::from(extent[0]);
         let mut ui = |pass: &mut orr::UiPass<'_, '_>| {
             overlay.paint(pass, id);
@@ -273,30 +301,7 @@ fn run(options: &Options) {
             ..ViewHooks::default()
         };
         reconstructed = f
-            .render_view(
-                &LitView {
-                    scene,
-                    history,
-                    position: eye.as_dvec3(),
-                    rotation: view::look_at_quat(eye, TARGET, Vec3::Y).inverse(),
-                    projection: Projection {
-                        fov_y: FOV_Y,
-                        near: 0.05,
-                    },
-                    lens: switches.lens(),
-                    camera_cut: false,
-                    not_rendering_scene: false,
-                    screenshot: None,
-                    texture_filter: TextureFilter::Hardware,
-                    target: ViewTarget::Display,
-                },
-                &ViewLighting::default(),
-                &ViewOutput {
-                    reconstruction,
-                    ..ViewOutput::default()
-                },
-                &mut hooks,
-            )
+            .render_view(&view, &ViewLighting::default(), &output, &mut hooks)
             .expect("render view")
             .reconstruction;
         last = Some(f.end().expect("end frame"));

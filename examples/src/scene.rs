@@ -1,37 +1,35 @@
 //! The examples' cooked scene: a gold knot, a glossy and a mirror sphere, a block and a
-//! glowing panel on a ground, under a cooked sky and a 100 klx sun.
+//! glowing panel on a ground, under `orr_atmosphere`'s sky and medium and a sun. A renderer
+//! that lights it takes `linked::KERNELS` and records [`Showcase::sky`] in every frame's
+//! `update_scenes`.
 
 use std::sync::Arc;
 
-use orr::orr_gpu::{Allocation, Device};
-use orr::orr_lighting::EnvironmentMapGpu;
+use orr::orr_gpu::Device;
 use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    Affine3, DirectionalLight, DiscProfile, FrameDesc, GroupWriter, InstanceFlags, InstancesDesc,
-    Light, LightId, PackSource, Renderer, SceneDesc, SceneId, SceneLightingSettings,
-    TransformGroupDesc,
+    Affine3, FrameDesc, GroupWriter, InstanceFlags, InstancesDesc, Light, LightId, PackSource,
+    Renderer, SceneDesc, SceneId, SceneLightingSettings, TransformGroupDesc,
 };
+use orr_atmosphere::presets::solar_disc;
+use orr_atmosphere::{Atmosphere, AtmosphereState};
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source};
 use orr_math::{DVec3, Vec3};
 
 use crate::mesh::MeshBuilder;
-use crate::sky::{self, Sky};
 use crate::{fixed_time, mount_at};
 
 const OBJECTS: &str = "objects";
 const GROUND: &str = "ground";
-const SKY: &str = "sky";
 
 /// The frame id the scene is created in, after the pack has mounted.
 const FIRST_FRAME: u64 = 500;
 pub const FOV_Y: f32 = 0.8;
 /// Unit direction to the sun.
 pub const SUN: Vec3 = Vec3::new(-0.453_413_4, 0.654_930_5, 0.604_551_3);
-/// Lux, linear Rec.709.
-const SUN_ILLUMINANCE: Vec3 = Vec3::new(100_000.0, 95_000.0, 88_000.0);
-/// The sun's angular radius, radians.
-const SUN_RADIUS: f32 = 0.004_65;
+/// The ground's color, which the atmosphere's ground carries on to the horizon.
+const GROUND_COLOR: [f32; 3] = [0.5, 0.5, 0.48];
 /// What the camera looks at.
 pub const TARGET: Vec3 = Vec3::new(0.0, 0.9, 0.0);
 
@@ -40,7 +38,7 @@ pub struct Showcase {
     pub scene: SceneId,
     /// The last frame id `load` used.
     pub frame: u64,
-    _environment: Allocation<EnvironmentMapGpu>,
+    pub sky: AtmosphereState,
 }
 
 impl Showcase {
@@ -71,7 +69,13 @@ impl Showcase {
                 .model(mount, AssetId::from_name(name))
                 .unwrap_or_else(|e| panic!("model {name}: {e}"))
         });
-        let environment = sky::environment(renderer, gpu, mount, SKY);
+        let atmosphere = Atmosphere {
+            ground_albedo: Vec3::from(GROUND_COLOR),
+            ..Atmosphere::earth(DVec3::ZERO, Vec3::Y)
+        };
+        let mut sky = AtmosphereState::new(gpu, &atmosphere, 0).expect("atmosphere");
+        sky.set_lights(&[LightId(0)]);
+        sky.skip_fades();
 
         frame += 1;
         let listed = [scene];
@@ -109,25 +113,17 @@ impl Showcase {
             .expect("instances");
         }
         w.set_light(LightId(0), Some(&sun())).expect("sun");
-        w.set_environment(environment.gpu().address());
+        w.set_environment(sky.data());
+        w.set_medium(sky.data());
         drop(w);
         f.end().expect("end frame");
-        Self {
-            scene,
-            frame,
-            _environment: environment,
-        }
+        Self { scene, frame, sky }
     }
 }
 
-/// A 100 klx sun along [`SUN`].
+/// The sun along [`SUN`].
 pub fn sun() -> Light {
-    Light::Directional(DirectionalLight {
-        direction_to_light: SUN,
-        illuminance: SUN_ILLUMINANCE,
-        angular_radius: SUN_RADIUS,
-        disc: DiscProfile::LimbDarkened,
-    })
+    Light::Directional(solar_disc(SUN))
 }
 
 /// The camera on its orbit around [`TARGET`] at `angle` radians.
@@ -135,7 +131,7 @@ pub fn orbit_eye(angle: f64) -> Vec3 {
     TARGET + Vec3::new(angle.sin() as f32 * 6.5, 1.1, angle.cos() as f32 * 6.5)
 }
 
-/// The objects, the ground and the sky, cooked into an in-memory pack.
+/// The objects and the ground, cooked into an in-memory pack.
 fn cook() -> Arc<[u8]> {
     let gold = Material {
         base_color: [1.0, 0.77, 0.34],
@@ -167,7 +163,7 @@ fn cook() -> Arc<[u8]> {
         ..Material::default()
     };
     let ground = Material {
-        base_color: [0.5, 0.5, 0.48],
+        base_color: GROUND_COLOR,
         specular_roughness: 0.75,
         ..Material::default()
     };
@@ -207,12 +203,10 @@ fn cook() -> Arc<[u8]> {
             settings: MeshSettings::default(),
         },
     };
-    let sky = Sky::new("showcase", SUN);
     let manifest = Manifest {
         archives: vec![ArchiveSpec::new(
             Target::Memory,
             vec![
-                sky.asset(SKY),
                 mesh(
                     OBJECTS,
                     objects.finish(),

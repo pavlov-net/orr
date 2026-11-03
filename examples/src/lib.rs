@@ -21,7 +21,6 @@ pub mod field;
 pub mod mesh;
 pub mod overlay;
 pub mod scene;
-pub mod sky;
 pub mod sun_shade;
 pub mod vegetation;
 pub mod window;
