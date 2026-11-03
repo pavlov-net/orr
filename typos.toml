@@ -1,0 +1,43 @@
+[default]
+locale = "en-us"
+extend-ignore-re = [
+    # NGX's own log text.
+    "(?m)^.*NgxRayReconstruction::.*$",
+]
+
+[default.extend-words]
+# Terms and short names used in orr.
+alph = "alph"
+ba = "ba"
+clas = "clas"
+cll = "cll"
+eto = "eto"
+fo = "fo"
+iy = "iy"
+iz = "iz"
+lod = "lod"
+metalness = "metalness"
+mis = "mis"
+nd = "nd"
+paeth = "paeth"
+planed = "planed"
+pn = "pn"
+ser = "ser"
+thr = "thr"
+ue = "ue"
+# British spellings the en-us locale lets through.
+cancelled = "canceled"
+cancelling = "canceling"
+grey = "gray"
+greyscale = "grayscale"
+labelled = "labeled"
+labelling = "labeling"
+maths = "math"
+rasterisation = "rasterization"
+rasterise = "rasterize"
+rasterised = "rasterized"
+rasteriser = "rasterizer"
+rasterises = "rasterizes"
+
+[files]
+extend-exclude = ["Cargo.lock"]
