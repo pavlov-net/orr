@@ -2020,7 +2020,7 @@ impl Paths {
             None => &mut *f.target,
         };
         let (lighting, settings) = (f.lighting, &self.settings);
-        target.begin(f.frame, lighting, &f.desc, settings);
+        target.begin(lighting, &f.desc, settings);
         self.kernels
             .record_media(list, lighting, target, pass, settings)
             .unwrap();

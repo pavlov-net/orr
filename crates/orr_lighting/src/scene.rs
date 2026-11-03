@@ -188,8 +188,10 @@ pub struct SceneLighting {
     /// One past the frame whose first view has recorded its update paths.
     first_view: AtomicU64,
     frames: [Option<u64>; FRAME_SLOTS],
-    reset_pending: bool,
-    reset_frame: Option<u64>,
+    /// Calls of [`Self::reset_history`] so far.
+    resets: AtomicU64,
+    /// `resets` as the last [`Self::record`] found it.
+    resets_applied: u64,
     clear_feedback: bool,
 }
 
@@ -248,8 +250,8 @@ impl SceneLighting {
             cache_pipelines: ResolvePipelines::new(device, kernels)?,
             first_view: AtomicU64::new(0),
             frames: [None; FRAME_SLOTS],
-            reset_pending: false,
-            reset_frame: None,
+            resets: AtomicU64::new(0),
+            resets_applied: 0,
             clear_feedback: true,
         })
     }
@@ -290,8 +292,9 @@ impl SceneLighting {
     pub fn record(&mut self, list: &mut CommandList<'_>, pass: &ScenePass) {
         let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         self.frames[slot] = Some(pass.frame);
-        if std::mem::take(&mut self.reset_pending) {
-            self.reset_frame = Some(pass.frame);
+        let resets = self.resets();
+        if self.resets_applied != resets {
+            self.resets_applied = resets;
             self.cache.clear();
             self.clear_feedback = true;
         }
@@ -366,15 +369,17 @@ impl SceneLighting {
     }
 
     /// A lighting discontinuity, such as a time skip: the next [`Self::record`] clears the
-    /// world cache and the light feedback and marks its frame as a history reset for every
-    /// view of the scene ([`crate::LightingView::begin`]). A camera that teleports declares a
-    /// cut through its view's `camera_cut` instead.
-    pub fn reset_history(&mut self) {
-        self.reset_pending = true;
+    /// world cache and the light feedback, and every view of the scene resets its history at its
+    /// next [`crate::LightingView::begin`], however many frames later. A camera that moves sets
+    /// `camera_cut` on the view instead; either resets the view's history.
+    pub fn reset_history(&self) {
+        self.resets.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn resets_history(&self, frame: u64) -> bool {
-        self.reset_frame == Some(frame)
+    /// How many times [`Self::reset_history`] has been called. A view that remembers the count
+    /// sees a reset as a change of it, however long ago the reset came.
+    pub fn resets(&self) -> u64 {
+        self.resets.load(Ordering::Relaxed)
     }
 
     /// Whether this is the first view of the scene in `frame` to trace update paths.
