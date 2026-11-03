@@ -70,7 +70,10 @@ const COMPENSATION: u64 = LOCAL_ROOT + 256;
 const _: () =
     assert!(size_of::<crate::shaders::post::fft_glare::Root>() as u64 <= GLARE_ROOT_STRIDE);
 const ZEROS: u64 = COMPENSATION + 4 * COMPENSATION_ENTRIES as u64;
-const UPLOAD_BYTES: u64 = ZEROS + 4 * HISTOGRAM_WORDS;
+const BLACK_ROOTS: u64 = (ZEROS + 4 * HISTOGRAM_WORDS).next_multiple_of(256);
+const BLACK_ROOT_STRIDE: u64 = 256;
+const UPLOAD_BYTES: u64 = BLACK_ROOTS + 2 * BLACK_ROOT_STRIDE;
+const _: () = assert!(size_of::<compose::Root>() as u64 <= BLACK_ROOT_STRIDE);
 const _: () =
     assert!(size_of::<crate::shaders::post::dof::Root>() as u64 <= GLARE_ROOTS - DOF_ROOT);
 const _: () = assert!(size_of::<crate::shaders::post::glare::Root>() as u64 <= GLARE_ROOT_STRIDE);
@@ -497,6 +500,30 @@ impl OutputKernels {
                 "screenshot_scene_referred",
             )?,
         })
+    }
+
+    /// Records black into `targets`, images of `extent` that hold no view yet. `sdr` is a display
+    /// with SDR encoding, in which black is exactly zero. Orders nothing after it.
+    pub fn black(
+        &self,
+        list: &mut CommandList<'_>,
+        view: &mut OutputView,
+        frame: u64,
+        targets: [StorageImageIndex; 2],
+        extent: [u32; 2],
+        sdr: &ResolvedDisplay,
+    ) {
+        let roots = view.roots(frame);
+        list.begin_pass("black", false);
+        for (i, target) in targets.into_iter().enumerate() {
+            let root = compose::Root {
+                target,
+                ..compose_root(ComposeSource::Black, None, extent, sdr)
+            };
+            let root = roots.put(BLACK_ROOTS + i as u64 * BLACK_ROOT_STRIDE, &root);
+            list.dispatch(&self.compose.0, root, groups(extent, 8));
+        }
+        list.end_pass();
     }
 
     /// Records the `hook_inputs` pass when the view sets a hook: depth and motion at output

@@ -314,9 +314,7 @@ impl Device {
         name: &str,
     ) -> Result<ComputePipeline, Error> {
         Ok(ComputePipeline {
-            raw: self
-                .shared
-                .create_compute(s, vk::PipelineCreateFlags2::empty(), name)?,
+            raw: self.shared.create_compute(s, self.creation_flags, name)?,
             inline_root: s.inline_root,
             workgroup: s.entry.workgroup,
             shared: Arc::clone(&self.shared),

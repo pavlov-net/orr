@@ -2060,6 +2060,7 @@ dependencies = [
 name = "orr"
 version = "0.0.1"
 dependencies = [
+ "log",
  "orr_lighting",
  "orr_math",
  "orr_output",
@@ -2181,6 +2182,7 @@ version = "0.0.1"
 dependencies = [
  "bytemuck",
  "glam 0.34.1",
+ "log",
  "orr_math",
  "orr_scene",
  "orr_shaders",

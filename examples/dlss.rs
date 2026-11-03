@@ -40,9 +40,9 @@ use orr::orr_output::Image;
 use orr::orr_output::orr_dlss::raw::Ngx;
 use orr::orr_output::orr_dlss::{Quality, SrInputs, SuperResolution};
 use orr::{
-    Display, DisplayRequest, DlssSdk, FrameDesc, FrameGenerationMode, FrameTime, Lens, LitView,
-    Projection, Reconstruction, Renderer, RendererDesc, TextureFilter, ViewDesc, ViewHooks,
-    ViewLighting, ViewOutput, ViewTarget,
+    CompilingKernels, Display, DisplayRequest, DlssSdk, FrameDesc, FrameGenerationMode, FrameTime,
+    Lens, LitView, Projection, Reconstruction, Renderer, RendererDesc, TextureFilter, ViewDesc,
+    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_math::camera::rh::view;
 use orr_math::{UVec2, Vec2, Vec3};
@@ -168,10 +168,11 @@ fn run(options: &Options) {
     if let Some(sdk) = &sdk {
         renderer.set_dlss(sdk.clone());
     }
-    let _workers = Workers::new(renderer.loading(), 2);
+    let _workers = Workers::new(renderer.loading(), 2 + CompilingKernels::JOBS);
     let showcase = Showcase::load(&mut renderer, gpu);
     let scene = showcase.scene;
     let history = renderer.create_view_history().expect("view history");
+    options.wait_for_paths(&mut renderer);
     let listed = [scene];
     let mut overlay = Overlay::new(desc.frames_in_flight);
     let started = Instant::now();
@@ -182,7 +183,7 @@ fn run(options: &Options) {
     let mut generated = 0;
     let mut frames = 0;
     for i in 0.. {
-        if options.frames.is_some_and(|n| i >= n) || !window.pump() {
+        if options.frames.is_some_and(|n| i >= n) || !window.pump_showing_paths(&renderer) {
             break;
         }
         for key in window.take_keys() {

@@ -11,8 +11,8 @@ use orr_scene::orr_gpu::{
     StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory, TextureUsage,
 };
 use orr_scene::{
-    ArenaRequest, ArenaTexture, GBufferGpu, MaterialId, RasterGpu, SceneRoot, Span, ViewArena,
-    ViewConstants, ViewDesc, ViewStep,
+    ArenaRequest, ArenaTexture, GBufferGpu, JobResult, Loading, MaterialId, RasterGpu, SceneRoot,
+    Span, ViewArena, ViewConstants, ViewDesc, ViewStep,
 };
 
 use crate::media::{MediaKernels, MediaSettings, MediaStats, MediaView};
@@ -748,15 +748,12 @@ impl PathPipeline {
     }
 }
 
-/// The per-view lighting kernels of one device.
-pub struct LightingKernels {
-    opaque: PathPipeline,
-    dielectric: PathPipeline,
+/// The kernels beside the path kernels, which compile as one job, and the small tables they use.
+struct SupportKernels {
     layer_tiles: ComputePipeline,
     layer_args: ComputePipeline,
     /// A zero word that starts each frame's tile count.
     zero: Allocation<u32>,
-    update: PathPipeline,
     guides: ComputePipeline,
     frost: ComputePipeline,
     local: ComputePipeline,
@@ -764,54 +761,21 @@ pub struct LightingKernels {
     cap_tail: CapTailTable,
 }
 
-/// The specialization constants of kernel module `$kernel`, which imports `bsdf`.
+/// The specialization constants of kernel module `$kernel`, which imports `bsdf`, with the BSDF
+/// tables' first slot.
 macro_rules! bsdf_spec {
-    ($kernel:ident, $tables:expr) => {
+    ($kernel:ident, $slot:expr) => {
         $kernel::Spec {
-            openpbr_lut_slot: $tables.first_slot(),
+            openpbr_lut_slot: $slot,
             ..$kernel::Spec::default()
         }
         .bytes()
     };
 }
 
-impl LightingKernels {
-    /// `kernels` replaces modules as [`SceneLighting::new`] does; `tables` must outlive the
-    /// kernels' use.
-    pub fn new(
-        device: &Device,
-        kernels: &KernelSet,
-        tables: &BsdfTables,
-        entry: PathEntry,
-    ) -> Result<Self, Error> {
-        let caps = device.caps();
-        let rays = match entry {
-            PathEntry::Fastest => caps.ray_dispatch && caps.reorder,
-            PathEntry::Compute => false,
-            PathEntry::RayDispatch => true,
-        };
-        let bytes = bsdf_spec!(opaque, tables);
-        let spec = SpecData {
-            entries: opaque::Spec::ENTRIES,
-            bytes: &bytes,
-        };
-        let m = module(kernels, &opaque::MODULE)?;
-        let opaque = PathPipeline::new(device, m, spec, rays, "opaque paths")?;
-        let bytes = bsdf_spec!(dispatch, tables);
-        let spec = SpecData {
-            entries: dispatch::Spec::ENTRIES,
-            bytes: &bytes,
-        };
-        let m = module(kernels, &dispatch::MODULE)?;
-        let dielectric = PathPipeline::new(device, m, spec, rays, "dielectric paths")?;
-        let bytes = bsdf_spec!(update, tables);
-        let spec = SpecData {
-            entries: update::Spec::ENTRIES,
-            bytes: &bytes,
-        };
-        let m = module(kernels, &update::MODULE)?;
-        let update = PathPipeline::new(device, m, spec, rays, "world cache update paths")?;
-        let bytes = bsdf_spec!(resolve, tables);
+impl SupportKernels {
+    fn new(device: &Device, kernels: &KernelSet, slot: u32) -> Result<Self, Error> {
+        let bytes = bsdf_spec!(resolve, slot);
         let spec = SpecData {
             entries: resolve::Spec::ENTRIES,
             bytes: &bytes,
@@ -821,18 +785,190 @@ impl LightingKernels {
         let mut zero = device.gpu_malloc::<u32>(MemoryKind::Upload, 1, "zero")?;
         zero.as_mut_slice().expect("mapped")[0] = 0;
         Ok(Self {
-            opaque,
-            dielectric,
             layer_tiles: pipeline(device, kernels, &tiles::MODULE, "tiles")?,
             layer_args: pipeline(device, kernels, &tiles::MODULE, "args")?,
             zero,
-            update,
             guides,
             frost: pipeline(device, kernels, &frost::MODULE, "main")?,
             local: pipeline(device, kernels, &local::MODULE, "main")?,
             media: MediaKernels::new(device, kernels)?,
             cap_tail: CapTailTable::new(device)?,
         })
+    }
+}
+
+/// Whether path kernels run as ray dispatches on `device`.
+fn runs_rays(device: &Device, entry: PathEntry) -> bool {
+    let caps = device.caps();
+    match entry {
+        PathEntry::Fastest => caps.ray_dispatch && caps.reorder,
+        PathEntry::Compute => false,
+        PathEntry::RayDispatch => true,
+    }
+}
+
+/// One path kernel: its name in reports, and how it compiles from the BSDF tables' first slot and
+/// whether it runs as rays.
+struct PathKernel {
+    name: &'static str,
+    compile: fn(&Device, &KernelSet, u32, bool) -> Result<PathPipeline, Error>,
+}
+
+macro_rules! path_kernel {
+    ($kernel:ident, $name:literal) => {
+        PathKernel {
+            name: $name,
+            compile: |device, kernels, slot, rays| {
+                let bytes = bsdf_spec!($kernel, slot);
+                let spec = SpecData {
+                    entries: $kernel::Spec::ENTRIES,
+                    bytes: &bytes,
+                };
+                let m = module(kernels, &$kernel::MODULE)?;
+                PathPipeline::new(device, m, spec, rays, $name)
+            },
+        }
+    };
+}
+
+const OPAQUE: PathKernel = path_kernel!(opaque, "opaque paths");
+const DIELECTRIC: PathKernel = path_kernel!(dispatch, "dielectric paths");
+const UPDATE: PathKernel = path_kernel!(update, "world cache update paths");
+const SUPPORT: &str = "lighting compute kernels";
+
+/// Queues `compile`, which writes the device's pipeline cache file when it finishes.
+fn compile_job<T: Send + 'static>(
+    device: &Device,
+    loading: &Loading,
+    compile: impl FnOnce(&Device) -> Result<T, Error> + Send + 'static,
+) -> JobResult<Result<T, Error>> {
+    let device = device.clone();
+    loading.spawn_result(move || {
+        let compiled = compile(&device);
+        if let Err(e) = device.save_pipeline_cache() {
+            log::warn!("pipeline cache not saved: {e}");
+        }
+        compiled
+    })
+}
+
+/// A compile job's result, or how it failed. Call once it finished.
+fn compiled<T>(job: &JobResult<Result<T, Error>>, kernel: &'static str) -> Result<T, Error> {
+    match job.take().expect("the job has finished") {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(Error::Compile {
+            kernel,
+            source: Box::new(e),
+        }),
+        Err(message) => Err(Error::CompilePanicked { kernel, message }),
+    }
+}
+
+/// [`LightingKernels`] compiling as jobs on the loading side, from
+/// [`LightingKernels::spawn`]. Dropping it cancels the jobs no thread has started; one
+/// already compiling finishes on its thread, since the driver cannot be interrupted.
+pub struct CompilingKernels {
+    opaque: JobResult<Result<PathPipeline, Error>>,
+    dielectric: JobResult<Result<PathPipeline, Error>>,
+    update: JobResult<Result<PathPipeline, Error>>,
+    support: JobResult<Result<SupportKernels, Error>>,
+}
+
+impl CompilingKernels {
+    /// The jobs [`LightingKernels::spawn`] queues: three path kernels and the kernels beside them.
+    /// A consumer lends this many threads for them to compile at once, and more to keep loading
+    /// while they do: on a first run a path kernel holds its thread for a minute or more.
+    pub const JOBS: usize = 4;
+
+    /// How many jobs have not finished.
+    pub fn outstanding(&self) -> u32 {
+        let paths = [&self.opaque, &self.dielectric, &self.update];
+        paths.iter().filter(|job| !job.finished()).count() as u32
+            + u32::from(!self.support.finished())
+    }
+
+    /// Whether a thread has started any job.
+    pub fn started(&self) -> bool {
+        self.opaque.started()
+            || self.dielectric.started()
+            || self.update.started()
+            || self.support.started()
+    }
+
+    /// Blocks until every job has finished, running queued jobs on the calling thread meanwhile,
+    /// so it finishes with no workers. `loading` is the side the jobs were queued on.
+    pub fn wait(&self, loading: &Loading) {
+        self.opaque.wait(loading);
+        self.dielectric.wait(loading);
+        self.update.wait(loading);
+        self.support.wait(loading);
+    }
+
+    /// The kernels, or the first failure, once [`Self::outstanding`] is 0.
+    pub fn finish(&self) -> Result<LightingKernels, Error> {
+        assert_eq!(self.outstanding(), 0, "kernels are still compiling");
+        Ok(LightingKernels {
+            opaque: compiled(&self.opaque, OPAQUE.name)?,
+            dielectric: compiled(&self.dielectric, DIELECTRIC.name)?,
+            update: compiled(&self.update, UPDATE.name)?,
+            support: compiled(&self.support, SUPPORT)?,
+        })
+    }
+}
+
+/// The per-view lighting kernels of one device.
+pub struct LightingKernels {
+    opaque: PathPipeline,
+    dielectric: PathPipeline,
+    update: PathPipeline,
+    support: SupportKernels,
+}
+
+impl LightingKernels {
+    /// Compiles the kernels one after another on the calling thread. `kernels` replaces modules
+    /// as [`SceneLighting::new`] does; `tables` must outlive the kernels' use.
+    pub fn new(
+        device: &Device,
+        kernels: &KernelSet,
+        tables: &BsdfTables,
+        entry: PathEntry,
+    ) -> Result<Self, Error> {
+        let rays = runs_rays(device, entry);
+        let slot = tables.first_slot();
+        Ok(Self {
+            opaque: (OPAQUE.compile)(device, kernels, slot, rays)?,
+            dielectric: (DIELECTRIC.compile)(device, kernels, slot, rays)?,
+            update: (UPDATE.compile)(device, kernels, slot, rays)?,
+            support: SupportKernels::new(device, kernels, slot)?,
+        })
+    }
+
+    /// [`Self::new`] as jobs on `loading`, [`CompilingKernels::JOBS`] of them, each writing
+    /// the device's pipeline cache file when it finishes, so an interrupted first run keeps
+    /// what it compiled. Returns at once; a job that fails or panics reports it through
+    /// [`CompilingKernels::finish`].
+    pub fn spawn(
+        device: &Device,
+        kernels: &'static KernelSet,
+        tables: &BsdfTables,
+        entry: PathEntry,
+        loading: &Loading,
+    ) -> CompilingKernels {
+        let rays = runs_rays(device, entry);
+        let slot = tables.first_slot();
+        let path = |kernel: PathKernel| {
+            compile_job(device, loading, move |d| {
+                (kernel.compile)(d, kernels, slot, rays)
+            })
+        };
+        CompilingKernels {
+            opaque: path(OPAQUE),
+            dielectric: path(DIELECTRIC),
+            update: path(UPDATE),
+            support: compile_job(device, loading, move |d| {
+                SupportKernels::new(d, kernels, slot)
+            }),
+        }
     }
 
     /// Records the froxel passes of `pass` after the scene's [`SceneLighting::record`], the
@@ -852,7 +988,7 @@ impl LightingKernels {
         pass: &ViewPass,
         lighting: &ViewLighting,
     ) -> Result<(), Error> {
-        self.media.record(list, scene, view, pass, lighting)
+        self.support.media.record(list, scene, view, pass, lighting)
     }
 
     /// Records media apply into `view`'s radiance after [`Self::record_media`] and the paths
@@ -875,7 +1011,9 @@ impl LightingKernels {
         pass: &ViewPass,
         lighting: &ViewLighting,
     ) {
-        self.media.record_apply(list, scene, view, pass, lighting);
+        self.support
+            .media
+            .record_apply(list, scene, view, pass, lighting);
     }
 
     /// Records the world cache's update paths, the view's local light samplers and the
@@ -938,7 +1076,7 @@ impl LightingKernels {
             );
             let [w, h] = view.local_tiles;
             list.begin_pass("local light samplers", false);
-            list.dispatch(&self.local, root, [w, h, 1]);
+            list.dispatch(&self.support.local, root, [w, h, 1]);
             list.end_pass();
             list.barrier(
                 Stages::COMPUTE,
@@ -1006,7 +1144,7 @@ impl LightingKernels {
             sss_max_steps: lighting
                 .sss_max_steps
                 .clamp(*SSS_STEPS.start(), *SSS_STEPS.end()),
-            cap_tail: self.cap_tail.gpu(),
+            cap_tail: self.support.cap_tail.gpu(),
             sss_flags: match lighting.sss_depth {
                 SubsurfaceDepth::FirstEvent => 0,
                 SubsurfaceDepth::PrimaryOnly => SSS_PRIMARY_ONLY,
@@ -1121,12 +1259,12 @@ impl LightingKernels {
             Stages::TRANSFER,
             Hazards::empty(),
         );
-        list.copy(args, self.zero.gpu().cast(), 4);
+        list.copy(args, self.support.zero.gpu().cast(), 4);
         list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
         let [tx, ty] = view.extent.map(|e| e.div_ceil(LAYER_TILE));
-        list.dispatch(&self.layer_tiles, tiles_root, [tx, ty, 1]);
+        list.dispatch(&self.support.layer_tiles, tiles_root, [tx, ty, 1]);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
-        list.dispatch(&self.layer_args, tiles_root, [1, 1, 1]);
+        list.dispatch(&self.support.layer_args, tiles_root, [1, 1, 1]);
         list.barrier(
             Stages::COMPUTE,
             Stages::COMPUTE | Stages::RAY,
@@ -1180,9 +1318,13 @@ impl LightingKernels {
             },
         );
         let [w, h] = view.extent;
-        let [gx, gy, _] = self.guides.workgroup();
+        let [gx, gy, _] = self.support.guides.workgroup();
         list.begin_pass("guide resolve", false);
-        list.dispatch(&self.guides, root, [w.div_ceil(gx), h.div_ceil(gy), 1]);
+        list.dispatch(
+            &self.support.guides,
+            root,
+            [w.div_ceil(gx), h.div_ceil(gy), 1],
+        );
         list.end_pass();
     }
 
@@ -1218,9 +1360,13 @@ impl LightingKernels {
             },
         );
         let [w, h] = view.extent;
-        let [gx, gy, _] = self.frost.workgroup();
+        let [gx, gy, _] = self.support.frost.workgroup();
         list.begin_pass("frosted glass", false);
-        list.dispatch(&self.frost, root, [w.div_ceil(gx), h.div_ceil(gy), 1]);
+        list.dispatch(
+            &self.support.frost,
+            root,
+            [w.div_ceil(gx), h.div_ceil(gy), 1],
+        );
         list.end_pass();
     }
 }

@@ -44,10 +44,10 @@ use orr::orr_pack::model::ModelInfo;
 use orr::orr_pack::skeleton::{MAX_JOINTS, NO_PARENT, SkeletonInfo};
 use orr::orr_pack::{Archive, AssetId, Class, Target};
 use orr::{
-    Affine3, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter, InstanceFlags,
-    InstancesDesc, Lens, LightId, LitView, PackSource, Pose, Projection, Renderer, RendererDesc,
-    SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc,
-    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    Affine3, CompilingKernels, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter,
+    InstanceFlags, InstancesDesc, Lens, LightId, LitView, PackSource, Pose, Projection, Renderer,
+    RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
+    TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, CookOptions, GltfSettings, Manifest, MeshSettings, NodeSelect,
@@ -426,7 +426,7 @@ fn run(options: &Options) -> Option<Capture> {
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
     enable_dlss(&mut renderer);
-    let _workers = Workers::new(renderer.loading(), 2);
+    let _workers = Workers::new(renderer.loading(), 2 + CompilingKernels::JOBS);
     let surroundings = cook_surroundings((radius * 8.0).max(40.0));
     let (mounts, mut frame) = mount_all_at(
         &mut renderer,
@@ -458,6 +458,7 @@ fn run(options: &Options) -> Option<Capture> {
         )
         .expect("scene");
     let history = renderer.create_view_history().expect("view history");
+    options.wait_for_paths(&mut renderer);
     frame += 1;
     let listed = [scene];
     let f = renderer
@@ -562,7 +563,7 @@ fn run(options: &Options) -> Option<Capture> {
             break;
         }
         if let Some(w) = window.as_mut()
-            && !w.pump()
+            && !w.pump_showing_paths(&renderer)
         {
             break;
         }

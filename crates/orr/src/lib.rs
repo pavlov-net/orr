@@ -19,6 +19,11 @@
 //! 6. [`Frame::end`] records the display's frame generation, submits the frame and hands
 //!    it to the display's present thread.
 //!
+//! The path tracing kernels compile as jobs on the threads the consumer lends to
+//! [`Renderer::loading`], and on a first run they take minutes. Until they finish a view renders
+//! black, with [`RenderedView::compiling`] set: nothing blocks a frame, and the UI still draws.
+//! See [`Renderer::create_view_history`].
+//!
 //! There is no scheduler, render graph or per-frame extraction: each step records directly
 //! into the frame's command list on the Render queue, and the output passes into
 //! [`Frame::output_list`]. On a device created with `QueueRequest::render_compute` that
@@ -29,11 +34,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub use orr_lighting::{
-    self, Error as LightingError, LightingDebugView, LightingStats, MediaSettings, ParticleDraw,
-    ParticleLighting, PathEntry, ReferenceSettings, SceneLightingSettings, ThinLens, ViewLighting,
-    WorldCacheSettings,
+    self, CompilingKernels, Error as LightingError, LightingDebugView, LightingStats,
+    MediaSettings, ParticleDraw, ParticleLighting, PathEntry, ReferenceSettings,
+    SceneLightingSettings, ThinLens, ViewLighting, WorldCacheSettings,
 };
 #[cfg(windows)]
 pub use orr_output::DisplayWatch;
@@ -53,16 +59,16 @@ pub use orr_scene::{
     DecalId, DepthOfField, DirectionalLight, DiscProfile, EditDesc, EditGroupGpu, EditId, EditRef,
     EmissiveGpu, EmissiveSpan, ExposureState, Focus, FrameStats, FrameTime, Glare, GroupGpu,
     GroupWriter, InstanceFlags, InstanceGpu, InstancePage, InstancePageRef, InstanceRange,
-    InstancesDesc, Lens, LensDistortion, Light, LightGpu, LightId, LoadState, Loading, MaterialGpu,
-    MaterialId, MaterialWriter, MeshGpu, ModelEmission, ModelGpu, ModelId, MountId, NeuralMipGpu,
-    NeuralSetGpu, NeuralTextureGpu, NeuralTextures, Opacity, OriginPolicy, PackSource, PageId,
-    PipelineId, Pose, ProducerBatch, ProducerClusterGpu, ProducerDesc, ProducerGpu, ProducerId,
-    ProducerStats, ProducerUpdate, Projection, REBASE_GRID_LOG2, RasterGpu, ReloadReport,
-    RendererDesc, ResidencyClass, ResidencyStats, RtCutGpu, RtStats, SceneCompute, SceneDesc,
-    SceneId, SceneRoot, SceneWriter, SkeletonRef, SkinStats, SkinnedDesc, SkyStats, SlotStateGpu,
-    Span, TextureFeedbackGpu, TextureFilter, TextureStreamGpu, TopologyGpu, TransformGroupDesc,
-    TransformGroupId, TransparencyPass, ViewConstants, ViewDesc, ViewHistoryId, ViewStep, WorldPos,
-    abi, material_flags, orr_gpu, orr_pack,
+    InstancesDesc, JobResult, Lens, LensDistortion, Light, LightGpu, LightId, LoadState, Loading,
+    MaterialGpu, MaterialId, MaterialWriter, MeshGpu, ModelEmission, ModelGpu, ModelId, MountId,
+    NeuralMipGpu, NeuralSetGpu, NeuralTextureGpu, NeuralTextures, Opacity, OriginPolicy,
+    PackSource, PageId, PipelineId, Pose, ProducerBatch, ProducerClusterGpu, ProducerDesc,
+    ProducerGpu, ProducerId, ProducerStats, ProducerUpdate, Projection, REBASE_GRID_LOG2,
+    RasterGpu, ReloadReport, RendererDesc, ResidencyClass, ResidencyStats, RtCutGpu, RtStats,
+    SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter, SkeletonRef, SkinStats, SkinnedDesc,
+    SkyStats, SlotStateGpu, Span, TextureFeedbackGpu, TextureFilter, TextureStreamGpu, TopologyGpu,
+    TransformGroupDesc, TransformGroupId, TransparencyPass, ViewConstants, ViewDesc, ViewHistoryId,
+    ViewStep, WorldPos, abi, material_flags, orr_gpu, orr_pack,
 };
 
 use orr_gpu::{
@@ -92,6 +98,11 @@ pub enum Error {
     /// pixels would not be square.
     #[error("render extent {render:?} does not keep the aspect ratio of the output {output:?}")]
     RenderAspect { render: [u32; 2], output: [u32; 2] },
+    /// The path tracing kernels failed to compile. [`Frame::render_view`] and
+    /// [`Renderer::wait_paths`] return this until [`Renderer::create_view_history`] starts the
+    /// compile again.
+    #[error(transparent)]
+    PathKernels(Arc<LightingError>),
     /// The view's target is the display, and the frame has none or its window has no area.
     #[error("the view targets a display, and the frame has none with any area")]
     NoDisplay,
@@ -181,6 +192,9 @@ pub enum ViewTarget<'a> {
 /// them this frame record there.
 #[derive(Clone)]
 pub struct RenderedView {
+    /// The path tracing kernels are still compiling: the view rendered its raster half, and
+    /// `radiance`, `linear` and its target hold black.
+    pub compiling: bool,
     pub raster: RasterView,
     /// The extent the view rendered at.
     pub render_extent: [u32; 2],
@@ -202,14 +216,99 @@ pub struct Renderer {
     output: Output,
 }
 
+/// How long the path kernels may wait for a thread before a warning says so.
+const UNSTARTED_PATHS_WARNING: Duration = Duration::from_secs(10);
+
+/// Where the path tracing kernels stand.
+enum Paths {
+    /// No view history has asked for them.
+    NotStarted,
+    Compiling {
+        jobs: CompilingKernels,
+        since: Instant,
+        warned: bool,
+    },
+    Ready(Box<LightingKernels>),
+    Failed(Arc<LightingError>),
+}
+
+impl Paths {
+    /// Takes the kernels when their last job has finished, and warns once when nothing runs the
+    /// jobs.
+    fn poll(&mut self) {
+        let Self::Compiling {
+            jobs,
+            since,
+            warned,
+        } = self
+        else {
+            return;
+        };
+        if jobs.outstanding() > 0 {
+            if !*warned && !jobs.started() && since.elapsed() > UNSTARTED_PATHS_WARNING {
+                log::warn!(
+                    "no thread has started the path tracing kernels' compile jobs, so views stay \
+                     black: lend threads to Renderer::loading() with run_worker or run_one, or \
+                     call Renderer::wait_paths"
+                );
+                *warned = true;
+            }
+            return;
+        }
+        *self = match jobs.finish() {
+            Ok(kernels) => {
+                log::info!(
+                    "path tracing kernels ready after {:.1} s",
+                    since.elapsed().as_secs_f64()
+                );
+                Self::Ready(Box::new(kernels))
+            }
+            Err(e) => {
+                log::error!("{e}");
+                Self::Failed(Arc::new(e))
+            }
+        };
+    }
+}
+
 /// orr_lighting's kernels and tables, and each scene's lighting state.
 struct Lighting {
     kernels: &'static KernelSet,
     entry: PathEntry,
-    /// Compiled with the first view history.
-    paths: Option<LightingKernels>,
+    try_cached_paths: bool,
+    /// Started by the first view history.
+    paths: Paths,
     scenes: HashMap<SceneId, SceneLighting>,
     tables: BsdfTables,
+}
+
+impl Lighting {
+    /// Starts the path kernels unless they are ready or compiling: from the pipeline caches when
+    /// they hold every one and `try_cached_paths` allows looking, else as jobs on `loading`, which
+    /// report any failure.
+    fn start_paths(&mut self, gpu: &Device, loading: &Loading) {
+        if matches!(self.paths, Paths::Ready(_) | Paths::Compiling { .. }) {
+            return;
+        }
+        if self.try_cached_paths {
+            let cached = gpu.cached_pipelines_only();
+            if let Ok(kernels) =
+                LightingKernels::new(&cached, self.kernels, &self.tables, self.entry)
+            {
+                self.paths = Paths::Ready(Box::new(kernels));
+                return;
+            }
+        }
+        log::info!(
+            "compiling the path tracing kernels on loading jobs; views render black until they \
+             finish, which on a first run takes minutes"
+        );
+        self.paths = Paths::Compiling {
+            jobs: LightingKernels::spawn(gpu, self.kernels, &self.tables, self.entry, loading),
+            since: Instant::now(),
+            warned: false,
+        };
+    }
 }
 
 /// One view history's lighting and output state.
@@ -232,6 +331,30 @@ struct ViewReconstruction {
 }
 
 impl ViewState {
+    /// The description of the view's next raster half at these extents.
+    fn raster_desc(&self, view: &LitView<'_>, extent: [u32; 2], render: [u32; 2]) -> ViewDesc {
+        let (jitter, mip_bias) = self.reconstruction.as_ref().map_or(([0.0; 2], 0.0), |r| {
+            (
+                r.feature.jitter(u64::from(self.samples)),
+                r.feature.mip_bias(),
+            )
+        });
+        ViewDesc {
+            scene: view.scene,
+            history: view.history,
+            position: view.position,
+            rotation: view.rotation,
+            projection: view.projection,
+            lens: view.lens,
+            render_extent: UVec2::from(render),
+            output_extent: UVec2::from(extent),
+            jitter: Vec2::from(jitter),
+            reset_history: view.reset_history,
+            mip_bias,
+            texture_filter: view.texture_filter,
+        }
+    }
+
     /// Makes the view's feature match `request` at the output extent `output`, with no feature
     /// without `sdk` or for [`Reconstruction::Off`].
     fn sync_reconstruction(
@@ -401,7 +524,7 @@ fn builtin_modules() -> Vec<&'static ShaderModule> {
 impl Renderer {
     /// Checks `desc.kernels` against orr's compiled-in kernels, then compiles the renderer's
     /// pipelines and uploads the BSDF tables on the calling thread, which must own the
-    /// Render queue. The path tracing pipelines compile with the first view history
+    /// Render queue. The path tracing pipelines start with the first view history
     /// ([`Renderer::create_view_history`]).
     pub fn new(gpu: &Device, desc: RendererDesc) -> Result<Self> {
         desc.kernels
@@ -413,7 +536,8 @@ impl Renderer {
             lighting: Lighting {
                 kernels: desc.kernels,
                 entry: desc.path_entry,
-                paths: None,
+                try_cached_paths: desc.try_cached_paths,
+                paths: Paths::NotStarted,
                 scenes: HashMap::new(),
                 tables,
             },
@@ -474,19 +598,26 @@ impl Renderer {
     }
 
     /// History for one persistent camera: its previous camera, exposure slots and the
-    /// lighting and output state of its renders. The first call compiles the path tracing
-    /// pipelines.
+    /// lighting and output state of its renders.
+    ///
+    /// The first call, and the first after a failed compile, starts the path tracing pipelines
+    /// without compiling on this thread. If
+    /// the pipeline caches hold them all ([`RendererDesc::try_cached_paths`]), they are ready
+    /// when it returns, in tens of milliseconds. Otherwise they compile as jobs on
+    /// [`Renderer::loading`], [`CompilingKernels::JOBS`] of them, which take minutes on a first
+    /// run, holding their threads the whole time. Until then [`Frame::render_view`] renders black.
+    /// The jobs need threads: lend them with [`Loading::run_worker`] or
+    /// [`Loading::run_one`], at least [`CompilingKernels::JOBS`] to compile in parallel and more
+    /// to keep loading meanwhile, or block in [`Renderer::wait_paths`]. With neither, views stay
+    /// black, and a warning is logged after a few seconds of frames.
+    ///
+    /// Each job writes the device's pipeline cache file when it finishes. Dropping the renderer
+    /// cancels the jobs no thread has started. A thread already compiling finishes that pipeline,
+    /// which a consumer joining its workers waits for, since the driver cannot be interrupted.
     pub fn create_view_history(&mut self) -> Result<ViewHistoryId> {
         let gpu = self.scenes.device().clone();
-        let lighting = &mut self.lighting;
-        if lighting.paths.is_none() {
-            lighting.paths = Some(LightingKernels::new(
-                &gpu,
-                lighting.kernels,
-                &lighting.tables,
-                lighting.entry,
-            )?);
-        }
+        let loading = self.scenes.loading();
+        self.lighting.start_paths(&gpu, &loading);
         let fif = self.output.frames_in_flight;
         let state = ViewState {
             lighting: None,
@@ -498,6 +629,35 @@ impl Renderer {
         let id = self.scenes.create_view_history()?;
         self.output.views.insert(id, state);
         Ok(id)
+    }
+
+    /// Whether the path tracing kernels have compiled, so the next frame's views render lit. False
+    /// also before the first view history and after a failed compile.
+    pub fn paths_ready(&mut self) -> bool {
+        self.lighting.paths.poll();
+        matches!(self.lighting.paths, Paths::Ready(_))
+    }
+
+    /// How many of the path tracing kernels' compile jobs have not finished.
+    pub fn paths_outstanding(&self) -> u32 {
+        match &self.lighting.paths {
+            Paths::Compiling { jobs, .. } => jobs.outstanding(),
+            _ => 0,
+        }
+    }
+
+    /// Blocks until the path tracing kernels have compiled, running queued loading jobs on this
+    /// thread so it needs no workers, and returns [`Error::PathKernels`] if they failed. For
+    /// tests and headless runs; returns at once when they are ready or never started.
+    pub fn wait_paths(&mut self) -> Result<()> {
+        if let Paths::Compiling { jobs, .. } = &self.lighting.paths {
+            jobs.wait(&self.scenes.loading());
+        }
+        self.lighting.paths.poll();
+        match &self.lighting.paths {
+            Paths::Failed(e) => Err(Error::PathKernels(Arc::clone(e))),
+            _ => Ok(()),
+        }
     }
 
     /// History for a camera that only [`Frame::raster_view`] renders: its previous camera
@@ -676,6 +836,7 @@ impl Renderer {
     /// Step 1: waits until the frame `frames_in_flight` back has completed, sleeps on the
     /// display's low latency handle, opens the next frame and the display's slot for it.
     pub fn begin_frame<'a>(&'a mut self, desc: FrameDesc<'a>) -> Result<Frame<'a>> {
+        self.lighting.paths.poll();
         let scenes = self.scenes.begin_frame(&orr_scene::FrameDesc {
             time: desc.time,
             scenes: desc.scenes,
@@ -717,6 +878,12 @@ impl<'a> Frame<'a> {
     /// orr's frame id: strictly increasing from 1.
     pub fn id(&self) -> u64 {
         self.scenes.id()
+    }
+
+    /// Whether this frame's views render lit, or black because the path tracing kernels are still
+    /// compiling. The answer holds for the whole frame.
+    pub fn paths_ready(&self) -> bool {
+        matches!(self.lighting.paths, Paths::Ready(_))
     }
 
     /// The exposure telemetry of the view's newest completed render. Read it before the
@@ -870,6 +1037,16 @@ impl<'a> Frame<'a> {
     /// the output extent. A new output extent or request remakes the view's NGX feature, which
     /// waits for its setup on this thread. The jitter follows the view's renders, so a view not
     /// rendered every frame still covers its pixels. A feature NGX refuses is an error.
+    ///
+    /// While the path tracing kernels compile ([`Frame::paths_ready`] false) only the view's raster
+    /// half runs, so streaming goes on while a loading thread is free, and everything after it
+    /// holds black:
+    /// [`RenderedView::compiling`] is set, ray reconstruction, exposure, motion blur, glare and
+    /// frame generation do not run, and the `transparency` and `scene_referred` hooks do not run,
+    /// since no radiance exists for them to draw into or to keep. `display_linear` and `ui` run over
+    /// the black image, so a consumer can draw its own message there. The first render after that
+    /// starts every history as a view's first render does. A compile that failed returns
+    /// [`Error::PathKernels`].
     pub fn render_view(
         &mut self,
         view: &LitView<'_>,
@@ -877,7 +1054,13 @@ impl<'a> Frame<'a> {
         output: &ViewOutput,
         hooks: &mut ViewHooks<'_>,
     ) -> Result<RenderedView> {
+        if let Paths::Failed(e) = &self.lighting.paths {
+            return Err(Error::PathKernels(Arc::clone(e)));
+        }
         let (extent, render) = self.resolve_view(view, lighting, output)?;
+        let Paths::Ready(kernels) = &self.lighting.paths else {
+            return self.render_view_black(view, output, hooks, extent, render);
+        };
         let id = self.scenes.id();
         let sdr = DisplayRequest::default().resolve(&[OutputFormat::Sdr], None, false);
         let frame = self.display.as_deref_mut().and_then(Display::frame);
@@ -892,29 +1075,12 @@ impl<'a> Frame<'a> {
             .views
             .get_mut(&view.history)
             .ok_or(SceneError::UnknownViewHistory(view.history))?;
-        let (jitter, mip_bias, reconstruction) = match &state.reconstruction {
-            Some(r) => (
-                r.feature.jitter(u64::from(state.samples)),
-                r.feature.mip_bias(),
-                Some(r.feature.mode()),
-            ),
-            None => ([0.0; 2], 0.0, None),
-        };
+        let reconstruction = state.reconstruction.as_ref().map(|r| r.feature.mode());
         let reconstructed = reconstruction.is_some();
-        let desc = ViewDesc {
-            scene: view.scene,
-            history: view.history,
-            position: view.position,
-            rotation: view.rotation,
-            projection: view.projection,
-            lens: view.lens,
-            render_extent: UVec2::from(render),
-            output_extent: UVec2::from(extent),
-            jitter: Vec2::from(jitter),
-            reset_history: view.reset_history,
-            mip_bias,
-            texture_filter: view.texture_filter,
-        };
+        let mut desc = state.raster_desc(view, extent, render);
+        let jitter = desc.jitter.to_array();
+        // Raster-only frames while the path kernels compile leave no history for lighting.
+        desc.reset_history |= state.lighting.is_none();
 
         let set = Hooks {
             scene_referred: hooks.scene_referred.is_some(),
@@ -933,13 +1099,12 @@ impl<'a> Frame<'a> {
             requests.extend(orr_output::hook_requests(extent));
         }
         let raster = self.scenes.raster_view_with(&desc, &requests)?;
-        let delta = self.scenes.time().delta;
         let gpu = self.output.device.clone();
         let (list, arena) = self.scenes.list_and_arena(view.history)?;
         arena.enter(ViewStep::Lighting, list);
 
-        let lights = &mut *self.lighting;
-        let scene = lights
+        let scene = self
+            .lighting
             .scenes
             .get_mut(&view.scene)
             .ok_or(SceneError::UnknownScene(view.scene))?;
@@ -974,10 +1139,6 @@ impl<'a> Frame<'a> {
         paths.begin(id, scene, &desc, output.cut, lighting);
         let traced = Stages::COMPUTE | Stages::RAY;
         list.barrier(Stages::ALL, traced, Hazards::empty());
-        let kernels = lights
-            .paths
-            .as_ref()
-            .expect("compiled with the view history");
         kernels.record_media(list, scene, paths, &pass, lighting)?;
         kernels.record_opaque(list, scene, paths, &pass, lighting)?;
         list.barrier(traced, traced, Hazards::empty());
@@ -1161,6 +1322,7 @@ impl<'a> Frame<'a> {
                 reconstruction,
                 radiance: chain.rr_output,
                 linear: TextureIndex::NONE,
+                compiling: false,
             });
         }
 
@@ -1187,59 +1349,158 @@ impl<'a> Frame<'a> {
         if let (Some(inputs), Some(hook)) = (inputs, hooks.display_linear.as_mut()) {
             inputs.run(list, HookPoint::DisplayLinear, &chain, field, &mut **hook);
         }
-        arena.enter(ViewStep::Compose, list);
-        let ui = match (display.as_mut(), hooks.ui.as_mut()) {
-            (Some(frame), Some(hook)) => {
-                let list = self.scenes.list()?;
-                let index = paint_ui(list, frame, delta, &mut **hook);
-                list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-                Some(index)
-            }
-            _ => None,
-        };
-        let (list, arena) = self.scenes.output_list_and_arena(view.history)?;
-        let store = match (view.target, display.as_mut()) {
-            (ViewTarget::Texture(t), _) => {
-                list.discard_after_use(t);
-                let slot = gpu.alloc_image_slot()?;
-                self.slots.push(slot);
-                gpu.write_storage(slot, t, &orr_gpu::ViewDesc::default())
-            }
-            (_, Some(frame)) => frame.backbuffer(list),
-            _ => StorageImageIndex::NONE,
-        };
-        let n = state.compose.len() as u64;
-        kernels.compose(
-            list,
-            &mut state.compose[(id % n) as usize],
-            &ComposePass {
-                source: ComposeSource::Linear(chain.linear),
-                ui: None,
-                target: store,
+        finish_view(
+            &mut self.scenes,
+            &mut self.slots,
+            &gpu,
+            kernels,
+            state,
+            display.as_mut(),
+            ViewEnd {
+                view,
+                output,
+                ui: hooks.ui.as_mut().map(|ui| &mut **ui as _),
+                linear: chain.linear,
                 extent,
                 display: &resolved,
             },
-        );
-        if let Some(ScreenshotRequest::Display { include_ui }) = output.screenshot {
-            kernels.capture(
-                list,
-                &mut state.output,
-                &CapturePass {
-                    source: ComposeSource::Linear(chain.linear),
-                    ui: ui.filter(|_| include_ui),
-                    extent,
-                    display: &resolved,
-                    frame: id,
-                },
-            )?;
-        }
-        arena.enter(ViewStep::After, list);
+        )?;
         Ok(RenderedView {
             raster,
             render_extent: render,
             reconstruction,
             radiance: chain.rr_output,
             linear: chain.linear,
+            compiling: false,
+        })
+    }
+
+    /// [`Frame::render_view`] while the path kernels compile: the raster half, then black. It
+    /// leaves the view's lighting, exposure and reconstruction state as it found them, and frame
+    /// generation restarts on a frame that does not ask for it.
+    fn render_view_black(
+        &mut self,
+        view: &LitView<'_>,
+        output: &ViewOutput,
+        hooks: &mut ViewHooks<'_>,
+        extent: [u32; 2],
+        render: [u32; 2],
+    ) -> Result<RenderedView> {
+        let id = self.scenes.id();
+        let sdr = DisplayRequest::default().resolve(&[OutputFormat::Sdr], None, false);
+        let frame = self.display.as_deref_mut().and_then(Display::frame);
+        let mut display = frame.filter(|_| matches!(view.target, ViewTarget::Display));
+        let resolved = display.as_ref().map_or(sdr, |f| f.display);
+        let tonemapped = !matches!(view.target, ViewTarget::Radiance { .. });
+
+        let state = self
+            .output
+            .views
+            .get_mut(&view.history)
+            .ok_or(SceneError::UnknownViewHistory(view.history))?;
+        // The render size, jitter and bias the first lit render will use, so geometry and
+        // streaming settle for it.
+        let desc = state.raster_desc(view, extent, render);
+        let set = Hooks {
+            scene_referred: false,
+            display_linear: tonemapped && hooks.display_linear.is_some(),
+        };
+        let mut requests = vec![
+            output_image_request(RECONSTRUCTED, extent, ViewStep::Rr),
+            output_image_request(VIEW_LINEAR, extent, ViewStep::SceneReferred),
+        ];
+        if set.any() {
+            requests.extend(orr_output::hook_requests(extent));
+        }
+        let raster = self.scenes.raster_view_with(&desc, &requests)?;
+        let (list, arena) = self.scenes.output_list_and_arena(view.history)?;
+        arena.enter(ViewStep::Rr, list);
+        let radiance = arena
+            .texture(RECONSTRUCTED)
+            .expect("requested above")
+            .clone();
+        arena.enter(ViewStep::SceneReferred, list);
+        let linear = arena.texture(VIEW_LINEAR).expect("requested above").clone();
+        let chain = ChainImages {
+            rr_output: radiance.sampled(),
+            rr_output_store: radiance.storage(0),
+            linear: linear.sampled(),
+            linear_store: linear.storage(0),
+        };
+        let mut field = match display.as_mut() {
+            Some(frame) if output.distortion_field && set.any() => Some(frame.distortion_field()?),
+            _ => None,
+        };
+        let kernels = &self.output.kernels;
+        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+        let black = [chain.rr_output_store, chain.linear_store];
+        kernels.black(list, &mut state.output, id, black, extent, &sdr);
+        list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
+        let inputs = kernels.hook_inputs(
+            list,
+            &mut state.output,
+            arena,
+            &HookInputsPass {
+                rr_depth: raster.targets.depth,
+                rr_motion: raster.targets.motion,
+                chain,
+                extent,
+                view: raster.view,
+                jitter: desc.jitter.to_array(),
+                frame: id,
+                hooks: set,
+            },
+            field.as_deref_mut(),
+        )?;
+        if let Some(ScreenshotRequest::SceneReferred { rec709 }) = output.screenshot {
+            kernels.capture_scene_referred(
+                list,
+                &mut state.output,
+                &SceneCapturePass {
+                    source: chain.rr_output,
+                    extent,
+                    view: raster.view,
+                    rec709,
+                    display: &resolved,
+                    frame: id,
+                },
+            )?;
+        }
+        if tonemapped {
+            arena.enter(ViewStep::DisplayLinear, list);
+            if let (Some(inputs), Some(hook)) = (inputs, hooks.display_linear.as_mut()) {
+                inputs.run(list, HookPoint::DisplayLinear, &chain, field, &mut **hook);
+            }
+            finish_view(
+                &mut self.scenes,
+                &mut self.slots,
+                &self.output.device,
+                kernels,
+                state,
+                display.as_mut(),
+                ViewEnd {
+                    view,
+                    output,
+                    ui: hooks.ui.as_mut().map(|ui| &mut **ui as _),
+                    linear: chain.linear,
+                    extent,
+                    display: &resolved,
+                },
+            )?;
+        } else {
+            arena.enter(ViewStep::After, list);
+        }
+        Ok(RenderedView {
+            compiling: true,
+            raster,
+            render_extent: render,
+            reconstruction: None,
+            radiance: chain.rr_output,
+            linear: if tonemapped {
+                chain.linear
+            } else {
+                TextureIndex::NONE
+            },
         })
     }
 
@@ -1394,6 +1655,89 @@ impl<'a> Frame<'a> {
         }
         Ok(last.expect("a frame submits"))
     }
+}
+
+/// What the end of a view's render works on.
+struct ViewEnd<'x> {
+    view: &'x LitView<'x>,
+    output: &'x ViewOutput,
+    ui: Option<&'x mut dyn FnMut(&mut UiPass<'_, '_>)>,
+    /// The display-linear image.
+    linear: TextureIndex,
+    extent: [u32; 2],
+    display: &'x ResolvedDisplay,
+}
+
+/// The end of a view's render with an image, after its display-linear hook: its UI, compose into
+/// its target and a display screenshot.
+fn finish_view(
+    scenes: &mut orr_scene::Frame<'_>,
+    slots: &mut Vec<u32>,
+    gpu: &Device,
+    kernels: &OutputKernels,
+    state: &mut ViewState,
+    mut frame: Option<&mut DisplayFrame<'_>>,
+    end: ViewEnd<'_>,
+) -> Result<()> {
+    let ViewEnd {
+        view,
+        output,
+        ui,
+        linear,
+        extent,
+        display,
+    } = end;
+    let id = scenes.id();
+    let delta = scenes.time().delta;
+    let (list, arena) = scenes.output_list_and_arena(view.history)?;
+    arena.enter(ViewStep::Compose, list);
+    let ui = match (frame.as_deref_mut(), ui) {
+        (Some(frame), Some(hook)) => {
+            let list = scenes.list()?;
+            let index = paint_ui(list, frame, delta, hook);
+            list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+            Some(index)
+        }
+        _ => None,
+    };
+    let (list, arena) = scenes.output_list_and_arena(view.history)?;
+    let store = match (view.target, frame) {
+        (ViewTarget::Texture(t), _) => {
+            list.discard_after_use(t);
+            let slot = gpu.alloc_image_slot()?;
+            slots.push(slot);
+            gpu.write_storage(slot, t, &orr_gpu::ViewDesc::default())
+        }
+        (_, Some(frame)) => frame.backbuffer(list),
+        _ => StorageImageIndex::NONE,
+    };
+    let n = state.compose.len() as u64;
+    kernels.compose(
+        list,
+        &mut state.compose[(id % n) as usize],
+        &ComposePass {
+            source: ComposeSource::Linear(linear),
+            ui: None,
+            target: store,
+            extent,
+            display,
+        },
+    );
+    if let Some(ScreenshotRequest::Display { include_ui }) = output.screenshot {
+        kernels.capture(
+            list,
+            &mut state.output,
+            &CapturePass {
+                source: ComposeSource::Linear(linear),
+                ui: ui.filter(|_| include_ui),
+                extent,
+                display,
+                frame: id,
+            },
+        )?;
+    }
+    arena.enter(ViewStep::After, list);
+    Ok(())
 }
 
 /// Runs `hook` once per UI layer of `frame`, each inside a [`UI_PASS`] pass with its

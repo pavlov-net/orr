@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use orr::Renderer;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, WindowEvent};
@@ -52,6 +53,8 @@ impl ApplicationHandler for App {
 pub struct Window {
     app: App,
     event_loop: EventLoop<()>,
+    title: String,
+    compiling: u32,
 }
 
 impl Window {
@@ -70,6 +73,8 @@ impl Window {
                 keys: Vec::new(),
             },
             event_loop,
+            title: title.to_owned(),
+            compiling: 0,
         };
         while w.app.window.is_none() {
             assert!(w.pump(), "the window closed while opening");
@@ -88,6 +93,22 @@ impl Window {
     /// The keys pressed since the last call, in order.
     pub fn take_keys(&mut self) -> Vec<KeyCode> {
         std::mem::take(&mut self.app.keys)
+    }
+
+    /// [`Window::pump`], saying in the title how many path tracing kernels are still compiling
+    /// while the view is black.
+    pub fn pump_showing_paths(&mut self, renderer: &Renderer) -> bool {
+        let outstanding = renderer.paths_outstanding();
+        if outstanding != self.compiling {
+            self.compiling = outstanding;
+            let title = if outstanding == 0 {
+                self.title.clone()
+            } else {
+                format!("{} (compiling, {outstanding} kernels left)", self.title)
+            };
+            self.window().set_title(&title);
+        }
+        self.pump()
     }
 
     /// Asks for a client area of `width` x `height` physical pixels.

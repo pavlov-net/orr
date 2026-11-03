@@ -23,10 +23,10 @@ use orr::orr_gpu::{
 use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    Affine3, DirectionalLight, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter,
-    HookPass, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, PackSource, Projection,
-    Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest, TextureFilter,
-    TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    Affine3, CompilingKernels, DirectionalLight, Display, DisplayRequest, FrameDesc, FrameTime,
+    GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, PackSource,
+    Projection, Renderer, RendererDesc, SceneDesc, SceneLightingSettings, ScreenshotRequest,
+    TextureFilter, TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_atmosphere::presets::{LUNAR_ANGULAR_RADIUS, lunar_albedo, lunar_disc, solar_disc};
 use orr_atmosphere::{Atmosphere, AtmosphereState, HeightFog};
@@ -151,7 +151,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         .expect("display")
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
-    let _workers = Workers::new(renderer.loading(), 2);
+    let _workers = Workers::new(renderer.loading(), 2 + CompilingKernels::JOBS);
     let (mount, mut frame) = mount_at(&mut renderer, PackSource::Memory(cook()), FIRST_FRAME);
 
     let atmosphere = Atmosphere {
@@ -185,6 +185,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         )
         .expect("scene");
     let history = renderer.create_view_history().expect("view history");
+    options.wait_for_paths(&mut renderer);
     let near = renderer
         .model(mount, AssetId::from_name(NEAR))
         .expect("near model");
@@ -258,7 +259,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             break;
         }
         if let Some(w) = window.as_mut()
-            && !w.pump()
+            && !w.pump_showing_paths(&renderer)
         {
             break;
         }
@@ -327,7 +328,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             .expect("prepare view");
         f.update_scenes(&mut |c| sky.record(c, &[]).expect("sky passes"))
             .expect("update scenes");
-        let mut average = average.hook(&f, i, extent);
+        let mut average = average.hook(&f, extent);
         let mut hooks = ViewHooks {
             scene_referred: still.then_some(&mut average as &mut dyn FnMut(&mut HookPass<'_, '_>)),
             ..ViewHooks::default()

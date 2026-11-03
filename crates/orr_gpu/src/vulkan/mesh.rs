@@ -286,9 +286,7 @@ impl Device {
         name: &str,
     ) -> Result<MeshPipeline, Error> {
         Ok(MeshPipeline {
-            raw: self
-                .shared
-                .create_mesh(d, vk::PipelineCreateFlags2::empty(), name)?,
+            raw: self.shared.create_mesh(d, self.creation_flags, name)?,
             shared: Arc::clone(&self.shared),
         })
     }

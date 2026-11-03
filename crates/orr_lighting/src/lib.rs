@@ -61,9 +61,9 @@ pub use shaders::types::{
 };
 pub use subsurface::{CapTailTable, SSS_STEPS, SubsurfaceDepth};
 pub use view::{
-    CameraJump, DofBackgroundPass, GuideKind, GuideSettings, LightingDebugView, LightingKernels,
-    LightingView, MAX_LOCAL_LIGHT_SHARE, MIN_PIXEL_FRACTION, ReferenceSettings, ThinLens,
-    ViewLighting, ViewPass,
+    CameraJump, CompilingKernels, DofBackgroundPass, GuideKind, GuideSettings, LightingDebugView,
+    LightingKernels, LightingView, MAX_LOCAL_LIGHT_SHARE, MIN_PIXEL_FRACTION, ReferenceSettings,
+    ThinLens, ViewLighting, ViewPass,
 };
 pub use world_cache::{MAX_CAPACITY_LOG2, WorldCacheStats};
 
@@ -83,6 +83,18 @@ pub enum Error {
     Scene(#[from] orr_scene::Error),
     #[error("invalid lighting settings: {0}")]
     Settings(&'static str),
+    /// A compile job of [`CompilingKernels`] failed.
+    #[error("compiling {kernel}: {source}")]
+    Compile {
+        kernel: &'static str,
+        source: Box<Error>,
+    },
+    /// A compile job of [`CompilingKernels`] panicked.
+    #[error("compiling {kernel}: panicked: {message}")]
+    CompilePanicked {
+        kernel: &'static str,
+        message: String,
+    },
     /// A replacement kernel does not match the module it replaces.
     #[error("kernel {kernel}: {reason}")]
     Kernel {

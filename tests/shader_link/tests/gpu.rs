@@ -265,6 +265,7 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
     // Compiles the path tracing pipelines from the linked `path/opaque` and
     // `world_cache/update`.
     r.create_view_history().unwrap();
+    r.wait_paths().unwrap();
     drop(r);
     // The linked modules create pipelines as orr's own do.
     for &m in orr_linked::KERNELS.modules {

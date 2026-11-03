@@ -302,6 +302,7 @@ impl StillShowcase {
         let workers = Workers::new(renderer.loading(), 2);
         let showcase = Showcase::load(&mut renderer, gpu);
         let history = renderer.create_view_history().expect("view history");
+        renderer.wait_paths().expect("path kernels");
         let frame = showcase.frame;
         Self {
             showcase,
@@ -345,7 +346,7 @@ impl StillShowcase {
                     .then_some(ScreenshotRequest::Display { include_ui: false }),
                 ..ViewOutput::default()
             };
-            let mut sum = average.as_mut().map(|a| a.hook(&f, i, extent));
+            let mut sum = average.as_mut().map(|a| a.hook(&f, extent));
             let mut overlay = |pass: &mut TransparencyPass<'_, '_>, _| {
                 pass.cmd.begin_rendering(&Rendering {
                     extent: pass.extent,
@@ -848,6 +849,7 @@ impl Lamp {
             .create_scene(&SceneDesc::default(), &Default::default())
             .expect("scene");
         let history = renderer.create_view_history().expect("view history");
+        renderer.wait_paths().expect("path kernels");
         frame += 1;
         let listed = [scene];
         let f = renderer

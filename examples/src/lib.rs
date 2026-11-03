@@ -142,6 +142,14 @@ impl Options {
         }
     }
 
+    /// Waits for the path tracing kernels when the run counts or captures frames, so each is lit.
+    /// A window left to run stays live while they compile.
+    pub fn wait_for_paths(&self, renderer: &mut Renderer) {
+        if self.headless || self.frames.is_some() || self.out.is_some() {
+            renderer.wait_paths().expect("path kernels");
+        }
+    }
+
     /// Whether `flag` is one of the example's own arguments.
     pub fn has(&self, flag: &str) -> bool {
         self.rest.iter().any(|a| a == flag)
@@ -321,9 +329,18 @@ impl Workers {
 }
 
 impl Drop for Workers {
+    /// Stops the workers. One still compiling a pipeline after a second is left to finish on its
+    /// own or die with the process, since the driver cannot be interrupted and closing a window
+    /// should not wait minutes for it.
     fn drop(&mut self) {
         self.loading.stop_workers();
-        for t in self.threads.drain(..) {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(1)
+            && !self.threads.iter().all(JoinHandle::is_finished)
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for t in self.threads.drain(..).filter(JoinHandle::is_finished) {
             t.join().expect("loading worker");
         }
     }

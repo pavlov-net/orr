@@ -19,9 +19,9 @@ use examples::window::Window;
 use examples::{Capture, Options, Workers, assert_clean, device, enable_dlss, fixed_time};
 use orr::orr_gpu::{Format, QueueKind, TextureDesc, TextureMemory, TextureUsage, TimelinePoint};
 use orr::{
-    Display, DisplayRequest, ExposureTelemetry, FrameDesc, FrameTime, HookPass, Lens, LitView,
-    Projection, Renderer, RendererDesc, ResolvedDisplay, ScreenshotRequest, TextureFilter,
-    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    CompilingKernels, Display, DisplayRequest, ExposureTelemetry, FrameDesc, FrameTime, HookPass,
+    Lens, LitView, Projection, Renderer, RendererDesc, ResolvedDisplay, ScreenshotRequest,
+    TextureFilter, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_math::Vec3;
 use orr_math::camera::rh::view;
@@ -64,10 +64,11 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     if !options.headless {
         enable_dlss(&mut renderer);
     }
-    let _workers = Workers::new(renderer.loading(), 2);
+    let _workers = Workers::new(renderer.loading(), 2 + CompilingKernels::JOBS);
     let showcase = Showcase::load(&mut renderer, gpu);
     let scene = showcase.scene;
     let history = renderer.create_view_history().expect("view history");
+    options.wait_for_paths(&mut renderer);
     let frame = showcase.frame;
     let listed = [scene];
 
@@ -100,7 +101,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             break;
         }
         if let Some(w) = window.as_mut()
-            && !w.pump()
+            && !w.pump_showing_paths(&renderer)
         {
             break;
         }
@@ -153,7 +154,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             }),
             ..ViewOutput::default()
         };
-        let mut average = average.hook(&f, i, extent);
+        let mut average = average.hook(&f, extent);
         let mut ui = |pass: &mut orr::UiPass<'_, '_>| overlay.paint(pass, id);
         let mut hooks = ViewHooks {
             scene_referred: still.then_some(&mut average as &mut dyn FnMut(&mut HookPass<'_, '_>)),

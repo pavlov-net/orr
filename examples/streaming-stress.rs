@@ -23,11 +23,11 @@ use orr::orr_pack::material::{Material, slot};
 use orr::orr_pack::mesh::MeshInfo;
 use orr::orr_pack::{Archive, AssetId, Class, Target};
 use orr::{
-    Affine3, Budgets, DirectionalLight, DiscProfile, Display, DisplayRequest, FrameDesc, FrameTime,
-    GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView, PackSource,
-    Projection, Renderer, RendererDesc, ResidencyClass, SceneDesc, SceneLightingSettings,
-    ScreenshotRequest, TextureFilter, TransformGroupDesc, ViewHooks, ViewLighting, ViewOutput,
-    ViewTarget,
+    Affine3, Budgets, CompilingKernels, DirectionalLight, DiscProfile, Display, DisplayRequest,
+    FrameDesc, FrameTime, GroupWriter, InstanceFlags, InstancesDesc, Lens, Light, LightId, LitView,
+    PackSource, Projection, Renderer, RendererDesc, ResidencyClass, SceneDesc,
+    SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc, ViewHooks,
+    ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{
     ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source, TextureSettings, Usage,
@@ -267,7 +267,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         .expect("display")
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
-    let _workers = Workers::new(renderer.loading(), 4);
+    let _workers = Workers::new(renderer.loading(), 4 + CompilingKernels::JOBS);
     let (mount, mut frame) = mount_at(&mut renderer, PackSource::Memory(pack), FIRST_FRAME);
     let scene = renderer
         .create_scene(
@@ -362,6 +362,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     }
 
     let history = renderer.create_view_history().expect("view history");
+    options.wait_for_paths(&mut renderer);
     let headless_target = options.headless.then(|| {
         let [w, h] = HEADLESS_EXTENT;
         gpu.create_texture(
@@ -389,7 +390,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             break;
         }
         if let Some(w) = window.as_mut()
-            && !w.pump()
+            && !w.pump_showing_paths(&renderer)
         {
             break;
         }

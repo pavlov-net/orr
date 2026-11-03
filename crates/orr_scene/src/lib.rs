@@ -86,7 +86,7 @@ pub use decals::{Decal, DecalChannels, DecalId};
 pub use edit::{EditDesc, EditId, EditRef};
 pub use emissive::{EmissiveSpan, ModelEmission, emissive_spans};
 pub use lights::{Cone, DirectionalLight, DiscProfile, Light, LightId};
-pub use loading::Loading;
+pub use loading::{JobResult, Loading};
 pub use material::{BoundTexture, MaterialId, MaterialWriter, material_flags};
 pub use medium_proxy::{MediumProxy, MediumProxyId, ProxyDensity, VolumeRef};
 pub use mount::{ClipRef, InstancePage, LoadState, MountId, PackSource, PageId, SkeletonRef};
