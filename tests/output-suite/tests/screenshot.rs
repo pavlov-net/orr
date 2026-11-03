@@ -31,10 +31,6 @@ fn captures_carry_their_frames() {
     assert!(telemetry.pre_exposure.log2().abs() > 4.0);
     let first = telemetry.frame + 1;
 
-    let shoot = |request| ViewOutput {
-        screenshot: Some(request),
-        ..ViewOutput::default()
-    };
     let requests = [
         (1.0, ScreenshotRequest::SceneReferred { rec709: false }),
         (2.0, ScreenshotRequest::SceneReferred { rec709: true }),
@@ -42,7 +38,8 @@ fn captures_carry_their_frames() {
         (1.5, ScreenshotRequest::Display { include_ui: false }),
     ];
     for (scale, request) in requests {
-        h.frame(scale, &shoot(request), Some(&display));
+        h.screenshot_next(request);
+        h.frame(scale, &plain, Some(&display));
     }
     let shots = h.screenshots();
     assert!(h.screenshots().is_empty());

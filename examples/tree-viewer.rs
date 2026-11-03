@@ -630,14 +630,13 @@ fn run(options: &Options) -> Option<Capture> {
             },
             lens: switches.lens(),
             camera_cut: false,
+            not_rendering_scene: false,
+            screenshot: (capture && final_frame)
+                .then_some(ScreenshotRequest::Display { include_ui: false }),
             texture_filter: TextureFilter::Hardware,
             target,
         };
-        let output = ViewOutput {
-            screenshot: (capture && final_frame)
-                .then_some(ScreenshotRequest::Display { include_ui: false }),
-            ..ViewOutput::default()
-        };
+        let output = ViewOutput::default();
         f.prepare_view(&view, &ViewLighting::default(), &output)
             .expect("prepare view");
         f.update_scenes(&mut |c| {

@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::encode::{pq_encode, srgb_encode};
 
-/// A capture of one view, made in the frame that sets it in `ViewOutput::screenshot`.
+/// A capture of one view, made in the frame that asks for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScreenshotRequest {
     /// What the display shows: display-linear Rec.709, 1.0 = paper white.

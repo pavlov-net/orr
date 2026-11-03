@@ -203,6 +203,13 @@ pub struct LitView<'a> {
     /// white balance snap. A view's first render, its first on another scene and its first after
     /// [`SceneWriter::reset_lighting_history`] are cuts without it.
     pub camera_cut: bool,
+    /// Menus and loading screens: frame generation is told the frame shows no scene.
+    pub not_rendering_scene: bool,
+    /// A capture of this render, read back through [`Renderer::screenshots`], which holds its
+    /// memory until then: set it only on the renders to capture. A display capture needs an
+    /// image, so a [`ViewTarget::Radiance`] view takes none, and it holds the UI only on
+    /// [`ViewTarget::Display`]. While the path tracing kernels compile it captures black.
+    pub screenshot: Option<ScreenshotRequest>,
     /// How the view filters material textures.
     pub texture_filter: TextureFilter,
     pub target: ViewTarget<'a>,
@@ -1269,7 +1276,7 @@ impl<'a> Frame<'a> {
             )
         };
         if let Some(frame) = display.as_mut() {
-            frame.frame_generation(&desc, depth, motion, output.not_rendering_scene);
+            frame.frame_generation(&desc, depth, motion, view.not_rendering_scene);
         }
         let distortion = output.lens_distortion(view.lens.distortion);
         let field_on = distortion.is_some() || (output.distortion_field && set.any());
@@ -1303,7 +1310,7 @@ impl<'a> Frame<'a> {
                 &mut **hook,
             );
         }
-        if let Some(ScreenshotRequest::SceneReferred { rec709 }) = output.screenshot {
+        if let Some(ScreenshotRequest::SceneReferred { rec709 }) = view.screenshot {
             kernels.capture_scene_referred(
                 list,
                 &mut state.output,
@@ -1409,7 +1416,6 @@ impl<'a> Frame<'a> {
             display.as_mut(),
             ViewEnd {
                 view,
-                output,
                 ui: hooks.ui.as_mut().map(|ui| &mut **ui as _),
                 linear: chain.linear,
                 extent,
@@ -1503,7 +1509,7 @@ impl<'a> Frame<'a> {
             },
             field.as_deref_mut(),
         )?;
-        if let Some(ScreenshotRequest::SceneReferred { rec709 }) = output.screenshot {
+        if let Some(ScreenshotRequest::SceneReferred { rec709 }) = view.screenshot {
             kernels.capture_scene_referred(
                 list,
                 &mut state.output,
@@ -1531,7 +1537,6 @@ impl<'a> Frame<'a> {
                 display.as_mut(),
                 ViewEnd {
                     view,
-                    output,
                     ui: hooks.ui.as_mut().map(|ui| &mut **ui as _),
                     linear: chain.linear,
                     extent,
@@ -1711,7 +1716,6 @@ impl<'a> Frame<'a> {
 /// What the end of a view's render works on.
 struct ViewEnd<'x> {
     view: &'x LitView<'x>,
-    output: &'x ViewOutput,
     ui: Option<&'x mut dyn FnMut(&mut UiPass<'_, '_>)>,
     /// The display-linear image.
     linear: TextureIndex,
@@ -1732,7 +1736,6 @@ fn finish_view(
 ) -> Result<()> {
     let ViewEnd {
         view,
-        output,
         ui,
         linear,
         extent,
@@ -1774,7 +1777,7 @@ fn finish_view(
             display,
         },
     );
-    if let Some(ScreenshotRequest::Display { include_ui }) = output.screenshot {
+    if let Some(ScreenshotRequest::Display { include_ui }) = view.screenshot {
         kernels.capture(
             list,
             &mut state.output,

@@ -338,11 +338,6 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         f.scene(scene)
             .expect("scene writer")
             .set_focus(eye.as_dvec3());
-        let output = ViewOutput {
-            screenshot: (capture && final_frame)
-                .then_some(ScreenshotRequest::Display { include_ui: false }),
-            ..ViewOutput::default()
-        };
         f.render_view(
             &LitView {
                 scene,
@@ -355,11 +350,14 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
                 },
                 lens: Lens::default(),
                 camera_cut: false,
+                not_rendering_scene: false,
+                screenshot: (capture && final_frame)
+                    .then_some(ScreenshotRequest::Display { include_ui: false }),
                 texture_filter: TextureFilter::Hardware,
                 target,
             },
             &lighting,
-            &output,
+            &ViewOutput::default(),
             &mut ViewHooks::default(),
         )
         .expect("render view");

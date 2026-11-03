@@ -5,7 +5,6 @@ use orr_scene::LensDistortion;
 
 use crate::{
     AutoWhiteBalance, CalibrationPattern, DofPath, Exposure, Grade, Gt7Params, LocalExposure,
-    ScreenshotRequest,
 };
 
 /// How a lit view goes through DLSS ray reconstruction when the renderer has it. Without it, or
@@ -43,10 +42,6 @@ pub struct ViewOutput {
     /// A hook warps the image: the view's hooks get the display's distortion field, which
     /// frame generation reads. A lens with distortion turns the field on too.
     pub distortion_field: bool,
-    /// Menus and loading screens: frame generation is told the frame shows no scene.
-    pub not_rendering_scene: bool,
-    /// A capture of this frame, read back through `OutputView::screenshots`.
-    pub screenshot: Option<ScreenshotRequest>,
     pub debug: OutputDebug,
 }
 

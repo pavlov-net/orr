@@ -443,6 +443,8 @@ fn view_of<'a>(
         },
         lens: Lens::default(),
         camera_cut: false,
+        not_rendering_scene: false,
+        screenshot: None,
         texture_filter: TextureFilter::Hardware,
         target: ViewTarget::Texture(image),
     }
@@ -860,18 +862,8 @@ fn render_view_runs_the_glare_its_lens_asks_for() {
         let eye = DVec3::new(0.0, 0.0, 30.0);
         f.render_view(
             &LitView {
-                scene,
-                history,
-                position: eye,
-                rotation: look_at_origin(eye),
-                projection: Projection {
-                    fov_y: 1.0,
-                    near: 0.05,
-                },
                 lens,
-                camera_cut: false,
-                texture_filter: TextureFilter::Hardware,
-                target: ViewTarget::Texture(&image),
+                ..view_of(scene, history, eye, &image)
             },
             &ViewLighting::default(),
             &ViewOutput {
