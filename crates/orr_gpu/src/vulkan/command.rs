@@ -349,18 +349,17 @@ impl<'q> CommandList<'q> {
         self.bind_data(point, pipeline, &root.to_le_bytes());
     }
 
-    /// Binds `pipeline` and pushes `root`, which must be the size `inline_root` of the kernel's
-    /// root.
+    /// Binds `pipeline`, whose kernel holds its root in the push data, and pushes `root`.
     fn bind_inline<R: Pod>(
         &mut self,
         point: vk::PipelineBindPoint,
         pipeline: vk::Pipeline,
-        inline_root: u32,
+        inline_root_bytes: u32,
         root: &R,
     ) {
         assert_eq!(
             size_of::<R>(),
-            inline_root as usize,
+            inline_root_bytes as usize,
             "the root pushed is not the size of the kernel's inline root"
         );
         const {
@@ -395,20 +394,30 @@ impl<'q> CommandList<'q> {
         unsafe { self.queue.shared.heap_fn.cmd_push_data(cmd, &push) };
     }
 
-    /// Runs `p` over `groups` workgroups with `root` as its root pointer.
-    pub fn dispatch<R>(&mut self, p: &ComputePipeline, root: GpuPtr<R>, groups: [u32; 3]) {
+    /// Binds `p`, whose kernel reads its root from GPU memory, and pushes the address of `root`.
+    fn bind_compute<R>(&mut self, p: &ComputePipeline, root: GpuPtr<R>) {
         assert_eq!(
-            p.inline_root, 0,
-            "dispatch_inline runs ORR_ROOT_INLINE kernels"
+            p.inline_root_bytes, 0,
+            "an ORR_ROOT_INLINE kernel runs with dispatch_inline or dispatch_indirect_inline"
         );
         self.bind(vk::PipelineBindPoint::COMPUTE, p.raw, root.address().0);
+    }
+
+    /// Runs `p` over `groups` workgroups with `root` as its root pointer.
+    pub fn dispatch<R>(&mut self, p: &ComputePipeline, root: GpuPtr<R>, groups: [u32; 3]) {
+        self.bind_compute(p, root);
         self.dispatch_bound(groups);
     }
 
     /// As [`Self::dispatch`], for a kernel declared with `ORR_ROOT_INLINE`: `root` is pushed with
     /// the dispatch.
     pub fn dispatch_inline<R: Pod>(&mut self, p: &ComputePipeline, root: &R, groups: [u32; 3]) {
-        self.bind_inline(vk::PipelineBindPoint::COMPUTE, p.raw, p.inline_root, root);
+        self.bind_inline(
+            vk::PipelineBindPoint::COMPUTE,
+            p.raw,
+            p.inline_root_bytes,
+            root,
+        );
         self.dispatch_bound(groups);
     }
 
@@ -425,7 +434,7 @@ impl<'q> CommandList<'q> {
         self.bind_inline(
             vk::PipelineBindPoint::RAY_TRACING_KHR,
             p.raw,
-            p.inline_root,
+            p.inline_root_bytes,
             root,
         );
         let rt = self
@@ -462,7 +471,7 @@ impl<'q> CommandList<'q> {
         self.bind_inline(
             vk::PipelineBindPoint::RAY_TRACING_KHR,
             p.raw,
-            p.inline_root,
+            p.inline_root_bytes,
             root,
         );
         let rt = self
@@ -685,11 +694,7 @@ impl<'q> CommandList<'q> {
         root: GpuPtr<R>,
         args: GpuPtr<DispatchArgs>,
     ) {
-        assert_eq!(
-            p.inline_root, 0,
-            "dispatch_indirect_inline runs ORR_ROOT_INLINE kernels"
-        );
-        self.bind(vk::PipelineBindPoint::COMPUTE, p.raw, root.address().0);
+        self.bind_compute(p, root);
         self.dispatch_indirect_bound(args);
     }
 
@@ -700,7 +705,12 @@ impl<'q> CommandList<'q> {
         root: &R,
         args: GpuPtr<DispatchArgs>,
     ) {
-        self.bind_inline(vk::PipelineBindPoint::COMPUTE, p.raw, p.inline_root, root);
+        self.bind_inline(
+            vk::PipelineBindPoint::COMPUTE,
+            p.raw,
+            p.inline_root_bytes,
+            root,
+        );
         self.dispatch_indirect_bound(args);
     }
 

@@ -40,7 +40,8 @@ pub struct Lut {
 }
 
 /// The eight tables in `OpenPBR_LutId` order.
-pub static LUTS: [Lut; 8] = include!(concat!(env!("OUT_DIR"), "/openpbr/luts.rs"));
+pub static LUTS: [Lut; crate::abi::OPENPBR_LUT_SLOTS as usize] =
+    include!(concat!(env!("OUT_DIR"), "/openpbr/luts.rs"));
 
 /// Specialization constant ids of the feature toggles (`bool`, default true); turning one
 /// off removes that part of the model from the kernel.
@@ -48,7 +49,8 @@ pub const SPEC_ENABLE_SHEEN_AND_COAT: u32 = 100;
 pub const SPEC_ENABLE_DISPERSION: u32 = 101;
 pub const SPEC_ENABLE_TRANSLUCENCY: u32 = 102;
 pub const SPEC_ENABLE_METALLIC: u32 = 103;
-/// Specialization constant id of the first table's heap slot (`uint`, default 0).
+/// Specialization constant id of the first table's heap slot (`uint`, default
+/// [`OPENPBR_LUT_SLOT`](crate::abi::OPENPBR_LUT_SLOT)).
 pub const SPEC_LUT_SLOT: u32 = 104;
 
 /// adobe/openpbr-bsdf's license text (Apache License 2.0).

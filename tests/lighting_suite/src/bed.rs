@@ -1951,7 +1951,6 @@ impl FlatColor {
 /// `settings`.
 pub struct Paths {
     kernels: LightingKernels,
-    _tables: BsdfTables,
     pub settings: ViewLighting,
     /// The background layer request of every frame.
     pub dof_background: Option<DofBackgroundPass>,
@@ -1967,7 +1966,6 @@ impl Paths {
         let tables = BsdfTables::new(device()).unwrap();
         Self {
             kernels: LightingKernels::new(device(), kernels, &tables, entry).unwrap(),
-            _tables: tables,
             settings,
             dof_background: None,
             frost_guide: None,

@@ -91,6 +91,8 @@ macro_rules! image_slot {
 pub const OPENPBR_LUT_SLOT: u32 = 1;
 /// How many image slots the OpenPBR tables take.
 pub const OPENPBR_LUT_SLOTS: u32 = 8;
+/// The first image slot the heap hands out, past the empty slot and the OpenPBR tables.
+pub const FIRST_FREE_IMAGE_SLOT: u32 = OPENPBR_LUT_SLOT + OPENPBR_LUT_SLOTS;
 
 image_slot!(
     /// A sampled image view's slot in the resource heap.

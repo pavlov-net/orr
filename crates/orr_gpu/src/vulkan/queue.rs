@@ -716,32 +716,30 @@ impl Shared {
     }
 
     pub(crate) fn wait(&self, point: TimelinePoint, timeout: Duration) -> Result<(), Error> {
-        let semaphores = [self.timeline(point.timeline).semaphore];
-        let values = [point.value];
-        let info = vk::SemaphoreWaitInfo::default()
-            .semaphores(&semaphores)
-            .values(&values);
-        // SAFETY: the semaphore is live.
-        unsafe {
-            self.device
-                .wait_semaphores(&info, timeout.as_nanos().min(u128::from(u64::MAX)) as u64)
-        }
-        .map_err(|e| self.vk_error("vkWaitSemaphores", e))
+        let semaphore = self.timeline(point.timeline).semaphore;
+        self.wait_values(&[semaphore], &[point.value], timeout)
     }
 
     /// Blocks until everything submitted so far, on every timeline, has completed.
     pub(crate) fn wait_submitted(&self, timeout: Duration) -> Result<(), Error> {
-        let (timelines, values): (Vec<u32>, Vec<u64>) = (0u32..)
-            .zip(self.submitted())
-            .filter(|&(_, value)| value > 0)
-            .unzip();
-        let semaphores: Vec<vk::Semaphore> = timelines
+        let (semaphores, values): (Vec<_>, Vec<_>) = self
+            .timelines
             .iter()
-            .map(|&t| self.timeline(t).semaphore)
-            .collect();
+            .flatten()
+            .map(|t| (t.semaphore, t.submitted.load(Ordering::Acquire)))
+            .unzip();
+        self.wait_values(&semaphores, &values, timeout)
+    }
+
+    fn wait_values(
+        &self,
+        semaphores: &[vk::Semaphore],
+        values: &[u64],
+        timeout: Duration,
+    ) -> Result<(), Error> {
         let info = vk::SemaphoreWaitInfo::default()
-            .semaphores(&semaphores)
-            .values(&values);
+            .semaphores(semaphores)
+            .values(values);
         // SAFETY: the semaphores are live.
         unsafe {
             self.device

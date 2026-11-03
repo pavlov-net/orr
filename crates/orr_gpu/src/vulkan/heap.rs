@@ -10,8 +10,8 @@ use super::garbage::{Item, RawBuffer};
 use super::memory::MemoryKind;
 use super::texture::{Texture, vk_address_mode, vk_compare, vk_filter, vk_mipmap_mode};
 use crate::{
-    Error, OPENPBR_LUT_SLOT, OPENPBR_LUT_SLOTS, SamplerDesc, SamplerIndex, StorageImageIndex,
-    TextureIndex, TimelinePoint, ViewDesc,
+    Error, FIRST_FREE_IMAGE_SLOT, SamplerDesc, SamplerIndex, StorageImageIndex, TextureIndex,
+    TimelinePoint, ViewDesc,
 };
 
 /// Descriptor sizes and limits of one heap.
@@ -106,7 +106,7 @@ impl SlotAllocator {
     /// the OpenPBR tables.
     pub(crate) fn images() -> Self {
         Self {
-            next: OPENPBR_LUT_SLOT + OPENPBR_LUT_SLOTS,
+            next: FIRST_FREE_IMAGE_SLOT,
             free: Vec::new(),
         }
     }
@@ -149,7 +149,7 @@ impl SlotAllocator {
 /// Panics unless the heap could have handed out `slot`.
 fn assert_freeable(slot: u32) {
     assert!(
-        slot >= OPENPBR_LUT_SLOT + OPENPBR_LUT_SLOTS,
+        slot >= FIRST_FREE_IMAGE_SLOT,
         "freeing the empty or a reserved image slot: {slot}"
     );
 }

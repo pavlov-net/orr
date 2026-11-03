@@ -1,5 +1,5 @@
 //! Ray-dispatch pipelines: one raygen stage with a raygen-only shader table, for kernels that
-//! reorder invocations at coherence points (contracts.md 3).
+//! reorder invocations at coherence points.
 
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
@@ -72,7 +72,7 @@ impl RecordBlock {
 pub struct RayDispatchPipeline {
     pub(crate) raw: vk::Pipeline,
     /// The size of the root the kernel holds in the push data.
-    pub(crate) inline_root: u32,
+    pub(crate) inline_root_bytes: u32,
     /// The raygen region of the shader table: this pipeline's record.
     pub(crate) raygen: vk::StridedDeviceAddressRegionKHR,
     slot: u32,
@@ -90,10 +90,10 @@ impl Drop for RayDispatchPipeline {
 impl Device {
     /// Creates a ray-dispatch pipeline from a raygen entry point: one raygen stage, a
     /// raygen-only shader table (no miss, hit or callable records), recursion depth 0 and
-    /// the root held in the push data: the kernel declares `ORR_ROOT_INLINE`, since on the NVIDIA
-    /// drivers measured a ray-dispatch pipeline with a mapped root never hits a pipeline cache.
-    /// The entry traces with ray query; it cannot call `TraceRay` or reorder a hit object. Fails
-    /// unless `Caps::ray_dispatch`.
+    /// the root held in the push data, so the kernel declares `ORR_ROOT_INLINE`. The entry traces
+    /// with ray query; it cannot call `TraceRay` or reorder a hit object. Threads asking for one
+    /// pipeline at once compile it once: the others wait for it. Fails unless
+    /// `Caps::ray_dispatch`.
     pub fn create_ray_dispatch_pipeline(
         &self,
         s: &ShaderStage<'_>,
@@ -109,11 +109,6 @@ impl Device {
             });
         };
         let parts = StageParts::new(shared, s, Stage::RayGen, name)?;
-        if s.inline_root == 0 {
-            return Err(Error::Shader(format!(
-                "{name}: a ray-dispatch kernel declares its root with ORR_ROOT_INLINE"
-            )));
-        }
         let groups = [vk::RayTracingShaderGroupCreateInfoKHR::default()
             .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
             .general_shader(0)
@@ -172,7 +167,7 @@ impl Device {
             );
         }
         Ok(RayDispatchPipeline {
-            inline_root: s.inline_root,
+            inline_root_bytes: s.inline_root_bytes,
             raw,
             raygen: vk::StridedDeviceAddressRegionKHR {
                 device_address: records.raw.address + offset,

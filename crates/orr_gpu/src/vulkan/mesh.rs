@@ -196,9 +196,8 @@ impl Shared {
         };
         let bias = r.depth_bias.unwrap_or_default();
         let dynamic = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let stages: Vec<_> = parts.iter().map(|(_, p)| p).collect();
         self.create_pipeline(
-            &stages,
+            &parts.iter().map(|(_, p)| p).collect::<Vec<_>>(),
             extra,
             name,
             "vkCreateGraphicsPipelines",
@@ -279,7 +278,8 @@ impl Device {
     /// Creates a mesh pipeline. Viewport and scissor are dynamic:
     /// [`crate::CommandList::begin_rendering`] sets both to the rendering extent and
     /// [`crate::CommandList::set_scissor`] narrows the scissor. Clip-space y points down the
-    /// target: y = -1 is row 0.
+    /// target: y = -1 is row 0. Threads asking for one pipeline at once compile it once: the
+    /// others wait for it.
     pub fn create_mesh_pipeline(
         &self,
         d: &MeshPipelineDesc<'_>,

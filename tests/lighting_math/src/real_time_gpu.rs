@@ -212,11 +212,7 @@ fn context() -> &'static Context {
         })
         .expect("Vulkan device");
         let tables = BsdfTables::new(&device).expect("BSDF tables");
-        let spec = Spec {
-            openpbr_lut_slot: tables.first_slot(),
-            ..Spec::default()
-        };
-        let bytes = spec.bytes();
+        let bytes = Spec::default().bytes();
         let stage = ShaderStage::new(
             &MODULE,
             "main",

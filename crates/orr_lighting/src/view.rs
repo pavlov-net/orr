@@ -763,21 +763,9 @@ struct SupportKernels {
     cap_tail: CapTailTable,
 }
 
-/// The specialization constants of kernel module `$kernel`, which imports `bsdf`, with the BSDF
-/// tables' first slot.
-macro_rules! bsdf_spec {
-    ($kernel:ident, $slot:expr) => {
-        $kernel::Spec {
-            openpbr_lut_slot: $slot,
-            ..$kernel::Spec::default()
-        }
-        .bytes()
-    };
-}
-
 impl SupportKernels {
-    fn new(device: &Device, kernels: &KernelSet, slot: u32) -> Result<Self, Error> {
-        let bytes = bsdf_spec!(resolve, slot);
+    fn new(device: &Device, kernels: &KernelSet) -> Result<Self, Error> {
+        let bytes = resolve::Spec::default().bytes();
         let spec = SpecData {
             entries: resolve::Spec::ENTRIES,
             bytes: &bytes,
@@ -809,19 +797,18 @@ fn runs_rays(device: &Device, entry: PathEntry) -> bool {
     }
 }
 
-/// One path kernel: its name in reports, and how it compiles from the BSDF tables' first slot and
-/// whether it runs as rays.
+/// One path kernel: its name in reports, and how it compiles given whether it runs as rays.
 struct PathKernel {
     name: &'static str,
-    compile: fn(&Device, &KernelSet, u32, bool) -> Result<PathPipeline, Error>,
+    compile: fn(&Device, &KernelSet, bool) -> Result<PathPipeline, Error>,
 }
 
 macro_rules! path_kernel {
     ($kernel:ident, $name:literal) => {
         PathKernel {
             name: $name,
-            compile: |device, kernels, slot, rays| {
-                let bytes = bsdf_spec!($kernel, slot);
+            compile: |device, kernels, rays| {
+                let bytes = $kernel::Spec::default().bytes();
                 let spec = SpecData {
                     entries: $kernel::Spec::ENTRIES,
                     bytes: &bytes,
@@ -874,6 +861,7 @@ pub struct CompilingKernels {
     dielectric: JobResult<Result<PathPipeline, Error>>,
     update: JobResult<Result<PathPipeline, Error>>,
     support: JobResult<Result<SupportKernels, Error>>,
+    tables: BsdfTables,
 }
 
 impl CompilingKernels {
@@ -914,6 +902,7 @@ impl CompilingKernels {
             dielectric: compiled(&self.dielectric, DIELECTRIC.name)?,
             update: compiled(&self.update, UPDATE.name)?,
             support: compiled(&self.support, SUPPORT)?,
+            _tables: self.tables.clone(),
         })
     }
 }
@@ -924,11 +913,12 @@ pub struct LightingKernels {
     dielectric: PathPipeline,
     update: PathPipeline,
     support: SupportKernels,
+    _tables: BsdfTables,
 }
 
 impl LightingKernels {
     /// Compiles the kernels one after another on the calling thread. `kernels` replaces modules
-    /// as [`SceneLighting::new`] does; `tables` must outlive the kernels' use.
+    /// as [`SceneLighting::new`] does. The kernels read `tables` and keep them alive.
     pub fn new(
         device: &Device,
         kernels: &KernelSet,
@@ -936,12 +926,12 @@ impl LightingKernels {
         entry: PathEntry,
     ) -> Result<Self, Error> {
         let rays = runs_rays(device, entry);
-        let slot = tables.first_slot();
         Ok(Self {
-            opaque: (OPAQUE.compile)(device, kernels, slot, rays)?,
-            dielectric: (DIELECTRIC.compile)(device, kernels, slot, rays)?,
-            update: (UPDATE.compile)(device, kernels, slot, rays)?,
-            support: SupportKernels::new(device, kernels, slot)?,
+            opaque: (OPAQUE.compile)(device, kernels, rays)?,
+            dielectric: (DIELECTRIC.compile)(device, kernels, rays)?,
+            update: (UPDATE.compile)(device, kernels, rays)?,
+            support: SupportKernels::new(device, kernels)?,
+            _tables: tables.clone(),
         })
     }
 
@@ -957,19 +947,15 @@ impl LightingKernels {
         loading: &Loading,
     ) -> CompilingKernels {
         let rays = runs_rays(device, entry);
-        let slot = tables.first_slot();
         let path = |kernel: PathKernel| {
-            compile_job(device, loading, move |d| {
-                (kernel.compile)(d, kernels, slot, rays)
-            })
+            compile_job(device, loading, move |d| (kernel.compile)(d, kernels, rays))
         };
         CompilingKernels {
             opaque: path(OPAQUE),
             dielectric: path(DIELECTRIC),
             update: path(UPDATE),
-            support: compile_job(device, loading, move |d| {
-                SupportKernels::new(d, kernels, slot)
-            }),
+            support: compile_job(device, loading, move |d| SupportKernels::new(d, kernels)),
+            tables: tables.clone(),
         }
     }
 
