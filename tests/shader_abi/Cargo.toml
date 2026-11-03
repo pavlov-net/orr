@@ -11,7 +11,7 @@ publish = false
 orr_shaders.workspace = true
 
 [dev-dependencies]
-gpu_suite = { path = "../gpu_suite" }
+gpu_suite.workspace = true
 log.workspace = true
 orr_gpu.workspace = true
 

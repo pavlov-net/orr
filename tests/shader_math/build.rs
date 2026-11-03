@@ -12,16 +12,10 @@ fn main() {
         .and_then(|b| {
             b.source("slang/math.slang")
                 .source("slang/color.slang")
-                .include(orr_color::SHADER_DIR)
                 .compile("shader_math")
         })
         .and_then(|()| Build::new())
-        .and_then(|b| {
-            b.kernels(manifest.join("gpu"))
-                .include(orr_color::SHADER_DIR)
-                .metal_check(true)
-                .compile()
-        });
+        .and_then(|b| b.kernels(manifest.join("gpu")).metal_check(true).compile());
     if let Err(e) = result {
         panic!("{e}");
     }

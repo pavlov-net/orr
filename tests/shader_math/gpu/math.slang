@@ -6,6 +6,9 @@ import orr.packing;
 import orr.random;
 import orr.sampling;
 import orr.color;
+import orr_color.luminance;
+import orr_color.primaries;
+import orr_color.transfer;
 
 struct Root
 {

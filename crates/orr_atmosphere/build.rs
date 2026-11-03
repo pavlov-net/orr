@@ -47,10 +47,11 @@ fn main() {
 
     // G173 ETR averaged over [l, l + 10 nm), W m^-2 nm^-1, and ozone cross sections at
     // 233 K averaged the same way, m^2; both labeled with the bin's first wavelength.
-    let solar = parse_array(&demo, "kSolarIrradiance[48]");
-    let ozone = parse_array(&demo, "kOzoneCrossSection[48]");
+    let solar = orr_shaders::build::parse_cpp_array(&demo, "kSolarIrradiance[48]");
+    let ozone = orr_shaders::build::parse_cpp_array(&demo, "kOzoneCrossSection[48]");
     // Rows of (wavelength, x, y, z) every 5 nm from 360 nm.
-    let cie = parse_array(&constants, "CIE_2_DEG_COLOR_MATCHING_FUNCTIONS[380]");
+    let cie =
+        orr_shaders::build::parse_cpp_array(&constants, "CIE_2_DEG_COLOR_MATCHING_FUNCTIONS[380]");
     assert_eq!((solar.len(), ozone.len(), cie.len()), (BINS, BINS, 380));
 
     let lambda: Vec<f64> = (0..BINS).map(|i| FIRST_NM + BIN_NM * i as f64).collect();
@@ -174,12 +175,7 @@ fn main() {
 fn compile_kernels() {
     let src = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("src");
     let roots = env::var("DEP_ORR_SHADER_DIRS").expect("orr's shader roots");
-    let out = Build::new().and_then(|b| {
-        b.kernels(&src)
-            .roots(&roots)
-            .include(orr_color::SHADER_DIR)
-            .compile()
-    });
+    let out = Build::new().and_then(|b| b.kernels(&src).roots(&roots).compile());
     match out {
         Ok(out) => println!("cargo:shader_dirs={}", out.shader_dirs),
         Err(e) => panic!("{e}"),
@@ -253,16 +249,4 @@ fn data_dir() -> PathBuf {
 
 fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
-
-/// The numbers inside the braces after `name` in C++ source.
-fn parse_array(src: &str, name: &str) -> Vec<f64> {
-    let start = src.find(name).unwrap_or_else(|| panic!("{name} not found"));
-    let open = start + src[start..].find('{').unwrap();
-    let close = open + src[open..].find('}').unwrap();
-    src[open + 1..close]
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse().unwrap_or_else(|e| panic!("{name}: {s}: {e}")))
-        .collect()
 }

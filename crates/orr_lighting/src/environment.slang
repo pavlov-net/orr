@@ -5,7 +5,8 @@ module environment;
 
 import orr.abi;
 import orr.math;
-import orr.color;
+import orr_color.luminance;
+import orr_color.primaries;
 import orr.sampling;
 import tables;
 

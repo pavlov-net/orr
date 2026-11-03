@@ -22,20 +22,20 @@ libloading = { workspace = true, optional = true }
 gltf = { version = "=1.4.1", default-features = false, features = ["utils", "names", "extras", "KHR_materials_emissive_strength", "KHR_materials_ior"] }
 half.workspace = true
 rustc-hash.workspace = true
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "hdr", "exr"] }
-ktx2 = "0.5"
-meshopt = "=0.7.0"
+image = { workspace = true, features = ["png", "jpeg", "webp", "hdr", "exr"] }
+ktx2 = "=0.5.0"
+meshopt.workspace = true
 # The binary's global allocator: it keeps freed pages, where the Windows heap returns large
 # buffers and faults them in again on the next job. Exact pin: it builds its C sources.
 mimalloc = { version = "=0.1.52", default-features = false }
 # Exact pin: no stable API before 1.0, and its composition shapes cooked meshes.
 openusd = "=0.8.0"
 orr_math.workspace = true
-png = "0.18"
+png.workspace = true
 roxmltree = "0.21"
 rayon = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 thiserror.workspace = true
 tiff = "0.11"
 vdb-rs = "0.6"

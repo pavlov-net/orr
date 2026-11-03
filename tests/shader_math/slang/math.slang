@@ -5,6 +5,9 @@ import orr.packing;
 import orr.random;
 import orr.sampling;
 import orr.color;
+import orr_color.luminance;
+import orr_color.primaries;
+import orr_color.transfer;
 
 float3 load3(float* p) { return float3(p[0], p[1], p[2]); }
 float4 load4(float* p) { return float4(p[0], p[1], p[2], p[3]); }

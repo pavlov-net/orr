@@ -125,6 +125,18 @@ pub enum Error {
     Lints(Vec<LintError>),
 }
 
+/// The numbers inside the braces after `name` in C++ source.
+pub fn parse_cpp_array(src: &str, name: &str) -> Vec<f64> {
+    let start = src.find(name).unwrap_or_else(|| panic!("{name} not found"));
+    let open = start + src[start..].find('{').unwrap();
+    let close = open + src[open..].find('}').unwrap();
+    src[open + 1..close]
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse().unwrap_or_else(|e| panic!("{name}: {s}: {e}")))
+        .collect()
+}
+
 /// The adobe/openpbr-bsdf checkout that `orr.openpbr` includes: `ORR_OPENPBR_BSDF` when
 /// set, else `.tools/openpbr-bsdf` in or above `CARGO_MANIFEST_DIR`, where
 /// `tools/fetch-slang.sh` puts it.

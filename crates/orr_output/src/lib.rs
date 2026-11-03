@@ -5,7 +5,6 @@ mod display;
 #[cfg(windows)]
 mod display_watch;
 mod dof;
-mod encode;
 mod exposure;
 mod fft_glare;
 mod frame_generation;
@@ -34,7 +33,6 @@ pub use display::{
 #[cfg(windows)]
 pub use display_watch::DisplayWatch;
 pub use dof::{DepthOfFieldPass, DofGuideImages, DofHoleMask, DofPath};
-pub use encode::{pq_decode, pq_encode, srgb_decode, srgb_encode};
 pub use exposure::{
     AutoExposure, CompensationCurve, Exposure, ExposureTelemetry, Grade, LocalExposure, MID_GRAY,
     MeterWeights, Physiological, SkyTelemetry, ev100_from_exposure, ev100_from_luminance,

@@ -48,7 +48,7 @@ impl CpuLibrary {
         Ok(Self {
             lib: super::toolchain::load()?,
             sources: Vec::new(),
-            includes: Vec::new(),
+            includes: vec![PathBuf::from(orr_color::SHADER_DIR)],
             defines: Vec::new(),
             links: Vec::new(),
             out_dir: None,
@@ -61,8 +61,8 @@ impl CpuLibrary {
         self
     }
 
-    /// One more import root. [`LIB_DIR`](crate::LIB_DIR) is always present, and so is
-    /// [`openpbr_dir`](super::openpbr_dir) when it is found.
+    /// One more import root. [`LIB_DIR`](crate::LIB_DIR) and `orr_color`'s Slang root are always
+    /// present, and so is [`openpbr_dir`](super::openpbr_dir) when it is found.
     pub fn include(mut self, dir: impl AsRef<Path>) -> Self {
         self.includes.push(dir.as_ref().to_path_buf());
         self

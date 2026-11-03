@@ -2,7 +2,8 @@
 // image of each `OutputFormat` holds, and back.
 module display;
 
-import orr.color;
+import orr_color.primaries;
+import orr_color.transfer;
 
 public static const uint ENCODING_SDR = 0;
 public static const uint ENCODING_PQ = 1;

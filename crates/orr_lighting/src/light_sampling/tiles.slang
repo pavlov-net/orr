@@ -2,7 +2,8 @@
 // environment's pyramid and the directional pass.
 #include "orr/root.h"
 import orr.math;
-import orr.color;
+import orr_color.luminance;
+import orr_color.primaries;
 import lights;
 import producer;
 import tables;

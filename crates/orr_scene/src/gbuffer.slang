@@ -7,7 +7,7 @@
 module gbuffer;
 
 import orr.abi;
-import orr.color;
+import orr_color.transfer;
 import orr.math;
 import orr.packing;
 import material;

@@ -3,7 +3,7 @@
 // their material's coverage. Writes display-linear Rec.709, 1.0 at paper white.
 #include "orr/root.h"
 import orr.abi;
-import orr.color;
+import orr_color.primaries;
 import orr.math;
 import orr.trace;
 import gbuffer;

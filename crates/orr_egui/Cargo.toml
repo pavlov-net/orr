@@ -9,12 +9,11 @@ repository.workspace = true
 
 [dependencies]
 orr_gpu.workspace = true
-egui = { version = "0.37", default-features = false, features = ["bytemuck"] }
+egui = { workspace = true, features = ["bytemuck"] }
 orr_shaders.workspace = true
 bytemuck.workspace = true
 
 [build-dependencies]
-orr_color.workspace = true
 orr_shaders = { workspace = true, features = ["build"] }
 
 [lints]

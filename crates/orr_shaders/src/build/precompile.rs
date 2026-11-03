@@ -36,6 +36,20 @@ impl Precompiled {
         used
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.modules.is_empty()
+    }
+
+    /// The files of the precompiled modules loaded into `session`.
+    pub(crate) fn inputs(&self, session: &Session) -> Vec<PathBuf> {
+        session
+            .loaded_modules()
+            .iter()
+            .filter_map(|m| self.modules.get(&canonical_lossy(&m.file()?)))
+            .flat_map(|e| e.inputs.iter().cloned())
+            .collect()
+    }
+
     /// The source file of a precompiled module file, which keeps no declaration locations.
     pub(crate) fn source(&self, module: &Path) -> Option<&Path> {
         self.modules

@@ -28,7 +28,6 @@ fn main() {
             let mut b = b
                 .kernels(dir.join("src"))
                 .roots(&gpu)
-                .include(orr_color::SHADER_DIR)
                 .debug_info(DebugInfo::Embedded)
                 .metal_check(false);
             for t in RTAS_RECORDS {

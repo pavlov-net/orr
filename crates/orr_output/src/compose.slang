@@ -4,7 +4,8 @@
 // cd/m2.
 #include "orr/root.h"
 import orr.abi;
-import orr.color;
+import orr_color.primaries;
+import orr_color.transfer;
 import view;
 import display;
 

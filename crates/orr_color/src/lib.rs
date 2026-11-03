@@ -14,7 +14,7 @@
 //!
 //! The same constants and functions exist in Slang, in f32, as the modules
 //! `orr_color.primaries`, `orr_color.luminance` and `orr_color.transfer` under
-//! [`SHADER_DIR`]; a shader build adds that directory as an import root.
+//! [`SHADER_DIR`], an import root of every shader build.
 
 #![forbid(unsafe_code)]
 

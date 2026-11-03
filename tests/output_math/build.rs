@@ -15,7 +15,6 @@ fn main() {
         .and_then(|b| {
             b.source("slang/output.slang")
                 .include(&output_src)
-                .include(orr_color::SHADER_DIR)
                 .compile("output_math")
         })
         .and_then(|()| Build::new())

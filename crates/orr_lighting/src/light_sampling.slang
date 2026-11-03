@@ -8,7 +8,7 @@ module light_sampling;
 
 import orr.abi;
 import orr.math;
-import orr.color;
+import orr_color.luminance;
 import orr.packing;
 import orr.random;
 import lights;

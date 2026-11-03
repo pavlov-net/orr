@@ -106,7 +106,7 @@ impl Build {
         Ok(Self {
             lib: super::toolchain::load()?,
             kernels: None,
-            includes: Vec::new(),
+            includes: vec![PathBuf::from(orr_color::SHADER_DIR)],
             externs: LIBRARY_TYPES
                 .iter()
                 .map(|(s, r)| ((*s).to_owned(), (*r).to_owned()))
@@ -140,8 +140,8 @@ impl Build {
         self
     }
 
-    /// One more import root. [`LIB_DIR`](crate::LIB_DIR) is always present, and so is
-    /// [`openpbr_dir`](super::openpbr_dir) when it is found.
+    /// One more import root. [`LIB_DIR`](crate::LIB_DIR) and `orr_color`'s Slang root are always
+    /// present, and so is [`openpbr_dir`](super::openpbr_dir) when it is found.
     pub fn include(mut self, dir: impl AsRef<Path>) -> Self {
         self.includes.push(dir.as_ref().to_path_buf());
         self
@@ -687,6 +687,7 @@ impl Build {
             asserts: self.asserts,
             separate_debug: self.debug_info == DebugInfo::Separate,
             precompiled: &precompiled,
+            include_dirs,
         };
         let mut modules = BTreeMap::new();
         let mut todo = Vec::new();
@@ -877,6 +878,8 @@ pub(super) struct Settings<'a> {
     /// `options` hold `-separate-debug-info`.
     pub(super) separate_debug: bool,
     pub(super) precompiled: &'a Precompiled,
+    /// The import roots, read only with precompiled modules.
+    pub(super) include_dirs: &'a [PathBuf],
 }
 
 impl Settings<'_> {
@@ -1273,16 +1276,25 @@ pub(super) fn compile_kernel(
             }
         })?;
 
+    // Dependencies reached through a precompiled library can resolve against the importing
+    // link module's directory and name a file outside every root, so those files come from the
+    // libraries' records instead.
     let mut inputs: Vec<PathBuf> = module
         .dependencies()
         .into_iter()
-        // The unit's link modules close `extra`; their files are inputs too.
         .chain(
             extra[extra.len() - unit.links.len()..]
                 .iter()
                 .flat_map(super::slang::Module::dependencies),
         )
         .map(|p| canonical_lossy(&p))
+        .filter(|p| {
+            settings.precompiled.is_empty()
+                || p == unit.path
+                || unit.links.iter().any(|l| p == &l.path)
+                || settings.include_dirs.iter().any(|d| p.starts_with(d))
+        })
+        .chain(settings.precompiled.inputs(session))
         .collect();
     inputs.sort();
     inputs.dedup();

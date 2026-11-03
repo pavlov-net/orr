@@ -204,6 +204,7 @@ fn recompile(
         asserts: manifest.asserts,
         separate_debug: false,
         precompiled: &precompiled,
+        include_dirs: &[],
     };
     let unit = Unit {
         name: &entry.name,

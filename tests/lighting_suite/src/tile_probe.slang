@@ -5,7 +5,7 @@
 #include "orr/root.h"
 import orr.math;
 import orr.random;
-import orr.color;
+import orr_color.luminance;
 import lights;
 import material;
 import producer;

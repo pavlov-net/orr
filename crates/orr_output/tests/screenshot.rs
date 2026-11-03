@@ -4,7 +4,8 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::PathBuf;
 
-use orr_output::{Primaries, Screenshot, pq_decode, pq_encode, srgb_encode};
+use orr_color::{pq_decode, pq_encode, srgb_encode};
+use orr_output::{Primaries, Screenshot};
 
 const W: u32 = 100;
 const H: u32 = 100;

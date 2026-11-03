@@ -27,7 +27,7 @@ module froxels;
 
 import orr.abi;
 import orr.math;
-import orr.color;
+import orr_color.luminance;
 import orr.random;
 import orr.sampling;
 import orr.trace;

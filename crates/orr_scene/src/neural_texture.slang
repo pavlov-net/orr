@@ -3,7 +3,7 @@
 module neural_texture;
 
 import orr.abi;
-import orr.color;
+import orr_color.transfer;
 import orr.coopvec;
 import orr_pack.neural;
 

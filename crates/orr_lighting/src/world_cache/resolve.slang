@@ -2,7 +2,7 @@
 // light rescale, `resolve` blends every cell's samples into its resolved value and evicts
 // stale cells, `finish` writes the frame's statistics.
 #include "orr/root.h"
-import orr.color;
+import orr_color.luminance;
 import orr.packing;
 import tables;
 import view;

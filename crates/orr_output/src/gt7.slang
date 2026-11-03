@@ -4,6 +4,7 @@
 module gt7;
 
 import orr.color;
+import orr_color.primaries;
 
 // Nits of frame-buffer value 1.0.
 public static const float GT7_REFERENCE_NITS = 100.0;

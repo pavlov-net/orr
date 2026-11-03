@@ -1,6 +1,6 @@
 //! The GT7 tone mapper's parameters and the per-display constants `gt7.slang` reads.
 
-use crate::encode::pq_encode;
+use orr_color::pq_encode;
 
 /// Nits of GT7 frame-buffer value 1.0.
 pub const GT7_REFERENCE_NITS: f32 = 100.0;

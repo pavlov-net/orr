@@ -3,7 +3,7 @@
 module material;
 
 import orr.abi;
-import orr.color;
+import orr_color.primaries;
 __exported import neural_texture;
 
 // `MaterialGpu.flags`.

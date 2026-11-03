@@ -11,7 +11,6 @@ module particle_lighting;
 import orr.abi;
 import orr.atomic;
 import orr.math;
-import orr.color;
 import orr.random;
 import orr.trace;
 import hit;

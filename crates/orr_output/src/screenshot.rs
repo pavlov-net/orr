@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{self, BufWriter};
 use std::path::Path;
 
-use crate::encode::{pq_encode, srgb_encode};
+use orr_color::{pq_encode, srgb_encode};
 
 /// A capture of one view, made in the frame that asks for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

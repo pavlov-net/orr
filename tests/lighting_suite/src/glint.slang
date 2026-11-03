@@ -3,7 +3,7 @@
 #include "orr/root.h"
 import orr.math;
 import orr.random;
-import orr.color;
+import orr_color.luminance;
 import orr.sampling;
 import media;
 import light_sampling;

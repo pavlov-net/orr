@@ -199,7 +199,10 @@ fn glare(manifest: &Path, out_dir: &Path) {
 /// channel's color matching function, normalized per channel over the 5 nm samples.
 fn spectral(constants: &Path, d65: &Path) -> Vec<(f64, [f64; 3])> {
     // Rows of (wavelength, x, y, z) every 5 nm from 360 nm.
-    let cie = parse_array(&read(constants), "CIE_2_DEG_COLOR_MATCHING_FUNCTIONS[380]");
+    let cie = orr_shaders::build::parse_cpp_array(
+        &read(constants),
+        "CIE_2_DEG_COLOR_MATCHING_FUNCTIONS[380]",
+    );
     let illuminant: Vec<(f64, f64)> = read(d65)
         .lines()
         .filter_map(|l| {
@@ -231,16 +234,4 @@ fn read(path: &Path) -> String {
 
 fn write(path: &Path, text: &str) {
     fs::write(path, text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-}
-
-/// The numbers inside the braces after `name` in C++ source.
-fn parse_array(src: &str, name: &str) -> Vec<f64> {
-    let start = src.find(name).unwrap_or_else(|| panic!("{name} not found"));
-    let open = start + src[start..].find('{').unwrap();
-    let close = open + src[open..].find('}').unwrap();
-    src[open + 1..close]
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse().unwrap_or_else(|e| panic!("{name}: {s}: {e}")))
-        .collect()
 }

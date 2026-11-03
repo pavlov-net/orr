@@ -17,7 +17,7 @@ module world_cache;
 
 import orr.abi;
 import orr.math;
-import orr.color;
+import orr_color.luminance;
 import orr.packing;
 import orr.random;
 import tables;

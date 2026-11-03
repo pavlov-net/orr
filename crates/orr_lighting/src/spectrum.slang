@@ -5,7 +5,7 @@
 // its value on average.
 module spectrum;
 
-import orr.color;
+import orr_color.primaries;
 import orr.openpbr;
 
 public static const float WAVELENGTH_MIN = 360.0;   // nm

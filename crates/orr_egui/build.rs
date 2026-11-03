@@ -7,7 +7,7 @@ use orr_shaders::build::Build;
 
 fn main() {
     let src = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("src");
-    let built = Build::new().and_then(|b| b.kernels(&src).include(orr_color::SHADER_DIR).compile());
+    let built = Build::new().and_then(|b| b.kernels(&src).compile());
     if let Err(e) = built {
         panic!("{e}");
     }

@@ -9,11 +9,12 @@ repository.workspace = true
 links = "orr_pack"
 
 [dependencies]
+orr_math.workspace = true
 orr_io.workspace = true
 blake3.workspace = true
 bytemuck = { workspace = true, features = ["extern_crate_alloc"] }
 half = { workspace = true, features = ["bytemuck"] }
-meshopt = "=0.7.0"
+meshopt.workspace = true
 thiserror.workspace = true
 zstd.workspace = true
 

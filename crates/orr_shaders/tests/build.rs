@@ -574,7 +574,7 @@ fn precompiled_modules_give_the_same_spirv_and_rust() {
         )
     };
     let a = format!(
-        "import orr.color;\nimport shared;\n{}",
+        "import orr_color.transfer;\nimport shared;\n{}",
         kernel("root.out[id.x] = float4(srgb_encode(lit(float3(root.count))), 1);")
     );
     let b = format!(
@@ -621,8 +621,8 @@ fn precompiled_modules_give_the_same_spirv_and_rust() {
             (
                 "a".to_owned(),
                 vec![
-                    "orr.color".to_owned(),
                     "orr.math".to_owned(),
+                    "orr_color.transfer".to_owned(),
                     "shared".to_owned()
                 ]
             ),

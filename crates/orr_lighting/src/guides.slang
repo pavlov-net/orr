@@ -9,7 +9,7 @@ module guides;
 
 import orr.abi;
 import orr.math;
-import orr.color;
+import orr_color.luminance;
 import orr.trace;
 import media;
 import hit;

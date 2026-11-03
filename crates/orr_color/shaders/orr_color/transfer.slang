@@ -25,10 +25,16 @@ static const float PQ_C1 = 3424.0 / 4096.0;
 static const float PQ_C2 = 2413.0 / 4096.0 * 32.0;
 static const float PQ_C3 = 2392.0 / 4096.0 * 32.0;
 
+// The PQ curve on luminance relative to 10000 nits, without the upper clamp.
+public float3 pq_curve(float3 y)
+{
+    float3 p = pow(y, PQ_M1);
+    return pow((PQ_C1 + PQ_C2 * p) / (1.0 + PQ_C3 * p), PQ_M2);
+}
+
 public float3 pq_encode(float3 nits)
 {
-    float3 y = pow(clamp(nits / PQ_MAX_NITS, 0.0, 1.0), PQ_M1);
-    return pow((PQ_C1 + PQ_C2 * y) / (1.0 + PQ_C3 * y), PQ_M2);
+    return pq_curve(clamp(nits / PQ_MAX_NITS, 0.0, 1.0));
 }
 
 public float3 pq_decode(float3 signal)

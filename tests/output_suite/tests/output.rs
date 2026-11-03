@@ -2,10 +2,11 @@
 //! scRGB backbuffers.
 
 use half::f16;
+use orr_color::{pq_decode, pq_encode, srgb_decode};
 use orr_output::{
     ComposePass, ComposeRoot, ComposeSource, DisplayInfo, DisplayRequest, Gt7Curve, Gt7Params,
     OutputFormat, OutputKernels, OutputRoots, ResolvedDisplay, TonemapPass, ViewOutput,
-    exposure_from_ev100, pq_decode, pq_encode, srgb_decode,
+    exposure_from_ev100,
 };
 use orr_scene::orr_gpu::{
     Format, Hazards, MemoryKind, QueueKind, Stages, TextureDesc, TextureMemory, TextureRegion,

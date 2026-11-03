@@ -20,7 +20,7 @@ orr_math.workspace = true
 
 [build-dependencies]
 orr_shaders = { workspace = true, features = ["build"] }
-cc = "1.2"
+cc.workspace = true
 
 [[test]]
 name = "gpu"
