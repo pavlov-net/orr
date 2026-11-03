@@ -50,9 +50,9 @@ use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
     Affine3, DlssMode, DlssQuality, Exposure, FrameDesc, Glare, GroupWriter, HookPass,
-    InstanceFlags, InstancesDesc, Lens, LightingDebugView, LitView, OutputDebug, PackSource,
-    PathEntry, Projection, Reconstruction, ReferenceSettings, Renderer, RendererDesc, SceneDesc,
-    SceneId, Screenshot, ScreenshotRequest, TextureFilter, ThinLens, TransformGroupDesc,
+    InstanceFlags, InstancesDesc, Lens, LensDistortion, LightingDebugView, LitView, OutputDebug,
+    PackSource, PathEntry, Projection, Reconstruction, ReferenceSettings, Renderer, RendererDesc,
+    SceneDesc, SceneId, Screenshot, ScreenshotRequest, TextureFilter, ThinLens, TransformGroupDesc,
     TransformGroupId, TransparencyPass, ViewHistoryId, ViewHooks, ViewLighting, ViewOutput,
     ViewTarget,
 };
@@ -740,6 +740,7 @@ struct LampSettings {
     hooks: bool,
     reconstruction: Reconstruction,
     glare: bool,
+    distortion: bool,
     debug_view: LightingDebugView,
 }
 
@@ -958,6 +959,11 @@ impl Lamp {
                         lens: Lens {
                             shutter: settings.shutter,
                             glare: settings.glare.then_some(Glare { strength: 1.0 }),
+                            distortion: settings.distortion.then_some(LensDistortion {
+                                k1: 0.2,
+                                k2: 0.0,
+                                chromatic_aberration: 0.0,
+                            }),
                             ..Lens::default()
                         },
                         camera_cut: i == 0 || (settings.cut && final_frame),
@@ -1056,7 +1062,7 @@ fn check_blur_under_ray_reconstruction(lamp: &mut Lamp, moving: LampSettings) {
 /// `render_view` smears a moving lamp along its motion by the distance the shutter says, in
 /// output pixels at any render extent, leaves still views alone to the byte, and shows no blur
 /// where motion vectors or the view's purpose rule it out. The reference keeps its glare, and a
-/// debug view shows neither.
+/// debug view shows no glare or distortion.
 #[test]
 fn render_view_blurs_what_moves_while_the_shutter_is_open() {
     let _serial = serial();
@@ -1073,6 +1079,7 @@ fn render_view_blurs_what_moves_while_the_shutter_is_open() {
         hooks: false,
         reconstruction: Reconstruction::Off,
         glare: false,
+        distortion: false,
         debug_view: LightingDebugView::None,
     };
     let sharp = lamp.run(extent, frames, moving.closed());
@@ -1162,6 +1169,14 @@ fn render_view_blurs_what_moves_while_the_shutter_is_open() {
         spread > plain,
         "the reference's glare leaves {spread} pixels lit of {plain}"
     );
+    let distorted = LampSettings {
+        distortion: true,
+        ..moving.closed()
+    };
+    assert!(
+        lamp.run(extent, frames, distorted) != sharp,
+        "the lens's distortion changes nothing"
+    );
     let debug_view = LampSettings {
         debug_view: LightingDebugView::DirectOnly,
         ..moving.closed()
@@ -1169,6 +1184,7 @@ fn render_view_blurs_what_moves_while_the_shutter_is_open() {
     let lensed = LampSettings {
         shutter: moving.shutter,
         glare: true,
+        distortion: true,
         ..debug_view
     };
     assert!(
