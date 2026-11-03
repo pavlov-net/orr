@@ -476,6 +476,12 @@ impl Display {
         self.feed = feed;
     }
 
+    /// The encodings the window's surface offered when its swapchain was last created. The list
+    /// can change while the display runs.
+    pub fn supported_formats(&self) -> Vec<OutputFormat> {
+        self.shared.lock().supported.clone()
+    }
+
     /// Replaces the request; the next `begin_frame` resolves with it. Changing only `vsync`
     /// keeps the swapchain.
     pub fn set_request(&mut self, request: &DisplayRequest) {

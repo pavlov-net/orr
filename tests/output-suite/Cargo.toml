@@ -8,6 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+log.workspace = true
 orr-color.workspace = true
 orr-math.workspace = true
 orr-output = { path = "../../crates/orr-output" }
@@ -22,7 +23,6 @@ output-maths = { path = "../output-maths" }
 orr-egui = { path = "../../crates/orr-egui" }
 egui = { version = "0.37", default-features = false, features = ["monochrome_emoji_fonts"] }
 egui_demo_lib = "0.37"
-log.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
 gpu-suite = { path = "../gpu-suite" }

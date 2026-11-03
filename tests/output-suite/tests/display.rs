@@ -175,7 +175,9 @@ fn a_display_that_cannot_watch_the_os_presents_sdr() {
     display.set_feed(None);
     window.pump();
     let d = r.frame(&mut display, true, false);
-    assert_eq!(d.encoding, OutputFormat::Hdr10Pq);
+    if output_suite::offers_hdr(&display) {
+        assert_eq!(d.encoding, OutputFormat::Hdr10Pq);
+    }
 
     drop(display);
     drop(window);
@@ -216,47 +218,50 @@ fn display_follows_feed_request_and_window() {
         assert_eq!(d.encoding, OutputFormat::Sdr);
     }
 
-    display.set_feed(Some(feed.clone()));
-    let d = frames(&mut display, &mut window, 6);
-    assert_eq!(d.encoding, OutputFormat::Hdr10Pq);
-    assert_eq!(d.paper_white_nits, 200.0);
+    if output_suite::offers_hdr(&display) {
+        display.set_feed(Some(feed.clone()));
+        let d = frames(&mut display, &mut window, 6);
+        assert_eq!(d.encoding, OutputFormat::Hdr10Pq);
+        assert_eq!(d.paper_white_nits, 200.0);
 
-    // Windows HDR off: SDR from the next frame on, though the surface still lists PQ.
-    feed.set(DisplayInfo {
-        os_hdr_on: Some(false),
-        ..hdr_on(200.0)
+        // Windows HDR off: SDR from the next frame on, though the surface still lists PQ.
+        feed.set(DisplayInfo {
+            os_hdr_on: Some(false),
+            ..hdr_on(200.0)
+        });
+        assert_eq!(
+            frames(&mut display, &mut window, 1).encoding,
+            OutputFormat::Sdr
+        );
+        assert_eq!(
+            frames(&mut display, &mut window, 4).encoding,
+            OutputFormat::Sdr
+        );
+
+        // HDR back on with the SDR content brightness slider moved.
+        feed.set(hdr_on(320.0));
+        let d = frames(&mut display, &mut window, 1);
+        assert_eq!(d.encoding, OutputFormat::Hdr10Pq);
+        assert_eq!(d.paper_white_nits, 320.0);
+
+        // An explicit scRGB request.
+        display.set_request(&DisplayRequest {
+            encoding: Some(OutputFormat::ScRgb),
+            ..DisplayRequest::default()
+        });
+        assert_eq!(
+            frames(&mut display, &mut window, 4).encoding,
+            OutputFormat::ScRgb
+        );
+    }
+
+    // Vsync off on the same swapchain.
+    let encoding = frames(&mut display, &mut window, 1).encoding;
+    display.set_request(&DisplayRequest {
+        vsync: false,
+        ..*display.request()
     });
-    assert_eq!(
-        frames(&mut display, &mut window, 1).encoding,
-        OutputFormat::Sdr
-    );
-    assert_eq!(
-        frames(&mut display, &mut window, 4).encoding,
-        OutputFormat::Sdr
-    );
-
-    // HDR back on with the SDR content brightness slider moved.
-    feed.set(hdr_on(320.0));
-    let d = frames(&mut display, &mut window, 1);
-    assert_eq!(d.encoding, OutputFormat::Hdr10Pq);
-    assert_eq!(d.paper_white_nits, 320.0);
-
-    // An explicit scRGB request, then vsync off on the same swapchain.
-    let mut request = DisplayRequest {
-        encoding: Some(OutputFormat::ScRgb),
-        ..DisplayRequest::default()
-    };
-    display.set_request(&request);
-    assert_eq!(
-        frames(&mut display, &mut window, 4).encoding,
-        OutputFormat::ScRgb
-    );
-    request.vsync = false;
-    display.set_request(&request);
-    assert_eq!(
-        frames(&mut display, &mut window, 20).encoding,
-        OutputFormat::ScRgb
-    );
+    assert_eq!(frames(&mut display, &mut window, 20).encoding, encoding);
 
     // Resizes reach the backbuffer on the next frame.
     for size in [(900, 500), (420, 700), (640, 400)] {

@@ -25,6 +25,18 @@ pub mod shaders {
 
 use shaders::synth;
 
+/// Whether the display's surface offers the HDR encodings the tests ask for, with a warning when
+/// it does not, so that a test's skipped HDR checks show in its log.
+pub fn offers_hdr(display: &orr_output::Display) -> bool {
+    let supported = display.supported_formats();
+    let hdr =
+        supported.contains(&OutputFormat::Hdr10Pq) && supported.contains(&OutputFormat::ScRgb);
+    if !hdr {
+        log::warn!("skipping the HDR checks: the surface offers only {supported:?}");
+    }
+    hdr
+}
+
 /// One view rendered frame by frame: its exposure slots and view constants, a radiance
 /// image lit from per-pixel luminance with the current pre-exposure (`synth.slang`), the
 /// exposure passes and, on request, glare, tonemap into an RGBA16F display-linear image and

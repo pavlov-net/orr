@@ -154,6 +154,7 @@ fn frame_generation_presents_generated_images_before_each_frame() {
     .unwrap();
     // The test asks for encodings the OS may have off.
     display.set_feed(None);
+    let hdr = output_suite::offers_hdr(&display);
     if let Err(e) = display.set_frame_generation(&sdk, FrameGenerationMode::Fixed(1)) {
         log::warn!("skipped: {e}");
         return;
@@ -187,7 +188,10 @@ fn frame_generation_presents_generated_images_before_each_frame() {
 
     for i in 0..PHASE * PHASES {
         window.pump();
-        let (mode, encoding, expected) = phase(i / PHASE, most, recommended);
+        let (mode, mut encoding, mut expected) = phase(i / PHASE, most, recommended);
+        if !hdr {
+            (encoding, expected) = (OutputFormat::Sdr, OutputFormat::Sdr);
+        }
         let per_present = i / PHASE == UI_PER_PRESENT;
         if i % PHASE == 0 {
             display.set_request(&request(encoding));
