@@ -33,6 +33,7 @@ public struct ParticleLighting
     public LightSetGpu* set;
     public WorldCacheGpu* cache;
     public FroxelLights* lights;        // the froxels' shadowed directional lights
+    public EyeColumn* eye;              // per froxel column; null without froxels
     public LayerGuide* layers;          // the dielectric dispatch's layer memory, null for none
     public TextureIndex incident;       // froxel_incident; NONE without froxels
     public TextureIndex visibility;     // the shadowed lights past the first
@@ -47,7 +48,7 @@ public struct ParticleLighting
     public TextureIndex aerial;         // the aerial-perspective LUT
     public TextureIndex aerial_rgb;     // its rgb transmittance; NONE for its luminance
     public float ap_range;              // m, the LUT's far end
-    public uint _pad0;
+    public TextureIndex eye_depth;      // per shadowed light, m its ray spends in the column's interior, times its visibility; NONE for none
 }
 
 // The light at render-space `x` that does not depend on a direction, as mean radiance over the
@@ -71,6 +72,18 @@ public float3 particle_ambient(ParticleLighting* l, float3 x, float3 to_eye, ino
     vis[1] = float3(more.x);
     vis[2] = float3(more.y);
     vis[3] = float3(more.z);
+    if (l.eye_depth.index != IMAGE_NONE && l.lights.eye != 0)
+    {
+        uint2 column = min(uint2(coord.xy * float2(l.columns, l.rows)), uint2(l.columns, l.rows) - 1u);
+        EyeColumn eye = l.eye[column.y * l.columns + column.x];
+        if (uint(coord.z * float(l.slices)) < eye.slices)
+        {
+            float3 sigma_t = interior_medium(s, eye.medium).sigma_t;
+            float4 depth = l.eye_depth.get<Texture3D<float4>>().SampleLevel(ss, coord, 0.0);
+            for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
+                vis[j] *= vis[j].x > 0.0 ? beer(sigma_t, depth[j] / vis[j].x) : float3(1.0);
+        }
+    }
     rng.next2();
     return incident.rgb;
 }
@@ -88,7 +101,9 @@ public void particle_shadow_rays<S : ISurface, M : IMedium>(ParticleLighting* l,
         if (j >= count)
             continue;
         float3 to_light = s.lights[l.lights.ids[j]].direction;
-        vis[j] = visibility<S, M>(s, l.view, x + to_light * offset, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), false, l.set.shadow_overflows);
+        float3 depth;
+        vis[j] = surface_visibility<S, M>(s, l.view, x + to_light * offset, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), false, l.set.shadow_overflows, depth);
+        vis[j] *= exp(-depth);
     }
 }
 
@@ -139,8 +154,9 @@ public float3 particle_light<S : ISurface, M : IMedium>(ParticleLighting* l, flo
 // The in-scatter (pre-exposed) and transmittance from the eye to render-space `x` along the
 // ray through image point `p`, in render pixels: the froxels' to the scene's `near_range`,
 // the aerial-perspective LUT's to `ap_range` and the linked medium `M`'s transmittance past
-// it.
-public float3 particle_fog<M : IMedium>(ParticleLighting* l, float2 p, float3 x, out float3 transmittance)
+// it. A camera segment starting in interior `medium` (MATERIAL_NONE for none) goes on through it
+// past the froxels.
+public float3 particle_fog<M : IMedium>(ParticleLighting* l, float2 p, float3 x, uint medium, out float3 transmittance)
 {
     transmittance = float3(1.0);
     if (l.integrated.index == IMAGE_NONE)
@@ -149,7 +165,18 @@ public float3 particle_fog<M : IMedium>(ParticleLighting* l, float2 p, float3 x,
     float near_range = l.scene.near_range;
     float3 eye = v.eye_render.xyz;
     float t = length(x - eye);
-    float3 fog = integrated_fog(l.integrated, l.integrated_rgb, l.sampler, uint3(l.columns, l.rows, l.slices), v.extent, near_range, p, t, transmittance);
+    uint3 grid = uint3(l.columns, l.rows, l.slices);
+    float3 fog;
+    if (l.lights.eye != 0)
+    {
+        Fog g = eye_fog(l.eye, l.integrated, l.integrated_rgb, grid, v.extent, near_range, p, medium, interior_medium(l.scene, medium).sigma_t, t);
+        fog = g.inscatter;
+        transmittance = g.transmittance;
+        if (medium != MATERIAL_NONE)
+            return fog;
+    }
+    else
+        fog = integrated_fog(l.integrated, l.integrated_rgb, l.sampler, grid, v.extent, near_range, p, t, transmittance);
     if (!(t > near_range))
         return fog;
     float ap_range = max(l.ap_range, near_range);
@@ -169,8 +196,8 @@ public float3 particle_fog<M : IMedium>(ParticleLighting* l, float2 p, float3 x,
 // (render pixels, `SV_Position.xy`) and render-space `x`, of `albedo`, `emission` (nits,
 // unexposed), `opacity` and directional response `anisotropy`: opacity x (C x T + S), with C
 // its light and emission and T and S its fog. Nothing behind the dielectric or presence layer
-// the pixel shades, which shows what lies behind it through its own rays; no fog where the eye
-// lies in an interior.
+// the pixel shades, which shows what lies behind it through its own rays; no fog where the
+// dispatch's path carried the camera segment through an interior.
 public float4 particle_shade<S : ISurface, M : IMedium>(ParticleLighting* l, float2 p, float3 x, float3 albedo, float3 emission, float opacity, float anisotropy)
 {
     ViewConstants* v = l.view;
@@ -178,14 +205,19 @@ public float4 particle_shade<S : ISurface, M : IMedium>(ParticleLighting* l, flo
     float t = length(to_eye);
     to_eye /= max(t, 1e-30);
     float end = 0.0;
+    uint medium = MATERIAL_NONE;
     if (l.layers != nullptr)
-        end = layer_guide(l.layers, v.extent, min(uint2(p), v.extent - 1)).medium_end;
+    {
+        LayerGuide guide = layer_guide(l.layers, v.extent, min(uint2(p), v.extent - 1));
+        end = guide.medium_end;
+        medium = guide.eye_medium - 1;
+    }
     if (end > 0.0 && t > end)
         return float4(0.0);
     float3 transmittance = float3(1.0);
     float3 fog = float3(0.0);
     if (!(end < 0.0))
-        fog = particle_fog<M>(l, p, x, transmittance);
+        fog = particle_fog<M>(l, p, x, medium, transmittance);
     Sampler rng = Sampler(uint2(p), l.frame, l.seed ^ PARTICLE_STREAM);
     float3 c = albedo * particle_light<S, M>(l, x, to_eye, anisotropy, rng) + emission;
     float a = saturate(opacity);

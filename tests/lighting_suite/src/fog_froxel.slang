@@ -16,6 +16,24 @@ void order()
 }
 
 [shader("compute")]
+[numthreads(8, 8, 1)]
+void eye_column(uint3 id: SV_DispatchThreadID)
+{
+    ORR_OMM(eye_column);
+    if (all(id.xy < uint2(root.columns, root.rows)))
+        froxel_eye_column<StandardSurface>(root, id.xy);
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void eye_reach(uint3 id: SV_DispatchThreadID)
+{
+    ORR_OMM(eye_reach);
+    if (all(id.xy < uint2(root.columns, root.rows)))
+        froxel_eye_reach(root, id.xy);
+}
+
+[shader("compute")]
 [numthreads(4, 4, 4)]
 void inject(uint3 id: SV_DispatchThreadID)
 {

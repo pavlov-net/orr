@@ -10,11 +10,14 @@
 //! pixel, against a fine march of its grid; overlapping boxes, surfaces inside boxes and eyes
 //! inside boxes against Beer's law, inside and past the froxels; sky pixels past the froxels;
 //! and proxies off screen. Smoke: its opacity on the camera ray, a column across a shaft against
-//! the reference march, and sheets past the froxels.
+//! the reference march, and sheets past the froxels. The eye under water: a turbid view per channel
+//! against the reference's distance samples, also past the froxels and with shafts, a waterline at
+//! the near plane from either side, a body in the water, flicker, and particles under water.
 
 use lighting_suite::bed::{
-    Accumulated, Bed, CANOPY, EXTENT, FLOOR, GLASS_SPHERE, Item, LEAF, MIRROR, PLUME, Particle,
-    ParticleLook, Paths, SKY, SUN, Spec, WHITE_SPHERE, look, pixel_of, plume_volume,
+    Accumulated, Bed, CANOPY, EXTENT, FLOOR, GLASS_SPHERE, Item, LEAF, MIRROR, NEAR, PLUME,
+    Particle, ParticleLook, Paths, SKY, SUN, Spec, TURBID_WATER, WATER_BOX, WHITE_SPHERE, fresnel,
+    look, pixel_of, plume_volume, water_transmission,
 };
 use lighting_suite::shaders::{
     fog_aerial, fog_apply, fog_directional, fog_froxel, fog_particles, froxel_lookup, froxel_probe,
@@ -27,9 +30,9 @@ use orr_lighting::{
     AERIAL_SIZE, DirectionalLight, DiscProfile, Light, LightId, LightingDebugView, MediaSettings,
     PathEntry, ReferenceSettings, ViewLighting,
 };
-use orr_math::{DVec3, Mat3, Quat, Vec3};
+use orr_math::{DVec3, Mat3, Quat, Vec2, Vec3};
 use orr_pack::volume::GridSampler;
-use orr_scene::{MediumProxy, MediumProxyId, Opacity, ProxyDensity, RendererDesc};
+use orr_scene::{MaterialId, MediumProxy, MediumProxyId, Opacity, ProxyDensity, RendererDesc};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 /// Kernels with the stock height fog linked as the medium (`media_types.slang`).
@@ -800,6 +803,327 @@ fn particles_stay_steady_at_a_still_camera() {
         "frame to frame the particle changes by {:.2}% around {mean:.1}",
         100.0 * change
     );
+    assert_clean();
+}
+
+/// Mean of each channel of each 8 x 8 block.
+fn block_rgb(a: &Accumulated) -> Vec<[f64; 3]> {
+    let [w, h] = EXTENT;
+    let mut out = Vec::new();
+    for by in 0..h / 8 {
+        for bx in 0..w / 8 {
+            let mut sum = [0.0; 3];
+            for y in by * 8..by * 8 + 8 {
+                for x in bx * 8..bx * 8 + 8 {
+                    let p = a.mean[(y * w + x) as usize];
+                    for c in 0..3 {
+                        sum[c] += f64::from(p[c]) / 64.0;
+                    }
+                }
+            }
+            out.push(sum);
+        }
+    }
+    out
+}
+
+/// The worst and the mean error of any channel of any block against `reference`.
+fn block_rgb_errors(a: &Accumulated, reference: &Accumulated) -> (f64, f64) {
+    let mut worst = 0.0f64;
+    let (mut sum, mut n) = (0.0, 0.0);
+    for (a, r) in block_rgb(a).iter().zip(&block_rgb(reference)) {
+        for c in 0..3 {
+            let e = (a[c] - r[c]).abs() / r[c].max(1e-9);
+            worst = worst.max(e);
+            sum += e;
+            n += 1.0;
+        }
+    }
+    (worst, sum / n)
+}
+
+/// `lighting` with `medium` holding the eye, through the froxels or as the reference's distance
+/// samples, in both of which a single scatter lights the water: the froxels' world cache ambient
+/// holds no scattering in the water, and the reference's walk would.
+fn water_view(medium: Option<MaterialId>, reference: bool) -> ViewLighting {
+    ViewLighting {
+        camera_medium: medium,
+        max_bounces: 0,
+        reference: reference.then(ReferenceSettings::default),
+        ..ViewLighting::default()
+    }
+}
+
+/// Turbid water around the origin, top at 4 m, and `more`; no fog above it.
+fn turbid(eye: Vec3, target: Vec3, more: Vec<Item>) -> (Bed, Allocation<[f32; 4]>, MaterialId) {
+    let mut copies = vec![at(TURBID_WATER, Vec3::ZERO)];
+    copies.extend(more);
+    let sun = vec![directional(60.0, 30.0, 1_000.0)];
+    let (bed, fog) = foggy(&CLEAR, copies, sun, None, eye, target);
+    let water = bed.material(TURBID_WATER);
+    (bed, fog, water)
+}
+
+fn assert_matches(what: &str, a: &Accumulated, reference: &Accumulated, tolerance: f64) {
+    let (worst, mean) = block_rgb_errors(a, reference);
+    assert!(
+        worst < tolerance,
+        "{what}: a block is {worst:.3} off the reference (mean {mean:.3})"
+    );
+}
+
+/// The eye 3 m below the surface of turbid water over a floor, looking along it under a high sun:
+/// in-scatter whose color changes with the light's depth, the floor seen through chromatic
+/// absorption and the surface from below, all per channel. The froxels hold the whole camera
+/// segment, and the scene's medium none of it.
+#[test]
+fn an_underwater_view_matches_the_reference() {
+    let (mut bed, _fog, water) = turbid(
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(0.0, 0.0, -10.0),
+        vec![at(FLOOR, Vec3::new(0.0, -4.0, 0.0))],
+    );
+    let lit = shown(&mut bed, water_view(Some(water), false), 32);
+    let stats = bed.view().media_stats(bed.last_frame()).unwrap();
+    assert_eq!(stats.eye_columns, EXTENT[0] / 8 * (EXTENT[1] / 8));
+    let reference = shown(&mut bed, water_view(Some(water), true), 768);
+    assert_matches("under water", &lit, &reference, 0.05);
+    let blocks = block_rgb(&lit);
+    let [r, g, b] = blocks[blocks.len() / 2];
+    assert!(b > g && g > r, "the water's color {r:.3} {g:.3} {b:.3}");
+    assert_clean();
+}
+
+/// The same view with the froxels ending 8 m out: slices stop before the far wall and the floor,
+/// and the rest of the segment goes on through the same water.
+#[test]
+fn the_interior_goes_on_past_the_froxels() {
+    let (mut bed, _fog, water) = turbid(
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(0.0, 0.0, -10.0),
+        Vec::new(),
+    );
+    bed.set_near_range(8.0);
+    let lit = shown(&mut bed, water_view(Some(water), false), 32);
+    let reference = shown(&mut bed, water_view(Some(water), true), 768);
+    assert_matches("past the froxels", &lit, &reference, 0.05);
+    assert_clean();
+}
+
+/// Slats over the water and a view across them: shafts below the surface, against the reference
+/// and darker on average than open water.
+#[test]
+fn shafts_below_a_surface_match_the_reference() {
+    let eye = Vec3::new(0.0, 1.0, 0.0);
+    let target = Vec3::new(10.0, 1.5, 0.0);
+    let slats = vec![at(CANOPY, Vec3::new(0.0, 6.0, 0.0))];
+    let (mut bed, _fog, water) = turbid(eye, target, slats);
+    bed.spec.fov_y = 0.1;
+    let lit = shown(&mut bed, water_view(Some(water), false), 64);
+    let reference = shown(&mut bed, water_view(Some(water), true), 768);
+    assert_matches("shafts", &lit, &reference, 0.05);
+    let (mut open, _fog, water) = turbid(eye, target, Vec::new());
+    open.spec.fov_y = 0.1;
+    let open = shown(&mut open, water_view(Some(water), false), 32);
+    let (under, outside) = (mean_luminance(&lit), mean_luminance(&open));
+    assert!(
+        under < 0.8 * outside,
+        "under the slats {under:.3}, in open water {outside:.3}"
+    );
+    assert_clean();
+}
+
+/// A surface through the near plane, with the eye on either side of it: pixels with the near-plane
+/// point in the water take the water's in-scatter, the others none, with nothing crossing the
+/// waterline. A view that names no medium gets its volumes from the columns' count.
+#[test]
+fn a_waterline_at_the_near_plane_is_clean() {
+    let level = 4.0;
+    for (above, medium) in [(-0.004, true), (0.004, false)] {
+        let eye = Vec3::new(0.0, level + above, 0.0);
+        let (mut bed, _fog, water) = turbid(eye, eye + Vec3::new(0.0, 0.0, -10.0), Vec::new());
+        let medium = medium.then_some(water);
+        let inscatter_only = |reference: bool| ViewLighting {
+            debug_view: if reference {
+                LightingDebugView::None
+            } else {
+                LightingDebugView::Media
+            },
+            ..water_view(medium, reference)
+        };
+        let lit = shown(&mut bed, inscatter_only(false), 32);
+        let stats = bed.view().media_stats(bed.last_frame()).unwrap();
+        assert!(stats.eye_columns > 0, "{above}: no column in the water");
+        let shown_full = shown(&mut bed, water_view(medium, false), 32);
+        let reference = shown(&mut bed, inscatter_only(true), 512);
+        // Rows from the top: the near-plane point sits 0.05 x tan(angle) above the eye's height.
+        let [w, h] = EXTENT;
+        let tan = (0.4f32).tan();
+        let line = (0.5 * h as f32 * (1.0 + above / (NEAR * tan))).round() as u32;
+        let row = |a: &Accumulated, y: u32| {
+            let rgb = (0..w).map(|x| a.mean[(y * w + x) as usize]);
+            rgb.map(|p| luminance([p[0], p[1], p[2]].map(f64::from)))
+                .sum::<f64>()
+                / f64::from(w)
+        };
+        let below = row(&lit, line + 3);
+        assert!(below > 0.0, "{above}: nothing below the waterline");
+        for y in 0..line.saturating_sub(1) {
+            let air = row(&lit, y);
+            assert!(
+                air < 1e-3 * below,
+                "{above}: row {y} above the waterline at {line} takes {air:.4}, below it {below:.4}"
+            );
+        }
+        for y in line + 3..h - 3 {
+            let (a, r) = (row(&shown_full, y), row(&reference, y));
+            assert!(
+                (a - r).abs() < 0.08 * r,
+                "{above}: row {y}, waterline {line}: {a:.3} against the reference {r:.3}"
+            );
+        }
+    }
+    assert_clean();
+}
+
+/// A glass sphere in the water does not end the water for the pixels beside it: the blocks clear
+/// of its silhouette match the reference.
+#[test]
+fn a_body_in_the_water_leaves_no_halo() {
+    let target = Vec3::new(0.0, 0.0, -6.0);
+    let (mut bed, _fog, water) = turbid(Vec3::ZERO, target, vec![at(GLASS_SPHERE, target)]);
+    let lit = shown(&mut bed, water_view(Some(water), false), 32);
+    let reference = shown(&mut bed, water_view(Some(water), true), 768);
+    // The sphere's silhouette at 6 m.
+    let [w, h] = EXTENT;
+    let radius = h as f32 / (2.0 * (0.4f32).tan()) * (1.0 / 6.0) / (1.0 - 1.0 / 36.0f32).sqrt();
+    let (a, r) = (block_rgb(&lit), block_rgb(&reference));
+    let (columns, rows) = (w / 8, h / 8);
+    let mut checked = 0;
+    for by in 0..rows {
+        for bx in 0..columns {
+            let d = Vec2::new(
+                (bx * 8 + 4) as f32 - w as f32 / 2.0,
+                (by * 8 + 4) as f32 - h as f32 / 2.0,
+            );
+            if d.length() < radius + 6.0 {
+                continue;
+            }
+            let i = (by * columns + bx) as usize;
+            for c in 0..3 {
+                let e = (a[i][c] - r[i][c]).abs() / r[i][c];
+                assert!(
+                    e < 0.05,
+                    "block {bx} {by} channel {c}: {e:.3} off the reference"
+                );
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked > 20, "{checked} blocks beside the sphere");
+    assert_clean();
+}
+
+/// Mean |dY| / Y frame to frame over the pixels of a still camera, from frame 60.
+fn flicker(bed: &mut Bed, lighting: ViewLighting) -> f64 {
+    let (eye, target) = (bed.spec.eye, bed.spec.target);
+    let mut paths = fog_paths();
+    paths.settings = lighting;
+    let mut last: Option<Vec<f64>> = None;
+    let (mut sum, mut n) = (0.0, 0.0);
+    for k in 0..76 {
+        let a = bed.follow(eye, target, k, &mut |list, f| paths.record(list, f));
+        if k < 60 {
+            continue;
+        }
+        let y: Vec<f64> = a
+            .mean
+            .iter()
+            .map(|p| luminance([p[0], p[1], p[2]].map(f64::from)))
+            .collect();
+        if let Some(last) = &last {
+            for (a, b) in y.iter().zip(last) {
+                if *b > 0.0 {
+                    sum += (a - b).abs() / b;
+                    n += 1.0;
+                }
+            }
+        }
+        last = Some(y);
+    }
+    sum / n
+}
+
+/// The same underwater view at a still camera holds steady through the froxels, the in-scatter
+/// alone within 0.5% and with the paths' noise before denoising within 1%, where one distance
+/// sample per pixel does not.
+#[test]
+fn an_underwater_view_stays_steady() {
+    let (mut bed, _fog, water) = turbid(
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(0.0, 0.0, -10.0),
+        Vec::new(),
+    );
+    let froxels = flicker(&mut bed, water_view(Some(water), false));
+    let inscatter = ViewLighting {
+        debug_view: LightingDebugView::Media,
+        ..water_view(Some(water), false)
+    };
+    let inscatter = flicker(&mut bed, inscatter);
+    let sampled = flicker(&mut bed, water_view(Some(water), true));
+    assert!(
+        inscatter < 0.005 && froxels < 0.01 && sampled > 0.05,
+        "frame to frame the in-scatter changes by {:.2}%, the froxels' view by {:.2}%, one distance sample's by {:.2}%",
+        100.0 * inscatter,
+        100.0 * froxels,
+        100.0 * sampled
+    );
+    assert_clean();
+}
+
+/// A white particle in clear blue water, seen from inside it: its light takes the absorption from
+/// the surface down, and its fog the absorption back to the eye, per channel, against the same
+/// model on the CPU, inside the froxels and past them.
+#[test]
+fn particles_under_water_take_its_color() {
+    let eye = Vec3::new(0.0, -1.0, 2.0);
+    let target = Vec3::new(0.0, -1.0, 0.0);
+    let illuminance = 10_000.0f32;
+    let copies = vec![at(WATER_BOX, Vec3::ZERO)];
+    let sun = vec![directional(90.0, 0.0, illuminance)];
+    let (mut bed, _fog) = foggy(&CLEAR, copies, sun, None, eye, target);
+    let water = bed.material(WATER_BOX);
+    bed.set_particles(
+        &[Particle {
+            center: target,
+            size: 0.5,
+        }],
+        WHITE_PARTICLES,
+        Opacity::Particle,
+    );
+    let mut paths = fog_paths();
+    paths.settings = ViewLighting {
+        camera_medium: Some(water),
+        ..ViewLighting::default()
+    };
+    let leave = 1.0 - fresnel(1.33, 1.0);
+    let phase = 1.0 / (4.0 * std::f64::consts::PI);
+    // 3 m up to the surface at 2 m, 2 m back to the eye.
+    let wanted = water_transmission()
+        .map(|t| f64::from(illuminance) * 0.8 * phase * leave * t.powf(3.0) * t.powf(2.0));
+    for near_range in [None, Some(1.0)] {
+        if let Some(near_range) = near_range {
+            bed.set_near_range(near_range);
+        }
+        let a = bed.accumulate(16, 3, &mut |list, f| paths.record(list, f));
+        let got = a.around(pixel_of(&bed.spec, target), 2);
+        for c in 0..3 {
+            assert!(
+                (got[c] - wanted[c]).abs() <= 0.05 * wanted[c],
+                "near_range {near_range:?}, channel {c}: {got:?} against {wanted:?}"
+            );
+        }
+    }
     assert_clean();
 }
 

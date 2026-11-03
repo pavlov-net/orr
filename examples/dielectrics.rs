@@ -4,10 +4,11 @@
 //! ray per pixel against the dielectric mask and the path through what it finds: Fresnel
 //! reflection or refraction, the water's and the amber's absorption, the jade's scattering,
 //! and nested media where the glass meets the water. The camera orbits the pool, or with
-//! `--dive` bobs through the water's surface, the eye's medium following it. A still camera
-//! averages its frames in a scene-referred hook.
+//! `--dive` bobs through the water's surface, the eye's medium following it. `--turbid` makes the
+//! water scatter, so a dive shows the light in it. A still camera averages its frames in a
+//! scene-referred hook.
 //!
-//! `dielectrics [--dive] [--still] [--frames N] [--headless] [--out file.png]`: headless runs
+//! `dielectrics [--dive] [--turbid] [--still] [--frames N] [--headless] [--out file.png]`: headless runs
 //! keep the camera still, render 480 x 270 for 120 frames unless told otherwise and write the
 //! last frame as a PNG.
 
@@ -159,6 +160,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             display: None,
         })
         .expect("begin frame");
+    let turbid = options.has("--turbid");
     let water = Material {
         base_color: [1.0; 3],
         specular_roughness: 0.02,
@@ -166,6 +168,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         transmission_weight: 1.0,
         transmission_color: [0.62, 0.86, 0.9],
         transmission_depth: 1.5,
+        transmission_scatter: if turbid { [0.9, 1.1, 1.1] } else { [0.0; 3] },
         ..Material::default()
     };
     let water = f

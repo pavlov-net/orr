@@ -11,10 +11,11 @@
 // segment, and a scatter there shades by directional next-event estimation through the
 // surface without bending, the Henyey-Greenstein phase function and the world cache for the
 // rest. A camera inside a medium starts from `camera_medium`, flipped at each surface
-// between the eye and the near plane. The dispatch also writes each pixel's layer guide,
-// which the guide resolve blends into ray reconstruction's guides, and, for the frosted-glass
-// term, what the background behind rough transmission looks like and how far its lobes blur
-// it.
+// between the eye and the near plane; media apply gives its camera segment from the froxels,
+// and only without them, as under the reference, a distance sample here does. The dispatch also
+// writes each pixel's layer guide, which the guide resolve blends into ray reconstruction's
+// guides, and, for the frosted-glass term, what the background behind rough transmission looks
+// like and how far its lobes blur it.
 module dielectric;
 
 import orr.abi;
@@ -35,13 +36,11 @@ import light_sampling;
 import world_cache;
 import path;
 import shadow;
+import interiors;
 import subsurface;
 import guides;
 import froxels;
 import spectrum;
-
-// Interior list entries a path keeps.
-public static const uint INTERIOR_ENTRIES = 4;
 
 // Separates the dielectric dispatch's samples from the opaque path's of the same pixel.
 public static const uint DIELECTRIC_STREAM = 0x85EBCA6B;
@@ -134,74 +133,6 @@ public uint2 layer_tile_pixel(PathRoot r, uint entry, uint2 lane)
     return uint2(index % columns, index / columns) * LAYER_TILE + lane;
 }
 
-// The dielectric materials whose interiors hold a point, innermost last.
-public struct Interior
-{
-    public uint count;
-    public uint entries[INTERIOR_ENTRIES];
-
-    public __init()
-    {
-        count = 0;
-        for (uint i = 0; i < INTERIOR_ENTRIES; i++)
-            entries[i] = MATERIAL_NONE;
-    }
-
-    public uint innermost()
-    {
-        return count > 0 ? entries[count - 1] : MATERIAL_NONE;
-    }
-
-    // The innermost entry other than `a` and `b`, MATERIAL_NONE for none.
-    public uint outside(uint a, uint b)
-    {
-        for (uint i = count; i > 0; i--)
-        {
-            uint e = entries[i - 1];
-            if (e != a && e != b)
-                return e;
-        }
-        return MATERIAL_NONE;
-    }
-
-    // Crosses the surface of material `m`: into it from its front, out of it from its back.
-    // A full list drops its outermost entry to take a new one.
-    [mutating]
-    public void cross(uint m, bool front)
-    {
-        uint at = INTERIOR_ENTRIES;
-        for (uint i = 0; i < count; i++)
-        {
-            if (entries[i] == m)
-                at = i;
-        }
-        if (front)
-        {
-            if (at != INTERIOR_ENTRIES)
-                return;
-            if (count == INTERIOR_ENTRIES)
-                at = 0;
-            else
-            {
-                entries[count] = m;
-                count++;
-                return;
-            }
-        }
-        else if (at == INTERIOR_ENTRIES)
-            return;
-        for (uint i = at; i + 1 < count; i++)
-            entries[i] = entries[i + 1];
-        if (front)
-            entries[count - 1] = m;
-        else
-        {
-            count--;
-            entries[count] = MATERIAL_NONE;
-        }
-    }
-}
-
 // Applies an interior segment of length `t` (+inf: unbounded) to `throughput`: its Beer
 // transmittance, or with `scatter` one distance sample from the extinction, picking a channel
 // uniformly and weighing by the channels' mean density. True with `at` set where the sample
@@ -230,39 +161,6 @@ public bool interior_segment(InteriorMedium m, float t, bool scatter, inout Samp
     float p = dot(select(m.sigma_t > 0.0, tr, float3(1.0)), float3(1.0 / 3.0));
     throughput *= p > 0.0 ? tr / p : float3(0.0);
     return false;
-}
-
-// Non-opaque candidates of rays that may meet layers: presence layers commit by `presence`,
-// the rest by the alpha test.
-public static const uint PRESENCE_NONE = 0;      // never: rays that look for dielectrics only
-public static const uint PRESENCE_ANY = 1;       // wherever its opacity is above 0
-public static const uint PRESENCE_DRAWN = 2;     // where a hashed draw from `seed` falls below its opacity
-
-public struct LayerAccept<S : ISurface> : IAnyHit
-{
-    public SceneRoot* scene;
-    public ViewConstants* view;
-    public float3 dir;
-    public HitContext context;
-    public uint seed;
-    public uint presence;           // PRESENCE_*
-
-    public bool accept(Candidate c)
-    {
-        if (c.cluster_id < 0)
-            return false;
-        if (c.custom_index == CLASS_PRESENCE)
-        {
-            if (presence == PRESENCE_NONE)
-                return false;
-            float coverage = resolve_coverage<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context);
-            if (presence == PRESENCE_ANY)
-                return coverage > 0.0;
-            uint h = pcg(seed ^ pcg(c.instance_index ^ pcg(uint(c.cluster_id) ^ pcg(c.primitive_index))));
-            return unit_float(h) < coverage;
-        }
-        return resolve_alpha<S>(scene, view, dir, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, context);
-    }
 }
 
 public bool is_layer(Hit h)
@@ -931,32 +829,6 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
     return radiance;
 }
 
-// The surfaces a ray from `eye` along `dir` crosses before `t_near`, flipped into `interior`.
-public void eye_crossings<S : ISurface>(SceneRoot* s, ViewConstants* v, float3 eye, float3 dir, float t_near, inout Interior interior)
-{
-    float3 origin = eye;
-    float left = t_near;
-    RayCone cone = camera_cone(v);
-    for (uint k = 0; k < INTERIOR_ENTRIES && left > 0.0; k++)
-    {
-        HitContext context = hit_context(HIT_PRIMARY, 0, cone, 0.0);
-        LayerAccept<S> a = { s, v, dir, context, 0, PRESENCE_NONE };
-        float3 positions[3];
-        Hit h = trace_closest(s.tlas, path_ray(origin, dir, left), MASK_DIELECTRIC, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
-        if (!h.hit || h.cluster_id < 0)
-            return;
-        float3 n;
-        uint m;
-        if (!hit_geometry(s, dir, h.instance_index, uint(h.cluster_id), h.primitive_index, h.barycentrics, positions, n, m))
-            return;
-        if ((s.materials[m].flags & (MATERIAL_DIELECTRIC | MATERIAL_THIN_WALLED)) == MATERIAL_DIELECTRIC)
-            interior.cross(m, dot(n, dir) < 0.0);
-        float step = h.t + 1e-4 * (1.0 + h.t);
-        origin += dir * step;
-        left -= step;
-    }
-}
-
 // Reverse-Z device depth of render-space point `p`, as the jittered projection places it.
 public float device_depth(ViewConstants* v, float3 p)
 {
@@ -1208,10 +1080,16 @@ public void dielectric_body<C : ICoherence, S : ISurface, E : IEnvironment, M : 
             wt = luminance_rec2020(b1.albedo().transmission);
         }
     }
-    if (interior.count > 0)
+    // The froxels hold a camera segment through an interior where this frame has them.
+    bool carried = interior.count > 0 && r.froxels == nullptr;
+    if (carried)
         guide.medium_end = -1.0;
-    else if (hit_layer)
-        guide.medium_end = t_near + h.t;
+    else
+    {
+        guide.eye_medium = interior.innermost() + 1;
+        if (hit_layer)
+            guide.medium_end = t_near + h.t;
+    }
     guide.background = background;
     r.layers[index] = guide;
     if (!hit_layer && interior.count == 0)
@@ -1232,7 +1110,7 @@ public void dielectric_body<C : ICoherence, S : ISurface, E : IEnvironment, M : 
     InteriorMedium im = interior_medium(s, medium);
     float scattered;
     bool path = true;
-    bool scatters = medium != MATERIAL_NONE && interior_segment(im, t_first, true, rng, throughput, scattered);
+    bool scatters = carried && interior_segment(im, t_first, true, rng, throughput, scattered);
     if (scatters)
         l = scatter_vertex(v, near + dir * scattered, dir, medium, im.anisotropy);
     else if (hit_layer)

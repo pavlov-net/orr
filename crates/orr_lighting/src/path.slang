@@ -156,9 +156,12 @@ public struct LayerGuide
     public float2 specular_motion;
     public uint dominant;           // 1: `depth` and `motion` replace the G-buffer's
     // Where the camera segment through the linked medium ends: m from the eye to the layer
-    // the pixel shades; 0: at the G-buffer's surface or the sky; below 0: nowhere, the eye
-    // lies in an interior.
+    // the pixel shades; 0: at the G-buffer's surface or the sky; below 0: nowhere, the
+    // dispatch's path carries the segment through an interior.
     public float medium_end;
+    // 1 + the innermost interior at the pixel's near-plane point when the froxels hold its camera
+    // segment, which makes MATERIAL_NONE 0, as on every zeroed guide.
+    public uint eye_medium;
     // With DIELECTRIC_FROST, on every pixel whether its tile was traced or not:
     // `guide_luminance` of the radiance the opaque dispatch left the pixel, which the
     // frosted-glass term blurs.
@@ -409,7 +412,7 @@ public struct SceneShadow<S : ISurface, M : IMedium> : IShadow
         weigh = true;
         // Environment light reaches vertices without the medium's transmittance, as BSDF
         // misses see it: the baked map carries the medium.
-        return visibility<S, M>(scene, view, origin, dir, t_max, RAY_FLAG_NONE, context, !environment, overflows);
+        return visibility<S, M>(scene, view, origin, dir, t_max, RAY_FLAG_NONE, context, environment, overflows);
     }
 }
 

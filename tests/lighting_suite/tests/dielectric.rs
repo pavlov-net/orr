@@ -227,7 +227,7 @@ fn a_scattering_slab_matches_single_scattering_within_5_percent() {
     let k = sigma_t * (1.0 + 1.0 / c);
     let depth = 1.0;
     let enter = 1.0 - fresnel(1.5, 1.0);
-    let leave = 1.0 - fresnel(1.0 / 1.5, c);
+    let leave = 1.0 - fresnel(1.5, c);
     let phase = 1.0 / (4.0 * std::f64::consts::PI);
     let l = 1000.0 * enter * leave * phase * sigma_s * (1.0 - (-k * depth).exp()) / k;
     assert_close("single scattering", center(&image, 16), [l; 3], 0.05);
@@ -310,7 +310,7 @@ fn a_camera_inside_water_sees_its_absorption() {
     let open = center(&render_paths(&mut dry, &paths(reference(0)), 64), 4);
     let sun = SUN.direction_to_light.normalize();
     let path = f64::from(eye.length() + top / sun.y);
-    let leave = 1.0 - fresnel(1.0 / 1.33, f64::from(sun.y));
+    let leave = 1.0 - fresnel(1.33, f64::from(sun.y));
     let transmitted = water_transmission();
     let wanted: [f64; 3] = std::array::from_fn(|c| open[c] * leave * transmitted[c].powf(path));
     assert_close("under water", under, wanted, 0.05);

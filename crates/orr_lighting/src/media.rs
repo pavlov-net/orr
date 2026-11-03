@@ -1,6 +1,7 @@
 //! Per-view participating media: the froxel volume to the scene's `near_range`, the
 //! aerial-perspective LUT past it, and media apply.
 
+use orr_scene::MaterialId;
 use orr_scene::orr_gpu::{
     self, AddressMode, Allocation, CommandList, ComputePipeline, Device, Filter, Format, GpuPtr,
     Hazards, MemoryKind, SamplerDesc, SamplerIndex, Stages, StorageImageIndex, Texture,
@@ -10,10 +11,10 @@ use orr_scene::orr_gpu::{
 use crate::scene::{FRAME_SLOTS, Ring};
 use crate::shaders::media::{aerial, apply, froxel, smoke};
 use crate::shaders::types::{
-    FroxelLights, FroxelRoot, FroxelVolume, LayerGuide, MediaApplyRoot, MediaStatsGpu,
+    EyeColumn, FroxelLights, FroxelRoot, FroxelVolume, LayerGuide, MediaApplyRoot, MediaStatsGpu,
     ParticleLighting,
 };
-use crate::view::{LightingDebugView, LightingView, ViewLighting, ViewPass};
+use crate::view::{LightingDebugView, LightingView, NO_MATERIAL, ViewLighting, ViewPass};
 use crate::{Error, KernelSet, SceneLighting, pipeline};
 
 /// Pixels per side of a froxel column's tile (`media`'s `FROXEL_TILE`).
@@ -95,6 +96,8 @@ pub struct MediaStats {
     pub froxel_rays: u32,
     /// Medium proxies in the view's frustum.
     pub visible_proxies: u32,
+    /// Froxel columns whose near-plane point lies in a dielectric's interior.
+    pub eye_columns: u32,
 }
 
 /// One 3D target with its storage and sampled views.
@@ -113,10 +116,14 @@ struct Shape {
     chromatic: bool,
     /// The scene holds a smoke entry.
     smoke: bool,
+    /// A column of this view has lain in a dielectric's interior, which takes rgb transmittance
+    /// and each shadowed light's distance through that interior.
+    eye: bool,
 }
 
 /// A view's froxel targets: `froxel_material`, `froxel_incident` and `froxel_visibility`
-/// with their histories, `froxel_integrated`; and its `aerial` LUT.
+/// with their histories, `froxel_integrated`; `eye_depth` with its history; and its `aerial`
+/// LUT.
 struct Volumes {
     device: Device,
     shape: Shape,
@@ -131,6 +138,8 @@ struct Volumes {
     aerial_rgb: Option<Volume>,
     /// `froxels`' `SMOKE_WORDS` per froxel.
     smoke: Option<Allocation<u32>>,
+    eye: Allocation<EyeColumn>,
+    eye_depth: Option<[Volume; 2]>,
 }
 
 impl Volumes {
@@ -170,6 +179,17 @@ impl Volumes {
             2 => Format::Rg8Unorm,
             _ => Format::Rgba8Unorm,
         };
+        let eye_depth_format = match shape.extra {
+            0 => Format::R16Float,
+            1 => Format::Rg16Float,
+            _ => Format::Rgba16Float,
+        };
+        // 8 bits run out of transmittance within meters of water.
+        let integrated_rgb_format = if shape.eye {
+            Format::Rgba16Float
+        } else {
+            Format::Rgba8Unorm
+        };
         Ok(Self {
             sigma: volume(Format::Rgba16Float, "froxel material")?,
             words: volume(Format::Rgba32Uint, "froxel material words")?,
@@ -186,8 +206,16 @@ impl Volumes {
                 None
             },
             integrated: volume(Format::Rgba16Float, "froxel integrated")?,
-            integrated_rgb: if shape.chromatic {
-                Some(volume(Format::Rgba8Unorm, "froxel integrated rgb")?)
+            integrated_rgb: if shape.chromatic || shape.eye {
+                Some(volume(integrated_rgb_format, "froxel integrated rgb")?)
+            } else {
+                None
+            },
+            eye_depth: if shape.eye {
+                Some([
+                    volume(eye_depth_format, "froxel eye depth")?,
+                    volume(eye_depth_format, "froxel eye depth")?,
+                ])
             } else {
                 None
             },
@@ -200,6 +228,11 @@ impl Volumes {
             } else {
                 None
             },
+            eye: device.gpu_malloc(
+                MemoryKind::DeviceLocal,
+                u64::from(shape.grid[0] * shape.grid[1]),
+                "froxel eye columns",
+            )?,
             device: device.clone(),
             shape,
             slots,
@@ -224,6 +257,9 @@ pub(crate) struct MediaView {
     /// Frames the froxel history holds.
     history: u32,
     near_range: f32,
+    camera_medium: Option<MaterialId>,
+    /// A column of this view has lain in a dielectric's interior.
+    eye: bool,
     lights: Allocation<FroxelLights>,
     stats: Allocation<MediaStatsGpu>,
     frames: [Option<u64>; FRAME_SLOTS],
@@ -244,12 +280,15 @@ impl MediaView {
             changed: 0,
             proxies: 0,
             far_smoke: 0,
+            eye: 0,
         };
         Ok(Self {
             volumes: None,
             current: 0,
             history: 0,
             near_range: 0.0,
+            camera_medium: None,
+            eye: false,
             lights,
             stats: device.gpu_malloc(MemoryKind::Readback, FRAME_SLOTS as u64, "media stats")?,
             frames: [None; FRAME_SLOTS],
@@ -271,6 +310,7 @@ impl MediaView {
                 active_froxels: s.active,
                 froxel_rays: s.rays,
                 visible_proxies: s.proxies,
+                eye_columns: s.eye_columns,
             }
         })
     }
@@ -300,6 +340,8 @@ impl MediaView {
 /// The media kernels of one device.
 pub(crate) struct MediaKernels {
     order: ComputePipeline,
+    eye_column: ComputePipeline,
+    eye_reach: ComputePipeline,
     inject: ComputePipeline,
     smoke: ComputePipeline,
     light: ComputePipeline,
@@ -313,6 +355,8 @@ impl MediaKernels {
     pub(crate) fn new(device: &Device, kernels: &KernelSet) -> Result<Self, Error> {
         Ok(Self {
             order: pipeline(device, kernels, &froxel::MODULE, "order")?,
+            eye_column: pipeline(device, kernels, &froxel::MODULE, "eye_column")?,
+            eye_reach: pipeline(device, kernels, &froxel::MODULE, "eye_reach")?,
             inject: pipeline(device, kernels, &froxel::MODULE, "inject")?,
             smoke: pipeline(device, kernels, &smoke::MODULE, "main")?,
             light: pipeline(device, kernels, &froxel::MODULE, "light")?,
@@ -354,6 +398,12 @@ impl MediaKernels {
         };
         let (integrated_rgb, integrated_rgb_sampled) = pair(v.integrated_rgb.as_ref());
         let (aerial_rgb, aerial_rgb_sampled) = pair(v.aerial_rgb.as_ref());
+        let (eye_depth, eye_depth_history) = v
+            .eye_depth
+            .as_ref()
+            .map_or((StorageImageIndex::NONE, TextureIndex::NONE), |p| {
+                (p[cur].store, p[prev].sampled)
+            });
         FroxelRoot {
             scene: pass.scene,
             view: pass.view,
@@ -364,6 +414,7 @@ impl MediaKernels {
             stats: media.stats.gpu().offset(slot as u64),
             raster: pass.raster,
             smoke: v.smoke.as_ref().map_or(GpuPtr::NULL, Allocation::gpu),
+            eye: v.eye.gpu(),
             sigma: v.sigma.store,
             words: v.words.store,
             incident: v.incident[cur].store,
@@ -391,7 +442,9 @@ impl MediaKernels {
             aerial_rgb_sampled,
             ap_range: settings.ap_range,
             smoke_anisotropy: settings.smoke_anisotropy,
-            _pad0: 0,
+            camera_medium: lighting.camera_medium.map_or(NO_MATERIAL, |m| m.0),
+            eye_depth,
+            eye_depth_history,
         }
     }
 
@@ -414,6 +467,7 @@ impl MediaKernels {
             set: scene.light_set(),
             cache: scene.world_cache(pass.frame),
             lights: media.lights.gpu(),
+            eye: v.map_or(GpuPtr::NULL, |v| v.eye.gpu()),
             layers,
             incident: v.map_or(TextureIndex::NONE, |v| current(&v.incident)),
             visibility: v
@@ -434,7 +488,9 @@ impl MediaKernels {
                 .and_then(|v| v.aerial_rgb.as_ref())
                 .map_or(TextureIndex::NONE, |t| t.sampled),
             ap_range: lighting.media.ap_range,
-            _pad0: 0,
+            eye_depth: v
+                .and_then(|v| v.eye_depth.as_ref())
+                .map_or(TextureIndex::NONE, current),
         }
     }
 
@@ -456,6 +512,13 @@ impl MediaKernels {
         let shadowed = settings
             .froxel_shadowed_lights
             .min(MAX_FROXEL_SHADOWED_LIGHTS);
+        // This slot's last frame has completed; its stats say whether a near plane reached an
+        // interior the view does not name.
+        let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
+        media.eye = media.eye
+            || lighting.camera_medium.is_some()
+            || (media.frames[slot].is_some()
+                && media.stats.as_slice().unwrap()[slot].eye_columns > 0);
         let shape = Shape {
             grid: [
                 extent[0].div_ceil(FROXEL_TILE),
@@ -465,6 +528,7 @@ impl MediaKernels {
             extra: shadowed.saturating_sub(1),
             chromatic: settings.chromatic_transmittance,
             smoke: pass.smoke_args.is_some(),
+            eye: media.eye,
         };
         let mut fresh = false;
         if media.volumes.as_ref().is_none_or(|v| v.shape != shape) {
@@ -473,18 +537,23 @@ impl MediaKernels {
             fresh = true;
         }
         let near_range = scene.settings().near_range;
-        if fresh || reset || media.near_range != near_range {
+        if fresh
+            || reset
+            || media.near_range != near_range
+            || media.camera_medium != lighting.camera_medium
+        {
             media.history = 0;
         }
         media.near_range = near_range;
+        media.camera_medium = lighting.camera_medium;
         media.current = 1 - media.current;
-        let slot = (pass.frame % FRAME_SLOTS as u64) as usize;
         media.frames[slot] = Some(pass.frame);
         let root = self.root(media, scene, pass, lighting);
         media.volume_roots.write(
             slot,
             FroxelVolume {
                 lights: root.lights,
+                eye: root.eye,
                 sigma: root.sigma,
                 words: root.words,
                 incident: root.incident,
@@ -500,6 +569,12 @@ impl MediaKernels {
         list.begin_pass("froxels", false);
         list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::DRAW_ARGUMENTS);
         list.dispatch(&self.order, root, [1, 1, 1]);
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        let column_groups = [columns.div_ceil(8), rows.div_ceil(8), 1];
+        list.dispatch(&self.eye_column, root, column_groups);
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+        list.dispatch(&self.eye_reach, root, column_groups);
+        list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         list.dispatch(
             &self.inject,
             root,

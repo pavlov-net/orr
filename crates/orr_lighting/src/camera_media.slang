@@ -53,13 +53,6 @@ public struct MediaApplyRoot
     public uint proxy_rays;                     // shadow rays per light over a stretch of proxies, at most MAX_PROXY_RAYS; 0 takes the froxels' visibility
 }
 
-// In-scatter (pre-exposed) and transmittance from the eye.
-struct Fog
-{
-    float3 inscatter;
-    float3 transmittance;
-}
-
 // The linked medium's in-scatter and transmittance from the eye to `t` m along unit `dir`, the
 // ray through `pixel`: the froxels to the scene's `near_range`, then the aerial-perspective LUT
 // to `ap_range` and `segment_inscatter` past it.
@@ -68,7 +61,15 @@ Fog linked_fog<M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 pixel, float3 
     ViewConstants* v = f.view;
     float near_range = f.scene.near_range;
     Fog g;
-    g.inscatter = integrated_fog(f.integrated_sampled, f.integrated_rgb_sampled, f.sampler, uint3(f.columns, f.rows, f.slices), v.extent, near_range, float2(pixel) + 0.5, min(t, near_range), g.transmittance);
+    if (f.lights.eye != 0)
+    {
+        uint medium = r.layers != nullptr ? layer_guide(r.layers, f.gbuffer.extent, pixel).eye_medium - 1 : MATERIAL_NONE;
+        g = eye_fog(f.eye, f.integrated_sampled, f.integrated_rgb_sampled, uint3(f.columns, f.rows, f.slices), v.extent, near_range, float2(pixel) + 0.5, medium, interior_medium(f.scene, medium).sigma_t, t);
+        if (medium != MATERIAL_NONE)
+            return g;
+    }
+    else
+        g.inscatter = integrated_fog(f.integrated_sampled, f.integrated_rgb_sampled, f.sampler, uint3(f.columns, f.rows, f.slices), v.extent, near_range, float2(pixel) + 0.5, min(t, near_range), g.transmittance);
     if (!(t > near_range))
         return g;
     float ap_range = max(f.ap_range, near_range);
@@ -525,7 +526,7 @@ Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uin
                     float3 l = c.kind == LIGHT_SAMPLE_DIRECTIONAL ? disc_radiance(set, c.light, c.dir) : c.radiance;
                     float t_max = isfinite(c.distance) ? c.distance * (1.0 - 1e-4) : c.distance;
                     RayCone cone = { 0.0, 0.0 };
-                    float3 vis = visibility<S, M>(s, f.view, origin, c.dir, t_max, RAY_FLAG_NONE, hit_context(HIT_SECONDARY, 1, cone, 0.0), c.kind != LIGHT_SAMPLE_ENVIRONMENT, set.shadow_overflows);
+                    float3 vis = visibility<S, M>(s, f.view, origin, c.dir, t_max, RAY_FLAG_NONE, hit_context(HIT_SECONDARY, 1, cone, 0.0), c.kind == LIGHT_SAMPLE_ENVIRONMENT, set.shadow_overflows);
                     source += scatter * l * vis / c.pdf;
                 }
                 source += sigma_s * multiple_scattered<M>(set, p);
@@ -633,9 +634,9 @@ Fog smoky_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 p
 
 // Media apply for `pixel`: L = S + T x L over the camera segment to the pixel's surface, or
 // the dielectric or presence layer it shades; sky pixels take the froxels' whole range, and
-// pixels whose eye lies in an interior nothing. Marked pixels of the background layer take
-// the same over the segment to their layer's depth. One ray finds the pixel's proxy spans for
-// both.
+// pixels whose path carried the segment through an interior nothing. Marked pixels of the
+// background layer take the same over the segment to their layer's depth. One ray finds the
+// pixel's proxy spans for both.
 public void media_apply<S : ISurface, M : IMedium>(MediaApplyRoot r, uint2 pixel)
 {
     FroxelRoot f = *r.froxels;
