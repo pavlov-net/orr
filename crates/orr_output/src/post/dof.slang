@@ -22,6 +22,7 @@ import orr.math;
 import orr.color;
 import orr.random;
 import view;
+import overlay_front;
 
 // Half-resolution pixels across a CoC tile.
 static const uint TILE = 8;
@@ -82,6 +83,10 @@ struct Root
     uint* scatter;
     TextureIndex rr_depth;
     TextureIndex rr_motion;
+    // Lighting's front layer; NONE without one.
+    TextureIndex overlay_depth;
+    TextureIndex overlay_motion;
+    TextureIndex overlay_weight;
     TextureIndex source;
     StorageImageIndex target;
     // R16F `luminance(after - before)`; NONE after RR.
@@ -147,6 +152,7 @@ struct Root
     // Diameter as a fraction of the width.
     float max_coc;
     uint _pad0;
+    uint _pad1;
 }
 ORR_ROOT(Root);
 
@@ -168,21 +174,25 @@ int2 render_pixel(int2 p)
     return clamp(int2(floor(at + view.jitter)), int2(0), int2(view.extent) - 1);
 }
 
-float depth_at(int2 p)
-{
-    return root.rr_depth.get<Texture2D<float>>().Load(int3(render_pixel(p), 0));
-}
-
 float coc_from_depth(float z)
 {
     LensState* l = root.lens;
     return clamp(l.coc_scale - l.coc_slope * z, -l.max_radius, l.max_radius);
 }
 
-// Full-resolution signed CoC radius at pixel `p`.
+// Full-resolution signed CoC radius at pixel `p`. With a front layer the radius blends by the
+// layer's weight and the sign is the larger share's: blending across the focal plane would
+// bring into focus a pixel neither of whose layers is.
 float coc_at(int2 p)
 {
-    return coc_from_depth(depth_at(p));
+    int2 pixel = render_pixel(p);
+    float dominant = coc_from_depth(root.rr_depth.get<Texture2D<float>>().Load(int3(pixel, 0)));
+    float w = weight_at(root.overlay_weight, pixel);
+    if (w <= 0.0)
+        return dominant;
+    float front = coc_from_depth(root.overlay_depth.get<Texture2D<float>>().Load(int3(pixel, 0)));
+    float radius = lerp(abs(dominant), abs(front), w);
+    return (w >= 0.5 ? front : dominant) < 0.0 ? -radius : radius;
 }
 
 // The diaphragm's radius toward lens-plane direction `d`, 1 at its widest.
@@ -304,10 +314,10 @@ void setup(uint3 id: SV_DispatchThreadID)
         return;
     int2 last = int2(root.width, root.height) - 1;
     int2 base = 2 * int2(id.xy);
-    float furthest = 2.0;
+    // The CoC grows with distance, so the largest is the furthest.
+    float key = -1e30;
     for (uint k = 0; k < 4; k++)
-        furthest = min(furthest, depth_at(min(base + int2(k & 1, k >> 1), last)));
-    float key = 0.5 * coc_from_depth(furthest);
+        key = max(key, 0.5 * coc_at(min(base + int2(k & 1, k >> 1), last)));
     Texture2D<float4> source = root.source.get<Texture2D<float4>>();
     float3 sum = 0.0;
     float weights = 0.0;
@@ -430,7 +440,7 @@ void stabilize(uint3 id: SV_DispatchThreadID)
         }
     }
     int2 full = min(2 * q + 1, int2(root.width, root.height) - 1);
-    float2 motion = root.rr_motion.get<Texture2D<float2>>().Load(int3(render_pixel(full), 0));
+    float2 motion = blended_motion(root.rr_motion, root.overlay_motion, root.overlay_weight, render_pixel(full));
     float2 uv = (float2(q) + 0.5) / float2(half_extent()) + motion;
     if (any(uv < 0.0) || any(uv > 1.0))
     {

@@ -4,7 +4,9 @@
 // composited) and the reverse-Z depth of the nearest opaque surface; `reference` averages
 // `lens_samples` rays from points of the aperture through each pixel's point on the focal
 // plane. `background_layer` stands in for lighting's background layer: on each pixel the
-// mask marks, one lens ray per frame that starts past the mask's depth.
+// mask marks, one lens ray per frame that starts past the mask's depth. With `layered` the depth
+// is the first layer of half coverage or more, as lighting's dominant layer, and the front
+// layer holds the nearest layer in front of it above 0.1 coverage and those layers' coverage.
 #include "orr/root.h"
 import orr.abi;
 
@@ -13,6 +15,7 @@ static const uint BACKGROUND = 1;
 static const uint HIGHLIGHTS = 2;
 static const uint WATER = 3;
 static const uint FENCE = 4;
+static const uint SHARP_PARTICLES = 5;
 
 static const float PI = 3.14159265;
 
@@ -22,6 +25,10 @@ struct Root
     StorageImageIndex radiance;
     StorageImageIndex depth;
     StorageImageIndex motion;
+    StorageImageIndex overlay_depth;
+    StorageImageIndex overlay_motion;
+    StorageImageIndex overlay_weight;
+    uint layered;
     uint width;
     uint height;
     uint scene;
@@ -92,6 +99,8 @@ float distance(uint i)
         return i == 0 ? 5.0 : 40.0;
     case FENCE:
         return i == 0 ? 0.4 : 1.0;
+    case SHARP_PARTICLES:
+        return i == 0 ? 1.0 : 8.0;
     default:
         return i == 0 ? 0.5 : 8.0;
     }
@@ -145,6 +154,17 @@ Layer surface(uint i, float3 x)
         float bright = length(cell) < 0.08 ? 40.0 : 0.0;
         return layer(float3(0.02, 0.025, 0.04) + bright * float3(1.0, 0.85, 0.6), 1.0);
     }
+    case SHARP_PARTICLES:
+    {
+        if (i == 0)
+        {
+            // In focus, nearly opaque: discs with soft rims.
+            float2 cell = frac(p / 0.12) - 0.5;
+            float a = 0.9 * saturate(8.0 * (1.0 - length(cell) / 0.35));
+            return layer(float3(0.9, 0.75, 0.3), a);
+        }
+        return layer(checker(p, 0.4, float3(0.75, 0.6, 0.45), float3(0.2, 0.3, 0.2)), 1.0);
+    }
     case FENCE:
     {
         // Bars in view angle, and behind each, in the pinhole image hidden, a warm stripe.
@@ -196,6 +216,12 @@ struct Trace
     float3 color;
     // View distance of the nearest opaque surface; 0 for sky.
     float depth;
+    // View distance of the first layer of half coverage or more; 0 for sky.
+    float dominant;
+    // View distance of the nearest layer above 0.1 coverage in front of `dominant`, 0 for none,
+    // and the coverage of everything in front of `dominant`.
+    float front;
+    float coverage;
 }
 
 // Surfaces composited front to back along the ray, from ray parameter `start` on.
@@ -204,6 +230,9 @@ Trace trace(float3 o, float3 d, float start)
     Trace r;
     r.color = 0.0;
     r.depth = 0.0;
+    r.dominant = 0.0;
+    r.front = 0.0;
+    r.coverage = 0.0;
     float transmit = 1.0;
     float last = start;
     for (uint step = 0; step < surfaces(); step++)
@@ -224,6 +253,17 @@ Trace trace(float3 o, float3 d, float start)
         last = best;
         float3 x = o + best * d;
         Layer l = surface(which, x);
+        if (r.dominant == 0.0)
+        {
+            if (l.alpha >= 0.5)
+                r.dominant = -x.z;
+            else
+            {
+                r.coverage = 1.0 - (1.0 - r.coverage) * (1.0 - l.alpha);
+                if (r.front == 0.0 && l.alpha > 0.1)
+                    r.front = -x.z;
+            }
+        }
         r.color += transmit * l.alpha * l.color;
         transmit *= 1.0 - l.alpha;
         if (l.alpha >= 1.0)
@@ -251,8 +291,12 @@ void frame(uint3 id: SV_DispatchThreadID)
         return;
     Trace t = trace(0.0, focal_point(id.xy) / root.focus, 0.0);
     root.radiance.get<RWTexture2D<float4>>()[id.xy] = float4(t.color, 1.0);
-    root.depth.get<RWTexture2D<float>>()[id.xy] = t.depth > 0.0 ? root.near / t.depth : 0.0;
+    float depth = root.layered != 0 ? t.dominant : t.depth;
+    root.depth.get<RWTexture2D<float>>()[id.xy] = depth > 0.0 ? root.near / depth : 0.0;
     root.motion.get<RWTexture2D<float2>>()[id.xy] = 0.0;
+    root.overlay_depth.get<RWTexture2D<float>>()[id.xy] = t.front > 0.0 ? root.near / t.front : 0.0;
+    root.overlay_motion.get<RWTexture2D<float2>>()[id.xy] = 0.0;
+    root.overlay_weight.get<RWTexture2D<float>>()[id.xy] = t.front > 0.0 ? t.coverage : 0.0;
 }
 
 float aperture(float angle)

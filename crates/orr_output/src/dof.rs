@@ -12,7 +12,7 @@ use orr_scene::{DepthOfField, Focus, Lens, Projection, ViewConstants};
 
 use crate::passes::groups;
 use crate::shaders::post::dof::{self, LensState, Root, Sprite};
-use crate::{Image, Result, ViewOutput};
+use crate::{Image, OverlayFront, Result, ViewOutput};
 
 /// Half-resolution pixels across a CoC tile (`TILE` in `dof.slang`).
 const TILE: u32 = 8;
@@ -39,6 +39,9 @@ pub struct DepthOfFieldPass<'a> {
     pub rr_depth: TextureIndex,
     /// Lighting's `rr_motion`: RG16F previous minus current UV at render resolution.
     pub rr_motion: TextureIndex,
+    /// Lighting's front layer, whose depth and motion the blur follows as far as it covers
+    /// each pixel.
+    pub overlay: Option<OverlayFront>,
     /// The extent the effect runs at: the output extent after RR, the render extent on the
     /// guide path.
     pub extent: [u32; 2],
@@ -165,6 +168,7 @@ impl DofKernels {
             .as_ref()
             .map_or(StorageImageIndex::NONE, |g| g.guide.storage);
         let max_radius = 0.25 * dof.max_coc * width as f32;
+        let [overlay_depth, overlay_motion, overlay_weight] = OverlayFront::indices(pass.overlay);
         let (auto_focus, focus_distance, [focus_u, focus_v], focus_speed) = match dof.focus {
             Focus::Manual { distance_m } => (0, distance_m, [0.5, 0.5], 0.0),
             Focus::Auto { uv, speed } => (1, 0.0, uv, speed),
@@ -177,6 +181,9 @@ impl DofKernels {
             scatter: targets.scatter.gpu(),
             rr_depth: pass.rr_depth,
             rr_motion: pass.rr_motion,
+            overlay_depth,
+            overlay_motion,
+            overlay_weight,
             source,
             target,
             guide,
@@ -225,6 +232,7 @@ impl DofKernels {
             round_at_f_number: dof.round_at_f_number,
             max_coc: dof.max_coc,
             _pad0: 0,
+            _pad1: 0,
         };
         if let Some(h) = targets.holes.as_mut() {
             let hole_reset = reset || std::mem::take(&mut h.fresh);

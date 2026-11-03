@@ -1984,25 +1984,25 @@ impl<'a> Frame<'a> {
     /// Step 5's transparency point for a view `raster_view` rendered this frame: enters
     /// [`ViewStep::Transparency`], clears the view's overlay, runs `hook` to draw into it,
     /// then composites the overlay over `radiance` (RGBA16F at the render extent,
-    /// pre-exposed) in place.
+    /// pre-exposed) in place. Returns the overlay and its sampled view, premultiplied with
+    /// coverage in alpha, which holds its contents through [`ViewStep::Transparency`].
     pub fn transparency(
         &mut self,
         view: &RasterView,
         radiance: StorageImageIndex,
         hook: &mut dyn FnMut(&mut TransparencyPass<'_, '_>),
-    ) -> Result<()> {
-        self.transparency_point(view, Some(radiance), hook)?;
-        Ok(())
+    ) -> Result<(Arc<orr_gpu::Texture>, TextureIndex)> {
+        self.transparency_point(view, Some(radiance), hook)
     }
 
-    /// [`Self::transparency`] without the composite: returns the overlay, premultiplied
-    /// RGBA16F at the render extent with coverage in alpha, for ray reconstruction to
-    /// composite after denoising. It holds its contents through [`ViewStep::Rr`].
+    /// [`Self::transparency`] without the composite: the overlay, RGBA16F at the render extent,
+    /// is for ray reconstruction to composite after denoising, and holds its contents through
+    /// [`ViewStep::Rr`].
     pub fn transparency_overlay(
         &mut self,
         view: &RasterView,
         hook: &mut dyn FnMut(&mut TransparencyPass<'_, '_>),
-    ) -> Result<Arc<orr_gpu::Texture>> {
+    ) -> Result<(Arc<orr_gpu::Texture>, TextureIndex)> {
         self.transparency_point(view, None, hook)
     }
 
@@ -2011,7 +2011,7 @@ impl<'a> Frame<'a> {
         view: &RasterView,
         radiance: Option<StorageImageIndex>,
         hook: &mut dyn FnMut(&mut TransparencyPass<'_, '_>),
-    ) -> Result<Arc<orr_gpu::Texture>> {
+    ) -> Result<(Arc<orr_gpu::Texture>, TextureIndex)> {
         self.ensure_updated()?;
         let device = self.device;
         let composite = self.pipelines.get(self.pipelines.own.composite);
@@ -2079,7 +2079,7 @@ impl<'a> Frame<'a> {
             list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
         }
         self.step("transparency");
-        Ok(overlay_texture)
+        Ok((overlay_texture, overlay_index))
     }
 
     /// The frame's command list and the arena of view `history`, as its last

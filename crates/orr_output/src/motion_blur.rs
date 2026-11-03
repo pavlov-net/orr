@@ -8,7 +8,7 @@ use orr_scene::orr_gpu::{
 
 use crate::passes::groups;
 use crate::shaders::post::motion_blur::{self, Root};
-use crate::{ChainImages, Image, Result, ViewOutput};
+use crate::{ChainImages, Image, OverlayFront, Result, ViewOutput};
 
 /// Pixels across a velocity tile (`TILE` in `motion_blur.slang`).
 const TILE: u32 = 20;
@@ -23,6 +23,8 @@ pub struct MotionBlurPass<'a> {
     pub rr_depth: TextureIndex,
     /// Lighting's `rr_motion`: RG16F previous minus current UV at render resolution.
     pub rr_motion: TextureIndex,
+    /// Lighting's front layer, which the blur follows as far as it covers each pixel.
+    pub overlay: Option<OverlayFront>,
     /// The output extent.
     pub extent: [u32; 2],
     /// The render's view constants: the render extent and jitter.
@@ -68,10 +70,14 @@ impl MotionBlurKernels {
         let [width, height] = pass.extent;
         let [tiles_x, tiles_y] = tiles(pass.extent);
         let max_radius = MOTION_BLUR_MAX_RADIUS * width as f32;
+        let [overlay_depth, overlay_motion, overlay_weight] = OverlayFront::indices(pass.overlay);
         Root {
             view: pass.view,
             rr_depth: pass.rr_depth,
             rr_motion: pass.rr_motion,
+            overlay_depth,
+            overlay_motion,
+            overlay_weight,
             source: chain.rr_output,
             target: chain.linear_store,
             tile_rows: targets.tile_rows.sampled,
@@ -88,6 +94,7 @@ impl MotionBlurKernels {
             scale: 0.5 * pass.shutter / (pass.generated + 1) as f32,
             max_radius,
             pairs: (pass.output.post.motion_blur_samples / 2).max(1),
+            _pad0: 0,
         }
     }
 

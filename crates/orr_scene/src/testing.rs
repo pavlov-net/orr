@@ -203,18 +203,36 @@ fn rgb8(i: &Image) -> nv_flip::FlipImageRgb8 {
     nv_flip::FlipImageRgb8::with_data(i.width, i.height, &rgb)
 }
 
-/// LDR FLIP of `test` against `reference` at the default viewing distance.
-pub fn flip(reference: &Image, test: &Image) -> FlipError {
+fn flip_map(reference: &Image, test: &Image) -> nv_flip::FlipImageFloat {
     assert_eq!(
         (reference.width, reference.height),
         (test.width, test.height),
         "image sizes differ"
     );
-    let map = nv_flip::flip(
+    nv_flip::flip(
         rgb8(reference),
         rgb8(test),
         nv_flip::DEFAULT_PIXELS_PER_DEGREE,
-    );
+    )
+}
+
+/// Mean LDR FLIP of `test` against `reference` over the pixels `mask` marks, in rows of the
+/// images' width.
+pub fn flip_mean_where(reference: &Image, test: &Image, mask: &[bool]) -> f32 {
+    let map = flip_map(reference, test).to_vec();
+    assert_eq!(map.len(), mask.len(), "the mask's size differs");
+    let marked: Vec<f32> = map
+        .iter()
+        .zip(mask)
+        .filter(|(_, m)| **m)
+        .map(|(v, _)| *v)
+        .collect();
+    marked.iter().sum::<f32>() / marked.len() as f32
+}
+
+/// LDR FLIP of `test` against `reference` at the default viewing distance.
+pub fn flip(reference: &Image, test: &Image) -> FlipError {
+    let map = flip_map(reference, test);
     let mut pool = nv_flip::FlipPool::from_image(&map);
     FlipError {
         mean: pool.mean(),

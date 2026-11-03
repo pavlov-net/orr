@@ -144,17 +144,24 @@ public struct PathRoot
     public uint64_t* overlay_front;
 }
 
-// A pixel's front layer over the G-buffer: reverse-Z device depth in the high half, so the
-// larger word is the nearer layer whatever the motion, and half floats of the motion in the
-// low half; 0 for no layer.
-public uint64_t overlay_front_word(float depth, float2 motion)
+// A pixel's front layer over the G-buffer: the top 24 bits of the reverse-Z device depth, so
+// the larger word is the nearer layer whatever else it holds, then the 8-bit share of the
+// pixel's light the layer itself gives (0 for an overlay fragment, whose share is the overlay's
+// coverage) and half floats of the motion; 0 for no layer.
+public uint64_t overlay_front_word(float depth, float2 motion, float weight)
 {
-    return (uint64_t(asuint(depth)) << 32) | uint64_t(f32tof16(motion.x) | (f32tof16(motion.y) << 16));
+    uint high = (asuint(depth) & 0xffffff00u) | uint(round(saturate(weight) * 255.0));
+    return (uint64_t(high) << 32) | uint64_t(f32tof16(motion.x) | (f32tof16(motion.y) << 16));
 }
 
 public float overlay_front_depth(uint64_t word)
 {
-    return asfloat(uint(word >> 32));
+    return asfloat(uint(word >> 32) & 0xffffff00u);
+}
+
+public float overlay_front_weight(uint64_t word)
+{
+    return float(uint(word >> 32) & 0xffu) / 255.0;
 }
 
 public float2 overlay_front_motion(uint64_t word)

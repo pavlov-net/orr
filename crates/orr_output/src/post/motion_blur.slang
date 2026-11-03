@@ -8,6 +8,7 @@
 import orr.abi;
 import orr.random;
 import view;
+import overlay_front;
 
 static const uint TILE = 20;
 // Relative depth difference over which a sample goes from behind to in front.
@@ -22,6 +23,10 @@ struct Root
     ViewConstants* view;
     TextureIndex rr_depth;
     TextureIndex rr_motion;
+    // Lighting's front layer; NONE without one.
+    TextureIndex overlay_depth;
+    TextureIndex overlay_motion;
+    TextureIndex overlay_weight;
     TextureIndex source;
     StorageImageIndex target;
     // Largest half vector per tile and output row: (tiles x, height).
@@ -44,6 +49,7 @@ struct Root
     // Pixels.
     float max_radius;
     uint pairs;
+    uint _pad0;
 }
 ORR_ROOT(Root);
 
@@ -58,7 +64,7 @@ int2 render_pixel(int2 p)
 // Output pixel `p`'s half vector in pixels, at most `max_radius` long.
 float2 half_vector(int2 p)
 {
-    float2 motion = root.rr_motion.get<Texture2D<float2>>().Load(int3(render_pixel(p), 0));
+    float2 motion = blended_motion(root.rr_motion, root.overlay_motion, root.overlay_weight, render_pixel(p));
     float2 v = -motion * float2(root.width, root.height) * root.scale;
     float l = length(v);
     return l > root.max_radius ? v * (root.max_radius / l) : v;
@@ -67,7 +73,7 @@ float2 half_vector(int2 p)
 // Proportional to view distance; finite at infinity.
 float distance_at(int2 p)
 {
-    float z = root.rr_depth.get<Texture2D<float>>().Load(int3(render_pixel(p), 0));
+    float z = blended_depth(root.rr_depth, root.overlay_depth, root.overlay_weight, render_pixel(p));
     return 1.0 / max(z, 1e-12);
 }
 

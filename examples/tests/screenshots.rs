@@ -831,6 +831,15 @@ struct Lamp {
 
 impl Lamp {
     fn new() -> Self {
+        Self::with_material(Material {
+            base_color: [0.0; 3],
+            emission_color: [1.0; 3],
+            emission_luminance: 0.5 / orr::orr_output::exposure_from_ev100(LAMP_EV100),
+            ..Material::default()
+        })
+    }
+
+    fn with_material(material: Material) -> Self {
         let gpu = device();
         let desc = RendererDesc {
             path_entry: PathEntry::Compute,
@@ -847,13 +856,7 @@ impl Lamp {
                     name: "lamp".into(),
                     source: Source::Mesh {
                         mesh: mesh.finish(),
-                        materials: vec![Material {
-                            base_color: [0.0; 3],
-                            emission_color: [1.0; 3],
-                            emission_luminance: 0.5
-                                / orr::orr_output::exposure_from_ev100(LAMP_EV100),
-                            ..Material::default()
-                        }],
+                        materials: vec![material],
                         settings: MeshSettings::default(),
                     },
                 }],
@@ -1076,6 +1079,65 @@ fn check_blur_under_ray_reconstruction(lamp: &mut Lamp, moving: LampSettings) {
         &sharp,
         tolerance,
     );
+}
+
+/// A see-through lamp lies in no G-buffer, so only its front layer can blur it: `render_view`
+/// smears it by its coverage's share of the distance the shutter says.
+#[test]
+fn render_view_blurs_a_see_through_lamp_by_its_coverage() {
+    let _serial = serial();
+    let coverage = 0.3;
+    let mut lamp = Lamp::with_material(Material {
+        base_color: [0.0; 3],
+        specular_weight: 0.0,
+        emission_color: [1.0; 3],
+        emission_luminance: 0.9 / orr::orr_output::exposure_from_ev100(LAMP_EV100),
+        geometry_opacity: coverage,
+        alpha_mode: Material::BLEND,
+        ..Material::default()
+    });
+    let extent = [320, 240];
+    let frames = 4;
+    let moving = LampSettings {
+        lamp: 6.0,
+        camera: 0.0,
+        shutter: 1.0,
+        cut: false,
+        scene_reset: false,
+        reference: false,
+        hooks: false,
+        reconstruction: Reconstruction::Off,
+        glare: false,
+        distortion: false,
+        stops: 0.0,
+        debug_view: LightingDebugView::None,
+    };
+    // Presence is stochastic per pixel, so the images are averaged over runs.
+    let mut average = |settings: LampSettings| {
+        let mut sum = vec![0.0; 4 * (extent[0] * extent[1]) as usize];
+        for _ in 0..8 {
+            for (s, v) in sum.iter_mut().zip(lamp.run(extent, frames, settings)) {
+                *s += v / 8.0;
+            }
+        }
+        Spread::of(&sum, extent[0])
+    };
+    let sharp = average(moving.closed());
+    let blurred = average(moving);
+    let length = blurred.half_length(&sharp);
+    let want = f64::from(coverage) * moving.half_length(extent[1]);
+    log::info!("half length {length:.2} of {want:.2}, {blurred:?}, sharp {sharp:?}");
+    assert!(
+        (length / want - 1.0).abs() < 0.1,
+        "half length {length:.2} of {want:.2}"
+    );
+    assert!(
+        (blurred.energy / sharp.energy - 1.0).abs() < 0.1,
+        "energy changes: {blurred:?}, sharp {sharp:?}"
+    );
+    drop(lamp);
+    device().collect_garbage();
+    assert_clean();
 }
 
 /// `render_view` smears a moving lamp along its motion by the distance the shutter says, in

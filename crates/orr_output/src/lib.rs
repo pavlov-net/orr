@@ -14,6 +14,7 @@ mod gt7;
 mod hooks;
 mod local_exposure;
 mod motion_blur;
+mod overlay_front;
 mod passes;
 #[cfg(all(windows, feature = "pcl-stats"))]
 mod pcl_stats;
@@ -50,6 +51,7 @@ pub use orr_dlss::{
     self, DlssSdk, Mode as DlssMode, Quality as DlssQuality, Support as DlssSupport,
 };
 pub use orr_scene::orr_gpu::{HdrMetadata, LowLatency, OutputFormat, PresentMode};
+pub use overlay_front::OverlayFront;
 pub use passes::{
     CapturePass, ComposePass, ComposeRoot, ComposeSource, ExposurePass, HookInputsPass,
     OutputKernels, OutputRoots, OutputView, SceneCapturePass, TonemapPass,

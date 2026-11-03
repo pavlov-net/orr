@@ -3,7 +3,9 @@
 //! distortion against its analytic map.
 
 use orr_color::srgb_encode;
-use orr_output::{ChainImages, MotionBlurPass, OutputKernels, OutputView, ViewOutput};
+use orr_output::{
+    ChainImages, MotionBlurPass, OutputKernels, OutputView, OverlayFront, ViewOutput,
+};
 use orr_scene::ViewConstants;
 use orr_scene::orr_gpu::{
     Allocation, ComputePipeline, Format, Hazards, MemoryKind, QueueKind, ShaderStage, SpecData,
@@ -23,6 +25,8 @@ const SUBFRAMES: u32 = 64;
 enum Scene {
     Wheel,
     Pan,
+    /// Translucent particles crossing a still background.
+    Particles = 3,
 }
 
 /// One view's chain, depth and motion at `OUT` (render extent equal to output, no jitter),
@@ -41,10 +45,12 @@ struct Blur {
     radiance_store: StorageImageIndex,
     depth_store: StorageImageIndex,
     motion_store: StorageImageIndex,
+    overlay: OverlayFront,
+    overlay_store: [StorageImageIndex; 3],
     chain: ChainImages,
     reference_out: Allocation<f32>,
     frame: u64,
-    _targets: [Texture; 2],
+    _targets: [Texture; 5],
 }
 
 impl Blur {
@@ -60,6 +66,9 @@ impl Blur {
         let linear = texture(Format::Rgba16Float, "display linear");
         let depth = texture(Format::R32Float, "rr depth");
         let motion = texture(Format::Rg16Float, "rr motion");
+        let overlay_depth = texture(Format::R32Float, "overlay depth");
+        let overlay_motion = texture(Format::Rg16Float, "overlay motion");
+        let overlay_weight = texture(Format::R16Float, "overlay weight");
         let view = ViewDesc::default();
         let slot = || gpu.alloc_image_slot().unwrap();
         let chain = ChainImages {
@@ -78,7 +87,15 @@ impl Blur {
         constants.as_mut_slice().unwrap()[0] = c;
         let queue = gpu.queue(QueueKind::Render).unwrap();
         let mut list = queue.command_list().unwrap();
-        for t in [&rr_output, &linear, &depth, &motion] {
+        for t in [
+            &rr_output,
+            &linear,
+            &depth,
+            &motion,
+            &overlay_depth,
+            &overlay_motion,
+            &overlay_weight,
+        ] {
             list.discard(t);
         }
         wait(queue.submit(vec![list], &[]).unwrap());
@@ -94,6 +111,16 @@ impl Blur {
             motion: gpu.write_sampled(slot(), &motion, &view),
             depth_store: gpu.write_storage(slot(), &depth, &view),
             motion_store: gpu.write_storage(slot(), &motion, &view),
+            overlay: OverlayFront {
+                depth: gpu.write_sampled(slot(), &overlay_depth, &view),
+                motion: gpu.write_sampled(slot(), &overlay_motion, &view),
+                weight: gpu.write_sampled(slot(), &overlay_weight, &view),
+            },
+            overlay_store: [
+                gpu.write_storage(slot(), &overlay_depth, &view),
+                gpu.write_storage(slot(), &overlay_motion, &view),
+                gpu.write_storage(slot(), &overlay_weight, &view),
+            ],
             chain,
             reference_out: gpu
                 .gpu_malloc(
@@ -105,7 +132,7 @@ impl Blur {
             frame: 0,
             rr_output,
             linear,
-            _targets: [depth, motion],
+            _targets: [depth, motion, overlay_depth, overlay_motion, overlay_weight],
         }
     }
 
@@ -115,6 +142,9 @@ impl Blur {
             radiance: self.radiance_store,
             depth: self.depth_store,
             motion: self.motion_store,
+            overlay_depth: self.overlay_store[0],
+            overlay_motion: self.overlay_store[1],
+            overlay_weight: self.overlay_store[2],
             width: OUT[0],
             height: OUT[1],
             scene: scene as u32,
@@ -122,6 +152,7 @@ impl Blur {
             shutter: SHUTTER,
             motion_scale,
             time: 0.0,
+            _pad0: 0,
         };
     }
 
@@ -145,6 +176,7 @@ impl Blur {
         let mut p = MotionBlurPass {
             rr_depth: self.depth,
             rr_motion: self.motion,
+            overlay: Some(self.overlay),
             extent: OUT,
             view: self.constants.gpu(),
             shutter: SHUTTER,
@@ -243,6 +275,22 @@ fn camera_pan_matches_shutter_reference() {
     check_scene(Scene::Pan, 0.05);
 }
 
+/// The surface behind holds still; only the front layer's motion can blur the particles.
+#[test]
+fn particles_over_a_still_background_match_shutter_reference() {
+    check_scene(Scene::Particles, 0.05);
+}
+
+/// A front layer no pixel holds changes nothing.
+#[test]
+fn empty_front_layer_equals_no_front_layer() {
+    let mut b = Blur::new();
+    let (with, _) = b.render(Scene::Wheel, 1.0, |_| {});
+    let (without, _) = b.render(Scene::Wheel, 1.0, |p| p.overlay = None);
+    assert!(with == without);
+    assert_clean();
+}
+
 /// At one display rate, frame generation renders 2x or 4x the motion per frame; the streak
 /// per presented frame stays the same.
 #[test]
@@ -277,7 +325,7 @@ fn closed_shutter_and_a_cut_record_nothing() {
 mod depth_of_field {
     use orr_color::srgb_encode;
     use orr_output::{
-        ChainImages, DepthOfFieldPass, DofPath, OutputKernels, OutputView, ViewOutput,
+        ChainImages, DepthOfFieldPass, DofPath, OutputKernels, OutputView, OverlayFront, ViewOutput,
     };
     use orr_scene::orr_gpu::{
         Allocation, ComputePipeline, Format, GpuPtr, Hazards, MemoryKind, QueueKind, ShaderStage,
@@ -285,7 +333,8 @@ mod depth_of_field {
         TextureRegion, TextureUsage, ViewDesc,
     };
     use orr_scene::testing::{
-        FlipError, Image, Pixels, assert_clean, device, flip, read_buffer, read_texture, wait,
+        FlipError, Image, Pixels, assert_clean, device, flip, flip_mean_where, read_buffer,
+        read_texture, wait,
     };
     use orr_scene::{DepthOfField, Focus, Lens, Projection, ViewConstants};
     use output_suite::shaders::dof_scene;
@@ -309,6 +358,8 @@ mod depth_of_field {
         /// A fence in front of the focal plane hiding, in the pinhole image, a warm stripe
         /// behind each bar.
         Fence,
+        /// Nearly opaque particles on the focal plane over a far background.
+        SharpParticles,
     }
 
     fn lens(blades: u32, f_number: f32) -> DepthOfField {
@@ -359,6 +410,11 @@ mod depth_of_field {
         depth_store: StorageImageIndex,
         motion: TextureIndex,
         motion_store: StorageImageIndex,
+        overlay: OverlayFront,
+        overlay_store: [StorageImageIndex; 3],
+        /// The surfaces and front layer lighting would write, read by the pass; else the
+        /// opaque depth alone.
+        layered: bool,
         chain: ChainImages,
         reference_out: Allocation<f32>,
         frame: u64,
@@ -368,8 +424,8 @@ mod depth_of_field {
         background_layer: ComputePipeline,
         holes: bool,
         reset: bool,
-        /// Depth and motion.
-        targets: [Texture; 2],
+        /// Depth, motion and the front layer's depth, motion and weight.
+        targets: [Texture; 5],
     }
 
     impl Bed {
@@ -386,6 +442,9 @@ mod depth_of_field {
             let layer = texture(Format::Rgba16Float, "background layer");
             let depth = texture(Format::R32Float, "rr depth");
             let motion = texture(Format::Rg16Float, "rr motion");
+            let overlay_depth = texture(Format::R32Float, "overlay depth");
+            let overlay_motion = texture(Format::Rg16Float, "overlay motion");
+            let overlay_weight = texture(Format::R16Float, "overlay weight");
             let view = ViewDesc::default();
             let slot = || gpu.alloc_image_slot().unwrap();
             let chain = ChainImages {
@@ -420,7 +479,16 @@ mod depth_of_field {
             constants.as_mut_slice().unwrap()[0] = c;
             let queue = gpu.queue(QueueKind::Render).unwrap();
             let mut list = queue.command_list().unwrap();
-            for t in [&rr_output, &linear, &depth, &motion, &layer] {
+            for t in [
+                &rr_output,
+                &linear,
+                &depth,
+                &motion,
+                &layer,
+                &overlay_depth,
+                &overlay_motion,
+                &overlay_weight,
+            ] {
                 list.discard(t);
             }
             wait(queue.submit(vec![list], &[]).unwrap());
@@ -435,6 +503,17 @@ mod depth_of_field {
                 depth_store: gpu.write_storage(slot(), &depth, &view),
                 motion: gpu.write_sampled(slot(), &motion, &view),
                 motion_store: gpu.write_storage(slot(), &motion, &view),
+                overlay: OverlayFront {
+                    depth: gpu.write_sampled(slot(), &overlay_depth, &view),
+                    motion: gpu.write_sampled(slot(), &overlay_motion, &view),
+                    weight: gpu.write_sampled(slot(), &overlay_weight, &view),
+                },
+                overlay_store: [
+                    gpu.write_storage(slot(), &overlay_depth, &view),
+                    gpu.write_storage(slot(), &overlay_motion, &view),
+                    gpu.write_storage(slot(), &overlay_weight, &view),
+                ],
+                layered: false,
                 chain,
                 reference_out: gpu
                     .gpu_malloc(
@@ -452,7 +531,7 @@ mod depth_of_field {
                 background_layer: pipeline("background_layer", "dof background layer"),
                 holes: false,
                 reset: false,
-                targets: [depth, motion],
+                targets: [depth, motion, overlay_depth, overlay_motion, overlay_weight],
             }
         }
 
@@ -463,6 +542,10 @@ mod depth_of_field {
                 radiance: self.chain.rr_output_store,
                 depth: self.depth_store,
                 motion: self.motion_store,
+                overlay_depth: self.overlay_store[0],
+                overlay_motion: self.overlay_store[1],
+                overlay_weight: self.overlay_store[2],
+                layered: u32::from(self.layered),
                 width: OUT[0],
                 height: OUT[1],
                 scene: scene as u32,
@@ -525,6 +608,7 @@ mod depth_of_field {
             let pass = DepthOfFieldPass {
                 rr_depth: self.depth,
                 rr_motion: self.motion,
+                overlay: self.layered.then_some(self.overlay),
                 extent: OUT,
                 view: self.constants.gpu(),
                 sensor_width_mm: SENSOR_MM,
@@ -565,6 +649,14 @@ mod depth_of_field {
                 &self.rr_output
             };
             (read_rgba16f(image), names, None)
+        }
+
+        /// Whether each pixel holds a translucent layer, as of the last frame.
+        fn overlay_pixels(&self) -> Vec<bool> {
+            read_r16f(&self.targets[4])
+                .iter()
+                .map(|w| *w > 0.0)
+                .collect()
         }
 
         /// The stand-in background layer the last frame traced.
@@ -784,6 +876,50 @@ mod depth_of_field {
     #[test]
     fn water_and_particles_match_lens_reference() {
         check(Scene::Water, lens(0, 1.4), 0.06);
+    }
+
+    /// FLIP over the pixels of a front layer against the reference, and of the same pixels
+    /// blurred at the opaque depth behind them.
+    fn over_the_front_layer(scene: Scene, path: DofPath) -> (f32, f32) {
+        let dof = lens(0, 1.4);
+        let mut behind = Bed::new();
+        let reference = behind.reference(scene, &dof);
+        let (behind, _, _) = behind.render(scene, Some(dof), path);
+        let mut b = Bed::new();
+        b.layered = true;
+        let (layered, _, _) = b.render(scene, Some(dof), path);
+        let mask = b.overlay_pixels();
+        assert!(mask.iter().any(|&m| m) && !mask.iter().all(|&m| m));
+        let measure =
+            |image: &[[f32; 4]]| flip_mean_where(&display(&reference), &display(image), &mask);
+        let (layered, behind) = (measure(&layered), measure(&behind));
+        log::info!(
+            "{scene:?} {path:?}: FLIP over the layer {layered}, at the depth behind {behind}"
+        );
+        (layered, behind)
+    }
+
+    #[test]
+    fn water_and_particles_front_layer_matches_lens_reference() {
+        for path in [DofPath::AfterRr, DofPath::Guide] {
+            let (layered, _) = over_the_front_layer(Scene::Water, path);
+            assert!(layered <= 0.06, "{path:?}: {layered}");
+        }
+        assert_clean();
+    }
+
+    /// Particles on the focal plane stay sharp over a background the lens blurs.
+    #[test]
+    fn particles_in_focus_keep_their_own_depth() {
+        for path in [DofPath::AfterRr, DofPath::Guide] {
+            let (layered, behind) = over_the_front_layer(Scene::SharpParticles, path);
+            assert!(layered <= 0.09, "{path:?}: {layered}");
+            assert!(
+                layered < 0.75 * behind,
+                "{path:?}: {layered} against {behind}"
+            );
+        }
+        assert_clean();
     }
 
     #[test]

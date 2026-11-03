@@ -522,6 +522,9 @@ mod lens_distortion {
                 radiance: self.radiance.storage,
                 depth: self.depth.storage,
                 motion: self.motion.storage,
+                overlay_depth: StorageImageIndex::NONE,
+                overlay_motion: StorageImageIndex::NONE,
+                overlay_weight: StorageImageIndex::NONE,
                 width: OUT[0],
                 height: OUT[1],
                 scene: PAN,
@@ -529,6 +532,7 @@ mod lens_distortion {
                 shutter: 0.0,
                 motion_scale: STEP,
                 time,
+                _pad0: 0,
             };
             let mut c: ViewConstants = bytemuck::Zeroable::zeroed();
             c.exposure = self.exposure.gpu();

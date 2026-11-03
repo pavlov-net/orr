@@ -82,7 +82,7 @@ use orr_output::orr_dlss::{MIN_OUTPUT as DLSS_MIN_OUTPUT, RayReconstruction, RrI
 use orr_output::{
     CapturePass, ChainImages, ComposePass, ComposeRoot, ComposeSource, DisplayFrame, ExposurePass,
     GlarePass, HookInputsPass, HookPoint, Hooks, Image, MotionBlurPass, OutputKernels, OutputView,
-    SceneCapturePass, TonemapPass, UI_PASS,
+    OverlayFront, SceneCapturePass, TonemapPass, UI_PASS,
 };
 use orr_scene::{ArenaRequest, Scenes};
 
@@ -1180,6 +1180,11 @@ impl<'a> Frame<'a> {
             l => *l = Some(LightingView::new(&gpu, arena)?),
         }
         let paths = state.lighting.as_mut().expect("lighting view");
+        // A debug view is not the final image, so it shows no camera effects. A view that stops
+        // after exposure holds none of their images. Depth of field takes this rule too once it
+        // runs here: the reference traces its own lens.
+        let look = lighting.debug_view == LightingDebugView::None;
+        let blurs = tonemapped && look && lighting.reference.is_none();
         let pass = ViewPass {
             frame: id,
             scene: raster.scene,
@@ -1191,7 +1196,7 @@ impl<'a> Frame<'a> {
             seed: 0,
             dof_background: None,
             frosted_glass: false,
-            overlay_front: false,
+            overlay_front: blurs && view.lens.shutter > 0.0,
             walking_materials: raster.walking_materials,
         };
         paths.begin(scene, &desc, lighting);
@@ -1210,19 +1215,31 @@ impl<'a> Frame<'a> {
         if let Some(hook) = hooks.transparency.as_mut() {
             let particles = paths.particle_lighting(id);
             let mut hook = |pass: &mut TransparencyPass<'_, '_>| hook(pass, particles);
-            if reconstructed {
-                overlay = Some(self.scenes.transparency_overlay(&raster, &mut hook)?);
+            overlay = Some(if reconstructed {
+                self.scenes.transparency_overlay(&raster, &mut hook)?
             } else {
                 let store = paths.radiance_storage();
-                self.scenes.transparency(&raster, store, &mut hook)?;
-            }
+                self.scenes.transparency(&raster, store, &mut hook)?
+            });
         }
-        kernels.record_overlay_front(self.scenes.list()?, paths);
+        let list = self.scenes.list()?;
+        if pass.overlay_front {
+            let sampled = overlay.as_ref().map(|(_, sampled)| *sampled);
+            kernels.record_overlay_front(list, paths, sampled);
+            list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
+        }
         if reconstructed || matches!(lighting.debug_view, LightingDebugView::Guide(_)) {
             let list = self.scenes.list()?;
             kernels.record_guides(list, paths, &pass, lighting);
             list.barrier(Stages::COMPUTE, Stages::ALL, Hazards::empty());
         }
+        let overlay_front = paths
+            .overlay_front_indices()
+            .map(|[depth, motion, weight]| OverlayFront {
+                depth,
+                motion,
+                weight,
+            });
         let (list, arena) = self.scenes.output_list_and_arena(view.history)?;
         let (rr_output, rr_output_store) = match state.reconstruction.as_mut() {
             Some(r) => {
@@ -1241,7 +1258,7 @@ impl<'a> Frame<'a> {
                         specular_albedo: paths.specular_albedo(),
                         normal_roughness: paths.normal_roughness(),
                         specular_motion: paths.specular_motion(),
-                        transparency: overlay.as_deref(),
+                        transparency: overlay.as_ref().map(|(texture, _)| &**texture),
                         depth_of_field_guide: None,
                         output: target.texture(),
                         reset: std::mem::take(&mut r.fresh) || paths.history_reset(),
@@ -1281,8 +1298,6 @@ impl<'a> Frame<'a> {
         if let Some(frame) = display.as_mut() {
             frame.frame_generation(&desc, depth, motion, view.not_rendering_scene);
         }
-        // A debug view is not the final image, so it shows no camera effects.
-        let look = lighting.debug_view == LightingDebugView::None;
         let distortion = output.lens_distortion(view.lens.distortion.filter(|_| look));
         let field_on = distortion.is_some() || (output.distortion_field && set.any());
         let mut field = match display.as_mut() {
@@ -1343,15 +1358,13 @@ impl<'a> Frame<'a> {
                 output,
             },
         )?;
-        // A view that stops after exposure holds none of the camera effects' images.
-        // Depth of field takes this rule too once it runs here: the reference traces its own lens.
-        let blurs = tonemapped && look && lighting.reference.is_none();
         kernels.motion_blur(
             list,
             &mut state.output,
             &MotionBlurPass {
                 rr_depth,
                 rr_motion,
+                overlay: overlay_front,
                 extent,
                 view: raster.view,
                 shutter: if blurs { view.lens.shutter } else { 0.0 },

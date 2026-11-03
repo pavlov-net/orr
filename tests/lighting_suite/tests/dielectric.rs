@@ -9,10 +9,10 @@
 use lighting_suite::bed::{
     Accumulated, Analytic, Bed, CLOUD_SPHERE, Capture, DISPERSIVE_SPHERE, EMITTER_LUMINANCE,
     EXTENT, FLOOR, FURNACE_RADIANCE, FrostGuide, GLASS_SPHERE, Item, LIGHT_FLOOR, LINE,
-    LINE_HALF_HEIGHT, LINE_HALF_WIDTH, MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, PRESENCE_VEIL,
-    PRESENCE_VEIL_OPACITY, PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR, Particle, ParticleLook,
-    Paths, ROUGH_SLAB, SLAB_THICKNESS, SMOOTH_FLOOR, SUN, SpareView, Spec, TINTED_SLAB, WATER_BOX,
-    fresnel, prism_corners, water_transmission,
+    LINE_HALF_HEIGHT, LINE_HALF_WIDTH, MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, OverlayFrontLayer,
+    PRESENCE_VEIL, PRESENCE_VEIL_OPACITY, PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR,
+    Particle, ParticleLook, Paths, ROUGH_SLAB, SLAB_THICKNESS, SMOOTH_FLOOR, SUN, SpareView, Spec,
+    TINTED_SLAB, WATER_BOX, fresnel, prism_corners, water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
 use lighting_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
@@ -31,7 +31,8 @@ const NONE: u32 = u32::MAX;
 /// depth and motion of an opaque floor in its plane: over a floor at y = 0, a smooth glass
 /// slab's top or a veil of low coverage is the front layer, a particle above 0.1 coverage is
 /// when it is nearest, and glass in front of a particle keeps it. A particle under the floor
-/// or of low coverage, or a layer that is not there, leaves no front layer.
+/// or of low coverage, or a layer that is not there, leaves no front layer. The layer's weight
+/// is the veil's coverage, the overlay's, and for glass the share of the light it reflects.
 #[test]
 fn the_front_layer_is_the_nearest_overlay_or_see_through_layer() {
     let mut realtime = paths(ViewLighting::default());
@@ -62,7 +63,7 @@ fn the_front_layer_is_the_nearest_overlay_or_see_through_layer() {
         }
         render_paths(&mut bed, &realtime, 1);
         bed.follow(eye, turned, 1, &mut |list, f| realtime.record(list, f));
-        realtime.overlay_front(&bed)
+        realtime.overlay_front(&mut bed)
     };
     // The depth and motion of an opaque floor at height y, as the G-buffer has them.
     let plane = |y: f32| {
@@ -80,7 +81,8 @@ fn the_front_layer_is_the_nearest_overlay_or_see_through_layer() {
     let veil = at(PRESENCE_VEIL, Vec3::new(0.0, 1.0, 0.0));
     let slab_top = 0.5 + SLAB_THICKNESS * 0.5;
 
-    let is_plane = |what: &str, (depth, motion): (Vec<f32>, Vec<[f32; 2]>), y: f32| {
+    let is_plane = |what: &str, front: &OverlayFrontLayer, y: f32| {
+        let (depth, motion) = (&front.depth, &front.motion);
         let (want_depth, want_motion) = plane(y);
         for &i in &pixels {
             assert!(
@@ -97,38 +99,40 @@ fn the_front_layer_is_the_nearest_overlay_or_see_through_layer() {
         }
         assert!(want_motion[pixels[0]][0].abs() > 1e-3, "the camera turned");
     };
-    let is_empty = |what: &str, (depth, motion): (Vec<f32>, Vec<[f32; 2]>)| {
+    let is_empty = |what: &str, front: OverlayFrontLayer| {
         for &i in &pixels {
-            assert_eq!(depth[i], 0.0, "{what}: pixel {i}");
-            assert_eq!(motion[i], [0.0; 2], "{what}: pixel {i}");
+            assert_eq!(front.depth[i], 0.0, "{what}: pixel {i}");
+            assert_eq!(front.motion[i], [0.0; 2], "{what}: pixel {i}");
+            assert_eq!(front.weight[i], 0.0, "{what}: pixel {i}");
+        }
+    };
+    let weighs = |what: &str, front: &OverlayFrontLayer, range: std::ops::Range<f32>| {
+        for &i in &pixels {
+            let w = front.weight[i];
+            assert!(range.contains(&w), "{what}: pixel {i} weight {w}");
         }
     };
 
     is_empty("an opaque floor", front(vec![floor], None));
-    is_plane(
-        "glass with what lies behind dominant",
-        front(vec![floor, slab], None),
-        slab_top,
-    );
-    is_plane(
-        "a veil below half coverage",
-        front(vec![floor, veil], None),
-        1.0,
-    );
-    is_plane(
-        "a particle in the open",
-        front(vec![floor], Some((1.0, 0.5))),
-        1.0,
-    );
-    is_plane(
-        "a particle above glass",
-        front(vec![floor, slab], Some((1.5, 0.5))),
-        1.5,
-    );
-    is_plane(
-        "a particle below glass",
-        front(vec![floor, slab], Some((0.2, 0.5))),
-        slab_top,
+    let glass = front(vec![floor, slab], None);
+    is_plane("glass with what lies behind dominant", &glass, slab_top);
+    weighs("glass", &glass, 0.005..0.5);
+    let opacity = PRESENCE_VEIL_OPACITY;
+    let veiled = front(vec![floor, veil], None);
+    is_plane("a veil below half coverage", &veiled, 1.0);
+    weighs("a veil", &veiled, opacity - 0.005..opacity + 0.005);
+    let open = front(vec![floor], Some((1.0, 0.5)));
+    is_plane("a particle in the open", &open, 1.0);
+    weighs("a particle", &open, 0.495..0.505);
+    let above = front(vec![floor, slab], Some((1.5, 0.5)));
+    is_plane("a particle above glass", &above, 1.5);
+    weighs("a particle above glass", &above, 0.495..0.505);
+    let below = front(vec![floor, slab], Some((0.2, 0.5)));
+    is_plane("a particle below glass", &below, slab_top);
+    weighs(
+        "a particle below glass, which the glass shows",
+        &below,
+        0.005..0.5,
     );
     is_empty(
         "a particle under the floor",

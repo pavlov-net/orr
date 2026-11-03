@@ -316,7 +316,8 @@ struct OverlayFront {
     words: Allocation<u64>,
     depth: OptionalTarget,
     motion: OptionalTarget,
-    root: Allocation<OverlayFrontRoot>,
+    weight: OptionalTarget,
+    roots: Ring<OverlayFrontRoot>,
     frame: u64,
 }
 
@@ -329,39 +330,41 @@ impl OverlayFront {
         )?;
         let depth = OptionalTarget::new(device, Format::R32Float, extent, "overlay depth")?;
         let motion = OptionalTarget::new(device, Format::Rg16Float, extent, "overlay motion")?;
-        let mut root = device.gpu_malloc(MemoryKind::Upload, 1, "overlay front root")?;
-        root.as_mut_slice().expect("mapped")[0] = OverlayFrontRoot {
-            words: words.gpu(),
-            depth: depth.store,
-            motion: motion.store,
-            width: extent[0],
-            height: extent[1],
-            _pad0: 0,
-            _pad1: 0,
-        };
+        let weight = OptionalTarget::new(device, Format::R16Float, extent, "overlay weight")?;
         Ok(Self {
             words,
             depth,
             motion,
-            root,
+            weight,
+            roots: Ring::new(device, "overlay front roots")?,
             frame: 0,
         })
     }
 
     fn dispatch(
-        &self,
+        &mut self,
         list: &mut CommandList<'_>,
         pipeline: &ComputePipeline,
         name: &'static str,
         [w, h]: [u32; 2],
+        overlay: TextureIndex,
     ) {
+        // The frame's clear and resolve share a root: the clear reads nothing the resolve changes.
+        let root = self.roots.write(
+            (self.frame % FRAME_SLOTS as u64) as usize,
+            OverlayFrontRoot {
+                words: self.words.gpu(),
+                depth: self.depth.store,
+                motion: self.motion.store,
+                weight: self.weight.store,
+                overlay,
+                width: w,
+                height: h,
+            },
+        );
         let [gx, gy, _] = pipeline.workgroup();
         list.begin_pass(name, false);
-        list.dispatch(
-            pipeline,
-            self.root.gpu(),
-            [w.div_ceil(gx), h.div_ceil(gy), 1],
-        );
+        list.dispatch(pipeline, root, [w.div_ceil(gx), h.div_ceil(gy), 1]);
         list.end_pass();
     }
 }
@@ -664,18 +667,25 @@ impl LightingView {
         self.overlay_front.as_ref().map(|f| &f.depth.texture)
     }
 
-    pub fn overlay_depth_index(&self) -> Option<TextureIndex> {
-        self.overlay_front.as_ref().map(|f| f.depth.sampled)
-    }
-
     /// RG16F, previous uv minus current uv, unjittered, of [`Self::overlay_depth`]'s layer; 0 on
     /// pixels without one.
     pub fn overlay_motion(&self) -> Option<&Texture> {
         self.overlay_front.as_ref().map(|f| &f.motion.texture)
     }
 
-    pub fn overlay_motion_index(&self) -> Option<TextureIndex> {
-        self.overlay_front.as_ref().map(|f| f.motion.sampled)
+    /// R16F, the share of each pixel that [`Self::overlay_depth`]'s layer takes from the dominant
+    /// layer behind it, from the overlay's coverage and a see-through layer's share of the
+    /// pixel's light; 0 on pixels without one.
+    pub fn overlay_weight(&self) -> Option<&Texture> {
+        self.overlay_front.as_ref().map(|f| &f.weight.texture)
+    }
+
+    /// The sampled views of [`Self::overlay_depth`], [`Self::overlay_motion`] and
+    /// [`Self::overlay_weight`].
+    pub fn overlay_front_indices(&self) -> Option<[TextureIndex; 3]> {
+        self.overlay_front
+            .as_ref()
+            .map(|f| [f.depth.sampled, f.motion.sampled, f.weight.sampled])
     }
 
     /// RG32_UINT: per pixel, the light feedback of the last opaque dispatch (a light's
@@ -1207,6 +1217,7 @@ impl LightingKernels {
                 let front = OverlayFront::new(&view.device, view.extent)?;
                 list.discard(&front.depth.texture);
                 list.discard(&front.motion.texture);
+                list.discard(&front.weight.texture);
                 view.overlay_front = Some(front);
             }
             let front = view.overlay_front.as_mut().expect("made above");
@@ -1216,6 +1227,7 @@ impl LightingKernels {
                 &self.support.overlay_clear,
                 "overlay front clear",
                 view.extent,
+                TextureIndex::NONE,
             );
         }
         let (dof_background, dof_mask, dof_focus, dof_aperture) =
@@ -1464,17 +1476,26 @@ impl LightingKernels {
         list.end_pass();
     }
 
-    /// Resolves `view`'s front layer into [`LightingView::overlay_depth`] and
-    /// [`LightingView::overlay_motion`]. The caller orders it after the frame's dielectric
-    /// dispatch and transparency hook, whose fragments enter the layer through `particle_front`.
-    /// Records nothing without [`ViewPass::overlay_front`]. Orders nothing after it.
-    pub fn record_overlay_front(&self, list: &mut CommandList<'_>, view: &LightingView) {
-        if let Some(front) = &view.overlay_front {
+    /// Resolves `view`'s front layer into [`LightingView::overlay_depth`],
+    /// [`LightingView::overlay_motion`] and [`LightingView::overlay_weight`]. `overlay` is the
+    /// frame's premultiplied overlay, where it drew one. The caller orders it after the frame's
+    /// dielectric dispatch and transparency hook, whose fragments enter the layer through
+    /// `particle_front`, while the overlay still holds its contents. Records nothing without
+    /// [`ViewPass::overlay_front`]. Orders nothing after it.
+    pub fn record_overlay_front(
+        &self,
+        list: &mut CommandList<'_>,
+        view: &mut LightingView,
+        overlay: Option<TextureIndex>,
+    ) {
+        let extent = view.extent;
+        if let Some(front) = &mut view.overlay_front {
             front.dispatch(
                 list,
                 &self.support.overlay_resolve,
                 "overlay front",
-                view.extent,
+                extent,
+                overlay.unwrap_or(TextureIndex::NONE),
             );
         }
     }

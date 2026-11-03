@@ -61,10 +61,10 @@ public struct OverlayFrontRoot
     public uint64_t* words;             // per pixel, in rows of `width`
     public StorageImageIndex depth;     // R32F
     public StorageImageIndex motion;    // RG16F
+    public StorageImageIndex weight;    // R16F
+    public TextureIndex overlay;        // the premultiplied overlay; NONE without one
     public uint width;
     public uint height;
-    public uint _pad0;
-    public uint _pad1;
 }
 
 // The frosted-glass term: on each pixel whose dominant layer is rough transmission, the

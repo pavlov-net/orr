@@ -241,7 +241,7 @@ public void particle_front(ParticleLighting* l, VisibleCluster vc, PrimaryHit hi
     ViewConstants* v = l.view;
     uint2 pixel = min(uint2(p), v.extent - 1);
     float2 motion = visible_motion(l.scene, v, vc, hit, primitive, hit.relative);
-    atomic_max_u64(l.overlay_front + pixel.y * v.extent.x + pixel.x, overlay_front_word(device_depth(v, hit.input.position), motion));
+    atomic_max_u64(l.overlay_front + pixel.y * v.extent.x + pixel.x, overlay_front_word(device_depth(v, hit.input.position), motion, 0.0));
 }
 
 // The stock particle draw's fragment at image point `p` of triangle `primitive` of the view's

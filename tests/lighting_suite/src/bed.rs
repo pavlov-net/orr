@@ -14,8 +14,8 @@ use orr_cook::{
 };
 use orr_gpu::{
     Allocation, CommandList, ComputePipeline, Format, GpuAddress, GpuPtr, Hazards, KernelSet,
-    MemoryKind, Stages, StorageImageIndex, Texture, TextureDesc, TextureMemory, TextureRegion,
-    TextureUsage,
+    MemoryKind, Stages, StorageImageIndex, Texture, TextureDesc, TextureIndex, TextureMemory,
+    TextureRegion, TextureUsage,
 };
 use orr_lighting::{
     BsdfTables, DirectionalLight, DiscProfile, DofBackgroundPass, EnvironmentMapGpu, Light,
@@ -1421,6 +1421,7 @@ pub struct Bed {
     pre_exposure: f32,
     frame: u64,
     last_id: u64,
+    last_overlay: Option<TextureIndex>,
     light_writes: Vec<(LightId, Option<Light>)>,
     proxy_writes: Vec<(MediumProxyId, Option<MediumProxy>)>,
     medium: Option<GpuAddress>,
@@ -1604,6 +1605,7 @@ impl Bed {
             pre_exposure: 1.0,
             frame,
             last_id: 0,
+            last_overlay: None,
             light_writes: Vec::new(),
             proxy_writes: Vec::new(),
             medium: None,
@@ -1935,10 +1937,12 @@ impl Bed {
         if let Some(p) = &self.particles {
             let lighting = self.target.particle_lighting(id);
             let radiance = self.target.radiance_storage();
-            f.transparency(&view, radiance, &mut |pass| {
-                p.draw.record(pass, lighting, p.anisotropy).unwrap();
-            })
-            .unwrap();
+            let (_, overlay) = f
+                .transparency(&view, radiance, &mut |pass| {
+                    p.draw.record(pass, lighting, p.anisotropy).unwrap();
+                })
+                .unwrap();
+            self.last_overlay = Some(overlay);
         }
         let list = f.list().unwrap();
         list.barrier(
@@ -2116,20 +2120,31 @@ impl Paths {
         }
     }
 
-    /// Resolves the front layer of `bed`'s last frame and reads it: depth and motion per pixel,
-    /// in rows of [`EXTENT`] top to bottom.
-    pub fn overlay_front(&self, bed: &Bed) -> (Vec<f32>, Vec<[f32; 2]>) {
+    /// Resolves the front layer of `bed`'s last frame and reads it: depth, motion and weight per
+    /// pixel, in rows of [`EXTENT`] top to bottom.
+    pub fn overlay_front(&self, bed: &mut Bed) -> OverlayFrontLayer {
+        let overlay = bed.last_overlay;
+        let mut list = render().command_list().unwrap();
+        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+        self.kernels
+            .record_overlay_front(&mut list, &mut bed.target, overlay);
         let view = bed.view();
         let depth = view.overlay_depth().expect("the frame kept no front layer");
         let motion = view
             .overlay_motion()
             .expect("the frame kept no front layer");
+        let weight = view
+            .overlay_weight()
+            .expect("the frame kept no front layer");
         let depth_out = crate::readback::<f32>(PIXELS, "overlay depth readback");
         let motion_out = crate::readback::<[u16; 2]>(PIXELS, "overlay motion readback");
-        let mut list = render().command_list().unwrap();
-        list.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-        self.kernels.record_overlay_front(&mut list, view);
+        let weight_out = crate::readback::<u16>(PIXELS, "overlay weight readback");
         list.barrier(Stages::COMPUTE, Stages::TRANSFER, Hazards::empty());
+        list.copy_from_texture(
+            weight_out.gpu().cast(),
+            weight,
+            &TextureRegion::whole_mip(weight.desc(), 0),
+        );
         list.copy_from_texture(
             depth_out.gpu().cast(),
             depth,
@@ -2142,16 +2157,29 @@ impl Paths {
         );
         crate::finish(list);
         let half = |b: u16| half::f16::from_bits(b).to_f32();
-        (
-            depth_out.as_slice().unwrap().to_vec(),
-            motion_out
+        OverlayFrontLayer {
+            depth: depth_out.as_slice().unwrap().to_vec(),
+            motion: motion_out
                 .as_slice()
                 .unwrap()
                 .iter()
                 .map(|m| m.map(half))
                 .collect(),
-        )
+            weight: weight_out
+                .as_slice()
+                .unwrap()
+                .iter()
+                .map(|w| half(*w))
+                .collect(),
+        }
     }
+}
+
+/// A view's front layer per pixel.
+pub struct OverlayFrontLayer {
+    pub depth: Vec<f32>,
+    pub motion: Vec<[f32; 2]>,
+    pub weight: Vec<f32>,
 }
 
 /// A lighting view at [`EXTENT`] besides a bed's own, for kernels that record into a second

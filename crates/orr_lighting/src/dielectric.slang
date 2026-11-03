@@ -1123,7 +1123,7 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
         g.dominant = coverage >= 0.5 ? 1 : 0;
         g.depth = own_depth;
         g.motion = own_motion;
-        front = g.dominant == 0 ? overlay_front_word(own_depth, own_motion) : 0;
+        front = g.dominant == 0 ? overlay_front_word(own_depth, own_motion, coverage) : 0;
         return g;
     }
 
@@ -1198,7 +1198,7 @@ public LayerGuide layer_guides<S : ISurface>(PathRoot r, LayerVertex l, Bsdf b, 
     g.roughness = wr + wt > 0.0 ? (wr * own.roughness + wt * behind.roughness) / (wr + wt) : own.roughness;
     g.weight = 1.0;
     g.dominant = 1;
-    front = wr < wt ? overlay_front_word(own_depth, own_motion) : 0;
+    front = wr < wt ? overlay_front_word(own_depth, own_motion, wr / (wr + wt)) : 0;
     if (wr >= wt)
     {
         g.depth = own_depth;

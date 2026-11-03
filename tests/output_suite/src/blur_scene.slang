@@ -1,7 +1,8 @@
 // Moving test scenes for motion blur, point-sampled at pixel centers: a spinning wheel over a
-// static checkerboard, and a camera pan past a near box with parallax, its textures fine or
-// coarse. `frame` writes the radiance, reverse-Z depth and motion (previous minus current UV,
-// one frame back) at `time`;
+// static checkerboard, a camera pan past a near box with parallax, its textures fine or
+// coarse, and translucent particles crossing a static checkerboard. `frame` writes the radiance,
+// reverse-Z depth and motion (previous minus current UV, one frame back) at `time`, and the
+// particles as the front layer over the surface;
 // `reference` writes the radiance averaged over `subframes` times spread across the open
 // shutter, centered on time 0.
 #include "orr/root.h"
@@ -12,6 +13,7 @@ static const uint PAN = 1;
 // The pan with its textures seven times coarser: the box stripes repeat beyond two steps,
 // so its motion is unambiguous, and they stay well above the pixel pitch through a lens.
 static const uint COARSE_PAN = 2;
+static const uint PARTICLES = 3;
 
 static const float FAR = 0.001;
 static const float NEAR = 0.05;
@@ -22,6 +24,10 @@ struct Root
     StorageImageIndex radiance;
     StorageImageIndex depth;
     StorageImageIndex motion;
+    // NONE: `frame` writes no front layer.
+    StorageImageIndex overlay_depth;
+    StorageImageIndex overlay_motion;
+    StorageImageIndex overlay_weight;
     uint width;
     uint height;
     uint scene;
@@ -31,6 +37,7 @@ struct Root
     float motion_scale;
     // Frames, for `frame`.
     float time;
+    uint _pad0;
 }
 ORR_ROOT(Root);
 
@@ -40,6 +47,10 @@ static const float WHEEL_SPEED = 0.45;
 // Pixels per frame.
 static const float BACKGROUND_SPEED = 8.0;
 static const float BOX_SPEED = 36.0;
+static const float PARTICLE_SPEED = 36.0;
+static const float PARTICLE_SPACING = 48.0;
+static const float PARTICLE_RADIUS = 11.0;
+static const float PARTICLE_OPACITY = 0.95;
 
 struct Sample
 {
@@ -100,10 +111,29 @@ Sample pan(float2 x, float t, float coarse)
     return s;
 }
 
+// The particle coverage at `x` at time `t`: soft discs on a grid moving along +x.
+float particle(float2 x, float t)
+{
+    float2 p = float2(x.x - PARTICLE_SPEED * t, x.y);
+    float2 cell = frac(p / PARTICLE_SPACING) - 0.5;
+    float d = length(cell) * PARTICLE_SPACING / PARTICLE_RADIUS;
+    return PARTICLE_OPACITY * saturate(4.0 * (1.0 - d));
+}
+
 Sample scene(float2 x, float t)
 {
     if (root.scene == WHEEL)
         return wheel(x, t);
+    if (root.scene == PARTICLES)
+    {
+        float a = particle(x, t);
+        Sample s;
+        float3 ground = lerp(float3(0.3, 0.32, 0.35), checker(x), 0.15);
+        s.color = lerp(ground, float3(0.95, 0.75, 0.3), a);
+        s.depth = FAR;
+        s.previous = x;
+        return s;
+    }
     return pan(x, t, root.scene == COARSE_PAN ? 7.0 : 1.0);
 }
 
@@ -119,6 +149,13 @@ void frame(uint3 id: SV_DispatchThreadID)
     root.radiance.get<RWTexture2D<float4>>()[id.xy] = float4(s.color, 1.0);
     root.depth.get<RWTexture2D<float>>()[id.xy] = s.depth;
     root.motion.get<RWTexture2D<float2>>()[id.xy] = root.motion_scale * (s.previous - x) / extent;
+    if (root.overlay_weight.index == IMAGE_NONE)
+        return;
+    float a = root.scene == PARTICLES ? particle(x, root.time) : 0.0;
+    bool front = a > 0.1;
+    root.overlay_depth.get<RWTexture2D<float>>()[id.xy] = front ? NEAR : 0.0;
+    root.overlay_motion.get<RWTexture2D<float2>>()[id.xy] = front ? root.motion_scale * float2(-PARTICLE_SPEED, 0.0) / extent : 0.0;
+    root.overlay_weight.get<RWTexture2D<float>>()[id.xy] = front ? a : 0.0;
 }
 
 [shader("compute")]
