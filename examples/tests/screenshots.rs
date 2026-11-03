@@ -49,11 +49,12 @@ use orr::orr_gpu::{QueueKind, Texture, TextureDesc, TextureMemory, TextureUsage,
 use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    Affine3, DlssMode, DlssQuality, Exposure, FrameDesc, GroupWriter, HookPass, InstanceFlags,
-    InstancesDesc, Lens, LitView, OutputDebug, PackSource, PathEntry, Projection, Reconstruction,
-    ReferenceSettings, Renderer, RendererDesc, SceneDesc, SceneId, Screenshot, ScreenshotRequest,
-    TextureFilter, ThinLens, TransformGroupDesc, TransformGroupId, TransparencyPass, ViewHistoryId,
-    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    Affine3, DlssMode, DlssQuality, Exposure, FrameDesc, Glare, GroupWriter, HookPass,
+    InstanceFlags, InstancesDesc, Lens, LightingDebugView, LitView, OutputDebug, PackSource,
+    PathEntry, Projection, Reconstruction, ReferenceSettings, Renderer, RendererDesc, SceneDesc,
+    SceneId, Screenshot, ScreenshotRequest, TextureFilter, ThinLens, TransformGroupDesc,
+    TransformGroupId, TransparencyPass, ViewHistoryId, ViewHooks, ViewLighting, ViewOutput,
+    ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source};
 use orr_math::camera::rh::view;
@@ -733,6 +734,8 @@ struct LampSettings {
     /// Sets hooks that draw nothing.
     hooks: bool,
     reconstruction: Reconstruction,
+    glare: bool,
+    debug_view: LightingDebugView,
 }
 
 impl LampSettings {
@@ -938,7 +941,7 @@ impl Lamp {
                         },
                         lens: Lens {
                             shutter: settings.shutter,
-                            glare: None,
+                            glare: settings.glare.then_some(Glare { strength: 1.0 }),
                             ..Lens::default()
                         },
                         reset_history: i == 0 || (settings.cut && final_frame),
@@ -947,6 +950,7 @@ impl Lamp {
                     },
                     &ViewLighting {
                         reference: settings.reference.then(ReferenceSettings::default),
+                        debug_view: settings.debug_view,
                         ..ViewLighting::default()
                     },
                     &ViewOutput {
@@ -1034,7 +1038,8 @@ fn check_blur_under_ray_reconstruction(lamp: &mut Lamp, moving: LampSettings) {
 
 /// `render_view` smears a moving lamp along its motion by the distance the shutter says, in
 /// output pixels at any render extent, leaves still views alone to the byte, and shows no blur
-/// where motion vectors or the view's purpose rule it out.
+/// where motion vectors or the view's purpose rule it out. The reference keeps its glare, and a
+/// debug view shows neither.
 #[test]
 fn render_view_blurs_what_moves_while_the_shutter_is_open() {
     let _serial = serial();
@@ -1049,10 +1054,12 @@ fn render_view_blurs_what_moves_while_the_shutter_is_open() {
         reference: false,
         hooks: false,
         reconstruction: Reconstruction::Off,
+        glare: false,
+        debug_view: LightingDebugView::None,
     };
     let sharp = lamp.run(extent, frames, moving.closed());
-    let lit = sharp.chunks_exact(4).filter(|p| p[1] > 0.0).count();
-    assert_eq!(lit, 8 * 8, "a sharp lamp is its near face");
+    let lit = |image: &[f32]| image.chunks_exact(4).filter(|p| p[1] > 0.0).count();
+    assert_eq!(lit(&sharp), 8 * 8, "a sharp lamp is its near face");
 
     // Without ray reconstruction the images repeat exactly.
     let tolerance = 0.04;
@@ -1111,6 +1118,38 @@ fn render_view_blurs_what_moves_while_the_shutter_is_open() {
     );
 
     check_blur_under_ray_reconstruction(&mut lamp, moving);
+
+    let glared = LampSettings {
+        glare: true,
+        ..moving.closed()
+    };
+    let spread = lit(&lamp.run(extent, frames, glared));
+    assert!(spread > lit(&sharp), "glare leaves {spread} pixels lit");
+    let reference_plain = reference.closed();
+    let reference_glared = LampSettings {
+        glare: true,
+        ..reference_plain
+    };
+    let plain = lit(&lamp.run(extent, frames, reference_plain));
+    let spread = lit(&lamp.run(extent, frames, reference_glared));
+    assert!(
+        spread > plain,
+        "the reference's glare leaves {spread} pixels lit of {plain}"
+    );
+    let debug_view = LampSettings {
+        debug_view: LightingDebugView::DirectOnly,
+        ..moving.closed()
+    };
+    let lensed = LampSettings {
+        shutter: moving.shutter,
+        glare: true,
+        ..debug_view
+    };
+    assert!(
+        lamp.run(extent, frames, lensed) == lamp.run(extent, frames, debug_view),
+        "a debug view shows the lens"
+    );
+
     drop(lamp);
     device().collect_garbage();
     assert_clean();
