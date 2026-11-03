@@ -116,10 +116,8 @@ pub(crate) struct PipelineCache {
     misses: AtomicU32,
     /// Held while saving; the misses counted when the file was last written.
     saved: Mutex<u32>,
-    /// The keys of the pipelines being compiled now: a thread asking for the same key waits, then
-    /// gets the pipeline from the driver's or this cache without compiling. The key is the stages
-    /// and creation flags, so pipelines that differ only in other state wait for each other and
-    /// then each compile.
+    /// The keys of the pipelines being compiled now: a thread asking for one of them waits, then
+    /// gets the pipeline from the driver's or this cache without compiling.
     compiling: Mutex<HashSet<blake3::Hash>>,
     compiled: Condvar,
 }
@@ -258,24 +256,32 @@ impl PipelineCache {
 }
 
 impl Shared {
-    /// Creates a pipeline through the cache with `extra` creation flags, one at a time per set
-    /// of `stages` and flags. `create` builds the create info with `next` as its `p_next` (creation flags,
-    /// then creation feedback) and calls the create function with `cache`.
+    /// Creates a pipeline through the cache with `extra` creation flags, compiling it once when
+    /// several threads ask for it. `stages` and `state`, whatever else the create info depends on,
+    /// tell pipelines apart. `create` builds the create info with `next` as its `p_next` (creation
+    /// flags, then creation feedback) and calls the create function with `cache`.
     pub(super) fn create_pipeline(
         &self,
         stages: &[&StageParts<'_>],
+        state: &[u8],
         extra: vk::PipelineCreateFlags2,
         name: &str,
         call: &'static str,
         create: impl FnOnce(vk::PipelineCache, *const c_void) -> Result<vk::Pipeline, vk::Result>,
     ) -> Result<vk::Pipeline, Error> {
         let cache = &self.pipeline_cache;
-        let mut key = blake3::Hasher::new();
-        for s in stages {
-            s.key(&mut key);
-        }
-        key.update(&extra.as_raw().to_le_bytes());
-        let guard = cache.begin_compile(key.finalize());
+        // A request for cached pipelines only compiles nothing, so nothing waits for it.
+        let guard = if extra.contains(vk::PipelineCreateFlags2::FAIL_ON_PIPELINE_COMPILE_REQUIRED) {
+            None
+        } else {
+            let mut key = blake3::Hasher::new();
+            for s in stages {
+                s.key(&mut key);
+            }
+            key.update(state);
+            key.update(&extra.as_raw().to_le_bytes());
+            Some(cache.begin_compile(key.finalize()))
+        };
         let start = Instant::now();
         let mut feedback = vk::PipelineCreationFeedback::default();
         let mut feedback_info = vk::PipelineCreationFeedbackCreateInfo::default()
