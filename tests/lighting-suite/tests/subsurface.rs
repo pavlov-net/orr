@@ -1,15 +1,18 @@
 //! The subsurface walk against openpbr-ref's CPU walk: in analytic slabs through
 //! `walk_probe.slang` (the walk alone, its cap tail and its numerics), and through the opaque
-//! path on the bed's slabs and spheres (entry, exit and geometry).
+//! path on the bed's slabs and spheres (entry, exit and geometry), and the dielectric dispatch
+//! on spheres with dense scattering interiors.
 
 use lighting_suite::bed::{
-    Accumulated, Bed, EXTENT, FURNACE_RADIANCE, Item, Paths, Spec, WALK_FURNACE, WALK_SLABS,
-    WALK_SPHERE, look,
+    Accumulated, Bed, DenseInterior, EXTENT, FURNACE_RADIANCE, Item, JADE, JADE_SPHERE, MILK,
+    MILK_SPHERE, Paths, Spec, WALK_FURNACE, WALK_SLABS, WALK_SPHERE, look,
 };
 use lighting_suite::shaders::walk_probe;
 use lighting_suite::{assert_clean, device, pipeline, readback, render, run, upload};
 use openpbr_ref::Inputs;
-use openpbr_ref::walk::{Interface, Light as CpuLight, Medium, Shape, Walks, top_exit};
+use openpbr_ref::walk::{
+    DielectricWalks, Interface, Light as CpuLight, Medium, Shape, Walks, top_exit,
+};
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::{
     CapTailTable, DirectionalLight, DiscProfile, Light, LightingDebugView, PathEntry,
@@ -390,6 +393,103 @@ fn a_lit_sphere_matches_the_cpu_walk(paths: &Paths) {
     });
     let e = relative(gpu, cpu);
     assert!(e < 0.02, "sphere: GPU {gpu:?}, CPU {cpu:?} ({e:.4})");
+}
+
+fn cpu_dielectric(interior: &DenseInterior, radius: f32) -> DielectricWalks {
+    let (extinction, albedo) = interior.rec2020();
+    DielectricWalks {
+        shape: Shape::Sphere {
+            radius: f64::from(radius),
+        },
+        medium: Medium {
+            extinction,
+            albedo,
+            anisotropy: f64::from(interior.anisotropy),
+            surface_ior: f64::from(interior.ior),
+        },
+    }
+}
+
+/// The light leaving through the walks of `interior`'s sphere `model` scaled to `radius`, in a
+/// uniform environment and under a sun, within `tolerance` of the CPU walk.
+fn interior_matches_the_cpu_walk(
+    paths: &Paths,
+    model: &'static str,
+    interior: &DenseInterior,
+    radius: f32,
+    tolerance: f64,
+) {
+    let (eye, target, fov_y) = (Vec3::new(0.0, 1.2, 4.0) * radius, Vec3::ZERO, 0.6);
+    let pixels = sphere_pixels(eye, target, fov_y, radius);
+    let cpu = cpu_dielectric(interior, radius);
+    let cases = [
+        (
+            "uniform light",
+            Vec::new(),
+            Some(FURNACE_RADIANCE),
+            CpuLight::Uniform {
+                radiance: DVec3::from(FURNACE_RADIANCE.map(f64::from)),
+            },
+        ),
+        ("a sun", vec![Light::Directional(sun())], None, cpu_sun()),
+    ];
+    for (what, lights, environment, light) in cases {
+        let spec = Spec {
+            copies: vec![Item {
+                model,
+                linear: Mat3::from_diagonal(Vec3::splat(radius)),
+                at: Vec3::ZERO,
+            }],
+            lights,
+            environment,
+            eye,
+            target,
+            fov_y,
+            focus: None,
+        };
+        let image = render_spec(paths, spec, 128);
+        let gpu = mean_rgb(&image, pixels.iter().map(|p| p.0));
+        let want = cpu.mean(2_000_000, light, 19, |rng| {
+            let (_, p, n, v) = pixels[(rng.f64() * pixels.len() as f64) as usize];
+            (p, n, v)
+        });
+        let e = relative(gpu, want);
+        assert!(
+            e < tolerance,
+            "{model} under {what}: GPU {gpu:?}, CPU {want:?} ({e:.4})"
+        );
+    }
+}
+
+#[test]
+fn dense_interiors_walk_as_the_cpu_walk_does() {
+    let mut paths = Paths::new(
+        &KernelSet::default(),
+        PathEntry::Compute,
+        settings(LightingDebugView::Subsurface),
+    );
+    paths.settings.max_bounces = 2;
+    interior_matches_the_cpu_walk(&paths, MILK_SPHERE, &MILK, 1.0, 0.02);
+    interior_matches_the_cpu_walk(&paths, JADE_SPHERE, &JADE, 1.0, 0.02);
+    assert_clean();
+}
+
+/// A walk stopped at the default step cap leaves at its entry with the cap tail's share of what
+/// it would yet carry out through the Fresnel surface. The tail is that of a half space entered
+/// from every angle of view, which this sphere, many diffusion lengths in radius, stays within
+/// 12% of; without it the milk sphere is a third darker.
+#[test]
+fn capped_interior_walks_keep_the_cap_tail() {
+    let mut paths = Paths::new(
+        &KernelSet::default(),
+        PathEntry::Compute,
+        settings(LightingDebugView::Subsurface),
+    );
+    paths.settings.max_bounces = 2;
+    paths.settings.sss_max_steps = 16;
+    interior_matches_the_cpu_walk(&paths, MILK_SPHERE, &MILK, 4.0, 0.12);
+    interior_matches_the_cpu_walk(&paths, JADE_SPHERE, &JADE, 4.0, 0.12);
+    assert_clean();
 }
 
 /// With the default cap, so the cap tail takes part.

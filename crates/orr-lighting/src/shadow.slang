@@ -50,6 +50,11 @@ public struct InteriorMedium
     public float3 sigma_t;          // 1/m
     public float3 sigma_s;
     public float anisotropy;
+
+    public float3 albedo()
+    {
+        return select(sigma_t > 0.0, sigma_s / sigma_t, float3(0.0));
+    }
 }
 
 public InteriorMedium interior_medium(SceneRoot* s, uint m)

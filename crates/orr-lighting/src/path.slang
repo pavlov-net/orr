@@ -426,9 +426,10 @@ public SceneShadow<S, M> scene_shadow<S : ISurface, M : IMedium>(PathRoot r)
 // `f`, with local sampler `local` (null for none): `candidates` draws from the light set's
 // mixture resampled by unshadowed luminance, one shadow ray through `shadow` for the
 // winner, weighted against BSDF sampling unless `weight_one`. `light` is the winner's
-// feedback id, NO_LIGHT for a directional winner or none. Draws four sampler dimensions per
-// candidate and counts the ray in `rays`.
-public float3 shade_vertex_nee<F : IScatter, V : IShadow>(PathRoot r, PathVertex x, F f, V shadow, float run, uint2 pixel, LocalLights* local, uint depth, uint candidates, bool weight_one, inout Sampler rng, inout uint rays, out uint light)
+// feedback id, NO_LIGHT for a directional winner or none. With `no_environment` the
+// environment's candidates count for nothing. Draws four sampler dimensions per candidate and
+// counts the ray in `rays`.
+public float3 shade_vertex_nee<F : IScatter, V : IShadow>(PathRoot r, PathVertex x, F f, V shadow, float run, uint2 pixel, LocalLights* local, uint depth, uint candidates, bool weight_one, inout Sampler rng, inout uint rays, out uint light, bool no_environment = false)
 {
     LightSetGpu* set = r.set;
     light = NO_LIGHT;
@@ -441,7 +442,7 @@ public float3 shade_vertex_nee<F : IScatter, V : IShadow>(PathRoot r, PathVertex
     {
         ResolvedLightSample c = nee_candidate(set, v, rng);
         float u = rng.next();
-        if (!(c.pdf > 0.0))
+        if (!(c.pdf > 0.0) || (no_environment && c.kind == LIGHT_SAMPLE_ENVIRONMENT))
             continue;
         float3 fc = f.eval(c.dir);
         float target = luminance_rec2020(fc * c.radiance);
@@ -519,10 +520,20 @@ public struct WalkTrace<S : ISurface> : IWalkTrace
         return trace_closest(scene.tlas, path_ray(origin, dir, t_max), MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
     }
 
-    public bool own(Hit h)
+    public WalkMeet meet(Hit h, float3 origin, float3 dir, float3 positions[3], inout Sampler rng)
     {
-        return on_instance(scene, h, instance);
+        return WalkMeet(on_instance(scene, h, instance) ? WALK_BOUNDARY : WALK_NONE);
     }
+}
+
+// A sampler of a walk's own, keyed on one dimension of `rng`.
+public Sampler walk_sampler(inout Sampler rng)
+{
+    Sampler walk = rng;
+    walk.seed = pcg(hash_combine(rng.seed, rng.dimension) ^ WALK_STREAM);
+    walk.dimension = 0;
+    rng.next();
+    return walk;
 }
 
 // A walk's exit: Lambert reflection on the exit's shading normal `n`, times the share of
@@ -562,11 +573,8 @@ public WalkExit walk_from<S : ISurface>(PathRoot r, PathVertex x, BsdfParams p, 
     float3 origin = g.position - g.geometric_normal * max(error, magnitude * F32_PRECISION);
     RayCone cone = { 0.0, 0.0 };
     WalkTrace<S> tracer = { r.scene, r.view, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0), g.instance };
-    Sampler walk = rng;
-    walk.seed = pcg(hash_combine(rng.seed, rng.dimension) ^ WALK_STREAM);
-    walk.dimension = 0;
-    rng.next();
-    return walk_subsurface(tracer, origin, wi, bsdf_subsurface_volume(p), r.cap_tail, r.sss_max_steps, walk, rays);
+    Sampler walk = walk_sampler(rng);
+    return walk_subsurface(tracer, origin, wi, bsdf_subsurface_volume(p), r.cap_tail, r.sss_max_steps, 1.0, walk, rays);
 }
 
 // The exit vertex of a walk whose last step along `dir` reached `sh`: its normals face out.

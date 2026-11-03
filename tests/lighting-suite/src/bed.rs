@@ -7,6 +7,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+pub use openpbr_ref::walk::fresnel;
 use orr_cook::{
     ArchiveSpec, AssetSpec, GridInput, GridVoxels, LodMode, Manifest, MeshInput, MeshSettings,
     Source, TextureSettings, Usage, VolumeGrids, VolumeInput, VolumeSettings,
@@ -397,17 +398,61 @@ pub fn water_transmission() -> [f64; 3] {
     (m * DVec3::from(color)).to_array()
 }
 
-/// Unpolarized Fresnel reflectance into a medium `eta` times denser at incidence cosine `c`.
-pub fn fresnel(eta: f64, c: f64) -> f64 {
-    let s2 = (1.0 - c * c) / (eta * eta);
-    if s2 >= 1.0 {
-        return 1.0;
-    }
-    let t = (1.0 - s2).sqrt();
-    let rs = (c - eta * t) / (c + eta * t);
-    let rp = (t - eta * c) / (t + eta * c);
-    0.5 * (rs * rs + rp * rp)
+/// A smooth dielectric's dense scattering interior, per m in Rec.709.
+#[derive(Clone, Copy, Debug)]
+pub struct DenseInterior {
+    pub sigma_t: [f32; 3],
+    pub sigma_s: [f32; 3],
+    pub anisotropy: f32,
+    pub ior: f32,
+    /// The material's `transmission_depth`, m.
+    pub depth: f32,
 }
+
+impl DenseInterior {
+    fn material(&self, glass: Material) -> Material {
+        Material {
+            transmission_color: self.sigma_t.map(|s| (-s * self.depth).exp()),
+            transmission_depth: self.depth,
+            transmission_scatter: self.sigma_s.map(|s| s * self.depth),
+            transmission_scatter_anisotropy: self.anisotropy,
+            specular_ior: self.ior,
+            ..glass
+        }
+    }
+
+    /// Extinction and single-scattering albedo in linear Rec.2020, as the cook converts the
+    /// material's colors.
+    pub fn rec2020(&self) -> (DVec3, DVec3) {
+        let m = orr_color::RgbPrimaries::REC709.matrix_to(orr_color::RgbPrimaries::REC2020);
+        let d = f64::from(self.depth);
+        let color = DVec3::from(self.sigma_t.map(|s| (f64::from(-s) * d).exp()));
+        let scatter = DVec3::from(self.sigma_s.map(|s| f64::from(s) * d));
+        let extinction = DVec3::from((m * color).to_array().map(|c| -c.ln() / d));
+        (extinction, (m * scatter) / d / extinction)
+    }
+}
+
+/// A smooth sphere of radius 1 m holding [`MILK`].
+pub const MILK_SPHERE: &str = "milk sphere";
+/// Bright and forward-scattering, about 40 mean free paths to the radius.
+pub const MILK: DenseInterior = DenseInterior {
+    sigma_t: [40.0, 42.0, 45.0],
+    sigma_s: [39.8, 41.7, 44.0],
+    anisotropy: 0.7,
+    ior: 1.35,
+    depth: 0.02,
+};
+/// A smooth sphere of radius 1 m holding [`JADE`].
+pub const JADE_SPHERE: &str = "jade sphere";
+/// Green, absorbing and nearly isotropic, a few mean free paths to the radius.
+pub const JADE: DenseInterior = DenseInterior {
+    sigma_t: [8.0, 4.0, 6.0],
+    sigma_s: [5.0, 3.8, 4.5],
+    anisotropy: 0.3,
+    ior: 1.6,
+    depth: 0.25,
+};
 /// A black 2 m square facing +y with opacity [`PRESENCE_VEIL_OPACITY`], blended: a presence layer.
 pub const PRESENCE_VEIL: &str = "presence veil";
 pub const PRESENCE_VEIL_OPACITY: f32 = 0.25;
@@ -1006,6 +1051,16 @@ fn cook() -> Arc<[u8]> {
                     vec![milk],
                 ),
                 model(CLOUD_SPHERE, mesh(|b| b.sphere(0, 32, 1.0)), vec![cloud]),
+                model(
+                    MILK_SPHERE,
+                    mesh(|b| b.sphere(0, 48, 1.0)),
+                    vec![MILK.material(glass)],
+                ),
+                model(
+                    JADE_SPHERE,
+                    mesh(|b| b.sphere(0, 48, 1.0)),
+                    vec![JADE.material(glass)],
+                ),
                 model(
                     WATER_BOX,
                     mesh(|b| b.cuboid(0, Vec3::new(3.0, 2.0, 3.0))),

@@ -47,14 +47,18 @@ fn cap_tail_table(path: &Path) {
         "{stamp}pub(crate) const CAP_TAIL_CAPS: [u32; {}] = [{caps}];\n\
          pub(crate) const CAP_TAIL_ALBEDOS: u32 = {};\n\
          pub(crate) const CAP_TAIL_ANISOTROPIES: u32 = {};\n\
-         pub(crate) const CAP_TAIL_G_MAX: f32 = {:?};\n",
+         pub(crate) const CAP_TAIL_G_MAX: f32 = {:?};\n\
+         pub(crate) const CAP_TAIL_IORS: u32 = {};\n\
+         pub(crate) const CAP_TAIL_IOR_SHARE_MAX: f32 = {:?};\n",
         cap_tail::CAPS.len(),
         cap_tail::ALBEDOS,
         cap_tail::ANISOTROPIES,
         cap_tail::G_MAX as f32,
+        cap_tail::IORS,
+        cap_tail::IOR_SHARE_MAX as f32,
     );
     let table = cap_tail::table();
-    writeln!(s, "pub(crate) const CAP_TAIL: [f32; {}] = [", table.len()).unwrap();
+    writeln!(s, "pub(crate) static CAP_TAIL: [f32; {}] = [", table.len()).unwrap();
     for v in table {
         writeln!(s, "    {v:?},").unwrap();
     }

@@ -68,6 +68,9 @@ pub struct Medium {
     pub extinction: DVec3,
     pub albedo: DVec3,
     pub anisotropy: f64,
+    /// The surface's IOR against the outside's. Above 1 it reflects walks back by Fresnel, each
+    /// reflection one step; at 1 they leave at the first boundary they reach.
+    pub surface_ior: f64,
 }
 
 impl Medium {
@@ -80,6 +83,7 @@ impl Medium {
             extinction: DVec3::from_array(v.extinction.map(f64::from)),
             albedo: DVec3::from_array(v.albedo.map(f64::from)),
             anisotropy: f64::from(v.anisotropy),
+            surface_ior: 1.0,
         }
     }
 }
@@ -98,8 +102,24 @@ fn sample_hg(w: DVec3, g: f64, rng: &mut Rng) -> DVec3 {
     to_world(DVec3::new(sine * phi.cos(), sine * phi.sin(), c), w).normalize()
 }
 
-/// Where channel `c`'s walk from `p` along unit `w` inside `shape` reaches the boundary: the
-/// outward normal there and the throughput. `None` when the walk is absorbed, or still
+/// The mean of `count` estimates over threads, each thread holding state from `make`.
+fn mean_of<S>(
+    count: usize,
+    seed: u64,
+    make: &(impl Fn() -> S + Sync),
+    estimate: impl Fn(&mut S, &mut Rng) -> DVec3 + Sync,
+) -> DVec3 {
+    let chunks = 256;
+    let per = count.div_ceil(chunks);
+    let sums = in_parallel(chunks, make, |state, i| {
+        let mut rng = rng(seed, i as u64);
+        (0..per).map(|_| estimate(state, &mut rng)).sum::<DVec3>()
+    });
+    sums.into_iter().sum::<DVec3>() / (per * chunks) as f64
+}
+
+/// Where channel `c`'s walk from `p` along unit `w` inside `shape` leaves through the boundary:
+/// the outward normal there and the throughput. `None` when the walk is absorbed, or still
 /// inside after `max_steps` steps.
 pub fn walk_channel(
     shape: Shape,
@@ -116,7 +136,14 @@ pub fn walk_channel(
         let t = -(1.0 - rng.f64()).ln() / sigma;
         let (tb, nb) = shape.exit(p, w);
         if t >= tb {
-            return Some((nb, throughput));
+            let cosine = w.dot(nb);
+            let ior = medium.surface_ior;
+            if ior == 1.0 || rng.f64() >= fresnel(1.0 / ior, cosine) {
+                return Some((nb, throughput));
+            }
+            p += w * tb;
+            w = (w - nb * (2.0 * cosine)).normalize();
+            continue;
         }
         p += w * t;
         throughput *= albedo;
@@ -279,18 +306,10 @@ impl<'a> Walks<'a> {
         seed: u64,
         point: impl Fn(&mut Rng) -> (DVec3, DVec3, DVec3) + Sync,
     ) -> DVec3 {
-        let chunks = 256;
-        let per = count.div_ceil(chunks);
-        let sums = in_parallel(chunks, &Reference::new, |bsdf, i| {
-            let mut rng = rng(seed, i as u64);
-            let mut sum = DVec3::ZERO;
-            for _ in 0..per {
-                let (p, n, v) = point(&mut rng);
-                sum += self.radiance(bsdf, p, n, v, light, &mut rng);
-            }
-            sum
-        });
-        sums.into_iter().sum::<DVec3>() / (per * chunks) as f64
+        mean_of(count, seed, &Reference::new, |bsdf, rng| {
+            let (p, n, v) = point(rng);
+            self.radiance(bsdf, p, n, v, light, rng)
+        })
     }
 }
 
@@ -304,25 +323,103 @@ pub fn top_exit(
     max_steps: u32,
     seed: u64,
 ) -> DVec3 {
-    let chunks = 256;
-    let per = walks.div_ceil(chunks);
     let shape = Shape::Slab { thickness };
-    let sums = in_parallel(chunks, &|| (), |_, i| {
-        let mut rng = rng(seed, i as u64);
+    mean_of(walks, seed, &|| (), |_, rng| {
         let mut sum = DVec3::ZERO;
-        for _ in 0..per {
-            for c in 0..3 {
-                if let Some((n, t)) =
-                    walk_channel(shape, medium, c, DVec3::ZERO, dir, max_steps, &mut rng)
-                    && n.z > 0.0
-                {
-                    sum[c] += t;
-                }
+        for c in 0..3 {
+            if let Some((n, t)) = walk_channel(shape, medium, c, DVec3::ZERO, dir, max_steps, rng)
+                && n.z > 0.0
+            {
+                sum[c] += t;
             }
         }
         sum
-    });
-    sums.into_iter().sum::<DVec3>() / (per * chunks) as f64
+    })
+}
+
+/// Fresnel reflectance of a smooth interface at incidence cosine `c`, where the far side's IOR
+/// is `eta` times the near side's.
+pub fn fresnel(eta: f64, c: f64) -> f64 {
+    let s2 = (1.0 - c * c) / (eta * eta);
+    if s2 >= 1.0 {
+        return 1.0;
+    }
+    let t = (1.0 - s2).sqrt();
+    let rs = (c - eta * t) / (c + eta * t);
+    let rp = (t - eta * c) / (t + eta * c);
+    0.5 * (rs * rs + rp * rp)
+}
+
+/// The interior of a smooth dielectric holding `medium`, in air, with the real-time walk's rules:
+/// the camera's ray refracts in, the walk reflects back or refracts out of the surface by Fresnel,
+/// its way out sees uniform light as it is, and a sun as Lambert reflection on the outward normal
+/// times the Fresnel transmission from the sun over that transmission's cosine-weighted mean.
+pub struct DielectricWalks {
+    pub shape: Shape,
+    pub medium: Medium,
+}
+
+impl DielectricWalks {
+    /// One estimate, one walk per channel, of the radiance toward `view` at boundary point
+    /// `p0` with outward normal `n0` that crosses the surface from inside.
+    pub fn radiance(
+        &self,
+        p0: DVec3,
+        n0: DVec3,
+        view: DVec3,
+        light: Light,
+        rng: &mut Rng,
+    ) -> DVec3 {
+        let c0 = n0.dot(view);
+        let ior = self.medium.surface_ior;
+        let eta = 1.0 / ior;
+        let cos_t = (1.0 - eta * eta * (1.0 - c0 * c0)).sqrt();
+        let entry = (-view * eta + n0 * (eta * c0 - cos_t)).normalize();
+        let weight = 1.0 - fresnel(ior, c0);
+        let mean = (0..16)
+            .map(|i| 1.0 - fresnel(ior, ((f64::from(i) + 0.5) / 16.0).sqrt()))
+            .sum::<f64>()
+            / 16.0;
+        let mut out = DVec3::ZERO;
+        for c in 0..3 {
+            let Some((n, throughput)) =
+                walk_channel(self.shape, &self.medium, c, p0, entry, u32::MAX, rng)
+            else {
+                continue;
+            };
+            let exit = match light {
+                Light::Sun {
+                    direction,
+                    illuminance,
+                } => {
+                    let cos = n.dot(direction);
+                    if cos > 0.0 {
+                        (1.0 - fresnel(ior, cos)) / mean * cos / PI * illuminance[c]
+                    } else {
+                        0.0
+                    }
+                }
+                Light::Uniform { radiance } => radiance[c],
+            };
+            out[c] = weight * throughput * exit;
+        }
+        out
+    }
+
+    /// The mean of [`Self::radiance`] over `count` estimates, each at a boundary point, its
+    /// outward normal and the view there from `point`.
+    pub fn mean(
+        &self,
+        count: usize,
+        light: Light,
+        seed: u64,
+        point: impl Fn(&mut Rng) -> (DVec3, DVec3, DVec3) + Sync,
+    ) -> DVec3 {
+        mean_of(count, seed, &|| (), |_, rng| {
+            let (p, n, v) = point(rng);
+            self.radiance(p, n, v, light, rng)
+        })
+    }
 }
 
 /// A cosine-distributed direction about +z.
