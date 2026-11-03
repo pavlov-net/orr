@@ -319,6 +319,9 @@ pub struct ExposurePass<'a> {
     /// The scene's sky statistics, for multi-reference metering and telemetry; null without
     /// a scene.
     pub sky: GpuPtr<SkyStats>,
+    /// A camera cut: auto exposure snaps to the target and resets its long-term stage, and auto
+    /// white balance snaps to its target.
+    pub camera_cut: bool,
     /// orr's frame id, which the telemetry carries.
     pub frame: u64,
     pub output: &'a ViewOutput,
@@ -645,7 +648,7 @@ impl OutputKernels {
                 let params = AdaptParams {
                     mode: 0,
                     manual_ev100: *ev100,
-                    ..adapt_params(&default_meter, output.cut)
+                    ..adapt_params(&default_meter, pass.camera_cut)
                 };
                 let metered = output.white_balance.is_some() || local.is_some();
                 (params, metered.then_some(&default_meter))
@@ -660,7 +663,7 @@ impl OutputKernels {
                     roots.compensation =
                         Some((auto.compensation.clone(), auto.range_ev100.clone()));
                 }
-                (adapt_params(auto, output.cut), Some(auto))
+                (adapt_params(auto, pass.camera_cut), Some(auto))
             }
         };
         if let Some(white) = &output.white_balance {
@@ -752,7 +755,7 @@ impl OutputKernels {
         {
             view.motion_blur = Some(MotionBlurTargets::new(&view.device, pass.extent)?);
         }
-        if pass.cut {
+        if pass.camera_cut {
             return Ok(false);
         }
         let targets = view.motion_blur.as_mut().expect("motion blur tiles");

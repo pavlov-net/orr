@@ -315,7 +315,7 @@ impl DisplayFrame<'_> {
                 output: view.output_extent.to_array(),
             },
             jitter: view.jitter.to_array(),
-            reset: view.reset_history,
+            reset: view.camera_cut,
             not_rendering_scene,
         });
     }

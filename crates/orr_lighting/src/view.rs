@@ -479,18 +479,17 @@ impl LightingView {
     }
 
     /// Starts the view's frame `frame` and settles its history reset. A camera cut
-    /// (`desc.reset_history`), output's exposure cut, a camera jump past
-    /// `lighting.guides.camera_jump` since the view's last frame, a change of scene or output
-    /// extent, the view's first frame and [`SceneLighting::reset_history`] before the scene's
-    /// pass of `frame` each set it. Call once per frame, after the scene's
-    /// [`SceneLighting::record`] and before the view's lighting records; returns
-    /// [`Self::history_reset`].
+    /// (`desc.camera_cut`), a camera jump past `lighting.guides.camera_jump` since the view's
+    /// last frame, a change of scene or output extent, the view's first frame and
+    /// [`SceneLighting::reset_history`] before the scene's pass of `frame` each set it. A camera
+    /// cut also snaps exposure, and ray reconstruction's history is in pre-exposed units. Call
+    /// once per frame, after the scene's [`SceneLighting::record`] and before the view's
+    /// lighting records; returns [`Self::history_reset`].
     pub fn begin(
         &mut self,
         frame: u64,
         scene: &SceneLighting,
         desc: &ViewDesc,
-        exposure_cut: bool,
         lighting: &ViewLighting,
     ) -> bool {
         let continues = self.previous.is_some_and(|p| {
@@ -501,8 +500,7 @@ impl LightingView {
                     .camera_jump
                     .jumps((p.position, p.rotation), (desc.position, desc.rotation))
         });
-        self.history_reset =
-            !continues || desc.reset_history || exposure_cut || scene.resets_history(frame);
+        self.history_reset = !continues || desc.camera_cut || scene.resets_history(frame);
         self.previous = Some(*desc);
         self.history_reset
     }

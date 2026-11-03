@@ -1785,7 +1785,7 @@ impl Bed {
             render_extent: UVec2::from(EXTENT),
             output_extent: UVec2::from(EXTENT),
             jitter: Vec2::ZERO,
-            reset_history: cut,
+            camera_cut: cut,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
         };
@@ -2020,7 +2020,7 @@ impl Paths {
             None => &mut *f.target,
         };
         let (lighting, settings) = (f.lighting, &self.settings);
-        target.begin(f.frame, lighting, &f.desc, false, settings);
+        target.begin(f.frame, lighting, &f.desc, settings);
         self.kernels
             .record_media(list, lighting, target, pass, settings)
             .unwrap();

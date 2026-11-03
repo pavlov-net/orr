@@ -291,6 +291,7 @@ impl View {
                     extent: OUT,
                     view,
                     sky: self.sky.gpu(),
+                    camera_cut: false,
                     frame: self.frame,
                     output: &output,
                 },

@@ -3192,7 +3192,7 @@ fn the_resolve_writes_the_color_a_neural_set_decodes() {
                 render_extent: glam::UVec2::splat(EXTENT),
                 output_extent: glam::UVec2::splat(EXTENT),
                 jitter: Vec2::ZERO,
-                reset_history: true,
+                camera_cut: true,
                 mip_bias: 0.0,
                 texture_filter: TextureFilter::Hardware,
             })

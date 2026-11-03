@@ -258,7 +258,7 @@ fn frame_generation_presents_generated_images_before_each_frame() {
             output_extent: UVec2::from(extent),
             jitter: Vec2::ZERO,
             // The bar jumps back when it wraps.
-            reset_history: i % PHASE == 0 || (i as f32 * SPEED) % travel < SPEED,
+            camera_cut: i % PHASE == 0 || (i as f32 * SPEED) % travel < SPEED,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
         };
@@ -554,6 +554,7 @@ mod lens_distortion {
                         extent: OUT,
                         view: self.constants.gpu(),
                         sky: self.sky.gpu(),
+                        camera_cut: false,
                         frame: self.frame,
                         output: &output,
                     },

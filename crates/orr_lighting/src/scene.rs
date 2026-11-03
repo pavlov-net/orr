@@ -368,7 +368,7 @@ impl SceneLighting {
     /// A lighting discontinuity, such as a time skip: the next [`Self::record`] clears the
     /// world cache and the light feedback and marks its frame as a history reset for every
     /// view of the scene ([`crate::LightingView::begin`]). A camera that teleports declares a
-    /// cut through its view's `reset_history` instead.
+    /// cut through its view's `camera_cut` instead.
     pub fn reset_history(&mut self) {
         self.reset_pending = true;
     }

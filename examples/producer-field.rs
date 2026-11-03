@@ -312,7 +312,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             render_extent: UVec2::from(extent),
             output_extent: UVec2::from(extent),
             jitter: Vec2::ZERO,
-            reset_history: i == 0,
+            camera_cut: false,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
         };

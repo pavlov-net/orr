@@ -265,7 +265,7 @@ fn still_view<'a>(
     scene: SceneId,
     history: ViewHistoryId,
     eye: Vec3,
-    reset_history: bool,
+    camera_cut: bool,
     target: ViewTarget<'a>,
 ) -> LitView<'a> {
     LitView {
@@ -278,7 +278,7 @@ fn still_view<'a>(
             near: 0.05,
         },
         lens: Lens::default(),
-        reset_history,
+        camera_cut,
         texture_filter: TextureFilter::Hardware,
         target,
     }
@@ -492,7 +492,7 @@ impl StillShowcase {
         let eye = orbit_eye(viewer::STILL_ANGLE);
         let lighting = ViewLighting::default();
         let mut last = None;
-        for i in 0..FRAMES {
+        for _ in 0..FRAMES {
             self.frame += 1;
             let mut f = self
                 .renderer
@@ -510,7 +510,7 @@ impl StillShowcase {
                 .zip(&histories)
                 .map(|(&(extent, reconstruction), &history)| {
                     let target = ViewTarget::Radiance { extent };
-                    let view = still_view(scene, history, eye, i == 0, target);
+                    let view = still_view(scene, history, eye, false, target);
                     let output = ViewOutput {
                         reconstruction,
                         ..ViewOutput::default()
@@ -946,7 +946,7 @@ impl Lamp {
                             glare: settings.glare.then_some(Glare { strength: 1.0 }),
                             ..Lens::default()
                         },
-                        reset_history: i == 0 || (settings.cut && final_frame),
+                        camera_cut: i == 0 || (settings.cut && final_frame),
                         texture_filter: TextureFilter::Hardware,
                         target: ViewTarget::Texture(&target),
                     },

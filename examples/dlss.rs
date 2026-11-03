@@ -284,7 +284,7 @@ fn run(options: &Options) {
                         near: 0.05,
                     },
                     lens: switches.lens(),
-                    reset_history: i == 0,
+                    camera_cut: false,
                     texture_filter: TextureFilter::Hardware,
                     target: ViewTarget::Display,
                 },
@@ -468,7 +468,7 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
                 }
             }
         };
-        let mut reset = i == 0;
+        let mut reset = false;
         if let Some(sdk) = &sdk
             && sr.as_ref().is_none_or(|s| s.output_size() != extent)
         {
@@ -500,7 +500,7 @@ pub(crate) fn run_sr(options: &Options) -> Option<SrRun> {
                 render_extent: UVec2::from(render),
                 output_extent: UVec2::from(extent),
                 jitter: Vec2::from(jitter),
-                reset_history: reset,
+                camera_cut: reset,
                 mip_bias,
                 texture_filter: TextureFilter::Hardware,
             })

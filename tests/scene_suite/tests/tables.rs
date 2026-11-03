@@ -494,7 +494,7 @@ fn view_constants_project_and_reconstruct_render_positions() {
             render_extent: extent,
             output_extent: UVec2::new(1280, 720),
             jitter,
-            reset_history: true,
+            camera_cut: true,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
         })
@@ -604,7 +604,7 @@ fn exposure_slots_alternate_per_render_of_a_view() {
                     render_extent: UVec2::new(64, 64),
                     output_extent: UVec2::new(64, 64),
                     jitter: Vec2::ZERO,
-                    reset_history: false,
+                    camera_cut: false,
                     mip_bias: 0.0,
                     texture_filter: TextureFilter::Hardware,
                 })
@@ -682,7 +682,7 @@ fn copies_are_placed_relative_to_the_eye_from_cells() {
             render_extent: UVec2::new(64, 64),
             output_extent: UVec2::new(64, 64),
             jitter: Vec2::ZERO,
-            reset_history: false,
+            camera_cut: false,
             mip_bias: 0.0,
             texture_filter: TextureFilter::Hardware,
         })
