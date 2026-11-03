@@ -2,7 +2,7 @@
 // material `m` from its front (`front` 1) or back and records the list, innermost last, and
 // the innermost entry other than the step's material.
 #include "orr/root.h"
-import dielectric;
+import interiors;
 
 struct Crossing
 {

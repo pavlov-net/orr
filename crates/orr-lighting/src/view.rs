@@ -62,7 +62,8 @@ pub struct ViewLighting {
     pub pixel_fraction: f32,
     /// The dielectric whose interior holds the eye; each pixel flips it at every dielectric
     /// surface between the eye and its near-plane point, so a near plane straddling the
-    /// surface works.
+    /// surface works. The froxels then hold its absorption and scattering in place of the
+    /// scene's medium up to the surface leaving it.
     pub camera_medium: Option<MaterialId>,
     pub media: MediaSettings,
     pub guides: GuideSettings,
@@ -241,7 +242,7 @@ const DIELECTRIC_FROST: u32 = 8;
 const SSS_PRIMARY_ONLY: u32 = 1;
 
 /// `MATERIAL_NONE`.
-const NO_MATERIAL: u32 = u32::MAX;
+pub(crate) const NO_MATERIAL: u32 = u32::MAX;
 
 /// A [`LightingView`] target and its storage view.
 struct Target {
@@ -1176,8 +1177,9 @@ impl LightingKernels {
     /// tiles. Pixels whose eye lies inside
     /// [`ViewLighting::camera_medium`] trace their path through it from the G-buffer's surface
     /// too. Outside the reference, segments between layers read the froxels of
-    /// [`Self::record_media`] of the same frame where it ran. Camera rays are pinhole rays
-    /// whatever the reference's lens. With [`ViewPass::frosted_glass`] it also keeps each
+    /// [`Self::record_media`] of the same frame where it ran, and those froxels hold the camera
+    /// segment through an interior, which media apply adds; without them the path samples it.
+    /// Camera rays are pinhole rays whatever the reference's lens. With [`ViewPass::frosted_glass`] it also keeps each
     /// pixel's background and rough-transmission blur for [`Self::record_frosted_glass`].
     /// Records nothing without the opaque dispatch of `pass.frame`. Orders nothing after it.
     pub fn record_dielectric(

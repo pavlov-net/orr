@@ -193,12 +193,26 @@ public struct FroxelLights
     // 1 when a visible smoke triangle reaches past `near_range` this frame; 0 spares media apply
     // its ray per pixel for smoke there.
     public uint far_smoke;
+    // 1 when a column's near-plane point lies in a dielectric's interior this frame; 0 spares
+    // media apply its per-column lookups.
+    public uint eye;
+}
+
+// What one froxel column's ray found of the interior holding its near-plane point. Slices that
+// interior holds carry its absorption and scattering in place of the linked medium.
+public struct EyeColumn
+{
+    public uint medium;     // the innermost interior at the near-plane point, MATERIAL_NONE for none
+    public float start;     // m from the eye where it begins
+    public float end;       // m from the eye of the surface leaving it, +inf for none before `near_range`
+    public uint slices;     // the slices from the eye it holds: those before the farthest `end` of the columns beside this one in the same interior
 }
 
 // One frame's froxel volume of a view, for passes that read it after its integration.
 public struct FroxelVolume
 {
     public FroxelLights* lights;
+    public EyeColumn* eye;                      // per column
     public StorageImageIndex sigma;             // froxel_material, RGBA16F
     public StorageImageIndex words;             // froxel_material, RGBA32_UINT
     public StorageImageIndex incident;          // RGBA16F

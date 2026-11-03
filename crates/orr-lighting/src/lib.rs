@@ -55,9 +55,9 @@ pub use scene::{
     ScenePass, WorldCacheSettings,
 };
 pub use shaders::types::{
-    CapTail, DirectionalState, EmissiveSelection, EnvironmentGpu, FroxelLights, FroxelRoot,
-    GuideRoot, LayerGuide, LightSample, LightSetGpu, LightSetStats, LocalLights, MediaApplyRoot,
-    MediaStatsGpu, ParticleLighting, PathRoot, WorldCacheGpu,
+    CapTail, DirectionalState, EmissiveSelection, EnvironmentGpu, EyeColumn, FroxelLights,
+    FroxelRoot, GuideRoot, LayerGuide, LightSample, LightSetGpu, LightSetStats, LocalLights,
+    MediaApplyRoot, MediaStatsGpu, ParticleLighting, PathRoot, WorldCacheGpu,
 };
 pub use subsurface::{CapTailTable, SSS_STEPS, SubsurfaceDepth};
 pub use view::{

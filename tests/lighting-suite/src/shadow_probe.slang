@@ -31,6 +31,6 @@ void main(uint3 id: SV_DispatchThreadID)
         return;
     RayCone cone = { 0.0, 0.0 };
     HitContext context = hit_context(HIT_SECONDARY, 1, cone, 0.0);
-    float3 t = visibility<StandardSurface, NoMedium>(root.scene, root.view, root.origins[id.x].xyz, root.dir.xyz, positive_infinity(), RAY_FLAG_NONE, context, true, root.overflows);
+    float3 t = visibility<StandardSurface, NoMedium>(root.scene, root.view, root.origins[id.x].xyz, root.dir.xyz, positive_infinity(), RAY_FLAG_NONE, context, false, root.overflows);
     root.transmittance[id.x] = float4(t, 0.0) + (root.add != 0 ? root.transmittance[id.x] : float4(0.0));
 }

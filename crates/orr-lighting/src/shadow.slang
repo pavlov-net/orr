@@ -81,6 +81,7 @@ public struct ShadowCandidates<S : ISurface, M : IMedium> : ICandidate
     public float t_max;
     public HitContext context;
     public float3 depth;
+    public bool environment;
 
     public bool positions(Candidate c)
     {
@@ -124,7 +125,7 @@ public struct ShadowCandidates<S : ISurface, M : IMedium> : ICandidate
         float3 n = sh.surface.geometric_normal;
         bool front = dot(n, dir) < 0.0;
         depth += interior_medium(scene, sh.surface.material).sigma_t * (front ? -c.t : c.t);
-        return bsdf_straight_transmission(sh.surface.bsdf, n, dir, AMBIENT_IOR);
+        return bsdf_straight_transmission(sh.surface.bsdf, n, dir, AMBIENT_IOR, environment);
     }
 
     // A medium proxy is the cube [-1, 1]^3 in its instance's object space. The ray's span
@@ -173,12 +174,26 @@ struct ProxyDepth : IProxyStep
 
 // What reaches `origin` from `t_max` along unit `dir` (+inf toward directional lights and the
 // environment), traced with ray flags `flags`: the product of every candidate along the
-// segment, 0 at an opaque hit, times the linked medium's transmittance over it when
-// `through_medium`. A ray past SHADOW_CANDIDATES non-opaque candidates keeps the product so
-// far and adds 1 to `overflows` (null: not counted).
-public float3 visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool through_medium, uint* overflows)
+// segment, 0 at an opaque hit, times the linked medium's transmittance over it unless the ray
+// goes to the `environment`, whose map holds that medium. A ray past SHADOW_CANDIDATES non-opaque
+// candidates keeps the product so far and adds 1 to `overflows` (null: not counted).
+public float3 visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, uint* overflows)
 {
-    ShadowCandidates<S, M> h = { s, v, origin, dir, t_max, context, float3(0.0) };
+    float3 depth;
+    float3 product = surface_visibility<S, M>(s, v, origin, dir, t_max, flags, context, environment, overflows, depth);
+    if (all(product == 0.0))
+        return product;
+    product *= exp(-depth);
+    if (!environment)
+        product *= medium_transmittance<M>(s.medium, origin, dir, t_max);
+    return product;
+}
+
+// `visibility` without the linked medium, with the dielectric interiors' optical depth over the
+// segment left out of the product and returned in `depth`.
+public float3 surface_visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants* v, float3 origin, float3 dir, float t_max, uint flags, HitContext context, bool environment, uint* overflows, out float3 depth)
+{
+    ShadowCandidates<S, M> h = { s, v, origin, dir, t_max, context, float3(0.0), environment };
     RayDesc ray;
     ray.Origin = origin;
     ray.Direction = dir;
@@ -188,10 +203,6 @@ public float3 visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewConstants*
     float3 product = trace_transmittance(s.tlas, ray, SHADOW_MASK, flags, h, SHADOW_CANDIDATES, overflow);
     if (overflow && overflows != nullptr)
         InterlockedAdd(*overflows, 1u);
-    if (all(product == 0.0))
-        return product;
-    product *= exp(-max(h.depth, 0.0));
-    if (through_medium)
-        product *= medium_transmittance<M>(s.medium, origin, dir, t_max);
+    depth = max(h.depth, 0.0);
     return product;
 }

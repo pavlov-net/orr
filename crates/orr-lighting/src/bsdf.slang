@@ -943,14 +943,17 @@ public BsdfParams bsdf_subsurface_diffuse(BsdfParams p)
 }
 
 // What a surface lets through straight along `wi` (unit), without bending: its transmission
-// share, surface tint and coat, times 1 - Fresnel at its interface, 0 beyond the critical
-// angle. `n` is the unit geometric normal on the material's front side, `exterior_ior` the
-// medium there. Shadow rays through dielectric layers take it.
-public float3 bsdf_straight_transmission(BsdfParams p, float3 n, float3 wi, float exterior_ior = 1.0)
+// share, surface tint and coat, times 1 - Fresnel at its interface. Shadow rays through
+// dielectric layers take it. `wi` is the light's direction outside the surface, so Fresnel is the
+// exterior side's from either side and light at any angle gets in. With `window`, for light from
+// every direction outside, `wi` is its direction on the ray's own side: light reaches a point
+// inside only within the critical angle, 0 beyond it, and what reflects there makes up the rest.
+// `n` is the unit geometric normal on the material's front side, `exterior_ior` the medium there.
+public float3 bsdf_straight_transmission(BsdfParams p, float3 n, float3 wi, float exterior_ior = 1.0, bool window = false)
 {
     bool thin = (p.flags & BSDF_THIN_WALLED) != 0;
     float c = dot(wi, n);
-    bool inside = c > 0.0 && !thin;
+    bool inside = window && c > 0.0 && !thin;
     float mu = max(abs(c), MIN_COS);
     float ior = exterior_ior * openpbr_apply_specular_weight_to_ior(p.specular_ior / exterior_ior, p.specular_weight);
     float eta = inside ? exterior_ior / ior : ior / exterior_ior;

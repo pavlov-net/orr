@@ -12,6 +12,14 @@
 // normals and resampled tile lights, one shadow ray) plus one visibility per shadowed
 // directional light, so the phase function applies per view direction at integration.
 //
+// When a column's near-plane point lies in a dielectric's interior (the eye below a water
+// surface), `froxel_eye_columns` finds what of the column that interior holds, and those slices
+// take its absorption and scattering in place of the linked medium. Its homogeneous coefficients
+// come from the material at integration, in rgb, so `froxel_material` holds nothing there. Their
+// shadowed lights keep the distance each ray spends in the interior beside the visibility, since
+// the light's color at a froxel depends on it, times that visibility: blocked rays say nothing of
+// the distance, and the two blend alike.
+//
 // Past `near_range`, `aerial_build` writes the aerial-perspective LUT (`media`'s layout) from
 // the linked medium and the directional lights, unshadowed; media apply composes surfaces
 // beyond `near_range` through it to the view's `ap_range` and marches the rest.
@@ -33,6 +41,7 @@ import media;
 import light_sampling;
 import world_cache;
 import shadow;
+import interiors;
 
 // Separates the froxels' samples from the paths' of the same pixel.
 public static const uint FROXEL_STREAM = 0x85EBCA6B;
@@ -67,7 +76,8 @@ public struct MediaStatsGpu
     public uint rays;
     // Medium proxies in the view's frustum.
     public uint proxies;
-    public uint _pad0;
+    // Columns whose near-plane point lies in a dielectric's interior.
+    public uint eye_columns;
 }
 
 public struct FroxelRoot
@@ -81,6 +91,7 @@ public struct FroxelRoot
     public MediaStatsGpu* stats;
     public RasterGpu* raster;
     public uint* smoke;                         // SMOKE_WORDS per froxel; null without smoke entries
+    public EyeColumn* eye;                      // per column
     public StorageImageIndex sigma;             // froxel_material, RGBA16F
     public StorageImageIndex words;             // froxel_material, RGBA32_UINT
     public StorageImageIndex incident;          // this frame's, RGBA16F
@@ -106,7 +117,9 @@ public struct FroxelRoot
     public TextureIndex aerial_rgb_sampled;
     public float ap_range;                      // m, the view's; the LUT's far end
     public float smoke_anisotropy;              // the view's
-    public uint _pad0;
+    public uint camera_medium;                  // the view's, MATERIAL_NONE for none
+    public StorageImageIndex eye_depth;         // per shadowed light, m its ray spends in the column's interior, times its visibility; NONE until the view needs it
+    public TextureIndex eye_depth_history;
 }
 
 // The view-space ray through point `p` of the view's unjittered image, in render pixels,
@@ -311,6 +324,103 @@ public void froxel_order(FroxelRoot r)
     out.proxies = proxies;
     r.stats.proxies = proxies;
     out.far_smoke = 0;
+    out.eye = 0;
+}
+
+// Most surfaces a column's ray passes looking for the one leaving its interior.
+static const uint EYE_CROSSINGS = 8;
+
+// Whether anything can lie in an interior at the near plane this frame: the view says the eye
+// does, a layer rastered before the near plane, or the G-buffer has no layer tiles to say.
+bool eye_may_be_inside(FroxelRoot r)
+{
+    uint* marks = r.gbuffer.layer_tiles;
+    return r.camera_medium != MATERIAL_NONE || marks == nullptr || marks[layer_tile_count(r.gbuffer.extent)] != 0;
+}
+
+// Finds what of column `column` the interior at its near-plane point holds: rays from the eye,
+// to the near plane until they are inside an interior and on to `near_range` from there. A body
+// of another material inside that interior does not end it.
+public void froxel_eye_column<S : ISurface>(FroxelRoot r, uint2 column)
+{
+    EyeColumn out = { MATERIAL_NONE, 0.0, positive_infinity(), 0 };
+    if (eye_may_be_inside(r))
+    {
+        SceneRoot* s = r.scene;
+        ViewConstants* v = r.view;
+        float3 dir = column_direction(r, column);
+        float3 eye = v.eye_render.xyz;
+        float t_near = v.clip_from_view[2][3] * length(unjittered_ray(v, column_pixel(r, float2(column))));
+        Interior list = Interior();
+        if (r.camera_medium != MATERIAL_NONE)
+            list.cross(r.camera_medium, true);
+        float at = 0.0;
+        for (uint k = 0; k < EYE_CROSSINGS; k++)
+        {
+            float t_max = (list.count > 0 ? s.near_range : t_near) - at;
+            float step;
+            uint m;
+            bool front;
+            if (!(t_max > 0.0) || !next_surface<S>(s, v, eye + dir * at, dir, t_max, step, m, front))
+                break;
+            float crossing = at + step;
+            at = crossing + 1e-4 * (1.0 + crossing);
+            if (m == MATERIAL_NONE)
+                continue;
+            if (crossing < t_near)
+            {
+                uint before = list.innermost();
+                list.cross(m, front);
+                if (list.innermost() != before)
+                    out.start = crossing;
+            }
+            else if (m == list.innermost() && !front)
+            {
+                out.end = crossing;
+                break;
+            }
+        }
+        out.medium = list.innermost();
+        if (out.medium != MATERIAL_NONE)
+        {
+            InterlockedOr(r.lights.eye, 1u);
+            InterlockedAdd(r.stats.eye_columns, 1u);
+        }
+    }
+    r.eye[column.y * r.columns + column.x] = out;
+}
+
+// Sets column `column`'s `slices`. A pixel's own surface may lie past its neighbors', so a
+// column's interior reaches as far as theirs in the same interior within one column spacing, as
+// active froxels reach past their tiles' surfaces.
+public void froxel_eye_reach(FroxelRoot r, uint2 column)
+{
+    uint index = column.y * r.columns + column.x;
+    EyeColumn c = r.eye[index];
+    uint slices = 0;
+    if (c.medium != MATERIAL_NONE)
+    {
+        float end = c.end;
+        int2 last = int2(r.columns, r.rows) - 1;
+        for (int y = max(int(column.y) - 1, 0); y <= min(int(column.y) + 1, last.y); y++)
+        {
+            for (int x = max(int(column.x) - 1, 0); x <= min(int(column.x) + 1, last.x); x++)
+            {
+                EyeColumn other = r.eye[uint(y) * r.columns + uint(x)];
+                if (other.medium == c.medium)
+                    end = max(end, other.end);
+            }
+        }
+        float near_range = r.scene.near_range;
+        slices = end < near_range ? min(uint(ceil(froxel_slice(end, r.slices, near_range))), r.slices) : r.slices;
+    }
+    r.eye[index].slices = slices;
+}
+
+// Whether column `c`'s interior holds its slice `k`, of `slices` to `near_range`.
+bool eye_holds(EyeColumn c, uint k, uint slices, float near_range)
+{
+    return k < c.slices && froxel_distance(float(k + 1), slices, near_range) > c.start;
 }
 
 // The first of froxel `f`'s words in `FroxelRoot.smoke`.
@@ -324,7 +434,9 @@ public void froxel_inject<M : IMedium>(FroxelRoot r, uint3 f)
 {
     Sampler rng = froxel_sampler(r, f);
     float3 x = froxel_sample(r, f, rng);
-    FroxelMaterial m = froxel_material(M.sample(r.scene.medium, x));
+    FroxelMaterial m = (FroxelMaterial)0;
+    if (!eye_holds(r.eye[f.y * r.columns + f.x], f.z, r.slices, r.scene.near_range))
+        m = froxel_material(M.sample(r.scene.medium, x));
     r.sigma.get<RWTexture3D<float4>>()[f] = m.sigma;
     r.words.get<RWTexture3D<uint4>>()[f] = m.words;
     if (r.smoke != nullptr)
@@ -436,7 +548,7 @@ float3 froxel_local<S : ISurface, M : IMedium>(FroxelRoot r, uint3 f, float3 x, 
     RayCone cone = { 0.0, 0.0 };
     rays++;
     // The baked environment carries the medium, as next-event estimation takes it.
-    float3 vis = visibility<S, M>(r.scene, r.view, x, chosen.dir, t_max, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), chosen.kind != LIGHT_SAMPLE_ENVIRONMENT, set.shadow_overflows);
+    float3 vis = visibility<S, M>(r.scene, r.view, x, chosen.dir, t_max, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), chosen.kind == LIGHT_SAMPLE_ENVIRONMENT, set.shadow_overflows);
     return l * vis * (sum / chosen_target) * INV_FOUR_PI;
 }
 
@@ -453,6 +565,9 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column, 
     float3 dir = column_direction(r, column);
     FroxelLights lights = *r.lights;
     float blend = r.history == 0 ? 1.0 : max(FROXEL_BLEND, 1.0 / float(r.history + 1));
+    EyeColumn eye_column = r.eye[column.y * r.columns + column.x];
+    float3 eye_sigma = interior_medium(r.scene, eye_column.medium).sigma_t;
+    bool keep_depth = r.eye_depth.index != IMAGE_NONE;
     uint active = 0;
     uint rays = 0;
     for (uint k = lane; k < r.slices; k += FROXEL_LANES)
@@ -463,8 +578,11 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column, 
         bool held = r.history > 0 && froxel_history_coord(r, center, coord);
         float4 incident = float4(0.0, 0.0, 0.0, 1.0);
         float4 more = float4(1.0);
+        float4 depth = float4(0.0);
         if (held)
         {
+            if (keep_depth)
+                depth = r.eye_depth_history.get<Texture3D<float4>>().SampleLevel(r.sampler.get(), coord, 0.0);
             incident = r.incident_history.get<Texture3D<float4>>().SampleLevel(r.sampler.get(), coord, 0.0);
             if (lights.count > 1)
                 more = r.visibility_history.get<Texture3D<float4>>().SampleLevel(r.sampler.get(), coord, 0.0);
@@ -477,7 +595,11 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column, 
             float3 to_eye = normalize(eye - x);
             float3 l = particle_irradiance(r.cache, r.scene, x, to_eye, rng) * (0.5 * INV_PI);
             l += froxel_local<S, M>(r, f, x, rng, rays);
+            float a = held ? blend : 1.0;
+            float a_vis = held && lights.changed == 0 ? blend : 1.0;
+            bool inside = keep_depth && eye_holds(eye_column, k, r.slices, near_range);
             float vis[MAX_FROXEL_SHADOWED_LIGHTS];
+            float4 depth_now = float4(0.0);
             for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
             {
                 float2 u = rng.next2();
@@ -488,20 +610,31 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column, 
                 float3 to_light = directional_sample(r.scene.lights[lights.ids[j]], u, cone_pdf);
                 RayCone cone = { 0.0, 0.0 };
                 rays++;
-                float3 t = visibility<S, M>(r.scene, r.view, x, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), false, r.set.shadow_overflows);
+                float3 tau;
+                float3 t = surface_visibility<S, M>(r.scene, r.view, x, to_light, positive_infinity(), RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, hit_context(HIT_SECONDARY, 1, cone, 0.0), false, r.set.shadow_overflows, tau);
+                // The column's interior takes its share of the optical depth as a distance.
+                float d = 0.0;
+                if (inside && any(eye_sigma > 0.0))
+                {
+                    d = dot(tau, eye_sigma) / dot(eye_sigma, eye_sigma);
+                    tau = max(tau - eye_sigma * d, 0.0);
+                }
+                t *= exp(-tau);
                 vis[j] = (t.x + t.y + t.z) / 3.0;
+                depth_now[j] = vis[j] * d;
             }
-            float a = held ? blend : 1.0;
-            float a_vis = held && lights.changed == 0 ? blend : 1.0;
             incident.rgb = lerp(incident.rgb, limit_incident(l), a);
             incident.a = lerp(incident.a, vis[0], a_vis);
             more = lerp(more, float4(vis[1], vis[2], vis[3], 1.0), a_vis);
+            depth = lerp(depth, depth_now, a_vis);
         }
         else if (!held)
             incident = float4(0.0, 0.0, 0.0, 1.0);
         r.incident.get<RWTexture3D<float4>>()[f] = incident;
         if (lights.count > 1)
             r.visibility.get<RWTexture3D<float4>>()[f] = more;
+        if (keep_depth)
+            r.eye_depth.get<RWTexture3D<float4>>()[f] = depth;
     }
     if (lane == 0)
     {
@@ -522,8 +655,10 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column, 
 // Light point `x` of a froxel, sampled as `m`, emits and scatters back along unit `dir` per
 // m: its emission, its isotropic `incident` light, the shadowed `lights` by the visibility in
 // `incident.a` and `more`, and every directional light's multiple scattering. Its smoke's
-// `smoke_scatter` takes the same light with a Henyey-Greenstein response of `anisotropy`.
-float3 froxel_source<M : IMedium>(LightSetGpu* set, FroxelLights lights, MediumPoint m, float3 smoke_scatter, float anisotropy, float4 incident, float4 more, float3 x, float3 dir)
+// `smoke_scatter` takes the same light with a Henyey-Greenstein response of `anisotropy`. A froxel
+// of a dielectric's interior `im` takes `im`'s phase function, its shadowed lights through their
+// distance in it (`depth` over their visibility), and no multiple scattering of the linked medium.
+float3 froxel_source<M : IMedium>(LightSetGpu* set, FroxelLights lights, MediumPoint m, float3 smoke_scatter, float anisotropy, float4 incident, float4 more, float3 x, float3 dir, bool in_interior = false, InteriorMedium im = (InteriorMedium)0, float4 depth = float4(0.0))
 {
     uint64_t data = set.scene.medium;
     float3 medium_light = float3(0.0);
@@ -536,12 +671,12 @@ float3 froxel_source<M : IMedium>(LightSetGpu* set, FroxelLights lights, MediumP
         if (vis > 0.0)
         {
             float cos_theta = dot(to_light, dir);
-            float3 arriving = directional_illuminance(set, id) * vis * M.transmittance(data, x, to_light, positive_infinity());
-            medium_light += arriving * M.phase(data, m, cos_theta);
+            float3 arriving = directional_illuminance(set, id) * vis * beer(im.sigma_t, depth[j] / vis) * M.transmittance(data, x, to_light, positive_infinity());
+            medium_light += arriving * (in_interior ? float3(hg_phase(im.anisotropy, cos_theta)) : M.phase(data, m, cos_theta));
             smoke_light += arriving * hg_phase(anisotropy, cos_theta);
         }
     }
-    float3 isotropic = incident.rgb + multiple_scattered<M>(set, x);
+    float3 isotropic = in_interior ? incident.rgb : incident.rgb + multiple_scattered<M>(set, x);
     return m.emission + m.sigma_s * (isotropic + medium_light) + smoke_scatter * (isotropic + smoke_light);
 }
 
@@ -624,7 +759,8 @@ public float3 froxel_segment_inscatter<M : IMedium>(FroxelVolume* volume, ViewCo
         uint3 f;
         MediumPoint m;
         float3 source;
-        if (volume != nullptr && froxel_at(grid, v, near_range, x, f))
+        // These segments lie outside every interior, so an interior's slices do not serve them.
+        if (volume != nullptr && froxel_at(grid, v, near_range, x, f) && !eye_holds(volume.eye[f.y * grid.x + f.x], f.z, grid.z, near_range))
         {
             FroxelMaterial fm = { volume.sigma.get<RWTexture3D<float4>>()[f], volume.words.get<RWTexture3D<uint4>>()[f] };
             m = froxel_point(fm, volume.chromatic != 0);
@@ -655,6 +791,9 @@ public void froxel_integrate<M : IMedium>(FroxelRoot r, uint2 column)
     float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
     bool chromatic = r.chromatic != 0;
     FroxelLights lights = *r.lights;
+    EyeColumn eye_column = r.eye[column.y * r.columns + column.x];
+    InteriorMedium im = interior_medium(r.scene, eye_column.medium);
+    bool keep_rgb = r.integrated_rgb.index != IMAGE_NONE;
     float3 inscatter = float3(0.0);
     float3 transmittance = float3(1.0);
     for (uint k = 0; k < r.slices; k++)
@@ -674,16 +813,23 @@ public void froxel_integrate<M : IMedium>(FroxelRoot r, uint2 column)
             smoke_scatter = float3(w[1], w[2], w[3]) / (SMOKE_DEPTH_SCALE * dt);
             m.emission += float3(w[4], w[5], w[6]) / (SMOKE_EMISSION_SCALE * dt);
         }
+        bool inside = eye_holds(eye_column, k, r.slices, near_range);
+        if (inside)
+        {
+            m.sigma_t += im.sigma_t;
+            m.sigma_s = im.sigma_s;
+        }
         float3 source = m.emission;
         if (any(m.sigma_s > 0.0) || any(smoke_scatter > 0.0))
         {
             float4 incident = r.incident.get<RWTexture3D<float4>>()[f];
             float4 more = lights.count > 1 ? r.visibility.get<RWTexture3D<float4>>()[f] : float4(1.0);
-            source = froxel_source<M>(set, lights, m, smoke_scatter, r.smoke_anisotropy, incident, more, x, dir);
+            float4 depth = inside && r.eye_depth.index != IMAGE_NONE ? r.eye_depth.get<RWTexture3D<float4>>()[f] : float4(0.0);
+            source = froxel_source<M>(set, lights, m, smoke_scatter, r.smoke_anisotropy, incident, more, x, dir, inside, im, depth);
         }
         march_step(m.sigma_t, source, dt, inscatter, transmittance);
         r.integrated.get<RWTexture3D<float4>>()[f] = float4(apply_hdr_ceiling(inscatter * pre_exposure), luminance_rec2020(transmittance));
-        if (chromatic)
+        if (keep_rgb)
             r.integrated_rgb.get<RWTexture3D<float4>>()[f] = float4(transmittance, 1.0);
     }
 }
@@ -723,11 +869,103 @@ float3 shell_fog(TextureIndex inscatter, TextureIndex rgb, SamplerIndex sampler,
     float3 coord = float3(xy, (k + 0.5) / float(shells));
     float4 hi = fog.SampleLevel(s, coord, 0.0);
     float3 t_hi = chromatic ? rgb.get<Texture3D<float4>>().SampleLevel(s, coord, 0.0).rgb : float3(hi.a);
+    return shell_mix(lo.rgb, t_lo, hi.rgb, t_hi, f, transmittance);
+}
+
+// Share `f` of the distance through a shell between in-scatter `s_lo` and transmittance `t_lo` at
+// its near boundary and `s_hi` and `t_hi` at its far one, as through a homogeneous shell.
+public float3 shell_mix(float3 s_lo, float3 t_lo, float3 s_hi, float3 t_hi, float f, out float3 transmittance)
+{
     float3 ratio = clamp(t_hi / max(t_lo, 1e-30), 1e-30, 1.0);
     float3 part = pow(ratio, float3(f));
     transmittance = t_lo * part;
     float3 share = select(ratio < 0.9999, (1.0 - part) / (1.0 - ratio), float3(f));
-    return lo.rgb + (hi.rgb - lo.rgb) * share;
+    return s_lo + (s_hi - s_lo) * share;
+}
+
+// In-scatter (pre-exposed) and transmittance from the eye.
+public struct Fog
+{
+    public float3 inscatter;
+    public float3 transmittance;
+}
+
+// The integrated volume at the far boundary of slice `k` of column `column`; k -1 is the eye.
+Fog column_boundary(TextureIndex integrated, TextureIndex rgb, uint2 column, int k)
+{
+    Fog g = { float3(0.0), float3(1.0) };
+    if (k < 0)
+        return g;
+    int4 at = int4(column, k, 0);
+    float4 v = integrated.get<Texture3D<float4>>().Load(at);
+    g.inscatter = v.rgb;
+    g.transmittance = rgb.index != IMAGE_NONE ? rgb.get<Texture3D<float4>>().Load(at).rgb : float3(v.a);
+    return g;
+}
+
+// Distance per unit of source that reaches the near end of `t` m of extinction `sigma_t`; 0 where
+// the extinction is 0, since such a channel also scatters nothing.
+float3 attenuated_length(float3 sigma_t, float t)
+{
+    return select(sigma_t > 0.0, (1.0 - beer(sigma_t, t)) / max(sigma_t, 1e-30), float3(0.0));
+}
+
+// What froxel column `column` holds to `t` m, of `shells` slices to `near_range`. Past `held` > 0
+// slices in an interior of `sigma_t`, the last one goes on to `t` through the same medium.
+Fog column_fog(TextureIndex integrated, TextureIndex rgb, uint2 column, uint shells, float near_range, uint held, float3 sigma_t, float t)
+{
+    float limit = held > 0 ? froxel_distance(float(held), shells, near_range) : near_range;
+    float c = froxel_slice(min(t, limit), shells, near_range);
+    float k = min(floor(c), float(shells) - 1.0);
+    Fog lo = column_boundary(integrated, rgb, column, int(k) - 1);
+    Fog hi = column_boundary(integrated, rgb, column, int(k));
+    Fog g;
+    g.inscatter = shell_mix(lo.inscatter, lo.transmittance, hi.inscatter, hi.transmittance, saturate((c * c - k * k) / (2.0 * k + 1.0)), g.transmittance);
+    if (held == 0 || !(t > limit))
+        return g;
+    // The last slice's in-scatter over what its medium lets through per unit source gives the
+    // source per m.
+    lo = column_boundary(integrated, rgb, column, int(held) - 2);
+    hi = column_boundary(integrated, rgb, column, int(held) - 1);
+    float dt = limit - froxel_distance(float(held) - 1.0, shells, near_range);
+    float3 per_source = lo.transmittance * attenuated_length(sigma_t, dt);
+    float3 source = select(per_source > 1e-20, (hi.inscatter - lo.inscatter) / max(per_source, 1e-20), float3(0.0));
+    g.inscatter += g.transmittance * source * attenuated_length(sigma_t, t - limit);
+    g.transmittance *= beer(sigma_t, t - limit);
+    return g;
+}
+
+// The froxels' fog to `t` m along the ray through image point `p`, in render pixels, whose camera
+// segment starts in interior `medium` of extinction `sigma_t`, or outside every interior for
+// MATERIAL_NONE: filtered over the columns around it that start in the same medium, so nothing
+// crosses a waterline. A pixel with no such column beside it takes the interior's absorption alone.
+public Fog eye_fog(EyeColumn* eye, TextureIndex integrated, TextureIndex rgb, uint3 grid, uint2 extent, float near_range, float2 p, uint medium, float3 sigma_t, float t)
+{
+    float2 c = p / froxel_spacing(extent, grid.xy);
+    uint2 base = min(uint2(c), max(grid.xy, 2u) - 2u);
+    float2 w = saturate(c - float2(base));
+    Fog sum = { float3(0.0), float3(0.0) };
+    float total = 0.0;
+    for (uint i = 0; i < 4; i++)
+    {
+        uint2 at = min(base + uint2(i & 1u, i >> 1), grid.xy - 1u);
+        float weight = ((i & 1u) != 0 ? w.x : 1.0 - w.x) * ((i >> 1) != 0 ? w.y : 1.0 - w.y);
+        EyeColumn column = eye[at.y * grid.x + at.x];
+        if (column.medium != medium || !(weight > 0.0))
+            continue;
+        Fog g = column_fog(integrated, rgb, at, grid.z, near_range, column.slices, sigma_t, t);
+        sum.inscatter += weight * g.inscatter;
+        sum.transmittance += weight * g.transmittance;
+        total += weight;
+    }
+    if (total > 0.0)
+    {
+        sum.inscatter /= total;
+        sum.transmittance /= total;
+        return sum;
+    }
+    Fog alone = { float3(0.0), beer(sigma_t, t) };
+    return alone;
 }
 
 // The in-scatter (pre-exposed) and transmittance from the scene's `near_range` to distance

@@ -313,6 +313,11 @@ pub const CLOUD_SPHERE: &str = "cloud sphere";
 /// is exp(-[`WATER_SIGMA`]) in Rec.709.
 pub const WATER_BOX: &str = "water box";
 pub const WATER_SIGMA: [f32; 3] = [0.4, 0.2, 0.1];
+/// A water box 40 x 8 x 40 m around its origin (IOR 1.33), turbid: extinction
+/// [`TURBID_SIGMA_T`] and isotropic scattering [`TURBID_SIGMA_S`] per m, in Rec.709.
+pub const TURBID_WATER: &str = "turbid water";
+pub const TURBID_SIGMA_T: [f32; 3] = [0.45, 0.25, 0.2];
+pub const TURBID_SIGMA_S: [f32; 3] = [0.1, 0.12, 0.13];
 
 /// A smoke plume: the cooked volume's grid `density`, a column about 1.5 m across and 3 m
 /// tall on 0.1 m voxels, base at the origin, thinning upward and broken into puffs under
@@ -846,6 +851,11 @@ fn cook() -> Arc<[u8]> {
         transmission_depth: 1.0,
         ..glass
     };
+    let turbid = Material {
+        transmission_color: TURBID_SIGMA_T.map(|s| (-s).exp()),
+        transmission_scatter: TURBID_SIGMA_S,
+        ..water
+    };
     let veil = Material {
         base_color: [0.0; 3],
         specular_weight: 0.0,
@@ -1000,6 +1010,11 @@ fn cook() -> Arc<[u8]> {
                     WATER_BOX,
                     mesh(|b| b.cuboid(0, Vec3::new(3.0, 2.0, 3.0))),
                     vec![water],
+                ),
+                model(
+                    TURBID_WATER,
+                    mesh(|b| b.cuboid(0, Vec3::new(20.0, 4.0, 20.0))),
+                    vec![turbid],
                 ),
                 model(
                     PRESENCE_VEIL,

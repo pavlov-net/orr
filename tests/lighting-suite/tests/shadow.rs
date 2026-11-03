@@ -129,8 +129,7 @@ fn a_slab_shadows_receivers_below_it_by_fresnel_and_beer_law() {
     );
     let mu = f64::from(sun.y);
     let path = f64::from(SLAB_THICKNESS) / mu;
-    let through =
-        (1.0 - fresnel(1.5, mu)) * (1.0 - fresnel(1.0 / 1.5, mu)) * 0.5f64.powf(path / 0.3);
+    let through = (1.0 - fresnel(1.5, mu)).powi(2) * 0.5f64.powf(path / 0.3);
     assert_all("below the slab", &below.transmittance, [through; 3], 2e-3);
     let above = trace(
         copies,
@@ -150,7 +149,6 @@ fn water_shadows_receivers_inside_and_under_it_by_their_depth() {
     let sun = SUN.direction_to_light.normalize();
     let mu = f64::from(sun.y);
     let enter = 1.0 - fresnel(1.33, mu);
-    let leave = 1.0 - fresnel(1.0 / 1.33, mu);
     // The box spans y from 0 to 4 and x and z from -3 to 3.
     let copies = vec![at(WATER_BOX, Vec3::new(0.0, 2.0, 0.0))];
     let surface = Vec3::new(0.0, 4.0, 0.0);
@@ -160,7 +158,7 @@ fn water_shadows_receivers_inside_and_under_it_by_their_depth() {
             &grid(surface, [0.5, 0.45], depth / sun.y, sun),
             sun,
         );
-        let wanted = water_transmission().map(|c| c.powf(f64::from(depth) / mu) * leave);
+        let wanted = water_transmission().map(|c| c.powf(f64::from(depth) / mu) * enter);
         assert_all(
             &format!("{depth} m deep"),
             &inside.transmittance,
@@ -173,7 +171,7 @@ fn water_shadows_receivers_inside_and_under_it_by_their_depth() {
         &grid(surface, [0.5, 0.45], 4.5 / sun.y, sun),
         sun,
     );
-    let wanted = water_transmission().map(|c| c.powf(4.0 / mu) * enter * leave);
+    let wanted = water_transmission().map(|c| c.powf(4.0 / mu) * enter * enter);
     assert_all("under the box", &under.transmittance, wanted, 2e-3);
     let above = trace(
         copies,
@@ -181,6 +179,26 @@ fn water_shadows_receivers_inside_and_under_it_by_their_depth() {
         sun,
     );
     assert_all("above the box", &above.transmittance, [1.0; 3], 0.0);
+    assert_clean();
+}
+
+/// A sun 15 degrees above the horizon, past the critical angle from inside the water, still
+/// lights a receiver in it, by Fresnel where the light enters. The shadow ray stands for a path
+/// that bends at the surface.
+#[test]
+fn a_low_sun_reaches_a_receiver_under_water() {
+    let sun = Vec3::new(0.966, 0.259, 0.0).normalize();
+    let mu = f64::from(sun.y);
+    let enter = 1.0 - fresnel(1.33, mu);
+    let copies = vec![at(WATER_BOX, Vec3::new(0.0, 2.0, 0.0))];
+    let depth = 0.5f32;
+    let inside = trace(
+        copies,
+        &grid(Vec3::new(0.0, 4.0, 0.0), [0.5, 0.45], depth / sun.y, sun),
+        sun,
+    );
+    let wanted = water_transmission().map(|c| c.powf(f64::from(depth) / mu) * enter);
+    assert_all("under a low sun", &inside.transmittance, wanted, 2e-3);
     assert_clean();
 }
 
