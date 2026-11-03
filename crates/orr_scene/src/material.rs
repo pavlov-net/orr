@@ -196,6 +196,8 @@ pub(crate) struct MaterialTable {
     ids: Mutex<RangeAllocator>,
     /// Materials whose pixels may use the extended G-buffer target.
     extended: Mutex<HashSet<u32>>,
+    /// Materials whose paths may take a random walk.
+    walking: Mutex<HashSet<u32>>,
 }
 
 /// Whether pixels of `m` may use the extended G-buffer target. A linked surface may set any
@@ -204,6 +206,16 @@ fn needs_extended(m: &MaterialGpu) -> bool {
     use material_flags as f;
     let thin_sss = m.flags & f::THIN_WALLED != 0 && m.subsurface_weight > 0.0;
     thin_sss || m.flags & (f::SUBSURFACE | f::COAT | f::FUZZ | f::ANISOTROPY) != 0 || m.surface != 0
+}
+
+/// Whether paths through `m` may take a random walk: through its subsurface medium or its dense
+/// scattering interior. A linked surface may set any lobe.
+fn may_walk(m: &MaterialGpu) -> bool {
+    let thin = m.flags & material_flags::THIN_WALLED != 0;
+    let interior = m.transmission_weight > 0.0
+        && m.transmission_depth > 0.0
+        && m.transmission_scatter.iter().any(|&c| c > 0.0);
+    m.surface != 0 || (!thin && (m.subsurface_weight > 0.0 || interior))
 }
 
 impl MaterialTable {
@@ -218,6 +230,7 @@ impl MaterialTable {
             )?,
             ids: Mutex::new(RangeAllocator::new(capacity)),
             extended: Mutex::new(HashSet::new()),
+            walking: Mutex::new(HashSet::new()),
         })
     }
 
@@ -231,17 +244,26 @@ impl MaterialTable {
 
     /// Records what material `id` now holds.
     pub(crate) fn note(&self, id: MaterialId, m: &MaterialGpu) {
-        let mut set = self.extended.lock().unwrap();
-        if needs_extended(m) {
-            set.insert(id.0);
-        } else {
-            set.remove(&id.0);
-        }
+        let mark = |set: &Mutex<HashSet<u32>>, on: bool| {
+            let mut set = set.lock().unwrap();
+            if on {
+                set.insert(id.0);
+            } else {
+                set.remove(&id.0);
+            }
+        };
+        mark(&self.extended, needs_extended(m));
+        mark(&self.walking, may_walk(m));
     }
 
     /// Whether any material may write the extended G-buffer target.
     pub(crate) fn any_extended(&self) -> bool {
         !self.extended.lock().unwrap().is_empty()
+    }
+
+    /// Whether paths through any material may take a random walk.
+    pub(crate) fn any_walking(&self) -> bool {
+        !self.walking.lock().unwrap().is_empty()
     }
 
     pub(crate) fn alloc(&self) -> Result<MaterialId> {
@@ -255,6 +277,7 @@ impl MaterialTable {
     /// Returns `id` for reuse; its record stays until a new material overwrites it.
     pub(crate) fn free(&self, id: MaterialId) {
         self.extended.lock().unwrap().remove(&id.0);
+        self.walking.lock().unwrap().remove(&id.0);
         self.ids.lock().unwrap().free(id.0, 1);
     }
 }

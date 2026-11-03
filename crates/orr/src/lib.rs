@@ -1191,6 +1191,7 @@ impl<'a> Frame<'a> {
             seed: 0,
             dof_background: None,
             frosted_glass: false,
+            walking_materials: raster.walking_materials,
         };
         paths.begin(scene, &desc, lighting);
         state.scene_resets = Some(scene_resets);

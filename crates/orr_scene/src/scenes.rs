@@ -1963,6 +1963,7 @@ impl<'a> Frame<'a> {
             counts: targets.counts(),
             raster,
             smoke_args: smoke.then(|| targets.smoke_args()),
+            walking_materials: core.materials.any_walking(),
             history: view.history,
             sky_stats,
             focus,

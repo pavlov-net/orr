@@ -6,7 +6,8 @@
 // follows Henyey-Greenstein. What a step reaching a surface does is up to the `IWalkTrace`: it
 // ends the walk there, ends it with nothing, reflects it back or lets it leave through the
 // surface. A walk that takes `max_steps` steps without leaving stops there and keeps the cap
-// tail's share of what it would yet carry out.
+// tail's share of what it would yet carry out. A caller may run a walk's steps in several calls,
+// with a coherence point between them.
 module subsurface;
 
 import orr.abi;
@@ -16,12 +17,16 @@ import hit;
 import bsdf;
 import media;
 
-// `WalkExit.kind` and `WalkMeet.kind`.
+// `Walk.kind` and `WalkMeet.kind`.
 public static const uint WALK_NONE = 0;     // nothing leaves
 public static const uint WALK_BOUNDARY = 1; // `hit` is where the walk reaches the surface
-public static const uint WALK_CAP = 2;      // the walk stopped at its step cap, `WalkExit` only
+public static const uint WALK_CAP = 2;      // the walk stopped at its step cap, `Walk` only
 public static const uint WALK_LEAVE = 3;    // the walk leaves along `dir` from `origin`, through a surface with outward `normal`
 public static const uint WALK_REFLECT = 4;  // the walk goes on along `dir` from `origin`, `WalkMeet` only
+public static const uint WALK_RUNNING = 5;  // steps remain, `Walk` only
+
+// Steps of a walk between two coherence points.
+public static const uint WALK_POINT_STEPS = 8;
 
 // What a walk that reaches its step cap inside a semi-infinite medium would yet carry out
 // through the surface, per unit throughput at the cap: for each of `iors` surface IORs, `caps`
@@ -68,15 +73,36 @@ public interface IWalkTrace
     WalkMeet meet(Hit h, float3 origin, float3 dir, float3 positions[3], inout Sampler rng);
 }
 
-public struct WalkExit
+// A walk, from `walk_start` until `walk_steps` leaves its kind other than WALK_RUNNING. `Walk()` is
+// a walk that never ran.
+public struct Walk
 {
     public uint kind;                   // WALK_*
     public float3 throughput;           // of the walk alone
-    public float3 dir;                  // the last step's direction, or the way out
-    public float3 origin;               // WALK_LEAVE: where it leaves from
+    public float3 dir;                  // the next step's direction; at the end the last step's, or the way out
+    public float3 origin;               // where the next step starts; WALK_LEAVE: where it leaves from
     public float3 normal;               // WALK_LEAVE: the surface's outward normal
     public Hit hit;                     // WALK_BOUNDARY: the query that reached the surface
     public float3 positions[3];         // and its triangle's fetched object-space corners
+    public float ior;                   // the surface's IOR against the outside's where it reflects by it, else 1
+    public SubsurfaceVolume volume;
+    public Sampler rng;
+    public uint step;
+
+    public __init()
+    {
+        kind = WALK_NONE;
+        throughput = float3(0.0);
+        dir = float3(0.0);
+        origin = float3(0.0);
+        normal = float3(0.0);
+        hit = (Hit)0;
+        positions = { float3(0.0), float3(0.0), float3(0.0) };
+        ior = 1.0;
+        volume = (SubsurfaceVolume)0;
+        rng = Sampler(uint2(0u), 0u);
+        step = 0;
+    }
 }
 
 float table_value(CapTail* t, uint e, uint k, uint j, uint i)
@@ -137,63 +163,79 @@ public bool on_instance(SceneRoot* s, Hit h, uint instance)
     return copy == instance;
 }
 
-// The walk from `origin` (inside a surface) along `dir` (unit, into the medium) through
-// `volume`, at most `max_steps` steps, each traced through `tracer`; `ior` is the surface's IOR
-// against the outside's where `tracer` reflects by it, else 1. Draws from `rng` alone and
-// counts its queries in `rays`.
-public WalkExit walk_subsurface<T : IWalkTrace>(T tracer, float3 origin, float3 dir, SubsurfaceVolume volume, CapTail* tail, uint max_steps, float ior, inout Sampler rng, inout uint rays)
+// The walk from `origin` (inside a surface) along `dir` (unit, into the medium) through `volume`.
+// Draws from `rng` alone from here on.
+public Walk walk_start(float3 origin, float3 dir, SubsurfaceVolume volume, float ior, Sampler rng)
 {
-    WalkExit e = (WalkExit)0;
-    e.kind = WALK_NONE;
-    float3 sigma = max(volume.extinction, float3(1e-30));
+    Walk e = Walk();
+    e.kind = WALK_RUNNING;
+    e.throughput = float3(1.0);
+    e.origin = origin;
+    e.dir = dir;
+    e.ior = ior;
+    e.volume = volume;
+    e.rng = rng;
+    return e;
+}
+
+// Runs up to `steps` more steps of running walk `e`, at most `max_steps` in all, each traced
+// through `tracer`, and counts its queries in `rays`.
+public void walk_steps<T : IWalkTrace>(inout Walk e, T tracer, uint steps, CapTail* tail, uint max_steps, inout uint rays)
+{
+    float3 sigma = max(e.volume.extinction, float3(1e-30));
     // The densities against the least attenuated channel, so the hero channel's term stays
     // above exp(-17).
     float3 excess = sigma - min(sigma.x, min(sigma.y, sigma.z));
-    float3 throughput = float3(1.0);
-    float3 p = origin;
-    float3 w = dir;
-    for (uint step = 0; step < max_steps; step++)
+    for (uint end = min(e.step + steps, max_steps); e.step < end; e.step++)
     {
-        float total = throughput.x + throughput.y + throughput.z;
+        float total = e.throughput.x + e.throughput.y + e.throughput.z;
         if (!(total > 0.0) || !isfinite(total))
-            return e;
-        float3 choose = throughput / total;
-        float4 u = rng.next4();
+        {
+            e.kind = WALK_NONE;
+            e.throughput = float3(0.0);
+            return;
+        }
+        float3 choose = e.throughput / total;
+        float4 u = e.rng.next4();
         uint hero = u.x < choose.x ? 0 : u.x < choose.x + choose.y ? 1 : 2;
         float t = -log(1.0 - min(u.y, 0.99999994)) / sigma[hero];
         rays++;
         float3 positions[3];
-        Hit h = tracer.trace(p, w, t, positions);
+        Hit h = tracer.trace(e.origin, e.dir, t, positions);
         if (h.hit)
         {
-            WalkMeet met = tracer.meet(h, p, w, positions, rng);
+            WalkMeet met = tracer.meet(h, e.origin, e.dir, positions, e.rng);
             if (met.kind == WALK_NONE)
-                return e;
+            {
+                e.kind = WALK_NONE;
+                e.throughput = float3(0.0);
+                return;
+            }
             float3 a = exp(-excess * h.t);
-            float3 reached = throughput * a / dot(choose, a);
+            e.throughput = e.throughput * a / dot(choose, a);
             if (met.kind == WALK_REFLECT)
             {
-                throughput = reached;
-                p = met.origin;
-                w = met.dir;
+                e.origin = met.origin;
+                e.dir = met.dir;
                 continue;
             }
-            e.throughput = reached;
             e.kind = met.kind;
-            e.dir = met.kind == WALK_LEAVE ? met.dir : w;
+            if (met.kind == WALK_LEAVE)
+                e.dir = met.dir;
             e.origin = met.origin;
             e.normal = met.normal;
             e.hit = h;
             e.positions = positions;
-            return e;
+            return;
         }
         float3 a = exp(-excess * t);
-        throughput *= volume.albedo * sigma * a / dot(choose, sigma * a);
-        p += w * t;
-        w = sample_hg(volume.anisotropy, w, u.zw);
+        e.throughput *= e.volume.albedo * sigma * a / dot(choose, sigma * a);
+        e.origin += e.dir * t;
+        e.dir = sample_hg(e.volume.anisotropy, e.dir, u.zw);
     }
-    e.throughput = throughput * cap_tail(tail, volume.albedo, volume.anisotropy, max_steps, ior);
-    e.kind = all(e.throughput == 0.0) ? WALK_NONE : WALK_CAP;
-    e.dir = w;
-    return e;
+    if (e.step == max_steps)
+    {
+        e.throughput *= cap_tail(tail, e.volume.albedo, e.volume.anisotropy, max_steps, e.ior);
+        e.kind = all(e.throughput == 0.0) ? WALK_NONE : WALK_CAP;
+    }
 }

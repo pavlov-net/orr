@@ -55,6 +55,10 @@ pub struct ViewLighting {
     pub sss_max_steps: u32,
     /// Which subsurface vertices of a path walk.
     pub sss_depth: SubsurfaceDepth,
+    /// Whether walks in ray-dispatch path kernels reorder lanes every 8 steps, so lanes whose
+    /// walk has ended leave the hardware threads of those still walking. It changes no result,
+    /// and does nothing without reordering hardware or while no material walks.
+    pub walk_compaction: bool,
     /// Share of surface pixels whose opaque path runs, clamped to
     /// [[`MIN_PIXEL_FRACTION`], 1]. Each frame every surface pixel runs its path with this
     /// probability, chosen independently per pixel, and divides the path's estimate by it;
@@ -84,6 +88,7 @@ impl Default for ViewLighting {
             dispersion: true,
             sss_max_steps: 16,
             sss_depth: SubsurfaceDepth::FirstEvent,
+            walk_compaction: true,
             pixel_fraction: 1.0,
             camera_medium: None,
             media: MediaSettings::default(),
@@ -241,6 +246,8 @@ const DIELECTRIC_FROST: u32 = 8;
 
 /// `path`'s `SSS_PRIMARY_ONLY`.
 const SSS_PRIMARY_ONLY: u32 = 1;
+/// `path`'s `SSS_POINTS`.
+const SSS_POINTS: u32 = 1 << 1;
 
 /// `MATERIAL_NONE`.
 pub(crate) const NO_MATERIAL: u32 = u32::MAX;
@@ -683,6 +690,8 @@ pub struct ViewPass {
     /// The dielectric dispatch keeps what [`LightingKernels::record_frosted_glass`] reads:
     /// set while output's depth-of-field guide is on.
     pub frosted_glass: bool,
+    /// [`orr_scene::RasterView::walking_materials`].
+    pub walking_materials: bool,
 }
 
 /// What the background layer behind out-of-focus foreground reads in one frame. Each marked
@@ -1099,6 +1108,10 @@ impl LightingKernels {
                     0.0,
                 ),
             };
+        let walk_points = lighting.walk_compaction
+            && pass.walking_materials
+            && matches!(self.opaque, PathPipeline::Rays(_))
+            && view.device.caps().reorder;
         let path_root = PathRoot {
             scene: pass.scene,
             view: pass.view,
@@ -1138,7 +1151,7 @@ impl LightingKernels {
             sss_flags: match lighting.sss_depth {
                 SubsurfaceDepth::FirstEvent => 0,
                 SubsurfaceDepth::PrimaryOnly => SSS_PRIMARY_ONLY,
-            },
+            } | if walk_points { SSS_POINTS } else { 0 },
             pixel_fraction: lighting.pixel_fraction.clamp(MIN_PIXEL_FRACTION, 1.0),
             dof_background,
             dof_mask,
@@ -1155,6 +1168,8 @@ impl LightingKernels {
                 local: GpuPtr::NULL,
                 light_flags: 0,
                 dof_background: StorageImageIndex::NONE,
+                // Update paths do not walk.
+                sss_flags: path_root.sss_flags & !SSS_POINTS,
                 ..path_root
             };
             list.begin_pass("world cache update paths", false);

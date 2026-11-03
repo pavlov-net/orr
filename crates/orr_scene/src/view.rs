@@ -239,6 +239,8 @@ pub struct RasterView {
     /// Workgroups of one per cluster of `raster`'s smoke list, when the scene holds a smoke
     /// entry.
     pub smoke_args: Option<GpuPtr<DispatchArgs>>,
+    /// Whether paths through any material the scene holds may take a random walk.
+    pub walking_materials: bool,
     /// The view history it rendered with.
     pub history: ViewHistoryId,
     /// The scene's sky statistics, which lighting's scene pass writes and exposure reads.

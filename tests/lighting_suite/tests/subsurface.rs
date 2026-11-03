@@ -8,7 +8,7 @@ use lighting_suite::bed::{
     MILK_SPHERE, Paths, Spec, WALK_FURNACE, WALK_SLABS, WALK_SPHERE, look,
 };
 use lighting_suite::shaders::walk_probe;
-use lighting_suite::{assert_clean, device, pipeline, readback, render, run, upload};
+use lighting_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
 use openpbr_ref::Inputs;
 use openpbr_ref::walk::{
     DielectricWalks, Interface, Light as CpuLight, Medium, Shape, Walks, top_exit,
@@ -489,6 +489,66 @@ fn capped_interior_walks_keep_the_cap_tail() {
     paths.settings.sss_max_steps = 16;
     interior_matches_the_cpu_walk(&paths, MILK_SPHERE, &MILK, 4.0, 0.12);
     interior_matches_the_cpu_walk(&paths, JADE_SPHERE, &JADE, 4.0, 0.12);
+    assert_clean();
+}
+
+/// Reordering lanes inside walks moves lanes between hardware threads, so a walk must pick up where
+/// it stopped: with a coherence point after every 8 steps, at caps with one and with seven of them,
+/// a subsurface sphere and a dense interior trace the same paths as without, and still match the
+/// CPU walk. The images compare BSDF rays alone: next-event estimates differ between any two runs.
+#[test]
+fn reordering_inside_walks_changes_no_path() {
+    let caps = device().caps();
+    if !require(caps.ray_dispatch && caps.reorder, "no reordering") {
+        return;
+    }
+    let mut paths = Paths::new(
+        &KernelSet::default(),
+        PathEntry::RayDispatch,
+        settings(LightingDebugView::BsdfOnly),
+    );
+    paths.settings.max_bounces = 2;
+    for model in [WALK_SPHERE, MILK_SPHERE] {
+        let spec = Spec {
+            copies: vec![Item {
+                model,
+                linear: Mat3::IDENTITY,
+                at: Vec3::ZERO,
+            }],
+            lights: vec![Light::Directional(sun())],
+            environment: Some(FURNACE_RADIANCE),
+            eye: Vec3::new(0.0, 1.2, 4.0),
+            target: Vec3::ZERO,
+            fov_y: 0.6,
+            focus: None,
+        };
+        for sss_max_steps in [16, 64] {
+            paths.settings.sss_max_steps = sss_max_steps;
+            let mut bed = Bed::with(spec.clone());
+            paths.settings.walk_compaction = true;
+            let reordered = bed.accumulate(4, 5, &mut |list, f| {
+                assert!(f.pass().walking_materials);
+                paths.record(list, f);
+            });
+            paths.settings.walk_compaction = false;
+            let plain = render_spec(&paths, spec.clone(), 4);
+            let bits = |a: &Accumulated| {
+                a.mean
+                    .iter()
+                    .map(|p| p.map(f32::to_bits))
+                    .collect::<Vec<_>>()
+            };
+            assert!(
+                bits(&reordered) == bits(&plain),
+                "{model}, cap {sss_max_steps}: reordering inside walks changed the image"
+            );
+        }
+    }
+    paths.settings = settings(LightingDebugView::Subsurface);
+    paths.settings.max_bounces = 2;
+    paths.settings.walk_compaction = true;
+    a_lit_sphere_matches_the_cpu_walk(&paths);
+    interior_matches_the_cpu_walk(&paths, MILK_SPHERE, &MILK, 1.0, 0.02);
     assert_clean();
 }
 

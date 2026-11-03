@@ -1197,6 +1197,7 @@ impl BedFrame<'_> {
             seed: self.seed,
             dof_background: None,
             frosted_glass: false,
+            walking_materials: self.view.walking_materials,
         }
     }
 

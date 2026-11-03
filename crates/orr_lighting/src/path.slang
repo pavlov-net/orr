@@ -49,6 +49,8 @@ public static const uint LIGHT_FEEDBACK_COUNT = 1 << 0;
 
 // `PathRoot.sss_flags`: only the first vertex walks.
 public static const uint SSS_PRIMARY_ONLY = 1 << 0;
+// `PathRoot.sss_flags`: walks reorder lanes every `WALK_POINT_STEPS` steps.
+public static const uint SSS_POINTS = 1 << 1;
 
 // Subsurface surfaces whose largest mean free path is below this share of the ray cone's
 // width shade their subsurface share as diffuse reflection instead of walking.
@@ -561,20 +563,38 @@ public struct WalkExitScatter : IScatter
     }
 }
 
-// The subsurface walk of vertex `x` (parameters `p`, path depth `depth`) entered along `wi`.
-// It starts inside the traced surface, past the raster's error and the rounding of `x`'s
-// position, which grows with its magnitude and its distance from the eye, and draws from a
-// sampler of its own, keyed on one dimension of `rng`.
-public WalkExit walk_from<S : ISurface>(PathRoot r, PathVertex x, BsdfParams p, float3 wi, uint depth, inout Sampler rng, inout uint rays)
+// The subsurface walk of vertex `x` (parameters `p`) entered along `wi`. It starts inside the
+// traced surface, past the raster's error and the rounding of `x`'s position, which grows with
+// its magnitude and its distance from the eye, and draws from a sampler of its own, keyed on one
+// dimension of `rng`.
+public Walk walk_from(PathVertex x, BsdfParams p, float3 wi, inout Sampler rng)
 {
     GSurface g = x.surface;
     float magnitude = max(x.camera_distance, max(abs(g.position.x), max(abs(g.position.y), abs(g.position.z))));
     float error = gsurface_origin(g) == ORIGIN_DEFAULT ? x.origin_error : 0.0;
     float3 origin = g.position - g.geometric_normal * max(error, magnitude * F32_PRECISION);
+    return walk_start(origin, wi, bsdf_subsurface_volume(p), 1.0, walk_sampler(rng));
+}
+
+// What traces a walk on instance `instance` from a vertex at path depth `depth`.
+public WalkTrace<S> walk_tracer<S : ISurface>(PathRoot r, uint instance, uint depth)
+{
     RayCone cone = { 0.0, 0.0 };
-    WalkTrace<S> tracer = { r.scene, r.view, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0), g.instance };
-    Sampler walk = walk_sampler(rng);
-    return walk_subsurface(tracer, origin, wi, bsdf_subsurface_volume(p), r.cap_tail, r.sss_max_steps, 1.0, walk, rays);
+    WalkTrace<S> tracer = { r.scene, r.view, hit_context(HIT_SECONDARY, depth + 1, cone, 0.0), instance };
+    return tracer;
+}
+
+// How many coherence points a walk has at most: a uniform count, which every lane runs whether
+// it walks or not, and none where nothing reorders or walks.
+public uint walk_points(PathRoot r)
+{
+    return (r.sss_flags & SSS_POINTS) != 0 ? (r.sss_max_steps - 1) / WALK_POINT_STEPS : 0;
+}
+
+// Runs `walk` up to its next coherence point, or through its end without points.
+public void walk_part<T : IWalkTrace>(PathRoot r, inout Walk walk, T tracer, inout uint rays)
+{
+    walk_steps(walk, tracer, (r.sss_flags & SSS_POINTS) != 0 ? WALK_POINT_STEPS : r.sss_max_steps, r.cap_tail, r.sss_max_steps, rays);
 }
 
 // The exit vertex of a walk whose last step along `dir` reached `sh`: its normals face out.
@@ -824,9 +844,10 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
     if (alive)
         record.vertex(r, x, b, throughput, radiance, rng);
 
-    // A uniform trip count keeps the coherence point in uniform control flow. A walk takes
+    // A uniform trip count keeps the coherence points in uniform control flow. A walk takes
     // an iteration of its own, and its exit vertex the next one at the same depth.
     uint depth = 0;
+    uint points = walk_points(r);
     for (uint i = 0; i < path_iterations(r); i++)
     {
         alive = alive && depth <= r.max_bounces;
@@ -840,7 +861,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
         // The particles in front of the ray's hit, premultiplied.
         float4 particles = float4(0.0);
         bool walking = false;
-        WalkExit walk = (WalkExit)0;
+        Walk walk = Walk();
         // Constant false for records that never walk, so their kernels hold no exit code.
         bool at_exit = record.walks() && exit;
         if (alive)
@@ -880,13 +901,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
                 alive = alive && any(throughput > 0.0) && all(isfinite(throughput));
             }
             if (alive && walking)
-            {
-                walk = walk_from<S>(r, x, params, bs.wi, depth, rng, rays);
-                throughput *= walk.throughput;
-                alive = walk.kind != WALK_NONE;
-                h = walk.hit;
-                positions = walk.positions;
-            }
+                walk = walk_from(x, params, bs.wi, rng);
             else if (alive)
             {
                 bool delta = (bs.lobe & LOBE_SPECULAR) != 0;
@@ -909,6 +924,24 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
                 }
                 else
                     h = trace_closest(s.tlas, rd, MASK_OPAQUE, RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE, a, positions);
+            }
+        }
+        if (record.walks())
+        {
+            // The iteration's main point follows the walk's last part.
+            for (uint p = 0; p <= points; p++)
+            {
+                if (walk.kind == WALK_RUNNING)
+                    walk_part(r, walk, walk_tracer<S>(r, x.surface.instance, depth), rays);
+                if (p < points)
+                    C.point(uint(walk.kind == WALK_RUNNING), 1);
+            }
+            if (alive && walking)
+            {
+                throughput *= walk.throughput;
+                alive = walk.kind != WALK_NONE;
+                h = walk.hit;
+                positions = walk.positions;
             }
         }
         C.point(alive ? path_key(s, h) : coherence_key(false, 0, 0), KEY_BITS);
@@ -1080,7 +1113,7 @@ public bool lens_vertex<S : ISurface>(PathRoot r, uint2 pixel, float aperture, f
 // dispatch.
 void skip_points<C : ICoherence>(PathRoot r)
 {
-    for (uint i = 0; i < path_iterations(r); i++)
+    for (uint i = 0; i < path_iterations(r) * (walk_points(r) + 1); i++)
         C.point(coherence_key(false, 0, 0), KEY_BITS);
 }
 

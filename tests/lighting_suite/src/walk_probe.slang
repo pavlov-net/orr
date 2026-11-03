@@ -73,7 +73,9 @@ void main(uint3 id: SV_DispatchThreadID)
     {
         Sampler rng = Sampler(uint2(lane, index), i, root.seed);
         uint rays = 0;
-        WalkExit e = walk_subsurface(slab, float3(0.0), float3(0.0, 0.0, -1.0), volume, root.tail, c.max_steps, 1.0, rng, rays);
+        Walk e = walk_start(float3(0.0), float3(0.0, 0.0, -1.0), volume, 1.0, rng);
+        while (e.kind == WALK_RUNNING)
+            walk_steps(e, slab, WALK_POINT_STEPS, root.tail, c.max_steps, rays);
         if (!all(isfinite(e.throughput)))
             bad += 1.0;
         else if (e.kind == WALK_CAP || (e.kind == WALK_BOUNDARY && e.dir.z > 0.0))
