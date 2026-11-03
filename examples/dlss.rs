@@ -6,12 +6,17 @@
 //! is drawn once per presented image, so the dot advances on every presented image instead
 //! of every rendered frame.
 //!
-//! `dlss [--frames N] [--off | --2x | --3x | --4x] [--cycle] [--ui-per-present]`. The
+//! `dlss [--frames N] [--off | --2x | --3x | --4x] [--cycle] [--sdr] [--ui-per-present]`. The
 //! default is NGX's recommended mode (4x Dynamic on RTX 50). `--cycle` steps every few
 //! seconds through 2x, 4x, Dynamic and off, with SDR, PQ and scRGB requests, to show frame
-//! generation turning on and off at run time. Without frame generation the scene renders
-//! without it. DLSS ray reconstruction denoises the scene at the mode that suits the output
-//! size.
+//! generation turning on and off at run time. `--sdr` presents SDR even with Windows HDR on,
+//! except under `--cycle`, whose steps name their encodings.
+//! Without frame generation the scene renders without it. DLSS ray reconstruction denoises the
+//! scene at the mode that suits the output size.
+//!
+//! With the window focused, for comparing live: `F` steps frame generation through off, 2x, 3x,
+//! 4x and the recommended mode, `R` steps ray reconstruction through off and each quality, and
+//! `H` switches between SDR and HDR. `F` and `H` end `--cycle`.
 //!
 //! `dlss --sr [--auto | --dlaa | --quality | --balanced | --performance | --ultra-performance]
 //! [--native] [--clusters] [--headless] [--frames N] [--out file.png]` shows DLSS super
@@ -26,7 +31,7 @@ use std::time::{Duration, Instant};
 use examples::overlay::Overlay;
 use examples::scene::{FOV_Y, SUN, Showcase, TARGET, orbit_eye};
 use examples::shaders::{capture, sun_shadow};
-use examples::window::Window;
+use examples::window::{KeyCode, Window};
 use examples::{Capture, Options, PROJECT_ID, Workers, assert_clean, device, fixed_time};
 use orr::orr_gpu::{
     Format, Hazards, MemoryKind, OutputFormat, QueueKind, SpecData, Stages, TimelinePoint,
@@ -36,8 +41,8 @@ use orr::orr_output::orr_dlss::raw::Ngx;
 use orr::orr_output::orr_dlss::{Quality, SrInputs, SuperResolution};
 use orr::{
     Display, DisplayRequest, DlssSdk, FrameDesc, FrameGenerationMode, FrameTime, Lens, LitView,
-    Projection, Renderer, RendererDesc, TextureFilter, ViewDesc, ViewHooks, ViewLighting,
-    ViewOutput, ViewTarget,
+    Projection, Reconstruction, Renderer, RendererDesc, TextureFilter, ViewDesc, ViewHooks,
+    ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_math::camera::rh::view;
 use orr_math::{UVec2, Vec2, Vec3};
@@ -67,6 +72,23 @@ fn main() {
     assert_clean();
 }
 
+/// What `R` steps through.
+const RECONSTRUCTIONS: [Reconstruction; 7] = [
+    Reconstruction::Off,
+    Reconstruction::Quality(Quality::Auto),
+    Reconstruction::Quality(Quality::Dlaa),
+    Reconstruction::Quality(Quality::Quality),
+    Reconstruction::Quality(Quality::Balanced),
+    Reconstruction::Quality(Quality::Performance),
+    Reconstruction::Quality(Quality::UltraPerformance),
+];
+
+/// The entry after `current` in `list`, wrapping; the first if `current` is not in it.
+fn next<T: Copy + PartialEq>(list: &[T], current: T) -> T {
+    let at = list.iter().position(|&v| v == current);
+    list[at.map_or(0, |i| (i + 1) % list.len())]
+}
+
 /// What `--cycle` steps through: a mode and an encoding request.
 fn cycle(
     step: usize,
@@ -90,16 +112,18 @@ fn run(options: &Options) {
     let gpu = device();
     let mut window = Window::new("orr dlss", 1600, 900);
     let desc = RendererDesc::default();
-    let request = |encoding: Option<OutputFormat>| DisplayRequest {
+    let request = |encoding: Option<OutputFormat>, hdr: bool| DisplayRequest {
+        hdr,
         encoding,
         vsync: false,
         ..DisplayRequest::default()
     };
+    let mut hdr = !options.has("--sdr");
     let mut display = Display::new(
         gpu,
         window.window_handle(),
         window.display_handle(),
-        &request(None),
+        &request(None, hdr),
         desc.frames_in_flight,
     )
     .expect("display");
@@ -116,11 +140,18 @@ fn run(options: &Options) {
         .find(|(flag, _)| options.has(flag))
         .map(|(_, n)| n)
     {
-        FrameGenerationMode::Fixed(n.min(support.max_generated.max(1)))
+        FrameGenerationMode::Fixed(n.min(most))
     } else {
         recommended
     };
-    let cycling = options.has("--cycle");
+    let mut modes = vec![FrameGenerationMode::Off];
+    modes.extend((1..=most).map(FrameGenerationMode::Fixed));
+    if !modes.contains(&recommended) {
+        modes.push(recommended);
+    }
+    let mut reconstruction = Reconstruction::default();
+    let mut reconstructed = None;
+    let mut cycling = options.has("--cycle");
     let set_mode = |display: &mut Display, mode| {
         if let Some(sdk) = &sdk
             && let Err(e) = display.set_frame_generation(sdk, mode)
@@ -154,13 +185,34 @@ fn run(options: &Options) {
         if options.frames.is_some_and(|n| i >= n) || !window.pump() {
             break;
         }
+        for key in window.take_keys() {
+            match key {
+                KeyCode::KeyF => {
+                    cycling = false;
+                    let mode = next(&modes, display.frame_generation_mode());
+                    set_mode(&mut display, mode);
+                    log::info!("frame generation {:?}", display.frame_generation_mode());
+                }
+                KeyCode::KeyR => {
+                    reconstruction = next(&RECONSTRUCTIONS, reconstruction);
+                    log::info!("ray reconstruction {reconstruction:?}");
+                }
+                KeyCode::KeyH => {
+                    cycling = false;
+                    hdr = !hdr;
+                    log::info!("HDR requested: {hdr}");
+                    display.set_request(&request(None, hdr));
+                }
+                _ => {}
+            }
+        }
         let t = started.elapsed().as_secs_f64();
         if cycling {
             let now = (t / CYCLE_STEP) as usize;
             if step != Some(now) {
                 let (mode, encoding) = cycle(now, recommended, most);
                 log::info!("frame generation {mode:?}, {encoding:?} requested");
-                display.set_request(&request(Some(encoding)));
+                display.set_request(&request(Some(encoding), hdr));
                 set_mode(&mut display, mode);
                 step = Some(now);
             }
@@ -192,7 +244,9 @@ fn run(options: &Options) {
             continue;
         };
         let text = format!(
-            "{} x {}  {:?}\nframe generation {mode:?}\n{} generated per frame\nframe time {:.1} ms",
+            "{} x {}  {:?}\nframe generation {mode:?}\nray reconstruction {reconstruction:?}, ran {reconstructed:?}\n\
+             {} generated per frame\nframe time {:.1} ms\n\
+             F frame generation, R ray reconstruction, H SDR or HDR",
             extent[0],
             extent[1],
             resolved.encoding,
@@ -213,26 +267,31 @@ fn run(options: &Options) {
             ui: Some(&mut ui),
             ..ViewHooks::default()
         };
-        f.render_view(
-            &LitView {
-                scene,
-                history,
-                position: eye.as_dvec3(),
-                rotation: view::look_at_quat(eye, TARGET, Vec3::Y).inverse(),
-                projection: Projection {
-                    fov_y: FOV_Y,
-                    near: 0.05,
+        reconstructed = f
+            .render_view(
+                &LitView {
+                    scene,
+                    history,
+                    position: eye.as_dvec3(),
+                    rotation: view::look_at_quat(eye, TARGET, Vec3::Y).inverse(),
+                    projection: Projection {
+                        fov_y: FOV_Y,
+                        near: 0.05,
+                    },
+                    lens: Lens::default(),
+                    reset_history: i == 0,
+                    texture_filter: TextureFilter::Hardware,
+                    target: ViewTarget::Display,
                 },
-                lens: Lens::default(),
-                reset_history: i == 0,
-                texture_filter: TextureFilter::Hardware,
-                target: ViewTarget::Display,
-            },
-            &ViewLighting::default(),
-            &ViewOutput::default(),
-            &mut hooks,
-        )
-        .expect("render view");
+                &ViewLighting::default(),
+                &ViewOutput {
+                    reconstruction,
+                    ..ViewOutput::default()
+                },
+                &mut hooks,
+            )
+            .expect("render view")
+            .reconstruction;
         last = Some(f.end().expect("end frame"));
     }
 
