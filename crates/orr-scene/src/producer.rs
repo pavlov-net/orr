@@ -83,11 +83,12 @@ pub enum Opacity {
     /// Traced by shadow and indirect rays; drawn for primary visibility at the
     /// transparency point.
     Particle,
-    /// Traced as [`Self::Particle`], but drawn for primary visibility through the views' froxel
-    /// volumes: each triangle adds its opacity as extinction over the froxels it covers, with
-    /// its base color as scattering albedo and its emission. Smoke therefore looks soft, at the
-    /// froxels' resolution, and shows only inside the scene's `near_range`; a hook's blended
-    /// particles behind it are fogged by it.
+    /// Traced as [`Self::Particle`], but drawn for primary visibility by media apply. Inside the
+    /// scene's `near_range` each triangle adds its opacity as extinction over the froxels it
+    /// covers, with its base color as scattering albedo and its emission, so smoke there looks
+    /// soft, at the froxels' resolution, and a hook's blended particles behind it are fogged by
+    /// it. Past `near_range` each pixel takes the triangles on its ray as one layer at their mean
+    /// distance, lit at that point; a hook's particles there draw over it.
     Smoke,
 }
 

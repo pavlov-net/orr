@@ -3,7 +3,8 @@
 // that. Medium proxies the camera ray crosses are marched per pixel over its spans inside them,
 // each step lit by the froxels' isotropic light (past them, the world cache's) and by shadow rays
 // from a few points of the span, and seen through the linked medium in front of it. Smoke comes
-// with the froxels; the reference takes each smoke triangle on the ray in turn.
+// with the froxels to `near_range`, and past it from one ray per pixel; the reference takes each
+// smoke triangle on the ray in turn.
 module camera_media;
 
 import orr.abi;
@@ -181,6 +182,20 @@ struct ProxySpans : ICandidate
     }
 }
 
+// Gives `handler` every candidate of `mask` on the ray from the eye along `dir` over
+// [`t_min`, `t_max`].
+[ForceInline]
+void trace_camera<H : ICandidate>(FroxelRoot f, float3 dir, uint mask, float t_min, float t_max, inout H handler)
+{
+    RayDesc ray;
+    ray.Origin = f.view.eye_render.xyz;
+    ray.Direction = dir;
+    ray.TMin = t_min;
+    ray.TMax = t_max;
+    bool overflow;
+    trace_transmittance(f.scene.tlas, ray, mask, RAY_FLAG_NONE, handler, 0, overflow);
+}
+
 // Spans of the ray from the eye along `dir` to `t_max` through the proxies on screen.
 ProxySpans camera_spans(FroxelRoot f, float3 dir, float t_max)
 {
@@ -188,13 +203,7 @@ ProxySpans camera_spans(FroxelRoot f, float3 dir, float t_max)
     s.t_max = t_max;
     if (f.lights.proxies == 0 || !(t_max > 0.0))
         return s;
-    RayDesc ray;
-    ray.Origin = f.view.eye_render.xyz;
-    ray.Direction = dir;
-    ray.TMin = 0.0;
-    ray.TMax = t_max;
-    bool overflow;
-    trace_transmittance(f.scene.tlas, ray, MASK_MEDIUM, RAY_FLAG_NONE, s, 0, overflow);
+    trace_camera(f, dir, MASK_MEDIUM, 0.0, t_max, s);
     return s;
 }
 
@@ -388,6 +397,15 @@ struct SmokeSheet
     float3 emission;
 }
 
+// `c` as a smoke triangle; false for any other candidate.
+bool smoke_sheet(SceneRoot* scene, Candidate c, out SmokeSheet s)
+{
+    s = (SmokeSheet)0;
+    s.t = c.t;
+    return c.triangle && c.custom_index == CLASS_PARTICLE && c.cluster_id >= 0
+        && resolve_smoke(scene, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, s.albedo, s.emission, s.opacity);
+}
+
 // Keeps the nearest smoke triangle of a camera ray.
 struct NearestSheet : ICandidate
 {
@@ -404,12 +422,8 @@ struct NearestSheet : ICandidate
     {
         counted = false;
         SmokeSheet s;
-        if (c.triangle && c.custom_index == CLASS_PARTICLE && c.cluster_id >= 0 && c.t < sheet.t
-            && resolve_smoke(scene, c.instance_index, uint(c.cluster_id), c.primitive_index, c.barycentrics, s.albedo, s.emission, s.opacity))
-        {
-            s.t = c.t;
+        if (c.t < sheet.t && smoke_sheet(scene, c, s))
             sheet = s;
-        }
         return float3(1.0);
     }
 }
@@ -421,15 +435,8 @@ SmokeSheet next_sheet(FroxelRoot f, float3 dir, float after, float t_max)
 {
     NearestSheet nearest = { f.scene, (SmokeSheet)0 };
     nearest.sheet.t = positive_infinity();
-    if (f.smoke == nullptr || !(after < t_max))
-        return nearest.sheet;
-    RayDesc ray;
-    ray.Origin = f.view.eye_render.xyz;
-    ray.Direction = dir;
-    ray.TMin = after;
-    ray.TMax = t_max;
-    bool overflow;
-    trace_transmittance(f.scene.tlas, ray, MASK_PARTICLE, RAY_FLAG_NONE, nearest, 0, overflow);
+    if (f.smoke != nullptr && after < t_max)
+        trace_camera(f, dir, MASK_PARTICLE, after, t_max, nearest);
     return nearest.sheet;
 }
 
@@ -447,20 +454,23 @@ Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uin
     float3 eye = f.view.eye_render.xyz;
     Sampler rng = Sampler(pixel, f.frame, f.seed ^ MEDIA_STREAM);
     float linked_end = isinf(t) ? s.near_range : t;
-    float end = isinf(t) ? max(linked_end, spans.end()) : t;
-    float sheets_end = min(end, s.near_range);
+    // On a sky pixel smoke reaches as far as the aerial-perspective LUT.
+    float end = isinf(t) ? max(max(linked_end, spans.end()), f.smoke != nullptr ? f.ap_range : 0.0) : t;
     SmokeSheet sheet = (SmokeSheet)0;
     float sheet_after = 0.0;
     uint sheets = 0;
     float3 inscatter = float3(0.0);
     float3 through = float3(1.0);
     float x = 0.0;
-    for (uint j = 0; j < 2 * MAX_PROXY_SPANS + 1 && x < end; j++)
+    for (uint j = 0; j < 2 * MAX_PROXY_SPANS + 2 && x < end; j++)
     {
         float next;
         uint active = spans.piece(x, end, next);
+        if (x < linked_end)
+            next = min(next, linked_end);
         float h = spans.step_size(s, active, next - x, r.segment_steps);
-        uint steps = uint(ceil((next - x) / h - 1e-3));
+        // Past the linked medium and the proxies only smoke is left.
+        uint steps = active == 0 && x >= linked_end ? 0 : uint(ceil((next - x) / h - 1e-3));
         h = (next - x) / float(max(steps, 1u));
         uint k = 0;
         float step_at = steps > 0 ? x + rng.next() * h : next;
@@ -469,7 +479,7 @@ Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uin
         {
             if (sheet_after >= 0.0)
             {
-                sheet = next_sheet(f, dir, sheets < REFERENCE_SHEETS ? sheet_after : sheets_end, sheets_end);
+                sheet = next_sheet(f, dir, sheets < REFERENCE_SHEETS ? sheet_after : end, end);
                 sheet_after = -1.0;
             }
             if (!(k < steps || sheet.t < next))
@@ -520,7 +530,7 @@ Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uin
                 }
                 source += sigma_s * multiple_scattered<M>(set, p);
             }
-            source *= medium_transmittance<M>(data, eye, dir, min(d, linked_end));
+            source *= medium_transmittance<M>(data, eye, dir, at_sheet ? d : min(d, linked_end));
             if (at_sheet)
             {
                 inscatter += through * source;
@@ -541,6 +551,39 @@ Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uin
     return out;
 }
 
+// The smoke triangles of a camera ray past `near_range`, in any order: what they let through,
+// and their opacity-weighted distance, albedo and emission.
+struct FarSmoke : ICandidate
+{
+    SceneRoot* scene;
+    float through = 1.0;
+    float weight = 0.0;
+    float distance = 0.0;
+    float3 albedo = float3(0.0);
+    float3 emission = float3(0.0);
+
+    bool positions(Candidate c)
+    {
+        return false;
+    }
+
+    [mutating]
+    float3 transmittance(Candidate c, out bool counted)
+    {
+        counted = false;
+        SmokeSheet s;
+        if (smoke_sheet(scene, c, s))
+        {
+            through *= 1.0 - s.opacity;
+            weight += s.opacity;
+            distance += s.opacity * s.t;
+            albedo += s.opacity * s.albedo;
+            emission += s.opacity * s.emission;
+        }
+        return float3(1.0);
+    }
+}
+
 // The camera segment's in-scatter (pre-exposed) and transmittance over `t` m along unit `dir`,
 // the ray through `pixel`: `linked_fog`, or through the proxies of `spans` where it crosses
 // any. Sky pixels (`t` infinite) take the froxels alone; the environment carries the rest.
@@ -551,6 +594,41 @@ Fog camera_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 
     if (spans.count != 0 && t > 0.0)
         return proxy_fog<S, M>(r, f, pixel, dir, t, spans);
     return linked_fog<M>(r, f, pixel, dir, isinf(t) ? f.scene.near_range : t);
+}
+
+// `camera_fog`, with the smoke past `near_range` on the ray as one lit layer at its mean distance,
+// its color the mean weighted by opacity: the fog in front of the layer, the layer, and through
+// the layer what lies behind it. The reference takes that smoke in its own march. On sky pixels
+// the fog ends at `near_range` and the environment holds the medium past it, so the difference of
+// the two fogs puts back what the layer must not take from the stretch in front of it.
+Fog smoky_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uint2 pixel, float3 dir, float t, ProxySpans spans)
+{
+    float near_range = f.scene.near_range;
+    FarSmoke smoke = { f.scene };
+    if (r.reference == 0 && f.lights.far_smoke != 0 && t > near_range)
+        trace_camera(f, dir, MASK_PARTICLE, near_range, t, smoke);
+    bool layer = smoke.weight > 0.0;
+    float smoke_t = layer ? smoke.distance / smoke.weight : t;
+    Fog front = (Fog)0;
+    Fog fog = (Fog)0;
+    // One call site: a linked surface and shadow ray compile once per call.
+    for (uint k = layer ? 0 : 1; k < 2; k++)
+    {
+        front = fog;
+        fog = camera_fog<S, M>(r, f, pixel, dir, k == 0 ? smoke_t : t, spans);
+    }
+    if (!layer)
+        return fog;
+    ViewConstants* v = f.view;
+    Sampler rng = Sampler(pixel, f.frame, f.seed ^ PARTICLE_STREAM);
+    float3 p = v.eye_render.xyz + dir * smoke_t;
+    float3 light = particle_light<S, M>(r.lighting, p, -dir, f.smoke_anisotropy, rng) + multiple_scattered<M>(f.set, p);
+    float3 color = (smoke.albedo * light + smoke.emission) / smoke.weight;
+    float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
+    fog.inscatter = front.inscatter + front.transmittance * (1.0 - smoke.through) * color * pre_exposure
+        + smoke.through * (fog.inscatter - front.inscatter);
+    fog.transmittance *= smoke.through;
+    return fog;
 }
 
 // Media apply for `pixel`: L = S + T x L over the camera segment to the pixel's surface, or
@@ -583,7 +661,7 @@ public void media_apply<S : ISurface, M : IMedium>(MediaApplyRoot r, uint2 pixel
     // One call site: a linked surface and shadow ray compile once per call.
     for (uint layer = 0; layer < (layered ? 2u : 1u); layer++)
     {
-        Fog fog = camera_fog<S, M>(r, f, pixel, dir, layer == 0 ? t : tb, spans);
+        Fog fog = smoky_fog<S, M>(r, f, pixel, dir, layer == 0 ? t : tb, spans);
         if (layer == 1)
         {
             r.dof_background.get<RWTexture2D<float4>>()[pixel] = float4(apply_hdr_ceiling(fog.inscatter + fog.transmittance * b.rgb), b.a);

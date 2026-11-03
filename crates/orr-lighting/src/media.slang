@@ -190,7 +190,9 @@ public struct FroxelLights
     public uint changed;
     // Medium proxies in the view's frustum this frame; 0 spares media apply its ray per pixel.
     public uint proxies;
-    public uint _pad0;
+    // 1 when a visible smoke triangle reaches past `near_range` this frame; 0 spares media apply
+    // its ray per pixel for smoke there.
+    public uint far_smoke;
 }
 
 // One frame's froxel volume of a view, for passes that read it after its integration.

@@ -243,7 +243,7 @@ impl MediaView {
             count: 0,
             changed: 0,
             proxies: 0,
-            _pad0: 0,
+            far_smoke: 0,
         };
         Ok(Self {
             volumes: None,
