@@ -37,6 +37,8 @@ const HEADLESS_FRAMES: u64 = 120;
 const FIRST_FRAME: u64 = 500;
 const FOV_Y: f32 = 0.9;
 const TARGET: Vec3 = Vec3::new(0.0, 1.5, 0.0);
+/// Meters. At 16:9 all the buildings stay in the frame at every angle.
+const ORBIT_RADIUS: f32 = 36.0;
 /// Radians per second.
 const ORBIT_RATE: f64 = 0.1;
 /// Where a still camera stands on the orbit, radians.
@@ -308,7 +310,12 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         } else {
             STILL_ANGLE + t * ORBIT_RATE
         };
-        let eye = TARGET + Vec3::new(angle.sin() as f32 * 16.0, 4.5, angle.cos() as f32 * 16.0);
+        let eye = TARGET
+            + Vec3::new(
+                angle.sin() as f32 * ORBIT_RADIUS,
+                4.5,
+                angle.cos() as f32 * ORBIT_RADIUS,
+            );
 
         let mut f = renderer
             .begin_frame(FrameDesc {
