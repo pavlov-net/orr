@@ -163,6 +163,7 @@ fn cook() -> Arc<[u8]> {
         base_color: [0.1, 0.1, 0.1],
         emission_color: [1.0, 0.55, 0.25],
         emission_luminance: 20_000.0,
+        double_sided: 1,
         ..Material::default()
     };
     let ground = Material {
