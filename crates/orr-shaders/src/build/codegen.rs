@@ -171,11 +171,11 @@ fn emit_module(out: &mut String, item: &str, k: &Kernel<'_>, manifest: &Path) {
         .map_or_else(String::new, |p| p.display().to_string());
     let _ = writeln!(
         out,
-        "{item}: ::orr_shaders::ShaderModule = ::orr_shaders::ShaderModule {{\n    name: {name:?},\n    kernel: {name:?},\n    spirv: ::orr_shaders::aligned_spirv!({spv:?}),\n    omm: {omm},\n    inline_root: {inline_root},\n    debug_info: {debug_info:?},\n    hash: {hash:#018x},\n    manifest: {manifest:?},\n    entry_points: &[",
+        "{item}: ::orr_shaders::ShaderModule = ::orr_shaders::ShaderModule {{\n    name: {name:?},\n    kernel: {name:?},\n    spirv: ::orr_shaders::aligned_spirv!({spv:?}),\n    omm: {omm},\n    inline_root_bytes: {inline_root_bytes},\n    debug_info: {debug_info:?},\n    hash: {hash:#018x},\n    manifest: {manifest:?},\n    entry_points: &[",
         name = k.name,
         spv = k.spv.display().to_string(),
         omm = k.model.omm,
-        inline_root = match &k.model.root {
+        inline_root_bytes = match &k.model.root {
             Some(root) if k.model.inline_root => k.plans[root].size,
             _ => 0,
         },

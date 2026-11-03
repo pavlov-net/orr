@@ -21,11 +21,11 @@ pub struct MeshPipelineDesc<'a> {
     pub mesh: ShaderStage<'a>,
     /// `None`: no pixel stage; only depth is written.
     pub pixel: Option<ShaderStage<'a>>,
-    /// Colour targets in attachment order.
+    /// Color targets in attachment order.
     pub colors: &'a [ColorTarget],
     pub depth: Option<DepthTarget>,
     pub raster: RasterState,
-    /// Rasterisation samples per pixel: 1, or more for pipelines with no targets.
+    /// Rasterization samples per pixel: 1, or more for pipelines with no targets.
     pub samples: u32,
 }
 
@@ -58,7 +58,7 @@ impl Drop for MeshPipeline {
     }
 }
 
-/// A colour attachment of [`Rendering`]: mip 0, layer 0 of a texture with `COLOR` usage.
+/// A color attachment of [`Rendering`]: mip 0, layer 0 of a texture with `COLOR` usage.
 #[derive(Clone, Copy)]
 pub struct ColorAttachment<'a> {
     pub texture: &'a Texture,
@@ -133,12 +133,12 @@ fn check(shared: &Shared, d: &MeshPipelineDesc<'_>, name: &str) -> Result<(), Er
     let max = shared.caps.limits.max_color_targets;
     if d.colors.len() > max as usize {
         return bad(format!(
-            "{} colour targets, the device has {max}",
+            "{} color targets, the device has {max}",
             d.colors.len()
         ));
     }
     if let Some(t) = d.colors.iter().find(|t| t.format.is_depth()) {
-        return bad(format!("{:?} is not a colour format", t.format));
+        return bad(format!("{:?} is not a color format", t.format));
     }
     if let Some(t) = d.depth.filter(|t| !t.format.is_depth()) {
         return bad(format!("{:?} is not a depth format", t.format));
@@ -152,7 +152,7 @@ fn check(shared: &Shared, d: &MeshPipelineDesc<'_>, name: &str) -> Result<(), Er
     if d.raster.conservative && !shared.caps.conservative_raster {
         return Err(Error::Unsupported {
             device: shared.caps.device_name.clone(),
-            missing: "conservative rasterisation (VK_EXT_conservative_rasterization)".into(),
+            missing: "conservative rasterization (VK_EXT_conservative_rasterization)".into(),
         });
     }
     Ok(())
@@ -196,9 +196,8 @@ impl Shared {
         };
         let bias = r.depth_bias.unwrap_or_default();
         let dynamic = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-        let stages: Vec<_> = parts.iter().map(|(_, p)| p).collect();
         self.create_pipeline(
-            &stages,
+            &parts.iter().map(|(_, p)| p).collect::<Vec<_>>(),
             extra,
             name,
             "vkCreateGraphicsPipelines",
@@ -279,7 +278,8 @@ impl Device {
     /// Creates a mesh pipeline. Viewport and scissor are dynamic:
     /// [`crate::CommandList::begin_rendering`] sets both to the rendering extent and
     /// [`crate::CommandList::set_scissor`] narrows the scissor. Clip-space y points down the
-    /// target: y = -1 is row 0.
+    /// target: y = -1 is row 0. Threads asking for one pipeline at once compile it once: the
+    /// others wait for it.
     pub fn create_mesh_pipeline(
         &self,
         d: &MeshPipelineDesc<'_>,

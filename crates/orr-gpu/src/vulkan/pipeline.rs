@@ -1,5 +1,5 @@
-//! Shader stages and compute pipelines in descriptor-heap mode with the root at binding
-//! (0, 0).
+//! Shader stages and compute pipelines in descriptor-heap mode, with the root at binding (0, 0)
+//! or in the push data.
 
 use std::borrow::Cow;
 use std::ffi::CStr;
@@ -15,14 +15,14 @@ use super::garbage::Item;
 use super::spirv;
 use crate::{EntryPoint, Error, ShaderModule, SpecData, Stage};
 
-/// One shader stage of a pipeline: SPIR-V words, the entry point and specialisation data.
+/// One shader stage of a pipeline: SPIR-V words, the entry point and specialization data.
 #[derive(Clone, Copy, Debug)]
 pub struct ShaderStage<'a> {
     pub spirv: &'a [u32],
     /// `spirv` declares the opacity-micromap execution mode, which needs `Caps::omm`.
     pub omm: bool,
     /// The size of the root the kernel holds in the push data; 0 for a root in GPU memory.
-    pub inline_root: u32,
+    pub inline_root_bytes: u32,
     /// The path of `spirv`'s separated debug info, handed to Aftermath; empty for none.
     pub debug_info: &'a str,
     pub entry: &'a EntryPoint,
@@ -38,7 +38,7 @@ impl<'a> ShaderStage<'a> {
         Ok(Self {
             spirv: module.spirv,
             omm: module.omm,
-            inline_root: module.inline_root,
+            inline_root_bytes: module.inline_root_bytes,
             debug_info: module.debug_info,
             entry,
             spec,
@@ -67,7 +67,7 @@ fn root_mapping() -> vk::DescriptorSetAndBindingMappingEXT<'static> {
 pub struct ComputePipeline {
     pub(crate) raw: vk::Pipeline,
     /// The size of the root the kernel holds in the push data; 0 for a root in GPU memory.
-    pub(crate) inline_root: u32,
+    pub(crate) inline_root_bytes: u32,
     workgroup: [u32; 3],
     shared: Arc<Shared>,
 }
@@ -133,13 +133,12 @@ impl Shared {
     }
 }
 
-/// What a stage's create info points to: code, root mapping and specialisation entries.
+/// What a stage's create info points to: code, root mapping and specialization entries.
 pub(super) struct StageParts<'a> {
     code: Cow<'a, [u32]>,
     entry: &'a CStr,
-    mappings: [vk::DescriptorSetAndBindingMappingEXT<'static>; 1],
-    /// The root is in the push data, so the stage carries no mapping.
-    inline_root: bool,
+    /// Empty for a root in the push data.
+    mappings: Vec<vk::DescriptorSetAndBindingMappingEXT<'static>>,
     map_entries: Vec<vk::SpecializationMapEntry>,
     spec: &'a [u8],
 }
@@ -148,7 +147,6 @@ pub(super) struct StageParts<'a> {
 pub(super) struct StageChain<'p> {
     module: vk::ShaderModuleCreateInfo<'p>,
     mapping: vk::ShaderDescriptorSetAndBindingMappingInfoEXT<'p>,
-    inline_root: bool,
     spec: vk::SpecializationInfo<'p>,
     entry: &'p CStr,
 }
@@ -166,6 +164,19 @@ impl<'a> StageParts<'a> {
                 "{name}: {:?} is a {:?} entry, not {want:?}",
                 s.entry.name, s.entry.stage
             )));
+        }
+        match want {
+            Stage::RayGen if s.inline_root_bytes == 0 => {
+                return Err(Error::Shader(format!(
+                    "{name}: a ray-dispatch kernel declares its root with ORR_ROOT_INLINE"
+                )));
+            }
+            Stage::Task | Stage::Mesh | Stage::Pixel if s.inline_root_bytes > 0 => {
+                return Err(Error::Shader(format!(
+                    "{name}: a {want:?} entry cannot use ORR_ROOT_INLINE"
+                )));
+            }
+            _ => {}
         }
         if s.omm && !shared.caps.omm {
             return Err(Error::Shader(format!(
@@ -198,10 +209,13 @@ impl<'a> StageParts<'a> {
             }
         }
         Ok(Self {
-            inline_root: s.inline_root > 0,
             code,
             entry: s.entry.name,
-            mappings: [root_mapping()],
+            mappings: if s.inline_root_bytes > 0 {
+                Vec::new()
+            } else {
+                vec![root_mapping()]
+            },
             map_entries: s
                 .spec
                 .entries
@@ -233,7 +247,6 @@ impl<'a> StageParts<'a> {
                 .map_entries(&self.map_entries)
                 .data(self.spec),
             entry: self.entry,
-            inline_root: self.inline_root,
         }
     }
 }
@@ -252,7 +265,8 @@ impl StageChain<'_> {
             info.specialization_info(&self.spec)
         };
         let info = info.push(&mut self.module);
-        if self.inline_root {
+        // Ray-dispatch pipelines with this struct on the stage miss every pipeline cache.
+        if self.mapping.mapping_count == 0 {
             info
         } else {
             info.push(&mut self.mapping)
@@ -315,7 +329,7 @@ impl Device {
     ) -> Result<ComputePipeline, Error> {
         Ok(ComputePipeline {
             raw: self.shared.create_compute(s, self.creation_flags, name)?,
-            inline_root: s.inline_root,
+            inline_root_bytes: s.inline_root_bytes,
             workgroup: s.entry.workgroup,
             shared: Arc::clone(&self.shared),
         })

@@ -60,7 +60,7 @@ pub(crate) mod decoration {
 }
 
 pub(crate) const STORAGE_UNIFORM: u32 = 2;
-pub(crate) const STORAGE_PUSH_CONSTANT: u32 = 9;
+const STORAGE_PUSH_CONSTANT: u32 = 9;
 pub(crate) const STORAGE_PHYSICAL: u32 = 5349;
 const EXECUTION_MODE_OMM_ID: u32 = 6031;
 
