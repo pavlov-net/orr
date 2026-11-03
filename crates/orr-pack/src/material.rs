@@ -68,6 +68,9 @@ pub struct Material {
     pub displacement_max: f32,
     /// [`Self::OPAQUE`], [`Self::MASK`] or [`Self::BLEND`].
     pub alpha_mode: u8,
+    /// By default (0), back faces are not drawn and do not emit light, but rays still hit them
+    /// and they cast shadows. Nonzero draws both sides and both sides emit. Transparent surfaces
+    /// and strands show both sides either way.
     pub double_sided: u8,
     pub thin_walled: u8,
     /// Linked surface id; 0 is the standard surface.
