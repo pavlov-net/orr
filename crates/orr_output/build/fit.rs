@@ -5,8 +5,8 @@
 use crate::psf;
 use crate::pyramid::{self, Plane};
 
-// The reference pixel pitch the tables are fitted at: a 36 mm sensor 3840 pixels across.
-pub const REFERENCE_PITCH_UM: f64 = 36000.0 / 3840.0;
+// The reference pixel pitch the tables are fitted at: a 20.25 mm sensor 2160 pixels high.
+pub const REFERENCE_PITCH_UM: f64 = 20250.0 / 2160.0;
 pub const F_NUMBERS: usize = 10;
 pub const F_MIN: f64 = 4.0;
 pub const F_MAX: f64 = 22.0;

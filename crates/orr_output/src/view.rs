@@ -80,8 +80,7 @@ pub enum GlareMethod {
     #[default]
     Bands,
     /// FFT convolution with the PSF itself: the blades' diffraction spikes and the far tail,
-    /// out to a quarter of the image's longer side. Costlier in time and memory (about
-    /// 100 MB at 4K).
+    /// out to 4/9 of the image's height. Costlier in time and memory (about 100 MB at 4K).
     Fft,
 }
 

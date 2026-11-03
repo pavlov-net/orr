@@ -104,9 +104,12 @@ impl Projection {
 /// The lens the camera effects read.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Lens {
-    /// Focal length = sensor_width / (2 tan(fov_x / 2)). With the output extent it also gives
-    /// the pixel pitch, which sets how many pixels glare reaches.
+    /// Focal length = sensor_width / (2 tan(fov_x / 2)).
     pub sensor_width_mm: f32,
+    /// With the output height it gives the pixel pitch, which sets how many pixels glare
+    /// reaches: the same share of the output's height at any aspect ratio. It need not follow
+    /// `sensor_width_mm`, and is not meant to change with the view's shape.
+    pub sensor_height_mm: f32,
     /// Fraction of the time between presented images the shutter is open; 0 = no motion blur.
     pub shutter: f32,
     pub depth_of_field: Option<DepthOfField>,
@@ -118,6 +121,7 @@ impl Default for Lens {
     fn default() -> Self {
         Self {
             sensor_width_mm: 36.0,
+            sensor_height_mm: 20.25,
             shutter: 0.5,
             depth_of_field: None,
             glare: Some(Glare { strength: 1.0 }),

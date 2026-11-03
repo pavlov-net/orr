@@ -38,8 +38,8 @@ pub struct GlarePass<'a> {
     pub extent: [u32; 2],
     /// The render's view constants: the exposure slots.
     pub view: GpuPtr<ViewConstants>,
-    /// `Lens::sensor_width_mm`, which with the extent gives the pixel pitch.
-    pub sensor_width_mm: f32,
+    /// `Lens::sensor_height_mm`, which with the extent's height gives the pixel pitch.
+    pub sensor_height_mm: f32,
     /// `Lens::glare`; `None` records nothing and frees the view's chain.
     pub glare: Option<Glare>,
     /// The display, whose peak moves the HDR rendition's F-number.
@@ -65,7 +65,7 @@ pub struct GlareComposite {
 /// The reference pixel pitch over the view's, and the stops the HDR rendition's F-number
 /// moves down by.
 pub(crate) fn lens_terms(pass: &GlarePass<'_>) -> (f32, f32) {
-    let pitch_um = 1000.0 * pass.sensor_width_mm / pass.extent[0] as f32;
+    let pitch_um = 1000.0 * pass.sensor_height_mm / pass.extent[1] as f32;
     let hdr_shift = match pass.display.encoding {
         OutputFormat::Sdr => 0.0,
         _ => (pass.display.peak_nits.max(GT7_SDR_NITS) / GT7_SDR_NITS).log2(),

@@ -1366,7 +1366,7 @@ impl<'a> Frame<'a> {
                 source: chain.rr_output,
                 extent,
                 view: raster.view,
-                sensor_width_mm: view.lens.sensor_width_mm,
+                sensor_height_mm: view.lens.sensor_height_mm,
                 glare: view.lens.glare.filter(|_| tonemapped && look),
                 display: &resolved,
                 frame: id,
