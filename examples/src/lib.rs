@@ -11,8 +11,8 @@ use orr::orr_gpu::{Allocation, Device, DeviceDesc, QueueRequest};
 use orr::orr_output::orr_dlss::Uuid;
 use orr::orr_pack::{Archive, AssetId};
 use orr::{
-    Affine3, DlssSdk, FrameDesc, FrameTime, LoadState, Loading, MountId, PackSource, Renderer,
-    Screenshot,
+    Affine3, DlssSdk, FrameDesc, FrameTime, Lens, LoadState, Loading, MountId, PackSource,
+    Renderer, Screenshot,
 };
 use orr_math::{Mat3, Vec3};
 
@@ -90,6 +90,57 @@ pub fn enable_dlss(renderer: &mut Renderer) -> bool {
 pub fn assert_clean() {
     let messages = device().validation_messages();
     assert_eq!(messages, 0, "validation messages (see the log)");
+}
+
+/// The lens effects a run can compare by eye: `--no-glare` and `--no-motion-blur` turn them off
+/// from the start, the `G` and `B` keys switch them while it runs.
+#[derive(Debug)]
+pub struct LensSwitches {
+    glare: bool,
+    motion_blur: bool,
+}
+
+impl LensSwitches {
+    pub fn new(options: &Options) -> Self {
+        Self {
+            glare: !options.has("--no-glare"),
+            motion_blur: !options.has("--no-motion-blur"),
+        }
+    }
+
+    /// Switches the effect `key` belongs to, if any, and logs it.
+    pub fn press(&mut self, key: window::KeyCode) {
+        match key {
+            window::KeyCode::KeyG => self.glare = !self.glare,
+            window::KeyCode::KeyB => self.motion_blur = !self.motion_blur,
+            _ => return,
+        }
+        log::info!("{self}");
+    }
+
+    /// The default lens with the switched-off effects removed.
+    pub fn lens(&self) -> Lens {
+        let mut lens = Lens::default();
+        if !self.glare {
+            lens.glare = None;
+        }
+        if !self.motion_blur {
+            lens.shutter = 0.0;
+        }
+        lens
+    }
+}
+
+impl std::fmt::Display for LensSwitches {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let on = |b| if b { "on" } else { "off" };
+        write!(
+            f,
+            "glare {}, motion blur {}",
+            on(self.glare),
+            on(self.motion_blur)
+        )
+    }
 }
 
 /// How an example runs.

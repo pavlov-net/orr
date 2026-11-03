@@ -6,17 +6,18 @@
 //! is drawn once per presented image, so the dot advances on every presented image instead
 //! of every rendered frame.
 //!
-//! `dlss [--frames N] [--off | --2x | --3x | --4x] [--cycle] [--sdr] [--ui-per-present]`. The
-//! default is NGX's recommended mode (4x Dynamic on RTX 50). `--cycle` steps every few
-//! seconds through 2x, 4x, Dynamic and off, with SDR, PQ and scRGB requests, to show frame
-//! generation turning on and off at run time. `--sdr` presents SDR even with Windows HDR on,
-//! except under `--cycle`, whose steps name their encodings.
+//! `dlss [--frames N] [--off | --2x | --3x | --4x] [--cycle] [--sdr] [--no-glare]
+//! [--no-motion-blur] [--ui-per-present]`. The default is NGX's recommended mode (4x Dynamic on
+//! RTX 50). `--cycle` steps every few seconds through 2x, 4x, Dynamic and off, with SDR, PQ and
+//! scRGB requests, to show frame generation turning on and off at run time. `--sdr` presents SDR
+//! even with Windows HDR on, except under `--cycle`, whose steps name their encodings.
 //! Without frame generation the scene renders without it. DLSS ray reconstruction denoises the
 //! scene at the mode that suits the output size.
 //!
 //! With the window focused, for comparing live: `F` steps frame generation through off, 2x, 3x,
-//! 4x and the recommended mode, `R` steps ray reconstruction through off and each quality, and
-//! `H` switches between SDR and HDR. `F` and `H` end `--cycle`.
+//! 4x and the recommended mode, `R` steps ray reconstruction through off and each quality, `H`
+//! switches between SDR and HDR, `G` switches glare and `B` switches motion blur. `F` and `H` end
+//! `--cycle`.
 //!
 //! `dlss --sr [--auto | --dlaa | --quality | --balanced | --performance | --ultra-performance]
 //! [--native] [--clusters] [--headless] [--frames N] [--out file.png]` shows DLSS super
@@ -32,7 +33,9 @@ use examples::overlay::Overlay;
 use examples::scene::{FOV_Y, SUN, Showcase, TARGET, orbit_eye};
 use examples::shaders::{capture, sun_shadow};
 use examples::window::{KeyCode, Window};
-use examples::{Capture, Options, PROJECT_ID, Workers, assert_clean, device, fixed_time};
+use examples::{
+    Capture, LensSwitches, Options, PROJECT_ID, Workers, assert_clean, device, fixed_time,
+};
 use orr::orr_gpu::{
     Format, Hazards, MemoryKind, OutputFormat, QueueKind, SpecData, Stages, TimelinePoint,
 };
@@ -151,6 +154,7 @@ fn run(options: &Options) {
     }
     let mut reconstruction = Reconstruction::default();
     let mut reconstructed = None;
+    let mut switches = LensSwitches::new(options);
     let mut cycling = options.has("--cycle");
     let set_mode = |display: &mut Display, mode| {
         if let Some(sdk) = &sdk
@@ -204,7 +208,7 @@ fn run(options: &Options) {
                     log::info!("HDR requested: {hdr}");
                     display.set_request(&request(None, hdr));
                 }
-                _ => {}
+                _ => switches.press(key),
             }
         }
         let t = started.elapsed().as_secs_f64();
@@ -245,9 +249,9 @@ fn run(options: &Options) {
             continue;
         };
         let text = format!(
-            "{} x {}  {:?}\nframe generation {mode:?}\nray reconstruction {reconstruction:?}, ran {reconstructed:?}\n\
+            "{} x {}  {:?}\nframe generation {mode:?}\nray reconstruction {reconstruction:?}, ran {reconstructed:?}\n{switches}\n\
              {} generated per frame\nframe time {:.1} ms\n\
-             F frame generation, R ray reconstruction, H SDR or HDR",
+             F frame generation, R ray reconstruction, H SDR or HDR, G glare, B motion blur",
             extent[0],
             extent[1],
             resolved.encoding,
@@ -279,7 +283,7 @@ fn run(options: &Options) {
                         fov_y: FOV_Y,
                         near: 0.05,
                     },
-                    lens: Lens::default(),
+                    lens: switches.lens(),
                     reset_history: i == 0,
                     texture_filter: TextureFilter::Hardware,
                     target: ViewTarget::Display,
