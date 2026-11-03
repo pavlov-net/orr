@@ -90,6 +90,21 @@ pub(crate) fn decode<'a>(file: &'a [u8], expect: &Identity) -> Result<&'a [u8], 
     Ok(payload)
 }
 
+/// The bytes `vkGetPipelineCacheData` would write for `cache`.
+fn data_size(device: &ash::Device, cache: vk::PipelineCache) -> Option<usize> {
+    let mut size = 0;
+    // SAFETY: the cache is live, and a null data pointer asks only for the size.
+    let queried = unsafe {
+        (device.fp_v1_0().get_pipeline_cache_data)(
+            device.handle(),
+            cache,
+            &mut size,
+            std::ptr::null_mut(),
+        )
+    };
+    (queried == vk::Result::SUCCESS).then_some(size)
+}
+
 pub(crate) struct PipelineCache {
     path: Option<PathBuf>,
     identity: Identity,
@@ -128,7 +143,7 @@ impl Drop for Compiling<'_> {
 
 impl PipelineCache {
     /// Opens the cache at `path`. A missing, damaged or foreign file starts it empty; so does one
-    /// the driver refuses, which is removed.
+    /// the driver refuses, which is removed, or ignores, which the next save replaces.
     pub(crate) fn open(
         device: &ash::Device,
         props: &vk::PhysicalDeviceProperties,
@@ -180,19 +195,37 @@ impl PipelineCache {
             vk::Result::ERROR_OUT_OF_HOST_MEMORY,
             vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
         ];
-        let created = match create(initial) {
-            Err(e) if !initial.is_empty() && !oom.contains(&e) => {
-                log::warn!(
-                    "pipeline cache {}: the driver refused the file ({e:?})",
-                    path.display()
-                );
-                cache.rejected = Some(format!("the driver refused it ({e:?})"));
-                let _ = std::fs::remove_file(path);
-                create(&[])
+        // A driver takes data it finds incompatible as an empty cache and reports success. The
+        // cache is then no larger than a new one, and a file with pipelines in it is larger.
+        let ignored = |pc: vk::PipelineCache| {
+            let Ok(empty) = create(&[]) else {
+                return false;
+            };
+            let sizes = (data_size(device, pc), data_size(device, empty));
+            // SAFETY: the cache was never used.
+            unsafe { device.destroy_pipeline_cache(empty, None) };
+            matches!(sizes, (Some(size), Some(new)) if size <= new && initial.len() > new)
+        };
+        let created = create(initial);
+        let unusable = match &created {
+            Err(e) if !initial.is_empty() && !oom.contains(e) => {
+                Some(format!("the driver refused it ({e:?})"))
             }
-            other => {
-                cache.loaded = other.is_ok() && !initial.is_empty();
-                other
+            Ok(pc) if !initial.is_empty() && ignored(*pc) => Some("the driver ignored it".into()),
+            _ => None,
+        };
+        let created = match unusable {
+            Some(why) => {
+                log::warn!("pipeline cache {}: {why}", path.display());
+                cache.rejected = Some(why);
+                created.or_else(|_| {
+                    let _ = std::fs::remove_file(path);
+                    create(&[])
+                })
+            }
+            None => {
+                cache.loaded = created.is_ok() && !initial.is_empty();
+                created
             }
         };
         match created {
