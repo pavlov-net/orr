@@ -25,8 +25,8 @@ use orr_cook::{
     MeshSettings, Placement, Primaries, PrototypeSpec, SectionSpec, Source, TextureSettings, Usage,
 };
 use orr_gpu::{
-    GpuPtr, Hazards, KernelSet, MemoryKind, QueueKind, SamplerIndex, ShaderModule, Stages, Texture,
-    TextureRegion,
+    ComputePipeline, GpuPtr, Hazards, KernelSet, MemoryKind, QueueKind, SamplerIndex, ShaderModule,
+    Stages, Texture, TextureRegion,
 };
 use orr_pack::clip::Clip;
 use orr_pack::instance::InstanceRecord;
@@ -1804,6 +1804,35 @@ fn a_change_of_aspect_adds_no_motion() {
     assert_clean();
 }
 
+/// A camera that turns past 90 degrees between frames sees points that were behind it, whose
+/// motion runs off the previous image on their own side, not mirrored through its center.
+#[test]
+fn a_point_behind_the_previous_camera_moves_off_its_own_side() {
+    let _serial = serial();
+    let mut w = World::new(&KernelSet {
+        modules: &[],
+        surfaces: 0,
+    });
+    let placed = place(&mut w, &showcase());
+    let eye = DVec3::new(0.0, 50.0, 0.0);
+    let shot = |frame, yaw: f64| Shot {
+        focus: Some(DVec3::ZERO),
+        jitter: Vec2::ZERO,
+        ..Shot::at(eye, eye + DVec3::new(-yaw.sin(), 0.0, -yaw.cos()), frame)
+    };
+    shoot(&mut w, &placed, &shot(1, 0.0));
+    // The center now looks along (-sin yaw, 0, -cos yaw) in the previous view: behind it, and
+    // to its left.
+    let motion = shoot(&mut w, &placed, &shot(2, 120f64.to_radians())).motion;
+    assert!(
+        motion.iter().flatten().all(|m| m.is_finite()),
+        "non-finite motion"
+    );
+    let center = motion[(EXTENT[1] / 2 * EXTENT[0] + EXTENT[0] / 2) as usize];
+    assert!(center[0] < -1.0, "the center moves {center:?}");
+    assert_clean();
+}
+
 /// The raster error code most pixels of copy `id` carry.
 fn error_code(frame: &Frame, id: u32) -> u32 {
     let mut codes: Vec<u32> = frame
@@ -2286,6 +2315,17 @@ fn shoot_with(
     shot: &Shot,
     write: impl FnOnce(&mut SceneWriter<'_>),
 ) -> Frame {
+    shoot_computed(w, placed, shot, write, |_| {})
+}
+
+/// [`shoot_with`] with `compute` run in scene compute.
+fn shoot_computed(
+    w: &mut World,
+    placed: &Placed,
+    shot: &Shot,
+    write: impl FnOnce(&mut SceneWriter<'_>),
+    mut compute: impl FnMut(&mut SceneCompute<'_, '_>),
+) -> Frame {
     let list = [placed.scene];
     let mut f = w
         .scenes
@@ -2306,6 +2346,7 @@ fn shoot_with(
         }
         write(&mut s);
     }
+    f.update_scenes(&mut compute).unwrap();
     let view = f
         .raster_view(&ViewDesc {
             scene: placed.scene,
@@ -5059,12 +5100,15 @@ fn skinned_vertices_match_the_cpu_skin_by_this_and_the_last_palette() {
     assert_clean();
 }
 
-#[test]
-fn a_pose_kernel_samples_clips_on_the_gpu_like_the_cpu() {
-    let _serial = serial();
-    let mut w = finest_world();
-    let copies = [(Mat3::IDENTITY, Vec3::ZERO), (Mat3::IDENTITY, Vec3::X)];
-    let worms = place_worms(&mut w, "worm", &copies, true);
+/// One frame of the worms posed at `t` by the test pose kernel.
+fn shoot_gpu_worms(
+    w: &mut World,
+    worms: &Worms,
+    kernel: &ComputePipeline,
+    shot: &Shot,
+    t: f32,
+    phase: f32,
+) -> Frame {
     let skeleton = w
         .scenes
         .skeleton(w.mount, AssetId::from_name("worm/skeleton"))
@@ -5075,54 +5119,39 @@ fn a_pose_kernel_samples_clips_on_the_gpu_like_the_cpu() {
         .unwrap();
     assert_eq!(skeleton.joint_count, worms.joints);
     assert_eq!(clip.joint_count, worms.joints);
+    shoot_computed(
+        w,
+        &worms.placed,
+        shot,
+        |_| {},
+        |c| {
+            let root = c
+                .put_root(&skin_pose::Root {
+                    scene: c.root,
+                    skeleton: skeleton.blob,
+                    clip_header: clip.header,
+                    clip_samples: clip.samples,
+                    group: worms.palette.0,
+                    copies: worms.placed.count,
+                    time: t,
+                    phase,
+                })
+                .unwrap();
+            c.cmd.dispatch(kernel, root, [1, 1, 1]);
+        },
+    )
+}
+
+#[test]
+fn a_pose_kernel_samples_clips_on_the_gpu_like_the_cpu() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let copies = [(Mat3::IDENTITY, Vec3::ZERO), (Mat3::IDENTITY, Vec3::X)];
+    let worms = place_worms(&mut w, "worm", &copies, true);
     let kernel = pipeline(&skin_pose::MODULE, "palette");
     let (t, phase) = (0.37, 0.81);
-    let eye = Vec3::new(0.0, 0.8, 3.0);
-    let list = [worms.placed.scene];
-    let mut f = w
-        .scenes
-        .begin_frame(&FrameDesc {
-            time: time(1),
-            scenes: &list,
-            low_latency: None,
-        })
-        .unwrap();
-    f.update_scenes(&mut |c| {
-        let root = c
-            .put_root(&skin_pose::Root {
-                scene: c.root,
-                skeleton: skeleton.blob,
-                clip_header: clip.header,
-                clip_samples: clip.samples,
-                group: worms.palette.0,
-                copies: 2,
-                time: t,
-                phase,
-            })
-            .unwrap();
-        c.cmd.dispatch(&kernel, root, [1, 1, 1]);
-    })
-    .unwrap();
-    let view = f
-        .raster_view(&ViewDesc {
-            scene: worms.placed.scene,
-            history: worms.placed.history,
-            position: eye.as_dvec3(),
-            rotation: look(eye, Vec3::new(0.0, 0.8, 0.0)),
-            projection: Projection {
-                fov_y: 0.9,
-                near: 0.1,
-            },
-            lens: Lens::default(),
-            render_extent: UVec2::from(EXTENT),
-            output_extent: UVec2::from(EXTENT),
-            jitter: Vec2::ZERO,
-            reset_history: true,
-            mip_bias: 0.0,
-            texture_filter: TextureFilter::Hardware,
-        })
-        .unwrap();
-    wait(f.end(&[]).unwrap());
+    let frame = shoot_gpu_worms(&mut w, &worms, &kernel, &worm_shot(1), t, phase);
+    let view = &frame.view;
     let root = read_buffer(view.scene, 1)[0];
     let group = read_buffer(root.groups.offset(u64::from(worms.palette.0)), 1)[0];
     let got: Vec<[[f32; 4]; 3]> = read_buffer(
@@ -5141,7 +5170,7 @@ fn a_pose_kernel_samples_clips_on_the_gpu_like_the_cpu() {
     }
     assert!(worst < 1e-5, "palette entries {worst} from the CPU's");
     assert!(
-        read_back(&view).ids.iter().any(|&id| id != 0),
+        frame.ids.iter().any(|&id| id != 0),
         "the GPU-posed copies draw"
     );
     assert_clean();
@@ -5213,6 +5242,44 @@ fn motion_vectors_of_skinned_copies_carry_their_deformation() {
     assert!(
         wrong * 50 < counted,
         "{wrong} of {counted} pixels reproject onto another cluster ({still} without motion)"
+    );
+    assert_clean();
+}
+
+/// A pose that jumps moves a skinned copy as far as it really went, from a CPU or a kernel
+/// palette; written without motion it stays put.
+#[test]
+fn a_pose_jump_keeps_valid_previous_positions() {
+    let _serial = serial();
+    let mut w = finest_world();
+    let one = [(Mat3::IDENTITY, Vec3::ZERO)];
+    let (from, to) = (0.1, 1.3);
+
+    let cpu = place_worms(&mut w, "worm", &one, false);
+    shoot_worms(&mut w, &cpu, &worm_shot(1), from, 0.0);
+    let jumped = shoot_worms(&mut w, &cpu, &worm_shot(2), to, 0.0);
+    let reach = largest_motion(&jumped);
+    assert!(reach > 2.0, "the jump moves {reach} pixels");
+    let declared = shoot_with(&mut w, &cpu.placed, &worm_shot(3), |s| {
+        let out = s
+            .transforms_without_motion(cpu.palette, 0, cpu.joints)
+            .unwrap();
+        for (o, p) in out.iter_mut().zip(worm_palette(from)) {
+            o.rows = p.rows;
+        }
+    });
+    let reach = largest_motion(&declared);
+    assert!(reach < 0.01, "a jump without motion moves {reach} pixels");
+
+    let kernel = pipeline(&skin_pose::MODULE, "palette");
+    let gpu = place_worms(&mut w, "worm", &one, true);
+    shoot_gpu_worms(&mut w, &gpu, &kernel, &worm_shot(1), from, 0.0);
+    let posed = shoot_gpu_worms(&mut w, &gpu, &kernel, &worm_shot(2), to, 0.0);
+    let (apart, compared) = motion_difference(&jumped, &posed);
+    assert!(compared > 100, "{compared} pixels compared");
+    assert!(
+        apart < 0.05,
+        "kernel and CPU palettes differ by {apart} pixels"
     );
     assert_clean();
 }

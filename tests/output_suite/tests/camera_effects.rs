@@ -149,7 +149,7 @@ impl Blur {
             view: self.constants.gpu(),
             shutter: SHUTTER,
             generated: 0,
-            history_reset: false,
+            cut: false,
             frame: self.frame,
             output: &output,
         };
@@ -258,14 +258,14 @@ fn frame_generation_keeps_streak_per_presented_frame() {
 }
 
 #[test]
-fn closed_shutter_and_history_reset_record_nothing() {
+fn closed_shutter_and_a_cut_record_nothing() {
     let mut b = Blur::new();
     let (sharp, names) = b.render(Scene::Pan, 1.0, |p| p.shutter = 0.0);
     assert!(names.is_empty(), "{names:?}");
     assert_eq!(b.output.motion_blur_bytes(), 0);
-    let (reset, names) = b.render(Scene::Pan, 1.0, |p| p.history_reset = true);
+    let (cut, names) = b.render(Scene::Pan, 1.0, |p| p.cut = true);
     assert!(names.is_empty(), "{names:?}");
-    assert!(reset == sharp);
+    assert!(cut == sharp);
     b.render(Scene::Pan, 1.0, |_| {});
     assert!(b.output.motion_blur_bytes() > 0);
     b.render(Scene::Pan, 1.0, |p| p.shutter = 0.0);

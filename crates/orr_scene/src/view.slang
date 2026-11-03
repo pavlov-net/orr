@@ -62,6 +62,23 @@ public float3 apply_hdr_ceiling(float3 c)
     return m > HDR_CEILING ? c * (HDR_CEILING / m) : c;
 }
 
+// How far a position may land from the center of the previous image, in NDC: far off screen
+// and well inside the range of the RG16F motion targets.
+static const float PREVIOUS_NDC_LIMIT = 1024.0;
+
+// Previous uv minus current uv, from a position through `prev_clip_from_view` and through
+// `clip_from_view`. A point at or behind the previous camera's plane was on no part of that
+// image, so it lands far off screen on its own side, where a point just in front of the plane
+// does, not mirrored through the center.
+public float2 motion_between(float4 previous, float4 current)
+{
+    float2 ndc = previous.xy / max(previous.w, 1e-6);
+    float squared = dot(ndc, ndc);
+    if (squared > PREVIOUS_NDC_LIMIT * PREVIOUS_NDC_LIMIT)
+        ndc *= PREVIOUS_NDC_LIMIT / sqrt(squared);
+    return (ndc - current.xy / current.w) * 0.5;
+}
+
 // The view-space position at `uv` (0..1, y down, of the render extent) and reverse-Z
 // `depth`, as the jittered projection placed it. Depth 0 (infinity) gives a direction at
 // infinite distance; use `view_direction` there.

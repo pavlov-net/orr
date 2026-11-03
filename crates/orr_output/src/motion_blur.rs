@@ -31,8 +31,8 @@ pub struct MotionBlurPass<'a> {
     pub shutter: f32,
     /// Frames generated after this one; 0 with frame generation off.
     pub generated: u32,
-    /// The view's history reset this frame; motion vectors do not hold.
-    pub history_reset: bool,
+    /// A declared camera cut: the frame's motion spans no time, so the pass records nothing.
+    pub cut: bool,
     /// orr's frame id.
     pub frame: u64,
     pub output: &'a ViewOutput,

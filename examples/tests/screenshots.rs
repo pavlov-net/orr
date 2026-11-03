@@ -1069,10 +1069,10 @@ fn render_view_blurs_what_moves_while_the_shutter_is_open() {
         &sharp,
         tolerance,
     );
-    // Below the camera jump distance, which would count as a cut.
+    // Past lighting's camera jump distance, which resets its history but is no cut.
     let camera = LampSettings {
         lamp: 0.0,
-        camera: 1.5,
+        camera: 2.2,
         shutter: 1.0,
         ..moving
     };

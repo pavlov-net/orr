@@ -154,7 +154,8 @@ pub struct LitView<'a> {
     pub rotation: Quat,
     pub projection: Projection,
     pub lens: Lens,
-    /// A camera cut: the previous camera is taken to be this one.
+    /// A camera cut: the previous camera is taken to be this one, motion blur shows nothing and
+    /// frame generation resets. Pair it with `ViewOutput::cut`.
     pub reset_history: bool,
     /// How the view filters material textures.
     pub texture_filter: TextureFilter,
@@ -854,10 +855,10 @@ impl<'a> Frame<'a> {
     /// screenshot.
     ///
     /// Motion blur smears the radiance along each pixel's motion over the fraction
-    /// `lens.shutter` of the time between presented images, centered on the frame. A frame that
-    /// resets the view's history, such as a camera cut or a camera jump past
-    /// `lighting.guides.camera_jump`, shows none, nor do the accumulation reference and
-    /// `lighting.debug_view`.
+    /// `lens.shutter` of the time between presented images, centered on the frame. A camera cut
+    /// (`view.reset_history`) shows none, nor do the accumulation reference and
+    /// `lighting.debug_view`. A camera that jumps without declaring a cut blurs up to the longest
+    /// streak, [`orr_output::MOTION_BLUR_MAX_RADIUS`] of the output width each way.
     ///
     /// The target decides the output extent. `output.reconstruction` and the output extent
     /// decide the render extent, the jitter and the texture level-of-detail bias while the
@@ -1129,7 +1130,7 @@ impl<'a> Frame<'a> {
                 view: raster.view,
                 shutter: if blurs { view.lens.shutter } else { 0.0 },
                 generated,
-                history_reset: paths.history_reset(),
+                cut: view.reset_history,
                 frame: id,
                 output,
             },

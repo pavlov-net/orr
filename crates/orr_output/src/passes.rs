@@ -701,7 +701,7 @@ impl OutputKernels {
         Ok(())
     }
 
-    /// Records the `motion_blur` pass when the shutter is open and the view's history holds:
+    /// Records the `motion_blur` pass when the shutter is open and the frame is no camera cut:
     /// it blurs `chain.rr_output` into `chain.linear` and swaps `chain`, so the blurred
     /// radiance is `chain.rr_output` again; returns whether it recorded. Allocates the
     /// view's tiles on the first frame with the shutter open and frees them on the first
@@ -725,7 +725,7 @@ impl OutputKernels {
         {
             view.motion_blur = Some(MotionBlurTargets::new(&view.device, pass.extent)?);
         }
-        if pass.history_reset {
+        if pass.cut {
             return Ok(false);
         }
         let targets = view.motion_blur.as_mut().expect("motion blur tiles");

@@ -43,8 +43,9 @@ pub struct ViewOutput {
     /// A hook warps the image: the view's hooks get the display's distortion field, which
     /// frame generation reads. A lens with distortion turns the field on too.
     pub distortion_field: bool,
-    /// A camera cut: auto exposure snaps to the target and resets its long-term stage, and
-    /// auto white balance snaps to its target.
+    /// The exposure half of a camera cut: auto exposure snaps to the target and resets its
+    /// long-term stage, and auto white balance snaps to its target. The view's `reset_history`
+    /// is the camera half, which stops motion blur.
     pub cut: bool,
     /// Menus and loading screens: frame generation is told the frame shows no scene.
     pub not_rendering_scene: bool,

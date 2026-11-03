@@ -141,7 +141,7 @@ public float2 moved_motion(ViewConstants* v, float3 q, float3 previous_q, float 
     float4 current = mul(v.clip_from_view, float4(view_from_relative(v, q), w));
     float3 p = previous_q + v.eye_motion.xyz * w;
     float4 previous = mul(v.prev_clip_from_view, float4(mul(v.prev_view_from_world_rotation, float4(p, 0.0)), w));
-    return (previous.xy / previous.w - current.xy / current.w) * 0.5;
+    return motion_between(previous, current);
 }
 
 // `moved_motion` of a static point or a direction.
