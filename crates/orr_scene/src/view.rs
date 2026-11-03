@@ -153,7 +153,8 @@ pub enum Focus {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Glare {
-    /// 1.0 = the fitted PSF energy. The image's total energy is the same at any strength.
+    /// 1.0 = the fitted PSF energy. Only light exposed past about SDR's white spreads, so a
+    /// scene with none shows no glare. The image's total energy is the same at any strength.
     pub strength: f32,
 }
 

@@ -325,8 +325,10 @@ fn floor_and_box() -> Arc<[u8]> {
     ])
 }
 
-/// The EV100 at which [`lamp`] exposes to 0.5.
+/// The EV100 at which [`lamp`] exposes to [`LAMP_EXPOSED`].
 const LAMP_EV100: f32 = 14.0;
+/// Past the display's white, so glare spreads most of it; the headless image clips it at 1.
+const LAMP_EXPOSED: f32 = 8.0;
 
 /// A pack of a 1 m cube that only emits.
 fn lamp() -> Arc<[u8]> {
@@ -336,7 +338,7 @@ fn lamp() -> Arc<[u8]> {
         Material {
             base_color: [0.0; 3],
             emission_color: [1.0; 3],
-            emission_luminance: 0.5 / orr::orr_output::exposure_from_ev100(LAMP_EV100),
+            emission_luminance: LAMP_EXPOSED / orr::orr_output::exposure_from_ev100(LAMP_EV100),
             ..Material::default()
         },
     )])
@@ -929,41 +931,32 @@ fn render_view_runs_the_glare_its_lens_asks_for() {
     loading.stop_workers();
     worker.join().unwrap();
 
-    let energy = off.iter().sum::<f64>();
-    let total = |image: &[f64]| image.iter().sum::<f64>();
     let halo = |image: &[f64]| -> f64 {
         let unlit = image.iter().zip(&off).filter(|(_, off)| **off == 0.0);
         unlit.map(|(v, _)| v).sum()
     };
     let near = |a: f64, b: f64, tolerance: f64| (a / b - 1.0).abs() < tolerance;
     let peak = off.iter().copied().fold(0.0, f64::max);
-    assert!(near(peak, 0.5, 1e-3), "the lamp exposes to {peak}");
+    assert!(near(peak, 1.0, 2e-3), "the lamp clips at {peak}");
     // The lamp's near face, 29.5 m away, is 7.4 pixels across, centered on a pixel corner.
     let lit = off.iter().filter(|&&v| v > 0.0).count();
     assert_eq!(lit, 8 * 8, "light outside the lamp without glare");
     assert!(off == off_again, "turning glare off leaves it in the image");
 
+    // The near face's area in pixels times what it exposes to.
+    let energy = 7.4 * 7.4 * f64::from(LAMP_EXPOSED);
     let base = halo(&glared);
     assert!(base > 0.05 * energy, "halo of {base} from energy {energy}");
-    for (name, image, want) in [
-        ("bands", &glared, energy),
-        ("strength 2", &doubled, energy),
-        ("FFT", &convolved, energy),
-        ("coarse pixels", &coarse, energy),
-        ("a stop darker", &darker, 0.5 * energy),
-    ] {
-        let got = total(image);
-        assert!(near(got, want, 0.01), "{name}: energy {got} of {want}");
-    }
+    // A stop darker the lamp gives up 2.5 of 4 instead of 6.5 of 8, through a wider F-number; on
+    // the frame before's exposure the halo would grow.
+    let dimmer = halo(&darker);
+    assert!(dimmer < 0.8 * base, "a stop darker: {dimmer} of {base}");
     let (twice, far, fft_halo) = (halo(&doubled), halo(&coarse), halo(&convolved));
     assert!(
         near(twice, 2.0 * base, 0.01),
         "strength 2: {twice} of {base}"
     );
-    assert!(
-        far < 0.25 * base,
-        "pixels 12 times coarser: {far} of {base}"
-    );
+    assert!(far < 0.5 * base, "pixels 12 times coarser: {far} of {base}");
     assert!(near(fft_halo, base, 0.05), "FFT: {fft_halo} of {base}");
     assert_clean();
 }

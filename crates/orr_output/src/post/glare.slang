@@ -2,14 +2,15 @@
 // by tables fitted at build to the diaphragm's PSF (`build/fit.rs`). Each dispatch has its
 // own root:
 //
-// - `downsample` writes mip `mip` of the chain with the 13-tap filter: from the exposed
-//   radiance, clamped to [0, GLARE_STORAGE_MAX], for mip 0, else from mip `mip - 1`. The first
-//   thread of mip 0 also writes the view's weights for this frame.
+// - `downsample` writes mip `mip` of the chain with the 13-tap filter: from the part of the
+//   exposed radiance, clamped to [0, GLARE_STORAGE_MAX], that glare spreads for mip 0, else from
+//   mip `mip - 1`. The first thread of mip 0 also writes the view's weights for this frame.
 // - `upsample` adds the 3x3 tent of mip `mip + 1` to mip `mip`'s band times its weight, in
 //   place, from the chain's last mip up; mip 0 then holds the weighted band sum the tonemap
 //   composites.
 //
-// The CPU model in `build/pyramid.rs` follows these taps and sample positions exactly.
+// The CPU model in `build/pyramid.rs` follows these taps and sample positions exactly, on the
+// plane of what `glare_extract` takes from each pixel.
 #include "orr/root.h"
 import orr.abi;
 import view;
@@ -18,6 +19,14 @@ import tent;
 
 static const uint ENTRIES = 9;
 static const uint F_NUMBERS = 10;
+// Pixels per axis around the radiance a group of 8 x 8 texels reads at first level 1: 8 texels
+// of up to 2.125 pixels, the taps' reach and a pixel of margin to each side.
+static const uint TILE = 24;
+
+// At first level 1, what glare spreads of each pixel the group's taps read, so the group
+// extracts each once, from `tile_origin` in the radiance.
+static groupshared float3 tile[TILE * TILE];
+static int2 tile_origin;
 
 struct Root
 {
@@ -74,22 +83,48 @@ void write_weights()
     }
 }
 
+// Fills the tile, each of the group's threads loading its share.
+void fill_tile(uint2 group, uint index, float scale)
+{
+    Texture2D<float4> source = root.source.get<Texture2D<float4>>();
+    float2 texel = float2(root.source_texel_x, root.source_texel_y);
+    float2 ratio = 1.0 / (texel * float2(root.width, root.height));
+    tile_origin = int2(floor((float2(group * 8) + 0.5) * ratio - 2.0 - 0.5)) - 1;
+    int2 last = int2(1.0 / texel + 0.5) - 1;
+    for (uint i = index; i < TILE * TILE; i += 64)
+    {
+        int2 at = clamp(tile_origin + int2(i % TILE, i / TILE), 0, last);
+        tile[i] = glare_extract(source.Load(int3(at, 0)).rgb, scale);
+    }
+    GroupMemoryBarrierWithGroupSync();
+}
+
 float3 tap(float2 uv, float scale)
 {
-    float3 c = root.source.get<Texture2D<float4>>().SampleLevel(root.linear.get(), uv,
-        root.mip == 0 ? 0.0 : float(root.mip - 1)).rgb;
-    return root.mip == 0 ? glare_exposed(c, scale) : c;
+    Texture2D<float4> source = root.source.get<Texture2D<float4>>();
+    if (root.mip != 0)
+        return source.SampleLevel(root.linear.get(), uv, float(root.mip - 1)).rgb;
+    if (root.first_level != 1)
+        return glare_extract_at(source, uv, scale);
+    float2 t = uv / float2(root.source_texel_x, root.source_texel_y) - 0.5;
+    float2 lo = floor(t);
+    float2 f = t - lo;
+    int2 a = int2(lo) - tile_origin;
+    uint i = uint(a.y) * TILE + uint(a.x);
+    return lerp(lerp(tile[i], tile[i + 1], f.x), lerp(tile[i + TILE], tile[i + TILE + 1], f.x), f.y);
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-void downsample(uint3 id: SV_DispatchThreadID)
+void downsample(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint index: SV_GroupIndex)
 {
     if (root.mip == 0 && all(id.xy == 0))
         write_weights();
+    float scale = root.mip == 0 ? glare_exposure_scale(root.view) : 1.0;
+    if (root.mip == 0 && root.first_level == 1)
+        fill_tile(group.xy, index, scale);
     if (any(id.xy >= uint2(root.width, root.height)))
         return;
-    float scale = root.mip == 0 ? glare_exposure_scale(root.view) : 1.0;
     float2 uv = (float2(id.xy) + 0.5) / float2(root.width, root.height);
     float2 o = root.stride * float2(root.source_texel_x, root.source_texel_y);
     float3 center = tap(uv, scale);

@@ -10,6 +10,7 @@ import view;
 import exposure;
 import gt7;
 import tent;
+import glare_lens;
 
 static const uint DEBUG_NONE = 0;
 static const uint DEBUG_LINEAR = 1;
@@ -238,7 +239,13 @@ void main(uint3 id: SV_DispatchThreadID)
             if (k.chromatic_aberration != 0.0)
                 bands = float3(tent(chain, linear, uv_r, texel, 0.0).r, bands.g,
                                tent(chain, linear, uv_b, texel, 0.0).b);
-            glared = root.glare_weights[0].xyz * exposed + bands;
+            // What the glare pass took from the radiance this gather reads.
+            float3 spread = k.distortion != 0 ? glare_extract_at(source, uv_g, scale)
+                                              : glare_extract(radiance, scale);
+            if (k.chromatic_aberration != 0.0)
+                spread = float3(glare_extract_at(source, uv_r, scale).r, spread.g,
+                                glare_extract_at(source, uv_b, scale).b);
+            glared = exposed - (1.0 - root.glare_weights[0].xyz) * spread + bands;
         }
         float local = 1.0;
         if (root.local_grid != nullptr)

@@ -1,5 +1,5 @@
-//! FFT glare: the exposed radiance at 1/2 or 1/4 resolution convolved with the diaphragm's
-//! PSF by FFT, with blade diffraction spikes and the far tail the bands drop. The kernel is
+//! FFT glare: the part of the exposed radiance that glare spreads, at 1/2 or 1/4 resolution,
+//! convolved with the diaphragm's PSF by FFT, with blade diffraction spikes and the far tail the bands drop. The kernel is
 //! the PSF's per-pixel energy from a table built at f/22 and scaled to the frame's F-number.
 
 use orr_scene::Glare;

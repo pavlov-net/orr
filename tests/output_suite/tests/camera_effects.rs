@@ -901,6 +901,11 @@ mod glare {
         (100.0 * data::F_NUMBERS[i] * data::F_NUMBERS[i]).log2() as f32
     }
 
+    /// The nits a surface has per unit it exposes to at `ev`.
+    fn nits_per_exposed(ev: f32) -> f32 {
+        1.0 / orr_output::exposure_from_ev100(ev)
+    }
+
     /// An scRGB display; Linear debug output on it is not clamped.
     fn hdr(peak_nits: f32) -> ResolvedDisplay {
         ResolvedDisplay {
@@ -1003,27 +1008,64 @@ mod glare {
         );
     }
 
-    /// The CPU model of the GPU run: per channel, the pyramid of the pre-exposed radiance the
-    /// harness rendered, scaled by `scale`, at the frame's weights.
+    /// `glare_extract`: the part of an exposed color glare spreads.
+    fn extract(exposed: [f64; 3]) -> [f64; 3] {
+        const KNEE: f64 = 1.5;
+        const WIDTH: f64 = 0.5;
+        let m = exposed[0].max(exposed[1]).max(exposed[2]);
+        if m <= KNEE - WIDTH {
+            return [0.0; 3];
+        }
+        let over = m - KNEE;
+        let over = if over < WIDTH {
+            (over + WIDTH) * (over + WIDTH) / (4.0 * WIDTH)
+        } else {
+            over
+        };
+        exposed.map(|v| v * over / m)
+    }
+
+    /// A pre-exposed pixel exposed by `scale` as the glare pass reads it.
+    fn exposed_pixel(p: [f32; 4], scale: f64) -> [f64; 3] {
+        [p[0], p[1], p[2]].map(|v| {
+            let v = f64::from(v) * scale;
+            if v > 0.0 { v.min(65504.0) } else { 0.0 }
+        })
+    }
+
+    /// The CPU model of the GPU run: per channel, the pyramid of what glare spreads of the
+    /// pre-exposed radiance the harness rendered, scaled by `scale`, at the frame's weights,
+    /// over the pixel less the part the bands take. Also returns that kept image.
     fn model(
         h: &Harness,
         extent: [u32; 2],
         first_level: u32,
         scale: f64,
         w: &[[f64; 4]],
-    ) -> Vec<[f64; 3]> {
+    ) -> (Vec<[f64; 3]>, Vec<[f64; 3]>) {
         let radiance = h.radiance();
+        let spread: Vec<[f64; 3]> = radiance
+            .iter()
+            .map(|&p| extract(exposed_pixel(p, scale)))
+            .collect();
+        let kept: Vec<[f64; 3]> = radiance
+            .iter()
+            .zip(&spread)
+            .map(|(p, s)| [0, 1, 2].map(|c| f64::from(p[c]) * scale - (1.0 - w[0][c]) * s[c]))
+            .collect();
         let mut out = vec![[0.0; 3]; radiance.len()];
         for c in 0..3 {
-            let input = Plane::dense(extent, radiance.iter().map(|p| f64::from(p[c])).collect());
-            let wc: Vec<f64> = w.iter().map(|e| e[c]).collect();
-            let downs = pyramid::downsamples(&input, first_level, scale);
-            let glare = pyramid::compose(&input, &downs, &wc, scale);
+            let part = Plane::dense(extent, spread.iter().map(|p| p[c]).collect());
+            let input = Plane::dense(extent, kept.iter().map(|p| p[c]).collect());
+            let mut wc: Vec<f64> = w.iter().map(|e| e[c]).collect();
+            wc[0] = 1.0;
+            let downs = pyramid::downsamples(&part, first_level);
+            let glare = pyramid::compose(&input, &downs, &wc);
             for (o, v) in out.iter_mut().zip(&glare.data) {
                 o[c] = *v;
             }
         }
-        out
+        (out, kept)
     }
 
     /// Point sources and a gradient on a dim ground, `extent[0] * extent[1]` nits.
@@ -1053,25 +1095,28 @@ mod glare {
 
     #[test]
     fn cpu_fit_keeps_uniform_fields_and_point_energy() {
-        let w: Vec<f64> = data::TABLES[0][6].iter().map(|w| w[1]).collect();
+        let w: Vec<f64> = data::TABLES[0][4].iter().map(|w| w[1]).collect();
         let size = [96, 64];
-        let input = Plane::dense(size, vec![3.0; 96 * 64]);
-        let downs = pyramid::downsamples(&input, 1, 0.5);
-        let out = pyramid::compose(&input, &downs, &pyramid::fold(&w, downs.len()), 0.5);
+        let input = Plane::dense(size, vec![1.5; 96 * 64]);
+        let downs = pyramid::downsamples(&input, 1);
+        let out = pyramid::compose(&input, &downs, &pyramid::fold(&w, downs.len()));
         for v in &out.data {
             assert!((v / 1.5 - 1.0).abs() < 1e-9, "{v}");
         }
         let size = [4096; 2];
         let input = Plane::impulse(size, [2048, 2048], 1.0);
-        let out = pyramid::compose(&input, &pyramid::downsamples(&input, 1, 1.0), &w, 1.0);
+        let out = pyramid::compose(&input, &pyramid::downsamples(&input, 1), &w);
         assert!((out.sum() - 1.0).abs() < 0.01, "{}", out.sum());
     }
 
     #[test]
     fn pyramid_matches_cpu_model() {
-        let extent = [160, 96];
+        // Odd, so level 1 is more than twice as coarse per texel.
+        let extent = [161, 97];
         let mut h = harness(extent, Some(1.0));
-        let ev = ev_at(5) + 0.37;
+        let ev = ev_at(3) + 0.37;
+        // On the knee's curve and past it.
+        let k = nits_per_exposed(ev);
         let nits = scene(
             extent,
             200.0,
@@ -1080,6 +1125,10 @@ mod glare {
                 ([41, 30], 2e6),
                 ([120, 70], 6e6),
                 ([159, 95], 1e6),
+                ([80, 20], 1.2 * k),
+                ([84, 20], 1.6 * k),
+                ([88, 20], 1.9 * k),
+                ([92, 20], 2.4 * k),
             ],
         );
         for first_level in [1, 2] {
@@ -1088,13 +1137,11 @@ mod glare {
             let (gpu, exposure, pre) = settle(&mut h, &nits, &out, &hdr(250.0));
             let w = weights(&h);
             let scale = exposure / pre;
-            let cpu = model(&h, extent, first_level, scale, &w);
-            let radiance = h.radiance();
+            let (cpu, kept) = model(&h, extent, first_level, scale, &w);
             let mut worst: f64 = 0.0;
             for (i, (g, c)) in gpu.iter().zip(&cpu).enumerate() {
                 for k in 0..3 {
-                    let identity = w[0][k] * scale * f64::from(radiance[i][k]);
-                    let glare = (c[k] - identity).abs();
+                    let glare = (c[k] - kept[i][k]).abs();
                     // RGBA16F rounding of the output and of the chain.
                     let error = (g[k] - c[k]).abs() / (1e-3 * c[k].abs() + 0.02 * glare + 1e-6);
                     worst = worst.max(error);
@@ -1123,20 +1170,53 @@ mod glare {
         assert_clean();
     }
 
-    #[test]
-    fn uniform_field_is_unchanged() {
-        let extent = [200, 120];
-        let nits = vec![900.0; 200 * 120];
-        let out = output(ev_at(7), OutputDebug::Linear);
-        let (plain, ..) = settle(&mut harness(extent, None), &nits, &out, &hdr(250.0));
-        let (glared, ..) = settle(&mut harness(extent, Some(1.0)), &nits, &out, &hdr(250.0));
+    /// The worst relative change glare makes to `nits` under `out`, over all channels.
+    fn worst_change(extent: [u32; 2], nits: &[f32], out: &ViewOutput) -> f64 {
+        let (plain, ..) = settle(&mut harness(extent, None), nits, out, &hdr(250.0));
+        let (glared, ..) = settle(&mut harness(extent, Some(1.0)), nits, out, &hdr(250.0));
         let mut worst: f64 = 0.0;
         for (a, b) in plain.iter().zip(&glared) {
             for k in 0..3 {
                 worst = worst.max((b[k] / a[k] - 1.0).abs());
             }
         }
-        log::info!("uniform field: worst relative change {worst:.2e}");
+        worst
+    }
+
+    /// A uniform field below the knee, on its curve and past it stays as it is under `out`.
+    fn assert_uniform_fields_unchanged(out: impl Fn(f32) -> ViewOutput, ev: f32) {
+        let extent = [200, 120];
+        for exposed in [0.05, 1.5, 6.0] {
+            let nits = vec![exposed * nits_per_exposed(ev); 200 * 120];
+            let worst = worst_change(extent, &nits, &out(ev));
+            log::info!("uniform field at {exposed}: worst relative change {worst:.2e}");
+            assert!(worst < 1e-3, "{exposed}: {worst}");
+        }
+        assert_clean();
+    }
+
+    #[test]
+    fn uniform_field_is_unchanged() {
+        assert_uniform_fields_unchanged(|ev| output(ev, OutputDebug::Linear), ev_at(5));
+    }
+
+    /// Fine detail a display can show as it is stays sharp at the widest F-number.
+    #[test]
+    fn detail_below_the_knee_is_unchanged() {
+        let extent = [200, 120];
+        let ev = ev_at(9);
+        let k = nits_per_exposed(ev);
+        let nits: Vec<f32> = (0..200 * 120)
+            .map(|i| {
+                if (i % 200 + i / 200) % 2 == 0 {
+                    0.02 * k
+                } else {
+                    0.9 * k
+                }
+            })
+            .collect();
+        let worst = worst_change(extent, &nits, &output(ev, OutputDebug::Linear));
+        log::info!("detail below the knee: worst relative change {worst:.2e}");
         assert!(worst < 1e-3, "{worst}");
         assert_clean();
     }
@@ -1144,21 +1224,27 @@ mod glare {
     #[test]
     fn point_source_keeps_energy() {
         let extent = [1024, 1024];
-        let ev = ev_at(6);
+        let ev = ev_at(4);
         let mut nits = vec![0.0; 1024 * 1024];
-        let source = EXPOSED * 1.2 * ev.exp2();
+        let source = EXPOSED * nits_per_exposed(ev);
         nits[512 * 1024 + 512] = source;
         let out = output(ev, OutputDebug::Linear);
-        let (image, exposure, _) =
-            settle(&mut harness(extent, Some(1.0)), &nits, &out, &hdr(250.0));
-        let energy = f64::from(source) * exposure;
-        for k in 0..3 {
-            let sum: f64 = image.iter().map(|p| p[k]).sum();
-            log::info!(
-                "point source: channel {k} keeps {:.5} of its energy",
-                sum / energy
+        for strength in [1.0, 2.0] {
+            let (image, exposure, _) = settle(
+                &mut harness(extent, Some(strength)),
+                &nits,
+                &out,
+                &hdr(250.0),
             );
-            assert!((sum / energy - 1.0).abs() < 0.01, "{k}: {}", sum / energy);
+            let energy = f64::from(source) * exposure;
+            for k in 0..3 {
+                let sum: f64 = image.iter().map(|p| p[k]).sum();
+                log::info!(
+                    "point source at strength {strength}: channel {k} keeps {:.5} of its energy",
+                    sum / energy
+                );
+                assert!((sum / energy - 1.0).abs() < 0.01, "{k}: {}", sum / energy);
+            }
         }
         assert_clean();
     }
@@ -1223,9 +1309,9 @@ mod glare {
     fn fitted_kernel_matches_psf() {
         let extent = [2048, 2048];
         let side = 512;
-        let i = 6;
+        let i = 4;
         let ev = ev_at(i);
-        let source = EXPOSED * 1.2 * ev.exp2();
+        let source = EXPOSED * nits_per_exposed(ev);
         let mut nits = vec![0.0; 2048 * 2048];
         nits[1024 * 2048 + 1024] = source;
         let mut h = harness(extent, Some(1.0));
@@ -1396,7 +1482,10 @@ mod glare {
 
     /// The lens's F-number at the reference pitch on SDR or a 250-nit peak.
     fn lens_f_number(ev100: f32) -> f64 {
-        (f64::from(ev100).exp2() / 100.0).sqrt().clamp(1.4, 22.0)
+        let f = &data::F_NUMBERS;
+        (f64::from(ev100).exp2() / 100.0)
+            .sqrt()
+            .clamp(f[0], f[f.len() - 1])
     }
 
     /// The glare kernel the GPU builds: per pixel within `radius`, the PSF's energy, the
@@ -1434,9 +1523,9 @@ mod glare {
                 for b in 0..f {
                     for a in 0..f {
                         let p = radiance[((y * f + b) * extent[0] + x * f + a) as usize];
+                        let part = extract(exposed_pixel(p, scale));
                         for c in 0..3 {
-                            let v = f64::from(p[c]) * scale;
-                            sum[c] += if v > 0.0 { v.min(65504.0) } else { 0.0 };
+                            sum[c] += part[c];
                         }
                     }
                 }
@@ -1492,7 +1581,7 @@ mod glare {
         let reach: i64 = 600;
         let (mut near, mut far): (f64, f64) = (0.0, 0.0);
         for first_level in [1, 2] {
-            for n in [1.4, 2.8, 5.6, 8.0, 11.0, 16.0, 22.0] {
+            for n in [4.0, 5.6, 8.0, 11.0, 16.0, 22.0] {
                 let u = fft::Kernel::texels(n, first_level);
                 let pitch = f64::from(1u32 << first_level) * data::REFERENCE_PITCH_UM;
                 // Energy and pixel count per squared distance.
@@ -1561,7 +1650,9 @@ mod glare {
     fn fft_convolution_matches_direct_convolution() {
         let extent = [320, 192];
         let mut h = harness(extent, Some(0.8));
-        let ev = ev_at(5) + 0.37;
+        let ev = ev_at(3) + 0.37;
+        // On the knee's curve and past it.
+        let k = nits_per_exposed(ev);
         let nits = scene(
             extent,
             200.0,
@@ -1571,6 +1662,10 @@ mod glare {
                 ([240, 140], 6e6),
                 ([319, 191], 1e6),
                 ([3, 100], 3e6),
+                ([160, 30], 1.2 * k),
+                ([164, 30], 1.6 * k),
+                ([168, 30], 1.9 * k),
+                ([172, 30], 2.4 * k),
             ],
         );
         for first_level in [1, 2] {
@@ -1611,34 +1706,24 @@ mod glare {
 
     #[test]
     fn fft_uniform_field_is_unchanged() {
-        let extent = [200, 120];
-        let nits = vec![900.0; 200 * 120];
-        let out = fft_output(ev_at(7), OutputDebug::Linear, 1);
-        let (plain, ..) = settle(&mut harness(extent, None), &nits, &out, &hdr(250.0));
-        let (glared, ..) = settle(&mut harness(extent, Some(1.0)), &nits, &out, &hdr(250.0));
-        let mut worst: f64 = 0.0;
-        for (a, b) in plain.iter().zip(&glared) {
-            for k in 0..3 {
-                worst = worst.max((b[k] / a[k] - 1.0).abs());
-            }
-        }
-        log::info!("fft uniform field: worst relative change {worst:.2e}");
-        assert!(worst < 1e-3, "{worst}");
-        assert_clean();
+        assert_uniform_fields_unchanged(|ev| fft_output(ev, OutputDebug::Linear, 1), ev_at(5));
     }
 
     #[test]
     fn fft_point_source_keeps_energy() {
         let extent = [512, 512];
-        let ev = ev_at(6);
+        let ev = ev_at(4);
         let mut nits = vec![0.0; 512 * 512];
-        let source = EXPOSED * 1.2 * ev.exp2();
+        let source = EXPOSED * nits_per_exposed(ev);
         nits[256 * 512 + 256] = source;
         let out = fft_output(ev, OutputDebug::Linear, 1);
-        let (image, exposure, _) =
-            settle(&mut harness(extent, Some(1.0)), &nits, &out, &hdr(250.0));
-        let energy = f64::from(source) * exposure;
+        let mut h = harness(extent, Some(1.0));
+        let (image, exposure, pre) = settle(&mut h, &nits, &out, &hdr(250.0));
+        // What the source holds after RGBA16F rounding, which is up to 5e-4 of it.
+        let radiance = h.radiance();
         for k in 0..3 {
+            let energy: f64 =
+                radiance.iter().map(|p| f64::from(p[k])).sum::<f64>() * exposure / pre;
             let sum: f64 = image.iter().map(|p| p[k]).sum();
             log::info!(
                 "fft point source: channel {k} keeps {:.5} of its energy",
@@ -1654,9 +1739,9 @@ mod glare {
     #[test]
     fn fft_spikes_match_the_blades() {
         let extent = [512, 512];
-        let ev = ev_at(6);
+        let ev = ev_at(4);
         let mut nits = vec![0.0; 512 * 512];
-        nits[256 * 512 + 256] = EXPOSED * 1.2 * ev.exp2();
+        nits[256 * 512 + 256] = EXPOSED * nits_per_exposed(ev);
         let mut h = harness(extent, Some(1.0));
         let out = fft_output(ev, OutputDebug::Linear, 1);
         settle(&mut h, &nits, &out, &hdr(250.0));
