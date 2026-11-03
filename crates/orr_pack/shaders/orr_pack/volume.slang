@@ -4,6 +4,8 @@
 // orr_pack::volume::GridSampler.
 module volume;
 
+import orr_shaders.packing;
+
 // Voxels per brick and axis, and texels with the one-voxel apron.
 public static const uint VOLUME_BRICK = 8;
 public static const uint VOLUME_BRICK_TEXELS = 10;
@@ -69,7 +71,7 @@ float volume_texel(VolumeGridGpu g, uint8_t* brick, int3 t)
 {
     uint i = uint(t.x + int(VOLUME_BRICK_TEXELS) * (t.y + int(VOLUME_BRICK_TEXELS) * t.z));
     float texel = g.vk_format == VOLUME_R8_UNORM
-        ? float(brick[i]) / 255.0
+        ? unpack_unorm8(uint(brick[i]))
         : f16tof32(uint(((uint16_t*)brick)[i]));
     return texel * g.scale + g.offset;
 }

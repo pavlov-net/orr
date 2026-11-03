@@ -220,7 +220,7 @@ public struct Bsdf : IDifferentiable
         float sum = 0.0;
         for (uint i = 0; i < LOBES; i++)
         {
-            float w = max(max3(e[i]), 0.0);
+            float w = max(max_component(e[i]), 0.0);
             if (i == SPECULAR || i == THIN_SPECULAR)
                 w *= layers.glossy_bias;
             if (i == COAT)
@@ -824,8 +824,8 @@ BsdfSample no_sample()
 
 float reflect_probability(float3 reflection, float3 transmission)
 {
-    float r = max3(reflection);
-    float t = max3(transmission);
+    float r = max_component(reflection);
+    float t = max_component(transmission);
     return r + t > 0.0 ? r / (r + t) : 1.0;
 }
 
@@ -855,12 +855,6 @@ float3 ltc_coeffs(float alpha, float mu)
     OpenPBR_FuzzLobe_CoatingLobe_AggregateLobe lobe = {};
     lobe.alpha = alpha;
     return openpbr_disney_sheen_fetch_coeffs(lobe, float3(0.0, 0.0, mu));
-}
-
-[ForwardDifferentiable]
-float max3(float3 v)
-{
-    return max(v.x, max(v.y, v.z));
 }
 
 float sq(float x)
@@ -924,7 +918,7 @@ public float3 bsdf_walk_exit(BsdfParams p, float3 n, float3 wi, float3 u)
 {
     p.scale = float3(1.0);
     Bsdf s = bsdf_prepare(p, n, wi);
-    float sss = max3(s.walk);
+    float sss = max_component(s.walk);
     if (!(sss > 0.0))
         return float3(0.0);
     BsdfSample e = s.subsurface_entry(u);
@@ -1142,7 +1136,7 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     s.fuzz_presence = collapsed ? 0.0 : fuzz_presence;
     float3 walk_ss = s.walk * tc * e_ss;
     float3 walk_ms = s.walk * (1.0 - s.dms_ratio) * s.dms_ec;
-    s.walk_ms_share = max3(walk_ms) > 0.0 ? max3(walk_ms) / (max3(walk_ss) + max3(walk_ms)) : 0.0;
+    s.walk_ms_share = max_component(walk_ms) > 0.0 ? max_component(walk_ms) / (max_component(walk_ss) + max_component(walk_ms)) : 0.0;
 
     layers.collapsed = collapsed;
     layers.e_ss = e_ss;

@@ -19,6 +19,17 @@ public float3 safe_normalize(float3 v, float3 fallback = float3(0, 0, 1))
     return len2 >= 1.17549435e-38 && !isinf(len2) ? v * rsqrt(len2) : fallback;
 }
 
+[ForwardDifferentiable]
+public float max_component(float3 v)
+{
+    return max(v.x, max(v.y, v.z));
+}
+
+public uint max_component(uint3 v)
+{
+    return max(v.x, max(v.y, v.z));
+}
+
 // Tangent `t` and bitangent `b` with (t, b, n) orthonormal and right-handed, for unit `n`.
 // Continuous everywhere except where n.z changes sign.
 public void orthonormal_basis(float3 n, out float3 t, out float3 b)
@@ -47,23 +58,6 @@ public float3 to_local(float3 v, float3 t, float3 b, float3 n)
 public float3 from_local(float3 v, float3 t, float3 b, float3 n)
 {
     return v.x * t + v.y * b + v.z * n;
-}
-
-public float4 quat_mul(float4 a, float4 b)
-{
-    return float4(a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz), a.w * b.w - dot(a.xyz, b.xyz));
-}
-
-public float4 quat_conjugate(float4 q)
-{
-    return float4(-q.xyz, q.w);
-}
-
-// `v` rotated by the unit quaternion `q`.
-public float3 quat_rotate(float4 q, float3 v)
-{
-    float3 t = 2.0 * cross(q.xyz, v);
-    return v + q.w * t + cross(q.xyz, t);
 }
 
 // The rotation matrix of the unit quaternion `q`.
@@ -120,13 +114,6 @@ public float3x4 affine_mul(float3x4 a, float3x4 b)
     return affine(r, transform_point(a, affine_translation(b)));
 }
 
-// The inverse of an affine transform with a non-singular linear part.
-public float3x4 affine_inverse(float3x4 m)
-{
-    float3x3 inv = linear_inverse(affine_linear(m));
-    return affine(inv, -mul(inv, affine_translation(m)));
-}
-
 // The inverse of a non-singular 3 x 3 matrix.
 public float3x3 linear_inverse(float3x3 m)
 {
@@ -140,21 +127,3 @@ public float3x3 cofactors(float3x3 m)
     return float3x3(cross(m[1], m[2]), cross(m[2], m[0]), cross(m[0], m[1]));
 }
 
-// A ray origin moved off the surface at `p` along the geometric normal `ng` (pointing to
-// the side the ray leaves from) by an amount that scales with |p|, so the ray does not hit
-// the surface it starts on. Wächter and Binder, Ray Tracing Gems chapter 6.
-public float3 offset_ray_origin(float3 p, float3 ng)
-{
-    const float ORIGIN = 1.0 / 32.0;
-    const float FLOAT_SCALE = 1.0 / 65536.0;
-    const float INT_SCALE = 256.0;
-    int3 of = int3(INT_SCALE * ng);
-    float3 pi = float3(
-        asfloat(asint(p.x) + (p.x < 0.0 ? -of.x : of.x)),
-        asfloat(asint(p.y) + (p.y < 0.0 ? -of.y : of.y)),
-        asfloat(asint(p.z) + (p.z < 0.0 ? -of.z : of.z)));
-    return float3(
-        abs(p.x) < ORIGIN ? p.x + FLOAT_SCALE * ng.x : pi.x,
-        abs(p.y) < ORIGIN ? p.y + FLOAT_SCALE * ng.y : pi.y,
-        abs(p.z) < ORIGIN ? p.z + FLOAT_SCALE * ng.z : pi.z);
-}

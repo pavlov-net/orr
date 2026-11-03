@@ -13,14 +13,12 @@
 const _: () = assert!(cfg!(target_endian = "little"));
 
 pub mod abi;
-mod alias;
 #[cfg(feature = "build")]
 pub mod build;
 mod module;
 #[cfg(feature = "openpbr")]
 pub mod openpbr;
 
-pub use alias::AliasEntry;
 #[cfg(feature = "hot-reload")]
 pub use build::{Reload, Watcher};
 pub use module::{EntryPoint, KernelMismatch, KernelSet, Mismatch, PathEntry, ShaderModule, Stage};

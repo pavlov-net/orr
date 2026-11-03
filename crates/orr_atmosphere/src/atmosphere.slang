@@ -264,18 +264,6 @@ public float3 atmosphere_optical_depth(AtmosphereGpu* a, float3 p_render, float3
         + fog;
 }
 
-public float rayleigh_phase(float cos_theta)
-{
-    return 3.0 / (16.0 * PI) * (1.0 + cos_theta * cos_theta);
-}
-
-public float cornette_shanks_phase(float g, float cos_theta)
-{
-    float d = 1.0 + g * g - 2.0 * g * cos_theta;
-    return 3.0 / (8.0 * PI) * (1.0 - g * g) * (1.0 + cos_theta * cos_theta)
-        / ((2.0 + g * g) * d * sqrt(d));
-}
-
 // exp(z^2) erfc(z) for z >= 0, within 4e-4 relative.
 float erfcx(float z)
 {

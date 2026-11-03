@@ -242,10 +242,11 @@ fn oct_forms_round_trip_within_their_step() {
 }
 
 #[test]
-fn scalar_words_round_trip_within_their_step() {
+fn scalar_words_decode_and_round_trip_within_their_step() {
     for c in 0..=0xFFFFu32 {
         let p = c | (0xFFFF - c) << 16;
-        assert_eq!(pack_unorm2x16(unpack_unorm2x16(p)), p);
+        let u = unpack_unorm2x16(p);
+        assert_eq!(u, [c as f32 / 65535.0, (0xFFFF - c) as f32 / 65535.0]);
         let s = unpack_snorm2x16(p);
         // -32768 decodes to -1 like -32767 and encodes back as -32767.
         let canonical = |h: u32| if h == 0x8000 { 0x8001 } else { h };
@@ -257,11 +258,12 @@ fn scalar_words_round_trip_within_their_step() {
     for c in 0..=0xFFu32 {
         let p = c | (0xFF - c) << 8 | (c ^ 0x5A) << 16 | (c.wrapping_mul(7) & 0xFF) << 24;
         assert_eq!(pack_unorm4x8(unpack_unorm4x8(p)), p);
-        let canonical = |b: u32| if b == 0x80 { 0x81 } else { b };
-        let want = (0..4)
-            .map(|i| canonical(p >> (8 * i) & 0xFF) << (8 * i))
-            .sum::<u32>();
-        assert_eq!(pack_snorm4x8(unpack_snorm4x8(p)), want);
+        for (&s, b) in unpack_snorm4x8(p).iter().zip(p.to_le_bytes()) {
+            assert_eq!(s, (f32::from(b as i8) / 127.0).max(-1.0));
+        }
+        assert_eq!(pack_unorm8(unpack_unorm8(c)), c);
+        let canonical = if c == 0x80 { 0x81 } else { c };
+        assert_eq!(pack_snorm8(unpack_snorm8(c)), canonical);
     }
     for c in 0..=0xFFFFu32 {
         let exp = c >> 10 & 0x1F;
@@ -272,27 +274,15 @@ fn scalar_words_round_trip_within_their_step() {
     }
     let mut rng = Rng::new(4);
     for _ in 0..100_000 {
-        let (u, s) = (
-            [rng.f32(), rng.f32()],
-            [rng.range(-1.0, 1.0), rng.range(-1.0, 1.0)],
-        );
-        let (du, ds) = (
-            unpack_unorm2x16(pack_unorm2x16(u)),
-            unpack_snorm2x16(pack_snorm2x16(s)),
-        );
+        let s = [rng.range(-1.0, 1.0), rng.range(-1.0, 1.0)];
+        let ds = unpack_snorm2x16(pack_snorm2x16(s));
         let u4 = [rng.f32(), rng.f32(), rng.f32(), rng.f32()];
-        let s4 = u4.map(|v| v * 2.0 - 1.0);
-        let (du4, ds4) = (
-            unpack_unorm4x8(pack_unorm4x8(u4)),
-            unpack_snorm4x8(pack_snorm4x8(s4)),
-        );
+        let du4 = unpack_unorm4x8(pack_unorm4x8(u4));
         for i in 0..2 {
-            assert!((du[i] - u[i]).abs() <= 0.5 / 65535.0 + 1e-7);
             assert!((ds[i] - s[i]).abs() <= 0.5 / 32767.0 + 1e-7);
         }
         for i in 0..4 {
             assert!((du4[i] - u4[i]).abs() <= 0.5 / 255.0 + 1e-7);
-            assert!((ds4[i] - s4[i]).abs() <= 0.5 / 127.0 + 1e-7);
         }
         // Normal halves: relative error at most half an ulp, 2^-11.
         let h = [rng.range(6.2e-5, 65000.0), -rng.range(6.2e-5, 1.0)];
@@ -312,40 +302,10 @@ fn scalar_words_round_trip_within_their_step() {
     );
 }
 
-/// The value of an unsigned float with a 5-bit exponent and `m` mantissa bits.
-fn small_float(v: u32, m: u32) -> f64 {
-    let (e, f) = (v >> m, v & ((1 << m) - 1));
-    if e == 0 {
-        f64::from(f) * 2f64.powi(-14 - m as i32)
-    } else {
-        (1.0 + f64::from(f) / f64::from(1u32 << m)) * 2f64.powi(e as i32 - 15)
-    }
-}
-
 #[test]
 fn packed_float_color_round_trips() {
-    // Every finite code decodes to its value and encodes back to itself.
-    for c in 0..(31u32 << 6) {
-        let p = c | c << 11 | (c >> 1) << 22;
-        let d = unpack_r11g11b10f(p);
-        assert_eq!(f64::from(d[0]), small_float(c, 6));
-        assert_eq!(f64::from(d[2]), small_float(c >> 1, 5));
-        assert_eq!(pack_r11g11b10f(d), p, "{c:#x}");
-    }
     let mut rng = Rng::new(5);
     for _ in 0..200_000 {
-        let c = [0; 3].map(|_: u8| 2f32.powf(rng.range(-20.0, 15.9)));
-        let d = unpack_r11g11b10f(pack_r11g11b10f(c));
-        for (i, m) in [6, 6, 5].into_iter().enumerate() {
-            // Half an ulp at the value's exponent, or of the denormal step below 2^-14.
-            let e = f64::from(c[i]).log2().floor().max(-14.0);
-            let half_ulp = 2f64.powf(e - f64::from(m) - 1.0);
-            assert!(
-                (f64::from(d[i]) - f64::from(c[i])).abs() <= half_ulp * (1.0 + 1e-6),
-                "{c:?} -> {d:?}"
-            );
-        }
-
         let c = [rng.f32(), rng.f32(), rng.f32()].map(|v| v * 2f32.powf(rng.range(-16.0, 15.0)));
         let d = unpack_rgb9e5(pack_rgb9e5(c));
         let max = c.iter().copied().fold(0.0f32, f32::max);
@@ -362,16 +322,6 @@ fn packed_float_color_round_trips() {
             );
         }
     }
-    let largest11 = small_float((31 << 6) - 1, 6) as f32;
-    let largest10 = small_float((31 << 5) - 1, 5) as f32;
-    assert_eq!(
-        unpack_r11g11b10f(pack_r11g11b10f([1e9, f32::INFINITY, 1e30])),
-        [largest11, largest11, largest10]
-    );
-    assert_eq!(
-        unpack_r11g11b10f(pack_r11g11b10f([-1.0, f32::NAN, -0.0])),
-        [0.0; 3]
-    );
     assert_eq!(
         unpack_rgb9e5(pack_rgb9e5([1e9, -1.0, f32::NAN])),
         [65408.0, 0.0, 0.0]

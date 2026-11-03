@@ -1,6 +1,7 @@
 // A compute pass paints a texture through a storage view; a mesh pass draws a textured,
 // lit cube that samples it through a sampled view.
 #include "orr_shaders/root.h"
+import orr_shaders.math;
 import orr_shaders.abi;
 
 struct CubeVertex
@@ -34,7 +35,7 @@ void paint_main(uint3 id: SV_DispatchThreadID)
     float2 uv = (float2(id.xy) + 0.5) / float(root.size);
     float t = float(root.frame) * 0.05;
     bool check = (((id.x / 32) ^ (id.y / 32)) & 1) != 0;
-    float3 base = 0.5 + 0.5 * cos(6.2831853 * (float3(0.0, 0.33, 0.67) + uv.x + t));
+    float3 base = 0.5 + 0.5 * cos(TWO_PI * (float3(0.0, 0.33, 0.67) + uv.x + t));
     float3 color = check ? base : base * 0.35;
     root.paint_target.get<RWTexture2D<float4>>()[id.xy] = float4(color, 1.0);
 }

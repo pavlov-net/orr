@@ -81,19 +81,6 @@ public struct Tlas
     }
 }
 
-// Marks a heap index that differs between lanes.
-[ForceInline]
-public uint nonuniform(uint index)
-{
-    __target_switch
-    {
-    case metal:
-        return index;
-    default:
-        return NonUniformResourceIndex(index);
-    }
-}
-
 // Metal: the root is at argument-table buffer 0, the texture view pool's base resource ID
 // at 1 and the sampler resource IDs at 2. SPIR-V never uses these.
 [[vk::binding(1, 0)]] ConstantBuffer<uint64_t> metal_texture_pool;
@@ -121,4 +108,17 @@ T metal_resource<T>(uint64_t id)
 {
     __requirePrelude(R"(template<typename T> T orr_resource_from_id(ulong id) { return *reinterpret_cast<thread T*>(&id); })");
     __intrinsic_asm "orr_resource_from_id<$TR>($0)";
+}
+
+// Record `index` of the records `stride` bytes apart at `list`, as 32-bit words.
+public uint* record(uint64_t list, uint index, uint stride)
+{
+    return (uint*)(list + uint64_t(index) * stride);
+}
+
+// Writes `v` to words `word` and `word + 1` of a record.
+public void put64(uint* p, uint word, uint64_t v)
+{
+    p[word] = uint(v);
+    p[word + 1] = uint(v >> 32);
 }

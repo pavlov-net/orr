@@ -4423,19 +4423,8 @@ impl CutRead {
 
 /// The traversal's order-free hash of a set of mesh clusters.
 fn cut_hash(clusters: &BTreeSet<u32>) -> [u32; 2] {
-    clusters.iter().fold([0u32; 2], |h, &c| {
-        let mut a = c.wrapping_mul(0x9e37_79b1).wrapping_add(0x7f4a_7c15);
-        a ^= a >> 16;
-        a = a.wrapping_mul(0x85eb_ca6b);
-        a ^= a >> 13;
-        a = a.wrapping_mul(0xc2b2_ae35);
-        a ^= a >> 16;
-        let mut b = (c ^ 0x5bd1_e995).wrapping_mul(0x27d4_eb2f);
-        b ^= b >> 15;
-        b = b.wrapping_mul(0x1656_67b1);
-        b ^= b >> 13;
-        [h[0].wrapping_add(a), h[1].wrapping_add(b)]
-    })
+    let clusters: Vec<u32> = clusters.iter().copied().collect();
+    orr_scene::testing::cut_hash(&clusters)
 }
 
 /// A world that traces the cut it rasters, every copy's own.

@@ -4,6 +4,7 @@
 // where its density is a grid of a resident volume, or 1 without one.
 module medium_proxy;
 
+import orr_shaders.math;
 import orr_pack.volume;
 
 // `MediumProxyGpu.flags`.
@@ -70,7 +71,7 @@ public float proxy_voxel_step(MediumProxyGpu p, float3 d)
     if (p.volume == nullptr)
         return asfloat(0x7f800000u);
     float3 du = abs(p.box_half * d * p.volume.inv_voxel_size);
-    return 1.0 / max(du.x, max(du.y, du.z));
+    return 1.0 / max_component(du);
 }
 
 // Walks the majorant cells along the object-space ray `o + d * t`: at least the largest
@@ -78,7 +79,7 @@ public float proxy_voxel_step(MediumProxyGpu p, float3 d)
 // it ends (+inf where it does not, as for a proxy without a volume).
 public float proxy_majorant_span(MediumProxyGpu p, float3 o, float3 d, float t, out float t_exit)
 {
-    float e = max(p.extinction.x, max(p.extinction.y, p.extinction.z));
+    float e = max_component(p.extinction);
     if (p.volume == nullptr)
     {
         t_exit = asfloat(0x7f800000u);
@@ -99,7 +100,7 @@ public bool proxy_span(float3 o, float3 d, float t_max, out float t0, out float 
     float3 b = (1.0 - o) * inv;
     float3 lo = min(a, b);
     float3 hi = max(a, b);
-    t0 = max(max(lo.x, max(lo.y, lo.z)), 0.0);
+    t0 = max(max_component(lo), 0.0);
     t1 = min(min(hi.x, min(hi.y, hi.z)), t_max);
     return t1 > t0;
 }

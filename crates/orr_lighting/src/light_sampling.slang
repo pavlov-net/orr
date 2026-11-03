@@ -6,6 +6,7 @@
 // also draw from the lights that fed back in their screen tile.
 module light_sampling;
 
+import orr_shaders.sampling;
 import orr_shaders.abi;
 import orr_shaders.math;
 import orr_color.luminance;
@@ -235,12 +236,9 @@ struct Cone
 // angle `one_minus_cos`.
 float3 cone_direction(float3 axis, float one_minus_cos, float2 u)
 {
-    float one_minus_z = u.x * one_minus_cos;
-    float r = sqrt(max(0.0, one_minus_z * (2.0 - one_minus_z)));
-    float phi = TWO_PI * u.y;
     float3 t, b;
     orthonormal_basis(axis, t, b);
-    return normalize(from_local(float3(r * cos(phi), r * sin(phi), 1.0 - one_minus_z), t, b, axis));
+    return normalize(from_local(sample_cone(u, one_minus_cos), t, b, axis));
 }
 
 // Squared distance from the disc center of direction `dir`, on the unit disc, or a value above
@@ -487,14 +485,14 @@ public float3 directional_disc<M : IMedium>(LightSetGpu* set, uint id, float3 po
 public float3 directional_sample(LightGpu l, float2 u, out float pdf)
 {
     Cone c = Cone(l.radius);
-    pdf = 1.0 / (TWO_PI * c.one_minus_cos);
+    pdf = cone_pdf(c.one_minus_cos);
     return cone_direction(l.direction, c.one_minus_cos, u);
 }
 
 // Density of `directional_sample` for light `l` in direction `dir`.
 public float directional_pdf(LightGpu l, float3 dir)
 {
-    return disc_r2(l, dir) <= 1.0 ? 1.0 / (TWO_PI * Cone(l.radius).one_minus_cos) : 0.0;
+    return disc_r2(l, dir) <= 1.0 ? cone_pdf(Cone(l.radius).one_minus_cos) : 0.0;
 }
 
 // Radiance of a primary sky pixel looking along `dir` from `eye`, beyond the scene's
@@ -646,22 +644,6 @@ public float producer_cluster_weight(SceneRoot* s, uint entry, uint c)
         return 0.0;
     float y = luminance_rec2020(material_light_emission(mat));
     return y > 0.0 ? y * cluster_area(b, k, m) : 0.0;
-}
-
-// The first of `count` inclusive sums from `cdf` above `target`, which lies below the last.
-uint upper_bound(float* cdf, uint count, float target)
-{
-    uint lo = 0;
-    uint hi = count - 1;
-    while (lo < hi)
-    {
-        uint mid = (lo + hi) / 2;
-        if (cdf[mid] > target)
-            hi = mid;
-        else
-            lo = mid + 1;
-    }
-    return lo;
 }
 
 // `x` x `total`, kept below `total`.
@@ -834,9 +816,7 @@ ResolvedLightSample local_candidate(LightSetGpu* set, LocalLights* local, float3
 {
     uint n = min(local.count, LOCAL_LIGHTS);
     float target = below(pick, local.cdf[n - 1]);
-    uint k = 0;
-    while (k + 1 < n && !(local.cdf[k] > target))
-        k++;
+    uint k = upper_bound(&local.cdf[0], n, target);
     return resolve_light_sample(set, tile_light_sample(set, local.ids[k], u, 1.0), x, u.xy);
 }
 
@@ -896,7 +876,7 @@ public ResolvedLightSample resolve_light_sample(LightSetGpu* set, LightSample s,
         LightGpu* light = set.scene.lights + s.light;
         float c = dot(oct_decode_snorm16(s.normal), -axis);
         r.radiance = l * spot_falloff(c, light.cone_cos_inner, light.cone_cos_outer);
-        r.pdf = s.pdf / (TWO_PI * one_minus_cos);
+        r.pdf = s.pdf * cone_pdf(one_minus_cos);
         return r;
     }
     float3 v = s.point - x;

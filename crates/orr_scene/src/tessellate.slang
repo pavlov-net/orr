@@ -193,7 +193,7 @@ void classify(Rates r, inout PatchItem item, float3 p[3], uint level)
     // Fixed point, at least one segment (NaN included) and at most what the splits reach.
     float3 f = round(t * float(FACTOR_ONE));
     uint3 q = select(f >= float(FACTOR_ONE), uint3(min(f, float(MAX_FACTOR))), uint3(FACTOR_ONE));
-    uint most = max(q.x, max(q.y, q.z));
+    uint most = max_component(q);
     if (level == 0)
         item.rate = float(most) / float(FACTOR_ONE);
     TessGpu* g = root.tess;

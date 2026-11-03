@@ -180,7 +180,7 @@ public VertexAttributes load_attributes(uint8_t* page, PageHeader h, Cluster c, 
         uint j = a[at];
         uint w = a[at + 1];
         v.joints = uint4(j, j >> 8, j >> 16, j >> 24) & 0xFF;
-        v.weights = float4(uint4(w, w >> 8, w >> 16, w >> 24) & 0xFF) / 255.0;
+        v.weights = unpack_unorm4x8(w);
     }
     return v;
 }

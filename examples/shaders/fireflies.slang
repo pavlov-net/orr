@@ -3,6 +3,8 @@
 // of the swarm's center, and emits the cluster as the octahedra topology. Last frame's
 // positions go to the batch's previous buffer.
 #include "orr_shaders/root.h"
+import orr_shaders.math;
+import orr_shaders.random;
 import examples.field;
 import orr_scene.producer;
 import orr_scene.tables;
@@ -31,14 +33,14 @@ static const uint PARTICLES = 16;
 // Particle `i`'s center at time `t`.
 float3 particle(Heights h, uint i, float t)
 {
-    uint s = field_hash(i * 0x9e3779b9u + 17u);
-    float a = 6.2831853 * field_unit(s);
-    float r = root.radius * sqrt(field_unit(s + 1));
+    uint s = pcg(i * 0x9e3779b9u + 17u);
+    float a = TWO_PI * pcg_float(s);
+    float r = root.radius * sqrt(pcg_float(s + 1));
     float2 home = float2(root.center_x, root.center_z) + r * float2(cos(a), sin(a));
-    float rate = 0.3 + 0.4 * field_unit(s + 2);
-    float phase = 6.2831853 * field_unit(s + 3);
+    float rate = 0.3 + 0.4 * pcg_float(s + 2);
+    float phase = TWO_PI * pcg_float(s + 3);
     float2 xz = home + 1.5 * float2(sin(t * rate + phase), cos(t * rate * 0.8 + phase));
-    float lift = 0.8 + 1.6 * field_unit(s + 4) + 0.3 * sin(t * 1.3 + phase);
+    float lift = 0.8 + 1.6 * pcg_float(s + 4) + 0.3 * sin(t * 1.3 + phase);
     return float3(xz.x, height_at(h, xz.x, xz.y) + lift, xz.y);
 }
 

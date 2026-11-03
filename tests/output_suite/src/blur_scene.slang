@@ -6,6 +6,7 @@
 // `reference` writes the radiance averaged over `subframes` times spread across the open
 // shutter, centered on time 0.
 #include "orr_shaders/root.h"
+import orr_shaders.math;
 import orr_shaders.abi;
 
 static const uint WHEEL = 0;
@@ -41,7 +42,6 @@ struct Root
 }
 ORR_ROOT(Root);
 
-static const float PI = 3.14159265;
 // Radians per frame.
 static const float WHEEL_SPEED = 0.45;
 // Pixels per frame.

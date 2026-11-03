@@ -173,48 +173,27 @@ public struct GBufferWords
     public uint4 x;
 }
 
-uint unorm8(float v)
-{
-    return uint(round(saturate(v) * 255.0));
-}
-
-float from_unorm8(uint v)
-{
-    return float(v & 255) / 255.0;
-}
-
-uint snorm8(float v)
-{
-    return uint(int(round(clamp(v, -1.0, 1.0) * 127.0))) & 255;
-}
-
-float from_snorm8(uint v)
-{
-    int s = int(v << 24) >> 24;
-    return max(float(s) / 127.0, -1.0);
-}
-
 uint rgb8(float3 c)
 {
     float3 e = srgb_encode(saturate(c));
-    return unorm8(e.x) | (unorm8(e.y) << 8) | (unorm8(e.z) << 16);
+    return pack_unorm8(e.x) | (pack_unorm8(e.y) << 8) | (pack_unorm8(e.z) << 16);
 }
 
 float3 from_rgb8(uint v)
 {
-    return srgb_decode(float3(from_unorm8(v), from_unorm8(v >> 8), from_unorm8(v >> 16)));
+    return srgb_decode(float3(unpack_unorm8(v), unpack_unorm8(v >> 8), unpack_unorm8(v >> 16)));
 }
 
 // 8 bits of sqrt(F0) at normal incidence from air: IOR 1 to 3, finest near 1.
 uint ior_code(float ior)
 {
     float n = max(ior, 1.0);
-    return unorm8(2.0 * (n - 1.0) / (n + 1.0));
+    return pack_unorm8(2.0 * (n - 1.0) / (n + 1.0));
 }
 
 float ior_from_code(uint c)
 {
-    float r = from_unorm8(c) * 0.5;
+    float r = unpack_unorm8(c) * 0.5;
     return (1.0 + r) / (1.0 - r);
 }
 
@@ -268,15 +247,15 @@ public GBufferWords encode_gsurface(GSurface s, bool extended)
             flags |= GBUFFER_LOBE_COLORS;
     }
     GBufferWords w;
-    w.a.x = rgb8(p.base_color) | (unorm8(p.specular_roughness) << 24);
+    w.a.x = rgb8(p.base_color) | (pack_unorm8(p.specular_roughness) << 24);
     w.a.y = oct_encode_snorm16(s.normal);
     w.a.z = pack_rgb9e5(max(p.emission, 0.0));
-    w.a.w = unorm8(p.metalness) | (unorm8(p.specular_weight) << 8) | (ior_code(p.specular_ior) << 16) | (flags << 24);
+    w.a.w = pack_unorm8(p.metalness) | (pack_unorm8(p.specular_weight) << 8) | (ior_code(p.specular_ior) << 16) | (flags << 24);
     float3 sc = srgb_encode(saturate(p.specular_color));
     uint3 s7 = uint3(round(sc * 127.0));
     w.b.x = s7.x | (s7.y << 7) | (s7.z << 14) | (raster_error_code(s.raster_error) << 21);
-    float occlusion = max(p.scale.x, max(p.scale.y, p.scale.z));
-    w.b.y = (oct_encode_snorm8(s.geometric_normal) & 0xffff) | (unorm8(p.diffuse_roughness) << 16) | (unorm8(occlusion) << 24);
+    float occlusion = max_component(p.scale);
+    w.b.y = (oct_encode_snorm8(s.geometric_normal) & 0xffff) | (pack_unorm8(p.diffuse_roughness) << 16) | (pack_unorm8(occlusion) << 24);
     w.x = uint4(0);
     if ((flags & GBUFFER_EXTENDED) != 0)
     {
@@ -290,11 +269,11 @@ public GBufferWords encode_gsurface(GSurface s, bool extended)
             float3 tint = p.subsurface_weight * p.subsurface_color;
             if (thin)
                 tint *= (p.subsurface_anisotropy + 1.0) * 0.5;
-            w.x.x = rgb8(tint) | (snorm8(p.subsurface_anisotropy) << 24);
+            w.x.x = rgb8(tint) | (pack_snorm8(p.subsurface_anisotropy) << 24);
             w.x.y = pack_rgb9e5(max(p.subsurface_radius, 0.0));
         }
-        w.x.z = unorm8(p.coat_weight) | (unorm8(p.coat_roughness) << 8) | (ior_code(p.coat_ior) << 16) | (unorm8(p.fuzz_weight) << 24);
-        w.x.w = unorm8(p.fuzz_roughness) | (unorm8(p.specular_anisotropy) << 8) | (angle_code(p.tangent_angle) << 16) | (unorm8(p.subsurface_weight) << 24);
+        w.x.z = pack_unorm8(p.coat_weight) | (pack_unorm8(p.coat_roughness) << 8) | (ior_code(p.coat_ior) << 16) | (pack_unorm8(p.fuzz_weight) << 24);
+        w.x.w = pack_unorm8(p.fuzz_roughness) | (pack_unorm8(p.specular_anisotropy) << 8) | (angle_code(p.tangent_angle) << 16) | (pack_unorm8(p.subsurface_weight) << 24);
     }
     return w;
 }
@@ -309,17 +288,17 @@ public GSurface decode_gsurface(GBufferWords w, MaterialGpu* m)
     uint flags = w.a.w >> 24;
     s.flags = flags;
     p.base_color = from_rgb8(w.a.x);
-    p.specular_roughness = from_unorm8(w.a.x >> 24);
+    p.specular_roughness = unpack_unorm8(w.a.x >> 24);
     s.normal = oct_decode_snorm16(w.a.y);
     p.emission = unpack_rgb9e5(w.a.z);
-    p.metalness = from_unorm8(w.a.w);
-    p.specular_weight = from_unorm8(w.a.w >> 8);
+    p.metalness = unpack_unorm8(w.a.w);
+    p.specular_weight = unpack_unorm8(w.a.w >> 8);
     p.specular_ior = ior_from_code(w.a.w >> 16);
     p.specular_color = srgb_decode(float3(uint3(w.b.x, w.b.x >> 7, w.b.x >> 14) & 127) / 127.0);
     s.raster_error = raster_error_from_code((w.b.x >> 21) & 31);
     s.geometric_normal = oct_decode_snorm8(w.b.y & 0xffff);
-    p.diffuse_roughness = from_unorm8(w.b.y >> 16);
-    p.scale = float3(from_unorm8(w.b.y >> 24));
+    p.diffuse_roughness = unpack_unorm8(w.b.y >> 16);
+    p.scale = float3(unpack_unorm8(w.b.y >> 24));
     p.transmission_weight = 0.0;
     p.transmission_color = float3(1.0);
     bool thin = (flags & GBUFFER_THIN_TWO_SIDED) != 0;
@@ -346,14 +325,14 @@ public GSurface decode_gsurface(GBufferWords w, MaterialGpu* m)
         p.flags |= BSDF_THIN_FILM;
     if ((flags & GBUFFER_EXTENDED) != 0)
     {
-        p.coat_weight = from_unorm8(w.x.z);
-        p.coat_roughness = from_unorm8(w.x.z >> 8);
+        p.coat_weight = unpack_unorm8(w.x.z);
+        p.coat_roughness = unpack_unorm8(w.x.z >> 8);
         p.coat_ior = ior_from_code(w.x.z >> 16);
-        p.fuzz_weight = from_unorm8(w.x.z >> 24);
-        p.fuzz_roughness = from_unorm8(w.x.w);
-        p.specular_anisotropy = from_unorm8(w.x.w >> 8);
+        p.fuzz_weight = unpack_unorm8(w.x.z >> 24);
+        p.fuzz_roughness = unpack_unorm8(w.x.w);
+        p.specular_anisotropy = unpack_unorm8(w.x.w >> 8);
         p.tangent_angle = angle_from_code(w.x.w >> 16);
-        p.subsurface_weight = from_unorm8(w.x.w >> 24);
+        p.subsurface_weight = unpack_unorm8(w.x.w >> 24);
         if ((flags & GBUFFER_LOBE_COLORS) != 0)
         {
             p.coat_color = from_rgb8(w.x.x);
@@ -361,7 +340,7 @@ public GSurface decode_gsurface(GBufferWords w, MaterialGpu* m)
         }
         else
         {
-            p.subsurface_anisotropy = from_snorm8(w.x.x >> 24);
+            p.subsurface_anisotropy = unpack_snorm8(w.x.x >> 24);
             float share = p.subsurface_weight;
             if (thin)
                 share *= (p.subsurface_anisotropy + 1.0) * 0.5;

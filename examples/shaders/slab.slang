@@ -2,6 +2,7 @@
 // a plane at `level` displaced by traveling waves, with their normals, and emits the patch
 // as the grid topology.
 #include "orr_shaders/root.h"
+import orr_shaders.random;
 import examples.field;
 import orr_scene.producer;
 import orr_scene.tables;

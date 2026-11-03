@@ -338,6 +338,12 @@ pub fn mounted_texture(
     scenes.texture_object(m, id)
 }
 
+/// The order-free hash the traversal gives a set of mesh clusters, as orr_scene computes it on
+/// the CPU.
+pub fn cut_hash(clusters: &[u32]) -> [u32; 2] {
+    crate::accel::cut_hash(clusters)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

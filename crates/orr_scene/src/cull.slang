@@ -158,7 +158,7 @@ bool cluster_visible(ViewConstants* v, RasterGpu* r, InstanceGpu inst, Placement
     if (layer)
         return true;
     // Back-face cone, as meshoptimizer's cluster bounds define it, under uniform scale only.
-    float4 cone = float4(int4(int(c.cone << 24) >> 24, int(c.cone << 16) >> 24, int(c.cone << 8) >> 24, int(c.cone) >> 24)) / 127.0;
+    float4 cone = unpack_snorm4x8(c.cone);
     bool single = (m.flags & MATERIAL_DOUBLE_SIDED) == 0;
     float det = determinant(p.linear);
     bool uniform = abs(abs(det) - p.scale * p.scale * p.scale) < 1e-3 * abs(det);

@@ -52,6 +52,12 @@ public float unit_float(uint x)
     return float(x >> 8) * (1.0 / 16777216.0);
 }
 
+// A float in [0, 1) hashed from `x`.
+public float pcg_float(uint x)
+{
+    return unit_float(pcg(x));
+}
+
 // Interleaved gradient noise (Jimenez 2014): a value in [0, 1) per pixel position.
 public float interleaved_gradient_noise(float2 p)
 {

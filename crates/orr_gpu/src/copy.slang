@@ -3,6 +3,8 @@
 // Addresses are device addresses.
 module copy;
 
+import orr_shaders.abi;
+
 public static const uint MEMORY_COPY_STRIDE = 24;
 public static const uint TEXTURE_COPY_STRIDE = 56;
 
@@ -27,17 +29,6 @@ public struct TextureCopy
     public uint layers;
     public uint3 offset;
     public uint3 extent;
-}
-
-uint* record(uint64_t list, uint index, uint stride)
-{
-    return (uint*)(list + uint64_t(index) * stride);
-}
-
-void put64(uint* p, uint word, uint64_t v)
-{
-    p[word] = uint(v);
-    p[word + 1] = uint(v >> 32);
 }
 
 public void store(uint64_t list, uint index, MemoryCopy v)

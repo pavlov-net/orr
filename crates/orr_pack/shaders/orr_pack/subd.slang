@@ -4,6 +4,8 @@
 // extrapolated), Gregory basis or bilinear.
 module subd;
 
+import orr_shaders.packing;
+
 // `PatchParam.kind`.
 public static const uint SUBD_REGULAR = 0;
 public static const uint SUBD_GREGORY = 1;
@@ -21,7 +23,7 @@ public SubdInfluence decode_influence(uint2 packed)
 {
     SubdInfluence i;
     i.joints = uint4(packed.x, packed.x >> 8, packed.x >> 16, packed.x >> 24) & 0xff;
-    i.weights = float4(uint4(packed.y, packed.y >> 8, packed.y >> 16, packed.y >> 24) & 0xff) / 255.0;
+    i.weights = unpack_unorm4x8(packed.y);
     return i;
 }
 

@@ -10,6 +10,7 @@
 // the same weights and, interpolated with `precise`, the same positions.
 module tessellation;
 
+import orr_shaders.math;
 import orr_shaders.abi;
 __exported import orr_scene.subd_cage;
 
@@ -128,7 +129,7 @@ public uint3 pattern_weights(uint key, uint3 q)
         return w;
     }
     // Ring r is the triangle scaled about its center by 1 - 2 depth / total.
-    uint qi = max(q.x, max(q.y, q.z));
+    uint qi = max_component(q);
     uint n = factor_count(qi);
     uint2 l = segment_lengths(n, qi);
     uint2 depth = along(n, r, l);

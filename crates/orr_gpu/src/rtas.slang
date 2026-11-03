@@ -4,6 +4,7 @@
 // device addresses; vertex positions are f32x3 with a 12-byte stride.
 module rtas;
 
+import orr_shaders.abi;
 import orr_shaders.debug;
 
 // `ClasBuild.flags`: the micromap index may name `OMM_INDEX_DISABLE` per triangle.
@@ -179,17 +180,6 @@ public static const uint PTLAS_UPDATE_STRIDE = 16;
 public static const uint PTLAS_TRANSLATE_STRIDE = 16;
 public static const uint PTLAS_COMMAND_STRIDE = 24;
 public static const uint CLASSIC_INSTANCE_STRIDE = 64;
-
-uint* record(uint64_t args, uint index, uint stride)
-{
-    return (uint*)(args + uint64_t(index) * stride);
-}
-
-void put64(uint* p, uint word, uint64_t v)
-{
-    p[word] = uint(v);
-    p[word + 1] = uint(v >> 32);
-}
 
 void put_transform(uint* p, float3x4 m)
 {

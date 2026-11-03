@@ -457,7 +457,7 @@ bool froxel_shadowed(FroxelLights* lights, uint id)
 
 float3 limit_incident(float3 c)
 {
-    float m = max(c.x, max(c.y, c.z));
+    float m = max_component(c);
     return !all(isfinite(c)) ? float3(0.0) : m > FROXEL_INCIDENT_MAX ? c * (FROXEL_INCIDENT_MAX / m) : c;
 }
 

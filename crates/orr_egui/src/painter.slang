@@ -2,6 +2,7 @@
 // their vertices through the root's pointers; the pixel stage filters, multiplies and blends
 // in gamma space like egui's reference painters.
 #include "orr_shaders/root.h"
+import orr_shaders.packing;
 import orr_shaders.abi;
 import orr_color.transfer;
 
@@ -60,7 +61,7 @@ void mesh_main(
         Vertex v;
         v.position = float4(e.pos.x * root.scale_x - 1.0, e.pos.y * root.scale_y - 1.0, 0.0, 1.0);
         v.uv = e.uv;
-        v.color = float4(e.color & 0xff, (e.color >> 8) & 0xff, (e.color >> 16) & 0xff, e.color >> 24) / 255.0;
+        v.color = unpack_unorm4x8(e.color);
         vertices[3 * thread + k] = v;
     }
     triangles[thread] = uint3(3 * thread, 3 * thread + 1, 3 * thread + 2);

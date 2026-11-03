@@ -5,6 +5,8 @@
 // at infinity.
 module view;
 
+import orr_shaders.math;
+
 public struct ExposureState
 {
     public float pre_exposure;
@@ -58,7 +60,7 @@ public float3 apply_hdr_ceiling(float3 c)
 {
     if (any(isnan(c)) || any(isinf(c)))
         return float3(0);
-    float m = max(c.x, max(c.y, c.z));
+    float m = max_component(c);
     return m > HDR_CEILING ? c * (HDR_CEILING / m) : c;
 }
 

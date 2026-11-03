@@ -3,6 +3,7 @@
 // is darkened toward the blade's root by the vertex words (height along the blade, 0 to
 // 65535) and shifted per clump by the cluster word.
 #include "orr_shaders/root.h"
+import orr_shaders.packing;
 import orr_shaders.abi;
 import orr_scene.surface;
 import orr_scene.visibility;
@@ -36,7 +37,7 @@ void main(uint3 id: SV_DispatchThreadID)
     float3 words = float3(i.vertex_user) / 65535.0;
     float2 b = i.barycentrics;
     float along = (1.0 - b.x - b.y) * words.x + b.x * words.y + b.y * words.z;
-    float clump = float(i.cluster_user & 0xff) / 255.0;
+    float clump = unpack_unorm8(i.cluster_user);
     float3 hue = lerp(float3(0.75, 1.0, 0.55), float3(1.15, 0.95, 0.6), clump);
     RWTexture2D<float4> target = root.target.get<RWTexture2D<float4>>();
     float4 c = target[id.xy];

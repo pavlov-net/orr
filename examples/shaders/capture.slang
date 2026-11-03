@@ -1,6 +1,7 @@
 // Encodes a display-linear Rec.709 image, 1.0 at paper white, as clamped 8-bit sRGB RGBA in
 // rows, for headless captures.
 #include "orr_shaders/root.h"
+import orr_shaders.packing;
 import orr_shaders.abi;
 import orr_color.transfer;
 
@@ -22,6 +23,5 @@ void main(uint3 id: SV_DispatchThreadID)
     if (id.x >= root.width || id.y >= root.height)
         return;
     float3 linear = root.source.get<Texture2D<float4>>().Load(int3(id.xy, 0)).rgb;
-    uint3 c = uint3(round(srgb_encode(saturate(linear)) * 255.0));
-    root.pixels[id.y * root.width + id.x] = c.r | c.g << 8 | c.b << 16 | 0xFF000000u;
+    root.pixels[id.y * root.width + id.x] = pack_unorm4x8(float4(srgb_encode(saturate(linear)), 1.0));
 }

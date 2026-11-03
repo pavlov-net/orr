@@ -184,6 +184,24 @@ void body<C : ICoherence>(uint2 px)
     root.out_hash[pix] = hash;
 }
 
+// A ray origin moved off the surface at `p` along the geometric normal `ng`, by an amount that
+// scales with |p|. Wachter and Binder, Ray Tracing Gems chapter 6.
+float3 offset_ray_origin(float3 p, float3 ng)
+{
+    const float ORIGIN = 1.0 / 32.0;
+    const float FLOAT_SCALE = 1.0 / 65536.0;
+    const float INT_SCALE = 256.0;
+    int3 of = int3(INT_SCALE * ng);
+    float3 pi = float3(
+        asfloat(asint(p.x) + (p.x < 0.0 ? -of.x : of.x)),
+        asfloat(asint(p.y) + (p.y < 0.0 ? -of.y : of.y)),
+        asfloat(asint(p.z) + (p.z < 0.0 ? -of.z : of.z)));
+    return float3(
+        abs(p.x) < ORIGIN ? p.x + FLOAT_SCALE * ng.x : pi.x,
+        abs(p.y) < ORIGIN ? p.y + FLOAT_SCALE * ng.y : pi.y,
+        abs(p.z) < ORIGIN ? p.z + FLOAT_SCALE * ng.z : pi.z);
+}
+
 [shader("raygeneration")]
 void raygen_main()
 {

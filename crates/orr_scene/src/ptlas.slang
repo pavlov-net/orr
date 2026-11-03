@@ -180,7 +180,7 @@ uint partition_bucket(uint p)
     if (p >= t.partition_count || root.focus_cell.w == 0)
         return 0;
     int3 d = abs(t.partitions[p].cell - root.focus_cell.xyz);
-    return min(uint(max(d.x, max(d.y, d.z))), DISTANCE_BUCKETS - 1);
+    return min(uint(max_component(d)), DISTANCE_BUCKETS - 1);
 }
 
 uint mask_of(uint class_id)

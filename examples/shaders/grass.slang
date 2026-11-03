@@ -6,6 +6,8 @@
 // picks a clump's color; vertex word: height along the blade, 0 at the root and 65535 at
 // the tip.
 #include "orr_shaders/root.h"
+import orr_shaders.math;
+import orr_shaders.random;
 import examples.field;
 import orr_scene.producer;
 import orr_scene.tables;
@@ -66,14 +68,14 @@ void main(uint3 id: SV_DispatchThreadID)
     if (first == NO_ROOM)
         return;
     Heights heights = { root.heights, root.side, root.spacing, root.origin_x, root.origin_z };
-    uint h = field_hash(c);
+    uint h = pcg(c);
     for (uint blade = 0; blade < BLADES; blade++)
     {
-        uint s = field_hash(h + blade * 0x9e3779b9u);
-        float2 xz = cell + (float2(field_unit(s), field_unit(s + 1)) - 0.5) * root.cell_size;
+        uint s = pcg(h + blade * 0x9e3779b9u);
+        float2 xz = cell + (float2(pcg_float(s), pcg_float(s + 1)) - 0.5) * root.cell_size;
         float3 base = float3(xz.x, height_at(heights, xz.x, xz.y), xz.y);
-        float height = 0.25 + 0.35 * field_unit(s + 2);
-        float yaw = 6.2831853 * field_unit(s + 3);
+        float height = 0.25 + 0.35 * pcg_float(s + 2);
+        float yaw = TWO_PI * pcg_float(s + 3);
         float3 n = normalize(float3(-sin(yaw), 0.6, cos(yaw)));
         for (uint k = 0; k < count; k++)
         {

@@ -754,7 +754,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             }
             if (alive && !walking && l.kind != VERTEX_LAYER && opaque > r.roulette_depth)
             {
-                float keep = saturate(max(throughput.x, max(throughput.y, throughput.z)));
+                float keep = saturate(max_component(throughput));
                 alive = u_roulette < keep;
                 throughput /= max(keep, 1e-6);
             }
@@ -840,7 +840,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
                 InteriorMedium im = interior_medium(s, medium);
                 // A walk takes a bounce; a ray leaving an opaque vertex takes transmittance only.
                 bool walks = ray.chain && (reference || !walked) && opaque < r.max_bounces
-                    && max(im.sigma_s.x, max(im.sigma_s.y, im.sigma_s.z)) * t >= 1.0;
+                    && max_component(im.sigma_s) * t >= 1.0;
                 float scattered;
                 scatters = interior_segment(im, t, ray.scatter || walks, rng, throughput, scattered);
                 if (scatters)
@@ -981,14 +981,14 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             if (count_bsdf && counted && (!skip_direct || environment_after_walk))
             {
                 float3 env = environment_map(set.environment, ray.dir);
-                float w = weigh ? power_heuristic(ray.pdf, ray.run * nee_environment_pdf(set, ray_local, ray.normal, ray.dir)) : 1.0;
+                float w = weigh ? mis_power(ray.pdf, ray.run * nee_environment_pdf(set, ray_local, ray.normal, ray.dir)) : 1.0;
                 float3 e = env * w;
                 for (uint k = 0; k < set.directional_count && !skip_direct; k++)
                 {
                     uint id = set.directional_ids[k];
                     float3 d = directional_disc<M>(set, id, ray.origin, ray.dir);
                     if (any(d > 0.0))
-                        e += d * (weigh ? power_heuristic(ray.pdf, ray.run * nee_directional_pdf(set, ray.normal, id, ray.dir)) : 1.0);
+                        e += d * (weigh ? mis_power(ray.pdf, ray.run * nee_directional_pdf(set, ray.normal, id, ray.dir)) : 1.0);
                 }
                 radiance += spectral.color(throughput * e);
             }
@@ -1036,7 +1036,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             if (weigh && producer)
             {
                 float lum = luminance_rec2020(material_light_emission(s.materials + sh.surface.material));
-                w = power_heuristic(ray.pdf, ray.run * nee_emissive_pdf(set, ray_local, ray.normal, entry, lum, t, dot(sh.surface.geometric_normal, ray.dir)));
+                w = mis_power(ray.pdf, ray.run * nee_emissive_pdf(set, ray_local, ray.normal, entry, lum, t, dot(sh.surface.geometric_normal, ray.dir)));
             }
             radiance += spectral.color(throughput * b.emission() * w);
         }

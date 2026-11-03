@@ -72,28 +72,11 @@ fn quaternions_and_affines_match_glam() {
             rng.range(-1.0, 1.0),
         ])
         .normalize();
-        let qb = Quat::from_array([
-            rng.range(-1.0, 1.0),
-            rng.range(-1.0, 1.0),
-            rng.range(-1.0, 1.0),
-            rng.range(-1.0, 1.0),
-        ])
-        .normalize();
         let v = Vec3::new(
             rng.range(-10.0, 10.0),
             rng.range(-10.0, 10.0),
             rng.range(-10.0, 10.0),
         );
-        assert!(close(
-            &quat_mul(qa.to_array(), qb.to_array()),
-            &(qa * qb).to_array(),
-            1e-6
-        ));
-        assert!(close(
-            &quat_rotate(qa.to_array(), v.into()),
-            &(qa * v).to_array(),
-            1e-5
-        ));
         assert!(close(
             &quat_to_matrix(qa.to_array()),
             &Mat3::from_quat(qa).transpose().to_cols_array(),
@@ -103,7 +86,6 @@ fn quaternions_and_affines_match_glam() {
         let (a, b) = (random_affine(&mut rng), random_affine(&mut rng));
         let (ra, rb) = (rows(&a), rows(&b));
         assert!(close(&affine_mul(ra, rb), &rows(&(a * b)), 1e-5));
-        assert!(close(&affine_inverse(ra), &rows(&a.inverse()), 1e-4));
         assert!(close(
             &transform_point(ra, v.into()),
             &a.transform_point3(v).to_array(),
@@ -120,22 +102,5 @@ fn quaternions_and_affines_match_glam() {
             close(&transform_normal(ra, n.into()), &want.to_array(), 1e-4),
             "{a:?} {n}"
         );
-    }
-}
-
-#[test]
-fn ray_origin_offset_leaves_the_surface_by_a_relative_step() {
-    let mut rng = Rng::new(12);
-    for _ in 0..100_000 {
-        let scale = 10f32.powf(rng.range(-4.0, 5.0));
-        let p = Vec3::from(rng.unit()) * scale * rng.f32();
-        let n = Vec3::from(rng.unit());
-        let o = Vec3::from(offset_ray_origin(p.into(), n.into()));
-        let moved = o - p;
-        assert!(moved.dot(n) > 0.0, "p {p} n {n} -> {o}");
-        // At most 256 ulps per axis away from the origin, a fixed step near it.
-        let bound = p.abs().max(Vec3::splat(1.0 / 32.0)) * (256.0 * f32::EPSILON)
-            + Vec3::splat(1.0 / 65536.0);
-        assert!(moved.abs().cmple(bound).all(), "p {p} n {n} moved {moved}");
     }
 }

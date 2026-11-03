@@ -290,7 +290,7 @@ pub(crate) fn cluster_refs(m: &MeshInput<'_>) -> Vec<ClusterRef> {
         .collect()
 }
 
-/// `tables.slang` `cluster_hash` of one mesh cluster.
+/// `orr_scene.tables`' `cluster_hash` of one mesh cluster.
 fn cluster_hash(mesh_cluster: u32) -> [u32; 2] {
     let mut a = mesh_cluster
         .wrapping_mul(0x9e37_79b1)
@@ -308,7 +308,7 @@ fn cluster_hash(mesh_cluster: u32) -> [u32; 2] {
 }
 
 /// The order-free hash the traversal gives a set of mesh clusters.
-fn cut_hash(clusters: &[u32]) -> [u32; 2] {
+pub(super) fn cut_hash(clusters: &[u32]) -> [u32; 2] {
     clusters.iter().fold([0, 0], |h, &c| {
         let k = cluster_hash(c);
         [h[0].wrapping_add(k[0]), h[1].wrapping_add(k[1])]

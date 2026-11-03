@@ -37,19 +37,3 @@ public float3 normal_at(Heights h, float x, float z)
     float dz = height_at(h, x, z + e) - height_at(h, x, z - e);
     return normalize(float3(-dx, 2.0 * e, -dz));
 }
-
-// A small integer hash, for per-blade and per-patch variety.
-public uint field_hash(uint x)
-{
-    x ^= x >> 16;
-    x *= 0x7feb352du;
-    x ^= x >> 15;
-    x *= 0x846ca68bu;
-    x ^= x >> 16;
-    return x;
-}
-
-public float field_unit(uint x)
-{
-    return float(field_hash(x) & 0xffffff) / 16777216.0;
-}

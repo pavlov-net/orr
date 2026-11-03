@@ -22,15 +22,11 @@ export __extern_cpp void orr_orthonormal_basis(float* n, float* t, float* b)
     store3(t, tt);
     store3(b, bb);
 }
-export __extern_cpp void orr_quat_mul(float* a, float* b, float* out) { store4(out, quat_mul(load4(a), load4(b))); }
-export __extern_cpp void orr_quat_rotate(float* q, float* v, float* out) { store3(out, quat_rotate(load4(q), load3(v))); }
 export __extern_cpp void orr_quat_to_matrix(float* q, float* out) { store3x3(out, quat_to_matrix(load4(q))); }
 export __extern_cpp void orr_affine_mul(float* a, float* b, float* out) { store3x4(out, affine_mul(load3x4(a), load3x4(b))); }
-export __extern_cpp void orr_affine_inverse(float* m, float* out) { store3x4(out, affine_inverse(load3x4(m))); }
 export __extern_cpp void orr_transform_point(float* m, float* p, float* out) { store3(out, transform_point(load3x4(m), load3(p))); }
 export __extern_cpp void orr_transform_vector(float* m, float* v, float* out) { store3(out, transform_vector(load3x4(m), load3(v))); }
 export __extern_cpp void orr_transform_normal(float* m, float* n, float* out) { store3(out, transform_normal(load3x4(m), load3(n))); }
-export __extern_cpp void orr_offset_ray_origin(float* p, float* n, float* out) { store3(out, offset_ray_origin(load3(p), load3(n))); }
 
 // packing
 
@@ -41,18 +37,14 @@ export __extern_cpp void orr_oct_decode_snorm16(uint e, float* out) { store3(out
 export __extern_cpp uint orr_oct_encode_snorm8(float* n) { return oct_encode_snorm8(load3(n)); }
 export __extern_cpp void orr_oct_decode_snorm8(uint e, float* out) { store3(out, oct_decode_snorm8(e)); }
 
-export __extern_cpp uint orr_pack_unorm2x16(float x, float y) { return pack_unorm2x16(float2(x, y)); }
 export __extern_cpp void orr_unpack_unorm2x16(uint p, float* out) { float2 v = unpack_unorm2x16(p); out[0] = v.x; out[1] = v.y; }
 export __extern_cpp uint orr_pack_snorm2x16(float x, float y) { return pack_snorm2x16(float2(x, y)); }
 export __extern_cpp void orr_unpack_snorm2x16(uint p, float* out) { float2 v = unpack_snorm2x16(p); out[0] = v.x; out[1] = v.y; }
 export __extern_cpp uint orr_pack_unorm4x8(float* v) { return pack_unorm4x8(load4(v)); }
 export __extern_cpp void orr_unpack_unorm4x8(uint p, float* out) { store4(out, unpack_unorm4x8(p)); }
-export __extern_cpp uint orr_pack_snorm4x8(float* v) { return pack_snorm4x8(load4(v)); }
 export __extern_cpp void orr_unpack_snorm4x8(uint p, float* out) { store4(out, unpack_snorm4x8(p)); }
 export __extern_cpp uint orr_pack_half2x16(float x, float y) { return pack_half2x16(float2(x, y)); }
 export __extern_cpp void orr_unpack_half2x16(uint p, float* out) { float2 v = unpack_half2x16(p); out[0] = v.x; out[1] = v.y; }
-export __extern_cpp uint orr_pack_r11g11b10f(float* c) { return pack_r11g11b10f(load3(c)); }
-export __extern_cpp void orr_unpack_r11g11b10f(uint p, float* out) { store3(out, unpack_r11g11b10f(p)); }
 export __extern_cpp uint orr_pack_rgb9e5(float* c) { return pack_rgb9e5(load3(c)); }
 export __extern_cpp void orr_unpack_rgb9e5(uint p, float* out) { store3(out, unpack_rgb9e5(p)); }
 
@@ -85,25 +77,9 @@ export __extern_cpp void orr_sampler_next2(uint px, uint py, uint frame, uint co
 export __extern_cpp void orr_sample_cosine_hemisphere(float u0, float u1, float* out) { store3(out, sample_cosine_hemisphere(float2(u0, u1))); }
 export __extern_cpp float orr_cosine_hemisphere_pdf(float cos_theta) { return cosine_hemisphere_pdf(cos_theta); }
 export __extern_cpp void orr_sample_uniform_hemisphere(float u0, float u1, float* out) { store3(out, sample_uniform_hemisphere(float2(u0, u1))); }
-export __extern_cpp float orr_uniform_hemisphere_pdf() { return uniform_hemisphere_pdf(); }
 export __extern_cpp void orr_sample_uniform_sphere(float u0, float u1, float* out) { store3(out, sample_uniform_sphere(float2(u0, u1))); }
-export __extern_cpp float orr_uniform_sphere_pdf() { return uniform_sphere_pdf(); }
-export __extern_cpp void orr_sample_cone(float u0, float u1, float cos_max, float* out) { store3(out, sample_cone(float2(u0, u1), cos_max)); }
-export __extern_cpp float orr_cone_pdf(float cos_max) { return cone_pdf(cos_max); }
-
-// Returns the solid angle.
-export __extern_cpp float orr_sample_spherical_rectangle(float* o, float* corner, float* ex, float* ey, float u0, float u1, float* out)
-{
-    SphericalRectangle r = SphericalRectangle(load3(o), load3(corner), load3(ex), load3(ey));
-    store3(out, r.sample(float2(u0, u1)));
-    return r.solid_angle;
-}
-export __extern_cpp float orr_sample_spherical_triangle(float* o, float* v0, float* v1, float* v2, float u0, float u1, float* out)
-{
-    SphericalTriangle t = SphericalTriangle(load3(o), load3(v0), load3(v1), load3(v2));
-    store3(out, t.sample(float2(u0, u1)));
-    return t.solid_angle;
-}
+export __extern_cpp void orr_sample_cone(float u0, float u1, float one_minus_cos, float* out) { store3(out, sample_cone(float2(u0, u1), one_minus_cos)); }
+export __extern_cpp float orr_cone_pdf(float one_minus_cos) { return cone_pdf(one_minus_cos); }
 
 export __extern_cpp void orr_sample_ggx_vndf_bounded(float* v, float ax, float ay, float u0, float u1, float* out)
 {
@@ -114,4 +90,8 @@ export __extern_cpp float orr_ggx_vndf_bounded_pdf(float* v, float* l, float ax,
     return ggx_vndf_bounded_pdf(load3(v), load3(l), float2(ax, ay));
 }
 
-export __extern_cpp uint orr_sample_alias(AliasEntry* table, uint count, float u) { return sample_alias(table, count, u); }
+export __extern_cpp float orr_mis_power(float a, float b) { return mis_power(a, b); }
+export __extern_cpp uint orr_pack_unorm8(float v) { return pack_unorm8(v); }
+export __extern_cpp float orr_unpack_unorm8(uint p) { return unpack_unorm8(p); }
+export __extern_cpp uint orr_pack_snorm8(float v) { return pack_snorm8(v); }
+export __extern_cpp float orr_unpack_snorm8(uint p) { return unpack_snorm8(p); }

@@ -65,9 +65,6 @@ pub enum DebugInfo {
     Separate,
 }
 
-/// Structs of orr's shared libraries and the default-feature Rust types they map to.
-const LIBRARY_TYPES: &[(&str, &str)] = &[("AliasEntry", "::orr_shaders::AliasEntry")];
-
 /// The session option of builds with micromaps, which `orr_shaders/root.h` and
 /// `orr_shaders.trace` test.
 const OMM_OPTION: &str = "-DORR_OMM_BUILD";
@@ -113,10 +110,7 @@ impl Build {
             prefix: None,
             includes: vec![Root::plain(orr_color::SHADER_DIR)],
             deps: Vec::new(),
-            externs: LIBRARY_TYPES
-                .iter()
-                .map(|(s, r)| ((*s).to_owned(), (*r).to_owned()))
-                .collect(),
+            externs: BTreeMap::new(),
             debug_info: match env::var("ORR_SHADER_DEBUG_INFO").as_deref() {
                 Err(_) | Ok("lines") => DebugInfo::Lines,
                 Ok("off") => DebugInfo::Off,

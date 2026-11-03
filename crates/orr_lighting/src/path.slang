@@ -9,6 +9,7 @@
 // added to its path, for the next frame's light selection and local samplers.
 module path;
 
+import orr_shaders.packing;
 import orr_shaders.abi;
 import orr_shaders.math;
 import orr_color.luminance;
@@ -150,7 +151,7 @@ public struct PathRoot
 // coverage) and half floats of the motion; 0 for no layer.
 public uint64_t overlay_front_word(float depth, float2 motion, float weight)
 {
-    uint high = (asuint(depth) & 0xffffff00u) | uint(round(saturate(weight) * 255.0));
+    uint high = (asuint(depth) & 0xffffff00u) | pack_unorm8(weight);
     return (uint64_t(high) << 32) | uint64_t(f32tof16(motion.x) | (f32tof16(motion.y) << 16));
 }
 
@@ -161,7 +162,7 @@ public float overlay_front_depth(uint64_t word)
 
 public float overlay_front_weight(uint64_t word)
 {
-    return float(uint(word >> 32) & 0xffu) / 255.0;
+    return unpack_unorm8(uint(word >> 32));
 }
 
 public float2 overlay_front_motion(uint64_t word)
@@ -362,7 +363,7 @@ public struct ParticleEmission<A : IAnyHit> : ITranslucent
         if (pdf > 0.0 && any(e > 0.0) && hit_producer(scene, c.instance_index, entry))
         {
             float l = luminance_rec2020(material_light_emission(scene.materials + material));
-            w = power_heuristic(pdf, run * nee_emissive_pdf(set, local, normal, entry, l, c.t, dot(n, dir)));
+            w = mis_power(pdf, run * nee_emissive_pdf(set, local, normal, entry, l, c.t, dot(n, dir)));
         }
         return float4(e * (a * w), a);
     }
@@ -381,11 +382,6 @@ public RayDesc path_ray(float3 origin, float3 dir, float t_max)
     r.TMin = 0.0;
     r.TMax = t_max;
     return r;
-}
-
-public float power_heuristic(float a, float b)
-{
-    return a > 0.0 ? mis_power(a, b) : 0.0;
 }
 
 // Probability that a vertex runs next-event estimation: 1 unless it is a smooth metal
@@ -507,7 +503,7 @@ public float3 shade_vertex_nee<F : IScatter, V : IShadow>(PathRoot r, PathVertex
     bool shared = chosen.kind == LIGHT_SAMPLE_ENVIRONMENT || chosen.kind == LIGHT_SAMPLE_DIRECTIONAL
         || chosen.kind == LIGHT_SAMPLE_EMISSIVE;
     if (!weight_one && weigh && shared)
-        mis = power_heuristic(run * chosen.pdf, f.pdf(dir));
+        mis = mis_power(run * chosen.pdf, f.pdf(dir));
     if (chosen.kind != LIGHT_SAMPLE_DIRECTIONAL)
         light = chosen.light;
     return e * vis * (W * mis / run);
@@ -920,7 +916,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
                 walking = record.walks() && (bs.lobe & LOBE_VOLUME) != 0;
                 if (!walking && depth >= r.roulette_depth)
                 {
-                    float keep = saturate(max(throughput.x, max(throughput.y, throughput.z)));
+                    float keep = saturate(max_component(throughput));
                     alive = u_roulette < keep;
                     throughput /= max(keep, 1e-6);
                 }
@@ -1004,7 +1000,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
             if (count_bsdf && counted)
             {
                 float3 env = environment_map(set.environment, ray.dir);
-                float w = weigh ? power_heuristic(ray.pdf, ray.run * nee_environment_pdf(set, local, ray.normal, ray.dir)) : 1.0;
+                float w = weigh ? mis_power(ray.pdf, ray.run * nee_environment_pdf(set, local, ray.normal, ray.dir)) : 1.0;
                 float3 l = env * w;
                 record.light(feedback_environment(set), luminance_rec2020(throughput * l));
                 for (uint k = 0; k < set.directional_count; k++)
@@ -1012,7 +1008,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
                     uint id = set.directional_ids[k];
                     float3 d = directional_disc<M>(set, id, ray.origin, ray.dir);
                     if (any(d > 0.0))
-                        l += d * (weigh ? power_heuristic(ray.pdf, ray.run * nee_directional_pdf(set, ray.normal, id, ray.dir)) : 1.0);
+                        l += d * (weigh ? mis_power(ray.pdf, ray.run * nee_directional_pdf(set, ray.normal, id, ray.dir)) : 1.0);
                 }
                 radiance += throughput * l;
             }
@@ -1059,7 +1055,7 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
             {
                 float l = luminance_rec2020(material_light_emission(s.materials + sh.surface.material));
                 float cos_light = dot(sh.surface.geometric_normal, ray.dir);
-                w = power_heuristic(ray.pdf, ray.run * nee_emissive_pdf(set, local, ray.normal, entry, l, t, cos_light));
+                w = mis_power(ray.pdf, ray.run * nee_emissive_pdf(set, local, ray.normal, entry, l, t, cos_light));
             }
             radiance += throughput * b.emission() * w;
         }

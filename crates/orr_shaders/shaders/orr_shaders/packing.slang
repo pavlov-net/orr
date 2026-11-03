@@ -85,12 +85,6 @@ public float3 oct_decode_snorm8(uint e)
 
 // Unorm, snorm and half words. The first component is in the low bits.
 
-public uint pack_unorm2x16(float2 v)
-{
-    uint2 q = uint2(round(clamp(v, 0.0, 1.0) * 65535.0));
-    return q.x | (q.y << 16);
-}
-
 public float2 unpack_unorm2x16(uint p)
 {
     return float2(uint2(p & 0xFFFF, p >> 16)) / 65535.0;
@@ -108,6 +102,27 @@ public float2 unpack_snorm2x16(uint p)
     return max(float2(q) / 32767.0, -1.0);
 }
 
+// One byte in the low bits.
+public uint pack_unorm8(float v)
+{
+    return uint(round(saturate(v) * 255.0));
+}
+
+public float unpack_unorm8(uint p)
+{
+    return float(p & 0xFF) / 255.0;
+}
+
+public uint pack_snorm8(float v)
+{
+    return uint(int(round(clamp(v, -1.0, 1.0) * 127.0))) & 0xFF;
+}
+
+public float unpack_snorm8(uint p)
+{
+    return max(float(int(p << 24) >> 24) / 127.0, -1.0);
+}
+
 public uint pack_unorm4x8(float4 v)
 {
     uint4 q = uint4(round(clamp(v, 0.0, 1.0) * 255.0));
@@ -117,12 +132,6 @@ public uint pack_unorm4x8(float4 v)
 public float4 unpack_unorm4x8(uint p)
 {
     return float4(uint4(p, p >> 8, p >> 16, p >> 24) & 0xFF) / 255.0;
-}
-
-public uint pack_snorm4x8(float4 v)
-{
-    uint4 q = uint4(int4(round(clamp(v, -1.0, 1.0) * 127.0))) & 0xFF;
-    return q.x | (q.y << 8) | (q.z << 16) | (q.w << 24);
 }
 
 public float4 unpack_snorm4x8(uint p)
@@ -142,60 +151,8 @@ public float2 unpack_half2x16(uint p)
     return float2(f16tof32(p & 0xFFFF), f16tof32(p >> 16));
 }
 
-// Packed float color: R11G11B10 (VK_FORMAT_B10G11R11_UFLOAT_PACK32) and shared exponent
-// (VK_FORMAT_E5B9G9R9_UFLOAT_PACK32). Both are unsigned: negative values and NaN store 0,
-// values past the largest finite one store the largest finite one.
-
-// An unsigned float with a 5-bit exponent (bias 15) and `mbits` mantissa bits, rounded to
-// nearest even from f32.
-uint small_float(float f, uint mbits)
-{
-    uint u = asuint(f);
-    if (!(f > 0.0) || (u >> 23) == 0)
-        return 0;
-    int exp = int(u >> 23) + (15 - 127);
-    uint mant = (u & 0x7FFFFF) | 0x800000;
-    uint shift = 23 - mbits;
-    if (exp < 1)
-    {
-        shift += uint(1 - exp);
-        exp = 0;
-    }
-    if (shift > 24)
-        return 0;
-    uint kept = mant >> shift;
-    uint rest = mant & ((1u << shift) - 1);
-    uint half = 1u << (shift - 1);
-    if (rest > half || (rest == half && (kept & 1) != 0))
-        kept += 1;
-    uint largest = (31u << mbits) - 1;
-    if (exp == 0)
-        return kept;
-    uint v = (uint(exp) << mbits) + kept - (1u << mbits);
-    return min(v, largest);
-}
-
-float small_float_value(uint v, uint mbits)
-{
-    uint exp = v >> mbits;
-    uint mant = v & ((1u << mbits) - 1);
-    if (exp == 0)
-        return float(mant) * asfloat((127 - 14 - mbits) << 23);
-    if (exp == 31)
-        return mant == 0 ? asfloat(0x7F800000) : asfloat(0x7FC00000);
-    return asfloat(((exp + 127 - 15) << 23) | (mant << (23 - mbits)));
-}
-
-// R in bits 0-10, G in 11-21, B in 22-31.
-public uint pack_r11g11b10f(float3 c)
-{
-    return small_float(c.r, 6) | (small_float(c.g, 6) << 11) | (small_float(c.b, 5) << 22);
-}
-
-public float3 unpack_r11g11b10f(uint p)
-{
-    return float3(small_float_value(p & 0x7FF, 6), small_float_value((p >> 11) & 0x7FF, 6), small_float_value(p >> 22, 5));
-}
+// Shared exponent packed float color (VK_FORMAT_E5B9G9R9_UFLOAT_PACK32). Unsigned: negative
+// values and NaN store 0, values past the largest finite one store the largest finite one.
 
 // 2^k for an exponent inside the normal f32 range.
 float exp2i(int k)

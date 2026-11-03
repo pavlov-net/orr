@@ -144,6 +144,16 @@ public float draine_phase(float g, float alpha, float cos_theta)
         / (1.0 + alpha * (1.0 + 2.0 * g * g) / 3.0);
 }
 
+public float rayleigh_phase(float cos_theta)
+{
+    return 3.0 / (16.0 * PI) * (1.0 + cos_theta * cos_theta);
+}
+
+public float cornette_shanks_phase(float g, float cos_theta)
+{
+    return draine_phase(g, 1.0, cos_theta);
+}
+
 // Cloud and fog droplet phase function for droplet diameter `diameter_um` (clamped to
 // 5-50 um): `(1 - w_D) HG(g_HG) + w_D Draine(g_D, alpha)`, with Jendersie and d'Eon's (2023)
 // fit of Mie scattering.
