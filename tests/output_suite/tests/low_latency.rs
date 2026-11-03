@@ -29,7 +29,6 @@ fn reports_stay_complete_as_low_latency_changes() {
             vsync: false,
             ..DisplayRequest::default()
         },
-        None,
         desc.frames_in_flight,
     )
     .unwrap();

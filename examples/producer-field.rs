@@ -74,7 +74,6 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             w.window_handle(),
             w.display_handle(),
             &DisplayRequest::default(),
-            None,
             desc.frames_in_flight,
         )
         .expect("display")

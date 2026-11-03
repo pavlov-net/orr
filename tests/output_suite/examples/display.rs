@@ -1,4 +1,4 @@
-//! A window presented through `Display` with the display watch's feed: a row of gray steps
+//! A window presented through `Display`: a row of gray steps
 //! from 1/64 of paper white up to the resolved peak, a calibration pattern that cycles every
 //! four seconds (peak patch on a 10,000-nit surround, paper white on 18% gray, black patch
 //! on black) and egui text naming the resolved display. Toggling Windows HDR, moving the SDR
@@ -13,7 +13,7 @@ use half::f16;
 use orr_egui::Painter;
 use orr_output::{
     CalibrationPattern, ComposePass, ComposeRoot, ComposeSource, Display, DisplayRequest,
-    DisplayWatch, OutputKernels, ResolvedDisplay,
+    OutputKernels, ResolvedDisplay,
 };
 use orr_scene::orr_gpu::{
     Allocation, Format, Hazards, MemoryKind, QueueKind, Stages, Texture, TextureDesc, TextureIndex,
@@ -73,16 +73,15 @@ fn main() {
     let gpu = device();
     let render = gpu.queue(QueueKind::Render).unwrap();
     let mut window = Window::new("orr display", 1280, 720);
-    let (_watch, feed) = DisplayWatch::new(window.window_handle()).unwrap();
     let mut display = Display::new(
         gpu,
         window.window_handle(),
         window.display_handle(),
         &DisplayRequest::default(),
-        Some(feed.clone()),
         FRAMES_IN_FLIGHT,
     )
     .unwrap();
+    let feed = display.feed().cloned().expect("display watch");
     let kernels = OutputKernels::new(gpu).unwrap();
     let mut roots: Vec<ComposeRoot> = (0..FRAMES_IN_FLIGHT)
         .map(|_| ComposeRoot::new(gpu).unwrap())

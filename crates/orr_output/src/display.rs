@@ -15,8 +15,8 @@ const D65: [f32; 2] = [0.3127, 0.3290];
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DisplayRequest {
     /// Use an HDR encoding when the surface offers one and the OS has HDR on. Without a
-    /// `DisplayInfo` the surface's list alone decides; Windows lists PQ with HDR off, so pass
-    /// a `DisplayWatch` feed there.
+    /// `DisplayInfo` the surface's list alone decides, and Windows lists PQ with HDR off; a
+    /// `Display` watches the OS for it.
     pub hdr: bool,
     /// Overrides `hdr` when the surface supports it.
     pub encoding: Option<OutputFormat>,
