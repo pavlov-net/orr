@@ -258,6 +258,8 @@ struct StillSettings {
     reference: bool,
     /// The camera orbits, reaching the still camera's place on the last frame.
     orbit: bool,
+    /// A manual exposure in place of auto exposure.
+    ev100: Option<f32>,
 }
 
 /// The showcase's camera at `eye`.
@@ -344,6 +346,9 @@ impl StillShowcase {
                 .set_focus(eye.as_dvec3());
             let output = ViewOutput {
                 reconstruction: settings.reconstruction,
+                exposure: settings
+                    .ev100
+                    .map_or_else(Exposure::default, |ev100| Exposure::Manual { ev100 }),
                 ..ViewOutput::default()
             };
             let mut sum = average.as_mut().map(|a| a.hook(&f, extent));
@@ -638,7 +643,12 @@ fn render_view_runs_ray_reconstruction() {
     }
 
     let extent = [640, 360];
-    let off = with(Reconstruction::Off);
+    // Where auto exposure settles on the converged image. Each run's camera cut would snap it to
+    // that run's own meter, and FLIP adds 0.02 for the 0.04 stops that leaves.
+    let off = StillSettings {
+        ev100: Some(14.82),
+        ..with(Reconstruction::Off)
+    };
     let truth = still.run(
         extent,
         256,
@@ -651,7 +661,10 @@ fn render_view_runs_ray_reconstruction() {
     let truth = image(truth.capture);
     let error = |run: &StillRun| flip(&truth, &image(run.capture.clone()));
     let noisy = error(&still.run(extent, 8, off));
-    let half = with(Reconstruction::Quality(DlssQuality::Performance));
+    let half = StillSettings {
+        reconstruction: Reconstruction::Quality(DlssQuality::Performance),
+        ..off
+    };
     let denoised = still.run(extent, 48, half);
     assert_eq!(denoised.render_extent, [320, 180]);
     let moving = error(&still.run(
@@ -675,14 +688,14 @@ fn render_view_runs_ray_reconstruction() {
         "against the converged image: noisy {noisy:?}, still {denoised_error:?}, \
          moving {moving:?}, averaged in the hook {summed:?}"
     );
-    // Measured mean 0.068 still and 0.065 moving; the jitter sign flipped gives 0.077 and 0.074,
-    // and one path per pixel without ray reconstruction 0.119. The rest of the error is the
+    // Measured mean 0.059 still and 0.060 moving; the jitter sign flipped gives 0.063 and 0.065,
+    // and one path per pixel without ray reconstruction 0.109. The rest of the error is the
     // fireflies in the converged image.
     assert!(
-        denoised_error.mean < 0.072,
+        denoised_error.mean < 0.061,
         "noisy {noisy:?}, still {denoised_error:?}"
     );
-    assert!(moving.mean < 0.07, "noisy {noisy:?}, moving {moving:?}");
+    assert!(moving.mean < 0.063, "noisy {noisy:?}, moving {moving:?}");
     assert!(
         summed.mean < noisy.mean * 0.75,
         "noisy {noisy:?}, averaged {summed:?}"
