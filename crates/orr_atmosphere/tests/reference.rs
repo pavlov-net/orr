@@ -115,15 +115,24 @@ const EYE: DVec3 = DVec3::new(0.0, 2.0, 0.0);
 
 #[test]
 fn groups_match_spectral_color() {
+    groups_match_spectral_color_at(&[30.0, 10.0, 5.0, 2.0, 0.0, -2.0, -4.0, -6.0]);
+}
+
+#[test]
+#[ignore = "takes about 12 minutes on 32 threads"]
+fn groups_match_spectral_color_in_deep_twilight() {
+    groups_match_spectral_color_at(&[-9.0, -12.0]);
+}
+
+fn groups_match_spectral_color_at(elevations: &[f64]) {
     let reference = Reference::new(&earth());
     let (spectral, groups) = (
         reference.run(Channels::Spectral),
         reference.run(Channels::Groups),
     );
-    let elevations = [30.0, 10.0, 5.0, 2.0, 0.0, -2.0, -4.0, -6.0, -9.0, -12.0];
     let precision = Precision::default();
     let mut worst = 0.0f64;
-    for elevation in elevations {
+    for &elevation in elevations {
         let light = Light::solar(dir(elevation, 0.0));
         let sky: Vec<_> = sky_directions()
             .iter()
