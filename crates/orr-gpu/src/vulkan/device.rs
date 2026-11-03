@@ -234,6 +234,8 @@ impl Drop for Shared {
 pub struct Device {
     pub(crate) shared: Arc<Shared>,
     queues: Arc<[Option<Queue>; MAX_TIMELINES]>,
+    /// Added to the flags of pipelines created through this handle.
+    pub(super) creation_flags: vk::PipelineCreateFlags2,
 }
 
 impl PartialEq for Device {
@@ -781,6 +783,7 @@ impl Device {
         let device = Device {
             shared,
             queues: Arc::new(queues),
+            creation_flags: vk::PipelineCreateFlags2::empty(),
         };
         let tlas = build_empty_tlas(&device)?;
         let _ = device.shared.empty_tlas.set(tlas);
@@ -822,6 +825,18 @@ impl Device {
     /// The queue of `kind`, if the device created one.
     pub fn queue(&self, kind: QueueKind) -> Option<&Queue> {
         self.queues[kind.index()].as_ref()
+    }
+
+    /// A handle to this device whose [`Device::create_compute_pipeline`],
+    /// [`Device::create_ray_dispatch_pipeline`] and [`Device::create_mesh_pipeline`] compile
+    /// nothing: a pipeline in the driver's disk cache or the [`DeviceDesc::pipeline_cache`] file
+    /// comes back at once, and any other returns [`crate::Error::CompileRequired`] without doing
+    /// the work. So a thread that must not stall can find out whether a start is warm.
+    pub fn cached_pipelines_only(&self) -> Device {
+        Device {
+            creation_flags: vk::PipelineCreateFlags2::FAIL_ON_PIPELINE_COMPILE_REQUIRED,
+            ..self.clone()
+        }
     }
 
     /// Blocks until everything submitted so far, on every queue, has completed.

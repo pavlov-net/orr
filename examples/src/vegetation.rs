@@ -35,13 +35,13 @@ use orr::orr_pack::mesh::MeshInfo;
 use orr::orr_pack::model::ModelInfo;
 use orr::orr_pack::{Archive, AssetId, Target};
 use orr::{
-    Affine3, BoundTexture, ClusterTopology, CopyVariant, DirectionalLight, DiscProfile, Display,
-    DisplayRequest, FrameDesc, FrameStats, FrameTime, GroupWriter, InstanceFlags, InstancesDesc,
-    Lens, Light, LightId, LightingStats, LitView, LoadState, MaterialGpu, ModelId, MountId,
-    Opacity, PackSource, PipelineId, Pose, ProducerDesc, ProducerId, ProducerUpdate, Projection,
-    Renderer, RendererDesc, SceneCompute, SceneDesc, SceneId, SceneLightingSettings,
-    ScreenshotRequest, TextureFilter, TransformGroupDesc, TransformGroupId, TransparencyPass,
-    ViewHistoryId, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    Affine3, BoundTexture, ClusterTopology, CompilingKernels, CopyVariant, DirectionalLight,
+    DiscProfile, Display, DisplayRequest, FrameDesc, FrameStats, FrameTime, GroupWriter,
+    InstanceFlags, InstancesDesc, Lens, Light, LightId, LightingStats, LitView, LoadState,
+    MaterialGpu, ModelId, MountId, Opacity, PackSource, PipelineId, Pose, ProducerDesc, ProducerId,
+    ProducerUpdate, Projection, Renderer, RendererDesc, SceneCompute, SceneDesc, SceneId,
+    SceneLightingSettings, ScreenshotRequest, TextureFilter, TransformGroupDesc, TransformGroupId,
+    TransparencyPass, ViewHistoryId, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source};
 use orr_cook::{TextureSettings, Usage};
@@ -1489,10 +1489,14 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
         .expect("display")
     });
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
-    let workers = Workers::new(renderer.loading(), 4);
+    let workers = Workers::new(renderer.loading(), 4 + CompilingKernels::JOBS);
     let started = Instant::now();
     let mut scene = DenseVegetation::load(&mut renderer, gpu, settings);
     let load_ms = started.elapsed().as_secs_f64() * 1e3;
+    if settings.script_frames.is_some() {
+        renderer.wait_paths().expect("path kernels");
+    }
+    options.wait_for_paths(&mut renderer);
     let listed = [scene.scene];
 
     let headless_target: Option<Texture> = options.headless.then(|| {
@@ -1542,7 +1546,7 @@ pub fn run(options: &Options, settings: &Settings) -> Run {
                 break;
             }
             if let Some(w) = window.as_mut()
-                && !w.pump()
+                && !w.pump_showing_paths(&renderer)
             {
                 closed = true;
                 break;

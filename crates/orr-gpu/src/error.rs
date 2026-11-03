@@ -25,6 +25,9 @@ pub enum Error {
     /// The device was lost.
     #[error("device lost")]
     DeviceLost,
+    /// A handle from [`crate::Device::cached_pipelines_only`] asked for a pipeline no cache holds.
+    #[error("the pipeline is not in a cache")]
+    CompileRequired,
     /// A shader stage does not fit the call.
     #[error("shader: {0}")]
     Shader(String),
@@ -66,6 +69,7 @@ impl Error {
         move |r| match r {
             ash::vk::Result::ERROR_DEVICE_LOST => Error::DeviceLost,
             ash::vk::Result::TIMEOUT => Error::Timeout,
+            ash::vk::Result::PIPELINE_COMPILE_REQUIRED => Error::CompileRequired,
             r => Error::Vulkan {
                 call,
                 result: VkResult(r.as_raw()),

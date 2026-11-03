@@ -5,8 +5,10 @@ use orr::{Frame, HookPass, PipelineId, Renderer};
 
 use crate::shaders::accumulate;
 
-/// Averages a still view's radiance over frames. The sum starts after the first `skip` frames
-/// of the run, while exposure settles, and starts over when the extent changes.
+/// Averages a still view's radiance over frames. The sum starts after the first `skip` lit frames
+/// of the run, while exposure settles, and starts over when the extent changes. Frames that
+/// render black while the path tracing kernels compile do not count, as the hook does not run in
+/// them.
 pub struct Average {
     gpu: &'static Device,
     pipeline: PipelineId,
@@ -42,12 +44,11 @@ impl Average {
         }
     }
 
-    /// The scene-referred hook of the run's frame `i`, frame `f`, at `extent`. Call once per
-    /// frame, whether the hook is used or not.
+    /// The scene-referred hook of frame `f` at `extent`. Call once per frame, whether the hook is
+    /// used or not.
     pub fn hook<'s, 'a>(
         &'s mut self,
         f: &Frame<'a>,
-        i: u64,
         extent: [u32; 2],
     ) -> impl FnMut(&mut HookPass<'_, '_>) + use<'s, 'a> {
         if self.sum.as_ref().is_none_or(|(_, e)| *e != extent) {
@@ -59,9 +60,13 @@ impl Average {
             self.sum = Some((buffer, extent));
             self.frames = 0;
         }
-        let in_sum = if i < self.skip { 0 } else { self.frames };
-        if i >= self.skip {
-            self.frames += 1;
+        let in_sum = self.frames;
+        if f.paths_ready() {
+            if self.skip > 0 {
+                self.skip -= 1;
+            } else {
+                self.frames += 1;
+            }
         }
         let sum = self.sum.as_ref().expect("radiance sum").0.gpu();
         let pipeline = f.pipeline(self.pipeline);

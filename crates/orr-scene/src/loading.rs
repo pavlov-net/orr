@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 
@@ -40,6 +41,81 @@ pub(crate) enum Msg {
 struct Jobs {
     queue: VecDeque<Job>,
     stopped: bool,
+}
+
+/// What a job from [`Loading::spawn_result`] leaves behind, polled from any thread. Dropping it
+/// cancels the job and frees what it holds if no thread has started it; a job already running
+/// finishes, and its result is dropped with it.
+pub struct JobResult<T> {
+    slot: Arc<JobSlot<T>>,
+}
+
+struct JobSlot<T> {
+    state: Mutex<JobState<T>>,
+    finished: Condvar,
+}
+
+enum JobState<T> {
+    Queued(Box<dyn FnOnce() -> T + Send>),
+    Running,
+    /// The job's value, or the message it panicked with.
+    Finished(std::result::Result<T, String>),
+    Taken,
+}
+
+impl<T> JobState<T> {
+    fn finished(&self) -> bool {
+        matches!(self, Self::Finished(_) | Self::Taken)
+    }
+}
+
+impl<T> JobResult<T> {
+    /// Whether a thread has started the job.
+    pub fn started(&self) -> bool {
+        !matches!(*self.slot.state.lock().unwrap(), JobState::Queued(_))
+    }
+
+    /// Whether the job has finished.
+    pub fn finished(&self) -> bool {
+        self.slot.state.lock().unwrap().finished()
+    }
+
+    /// Takes the job's value, or the message it panicked with, once it has finished and the first
+    /// time this is called.
+    pub fn take(&self) -> Option<std::result::Result<T, String>> {
+        let mut state = self.slot.state.lock().unwrap();
+        match std::mem::replace(&mut *state, JobState::Taken) {
+            JobState::Finished(result) => Some(result),
+            other => {
+                *state = other;
+                None
+            }
+        }
+    }
+
+    /// Blocks until the job has finished, running queued jobs on the calling thread meanwhile, so
+    /// it finishes with no workers and after [`Loading::stop_workers`]. `loading` is the side that
+    /// made the job.
+    pub fn wait(&self, loading: &Loading) {
+        while !self.finished() && loading.run_one() {}
+        // Nothing is queued, so an unfinished job is on another thread.
+        let state = self.slot.state.lock().unwrap();
+        drop(
+            self.slot
+                .finished
+                .wait_while(state, |s| !s.finished())
+                .unwrap(),
+        );
+    }
+}
+
+impl<T> Drop for JobResult<T> {
+    fn drop(&mut self) {
+        let mut state = self.slot.state.lock().unwrap();
+        if matches!(*state, JobState::Queued(_)) {
+            *state = JobState::Taken;
+        }
+    }
 }
 
 /// The loading side's job queue and its thread's inbox. `Send + Sync`; [`crate::Scenes::loading`]
@@ -117,6 +193,42 @@ impl Loading {
         if let Some(signal) = signal {
             signal();
         }
+    }
+
+    /// Queues `job` for the next worker and returns a handle to its result. A panic in `job` ends
+    /// the job, not the worker, and comes back through the handle.
+    pub fn spawn_result<T: Send + 'static>(
+        &self,
+        job: impl FnOnce() -> T + Send + 'static,
+    ) -> JobResult<T> {
+        let slot = Arc::new(JobSlot {
+            state: Mutex::new(JobState::Queued(Box::new(job))),
+            finished: Condvar::new(),
+        });
+        let out = Arc::clone(&slot);
+        self.spawn(move || {
+            let job = {
+                let mut state = out.state.lock().unwrap();
+                match std::mem::replace(&mut *state, JobState::Running) {
+                    JobState::Queued(job) => job,
+                    // The handle cancelled it.
+                    cancelled => {
+                        *state = cancelled;
+                        return;
+                    }
+                }
+            };
+            let result = catch_unwind(AssertUnwindSafe(job)).map_err(|payload| {
+                let text = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned());
+                text.unwrap_or_else(|| "panicked".to_owned())
+            });
+            *out.state.lock().unwrap() = JobState::Finished(result);
+            out.finished.notify_all();
+        });
+        JobResult { slot }
     }
 
     /// Calls `signal` each time a job is queued, so a consumer's own thread pool can call
@@ -312,5 +424,77 @@ pub(crate) fn thread(loading: Arc<Loading>, device: Device) {
         if idle && loading.inbox.lock().unwrap().is_empty() {
             loading.wake.wait(ring.as_ref());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn a_result_job_finishes_with_no_workers_and_after_a_stop() {
+        let loading = Loading::new(true);
+        loading.stop_workers();
+        let first = loading.spawn_result(|| 1);
+        let second = loading.spawn_result(|| 2);
+        assert!(!first.started() && !first.finished());
+        assert_eq!(first.take(), None);
+        second.wait(&loading);
+        assert!(first.finished() && second.finished());
+        assert_eq!(second.take(), Some(Ok(2)));
+        assert_eq!(second.take(), None);
+        assert!(second.finished());
+        second.wait(&loading);
+        assert_eq!(first.take(), Some(Ok(1)));
+    }
+
+    #[test]
+    fn a_panicking_job_reports_it_and_leaves_its_worker_running() {
+        let loading = Arc::new(Loading::new(true));
+        let worker = {
+            let l = Arc::clone(&loading);
+            std::thread::spawn(move || l.run_worker())
+        };
+        let panicked = loading.spawn_result(|| -> u32 { panic!("kernel {}", 7) });
+        panicked.wait(&loading);
+        assert_eq!(panicked.take(), Some(Err("kernel 7".to_owned())));
+        let next = loading.spawn_result(|| 3);
+        next.wait(&loading);
+        assert_eq!(next.take(), Some(Ok(3)));
+        loading.stop_workers();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn waiting_for_a_job_on_a_worker_returns_when_it_finishes() {
+        let loading = Arc::new(Loading::new(true));
+        let worker = {
+            let l = Arc::clone(&loading);
+            std::thread::spawn(move || l.run_worker())
+        };
+        let job = loading.spawn_result(|| {
+            std::thread::sleep(Duration::from_millis(50));
+            4
+        });
+        while !job.started() {
+            std::thread::yield_now();
+        }
+        job.wait(&loading);
+        assert_eq!(job.take(), Some(Ok(4)));
+        loading.stop_workers();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn dropping_the_handle_cancels_a_queued_job() {
+        let loading = Loading::new(true);
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        drop(loading.spawn_result(move || flag.store(true, Ordering::Relaxed)));
+        assert!(loading.run_one());
+        assert!(!ran.load(Ordering::Relaxed));
     }
 }

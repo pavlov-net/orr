@@ -2,15 +2,15 @@
 //! refuses and creation from several threads.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use gpu_suite::shaders::{cached, cached_rays};
 use gpu_suite::{log_to_stderr, require};
 use orr_gpu::{
     ClearColor, ColorAttachment, ColorLoad, ColorTarget, ComputePipeline, Device, DeviceDesc,
-    Format, Hazards, MemoryKind, MeshPipeline, MeshPipelineDesc, QueueKind, RayDispatchPipeline,
-    Rendering, ShaderStage, SpecData, Stages, TextureDesc, TextureMemory, TextureRegion,
-    TextureUsage,
+    Error, Format, Hazards, MemoryKind, MeshPipeline, MeshPipelineDesc, QueueKind,
+    RayDispatchPipeline, Rendering, ShaderStage, SpecData, Stages, TextureDesc, TextureMemory,
+    TextureRegion, TextureUsage,
 };
 
 fn cache_path(test: &str) -> PathBuf {
@@ -187,6 +187,51 @@ fn assert_clean(d: &Device) {
         0,
         "validation messages (see the log)"
     );
+}
+
+/// A handle that only takes cached pipelines refuses a pipeline no cache holds, without compiling
+/// or counting a miss, and takes it once it is compiled. The spec value is new each run, since the
+/// driver's disk cache outlives the process.
+#[test]
+fn a_cached_only_handle_compiles_nothing() {
+    let path = &cache_path("cached_only");
+    let d = open(path);
+    let value = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    let spec = cached::Spec { value }.bytes();
+    let data = SpecData {
+        entries: cached::Spec::ENTRIES,
+        bytes: &spec,
+    };
+    let stage = ShaderStage::new(&cached::MODULE, "compute_main", data).unwrap();
+    let only = d.cached_pipelines_only();
+    assert!(matches!(
+        only.create_compute_pipeline(&stage, "cached compute"),
+        Err(Error::CompileRequired)
+    ));
+    assert_eq!(d.pipeline_cache_report().misses, 0);
+    d.create_compute_pipeline(&stage, "cached compute").unwrap();
+    only.create_compute_pipeline(&stage, "cached compute")
+        .unwrap();
+    if d.caps().ray_dispatch {
+        let spec = cached_rays::Spec { value }.bytes();
+        let data = SpecData {
+            entries: cached_rays::Spec::ENTRIES,
+            bytes: &spec,
+        };
+        let stage = ShaderStage::new(&cached_rays::MODULE, "raygen_main", data).unwrap();
+        assert!(matches!(
+            only.create_ray_dispatch_pipeline(&stage, "cached raygen"),
+            Err(Error::CompileRequired)
+        ));
+        d.create_ray_dispatch_pipeline(&stage, "cached raygen")
+            .unwrap();
+        only.create_ray_dispatch_pipeline(&stage, "cached raygen")
+            .unwrap();
+    }
+    assert_clean(&d);
 }
 
 /// Writes a cache, loads it warm, then loads it as another driver version and as another

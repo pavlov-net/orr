@@ -1,7 +1,8 @@
 //! The frame through `orr::Renderer`: frames with no scene and no view, a scene frame with
 //! a view, a consumer pipeline that hot reload replaces, views whose transient targets share
-//! memory, and the glare a view's lens asks for.
+//! memory, the glare a view's lens asks for, and views while the path kernels compile.
 
+use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,12 +10,12 @@ use std::time::{Duration, Instant};
 
 use glam::{DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr::{
-    Affine3, ArenaReport, Budgets, DirectionalLight, DiscProfile, Exposure, FrameDesc, FrameTime,
-    Glare, GlareMethod, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens, Light, LightId,
-    LitView, LoadState, MountId, OutputDebug, PackSource, PathEntry, PipelineId, PostQuality,
-    Projection, ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId, TextureFilter,
-    TransformGroupDesc, TransparencyPass, ViewDesc, ViewHooks, ViewLighting, ViewOutput,
-    ViewTarget,
+    Affine3, ArenaReport, Budgets, CompilingKernels, DirectionalLight, DiscProfile, Exposure,
+    FrameDesc, FrameTime, Glare, GlareMethod, GroupWriter, HookPass, InstanceFlags, InstancesDesc,
+    Lens, Light, LightId, LitView, LoadState, MountId, OutputDebug, PackSource, PathEntry,
+    PipelineId, PostQuality, Projection, ReloadReport, Renderer, RendererDesc, SceneDesc, SceneId,
+    TextureFilter, TransformGroupDesc, TransparencyPass, ViewDesc, ViewHooks, ViewLighting,
+    ViewOutput, ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source};
 use orr_gpu::{
@@ -378,6 +379,75 @@ fn mount_pack(r: &mut Renderer, pack: &Arc<[u8]>, frame: &mut u32) -> MountId {
     mount
 }
 
+/// Places `pack`'s floor and box, a sun and the focus in `scene`.
+fn place_floor_and_box(f: &orr::Frame<'_>, scene: SceneId, models: [orr::ModelId; 2]) {
+    let mut s = f.scene(scene).unwrap();
+    let group = s
+        .create_transform_group(&TransformGroupDesc {
+            count: 2,
+            writer: GroupWriter::Cpu,
+            anchor: DVec3::ZERO,
+        })
+        .unwrap();
+    let raised = Affine3 {
+        rows: [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.5],
+            [0.0, 0.0, 1.0, 0.0],
+        ],
+    };
+    s.transforms(group, 0, 2)
+        .unwrap()
+        .copy_from_slice(&[Affine3::IDENTITY, raised]);
+    for (first, model) in models.into_iter().enumerate() {
+        s.add_instances(&InstancesDesc {
+            model,
+            copies: 1,
+            transforms: group,
+            first: first as u32,
+            pose: None,
+            material_set: None,
+            flags: InstanceFlags::RASTER | InstanceFlags::RAY,
+            rt_range: 1000.0,
+            animation_range: 0.0,
+            user_tag: 0,
+        })
+        .unwrap();
+    }
+    let sun = DirectionalLight {
+        direction_to_light: Vec3::new(0.3, 0.8, 0.5).normalize(),
+        illuminance: Vec3::splat(50_000.0),
+        angular_radius: 4.65e-3,
+        disc: DiscProfile::Uniform,
+    };
+    s.set_light(LightId(0), Some(&Light::Directional(sun)))
+        .unwrap();
+    s.set_focus(DVec3::ZERO);
+}
+
+/// The view of `scene` from `eye`, looking at the origin, rendered into `image`.
+fn view_of<'a>(
+    scene: SceneId,
+    history: orr::ViewHistoryId,
+    eye: DVec3,
+    image: &'a orr_gpu::Texture,
+) -> LitView<'a> {
+    LitView {
+        scene,
+        history,
+        position: eye,
+        rotation: look_at_origin(eye),
+        projection: Projection {
+            fov_y: 1.0,
+            near: 0.05,
+        },
+        lens: Lens::default(),
+        reset_history: false,
+        texture_filter: TextureFilter::Hardware,
+        target: ViewTarget::Texture(image),
+    }
+}
+
 /// Four frames of `pack`'s floor and box through `render_view` into an RGBA16F texture, the
 /// camera moving: the first and last without hooks, the others with every hook. Returns
 /// each frame's image and the view's arena after a frame with hooks.
@@ -413,6 +483,7 @@ fn hooked_frames(pack: &Arc<[u8]>, alias: bool) -> (Vec<Vec<u8>>, ArenaReport) {
         )
         .unwrap();
     let history = r.create_view_history().unwrap();
+    r.wait_paths().unwrap();
     let [w, h] = [320, 240];
     let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
     let image = d
@@ -436,48 +507,7 @@ fn hooked_frames(pack: &Arc<[u8]>, alias: bool) -> (Vec<Vec<u8>>, ArenaReport) {
             })
             .unwrap();
         if i == 0 {
-            let mut s = f.scene(scene).unwrap();
-            let group = s
-                .create_transform_group(&TransformGroupDesc {
-                    count: 2,
-                    writer: GroupWriter::Cpu,
-                    anchor: DVec3::ZERO,
-                })
-                .unwrap();
-            let raised = Affine3 {
-                rows: [
-                    [1.0, 0.0, 0.0, 0.0],
-                    [0.0, 1.0, 0.0, 0.5],
-                    [0.0, 0.0, 1.0, 0.0],
-                ],
-            };
-            s.transforms(group, 0, 2)
-                .unwrap()
-                .copy_from_slice(&[Affine3::IDENTITY, raised]);
-            for (first, model) in models.into_iter().enumerate() {
-                s.add_instances(&InstancesDesc {
-                    model,
-                    copies: 1,
-                    transforms: group,
-                    first: first as u32,
-                    pose: None,
-                    material_set: None,
-                    flags: InstanceFlags::RASTER | InstanceFlags::RAY,
-                    rt_range: 1000.0,
-                    animation_range: 0.0,
-                    user_tag: 0,
-                })
-                .unwrap();
-            }
-            let sun = DirectionalLight {
-                direction_to_light: Vec3::new(0.3, 0.8, 0.5).normalize(),
-                illuminance: Vec3::splat(50_000.0),
-                angular_radius: 4.65e-3,
-                disc: DiscProfile::Uniform,
-            };
-            s.set_light(LightId(0), Some(&Light::Directional(sun)))
-                .unwrap();
-            s.set_focus(DVec3::ZERO);
+            place_floor_and_box(&f, scene, models);
         }
         f.update_scenes(&mut |_| {}).unwrap();
         let hooked = i == 1 || i == 2;
@@ -496,20 +526,7 @@ fn hooked_frames(pack: &Arc<[u8]>, alias: bool) -> (Vec<Vec<u8>>, ArenaReport) {
         };
         let eye = DVec3::new(0.2 * f64::from(i), 2.0, 4.0);
         f.render_view(
-            &LitView {
-                scene,
-                history,
-                position: eye,
-                rotation: look_at_origin(eye),
-                projection: Projection {
-                    fov_y: 1.0,
-                    near: 0.05,
-                },
-                lens: Lens::default(),
-                reset_history: false,
-                texture_filter: TextureFilter::Hardware,
-                target: ViewTarget::Texture(&image),
-            },
+            &view_of(scene, history, eye, &image),
             &ViewLighting::default(),
             &ViewOutput::default(),
             &mut hooks,
@@ -527,6 +544,215 @@ fn hooked_frames(pack: &Arc<[u8]>, alias: bool) -> (Vec<Vec<u8>>, ArenaReport) {
     loading.stop_workers();
     worker.join().unwrap();
     (images, report.unwrap())
+}
+
+/// Renders `pack`'s floor and box into an RGBA16F texture: `waiting` frames before the path kernels
+/// have compiled, with the camera elsewhere and every hook set, then `lit` frames with the camera
+/// moving. With `black`, the waiting frames render the view; without, they render nothing, which
+/// any view may do. Returns the images of each kind.
+fn frames_around_the_compile(
+    pack: &Arc<[u8]>,
+    waiting: u32,
+    black: bool,
+    lit: u32,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let d = device();
+    let desc = RendererDesc {
+        path_entry: PathEntry::Compute,
+        try_cached_paths: false,
+        ..RendererDesc::default()
+    };
+    let mut r = Renderer::new(d, desc).unwrap();
+    let loading = r.loading();
+    let worker = {
+        let l = Arc::clone(&loading);
+        std::thread::spawn(move || l.run_worker())
+    };
+    let mut frame = 0;
+    let mount = mount_pack(&mut r, pack, &mut frame);
+    let models = ["floor", "box"].map(|name| r.model(mount, AssetId::from_name(name)).unwrap());
+    loading.stop_workers();
+    worker.join().unwrap();
+    let scene = r
+        .create_scene(
+            &SceneDesc {
+                light_capacity: 1,
+                ..SceneDesc::default()
+            },
+            &Default::default(),
+        )
+        .unwrap();
+    assert!(!r.paths_ready());
+    let history = r.create_view_history().unwrap();
+    assert_eq!(r.paths_outstanding() as usize, CompilingKernels::JOBS);
+    let [w, h] = [320, 240];
+    let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
+    let image = d
+        .create_texture(
+            &TextureDesc::d2(Format::Rgba16Float, w, h, usage),
+            TextureMemory::Dedicated,
+            "view image",
+        )
+        .unwrap();
+    let listed = [scene];
+    let (mut before, mut after) = (Vec::new(), Vec::new());
+    for i in 0..waiting + lit {
+        if i == waiting {
+            r.wait_paths().unwrap();
+            assert!(r.paths_ready());
+            assert_eq!(r.paths_outstanding(), 0);
+        }
+        frame += 1;
+        let mut f = r
+            .begin_frame(FrameDesc {
+                time: time(frame),
+                scenes: &listed,
+                display: None,
+            })
+            .unwrap();
+        assert_eq!(f.paths_ready(), i >= waiting);
+        if i == 0 {
+            place_floor_and_box(&f, scene, models);
+        }
+        f.update_scenes(&mut |_| {}).unwrap();
+        let waited = i < waiting;
+        if !waited || black {
+            let (image_hooks, display_hooks) = (Cell::new(0), Cell::new(0));
+            let mut transparency =
+                |_: &mut TransparencyPass<'_, '_>, _| image_hooks.set(image_hooks.get() + 1);
+            let mut scene_referred =
+                |_: &mut HookPass<'_, '_>| image_hooks.set(image_hooks.get() + 1);
+            let mut display_linear =
+                |_: &mut HookPass<'_, '_>| display_hooks.set(display_hooks.get() + 1);
+            let mut hooks = if waited {
+                ViewHooks {
+                    transparency: Some(&mut transparency),
+                    scene_referred: Some(&mut scene_referred),
+                    display_linear: Some(&mut display_linear),
+                    ui: None,
+                }
+            } else {
+                ViewHooks::default()
+            };
+            let eye = if waited {
+                DVec3::new(-3.0, 1.0, 2.0)
+            } else {
+                DVec3::new(0.2 * f64::from(i - waiting), 2.0, 4.0)
+            };
+            let rendered = f
+                .render_view(
+                    &view_of(scene, history, eye, &image),
+                    &ViewLighting::default(),
+                    &ViewOutput::default(),
+                    &mut hooks,
+                )
+                .unwrap();
+            assert_eq!(rendered.compiling, waited);
+            if waited {
+                assert_eq!(image_hooks.get(), 0);
+                assert_eq!(display_hooks.get(), 1);
+            }
+        }
+        wait(f.end().unwrap());
+        if !waited || black {
+            let bytes = read_texture(&image, &TextureRegion::whole_mip(image.desc(), 0));
+            if waited {
+                before.push(bytes);
+            } else {
+                after.push(bytes);
+            }
+        }
+    }
+    (before, after)
+}
+
+#[test]
+fn a_view_is_black_while_the_path_kernels_compile_and_then_renders_as_if_it_never_was() {
+    let pack = floor_and_box();
+    let (black, lit) = frames_around_the_compile(&pack, 3, true, 3);
+    let (_, unwaited) = frames_around_the_compile(&pack, 3, false, 3);
+    assert_eq!(black.len(), 3);
+    for image in &black {
+        // RGBA16F half floats: zero color and 1.0 alpha, as compose writes it.
+        assert!(
+            image.chunks(8).all(|t| t == [0, 0, 0, 0, 0, 0, 0x00, 0x3c]),
+            "a view is not black while its kernels compile"
+        );
+    }
+    let texel = &lit[0][..8];
+    assert!(
+        lit[0].chunks(8).any(|t| t != texel),
+        "the view is one color"
+    );
+    for (i, (a, b)) in lit.iter().zip(&unwaited).enumerate() {
+        assert!(a == b, "lit frame {i} differs after black frames");
+    }
+    assert_clean();
+}
+
+/// A path kernel that cannot compile: the device has no ray dispatch and the renderer asks for it.
+#[test]
+fn a_failed_path_compile_comes_back_from_wait_paths_and_render_view() {
+    let d = orr_gpu::Device::new(&orr_gpu::DeviceDesc {
+        name: "no ray dispatch",
+        skip_extensions: &[c"VK_KHR_ray_tracing_pipeline"],
+        ..orr_gpu::DeviceDesc::default()
+    })
+    .unwrap();
+    let desc = RendererDesc {
+        path_entry: PathEntry::RayDispatch,
+        ..RendererDesc::default()
+    };
+    let mut r = Renderer::new(&d, desc).unwrap();
+    let scene = r
+        .create_scene(&SceneDesc::default(), &Default::default())
+        .unwrap();
+    let history = r.create_view_history().unwrap();
+    let failed = |e: orr::Error| match e {
+        orr::Error::PathKernels(e) => assert!(
+            matches!(&*e, orr::LightingError::Compile { kernel, .. } if *kernel == "opaque paths"),
+            "{e}"
+        ),
+        e => panic!("{e}"),
+    };
+    failed(r.wait_paths().unwrap_err());
+    assert!(!r.paths_ready());
+    assert_eq!(r.paths_outstanding(), 0);
+    failed(r.wait_paths().unwrap_err());
+    let image = d
+        .create_texture(
+            &TextureDesc::d2(
+                Format::Rgba16Float,
+                64,
+                64,
+                TextureUsage::SAMPLED | TextureUsage::STORAGE,
+            ),
+            TextureMemory::Dedicated,
+            "view image",
+        )
+        .unwrap();
+    let listed = [scene];
+    let mut f = r
+        .begin_frame(FrameDesc {
+            time: time(1),
+            scenes: &listed,
+            display: None,
+        })
+        .unwrap();
+    assert!(!f.paths_ready());
+    let eye = DVec3::new(0.0, 2.0, 4.0);
+    let error = f
+        .render_view(
+            &view_of(scene, history, eye, &image),
+            &ViewLighting::default(),
+            &ViewOutput::default(),
+            &mut ViewHooks::default(),
+        )
+        .err()
+        .expect("render_view with no kernels");
+    failed(error);
+    f.end().unwrap();
+    d.wait_submitted(Duration::from_secs(10)).unwrap();
 }
 
 #[test]
@@ -571,6 +797,7 @@ fn render_view_runs_the_glare_its_lens_asks_for() {
         .create_scene(&SceneDesc::default(), &Default::default())
         .unwrap();
     let history = r.create_view_history().unwrap();
+    r.wait_paths().unwrap();
     let [w, h] = [320u32, 240];
     let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
     let image = d

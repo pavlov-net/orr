@@ -175,6 +175,11 @@ pub struct RendererDesc {
     pub kernels: &'static KernelSet,
     /// Which entry of the path tracing kernels views run.
     pub path_entry: PathEntry,
+    /// The first view history looks for the path tracing kernels in the pipeline caches on the
+    /// calling thread, which takes tens of milliseconds and lights a warm start's first frame.
+    /// Off, the calling thread never touches the driver for them: they always start as jobs, so
+    /// even a warm start renders black until a thread has run them.
+    pub try_cached_paths: bool,
     /// World cells are 2^cell_log2 m on a side.
     pub cell_log2: u32,
     /// Archive reads are positioned reads on workers even where the system's completion
@@ -214,6 +219,7 @@ impl Default for RendererDesc {
             frames_in_flight: 2,
             kernels: &NO_KERNELS,
             path_entry: PathEntry::Fastest,
+            try_cached_paths: true,
             cell_log2: 8,
             positioned_reads: false,
             raster_error_pixels: 1.0,
