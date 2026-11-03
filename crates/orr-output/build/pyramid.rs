@@ -5,8 +5,6 @@
 
 // Halvings to the chain's last level: 1/256 of the extent.
 pub const LAST_LEVEL: u32 = 8;
-// The largest value the chain stores (RGBA16F).
-pub const STORAGE_MAX: f64 = 65504.0;
 
 // One level of the chain: `size` texels, of which the window at `origin` is held; texels
 // outside the window are zero, texel indices outside the level clamp to its edge.
@@ -103,9 +101,8 @@ fn fill(size: [u32; 2], xs: [i64; 2], ys: [i64; 2], f: impl Fn(i64, i64) -> f64)
 
 // The 13-tap downsample of the Jimenez pyramid to a level of `size`: bilinear taps at 0,
 // +-1 and +-2 times `stride` source texels around each texel's center, weighted as five 2x2
-// boxes (center 1/2, corners 1/8 each). On the first step (`first` = the exposure) each tap
-// is scaled and clamped to [0, STORAGE_MAX].
-pub fn downsample(src: &Plane, size: [u32; 2], stride: f64, first: Option<f64>) -> Plane {
+// boxes (center 1/2, corners 1/8 each).
+pub fn downsample(src: &Plane, size: [u32; 2], stride: f64) -> Plane {
     let ratio = [
         f64::from(src.size[0]) / f64::from(size[0]),
         f64::from(src.size[1]) / f64::from(size[1]),
@@ -114,19 +111,9 @@ pub fn downsample(src: &Plane, size: [u32; 2], stride: f64, first: Option<f64>) 
     let reach = 3.0 * stride;
     let xs = reached(bx[0], bx[1], 1.0 / ratio[0], reach / ratio[0], size[0]);
     let ys = reached(by[0], by[1], 1.0 / ratio[1], reach / ratio[1], size[1]);
-    let tap = |c: [f64; 2], o: [f64; 2]| {
-        let v = src.sample([c[0] + o[0] * stride, c[1] + o[1] * stride]);
-        match first {
-            Some(scale) => {
-                let v = v * scale;
-                if v > 0.0 { v.min(STORAGE_MAX) } else { 0.0 }
-            }
-            None => v,
-        }
-    };
     fill(size, xs, ys, |x, y| {
         let c = [(x as f64 + 0.5) * ratio[0], (y as f64 + 0.5) * ratio[1]];
-        let t = |ox: f64, oy: f64| tap(c, [ox, oy]);
+        let t = |ox: f64, oy: f64| src.sample([c[0] + ox * stride, c[1] + oy * stride]);
         let center = t(0.0, 0.0);
         let inner = t(-1.0, -1.0) + t(1.0, -1.0) + t(-1.0, 1.0) + t(1.0, 1.0);
         let edges = t(0.0, -2.0) + t(-2.0, 0.0) + t(2.0, 0.0) + t(0.0, 2.0);
@@ -189,22 +176,22 @@ pub fn levels(extent: [u32; 2], first_level: u32) -> Vec<[u32; 2]> {
         .collect()
 }
 
-// The chain's downsampled levels of `input`, the first step's taps scaled by `scale`.
-pub fn downsamples(input: &Plane, first_level: u32, scale: f64) -> Vec<Plane> {
+// The chain's downsampled levels of `input`.
+pub fn downsamples(input: &Plane, first_level: u32) -> Vec<Plane> {
     let sizes = levels(input.size, first_level);
     let stride = f64::from(1u32 << (first_level - 1));
-    let mut downs = vec![downsample(input, sizes[0], stride, Some(scale))];
+    let mut downs = vec![downsample(input, sizes[0], stride)];
     for &size in &sizes[1..] {
-        let next = downsample(downs.last().unwrap(), size, 1.0, None);
+        let next = downsample(downs.last().unwrap(), size, 1.0);
         downs.push(next);
     }
     downs
 }
 
-// The glare on one channel at the input's resolution: `w0 * scale * c + sum_m w_m * band_m`
-// with `weights[0]` = w0 and `weights[1 + m]` the weight of mip m of `downs`. The tent
-// upsample sums the chain from its last level up, each level adding its weighted band.
-pub fn compose(input: &Plane, downs: &[Plane], weights: &[f64], scale: f64) -> Plane {
+// The glare on one channel at the input's resolution: `w0 * c + sum_m w_m * band_m` with
+// `weights[0]` = w0 and `weights[1 + m]` the weight of mip m of `downs`. The tent upsample sums
+// the chain from its last level up, each level adding its weighted band.
+pub fn compose(input: &Plane, downs: &[Plane], weights: &[f64]) -> Plane {
     let last = downs.len() - 1;
     let mut up: Option<Plane> = None;
     for m in (0..last).rev() {
@@ -224,12 +211,7 @@ pub fn compose(input: &Plane, downs: &[Plane], weights: &[f64], scale: f64) -> P
         Some(p) => (p, 1.0),
         None => (&downs[0], weights[1]),
     };
-    upsample(
-        Some((input, weights[0] * scale)),
-        chain,
-        chain_weight,
-        input.size,
-    )
+    upsample(Some((input, weights[0])), chain, chain_weight, input.size)
 }
 
 // `weights` for a chain of `mips` levels: the bands past its last mip fold into it.

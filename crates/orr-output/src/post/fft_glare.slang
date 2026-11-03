@@ -1,8 +1,8 @@
-// FFT glare: the exposed radiance at 1/2 or 1/4 resolution convolved with the diaphragm's
-// PSF by FFT in shared memory, its edge pixels repeated out to the kernel's radius. The
-// kernel is the PSF's energy per pixel (`build/fft.rs`) within that radius, less the source
-// pixel's own, which tonemap keeps at full resolution as `w0 * exposed`. The dispatches
-// share one root:
+// FFT glare: the part of the exposed radiance that glare spreads, at 1/2 or 1/4 resolution,
+// convolved with the diaphragm's PSF by FFT in shared memory, its edge pixels repeated out to
+// the kernel's radius. The kernel is the PSF's energy per pixel (`build/fft.rs`) within that
+// radius, less the source pixel's own, which tonemap keeps at full resolution by taking only
+// `1 - w0` of that part out of the pixel. The dispatches share one root:
 //
 // - `lens` (one thread): the F-number. When it moved more than REBUILD_STOPS since the kernel
 //   was built, or the view's buffers are new, it writes the kernel dispatches' group counts,
@@ -191,7 +191,7 @@ void split_real(uint tid, float2* out)
     }
 }
 
-// The exposed radiance averaged over the full-resolution pixels of pixel (x, y).
+// The part glare spreads averaged over the full-resolution pixels of pixel (x, y).
 float3 image_pixel(uint x, uint y, float scale)
 {
     Texture2D<float4> source = root.source.get<Texture2D<float4>>();
@@ -199,7 +199,7 @@ float3 image_pixel(uint x, uint y, float scale)
     float3 sum = 0.0;
     for (uint b = 0; b < f; b++)
         for (uint a = 0; a < f; a++)
-            sum += glare_exposed(source.Load(int3(x * f + a, y * f + b, 0)).rgb, scale);
+            sum += glare_extract(source.Load(int3(x * f + a, y * f + b, 0)).rgb, scale);
     return sum / float(f * f);
 }
 

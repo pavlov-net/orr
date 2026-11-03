@@ -719,6 +719,8 @@ fn render_view_runs_ray_reconstruction() {
 /// The EV100 at which the lamp exposes to 0.5.
 const LAMP_EV100: f32 = 14.0;
 /// m along the view axis from the camera to the center of the lamp, a 1 m cube.
+/// How much brighter glare's checks expose the lamp, so it is past glare's knee.
+const GLARE_STOPS: f32 = 4.0;
 const LAMP_DISTANCE: f64 = 30.0;
 const LAMP_FOV_Y: f32 = 1.0;
 
@@ -741,6 +743,8 @@ struct LampSettings {
     reconstruction: Reconstruction,
     glare: bool,
     distortion: bool,
+    /// Stops brighter than [`LAMP_EV100`] exposes it; glare only spreads what is past white.
+    stops: f32,
     debug_view: LightingDebugView,
 }
 
@@ -979,7 +983,9 @@ impl Lamp {
                         ..ViewLighting::default()
                     },
                     &ViewOutput {
-                        exposure: Exposure::Manual { ev100: LAMP_EV100 },
+                        exposure: Exposure::Manual {
+                            ev100: LAMP_EV100 - settings.stops,
+                        },
                         debug: OutputDebug::Linear,
                         reconstruction: settings.reconstruction,
                         ..ViewOutput::default()
@@ -1080,6 +1086,7 @@ fn render_view_blurs_what_moves_while_the_shutter_is_open() {
         reconstruction: Reconstruction::Off,
         glare: false,
         distortion: false,
+        stops: 0.0,
         debug_view: LightingDebugView::None,
     };
     let sharp = lamp.run(extent, frames, moving.closed());
@@ -1154,6 +1161,7 @@ fn render_view_blurs_what_moves_while_the_shutter_is_open() {
 
     let glared = LampSettings {
         glare: true,
+        stops: GLARE_STOPS,
         ..moving.closed()
     };
     let spread = lit(&lamp.run(extent, frames, glared));
@@ -1161,6 +1169,7 @@ fn render_view_blurs_what_moves_while_the_shutter_is_open() {
     let reference_plain = reference.closed();
     let reference_glared = LampSettings {
         glare: true,
+        stops: GLARE_STOPS,
         ..reference_plain
     };
     let plain = lit(&lamp.run(extent, frames, reference_plain));
@@ -1179,6 +1188,7 @@ fn render_view_blurs_what_moves_while_the_shutter_is_open() {
     );
     let debug_view = LampSettings {
         debug_view: LightingDebugView::DirectOnly,
+        stops: GLARE_STOPS,
         ..moving.closed()
     };
     let lensed = LampSettings {

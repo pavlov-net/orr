@@ -8,7 +8,7 @@ use crate::pyramid::{self, Plane};
 // The reference pixel pitch the tables are fitted at: a 36 mm sensor 3840 pixels across.
 pub const REFERENCE_PITCH_UM: f64 = 36000.0 / 3840.0;
 pub const F_NUMBERS: usize = 10;
-pub const F_MIN: f64 = 1.4;
+pub const F_MIN: f64 = 4.0;
 pub const F_MAX: f64 = 22.0;
 // Bands fitted on their own pyramid run; the kernels of coarser levels are this level's
 // scaled by 2 per level, which the pyramid is to within its sampling.
@@ -91,11 +91,11 @@ fn band_rings(rings: &Rings, first_level: u32) -> Vec<Vec<f64>> {
             i64::from(PLANE / 2) + offset[1],
         ];
         let input = Plane::impulse(size, at, 1.0);
-        let downs = pyramid::downsamples(&input, first_level, 1.0);
+        let downs = pyramid::downsamples(&input, first_level);
         for (m, e) in energy.iter_mut().enumerate() {
             let mut weights = vec![0.0; mips + 1];
             weights[1 + m] = 1.0;
-            let kernel = pyramid::compose(&input, &downs[..=m], &weights, 1.0);
+            let kernel = pyramid::compose(&input, &downs[..=m], &weights);
             for wy in 0..kernel.window[1] {
                 for wx in 0..kernel.window[0] {
                     let v = kernel.data[wy * kernel.window[0] + wx] / IMPULSES.len() as f64;

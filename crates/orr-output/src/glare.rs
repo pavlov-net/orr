@@ -1,6 +1,7 @@
-//! Glare after the other camera effects, which the tonemap composites: by default
-//! Jimenez's band pyramid with per-channel band weights fitted at build to the diaphragm's
-//! Fraunhofer PSF; FFT convolution with the same PSF (`fft_glare`) as the costlier setting.
+//! Glare after the other camera effects, which the tonemap composites: the light past a knee
+//! at about SDR's white spreads, by default through Jimenez's band pyramid with per-channel band weights fitted
+//! at build to the diaphragm's Fraunhofer PSF; FFT convolution with the same PSF (`fft_glare`) is
+//! the costlier setting.
 
 use orr_scene::orr_gpu::{
     AddressMode, Allocation, CommandList, ComputePipeline, Device, Filter, Format, GpuPtr, Hazards,
@@ -21,8 +22,11 @@ const LAST_LEVEL: u32 = GLARE_ENTRIES as u32 - 1;
 /// The most dispatches the pass records: a downsample per mip and an upsample per mip but
 /// the last, with the chain from half resolution.
 pub(crate) const GLARE_DISPATCHES: usize = 2 * LAST_LEVEL as usize - 1;
-/// `F_NUMBERS` and `ENTRIES` in `glare.slang`.
-const _: () = assert!(GLARE_F_NUMBERS == 10 && GLARE_ENTRIES == 9);
+/// `F_NUMBERS` and `ENTRIES` in `glare.slang`, and `GLARE_F_MIN` and `GLARE_F_MAX` in
+/// `glare_lens.slang`.
+const _: () = assert!(
+    GLARE_F_NUMBERS == 10 && GLARE_ENTRIES == 9 && GLARE_F_MIN == 4.0 && GLARE_F_MAX == 22.0
+);
 const _: () = assert!(GLARE_TABLES.len() == 2 * GLARE_F_NUMBERS * GLARE_ENTRIES);
 
 /// Glaring one view's radiance through its lens's diaphragm.
@@ -52,8 +56,9 @@ pub struct GlareComposite {
     /// convolution.
     pub chain: TextureIndex,
     /// The frame's weights, one `[f32; 4]` per entry, xyz per Rec.2020 channel. Entry 0 is
-    /// the identity weight `1 - sum w`. With bands, entry `1 + m` is mip m's band times the
-    /// strength, 9 entries in all; FFT glare has entry 0 only.
+    /// the identity weight `1 - sum w` of the light glare spreads; the rest of a pixel stays.
+    /// With bands, entry `1 + m` is mip m's band times the strength, 9 entries in all; FFT
+    /// glare has entry 0 only.
     pub weights: GpuPtr<[f32; 4]>,
 }
 

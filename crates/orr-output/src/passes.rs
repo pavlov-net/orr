@@ -848,8 +848,8 @@ impl OutputKernels {
     }
 
     /// Records the `glare` pass when the lens has glare: with `GlareMethod::Bands` the band
-    /// pyramid of `pass.source` at the adapted exposure and this frame's band weights, with
-    /// `Fft` its FFT convolution with the PSF; the tonemap composites either from the
+    /// pyramid of the light in `pass.source` past glare's knee, at the adapted exposure and this
+    /// frame's band weights, with `Fft` its FFT convolution with the PSF; the tonemap composites either from the
     /// returned [`GlareComposite`]. Allocates the view's buffers on the first frame with
     /// glare by a method and frees them on the first without, which records nothing; an
     /// extent too small for two pyramid levels, or for the FFT's smallest kernel or too large

@@ -95,6 +95,8 @@ fn glare(manifest: &Path, out_dir: &Path) {
     let mut rs = String::new();
     let n = fit::F_NUMBERS;
     writeln!(rs, "pub(crate) const GLARE_F_NUMBERS: usize = {n};").unwrap();
+    writeln!(rs, "pub(crate) const GLARE_F_MIN: f64 = {:?};", fit::F_MIN).unwrap();
+    writeln!(rs, "pub(crate) const GLARE_F_MAX: f64 = {:?};", fit::F_MAX).unwrap();
     writeln!(rs, "/// Pixel pitch the tables are fitted at, um.").unwrap();
     writeln!(
         rs,
