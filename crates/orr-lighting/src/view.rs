@@ -367,6 +367,8 @@ pub struct LightingView {
     guide_roots: Ring<GuideRoot>,
     frost_roots: Ring<FrostRoot>,
     previous: Option<ViewDesc>,
+    /// [`SceneLighting::resets`] at the last [`Self::begin`].
+    scene_resets: u64,
     history_reset: bool,
     pub(crate) media: MediaView,
     dof: Option<DofLayer>,
@@ -460,6 +462,7 @@ impl LightingView {
             guide_roots: Ring::new(device, "guide roots")?,
             frost_roots: Ring::new(device, "frosted glass roots")?,
             previous: None,
+            scene_resets: 0,
             history_reset: true,
             media: MediaView::new(device)?,
             dof: None,
@@ -478,16 +481,15 @@ impl LightingView {
         self.extent
     }
 
-    /// Starts the view's frame `frame` and settles its history reset. A camera cut
-    /// (`desc.camera_cut`), a camera jump past `lighting.guides.camera_jump` since the view's
-    /// last frame, a change of scene or output extent, the view's first frame and
-    /// [`SceneLighting::reset_history`] before the scene's pass of `frame` each set it. A camera
-    /// cut also snaps exposure, and ray reconstruction's history is in pre-exposed units. Call
-    /// once per frame, after the scene's [`SceneLighting::record`] and before the view's
-    /// lighting records; returns [`Self::history_reset`].
+    /// Starts the view's frame and settles its history reset. A camera cut (`desc.camera_cut`),
+    /// a camera jump past `lighting.guides.camera_jump` since the view's last frame, a change of
+    /// scene or output extent, the view's first frame and [`SceneLighting::reset_history`] since
+    /// the view's last frame each set it. A camera cut also snaps exposure, and ray
+    /// reconstruction's history is in pre-exposed units. Call once per frame, after the scene's
+    /// [`SceneLighting::record`] and before the view's lighting records; returns
+    /// [`Self::history_reset`].
     pub fn begin(
         &mut self,
-        frame: u64,
         scene: &SceneLighting,
         desc: &ViewDesc,
         lighting: &ViewLighting,
@@ -500,7 +502,9 @@ impl LightingView {
                     .camera_jump
                     .jumps((p.position, p.rotation), (desc.position, desc.rotation))
         });
-        self.history_reset = !continues || desc.camera_cut || scene.resets_history(frame);
+        let scene_resets = scene.resets();
+        self.history_reset = !continues || desc.camera_cut || scene_resets != self.scene_resets;
+        self.scene_resets = scene_resets;
         self.previous = Some(*desc);
         self.history_reset
     }

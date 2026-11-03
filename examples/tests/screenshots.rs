@@ -730,6 +730,8 @@ struct LampSettings {
     shutter: f32,
     /// The last frame is a camera cut.
     cut: bool,
+    /// The frame before the last resets the scene's lighting and does not render the view.
+    scene_reset: bool,
     /// Renders the accumulation reference.
     reference: bool,
     /// Sets hooks that draw nothing.
@@ -917,12 +919,22 @@ impl Lamp {
                 .expect("begin frame");
             let id = f.id();
             let x = -settings.lamp * behind;
+            let skipped = settings.scene_reset && i + 2 == frames;
             f.scene(self.scene)
                 .expect("scene writer")
                 .transforms(self.group, 0, 1)
                 .expect("transforms")
                 .fill(affine(Mat3::IDENTITY, Vec3::new(x as f32, 0.0, 0.0)));
+            if skipped {
+                f.scene(self.scene)
+                    .expect("scene writer")
+                    .reset_lighting_history();
+            }
             f.update_scenes(&mut |_| {}).expect("update scenes");
+            if skipped {
+                f.end().expect("end frame");
+                continue;
+            }
             let mut scene_referred = |_: &mut HookPass<'_, '_>| {};
             let mut display_linear = |_: &mut HookPass<'_, '_>| {};
             let mut hooks = ViewHooks::default();
@@ -1053,6 +1065,7 @@ fn render_view_blurs_what_moves_while_the_shutter_is_open() {
         camera: 0.0,
         shutter: 0.5,
         cut: false,
+        scene_reset: false,
         reference: false,
         hooks: false,
         reconstruction: Reconstruction::Off,
@@ -1108,6 +1121,14 @@ fn render_view_blurs_what_moves_while_the_shutter_is_open() {
         ..moving
     };
     assert!(lamp.run(extent, frames, cut) == sharp, "a cut smears");
+    let scene_reset = LampSettings {
+        scene_reset: true,
+        ..moving
+    };
+    assert!(
+        lamp.run(extent, frames, scene_reset) == sharp,
+        "a scene's lighting reset before a frame that skips the view smears its next render"
+    );
     let reference = LampSettings {
         reference: true,
         ..moving

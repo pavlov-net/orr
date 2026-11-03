@@ -33,6 +33,7 @@
 //! from [`Frame::pattern`].
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -65,8 +66,8 @@ pub use orr_scene::{
     PackSource, PageId, PipelineId, Pose, ProducerBatch, ProducerClusterGpu, ProducerDesc,
     ProducerGpu, ProducerId, ProducerStats, ProducerUpdate, Projection, REBASE_GRID_LOG2,
     RasterGpu, ReloadReport, RendererDesc, ResidencyClass, ResidencyStats, RtCutGpu, RtStats,
-    SceneCompute, SceneDesc, SceneId, SceneRoot, SceneWriter, SkeletonRef, SkinStats, SkinnedDesc,
-    SkyStats, SlotStateGpu, Span, TextureFeedbackGpu, TextureFilter, TextureStreamGpu, TopologyGpu,
+    SceneCompute, SceneDesc, SceneId, SceneRoot, SkeletonRef, SkinStats, SkinnedDesc, SkyStats,
+    SlotStateGpu, Span, TextureFeedbackGpu, TextureFilter, TextureStreamGpu, TopologyGpu,
     TransformGroupDesc, TransformGroupId, TransparencyPass, ViewConstants, ViewDesc, ViewHistoryId,
     ViewStep, WorldPos, abi, material_flags, orr_gpu, orr_pack,
 };
@@ -154,6 +155,38 @@ pub struct ViewHooks<'a> {
     pub ui: Option<&'a mut dyn FnMut(&mut UiPass<'_, '_>)>,
 }
 
+/// Writes one scene's changes: everything [`orr_scene::SceneWriter`] writes, which it derefs to,
+/// and what reaches the scene's lighting. Send.
+pub struct SceneWriter<'f> {
+    writer: orr_scene::SceneWriter<'f>,
+    lighting: &'f SceneLighting,
+}
+
+impl<'f> Deref for SceneWriter<'f> {
+    type Target = orr_scene::SceneWriter<'f>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.writer
+    }
+}
+
+impl DerefMut for SceneWriter<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.writer
+    }
+}
+
+impl SceneWriter<'_> {
+    /// The world changed at once, as in a time skip: the scene's next lighting pass clears its
+    /// world cache and light feedback, and every view of the scene renders as a camera cut the
+    /// next time [`Frame::render_view`] renders it, this frame or later. A view
+    /// [`Frame::raster_view`] renders sets its own `camera_cut`. A camera that moves:
+    /// `camera_cut` on the view; the world that changes: this on the scene; either cuts the view.
+    pub fn reset_lighting_history(&self) {
+        self.lighting.reset_history();
+    }
+}
+
 /// One camera that [`Frame::render_view`] renders this frame.
 #[derive(Clone, Copy)]
 pub struct LitView<'a> {
@@ -167,7 +200,8 @@ pub struct LitView<'a> {
     pub lens: Lens,
     /// A camera cut: the previous camera is taken to be this one; motion blur shows nothing,
     /// frame generation, ray reconstruction and lighting drop their history, auto exposure and
-    /// white balance snap. A view's first render is a cut without it.
+    /// white balance snap. A view's first render, its first on another scene and its first after
+    /// [`SceneWriter::reset_lighting_history`] are cuts without it.
     pub camera_cut: bool,
     /// How the view filters material textures.
     pub texture_filter: TextureFilter,
@@ -320,6 +354,8 @@ struct ViewState {
     compose: Vec<ComposeRoot>,
     /// Renders of the view so far: the sample index of its next paths.
     samples: u32,
+    /// The scene of the view's last lit render and that scene's lighting resets then.
+    scene_resets: Option<(SceneId, u64)>,
     reconstruction: Option<ViewReconstruction>,
 }
 
@@ -625,6 +661,7 @@ impl Renderer {
             output: OutputView::new(&gpu, fif)?,
             compose: compose_roots(&gpu, fif)?,
             samples: 0,
+            scene_resets: None,
             reconstruction: None,
         };
         let id = self.scenes.create_view_history()?;
@@ -916,7 +953,14 @@ impl<'a> Frame<'a> {
 
     /// Step 2: the writer of a scene listed in this frame. One per scene at a time; Send.
     pub fn scene(&self, id: SceneId) -> Result<SceneWriter<'_>> {
-        Ok(self.scenes.scene(id)?)
+        Ok(SceneWriter {
+            writer: self.scenes.scene(id)?,
+            lighting: self
+                .lighting
+                .scenes
+                .get(&id)
+                .ok_or(SceneError::UnknownScene(id))?,
+        })
     }
 
     /// Step 2: tells orr that kernels change edit `id` at this frame's scene compute point.
@@ -1024,7 +1068,8 @@ impl<'a> Frame<'a> {
     ///
     /// Motion blur smears the radiance along each pixel's motion over the fraction
     /// `lens.shutter` of the time between presented images, centered on the frame. A camera cut
-    /// (`view.camera_cut`) shows none. A camera that jumps without declaring a cut blurs up to
+    /// (`view.camera_cut`, or [`SceneWriter::reset_lighting_history`] since the view's last
+    /// render) shows none. A camera that jumps without declaring a cut blurs up to
     /// the longest streak, [`orr_output::MOTION_BLUR_MAX_RADIUS`] of the output width each way.
     ///
     /// A `lighting.debug_view` shows neither motion blur nor glare, since it is not the final
@@ -1080,9 +1125,16 @@ impl<'a> Frame<'a> {
         let reconstructed = reconstruction.is_some();
         let mut desc = state.raster_desc(view, extent, render);
         let jitter = desc.jitter.to_array();
-        // A first lit render is a cut, whatever raster-only frames came before it while the path
-        // kernels compiled.
-        desc.camera_cut |= state.lighting.is_none();
+        let scene = self
+            .lighting
+            .scenes
+            .get_mut(&view.scene)
+            .ok_or(SceneError::UnknownScene(view.scene))?;
+        // The view's first lit render, whatever raster-only frames came before it while the path
+        // kernels compiled, its first on another scene and a lighting reset since its last are
+        // all cuts.
+        let scene_resets = (view.scene, scene.resets());
+        desc.camera_cut |= state.scene_resets != Some(scene_resets);
 
         let set = Hooks {
             scene_referred: hooks.scene_referred.is_some(),
@@ -1105,11 +1157,6 @@ impl<'a> Frame<'a> {
         let (list, arena) = self.scenes.list_and_arena(view.history)?;
         arena.enter(ViewStep::Lighting, list);
 
-        let scene = self
-            .lighting
-            .scenes
-            .get_mut(&view.scene)
-            .ok_or(SceneError::UnknownScene(view.scene))?;
         if !self.lit.contains(&view.scene) {
             scene.record(
                 list,
@@ -1138,7 +1185,8 @@ impl<'a> Frame<'a> {
             dof_background: None,
             frosted_glass: false,
         };
-        paths.begin(id, scene, &desc, lighting);
+        paths.begin(scene, &desc, lighting);
+        state.scene_resets = Some(scene_resets);
         let traced = Stages::COMPUTE | Stages::RAY;
         list.barrier(Stages::ALL, traced, Hazards::empty());
         kernels.record_media(list, scene, paths, &pass, lighting)?;

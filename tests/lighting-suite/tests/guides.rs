@@ -398,7 +398,7 @@ fn history_frame(bed: &mut Bed, eye: Vec3, lighting: ViewLighting) -> bool {
     let target = bed.spec.target;
     let mut reset = None;
     bed.follow(eye, target, 0, &mut |_, f| {
-        reset = Some(f.target.begin(f.frame, f.lighting, &f.desc, &lighting));
+        reset = Some(f.target.begin(f.lighting, &f.desc, &lighting));
     });
     reset.unwrap()
 }
@@ -432,10 +432,18 @@ fn history_resets_on_each_of_its_sources() {
         !frame(&mut bed, eye, lighting),
         "a lighting reset lasts one frame"
     );
+    bed.lighting.reset_history();
+    let target = bed.spec.target;
+    bed.follow(eye, target, 0, &mut |_, _| {});
+    assert!(
+        frame(&mut bed, eye, lighting),
+        "a lighting reset before a frame that does not render the view"
+    );
+    assert!(!frame(&mut bed, eye, lighting));
     // `accumulate` cuts the camera on its first frame.
     let mut reset = false;
     bed.accumulate(1, 0, &mut |_, f| {
-        reset = f.target.begin(f.frame, f.lighting, &f.desc, &lighting);
+        reset = f.target.begin(f.lighting, &f.desc, &lighting);
     });
     assert!(reset, "a camera cut");
     assert!(!frame(&mut bed, eye, lighting));
@@ -446,7 +454,7 @@ fn history_resets_on_each_of_its_sources() {
             output_extent: f.desc.output_extent + 1,
             ..f.desc
         };
-        reset = f.target.begin(f.frame, f.lighting, &desc, &lighting);
+        reset = f.target.begin(f.lighting, &desc, &lighting);
     });
     assert!(reset, "a new output extent");
     assert_clean();
