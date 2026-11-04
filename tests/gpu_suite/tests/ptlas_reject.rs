@@ -2,11 +2,12 @@
 //! would apply only in part. In its own process: the rejection counts as a validation
 //! message on the shared device.
 
+#![cfg(debug_assertions)]
+
 use gpu_suite::clusters::*;
 use gpu_suite::device;
 
 #[test]
-#[cfg(debug_assertions)]
 fn ptlas_build_with_a_repeated_op_is_rejected() {
     let clusters = base_clusters();
     let mut b = Builder::new();

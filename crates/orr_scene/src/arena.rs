@@ -66,6 +66,7 @@ impl Span {
         Self { first, last }
     }
 
+    #[cfg(debug_assertions)]
     fn contains(&self, step: ViewStep) -> bool {
         self.first <= step && step <= self.last
     }
