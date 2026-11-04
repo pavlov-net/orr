@@ -1188,8 +1188,12 @@ impl TextureJob {
             }
         };
         let (size, mips) = if pass.all_mips {
-            let (size, kept) = super::kept_mips(b.levels[0].clone(), b.w, b.h, self.max_size);
-            (size, kept.iter().map(|m| half(m)).collect())
+            let skip = super::skipped_mips(b.w, b.h, self.max_size);
+            let kept = &b.levels[0][skip as usize..];
+            (
+                mip_size(b.w, b.h, skip),
+                kept.iter().map(|m| half(m)).collect(),
+            )
         } else {
             let first = half(&b.levels[0][0]);
             let (img, plan) = self
