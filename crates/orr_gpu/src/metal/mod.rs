@@ -47,7 +47,7 @@ pub use memory::{
 };
 pub use mesh::{ColorAttachment, DepthAttachment, MeshPipeline, MeshPipelineDesc, Rendering};
 pub use pipeline::{ComputePipeline, ShaderStage};
-pub use queue::{PassResult, PipelineStats, Queue, QueueKind, QueueRequest};
+pub use queue::{HostTimeline, PassResult, PipelineStats, Queue, QueueKind, QueueRequest};
 pub use sparse::{PageBind, SparseAllocation, SparseBinds, TileBind};
 pub use texture::{Texture, TextureMemory};
 pub use unsupported::{

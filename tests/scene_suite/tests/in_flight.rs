@@ -1,18 +1,16 @@
 //! Frames in flight: the CPU records frame N + 1 while the GPU still has frame N, and an
-//! upload window is reused only after its frame has completed. In its own process: the
-//! gate holds the render queue.
+//! upload window is reused only after its frame has completed. In its own process: a host
+//! timeline holds frame N, and the render queue behind it.
 
 use std::time::{Duration, Instant};
 
-use orr_gpu::{GpuPtr, MemoryKind, QueueKind};
+use orr_gpu::{GpuPtr, QueueKind, TimelinePoint};
 use orr_math::DVec3;
 use orr_scene::testing::{assert_clean, device, read_buffer, wait};
 use orr_scene::{
     AffineRows, FrameDesc, FrameTime, GroupWriter, RendererDesc, SceneDesc, SceneRoot, Scenes,
     TransformGroupDesc, TransformGroupId,
 };
-use scene_suite::pipeline;
-use scene_suite::shaders::gate;
 
 fn filled(salt: f32) -> AffineRows {
     AffineRows {
@@ -52,27 +50,10 @@ fn cpu_records_ahead_and_windows_wait_for_their_frame() {
     f.update_scenes(&mut |c| root = c.root).unwrap();
     wait(f.end(&[]).unwrap());
 
-    // Hold the render queue so frame N cannot start.
-    let mut flag = d
-        .gpu_malloc::<u32>(MemoryKind::Upload, 1, "gate flag")
-        .unwrap();
-    flag.as_mut_slice().unwrap()[0] = 0;
-    let out = d
-        .gpu_malloc::<u32>(MemoryKind::Readback, 1, "gate out")
-        .unwrap();
-    let mut gate_root = d
-        .gpu_malloc::<gate::Root>(MemoryKind::Upload, 1, "gate root")
-        .unwrap();
-    gate_root.as_mut_slice().unwrap()[0] = gate::Root {
-        flag: flag.gpu(),
-        out: out.gpu(),
-    };
-    let p = pipeline(&gate::MODULE, "main");
-    let mut cmd = render.command_list().unwrap();
-    cmd.dispatch(&p, gate_root.gpu(), [1, 1, 1]);
-    let gate_point = render.submit(vec![cmd], &[]).unwrap();
+    // Frame N waits for a gate the CPU opens, so it cannot start until then.
+    let gate = d.create_host_timeline("gate").unwrap();
 
-    let write = |scenes: &mut Scenes, g: TransformGroupId, salt: f32| {
+    let write = |scenes: &mut Scenes, g: TransformGroupId, salt: f32, wait: &[TimelinePoint]| {
         let mut f = scenes.begin_frame(&desc).unwrap();
         f.scene(s)
             .unwrap()
@@ -81,11 +62,11 @@ fn cpu_records_ahead_and_windows_wait_for_their_frame() {
             .fill(filled(salt));
         let written = Instant::now();
         f.update_scenes(&mut |_| {}).unwrap();
-        (f.end(&[]).unwrap(), written)
+        (f.end(wait).unwrap(), written)
     };
-    let (n, _) = write(&mut scenes, groups[0], 1.0);
+    let (n, _) = write(&mut scenes, groups[0], 1.0, &[gate.point(1)]);
     let started = Instant::now();
-    let (_, written_n1) = write(&mut scenes, groups[1], 2.0);
+    let (_, written_n1) = write(&mut scenes, groups[1], 2.0, &[]);
     assert!(
         started.elapsed() < Duration::from_millis(200),
         "frame N + 1 waited for the GPU"
@@ -93,23 +74,20 @@ fn cpu_records_ahead_and_windows_wait_for_their_frame() {
     assert!(render.completed() < n.value(), "frame N ran past the gate");
 
     // Frame N + 2 reuses frame N's window, so it waits for frame N.
-    let flag_ptr = flag.mapped_ptr().unwrap().as_ptr() as usize;
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(300));
-        // SAFETY: the flag allocation outlives this thread (joined below) and the GPU only
-        // reads it.
-        unsafe { (flag_ptr as *mut u32).write_volatile(1) };
-    });
     let waited = Instant::now();
-    let (n2, _) = write(&mut scenes, groups[2], 3.0);
+    let n2 = std::thread::scope(|t| {
+        t.spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            gate.signal(1);
+        });
+        write(&mut scenes, groups[2], 3.0, &[]).0
+    });
     assert!(
         waited.elapsed() >= Duration::from_millis(250),
         "frame N + 2 did not wait"
     );
-    release.join().unwrap();
     wait(n2);
-    assert_eq!(out.as_slice().unwrap()[0], 1, "the gate timed out");
-    assert!(render.completed() >= gate_point.value());
+    assert!(render.completed() >= n.value());
 
     // Each frame's data came from its own window.
     let root: SceneRoot = read_buffer(root, 1)[0];

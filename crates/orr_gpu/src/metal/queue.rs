@@ -7,16 +7,16 @@ use std::time::{Duration, Instant};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSRange;
+use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTL4CommandBuffer, MTL4CommandQueue, MTL4CommitFeedback, MTL4CommitOptions, MTL4CounterHeap,
-    MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTLDevice, MTLSharedEvent,
+    MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTLDevice, MTLEvent, MTLSharedEvent,
 };
 
 use super::command::{CommandList, Finished};
 use super::device::{Device, Shared};
 use super::unsupported::SwapchainFrame;
-use super::{Obj, lock};
+use super::{MAX_TIMELINES, Obj, lock};
 use crate::{Error, TimelinePoint};
 
 /// Which queue. Each has one owner thread that submits it.
@@ -284,9 +284,9 @@ impl Queue {
         // A point of this queue's own timeline is waited on too: Metal 4 runs a queue's
         // command buffers concurrently, so only the event orders them after that point.
         for p in wait {
-            let event = &self.shared.timelines[p.timeline as usize].event;
+            let event = self.shared.event(p.timeline);
             self.raw
-                .waitForEvent_value(ProtocolObject::from_ref(&**event), p.value);
+                .waitForEvent_value(ProtocolObject::from_ref(&*event), p.value);
         }
         // Commits up to each CPU step, runs it once the GPU has caught up and commits what
         // it recorded before the rest.
@@ -467,8 +467,11 @@ impl Queue {
     /// Waits until `point` has completed.
     pub fn wait(&self, point: TimelinePoint, timeout: Duration) -> Result<(), Error> {
         let ms = timeout.as_millis().try_into().unwrap_or(u64::MAX);
-        let event = &self.shared.timelines[point.timeline as usize].event;
-        if event.waitUntilSignaledValue_timeoutMS(point.value, ms) {
+        if self
+            .shared
+            .event(point.timeline)
+            .waitUntilSignaledValue_timeoutMS(point.value, ms)
+        {
             Ok(())
         } else {
             Err(Error::Timeout)
@@ -489,9 +492,53 @@ impl Drop for Queue {
     }
 }
 
+/// A timeline the CPU advances: submits wait on its points like on a queue's, and
+/// [`HostTimeline::signal`] lets them run. For gating GPU work on CPU progress, such as a test
+/// holding a queue. Frees take queue points, not these. Its event stays with the device.
+pub struct HostTimeline {
+    index: u32,
+    event: Obj<ProtocolObject<dyn MTLSharedEvent>>,
+}
+
+impl HostTimeline {
+    /// The point the timeline passes once signaled `value` or more.
+    pub fn point(&self, value: u64) -> TimelinePoint {
+        TimelinePoint {
+            timeline: self.index,
+            value,
+        }
+    }
+
+    /// Moves the timeline to `value`, more than it has been signaled before.
+    pub fn signal(&self, value: u64) {
+        self.event.setSignaledValue(value);
+    }
+
+    /// The value last signaled.
+    pub fn value(&self) -> u64 {
+        self.event.signaledValue()
+    }
+}
+
 impl Device {
+    /// A host timeline at 0.
+    pub fn create_host_timeline(&self, name: &str) -> Result<HostTimeline, Error> {
+        let event = self.shared.device.newSharedEvent().ok_or(Error::Metal {
+            call: "newSharedEvent",
+            message: format!("host timeline {name}"),
+        })?;
+        event.setLabel(Some(&NSString::from_str(name)));
+        let event = Obj(event);
+        let mut hosts = lock(&self.shared.host_timelines);
+        hosts.push(event.clone());
+        Ok(HostTimeline {
+            index: (MAX_TIMELINES + hosts.len() - 1) as u32,
+            event,
+        })
+    }
+
     pub fn is_complete(&self, point: TimelinePoint) -> bool {
-        self.shared.timelines[point.timeline as usize].completed() >= point.value
+        self.shared.event(point.timeline).signaledValue() >= point.value
     }
 
     /// Pass timings of the submit that signals `point`, once it has completed; `None`

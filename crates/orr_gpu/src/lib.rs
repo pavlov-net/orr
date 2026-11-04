@@ -68,13 +68,14 @@ pub use metal::{
     ClassicInstance, ClassicKind, ColorAttachment, CommandList, ComputePipeline, CounterRange,
     CounterReport, DecompressRegion, DepthAttachment, Device, DeviceArenas, DeviceDesc,
     DeviceFault, DeviceHooks, Diagnostics, DiagnosticsReport, DispatchArgs, ExecutionSet,
-    FaultAccess, FaultAddress, Generated, HeapReport, HostArenas, InstanceFlags, LowLatency,
-    LssEndCaps, LssIndexing, MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout,
-    MemoryCopy, MemoryKind, MemoryPriority, MemoryReport, MemoryUsage, MeshArgs, MeshPipeline,
-    MeshPipelineDesc, Micromap, MicromapDesc, MicromapTriangle, MicromapUsage, OmmFormat, PageBind,
-    PassResult, PipelineCacheReport, PipelineStats, Queue, QueueKind, QueueProgress, QueueRequest,
-    RayDispatchPipeline, Rendering, Sequence, SetKind, ShaderStage, SparseAllocation, SparseBinds,
-    Swapchain, SwapchainFrame, Texture, TextureCopy, TextureMemory, TileBind,
+    FaultAccess, FaultAddress, Generated, HeapReport, HostArenas, HostTimeline, InstanceFlags,
+    LowLatency, LssEndCaps, LssIndexing, MATRIX_ALIGN, MatrixConversion, MatrixFormat,
+    MatrixLayout, MemoryCopy, MemoryKind, MemoryPriority, MemoryReport, MemoryUsage, MeshArgs,
+    MeshPipeline, MeshPipelineDesc, Micromap, MicromapDesc, MicromapTriangle, MicromapUsage,
+    OmmFormat, PageBind, PassResult, PipelineCacheReport, PipelineStats, Queue, QueueKind,
+    QueueProgress, QueueRequest, RayDispatchPipeline, Rendering, Sequence, SetKind, ShaderStage,
+    SparseAllocation, SparseBinds, Swapchain, SwapchainFrame, Texture, TextureCopy, TextureMemory,
+    TileBind,
 };
 #[cfg(not(target_vendor = "apple"))]
 pub use orr_memory::AllocError;
@@ -84,13 +85,14 @@ pub use vulkan::{
     ClassicInstance, ClassicKind, ColorAttachment, CommandList, ComputePipeline, CounterRange,
     CounterReport, DecompressRegion, DepthAttachment, Device, DeviceArenas, DeviceDesc,
     DeviceFault, DeviceHooks, Diagnostics, DiagnosticsReport, DispatchArgs, ExecutionSet,
-    FaultAccess, FaultAddress, Generated, HeapReport, HostArenas, InstanceFlags, LowLatency,
-    LssEndCaps, LssIndexing, MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout,
-    MemoryCopy, MemoryKind, MemoryPriority, MemoryReport, MemoryUsage, MeshArgs, MeshPipeline,
-    MeshPipelineDesc, Micromap, MicromapDesc, MicromapTriangle, MicromapUsage, OmmFormat, PageBind,
-    PassResult, PipelineCacheReport, PipelineStats, Queue, QueueKind, QueueProgress, QueueRequest,
-    RayDispatchPipeline, Rendering, Sequence, SetKind, ShaderStage, SparseAllocation, SparseBinds,
-    Swapchain, SwapchainFrame, Texture, TextureCopy, TextureMemory, TileBind,
+    FaultAccess, FaultAddress, Generated, HeapReport, HostArenas, HostTimeline, InstanceFlags,
+    LowLatency, LssEndCaps, LssIndexing, MATRIX_ALIGN, MatrixConversion, MatrixFormat,
+    MatrixLayout, MemoryCopy, MemoryKind, MemoryPriority, MemoryReport, MemoryUsage, MeshArgs,
+    MeshPipeline, MeshPipelineDesc, Micromap, MicromapDesc, MicromapTriangle, MicromapUsage,
+    OmmFormat, PageBind, PassResult, PipelineCacheReport, PipelineStats, Queue, QueueKind,
+    QueueProgress, QueueRequest, RayDispatchPipeline, Rendering, Sequence, SetKind, ShaderStage,
+    SparseAllocation, SparseBinds, Swapchain, SwapchainFrame, Texture, TextureCopy, TextureMemory,
+    TileBind,
 };
 
 #[cfg(not(target_vendor = "apple"))]

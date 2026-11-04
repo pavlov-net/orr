@@ -1,14 +1,12 @@
 //! Removed instance slots are reused only once the frame that removed them has completed.
-//! In its own process: the gate holds the render queue.
+//! In its own process: a host timeline holds the render queue.
 
-use orr_gpu::{GpuPtr, MemoryKind};
+use orr_gpu::GpuPtr;
 use orr_scene::testing::{assert_clean, device, read_buffer, wait};
 use orr_scene::{
     FrameDesc, FrameTime, InstanceFlags, InstanceRange, InstancesDesc, ModelId, RendererDesc,
     SceneDesc, SceneRoot, Scenes, TransformGroupId,
 };
-use scene_suite::pipeline;
-use scene_suite::shaders::gate;
 
 #[test]
 fn removed_slots_wait_for_their_frame() {
@@ -44,38 +42,21 @@ fn removed_slots_wait_for_their_frame() {
     f.end(&[]).unwrap();
 
     // The frame removing `a` cannot complete until the gate opens.
-    let mut flag = d
-        .gpu_malloc::<u32>(MemoryKind::Upload, 1, "gate flag")
-        .unwrap();
-    flag.as_mut_slice().unwrap()[0] = 0;
-    let out = d
-        .gpu_malloc::<u32>(MemoryKind::Readback, 1, "gate out")
-        .unwrap();
-    let mut gate_root = d
-        .gpu_malloc::<gate::Root>(MemoryKind::Upload, 1, "gate root")
-        .unwrap();
-    gate_root.as_mut_slice().unwrap()[0] = gate::Root {
-        flag: flag.gpu(),
-        out: out.gpu(),
-    };
-    let p = pipeline(&gate::MODULE, "main");
-    let mut f = scenes.begin_frame(&desc).unwrap();
+    let gate = d.create_host_timeline("gate").unwrap();
+    let f = scenes.begin_frame(&desc).unwrap();
     let b = {
         let mut w = f.scene(s).unwrap();
         w.remove(a);
         add(&mut w)
     };
-    f.update_scenes(&mut |c| c.cmd.dispatch(&p, gate_root.gpu(), [1, 1, 1]))
-        .unwrap();
-    let removal = f.end(&[]).unwrap();
+    let removal = f.end(&[gate.point(1)]).unwrap();
 
     // Frame 3 waits only for frame 1, so `a`'s slots are still held.
     let f = scenes.begin_frame(&desc).unwrap();
     let c = add(&mut f.scene(s).unwrap());
     f.end(&[]).unwrap();
-    flag.as_mut_slice().unwrap()[0] = 1;
+    gate.signal(1);
     wait(removal);
-    assert_eq!(out.as_slice().unwrap()[0], 1, "the gate timed out");
     assert_eq!((a.first, b.first, c.first), (0, 100, 200));
     let root: SceneRoot = read_buffer(root, 1)[0];
     let removed = read_buffer(root.instances, 100);

@@ -77,6 +77,11 @@ pub(super) struct Shared {
     pub(super) residency: Mutex<Residency>,
     /// Indexed by [`QueueKind`].
     pub(super) timelines: [Timeline; MAX_TIMELINES],
+    /// The events of [`HostTimeline`]s, whose points' timelines count on from
+    /// `MAX_TIMELINES`. Kept with the device.
+    ///
+    /// [`HostTimeline`]: super::HostTimeline
+    pub(super) host_timelines: Mutex<Vec<Obj<ProtocolObject<dyn MTLSharedEvent>>>>,
     pub(super) garbage: Mutex<Garbage>,
     pub(super) buffers: Mutex<Buffers>,
     /// Pass results by the point of their submit, oldest first.
@@ -110,6 +115,10 @@ impl Shared {
 
     /// Runs `release` once `value` of `timeline` has completed.
     pub(super) fn defer_until(&self, timeline: u32, value: u64, release: Release) {
+        assert!(
+            (timeline as usize) < MAX_TIMELINES,
+            "frees wait for a queue's points, not a host timeline's"
+        );
         let mut after = [0; MAX_TIMELINES];
         after[timeline as usize] = value;
         lock(&self.garbage).push(after, release);
@@ -124,6 +133,14 @@ impl Shared {
         let done = lock(&self.garbage).take_done(&completed);
         for release in done {
             release();
+        }
+    }
+
+    /// The event behind `timeline`: a queue's or a host timeline's.
+    pub(super) fn event(&self, timeline: u32) -> Obj<ProtocolObject<dyn MTLSharedEvent>> {
+        match self.timelines.get(timeline as usize) {
+            Some(t) => t.event.clone(),
+            None => lock(&self.host_timelines)[timeline as usize - MAX_TIMELINES].clone(),
         }
     }
 
@@ -192,6 +209,7 @@ impl Device {
                 dirty: true,
             }),
             timelines,
+            host_timelines: Mutex::default(),
             garbage: Mutex::default(),
             buffers: Mutex::default(),
             results: Mutex::default(),

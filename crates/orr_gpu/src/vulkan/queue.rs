@@ -9,6 +9,7 @@ use ash::vk;
 use ash::vk::TaggedStructure as _;
 
 use super::command::{CommandList, Finished, PassRecord};
+use super::debug::name_object;
 use super::device::{Device, Shared};
 use super::garbage::{After, MAX_TIMELINES};
 use super::swapchain::SwapchainFrame;
@@ -398,7 +399,7 @@ impl Queue {
             .iter()
             .map(|p| {
                 vk::SemaphoreSubmitInfo::default()
-                    .semaphore(self.shared.timeline(p.timeline).semaphore)
+                    .semaphore(self.shared.semaphore(p.timeline))
                     .value(p.value)
                     .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
             })
@@ -681,11 +682,19 @@ impl Shared {
             .expect("a timeline of a queue the device did not create")
     }
 
+    /// The semaphore behind timeline `index`: a queue's or a host timeline's.
+    pub(super) fn semaphore(&self, index: u32) -> vk::Semaphore {
+        match self.timelines.get(index as usize) {
+            Some(_) => self.timeline(index).semaphore,
+            None => self.host_timelines.lock().unwrap()[index as usize - MAX_TIMELINES],
+        }
+    }
+
     fn completed_value(&self, index: u32) -> u64 {
         // SAFETY: the semaphore is live.
         unsafe {
             self.device
-                .get_semaphore_counter_value(self.timeline(index).semaphore)
+                .get_semaphore_counter_value(self.semaphore(index))
         }
         .unwrap_or(0)
     }
@@ -710,13 +719,17 @@ impl Shared {
     }
 
     pub(super) fn after_point(&self, p: TimelinePoint) -> After {
+        assert!(
+            (p.timeline as usize) < MAX_TIMELINES,
+            "frees wait for a queue's points, not a host timeline's"
+        );
         let mut after = [0; MAX_TIMELINES];
         after[p.timeline as usize] = p.value;
         after
     }
 
     pub(super) fn wait(&self, point: TimelinePoint, timeout: Duration) -> Result<(), Error> {
-        let semaphore = self.timeline(point.timeline).semaphore;
+        let semaphore = self.semaphore(point.timeline);
         self.wait_values(&[semaphore], &[point.value], timeout)
     }
 
@@ -787,8 +800,70 @@ impl Shared {
     }
 }
 
+/// A timeline the CPU advances: submits wait on its points like on a queue's, and
+/// [`HostTimeline::signal`] lets them run. For gating GPU work on CPU progress, such as a test
+/// holding a queue. Frees take queue points, not these. Its semaphore stays with the device.
+pub struct HostTimeline {
+    index: u32,
+    semaphore: vk::Semaphore,
+    shared: Arc<Shared>,
+}
+
+impl HostTimeline {
+    /// The point the timeline passes once signaled `value` or more.
+    pub fn point(&self, value: u64) -> TimelinePoint {
+        TimelinePoint {
+            timeline: self.index,
+            value,
+        }
+    }
+
+    /// Moves the timeline to `value`, more than it has been signaled before.
+    pub fn signal(&self, value: u64) {
+        let info = vk::SemaphoreSignalInfo::default()
+            .semaphore(self.semaphore)
+            .value(value);
+        // SAFETY: the semaphore is live while the device is; `value` grows (the caller's).
+        unsafe { self.shared.device.signal_semaphore(&info) }
+            .expect("vkSignalSemaphore on a host timeline");
+    }
+
+    /// The value last signaled.
+    pub fn value(&self) -> u64 {
+        // SAFETY: the semaphore is live.
+        unsafe {
+            self.shared
+                .device
+                .get_semaphore_counter_value(self.semaphore)
+        }
+        .unwrap_or(0)
+    }
+}
+
 impl Device {
-    /// Whether `point`, on any queue's timeline, has completed.
+    /// A host timeline at 0.
+    pub fn create_host_timeline(&self, name: &str) -> Result<HostTimeline, Error> {
+        let mut ty = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        // SAFETY: valid create info.
+        let semaphore = unsafe {
+            self.shared
+                .device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default().push(&mut ty), None)
+        }
+        .map_err(Error::vk("vkCreateSemaphore"))?;
+        name_object(&self.shared.debug_fn, semaphore, name);
+        let mut hosts = self.shared.host_timelines.lock().unwrap();
+        hosts.push(semaphore);
+        Ok(HostTimeline {
+            index: (MAX_TIMELINES + hosts.len() - 1) as u32,
+            semaphore,
+            shared: Arc::clone(&self.shared),
+        })
+    }
+
+    /// Whether `point`, on any queue's or host timeline, has completed.
     pub fn is_complete(&self, point: TimelinePoint) -> bool {
         self.shared.completed_value(point.timeline) >= point.value
     }
@@ -801,7 +876,7 @@ impl Device {
         }
         // `command_list` moves results from pending to the store under the pools lock, so
         // pending is read first: a submit found in neither has no passes.
-        let queue = self.queue(QueueKind::ALL[point.timeline as usize])?;
+        let queue = self.queue(*QueueKind::ALL.get(point.timeline as usize)?)?;
         if let Some(r) = queue.take_results(point.value) {
             return Some(r);
         }
