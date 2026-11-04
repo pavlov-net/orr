@@ -95,7 +95,7 @@ impl Bindings {
 }
 
 /// The 64-bit value of a resource ID, which shaders reinterpret as the resource.
-fn id_bits(id: MTLResourceID) -> u64 {
+pub(super) fn id_bits(id: MTLResourceID) -> u64 {
     const _: () = assert!(size_of::<MTLResourceID>() == 8);
     // SAFETY: `MTLResourceID` is a `repr(C)` struct of one `u64`.
     unsafe { std::mem::transmute::<MTLResourceID, u64>(id) }

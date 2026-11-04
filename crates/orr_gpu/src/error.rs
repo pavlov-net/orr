@@ -71,6 +71,7 @@ impl fmt::Debug for VkResult {
 }
 
 impl Error {
+    #[cfg(not(target_vendor = "apple"))]
     pub(crate) fn vk(call: &'static str) -> impl FnOnce(ash::vk::Result) -> Error {
         move |r| match r {
             ash::vk::Result::ERROR_DEVICE_LOST => Error::DeviceLost,
