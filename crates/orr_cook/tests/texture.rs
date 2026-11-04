@@ -900,6 +900,58 @@ fn bcn_material_textures_keep_their_blocks() {
     }
 }
 
+#[test]
+fn two_channel_normals_rebuild_z_when_they_are_reencoded() {
+    let d = dir("rg-normal");
+    let n = 64;
+    // Two halves tilted 45 degrees either way; the block format holds no z.
+    let tilt = 0.5f32.sqrt();
+    let (image, _) = ktx2(n, n, ctt::Format::BC5_UNORM_BLOCK, |m, x, _| {
+        let stored = if x << m < n / 2 { 1.0 } else { -1.0 } * tilt * 0.5 + 0.5;
+        [(stored * 255.0).round() as u8, 128, 0, 255]
+    });
+    let x_of = |a: &Archive, name: &str| {
+        let (_, levels) = mips(a, name);
+        2.0 * decode(vk::BC5_UNORM, n, n, &levels[0][0])[8 * n as usize + 8][0] - 1.0
+    };
+
+    // A normal scale stops the blocks passing through, whichever path remakes them.
+    let path = d.join("scaled.glb");
+    write_glb(
+        &path,
+        &[r#"{"normalTexture":{"index":0,"scale":0.5}}"#.into()],
+        std::slice::from_ref(&image),
+    );
+    let scaled = 0.5 / 1.25f32.sqrt();
+    for quality in [Quality::Fast, Quality::Slow] {
+        let a = cook_at(
+            vec![AssetSpec {
+                name: "g".into(),
+                source: Source::Gltf {
+                    path: path.clone(),
+                    settings: GltfSettings::default(),
+                },
+            }],
+            quality,
+        );
+        let e = a.find(AssetId::from_name("g/material/0")).unwrap();
+        let m = Material::from_bytes(&read_blob(&a, e, 0)).unwrap();
+        let name = a.name(a.find(m.textures[slot::NORMAL].texture).unwrap());
+        let x = x_of(&a, name);
+        assert!((x - scaled).abs() < 0.02, "{quality:?}: {x}, not {scaled}");
+    }
+
+    let path = d.join("standalone.ktx2");
+    std::fs::write(&path, &image).unwrap();
+    let settings = TextureSettings {
+        usage: Usage::Normal,
+        atlas_grid: Some([2, 2]),
+        ..TextureSettings::default()
+    };
+    let x = x_of(&cook(vec![texture(&path, "n", settings)]), "n");
+    assert!((x - tilt).abs() < 0.02, "{x}, not {tilt}");
+}
+
 fn bcn_material_checks(a: &Archive, remade: bool, blocks: [&Vec<Vec<u8>>; 5]) {
     let [
         color_blocks,

@@ -81,8 +81,8 @@ pub enum Usage {
     Color,
     /// sRGB color with linear alpha to BC7 sRGB.
     ColorAlpha,
-    /// Tangent-space normal (RGB as stored, `2v - 1`) to BC5 holding x and y; z is
-    /// reconstructed.
+    /// Tangent-space normal (RGB as stored, `2v - 1`, or x and y alone from a two-channel
+    /// source) to BC5 holding x and y; z is reconstructed.
     Normal,
     /// One linear channel (R) to BC4.
     Linear1,
@@ -322,6 +322,16 @@ fn build(layers: Vec<Img>, plan: &Plan) -> Result<Built, String> {
     finish(chains(layers, plan, 0)?, plan)
 }
 
+/// The normal of source texel `t`. A two-channel source (`rg`) holds no z, which is rebuilt
+/// as the shader rebuilds it.
+fn source_normal(t: [f32; 4], rg: bool) -> [f32; 3] {
+    if rg {
+        normal::decode([t[0], t[1]])
+    } else {
+        [2.0 * t[0] - 1.0, 2.0 * t[1] - 1.0, 2.0 * t[2] - 1.0]
+    }
+}
+
 /// Encoding and layout for the mip chains of `layers` (values linear, normals unit).
 fn finish(mut chains: Vec<Vec<Img>>, plan: &Plan) -> Result<Built, String> {
     if plan.mips.normal {
@@ -487,7 +497,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         Usage::Color | Usage::ColorAlpha | Usage::Hdr | Usage::Data(DataFormat::Rgba8Srgb)
     );
     let normal = s.usage == Usage::Normal;
-    let srgb = src.srgb;
+    let (srgb, rg) = (src.srgb, src.rg);
     let linear = |p: &mut [f32; 4]| {
         if color && srgb {
             for c in &mut p[..3] {
@@ -495,7 +505,8 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
             }
         }
         if normal {
-            *p = [p[0] * 2.0 - 1.0, p[1] * 2.0 - 1.0, p[2] * 2.0 - 1.0, 1.0];
+            let [x, y, z] = source_normal(*p, rg);
+            *p = [x, y, z, 1.0];
         }
     };
     let plan = Plan {

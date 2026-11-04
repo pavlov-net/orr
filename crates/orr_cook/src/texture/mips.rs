@@ -36,6 +36,8 @@ pub(super) fn chain(base: Img, spec: &MipSpec, count: u32) -> Vec<Img> {
         let _z = crate::profile::zone!("mips.downsample");
         raw_chain(base, spec, count)
     };
+    // Only x and y are stored and z is rebuilt from them, so a shortened mean would read as a
+    // flatter normal, not a shorter one.
     if spec.normal {
         let _z = crate::profile::zone!("mips.renormalize");
         for m in &mut out[1..] {
