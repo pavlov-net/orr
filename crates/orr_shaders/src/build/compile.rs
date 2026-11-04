@@ -1416,7 +1416,7 @@ fn metal_issues(
     let mut issues = Vec::new();
     let mut declared = Vec::new();
     for (extension, msl, _) in &programs {
-        let msl = metal::multi_level(msl);
+        let msl = metal::primitive_culled(&metal::multi_level(msl));
         let msl = msl.as_str();
         write(&job.spv.with_extension(extension), msl.as_bytes())?;
         issues.extend(metal::msl_issues(msl));

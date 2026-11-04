@@ -261,6 +261,41 @@ fn entry_signatures(msl: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// `msl` with the cull flag of each mesh entry's primitives marked `[[primitive_culled]]`.
+/// Slang drops `SV_CullPrimitive` in MSL, leaving a plain `bool` member that Metal takes as
+/// per-primitive data, so no mesh shader culled a primitive. The `bool` member without an
+/// attribute of a mesh entry's primitive struct is that flag: no other primitive output is a
+/// `bool`.
+pub(super) fn primitive_culled(msl: &str) -> String {
+    let primitives: Vec<String> = entry_signatures(msl)
+        .iter()
+        .filter_map(|(_, s)| {
+            let args = &s[s.find("metal::mesh<")? + "metal::mesh<".len()..];
+            let p = args.split(',').nth(1)?.trim();
+            (p != "void").then(|| p.to_owned())
+        })
+        .collect();
+    let mut out = String::with_capacity(msl.len() + 64);
+    let mut in_primitive = false;
+    for line in msl.split_inclusive('\n') {
+        let t = line.trim();
+        if let Some(name) = t.strip_prefix("struct ") {
+            in_primitive = primitives.iter().any(|p| p == name.trim());
+        } else if in_primitive && t.starts_with('}') {
+            in_primitive = false;
+        } else if in_primitive
+            && let Some(field) = t.strip_prefix("bool ").and_then(|f| f.strip_suffix(';'))
+            && !field.contains("[[")
+        {
+            let indent = &line[..line.len() - line.trim_start().len()];
+            out.push_str(&format!("{indent}bool {field} [[primitive_culled]];\n"));
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 /// `msl` with its ray queries traversing three instancing levels: the Metal backend stands
 /// in for a cluster BLAS with an instance structure over one BLAS per cluster, under the
 /// TLAS. Slang has no way to ask for it. Instance IDs then take a depth: 0, the TLAS's.
@@ -391,6 +426,29 @@ struct Fwd_0;
         assert!(issues[0].contains("line 7") && issues[0].contains("Tracer_0"));
         assert!(issues[1].contains("line 11") && issues[1].contains("64-bit"));
         assert!(issues[2].contains("line 14") && issues[2].contains("root_scene_tlas_1"));
+    }
+
+    #[test]
+    fn mesh_primitives_cull_by_their_flag() {
+        let msl = "\
+struct Primitive_0
+{
+    uint triangle_2 [[primitive_id]];
+    bool cull_0;
+};
+struct Other_0
+{
+    bool kept_0;
+};
+[[mesh]] void cluster_mesh(uint3 g [[threadgroup_position_in_grid]], metal::mesh<Vertex_0, Primitive_0, int(256), int(128), metal::topology::triangle> _slang_mesh)
+";
+        let out = primitive_culled(msl);
+        assert!(
+            out.contains("    bool cull_0 [[primitive_culled]];\n"),
+            "{out}"
+        );
+        assert!(out.contains("    bool kept_0;\n"), "{out}");
+        assert!(out.contains("uint triangle_2 [[primitive_id]];"));
     }
 
     #[test]
