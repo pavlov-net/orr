@@ -9,7 +9,6 @@ use std::{fs, ptr};
 
 use super::compile::{self, Manifest, Settings, Unit};
 use super::link::LinkModule;
-use super::precompile::Precompiled;
 use super::slang::{GlobalSession, Library};
 use super::{Error, toolchain};
 use crate::ShaderModule;
@@ -196,14 +195,12 @@ fn recompile(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let precompiled = Precompiled::default();
     let settings = Settings {
         tool: "",
         options: &options,
         metal: None,
         asserts: manifest.asserts,
         separate_debug: false,
-        precompiled: &precompiled,
         roots,
     };
     let unit = Unit {

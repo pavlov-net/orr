@@ -10,7 +10,6 @@ mod lint;
 mod locate;
 mod metal;
 mod model;
-mod precompile;
 #[cfg(feature = "hot-reload")]
 mod reload;
 mod roots;

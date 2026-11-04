@@ -138,7 +138,7 @@ impl CpuLibrary {
         for source in &self.sources {
             let path = canonical(&manifest.join(source))?;
             let text = read(&path)?;
-            roots::load_prefixed(&session, &import_roots, &[(&path, &text)], |_| false)
+            roots::load_prefixed(&session, &import_roots, &[(&path, &text)])
                 .map_err(compile_err)?;
             let stem = path
                 .file_stem()
@@ -156,7 +156,7 @@ impl CpuLibrary {
             else {
                 continue;
             };
-            roots::load_prefixed(&session, &import_roots, &[(&m.path, &m.source)], |_| false)
+            roots::load_prefixed(&session, &import_roots, &[(&m.path, &m.source)])
                 .map_err(compile_err)?;
             let module = session
                 .load(&m.module, &m.path, &m.source)

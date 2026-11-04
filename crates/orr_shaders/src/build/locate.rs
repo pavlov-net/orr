@@ -1,8 +1,8 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// The Slang release orr builds with. The check is exact: precompiled Slang modules load
-/// only in the compiler version that wrote them.
+/// The Slang release orr builds with. The check is exact: the committed bindings are for this
+/// release.
 pub(crate) const SLANG_VERSION: &str = "2026.20";
 
 pub(crate) enum Missing {

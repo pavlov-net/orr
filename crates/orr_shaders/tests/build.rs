@@ -400,7 +400,6 @@ fn omm_builds_declare_the_mode_on_every_ray_query_entry() {
     assert!(!capabilities(&words).contains(&OMM) && !capabilities(&words).contains(&OMM_MODE));
     assert_eq!(modes(&words), 0);
 
-    // The same fixture, so the build reuses its precompiled libraries.
     fs::write(dir.join("src/k.slang"), src("")).unwrap();
     match build(&dir).omm(true).compile() {
         Err(Error::Lints(l)) => {
@@ -560,162 +559,6 @@ fn link_calls_are_checked() {
     assert!(message(name).contains("lower-case"));
 }
 
-/// Every `.spv` under `dir` by its path below it.
-fn spirv_files(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-    let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        for path in fs::read_dir(&d).unwrap().map(|e| e.unwrap().path()) {
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "spv") {
-                out.push((
-                    path.strip_prefix(dir).unwrap().to_path_buf(),
-                    fs::read(&path).unwrap(),
-                ));
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
-/// The `precompiled` lists of a build manifest's modules.
-fn precompiled(out: &Output) -> Vec<(String, Vec<String>)> {
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(&out.manifest).unwrap()).unwrap();
-    manifest["modules"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| {
-            let names = m["precompiled"].as_array().unwrap();
-            (
-                m["name"].as_str().unwrap().to_owned(),
-                names
-                    .iter()
-                    .map(|n| n.as_str().unwrap().to_owned())
-                    .collect(),
-            )
-        })
-        .collect()
-}
-
-#[test]
-fn precompiled_modules_give_the_same_spirv_and_rust() {
-    let shared = |scale: &str| {
-        format!(
-            "import orr_shaders.math;\npublic float3 lit(float3 n) {{ return safe_normalize(n) * {scale}; }}\n"
-        )
-    };
-    let a = format!(
-        "import orr_color.transfer;\nimport fixture.shared;\n{}",
-        kernel("root.out[id.x] = float4(srgb_encode(lit(float3(root.count))), 1);")
-    );
-    let b = format!(
-        "import orr_shaders.coherence;\nimport fixture.shared;\n{}",
-        kernel(
-            "root.out[id.x] = float4(lit(float3(1)), float(coherence_key(true, 1, root.count)));"
-        )
-    );
-    let dir = fixture(
-        "precompiled",
-        &[
-            ("src/a.slang", &a),
-            ("src/b.slang", &b),
-            ("src/shared.slang", &shared("2")),
-        ],
-    );
-    let both = || {
-        let [on, off] = [true, false].map(|on| {
-            let out = dir.join(if on { "on" } else { "off" });
-            let built = build(&dir)
-                .debug_info(DebugInfo::Off)
-                .asserts(true)
-                .precompile(on)
-                .out_dir(&out)
-                .compile()
-                .unwrap_or_else(|e| panic!("{e}"));
-            let rust = fs::read_to_string(out.join("orr_shaders.rs"))
-                .unwrap()
-                .replace(
-                    format!("{:?}", out.display().to_string()).trim_matches('"'),
-                    "OUT",
-                )
-                .replace(&out.display().to_string(), "OUT");
-            (built, spirv_files(&out), rust)
-        });
-        assert_eq!(on.1, off.1);
-        assert_eq!(on.2, off.2);
-        (on.0, off.0)
-    };
-    let (on, off) = both();
-    assert_eq!(
-        precompiled(&on),
-        [
-            (
-                "a".to_owned(),
-                vec![
-                    "fixture.shared".to_owned(),
-                    "orr_color.transfer".to_owned(),
-                    "orr_shaders.math".to_owned(),
-                ]
-            ),
-            (
-                "b".to_owned(),
-                vec![
-                    "fixture.shared".to_owned(),
-                    "orr_shaders.coherence".to_owned(),
-                    "orr_shaders.math".to_owned(),
-                ]
-            ),
-        ]
-    );
-    assert!(precompiled(&off).iter().all(|(_, p)| p.is_empty()));
-
-    // An edited library is compiled again before its importers use it.
-    fs::write(dir.join("src/shared.slang"), shared("3")).unwrap();
-    let (on, _) = both();
-    assert_eq!(on.compiled, ["a", "b"]);
-}
-
-#[test]
-fn linked_kernels_load_precompiled_consumer_modules() {
-    let (dir, renderer) = link_fixture("link-precompiled");
-    let [on, off] = [true, false].map(|on| {
-        let out = dir.join(if on { "linked-on" } else { "linked-off" });
-        let built = consumer(&dir, &renderer)
-            .link(
-                LinkPoint::Surface,
-                "ground",
-                dir.join("consumer/ground.slang"),
-                "Ground",
-            )
-            .link(
-                LinkPoint::Surface,
-                "grass",
-                dir.join("consumer/grass.slang"),
-                "Grass",
-            )
-            .link(
-                LinkPoint::Medium,
-                "air",
-                dir.join("consumer/air.slang"),
-                "Air",
-            )
-            .debug_info(DebugInfo::Off)
-            .precompile(on)
-            .out_dir(&out)
-            .compile()
-            .unwrap_or_else(|e| panic!("{e}"));
-        (built, spirv_files(&out))
-    });
-    assert_eq!(on.1, off.1);
-    let used = precompiled(&on.0);
-    let resolve = &used.iter().find(|(n, _)| n == "resolve").unwrap().1;
-    assert_eq!(resolve, &["grass", "ground", "orr_scene.surface"]);
-}
-
 #[test]
 fn cooperative_vectors_stay_out_of_records() {
     // SPIR-V allows cooperative vectors only in function and private storage, so a root or
@@ -778,8 +621,8 @@ fn separate_debug_info_strips_the_module_into_a_sidecar() {
     const DEBUG_SOURCE: u32 = 35;
     const DEBUG_LINE: u32 = 103;
     const DEBUG_BUILD_IDENTIFIER: u32 = 105;
-    // A precompiled import, and an array in a pointee, which the model knows by its SPIR-V
-    // wrapper struct's name.
+    // An import, and an array in a pointee, which the model knows by its SPIR-V wrapper struct's
+    // name.
     let src = "import orr_shaders.debug;\n#include \"orr_debug.h\"\n\
         struct Rec { uint3 a[2]; uint b; }\n\
         struct Root { Rec* recs; uint count; uint pad; }\n\

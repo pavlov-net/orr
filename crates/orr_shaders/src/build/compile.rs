@@ -13,7 +13,6 @@ use super::layout::{Plan, Planner};
 use super::link::{self, KernelPoints, Link, LinkModule, LinkPoint, LinkPoints};
 use super::lint::{self, Lint, LintError};
 use super::model::{self, Model, StructDef, Ty};
-use super::precompile::{self, Precompiled};
 use super::roots::{self, Root};
 use super::slang::{GlobalSession, Library, Session};
 use super::{Error, SLANG_VERSION, SLANGC_OPTIONS, metal, spirv};
@@ -42,7 +41,6 @@ pub struct Build {
     omm: bool,
     neural: bool,
     metal_check: bool,
-    precompile: bool,
     allowed: BTreeSet<Lint>,
     out_dir: Option<PathBuf>,
     link_points: Vec<PathBuf>,
@@ -123,7 +121,6 @@ impl Build {
             omm: flag("ORR_SHADER_OMM", !capture),
             neural: flag("ORR_SHADER_NEURAL", true),
             metal_check: env::var_os("ORR_METAL_CHECK").is_some_and(|v| v == "1"),
-            precompile: env::var_os("ORR_SHADER_PRECOMPILE").is_none_or(|v| v != "0"),
             allowed: BTreeSet::new(),
             out_dir: None,
             link_points: Vec::new(),
@@ -286,14 +283,6 @@ impl Build {
         self
     }
 
-    /// Compiles the library modules that kernels import once per build into
-    /// `.slang-module` files, which every kernel then loads instead of the source. The
-    /// SPIR-V is the same either way. On unless `ORR_SHADER_PRECOMPILE=0`.
-    pub fn precompile(mut self, on: bool) -> Self {
-        self.precompile = on;
-        self
-    }
-
     /// Turns a lint off for this build.
     pub fn allow(mut self, lint: Lint) -> Self {
         self.allowed.insert(lint);
@@ -395,7 +384,7 @@ impl Build {
         let Run {
             modules,
             mut compiled,
-        } = self.run(&tool, &roots, &records, jobs)?;
+        } = self.run(&tool, &roots, jobs)?;
 
         // The listed kernels compiled once more with the linked types.
         let mut linked_modules = BTreeMap::new();
@@ -414,7 +403,7 @@ impl Build {
                     lint_roots.push(root);
                 }
             }
-            let run = self.run(&tool, &linked_roots, &records, jobs)?;
+            let run = self.run(&tool, &linked_roots, jobs)?;
             linked_modules = run.modules;
             compiled.extend(run.compiled.into_iter().map(|n| format!("linked/{n}")));
         }
@@ -600,7 +589,6 @@ impl Build {
                     hash: r.hash,
                     inputs: r.inputs.clone(),
                     links: r.links.clone(),
-                    precompiled: r.precompiled.clone(),
                 })
                 .collect(),
         };
@@ -679,48 +667,19 @@ impl Build {
         })
     }
 
-    /// Precompiles the libraries the jobs import, loads up-to-date records and compiles the
-    /// rest.
-    fn run(
-        &self,
-        tool: &str,
-        roots: &[Root],
-        records: &Path,
-        jobs: Vec<Job>,
-    ) -> Result<Run, Error> {
+    /// Loads up-to-date records and compiles the rest.
+    fn run(&self, tool: &str, roots: &[Root], jobs: Vec<Job>) -> Result<Run, Error> {
         let include_dirs = include_dirs(roots);
         let options = self.options(&include_dirs);
-        let (precompiled, kernel_options) = if self.precompile && !jobs.is_empty() {
-            let root_list = roots::format_list(roots);
-            let identity = format!("{}\n{root_list}", options.join("\n"));
-            let dir = records
-                .join("modules")
-                .join(format!("{:016x}", hash64(identity.as_bytes())));
-            let mut key_parts = vec![tool, root_list.as_str()];
-            key_parts.extend(options.iter().map(String::as_str));
-            let mut sources = Vec::new();
-            for job in &jobs {
-                sources.push((job.path.clone(), read(&job.path)?));
-                sources.extend(job.links.iter().map(|l| (l.path.clone(), l.source.clone())));
-            }
-            let precompiled =
-                precompile::precompile(&self.lib, &options, &key_parts, roots, &sources, &dir)?;
-            let mut dirs = vec![canonical_lossy(&dir)];
-            dirs.extend(include_dirs.iter().cloned());
-            (precompiled, self.options(&dirs))
-        } else {
-            (Precompiled::default(), options)
-        };
         let metal_options = self
             .metal_check
             .then(|| metal_session_options(&include_dirs));
         let settings = Settings {
             tool,
-            options: &kernel_options,
+            options: &options,
             metal: metal_options.as_deref(),
             asserts: self.asserts,
             separate_debug: self.debug_info == DebugInfo::Separate,
-            precompiled: &precompiled,
             roots,
         };
         let mut modules = BTreeMap::new();
@@ -883,8 +842,6 @@ pub(super) struct ManifestModule {
     pub(super) inputs: Vec<PathBuf>,
     /// The generated link modules composed with the kernel.
     pub(super) links: Vec<LinkFile>,
-    /// The library modules the compile loaded precompiled, by import name.
-    precompiled: Vec<String>,
 }
 
 /// A generated link module as the manifest lists it.
@@ -904,7 +861,6 @@ struct Record {
     debug_info: Option<PathBuf>,
     hash: u64,
     links: Vec<LinkFile>,
-    precompiled: Vec<String>,
     model: Model,
     /// MSL check failures; empty when the check passed or did not run.
     metal: Vec<String>,
@@ -921,15 +877,13 @@ struct Run {
 pub(super) struct Settings<'a> {
     /// A hash of the running build script, so a changed build invalidates every record.
     pub(super) tool: &'a str,
-    /// The kernel session's options, led by the precompiled modules' directory when there
-    /// is one.
+    /// The kernel session's options.
     pub(super) options: &'a [String],
     /// The Metal session's options when the MSL check runs.
     pub(super) metal: Option<&'a [String]>,
     pub(super) asserts: bool,
     /// `options` hold `-separate-debug-info`.
     pub(super) separate_debug: bool,
-    pub(super) precompiled: &'a Precompiled,
     /// The import roots.
     pub(super) roots: &'a [Root],
 }
@@ -984,7 +938,6 @@ fn print_cargo<'a>(
         for var in [
             "ORR_SLANGC",
             "ORR_METAL_CHECK",
-            "ORR_SHADER_PRECOMPILE",
             "ORR_SHADER_TIMINGS",
             "ORR_SHADER_ASSERTS",
             "ORR_SHADER_DEBUG_INFO",
@@ -1272,7 +1225,6 @@ fn compile_one(
                 path: l.path.clone(),
             })
             .collect(),
-        precompiled: compiled.precompiled,
         model: compiled.model,
         metal,
     })
@@ -1295,8 +1247,6 @@ pub(super) struct Compiled {
     pub(super) model: Model,
     /// Every file the kernel and its link modules read.
     pub(super) inputs: Vec<PathBuf>,
-    /// The library modules loaded precompiled.
-    precompiled: Vec<String>,
 }
 
 /// Compiles `unit` in `session`, which holds `settings.options`, and reads its model.
@@ -1315,10 +1265,7 @@ pub(super) fn compile_kernel(
             .iter()
             .map(|l| (l.path.as_path(), l.source.as_str())),
     );
-    roots::load_prefixed(session, settings.roots, &sources, |name| {
-        settings.precompiled.holds(name)
-    })
-    .map_err(compile_err)?;
+    roots::load_prefixed(session, settings.roots, &sources).map_err(compile_err)?;
     let module = session
         .load(&unit.name.replace('/', "."), unit.path, unit.source)
         .map_err(compile_err)?;
@@ -1336,17 +1283,11 @@ pub(super) fn compile_kernel(
     };
     let layout = program.layout().map_err(compile_err)?;
     let named = debug.as_deref().unwrap_or(&words);
-    let model =
-        model::extract(session, layout, named, settings.precompiled).map_err(|message| {
-            Error::Reflection {
-                module: unit.name.to_owned(),
-                message,
-            }
-        })?;
+    let model = model::extract(session, layout, named).map_err(|message| Error::Reflection {
+        module: unit.name.to_owned(),
+        message,
+    })?;
 
-    // Dependencies reached through a precompiled library can resolve against the importing
-    // link module's directory and name a file outside every root, so those files come from the
-    // libraries' records instead.
     let mut inputs: Vec<PathBuf> = module
         .dependencies()
         .into_iter()
@@ -1356,13 +1297,6 @@ pub(super) fn compile_kernel(
                 .flat_map(super::slang::Module::dependencies),
         )
         .map(|p| canonical_lossy(&p))
-        .filter(|p| {
-            settings.precompiled.is_empty()
-                || p == unit.path
-                || unit.links.iter().any(|l| p == &l.path)
-                || settings.roots.iter().any(|r| p.starts_with(&r.dir))
-        })
-        .chain(settings.precompiled.inputs(session))
         .collect();
     inputs.sort();
     inputs.dedup();
@@ -1371,7 +1305,6 @@ pub(super) fn compile_kernel(
         debug,
         model,
         inputs,
-        precompiled: settings.precompiled.used(session),
     })
 }
 
@@ -1422,7 +1355,7 @@ fn metal_issues(
                 .iter()
                 .map(|l| (l.path.as_path(), l.source.as_str())),
         );
-        roots::load_prefixed(session, settings.roots, &sources, |_| false)?;
+        roots::load_prefixed(session, settings.roots, &sources)?;
         let module = session.load(&job.name.replace('/', "."), &job.path, &text)?;
         let extra = link_modules(session, settings, &job.links)?;
         let program = session.link(&module, &extra, |e| entries.contains(e))?;

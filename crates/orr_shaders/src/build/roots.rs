@@ -168,18 +168,14 @@ fn prefixed_modules(
     out
 }
 
-/// Loads the modules under prefixed roots that `sources` (path and text) reach into `session`,
-/// those `skip` accepts aside. Errors carry Slang's diagnostics.
+/// Loads the modules under prefixed roots that `sources` (path and text) reach into `session`.
+/// Errors carry Slang's diagnostics.
 pub(crate) fn load_prefixed(
     session: &Session,
     roots: &[Root],
     sources: &[(&Path, &str)],
-    skip: impl Fn(&str) -> bool,
 ) -> Result<(), String> {
     for (name, file, text) in prefixed_modules(roots, sources) {
-        if skip(&name) {
-            continue;
-        }
         let text = text.map_err(|e| format!("{}: {e}", file.display()))?;
         // The name an import looks a module up by has `/` where the source has `.`.
         session.load(&name.replace('.', "/"), &file, &text)?;
