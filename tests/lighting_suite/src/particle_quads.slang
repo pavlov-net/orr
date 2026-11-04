@@ -1,6 +1,6 @@
 // A particle producer: per listed particle (center xyz, half edge w) one cluster of a square
 // facing `eye`, emitted as topology 0 (two triangles over four corners).
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_scene.producer;
 import orr_scene.tables;
 

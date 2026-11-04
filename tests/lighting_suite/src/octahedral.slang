@@ -1,5 +1,5 @@
 // The equal-area octahedral mapping in both directions.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_lighting.environment;
 
 struct Root

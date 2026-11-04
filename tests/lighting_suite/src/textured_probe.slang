@@ -1,6 +1,6 @@
 // `textured_disc_integral` from a scene compute kernel: one value per light slot, 0 for
 // lights that are not textured discs.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_scene.lights;
 import orr_scene.tables;
 import orr_lighting.light_sampling;

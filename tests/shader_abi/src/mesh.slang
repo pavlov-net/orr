@@ -1,6 +1,6 @@
 // Task, mesh and pixel entries drawing triangles into two render targets: coverage, and a
 // flat value per triangle read through `SV_PrimitiveID`, which the mesh entry writes.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 
 struct Root
 {

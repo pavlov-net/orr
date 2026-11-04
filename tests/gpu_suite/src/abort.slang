@@ -1,5 +1,5 @@
 // Aborts unless `*flag` is set; writes 1 to `*out` otherwise. Needs `shaderAbort`.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 
 struct Root
 {

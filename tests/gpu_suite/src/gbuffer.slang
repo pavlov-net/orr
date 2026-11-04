@@ -1,6 +1,6 @@
 // A G-buffer pass: the task stage drops hidden triangles and hands the rest to one mesh
 // workgroup each; the pixel stage writes three color targets beside reverse-Z depth.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 
 struct Triangle
 {

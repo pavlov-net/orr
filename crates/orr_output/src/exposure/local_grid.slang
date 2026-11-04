@@ -2,7 +2,7 @@
 // a binomial 1 4 6 4 1 over the bins, then across the cells and down them, leaving out taps
 // past the grid's edges, and clears the sums for the next frame. `clear` zeroes a new grid's
 // sums and pivot.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_output.exposure;
 

@@ -1,7 +1,7 @@
 // A displaced-grid dielectric slab: one thread per grid patch places its 9 x 9 vertices on
 // a plane at `level` displaced by traveling waves, with their normals, and emits the patch
 // as the grid topology.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.random;
 import examples.field;
 import orr_scene.producer;

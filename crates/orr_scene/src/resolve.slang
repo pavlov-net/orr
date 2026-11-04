@@ -5,7 +5,7 @@
 // pixel's surface through the linked `Surface` switch, the depth offset applied to depth,
 // position and motion, projected-space NDF filtering of the roughness, and the G-buffer
 // written.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.math;
 import orr_pack.mesh;

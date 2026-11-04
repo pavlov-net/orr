@@ -1,6 +1,6 @@
 // Froxel lookup: a point between each froxel's column rays and inside its slice, back to the
 // froxel holding it.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_lighting.media;
 import orr_scene.view;
 import orr_scene.visibility;

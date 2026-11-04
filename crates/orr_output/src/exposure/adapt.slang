@@ -2,7 +2,7 @@
 // white point: reads the view's current exposure slot, writes the next one, the white
 // balance matrix, local exposure's pivot and the telemetry, and clears the histogram for the
 // next frame.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.math;
 import orr_color.chromaticity;

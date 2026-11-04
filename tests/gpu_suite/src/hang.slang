@@ -1,5 +1,5 @@
 // Spins until the host sets `*flag`, with no bound, then writes what it saw to `*out`.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 
 struct Root
 {

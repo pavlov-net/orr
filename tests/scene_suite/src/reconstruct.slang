@@ -1,5 +1,5 @@
 // Reconstructs render-space positions from (uv, depth) through a view's constants.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_scene.view;
 
 struct Root

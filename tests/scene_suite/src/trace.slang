@@ -2,7 +2,7 @@
 // hit; `same_point` resolves each pixel's visible point three ways, as the material resolve
 // does, from a camera ray and from a ray arriving from elsewhere; `cones` follows a camera
 // ray to its hit and a mirror ray from there to the next, with their ray cones.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.math;
 import orr_shaders.trace;
 import orr_scene.hit;

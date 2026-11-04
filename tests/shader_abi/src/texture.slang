@@ -1,6 +1,6 @@
 // Heap views: point samples of a sampled view at texel centers, and writes through a storage
 // view of the same image.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 
 struct Root

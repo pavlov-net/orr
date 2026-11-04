@@ -1,7 +1,7 @@
 // Shadow rays from a list of origins along one direction, as next-event estimation traces
 // them: per ray the shadow product, written or with `add` added to what is there, and how
 // many rays ran past the candidate limit.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.trace;
 import orr_scene.hit;
 import orr_lighting.media;

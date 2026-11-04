@@ -4,7 +4,7 @@
 // `tile_max` take the largest half vector per TILE x TILE tile, `neighbors` the largest that
 // can reach each tile and the spread of directions around it, and `gather` blurs `source`
 // into `target`.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.random;
 import orr_scene.view;

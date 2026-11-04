@@ -1,6 +1,6 @@
 // Stock height fog: `medium_transmittance` along given rays, and `fog_phase` at given
 // cosines.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_lighting.media;
 import lighting_suite.media_types;
 

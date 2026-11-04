@@ -1,6 +1,6 @@
 // A view's overlay front words: cleared before the frame's dielectric dispatch, resolved into
 // its front depth, motion and weight after the transparency point.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_lighting.guides;
 import orr_shaders.abi;
 import orr_lighting.path;

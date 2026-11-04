@@ -1,6 +1,6 @@
 // A view's aerial-perspective LUT: each column's in-scatter and transmittance from the
 // scene's `near_range` to the view's `ap_range`.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_lighting.media;
 import orr_lighting.froxels;
 

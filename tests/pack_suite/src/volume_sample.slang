@@ -2,7 +2,7 @@
 // trilinear sample and majorant at the point and the voxel at the matching index; `spans`
 // walks the majorant cells along a ray from the point and gives the majorant that covers
 // each of SPAN_SAMPLES evenly spaced points of it.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_pack.volume;
 
 static const uint SPAN_SAMPLES = 64;

@@ -5,7 +5,7 @@
 // particles as the front layer over the surface;
 // `reference` writes the radiance averaged over `subframes` times spread across the open
 // shutter, centered on time 0.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.math;
 import orr_shaders.abi;
 

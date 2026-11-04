@@ -2,7 +2,7 @@
 // directions over equal-solid-angle bins in a cone around an axis, the bins' probabilities
 // integrated from the tiles' density, a check of each sample's density, and each sample's
 // estimate of the irradiance on a surface facing the axis.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.math;
 import orr_shaders.random;
 import orr_color.luminance;

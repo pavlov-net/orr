@@ -1,7 +1,7 @@
 // orr_lighting's subsurface walk in analytic slabs: per case, walks entered at the top face
 // (z = 0) straight down; each lane sums the throughput that leaves through the top, a capped
 // walk counting as leaving there, and counts walks whose throughput is not finite.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.random;
 import orr_shaders.trace;
 import orr_lighting.bsdf;

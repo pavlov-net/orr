@@ -2,7 +2,7 @@
 // culling data to the triangles it now holds, after the consumer kernel wrote its page;
 // `refs` puts each built CLAS's address into the resident cluster table, or each built
 // template's into the edit's skin table.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.packing;
 import orr_pack.mesh;

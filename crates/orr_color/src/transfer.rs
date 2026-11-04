@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn slang_constants_are_the_rust_ones() {
-        let slang = include_str!("../shaders/orr_color/transfer.slang");
+        let slang = include_str!("transfer.slang");
         for (name, v) in [
             ("PQ_MAX_NITS", PQ_MAX_NITS),
             ("SCRGB_WHITE_NITS", SCRGB_WHITE_NITS),

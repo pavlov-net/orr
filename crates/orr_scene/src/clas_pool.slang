@@ -2,7 +2,7 @@
 // pool's free bitmap, then gives each built CLAS the lowest run of free 128 B units that
 // holds it and writes its move. Thread t owns a fixed block of pages: it alone reads and
 // writes their bits and summaries, and shares the free run at the start of its first page.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_gpu.rtas;
 

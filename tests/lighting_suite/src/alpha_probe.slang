@@ -1,7 +1,7 @@
 // Shadow and bounce rays through alpha-tested and linked-coverage geometry, as the path
 // kernel traces them: per ray whether it was stopped, and how many candidates the alpha
 // test was asked about.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.trace;
 import orr_scene.hit;
 import orr_lighting.media;

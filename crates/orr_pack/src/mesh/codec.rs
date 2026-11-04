@@ -15,7 +15,7 @@
 //! grid offsets, a zero u16, then the vertex's attributes. The vertex codec is version 1,
 //! encoded at level 3. A triangle stream is the meshlet codec over triangles only.
 //!
-//! Every region of a page starts 4-aligned. `orr_pack/page_codec.slang` decodes the same
+//! Every region of a page starts 4-aligned. `orr_pack.page_codec` decodes the same
 //! form on the GPU and accepts exactly the pages [`decode_page`] accepts.
 
 use meshopt::ffi;
@@ -161,7 +161,7 @@ fn check_stored(stored: &[u8]) -> Result<Stored> {
 }
 
 /// Checks a stored page as far as it can without decoding its streams, as a caller of
-/// `orr_pack/page_codec.slang` does before handing the page to the GPU: a page that passes
+/// `orr_pack.page_codec` does before handing the page to the GPU: a page that passes
 /// can still fail there on a stream's contents. Returns its header and cluster records,
 /// which the resident page holds unchanged.
 pub fn check_stored_page(stored: &[u8]) -> Result<(PageHeader, Vec<Cluster>)> {

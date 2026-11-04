@@ -2,7 +2,7 @@
 // surface: mode 0 reads the visibility buffer at the pixel and traces the camera ray through
 // its center as a primary hit; mode 1 traces straight down from a grid over the field as a
 // secondary hit. Rays commit every candidate under `mask`.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.trace;
 import orr_scene.hit;
 import orr_scene.visibility;

@@ -1,5 +1,5 @@
 // The directional scene pass through the homogeneous slab.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_lighting.light_sampling;
 import lighting_suite.media_types;
 

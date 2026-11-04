@@ -3,7 +3,7 @@
 
 fn main() {
     let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    println!("cargo::metadata=shader_dirs={dir}/shaders");
+    println!("cargo::metadata=shader_dirs=orr_pack={dir}/src");
     println!("cargo::metadata=types={dir}/types.json");
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=types.json");

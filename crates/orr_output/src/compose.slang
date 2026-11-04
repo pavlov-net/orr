@@ -2,7 +2,7 @@
 // it in extended sRGB relative to paper white (egui's gamma blending in SDR). Screenshot
 // capture: the same result as display-linear Rec.709 floats, or the scene-referred radiance in
 // cd/m2.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_color.primaries;
 import orr_color.transfer;

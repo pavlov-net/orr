@@ -184,7 +184,7 @@ mod tests {
         }
     }
 
-    const SLANG: &str = include_str!("../shaders/orr_color/primaries.slang");
+    const SLANG: &str = include_str!("primaries.slang");
 
     fn named(name: &str) -> RgbPrimaries {
         match name {

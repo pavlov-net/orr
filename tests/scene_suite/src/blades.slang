@@ -3,7 +3,7 @@
 // its tip swaying by sin(time + i). Even blades instantiate topology 0, odd ones carry the
 // same triangles directly. Cluster word: `base` + i; vertex word of corner k: 8 i + k.
 // Previous positions, where the batch keeps them, are the blade at `previous_time`.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_scene.producer;
 import orr_scene.tables;
 

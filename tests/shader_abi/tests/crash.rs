@@ -47,7 +47,7 @@ fn null_tlas_aborts_with_asserts() {
 
 /// A failed `orr_assert` in a kernel with separate debug info: the report names the pass, and
 /// Aftermath's dump maps the abort to source lines through the sidecar. Instructions expanded
-/// from a macro carry the macro's lines, so the mapping names `orr_shaders/debug.h`.
+/// from a macro carry the macro's lines, so the mapping names `orr_debug.h`.
 #[test]
 #[ignore = "loses the device: run alone with ORR_GPU_EXPECT_FAULT=1 cargo test -p shader_abi --test crash -- --ignored failed_assert_dumps_with_source_lines"]
 fn failed_assert_dumps_with_source_lines() {
@@ -103,14 +103,14 @@ fn failed_assert_dumps_with_source_lines() {
     assert!(named, "{report}");
     if let Some(message) = &report.abort {
         assert!(
-            message.ends_with("forced.slang:17: forced assert, flag %u"),
+            message.ends_with("forced.slang:18: forced assert, flag %u"),
             "{report}"
         );
     }
     let dump = report.crash_dump.as_ref().expect("no crash dump");
     let json = std::fs::read_to_string(dump.with_extension("json")).expect("decoded dump");
     assert!(
-        json.contains("orr_shaders/debug.h:24"),
+        json.contains("orr_debug.h:24"),
         "the dump does not map the abort to orr_assert"
     );
     let served = std::fs::read_dir(dir)

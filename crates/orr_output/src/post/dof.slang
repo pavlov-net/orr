@@ -16,7 +16,7 @@
 // - `median_background`, `median_foreground`: 3x3 medians.
 // - `sprite_mesh`, `sprite_pixel`: highlight sprites added onto both layers.
 // - `composite`: full resolution, writing `target` and, on the guide path, `guide`.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.math;
 import orr_color.luminance;

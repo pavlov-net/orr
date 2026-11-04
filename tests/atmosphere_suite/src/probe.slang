@@ -2,7 +2,7 @@
 // the sky-view LUT integrated over the upper hemisphere, `AtmosphereSky` directly and as
 // lighting bakes it, the night background, a light's disc seen through the atmosphere, and
 // `AtmosphereMedium` as lighting's segments and froxels read it.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.math;
 import orr_color.luminance;
 import orr_scene.lights;

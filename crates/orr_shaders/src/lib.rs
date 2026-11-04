@@ -23,8 +23,5 @@ pub mod openpbr;
 pub use build::{Reload, Watcher};
 pub use module::{EntryPoint, KernelMismatch, KernelSet, Mismatch, PathEntry, ShaderModule, Stage};
 
-/// The directory of orr's shared Slang libraries, imported as `orr_shaders.<name>`.
-pub const LIB_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders");
-
 #[doc(hidden)]
 pub use bytemuck;

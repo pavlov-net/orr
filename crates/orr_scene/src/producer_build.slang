@@ -7,7 +7,7 @@
 // `gather` lists the built CLAS and writes the entry's cluster BLAS record; `finish` keeps
 // the BLAS in the entry's state. One root per entry; every kernel runs one workgroup per
 // entry, so work follows the emitted counts.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.math;
 import orr_scene.producer;

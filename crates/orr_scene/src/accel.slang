@@ -3,7 +3,7 @@
 // stores its CLAS build, or with CLAS_TEMPLATE its cluster template build over the rest
 // positions, bounded by its rest box grown by its deformation bound; `records` stores
 // cluster BLAS and move records from address jobs.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.packing;
 import orr_pack.mesh;

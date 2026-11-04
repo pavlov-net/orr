@@ -15,7 +15,7 @@
 // `gather` writes the CLAS addresses each built BLAS takes and `jobs` its build record. A posed
 // copy of an edit builds a BLAS for its body and one per animated part with clusters in the cut:
 // `split` counts them and `place` gives them their jobs and CLAS ranges.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.math;
 import orr_shaders.trace;

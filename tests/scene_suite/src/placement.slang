@@ -1,6 +1,6 @@
 // Per instance slot: the copy's translation relative to the eye, from its group's anchor
 // and transform, as raster kernels place copies.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_scene.tables;
 import orr_scene.view;
 

@@ -1,6 +1,6 @@
 // The transparency point's composite: the view's premultiplied overlay over its pre-exposed
 // radiance, in place.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 
 public struct CompositeRoot

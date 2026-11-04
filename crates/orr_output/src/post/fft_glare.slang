@@ -17,7 +17,7 @@
 // Row spectra hold nx / 2 + 1 complex values per row and channel, the rest being their
 // conjugates. Past the image, rows and columns repeat its last one out to the kernel's
 // radius and, wrapped around, its first one; the rest are zero.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.math;
 import orr_scene.view;

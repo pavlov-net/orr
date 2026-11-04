@@ -1,7 +1,7 @@
 // A transparency hook's draw of a view's particle clusters: each covered pixel takes the
 // particles' radiance, pre-exposed as the view's lighting is, as an opaque premultiplied
 // color.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_scene.particles;
 
 struct Root

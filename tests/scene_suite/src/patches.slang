@@ -1,7 +1,7 @@
 // Emits a fixed patch mesh into a tessellated entry's patch batch: one thread per cluster
 // copies its vertices, last frame's 0.25 m toward -x where the batch keeps them, and emits it
 // with its own triangles.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_scene.producer;
 import orr_scene.tables;
 

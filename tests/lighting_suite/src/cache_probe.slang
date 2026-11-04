@@ -1,6 +1,6 @@
 // orr_lighting's world cache cell by cell: keys of points, samples added in order by one
 // thread, and every cell's slot as the resolve left it.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_lighting.world_cache;
 
 struct KeyCase

@@ -5,7 +5,7 @@
 // frame's positions go to the batch's previous buffer. Cluster word: the cell's hash, which
 // picks a clump's color; vertex word: height along the blade, 0 at the root and 65535 at
 // the tip.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.math;
 import orr_shaders.random;
 import examples.field;

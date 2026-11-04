@@ -1,6 +1,6 @@
 // The scene pass over directional lights: their states, `Textured` disc integrals, LightIds
 // and summed focus illuminance.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_lighting.media;
 import orr_lighting.light_sampling;
 

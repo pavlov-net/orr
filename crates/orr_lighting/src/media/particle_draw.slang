@@ -1,7 +1,7 @@
 // The stock particle draw for transparency hooks: one mesh workgroup per visible particle
 // cluster, and per covered pixel its surface's base color as albedo, its emission and its
 // opacity, lit and fogged by `particle_shade` and blended premultiplied into the overlay.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_lighting.media;
 import orr_scene.surface;
 import orr_scene.particles;

@@ -1,6 +1,6 @@
 // A screen warp: rotates the source about the image center by an angle that falls to zero
 // at `radius`, sampled bilinearly with clamped edges.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 
 struct Root

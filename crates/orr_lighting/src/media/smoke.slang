@@ -5,7 +5,7 @@
 // read at the triangle's uv centroid. A cluster of two triangles on a shared edge counts as one
 // quad, since two disjoint parts of a cell let through 1 - (c1 + c2) x opacity, not
 // (1 - c1 x opacity) x (1 - c2 x opacity).
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_lighting.media;
 import orr_lighting.froxels;
 import orr_scene.particles;

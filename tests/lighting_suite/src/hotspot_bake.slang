@@ -1,6 +1,6 @@
 // The environment bake with a dim sky and a hot spot of 0.5 deg diameter, centered on a point
 // the bake samples so that the baked map holds it.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_lighting.environment;
 
 struct HotSpot : IEnvironment

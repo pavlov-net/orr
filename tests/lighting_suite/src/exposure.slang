@@ -1,5 +1,5 @@
 // Sets both exposure slots of a view to one pre-exposure, standing in for the output's meter.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_scene.view;
 
 struct Root

@@ -11,7 +11,7 @@
 //
 // The output suite's CPU model (`glare_model/pyramid.rs`) follows these taps and sample
 // positions exactly, on the plane of what `glare_extract` takes from each pixel.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_scene.view;
 import orr_output.glare_lens;

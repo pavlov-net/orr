@@ -1,5 +1,5 @@
 // Reads the linked environment and medium through their data addresses.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_lighting.environment;
 import orr_lighting.media;
 

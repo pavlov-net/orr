@@ -34,4 +34,4 @@ pub use transfer::{
 };
 
 /// The import root of the crate's Slang modules (`orr_color.*`).
-pub const SHADER_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/shaders");
+pub const SHADER_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src");

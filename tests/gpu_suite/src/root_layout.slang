@@ -1,6 +1,6 @@
 // Copies a root with a row-major matrix, and a record with a nested struct at offsets that
 // are not multiples of 16, into a word buffer.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 
 struct Inner
 {

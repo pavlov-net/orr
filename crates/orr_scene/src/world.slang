@@ -1,5 +1,5 @@
 // Moves the scene's lights into the render space of its current render origin.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_scene.lights;
 import orr_scene.tables;
 

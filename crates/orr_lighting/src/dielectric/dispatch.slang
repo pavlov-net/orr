@@ -2,7 +2,7 @@
 // layer before the opaque depth and its path, and the pixel's layer guide. The raygen entry
 // reorders lanes at each coherence point; the compute entry runs the same body without
 // reordering.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.coherence;
 import orr_lighting.environment;
 import orr_lighting.media;

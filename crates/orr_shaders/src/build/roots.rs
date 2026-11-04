@@ -90,6 +90,19 @@ impl Root {
     }
 }
 
+/// The directory of orr_shaders' Slang modules, imported as `orr_shaders.<name>`.
+pub(super) const LIB_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+
+/// The roots of every build: orr_color's and orr_shaders' modules, and orr_shaders' headers, whose
+/// directory holds nothing else so that the search paths give no module a name without its prefix.
+pub(crate) fn library() -> Result<[Root; 3], Error> {
+    Ok([
+        Root::prefixed("orr_color", orr_color::SHADER_DIR).canonical()?,
+        Root::prefixed("orr_shaders", LIB_DIR).canonical()?,
+        Root::plain(Path::new(LIB_DIR).join("include")).canonical()?,
+    ])
+}
+
 /// The roots of a `DEP_*_SHADER_DIRS` value (`;`-separated).
 pub(crate) fn parse_list(list: &str) -> impl Iterator<Item = Root> + '_ {
     list.split(';').filter(|s| !s.is_empty()).map(Root::parse)

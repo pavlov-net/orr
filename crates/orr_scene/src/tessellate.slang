@@ -14,7 +14,7 @@
 // cut it alike: its undisplaced world length in pixels at the scene focus over the dice rate,
 // times the entry's rate scale, over 15 where last frame's first view of the scene saw
 // neither the edge in its frustum nor in front of its HZB.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.atomic;
 import orr_shaders.math;

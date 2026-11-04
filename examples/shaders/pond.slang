@@ -1,7 +1,7 @@
 // Shows a view's dielectric producers over its shaded image: each pixel's camera ray traces
 // the dielectric mask, and where it meets a surface in front of the G-buffer's, the image
 // takes a water tint and a Fresnel share of the sky.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.math;
 import orr_shaders.trace;

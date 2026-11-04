@@ -1,6 +1,6 @@
 // One body behind a raygen and a compute entry, tracing a PTLAS: per ray the hit instance,
 // cluster id, primitive and corner positions, all zero (cluster id -1) on a miss.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.coherence;
 import orr_shaders.trace;

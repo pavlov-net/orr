@@ -1,7 +1,7 @@
 // Decodes a batch of stored pages through orr_pack.page_codec: `copy` over every page's
 // resident dwords, then `decode` with one workgroup per cluster. Group y is the page; each
 // page's status collects both passes' bits.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_pack.page_codec;
 
 struct Root

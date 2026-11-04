@@ -11,14 +11,14 @@ fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let lighting = manifest.join("../../crates/orr_lighting/src");
     let scene = manifest.join("../../crates/orr_scene/src");
-    let pack = manifest.join("../../crates/orr_pack/shaders");
+    let pack = manifest.join("../../crates/orr_pack/src");
     let inputs = manifest.join("../openpbr_ref/gpu");
     let result = CpuLibrary::new()
         .and_then(|b| {
             b.source("slang/bsdf_cpu.slang")
                 .include_as("orr_lighting", &lighting)
                 .include_as("orr_scene", &scene)
-                .include(&pack)
+                .include_as("orr_pack", &pack)
                 .include_as("openpbr_ref", &inputs)
                 .include_as("lighting_math", manifest.join("gpu"))
                 .define("ORR_OPENPBR_ARRAY_LUTS", "1")
@@ -29,7 +29,7 @@ fn main() {
             b.kernels(manifest.join("gpu"))
                 .include_as("orr_lighting", &lighting)
                 .include_as("orr_scene", &scene)
-                .include(&pack)
+                .include_as("orr_pack", &pack)
                 .include_as("openpbr_ref", &inputs)
                 .extern_type("Inputs", "::openpbr_ref::Inputs")
                 .metal_check(true)

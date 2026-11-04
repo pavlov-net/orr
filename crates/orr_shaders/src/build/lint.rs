@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
 
+use super::compile::canonical_lossy;
 use super::layout::Plan;
 use super::model::{Model, Scalar, Ty};
-use super::roots::Root;
+use super::roots::{LIB_DIR, Root};
 use crate::Stage;
 use crate::abi::MAX_INLINE_ROOT_BYTES;
 
@@ -14,7 +15,7 @@ use crate::abi::MAX_INLINE_ROOT_BYTES;
 #[non_exhaustive]
 pub enum Lint {
     /// `root` is the only shader parameter besides specialization constants and the Metal
-    /// bindings of `orr_shaders/abi.slang`: no other globals, no entry-point uniforms.
+    /// bindings of `orr_shaders.abi`: no other globals, no entry-point uniforms.
     SingleRoot,
     /// Root size is a multiple of 16; members are 32/64-bit scalars, 4-vectors, matrices
     /// with 4-wide rows, heap slots, TLAS addresses and pointers, each at its native
@@ -28,13 +29,13 @@ pub enum Lint {
     /// Specialization constants take explicit ids (`[vk::constant_id(N)]`).
     SpecIds,
     /// `DescriptorHandle`, `getDescriptorFromHandle` and `RaytracingAccelerationStructure(`
-    /// appear only in `orr_shaders/abi.slang`.
+    /// appear only in `orr_shaders.abi`.
     HeapTokens,
-    /// `RayQuery` appears only in `orr_shaders/trace.slang`.
+    /// `RayQuery` appears only in `orr_shaders.trace`.
     RayQuery,
-    /// `ReorderThread` and `HitObject` appear only in `orr_shaders/coherence.slang`.
+    /// `ReorderThread` and `HitObject` appear only in `orr_shaders.coherence`.
     Reorder,
-    /// Cooperative-vector names appear only in `orr_shaders/coopvec.slang`.
+    /// Cooperative-vector names appear only in `orr_shaders.coopvec`.
     CoopVec,
     /// Every 64-bit atomic is a max whose result is unused.
     Atomic64,
@@ -50,7 +51,7 @@ pub enum Lint {
     InlineRoot,
     /// In builds with micromaps ([`Build::omm`](super::Build::omm)), every entry point of a
     /// module that traces rays declares the opacity-micromap execution mode with
-    /// `ORR_OMM(entry)` from `orr_shaders/root.h`.
+    /// `ORR_OMM(entry)` from `orr_root.h`.
     Micromap,
     /// The module's compute and mesh-pipeline entries emit MSL, lay out roots and pointees
     /// as the SPIR-V does, and the MSL has none of the constructs Metal rejects: 64-bit
@@ -86,7 +87,7 @@ struct TokenRule {
     prefixes: &'static [&'static str],
     /// Flagged only when followed by `(`.
     calls: &'static [&'static str],
-    /// The one file under `LIB_DIR` allowed to use them.
+    /// The one module of `orr_shaders` allowed to use them.
     home: Option<&'static str>,
 }
 
@@ -96,28 +97,28 @@ const TOKEN_RULES: &[TokenRule] = &[
         exact: &["DescriptorHandle", "getDescriptorFromHandle"],
         prefixes: &[],
         calls: &["RaytracingAccelerationStructure"],
-        home: Some("orr_shaders/abi.slang"),
+        home: Some("abi"),
     },
     TokenRule {
         lint: Lint::RayQuery,
         exact: &["RayQuery"],
         prefixes: &[],
         calls: &[],
-        home: Some("orr_shaders/trace.slang"),
+        home: Some("trace"),
     },
     TokenRule {
         lint: Lint::Reorder,
         exact: &["ReorderThread", "HitObject"],
         prefixes: &[],
         calls: &[],
-        home: Some("orr_shaders/coherence.slang"),
+        home: Some("coherence"),
     },
     TokenRule {
         lint: Lint::CoopVec,
         exact: &[],
         prefixes: &["CoopVec", "coopVec", "OpCooperativeVector"],
         calls: &[],
-        home: Some("orr_shaders/coopvec.slang"),
+        home: Some("coopvec"),
     },
     TokenRule {
         lint: Lint::SpecIds,
@@ -178,7 +179,7 @@ pub(super) fn tokens(src: &str) -> Vec<(&str, u32, bool)> {
 }
 
 /// Token lints over one source file.
-pub(super) fn source_lints(path: &Path, src: &str, lib_dir: &Path) -> Vec<LintError> {
+pub(super) fn source_lints(path: &Path, src: &str) -> Vec<LintError> {
     let mut out = Vec::new();
     for (token, line, call) in tokens(src) {
         for rule in TOKEN_RULES {
@@ -188,14 +189,11 @@ pub(super) fn source_lints(path: &Path, src: &str, lib_dir: &Path) -> Vec<LintEr
             if !hit {
                 continue;
             }
-            if rule
-                .home
-                .is_some_and(|home| same_file(path, &lib_dir.join(home)))
-            {
+            if rule.home.is_some_and(|home| in_library(path, home)) {
                 continue;
             }
             let place = match rule.home {
-                Some(home) => format!("; it belongs in {home}"),
+                Some(home) => format!("; it belongs in orr_shaders.{home}"),
                 None => String::new(),
             };
             out.push(LintError {
@@ -212,11 +210,9 @@ pub(super) fn source_lints(path: &Path, src: &str, lib_dir: &Path) -> Vec<LintEr
     out
 }
 
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    }
+/// Whether `path` is the file of `orr_shaders.<module>`.
+fn in_library(path: &Path, module: &str) -> bool {
+    canonical_lossy(path) == canonical_lossy(&Path::new(LIB_DIR).join(format!("{module}.slang")))
 }
 
 /// Lints read from a compiled module's model and the generated layout.
@@ -224,7 +220,6 @@ pub(super) fn model_lints(
     module: &str,
     model: &Model,
     plans: &HashMap<String, Plan>,
-    lib_dir: &Path,
 ) -> Vec<LintError> {
     let mut out = Vec::new();
     let mut push = |lint, message: String| {
@@ -234,9 +229,8 @@ pub(super) fn model_lints(
             message,
         });
     };
-    let abi = lib_dir.join("orr_shaders/abi.slang");
     for p in &model.stray_params {
-        if p.file.as_deref().is_some_and(|f| same_file(f, &abi)) {
+        if p.file.as_deref().is_some_and(|f| in_library(f, "abi")) {
             continue;
         }
         let place = match &p.entry {

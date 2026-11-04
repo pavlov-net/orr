@@ -1,7 +1,7 @@
 // Media apply: the froxels' in-scatter and transmittance and a march through the medium proxies
 // the pixel's ray crosses, composed with every pixel's radiance, or with the reference, the
 // camera segment marched per pixel.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_lighting.media;
 import orr_scene.surface;
 import orr_lighting.camera_media;

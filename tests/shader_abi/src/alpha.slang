@@ -1,6 +1,6 @@
 // Orthographic rays over the unit square toward +z with the cluster probe's alpha test on
 // non-opaque triangles. Per ray: hit, instance index, primitive and cluster id.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.trace;
 

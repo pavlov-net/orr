@@ -1,5 +1,5 @@
 // Decodes instance records through orr_pack.instance, one thread per record.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_pack.instance;
 
 struct Root

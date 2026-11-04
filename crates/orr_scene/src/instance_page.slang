@@ -1,6 +1,6 @@
 // Writes a cooked instance page's slots from its records once they are resident: each record
 // takes its prototype's instance record and emissive list entries.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_pack.instance;
 import orr_scene.lights;
 import orr_scene.tables;

@@ -1,5 +1,5 @@
 // Bakes the linked environment at the scene focus into lighting's map.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_lighting.environment;
 
 extern struct Environment : IEnvironment = EnvironmentMap;

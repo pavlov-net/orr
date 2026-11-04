@@ -2,7 +2,7 @@
 // i % 16 and row i / 16 of a grid 3 cm above the ground, so no ray starts inside a strand,
 // bending sideways by its own amount and tapering from `radius` to half of it at its tip.
 // Its segments carry the word `base` + i.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_scene.producer;
 import orr_scene.tables;
 

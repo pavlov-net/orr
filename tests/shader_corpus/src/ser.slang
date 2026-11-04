@@ -1,5 +1,5 @@
 // One body, two entries: raygen reorders by a key, compute does not.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import shader_corpus.handles;
 
 struct Root

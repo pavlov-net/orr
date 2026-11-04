@@ -1,6 +1,6 @@
 // Froxel and aerial-perspective slice mappings: each distance to its slice coordinate and
 // back.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_lighting.media;
 
 struct Root

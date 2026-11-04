@@ -380,7 +380,7 @@ fn exp2(k: i8) -> f32 {
     f32::from_bits(((i32::from(k) + 127) as u32) << 23)
 }
 
-/// One page for `orr_pack/page_codec.slang`, which decodes a stored page on the GPU into the
+/// One page for `orr_pack.page_codec`, which decodes a stored page on the GPU into the
 /// bytes [`decode_page`] writes. Addresses are device addresses, both 4-aligned;
 /// `resident_capacity` is the bytes the page may take at `resident`.
 #[repr(C)]

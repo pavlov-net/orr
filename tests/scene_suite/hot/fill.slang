@@ -1,6 +1,6 @@
 // Writes 1 to every element. The build compiles a copy in OUT_DIR, which the hot reload
 // test edits.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 
 struct FillRoot
 {

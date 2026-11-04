@@ -2,7 +2,7 @@
 // each a small octahedron of six vertices, on slow loops around fixed homes within `radius`
 // of the swarm's center, and emits the cluster as the octahedra topology. Last frame's
 // positions go to the batch's previous buffer.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.math;
 import orr_shaders.random;
 import examples.field;

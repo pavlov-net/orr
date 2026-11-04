@@ -25,7 +25,7 @@
 [vk::constant_id(102)] const bool openpbr_enable_translucency = true;
 [vk::constant_id(103)] const bool openpbr_enable_metallic = true;
 
-// Defined in orr_shaders/openpbr.slang.
+// Defined in orr_shaders.openpbr.
 extern float4 orr_openpbr_sample_2d(int id, float2 uv);
 extern float4 orr_openpbr_sample_3d(int id, float3 uvw);
 #define OPENPBR_USE_TEXTURE_LUTS 1

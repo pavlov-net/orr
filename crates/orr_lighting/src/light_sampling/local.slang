@@ -3,7 +3,7 @@
 // the G-buffer's motion. A pixel whose reprojected surface lay at another distance from the
 // camera was hidden then, and adds nothing; the sampler's share falls with the tile's
 // surfaces that found no feedback.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.math;
 import orr_scene.lights;

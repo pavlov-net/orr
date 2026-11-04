@@ -1,7 +1,7 @@
 // A path tracer through alpha-tested foliage with one body and two entries: the raygen entry
 // reorders by hit material after each traversal, the compute entry does not. Each pixel
 // writes its radiance and a hash of every segment's hit. Built with `-fp-mode precise`.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.coherence;
 import orr_shaders.math;

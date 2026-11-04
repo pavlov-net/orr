@@ -2,7 +2,7 @@
 // or the sky color where nothing was drawn, scaled by a uniform draw in [0, 2) from the
 // pixel's sampler. The mean over frames is the flat color; the noise follows the seed. Alpha is
 // 1 where a surface was drawn and 0 for sky.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.random;
 import orr_scene.gbuffer;

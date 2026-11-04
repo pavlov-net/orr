@@ -2,7 +2,7 @@
 // one transform per part. Each joint leans downwind about its pivot by its bend times the
 // gust, sways across the wind and flutters, and is carried by its parent, so deeper parts
 // ride on the parts below them. A gust front crosses the tree along the wind.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.math;
 import orr_scene.tables;
 

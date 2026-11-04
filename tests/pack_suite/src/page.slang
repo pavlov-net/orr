@@ -1,6 +1,6 @@
 // Reads a resident mesh page through orr_pack.mesh: one workgroup per cluster, one thread
 // per vertex and triangle slot.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_pack.mesh;
 import orr_shaders.packing;
 

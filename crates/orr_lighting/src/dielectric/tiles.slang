@@ -1,5 +1,5 @@
 // The tiles a view's dielectric dispatch traces, and its indirect arguments.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_lighting.dielectric;
 
 ORR_ROOT(LayerTilesRoot);

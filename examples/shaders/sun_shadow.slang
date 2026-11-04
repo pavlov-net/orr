@@ -1,7 +1,7 @@
 // Shades a view's G-buffer under a sun and a uniform sky. Each lit pixel traces one shadow
 // ray toward the sun through the scene's TLAS; alpha-tested triangles cast shadows through
 // their material's coverage. Writes display-linear Rec.709, 1.0 at paper white.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_color.primaries;
 import orr_shaders.math;

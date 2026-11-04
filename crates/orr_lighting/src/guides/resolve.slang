@@ -1,5 +1,5 @@
 // The guide resolve: every ray reconstruction guide of one view.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_scene.surface;
 import orr_lighting.guides;
 

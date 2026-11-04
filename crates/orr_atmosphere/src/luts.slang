@@ -1,7 +1,7 @@
 // The atmosphere's LUT passes: transmittance, multiple scattering and ground irradiance after
 // each `set`, then the fold and the sky-view LUTs every frame. Each pass runs the wavelength
 // groups three at a time.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.math;
 import orr_color.luminance;

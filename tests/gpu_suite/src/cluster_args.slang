@@ -1,6 +1,6 @@
 // Writes `n` rtas records of one kind from CPU-written logical records, resolving addresses
 // that earlier operations produced on the GPU through `table`, and the record count.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_gpu.rtas;
 
 static const uint OP_CLAS = 0;

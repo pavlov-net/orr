@@ -1,7 +1,7 @@
 // Debug check before a PTLAS build: more commands than the build allows, an unknown op or a
 // second command of one op type rejects the whole build. The command count becomes 0 and
 // `failures` counts the rejection.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 
 struct Root
 {

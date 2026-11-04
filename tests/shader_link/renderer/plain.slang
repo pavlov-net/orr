@@ -1,5 +1,5 @@
 // Declares no link point, so linking leaves it out of the kernel set.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 
 struct PlainRoot
 {

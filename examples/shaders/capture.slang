@@ -1,6 +1,6 @@
 // Encodes a display-linear Rec.709 image, 1.0 at paper white, as clamped 8-bit sRGB RGBA in
 // rows, for headless captures.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.packing;
 import orr_shaders.abi;
 import orr_color.transfer;

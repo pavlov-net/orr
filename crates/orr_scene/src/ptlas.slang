@@ -31,7 +31,7 @@
 // steps, a part instance of its own (a run of one, named in `part_slots` with COPY_FAR)
 // traces the farther step's cached cut, and both are written non-opaque so hits test the
 // fade. Chain work is mandatory, so ray tracing changes step in the frame the raster does.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.math;
 import orr_shaders.trace;

@@ -1,7 +1,7 @@
 // Next-event candidates at one vertex: a histogram of directional candidates over
 // equal-solid-angle bins of each light's cone, one bin for tile candidates and one for empty
 // ones; checks of each candidate; and the directional probabilities at a set of normals.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.math;
 import orr_shaders.random;
 import orr_scene.lights;

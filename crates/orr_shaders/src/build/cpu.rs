@@ -49,7 +49,7 @@ impl CpuLibrary {
         Ok(Self {
             lib: super::toolchain::load()?,
             sources: Vec::new(),
-            includes: vec![Root::plain(orr_color::SHADER_DIR)],
+            includes: Vec::new(),
             defines: Vec::new(),
             links: Vec::new(),
             out_dir: None,
@@ -62,8 +62,8 @@ impl CpuLibrary {
         self
     }
 
-    /// One more import root. [`LIB_DIR`](crate::LIB_DIR) and `orr_color`'s Slang root are always
-    /// present, and so is [`openpbr_dir`](super::openpbr_dir) when it is found.
+    /// One more import root. `orr_shaders`' and `orr_color`'s Slang roots are always present, and
+    /// so is [`openpbr_dir`](super::openpbr_dir) when it is found.
     pub fn include(mut self, dir: impl AsRef<Path>) -> Self {
         self.includes.push(Root::plain(dir.as_ref()));
         self
@@ -113,7 +113,7 @@ impl CpuLibrary {
             .iter()
             .map(Root::canonical)
             .collect::<Result<Vec<_>, Error>>()?;
-        import_roots.push(Root::plain(canonical(Path::new(crate::LIB_DIR))?));
+        import_roots.extend(roots::library()?);
         import_roots.extend(super::openpbr_dir().ok().map(Root::plain));
         let links = link::resolve(&self.links, &import_roots)?;
         import_roots.extend(link::module_dirs(&links));

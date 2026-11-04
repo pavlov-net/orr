@@ -1,6 +1,6 @@
 // Writes a device-generated sequence per non-empty bin, picking the bin's pipeline and root,
 // and the indirect dispatch arguments of every bin for the CPU-recorded form.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_gpu.sequence;
 
 struct Root

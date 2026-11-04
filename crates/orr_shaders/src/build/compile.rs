@@ -65,7 +65,7 @@ pub enum DebugInfo {
     Separate,
 }
 
-/// The session option of builds with micromaps, which `orr_shaders/root.h` and
+/// The session option of builds with micromaps, which `orr_root.h` and
 /// `orr_shaders.trace` test.
 const OMM_OPTION: &str = "-DORR_OMM_BUILD";
 
@@ -108,7 +108,7 @@ impl Build {
             lib: super::toolchain::load()?,
             kernels: None,
             prefix: None,
-            includes: vec![Root::plain(orr_color::SHADER_DIR)],
+            includes: Vec::new(),
             deps: Vec::new(),
             externs: BTreeMap::new(),
             debug_info: match env::var("ORR_SHADER_DEBUG_INFO").as_deref() {
@@ -149,7 +149,7 @@ impl Build {
     }
 
     /// One more import root whose modules are imported by their path under it.
-    /// [`LIB_DIR`](crate::LIB_DIR) and `orr_color`'s Slang root are always present, and so is
+    /// `orr_shaders`' and `orr_color`'s Slang roots are always present, and so is
     /// [`openpbr_dir`](super::openpbr_dir) when it is found.
     pub fn include(mut self, dir: impl AsRef<Path>) -> Self {
         self.includes.push(Root::plain(dir.as_ref()));
@@ -258,7 +258,7 @@ impl Build {
         self
     }
 
-    /// Builds with opacity micromaps: `ORR_OMM(entry)` from `orr_shaders/root.h` declares the
+    /// Builds with opacity micromaps: `ORR_OMM(entry)` from `orr_root.h` declares the
     /// micromap execution mode on the entry points of ray-query modules, and
     /// `RAY_FLAG_FORCE_OPACITY_MICROMAP_2_STATE` reaches the ray queries. Pipelines from
     /// these modules need a device with micromaps. Without, both drop out and alpha-tested
@@ -333,7 +333,6 @@ impl Build {
             }
         }
         let out_dir = out_dir(self.out_dir.as_deref())?;
-        let lib_dir = canonical_lossy(Path::new(crate::LIB_DIR));
         let own_root = self.kernels.as_deref().map(canonical).transpose()?;
         let prefix = self
             .prefix
@@ -348,14 +347,12 @@ impl Build {
             .collect();
         for root in &self.includes {
             let root = root.canonical()?;
-            if !roots.contains(&root) && root.dir != lib_dir {
+            if !roots.contains(&root) {
                 roots.push(root);
             }
         }
         let shader_dirs = roots::format_list(&roots);
-        if lib_dir.is_dir() {
-            roots.push(Root::plain(&lib_dir));
-        }
+        roots.extend(roots::library()?);
         let mut lint_roots = roots.clone();
         roots.extend(super::openpbr_dir().ok().map(Root::plain));
 
@@ -445,7 +442,7 @@ impl Build {
                 if seen_files.insert(input.clone())
                     && let Ok(src) = fs::read_to_string(input)
                 {
-                    lints.extend(lint::source_lints(input, &src, &lib_dir));
+                    lints.extend(lint::source_lints(input, &src));
                 }
             }
         }
@@ -500,19 +497,14 @@ impl Build {
                 }
             }
             let module_plans = plan(name, &model)?;
-            lints.extend(lint::model_lints(name, &model, &module_plans, &lib_dir));
+            lints.extend(lint::model_lints(name, &model, &module_plans));
             plans.insert(name.clone(), module_plans);
             models.insert(name.clone(), model);
         }
         let mut linked_plans: HashMap<String, HashMap<String, Plan>> = HashMap::new();
         for (name, record) in &linked_modules {
             let module_plans = plan(name, &record.model)?;
-            lints.extend(lint::model_lints(
-                name,
-                &record.model,
-                &module_plans,
-                &lib_dir,
-            ));
+            lints.extend(lint::model_lints(name, &record.model, &module_plans));
             linked_plans.insert(name.clone(), module_plans);
         }
 
@@ -1455,7 +1447,7 @@ fn metal_issues(
 /// The [`Lint::Micromap`] message for `entry`.
 pub(super) fn no_omm_mode(entry: &str) -> String {
     format!(
-        "entry point {entry} traces rays without the opacity-micromap mode; begin it with `ORR_OMM({entry});` from orr_shaders/root.h"
+        "entry point {entry} traces rays without the opacity-micromap mode; begin it with `ORR_OMM({entry});` from orr_root.h"
     )
 }
 

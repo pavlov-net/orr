@@ -1,6 +1,6 @@
 // Calls orr_output's math, so the build compiles it to SPIR-V (validated) and MSL under
 // the lints and generates the Rust layout of Gt7Curve.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_output.gt7;
 import orr_output.exposure;
 

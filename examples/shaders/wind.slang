@@ -1,7 +1,7 @@
 // Wind on a stand of trees: writes every pose of a GPU-written pose group, one block of
 // `parts` transforms per copy. Branch p of a copy tilts about its axis through its base, in
 // gusts phase-offset by copy and branch; part 0, the trunk, stays at rest.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.math;
 import orr_scene.tables;
 

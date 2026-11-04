@@ -3,7 +3,7 @@
 // glare, its local exposure, its white balance, the grade, then GT7, or one of the debug
 // views. With lens distortion on it also composes the lens's map into frame generation's
 // distortion field.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_color.luminance;
 import orr_color.primaries;

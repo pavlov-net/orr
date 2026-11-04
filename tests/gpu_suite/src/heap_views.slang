@@ -1,6 +1,6 @@
 // Writes a pattern through a storage view, then point-samples it through a sampled view of
 // the same texture at texel centers.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 
 struct Root

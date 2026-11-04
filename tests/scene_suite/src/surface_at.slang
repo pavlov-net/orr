@@ -1,5 +1,5 @@
 // `load_gsurface` at every pixel of a view's G-buffer.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_scene.gbuffer;
 import orr_scene.material;
 import orr_scene.tables;

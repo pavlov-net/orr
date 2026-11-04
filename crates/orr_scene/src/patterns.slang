@@ -1,6 +1,6 @@
 // The CLAS templates of the tessellation patterns: one thread per pattern and opacity
 // writes its template build record over the moment-curve positions, opaque templates first.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_gpu.rtas;
 import orr_scene.tessellation;

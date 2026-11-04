@@ -7,7 +7,7 @@
 // rest positions for its previous positions) and writes the instantiation
 // of its cluster template; after the builds `finish` keeps each copy's BLAS. A copy
 // skins its clusters whether or not a view shows it; one inside `rt_range` is traced.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_shaders.math;
 import orr_shaders.packing;

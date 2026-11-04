@@ -1,6 +1,6 @@
 // A compute pass paints a texture through a storage view; a mesh pass draws a textured,
 // lit cube that samples it through a sampled view.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.math;
 import orr_shaders.abi;
 

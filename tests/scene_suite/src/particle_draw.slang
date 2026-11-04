@@ -1,6 +1,6 @@
 // A transparency hook's draw of a view's particle clusters: each covered pixel takes its
 // hit's cluster word and first two vertex words as an opaque premultiplied color.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_scene.particles;
 import orr_scene.surface;
 

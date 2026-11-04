@@ -1,6 +1,6 @@
 // Calls every function of orr's math libraries, so the build compiles them to SPIR-V
 // (validated) and MSL under the lints.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.math;
 import orr_shaders.packing;
 import orr_shaders.random;

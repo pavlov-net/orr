@@ -1,6 +1,6 @@
 // The light set's selection, per-entry cluster CDFs and presampled light tiles, after the
 // environment's pyramid and the directional pass.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.math;
 import orr_color.chromaticity;
 import orr_color.luminance;

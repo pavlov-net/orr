@@ -275,7 +275,7 @@ fn spirv_validation_runs_in_process() {
 #[test]
 fn an_inline_root_generates_its_rust_type() {
     let src = "struct Root { float4* out; uint count; uint pad; }\n\
-        #include \"orr_shaders/root.h\"\nORR_ROOT_INLINE(Root);\n\
+        #include \"orr_root.h\"\nORR_ROOT_INLINE(Root);\n\
         [shader(\"compute\")] [numthreads(1, 1, 1)] void main() { root.out[root.count] = float4(0.0); }\n";
     let dir = fixture("inline-root", &[("src/k.slang", src)]);
     build(&dir).compile().unwrap_or_else(|e| panic!("{e}"));
@@ -355,7 +355,7 @@ fn omm_builds_declare_the_mode_on_every_ray_query_entry() {
     const OMM_MODE_ID: u32 = 6031;
     let src = |compute_mode: &str| {
         format!(
-            "#include \"orr_shaders/root.h\"\nimport orr_shaders.abi;\nimport orr_shaders.trace;\n\
+            "#include \"orr_root.h\"\nimport orr_shaders.abi;\nimport orr_shaders.trace;\n\
             struct Root {{ uint* out; Tlas scene; }}\nORR_ROOT_INLINE(Root);\n\
             void body(uint2 i) {{\n\
             RayDesc r; r.Origin = float3(i, 0); r.Direction = float3(0, 0, 1); r.TMin = 0; r.TMax = 1;\n\
@@ -780,7 +780,7 @@ fn separate_debug_info_strips_the_module_into_a_sidecar() {
     const DEBUG_BUILD_IDENTIFIER: u32 = 105;
     // A precompiled import, and an array in a pointee, which the model knows by its SPIR-V
     // wrapper struct's name.
-    let src = "#include \"orr_shaders/debug.h\"\n\
+    let src = "import orr_shaders.debug;\n#include \"orr_debug.h\"\n\
         struct Rec { uint3 a[2]; uint b; }\n\
         struct Root { Rec* recs; uint count; uint pad; }\n\
         [[vk::binding(0, 0)]] ConstantBuffer<Root> root;\n\
@@ -839,7 +839,7 @@ fn orr_assert_aborts_with_its_location_only_when_asserts_are_linked() {
     const OP_CONSTANT_COMPOSITE: u32 = 44;
     const OP_ABORT: u32 = 5121;
     let src = format!(
-        "#include \"orr_shaders/debug.h\"\n{}",
+        "import orr_shaders.debug;\n#include \"orr_debug.h\"\n{}",
         kernel(
             "orr_assert(id.x < root.count, \"thread %u past %u\", id.x, root.count);\n root.out[id.x] = float4(id.x);"
         )
@@ -881,7 +881,7 @@ fn orr_assert_aborts_with_its_location_only_when_asserts_are_linked() {
     let text = literal(&text);
     let kernel_path = dir.join("src/k.slang").canonicalize().unwrap();
     let file = text
-        .strip_suffix(":5: thread %u past %u")
+        .strip_suffix(":6: thread %u past %u")
         .unwrap_or_else(|| panic!("{text}"));
     assert_eq!(Path::new(file).canonicalize().unwrap(), kernel_path);
 }

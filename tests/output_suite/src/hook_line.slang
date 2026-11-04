@@ -1,6 +1,6 @@
 // A debug overlay: one row and one column at a fixed reverse-Z depth, drawn only where it is
 // nearer than the hook's depth.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 
 struct Root

@@ -1,5 +1,5 @@
 // The baked environment's mean and importance pyramid.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_color.luminance;
 import orr_lighting.environment;
 

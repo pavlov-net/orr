@@ -1,6 +1,6 @@
 // The opaque dispatch: one path per G-buffer pixel. The raygen entry reorders lanes at each
 // coherence point; the compute entry runs the same body without reordering.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.coherence;
 import orr_lighting.environment;
 import orr_lighting.media;

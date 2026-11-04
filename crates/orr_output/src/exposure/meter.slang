@@ -2,7 +2,7 @@
 // layout), with each bin's chromaticity sums on request, and on request into local
 // exposure's grid. Pixels that are black or not finite are left out of both, and masked out
 // ones out of the histogram.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_color.chromaticity;
 import orr_color.primaries;

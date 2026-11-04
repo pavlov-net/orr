@@ -1,6 +1,6 @@
 // Writes a test card into a swapchain image in its output encoding: a gray ramp to paper
 // white, color bars, a ramp to 10x paper white and a moving bar that shows tearing.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_color.primaries;
 import orr_color.transfer;

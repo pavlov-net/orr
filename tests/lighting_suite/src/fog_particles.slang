@@ -1,5 +1,5 @@
 // orr_lighting's particle draw through the stock height fog.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_lighting.media;
 import orr_scene.surface;
 import orr_scene.particles;

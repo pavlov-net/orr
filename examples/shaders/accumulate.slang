@@ -1,7 +1,7 @@
 // Averages a still view's radiance over frames, as a scene-referred hook: adds this frame's
 // radiance, divided by its pre-exposure, to a running sum and writes the mean back,
 // pre-exposed again.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.abi;
 import orr_scene.view;
 

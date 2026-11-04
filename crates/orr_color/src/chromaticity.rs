@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn slang_cat16_is_the_rust_one_and_its_inverse() {
-        let slang = include_str!("../shaders/orr_color/chromaticity.slang");
+        let slang = include_str!("chromaticity.slang");
         let matrix = |name: &str| {
             let at = slang.find(&format!("{name} = float3x3(")).unwrap();
             let body = &slang[at + name.len() + " = float3x3(".len()..];

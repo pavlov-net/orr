@@ -1,7 +1,7 @@
 // The world cache's update paths for one view: one path per block of pixels. The raygen
 // entry reorders lanes at each coherence point; the compute entry runs the same body
 // without reordering.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.coherence;
 import orr_lighting.media;
 import orr_scene.surface;

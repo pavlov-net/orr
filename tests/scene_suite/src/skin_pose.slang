@@ -2,7 +2,7 @@
 // thread per copy samples the clip `time + copy x phase` seconds in, chains the joints'
 // local transforms into model space in the group's own entries, then turns each into its
 // palette entry with the skeleton's inverse bind.
-#include "orr_shaders/root.h"
+#include "orr_root.h"
 import orr_shaders.math;
 import orr_pack.skeleton;
 import orr_scene.tables;
