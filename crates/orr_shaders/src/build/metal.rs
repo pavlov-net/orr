@@ -299,32 +299,73 @@ pub(super) fn primitive_culled(msl: &str) -> String {
 /// `msl` with its ray queries traversing three instancing levels: the Metal backend stands
 /// in for a cluster BLAS with an instance structure over one BLAS per cluster, under the
 /// TLAS. Slang has no way to ask for it. Instance IDs then take a depth: 0, the TLAS's.
-pub(super) fn multi_level(msl: &str) -> String {
+/// Fails when a query or an instance ID read is left as Slang wrote it, which means Slang's
+/// MSL changed shape and the rewrite needs updating.
+pub(super) fn multi_level(msl: &str) -> Result<String, String> {
     let mut out = msl.replace(
         "raytracing::triangle_data, raytracing::instancing>",
         "raytracing::triangle_data, raytracing::instancing, raytracing::max_levels<3>>",
     );
+    let mut reads = Vec::new();
     for access in ["candidate", "committed"] {
         for id in ["instance_id", "user_instance_id"] {
-            out = out.replace(
-                &format!("get_{access}_{id}()"),
-                &format!("get_{access}_{id}(0)"),
-            );
+            let read = format!("get_{access}_{id}(");
+            out = out.replace(&format!("{read})"), &format!("{read}0)"));
+            reads.push(read);
         }
     }
-    out
+    let queries = out.matches("intersection_query<").count();
+    let rewritten = out.matches("raytracing::max_levels<3>>").count();
+    if queries != rewritten {
+        return Err(format!(
+            "{} of {queries} intersection queries are not `intersection_query<raytracing::triangle_data, raytracing::instancing>`, which the multi-level rewrite expects",
+            queries - rewritten.min(queries)
+        ));
+    }
+    if let Some(read) = reads.iter().find(|r| {
+        out.match_indices(r.as_str())
+            .any(|(i, _)| !out[i + r.len()..].starts_with("0)"))
+    }) {
+        return Err(format!(
+            "`{read}` takes arguments the multi-level rewrite does not expect"
+        ));
+    }
+    Ok(out)
 }
 
-/// Compiles the MSL at `metal` into the library `out` with Xcode's Metal compiler. The error
-/// holds the compiler's error lines. Math is `safe`, as SPIR-V's: Metal's default `fast`
-/// assumes no NaNs or infinities and reassociates. Nothing fuses into FMAs either, since
-/// fusing differs between call sites and kernels rely on evaluating one expression to the
-/// same bits everywhere (tessellated edges two patches share).
-pub(super) fn compile_library(metal: &Path, out: &Path) -> Result<(), String> {
+/// The SDK whose Metal compiler builds libraries for the target Cargo builds for: `None`
+/// off Apple targets.
+pub(super) fn target_sdk() -> Option<&'static str> {
+    let var = |name: &str| std::env::var(name).unwrap_or_default();
+    if var("CARGO_CFG_TARGET_VENDOR") != "apple" {
+        return None;
+    }
+    let sim = var("CARGO_CFG_TARGET_ABI") == "sim";
+    Some(match var("CARGO_CFG_TARGET_OS").as_str() {
+        "ios" if var("CARGO_CFG_TARGET_ABI") == "macabi" => "macosx",
+        "ios" if sim => "iphonesimulator",
+        "ios" => "iphoneos",
+        "tvos" if sim => "appletvsimulator",
+        "tvos" => "appletvos",
+        "visionos" if sim => "xrsimulator",
+        "visionos" => "xros",
+        "watchos" if sim => "watchsimulator",
+        "watchos" => "watchos",
+        _ => "macosx",
+    })
+}
+
+/// Compiles the MSL at `metal` into the library `out` with the Metal compiler of Xcode's
+/// `sdk` ([`target_sdk`]). The error holds the compiler's error lines. Math is `safe`, as
+/// SPIR-V's: Metal's default `fast` assumes no NaNs or infinities and reassociates. Nothing
+/// fuses into FMAs either, since fusing differs between call sites and kernels rely on
+/// evaluating one expression to the same bits everywhere (tessellated edges two patches
+/// share).
+pub(super) fn compile_library(metal: &Path, out: &Path, sdk: &str) -> Result<(), String> {
     let output = Command::new("xcrun")
         .args([
             "-sdk",
-            "macosx",
+            sdk,
             "metal",
             "-std=metal4.0",
             "-fmetal-math-mode=safe",
