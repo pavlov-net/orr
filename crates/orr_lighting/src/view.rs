@@ -26,7 +26,7 @@ use crate::shaders::types::{
     ParticleLighting, PathRoot,
 };
 use crate::shaders::world_cache::update;
-use crate::subsurface::{CapTailTable, SSS_STEPS, SubsurfaceDepth};
+use crate::subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 use crate::{BsdfTables, Error, KernelSet, PathEntry, SceneLighting, module, pipeline};
 
 /// Lighting settings of one view, passed with every render of it.
@@ -872,7 +872,7 @@ struct SupportKernels {
     overlay_resolve: ComputePipeline,
     local: ComputePipeline,
     media: MediaKernels,
-    cap_tail: CapTailTable,
+    subsurface_table: SubsurfaceTable,
 }
 
 impl SupportKernels {
@@ -896,7 +896,7 @@ impl SupportKernels {
             overlay_resolve: pipeline(device, kernels, &overlay_front::MODULE, "resolve")?,
             local: pipeline(device, kernels, &local::MODULE, "main")?,
             media: MediaKernels::new(device, kernels)?,
-            cap_tail: CapTailTable::new(device)?,
+            subsurface_table: SubsurfaceTable::new(device)?,
         })
     }
 }
@@ -1276,7 +1276,7 @@ impl LightingKernels {
             sss_max_steps: lighting
                 .sss_max_steps
                 .clamp(*SSS_STEPS.start(), *SSS_STEPS.end()),
-            cap_tail: self.support.cap_tail.gpu(),
+            subsurface_table: self.support.subsurface_table.gpu(),
             sss_flags: match lighting.sss_depth {
                 SubsurfaceDepth::FirstEvent => 0,
                 SubsurfaceDepth::PrimaryOnly => SSS_PRIMARY_ONLY,

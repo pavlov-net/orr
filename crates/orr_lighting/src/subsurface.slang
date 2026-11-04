@@ -5,9 +5,9 @@
 // channels, and traces one closest-hit query no longer than that distance. Scattering
 // follows Henyey-Greenstein. What a step reaching a surface does is up to the `IWalkTrace`: it
 // ends the walk there, ends it with nothing, reflects it back or lets it leave through the
-// surface. A walk that takes `max_steps` steps without leaving stops there and keeps the cap
-// tail's share of what it would yet carry out. A caller may run a walk's steps in several calls,
-// with a coherence point between them.
+// surface. A walk that takes `max_steps` steps without leaving stops there and keeps the
+// subsurface table's share of what it would yet carry out. A caller may run a walk's steps in
+// several calls, with a coherence point between them.
 module subsurface;
 
 import orr_shaders.abi;
@@ -34,7 +34,7 @@ public static const uint WALK_POINT_STEPS = 8;
 // 2^k; anisotropy `j` is tanh(x) for x from -atanh(`g_max`) to atanh(`g_max`) in even steps;
 // albedo `i` is 1 - s^4 for s = i / (`albedos` - 1); IOR `e`, against the outside's, has
 // 1 - 1/ior^2 = `ior_share_max` x e / (`iors` - 1).
-public struct CapTail
+public struct SubsurfaceTableGpu
 {
     public float* values;
     public uint albedos;
@@ -105,7 +105,7 @@ public struct Walk
     }
 }
 
-float table_value(CapTail* t, uint e, uint k, uint j, uint i)
+float table_value(SubsurfaceTableGpu* t, uint e, uint k, uint j, uint i)
 {
     return t.values[((e * t.caps + k) * t.anisotropies + j) * t.albedos + i];
 }
@@ -123,10 +123,11 @@ float lerp_index(float x, uint n, out uint i)
     return c - float(i);
 }
 
-// The cap tail for per-channel single-scattering `albedo`, anisotropy `g`, step cap `cap` and
-// the surface's `ior` against the outside's, interpolated linearly between table entries;
-// values outside the table take its nearest.
-public float3 cap_tail(CapTail* t, float3 albedo, float g, uint cap, float ior)
+// The share of its throughput a walk stopped at step cap `cap` would yet carry out, for
+// per-channel single-scattering `albedo`, anisotropy `g` and the surface's `ior` against the
+// outside's, interpolated linearly between table entries; values outside the table take its
+// nearest.
+public float3 capped_walk_share(SubsurfaceTableGpu* t, float3 albedo, float g, uint cap, float ior)
 {
     uint e, k, j;
     float fe = lerp_index(max(1.0 - 1.0 / (ior * ior), 0.0) / t.ior_share_max * float(t.iors - 1), t.iors, e);
@@ -180,7 +181,7 @@ public Walk walk_start(float3 origin, float3 dir, SubsurfaceVolume volume, float
 
 // Runs up to `steps` more steps of running walk `e`, at most `max_steps` in all, each traced
 // through `tracer`, and counts its queries in `rays`.
-public void walk_steps<T : IWalkTrace>(inout Walk e, T tracer, uint steps, CapTail* tail, uint max_steps, inout uint rays)
+public void walk_steps<T : IWalkTrace>(inout Walk e, T tracer, uint steps, SubsurfaceTableGpu* table, uint max_steps, inout uint rays)
 {
     float3 sigma = max(e.volume.extinction, float3(1e-30));
     // The densities against the least attenuated channel, so the hero channel's term stays
@@ -235,7 +236,7 @@ public void walk_steps<T : IWalkTrace>(inout Walk e, T tracer, uint steps, CapTa
     }
     if (e.step == max_steps)
     {
-        e.throughput *= cap_tail(tail, e.volume.albedo, e.volume.anisotropy, max_steps, e.ior);
+        e.throughput *= capped_walk_share(table, e.volume.albedo, e.volume.anisotropy, max_steps, e.ior);
         e.kind = all(e.throughput == 0.0) ? WALK_NONE : WALK_CAP;
     }
 }

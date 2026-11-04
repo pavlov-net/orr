@@ -1,7 +1,7 @@
 //! The subsurface walk against openpbr_ref's CPU walk: in analytic slabs through
-//! `walk_probe.slang` (the walk alone, its cap tail and its numerics), and through the opaque
-//! path on the bed's slabs and spheres (entry, exit and geometry), and the dielectric dispatch
-//! on spheres with dense scattering interiors.
+//! `walk_probe.slang` (the walk alone, its subsurface table and its numerics), and through the
+//! opaque path on the bed's slabs and spheres (entry, exit and geometry), and the dielectric
+//! dispatch on spheres with dense scattering interiors.
 
 use lighting_suite::bed::{
     Accumulated, Bed, DenseInterior, EXTENT, FURNACE_RADIANCE, Item, JADE, JADE_SPHERE, MILK,
@@ -15,8 +15,8 @@ use openpbr_ref::walk::{
 };
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::{
-    CapTailTable, DirectionalLight, DiscProfile, Light, LightingDebugView, PathEntry,
-    ReferenceSettings, ViewLighting,
+    DirectionalLight, DiscProfile, Light, LightingDebugView, PathEntry, ReferenceSettings,
+    SubsurfaceTable, ViewLighting,
 };
 use orr_math::{DVec3, Mat3, Vec3};
 
@@ -50,7 +50,7 @@ impl Case {
 /// Per case, the mean throughput leaving through the slab's top and the walks whose
 /// throughput was not finite, over `walks` walks per lane.
 fn probe(cases: &[Case], walks: u32) -> Vec<(DVec3, u32)> {
-    let tail = CapTailTable::new(device()).unwrap();
+    let table = SubsurfaceTable::new(device()).unwrap();
     let module = pipeline(&walk_probe::MODULE, "main");
     let gpu_cases: Vec<walk_probe::WalkCase> = cases
         .iter()
@@ -71,7 +71,7 @@ fn probe(cases: &[Case], walks: u32) -> Vec<(DVec3, u32)> {
         &[walk_probe::Root {
             cases: input.gpu(),
             sums: sums.gpu(),
-            tail: tail.gpu(),
+            table: table.gpu(),
             walks,
             seed: 7,
         }],
@@ -139,7 +139,7 @@ fn walks_match_the_cpu_walk_from_a_quarter_to_16_mean_free_paths() {
 }
 
 #[test]
-fn the_cap_tail_keeps_what_capped_walks_would_carry_out() {
+fn the_subsurface_table_keeps_what_capped_walks_would_carry_out() {
     let mut cases = Vec::new();
     for color in [0.8f32, 0.9] {
         for anisotropy in [0.0f32, 0.8] {
@@ -474,12 +474,12 @@ fn dense_interiors_walk_as_the_cpu_walk_does() {
     assert_clean();
 }
 
-/// A walk stopped at the default step cap leaves at its entry with the cap tail's share of what
-/// it would yet carry out through the Fresnel surface. The tail is that of a half space entered
-/// from every angle of view, which this sphere, many diffusion lengths in radius, stays within
-/// 12% of; without it the milk sphere is a third darker.
+/// A walk stopped at the default step cap leaves at its entry with the subsurface table's share
+/// of what it would yet carry out through the Fresnel surface. The table is that of a half space
+/// entered from every angle of view, which this sphere, many diffusion lengths in radius, stays
+/// within 12% of; without it the milk sphere is a third darker.
 #[test]
-fn capped_interior_walks_keep_the_cap_tail() {
+fn capped_interior_walks_keep_the_table_share() {
     let mut paths = Paths::new(
         &KernelSet::default(),
         PathEntry::Compute,
@@ -552,7 +552,7 @@ fn reordering_inside_walks_changes_no_path() {
     assert_clean();
 }
 
-/// With the default cap, so the cap tail takes part.
+/// With the default cap, so the subsurface table takes part.
 fn a_furnace_sphere_returns_the_subsurface_color(paths: &Paths) {
     let (eye, target, fov_y) = (Vec3::new(0.0, 0.0, 4.0), Vec3::ZERO, 0.6);
     let spec = Spec {

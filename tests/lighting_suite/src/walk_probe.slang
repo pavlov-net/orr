@@ -45,7 +45,7 @@ struct Root
 {
     WalkCase* cases;
     float4* sums;               // per case and lane: top throughput rgb, non-finite walks
-    CapTail* tail;
+    SubsurfaceTableGpu* table;
     uint walks;                 // per lane
     uint seed;
 }
@@ -75,7 +75,7 @@ void main(uint3 id: SV_DispatchThreadID)
         uint rays = 0;
         Walk e = walk_start(float3(0.0), float3(0.0, 0.0, -1.0), volume, 1.0, rng);
         while (e.kind == WALK_RUNNING)
-            walk_steps(e, slab, WALK_POINT_STEPS, root.tail, c.max_steps, rays);
+            walk_steps(e, slab, WALK_POINT_STEPS, root.table, c.max_steps, rays);
         if (!all(isfinite(e.throughput)))
             bad += 1.0;
         else if (e.kind == WALK_CAP || (e.kind == WALK_BOUNDARY && e.dir.z > 0.0))

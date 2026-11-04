@@ -39,6 +39,7 @@ mod media;
 mod particles;
 mod scene;
 mod subsurface;
+mod subsurface_table;
 mod view;
 mod world_cache;
 
@@ -57,7 +58,7 @@ pub use scene::{
 pub use shaders::types::{
     DirectionalState, EmissiveSelection, LightSample, LightSetGpu, ParticleLighting, WorldCacheGpu,
 };
-pub use subsurface::{CapTailTable, SSS_STEPS, SubsurfaceDepth};
+pub use subsurface::{SSS_STEPS, SubsurfaceDepth, SubsurfaceTable};
 pub use view::{
     CameraJump, CompilingKernels, DofBackgroundPass, GuideKind, GuideSettings, LightingDebugView,
     LightingKernels, LightingView, MAX_LOCAL_LIGHT_SHARE, MIN_PIXEL_FRACTION, ReferenceSettings,

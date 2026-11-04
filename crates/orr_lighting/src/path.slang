@@ -125,9 +125,10 @@ public struct PathRoot
     public uint dielectric_depth;
     public uint camera_medium;
     public uint dielectric_flags;
-    // Subsurface walks: steps before the cap tail ends them, their table, and SSS_* flags.
+    // Subsurface walks: steps before a walk stops at its cap, the table of what it would yet
+    // carry out, and SSS_* flags.
     public uint sss_max_steps;
-    public CapTail* cap_tail;
+    public SubsurfaceTableGpu* subsurface_table;
     public uint sss_flags;
     // Share of surface pixels whose path runs, in (0, 1]; each runs with this probability
     // and divides its path's estimate by it.
@@ -616,7 +617,7 @@ public uint walk_points(PathRoot r)
 // Runs `walk` up to its next coherence point, or through its end without points.
 public void walk_part<T : IWalkTrace>(PathRoot r, inout Walk walk, T tracer, inout uint rays)
 {
-    walk_steps(walk, tracer, (r.sss_flags & SSS_POINTS) != 0 ? WALK_POINT_STEPS : r.sss_max_steps, r.cap_tail, r.sss_max_steps, rays);
+    walk_steps(walk, tracer, (r.sss_flags & SSS_POINTS) != 0 ? WALK_POINT_STEPS : r.sss_max_steps, r.subsurface_table, r.sss_max_steps, rays);
 }
 
 // The exit vertex of a walk whose last step along `dir` reached `sh`: its normals face out.
