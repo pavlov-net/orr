@@ -29,7 +29,7 @@ import orr_shaders.random;
 import orr_shaders.sampling;
 import orr_shaders.trace;
 import orr_shaders.coherence;
-import orr_shaders.openpbr;
+import orr_lighting.openpbr;
 import orr_scene.hit;
 import orr_scene.visibility;
 import orr_lighting.bsdf;

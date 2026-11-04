@@ -1,15 +1,16 @@
 // The OpenPBR 1.1.1 reference BSDF (adobe/openpbr-bsdf, unedited): `openpbr_prepare`,
-// `openpbr_eval`, `openpbr_sample`, `openpbr_pdf` and their types. `Build` and `CpuLibrary`
-// put the fetched openpbr-bsdf directory on the include path.
+// `openpbr_eval`, `openpbr_sample`, `openpbr_pdf` and their types. A build that imports it
+// has the fetched openpbr-bsdf directory among its include roots, which orr_lighting's build
+// script publishes to dependents.
 //
 // Feature toggles are specialization constants 100-103 (default true). Kernels read the eight
 // lookup tables from consecutive heap slots starting at specialization constant 104, in
-// `OpenPBR_LutId` order (`orr_shaders::openpbr::LUTS`), and filter them in the shader the way
+// `OpenPBR_LutId` order (`orr_lighting::openpbr::LUTS`), and filter them in the shader the way
 // the array mode does, so both modes give the same values. With `ORR_OPENPBR_ARRAY_LUTS`
 // defined the tables are compiled in instead (CPU tests).
 module openpbr;
 
-__exported import orr_shaders.openpbr_bsdf;
+__exported import orr_lighting.openpbr_bsdf;
 
 #ifndef ORR_OPENPBR_ARRAY_LUTS
 

@@ -11,7 +11,7 @@
 // diffuse and specular transmission, thin-film iridescence, a coat with darkening and fuzz
 // from the Zeltner sheen LTC, each layer scaling the ones below by its albedo complement seen
 // from the view, and energy compensation from adobe's tables. Kernels that import this module
-// read the tables from the heap slots `orr_shaders.openpbr` names (specialization constant 104);
+// read the tables from the heap slots `orr_lighting.openpbr` names (specialization constant 104);
 // defining `ORR_OPENPBR_ARRAY_LUTS` compiles them in instead (CPU builds).
 //
 // Differences from the reference: one shading normal for every layer and an isotropic coat;
@@ -28,7 +28,7 @@ module bsdf;
 
 import orr_shaders.math;
 import orr_shaders.sampling;
-import orr_shaders.openpbr;
+import orr_lighting.openpbr;
 // `BsdfParams` and its flags.
 __exported import orr_scene.gbuffer;
 

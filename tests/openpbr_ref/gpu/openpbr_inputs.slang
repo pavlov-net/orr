@@ -1,7 +1,7 @@
 // The material parameters of the harness (`openpbr_ref::Inputs`): every OpenPBR input but
 // the shading bases, which are the identity, plus the exterior IOR. cpp/reference.cpp
 // mirrors the struct.
-import orr_shaders.openpbr;
+import orr_lighting.openpbr;
 
 struct Inputs
 {

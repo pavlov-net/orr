@@ -111,4 +111,15 @@ mod tests {
             assert!(message.contains("exactly 2026.20"), "{message}");
         }
     }
+
+    /// The version check at load time compares the library with [`SLANG_VERSION`] only, so the
+    /// committed bindings have to follow that constant.
+    #[test]
+    fn bindings_are_from_the_pinned_release() {
+        let stamp = format!("from Slang {SLANG_VERSION} on");
+        assert!(
+            include_str!("slang_sys.rs").contains(&stamp),
+            "slang_sys.rs is not from Slang {SLANG_VERSION}; run tools/gen-slang-bindings.sh"
+        );
+    }
 }

@@ -42,7 +42,7 @@ jobs:
         env:
           ORR_METAL_CHECK: "1"
         run: |
-          cargo test -p orr_shaders --features build,openpbr
+          cargo test -p orr_shaders --features build
           cargo test -p shader_corpus
           cargo test -p shader_abi --lib
           cargo build -p shader_abi --all-targets

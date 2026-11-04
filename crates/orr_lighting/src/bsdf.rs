@@ -3,20 +3,20 @@
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
+use crate::openpbr::{LUTS, LutFormat};
 use orr_scene::orr_gpu::{
     self, Device, FIRST_FREE_IMAGE_SLOT, Format, Hazards, MemoryKind, OPENPBR_LUT_SLOT, QueueKind,
     Stages, Texture, TextureDesc, TextureKind, TextureMemory, TextureRegion, TextureUsage,
     ViewDesc,
 };
-use orr_shaders::openpbr::{LUTS, LutFormat};
 
 use crate::Error;
 
 /// How long to wait for the GPU before giving up on the tables.
 const WAIT: Duration = Duration::from_secs(60);
 
-/// `orr_shaders::openpbr::LUTS` as textures with sampled views in the reserved heap slots from
-/// `OPENPBR_LUT_SLOT`, the layout `orr_lighting.bsdf` (through `orr_shaders.openpbr`) reads, and
+/// [`LUTS`] as textures with sampled views in the reserved heap slots from
+/// `OPENPBR_LUT_SLOT`, the layout `orr_lighting.bsdf` (through `orr_lighting.openpbr`) reads, and
 /// where specialization constant `openpbr_lut_slot` (104) points by default. Keep a set alive while
 /// kernels that import `orr_lighting.bsdf` run. Every set on a device shares one upload, freed once
 /// everything submitted before the last set's drop has completed.

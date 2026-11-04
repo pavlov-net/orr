@@ -1,4 +1,4 @@
-//! `orr_shaders.openpbr` on the GPU (heap LUTs) passes every harness gate against adobe's C++, and
+//! `orr_lighting.openpbr` on the GPU (heap LUTs) passes every harness gate against adobe's C++, and
 //! agrees with the same Slang on the CPU (array LUTs) within 1e-3. Runs with validation on
 //! and fails if the layer reports anything.
 
@@ -18,7 +18,7 @@ fn assert_clean() {
 #[test]
 fn gpu_passes_the_gates() {
     let results = evaluate(
-        "orr_shaders.openpbr (GPU)",
+        "orr_lighting.openpbr (GPU)",
         SlangGpu::new,
         Reference::new,
         true,

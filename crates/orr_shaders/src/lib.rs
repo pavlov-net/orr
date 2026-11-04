@@ -4,8 +4,6 @@
 //! module types that generated code fills in. The `build` feature is for `build.rs`: it
 //! compiles a crate's Slang kernels in process with the pinned Slang release, checks their
 //! layout and ABI rules, and generates Rust for their roots, records and modules. The
-//! `openpbr` feature adds [`openpbr`]: the lookup tables and specialization constants of
-//! `orr_shaders.openpbr`, derived from adobe/openpbr-bsdf under the Apache License 2.0. The
 //! `hot-reload` feature adds [`Watcher`], which recompiles compiled-in modules from their
 //! sources at run time.
 
@@ -16,8 +14,6 @@ pub mod abi;
 #[cfg(feature = "build")]
 pub mod build;
 mod module;
-#[cfg(feature = "openpbr")]
-pub mod openpbr;
 
 #[cfg(feature = "hot-reload")]
 pub use build::{Reload, Watcher};

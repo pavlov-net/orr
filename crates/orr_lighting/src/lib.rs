@@ -36,6 +36,7 @@
 mod bsdf;
 mod environment;
 mod media;
+pub mod openpbr;
 mod particles;
 mod scene;
 mod subsurface;

@@ -62,8 +62,7 @@ impl CpuLibrary {
         self
     }
 
-    /// One more import root. `orr_shaders`' and `orr_color`'s Slang roots are always present, and
-    /// so is [`openpbr_dir`](super::openpbr_dir) when it is found.
+    /// One more import root. `orr_shaders`' and `orr_color`'s Slang roots are always present.
     pub fn include(mut self, dir: impl AsRef<Path>) -> Self {
         self.includes.push(Root::plain(dir.as_ref()));
         self
@@ -114,7 +113,6 @@ impl CpuLibrary {
             .map(Root::canonical)
             .collect::<Result<Vec<_>, Error>>()?;
         import_roots.extend(roots::library()?);
-        import_roots.extend(super::openpbr_dir().ok().map(Root::plain));
         let links = link::resolve(&self.links, &import_roots)?;
         import_roots.extend(link::module_dirs(&links));
         let mut options: Vec<String> = OPTIONS.iter().map(|s| (*s).to_owned()).collect();
@@ -201,7 +199,6 @@ impl CpuLibrary {
                 println!("cargo::rerun-if-changed={}", input.display());
             }
             println!("cargo::rerun-if-env-changed=ORR_SLANGC");
-            println!("cargo::rerun-if-env-changed=ORR_OPENPBR_BSDF");
         }
         Ok(())
     }

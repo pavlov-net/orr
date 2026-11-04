@@ -227,13 +227,13 @@ mod tests {
 
     #[test]
     fn import_declarations() {
-        let text = "import orr_shaders.abi;\n  __exported import orr_shaders.openpbr_bsdf;\npublic import lights; // x\n\
+        let text = "import orr_shaders.abi;\n  __exported import orr_lighting.openpbr_bsdf;\npublic import lights; // x\n\
             // import gone;\nimport \"orr/path\";\nimport a.b; import c;\nimplementing x;\n";
         assert_eq!(
             imports(text),
             [
                 "orr_shaders.abi",
-                "orr_shaders.openpbr_bsdf",
+                "orr_lighting.openpbr_bsdf",
                 "lights",
                 "a.b",
                 "c"

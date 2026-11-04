@@ -8,8 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-openpbr = []
-build = ["dep:orr_color", "dep:thiserror", "dep:libloading", "dep:serde", "dep:serde_json", "dep:blake3", "dep:bindgen", "dep:cc", "dep:jobserver"]
+build = ["dep:orr_color", "dep:thiserror", "dep:libloading", "dep:serde", "dep:serde_json", "dep:blake3", "dep:cc", "dep:jobserver"]
 # `Watcher`: recompiles compiled-in modules from source at run time, for dev builds.
 hot-reload = ["build"]
 
@@ -23,9 +22,6 @@ serde_json = { workspace = true, optional = true }
 blake3 = { workspace = true, optional = true }
 cc = { workspace = true, optional = true }
 jobserver = { version = "0.1.35", optional = true }
-
-[build-dependencies]
-bindgen = { workspace = true, optional = true }
 
 [[test]]
 name = "build"

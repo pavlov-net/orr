@@ -2009,6 +2009,7 @@ dependencies = [
  "cc",
  "env_logger",
  "orr_gpu",
+ "orr_lighting",
  "orr_math",
  "orr_shaders",
  "shader_math",
@@ -2253,7 +2254,6 @@ dependencies = [
 name = "orr_shaders"
 version = "0.0.1"
 dependencies = [
- "bindgen",
  "blake3",
  "bytemuck",
  "cc",

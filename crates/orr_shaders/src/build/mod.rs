@@ -45,13 +45,6 @@ pub enum Error {
     /// `ORR_SLANGC` is not the absolute path of an existing file.
     #[error("ORR_SLANGC is {}, which is not the absolute path of an existing file", path.display())]
     SlangcMissing { path: PathBuf },
-    /// `ORR_OPENPBR_BSDF` is unset or wrong and no `.tools` directory above the crate holds
-    /// adobe/openpbr-bsdf.
-    #[error(
-        "adobe/openpbr-bsdf not found: no .tools/openpbr-bsdf/openpbr.h in or above {} and ORR_OPENPBR_BSDF does not name a checkout; run tools/fetch-slang.sh",
-        searched_from.display()
-    )]
-    OpenPbrNotFound { searched_from: PathBuf },
     /// A fetched tool or data file is in neither its `ORR_<ITEM>` variable, `ORR_TOOLS` nor
     /// a `.tools` directory above the crate.
     #[error(
@@ -64,8 +57,12 @@ pub enum Error {
         relative: PathBuf,
         searched_from: PathBuf,
     },
-    /// The release's Slang library could not be loaded.
-    #[error("cannot load the Slang library at {}: {source}", path.display())]
+    /// The release's Slang library could not be loaded, or lacks a function of the release orr
+    /// needs.
+    #[error(
+        "cannot load the Slang library at {}: {source}; orr needs exactly {SLANG_VERSION} (run tools/fetch-slang.sh or point ORR_SLANGC at a {SLANG_VERSION} release)",
+        path.display()
+    )]
     LibraryLoad {
         path: PathBuf,
         source: libloading::Error,
@@ -129,18 +126,6 @@ pub enum Error {
     /// One or more lints failed.
     #[error("{}", lint_lines(.0))]
     Lints(Vec<LintError>),
-}
-
-/// The adobe/openpbr-bsdf checkout that `orr_shaders.openpbr` includes: `ORR_OPENPBR_BSDF` when
-/// set, else `.tools/openpbr-bsdf` in or above `CARGO_MANIFEST_DIR`, where
-/// `tools/fetch-slang.sh` puts it.
-pub fn openpbr_dir() -> Result<PathBuf, Error> {
-    let start = env::var_os("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .ok_or(Error::NoManifestDir)?;
-    locate::find_openpbr(env::var_os("ORR_OPENPBR_BSDF"), &start).ok_or(Error::OpenPbrNotFound {
-        searched_from: start,
-    })
 }
 
 /// A tool or data file that `tools/fetch-slang.sh` fetches: the path in `var` (`ORR_<ITEM>`)

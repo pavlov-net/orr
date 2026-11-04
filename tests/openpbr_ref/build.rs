@@ -1,4 +1,4 @@
-//! Builds the two CPU BSDFs the harness compares, `orr_shaders.openpbr` through Slang's C++ target
+//! Builds the two CPU BSDFs the harness compares, `orr_lighting.openpbr` through Slang's C++ target
 //! (`slang/openpbr_cpu.slang`, array LUTs) and adobe/openpbr-bsdf's own C++ with GLM
 //! (`cpp/reference.cpp`), and compiles the GPU kernels under `gpu/` to SPIR-V.
 //!
@@ -7,18 +7,21 @@
 use std::env;
 use std::path::PathBuf;
 
-use orr_shaders::build::{Build, CpuLibrary, openpbr_dir};
+use orr_shaders::build::{Build, CpuLibrary, fetched};
 
 fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let fail = |e: orr_shaders::build::Error| -> ! { panic!("{e}") };
-    let openpbr = openpbr_dir().unwrap_or_else(|e| fail(e));
+    let openpbr = fetched("ORR_OPENPBR_BSDF", "openpbr-bsdf").unwrap_or_else(|e| fail(e));
+    let lighting = manifest.join("../../crates/orr_lighting/src");
     let glm = glm_dir(&manifest);
 
     CpuLibrary::new()
         .and_then(|b| {
             b.source("slang/openpbr_cpu.slang")
                 .include_as("openpbr_ref", manifest.join("gpu"))
+                .include_as("orr_lighting", &lighting)
+                .include(&openpbr)
                 .define("ORR_OPENPBR_ARRAY_LUTS", "1")
                 .compile("openpbr_slang")
         })
@@ -36,7 +39,12 @@ fn main() {
         .compile("openpbr_ref");
 
     Build::new()
-        .and_then(|b| b.kernels(manifest.join("gpu")).compile())
+        .and_then(|b| {
+            b.kernels(manifest.join("gpu"))
+                .include_as("orr_lighting", &lighting)
+                .include(&openpbr)
+                .compile()
+        })
         .unwrap_or_else(|e| fail(e));
 }
 

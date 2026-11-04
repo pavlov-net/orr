@@ -11,7 +11,7 @@ import orr_shaders.abi;
 import orr_shaders.math;
 import orr_shaders.random;
 import orr_shaders.trace;
-import orr_shaders.openpbr;
+import orr_lighting.openpbr;
 import orr_scene.hit;
 import orr_lighting.bsdf;
 import orr_lighting.media;

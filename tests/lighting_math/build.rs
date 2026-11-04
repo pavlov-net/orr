@@ -5,7 +5,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use orr_shaders::build::{Build, CpuLibrary};
+use orr_shaders::build::{Build, CpuLibrary, fetched};
 
 fn main() {
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
@@ -13,12 +13,14 @@ fn main() {
     let scene = manifest.join("../../crates/orr_scene/src");
     let pack = manifest.join("../../crates/orr_pack/src");
     let inputs = manifest.join("../openpbr_ref/gpu");
+    let openpbr = fetched("ORR_OPENPBR_BSDF", "openpbr-bsdf").unwrap_or_else(|e| panic!("{e}"));
     let result = CpuLibrary::new()
         .and_then(|b| {
             b.source("slang/bsdf_cpu.slang")
                 .include_as("orr_lighting", &lighting)
                 .include_as("orr_scene", &scene)
                 .include_as("orr_pack", &pack)
+                .include(&openpbr)
                 .include_as("openpbr_ref", &inputs)
                 .include_as("lighting_math", manifest.join("gpu"))
                 .define("ORR_OPENPBR_ARRAY_LUTS", "1")
@@ -30,6 +32,7 @@ fn main() {
                 .include_as("orr_lighting", &lighting)
                 .include_as("orr_scene", &scene)
                 .include_as("orr_pack", &pack)
+                .include(&openpbr)
                 .include_as("openpbr_ref", &inputs)
                 .extern_type("Inputs", "::openpbr_ref::Inputs")
                 .metal_check(true)

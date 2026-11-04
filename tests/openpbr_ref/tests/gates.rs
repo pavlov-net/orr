@@ -1,4 +1,4 @@
-//! The reference wrapper `orr_shaders.openpbr` (Slang, CPU) passes every harness gate: energy,
+//! The reference wrapper `orr_lighting.openpbr` (Slang, CPU) passes every harness gate: energy,
 //! chi-square, reciprocity, and agreement with adobe/openpbr-bsdf's C++ within 1e-3.
 
 use openpbr_ref::report::{Counts, evaluate};
@@ -7,7 +7,7 @@ use openpbr_ref::{Bsdf, Reference, SlangCpu};
 #[test]
 fn reference_wrapper_passes_the_gates() {
     let results = evaluate(
-        "orr_shaders.openpbr",
+        "orr_lighting.openpbr",
         SlangCpu::new,
         Reference::new,
         true,

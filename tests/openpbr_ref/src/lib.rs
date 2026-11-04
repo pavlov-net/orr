@@ -2,8 +2,8 @@
 //! with it.
 //!
 //! Builds of adobe/openpbr-bsdf implement [`Bsdf`]: [`Reference`], its own C++ with GLM;
-//! [`SlangCpu`], `orr_shaders.openpbr` through Slang's C++ target with the tables compiled in; and
-//! with feature `gpu`, `SlangGpu`, `orr_shaders.openpbr` in a Vulkan compute kernel reading the
+//! [`SlangCpu`], `orr_lighting.openpbr` through Slang's C++ target with the tables compiled in; and
+//! with feature `gpu`, `SlangGpu`, `orr_lighting.openpbr` in a Vulkan compute kernel reading the
 //! tables from the descriptor heap. [`harness`] holds the checks that hold for any correct
 //! BSDF (energy, sampling against the density, reciprocity) and the comparison of two
 //! BSDFs; [`report`] runs them over [`materials::grid`] and writes the tables. A real-time
@@ -311,7 +311,7 @@ openpbr_bsdf!(
 );
 
 openpbr_bsdf!(
-    /// `orr_shaders.openpbr` compiled by Slang to C++, with the tables as arrays.
+    /// `orr_lighting.openpbr` compiled by Slang to C++, with the tables as arrays.
     SlangCpu,
     slang_openpbr_inputs_size,
     slang_openpbr_prepared_size,

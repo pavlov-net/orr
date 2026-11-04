@@ -1,6 +1,6 @@
 [package]
 name = "openpbr_ref"
-description = "The OpenPBR reference BSDF: adobe/openpbr-bsdf's C++ build, orr_shaders.openpbr through Slang's C++ target and, with feature gpu, on the GPU, with the harness that checks a BSDF against them."
+description = "The OpenPBR reference BSDF: adobe/openpbr-bsdf's C++ build, orr_lighting.openpbr through Slang's C++ target and, with feature gpu, on the GPU, with the harness that checks a BSDF against them."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,11 +9,12 @@ publish = false
 
 [features]
 # `SlangGpu`, the GPU suite, `openpbr-report --gpu` and `openpbr-bench`; need a Vulkan device.
-gpu = ["dep:orr_gpu", "dep:env_logger"]
+gpu = ["dep:orr_gpu", "dep:orr_lighting", "dep:env_logger"]
 
 [dependencies]
-orr_shaders = { workspace = true, features = ["openpbr"] }
+orr_shaders.workspace = true
 orr_gpu = { workspace = true, optional = true }
+orr_lighting = { workspace = true, optional = true }
 env_logger = { workspace = true, optional = true }
 shader_math.workspace = true
 orr_math.workspace = true

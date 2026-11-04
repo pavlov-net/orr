@@ -1,11 +1,12 @@
-//! The lookup tables and specialization constants of `orr_shaders.openpbr`, the OpenPBR 1.1.1
-//! reference BSDF from adobe/openpbr-bsdf.
+//! The lookup tables of `orr_lighting.openpbr`, the OpenPBR 1.1.1 reference BSDF from
+//! adobe/openpbr-bsdf.
 //!
-//! Kernels that import `orr_shaders.openpbr` read the tables from eight consecutive heap slots, in
-//! [`LUTS`] order, starting at the slot given by specialization constant [`SPEC_LUT_SLOT`].
+//! Kernels that import `orr_lighting.openpbr` read the tables from eight consecutive heap slots, in
+//! [`LUTS`] order, starting at the slot given by specialization constant `openpbr_lut_slot` (id
+//! 104, default [`OPENPBR_LUT_SLOT`](orr_shaders::abi::OPENPBR_LUT_SLOT)).
 //! The shader filters them itself with texel loads, so no sampler is involved and any view
 //! of the listed format works. The data is derived from openpbr-bsdf, which is under the
-//! Apache License 2.0: binaries that embed it or kernels built from `orr_shaders.openpbr` carry
+//! Apache License 2.0: binaries that embed it or kernels built from `orr_lighting.openpbr` carry
 //! [`LICENSE`].
 
 /// The texel format of a table.
@@ -30,18 +31,8 @@ pub struct Lut {
 }
 
 /// The eight tables in `OpenPBR_LutId` order.
-pub static LUTS: [Lut; crate::abi::OPENPBR_LUT_SLOTS as usize] =
+pub static LUTS: [Lut; orr_shaders::abi::OPENPBR_LUT_SLOTS as usize] =
     include!(concat!(env!("OUT_DIR"), "/openpbr/luts.rs"));
-
-/// Specialization constant ids of the feature toggles (`bool`, default true); turning one
-/// off removes that part of the model from the kernel.
-pub const SPEC_ENABLE_SHEEN_AND_COAT: u32 = 100;
-pub const SPEC_ENABLE_DISPERSION: u32 = 101;
-pub const SPEC_ENABLE_TRANSLUCENCY: u32 = 102;
-pub const SPEC_ENABLE_METALLIC: u32 = 103;
-/// Specialization constant id of the first table's heap slot (`uint`, default
-/// [`OPENPBR_LUT_SLOT`](crate::abi::OPENPBR_LUT_SLOT)).
-pub const SPEC_LUT_SLOT: u32 = 104;
 
 /// adobe/openpbr-bsdf's license text (Apache License 2.0).
 pub static LICENSE: &str = include_str!(concat!(env!("OUT_DIR"), "/openpbr/LICENSE"));

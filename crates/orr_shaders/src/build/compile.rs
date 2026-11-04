@@ -149,8 +149,7 @@ impl Build {
     }
 
     /// One more import root whose modules are imported by their path under it.
-    /// `orr_shaders`' and `orr_color`'s Slang roots are always present, and so is
-    /// [`openpbr_dir`](super::openpbr_dir) when it is found.
+    /// `orr_shaders`' and `orr_color`'s Slang roots are always present.
     pub fn include(mut self, dir: impl AsRef<Path>) -> Self {
         self.includes.push(Root::plain(dir.as_ref()));
         self
@@ -354,7 +353,6 @@ impl Build {
         let shader_dirs = roots::format_list(&roots);
         roots.extend(roots::library()?);
         let mut lint_roots = roots.clone();
-        roots.extend(super::openpbr_dir().ok().map(Root::plain));
 
         let links = link::resolve(&self.links, &roots)?;
         let mut listed = LinkPoints::default();
@@ -985,7 +983,6 @@ fn print_cargo<'a>(
         }
         for var in [
             "ORR_SLANGC",
-            "ORR_OPENPBR_BSDF",
             "ORR_METAL_CHECK",
             "ORR_SHADER_PRECOMPILE",
             "ORR_SHADER_TIMINGS",

@@ -12,4 +12,4 @@
     clippy::restriction
 )]
 
-include!(concat!(env!("OUT_DIR"), "/slang_sys.rs"));
+include!("slang_sys.rs");
