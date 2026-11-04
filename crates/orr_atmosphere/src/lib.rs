@@ -5,7 +5,7 @@
 //! state: its LUTs, recorded at the scene compute point, and the [`AtmosphereGpu`] block
 //! the Slang module `orr_atmosphere.atmosphere` reads (`DEP_ORR_ATMOSPHERE_SHADER_DIRS`), whose
 //! `AtmosphereSky` and `AtmosphereMedium` link into orr's kernels as the environment and the
-//! medium. [`presets`] holds example lights, [`spectrum`] the build-time spectral coefficients
+//! medium. [`presets`] holds example lights, [`spectrum`] the spectral coefficients
 //! and [`reference`](mod@reference) an f64 spectral integrator that the GPU passes are checked
 //! against.
 
@@ -14,6 +14,7 @@ mod luts;
 pub mod presets;
 pub mod reference;
 pub mod spectrum;
+mod spectrum_data;
 
 pub use luts::{AtmosphereState, MULTIPLE_SCATTERING_SIZE, SKY_VIEW_SIZE, TRANSMITTANCE_SIZE};
 pub use shaders::types::{AtmosphereGpu, AtmosphereGroups, FoldGpu};

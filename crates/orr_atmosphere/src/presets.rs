@@ -18,7 +18,7 @@ pub const SOLAR_ANGULAR_RADIUS: f32 = 4.652e-3;
 /// top-of-atmosphere illuminance (132.6 klx) in its color.
 pub fn solar_disc(direction_to_light: Vec3) -> DirectionalLight {
     let to_rec709 = RgbPrimaries::REC2020.matrix_to(RgbPrimaries::REC709);
-    let rec709 = to_rec709 * (DVec3::from(SOLAR_COLOR) * SOLAR_ILLUMINANCE);
+    let rec709 = to_rec709 * (DVec3::from(*SOLAR_COLOR) * SOLAR_ILLUMINANCE);
     DirectionalLight {
         direction_to_light: direction_to_light.normalize(),
         illuminance: rec709.as_vec3(),

@@ -1,10 +1,15 @@
 #![allow(clippy::print_stderr)]
 
+use std::path::{Path, PathBuf};
+
 use orr_atmosphere::reference::{Channels, Geometry, Light, Precision, Reference, Run};
 use orr_atmosphere::spectrum::{SOLAR_COLOR, SOLAR_ILLUMINANCE};
 use orr_atmosphere::{Aerosol, Atmosphere, HeightFog};
 use orr_color::{delta_uv_1976, luminance};
 use orr_math::{DVec3, Vec3};
+
+#[path = "../src/spectrum_data.rs"]
+mod spectrum_data;
 
 fn earth() -> Atmosphere {
     Atmosphere::earth(DVec3::ZERO, Vec3::Y)
@@ -16,11 +21,69 @@ fn dir(elevation: f64, azimuth: f64) -> DVec3 {
     DVec3::new(e.cos() * a.cos(), e.sin(), e.cos() * a.sin())
 }
 
+/// A file under `precomputed_atmospheric_scattering` in `ORR_TOOLS` or the nearest `.tools`.
+fn fetched(relative: &str) -> Option<String> {
+    let tools = std::env::var_os("ORR_TOOLS")
+        .filter(|t| !t.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .map(|d| d.join(".tools"))
+                .find(|d| d.is_dir())
+        })?;
+    let path = tools
+        .join("precomputed_atmospheric_scattering")
+        .join(relative);
+    std::fs::read_to_string(path).ok()
+}
+
+/// The numbers inside the braces after `name` in C++ source.
+fn cpp_array(src: &str, name: &str) -> Vec<f64> {
+    let start = src.find(name).unwrap();
+    let open = start + src[start..].find('{').unwrap();
+    let close = open + src[open..].find('}').unwrap();
+    src[open + 1..close]
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse().unwrap())
+        .collect()
+}
+
+/// Skipped when `tools/fetch-slang.sh` has not fetched the files (`ORR_VALIDATION_DATA=1`).
+#[test]
+fn committed_spectrum_data_matches_the_fetched_files() {
+    let (Some(demo), Some(constants)) = (
+        fetched("atmosphere/demo/demo.cc"),
+        fetched("atmosphere/constants.h"),
+    ) else {
+        eprintln!("skipped: precomputed_atmospheric_scattering not fetched");
+        return;
+    };
+    assert_eq!(
+        cpp_array(&demo, "kSolarIrradiance[48]"),
+        spectrum_data::SOLAR_IRRADIANCE,
+        "solar irradiance"
+    );
+    assert_eq!(
+        cpp_array(&demo, "kOzoneCrossSection[48]"),
+        spectrum_data::OZONE_CROSS_SECTION,
+        "ozone"
+    );
+    // Rows of (wavelength, x, y, z) every 5 nm from 360 nm; the bins take every other row.
+    let cie = cpp_array(&constants, "CIE_2_DEG_COLOR_MATCHING_FUNCTIONS[380]");
+    for (i, c) in spectrum_data::COLOR_MATCHING.iter().enumerate() {
+        let row = &cie[8 * i..8 * i + 4];
+        assert_eq!(row[0], 360.0 + 10.0 * i as f64);
+        assert_eq!(&row[1..], c, "color matching at {} nm", row[0]);
+    }
+}
+
 #[test]
 fn solar_illuminance_from_spectrum() {
     let error = (SOLAR_ILLUMINANCE - 132_600.0).abs() / 132_600.0;
     assert!(error < 1e-3, "{SOLAR_ILLUMINANCE} lx");
-    let y = luminance(SOLAR_COLOR);
+    let y = luminance(*SOLAR_COLOR);
     assert!((y - 1.0).abs() < 1e-6, "solar color luminance {y}");
 }
 

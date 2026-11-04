@@ -150,7 +150,7 @@ fn transmittance_toward_lights_and_on_extreme_segments() {
         let origin = DVec3::new(0.0, o.y, 0.0);
         let values = run.transmittance(origin, d, f64::INFINITY, Geometry::Sphere);
         let sunlight = run.rec2020(&values);
-        let solar = orr_atmosphere::spectrum::SOLAR_COLOR;
+        let solar = *orr_atmosphere::spectrum::SOLAR_COLOR;
         let want = [0, 1, 2].map(|c| sunlight[c] / solar[c]);
         let error = worst(*g, want);
         assert!(

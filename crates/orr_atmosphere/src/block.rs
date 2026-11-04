@@ -105,7 +105,7 @@ pub(crate) fn medium(a: &Atmosphere, out: &mut AtmosphereGpu) {
     out.top_meters = top.cell.extend(0).to_array();
     out.top_offset = top.offset.extend(0.0).to_array();
     out.up = a.up.normalize().extend(0.0).to_array();
-    out.solar_color = xyz(SOLAR_COLOR);
+    out.solar_color = xyz(*SOLAR_COLOR);
     out.rayleigh = band(&|c| RGB.rayleigh[c] * density);
     out.aerosol_extinction = band(&|c| aod * RGB.aerosol_factor(c, alpha));
     out.aerosol_scattering = band(&|c| {
