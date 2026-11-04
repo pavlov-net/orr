@@ -20,6 +20,11 @@ use crate::{EntryPoint, Error, ShaderModule, SpecData};
 #[derive(Clone, Copy, Debug)]
 pub struct ShaderStage<'a> {
     pub spirv: &'a [u32],
+    /// The Metal library of the compute, task and mesh entries: the module's, or a hot
+    /// reload's.
+    pub metallib: &'a [u8],
+    /// The Metal library of the pixel entries.
+    pub metallib_fragment: &'a [u8],
     pub omm: bool,
     /// The size of the root the kernel holds inline; 0 for a root in GPU memory.
     pub inline_root_bytes: u32,
@@ -37,6 +42,8 @@ impl<'a> ShaderStage<'a> {
             .ok_or_else(|| Error::Shader(format!("{} has no entry point {entry}", module.name)))?;
         Ok(Self {
             spirv: module.spirv,
+            metallib: module.metallib,
+            metallib_fragment: module.metallib_fragment,
             omm: module.omm,
             inline_root_bytes: module.inline_root_bytes,
             debug_info: module.debug_info,
@@ -44,6 +51,24 @@ impl<'a> ShaderStage<'a> {
             spec,
             module,
         })
+    }
+
+    /// The stage's library for pixel entries when `fragment`, else for the others: the
+    /// module's own, named by the module's hash, or a reload's, named by its contents.
+    fn library(&self, fragment: bool) -> Library<'a> {
+        let (bytes, own) = if fragment {
+            (self.metallib_fragment, self.module.metallib_fragment)
+        } else {
+            (self.metallib, self.module.metallib)
+        };
+        if std::ptr::eq(bytes, own) {
+            return Library::Module(self.module.hash, own);
+        }
+        let digest = blake3::hash(bytes);
+        Library::Reload(
+            u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap()),
+            bytes,
+        )
     }
 
     /// The Metal function descriptor of the entry: its name in the module's library, the
@@ -60,7 +85,7 @@ impl<'a> ShaderStage<'a> {
             )));
         }
         let fragment = self.entry.stage == crate::Stage::Pixel;
-        let library = shared.library(self.module, fragment)?;
+        let library = shared.library(self.module.name, fragment, self.library(fragment))?;
         let f = MTL4LibraryFunctionDescriptor::new();
         f.setName(Some(&NSString::from_str(name)));
         f.setLibrary(Some(&library));
@@ -77,7 +102,8 @@ impl<'a> ShaderStage<'a> {
     /// Adds what tells this stage apart from others to a pipeline cache key: the module's
     /// code, the entry and the specialization data.
     pub(super) fn key(&self, hasher: &mut blake3::Hasher) {
-        hasher.update(&self.module.hash.to_le_bytes());
+        let fragment = self.entry.stage == crate::Stage::Pixel;
+        hasher.update(&self.library(fragment).hash().to_le_bytes());
         hasher.update(self.entry.metal_name.to_bytes_with_nul());
         hasher.update(&(self.spec.bytes.len() as u64).to_le_bytes());
         hasher.update(self.spec.bytes);
@@ -172,37 +198,54 @@ impl Shared {
             })
     }
 
-    /// `module`'s Metal library: the pixel entries' when `fragment`, the others' otherwise.
-    /// Loaded once per module.
-    pub(super) fn library(
+    /// The Metal library `library` of the module `module`, of its pixel entries when
+    /// `fragment`. Loaded once per hash and kind.
+    fn library(
         &self,
-        module: &ShaderModule,
+        module: &str,
         fragment: bool,
+        library: Library<'_>,
     ) -> Result<Obj<ProtocolObject<dyn MTLLibrary>>, Error> {
+        let key = (library.hash(), fragment);
         let mut libraries = lock(&self.libraries);
-        if let Some(l) = libraries.get(&(module.hash, fragment)) {
+        if let Some(l) = libraries.get(&key) {
             return Ok(l.clone());
         }
-        let bytes = if fragment {
-            module.metallib_fragment
-        } else {
-            module.metallib
-        };
+        let (Library::Module(_, bytes) | Library::Reload(_, bytes)) = library;
         if bytes.is_empty() {
             return Err(Error::Shader(format!(
-                "{} has no Metal library: build it for an Apple target with the MSL check on",
-                module.name
+                "{module} has no Metal library: build it for an Apple target with the MSL check on"
             )));
         }
-        let data = dispatch2::DispatchData::from_static_bytes(bytes);
+        let data = match library {
+            Library::Module(_, bytes) => dispatch2::DispatchData::from_static_bytes(bytes),
+            Library::Reload(_, bytes) => dispatch2::DispatchData::from_bytes(bytes),
+        };
         let library = self
             .device
             .newLibraryWithData_error(&data)
             .map_err(|e| metal_error("newLibraryWithData", &e))?;
-        library.setLabel(Some(&NSString::from_str(module.name)));
+        library.setLabel(Some(&NSString::from_str(module)));
         let library = Obj(library);
-        libraries.insert((module.hash, fragment), library.clone());
+        libraries.insert(key, library.clone());
         Ok(library)
+    }
+}
+
+/// A stage's Metal library and the hash that names it.
+#[derive(Clone, Copy)]
+enum Library<'a> {
+    /// The module's own, embedded in the binary.
+    Module(u64, &'static [u8]),
+    /// A hot reload's.
+    Reload(u64, &'a [u8]),
+}
+
+impl Library<'_> {
+    fn hash(self) -> u64 {
+        match self {
+            Library::Module(hash, _) | Library::Reload(hash, _) => hash,
+        }
     }
 }
 

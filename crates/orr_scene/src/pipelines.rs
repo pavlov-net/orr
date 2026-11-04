@@ -32,9 +32,11 @@ pub enum ReloadReport {
     },
 }
 
-/// A module's SPIR-V from a reload.
+/// A module's SPIR-V and Metal libraries from a reload.
 pub(crate) struct Code {
     pub(crate) spirv: Arc<[u32]>,
+    pub(crate) metallib: Arc<[u8]>,
+    pub(crate) metallib_fragment: Arc<[u8]>,
 }
 
 /// What a recipe makes: a pipeline, or an execution set holding the pipeline alone, which
@@ -63,6 +65,8 @@ impl Recipe {
         let mut stage = ShaderStage::new(self.module, &self.entry, spec)?;
         if let Some(code) = code {
             stage.spirv = &code.spirv;
+            stage.metallib = &code.metallib;
+            stage.metallib_fragment = &code.metallib_fragment;
             // The module's sidecar describes the build's SPIR-V; a reload embeds its own.
             stage.debug_info = "";
         }
