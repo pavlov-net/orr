@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use egui::epaint::ClippedShape;
 use egui::{Color32, Context, FullOutput, Pos2, RawInput, Rect, Shape, TexturesDelta, vec2};
-use gpu_suite::check_latency_reports;
 use gpu_suite::window::Window;
+use gpu_suite::{check_latency_reports, watch_latency_markers};
 use orr::orr_gpu::{
     Device, DeviceDesc, Format, MemoryKind, QueueKind, QueueRequest, SpecData, StorageImageIndex,
     Texture, TextureDesc, TextureIndex, TextureMemory, TextureUsage, ViewDesc as ImageView,
@@ -159,6 +159,7 @@ fn frame_generation_presents_generated_images_before_each_frame() {
         log::warn!("skipped: {e}");
         return;
     }
+    watch_latency_markers(display.latency().expect("low latency"));
     let most = support.max_generated.min(3);
     let recommended = FrameGenerationMode::recommended(&support);
 

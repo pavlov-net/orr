@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use gpu_suite::check_latency_reports;
 use gpu_suite::window::Window;
+use gpu_suite::{check_latency_reports, watch_latency_markers};
 use orr::{
     ConsumerMarker, Display, DisplayRequest, FrameDesc, FrameTime, Renderer, RendererDesc,
     SceneDesc,
@@ -36,10 +36,9 @@ fn every_frame_id_gets_a_complete_ordered_report() {
         desc.frames_in_flight,
     )
     .unwrap();
-    display
-        .latency()
-        .expect("low latency")
-        .set_mode(true, false, 0);
+    let latency = display.latency().expect("low latency");
+    latency.set_mode(true, false, 0);
+    watch_latency_markers(latency);
 
     let render_thread = std::thread::spawn(move || {
         let mut r = Renderer::new(device(), desc).unwrap();

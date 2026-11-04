@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use gpu_suite::shaders::swapchain_fill;
 use gpu_suite::window::Window;
-use gpu_suite::{assert_clean, check_latency_reports, device, fill_frame, pipeline, render};
+use gpu_suite::{
+    assert_clean, check_latency_reports, device, fill_frame, pipeline, render,
+    watch_latency_markers,
+};
 use orr_gpu::{
     ComputePipeline, LatencyMarker, PresentMode, Queue, QueueKind, Swapchain, SwapchainDesc,
     TimelinePoint,
@@ -128,6 +131,7 @@ fn render_thread_sleeps_and_marks_beside_the_present_thread() {
     let mut sc = swapchain(&window, PresentMode::Immediate);
     let latency = sc.latency().expect("low latency");
     latency.set_mode(true, false, 0);
+    watch_latency_markers(&latency);
     let fill = pipeline(&swapchain_fill::MODULE, "fill_main");
     let (to_present, frames) = mpsc::sync_channel::<(u64, TimelinePoint)>(1);
 

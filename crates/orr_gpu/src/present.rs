@@ -80,7 +80,8 @@ pub enum LatencyMarker {
 }
 
 /// One frame's latency report (`VkLatencyTimingsFrameReportNV`): times in microseconds on
-/// the driver's clock, 0 where nothing was recorded.
+/// the driver's clock, 0 where nothing was recorded. That clock can step back, so a later
+/// marker can show an earlier time.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LatencyTimings {
     /// The frame id the markers carried.

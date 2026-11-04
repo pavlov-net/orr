@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use gpu_suite::check_latency_reports;
 use gpu_suite::window::Window;
+use gpu_suite::{check_latency_reports, watch_latency_markers};
 use orr::{ConsumerMarker, Display, DisplayRequest, FrameDesc, FrameTime, Renderer, RendererDesc};
 use orr_scene::testing::{assert_clean, device, wait};
 
@@ -32,6 +32,7 @@ fn reports_stay_complete_as_low_latency_changes() {
         desc.frames_in_flight,
     )
     .unwrap();
+    watch_latency_markers(display.latency().expect("low latency"));
 
     let render_thread = std::thread::spawn(move || {
         let mut r = Renderer::new(device(), desc).unwrap();

@@ -2,14 +2,15 @@
 //! layer, when the environment enables it, reports anything.
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use orr_gpu::{
     Allocation, ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance,
     ClassicKind, CommandList, ComputePipeline, Device, DeviceDesc, Diagnostics, GpuPtr,
-    InstanceFlags, LatencyTimings, MemoryKind, OutputFormat, Queue, QueueKind, QueueRequest,
-    RtasFlags, ShaderModule, ShaderStage, SpecData, SwapchainFrame, TimelinePoint,
+    InstanceFlags, LatencyMarker, LatencyTimings, LowLatency, MemoryKind, OutputFormat, Queue,
+    QueueKind, QueueRequest, RtasFlags, ShaderModule, ShaderStage, SpecData, SwapchainFrame,
+    TimelinePoint,
 };
 use orr_shaders::bytemuck::Pod;
 
@@ -270,16 +271,39 @@ pub fn fill_frame<'q>(
     (list, root)
 }
 
+/// The markers of each frame id since [`watch_latency_markers`], in call order.
+static LATENCY_MARKERS: Mutex<BTreeMap<u64, Vec<LatencyMarker>>> = Mutex::new(BTreeMap::new());
+
+/// Records every marker of `latency` for [`check_latency_reports`], from now on.
+pub fn watch_latency_markers(latency: &LowLatency) {
+    LATENCY_MARKERS.lock().unwrap().clear();
+    latency.set_marker_hook(Some(|id, marker| {
+        LATENCY_MARKERS
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_default()
+            .push(marker);
+    }));
+}
+
 /// Asserts that every frame id up to `frames` has a latency report with every marker of the
-/// render and present threads, in order, and a GPU span. The first frames run before the
-/// driver's history fills and the last are in flight. 621.01 never reports ids that are
-/// multiples of 128 (measured.md PR-10).
+/// render and present threads and a GPU span, and that [`watch_latency_markers`] saw those
+/// markers set in order. Order is checked on the calls because the driver's clock steps
+/// back, by up to a millisecond under load, so a report's times can cross. The first frames
+/// run before the driver's history fills and the last are in flight. 621.01 never reports
+/// ids that are multiples of 128.
 pub fn check_latency_reports(reports: &BTreeMap<u64, LatencyTimings>, frames: u64) {
+    use LatencyMarker::{
+        PresentEnd, PresentStart, RenderSubmitEnd, RenderSubmitStart, SimulationEnd,
+        SimulationStart,
+    };
+    let markers = LATENCY_MARKERS.lock().unwrap();
     for id in (64..frames - 64).filter(|id| id % 128 != 0) {
         let t = reports
             .get(&id)
             .unwrap_or_else(|| panic!("no latency report for frame {id}"));
-        let ordered = [
+        let times = [
             t.simulation_start,
             t.simulation_end,
             t.render_submit_start,
@@ -288,17 +312,26 @@ pub fn check_latency_reports(reports: &BTreeMap<u64, LatencyTimings>, frames: u6
             t.present_end,
         ];
         assert!(
-            ordered.iter().all(|&v| v != 0),
+            times.iter().all(|&v| v != 0),
             "frame {id}: a marker is missing: {t:?}"
         );
-        // Markers set within the same microsecond can read 1 us out of order.
         assert!(
-            ordered.windows(2).all(|w| w[0] <= w[1] + 1),
-            "frame {id}: markers out of order: {t:?}"
-        );
-        assert!(
-            t.gpu_render_start != 0 && t.gpu_render_start <= t.gpu_render_end,
+            t.gpu_render_start != 0 && t.gpu_render_end != 0,
             "frame {id}: no GPU span: {t:?}"
+        );
+        assert_eq!(
+            markers.get(&id).map(Vec::as_slice),
+            Some(
+                &[
+                    SimulationStart,
+                    SimulationEnd,
+                    RenderSubmitStart,
+                    RenderSubmitEnd,
+                    PresentStart,
+                    PresentEnd,
+                ][..]
+            ),
+            "frame {id}: markers out of order"
         );
     }
 }
