@@ -7,23 +7,46 @@ use std::path::Path;
 
 use io_uring::{IoUring, Probe, opcode, types};
 
-use crate::{AlignedBuf, Read};
+use crate::{AlignedBuf, Read, SECTOR};
 
 /// Reads in flight at once; 64 reach a fast NVMe drive's rate.
 const DEPTH: usize = 64;
 
-/// Opens with `O_DIRECT`, or buffered where the file system refuses it. Returns the file and
-/// whether it is unbuffered.
+/// Opens with `O_DIRECT`, or buffered where the file system refuses it or needs an alignment
+/// that [`SECTOR`] does not meet. Returns the file and whether it is unbuffered.
 pub(crate) fn open_unbuffered(path: &Path) -> io::Result<(File, bool)> {
     match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECT)
         .open(path)
     {
-        Ok(f) => Ok((f, true)),
-        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok((File::open(path)?, false)),
-        Err(e) => Err(e),
+        Ok(f) if sectors_fit(&f) => Ok((f, true)),
+        Err(e) if e.raw_os_error() != Some(libc::EINVAL) => Err(e),
+        _ => Ok((File::open(path)?, false)),
     }
+}
+
+/// Whether [`SECTOR`] meets the file's direct IO alignment. True where the kernel does not
+/// report it, which it does from Linux 6.1.
+fn sectors_fit(f: &File) -> bool {
+    // SAFETY: all zeros is a valid `statx`.
+    let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: an empty path with `AT_EMPTY_PATH` reads the open file; `stat` is written only
+    // during the call.
+    let r = unsafe {
+        libc::statx(
+            f.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH,
+            libc::STATX_DIOALIGN,
+            &mut stat,
+        )
+    };
+    if r != 0 || stat.stx_mask & libc::STATX_DIOALIGN == 0 {
+        return true;
+    }
+    SECTOR.is_multiple_of(stat.stx_dio_offset_align as usize)
+        && SECTOR.is_multiple_of(stat.stx_dio_mem_align as usize)
 }
 
 /// An auto-reset event: an eventfd.

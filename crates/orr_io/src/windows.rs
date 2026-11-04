@@ -10,17 +10,18 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, HANDLE, WAIT_FAILED, WIN32_ERROR,
 };
 use windows::Win32::Storage::FileSystem::{
-    FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, HIORING,
-    IORING_BUFFER_REF, IORING_BUFFER_REF_0, IORING_CQE, IORING_CREATE_ADVISORY_FLAGS_NONE,
-    IORING_CREATE_FLAGS, IORING_CREATE_REQUIRED_FLAGS_NONE, IORING_HANDLE_REF, IORING_HANDLE_REF_0,
-    IORING_REF_RAW, IORING_SQE_FLAGS, IORING_VERSION, IORING_VERSION_3, IOSQE_FLAGS_NONE, ReadFile,
+    FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_STORAGE_INFO, FileStorageInfo, GetFileInformationByHandleEx, HIORING, IORING_BUFFER_REF,
+    IORING_BUFFER_REF_0, IORING_CQE, IORING_CREATE_ADVISORY_FLAGS_NONE, IORING_CREATE_FLAGS,
+    IORING_CREATE_REQUIRED_FLAGS_NONE, IORING_HANDLE_REF, IORING_HANDLE_REF_0, IORING_REF_RAW,
+    IORING_SQE_FLAGS, IORING_VERSION, IORING_VERSION_3, IOSQE_FLAGS_NONE, ReadFile,
 };
 use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects};
 use windows::core::{HRESULT, PCSTR, w};
 
-use crate::{AlignedBuf, Read};
+use crate::{AlignedBuf, Read, SECTOR};
 
 /// Reads in flight at once; 64 reach a fast NVMe drive's rate.
 const DEPTH: usize = 64;
@@ -37,11 +38,28 @@ pub(crate) fn open_shared(path: &Path) -> io::Result<File> {
     open(path, 0)
 }
 
-/// The file and that it is unbuffered. The handle is overlapped: read it with
-/// [`read_overlapped`] or an [`IoRing`].
+/// Opens unbuffered, or buffered where the file system refuses that or [`SECTOR`] is not a
+/// whole number of its sectors. Returns the file and whether it is unbuffered. The handle is
+/// overlapped: read it with [`read_overlapped`] or an [`IoRing`].
 pub(crate) fn open_unbuffered(path: &Path) -> io::Result<(File, bool)> {
-    let flags = FILE_FLAG_NO_BUFFERING.0 | FILE_FLAG_OVERLAPPED.0;
-    Ok((open(path, flags)?, true))
+    match open(path, FILE_FLAG_NO_BUFFERING.0 | FILE_FLAG_OVERLAPPED.0) {
+        Ok(f) if sectors_fit(&f) => Ok((f, true)),
+        _ => Ok((open(path, FILE_FLAG_OVERLAPPED.0)?, false)),
+    }
+}
+
+fn sectors_fit(f: &File) -> bool {
+    let mut info = FILE_STORAGE_INFO::default();
+    // SAFETY: `info` is the size given and is written only during the call.
+    let got = unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(f.as_raw_handle()),
+            FileStorageInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_STORAGE_INFO>() as u32,
+        )
+    };
+    got.is_ok() && SECTOR.is_multiple_of(info.LogicalBytesPerSector as usize)
 }
 
 /// One read at `offset` on an overlapped handle, which can run alongside reads on other

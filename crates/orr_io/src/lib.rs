@@ -25,7 +25,8 @@ use crate::linux as sys;
 #[cfg(windows)]
 use crate::windows as sys;
 
-/// Alignment and size granule of unbuffered reads.
+/// Alignment and size granule of unbuffered reads. A [`ReadFile`] on a volume whose sectors do
+/// not divide it is buffered.
 pub const SECTOR: usize = 4096;
 
 /// A zeroed buffer at a [`SECTOR`] boundary, a whole number of sectors long.
@@ -138,9 +139,9 @@ fn read_all(
 }
 
 /// A file opened for unbuffered reads at [`SECTOR`] offsets, from any number of threads at
-/// once or through a [`Ring`]. On Linux the file is buffered where the file system refuses
-/// unbuffered reads. The handle names the file as it was when opened, so a file renamed over
-/// the path later is never read through it.
+/// once or through a [`Ring`]. The file is buffered where the file system refuses unbuffered
+/// reads or needs a larger alignment than [`SECTOR`]. The handle names the file as it was when
+/// opened, so a file renamed over the path later is never read through it.
 pub struct ReadFile {
     /// Overlapped on Windows, where reads on a synchronous handle take turns. No read through
     /// it may come from std, which aborts the process on a read that does not finish at once.
