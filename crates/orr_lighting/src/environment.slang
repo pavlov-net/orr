@@ -193,23 +193,14 @@ public float3 environment_sample(EnvironmentGpu* e, float3 u, out float pdf)
         float4 c = float4(row0[0], row0[1], row0[m], row0[m + 1]);
         float target = x * (c.x + c.y + c.z + c.w);
         // The child holding `target`, or the last non-empty one when rounding carries
-        // `target` past the sum.
-        uint pick = 0;
-        float before_pick = 0.0;
-        float below = 0.0;
-        for (uint j = 0; j < 4; j++)
-        {
-            if (c[j] > 0.0)
-            {
-                pick = j;
-                before_pick = below;
-                if (target < below + c[j])
-                    break;
-            }
-            below += c[j];
-        }
+        // `target` past the sum. An empty child's sum equals the one before it, so no comparison
+        // stops at it.
+        float3 sums = float3(c.x, c.x + c.y, c.x + c.y + c.z);
+        uint pick = uint(target >= sums.x) + uint(target >= sums.y) + uint(target >= sums.z);
+        if (!(c[pick] > 0.0))
+            pick = c.z > 0.0 ? 2 : c.y > 0.0 ? 1 : 0;
         w = c[pick];
-        x = clamp((target - before_pick) / w, 0.0, ONE_BELOW_ONE);
+        x = clamp((target - float4(0.0, sums)[pick]) / w, 0.0, ONE_BELOW_ONE);
         t = 2 * t + uint2(pick & 1, pick >> 1);
     }
     pdf = w / total * float(n * n) * INV_FOUR_PI;

@@ -78,31 +78,35 @@ public uint sobol(uint index, uint dim)
 {
     if (dim == 0)
         return reversebits(index);
+    if (dim == 1)
+    {
+        // Its generator is Pascal's matrix mod 2: bit j of the point sums the index bits whose
+        // positions hold j's set bits, which a butterfly per bit of j computes.
+        uint y = index;
+        y ^= (y >> 1) & 0x55555555;
+        y ^= (y >> 2) & 0x33333333;
+        y ^= (y >> 4) & 0x0f0f0f0f;
+        y ^= (y >> 8) & 0x00ff00ff;
+        y ^= y >> 16;
+        return reversebits(y);
+    }
     uint x = 0;
     uint a = 0x80000000;
     uint b = 0xc0000000;
     uint c = 0x20000000;
     for (; index != 0; index >>= 1)
     {
-        if ((index & 1) != 0)
-            x ^= a;
-        if (dim == 1)
+        x ^= a & (0u - (index & 1u));
+        uint next = b ^ a ^ (a >> dim);
+        a = b;
+        if (dim == 2)
         {
-            a ^= a >> 1;
+            b = next;
         }
         else
         {
-            uint next = b ^ a ^ (a >> dim);
-            a = b;
-            if (dim == 2)
-            {
-                b = next;
-            }
-            else
-            {
-                b = c;
-                c = next;
-            }
+            b = c;
+            c = next;
         }
     }
     return x;
