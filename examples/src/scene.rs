@@ -53,7 +53,7 @@ impl Showcase {
                 &SceneDesc {
                     instance_capacity: 16,
                     group_capacity: 4,
-                    light_capacity: 1,
+                    light_capacity: 2,
                     material_set_capacity: 16,
                     emissive_capacity: 16,
                     part_capacity: 0,

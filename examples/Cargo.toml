@@ -88,6 +88,10 @@ name = "bench"
 path = "bench.rs"
 
 [[example]]
+name = "quality"
+path = "quality.rs"
+
+[[example]]
 name = "skinned"
 path = "skinned.rs"
 

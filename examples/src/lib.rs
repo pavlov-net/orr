@@ -20,6 +20,7 @@ pub mod creature;
 pub mod field;
 pub mod mesh;
 pub mod overlay;
+pub mod quality;
 pub mod scene;
 pub mod sun_shade;
 pub mod vegetation;
@@ -140,6 +141,30 @@ impl std::fmt::Display for LensSwitches {
             on(self.motion_blur)
         )
     }
+}
+
+/// `git rev-parse --short HEAD` in the repository, or "unknown".
+pub fn git_rev() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map_or_else(
+            || "unknown".into(),
+            |o| String::from_utf8_lossy(&o.stdout).trim().to_owned(),
+        )
+}
+
+/// Where examples write their reports, made if needed.
+pub fn report_dir() -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("target")
+        .join("orr-reports");
+    std::fs::create_dir_all(&dir).expect("report directory");
+    dir
 }
 
 /// How an example runs.

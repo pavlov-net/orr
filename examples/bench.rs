@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use examples::vegetation::{Run, Sample, Script, Settings, run, settled};
-use examples::{Options, assert_clean, device, request_perf_counters};
+use examples::{Options, assert_clean, device, git_rev, report_dir, request_perf_counters};
 use orr::orr_gpu::{COUNTER_METRICS, CounterReport, MemoryKind};
 use orr::{FrameStats, LightingStats};
 use serde_json::{Map, Value, json};
@@ -274,20 +274,6 @@ fn script_report(script: Script, samples: &[Sample]) -> Value {
     })
 }
 
-/// `git rev-parse --short HEAD` in the repository, or "unknown".
-fn git_rev() -> String {
-    std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map_or_else(
-            || "unknown".into(),
-            |o| String::from_utf8_lossy(&o.stdout).trim().to_owned(),
-        )
-}
-
 fn write_report(settings: &Settings, r: &Run) -> PathBuf {
     let caps = device().caps();
     let rev = git_rev();
@@ -316,12 +302,7 @@ fn write_report(settings: &Settings, r: &Run) -> PathBuf {
         "scripts": scripts,
         "counters": r.counters.as_ref().map(counter_report),
     });
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("target")
-        .join("orr-reports");
-    std::fs::create_dir_all(&dir).expect("report directory");
-    let path = dir.join(format!("dense_vegetation-{rev}.json"));
+    let path = report_dir().join(format!("dense_vegetation-{rev}.json"));
     let text = serde_json::to_string_pretty(&report).expect("report")
         + "
 ";
