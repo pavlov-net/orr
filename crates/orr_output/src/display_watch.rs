@@ -119,16 +119,14 @@ fn steady(last: DisplayInfo, mut new: DisplayInfo) -> DisplayInfo {
     new
 }
 
-struct QueueController(DispatcherQueueController);
-
-struct Apartment;
+windows_core::link!("ntdll.dll" "system" fn RtlDllShutdownInProgress() -> u8);
 
 /// What a thread needs for `GetForWindow`, kept until the thread ends: a queue shut down with
 /// the watch that made it would take the thread's other watches down with it.
 struct ThreadSetup {
-    // Fields drop in order: the queue, then the apartment.
-    _queue: Option<QueueController>,
-    _apartment: Option<Apartment>,
+    queue: Option<DispatcherQueueController>,
+    /// `RoInitialize` succeeded here, so `drop` balances it.
+    apartment: bool,
 }
 
 thread_local! {
@@ -137,31 +135,27 @@ thread_local! {
 
 impl ThreadSetup {
     fn new() -> windows_core::Result<Self> {
-        // SAFETY: `Apartment` balances it on this thread. An apartment of another kind already
-        // on the thread serves WinRT as well.
+        // SAFETY: `drop` balances it on this thread. An apartment of another kind already on the
+        // thread serves WinRT as well.
         let apartment = match unsafe { RoInitialize(RO_INIT_SINGLETHREADED) } {
-            Ok(()) => Some(Apartment),
-            Err(e) if e.code() == RPC_E_CHANGED_MODE => None,
+            Ok(()) => true,
+            Err(e) if e.code() == RPC_E_CHANGED_MODE => false,
             Err(e) => return Err(e),
         };
-        let queue = match DispatcherQueue::GetForCurrentThread() {
-            Ok(_) => None,
-            Err(_) => {
-                let options = DispatcherQueueOptions {
-                    dwSize: size_of::<DispatcherQueueOptions>() as u32,
-                    threadType: DQTYPE_THREAD_CURRENT,
-                    apartmentType: DQTAT_COM_NONE,
-                };
-                // SAFETY: plain call with a filled options struct.
-                Some(QueueController(unsafe {
-                    CreateDispatcherQueueController(options)
-                }?))
-            }
+        let mut setup = Self {
+            queue: None,
+            apartment,
         };
-        Ok(Self {
-            _queue: queue,
-            _apartment: apartment,
-        })
+        if DispatcherQueue::GetForCurrentThread().is_err() {
+            let options = DispatcherQueueOptions {
+                dwSize: size_of::<DispatcherQueueOptions>() as u32,
+                threadType: DQTYPE_THREAD_CURRENT,
+                apartmentType: DQTAT_COM_NONE,
+            };
+            // SAFETY: plain call with a filled options struct.
+            setup.queue = Some(unsafe { CreateDispatcherQueueController(options) }?);
+        }
+        Ok(setup)
     }
 }
 
@@ -265,17 +259,22 @@ impl Drop for Subclass {
     }
 }
 
-impl Drop for QueueController {
+impl Drop for ThreadSetup {
     fn drop(&mut self) {
-        let _ = self.0.ShutdownQueueAsync();
-    }
-}
-
-impl Drop for Apartment {
-    fn drop(&mut self) {
-        // SAFETY: balances `RoInitialize` in `ThreadSetup::new` on the same thread, after the
-        // queue is released.
-        unsafe { RoUninitialize() };
+        // The thread that ends the process runs its destructors after combase and CoreMessaging
+        // have shut down, and calling into them then faults. The OS frees all of this anyway.
+        // SAFETY: a plain query.
+        if unsafe { RtlDllShutdownInProgress() } != 0 {
+            std::mem::forget(self.queue.take());
+            return;
+        }
+        if let Some(queue) = self.queue.take() {
+            let _ = queue.ShutdownQueueAsync();
+        }
+        if self.apartment {
+            // SAFETY: balances `RoInitialize` in `new` on the same thread, after the queue.
+            unsafe { RoUninitialize() };
+        }
     }
 }
 

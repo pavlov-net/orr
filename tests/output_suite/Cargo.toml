@@ -26,9 +26,19 @@ egui_demo_lib = "0.37"
 
 [target.'cfg(windows)'.dev-dependencies]
 gpu_suite.workspace = true
+windows = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_Kernel",
+  "Win32_System_Threading",
+] }
 
 [build-dependencies]
 orr_shaders = { workspace = true, features = ["build"] }
+
+[[test]]
+name = "watch_at_exit"
+harness = false
 
 [lints]
 workspace = true
