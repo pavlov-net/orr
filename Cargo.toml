@@ -1,5 +1,6 @@
 [workspace]
-members = ["crates/*", "tests/*", "examples"]
+members = ["crates/*", "tests/*", "examples", "xtask"]
+default-members = ["crates/*", "tests/*", "examples"]
 resolver = "3"
 
 [workspace.package]

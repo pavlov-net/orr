@@ -9,7 +9,10 @@ pub(crate) fn block_glb() -> PathBuf {
 }
 
 fn write_block_glb() -> PathBuf {
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("block.glb");
+    // Test targets share `CARGO_TARGET_TMPDIR` and can run at the same time.
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(env!("CARGO_CRATE_NAME"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("block.glb");
     let pos: [[f32; 3]; 8] = [
         [0.0, 0.0, 0.0],
         [1.0, 0.0, 0.0],
