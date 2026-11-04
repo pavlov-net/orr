@@ -199,6 +199,7 @@ fn recompile(
         tool: "",
         options: &options,
         metal: None,
+        metallib: false,
         asserts: manifest.asserts,
         separate_debug: false,
         roots,

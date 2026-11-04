@@ -9,8 +9,9 @@
 // codec) into its slots. Both return 0 or PAGE_CODEC_* bits; a page that sets any bit in
 // either pass is malformed, and the thread or workgroup that found it writes nothing.
 //
-// The decode keeps its working set in groupshared memory (about 35 KiB) declared here, so
-// a kernel that calls `page_decode_cluster` holds it; the module has no bindings.
+// The decode keeps its working set in groupshared memory (about 27 KiB, under Apple GPUs'
+// 32 KiB) declared here, so a kernel that calls `page_decode_cluster` holds it; the module
+// has no bindings.
 module page_codec;
 
 import orr_pack.mesh;
@@ -63,7 +64,7 @@ groupshared uint codec_vstream[VERTEX_STREAM_WORDS];
 groupshared uint codec_tstream[TRIANGLE_STREAM_WORDS];
 groupshared uint codec_columns[MAX_VERTEX_BYTES];               // kind << 16 | stream offset
 groupshared uint codec_groups[MAX_VERTEX_BYTES * MAX_GROUPS];   // bits << 16 | stream offset
-groupshared uint codec_bytes[MAX_VERTEX_BYTES * MAX_VERTICES / 4];
+// The byte columns (MAX_VERTEX_BYTES * MAX_VERTICES / 4 words), then the channels built from them.
 groupshared uint codec_channels[MAX_CHANNELS * MAX_VERTICES];
 groupshared uint codec_prefix[MAX_VERTICES];                     // extra | next << 16
 groupshared uint codec_slots[3 * MAX_VERTICES];
@@ -442,7 +443,7 @@ public uint page_decode_cluster(StoredPage p, uint cluster, uint lane)
         uint v = 0;
         for (uint j = 0; j < 4 && i + j < vn; j++)
             v |= column_byte(col, i + j) << (8 * j);
-        codec_bytes[task] = v;
+        codec_channels[task] = v;
     }
     for (uint d = 1; d < MAX_VERTICES; d *= 2)
     {
@@ -458,7 +459,9 @@ public uint page_decode_cluster(StoredPage p, uint cluster, uint lane)
     if (lane == 0 && (last & 0xFFFF) != bound)
         InterlockedOr(codec_status, PAGE_CODEC_BAD_TRIANGLES);
 
+    // The channels replace the byte columns they are built from, once every lane has read them.
     uint channels = stride / 4;
+    uint built[MAX_CHANNELS];
     for (uint ch = 0; ch < channels; ch++)
     {
         uint x = 0;
@@ -469,11 +472,14 @@ public uint page_decode_cluster(StoredPage p, uint cluster, uint lane)
             uint at = lane / 4;
             uint shift = lane % 4 * 8;
             for (uint j = 0; j < 4; j++)
-                x |= ((codec_bytes[(col + j) * q + at] >> shift) & 0xFF) << (8 * j);
+                x |= ((codec_channels[(col + j) * q + at] >> shift) & 0xFF) << (8 * j);
             x = channel_delta(channel_mode(vlen, stride, ch), x);
         }
-        codec_channels[ch * MAX_VERTICES + lane] = x;
+        built[ch] = x;
     }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint ch = 0; ch < channels; ch++)
+        codec_channels[ch * MAX_VERTICES + lane] = built[ch];
 
     // Triangle corners as slots 3t + (a, b, c). Edge reuse names two corners of one of the
     // three triangles before; pointer doubling resolves those chains.

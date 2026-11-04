@@ -1,8 +1,13 @@
+use std::collections::HashMap;
+use std::ptr::NonNull;
+
+use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTL4Compiler, MTL4ComputePipelineDescriptor, MTL4FunctionDescriptor,
-    MTL4LibraryFunctionDescriptor, MTLComputePipelineState, MTLDevice, MTLLibrary,
+    MTL4LibraryFunctionDescriptor, MTL4SpecializedFunctionDescriptor, MTLComputePipelineState,
+    MTLDataType, MTLDevice, MTLFunction, MTLFunctionConstantValues, MTLLibrary,
 };
 
 use super::device::{Device, Shared, metal_error};
@@ -41,14 +46,11 @@ impl<'a> ShaderStage<'a> {
     }
 
     /// The Metal function descriptor of the entry: its name in the module's library, the
-    /// fragment library for pixel entries.
+    /// fragment library for pixel entries, specialized when the stage has constants.
     pub(super) fn function(
         &self,
         shared: &Shared,
-    ) -> Result<objc2::rc::Retained<MTL4LibraryFunctionDescriptor>, Error> {
-        if !self.spec.bytes.is_empty() {
-            return Err(Error::NotImplemented("specialization constants"));
-        }
+    ) -> Result<Retained<MTL4FunctionDescriptor>, Error> {
         let name = self.entry.metal_name.to_str().unwrap_or("");
         if name.is_empty() {
             return Err(Error::Shader(format!(
@@ -61,7 +63,67 @@ impl<'a> ShaderStage<'a> {
         let f = MTL4LibraryFunctionDescriptor::new();
         f.setName(Some(&NSString::from_str(name)));
         f.setLibrary(Some(&library));
-        Ok(f)
+        if self.spec.entries.is_empty() {
+            return Ok(Retained::into_super(f));
+        }
+        let values = self.constant_values(&library, name)?;
+        let specialized = MTL4SpecializedFunctionDescriptor::new();
+        specialized.setFunctionDescriptor(Some(&f));
+        specialized.setConstantValues(Some(&values));
+        Ok(Retained::into_super(specialized))
+    }
+
+    /// The stage's specialization constants as Metal function constants: Slang gives each
+    /// the index of its `constant_id`. Values are laid out as for Vulkan, so a bool is four
+    /// bytes here and one byte in Metal; constants the function lacks are skipped.
+    fn constant_values(
+        &self,
+        library: &ProtocolObject<dyn MTLLibrary>,
+        name: &str,
+    ) -> Result<Retained<MTLFunctionConstantValues>, Error> {
+        let function = library
+            .newFunctionWithName(&NSString::from_str(name))
+            .ok_or_else(|| {
+                Error::Shader(format!("{}: no Metal function {name}", self.module.name))
+            })?;
+        let dictionary = function.functionConstantsDictionary();
+        let types: HashMap<usize, MTLDataType> = dictionary
+            .allValues()
+            .iter()
+            .map(|c| (c.index(), c.r#type()))
+            .collect();
+        let values = MTLFunctionConstantValues::new();
+        for e in self.spec.entries {
+            let Some(&ty) = types.get(&(e.constant_id as usize)) else {
+                continue;
+            };
+            let bytes = &self.spec.bytes[e.offset as usize..(e.offset + e.size) as usize];
+            let word = match bytes {
+                &[a, b, c, d] => u32::from_le_bytes([a, b, c, d]),
+                _ => {
+                    return Err(Error::Shader(format!(
+                        "{}: constant {} is {} bytes, not 4",
+                        self.module.name, e.constant_id, e.size
+                    )));
+                }
+            };
+            let flag = u8::from(word != 0);
+            let value = match ty {
+                MTLDataType::Bool => NonNull::from(&flag).cast(),
+                MTLDataType::UInt | MTLDataType::Int | MTLDataType::Float => {
+                    NonNull::from(&word).cast()
+                }
+                _ => {
+                    return Err(Error::Shader(format!(
+                        "{}: constant {} has Metal type {ty:?}",
+                        self.module.name, e.constant_id
+                    )));
+                }
+            };
+            // SAFETY: `value` points at a value of `ty`, which Metal copies.
+            unsafe { values.setConstantValue_type_atIndex(value, ty, e.constant_id as usize) };
+        }
+        Ok(values)
     }
 }
 
@@ -69,19 +131,24 @@ impl Shared {
     /// The compute pipeline state of `function`, whose threadgroups are `workgroup`.
     pub(super) fn compute_state(
         &self,
-        function: &MTL4LibraryFunctionDescriptor,
+        function: &MTL4FunctionDescriptor,
         workgroup: [u32; 3],
         name: &str,
     ) -> Result<Obj<ProtocolObject<dyn MTLComputePipelineState>>, Error> {
         let desc = MTL4ComputePipelineDescriptor::new();
         desc.setLabel(Some(&NSString::from_str(name)));
-        let f: &MTL4FunctionDescriptor = function;
-        desc.setComputeFunctionDescriptor(Some(f));
+        desc.setComputeFunctionDescriptor(Some(function));
         desc.setRequiredThreadsPerThreadgroup(super::command::size(workgroup));
         let raw = self
             .compiler
             .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&desc, None)
-            .map_err(|e| metal_error("newComputePipelineState", &e))?;
+            .map_err(|e| {
+                let mut e = metal_error("newComputePipelineState", &e);
+                if let Error::Metal { message, .. } = &mut e {
+                    *message = format!("{name}: {message}");
+                }
+                e
+            })?;
         Ok(Obj(raw))
     }
 

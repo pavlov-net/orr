@@ -1,24 +1,28 @@
+use std::sync::OnceLock;
+
+use bytemuck::{Pod, Zeroable};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTL4ArgumentTable, MTL4BlendState, MTL4CommandBuffer, MTL4Compiler,
-    MTL4MeshRenderPipelineDescriptor, MTL4PipelineDescriptor, MTL4RenderCommandEncoder,
-    MTL4RenderPassDescriptor, MTLBlendFactor, MTLBlendOperation, MTLClearColor, MTLColorWriteMask,
-    MTLCullMode, MTLDepthStencilDescriptor, MTLDepthStencilState, MTLDevice, MTLLoadAction,
+    MTL4ArgumentTable, MTL4BlendState, MTL4CommandBuffer, MTL4CommandEncoder, MTL4Compiler,
+    MTL4LibraryFunctionDescriptor, MTL4MeshRenderPipelineDescriptor, MTL4PipelineDescriptor,
+    MTL4RenderCommandEncoder, MTL4RenderPassDescriptor, MTLBlendFactor, MTLBlendOperation,
+    MTLClearColor, MTLColorWriteMask, MTLComputePipelineState, MTLCullMode,
+    MTLDepthStencilDescriptor, MTLDepthStencilState, MTLDevice, MTLLoadAction,
     MTLRenderPipelineState, MTLRenderStages, MTLScissorRect, MTLStoreAction, MTLTriangleFillMode,
     MTLViewport, MTLWinding,
 };
 
-use super::command::{CommandList, Encoder, size};
+use super::Obj;
+use super::command::{CommandList, RenderEncoder, size};
 use super::device::{Device, metal_error};
 use super::heap::compare;
 use super::pipeline::ShaderStage;
 use super::texture::{Texture, pixel_format};
-use super::{Obj, not_implemented};
 use crate::{
     BlendFactor, BlendOp, ClearColor, ColorLoad, ColorMask, ColorTarget, Cull, DepthLoad,
-    DepthTarget, Error, Fill, FrontFace, GpuPtr, RasterState,
+    DepthTarget, Error, Fill, FrontFace, GpuPtr, Hazards, RasterState, Stages,
 };
 
 /// Object payload bytes a task stage may write: Metal's limit, since the build does not
@@ -170,13 +174,74 @@ impl Device {
     }
 }
 
+/// A render pass being recorded. Metal opens its encoder at `end_rendering`, after a kernel
+/// has gated the arguments of the pass's counted draws, which no render command can do.
+pub(super) struct PendingPass {
+    desc: Retained<MTL4RenderPassDescriptor>,
+    extent: [u32; 2],
+    commands: Vec<RenderCommand>,
+    /// Counted draws' arguments to gate, as (args, count, gated copy, max).
+    gates: Vec<(u64, u64, u64, u32)>,
+}
+
+enum RenderCommand {
+    Scissor(MTLScissorRect),
+    Draw {
+        pipeline: DrawState,
+        root: u64,
+        groups: Groups,
+    },
+}
+
+enum Groups {
+    Direct([u32; 3]),
+    /// The address of Metal's indirect threadgroup counts, laid out as [`MeshArgs`].
+    Indirect(u64),
+}
+
+/// What a draw sets from its [`MeshPipeline`].
+#[derive(Clone)]
+struct DrawState {
+    raw: Obj<ProtocolObject<dyn MTLRenderPipelineState>>,
+    depth: Option<Obj<ProtocolObject<dyn MTLDepthStencilState>>>,
+    raster: RasterState,
+    task_workgroup: [u32; 3],
+    mesh_workgroup: [u32; 3],
+}
+
+/// Copies `max` draws' threadgroup counts, zeroing those at or past the count.
+const DRAW_GATE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+struct Args { device const uint* src; device const uint* count; device uint* dst; uint max; uint pad; };
+kernel void gate(constant Args& a [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+    if (i >= a.max) return;
+    bool live = i < *a.count;
+    for (uint c = 0; c < 3; c++) a.dst[3 * i + c] = live ? a.src[3 * i + c] : 0;
+}
+"#;
+
+/// The arguments of [`DRAW_GATE`].
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GateArgs {
+    src: u64,
+    count: u64,
+    dst: u64,
+    max: u32,
+    pad: u32,
+}
+
 impl CommandList<'_> {
     /// Starts drawing into `r`'s attachments.
     pub fn begin_rendering(&mut self, r: &Rendering<'_>) {
-        self.end_encoder();
+        assert!(self.pass.is_none(), "begin_rendering inside rendering");
         let pass = MTL4RenderPassDescriptor::new();
         pass.setRenderTargetWidth(r.extent[0] as usize);
         pass.setRenderTargetHeight(r.extent[1] as usize);
+        // Passes without attachments, which only write memory, rasterize one sample a pixel.
+        // SAFETY: one sample is always supported.
+        unsafe { pass.setDefaultRasterSampleCount(1) };
         let colors = pass.colorAttachments();
         for (i, c) in r.colors.iter().enumerate() {
             // SAFETY: the index is below Metal's eight color attachments; Metal validates the
@@ -219,13 +284,58 @@ impl CommandList<'_> {
             }
             self.keep.push(Box::new(d.texture.raw.clone()));
         }
+        self.pass = Some(PendingPass {
+            desc: pass,
+            extent: r.extent,
+            commands: Vec::new(),
+            gates: Vec::new(),
+        });
+    }
+
+    /// Limits drawing to `extent` pixels from `offset`.
+    pub fn set_scissor(&mut self, offset: [u32; 2], extent: [u32; 2]) {
+        self.pass()
+            .commands
+            .push(RenderCommand::Scissor(MTLScissorRect {
+                x: offset[0] as usize,
+                y: offset[1] as usize,
+                width: extent[0] as usize,
+                height: extent[1] as usize,
+            }));
+    }
+
+    pub fn end_rendering(&mut self) {
+        let pass = self
+            .pass
+            .take()
+            .expect("end_rendering without begin_rendering");
+        if !pass.gates.is_empty() {
+            let state = self.queue.shared.draw_gate().expect("the draw gate kernel");
+            for &(src, count, dst, max) in &pass.gates {
+                let args = GateArgs {
+                    src,
+                    count,
+                    dst,
+                    max,
+                    pad: 0,
+                };
+                self.dispatch_state(
+                    &state,
+                    bytemuck::bytes_of(&args),
+                    [max.div_ceil(64), 1, 1],
+                    [64, 1, 1],
+                );
+            }
+            self.barrier(Stages::COMPUTE, Stages::ALL, Hazards::DRAW_ARGUMENTS);
+        }
+        self.end_encoder();
         let e = self
             .buffer
-            .renderCommandEncoderWithDescriptor(&pass)
+            .renderCommandEncoderWithDescriptor(&pass.desc)
             .expect("renderCommandEncoderWithDescriptor");
         self.open_barrier(ProtocolObject::from_ref(&*e));
         // orr's clip space has +y pointing down the target, Metal's up: the viewport flips it.
-        let (w, h) = (f64::from(r.extent[0]), f64::from(r.extent[1]));
+        let (w, h) = (f64::from(pass.extent[0]), f64::from(pass.extent[1]));
         e.setViewport(MTLViewport {
             originX: 0.0,
             originY: h,
@@ -234,38 +344,40 @@ impl CommandList<'_> {
             znear: 0.0,
             zfar: 1.0,
         });
-        self.encoder = Encoder::Render(e);
+        for c in pass.commands {
+            match c {
+                RenderCommand::Scissor(r) => e.setScissorRect(r),
+                RenderCommand::Draw {
+                    pipeline,
+                    root,
+                    groups,
+                } => self.encode_draw(&e, &pipeline, root, groups),
+            }
+        }
+        e.endEncoding();
     }
 
-    /// Limits drawing to `extent` pixels from `offset`.
-    pub fn set_scissor(&mut self, offset: [u32; 2], extent: [u32; 2]) {
-        self.render().setScissorRect(MTLScissorRect {
-            x: offset[0] as usize,
-            y: offset[1] as usize,
-            width: extent[0] as usize,
-            height: extent[1] as usize,
+    fn pass(&mut self) -> &mut PendingPass {
+        self.pass.as_mut().expect("drawing outside begin_rendering")
+    }
+
+    fn draw(&mut self, p: &MeshPipeline, root: u64, groups: Groups) {
+        let pipeline = DrawState {
+            raw: p.raw.clone(),
+            depth: p.depth.clone(),
+            raster: p.raster,
+            task_workgroup: p.task_workgroup,
+            mesh_workgroup: p.mesh_workgroup,
+        };
+        self.keep.push(Box::new(pipeline.clone()));
+        self.pass().commands.push(RenderCommand::Draw {
+            pipeline,
+            root,
+            groups,
         });
     }
 
-    pub fn end_rendering(&mut self) {
-        assert!(
-            matches!(self.encoder, Encoder::Render(_)),
-            "end_rendering without begin_rendering"
-        );
-        self.end_encoder();
-    }
-
-    fn render(&self) -> Retained<ProtocolObject<dyn MTL4RenderCommandEncoder>> {
-        match &self.encoder {
-            Encoder::Render(e) => e.clone(),
-            _ => panic!("drawing outside begin_rendering"),
-        }
-    }
-
-    /// Draws `groups` task workgroups of `p`, or mesh workgroups without a task stage, with
-    /// the root at `root`.
-    pub fn draw_mesh_tasks<R>(&mut self, p: &MeshPipeline, root: GpuPtr<R>, groups: [u32; 3]) {
-        let e = self.render();
+    fn encode_draw(&self, e: &RenderEncoder, p: &DrawState, root: u64, groups: Groups) {
         e.setRenderPipelineState(&p.raw);
         let raster = p.raster;
         e.setCullMode(match raster.cull {
@@ -287,22 +399,34 @@ impl CommandList<'_> {
         e.setDepthStencilState(p.depth.as_deref());
         // SAFETY: the root's address is the caller's to keep valid until the submit
         // completes, as on every backend.
-        unsafe { self.table.setAddress_atIndex(root.address().0, 0) };
+        unsafe { self.table.setAddress_atIndex(root, 0) };
         e.setArgumentTable_atStages(
             &self.table,
             MTLRenderStages::Object | MTLRenderStages::Mesh | MTLRenderStages::Fragment,
         );
-        e.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
-            size(groups),
-            size(p.task_workgroup),
-            size(p.mesh_workgroup),
-        );
-        self.keep.push(Box::new(p.raw.clone()));
-        if let Some(d) = &p.depth {
-            self.keep.push(Box::new(d.clone()));
+        let (task, mesh) = (size(p.task_workgroup), size(p.mesh_workgroup));
+        match groups {
+            Groups::Direct(g) => e
+                .drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                    size(g),
+                    task,
+                    mesh,
+                ),
+            Groups::Indirect(args) => e
+                .drawMeshThreadgroupsWithIndirectBuffer_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                    args, task, mesh,
+                ),
         }
     }
 
+    /// Draws `groups` task workgroups of `p`, or mesh workgroups without a task stage, with
+    /// the root at `root`.
+    pub fn draw_mesh_tasks<R>(&mut self, p: &MeshPipeline, root: GpuPtr<R>, groups: [u32; 3]) {
+        self.draw(p, root.address().0, Groups::Direct(groups));
+    }
+
+    /// Draws up to `max` times with the workgroup counts at `args`, as many times as the
+    /// GPU wrote to `count` by the time the pass starts.
     pub fn draw_mesh_tasks_indirect_count<R>(
         &mut self,
         p: &MeshPipeline,
@@ -311,8 +435,33 @@ impl CommandList<'_> {
         count: GpuPtr<u32>,
         max: u32,
     ) {
-        let _ = (p, root, args, count, max);
-        not_implemented("CommandList::draw_mesh_tasks_indirect_count")
+        let stride = size_of::<super::MeshArgs>() as u64;
+        let gated = self.inline_bytes(&vec![0; (stride * u64::from(max)) as usize]);
+        self.pass()
+            .gates
+            .push((args.address().0, count.address().0, gated, max));
+        for i in 0..u64::from(max) {
+            self.draw(p, root.address().0, Groups::Indirect(gated + i * stride));
+        }
+    }
+}
+
+impl super::device::Shared {
+    /// The compute pipeline of [`DRAW_GATE`], compiled once.
+    fn draw_gate(&self) -> Result<Obj<ProtocolObject<dyn MTLComputePipelineState>>, Error> {
+        static STATE: OnceLock<Obj<ProtocolObject<dyn MTLComputePipelineState>>> = OnceLock::new();
+        if let Some(s) = STATE.get() {
+            return Ok(s.clone());
+        }
+        let library = self
+            .device
+            .newLibraryWithSource_options_error(&NSString::from_str(DRAW_GATE), None)
+            .map_err(|e| metal_error("newLibraryWithSource", &e))?;
+        let f = MTL4LibraryFunctionDescriptor::new();
+        f.setName(Some(&NSString::from_str("gate")));
+        f.setLibrary(Some(&library));
+        let state = self.compute_state(&f, [64, 1, 1], "draw gate")?;
+        Ok(STATE.get_or_init(|| state).clone())
     }
 }
 
