@@ -1,6 +1,7 @@
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
@@ -145,13 +146,42 @@ impl TimestampRing {
     }
 }
 
+/// Work for the queue's step thread, run in order.
+type Job = Box<dyn FnOnce(&Queue) + Send>;
+
+/// Submits and mapping updates handed to the queue's step thread. While any is queued or
+/// running, later ones queue behind it, so the queue commits and signals in submit order.
+#[derive(Default)]
+struct Backlog {
+    /// Jobs sent to the thread and not yet done.
+    queued: usize,
+    thread: Option<StepThread>,
+}
+
+struct StepThread {
+    send: mpsc::Sender<Job>,
+    handle: JoinHandle<()>,
+}
+
+/// The address of a queue for its step thread. A queue starts the thread only once it lives
+/// in its device's queue array, where it stays until dropped; dropping it joins the thread.
+struct QueueRef(*const Queue);
+
+// SAFETY: queues are `Sync`; the pointee outlives the thread (see above).
+unsafe impl Send for QueueRef {}
+
 /// One Metal 4 command queue with its own timeline.
+///
+/// A submit whose lists hold CPU steps ([`super::command::HostStep`]) would block its caller
+/// until the GPU has run everything before each step. Instead the queue's step thread takes
+/// it: it waits for the GPU, runs the step and commits the rest, then signals the point the
+/// submit returned at once. Submits made while one is with the thread follow it there.
 pub struct Queue {
     pub(super) kind: QueueKind,
     pub(super) raw: Obj<ProtocolObject<dyn MTL4CommandQueue>>,
-    /// Held for every submit, so timeline values signal in order.
-    submit_lock: Mutex<()>,
-    /// Signaled before each CPU step of a submit ([`super::command::HostStep`]).
+    /// Held for every submit, so timeline values are taken and signaled in order.
+    backlog: Mutex<Backlog>,
+    /// Signaled before each CPU step of a submit, on the step thread.
     host_event: Obj<ProtocolObject<dyn MTLSharedEvent>>,
     host_value: AtomicU64,
     pub(super) shared: Arc<Shared>,
@@ -167,7 +197,7 @@ impl Queue {
         Ok(Queue {
             kind,
             raw: Obj(raw),
-            submit_lock: Mutex::new(()),
+            backlog: Mutex::default(),
             host_event: Obj(shared.device.newSharedEvent().ok_or(Error::Metal {
                 call: "newSharedEvent",
                 message: format!("{kind:?} queue CPU steps"),
@@ -187,36 +217,96 @@ impl Queue {
     }
 
     /// Submits `lists` in order once every point of `wait` has completed. Returns the point
-    /// this queue's timeline reaches when they have run.
+    /// this queue's timeline reaches when they have run; never waits for the GPU.
     pub fn submit(
         &self,
         lists: Vec<CommandList<'_>>,
         wait: &[TimelinePoint],
     ) -> Result<TimelinePoint, Error> {
-        let _guard = lock(&self.submit_lock);
-        self.shared.commit_residency();
-        for p in wait {
-            if p.timeline != self.timeline() {
-                let event = &self.shared.timelines[p.timeline as usize].event;
-                self.raw
-                    .waitForEvent_value(ProtocolObject::from_ref(&**event), p.value);
-            }
-        }
         let mut finished: Vec<_> = lists.into_iter().map(CommandList::finish).collect();
         let passes: Vec<(&'static str, u64)> = finished
             .iter_mut()
             .flat_map(|f| std::mem::take(&mut f.passes))
             .collect();
+        let steps = finished
+            .iter()
+            .any(|f| f.buffers.iter().any(|(_, step)| step.is_some()));
+        let wait = wait.to_vec();
+        let mut backlog = lock(&self.backlog);
+        let point = self.next_point();
+        self.resolve_passes(point, passes);
+        if steps || backlog.queued > 0 {
+            self.send(
+                &mut backlog,
+                Box::new(move |q: &Queue| q.commit_submit(&wait, finished, point)),
+            );
+        } else {
+            self.commit_submit(&wait, finished, point);
+        }
+        Ok(point)
+    }
+
+    /// Hands `job` to the step thread, started on first use; the caller holds the backlog.
+    fn send(&self, backlog: &mut Backlog, job: Job) {
+        let thread = backlog.thread.get_or_insert_with(|| {
+            let (send, receive) = mpsc::channel::<Job>();
+            let queue = QueueRef(self);
+            let handle = std::thread::Builder::new()
+                .name(format!("orr {:?} queue steps", self.kind))
+                .spawn(move || {
+                    let queue = queue;
+                    // SAFETY: the queue outlives the thread (`QueueRef`).
+                    let q = unsafe { &*queue.0 };
+                    for job in receive {
+                        job(q);
+                        lock(&q.backlog).queued -= 1;
+                    }
+                })
+                .expect("spawning a queue's step thread");
+            StepThread { send, handle }
+        });
+        thread
+            .send
+            .send(job)
+            .expect("the step thread runs while its queue lives");
+        backlog.queued += 1;
+    }
+
+    /// Commits a submit's lists after `wait`, running their CPU steps on the way, and
+    /// signals `point`; on the submitting thread or the step thread, in submit order.
+    fn commit_submit(
+        &self,
+        wait: &[TimelinePoint],
+        mut finished: Vec<Finished>,
+        point: TimelinePoint,
+    ) {
+        self.shared.commit_residency();
+        // A point of this queue's own timeline is waited on too: Metal 4 runs a queue's
+        // command buffers concurrently, so only the event orders them after that point.
+        for p in wait {
+            let event = &self.shared.timelines[p.timeline as usize].event;
+            self.raw
+                .waitForEvent_value(ProtocolObject::from_ref(&**event), p.value);
+        }
         // Commits up to each CPU step, runs it once the GPU has caught up and commits what
         // it recorded before the rest.
         let mut ready = Vec::new();
         let mut steps = Vec::new();
         for f in &mut finished {
-            self.run_steps(f, &mut ready, &mut steps)?;
+            self.run_steps(f, &mut ready, &mut steps);
         }
         self.commit(&mut ready);
         finished.extend(steps);
-        let point = self.signal();
+        self.signal(point);
+        self.shared.defer_until(
+            self.timeline(),
+            point.value,
+            Box::new(move || drop(finished)),
+        );
+    }
+
+    /// Keeps the timings of `passes` once the submit signaling `point` completes.
+    fn resolve_passes(&self, point: TimelinePoint, passes: Vec<(&'static str, u64)>) {
         if !passes.is_empty() {
             // Read once the submit completes, before the ring goes round.
             let shared = Arc::downgrade(&self.shared);
@@ -234,12 +324,6 @@ impl Queue {
             self.shared
                 .defer_until(self.timeline(), point.value, Box::new(resolve));
         }
-        self.shared.defer_until(
-            self.timeline(),
-            point.value,
-            Box::new(move || drop(finished)),
-        );
-        Ok(point)
     }
 
     /// Queues `f`'s command buffers on `ready`, committing and running each CPU step on the
@@ -249,23 +333,22 @@ impl Queue {
         f: &mut Finished,
         ready: &mut Vec<Retained<ProtocolObject<dyn MTL4CommandBuffer>>>,
         steps: &mut Vec<Finished>,
-    ) -> Result<(), Error> {
+    ) {
         for (buffer, step) in &mut f.buffers {
             ready.push(buffer.clone());
             if let Some(step) = step.take() {
                 self.commit(ready);
                 self.wait_for_gpu();
-                let mut list = CommandList::new(self)?;
+                let mut list = CommandList::new(self).expect("a command list for a CPU step");
                 step(&mut list);
                 let mut done = list.finish();
-                self.run_steps(&mut done, ready, steps)?;
+                self.run_steps(&mut done, ready, steps);
                 steps.push(done);
             }
         }
-        Ok(())
     }
 
-    /// Commits `buffers` in order and empties it; the caller holds the submit lock.
+    /// Commits `buffers` in order and empties it; in submit order (see `commit_submit`).
     fn commit(&self, buffers: &mut Vec<Retained<ProtocolObject<dyn MTL4CommandBuffer>>>) {
         if buffers.is_empty() {
             return;
@@ -305,7 +388,7 @@ impl Queue {
     }
 
     /// Waits on the CPU until everything committed to this queue has completed, for a CPU
-    /// step that reads what it wrote; the caller holds the submit lock.
+    /// step that reads what it wrote; on the step thread.
     fn wait_for_gpu(&self) {
         let value = self.host_value.fetch_add(1, Ordering::Relaxed) + 1;
         self.raw
@@ -317,13 +400,11 @@ impl Queue {
         );
     }
 
-    /// Signals the next value of the timeline after the work queued so far; the caller
-    /// holds the submit lock.
-    fn signal(&self) -> TimelinePoint {
+    /// Takes the timeline's next value, which `signal` signals once the work before it is
+    /// committed; the caller holds the backlog.
+    fn next_point(&self) -> TimelinePoint {
         let timeline = &self.shared.timelines[self.timeline() as usize];
         let value = timeline.submitted.load(Ordering::Acquire) + 1;
-        self.raw
-            .signalEvent_value(ProtocolObject::from_ref(&*timeline.event.0), value);
         timeline.submitted.store(value, Ordering::Release);
         TimelinePoint {
             timeline: self.timeline(),
@@ -331,15 +412,34 @@ impl Queue {
         }
     }
 
+    /// Signals `point` after the work committed so far; in submit order.
+    fn signal(&self, point: TimelinePoint) {
+        let timeline = &self.shared.timelines[self.timeline() as usize];
+        self.raw
+            .signalEvent_value(ProtocolObject::from_ref(&*timeline.event.0), point.value);
+    }
+
     /// Queues sparse mapping updates through `update`, in order with this queue's submits.
     /// Returns the point the timeline reaches once they have run.
     pub(super) fn update_mappings(
         &self,
-        update: impl FnOnce(&ProtocolObject<dyn MTL4CommandQueue>),
+        update: impl FnOnce(&ProtocolObject<dyn MTL4CommandQueue>) + Send + 'static,
     ) -> TimelinePoint {
-        let _guard = lock(&self.submit_lock);
-        update(&self.raw);
-        self.signal()
+        let mut backlog = lock(&self.backlog);
+        let point = self.next_point();
+        if backlog.queued > 0 {
+            self.send(
+                &mut backlog,
+                Box::new(move |q: &Queue| {
+                    update(&q.raw);
+                    q.signal(point);
+                }),
+            );
+        } else {
+            update(&self.raw);
+            self.signal(point);
+        }
+        point
     }
 
     /// Submits `lists`, which write `frame`. No swapchains on Metal yet.
@@ -372,6 +472,19 @@ impl Queue {
             Ok(())
         } else {
             Err(Error::Timeout)
+        }
+    }
+}
+
+impl Drop for Queue {
+    /// Lets the step thread finish what it was given, then joins it.
+    fn drop(&mut self) {
+        let thread = lock(&self.backlog).thread.take();
+        if let Some(StepThread { send, handle }) = thread {
+            drop(send);
+            if handle.join().is_err() {
+                log::error!("{:?} queue: the step thread panicked", self.kind);
+            }
         }
     }
 }

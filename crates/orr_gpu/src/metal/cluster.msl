@@ -217,6 +217,29 @@ device Instance* descriptors(constant PtlasArgs& a) {
     return at<Instance>(a.state + 256 + (a.partitions + 1) * 16 + a.instances * WRITE_WORDS * 4);
 }
 
+struct PtlasCheckArgs { ulong commands; ulong count; ulong failures; uint max_ops; uint pad; };
+
+// Debug builds run this first, as on Vulkan: more commands than the build allows, an unknown
+// op or a second command of one op type rejects the whole build. The command count becomes 0
+// and `failures` counts the rejection.
+kernel void ptlas_check(constant PtlasCheckArgs& a [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+    if (i != 0) return;
+    device uint* count = at<uint>(a.count);
+    uint n = count[0];
+    bool bad = n > a.max_ops;
+    uint seen = 0;
+    for (uint c = 0; c < min(n, a.max_ops); c++) {
+        uint op = at<uint>(a.commands + c * 24)[0];
+        uint bit = 1u << min(op, 31u);
+        bad = bad || op > 2 || (seen & bit) != 0;
+        seen |= bit;
+    }
+    if (bad) {
+        count[0] = 0;
+        atomic_fetch_add_explicit(at<atomic_uint>(a.failures), 1u, memory_order_relaxed);
+    }
+}
+
 // Forgets every instance and translation.
 kernel void ptlas_clear(constant PtlasArgs& a [[buffer(0)]], uint i [[thread_position_in_grid]]) {
     if (i < a.instances)

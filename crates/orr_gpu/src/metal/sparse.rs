@@ -87,6 +87,7 @@ pub struct TileBind<'a> {
 }
 
 /// One mapping update: a resource, the heap it maps to (none to unmap) and the operation.
+#[derive(Clone)]
 enum Update {
     Buffer(
         Obj<ProtocolObject<dyn MTLBuffer>>,
@@ -333,8 +334,10 @@ impl Device {
             .queue(QueueKind::Loading)
             .or_else(|| self.queue(QueueKind::Render))
             .expect("the render queue always exists");
-        Ok(queue.update_mappings(|raw| {
-            for u in &binds.updates {
+        // Owned, since the queue may apply them after a submit still on its step thread.
+        let updates = binds.updates.clone();
+        Ok(queue.update_mappings(move |raw| {
+            for u in &updates {
                 // SAFETY: each operation names tiles inside its resource and, when mapping,
                 // pages inside the heap (checked as the batch was collected); the resources
                 // and heaps outlive the batch.

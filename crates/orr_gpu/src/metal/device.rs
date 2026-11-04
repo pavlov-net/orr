@@ -13,7 +13,7 @@ use objc2_metal::{
 };
 
 use super::accel::{EmptyTlas, build_empty_tlas};
-use super::cluster::{self, Kernels, Objects};
+use super::cluster::{self, Kernels, Objects, PtlasCheck, StructureIds};
 use super::heap::Bindings;
 use super::queue::{PassResult, Queue, QueueKind, QueueRequest, TimestampRing};
 use super::unsupported::Diagnostics;
@@ -84,6 +84,9 @@ pub(super) struct Shared {
     pub(super) timestamps: TimestampRing,
     /// Cluster and partitioned acceleration structures by the address of their object.
     pub(super) objects: Mutex<Objects>,
+    pub(super) structure_ids: StructureIds,
+    /// The debug PTLAS check, created by the first PTLAS build of a debug build.
+    pub(super) ptlas_check: OnceLock<PtlasCheck>,
     pub(super) cluster_kernels: OnceLock<Kernels>,
     /// Command buffers that completed with an error.
     pub(super) gpu_errors: AtomicU32,
@@ -194,6 +197,8 @@ impl Device {
             results: Mutex::default(),
             timestamps,
             objects: Mutex::default(),
+            structure_ids: StructureIds::default(),
+            ptlas_check: OnceLock::new(),
             cluster_kernels: OnceLock::new(),
             gpu_errors: AtomicU32::new(0),
             libraries: Mutex::default(),
@@ -256,9 +261,15 @@ impl Device {
     }
 
     /// Command buffers the GPU failed: a fault or a validation error, each logged with
-    /// Metal's description as it completes.
+    /// Metal's description as it completes; and PTLAS builds the debug check rejected among
+    /// completed work.
     pub fn validation_messages(&self) -> u32 {
-        self.shared.gpu_errors.load(Ordering::Relaxed)
+        let rejected = self
+            .shared
+            .ptlas_check
+            .get()
+            .map_or(0, PtlasCheck::failures);
+        self.shared.gpu_errors.load(Ordering::Relaxed) + rejected
     }
 }
 
