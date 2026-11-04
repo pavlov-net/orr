@@ -261,6 +261,25 @@ fn entry_signatures(msl: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// `msl` with its ray queries traversing three instancing levels: the Metal backend stands
+/// in for a cluster BLAS with an instance structure over one BLAS per cluster, under the
+/// TLAS. Slang has no way to ask for it. Instance IDs then take a depth: 0, the TLAS's.
+pub(super) fn multi_level(msl: &str) -> String {
+    let mut out = msl.replace(
+        "raytracing::triangle_data, raytracing::instancing>",
+        "raytracing::triangle_data, raytracing::instancing, raytracing::max_levels<3>>",
+    );
+    for access in ["candidate", "committed"] {
+        for id in ["instance_id", "user_instance_id"] {
+            out = out.replace(
+                &format!("get_{access}_{id}()"),
+                &format!("get_{access}_{id}(0)"),
+            );
+        }
+    }
+    out
+}
+
 /// Compiles the MSL at `metal` into the library `out` with Xcode's Metal compiler. The error
 /// holds the compiler's error lines. Math is `safe`, as SPIR-V's: Metal's default `fast`
 /// assumes no NaNs or infinities and reassociates. Nothing fuses into FMAs either, since

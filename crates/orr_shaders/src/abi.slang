@@ -72,7 +72,10 @@ public struct Tlas
         __target_switch
         {
         case metal:
-            return metal_resource<RaytracingAccelerationStructure>(address);
+            // A classic structure's address is its resource ID tagged in bit 63; a cluster
+            // BLAS's or PTLAS's is memory whose header holds the ID at byte 8.
+            uint64_t id = (address >> 63) != 0 ? (address & 0x7fffffffffffffffull) : *(uint64_t*)(address + 8);
+            return metal_resource<RaytracingAccelerationStructure>(id);
         default:
             if (ASSERTS && address == 0)
                 abort("Tlas.get() on address 0");

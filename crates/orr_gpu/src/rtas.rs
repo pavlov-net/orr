@@ -15,6 +15,10 @@ bitflags::bitflags! {
         const ALLOW_DATA_ACCESS = 1 << 2;
         /// Geometry may carry opacity micromaps.
         const ALLOW_OMM = 1 << 3;
+        /// The result is rebuilt within a few frames. Backends without cluster acceleration
+        /// structures build a cluster BLAS so marked for a cheap build over a fast trace;
+        /// others ignore it.
+        const TRANSIENT = 1 << 4;
     }
 }
 

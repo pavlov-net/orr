@@ -1,11 +1,12 @@
 //! Classic BLAS and TLAS over caller memory, and opacity micromaps, which Metal lacks.
 //!
 //! A classic acceleration structure lives in a DeviceLocal block's placement heap, and its
-//! address is its resource ID: what `abi.slang`'s `Tlas.get()` reinterprets as the TLAS, and
-//! what Metal's instance descriptors name a BLAS by. TLAS builds first rewrite the instance
+//! address is its resource ID tagged in bit 63 ([`CLASSIC_TAG`]); a cluster BLAS or PTLAS
+//! address is memory whose header holds the ID (`cluster.rs`). `abi.slang`'s `Tlas.get()`
+//! and the instance conversion below take either. TLAS builds first rewrite the instance
 //! records, laid out as the Vulkan backend's, into Metal's indirect instance descriptors.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bytemuck::{Pod, Zeroable};
 use objc2::rc::Retained;
@@ -25,7 +26,7 @@ use objc2_metal::{
 use super::command::CommandList;
 use super::device::{Device, Shared, metal_error};
 use super::memory::{Allocation, MemoryKind, malloc};
-use super::{Obj, not_implemented};
+use super::{Obj, lock, not_implemented};
 use crate::{Error, GpuAddress, GpuPtr, Hazards, RtasFlags, RtasSizes, Stages, Tlas};
 
 /// Bytes of Metal's `MTLIndirectAccelerationStructureInstanceDescriptor`.
@@ -38,6 +39,14 @@ const INSTANCE_CONVERT: &str = r#"
 using namespace metal;
 struct Orr { float t[12]; uint custom_mask; uint sbt_flags; ulong blas; };
 struct Mtl { packed_float3 m[4]; uint options; uint mask; uint ift_offset; uint user_id; ulong as_id; };
+ulong resolve(ulong a, thread bool& cluster) {
+    cluster = false;
+    if (a == 0) return 0;
+    if ((a >> 63) != 0) return a & ~(1ul << 63);
+    uint kind = *reinterpret_cast<device const uint*>(a);
+    cluster = kind == 3 || kind == 4;
+    return reinterpret_cast<device const ulong*>(a)[1];
+}
 struct Args { device const Orr* src; device Mtl* dst; uint count; uint pad; };
 kernel void convert(constant Args& a [[buffer(0)]], uint i [[thread_position_in_grid]]) {
     if (i >= a.count) return;
@@ -48,11 +57,40 @@ kernel void convert(constant Args& a [[buffer(0)]], uint i [[thread_position_in_
     o.options = (v.sbt_flags >> 24) & 0xf;
     o.mask = v.blas == 0 ? 0 : v.custom_mask >> 24;
     o.ift_offset = 0;
-    o.user_id = v.custom_mask & 0xffffff;
-    o.as_id = v.blas;
+    bool cluster;
+    o.as_id = resolve(v.blas, cluster);
+    o.user_id = (v.custom_mask & 0xffffff) | (cluster ? 1u << 31 : 0u);
     a.dst[i] = o;
 }
+// The per-triangle data of a classic triangle BLAS, as cluster BLAS give theirs (cluster.msl):
+// no cluster, geometry 0, the triangle, then its corners for hits to fetch.
+struct DataArgs { device const float* positions; device const uint* indices; device uint* out; uint count; uint pad; };
+kernel void classic_data(constant DataArgs& a [[buffer(0)]], uint t [[thread_position_in_grid]]) {
+    if (t >= a.count) return;
+    device uint* o = a.out + t * 12;
+    o[0] = 0xffffffffu;
+    o[1] = 0;
+    o[2] = t;
+    for (uint c = 0; c < 3; c++) {
+        uint v = a.indices ? a.indices[t * 3 + c] : t * 3 + c;
+        for (uint k = 0; k < 3; k++) o[3 + c * 3 + k] = as_type<uint>(a.positions[v * 3 + k]);
+    }
+}
 "#;
+
+/// Bytes of a triangle's primitive data, as `cluster.rs` lays it out.
+const TRIANGLE_DATA_BYTES: u64 = 48;
+
+/// The arguments of `classic_data`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct DataArgs {
+    positions: u64,
+    indices: u64,
+    out: u64,
+    count: u32,
+    pad: u32,
+}
 
 /// The arguments of [`INSTANCE_CONVERT`].
 #[repr(C)]
@@ -181,16 +219,20 @@ pub struct ClassicAs {
     shared: Arc<Shared>,
 }
 
+/// Bit 63 of a classic acceleration structure's address, which is its resource ID: no
+/// device address sets it.
+pub(super) const CLASSIC_TAG: u64 = 1 << 63;
+
 impl ClassicAs {
-    /// The address instances and traces name it by: its resource ID.
+    /// The address instances and traces name it by: its resource ID, tagged.
     pub fn address(&self) -> GpuAddress {
-        GpuAddress(self.id)
+        GpuAddress(self.id | CLASSIC_TAG)
     }
 
     /// The TLAS kernels trace.
     pub fn tlas(&self) -> Tlas {
         assert_eq!(self.kind, ClassicKind::Tlas, "tlas() of a BLAS");
-        Tlas(self.id)
+        Tlas(self.id | CLASSIC_TAG)
     }
 }
 
@@ -271,7 +313,7 @@ impl Device {
     /// The result and scratch sizes of building `d`. The result size covers the heap
     /// alignment, so a block of it holds the structure at offset 0.
     pub fn classic_sizes(&self, d: &ClassicDesc) -> RtasSizes {
-        let desc = descriptor(d, None);
+        let desc = descriptor(d, None, Some(0));
         let base: &MTLAccelerationStructureDescriptor = &desc;
         let sizes = self
             .shared
@@ -346,7 +388,18 @@ impl CommandList<'_> {
             }
             _ => None,
         };
-        let desc = descriptor(b.desc, instances);
+        let data = match b.desc.geometry {
+            ClassicGeometry::Triangles {
+                positions,
+                indices,
+                triangle_count,
+                ..
+            } => {
+                Some(self.triangle_data(positions.address().0, indices.address().0, triangle_count))
+            }
+            _ => None,
+        };
+        let desc = descriptor(b.desc, instances, data);
         let e = self.compute();
         // SAFETY: the inputs, destination and scratch are live device memory, as on every
         // backend.
@@ -362,6 +415,40 @@ impl CommandList<'_> {
         }
         self.keep.push(Box::new(b.dst.raw.clone()));
         self.barrier(Stages::AS_BUILD, Stages::ALL, Hazards::ACCEL_STRUCT);
+    }
+
+    /// Writes the per-triangle data of a classic triangle BLAS, in memory the list keeps;
+    /// returns its address. Hits fetch their corners from it, since Metal cannot.
+    fn triangle_data(&mut self, positions: u64, indices: u64, count: u32) -> u64 {
+        let shared = Arc::clone(&self.queue.shared);
+        let dst = malloc::<u8>(
+            &shared,
+            MemoryKind::DeviceLocal,
+            TRIANGLE_DATA_BYTES * u64::from(count.max(1)),
+            "triangle data",
+        )
+        .expect("triangle data");
+        let address = dst.gpu().address().0;
+        let state = shared
+            .accel_kernel("classic_data")
+            .expect("the triangle data kernel");
+        let args = DataArgs {
+            positions,
+            indices,
+            out: address,
+            count,
+            pad: 0,
+        };
+        self.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+        self.dispatch_state(
+            &state,
+            bytemuck::bytes_of(&args),
+            [count.div_ceil(64).max(1), 1, 1],
+            [64, 1, 1],
+        );
+        self.barrier(Stages::COMPUTE, Stages::AS_BUILD, Hazards::empty());
+        self.keep.push(Box::new(dst));
+        address
     }
 
     /// Rewrites `capacity` instance records at `records` into Metal's descriptors, in
@@ -397,14 +484,35 @@ impl CommandList<'_> {
         address
     }
 
+    /// Writes the bytes `a` compacts into to `dst`, once its build has completed on the GPU.
     pub fn classic_compacted_size(&mut self, a: &ClassicAs, dst: GpuPtr<u64>) {
-        let _ = (a, dst);
-        not_implemented("CommandList::classic_compacted_size")
+        self.barrier(Stages::AS_BUILD, Stages::AS_BUILD, Hazards::empty());
+        let e = self.compute();
+        // SAFETY: the structure is live and `dst` is eight bytes of the caller's memory.
+        unsafe {
+            e.writeCompactedAccelerationStructureSize_toBuffer(
+                &a.raw,
+                MTL4BufferRange {
+                    bufferAddress: dst.address().0,
+                    length: 8,
+                },
+            );
+        }
+        self.keep.push(Box::new(a.raw.clone()));
+        self.barrier(Stages::AS_BUILD, Stages::ALL, Hazards::empty());
     }
 
+    /// Copies `src` into `dst`, created with at least its compacted size.
     pub fn compact_classic(&mut self, dst: &ClassicAs, src: &ClassicAs) {
-        let _ = (dst, src);
-        not_implemented("CommandList::compact_classic")
+        self.barrier(Stages::AS_BUILD, Stages::AS_BUILD, Hazards::empty());
+        let e = self.compute();
+        // SAFETY: both structures are live until the submit completes.
+        unsafe {
+            e.copyAndCompactAccelerationStructure_toAccelerationStructure(&src.raw, &dst.raw)
+        };
+        self.keep.push(Box::new(src.raw.clone()));
+        self.keep.push(Box::new(dst.raw.clone()));
+        self.barrier(Stages::AS_BUILD, Stages::ALL, Hazards::ACCEL_STRUCT);
     }
 
     pub fn build_micromap(&mut self, d: &MicromapDesc<'_>, dst: &Micromap, scratch: GpuAddress) {
@@ -416,8 +524,23 @@ impl CommandList<'_> {
 impl Shared {
     /// The compute pipeline of [`INSTANCE_CONVERT`], compiled once.
     fn instance_convert(&self) -> Result<Obj<ProtocolObject<dyn MTLComputePipelineState>>, Error> {
-        static STATE: OnceLock<Obj<ProtocolObject<dyn MTLComputePipelineState>>> = OnceLock::new();
-        if let Some(s) = STATE.get() {
+        self.accel_kernel("convert")
+    }
+
+    /// The compute pipeline of kernel `name` of [`INSTANCE_CONVERT`], compiled once.
+    fn accel_kernel(
+        &self,
+        name: &'static str,
+    ) -> Result<Obj<ProtocolObject<dyn MTLComputePipelineState>>, Error> {
+        type States = Mutex<
+            Vec<(
+                &'static str,
+                Obj<ProtocolObject<dyn MTLComputePipelineState>>,
+            )>,
+        >;
+        static STATES: OnceLock<States> = OnceLock::new();
+        let states = STATES.get_or_init(Mutex::default);
+        if let Some((_, s)) = lock(states).iter().find(|(n, _)| *n == name) {
             return Ok(s.clone());
         }
         let library = self
@@ -425,10 +548,11 @@ impl Shared {
             .newLibraryWithSource_options_error(&NSString::from_str(INSTANCE_CONVERT), None)
             .map_err(|e| metal_error("newLibraryWithSource", &e))?;
         let f = MTL4LibraryFunctionDescriptor::new();
-        f.setName(Some(&NSString::from_str("convert")));
+        f.setName(Some(&NSString::from_str(name)));
         f.setLibrary(Some(&library));
-        let state = self.compute_state(&f, [64, 1, 1], "instance conversion")?;
-        Ok(STATE.get_or_init(|| state).clone())
+        let state = self.compute_state(&f, [64, 1, 1], name)?;
+        lock(states).push((name, state.clone()));
+        Ok(state)
     }
 }
 
@@ -437,6 +561,7 @@ impl Shared {
 fn descriptor(
     d: &ClassicDesc,
     instances: Option<u64>,
+    data: Option<u64>,
 ) -> Retained<MTL4AccelerationStructureDescriptor> {
     let range = |address: u64, bytes: u64| MTL4BufferRange {
         bufferAddress: address,
@@ -459,6 +584,17 @@ fn descriptor(
                 g.setTriangleCount(triangle_count as usize);
                 if indices != GpuPtr::NULL {
                     g.setIndexBuffer(range(indices.address().0, 12 * u64::from(triangle_count)));
+                }
+            }
+            if let Some(data) = data {
+                // SAFETY: `data` holds a record per triangle once its kernel has run.
+                unsafe {
+                    g.setPrimitiveDataBuffer(range(
+                        data,
+                        TRIANGLE_DATA_BYTES * u64::from(triangle_count),
+                    ));
+                    g.setPrimitiveDataElementSize(TRIANGLE_DATA_BYTES as usize);
+                    g.setPrimitiveDataStride(TRIANGLE_DATA_BYTES as usize);
                 }
             }
             g.setVertexFormat(MTLAttributeFormat::Float3);

@@ -105,9 +105,19 @@ pub(super) enum Encoder {
     Compute(Retained<ComputeEncoder>),
 }
 
+/// Work a list leaves to the CPU between two of its command buffers: it runs once the GPU
+/// has completed everything before it, and records into a fresh list the queue commits next.
+/// Metal encodes some work only from values the GPU writes, such as acceleration-structure
+/// builds whose counts kernels decide.
+pub(super) type HostStep = Box<dyn FnOnce(&mut CommandList<'_>) + Send>;
+
 /// What a list's commands use until its submit completes.
 pub(super) struct Finished {
-    pub(super) buffer: Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
+    /// The list's command buffers in order, each with the CPU step that follows it.
+    pub(super) buffers: Vec<(
+        Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
+        Option<HostStep>,
+    )>,
     _allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
     _table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
     _inline: Vec<Allocation<u8>>,
@@ -138,6 +148,8 @@ pub struct CommandList<'q> {
     /// Bytes used of the last inline block.
     inline_used: u64,
     pub(super) keep: Vec<Box<dyn Any + Send>>,
+    /// Ended command buffers before `buffer`, each with the CPU step that follows it.
+    segments: Vec<(Retained<ProtocolObject<dyn MTL4CommandBuffer>>, HostStep)>,
     /// Each pass's name and the sequence number of its begin timestamp in the device's
     /// timestamp ring.
     passes: Vec<(&'static str, u64)>,
@@ -191,6 +203,7 @@ impl<'q> CommandList<'q> {
             inline: Vec::new(),
             inline_used: INLINE_BLOCK,
             keep: Vec::new(),
+            segments: Vec::new(),
             passes: Vec::new(),
             in_pass: false,
             finished: false,
@@ -202,14 +215,38 @@ impl<'q> CommandList<'q> {
         self.end_encoder();
         self.buffer.endCommandBuffer();
         self.finished = true;
+        let mut buffers: Vec<_> = std::mem::take(&mut self.segments)
+            .into_iter()
+            .map(|(b, step)| (b, Some(step)))
+            .collect();
+        buffers.push((self.buffer.clone(), None));
         Finished {
-            buffer: self.buffer.clone(),
+            buffers,
             _allocator: self.allocator.clone(),
             _table: self.table.clone(),
             _inline: std::mem::take(&mut self.inline),
             _keep: std::mem::take(&mut self.keep),
             passes: std::mem::take(&mut self.passes),
         }
+    }
+
+    /// Ends the command buffer so far and leaves `step` to the CPU before what follows: the
+    /// queue runs it once the GPU has completed this list's work so far and commits what it
+    /// records before the rest. Later commands wait for all of it.
+    pub(super) fn split(&mut self, step: HostStep) {
+        assert!(self.pass.is_none(), "a CPU step inside rendering");
+        self.end_encoder();
+        self.buffer.endCommandBuffer();
+        let next = self
+            .queue
+            .shared
+            .device
+            .newCommandBuffer()
+            .expect("newCommandBuffer");
+        next.beginCommandBufferWithAllocator(&self.allocator);
+        let done = std::mem::replace(&mut self.buffer, next);
+        self.segments.push((done, step));
+        self.pending = Some((MTLStages::All, MTLStages::All));
     }
 
     pub(super) fn end_encoder(&mut self) {

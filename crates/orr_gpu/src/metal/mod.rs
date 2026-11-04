@@ -14,6 +14,7 @@
 //! The descriptor and report types repeat the Vulkan backend's definitions field for field.
 
 mod accel;
+mod cluster;
 mod command;
 mod device;
 mod heap;

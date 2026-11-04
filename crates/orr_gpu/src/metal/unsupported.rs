@@ -19,7 +19,6 @@ use super::not_implemented;
 use super::pipeline::ShaderStage;
 use super::queue::{Queue, QueueKind};
 use super::texture::Texture;
-use crate::rtas::{self, PtlasArgs, RtasIo, RtasOp, RtasOpDesc, RtasSizes};
 use crate::{
     ComponentType, Error, GpuAddress, GpuPtr, HdrMetadata, LatencyMarker, LatencyTimings,
     OutputFormat, PresentMode, Refresh, StorageImageIndex, SwapchainDesc, TimelinePoint,
@@ -350,39 +349,6 @@ impl Device {
     ) -> Result<RayDispatchPipeline, Error> {
         let _ = (s, name);
         Err(Error::NotImplemented("ray-dispatch pipelines"))
-    }
-
-    pub fn rtas_sizes(&self, d: &RtasOpDesc) -> RtasSizes {
-        let _ = d;
-        not_implemented("cluster acceleration structures")
-    }
-
-    /// Bytes per record of `op`'s arguments: orr's own records, which nothing reads yet.
-    pub fn rtas_args_stride(&self, op: RtasOp) -> u32 {
-        (match op {
-            RtasOp::BuildClas => size_of::<rtas::ClasBuild>(),
-            RtasOp::BuildTemplates => size_of::<rtas::TemplateBuild>(),
-            RtasOp::InstantiateTemplates => size_of::<rtas::Instantiate>(),
-            RtasOp::BuildClusterBlas => size_of::<rtas::ClusterBlas>(),
-            RtasOp::Move => size_of::<rtas::Move>(),
-            RtasOp::Ptlas => size_of::<rtas::PtlasCommand>(),
-        }) as u32
-    }
-
-    /// Bytes per record of the arrays PTLAS commands point at.
-    pub fn ptlas_args_stride(&self, args: PtlasArgs) -> u32 {
-        (match args {
-            PtlasArgs::Write => size_of::<rtas::PtlasWrite>(),
-            PtlasArgs::Update => size_of::<rtas::PtlasUpdate>(),
-            PtlasArgs::Translate => size_of::<rtas::PtlasTranslate>(),
-        }) as u32
-    }
-}
-
-impl CommandList<'_> {
-    pub fn rtas_execute(&mut self, d: &RtasOpDesc, io: &RtasIo) {
-        let _ = (d, io);
-        not_implemented("cluster acceleration structures")
     }
 }
 
