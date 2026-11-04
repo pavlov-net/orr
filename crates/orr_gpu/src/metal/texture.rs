@@ -45,6 +45,24 @@ impl Texture {
     }
 }
 
+impl Texture {
+    /// A drawable's texture. The layer's residency set holds it, so it takes no part in the
+    /// device's.
+    pub(super) fn drawable(
+        shared: &Arc<Shared>,
+        raw: objc2::rc::Retained<ProtocolObject<dyn MTLTexture>>,
+        desc: TextureDesc,
+    ) -> Texture {
+        Texture {
+            raw: Obj(raw),
+            desc,
+            dedicated: false,
+            sparse: None,
+            shared: Arc::clone(shared),
+        }
+    }
+}
+
 impl Drop for Texture {
     fn drop(&mut self) {
         let raw = self.raw.clone();

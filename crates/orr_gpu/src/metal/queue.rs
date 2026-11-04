@@ -10,12 +10,14 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTL4CommandBuffer, MTL4CommandQueue, MTL4CommitFeedback, MTL4CommitOptions, MTL4CounterHeap,
-    MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTLDevice, MTLEvent, MTLSharedEvent,
+    MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTLDevice, MTLDrawable, MTLEvent,
+    MTLSharedEvent,
 };
+use objc2_quartz_core::CAMetalDrawable;
 
 use super::command::{CommandList, Finished};
 use super::device::{Device, Shared};
-use super::unsupported::SwapchainFrame;
+use super::swapchain::SwapchainFrame;
 use super::{MAX_TIMELINES, Obj, lock};
 use crate::{Error, PassResult, QueueKind, TimelinePoint};
 
@@ -164,6 +166,16 @@ impl Queue {
         lists: Vec<CommandList<'_>>,
         wait: &[TimelinePoint],
     ) -> Result<TimelinePoint, Error> {
+        self.submit_with(lists, wait, None)
+    }
+
+    /// [`Self::submit`], waiting for `drawable` before the commits and signaling it after.
+    fn submit_with(
+        &self,
+        lists: Vec<CommandList<'_>>,
+        wait: &[TimelinePoint],
+        drawable: Option<Obj<ProtocolObject<dyn CAMetalDrawable>>>,
+    ) -> Result<TimelinePoint, Error> {
         let mut finished: Vec<_> = lists.into_iter().map(CommandList::finish).collect();
         let passes: Vec<(&'static str, u64)> = finished
             .iter_mut()
@@ -179,10 +191,10 @@ impl Queue {
         if steps || backlog.queued > 0 {
             self.send(
                 &mut backlog,
-                Box::new(move |q: &Queue| q.commit_submit(&wait, finished, point)),
+                Box::new(move |q: &Queue| q.commit_submit(&wait, finished, point, drawable)),
             );
         } else {
-            self.commit_submit(&wait, finished, point);
+            self.commit_submit(&wait, finished, point, drawable);
         }
         Ok(point)
     }
@@ -214,13 +226,18 @@ impl Queue {
     }
 
     /// Commits a submit's lists after `wait`, running their CPU steps on the way, and
-    /// signals `point`; on the submitting thread or the step thread, in submit order.
+    /// signals `point`; on the submitting thread or the step thread, in submit order. The
+    /// commits wait for `drawable`, which is signaled once they are all in.
     fn commit_submit(
         &self,
         wait: &[TimelinePoint],
         mut finished: Vec<Finished>,
         point: TimelinePoint,
+        drawable: Option<Obj<ProtocolObject<dyn CAMetalDrawable>>>,
     ) {
+        let drawable = drawable
+            .as_ref()
+            .map(|d| ProtocolObject::<dyn MTLDrawable>::from_ref(&*d.0));
         self.shared.commit_residency();
         // A point of this queue's own timeline is waited on too: Metal 4 runs a queue's
         // command buffers concurrently, so only the event orders them after that point.
@@ -228,6 +245,9 @@ impl Queue {
             let event = self.shared.event(p.timeline);
             self.raw
                 .waitForEvent_value(ProtocolObject::from_ref(&*event), p.value);
+        }
+        if let Some(d) = drawable {
+            self.raw.waitForDrawable(d);
         }
         // Commits up to each CPU step, runs it once the GPU has caught up and commits what
         // it recorded before the rest.
@@ -237,6 +257,9 @@ impl Queue {
             self.run_steps(f, &mut ready, &mut steps);
         }
         self.commit(&mut ready);
+        if let Some(d) = drawable {
+            self.raw.signalDrawable(d);
+        }
         finished.extend(steps);
         self.signal(point);
         self.shared.defer_until(
@@ -368,30 +391,50 @@ impl Queue {
     ) -> TimelinePoint {
         let mut backlog = lock(&self.backlog);
         let point = self.next_point();
-        if backlog.queued > 0 {
-            self.send(
-                &mut backlog,
-                Box::new(move |q: &Queue| {
-                    update(&q.raw);
-                    q.signal(point);
-                }),
-            );
-        } else {
-            update(&self.raw);
-            self.signal(point);
-        }
+        self.run_in_order(&mut backlog, move |q| {
+            update(&q.raw);
+            q.signal(point);
+        });
         point
     }
 
-    /// Submits `lists`, which write `frame`. No swapchains on Metal yet.
+    /// Runs `job` in order with this queue's submits: at once, or on the step thread after
+    /// the submits waiting there.
+    pub(super) fn in_order(&self, job: impl FnOnce(&Queue) + Send + 'static) {
+        let mut backlog = lock(&self.backlog);
+        self.run_in_order(&mut backlog, job);
+    }
+
+    /// [`Self::in_order`] for a caller holding the backlog.
+    fn run_in_order(&self, backlog: &mut Backlog, job: impl FnOnce(&Queue) + Send + 'static) {
+        if backlog.queued > 0 {
+            self.send(backlog, Box::new(job));
+        } else {
+            job(self);
+        }
+    }
+
+    /// Submits `lists`, after which `frame` can be presented. The lists run once the display
+    /// is done with the drawable; its contents are undefined until they write it. Present
+    /// queue only.
     pub fn submit_present(
         &self,
         lists: Vec<CommandList<'_>>,
         wait: &[TimelinePoint],
         frame: &SwapchainFrame,
     ) -> Result<TimelinePoint, Error> {
-        let _ = (lists, wait, frame);
-        Err(Error::NotImplemented("Queue::submit_present"))
+        assert_eq!(
+            self.kind,
+            QueueKind::Present,
+            "swapchain frames are submitted on the Present queue"
+        );
+        assert!(
+            frame.submitted.get().is_none(),
+            "a swapchain frame is submitted once"
+        );
+        let point = self.submit_with(lists, wait, Some(frame.drawable.clone()))?;
+        frame.submitted.set(Some(point));
+        Ok(point)
     }
 
     /// Marks the end of `frame` for tools; nothing on Metal.

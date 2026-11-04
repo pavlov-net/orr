@@ -26,6 +26,7 @@ mod mesh;
 mod pipeline;
 mod queue;
 mod sparse;
+mod swapchain;
 mod texture;
 mod unsupported;
 
@@ -45,17 +46,17 @@ pub use mesh::MeshPipeline;
 pub use pipeline::{ComputePipeline, ShaderStage};
 pub use queue::{HostTimeline, Queue};
 pub use sparse::{SparseAllocation, SparseBinds};
+pub use swapchain::{LowLatency, Swapchain, SwapchainFrame};
 pub use texture::Texture;
-pub use unsupported::{
-    Diagnostics, ExecutionSet, LowLatency, RayDispatchPipeline, Swapchain, SwapchainFrame,
-};
+pub use unsupported::{Diagnostics, ExecutionSet, RayDispatchPipeline};
 
 /// The most queues a device has, one per [`QueueKind`].
 const MAX_TIMELINES: usize = 5;
 
 /// A Metal object shared between threads. Metal's devices, resources (buffers, heaps,
-/// textures), events, libraries and pipeline states are safe to use from any thread; objc2
-/// marks only some of their protocols `Send + Sync`. Only those kinds go in here.
+/// textures), events, libraries and pipeline states are safe to use from any thread, as are
+/// Core Animation's Metal layers and drawables; objc2 marks only some of their protocols
+/// `Send + Sync`. Only those kinds go in here.
 pub(super) struct Obj<T: Message>(pub(super) Retained<T>);
 
 // SAFETY: only thread-safe Metal objects are wrapped (see above); the wrapper hands out

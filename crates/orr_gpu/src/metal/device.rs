@@ -347,11 +347,13 @@ fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
         pipeline_executable_info: false,
         conservative_raster: false,
         ray_tracing_validation: false,
-        present_wait: false,
+        // Presented handlers report each drawable's present.
+        present_wait: desc.queues.present,
         low_latency: false,
         present_metering: false,
         present_timing: false,
-        hdr_metadata: false,
+        // `CAEDRMetadata` on the layer.
+        hdr_metadata: desc.queues.present,
         // Emulated over classic structures (cluster.rs).
         cluster: ClusterCaps {
             formats: &[ClusterVertexFormat::F32x3],
