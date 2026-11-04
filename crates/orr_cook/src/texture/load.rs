@@ -275,7 +275,7 @@ pub(super) fn block_range(
     let stored = match vk_format {
         vk::BC4_UNORM | vk::BC4_SNORM => 1,
         vk::BC5_UNORM | vk::BC5_SNORM => 2,
-        vk::BC6H_UFLOAT | vk::BC6H_SFLOAT => 3,
+        vk::BC1_RGB_UNORM | vk::BC1_RGB_SRGB | vk::BC6H_UFLOAT | vk::BC6H_SFLOAT => 3,
         _ => 4,
     };
     let bc7 = matches!(vk_format, vk::BC7_UNORM | vk::BC7_SRGB);
@@ -601,6 +601,10 @@ fn decode_block(vk_format: u32, block: &[u8]) -> Result<[[f32; 4]; 16], String> 
     Ok(match vk_format {
         BC1_RGB_UNORM | BC1_RGB_SRGB | BC1_RGBA_UNORM | BC1_RGBA_SRGB => {
             bcdec_rs::bc1(block, &mut b8, 16);
+            // bcdec reads index 3 of a c0 <= c1 block as transparent; only RGBA formats are.
+            if matches!(vk_format, BC1_RGB_UNORM | BC1_RGB_SRGB) {
+                b8.iter_mut().skip(3).step_by(4).for_each(|a| *a = 255);
+            }
             unorm(&b8, 4)
         }
         BC2_UNORM | BC2_SRGB => {
@@ -694,6 +698,19 @@ mod tests {
         block[..8].copy_from_slice(&[127, 0x81, 0x49, 0x92, 0x24, 0x49, 0x92, 0x24]);
         let texels = decode_block(vk::BC5_SNORM, &block).unwrap();
         assert!(texels.iter().all(|t| t[..2] == [-1.0, 0.0]), "{texels:?}");
+    }
+
+    #[test]
+    fn bc1_rgb_blocks_have_no_alpha() {
+        // c0 <= c1 with every index 3: black, and transparent only where the format has alpha.
+        let block = [0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        let texels = decode_block(vk::BC1_RGB_UNORM, &block).unwrap();
+        assert!(
+            texels.iter().all(|t| *t == [0.0, 0.0, 0.0, 1.0]),
+            "{texels:?}"
+        );
+        let texels = decode_block(vk::BC1_RGBA_UNORM, &block).unwrap();
+        assert!(texels.iter().all(|t| t[3] == 0.0), "{texels:?}");
     }
 
     #[test]
