@@ -175,3 +175,28 @@ fn open_file_can_be_replaced_by_rename() {
         assert_eq!(run_ring(ring, &file, &[(0, SECTOR)]), [b"old contents"]);
     }
 }
+
+#[test]
+fn handles_opened_together_name_one_file_while_the_path_is_replaced() {
+    let p = path("together.bin");
+    let new = path("together.new");
+    fs::write(&p, [0; SECTOR]).unwrap();
+    std::thread::scope(|s| {
+        let reader = s.spawn(|| {
+            for _ in 0..2000 {
+                let (file, shared) = ReadFile::open_with_shared(&p).unwrap();
+                let mut sector = AlignedBuf::new(SECTOR);
+                file.read(0, &mut sector).unwrap();
+                let mut byte = [0];
+                read_at(&shared, 0, &mut byte).unwrap();
+                assert_eq!(sector.as_slice()[0], byte[0]);
+            }
+        });
+        let mut i = 0_u8;
+        while !reader.is_finished() {
+            i = i.wrapping_add(1);
+            fs::write(&new, [i; SECTOR]).unwrap();
+            fs::rename(&new, &p).unwrap();
+        }
+    });
+}

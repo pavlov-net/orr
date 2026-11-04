@@ -10,11 +10,12 @@ use windows::Win32::Foundation::{
     CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, HANDLE, WAIT_FAILED, WIN32_ERROR,
 };
 use windows::Win32::Storage::FileSystem::{
-    FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_STORAGE_INFO, FileStorageInfo, GetFileInformationByHandleEx, HIORING, IORING_BUFFER_REF,
-    IORING_BUFFER_REF_0, IORING_CQE, IORING_CREATE_ADVISORY_FLAGS_NONE, IORING_CREATE_FLAGS,
-    IORING_CREATE_REQUIRED_FLAGS_NONE, IORING_HANDLE_REF, IORING_HANDLE_REF_0, IORING_REF_RAW,
-    IORING_SQE_FLAGS, IORING_VERSION, IORING_VERSION_3, IOSQE_FLAGS_NONE, ReadFile,
+    FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_STORAGE_INFO, FileIdInfo, FileStorageInfo,
+    GetFileInformationByHandleEx, HIORING, IORING_BUFFER_REF, IORING_BUFFER_REF_0, IORING_CQE,
+    IORING_CREATE_ADVISORY_FLAGS_NONE, IORING_CREATE_FLAGS, IORING_CREATE_REQUIRED_FLAGS_NONE,
+    IORING_HANDLE_REF, IORING_HANDLE_REF_0, IORING_REF_RAW, IORING_SQE_FLAGS, IORING_VERSION,
+    IORING_VERSION_3, IOSQE_FLAGS_NONE, ReadFile,
 };
 use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -48,18 +49,37 @@ pub(crate) fn open_unbuffered(path: &Path) -> io::Result<(File, bool)> {
     }
 }
 
-fn sectors_fit(f: &File) -> bool {
-    let mut info = FILE_STORAGE_INFO::default();
+/// The file's information of `class`, whose struct is `T`, if the file system gives it.
+fn file_info<T: Default>(f: &File, class: FILE_INFO_BY_HANDLE_CLASS) -> Option<T> {
+    let mut info = T::default();
     // SAFETY: `info` is the size given and is written only during the call.
     let got = unsafe {
         GetFileInformationByHandleEx(
             HANDLE(f.as_raw_handle()),
-            FileStorageInfo,
+            class,
             (&raw mut info).cast(),
-            size_of::<FILE_STORAGE_INFO>() as u32,
+            size_of::<T>() as u32,
         )
     };
-    got.is_ok() && SECTOR.is_multiple_of(info.LogicalBytesPerSector as usize)
+    got.ok().map(|()| info)
+}
+
+/// Whether `a` and `b` name one file. True where the file system has no file ids. The ids are
+/// 128 bits because ReFS uses all of them.
+pub(crate) fn same_file(a: &File, b: &File) -> bool {
+    let id = |f: &File| {
+        file_info::<FILE_ID_INFO>(f, FileIdInfo)
+            .map(|info| (info.VolumeSerialNumber, info.FileId.Identifier))
+    };
+    match (id(a), id(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
+fn sectors_fit(f: &File) -> bool {
+    file_info::<FILE_STORAGE_INFO>(f, FileStorageInfo)
+        .is_some_and(|info| SECTOR.is_multiple_of(info.LogicalBytesPerSector as usize))
 }
 
 /// One read at `offset` on an overlapped handle, which can run alongside reads on other

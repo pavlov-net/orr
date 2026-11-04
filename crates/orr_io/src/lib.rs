@@ -86,6 +86,19 @@ fn open_unbuffered(path: &Path) -> io::Result<(File, bool)> {
     Ok((File::open(path)?, false))
 }
 
+#[cfg(windows)]
+use crate::windows::same_file;
+
+/// Whether `a` and `b` name one file. True where the system cannot tell.
+#[cfg(unix)]
+fn same_file(a: &File, b: &File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (a.metadata(), b.metadata()) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        _ => true,
+    }
+}
+
 /// Fills `buf` from `offset` like [`read_at`]; a file that ends first is `UnexpectedEof`.
 pub fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
     if read_at(file, offset, buf)? < buf.len() {
@@ -153,6 +166,19 @@ impl ReadFile {
     pub fn open(path: &Path) -> io::Result<Self> {
         let (handle, unbuffered) = open_unbuffered(path)?;
         Ok(Self { handle, unbuffered })
+    }
+
+    /// Opens `path` as [`ReadFile::open`] and [`open_shared`] do, with both handles on the same
+    /// file even if another file is renamed over the path during the call. A file system that
+    /// cannot identify its files gets no such check.
+    pub fn open_with_shared(path: &Path) -> io::Result<(Self, File)> {
+        loop {
+            let shared = open_shared(path)?;
+            let file = Self::open(path)?;
+            if same_file(&file.handle, &shared) {
+                return Ok((file, shared));
+            }
+        }
     }
 
     /// Reads at `offset`, a multiple of [`SECTOR`], into `buf`. Returns the bytes read; fewer

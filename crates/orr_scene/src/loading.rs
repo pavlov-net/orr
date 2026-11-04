@@ -300,9 +300,10 @@ pub(crate) struct ArchiveFile {
 
 impl ArchiveFile {
     pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
+        let (reads, archive) = ReadFile::open_with_shared(path)?;
         Ok(Self {
-            archive: Mutex::new(Some(orr_io::open_shared(path)?)),
-            reads: Arc::new(ReadFile::open(path)?),
+            archive: Mutex::new(Some(archive)),
+            reads: Arc::new(reads),
         })
     }
 }
