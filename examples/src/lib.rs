@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -374,37 +375,53 @@ pub fn entry_head(archive: &Archive, id: AssetId) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// How long dropping [`Workers`] waits for them, which covers the jobs that take milliseconds.
+const WORKER_STOP_WAIT: Duration = Duration::from_millis(100);
+
 /// Threads lent to orr's loading side until dropped.
 pub struct Workers {
     loading: Arc<Loading>,
     threads: Vec<JoinHandle<()>>,
+    /// Disconnects when every thread has ended; nothing is sent on it.
+    ended: Receiver<()>,
 }
 
 impl Workers {
     pub fn new(loading: Arc<Loading>, count: usize) -> Self {
+        let (running, ended) = mpsc::channel();
         let threads = (0..count)
             .map(|_| {
                 let l = Arc::clone(&loading);
-                std::thread::spawn(move || l.run_worker())
+                let running = running.clone();
+                std::thread::spawn(move || {
+                    l.run_worker();
+                    drop(running);
+                })
             })
             .collect();
-        Workers { loading, threads }
+        Workers {
+            loading,
+            threads,
+            ended,
+        }
     }
 }
 
 impl Drop for Workers {
-    /// Stops the workers. One still compiling a pipeline after a second is left to finish on its
-    /// own or die with the process, since the driver cannot be interrupted and closing a window
-    /// should not wait minutes for it.
+    /// Stops the workers. One still in a job after [`WORKER_STOP_WAIT`] finishes it on its own or
+    /// dies with the process: a pipeline compile cannot be interrupted, and closing a window
+    /// should not wait minutes for one the process no longer needs.
     fn drop(&mut self) {
         self.loading.stop_workers();
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_secs(1)
-            && !self.threads.iter().all(JoinHandle::is_finished)
+        let all_ended = matches!(
+            self.ended.recv_timeout(WORKER_STOP_WAIT),
+            Err(RecvTimeoutError::Disconnected)
+        );
+        for t in self
+            .threads
+            .drain(..)
+            .filter(|t| all_ended || t.is_finished())
         {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        for t in self.threads.drain(..).filter(JoinHandle::is_finished) {
             t.join().expect("loading worker");
         }
     }

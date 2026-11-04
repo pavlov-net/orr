@@ -654,7 +654,9 @@ impl Renderer {
     ///
     /// Each job writes the device's pipeline cache file when it finishes. Dropping the renderer
     /// cancels the jobs no thread has started. A thread already compiling finishes that pipeline,
-    /// which a consumer joining its workers waits for, since the driver cannot be interrupted.
+    /// which a consumer joining its workers waits for, since the driver cannot be interrupted. On
+    /// Windows, a process that is ending need not join them: the system stops its threads before
+    /// the driver unloads.
     pub fn create_view_history(&mut self) -> Result<ViewHistoryId> {
         let gpu = self.scenes.device().clone();
         let loading = self.scenes.loading();
