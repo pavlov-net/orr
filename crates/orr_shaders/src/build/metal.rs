@@ -263,7 +263,9 @@ fn entry_signatures(msl: &str) -> Vec<(usize, String)> {
 
 /// Compiles the MSL at `metal` into the library `out` with Xcode's Metal compiler. The error
 /// holds the compiler's error lines. Math is `safe`, as SPIR-V's: Metal's default `fast`
-/// assumes no NaNs or infinities and reassociates.
+/// assumes no NaNs or infinities and reassociates. Nothing fuses into FMAs either, since
+/// fusing differs between call sites and kernels rely on evaluating one expression to the
+/// same bits everywhere (tessellated edges two patches share).
 pub(super) fn compile_library(metal: &Path, out: &Path) -> Result<(), String> {
     let output = Command::new("xcrun")
         .args([
@@ -272,6 +274,7 @@ pub(super) fn compile_library(metal: &Path, out: &Path) -> Result<(), String> {
             "metal",
             "-std=metal4.0",
             "-fmetal-math-mode=safe",
+            "-ffp-contract=off",
             "-o",
         ])
         .arg(out)

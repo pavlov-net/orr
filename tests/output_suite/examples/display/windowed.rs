@@ -1,9 +1,4 @@
-//! A window presented through `Display`: a row of gray steps
-//! from 1/64 of paper white up to the resolved peak, a calibration pattern that cycles every
-//! four seconds (peak patch on a 10,000-nit surround, paper white on 18% gray, black patch
-//! on black) and egui text naming the resolved display. Toggling Windows HDR, moving the SDR
-//! content brightness slider or moving the window to another monitor re-resolves on the
-//! next frame and is logged. Runs for the given seconds (default 60) or until closed.
+//! The example on Windows, the one target with a test window ([`gpu_suite::window`]).
 
 use std::time::{Duration, Instant};
 
@@ -65,7 +60,7 @@ struct Linear {
     key: (ResolvedDisplay, usize, [u32; 2]),
 }
 
-fn main() {
+pub(super) fn main() {
     let seconds: u64 = std::env::args()
         .nth(1)
         .and_then(|a| a.parse().ok())
