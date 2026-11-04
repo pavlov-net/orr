@@ -214,6 +214,12 @@ public struct InteriorExitScatter : IScatter
     {
         return cosine_hemisphere_pdf(dot(n, wi));
     }
+
+    public float3 eval_and_pdf(float3 wi, out float density)
+    {
+        density = pdf(wi);
+        return eval(wi);
+    }
 }
 
 public InteriorExitScatter interior_exit(float3 n, float eta)
@@ -239,26 +245,18 @@ public struct VertexScatter : IScatter
     public bool leave;              // a walk leaving an interior, which scatters as `way_out`
     public InteriorExitScatter way_out;
 
-    public float3 eval(float3 wi)
+    public float3 eval_and_pdf(float3 wi, out float density)
     {
         if (phase)
-            return float3(hg_phase(anisotropy, dot(travel, wi)));
+        {
+            density = hg_phase(anisotropy, dot(travel, wi));
+            return float3(density);
+        }
         if (leave)
-            return way_out.eval(wi);
+            return way_out.eval_and_pdf(wi, density);
         if (exit)
-            return walk.eval(wi);
-        return b.eval(wi);
-    }
-
-    public float pdf(float3 wi)
-    {
-        if (phase)
-            return hg_phase(anisotropy, dot(travel, wi));
-        if (leave)
-            return way_out.pdf(wi);
-        if (exit)
-            return walk.pdf(wi);
-        return b.pdf(wi);
+            return walk.eval_and_pdf(wi, density);
+        return b.eval_and_pdf(wi, density);
     }
 }
 
@@ -771,10 +769,7 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
                     if (delta)
                         fk = bk.delta_value(component, wi, pk);
                     else
-                    {
-                        fk = bk.eval(wi);
-                        pk = bk.pdf(wi);
-                    }
+                        fk = bk.eval_and_pdf(wi, pk);
                     spectral.weigh(k, fk, pk, hero_f, pdf);
                 }
                 spectral.update();

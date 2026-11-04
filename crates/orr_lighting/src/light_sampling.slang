@@ -185,6 +185,9 @@ public struct NeeVertex
     public uint2 pixel;
     // The local sampler of the pixel's screen tile, or null.
     public LocalLights* local;
+    // `directional_share` at `normal`: every candidate reads them.
+    public float share;
+    public float total;
 }
 
 // One light candidate at a vertex, before visibility.
@@ -901,6 +904,16 @@ public uint light_tile(uint2 pixel, uint frame)
     return (pcg(b.x | (b.y << 16)) + frame * TILE_FRAME_STEP) % TILE_COUNT;
 }
 
+// The receiver at `position` with shading normal `normal`, for pixel `pixel` and local sampler
+// `local`.
+public NeeVertex nee_vertex(LightSetGpu* set, float3 position, float3 normal, uint2 pixel, LocalLights* local)
+{
+    float total;
+    float share = directional_share(set, normal, total);
+    NeeVertex v = { position, normal, pixel, local, share, total };
+    return v;
+}
+
 // One next-event candidate for vertex `v`: with the vertex's directional share, a directional
 // light chosen by weight x n.l and a direction in its cone; otherwise, with the local
 // sampler's share, a light it holds and a point on it, or else a sample at a random offset
@@ -908,8 +921,8 @@ public uint light_tile(uint2 pixel, uint frame)
 // three sampler dimensions.
 public ResolvedLightSample nee_candidate(LightSetGpu* set, NeeVertex v, inout Sampler rng)
 {
-    float total;
-    float share = directional_share(set, v.normal, total);
+    float total = v.total;
+    float share = v.share;
     float choice = rng.next();
     float pick = rng.next();
     OwenSobol4 u4 = rng.next4_parts();

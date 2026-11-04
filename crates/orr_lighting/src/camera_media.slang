@@ -491,7 +491,7 @@ Fog reference_fog<S : ISurface, M : IMedium>(MediaApplyRoot r, FroxelRoot f, uin
             MediumPoint m = (MediumPoint)0;
             if (!at_sheet && d < linked_end)
                 m = M.sample(data, p);
-            NeeVertex nv = { p, float3(0.0), pixel, nullptr };
+            NeeVertex nv = nee_vertex(set, p, float3(0.0), pixel, nullptr);
             ResolvedLightSample c = nee_candidate(set, nv, rng);
             float cos_theta = dot(c.dir, dir);
             float3 sigma_t = float3(0.0);

@@ -167,6 +167,12 @@ public struct Bsdf : IDifferentiable
     no_diff float dms_ec;
     no_diff float3 mms;
     no_diff float mms_ec;
+    // Average energy complements of the multiple-scattering lobes, 1 where no evaluation needs
+    // them, and the view's Smith term: none depends on the light direction.
+    no_diff float mms_average;
+    no_diff float dms_average_above;
+    no_diff float dms_average_below;
+    no_diff float g1v;
 
     no_diff float3 diffuse;
     no_diff float3 thin_diffuse;
@@ -266,6 +272,13 @@ public struct Bsdf : IDifferentiable
     public float3 eval(float3 wi, out float3 diffuse)
     {
         float density;
+        return evaluate(local(wi), density, diffuse);
+    }
+
+    // `eval`, and in `density` what `pdf` gives for `wi`.
+    public float3 eval_and_pdf(float3 wi, out float density)
+    {
+        float3 diffuse;
         return evaluate(local(wi), density, diffuse);
     }
 
@@ -617,7 +630,7 @@ public struct Bsdf : IDifferentiable
     {
         float3 h = normalize(v + l);
         pdf = ggx_vndf_bounded_pdf(v, l, alpha);
-        return openpbr_eval_aniso_ggx(h, alpha) * openpbr_eval_aniso_smith_g1(v, alpha)
+        return openpbr_eval_aniso_ggx(h, alpha) * g1v
             * openpbr_eval_aniso_smith_g1(l, alpha) / (4.0 * v.z);
     }
 
@@ -628,7 +641,6 @@ public struct Bsdf : IDifferentiable
     {
         pdf = 0.0;
         shape = 0.0;
-        float g1v = openpbr_eval_aniso_smith_g1(v, alpha);
         float g = g1v * openpbr_eval_aniso_smith_g1(l, alpha);
         if (l.z > 0.0)
         {
@@ -673,7 +685,6 @@ public struct Bsdf : IDifferentiable
         float d = openpbr_eval_aniso_ggx(refraction_half(l), alpha);
         float3 rc, tc;
         coefficients(c, rc, tc);
-        float g1v = openpbr_eval_aniso_smith_g1(v, alpha);
         pdf += (1.0 - walk_ms_share) * d * g1v * jacobian;
         return f + d * g1v * openpbr_eval_aniso_smith_g1(l, alpha) * jacobian * walk * tc;
     }
@@ -747,8 +758,7 @@ public struct Bsdf : IDifferentiable
     [TreatAsDifferentiable]
     float metal_ms(float cos_l)
     {
-        float f = mms_ec * openpbr_look_up_ideal_metal_energy_complement(alpha_iso, cos_l)
-            / openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_ideal_metal_average_energy_complement(alpha_iso));
+        float f = mms_ec * openpbr_look_up_ideal_metal_energy_complement(alpha_iso, cos_l) / mms_average;
         return min(f, 1.0 / cos_l);
     }
 
@@ -762,7 +772,7 @@ public struct Bsdf : IDifferentiable
         float c = abs(cos_l);
         float eta = cos_l > 0.0 ? eta_refraction : 1.0 / eta_refraction;
         float f = dms_ec * openpbr_look_up_ideal_dielectric_energy_complement(eta, alpha_iso, c)
-            / openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_ideal_dielectric_average_energy_complement(eta, alpha_iso));
+            / (cos_l > 0.0 ? dms_average_above : dms_average_below);
         f *= cos_l > 0.0 ? dms_ratio : 1.0 - dms_ratio;
         return min(f, 1.0 / c);
     }
@@ -772,7 +782,10 @@ public struct Bsdf : IDifferentiable
     void coefficients(float c, out float3 reflection, out float3 transmission)
     {
         float ft = openpbr_fresnel(eta_transparent, c);
-        float fo = openpbr_fresnel(eta_opaque, c);
+        // The two differ only from inside.
+        float fo = ft;
+        if (eta_opaque != eta_transparent)
+            fo = openpbr_fresnel(eta_opaque, c);
         reflection = reflect_transparent * ft + reflect_opaque * fo;
         if (metal > 0.0)
             reflection += metal * openpbr_metal_schlick_with_f82_tint(f0, f82, c);
@@ -1109,14 +1122,23 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     s.dms_ec = 0.0;
     s.dms_ratio = 0.5;
     s.mms_ec = 0.0;
+    s.mms_average = 1.0;
+    s.dms_average_above = 1.0;
+    s.dms_average_below = 1.0;
+    s.g1v = openpbr_eval_aniso_smith_g1(s.v, s.alpha);
+    s.dms_reflect = s.inside ? float3(trans + sss) : p.specular_color * (trans + sss);
+    s.dms_transmit = tinted + (walk_on ? 0.0 : sss);
     if (s.alpha_iso >= MIN_MS_ALPHA)
     {
         s.dms_ratio = openpbr_look_up_ideal_dielectric_reflection_ratio(eta_r, s.alpha_iso);
         s.dms_ec = openpbr_look_up_ideal_dielectric_energy_complement(eta_r, s.alpha_iso, mu);
         s.mms_ec = openpbr_look_up_ideal_metal_energy_complement(s.alpha_iso, mu);
+        if (s.metal > 0.0)
+            s.mms_average = openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_ideal_metal_average_energy_complement(s.alpha_iso));
+        s.dms_average_above = openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_ideal_dielectric_average_energy_complement(eta_r, s.alpha_iso));
+        if (walk_on || any(s.dms_transmit > 0.0))
+            s.dms_average_below = openpbr_clamp_average_energy_complement_above_zero(openpbr_look_up_ideal_dielectric_average_energy_complement(1.0 / eta_r, s.alpha_iso));
     }
-    s.dms_reflect = s.inside ? float3(trans + sss) : p.specular_color * (trans + sss);
-    s.dms_transmit = tinted + (walk_on ? 0.0 : sss);
     s.mms = metal_average * metal_average * darkened_metal;
 
     // Diffuse under the specular layer.

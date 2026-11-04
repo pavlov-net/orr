@@ -49,11 +49,7 @@ uint cone_bin(LightGpu l, float3 dir)
 void candidates(uint3 id: SV_DispatchThreadID)
 {
     LightSetGpu* set = root.set;
-    NeeVertex v;
-    v.position = root.position.xyz;
-    v.normal = root.normal.xyz;
-    v.pixel = uint2(id.x % 1024, id.x / 1024);
-    v.local = nullptr;
+    NeeVertex v = nee_vertex(set, root.position.xyz, root.normal.xyz, uint2(id.x % 1024, id.x / 1024), nullptr);
     uint per_light = root.rings * root.sectors;
     uint tile_bin = set.directional_count * per_light;
     for (uint f = 0; f < root.frames; f++)

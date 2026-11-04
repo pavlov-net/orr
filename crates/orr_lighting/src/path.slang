@@ -408,10 +408,9 @@ public LocalLights* pixel_local_lights(PathRoot r, uint2 pixel)
 // phase function.
 public interface IScatter
 {
-    // BSDF x cos, or the phase function, toward `wi`.
-    float3 eval(float3 wi);
-    // The density the vertex's own sampling draws `wi` with.
-    float pdf(float3 wi);
+    // BSDF x cos, or the phase function, toward `wi`, and in `pdf` the density the vertex's own
+    // sampling draws `wi` with.
+    float3 eval_and_pdf(float3 wi, out float pdf);
 }
 
 // The shadow rays of next-event estimation.
@@ -458,10 +457,11 @@ public float3 shade_vertex_nee<F : IScatter, V : IShadow>(PathRoot r, PathVertex
 {
     LightSetGpu* set = r.set;
     light = NO_LIGHT;
-    NeeVertex v = { x.surface.position, x.surface.normal, pixel, local };
+    NeeVertex v = nee_vertex(set, x.surface.position, x.surface.normal, pixel, local);
     ResolvedLightSample chosen = no_candidate();
     float chosen_target = 0.0;
     float3 chosen_f = float3(0.0);
+    float chosen_scatter_pdf = 0.0;
     float sum = 0.0;
     for (uint i = 0; i < candidates; i++)
     {
@@ -469,7 +469,8 @@ public float3 shade_vertex_nee<F : IScatter, V : IShadow>(PathRoot r, PathVertex
         float u = rng.next();
         if (!(c.pdf > 0.0) || (no_environment && c.kind == LIGHT_SAMPLE_ENVIRONMENT))
             continue;
-        float3 fc = f.eval(c.dir);
+        float scatter_pdf;
+        float3 fc = f.eval_and_pdf(c.dir, scatter_pdf);
         float target = luminance_rec2020(fc * c.radiance);
         float w = target / c.pdf;
         if (!(w > 0.0) || !isfinite(w))
@@ -480,6 +481,7 @@ public float3 shade_vertex_nee<F : IScatter, V : IShadow>(PathRoot r, PathVertex
             chosen = c;
             chosen_target = target;
             chosen_f = fc;
+            chosen_scatter_pdf = scatter_pdf;
         }
     }
     if (!(sum > 0.0))
@@ -504,7 +506,7 @@ public float3 shade_vertex_nee<F : IScatter, V : IShadow>(PathRoot r, PathVertex
     bool shared = chosen.kind == LIGHT_SAMPLE_ENVIRONMENT || chosen.kind == LIGHT_SAMPLE_DIRECTIONAL
         || chosen.kind == LIGHT_SAMPLE_EMISSIVE;
     if (!weight_one && weigh && shared)
-        mis = mis_power(run * chosen.pdf, f.pdf(dir));
+        mis = mis_power(run * chosen.pdf, chosen_scatter_pdf);
     if (chosen.kind != LIGHT_SAMPLE_DIRECTIONAL)
         light = chosen.light;
     return e * vis * (W * mis / run);
@@ -583,6 +585,12 @@ public struct WalkExitScatter : IScatter
     public float pdf(float3 wi)
     {
         return cosine_hemisphere_pdf(dot(n, wi));
+    }
+
+    public float3 eval_and_pdf(float3 wi, out float density)
+    {
+        density = pdf(wi);
+        return eval(wi);
     }
 }
 
@@ -665,18 +673,11 @@ public struct PathScatter : IScatter
     public bool exit;
     public WalkExitScatter walk;
 
-    public float3 eval(float3 wi)
+    public float3 eval_and_pdf(float3 wi, out float density)
     {
         if (exit)
-            return walk.eval(wi);
-        return b.eval(wi);
-    }
-
-    public float pdf(float3 wi)
-    {
-        if (exit)
-            return walk.pdf(wi);
-        return b.pdf(wi);
+            return walk.eval_and_pdf(wi, density);
+        return b.eval_and_pdf(wi, density);
     }
 }
 
