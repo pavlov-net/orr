@@ -46,6 +46,7 @@ impl VirtualBlock {
     /// space only at the ends (a ring or a stack); otherwise ranges go to the best free fit
     /// (TLSF).
     pub fn new(size: u64, linear: bool) -> Result<Self> {
+        sys::set_handlers();
         let info = sys::VmaVirtualBlockCreateInfo {
             size,
             flags: if linear {

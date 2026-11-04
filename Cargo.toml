@@ -56,6 +56,7 @@ libc = "0.2"
 # bindgen's generated dynamic loader calls this version's `Library::new`.
 libloading = "0.8"
 windows = "0.62.2"
+vulkan-memory-allocator-sys = "0.1.0"
 
 cc = "1.10"
 bindgen = { version = "0.72.1", default-features = false, features = ["runtime"] }

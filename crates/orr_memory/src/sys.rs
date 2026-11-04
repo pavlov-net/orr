@@ -1,66 +1,105 @@
-//! VMA's C API. The generated bindings name Vulkan types the C way; they resolve to ash's.
+//! VMA's C API, and the conversions between ash and the Vulkan types its bindings declare.
+//!
+//! Both sides have the Vulkan C layout. The bindings only build for 64-bit targets, where every
+//! handle fits a pointer and `extern "system"` is `extern "C"`.
 
-#![allow(
-    dead_code,
-    non_camel_case_types,
-    non_snake_case,
-    non_upper_case_globals,
-    unreachable_pub,
-    unused_qualifications,
-    clippy::all,
-    clippy::pedantic,
-    clippy::undocumented_unsafe_blocks
-)]
+use std::ffi::{CStr, c_char, c_int};
+use std::mem::transmute;
+use std::ptr;
+use std::sync::Once;
 
-use ash::vk;
+use ash::vk::{self, Handle};
 
-type VkAllocationCallbacks = vk::AllocationCallbacks;
-type VkBool32 = vk::Bool32;
-type VkBuffer = vk::Buffer;
-type VkBufferCreateInfo = vk::BufferCreateInfo<'static>;
-type VkDevice = vk::Device;
-type VkDeviceMemory = vk::DeviceMemory;
-type VkDeviceSize = vk::DeviceSize;
-type VkExternalMemoryHandleTypeFlagsKHR = vk::ExternalMemoryHandleTypeFlags;
-type VkFlags = vk::Flags;
-type VkImage = vk::Image;
-type VkImageCreateInfo = vk::ImageCreateInfo<'static>;
-type VkInstance = vk::Instance;
-type VkMemoryPropertyFlags = vk::MemoryPropertyFlags;
-type VkMemoryRequirements = vk::MemoryRequirements;
-type VkPhysicalDevice = vk::PhysicalDevice;
-type VkPhysicalDeviceMemoryProperties = vk::PhysicalDeviceMemoryProperties;
-type VkPhysicalDeviceProperties = vk::PhysicalDeviceProperties;
-type VkResult = vk::Result;
+pub(crate) use vulkan_memory_allocator_sys::*;
 
-type PFN_vkAllocateMemory = Option<vk::PFN_vkAllocateMemory>;
-type PFN_vkBindBufferMemory = Option<vk::PFN_vkBindBufferMemory>;
-type PFN_vkBindBufferMemory2KHR = Option<vk::PFN_vkBindBufferMemory2>;
-type PFN_vkBindImageMemory = Option<vk::PFN_vkBindImageMemory>;
-type PFN_vkBindImageMemory2KHR = Option<vk::PFN_vkBindImageMemory2>;
-type PFN_vkCmdCopyBuffer = Option<vk::PFN_vkCmdCopyBuffer>;
-type PFN_vkCreateBuffer = Option<vk::PFN_vkCreateBuffer>;
-type PFN_vkCreateImage = Option<vk::PFN_vkCreateImage>;
-type PFN_vkDestroyBuffer = Option<vk::PFN_vkDestroyBuffer>;
-type PFN_vkDestroyImage = Option<vk::PFN_vkDestroyImage>;
-type PFN_vkFlushMappedMemoryRanges = Option<vk::PFN_vkFlushMappedMemoryRanges>;
-type PFN_vkFreeMemory = Option<vk::PFN_vkFreeMemory>;
-type PFN_vkGetBufferMemoryRequirements = Option<vk::PFN_vkGetBufferMemoryRequirements>;
-type PFN_vkGetBufferMemoryRequirements2KHR = Option<vk::PFN_vkGetBufferMemoryRequirements2>;
-type PFN_vkGetDeviceBufferMemoryRequirementsKHR =
-    Option<vk::PFN_vkGetDeviceBufferMemoryRequirements>;
-type PFN_vkGetDeviceImageMemoryRequirementsKHR = Option<vk::PFN_vkGetDeviceImageMemoryRequirements>;
-type PFN_vkGetDeviceProcAddr = Option<vk::PFN_vkGetDeviceProcAddr>;
-type PFN_vkGetImageMemoryRequirements = Option<vk::PFN_vkGetImageMemoryRequirements>;
-type PFN_vkGetImageMemoryRequirements2KHR = Option<vk::PFN_vkGetImageMemoryRequirements2>;
-type PFN_vkGetInstanceProcAddr = Option<vk::PFN_vkGetInstanceProcAddr>;
-type PFN_vkGetPhysicalDeviceMemoryProperties = Option<vk::PFN_vkGetPhysicalDeviceMemoryProperties>;
-type PFN_vkGetPhysicalDeviceMemoryProperties2KHR =
-    Option<vk::PFN_vkGetPhysicalDeviceMemoryProperties2>;
-type PFN_vkGetPhysicalDeviceProperties = Option<vk::PFN_vkGetPhysicalDeviceProperties>;
-type PFN_vkGetPhysicalDeviceProperties2KHR = Option<vk::PFN_vkGetPhysicalDeviceProperties2>;
-type PFN_vkInvalidateMappedMemoryRanges = Option<vk::PFN_vkInvalidateMappedMemoryRanges>;
-type PFN_vkMapMemory = Option<vk::PFN_vkMapMemory>;
-type PFN_vkUnmapMemory = Option<vk::PFN_vkUnmapMemory>;
+const fn same_layout<A, B>() -> bool {
+    size_of::<A>() == size_of::<B>() && align_of::<A>() == align_of::<B>()
+}
 
-include!("bindings.rs");
+const _: () = assert!(same_layout::<vk::BufferCreateInfo<'_>, VkBufferCreateInfo>());
+const _: () = assert!(same_layout::<vk::ImageCreateInfo<'_>, VkImageCreateInfo>());
+const _: () = assert!(same_layout::<vk::MemoryRequirements, VkMemoryRequirements>());
+
+/// An ash handle and what the matching C handle points to, so one kind of handle can't be passed
+/// as another.
+pub(crate) trait RawHandle: Handle {
+    type Target;
+}
+
+impl RawHandle for vk::Instance {
+    type Target = VkInstance_T;
+}
+impl RawHandle for vk::PhysicalDevice {
+    type Target = VkPhysicalDevice_T;
+}
+impl RawHandle for vk::Device {
+    type Target = VkDevice_T;
+}
+impl RawHandle for vk::DeviceMemory {
+    type Target = VkDeviceMemory_T;
+}
+impl RawHandle for vk::Buffer {
+    type Target = VkBuffer_T;
+}
+impl RawHandle for vk::Image {
+    type Target = VkImage_T;
+}
+
+pub(crate) fn to_raw<H: RawHandle>(handle: H) -> *mut H::Target {
+    handle.as_raw() as *mut H::Target
+}
+
+pub(crate) fn from_raw<H: RawHandle>(raw: *mut H::Target) -> H {
+    H::from_raw(raw as u64)
+}
+
+pub(crate) fn buffer_info(info: &vk::BufferCreateInfo<'_>) -> *const VkBufferCreateInfo {
+    ptr::from_ref(info).cast()
+}
+
+pub(crate) fn image_info(info: &vk::ImageCreateInfo<'_>) -> *const VkImageCreateInfo {
+    ptr::from_ref(info).cast()
+}
+
+pub(crate) fn memory_requirements(r: &vk::MemoryRequirements) -> *const VkMemoryRequirements {
+    ptr::from_ref(r).cast()
+}
+
+pub(crate) fn instance_proc_addr(f: vk::PFN_vkGetInstanceProcAddr) -> PFN_vkGetInstanceProcAddr {
+    // SAFETY: both types describe the C function `vkGetInstanceProcAddr`, which only VMA calls.
+    // The source is never null, so the result is `Some`.
+    unsafe { transmute::<vk::PFN_vkGetInstanceProcAddr, PFN_vkGetInstanceProcAddr>(f) }
+}
+
+pub(crate) fn device_proc_addr(f: vk::PFN_vkGetDeviceProcAddr) -> PFN_vkGetDeviceProcAddr {
+    // SAFETY: as above, for `vkGetDeviceProcAddr`.
+    unsafe { transmute::<vk::PFN_vkGetDeviceProcAddr, PFN_vkGetDeviceProcAddr>(f) }
+}
+
+/// VMA aborts the process when this returns.
+unsafe extern "C" fn check_failed(expr: *const c_char, file: *const c_char, line: c_int) {
+    // SAFETY: VMA passes string literals.
+    let (expr, file) = unsafe {
+        (
+            CStr::from_ptr(expr).to_string_lossy(),
+            CStr::from_ptr(file).to_string_lossy(),
+        )
+    };
+    log::error!("VMA check failed at {file}:{line}: {expr}");
+}
+
+unsafe extern "C" fn leak(expr: *const c_char) {
+    // SAFETY: VMA passes a string literal.
+    let expr = unsafe { CStr::from_ptr(expr) }.to_string_lossy();
+    log::error!("GPU memory leaked: {expr}");
+}
+
+/// Sends VMA's failed checks and leak reports to `log`. VMA's handlers are process-wide, so this
+/// runs before the first allocator or block is created.
+pub(crate) fn set_handlers() {
+    static SET: Once = Once::new();
+    SET.call_once(|| {
+        // SAFETY: the handlers are plain functions that live as long as the process.
+        unsafe { vmaSysSetHandlers(Some(check_failed), Some(leak)) };
+    });
+}

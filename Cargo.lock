@@ -2190,9 +2190,9 @@ version = "0.0.1"
 dependencies = [
  "ash",
  "bitflags 2.13.2",
- "cc",
  "log",
  "thiserror 2.0.21",
+ "vulkan-memory-allocator-sys",
 ]
 
 [[package]]
@@ -3557,6 +3557,15 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vulkan-memory-allocator-sys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4082fad9c62bd999876341ef50180b38d9127b214530ddf4ca19db76379c2188"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "walkdir"

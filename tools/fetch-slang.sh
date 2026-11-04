@@ -5,7 +5,6 @@
 #   glm/             GLM 1.0.1 at its tag commit
 #   display/gt7/     Polyphony Digital's GT7 tone-mapping sample (MIT), checked against its
 #                    sha256
-#   vma/             GPUOpen VulkanMemoryAllocator v3.5.0 at its tag commit
 #   libdeflate-gdeflate/
 #                    NVIDIA/libdeflate's gdeflate branch at a pinned commit (MIT and
 #                    Apache-2.0): the GDeflate codec of orr_cook's `gdeflate` feature
@@ -36,7 +35,6 @@ set -euo pipefail
 slang_version=2026.20
 openpbr_commit=c91aad1d1ce1693e803f039d7c92c2965c4eb013
 glm_commit=0af55ccecd98d4e5a8d1fad7de25ba429d60e863
-vma_commit=0f1a757da579831283413295cc7f3b47eb521c77
 gdeflate_commit=8ba9502fb30d2bf728592d121f0d402e40c8cb05
 sky_commit=34f14e745cff948f4ca3157d1b62a445ffa7286f
 d65_sum=e76f210bffff3d552ef7113025da5f325d5dfec200dd4b878b1a2f3a507032cb
@@ -107,7 +105,6 @@ fetch_commit() {
 
 fetch_commit https://github.com/adobe/openpbr-bsdf "$openpbr_commit" "$tools/openpbr-bsdf"
 fetch_commit https://github.com/g-truc/glm "$glm_commit" "$tools/glm"
-fetch_commit https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator "$vma_commit" "$tools/vma"
 fetch_commit https://github.com/NVIDIA/libdeflate "$gdeflate_commit" "$tools/libdeflate-gdeflate"
 
 gt7="$tools/display/gt7/gt7_tone_mapping.cpp"

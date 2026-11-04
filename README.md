@@ -89,8 +89,9 @@ You'll need:
 
 - an NVIDIA RTX card with a current driver
 - Rust, with the version picked by `rust-toolchain.toml`
-- the Vulkan SDK, with `VULKAN_SDK` set
-- optionally, the NVIDIA DLSS SDK, with `DLSS_SDK` set (orr builds without it)
+- a C++17 compiler
+- optionally, the NVIDIA DLSS SDK, with `DLSS_SDK` set, and the Vulkan SDK for its headers, with
+  `VULKAN_SDK` set (orr builds without them)
 
 Then:
 

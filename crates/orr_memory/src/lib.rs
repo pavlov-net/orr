@@ -49,35 +49,9 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-fn check(call: &'static str, result: vk::Result) -> Result<()> {
-    match result {
+fn check(call: &'static str, result: sys::VkResult) -> Result<()> {
+    match vk::Result::from_raw(result) {
         vk::Result::SUCCESS => Ok(()),
         result => Err(Error::Vulkan { call, result }),
     }
-}
-
-/// Called by VMA's internal checks in debug builds.
-#[unsafe(no_mangle)]
-extern "C" fn orr_memory_check_failed(
-    expr: *const std::ffi::c_char,
-    file: *const std::ffi::c_char,
-    line: std::ffi::c_int,
-) {
-    // SAFETY: VMA passes string literals.
-    let (expr, file) = unsafe {
-        (
-            std::ffi::CStr::from_ptr(expr).to_string_lossy(),
-            std::ffi::CStr::from_ptr(file).to_string_lossy(),
-        )
-    };
-    log::error!("VMA check failed at {file}:{line}: {expr}");
-    std::process::abort();
-}
-
-/// Called by VMA when a pool, block or allocator is destroyed with allocations left.
-#[unsafe(no_mangle)]
-extern "C" fn orr_memory_leak(expr: *const std::ffi::c_char) {
-    // SAFETY: VMA passes a string literal.
-    let expr = unsafe { std::ffi::CStr::from_ptr(expr) }.to_string_lossy();
-    log::error!("GPU memory leaked: {expr}");
 }
