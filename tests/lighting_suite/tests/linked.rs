@@ -4,7 +4,7 @@
 
 use lighting_suite::bed::{
     Accumulated, BARE_LEAF, Bed, FLOOR, Item, MIRROR, PANEL, Paths, RINGS_LEAF, Spec, WHITE_SPHERE,
-    against_noise, assert_close, luminance, mean_where, quad_scene, reference, surface_mean,
+    assert_close, assert_within_noise, luminance, mean_where, quad_scene, reference, surface_mean,
 };
 use lighting_suite::{assert_clean, linked};
 use orr_lighting::{LightingDebugView, PathEntry, ReferenceSettings, ViewLighting};
@@ -122,10 +122,14 @@ fn linked_coverage_casts_the_shadow_of_the_equivalent_alpha_texture() {
     let leaf = render_paths(&mut linked_bed(quad_scene(BARE_LEAF)), &paths, 32, 1);
     let noise = render_paths(&mut linked_bed(quad_scene(BARE_LEAF)), &paths, 32, 2);
     let rings = render_paths(&mut linked_bed(quad_scene(RINGS_LEAF)), &paths, 32, 1);
-    let (e, floor) = against_noise(&rings, &leaf, &noise);
-    assert!(
-        e <= floor,
-        "FLIP {e} with linked coverage against the texture, {floor} between seeds"
+    // The two differ on pixels at the ring edges, which holds FLIP at about the seed-to-seed
+    // value: up to 1.04 of it over 48 seeds.
+    assert_within_noise(
+        "linked coverage against the texture",
+        &rings,
+        &leaf,
+        &noise,
+        1.1,
     );
     assert_clean();
 }

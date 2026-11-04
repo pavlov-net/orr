@@ -1684,7 +1684,10 @@ impl Bed {
 
     /// Runs `frames` frames of the scene, each recording `kernel` after the scene pass and
     /// adding the radiance it wrote, and returns the mean. A frame's index and `seed`
-    /// choose its samples, so the same `frames` and `seed` give the same image.
+    /// choose its samples, except the light tiles', which follow the scene's frame id. That
+    /// starts wherever mounting left it and keeps counting across calls, so with an
+    /// environment, local lights or emitters the same `frames` and `seed` can give different
+    /// images.
     pub fn accumulate(
         &mut self,
         frames: u32,
@@ -2071,12 +2074,52 @@ pub fn quad_scene(model: &'static str) -> Spec {
     spec
 }
 
-/// FLIP of `a` against `b`, and of `b` against `noise` (the same scene at another seed),
-/// shown at an exposure putting `b`'s mean at 0.18.
-pub fn against_noise(a: &Accumulated, b: &Accumulated, noise: &Accumulated) -> (f32, f32) {
+/// Pixels a side of the blocks [`assert_within_noise`] averages.
+const NOISE_BLOCK: u32 = 8;
+
+/// How far above the seed-to-seed difference [`assert_within_noise`] lets a block difference
+/// sit. Over 48 seeds correct images reach 1.25 of it with linked coverage and 0.86 with
+/// micromaps; coverage wrong only in the shadow it casts starts at 2.0.
+const BLOCK_MARGIN: f64 = 1.6;
+
+/// Rms over [`NOISE_BLOCK`] pixel blocks of the difference in mean luminance of `a` and `b`.
+fn block_difference(a: &Accumulated, b: &Accumulated) -> f64 {
+    let half = NOISE_BLOCK / 2;
+    let [columns, rows] = EXTENT.map(|e| e / NOISE_BLOCK);
+    let block = |image: &Accumulated, at| orr_color::luminance(DVec3::from(image.around(at, half)));
+    let squares = (0..columns * rows)
+        .map(|i| {
+            let at = (UVec2::new(i % columns, i / columns) * NOISE_BLOCK + half).as_vec2();
+            (block(a, at) - block(b, at)).powi(2)
+        })
+        .sum::<f64>();
+    (squares / f64::from(columns * rows)).sqrt()
+}
+
+/// Asserts `a` shows what `b` shows up to sampling noise, where `a` has `b`'s seed and `noise`
+/// is `b`'s scene at another seed. Block means catch a wrong shadow, too small a share of the
+/// image to lift FLIP clear of the noise; FLIP, at up to `flip_margin` times its value for
+/// `noise` and an exposure putting `b`'s mean at 0.18, catches detail finer than a block.
+pub fn assert_within_noise(
+    what: &str,
+    a: &Accumulated,
+    b: &Accumulated,
+    noise: &Accumulated,
+    flip_margin: f32,
+) {
     let mean = b.mean.iter().map(luminance).sum::<f64>() / b.mean.len() as f64;
     let exposure = (0.18 / mean) as f32;
-    (a.flip(b, exposure).mean, noise.flip(b, exposure).mean)
+    let (e, floor) = (a.flip(b, exposure).mean, noise.flip(b, exposure).mean);
+    assert!(
+        e <= flip_margin * floor,
+        "{what}: FLIP {e}, {floor} between seeds"
+    );
+    let (e, floor) = (block_difference(a, b), block_difference(noise, b));
+    assert!(floor > 0.0, "{what}: no difference between seeds");
+    assert!(
+        e <= BLOCK_MARGIN * floor,
+        "{what}: block difference {e}, {floor} between seeds"
+    );
 }
 
 /// orr_lighting's opaque dispatch and guide resolve recording into bed frames with

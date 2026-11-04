@@ -1,4 +1,4 @@
-//! The lighting test bed: every analytic scene builds and renders, and accumulated images
+//! The lighting test bed: every analytic scene builds and renders, and flat color images
 //! depend on the seed and nothing else.
 
 use lighting_suite::assert_clean;

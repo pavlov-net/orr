@@ -3,8 +3,8 @@
 //! real ray-query candidate loop; and the shadow a micromap casts in the path kernel.
 
 use lighting_suite::bed::{
-    Accumulated, BARE_LEAF, Bed, Item, LEAF, Paths, RINGS_LEAF, SUN, Spec, VEIL, against_noise,
-    quad_scene,
+    Accumulated, BARE_LEAF, Bed, Item, LEAF, Paths, RINGS_LEAF, SUN, Spec, VEIL,
+    assert_within_noise, quad_scene,
 };
 use lighting_suite::shaders::alpha_probe;
 use lighting_suite::{assert_clean, device, pipeline, readback, require, upload};
@@ -257,10 +257,6 @@ fn an_alpha_quad_casts_the_same_shadow_with_and_without_micromaps() {
     let bare = direct(&mut Bed::with(quad_scene(BARE_LEAF)), &paths, 1);
     let noise = direct(&mut Bed::with(quad_scene(BARE_LEAF)), &paths, 2);
     let leaf = direct(&mut Bed::with(quad_scene(LEAF)), &paths, 1);
-    let (e, floor) = against_noise(&leaf, &bare, &noise);
-    assert!(
-        e <= floor,
-        "FLIP {e} with against without micromaps, {floor} between seeds"
-    );
+    assert_within_noise("with against without micromaps", &leaf, &bare, &noise, 1.0);
     assert_clean();
 }
