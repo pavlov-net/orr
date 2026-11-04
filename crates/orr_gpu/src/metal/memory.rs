@@ -64,7 +64,6 @@ pub(super) struct RawBuffer {
     pub(super) buffer: Obj<Buffer>,
     /// The placement heap of a DeviceLocal allocation, which textures can be placed in.
     pub(super) heap: Option<Obj<ProtocolObject<dyn MTLHeap>>>,
-    pub(super) kind: MemoryKind,
 }
 
 /// GPU memory from [`Device::gpu_malloc`]: `count` values of `T` at [`Allocation::gpu`],
@@ -335,7 +334,6 @@ impl Shared {
                 RawBuffer {
                     buffer: Obj(buffer),
                     heap: None,
-                    kind,
                 }
             }
             MemoryKind::DeviceLocal => {
@@ -363,7 +361,6 @@ impl Shared {
                 RawBuffer {
                     buffer: Obj(buffer),
                     heap: Some(Obj(heap)),
-                    kind,
                 }
             }
         };

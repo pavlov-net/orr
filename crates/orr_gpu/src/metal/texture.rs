@@ -93,6 +93,12 @@ impl Device {
         if desc.usage.contains(TextureUsage::HOST_COPY) {
             return Err(Error::NotImplemented("host-copy textures"));
         }
+        if desc.usage.contains(TextureUsage::DEPTH) != desc.format.is_depth() {
+            return Err(Error::Invalid(format!(
+                "{name}: DEPTH usage goes with depth formats only, not {:?}",
+                desc.format
+            )));
+        }
         let d = descriptor(desc)?;
         let failed = || Error::Metal {
             call: "newTexture",

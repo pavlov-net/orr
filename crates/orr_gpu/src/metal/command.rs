@@ -6,7 +6,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
     MTL4CommandEncoder, MTL4ComputeCommandEncoder, MTL4RenderCommandEncoder, MTL4VisibilityOptions,
-    MTLBuffer, MTLDevice, MTLSize, MTLStages,
+    MTLBuffer, MTLComputePipelineState, MTLDevice, MTLSize, MTLStages,
 };
 
 use super::memory::{Allocation, MemoryKind, malloc};
@@ -278,11 +278,13 @@ impl<'q> CommandList<'q> {
 
     /// Runs `p` over `groups` workgroups with the root at `root`.
     pub fn dispatch<R>(&mut self, p: &ComputePipeline, root: GpuPtr<R>, groups: [u32; 3]) {
+        root_in_memory(p);
         self.dispatch_at(p, root.address().0, groups);
     }
 
     /// Runs `p`, whose kernel holds its root inline (`ORR_ROOT_INLINE`), with `root`.
     pub fn dispatch_inline<R: Pod>(&mut self, p: &ComputePipeline, root: &R, groups: [u32; 3]) {
+        root_inline::<R>(p);
         let address = self.inline_bytes(bytemuck::bytes_of(root));
         self.dispatch_at(p, address, groups);
     }
@@ -303,6 +305,25 @@ impl<'q> CommandList<'q> {
         e
     }
 
+    /// Runs one of orr_gpu's own pipeline states over `groups` workgroups of `workgroup`
+    /// threads, with a copy of `root` as its root.
+    pub(super) fn dispatch_state(
+        &mut self,
+        state: &super::Obj<ProtocolObject<dyn MTLComputePipelineState>>,
+        root: &[u8],
+        groups: [u32; 3],
+        workgroup: [u32; 3],
+    ) {
+        let address = self.inline_bytes(root);
+        let e = self.compute();
+        e.setComputePipelineState(state);
+        // SAFETY: the root copy lives in the list's inline blocks until the submit completes.
+        unsafe { self.table.setAddress_atIndex(address, 0) };
+        e.setArgumentTable(Some(&self.table));
+        e.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(workgroup));
+        self.keep.push(Box::new(state.clone()));
+    }
+
     /// Runs `p` over the workgroup counts the GPU reads from `args`.
     pub fn dispatch_indirect<R>(
         &mut self,
@@ -310,6 +331,7 @@ impl<'q> CommandList<'q> {
         root: GpuPtr<R>,
         args: GpuPtr<DispatchArgs>,
     ) {
+        root_in_memory(p);
         let e = self.bind_compute(p, root.address().0);
         // SAFETY: `args` is the caller's live memory, as on every backend.
         unsafe {
@@ -327,6 +349,7 @@ impl<'q> CommandList<'q> {
         root: &R,
         args: GpuPtr<DispatchArgs>,
     ) {
+        root_inline::<R>(p);
         let root = self.inline_bytes(bytemuck::bytes_of(root));
         let e = self.bind_compute(p, root);
         // SAFETY: as in `dispatch_indirect`.
@@ -338,9 +361,10 @@ impl<'q> CommandList<'q> {
         }
     }
 
+    /// No call creates a [`RayDispatchPipeline`] on Metal.
     pub fn dispatch_rays<R: Pod>(&mut self, p: &RayDispatchPipeline, root: &R, extent: [u32; 3]) {
-        let _ = (p, root, extent);
-        not_implemented("CommandList::dispatch_rays")
+        let _ = (root, extent);
+        p.unreachable()
     }
 
     pub fn dispatch_rays_indirect<R: Pod>(
@@ -349,8 +373,8 @@ impl<'q> CommandList<'q> {
         root: &R,
         args: GpuPtr<DispatchArgs>,
     ) {
-        let _ = (p, root, args);
-        not_implemented("CommandList::dispatch_rays_indirect")
+        let _ = (root, args);
+        p.unreachable()
     }
 
     /// Copies `bytes` bytes from `src` to `dst`.
@@ -429,6 +453,21 @@ impl Drop for CommandList<'_> {
             self.buffer.endCommandBuffer();
         }
     }
+}
+
+fn root_in_memory(p: &ComputePipeline) {
+    assert_eq!(
+        p.inline_root_bytes, 0,
+        "an ORR_ROOT_INLINE kernel runs with dispatch_inline or dispatch_indirect_inline"
+    );
+}
+
+fn root_inline<R>(p: &ComputePipeline) {
+    assert_eq!(
+        p.inline_root_bytes as usize,
+        size_of::<R>(),
+        "the inline root is not the kernel's ORR_ROOT_INLINE type"
+    );
 }
 
 pub(super) fn size([x, y, z]: [u32; 3]) -> MTLSize {

@@ -66,6 +66,25 @@ impl<'a> ShaderStage<'a> {
 }
 
 impl Shared {
+    /// The compute pipeline state of `function`, whose threadgroups are `workgroup`.
+    pub(super) fn compute_state(
+        &self,
+        function: &MTL4LibraryFunctionDescriptor,
+        workgroup: [u32; 3],
+        name: &str,
+    ) -> Result<Obj<ProtocolObject<dyn MTLComputePipelineState>>, Error> {
+        let desc = MTL4ComputePipelineDescriptor::new();
+        desc.setLabel(Some(&NSString::from_str(name)));
+        let f: &MTL4FunctionDescriptor = function;
+        desc.setComputeFunctionDescriptor(Some(f));
+        desc.setRequiredThreadsPerThreadgroup(super::command::size(workgroup));
+        let raw = self
+            .compiler
+            .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&desc, None)
+            .map_err(|e| metal_error("newComputePipelineState", &e))?;
+        Ok(Obj(raw))
+    }
+
     /// `module`'s Metal library: the pixel entries' when `fragment`, the others' otherwise.
     /// Loaded once per module.
     pub(super) fn library(
@@ -130,18 +149,11 @@ impl Device {
             )));
         }
         let function = s.function(&self.shared)?;
-        let desc = MTL4ComputePipelineDescriptor::new();
-        desc.setLabel(Some(&NSString::from_str(name)));
-        let f: &MTL4FunctionDescriptor = &function;
-        desc.setComputeFunctionDescriptor(Some(f));
-        desc.setRequiredThreadsPerThreadgroup(super::command::size(s.entry.workgroup));
         let raw = self
             .shared
-            .compiler
-            .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&desc, None)
-            .map_err(|e| metal_error("newComputePipelineState", &e))?;
+            .compute_state(&function, s.entry.workgroup, name)?;
         Ok(ComputePipeline {
-            raw: Obj(raw),
+            raw,
             inline_root_bytes: s.inline_root_bytes,
             workgroup: s.entry.workgroup,
         })

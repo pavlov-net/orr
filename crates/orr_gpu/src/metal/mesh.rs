@@ -206,6 +206,17 @@ impl CommandList<'_> {
                 a.setClearDepth(f64::from(z));
             }
             a.setStoreAction(store_action(d.store));
+            if d.texture.desc().format.has_stencil() {
+                let s = pass.stencilAttachment();
+                s.setTexture(Some(&d.texture.raw));
+                s.setLoadAction(match d.load {
+                    DepthLoad::Keep => MTLLoadAction::Load,
+                    DepthLoad::Clear(_) => MTLLoadAction::Clear,
+                    DepthLoad::Discard => MTLLoadAction::DontCare,
+                });
+                s.setClearStencil(0);
+                s.setStoreAction(store_action(d.store));
+            }
             self.keep.push(Box::new(d.texture.raw.clone()));
         }
         let e = self

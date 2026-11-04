@@ -8,8 +8,8 @@ use std::time::Duration;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTL4Compiler, MTL4CompilerDescriptor, MTLCreateSystemDefaultDevice, MTLDevice, MTLEvent,
-    MTLGPUFamily, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor, MTLSharedEvent,
+    MTL4Compiler, MTL4CompilerDescriptor, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily,
+    MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor, MTLSharedEvent,
 };
 
 use super::heap::Bindings;
