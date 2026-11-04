@@ -41,8 +41,9 @@ pub struct Build {
     omm: bool,
     neural: bool,
     metal_check: bool,
-    /// The target is Apple's: the MSL check also compiles each module's Metal libraries.
-    metallib: bool,
+    /// The SDK of the Apple target, whose Metal compiler the MSL check also builds each
+    /// module's Metal libraries with.
+    metal_sdk: Option<&'static str>,
     allowed: BTreeSet<Lint>,
     out_dir: Option<PathBuf>,
     link_points: Vec<PathBuf>,
@@ -104,7 +105,7 @@ impl Build {
         // `1` or `0` from `var`, else `default`.
         let flag = |var: &str, default: bool| env::var_os(var).map_or(default, |v| v == "1");
         let capture = flag("ORR_SHADER_CAPTURE", false);
-        let apple = env::var("CARGO_CFG_TARGET_VENDOR").is_ok_and(|v| v == "apple");
+        let metal_sdk = metal::target_sdk();
         Ok(Self {
             lib: super::toolchain::load()?,
             kernels: None,
@@ -123,8 +124,8 @@ impl Build {
             asserts: flag("ORR_SHADER_ASSERTS", !release && !capture),
             omm: flag("ORR_SHADER_OMM", !capture),
             neural: flag("ORR_SHADER_NEURAL", true),
-            metal_check: env::var_os("ORR_METAL_CHECK").map_or(apple, |v| v == "1"),
-            metallib: apple,
+            metal_check: env::var_os("ORR_METAL_CHECK").map_or(metal_sdk.is_some(), |v| v == "1"),
+            metal_sdk,
             allowed: BTreeSet::new(),
             out_dir: None,
             link_points: Vec::new(),
@@ -686,7 +687,7 @@ impl Build {
             tool,
             options: &options,
             metal: metal_options.as_deref(),
-            metallib: self.metallib,
+            metal_sdk: self.metal_sdk,
             asserts: self.asserts,
             separate_debug: self.debug_info == DebugInfo::Separate,
             roots,
@@ -903,8 +904,8 @@ pub(super) struct Settings<'a> {
     pub(super) options: &'a [String],
     /// The Metal session's options when the MSL check runs.
     pub(super) metal: Option<&'a [String]>,
-    /// The MSL check also compiles Metal libraries.
-    pub(super) metallib: bool,
+    /// The MSL check also compiles Metal libraries with this SDK's compiler.
+    pub(super) metal_sdk: Option<&'a str>,
     pub(super) asserts: bool,
     /// `options` hold `-separate-debug-info`.
     pub(super) separate_debug: bool,
@@ -923,8 +924,8 @@ impl Settings<'_> {
         if let Some(metal) = self.metal {
             parts.push("+metal");
             parts.extend(metal.iter().map(String::as_str));
-            if self.metallib {
-                parts.push("+metallib");
+            if let Some(sdk) = self.metal_sdk {
+                parts.extend(["+metallib", sdk]);
             }
         }
         parts
@@ -1229,7 +1230,7 @@ fn compile_one(
     let (metal, metallib) = match settings.metal {
         Some(metal_options) => {
             let session = global.session(metal_options).map_err(slang_err)?;
-            metal_issues(&session, settings, &compiled.model, job, &source)?
+            metal_issues(&session, settings, &compiled.model, &unit, &job.spv)?
         }
         None => (Vec::new(), MetalLibs::default()),
     };
@@ -1357,17 +1358,17 @@ fn link_modules(
     Ok(out)
 }
 
-/// Loads the kernel at `path` once more into the Metal `session`, compiles its non-raygen
-/// entries to MSL and returns what the MSL check finds, with the Metal libraries when
-/// `settings.metallib` asks for them and nothing was found. Writes `<name>.metal`, and the
-/// pixel entries apart as `<name>.fragment.metal`: a fragment function that reads a global
-/// gets every global of its program, `groupshared` ones too, which Metal rejects there.
-fn metal_issues(
+/// Loads `unit` once more into the Metal `session`, compiles its non-raygen entries to MSL
+/// and returns what the MSL check finds, with the Metal libraries when `settings.metal_sdk`
+/// asks for them and nothing was found. Writes the MSL beside `spv` as `.metal`, and the
+/// pixel entries apart as `.fragment.metal`: a fragment function that reads a global gets
+/// every global of its program, `groupshared` ones too, which Metal rejects there.
+pub(super) fn metal_issues(
     session: &Session,
     settings: &Settings<'_>,
     model: &Model,
-    job: &Job,
-    source: &str,
+    unit: &Unit<'_>,
+    spv: &Path,
 ) -> Result<(Vec<String>, MetalLibs), Error> {
     let entries = |pixel: bool| -> BTreeSet<&str> {
         model
@@ -1387,17 +1388,17 @@ fn metal_issues(
     if groups.is_empty() {
         return Ok((Vec::new(), MetalLibs::default()));
     }
-    let text = metal::without_raygen(source);
+    let text = metal::without_raygen(unit.source);
     let compiled = (|| {
-        let mut sources = vec![(job.path.as_path(), text.as_ref())];
+        let mut sources = vec![(unit.path, text.as_ref())];
         sources.extend(
-            job.links
+            unit.links
                 .iter()
                 .map(|l| (l.path.as_path(), l.source.as_str())),
         );
         roots::load_prefixed(session, settings.roots, &sources)?;
-        let module = session.load(&job.name.replace('/', "."), &job.path, &text)?;
-        let extra = link_modules(session, settings, &job.links)?;
+        let module = session.load(&unit.name.replace('/', "."), unit.path, &text)?;
+        let extra = link_modules(session, settings, unit.links)?;
         groups
             .iter()
             .map(|(extension, entries)| {
@@ -1416,9 +1417,15 @@ fn metal_issues(
     let mut issues = Vec::new();
     let mut declared = Vec::new();
     for (extension, msl, _) in &programs {
-        let msl = metal::primitive_culled(&metal::multi_level(msl));
+        let msl = match metal::multi_level(msl) {
+            Ok(msl) => metal::primitive_culled(&msl),
+            Err(e) => {
+                issues.push(e);
+                continue;
+            }
+        };
         let msl = msl.as_str();
-        write(&job.spv.with_extension(extension), msl.as_bytes())?;
+        write(&spv.with_extension(extension), msl.as_bytes())?;
         issues.extend(metal::msl_issues(msl));
         declared.extend(metal::entry_names(msl));
     }
@@ -1438,13 +1445,13 @@ fn metal_issues(
             }
         }
     }
-    if !settings.metallib || !issues.is_empty() {
+    let Some(sdk) = settings.metal_sdk.filter(|_| issues.is_empty()) else {
         return Ok((issues, MetalLibs::default()));
-    }
+    };
     for (extension, _, _) in &programs {
-        let msl = job.spv.with_extension(extension);
+        let msl = spv.with_extension(extension);
         let lib = msl.with_extension("metallib");
-        match metal::compile_library(&msl, &lib) {
+        match metal::compile_library(&msl, &lib, sdk) {
             Ok(()) if *extension == "metal" => libs.lib = Some(lib),
             Ok(()) => libs.fragment = Some(lib),
             Err(e) => issues.push(e),
