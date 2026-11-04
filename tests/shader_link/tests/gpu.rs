@@ -255,19 +255,9 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
             "world_cache/update"
         ]
     );
-    let mut r = Renderer::new(
-        device(),
-        RendererDesc {
-            kernels: &orr_linked::KERNELS,
-            ..RendererDesc::default()
-        },
-    )
-    .unwrap_or_else(|e| panic!("{e}"));
-    // Compiles the path tracing pipelines from the linked `path/opaque`, `path/background` and
-    // `world_cache/update`.
-    r.create_view_history().unwrap();
-    r.wait_paths().unwrap();
-    drop(r);
+    if let Some(e) = renderer_error(&orr_linked::KERNELS) {
+        panic!("{e}");
+    }
     // The linked modules create pipelines as orr's own do.
     for &m in orr_linked::KERNELS.modules {
         for e in m.entry_points.iter().filter(|e| e.stage == Stage::Compute) {
