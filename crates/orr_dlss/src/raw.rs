@@ -64,7 +64,11 @@ impl Ngx {
     /// # Safety
     ///
     /// The device was created with the extensions from [`instance_extensions`] and
-    /// [`device_extensions`], and outlives this value and every feature created from it.
+    /// [`device_extensions`], and outlives this value and every feature created from it. No
+    /// other `Ngx`, [`DlssSdk`](crate::DlssSdk) or feature made from a `DlssSdk` is alive on
+    /// the device now or while this value is, and a dropped feature lives until the device
+    /// collects it: NGX allows one initialization per device, and releasing either would shut
+    /// it down for both.
     pub unsafe fn new(vulkan: Vulkan<'_>, project_id: Uuid) -> Result<Self, DlssError> {
         // SAFETY: forwarded from the caller.
         unsafe { imp::Ngx::new(vulkan, project_id).map(Self) }

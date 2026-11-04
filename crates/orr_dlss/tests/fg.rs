@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use orr_dlss::{DlssSdk, FgCamera, FgInputs, FrameGeneration};
 use orr_gpu::{
-    Allocation, CommandList, Device, DeviceDesc, Format, Hazards, MemoryKind, QueueKind,
-    QueueRequest, Stages, Texture, TextureDesc, TextureMemory, TextureRegion, TextureUsage,
+    Allocation, CommandList, Device, Format, Hazards, MemoryKind, QueueKind, Stages, Texture,
+    TextureDesc, TextureMemory, TextureRegion, TextureUsage,
 };
 
 const OUTPUT: [u32; 2] = [1280, 720];
@@ -26,20 +26,6 @@ const FRAMES: u32 = 12;
 const TOLERANCE: f64 = 2.0;
 const BACKGROUND: u8 = 40;
 const BAR: u8 = 230;
-
-fn device() -> Device {
-    let hooks = DlssSdk::device_hooks(harness::PROJECT_ID);
-    Device::new(&DeviceDesc {
-        name: "orr_dlss fg tests",
-        hooks: Some(&hooks),
-        queues: QueueRequest {
-            render_compute: true,
-            ..QueueRequest::default()
-        },
-        ..DeviceDesc::default()
-    })
-    .expect("orr device with NGX hooks")
-}
 
 /// Left edge of the bar, as rendered, in frame `f`.
 fn bar_x(f: u32) -> u32 {
@@ -292,7 +278,7 @@ fn fg_sdk(device: &Device) -> Option<DlssSdk> {
 
 #[test]
 fn generated_images_split_the_step() {
-    let device = device();
+    let device = harness::orr_device("orr_dlss fg tests");
     let Some(sdk) = fg_sdk(&device) else {
         return;
     };
@@ -323,7 +309,7 @@ fn generated_images_split_the_step() {
 
 #[test]
 fn bound_distortion_field_keeps_a_shifted_bar_in_place() {
-    let device = device();
+    let device = harness::orr_device("orr_dlss fg tests");
     let Some(sdk) = fg_sdk(&device) else {
         return;
     };

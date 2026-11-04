@@ -4,8 +4,9 @@
 #![allow(dead_code, unreachable_pub)]
 
 use ash::vk::{self, TaggedStructure};
-use orr_dlss::Uuid;
 use orr_dlss::raw::{self, Image};
+use orr_dlss::{DlssSdk, Uuid};
+use orr_gpu::{Device, DeviceDesc, QueueRequest};
 use std::ffi::{CStr, CString, c_void};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -15,8 +16,27 @@ pub const PROJECT_ID: Uuid = Uuid::from_u128(0x6a3c1e0d_9b2f_4c7a_8e15_3d0f7b9a2
 static MESSAGES: AtomicU32 = AtomicU32::new(0);
 static NGX_HAZARDS: AtomicU32 = AtomicU32::new(0);
 
-/// NGX state is process-wide and not thread-safe: one `Gpu`, and so one test, at a time.
+/// NGX state is process-wide and not thread-safe: one test at a time.
 static TURN: Mutex<()> = Mutex::new(());
+
+pub fn ngx_turn() -> MutexGuard<'static, ()> {
+    TURN.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// An orr device with NGX's extensions and a compute-family queue on the render thread.
+pub fn orr_device(name: &str) -> Device {
+    let hooks = DlssSdk::device_hooks(PROJECT_ID);
+    Device::new(&DeviceDesc {
+        name,
+        hooks: Some(&hooks),
+        queues: QueueRequest {
+            render_compute: true,
+            ..QueueRequest::default()
+        },
+        ..DeviceDesc::default()
+    })
+    .expect("orr device with NGX hooks")
+}
 
 unsafe extern "system" fn on_message(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
@@ -90,7 +110,7 @@ pub struct Gpu {
 impl Gpu {
     /// A device on the first discrete GPU with NGX's extensions when `ngx` is set.
     pub fn new(ngx: bool) -> Gpu {
-        let turn = TURN.lock().unwrap_or_else(PoisonError::into_inner);
+        let turn = ngx_turn();
         // SAFETY: test setup; every create call gets valid infos, and the objects are
         // destroyed in `Drop`.
         unsafe {

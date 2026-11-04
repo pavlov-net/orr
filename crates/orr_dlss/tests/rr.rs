@@ -9,8 +9,8 @@ use harness::{Gpu, f16_bytes, f16_values};
 use orr_dlss::raw::{ClassicBind, Image, Ngx, RayReconstruction, RrInputs};
 use orr_dlss::{DlssSdk, Quality};
 use orr_gpu::{
-    Allocation, CommandList, Device, DeviceDesc, Format, Hazards, MemoryKind, QueueKind,
-    QueueRequest, Stages, Texture, TextureDesc, TextureMemory, TextureRegion, TextureUsage,
+    Allocation, CommandList, Device, Format, Hazards, MemoryKind, QueueKind, Stages, Texture,
+    TextureDesc, TextureMemory, TextureRegion, TextureUsage,
 };
 use std::time::Duration;
 
@@ -372,6 +372,16 @@ fn transparency_layer_is_composited_after_denoising() {
     validation_clean(&gpu);
 }
 
+/// RR on `sdk`; a failure prints NGX's log.
+fn create_on_orr(sdk: &DlssSdk, output: [u32; 2], quality: Quality) -> orr_dlss::RayReconstruction {
+    orr_dlss::RayReconstruction::new(sdk, output, quality, None).unwrap_or_else(|e| {
+        for l in Ngx::take_log() {
+            eprintln!("NGX: {l}");
+        }
+        panic!("RR create: {e}")
+    })
+}
+
 /// Runs RR through the orr_gpu API for `frames` frames on the inputs `targets` makes, on
 /// `kind`, a queue that binds heaps in every list. The last frame writes a fresh output
 /// cleared to the sentinel; returns it.
@@ -383,12 +393,7 @@ fn run_on_orr(
     quality: Quality,
     frames: u64,
 ) -> Vec<f32> {
-    let mut rr = orr_dlss::RayReconstruction::new(sdk, output, quality, None).unwrap_or_else(|e| {
-        for l in Ngx::take_log() {
-            eprintln!("NGX: {l}");
-        }
-        panic!("RR create: {e}")
-    });
+    let mut rr = create_on_orr(sdk, output, quality);
     let render = rr.render_size();
     let usage = TextureUsage::SAMPLED | TextureUsage::STORAGE;
     let texture = |format, size: [u32; 2], name| {
@@ -495,17 +500,7 @@ fn rr_on_an_orr_device_matches_the_raw_harness() {
     let (t, staging) = targets(&mut gpu, rr.render_size(), None);
     let reference = run(&mut gpu, &mut [(rr, false)], &t, staging, frames, &images).remove(0);
 
-    let hooks = DlssSdk::device_hooks(harness::PROJECT_ID);
-    let device = Device::new(&DeviceDesc {
-        name: "orr_dlss tests",
-        hooks: Some(&hooks),
-        queues: QueueRequest {
-            render_compute: true,
-            ..QueueRequest::default()
-        },
-        ..DeviceDesc::default()
-    })
-    .expect("orr device with NGX hooks");
+    let device = harness::orr_device("orr_dlss tests");
     let sdk = DlssSdk::new(&device, harness::PROJECT_ID).expect("NGX init on an orr device");
     assert!(sdk.support().rr, "ray reconstruction unavailable");
     for kind in [QueueKind::Render, QueueKind::Compute] {
@@ -523,4 +518,22 @@ fn rr_on_an_orr_device_matches_the_raw_harness() {
     drop(sdk);
     assert_eq!(device.validation_messages(), 0, "orr device validation");
     validation_clean(&gpu);
+}
+
+/// A dropped feature holds NGX until the device collects it, which can be after a new SDK has
+/// started on the same device.
+#[test]
+fn an_sdk_keeps_working_through_the_release_of_an_older_feature() {
+    let _turn = harness::ngx_turn();
+    let device = harness::orr_device("orr_dlss tests");
+    let create = |sdk: &DlssSdk| create_on_orr(sdk, [256, 256], Quality::Performance);
+    let old = DlssSdk::new(&device, harness::PROJECT_ID).expect("NGX init");
+    drop(create(&old));
+    drop(old);
+    let sdk = DlssSdk::new(&device, harness::PROJECT_ID).expect("NGX on the same device");
+    device.collect_garbage();
+    drop(create(&sdk));
+    drop(sdk);
+    device.collect_garbage();
+    assert_eq!(device.validation_messages(), 0, "orr device validation");
 }

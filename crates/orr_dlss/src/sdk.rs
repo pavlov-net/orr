@@ -16,10 +16,13 @@ use orr_gpu::{
 use crate::raw::FgCamera;
 use crate::{DlssError, Mode, Quality, Support, Uuid, raw};
 
-/// Serializes every NGX call this layer makes; NGX is not thread-safe.
-static NGX: Mutex<()> = Mutex::new(());
+/// NGX on each device with an SDK or feature alive.
+type LiveNgx = Vec<(vk::Device, Arc<Locked<raw::Ngx>>)>;
 
-fn ngx_lock() -> MutexGuard<'static, ()> {
+/// Serializes every NGX call this layer makes; NGX is not thread-safe.
+static NGX: Mutex<LiveNgx> = Mutex::new(Vec::new());
+
+fn ngx_lock() -> MutexGuard<'static, LiveNgx> {
     NGX.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -67,19 +70,23 @@ impl DeviceHooks for DlssDeviceHooks {
     }
 }
 
-/// The NGX instance, released once the SDK and every feature made from it are gone.
-struct NgxInstance(ManuallyDrop<Locked<raw::Ngx>>);
+/// One SDK's share of its device's NGX, released once the SDK and every feature made from it
+/// are gone. NGX allows one initialization per device and its shutdown ends it for every
+/// user, so the last share of a device shuts it down.
+struct NgxInstance(ManuallyDrop<Arc<Locked<raw::Ngx>>>);
 
 impl Drop for NgxInstance {
     fn drop(&mut self) {
-        let _ngx = ngx_lock();
+        let mut live = ngx_lock();
+        // Two references left are the list's and this one.
+        live.retain(|(_, ngx)| !Arc::ptr_eq(ngx, &self.0) || Arc::strong_count(ngx) > 2);
         // SAFETY: dropped once, here.
         unsafe { ManuallyDrop::drop(&mut self.0) };
     }
 }
 
 /// NGX initialized on an orr_gpu device. Every NGX call made through this API is serialized
-/// across threads. Clones share the NGX instance.
+/// across threads. Every SDK on a device shares one NGX instance.
 #[derive(Clone)]
 pub struct DlssSdk {
     ngx: Arc<NgxInstance>,
@@ -92,29 +99,41 @@ impl DlssSdk {
         DlssDeviceHooks { project_id }
     }
 
-    /// Initializes NGX on `gpu`, which was created with [`DlssSdk::device_hooks`].
+    /// Initializes NGX on `gpu`, which was created with [`DlssSdk::device_hooks`]. While an SDK
+    /// or feature is alive on the device, a new SDK shares its NGX and the `project_id` NGX
+    /// started with.
     pub fn new(gpu: &Device, project_id: Uuid) -> Result<Self, DlssError> {
         let device = interop::raw_device(gpu);
-        let _ngx = ngx_lock();
-        // SAFETY: the physical device belongs to the instance.
-        let wanted =
-            unsafe { raw::device_extensions(device.instance, device.physical_device, project_id)? };
-        if let Some(missing) = wanted.iter().find(|e| !device.has_extension(e)) {
-            return Err(DlssError::MissingExtension(
-                missing.to_string_lossy().into_owned(),
-            ));
-        }
-        let vulkan = raw::Vulkan {
-            entry: device.entry,
-            instance: device.instance,
-            physical_device: device.physical_device,
-            device: device.device,
+        let handle = device.device.handle();
+        let mut live = ngx_lock();
+        let ngx = match live.iter().find(|(d, _)| *d == handle) {
+            Some((_, ngx)) => Arc::clone(ngx),
+            None => {
+                // SAFETY: the physical device belongs to the instance.
+                let wanted = unsafe {
+                    raw::device_extensions(device.instance, device.physical_device, project_id)?
+                };
+                if let Some(missing) = wanted.iter().find(|e| !device.has_extension(e)) {
+                    return Err(DlssError::MissingExtension(
+                        missing.to_string_lossy().into_owned(),
+                    ));
+                }
+                let vulkan = raw::Vulkan {
+                    entry: device.entry,
+                    instance: device.instance,
+                    physical_device: device.physical_device,
+                    device: device.device,
+                };
+                // SAFETY: the device has NGX's extensions, `live` shows no `Ngx` on it, and
+                // `NgxInstance` is released before it: the SDK and every feature hold the
+                // device or release through its garbage list.
+                let ngx = Arc::new(Locked(unsafe { raw::Ngx::new(vulkan, project_id)? }));
+                live.push((handle, Arc::clone(&ngx)));
+                ngx
+            }
         };
-        // SAFETY: the device has NGX's extensions, and `NgxInstance` is released before it:
-        // the SDK and every feature hold the device or release through its garbage list.
-        let ngx = unsafe { raw::Ngx::new(vulkan, project_id)? };
         Ok(Self {
-            ngx: Arc::new(NgxInstance(ManuallyDrop::new(Locked(ngx)))),
+            ngx: Arc::new(NgxInstance(ManuallyDrop::new(ngx))),
             gpu: gpu.clone(),
         })
     }
