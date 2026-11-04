@@ -952,6 +952,63 @@ fn two_channel_normals_rebuild_z_when_they_are_reencoded() {
     assert!((x - tilt).abs() < 0.02, "{x}, not {tilt}");
 }
 
+#[test]
+fn signed_two_channel_normals_read_their_own_values() {
+    let d = dir("snorm-normal");
+    let n = 64u32;
+    let tilt = 0.5f32.sqrt();
+    let texels: Vec<u8> = (0..n * n)
+        .flat_map(|i| {
+            let x = if i % n < n / 2 { tilt } else { -tilt };
+            [x, 0.0, 0.0, 1.0]
+        })
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let image = ctt::ImageRef {
+        surfaces: vec![vec![ctt::SurfaceRef {
+            data: &texels,
+            width: n,
+            height: n,
+            depth: 1,
+            stride: n * 16,
+            slice_stride: 0,
+        }]],
+        kind: ctt::TextureKind::Texture2D,
+        desc: ctt::FormatDesc {
+            format: ctt::Format::R32G32B32A32_SFLOAT,
+            color_space: ctt::ColorSpace::Linear,
+            alpha: ctt::AlphaMode::Opaque,
+        },
+    };
+    let ctt::PipelineOutput::Encoded(bytes) = ctt::convert(
+        image,
+        ctt::ConvertSettings {
+            format: Some(ctt::TargetFormat::Uncompressed(ctt::Format::R8G8_SNORM)),
+            container: ctt::Container::ktx2(),
+            mipmap: false,
+            ..Default::default()
+        },
+    )
+    .unwrap() else {
+        panic!("container output");
+    };
+    let path = d.join("signed.ktx2");
+    std::fs::write(&path, bytes).unwrap();
+    let settings = TextureSettings {
+        usage: Usage::Normal,
+        ..TextureSettings::default()
+    };
+    let a = cook(vec![texture(&path, "n", settings)]);
+    let (_, levels) = mips(&a, "n");
+    let texels = decode(vk::BC5_UNORM, n, n, &levels[0][0]);
+    let stored = |x: usize| texels[8 * n as usize + x].map(|c| 2.0 * c - 1.0);
+    for (x, want) in [(8, tilt), (56, -tilt)] {
+        let got = stored(x);
+        assert!((got[0] - want).abs() < 0.02, "{got:?}, not {want}");
+        assert!(got[1].abs() < 0.02, "{got:?}");
+    }
+}
+
 fn bcn_material_checks(a: &Archive, remade: bool, blocks: [&Vec<Vec<u8>>; 5]) {
     let [
         color_blocks,

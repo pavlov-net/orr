@@ -19,7 +19,8 @@ use super::{Img, Primaries};
 
 /// A decoded image file.
 pub(super) struct Source {
-    /// Mip 0 of each layer, values as stored: unorm data in 0..1, floats as they are.
+    /// Mip 0 of each layer, values as stored: unorm data in 0..1, snorm data at `0.5 v + 0.5`
+    /// so that it reads as unorm data does, floats as they are.
     pub(super) layers: Vec<Img>,
     /// Six layers in the Vulkan face order.
     pub(super) cube: bool,
@@ -264,7 +265,7 @@ pub(super) fn block_range(
     // Channels past these hold the same value in every block of the format.
     let stored = match vk_format {
         vk::BC4_UNORM => 1,
-        vk::BC5_UNORM => 2,
+        vk::BC5_UNORM | vk::BC5_SNORM => 2,
         vk::BC6H_UFLOAT | vk::BC6H_SFLOAT => 3,
         _ => 4,
     };
@@ -375,6 +376,11 @@ fn container(image: ctt::Image) -> Result<Source, String> {
     let ctt::PipelineOutput::Raw(img) = out else {
         return Err("ctt returned a container for raw output".into());
     };
+    let signed = if is_snorm(format) {
+        format.channel_count().unwrap_or(0)
+    } else {
+        0
+    };
     let layers = img
         .surfaces
         .iter()
@@ -387,6 +393,7 @@ fn container(image: ctt::Image) -> Result<Source, String> {
                     *p = std::array::from_fn(|c| {
                         f32::from_le_bytes(b[c * 4..c * 4 + 4].try_into().expect("4 bytes"))
                     });
+                    p[..signed].iter_mut().for_each(|v| *v = 0.5 * *v + 0.5);
                 }
             }
             out
@@ -398,11 +405,28 @@ fn container(image: ctt::Image) -> Result<Source, String> {
         srgb,
         primaries: None,
         blocks: None,
-        rg: matches!(
-            format.value(),
-            vk::R8G8_UNORM | vk::R16G16_UNORM | vk::R16G16_SFLOAT | vk::R32G32_SFLOAT
-        ),
+        rg: format.channel_count() == Some(2),
     })
+}
+
+/// Whether uncompressed `format` stores signed normalized channels.
+fn is_snorm(format: ctt::Format) -> bool {
+    use ctt::Format as F;
+    matches!(
+        format,
+        F::R8_SNORM
+            | F::R8G8_SNORM
+            | F::R8G8B8_SNORM
+            | F::B8G8R8_SNORM
+            | F::R8G8B8A8_SNORM
+            | F::B8G8R8A8_SNORM
+            | F::R16_SNORM
+            | F::R16G16_SNORM
+            | F::R16G16B16_SNORM
+            | F::R16G16B16A16_SNORM
+            | F::A2R10G10B10_SNORM_PACK32
+            | F::A2B10G10R10_SNORM_PACK32
+    )
 }
 
 fn file(bytes: &[u8]) -> Result<Source, String> {
@@ -482,7 +506,8 @@ fn png_cicp(bytes: &[u8]) -> Result<Option<png::CodingIndependentCodePoints>, St
     Ok(reader.info().coding_independent_code_points)
 }
 
-/// Decodes one layer's BCn mip to float texels (unorm values in 0..1, BC6H as floats).
+/// Decodes one layer's BCn mip to float texels (unorm values in 0..1, snorm values at
+/// `0.5 v + 0.5`, BC6H as floats).
 pub(crate) fn decode_blocks(vk_format: u32, w: u32, h: u32, data: &[u8]) -> Result<Img, String> {
     decode_blocks_with(vk_format, w, h, data, |t| t)
 }
@@ -546,17 +571,20 @@ fn decode_rows<T: Send>(
     Ok(())
 }
 
+/// The 16 texels of `channels` bytes each in `b`, every byte read by `value`.
+fn block_texels(b: &[u8], channels: usize, value: impl Fn(u8) -> f32) -> [[f32; 4]; 16] {
+    std::array::from_fn(|i| {
+        let mut p = [0.0, 0.0, 0.0, 1.0];
+        for c in 0..channels {
+            p[c] = value(b[i * channels + c]);
+        }
+        p
+    })
+}
+
 fn decode_block(vk_format: u32, block: &[u8]) -> Result<[[f32; 4]; 16], String> {
     use vk::*;
-    let unorm = |b: &[u8], channels: usize| -> [[f32; 4]; 16] {
-        std::array::from_fn(|i| {
-            let mut p = [0.0, 0.0, 0.0, 1.0];
-            for c in 0..channels {
-                p[c] = f32::from(b[i * channels + c]) / 255.0;
-            }
-            p
-        })
-    };
+    let unorm = |b: &[u8], channels| block_texels(b, channels, |v| f32::from(v) / 255.0);
     let mut b8 = [0u8; 64];
     Ok(match vk_format {
         BC1_RGB_UNORM | BC1_RGB_SRGB | BC1_RGBA_UNORM | BC1_RGBA_SRGB => {
@@ -582,6 +610,10 @@ fn decode_block(vk_format: u32, block: &[u8]) -> Result<[[f32; 4]; 16], String> 
         BC5_UNORM => {
             bcdec_rs::bc5(block, &mut b8[..32], 8, false);
             unorm(&b8, 2)
+        }
+        BC5_SNORM => {
+            bcdec_rs::bc5(block, &mut b8[..32], 8, true);
+            block_texels(&b8, 2, |v| 0.5 * f32::from(v.cast_signed()) / 127.0 + 0.5)
         }
         BC6H_UFLOAT | BC6H_SFLOAT => {
             let mut f = [0.0f32; 48];
@@ -637,6 +669,15 @@ mod tests {
                 assert_eq!(got[3].round(), f32::from(want[3]), "({x}, {y})");
             }
         }
+    }
+
+    #[test]
+    fn bc5_snorm_decodes_to_the_unorm_encoding() {
+        // Red: index 1 of endpoints 127 and -127 in every texel. Green: endpoints of 0.
+        let mut block = [0u8; 16];
+        block[..8].copy_from_slice(&[127, 0x81, 0x49, 0x92, 0x24, 0x49, 0x92, 0x24]);
+        let texels = decode_block(vk::BC5_SNORM, &block).unwrap();
+        assert!(texels.iter().all(|t| t[..2] == [0.0, 0.5]), "{texels:?}");
     }
 
     #[test]
