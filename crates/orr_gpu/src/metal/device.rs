@@ -13,6 +13,7 @@ use objc2_metal::{
 };
 
 use super::accel::{EmptyTlas, build_empty_tlas};
+use super::cache::PipelineCache;
 use super::cluster::{self, Kernels, Objects, PtlasCheck, StructureIds};
 use super::heap::Bindings;
 use super::queue::{PassResult, Queue, QueueKind, QueueRequest, TimestampRing};
@@ -73,6 +74,7 @@ impl Default for DeviceDesc<'_> {
 pub(super) struct Shared {
     pub(super) device: Obj<ProtocolObject<dyn MTLDevice>>,
     pub(super) compiler: Obj<ProtocolObject<dyn MTL4Compiler>>,
+    pub(super) pipeline_cache: PipelineCache,
     /// Every allocation; committed before a submit when `dirty`.
     pub(super) residency: Mutex<Residency>,
     /// Indexed by [`QueueKind`].
@@ -163,6 +165,8 @@ pub struct Device {
     queues: Arc<[Option<Queue>; MAX_TIMELINES]>,
     /// Built in [`Device::new`]; outside `Shared`, since it holds the shared state itself.
     empty_tlas: Arc<OnceLock<EmptyTlas>>,
+    /// Pipelines come only from the cache: [`Device::cached_pipelines_only`].
+    pub(super) cached_only: bool,
 }
 
 impl PartialEq for Device {
@@ -185,9 +189,13 @@ impl Device {
                 missing: "Metal 4".to_owned(),
             });
         }
+        let serializer = PipelineCache::serializer(&device, desc.pipeline_cache);
+        let compiler_desc = MTL4CompilerDescriptor::new();
+        compiler_desc.setPipelineDataSetSerializer(serializer.as_deref());
         let compiler = device
-            .newCompilerWithDescriptor_error(&MTL4CompilerDescriptor::new())
+            .newCompilerWithDescriptor_error(&compiler_desc)
             .map_err(|e| metal_error("newCompilerWithDescriptor", &e))?;
+        let pipeline_cache = PipelineCache::open(&device, desc.pipeline_cache, serializer);
         let residency_desc = MTLResidencySetDescriptor::new();
         residency_desc.setLabel(Some(&NSString::from_str(desc.name)));
         let set = device
@@ -204,6 +212,7 @@ impl Device {
         let shared = Arc::new(Shared {
             device,
             compiler: Obj(compiler),
+            pipeline_cache,
             residency: Mutex::new(Residency {
                 set: Obj(set),
                 dirty: true,
@@ -236,6 +245,7 @@ impl Device {
             shared,
             queues: Arc::new(queues),
             empty_tlas: Arc::default(),
+            cached_only: false,
         };
         let empty = build_empty_tlas(&device)?;
         let _ = device.empty_tlas.set(empty);
@@ -251,9 +261,13 @@ impl Device {
         self.queues[kind as usize].as_ref()
     }
 
-    /// The same device. Metal has no pipeline cache yet, so pipelines compile as usual.
+    /// A handle to the same device whose pipeline creation compiles nothing: a pipeline this
+    /// session or the cache's archive does not hold fails with [`Error::CompileRequired`].
     pub fn cached_pipelines_only(&self) -> Device {
-        self.clone()
+        Device {
+            cached_only: true,
+            ..self.clone()
+        }
     }
 
     /// Waits for everything submitted so far on every queue.

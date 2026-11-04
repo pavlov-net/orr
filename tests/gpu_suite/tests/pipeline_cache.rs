@@ -282,6 +282,32 @@ fn round_trip_and_refuse_foreign_files() {
     }
 }
 
+/// A second save in one session keeps what the first saved: both sets load warm.
+#[test]
+fn a_second_save_keeps_the_first() {
+    let path = &cache_path("second_save");
+    let d = open(path);
+    let first = Set::new(&d, 3);
+    d.save_pipeline_cache().unwrap();
+    let second = Set::new(&d, 4);
+    d.save_pipeline_cache().unwrap();
+    assert_clean(&d);
+    drop((first, second, d));
+
+    let d = open(path);
+    for value in [3, 4] {
+        let set = Set::new(&d, value);
+        assert_eq!(
+            set.cached,
+            [true, true, true],
+            "set {value}: {:?}",
+            d.pipeline_cache_report()
+        );
+        set.check(&d);
+    }
+    assert_clean(&d);
+}
+
 /// A file with good headers and a good checksum whose cache data the driver refuses is removed:
 /// the device starts empty, and the run after the next save hits. Valid usage does not allow data
 /// like this, so the test runs only where the driver is known to return an error for it.

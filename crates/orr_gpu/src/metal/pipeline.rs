@@ -5,9 +5,10 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTL4Compiler, MTL4ComputePipelineDescriptor, MTL4FunctionDescriptor,
-    MTL4LibraryFunctionDescriptor, MTL4SpecializedFunctionDescriptor, MTLComputePipelineState,
-    MTLDataType, MTLDevice, MTLFunction, MTLFunctionConstantValues, MTLLibrary,
+    MTL4Archive, MTL4Compiler, MTL4CompilerTaskOptions, MTL4ComputePipelineDescriptor,
+    MTL4FunctionDescriptor, MTL4LibraryFunctionDescriptor, MTL4SpecializedFunctionDescriptor,
+    MTLComputePipelineState, MTLDataType, MTLDevice, MTLFunction, MTLFunctionConstantValues,
+    MTLLibrary,
 };
 
 use super::device::{Device, Shared, metal_error};
@@ -73,6 +74,20 @@ impl<'a> ShaderStage<'a> {
         Ok(Retained::into_super(specialized))
     }
 
+    /// Adds what tells this stage apart from others to a pipeline cache key: the module's
+    /// code, the entry and the specialization data.
+    pub(super) fn key(&self, hasher: &mut blake3::Hasher) {
+        hasher.update(&self.module.hash.to_le_bytes());
+        hasher.update(self.entry.metal_name.to_bytes_with_nul());
+        hasher.update(&(self.spec.bytes.len() as u64).to_le_bytes());
+        hasher.update(self.spec.bytes);
+        for e in self.spec.entries {
+            for v in [e.constant_id, e.offset, e.size] {
+                hasher.update(&v.to_le_bytes());
+            }
+        }
+    }
+
     /// The stage's specialization constants as Metal function constants: Slang gives each
     /// the index of its `constant_id`. Values are laid out as for Vulkan, so a bool is four
     /// bytes here and one byte in Metal; constants the function lacks are skipped.
@@ -135,21 +150,26 @@ impl Shared {
         workgroup: [u32; 3],
         name: &str,
     ) -> Result<Obj<ProtocolObject<dyn MTLComputePipelineState>>, Error> {
-        let desc = MTL4ComputePipelineDescriptor::new();
-        desc.setLabel(Some(&NSString::from_str(name)));
-        desc.setComputeFunctionDescriptor(Some(function));
-        desc.setRequiredThreadsPerThreadgroup(super::command::size(workgroup));
-        let raw = self
-            .compiler
-            .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&desc, None)
+        let desc = compute_descriptor(function, workgroup, name);
+        Ok(Obj(self.compile_compute(&desc, None, name)?))
+    }
+
+    /// Compiles the compute pipeline `desc`, named `name` in errors.
+    fn compile_compute(
+        &self,
+        desc: &MTL4ComputePipelineDescriptor,
+        options: Option<&MTL4CompilerTaskOptions>,
+        name: &str,
+    ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, Error> {
+        self.compiler
+            .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(desc, options)
             .map_err(|e| {
                 let mut e = metal_error("newComputePipelineState", &e);
                 if let Error::Metal { message, .. } = &mut e {
                     *message = format!("{name}: {message}");
                 }
                 e
-            })?;
-        Ok(Obj(raw))
+            })
     }
 
     /// `module`'s Metal library: the pixel entries' when `fragment`, the others' otherwise.
@@ -186,6 +206,19 @@ impl Shared {
     }
 }
 
+/// The descriptor of a compute pipeline over `function` with threadgroups of `workgroup`.
+fn compute_descriptor(
+    function: &MTL4FunctionDescriptor,
+    workgroup: [u32; 3],
+    name: &str,
+) -> Retained<MTL4ComputePipelineDescriptor> {
+    let desc = MTL4ComputePipelineDescriptor::new();
+    desc.setLabel(Some(&NSString::from_str(name)));
+    desc.setComputeFunctionDescriptor(Some(function));
+    desc.setRequiredThreadsPerThreadgroup(super::command::size(workgroup));
+    desc
+}
+
 /// A compute pipeline. Command lists keep the pipelines they bind until their submit
 /// completes, so dropping it is safe at any time.
 pub struct ComputePipeline {
@@ -216,9 +249,24 @@ impl Device {
             )));
         }
         let function = s.function(&self.shared)?;
-        let raw = self
-            .shared
-            .compute_state(&function, s.entry.workgroup, name)?;
+        let desc = compute_descriptor(&function, s.entry.workgroup, name);
+        let mut key = blake3::Hasher::new();
+        key.update(b"compute");
+        s.key(&mut key);
+        for v in s.entry.workgroup {
+            key.update(&v.to_le_bytes());
+        }
+        let raw = self.shared.cached_compute(
+            key.finalize(),
+            self.cached_only,
+            |archive| {
+                archive
+                    .newComputePipelineStateWithDescriptor_error(&desc)
+                    .ok()
+            },
+            |options| self.shared.compile_compute(&desc, options, name),
+            &desc,
+        )?;
         Ok(ComputePipeline {
             raw,
             inline_root_bytes: s.inline_root_bytes,

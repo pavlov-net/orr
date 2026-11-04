@@ -14,6 +14,7 @@
 //! Each [`Queue`] has one owner thread that submits; any thread records its own
 //! [`CommandList`]s and sends them to the owner.
 
+mod cache_file;
 mod caps;
 mod error;
 mod format;

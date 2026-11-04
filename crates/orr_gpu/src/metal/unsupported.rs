@@ -1,7 +1,6 @@
 //! The parts of orr_gpu the Metal backend does not implement yet, or that Metal has no
 //! counterpart for: crash diagnostics, device-generated commands, cooperative vectors,
-//! counter frames, the pipeline cache, ray-dispatch pipelines, cluster and partitioned
-//! acceleration structures, sparse resources and swapchains. The types mirror the Vulkan
+//! counter frames, ray-dispatch pipelines and swapchains. The types mirror the Vulkan
 //! backend's; the calls fail, panic, or take handles no call creates.
 
 use std::alloc::Layout;
@@ -302,31 +301,6 @@ impl Queue {
     pub fn end_counter_frame(&self, last: TimelinePoint) -> Result<Option<CounterReport>, Error> {
         let _ = last;
         Err(Error::NotImplemented("counter frames"))
-    }
-}
-
-/// What the pipeline cache loaded and how creation has used it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PipelineCacheReport {
-    pub loaded: bool,
-    pub hits: u32,
-    pub misses: u32,
-    pub rejected: Option<String>,
-}
-
-impl Device {
-    /// Nothing to save: Metal has no pipeline cache yet.
-    pub fn save_pipeline_cache(&self) -> Result<(), Error> {
-        Ok(())
-    }
-
-    pub fn pipeline_cache_report(&self) -> PipelineCacheReport {
-        PipelineCacheReport {
-            loaded: false,
-            hits: 0,
-            misses: 0,
-            rejected: None,
-        }
     }
 }
 

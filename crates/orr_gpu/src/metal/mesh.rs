@@ -5,10 +5,10 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTL4ArgumentTable, MTL4BlendState, MTL4CommandBuffer, MTL4CommandEncoder, MTL4Compiler,
-    MTL4LibraryFunctionDescriptor, MTL4MeshRenderPipelineDescriptor, MTL4PipelineDescriptor,
-    MTL4RenderCommandEncoder, MTL4RenderPassDescriptor, MTLBlendFactor, MTLBlendOperation,
-    MTLClearColor, MTLColorWriteMask, MTLComputePipelineState, MTLCullMode,
+    MTL4Archive, MTL4ArgumentTable, MTL4BlendState, MTL4CommandBuffer, MTL4CommandEncoder,
+    MTL4Compiler, MTL4LibraryFunctionDescriptor, MTL4MeshRenderPipelineDescriptor,
+    MTL4PipelineDescriptor, MTL4RenderCommandEncoder, MTL4RenderPassDescriptor, MTLBlendFactor,
+    MTLBlendOperation, MTLClearColor, MTLColorWriteMask, MTLComputePipelineState, MTLCullMode,
     MTLDepthStencilDescriptor, MTLDepthStencilState, MTLDevice, MTLLoadAction,
     MTLRenderPipelineState, MTLRenderStages, MTLScissorRect, MTLStoreAction, MTLTriangleFillMode,
     MTLViewport, MTLWinding,
@@ -144,10 +144,32 @@ impl Device {
         // SAFETY: a sample count the device validates.
         unsafe { desc.setRasterSampleCount(d.samples.max(1) as usize) };
         let base: &MTL4PipelineDescriptor = &desc;
-        let raw = shared
-            .compiler
-            .newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(base, None)
-            .map_err(|e| metal_error("newRenderPipelineState", &e))?;
+        // The stages, then the state the descriptor takes from `d`.
+        let mut key = blake3::Hasher::new();
+        key.update(b"mesh");
+        for (tag, stage) in [(b't', d.task), (b'm', Some(d.mesh)), (b'p', d.pixel)] {
+            if let Some(s) = stage {
+                key.update(&[tag]);
+                s.key(&mut key);
+            }
+        }
+        key.update(format!("{:?}", (d.colors, d.depth, d.raster, d.samples)).as_bytes());
+        let raw = shared.cached_render(
+            key.finalize(),
+            self.cached_only,
+            |archive| {
+                archive
+                    .newRenderPipelineStateWithDescriptor_error(base)
+                    .ok()
+            },
+            |options| {
+                shared
+                    .compiler
+                    .newRenderPipelineStateWithDescriptor_compilerTaskOptions_error(base, options)
+                    .map_err(|e| metal_error("newRenderPipelineState", &e))
+            },
+            Retained::into_super(desc.clone()),
+        )?;
         let depth = match d.depth {
             Some(t) => {
                 let ds = MTLDepthStencilDescriptor::new();
@@ -165,7 +187,7 @@ impl Device {
             None => None,
         };
         Ok(MeshPipeline {
-            raw: Obj(raw),
+            raw,
             depth,
             raster: d.raster,
             task_workgroup: d.task.map_or([1, 1, 1], |t| t.entry.workgroup),

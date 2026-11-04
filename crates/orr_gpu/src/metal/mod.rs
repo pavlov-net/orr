@@ -14,6 +14,7 @@
 //! The descriptor and report types repeat the Vulkan backend's definitions field for field.
 
 mod accel;
+mod cache;
 mod cluster;
 mod command;
 mod device;
@@ -39,6 +40,7 @@ pub use accel::{
     InstanceFlags, LssEndCaps, LssIndexing, Micromap, MicromapDesc, MicromapTriangle,
     MicromapUsage, OmmFormat,
 };
+pub use cache::PipelineCacheReport;
 pub use command::{CommandList, DecompressRegion, DispatchArgs, MemoryCopy, MeshArgs, TextureCopy};
 pub use device::{Device, DeviceDesc, DeviceHooks};
 pub use memory::{
@@ -53,8 +55,8 @@ pub use texture::{Texture, TextureMemory};
 pub use unsupported::{
     COUNTER_METRICS, Checkpoint, CounterRange, CounterReport, DeviceFault, Diagnostics,
     DiagnosticsReport, ExecutionSet, FaultAccess, FaultAddress, Generated, LowLatency,
-    MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout, PipelineCacheReport, QueueProgress,
-    RayDispatchPipeline, Sequence, SetKind, Swapchain, SwapchainFrame,
+    MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout, QueueProgress, RayDispatchPipeline,
+    Sequence, SetKind, Swapchain, SwapchainFrame,
 };
 
 /// The most queues a device has, one per [`QueueKind`].
