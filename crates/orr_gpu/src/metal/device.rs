@@ -13,11 +13,12 @@ use objc2_metal::{
 };
 
 use super::accel::{EmptyTlas, build_empty_tlas};
+use super::cluster::{self, Kernels, Objects};
 use super::heap::Bindings;
 use super::queue::{PassResult, Queue, QueueKind, QueueRequest, TimestampRing};
 use super::unsupported::Diagnostics;
 use super::{Buffers, Garbage, MAX_TIMELINES, Obj, Release, Timeline, lock};
-use crate::rtas::ClusterCaps;
+use crate::rtas::{ClusterCaps, ClusterVertexFormat};
 use crate::{Caps, Error, Limits, MAX_INLINE_ROOT_BYTES, TimelinePoint, Tlas};
 
 /// Additions to device creation. Metal devices take none, so the trait has no methods here.
@@ -81,6 +82,9 @@ pub(super) struct Shared {
     /// Pass results by the point of their submit, oldest first.
     pub(super) results: Mutex<VecDeque<(TimelinePoint, Vec<PassResult>)>>,
     pub(super) timestamps: TimestampRing,
+    /// Cluster and partitioned acceleration structures by the address of their object.
+    pub(super) objects: Mutex<Objects>,
+    pub(super) cluster_kernels: OnceLock<Kernels>,
     /// Each module's libraries by (module hash, fragment library).
     pub(super) libraries: Mutex<HashMap<(u64, bool), Obj<ProtocolObject<dyn MTLLibrary>>>>,
     pub(super) bindings: Bindings,
@@ -187,6 +191,8 @@ impl Device {
             buffers: Mutex::default(),
             results: Mutex::default(),
             timestamps,
+            objects: Mutex::default(),
+            cluster_kernels: OnceLock::new(),
             libraries: Mutex::default(),
             bindings,
             caps,
@@ -308,18 +314,19 @@ fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
         present_metering: false,
         present_timing: false,
         hdr_metadata: false,
+        // Emulated over classic structures (cluster.rs).
         cluster: ClusterCaps {
-            formats: &[],
-            max_tris: 0,
-            max_verts: 0,
-            align_clas: 0,
-            align_template: 0,
-            align_blas: 0,
-            align_scratch: 0,
-            align_bounds: 0,
-            max_geometry_index: 0,
+            formats: &[ClusterVertexFormat::F32x3],
+            max_tris: 256,
+            max_verts: 256,
+            align_clas: cluster::ALIGN,
+            align_template: cluster::ALIGN,
+            align_blas: cluster::ALIGN,
+            align_scratch: 256,
+            align_bounds: 32,
+            max_geometry_index: (1 << 24) - 1,
             omm_in_clusters: false,
-            max_partitions: 0,
+            max_partitions: 1 << 16,
         },
         limits: Limits {
             image_descriptor_bytes: 8,

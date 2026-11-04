@@ -39,8 +39,8 @@ public struct Candidate
     public bool front_face;     // triangle candidates only
     public float3 object_origin;
     public float3 object_direction;
-    // Object-space corner positions where the handler asked for them (zero elsewhere and on
-    // Metal). The BLAS must allow data access.
+    // Object-space corner positions where the handler asked for them (zero elsewhere). The
+    // BLAS must allow data access.
     public float3 object_positions[3];
 }
 
@@ -108,7 +108,7 @@ public Hit trace_closest<A : IAnyHit>(Tlas tlas, RayDesc ray, uint mask, uint fl
 
 // As above, and the object-space corner positions of a triangle hit, whose BLAS must allow
 // data access. On any other hit the first position is the object-space hit point and the
-// others are zero. All are zero on Metal.
+// others are zero.
 [ForceInline]
 public Hit trace_closest<A : IAnyHit>(Tlas tlas, RayDesc ray, uint mask, uint flags, A any_hit, out float3 positions[3])
 {
@@ -123,7 +123,9 @@ public bool trace_any<A : IAnyHit>(Tlas tlas, RayDesc ray, uint mask, uint flags
     begin(q, tlas, ray, mask, flags | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH);
     while (q.Proceed())
     {
-        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && any_hit.accept(candidate(q)))
+        if (opaque_candidate(q, flags))
+            q.CommitNonOpaqueTriangleHit();
+        else if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && any_hit.accept(candidate(q)))
             q.CommitNonOpaqueTriangleHit();
     }
     return q.CommittedStatus() != COMMITTED_NOTHING;
@@ -142,6 +144,11 @@ public float3 trace_transmittance<H : ICandidate>(Tlas tlas, RayDesc ray, uint m
     begin(q, tlas, ray, mask, flags);
     while (q.Proceed())
     {
+        if (opaque_candidate(q, flags))
+        {
+            q.CommitNonOpaqueTriangleHit();
+            continue;
+        }
         Candidate c = candidate(q);
         if (c.triangle && handler.positions(c))
             candidate_positions(q, c.object_positions);
@@ -199,7 +206,9 @@ Hit closest<A : IAnyHit>(Tlas tlas, RayDesc ray, uint mask, uint flags, A any_hi
     begin(q, tlas, ray, mask, flags);
     while (q.Proceed())
     {
-        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && any_hit.accept(candidate(q)))
+        if (opaque_candidate(q, flags))
+            q.CommitNonOpaqueTriangleHit();
+        else if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && any_hit.accept(candidate(q)))
             q.CommitNonOpaqueTriangleHit();
     }
     Hit h = committed(q);
@@ -230,6 +239,11 @@ Hit translucent<H : ITranslucent>(Tlas tlas, RayDesc ray, uint mask, uint flags,
             break;
         }
         count++;
+        if (opaque_candidate(q, flags))
+        {
+            q.CommitNonOpaqueTriangleHit();
+            continue;
+        }
         if (q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
             continue;
         Candidate c = candidate(q);
@@ -345,10 +359,63 @@ Candidate candidate(inout RayQuery<RAY_FLAG_NONE> q)
     {
     case metal:
         c.cluster_id = -1;
+        if (c.triangle && (c.custom_index & METAL_CLUSTER_INSTANCE) != 0)
+        {
+            uint* d = (uint*)metal_candidate_data(q);
+            c.cluster_id = int(d[0]);
+            c.geometry_index = d[1] & 0xffffff;
+            c.primitive_index = d[2];
+        }
+        c.custom_index &= 0xffffff;
     default:
         c.cluster_id = q.CandidateClusterID();
     }
     return c;
+}
+
+// Metal has no cluster acceleration structures and fetches no corners from hits. The backend
+// gives every triangle primitive data: its cluster ID (-1 outside clusters), geometry index
+// and flags, triangle in the cluster and its three corners. Its stand-ins for cluster BLAS
+// also set bit 31 of their instances' user ID.
+static const uint METAL_CLUSTER_INSTANCE = 0x80000000;
+static const uint METAL_GEOMETRY_OPAQUE = 0x80000000;
+
+uint64_t metal_candidate_data(inout RayQuery<RAY_FLAG_NONE> q)
+{
+    __intrinsic_asm "reinterpret_cast<ulong>(($0)->get_candidate_primitive_data())";
+}
+
+// The corners a cluster triangle's data holds.
+float3[3] metal_corners(uint64_t data)
+{
+    float* f = (float*)(data + 12);
+    float3 p[3];
+    for (uint c = 0; c < 3; c++)
+        p[c] = float3(f[c * 3], f[c * 3 + 1], f[c * 3 + 2]);
+    return p;
+}
+
+uint64_t metal_committed_data(inout RayQuery<RAY_FLAG_NONE> q)
+{
+    __intrinsic_asm "reinterpret_cast<ulong>(($0)->get_committed_primitive_data())";
+}
+
+// Whether a non-opaque candidate is an opaque triangle of a cluster: Metal makes a whole
+// geometry opaque or not, so a cluster mixing them arrives whole and its triangles' own
+// flags decide here. Always false outside Metal.
+[ForceInline]
+bool opaque_candidate(inout RayQuery<RAY_FLAG_NONE> q, uint flags)
+{
+    __target_switch
+    {
+    case metal:
+        if ((flags & RAY_FLAG_FORCE_NON_OPAQUE) != 0 || q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE
+            || (q.CandidateInstanceID() & METAL_CLUSTER_INSTANCE) == 0)
+            return false;
+        return (*(uint*)(metal_candidate_data(q) + 4) & METAL_GEOMETRY_OPAQUE) != 0;
+    default:
+        return false;
+    }
 }
 
 [ForceInline]
@@ -369,6 +436,14 @@ Hit committed(inout RayQuery<RAY_FLAG_NONE> q)
     {
     case metal:
         h.cluster_id = -1;
+        if (h.triangle && (h.custom_index & METAL_CLUSTER_INSTANCE) != 0)
+        {
+            uint* d = (uint*)metal_committed_data(q);
+            h.cluster_id = int(d[0]);
+            h.geometry_index = d[1] & 0xffffff;
+            h.primitive_index = d[2];
+        }
+        h.custom_index &= 0xffffff;
     default:
         h.cluster_id = h.hit ? q.CommittedClusterID() : -1;
     }
@@ -381,7 +456,9 @@ void candidate_positions(inout RayQuery<RAY_FLAG_NONE> q, inout float3 p[3])
     __target_switch
     {
     case metal:
-        break;
+        // Every triangle carries its corners after three words of data.
+        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE)
+            p = metal_corners(metal_candidate_data(q));
     default:
         p = q.CandidateGetIntersectionTriangleVertexPositions();
     }
@@ -397,7 +474,10 @@ void committed_positions(inout RayQuery<RAY_FLAG_NONE> q, bool fetch, Hit h, out
     __target_switch
     {
     case metal:
-        break;
+        if (fetch && h.triangle)
+            p = metal_corners(metal_committed_data(q));
+        else if (fetch && h.hit)
+            p[0] = q.CommittedObjectRayOrigin() + h.t * q.CommittedObjectRayDirection();
     default:
         if (fetch && h.triangle)
             p = q.CommittedGetIntersectionTriangleVertexPositions();

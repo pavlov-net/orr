@@ -340,7 +340,7 @@ impl Cuts {
         RtasOpDesc {
             op: RtasOp::BuildClusterBlas,
             mode: RtasMode::Implicit,
-            flags: RtasFlags::FAST_TRACE,
+            flags: RtasFlags::FAST_TRACE | RtasFlags::TRANSIENT,
             vertex_format: ClusterVertexFormat::F32x3,
             limits: RtasLimits::Blas(BlasLimits {
                 max_args: self.sizes.rt_blas.max(1),

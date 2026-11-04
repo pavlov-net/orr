@@ -150,6 +150,7 @@ impl<T> Drop for Allocation<T> {
 /// Takes a freed buffer out of the address map and the residency set.
 fn release_buffer(shared: &Shared, start: u64, raw: RawBuffer) {
     lock(&shared.buffers).remove(start);
+    shared.forget_objects(start, start + raw.buffer.length() as u64);
     let mut r = lock(&shared.residency);
     match &raw.heap {
         Some(heap) => r.set.removeAllocation(ProtocolObject::from_ref(&**heap)),

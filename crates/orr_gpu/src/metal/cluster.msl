@@ -1,0 +1,275 @@
+// Kernels of the cluster acceleration-structure emulation (cluster.rs). Records arrive in
+// the layout `rtas` `store` writes (the Vulkan structs); objects live in the caller's memory
+// behind a 64-byte header:
+//   word 0 kind, word 1 size in bytes, words 2-3 Metal resource ID,
+//   word 4 triangles, word 5 vertices, word 6 cluster ID, word 7 1 when every triangle is opaque.
+// A CLAS follows it with its vertices (f32x3), its indices (u32x3) and per-triangle data
+// (cluster ID, geometry index and flags, triangle in the cluster, then the three corners for
+// hits to fetch: DATA_WORDS words); a template has no vertices and leaves the corners.
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint KIND_CLAS = 1;
+constant uint KIND_TEMPLATE = 2;
+constant uint KIND_BLAS_INSTANCED = 3;
+constant uint KIND_BLAS_FLAT = 4;
+constant uint HEADER = 64;
+constant uint GEOMETRY_OPAQUE_BIT = 1u << 31;
+constant uint DATA_WORDS = 12;
+
+struct Instance { packed_float3 m[4]; uint options; uint mask; uint ift; uint user; ulong id; };
+
+template <typename T> device T* at(ulong a) { return reinterpret_cast<device T*>(a); }
+
+// The Metal resource ID behind an acceleration-structure address: a classic one's address is
+// its ID tagged in bit 63, a cluster BLAS's header holds it. `cluster` tells which.
+ulong resolve(ulong a, thread bool& cluster) {
+    cluster = false;
+    if (a == 0) return 0;
+    if ((a >> 63) != 0) return a & ~(1ul << 63);
+    uint kind = at<uint>(a)[0];
+    cluster = kind == KIND_BLAS_INSTANCED || kind == KIND_BLAS_FLAT;
+    return at<ulong>(a)[1];
+}
+
+// --- CLAS, templates and instantiations -------------------------------------------------
+
+struct PackJob { ulong dst; ulong id; ulong record; uint kind; uint pad; };
+struct PackArgs { device const PackJob* jobs; };
+
+uint load_index(ulong base, uint i, uint bytes) {
+    device const uchar* p = at<uchar>(base) + i * bytes;
+    uint v = p[0];
+    if (bytes > 1) v |= uint(p[1]) << 8;
+    if (bytes > 2) v |= uint(p[2]) << 16 | uint(p[3]) << 24;
+    return v;
+}
+
+uint geometry_word(uint base, uint t) {
+    return (((base & 0xffffff) + (t & 0xffffff)) & 0xffffff) | ((base | t) & 0xe0000000u);
+}
+
+// One threadgroup per job: a ClasBuild or TemplateBuild record (kind 1 or 2) or an
+// Instantiate record (kind 3) packed into an object at `dst`.
+kernel void pack(constant PackArgs& a [[buffer(0)]], uint g [[threadgroup_position_in_grid]],
+                 uint tid [[thread_position_in_threadgroup]]) {
+    PackJob job = a.jobs[g];
+    device const uint* r = at<uint>(job.record);
+    device uint* h = at<uint>(job.dst);
+    uint tris, verts, cluster, all_opaque;
+    ulong vertices, vstride;
+    // Indices and per-triangle words come from the record, or from the template.
+    device const uint* tmpl = nullptr;
+    uint id_offset = 0, geometry_offset = 0;
+    uint base = 0, ibytes = 0, truncate = 0;
+    ulong indices = 0, flags = 0;
+    if (job.kind == 3) {
+        tmpl = at<uint>(ulong(r[2]) | ulong(r[3]) << 32);
+        id_offset = r[0];
+        geometry_offset = r[1] & 0xffffff;
+        vertices = ulong(r[4]) | ulong(r[5]) << 32;
+        vstride = ulong(r[6]) | ulong(r[7]) << 32;
+        tris = tmpl[4];
+        verts = tmpl[5];
+        cluster = tmpl[6] + id_offset;
+        all_opaque = tmpl[7];
+    } else {
+        cluster = r[0];
+        tris = r[2] & 0x1ff;
+        verts = (r[2] >> 9) & 0x1ff;
+        truncate = (r[2] >> 18) & 0x3f;
+        ibytes = (r[2] >> 24) & 0xf;
+        base = r[3];
+        vstride = r[4] >> 16;
+        indices = ulong(r[6]) | ulong(r[7]) << 32;
+        vertices = ulong(r[8]) | ulong(r[9]) << 32;
+        flags = ulong(r[10]) | ulong(r[11]) << 32;
+        all_opaque = (base & GEOMETRY_OPAQUE_BIT) != 0 && flags == 0 ? 1 : 0;
+    }
+    bool clas = job.kind != 2;
+    uint vbytes = clas ? verts * 12 : 0;
+    device float* v_out = at<float>(job.dst + HEADER);
+    device uint* i_out = at<uint>(job.dst + HEADER + vbytes);
+    device uint* p_out = at<uint>(job.dst + HEADER + vbytes + tris * 12);
+    if (tid == 0) {
+        h[0] = clas ? KIND_CLAS : KIND_TEMPLATE;
+        h[1] = (HEADER + vbytes + tris * (12 + DATA_WORDS * 4) + 15) & ~15u;
+        h[2] = uint(job.id);
+        h[3] = uint(job.id >> 32);
+        h[4] = tris;
+        h[5] = verts;
+        h[6] = cluster;
+        h[7] = all_opaque;
+    }
+    if (clas) {
+        uint keep = truncate == 0 ? ~0u : ~((1u << truncate) - 1);
+        for (uint i = tid; i < verts; i += 64) {
+            device const float* src = at<float>(vertices + i * vstride);
+            for (uint c = 0; c < 3; c++) v_out[i * 3 + c] = as_type<float>(as_type<uint>(src[c]) & keep);
+        }
+    }
+    for (uint t = tid; t < tris; t += 64) {
+        if (tmpl != nullptr) {
+            device const uint* ti = tmpl + HEADER / 4;
+            device const uint* tp = tmpl + HEADER / 4 + tris * 3;
+            for (uint c = 0; c < 3; c++) i_out[t * 3 + c] = ti[t * 3 + c];
+            uint w = tp[t * DATA_WORDS + 1];
+            p_out[t * DATA_WORDS] = cluster;
+            p_out[t * DATA_WORDS + 1] = (((w & 0xffffff) + geometry_offset) & 0xffffff) | (w & 0xe0000000u);
+            p_out[t * DATA_WORDS + 2] = t;
+        } else {
+            for (uint c = 0; c < 3; c++) i_out[t * 3 + c] = load_index(indices, t * 3 + c, ibytes);
+            uint w = flags != 0 ? geometry_word(base, at<uint>(flags)[t]) : base;
+            p_out[t * DATA_WORDS] = cluster;
+            p_out[t * DATA_WORDS + 1] = w;
+            p_out[t * DATA_WORDS + 2] = t;
+        }
+    }
+    if (!clas) return;
+    // The corners, once every vertex is written.
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint t = tid; t < tris; t += 64)
+        for (uint c = 0; c < 3; c++)
+            for (uint k = 0; k < 3; k++)
+                p_out[t * DATA_WORDS + 3 + c * 3 + k] = as_type<uint>(v_out[i_out[t * 3 + c] * 3 + k]);
+}
+
+// --- Cluster BLAS -------------------------------------------------------------------------
+
+struct BlasJob { ulong clas; ulong out; uint count; uint pad; };
+struct BlasArgs { device const BlasJob* jobs; };
+
+// One threadgroup per BLAS: an instance per CLAS, its ID from the CLAS header.
+kernel void blas_instances(constant BlasArgs& a [[buffer(0)]], uint g [[threadgroup_position_in_grid]],
+                           uint tid [[thread_position_in_threadgroup]]) {
+    BlasJob job = a.jobs[g];
+    device Instance* out = at<Instance>(job.out);
+    for (uint i = tid; i < job.count; i += 64) {
+        ulong clas = at<ulong>(job.clas)[i];
+        Instance o;
+        o.m[0] = packed_float3(1, 0, 0);
+        o.m[1] = packed_float3(0, 1, 0);
+        o.m[2] = packed_float3(0, 0, 1);
+        o.m[3] = packed_float3(0, 0, 0);
+        o.options = 0;
+        o.mask = 0xff;
+        o.ift = 0;
+        o.user = 0;
+        o.id = at<ulong>(clas)[1];
+        out[i] = o;
+    }
+}
+
+struct GatherJob { ulong clas; ulong vertices; ulong data; };
+struct GatherArgs { device const GatherJob* jobs; };
+
+// One threadgroup per CLAS of a flat BLAS: its triangles unindexed, and their data.
+kernel void blas_gather(constant GatherArgs& a [[buffer(0)]], uint g [[threadgroup_position_in_grid]],
+                        uint tid [[thread_position_in_threadgroup]]) {
+    GatherJob job = a.jobs[g];
+    device const uint* h = at<uint>(job.clas);
+    uint tris = h[4], verts = h[5];
+    device const float* v = at<float>(job.clas + HEADER);
+    device const uint* idx = at<uint>(job.clas + HEADER + verts * 12);
+    device const uint* data = at<uint>(job.clas + HEADER + verts * 12 + tris * 12);
+    device float* vo = at<float>(job.vertices);
+    device uint* po = at<uint>(job.data);
+    for (uint t = tid; t < tris; t += 64) {
+        for (uint c = 0; c < 3; c++)
+            for (uint k = 0; k < 3; k++) vo[t * 9 + c * 3 + k] = v[idx[t * 3 + c] * 3 + k];
+        for (uint k = 0; k < DATA_WORDS; k++) po[t * DATA_WORDS + k] = data[t * DATA_WORDS + k];
+    }
+}
+
+// --- Object copies -----------------------------------------------------------------------
+
+struct CopyJob { ulong src; ulong dst; uint words; uint pad; };
+struct CopyArgs { device const CopyJob* jobs; };
+
+kernel void copy_words(constant CopyArgs& a [[buffer(0)]], uint g [[threadgroup_position_in_grid]],
+                       uint tid [[thread_position_in_threadgroup]]) {
+    CopyJob job = a.jobs[g];
+    device const uint* s = at<uint>(job.src);
+    device uint* d = at<uint>(job.dst);
+    for (uint i = tid; i < job.words; i += 64) d[i] = s[i];
+}
+
+// --- Partitioned TLAS ---------------------------------------------------------------------
+// State at the PTLAS address: the header (word 4 the instance capacity, read as the build's
+// instance count; word 5 the partitions, the global one last), one translation per
+// partition, a copy of each instance's last write and its Metal instance descriptor.
+
+struct PtlasArgs {
+    ulong state;
+    ulong commands;
+    ulong count;
+    uint instances;
+    uint partitions;
+    uint op;
+    uint pad;
+};
+
+constant uint WRITE_WORDS = 26;
+
+device float4* translations(constant PtlasArgs& a) { return at<float4>(a.state + 256); }
+device uint* writes(constant PtlasArgs& a) { return at<uint>(a.state + 256 + (a.partitions + 1) * 16); }
+device Instance* descriptors(constant PtlasArgs& a) {
+    return at<Instance>(a.state + 256 + (a.partitions + 1) * 16 + a.instances * WRITE_WORDS * 4);
+}
+
+// Forgets every instance and translation.
+kernel void ptlas_clear(constant PtlasArgs& a [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+    if (i < a.instances)
+        for (uint w = 0; w < WRITE_WORDS; w++) writes(a)[i * WRITE_WORDS + w] = 0;
+    if (i <= a.partitions) translations(a)[i] = float4(0);
+}
+
+// Applies record `i` of each command of op `a.op`.
+kernel void ptlas_apply(constant PtlasArgs& a [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+    uint n = min(at<uint>(a.count)[0], 3u);
+    for (uint c = 0; c < n; c++) {
+        device const uint* cmd = at<uint>(a.commands + c * 24);
+        if (cmd[0] != a.op || i >= cmd[1]) continue;
+        ulong args = ulong(cmd[2]) | ulong(cmd[3]) << 32;
+        ulong stride = ulong(cmd[4]) | ulong(cmd[5]) << 32;
+        device const uint* r = at<uint>(args + i * stride);
+        if (a.op == 0) {
+            uint index = r[22];
+            if (index >= a.instances) continue;
+            for (uint w = 0; w < WRITE_WORDS; w++) writes(a)[index * WRITE_WORDS + w] = r[w];
+        } else if (a.op == 1) {
+            uint index = r[0];
+            if (index >= a.instances) continue;
+            writes(a)[index * WRITE_WORDS + 24] = r[2];
+            writes(a)[index * WRITE_WORDS + 25] = r[3];
+        } else {
+            uint p = r[0] == 0xffffffffu ? a.partitions : r[0];
+            if (p > a.partitions) continue;
+            translations(a)[p] = float4(as_type<float>(r[1]), as_type<float>(r[2]), as_type<float>(r[3]), 0);
+        }
+    }
+}
+
+// Rewrites instance `i`'s Metal descriptor from its last write and its partition's translation.
+kernel void ptlas_descriptors(constant PtlasArgs& a [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+    if (i >= a.instances) return;
+    device const uint* r = writes(a) + i * WRITE_WORDS;
+    ulong blas = ulong(r[24]) | ulong(r[25]) << 32;
+    bool cluster;
+    ulong id = resolve(blas, cluster);
+    uint p = r[23] == 0xffffffffu ? a.partitions : min(r[23], a.partitions);
+    float3 t = translations(a)[p].xyz;
+    float m[12];
+    for (uint k = 0; k < 12; k++) m[k] = as_type<float>(r[k]);
+    Instance o;
+    for (uint c = 0; c < 3; c++) o.m[c] = packed_float3(m[c], m[4 + c], m[8 + c]);
+    o.m[3] = packed_float3(m[3] + t.x, m[7] + t.y, m[11] + t.z);
+    o.options = r[21] & 0xf;
+    o.mask = blas == 0 ? 0 : r[19] & 0xff;
+    o.ift = 0;
+    o.user = (r[18] & 0xffffff) | (cluster ? 1u << 31 : 0u);
+    o.id = id;
+    if (blas == 0)
+        for (uint c = 0; c < 4; c++) o.m[c] = packed_float3(0);
+    descriptors(a)[i] = o;
+}

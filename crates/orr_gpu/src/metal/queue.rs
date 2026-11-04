@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::{
@@ -10,7 +11,7 @@ use objc2_metal::{
     MTL4CounterHeapType, MTLDevice, MTLSharedEvent,
 };
 
-use super::command::CommandList;
+use super::command::{CommandList, Finished};
 use super::device::{Device, Shared};
 use super::unsupported::SwapchainFrame;
 use super::{Obj, lock};
@@ -149,6 +150,9 @@ pub struct Queue {
     pub(super) raw: Obj<ProtocolObject<dyn MTL4CommandQueue>>,
     /// Held for every submit, so timeline values signal in order.
     submit_lock: Mutex<()>,
+    /// Signaled before each CPU step of a submit ([`super::command::HostStep`]).
+    host_event: Obj<ProtocolObject<dyn MTLSharedEvent>>,
+    host_value: AtomicU64,
     pub(super) shared: Arc<Shared>,
 }
 
@@ -163,6 +167,11 @@ impl Queue {
             kind,
             raw: Obj(raw),
             submit_lock: Mutex::new(()),
+            host_event: Obj(shared.device.newSharedEvent().ok_or(Error::Metal {
+                call: "newSharedEvent",
+                message: format!("{kind:?} queue CPU steps"),
+            })?),
+            host_value: AtomicU64::new(0),
             shared: Arc::clone(shared),
         })
     }
@@ -197,12 +206,15 @@ impl Queue {
             .iter_mut()
             .flat_map(|f| std::mem::take(&mut f.passes))
             .collect();
-        let mut buffers: Vec<NonNull<ProtocolObject<dyn MTL4CommandBuffer>>> =
-            finished.iter().map(|f| NonNull::from(&*f.buffer)).collect();
-        if let Some(first) = NonNull::new(buffers.as_mut_ptr()) {
-            // SAFETY: `buffers` holds `len` live, ended command buffers.
-            unsafe { self.raw.commit_count(first, buffers.len()) };
+        // Commits up to each CPU step, runs it once the GPU has caught up and commits what
+        // it recorded before the rest.
+        let mut ready = Vec::new();
+        let mut steps = Vec::new();
+        for f in &mut finished {
+            self.run_steps(f, &mut ready, &mut steps)?;
         }
+        self.commit(&mut ready);
+        finished.extend(steps);
         let point = self.signal();
         if !passes.is_empty() {
             // Read once the submit completes, before the ring goes round.
@@ -227,6 +239,59 @@ impl Queue {
             Box::new(move || drop(finished)),
         );
         Ok(point)
+    }
+
+    /// Queues `f`'s command buffers on `ready`, committing and running each CPU step on the
+    /// way; the lists the steps record (themselves split by steps) go to `steps`.
+    fn run_steps(
+        &self,
+        f: &mut Finished,
+        ready: &mut Vec<Retained<ProtocolObject<dyn MTL4CommandBuffer>>>,
+        steps: &mut Vec<Finished>,
+    ) -> Result<(), Error> {
+        for (buffer, step) in &mut f.buffers {
+            ready.push(buffer.clone());
+            if let Some(step) = step.take() {
+                self.commit(ready);
+                self.wait_for_gpu();
+                let mut list = CommandList::new(self)?;
+                step(&mut list);
+                let mut done = list.finish();
+                self.run_steps(&mut done, ready, steps)?;
+                steps.push(done);
+            }
+        }
+        Ok(())
+    }
+
+    /// Commits `buffers` in order and empties it; the caller holds the submit lock.
+    fn commit(&self, buffers: &mut Vec<Retained<ProtocolObject<dyn MTL4CommandBuffer>>>) {
+        if buffers.is_empty() {
+            return;
+        }
+        self.shared.commit_residency();
+        let mut raw: Vec<NonNull<ProtocolObject<dyn MTL4CommandBuffer>>> =
+            buffers.iter().map(|b| NonNull::from(&**b)).collect();
+        // SAFETY: `raw` holds `len` live, ended command buffers, which `finished` keeps
+        // until the submit completes.
+        unsafe {
+            self.raw
+                .commit_count(NonNull::new(raw.as_mut_ptr()).unwrap(), raw.len())
+        };
+        buffers.clear();
+    }
+
+    /// Waits on the CPU until everything committed to this queue has completed, for a CPU
+    /// step that reads what it wrote; the caller holds the submit lock.
+    fn wait_for_gpu(&self) {
+        let value = self.host_value.fetch_add(1, Ordering::Relaxed) + 1;
+        self.raw
+            .signalEvent_value(ProtocolObject::from_ref(&*self.host_event.0), value);
+        assert!(
+            self.host_event
+                .waitUntilSignaledValue_timeoutMS(value, 60_000),
+            "the GPU did not reach a CPU step within a minute"
+        );
     }
 
     /// Signals the next value of the timeline after the work queued so far; the caller

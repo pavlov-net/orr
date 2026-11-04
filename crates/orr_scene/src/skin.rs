@@ -291,7 +291,7 @@ impl SkinFrame {
                 RtasOpDesc {
                     op: RtasOp::BuildClusterBlas,
                     mode: RtasMode::Implicit,
-                    flags: RtasFlags::FAST_TRACE,
+                    flags: RtasFlags::FAST_TRACE | RtasFlags::TRANSIENT,
                     vertex_format: ClusterVertexFormat::F32x3,
                     limits: RtasLimits::Blas(BlasLimits {
                         max_args: copies.max(1),

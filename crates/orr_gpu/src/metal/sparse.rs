@@ -52,8 +52,10 @@ impl<T> Drop for SparseAllocation<T> {
         let buffer = self.buffer.clone();
         let shared = Arc::clone(&self.shared);
         let start = self.gpu.address().0;
+        let end = start + self.size;
         self.shared.defer(Box::new(move || {
             lock(&shared.buffers).remove(start);
+            shared.forget_objects(start, end);
             let mut r = lock(&shared.residency);
             r.set.removeAllocation(ProtocolObject::from_ref(&*buffer));
             r.dirty = true;
