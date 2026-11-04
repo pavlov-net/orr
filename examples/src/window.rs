@@ -49,12 +49,15 @@ impl ApplicationHandler for App {
     }
 }
 
-/// A resizable window, shown without taking focus and closed when dropped.
+/// A resizable window, closed when dropped. It shows without taking focus at the first
+/// [`Window::pump`] and hides as soon as it is closed: Windows calls a window that goes five
+/// seconds without a pump not responding, and neither loading nor teardown pumps it.
 pub struct Window {
     app: App,
     event_loop: EventLoop<()>,
     title: String,
     compiling: u32,
+    shown: bool,
 }
 
 impl Window {
@@ -64,6 +67,7 @@ impl Window {
         let attributes = WindowAttributes::default()
             .with_title(title)
             .with_inner_size(PhysicalSize::new(width, height))
+            .with_visible(false)
             .with_active(false);
         let mut w = Window {
             app: App {
@@ -75,15 +79,28 @@ impl Window {
             event_loop,
             title: title.to_owned(),
             compiling: 0,
+            shown: false,
         };
         while w.app.window.is_none() {
-            assert!(w.pump(), "the window closed while opening");
+            assert!(w.pump_events(), "the window closed while opening");
         }
         w
     }
 
     /// Handles pending events without waiting; false once the window was closed.
     pub fn pump(&mut self) -> bool {
+        if !self.shown {
+            self.shown = true;
+            self.window().set_visible(true);
+        }
+        let open = self.pump_events();
+        if !open {
+            self.window().set_visible(false);
+        }
+        open
+    }
+
+    fn pump_events(&mut self) -> bool {
         let status = self
             .event_loop
             .pump_app_events(Some(Duration::ZERO), &mut self.app);
