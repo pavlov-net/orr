@@ -474,7 +474,7 @@ impl<'a> Packer<'a> {
 
     /// The channel `r` reads for an input: the last override for its image that sets the
     /// input's channel, else its two-channel reading on a red-green image, else its own.
-    fn channel_of(&self, r: TexRef, input: fn(&InputChannels) -> Option<u8>) -> TexRef {
+    fn channel_of(&self, r: TexRef, input: fn(&InputChannels) -> Option<u8>) -> Result<TexRef> {
         let name = &self.images[r.image].name;
         let set = self
             .rules
@@ -483,10 +483,14 @@ impl<'a> Packer<'a> {
             .filter(|(pattern, _)| name.contains(pattern.as_str()))
             .fold(None, |c, (_, o)| input(&o.channels).or(c));
         let rg = r.rg_channel.filter(|_| self.image(r.image).rg);
-        TexRef {
-            channel: set.or(rg).unwrap_or(r.channel),
-            ..r
+        let channel = set.or(rg).unwrap_or(r.channel);
+        if channel > 3 {
+            return Err(Error::Texture {
+                asset: self.asset.into(),
+                message: format!("image {name}: no channel {channel}"),
+            });
         }
+        Ok(TexRef { channel, ..r })
     }
 
     /// Cooks the material's textures, binds them and folds constants into its factors.
@@ -496,18 +500,19 @@ impl<'a> Packer<'a> {
         m: &mut Material,
         t: &MaterialTextures,
     ) -> Result<()> {
-        let remap = |r: Option<TexRef>, input| r.map(|r| self.channel_of(r, input));
+        let remap = |r: Option<TexRef>, input| r.map(|r| self.channel_of(r, input)).transpose();
         let t = &MaterialTextures {
-            opacity: remap(t.opacity, |c| c.opacity),
-            roughness: remap(t.roughness, |c| c.roughness),
-            metalness: remap(t.metalness, |c| c.metalness),
+            opacity: remap(t.opacity, |c| c.opacity)?,
+            roughness: remap(t.roughness, |c| c.roughness)?,
+            metalness: remap(t.metalness, |c| c.metalness)?,
             occlusion: t
                 .occlusion
-                .map(|(r, s)| (self.channel_of(r, |c| c.occlusion), s)),
-            specular: remap(t.specular, |c| c.specular),
-            coat: remap(t.coat, |c| c.coat),
-            transmission: remap(t.transmission, |c| c.transmission),
-            displacement: remap(t.displacement, |c| c.displacement),
+                .map(|(r, s)| Ok::<_, Error>((self.channel_of(r, |c| c.occlusion)?, s)))
+                .transpose()?,
+            specular: remap(t.specular, |c| c.specular)?,
+            coat: remap(t.coat, |c| c.coat)?,
+            transmission: remap(t.transmission, |c| c.transmission)?,
+            displacement: remap(t.displacement, |c| c.displacement)?,
             ..t.clone()
         };
         if let Some(r) = &t.base_color {
