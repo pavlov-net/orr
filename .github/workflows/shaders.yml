@@ -29,7 +29,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           ldd --version | head -1
-          for f in .tools/slang-2026.20/bin/slangc .tools/slang-2026.20/lib/*.so*; do
+          for f in .tools/slang-2026.21/bin/slangc .tools/slang-2026.21/lib/*.so*; do
             [ -f "$f" ] || continue
             glibc=$(objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
             glibcxx=$(objdump -T "$f" | grep -o 'GLIBCXX_[0-9.]*' | sort -uV | tail -1)

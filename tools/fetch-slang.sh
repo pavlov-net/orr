@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Fetches the pinned third-party tools into .tools/ (ignored by git):
-#   slang-2026.20/   Slang release for the host, checked against its sha256
+#   slang-2026.21/   Slang release for the host, checked against its sha256
 #   openpbr-bsdf/    adobe/openpbr-bsdf at a pinned commit
 #   glm/             GLM 1.0.1 at its tag commit
 #   display/gt7/     Polyphony Digital's GT7 tone-mapping sample (MIT), checked against its
@@ -32,7 +32,7 @@
 # (for example a separate Linux copy when WSL shares the tree with Windows).
 set -euo pipefail
 
-slang_version=2026.20
+slang_version=2026.21
 openpbr_commit=c91aad1d1ce1693e803f039d7c92c2965c4eb013
 glm_commit=0af55ccecd98d4e5a8d1fad7de25ba429d60e863
 gdeflate_commit=8ba9502fb30d2bf728592d121f0d402e40c8cb05
@@ -53,15 +53,15 @@ case "$(uname -s)" in
     case "${SLANG_ASSET:-default}" in
       default)
         asset=slang-$slang_version-linux-x86_64.tar.gz
-        sum=e863e568c204810d6e8bc31852f056aef6763c55ea9925db2db7affa060347c9 ;;
+        sum=691f9341e5bec099eec97ee30a83bcbef541cee7fe3b4de68a821d42f9506c2f ;;
       glibc-2.28)
         asset=slang-$slang_version-linux-x86_64-glibc-2.28.tar.gz
-        sum=84ebd777968caceea26b21bfd014341078be6047be6c5a963a69f984f896cebd ;;
+        sum=7b8800e7115668bfb073456ada3b20fa40718d7be41e7beec7c46c31351ba569 ;;
       *) echo "unknown SLANG_ASSET '$SLANG_ASSET' (default or glibc-2.28)" >&2; exit 1 ;;
     esac ;;
   MINGW*|MSYS*|CYGWIN*)
     asset=slang-$slang_version-windows-x86_64.zip
-    sum=e6dd32bbddf1720ebb4e679d55e9635ce792865a5bd84f3d2cd9af28647c0174 ;;
+    sum=4b6f509e73397175ed36a341beb7ad15f4fff5feaf5f6d95fecf896c0d86b8de ;;
   *) echo "unsupported host $(uname -s)" >&2; exit 1 ;;
 esac
 
