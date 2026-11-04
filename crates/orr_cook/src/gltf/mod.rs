@@ -211,6 +211,13 @@ struct Context<'a> {
     rigid: bool,
 }
 
+/// The accessors of `prim`'s morph targets.
+fn morph_accessors<'a>(prim: &gltf::Primitive<'a>) -> impl Iterator<Item = gltf::Accessor<'a>> {
+    prim.morph_targets()
+        .flat_map(|t| [t.positions(), t.normals(), t.tangents()])
+        .flatten()
+}
+
 /// Appends a triangle primitive to `b` with its morph targets at `weights`, its positions
 /// taken to model space by `world` (winding and tangent signs flipped under a mirroring
 /// `world`).
@@ -743,13 +750,8 @@ impl Imported<'_> {
         for prim in m.primitives() {
             self.material(mesh, &prim)?;
             primitive_views(&prim, &mut views);
-            for t in prim.morph_targets() {
-                for a in [t.positions(), t.normals(), t.tangents()]
-                    .into_iter()
-                    .flatten()
-                {
-                    Document::accessor_views(&a, &mut views);
-                }
+            for a in morph_accessors(&prim) {
+                Document::accessor_views(&a, &mut views);
             }
             let what = format!("mesh {mesh} primitive {}", prim.index());
             if prim.mode() != Mode::Triangles {
@@ -794,7 +796,11 @@ impl Imported<'_> {
         };
         json(&src.json["meshes"][mesh]);
         for prim in m.primitives() {
-            for a in prim.attributes().map(|a| a.1).chain(prim.indices()) {
+            let attributes = prim.attributes().map(|a| a.1);
+            for a in attributes
+                .chain(prim.indices())
+                .chain(morph_accessors(&prim))
+            {
                 json(&src.json["accessors"][a.index()]);
             }
         }
@@ -1043,13 +1049,8 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
         if let Some(mesh) = doc.nodes().nth(n).and_then(|d| d.mesh()) {
             for p in mesh.primitives() {
                 primitive_views(&p, &mut views);
-                for t in p.morph_targets() {
-                    for a in [t.positions(), t.normals(), t.tangents()]
-                        .into_iter()
-                        .flatten()
-                    {
-                        Document::accessor_views(&a, &mut views);
-                    }
+                for a in morph_accessors(&p) {
+                    Document::accessor_views(&a, &mut views);
                 }
             }
         }
