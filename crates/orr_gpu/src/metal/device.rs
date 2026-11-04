@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,11 +14,11 @@ use objc2_metal::{
 
 use super::accel::{EmptyTlas, build_empty_tlas};
 use super::heap::Bindings;
-use super::queue::{Queue, QueueKind, QueueRequest};
+use super::queue::{PassResult, Queue, QueueKind, QueueRequest, TimestampRing};
 use super::unsupported::Diagnostics;
 use super::{Buffers, Garbage, MAX_TIMELINES, Obj, Release, Timeline, lock};
 use crate::rtas::ClusterCaps;
-use crate::{Caps, Error, Limits, MAX_INLINE_ROOT_BYTES, Tlas};
+use crate::{Caps, Error, Limits, MAX_INLINE_ROOT_BYTES, TimelinePoint, Tlas};
 
 /// Additions to device creation. Metal devices take none, so the trait has no methods here.
 pub trait DeviceHooks {}
@@ -78,6 +78,9 @@ pub(super) struct Shared {
     pub(super) timelines: [Timeline; MAX_TIMELINES],
     pub(super) garbage: Mutex<Garbage>,
     pub(super) buffers: Mutex<Buffers>,
+    /// Pass results by the point of their submit, oldest first.
+    pub(super) results: Mutex<VecDeque<(TimelinePoint, Vec<PassResult>)>>,
+    pub(super) timestamps: TimestampRing,
     /// Each module's libraries by (module hash, fragment library).
     pub(super) libraries: Mutex<HashMap<(u64, bool), Obj<ProtocolObject<dyn MTLLibrary>>>>,
     pub(super) bindings: Bindings,
@@ -169,6 +172,7 @@ impl Device {
             submitted: AtomicU64::new(0),
         });
         let caps = caps(&device, desc);
+        let timestamps = TimestampRing::new(&device)?;
         let device = Obj(device);
         let bindings = Bindings::new(&device, desc)?;
         let shared = Arc::new(Shared {
@@ -181,6 +185,8 @@ impl Device {
             timelines,
             garbage: Mutex::default(),
             buffers: Mutex::default(),
+            results: Mutex::default(),
+            timestamps,
             libraries: Mutex::default(),
             bindings,
             caps,

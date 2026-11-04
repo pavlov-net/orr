@@ -1,8 +1,10 @@
 use std::any::Any;
+use std::sync::atomic::Ordering;
 
 use bytemuck::{Pod, Zeroable};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSString;
 use objc2_metal::{
     MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
     MTL4CommandEncoder, MTL4ComputeCommandEncoder, MTL4RenderCommandEncoder, MTL4VisibilityOptions,
@@ -12,7 +14,7 @@ use objc2_metal::{
 use super::memory::{Allocation, MemoryKind, malloc};
 use super::mesh::PendingPass;
 use super::pipeline::ComputePipeline;
-use super::queue::Queue;
+use super::queue::{Queue, TimestampRing};
 use super::texture::Texture;
 use super::unsupported::RayDispatchPipeline;
 use super::{lock, not_implemented};
@@ -110,6 +112,8 @@ pub(super) struct Finished {
     _table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
     _inline: Vec<Allocation<u8>>,
     _keep: Vec<Box<dyn Any + Send>>,
+    /// The list's passes: each name and the sequence number of its begin timestamp.
+    pub(super) passes: Vec<(&'static str, u64)>,
 }
 
 // SAFETY: a finished list is only dropped, on whichever thread collects garbage; Metal command
@@ -134,6 +138,11 @@ pub struct CommandList<'q> {
     /// Bytes used of the last inline block.
     inline_used: u64,
     pub(super) keep: Vec<Box<dyn Any + Send>>,
+    /// Each pass's name and the sequence number of its begin timestamp in the device's
+    /// timestamp ring.
+    passes: Vec<(&'static str, u64)>,
+    /// A pass is open.
+    in_pass: bool,
     /// Set by `finish`, so dropping does not end the buffer twice.
     finished: bool,
 }
@@ -182,6 +191,8 @@ impl<'q> CommandList<'q> {
             inline: Vec::new(),
             inline_used: INLINE_BLOCK,
             keep: Vec::new(),
+            passes: Vec::new(),
+            in_pass: false,
             finished: false,
         })
     }
@@ -197,6 +208,7 @@ impl<'q> CommandList<'q> {
             _table: self.table.clone(),
             _inline: std::mem::take(&mut self.inline),
             _keep: std::mem::take(&mut self.keep),
+            passes: std::mem::take(&mut self.passes),
         }
     }
 
@@ -442,12 +454,38 @@ impl<'q> CommandList<'q> {
         let _ = (priority, throttling);
     }
 
-    /// Opens a named pass. Metal records no pass timings yet.
+    /// Opens a named pass: a debug group and GPU timestamps. `stats` asks for nothing:
+    /// Apple GPUs expose only the timestamp counter set, no shader invocation counts.
+    /// Passes do not nest; [`crate::Device::pass_results`] reads them.
     pub fn begin_pass(&mut self, name: &'static str, stats: bool) {
-        let _ = (name, stats);
+        let _ = stats;
+        assert!(!self.in_pass, "pass {name} begun inside another pass");
+        self.end_encoder();
+        self.buffer.pushDebugGroup(&NSString::from_str(name));
+        let ring = &self.queue.shared.timestamps;
+        let seq = ring.next.fetch_add(2, Ordering::Relaxed);
+        // SAFETY: ring indices are within the heap.
+        unsafe {
+            self.buffer
+                .writeTimestampIntoHeap_atIndex(&ring.heap, TimestampRing::index(seq))
+        };
+        self.passes.push((name, seq));
+        self.in_pass = true;
     }
 
-    pub fn end_pass(&mut self) {}
+    pub fn end_pass(&mut self) {
+        assert!(self.in_pass, "end_pass without begin_pass");
+        self.end_encoder();
+        let ring = &self.queue.shared.timestamps;
+        let (_, seq) = *self.passes.last().unwrap();
+        // SAFETY: as in `begin_pass`.
+        unsafe {
+            self.buffer
+                .writeTimestampIntoHeap_atIndex(&ring.heap, TimestampRing::index(seq + 1))
+        };
+        self.buffer.popDebugGroup();
+        self.in_pass = false;
+    }
 }
 
 impl Drop for CommandList<'_> {

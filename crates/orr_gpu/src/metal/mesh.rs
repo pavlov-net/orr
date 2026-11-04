@@ -292,16 +292,18 @@ impl CommandList<'_> {
         });
     }
 
-    /// Limits drawing to `extent` pixels from `offset`.
+    /// Limits drawing to `extent` pixels from `offset`, clipped to the pass: Metal takes no
+    /// rectangle reaching past it.
     pub fn set_scissor(&mut self, offset: [u32; 2], extent: [u32; 2]) {
-        self.pass()
-            .commands
-            .push(RenderCommand::Scissor(MTLScissorRect {
-                x: offset[0] as usize,
-                y: offset[1] as usize,
-                width: extent[0] as usize,
-                height: extent[1] as usize,
-            }));
+        let pass = self.pass();
+        let [x, y] = [0, 1].map(|i| offset[i].min(pass.extent[i]));
+        let [w, h] = [0, 1].map(|i| extent[i].min(pass.extent[i] - [x, y][i]));
+        pass.commands.push(RenderCommand::Scissor(MTLScissorRect {
+            x: x as usize,
+            y: y as usize,
+            width: w as usize,
+            height: h as usize,
+        }));
     }
 
     pub fn end_rendering(&mut self) {

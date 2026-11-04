@@ -1,10 +1,14 @@
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTL4CommandBuffer, MTL4CommandQueue, MTLDevice, MTLSharedEvent};
+use objc2_foundation::NSRange;
+use objc2_metal::{
+    MTL4CommandBuffer, MTL4CommandQueue, MTL4CounterHeap, MTL4CounterHeapDescriptor,
+    MTL4CounterHeapType, MTLDevice, MTLSharedEvent,
+};
 
 use super::command::CommandList;
 use super::device::{Device, Shared};
@@ -71,6 +75,74 @@ pub struct PipelineStats {
     pub pixel: u64,
 }
 
+/// Submits with passes whose results are kept.
+const MAX_RESULTS: usize = 64;
+
+/// The device's GPU timestamps: one counter heap used as a ring, since a process may hold
+/// only 32 counter heaps of at most 4096 entries. A pass takes the two entries from a
+/// sequence number on; its submit reads them once it has completed.
+pub(super) struct TimestampRing {
+    pub(super) heap: Obj<ProtocolObject<dyn MTL4CounterHeap>>,
+    /// The sequence number the next pass's begin entry takes.
+    pub(super) next: AtomicU64,
+}
+
+impl TimestampRing {
+    const ENTRIES: u64 = 4096;
+
+    pub(super) fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self, Error> {
+        let desc = MTL4CounterHeapDescriptor::new();
+        desc.setType(MTL4CounterHeapType::Timestamp);
+        // SAFETY: a count the device accepts.
+        unsafe { desc.setCount(Self::ENTRIES as usize) };
+        let heap = device
+            .newCounterHeapWithDescriptor_error(&desc)
+            .map_err(|e| super::device::metal_error("newCounterHeapWithDescriptor", &e))?;
+        Ok(Self {
+            heap: Obj(heap),
+            next: AtomicU64::new(0),
+        })
+    }
+
+    /// The heap entry of sequence number `seq`.
+    pub(super) fn index(seq: u64) -> usize {
+        (seq % Self::ENTRIES) as usize
+    }
+
+    /// The timings of a completed submit's passes. A pass whose entries later passes may
+    /// have overwritten (the ring went round before its results were read) reads 0 ms.
+    fn resolve(&self, passes: &[(&'static str, u64)], ms_per_tick: f64) -> Vec<PassResult> {
+        let next = self.next.load(Ordering::Relaxed);
+        passes
+            .iter()
+            .map(|&(name, seq)| {
+                let mut gpu_ms = 0.0;
+                if next - seq <= Self::ENTRIES {
+                    // SAFETY: two entries inside the heap, which the completed submit wrote.
+                    let data = unsafe {
+                        self.heap
+                            .resolveCounterRange(NSRange::new(Self::index(seq), 2))
+                    };
+                    if let Some(d) = data {
+                        let t: Vec<u64> = d
+                            .to_vec()
+                            .chunks_exact(8)
+                            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                            .collect();
+                        gpu_ms = t[1].saturating_sub(t[0]) as f64 * ms_per_tick;
+                    }
+                }
+                PassResult {
+                    name,
+                    gpu_ms,
+                    cpu: None,
+                    stats: None,
+                }
+            })
+            .collect()
+    }
+}
+
 /// One Metal 4 command queue with its own timeline.
 pub struct Queue {
     pub(super) kind: QueueKind,
@@ -120,7 +192,11 @@ impl Queue {
                     .waitForEvent_value(ProtocolObject::from_ref(&**event), p.value);
             }
         }
-        let finished: Vec<_> = lists.into_iter().map(CommandList::finish).collect();
+        let mut finished: Vec<_> = lists.into_iter().map(CommandList::finish).collect();
+        let passes: Vec<(&'static str, u64)> = finished
+            .iter_mut()
+            .flat_map(|f| std::mem::take(&mut f.passes))
+            .collect();
         let mut buffers: Vec<NonNull<ProtocolObject<dyn MTL4CommandBuffer>>> =
             finished.iter().map(|f| NonNull::from(&*f.buffer)).collect();
         if let Some(first) = NonNull::new(buffers.as_mut_ptr()) {
@@ -128,6 +204,23 @@ impl Queue {
             unsafe { self.raw.commit_count(first, buffers.len()) };
         }
         let point = self.signal();
+        if !passes.is_empty() {
+            // Read once the submit completes, before the ring goes round.
+            let shared = Arc::downgrade(&self.shared);
+            let resolve = move || {
+                if let Some(shared) = shared.upgrade() {
+                    let ms_per_tick = 1e3 / shared.device.queryTimestampFrequency() as f64;
+                    let results = shared.timestamps.resolve(&passes, ms_per_tick);
+                    let mut r = lock(&shared.results);
+                    if r.len() == MAX_RESULTS {
+                        r.pop_front();
+                    }
+                    r.push_back((point, results));
+                }
+            };
+            self.shared
+                .defer_until(self.timeline(), point.value, Box::new(resolve));
+        }
         self.shared.defer_until(
             self.timeline(),
             point.value,
@@ -200,10 +293,18 @@ impl Device {
         self.shared.timelines[point.timeline as usize].completed() >= point.value
     }
 
-    /// The passes of the submit that reached `point`. Metal records no pass timings yet.
+    /// Pass timings of the submit that signals `point`, once it has completed; `None`
+    /// before. Results of the 64 most recent submits with passes are kept. `stats` is always
+    /// `None`: Apple GPUs count no shader invocations for apps.
     pub fn pass_results(&self, point: TimelinePoint) -> Option<Vec<PassResult>> {
-        let _ = point;
-        None
+        if !self.is_complete(point) {
+            return None;
+        }
+        // Runs the resolves of completed submits.
+        self.shared.collect();
+        let store = lock(&self.shared.results);
+        let found = store.iter().find(|(p, _)| *p == point);
+        Some(found.map(|(_, r)| r.clone()).unwrap_or_default())
     }
 
     /// Releases what dropped objects held once the GPU is done with them.
