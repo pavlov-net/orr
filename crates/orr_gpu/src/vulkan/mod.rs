@@ -26,34 +26,21 @@ mod spirv;
 mod swapchain;
 mod texture;
 
-pub use accel::{
-    ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance, ClassicKind,
-    InstanceFlags, LssEndCaps, LssIndexing, Micromap, MicromapDesc, MicromapTriangle,
-    MicromapUsage, OmmFormat,
-};
+pub use accel::{ClassicAs, Micromap};
 pub use ash;
-pub use cache::PipelineCacheReport;
-pub use command::{CommandList, DecompressRegion, DispatchArgs, MemoryCopy, MeshArgs, TextureCopy};
-pub use coopvec::{MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout};
-pub use device::{Device, DeviceDesc};
-pub use diagnostics::{
-    Checkpoint, DeviceFault, Diagnostics, DiagnosticsReport, FaultAccess, FaultAddress,
-    QueueProgress,
-};
-pub use generated::{ExecutionSet, Generated, Sequence, SetKind};
+pub use command::CommandList;
+pub use device::Device;
+pub use diagnostics::Diagnostics;
+pub use generated::ExecutionSet;
 pub use interop::{
     DeviceHooks, Features, ImageHandles, RawCommandBuffer, RawDevice, buffer_handle,
     defer_after_submitted, image_handles, raw_device,
 };
-pub use memory::{
-    Allocation, DeviceArenas, HeapReport, HostArenas, MemoryKind, MemoryPriority, MemoryReport,
-    MemoryUsage,
-};
-pub use mesh::{ColorAttachment, DepthAttachment, MeshPipeline, MeshPipelineDesc, Rendering};
-pub use perf::{COUNTER_METRICS, CounterRange, CounterReport};
+pub use memory::{Allocation, DeviceArenas, HostArenas};
+pub use mesh::MeshPipeline;
 pub use pipeline::{ComputePipeline, ShaderStage};
-pub use queue::{HostTimeline, PassResult, PipelineStats, Queue, QueueKind, QueueRequest};
+pub use queue::{HostTimeline, Queue};
 pub use ray::RayDispatchPipeline;
-pub use sparse::{PageBind, SparseAllocation, SparseBinds, TileBind};
+pub use sparse::{SparseAllocation, SparseBinds};
 pub use swapchain::{LowLatency, Swapchain, SwapchainFrame};
-pub use texture::{Texture, TextureMemory};
+pub use texture::Texture;

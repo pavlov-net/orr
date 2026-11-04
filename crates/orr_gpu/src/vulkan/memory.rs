@@ -18,46 +18,10 @@ use orr_memory::{AllocError, AllocationFlags, Allocator, AllocatorDesc, Arena, P
 use super::debug::name_object;
 use super::device::{Device, Shared};
 use super::garbage::{Item, RawBuffer};
-use crate::{Error, GpuAddress, GpuPtr, TimelinePoint};
-
-/// Where an allocation lives.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum MemoryKind {
-    /// Host-visible and mapped, written by the CPU sequentially and read by the GPU:
-    /// device-local with resizable BAR (`Caps::rebar`), host memory without. Possibly
-    /// write-combined: the CPU should not read it.
-    Upload,
-    /// Device-local, not mapped. Textures can be placed in these blocks.
-    DeviceLocal,
-    /// Host-visible and cached, mapped, for the CPU to read back GPU results.
-    Readback,
-}
-
-impl MemoryKind {
-    const ALL: [MemoryKind; 3] = [
-        MemoryKind::Upload,
-        MemoryKind::DeviceLocal,
-        MemoryKind::Readback,
-    ];
-
-    fn index(self) -> usize {
-        self as usize
-    }
-}
-
-/// How firmly the OS keeps an allocation in VRAM when the process is over its budget, with
-/// `Caps::memory_priority`. Allocations of different priorities never share a block.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
-pub enum MemoryPriority {
-    /// Paged out first: streaming pools, which shrink under pressure anyway.
-    Low,
-    /// Resident data; what [`Device::gpu_malloc`] gives.
-    #[default]
-    Normal,
-    /// Paged out last: acceleration structures and tables every frame reads. Render
-    /// targets and transient arenas take it too.
-    High,
-}
+use crate::{
+    Error, GpuAddress, GpuPtr, HeapReport, MemoryKind, MemoryPriority, MemoryReport, MemoryUsage,
+    TimelinePoint,
+};
 
 impl MemoryPriority {
     /// The `VK_EXT_memory_priority` value.
@@ -269,53 +233,6 @@ impl<T> Drop for Allocation<T> {
         let raw = unsafe { ManuallyDrop::take(&mut self.raw) };
         self.shared.defer_after_submitted(Item::Buffer(raw));
     }
-}
-
-/// Memory use per [`MemoryKind`] and per heap and, with `Caps::memory_budget`, the OS
-/// budget per heap.
-#[derive(Clone, Debug)]
-pub struct MemoryReport {
-    /// Indexed like [`MemoryKind`]: Upload, DeviceLocal, Readback.
-    pub kinds: [MemoryUsage; 3],
-    pub heaps: Vec<HeapReport>,
-    /// `vkAllocateMemory` calls orr_gpu has made so far.
-    pub device_allocations: u64,
-}
-
-impl MemoryReport {
-    pub fn kind(&self, kind: MemoryKind) -> MemoryUsage {
-        self.kinds[kind.index()]
-    }
-
-    /// The largest share of its OS budget a device-local heap uses; above 1 the OS pages
-    /// memory out. `None` without `Caps::memory_budget`.
-    pub fn pressure(&self) -> Option<f64> {
-        self.heaps
-            .iter()
-            .filter(|h| h.device_local)
-            .filter_map(|h| Some(h.usage? as f64 / h.budget?.max(1) as f64))
-            .reduce(f64::max)
-    }
-}
-
-/// Live `gpu_malloc` bytes and allocations of one kind, transient arena blocks included.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub struct MemoryUsage {
-    pub bytes: u64,
-    pub allocations: u64,
-}
-
-/// One memory heap.
-#[derive(Clone, Copy, Debug)]
-pub struct HeapReport {
-    pub size: u64,
-    pub device_local: bool,
-    /// Bytes of the `VkDeviceMemory` blocks orr_gpu holds on the heap.
-    pub block_bytes: u64,
-    /// What the OS lets this process use; `None` without `Caps::memory_budget`.
-    pub budget: Option<u64>,
-    /// What this process uses, as the OS counts it.
-    pub usage: Option<u64>,
 }
 
 /// A registered address range.

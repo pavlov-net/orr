@@ -6,6 +6,20 @@ use std::path::Path;
 
 use crate::Error;
 
+/// What the pipeline cache loaded and how creation has used it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PipelineCacheReport {
+    /// The file existed and its data was loaded.
+    pub loaded: bool,
+    /// Pipelines the cache already held: a driver cache hit on Vulkan, a pipeline this session
+    /// or the archive held on Metal.
+    pub hits: u32,
+    /// Pipelines compiled from source.
+    pub misses: u32,
+    /// Why the file was ignored, when it existed and was.
+    pub rejected: Option<String>,
+}
+
 const MAGIC: [u8; 8] = *b"orrpipe\0";
 const FORMAT: u32 = 2;
 /// Magic, format, vendor, device, driver version, then the 16-byte cache UUID.

@@ -10,28 +10,12 @@ use objc2_metal::{
 
 use super::command::CommandList;
 use super::device::{Device, Shared};
-use super::memory::Allocation;
 use super::sparse::SPARSE_PAGE;
 use super::{Obj, lock};
 use crate::{
-    Error, Format, GpuPtr, SparseLayout, TextureDesc, TextureKind, TextureRegion, TextureUsage,
+    Error, Format, GpuPtr, SparseLayout, TextureDesc, TextureKind, TextureMemory, TextureRegion,
+    TextureUsage,
 };
-
-/// Where a texture's memory comes from.
-pub enum TextureMemory<'a> {
-    /// Its own memory.
-    Dedicated,
-    /// Inside a [`MemoryKind::DeviceLocal`](super::MemoryKind::DeviceLocal) block, at an
-    /// offset aligned as [`Device::texture_requirements`] says. The block must outlive the
-    /// texture.
-    Placed {
-        block: &'a Allocation<u8>,
-        offset: u64,
-    },
-    /// No memory until [`Device::bind_sparse`] binds its tiles and mip tails
-    /// ([`Texture::sparse_layout`]) to DeviceLocal blocks. 2D and cube color textures.
-    Sparse,
-}
 
 /// A texture and its memory. It has no layout state.
 ///

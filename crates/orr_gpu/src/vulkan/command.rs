@@ -3,19 +3,19 @@
 use std::ffi::CString;
 
 use ash::vk;
-use bytemuck::{Pod, Zeroable};
+use bytemuck::Pod;
 
 use super::diagnostics::next_pass_id;
 use super::garbage::Item;
-use super::memory::MemoryKind;
-use super::mesh::{MeshPipeline, Rendering};
+use super::mesh::MeshPipeline;
 use super::pipeline::ComputePipeline;
 use super::queue::{ListResources, MAX_PASSES, Queue};
 use super::ray::RayDispatchPipeline;
 use super::texture::{Texture, indirect_copy_format, vk_extent, vk_offset};
 use crate::{
-    Caps, ClearColor, ColorLoad, DepthLoad, Error, GpuAddress, GpuPtr, Hazards,
-    MAX_INLINE_ROOT_BYTES, Stages, TextureLayers, TextureRegion, TextureUsage,
+    Caps, ClearColor, ColorLoad, DecompressRegion, DepthLoad, DispatchArgs, Error, GpuAddress,
+    GpuPtr, Hazards, MAX_INLINE_ROOT_BYTES, MemoryCopy, MemoryKind, MeshArgs, Rendering, Stages,
+    TextureCopy, TextureLayers, TextureRegion, TextureUsage,
 };
 
 /// What device address commands are told about every `gpu_malloc` and sparse range: their
@@ -28,81 +28,6 @@ pub(super) fn address_range(address: GpuAddress, size: u64) -> vk::DeviceAddress
     vk::DeviceAddressRangeKHR {
         address: address.0,
         size,
-    }
-}
-
-/// `vkCmdDispatchIndirect` arguments: workgroup counts.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
-pub struct DispatchArgs {
-    pub x: u32,
-    pub y: u32,
-    pub z: u32,
-}
-
-/// `vkCmdDrawMeshTasksIndirectEXT` arguments: task workgroup counts, or mesh workgroup
-/// counts for pipelines without a task stage.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
-pub struct MeshArgs {
-    pub x: u32,
-    pub y: u32,
-    pub z: u32,
-}
-
-/// One GDeflate region for [`CommandList::decompress`]: device addresses and byte counts.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
-pub struct DecompressRegion {
-    pub src: u64,
-    pub dst: u64,
-    pub compressed_bytes: u64,
-    pub decompressed_bytes: u64,
-}
-
-/// One region of [`CommandList::copy_indirect`] (`VkCopyMemoryIndirectCommandKHR`, 24 B):
-/// device addresses and a byte count, each a multiple of 4. A region of 0 bytes copies
-/// nothing.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
-pub struct MemoryCopy {
-    pub src: u64,
-    pub dst: u64,
-    pub bytes: u64,
-}
-
-/// One region of [`CommandList::copy_to_texture_indirect`]
-/// (`VkCopyMemoryToImageIndirectCommandKHR`, 56 B). Kernels write it with the `copy`
-/// module's `store`.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
-pub struct TextureCopy {
-    src: u64,
-    row_texels: u32,
-    image_rows: u32,
-    aspect: u32,
-    mip: u32,
-    base_layer: u32,
-    layers: u32,
-    offset: [u32; 3],
-    extent: [u32; 3],
-}
-
-impl TextureCopy {
-    /// Texels from `src`, whose rows start `row_texels` texels apart (0 packs them tightly),
-    /// into `region` of a color texture. The region's extent is not empty.
-    pub fn new(src: GpuAddress, region: &TextureRegion, row_texels: u32) -> Self {
-        Self {
-            src: src.0,
-            row_texels,
-            image_rows: 0,
-            aspect: vk::ImageAspectFlags::COLOR.as_raw(),
-            mip: region.mip,
-            base_layer: region.base_layer,
-            layers: region.layers,
-            offset: region.offset,
-            extent: region.extent,
-        }
     }
 }
 

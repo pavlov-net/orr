@@ -19,10 +19,9 @@ use objc2_metal::{
 
 use super::device::{Device, Shared};
 use super::memory::Allocation;
-use super::queue::QueueKind;
 use super::texture::Texture;
 use super::{Obj, lock};
-use crate::{Error, GpuAddress, GpuPtr, TimelinePoint};
+use crate::{Error, GpuAddress, GpuPtr, PageBind, QueueKind, TileBind, TimelinePoint};
 
 /// The page size of every sparse resource, and the largest a DeviceLocal heap takes.
 pub(super) const SPARSE_PAGE: MTLSparsePageSize = MTLSparsePageSize::Size64;
@@ -61,29 +60,6 @@ impl<T> Drop for SparseAllocation<T> {
             r.dirty = true;
         }));
     }
-}
-
-/// `count` pages from `first_page` take `memory`: a [`MemoryKind::DeviceLocal`] allocation
-/// and a page-aligned byte offset into it. `None` unbinds them.
-#[derive(Clone, Copy)]
-pub struct PageBind<'a> {
-    pub first_page: u64,
-    pub count: u64,
-    pub memory: Option<(&'a Allocation<u8>, u64)>,
-}
-
-/// Tile `tile` of `mip` in `layer` of a sparse texture takes `memory`: a DeviceLocal block
-/// and an offset into it, a multiple of [`SparseLayout::tile_bytes`]. `None` unbinds it.
-/// Mips from the tail's first mip bind through [`SparseBinds::tail`].
-///
-/// [`SparseLayout::tile_bytes`]: crate::SparseLayout::tile_bytes
-#[derive(Clone, Copy)]
-pub struct TileBind<'a> {
-    pub mip: u32,
-    pub layer: u32,
-    /// Tile column and row in the mip.
-    pub tile: [u32; 2],
-    pub memory: Option<(&'a Allocation<u8>, u64)>,
 }
 
 /// One mapping update: a resource, the heap it maps to (none to unmap) and the operation.

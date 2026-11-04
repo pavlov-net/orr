@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{CStr, CString, c_char};
 use std::mem::ManuallyDrop;
-use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
@@ -15,69 +14,25 @@ use super::accel::{EmptyTlas, build_empty_tlas};
 use super::cache::PipelineCache;
 use super::coopvec::component;
 use super::debug::{MessageCount, messenger_info, name_object};
-use super::diagnostics::{Breadcrumbs, Diagnostics, DiagnosticsReport, FaultFns, Trail};
+use super::diagnostics::{Breadcrumbs, Diagnostics, FaultFns, Trail};
 use super::features::{self, SURFACE_INSTANCE_EXTENSIONS, Selection};
 use super::garbage::{Garbage, Item, MAX_TIMELINES};
 use super::heap::Heaps;
-use super::interop::{ClassicBind, DeviceHooks};
-use super::memory::{MemoryKind, MemoryTypes, Pools, Range, Usage, buffer_usage, sharing};
+use super::interop::ClassicBind;
+use super::memory::{MemoryTypes, Pools, Range, Usage, buffer_usage, sharing};
 use super::perf::{self, Perf};
-use super::queue::{Calibration, PassResult, Queue, QueueKind, QueueRequest, Timeline};
+use super::queue::{Calibration, Queue, Timeline};
 use super::ray::RecordBlock;
 use super::rtas::{RtasCheck, cluster_caps};
 use super::texture::{image_info, vk_format};
 use crate::{
-    Caps, CooperativeVectorCombination, Error, Format, Limits, TextureDesc, TextureUsage,
-    TimelinePoint, Tlas,
+    Caps, CooperativeVectorCombination, DeviceDesc, DiagnosticsReport, Error, Format, Limits,
+    MemoryKind, PassResult, QueueKind, QueueRequest, TextureDesc, TextureUsage, TimelinePoint,
+    Tlas,
 };
 use orr_memory::AllocatorDesc;
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
-
-/// How to create a [`Device`].
-#[derive(Clone, Copy, Debug)]
-pub struct DeviceDesc<'a> {
-    /// Application name reported to the driver.
-    pub name: &'a str,
-    /// Extensions and features a library that records raw Vulkan commands needs.
-    pub hooks: Option<&'a dyn DeviceHooks>,
-    pub queues: QueueRequest,
-    pub diagnostics: Diagnostics<'a>,
-    /// The file of the `VkPipelineCache` every pipeline compiles through: read at creation,
-    /// written by [`Device::save_pipeline_cache`]. `None`: no cache beyond the driver's own.
-    pub pipeline_cache: Option<&'a Path>,
-    /// Optional extensions to leave off even when the device offers them; their `Caps`
-    /// stay false.
-    pub skip_extensions: &'a [&'a CStr],
-    /// Reports `Caps::rebar` and `Caps::host_image_copy` false and puts
-    /// [`MemoryKind::Upload`] in host memory whatever the device offers, so callers take the
-    /// staging path, as on a device without resizable BAR.
-    pub force_staging: bool,
-    /// Loads the Nsight Perf SDK and enables the extensions its range profiler needs, for
-    /// counter frames ([`crate::Caps::perf_counters`]). Builds without `NSIGHT_PERF_SDK`
-    /// ignore it.
-    pub perf_counters: bool,
-    /// Resource-heap slots for sampled and storage image views.
-    pub image_heap_slots: u32,
-    pub sampler_heap_slots: u32,
-}
-
-impl Default for DeviceDesc<'_> {
-    fn default() -> Self {
-        Self {
-            name: "orr",
-            hooks: None,
-            queues: QueueRequest::default(),
-            diagnostics: Diagnostics::Off,
-            pipeline_cache: None,
-            skip_extensions: &[],
-            force_staging: false,
-            perf_counters: false,
-            image_heap_slots: 262_144,
-            sampler_heap_slots: 1024,
-        }
-    }
-}
 
 /// State every object of one device shares. Objects hold it through an `Arc`, so it is
 /// destroyed after the last of them.

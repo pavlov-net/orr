@@ -7,10 +7,12 @@ use ash::vk;
 
 use super::device::{Device, Shared};
 use super::garbage::Item;
-use super::memory::{Allocation, MemoryKind, sharing};
-use super::queue::QueueKind;
+use super::memory::{Allocation, sharing};
 use super::texture::{SparseTail, Texture, vk_extent, vk_offset};
-use crate::{Error, GpuAddress, GpuPtr, SparseLayout, TimelinePoint};
+use crate::{
+    Error, GpuAddress, GpuPtr, MemoryKind, PageBind, QueueKind, SparseLayout, TileBind,
+    TimelinePoint,
+};
 
 /// A device address range of `max_count` values of `T` with no memory until
 /// [`Device::bind_sparse`] binds its pages. The address never changes. Dropping it destroys
@@ -39,27 +41,6 @@ impl<T> Drop for SparseAllocation<T> {
             address: self.gpu.address().0,
         });
     }
-}
-
-/// `count` pages from `first_page` take `memory`: a [`MemoryKind::DeviceLocal`] allocation
-/// and a page-aligned byte offset into it. `None` unbinds them.
-#[derive(Clone, Copy)]
-pub struct PageBind<'a> {
-    pub first_page: u64,
-    pub count: u64,
-    pub memory: Option<(&'a Allocation<u8>, u64)>,
-}
-
-/// Tile `tile` of `mip` in `layer` of a sparse texture takes `memory`: a DeviceLocal block
-/// and an offset into it, a multiple of [`SparseLayout::tile_bytes`]. `None` unbinds it.
-/// Mips from the tail's first mip bind through [`SparseBinds::tail`].
-#[derive(Clone, Copy)]
-pub struct TileBind<'a> {
-    pub mip: u32,
-    pub layer: u32,
-    /// Tile column and row in the mip.
-    pub tile: [u32; 2],
-    pub memory: Option<(&'a Allocation<u8>, u64)>,
 }
 
 /// Binds and unbinds collected for one [`Device::bind_sparse`] call. One entry per run or

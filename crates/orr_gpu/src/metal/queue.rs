@@ -2,7 +2,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use block2::RcBlock;
 use objc2::rc::Retained;
@@ -17,66 +17,7 @@ use super::command::{CommandList, Finished};
 use super::device::{Device, Shared};
 use super::unsupported::SwapchainFrame;
 use super::{MAX_TIMELINES, Obj, lock};
-use crate::{Error, TimelinePoint};
-
-/// Which queue. Each has one owner thread that submits it.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum QueueKind {
-    /// The render thread's. Always present.
-    Render,
-    /// A second queue the render thread owns.
-    Compute,
-    /// A queue the loading thread owns.
-    Loading,
-    /// A queue the loading thread owns for copies.
-    Copy,
-    /// A queue the present thread owns.
-    Present,
-}
-
-impl QueueKind {
-    pub(super) const ALL: [QueueKind; 5] = [
-        QueueKind::Render,
-        QueueKind::Compute,
-        QueueKind::Loading,
-        QueueKind::Copy,
-        QueueKind::Present,
-    ];
-}
-
-/// The queues a device creates besides [`QueueKind::Render`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct QueueRequest {
-    /// [`QueueKind::Compute`].
-    pub render_compute: bool,
-    /// [`QueueKind::Loading`].
-    pub async_compute: bool,
-    /// [`QueueKind::Copy`].
-    pub copy: bool,
-    /// [`QueueKind::Present`].
-    pub present: bool,
-}
-
-/// Measurements of one pass between [`CommandList::begin_pass`] and
-/// [`CommandList::end_pass`].
-#[derive(Clone, Debug)]
-pub struct PassResult {
-    pub name: &'static str,
-    pub gpu_ms: f64,
-    /// Begin and end on the CPU clock; `None` on Metal.
-    pub cpu: Option<(Instant, Instant)>,
-    /// Shader invocations; `None` on Metal.
-    pub stats: Option<PipelineStats>,
-}
-
-/// Shader invocation counts of a pass.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PipelineStats {
-    pub compute: u64,
-    pub task: u64,
-    pub mesh: u64,
-    pub pixel: u64,
-}
+use crate::{Error, PassResult, QueueKind, TimelinePoint};
 
 /// Submits with passes whose results are kept.
 const MAX_RESULTS: usize = 64;

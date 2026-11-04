@@ -45,10 +45,10 @@ use objc2_metal::{
 use super::command::CommandList;
 use super::device::{Device, Shared, metal_error};
 use super::heap::id_bits;
-use super::memory::{Allocation, MemoryKind, malloc};
+use super::memory::{Allocation, malloc};
 use super::{Obj, lock};
 use crate::rtas::{PtlasArgs, RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc, RtasSizes};
-use crate::{Error, GpuAddress, GpuPtr, Hazards, RtasFlags, Stages};
+use crate::{Error, GpuAddress, GpuPtr, Hazards, MemoryKind, RtasFlags, Stages};
 
 type Structure = ProtocolObject<dyn MTLAccelerationStructure>;
 

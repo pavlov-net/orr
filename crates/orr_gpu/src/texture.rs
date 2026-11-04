@@ -1,4 +1,4 @@
-use crate::Format;
+use crate::{Allocation, Format};
 
 /// The shape of a texture.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -251,4 +251,48 @@ impl Default for SamplerDesc {
             max_lod: 1000.0,
         }
     }
+}
+
+/// Where a texture's memory comes from.
+pub enum TextureMemory<'a> {
+    /// Memory orr_gpu manages. On Vulkan it comes from blocks that hold only images: render
+    /// targets (`COLOR` or `DEPTH` usage, or single-mip 2D `STORAGE` textures of 1 MiB and
+    /// more), textures of 16 MiB and more and textures the driver wants alone get their own
+    /// `VkDeviceMemory`, and render targets sit at the highest memory priority. On Metal
+    /// each has its own memory.
+    Dedicated,
+    /// Inside a block, at an offset aligned as
+    /// [`Device::texture_requirements`](crate::Device::texture_requirements) says: a
+    /// [`MemoryKind::DeviceLocal`](crate::MemoryKind::DeviceLocal) block, or an Upload block
+    /// for [`TextureUsage::HOST_COPY`]. The block must outlive the texture.
+    Placed {
+        block: &'a Allocation<u8>,
+        offset: u64,
+    },
+    /// No memory until [`Device::bind_sparse`](crate::Device::bind_sparse) binds its tiles and
+    /// mip tails ([`Texture::sparse_layout`](crate::Texture::sparse_layout)) to DeviceLocal blocks. 2D and cube color textures.
+    Sparse,
+}
+
+/// `count` pages from `first_page` take `memory`: a
+/// [`MemoryKind::DeviceLocal`](crate::MemoryKind::DeviceLocal) allocation
+/// and a page-aligned byte offset into it. `None` unbinds them.
+#[derive(Clone, Copy)]
+pub struct PageBind<'a> {
+    pub first_page: u64,
+    pub count: u64,
+    pub memory: Option<(&'a Allocation<u8>, u64)>,
+}
+
+/// Tile `tile` of `mip` in `layer` of a sparse texture takes `memory`: a DeviceLocal block
+/// and an offset into it, a multiple of [`SparseLayout::tile_bytes`]. `None` unbinds it.
+/// Mips from the tail's first mip bind through
+/// [`SparseBinds::tail`](crate::SparseBinds::tail).
+#[derive(Clone, Copy)]
+pub struct TileBind<'a> {
+    pub mip: u32,
+    pub layer: u32,
+    /// Tile column and row in the mip.
+    pub tile: [u32; 2],
+    pub memory: Option<(&'a Allocation<u8>, u64)>,
 }

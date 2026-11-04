@@ -5,22 +5,21 @@
 
 use std::alloc::Layout;
 use std::convert::Infallible;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
-use bytemuck::{Pod, Zeroable};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 use super::command::CommandList;
 use super::device::Device;
-use super::mesh::MeshPipelineDesc;
 use super::not_implemented;
 use super::pipeline::ShaderStage;
-use super::queue::{Queue, QueueKind};
+use super::queue::Queue;
 use super::texture::Texture;
 use crate::{
-    ComponentType, Error, GpuAddress, GpuPtr, HdrMetadata, LatencyMarker, LatencyTimings,
-    OutputFormat, PresentMode, Refresh, StorageImageIndex, SwapchainDesc, TimelinePoint,
+    CounterReport, DiagnosticsReport, Error, Generated, GpuAddress, HdrMetadata, LatencyMarker,
+    LatencyTimings, MatrixConversion, MatrixFormat, MeshPipelineDesc, OutputFormat, PresentMode,
+    Refresh, StorageImageIndex, SwapchainDesc, TimelinePoint,
 };
 
 /// What a device records for crash diagnosis. Metal records nothing yet, whatever the mode.
@@ -35,108 +34,11 @@ pub enum Diagnostics<'a> {
     Capture,
 }
 
-/// What a device was doing, and on a lost device why it was lost.
-#[derive(Clone, Debug, Default)]
-pub struct DiagnosticsReport {
-    pub lost: bool,
-    pub queues: Vec<QueueProgress>,
-    pub faults: Vec<DeviceFault>,
-    pub abort: Option<String>,
-    pub crash_dump: Option<PathBuf>,
-    pub memory: Option<String>,
-}
-
-impl std::fmt::Display for DiagnosticsReport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.lost {
-            writeln!(f, "device lost")?;
-        }
-        if let Some(abort) = &self.abort {
-            writeln!(f, "abort: {abort}")?;
-        }
-        f.write_str("Metal records no further diagnostics yet")
-    }
-}
-
-/// One queue's progress through its recent passes.
-#[derive(Clone, Debug)]
-pub struct QueueProgress {
-    pub queue: QueueKind,
-    pub submitted: u64,
-    pub completed: Option<u64>,
-    pub last_completed: Option<&'static str>,
-    pub in_flight: Vec<&'static str>,
-    pub checkpoints: Vec<Checkpoint>,
-}
-
-/// The last pass marker one pipeline stage passed.
-#[derive(Clone, Debug)]
-pub struct Checkpoint {
-    pub stage: String,
-    pub pass: Option<&'static str>,
-    pub end: bool,
-}
-
-/// One device fault report.
-#[derive(Clone, Debug)]
-pub struct DeviceFault {
-    pub description: String,
-    pub watchdog: bool,
-    pub addresses: Vec<FaultAddress>,
-    pub vendor: Vec<String>,
-}
-
-/// An address a fault reported.
-#[derive(Clone, Debug)]
-pub struct FaultAddress {
-    pub access: FaultAccess,
-    pub address: u64,
-    pub precision: u64,
-    pub allocation: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FaultAccess {
-    Read,
-    Write,
-    Execute,
-    Instruction,
-    Other,
-}
-
 impl Device {
     /// An empty report: Metal records no diagnostics yet.
     pub fn diagnostics_report(&self) -> DiagnosticsReport {
         DiagnosticsReport::default()
     }
-}
-
-/// One sequence of [`CommandList::execute_generated`].
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
-pub struct Sequence {
-    pub pipeline: u32,
-    /// The root's address, low word first.
-    pub root: [u32; 2],
-    pub groups: [u32; 3],
-}
-
-impl Sequence {
-    pub fn new<R>(pipeline: u32, root: GpuPtr<R>, groups: [u32; 3]) -> Self {
-        let a = root.address().0;
-        Self {
-            pipeline,
-            root: [a as u32, (a >> 32) as u32],
-            groups,
-        }
-    }
-}
-
-/// The kind of pipelines an execution set holds.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum SetKind {
-    Compute,
-    Mesh,
 }
 
 /// Pipelines that GPU-written sequences pick by index; not on Metal yet.
@@ -157,16 +59,6 @@ impl ExecutionSet {
         let _ = max;
         match self.never {}
     }
-}
-
-/// One run of an execution set.
-#[derive(Clone, Copy)]
-pub struct Generated<'a> {
-    pub set: &'a ExecutionSet,
-    pub sequences: GpuPtr<Sequence>,
-    pub count: GpuPtr<u32>,
-    pub max: u32,
-    pub preprocess: GpuPtr<u8>,
 }
 
 impl Device {
@@ -200,46 +92,6 @@ impl CommandList<'_> {
     }
 }
 
-/// Matrices start at multiples of this many bytes.
-pub const MATRIX_ALIGN: u64 = 64;
-
-/// How a cooperative-vector matrix lays out its elements.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum MatrixLayout {
-    RowMajor,
-    ColumnMajor,
-    InferencingOptimal,
-    TrainingOptimal,
-}
-
-/// The element type and layout of a matrix.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct MatrixFormat {
-    pub component: ComponentType,
-    pub layout: MatrixLayout,
-    pub stride: u32,
-}
-
-impl MatrixFormat {
-    /// Tightly packed in `layout`.
-    pub fn new(component: ComponentType, layout: MatrixLayout) -> Self {
-        Self {
-            component,
-            layout,
-            stride: 0,
-        }
-    }
-}
-
-/// A `rows` x `columns` matrix converted from `src_format` to `dst_format`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct MatrixConversion {
-    pub rows: u32,
-    pub columns: u32,
-    pub src_format: MatrixFormat,
-    pub dst_format: MatrixFormat,
-}
-
 impl Device {
     pub fn matrix_bytes(
         &self,
@@ -267,30 +119,6 @@ impl CommandList<'_> {
         let _ = (c, src, dst);
         not_implemented("cooperative vectors")
     }
-}
-
-/// The metrics a counter frame collects for every pass.
-pub const COUNTER_METRICS: [&str; 6] = [
-    "gpu__time_duration.sum",
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed",
-    "sm__warps_active.avg.pct_of_peak_sustained_active",
-    "l1tex__t_sector_hit_rate.pct",
-    "lts__t_sector_hit_rate.pct",
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed",
-];
-
-/// The counters of one counter frame.
-#[derive(Clone, Debug, Default)]
-pub struct CounterReport {
-    pub chip: String,
-    pub ranges: Vec<CounterRange>,
-}
-
-/// One pass's counters.
-#[derive(Clone, Debug)]
-pub struct CounterRange {
-    pub name: String,
-    pub values: Vec<f64>,
 }
 
 impl Queue {

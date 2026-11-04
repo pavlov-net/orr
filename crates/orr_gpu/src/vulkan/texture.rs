@@ -9,30 +9,11 @@ use ash::vk::TaggedStructure as _;
 use super::debug::name_object;
 use super::device::{Device, Shared};
 use super::garbage::Item;
-use super::memory::{Allocation, MemoryKind, memory_error, sharing};
+use super::memory::{memory_error, sharing};
 use crate::{
-    AddressMode, CompareOp, Error, Filter, Format, SparseLayout, TextureDesc, TextureKind,
-    TextureRegion, TextureUsage, ViewDesc, ViewKind,
+    AddressMode, CompareOp, Error, Filter, Format, MemoryKind, SparseLayout, TextureDesc,
+    TextureKind, TextureMemory, TextureRegion, TextureUsage, ViewDesc, ViewKind,
 };
-
-/// Where a texture's memory comes from.
-pub enum TextureMemory<'a> {
-    /// Memory orr_gpu manages, from blocks that hold only images. Render targets (`COLOR` or
-    /// `DEPTH` usage, or single-mip 2D `STORAGE` textures of 1 MiB and more), textures of
-    /// 16 MiB and more and textures the driver wants alone get their own `VkDeviceMemory`;
-    /// render targets sit at the highest memory priority.
-    Dedicated,
-    /// Inside a block, at an offset aligned as [`Device::texture_requirements`] says: a
-    /// [`MemoryKind::DeviceLocal`] block, or an Upload block for
-    /// [`TextureUsage::HOST_COPY`]. The block must outlive the texture.
-    Placed {
-        block: &'a Allocation<u8>,
-        offset: u64,
-    },
-    /// No memory until [`Device::bind_sparse`] binds its tiles and mip tails
-    /// ([`Texture::sparse_layout`]) to DeviceLocal blocks. 2D and cube color textures.
-    Sparse,
-}
 
 /// Where a sparse texture's mip tails sit in its opaque range.
 pub(super) struct SparseTail {

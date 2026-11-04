@@ -1,4 +1,4 @@
-use crate::{CompareOp, Format};
+use crate::{CompareOp, Format, ShaderStage, Texture};
 
 /// Which triangles the rasterizer drops.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
@@ -188,4 +188,62 @@ pub enum DepthLoad {
     Keep,
     Clear(f32),
     Discard,
+}
+
+/// A color attachment of [`Rendering`]: mip 0, layer 0 of a texture with `COLOR` usage.
+#[derive(Clone, Copy)]
+pub struct ColorAttachment<'a> {
+    pub texture: &'a Texture,
+    pub load: ColorLoad,
+    /// Keep what rendering wrote; otherwise the contents are undefined afterwards.
+    pub store: bool,
+}
+
+/// The depth attachment of [`Rendering`]: mip 0, layer 0 of a texture with `DEPTH` usage.
+/// A depth-stencil format clears its stencil to 0 with `DepthLoad::Clear`.
+#[derive(Clone, Copy)]
+pub struct DepthAttachment<'a> {
+    pub texture: &'a Texture,
+    pub load: DepthLoad,
+    pub store: bool,
+}
+
+/// What [`CommandList::begin_rendering`](crate::CommandList::begin_rendering) draws into. With no attachments the extent
+/// alone sets the raster grid.
+#[derive(Clone, Copy)]
+pub struct Rendering<'a> {
+    /// Width and height in pixels, from the origin.
+    pub extent: [u32; 2],
+    pub colors: &'a [ColorAttachment<'a>],
+    pub depth: Option<DepthAttachment<'a>>,
+}
+
+/// How to build a mesh pipeline. Every stage reads the root pointer passed to the draw.
+#[derive(Clone, Copy, Debug)]
+pub struct MeshPipelineDesc<'a> {
+    pub task: Option<ShaderStage<'a>>,
+    pub mesh: ShaderStage<'a>,
+    /// `None`: no pixel stage; only depth is written.
+    pub pixel: Option<ShaderStage<'a>>,
+    /// Color targets in attachment order.
+    pub colors: &'a [ColorTarget],
+    pub depth: Option<DepthTarget>,
+    pub raster: RasterState,
+    /// Rasterization samples per pixel: 1, or more for pipelines with no targets.
+    pub samples: u32,
+}
+
+impl<'a> MeshPipelineDesc<'a> {
+    /// A mesh stage alone: no targets, default raster state, one sample.
+    pub fn new(mesh: ShaderStage<'a>) -> Self {
+        Self {
+            task: None,
+            mesh,
+            pixel: None,
+            colors: &[],
+            depth: None,
+            raster: RasterState::default(),
+            samples: 1,
+        }
+    }
 }

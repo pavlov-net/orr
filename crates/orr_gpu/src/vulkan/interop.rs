@@ -12,9 +12,8 @@ use super::debug::name_object;
 use super::device::{Device, Shared};
 use super::garbage::Item;
 use super::memory::Allocation;
-use super::queue::QueueKind;
 use super::texture::Texture;
-use crate::{Error, ViewDesc};
+use crate::{Error, QueueKind, ViewDesc};
 
 /// Additions to device creation. Every method has a no-op default.
 pub trait DeviceHooks {
