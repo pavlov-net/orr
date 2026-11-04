@@ -58,49 +58,51 @@ fn run_ring(mut ring: Ring, file: &Arc<ReadFile>, reads: &[(u64, usize)]) -> Vec
 
 #[test]
 fn ring_matches_positioned_reads() {
-    let len = 37 * SECTOR + 123;
-    let data = bytes(len);
-    let p = path("ring.bin");
-    fs::write(&p, &data).unwrap();
-    let file = Arc::new(ReadFile::open(&p).unwrap());
-    let plain = fs::File::open(&p).unwrap();
+    // A file that ends on a sector takes one more read to find its end.
+    for len in [37 * SECTOR + 123, 37 * SECTOR] {
+        let data = bytes(len);
+        let p = path("ring.bin");
+        fs::write(&p, &data).unwrap();
+        let file = Arc::new(ReadFile::open(&p).unwrap());
+        let plain = fs::File::open(&p).unwrap();
 
-    // More reads than the ring keeps in flight, with lengths that are not whole sectors and
-    // reads that cross, end at and start past the end of the file.
-    let mut reads: Vec<(u64, usize)> = (0..150)
-        .map(|i| {
-            (
-                (i * 7 % 36) as u64 * SECTOR as u64,
-                1 + i * 997 % (3 * SECTOR),
-            )
-        })
-        .collect();
-    reads.extend([
-        (36 * SECTOR as u64, 2 * SECTOR),
-        (37 * SECTOR as u64, SECTOR),
-        (37 * SECTOR as u64, 123),
-        (38 * SECTOR as u64, SECTOR),
-    ]);
-    let expected: Vec<Vec<u8>> = reads
-        .iter()
-        .map(|&(offset, n)| {
-            let mut buf = vec![0; n];
-            let got = read_at(&plain, offset, &mut buf).unwrap();
-            buf.truncate(got);
-            buf
-        })
-        .collect();
+        // More reads than the ring keeps in flight, with lengths that are not whole sectors and
+        // reads that cross, end at and start past the end of the file.
+        let mut reads: Vec<(u64, usize)> = (0..150)
+            .map(|i| {
+                (
+                    (i * 7 % 36) as u64 * SECTOR as u64,
+                    1 + i * 997 % (3 * SECTOR),
+                )
+            })
+            .collect();
+        reads.extend([
+            (36 * SECTOR as u64, 2 * SECTOR),
+            (37 * SECTOR as u64, SECTOR),
+            (37 * SECTOR as u64, 123),
+            (38 * SECTOR as u64, SECTOR),
+        ]);
+        let expected: Vec<Vec<u8>> = reads
+            .iter()
+            .map(|&(offset, n)| {
+                let mut buf = vec![0; n];
+                let got = read_at(&plain, offset, &mut buf).unwrap();
+                buf.truncate(got);
+                buf
+            })
+            .collect();
 
-    let mut rings = vec![("positioned", Ring::positioned())];
-    match Ring::native() {
-        Some(r) => rings.push(("native", r)),
-        #[allow(clippy::print_stderr)]
-        None => eprintln!("skipping the native ring: the system has none"),
-    }
-    for (name, ring) in rings {
-        let got = run_ring(ring, &file, &reads);
-        for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
-            assert!(g == e, "{name} ring, read {i} {:?}", reads[i]);
+        let mut rings = vec![("positioned", Ring::positioned())];
+        match Ring::native() {
+            Some(r) => rings.push(("native", r)),
+            #[allow(clippy::print_stderr)]
+            None => eprintln!("skipping the native ring: the system has none"),
+        }
+        for (name, ring) in rings {
+            let got = run_ring(ring, &file, &reads);
+            for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
+                assert!(g == e, "{name} ring, read {i} {:?}", reads[i]);
+            }
         }
     }
 }

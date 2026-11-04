@@ -17,6 +17,8 @@ use std::sync::{Condvar, Mutex};
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(any(windows, target_os = "linux"))]
+mod native;
 #[cfg(windows)]
 mod windows;
 
@@ -28,6 +30,9 @@ use crate::windows as sys;
 /// Alignment and size granule of unbuffered reads. A [`ReadFile`] on a volume whose sectors do
 /// not divide it is buffered.
 pub const SECTOR: usize = 4096;
+
+/// The most bytes one read asks the system for, which is under every platform's limit.
+const CHUNK: usize = 1 << 30;
 
 /// A zeroed buffer at a [`SECTOR`] boundary, a whole number of sectors long.
 pub struct AlignedBuf {
@@ -124,17 +129,21 @@ pub fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
     })
 }
 
-/// Fills `buf` from `offset` with calls to `read`, each for at most 1 GiB, which is under every
-/// platform's limit for one call, until `buf` is full or the file ends. An unbuffered handle
-/// rejects offsets that are not whole sectors, and a read on one only ends off a sector at the
-/// end of the file, so with `unbuffered` that ends the loop.
+/// Whether a read that has reached `at` is at the end of the file though it read something. An
+/// unbuffered handle rejects offsets that are not whole sectors, and a read on one only ends
+/// off a sector at the end of the file.
+fn ended_off_sector(unbuffered: bool, at: u64) -> bool {
+    unbuffered && !at.is_multiple_of(SECTOR as u64)
+}
+
+/// Fills `buf` from `offset` with calls to `read`, each for at most [`CHUNK`] bytes, until `buf`
+/// is full or the file ends.
 fn read_all(
     offset: u64,
     buf: &mut [u8],
     unbuffered: bool,
     read: impl Fn(u64, &mut [u8]) -> io::Result<usize>,
 ) -> io::Result<usize> {
-    const CHUNK: usize = 1 << 30;
     let mut done = 0;
     while done < buf.len() {
         let want = (buf.len() - done).min(CHUNK);
@@ -144,7 +153,7 @@ fn read_all(
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
-        if unbuffered && !(offset + done as u64).is_multiple_of(SECTOR as u64) {
+        if ended_off_sector(unbuffered, offset + done as u64) {
             break;
         }
     }
@@ -213,10 +222,8 @@ pub struct Ring {
 }
 
 enum Backend {
-    #[cfg(windows)]
-    Native(windows::IoRing),
-    #[cfg(target_os = "linux")]
-    Native(Box<linux::Uring>),
+    #[cfg(any(windows, target_os = "linux"))]
+    Native(Box<native::Native>),
     Positioned(VecDeque<Read>),
 }
 
@@ -224,10 +231,8 @@ impl Ring {
     /// A ring backed by the operating system's completion ring, or `None` where it is
     /// missing or refused, as on old Linux kernels or where seccomp blocks io_uring.
     pub fn native() -> Option<Self> {
-        #[cfg(windows)]
-        let backend = windows::IoRing::new().map(Backend::Native);
-        #[cfg(target_os = "linux")]
-        let backend = linux::Uring::new().map(|r| Backend::Native(Box::new(r)));
+        #[cfg(any(windows, target_os = "linux"))]
+        let backend = native::Native::new().map(|r| Backend::Native(Box::new(r)));
         #[cfg(not(any(windows, target_os = "linux")))]
         let backend = None;
         backend.map(|backend| Self { backend })
@@ -250,7 +255,7 @@ impl Ring {
         }
     }
 
-    /// Issues queued reads and runs `done` for every completed one.
+    /// Runs `done` for every completed read, then issues queued reads.
     pub fn pump(&mut self) {
         match &mut self.backend {
             #[cfg(any(windows, target_os = "linux"))]
@@ -318,7 +323,7 @@ impl Wake {
         let ring = ring.filter(|r| r.busy());
         #[cfg(any(windows, target_os = "linux"))]
         match ring.map(|r| &r.backend) {
-            Some(Backend::Native(r)) => sys::wait_any(&[&self.event, r.event()]),
+            Some(Backend::Native(r)) => sys::wait_any(&[&self.event, r.ring.event()]),
             Some(Backend::Positioned(_)) => {}
             None => sys::wait_any(&[&self.event]),
         }

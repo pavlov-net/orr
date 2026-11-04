@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::fs::File;
 use std::io;
@@ -23,10 +22,8 @@ use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects};
 use windows::core::{HRESULT, PCSTR, w};
 
-use crate::{AlignedBuf, Read, SECTOR};
-
-/// Reads in flight at once; 64 reach a fast NVMe drive's rate.
-const DEPTH: usize = 64;
+use crate::SECTOR;
+use crate::native::InFlight;
 
 fn open(path: &Path, flags: u32) -> io::Result<File> {
     std::fs::OpenOptions::new()
@@ -42,7 +39,7 @@ pub(crate) fn open_shared(path: &Path) -> io::Result<File> {
 
 /// Opens unbuffered, or buffered where the file system refuses that or [`SECTOR`] is not a
 /// whole number of its sectors. Returns the file and whether it is unbuffered. The handle is
-/// overlapped: read it with [`read_overlapped`] or an [`IoRing`].
+/// overlapped: read it with [`read_overlapped`] or an [`OsRing`].
 pub(crate) fn open_unbuffered(path: &Path) -> io::Result<(File, bool)> {
     match open(path, FILE_FLAG_NO_BUFFERING.0 | FILE_FLAG_OVERLAPPED.0) {
         Ok(f) if sectors_fit(&f) => Ok((f, true)),
@@ -86,7 +83,7 @@ fn sectors_fit(f: &File) -> bool {
 /// One read at `offset` on an overlapped handle, which can run alongside reads on other
 /// threads. Reads nothing at the end of the file.
 pub(crate) fn read_overlapped(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-    let event = Event::manual()?;
+    let event = Event::create(true).map_err(os_error)?;
     let mut overlapped = OVERLAPPED {
         hEvent: event.0,
         ..Default::default()
@@ -126,7 +123,6 @@ fn os_error(e: windows::core::Error) -> io::Error {
     }
 }
 
-/// An event: auto-reset, except from [`Event::manual`].
 pub(crate) struct Event(HANDLE);
 
 // SAFETY: event handles may be used from any thread.
@@ -136,14 +132,12 @@ unsafe impl Sync for Event {}
 
 impl Event {
     pub(crate) fn new() -> Self {
-        // SAFETY: plain event creation.
-        Self(unsafe { CreateEventW(None, false, false, None) }.expect("wake event"))
+        Self::create(false).expect("wake event")
     }
 
-    fn manual() -> io::Result<Self> {
+    fn create(manual_reset: bool) -> windows::core::Result<Self> {
         // SAFETY: plain event creation.
-        let event = unsafe { CreateEventW(None, true, false, None) };
-        event.map(Self).map_err(os_error)
+        unsafe { CreateEventW(None, manual_reset, false, None) }.map(Self)
     }
 
     pub(crate) fn set(&self) {
@@ -196,26 +190,19 @@ struct Fns {
     close: Close,
 }
 
-struct InFlight {
-    read: Read,
-    buf: AlignedBuf,
-}
-
-/// One IoRing with raw handle and buffer references, at most [`DEPTH`] reads in flight.
-pub(crate) struct IoRing {
+/// One IoRing with raw handle and buffer references.
+pub(crate) struct OsRing {
     fns: Fns,
     ring: HIORING,
     event: Event,
-    slots: Vec<Option<InFlight>>,
-    queued: VecDeque<Read>,
     /// Entries are built that no submit has taken.
     unsubmitted: bool,
 }
 
 // SAFETY: the ring is used only by the thread that owns it.
-unsafe impl Send for IoRing {}
+unsafe impl Send for OsRing {}
 
-impl IoRing {
+impl OsRing {
     pub(crate) fn new() -> Option<Self> {
         // SAFETY: loading a system library and looking up exports by their documented
         // names and signatures.
@@ -248,8 +235,6 @@ impl IoRing {
                 fns,
                 ring,
                 event,
-                slots: (0..DEPTH).map(|_| None).collect(),
-                queued: VecDeque::new(),
                 unsubmitted: false,
             })
         }
@@ -259,74 +244,32 @@ impl IoRing {
         &self.event
     }
 
-    fn in_flight(&self) -> bool {
-        self.slots.iter().any(Option::is_some)
+    /// Builds the next chunk of `f`, which goes in `slot`, into the ring.
+    pub(crate) fn start(&mut self, slot: usize, f: &mut InFlight) -> io::Result<()> {
+        let (address, len) = f.chunk();
+        let file = IORING_HANDLE_REF {
+            Kind: IORING_REF_RAW,
+            Handle: IORING_HANDLE_REF_0 {
+                Handle: HANDLE(f.read.file.handle.as_raw_handle()),
+            },
+        };
+        let data = IORING_BUFFER_REF {
+            Kind: IORING_REF_RAW,
+            Buffer: IORING_BUFFER_REF_0 {
+                Address: address.cast::<c_void>(),
+            },
+        };
+        // SAFETY: the handle and the buffer stay alive in the slot until the completion is
+        // popped.
+        let h = unsafe {
+            (self.fns.build_read)(self.ring, file, data, len, f.at(), slot, IOSQE_FLAGS_NONE)
+        };
+        h.ok().map_err(os_error)?;
+        self.unsubmitted = true;
+        Ok(())
     }
 
-    pub(crate) fn busy(&self) -> bool {
-        !self.queued.is_empty() || self.in_flight()
-    }
-
-    pub(crate) fn push(&mut self, read: Read) {
-        self.queued.push_back(read);
-    }
-
-    pub(crate) fn pump(&mut self) {
-        // Completions go first: each frees a slot for a queued read, and the wait that follows
-        // has no event to end it if it took the event for those completions already.
-        self.complete();
-        self.issue();
-        self.submit();
-    }
-
-    fn issue(&mut self) {
-        while let Some(slot) = self.slots.iter().position(Option::is_none) {
-            let Some(read) = self.queued.pop_front() else {
-                break;
-            };
-            let mut buf = AlignedBuf::new(read.len);
-            let Ok(len) = u32::try_from(buf.as_slice().len()) else {
-                (read.done)(Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "IoRing read over 4 GiB",
-                )));
-                continue;
-            };
-            let file = IORING_HANDLE_REF {
-                Kind: IORING_REF_RAW,
-                Handle: IORING_HANDLE_REF_0 {
-                    Handle: HANDLE(read.file.handle.as_raw_handle()),
-                },
-            };
-            let data = IORING_BUFFER_REF {
-                Kind: IORING_REF_RAW,
-                Buffer: IORING_BUFFER_REF_0 {
-                    Address: buf.as_mut_slice().as_mut_ptr().cast::<c_void>(),
-                },
-            };
-            // SAFETY: the handle and the buffer stay alive in the slot until the completion
-            // is popped.
-            let h = unsafe {
-                (self.fns.build_read)(
-                    self.ring,
-                    file,
-                    data,
-                    len,
-                    read.offset,
-                    slot,
-                    IOSQE_FLAGS_NONE,
-                )
-            };
-            if h.is_err() {
-                (read.done)(Err(os_error(h.into())));
-                continue;
-            }
-            self.slots[slot] = Some(InFlight { read, buf });
-            self.unsubmitted = true;
-        }
-    }
-
-    fn submit(&mut self) {
+    pub(crate) fn submit(&mut self) {
         if self.unsubmitted {
             let mut submitted = 0;
             // SAFETY: the ring is live; no wait.
@@ -341,50 +284,32 @@ impl IoRing {
         }
     }
 
-    /// Runs `done` for every completed read.
-    fn complete(&mut self) {
+    /// Waits up to a second for a completion. Returns false if the ring is broken.
+    pub(crate) fn wait(&mut self) -> bool {
+        let mut submitted = 0;
+        // SAFETY: the ring is live; waits for one completion.
+        let h = unsafe { (self.fns.submit)(self.ring, 1, 1000, &mut submitted) };
+        h != IORING_E_CORRUPT
+    }
+
+    /// The next completion: its slot and the bytes read, none at or past the end of the file.
+    pub(crate) fn pop(&mut self) -> Option<(usize, io::Result<usize>)> {
         let mut cqe = IORING_CQE::default();
         // SAFETY: the ring is live; `cqe` is written on S_OK.
-        while unsafe { (self.fns.pop)(self.ring, &mut cqe) } == HRESULT(0) {
-            let Some(f) = self.slots.get_mut(cqe.UserData).and_then(Option::take) else {
-                continue;
-            };
-            // A read that starts at or past the end of the file reads nothing, as `read_at`.
-            let result = if cqe.ResultCode == ERROR_HANDLE_EOF.to_hresult() {
-                Ok((f.buf, 0))
-            } else if cqe.ResultCode.is_err() {
-                Err(os_error(cqe.ResultCode.into()))
-            } else {
-                Ok((f.buf, cqe.Information.min(f.read.len)))
-            };
-            (f.read.done)(result);
+        if unsafe { (self.fns.pop)(self.ring, &mut cqe) } != HRESULT(0) {
+            return None;
         }
+        let n = match cqe.ResultCode.ok() {
+            Ok(()) => Ok(cqe.Information),
+            Err(e) => read_error(e),
+        };
+        Some((cqe.UserData, n))
     }
 }
 
-impl Drop for IoRing {
+impl Drop for OsRing {
     fn drop(&mut self) {
-        // Closing the ring cancels nothing in flight; wait for the reads first.
-        while self.in_flight() {
-            let mut submitted = 0;
-            // SAFETY: the ring is live; waits for one completion.
-            let h = unsafe { (self.fns.submit)(self.ring, 1, 1000, &mut submitted) };
-            if h == IORING_E_CORRUPT {
-                // The ring is broken and the kernel may still write into these buffers.
-                for s in &mut self.slots {
-                    std::mem::forget(s.take());
-                }
-                return;
-            }
-            let mut cqe = IORING_CQE::default();
-            // SAFETY: as in `complete`.
-            while unsafe { (self.fns.pop)(self.ring, &mut cqe) } == HRESULT(0) {
-                if let Some(s) = self.slots.get_mut(cqe.UserData) {
-                    *s = None;
-                }
-            }
-        }
-        // SAFETY: nothing is in flight.
+        // SAFETY: a read still in flight here is on a broken ring and owns leaked memory.
         let _ = unsafe { (self.fns.close)(self.ring) };
     }
 }
