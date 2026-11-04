@@ -39,7 +39,8 @@ const RESERVE_PAGES: usize = 2;
 /// Alignment of every region carved from the build scratch.
 const ALIGN: u64 = 256;
 
-/// Units a cluster's CLAS is taken to need before it is built.
+/// Units a cluster's CLAS is taken to need before it is built, before the pool's
+/// [`ClasPool::scale`].
 fn estimate(tris: u32) -> u64 {
     (u64::from(tris) * 32 + 256).div_ceil(UNIT)
 }
@@ -74,6 +75,10 @@ pub(crate) struct ClasPool {
     reference: RangeAllocator,
     /// Free units once every sent batch lands, less what their builds are taken to need.
     room: i64,
+    /// What estimates are multiplied by: at least 1, raised when a landed batch built more
+    /// than its estimate, as a backend with larger CLAS does. An estimate below the built
+    /// sizes would bind too few pages for builds that retry until they fit.
+    scale: f64,
     frees: Vec<(u32, u32)>,
     takes: Vec<u32>,
     unbinds: Vec<u32>,
@@ -112,6 +117,7 @@ impl ClasPool {
             used: vec![0; pages as usize],
             reference,
             room: 0,
+            scale: 1.0,
             frees: Vec::new(),
             takes: Vec::new(),
             unbinds: Vec::new(),
@@ -342,6 +348,10 @@ impl ClasPool {
                 self.room += i64::from(n);
             }
         }
+        let built: u64 = sizes.iter().map(|&b| u64::from(Self::units(b))).sum();
+        if ops.estimate > 0 && built > ops.estimate {
+            self.scale *= built as f64 / ops.estimate as f64;
+        }
         let mut allocated = 0u64;
         for (&bytes, &unit) in sizes.iter().zip(units) {
             if unit == NO_UNIT {
@@ -562,6 +572,7 @@ pub(crate) fn build_pages(
         .flat_map(|p| p.clusters)
         .map(|c| estimate(c.tri_count))
         .sum();
+    let estimate = (estimate as f64 * pool.scale).ceil() as u64;
     let (ops, bind) = pool.begin(device, estimate)?;
 
     // A micromap per page with a micromap region, its storage living with the page.

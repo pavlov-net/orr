@@ -433,9 +433,21 @@ impl Residency {
         self.unit(k).is_some_and(|u| u.state == State::Resident)
     }
 
-    /// Takes back the load of `k` a plan started: absent again, its bytes released, and
-    /// counted as dropped.
+    /// Takes back the load of `k` this step's plan started: absent again, its bytes released,
+    /// and counted as dropped instead of loaded.
     pub(crate) fn cancel(&mut self, k: Key) {
+        self.release_load(k);
+        self.stats.loads -= 1;
+        self.stats.dropped += 1;
+    }
+
+    /// Takes back the load of `k` an earlier step started, which landed unusable: absent
+    /// again and its bytes released, so a later step loads it again. This step's figures stay.
+    pub(crate) fn retry(&mut self, k: Key) {
+        self.release_load(k);
+    }
+
+    fn release_load(&mut self, k: Key) {
         let units = self.mounts.get_mut(&k.mount).expect("mounted");
         let u = &mut units[k.unit as usize];
         debug_assert_eq!(u.state, State::Loading);
@@ -448,8 +460,6 @@ impl Residency {
         for d in u.deps.clone() {
             units[d as usize].dependents -= 1;
         }
-        self.stats.loads -= 1;
-        self.stats.dropped += 1;
         self.refresh();
     }
 
