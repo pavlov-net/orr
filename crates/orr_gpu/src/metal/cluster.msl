@@ -240,6 +240,23 @@ kernel void ptlas_check(constant PtlasCheckArgs& a [[buffer(0)]], uint i [[threa
     }
 }
 
+// Debug builds run this after `ptlas_check`, for the check Vulkan's `store` asserts: a write
+// whose custom index needs more than 24 bits rejects the build, which `failures` counts
+// once. `ptlas_descriptors` keeps the index's low 24 bits beside its own tags in bits 30 and 31.
+kernel void ptlas_check_writes(constant PtlasCheckArgs& a [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+    device atomic_uint* count = at<atomic_uint>(a.count);
+    uint n = min(atomic_load_explicit(count, memory_order_relaxed), a.max_ops);
+    for (uint c = 0; c < n; c++) {
+        device const uint* cmd = at<uint>(a.commands + c * 24);
+        if (cmd[0] != 0 || i >= cmd[1]) continue;
+        ulong args = ulong(cmd[2]) | ulong(cmd[3]) << 32;
+        ulong stride = ulong(cmd[4]) | ulong(cmd[5]) << 32;
+        device const uint* r = at<uint>(args + i * stride);
+        if ((r[18] >> 24) != 0 && atomic_exchange_explicit(count, 0u, memory_order_relaxed) != 0)
+            atomic_fetch_add_explicit(at<atomic_uint>(a.failures), 1u, memory_order_relaxed);
+    }
+}
+
 // Forgets every instance and translation.
 kernel void ptlas_clear(constant PtlasArgs& a [[buffer(0)]], uint i [[thread_position_in_grid]]) {
     if (i < a.instances)

@@ -254,6 +254,7 @@ pub(super) struct Kernels {
     ptlas_apply: Obj<ProtocolObject<dyn MTLComputePipelineState>>,
     ptlas_descriptors: Obj<ProtocolObject<dyn MTLComputePipelineState>>,
     ptlas_check: Obj<ProtocolObject<dyn MTLComputePipelineState>>,
+    ptlas_check_writes: Obj<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl Kernels {
@@ -283,6 +284,7 @@ impl Kernels {
             ptlas_apply: state("ptlas_apply")?,
             ptlas_descriptors: state("ptlas_descriptors")?,
             ptlas_check: state("ptlas_check")?,
+            ptlas_check_writes: state("ptlas_check_writes")?,
         })
     }
 }
@@ -328,7 +330,7 @@ impl PtlasCheck {
         let before = self.reported.swap(n, Ordering::Relaxed);
         if n > before {
             log::error!(
-                "{} PTLAS build(s) rejected: more commands than PtlasLimits::max_ops, an unknown op or two commands of one op type",
+                "{} PTLAS build(s) rejected: more commands than PtlasLimits::max_ops, an unknown op, two commands of one op type or a write's custom index above 24 bits",
                 n - before
             );
         }
@@ -1205,9 +1207,13 @@ impl CommandList<'_> {
                 max_ops: l.max_ops,
                 pad: 0,
             };
-            let state = k.ptlas_check.clone();
+            let (check, writes) = (k.ptlas_check.clone(), k.ptlas_check_writes.clone());
+            let args = bytemuck::bytes_of(&args);
             self.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
-            self.dispatch_state(&state, bytemuck::bytes_of(&args), [1, 1, 1], [1, 1, 1]);
+            // Its pipeline takes groups of GROUP threads; thread 0 checks.
+            self.dispatch_state(&check, args, [1, 1, 1], [GROUP, 1, 1]);
+            self.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
+            self.dispatch_state(&writes, args, groups, [GROUP, 1, 1]);
         }
         self.barrier(
             Stages::ALL,

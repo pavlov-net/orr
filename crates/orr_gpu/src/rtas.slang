@@ -250,6 +250,7 @@ public void store(uint64_t args, uint index, Move v)
 
 public void store(uint64_t args, uint index, PtlasWrite v)
 {
+    // Metal has no `abort`; its debug PTLAS check rejects such a write instead.
     __target_switch
     {
     case metal:
