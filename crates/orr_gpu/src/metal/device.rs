@@ -68,10 +68,12 @@ pub(super) struct Shared {
     pub(super) gpu_errors: AtomicU32,
     /// Metal libraries by the hash that names them (a module's own by the module's hash, a
     /// reload's by its contents') and whether they hold the pixel entries.
-    pub(super) libraries: Mutex<HashMap<(u64, bool), Obj<ProtocolObject<dyn MTLLibrary>>>>,
+    pub(super) libraries: Mutex<HashMap<(u64, bool), Obj<Library>>>,
     pub(super) bindings: Bindings,
     pub(super) caps: Caps,
 }
+
+type Library = ProtocolObject<dyn MTLLibrary>;
 
 pub(super) struct Residency {
     pub(super) set: Obj<ProtocolObject<dyn MTLResidencySet>>,

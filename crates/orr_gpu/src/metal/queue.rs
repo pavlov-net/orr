@@ -323,8 +323,8 @@ impl Queue {
                 NonNull::new(raw.as_mut_ptr()).unwrap(),
                 raw.len(),
                 &options,
-            )
-        };
+            );
+        }
         buffers.clear();
     }
 

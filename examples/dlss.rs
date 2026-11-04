@@ -317,6 +317,8 @@ fn run(options: &Options) {
             .wait(point, Duration::from_secs(10))
             .expect("wait");
     }
+    // Off Windows the overlay is a stub that holds nothing.
+    #[allow(clippy::drop_non_drop)]
     drop(overlay);
     drop(showcase);
     drop(display);

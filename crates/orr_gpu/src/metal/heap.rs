@@ -165,7 +165,7 @@ impl Device {
         assert_freeable(slot);
         let shared = std::sync::Arc::clone(&self.shared);
         self.shared.defer(Box::new(move || {
-            lock(&shared.bindings.slots).free.push(slot)
+            lock(&shared.bindings.slots).free.push(slot);
         }));
     }
 

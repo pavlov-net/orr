@@ -85,13 +85,15 @@ pub struct SparseBinds<'a> {
     _resources: std::marker::PhantomData<&'a ()>,
 }
 
+type Heap = ProtocolObject<dyn MTLHeap>;
+
 /// The heap and the offset in pages of a bind of `bytes` bytes, once the block and
 /// alignment check; no heap to unbind.
 fn bound_memory(
     memory: Option<(&Allocation<u8>, u64)>,
     bytes: u64,
     page: u64,
-) -> Result<(Option<Obj<ProtocolObject<dyn MTLHeap>>>, usize), Error> {
+) -> Result<(Option<Obj<Heap>>, usize), Error> {
     let Some((block, offset)) = memory else {
         return Ok((None, 0));
     };

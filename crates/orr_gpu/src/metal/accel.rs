@@ -144,6 +144,13 @@ pub struct Micromap {
     never: std::convert::Infallible,
 }
 
+/// As the Vulkan backend's, which releases the micromap.
+impl Drop for Micromap {
+    fn drop(&mut self) {
+        match self.never {}
+    }
+}
+
 impl Micromap {
     pub fn address(&self) -> GpuAddress {
         match self.never {}
@@ -367,8 +374,8 @@ impl CommandList<'_> {
         let e = self.compute();
         // SAFETY: both structures are live until the submit completes.
         unsafe {
-            e.copyAndCompactAccelerationStructure_toAccelerationStructure(&src.raw, &dst.raw)
-        };
+            e.copyAndCompactAccelerationStructure_toAccelerationStructure(&src.raw, &dst.raw);
+        }
         self.keep.push(Box::new(src.raw.clone()));
         self.keep.push(Box::new(dst.raw.clone()));
         self.barrier(Stages::AS_BUILD, Stages::ALL, Hazards::ACCEL_STRUCT);

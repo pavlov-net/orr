@@ -15,6 +15,7 @@ fn main() {
 }
 
 #[cfg(not(windows))]
+#[allow(clippy::print_stderr)]
 fn main() {
     eprintln!("the swapchain example needs gpu_suite's window, which is Windows-only");
 }
