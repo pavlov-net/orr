@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -85,6 +85,8 @@ pub(super) struct Shared {
     /// Cluster and partitioned acceleration structures by the address of their object.
     pub(super) objects: Mutex<Objects>,
     pub(super) cluster_kernels: OnceLock<Kernels>,
+    /// Command buffers that completed with an error.
+    pub(super) gpu_errors: AtomicU32,
     /// Each module's libraries by (module hash, fragment library).
     pub(super) libraries: Mutex<HashMap<(u64, bool), Obj<ProtocolObject<dyn MTLLibrary>>>>,
     pub(super) bindings: Bindings,
@@ -193,6 +195,7 @@ impl Device {
             timestamps,
             objects: Mutex::default(),
             cluster_kernels: OnceLock::new(),
+            gpu_errors: AtomicU32::new(0),
             libraries: Mutex::default(),
             bindings,
             caps,
@@ -252,9 +255,10 @@ impl Device {
             .tlas()
     }
 
-    /// Messages from Metal's validation; the backend does not collect them yet.
+    /// Command buffers the GPU failed: a fault or a validation error, each logged with
+    /// Metal's description as it completes.
     pub fn validation_messages(&self) -> u32 {
-        0
+        self.shared.gpu_errors.load(Ordering::Relaxed)
     }
 }
 
