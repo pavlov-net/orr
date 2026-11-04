@@ -20,7 +20,7 @@ use crate::scene::{FRAME_SLOTS, Ring, device_local};
 use crate::shaders::dielectric::{dispatch, tiles};
 use crate::shaders::guides::{frost, overlay_front, resolve};
 use crate::shaders::light_sampling::local;
-use crate::shaders::path::opaque;
+use crate::shaders::path::{background, opaque};
 use crate::shaders::types::{
     FrostRoot, GuideRoot, LayerGuide, LayerTilesRoot, LocalLights, OverlayFrontRoot,
     ParticleLighting, PathRoot,
@@ -302,7 +302,7 @@ impl Drop for OptionalTarget {
     }
 }
 
-/// The background layer behind out-of-focus foreground and the frame the opaque dispatch
+/// The background layer behind out-of-focus foreground and the frame the background dispatch
 /// last wrote it.
 struct DofLayer {
     target: OptionalTarget,
@@ -646,10 +646,11 @@ impl LightingView {
     }
 
     /// The sampled view of the RGBA16F background layer behind out-of-focus foreground, as the
-    /// last opaque dispatch given a [`DofBackgroundPass`] wrote it: on each marked pixel, the
-    /// pre-exposed radiance its lens ray reaches past the mask's depth in RGB (with the camera
-    /// segment's media where media apply ran) and that hit's reverse-Z device depth in A, 0 for
-    /// sky; (0, 0, 0, -1) on unmarked pixels. `None` once a dispatch runs without one.
+    /// last [`LightingKernels::record_opaque`] given a [`DofBackgroundPass`] wrote it: on each
+    /// marked pixel, the pre-exposed radiance its lens ray reaches past the mask's depth in RGB
+    /// (with the camera segment's media where media apply ran) and that hit's reverse-Z device
+    /// depth in A, 0 for sky; (0, 0, 0, -1) on unmarked pixels. `None` once a call runs without
+    /// one.
     pub fn dof_background_index(&self) -> Option<TextureIndex> {
         self.dof.as_ref().map(|l| l.target.sampled)
     }
@@ -695,7 +696,7 @@ impl LightingView {
         }
     }
 
-    /// The background layer's storage view when the opaque dispatch of `frame` wrote it.
+    /// The background layer's storage view when the background dispatch of `frame` wrote it.
     pub(crate) fn dof_background_store(&self, frame: u64) -> StorageImageIndex {
         self.dof
             .as_ref()
@@ -779,7 +780,7 @@ pub struct ViewPass {
     pub sample_index: u32,
     /// Separates sample sets of the same pixels and sample index.
     pub seed: u32,
-    /// The opaque dispatch also traces the view's background layer
+    /// A dispatch beside the opaque one traces the view's background layer
     /// ([`LightingView::dof_background_index`]); `None` frees it.
     pub dof_background: Option<DofBackgroundPass>,
     /// The dielectric dispatch keeps what [`LightingKernels::record_frosted_glass`] reads:
@@ -935,6 +936,7 @@ macro_rules! path_kernel {
 }
 
 const OPAQUE: PathKernel = path_kernel!(opaque, "opaque paths");
+const BACKGROUND: PathKernel = path_kernel!(background, "background paths");
 const DIELECTRIC: PathKernel = path_kernel!(dispatch, "dielectric paths");
 const UPDATE: PathKernel = path_kernel!(update, "world cache update paths");
 const SUPPORT: &str = "lighting compute kernels";
@@ -972,6 +974,7 @@ fn compiled<T>(job: &JobResult<Result<T, Error>>, kernel: &'static str) -> Resul
 /// already compiling finishes on its thread, since the driver cannot be interrupted.
 pub struct CompilingKernels {
     opaque: JobResult<Result<PathPipeline, Error>>,
+    background: JobResult<Result<PathPipeline, Error>>,
     dielectric: JobResult<Result<PathPipeline, Error>>,
     update: JobResult<Result<PathPipeline, Error>>,
     support: JobResult<Result<SupportKernels, Error>>,
@@ -979,14 +982,19 @@ pub struct CompilingKernels {
 }
 
 impl CompilingKernels {
-    /// The jobs [`LightingKernels::spawn`] queues: three path kernels and the kernels beside them.
+    /// The jobs [`LightingKernels::spawn`] queues: four path kernels and the kernels beside them.
     /// A consumer lends this many threads for them to compile at once, and more to keep loading
     /// while they do: on a first run a path kernel holds its thread for a minute or more.
-    pub const JOBS: usize = 4;
+    pub const JOBS: usize = 5;
 
     /// How many jobs have not finished.
     pub fn outstanding(&self) -> u32 {
-        let paths = [&self.opaque, &self.dielectric, &self.update];
+        let paths = [
+            &self.opaque,
+            &self.background,
+            &self.dielectric,
+            &self.update,
+        ];
         paths.iter().filter(|job| !job.finished()).count() as u32
             + u32::from(!self.support.finished())
     }
@@ -994,6 +1002,7 @@ impl CompilingKernels {
     /// Whether a thread has started any job.
     pub fn started(&self) -> bool {
         self.opaque.started()
+            || self.background.started()
             || self.dielectric.started()
             || self.update.started()
             || self.support.started()
@@ -1003,6 +1012,7 @@ impl CompilingKernels {
     /// so it finishes with no workers. `loading` is the side the jobs were queued on.
     pub fn wait(&self, loading: &Loading) {
         self.opaque.wait(loading);
+        self.background.wait(loading);
         self.dielectric.wait(loading);
         self.update.wait(loading);
         self.support.wait(loading);
@@ -1013,6 +1023,7 @@ impl CompilingKernels {
         assert_eq!(self.outstanding(), 0, "kernels are still compiling");
         Ok(LightingKernels {
             opaque: compiled(&self.opaque, OPAQUE.name)?,
+            background: compiled(&self.background, BACKGROUND.name)?,
             dielectric: compiled(&self.dielectric, DIELECTRIC.name)?,
             update: compiled(&self.update, UPDATE.name)?,
             support: compiled(&self.support, SUPPORT)?,
@@ -1024,6 +1035,7 @@ impl CompilingKernels {
 /// The per-view lighting kernels of one device.
 pub struct LightingKernels {
     opaque: PathPipeline,
+    background: PathPipeline,
     dielectric: PathPipeline,
     update: PathPipeline,
     support: SupportKernels,
@@ -1042,6 +1054,7 @@ impl LightingKernels {
         let rays = runs_rays(device, entry);
         Ok(Self {
             opaque: (OPAQUE.compile)(device, kernels, rays)?,
+            background: (BACKGROUND.compile)(device, kernels, rays)?,
             dielectric: (DIELECTRIC.compile)(device, kernels, rays)?,
             update: (UPDATE.compile)(device, kernels, rays)?,
             support: SupportKernels::new(device, kernels)?,
@@ -1066,6 +1079,7 @@ impl LightingKernels {
         };
         CompilingKernels {
             opaque: path(OPAQUE),
+            background: path(BACKGROUND),
             dielectric: path(DIELECTRIC),
             update: path(UPDATE),
             support: compile_job(device, loading, move |d| SupportKernels::new(d, kernels)),
@@ -1124,7 +1138,7 @@ impl LightingKernels {
     /// orders nothing after it. The scene's first view in a frame traces one update path per
     /// `update_block`^2 pixels, its later views one per four times as many. The reference
     /// traces none, never reads the cache, builds no local samplers and adds nothing to the
-    /// scene's light feedback. With [`ViewPass::dof_background`] the dispatch also writes the
+    /// scene's light feedback. With [`ViewPass::dof_background`] a dispatch of its own writes the
     /// view's background layer, made at the first such call; without it the layer is freed.
     /// [`ViewPass::overlay_front`] clears the view's front layer the same way.
     pub fn record_opaque(
@@ -1308,6 +1322,11 @@ impl LightingKernels {
         list.begin_pass("opaque paths", false);
         self.opaque.record(list, &path_root, view.extent);
         list.end_pass();
+        if pass.dof_background.is_some() {
+            list.begin_pass("background paths", false);
+            self.background.record(list, &path_root, view.extent);
+            list.end_pass();
+        }
         Ok(())
     }
 

@@ -250,6 +250,7 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
             "media/apply",
             "media/froxel",
             "media/particle_draw",
+            "path/background",
             "path/opaque",
             "world_cache/update"
         ]
@@ -262,7 +263,7 @@ fn renderer_accepts_a_set_built_against_its_kernels() {
         },
     )
     .unwrap_or_else(|e| panic!("{e}"));
-    // Compiles the path tracing pipelines from the linked `path/opaque` and
+    // Compiles the path tracing pipelines from the linked `path/opaque`, `path/background` and
     // `world_cache/update`.
     r.create_view_history().unwrap();
     r.wait_paths().unwrap();

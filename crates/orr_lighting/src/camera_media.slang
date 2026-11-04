@@ -46,7 +46,7 @@ public struct MediaApplyRoot
     public ParticleLighting* lighting;          // this frame's: lights the proxies' steps
     public LayerGuide* layers;                  // the dielectric dispatch's layer memory, null for none
     public StorageImageIndex radiance;          // the view's, RGBA16F
-    public StorageImageIndex dof_background;    // the opaque dispatch's background layer, NONE for none
+    public StorageImageIndex dof_background;    // the background dispatch's layer, NONE for none
     public uint mode;                           // MEDIA_*
     public uint reference;                      // 1: marches the camera segment
     public uint segment_steps;                  // steps of that march and of the march past `ap_range`; most steps per stretch of proxies

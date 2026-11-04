@@ -1223,8 +1223,6 @@ public void opaque_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
     r.feedback.get<RWTexture2D<uint2>>()[pixel] = uint2(feedback, asuint(surface ? x1.camera_distance : 0.0));
     if ((r.light_flags & LIGHT_FEEDBACK_COUNT) != 0 && feedback != NO_LIGHT)
         count_feedback(set, feedback);
-    if (r.dof_background.index != IMAGE_NONE)
-        r.dof_background.get<RWTexture2D<float4>>()[pixel] = background_texel<C, S, E, M>(r, pixel);
 }
 
 // The background layer's texel of `pixel`: on a marked pixel, the pre-exposed radiance of
@@ -1256,6 +1254,12 @@ float4 background_texel<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
     ViewPath record = ViewPath(pcg3d(uint3(pixel, r.frame ^ r.seed ^ DOF_STREAM)).x);
     float3 radiance = vertex_emission(x1) + trace_path<C, S, M>(b, x1, pixel, rng, rays, record);
     return float4(apply_hdr_ceiling(pre_exposure * radiance), near / depth);
+}
+
+// The background dispatch's body for `pixel`: writes its texel of the background layer.
+public void background_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMedium>(PathRoot r, uint2 pixel)
+{
+    r.dof_background.get<RWTexture2D<float4>>()[pixel] = background_texel<C, S, E, M>(r, pixel);
 }
 
 // The update path of `block`, a square of `PathRoot.update_block` pixels: one pixel of it,
