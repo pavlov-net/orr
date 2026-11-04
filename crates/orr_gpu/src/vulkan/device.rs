@@ -121,6 +121,11 @@ pub(crate) struct Shared {
     /// Distinct queue families of the created queues; buffers and images share across them.
     pub(super) families: Vec<u32>,
     pub(super) timelines: [Option<Timeline>; MAX_TIMELINES],
+    /// The semaphores of [`HostTimeline`]s, whose points' timelines count on from
+    /// `MAX_TIMELINES`. Destroyed with the device.
+    ///
+    /// [`HostTimeline`]: super::HostTimeline
+    pub(super) host_timelines: Mutex<Vec<vk::Semaphore>>,
     heaps: OnceLock<Heaps>,
     /// Raygen shader-table records; with `Caps::ray_dispatch` only.
     pub(super) records: OnceLock<RecordBlock>,
@@ -216,6 +221,9 @@ impl Drop for Shared {
             }
             for t in self.timelines.iter().flatten() {
                 self.device.destroy_semaphore(t.semaphore, None);
+            }
+            for &s in self.host_timelines.get_mut().unwrap().iter() {
+                self.device.destroy_semaphore(s, None);
             }
             self.pipeline_cache.destroy(&self.device);
             ManuallyDrop::drop(&mut self.pools);
@@ -713,6 +721,7 @@ impl Device {
             pools: ManuallyDrop::new(pools),
             families: family_list,
             timelines,
+            host_timelines: Mutex::default(),
             heaps: OnceLock::new(),
             records: OnceLock::new(),
             empty_tlas: OnceLock::new(),

@@ -41,7 +41,8 @@ bitflags::bitflags! {
     }
 }
 
-/// A value on one queue's timeline. A submit returns the point its work signals when done.
+/// A value on one queue's timeline, or on a host timeline the CPU signals. A submit returns
+/// the point its work signals when done.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TimelinePoint {
     pub(crate) timeline: u32,
