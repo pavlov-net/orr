@@ -22,7 +22,7 @@ orr_cook = { workspace = true, features = ["subd"] }
 orr_pack.workspace = true
 png.workspace = true
 
-[target.'cfg(windows)'.dev-dependencies]
+[target.'cfg(any(windows, target_vendor = "apple"))'.dev-dependencies]
 gpu_suite.workspace = true
 log.workspace = true
 

@@ -177,7 +177,8 @@ impl<'q> CommandList<'q> {
             table,
             encoder: Encoder::None,
             pass: None,
-            pending: None,
+            // Sparse mapping updates queued before the list come first.
+            pending: Some((MTLStages::ResourceState, MTLStages::All)),
             inline: Vec::new(),
             inline_used: INLINE_BLOCK,
             keep: Vec::new(),

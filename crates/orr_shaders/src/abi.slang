@@ -53,7 +53,7 @@ public struct SamplerIndex
         __target_switch
         {
         case metal:
-            return metal_resource<SamplerState>(metal_samplers[index].id);
+            return metal_sampler(metal_samplers, index);
         default:
             return getDescriptorFromHandle(DescriptorHandle<SamplerState>(uint2(index, 0)));
         }
@@ -108,6 +108,13 @@ T metal_resource<T>(uint64_t id)
 {
     __requirePrelude(R"(template<typename T> T orr_resource_from_id(ulong id) { return *reinterpret_cast<thread T*>(&id); })");
     __intrinsic_asm "orr_resource_from_id<$TR>($0)";
+}
+
+// Entry `index` of the sampler table, read in place as a sampler: one made from its resource
+// ID in thread memory ignores its mip filter.
+SamplerState metal_sampler(StructuredBuffer<MetalSampler> table, uint index)
+{
+    __intrinsic_asm "(((device sampler*)($0))[$1])";
 }
 
 // Record `index` of the records `stride` bytes apart at `list`, as 32-bit words.

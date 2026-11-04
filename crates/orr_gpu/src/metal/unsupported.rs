@@ -14,7 +14,6 @@ use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 use super::command::CommandList;
 use super::device::Device;
-use super::memory::Allocation;
 use super::mesh::MeshPipelineDesc;
 use super::not_implemented;
 use super::pipeline::ShaderStage;
@@ -384,98 +383,6 @@ impl CommandList<'_> {
     pub fn rtas_execute(&mut self, d: &RtasOpDesc, io: &RtasIo) {
         let _ = (d, io);
         not_implemented("cluster acceleration structures")
-    }
-}
-
-/// A sparse device address range; not on Metal yet.
-pub struct SparseAllocation<T: 'static> {
-    pub gpu: GpuPtr<T>,
-    pub size: u64,
-    pub page_size: u64,
-    never: Infallible,
-}
-
-impl<T> SparseAllocation<T> {
-    pub fn pages(&self) -> u64 {
-        match self.never {}
-    }
-}
-
-/// `count` pages from `first_page` take `memory`; `None` unbinds them.
-#[derive(Clone, Copy)]
-pub struct PageBind<'a> {
-    pub first_page: u64,
-    pub count: u64,
-    pub memory: Option<(&'a Allocation<u8>, u64)>,
-}
-
-/// Tile `tile` of `mip` in `layer` of a sparse texture takes `memory`; `None` unbinds it.
-#[derive(Clone, Copy)]
-pub struct TileBind<'a> {
-    pub mip: u32,
-    pub layer: u32,
-    pub tile: [u32; 2],
-    pub memory: Option<(&'a Allocation<u8>, u64)>,
-}
-
-/// Binds collected for one [`Device::bind_sparse`] call.
-#[derive(Default)]
-pub struct SparseBinds<'a> {
-    _resources: std::marker::PhantomData<&'a ()>,
-}
-
-impl<'a> SparseBinds<'a> {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn pages<T>(
-        &mut self,
-        a: &'a SparseAllocation<T>,
-        runs: &[PageBind<'_>],
-    ) -> Result<&mut Self, Error> {
-        let _ = runs;
-        match a.never {}
-    }
-
-    pub fn tiles(&mut self, t: &'a Texture, tiles: &[TileBind<'_>]) -> Result<&mut Self, Error> {
-        let _ = (t, tiles);
-        Err(Error::NotImplemented("sparse textures"))
-    }
-
-    pub fn tail(
-        &mut self,
-        t: &'a Texture,
-        layer: u32,
-        memory: Option<(&Allocation<u8>, u64)>,
-    ) -> Result<&mut Self, Error> {
-        let _ = (t, layer, memory);
-        Err(Error::NotImplemented("sparse textures"))
-    }
-}
-
-impl Device {
-    pub fn gpu_malloc_sparse<T>(
-        &self,
-        max_count: u64,
-        name: &str,
-    ) -> Result<SparseAllocation<T>, Error> {
-        let _ = (max_count, name);
-        Err(Error::NotImplemented("sparse allocations"))
-    }
-
-    pub fn bind_sparse(&self, binds: &SparseBinds<'_>) -> Result<TimelinePoint, Error> {
-        let _ = binds;
-        Err(Error::NotImplemented("sparse binds"))
-    }
-
-    pub fn bind_sparse_pages<T>(
-        &self,
-        a: &SparseAllocation<T>,
-        runs: &[PageBind<'_>],
-    ) -> Result<TimelinePoint, Error> {
-        let _ = runs;
-        match a.never {}
     }
 }
 
