@@ -7,7 +7,7 @@ use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, HANDLE, WAIT_FAILED,
+    CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, HANDLE, WAIT_FAILED, WIN32_ERROR,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, HIORING,
@@ -61,32 +61,29 @@ pub(crate) fn read_overlapped(file: &File, offset: u64, buf: &mut [u8]) -> io::R
     if let Err(e) = started
         && e.code() != ERROR_IO_PENDING.to_hresult()
     {
-        return read_error(&e);
+        return read_error(e);
     }
     let mut n = 0;
     // SAFETY: the read above uses this handle and `overlapped`.
     match unsafe { GetOverlappedResult(handle, &overlapped, &mut n, true) } {
         Ok(()) => Ok(n as usize),
-        Err(e) => read_error(&e),
+        Err(e) => read_error(e),
     }
 }
 
-fn read_error(e: &windows::core::Error) -> io::Result<usize> {
+fn read_error(e: windows::core::Error) -> io::Result<usize> {
     if e.code() == ERROR_HANDLE_EOF.to_hresult() {
         Ok(0)
     } else {
-        Err(os_error(e.code()))
+        Err(os_error(e))
     }
 }
 
-/// The OS error for a failed `h`, whose kind callers can test when it came from a Win32 code.
-fn os_error(h: HRESULT) -> io::Error {
-    const FACILITY_WIN32: u32 = 0x8007_0000;
-    let code = h.0 as u32;
-    if code & 0xffff_0000 == FACILITY_WIN32 {
-        io::Error::from_raw_os_error((code & 0xffff) as i32)
-    } else {
-        io::Error::other(format!("HRESULT {code:#x}"))
+/// The OS error for `e`, whose kind callers can test when it came from a Win32 code.
+fn os_error(e: windows::core::Error) -> io::Error {
+    match WIN32_ERROR::from_error(&e) {
+        Some(code) => io::Error::from_raw_os_error(code.0 as i32),
+        None => io::Error::other(e),
     }
 }
 
@@ -107,7 +104,7 @@ impl Event {
     fn manual() -> io::Result<Self> {
         // SAFETY: plain event creation.
         let event = unsafe { CreateEventW(None, true, false, None) };
-        event.map(Self).map_err(|e| os_error(e.code()))
+        event.map(Self).map_err(os_error)
     }
 
     pub(crate) fn set(&self) {
@@ -176,14 +173,6 @@ pub(crate) struct IoRing {
 
 // SAFETY: the ring is used only by the thread that owns it.
 unsafe impl Send for IoRing {}
-
-fn hr(what: &str, h: HRESULT) -> io::Result<()> {
-    if h.is_err() {
-        Err(io::Error::other(format!("{what}: HRESULT {:#x}", h.0)))
-    } else {
-        Ok(())
-    }
-}
 
 impl IoRing {
     pub(crate) fn new() -> Option<Self> {
@@ -279,8 +268,8 @@ impl IoRing {
                     IOSQE_FLAGS_NONE,
                 )
             };
-            if let Err(e) = hr("BuildIoRingReadFile", h) {
-                (read.done)(Err(e));
+            if h.is_err() {
+                (read.done)(Err(os_error(h.into())));
                 continue;
             }
             self.slots[slot] = Some(InFlight { read, buf });
@@ -293,7 +282,7 @@ impl IoRing {
             // Entries a failed submit leaves in the queue go with the next one; setting the
             // event makes the next wait return so that it happens. Reads already in the kernel
             // keep their slots and buffers until they complete.
-            if hr("SubmitIoRing", h).is_err() {
+            if h.is_err() {
                 self.event.set();
             }
         }
@@ -307,7 +296,7 @@ impl IoRing {
             let result = if cqe.ResultCode == ERROR_HANDLE_EOF.to_hresult() {
                 Ok((f.buf, 0))
             } else if cqe.ResultCode.is_err() {
-                Err(os_error(cqe.ResultCode))
+                Err(os_error(cqe.ResultCode.into()))
             } else {
                 Ok((f.buf, cqe.Information.min(f.read.len)))
             };
