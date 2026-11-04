@@ -45,8 +45,8 @@ use orr::orr_output::orr_dlss::raw::Ngx;
 use orr::orr_output::orr_dlss::{Quality, SrInputs, SuperResolution};
 use orr::{
     CompilingKernels, Display, DisplayRequest, DlssSdk, FrameDesc, FrameGenerationMode, FrameTime,
-    Lens, LitView, Projection, Reconstruction, Renderer, RendererDesc, TextureFilter, ViewDesc,
-    ViewHooks, ViewLighting, ViewOutput, ViewTarget,
+    Lens, LitView, Projection, Reconstruction, Renderer, RendererDesc, TextureFilter,
+    UpscaleQuality, ViewDesc, ViewHooks, ViewLighting, ViewOutput, ViewTarget,
 };
 use orr_math::camera::rh::view;
 use orr_math::{UVec2, Vec2, Vec3};
@@ -58,7 +58,7 @@ const CYCLE_STEP: f64 = 4.0;
 /// The dot's speed in points per second.
 const CURSOR_SPEED: f64 = 400.0;
 
-fn main() {
+pub(crate) fn main() {
     let options = Options::from_args();
     if options.has("--sr") {
         let run = run_sr(&options);
@@ -79,12 +79,12 @@ fn main() {
 /// What `R` steps through.
 const RECONSTRUCTIONS: [Reconstruction; 7] = [
     Reconstruction::Off,
-    Reconstruction::Quality(Quality::Auto),
-    Reconstruction::Quality(Quality::Dlaa),
-    Reconstruction::Quality(Quality::Quality),
-    Reconstruction::Quality(Quality::Balanced),
-    Reconstruction::Quality(Quality::Performance),
-    Reconstruction::Quality(Quality::UltraPerformance),
+    Reconstruction::Upscale(UpscaleQuality::Auto),
+    Reconstruction::Upscale(UpscaleQuality::Dlaa),
+    Reconstruction::Upscale(UpscaleQuality::Quality),
+    Reconstruction::Upscale(UpscaleQuality::Balanced),
+    Reconstruction::Upscale(UpscaleQuality::Performance),
+    Reconstruction::Upscale(UpscaleQuality::UltraPerformance),
 ];
 
 /// The entry after `current` in `list`, wrapping; the first if `current` is not in it.
@@ -138,7 +138,7 @@ fn run(options: &Options) {
         .inspect_err(|e| log::warn!("no DLSS: {e}"))
         .ok();
     let support = sdk.as_ref().map(DlssSdk::support).unwrap_or_default();
-    let recommended = FrameGenerationMode::recommended(&support);
+    let recommended = FrameGenerationMode::recommended(support.max_generated);
     let most = support.max_generated.clamp(1, 3);
     let chosen = if options.has("--off") {
         FrameGenerationMode::Off
@@ -162,7 +162,7 @@ fn run(options: &Options) {
     let mut cycling = options.has("--cycle");
     let set_mode = |display: &mut Display, mode| {
         if let Some(sdk) = &sdk
-            && let Err(e) = display.set_frame_generation(sdk, mode)
+            && let Err(e) = display.set_frame_generation(sdk.clone(), mode)
         {
             log::warn!("frame generation {mode:?}: {e}");
         }
@@ -174,7 +174,7 @@ fn run(options: &Options) {
 
     let mut renderer = Renderer::new(gpu, desc).expect("renderer");
     if let Some(sdk) = &sdk {
-        renderer.set_dlss(sdk.clone());
+        renderer.set_reconstruction(sdk.clone());
     }
     let _workers = Workers::new(renderer.loading(), 2 + CompilingKernels::JOBS);
     let mut showcase = Showcase::load(&mut renderer, gpu);
@@ -303,7 +303,7 @@ fn run(options: &Options) {
         reconstructed = f
             .render_view(&view, &ViewLighting::default(), &output, &mut hooks)
             .expect("render view")
-            .reconstruction;
+            .upscale_mode;
         last = Some(f.end().expect("end frame"));
     }
 

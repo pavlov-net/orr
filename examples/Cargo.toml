@@ -8,6 +8,9 @@ license.workspace = true
 publish = false
 
 [features]
+default = ["dlss"]
+# orr's `dlss`. Without it the dlss example only says so, and the others run without DLSS.
+dlss = ["orr/dlss"]
 # orr's `pcl-stats`: hdr-calibration reports PC latency to the NVIDIA overlay and FrameView.
 pcl-stats = ["orr/pcl-stats"]
 
@@ -54,7 +57,7 @@ path = "hdr-calibration.rs"
 
 [[example]]
 name = "dlss"
-path = "dlss.rs"
+path = "dlss-main.rs"
 
 [[example]]
 name = "rigid-parts"

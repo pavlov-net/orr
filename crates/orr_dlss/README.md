@@ -13,7 +13,8 @@ with bindgen, so it needs clang and the Vulkan SDK headers (`VULKAN_SDK`).
 | --- | --- |
 | 0.0.1 | v310.9.16 |
 
-Without `DLSS_SDK` the crate builds without NGX and reports DLSS unavailable at run time.
+Without `DLSS_SDK` the crate builds without NGX and reports DLSS unavailable at run time. For
+targets where orr_gpu has no Vulkan backend the crate is empty.
 Features:
 
 - `mock`: no SDK needed. Every feature reports unsupported, and ray reconstruction and super

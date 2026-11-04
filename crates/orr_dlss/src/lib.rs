@@ -15,6 +15,10 @@
 //! an orr_gpu device and record into its command lists, serializing every NGX call. [`raw`]
 //! holds the NGX instance and ray reconstruction on ash handles; its caller keeps NGX calls on
 //! one thread at a time.
+//!
+//! The crate is empty for targets where orr_gpu has no Vulkan backend.
+
+#![cfg(vulkan)]
 
 mod error;
 mod jitter;

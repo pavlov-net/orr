@@ -13,6 +13,7 @@ mod dense_vegetation;
 #[path = "../dielectrics.rs"]
 mod dielectrics;
 #[allow(dead_code)]
+#[cfg(dlss)]
 #[path = "../dlss.rs"]
 mod dlss;
 #[allow(dead_code)]
@@ -50,12 +51,12 @@ use orr::orr_gpu::{QueueKind, Texture, TextureDesc, TextureMemory, TextureUsage,
 use orr::orr_pack::material::Material;
 use orr::orr_pack::{AssetId, Target};
 use orr::{
-    DlssMode, DlssQuality, Exposure, FrameDesc, Glare, GroupWriter, HookPass, InstanceFlags,
-    InstancesDesc, Lens, LensDistortion, LightingDebugView, LitView, OutputDebug, PackSource,
-    PathEntry, Projection, Reconstruction, ReferenceSettings, Renderer, RendererDesc, SceneDesc,
-    SceneId, Screenshot, ScreenshotRequest, TextureFilter, ThinLens, TransformGroupDesc,
-    TransformGroupId, TransparencyPass, ViewHistoryId, ViewHooks, ViewLighting, ViewOutput,
-    ViewTarget,
+    Exposure, FrameDesc, Glare, GroupWriter, HookPass, InstanceFlags, InstancesDesc, Lens,
+    LensDistortion, LightingDebugView, LitView, OutputDebug, PackSource, PathEntry, Projection,
+    Reconstruction, ReferenceSettings, Renderer, RendererDesc, SceneDesc, SceneId, Screenshot,
+    ScreenshotRequest, TextureFilter, ThinLens, TransformGroupDesc, TransformGroupId,
+    TransparencyPass, UpscaleMode, UpscaleQuality, ViewHistoryId, ViewHooks, ViewLighting,
+    ViewOutput, ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source};
 use orr_math::camera::rh::view;
@@ -181,6 +182,7 @@ fn dense_vegetation_matches_its_reference() {
 /// The dlss example's raster debug view upscaled by super resolution at Quality, on an
 /// orbiting camera, matches the view rendered at the output size, and NGX's log names the
 /// preset it applied.
+#[cfg(dlss)]
 #[test]
 fn super_resolution_matches_the_native_render() {
     let _serial = serial();
@@ -243,7 +245,7 @@ const ORBIT_STEP: f64 = 0.01;
 struct StillRun {
     capture: Capture,
     render_extent: [u32; 2],
-    mode: Option<DlssMode>,
+    mode: Option<UpscaleMode>,
 }
 
 /// How [`StillShowcase::run`] renders.
@@ -410,7 +412,7 @@ impl StillShowcase {
                 .render_view(&view, &lighting, &output, &mut hooks)
                 .expect("render view");
             render_extent = rendered.render_extent;
-            mode = rendered.reconstruction;
+            mode = rendered.upscale_mode;
             last = Some((id, f.end().expect("end frame")));
         }
         let shot = last_screenshot(&mut self.renderer, self.history, last);
@@ -579,7 +581,7 @@ fn scene_detail_follows_the_render_size_of_its_sharpest_view() {
     assert_eq!(still.detail(&both, true), native);
     assert_eq!(still.detail(&both, false), native);
     if enable_dlss(&mut still.renderer) {
-        let upscaled = [([960, 540], Reconstruction::Quality(DlssQuality::Quality))];
+        let upscaled = [([960, 540], Reconstruction::Upscale(UpscaleQuality::Quality))];
         assert_eq!(still.detail(&upscaled, false), native);
         assert_eq!(still.detail(&upscaled, true), native);
     } else {
@@ -616,31 +618,32 @@ fn render_view_runs_ray_reconstruction() {
             hd,
             Reconstruction::default(),
             [1280, 720],
-            Some(DlssMode::Quality),
+            Some(UpscaleMode::Quality),
         ),
         (
             [1280, 720],
             Reconstruction::default(),
             [853, 480],
-            Some(DlssMode::Quality),
+            Some(UpscaleMode::Quality),
         ),
         (
             [64, 32],
             Reconstruction::default(),
             [43, 21],
-            Some(DlssMode::Quality),
+            Some(UpscaleMode::Quality),
         ),
+        #[cfg(dlss)]
         (
             hd,
-            Reconstruction::Quality(DlssQuality::Dlaa),
+            Reconstruction::Upscale(UpscaleQuality::Dlaa),
             hd,
-            Some(DlssMode::Dlaa),
+            Some(UpscaleMode::Dlaa),
         ),
         (
             hd,
             Reconstruction::RenderExtent([1100, 619]),
             [1100, 619],
-            Some(DlssMode::Balanced),
+            Some(UpscaleMode::Balanced),
         ),
         (hd, Reconstruction::Off, hd, None),
     ] {
@@ -668,7 +671,7 @@ fn render_view_runs_ray_reconstruction() {
     let error = |run: &StillRun| flip(&truth, &image(run.capture.clone()));
     let noisy = error(&still.run(extent, 8, off));
     let half = StillSettings {
-        reconstruction: Reconstruction::Quality(DlssQuality::Performance),
+        reconstruction: Reconstruction::Upscale(UpscaleQuality::Performance),
         ..off
     };
     let denoised = still.run(extent, 48, half);
@@ -1069,7 +1072,7 @@ fn check_blur_under_ray_reconstruction(lamp: &mut Lamp, moving: LampSettings) {
     let extent = [640, 360];
     let frames = 16;
     let moving = LampSettings {
-        reconstruction: Reconstruction::Quality(DlssQuality::Performance),
+        reconstruction: Reconstruction::Upscale(UpscaleQuality::Performance),
         ..moving
     };
     let sharp = lamp.run(extent, frames, moving.closed());

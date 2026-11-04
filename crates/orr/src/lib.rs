@@ -12,7 +12,7 @@
 //!    first [`Frame::render_view`] runs it when the consumer did not.
 //! 4. [`Frame::render_view`] once per view records its raster half,
 //! 5. then the view's lighting and output: the scene's lighting pass before its first view,
-//!    one path per pixel, DLSS ray reconstruction, the hooks, exposure, motion blur, glare,
+//!    one path per pixel, ray reconstruction, the hooks, exposure, motion blur, glare,
 //!    tonemap, the UI and compose. A consumer may
 //!    instead shade the G-buffer [`Frame::raster_view`] returns with its own kernels in
 //!    [`Frame::list`] and show the result with [`Frame::compose`].
@@ -47,11 +47,16 @@ pub use orr_output::DisplayWatch;
 pub use orr_output::{self, Error as OutputError};
 pub use orr_output::{
     AutoExposure, AutoWhiteBalance, CalibrationPattern, CompensationCurve, Display, DisplayFeed,
-    DisplayInfo, DisplayRequest, DlssMode, DlssQuality, DlssSdk, DlssSupport, Exposure,
-    ExposureTelemetry, FrameGenerationMode, GlareMethod, Grade, Gt7Params, HookPass, LocalExposure,
-    MeterWeights, OutputDebug, Physiological, PostQuality, Presented, Primaries, Reconstruction,
-    ResolvedDisplay, Screenshot, ScreenshotRequest, SkyTelemetry, UiPass, ViewOutput,
+    DisplayInfo, DisplayRequest, Exposure, ExposureTelemetry, FrameGenerationBackend,
+    FrameGenerationCamera, FrameGenerationFeature, FrameGenerationInputs, FrameGenerationMode,
+    GlareMethod, Grade, Gt7Params, HookPass, InterpolationCheck, LocalExposure, MeterWeights,
+    OutputDebug, Physiological, PostQuality, Presented, Primaries, Reconstruction,
+    ReconstructionBackend, ReconstructionFeature, ReconstructionInputs, ReconstructionSupport,
+    ResolvedDisplay, Screenshot, ScreenshotRequest, SkyTelemetry, UiPass, UpscaleMode,
+    UpscaleQuality, ViewOutput,
 };
+#[cfg(dlss)]
+pub use orr_output::{DlssSdk, DlssSupport};
 pub use orr_scene::Error as SceneError;
 pub use orr_scene::{self, RasterView};
 pub use orr_scene::{
@@ -75,7 +80,6 @@ use orr_gpu::{
 };
 use orr_lighting::{BsdfTables, LightingKernels, LightingView, SceneLighting, ScenePass, ViewPass};
 use orr_math::{DVec3, Quat, UVec2, Vec2};
-use orr_output::orr_dlss::{MIN_OUTPUT as DLSS_MIN_OUTPUT, RayReconstruction, RrInputs};
 use orr_output::{
     CapturePass, ChainImages, ComposePass, ComposeRoot, ComposeSource, DisplayFrame, ExposurePass,
     GlarePass, HookInputsPass, HookPoint, Hooks, Image, MotionBlurPass, OutputKernels, OutputView,
@@ -237,8 +241,10 @@ pub struct RenderedView {
     pub raster: RasterView,
     /// The extent the view rendered at.
     pub render_extent: [u32; 2],
-    /// The mode ray reconstruction ran in; `None` when it did not run.
-    pub reconstruction: Option<DlssMode>,
+    /// Ray reconstruction ran.
+    pub reconstructed: bool,
+    /// The named mode it ran in, from a backend that has them.
+    pub upscale_mode: Option<UpscaleMode>,
     /// RGBA16F linear Rec.2020 pre-exposed radiance at the output extent, as ray
     /// reconstruction, or lighting without it, `hooks.scene_referred` and motion blur left it.
     /// With a `display_linear` hook it holds that hook's source instead.
@@ -365,7 +371,7 @@ struct ViewState {
 
 /// A view's ray reconstruction feature and what it was made for.
 struct ViewReconstruction {
-    feature: RayReconstruction,
+    feature: Box<dyn ReconstructionFeature>,
     request: Reconstruction,
     /// No render has used it yet, so it has no history.
     fresh: bool,
@@ -397,10 +403,10 @@ impl ViewState {
     }
 
     /// Makes the view's feature match `request` at the output extent `output`, with no feature
-    /// without `sdk` or for [`Reconstruction::Off`].
+    /// without `backend` or for [`Reconstruction::Off`].
     fn sync_reconstruction(
         &mut self,
-        sdk: Option<&DlssSdk>,
+        backend: Option<&dyn ReconstructionBackend>,
         output: [u32; 2],
         request: Reconstruction,
     ) -> Result<()> {
@@ -408,16 +414,16 @@ impl ViewState {
             .reconstruction
             .as_ref()
             .is_some_and(|r| r.request == request && r.feature.output_size() == output);
-        if current && sdk.is_some() {
+        if current && backend.is_some() {
             return Ok(());
         }
         self.reconstruction = None;
-        let Some(sdk) = sdk else {
+        let Some(backend) = backend else {
             return Ok(());
         };
         let feature = match request {
             Reconstruction::Off => return Ok(()),
-            Reconstruction::Quality(quality) => RayReconstruction::new(sdk, output, quality, None),
+            Reconstruction::Upscale(quality) => backend.feature(output, quality),
             Reconstruction::RenderExtent(render) => {
                 let wide = u64::from(render[0]) * u64::from(output[1]);
                 let tall = u64::from(render[1]) * u64::from(output[0]);
@@ -425,11 +431,11 @@ impl ViewState {
                 if wide.abs_diff(tall) > u64::from(output[0].max(output[1])) {
                     return Err(Error::RenderAspect { render, output });
                 }
-                RayReconstruction::with_render_size(sdk, render, output, None)
+                backend.feature_at(render, output)
             }
         };
         self.reconstruction = Some(ViewReconstruction {
-            feature: feature.map_err(OutputError::from)?,
+            feature: feature?,
             request,
             fresh: true,
         });
@@ -449,8 +455,8 @@ struct Output {
     compose: Vec<ComposeRoot>,
     /// The display-linear image [`Frame::pattern`] draws into, at the display's extent.
     linear: Option<Image>,
-    /// NGX, while it offers ray reconstruction.
-    dlss: Option<DlssSdk>,
+    /// What makes ray reconstruction features, while it offers them, and what it offers.
+    reconstruction: Option<(Box<dyn ReconstructionBackend>, ReconstructionSupport)>,
     views: HashMap<ViewHistoryId, ViewState>,
 }
 
@@ -489,7 +495,7 @@ impl Output {
             roots: OutputView::new(gpu, frames_in_flight)?,
             compose: compose_roots(gpu, frames_in_flight)?,
             linear: None,
-            dlss: None,
+            reconstruction: None,
             views: HashMap::new(),
         })
     }
@@ -590,11 +596,23 @@ impl Renderer {
         self.scenes.device()
     }
 
-    /// Gives lit views DLSS ray reconstruction, when NGX offers it on the device; returns
-    /// whether it does. `sdk` must be on this renderer's device.
-    pub fn set_dlss(&mut self, sdk: DlssSdk) -> bool {
-        self.output.dlss = sdk.support().rr.then_some(sdk);
-        self.output.dlss.is_some()
+    /// Gives lit views ray reconstruction, when `backend` offers it on the device; returns
+    /// whether it does. `backend` must be on this renderer's device. Views drop their features
+    /// and history, and make new features on `backend` at their next render.
+    pub fn set_reconstruction(&mut self, backend: impl ReconstructionBackend + 'static) -> bool {
+        for view in self.output.views.values_mut() {
+            view.reconstruction = None;
+        }
+        let support = backend.support();
+        self.output.reconstruction = support
+            .available
+            .then(|| (Box::new(backend) as Box<dyn ReconstructionBackend>, support));
+        self.output.reconstruction.is_some()
+    }
+
+    /// What the renderer's ray reconstruction backend offers; `None` without one.
+    pub fn reconstruction_support(&self) -> Option<ReconstructionSupport> {
+        self.output.reconstruction.as_ref().map(|(_, s)| *s)
     }
 
     /// A scene's tables and the lighting state every view of the scene shares.
@@ -1008,10 +1026,10 @@ impl<'a> Frame<'a> {
     }
 
     /// Step 2: works out the render extent [`Frame::render_view`] gives `view` with these
-    /// settings, remaking the view's NGX feature as that call would, and asks the view's scene
-    /// to choose geometry for it at this frame's [`Frame::update_scenes`]. A scene takes the
-    /// sharpest of its views. Only a view whose render comes after the update needs this;
-    /// without it the view counts from the next frame on.
+    /// settings, remaking the view's ray reconstruction feature as that call would, and asks the
+    /// view's scene to choose geometry for it at this frame's [`Frame::update_scenes`]. A scene
+    /// takes the sharpest of its views. Only a view whose render comes after the update needs
+    /// this; without it the view counts from the next frame on.
     pub fn prepare_view(
         &mut self,
         view: &LitView<'_>,
@@ -1036,18 +1054,23 @@ impl<'a> Frame<'a> {
             }
             ViewTarget::Radiance { extent } => extent,
         };
-        let dlss = self.output.dlss.as_ref().filter(|_| {
-            lighting.reference.is_none()
-                && lighting.debug_view == LightingDebugView::None
-                && extent[0] >= DLSS_MIN_OUTPUT[0]
-                && extent[1] >= DLSS_MIN_OUTPUT[1]
-        });
+        let backend = self
+            .output
+            .reconstruction
+            .as_ref()
+            .filter(|(_, support)| {
+                lighting.reference.is_none()
+                    && lighting.debug_view == LightingDebugView::None
+                    && extent[0] >= support.min_output[0]
+                    && extent[1] >= support.min_output[1]
+            })
+            .map(|(backend, _)| &**backend);
         let state = self
             .output
             .views
             .get_mut(&view.history)
             .ok_or(SceneError::UnknownViewHistory(view.history))?;
-        state.sync_reconstruction(dlss, extent, output.reconstruction)?;
+        state.sync_reconstruction(backend, extent, output.reconstruction)?;
         let render = state
             .reconstruction
             .as_ref()
@@ -1067,7 +1090,7 @@ impl<'a> Frame<'a> {
     /// first view this frame; the view's froxel volume; one path per pixel into the view's
     /// radiance, then the dielectric dispatch over it, which traces each pixel's first
     /// dielectric or presence layer; media apply over each pixel's camera segment; the
-    /// transparency hook; DLSS ray reconstruction; `hooks.scene_referred`; a scene-referred
+    /// transparency hook; ray reconstruction; `hooks.scene_referred`; a scene-referred
     /// screenshot; metering and adaptation; then, unless the view stops there, motion blur, the
     /// lens's glare, tonemap, `hooks.display_linear`, `hooks.ui`, compose and a display
     /// screenshot.
@@ -1085,10 +1108,11 @@ impl<'a> Frame<'a> {
     ///
     /// The target decides the output extent. `output.reconstruction` and the output extent
     /// decide the render extent, the jitter and the texture level-of-detail bias while the
-    /// renderer has ray reconstruction ([`Renderer::set_dlss`]); otherwise the view renders at
-    /// the output extent. A new output extent or request remakes the view's NGX feature, which
-    /// waits for its setup on this thread. The jitter follows the view's renders, so a view not
-    /// rendered every frame still covers its pixels. A feature NGX refuses is an error.
+    /// renderer has ray reconstruction ([`Renderer::set_reconstruction`]); otherwise the view
+    /// renders at the output extent. A new output extent or request remakes the view's feature,
+    /// which waits for its setup on this thread. The jitter follows the view's renders, so a view
+    /// not rendered every frame still covers its pixels. A feature the backend refuses is an
+    /// error.
     ///
     /// While the path tracing kernels compile ([`Frame::paths_ready`] false) only the view's raster
     /// half runs, so streaming goes on while a loading thread is free, and everything after it
@@ -1127,8 +1151,8 @@ impl<'a> Frame<'a> {
             .views
             .get_mut(&view.history)
             .ok_or(SceneError::UnknownViewHistory(view.history))?;
-        let reconstruction = state.reconstruction.as_ref().map(|r| r.feature.mode());
-        let reconstructed = reconstruction.is_some();
+        let reconstructed = state.reconstruction.is_some();
+        let upscale_mode = state.reconstruction.as_ref().and_then(|r| r.feature.mode());
         let mut desc = state.raster_desc(view, extent, render);
         let jitter = desc.jitter.to_array();
         let scene = self
@@ -1239,6 +1263,7 @@ impl<'a> Frame<'a> {
                 motion,
                 weight,
             });
+        let delta = self.scenes.time().delta;
         let (list, arena) = self.scenes.output_list_and_arena(view.history)?;
         let (rr_output, rr_output_store) = match state.reconstruction.as_mut() {
             Some(r) => {
@@ -1248,7 +1273,7 @@ impl<'a> Frame<'a> {
                 list.begin_pass("ray_reconstruction", false);
                 let recorded = r.feature.record(
                     list,
-                    &RrInputs {
+                    &ReconstructionInputs {
                         color: paths.radiance(),
                         color_before_transparency: None,
                         depth: paths.depth(),
@@ -1257,15 +1282,19 @@ impl<'a> Frame<'a> {
                         specular_albedo: paths.specular_albedo(),
                         normal_roughness: paths.normal_roughness(),
                         specular_motion: paths.specular_motion(),
+                        specular_hit_distance: None,
                         transparency: overlay.as_ref().map(|(texture, _)| &**texture),
                         depth_of_field_guide: None,
+                        denoise_strength_mask: None,
+                        reactive_mask: None,
+                        exposure: None,
                         output: target.texture(),
                         reset: std::mem::take(&mut r.fresh) || paths.history_reset(),
-                        jitter,
+                        view: &desc,
                     },
                 );
                 list.end_pass();
-                recorded.map_err(OutputError::from)?;
+                recorded?;
                 list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
                 (target.sampled(), target.storage(0))
             }
@@ -1295,7 +1324,7 @@ impl<'a> Frame<'a> {
             )
         };
         if let Some(frame) = display.as_mut() {
-            frame.frame_generation(&desc, depth, motion, view.not_rendering_scene);
+            frame.frame_generation(&desc, depth, motion, view.not_rendering_scene, delta);
         }
         let distortion = output.lens_distortion(view.lens.distortion.filter(|_| look));
         let field_on = distortion.is_some() || (output.distortion_field && set.any());
@@ -1393,7 +1422,8 @@ impl<'a> Frame<'a> {
             return Ok(RenderedView {
                 raster,
                 render_extent: render,
-                reconstruction,
+                reconstructed,
+                upscale_mode,
                 radiance: chain.rr_output,
                 linear: TextureIndex::NONE,
                 compiling: false,
@@ -1441,7 +1471,8 @@ impl<'a> Frame<'a> {
         Ok(RenderedView {
             raster,
             render_extent: render,
-            reconstruction,
+            reconstructed,
+            upscale_mode,
             radiance: chain.rr_output,
             linear: chain.linear,
             compiling: false,
@@ -1566,7 +1597,8 @@ impl<'a> Frame<'a> {
             compiling: true,
             raster,
             render_extent: render,
-            reconstruction: None,
+            reconstructed: false,
+            upscale_mode: None,
             radiance: chain.rr_output,
             linear: if tonemapped {
                 chain.linear
@@ -1668,8 +1700,9 @@ impl<'a> Frame<'a> {
         motion: &Arc<orr_gpu::Texture>,
         not_rendering_scene: bool,
     ) {
+        let delta = self.scenes.time().delta;
         if let Some(mut frame) = self.display.as_deref_mut().and_then(Display::frame) {
-            frame.frame_generation(view, depth, motion, not_rendering_scene);
+            frame.frame_generation(view, depth, motion, not_rendering_scene, delta);
         }
     }
 

@@ -1,5 +1,5 @@
 //! The `mock` backend: no features supported, and ray reconstruction upscales color.
-#![cfg(feature = "mock")]
+#![cfg(all(vulkan, feature = "mock"))]
 
 mod harness;
 

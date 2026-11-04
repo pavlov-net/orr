@@ -4,6 +4,8 @@
 mod display;
 #[cfg(windows)]
 mod display_watch;
+#[cfg(dlss)]
+mod dlss;
 mod dof;
 mod exposure;
 mod fft_glare;
@@ -19,6 +21,7 @@ mod passes;
 #[cfg(all(windows, feature = "pcl-stats"))]
 mod pcl_stats;
 mod present;
+mod reconstruction;
 mod screenshot;
 mod ui;
 mod view;
@@ -39,7 +42,10 @@ pub use exposure::{
     MeterWeights, Physiological, SkyTelemetry, ev100_from_exposure, ev100_from_luminance,
     exposure_from_ev100, keyed_ev100, luminance_from_ev100,
 };
-pub use frame_generation::FrameGenerationMode;
+pub use frame_generation::{
+    FrameGenerationBackend, FrameGenerationCamera, FrameGenerationFeature, FrameGenerationInputs,
+    FrameGenerationMode, InterpolationCheck,
+};
 pub use glare::{GlareComposite, GlarePass};
 pub use gt7::{GT7_REFERENCE_NITS, Gt7Curve, Gt7Params};
 pub use hooks::{
@@ -47,9 +53,8 @@ pub use hooks::{
 };
 pub use motion_blur::{MOTION_BLUR_MAX_RADIUS, MotionBlurPass};
 pub use orr_color::Primaries;
-pub use orr_dlss::{
-    self, DlssSdk, Mode as DlssMode, Quality as DlssQuality, Support as DlssSupport,
-};
+#[cfg(dlss)]
+pub use orr_dlss::{self, DlssSdk, Support as DlssSupport};
 pub use orr_scene::orr_gpu::{LowLatency, OutputFormat};
 pub use overlay_front::OverlayFront;
 pub use passes::{
@@ -57,9 +62,13 @@ pub use passes::{
     OutputKernels, OutputRoots, OutputView, SceneCapturePass, TonemapPass,
 };
 pub use present::{Display, DisplayFrame, Presented, UI_PASS};
+pub use reconstruction::{
+    Reconstruction, ReconstructionBackend, ReconstructionFeature, ReconstructionInputs,
+    ReconstructionSupport, UpscaleMode, UpscaleQuality,
+};
 pub use screenshot::{Screenshot, ScreenshotRequest};
 pub use ui::{UiLayer, UiPass};
-pub use view::{GlareMethod, OutputDebug, PostQuality, Reconstruction, ViewOutput};
+pub use view::{GlareMethod, OutputDebug, PostQuality, ViewOutput};
 pub use white_balance::{AutoWhiteBalance, WHITE_BALANCE_CCT, WHITE_BALANCE_DUV};
 
 /// Errors from orr_output.
@@ -71,6 +80,7 @@ pub enum Error {
     NotWin32Window,
     #[error("present thread: {0}")]
     Thread(String),
+    #[cfg(dlss)]
     #[error(transparent)]
     Dlss(#[from] orr_dlss::DlssError),
     /// The device or system lacks something frame generation needs.

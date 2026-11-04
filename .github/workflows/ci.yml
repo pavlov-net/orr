@@ -29,6 +29,9 @@ jobs:
       # commit that does not build on its own.
       - name: Check the workspace
         run: cargo check --workspace --all-targets
+      # What Apple targets build: orr without DLSS.
+      - name: Check the workspace without DLSS
+        run: cargo check --workspace --all-targets --no-default-features
       - name: Test file IO
         run: cargo test -p orr_io
 

@@ -9,13 +9,16 @@ repository.workspace = true
 links = "orr_output"
 
 [features]
+default = ["dlss"]
+# Ray reconstruction and frame generation through NVIDIA NGX. On Apple targets, which have no
+# Vulkan, it does nothing.
+dlss = ["dep:orr_dlss"]
 # Sends every Reflex marker as a PCL Stats event too and marks the PC latency ping that
 # `DisplayWatch` receives, for the NVIDIA overlay and FrameView. Windows only; builds
 # pclstats.h from the Reflex SDK at `REFLEX_SDK`.
 pcl-stats = ["dep:cc"]
 
 [dependencies]
-orr_dlss.workspace = true
 orr_math.workspace = true
 orr_color.workspace = true
 orr_scene.workspace = true
@@ -31,6 +34,9 @@ moxcms = "0.8"
 [build-dependencies]
 cc = { workspace = true, optional = true }
 orr_shaders = { workspace = true, features = ["build"] }
+
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+orr_dlss = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.62.2"

@@ -1,7 +1,8 @@
 //! Compiles orr_gpu's own kernels, publishes its shader root, which holds the `rtas` and
 //! `sequence` libraries, and the Rust types of the `rtas` records, sets `cfg(orr_omm)` when the
 //! shaders are built with micromaps, and generates the Nsight Perf SDK bindings that counter
-//! frames use when the SDK is found.
+//! frames use when the SDK is found. Publishes `vulkan` for targets with the Vulkan backend, for
+//! crates built on its interop.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -22,6 +23,9 @@ const RTAS_RECORDS: &[&str] = &[
 ];
 
 fn main() {
+    if env::var("CARGO_CFG_TARGET_VENDOR").as_deref() != Ok("apple") {
+        println!("cargo::metadata=vulkan=1");
+    }
     let src = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("src");
     println!("cargo::rustc-check-cfg=cfg(orr_omm)");
     let built = Build::new().and_then(|b| {

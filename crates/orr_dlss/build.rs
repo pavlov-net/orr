@@ -1,10 +1,18 @@
 //! Generates NGX bindings from the DLSS SDK at `DLSS_SDK` and links NGX's static library for
 //! the target's C runtime. With the `mock` feature, or without `DLSS_SDK`, nothing is linked.
+//! Publishes `built`, so a dependent's build script can tell that Cargo resolved this crate.
+//! Sets `cfg(vulkan)` where orr_gpu has its Vulkan backend; elsewhere the crate is empty.
 
 use std::path::PathBuf;
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(ngx)");
+    println!("cargo::rustc-check-cfg=cfg(vulkan)");
+    if std::env::var_os("DEP_ORR_GPU_VULKAN").is_none() {
+        return;
+    }
+    println!("cargo::rustc-cfg=vulkan");
+    println!("cargo::metadata=built=1");
     println!("cargo::rerun-if-env-changed=DLSS_SDK");
     println!("cargo::rerun-if-env-changed=VULKAN_SDK");
     println!("cargo::rerun-if-changed=wrapper.h");

@@ -8,12 +8,14 @@ use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(dlss)]
+use orr::DlssSdk;
 use orr::orr_gpu::{Allocation, Device, DeviceDesc, QueueRequest};
+#[cfg(dlss)]
 use orr::orr_output::orr_dlss::Uuid;
 use orr::orr_pack::{Archive, AssetId};
 use orr::{
-    DlssSdk, FrameDesc, FrameTime, Lens, LoadState, Loading, MountId, PackSource, Renderer,
-    Screenshot,
+    FrameDesc, FrameTime, Lens, LoadState, Loading, MountId, PackSource, Renderer, Screenshot,
 };
 
 pub mod average;
@@ -39,6 +41,7 @@ pub mod linked {
 }
 
 /// The examples' NGX project id.
+#[cfg(dlss)]
 pub const PROJECT_ID: Uuid = Uuid::from_u128(0x5d1e_7a40_c2b9_4f86_9e3d_61a0_b8f2_47c5);
 
 /// Asks [`device`] for counter frames (`DeviceDesc::perf_counters`); call before its first use.
@@ -59,9 +62,11 @@ pub fn device() -> &'static Device {
             .parse_default_env()
             .is_test(true)
             .try_init();
+        #[cfg(dlss)]
         let hooks = DlssSdk::device_hooks(PROJECT_ID);
         let desc = DeviceDesc {
             name: "orr-examples",
+            #[cfg(dlss)]
             hooks: Some(&hooks),
             queues: QueueRequest {
                 render_compute: true,
@@ -77,9 +82,16 @@ pub fn device() -> &'static Device {
 }
 
 /// Gives `renderer` DLSS ray reconstruction where NGX offers it; returns whether it does.
+#[cfg(not(dlss))]
+pub fn enable_dlss(_renderer: &mut Renderer) -> bool {
+    false
+}
+
+/// Gives `renderer` DLSS ray reconstruction where NGX offers it; returns whether it does.
+#[cfg(dlss)]
 pub fn enable_dlss(renderer: &mut Renderer) -> bool {
     match DlssSdk::new(device(), PROJECT_ID) {
-        Ok(sdk) => renderer.set_dlss(sdk),
+        Ok(sdk) => renderer.set_reconstruction(sdk),
         Err(e) => {
             log::warn!("no DLSS: {e}");
             false

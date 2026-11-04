@@ -72,7 +72,8 @@ world.
 - HDR first: rendering happens in linear Rec.2020, with HDR10 (PQ), scRGB and SDR output that
   follows the display's settings
 - Gran Turismo 7's tone mapping, gamut compression for SDR, and lights in physical units
-- DLSS ray reconstruction, super resolution, DLAA and frame generation, with Reflex for low latency
+- DLSS ray reconstruction, super resolution, DLAA and frame generation, with Reflex for low latency,
+  behind the default `dlss` feature, which does nothing on Apple targets
 - Auto exposure, white balance, local exposure, depth of field, motion blur and glare
 - A UI layer you can draw into, with `orr_egui` as a simple way to get debug UI on screen for now
 

@@ -11,7 +11,9 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/pavlov-net/orr"
 
 [workspace.dependencies]
-orr = { path = "crates/orr" }
+# Default features off, so a member that doesn't name `dlss` doesn't turn it back on under
+# `--no-default-features`.
+orr = { path = "crates/orr", default-features = false }
 orr_atmosphere = { path = "crates/orr_atmosphere" }
 orr_color = { path = "crates/orr_color", version = "0.0.1" }
 orr_cook = { path = "crates/orr_cook" }
@@ -21,7 +23,7 @@ orr_gpu = { path = "crates/orr_gpu" }
 orr_io = { path = "crates/orr_io", version = "0.0.1" }
 orr_lighting = { path = "crates/orr_lighting" }
 orr_math = { path = "crates/orr_math", version = "0.0.1" }
-orr_output = { path = "crates/orr_output" }
+orr_output = { path = "crates/orr_output", default-features = false }
 orr_memory = { path = "crates/orr_memory", version = "0.0.1" }
 orr_pack = { path = "crates/orr_pack" }
 orr_scene = { path = "crates/orr_scene" }

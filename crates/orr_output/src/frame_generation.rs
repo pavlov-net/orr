@@ -1,16 +1,18 @@
-//! Frame generation's policy: the multiplier mode, the Dynamic rule that follows the
-//! measured GPU cost, the camera NGX reprojects with and the system requirements.
+//! Frame generation apart from what runs it: the multiplier mode, the Dynamic rule that follows
+//! the measured GPU cost, and the two traits a backend implements.
 
-use orr_dlss::{FgCamera, Support};
-use orr_math::{DMat4, DVec3, Quat, Vec3};
-use orr_scene::orr_gpu::Device;
+use orr_math::{DMat4, DVec3, Quat};
+use orr_scene::orr_gpu::{Allocation, CommandList, Device, Texture};
 use orr_scene::{Projection, SceneId};
+
+use crate::Result;
 
 /// How many images frame generation adds per rendered frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FrameGenerationMode {
     Off,
-    /// `n` generated images per rendered frame, 1 to `Support::max_generated`.
+    /// `n` generated images per rendered frame, 1 to
+    /// [`FrameGenerationBackend::max_generated`].
     Fixed(u32),
     /// Up to `max` generated images per rendered frame, fewer while the rendered frame's
     /// GPU time does not fit the base interval `1 / base_hz`.
@@ -21,17 +23,90 @@ pub enum FrameGenerationMode {
 }
 
 impl FrameGenerationMode {
-    /// `Dynamic` at a 60 Hz base rate with up to 3 generated images (4x), or as many as NGX
-    /// can generate if fewer; `Off` without frame generation.
-    pub fn recommended(support: &Support) -> Self {
-        if !support.fg || support.max_generated == 0 {
+    /// `Dynamic` at a 60 Hz base rate with up to 3 generated images (4x), or `max_generated` if
+    /// fewer; `Off` when that is 0.
+    pub fn recommended(max_generated: u32) -> Self {
+        if max_generated == 0 {
             return Self::Off;
         }
         Self::Dynamic {
-            max: support.max_generated.min(3),
+            max: max_generated.min(3),
             base_hz: 60.0,
         }
     }
+}
+
+/// Reads a frame's flag once its evaluates have completed: whether they asked that its generated
+/// images not be shown.
+pub type InterpolationCheck = fn(&Allocation<u32>) -> bool;
+
+/// Makes frame generation features on one device.
+pub trait FrameGenerationBackend: Send + Sync {
+    /// The most images it generates per rendered frame, at least 1, on `gpu`, the display's
+    /// device, where `low_latency` tells whether the display has a low-latency handle. Fails with
+    /// [`Error::FrameGenerationUnavailable`](crate::Error::FrameGenerationUnavailable) naming what
+    /// the device or system lacks.
+    fn max_generated(&self, gpu: &Device, low_latency: bool) -> Result<u32>;
+
+    /// A feature for backbuffers like `backbuffer`; `hdr` when they hold PQ. May wait for setup
+    /// on the Render queue, so call it on that queue's owner thread.
+    fn feature(&self, backbuffer: &Texture, hdr: bool) -> Result<Box<dyn FrameGenerationFeature>>;
+
+    /// How to read the flag in [`FrameGenerationInputs::disable_interpolation`]. `None` when the
+    /// backend's images are always shown: frames then carry no flag, and the present thread does
+    /// not wait for their evaluates.
+    fn interpolation_check(&self) -> Option<InterpolationCheck>;
+}
+
+/// Frame generation for one backbuffer size and format. Dropping it releases its resources once
+/// everything submitted before the drop has completed.
+pub trait FrameGenerationFeature: Send + Sync {
+    /// Records the frame's generated images into `list`, on a compute-capable queue of the
+    /// feature's device.
+    fn record(
+        &mut self,
+        list: &mut CommandList<'_>,
+        inputs: &FrameGenerationInputs<'_>,
+    ) -> Result<()>;
+}
+
+/// A frame's inputs to frame generation: all a backend may use, of which it ignores the rest.
+/// Images are 2D with one mip and layer, and have sampled or storage usage.
+#[derive(Clone, Copy)]
+pub struct FrameGenerationInputs<'a> {
+    /// Display-encoded, without UI, in the format and size the feature was made for.
+    pub backbuffer: &'a Texture,
+    /// The backbuffer `previous_camera` saw, like `backbuffer`; `None` after a reset, or when
+    /// `backbuffer` took its place.
+    pub previous_backbuffer: Option<&'a Texture>,
+    /// Reverse-Z device depth at the render extent, which can change while the feature lives.
+    pub depth: &'a Texture,
+    /// Unjittered motion at the render extent, previous UV minus current UV.
+    pub motion: &'a Texture,
+    /// RGBA16F bidirectional distortion field, while a lens or hook warps the image.
+    pub distortion: Option<&'a Texture>,
+    /// One per generated image, in presented order, in the backbuffer's format and size.
+    pub outputs: &'a [&'a Texture],
+    /// Host-readable and zeroed before the frame's evaluates, while the backend has an
+    /// [`InterpolationCheck`].
+    pub disable_interpolation: Option<&'a Allocation<u32>>,
+    pub camera: FrameGenerationCamera,
+    /// The camera to reproject to: the last generating frame's, or `camera` itself when that
+    /// one has another scene or extent. Across a camera cut it is the camera before the cut, with
+    /// `reset` set.
+    pub previous_camera: FrameGenerationCamera,
+    /// The point positions are given relative to, fixed between resets.
+    pub anchor: DVec3,
+    /// The jitter of `depth` and `motion`, render pixels.
+    pub jitter: [f32; 2],
+    /// Seconds between the previous rendered frame and this one.
+    pub delta_time: f32,
+    /// The previous frame is unrelated to this one.
+    pub reset: bool,
+    /// Increases by one each rendered frame, with frame generation on or off.
+    pub frame_id: u64,
+    /// Menus and loading screens.
+    pub not_rendering_scene: bool,
 }
 
 /// Seconds the cost must stay over or under its threshold before `Dynamic` changes n.
@@ -127,20 +202,20 @@ impl DynamicCount {
 
 /// A view's camera as frame generation reprojects it.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct FgCameraState {
-    pub(crate) scene: SceneId,
-    pub(crate) position: DVec3,
+pub struct FrameGenerationCamera {
+    pub scene: SceneId,
+    pub position: DVec3,
     /// World from view.
-    pub(crate) rotation: Quat,
-    pub(crate) projection: Projection,
+    pub rotation: Quat,
+    pub projection: Projection,
     /// The render extent, of the depth and motion.
-    pub(crate) extent: [u32; 2],
+    pub extent: [u32; 2],
     /// The output extent, whose aspect ratio the projection takes.
-    pub(crate) output: [u32; 2],
+    pub output: [u32; 2],
 }
 
-impl FgCameraState {
-    fn clip_from_view(&self) -> DMat4 {
+impl FrameGenerationCamera {
+    pub fn clip_from_view(&self) -> DMat4 {
         self.projection
             .clip_from_view(self.output.into())
             .as_dmat4()
@@ -150,99 +225,6 @@ impl FgCameraState {
     pub(crate) fn continues(&self, prev: &Self) -> bool {
         self.scene == prev.scene && self.extent == prev.extent && self.output == prev.output
     }
-}
-
-/// The far plane frame generation is told; orr's projections have none.
-const FG_FAR_M: f32 = 100_000.0;
-
-/// NGX's camera for `cur`, reprojecting to `prev`, with the position relative to `anchor`.
-pub(crate) fn fg_camera(cur: &FgCameraState, prev: &FgCameraState, anchor: DVec3) -> FgCamera {
-    let clip = cur.clip_from_view();
-    let view_from_clip = clip.inverse();
-    let world_from_view = DMat4::from_quat(cur.rotation.as_dquat());
-    let prev_view_from_world = DMat4::from_quat(prev.rotation.as_dquat().inverse());
-    // Positions relative to each camera: the current one sits at the previous one's
-    // position plus the motion.
-    let motion = DMat4::from_translation(cur.position - prev.position);
-    let clip_to_prev =
-        prev.clip_from_view() * prev_view_from_world * motion * world_from_view * view_from_clip;
-    let cols = |m: DMat4| m.as_mat4().to_cols_array_2d();
-    let dir = |v: Vec3| (cur.rotation * v).to_array();
-    FgCamera {
-        view_to_clip: cols(clip),
-        clip_to_view: cols(view_from_clip),
-        clip_to_prev_clip: cols(clip_to_prev),
-        prev_clip_to_clip: cols(clip_to_prev.inverse()),
-        position: (cur.position - anchor).as_vec3().to_array(),
-        up: dir(Vec3::Y),
-        right: dir(Vec3::X),
-        forward: dir(Vec3::NEG_Z),
-        near: cur.projection.near,
-        far: FG_FAR_M,
-        fov_y: cur.projection.fov_y,
-        aspect: cur.output[0] as f32 / cur.output[1].max(1) as f32,
-    }
-}
-
-/// Whether Windows schedules the device's GPU in hardware, which frame generation needs.
-/// `None` when it cannot tell; always true off Windows.
-#[cfg(windows)]
-pub(crate) fn hardware_scheduling(gpu: &Device) -> Option<bool> {
-    use orr_scene::orr_gpu::interop::{self, ash::vk};
-    use vk::TaggedStructure as _;
-    use windows::Wdk::Graphics::Direct3D::{
-        D3DKMT_CLOSEADAPTER, D3DKMT_OPENADAPTERFROMLUID, D3DKMT_QUERYADAPTERINFO,
-        D3DKMT_WDDM_2_7_CAPS, D3DKMTCloseAdapter, D3DKMTOpenAdapterFromLuid,
-        D3DKMTQueryAdapterInfo, KMTQAITYPE_WDDM_2_7_CAPS,
-    };
-    use windows::Win32::Foundation::LUID;
-
-    let raw = interop::raw_device(gpu);
-    let mut id = vk::PhysicalDeviceIDProperties::default();
-    let mut props = vk::PhysicalDeviceProperties2::default().push(&mut id);
-    // SAFETY: a query on the device's live physical device.
-    unsafe {
-        raw.instance
-            .get_physical_device_properties2(raw.physical_device, &mut props);
-    }
-    if id.device_luid_valid == vk::FALSE {
-        return None;
-    }
-    let l = id.device_luid;
-    let mut open = D3DKMT_OPENADAPTERFROMLUID {
-        AdapterLuid: LUID {
-            LowPart: u32::from_le_bytes([l[0], l[1], l[2], l[3]]),
-            HighPart: i32::from_le_bytes([l[4], l[5], l[6], l[7]]),
-        },
-        hAdapter: 0,
-    };
-    // SAFETY: a plain struct the call fills.
-    if unsafe { D3DKMTOpenAdapterFromLuid(&mut open) }.is_err() {
-        return None;
-    }
-    let mut caps = D3DKMT_WDDM_2_7_CAPS::default();
-    let mut query = D3DKMT_QUERYADAPTERINFO {
-        hAdapter: open.hAdapter,
-        Type: KMTQAITYPE_WDDM_2_7_CAPS,
-        pPrivateDriverData: (&raw mut caps).cast(),
-        PrivateDriverDataSize: size_of::<D3DKMT_WDDM_2_7_CAPS>() as u32,
-    };
-    // SAFETY: `query` points at a caps struct of the size it states.
-    let read = unsafe { D3DKMTQueryAdapterInfo(&mut query) }.is_ok();
-    // SAFETY: the adapter was opened above.
-    let _ = unsafe {
-        D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER {
-            hAdapter: open.hAdapter,
-        })
-    };
-    // SAFETY: every bit pattern is a valid u32. HwSchEnabled is bit 1.
-    let value = unsafe { caps.Anonymous.Value };
-    read.then_some(value & 0b10 != 0)
-}
-
-#[cfg(not(windows))]
-pub(crate) fn hardware_scheduling(_gpu: &Device) -> Option<bool> {
-    Some(true)
 }
 
 /// The base-rate cap in microseconds for `generated` images per rendered frame: n + 1
@@ -262,12 +244,6 @@ pub(crate) fn min_interval_us(generated: u32, refresh_s: Option<f64>, variable: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orr_math::{DVec4, Mat4};
-
-    /// `m`, a column-vector matrix given as columns, applied to `p`.
-    fn apply(m: [[f32; 4]; 4], p: DVec4) -> DVec4 {
-        Mat4::from_cols_array_2d(&m).as_dmat4() * p
-    }
 
     fn ms_at(costs: &[(f64, f64)], t: f64) -> f64 {
         costs
@@ -351,45 +327,5 @@ mod tests {
         let mut d = DynamicCount::new(3, 60.0);
         d.set_limits(1, None);
         assert_eq!(d.generated(), 1);
-    }
-
-    #[test]
-    fn clip_to_prev_clip_reprojects_a_world_point() {
-        let projection = Projection {
-            fov_y: 0.9,
-            near: 0.1,
-        };
-        let prev = FgCameraState {
-            scene: SceneId(0),
-            position: DVec3::new(1000.0, 2.0, -3.0),
-            rotation: Quat::from_rotation_y(0.3),
-            projection,
-            extent: [1600, 900],
-            output: [1600, 900],
-        };
-        let cur = FgCameraState {
-            position: prev.position + DVec3::new(0.4, 0.1, -0.7),
-            rotation: Quat::from_rotation_y(0.34) * Quat::from_rotation_x(-0.05),
-            ..prev
-        };
-        let c = fg_camera(&cur, &prev, prev.position);
-        let world = DVec3::new(1003.0, 2.5, -12.0);
-        let clip_of = |cam: &FgCameraState| {
-            let view = cam.rotation.as_dquat().inverse() * (world - cam.position);
-            let clip = cam.clip_from_view() * view.extend(1.0);
-            clip / clip.w
-        };
-        let here = clip_of(&cur);
-        let there = apply(c.clip_to_prev_clip, here);
-        let there = there / there.w;
-        assert!(
-            (there - clip_of(&prev)).abs().max_element() < 1e-5,
-            "{there} vs {}",
-            clip_of(&prev)
-        );
-        let back = apply(c.prev_clip_to_clip, clip_of(&prev));
-        assert!((back / back.w - here).abs().max_element() < 1e-5);
-        let moved = Vec3::from_array(c.position) - Vec3::new(0.4, 0.1, -0.7);
-        assert!(moved.abs().max_element() < 1e-6);
     }
 }

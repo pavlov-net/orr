@@ -9,7 +9,6 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use orr_dlss::{DlssSdk, FgInputs, FrameGeneration};
 use orr_math::DVec3;
 use orr_scene::ViewDesc as SceneView;
 use orr_scene::orr_gpu::{
@@ -20,13 +19,12 @@ use orr_scene::orr_gpu::{
 };
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
-use crate::frame_generation::{
-    DynamicCount, FgCameraState, fg_camera, hardware_scheduling, min_interval_us,
-};
+use crate::frame_generation::{DynamicCount, min_interval_us};
 use crate::passes::ComposeKernel;
 use crate::{
     ComposePass, ComposeRoot, ComposeSource, DisplayFeed, DisplayRequest, DistortionField, Error,
-    FrameGenerationMode, ResolvedDisplay, Result, UiLayer,
+    FrameGenerationBackend, FrameGenerationCamera, FrameGenerationFeature, FrameGenerationInputs,
+    FrameGenerationMode, InterpolationCheck, ResolvedDisplay, Result, UiLayer,
 };
 
 /// How long the present thread waits for a compose root's previous submit, which is a frame
@@ -81,13 +79,13 @@ pub struct Display {
 
 /// Frame generation on this display.
 struct Fg {
-    sdk: DlssSdk,
+    backend: Box<dyn FrameGenerationBackend>,
     mode: FrameGenerationMode,
     max_generated: u32,
     dynamic: Option<DynamicCount>,
-    feature: Option<(FrameGeneration, OutputFormat, [u32; 2])>,
-    /// The camera of the last frame that generated images.
-    prev: Option<FgCameraState>,
+    feature: Option<(Box<dyn FrameGenerationFeature>, OutputFormat, [u32; 2])>,
+    /// The camera of the last frame that generated images, and its slot.
+    prev: Option<(FrameGenerationCamera, usize)>,
     /// The point camera positions are given relative to, moved at each reset.
     anchor: DVec3,
     /// The next evaluate does not follow the last one.
@@ -129,8 +127,10 @@ struct Slot {
     ui_drawn: Vec<bool>,
     /// Frame generation's outputs, in the backbuffer's encoding and size.
     generated: Vec<Encoded>,
-    /// NGX's interpolation-disabled flag for this slot's frame.
+    /// The interpolation-disabled flag for this slot's frame.
     flag: Option<Arc<Allocation<u32>>>,
+    /// What reads `flag`, from the backend that recorded the frame's generated images.
+    check: Option<InterpolationCheck>,
     /// What the frame's view gave frame generation.
     view: Option<FgView>,
     /// The frame's hooks wrote the display's distortion field.
@@ -143,8 +143,9 @@ struct Slot {
 struct FgView {
     depth: Arc<Texture>,
     motion: Arc<Texture>,
-    camera: FgCameraState,
+    camera: FrameGenerationCamera,
     jitter: [f32; 2],
+    delta_time: f32,
     reset: bool,
     not_rendering_scene: bool,
 }
@@ -195,7 +196,9 @@ struct Job {
     ui: Vec<Option<TextureIndex>>,
     /// Generated images, presented in order before the frame.
     generated: Vec<TextureIndex>,
-    flag: Option<Arc<Allocation<u32>>>,
+    /// What reads the frame's interpolation-disabled flag and the flag, while it has generated
+    /// images and its backend has a check.
+    flag: Option<(InterpolationCheck, Arc<Allocation<u32>>)>,
     min_images: u32,
 }
 
@@ -294,19 +297,21 @@ impl DisplayFrame<'_> {
 
     /// The view the backbuffer shows, for frame generation: its camera, its reverse-Z
     /// `depth` and its `motion` (previous UV minus current UV) at the render extent, which
-    /// stay valid until the frame's GPU work completes. A frame without it generates no
-    /// images, and the next one that has it starts frame generation afresh.
+    /// stay valid until the frame's GPU work completes, and the seconds since the previous
+    /// frame. A frame without it generates no images, and the next one that has it starts frame
+    /// generation afresh.
     pub fn frame_generation(
         &mut self,
         view: &SceneView,
         depth: &Arc<Texture>,
         motion: &Arc<Texture>,
         not_rendering_scene: bool,
+        delta_time: f32,
     ) {
         self.slot.view = Some(FgView {
             depth: Arc::clone(depth),
             motion: Arc::clone(motion),
-            camera: FgCameraState {
+            camera: FrameGenerationCamera {
                 scene: view.scene,
                 position: view.position,
                 rotation: view.rotation,
@@ -315,6 +320,7 @@ impl DisplayFrame<'_> {
                 output: view.output_extent.to_array(),
             },
             jitter: view.jitter.to_array(),
+            delta_time,
             reset: view.camera_cut,
             not_rendering_scene,
         });
@@ -435,6 +441,7 @@ impl Display {
                     ui_drawn: Vec::new(),
                     generated: Vec::new(),
                     flag: None,
+                    check: None,
                     view: None,
                     field_used: false,
                     recorded: 0,
@@ -496,34 +503,27 @@ impl Display {
     }
 
     /// Turns frame generation on, changes its mode or turns it off, from the next
-    /// `begin_frame`. On, it needs NGX frame generation on `sdk`'s device (the display's),
-    /// Windows' hardware-accelerated GPU scheduling, Reflex low latency
-    /// (`Caps::low_latency`), present ids and present metering; without them this fails and
-    /// leaves frame generation as it was. While it is on, scRGB requests present as PQ and
-    /// Reflex stays on with the base rate capped to the refresh rate over n + 1.
-    pub fn set_frame_generation(&mut self, sdk: &DlssSdk, mode: FrameGenerationMode) -> Result<()> {
+    /// `begin_frame`. On, it needs `backend` to offer frame generation on the display's device,
+    /// where [`FrameGenerationBackend::max_generated`] checks what it needs of the system; without
+    /// that this fails and leaves frame generation as it was. While it is on, scRGB requests
+    /// present as PQ and Reflex, where the display has it, stays on with the base rate capped to
+    /// the refresh rate over n + 1. Once on it keeps its backend until turned off, and checks
+    /// `mode` against that one instead of `backend`.
+    pub fn set_frame_generation(
+        &mut self,
+        backend: impl FrameGenerationBackend + 'static,
+        mode: FrameGenerationMode,
+    ) -> Result<()> {
         if mode == FrameGenerationMode::Off {
             self.fg = None;
             return Ok(());
         }
-        let support = sdk.support();
-        let caps = self.device.caps();
-        let missing = if !support.fg || support.max_generated == 0 {
-            Some("NGX frame generation")
-        } else if self.latency.is_none() {
-            Some("VK_NV_low_latency2")
-        } else if !caps.present_wait || !caps.present_metering {
-            Some("present ids and present metering")
-        } else if hardware_scheduling(&self.device) != Some(true) {
-            Some("hardware-accelerated GPU scheduling")
-        } else {
-            None
-        };
-        if let Some(missing) = missing {
-            return Err(Error::FrameGenerationUnavailable(missing));
-        }
+        let kept = self.fg.as_ref().map(|fg| &*fg.backend);
+        let max_generated = kept
+            .unwrap_or(&backend)
+            .max_generated(&self.device, self.latency.is_some())?;
         let dynamic = match mode {
-            FrameGenerationMode::Fixed(n) if (1..=support.max_generated).contains(&n) => None,
+            FrameGenerationMode::Fixed(n) if (1..=max_generated).contains(&n) => None,
             FrameGenerationMode::Dynamic { max, base_hz }
                 if max >= 1 && base_hz.is_finite() && base_hz > 0.0 =>
             {
@@ -534,13 +534,14 @@ impl Display {
         match &mut self.fg {
             Some(fg) => {
                 fg.mode = mode;
+                fg.max_generated = max_generated;
                 fg.dynamic = dynamic;
             }
             None => {
                 self.fg = Some(Fg {
-                    sdk: sdk.clone(),
+                    backend: Box::new(backend),
                     mode,
-                    max_generated: support.max_generated,
+                    max_generated,
                     dynamic,
                     feature: None,
                     prev: None,
@@ -763,15 +764,15 @@ impl Display {
     }
 
     /// Records the open frame's frame generation into `list`, the list compose wrote the
-    /// backbuffer with, after compose: one evaluate per generated image. Does nothing with
-    /// frame generation off, for a frame whose view did not call
-    /// [`DisplayFrame::frame_generation`] or that never wrote the backbuffer, or while the
-    /// generated count is 0. `orr`'s `Frame::end` calls it before submitting.
+    /// backbuffer with, after compose. Does nothing with frame generation off, for a frame whose
+    /// view did not call [`DisplayFrame::frame_generation`] or that never wrote the backbuffer,
+    /// or while the generated count is 0. `orr`'s `Frame::end` calls it before submitting.
     pub fn record_frame_generation(&mut self, list: &mut CommandList<'_>) -> Result<()> {
         let (Some(b), Some(fg)) = (&self.begun, &mut self.fg) else {
             return Ok(());
         };
-        let slot = &mut self.slots[b.slot];
+        let (slot, previous_slot) =
+            slot_and_previous(&mut self.slots, b.slot, fg.prev.map(|(_, slot)| slot));
         let view = slot.view.take();
         let Some(view) = view.filter(|_| slot.backbuffer_written && b.generated > 0) else {
             fg.reset = true;
@@ -787,21 +788,22 @@ impl Display {
             .is_none_or(|(_, e, x)| (*e, *x) != (encoding, b.extent))
         {
             fg.feature = None;
-            let feature = FrameGeneration::new(
-                &fg.sdk,
-                &backbuffer.texture,
-                encoding == OutputFormat::Hdr10Pq,
-            )?;
+            let feature = fg
+                .backend
+                .feature(&backbuffer.texture, encoding == OutputFormat::Hdr10Pq)?;
             fg.feature = Some((feature, encoding, b.extent));
             fg.reset = true;
         }
-        let prev = fg.prev.filter(|p| view.camera.continues(p));
+        let prev = fg
+            .prev
+            .map(|(camera, _)| camera)
+            .filter(|p| view.camera.continues(p));
         let reset = fg.reset || view.reset || prev.is_none();
         if reset {
             fg.anchor = view.camera.position;
         }
-        let camera = fg_camera(&view.camera, &prev.unwrap_or(view.camera), fg.anchor);
-        fg.prev = Some(view.camera);
+        let previous_camera = prev.unwrap_or(view.camera);
+        fg.prev = Some((view.camera, b.slot));
         fg.reset = false;
 
         if slot.generated.iter().any(|g| !g.fits(encoding, b.extent)) {
@@ -812,52 +814,64 @@ impl Display {
             list.discard(&image.texture);
             slot.generated.push(image);
         }
-        let flag = match &slot.flag {
-            Some(f) => Arc::clone(f),
-            None => {
-                let f = Arc::new(self.device.gpu_malloc::<u32>(
-                    MemoryKind::Readback,
-                    1,
-                    "interpolation disabled",
-                )?);
-                slot.flag = Some(Arc::clone(&f));
-                f
-            }
-        };
-        let flag_ptr = flag.mapped_ptr().expect("readback memory is mapped");
-        // SAFETY: the mapping lives as long as `flag`. No GPU work uses it now: the last
-        // evaluate that wrote it completed before the present thread read it, which it did
-        // before the slot came back to this frame.
-        unsafe { flag_ptr.as_ptr().write_volatile(0) };
+        slot.check = fg.backend.interpolation_check();
+        if slot.check.is_some() {
+            let flag = match &slot.flag {
+                Some(f) => Arc::clone(f),
+                None => {
+                    let f = Arc::new(self.device.gpu_malloc::<u32>(
+                        MemoryKind::Readback,
+                        1,
+                        "interpolation disabled",
+                    )?);
+                    slot.flag = Some(Arc::clone(&f));
+                    f
+                }
+            };
+            let flag_ptr = flag.mapped_ptr().expect("readback memory is mapped");
+            // SAFETY: the mapping lives as long as `flag`. No GPU work uses it now: the last
+            // evaluate that wrote it completed before the present thread read it, which it did
+            // before the slot came back to this frame.
+            unsafe { flag_ptr.as_ptr().write_volatile(0) };
+        }
+        let flag = slot.flag.as_deref().filter(|_| slot.check.is_some());
+        let previous_backbuffer = previous_slot
+            .filter(|_| !reset)
+            .and_then(|p| p.backbuffer.as_ref())
+            .map(|p| &p.texture);
 
         let distortion = self
             .field
             .as_ref()
             .filter(|_| slot.field_used)
             .map(DistortionField::current_texture);
-        let render = view.camera.extent;
+        let outputs: Vec<&Texture> = slot.generated[..n as usize]
+            .iter()
+            .map(|g| &g.texture)
+            .collect();
+        let inputs = FrameGenerationInputs {
+            backbuffer: &backbuffer.texture,
+            previous_backbuffer,
+            depth: &view.depth,
+            motion: &view.motion,
+            distortion,
+            outputs: &outputs,
+            disable_interpolation: flag,
+            camera: view.camera,
+            previous_camera,
+            anchor: fg.anchor,
+            jitter: view.jitter,
+            delta_time: view.delta_time,
+            reset,
+            frame_id: b.frame,
+            not_rendering_scene: view.not_rendering_scene,
+        };
         let (feature, _, _) = fg.feature.as_mut().expect("made above");
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
         list.begin_pass(FG_PASS, false);
-        for index in 1..=n {
-            let inputs = FgInputs {
-                backbuffer: &backbuffer.texture,
-                depth: &view.depth,
-                motion: &view.motion,
-                distortion,
-                interpolated: &slot.generated[index as usize - 1].texture,
-                disable_interpolation: Some(&flag),
-                camera,
-                jitter: view.jitter,
-                mvec_scale: render.map(|v| v as f32),
-                reset,
-                frame_id: b.frame,
-                not_rendering_scene: view.not_rendering_scene,
-                depth_scale: 1.0,
-            };
-            feature.record(list, &inputs, index, n)?;
-        }
+        let recorded = feature.record(list, &inputs);
         list.end_pass();
+        recorded?;
         list.barrier(Stages::ALL, Stages::ALL, Hazards::empty());
         slot.recorded = n;
         Ok(())
@@ -892,7 +906,7 @@ impl Display {
                 .map(|(u, &drawn)| drawn.then(|| u.index()))
                 .collect(),
             generated: s.generated[..recorded].iter().map(|g| g.sampled).collect(),
-            flag: s.flag.as_ref().filter(|_| recorded > 0).map(Arc::clone),
+            flag: s.check.zip(s.flag.clone()).filter(|_| recorded > 0),
             min_images: MIN_IMAGES.max(self.fg.as_ref().map_or(0, |f| f.most() + 2)),
         };
         if self.fg.as_ref().is_some_and(|f| f.dynamic.is_some()) {
@@ -939,6 +953,23 @@ impl Drop for Display {
         {
             log::error!("the present thread panicked");
         }
+    }
+}
+
+/// Slot `index` and slot `previous`, unless that is the same slot.
+fn slot_and_previous(
+    slots: &mut [Slot],
+    index: usize,
+    previous: Option<usize>,
+) -> (&mut Slot, Option<&Slot>) {
+    match previous.filter(|&p| p != index) {
+        Some(previous) => {
+            let [slot, previous] = slots
+                .get_disjoint_mut([index, previous])
+                .expect("two distinct slots");
+            (slot, Some(previous))
+        }
+        None => (&mut slots[index], None),
     }
 }
 
@@ -1088,11 +1119,11 @@ impl Presenter {
             .queue(QueueKind::Present)
             .expect("the swapchain needs the Present queue");
 
-        let mut interpolated = false;
-        if let Some(flag) = &job.flag {
-            // NGX sets the flag in the frame's evaluates.
+        let mut interpolated = true;
+        if let Some((check, flag)) = &job.flag {
+            // The frame's evaluates set the flag.
             queue.wait(job.after, ROOT_TIMEOUT)?;
-            interpolated = !FrameGeneration::interpolation_disabled(flag);
+            interpolated = !check(flag);
         }
         let generated = if interpolated { job.generated.len() } else { 0 };
         let sources = presented_images(&job.generated[..generated], job.source, &job.ui);

@@ -1,5 +1,6 @@
 //! Compiles the examples' kernels against orr's shader roots, with orr's Slang structs mapped
 //! to the Rust types orr publishes, and orr's kernels with the planet's sky and medium linked.
+//! Sets `cfg(dlss)` when orr has DLSS.
 
 use std::env;
 use std::path::PathBuf;
@@ -7,6 +8,10 @@ use std::path::PathBuf;
 use orr_shaders::build::{Build, Error, LinkPoint, Output, module_file};
 
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(dlss)");
+    if env::var_os("DEP_ORR_DLSS").is_some() {
+        println!("cargo::rustc-cfg=dlss");
+    }
     let dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let built = Build::new().and_then(|b| b.kernels(dir.join("shaders")).dep("orr").compile());
     if let Err(e) = built.and_then(|_| link_atmosphere()) {

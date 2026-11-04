@@ -2,7 +2,8 @@
 //! kernel table (`build/fft.rs`) into `OUT_DIR/glare_fft_table.bin` and its far-field terms into
 //! `OUT_DIR/glare_fft.rs`, publishing that directory as `glare_fft`. With the `pcl-stats` feature
 //! on Windows it also builds the PCL Stats shim against `pclstats.h` from the Reflex SDK at
-//! `REFLEX_SDK`.
+//! `REFLEX_SDK`. It sets `cfg(dlss)` when orr_dlss is linked, and publishes it as `dlss` for the
+//! crates above to read.
 
 use std::env;
 use std::fs;
@@ -21,6 +22,7 @@ mod psf;
 mod spectral_weights;
 
 fn main() {
+    dlss();
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let out = Build::new().and_then(|b| {
@@ -36,6 +38,16 @@ fn main() {
     glare_fft(&out_dir);
     #[cfg(feature = "pcl-stats")]
     pcl_stats(&manifest);
+}
+
+/// Reads orr_dlss's metadata, not the `dlss` feature: Cargo has no per-target default features,
+/// so the feature stays on for targets where the manifest leaves the dependency out.
+fn dlss() {
+    println!("cargo::rustc-check-cfg=cfg(dlss)");
+    if env::var_os("DEP_ORR_DLSS_BUILT").is_some() {
+        println!("cargo::rustc-cfg=dlss");
+        println!("cargo::metadata=dlss=1");
+    }
 }
 
 #[cfg(feature = "pcl-stats")]

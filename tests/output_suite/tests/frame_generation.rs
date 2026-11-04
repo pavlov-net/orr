@@ -8,7 +8,7 @@
 //! image and the cursor advances by equal steps from image to image, every frame id keeps
 //! one complete latency report, and the validation layer stays silent. Headless, a
 //! lens-distorted pan keeps its generated images aligned through the distortion field.
-#![cfg(windows)]
+#![cfg(all(windows, dlss))]
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -155,13 +155,13 @@ fn frame_generation_presents_generated_images_before_each_frame() {
     // The test asks for encodings the OS may have off.
     display.set_feed(None);
     let hdr = output_suite::offers_hdr(&display);
-    if let Err(e) = display.set_frame_generation(&sdk, FrameGenerationMode::Fixed(1)) {
+    if let Err(e) = display.set_frame_generation(sdk.clone(), FrameGenerationMode::Fixed(1)) {
         log::warn!("skipped: {e}");
         return;
     }
     watch_latency_markers(display.latency().expect("low latency"));
     let most = support.max_generated.min(3);
-    let recommended = FrameGenerationMode::recommended(&support);
+    let recommended = FrameGenerationMode::recommended(support.max_generated);
 
     let mut renderer = Renderer::new(&gpu, desc).unwrap();
     let bar = renderer
@@ -196,7 +196,7 @@ fn frame_generation_presents_generated_images_before_each_frame() {
         let per_present = i / PHASE == UI_PER_PRESENT;
         if i % PHASE == 0 {
             display.set_request(&request(encoding));
-            display.set_frame_generation(&sdk, mode).unwrap();
+            display.set_frame_generation(sdk.clone(), mode).unwrap();
             display.set_ui_per_present(per_present);
             last_cursor = None;
         }

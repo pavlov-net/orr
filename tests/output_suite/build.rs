@@ -1,4 +1,5 @@
-//! Builds the suite's test kernels against orr_output's shader roots.
+//! Builds the suite's test kernels against orr_output's shader roots. Sets `cfg(dlss)` when
+//! orr_output has DLSS.
 
 use std::env;
 use std::path::PathBuf;
@@ -6,6 +7,10 @@ use std::path::PathBuf;
 use orr_shaders::build::Build;
 
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(dlss)");
+    if env::var_os("DEP_ORR_OUTPUT_DLSS").is_some() {
+        println!("cargo::rustc-cfg=dlss");
+    }
     let src = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("src");
     let out = Build::new().and_then(|b| b.kernels(&src).dep("orr_output").compile());
     if let Err(e) = out {
