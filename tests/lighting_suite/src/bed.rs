@@ -2032,6 +2032,53 @@ pub fn luminance(p: &[f32; 4]) -> f64 {
     orr_color::luminance(DVec3::new(p[0].into(), p[1].into(), p[2].into()))
 }
 
+/// Mean rgb over the pixels that pass `keep`.
+pub fn mean_where(a: &Accumulated, keep: impl Fn(&[f32; 4]) -> bool) -> [f64; 3] {
+    let mut sum = [0.0f64; 3];
+    let mut n = 0.0;
+    for p in a.mean.iter().filter(|p| keep(p)) {
+        for c in 0..3 {
+            sum[c] += f64::from(p[c]);
+        }
+        n += 1.0;
+    }
+    assert!(n > 0.0, "no pixels selected");
+    sum.map(|s| s / n)
+}
+
+/// Mean rgb over the pixels a surface or layer was drawn on.
+pub fn surface_mean(a: &Accumulated) -> [f64; 3] {
+    mean_where(a, |p| p[3] > 0.5)
+}
+
+/// Mean rgb over the whole image.
+pub fn image_mean(a: &Accumulated) -> [f64; 3] {
+    mean_where(a, |_| true)
+}
+
+/// Asserts each channel of `a` is within `tolerance` of `b`'s, relative to `b`.
+pub fn assert_close(what: &str, a: [f64; 3], b: [f64; 3], tolerance: f64) {
+    for c in 0..3 {
+        let e = (a[c] - b[c]).abs() / b[c].abs().max(1e-12);
+        assert!(e <= tolerance, "{what}: channel {c} {a:?} against {b:?}");
+    }
+}
+
+/// The alpha quad scene with `model` for its quad.
+pub fn quad_scene(model: &'static str) -> Spec {
+    let mut spec = Analytic::AlphaQuad.spec();
+    spec.copies[1].model = model;
+    spec
+}
+
+/// FLIP of `a` against `b`, and of `b` against `noise` (the same scene at another seed),
+/// shown at an exposure putting `b`'s mean at 0.18.
+pub fn against_noise(a: &Accumulated, b: &Accumulated, noise: &Accumulated) -> (f32, f32) {
+    let mean = b.mean.iter().map(luminance).sum::<f64>() / b.mean.len() as f64;
+    let exposure = (0.18 / mean) as f32;
+    (a.flip(b, exposure).mean, noise.flip(b, exposure).mean)
+}
+
 /// orr_lighting's opaque dispatch and guide resolve recording into bed frames with
 /// `settings`.
 pub struct Paths {

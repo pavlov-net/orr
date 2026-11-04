@@ -1,17 +1,16 @@
 //! Alpha in traversal: shadow and bounce rays through an alpha-tested quad with and without
 //! opacity micromaps, through linked coverage, and through fractional linked coverage, on a
-//! real ray-query candidate loop; and the shadows they cast in the path kernel.
+//! real ray-query candidate loop; and the shadow a micromap casts in the path kernel.
 
 use lighting_suite::bed::{
-    Accumulated, Analytic, BARE_LEAF, Bed, Item, LEAF, Paths, RINGS_LEAF, SUN, Spec, VEIL,
-    luminance,
+    Accumulated, BARE_LEAF, Bed, Item, LEAF, Paths, RINGS_LEAF, SUN, Spec, VEIL, against_noise,
+    quad_scene,
 };
 use lighting_suite::shaders::alpha_probe;
-use lighting_suite::{assert_clean, device, linked, pipeline, readback, require, upload};
+use lighting_suite::{assert_clean, device, pipeline, readback, require, upload};
 use orr_gpu::{Allocation, Hazards, KernelSet, Stages};
 use orr_lighting::{Light, LightingDebugView, PathEntry, ReferenceSettings, ViewLighting};
 use orr_math::{Mat3, Vec2, Vec3};
-use orr_scene::RendererDesc;
 
 /// Rays a side aimed across each quad.
 const GRID: u32 = 192;
@@ -239,24 +238,9 @@ fn direct(bed: &mut Bed, paths: &Paths, seed: u32) -> Accumulated {
     bed.accumulate(32, seed, &mut |list, f| paths.record(list, f))
 }
 
-/// The alpha quad scene with `model` for its quad.
-fn quad_scene(model: &'static str) -> Spec {
-    let mut spec = Analytic::AlphaQuad.spec();
-    spec.copies[1].model = model;
-    spec
-}
-
-/// FLIP of `a` against `b`, and of `b` against `noise` (the same scene at another seed),
-/// shown at an exposure putting `b`'s mean at 0.18.
-fn against_noise(a: &Accumulated, b: &Accumulated, noise: &Accumulated) -> (f32, f32) {
-    let mean = b.mean.iter().map(luminance).sum::<f64>() / b.mean.len() as f64;
-    let exposure = (0.18 / mean) as f32;
-    (a.flip(b, exposure).mean, noise.flip(b, exposure).mean)
-}
-
-fn direct_paths(kernels: &KernelSet) -> Paths {
+fn direct_paths() -> Paths {
     Paths::new(
-        kernels,
+        &KernelSet::default(),
         PathEntry::Compute,
         ViewLighting {
             max_bounces: 1,
@@ -269,7 +253,7 @@ fn direct_paths(kernels: &KernelSet) -> Paths {
 
 #[test]
 fn an_alpha_quad_casts_the_same_shadow_with_and_without_micromaps() {
-    let paths = direct_paths(&KernelSet::default());
+    let paths = direct_paths();
     let bare = direct(&mut Bed::with(quad_scene(BARE_LEAF)), &paths, 1);
     let noise = direct(&mut Bed::with(quad_scene(BARE_LEAF)), &paths, 2);
     let leaf = direct(&mut Bed::with(quad_scene(LEAF)), &paths, 1);
@@ -277,25 +261,6 @@ fn an_alpha_quad_casts_the_same_shadow_with_and_without_micromaps() {
     assert!(
         e <= floor,
         "FLIP {e} with against without micromaps, {floor} between seeds"
-    );
-    assert_clean();
-}
-
-#[test]
-fn linked_coverage_casts_the_shadow_of_the_equivalent_alpha_texture() {
-    let paths = direct_paths(&linked::KERNELS);
-    let renderer = RendererDesc {
-        kernels: &linked::KERNELS,
-        ..RendererDesc::default()
-    };
-    let bed = |model| Bed::with_renderer(quad_scene(model), &renderer);
-    let leaf = direct(&mut bed(BARE_LEAF), &paths, 1);
-    let noise = direct(&mut bed(BARE_LEAF), &paths, 2);
-    let rings = direct(&mut bed(RINGS_LEAF), &paths, 1);
-    let (e, floor) = against_noise(&rings, &leaf, &noise);
-    assert!(
-        e <= floor,
-        "FLIP {e} with linked coverage against the texture, {floor} between seeds"
     );
     assert_clean();
 }

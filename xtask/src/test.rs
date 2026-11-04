@@ -41,8 +41,7 @@ const DEFAULT_JOBS: usize = 3;
 /// Targets that take much longer than the rest, longest first. They start first, so the
 /// run doesn't end on one of them, and `--fast` leaves them out.
 const SLOW: &[&str] = &[
-    "lighting_suite.path",
-    "lighting_suite.alpha",
+    "lighting_suite.linked",
     "examples.screenshots",
     "lighting_suite.dielectric",
     "shader_link.gpu",
@@ -50,6 +49,8 @@ const SLOW: &[&str] = &[
     "lighting_suite.subsurface",
     "lighting_suite.world_cache",
     "atmosphere_suite.rendered_medium",
+    "lighting_suite.path",
+    "lighting_suite.alpha",
     "lighting_suite.guides",
     "orr_atmosphere.reference",
     "scene_suite.renderer",

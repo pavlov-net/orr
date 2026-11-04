@@ -1,17 +1,15 @@
 //! The opaque path kernel on the bed's analytic scenes: the furnace, convergence, the three
 //! estimators against each other, pixel subsets, directional lights, ray counts, ray
-//! origins, the thin lens and the background layer behind foreground, linked surfaces at
-//! every hit, the raygen against the compute entry, and emissive particles as lights.
+//! origins, the thin lens and the background layer behind foreground, and emissive particles
+//! as lights.
 
 use lighting_suite::bed::{
     Accumulated, Analytic, BUMPY_FLOOR, Bed, EXTENT, FLOOR, FURNACE_RADIANCE, Item, MIRROR, NEAR,
-    PANEL, Particle, ParticleLook, Paths, SKY, SMOOTH_FLOOR, SUN, Spec, TROUGH, WHITE_SPHERE,
-    luminance, reference,
+    Particle, ParticleLook, Paths, SKY, SMOOTH_FLOOR, SUN, Spec, TROUGH, assert_close, image_mean,
+    luminance, mean_where, reference, surface_mean,
 };
 use lighting_suite::shaders::origins;
-use lighting_suite::{
-    assert_clean, device, linked, pipeline, readback, render, require, run, texture, upload,
-};
+use lighting_suite::{assert_clean, pipeline, readback, render, run, texture, upload};
 use orr_gpu::{Hazards, KernelSet, Stages};
 use orr_lighting::{
     DirectionalLight, DiscProfile, DofBackgroundPass, Light, LightId, LightingDebugView, PathEntry,
@@ -32,35 +30,6 @@ fn debug(view: LightingDebugView, max_bounces: u32) -> ViewLighting {
     ViewLighting {
         debug_view: view,
         ..reference(max_bounces)
-    }
-}
-
-/// Mean rgb over the pixels that pass `keep`.
-fn mean_where(a: &Accumulated, keep: impl Fn(&[f32; 4]) -> bool) -> [f64; 3] {
-    let mut sum = [0.0f64; 3];
-    let mut n = 0.0;
-    for p in a.mean.iter().filter(|p| keep(p)) {
-        for c in 0..3 {
-            sum[c] += f64::from(p[c]);
-        }
-        n += 1.0;
-    }
-    assert!(n > 0.0, "no pixels selected");
-    sum.map(|s| s / n)
-}
-
-fn surface_mean(a: &Accumulated) -> [f64; 3] {
-    mean_where(a, |p| p[3] > 0.5)
-}
-
-fn image_mean(a: &Accumulated) -> [f64; 3] {
-    mean_where(a, |_| true)
-}
-
-fn assert_close(what: &str, a: [f64; 3], b: [f64; 3], tolerance: f64) {
-    for c in 0..3 {
-        let e = (a[c] - b[c]).abs() / b[c].abs().max(1e-12);
-        assert!(e <= tolerance, "{what}: channel {c} {a:?} against {b:?}");
     }
 }
 
@@ -485,36 +454,6 @@ fn noise_on_a_lit_plane_is_uncorrelated_across_pixels_and_frames() {
 }
 
 #[test]
-fn raygen_and_compute_entries_trace_the_same_light() {
-    if !require(device().caps().ray_dispatch, "no ray-dispatch pipelines") {
-        return;
-    }
-    let mut bed = Bed::new(Analytic::SunAndGround);
-    bed.set_pre_exposure(1.0 / 64.0);
-    let settings = ViewLighting::default();
-    let compute = Paths::new(&KernelSet::default(), PathEntry::Compute, settings);
-    let rays = Paths::new(&KernelSet::default(), PathEntry::RayDispatch, settings);
-    // Every frame redraws the light tiles, so runs differ by their noise; the raygen run must
-    // sit as close to a compute run as another compute run does.
-    let a = render_paths(&mut bed, &compute, 32, 1);
-    let again = render_paths(&mut bed, &compute, 32, 1);
-    let b = render_paths(&mut bed, &rays, 32, 1);
-    assert_close(
-        "raygen against compute",
-        image_mean(&b),
-        image_mean(&a),
-        0.005,
-    );
-    let noise = again.flip(&a, 1.0 / 500.0);
-    let e = b.flip(&a, 1.0 / 500.0);
-    assert!(
-        e.mean < 1.25 * noise.mean,
-        "raygen against compute: {e:?}, compute against itself: {noise:?}"
-    );
-    assert_clean();
-}
-
-#[test]
 fn a_thin_lens_with_no_aperture_matches_the_gbuffer() {
     let mut bed = Bed::new(Analytic::SunAndGround);
     bed.set_pre_exposure(1.0 / 64.0);
@@ -618,91 +557,6 @@ fn the_background_layer_sees_past_the_foreground_as_a_lens_does_without_it() {
     assert!(
         e.mean < 0.06,
         "background layer against the lens reference without the foreground: {e:?}"
-    );
-    assert_clean();
-}
-
-/// The bed with `spec`, its panels' surface linked as `surfaces/context.slang`.
-fn linked_bed(spec: Spec) -> Bed {
-    Bed::with_renderer(
-        spec,
-        &RendererDesc {
-            kernels: &linked::KERNELS,
-            ..RendererDesc::default()
-        },
-    )
-}
-
-fn linked_paths(settings: ViewLighting) -> Paths {
-    Paths::new(&linked::KERNELS, PathEntry::Compute, settings)
-}
-
-#[test]
-fn a_linked_surface_looks_the_same_in_a_mirror() {
-    let panel_facing_back = Mat3::from_rotation_y(std::f32::consts::PI);
-    let direct = Spec {
-        copies: vec![at(PANEL, Mat3::IDENTITY, Vec3::new(0.0, 1.0, 0.0))],
-        lights: Vec::new(),
-        environment: None,
-        eye: Vec3::new(0.0, 1.0, 3.0),
-        target: Vec3::new(0.0, 1.0, 0.0),
-        fov_y: 0.8,
-        focus: None,
-    };
-    let mirrored = Spec {
-        copies: vec![
-            at(MIRROR, Mat3::IDENTITY, Vec3::new(0.0, 1.0, 0.0)),
-            at(PANEL, panel_facing_back, Vec3::new(0.0, 1.0, 6.0)),
-        ],
-        ..direct.clone()
-    };
-    let color = |spec| {
-        let mut bed = linked_bed(spec);
-        let p = linked_paths(reference(2));
-        let image = render_paths(&mut bed, &p, 4, 1);
-        let m = mean_where(&image, |p| luminance(p) > 1.0);
-        let total = m[0] + m[1] + m[2];
-        m.map(|c| c / total)
-    };
-    let seen = color(direct);
-    let reflected = color(mirrored);
-    assert!(
-        seen[0] > 0.7,
-        "the panel seen directly is not red: {seen:?}"
-    );
-    assert_close("panel in the mirror", reflected, seen, 0.02);
-    assert_clean();
-}
-
-#[test]
-fn a_linked_surface_switches_form_only_from_the_second_bounce() {
-    let spec = Spec {
-        copies: vec![
-            at(FLOOR, Mat3::IDENTITY, Vec3::ZERO),
-            at(PANEL, Mat3::IDENTITY, Vec3::new(0.0, 0.8, -1.0)),
-            at(WHITE_SPHERE, Mat3::IDENTITY, Vec3::new(1.6, 1.0, 0.0)),
-        ],
-        lights: Vec::new(),
-        environment: None,
-        eye: Vec3::new(0.0, 2.0, 4.0),
-        target: Vec3::new(0.0, 0.5, 0.0),
-        fov_y: 0.8,
-        focus: None,
-    };
-    let mut bed = linked_bed(spec);
-    let mut light = |view| {
-        let p = linked_paths(debug(view, 3));
-        surface_mean(&render_paths(&mut bed, &p, 32, 1))
-    };
-    let direct = light(LightingDebugView::DirectOnly);
-    let indirect = light(LightingDebugView::IndirectOnly);
-    assert!(
-        direct[1] < 0.15 * direct[0],
-        "light from the first bounce holds the far form: {direct:?}"
-    );
-    assert!(
-        indirect[0] < 0.15 * indirect[1],
-        "light from later bounces holds the near form: {indirect:?}"
     );
     assert_clean();
 }

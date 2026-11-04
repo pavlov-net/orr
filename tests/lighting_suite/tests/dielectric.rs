@@ -3,8 +3,8 @@
 //! medium, presence layers, a camera inside water, layer guides under camera rotation,
 //! the frosted-glass term of rough glass, dispersion: a white line through a prism against a
 //! CPU model, a dispersive furnace, and paths without dispersive hits, the layer tiles
-//! against tracing every tile, an emissive particle seen through glass, and each pixel's front
-//! layer.
+//! against tracing every tile, the raygen against the compute entry, an emissive particle seen
+//! through glass, and each pixel's front layer.
 
 use lighting_suite::bed::{
     Accumulated, Analytic, Bed, CLOUD_SPHERE, Capture, DISPERSIVE_SPHERE, EMITTER_LUMINANCE,
@@ -12,7 +12,8 @@ use lighting_suite::bed::{
     LINE_HALF_HEIGHT, LINE_HALF_WIDTH, MILK_SIGMA_S, MILK_SIGMA_T, MILKY_SLAB, OverlayFrontLayer,
     PRESENCE_VEIL, PRESENCE_VEIL_OPACITY, PRISM, PRISM_ABBE, PRISM_HALF_HEIGHT, PRISM_IOR,
     Particle, ParticleLook, Paths, ROUGH_SLAB, SLAB_THICKNESS, SMOOTH_FLOOR, SUN, SpareView, Spec,
-    TINTED_SLAB, WATER_BOX, fresnel, prism_corners, reference, water_transmission,
+    TINTED_SLAB, WATER_BOX, assert_close, fresnel, image_mean, prism_corners, reference,
+    surface_mean, water_transmission,
 };
 use lighting_suite::shaders::interior_probe;
 use lighting_suite::{assert_clean, device, pipeline, readback, render, require, run, upload};
@@ -179,29 +180,6 @@ fn center(a: &Accumulated, side: u32) -> [f64; 3] {
     a.around(Vec2::new(w as f32, h as f32) * 0.5, side / 2)
 }
 
-/// Mean rgb over the pixels a surface or layer was drawn on.
-fn drawn_mean(a: &Accumulated) -> [f64; 3] {
-    let drawn: Vec<_> = a.mean.iter().filter(|p| p[3] > 0.5).collect();
-    assert!(!drawn.is_empty(), "nothing drawn");
-    let mut sum = [0.0f64; 3];
-    for p in &drawn {
-        for c in 0..3 {
-            sum[c] += f64::from(p[c]);
-        }
-    }
-    sum.map(|s| s / drawn.len() as f64)
-}
-
-fn assert_close(what: &str, got: [f64; 3], wanted: [f64; 3], tolerance: f64) {
-    for c in 0..3 {
-        let e = (got[c] - wanted[c]).abs() / wanted[c].abs().max(1e-12);
-        assert!(
-            e <= tolerance,
-            "{what}: channel {c} {got:?} against {wanted:?}"
-        );
-    }
-}
-
 #[test]
 fn the_interior_list_keeps_nested_media_innermost_last() {
     let script: [(u32, u32); 10] = [
@@ -302,7 +280,7 @@ fn a_glass_sphere_in_a_furnace_keeps_its_energy() {
         ..reference(4)
     };
     let image = render_paths(&mut Bed::with(spec), &paths(settings), 16);
-    let mean = drawn_mean(&image);
+    let mean = surface_mean(&image);
     for c in 0..3 {
         let ratio = mean[c] / f64::from(FURNACE_RADIANCE[c]);
         assert!(
@@ -362,7 +340,7 @@ fn an_albedo_one_medium_keeps_at_most_its_energy() {
         ..reference(32)
     };
     let image = render_paths(&mut Bed::with(spec), &paths(settings), 16);
-    let mean = drawn_mean(&image);
+    let mean = surface_mean(&image);
     for c in 0..3 {
         let ratio = mean[c] / f64::from(FURNACE_RADIANCE[c]);
         assert!(
@@ -548,7 +526,7 @@ fn a_dispersive_sphere_in_a_furnace_stays_white() {
         ..reference(4)
     };
     let image = render_paths(&mut Bed::with(spec), &paths(settings), 64);
-    let mean = drawn_mean(&image);
+    let mean = surface_mean(&image);
     for c in 0..3 {
         let ratio = mean[c] / f64::from(FURNACE_RADIANCE[c]);
         assert!(
@@ -887,6 +865,36 @@ fn layer_tiles_trace_what_every_tile_traces() {
             }
         }
     }
+    assert_clean();
+}
+
+#[test]
+fn raygen_and_compute_entries_trace_the_same_light() {
+    if !require(device().caps().ray_dispatch, "no ray-dispatch pipelines") {
+        return;
+    }
+    let mut bed = Bed::new(Analytic::SunAndGround);
+    bed.set_pre_exposure(1.0 / 64.0);
+    let settings = ViewLighting::default();
+    let compute = Paths::new(&KernelSet::default(), PathEntry::Compute, settings);
+    let rays = Paths::new(&KernelSet::default(), PathEntry::RayDispatch, settings);
+    // Every frame redraws the light tiles, so runs differ by their noise; the raygen run must
+    // sit as close to a compute run as another compute run does.
+    let a = render_paths(&mut bed, &compute, 32);
+    let again = render_paths(&mut bed, &compute, 32);
+    let b = render_paths(&mut bed, &rays, 32);
+    assert_close(
+        "raygen against compute",
+        image_mean(&b),
+        image_mean(&a),
+        0.005,
+    );
+    let noise = again.flip(&a, 1.0 / 500.0);
+    let e = b.flip(&a, 1.0 / 500.0);
+    assert!(
+        e.mean < 1.25 * noise.mean,
+        "raygen against compute: {e:?}, compute against itself: {noise:?}"
+    );
     assert_clean();
 }
 
