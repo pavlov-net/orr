@@ -22,53 +22,6 @@ static const uint POLYGON_CORNERS = 9;
 // The most opacity a cell takes from one triangle, so its optical depth stays finite.
 static const float SMOKE_MAX_OPACITY = 0.999;
 
-struct Polygon
-{
-    float2 p[POLYGON_CORNERS];
-    uint count;
-
-    // Keeps the part with `side` x (p[axis] - limit) >= 0.
-    [mutating]
-    void clip(uint axis, float limit, float side)
-    {
-        float2 out[POLYGON_CORNERS];
-        uint n = 0;
-        for (uint i = 0; i < count; i++)
-        {
-            float2 a = p[i];
-            float2 b = p[i + 1 == count ? 0 : i + 1];
-            float da = side * (a[axis] - limit);
-            float db = side * (b[axis] - limit);
-            if (da >= 0.0 && n < POLYGON_CORNERS)
-                out[n++] = a;
-            if ((da < 0.0) != (db < 0.0) && n < POLYGON_CORNERS)
-                out[n++] = lerp(a, b, da / (da - db));
-        }
-        p = out;
-        count = n;
-    }
-
-    float area()
-    {
-        float sum = 0.0;
-        for (uint i = 0; i < count; i++)
-        {
-            float2 a = p[i];
-            float2 b = p[i + 1 == count ? 0 : i + 1];
-            sum += a.x * b.y - a.y * b.x;
-        }
-        return 0.5 * abs(sum);
-    }
-
-    float2 center()
-    {
-        float2 sum = float2(0.0);
-        for (uint i = 0; i < count; i++)
-            sum += p[i];
-        return sum / float(max(count, 1u));
-    }
-}
-
 void add_smoke(FroxelRoot r, uint3 f, float3 tint, float3 emission, float depth)
 {
     uint first = smoke_index(r, f);
@@ -82,21 +35,17 @@ void add_smoke(FroxelRoot r, uint3 f, float3 tint, float3 emission, float depth)
     }
 }
 
-// Adds view-space point `x` to `polygon` in column coordinates, its depth to `lo`, which bounds
-// the polygon's distances from the eye from below, and its distance to `hi`, which bounds them
-// from above.
-void add_corner(FroxelRoot r, inout Polygon polygon, float3 x, inout float lo, inout float hi)
-{
-    polygon.p[polygon.count++] = view_column(uint2(r.columns, r.rows), r.view, x);
-    lo = min(lo, -x.z);
-    hi = max(hi, length(x));
-}
-
 // Adds to the froxels the planar polygon with view-space corners `q`, `count` of them in order
-// around it.
+// around it. Its corners and each cell's part of it are arrays local to this function: written
+// as a polygon struct with clip, area and center methods, this kernel came out of Metal's
+// compiler with every corner past the first wrong, so a polygon covered at most one cell. The
+// same struct in a small kernel compiles right.
 void splat_polygon(FroxelRoot r, float3 q[4], uint count, float opacity, float3 albedo, float3 emission)
 {
-    Polygon polygon = (Polygon)0;
+    // The polygon in column coordinates, clipped to the near plane; `lo` bounds its distances
+    // from the eye from below, `hi` from above.
+    float2 corners[POLYGON_CORNERS];
+    uint n = 0;
     float lo = positive_infinity();
     float hi = 0.0;
     for (uint i = 0; i < count; i++)
@@ -105,24 +54,29 @@ void splat_polygon(FroxelRoot r, float3 q[4], uint count, float opacity, float3 
         float3 b = q[i + 1 == count ? 0 : i + 1];
         bool a_in = a.z < -SMOKE_NEAR;
         bool b_in = b.z < -SMOKE_NEAR;
-        if (a_in)
-            add_corner(r, polygon, a, lo, hi);
-        if (a_in != b_in)
-            add_corner(r, polygon, lerp(a, b, (a.z + SMOKE_NEAR) / (a.z - b.z)), lo, hi);
+        for (uint k = 0; k < 2; k++)
+        {
+            if (k == 0 ? !a_in : a_in == b_in)
+                continue;
+            float3 x = k == 0 ? a : lerp(a, b, (a.z + SMOKE_NEAR) / (a.z - b.z));
+            corners[n++] = view_column(uint2(r.columns, r.rows), r.view, x);
+            lo = min(lo, -x.z);
+            hi = max(hi, length(x));
+        }
     }
     float near_range = r.scene.near_range;
-    if (polygon.count < 3)
+    if (n < 3)
         return;
     if (hi >= near_range)
         InterlockedOr(r.lights.far_smoke, 1u);
     if (!(lo < near_range))
         return;
-    float2 low = polygon.p[0];
+    float2 low = corners[0];
     float2 high = low;
-    for (uint i = 1; i < polygon.count; i++)
+    for (uint i = 1; i < n; i++)
     {
-        low = min(low, polygon.p[i]);
-        high = max(high, polygon.p[i]);
+        low = min(low, corners[i]);
+        high = max(high, corners[i]);
     }
     int2 first = max(int2(floor(low + 0.5)), int2(0));
     int2 last = min(int2(floor(high + 0.5)), int2(r.columns, r.rows) - 1);
@@ -131,15 +85,45 @@ void splat_polygon(FroxelRoot r, float3 q[4], uint count, float opacity, float3 
     {
         for (int x = first.x; x <= last.x; x++)
         {
-            Polygon cell = polygon;
-            cell.clip(0, float(x) - 0.5, 1.0);
-            cell.clip(0, float(x) + 0.5, -1.0);
-            cell.clip(1, float(y) - 0.5, 1.0);
-            cell.clip(1, float(y) + 0.5, -1.0);
-            float coverage = cell.area();
+            // The cell's part: the polygon clipped to each side of the cell in turn, keeping
+            // the part with side x (corner[axis] - limit) >= 0.
+            float2 cell[POLYGON_CORNERS] = corners;
+            uint m = n;
+            for (uint plane = 0; plane < 4; plane++)
+            {
+                uint axis = plane / 2;
+                float side = plane % 2 == 0 ? 1.0 : -1.0;
+                float limit = float(axis == 0 ? x : y) - 0.5 * side;
+                float2 out[POLYGON_CORNERS];
+                uint kept = 0;
+                for (uint i = 0; i < m; i++)
+                {
+                    float2 a = cell[i];
+                    float2 b = cell[i + 1 == m ? 0 : i + 1];
+                    float da = side * ((axis == 0 ? a.x : a.y) - limit);
+                    float db = side * ((axis == 0 ? b.x : b.y) - limit);
+                    if (da >= 0.0 && kept < POLYGON_CORNERS)
+                        out[kept++] = a;
+                    if ((da < 0.0) != (db < 0.0) && kept < POLYGON_CORNERS)
+                        out[kept++] = lerp(a, b, da / (da - db));
+                }
+                cell = out;
+                m = kept;
+            }
+            float twice_area = 0.0;
+            float2 sum = float2(0.0);
+            for (uint i = 0; i < m; i++)
+            {
+                float2 a = cell[i];
+                float2 b = cell[i + 1 == m ? 0 : i + 1];
+                twice_area += a.x * b.y - a.y * b.x;
+                sum += a;
+            }
+            float coverage = 0.5 * abs(twice_area);
             if (!(coverage > 0.0))
                 continue;
-            float3 ray = normalize(unjittered_ray(r.view, column_pixel(r, cell.center())));
+            float2 center = sum / float(max(m, 1u));
+            float3 ray = normalize(unjittered_ray(r.view, column_pixel(r, center)));
             float along = dot(normal, ray);
             float t = abs(along) > 1e-6 * length(normal) ? dot(normal, q[0]) / along : 0.5 * (lo + hi);
             t = clamp(t, lo, hi);
