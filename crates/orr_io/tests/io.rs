@@ -123,6 +123,34 @@ fn read_at_is_short_only_at_end_of_file() {
 }
 
 #[test]
+fn reads_on_many_threads_match_the_file() {
+    // A file that ends on a sector takes one more read to find its end.
+    for len in [64 * SECTOR + 123, 64 * SECTOR] {
+        let data = bytes(len);
+        let p = path("threads.bin");
+        fs::write(&p, &data).unwrap();
+        let file = ReadFile::open(&p).unwrap();
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let (file, data) = (&file, &data);
+                s.spawn(move || {
+                    let mut buf = AlignedBuf::new(3 * SECTOR);
+                    for i in 0..200 {
+                        // Every thread reaches the last sectors and the sector past the end.
+                        let offset = (i * 7 + t) % 66 * SECTOR;
+                        let n = file.read(offset as u64, &mut buf).unwrap();
+                        let start = offset.min(len);
+                        let end = (offset + 3 * SECTOR).min(len);
+                        assert_eq!(n, end - start, "offset {offset}");
+                        assert!(buf.as_slice()[..n] == data[start..end], "offset {offset}");
+                    }
+                });
+            }
+        });
+    }
+}
+
+#[test]
 fn open_file_can_be_replaced_by_rename() {
     let p = path("replace.bin");
     let new = path("replace.new");
@@ -137,8 +165,13 @@ fn open_file_can_be_replaced_by_rename() {
     let mut buf = [0; 32];
     let n = read_at(&shared, 0, &mut buf).unwrap();
     assert_eq!(&buf[..n], b"old contents");
-    // The per-thread handle is opened after the rename and still names the old file.
     let mut sector = AlignedBuf::new(SECTOR);
     let n = file.read(0, &mut sector).unwrap();
     assert_eq!(&sector.as_slice()[..n], b"old contents");
+    for ring in [Some(Ring::positioned()), Ring::native()]
+        .into_iter()
+        .flatten()
+    {
+        assert_eq!(run_ring(ring, &file, &[(0, SECTOR)]), [b"old contents"]);
+    }
 }

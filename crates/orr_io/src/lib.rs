@@ -1,18 +1,17 @@
 //! File reads: sector-aligned buffers, file handles that let a file be replaced by rename
-//! while open, a positioned read, and a completion ring for batched reads.
+//! while open, positioned reads, and a completion ring for batched reads.
 //!
 //! On Windows the ring is an IoRing, loaded at run time, and on Linux an io_uring. Elsewhere,
 //! and where the system refuses them, [`Ring::positioned`] runs the same reads as positioned
 //! reads.
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 #[cfg(not(any(windows, target_os = "linux")))]
 use std::sync::{Condvar, Mutex};
 
@@ -72,22 +71,18 @@ impl Drop for AlignedBuf {
 /// Opens `path` for reading so that it can be deleted, or replaced by a rename, while open.
 /// The handle keeps reading the file as it was when opened.
 pub fn open_shared(path: &Path) -> io::Result<File> {
-    open(path, false, false)
-}
-
-#[cfg(any(windows, target_os = "linux"))]
-use crate::sys::open;
-#[cfg(windows)]
-use crate::windows::reopen;
-
-#[cfg(not(any(windows, target_os = "linux")))]
-fn open(path: &Path, _unbuffered: bool, _overlapped: bool) -> io::Result<File> {
+    #[cfg(windows)]
+    return windows::open_shared(path);
+    #[cfg(not(windows))]
     File::open(path)
 }
 
-#[cfg(not(windows))]
-fn reopen(f: &File) -> io::Result<File> {
-    f.try_clone()
+#[cfg(any(windows, target_os = "linux"))]
+use crate::sys::open_unbuffered;
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn open_unbuffered(path: &Path) -> io::Result<(File, bool)> {
+    Ok((File::open(path)?, false))
 }
 
 /// Fills `buf` from `offset` like [`read_at`]; a file that ends first is `UnexpectedEof`.
@@ -100,82 +95,74 @@ pub fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()>
 
 /// Reads at `offset` into `buf` without moving a shared cursor, so many threads can read
 /// one `File`. Returns the bytes read; fewer than `buf.len()` only at the end of the file.
+/// A read that runs off the end of a file that does not end on a sector fails on an unbuffered
+/// `File`; [`ReadFile`] reads those.
 pub fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
     #[cfg(unix)]
     use std::os::unix::fs::FileExt;
     #[cfg(windows)]
     use std::os::windows::fs::FileExt;
-    // Each call asks for at most `CHUNK` bytes, under every platform's per-call limit, so a
-    // shorter read is the end of the file. Reading on past it would fail on an unbuffered
-    // handle, which rejects offsets that are not whole sectors.
+    read_all(offset, buf, false, |at, dst| {
+        #[cfg(windows)]
+        return file.seek_read(dst, at);
+        #[cfg(unix)]
+        file.read_at(dst, at)
+    })
+}
+
+/// Fills `buf` from `offset` with calls to `read`, each for at most 1 GiB, which is under every
+/// platform's limit for one call, until `buf` is full or the file ends. An unbuffered handle
+/// rejects offsets that are not whole sectors, and a read on one only ends off a sector at the
+/// end of the file, so with `unbuffered` that ends the loop.
+fn read_all(
+    offset: u64,
+    buf: &mut [u8],
+    unbuffered: bool,
+    read: impl Fn(u64, &mut [u8]) -> io::Result<usize>,
+) -> io::Result<usize> {
     const CHUNK: usize = 1 << 30;
     let mut done = 0;
     while done < buf.len() {
         let want = (buf.len() - done).min(CHUNK);
-        let dst = &mut buf[done..][..want];
-        let at = offset + done as u64;
-        #[cfg(windows)]
-        let n = file.seek_read(dst, at);
-        #[cfg(unix)]
-        let n = file.read_at(dst, at);
-        match n {
-            Ok(n) => {
-                done += n;
-                if n < want {
-                    break;
-                }
-            }
+        match read(offset + done as u64, &mut buf[done..][..want]) {
+            Ok(0) => break,
+            Ok(n) => done += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
+        }
+        if unbuffered && !(offset + done as u64).is_multiple_of(SECTOR as u64) {
+            break;
         }
     }
     Ok(done)
 }
 
-/// A file opened for unbuffered reads at [`SECTOR`] offsets, through a [`Ring`] or through
-/// each thread's own handle. On Linux the file is buffered where the file system refuses
-/// unbuffered reads. Every handle names the file as it was when opened, so a file renamed
-/// over the path later is never read through them.
+/// A file opened for unbuffered reads at [`SECTOR`] offsets, from any number of threads at
+/// once or through a [`Ring`]. On Linux the file is buffered where the file system refuses
+/// unbuffered reads. The handle names the file as it was when opened, so a file renamed over
+/// the path later is never read through it.
 pub struct ReadFile {
-    /// Unbuffered and overlapped, for IoRing.
-    #[cfg(windows)]
-    ring: File,
-    /// Unbuffered: threads reopen it for their own handles.
-    reads: File,
-}
-
-thread_local! {
-    /// This thread's own handle per open [`ReadFile`].
-    static HANDLES: RefCell<Vec<(Weak<ReadFile>, File)>> = const { RefCell::new(Vec::new()) };
+    /// Overlapped on Windows, where reads on a synchronous handle take turns. No read through
+    /// it may come from std, which aborts the process on a read that does not finish at once.
+    handle: File,
+    unbuffered: bool,
 }
 
 impl ReadFile {
     pub fn open(path: &Path) -> io::Result<Self> {
-        Ok(Self {
-            #[cfg(windows)]
-            ring: open(path, true, true)?,
-            reads: open(path, true, false)?,
-        })
+        let (handle, unbuffered) = open_unbuffered(path)?;
+        Ok(Self { handle, unbuffered })
     }
 
-    /// Reads at `offset`, a multiple of [`SECTOR`], into `buf` through the calling thread's
-    /// own handle, opened on first use. Threads sharing one handle serialize, so each reads
-    /// through its own. Returns the bytes read; fewer than the buffer only at the end of
-    /// the file.
-    pub fn read(self: &Arc<Self>, offset: u64, buf: &mut AlignedBuf) -> io::Result<usize> {
-        HANDLES.with_borrow_mut(|handles| {
-            handles.retain(|(f, _)| f.strong_count() > 0);
-            let i = match handles
-                .iter()
-                .position(|(f, _)| std::ptr::eq(f.as_ptr(), Arc::as_ptr(self)))
-            {
-                Some(i) => i,
-                None => {
-                    handles.push((Arc::downgrade(self), reopen(&self.reads)?));
-                    handles.len() - 1
-                }
-            };
-            read_at(&handles[i].1, offset, buf.as_mut_slice())
+    /// Reads at `offset`, a multiple of [`SECTOR`], into `buf`. Returns the bytes read; fewer
+    /// than the buffer only at the end of the file.
+    pub fn read(&self, offset: u64, buf: &mut AlignedBuf) -> io::Result<usize> {
+        debug_assert!(offset.is_multiple_of(SECTOR as u64));
+        read_all(offset, buf.as_mut_slice(), self.unbuffered, |at, dst| {
+            #[cfg(windows)]
+            return windows::read_overlapped(&self.handle, at, dst);
+            #[cfg(unix)]
+            std::os::unix::fs::FileExt::read_at(&self.handle, dst, at)
         })
     }
 }
@@ -244,7 +231,9 @@ impl Ring {
             Backend::Positioned(queued) => {
                 while let Some(read) = queued.pop_front() {
                     let mut buf = AlignedBuf::new(read.len);
-                    let result = read_at(&read.file.reads, read.offset, buf.as_mut_slice())
+                    let result = read
+                        .file
+                        .read(read.offset, &mut buf)
                         .map(|n| (buf, n.min(read.len)));
                     (read.done)(result);
                 }

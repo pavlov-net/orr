@@ -12,19 +12,18 @@ use crate::{AlignedBuf, Read};
 /// Reads in flight at once; 64 reach a fast NVMe drive's rate.
 const DEPTH: usize = 64;
 
-/// Opens with `O_DIRECT` when `unbuffered`, or buffered where the file system refuses it.
-pub(crate) fn open(path: &Path, unbuffered: bool, _overlapped: bool) -> io::Result<File> {
-    if unbuffered {
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(path)
-        {
-            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
-            r => return r,
-        }
+/// Opens with `O_DIRECT`, or buffered where the file system refuses it. Returns the file and
+/// whether it is unbuffered.
+pub(crate) fn open_unbuffered(path: &Path) -> io::Result<(File, bool)> {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+    {
+        Ok(f) => Ok((f, true)),
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok((File::open(path)?, false)),
+        Err(e) => Err(e),
     }
-    File::open(path)
 }
 
 /// An auto-reset event: an eventfd.
@@ -137,7 +136,7 @@ impl Uring {
                 continue;
             };
             let sqe = opcode::Read::new(
-                types::Fd(read.file.reads.as_raw_fd()),
+                types::Fd(read.file.handle.as_raw_fd()),
                 buf.as_mut_slice().as_mut_ptr(),
                 len,
             )

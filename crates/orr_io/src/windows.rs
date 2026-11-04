@@ -3,19 +3,19 @@ use std::ffi::c_void;
 use std::fs::File;
 use std::io;
 use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_HANDLE_EOF, GENERIC_READ, HANDLE, WAIT_FAILED,
+    CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, HANDLE, WAIT_FAILED,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, HIORING,
     IORING_BUFFER_REF, IORING_BUFFER_REF_0, IORING_CQE, IORING_CREATE_ADVISORY_FLAGS_NONE,
     IORING_CREATE_FLAGS, IORING_CREATE_REQUIRED_FLAGS_NONE, IORING_HANDLE_REF, IORING_HANDLE_REF_0,
-    IORING_REF_RAW, IORING_SQE_FLAGS, IORING_VERSION, IORING_VERSION_3, IOSQE_FLAGS_NONE,
-    ReOpenFile,
+    IORING_REF_RAW, IORING_SQE_FLAGS, IORING_VERSION, IORING_VERSION_3, IOSQE_FLAGS_NONE, ReadFile,
 };
+use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects};
 use windows::core::{HRESULT, PCSTR, w};
@@ -25,14 +25,7 @@ use crate::{AlignedBuf, Read};
 /// Reads in flight at once; 64 reach a fast NVMe drive's rate.
 const DEPTH: usize = 64;
 
-pub(crate) fn open(path: &Path, unbuffered: bool, overlapped: bool) -> io::Result<File> {
-    let mut flags = 0;
-    if unbuffered {
-        flags |= FILE_FLAG_NO_BUFFERING.0;
-    }
-    if overlapped {
-        flags |= FILE_FLAG_OVERLAPPED.0;
-    }
+fn open(path: &Path, flags: u32) -> io::Result<File> {
     std::fs::OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_DELETE.0)
@@ -40,23 +33,64 @@ pub(crate) fn open(path: &Path, unbuffered: bool, overlapped: bool) -> io::Resul
         .open(path)
 }
 
-/// A new unbuffered handle on the file `f` names, even if another file has since been
-/// renamed over its path.
-pub(crate) fn reopen(f: &File) -> io::Result<File> {
-    // SAFETY: `f` is a live handle; the new handle is owned by the returned File.
-    unsafe {
-        let h = ReOpenFile(
-            HANDLE(f.as_raw_handle()),
-            GENERIC_READ.0,
-            FILE_SHARE_READ | FILE_SHARE_DELETE,
-            FILE_FLAG_NO_BUFFERING,
-        )
-        .map_err(io::Error::other)?;
-        Ok(File::from_raw_handle(h.0))
+pub(crate) fn open_shared(path: &Path) -> io::Result<File> {
+    open(path, 0)
+}
+
+/// The file and that it is unbuffered. The handle is overlapped: read it with
+/// [`read_overlapped`] or an [`IoRing`].
+pub(crate) fn open_unbuffered(path: &Path) -> io::Result<(File, bool)> {
+    let flags = FILE_FLAG_NO_BUFFERING.0 | FILE_FLAG_OVERLAPPED.0;
+    Ok((open(path, flags)?, true))
+}
+
+/// One read at `offset` on an overlapped handle, which can run alongside reads on other
+/// threads. Reads nothing at the end of the file.
+pub(crate) fn read_overlapped(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+    let event = Event::manual()?;
+    let mut overlapped = OVERLAPPED {
+        hEvent: event.0,
+        ..Default::default()
+    };
+    overlapped.Anonymous.Anonymous.Offset = offset as u32;
+    overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+    let handle = HANDLE(file.as_raw_handle());
+    // SAFETY: `buf` and `overlapped` outlive the read, which is finished once this returns an
+    // error other than pending, or once the wait below returns.
+    let started = unsafe { ReadFile(handle, Some(buf), None, Some(&mut overlapped)) };
+    if let Err(e) = started
+        && e.code() != ERROR_IO_PENDING.to_hresult()
+    {
+        return read_error(&e);
+    }
+    let mut n = 0;
+    // SAFETY: the read above uses this handle and `overlapped`.
+    match unsafe { GetOverlappedResult(handle, &overlapped, &mut n, true) } {
+        Ok(()) => Ok(n as usize),
+        Err(e) => read_error(&e),
     }
 }
 
-/// An auto-reset event.
+fn read_error(e: &windows::core::Error) -> io::Result<usize> {
+    if e.code() == ERROR_HANDLE_EOF.to_hresult() {
+        Ok(0)
+    } else {
+        Err(os_error(e.code()))
+    }
+}
+
+/// The OS error for a failed `h`, whose kind callers can test when it came from a Win32 code.
+fn os_error(h: HRESULT) -> io::Error {
+    const FACILITY_WIN32: u32 = 0x8007_0000;
+    let code = h.0 as u32;
+    if code & 0xffff_0000 == FACILITY_WIN32 {
+        io::Error::from_raw_os_error((code & 0xffff) as i32)
+    } else {
+        io::Error::other(format!("HRESULT {code:#x}"))
+    }
+}
+
+/// An event: auto-reset, except from [`Event::manual`].
 pub(crate) struct Event(HANDLE);
 
 // SAFETY: event handles may be used from any thread.
@@ -68,6 +102,12 @@ impl Event {
     pub(crate) fn new() -> Self {
         // SAFETY: plain event creation.
         Self(unsafe { CreateEventW(None, false, false, None) }.expect("wake event"))
+    }
+
+    fn manual() -> io::Result<Self> {
+        // SAFETY: plain event creation.
+        let event = unsafe { CreateEventW(None, true, false, None) };
+        event.map(Self).map_err(|e| os_error(e.code()))
     }
 
     pub(crate) fn set(&self) {
@@ -217,7 +257,7 @@ impl IoRing {
             let file = IORING_HANDLE_REF {
                 Kind: IORING_REF_RAW,
                 Handle: IORING_HANDLE_REF_0 {
-                    Handle: HANDLE(read.file.ring.as_raw_handle()),
+                    Handle: HANDLE(read.file.handle.as_raw_handle()),
                 },
             };
             let data = IORING_BUFFER_REF {
@@ -266,8 +306,10 @@ impl IoRing {
             // A read that starts at or past the end of the file reads nothing, as `read_at`.
             let result = if cqe.ResultCode == ERROR_HANDLE_EOF.to_hresult() {
                 Ok((f.buf, 0))
+            } else if cqe.ResultCode.is_err() {
+                Err(os_error(cqe.ResultCode))
             } else {
-                hr("IoRing read", cqe.ResultCode).map(|()| (f.buf, cqe.Information.min(f.read.len)))
+                Ok((f.buf, cqe.Information.min(f.read.len)))
             };
             (f.read.done)(result);
         }
