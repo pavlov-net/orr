@@ -354,6 +354,7 @@ impl Device {
             ClassicKind::Blas => "classic blas",
             ClassicKind::Tlas => "classic tlas",
         })));
+        self.shared.structure_ids.note(&raw);
         let id = super::heap::id_bits(raw.gpuResourceID());
         Ok(ClassicAs {
             raw: Obj(raw),

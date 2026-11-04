@@ -18,9 +18,15 @@
 //! Metal builds only what the CPU encodes with exact counts, so cluster ops copy their
 //! records back and finish in a CPU step ([`CommandList::split`]) once the GPU has written
 //! them. PTLAS builds need none.
+//!
+//! Metal finds a structure from its ID through a table that grows as structures are created,
+//! and work encoded before a growth misses IDs past the old size: its traces and TLAS builds
+//! see no geometry. A CPU step creates structures after the work that uses them was encoded,
+//! so recording the op grows the table first ([`StructureIds`]).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -32,12 +38,13 @@ use objc2_metal::{
     MTL4InstanceAccelerationStructureDescriptor, MTL4LibraryFunctionDescriptor,
     MTL4PrimitiveAccelerationStructureDescriptor, MTLAccelerationStructure,
     MTLAccelerationStructureDescriptor, MTLAccelerationStructureInstanceDescriptorType,
-    MTLAccelerationStructureUsage, MTLAttributeFormat, MTLComputePipelineState, MTLDevice,
-    MTLIndexType, MTLResidencySet,
+    MTLAccelerationStructureUsage, MTLAttributeFormat, MTLBuffer, MTLComputePipelineState,
+    MTLDevice, MTLIndexType, MTLResidencySet, MTLResource, MTLResourceOptions,
 };
 
 use super::command::CommandList;
 use super::device::{Device, Shared, metal_error};
+use super::heap::id_bits;
 use super::memory::{Allocation, MemoryKind, malloc};
 use super::{Obj, lock};
 use crate::rtas::{PtlasArgs, RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc, RtasSizes};
@@ -122,7 +129,75 @@ impl Objects {
     }
 }
 
+/// The acceleration-structure IDs Metal's table holds. A CPU step hands out IDs no higher
+/// than the highest so far plus the structures recorded steps may still create, so
+/// recording an op makes the table hold those first.
+#[derive(Default)]
+pub(super) struct StructureIds {
+    /// The highest ID a structure the backend keeps has had.
+    high: AtomicU64,
+    /// Structures that recorded CPU steps may still create.
+    pending: AtomicU64,
+    /// IDs the table holds at least. Held while growing it.
+    held: std::sync::Mutex<u64>,
+}
+
+impl StructureIds {
+    pub(super) fn note(&self, s: &Structure) {
+        self.high
+            .fetch_max(id_bits(s.gpuResourceID()), Ordering::Relaxed);
+    }
+}
+
+/// Structures a recorded CPU step may create; released with the step.
+struct Reservation {
+    shared: Arc<Shared>,
+    count: u64,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.shared
+            .structure_ids
+            .pending
+            .fetch_sub(self.count, Ordering::Relaxed);
+    }
+}
+
 impl Shared {
+    /// Makes room in Metal's ID table for `count` more structures, created by a CPU step
+    /// after work recorded before it. Grows the table by creating throwaway structures,
+    /// to the next power of two past what is needed, so growths stay rare.
+    fn reserve_structures(self: &Arc<Self>, count: u64) -> Reservation {
+        let ids = &self.structure_ids;
+        let pending = ids.pending.fetch_add(count, Ordering::Relaxed) + count;
+        let reservation = Reservation {
+            shared: Arc::clone(self),
+            count,
+        };
+        let need = ids.high.load(Ordering::Relaxed) + pending + 1;
+        let mut held = lock(&ids.held);
+        if need > *held {
+            let target = need.next_power_of_two().max(256);
+            // New IDs take the lowest free ones: the last of `target` structures has an ID
+            // at least `target - 1`, which makes the table hold `target`.
+            let mut throwaway = Vec::new();
+            while (throwaway.len() as u64) < target {
+                let s = self
+                    .device
+                    .newAccelerationStructureWithSize(16)
+                    .expect("newAccelerationStructureWithSize");
+                let id = id_bits(s.gpuResourceID());
+                throwaway.push(s);
+                if id + 1 >= target {
+                    break;
+                }
+            }
+            *held = target;
+        }
+        reservation
+    }
+
     /// Forgets the objects in `[start, end)`, memory being freed, and releases their
     /// structures; runs when nothing submitted uses them any more.
     pub(super) fn forget_objects(&self, start: u64, end: u64) {
@@ -164,6 +239,7 @@ impl Shared {
             .device
             .newAccelerationStructureWithSize(sizes.accelerationStructureSize.max(1))
             .expect("newAccelerationStructureWithSize");
+        self.structure_ids.note(&raw);
         (Obj(raw), sizes.buildScratchBufferSize as u64)
     }
 }
@@ -177,6 +253,7 @@ pub(super) struct Kernels {
     ptlas_clear: Obj<ProtocolObject<dyn MTLComputePipelineState>>,
     ptlas_apply: Obj<ProtocolObject<dyn MTLComputePipelineState>>,
     ptlas_descriptors: Obj<ProtocolObject<dyn MTLComputePipelineState>>,
+    ptlas_check: Obj<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl Kernels {
@@ -205,7 +282,57 @@ impl Kernels {
             ptlas_clear: state("ptlas_clear")?,
             ptlas_apply: state("ptlas_apply")?,
             ptlas_descriptors: state("ptlas_descriptors")?,
+            ptlas_check: state("ptlas_check")?,
         })
+    }
+}
+
+/// The debug PTLAS check's count of rejected builds, which the GPU adds to.
+pub(super) struct PtlasCheck {
+    failures: Obj<super::Buffer>,
+    reported: std::sync::atomic::AtomicU32,
+}
+
+impl PtlasCheck {
+    fn get(shared: &Shared) -> &PtlasCheck {
+        shared.ptlas_check.get_or_init(|| {
+            let options = MTLResourceOptions::StorageModeShared
+                | MTLResourceOptions::HazardTrackingModeUntracked;
+            let failures = shared
+                .device
+                .newBufferWithLength_options(4, options)
+                .expect("the PTLAS check's failure count");
+            failures.setLabel(Some(&NSString::from_str("orr PTLAS check failures")));
+            // SAFETY: shared storage is mapped and zeroed; nothing else uses it yet.
+            unsafe { failures.contents().cast::<u32>().as_ptr().write(0) };
+            let mut r = lock(&shared.residency);
+            r.set.addAllocation(ProtocolObject::from_ref(&*failures));
+            r.dirty = true;
+            PtlasCheck {
+                failures: Obj(failures),
+                reported: Default::default(),
+            }
+        })
+    }
+
+    /// Rejected builds among completed work; logs the ones not reported before.
+    pub(super) fn failures(&self) -> u32 {
+        // SAFETY: the word stays mapped while the buffer lives; the GPU only adds to it.
+        let n = unsafe {
+            self.failures
+                .contents()
+                .cast::<u32>()
+                .as_ptr()
+                .read_volatile()
+        };
+        let before = self.reported.swap(n, Ordering::Relaxed);
+        if n > before {
+            log::error!(
+                "{} PTLAS build(s) rejected: more commands than PtlasLimits::max_ops, an unknown op or two commands of one op type",
+                n - before
+            );
+        }
+        n
     }
 }
 
@@ -446,8 +573,13 @@ impl CommandList<'_> {
         } else {
             let (d, io) = (*d, *io);
             let readback = self.read_records(&d, &io);
+            let creates = match d.op {
+                RtasOp::BuildTemplates | RtasOp::Move => 0,
+                _ => u64::from(max_args(&d)),
+            };
+            let reservation = self.queue.shared.reserve_structures(creates);
             self.split(Box::new(move |list: &mut CommandList<'_>| {
-                list.cluster_step(&d, &io, &readback)
+                list.cluster_step(&d, &io, &readback, reservation);
             }));
         }
         self.barrier(Stages::AS_BUILD, Stages::ALL, Hazards::ACCEL_STRUCT);
@@ -488,8 +620,15 @@ impl CommandList<'_> {
         }
     }
 
-    /// The CPU half of a cluster op: encodes it from the records the GPU wrote.
-    fn cluster_step(&mut self, d: &RtasOpDesc, io: &RtasIo, rb: &Readback) {
+    /// The CPU half of a cluster op: encodes it from the records the GPU wrote. The
+    /// structures it creates are within `reservation`, which it keeps until they exist.
+    fn cluster_step(
+        &mut self,
+        d: &RtasOpDesc,
+        io: &RtasIo,
+        rb: &Readback,
+        reservation: Reservation,
+    ) {
         let count = rb.count(max_args(d)) as usize;
         if count == 0 {
             return;
@@ -498,7 +637,7 @@ impl CommandList<'_> {
             RtasOp::BuildClas | RtasOp::BuildTemplates | RtasOp::InstantiateTemplates => {
                 self.build_objects(d, io, rb, count)
             }
-            RtasOp::BuildClusterBlas => self.build_blas(d, io, rb, count),
+            RtasOp::BuildClusterBlas => self.build_blas(d, io, rb, count, reservation),
             RtasOp::Move => self.move_objects(d, io, rb, count),
             RtasOp::Ptlas => unreachable!("PTLAS builds take no CPU step"),
         }
@@ -697,7 +836,7 @@ impl CommandList<'_> {
                     false,
                 );
                 let (s, scratch) = shared.structure(&desc);
-                id = super::heap::id_bits(s.gpuResourceID());
+                id = id_bits(s.gpuResourceID());
                 builds.push((s.clone(), desc, scratch));
                 raw = Some(s);
             }
@@ -732,7 +871,14 @@ impl CommandList<'_> {
     }
 
     /// Cluster BLAS builds.
-    fn build_blas(&mut self, d: &RtasOpDesc, io: &RtasIo, rb: &Readback, count: usize) {
+    fn build_blas(
+        &mut self,
+        d: &RtasOpDesc,
+        io: &RtasIo,
+        rb: &Readback,
+        count: usize,
+        reservation: Reservation,
+    ) {
         let blas: Vec<(u64, u32)> = (0..count)
             .map(|i| {
                 let r = rb.record(i);
@@ -771,6 +917,7 @@ impl CommandList<'_> {
             }
             let io = *io;
             self.split(Box::new(move |list: &mut CommandList<'_>| {
+                let _reservation = reservation;
                 let bytes = memory.as_slice().expect("readback is mapped");
                 let mut at = 0;
                 let clas: Vec<Vec<u64>> = blas
@@ -807,7 +954,7 @@ impl CommandList<'_> {
         for (&(list, n), &at) in blas.iter().zip(addresses) {
             let desc = instances(out, n);
             let (s, scratch) = shared.structure(&desc);
-            let id = super::heap::id_bits(s.gpuResourceID());
+            let id = id_bits(s.gpuResourceID());
             jobs.push(BlasJob {
                 clas: list,
                 out,
@@ -894,7 +1041,7 @@ impl CommandList<'_> {
                 (primitive(&geometries, false), Kind::BlasFlat)
             };
             let (raw, scratch) = shared.structure(&s);
-            let id = super::heap::id_bits(raw.gpuResourceID());
+            let id = id_bits(raw.gpuResourceID());
             builds.push((raw.clone(), s, scratch));
             headers.push((at, header(kind, HEADER, id, &[])));
             shared.place(
@@ -1031,7 +1178,7 @@ impl CommandList<'_> {
                 raw
             }
         };
-        let id = super::heap::id_bits(raw.gpuResourceID());
+        let id = id_bits(raw.gpuResourceID());
         let k = Kernels::get(&shared);
         let (clear, apply, descriptors) = (
             k.ptlas_clear.clone(),
@@ -1049,6 +1196,19 @@ impl CommandList<'_> {
         };
         let threads = l.instances.max(l.partitions + 1);
         let groups = [threads.div_ceil(GROUP), 1, 1];
+        if cfg!(debug_assertions) {
+            let check = PtlasCheck::get(&shared);
+            let args = PtlasCheckArgs {
+                commands: io.args.0,
+                count: io.count.address().0,
+                failures: check.failures.gpuAddress(),
+                max_ops: l.max_ops,
+                pad: 0,
+            };
+            let state = k.ptlas_check.clone();
+            self.barrier(Stages::ALL, Stages::COMPUTE, Hazards::empty());
+            self.dispatch_state(&state, bytemuck::bytes_of(&args), [1, 1, 1], [1, 1, 1]);
+        }
         self.barrier(
             Stages::ALL,
             Stages::COMPUTE | Stages::TRANSFER,
@@ -1128,6 +1288,16 @@ struct CopyJob {
     src: u64,
     dst: u64,
     words: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct PtlasCheckArgs {
+    commands: u64,
+    count: u64,
+    failures: u64,
+    max_ops: u32,
     pad: u32,
 }
 
