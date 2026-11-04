@@ -12,7 +12,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # macOS is the only platform that builds the Metal backend, so it is what catches a
+        # Vulkan-side change that breaks it.
+        os: [ubuntu-latest, windows-latest, macos-26]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -25,12 +27,18 @@ jobs:
           key: tools-dl-${{ runner.os }}-${{ hashFiles('tools/fetch-slang.sh') }}
       - name: Fetch pinned tools
         run: bash tools/fetch-slang.sh
+      # Apple targets compile every kernel into Metal libraries, and Xcode ships the Metal
+      # compiler as a separate component.
+      - name: Install the Metal toolchain
+        if: runner.os == 'macOS'
+        run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
       # Every crate, test and example builds on both platforms; this is what catches a
       # commit that does not build on its own.
       - name: Check the workspace
         run: cargo check --workspace --all-targets
       # What Apple targets build: orr without DLSS.
       - name: Check the workspace without DLSS
+        if: runner.os != 'macOS'
         run: cargo check --workspace --all-targets --no-default-features
       - name: Test file IO
         run: cargo test -p orr_io
