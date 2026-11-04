@@ -10,18 +10,18 @@ links = "orr_gpu"
 
 [dependencies]
 orr_shaders.workspace = true
-ash.workspace = true
 raw-window-handle.workspace = true
 bitflags.workspace = true
 blake3.workspace = true
 bytemuck.workspace = true
-libloading.workspace = true
 log.workspace = true
 thiserror.workspace = true
 
-# VMA, which the Vulkan backend allocates through; Apple targets have no Vulkan backend.
+# The Vulkan backend; Apple targets have none.
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
 orr_memory.workspace = true
+ash.workspace = true
+libloading.workspace = true
 
 # The Metal 4 backend.
 [target.'cfg(target_vendor = "apple")'.dependencies]
