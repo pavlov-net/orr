@@ -376,8 +376,10 @@ Candidate candidate(inout RayQuery<RAY_FLAG_NONE> q)
 // Metal has no cluster acceleration structures and fetches no corners from hits. The backend
 // gives every triangle primitive data: its cluster ID (-1 outside clusters), geometry index
 // and flags, triangle in the cluster and its three corners. Its stand-ins for cluster BLAS
-// also set bit 31 of their instances' user ID.
+// also set bit 31 of their instances' user ID, and instances forced non-opaque bit 30, since
+// a query cannot read an instance's options.
 static const uint METAL_CLUSTER_INSTANCE = 0x80000000;
+static const uint METAL_FORCED_NON_OPAQUE = 0x40000000;
 static const uint METAL_GEOMETRY_OPAQUE = 0x80000000;
 
 uint64_t metal_candidate_data(inout RayQuery<RAY_FLAG_NONE> q)
@@ -402,15 +404,17 @@ uint64_t metal_committed_data(inout RayQuery<RAY_FLAG_NONE> q)
 
 // Whether a non-opaque candidate is an opaque triangle of a cluster: Metal makes a whole
 // geometry opaque or not, so a cluster mixing them arrives whole and its triangles' own
-// flags decide here. Always false outside Metal.
+// flags decide here, unless its instance is forced non-opaque, as a fading copy is. Always
+// false outside Metal.
 [ForceInline]
 bool opaque_candidate(inout RayQuery<RAY_FLAG_NONE> q, uint flags)
 {
     __target_switch
     {
     case metal:
+        uint user = q.CandidateInstanceID();
         if ((flags & RAY_FLAG_FORCE_NON_OPAQUE) != 0 || q.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE
-            || (q.CandidateInstanceID() & METAL_CLUSTER_INSTANCE) == 0)
+            || (user & METAL_CLUSTER_INSTANCE) == 0 || (user & METAL_FORCED_NON_OPAQUE) != 0)
             return false;
         return (*(uint*)(metal_candidate_data(q) + 4) & METAL_GEOMETRY_OPAQUE) != 0;
     default:

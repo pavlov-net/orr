@@ -290,7 +290,7 @@ kernel void ptlas_descriptors(constant PtlasArgs& a [[buffer(0)]], uint i [[thre
     o.options = r[21] & 0xf;
     o.mask = blas == 0 ? 0 : r[19] & 0xff;
     o.ift = 0;
-    o.user = (r[18] & 0xffffff) | (cluster ? 1u << 31 : 0u);
+    o.user = (r[18] & 0xffffff) | (cluster ? 1u << 31 : 0u) | ((o.options & 8u) != 0 ? 1u << 30 : 0u);
     o.id = id;
     if (blas == 0)
         for (uint c = 0; c < 4; c++) o.m[c] = packed_float3(0);

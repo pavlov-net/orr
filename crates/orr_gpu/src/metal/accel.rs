@@ -59,7 +59,7 @@ kernel void convert(constant Args& a [[buffer(0)]], uint i [[thread_position_in_
     o.ift_offset = 0;
     bool cluster;
     o.as_id = resolve(v.blas, cluster);
-    o.user_id = (v.custom_mask & 0xffffff) | (cluster ? 1u << 31 : 0u);
+    o.user_id = (v.custom_mask & 0xffffff) | (cluster ? 1u << 31 : 0u) | ((o.options & 8u) != 0 ? 1u << 30 : 0u);
     a.dst[i] = o;
 }
 // The per-triangle data of a classic triangle BLAS, as cluster BLAS give theirs (cluster.msl):
