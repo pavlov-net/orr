@@ -17,6 +17,7 @@ fn main() {
 }
 
 #[cfg(not(windows))]
+#[allow(clippy::print_stderr)]
 fn main() {
     eprintln!("the display example needs gpu_suite's window, which is Windows-only");
 }

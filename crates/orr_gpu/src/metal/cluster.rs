@@ -637,7 +637,7 @@ impl CommandList<'_> {
         }
         match d.op {
             RtasOp::BuildClas | RtasOp::BuildTemplates | RtasOp::InstantiateTemplates => {
-                self.build_objects(d, io, rb, count)
+                self.build_objects(d, io, rb, count);
             }
             RtasOp::BuildClusterBlas => self.build_blas(d, io, rb, count, reservation),
             RtasOp::Move => self.move_objects(d, io, rb, count),

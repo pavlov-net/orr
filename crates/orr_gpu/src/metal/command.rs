@@ -42,13 +42,12 @@ pub(super) enum Encoder {
 /// builds whose counts kernels decide.
 pub(super) type HostStep = Box<dyn FnOnce(&mut CommandList<'_>) + Send>;
 
+type CommandBuffer = Retained<ProtocolObject<dyn MTL4CommandBuffer>>;
+
 /// What a list's commands use until its submit completes.
 pub(super) struct Finished {
     /// The list's command buffers in order, each with the CPU step that follows it.
-    pub(super) buffers: Vec<(
-        Retained<ProtocolObject<dyn MTL4CommandBuffer>>,
-        Option<HostStep>,
-    )>,
+    pub(super) buffers: Vec<(CommandBuffer, Option<HostStep>)>,
     _allocator: Retained<ProtocolObject<dyn MTL4CommandAllocator>>,
     _table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
     _inline: Vec<Allocation<u8>>,
@@ -435,8 +434,8 @@ impl<'q> CommandList<'q> {
         // SAFETY: ring indices are within the heap.
         unsafe {
             self.buffer
-                .writeTimestampIntoHeap_atIndex(&ring.heap, TimestampRing::index(seq))
-        };
+                .writeTimestampIntoHeap_atIndex(&ring.heap, TimestampRing::index(seq));
+        }
         self.passes.push((name, seq));
         self.in_pass = true;
     }
@@ -449,8 +448,8 @@ impl<'q> CommandList<'q> {
         // SAFETY: as in `begin_pass`.
         unsafe {
             self.buffer
-                .writeTimestampIntoHeap_atIndex(&ring.heap, TimestampRing::index(seq + 1))
-        };
+                .writeTimestampIntoHeap_atIndex(&ring.heap, TimestampRing::index(seq + 1));
+        }
         self.buffer.popDebugGroup();
         self.in_pass = false;
     }

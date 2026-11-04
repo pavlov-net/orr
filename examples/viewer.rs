@@ -201,6 +201,8 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         .and_then(|(id, _)| renderer.screenshots(history, id).pop())
         .map(|shot| Capture::from_screenshot(&shot));
     drop(average);
+    // Off Windows the overlay is a stub that holds nothing.
+    #[allow(clippy::drop_non_drop)]
     drop(overlay);
     drop(headless_target);
     drop(showcase);
