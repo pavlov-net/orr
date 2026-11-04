@@ -66,6 +66,7 @@ pub use error::VkResult;
 pub use format::Format;
 pub use generated::{Generated, Sequence, SetKind};
 pub use memory::{HeapReport, MemoryKind, MemoryPriority, MemoryReport, MemoryUsage};
+pub use orr_memory::AllocError;
 pub use orr_shaders::abi::*;
 pub use orr_shaders::{EntryPoint, KernelSet, ShaderModule, Stage};
 pub use present::{
@@ -89,16 +90,12 @@ pub use texture::{
 };
 
 #[cfg(target_vendor = "apple")]
-pub use metal::AllocError;
-#[cfg(target_vendor = "apple")]
 pub use metal::{
     Allocation, ClassicAs, CommandList, ComputePipeline, Device, DeviceArenas, DeviceHooks,
     Diagnostics, ExecutionSet, HostArenas, HostTimeline, LowLatency, MeshPipeline, Micromap, Queue,
     RayDispatchPipeline, ShaderStage, SparseAllocation, SparseBinds, Swapchain, SwapchainFrame,
     Texture,
 };
-#[cfg(not(target_vendor = "apple"))]
-pub use orr_memory::AllocError;
 #[cfg(not(target_vendor = "apple"))]
 pub use vulkan::{
     Allocation, ClassicAs, CommandList, ComputePipeline, Device, DeviceArenas, DeviceHooks,

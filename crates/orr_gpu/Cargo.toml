@@ -10,6 +10,7 @@ links = "orr_gpu"
 
 [dependencies]
 orr_shaders.workspace = true
+orr_memory.workspace = true
 raw-window-handle.workspace = true
 bitflags.workspace = true
 blake3.workspace = true
@@ -19,15 +20,14 @@ thiserror.workspace = true
 
 # The Vulkan backend; Apple targets have none.
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
-orr_memory.workspace = true
 ash.workspace = true
 libloading.workspace = true
 
 # The Metal 4 backend.
 [target.'cfg(target_vendor = "apple")'.dependencies]
-objc2 = "0.6"
-objc2-foundation = "0.3"
-objc2-metal = "0.3.2"
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-metal.workspace = true
 block2 = "0.6"
 dispatch2 = "0.3"
 

@@ -1,7 +1,7 @@
 use std::alloc::Layout;
 use std::ptr;
 
-use crate::{AllocError, Result, check, sys};
+use crate::{AllocError, sys};
 
 /// Places ranges inside a space of `size` units that the caller owns: a buffer, a heap of
 /// slots, a file. It touches no memory and needs no device.
@@ -44,8 +44,8 @@ pub struct VirtualStats {
 impl VirtualBlock {
     /// A block of `size` units. `linear` places each range after the last, reusing freed
     /// space only at the ends (a ring or a stack); otherwise ranges go to the best free fit
-    /// (TLSF). Panics if `size` is 0.
-    pub fn new(size: u64, linear: bool) -> Result<Self> {
+    /// (TLSF). Panics if `size` is 0; fails only when the host is out of memory.
+    pub fn new(size: u64, linear: bool) -> Result<Self, AllocError> {
         assert!(size > 0, "a virtual block of 0 units");
         let info = sys::VmaVirtualBlockCreateInfo {
             size,
@@ -58,9 +58,9 @@ impl VirtualBlock {
         };
         let mut raw = ptr::null_mut();
         // SAFETY: valid create info and out pointer.
-        check("vmaCreateVirtualBlock", unsafe {
-            sys::vmaCreateVirtualBlock(&info, &mut raw)
-        })?;
+        if unsafe { sys::vmaCreateVirtualBlock(&info, &mut raw) } != sys::VK_SUCCESS {
+            return Err(AllocError);
+        }
         Ok(Self { raw, generation: 0 })
     }
 
@@ -81,7 +81,9 @@ impl VirtualBlock {
         let mut offset = 0;
         // SAFETY: a live block, valid create info and out pointers.
         let r = unsafe { sys::vmaVirtualAllocate(self.raw, &info, &mut raw, &mut offset) };
-        check("vmaVirtualAllocate", r).map_err(|_| AllocError)?;
+        if r != sys::VK_SUCCESS {
+            return Err(AllocError);
+        }
         Ok(VirtualAllocation {
             offset,
             size: info.size,

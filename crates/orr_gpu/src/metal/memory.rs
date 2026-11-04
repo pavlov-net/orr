@@ -1,4 +1,5 @@
 use std::alloc::Layout;
+use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
@@ -9,11 +10,13 @@ use bytemuck::Pod;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLAllocation, MTLBuffer, MTLDevice, MTLHazardTrackingMode, MTLHeap, MTLHeapDescriptor,
-    MTLHeapType, MTLResidencySet, MTLResource, MTLResourceOptions, MTLStorageMode,
+    MTLBuffer, MTLCPUCacheMode, MTLDevice, MTLHazardTrackingMode, MTLHeap, MTLHeapDescriptor,
+    MTLResidencySet, MTLResource, MTLResourceOptions, MTLSharedEvent, MTLStorageMode,
 };
+use orr_memory::{AllocError, Arena, HeapAllocation, HeapPool};
 
 use super::device::{Device, Shared};
+use super::sparse::SPARSE_PAGE;
 use super::{Buffer, Obj, lock};
 use crate::{
     Error, GpuAddress, GpuPtr, HeapReport, MemoryKind, MemoryPriority, MemoryReport, TimelinePoint,
@@ -22,24 +25,56 @@ use crate::{
 /// Every allocation starts at a multiple of this many bytes.
 const MALLOC_ALIGN: u64 = 256;
 
-/// No free range fits the requested layout.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct AllocError;
+/// Bytes of each heap a pool shares between allocations.
+const HEAP_BYTES: u64 = 64 << 20;
 
-impl std::fmt::Display for AllocError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("memory allocation failed")
-    }
+/// DeviceLocal allocations start at a multiple of this many bytes, a GPU page, which covers
+/// the placement alignment Metal asks of textures (up to 2 KiB) and acceleration structures
+/// (1 KiB), so either can be placed at the start of an allocation sized for it.
+const DEVICE_LOCAL_ALIGN: u64 = 16 << 10;
+
+/// DeviceLocal allocations this large start and end on a sparse page, so sparse pages can be
+/// bound to them too.
+const PLACEMENT_MIN_BYTES: u64 = 64 << 10;
+
+/// The heap pools `gpu_malloc` places buffers in, indexed by [`MemoryKind`]: shared storage for
+/// Upload and Readback, private storage that takes sparse pages for DeviceLocal.
+pub(super) fn heap_pools(device: &Obj<ProtocolObject<dyn MTLDevice>>) -> [HeapPool; 3] {
+    MemoryKind::ALL.map(|kind| {
+        let desc = MTLHeapDescriptor::new();
+        desc.setHazardTrackingMode(MTLHazardTrackingMode::Untracked);
+        desc.setCpuCacheMode(MTLCPUCacheMode::DefaultCache);
+        if kind == MemoryKind::DeviceLocal {
+            desc.setStorageMode(MTLStorageMode::Private);
+            desc.setMaxCompatiblePlacementSparsePageSize(SPARSE_PAGE);
+        } else {
+            desc.setStorageMode(MTLStorageMode::Shared);
+        }
+        HeapPool::new(device.0.clone(), desc, HEAP_BYTES, &format!("orr {kind:?}"))
+    })
 }
 
-impl std::error::Error for AllocError {}
+fn options(kind: MemoryKind) -> MTLResourceOptions {
+    let storage = match kind {
+        MemoryKind::DeviceLocal => MTLResourceOptions::StorageModePrivate,
+        MemoryKind::Upload | MemoryKind::Readback => MTLResourceOptions::StorageModeShared,
+    };
+    storage | MTLResourceOptions::HazardTrackingModeUntracked
+}
 
-/// The Metal objects behind an allocation.
+/// The Metal objects behind an allocation: a buffer placed in a range of a pool's heap.
 pub(super) struct RawBuffer {
     pub(super) kind: MemoryKind,
     pub(super) buffer: Obj<Buffer>,
-    /// The placement heap of a DeviceLocal allocation, which textures can be placed in.
-    pub(super) heap: Option<Obj<ProtocolObject<dyn MTLHeap>>>,
+    memory: HeapAllocation,
+}
+
+impl RawBuffer {
+    /// The heap of a DeviceLocal allocation and where the allocation starts in it, for
+    /// textures, sparse pages and acceleration structures placed in the allocation.
+    pub(super) fn placement(&self) -> Option<(&ProtocolObject<dyn MTLHeap>, u64)> {
+        (self.kind == MemoryKind::DeviceLocal).then(|| (self.memory.heap(), self.memory.offset()))
+    }
 }
 
 /// GPU memory from [`Device::gpu_malloc`]: `count` values of `T` at [`Allocation::gpu`],
@@ -123,22 +158,26 @@ impl<T> Drop for Allocation<T> {
     }
 }
 
-/// Takes a freed buffer out of the address map and the residency set.
+/// Takes a freed buffer out of the address map, then gives its range back to its pool and
+/// a heap the pool releases out of the residency set.
 fn release_buffer(shared: &Shared, start: u64, raw: RawBuffer) {
     lock(&shared.buffers).remove(start);
-    shared.forget_objects(start, start + raw.buffer.length() as u64);
-    let mut r = lock(&shared.residency);
-    match &raw.heap {
-        Some(heap) => r.set.removeAllocation(ProtocolObject::from_ref(&**heap)),
-        None => r
-            .set
-            .removeAllocation(ProtocolObject::from_ref(&*raw.buffer)),
+    let RawBuffer {
+        kind,
+        buffer,
+        memory,
+    } = raw;
+    let size = buffer.length() as u64;
+    shared.forget_objects(start, start + size);
+    drop(buffer);
+    if let Some(heap) = lock(&shared.heaps[kind.index()]).free(memory) {
+        let mut r = lock(&shared.residency);
+        r.set.removeAllocation(ProtocolObject::from_ref(&*heap));
+        r.dirty = true;
     }
-    r.dirty = true;
-    drop(r);
     let mut usage = lock(&shared.usage);
-    let u = &mut usage[raw.kind.index()];
-    u.bytes -= raw.buffer.length() as u64;
+    let u = &mut usage[kind.index()];
+    u.bytes -= size;
     u.allocations -= 1;
 }
 
@@ -192,7 +231,7 @@ impl Device {
             heaps: vec![HeapReport {
                 size: budget,
                 device_local: true,
-                block_bytes: kinds.iter().map(|k| k.bytes).sum(),
+                block_bytes: s.heaps.iter().map(|p| lock(p).heap_bytes()).sum(),
                 budget: Some(budget),
                 usage: Some(s.device.currentAllocatedSize() as u64),
             }],
@@ -200,6 +239,7 @@ impl Device {
         }
     }
 
+    /// `count` arenas of `bytes` each in `kind` memory, Upload or Readback.
     pub fn create_host_arenas(
         &self,
         kind: MemoryKind,
@@ -207,18 +247,24 @@ impl Device {
         bytes: u64,
         name: &str,
     ) -> Result<HostArenas, Error> {
-        let _ = (kind, count, bytes, name);
-        Err(Error::NotImplemented("Device::create_host_arenas"))
+        if kind == MemoryKind::DeviceLocal {
+            return Err(Error::Invalid(format!(
+                "{name}: host arenas take Upload or Readback memory"
+            )));
+        }
+        let ring = Ring::new(&self.shared, kind, count, bytes, name)?;
+        Ok(HostArenas { ring })
     }
 
+    /// `count` arenas of `bytes` each in DeviceLocal memory.
     pub fn create_device_arenas(
         &self,
         count: u32,
         bytes: u64,
         name: &str,
     ) -> Result<DeviceArenas, Error> {
-        let _ = (count, bytes, name);
-        Err(Error::NotImplemented("Device::create_device_arenas"))
+        let ring = Ring::new(&self.shared, MemoryKind::DeviceLocal, count, bytes, name)?;
+        Ok(DeviceArenas { ring })
     }
 }
 
@@ -259,136 +305,339 @@ pub(super) fn malloc<T>(
 }
 
 impl Shared {
-    /// A buffer of `size` bytes of `kind` memory, resident and in the address map.
+    /// A buffer of `size` bytes of `kind` memory, placed in one of the kind's heaps, resident
+    /// and in the address map.
     pub(super) fn create_buffer(
         &self,
         kind: MemoryKind,
         size: u64,
         name: &str,
     ) -> Result<RawBuffer, Error> {
-        let label = NSString::from_str(name);
         let no_memory = || Error::Metal {
             call: "newBufferWithLength",
             message: format!("{name}: {size} bytes of {kind:?} memory"),
         };
-        let size = size.next_multiple_of(MALLOC_ALIGN);
-        let raw = match kind {
-            MemoryKind::Upload | MemoryKind::Readback => {
-                let options = MTLResourceOptions::StorageModeShared
-                    | MTLResourceOptions::HazardTrackingModeUntracked;
-                let buffer = self
-                    .device
-                    .newBufferWithLength_options(size as usize, options)
-                    .ok_or_else(no_memory)?;
-                buffer.setLabel(Some(&label));
-                RawBuffer {
-                    kind,
-                    buffer: Obj(buffer),
-                    heap: None,
-                }
-            }
-            MemoryKind::DeviceLocal => {
-                let options = MTLResourceOptions::StorageModePrivate
-                    | MTLResourceOptions::HazardTrackingModeUntracked;
-                let sa = self
-                    .device
-                    .heapBufferSizeAndAlignWithLength_options(size as usize, options);
-                let desc = MTLHeapDescriptor::new();
-                desc.setType(MTLHeapType::Placement);
-                desc.setMaxCompatiblePlacementSparsePageSize(super::sparse::SPARSE_PAGE);
-                desc.setStorageMode(MTLStorageMode::Private);
-                desc.setHazardTrackingMode(MTLHazardTrackingMode::Untracked);
-                desc.setSize(sa.size);
-                let heap = self
-                    .device
-                    .newHeapWithDescriptor(&desc)
-                    .ok_or_else(no_memory)?;
-                heap.setLabel(Some(&label));
-                // SAFETY: the buffer covers the heap from offset 0, which the size and
-                // alignment above allow.
-                let buffer =
-                    unsafe { heap.newBufferWithLength_options_offset(size as usize, options, 0) }
-                        .ok_or_else(no_memory)?;
-                buffer.setLabel(Some(&label));
-                RawBuffer {
-                    kind,
-                    buffer: Obj(buffer),
-                    heap: Some(Obj(heap)),
-                }
-            }
-        };
-        {
-            let mut r = lock(&self.residency);
-            let allocation: &ProtocolObject<dyn MTLAllocation> = match &raw.heap {
-                Some(heap) => ProtocolObject::from_ref(&**heap),
-                None => ProtocolObject::from_ref(&*raw.buffer),
-            };
-            r.set.addAllocation(allocation);
-            r.dirty = true;
+        let options = options(kind);
+        let mut size = size.next_multiple_of(MALLOC_ALIGN);
+        let sa = self
+            .device
+            .heapBufferSizeAndAlignWithLength_options(size as usize, options);
+        let mut align = (sa.align as u64).max(MALLOC_ALIGN);
+        let mut bytes = sa.size as u64;
+        if kind == MemoryKind::DeviceLocal {
+            align = align.max(DEVICE_LOCAL_ALIGN);
         }
+        if kind == MemoryKind::DeviceLocal && size >= PLACEMENT_MIN_BYTES {
+            let page = self.sparse_page_bytes();
+            align = align.max(page);
+            size = size.next_multiple_of(page);
+            bytes = bytes.max(size).next_multiple_of(page);
+        }
+        let layout =
+            Layout::from_size_align(bytes as usize, align as usize).map_err(|_| no_memory())?;
+        let (memory, new_heap) = lock(&self.heaps[kind.index()])
+            .allocate(layout)
+            .map_err(|_| no_memory())?;
+        // SAFETY: the buffer lies in the range the pool placed, which no other resource uses.
+        let buffer = unsafe {
+            memory.heap().newBufferWithLength_options_offset(
+                size as usize,
+                options,
+                memory.offset() as usize,
+            )
+        };
+        let Some(buffer) = buffer else {
+            // A heap the pool releases here is the new one, never made resident.
+            lock(&self.heaps[kind.index()]).free(memory);
+            return Err(no_memory());
+        };
+        buffer.setLabel(Some(&NSString::from_str(name)));
+        if new_heap {
+            let mut r = lock(&self.residency);
+            r.set.addAllocation(ProtocolObject::from_ref(memory.heap()));
+            r.dirty = true;
+            self.device_allocations.fetch_add(1, Ordering::Relaxed);
+        }
+        let raw = RawBuffer {
+            kind,
+            buffer: Obj(buffer),
+            memory,
+        };
         lock(&self.buffers).insert(raw.buffer.gpuAddress(), size, raw.buffer.clone());
         let mut usage = lock(&self.usage);
         let u = &mut usage[kind.index()];
         u.bytes += size;
         u.allocations += 1;
-        self.device_allocations.fetch_add(1, Ordering::Relaxed);
         Ok(raw)
+    }
+
+    /// Bytes of a sparse page, where placed resources start in DeviceLocal heaps.
+    pub(super) fn sparse_page_bytes(&self) -> u64 {
+        self.device
+            .sparseTileSizeInBytesForSparsePageSize(SPARSE_PAGE) as u64
+    }
+
+    /// Waits until `point` has completed.
+    fn wait(&self, point: TimelinePoint) -> Result<(), Error> {
+        if self
+            .event(point.timeline)
+            .waitUntilSignaledValue_timeoutMS(point.value, u64::MAX)
+        {
+            Ok(())
+        } else {
+            Err(Error::Timeout)
+        }
     }
 }
 
-/// Short-lived host-visible memory; see the Vulkan backend. Not implemented on Metal yet:
-/// [`Device::create_host_arenas`] fails.
+/// The buffers behind [`HostArenas`] and [`DeviceArenas`]: a ring of linear arenas, one per
+/// frame in flight on the render queue, or one per loading batch in flight on the loading
+/// queue. Allocation bumps the current arena; `reset` closes it at a timeline point and moves
+/// to the next arena once the point that closed that one has completed.
+struct Ring {
+    blocks: Vec<Block>,
+    current: usize,
+    /// The current arena, over mapped addresses for host arenas and device addresses for
+    /// device arenas.
+    arena: RefCell<Arena>,
+    name: Box<str>,
+    shared: Arc<Shared>,
+}
+
+struct Block {
+    raw: RawBuffer,
+    address: u64,
+    mapped: Option<NonNull<u8>>,
+    size: u64,
+    /// The point given to the `reset` that closed the arena.
+    done: Option<TimelinePoint>,
+}
+
+// SAFETY: the blocks and their mappings belong to the ring alone.
+unsafe impl Send for Ring {}
+
+impl Block {
+    fn mapped_addr(&self) -> usize {
+        self.mapped.unwrap().addr().get()
+    }
+
+    /// The arena's base: the mapped address when mapped, else the device address.
+    fn base(&self) -> u64 {
+        self.mapped.map_or(self.address, |p| p.addr().get() as u64)
+    }
+}
+
+impl Ring {
+    fn new(
+        shared: &Arc<Shared>,
+        kind: MemoryKind,
+        count: u32,
+        bytes: u64,
+        name: &str,
+    ) -> Result<Self, Error> {
+        if count == 0 || bytes == 0 {
+            return Err(Error::Invalid(format!(
+                "{name}: {count} transient arenas of {bytes} bytes"
+            )));
+        }
+        let mut blocks = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let raw = shared.create_buffer(kind, bytes, &format!("{name} {i}"))?;
+            let mapped = (kind != MemoryKind::DeviceLocal)
+                .then(|| NonNull::new(raw.buffer.contents().as_ptr().cast::<u8>()))
+                .flatten();
+            let address = raw.buffer.gpuAddress();
+            blocks.push(Block {
+                raw,
+                address,
+                mapped,
+                size: bytes,
+                done: None,
+            });
+        }
+        let mut ring = Self {
+            blocks,
+            current: 0,
+            arena: RefCell::new(Arena::new(0, bytes)),
+            name: name.into(),
+            shared: Arc::clone(shared),
+        };
+        if let Some(b) = ring.blocks.iter().find(|b| {
+            !b.base()
+                .wrapping_sub(b.address)
+                .is_multiple_of(MALLOC_ALIGN)
+        }) {
+            return Err(Error::Invalid(format!(
+                "{name}: mapping {:#x} is not aligned like address {:#x}",
+                b.base(),
+                b.address
+            )));
+        }
+        ring.start(0);
+        Ok(ring)
+    }
+
+    /// Makes block `i` the current arena, empty.
+    fn start(&mut self, i: usize) {
+        let arena = self.arena.get_mut();
+        *arena = Arena::new(self.blocks[i].base(), arena.size());
+        self.current = i;
+    }
+
+    /// The current block and the offset of `layout` in it.
+    fn bump(&self, layout: Layout) -> Result<(&Block, u64), AllocError> {
+        let mut arena = self.arena.borrow_mut();
+        let start = arena.allocate(layout)?;
+        Ok((&self.blocks[self.current], start - arena.base()))
+    }
+
+    fn reset(&mut self, after: TimelinePoint) -> Result<(), Error> {
+        self.blocks[self.current].done = Some(after);
+        let next = (self.current + 1) % self.blocks.len();
+        if let Some(done) = self.blocks[next].done {
+            self.shared.wait(done)?;
+            self.blocks[next].done = None;
+        }
+        self.start(next);
+        Ok(())
+    }
+}
+
+impl Drop for Ring {
+    fn drop(&mut self) {
+        for b in self.blocks.drain(..) {
+            let shared = Arc::clone(&self.shared);
+            let start = b.address;
+            let raw = b.raw;
+            self.shared
+                .defer(Box::new(move || release_buffer(&shared, start, raw)));
+        }
+    }
+}
+
+/// Short-lived host-visible memory, Upload or Readback, for the CPU to fill or read: a ring
+/// of linear arenas, one per frame in flight on the render queue or one per loading batch in
+/// flight on the loading queue.
+///
+/// The allocation methods have the signatures and meaning of `std`'s `Allocator` trait.
+/// Allocation bumps a pointer in the current arena. [`HostArenas::deallocate`] does nothing:
+/// unlike `std`'s allocators, the memory comes back only once the GPU is done with it, when
+/// the ring returns to the arena through [`HostArenas::reset`]. Memory from an arena is valid
+/// on the CPU until that return, whether or not `deallocate` was called; `reset` takes
+/// `&mut self`, so no container borrowing the ring outlives it. The GPU may use the memory
+/// until the point given to the `reset` that closed the arena has completed.
+///
+/// One thread owns the ring. Dropping it frees the blocks once everything submitted before
+/// the drop has completed.
 pub struct HostArenas {
-    never: std::convert::Infallible,
+    ring: Ring,
 }
 
 impl HostArenas {
+    /// `layout.size()` bytes from the current arena at a multiple of `layout.align()`; up to
+    /// 256 bytes of alignment the device address is aligned the same. Fails when the arena
+    /// has no room left.
     pub fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let _ = layout;
-        match self.never {}
+        let (ptr, _) = self.place(layout)?;
+        Ok(NonNull::slice_from_raw_parts(ptr, layout.size()))
     }
 
+    /// The mapped and device addresses of `layout` in the current arena.
+    fn place(&self, layout: Layout) -> Result<(NonNull<u8>, u64), AllocError> {
+        let (block, offset) = self.ring.bump(layout)?;
+        // SAFETY: the range lies in the block's mapping.
+        let ptr = unsafe { block.mapped.unwrap().add(offset as usize) };
+        Ok((ptr, block.address + offset))
+    }
+
+    /// As [`HostArenas::allocate`], with the bytes zeroed.
     pub fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        let _ = layout;
-        match self.never {}
+        let ptr = self.allocate(layout)?;
+        // SAFETY: the range was just allocated and nothing else uses it.
+        unsafe { ptr.cast::<u8>().write_bytes(0, layout.size()) };
+        Ok(ptr)
     }
 
-    /// Does nothing; the memory comes back at [`HostArenas::reset`].
+    /// Does nothing. The memory comes back once the GPU is done with it, after a
+    /// [`HostArenas::reset`].
     ///
     /// # Safety
-    /// As `std`'s `Allocator::deallocate`.
+    ///
+    /// `ptr` came from these arenas with `layout`.
     pub unsafe fn deallocate(&self, _ptr: NonNull<u8>, _layout: Layout) {}
 
+    /// The device address of `ptr`. Panics if `ptr` is not in the arenas; the end of an
+    /// arena counts, where an empty allocation can land.
     pub fn gpu_ptr<T>(&self, ptr: NonNull<T>) -> GpuPtr<T> {
-        let _ = ptr;
-        match self.never {}
+        let addr = ptr.addr().get();
+        let blocks = &self.ring.blocks;
+        // Two blocks can be adjacent in the mapping; a pointer at the start of one is in it,
+        // not at the end of the other.
+        let block = blocks
+            .iter()
+            .find(|b| (b.mapped_addr()..b.mapped_addr() + b.size as usize).contains(&addr))
+            .or_else(|| {
+                blocks
+                    .iter()
+                    .find(|b| b.mapped_addr() + b.size as usize == addr)
+            })
+            .unwrap_or_else(|| panic!("{}: {ptr:p} is not in the arenas", self.ring.name));
+        let offset = (addr - block.mapped_addr()) as u64;
+        // SAFETY: the address lies in or at the end of the block.
+        unsafe { GpuPtr::from_address(GpuAddress(block.address + offset)) }
     }
 
+    /// Copies `values` into the current arena, at a multiple of 16 and of `T`'s alignment.
     pub fn upload<T: Pod>(&self, values: &[T]) -> Result<GpuPtr<T>, AllocError> {
-        let _ = values;
-        match self.never {}
+        let layout = Layout::for_value(values)
+            .align_to(16)
+            .map_err(|_| AllocError)?;
+        let (ptr, gpu) = self.place(layout)?;
+        let ptr = ptr.cast::<T>();
+        assert!(
+            ptr.is_aligned(),
+            "{}: upload is not aligned",
+            self.ring.name
+        );
+        // SAFETY: the range was just allocated for `values.len()` values, aligned (asserted
+        // above), and nothing else uses it.
+        unsafe {
+            ptr.copy_from_nonoverlapping(NonNull::from(values).cast(), values.len());
+        }
+        // SAFETY: the range lies in the block.
+        Ok(unsafe { GpuPtr::from_address(GpuAddress(gpu)) })
     }
 
+    /// Closes the current arena: the work signaling `after` is the last to use it. Moves to
+    /// the next arena, first waiting for the point that closed it.
     pub fn reset(&mut self, after: TimelinePoint) -> Result<(), Error> {
-        let _ = after;
-        match self.never {}
+        self.ring.reset(after)
     }
 }
 
-/// Short-lived DeviceLocal memory; see the Vulkan backend. Not implemented on Metal yet:
-/// [`Device::create_device_arenas`] fails.
+/// Short-lived DeviceLocal memory for scratch and other data the GPU writes and reads within
+/// a frame or a loading batch: a ring of linear arenas, as [`HostArenas`]. Nothing is freed
+/// one by one; [`DeviceArenas::reset`] closes the current arena.
+///
+/// One thread owns the ring. Dropping it frees the blocks once everything submitted before
+/// the drop has completed.
 pub struct DeviceArenas {
-    never: std::convert::Infallible,
+    ring: Ring,
 }
 
 impl DeviceArenas {
+    /// `layout.size()` bytes from the current arena, at a device address that is a multiple
+    /// of `layout.align()` and of 16. Fails when the arena has no room left.
     pub fn allocate(&self, layout: Layout) -> Result<GpuPtr<u8>, AllocError> {
-        let _ = layout;
-        match self.never {}
+        let layout = layout.align_to(16).map_err(|_| AllocError)?;
+        let (block, offset) = self.ring.bump(layout)?;
+        // SAFETY: the range lies in the block.
+        Ok(unsafe { GpuPtr::from_address(GpuAddress(block.address + offset)) })
     }
 
+    /// Closes the current arena: the work signaling `after` is the last to use it. Moves to
+    /// the next arena, first waiting for the point that closed it.
     pub fn reset(&mut self, after: TimelinePoint) -> Result<(), Error> {
-        let _ = after;
-        match self.never {}
+        self.ring.reset(after)
     }
 }

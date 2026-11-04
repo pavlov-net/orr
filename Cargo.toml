@@ -60,6 +60,10 @@ libc = "0.2"
 libloading = "0.8"
 windows = "0.62.2"
 vulkan-memory-allocator-sys = "0.2.0"
+# Metal
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3.2"
 
 cc = "1.10"
 bindgen = { version = "0.72.1", default-features = false, features = ["runtime"] }

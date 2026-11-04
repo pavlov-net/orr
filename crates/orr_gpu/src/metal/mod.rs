@@ -4,8 +4,9 @@
 //! Kernels reach everything as `abi.slang` lays it out for Metal: argument-table buffer 0 holds
 //! the root's address, buffer 1 the address of the texture view pool's base resource ID and
 //! buffer 2 the address of the sampler resource IDs. Memory is reached by address
-//! (`MTLBuffer::gpuAddress`), every allocation sits in one residency set, and each queue's
-//! timeline is an `MTLSharedEvent`.
+//! (`MTLBuffer::gpuAddress`): each allocation is a buffer placed in a heap that orr_memory
+//! sub-allocates, every heap sits in one residency set, and each queue's timeline is an
+//! `MTLSharedEvent`.
 //!
 //! What the backend does not do yet still exists: calls that return a `Result` fail with
 //! [`Error::NotImplemented`](crate::Error::NotImplemented), the others panic saying so, and
@@ -39,7 +40,7 @@ use objc2_metal::{MTLBuffer, MTLSharedEvent};
 pub use accel::{ClassicAs, Micromap};
 pub use command::CommandList;
 pub use device::{Device, DeviceHooks};
-pub use memory::{AllocError, Allocation, DeviceArenas, HostArenas};
+pub use memory::{Allocation, DeviceArenas, HostArenas};
 pub use mesh::MeshPipeline;
 pub use pipeline::{ComputePipeline, ShaderStage};
 pub use queue::{HostTimeline, Queue};
