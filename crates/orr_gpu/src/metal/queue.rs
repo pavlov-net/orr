@@ -3,12 +3,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::{
-    MTL4CommandBuffer, MTL4CommandQueue, MTL4CounterHeap, MTL4CounterHeapDescriptor,
-    MTL4CounterHeapType, MTLDevice, MTLSharedEvent,
+    MTL4CommandBuffer, MTL4CommandQueue, MTL4CommitFeedback, MTL4CommitOptions, MTL4CounterHeap,
+    MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTLDevice, MTLSharedEvent,
 };
 
 use super::command::{CommandList, Finished};
@@ -272,11 +273,33 @@ impl Queue {
         self.shared.commit_residency();
         let mut raw: Vec<NonNull<ProtocolObject<dyn MTL4CommandBuffer>>> =
             buffers.iter().map(|b| NonNull::from(&**b)).collect();
+        // Faults and validation errors end a command buffer early and silently: log them.
+        let shared = Arc::downgrade(&self.shared);
+        let kind = self.kind;
+        let feedback = RcBlock::new(move |f: NonNull<ProtocolObject<dyn MTL4CommitFeedback>>| {
+            // SAFETY: Metal passes a live feedback object for the call.
+            let f = unsafe { f.as_ref() };
+            if let Some(e) = f.error() {
+                log::error!(
+                    "{kind:?} queue: a command buffer failed: {}",
+                    e.localizedDescription()
+                );
+                if let Some(shared) = shared.upgrade() {
+                    shared.gpu_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+        let options = MTL4CommitOptions::new();
+        // SAFETY: Metal copies the block, which captures only `Send` values.
+        unsafe { options.addFeedbackHandler(RcBlock::as_ptr(&feedback)) };
         // SAFETY: `raw` holds `len` live, ended command buffers, which `finished` keeps
         // until the submit completes.
         unsafe {
-            self.raw
-                .commit_count(NonNull::new(raw.as_mut_ptr()).unwrap(), raw.len())
+            self.raw.commit_count_options(
+                NonNull::new(raw.as_mut_ptr()).unwrap(),
+                raw.len(),
+                &options,
+            )
         };
         buffers.clear();
     }

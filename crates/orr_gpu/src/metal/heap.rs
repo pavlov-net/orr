@@ -17,8 +17,8 @@ use super::device::{Device, DeviceDesc, metal_error};
 use super::texture::{Texture, pixel_format};
 use super::{Buffer, Obj, lock};
 use crate::{
-    AddressMode, CompareOp, Error, Filter, SamplerDesc, SamplerIndex, StorageImageIndex,
-    TextureIndex, TextureKind, TimelinePoint, ViewDesc, ViewKind,
+    AddressMode, CompareOp, Error, FIRST_FREE_IMAGE_SLOT, Filter, SamplerDesc, SamplerIndex,
+    StorageImageIndex, TextureIndex, TextureKind, TimelinePoint, ViewDesc, ViewKind,
 };
 
 /// The view pool, the buffers argument-table slots 1 and 2 point at, and the free slots.
@@ -34,7 +34,8 @@ pub(super) struct Bindings {
 
 struct Slots {
     capacity: u32,
-    /// Slots never handed out start here; slot 0 never is.
+    /// Slots never handed out start here: past the empty slot 0 and the OpenPBR tables'
+    /// reserved slots, which `orr_lighting` writes itself.
     next: u32,
     free: Vec<u32>,
 }
@@ -79,7 +80,7 @@ impl Bindings {
             samplers: table(8 * sampler_slots, "sampler table")?,
             slots: Mutex::new(Slots {
                 capacity: desc.image_heap_slots,
-                next: 1,
+                next: FIRST_FREE_IMAGE_SLOT,
                 free: Vec::new(),
             }),
             sampler_states: Mutex::new(Samplers {
@@ -150,6 +151,7 @@ impl Device {
 
     /// Returns `slot` once `after` has completed.
     pub fn free_image_slot(&self, slot: u32, after: TimelinePoint) {
+        assert_freeable(slot);
         let shared = std::sync::Arc::clone(&self.shared);
         self.shared.defer_until(
             after.timeline,
@@ -160,6 +162,7 @@ impl Device {
 
     /// Returns `slot` once everything submitted so far has completed.
     pub fn free_image_slot_after_submitted(&self, slot: u32) {
+        assert_freeable(slot);
         let shared = std::sync::Arc::clone(&self.shared);
         self.shared.defer(Box::new(move || {
             lock(&shared.bindings.slots).free.push(slot)
@@ -317,4 +320,11 @@ fn view_descriptor(
         d.setSliceRange(NSRange::new(view.base_layer as usize, layers as usize));
     }
     d
+}
+
+fn assert_freeable(slot: u32) {
+    assert!(
+        slot >= FIRST_FREE_IMAGE_SLOT,
+        "freeing the empty or a reserved image slot: {slot}"
+    );
 }
