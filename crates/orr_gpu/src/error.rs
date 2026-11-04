@@ -40,6 +40,12 @@ pub enum Error {
     /// Aftermath crash dumps were asked for and cannot be enabled.
     #[error("Aftermath: {0}")]
     Aftermath(String),
+    /// A Metal call failed.
+    #[error("{call} failed: {message}")]
+    Metal { call: &'static str, message: String },
+    /// The Metal backend does not implement the call yet.
+    #[error("the Metal backend does not implement {0} yet")]
+    NotImplemented(&'static str),
     /// A file could not be read or written.
     #[error("{}: {source}", path.display())]
     Io {
