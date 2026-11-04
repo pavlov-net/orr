@@ -136,3 +136,20 @@ public uint upper_bound(float* cdf, uint count, float target)
     }
     return lo;
 }
+
+// As above, over the first `count` sums of the array `cdf`, which may be a struct field in GPU
+// memory: Metal takes no address of an array element (`&cdf[0]`).
+public uint upper_bound<let N : int>(__ref float cdf[N], uint count, float target)
+{
+    uint lo = 0;
+    uint hi = count - 1;
+    while (lo < hi)
+    {
+        uint mid = (lo + hi) / 2;
+        if (cdf[mid] > target)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    return lo;
+}

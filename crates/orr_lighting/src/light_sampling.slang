@@ -819,7 +819,7 @@ ResolvedLightSample local_candidate(LightSetGpu* set, LocalLights* local, float3
 {
     uint n = min(local.count, LOCAL_LIGHTS);
     float target = below(pick, local.cdf[n - 1]);
-    uint k = upper_bound(&local.cdf[0], n, target);
+    uint k = upper_bound(local.cdf, n, target);
     return resolve_light_sample(set, tile_light_sample(set, local.ids[k], u, 1.0), x, u.xy);
 }
 

@@ -219,8 +219,14 @@ public void store(uint64_t args, uint index, TemplateBuild v)
 
 public void store(uint64_t args, uint index, Instantiate v)
 {
-    if (ASSERTS && v.vertices == 0)
-        abort("rtas: a template instantiation without vertices");
+    __target_switch
+    {
+    case metal:
+        break;
+    default:
+        if (ASSERTS && v.vertices == 0)
+            abort("rtas: a template instantiation without vertices");
+    }
     uint* p = record(args, index, INSTANTIATE_STRIDE);
     p[0] = v.cluster_id_offset;
     p[1] = v.geometry_index_offset & 0xffffff;
@@ -244,8 +250,14 @@ public void store(uint64_t args, uint index, Move v)
 
 public void store(uint64_t args, uint index, PtlasWrite v)
 {
-    if (ASSERTS && v.custom_index >= (1u << 24))
-        abort("rtas: an instance custom index above 24 bits");
+    __target_switch
+    {
+    case metal:
+        break;
+    default:
+        if (ASSERTS && v.custom_index >= (1u << 24))
+            abort("rtas: an instance custom index above 24 bits");
+    }
     uint* p = record(args, index, PTLAS_WRITE_STRIDE);
     put_transform(p, v.transform);
     p[12] = asuint(v.aabb_min.x);

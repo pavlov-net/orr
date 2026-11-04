@@ -1330,7 +1330,9 @@ fn link_modules(
 }
 
 /// Loads the kernel at `path` once more into the Metal `session`, compiles its non-raygen
-/// entries to MSL and returns what the MSL check finds. Writes `<name>.metal`.
+/// entries to MSL and returns what the MSL check finds. Writes `<name>.metal`, and the pixel
+/// entries apart as `<name>.fragment.metal`: a fragment function that reads a global gets
+/// every global of its program, `groupshared` ones too, which Metal rejects there.
 fn metal_issues(
     session: &Session,
     settings: &Settings<'_>,
@@ -1338,13 +1340,22 @@ fn metal_issues(
     job: &Job,
     source: &str,
 ) -> Result<Vec<String>, Error> {
-    let entries: BTreeSet<&str> = model
-        .entries
-        .iter()
-        .filter(|e| e.stage != crate::Stage::RayGen)
-        .map(|e| e.name.as_str())
-        .collect();
-    if entries.is_empty() {
+    let entries = |pixel: bool| -> BTreeSet<&str> {
+        model
+            .entries
+            .iter()
+            .filter(|e| {
+                e.stage != crate::Stage::RayGen && (e.stage == crate::Stage::Pixel) == pixel
+            })
+            .map(|e| e.name.as_str())
+            .collect()
+    };
+    let groups: Vec<(&str, BTreeSet<&str>)> =
+        [("metal", entries(false)), ("fragment.metal", entries(true))]
+            .into_iter()
+            .filter(|(_, e)| !e.is_empty())
+            .collect();
+    if groups.is_empty() {
         return Ok(Vec::new());
     }
     let text = metal::without_raygen(source);
@@ -1358,16 +1369,25 @@ fn metal_issues(
         roots::load_prefixed(session, settings.roots, &sources)?;
         let module = session.load(&job.name.replace('/', "."), &job.path, &text)?;
         let extra = link_modules(session, settings, &job.links)?;
-        let program = session.link(&module, &extra, |e| entries.contains(e))?;
-        Ok::<_, String>((program.text()?, program))
+        groups
+            .iter()
+            .map(|(extension, entries)| {
+                let program = session.link(&module, &extra, |e| entries.contains(e))?;
+                Ok::<_, String>((*extension, program.text()?, program))
+            })
+            .collect::<Result<Vec<_>, String>>()
     })();
-    let (msl, program) = match compiled {
+    let programs = match compiled {
         Ok(r) => r,
         Err(diagnostics) => return Ok(vec![format!("Metal emission failed:\n{diagnostics}")]),
     };
-    write(&job.spv.with_extension("metal"), msl.as_bytes())?;
-    let mut issues = metal::msl_issues(&msl);
-    match program.layout() {
+    let mut issues = Vec::new();
+    for (extension, msl, _) in &programs {
+        write(&job.spv.with_extension(extension), msl.as_bytes())?;
+        issues.extend(metal::msl_issues(msl));
+    }
+    // The root and its pointees are the same in every program.
+    match programs[0].2.layout() {
         Ok(layout) => issues.extend(metal::layout_issues(&session.lib.api, layout, model)),
         Err(diagnostics) => issues.push(format!("no Metal layout: {diagnostics}")),
     }
