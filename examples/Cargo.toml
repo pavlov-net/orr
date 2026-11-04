@@ -27,6 +27,7 @@ winit = "0.30.13"
 [target.'cfg(windows)'.dependencies]
 orr_egui.workspace = true
 egui = { workspace = true, features = ["monochrome_emoji_fonts"] }
+windows = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 orr_scene = { workspace = true, features = ["testing"] }

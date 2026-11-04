@@ -60,6 +60,42 @@ pub struct Window {
     shown: bool,
 }
 
+/// Whether windows open behind every other window, for runs nobody is watching:
+/// `ORR_WINDOW_BEHIND=1`.
+fn behind() -> bool {
+    std::env::var_os("ORR_WINDOW_BEHIND").is_some_and(|v| v == "1")
+}
+
+/// Shows a hidden window at the bottom of the window order.
+#[cfg(windows)]
+fn show_behind(window: &winit::window::Window) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos,
+    };
+    let handle = window.window_handle().expect("window handle").as_raw();
+    let RawWindowHandle::Win32(handle) = handle else {
+        return;
+    };
+    // SAFETY: the window is live and owned by this thread.
+    let _ = unsafe {
+        SetWindowPos(
+            HWND(handle.hwnd.get() as *mut _),
+            Some(HWND_BOTTOM),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        )
+    };
+}
+
+#[cfg(not(windows))]
+fn show_behind(window: &winit::window::Window) {
+    window.set_visible(true);
+}
+
 impl Window {
     /// Opens a window whose client area is `width` x `height` physical pixels.
     pub fn new(title: &str, width: u32, height: u32) -> Self {
@@ -91,7 +127,11 @@ impl Window {
     pub fn pump(&mut self) -> bool {
         if !self.shown {
             self.shown = true;
-            self.window().set_visible(true);
+            if behind() {
+                show_behind(self.window());
+            } else {
+                self.window().set_visible(true);
+            }
         }
         let open = self.pump_events();
         if !open {
