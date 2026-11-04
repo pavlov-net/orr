@@ -1,6 +1,6 @@
 [package]
 name = "orr_memory"
-description = "GPU memory for orr: Vulkan Memory Allocator pools, transient arenas and an offset allocator."
+description = "GPU memory for orr: Vulkan Memory Allocator pools, Metal heap pools, transient arenas and an offset allocator."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,11 +8,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-ash.workspace = true
 bitflags.workspace = true
 log.workspace = true
 thiserror.workspace = true
 vulkan-memory-allocator-sys.workspace = true
+
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+ash.workspace = true
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-metal.workspace = true
 
 [lints]
 workspace = true

@@ -95,14 +95,19 @@ fn bound_memory(
     let Some((block, offset)) = memory else {
         return Ok((None, 0));
     };
-    // Only DeviceLocal blocks have a heap.
-    match block.raw().heap.as_ref() {
-        Some(heap) if offset.is_multiple_of(page) && offset + bytes <= block.size() => {
-            Ok((Some(heap.clone()), (offset / page) as usize))
+    // Only DeviceLocal blocks have a heap; pages count from the heap's start.
+    match block.raw().placement() {
+        Some((heap, start))
+            if (start + offset).is_multiple_of(page) && offset + bytes <= block.size() =>
+        {
+            Ok((
+                Some(Obj(objc2::Message::retain(heap))),
+                ((start + offset) / page) as usize,
+            ))
         }
-        heap => Err(Error::Invalid(format!(
+        placement => Err(Error::Invalid(format!(
             "{bytes} bytes at offset {offset} (alignment {page}) of a {} block of {} bytes",
-            if heap.is_some() {
+            if placement.is_some() {
                 "DeviceLocal"
             } else {
                 "host-visible"

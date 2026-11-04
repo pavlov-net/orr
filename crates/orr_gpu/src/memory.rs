@@ -14,7 +14,6 @@ pub enum MemoryKind {
 }
 
 impl MemoryKind {
-    #[cfg_attr(target_vendor = "apple", expect(dead_code))]
     pub(crate) const ALL: [MemoryKind; 3] = [
         MemoryKind::Upload,
         MemoryKind::DeviceLocal,

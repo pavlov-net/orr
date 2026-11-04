@@ -181,12 +181,29 @@ impl Device {
         block: &Allocation<u8>,
         offset: u64,
     ) -> Result<ClassicAs, Error> {
-        let heap = block.raw().heap.as_ref().ok_or_else(|| {
+        let (heap, start) = block.raw().placement().ok_or_else(|| {
             Error::Invalid("acceleration structures go in DeviceLocal blocks".to_owned())
         })?;
-        // SAFETY: the range lies within the block's heap, which outlives the structure.
+        // SAFETY: any size is valid to ask about.
+        let sa = unsafe {
+            self.shared
+                .device
+                .heapAccelerationStructureSizeAndAlignWithSize(size as usize)
+        };
+        let at = start + offset;
+        if !at.is_multiple_of(sa.align as u64) || offset + sa.size as u64 > block.size() {
+            return Err(Error::Invalid(format!(
+                "{} bytes at offset {offset} of a {}-byte block, which starts at {start} of its \
+                 heap (alignment {})",
+                sa.size,
+                block.size(),
+                sa.align
+            )));
+        }
+        // SAFETY: the structure lies within the block's range of the heap (checked above),
+        // and the block outlives it.
         let raw =
-            unsafe { heap.newAccelerationStructureWithSize_offset(size as usize, offset as usize) }
+            unsafe { heap.newAccelerationStructureWithSize_offset(size as usize, at as usize) }
                 .ok_or_else(|| Error::Metal {
                     call: "newAccelerationStructureWithSize",
                     message: format!("{size} bytes at {offset}"),

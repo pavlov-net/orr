@@ -118,13 +118,23 @@ impl Device {
                 (t, true)
             }
             TextureMemory::Placed { block, offset } => {
-                let heap = block.raw().heap.as_ref().ok_or_else(|| {
+                let (heap, start) = block.raw().placement().ok_or_else(|| {
                     Error::Invalid(format!("{name}: placed in a block that is not DeviceLocal"))
                 })?;
-                // SAFETY: the offset and the texture's size lie within the heap (the caller
-                // aligned the offset as `texture_requirements` says, and the block outlives
-                // the texture).
-                let t = unsafe { heap.newTextureWithDescriptor_offset(&d, offset as usize) }
+                let sa = self.shared.device.heapTextureSizeAndAlignWithDescriptor(&d);
+                let at = start + offset;
+                if !at.is_multiple_of(sa.align as u64) || offset + sa.size as u64 > block.size() {
+                    return Err(Error::Invalid(format!(
+                        "{name}: {} bytes at offset {offset} of a {}-byte block, which starts at \
+                         {start} of its heap (alignment {})",
+                        sa.size,
+                        block.size(),
+                        sa.align
+                    )));
+                }
+                // SAFETY: the texture lies within the block's range of the heap (checked above),
+                // and the block outlives the texture.
+                let t = unsafe { heap.newTextureWithDescriptor_offset(&d, at as usize) }
                     .ok_or_else(failed)?;
                 (t, false)
             }

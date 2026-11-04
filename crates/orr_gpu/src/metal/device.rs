@@ -10,6 +10,8 @@ use objc2_metal::{
     MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor, MTLSharedEvent,
 };
 
+use orr_memory::HeapPool;
+
 use super::accel::{EmptyTlas, build_empty_tlas};
 use super::cache::PipelineCache;
 use super::cluster::{self, Kernels, Objects, PtlasCheck, StructureIds};
@@ -47,9 +49,11 @@ pub(super) struct Shared {
     pub(super) host_timelines: Mutex<Vec<Obj<ProtocolObject<dyn MTLSharedEvent>>>>,
     pub(super) garbage: Mutex<Garbage>,
     pub(super) buffers: Mutex<Buffers>,
+    /// The heaps `gpu_malloc` places buffers in, by [`MemoryKind`](crate::MemoryKind).
+    pub(super) heaps: [Mutex<HeapPool>; 3],
     /// Live `gpu_malloc` memory by [`MemoryKind`](crate::MemoryKind).
     pub(super) usage: Mutex<[MemoryUsage; 3]>,
-    /// Buffers `gpu_malloc` has created so far.
+    /// Heaps the pools have created so far.
     pub(super) device_allocations: AtomicU64,
     /// Pass results by the point of their submit, oldest first.
     pub(super) results: Mutex<VecDeque<(TimelinePoint, Vec<PassResult>)>>,
@@ -181,6 +185,7 @@ impl Device {
         let timestamps = TimestampRing::new(&device)?;
         let device = Obj(device);
         let bindings = Bindings::new(&device, desc)?;
+        let heaps = super::memory::heap_pools(&device).map(Mutex::new);
         let shared = Arc::new(Shared {
             device,
             compiler: Obj(compiler),
@@ -193,6 +198,7 @@ impl Device {
             host_timelines: Mutex::default(),
             garbage: Mutex::default(),
             buffers: Mutex::default(),
+            heaps,
             usage: Mutex::default(),
             device_allocations: AtomicU64::new(0),
             results: Mutex::default(),
