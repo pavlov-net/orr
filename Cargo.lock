@@ -3560,11 +3560,12 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vulkan-memory-allocator-sys"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4082fad9c62bd999876341ef50180b38d9127b214530ddf4ca19db76379c2188"
+checksum = "65271d58ef717d332fc2b8293e5439d62bbeb86a55196b2b1b4f7e999a23fa02"
 dependencies = [
  "cc",
+ "log",
 ]
 
 [[package]]

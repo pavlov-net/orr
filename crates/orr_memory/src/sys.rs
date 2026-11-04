@@ -3,10 +3,8 @@
 //! Both sides have the Vulkan C layout. The bindings only build for 64-bit targets, where every
 //! handle fits a pointer and `extern "system"` is `extern "C"`.
 
-use std::ffi::{CStr, c_char, c_int};
 use std::mem::transmute;
 use std::ptr;
-use std::sync::Once;
 
 use ash::vk::{self, Handle};
 
@@ -74,32 +72,4 @@ pub(crate) fn instance_proc_addr(f: vk::PFN_vkGetInstanceProcAddr) -> PFN_vkGetI
 pub(crate) fn device_proc_addr(f: vk::PFN_vkGetDeviceProcAddr) -> PFN_vkGetDeviceProcAddr {
     // SAFETY: as above, for `vkGetDeviceProcAddr`.
     unsafe { transmute::<vk::PFN_vkGetDeviceProcAddr, PFN_vkGetDeviceProcAddr>(f) }
-}
-
-/// VMA aborts the process when this returns.
-unsafe extern "C" fn check_failed(expr: *const c_char, file: *const c_char, line: c_int) {
-    // SAFETY: VMA passes string literals.
-    let (expr, file) = unsafe {
-        (
-            CStr::from_ptr(expr).to_string_lossy(),
-            CStr::from_ptr(file).to_string_lossy(),
-        )
-    };
-    log::error!("VMA check failed at {file}:{line}: {expr}");
-}
-
-unsafe extern "C" fn leak(expr: *const c_char) {
-    // SAFETY: VMA passes a string literal.
-    let expr = unsafe { CStr::from_ptr(expr) }.to_string_lossy();
-    log::error!("GPU memory leaked: {expr}");
-}
-
-/// Sends VMA's failed checks and leak reports to `log`. VMA's handlers are process-wide, so this
-/// runs before the first allocator or block is created.
-pub(crate) fn set_handlers() {
-    static SET: Once = Once::new();
-    SET.call_once(|| {
-        // SAFETY: the handlers are plain functions that live as long as the process.
-        unsafe { vmaSysSetHandlers(Some(check_failed), Some(leak)) };
-    });
 }

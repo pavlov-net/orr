@@ -10,6 +10,14 @@
 //! Requests for a size and an alignment take a [`Layout`](std::alloc::Layout), and a request
 //! that finds no room fails with [`AllocError`], as with `std`'s allocators. Calls that reach
 //! Vulkan fail with [`Error`], which carries the Vulkan result.
+//!
+//! Allocations still live when an [`Allocator`] is dropped are reported to `log` at error level
+//! with the target [`LOG_TARGET`], or to stderr if the logger doesn't take them. Each gets a line,
+//! except dedicated ones, which are only noted as left. Ranges left in a [`VirtualBlock`] are freed
+//! with it and not reported. Dropping an [`Allocator`] flushes the logger. With debug assertions
+//! on, a failed VMA check goes to stderr and `log`, then aborts the process. The logger can run
+//! inside VMA's calls, so it must not use an [`Allocator`] or [`VirtualBlock`], and a panic in it
+//! aborts the process.
 
 mod allocator;
 mod arena;
@@ -21,6 +29,7 @@ pub use allocator::{
 };
 pub use arena::Arena;
 pub use virtual_block::{VirtualAllocation, VirtualBlock, VirtualStats};
+pub use vulkan_memory_allocator_sys::LOG_TARGET;
 
 use ash::vk;
 

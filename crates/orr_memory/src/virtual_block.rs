@@ -44,9 +44,9 @@ pub struct VirtualStats {
 impl VirtualBlock {
     /// A block of `size` units. `linear` places each range after the last, reusing freed
     /// space only at the ends (a ring or a stack); otherwise ranges go to the best free fit
-    /// (TLSF).
+    /// (TLSF). Panics if `size` is 0.
     pub fn new(size: u64, linear: bool) -> Result<Self> {
-        sys::set_handlers();
+        assert!(size > 0, "a virtual block of 0 units");
         let info = sys::VmaVirtualBlockCreateInfo {
             size,
             flags: if linear {

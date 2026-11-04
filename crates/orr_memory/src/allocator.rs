@@ -142,7 +142,6 @@ impl Allocator {
     /// extensions `desc` names enabled, and the device outlives the allocator and
     /// everything allocated from it.
     pub unsafe fn new(desc: &AllocatorDesc<'_>) -> Result<Self> {
-        sys::set_handlers();
         let allocations = Box::<AtomicU64>::default();
         let callbacks = sys::VmaDeviceMemoryCallbacks {
             pfnAllocate: Some(on_allocate),
@@ -444,5 +443,7 @@ impl Drop for Allocator {
             }
             sys::vmaDestroyAllocator(self.raw);
         }
+        // Leak reports end here, and the process may exit before a buffering logger writes them.
+        log::logger().flush();
     }
 }
