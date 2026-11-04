@@ -1,35 +1,36 @@
-// Fits the glare pyramid's band weights to the diaphragm PSF: per first level, F-number and
-// Rec.2020 channel, non-negative weights of the identity and each band whose kernels match
-// the PSF's energy in rings around the source, by relative error, normalized to energy 1.
+//! Fits the glare pyramid's band weights to the diaphragm PSF: per first level, F-number and
+//! Rec.2020 channel, non-negative weights of the identity and each band whose kernels match
+//! the PSF's energy in rings around the source, by relative error, normalized to energy 1.
 
-use crate::psf;
-use crate::pyramid::{self, Plane};
+use std::fmt::Write as _;
 
-// The reference pixel pitch the tables are fitted at: a 20.25 mm sensor 2160 pixels high.
-pub const REFERENCE_PITCH_UM: f64 = 20250.0 / 2160.0;
+use super::encircled::encircled_rgb;
+use super::psf;
+use super::pyramid::{self, Plane};
+
 pub const F_NUMBERS: usize = 10;
 pub const F_MIN: f64 = 4.0;
 pub const F_MAX: f64 = 22.0;
-// Bands fitted on their own pyramid run; the kernels of coarser levels are this level's
-// scaled by 2 per level, which the pyramid is to within its sampling.
+/// Bands fitted on their own pyramid run; the kernels of coarser levels are this level's
+/// scaled by 2 per level, which the pyramid is to within its sampling.
 const EXACT_LEVEL: u32 = 4;
-// Impulse positions the exact kernels are averaged over, so each level's grid alignment is
-// covered.
+/// Impulse positions the exact kernels are averaged over, so each level's grid alignment is
+/// covered.
 const IMPULSES: [[i64; 2]; 4] = [[0, 0], [5, 11], [10, 3], [13, 14]];
-// The full-resolution plane the impulses run on; nothing reaches its edges.
+/// The full-resolution plane the impulses run on; nothing reaches its edges.
 const PLANE: u32 = 8192;
-// Ring edges in pixels, by distance between pixel centers: the source pixel, then rings
-// growing by sqrt(2) out to OUTER.
+/// Ring edges in pixels, by distance between pixel centers: the source pixel, then rings
+/// growing by sqrt(2) out to OUTER.
 const FIRST_EDGE: f64 = 1.2;
 const OUTER: f64 = 2048.0;
 
-// F-number i of the tables, spaced evenly in log between F_MIN and F_MAX.
+/// F-number i of the tables, spaced evenly in log between F_MIN and F_MAX.
 pub fn f_number(i: usize) -> f64 {
     F_MIN * (F_MAX / F_MIN).powf(i as f64 / (F_NUMBERS - 1) as f64)
 }
 
-// Rings around a pixel center: `edges[b]` is ring b's outer distance, `area_radius[b]` the
-// radius of the disc with as much area as the pixels inside it.
+/// Rings around a pixel center: `edges[b]` is ring b's outer distance, `area_radius[b]` the
+/// radius of the disc with as much area as the pixels inside it.
 struct Rings {
     edges: Vec<f64>,
     area_radius: Vec<f64>,
@@ -76,8 +77,8 @@ impl Rings {
     }
 }
 
-// Energy per ring of each band's kernel at full resolution, for a chain starting at
-// `first_level`: one entry per mip.
+/// Energy per ring of each band's kernel at full resolution, for a chain starting at
+/// `first_level`: one entry per mip.
 fn band_rings(rings: &Rings, first_level: u32) -> Vec<Vec<f64>> {
     let mips = (pyramid::LAST_LEVEL + 1 - first_level) as usize;
     let exact = (EXACT_LEVEL + 1 - first_level) as usize;
@@ -153,7 +154,7 @@ fn band_rings(rings: &Rings, first_level: u32) -> Vec<Vec<f64>> {
     energy
 }
 
-// Non-negative least squares by cyclic coordinate descent on the normal equations.
+/// Non-negative least squares by cyclic coordinate descent on the normal equations.
 fn nnls(columns: &[Vec<f64>], target: &[f64], weight: &[f64]) -> Vec<f64> {
     let n = columns.len();
     let dot = |a: &[f64], b: &[f64]| -> f64 {
@@ -180,9 +181,9 @@ fn nnls(columns: &[Vec<f64>], target: &[f64], weight: &[f64]) -> Vec<f64> {
     x
 }
 
-// The fitted weights: per first level (1, 2), per F-number, LAST_LEVEL + 1 entries (w0,
-// then the band of each mip; zero past the chain's last mip) of per-channel weights.
-pub fn tables(ee: &[f64], tail: f64, spectral: &[(f64, [f64; 3])]) -> Vec<Vec<Vec<[f64; 3]>>> {
+/// The fitted weights: per first level (1, 2), per F-number, LAST_LEVEL + 1 entries (w0,
+/// then the band of each mip; zero past the chain's last mip) of per-channel weights.
+fn tables() -> Vec<Vec<Vec<[f64; 3]>>> {
     let rings = Rings::new();
     let entries = pyramid::LAST_LEVEL as usize + 1;
     (1..=2)
@@ -197,7 +198,7 @@ pub fn tables(ee: &[f64], tail: f64, spectral: &[(f64, [f64; 3])]) -> Vec<Vec<Ve
                     let mut inside = [0.0; 3];
                     let mut target = vec![[0.0; 3]; rings.len()];
                     for (b, &r) in rings.area_radius.iter().enumerate() {
-                        let e = psf::encircled_rgb(ee, tail, spectral, r, n, REFERENCE_PITCH_UM);
+                        let e = encircled_rgb(r, n, psf::REFERENCE_PITCH_UM);
                         for c in 0..3 {
                             target[b][c] = (e[c] - inside[c]).max(1e-12);
                         }
@@ -218,4 +219,56 @@ pub fn tables(ee: &[f64], tail: f64, spectral: &[(f64, [f64; 3])]) -> Vec<Vec<Ve
                 .collect()
         })
         .collect()
+}
+
+/// `v` to 10 decimal places: the last digits of a full-precision fit differ with the platform's
+/// math library.
+fn rounded(v: f64) -> f64 {
+    format!("{v:.10}").parse().unwrap()
+}
+
+/// The text of orr_output's `src/glare_tables.rs`.
+pub fn source() -> String {
+    let tables = tables();
+    let entries = pyramid::LAST_LEVEL as usize + 1;
+    let mut s = format!(
+        "//! The glare pyramid's band weights: per first level (1, 2), F-number (spaced evenly in log
+//! from `GLARE_F_MIN` to `GLARE_F_MAX`) and entry (w0, then each mip's band), a weight per
+//! Rec.2020 channel.
+//!
+//! Made by a non-negative least squares fit of the pyramid's kernels to the energy of a
+//! {}-blade diaphragm's Fraunhofer PSF in rings around the source, integrated over wavelength
+//! with `build/spectral_weights.rs`, which comes from CIE standard illuminant D65 and the CIE
+//! 1931 2-degree color matching functions; `THIRD_PARTY_LICENSES.md` gives their sources and
+//! licenses. Weights are rounded to 10 decimal places. The output suite holds the fit
+//! (`src/glare_model/fit.rs`); its test
+//! `the_committed_glare_tables_match_the_fit` checks this file and rewrites it with
+//! `ORR_BLESS=1`.
+
+pub(crate) const GLARE_F_NUMBERS: usize = {F_NUMBERS};
+pub(crate) const GLARE_F_MIN: f64 = {F_MIN:?};
+pub(crate) const GLARE_F_MAX: f64 = {F_MAX:?};
+/// Pixel pitch the tables are fitted at, um.
+pub(crate) const GLARE_REFERENCE_PITCH_UM: f32 = {:?};
+pub(crate) const GLARE_ENTRIES: usize = {entries};
+
+#[rustfmt::skip]
+pub(crate) const GLARE_TABLES: [[[[f64; 3]; GLARE_ENTRIES]; GLARE_F_NUMBERS]; 2] = [
+",
+        psf::BLADES,
+        psf::REFERENCE_PITCH_UM as f32,
+    );
+    for first in &tables {
+        s.push_str("    [\n");
+        for row in first {
+            s.push_str("        [\n");
+            for w in row {
+                writeln!(s, "            {:?},", w.map(rounded)).unwrap();
+            }
+            s.push_str("        ],\n");
+        }
+        s.push_str("    ],\n");
+    }
+    s.push_str("];\n");
+    s
 }

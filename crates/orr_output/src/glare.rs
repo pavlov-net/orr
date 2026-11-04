@@ -1,7 +1,7 @@
 //! Glare after the other camera effects, which the tonemap composites: the light past a knee
-//! at about SDR's white spreads, by default through Jimenez's band pyramid with per-channel band weights fitted
-//! at build to the diaphragm's Fraunhofer PSF; FFT convolution with the same PSF (`fft_glare`) is
-//! the costlier setting.
+//! at about SDR's white spreads, by default through Jimenez's band pyramid with per-channel band
+//! weights fitted to the diaphragm's Fraunhofer PSF (`glare_tables`); FFT convolution with the
+//! same PSF (`fft_glare`) is the costlier setting.
 
 use orr_scene::orr_gpu::{
     AddressMode, Allocation, CommandList, ComputePipeline, Device, Filter, Format, GpuPtr, Hazards,
@@ -11,12 +11,14 @@ use orr_scene::orr_gpu::{
 use orr_scene::{Glare, ViewConstants};
 
 use crate::fft_glare::FftGlareTargets;
+use crate::glare_tables::{
+    GLARE_ENTRIES, GLARE_F_MAX, GLARE_F_MIN, GLARE_F_NUMBERS, GLARE_REFERENCE_PITCH_UM,
+    GLARE_TABLES,
+};
 use crate::gt7::GT7_SDR_NITS;
 use crate::passes::groups;
 use crate::shaders::post::glare::{self, Root};
 use crate::{Image, ResolvedDisplay, Result, ViewOutput};
-
-include!(concat!(env!("OUT_DIR"), "/glare_tables.rs"));
 
 /// Halvings to the chain's last level (1/256 of the extent).
 const LAST_LEVEL: u32 = GLARE_ENTRIES as u32 - 1;
@@ -28,7 +30,6 @@ pub(crate) const GLARE_DISPATCHES: usize = 2 * LAST_LEVEL as usize - 1;
 const _: () = assert!(
     GLARE_F_NUMBERS == 10 && GLARE_ENTRIES == 9 && GLARE_F_MIN == 4.0 && GLARE_F_MAX == 22.0
 );
-const _: () = assert!(GLARE_TABLES.len() == 2 * GLARE_F_NUMBERS * GLARE_ENTRIES);
 
 /// Glaring one view's radiance through its lens's diaphragm.
 #[derive(Clone, Copy, Debug)]
@@ -109,15 +110,18 @@ impl GlareKernels {
             let stage = ShaderStage::new(&glare::MODULE, entry, SpecData::default())?;
             Ok(gpu.create_compute_pipeline(&stage, name)?)
         };
-        let mut tables = gpu.gpu_malloc(
-            MemoryKind::Upload,
-            GLARE_TABLES.len() as u64,
-            "glare tables",
-        )?;
+        let weights: Vec<[f32; 4]> = GLARE_TABLES
+            .iter()
+            .flatten()
+            .flatten()
+            .map(|w| [w[0] as f32, w[1] as f32, w[2] as f32, 0.0])
+            .collect();
+        let mut tables =
+            gpu.gpu_malloc(MemoryKind::Upload, weights.len() as u64, "glare tables")?;
         tables
             .as_mut_slice()
             .expect("upload memory")
-            .copy_from_slice(&GLARE_TABLES);
+            .copy_from_slice(&weights);
         Ok(Self {
             downsample: pipeline("downsample", "glare_downsample")?,
             upsample: pipeline("upsample", "glare_upsample")?,

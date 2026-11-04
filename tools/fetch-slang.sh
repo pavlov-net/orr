@@ -3,19 +3,21 @@
 #   slang-2026.20/   Slang release for the host, checked against its sha256
 #   openpbr-bsdf/    adobe/openpbr-bsdf at a pinned commit
 #   glm/             GLM 1.0.1 at its tag commit
-#   precomputed_atmospheric_scattering/
-#                    ebruneton/precomputed_atmospheric_scattering at a pinned commit: ASTM G173
-#                    solar spectrum, ozone cross sections and CIE 1931 2-deg tables
 #   display/gt7/     Polyphony Digital's GT7 tone-mapping sample (MIT), checked against its
 #                    sha256
 #   vma/             GPUOpen VulkanMemoryAllocator v3.5.0 at its tag commit
 #   libdeflate-gdeflate/
 #                    NVIDIA/libdeflate's gdeflate branch at a pinned commit (MIT and
 #                    Apache-2.0): the GDeflate codec of orr_cook's `gdeflate` feature
+# With ORR_VALIDATION_DATA=1 it also fetches the test-only validation data:
+#   precomputed_atmospheric_scattering/
+#                    ebruneton/precomputed_atmospheric_scattering at a pinned commit: ASTM G173
+#                    solar spectrum, ozone cross sections and CIE 1931 2-deg tables, which the
+#                    committed spectrum and glare tables are checked against
 #   cie/CIE_std_illum_D65.csv
 #                    CIE standard illuminant D65 at 1 nm (CIE, CC BY-SA 4.0,
-#                    doi:10.25039/CIE.DS.hjfjmt59), checked against its sha256
-# With ORR_VALIDATION_DATA=1 it also fetches the test-only validation data:
+#                    doi:10.25039/CIE.DS.hjfjmt59), checked against its sha256, which the
+#                    committed glare weights are checked against
 #   sky/pragueskymodel/
 #                    PetrVevoda/pragueskymodel at a pinned commit (its solar radiance table)
 #   sky/prague/PragueSkyModelGround.dat
@@ -105,8 +107,6 @@ fetch_commit() {
 
 fetch_commit https://github.com/adobe/openpbr-bsdf "$openpbr_commit" "$tools/openpbr-bsdf"
 fetch_commit https://github.com/g-truc/glm "$glm_commit" "$tools/glm"
-fetch_commit https://github.com/ebruneton/precomputed_atmospheric_scattering "$sky_commit" \
-  "$tools/precomputed_atmospheric_scattering"
 fetch_commit https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator "$vma_commit" "$tools/vma"
 fetch_commit https://github.com/NVIDIA/libdeflate "$gdeflate_commit" "$tools/libdeflate-gdeflate"
 
@@ -121,18 +121,19 @@ else
   echo "gt7 sample in $gt7"
 fi
 
-d65="$tools/cie/CIE_std_illum_D65.csv"
-if echo "$d65_sum  $d65" | sha256sum -c --quiet - 2>/dev/null; then
-  echo "CIE D65 already in $d65"
-else
-  mkdir -p "$(dirname "$d65")"
-  curl -fsSL --retry 3 -o "$d65.part" https://files.cie.co.at/Publications-datasets/CIE_std_illum_D65.csv
-  echo "$d65_sum  $d65.part" | sha256sum -c --quiet -
-  mv "$d65.part" "$d65"
-  echo "CIE D65 in $d65"
-fi
-
 if [ "${ORR_VALIDATION_DATA:-0}" = 1 ]; then
+  fetch_commit https://github.com/ebruneton/precomputed_atmospheric_scattering "$sky_commit" \
+    "$tools/precomputed_atmospheric_scattering"
+  d65="$tools/cie/CIE_std_illum_D65.csv"
+  if echo "$d65_sum  $d65" | sha256sum -c --quiet - 2>/dev/null; then
+    echo "CIE D65 already in $d65"
+  else
+    mkdir -p "$(dirname "$d65")"
+    curl -fsSL --retry 3 -o "$d65.part" https://files.cie.co.at/Publications-datasets/CIE_std_illum_D65.csv
+    echo "$d65_sum  $d65.part" | sha256sum -c --quiet -
+    mv "$d65.part" "$d65"
+    echo "CIE D65 in $d65"
+  fi
   fetch_commit https://github.com/PetrVevoda/pragueskymodel "$prague_commit" "$tools/sky/pragueskymodel"
   ground="$tools/sky/prague/PragueSkyModelGround.dat"
   if echo "$prague_ground_sum  $ground" | sha256sum -c --quiet - 2>/dev/null; then

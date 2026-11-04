@@ -1,13 +1,13 @@
-// The glare band pyramid's filters on the CPU, one channel in f64: the same taps, sample
-// positions and level sizes as `post/glare.slang`, with exact bilinear sampling and no
-// storage rounding. Shared by the build script, which fits band weights to its kernels, and
-// the output suite (through `include!`), so it has no inner attributes or doc comments.
+//! The glare band pyramid's filters on the CPU, one channel in f64: the same taps, sample
+//! positions and level sizes as `post/glare.slang`, with exact bilinear sampling and no
+//! storage rounding. The glare fit matches band weights to its kernels; the glare tests check the
+//! GPU against it.
 
-// Halvings to the chain's last level: 1/256 of the extent.
+/// Halvings to the chain's last level: 1/256 of the extent.
 pub const LAST_LEVEL: u32 = 8;
 
-// One level of the chain: `size` texels, of which the window at `origin` is held; texels
-// outside the window are zero, texel indices outside the level clamp to its edge.
+/// One level of the chain: `size` texels, of which the window at `origin` is held; texels
+/// outside the window are zero, texel indices outside the level clamp to its edge.
 #[derive(Clone, Debug)]
 pub struct Plane {
     pub size: [u32; 2],
@@ -17,7 +17,7 @@ pub struct Plane {
 }
 
 impl Plane {
-    // A whole level, rows top to bottom.
+    /// A whole level, rows top to bottom.
     pub fn dense(size: [u32; 2], data: Vec<f64>) -> Self {
         assert_eq!(data.len(), (size[0] * size[1]) as usize);
         Self {
@@ -28,7 +28,7 @@ impl Plane {
         }
     }
 
-    // A level of `size` that is zero except `value` at texel `at`.
+    /// A level of `size` that is zero except `value` at texel `at`.
     pub fn impulse(size: [u32; 2], at: [i64; 2], value: f64) -> Self {
         Self {
             size,
@@ -47,7 +47,7 @@ impl Plane {
         self.data[y as usize * self.window[0] + x as usize]
     }
 
-    // Bilinear sample at texel coordinates `p` (texel centers at i + 0.5).
+    /// Bilinear sample at texel coordinates `p` (texel centers at i + 0.5).
     fn sample(&self, p: [f64; 2]) -> f64 {
         let (tx, ty) = (p[0] - 0.5, p[1] - 0.5);
         let (x, y) = (tx.floor(), ty.floor());
@@ -58,7 +58,7 @@ impl Plane {
         top * (1.0 - fy) + bottom * fy
     }
 
-    // Texel indices `[x0, x1)` and `[y0, y1)` of the window.
+    /// Texel indices `[x0, x1)` and `[y0, y1)` of the window.
     fn bounds(&self) -> [[i64; 2]; 2] {
         [
             [self.origin[0], self.origin[0] + self.window[0] as i64],
@@ -71,9 +71,9 @@ impl Plane {
     }
 }
 
-// Texel indices `[first, last)` of a level of `size` whose taps, `reach` of its own texels
-// around each center, can touch the window `[lo, hi)` of a level `ratio` times coarser per
-// texel.
+/// Texel indices `[first, last)` of a level of `size` whose taps, `reach` of its own texels
+/// around each center, can touch the window `[lo, hi)` of a level `ratio` times coarser per
+/// texel.
 fn reached(lo: i64, hi: i64, ratio: f64, reach: f64, size: u32) -> [i64; 2] {
     let first = ((lo as f64 - 1.0) * ratio - reach).floor() as i64 - 1;
     let last = ((hi as f64 + 1.0) * ratio + reach).ceil() as i64 + 1;
@@ -99,9 +99,9 @@ fn fill(size: [u32; 2], xs: [i64; 2], ys: [i64; 2], f: impl Fn(i64, i64) -> f64)
     }
 }
 
-// The 13-tap downsample of the Jimenez pyramid to a level of `size`: bilinear taps at 0,
-// +-1 and +-2 times `stride` source texels around each texel's center, weighted as five 2x2
-// boxes (center 1/2, corners 1/8 each).
+/// The 13-tap downsample of the Jimenez pyramid to a level of `size`: bilinear taps at 0,
+/// +-1 and +-2 times `stride` source texels around each texel's center, weighted as five 2x2
+/// boxes (center 1/2, corners 1/8 each).
 pub fn downsample(src: &Plane, size: [u32; 2], stride: f64) -> Plane {
     let ratio = [
         f64::from(src.size[0]) / f64::from(size[0]),
@@ -122,8 +122,8 @@ pub fn downsample(src: &Plane, size: [u32; 2], stride: f64) -> Plane {
     })
 }
 
-// `w * own + coarse_weight * tent(coarse)` at a level of `size`: the 3x3 tent (1 2 1) of
-// bilinear samples of `coarse` one texel of this level apart.
+/// `w * own + coarse_weight * tent(coarse)` at a level of `size`: the 3x3 tent (1 2 1) of
+/// bilinear samples of `coarse` one texel of this level apart.
 pub fn upsample(
     own: Option<(&Plane, f64)>,
     coarse: &Plane,
@@ -164,9 +164,9 @@ pub fn upsample(
     })
 }
 
-// Level sizes of the chain for `extent` starting `first_level` halvings down: mip m is
-// mip 0 halved m times, rounding down as texture mips do, and the chain ends at LAST_LEVEL
-// or at a level one texel across.
+/// Level sizes of the chain for `extent` starting `first_level` halvings down: mip m is
+/// mip 0 halved m times, rounding down as texture mips do, and the chain ends at LAST_LEVEL
+/// or at a level one texel across.
 pub fn levels(extent: [u32; 2], first_level: u32) -> Vec<[u32; 2]> {
     let first = extent.map(|n| (n >> first_level).max(1));
     let max = (LAST_LEVEL + 1 - first_level) as usize;
@@ -176,7 +176,7 @@ pub fn levels(extent: [u32; 2], first_level: u32) -> Vec<[u32; 2]> {
         .collect()
 }
 
-// The chain's downsampled levels of `input`.
+/// The chain's downsampled levels of `input`.
 pub fn downsamples(input: &Plane, first_level: u32) -> Vec<Plane> {
     let sizes = levels(input.size, first_level);
     let stride = f64::from(1u32 << (first_level - 1));
@@ -188,9 +188,9 @@ pub fn downsamples(input: &Plane, first_level: u32) -> Vec<Plane> {
     downs
 }
 
-// The glare on one channel at the input's resolution: `w0 * c + sum_m w_m * band_m` with
-// `weights[0]` = w0 and `weights[1 + m]` the weight of mip m of `downs`. The tent upsample sums
-// the chain from its last level up, each level adding its weighted band.
+/// The glare on one channel at the input's resolution: `w0 * c + sum_m w_m * band_m` with
+/// `weights[0]` = w0 and `weights[1 + m]` the weight of mip m of `downs`. The tent upsample sums
+/// the chain from its last level up, each level adding its weighted band.
 pub fn compose(input: &Plane, downs: &[Plane], weights: &[f64]) -> Plane {
     let last = downs.len() - 1;
     let mut up: Option<Plane> = None;
@@ -214,7 +214,7 @@ pub fn compose(input: &Plane, downs: &[Plane], weights: &[f64]) -> Plane {
     upsample(Some((input, weights[0])), chain, chain_weight, input.size)
 }
 
-// `weights` for a chain of `mips` levels: the bands past its last mip fold into it.
+/// `weights` for a chain of `mips` levels: the bands past its last mip fold into it.
 pub fn fold(weights: &[f64], mips: usize) -> Vec<f64> {
     let mut w = weights[..=mips].to_vec();
     w[mips] += weights[mips + 1..].iter().sum::<f64>();

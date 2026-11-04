@@ -9,6 +9,7 @@ mod exposure;
 mod fft_glare;
 mod frame_generation;
 mod glare;
+mod glare_tables;
 mod gt7;
 mod hooks;
 mod local_exposure;

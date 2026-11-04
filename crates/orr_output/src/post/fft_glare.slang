@@ -217,7 +217,7 @@ int padded(uint i, uint size, uint n)
 }
 
 // The kernel's energy per channel at `[dx, dy]` pixels from the source, for pixels `u`
-// table texels across (`Kernel::energy` in `build/fft.rs`).
+// table texels across (the output suite's `Kernel::energy` follows this exactly).
 float3 kernel_energy(int dx, int dy, float u)
 {
     FftKernel* k = root.kernel;

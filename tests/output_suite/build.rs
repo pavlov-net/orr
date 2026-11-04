@@ -11,11 +11,9 @@ fn main() {
     if let Err(e) = out {
         panic!("{e}");
     }
-    // orr_output's glare PSF data and CPU pyramid model, which the glare tests include.
-    for (dep, var) in [
-        ("DEP_ORR_OUTPUT_GLARE_PSF", "ORR_GLARE_PSF"),
-        ("DEP_ORR_OUTPUT_GLARE_MODEL", "ORR_GLARE_MODEL"),
-    ] {
-        println!("cargo::rustc-env={var}={}", env::var(dep).unwrap());
-    }
+    // Where orr_output built the FFT glare's kernel, which the glare tests read as the GPU does.
+    println!(
+        "cargo::rustc-env=ORR_GLARE_FFT={}",
+        env::var("DEP_ORR_OUTPUT_GLARE_FFT").unwrap()
+    );
 }

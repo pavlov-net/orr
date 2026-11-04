@@ -1002,29 +1002,11 @@ mod glare {
     };
     use orr_scene::Glare;
     use orr_scene::testing::{Image, Pixels, assert_clean, flip};
+    use output_suite::glare_model::{
+        F_NUMBERS, TABLES, check_or_bless, encircled_rgb, fft, fft_kernel, fit, psf, pyramid,
+        spectral_weights_source,
+    };
     use output_suite::{Harness, read_rgba16f};
-
-    #[allow(dead_code, unreachable_pub)]
-    mod pyramid {
-        include!(concat!(env!("ORR_GLARE_MODEL"), "/pyramid.rs"));
-    }
-    #[allow(dead_code, unreachable_pub)]
-    mod psf {
-        include!(concat!(env!("ORR_GLARE_MODEL"), "/psf.rs"));
-    }
-    #[allow(dead_code, unreachable_pub)]
-    mod fft {
-        include!(concat!(env!("ORR_GLARE_MODEL"), "/fft.rs"));
-    }
-    #[allow(
-        dead_code,
-        unreachable_pub,
-        clippy::unreadable_literal,
-        clippy::excessive_precision
-    )]
-    mod data {
-        include!(env!("ORR_GLARE_PSF"));
-    }
 
     use pyramid::Plane;
 
@@ -1033,7 +1015,7 @@ mod glare {
 
     /// The EV100 at which the lens is at table F-number `i` at the reference pitch.
     fn ev_at(i: usize) -> f32 {
-        (100.0 * data::F_NUMBERS[i] * data::F_NUMBERS[i]).log2() as f32
+        (100.0 * F_NUMBERS[i] * F_NUMBERS[i]).log2() as f32
     }
 
     /// The nits a surface has per unit it exposes to at `ev`.
@@ -1071,7 +1053,7 @@ mod glare {
     /// The harness's view at `extent` with the reference pixel pitch, glare `strength`.
     fn harness(extent: [u32; 2], glare: Option<f32>) -> Harness {
         let mut h = Harness::new(extent[0], extent[1]);
-        h.sensor_height_mm = (data::REFERENCE_PITCH_UM * f64::from(extent[1]) / 1000.0) as f32;
+        h.sensor_height_mm = (psf::REFERENCE_PITCH_UM * f64::from(extent[1]) / 1000.0) as f32;
         h.glare = glare.map(|strength| Glare { strength });
         h
     }
@@ -1110,11 +1092,11 @@ mod glare {
     /// The weights the pass writes at F-number `n` (reference pitch) for a chain of `mips`
     /// levels from `first_level`: the tables interpolated in log N, folded into the last mip.
     fn expected_weights(first_level: usize, n: f64, mips: usize) -> Vec<[f64; 3]> {
-        let f = &data::F_NUMBERS;
+        let f = &F_NUMBERS;
         let n = n.clamp(f[0], f[f.len() - 1]);
         let t = (n / f[0]).ln() / (f[f.len() - 1] / f[0]).ln() * (f.len() - 1) as f64;
         let i = (t as usize).min(f.len() - 2);
-        let rows = &data::TABLES[first_level - 1];
+        let rows = &TABLES[first_level - 1];
         let mut out = vec![[0.0; 3]; mips + 1];
         for c in 0..3 {
             let lerped: Vec<f64> = (0..rows[i].len())
@@ -1214,9 +1196,30 @@ mod glare {
         nits
     }
 
+    /// `ORR_BLESS=1` rewrites orr_output's `src/glare_tables.rs`.
+    #[test]
+    fn the_committed_glare_tables_match_the_fit() {
+        check_or_bless(
+            "../../crates/orr_output/src/glare_tables.rs",
+            &fit::source(),
+        );
+    }
+
+    /// Skipped when `tools/fetch-slang.sh` has not fetched the files (`ORR_VALIDATION_DATA=1`).
+    #[test]
+    #[allow(clippy::print_stderr)]
+    fn the_spectral_weights_match_the_fetched_files() {
+        let path = "../../crates/orr_output/build/spectral_weights.rs";
+        let committed = include_str!("../../../crates/orr_output/build/spectral_weights.rs");
+        match spectral_weights_source(committed) {
+            Some(generated) => check_or_bless(path, &generated),
+            None => eprintln!("skipped: D65 or the color matching functions not fetched"),
+        }
+    }
+
     #[test]
     fn tables_are_non_negative_and_keep_energy() {
-        for first in &data::TABLES {
+        for first in &TABLES {
             for row in first {
                 for c in 0..3 {
                     assert!(row.iter().all(|w| w[c] >= 0.0), "{row:?}");
@@ -1229,7 +1232,7 @@ mod glare {
 
     #[test]
     fn cpu_fit_keeps_uniform_fields_and_point_energy() {
-        let w: Vec<f64> = data::TABLES[0][4].iter().map(|w| w[1]).collect();
+        let w: Vec<f64> = TABLES[0][4].iter().map(|w| w[1]).collect();
         let size = [96, 64];
         let input = Plane::dense(size, vec![1.5; 96 * 64]);
         let downs = pyramid::downsamples(&input, 1);
@@ -1415,14 +1418,7 @@ mod glare {
         }
         let ee = |n: u64| {
             let r = (n as f64 / std::f64::consts::PI).sqrt();
-            psf::encircled_rgb(
-                &data::EE,
-                data::EE_TAIL,
-                &data::SPECTRAL,
-                r,
-                f_number,
-                data::REFERENCE_PITCH_UM,
-            )
+            encircled_rgb(r, f_number, psf::REFERENCE_PITCH_UM)
         };
         let mut inside = 0;
         let mut per_pixel = std::collections::BTreeMap::new();
@@ -1453,7 +1449,7 @@ mod glare {
         let (image, exposure, _) = settle(&mut h, &nits, &out, &hdr(250.0));
         assert_weights(
             &weights(&h),
-            &expected_weights(1, data::F_NUMBERS[i], 8),
+            &expected_weights(1, F_NUMBERS[i], 8),
             &format!("table F-number {i}"),
         );
         let energy = f64::from(source) * exposure;
@@ -1464,11 +1460,11 @@ mod glare {
             })
             .collect();
         let fitted = log_image(side, &crop, energy);
-        let reference = log_image(side, &psf_image(side, data::F_NUMBERS[i]), 1.0);
+        let reference = log_image(side, &psf_image(side, F_NUMBERS[i]), 1.0);
         let error = flip(&reference, &fitted);
         log::info!(
             "fitted kernel against the PSF at f/{:.2}: FLIP {error:?}",
-            data::F_NUMBERS[i]
+            F_NUMBERS[i]
         );
         assert!(error.mean < 0.03, "{error:?}");
         assert_clean();
@@ -1508,7 +1504,7 @@ mod glare {
     fn weights_ignore_the_aspect_ratio() {
         let ev = ev_at(4);
         // The reference pitch at the height below, whatever the width.
-        let sensor_mm = (data::REFERENCE_PITCH_UM * 128.0 / 1000.0) as f32;
+        let sensor_mm = (psf::REFERENCE_PITCH_UM * 128.0 / 1000.0) as f32;
         let weights_at = |extent: [u32; 2], out: &ViewOutput| {
             let mut h = Harness::new(extent[0], extent[1]);
             h.glare = Some(Glare { strength: 1.0 });
@@ -1520,7 +1516,7 @@ mod glare {
         let bands = output(ev, OutputDebug::None);
         let wide = weights_at([512, 128], &bands);
         assert_eq!(wide, weights_at([128, 128], &bands));
-        assert_weights(&wide, &expected_weights(1, data::F_NUMBERS[4], 7), "bands");
+        assert_weights(&wide, &expected_weights(1, F_NUMBERS[4], 7), "bands");
         let fft = fft_output(ev, OutputDebug::None, 1);
         assert_eq!(
             weights_at([512, 128], &fft)[0],
@@ -1605,32 +1601,6 @@ mod glare {
         assert_clean();
     }
 
-    /// The FFT kernel's table and spikes as the GPU reads them.
-    fn fft_kernel() -> fft::Kernel {
-        let bytes = std::fs::read(data::FFT_TABLE_BIN).expect("fft glare table");
-        let floats: Vec<f64> = bytes
-            .chunks_exact(4)
-            .map(|b| f64::from(f32::from_le_bytes(b.try_into().unwrap())))
-            .collect();
-        let mut levels = Vec::new();
-        let mut at = 0;
-        for k in 0..fft::LEVELS {
-            let n = fft::TABLE >> k;
-            levels.push(
-                (at..at + n * n)
-                    .map(|i| [floats[4 * i], floats[4 * i + 1], floats[4 * i + 2]])
-                    .collect(),
-            );
-            at += n * n;
-        }
-        assert_eq!(4 * at, floats.len());
-        fft::Kernel {
-            levels,
-            kappa: data::FFT_KAPPA,
-            spikes: data::FFT_SPIKES.to_vec(),
-        }
-    }
-
     /// The FFT's image size and kernel radius for `extent`: 4/9 of the image's height at its
     /// resolution, as far as power-of-two padding up to 4096 allows.
     fn fft_layout(extent: [u32; 2], first_level: u32) -> ([u32; 2], i64) {
@@ -1642,7 +1612,7 @@ mod glare {
 
     /// The lens's F-number at the reference pitch on SDR or a 250-nit peak.
     fn lens_f_number(ev100: f32) -> f64 {
-        let f = &data::F_NUMBERS;
+        let f = &F_NUMBERS;
         (f64::from(ev100).exp2() / 100.0)
             .sqrt()
             .clamp(f[0], f[f.len() - 1])
@@ -1743,7 +1713,7 @@ mod glare {
         for first_level in [1, 2] {
             for n in [4.0, 5.6, 8.0, 11.0, 16.0, 22.0] {
                 let u = fft::Kernel::texels(n, first_level);
-                let pitch = f64::from(1u32 << first_level) * data::REFERENCE_PITCH_UM;
+                let pitch = f64::from(1u32 << first_level) * psf::REFERENCE_PITCH_UM;
                 // Energy and pixel count per squared distance.
                 let mut shells = std::collections::BTreeMap::<i64, ([f64; 3], u64)>::new();
                 let mut total = [0.0; 3];
@@ -1776,14 +1746,7 @@ mod glare {
                     }
                     next = r * 2.0;
                     let area_radius = (count as f64 / std::f64::consts::PI).sqrt();
-                    let psf = psf::encircled_rgb(
-                        &data::EE,
-                        data::EE_TAIL,
-                        &data::SPECTRAL,
-                        area_radius,
-                        n,
-                        pitch,
-                    );
+                    let psf = encircled_rgb(area_radius, n, pitch);
                     for c in 0..3 {
                         let error = ((1.0 - inside[c]) / (1.0 - psf[c]) - 1.0).abs();
                         let worst = if r < 8.0 { &mut near } else { &mut far };
@@ -1937,7 +1900,7 @@ mod glare {
                 .map(|i| 360.0 * i as f64 / steps as f64)
                 .collect();
             log::info!("fft spikes at radius {radius:.1}: peaks at {peaks:?} degrees");
-            assert_eq!(peaks.len(), data::BLADES as usize, "{radius}: {peaks:?}");
+            assert_eq!(peaks.len(), psf::BLADES as usize, "{radius}: {peaks:?}");
             for p in &peaks {
                 let off = (p - 30.0).rem_euclid(60.0);
                 assert!(off.min(60.0 - off) < 1.0, "{radius}: {peaks:?}");

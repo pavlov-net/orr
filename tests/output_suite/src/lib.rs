@@ -19,6 +19,8 @@ use orr_scene::orr_gpu::{
 use orr_scene::testing::{device, read_buffer, read_texture, wait};
 use orr_scene::{ExposureState, Glare, SkyStats, ViewConstants};
 
+pub mod glare_model;
+
 pub mod shaders {
     include!(concat!(env!("OUT_DIR"), "/orr_shaders.rs"));
 }

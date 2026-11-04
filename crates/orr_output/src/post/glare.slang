@@ -1,5 +1,5 @@
 // Glare: Jimenez's band pyramid on RGBA16F, its bands weighted per Rec.2020 channel
-// by tables fitted at build to the diaphragm's PSF (`build/fit.rs`). Each dispatch has its
+// by tables fitted to the diaphragm's PSF (`glare_tables.rs`). Each dispatch has its
 // own root:
 //
 // - `downsample` writes mip `mip` of the chain with the 13-tap filter: from the part of the
@@ -9,8 +9,8 @@
 //   place, from the chain's last mip up; mip 0 then holds the weighted band sum the tonemap
 //   composites.
 //
-// The CPU model in `build/pyramid.rs` follows these taps and sample positions exactly, on the
-// plane of what `glare_extract` takes from each pixel.
+// The output suite's CPU model (`glare_model/pyramid.rs`) follows these taps and sample
+// positions exactly, on the plane of what `glare_extract` takes from each pixel.
 #include "orr_shaders/root.h"
 import orr_shaders.abi;
 import orr_scene.view;
