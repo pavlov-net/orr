@@ -10,7 +10,6 @@ use objc2_metal::{
 };
 
 use super::memory::{Allocation, MemoryKind, malloc};
-use super::mesh::MeshPipeline;
 use super::pipeline::ComputePipeline;
 use super::queue::Queue;
 use super::texture::Texture;
@@ -421,23 +420,6 @@ impl<'q> CommandList<'q> {
     }
 
     pub fn end_pass(&mut self) {}
-
-    pub fn draw_mesh_tasks<R>(&mut self, p: &MeshPipeline, root: GpuPtr<R>, groups: [u32; 3]) {
-        let _ = (p, root, groups);
-        not_implemented("CommandList::draw_mesh_tasks")
-    }
-
-    pub fn draw_mesh_tasks_indirect_count<R>(
-        &mut self,
-        p: &MeshPipeline,
-        root: GpuPtr<R>,
-        args: GpuPtr<MeshArgs>,
-        count: GpuPtr<u32>,
-        max: u32,
-    ) {
-        let _ = (p, root, args, count, max);
-        not_implemented("CommandList::draw_mesh_tasks_indirect_count")
-    }
 }
 
 impl Drop for CommandList<'_> {
