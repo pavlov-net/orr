@@ -205,7 +205,8 @@ public float3 surface_visibility<S : ISurface, M : IMedium>(SceneRoot* s, ViewCo
     ray.TMin = 0.0;
     ray.TMax = t_max;
     bool overflow;
-    float3 product = trace_transmittance(s.tlas, ray, SHADOW_MASK, flags, h, SHADOW_CANDIDATES, overflow);
+    // Any opaque hit makes the product 0, so the search ends at the first it finds.
+    float3 product = trace_transmittance(s.tlas, ray, SHADOW_MASK, flags | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, h, SHADOW_CANDIDATES, overflow);
     if (overflow && overflows != nullptr)
         InterlockedAdd(*overflows, 1u);
     depth = max(h.depth, 0.0);
