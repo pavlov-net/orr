@@ -81,8 +81,8 @@ pub enum Usage {
     Color,
     /// sRGB color with linear alpha to BC7 sRGB.
     ColorAlpha,
-    /// Tangent-space normal (RGB as stored, `2v - 1`, or x and y alone from a two-channel
-    /// source) to BC5 holding x and y; z is reconstructed.
+    /// Tangent-space normal (RGB as stored, `2v - 1` unless the source is signed, or x and y
+    /// alone from a two-channel source) to BC5 holding x and y; z is reconstructed.
     Normal,
     /// One linear channel (R) to BC4.
     Linear1,
@@ -322,13 +322,26 @@ fn build(layers: Vec<Img>, plan: &Plan) -> Result<Built, String> {
     finish(chains(layers, plan, 0)?, plan)
 }
 
-/// The normal of source texel `t`. A two-channel source (`rg`) holds no z, which is rebuilt
-/// as the shader rebuilds it.
-fn source_normal(t: [f32; 4], rg: bool) -> [f32; 3] {
-    if rg {
-        normal::decode([t[0], t[1]])
-    } else {
-        [2.0 * t[0] - 1.0, 2.0 * t[1] - 1.0, 2.0 * t[2] - 1.0]
+/// How an image stores normals.
+#[derive(Copy, Clone, Debug)]
+struct NormalSource {
+    /// It holds x and y alone.
+    rg: bool,
+    /// Components are stored as they are, not at `0.5 v + 0.5`.
+    signed: bool,
+}
+
+impl NormalSource {
+    /// The normal of texel `t`. Without a stored z it is rebuilt as the shader rebuilds it.
+    fn read(self, t: [f32; 4]) -> [f32; 3] {
+        let component = |v: f32| if self.signed { v } else { 2.0 * v - 1.0 };
+        let [x, y] = [component(t[0]), component(t[1])];
+        let z = if self.rg {
+            normal::z(x, y)
+        } else {
+            component(t[2])
+        };
+        [x, y, z]
     }
 }
 
@@ -497,7 +510,11 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         Usage::Color | Usage::ColorAlpha | Usage::Hdr | Usage::Data(DataFormat::Rgba8Srgb)
     );
     let normal = s.usage == Usage::Normal;
-    let (srgb, rg) = (src.srgb, src.rg);
+    let srgb = src.srgb;
+    let source = NormalSource {
+        rg: src.rg,
+        signed: src.signed,
+    };
     let linear = |p: &mut [f32; 4]| {
         if color && srgb {
             for c in &mut p[..3] {
@@ -505,7 +522,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
             }
         }
         if normal {
-            let [x, y, z] = source_normal(*p, rg);
+            let [x, y, z] = source.read(*p);
             *p = [x, y, z, 1.0];
         }
     };

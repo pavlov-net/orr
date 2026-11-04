@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use orr_color::RgbPrimaries;
 use orr_cook::{
-    ArchiveSpec, AssetSpec, CookOptions, GltfSettings, InputChannels, Manifest, Primaries, Quality,
-    Source, TextureOverride, TextureRules, TextureSettings, Usage,
+    ArchiveSpec, AssetSpec, CookOptions, DataFormat, GltfSettings, InputChannels, Manifest,
+    Primaries, Quality, Source, TextureOverride, TextureRules, TextureSettings, Usage,
 };
 use orr_math::Vec3;
 use orr_pack::material::{Material, slot};
@@ -218,7 +218,7 @@ fn textures_keep_the_mips_their_usage_or_settings_ask_for() {
     let color_path = d.join("color.ktx2");
     std::fs::write(&color_path, color).unwrap();
     let data = |max_size, mips| TextureSettings {
-        usage: Usage::Data(orr_cook::DataFormat::Rgba8),
+        usage: Usage::Data(DataFormat::Rgba8),
         max_size,
         mips,
         ..TextureSettings::default()
@@ -993,20 +993,51 @@ fn signed_two_channel_normals_read_their_own_values() {
         panic!("container output");
     };
     let path = d.join("signed.ktx2");
-    std::fs::write(&path, bytes).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let check = |a: &Archive, name: &str| {
+        let (_, levels) = mips(a, name);
+        let texels = decode(vk::BC5_UNORM, n, n, &levels[0][0]);
+        for (x, want) in [(8, tilt), (56, -tilt)] {
+            let got = texels[8 * n as usize + x].map(|c| 2.0 * c - 1.0);
+            assert!((got[0] - want).abs() < 0.02, "{got:?}, not {want}");
+            assert!(got[1].abs() < 0.02, "{got:?}");
+        }
+    };
     let settings = TextureSettings {
         usage: Usage::Normal,
         ..TextureSettings::default()
     };
-    let a = cook(vec![texture(&path, "n", settings)]);
-    let (_, levels) = mips(&a, "n");
-    let texels = decode(vk::BC5_UNORM, n, n, &levels[0][0]);
-    let stored = |x: usize| texels[8 * n as usize + x].map(|c| 2.0 * c - 1.0);
-    for (x, want) in [(8, tilt), (56, -tilt)] {
-        let got = stored(x);
-        assert!((got[0] - want).abs() < 0.02, "{got:?}, not {want}");
-        assert!(got[1].abs() < 0.02, "{got:?}");
-    }
+    check(&cook(vec![texture(&path, "n", settings)]), "n");
+
+    let glb = d.join("signed.glb");
+    write_glb(&glb, &[r#"{"normalTexture":{"index":0}}"#.into()], &[bytes]);
+    let a = cook(vec![AssetSpec {
+        name: "g".into(),
+        source: Source::Gltf {
+            path: glb,
+            settings: GltfSettings::default(),
+        },
+    }]);
+    let e = a.find(AssetId::from_name("g/material/0")).unwrap();
+    let m = Material::from_bytes(&read_blob(&a, e, 0)).unwrap();
+    check(
+        &a,
+        a.name(a.find(m.textures[slot::NORMAL].texture).unwrap()),
+    );
+
+    // As plain data, a signed value is that value.
+    let settings = TextureSettings {
+        usage: Usage::Data(DataFormat::R32f),
+        ..TextureSettings::default()
+    };
+    let a = cook(vec![texture(&path, "data", settings)]);
+    let (_, levels) = mips(&a, "data");
+    let value = |x: usize| {
+        let at = (8 * n as usize + x) * 4;
+        f32::from_le_bytes(levels[0][0][at..at + 4].try_into().unwrap())
+    };
+    assert!((value(8) - tilt).abs() < 0.02, "{}", value(8));
+    assert!((value(56) + tilt).abs() < 0.02, "{}", value(56));
 }
 
 fn bcn_material_checks(a: &Archive, remade: bool, blocks: [&Vec<Vec<u8>>; 5]) {

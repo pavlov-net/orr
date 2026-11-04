@@ -19,8 +19,8 @@ use super::{Img, Primaries};
 
 /// A decoded image file.
 pub(super) struct Source {
-    /// Mip 0 of each layer, values as stored: unorm data in 0..1, snorm data at `0.5 v + 0.5`
-    /// so that it reads as unorm data does, floats as they are.
+    /// Mip 0 of each layer, values as stored: unorm data in 0..1, snorm data in -1..1, floats
+    /// as they are.
     pub(super) layers: Vec<Img>,
     /// Six layers in the Vulkan face order.
     pub(super) cube: bool,
@@ -33,6 +33,8 @@ pub(super) struct Source {
     pub(super) blocks: Option<Blocks>,
     /// The file holds two channels, red and green.
     pub(super) rg: bool,
+    /// The file stores signed normalized values.
+    pub(super) signed: bool,
 }
 
 pub(super) struct Blocks {
@@ -97,6 +99,7 @@ pub(crate) struct Scan {
     pub(super) complete: bool,
     pub(super) srgb: bool,
     pub(super) rg: bool,
+    pub(super) signed: bool,
     pub(super) range: [(f32, f32); 4],
 }
 
@@ -201,6 +204,7 @@ impl<'a> Ktx2Blocks<'a> {
             srgb: self.srgb(),
             primaries: None,
             rg: two_channels(self.vk_format()),
+            signed: signed_blocks(self.vk_format()),
             blocks: Some(Blocks {
                 vk_format: self.vk_format(),
                 w: h.pixel_width,
@@ -239,6 +243,7 @@ impl<'a> Ktx2Blocks<'a> {
             complete: h.level_count.max(1) == full_mip_count(w, hh),
             srgb: self.srgb(),
             rg: two_channels(vk_format),
+            signed: signed_blocks(vk_format),
             range,
         })
     }
@@ -247,6 +252,10 @@ impl<'a> Ktx2Blocks<'a> {
 /// Whether blocks of `vk_format` hold two channels, red and green.
 fn two_channels(vk_format: u32) -> bool {
     matches!(vk_format, vk::BC5_UNORM | vk::BC5_SNORM)
+}
+
+fn signed_blocks(vk_format: u32) -> bool {
+    matches!(vk_format, vk::BC4_SNORM | vk::BC5_SNORM)
 }
 
 /// Per channel, the lowest and highest value of a `w` x `h` mip of `vk_format` blocks read
@@ -264,7 +273,7 @@ pub(super) fn block_range(
     let blocks = bw * h.div_ceil(4) as usize;
     // Channels past these hold the same value in every block of the format.
     let stored = match vk_format {
-        vk::BC4_UNORM => 1,
+        vk::BC4_UNORM | vk::BC4_SNORM => 1,
         vk::BC5_UNORM | vk::BC5_SNORM => 2,
         vk::BC6H_UFLOAT | vk::BC6H_SFLOAT => 3,
         _ => 4,
@@ -353,6 +362,7 @@ fn container(image: ctt::Image) -> Result<Source, String> {
                 levels,
             }),
             rg: two_channels(vk_format),
+            signed: signed_blocks(vk_format),
         });
     }
     // Uncompressed: ctt converts to f32 RGBA in the file's color space.
@@ -376,11 +386,6 @@ fn container(image: ctt::Image) -> Result<Source, String> {
     let ctt::PipelineOutput::Raw(img) = out else {
         return Err("ctt returned a container for raw output".into());
     };
-    let signed = if is_snorm(format) {
-        format.channel_count().unwrap_or(0)
-    } else {
-        0
-    };
     let layers = img
         .surfaces
         .iter()
@@ -393,7 +398,6 @@ fn container(image: ctt::Image) -> Result<Source, String> {
                     *p = std::array::from_fn(|c| {
                         f32::from_le_bytes(b[c * 4..c * 4 + 4].try_into().expect("4 bytes"))
                     });
-                    p[..signed].iter_mut().for_each(|v| *v = 0.5 * *v + 0.5);
                 }
             }
             out
@@ -406,6 +410,7 @@ fn container(image: ctt::Image) -> Result<Source, String> {
         primaries: None,
         blocks: None,
         rg: format.channel_count() == Some(2),
+        signed: is_snorm(format),
     })
 }
 
@@ -467,6 +472,7 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
         primaries,
         blocks: None,
         rg: false,
+        signed: false,
     })
 }
 
@@ -506,8 +512,8 @@ fn png_cicp(bytes: &[u8]) -> Result<Option<png::CodingIndependentCodePoints>, St
     Ok(reader.info().coding_independent_code_points)
 }
 
-/// Decodes one layer's BCn mip to float texels (unorm values in 0..1, snorm values at
-/// `0.5 v + 0.5`, BC6H as floats).
+/// Decodes one layer's BCn mip to float texels (unorm values in 0..1, snorm values in -1..1,
+/// BC6H as floats).
 pub(crate) fn decode_blocks(vk_format: u32, w: u32, h: u32, data: &[u8]) -> Result<Img, String> {
     decode_blocks_with(vk_format, w, h, data, |t| t)
 }
@@ -585,6 +591,12 @@ fn block_texels(b: &[u8], channels: usize, value: impl Fn(u8) -> f32) -> [[f32; 
 fn decode_block(vk_format: u32, block: &[u8]) -> Result<[[f32; 4]; 16], String> {
     use vk::*;
     let unorm = |b: &[u8], channels| block_texels(b, channels, |v| f32::from(v) / 255.0);
+    // Both -128 and -127 stand for -1.
+    let snorm = |b: &[u8], channels| {
+        block_texels(b, channels, |v| {
+            (f32::from(v.cast_signed()) / 127.0).max(-1.0)
+        })
+    };
     let mut b8 = [0u8; 64];
     Ok(match vk_format {
         BC1_RGB_UNORM | BC1_RGB_SRGB | BC1_RGBA_UNORM | BC1_RGBA_SRGB => {
@@ -611,9 +623,13 @@ fn decode_block(vk_format: u32, block: &[u8]) -> Result<[[f32; 4]; 16], String> 
             bcdec_rs::bc5(block, &mut b8[..32], 8, false);
             unorm(&b8, 2)
         }
+        BC4_SNORM => {
+            bcdec_rs::bc4(block, &mut b8[..16], 4, true);
+            snorm(&b8, 1)
+        }
         BC5_SNORM => {
             bcdec_rs::bc5(block, &mut b8[..32], 8, true);
-            block_texels(&b8, 2, |v| 0.5 * f32::from(v.cast_signed()) / 127.0 + 0.5)
+            snorm(&b8, 2)
         }
         BC6H_UFLOAT | BC6H_SFLOAT => {
             let mut f = [0.0f32; 48];
@@ -672,12 +688,12 @@ mod tests {
     }
 
     #[test]
-    fn bc5_snorm_decodes_to_the_unorm_encoding() {
+    fn bc5_snorm_decodes_to_signed_values() {
         // Red: index 1 of endpoints 127 and -127 in every texel. Green: endpoints of 0.
         let mut block = [0u8; 16];
         block[..8].copy_from_slice(&[127, 0x81, 0x49, 0x92, 0x24, 0x49, 0x92, 0x24]);
         let texels = decode_block(vk::BC5_SNORM, &block).unwrap();
-        assert!(texels.iter().all(|t| t[..2] == [0.0, 0.5]), "{texels:?}");
+        assert!(texels.iter().all(|t| t[..2] == [-1.0, 0.0]), "{texels:?}");
     }
 
     #[test]

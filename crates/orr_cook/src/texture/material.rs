@@ -42,7 +42,7 @@ use super::load::{self, Blocks, Source};
 use super::mips::{MipSpec, Toksvig, normalized};
 use super::neural::{self, NeuralJob, NeuralSettings};
 use super::{
-    Built, DataFormat, Encoding, Img, MipFilter, Plan, Primaries, Wrap, source_normal,
+    Built, DataFormat, Encoding, Img, MipFilter, NormalSource, Plan, Primaries, Wrap,
     srgb_to_linear,
 };
 use crate::decoded::Decoded;
@@ -211,6 +211,8 @@ pub(crate) struct ImageFacts {
     blocks: Option<(u32, bool)>,
     /// The file holds two channels, red and green.
     rg: bool,
+    /// The file stores signed normalized values.
+    signed: bool,
     /// The file is animated; only its first frame is read.
     pub(crate) animated: bool,
 }
@@ -291,6 +293,7 @@ fn facts_of(bytes: &[u8], hash: Hash32) -> Result<ImageFacts, String> {
             hash,
             blocks: Some((s.vk_format, s.complete)),
             rg: s.rg,
+            signed: s.signed,
             animated: false,
         });
     }
@@ -323,6 +326,7 @@ fn facts_of(bytes: &[u8], hash: Hash32) -> Result<ImageFacts, String> {
         hash,
         blocks: src.blocks.as_ref().map(|b| (b.vk_format, b.complete())),
         rg: src.rg,
+        signed: src.signed,
         animated: load::is_animated(bytes),
     })
 }
@@ -353,8 +357,8 @@ struct Pack {
     channels: Vec<Channel>,
     refs: Vec<TexRef>,
     coverage: Option<(usize, f32)>,
-    /// Output channel, normal map, its scale and whether it holds only x and y.
-    toksvig: Option<(usize, TexRef, f32, bool)>,
+    /// Output channel, normal map, its scale and how it stores normals.
+    toksvig: Option<(usize, TexRef, f32, NormalSource)>,
     normal: bool,
     shrink: bool,
 }
@@ -373,6 +377,7 @@ enum Channel {
     /// The z of a two-channel normal image, which holds none, rebuilt from its x and y.
     NormalZ {
         image: usize,
+        source: NormalSource,
     },
     Constant(f32),
     /// Never read: stored as 1, or as the source has it where the blocks pass through.
@@ -558,11 +563,19 @@ impl<'a> Packer<'a> {
 
         let mut normal_packed = None;
         if let Some((r, scale)) = &t.normal {
-            let flat = [0.5, 0.5, 1.0];
-            let rg = self.image(r.image).rg;
+            let facts = self.image(r.image);
+            let source = NormalSource {
+                rg: facts.rg,
+                signed: facts.signed,
+            };
+            let flat = if source.signed {
+                [0.0, 0.0, 1.0]
+            } else {
+                [0.5, 0.5, 1.0]
+            };
             let mut consts: Vec<Option<f32>> = (0..3).map(|c| self.constant(r.image, c)).collect();
             // A two-channel image's blue is no z, so x and y alone say whether it is flat.
-            if rg {
+            if source.rg {
                 consts[2] = Some(flat[2]);
             }
             let is_flat = consts
@@ -574,8 +587,8 @@ impl<'a> Packer<'a> {
                     image: r.image,
                     channel: c,
                     srgb: false,
-                    a: -s,
-                    b: 2.0 * s,
+                    a: if source.signed { 0.0 } else { -s },
+                    b: if source.signed { s } else { 2.0 * s },
                 };
                 let id = self.make(
                     suffix,
@@ -585,8 +598,11 @@ impl<'a> Packer<'a> {
                         channels: vec![
                             channel(0, scale[0]),
                             channel(1, scale[1]),
-                            if rg {
-                                Channel::NormalZ { image: r.image }
+                            if source.rg {
+                                Channel::NormalZ {
+                                    image: r.image,
+                                    source,
+                                }
                             } else {
                                 channel(2, 1.0)
                             },
@@ -604,7 +620,7 @@ impl<'a> Packer<'a> {
                 // no Toksvig roughness.
                 let toksvig = !self.jobs[self.by_id[&id.id]].source_mips;
                 if toksvig && consts.iter().any(Option::is_none) {
-                    normal_packed = Some((*r, scale[0], rg));
+                    normal_packed = Some((*r, scale[0], source));
                 }
             }
         }
@@ -685,7 +701,7 @@ impl<'a> Packer<'a> {
             channels.resize(4, Channel::Constant(0.0));
             // Toksvig pairs roughness and normal texels, so both must sample alike.
             let toksvig = match (&normal_packed, rm[0].0 == slot::ROUGHNESS) {
-                (Some((r, s, rg)), true) if refs[0].samples_like(r) => Some((0, *r, *s, *rg)),
+                (Some((r, s, n)), true) if refs[0].samples_like(r) => Some((0, *r, *s, *n)),
                 _ => None,
             };
             let id = self.make(
@@ -1013,7 +1029,7 @@ impl<'a> Packer<'a> {
             .channels
             .iter()
             .filter_map(|c| match c {
-                Channel::Image { image, .. } | Channel::NormalZ { image } => Some(*image),
+                Channel::Image { image, .. } | Channel::NormalZ { image, .. } => Some(*image),
                 Channel::Constant(_) | Channel::Unused => None,
             })
             .collect();
@@ -1273,21 +1289,25 @@ impl TextureJob {
             sources.insert(i, img.resized(self.size[0], self.size[1]));
         }
         let img = self.pack(&sources, self.size);
-        let toksvig = self.pack.toksvig.as_ref().map(|(channel, r, scale, rg)| {
-            let n = &sources[&r.image];
-            let px = n.px.iter().map(|t| {
-                let [x, y, z] = source_normal(*t, *rg);
-                [x * scale, y * scale, z, 1.0]
+        let toksvig = self
+            .pack
+            .toksvig
+            .as_ref()
+            .map(|(channel, r, scale, source)| {
+                let n = &sources[&r.image];
+                let px = n.px.iter().map(|t| {
+                    let [x, y, z] = source.read(*t);
+                    [x * scale, y * scale, z, 1.0]
+                });
+                Toksvig {
+                    channel: *channel,
+                    normals: Img {
+                        w: n.w,
+                        h: n.h,
+                        px: px.collect(),
+                    },
+                }
             });
-            Toksvig {
-                channel: *channel,
-                normals: Img {
-                    w: n.w,
-                    h: n.h,
-                    px: px.collect(),
-                },
-            }
-        });
         Ok((img, self.plan(toksvig)))
     }
 
@@ -1340,11 +1360,11 @@ impl TextureJob {
             match *ch {
                 Channel::Constant(v) => img.px.par_iter_mut().for_each(|t| t[c] = v),
                 Channel::Unused => img.px.par_iter_mut().for_each(|t| t[c] = 1.0),
-                Channel::NormalZ { image } => {
+                Channel::NormalZ { image, source } => {
                     img.px
                         .par_iter_mut()
                         .zip(&decoded[&image].px)
-                        .for_each(|(t, s)| t[c] = source_normal(*s, true)[2]);
+                        .for_each(|(t, s)| t[c] = source.read(*s)[2]);
                 }
                 Channel::Image {
                     image,

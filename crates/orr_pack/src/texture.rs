@@ -303,10 +303,15 @@ pub mod normal {
         0.5 * v + 0.5
     }
 
+    /// The z of a normal with components `x` and `y`.
+    pub fn z(x: f32, y: f32) -> f32 {
+        (1.0 - x * x - y * y).clamp(0.0, 1.0).sqrt()
+    }
+
     /// The tangent-space normal of stored x and y.
     pub fn decode([x, y]: [f32; 2]) -> [f32; 3] {
         let (x, y) = (2.0 * x - 1.0, 2.0 * y - 1.0);
-        [x, y, (1.0 - x * x - y * y).clamp(0.0, 1.0).sqrt()]
+        [x, y, z(x, y)]
     }
 }
 
