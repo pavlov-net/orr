@@ -661,10 +661,10 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
     // depth.
     for (uint i = 0; i < layer_iterations(r); i++)
     {
+        if (!alive || (l.kind != VERTEX_LAYER && opaque > r.max_bounces + 1))
+            break;
         bool counted = r.mode == PATH_DIRECT ? depth == 0 : r.mode == PATH_INDIRECT ? depth > 0
             : r.mode == PATH_SUBSURFACE ? walked : true;
-        if (alive && l.kind != VERTEX_LAYER && opaque > r.max_bounces + 1)
-            alive = false;
         Hit h = (Hit)0;
         float3 positions[3] = { float3(0.0), float3(0.0), float3(0.0) };
         // The particles in front of the ray's hit, premultiplied.
@@ -856,15 +856,12 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
             }
         }
         // The iteration's main point follows the walk's last part.
-        for (uint p = 0; p <= points; p++)
+        for (uint p = 0; p <= points && walk.kind == WALK_RUNNING; p++)
         {
-            if (walk.kind == WALK_RUNNING)
-            {
-                if (walking)
-                    walk_part(r, walk, walk_tracer<S>(r, l.x.surface.instance, depth), rays);
-                else
-                    walk_part(r, walk, interior_tracer<S>(r, medium, walk.ior, pcg(seed ^ (depth + 1)), depth), rays);
-            }
+            if (walking)
+                walk_part(r, walk, walk_tracer<S>(r, l.x.surface.instance, depth), rays);
+            else
+                walk_part(r, walk, interior_tracer<S>(r, medium, walk.ior, pcg(seed ^ (depth + 1)), depth), rays);
             if (p < points)
                 C.point(uint(walk.kind == WALK_RUNNING), 1);
         }
@@ -878,9 +875,9 @@ public float3 trace_layers<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r
                 positions = walk.positions;
             }
         }
-        C.point(alive ? path_key(s, h) : coherence_key(false, 0, 0), KEY_BITS);
         if (!alive)
-            continue;
+            break;
+        C.point(path_key(s, h), KEY_BITS);
         exit = false;
         if (walking)
         {
@@ -1232,13 +1229,6 @@ float3 rough_widening(LayerVertex x, float s)
     return w2 * float3(1.0, s, s * s);
 }
 
-// The coherence points of a lane with no layer path: they run in every lane of the dispatch.
-void skip_layer_points<C : ICoherence>(PathRoot r)
-{
-    for (uint i = 0; i < layer_iterations(r) * (walk_points(r) + 1); i++)
-        C.point(coherence_key(false, 0, 0), KEY_BITS);
-}
-
 // The dielectric dispatch's body for `pixel`.
 public void dielectric_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMedium>(PathRoot r, uint2 pixel)
 {
@@ -1334,10 +1324,7 @@ public void dielectric_body<C : ICoherence, S : ISurface, E : IEnvironment, M : 
     guide.background = background;
     r.layers[index] = guide;
     if (!hit_layer && interior.count == 0)
-    {
-        skip_layer_points<C>(r);
         return;
-    }
 
     // The camera segment, then the first vertex.
     float3 throughput = float3(1.0);
@@ -1382,8 +1369,6 @@ public void dielectric_body<C : ICoherence, S : ISurface, E : IEnvironment, M : 
     }
     if (path)
         radiance += trace_layers<C, S, M>(r, pixel, l, interior, throughput, seed, rng, rays, layers);
-    else
-        skip_layer_points<C>(r);
 
     float3 total = exposed + pre_exposure * radiance;
     float4 out = float4(apply_hdr_ceiling(total), 1.0);

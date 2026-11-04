@@ -615,8 +615,7 @@ public WalkTrace<S> walk_tracer<S : ISurface>(PathRoot r, uint instance, uint de
     return tracer;
 }
 
-// How many coherence points a walk has at most: a uniform count, which every lane runs whether
-// it walks or not, and none where nothing reorders or walks.
+// How many coherence points a walk has at most, none where nothing reorders or walks.
 public uint walk_points(PathRoot r)
 {
     return (r.sss_flags & SSS_POINTS) != 0 ? (r.sss_max_steps - 1) / WALK_POINT_STEPS : 0;
@@ -868,13 +867,13 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
     if (alive)
         record.vertex(r, x, b, throughput, radiance, rng);
 
-    // A uniform trip count keeps the coherence points in uniform control flow. A walk takes
-    // an iteration of its own, and its exit vertex the next one at the same depth.
+    // A walk takes an iteration of its own, and its exit vertex the next one at the same depth.
     uint depth = 0;
     uint points = walk_points(r);
     for (uint i = 0; i < path_iterations(r); i++)
     {
-        alive = alive && depth <= r.max_bounces;
+        if (!alive || depth > r.max_bounces)
+            break;
         bool counted = r.mode == PATH_DIRECT ? depth == 0 : r.mode == PATH_INDIRECT ? depth > 0
             : r.mode == PATH_SUBSURFACE ? walked : true;
         LocalLights* local = nullptr;
@@ -953,10 +952,9 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
         if (record.walks())
         {
             // The iteration's main point follows the walk's last part.
-            for (uint p = 0; p <= points; p++)
+            for (uint p = 0; p <= points && walk.kind == WALK_RUNNING; p++)
             {
-                if (walk.kind == WALK_RUNNING)
-                    walk_part(r, walk, walk_tracer<S>(r, x.surface.instance, depth), rays);
+                walk_part(r, walk, walk_tracer<S>(r, x.surface.instance, depth), rays);
                 if (p < points)
                     C.point(uint(walk.kind == WALK_RUNNING), 1);
             }
@@ -968,9 +966,9 @@ public float3 trace_path<C : ICoherence, S : ISurface, M : IMedium, R : IPathRec
                 positions = walk.positions;
             }
         }
-        C.point(alive ? path_key(s, h) : coherence_key(false, 0, 0), KEY_BITS);
         if (!alive)
-            continue;
+            break;
+        C.point(path_key(s, h), KEY_BITS);
         exit = false;
         if (walking)
         {
@@ -1133,14 +1131,6 @@ public bool lens_vertex<S : ISurface>(PathRoot r, uint2 pixel, float aperture, f
     return true;
 }
 
-// The coherence points of a lane that traces no path: they run in every lane of the
-// dispatch.
-void skip_points<C : ICoherence>(PathRoot r)
-{
-    for (uint i = 0; i < path_iterations(r) * (walk_points(r) + 1); i++)
-        C.point(coherence_key(false, 0, 0), KEY_BITS);
-}
-
 // Whether `pixel`'s opaque path runs this frame, with probability `PathRoot.pixel_fraction`.
 bool runs_path(PathRoot r, uint2 pixel)
 {
@@ -1188,7 +1178,6 @@ public void opaque_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
             radiance = vertex_emission(x1) * (lens ? pre_exposure : 1.0);
         if (r.mode == PATH_CACHE || r.mode == PATH_CACHE_LOD)
         {
-            skip_points<C>(r);
             CacheCell cell = cache_cell(r.cache, r.scene, x1.surface.position, x1.surface.geometric_normal, rng.next4().xyz, true);
             float3 cached;
             bool found = cache_lookup(r.cache, cell.key, cached);
@@ -1197,21 +1186,15 @@ public void opaque_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
             else
                 radiance = float3(float(cell.level), found ? 1.0 : 0.0, unit_float(cache_hash(cell.key) * 2654435761u));
         }
-        else if (!runs_path(r, pixel))
-            skip_points<C>(r);
-        else
+        else if (runs_path(r, pixel))
         {
             ViewPath view_path = ViewPath(pcg3d(uint3(pixel, r.frame ^ r.seed)).x);
             radiance += pre_exposure / r.pixel_fraction * trace_path<C, S, M>(r, x1, pixel, rng, rays, view_path);
             feedback = view_path.feedback;
         }
     }
-    else
-    {
-        skip_points<C>(r);
-        if (r.mode != PATH_INDIRECT && r.mode != PATH_SUBSURFACE)
-            radiance = pre_exposure * sky_radiance<E, M>(set, v.eye_render.xyz, dir);
-    }
+    else if (r.mode != PATH_INDIRECT && r.mode != PATH_SUBSURFACE)
+        radiance = pre_exposure * sky_radiance<E, M>(set, v.eye_render.xyz, dir);
     float4 out = float4(apply_hdr_ceiling(radiance), surface ? 1.0 : 0.0);
     if (r.mode == PATH_CACHE_LOD)
         out.rgb = radiance;
@@ -1233,10 +1216,7 @@ float4 background_texel<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
     ViewConstants* v = r.view;
     float mask = r.dof_mask.get<Texture2D<float>>().Load(int3(pixel, 0));
     if (!(mask > 0.0))
-    {
-        skip_points<C>(r);
         return float4(0.0, 0.0, 0.0, -1.0);
-    }
     PathRoot b = r;
     b.mode = PATH_FULL;
     float pre_exposure = v.exposure[v.exposure_slot].pre_exposure;
@@ -1246,10 +1226,7 @@ float4 background_texel<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
     float3 dir;
     float depth;
     if (!lens_vertex<S>(b, pixel, r.dof_aperture, *r.dof_focus, near / mask, rng, x1, dir, depth))
-    {
-        skip_points<C>(r);
         return float4(apply_hdr_ceiling(pre_exposure * sky_radiance<E, M>(r.set, v.eye_render.xyz, dir)), 0.0);
-    }
     uint rays = 0;
     ViewPath record = ViewPath(pcg3d(uint3(pixel, r.frame ^ r.seed ^ DOF_STREAM)).x);
     float3 radiance = vertex_emission(x1) + trace_path<C, S, M>(b, x1, pixel, rng, rays, record);
@@ -1279,6 +1256,4 @@ public void update_body<C : ICoherence, S : ISurface, M : IMedium>(PathRoot r, u
         CacheUpdate update = CacheUpdate();
         trace_path<C, S, M>(r, x1, pixel, rng, rays, update);
     }
-    else
-        skip_points<C>(r);
 }

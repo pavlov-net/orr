@@ -2,8 +2,9 @@
 //
 // A body is `void body<C : ICoherence>(uint2 index)`. The raygen entry calls
 // `body<Reorder>(DispatchRaysIndex().xy)` and the compute entry `body<NoReorder>(id.xy)`.
-// The body calls `C.point(key, bits)` in uniform control flow after traversal and before
-// shading; lanes with equal keys run on together after a `Reorder` point.
+// The body calls `C.point(key, bits)` after traversal and before shading, in the lanes that
+// shade next; lanes with equal keys run on together after a `Reorder` point. A point saves and
+// restores a lane's live state whether or not it has work left, so finished lanes leave first.
 module coherence;
 
 // The bits of a coherence key: hit or miss, the 2-bit cost class, then the linked surface id.
