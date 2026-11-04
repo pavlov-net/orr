@@ -112,8 +112,8 @@ impl Build {
             deps: Vec::new(),
             externs: BTreeMap::new(),
             debug_info: match env::var("ORR_SHADER_DEBUG_INFO").as_deref() {
-                Err(_) | Ok("lines") => DebugInfo::Lines,
-                Ok("off") => DebugInfo::Off,
+                Err(_) | Ok("off") => DebugInfo::Off,
+                Ok("lines") => DebugInfo::Lines,
                 Ok("embedded") => DebugInfo::Embedded,
                 Ok("separate") => DebugInfo::Separate,
                 Ok(other) => return Err(Error::DebugInfoVar(other.to_owned())),
@@ -234,8 +234,8 @@ impl Build {
     }
 
     /// How much debug info the SPIR-V carries, overriding `ORR_SHADER_DEBUG_INFO` (`off`,
-    /// `lines`, `embedded` or `separate`). Without either it is [`DebugInfo::Lines`] in
-    /// every profile.
+    /// `lines`, `embedded` or `separate`). Without either it is [`DebugInfo::Off`] in every
+    /// profile.
     pub fn debug_info(mut self, debug_info: DebugInfo) -> Self {
         self.debug_info = debug_info;
         self

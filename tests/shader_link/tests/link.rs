@@ -167,8 +167,8 @@ mod hot_reload {
         assert_eq!(reloaded(&mut w), ["resolve"]);
         let _air = Edit::new(
             "air.slang",
-            "float3(0.25 / 3.14159265)",
-            "float3(0.5 / 3.14159265)",
+            "return exp(-(d.scattering + d.absorption) * t);",
+            "return exp(-(d.scattering + d.absorption) * t * 0.5);",
         );
         assert_eq!(reloaded(&mut w), ["sky"]);
     }
