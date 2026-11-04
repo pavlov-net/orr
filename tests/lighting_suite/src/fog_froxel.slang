@@ -43,11 +43,12 @@ void inject(uint3 id: SV_DispatchThreadID)
 }
 
 [shader("compute")]
-[numthreads(FROXEL_LANES, 1, 1)]
-void light(uint lane: SV_GroupIndex, uint3 group: SV_GroupID)
+[numthreads(FROXEL_LIGHT_GROUP, 1, 1)]
+void light(uint3 id: SV_DispatchThreadID)
 {
     ORR_OMM(light);
-    froxel_light<StandardSurface, StockFog>(root, group.xy, lane);
+    if (all(id.xy < uint2(root.columns, root.rows)))
+        froxel_light<StandardSurface, StockFog>(root, id.xy);
 }
 
 [shader("compute")]

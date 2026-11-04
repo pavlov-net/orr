@@ -587,7 +587,8 @@ impl MediaKernels {
             list.dispatch_indirect(&self.smoke, root, args);
             list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         }
-        list.dispatch(&self.light, root, [columns, rows, 1]);
+        let [light_group, ..] = self.light.workgroup();
+        list.dispatch(&self.light, root, [columns.div_ceil(light_group), rows, 1]);
         list.barrier(Stages::COMPUTE, Stages::COMPUTE, Hazards::empty());
         list.dispatch(
             &self.integrate,

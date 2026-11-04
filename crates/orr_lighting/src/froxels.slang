@@ -49,8 +49,8 @@ public static const uint FROXEL_STREAM = 0x85EBCA6B;
 // A froxel's history keeps at least this share of each frame's sample.
 public static const float FROXEL_BLEND = 1.0 / 16.0;
 
-// Lanes per froxel column in the light pass.
-public static const uint FROXEL_LANES = 64;
+// Froxel columns per workgroup in the light pass, one per lane.
+public static const uint FROXEL_LIGHT_GROUP = 32;
 
 // Resampled tile-light candidates per froxel, beside one directional candidate.
 public static const uint FROXEL_TILE_CANDIDATES = 4;
@@ -552,12 +552,9 @@ float3 froxel_local<S : ISurface, M : IMedium>(FroxelRoot r, uint3 f, float3 x, 
     return l * vis * (sum / chosen_target) * INV_FOUR_PI;
 }
 
-static groupshared uint column_active;
-static groupshared uint column_rays;
-
-// The light pass over column `column`: lane `lane` takes every FROXEL_LANES-th slice.
-// Froxels behind their tiles' surfaces carry their history unchanged.
-public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column, uint lane)
+// The light pass over column `column`. Froxels behind their tiles' surfaces carry their history
+// unchanged.
+public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column)
 {
     float far = farthest_surface(r, column);
     float near_range = r.scene.near_range;
@@ -570,7 +567,7 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column, 
     bool keep_depth = r.eye_depth.index != IMAGE_NONE;
     uint active = 0;
     uint rays = 0;
-    for (uint k = lane; k < r.slices; k += FROXEL_LANES)
+    for (uint k = 0; k < r.slices; k++)
     {
         uint3 f = uint3(column, k);
         float3 center = eye + dir * froxel_distance(float(k) + 0.5, r.slices, near_range);
@@ -602,10 +599,10 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column, 
             float4 depth_now = float4(0.0);
             for (uint j = 0; j < MAX_FROXEL_SHADOWED_LIGHTS; j++)
             {
-                float2 u = rng.next2();
                 vis[j] = 1.0;
                 if (j >= lights.count)
                     continue;
+                float2 u = rng.next2();
                 float cone_pdf;
                 float3 to_light = directional_sample(r.scene.lights[lights.ids[j]], u, cone_pdf);
                 RayCone cone = { 0.0, 0.0 };
@@ -636,19 +633,12 @@ public void froxel_light<S : ISurface, M : IMedium>(FroxelRoot r, uint2 column, 
         if (keep_depth)
             r.eye_depth.get<RWTexture3D<float4>>()[f] = depth;
     }
-    if (lane == 0)
+    uint wave_active = WaveActiveSum(active);
+    uint wave_rays = WaveActiveSum(rays);
+    if (WaveIsFirstLane())
     {
-        column_active = 0;
-        column_rays = 0;
-    }
-    GroupMemoryBarrierWithGroupSync();
-    InterlockedAdd(column_active, active);
-    InterlockedAdd(column_rays, rays);
-    GroupMemoryBarrierWithGroupSync();
-    if (lane == 0)
-    {
-        InterlockedAdd(r.stats.active, column_active);
-        InterlockedAdd(r.stats.rays, column_rays);
+        InterlockedAdd(r.stats.active, wave_active);
+        InterlockedAdd(r.stats.rays, wave_rays);
     }
 }
 
