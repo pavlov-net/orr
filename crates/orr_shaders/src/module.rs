@@ -1,6 +1,6 @@
 use core::ffi::CStr;
 
-/// A compiled SPIR-V module with its entry points.
+/// A compiled SPIR-V module with its entry points, and its Metal libraries.
 #[derive(Debug)]
 pub struct ShaderModule {
     /// Unique within a build: the kernel path under its shader root, without extension.
@@ -8,6 +8,11 @@ pub struct ShaderModule {
     /// The kernel file the module was compiled from, as a path under its shader root.
     pub kernel: &'static str,
     pub spirv: &'static [u32],
+    /// The Metal library of the compute, task and mesh entries; empty unless the module was
+    /// built for an Apple target with the MSL check on.
+    pub metallib: &'static [u8],
+    /// The Metal library of the pixel entries, which Metal needs apart from the others.
+    pub metallib_fragment: &'static [u8],
     /// Built with opacity micromaps: its entry points declare the micromap execution mode,
     /// so its pipelines need a device with micromaps.
     pub omm: bool,
@@ -37,6 +42,9 @@ impl ShaderModule {
 #[derive(Clone, Copy, Debug)]
 pub struct EntryPoint {
     pub name: &'static CStr,
+    /// The entry's function in the module's Metal library, which Slang may have renamed
+    /// (`main` is `main_0`); empty without a library and for ray-generation entries.
+    pub metal_name: &'static CStr,
     pub stage: Stage,
     /// The workgroup size; `[1, 1, 1]` for ray-generation and pixel entries.
     pub workgroup: [u32; 3],

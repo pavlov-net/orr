@@ -1,8 +1,11 @@
 //! The MSL emission check: a module's compute and mesh-pipeline entries compiled for Metal,
 //! their root and pointee layouts compared with the SPIR-V, and the MSL searched for
-//! constructs Metal rejects. Emission only: nothing here compiles MSL.
+//! constructs Metal rejects. Builds for Apple targets also compile the MSL into Metal
+//! libraries ([`compile_library`]), which the modules embed.
 
 use std::collections::HashSet;
+use std::path::Path;
+use std::process::Command;
 
 use super::model::{Model, Ty, text};
 use super::sys;
@@ -213,6 +216,57 @@ pub(super) fn without_raygen(source: &str) -> String {
     out
 }
 
+/// The names of the entry functions `msl` declares. Slang renames some (`main` becomes
+/// `main_0`), so these are the names a Metal library knows them by.
+pub(super) fn entry_names(msl: &str) -> Vec<&str> {
+    msl.lines()
+        .filter(|l| ENTRY_STAGES.iter().any(|s| l.starts_with(s)))
+        .filter_map(|l| {
+            let name = l[..l.find('(')?].split_whitespace().last()?;
+            Some(name)
+        })
+        .collect()
+}
+
+/// The Metal function name of the entry `name` among `declared`.
+pub(super) fn metal_name<'a>(name: &str, declared: &[&'a str]) -> Option<&'a str> {
+    let renamed = format!("{name}_0");
+    declared
+        .iter()
+        .find(|d| **d == name)
+        .or_else(|| declared.iter().find(|d| **d == renamed))
+        .copied()
+}
+
+/// Compiles the MSL at `metal` into the library `out` with Xcode's Metal compiler. The error
+/// holds the compiler's error lines.
+pub(super) fn compile_library(metal: &Path, out: &Path) -> Result<(), String> {
+    let output = Command::new("xcrun")
+        .args(["-sdk", "macosx", "metal", "-std=metal4.0", "-o"])
+        .arg(out)
+        .arg(metal)
+        .output()
+        .map_err(|e| {
+            format!("cannot run `xcrun metal` ({e}): install Xcode and its Metal toolchain")
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let errors: Vec<&str> = stderr.lines().filter(|l| l.contains("error:")).collect();
+    let errors = if errors.is_empty() {
+        stderr.trim().to_owned()
+    } else {
+        errors.join("\n")
+    };
+    Err(format!(
+        "Apple's Metal compiler rejected {}:\n{errors}",
+        metal.display()
+    ))
+}
+
+const ENTRY_STAGES: &[&str] = &["[[kernel]]", "[[mesh]]", "[[object]]", "[[fragment]]"];
+
 fn brace_delta(line: &str) -> i32 {
     line.chars()
         .map(|c| match c {
@@ -225,8 +279,7 @@ fn brace_delta(line: &str) -> i32 {
 
 /// The parameters of an entry function's signature line.
 fn entry_parameters(line: &str) -> Option<Vec<&str>> {
-    const STAGES: &[&str] = &["[[kernel]]", "[[mesh]]", "[[object]]", "[[fragment]]"];
-    if !STAGES.iter().any(|s| line.starts_with(s)) {
+    if !ENTRY_STAGES.iter().any(|s| line.starts_with(s)) {
         return None;
     }
     let open = line.find('(')?;
