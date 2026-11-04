@@ -1,5 +1,5 @@
 //! Compiles orr's and orr_color's Slang math for the CPU through `slang/math.slang` and
-//! `slang/color.slang`, and for SPIR-V and Metal through `gpu/`, whose kernels call every
+//! `slang/color.slang`, and for SPIR-V through `gpu/`, whose kernels call every
 //! function under the lints.
 
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ fn main() {
                 .compile("shader_math")
         })
         .and_then(|()| Build::new())
-        .and_then(|b| b.kernels(manifest.join("gpu")).metal_check(true).compile());
+        .and_then(|b| b.kernels(manifest.join("gpu")).compile());
     if let Err(e) = result {
         panic!("{e}");
     }

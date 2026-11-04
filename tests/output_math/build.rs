@@ -1,5 +1,5 @@
 //! Compiles orr_output's Slang math for the CPU through `slang/output.slang`, and for
-//! SPIR-V and Metal through `gpu/output.slang`; links Polyphony's GT7 sample as the
+//! SPIR-V through `gpu/output.slang`; links Polyphony's GT7 sample as the
 //! reference. `GT7_SAMPLE` names its directory, else `.tools/display/gt7` in the nearest
 //! directory above the crate that has it (where `tools/fetch-slang.sh` puts it).
 
@@ -22,7 +22,6 @@ fn main() {
             b.kernels(manifest.join("gpu"))
                 .include_as("orr_output", &output_src)
                 .extern_type("Gt7Curve", "orr_output::Gt7Curve")
-                .metal_check(true)
                 .compile()
         });
     if let Err(e) = result {

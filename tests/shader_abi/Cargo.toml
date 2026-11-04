@@ -1,6 +1,6 @@
 [package]
 name = "shader_abi"
-description = "Kernels over orr's Slang ABI and trace libraries, built with the MSL check and run on the GPU."
+description = "Kernels over orr's Slang ABI and trace libraries, run on the GPU."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

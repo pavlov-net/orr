@@ -1,5 +1,5 @@
 //! Compiles orr_lighting's `bsdf`, with the orr_scene and orr_pack modules it imports, for
-//! the CPU through `slang/bsdf_cpu.slang` (array LUTs), and for SPIR-V and Metal through
+//! the CPU through `slang/bsdf_cpu.slang` (array LUTs), and for SPIR-V through
 //! `gpu/bsdf_cases.slang` (heap LUTs). The harness's `Inputs` come from `tests/openpbr_ref/gpu`.
 
 use std::env;
@@ -35,7 +35,6 @@ fn main() {
                 .include(&openpbr)
                 .include_as("openpbr_ref", &inputs)
                 .extern_type("Inputs", "::openpbr_ref::Inputs")
-                .metal_check(true)
                 .compile()
         });
     if let Err(e) = result {

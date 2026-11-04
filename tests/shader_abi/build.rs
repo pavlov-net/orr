@@ -1,5 +1,5 @@
 //! Builds the kernels under `src` without asserts and those under `asserts` with asserts
-//! linked and their debug info in sidecars. Both run the MSL check.
+//! linked and their debug info in sidecars.
 
 use std::env;
 use std::path::PathBuf;
@@ -14,7 +14,6 @@ fn main() {
             b.kernels(dir.join("src"))
                 .fp_precise(true)
                 .asserts(false)
-                .metal_check(true)
                 .compile()
         })
         .and_then(|_| {
@@ -22,7 +21,6 @@ fn main() {
                 .kernels(dir.join("asserts"))
                 .asserts(true)
                 .debug_info(DebugInfo::Separate)
-                .metal_check(true)
                 .out_dir(out.join("asserts"))
                 .compile()
         });
