@@ -1364,6 +1364,32 @@ fn a_texture_on_texcoord_1_binds_uv_set_1_and_the_mesh_stores_it() {
     }
 }
 
+/// A flattened node keeps its surface, and a node scaled to nothing leaves the others to cook.
+#[test]
+fn a_flattened_node_keeps_its_surface() {
+    let d = dir("gltf-zero-scale");
+    let mut g = Glb::default();
+    let pa = g.floats(
+        &[[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        "VEC3",
+    );
+    let na = g.floats(&[[0.0f32, 0.0, 1.0]; 3], "VEC3");
+    let path = d.join("scaled.glb");
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0,1]}}],
+"nodes":[{{"mesh":0,"scale":[0,0,0]}},{{"mesh":0,"scale":[2,2,0]}}],
+"meshes":[{{"primitives":[{{"attributes":{{"POSITION":{pa},"NORMAL":{na}}}}}]}}]"#
+        ),
+    );
+    let (a, _) = cook(&path, GltfSettings::default()).unwrap();
+    let triangles = triangle_set(&mesh_of(&a, "g/mesh", 0));
+    let two = 2.0f32.to_bits();
+    let flat = [[0, 0, 0], [two, 0, 0], [0, two, 0]];
+    assert!(triangles.contains(&flat), "{triangles:?}");
+}
+
 /// A primitive without the uv set its material reads fails in either layout, even when
 /// another primitive of the mesh has it.
 #[test]

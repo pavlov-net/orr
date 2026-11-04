@@ -235,7 +235,10 @@ fn append_primitive(
     }
     let linear = Mat3::from_mat4(world);
     let flip = linear.determinant() < 0.0;
-    let normal_m = linear.inverse().transpose();
+    // The inverse transpose up to scale, which still exists where `world` flattens an axis.
+    let [x, y, z] = [linear.x_axis, linear.y_axis, linear.z_axis];
+    let normal_m =
+        Mat3::from_cols(y.cross(z), z.cross(x), x.cross(y)) * if flip { -1.0 } else { 1.0 };
     let position = prim.get(&Semantic::Positions).ok_or("no positions")?;
     let n = position.count();
     let counted = |a: &gltf::Accessor<'_>, k| {
@@ -317,7 +320,7 @@ fn append_primitive(
         ns.as_chunks::<3>()
             .0
             .iter()
-            .map(|&nv| (normal_m * Vec3::from(nv)).to_array())
+            .map(|&nv| (normal_m * Vec3::from(nv)).normalize_or_zero().to_array())
             .collect()
     });
     let skin: Vec<([u8; 4], [u8; 4])> = match binding {
