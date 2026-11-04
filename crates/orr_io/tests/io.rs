@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use orr_io::{AlignedBuf, Read, ReadFile, Ring, SECTOR, Wake, open_shared, read_at};
 
@@ -101,6 +103,49 @@ fn ring_matches_positioned_reads() {
             assert!(g == e, "{name} ring, read {i} {:?}", reads[i]);
         }
     }
+}
+
+#[test]
+fn ring_finishes_when_every_read_completes_before_the_wait() {
+    let p = path("drain.bin");
+    fs::write(&p, bytes(SECTOR)).unwrap();
+    let file = Arc::new(ReadFile::open(&p).unwrap());
+    let Some(mut ring) = Ring::native() else {
+        return;
+    };
+    // More reads than the ring keeps in flight.
+    for _ in 0..200 {
+        ring.push(Read {
+            file: Arc::clone(&file),
+            offset: 0,
+            len: SECTOR,
+            done: Box::new(|r| drop(r.expect("ring read"))),
+        });
+    }
+    let wake = Wake::default();
+    let finished = AtomicBool::new(false);
+    let limit = Duration::from_secs(10);
+    let start = Instant::now();
+    std::thread::scope(|s| {
+        // Ends a wait that nothing else would, so that a stuck ring fails the test.
+        s.spawn(|| {
+            while !finished.load(Ordering::Relaxed) && start.elapsed() < limit {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            wake.set();
+        });
+        loop {
+            ring.pump();
+            if !ring.busy() {
+                break;
+            }
+            // Everything in flight finishes here, so the wait takes the event for all of it.
+            std::thread::sleep(Duration::from_millis(20));
+            wake.wait(Some(&ring));
+            assert!(start.elapsed() < limit, "the ring stopped reading");
+        }
+        finished.store(true, Ordering::Relaxed);
+    });
 }
 
 #[test]

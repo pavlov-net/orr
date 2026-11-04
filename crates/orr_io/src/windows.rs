@@ -7,7 +7,8 @@ use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, HANDLE, WAIT_FAILED, WIN32_ERROR,
+    CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, HANDLE, IORING_E_CORRUPT, WAIT_FAILED,
+    WIN32_ERROR,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_ID_INFO, FILE_INFO_BY_HANDLE_CLASS,
@@ -207,6 +208,8 @@ pub(crate) struct IoRing {
     event: Event,
     slots: Vec<Option<InFlight>>,
     queued: VecDeque<Read>,
+    /// Entries are built that no submit has taken.
+    unsubmitted: bool,
 }
 
 // SAFETY: the ring is used only by the thread that owns it.
@@ -247,6 +250,7 @@ impl IoRing {
                 event,
                 slots: (0..DEPTH).map(|_| None).collect(),
                 queued: VecDeque::new(),
+                unsubmitted: false,
             })
         }
     }
@@ -268,7 +272,14 @@ impl IoRing {
     }
 
     pub(crate) fn pump(&mut self) {
-        let mut issued = 0;
+        // Completions go first: each frees a slot for a queued read, and the wait that follows
+        // has no event to end it if it took the event for those completions already.
+        self.complete();
+        self.issue();
+        self.submit();
+    }
+
+    fn issue(&mut self) {
         while let Some(slot) = self.slots.iter().position(Option::is_none) {
             let Some(read) = self.queued.pop_front() else {
                 break;
@@ -311,19 +322,27 @@ impl IoRing {
                 continue;
             }
             self.slots[slot] = Some(InFlight { read, buf });
-            issued += 1;
+            self.unsubmitted = true;
         }
-        if issued > 0 {
+    }
+
+    fn submit(&mut self) {
+        if self.unsubmitted {
             let mut submitted = 0;
             // SAFETY: the ring is live; no wait.
             let h = unsafe { (self.fns.submit)(self.ring, 0, 0, &mut submitted) };
             // Entries a failed submit leaves in the queue go with the next one; setting the
             // event makes the next wait return so that it happens. Reads already in the kernel
             // keep their slots and buffers until they complete.
-            if h.is_err() {
+            self.unsubmitted = h.is_err();
+            if self.unsubmitted {
                 self.event.set();
             }
         }
+    }
+
+    /// Runs `done` for every completed read.
+    fn complete(&mut self) {
         let mut cqe = IORING_CQE::default();
         // SAFETY: the ring is live; `cqe` is written on S_OK.
         while unsafe { (self.fns.pop)(self.ring, &mut cqe) } == HRESULT(0) {
@@ -349,9 +368,16 @@ impl Drop for IoRing {
         while self.in_flight() {
             let mut submitted = 0;
             // SAFETY: the ring is live; waits for one completion.
-            let _ = unsafe { (self.fns.submit)(self.ring, 1, 1000, &mut submitted) };
+            let h = unsafe { (self.fns.submit)(self.ring, 1, 1000, &mut submitted) };
+            if h == IORING_E_CORRUPT {
+                // The ring is broken and the kernel may still write into these buffers.
+                for s in &mut self.slots {
+                    std::mem::forget(s.take());
+                }
+                return;
+            }
             let mut cqe = IORING_CQE::default();
-            // SAFETY: as in `pump`.
+            // SAFETY: as in `complete`.
             while unsafe { (self.fns.pop)(self.ring, &mut cqe) } == HRESULT(0) {
                 if let Some(s) = self.slots.get_mut(cqe.UserData) {
                     *s = None;

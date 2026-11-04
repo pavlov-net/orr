@@ -146,6 +146,14 @@ impl Uring {
     }
 
     pub(crate) fn pump(&mut self) {
+        // Completions go first: each frees a slot for a queued read, and the wait that follows
+        // has no event to end it if it took the event for those completions already.
+        self.complete();
+        self.issue();
+        self.submit();
+    }
+
+    fn issue(&mut self) {
         while let Some(slot) = self.slots.iter().position(Option::is_none) {
             let Some(read) = self.queued.pop_front() else {
                 break;
@@ -172,6 +180,9 @@ impl Uring {
             unsafe { self.ring.submission().push(&sqe) }.expect("io_uring queue has room");
             self.slots[slot] = Some(InFlight { read, buf });
         }
+    }
+
+    fn submit(&mut self) {
         if !self.ring.submission().is_empty() {
             let _ = self.ring.submit();
             // Entries the kernel did not take go with the next submit; setting the event makes
@@ -180,6 +191,10 @@ impl Uring {
                 self.event.set();
             }
         }
+    }
+
+    /// Runs `done` for every completed read.
+    fn complete(&mut self) {
         for cqe in self.ring.completion() {
             let Some(f) = self
                 .slots
