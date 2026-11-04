@@ -918,8 +918,8 @@ impl<'a> Packer<'a> {
     /// source channel that holds it; `None` when it needs its texels made. The image's blocks
     /// must be the pack's format (or a BC5 whose half a BC4 takes), with every mip, each
     /// packed channel a source channel as stored. Mip 0 alone passes when the pack makes its
-    /// other mips from it (Toksvig roughness, alpha coverage unless `source_mips`) and keeps
-    /// its full size.
+    /// other mips from it (Toksvig roughness, alpha coverage unless `source_mips`), keeps its
+    /// full size and holds its channels in pack order, as the made mips do.
     fn passes(
         &self,
         p: &Pack,
@@ -995,6 +995,7 @@ impl<'a> Packer<'a> {
             vk::BC5_UNORM => 2,
             _ => 4,
         };
+        let derived = p.toksvig.is_some() || p.coverage.is_some() && !source_mips;
         // A neural set trains on the packed channels in pack order.
         let reordered = channels[..count]
             .iter()
@@ -1002,16 +1003,14 @@ impl<'a> Packer<'a> {
             .any(|(c, &s)| usize::from(s) != c);
         if !in_order
             || channels[..count].iter().any(|&c| c >= held)
-            || reordered && half.is_none() && self.rules.neural.is_some()
+            || reordered && half.is_none() && (derived || self.rules.neural.is_some())
+            || !complete
+            || derived && skipped
         {
             return None;
         }
         if half.is_some() {
             channels[0] = 0;
-        }
-        let derived = p.toksvig.is_some() || p.coverage.is_some() && !source_mips;
-        if !complete || derived && skipped {
-            return None;
         }
         Some((
             Pass {

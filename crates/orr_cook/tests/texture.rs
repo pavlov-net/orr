@@ -900,6 +900,77 @@ fn bcn_material_textures_keep_their_blocks() {
     }
 }
 
+/// Mips made below a passed mip 0 hold their channels where mip 0 does, which is where the
+/// material's bindings read them.
+#[test]
+fn swapped_roughness_and_metalness_keep_their_channels_below_mip_0() {
+    let d = dir("bcn-swapped");
+    let n = 64;
+    let (metal, rough) = (50.0 / 255.0, 210.0 / 255.0);
+    let (rm, _) = ktx2(n, n, ctt::Format::BC5_UNORM_BLOCK, |_, x, _| {
+        let wobble = (x % 2 * 20) as u8;
+        [40 + wobble, 200 + wobble, 0, 255]
+    });
+    let normal = png(n, n, |x, _| [118 + (x % 2 * 20) as u8, 128, 255, 255]);
+    let path = d.join("swapped.glb");
+    write_glb(
+        &path,
+        &[
+            r#"{"pbrMetallicRoughness":{"metallicRoughnessTexture":{"index":0}},
+            "normalTexture":{"index":1}}"#
+                .into(),
+        ],
+        &[rm, normal],
+    );
+    let channels = InputChannels {
+        roughness: Some(1),
+        metalness: Some(0),
+        ..InputChannels::default()
+    };
+    let overrides = vec![(
+        "image 0".to_string(),
+        TextureOverride {
+            channels,
+            ..TextureOverride::default()
+        },
+    )];
+    let a = cook_at(
+        vec![AssetSpec {
+            name: "g".into(),
+            source: Source::Gltf {
+                path,
+                settings: GltfSettings {
+                    textures: TextureRules {
+                        overrides,
+                        ..TextureRules::default()
+                    },
+                    ..GltfSettings::default()
+                },
+            },
+        }],
+        Quality::Slow,
+    );
+    let e = a.find(AssetId::from_name("g/material/0")).unwrap();
+    let m = Material::from_bytes(&read_blob(&a, e, 0)).unwrap();
+    let (r, t) = (m.textures[slot::ROUGHNESS], m.textures[slot::METALNESS]);
+    assert_eq!(r.texture, t.texture);
+    let (_, levels) = mips(&a, a.name(a.find(r.texture).unwrap()));
+    for (mip, size) in [(0, n), (1, n / 2)] {
+        let texels = decode(vk::BC5_UNORM, size, size, &levels[0][mip]);
+        let mean =
+            |c: u8| texels.iter().map(|t| t[usize::from(c)]).sum::<f32>() / texels.len() as f32;
+        let (got_rough, got_metal) = (mean(r.channels), mean(t.channels));
+        assert!(
+            got_rough >= rough - 0.05,
+            "mip {mip}: roughness {got_rough}"
+        );
+        assert!(
+            (got_metal - metal).abs() < 0.05,
+            "mip {mip}: metalness {got_metal}"
+        );
+    }
+}
+
 #[test]
 fn two_channel_normals_rebuild_z_when_they_are_reencoded() {
     let d = dir("rg-normal");
