@@ -127,17 +127,38 @@ impl Queue {
             // SAFETY: `buffers` holds `len` live, ended command buffers.
             unsafe { self.raw.commit_count(first, buffers.len()) };
         }
+        let point = self.signal();
+        self.shared.defer_until(
+            self.timeline(),
+            point.value,
+            Box::new(move || drop(finished)),
+        );
+        Ok(point)
+    }
+
+    /// Signals the next value of the timeline after the work queued so far; the caller
+    /// holds the submit lock.
+    fn signal(&self) -> TimelinePoint {
         let timeline = &self.shared.timelines[self.timeline() as usize];
         let value = timeline.submitted.load(Ordering::Acquire) + 1;
         self.raw
             .signalEvent_value(ProtocolObject::from_ref(&*timeline.event.0), value);
         timeline.submitted.store(value, Ordering::Release);
-        self.shared
-            .defer_until(self.timeline(), value, Box::new(move || drop(finished)));
-        Ok(TimelinePoint {
+        TimelinePoint {
             timeline: self.timeline(),
             value,
-        })
+        }
+    }
+
+    /// Queues sparse mapping updates through `update`, in order with this queue's submits.
+    /// Returns the point the timeline reaches once they have run.
+    pub(super) fn update_mappings(
+        &self,
+        update: impl FnOnce(&ProtocolObject<dyn MTL4CommandQueue>),
+    ) -> TimelinePoint {
+        let _guard = lock(&self.submit_lock);
+        update(&self.raw);
+        self.signal()
     }
 
     /// Submits `lists`, which write `frame`. No swapchains on Metal yet.

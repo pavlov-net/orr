@@ -344,6 +344,7 @@ impl Shared {
                     .heapBufferSizeAndAlignWithLength_options(size as usize, options);
                 let desc = MTLHeapDescriptor::new();
                 desc.setType(MTLHeapType::Placement);
+                desc.setMaxCompatiblePlacementSparsePageSize(super::sparse::SPARSE_PAGE);
                 desc.setStorageMode(MTLStorageMode::Private);
                 desc.setHazardTrackingMode(MTLHazardTrackingMode::Untracked);
                 desc.setSize(sa.size);

@@ -21,6 +21,7 @@ mod memory;
 mod mesh;
 mod pipeline;
 mod queue;
+mod sparse;
 mod texture;
 mod unsupported;
 
@@ -46,13 +47,13 @@ pub use memory::{
 pub use mesh::{ColorAttachment, DepthAttachment, MeshPipeline, MeshPipelineDesc, Rendering};
 pub use pipeline::{ComputePipeline, ShaderStage};
 pub use queue::{PassResult, PipelineStats, Queue, QueueKind, QueueRequest};
+pub use sparse::{PageBind, SparseAllocation, SparseBinds, TileBind};
 pub use texture::{Texture, TextureMemory};
 pub use unsupported::{
     COUNTER_METRICS, Checkpoint, CounterRange, CounterReport, DeviceFault, Diagnostics,
     DiagnosticsReport, ExecutionSet, FaultAccess, FaultAddress, Generated, LowLatency,
-    MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout, PageBind, PipelineCacheReport,
-    QueueProgress, RayDispatchPipeline, Sequence, SetKind, SparseAllocation, SparseBinds,
-    Swapchain, SwapchainFrame, TileBind,
+    MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout, PipelineCacheReport, QueueProgress,
+    RayDispatchPipeline, Sequence, SetKind, Swapchain, SwapchainFrame,
 };
 
 /// The most queues a device has, one per [`QueueKind`].

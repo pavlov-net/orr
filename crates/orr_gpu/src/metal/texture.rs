@@ -11,6 +11,7 @@ use objc2_metal::{
 use super::command::CommandList;
 use super::device::{Device, Shared};
 use super::memory::Allocation;
+use super::sparse::SPARSE_PAGE;
 use super::{Obj, lock};
 use crate::{
     Error, Format, GpuPtr, SparseLayout, TextureDesc, TextureKind, TextureRegion, TextureUsage,
@@ -27,7 +28,8 @@ pub enum TextureMemory<'a> {
         block: &'a Allocation<u8>,
         offset: u64,
     },
-    /// No memory until bound; not supported on Metal yet.
+    /// No memory until [`Device::bind_sparse`] binds its tiles and mip tails
+    /// ([`Texture::sparse_layout`]) to DeviceLocal blocks. 2D and cube color textures.
     Sparse,
 }
 
@@ -39,6 +41,8 @@ pub struct Texture {
     desc: TextureDesc,
     /// The texture is in the residency set itself, not through a heap.
     dedicated: bool,
+    /// With [`TextureMemory::Sparse`].
+    sparse: Option<(SparseLayout, MetalTail)>,
     shared: Arc<Shared>,
 }
 
@@ -47,9 +51,13 @@ impl Texture {
         &self.desc
     }
 
-    /// `None`: Metal has no sparse textures here yet.
+    /// How tiles and mip tails bind, for a texture created with [`TextureMemory::Sparse`].
     pub fn sparse_layout(&self) -> Option<&SparseLayout> {
-        None
+        self.sparse.as_ref().map(|(l, _)| l)
+    }
+
+    pub(super) fn metal_tail(&self) -> Option<&MetalTail> {
+        self.sparse.as_ref().map(|(_, t)| t)
     }
 }
 
@@ -104,8 +112,17 @@ impl Device {
             call: "newTexture",
             message: format!("{name}: {desc:?}"),
         };
+        let sparse = matches!(memory, TextureMemory::Sparse);
+        if sparse && (desc.kind == TextureKind::D3 || desc.format.is_depth()) {
+            return Err(Error::Invalid(format!(
+                "{name}: sparse textures are 2D or cube color textures"
+            )));
+        }
         let (raw, dedicated) = match memory {
-            TextureMemory::Dedicated => {
+            TextureMemory::Dedicated | TextureMemory::Sparse => {
+                if sparse {
+                    d.setPlacementSparsePageSize(SPARSE_PAGE);
+                }
                 let t = self
                     .shared
                     .device
@@ -127,17 +144,82 @@ impl Device {
                     .ok_or_else(failed)?;
                 (t, false)
             }
-            TextureMemory::Sparse => return Err(Error::NotImplemented("sparse textures")),
         };
         raw.setLabel(Some(&NSString::from_str(name)));
+        let sparse = sparse.then(|| self.sparse_layout(&raw, &d, desc));
         Ok(Texture {
             raw: Obj(raw),
             desc: *desc,
             dedicated,
+            sparse,
             shared: Arc::clone(&self.shared),
         })
     }
 
+    /// The tile shape and mip tail of the sparse texture `raw`. Every layer has its own tail.
+    ///
+    /// The tail starts at the first mip smaller than a tile along either axis, as on Vulkan
+    /// with standard tile shapes and as orr_pack cooks textures. Metal's own tail can start
+    /// later (it rounds the extent up to powers of two), so the mips between are tiled in
+    /// Metal but bind as part of the tail here.
+    fn sparse_layout(
+        &self,
+        raw: &ProtocolObject<dyn MTLTexture>,
+        d: &MTLTextureDescriptor,
+        desc: &TextureDesc,
+    ) -> (SparseLayout, MetalTail) {
+        let device = &self.shared.device;
+        let tile_bytes = device.sparseTileSizeInBytesForSparsePageSize(SPARSE_PAGE) as u64;
+        // SAFETY: one sample, the type and format of a texture Metal created.
+        let g = unsafe {
+            device.sparseTileSizeWithTextureType_pixelFormat_sampleCount_sparsePageSize(
+                d.textureType(),
+                d.pixelFormat(),
+                1,
+                SPARSE_PAGE,
+            )
+        };
+        let tile_extent = [g.width as u32, g.height as u32, g.depth as u32];
+        let metal_first = (raw.firstMipmapInTail() as u32).min(desc.mips);
+        let metal = MetalTail {
+            first_mip: metal_first,
+            bytes: if metal_first < desc.mips {
+                (raw.tailSizeInBytes() as u64).next_multiple_of(tile_bytes)
+            } else {
+                0
+            },
+        };
+        let tail_first_mip = (0..metal_first)
+            .find(|&m| {
+                let size = |e: u32, t: u32| (e >> m).max(1) < t;
+                size(desc.extent[0], tile_extent[0]) || size(desc.extent[1], tile_extent[1])
+            })
+            .unwrap_or(metal_first);
+        let mut layout = SparseLayout {
+            tile_extent,
+            tile_bytes,
+            tail_first_mip,
+            tail_bytes: 0,
+            single_tail: false,
+        };
+        let tiled: u64 = (tail_first_mip..metal_first)
+            .map(|m| {
+                let [x, y] = layout.tiles(desc, m);
+                u64::from(x * y)
+            })
+            .sum();
+        layout.tail_bytes = tiled * tile_bytes + metal.bytes;
+        (layout, metal)
+    }
+}
+
+/// Metal's own mip tail of a sparse texture: its first mip and the bytes one layer's maps.
+pub(super) struct MetalTail {
+    pub(super) first_mip: u32,
+    pub(super) bytes: u64,
+}
+
+impl Device {
     pub fn host_copy_to_texture(
         &self,
         t: &Texture,

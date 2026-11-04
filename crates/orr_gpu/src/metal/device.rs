@@ -42,7 +42,7 @@ pub struct DeviceDesc<'a> {
     pub pipeline_cache: Option<&'a Path>,
     /// Unused on Metal.
     pub skip_extensions: &'a [&'a CStr],
-    /// Unused on Metal: memory is unified, so there is no staging path.
+    /// Report no `rebar`, so callers take their staging paths; memory stays unified.
     pub force_staging: bool,
     /// Unused on Metal.
     pub perf_counters: bool,
@@ -270,7 +270,7 @@ fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
         device_id: device.registryID() as u32,
         driver: "Metal 4".to_owned(),
         driver_version: 0,
-        rebar: true,
+        rebar: !desc.force_staging,
         host_image_copy: false,
         memory_decompression: false,
         occupancy_priority: false,
