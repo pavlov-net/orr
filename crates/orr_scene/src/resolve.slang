@@ -3,11 +3,9 @@
 // device-generated commands `sequences` then writes one sequence per bin with tiles.
 // `resolve` runs once per bin over the bin's tiles with the bin's surface id uniform: each
 // pixel's surface through the linked `Surface` switch, the depth offset applied to depth,
-// position and motion, projected-space NDF filtering of the roughness, and the G-buffer
-// written.
+// position and motion, and the G-buffer written.
 #include "orr_root.h"
 import orr_shaders.abi;
-import orr_shaders.math;
 import orr_pack.mesh;
 import orr_scene.producer;
 import orr_gpu.sequence;
@@ -23,7 +21,6 @@ extern struct Surface : ISurface = StandardSurface;
 ORR_ROOT(RasterRoot);
 
 groupshared uint bins_used[8];
-groupshared float3 normals[64];
 
 // Previous uv minus current uv of a direction at infinity.
 float2 sky_motion(ViewConstants* v, float3 d)
@@ -104,15 +101,6 @@ void sequences(uint3 id: SV_DispatchThreadID)
     store(r.sequences, slot, q);
 }
 
-// Projected-space NDF filtering (Tokuyoshi and Kaplanyan 2021): widens GGX alpha^2 by the
-// screen-space variance of the shading normal.
-float filtered_roughness(float roughness, float variance)
-{
-    static const float KAPPA = 0.18;
-    float a2 = roughness * roughness * roughness * roughness;
-    return sqrt(sqrt(saturate(a2 + min(2.0 * variance, KAPPA))));
-}
-
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
@@ -122,38 +110,23 @@ void resolve(uint group: SV_GroupID, uint t: SV_GroupThreadID)
     RasterGpu* r = root.raster;
     uint bin = root.value;
     uint2 pixel = tile_pixel(r.bin_tiles[bin * r.tile_capacity + group], r.tiles_x, t);
-    uint index = pixel.y * r.gbuffer.extent.x + pixel.x;
-    uint64_t w = all(pixel < r.gbuffer.extent) ? r.gbuffer.visibility[index] : 0;
-    VisibleCluster vc = r.gbuffer.clusters[w != 0 ? visibility_cluster(w) : 0];
-    bool active = w != 0 && surface_bin(r, s.materials[vc.material].surface) == bin;
-
-    GSurface g = (GSurface)0;
-    PrimaryHit hit = (PrimaryHit)0;
-    float offset = 0.0;
-    if (active)
-    {
-        hit = primary_hit(s, v, vc, visibility_triangle(w), float2(pixel) + 0.5);
-        material_prepare(s.materials + vc.material, hit.input.uv);
-        g = Surface.surface(hit.input, offset);
-        offset = max(offset, 0.0);
-    }
-
-    // Quad neighbors exchange normals; a pixel without a neighbor in its bin takes no
-    // variance from that side.
-    float3 n = active ? g.normal : float3(0.0);
-    normals[t] = n;
-    GroupMemoryBarrierWithGroupSync();
-    float3 nx = normals[t ^ 1];
-    float3 ny = normals[t ^ 2];
-    if (!active)
+    if (any(pixel >= r.gbuffer.extent))
         return;
-    float3 dndx = dot(nx, nx) > 0.0 ? nx - n : float3(0.0);
-    float3 dndy = dot(ny, ny) > 0.0 ? ny - n : float3(0.0);
-    float variance = INV_TWO_PI * (dot(dndx, dndx) + dot(dndy, dndy));
-    g.bsdf.specular_roughness = filtered_roughness(g.bsdf.specular_roughness, variance);
-    g.bsdf.coat_roughness = filtered_roughness(g.bsdf.coat_roughness, variance);
-
+    uint index = pixel.y * r.gbuffer.extent.x + pixel.x;
+    uint64_t w = r.gbuffer.visibility[index];
+    if (w == 0)
+        return;
+    VisibleCluster vc = r.gbuffer.clusters[visibility_cluster(w)];
     MaterialGpu* m = s.materials + vc.material;
+    if (surface_bin(r, m.surface) != bin)
+        return;
+
+    PrimaryHit hit = primary_hit(s, v, vc, visibility_triangle(w), float2(pixel) + 0.5);
+    material_prepare(m, hit.input.uv);
+    float offset = 0.0;
+    GSurface g = Surface.surface(hit.input, offset);
+    offset = max(offset, 0.0);
+
     float3 relative = hit.relative + hit.direction * offset;
     g.position = relative + v.eye_render.xyz;
     g.raster_error = hit.error;

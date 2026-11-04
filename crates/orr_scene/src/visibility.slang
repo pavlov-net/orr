@@ -280,13 +280,10 @@ public uint alpha_start(SceneRoot* s, VisibleCluster vc, MaterialGpu* m, Cluster
     return m.surface != 0 ? 0 : c.alpha_first;
 }
 
-// Pixel `t` of an 8 x 8 tile whose 64 threads run in 2 x 2 quads: threads 4q to 4q + 3 are
-// one quad, so a thread's x and y neighbors are threads t ^ 1 and t ^ 2.
+// Pixel `t` of an 8 x 8 tile.
 public uint2 tile_pixel(uint tile, uint tiles_x, uint t)
 {
-    uint q = t >> 2;
-    uint2 in_tile = uint2((q & 3) * 2 + (t & 1), (q >> 2) * 2 + ((t >> 1) & 1));
-    return uint2(tile % tiles_x, tile / tiles_x) * 8 + in_tile;
+    return uint2(tile % tiles_x, tile / tiles_x) * 8 + uint2(t & 7, t >> 3);
 }
 
 // A render-space direction from a view-space one.
