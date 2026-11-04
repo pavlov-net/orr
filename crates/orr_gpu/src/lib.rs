@@ -23,6 +23,8 @@ pub mod rtas;
 mod sync;
 mod texture;
 
+#[cfg(target_vendor = "apple")]
+mod metal;
 #[cfg(not(target_vendor = "apple"))]
 mod vulkan;
 
@@ -58,6 +60,22 @@ pub use texture::{
     TextureLayers, TextureRegion, TextureUsage, ViewDesc, ViewKind,
 };
 
+#[cfg(target_vendor = "apple")]
+pub use metal::AllocError;
+#[cfg(target_vendor = "apple")]
+pub use metal::{
+    Allocation, COUNTER_METRICS, Checkpoint, ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry,
+    ClassicInstance, ClassicKind, ColorAttachment, CommandList, ComputePipeline, CounterRange,
+    CounterReport, DecompressRegion, DepthAttachment, Device, DeviceArenas, DeviceDesc,
+    DeviceFault, DeviceHooks, Diagnostics, DiagnosticsReport, DispatchArgs, ExecutionSet,
+    FaultAccess, FaultAddress, Generated, HeapReport, HostArenas, InstanceFlags, LowLatency,
+    LssEndCaps, LssIndexing, MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout,
+    MemoryCopy, MemoryKind, MemoryPriority, MemoryReport, MemoryUsage, MeshArgs, MeshPipeline,
+    MeshPipelineDesc, Micromap, MicromapDesc, MicromapTriangle, MicromapUsage, OmmFormat, PageBind,
+    PassResult, PipelineCacheReport, PipelineStats, Queue, QueueKind, QueueProgress, QueueRequest,
+    RayDispatchPipeline, Rendering, Sequence, SetKind, ShaderStage, SparseAllocation, SparseBinds,
+    Swapchain, SwapchainFrame, Texture, TextureCopy, TextureMemory, TileBind,
+};
 #[cfg(not(target_vendor = "apple"))]
 pub use orr_memory::AllocError;
 #[cfg(not(target_vendor = "apple"))]
