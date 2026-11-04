@@ -140,6 +140,24 @@ float owen_sobol(uint shuffled, uint dim, uint seed)
     return unit_float(nested_uniform_scramble(sobol(shuffled, dim), hash_combine(seed, dim)));
 }
 
+// One point of `owen_sobol4`, each half computed where it is used: most of its users read `xy`,
+// and `zw` costs a loop per dimension.
+public struct OwenSobol4
+{
+    public uint shuffled;
+    public uint seed;
+
+    public float2 xy()
+    {
+        return float2(owen_sobol(shuffled, 0, seed), owen_sobol(shuffled, 1, seed));
+    }
+
+    public float2 zw()
+    {
+        return float2(owen_sobol(shuffled, 2, seed), owen_sobol(shuffled, 3, seed));
+    }
+}
+
 // Samples for one pixel and frame. Each `next*` call takes the next dimension; its points
 // over the frames of one pixel are a scrambled Sobol sequence.
 public struct Sampler
@@ -175,6 +193,15 @@ public struct Sampler
     public float4 next4()
     {
         return owen_sobol4(index, next_seed());
+    }
+
+    // `next4`, its components computed by the caller as it needs them.
+    [mutating]
+    public OwenSobol4 next4_parts()
+    {
+        uint s = next_seed();
+        OwenSobol4 point = { nested_uniform_scramble(index, s), s };
+        return point;
     }
 
     [mutating]

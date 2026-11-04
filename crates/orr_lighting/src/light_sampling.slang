@@ -912,8 +912,8 @@ public ResolvedLightSample nee_candidate(LightSetGpu* set, NeeVertex v, inout Sa
     float share = directional_share(set, v.normal, total);
     float choice = rng.next();
     float pick = rng.next();
-    float4 u4 = rng.next4();
-    float2 u = u4.xy;
+    OwenSobol4 u4 = rng.next4_parts();
+    float2 u = u4.xy();
     if (choice < share)
     {
         float target = pick * total;
@@ -947,7 +947,7 @@ public ResolvedLightSample nee_candidate(LightSetGpu* set, NeeVertex v, inout Sa
     ResolvedLightSample r;
     if (local != nullptr && (choice - share) < local.share * (1.0 - share))
     {
-        r = local_candidate(set, local, v.position, pick, u4);
+        r = local_candidate(set, local, v.position, pick, float4(u, u4.zw()));
         if (r.pdf > 0.0)
             r.pdf *= light_selection(set, local, r.light);
     }

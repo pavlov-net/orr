@@ -1147,6 +1147,15 @@ bool runs_path(PathRoot r, uint2 pixel)
     return r.pixel_fraction >= 1.0 || subset.next() < r.pixel_fraction;
 }
 
+// What vertex `x` emits toward its view. Most surfaces emit nothing and skip the prepare, which
+// their path repeats.
+float3 vertex_emission(PathVertex x)
+{
+    if (all(x.surface.bsdf.emission == 0.0))
+        return float3(0.0);
+    return bsdf_prepare(x.surface.bsdf, x.surface.normal, x.view).emission();
+}
+
 // The opaque dispatch's body for `pixel`: sky pixels take the linked environment and the
 // directional discs; surfaces the G-buffer's emission and their path, which runs on a random
 // `pixel_fraction` share of them each frame.
@@ -1173,10 +1182,9 @@ public void opaque_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
     uint feedback = NO_LIGHT;
     if (surface)
     {
-        Bsdf b = bsdf_prepare(x1.surface.bsdf, x1.surface.normal, x1.view);
         // The G-buffer's emission is already pre-exposed.
         if (r.mode != PATH_INDIRECT && r.mode != PATH_SUBSURFACE)
-            radiance = b.emission() * (lens ? pre_exposure : 1.0);
+            radiance = vertex_emission(x1) * (lens ? pre_exposure : 1.0);
         if (r.mode == PATH_CACHE || r.mode == PATH_CACHE_LOD)
         {
             skip_points<C>(r);
@@ -1184,7 +1192,7 @@ public void opaque_body<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
             float3 cached;
             bool found = cache_lookup(r.cache, cell.key, cached);
             if (r.mode == PATH_CACHE)
-                radiance = pre_exposure * cache_albedo(b.albedo(), x1.surface.bsdf) * cached;
+                radiance = pre_exposure * cache_albedo(bsdf_prepare(x1.surface.bsdf, x1.surface.normal, x1.view).albedo(), x1.surface.bsdf) * cached;
             else
                 radiance = float3(float(cell.level), found ? 1.0 : 0.0, unit_float(cache_hash(cell.key) * 2654435761u));
         }
@@ -1243,10 +1251,9 @@ float4 background_texel<C : ICoherence, S : ISurface, E : IEnvironment, M : IMed
         skip_points<C>(r);
         return float4(apply_hdr_ceiling(pre_exposure * sky_radiance<E, M>(r.set, v.eye_render.xyz, dir)), 0.0);
     }
-    Bsdf bx = bsdf_prepare(x1.surface.bsdf, x1.surface.normal, x1.view);
     uint rays = 0;
     ViewPath record = ViewPath(pcg3d(uint3(pixel, r.frame ^ r.seed ^ DOF_STREAM)).x);
-    float3 radiance = bx.emission() + trace_path<C, S, M>(b, x1, pixel, rng, rays, record);
+    float3 radiance = vertex_emission(x1) + trace_path<C, S, M>(b, x1, pixel, rng, rays, record);
     return float4(apply_hdr_ceiling(pre_exposure * radiance), near / depth);
 }
 
