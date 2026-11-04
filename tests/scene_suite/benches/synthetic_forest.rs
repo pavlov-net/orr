@@ -20,7 +20,7 @@ use orr::orr_gpu::{
     QueueKind, QueueRequest, ShaderStage, SpecData, Stages, TimelinePoint,
 };
 use orr::{
-    Budgets, Display, FrameDesc, FrameStats, FrameTime, GroupWriter, InstanceFlags, InstanceRange,
+    Budgets, FrameDesc, FrameStats, FrameTime, GroupWriter, InstanceFlags, InstanceRange,
     InstancesDesc, Lens, LoadState, Loading, ModelId, MountId, PackSource, Projection, RasterView,
     Renderer, RendererDesc, SceneDesc, SceneId, TextureFilter, TransformGroupDesc, ViewDesc,
     ViewHistoryId,
@@ -966,6 +966,7 @@ fn median(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
+#[cfg(windows)]
 fn percentile(mut v: Vec<f64>, p: f64) -> f64 {
     if v.is_empty() {
         return 0.0;
@@ -1181,7 +1182,7 @@ fn ptlas_sweep(device: &'static Device, pack: &Arc<[u8]>, args: &Args) {
 #[cfg(windows)]
 fn cpu_sweep(device: &'static Device, pack: &Arc<[u8]>, args: &Args) {
     use gpu_suite::window::Window;
-    use orr::DisplayRequest;
+    use orr::{Display, DisplayRequest};
 
     let mut window = Window::new("synthetic forest", 1280, 720);
     let desc = RendererDesc {

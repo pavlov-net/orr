@@ -1,7 +1,4 @@
-//! Presents a test card to a window, cycling the encoding SDR -> PQ -> scRGB every two
-//! seconds (with HDR metadata) and the present mode FIFO <-> IMMEDIATE every second. Logs
-//! each switch and whether it recreated the swapchain. Runs for the given seconds (default
-//! 12) or until the window closes.
+//! The example on Windows, the one target with a test window ([`gpu_suite::window`]).
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -30,7 +27,7 @@ const METADATA: HdrMetadata = HdrMetadata {
     max_fall: 0.0,
 };
 
-fn main() {
+pub(super) fn main() {
     let seconds: u64 = std::env::args()
         .nth(1)
         .and_then(|a| a.parse().ok())
