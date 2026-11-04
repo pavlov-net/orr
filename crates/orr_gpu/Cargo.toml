@@ -28,8 +28,8 @@ libloading.workspace = true
 objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-metal.workspace = true
-block2 = "0.6"
-dispatch2 = "0.3"
+block2.workspace = true
+dispatch2.workspace = true
 
 [build-dependencies]
 orr_shaders = { workspace = true, features = ["build"] }

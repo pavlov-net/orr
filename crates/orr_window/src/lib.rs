@@ -11,9 +11,14 @@ mod win32;
 #[cfg(windows)]
 use win32 as imp;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod appkit;
+#[cfg(target_os = "macos")]
+use appkit as imp;
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod none;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 use none as imp;
 
 /// What the OS reports for the window's monitor. With HDR on, the luminance fields are the
@@ -109,21 +114,27 @@ impl DisplayWatch {
     }
 }
 
-/// How far the SDR white may move, as a share of its value, and still count as unchanged: each
-/// change moves the tone curve, and the reading drifts.
-const SDR_WHITE_TOLERANCE: f32 = 0.01;
+/// How far the SDR white and the peak may move, as a share of their value, and still count as
+/// unchanged: each change moves the tone curve, and the readings drift (on macOS the peak
+/// follows the brightness setting).
+const STEADY_TOLERANCE: f32 = 0.01;
 
-/// `new` keeping the last SDR white while it stays within `SDR_WHITE_TOLERANCE` of `new`'s.
+/// `new` keeping the last SDR white and peak while each stays within `STEADY_TOLERANCE` of
+/// `new`'s.
 #[cfg_attr(
-    not(any(windows, test)),
+    not(any(windows, target_os = "macos", test)),
     expect(dead_code, reason = "used by the platform watches")
 )]
 fn steady(last: DisplayInfo, mut new: DisplayInfo) -> DisplayInfo {
-    if let (Some(old), Some(white)) = (last.sdr_white_nits, new.sdr_white_nits)
-        && (white - old).abs() <= SDR_WHITE_TOLERANCE * old
-    {
-        new.sdr_white_nits = last.sdr_white_nits;
-    }
+    let hold = |old: Option<f32>, new: &mut Option<f32>| {
+        if let (Some(old), Some(value)) = (old, *new)
+            && (value - old).abs() <= STEADY_TOLERANCE * old
+        {
+            *new = Some(old);
+        }
+    };
+    hold(last.sdr_white_nits, &mut new.sdr_white_nits);
+    hold(last.max_nits, &mut new.max_nits);
     new
 }
 
@@ -132,10 +143,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sdr_white_stays_through_small_changes_only() {
+    fn sdr_white_and_peak_stay_through_small_changes_only() {
         let with = |nits: f32| DisplayInfo {
             os_hdr_on: Some(true),
             sdr_white_nits: Some(nits),
+            max_nits: Some(nits * 4.0),
             ..DisplayInfo::default()
         };
         assert_eq!(steady(with(200.0), with(201.0)), with(200.0));

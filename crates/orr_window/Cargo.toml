@@ -27,9 +27,20 @@ windows = { workspace = true, features = [
   "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-app-kit.workspace = true
+block2.workspace = true
+dispatch2.workspace = true
+
 [target.'cfg(windows)'.dev-dependencies]
 orr_color.workspace = true
 windows = { workspace = true, features = ["Win32_System_LibraryLoader"] }
+
+[[test]]
+name = "appkit_watch"
+harness = false
 
 [lints]
 workspace = true
