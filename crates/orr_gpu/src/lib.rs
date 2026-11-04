@@ -39,7 +39,9 @@ pub mod interop {
 }
 
 pub use caps::{Caps, ComponentType, CooperativeVectorCombination, Limits};
-pub use error::{Error, VkResult};
+pub use error::Error;
+#[cfg(not(target_vendor = "apple"))]
+pub use error::VkResult;
 pub use format::Format;
 pub use orr_shaders::abi::*;
 pub use orr_shaders::{EntryPoint, KernelSet, ShaderModule, Stage};
