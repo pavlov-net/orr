@@ -66,7 +66,8 @@ pub(super) struct Shared {
     pub(super) cluster_kernels: OnceLock<Kernels>,
     /// Command buffers that completed with an error.
     pub(super) gpu_errors: AtomicU32,
-    /// Each module's libraries by (module hash, fragment library).
+    /// Metal libraries by the hash that names them (a module's own by the module's hash, a
+    /// reload's by its contents') and whether they hold the pixel entries.
     pub(super) libraries: Mutex<HashMap<(u64, bool), Obj<ProtocolObject<dyn MTLLibrary>>>>,
     pub(super) bindings: Bindings,
     pub(super) caps: Caps,

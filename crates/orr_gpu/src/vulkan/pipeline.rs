@@ -19,6 +19,10 @@ use crate::{EntryPoint, Error, ShaderModule, SpecData, Stage};
 #[derive(Clone, Copy, Debug)]
 pub struct ShaderStage<'a> {
     pub spirv: &'a [u32],
+    /// The module's Metal libraries, or a hot reload's. Unused here; they mirror the Metal
+    /// backend's.
+    pub metallib: &'a [u8],
+    pub metallib_fragment: &'a [u8],
     /// `spirv` declares the opacity-micromap execution mode, which needs `Caps::omm`.
     pub omm: bool,
     /// The size of the root the kernel holds in the push data; 0 for a root in GPU memory.
@@ -37,6 +41,8 @@ impl<'a> ShaderStage<'a> {
             .ok_or_else(|| Error::Shader(format!("{} has no entry point {entry}", module.name)))?;
         Ok(Self {
             spirv: module.spirv,
+            metallib: module.metallib,
+            metallib_fragment: module.metallib_fragment,
             omm: module.omm,
             inline_root_bytes: module.inline_root_bytes,
             debug_info: module.debug_info,

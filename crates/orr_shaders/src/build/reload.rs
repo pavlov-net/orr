@@ -40,10 +40,14 @@ struct Watched {
 /// One recompiled module.
 pub enum Reload {
     /// New SPIR-V for `module`, whose entry points and interface are unchanged. Its debug
-    /// info is embedded.
+    /// info is embedded. With the Metal libraries built from it, as
+    /// [`ShaderModule::metallib`] and [`ShaderModule::metallib_fragment`], when the module's
+    /// build made them; empty otherwise.
     Module {
         module: &'static ShaderModule,
         spirv: Arc<[u32]>,
+        metallib: Arc<[u8]>,
+        metallib_fragment: Arc<[u8]>,
         hash: u64,
     },
     /// The module failed to compile, with Slang's file and line, or its entry points or
@@ -175,10 +179,18 @@ fn recompile(
 ) -> Result<Option<Reload>, String> {
     let manifest = &*w.manifest;
     let entry = &manifest.modules[w.index];
-    let (mut options, roots) = if entry.linked {
-        (manifest.linked_options.clone(), &manifest.linked_roots)
+    let (mut options, roots, metal_options) = if entry.linked {
+        (
+            manifest.linked_options.clone(),
+            &manifest.linked_roots,
+            &manifest.linked_metal_options,
+        )
     } else {
-        (manifest.options.clone(), &manifest.roots)
+        (
+            manifest.options.clone(),
+            &manifest.roots,
+            &manifest.metal_options,
+        )
     };
     options.retain(|o| o != "-separate-debug-info");
     let session = global.session(&options)?;
@@ -198,8 +210,8 @@ fn recompile(
     let settings = Settings {
         tool: "",
         options: &options,
-        metal: None,
-        metal_sdk: None,
+        metal: metal_options.as_deref(),
+        metal_sdk: manifest.metal_sdk.as_deref(),
         asserts: manifest.asserts,
         separate_debug: false,
         roots,
@@ -257,10 +269,45 @@ fn recompile(
     if hash == w.hash {
         return Ok(None);
     }
+    let (metallib, metallib_fragment) = match settings.metal {
+        Some(metal_options) => {
+            let session = global.session(metal_options)?;
+            // Beside the build's own MSL and libraries, which the binary embeds.
+            let spv = entry.spv.with_extension("reload.spv");
+            let (issues, libs) =
+                compile::metal_issues(&session, &settings, &compiled.model, &unit, &spv)
+                    .map_err(|e| e.to_string())?;
+            if !issues.is_empty() {
+                return Err(format!("{}: {}", module.name, issues.join("\n")));
+            }
+            // Raygen entries have no Metal function in either.
+            let renamed = module.entry_points.iter().find(|e| {
+                let name = e.name.to_str().unwrap_or("");
+                libs.names.get(name).map_or("", String::as_str).as_bytes()
+                    != e.metal_name.to_bytes()
+            });
+            if let Some(e) = renamed {
+                return Err(format!(
+                    "{}: rebuild required: the Metal function of {:?} changed",
+                    module.name, e.name
+                ));
+            }
+            let lib = |path: &Option<PathBuf>| match path {
+                Some(p) => fs::read(p)
+                    .map(Arc::from)
+                    .map_err(|e| format!("{}: {e}", p.display())),
+                None => Ok(Arc::from([])),
+            };
+            (lib(&libs.lib)?, lib(&libs.fragment)?)
+        }
+        None => (Arc::from([]), Arc::from([])),
+    };
     w.hash = hash;
     Ok(Some(Reload::Module {
         module,
         spirv: compiled.words.into(),
+        metallib,
+        metallib_fragment,
         hash,
     }))
 }

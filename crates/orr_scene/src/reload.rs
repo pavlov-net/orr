@@ -99,7 +99,20 @@ impl Reloader {
                 for reload in watcher.scan() {
                     let kernel = reload.module().name;
                     let (module, new) = match reload {
-                        Reload::Module { module, spirv, .. } => (module, Arc::new(Code { spirv })),
+                        Reload::Module {
+                            module,
+                            spirv,
+                            metallib,
+                            metallib_fragment,
+                            ..
+                        } => (
+                            module,
+                            Arc::new(Code {
+                                spirv,
+                                metallib,
+                                metallib_fragment,
+                            }),
+                        ),
                         Reload::Rejected { reason, .. } => {
                             log::warn!("hot reload of {kernel} rejected: {reason}");
                             reports.push(ReloadReport::Rejected { kernel, reason });

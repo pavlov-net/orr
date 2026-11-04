@@ -576,6 +576,12 @@ impl Build {
         let rust = codegen::kernel_set(&linked_out, &link::ids(&links), &manifest_path);
         write(&out_dir.join("orr_kernels.rs"), rust.as_bytes())?;
 
+        // Reloads build Metal libraries as the build did, when it did.
+        let metal_sdk = self.metal_sdk.filter(|_| self.metal_check);
+        let metal_options =
+            |roots: &[Root]| metal_sdk.map(|_| metal_session_options(&include_dirs(roots)));
+        let (metal_options, linked_metal_options) =
+            (metal_options(&roots), metal_options(&linked_roots));
         let manifest = Manifest {
             slang: SLANG_VERSION.to_owned(),
             library: self.lib.path.clone(),
@@ -585,6 +591,9 @@ impl Build {
             linked_roots,
             asserts: self.asserts,
             omm: self.omm,
+            metal_options,
+            linked_metal_options,
+            metal_sdk: metal_sdk.map(str::to_owned),
             modules: modules
                 .iter()
                 .map(|(name, r)| (name, r, false))
@@ -836,6 +845,11 @@ pub(super) struct Manifest {
     pub(super) linked_roots: Vec<Root>,
     pub(super) asserts: bool,
     pub(super) omm: bool,
+    /// The Metal session options of the crate's own and the linked kernels, and the SDK
+    /// their Metal libraries are built with, when the build makes them.
+    pub(super) metal_options: Option<Vec<String>>,
+    pub(super) linked_metal_options: Option<Vec<String>>,
+    pub(super) metal_sdk: Option<String>,
     pub(super) modules: Vec<ManifestModule>,
 }
 
@@ -845,7 +859,7 @@ pub(super) struct ManifestModule {
     pub(super) kernel: PathBuf,
     /// Compiled with this build's linked types; goes into `KERNELS`.
     pub(super) linked: bool,
-    spv: PathBuf,
+    pub(super) spv: PathBuf,
     /// The separated debug info of `spv`.
     debug_info: Option<PathBuf>,
     pub(super) hash: u64,
