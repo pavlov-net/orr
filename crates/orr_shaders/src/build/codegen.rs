@@ -2,8 +2,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use super::compile::MetalLibs;
 use super::layout::{Plan, Slot};
 use super::link::LinkPoint;
 use super::model::{Model, Scalar, SpecConstant, StructDef, Ty};
@@ -27,6 +28,7 @@ pub(super) struct Kernel<'a> {
     pub(super) hash: u64,
     /// Shared by every entry point: they share the root and the constants.
     pub(super) interface: u64,
+    pub(super) metallib: &'a MetalLibs,
     pub(super) model: &'a Model,
     pub(super) owners: &'a HashMap<String, Owner>,
     pub(super) plans: &'a HashMap<String, Plan>,
@@ -169,11 +171,19 @@ fn emit_module(out: &mut String, item: &str, k: &Kernel<'_>, manifest: &Path) {
     let debug_info = k
         .debug_info
         .map_or_else(String::new, |p| p.display().to_string());
+    let lib = |p: &Option<PathBuf>| {
+        p.as_ref().map_or_else(
+            || "&[]".to_owned(),
+            |p| format!("include_bytes!({:?})", p.display().to_string()),
+        )
+    };
     let _ = writeln!(
         out,
-        "{item}: ::orr_shaders::ShaderModule = ::orr_shaders::ShaderModule {{\n    name: {name:?},\n    kernel: {name:?},\n    spirv: ::orr_shaders::aligned_spirv!({spv:?}),\n    omm: {omm},\n    inline_root_bytes: {inline_root_bytes},\n    debug_info: {debug_info:?},\n    hash: {hash:#018x},\n    manifest: {manifest:?},\n    entry_points: &[",
+        "{item}: ::orr_shaders::ShaderModule = ::orr_shaders::ShaderModule {{\n    name: {name:?},\n    kernel: {name:?},\n    spirv: ::orr_shaders::aligned_spirv!({spv:?}),\n    metallib: {metallib},\n    metallib_fragment: {metallib_fragment},\n    omm: {omm},\n    inline_root_bytes: {inline_root_bytes},\n    debug_info: {debug_info:?},\n    hash: {hash:#018x},\n    manifest: {manifest:?},\n    entry_points: &[",
         name = k.name,
         spv = k.spv.display().to_string(),
+        metallib = lib(&k.metallib.lib),
+        metallib_fragment = lib(&k.metallib.fragment),
         omm = k.model.omm,
         inline_root_bytes = match &k.model.root {
             Some(root) if k.model.inline_root => k.plans[root].size,
@@ -185,8 +195,12 @@ fn emit_module(out: &mut String, item: &str, k: &Kernel<'_>, manifest: &Path) {
     for e in &k.model.entries {
         let _ = writeln!(
             out,
-            "        ::orr_shaders::EntryPoint {{ name: c{:?}, stage: ::orr_shaders::Stage::{:?}, workgroup: {:?}, interface: {:#018x} }},",
-            e.name, e.stage, e.workgroup, k.interface
+            "        ::orr_shaders::EntryPoint {{ name: c{:?}, metal_name: c{:?}, stage: ::orr_shaders::Stage::{:?}, workgroup: {:?}, interface: {:#018x} }},",
+            e.name,
+            k.metallib.names.get(&e.name).map_or("", String::as_str),
+            e.stage,
+            e.workgroup,
+            k.interface
         );
     }
     out.push_str("    ],\n};\n");
