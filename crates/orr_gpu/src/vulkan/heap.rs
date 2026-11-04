@@ -26,6 +26,8 @@ struct HeapLayout {
 /// One heap buffer and how it is bound.
 pub(crate) struct HeapBuffer {
     pub(super) raw: RawBuffer,
+    /// Where the heap starts in `raw`.
+    address: u64,
     ptr: NonNull<u8>,
     stride: u64,
     slots: u32,
@@ -47,12 +49,23 @@ impl HeapBuffer {
         }
         let usage =
             vk::BufferUsageFlags::DESCRIPTOR_HEAP_EXT | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
+        // The buffer's address need not meet the heap's alignment, so the heap starts at the
+        // first address in it that does.
+        let heap_align = l.heap_align.max(1);
         let (raw, ptr) =
-            shared.create_buffer(MemoryKind::Upload, size, usage, l.heap_align.max(1), name)?;
-        let ptr =
-            ptr.ok_or_else(|| Error::Invalid(format!("{name}: upload memory is not mapped")))?;
+            shared.create_buffer(MemoryKind::Upload, size + heap_align - 1, usage, 1, name)?;
+        let Some(ptr) = ptr else {
+            shared.destroy(Item::Buffer(raw));
+            return Err(Error::Invalid(format!(
+                "{name}: upload memory is not mapped"
+            )));
+        };
+        let address = raw.address.next_multiple_of(heap_align);
+        // SAFETY: the buffer holds `heap_align - 1` bytes beyond the heap.
+        let ptr = unsafe { ptr.add((address - raw.address) as usize) };
         Ok(HeapBuffer {
             raw,
+            address,
             ptr,
             stride: l.stride,
             slots,
@@ -64,7 +77,7 @@ impl HeapBuffer {
     fn bind_info(&self) -> vk::BindHeapInfoEXT<'static> {
         vk::BindHeapInfoEXT {
             heap_range: vk::DeviceAddressRangeEXT {
-                address: self.raw.address,
+                address: self.address,
                 size: self.reserved_offset + self.reserved_size,
             },
             reserved_range_offset: self.reserved_offset,

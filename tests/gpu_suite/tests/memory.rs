@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use gpu_suite::shaders::gate;
 use gpu_suite::{assert_clean, device, pipeline};
-use orr_gpu::{Hazards, MemoryKind, QueueKind, Stages, TimelinePoint};
+use orr_gpu::{
+    Device, DeviceDesc, Hazards, MemoryKind, QueueKind, QueueRequest, Stages, TimelinePoint,
+};
 
 #[test]
 fn steady_frames_reuse_memory_without_allocating() {
@@ -87,4 +89,41 @@ fn steady_frames_reuse_memory_without_allocating() {
         "steady frames called vkAllocateMemory"
     );
     assert_clean();
+}
+
+/// Host memory blocks can start on any 4 KiB page, which meets neither the resource heap's
+/// alignment nor a large block's offset alignment. Devices made and freed side by side, with
+/// small readback buffers, leave such pages: about one device in ten here.
+#[test]
+fn staged_devices_work_at_any_memory_address() {
+    let churn = || {
+        for i in 1..=8 {
+            let d = Device::new(&DeviceDesc {
+                name: "orr-test-staged",
+                queues: QueueRequest {
+                    render_compute: true,
+                    ..QueueRequest::default()
+                },
+                force_staging: true,
+                ..DeviceDesc::default()
+            })
+            .unwrap();
+            d.gpu_malloc::<u8>(MemoryKind::Upload, 1 << 16, "large upload")
+                .unwrap();
+            for k in 0..6 {
+                d.gpu_malloc::<u8>(MemoryKind::Readback, (i + k) * 4096, "small readback")
+                    .unwrap();
+            }
+            let queue = d.queue(QueueKind::Render).unwrap();
+            let list = queue.command_list().unwrap();
+            let done = queue.submit(vec![list], &[]).unwrap();
+            queue.wait(done, Duration::from_secs(10)).unwrap();
+            assert_eq!(d.validation_messages(), 0, "staged device validation");
+        }
+    };
+    std::thread::scope(|s| {
+        for _ in 0..6 {
+            s.spawn(churn);
+        }
+    });
 }

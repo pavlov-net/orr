@@ -463,7 +463,9 @@ impl Shared {
     }
 
     /// Creates a buffer of `kind` in the buffer pool of `priority`, or the transient pool
-    /// for `None`, at an address that is a multiple of `align` (a power of two).
+    /// for `None`, at an address that is a multiple of `align` (a power of two). Fails when
+    /// its memory cannot give that: the allocator aligns offsets in a block, and host memory
+    /// blocks can start on any 4 KiB page.
     fn create_buffer_in(
         &self,
         priority: Option<MemoryPriority>,
@@ -477,9 +479,10 @@ impl Shared {
         let (sharing, families) = sharing(&self.families);
         let pools = &self.pools;
         let mut size = size.max(4);
-        let mut align = align.max(MIN_ALIGN);
+        let align = align.max(MIN_ALIGN);
+        let mut offset_align = align;
         if kind != MemoryKind::Readback && size >= PLACEMENT_MIN_BYTES {
-            align = align.max(pools.placement_align);
+            offset_align = offset_align.max(pools.placement_align);
             size = size.next_multiple_of(pools.placement_align);
         }
         // Device-generated commands preprocess into DeviceLocal arena memory.
@@ -512,7 +515,7 @@ impl Shared {
         let (buffer, allocation) = unsafe {
             pools
                 .allocator
-                .create_buffer(pool, &info, align, flags, name)
+                .create_buffer(pool, &info, offset_align, flags, name)
         }
         .map_err(memory_error)?;
         let mapped = allocation.mapped;
