@@ -13,21 +13,8 @@ use ash::vk;
 
 use super::device::{Device, Shared};
 use super::pipeline::StageParts;
-use crate::Error;
 use crate::cache_file::{Identity, decode, encode, write};
-
-/// What the pipeline cache loaded and how creation has used it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PipelineCacheReport {
-    /// The file existed and its data was loaded.
-    pub loaded: bool,
-    /// Pipelines compiled with the driver reporting a cache hit.
-    pub hits: u32,
-    /// Pipelines compiled with no cache hit.
-    pub misses: u32,
-    /// Why the file was ignored, when it existed and was.
-    pub rejected: Option<String>,
-}
+use crate::{Error, PipelineCacheReport};
 
 /// The bytes `vkGetPipelineCacheData` would write for `cache`.
 fn data_size(device: &ash::Device, cache: vk::PipelineCache) -> Option<usize> {

@@ -1,6 +1,4 @@
 use std::collections::{HashMap, VecDeque};
-use std::ffi::CStr;
-use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -16,12 +14,13 @@ use super::accel::{EmptyTlas, build_empty_tlas};
 use super::cache::PipelineCache;
 use super::cluster::{self, Kernels, Objects, PtlasCheck, StructureIds};
 use super::heap::Bindings;
-use super::memory::MemoryUsage;
-use super::queue::{PassResult, Queue, QueueKind, QueueRequest, TimestampRing};
-use super::unsupported::Diagnostics;
+use super::queue::{Queue, TimestampRing};
 use super::{Buffers, Garbage, MAX_TIMELINES, Obj, Release, Timeline, lock};
 use crate::rtas::{ClusterCaps, ClusterVertexFormat};
-use crate::{Caps, Error, Limits, MAX_INLINE_ROOT_BYTES, TimelinePoint, Tlas};
+use crate::{
+    Caps, DeviceDesc, Error, Limits, MAX_INLINE_ROOT_BYTES, MemoryUsage, PassResult, QueueKind,
+    TimelinePoint, Tlas,
+};
 
 /// Additions to device creation. Metal devices take none, so the trait has no methods here.
 pub trait DeviceHooks {}
@@ -29,45 +28,6 @@ pub trait DeviceHooks {}
 impl std::fmt::Debug for dyn DeviceHooks + '_ {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("DeviceHooks")
-    }
-}
-
-/// How to create a [`Device`].
-#[derive(Clone, Copy, Debug)]
-pub struct DeviceDesc<'a> {
-    /// Application name; labels the device's objects.
-    pub name: &'a str,
-    /// Unused on Metal.
-    pub hooks: Option<&'a dyn DeviceHooks>,
-    pub queues: QueueRequest,
-    pub diagnostics: Diagnostics<'a>,
-    /// Unused on Metal: there is no pipeline cache yet.
-    pub pipeline_cache: Option<&'a Path>,
-    /// Unused on Metal.
-    pub skip_extensions: &'a [&'a CStr],
-    /// Report no `rebar`, so callers take their staging paths; memory stays unified.
-    pub force_staging: bool,
-    /// Unused on Metal.
-    pub perf_counters: bool,
-    /// Texture view pool slots for sampled and storage image views.
-    pub image_heap_slots: u32,
-    pub sampler_heap_slots: u32,
-}
-
-impl Default for DeviceDesc<'_> {
-    fn default() -> Self {
-        Self {
-            name: "orr",
-            hooks: None,
-            queues: QueueRequest::default(),
-            diagnostics: Diagnostics::Off,
-            pipeline_cache: None,
-            skip_extensions: &[],
-            force_staging: false,
-            perf_counters: false,
-            image_heap_slots: 262_144,
-            sampler_heap_slots: 1024,
-        }
     }
 }
 
@@ -87,7 +47,7 @@ pub(super) struct Shared {
     pub(super) host_timelines: Mutex<Vec<Obj<ProtocolObject<dyn MTLSharedEvent>>>>,
     pub(super) garbage: Mutex<Garbage>,
     pub(super) buffers: Mutex<Buffers>,
-    /// Live `gpu_malloc` memory by [`MemoryKind`](super::MemoryKind).
+    /// Live `gpu_malloc` memory by [`MemoryKind`](crate::MemoryKind).
     pub(super) usage: Mutex<[MemoryUsage; 3]>,
     /// Buffers `gpu_malloc` has created so far.
     pub(super) device_allocations: AtomicU64,

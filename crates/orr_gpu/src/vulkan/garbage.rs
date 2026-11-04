@@ -4,7 +4,7 @@
 use ash::vk;
 
 use super::device::Shared;
-use super::memory::MemoryKind;
+use crate::MemoryKind;
 
 /// Timelines a device can have: one per queue kind.
 pub(super) const MAX_TIMELINES: usize = 5;

@@ -9,9 +9,8 @@ use ash::vk;
 use super::device::{Device, Shared};
 use super::garbage::{Item, RawBuffer};
 use super::heap::SlotAllocator;
-use super::memory::MemoryKind;
 use super::pipeline::{ShaderStage, StageParts};
-use crate::{Error, Stage};
+use crate::{Error, MemoryKind, Stage};
 
 /// Raygen records the block holds: one per live ray-dispatch pipeline.
 const RECORDS: u32 = 4096;

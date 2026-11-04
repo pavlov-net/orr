@@ -7,11 +7,10 @@ use ash::vk;
 
 use super::device::{Device, Shared};
 use super::garbage::{Item, RawBuffer};
-use super::memory::MemoryKind;
 use super::texture::{Texture, vk_address_mode, vk_compare, vk_filter, vk_mipmap_mode};
 use crate::{
-    Error, FIRST_FREE_IMAGE_SLOT, SamplerDesc, SamplerIndex, StorageImageIndex, TextureIndex,
-    TimelinePoint, ViewDesc,
+    Error, FIRST_FREE_IMAGE_SLOT, MemoryKind, SamplerDesc, SamplerIndex, StorageImageIndex,
+    TextureIndex, TimelinePoint, ViewDesc,
 };
 
 /// Descriptor sizes and limits of one heap.

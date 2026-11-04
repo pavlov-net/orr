@@ -12,11 +12,11 @@ use super::accel::vk_build_flags;
 use super::command::CommandList;
 use super::device::{Device, Shared};
 use super::garbage::RawBuffer;
-use super::memory::MemoryKind;
 use super::pipeline::ShaderStage;
 use crate::{
-    ClusterCaps, ClusterVertexFormat, Error, GpuAddress, GpuPtr, Hazards, MoveKind, PtlasArgs,
-    RtasFlags, RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc, RtasSizes, SpecData, Stages,
+    ClusterCaps, ClusterVertexFormat, Error, GpuAddress, GpuPtr, Hazards, MemoryKind, MoveKind,
+    PtlasArgs, RtasFlags, RtasIo, RtasLimits, RtasMode, RtasOp, RtasOpDesc, RtasSizes, SpecData,
+    Stages,
 };
 
 const PTLAS_COMMAND_STRIDE: u32 =

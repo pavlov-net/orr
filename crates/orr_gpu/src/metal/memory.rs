@@ -15,38 +15,12 @@ use objc2_metal::{
 
 use super::device::{Device, Shared};
 use super::{Buffer, Obj, lock};
-use crate::{Error, GpuAddress, GpuPtr, TimelinePoint};
+use crate::{
+    Error, GpuAddress, GpuPtr, HeapReport, MemoryKind, MemoryPriority, MemoryReport, TimelinePoint,
+};
 
 /// Every allocation starts at a multiple of this many bytes.
 const MALLOC_ALIGN: u64 = 256;
-
-/// Where an allocation lives.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum MemoryKind {
-    /// Mapped, written by the CPU and read by the GPU. Memory is unified, so this is shared
-    /// storage.
-    Upload,
-    /// Private storage, not mapped, in a placement heap so textures can be placed in it.
-    DeviceLocal,
-    /// Mapped, for the CPU to read back GPU results.
-    Readback,
-}
-
-impl MemoryKind {
-    fn index(self) -> usize {
-        self as usize
-    }
-}
-
-/// How firmly the OS keeps an allocation resident. Metal has no such control yet; every
-/// priority behaves alike.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
-pub enum MemoryPriority {
-    Low,
-    #[default]
-    Normal,
-    High,
-}
 
 /// No free range fits the requested layout.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -166,48 +140,6 @@ fn release_buffer(shared: &Shared, start: u64, raw: RawBuffer) {
     let u = &mut usage[raw.kind.index()];
     u.bytes -= raw.buffer.length() as u64;
     u.allocations -= 1;
-}
-
-/// Memory use per [`MemoryKind`] and per heap.
-#[derive(Clone, Debug)]
-pub struct MemoryReport {
-    /// Indexed like [`MemoryKind`]: Upload, DeviceLocal, Readback.
-    pub kinds: [MemoryUsage; 3],
-    pub heaps: Vec<HeapReport>,
-    /// Metal allocations orr_gpu has made so far.
-    pub device_allocations: u64,
-}
-
-impl MemoryReport {
-    pub fn kind(&self, kind: MemoryKind) -> MemoryUsage {
-        self.kinds[kind.index()]
-    }
-
-    /// The largest share of its OS budget a device-local heap uses; `None` without budgets.
-    pub fn pressure(&self) -> Option<f64> {
-        self.heaps
-            .iter()
-            .filter(|h| h.device_local)
-            .filter_map(|h| Some(h.usage? as f64 / h.budget?.max(1) as f64))
-            .reduce(f64::max)
-    }
-}
-
-/// Live `gpu_malloc` bytes and allocations of one kind.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub struct MemoryUsage {
-    pub bytes: u64,
-    pub allocations: u64,
-}
-
-/// One memory heap.
-#[derive(Clone, Copy, Debug)]
-pub struct HeapReport {
-    pub size: u64,
-    pub device_local: bool,
-    pub block_bytes: u64,
-    pub budget: Option<u64>,
-    pub usage: Option<u64>,
 }
 
 impl Device {

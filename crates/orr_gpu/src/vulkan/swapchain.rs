@@ -12,11 +12,10 @@ use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 use super::debug::name_object;
 use super::device::{Device, PresentFns, Shared};
-use super::queue::QueueKind;
 use super::texture::Texture;
 use crate::{
-    Error, Format, HdrMetadata, LatencyMarker, LatencyTimings, OutputFormat, PresentMode, Refresh,
-    StorageImageIndex, SwapchainDesc, TextureDesc, TextureUsage, ViewDesc,
+    Error, Format, HdrMetadata, LatencyMarker, LatencyTimings, OutputFormat, PresentMode,
+    QueueKind, Refresh, StorageImageIndex, SwapchainDesc, TextureDesc, TextureUsage, ViewDesc,
 };
 
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);

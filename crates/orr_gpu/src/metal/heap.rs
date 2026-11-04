@@ -13,12 +13,12 @@ use objc2_metal::{
     MTLSamplerState, MTLTextureType, MTLTextureViewDescriptor, MTLTextureViewPool,
 };
 
-use super::device::{Device, DeviceDesc, metal_error};
+use super::device::{Device, metal_error};
 use super::texture::{Texture, pixel_format};
 use super::{Buffer, Obj, lock};
 use crate::{
-    AddressMode, CompareOp, Error, FIRST_FREE_IMAGE_SLOT, Filter, SamplerDesc, SamplerIndex,
-    StorageImageIndex, TextureIndex, TextureKind, TimelinePoint, ViewDesc, ViewKind,
+    AddressMode, CompareOp, DeviceDesc, Error, FIRST_FREE_IMAGE_SLOT, Filter, SamplerDesc,
+    SamplerIndex, StorageImageIndex, TextureIndex, TextureKind, TimelinePoint, ViewDesc, ViewKind,
 };
 
 /// The view pool, the buffers argument-table slots 1 and 2 point at, and the free slots.

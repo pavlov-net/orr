@@ -18,46 +18,15 @@ use super::Obj;
 use super::command::{CommandList, RenderEncoder, size};
 use super::device::{Device, metal_error};
 use super::heap::compare;
-use super::pipeline::ShaderStage;
-use super::texture::{Texture, pixel_format};
+use super::texture::pixel_format;
 use crate::{
-    BlendFactor, BlendOp, ClearColor, ColorLoad, ColorMask, ColorTarget, Cull, DepthLoad,
-    DepthTarget, Error, Fill, FrontFace, GpuPtr, Hazards, RasterState, Stages,
+    BlendFactor, BlendOp, ClearColor, ColorLoad, ColorMask, Cull, DepthLoad, Error, Fill,
+    FrontFace, GpuPtr, Hazards, MeshArgs, MeshPipelineDesc, RasterState, Rendering, Stages,
 };
 
 /// Object payload bytes a task stage may write: Metal's limit, since the build does not
 /// record each kernel's payload size yet.
 const PAYLOAD_BYTES: usize = 16 << 10;
-
-/// How to build a mesh pipeline. Every stage reads the root pointer passed to the draw.
-#[derive(Clone, Copy, Debug)]
-pub struct MeshPipelineDesc<'a> {
-    pub task: Option<ShaderStage<'a>>,
-    pub mesh: ShaderStage<'a>,
-    /// `None`: no pixel stage; only depth is written.
-    pub pixel: Option<ShaderStage<'a>>,
-    /// Color targets in attachment order.
-    pub colors: &'a [ColorTarget],
-    pub depth: Option<DepthTarget>,
-    pub raster: RasterState,
-    /// Rasterization samples per pixel: 1, or more for pipelines with no targets.
-    pub samples: u32,
-}
-
-impl<'a> MeshPipelineDesc<'a> {
-    /// A mesh stage alone: no targets, default raster state, one sample.
-    pub fn new(mesh: ShaderStage<'a>) -> Self {
-        Self {
-            task: None,
-            mesh,
-            pixel: None,
-            colors: &[],
-            depth: None,
-            raster: RasterState::default(),
-            samples: 1,
-        }
-    }
-}
 
 /// A task/mesh/pixel pipeline drawn by [`CommandList::draw_mesh_tasks`] inside
 /// [`CommandList::begin_rendering`]. Command lists keep the pipelines they draw with until
@@ -69,33 +38,6 @@ pub struct MeshPipeline {
     raster: RasterState,
     task_workgroup: [u32; 3],
     mesh_workgroup: [u32; 3],
-}
-
-/// A color attachment of [`Rendering`]: mip 0, layer 0 of a texture with `COLOR` usage.
-#[derive(Clone, Copy)]
-pub struct ColorAttachment<'a> {
-    pub texture: &'a Texture,
-    pub load: ColorLoad,
-    /// Keep what rendering wrote; otherwise the contents are undefined afterwards.
-    pub store: bool,
-}
-
-/// The depth attachment of [`Rendering`]: mip 0, layer 0 of a texture with `DEPTH` usage.
-#[derive(Clone, Copy)]
-pub struct DepthAttachment<'a> {
-    pub texture: &'a Texture,
-    pub load: DepthLoad,
-    pub store: bool,
-}
-
-/// What [`CommandList::begin_rendering`] draws into. With no attachments the extent alone
-/// sets the raster grid.
-#[derive(Clone, Copy)]
-pub struct Rendering<'a> {
-    /// Width and height in pixels, from the origin.
-    pub extent: [u32; 2],
-    pub colors: &'a [ColorAttachment<'a>],
-    pub depth: Option<DepthAttachment<'a>>,
 }
 
 impl Device {
@@ -455,11 +397,11 @@ impl CommandList<'_> {
         &mut self,
         p: &MeshPipeline,
         root: GpuPtr<R>,
-        args: GpuPtr<super::MeshArgs>,
+        args: GpuPtr<MeshArgs>,
         count: GpuPtr<u32>,
         max: u32,
     ) {
-        let stride = size_of::<super::MeshArgs>() as u64;
+        let stride = size_of::<MeshArgs>() as u64;
         let gated = self.inline_bytes(&vec![0; (stride * u64::from(max)) as usize]);
         self.pass()
             .gates

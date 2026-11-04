@@ -28,21 +28,8 @@ use objc2_metal::{
 
 use super::device::{Device, Shared, metal_error};
 use super::{Obj, lock};
-use crate::Error;
 use crate::cache_file::{Identity, decode, encode, write};
-
-/// What the pipeline cache loaded and how creation has used it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PipelineCacheReport {
-    /// The file existed and its archive was loaded.
-    pub loaded: bool,
-    /// Pipelines this session or the archive already held.
-    pub hits: u32,
-    /// Pipelines compiled from source.
-    pub misses: u32,
-    /// Why the file was ignored, when it existed and was.
-    pub rejected: Option<String>,
-}
+use crate::{Error, PipelineCacheReport};
 
 /// Apple's PCI vendor ID.
 const APPLE: u32 = 0x106b;

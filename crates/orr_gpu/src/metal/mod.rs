@@ -11,7 +11,8 @@
 //! [`Error::NotImplemented`](crate::Error::NotImplemented), the others panic saying so, and
 //! handles only those calls create cannot be made.
 //!
-//! The descriptor and report types repeat the Vulkan backend's definitions field for field.
+//! Types alike on both backends are the crate root's; the ones here hold Metal objects and
+//! have the Vulkan backend's public fields and methods.
 
 mod accel;
 mod cache;
@@ -35,28 +36,17 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLSharedEvent};
 
-pub use accel::{
-    ClassicAs, ClassicBuild, ClassicDesc, ClassicGeometry, ClassicInstance, ClassicKind,
-    InstanceFlags, LssEndCaps, LssIndexing, Micromap, MicromapDesc, MicromapTriangle,
-    MicromapUsage, OmmFormat,
-};
-pub use cache::PipelineCacheReport;
-pub use command::{CommandList, DecompressRegion, DispatchArgs, MemoryCopy, MeshArgs, TextureCopy};
-pub use device::{Device, DeviceDesc, DeviceHooks};
-pub use memory::{
-    AllocError, Allocation, DeviceArenas, HeapReport, HostArenas, MemoryKind, MemoryPriority,
-    MemoryReport, MemoryUsage,
-};
-pub use mesh::{ColorAttachment, DepthAttachment, MeshPipeline, MeshPipelineDesc, Rendering};
+pub use accel::{ClassicAs, Micromap};
+pub use command::CommandList;
+pub use device::{Device, DeviceHooks};
+pub use memory::{AllocError, Allocation, DeviceArenas, HostArenas};
+pub use mesh::MeshPipeline;
 pub use pipeline::{ComputePipeline, ShaderStage};
-pub use queue::{HostTimeline, PassResult, PipelineStats, Queue, QueueKind, QueueRequest};
-pub use sparse::{PageBind, SparseAllocation, SparseBinds, TileBind};
-pub use texture::{Texture, TextureMemory};
+pub use queue::{HostTimeline, Queue};
+pub use sparse::{SparseAllocation, SparseBinds};
+pub use texture::Texture;
 pub use unsupported::{
-    COUNTER_METRICS, Checkpoint, CounterRange, CounterReport, DeviceFault, Diagnostics,
-    DiagnosticsReport, ExecutionSet, FaultAccess, FaultAddress, Generated, LowLatency,
-    MATRIX_ALIGN, MatrixConversion, MatrixFormat, MatrixLayout, QueueProgress, RayDispatchPipeline,
-    Sequence, SetKind, Swapchain, SwapchainFrame,
+    Diagnostics, ExecutionSet, LowLatency, RayDispatchPipeline, Swapchain, SwapchainFrame,
 };
 
 /// The most queues a device has, one per [`QueueKind`].

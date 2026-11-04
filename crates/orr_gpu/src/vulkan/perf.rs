@@ -7,36 +7,10 @@
 use std::time::Duration;
 
 use super::queue::Queue;
-use crate::{Error, TimelinePoint};
-
-/// The metrics a counter frame collects for every pass, in the order of
-/// [`CounterRange::values`].
-pub const COUNTER_METRICS: [&str; 6] = [
-    "gpu__time_duration.sum",
-    "sm__throughput.avg.pct_of_peak_sustained_elapsed",
-    "sm__warps_active.avg.pct_of_peak_sustained_active",
-    "l1tex__t_sector_hit_rate.pct",
-    "lts__t_sector_hit_rate.pct",
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed",
-];
+use crate::{CounterReport, Error, TimelinePoint};
 
 /// How long [`Queue::end_counter_frame`] waits for the frame's submits and their counters.
 const DECODE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// The counters of one counter frame: a range per pass, in submission order.
-#[derive(Clone, Debug, Default)]
-pub struct CounterReport {
-    pub chip: String,
-    pub ranges: Vec<CounterRange>,
-}
-
-/// One pass's counters.
-#[derive(Clone, Debug)]
-pub struct CounterRange {
-    pub name: String,
-    /// Values of [`COUNTER_METRICS`], in its order.
-    pub values: Vec<f64>,
-}
 
 impl Queue {
     /// Opens a counter frame on this queue: the passes of every list recorded for it from now
@@ -79,9 +53,7 @@ mod imp {
 
     use ash::vk;
 
-    use super::CounterReport;
-    use crate::Error;
-    use crate::vulkan::queue::QueueKind;
+    use crate::{CounterReport, Error, QueueKind};
 
     /// Never made: orr_gpu was built without the Nsight Perf SDK.
     pub(crate) enum Library {}
@@ -162,9 +134,7 @@ mod imp {
 
     use ash::vk::{self, Handle as _};
 
-    use super::{COUNTER_METRICS, CounterRange, CounterReport};
-    use crate::Error;
-    use crate::vulkan::queue::QueueKind;
+    use crate::{COUNTER_METRICS, CounterRange, CounterReport, Error, QueueKind};
 
     #[allow(
         non_camel_case_types,

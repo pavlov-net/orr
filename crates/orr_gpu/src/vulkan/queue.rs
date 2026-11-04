@@ -13,7 +13,7 @@ use super::debug::name_object;
 use super::device::{Device, Shared};
 use super::garbage::{After, MAX_TIMELINES};
 use super::swapchain::SwapchainFrame;
-use crate::{Error, TimelinePoint};
+use crate::{Error, PassResult, PipelineStats, QueueKind, TimelinePoint};
 
 /// Passes one command list can time.
 pub(super) const MAX_PASSES: u32 = 256;
@@ -25,48 +25,6 @@ pub(super) const SWAPCHAIN_WRITE_STAGES: vk::PipelineStageFlags2 =
             | vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT.as_raw()
             | vk::PipelineStageFlags2::ALL_TRANSFER.as_raw(),
     );
-
-/// Which queue. Each has one owner thread that submits it.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum QueueKind {
-    /// Graphics and compute, family 0; the render thread's. Always present.
-    Render,
-    /// A compute-family queue the render thread owns.
-    Compute,
-    /// A compute-family queue the loading thread owns.
-    Loading,
-    /// A transfer-family queue the loading thread owns.
-    Copy,
-    /// A second graphics queue the present thread owns.
-    Present,
-}
-
-impl QueueKind {
-    pub(super) const ALL: [QueueKind; MAX_TIMELINES] = [
-        QueueKind::Render,
-        QueueKind::Compute,
-        QueueKind::Loading,
-        QueueKind::Copy,
-        QueueKind::Present,
-    ];
-
-    pub(super) fn index(self) -> usize {
-        self as usize
-    }
-}
-
-/// The queues a device creates besides [`QueueKind::Render`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct QueueRequest {
-    /// [`QueueKind::Compute`].
-    pub render_compute: bool,
-    /// [`QueueKind::Loading`].
-    pub async_compute: bool,
-    /// [`QueueKind::Copy`].
-    pub copy: bool,
-    /// [`QueueKind::Present`].
-    pub present: bool,
-}
 
 /// A queue's timeline semaphore and the last value submitted to it.
 pub(super) struct Timeline {
@@ -115,27 +73,6 @@ pub struct Queue {
     /// Valid timestamp bits; 0 when the family has no timestamps.
     timestamp_mask: u64,
     pub(super) shared: Arc<Shared>,
-}
-
-/// Measurements of one pass between [`CommandList::begin_pass`] and
-/// [`CommandList::end_pass`].
-#[derive(Clone, Debug)]
-pub struct PassResult {
-    pub name: &'static str,
-    pub gpu_ms: f64,
-    /// Begin and end on the CPU clock; `None` without `Caps::calibrated_timestamps`.
-    pub cpu: Option<(Instant, Instant)>,
-    /// Shader invocations; `None` unless the pass asked for statistics.
-    pub stats: Option<PipelineStats>,
-}
-
-/// Shader invocation counts of a pass.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PipelineStats {
-    pub compute: u64,
-    pub task: u64,
-    pub mesh: u64,
-    pub pixel: u64,
 }
 
 impl Queue {

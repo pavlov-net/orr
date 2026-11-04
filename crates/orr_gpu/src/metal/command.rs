@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::sync::atomic::Ordering;
 
-use bytemuck::{Pod, Zeroable};
+use bytemuck::Pod;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
@@ -11,89 +11,20 @@ use objc2_metal::{
     MTLBuffer, MTLComputePipelineState, MTLDevice, MTLSize, MTLStages,
 };
 
-use super::memory::{Allocation, MemoryKind, malloc};
+use super::memory::{Allocation, malloc};
 use super::mesh::PendingPass;
 use super::pipeline::ComputePipeline;
 use super::queue::{Queue, TimestampRing};
 use super::texture::Texture;
 use super::unsupported::RayDispatchPipeline;
 use super::{lock, not_implemented};
-use crate::{Error, GpuAddress, GpuPtr, Hazards, Stages, TextureLayers, TextureRegion};
+use crate::{
+    DecompressRegion, DispatchArgs, Error, GpuPtr, Hazards, MemoryCopy, MemoryKind, Stages,
+    TextureCopy, TextureLayers,
+};
 
 /// Bytes of each block inline roots are copied into.
 const INLINE_BLOCK: u64 = 64 << 10;
-
-/// Indirect dispatch arguments: workgroup counts.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
-pub struct DispatchArgs {
-    pub x: u32,
-    pub y: u32,
-    pub z: u32,
-}
-
-/// Indirect mesh-draw arguments: task workgroup counts, or mesh workgroup counts for
-/// pipelines without a task stage.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
-pub struct MeshArgs {
-    pub x: u32,
-    pub y: u32,
-    pub z: u32,
-}
-
-/// One GDeflate region for [`CommandList::decompress`]: device addresses and byte counts.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
-pub struct DecompressRegion {
-    pub src: u64,
-    pub dst: u64,
-    pub compressed_bytes: u64,
-    pub decompressed_bytes: u64,
-}
-
-/// One region of [`CommandList::copy_indirect`]: device addresses and a byte count.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
-pub struct MemoryCopy {
-    pub src: u64,
-    pub dst: u64,
-    pub bytes: u64,
-}
-
-/// One region of [`CommandList::copy_to_texture_indirect`], laid out as the Vulkan
-/// backend's.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
-pub struct TextureCopy {
-    src: u64,
-    row_texels: u32,
-    image_rows: u32,
-    aspect: u32,
-    mip: u32,
-    base_layer: u32,
-    layers: u32,
-    offset: [u32; 3],
-    extent: [u32; 3],
-}
-
-impl TextureCopy {
-    /// Texels from `src`, whose rows start `row_texels` texels apart (0 packs them tightly),
-    /// into `region` of a color texture. The region's extent is not empty.
-    pub fn new(src: GpuAddress, region: &TextureRegion, row_texels: u32) -> Self {
-        Self {
-            src: src.0,
-            row_texels,
-            image_rows: 0,
-            aspect: 1,
-            mip: region.mip,
-            base_layer: region.base_layer,
-            layers: region.layers,
-            offset: region.offset,
-            extent: region.extent,
-        }
-    }
-}
 
 type ComputeEncoder = ProtocolObject<dyn MTL4ComputeCommandEncoder>;
 pub(super) type RenderEncoder = ProtocolObject<dyn MTL4RenderCommandEncoder>;
