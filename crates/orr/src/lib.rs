@@ -42,7 +42,6 @@ pub use orr_lighting::{
     MediaSettings, ParticleDraw, ParticleLighting, PathEntry, ReferenceSettings,
     SceneLightingSettings, ThinLens, ViewLighting, WorldCacheSettings,
 };
-#[cfg(windows)]
 pub use orr_output::DisplayWatch;
 pub use orr_output::{self, Error as OutputError};
 pub use orr_output::{

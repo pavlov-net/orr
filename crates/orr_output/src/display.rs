@@ -1,7 +1,6 @@
-use std::sync::{Arc, Mutex, PoisonError};
-
 use orr_color::{PQ_MAX_NITS, RgbPrimaries};
 use orr_scene::orr_gpu::{HdrMetadata, OutputFormat, PresentMode};
+use orr_window::DisplayInfo;
 
 /// GT7's SDR calibration: SDR paper white and peak, and the default HDR paper white.
 const SDR_WHITE_NITS: f32 = 250.0;
@@ -36,55 +35,6 @@ impl Default for DisplayRequest {
             peak_nits: None,
             black_nits: None,
         }
-    }
-}
-
-/// What the OS reports for the window's monitor. With HDR on, the luminance fields are the
-/// display's default HDR color profile (the Windows HDR Calibration app writes one), else
-/// EDID; the consumer's request overrides them.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct DisplayInfo {
-    pub os_hdr_on: Option<bool>,
-    pub max_nits: Option<f32>,
-    pub max_full_frame_nits: Option<f32>,
-    pub min_nits: Option<f32>,
-    pub sdr_white_nits: Option<f32>,
-    pub refresh_hz: Option<f32>,
-    /// Red, green, blue and white, CIE 1931 xy.
-    pub primaries_xy: Option<[[f32; 2]; 4]>,
-}
-
-/// The latest `DisplayInfo` and a count that rises each time it changes. Clones share one
-/// value; any thread may read or write it.
-#[derive(Clone, Debug)]
-pub struct DisplayFeed(Arc<Mutex<(u64, DisplayInfo)>>);
-
-impl DisplayFeed {
-    pub fn new(info: DisplayInfo) -> Self {
-        Self(Arc::new(Mutex::new((0, info))))
-    }
-
-    /// For a window whose OS report is unknown: Windows lists PQ with HDR on or off, and PQ on
-    /// an SDR desktop looks dim and washed out, so it resolves to SDR.
-    #[cfg(windows)]
-    pub(crate) fn hdr_off() -> Self {
-        Self::new(DisplayInfo {
-            os_hdr_on: Some(false),
-            ..DisplayInfo::default()
-        })
-    }
-
-    /// Stores `info`, raising the count if it differs from the current value.
-    pub fn set(&self, info: DisplayInfo) {
-        let mut latest = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if latest.1 != info {
-            *latest = (latest.0 + 1, info);
-        }
-    }
-
-    /// The change count and the current value.
-    pub fn latest(&self) -> (u64, DisplayInfo) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

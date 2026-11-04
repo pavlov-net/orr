@@ -2297,11 +2297,11 @@ dependencies = [
  "orr_math",
  "orr_scene",
  "orr_shaders",
+ "orr_window",
  "png 0.18.1",
  "raw-window-handle",
  "thiserror 2.0.21",
  "windows",
- "windows-core",
 ]
 
 [[package]]
@@ -2351,6 +2351,18 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "orr_window"
+version = "0.0.1"
+dependencies = [
+ "log",
+ "orr_color",
+ "raw-window-handle",
+ "thiserror 2.0.21",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]

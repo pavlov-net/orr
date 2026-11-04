@@ -55,7 +55,6 @@ pub struct Display {
     feed: Option<DisplayFeed>,
     /// What the last `begin_frame` logged.
     logged: Option<(Option<bool>, ResolvedDisplay)>,
-    #[cfg(windows)]
     _watch: Option<crate::DisplayWatch>,
     slots: Vec<Slot>,
     begun: Option<Begun>,
@@ -416,22 +415,22 @@ impl Display {
         };
         #[cfg(all(windows, feature = "pcl-stats"))]
         let pcl_stats = latency.as_ref().map(crate::pcl_stats::Session::start);
-        #[cfg(windows)]
-        let (watch, feed) = match crate::DisplayWatch::new(window) {
+        #[cfg(all(windows, feature = "pcl-stats"))]
+        let watched = crate::DisplayWatch::with_message_hook(window, crate::pcl_stats::on_message);
+        #[cfg(not(all(windows, feature = "pcl-stats")))]
+        let watched = crate::DisplayWatch::new(window);
+        let (watch, feed) = match watched {
             Ok((watch, feed)) => (Some(watch), Some(feed)),
             Err(e) => {
                 log::warn!("not watching the OS's display state, so presenting SDR: {e}");
                 (None, Some(DisplayFeed::hdr_off()))
             }
         };
-        #[cfg(not(windows))]
-        let feed = None;
         Ok(Self {
             window: handle.hwnd.get(),
             request: *request,
             feed,
             logged: None,
-            #[cfg(windows)]
             _watch: watch,
             slots: (0..n)
                 .map(|_| Slot {
