@@ -103,3 +103,12 @@ cargo run -p examples --example viewer
 The other programs in `examples/` show one feature each: try `sky`, `dielectrics` for glass,
 `skinned` for animated characters, and `dense-vegetation` for a large scene. When you're ready to
 read code, start with those examples and the `orr` crate.
+
+## Contributing
+
+Install the pre-commit hook, which runs fmt, clippy and typos:
+
+```sh
+cargo install --locked prek typos-cli
+prek install
+```
