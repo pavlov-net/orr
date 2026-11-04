@@ -113,15 +113,15 @@ impl Garbage {
         self.pending.push((after, release));
     }
 
-    /// Runs every release whose values `completed` has reached.
-    pub(super) fn collect(&mut self, completed: &[u64; MAX_TIMELINES]) {
+    /// Takes every release whose values `completed` has reached. The caller runs them after
+    /// unlocking the list, since a release may defer releases of its own.
+    #[must_use]
+    pub(super) fn take_done(&mut self, completed: &[u64; MAX_TIMELINES]) -> Vec<Release> {
         let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending)
             .into_iter()
             .partition(|(after, _)| after.iter().zip(completed).all(|(a, c)| c >= a));
         self.pending = keep;
-        for (_, release) in done {
-            release();
-        }
+        done.into_iter().map(|(_, release)| release).collect()
     }
 }
 

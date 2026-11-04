@@ -1,4 +1,5 @@
 //! Raw Vulkan commands inside orr command lists, and device-creation hooks.
+#![cfg(not(target_vendor = "apple"))]
 
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};

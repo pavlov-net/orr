@@ -10,6 +10,7 @@ use objc2_metal::{
 };
 
 use super::memory::{Allocation, MemoryKind, malloc};
+use super::mesh::PendingPass;
 use super::pipeline::ComputePipeline;
 use super::queue::Queue;
 use super::texture::Texture;
@@ -93,13 +94,13 @@ impl TextureCopy {
 }
 
 type ComputeEncoder = ProtocolObject<dyn MTL4ComputeCommandEncoder>;
-type RenderEncoder = ProtocolObject<dyn MTL4RenderCommandEncoder>;
+pub(super) type RenderEncoder = ProtocolObject<dyn MTL4RenderCommandEncoder>;
 
-/// The encoder commands go into now.
+/// The encoder commands go into now. Render encoders open and close within
+/// `end_rendering`.
 pub(super) enum Encoder {
     None,
     Compute(Retained<ComputeEncoder>),
-    Render(Retained<RenderEncoder>),
 }
 
 /// What a list's commands use until its submit completes.
@@ -125,6 +126,8 @@ pub struct CommandList<'q> {
     /// Buffer 0 holds the root, 1 the texture view pool's base ID, 2 the sampler IDs.
     pub(super) table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
     pub(super) encoder: Encoder,
+    /// The render pass between `begin_rendering` and `end_rendering`.
+    pub(super) pass: Option<PendingPass>,
     /// Stages the next encoder waits for, and its stages that wait: a queue barrier.
     pending: Option<(MTLStages, MTLStages)>,
     inline: Vec<Allocation<u8>>,
@@ -173,6 +176,7 @@ impl<'q> CommandList<'q> {
             allocator,
             table,
             encoder: Encoder::None,
+            pass: None,
             pending: None,
             inline: Vec::new(),
             inline_used: INLINE_BLOCK,
@@ -199,7 +203,6 @@ impl<'q> CommandList<'q> {
         match std::mem::replace(&mut self.encoder, Encoder::None) {
             Encoder::None => {}
             Encoder::Compute(e) => e.endEncoding(),
-            Encoder::Render(e) => e.endEncoding(),
         }
     }
 
@@ -231,7 +234,7 @@ impl<'q> CommandList<'q> {
     }
 
     /// The device address of a copy of `bytes`, for an inline root.
-    fn inline_bytes(&mut self, bytes: &[u8]) -> u64 {
+    pub(super) fn inline_bytes(&mut self, bytes: &[u8]) -> u64 {
         let len = (bytes.len() as u64).next_multiple_of(16);
         if self.inline_used + len > INLINE_BLOCK {
             let block = malloc::<u8>(

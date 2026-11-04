@@ -510,3 +510,48 @@ fn primitive(
     p.setGeometryDescriptors(Some(&NSArray::from_retained_slice(&[g])));
     Retained::into_super(p)
 }
+
+/// [`Device::empty_tlas`]'s TLAS and its memory.
+pub(super) struct EmptyTlas {
+    pub(super) tlas: ClassicAs,
+    _storage: Allocation<u8>,
+}
+
+/// Builds a TLAS with one inactive instance on the render queue and waits for it.
+pub(super) fn build_empty_tlas(device: &Device) -> Result<EmptyTlas, Error> {
+    let mut instances =
+        device.gpu_malloc::<ClassicInstance>(MemoryKind::Upload, 1, "orr empty TLAS instance")?;
+    instances.as_mut_slice().unwrap()[0] = ClassicInstance::zeroed();
+    let desc = ClassicDesc {
+        kind: ClassicKind::Tlas,
+        flags: RtasFlags::FAST_TRACE,
+        geometry: ClassicGeometry::Instances {
+            records: instances.gpu().address(),
+            capacity: 1,
+        },
+    };
+    let sizes = device.classic_sizes(&desc);
+    let storage =
+        device.gpu_malloc::<u8>(MemoryKind::DeviceLocal, sizes.result_max, "orr empty TLAS")?;
+    let scratch = device.gpu_malloc::<u8>(
+        MemoryKind::DeviceLocal,
+        sizes.scratch.max(1),
+        "orr empty TLAS scratch",
+    )?;
+    let tlas = device.create_classic_as(ClassicKind::Tlas, sizes.result_max, &storage, 0)?;
+    let queue = device
+        .queue(crate::QueueKind::Render)
+        .expect("the render queue always exists");
+    let mut list = queue.command_list()?;
+    list.build_classic(&ClassicBuild {
+        desc: &desc,
+        dst: &tlas,
+        scratch: scratch.gpu().address(),
+    });
+    let point = queue.submit(vec![list], &[])?;
+    queue.wait(point, std::time::Duration::from_secs(10))?;
+    Ok(EmptyTlas {
+        tlas,
+        _storage: storage,
+    })
+}

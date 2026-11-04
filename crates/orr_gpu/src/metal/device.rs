@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use objc2::runtime::ProtocolObject;
@@ -12,6 +12,7 @@ use objc2_metal::{
     MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor, MTLSharedEvent,
 };
 
+use super::accel::{EmptyTlas, build_empty_tlas};
 use super::heap::Bindings;
 use super::queue::{Queue, QueueKind, QueueRequest};
 use super::unsupported::Diagnostics;
@@ -108,7 +109,10 @@ impl Shared {
 
     pub(super) fn collect(&self) {
         let completed = std::array::from_fn(|i| self.timelines[i].completed());
-        lock(&self.garbage).collect(&completed);
+        let done = lock(&self.garbage).take_done(&completed);
+        for release in done {
+            release();
+        }
     }
 
     /// Makes the allocations added or removed since the last commit resident for the next
@@ -128,6 +132,8 @@ impl Shared {
 pub struct Device {
     pub(super) shared: Arc<Shared>,
     queues: Arc<[Option<Queue>; MAX_TIMELINES]>,
+    /// Built in [`Device::new`]; outside `Shared`, since it holds the shared state itself.
+    empty_tlas: Arc<OnceLock<EmptyTlas>>,
 }
 
 impl PartialEq for Device {
@@ -188,10 +194,14 @@ impl Device {
                 *slot = Some(Queue::new(&shared, kind)?);
             }
         }
-        Ok(Device {
+        let device = Device {
             shared,
             queues: Arc::new(queues),
-        })
+            empty_tlas: Arc::default(),
+        };
+        let empty = build_empty_tlas(&device)?;
+        let _ = device.empty_tlas.set(empty);
+        Ok(device)
     }
 
     pub fn caps(&self) -> &Caps {
@@ -220,9 +230,14 @@ impl Device {
         Ok(())
     }
 
-    /// A TLAS with no instances.
+    /// A TLAS with one inactive instance: every ray misses it. For kernels with nothing to
+    /// trace; `Tlas(0)` is never traced.
     pub fn empty_tlas(&self) -> Tlas {
-        super::not_implemented("Device::empty_tlas")
+        self.empty_tlas
+            .get()
+            .expect("built in Device::new")
+            .tlas
+            .tlas()
     }
 
     /// Messages from Metal's validation; the backend does not collect them yet.
