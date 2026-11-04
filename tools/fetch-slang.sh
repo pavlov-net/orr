@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fetches the pinned third-party tools into .tools/ (ignored by git):
-#   slang-2026.21/   Slang release for the host, checked against its sha256
+#   slang-2026.21/   Slang release for the host (Linux, Windows or Apple silicon macOS),
+#                    checked against its sha256
 #   openpbr-bsdf/    adobe/openpbr-bsdf at a pinned commit
 #   glm/             GLM 1.0.1 at its tag commit
 #   display/gt7/     Polyphony Digital's GT7 tone-mapping sample (MIT), checked against its
@@ -58,6 +59,13 @@ case "$(uname -s)" in
         asset=slang-$slang_version-linux-x86_64-glibc-2.28.tar.gz
         sum=7b8800e7115668bfb073456ada3b20fa40718d7be41e7beec7c46c31351ba569 ;;
       *) echo "unknown SLANG_ASSET '$SLANG_ASSET' (default or glibc-2.28)" >&2; exit 1 ;;
+    esac ;;
+  Darwin)
+    case "$(uname -m)" in
+      arm64)
+        asset=slang-$slang_version-macos-aarch64.tar.gz
+        sum=c3d3c959ba3e0c8fdb6c2a5cf6a471ed097ed19c41820af9fb21625779794fb2 ;;
+      *) echo "unsupported macOS architecture $(uname -m) (Apple silicon only)" >&2; exit 1 ;;
     esac ;;
   MINGW*|MSYS*|CYGWIN*)
     asset=slang-$slang_version-windows-x86_64.zip

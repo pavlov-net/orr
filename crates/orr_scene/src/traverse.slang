@@ -17,6 +17,7 @@
 // `split` counts them and `place` gives them their jobs and CLAS ranges.
 #include "orr_root.h"
 import orr_shaders.abi;
+import orr_shaders.atomic;
 import orr_shaders.math;
 import orr_shaders.trace;
 import orr_pack.mesh;
@@ -90,8 +91,8 @@ void gather_cluster(CutGpu* cut, SlotCutGpu* c, uint work, uint mesh_cluster)
     cut.entries[e] = uint2(work, mesh_cluster);
     uint2 h = cluster_hash(mesh_cluster);
     InterlockedAdd(c.rt_count, 1);
-    InterlockedAdd(c.rt_hash.x, h.x);
-    InterlockedAdd(c.rt_hash.y, h.y);
+    atomic_add_at(c.rt_hash, 0, h.x);
+    atomic_add_at(c.rt_hash, 1, h.y);
 }
 
 // Whether `mesh` is an edit that holds what `sphere` covers at level 0.

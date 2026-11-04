@@ -9,6 +9,7 @@
 // skins its clusters whether or not a view shows it; one inside `rt_range` is traced.
 #include "orr_root.h"
 import orr_shaders.abi;
+import orr_shaders.atomic;
 import orr_shaders.math;
 import orr_shaders.packing;
 import orr_pack.mesh;
@@ -277,12 +278,12 @@ void skin(uint group: SV_GroupID, uint t: SV_GroupThreadID)
         k.boxes[6 * c + j] = unordered(box_lo[j]);
         k.boxes[6 * c + 3 + j] = unordered(box_hi[j]);
     }
-    InterlockedMin(st.lo.x, box_lo[0]);
-    InterlockedMin(st.lo.y, box_lo[1]);
-    InterlockedMin(st.lo.z, box_lo[2]);
-    InterlockedMax(st.hi.x, box_hi[0]);
-    InterlockedMax(st.hi.y, box_hi[1]);
-    InterlockedMax(st.hi.z, box_hi[2]);
+    atomic_min_at(st.lo, 0, box_lo[0]);
+    atomic_min_at(st.lo, 1, box_lo[1]);
+    atomic_min_at(st.lo, 2, box_lo[2]);
+    atomic_max_at(st.hi, 0, box_hi[0]);
+    atomic_max_at(st.hi, 1, box_hi[1]);
+    atomic_max_at(st.hi, 2, box_hi[2]);
     if (f.traced == 0)
         return;
     Instantiate r;

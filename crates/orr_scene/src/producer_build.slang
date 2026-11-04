@@ -9,6 +9,7 @@
 // entry, so work follows the emitted counts.
 #include "orr_root.h"
 import orr_shaders.abi;
+import orr_shaders.atomic;
 import orr_shaders.math;
 import orr_scene.producer;
 import orr_gpu.rtas;
@@ -116,12 +117,12 @@ void begin(uint t: SV_GroupThreadID)
 
 void grow_bounds(ProducerStateGpu* st, float3 lo, float3 hi)
 {
-    InterlockedMin(st.lo.x, ordered(lo.x));
-    InterlockedMin(st.lo.y, ordered(lo.y));
-    InterlockedMin(st.lo.z, ordered(lo.z));
-    InterlockedMax(st.hi.x, ordered(hi.x));
-    InterlockedMax(st.hi.y, ordered(hi.y));
-    InterlockedMax(st.hi.z, ordered(hi.z));
+    atomic_min_at(st.lo, 0, ordered(lo.x));
+    atomic_min_at(st.lo, 1, ordered(lo.y));
+    atomic_min_at(st.lo, 2, ordered(lo.z));
+    atomic_max_at(st.hi, 0, ordered(hi.x));
+    atomic_max_at(st.hi, 1, ordered(hi.y));
+    atomic_max_at(st.hi, 2, ordered(hi.z));
 }
 
 // The ring of tube vertices around `center` at right angles to the unit `tangent`.
