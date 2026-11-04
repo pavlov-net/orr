@@ -16,6 +16,7 @@ use super::accel::{EmptyTlas, build_empty_tlas};
 use super::cache::PipelineCache;
 use super::cluster::{self, Kernels, Objects, PtlasCheck, StructureIds};
 use super::heap::Bindings;
+use super::memory::MemoryUsage;
 use super::queue::{PassResult, Queue, QueueKind, QueueRequest, TimestampRing};
 use super::unsupported::Diagnostics;
 use super::{Buffers, Garbage, MAX_TIMELINES, Obj, Release, Timeline, lock};
@@ -86,6 +87,10 @@ pub(super) struct Shared {
     pub(super) host_timelines: Mutex<Vec<Obj<ProtocolObject<dyn MTLSharedEvent>>>>,
     pub(super) garbage: Mutex<Garbage>,
     pub(super) buffers: Mutex<Buffers>,
+    /// Live `gpu_malloc` memory by [`MemoryKind`](super::MemoryKind).
+    pub(super) usage: Mutex<[MemoryUsage; 3]>,
+    /// Buffers `gpu_malloc` has created so far.
+    pub(super) device_allocations: AtomicU64,
     /// Pass results by the point of their submit, oldest first.
     pub(super) results: Mutex<VecDeque<(TimelinePoint, Vec<PassResult>)>>,
     pub(super) timestamps: TimestampRing,
@@ -130,11 +135,18 @@ impl Shared {
         std::array::from_fn(|i| self.timelines[i].submitted.load(Ordering::Acquire))
     }
 
+    /// Runs the releases whose points have completed, and those they queue in turn, such as
+    /// a finished list's allocations, which free once what was submitted when they dropped has.
     pub(super) fn collect(&self) {
         let completed = std::array::from_fn(|i| self.timelines[i].completed());
-        let done = lock(&self.garbage).take_done(&completed);
-        for release in done {
-            release();
+        loop {
+            let done = lock(&self.garbage).take_done(&completed);
+            if done.is_empty() {
+                break;
+            }
+            for release in done {
+                release();
+            }
         }
     }
 
@@ -221,6 +233,8 @@ impl Device {
             host_timelines: Mutex::default(),
             garbage: Mutex::default(),
             buffers: Mutex::default(),
+            usage: Mutex::default(),
+            device_allocations: AtomicU64::new(0),
             results: Mutex::default(),
             timestamps,
             objects: Mutex::default(),
@@ -341,7 +355,8 @@ fn caps(device: &ProtocolObject<dyn MTLDevice>, desc: &DeviceDesc<'_>) -> Caps {
         device_address_commands: false,
         indirect_copy: false,
         unified_image_layouts: true,
-        memory_budget: false,
+        // The working set Metal recommends, against what the device has allocated.
+        memory_budget: true,
         memory_priority: false,
         shader_abort: false,
         device_fault: false,

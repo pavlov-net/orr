@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use bytemuck::Pod;
 use objc2::runtime::ProtocolObject;
@@ -61,6 +62,7 @@ impl std::error::Error for AllocError {}
 
 /// The Metal objects behind an allocation.
 pub(super) struct RawBuffer {
+    pub(super) kind: MemoryKind,
     pub(super) buffer: Obj<Buffer>,
     /// The placement heap of a DeviceLocal allocation, which textures can be placed in.
     pub(super) heap: Option<Obj<ProtocolObject<dyn MTLHeap>>>,
@@ -159,6 +161,11 @@ fn release_buffer(shared: &Shared, start: u64, raw: RawBuffer) {
             .removeAllocation(ProtocolObject::from_ref(&*raw.buffer)),
     }
     r.dirty = true;
+    drop(r);
+    let mut usage = lock(&shared.usage);
+    let u = &mut usage[raw.kind.index()];
+    u.bytes -= raw.buffer.length() as u64;
+    u.allocations -= 1;
 }
 
 /// Memory use per [`MemoryKind`] and per heap.
@@ -176,8 +183,7 @@ impl MemoryReport {
         self.kinds[kind.index()]
     }
 
-    /// The largest share of its OS budget a device-local heap uses; `None` without budgets,
-    /// as on Metal.
+    /// The largest share of its OS budget a device-local heap uses; `None` without budgets.
     pub fn pressure(&self) -> Option<f64> {
         self.heaps
             .iter()
@@ -242,12 +248,23 @@ impl Device {
         );
     }
 
-    /// Memory use. Metal reports no budgets; the per-kind totals are not tracked yet.
+    /// Memory use: live `gpu_malloc` memory per kind, and memory as one heap, unified, with
+    /// the working set Metal recommends as its budget and what the device has allocated as
+    /// its usage.
     pub fn memory_report(&self) -> MemoryReport {
+        let s = &self.shared;
+        let kinds = *lock(&s.usage);
+        let budget = s.device.recommendedMaxWorkingSetSize();
         MemoryReport {
-            kinds: [MemoryUsage::default(); 3],
-            heaps: Vec::new(),
-            device_allocations: 0,
+            kinds,
+            heaps: vec![HeapReport {
+                size: budget,
+                device_local: true,
+                block_bytes: kinds.iter().map(|k| k.bytes).sum(),
+                budget: Some(budget),
+                usage: Some(s.device.currentAllocatedSize() as u64),
+            }],
+            device_allocations: s.device_allocations.load(Ordering::Relaxed),
         }
     }
 
@@ -333,6 +350,7 @@ impl Shared {
                     .ok_or_else(no_memory)?;
                 buffer.setLabel(Some(&label));
                 RawBuffer {
+                    kind,
                     buffer: Obj(buffer),
                     heap: None,
                 }
@@ -361,6 +379,7 @@ impl Shared {
                         .ok_or_else(no_memory)?;
                 buffer.setLabel(Some(&label));
                 RawBuffer {
+                    kind,
                     buffer: Obj(buffer),
                     heap: Some(Obj(heap)),
                 }
@@ -376,6 +395,11 @@ impl Shared {
             r.dirty = true;
         }
         lock(&self.buffers).insert(raw.buffer.gpuAddress(), size, raw.buffer.clone());
+        let mut usage = lock(&self.usage);
+        let u = &mut usage[kind.index()];
+        u.bytes += size;
+        u.allocations += 1;
+        self.device_allocations.fetch_add(1, Ordering::Relaxed);
         Ok(raw)
     }
 }
