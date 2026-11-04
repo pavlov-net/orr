@@ -66,7 +66,13 @@ void particle_mesh(
 }
 
 [shader("pixel")]
+// Slang emits an `int` primitive ID as `ushort` for Metal, which Metal rejects, and passes a
+// `uint` one to a generic call by pointer in SPIR-V, which fails validation.
+#if defined(ORR_METAL)
+float4 particle_pixel(Vertex v, uint primitive: SV_PrimitiveID) : SV_Target0
+#else
 float4 particle_pixel(Vertex v, int primitive: SV_PrimitiveID) : SV_Target0
+#endif
 {
     ORR_OMM(particle_pixel);
     return particle_fragment<StandardSurface, StockFog>(root.lighting, root.raster, v.visible, uint(primitive), v.position.xy, root.anisotropy);

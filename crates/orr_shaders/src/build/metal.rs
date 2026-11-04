@@ -10,8 +10,15 @@ use std::process::Command;
 use super::model::{Model, Ty, text};
 use super::sys;
 
-/// Options of the Metal session; include roots follow.
-pub(super) const OPTIONS: &[&str] = &["-target", "metal", "-matrix-layout-row-major"];
+/// Options of the Metal session; include roots follow. `ORR_METAL` (tested with `#if defined`) lets a kernel work around
+/// what a target's Slang backend gets wrong where `__target_switch` cannot reach, as in entry
+/// signatures.
+pub(super) const OPTIONS: &[&str] = &[
+    "-target",
+    "metal",
+    "-matrix-layout-row-major",
+    "-DORR_METAL=1",
+];
 
 /// Every difference between the Metal layout of the root and its pointees and the SPIR-V
 /// layout in `model`. `layout` must be the live Metal program layout.
@@ -174,17 +181,17 @@ pub(super) fn msl_issues(msl: &str) -> Vec<String> {
                 "MSL line {line_no}: a 64-bit fetch atomic, which Metal lacks (use orr_shaders.atomic)"
             ));
         }
-        if let Some(params) = entry_parameters(t) {
-            for p in params {
-                let builtin = ["mesh_grid_properties", "metal::mesh<"]
-                    .iter()
-                    .any(|b| p.trim_start().starts_with(b));
-                if !p.contains("[[") && !builtin {
-                    out.push(format!(
-                        "MSL line {line_no}: entry parameter `{}` has no binding",
-                        p.trim()
-                    ));
-                }
+    }
+    for (line_no, signature) in entry_signatures(msl) {
+        for p in entry_parameters(&signature).unwrap_or_default() {
+            let builtin = ["mesh_grid_properties", "metal::mesh<"]
+                .iter()
+                .any(|b| p.trim_start().starts_with(b));
+            if !p.contains("[[") && !builtin {
+                out.push(format!(
+                    "MSL line {line_no}: entry parameter `{}` has no binding",
+                    p.trim()
+                ));
             }
         }
     }
@@ -218,24 +225,40 @@ pub(super) fn without_raygen(source: &str) -> String {
 
 /// The names of the entry functions `msl` declares. Slang renames some (`main` becomes
 /// `main_0`), so these are the names a Metal library knows them by.
-pub(super) fn entry_names(msl: &str) -> Vec<&str> {
-    msl.lines()
-        .filter(|l| ENTRY_STAGES.iter().any(|s| l.starts_with(s)))
-        .filter_map(|l| {
-            let name = l[..l.find('(')?].split_whitespace().last()?;
-            Some(name)
-        })
+pub(super) fn entry_names(msl: &str) -> Vec<String> {
+    entry_signatures(msl)
+        .into_iter()
+        .filter_map(|(_, s)| Some(s[..s.find('(')?].split_whitespace().last()?.to_owned()))
         .collect()
 }
 
 /// The Metal function name of the entry `name` among `declared`.
-pub(super) fn metal_name<'a>(name: &str, declared: &[&'a str]) -> Option<&'a str> {
+pub(super) fn metal_name<'a>(name: &str, declared: &'a [String]) -> Option<&'a str> {
     let renamed = format!("{name}_0");
     declared
         .iter()
         .find(|d| **d == name)
         .or_else(|| declared.iter().find(|d| **d == renamed))
-        .copied()
+        .map(String::as_str)
+}
+
+/// Each entry function's signature, from its stage attribute on, with its 1-based line.
+/// Attributes such as `[[early_fragment_tests]]` can put the stage on a line of its own,
+/// before the signature.
+fn entry_signatures(msl: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = msl.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if !ENTRY_STAGES.iter().any(|s| line.starts_with(s)) {
+            continue;
+        }
+        if line.contains('(') {
+            out.push((i + 1, (*line).to_owned()));
+        } else if let Some(next) = lines.get(i + 1) {
+            out.push((i + 2, format!("{line} {next}")));
+        }
+    }
+    out
 }
 
 /// Compiles the MSL at `metal` into the library `out` with Xcode's Metal compiler. The error

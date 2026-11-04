@@ -130,6 +130,15 @@ pub struct Device {
     queues: Arc<[Option<Queue>; MAX_TIMELINES]>,
 }
 
+impl PartialEq for Device {
+    /// Whether both handles are clones of one device.
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+}
+
+impl Eq for Device {}
+
 impl Device {
     /// The system's default GPU, which must support Metal 4.
     pub fn new(desc: &DeviceDesc<'_>) -> Result<Device, Error> {
