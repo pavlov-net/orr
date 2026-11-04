@@ -635,33 +635,43 @@ impl Imported<'_> {
         Ok(())
     }
 
-    /// Registers the material of `prim`.
-    fn material(&mut self, prim: &gltf::Primitive<'_>) -> Result<()> {
+    /// Registers the material of `prim` of glTF mesh `mesh`; the primitive must hold the uv
+    /// sets it reads.
+    fn material(&mut self, mesh: usize, prim: &gltf::Primitive<'_>) -> Result<()> {
         let index = material_index(prim);
-        if self.materials.contains_key(&index) {
-            return Ok(());
-        }
-        let mat = prim.material();
-        let t = material::textures(&self.src.doc, &self.src.json, &mat)
-            .map_err(|m| self.fail(format!("material {index}: {m}")))?;
-        let mut m = material::material(&self.src.json, &mat);
-        patch::apply_matching(
-            &self.settings.material_overrides,
-            mat.name().unwrap_or_default(),
-            &mut m,
-            MaterialPatch::apply,
-        );
-        self.materials.insert(
-            index,
-            SceneMaterial {
-                suffix: match index {
-                    usize::MAX => "default".to_string(),
-                    i => i.to_string(),
+        if !self.materials.contains_key(&index) {
+            let mat = prim.material();
+            let t = material::textures(&self.src.doc, &self.src.json, &mat)
+                .map_err(|m| self.fail(format!("material {index}: {m}")))?;
+            let mut m = material::material(&self.src.json, &mat);
+            patch::apply_matching(
+                &self.settings.material_overrides,
+                mat.name().unwrap_or_default(),
+                &mut m,
+                MaterialPatch::apply,
+            );
+            self.materials.insert(
+                index,
+                SceneMaterial {
+                    suffix: match index {
+                        usize::MAX => "default".to_string(),
+                        i => i.to_string(),
+                    },
+                    material: m,
+                    textures: t,
                 },
-                material: m,
-                textures: t,
-            },
-        );
+            );
+        }
+        let reads_uv1 = self.materials[&index]
+            .textures
+            .refs()
+            .any(|r| r.uv_set == 1);
+        if reads_uv1 && prim.get(&Semantic::TexCoords(1)).is_none() {
+            return Err(self.fail(format!(
+                "mesh {mesh} primitive {}: its material reads TEXCOORD_1, which the primitive does not have",
+                prim.index()
+            )));
+        }
         Ok(())
     }
 
@@ -731,7 +741,7 @@ impl Imported<'_> {
         let mut views = Vec::new();
         let mut groups: BTreeMap<usize, u64> = BTreeMap::new();
         for prim in m.primitives() {
-            self.material(&prim)?;
+            self.material(mesh, &prim)?;
             primitive_views(&prim, &mut views);
             for t in prim.morph_targets() {
                 for a in [t.positions(), t.normals(), t.tangents()]
@@ -1113,18 +1123,7 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
         };
         let weights = node.weights().or(mesh.weights()).unwrap_or_default();
         for prim in mesh.primitives() {
-            b.material(&prim)?;
-            let reads_uv1 = b.materials[&material_index(&prim)]
-                .textures
-                .refs()
-                .any(|r| r.uv_set == 1);
-            if reads_uv1 && prim.get(&Semantic::TexCoords(1)).is_none() {
-                return Err(fail(format!(
-                    "mesh {} primitive {}: its material reads TEXCOORD_1, which the primitive does not have",
-                    mesh.index(),
-                    prim.index()
-                )));
-            }
+            b.material(mesh.index(), &prim)?;
             append_primitive(
                 &data,
                 &prim,

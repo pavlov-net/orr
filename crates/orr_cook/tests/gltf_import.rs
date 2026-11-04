@@ -1364,6 +1364,45 @@ fn a_texture_on_texcoord_1_binds_uv_set_1_and_the_mesh_stores_it() {
     }
 }
 
+/// A primitive without the uv set its material reads fails in either layout, even when
+/// another primitive of the mesh has it.
+#[test]
+fn a_primitive_needs_the_uv_set_its_material_reads() {
+    let d = dir("gltf-uv1-primitive");
+    let mut g = Glb::default();
+    let pos = [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+    let pa = g.floats(&pos, "VEC3");
+    let na = g.floats(&[[0.0f32, 0.0, 1.0]; 3], "VEC3");
+    let t0 = g.floats(&[[0.0f32; 2]; 3], "VEC2");
+    let t1 = g.floats(&[[0.5f32; 2]; 3], "VEC2");
+    let image = g.image(&png(16, 16, |x, y| {
+        [(x * 16) as u8, (y * 16) as u8, 0, 255]
+    }));
+    let path = d.join("uv1.glb");
+    g.write(
+        &path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+"meshes":[{{"primitives":[
+{{"attributes":{{"POSITION":{pa},"NORMAL":{na},"TEXCOORD_0":{t0},"TEXCOORD_1":{t1}}},"material":0}},
+{{"attributes":{{"POSITION":{pa},"NORMAL":{na},"TEXCOORD_0":{t0}}},"material":1}}]}}],
+"materials":[{{}},{{"pbrMetallicRoughness":{{"baseColorTexture":{{"index":0,"texCoord":1}}}}}}],
+"textures":[{{"source":0}}],
+"images":[{{"bufferView":{image},"mimeType":"image/png"}}]"#
+        ),
+    );
+    for layout in [GltfLayout::Scene, GltfLayout::Meshes] {
+        let settings = GltfSettings {
+            layout,
+            ..GltfSettings::default()
+        };
+        let Err(e) = cook(&path, settings) else {
+            panic!("{layout:?} cooked a primitive without TEXCOORD_1");
+        };
+        assert!(e.to_string().contains("TEXCOORD_1"), "{layout:?}: {e}");
+    }
+}
+
 /// A scene with a plain node and an instanced one: node `tree` carries
 /// `EXT_mesh_gpu_instancing` (required) and a translation of its own.
 fn instanced(path: &Path, instances: &[([f32; 3], [f32; 4], [f32; 3])]) {
