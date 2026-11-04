@@ -1447,13 +1447,13 @@ impl<'m, 's> Run<'m, 's> {
         Ok(())
     }
 
-    /// Completes the archives, then saves cookstates and trims the cache.
     fn remove_scratch(&self) {
         for dir in self.scratch.iter().flatten() {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
 
+    /// Completes the archives, then saves cookstates and trims the cache.
     fn finish(self) -> Result<Cooked> {
         let mut cooked = Cooked::default();
         self.remove_scratch();

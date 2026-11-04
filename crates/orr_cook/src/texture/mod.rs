@@ -263,17 +263,6 @@ fn split_by_default(_: BcLayout) -> bool {
     true
 }
 
-/// The mips of a stored `w` x `h` chain that fit `max_size`, and the size of the first.
-fn kept_mips(
-    mut mips: Vec<Vec<u8>>,
-    w: u32,
-    h: u32,
-    max_size: Option<u32>,
-) -> ([u32; 2], Vec<Vec<u8>>) {
-    let skip = skipped_mips(w, h, max_size);
-    (mip_size(w, h, skip), mips.split_off(skip as usize))
-}
-
 /// Mips a `w` x `h` texture keeps: down to 1x1 with `full_chain`, else down to the first
 /// that fits `max_size`.
 fn kept_mip_count(w: u32, h: u32, max_size: Option<u32>, full_chain: bool) -> u32 {
@@ -552,18 +541,18 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
     {
         if b.vk_format == encoding.vk_format() && (coverage.is_none() || !remakes) {
             let (w, h) = (b.w, b.h);
-            let size = mip_size(w, h, skipped_mips(w, h, s.max_size));
+            let skip = skipped_mips(w, h, s.max_size);
             let levels: Vec<Vec<Vec<u8>>> = src
                 .blocks
                 .take()
                 .expect("blocks")
                 .levels
                 .into_iter()
-                .map(|l| kept_mips(l, w, h, s.max_size).1)
+                .map(|mut l| l.split_off(skip as usize))
                 .collect();
             return Ok(layout(
                 encoding.vk_format(),
-                size,
+                mip_size(w, h, skip),
                 src.cube,
                 primaries,
                 coverage.map_or(f32::NAN, |c| c.1),

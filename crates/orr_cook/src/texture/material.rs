@@ -217,19 +217,15 @@ pub(crate) struct ImageFacts {
     pub(crate) animated: bool,
 }
 
-/// Decodes a 2D image: its only layer and the file's color facts.
-fn decode(bytes: &[u8]) -> Result<(Img, bool, Option<Primaries>), String> {
+/// Decodes a 2D image: its only layer.
+fn decode(bytes: &[u8]) -> Result<Img, String> {
     let Source {
-        mut layers,
-        cube,
-        srgb,
-        primaries,
-        ..
+        mut layers, cube, ..
     } = load::decode(bytes)?;
     if cube || layers.len() != 1 {
         return Err("not a 2D image".into());
     }
-    Ok((layers.remove(0), srgb, primaries))
+    Ok(layers.remove(0))
 }
 
 /// Facts of the images `used`, read in parallel. File images are read through the memo, and
@@ -682,12 +678,7 @@ impl<'a> Packer<'a> {
             let entry = (slot::METALNESS, metal_channel(m, &r));
             let alike = |a: &TexRef| a.samples_like(&r) && a.wrap == r.wrap;
             match packs.first_mut() {
-                Some((channels, refs)) if refs.first().is_none_or(alike) => {
-                    channels.push(entry);
-                    if refs.is_empty() {
-                        refs.push(r);
-                    }
-                }
+                Some((channels, refs)) if alike(&refs[0]) => channels.push(entry),
                 _ => packs.push((vec![entry], vec![r])),
             }
         }
@@ -1283,7 +1274,7 @@ impl TextureJob {
                     load::decode_layers(&mut src).map_err(&fail)?;
                     Ok(src.layers.remove(0))
                 }
-                None => decode(&images[i].bytes()?).map(|d| d.0).map_err(&fail),
+                None => decode(&images[i].bytes()?).map_err(&fail),
             })?;
             sources.insert(i, img.resized(self.size[0], self.size[1]));
         }
