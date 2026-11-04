@@ -9,6 +9,9 @@
 #   libdeflate-gdeflate/
 #                    NVIDIA/libdeflate's gdeflate branch at a pinned commit (MIT and
 #                    Apache-2.0): the GDeflate codec of orr_cook's `gdeflate` feature
+#   OpenSubdiv-3.8.0/
+#                    PixarAnimationStudios/OpenSubdiv v3.8.0 at its tag commit (Apache-2.0
+#                    modified): the Far library of orr_cook's `subd` feature
 # With ORR_VALIDATION_DATA=1 it also fetches the test-only validation data:
 #   precomputed_atmospheric_scattering/
 #                    ebruneton/precomputed_atmospheric_scattering at a pinned commit: ASTM G173
@@ -37,6 +40,7 @@ slang_version=2026.21
 openpbr_commit=c91aad1d1ce1693e803f039d7c92c2965c4eb013
 glm_commit=0af55ccecd98d4e5a8d1fad7de25ba429d60e863
 gdeflate_commit=8ba9502fb30d2bf728592d121f0d402e40c8cb05
+opensubdiv_commit=1d90921ea32b9dcae31d30b907cbacefc0c616bf
 sky_commit=34f14e745cff948f4ca3157d1b62a445ffa7286f
 d65_sum=e76f210bffff3d552ef7113025da5f325d5dfec200dd4b878b1a2f3a507032cb
 gt7_sum=94df7e7e310b9423ebb5aaaa29416f376ebbae66e0948fb259f8688314b29822
@@ -114,6 +118,8 @@ fetch_commit() {
 fetch_commit https://github.com/adobe/openpbr-bsdf "$openpbr_commit" "$tools/openpbr-bsdf"
 fetch_commit https://github.com/g-truc/glm "$glm_commit" "$tools/glm"
 fetch_commit https://github.com/NVIDIA/libdeflate "$gdeflate_commit" "$tools/libdeflate-gdeflate"
+fetch_commit https://github.com/PixarAnimationStudios/OpenSubdiv "$opensubdiv_commit" \
+  "$tools/OpenSubdiv-3.8.0"
 
 gt7="$tools/display/gt7/gt7_tone_mapping.cpp"
 if echo "$gt7_sum  $gt7" | sha256sum -c --quiet - 2>/dev/null; then
