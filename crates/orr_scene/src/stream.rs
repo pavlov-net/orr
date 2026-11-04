@@ -1438,7 +1438,7 @@ impl Streaming {
         let live = if !self.mounts.contains_key(&key.mount) {
             false
         } else if l.result.is_ok() && !placed {
-            self.residency.cancel(key);
+            self.residency.retry(key);
             false
         } else {
             self.residency.landed(key, l.result.is_ok(), frame)
