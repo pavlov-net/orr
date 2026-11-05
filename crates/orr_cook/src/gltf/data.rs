@@ -1,7 +1,9 @@
 //! A glTF document and the bytes of the buffer views a caller reads.
 //!
 //! The JSON is parsed first, and the extensions the cook implements itself are removed from
-//! `extensionsRequired`, so the `gltf` crate validates the rest of the document. Buffers stay
+//! `extensionsRequired`, so the `gltf` crate validates the rest of the document, but for two
+//! things it refuses that glTF allows: an accessor with no element source reads as zeros and
+//! a primitive without positions is left to the importer to skip. Buffers stay
 //! where they are: [`Data::load`] reads the byte ranges of the views a caller needs, and
 //! decodes views compressed with `EXT_meshopt_compression` or `KHR_meshopt_compression` with
 //! meshoptimizer's decoders and filters, so every view reads as if it were stored plain.
@@ -117,6 +119,44 @@ fn check_morph_weights(doc: &gltf::Document) -> Result<(), String> {
     Ok(())
 }
 
+/// Readies the images for the `gltf` crate, which panics on a buffer view's image without a
+/// `mimeType` and on an image with no source. Images are recognized by their bytes, so the
+/// former reads as any other; the latter has nothing to read.
+fn check_images(json: &mut Value) -> Result<(), String> {
+    let Some(Value::Array(images)) = json.get_mut("images") else {
+        return Ok(());
+    };
+    for (i, image) in images.iter_mut().enumerate() {
+        if image["bufferView"].is_null() {
+            if image["uri"].is_null() {
+                return Err(format!("image {i} has neither a uri nor a buffer view"));
+            }
+        } else if image["mimeType"].is_null() {
+            image["mimeType"] = "application/octet-stream".into();
+        }
+    }
+    Ok(())
+}
+
+/// Validates as `gltf::Document::from_json` does, less what the module documentation lists.
+fn validate(root: &gltf::json::Root) -> Result<(), String> {
+    use gltf::json::validation::{Error, Validate};
+    let mut errors = Vec::new();
+    root.validate(root, gltf::json::Path::new, &mut |path, error| {
+        let path = path();
+        let at = path.as_str();
+        let no_positions = at.ends_with(r#".attributes["POSITION"]"#);
+        let no_source = at.starts_with("accessors[") && at.ends_with(".bufferView");
+        if error != Error::Missing || !(no_positions || no_source) {
+            errors.push(format!("{path}: {error}"));
+        }
+    });
+    match errors.is_empty() {
+        true => Ok(()),
+        false => Err(errors.join("; ")),
+    }
+}
+
 /// Opens a `.gltf` or `.glb` file's bytes; buffer URIs resolve against `dir`.
 pub(super) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
     let (json_bytes, mut bin) = if bytes.starts_with(b"glTF") {
@@ -137,8 +177,10 @@ pub(super) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
             }
         }
     }
+    check_images(&mut json)?;
     let root: gltf::json::Root = serde_json::from_value(json.clone()).map_err(|e| e.to_string())?;
-    let doc = gltf::Document::from_json(root).map_err(|e| e.to_string())?;
+    validate(&root)?;
+    let doc = gltf::Document::from_json_without_validation(root);
     check_morph_weights(&doc)?;
     let mut buffers = Vec::new();
     for b in doc.buffers() {
