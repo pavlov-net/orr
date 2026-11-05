@@ -8,7 +8,10 @@
 //! A standalone material has no mesh, so each texture keeps its uv set (0 or 1) and transform
 //! in its slot; geometric properties name `st`, `UV0` or a `geompropdef` of a texcoord.
 //!
-//! A `namespace` qualifies the names of its scope: references within it and to the global
+//! An `xi:include` adds the children of the root of the document it names, read before the
+//! including document, so that the first of two like-named elements wins, as in the MaterialX
+//! library. Root attributes an included document leaves out come from the document including
+//! it. A `namespace` qualifies the names of its scope: references within it and to the global
 //! namespace need no qualifier, others name `namespace:element`, and so may the material.
 //!
 //! Not honored yet, and reported as warnings: a `backsurfaceshader` other than the
@@ -16,10 +19,10 @@
 //! tangent space.
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use roxmltree::{Document, Node as XmlNode};
+use roxmltree::{Document, Node as XmlNode, NodeId};
 
 use crate::import::{Scene, SceneMaterial};
 use crate::shading::{self, Input, Network, Node, through};
@@ -46,22 +49,41 @@ const NOT_NODES: &[&str] = &[
     "unittypedef",
 ];
 
+const XINCLUDE: &str = "http://www.w3.org/2001/XInclude";
+
+fn is_xinclude(e: &XmlNode<'_, '_>, name: &str) -> bool {
+    e.tag_name().namespace() == Some(XINCLUDE) && e.tag_name().name() == name
+}
+
 pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> Result<Scene> {
     let fail = |message: String| Error::Import {
         asset: asset.into(),
         message: format!("{}: {message}", path.display()),
     };
-    let (bytes, hash) = memo.read(path)?;
-    let files = vec![FileInput {
-        path: path.to_owned(),
-        hash,
-    }];
-    let text = String::from_utf8(bytes).map_err(|e| fail(e.to_string()))?;
-    let docs = [Doc {
-        doc: Document::parse(&text).map_err(|e| fail(e.to_string()))?,
-        dir: path.parent().unwrap_or(Path::new("")),
-        parent: None,
-    }];
+    let mut reader = Reader {
+        memo,
+        texts: Vec::new(),
+        order: Vec::new(),
+        open: Vec::new(),
+        seen: HashSet::new(),
+        files: Vec::new(),
+    };
+    reader.read(path, None).map_err(|e| match e {
+        Failure::Read(e) => e,
+        Failure::Document(m) => fail(m),
+    })?;
+    let docs = reader
+        .texts
+        .iter()
+        .map(|t| {
+            Ok(Doc {
+                doc: Document::parse(&t.text).map_err(|e| fail(e.to_string()))?,
+                dir: t.path.parent().unwrap_or(Path::new("")),
+                parent: t.parent,
+                fallbacks: &t.fallbacks,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut images = Vec::new();
     let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
     let mut load = |dir: &Path, file: &str| -> usize {
@@ -77,7 +99,7 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
             images.len() - 1
         })
     };
-    let graph = network(&docs, &[0], material, &mut load).map_err(fail)?;
+    let graph = network(&docs, &reader.order, material, &mut load).map_err(fail)?;
     let mapped = shading::map_per_slot(&graph.net, graph.surface, graph.displacement, &["st"])
         .map_err(|m| fail(format!("material {material}: {m}")))?;
     let mut warnings = graph.warnings;
@@ -92,9 +114,41 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
         images,
         skeletons: Vec::new(),
         instances: Vec::new(),
-        files,
+        files: reader.files,
         warnings,
     })
+}
+
+enum Failure {
+    Read(Error),
+    Document(String),
+}
+
+impl From<String> for Failure {
+    fn from(m: String) -> Self {
+        Self::Document(m)
+    }
+}
+
+/// One document's text.
+struct Text {
+    path: PathBuf,
+    /// Its entry in [`Reader::seen`].
+    key: PathBuf,
+    text: String,
+    /// The document that first included it.
+    parent: Option<usize>,
+    /// `xi:fallback` elements taking the place of includes that could not be read.
+    fallbacks: Vec<NodeId>,
+}
+
+/// An `xi:include` of a document.
+struct Include {
+    id: NodeId,
+    href: String,
+    fallback: Option<NodeId>,
+    /// The include whose fallback holds it, which it is read only in place of.
+    within: Option<usize>,
 }
 
 /// One parsed document.
@@ -102,6 +156,134 @@ struct Doc<'t> {
     doc: Document<'t>,
     dir: &'t Path,
     parent: Option<usize>,
+    fallbacks: &'t [NodeId],
+}
+
+/// Reads a document and all it includes.
+struct Reader<'a> {
+    memo: &'a Memo,
+    texts: Vec<Text>,
+    /// Indices of `texts`, each after those it includes.
+    order: Vec<usize>,
+    /// The chain of includes being read.
+    open: Vec<PathBuf>,
+    seen: HashSet<PathBuf>,
+    files: Vec<FileInput>,
+}
+
+impl Reader<'_> {
+    fn read(&mut self, path: &Path, parent: Option<usize>) -> std::result::Result<(), Failure> {
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+        if self.open.contains(&key) {
+            return Err(format!("{} includes itself in a cycle", path.display()).into());
+        }
+        if self.seen.contains(&key) {
+            return Ok(());
+        }
+        let (bytes, hash) = match self.memo.read(path) {
+            Ok(read) => read,
+            Err(e) => {
+                self.files.push(FileInput {
+                    path: path.to_owned(),
+                    hash: FileInput::ABSENT,
+                });
+                return Err(Failure::Read(e));
+            }
+        };
+        self.seen.insert(key.clone());
+        self.files.push(FileInput {
+            path: path.to_owned(),
+            hash,
+        });
+        let in_file = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+        let mut text = String::from_utf8(bytes).map_err(|e| in_file(&e))?;
+        let undeclared = matches!(
+            Document::parse(&text),
+            Err(roxmltree::Error::UnknownNamespace(prefix, _)) if prefix == "xi"
+        );
+        if undeclared && let Some(declared) = declare_xi(&text) {
+            text = declared;
+        }
+        let doc = Document::parse(&text).map_err(|e| in_file(&e))?;
+        let mut includes: Vec<Include> = Vec::new();
+        for e in doc.descendants().filter(|e| is_xinclude(e, "include")) {
+            let href = e
+                .attribute("href")
+                .ok_or_else(|| in_file(&"xi:include without an href"))?;
+            let outer = e.ancestors().skip(1).find(|a| is_xinclude(a, "include"));
+            includes.push(Include {
+                id: e.id(),
+                href: href.to_string(),
+                fallback: e
+                    .children()
+                    .find(|c| is_xinclude(c, "fallback"))
+                    .map(|f| f.id()),
+                within: outer.and_then(|o| includes.iter().position(|i| i.id == o.id())),
+            });
+        }
+        drop(doc);
+        let id = self.texts.len();
+        self.texts.push(Text {
+            path: path.to_owned(),
+            key: key.clone(),
+            text,
+            parent,
+            fallbacks: Vec::new(),
+        });
+        self.open.push(key);
+        let dir = path.parent().unwrap_or(Path::new(""));
+        let mut fell_back = vec![false; includes.len()];
+        let mut result = Ok(());
+        for (i, include) in includes.iter().enumerate() {
+            if include.within.is_some_and(|w| !fell_back[w]) {
+                continue;
+            }
+            let (texts, order) = (self.texts.len(), self.order.len());
+            match (
+                self.read(&dir.join(&include.href), Some(id)),
+                include.fallback,
+            ) {
+                (Err(Failure::Read(_)), Some(f)) => {
+                    // What the failed include read is not part of the document, though
+                    // another include may yet bring it in.
+                    self.order.truncate(order);
+                    for t in self.texts.drain(texts..) {
+                        self.seen.remove(&t.key);
+                    }
+                    self.texts[id].fallbacks.push(f);
+                    fell_back[i] = true;
+                }
+                (Err(e), _) => {
+                    result = Err(e);
+                    break;
+                }
+                (Ok(()), _) => {}
+            }
+        }
+        self.open.pop();
+        self.order.push(id);
+        result
+    }
+}
+
+/// `text` with the `xi` prefix declared on its root, which the specification's own snippets
+/// leave out.
+fn declare_xi(text: &str) -> Option<String> {
+    let mut rest = text.trim_start_matches('\u{feff}');
+    loop {
+        rest = rest.trim_start();
+        let end = if rest.starts_with("<?") {
+            "?>"
+        } else if rest.starts_with("<!--") {
+            "-->"
+        } else {
+            break;
+        };
+        rest = &rest[rest.find(end)? + end.len()..];
+    }
+    let name = rest.find(|c: char| c.is_whitespace() || c == '>' || c == '/')?;
+    let (head, tail) = text.split_at(text.len() - rest.len() + name);
+    Some(format!("{head} xmlns:xi=\"{XINCLUDE}\"{tail}"))
 }
 
 /// Attribute `attr` of `e` in document `d`, from its nearest scope, then the roots of the
@@ -167,7 +349,12 @@ fn network(
                 root.tag_name().name()
             ));
         }
-        for e in root.children().filter(XmlNode::is_element) {
+        let fallbacks = docs[d]
+            .fallbacks
+            .iter()
+            .filter_map(|&f| docs[d].doc.get_node(f))
+            .flat_map(|f| f.children());
+        for e in fallbacks.chain(root.children()).filter(XmlNode::is_element) {
             let name = e.attribute("name").unwrap_or_default();
             let full_name = qualified(inherited(docs, d, &e, "namespace"), name);
             match e.tag_name().name() {

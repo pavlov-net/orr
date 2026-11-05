@@ -634,7 +634,10 @@ impl<'m, 's> Run<'m, 's> {
         let unchanged = record
             .files
             .iter()
-            .all(|f| self.shared.memo.hash(&f.path).is_ok_and(|h| h == f.hash));
+            .all(|f| match self.shared.memo.hash(&f.path) {
+                Ok(h) => h == f.hash,
+                Err(_) => f.hash == Input::ABSENT,
+            });
         if !unchanged {
             return Ok(false);
         }

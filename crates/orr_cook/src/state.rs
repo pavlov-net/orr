@@ -157,6 +157,12 @@ pub(crate) struct Input {
     pub(crate) hash: Hash32,
 }
 
+impl Input {
+    /// The hash of a file an importer looked for and could not read: the import stands only
+    /// while that stays so.
+    pub(crate) const ABSENT: Hash32 = Hash32([0; 32]);
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct StateFile {
     version: u32,

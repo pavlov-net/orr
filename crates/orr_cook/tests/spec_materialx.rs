@@ -520,6 +520,197 @@ fn toksvig_roughness_follows_the_normal_scale_of_each_axis() {
     assert_ne!(roughness("0, 1"), roughness("0, 0.1"));
 }
 
+#[test]
+fn xinclude_adds_the_children_of_the_included_root() {
+    // Spec File Format; the spec's snippet leaves the xi prefix undeclared.
+    let d = fixture();
+    std::fs::write(
+        d.join("lib/lib.mtlx"),
+        r#"<?xml version="1.0"?>
+<materialx version="1.39" namespace="stdmaterials" fileprefix="sub/">
+  <image name="i" type="color3"><input name="file" type="filename" value="l.png"/></image>
+  <open_pbr_surface name="S" type="surfaceshader">
+    <input name="base_color" type="color3" nodename="i"/>
+  </open_pbr_surface>
+  <surfacematerial name="wood" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="S"/>
+  </surfacematerial>
+</materialx>
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("lib/nodes.mtlx"),
+        r#"<?xml version="1.0"?>
+<materialx version="1.39">
+  <image name="shared" type="color3">
+    <input name="file" type="filename" value="r.png"/>
+  </image>
+</materialx>
+"#,
+    )
+    .unwrap();
+    let top = write_doc(
+        &d,
+        "top.mtlx",
+        r#"fileprefix="textures/color/""#,
+        r#"<xi:include href="lib/lib.mtlx"/>"#,
+        "",
+    );
+    let (a, report) = cook(&top, "stdmaterials:wood").unwrap();
+    assert!(bound(&material(&a), slot::BASE_COLOR));
+    let inputs = &report.assets[0].inputs;
+    assert!(
+        inputs.iter().any(|p| p.ends_with("lib.mtlx")),
+        "an included document is an input of the cook: {inputs:?}"
+    );
+
+    // No fileprefix of its own: the includer's is distributed to the included children,
+    // and a declared xi prefix reads the same. The image resolves against the included
+    // document, and the includer connects to it by name.
+    let top = write_doc(
+        &d,
+        "shared.mtlx",
+        r#"xmlns:xi="http://www.w3.org/2001/XInclude" fileprefix="../textures/color/""#,
+        r#"<xi:include href="lib/nodes.mtlx"/>"#,
+        r#"<input name="base_color" type="color3" nodename="shared"/>"#,
+    );
+    let (a, _) = cook(&top, "M").unwrap();
+    assert!(bound(&material(&a), slot::BASE_COLOR));
+}
+
+#[test]
+fn xinclude_targets_must_exist_and_end() {
+    let d = fixture();
+    let missing = write_doc(&d, "a.mtlx", "", r#"<xi:include href="nope.mtlx"/>"#, "");
+    assert!(cook(&missing, "M").is_err(), "a missing include");
+    let fallback = write_doc(
+        &d,
+        "b.mtlx",
+        "",
+        r#"<xi:include href="nope.mtlx"><xi:fallback/></xi:include>"#,
+        "",
+    );
+    assert!(
+        cook(&fallback, "M").is_ok(),
+        "a fallback replaces a missing include"
+    );
+
+    let one = write_doc(
+        &d,
+        "one.mtlx",
+        "",
+        r#"<xi:include href="sub/../two.mtlx"/>"#,
+        "",
+    );
+    write_doc(&d, "two.mtlx", "", r#"<xi:include href="one.mtlx"/>"#, "");
+    std::fs::create_dir_all(d.join("sub")).unwrap();
+    let e = cook(&one, "M").err().expect("an include cycle cooks");
+    assert!(e.to_string().contains("cycle"), "{e}");
+}
+
+#[test]
+fn xinclude_fallbacks_stand_where_the_include_failed() {
+    let d = fixture();
+    let image = r#"<image name="shared" type="color3">
+        <input name="file" type="filename" value="v.png"/></image>"#;
+    let base = r#"<input name="base_color" type="color3" nodename="shared"/>"#;
+    std::fs::write(
+        d.join("good.mtlx"),
+        format!(r#"<?xml version="1.0"?><materialx version="1.39">{image}</materialx>"#),
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("broken.mtlx"),
+        r#"<?xml version="1.0"?><materialx version="1.39">
+          <xi:include href="good.mtlx"/><xi:include href="nope.mtlx"/></materialx>"#,
+    )
+    .unwrap();
+
+    let body = format!(
+        r#"<xi:include href="nope.mtlx"><xi:fallback/></xi:include>
+        <xi:include href="nope.mtlx"><xi:fallback>{image}</xi:fallback></xi:include>"#
+    );
+    let again = write_doc(&d, "again.mtlx", "", &body, base);
+    assert!(
+        cook(&again, "M").is_ok(),
+        "a second failed include takes its own fallback"
+    );
+    let body = r#"<xi:include href="nope.mtlx"><xi:fallback/></xi:include>
+        <xi:include href="nope.mtlx"/>"#;
+    let unforgiven = write_doc(&d, "unforgiven.mtlx", "", body, "");
+    assert!(
+        cook(&unforgiven, "M").is_err(),
+        "a fallback excuses only its own include"
+    );
+
+    let body = r#"<xi:include href="broken.mtlx"><xi:fallback/></xi:include>
+        <xi:include href="good.mtlx"/>"#;
+    let partial = write_doc(&d, "partial.mtlx", "", body, base);
+    assert!(
+        cook(&partial, "M").is_ok(),
+        "a document a failed include read is still there to include"
+    );
+
+    let body = r#"<xi:include href="good.mtlx">
+        <xi:fallback><xi:include href="nope.mtlx"/></xi:fallback></xi:include>"#;
+    let unused = write_doc(&d, "unused.mtlx", "", body, base);
+    assert!(
+        cook(&unused, "M").is_ok(),
+        "an include in an unused fallback is not read"
+    );
+    let body = r#"<xi:include href="nope.mtlx">
+        <xi:fallback><xi:include href="good.mtlx"/></xi:fallback></xi:include>"#;
+    let nested = write_doc(&d, "nested.mtlx", "", body, base);
+    assert!(
+        cook(&nested, "M").is_ok(),
+        "an include in a used fallback is read"
+    );
+}
+
+#[test]
+fn a_fallback_stands_only_until_the_include_appears() {
+    let d = fixture();
+    let doc = write_doc(
+        &d,
+        "m.mtlx",
+        "",
+        r#"<xi:include href="late.mtlx"><xi:fallback>
+          <constant name="c" type="color3">
+            <input name="value" type="color3" value="1, 0, 0"/></constant>
+          </xi:fallback></xi:include>"#,
+        r#"<input name="base_color" type="color3" nodename="c"/>"#,
+    );
+    let out = d.join("out.orr");
+    let cook_file = || {
+        let manifest = Manifest {
+            archives: vec![ArchiveSpec::new(
+                Target::File(out.clone()),
+                vec![AssetSpec {
+                    name: "u".into(),
+                    source: Source::MaterialX {
+                        path: doc.clone(),
+                        material: "M".into(),
+                        textures: TextureRules::default(),
+                    },
+                }],
+            )],
+        };
+        orr_cook::cook(&manifest, &Default::default()).unwrap();
+        material(&Archive::open(&out).unwrap()).base_color
+    };
+    assert_eq!(cook_file(), [1.0, 0.0, 0.0]);
+    assert_eq!(cook_file(), [1.0, 0.0, 0.0], "the record links");
+    std::fs::write(
+        d.join("late.mtlx"),
+        r#"<?xml version="1.0"?><materialx version="1.39">
+          <constant name="c" type="color3">
+            <input name="value" type="color3" value="0, 1, 0"/></constant></materialx>"#,
+    )
+    .unwrap();
+    assert_eq!(cook_file(), [0.0, 1.0, 0.0]);
+}
+
 /// Runs a cook that a cycle could keep from ending.
 fn bounded(body: &'static str, inputs: &'static str) -> String {
     let (send, receive) = mpsc::channel();
