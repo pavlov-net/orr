@@ -163,8 +163,8 @@ impl Watch {
     }
 }
 
-/// What `screen` reports. A screen whose potential headroom is above 1 can show HDR; macOS has
-/// no HDR switch to read, and composites HDR content on such screens at any time.
+/// What `screen` reports. HDR is on when the potential headroom is above 1: built-in XDR
+/// screens always, external HDR screens with their High Dynamic Range setting on.
 fn read(screen: &NSScreen) -> DisplayInfo {
     let potential = screen.maximumPotentialExtendedDynamicRangeColorComponentValue() as f32;
     let current = screen.maximumExtendedDynamicRangeColorComponentValue() as f32;
