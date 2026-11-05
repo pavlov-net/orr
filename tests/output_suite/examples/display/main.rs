@@ -5,19 +5,19 @@
 //! content brightness slider or moving the window to another monitor re-resolves on the
 //! next frame and is logged. Runs for the given seconds (default 60) or until closed.
 //!
-//! Windows only: `gpu_suite::window` is a Win32 window. Elsewhere the example says so and
-//! exits.
+//! On Windows and macOS, the platforms with a `gpu_suite::window`. Elsewhere the example says
+//! so and exits.
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod windowed;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn main() {
     windowed::main();
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 #[allow(clippy::print_stderr)]
 fn main() {
-    eprintln!("the display example needs gpu_suite's window, which is Windows-only");
+    eprintln!("the display example needs gpu_suite's window, which Windows and macOS have");
 }
