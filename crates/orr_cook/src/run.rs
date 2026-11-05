@@ -1985,7 +1985,7 @@ fn map_spec(m: &Material, textures: &HashMap<AssetId, (String, Hash32)>) -> MapS
         }),
     });
     let normal = match bound(slot::NORMAL) {
-        _ if m.specular_anisotropy > 0.0 || m.surface != 0 => NormalSpec::Tangent,
+        _ if mesh::reads_tangent(m) => NormalSpec::Tangent,
         None => NormalSpec::None,
         Some((Some((unit, key)), uv_set)) => NormalSpec::Texture {
             unit: unit.clone(),

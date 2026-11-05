@@ -539,6 +539,392 @@ fn uv_tangents_share_the_handedness_of_published_ones() {
     assert!(t.derived && t.angle_p99.unwrap() < 0.1, "{t:?}");
 }
 
+/// Cooks keeping tangents in the mesh, for reading them back.
+fn keeping_tangents(layout: GltfLayout) -> GltfSettings {
+    let mut s = GltfSettings {
+        layout,
+        ..GltfSettings::default()
+    };
+    s.mesh.tangent_error_max = None;
+    s
+}
+
+const NORMAL_MAP: &str = r#"{"normalTexture":{"index":0}}"#;
+
+/// Positions, and normals and tangents where stated.
+type Attributes<'a> = (
+    &'a [[f32; 3]],
+    Option<&'a [[f32; 3]]>,
+    Option<&'a [[f32; 4]]>,
+);
+
+/// A primitive's JSON over its attributes, after `extra` members.
+fn primitive(
+    g: &mut Glb,
+    (p, n, t): Attributes<'_>,
+    uv: &[[f32; 2]],
+    idx: &[u32],
+    extra: &str,
+) -> String {
+    let mut attributes = format!(
+        r#""POSITION":{},"TEXCOORD_0":{}"#,
+        g.floats(p, "VEC3"),
+        g.floats(uv, "VEC2")
+    );
+    if let Some(n) = n {
+        attributes += &format!(r#","NORMAL":{}"#, g.floats(n, "VEC3"));
+    }
+    if let Some(t) = t {
+        attributes += &format!(r#","TANGENT":{}"#, g.floats(t, "VEC4"));
+    }
+    let ia = g.indices(idx);
+    format!(r#"{{"attributes":{{{attributes}}},"indices":{ia},"material":0{extra}}}"#)
+}
+
+/// One node holding `primitives`, with `node` members and material 0 being `material`.
+fn write_mesh(mut g: Glb, path: &Path, primitives: &[String], node: &str, material: &str) {
+    let img = g.image(&textured_normals());
+    let primitives = primitives.join(",");
+    g.write(
+        path,
+        &format!(
+            r#""scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0{node}}}],
+"meshes":[{{"primitives":[{primitives}]}}],"materials":[{material}],
+"textures":[{{"source":0}}],"images":[{{"bufferView":{img},"mimeType":"image/png"}}]"#
+        ),
+    );
+}
+
+/// The position and tangent of every corner of mesh entry `name`.
+fn corner_tangents(a: &Archive, name: &str) -> Vec<(Vec3, [f32; 4])> {
+    per_triangle(a, name, |view, c, t| {
+        t.map(|v| (Vec3::from(view.position(c, v)), view.tangent(c, v).unwrap()))
+    })
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Asserts that the corners at `at` have tangent `want`, to the precision of its encoding.
+fn assert_tangent(got: &[(Vec3, [f32; 4])], at: Vec3, want: [f32; 4]) {
+    let dir = Vec3::from_slice(&want).normalize();
+    let mut seen = false;
+    for (p, t) in got {
+        if near(*p, at) {
+            seen = true;
+            assert!(
+                Vec3::from_slice(t).dot(dir) > 0.9999 && t[3] == want[3],
+                "at {at}: {t:?} want {want:?}"
+            );
+        }
+    }
+    assert!(seen, "no corner at {at}");
+}
+
+fn assert_published(got: &[(Vec3, [f32; 4])]) {
+    let (p, _, _, t, _) = tangent_quads::arrays();
+    for (p, t) in p.iter().zip(t) {
+        assert_tangent(got, Vec3::from(*p), t);
+    }
+}
+
+/// L1821: "When tangents are not specified and the material has a normal texture, the tangent
+/// vectors are calculated using default MikkTSpace algorithms with the vertex positions,
+/// normals [...] and texture coordinates associated with the normal texture." The tangents
+/// `NormalTangentMirrorTest` publishes are what its geometry computes, plain, mirrored and facing
+/// away, in either layout.
+#[test]
+fn unstated_tangents_are_the_published_mikktspace_ones() {
+    let path = dir("mikk").join("quads.glb");
+    let (p, n, uv, _, idx) = tangent_quads::arrays();
+    let mut g = Glb::default();
+    let prim = primitive(&mut g, (&p, Some(&n), None), &uv, &idx, "");
+    write_mesh(g, &path, &[prim], "", NORMAL_MAP);
+    let (a, _) = cook(&path, keeping_tangents(GltfLayout::Scene)).unwrap();
+    assert_published(&corner_tangents(&a, "g/mesh"));
+    let (a, _) = cook(&path, keeping_tangents(GltfLayout::Meshes)).unwrap();
+    assert_published(&corner_tangents(&a, "g/mesh/0/mesh"));
+}
+
+/// L1821, on the texture coordinates "associated with the normal texture".
+#[test]
+fn tangents_follow_the_normal_textures_uv_set() {
+    let path = dir("mikk-set").join("quads.glb");
+    let (p, n, uv, _, idx) = tangent_quads::arrays();
+    let turned: Vec<[f32; 2]> = uv.iter().map(|&[u, v]| [v, -u]).collect();
+    let mut g = Glb::default();
+    let set1 = g.floats(&uv, "VEC2");
+    let prim = primitive(&mut g, (&p, Some(&n), None), &turned, &idx, "").replace(
+        r#""TEXCOORD_0""#,
+        &format!(r#""TEXCOORD_1":{set1},"TEXCOORD_0""#),
+    );
+    write_mesh(
+        g,
+        &path,
+        &[prim],
+        "",
+        r#"{"normalTexture":{"index":0,"texCoord":1}}"#,
+    );
+    let (a, _) = cook(&path, keeping_tangents(GltfLayout::Scene)).unwrap();
+    assert_published(&corner_tangents(&a, "g/mesh"));
+}
+
+/// L1813: without normals "the provided tangents are ignored", and L1821 computes them from
+/// normals "specified or generated".
+#[test]
+fn flat_primitives_compute_tangents_from_generated_normals() {
+    let path = dir("mikk-flat").join("quads.glb");
+    let (p, _, uv, _, idx) = tangent_quads::arrays();
+    let mut g = Glb::default();
+    let wrong = vec![[0.0, 0.0, 1.0, -1.0]; p.len()];
+    let prim = primitive(&mut g, (&p, None, Some(&wrong)), &uv, &idx, "");
+    write_mesh(g, &path, &[prim], "", NORMAL_MAP);
+    let (a, _) = cook(&path, keeping_tangents(GltfLayout::Scene)).unwrap();
+    assert_published(&corner_tangents(&a, "g/mesh"));
+}
+
+/// L1821 and L1660's table are per primitive: a primitive stating `TANGENT` keeps it beside one
+/// that doesn't.
+#[test]
+fn stated_tangents_stay_beside_a_primitive_without_them() {
+    let path = dir("mikk-mixed").join("quads.glb");
+    let (p, n, uv, t, idx) = tangent_quads::arrays();
+    let stated = [0.0, 1.0, 0.0, 1.0];
+    let mut g = Glb::default();
+    let first = primitive(
+        &mut g,
+        (&p[..4], Some(&n[..4]), Some(&[stated; 4])),
+        &uv[..4],
+        &idx[..6],
+        "",
+    );
+    let second = primitive(
+        &mut g,
+        (&p[4..8], Some(&n[4..8]), None),
+        &uv[4..8],
+        &idx[..6],
+        "",
+    );
+    write_mesh(g, &path, &[first, second], "", NORMAL_MAP);
+    let (a, _) = cook(&path, keeping_tangents(GltfLayout::Scene)).unwrap();
+    let got = corner_tangents(&a, "g/mesh");
+    assert_tangent(&got, Vec3::from(p[0]), stated);
+    assert_tangent(&got, Vec3::from(p[4]), t[4]);
+}
+
+/// A prototype can bind a material that reads tangents to any section, so a primitive whose
+/// material reads none still has its own beside one that does.
+#[test]
+fn tangents_reach_a_primitive_whose_material_reads_none() {
+    let path = dir("mikk-plain").join("quads.glb");
+    let (p, n, uv, t, idx) = tangent_quads::arrays();
+    let mut g = Glb::default();
+    let quad = |g: &mut Glb, at: std::ops::Range<usize>| {
+        let v = (&p[at.clone()], Some(&n[at.clone()]), None);
+        primitive(g, v, &uv[at], &idx[..6], "")
+    };
+    let mapped = quad(&mut g, 0..4);
+    let plain = quad(&mut g, 4..8).replace(r#""material":0"#, r#""material":1"#);
+    write_mesh(
+        g,
+        &path,
+        &[mapped, plain],
+        "",
+        &format!("{NORMAL_MAP},{{}}"),
+    );
+    let (a, _) = cook(&path, keeping_tangents(GltfLayout::Scene)).unwrap();
+    assert_tangent(&corner_tangents(&a, "g/mesh"), Vec3::from(p[4]), t[4]);
+}
+
+/// L1998 applies a transform after the vertex attributes: tangents come from the primitive's
+/// own attributes, and a node's mirror and uneven scale reach them as they reach stated ones.
+#[test]
+fn tangents_are_computed_before_node_transforms() {
+    let path = dir("mikk-node").join("strip.glb");
+    let d = dir("mikk-node");
+    // A bent strip, its middle column's tangent an average that scale would change.
+    let column = |x: f32, z: f32, u: f32, nx: f32| {
+        let n = Vec3::new(nx, 0.0, 1.0).normalize().to_array();
+        [([x, 0.0, z], n, [u, 0.0]), ([x, 1.0, z], n, [u, 1.0])]
+    };
+    let v = [
+        column(0.0, 0.0, 0.0, -0.6),
+        column(1.0, 0.7, 0.4, -0.1),
+        column(1.5, 0.3, 1.0, 0.8),
+    ]
+    .concat();
+    let p: Vec<[f32; 3]> = v.iter().map(|c| c.0).collect();
+    let n: Vec<[f32; 3]> = v.iter().map(|c| c.1).collect();
+    let uv: Vec<[f32; 2]> = v.iter().map(|c| c.2).collect();
+    let idx = [0, 2, 1, 1, 2, 3, 2, 4, 3, 3, 4, 5];
+    let scale = Vec3::new(-2.0, 1.0, 5.0);
+    let write = |path: &Path, node: &str| {
+        let mut g = Glb::default();
+        let prim = primitive(&mut g, (&p, Some(&n), None), &uv, &idx, "");
+        write_mesh(g, path, &[prim], node, NORMAL_MAP);
+    };
+    let plain_path = d.join("plain.glb");
+    write(&plain_path, "");
+    write(&path, r#","scale":[-2,1,5]"#);
+    let (a, _) = cook(&plain_path, keeping_tangents(GltfLayout::Scene)).unwrap();
+    let plain = corner_tangents(&a, "g/mesh");
+    let (a, _) = cook(&path, keeping_tangents(GltfLayout::Scene)).unwrap();
+    let scaled = corner_tangents(&a, "g/mesh");
+    for (at, t) in plain {
+        let dir = Vec3::from_slice(&t) * scale;
+        assert_tangent(&scaled, at * scale, [dir.x, dir.y, dir.z, -t[3]]);
+    }
+}
+
+/// L2004: "the tangent vector deltas are also calculated for each morph target using the same
+/// algorithms and vertex positions, normals, and texture coordinates with the corresponding
+/// deltas applied. The provided tangent deltas are ignored in this case".
+#[test]
+fn computed_tangents_follow_morphed_positions() {
+    let path = dir("mikk-morph").join("quad.glb");
+    let mut g = Glb::default();
+    let shear: Vec<[f32; 3]> = QUAD.iter().map(|p| [0.0, p[0], 0.0]).collect();
+    let shear = g.floats(&shear, "VEC3");
+    let ignored = g.floats(&[[0.0f32, 0.0, 1.0]; 4], "VEC3");
+    let targets = format!(r#","targets":[{{"POSITION":{shear},"TANGENT":{ignored}}}]"#);
+    let prim = primitive(
+        &mut g,
+        (&QUAD, None, None),
+        &QUAD_UV,
+        &QUAD_INDICES,
+        &targets,
+    );
+    write_mesh(g, &path, &[prim], r#","weights":[1]"#, NORMAL_MAP);
+    let (a, _) = cook(&path, keeping_tangents(GltfLayout::Scene)).unwrap();
+    let got = corner_tangents(&a, "g/mesh");
+    assert_tangent(&got, Vec3::new(1.0, 1.0, 0.0), [1.0, 1.0, 0.0, -1.0]);
+}
+
+/// L1821 at a uv fold: one vertex's corners on either side take tangents of opposite handedness,
+/// and L1823 wants one W per triangle.
+#[test]
+fn tangents_split_a_vertex_where_uvs_fold() {
+    let path = dir("mikk-fold").join("fold.glb");
+    let p = [
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 0.5, 0.0],
+        [-1.0, 0.5, 0.0],
+    ];
+    let uv = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.5], [1.0, 0.5]];
+    let mut g = Glb::default();
+    let prim = primitive(
+        &mut g,
+        (&p, Some(&[[0.0, 0.0, 1.0]; 4]), None),
+        &uv,
+        &[0, 2, 1, 0, 1, 3],
+        "",
+    );
+    write_mesh(g, &path, &[prim], "", NORMAL_MAP);
+    let (a, _) = cook(&path, keeping_tangents(GltfLayout::Scene)).unwrap();
+    let triangles = per_triangle(&a, "g/mesh", |view, c, t| {
+        t.map(|v| (Vec3::from(view.position(c, v)), view.tangent(c, v).unwrap()))
+    });
+    assert_eq!(triangles.len(), 2);
+    for t in triangles {
+        let right = t.iter().any(|c| c.0.x > 0.5);
+        let want = if right {
+            [1.0, 0.0, 0.0, -1.0]
+        } else {
+            [-1.0, 0.0, 0.0, 1.0]
+        };
+        for (p, _) in t {
+            assert_tangent(&t, p, want);
+        }
+    }
+}
+
+/// `path` without its primitives' `TANGENT`, written to `out`.
+fn without_tangents(path: &Path, out: &Path) {
+    let glb = std::fs::read(path).unwrap();
+    let len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+    let mut json: serde_json::Value = serde_json::from_slice(&glb[20..20 + len]).unwrap();
+    for mesh in json["meshes"].as_array_mut().unwrap() {
+        for prim in mesh["primitives"].as_array_mut().unwrap() {
+            prim["attributes"]
+                .as_object_mut()
+                .unwrap()
+                .remove("TANGENT");
+        }
+    }
+    let mut text = serde_json::to_vec(&json).unwrap();
+    text.resize(text.len().next_multiple_of(4), b' ');
+    let bin = &glb[20 + len..];
+    let mut bytes = glb[..8].to_vec();
+    bytes.extend((20 + text.len() + bin.len()).to_le_bytes()[..4].iter());
+    bytes.extend((text.len() as u32).to_le_bytes());
+    bytes.extend(b"JSON");
+    bytes.extend(text);
+    bytes.extend(bin);
+    std::fs::write(out, bytes).unwrap();
+}
+
+/// L1821 over a whole published model: without its `TANGENT`, `NormalTangentMirrorTest`'s bowls
+/// and quads compute the tangents the file stores.
+#[test]
+#[ignore = "needs the Khronos sample: ORR_VALIDATION_DATA=1 tools/fetch-slang.sh"]
+fn a_published_model_computes_the_tangents_it_stores() {
+    let rel = "gltf/NormalTangentMirrorTest.glb";
+    let path = match std::env::var_os("ORR_TOOLS").filter(|p| !p.is_empty()) {
+        Some(t) => PathBuf::from(t).join(rel),
+        None => Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .map(|d| d.join(".tools").join(rel))
+            .find(|p| p.exists())
+            .expect("sample not fetched: ORR_VALIDATION_DATA=1 tools/fetch-slang.sh"),
+    };
+    let stripped = dir("mikk-published").join("stripped.glb");
+    without_tangents(&path, &stripped);
+    let settings = || keeping_tangents(GltfLayout::Scene);
+    let (stated, _) = cook(&path, settings()).unwrap();
+    let (computed, _) = cook(&stripped, settings()).unwrap();
+    let corners = |a: &Archive| {
+        let mut c = per_triangle(a, "g/mesh", |view, cl, t| {
+            t.map(|v| {
+                let [u, w] = view.uv(cl, v, 0).map(|x| (x * 4096.0).round() as i32);
+                let [x, y, z] = view.position(cl, v).map(|x| (x * 4096.0).round() as i32);
+                let t = view.tangent(cl, v).unwrap();
+                ([x, y, z, u, w, t[3] as i32], t)
+            })
+        })
+        .concat();
+        c.sort_unstable_by_key(|c| c.0);
+        c.dedup_by_key(|c| c.0);
+        c
+    };
+    let (stated, computed) = (corners(&stated), corners(&computed));
+    assert_eq!(stated.len(), computed.len());
+    for (a, b) in stated.iter().zip(&computed) {
+        assert_eq!(a.0, b.0);
+        let dot = Vec3::from_slice(&a.1).dot(Vec3::from_slice(&b.1));
+        assert!(dot > 0.9999 && a.1[3] == b.1[3], "{a:?} {b:?}");
+    }
+}
+
+/// `KHR_materials_anisotropy`: "When the mesh primitive does not have `NORMAL` or `TANGENT`
+/// vectors, they are computed as defined in the glTF 2.0 specification."
+#[test]
+fn anisotropy_computes_tangents_without_a_normal_texture() {
+    let path = dir("mikk-aniso").join("quads.glb");
+    let (p, n, uv, _, idx) = tangent_quads::arrays();
+    let mut g = Glb::default();
+    let prim = primitive(&mut g, (&p, Some(&n), None), &uv, &idx, "");
+    write_mesh(
+        g,
+        &path,
+        &[prim],
+        "",
+        r#"{"extensions":{"KHR_materials_anisotropy":{"anisotropyStrength":0.5}}}"#,
+    );
+    let (a, _) = cooked(&path);
+    assert_published(&corner_tangents(&a, "g/mesh"));
+}
+
 /// L2899: "If the alpha value is greater than or equal to the alpha cutoff value, the material
 /// is rendered as fully opaque, otherwise, it is rendered as fully transparent", per texel and
 /// with the base color factor's alpha. Texels within one UNORM8 step of each other fold into

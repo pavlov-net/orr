@@ -19,7 +19,7 @@ mod displace;
 mod lod;
 pub(crate) mod maps;
 mod omm;
-mod tangents;
+pub(crate) mod tangents;
 mod thickness;
 
 use std::ops::Range;
@@ -84,8 +84,8 @@ pub struct MeshSettings {
     /// `<model>/unit/<i>`, placed by the instance sources that place the model.
     pub assemblies: Option<AssemblySettings>,
     /// Degrees: a mesh drops `TANGENT` when tangents derived per triangle from positions and
-    /// uvs shade its normal maps within this of the stored ones at the 99th percentile;
-    /// `None` keeps stored tangents.
+    /// uvs shade its normal maps within this of its tangents, stated or MikkTSpace's, at the
+    /// 99th percentile; `None` keeps them.
     pub tangent_error_max: Option<f32>,
 }
 
@@ -317,6 +317,11 @@ pub(crate) fn reads_uv1(m: &Material) -> bool {
     m.textures
         .iter()
         .any(|b| b.texture != AssetId::NONE && b.uv_set == 1)
+}
+
+/// Whether material `m` reads the tangent with or without a normal map.
+pub(crate) fn reads_tangent(m: &Material) -> bool {
+    m.specular_anisotropy > 0.0 || m.surface != 0
 }
 
 /// [`Section`] flags of a section drawn with material `m`.

@@ -10,7 +10,7 @@ use orr_pack::material::Material;
 use orr_pack::skeleton::SkeletonInfo;
 use serde::Deserialize;
 
-use crate::mesh::{MeshSettings, MeshSource};
+use crate::mesh::{self, MeshSettings, MeshSource};
 use crate::state::Input;
 use crate::subd::{CageData, SubdSettings};
 use crate::texture::material::{ImageFile, MaterialTextures};
@@ -95,6 +95,18 @@ pub(crate) struct SceneMaterial {
     pub(crate) suffix: String,
     pub(crate) material: Material,
     pub(crate) textures: MaterialTextures,
+}
+
+impl SceneMaterial {
+    /// The uv set a surface with this material takes its tangents from; `None` when it reads
+    /// none. Without a normal map the shaders read set 0.
+    pub(crate) fn tangent_set(&self) -> Option<usize> {
+        let m = &self.material;
+        match &self.textures.normal {
+            Some((r, _)) => Some(usize::from(r.uv_set)),
+            None => mesh::reads_tangent(m).then_some(0),
+        }
+    }
 }
 
 /// Copies whose linear transform collapses: the transform, for the importer to bake into a

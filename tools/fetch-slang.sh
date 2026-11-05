@@ -26,6 +26,9 @@
 #   sky/prague/PragueSkyModelGround.dat
 #                    the Prague sky model's ground-level dataset (103 MB), checked against its
 #                    sha256
+#   gltf/NormalTangentMirrorTest.glb
+#                    KhronosGroup/glTF-Sample-Assets' model at a pinned commit (CC BY 4.0),
+#                    checked against its sha256, whose tangents the cook computes again
 #   volumes/smoke.vdb
 #                    OpenVDB's smoke1 sample model from the ASWF artifacts, its zip checked
 #                    against its sha256
@@ -54,6 +57,8 @@ prague_ground_sum=76bd619dc6dfcbc900c2996436dd6cf68197c03e3982fe5580f2b109ce1c71
 smoke_sum=dca7a0477e77fac197a969f5f418057fc3f89b12887c35d1fc9c1b0d2892f20f
 dlss_commit=9981c6350dc58c0ce21f024fd65e31e851c31689
 vulkan_headers_commit=6802bb4733b63ed5efd3adb308a6c885ef180ea1
+gltf_samples_commit=8f492390ddc7a2ae221a1369ef560589cf8c70fb
+tangent_test_sum=31ce5f3c873fc55531a17ccacf001e3d1d482a508695aa826fa79cc196e0ce78
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 tools="${ORR_TOOLS:-$root/.tools}"
@@ -176,6 +181,17 @@ if [ "${ORR_VALIDATION_DATA:-0}" = 1 ]; then
     echo "$prague_ground_sum  $ground.part" | sha256sum -c --quiet -
     mv "$ground.part" "$ground"
     echo "prague ground dataset in $ground"
+  fi
+  tangent_test="$tools/gltf/NormalTangentMirrorTest.glb"
+  if echo "$tangent_test_sum  $tangent_test" | sha256sum -c --quiet - 2>/dev/null; then
+    echo "tangent test model already in $tangent_test"
+  else
+    mkdir -p "$(dirname "$tangent_test")"
+    curl -fsSL --retry 3 -o "$tangent_test.part" \
+      "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/$gltf_samples_commit/Models/NormalTangentMirrorTest/glTF-Binary/NormalTangentMirrorTest.glb"
+    echo "$tangent_test_sum  $tangent_test.part" | sha256sum -c --quiet -
+    mv "$tangent_test.part" "$tangent_test"
+    echo "tangent test model in $tangent_test"
   fi
   smoke="$tools/volumes/smoke.vdb"
   if [ -f "$smoke" ] && [ "$(cat "$smoke.zip-sha256" 2>/dev/null)" = "$smoke_sum" ]; then
