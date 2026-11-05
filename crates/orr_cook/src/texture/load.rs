@@ -353,6 +353,12 @@ pub(super) fn block_range(
     spread: f32,
 ) -> Result<[(f32, f32); 4], String> {
     let f = FormatInfo::of(vk_format).ok_or("unknown format")?;
+    // No fixed span says how far floats reach, so their readers need all of the range.
+    let spread = if float_blocks(vk_format) {
+        f32::INFINITY
+    } else {
+        spread
+    };
     let bw = w.div_ceil(4) as usize;
     let blocks = bw * h.div_ceil(4) as usize;
     // Channels past these hold the same value in every block of the format.

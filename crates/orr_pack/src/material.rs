@@ -83,8 +83,9 @@ pub struct Material {
     pub uv_transforms: [[f32; 6]; 12],
 }
 
-/// Texture slots. All but `NORMAL`, `EMISSION` and `DISPLACEMENT` read values of 0..1. Nothing
-/// clamps what they sample: a signed texture bound to one is the caller's responsibility.
+/// Texture slots. All but `NORMAL`, `EMISSION`, `SPECULAR_WEIGHT` and `DISPLACEMENT` read values
+/// of 0..1. Nothing clamps what they sample: a signed texture bound to one is the caller's
+/// responsibility.
 pub mod slot {
     pub const BASE_COLOR: usize = 0;
     pub const OPACITY: usize = 1;

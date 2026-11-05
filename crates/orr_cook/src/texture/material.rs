@@ -11,18 +11,20 @@
 //!   map gets a roughness texture even when its roughness is constant. At the quality levels
 //!   that keep source mips, roughness that keeps them, and roughness beside a normal map
 //!   that keeps them, takes none.
-//! - Emission and subsurface color: BC7 sRGB.
+//! - Emission and subsurface color: BC7 sRGB. A float image's emission is BC6H under USD and
+//!   MaterialX, which range it past 1; glTF's emissive values stop at 1.
 //! - Specular weight (the specular texture's alpha), coat and transmission weights (red):
 //!   BC4 each. Coat and transmission factors are folded into their texels and set to 1;
-//!   the specular weight texture multiplies `specular_weight`.
+//!   the specular weight texture multiplies `specular_weight`. A float image's specular weight
+//!   is R16_SFLOAT under USD and MaterialX, which range it past 1.
 //! - Displacement: R16 unorm from red, never collapsed; displacement is
 //!   `displacement_scale x texel + displacement_offset`. A height `h` stores across the
 //!   range `lo..hi` the image measures, as `(h - lo) / (hi - lo)`, with the scale and offset
 //!   compensated; a range past 0..1 widens the declared one.
 //! - An image whose texels all lie within 1/255 of one value collapses into the material's
-//!   factor, clamped to 0..1 as a texture stores it; a constant normal or occlusion image,
-//!   which has no factor, cooks at 4x4. Under `MASK` an opacity image collapses only when its
-//!   texels fall on one side of the cutoff.
+//!   factor, clamped to the input's range as a texture stores it; a constant normal or
+//!   occlusion image, which has no factor, cooks at 4x4. Under `MASK` an opacity image collapses
+//!   only when its texels fall on one side of the cutoff.
 //!
 //! A bound texture's value multiplies the matching factor; normal, occlusion and opacity
 //! textures have no factor.
@@ -269,8 +271,8 @@ pub(crate) struct ImageFacts {
     primaries: Option<Primaries>,
     /// Per channel, the value every texel lies within 1/255 of, if there is one.
     constant: [Option<f32>; 4],
-    /// Per channel, the lowest and highest value of mip 0. Only an image read as a height is
-    /// sure to have all of it: reading blocks stops once every channel varies.
+    /// Per channel, the lowest and highest value of mip 0. Only a float image or one read as a
+    /// height is sure to have all of it: reading blocks stops once every channel varies.
     range: [(f32, f32); 4],
     hash: Hash32,
     /// The block format of a block-compressed file, and whether it has every mip.
@@ -585,6 +587,18 @@ impl<'a> Packer<'a> {
     /// [`Self::constant`] of an input with a 0..1 meaning, clamped as its texture stores it.
     fn constant_weight(&self, r: &TexRef, c: usize) -> Option<f32> {
         self.constant(r, c).map(|v| v.clamp(0.0, 1.0))
+    }
+
+    /// [`Self::constant_weight`], or with `hdr` of an input ranging over 0 and up, with a float
+    /// image's texels also within 1/255 of their own size: no 8-bit step limits them, and a dim
+    /// image can be multiplied by any luminance.
+    fn constant_ranged(&self, r: &TexRef, c: usize, hdr: bool) -> Option<f32> {
+        if !hdr {
+            return self.constant_weight(r, c);
+        }
+        let (lo, hi) = self.range(r, c);
+        let held = !self.image(r.image).float || hi - lo <= hi.abs() / 255.0;
+        self.constant(r, c).filter(|_| held).map(|v| v.max(0.0))
     }
 
     /// [`Self::constant_weight`] of the channel of scalar input `r`, as the input reads it.
@@ -911,10 +925,22 @@ impl<'a> Packer<'a> {
             self.color(suffix, m, r, slot::SUBSURFACE_COLOR, true)?;
         }
         if let Some(r) = &t.specular {
-            match self.constant_input(r) {
+            let hdr = r.rules != ImageRules::Gltf;
+            let constant = if hdr {
+                self.constant_ranged(r, usize::from(r.channel), true)
+                    .map(|v| r.read(0, v).max(0.0))
+            } else {
+                self.constant_input(r)
+            };
+            match constant {
                 Some(v) => m.specular_weight *= v,
                 None => {
-                    let id = self.single(suffix, r, 1.0, "specular_weight")?;
+                    let encoding = if hdr && self.image(r.image).float {
+                        Encoding::Raw(DataFormat::R16f)
+                    } else {
+                        Encoding::Bc4
+                    };
+                    let id = self.single(suffix, r, 1.0, "specular_weight", encoding)?;
                     bind(m, slot::SPECULAR_WEIGHT, id, 0, r);
                 }
             }
@@ -932,7 +958,7 @@ impl<'a> Packer<'a> {
             *weight(m) = match self.constant_input(r) {
                 Some(v) => factor * v,
                 None => {
-                    let id = self.single(suffix, r, factor, role)?;
+                    let id = self.single(suffix, r, factor, role, Encoding::Bc4)?;
                     bind(m, s, id, 0, r);
                     1.0
                 }
@@ -1026,12 +1052,13 @@ impl<'a> Packer<'a> {
             _ => ("subsurface_color", |m| &mut m.subsurface_color),
         };
         let srgb = r.srgb.unwrap_or(self.image(r.image).srgb);
-        let rgb: Vec<Option<f32>> = (0..3).map(|c| self.constant_weight(r, c)).collect();
+        let hdr = s == slot::EMISSION && r.rules != ImageRules::Gltf;
+        let rgb: Vec<Option<f32>> = (0..3).map(|c| self.constant_ranged(r, c, hdr)).collect();
         if rgb.iter().all(Option::is_some) {
             let texel: [f32; 3] = std::array::from_fn(|c| {
                 let v = rgb[c].expect("constant");
-                r.read(c, if srgb { srgb_to_linear(v) } else { v })
-                    .clamp(0.0, 1.0)
+                let read = r.read(c, if srgb { srgb_to_linear(v) } else { v });
+                read.clamp(0.0, if hdr { f32::INFINITY } else { 1.0 })
             });
             let target = color(m);
             // Rec.709 multiplies directly, so its factors stay exact.
@@ -1051,7 +1078,11 @@ impl<'a> Packer<'a> {
             suffix,
             Pack {
                 role,
-                encoding: Encoding::Bc7Srgb,
+                encoding: if hdr && self.image(r.image).float {
+                    Encoding::Bc6h
+                } else {
+                    Encoding::Bc7Srgb
+                },
                 channels: vec![image(0), image(1), image(2), alpha],
                 refs: vec![*r],
                 coverage: None,
@@ -1064,13 +1095,20 @@ impl<'a> Packer<'a> {
         Ok(())
     }
 
-    /// A BC4 texture of the reference's channel times `scale`.
-    fn single(&mut self, suffix: &str, r: &TexRef, scale: f32, role: &'static str) -> Result<Made> {
+    /// A one-channel texture of the reference's channel times `scale`.
+    fn single(
+        &mut self,
+        suffix: &str,
+        r: &TexRef,
+        scale: f32,
+        role: &'static str,
+        encoding: Encoding,
+    ) -> Result<Made> {
         self.make(
             suffix,
             Pack {
                 role,
-                encoding: Encoding::Bc4,
+                encoding,
                 channels: vec![self.source(r, 0, usize::from(r.channel), false, 0.0, scale)],
                 refs: vec![*r],
                 coverage: None,
@@ -1098,6 +1136,7 @@ impl<'a> Packer<'a> {
         use orr_pack::texture::vk;
         let count = match p.encoding {
             Encoding::Bc7Srgb => 4,
+            Encoding::Bc6h => 3,
             Encoding::Bc5 => 2,
             Encoding::Bc4 => 1,
             _ => return None,
@@ -1153,7 +1192,7 @@ impl<'a> Packer<'a> {
         };
         // Slots read color and normal channels together from their first one on.
         let in_order = match p.encoding {
-            Encoding::Bc7Srgb => channels[..3] == [0, 1, 2],
+            Encoding::Bc7Srgb | Encoding::Bc6h => channels[..3] == [0, 1, 2],
             Encoding::Bc5 if p.normal => channels[..2] == [0, 1],
             _ => true,
         };
@@ -1238,7 +1277,7 @@ impl<'a> Packer<'a> {
         if p.shrink {
             size = [4, 4];
         }
-        let primaries = if p.encoding == Encoding::Bc7Srgb {
+        let primaries = if matches!(p.encoding, Encoding::Bc7Srgb | Encoding::Bc6h) {
             self.color_primaries(images[0])
         } else {
             primaries.unwrap_or(Primaries::Rec709)
@@ -1521,10 +1560,13 @@ impl TextureJob {
 
     /// The packed texture of `decoded` source images, each `w` x `h`.
     fn pack(&self, decoded: &HashMap<usize, Arc<Img>>, [w, h]: [u32; 2]) -> Img {
-        // Apart from normals, BC4 and BC5 hold weights: a source texel clamps before its factor,
-        // as a constant does.
-        let weight =
-            !self.pack.normal && matches!(self.pack.encoding, Encoding::Bc4 | Encoding::Bc5);
+        // Apart from normals, BC4 and BC5 hold weights, and a float weight has no upper limit: a
+        // source texel clamps before its factor, as a constant does.
+        let limit = match self.pack.encoding {
+            Encoding::Bc4 | Encoding::Bc5 if !self.pack.normal => Some(1.0),
+            Encoding::Raw(DataFormat::R16f) => Some(f32::INFINITY),
+            _ => None,
+        };
         let mut img = Img::new(w, h);
         for (c, ch) in self.pack.channels.iter().enumerate() {
             match *ch {
@@ -1560,7 +1602,7 @@ impl TextureJob {
                             } else {
                                 s[channel]
                             };
-                            t[c] = a + b * if weight { v.clamp(0.0, 1.0) } else { v };
+                            t[c] = a + b * limit.map_or(v, |l| v.clamp(0.0, l));
                         });
                 }
             }
