@@ -427,7 +427,7 @@ impl Primvar {
 
 impl PrimReader<'_> {
     /// Primvar `name` (`primvars:name`), or a plain attribute `fallback` with vertex
-    /// interpolation; `None` when neither is authored.
+    /// interpolation; `None` when neither holds values.
     pub(super) fn primvar(
         &self,
         name: &str,
@@ -435,21 +435,23 @@ impl PrimReader<'_> {
         fallback: Option<&str>,
     ) -> Result<Option<Primvar>, String> {
         let full = format!("primvars:{name}");
-        let (values, attr) = match self.numbers(&full)? {
-            Some(v) => (v, full.as_str()),
-            None => match fallback {
-                Some(f) => match self.numbers(f)? {
-                    Some(v) => (v, f),
-                    None => return Ok(None),
-                },
+        let held = |attr: &str| Ok::<_, String>(self.numbers(attr)?.filter(|v| !v.is_empty()));
+        let (values, attr) = match (held(&full)?, fallback) {
+            (Some(v), _) => (v, full.as_str()),
+            (None, Some(f)) => match held(f)? {
+                Some(v) => (v, f),
                 None => return Ok(None),
             },
+            (None, None) => return Ok(None),
         };
         let interp = match self.metadata_token(attr, "interpolation").as_deref() {
             Some("constant") => Interp::Constant,
             Some("uniform") => Interp::Uniform,
             Some("faceVarying") => Interp::FaceVarying,
-            Some("vertex" | "varying") | None => Interp::Vertex,
+            Some("vertex" | "varying") => Interp::Vertex,
+            // A primvar unauthored is constant; the plain attribute has vertex as its fallback.
+            None if attr == full => Interp::Constant,
+            None => Interp::Vertex,
             Some(i) => return Err(format!("{} {attr}: interpolation {i}", self.path())),
         };
         let indices = if attr == full {

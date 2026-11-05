@@ -1,5 +1,6 @@
 //! `UsdGeomMesh` faces as welded triangles: ngons by ear clipping, holes dropped, normals
-//! and `st` by their interpolation (smooth point normals where none are authored), uvs
+//! and `st` by their interpolation (where no normals are authored, face normals on the
+//! polygons of schemes `none` and `bilinear` and smooth point normals on other hulls), uvs
 //! flipped from USD's bottom-left origin to the cook's top-left. Or as a subdivision cage
 //! ([`CageBuilder`]): faces as authored with their creases, corners, holes and boundary
 //! rules, `st` as face-varying values (unindexed values weld where a point's corners agree).
@@ -23,7 +24,7 @@ pub(super) struct MeshPrim {
     uvs1: Option<Primvar>,
     left_handed: bool,
     holes: Vec<usize>,
-    pub(super) scheme: String,
+    scheme: String,
     pub(super) double_sided: bool,
     creases: Vec<Crease>,
     corners: Vec<Corner>,
@@ -159,6 +160,11 @@ impl MeshPrim {
             double_sided: r.numbers("doubleSided")?.is_some_and(|v| v[0] != 0.0),
         })
     }
+
+    /// Whether its surface is its faces, which no scheme smooths.
+    pub(super) fn polygonal(&self) -> bool {
+        matches!(self.scheme.as_str(), "none" | "bilinear")
+    }
 }
 
 /// Per-vertex skin influences: four joints and unorm8 weights.
@@ -222,8 +228,10 @@ impl Welder {
         let linear = DMat3::from_mat4(at.transform);
         let flip = (linear.determinant() < 0.0) != mesh.left_handed;
         let normal_m = normal_matrix(linear);
-        let smooth = match &mesh.normals {
+        let faceted = mesh.polygonal();
+        let made = match &mesh.normals {
             Some(_) => Vec::new(),
+            None if faceted => face_normals(mesh),
             None => smooth_normals(mesh),
         };
         let holes: std::collections::HashSet<usize> = mesh.holes.iter().copied().collect();
@@ -250,7 +258,8 @@ impl Welder {
                             })?;
                             DVec3::from_slice(v)
                         }
-                        None => smooth[point],
+                        None if faceted => made[face],
+                        None => made[point],
                     };
                     let n = (normal_m * n).normalize_or_zero();
                     // The material's one uv transform applies to both sets.
@@ -450,14 +459,12 @@ fn uv_values(mesh: &MeshPrim, uv: &Primvar, path: &str) -> Result<(Vec<Vec2>, Ve
     Ok((values, index))
 }
 
-/// Area-weighted point normals from the faces around each point.
-fn smooth_normals(mesh: &MeshPrim) -> Vec<DVec3> {
-    let mut acc = vec![DVec3::ZERO; mesh.points.len()];
+/// Per face, Newell's normal: twice the area along the face's normal.
+fn face_normals(mesh: &MeshPrim) -> Vec<DVec3> {
     let mut base = 0;
-    for &count in &mesh.counts {
+    let faces = mesh.counts.iter().map(|&count| {
         let ring = &mesh.indices[base..base + count];
         base += count;
-        // Newell's normal: twice the area along the face's normal.
         let mut n = DVec3::ZERO;
         for (i, &a) in ring.iter().enumerate() {
             let (p, q) = (mesh.points[a], mesh.points[ring[(i + 1) % ring.len()]]);
@@ -467,12 +474,20 @@ fn smooth_normals(mesh: &MeshPrim) -> Vec<DVec3> {
                 (p.x - q.x) * (p.y + q.y),
             );
         }
-        for &a in ring {
+        if mesh.left_handed { -n } else { n }
+    });
+    faces.collect()
+}
+
+/// Area-weighted point normals from the faces around each point.
+fn smooth_normals(mesh: &MeshPrim) -> Vec<DVec3> {
+    let mut acc = vec![DVec3::ZERO; mesh.points.len()];
+    let mut base = 0;
+    for (&count, n) in mesh.counts.iter().zip(face_normals(mesh)) {
+        for &a in &mesh.indices[base..base + count] {
             acc[a] += n;
         }
-    }
-    if mesh.left_handed {
-        acc.iter_mut().for_each(|n| *n = -*n);
+        base += count;
     }
     acc.into_iter().map(DVec3::normalize_or_zero).collect()
 }

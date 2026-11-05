@@ -208,3 +208,90 @@ fn xform_ops_compose_as_listed() {
         );
     }
 }
+
+/// `mesh.h`: "If a polygonal mesh specifies neither normals nor primvars:normals, then it should
+/// be treated and rendered as faceted". Storm's `_UseSmoothNormals` is false for `none` and
+/// `bilinear`; the other schemes smooth their hulls.
+#[test]
+fn polygonal_meshes_without_normals_are_faceted() {
+    for (scheme, faceted) in [("none", true), ("bilinear", true), ("catmullClark", false)] {
+        let a = cook(
+            &format!("faceted-{scheme}"),
+            &format!(
+                r#"def Mesh "M"
+{{
+    uniform token subdivisionScheme = "{scheme}"
+    int[] faceVertexCounts = [3, 3]
+    int[] faceVertexIndices = [0, 1, 2, 0, 3, 1]
+    point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)]
+}}"#
+            ),
+        );
+        let mesh = corners(&a, "u/mesh");
+        let face = |n: Vec3| n.abs_diff_eq(Vec3::Z, 1e-2) || n.abs_diff_eq(Vec3::Y, 1e-2);
+        assert_eq!(
+            mesh.iter().all(|c| face(c.1)),
+            faceted,
+            "{scheme}: {mesh:?}"
+        );
+    }
+}
+
+/// `primvar.h`: "Return the Primvar's interpolation, which is UsdGeomTokens->constant if
+/// unauthored". `pointBased.h`: the plain `normals` attribute falls back to `vertex`.
+#[test]
+fn unauthored_interpolation_is_constant_for_primvars_and_vertex_for_normals() {
+    let a = cook(
+        "interpolation-primvar",
+        &format!(
+            r#"def Mesh "M"
+{{
+    {TRIANGLE}
+    texCoord2f[] primvars:st = [(0.25, 0.75), (0.5, 0.5), (0.75, 0.25)]
+    normal3f[] primvars:normals = [(0, 1, 0), (1, 0, 0), (0, 0, 1)]
+}}"#
+        ),
+    );
+    for c in corners(&a, "u/mesh") {
+        assert_eq!(c.2, [0.25, 0.25], "st reads its first element, t flipped");
+        assert!(c.1.abs_diff_eq(Vec3::Y, 1e-2), "{}", c.1);
+    }
+    let a = cook(
+        "interpolation-normals",
+        &format!(
+            r#"def Mesh "M"
+{{
+    {TRIANGLE}
+    normal3f[] normals = [(0, 1, 0), (1, 0, 0), (0, 0, 1)]
+}}"#
+        ),
+    );
+    let by_point = [
+        (Vec3::ZERO, Vec3::Y),
+        (Vec3::X, Vec3::X),
+        (Vec3::Y, Vec3::Z),
+    ];
+    for c in corners(&a, "u/mesh") {
+        let (_, n) = by_point.iter().find(|p| p.0 == c.0).unwrap();
+        assert!(c.1.abs_diff_eq(*n, 1e-2), "{}", c.1);
+    }
+
+    // A primvar of no values holds nothing, whatever it would have applied to.
+    let a = cook(
+        "interpolation-empty",
+        &format!(
+            r#"def Mesh "M"
+{{
+    {TRIANGLE}
+    texCoord2f[] primvars:st = []
+    normal3f[] primvars:normals = []
+    normal3f[] normals = [(0, 1, 0), (0, 1, 0), (0, 1, 0)]
+}}"#
+        ),
+    );
+    assert!(
+        corners(&a, "u/mesh")
+            .iter()
+            .all(|c| c.1.abs_diff_eq(Vec3::Y, 1e-2))
+    );
+}

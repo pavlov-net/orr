@@ -494,7 +494,7 @@ impl<'s> Importer<'s> {
             let path = r.path().to_string();
             let o = owner[i].expect("owned");
             let mesh = MeshPrim::read(&r, &self.settings.uv, self.settings.uv1.as_deref())?;
-            let as_cage = mesh.scheme != "none" && self.settings.subdivision == Subdivision::Cage;
+            let as_cage = !mesh.polygonal() && self.settings.subdivision == Subdivision::Cage;
             let skeleton = models[o].skeleton.map(|k| &skels[k].1);
             let (skin, transform) = match (models[o].skinned, self.skinned(i), skeleton) {
                 (true, true, Some(sk)) => {
