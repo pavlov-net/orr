@@ -965,6 +965,63 @@ fn read_back(d: &Path, bytes: &[u8]) -> (u8, [[f32; 4]; 2]) {
     (info.header.primaries, [texels[0], texels[4]])
 }
 
+/// Color past Rec.2020 clips, so a file of primaries that reach there warns, once, where it is
+/// read as color.
+#[test]
+fn primaries_past_rec2020_warn_where_read_as_color() {
+    let d = dir("past-rec2020");
+    let path = d.join("image");
+    let wide = moxcms::ColorProfile::new_aces_aces_2065_1_linear();
+    let narrow = moxcms::ColorProfile::new_display_p3();
+    for (profile, usage, want) in [
+        (&wide, Usage::Hdr, 1),
+        (&wide, Usage::Linear4, 0),
+        (&narrow, Usage::Hdr, 0),
+    ] {
+        let icc = profile.encode().unwrap();
+        let red = [255u8, 0, 0].repeat(64);
+        let image = tagged::png(tagged::RGB8, [8, 8], &red, Some(&icc), &[]);
+        std::fs::write(&path, image).unwrap();
+        let settings = TextureSettings {
+            usage,
+            ..Default::default()
+        };
+        let (_, report) = cook(Source::Texture {
+            path: path.clone(),
+            settings,
+        });
+        let entries = report.assets.iter().flat_map(|a| &a.entries);
+        let warnings: Vec<&String> = entries.flat_map(|e| &e.warnings).collect();
+        assert_eq!(warnings.len(), want, "{usage:?}: {warnings:?}");
+    }
+}
+
+/// A float file's values below 0 clip in any primaries.
+#[test]
+fn color_below_zero_warns() {
+    let d = dir("below-zero");
+    let path = d.join("image.exr");
+    let warnings = |texel: [f32; 3], usage| {
+        let img = image::Rgb32FImage::from_fn(8, 8, |_, _| image::Rgb(texel));
+        image::DynamicImage::ImageRgb32F(img)
+            .save_with_format(&path, image::ImageFormat::OpenExr)
+            .unwrap();
+        let settings = TextureSettings {
+            usage,
+            ..Default::default()
+        };
+        let (_, report) = cook(Source::Texture {
+            path: path.clone(),
+            settings,
+        });
+        let entries = report.assets.iter().flat_map(|a| &a.entries);
+        entries.flat_map(|e| &e.warnings).count()
+    };
+    assert_eq!(warnings([-0.5, 1.0, 0.0], Usage::Hdr), 1);
+    assert_eq!(warnings([-0.5, 1.0, 0.0], Usage::Linear4), 0);
+    assert_eq!(warnings([0.5, 1.0, 0.0], Usage::Hdr), 0);
+}
+
 fn assert_rgb(got: [f32; 4], want: [f32; 3], what: &str) {
     let close = (0..3).all(|c| (got[c] - want[c]).abs() <= 0.012 * want[c].abs().max(0.25));
     assert!(close, "{what}: {got:?}, not {want:?}");

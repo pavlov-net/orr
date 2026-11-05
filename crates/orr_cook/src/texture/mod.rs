@@ -20,10 +20,10 @@ use orr_pack::texture::{
 use orr_pack::{ArchiveWriter, AssetId, BcLayout, BlobIn, Class, Filter, Hash32, Span};
 use serde::Deserialize;
 
-use color::{Decode, ImageColor, Read};
+use color::{CLIPS_BELOW, Decode, ImageColor, Read};
 use ctt::Quality;
 pub(crate) use encode::{Encoding, encode as encode_chains};
-use load::{Blocks, Source};
+use load::{Blocks, Gray, Source};
 pub(crate) use load::{decode_blocks, decode_channel, file_header};
 use mips::{MipSpec, Toksvig};
 
@@ -303,11 +303,18 @@ pub(crate) struct Built {
     info: TextureInfo,
     blobs: Vec<Vec<u8>>,
     filter: Filter,
+    /// Its source holds colors a texture can't.
+    pub(crate) clips: bool,
 }
 
 /// The report's warning for a source that reads the animated image `image`.
 pub(crate) fn first_frame_warning(image: &str) -> String {
     format!("image {image} is animated; only its first frame is cooked")
+}
+
+/// The report's warning for `images`, with colors a texture can't hold.
+pub(crate) fn gamut_warning(images: &str) -> String {
+    format!("colors of {images} below 0 or outside Rec.2020 clip")
 }
 
 /// The report's warning for a USD normal map `image` with no scale or bias, which an unsigned
@@ -529,6 +536,7 @@ fn layout(
         info: TextureInfo { header, lights },
         blobs,
         filter: Filter::None,
+        clips: false,
     }
 }
 
@@ -575,7 +583,13 @@ pub(crate) fn cook_file(
     quality: Quality,
 ) -> Result<Built> {
     load::open(bytes)
-        .and_then(|src| cook_source(src, s, quality))
+        .and_then(|mut src| {
+            let clips = clips(&mut src, s)?;
+            Ok(Built {
+                clips,
+                ..cook_source(src, s, quality)?
+            })
+        })
         .map(|b| b.with_split(s.bc_split))
         .map_err(|message| Error::Texture {
             asset: asset.into(),
@@ -587,6 +601,39 @@ pub(crate) fn cook_file(
 /// [`crate::key`].
 pub(crate) fn encoders(quality: Quality) -> String {
     format!("bc7e for BC7, amd for BC4 BC5, intel for BC6H, preset {quality:?}")
+}
+
+/// Whether `usage` holds color, not numbers.
+fn reads_color(usage: Usage) -> bool {
+    matches!(
+        usage,
+        Usage::Color
+            | Usage::ColorAlpha
+            | Usage::Hdr
+            | Usage::Data(DataFormat::Rgba8Srgb)
+            | Usage::Environment { .. }
+    )
+}
+
+/// Whether `src`, read as `s` says, holds colors a texture can't: past Rec.2020, or below 0 in
+/// the primaries they stay in. Gray that decoding spreads over RGB stays neutral through any
+/// primaries.
+fn clips(src: &mut Source, s: &TextureSettings) -> Result<bool, String> {
+    if !reads_color(s.usage) {
+        return Ok(false);
+    }
+    let (read, _, gamut) = ImageColor::File.color(&src.color, s.primaries);
+    let neutral = matches!(src.gray, Gray::Alone | Gray::WithAlpha);
+    if !neutral && read.clips(gamut.as_ref()) {
+        return Ok(true);
+    }
+    if !src.negatives {
+        return Ok(false);
+    }
+    load::decode_layers(src)?;
+    let below = |v: &f32| f64::from(*v) < CLIPS_BELOW;
+    let mut texels = src.layers.iter().flat_map(|l| &l.px);
+    Ok(texels.any(|p| p[..3].iter().any(below)))
 }
 
 fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result<Built, String> {
@@ -636,10 +683,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         (Some(c), Usage::Linear1) => Some((0, c)),
         (Some(_), u) => return Err(format!("alpha_cutoff does not apply to {u:?}")),
     };
-    let color = matches!(
-        s.usage,
-        Usage::Color | Usage::ColorAlpha | Usage::Hdr | Usage::Data(DataFormat::Rgba8Srgb)
-    );
+    let color = reads_color(s.usage);
     let normal = s.usage == Usage::Normal;
     let vectors = normal && src.float && src.negatives;
     if vectors {

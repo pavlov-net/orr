@@ -49,7 +49,7 @@ use orr_pack::{AssetId, Class, Hash32};
 use rayon::prelude::*;
 use serde::Deserialize;
 
-use super::color::{Decode, FileColor, ImageColor, Read, multiply};
+use super::color::{CLIPS_BELOW, Decode, FileColor, ImageColor, Read, multiply};
 use super::load::{self, Blocks, Gray, Source};
 use super::mips::{MipSpec, Toksvig, normalized, settled};
 use super::neural::{self, NeuralJob, NeuralSettings};
@@ -873,6 +873,27 @@ impl<'a> Packer<'a> {
     fn color_read(&self, r: &TexRef) -> (Read, Primaries, Option<DMat3>) {
         let over = self.overridden(&[r.image], |o| o.primaries);
         r.color.color(&self.image(r.image).color, over)
+    }
+
+    /// The images of `t`'s color inputs with colors a texture can't hold: past Rec.2020, or below
+    /// 0 in the primaries they stay in. Gray that repeats over RGB stays neutral through any
+    /// primaries.
+    pub(crate) fn clipped(&self, t: &MaterialTextures) -> Vec<usize> {
+        [&t.base_color, &t.emissive, &t.subsurface_color]
+            .into_iter()
+            .flatten()
+            .filter(|r| {
+                let (read, _, gamut) = self.color_read(r);
+                let f = self.image(r.image);
+                let neutral = r.rules != ImageRules::MaterialX && f.gray != Gray::No;
+                let below = |c| {
+                    self.read(r, c)
+                        .is_ok_and(|s| f64::from(r.read(c, f.range[s].0)) < CLIPS_BELOW)
+                };
+                (!neutral && read.clips(gamut.as_ref())) || (0..3).any(below)
+            })
+            .map(|r| r.image)
+            .collect()
     }
 
     /// The channel `r` reads for an input: the last override for its image that sets the

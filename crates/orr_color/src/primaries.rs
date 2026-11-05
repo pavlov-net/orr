@@ -188,6 +188,18 @@ mod tests {
     }
 
     #[test]
+    fn aces_ap0_matches_its_published_matrix() {
+        // The RGB to XYZ matrix of SMPTE ST 2065-1 (ACES2065-1), rows.
+        let npm = DMat3::from_cols_array_2d(&[
+            [0.952_552_395_9, 0.0, 0.000_093_678_6],
+            [0.343_966_449_8, 0.728_166_096_6, -0.072_132_546_4],
+            [0.0, 0.0, 1.008_825_184_4],
+        ])
+        .transpose();
+        assert_close(RgbPrimaries::ACES_AP0.rgb_to_xyz(), npm, 1e-9, "AP0");
+    }
+
+    #[test]
     fn matrices_round_trip_and_keep_white() {
         for a in SETS {
             assert_close(

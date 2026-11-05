@@ -346,6 +346,16 @@ impl Read {
         self.unmultiplied(self.decode.value(t[c]), t[3])
     }
 
+    /// Whether colors this reads through `gamut` can reach past Rec.2020, where they clip: a
+    /// texture holds none of its colors below 0.
+    pub(crate) fn clips(&self, gamut: Option<&DMat3>) -> bool {
+        match (&self.icc, gamut) {
+            (Some(icc), _) => icc.clips,
+            (None, Some(m)) => past_rec2020(m),
+            (None, None) => false,
+        }
+    }
+
     /// Linear `v` straight from a file that stores it premultiplied by `alpha`. Division by alpha
     /// recovers no color where alpha is 0, and OpenEXR allows color there, as light that covers
     /// nothing: it stays as stored.
@@ -375,11 +385,21 @@ pub(crate) struct FileColor {
     pub(crate) rgb8: bool,
 }
 
+/// What a channel reads below to clip: the margin keeps what rounds there.
+pub(crate) const CLIPS_BELOW: f64 = -1e-3;
+
+/// Whether matrix `m`, to Rec.2020, takes a primary outside it: its column is that primary.
+fn past_rec2020(m: &DMat3) -> bool {
+    m.to_cols_array().iter().any(|&v| v < CLIPS_BELOW)
+}
+
 /// An ICC profile's transform to linear Rec.2020.
 #[derive(Clone)]
 pub(crate) struct Icc {
     transform: Arc<moxcms::TransformF32Executor>,
     gray: bool,
+    /// The profile's colors reach past Rec.2020.
+    clips: bool,
 }
 
 impl fmt::Debug for Icc {
@@ -405,19 +425,14 @@ impl Icc {
 /// neither, or one that doesn't parse, states nothing, and `false` says so. A profile that reads
 /// as sRGB states that, with no transform: most profiles are sRGB, and their blocks and ids stay.
 pub(crate) fn read_icc(f: &mut FileColor, bytes: &[u8], gray: bool) -> bool {
-    let Some(icc) = icc_transform(bytes, gray) else {
+    let Some((mut icc, profile)) = icc_transform(bytes, gray) else {
         return false;
     };
-    const STEPS: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
-    let srgb = STEPS.iter().all(|&r| {
-        STEPS.iter().all(|&g| {
-            STEPS.iter().all(|&b| {
-                let (r, g, b) = if gray { (r, r, r) } else { (r, g, b) };
-                let want = rec709_to_rec2020([r, g, b].map(|v| srgb_decode(f64::from(v))));
-                let got = DVec3::from(icc.linear([r, g, b]).map(f64::from));
-                (got - want).abs().max_element() < 2e-3
-            })
-        })
+    let srgb = rgb_grid().all(|[r, g, b]| {
+        let rgb = if gray { [r; 3] } else { [r, g, b] };
+        let want = rec709_to_rec2020(rgb.map(|v| srgb_decode(f64::from(v))));
+        let got = DVec3::from(icc.linear(rgb).map(f64::from));
+        (got - want).abs().max_element() < 2e-3
     });
     if srgb {
         f.transfer = Some(Transfer::Srgb);
@@ -429,11 +444,22 @@ pub(crate) fn read_icc(f: &mut FileColor, bytes: &[u8], gray: bool) -> bool {
     let y = weights.dot(DVec3::from(icc.linear([0.5; 3]).map(f64::from)));
     let gamma = y.ln() / 0.5f64.ln();
     f.transfer = (gamma.is_finite() && gamma > 0.0).then_some(Transfer::Gamma(gamma as f32));
+    icc.clips = !gray && icc_clips(&profile);
     f.icc = Some(icc);
     true
 }
 
-fn icc_transform(bytes: &[u8], gray: bool) -> Option<Icc> {
+/// Steps through the RGB cube.
+fn rgb_grid() -> impl Iterator<Item = [f32; 3]> {
+    const STEPS: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
+    STEPS.into_iter().flat_map(|r| {
+        STEPS
+            .into_iter()
+            .flat_map(move |g| STEPS.map(|b| [r, g, b]))
+    })
+}
+
+fn icc_transform(bytes: &[u8], gray: bool) -> Option<(Icc, ColorProfile)> {
     let profile = ColorProfile::new_from_slice(bytes).ok()?;
     let stated = match profile.color_space {
         DataColorSpace::Gray => true,
@@ -452,7 +478,30 @@ fn icc_transform(bytes: &[u8], gray: bool) -> Option<Icc> {
     let transform = profile
         .create_transform_f32(layout, &target, Layout::Rgb, TransformOptions::default())
         .ok()?;
-    Some(Icc { transform, gray })
+    let icc = Icc {
+        transform,
+        gray,
+        clips: false,
+    };
+    Some((icc, profile))
+}
+
+/// Whether an RGB `profile`'s colors reach past Rec.2020. A transform clamps to its target, so
+/// they show only through AP0, which holds every color. The whole cube is read, because the
+/// primaries of a profile of tables don't bound its gamut. A profile with no such transform
+/// still reads through the one it has.
+fn icc_clips(profile: &ColorProfile) -> bool {
+    let wide = ColorProfile::new_aces_aces_2065_1_linear();
+    let options = TransformOptions::default();
+    let Ok(probe) = profile.create_transform_f32(Layout::Rgb, &wide, Layout::Rgb, options) else {
+        return false;
+    };
+    let to_rec2020 = RgbPrimaries::ACES_AP0.matrix_to(RgbPrimaries::REC2020);
+    rgb_grid().any(|rgb| {
+        let mut ap0 = [0.0f32; 3];
+        let read = probe.transform(&rgb, &mut ap0).is_ok();
+        read && (to_rec2020 * DVec3::from(ap0.map(f64::from))).min_element() < CLIPS_BELOW
+    })
 }
 
 /// RGB primaries at `[x, y]` of red, green, blue and white.
@@ -617,5 +666,25 @@ mod tests {
         assert!(white.iter().all(|c| (c - 1.0).abs() < 1e-5), "{white:?}");
         let hottest = multiply(&m.unwrap(), [f32::INFINITY; 3]);
         assert!(hottest.iter().all(|&c| c > 1e30), "{hottest:?}");
+    }
+
+    #[test]
+    fn only_primaries_past_rec2020_clip() {
+        let read = Read::of(Decode::STORED);
+        let clips = |p| read.clips(Gamut::Rgb(p).cooked().1.as_ref());
+        assert!(clips(RgbPrimaries::ACES_AP0));
+        assert!(clips(RgbPrimaries::ACES_CG));
+        assert!(!clips(RgbPrimaries::ADOBE_RGB));
+        assert!(!clips(RgbPrimaries::REC2020));
+        assert!(read.clips(Gamut::Xyz.cooked().1.as_ref()));
+
+        let icc = |p: ColorProfile| {
+            let mut f = FileColor::default();
+            assert!(read_icc(&mut f, &p.encode().unwrap(), false));
+            f.icc.unwrap().clips
+        };
+        assert!(icc(ColorProfile::new_aces_aces_2065_1_linear()));
+        assert!(!icc(ColorProfile::new_display_p3()));
+        assert!(!icc(ColorProfile::new_bt2020()));
     }
 }

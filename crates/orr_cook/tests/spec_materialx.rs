@@ -1255,8 +1255,11 @@ fn named_spaces_stand_over_what_the_file_states() {
         (r#"colorspace="acescg""#, 2),
     ] {
         let image = image_node("color3", "tagged.png", attrs);
-        let (a, _) = cook_body(&image, color).unwrap();
+        let (a, report) = cook_body(&image, color).unwrap();
         assert_eq!(primaries(&a), want, "{attrs}");
+        let warnings = &report.assets[0].warnings;
+        let clipped = warnings.iter().filter(|w| w.contains("Rec.2020")).count();
+        assert_eq!(clipped, usize::from(want == 2), "{attrs}: {warnings:?}");
     }
 }
 

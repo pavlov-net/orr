@@ -1734,6 +1734,18 @@ fn plan_scene(
         materials.push((AssetId::from_name(&unit.name), unit.key, cooked));
         units.push(unit);
     }
+    let clipped: BTreeSet<usize> = src
+        .materials
+        .iter()
+        .flat_map(|m| packer.clipped(&m.textures))
+        .collect();
+    if let Some(&first) = clipped.first() {
+        let name = &src.images[first].name;
+        warnings.push(texture::gamut_warning(&match clipped.len() - 1 {
+            0 => name.clone(),
+            more => format!("{name} and {more} more images"),
+        }));
+    }
     let jobs = std::mem::take(&mut packer.jobs);
     let sets = std::mem::take(&mut packer.neural);
     drop(packer);
@@ -2446,6 +2458,9 @@ fn cook_unit(
         Work::TextureFile(path, hash, settings) => {
             let bytes = state::read_checked(&path, hash)?;
             let built = texture::cook_file(name, &bytes, &settings, shared.quality)?;
+            if built.clips {
+                detail.warnings.push(texture::gamut_warning(name));
+            }
             texture::add(&mut w, name, key, &built)?;
         }
         Work::Subd(data, materials, settings) => {
