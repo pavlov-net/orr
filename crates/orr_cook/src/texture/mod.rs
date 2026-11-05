@@ -147,7 +147,7 @@ pub enum DataFormat {
 pub enum MipFilter {
     /// Area average.
     Box,
-    /// Kaiser-windowed sinc, 3 lobes, alpha 4.
+    /// Kaiser-windowed sinc, 3 lobes, alpha 4. BC6H mips use [`Self::Box`] instead.
     #[default]
     Kaiser,
 }
@@ -190,17 +190,31 @@ impl Img {
         finite.fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)))
     }
 
-    /// Bilinear resize; used to bring a packed texture's inputs to one size.
+    /// Bilinear resize; used to bring a packed texture's inputs to one size. A non-finite texel
+    /// takes an end of its channel's range, or every tap beside it would read it.
     fn resized(self: Arc<Self>, w: u32, h: u32) -> Arc<Self> {
         if (w, h) == (self.w, self.h) {
             return self;
         }
+        let held = self.px.iter().flatten().any(|v| !v.is_finite()).then(|| {
+            let ranges: [_; 4] = std::array::from_fn(|c| self.finite_range(c));
+            let mut held = (*self).clone();
+            for p in &mut held.px {
+                for (v, (lo, hi)) in p.iter_mut().zip(ranges) {
+                    if !v.is_finite() {
+                        *v = if lo <= hi { v.max(lo).min(hi) } else { 0.0 };
+                    }
+                }
+            }
+            held
+        });
+        let src = held.as_ref().unwrap_or(&self);
         let mut out = Self::new(w, h);
         for y in 0..h {
             for x in 0..w {
                 let sx = (x as f32 + 0.5) * self.w as f32 / w as f32 - 0.5;
                 let sy = (y as f32 + 0.5) * self.h as f32 / h as f32 - 0.5;
-                out.px[(y * w + x) as usize] = self.bilinear(sx, sy);
+                out.px[(y * w + x) as usize] = src.bilinear(sx, sy);
             }
         }
         Arc::new(out)
@@ -310,9 +324,17 @@ fn chains(layers: Vec<Img>, plan: &Plan, first: usize) -> Result<Vec<Vec<Img>>, 
     }
     let skip = skipped_mips(w, h, plan.max_size) as usize;
     let count = kept_mip_count(w, h, plan.max_size, plan.full_chain);
+    // Normals and heights hold their own ranges.
+    let settles = count > 1 && !plan.mips.normal && !plan.mips.height;
+    let (lo, hi) = plan.encoding.range();
     let mut chains: Vec<Vec<Img>> = layers
         .into_iter()
-        .map(|l| mips::chain(l, &plan.mips, count))
+        .map(|mut l| {
+            if settles {
+                mips::settle(&mut l, lo, hi);
+            }
+            mips::chain(l, &plan.mips, count)
+        })
         .collect();
     if let Some(t) = &plan.toksvig {
         for c in &mut chains {
@@ -585,7 +607,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         cube: src.cube,
         primaries,
         mips: MipSpec {
-            filter: s.filter,
+            filter: encoding.mip_filter(s.filter),
             wrap: s.wrap,
             grid: s.atlas_grid.map(|g| g.map(u32::from)),
             normal,

@@ -14,7 +14,7 @@ use orr_pack::texture::{ExtractedLight, octahedral};
 use rayon::prelude::*;
 
 use super::load::Source;
-use super::mips::MipSpec;
+use super::mips::{MipSpec, settled};
 use super::{Encoding, Img, MipFilter, Plan, Primaries, TextureSettings, Wrap, srgb_to_linear};
 
 const SUB: u32 = 4;
@@ -34,6 +34,14 @@ pub(super) fn cook(
                     *c = srgb_to_linear(*c);
                 }
             }
+        }
+    }
+    // Finite values past the format's range stay, for the lights to take. Others would spread
+    // through the resampling and the lights' energy.
+    let (lo, hi) = Encoding::Bc6h.range();
+    for v in src.layers.iter_mut().flat_map(|l| &mut l.px).flatten() {
+        if !v.is_finite() {
+            *v = settled(*v, lo, hi);
         }
     }
     let n = s.max_size.unwrap_or(1024).max(4);

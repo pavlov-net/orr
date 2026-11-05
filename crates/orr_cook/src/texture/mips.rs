@@ -57,6 +57,20 @@ pub(super) fn chain(base: Img, spec: &MipSpec, count: u32) -> Vec<Img> {
     out
 }
 
+/// `v` in `lo..hi`, which holds 0; NaN reads 0.
+pub(super) fn settled(v: f32, lo: f32, hi: f32) -> f32 {
+    if v.is_nan() { 0.0 } else { v.clamp(lo, hi) }
+}
+
+/// Holds `l` to `lo..hi`, the range its format stores. Filtering texels the format can't hold
+/// spreads them through the mips: an infinite tap under a negative lobe makes NaN of its
+/// neighbors, and a mip should average what the mip above it stores.
+pub(super) fn settle(l: &mut Img, lo: f32, hi: f32) {
+    l.px.par_iter_mut()
+        .flatten()
+        .for_each(|v| *v = settled(*v, lo, hi));
+}
+
 /// Stores non-finite heights as a format of fixed span does, at an end of the image's finite
 /// range, or at 0 without one, and returns that range. Geometry can't be displaced by them, and
 /// filtering would spread them through the mips.
@@ -102,7 +116,7 @@ fn cell_mip(w: u32, h: u32, [gx, gy]: [u32; 2]) -> bool {
 pub(super) fn normalized(p: [f32; 4]) -> [f32; 4] {
     let n = Vec3::from_slice(&p);
     let l = n.length();
-    if l > 0.0 {
+    if l > 0.0 && l.is_finite() {
         (n / l).extend(p[3]).to_array()
     } else {
         [0.0, 0.0, 1.0, p[3]]

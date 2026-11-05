@@ -1510,7 +1510,7 @@ impl TextureJob {
             cube: false,
             primaries: self.primaries,
             mips: MipSpec {
-                filter: self.filter,
+                filter: p.encoding.mip_filter(self.filter),
                 wrap: p.refs[0].wrap,
                 grid: self.grid.map(|g| g.map(u32::from)),
                 normal: p.normal,

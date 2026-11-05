@@ -10,7 +10,8 @@ use ctt::{
 use half::f16;
 use orr_pack::texture::{FormatInfo, vk};
 
-use super::{DataFormat, Img, Usage, linear_to_srgb};
+use super::mips::settled;
+use super::{DataFormat, Img, MipFilter, Usage, linear_to_srgb};
 
 /// Stored format of a cooked texture.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -44,6 +45,30 @@ impl Encoding {
             Usage::Displacement if signed => Self::Raw(DataFormat::R16Snorm),
             Usage::Displacement => Self::Raw(DataFormat::R16),
             Usage::Data(f) => Self::Raw(f),
+        }
+    }
+
+    /// The range of values this stores; for formats of floats, the finite ones a filter can sum.
+    pub(super) fn range(self) -> (f32, f32) {
+        use DataFormat as D;
+        let half = f16::MAX.to_f32();
+        match self {
+            Self::Bc4Snorm | Self::Bc5Snorm | Self::Raw(D::R16Snorm) => (-1.0, 1.0),
+            Self::Bc6h => (0.0, half),
+            Self::Raw(D::R16f | D::Rg16f | D::Rgba16f) => (-half, half),
+            Self::Raw(D::R32f | D::Rg32f | D::Rgba32f) => (f32::MIN / 16.0, f32::MAX / 16.0),
+            _ => (0.0, 1.0),
+        }
+    }
+
+    /// The filter that makes this format's mips from `asked`. Kaiser's negative lobes are clipped
+    /// at 0 in non-negative images, which adds energy, and around an HDR texel that is more than
+    /// the mean of the image: one texel of 65504 in a white 64x64 doubles the 1x1.
+    pub(super) fn mip_filter(self, asked: MipFilter) -> MipFilter {
+        if self == Self::Bc6h {
+            MipFilter::Box
+        } else {
+            asked
         }
     }
 
@@ -123,6 +148,13 @@ fn snorm16(v: f32) -> [u8; 2] {
     ((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes()
 }
 
+/// `v` as a half float, at the largest finite one past them: a Kaiser mip overshoots a step
+/// beside the largest half, which would otherwise store as infinity.
+fn half(v: f32) -> [u8; 2] {
+    let max = f16::MAX.to_f32();
+    f16::from_f32(v.clamp(-max, max)).to_le_bytes()
+}
+
 fn raw(d: DataFormat, m: &Img) -> Vec<u8> {
     let mut out = Vec::new();
     for p in &m.px {
@@ -138,13 +170,9 @@ fn raw(d: DataFormat, m: &Img) -> Vec<u8> {
             DataFormat::R16Snorm => out.extend(snorm16(p[0])),
             DataFormat::Rg16 => out.extend(p[..2].iter().flat_map(|&v| unorm16(v))),
             DataFormat::Rgba16 => out.extend(p.iter().flat_map(|&v| unorm16(v))),
-            DataFormat::R16f => out.extend(f16::from_f32(p[0]).to_le_bytes()),
-            DataFormat::Rg16f => {
-                out.extend(p[..2].iter().flat_map(|&v| f16::from_f32(v).to_le_bytes()));
-            }
-            DataFormat::Rgba16f => {
-                out.extend(p.iter().flat_map(|&v| f16::from_f32(v).to_le_bytes()));
-            }
+            DataFormat::R16f => out.extend(half(p[0])),
+            DataFormat::Rg16f => out.extend(p[..2].iter().flat_map(|&v| half(v))),
+            DataFormat::Rgba16f => out.extend(p.iter().flat_map(|&v| half(v))),
             DataFormat::R32f => out.extend(p[0].to_le_bytes()),
             DataFormat::Rg32f => out.extend(p[..2].iter().flat_map(|v| v.to_le_bytes())),
             DataFormat::Rgba32f => out.extend(p.iter().flat_map(|v| v.to_le_bytes())),
@@ -187,12 +215,12 @@ fn bc(e: Encoding, quality: Quality, chains: &[Vec<Img>]) -> Result<Vec<Vec<Vec<
         Encoding::Raw(_) => unreachable!("raw formats skip ctt"),
     };
     let srgb = e == Encoding::Bc7Srgb;
+    let (lo, hi) = e.range();
     let texel = |p: &[f32; 4], out: &mut Vec<u8>| match e {
-        Encoding::Bc6h => out.extend(
-            [p[0].max(0.0), p[1].max(0.0), p[2].max(0.0), 1.0]
-                .iter()
-                .flat_map(|v| v.to_le_bytes()),
-        ),
+        Encoding::Bc6h => {
+            let [r, g, b] = [p[0], p[1], p[2]].map(|v| settled(v, lo, hi));
+            out.extend([r, g, b, 1.0].iter().flat_map(|v| v.to_le_bytes()));
+        }
         Encoding::Bc4 | Encoding::Bc5 => out.extend(p[..bpp].iter().map(|&v| unorm8(v))),
         Encoding::Bc4Snorm | Encoding::Bc5Snorm => {
             out.extend(p[..bpp].iter().map(|&v| snorm8(v)));
