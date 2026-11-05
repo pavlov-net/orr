@@ -362,6 +362,8 @@ struct NormalSource {
     signed: bool,
     /// The texel channel holding y.
     y: usize,
+    /// The texel channel holding z, where it holds one.
+    z: usize,
 }
 
 impl NormalSource {
@@ -372,7 +374,7 @@ impl NormalSource {
         let z = if self.rg {
             normal::z(x, y)
         } else {
-            component(t[2])
+            component(t[self.z])
         };
         [x, y, z]
     }
@@ -392,6 +394,7 @@ fn stores_normals(layers: &[Img], rg: bool) -> bool {
         rg: false,
         signed,
         y: 1,
+        z: 2,
     });
     if rg {
         let outside = |s: NormalSource| {
@@ -599,6 +602,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         rg: src.rg,
         signed: src.signed || (vectors && stores_normals(&src.layers, src.rg)),
         y: 1,
+        z: 2,
     };
     let linear = |p: &mut [f32; 4]| {
         if color && srgb {

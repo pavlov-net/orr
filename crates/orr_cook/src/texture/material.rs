@@ -153,7 +153,7 @@ impl TexRef {
         let z = if source.rg {
             orr_pack::texture::normal::z(x, y)
         } else {
-            self.read(2, t[2])
+            self.read(2, t[source.z])
         };
         [x, y, z]
     }
@@ -377,7 +377,7 @@ fn facts_of(bytes: &[u8], hash: Hash32, height: bool, normal: bool) -> Result<Im
             float: s.float,
             negatives: s.negatives,
             stored_normals,
-            gray: Gray::No,
+            gray: s.gray,
             animated: false,
         });
     }
@@ -551,16 +551,19 @@ impl<'a> Packer<'a> {
 
     /// Channel `c` of `r` as its rules read the file: a channel of the decoded image, or the
     /// value of one the file doesn't hold. MaterialX reads a file's N channels as they are, zero
-    /// past them and 1 in the fourth, where the decoded image spreads a gray one over RGB.
+    /// past them and 1 in the fourth. USD repeats the first of one or two over RGB, with the second
+    /// as alpha, and glTF repeats one.
     fn read(&self, r: &TexRef, c: usize) -> Result<usize, f32> {
-        if r.rules != ImageRules::MaterialX {
-            return Ok(c);
-        }
-        match (self.image(r.image).gray, c) {
-            (Gray::No, _) | (_, 0) => Ok(c),
-            (Gray::WithAlpha, 1) => Ok(3),
-            (_, 3) => Err(1.0),
-            _ => Err(0.0),
+        let f = self.image(r.image);
+        match (r.rules, f.gray, c) {
+            (_, _, 0) => Ok(0),
+            (ImageRules::MaterialX, Gray::WithAlpha, 1) => Ok(3),
+            (ImageRules::MaterialX, Gray::Alone | Gray::WithAlpha, 3) => Err(1.0),
+            (ImageRules::MaterialX, Gray::Alone | Gray::WithAlpha, _) => Err(0.0),
+            (ImageRules::MaterialX, ..) => Ok(c),
+            (_, Gray::Red, 1 | 2) => Ok(0),
+            (ImageRules::Usd, ..) if f.rg => Ok(if c == 3 { 1 } else { 0 }),
+            _ => Ok(c),
         }
     }
 
@@ -647,17 +650,29 @@ impl<'a> Packer<'a> {
             }),
             Some(m) => m,
         };
+        let r = self.file_channels(*r);
         // A channel the file doesn't hold reads as the same decode of its fill value.
-        let remap = Some(std::array::from_fn(|c| match self.read(r, c) {
+        let remap = Some(std::array::from_fn(|c| match self.read(&r, c) {
             Ok(_) => m[c],
             Err(v) => [m[c][0] + m[c][1] * v, 0.0],
         }));
         let source = NormalSource {
             rg: f.rg,
             signed: f.stored_normals,
-            y: self.read(r, 1).unwrap_or(1),
+            y: self.read(&r, 1).unwrap_or(1),
+            z: self.read(&r, 2).unwrap_or(2),
         };
-        (TexRef { remap, ..*r }, source)
+        (TexRef { remap, ..r }, source)
+    }
+
+    /// `r` reading the channels a two-channel file holds, not what USD's outputs make of them:
+    /// a normal's x and y, or a channel an override names.
+    fn file_channels(&self, r: TexRef) -> TexRef {
+        let rules = match r.rules {
+            ImageRules::Usd if self.image(r.image).rg => ImageRules::MaterialX,
+            rules => rules,
+        };
+        TexRef { rules, ..r }
     }
 
     /// The primaries of a color texture made from image `i`: the last override that sets
@@ -690,6 +705,11 @@ impl<'a> Packer<'a> {
                 message: format!("image {name}: no channel {channel}"),
             });
         }
+        let r = if set.is_some() {
+            self.file_channels(r)
+        } else {
+            r
+        };
         Ok(TexRef { channel, ..r })
     }
 

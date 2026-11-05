@@ -18,12 +18,16 @@ use rayon::prelude::*;
 
 use super::{Img, Primaries};
 
-/// What a gray file holds, whose decoded texels spread the gray over RGB.
+/// What a file of one channel, or of gray and alpha, holds.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum Gray {
     No,
+    /// Gray alone, which decoded texels spread over RGB.
     Alone,
+    /// Gray and alpha, likewise.
     WithAlpha,
+    /// One channel, which decoded texels hold in red alone.
+    Red,
 }
 
 /// A decoded image file.
@@ -106,6 +110,7 @@ pub(super) fn open(bytes: &[u8]) -> Result<Source, String> {
     if let Some(s) = ktx2_swizzle(bytes) {
         decode_layers(&mut src)?;
         src.blocks = None;
+        src.gray = Gray::No;
         // Past the file's two channels, only what decoding fills in leaves it two.
         src.rg &= s[2].keeps(2, 2) && s[3].keeps(3, 2);
         for p in src.layers.iter_mut().flat_map(|l| &mut l.px) {
@@ -176,6 +181,7 @@ pub(crate) struct Scan {
     pub(super) signed: bool,
     pub(super) float: bool,
     pub(super) negatives: bool,
+    pub(super) gray: Gray,
     pub(super) range: [(f32, f32); 4],
 }
 
@@ -287,7 +293,7 @@ impl<'a> Ktx2Blocks<'a> {
             signed: signed_blocks(self.vk_format()),
             float: float_blocks(self.vk_format()),
             negatives: negative_blocks(self.vk_format()),
-            gray: Gray::No,
+            gray: gray_blocks(self.vk_format()),
             blocks: Some(Blocks {
                 vk_format: self.vk_format(),
                 w: h.pixel_width,
@@ -329,6 +335,7 @@ impl<'a> Ktx2Blocks<'a> {
             signed: signed_blocks(vk_format),
             float: float_blocks(vk_format),
             negatives: negative_blocks(vk_format),
+            gray: gray_blocks(vk_format),
             range,
         })
     }
@@ -345,6 +352,14 @@ fn signed_blocks(vk_format: u32) -> bool {
 
 fn float_blocks(vk_format: u32) -> bool {
     matches!(vk_format, vk::BC6H_UFLOAT | vk::BC6H_SFLOAT)
+}
+
+fn gray_blocks(vk_format: u32) -> Gray {
+    if matches!(vk_format, vk::BC4_UNORM | vk::BC4_SNORM) {
+        Gray::Red
+    } else {
+        Gray::No
+    }
 }
 
 fn negative_blocks(vk_format: u32) -> bool {
@@ -464,7 +479,7 @@ fn container(image: ctt::Image) -> Result<Source, String> {
             signed: signed_blocks(vk_format),
             float: float_blocks(vk_format),
             negatives: negative_blocks(vk_format),
-            gray: Gray::No,
+            gray: gray_blocks(vk_format),
         });
     }
     // Uncompressed: ctt converts to f32 RGBA in the file's color space. Read as straight alpha
@@ -518,7 +533,11 @@ fn container(image: ctt::Image) -> Result<Source, String> {
         signed: is_snorm(format),
         float: is_float(format),
         negatives: is_snorm(format) || (is_float(format) && !is_ufloat(format)),
-        gray: Gray::No,
+        gray: if format.channel_count() == Some(1) {
+            Gray::Red
+        } else {
+            Gray::No
+        },
     })
 }
 
