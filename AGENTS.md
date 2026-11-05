@@ -12,6 +12,8 @@ setup. It has no users yet.
   do it. Don't refuse input, drop a feature or work around a limitation to avoid a larger change.
 - Don't skip, defer or downplay a problem by calling a case rare, unlikely or degenerate unless
   you measured it. Decide on whether it's correct, not on how often you guess it happens.
+- Don't defer known work. A bug or gap you find in what you're building gets fixed now: "later",
+  "out of scope" and "needs its own design" aren't reasons. If it's truly separate, say why and ask.
 - Don't vendor third-party code: no copied sources, submodules or committed derived data. Use crate
   dependencies, bindgen against an SDK found by environment variable, or a pinned fetch into the
   ignored `.tools/`. The exceptions are small numeric tables, with their source and license at the
