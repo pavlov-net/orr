@@ -39,11 +39,13 @@ use crate::import::{PlacedModel, Scene};
 use crate::instances::{self, Catalog, ModelFacts, PageFrame};
 use crate::key::{self, Key};
 use crate::mesh::maps::{
-    Displacement, Map, Opacity, OpacityMap, OpacityRead, Passes, Raster, Reach, Tiles,
+    Displacement, Emission, EmissionMap, Map, Opacity, OpacityMap, OpacityRead, Passes, Raster,
+    Reach, Tiles,
 };
 use crate::mesh::{
-    self, DisplacementSpec, DisplacementTexture, MapRead, MapSpec, MapTexture, MeshData, MeshInput,
-    MeshSource, NormalSpec, OpacitySpec, PartData, Pivots, SectionData, SectionMaps,
+    self, DisplacementSpec, DisplacementTexture, EmissionSpec, MapRead, MapSpec, MapTexture,
+    MeshData, MeshInput, MeshSource, NormalSpec, OpacitySpec, PartData, Pivots, SectionData,
+    SectionMaps,
 };
 use crate::raster::{self, RasterReport};
 use crate::report::{
@@ -63,9 +65,10 @@ use crate::{
     PrototypeSpec, Result, Source, TextureSettings, UsdSettings, mount,
 };
 
-/// Each of the two caches of decoded data holds up to this part of the working set, which
-/// the jobs' estimates leave free.
+/// Each of the [`DECODED_CACHES`] caches of decoded data holds up to this part of the working
+/// set, which the jobs' estimates leave free.
 const DECODED_SHARE: u64 = 16;
+const DECODED_CACHES: u64 = 3;
 
 /// Peak bytes of a subdivision cage cook per cage face, an estimate.
 const SUBD_BYTES_PER_FACE: u64 = 16 << 10;
@@ -92,6 +95,7 @@ pub(crate) fn cook(manifest: &Manifest, opts: &CookOptions) -> Result<Cooked> {
             .unwrap_or_else(|| crate::quality::zstd_level(opts.quality)),
         images: Decoded::new(opts.working_set / DECODED_SHARE, Img::bytes),
         opacity: Decoded::new(opts.working_set / DECODED_SHARE, OpacityMap::bytes),
+        emission: Decoded::new(opts.working_set / DECODED_SHARE, EmissionMap::bytes),
     };
     let threads = rayon::current_num_threads();
     let mut run = Run::new(manifest, opts, &shared)?;
@@ -123,6 +127,8 @@ struct Shared {
     images: Decoded<Img>,
     /// Cooked opacity mips by cook key and cutoff, for the mesh jobs that read them.
     opacity: Decoded<OpacityMap>,
+    /// Cooked emission luminance by cook key, for the mesh jobs that read it.
+    emission: Decoded<EmissionMap>,
 }
 
 struct Unit<'m> {
@@ -1136,7 +1142,8 @@ impl<'m, 's> Run<'m, 's> {
         's: 't,
     {
         let (mut running, mut bytes) = (0usize, 0u64);
-        let budget = self.opts.working_set - 2 * (self.opts.working_set / DECODED_SHARE);
+        let budget =
+            self.opts.working_set - DECODED_CACHES * (self.opts.working_set / DECODED_SHARE);
         loop {
             while let Some(u) = self.local.pop() {
                 self.finish_local(u)?;
@@ -2050,11 +2057,20 @@ fn map_spec(m: &Material, textures: &HashMap<AssetId, MapTexture>) -> MapSpec {
         },
         Some((None, _)) => NormalSpec::Tangent { frame_set },
     };
+    let emission = match bound(slot::EMISSION) {
+        Some((Some(texture), uv_set)) if m.emits() => Some(EmissionSpec {
+            texture: texture.clone(),
+            read: read(slot::EMISSION),
+            uv_set,
+        }),
+        _ => None,
+    };
     MapSpec {
         tangent_displacement,
         opacity,
         displacement,
         normal,
+        emission,
         uv1: mesh::reads_uv1(m),
     }
 }
@@ -2360,6 +2376,7 @@ fn section_maps(
     archives: &HashMap<String, Arc<Archive>>,
     normals: bool,
     opacity_maps: &Decoded<OpacityMap>,
+    emission_maps: &Decoded<EmissionMap>,
 ) -> Result<Vec<SectionMaps>> {
     let _z = crate::profile::zone!("mesh.maps");
     let read = |unit: &str, all: bool, read, channels| {
@@ -2482,11 +2499,39 @@ fn section_maps(
             }
             _ => None,
         };
+        let emission = match &s.maps.emission {
+            None => None,
+            Some(e) => {
+                // A set's tiles share their primaries, which its slot's values are in too.
+                let unit = e.texture.units().next().expect("a texture has a unit");
+                let y = luminance_weights(&archives[unit], AssetId::from_name(unit))?;
+                let luminance = |[r, g, b, _]: [f32; 4]| y.x * r + y.y * g + y.z * b;
+                let tile = |unit: &str, key: Hash32, at: MapRead| {
+                    let map = emission_maps.get((key, 0), || {
+                        emission_map(&archives[unit], AssetId::from_name(unit))
+                    })?;
+                    Ok(Raster {
+                        w: map.w,
+                        h: map.h,
+                        texels: Arc::clone(&map.texels),
+                        wrap: at.wrap,
+                        uv: at.uv,
+                        outside: luminance(at.outside),
+                    })
+                };
+                let missing = |outside| Raster::solid(luminance(outside));
+                Some(Emission {
+                    map: read_map(&e.texture, e.read, uvs(e.uv_set), tile, missing)?,
+                    uv_set: e.uv_set,
+                })
+            }
+        };
         out.push(SectionMaps {
             opacity,
             displacement,
             tangent_displacement,
             normal,
+            emission,
         });
     }
     Ok(out)
@@ -2523,6 +2568,92 @@ fn read_map<T>(
     }))
 }
 
+/// The blobs of a cooked texture and its parsed blob 0.
+fn texture_head(arc: &Archive, id: AssetId) -> Result<(&[orr_pack::Blob], TextureInfo)> {
+    let e = arc.expect(id, Class::Texture as u16, orr_pack::texture::SCHEMA)?;
+    let blobs = arc.blobs(e);
+    let mut head = vec![0; blobs[0].raw_len as usize];
+    arc.read(&blobs[0], &mut head)?;
+    Ok((blobs, TextureInfo::parse(&head)?))
+}
+
+/// Luminance per channel in a cooked texture's primaries.
+fn luminance_weights(arc: &Archive, id: AssetId) -> Result<Vec3> {
+    let primaries = texture_head(arc, id)?.1.header.primaries;
+    header_luminance(primaries)
+}
+
+/// Luminance per channel in primaries `id`.
+fn header_luminance(id: u8) -> Result<Vec3> {
+    let primaries =
+        orr_color::Primaries::from_id(id).ok_or(orr_pack::Error::Malformed("texture primaries"))?;
+    Ok(primaries.rgb().luminance_weights().as_vec3())
+}
+
+/// The luminance, in the texture's primaries, of the first mip of a cooked emission texture
+/// no larger than [`EmissionMap::SIDE_MAX`] a side, or of its last.
+fn emission_map(arc: &Archive, id: AssetId) -> Result<EmissionMap> {
+    let (blobs, info) = texture_head(arc, id)?;
+    let h = info.header;
+    let mip = (0..u32::from(h.mip_count))
+        .find(|&m| h.mip_size(m).into_iter().max() <= Some(EmissionMap::SIDE_MAX))
+        .unwrap_or(u32::from(h.mip_count) - 1);
+    let b = h.mip_blob(mip);
+    let mut blob = vec![0; blobs[b].raw_len as usize];
+    arc.read(&blobs[b], &mut blob)?;
+    let bytes = info.mip_texels(&blob, mip, 0)?;
+    let [w, hh] = h.mip_size(mip);
+    let srgb = h.vk_format == orr_pack::texture::vk::BC7_SRGB;
+    let planes = mip_planes(h.vk_format, w, hh, &bytes, 3)?;
+    let y = header_luminance(h.primaries)?;
+    let linear = |c: f32| if srgb { texture::srgb_to_linear(c) } else { c };
+    let [r, g, b] = [&planes[0], &planes[1], &planes[2]];
+    let texels = (0..r.len())
+        .map(|i| y.x * linear(r[i]) + y.y * linear(g[i]) + y.z * linear(b[i]))
+        .collect();
+    Ok(EmissionMap {
+        w,
+        h: hh,
+        texels: Arc::new(texels),
+    })
+}
+
+/// The first `channels` channels of a cooked mip, one plane each, as the texture reads them.
+fn mip_planes(format: u32, w: u32, h: u32, bytes: &[u8], channels: usize) -> Result<Vec<Vec<f32>>> {
+    use orr_pack::texture::vk;
+    let unread = |_| orr_pack::Error::Malformed("texture format the mesh cook reads");
+    let pairs = || bytes.chunks_exact(2).map(|b| [b[0], b[1]]);
+    let red = |r: Vec<f32>| {
+        let n = r.len();
+        let mut planes = vec![r];
+        planes.extend([0.0, 0.0, 1.0].map(|v| vec![v; n]));
+        planes.truncate(channels);
+        planes
+    };
+    let planes: Vec<Vec<f32>> = match format {
+        vk::R16_UNORM => red(pairs()
+            .map(|b| f32::from(u16::from_le_bytes(b)) / 65535.0)
+            .collect()),
+        vk::R16_SNORM => red(pairs()
+            .map(|b| (f32::from(i16::from_le_bytes(b)) / 32767.0).max(-1.0))
+            .collect()),
+        vk::R32_SFLOAT => red(bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect()),
+        f if channels == 1 => {
+            vec![texture::decode_channel(f, w, h, bytes, 0).map_err(unread)?]
+        }
+        f => {
+            let px = texture::decode_blocks(f, w, h, bytes).map_err(unread)?.px;
+            (0..channels)
+                .map(|c| px.iter().map(|p| p[c]).collect())
+                .collect()
+        }
+    };
+    Ok(planes)
+}
+
 /// Mip 0, or every mip with `all`, of a cooked texture: per mip, its first `channels`
 /// channels as rasters.
 fn texture_mips(
@@ -2532,12 +2663,7 @@ fn texture_mips(
     read: MapRead,
     channels: usize,
 ) -> Result<Vec<Raster>> {
-    use orr_pack::texture::vk;
-    let e = arc.expect(id, Class::Texture as u16, orr_pack::texture::SCHEMA)?;
-    let blobs = arc.blobs(e);
-    let mut head = vec![0; blobs[0].raw_len as usize];
-    arc.read(&blobs[0], &mut head)?;
-    let info = TextureInfo::parse(&head)?;
+    let (blobs, info) = texture_head(arc, id)?;
     let h = info.header;
     let mips = if all { u32::from(h.mip_count) } else { 1 };
     let mut out = Vec::with_capacity(mips as usize);
@@ -2550,36 +2676,7 @@ fn texture_mips(
         }
         let bytes = info.mip_texels(&blob.1, mip, 0)?;
         let [w, hh] = h.mip_size(mip);
-        let unread = |_| orr_pack::Error::Malformed("texture format the mesh cook reads");
-        let pairs = || bytes.chunks_exact(2).map(|b| [b[0], b[1]]);
-        let red = |r: Vec<f32>| {
-            let n = r.len();
-            let mut planes = vec![r];
-            planes.extend([0.0, 0.0, 1.0].map(|v| vec![v; n]));
-            planes.truncate(channels);
-            planes
-        };
-        let planes: Vec<Vec<f32>> = match h.vk_format {
-            vk::R16_UNORM => red(pairs()
-                .map(|b| f32::from(u16::from_le_bytes(b)) / 65535.0)
-                .collect()),
-            vk::R16_SNORM => red(pairs()
-                .map(|b| (f32::from(i16::from_le_bytes(b)) / 32767.0).max(-1.0))
-                .collect()),
-            vk::R32_SFLOAT => red(bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect()),
-            f if channels == 1 => {
-                vec![texture::decode_channel(f, w, hh, &bytes, 0).map_err(unread)?]
-            }
-            f => {
-                let px = texture::decode_blocks(f, w, hh, &bytes).map_err(unread)?.px;
-                (0..channels)
-                    .map(|c| px.iter().map(|p| p[c]).collect())
-                    .collect()
-            }
-        };
+        let planes = mip_planes(h.vk_format, w, hh, &bytes, channels)?;
         for (c, texels) in planes.into_iter().enumerate() {
             out.push(Raster {
                 w,
@@ -2642,7 +2739,7 @@ fn cook_unit(
             data.compute_tangents();
             // Only the tangent check reads normal maps.
             let normals = data.tangents.is_some() && settings.tangent_error_max.is_some();
-            let maps = section_maps(&data, &archives, normals, &shared.opacity)?;
+            let maps = section_maps(&data, &archives, normals, &shared.opacity, &shared.emission)?;
             drop(archives);
             let cooked = mesh::cook(name, &data, &settings, &maps)?;
             drop((data, maps));

@@ -22,8 +22,8 @@ use std::os::raw::c_int;
 
 use meshopt::ffi;
 use orr_pack::mesh::{
-    Cluster, Group, MeshHeader, MeshInfo, NODE_PAGE_MAX, Node, NodePage, OMM_ALIGN, PAGE_MAX,
-    PageHeader, PageInfo, Section, SurfaceClass, cluster_resident_len,
+    Cluster, ClusterSets, Group, MeshHeader, MeshInfo, NODE_PAGE_MAX, Node, NodePage, OMM_ALIGN,
+    PAGE_MAX, PageHeader, PageInfo, Section, SurfaceClass, cluster_resident_len,
 };
 use orr_pack::{Aabb, Span, Sphere};
 use rayon::prelude::*;
@@ -736,6 +736,12 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
         }
     }
 
+    let set_clusters = page_groups
+        .iter()
+        .flatten()
+        .flat_map(|&g| &groups[g].clusters)
+        .map(ClusterData::set_cluster)
+        .collect();
     let mut part_bounds = vec![Aabb::EMPTY; cx.parts.table.len()];
     for c in groups.iter().flat_map(|g| &g.clusters) {
         if c.record.flags & Cluster::MERGED == 0 {
@@ -823,12 +829,16 @@ pub(super) fn cook(cx: &Ctx<'_>) -> Result<Built, String> {
         roots,
         pages: page_info,
         page_deps,
+        cut_rows: Vec::new(),
+        emissive: ClusterSets::default(),
+        casters: ClusterSets::default(),
     };
     Ok(Built {
         info,
         pages,
         node_pages: node_blobs,
         part_bounds,
+        clusters: set_clusters,
     })
 }
 

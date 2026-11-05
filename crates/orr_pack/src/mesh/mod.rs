@@ -2,6 +2,9 @@
 //! it are the pages of whole clusters ([`PageInfo`]), then in DAG mode the hierarchy's node
 //! pages when it is paged ([`NodePage`], records read by [`nodes`]).
 //!
+//! Blob 0 also holds the cluster sets a light or photon sampler picks from ([`ClusterSets`]):
+//! per cut row and section, a section's clusters in spatial order with a fixed-point CDF.
+//!
 //! A page is stored in the codec form [`encode_page`] writes, and [`decode_page`] turns it
 //! into the resident layout the GPU reads:
 //!
@@ -29,7 +32,7 @@ use orr_math::{Affine3, Vec3};
 pub use codec::{check_stored_page, decode_page, encode_page};
 pub use omm::*;
 
-use crate::blob::{put_table, read, table};
+use crate::blob::{put_table, put_table_aligned, read, table};
 use crate::{Aabb, Error, Result, Span, Sphere};
 
 pub const SCHEMA: u16 = 6;
@@ -102,6 +105,14 @@ pub struct MeshHeader {
     pub layer_sections: u32,
     /// Bit per [`SurfaceClass`] of the sections from 32 on.
     pub high_classes: u32,
+    /// DAG mode: f32 threshold per cut row. Row 0 is the finest cut whose clusters all sit in
+    /// pinned pages, at 0 when no streamed group has an error; [`cut_thresholds`] follow.
+    /// Discrete mode has a row per level and no thresholds.
+    pub cut_rows: Span,
+    /// The sections that emit light.
+    pub emissive: SetSpans,
+    /// The sections light bends or mirrors off into a caustic.
+    pub casters: SetSpans,
 }
 
 impl MeshHeader {
@@ -361,6 +372,139 @@ impl Cluster {
 /// difference.
 pub const FLAT_NORMAL: f32 = 1e-4;
 
+/// Whether a cluster with these errors and flags is in the cut at threshold `t` of a mesh
+/// with `merge_error`: its own error at or under `t` and its parent's over it, from the
+/// merged stage once `t` reaches the merge error.
+pub fn in_cut(self_error: f32, parent_error: f32, flags: u8, t: f32, merge_error: f32) -> bool {
+    (flags & Cluster::MERGED != 0) == (t >= merge_error) && self_error <= t && parent_error > t
+}
+
+/// The thresholds a DAG mesh with these cluster self errors takes cuts at, finest first: 0,
+/// the smallest positive error and its powers of 4 up to the first at or over the largest.
+pub fn cut_thresholds(errors: impl Iterator<Item = f32>) -> Vec<f32> {
+    let (mut smallest, mut largest) = (f32::INFINITY, 0.0f32);
+    for e in errors.filter(|e| e.is_finite() && *e > 0.0) {
+        smallest = smallest.min(e);
+        largest = largest.max(e);
+    }
+    let mut out = vec![0.0];
+    let mut t = smallest;
+    while t.is_finite() {
+        out.push(t);
+        if t >= largest {
+            break;
+        }
+        t *= 4.0;
+    }
+    out
+}
+
+/// A set tree leaf holds at most this many clusters; a set no larger has no tree.
+pub const SET_LEAF: u32 = 16;
+
+/// [`ClusterSets::ranks`] entry of a section with no set.
+pub const NO_RANK: u32 = !0;
+
+/// One section's clusters in the cut of one row: a range of each [`ClusterSets`] list, and of
+/// its nodes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct ClusterSet {
+    /// Clusters `first..first + count` of [`ClusterSets::clusters`], `cdf` and `index`.
+    pub first: u32,
+    pub count: u32,
+    /// Nodes `first_node..first_node + node_count` of [`ClusterSets::nodes`]; none for a set
+    /// of [`SET_LEAF`] clusters or fewer.
+    pub first_node: u32,
+    pub node_count: u32,
+    pub section: u32,
+    /// The sum of the clusters' weights: area in square meters, on emissive sets times the
+    /// emission texture's mean over the cluster.
+    pub total: f32,
+}
+
+/// A node of a set's tree over a range of the set's clusters: a perfect binary heap, node
+/// `i`'s children at `2i + 1` and `2i + 2`, its leaves all one depth. Each node splits its
+/// clusters at their median along the longest axis of their centers.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct SetNode {
+    /// Bounds every vertex below the node, mesh space.
+    pub center: [f32; 3],
+    pub radius: f32,
+    /// Octahedral 2x16 unorm ([`oct_encode`]): the axis of the cone holding the front face
+    /// normals below the node.
+    pub axis: u32,
+    /// Cosine of the cone's half angle; -1 where faces of any direction may emit.
+    pub cone_cos: f32,
+    /// Positions `first..first + count` within the set.
+    pub first: u32,
+    pub count: u32,
+}
+
+/// Where blob 0 holds a [`ClusterSets`].
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct SetSpans {
+    pub ranks: Span,
+    pub sets: Span,
+    pub clusters: Span,
+    pub cdf: Span,
+    pub index: Span,
+    pub nodes: Span,
+}
+
+/// The sets of one purpose: for each cut row, one per ranked section. A row is a discrete
+/// level, or a threshold of [`MeshHeader::cut_rows`]; two rows with the same clusters share
+/// their ranges.
+///
+/// A set's `clusters`, `cdf` and `index` ranges cover one list. A cluster of zero weight is
+/// left out of it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ClusterSets {
+    /// Per section: its rank, or [`NO_RANK`].
+    pub ranks: Vec<u32>,
+    /// The set of rank `k` at row `r` is `sets[r * rank_count + k]`.
+    pub sets: Vec<ClusterSet>,
+    /// Mesh cluster indices in tree leaf order.
+    pub clusters: Vec<u32>,
+    /// Per list position: the inclusive sum of weights in fixed point, ascending by at least
+    /// 1 and ending at `u32::MAX`, so a cluster's probability is its step over `u32::MAX`.
+    pub cdf: Vec<u32>,
+    /// (mesh cluster, position in the set), ascending by cluster.
+    pub index: Vec<[u32; 2]>,
+    pub nodes: Vec<SetNode>,
+}
+
+impl ClusterSets {
+    /// Sections with a set.
+    pub fn rank_count(&self) -> u32 {
+        self.ranks.iter().filter(|&&r| r != NO_RANK).count() as u32
+    }
+
+    fn parse(blob: &[u8], s: SetSpans) -> Result<Self> {
+        Ok(Self {
+            ranks: table(blob, s.ranks)?,
+            sets: table(blob, s.sets)?,
+            clusters: table(blob, s.clusters)?,
+            cdf: table(blob, s.cdf)?,
+            index: table(blob, s.index)?,
+            nodes: table(blob, s.nodes)?,
+        })
+    }
+
+    fn put(&self, out: &mut Vec<u8>) -> SetSpans {
+        SetSpans {
+            ranks: put_table(out, &self.ranks),
+            sets: put_table(out, &self.sets),
+            clusters: put_table(out, &self.clusters),
+            cdf: put_table(out, &self.cdf),
+            index: put_table_aligned(out, &self.index, 8),
+            nodes: put_table_aligned(out, &self.nodes, 16),
+        }
+    }
+}
+
 const _: () = assert!(size_of::<Cluster>() == 144);
 const _: () = assert!(size_of::<PageHeader>() == 96);
 
@@ -378,6 +522,9 @@ pub struct MeshInfo {
     pub roots: Vec<u32>,
     pub pages: Vec<PageInfo>,
     pub page_deps: Vec<u32>,
+    pub cut_rows: Vec<f32>,
+    pub emissive: ClusterSets,
+    pub casters: ClusterSets,
 }
 
 impl MeshInfo {
@@ -398,6 +545,9 @@ impl MeshInfo {
             roots: table(blob, header.roots)?,
             pages: table(blob, header.pages)?,
             page_deps: table(blob, header.page_deps)?,
+            cut_rows: table(blob, header.cut_rows)?,
+            emissive: ClusterSets::parse(blob, header.emissive)?,
+            casters: ClusterSets::parse(blob, header.casters)?,
             header,
         })
     }
@@ -416,6 +566,9 @@ impl MeshInfo {
         h.roots = put_table(&mut out, &self.roots);
         h.pages = put_table(&mut out, &self.pages);
         h.page_deps = put_table(&mut out, &self.page_deps);
+        h.cut_rows = put_table(&mut out, &self.cut_rows);
+        h.emissive = self.emissive.put(&mut out);
+        h.casters = self.casters.put(&mut out);
         out[..size_of::<MeshHeader>()].copy_from_slice(bytemuck::bytes_of(&h));
         out
     }

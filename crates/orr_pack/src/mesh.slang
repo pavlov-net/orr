@@ -73,6 +73,33 @@ public struct Cluster
     public uint16_t part;
 }
 
+// A set tree leaf holds at most this many clusters; a set no larger has no tree.
+public static const uint SET_LEAF = 16;
+// `SetTablesGpu.ranks` entry of a section with no set.
+public static const uint NO_RANK = 0xffffffff;
+
+// 24 B. One section's clusters at one cut row (orr_pack::mesh::ClusterSet).
+public struct ClusterSet
+{
+    public uint first;             // in `clusters`, `cdf` and `index`
+    public uint count;
+    public uint first_node;
+    public uint node_count;
+    public uint section;
+    public float total;            // m^2, weighted
+}
+
+// 32 B. A node of a set's heap, children at 2i + 1 and 2i + 2.
+public struct SetNode
+{
+    public float3 center;          // mesh space
+    public float radius;
+    public uint axis;              // oct 2x16 unorm
+    public float cone_cos;         // -1: any direction
+    public uint first;             // positions in the set
+    public uint count;
+}
+
 // 32 B. A DAG hierarchy node: a leaf names a group (`group` >= 0), an internal node has
 // children `child_first..child_first + child_count`, all in one node page.
 public struct Node

@@ -23,7 +23,12 @@ pub(crate) fn table<T: Pod>(blob: &[u8], s: Span) -> Result<Vec<T>> {
 }
 
 pub(crate) fn put_table<T: Pod>(out: &mut Vec<u8>, t: &[T]) -> Span {
-    out.resize(out.len().next_multiple_of(4), 0);
+    put_table_aligned(out, t, 4)
+}
+
+/// [`put_table`] for a table the GPU reads in units wider than a word.
+pub(crate) fn put_table_aligned<T: Pod>(out: &mut Vec<u8>, t: &[T], align: usize) -> Span {
+    out.resize(out.len().next_multiple_of(align), 0);
     let first = out.len() as u32;
     out.extend_from_slice(bytemuck::cast_slice(t));
     Span {

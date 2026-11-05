@@ -1,6 +1,6 @@
 //! Cooked textures a mesh cook reads: the opacity mip 0 that decides which triangles of an
-//! alpha-tested section are opaque, and the displacement mips that bound each cluster's
-//! displacement.
+//! alpha-tested section are opaque, the displacement mips that bound each cluster's
+//! displacement, and a small mip of the emission texture that weighs each emissive cluster.
 //!
 //! A slot reads one texture or a tile set ([`Map`]). A set reads as `texture_tile` does: the cell
 //! under a point's mapped uv picks a tile or nothing, and the point reads that tile clamped to its
@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::texture::Wrap;
 use crate::texture::tiles::Cell;
-use orr_math::Vec3;
+use orr_math::{Mat3, Vec3};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
@@ -908,6 +908,56 @@ impl Opacity {
     }
 }
 
+/// A cooked emission texture's luminance at the mip the mesh cook reads, for every section
+/// that reads it.
+pub(crate) struct EmissionMap {
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+    pub(crate) texels: Arc<Vec<f32>>,
+}
+
+impl EmissionMap {
+    /// The largest side of the mip read: selection weights need the texture's broad shape.
+    pub(crate) const SIDE_MAX: u32 = 512;
+
+    pub(crate) fn bytes(&self) -> u64 {
+        (self.texels.len() * size_of::<f32>()) as u64
+    }
+}
+
+/// A section's emission texture or tile set, as luminance relative to the material's emission
+/// factor.
+pub(crate) struct Emission {
+    pub(crate) map: Map<Raster>,
+    pub(crate) uv_set: usize,
+}
+
+impl Emission {
+    /// The mean of what a triangle at `uv` reads: each part's texels, by its share of the
+    /// triangle. A triangle reading along a line has parts of no area, which count alike.
+    pub(super) fn mean(&self, uv: [[f32; 2]; 3]) -> f64 {
+        let mut parts = Vec::new();
+        self.map.parts(uv, |p| {
+            let (mut sum, mut count) = (0.0, 0u32);
+            p.read.footprint(p.uv, |t| {
+                sum += f64::from(t);
+                count += 1;
+                true
+            });
+            let [a, b, c] = p.weights;
+            let share = f64::from(Mat3::from_cols(a, b, c).determinant().abs());
+            parts.push((share, sum / f64::from(count.max(1))));
+            true
+        });
+        let whole: f64 = parts.iter().map(|p| p.0).sum();
+        if whole > 0.0 {
+            parts.iter().map(|(share, mean)| share * mean).sum::<f64>() / whole
+        } else {
+            parts.iter().map(|p| p.1).sum::<f64>() / parts.len().max(1) as f64
+        }
+    }
+}
+
 /// A section's displacement: `scale x texel + offset` meters, within the declared range.
 pub(crate) struct Displacement {
     pub(crate) scale: f32,
@@ -1249,6 +1299,18 @@ mod tests {
 
     /// `texture_tile`: a floor picks the cell, rows climb up the image, and nothing lies past the
     /// tiles, below 0 or above the first row.
+    #[test]
+    fn a_triangle_over_two_tiles_weighs_them_by_area() {
+        let emission = |tri| {
+            let map = solid_set([0.0; 6], &[(0, 0, 1.0), (0, 1, 3.0)], 7.0);
+            Emission { map, uv_set: 0 }.mean(tri)
+        };
+        // Three quarters of the triangle lie left of u = 1.
+        assert!((emission([[0.0, 0.0], [2.0, 0.0], [0.0, 1.0]]) - 1.5).abs() < 1e-5);
+        // On a line in uv space it reads each tile it crosses alike.
+        assert!((emission([[0.5, 0.5], [1.5, 0.5], [1.0, 0.5]]) - 2.0).abs() < 1e-5);
+    }
+
     #[test]
     fn a_point_reads_the_tile_of_the_cell_under_it() {
         let tiles = [(0, 0, 0.1), (0, 1, 0.2), (1, 0, 0.3), (0, 9, 0.4)];

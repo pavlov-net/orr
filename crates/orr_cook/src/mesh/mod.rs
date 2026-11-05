@@ -11,7 +11,8 @@
 //! pages hold whole clusters of one level, coarsest level first, and the coarsest level's
 //! pages are pinned. DAG mode builds the clusters, groups, pages and hierarchy in [`dag`].
 //! Alpha-tested clusters put opaque triangles first and carry opacity micromaps over the
-//! rest. Clusters of subsurface sections carry their minimum thickness ([`thickness`]).
+//! rest. Clusters of subsurface sections carry their minimum thickness ([`thickness`]). Blob 0
+//! ends with the sets of emissive and caster sections for every cut ([`sets`]).
 
 mod clod;
 mod dag;
@@ -19,6 +20,7 @@ mod displace;
 mod lod;
 pub(crate) mod maps;
 mod omm;
+mod sets;
 pub(crate) mod tangents;
 mod thickness;
 
@@ -26,11 +28,11 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use meshopt::VertexDataAdapter;
-use orr_math::{Vec2, Vec3};
+use orr_math::{DVec3, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{
-    Cluster, FLAT_NORMAL, Level, MAX_SECTIONS, MeshHeader, MeshInfo, OMM_ALIGN, PAGE_MAX,
-    PageHeader, PageInfo, Part, PartLevel, Section, SurfaceClass, oct_encode,
+    Cluster, ClusterSets, FLAT_NORMAL, Level, MAX_SECTIONS, MeshHeader, MeshInfo, OMM_ALIGN,
+    PAGE_MAX, PageHeader, PageInfo, Part, PartLevel, Section, SurfaceClass, oct_encode,
 };
 use orr_pack::{Aabb, AssetId, Hash32, Span, Sphere};
 use rayon::prelude::*;
@@ -42,7 +44,7 @@ use crate::state::Memo;
 use crate::texture::Wrap;
 use crate::texture::tiles::Cell;
 use crate::{Error, Result};
-use maps::{Displacement, Map, Opacity, Raster};
+use maps::{Displacement, Emission, Map, Opacity, Raster};
 pub use omm::OmmSettings;
 use omm::{ClusterOmm, OmmAlpha, OmmRead};
 pub(crate) use tangents::TangentCheck;
@@ -378,6 +380,7 @@ pub(crate) struct MapSpec {
     /// Along the surface's u and v, beside `displacement`.
     pub(crate) tangent_displacement: [Option<DisplacementSpec>; 2],
     pub(crate) normal: NormalSpec,
+    pub(crate) emission: Option<EmissionSpec>,
     pub(crate) uv1: bool,
 }
 
@@ -400,7 +403,7 @@ impl MapTexture {
     }
 
     /// The units whose texels it reads.
-    fn units(&self) -> impl Iterator<Item = &str> {
+    pub(crate) fn units(&self) -> impl Iterator<Item = &str> {
         let lone = self.tiles.is_empty().then_some(self.unit.as_str());
         lone.into_iter()
             .chain(self.tiles.iter().map(|t| t.1.as_str()))
@@ -414,6 +417,15 @@ pub(crate) struct MapRead {
     pub(crate) wrap: [Wrap; 2],
     pub(crate) uv: [f32; 6],
     pub(crate) outside: [f32; 4],
+}
+
+/// The cooked emission texture of a section whose material emits, how it reads and the uv set
+/// it reads.
+#[derive(Clone, Debug)]
+pub(crate) struct EmissionSpec {
+    pub(crate) texture: MapTexture,
+    pub(crate) read: MapRead,
+    pub(crate) uv_set: usize,
 }
 
 /// What a section's material reads the vertex tangent for.
@@ -495,11 +507,13 @@ impl MapSpec {
         };
         let tangents = self.tangent_displacement.iter().flatten();
         let tangents = tangents.filter_map(|d| d.texture.as_ref().map(|t| &t.texture));
+        let emission = self.emission.as_ref().map(|e| &e.texture);
         let textures = opacity
             .into_iter()
             .chain(displacement)
             .chain(tangents)
-            .chain(normal);
+            .chain(normal)
+            .chain(emission);
         textures.flat_map(MapTexture::units)
     }
 
@@ -536,8 +550,12 @@ impl MapSpec {
             } => format!("texture {:?} {read:?} {uv_set} {frame_set}", texture.key),
             n => format!("{n:?}"),
         };
+        let emission = self
+            .emission
+            .as_ref()
+            .map(|e| (e.texture.key, e.read, e.uv_set));
         format!(
-            "{opacity} {displacement:?} {tangents:?} {normal} {}",
+            "{opacity} {displacement:?} {tangents:?} {normal} {emission:?} {}",
             self.uv1
         )
     }
@@ -552,6 +570,7 @@ pub(crate) struct SectionMaps {
     pub(crate) tangent_displacement: [Option<Displacement>; 2],
     /// Mip 0 of the [`NormalSpec::Texture`] map, stored x and y.
     pub(crate) normal: Option<Map<[Raster; 2]>>,
+    pub(crate) emission: Option<Emission>,
 }
 
 impl SectionMaps {
@@ -750,6 +769,7 @@ pub(crate) fn cook(
             _ => h.layer_sections |= bit,
         }
     }
+    sets::build(&mut built.info, &m.sections, &built.clusters);
     built.info.parts = parts
         .table
         .iter()
@@ -772,6 +792,8 @@ struct Built {
     pages: Vec<Vec<u8>>,
     node_pages: Vec<Vec<u8>>,
     part_bounds: Vec<Aabb>,
+    /// What the sets read of every cluster, in mesh cluster order.
+    clusters: Vec<sets::SetCluster>,
 }
 
 /// What every cluster of a mesh is built from.
@@ -842,6 +864,23 @@ impl Ctx<'_> {
         };
         stored_corner_order(&mut tris);
         let mut c = build_cluster(w, self.grid, &verts, &cells, &tris, sec.flags, &uv);
+        if sec.flags & (Section::EMISSIVE | Section::CASTER) != 0 {
+            let step = self.grid.step();
+            let positions: Vec<DVec3> = cells
+                .iter()
+                .map(|g| DVec3::from(g.map(|v| f64::from(v) * step)))
+                .collect();
+            let emission = section_maps.emission.as_ref().map(|e| {
+                let uvs: Vec<[f32; 2]> =
+                    verts.iter().map(|&v| w.uvs[e.uv_set][v as usize]).collect();
+                (e, uvs)
+            });
+            c.bounds = Some(sets::ClusterBounds::new(
+                &positions,
+                tris.as_chunks::<3>().0,
+                emission.as_ref().map(|(e, uvs)| (*e, uvs.as_slice())),
+            ));
+        }
         c.record.flat_triangles = flat;
         if self.s.omm.is_some() && section_maps.opacity.is_some() {
             c.uvs = uvs;
@@ -967,6 +1006,7 @@ fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
     let mut level_spans = vec![Span::default(); level_count];
     let mut part_level_spans = vec![Span::default(); part_count * level_count];
     let mut part_bounds = vec![Aabb::EMPTY; part_count];
+    let mut set_clusters = Vec::new();
     let mut next = 0u32;
     let mut pinned_pages = 0;
     for li in (0..level_count).rev() {
@@ -978,6 +1018,7 @@ fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
         for p in 0..part_count {
             part_level_spans[p * level_count + li].first = next;
         }
+        set_clusters.extend(clusters.iter().map(ClusterData::set_cluster));
         for (i, c) in clusters.iter().enumerate() {
             let span = &mut part_level_spans[usize::from(c.record.part) * level_count + li];
             if span.count == 0 {
@@ -1039,12 +1080,16 @@ fn discrete(cx: &Ctx<'_>, errors: &[f32]) -> Result<Built> {
         roots: Vec::new(),
         pages: page_info,
         page_deps: Vec::new(),
+        cut_rows: Vec::new(),
+        emissive: ClusterSets::default(),
+        casters: ClusterSets::default(),
     };
     Ok(Built {
         info,
         pages,
         node_pages: Vec::new(),
         part_bounds,
+        clusters: set_clusters,
     })
 }
 
@@ -1396,11 +1441,23 @@ struct ClusterData {
     /// Vertex uvs as the page stores them, until the micromaps are made.
     uvs: Vec<[f32; 2]>,
     omm: Option<ClusterOmm>,
+    /// On sections with a set.
+    bounds: Option<sets::ClusterBounds>,
 }
 
 impl ClusterData {
     fn slots(&self) -> usize {
         self.local.len().next_multiple_of(2)
+    }
+
+    fn set_cluster(&self) -> sets::SetCluster {
+        sets::SetCluster {
+            self_error: self.record.self_error,
+            parent_error: self.record.parent_error,
+            flags: self.record.flags,
+            section: self.record.section,
+            bounds: self.bounds,
+        }
     }
 
     /// Bytes the cluster adds to a resident page, its micromaps included.
@@ -1521,6 +1578,7 @@ fn build_cluster(
         tris: tris.to_vec(),
         uvs: Vec::new(),
         omm: None,
+        bounds: None,
     }
 }
 
