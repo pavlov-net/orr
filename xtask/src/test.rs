@@ -42,7 +42,7 @@ const DEFAULT_JOBS: usize = 3;
 /// run doesn't end on one of them, and `--fast` leaves them out.
 const SLOW: &[&str] = &[
     "lighting_suite.linked",
-    "examples.screenshots",
+    "orr_examples.screenshots",
     "lighting_suite.dielectric",
     "shader_link.gpu",
     "lighting_suite.media",

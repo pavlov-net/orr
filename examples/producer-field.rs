@@ -11,10 +11,6 @@
 
 use std::time::{Duration, Instant};
 
-use examples::field::{Grass, Heights, Slab, Terrain, blade_triangles, patch_triangles};
-use examples::shaders::{capture, grass, grass_tint, pond, slab, sun_shadow, terrain};
-use examples::window::Window;
-use examples::{Options, assert_clean, device, fixed_time};
 use orr::orr_gpu::{Format, Hazards, MemoryKind, QueueKind, SpecData, Stages, TimelinePoint};
 use orr::orr_output::Image;
 use orr::orr_pack::material::{Material, slot};
@@ -23,10 +19,14 @@ use orr::{
     Lens, MaterialGpu, ProducerId, Projection, Renderer, RendererDesc, SceneDesc,
     SceneLightingSettings, TextureFilter, TransformGroupDesc, ViewDesc,
 };
+use orr_examples::field::{Grass, Heights, Slab, Terrain, blade_triangles, patch_triangles};
+use orr_examples::shaders::{capture, grass, grass_tint, pond, slab, sun_shadow, terrain};
+use orr_examples::window::Window;
+use orr_examples::{Options, assert_clean, device, fixed_time};
 use orr_math::camera::rh::view;
 use orr_math::{Affine3, DVec3, UVec2, Vec2, Vec3};
 
-use examples::Capture;
+use orr_examples::Capture;
 
 const HEADLESS_EXTENT: [u32; 2] = [480, 270];
 const HEADLESS_FRAMES: u64 = 120;

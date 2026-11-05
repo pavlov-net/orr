@@ -13,9 +13,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use examples::mesh::MeshBuilder;
-use examples::window::Window;
-use examples::{Capture, Options, Workers, assert_clean, device, fixed_time, mount_at};
 use orr::orr_gpu::{
     Device, Format, QueueKind, TextureDesc, TextureKind, TextureMemory, TextureUsage, TimelinePoint,
 };
@@ -32,6 +29,9 @@ use orr::{
 use orr_cook::{
     ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source, TextureSettings, Usage,
 };
+use orr_examples::mesh::MeshBuilder;
+use orr_examples::window::Window;
+use orr_examples::{Capture, Options, Workers, assert_clean, device, fixed_time, mount_at};
 use orr_math::camera::rh::view;
 use orr_math::{Affine3, DVec3, Mat3, Vec3};
 

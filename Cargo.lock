@@ -838,28 +838,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "examples"
-version = "0.0.1"
-dependencies = [
- "bytemuck",
- "egui",
- "env_logger",
- "log",
- "orr",
- "orr_atmosphere",
- "orr_color",
- "orr_cook",
- "orr_egui",
- "orr_math",
- "orr_scene",
- "orr_shaders",
- "png 0.18.1",
- "serde_json",
- "windows",
- "winit",
-]
-
-[[package]]
 name = "exr"
 version = "1.74.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2230,6 +2208,28 @@ dependencies = [
  "egui",
  "orr_gpu",
  "orr_shaders",
+]
+
+[[package]]
+name = "orr_examples"
+version = "0.0.1"
+dependencies = [
+ "bytemuck",
+ "egui",
+ "env_logger",
+ "log",
+ "orr",
+ "orr_atmosphere",
+ "orr_color",
+ "orr_cook",
+ "orr_egui",
+ "orr_math",
+ "orr_scene",
+ "orr_shaders",
+ "png 0.18.1",
+ "serde_json",
+ "windows",
+ "winit",
 ]
 
 [[package]]

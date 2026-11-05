@@ -16,12 +16,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use examples::average::Average;
-use examples::field::{Slab, patch_triangles};
-use examples::mesh::MeshBuilder;
-use examples::shaders::slab;
-use examples::window::Window;
-use examples::{Capture, Options, Workers, assert_clean, device, fixed_time, mount_at};
 use orr::orr_gpu::{
     AddressMode, Allocation, Device, Filter, Format, MemoryKind, QueueKind, SamplerDesc, SpecData,
     TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
@@ -39,6 +33,12 @@ use orr::{
 use orr_cook::{
     ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source, TextureSettings, Usage,
 };
+use orr_examples::average::Average;
+use orr_examples::field::{Slab, patch_triangles};
+use orr_examples::mesh::MeshBuilder;
+use orr_examples::shaders::slab;
+use orr_examples::window::Window;
+use orr_examples::{Capture, Options, Workers, assert_clean, device, fixed_time, mount_at};
 use orr_math::camera::rh::view;
 use orr_math::{Affine3, DVec3, Vec3};
 

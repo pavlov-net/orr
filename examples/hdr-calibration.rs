@@ -24,14 +24,14 @@ mod run {
     use std::time::{Duration, Instant};
 
     use egui::{Color32, Context, FullOutput, Pos2, RawInput, Rect, RichText, TexturesDelta, vec2};
-    use examples::window::Window;
-    use examples::{assert_clean, device};
     use orr::orr_gpu::{OutputFormat, QueueKind};
     use orr::{
         CalibrationPattern, ConsumerMarker, Display, DisplayRequest, FrameDesc, FrameTime,
         Renderer, RendererDesc, ResolvedDisplay,
     };
     use orr_egui::Painter;
+    use orr_examples::window::Window;
+    use orr_examples::{assert_clean, device};
 
     /// The requests the script steps through, with their labels.
     fn requests() -> [(&'static str, DisplayRequest); 5] {

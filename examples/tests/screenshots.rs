@@ -39,13 +39,6 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use examples::average::Average;
-use examples::linked::KERNELS;
-use examples::mesh::MeshBuilder;
-use examples::scene::{FOV_Y, Showcase, TARGET, orbit_eye};
-use examples::{
-    Capture, Options, Workers, assert_clean, device, enable_dlss, fixed_time, mount_at,
-};
 use orr::orr_gpu::{ClearColor, ColorAttachment, ColorLoad, Format, Rendering};
 use orr::orr_gpu::{QueueKind, Texture, TextureDesc, TextureMemory, TextureUsage, TimelinePoint};
 use orr::orr_pack::material::Material;
@@ -59,6 +52,13 @@ use orr::{
     ViewOutput, ViewTarget,
 };
 use orr_cook::{ArchiveSpec, AssetSpec, LodMode, Manifest, MeshSettings, Source};
+use orr_examples::average::Average;
+use orr_examples::linked::KERNELS;
+use orr_examples::mesh::MeshBuilder;
+use orr_examples::scene::{FOV_Y, Showcase, TARGET, orbit_eye};
+use orr_examples::{
+    Capture, Options, Workers, assert_clean, device, enable_dlss, fixed_time, mount_at,
+};
 use orr_math::camera::rh::view;
 use orr_math::{Affine3, DVec3, Quat, Vec3};
 use orr_scene::testing::{Image, Pixels, Tolerance, check, flip};
