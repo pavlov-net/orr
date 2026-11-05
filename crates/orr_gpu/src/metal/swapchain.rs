@@ -293,8 +293,9 @@ impl Swapchain {
         Ok(true)
     }
 
-    /// Acquires the next drawable. `None` while the view has no area (minimized). Applies a
-    /// new size, encoding or present mode to the layer first.
+    /// Acquires the next drawable. `None` while the view has no area (minimized) or the layer
+    /// has no drawable to give; the caller skips this frame's work and present. Applies a new
+    /// size, encoding or present mode to the layer first.
     pub fn acquire(&mut self) -> Result<Option<SwapchainFrame>, Error> {
         let Some(extent) = layer_extent(&self.layer) else {
             return Ok(None);
@@ -309,8 +310,11 @@ impl Swapchain {
             self.apply(wanted);
             self.applied = Some(wanted);
         }
+        // The layer gives none within a second while the screens reconfigure, among other
+        // passing states; the frame is skipped, as for a window without area.
         let Some(drawable) = self.layer.nextDrawable() else {
-            return Err(Error::Timeout);
+            log::warn!("the layer gave no drawable; skipping a frame");
+            return Ok(None);
         };
         let raw = drawable.texture();
         let desc = TextureDesc::d2(
