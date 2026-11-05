@@ -10,21 +10,53 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 jobs:
-  # Without the DLSS SDK, so this builds the path lint does not.
-  test:
+  prek:
+    name: prek (${{ matrix.os }})
     strategy:
-      fail-fast: false
+      # Clippy sees different code on each: macOS builds the Metal backend, Windows Vulkan and,
+      # with the DLSS SDK, orr_dlss's NGX code.
       matrix:
-        os: [blacksmith-8vcpu-windows-2025, blacksmith-6vcpu-macos-26]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: windows
+            runner: blacksmith-8vcpu-windows-2025
+          - os: macos
+            runner: macos-26
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
+        with:
+          cache-key: check
+          dlss: ${{ runner.os == 'Windows' }}
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: prek@0.5.10,typos@1.52.0
+      - name: Run the pre-commit hooks
+        run: prek run --all-files
+
+  # Without the DLSS SDK, so this builds the path prek does not.
+  test:
+    name: test (${{ matrix.os }})
+    needs: prek
+    strategy:
+      matrix:
+        include:
+          - os: windows
+            runner: blacksmith-8vcpu-windows-2025
+          - os: macos
+            runner: macos-26
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup
-      # groups_match_spectral_color takes minutes on 32 threads, and runners have 6 or 8.
+        with:
+          cache-key: test
+      # groups_match_spectral_color takes minutes on 32 threads, and runners have 3 to 8.
       - name: Run the tests that need no GPU
         run: cargo run --locked -p xtask -- test --no-gpu -- --skip groups_match_spectral_color
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -33,12 +65,15 @@ jobs:
           name: test-logs-${{ matrix.os }}
           path: target/test-logs
 
-  # What Apple targets build: orr without DLSS. Lint covers the default features.
+  # What Apple targets build: orr without DLSS. prek covers the default features.
   no-dlss:
+    needs: prek
     runs-on: blacksmith-8vcpu-windows-2025
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup
+        with:
+          cache-key: check
       - name: Check the workspace without DLSS
         run: cargo check --workspace --all-targets --locked --no-default-features
