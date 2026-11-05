@@ -46,7 +46,7 @@ pub use mesh::MeshPipeline;
 pub use pipeline::{ComputePipeline, ShaderStage};
 pub use queue::{HostTimeline, Queue};
 pub use sparse::{SparseAllocation, SparseBinds};
-pub use swapchain::{LowLatency, Swapchain, SwapchainFrame};
+pub use swapchain::{LowLatency, Swapchain, SwapchainFrame, WindowExtent};
 pub use texture::Texture;
 pub use unsupported::{Diagnostics, ExecutionSet, RayDispatchPipeline};
 

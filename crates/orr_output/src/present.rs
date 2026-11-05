@@ -15,7 +15,7 @@ use orr_scene::orr_gpu::{
     self, Allocation, CommandList, Device, Format, Hazards, HdrMetadata, LatencyMarker, LowLatency,
     MemoryKind, OutputFormat, PresentMode, QueueKind, Refresh, Stages, StorageImageIndex,
     Swapchain, SwapchainDesc, Texture, TextureDesc, TextureIndex, TextureMemory, TextureUsage,
-    TimelinePoint, ViewDesc,
+    TimelinePoint, ViewDesc, WindowExtent,
 };
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
@@ -50,7 +50,7 @@ pub const UI_PASS: &str = "ui";
 /// OS last reported for the window and the formats the surface offers; an encoding change takes
 /// effect on that frame.
 pub struct Display {
-    window: isize,
+    window_extent: WindowExtent,
     request: DisplayRequest,
     feed: Option<DisplayFeed>,
     /// What the last `begin_frame` logged.
@@ -356,11 +356,12 @@ pub struct Presented {
 impl Display {
     /// Creates the swapchain, starts the present thread and watches what the OS reports for the
     /// window. `frames_in_flight` matches the renderer's. Fails if the device was created
-    /// without `QueueRequest::present` or the window is not a Win32 window.
+    /// without `QueueRequest::present` or the swapchain cannot present to the window.
     ///
-    /// Call it on the thread that owns the window and pumps its messages; the display can then
-    /// move to a render thread. If the OS cannot be watched, as when called on another thread, it
-    /// logs a warning and presents SDR; a `DisplayWatch` on the window's thread can then provide
+    /// Call it on the thread that owns the window and pumps its events (on macOS, the main
+    /// thread, which the swapchain needs too); the display can then move to a render thread.
+    /// If the OS cannot be watched, as when called on another thread, it logs a warning and
+    /// presents SDR; a `DisplayWatch` on the window's thread can then provide
     /// [`Self::set_feed`].
     pub fn new(
         gpu: &Device,
@@ -369,9 +370,6 @@ impl Display {
         request: &DisplayRequest,
         frames_in_flight: u32,
     ) -> Result<Self> {
-        let RawWindowHandle::Win32(handle) = window else {
-            return Err(Error::NotWin32Window);
-        };
         let swapchain = Swapchain::new(
             gpu,
             window,
@@ -383,6 +381,7 @@ impl Display {
             },
         )?;
         let latency = swapchain.latency();
+        let window_extent = swapchain.window_extent();
         let compose = ComposeKernel::new(gpu)?;
         let n = frames_in_flight.max(1) as usize;
         let shared = Arc::new(Shared {
@@ -427,7 +426,7 @@ impl Display {
             }
         };
         Ok(Self {
-            window: handle.hwnd.get(),
+            window_extent,
             request: *request,
             feed,
             logged: None,
@@ -635,7 +634,7 @@ impl Display {
             self.applied_latency = Some(mode);
         }
 
-        let Some(extent) = client_extent(self.window).filter(|e| !e.contains(&0)) else {
+        let Some(extent) = self.window_extent.get() else {
             return Ok(None);
         };
         let s = &mut self.slots[slot];
@@ -1016,22 +1015,6 @@ fn encoded(gpu: &Device, encoding: OutputFormat, extent: [u32; 2], name: &str) -
         encoding,
         device: gpu.clone(),
     })
-}
-
-/// The window's client area in pixels.
-#[cfg(windows)]
-fn client_extent(hwnd: isize) -> Option<[u32; 2]> {
-    use windows::Win32::Foundation::{HWND, RECT};
-    use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
-    let mut rc = RECT::default();
-    // SAFETY: the display's window outlives it; GetClientRect may be called from any thread.
-    unsafe { GetClientRect(HWND(hwnd as *mut std::ffi::c_void), &mut rc) }.ok()?;
-    Some([(rc.right - rc.left) as u32, (rc.bottom - rc.top) as u32])
-}
-
-#[cfg(not(windows))]
-fn client_extent(_hwnd: isize) -> Option<[u32; 2]> {
-    None
 }
 
 /// The present thread's state.

@@ -125,9 +125,11 @@ impl Locked {
     }
 }
 
-/// The lock a [`Swapchain`] and its [`LowLatency`] handles share.
+/// The lock a [`Swapchain`] and its [`LowLatency`] and [`WindowExtent`] handles share, and
+/// the window surface, which lives as long as any of them.
 struct Lock {
     shared: Arc<Shared>,
+    surface: vk::SurfaceKHR,
     locked: Mutex<Locked>,
     /// Timeline semaphore `vkLatencySleepNV` signals; null without low latency.
     sleep: vk::Semaphore,
@@ -169,6 +171,41 @@ impl Drop for Lock {
             // SAFETY: every sleep waited its value before returning; nothing else uses it.
             unsafe { self.shared.device.destroy_semaphore(self.sleep, None) };
         }
+        // SAFETY: the swapchain destroyed its swapchains before dropping its share, and no
+        // handle remains to name the surface.
+        unsafe { self.fns().surface.destroy_surface(self.surface, None) };
+    }
+}
+
+/// The size of a swapchain's window, for the thread that sizes frames while another acquires
+/// and presents: Send, Sync and cheap to clone. It keeps the window's surface alive.
+#[derive(Clone)]
+pub struct WindowExtent {
+    lock: Arc<Lock>,
+    fallback: [u32; 2],
+}
+
+impl WindowExtent {
+    /// The window's client extent in pixels as the surface reports it; `None` while it has
+    /// no area, or once the window is gone.
+    pub fn get(&self) -> Option<[u32; 2]> {
+        let caps = {
+            let _locked = self.lock.lock();
+            // SAFETY: the surface and physical device are live, and the lock keeps a swapchain
+            // creation, which needs the surface to itself, from running beside this.
+            unsafe {
+                self.lock
+                    .fns()
+                    .surface
+                    .get_physical_device_surface_capabilities(
+                        self.lock.shared.physical,
+                        self.lock.surface,
+                    )
+            }
+        }
+        .ok()?;
+        let extent = extent_of(&caps, self.fallback);
+        (!extent.contains(&0)).then_some(extent)
     }
 }
 
@@ -365,7 +402,6 @@ struct Generation {
 pub struct Swapchain {
     device: Device,
     lock: Arc<Lock>,
-    surface: vk::SurfaceKHR,
     current: Option<Generation>,
     /// Replaced swapchains, destroyed once their presents complete.
     retired: Vec<Generation>,
@@ -398,31 +434,6 @@ impl Swapchain {
         let fns = shared.present_fn.as_ref().ok_or_else(|| {
             Error::Invalid("the device was created without QueueRequest::present".into())
         })?;
-        let sleep = if shared.caps.low_latency {
-            let mut ty = vk::SemaphoreTypeCreateInfo::default()
-                .semaphore_type(vk::SemaphoreType::TIMELINE)
-                .initial_value(0);
-            // SAFETY: valid create info.
-            unsafe {
-                shared
-                    .device
-                    .create_semaphore(&vk::SemaphoreCreateInfo::default().push(&mut ty), None)
-            }
-            .map_err(Error::vk("vkCreateSemaphore"))?
-        } else {
-            vk::Semaphore::null()
-        };
-        let lock = Arc::new(Lock {
-            shared: Arc::clone(shared),
-            locked: Mutex::new(Locked {
-                raw: vk::SwapchainKHR::null(),
-                latency: false,
-                mode: None,
-                marker_hook: None,
-            }),
-            sleep,
-            sleep_value: AtomicU64::new(0),
-        });
         let surface = match window {
             RawWindowHandle::Win32(w) => {
                 let hinstance = w.hinstance.ok_or_else(|| {
@@ -442,11 +453,40 @@ impl Swapchain {
                 });
             }
         };
+        let sleep = if shared.caps.low_latency {
+            let mut ty = vk::SemaphoreTypeCreateInfo::default()
+                .semaphore_type(vk::SemaphoreType::TIMELINE)
+                .initial_value(0);
+            // SAFETY: valid create info.
+            unsafe {
+                shared
+                    .device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default().push(&mut ty), None)
+            }
+            .map_err(|e| {
+                // SAFETY: nothing else holds the surface yet.
+                unsafe { fns.surface.destroy_surface(surface, None) };
+                Error::vk("vkCreateSemaphore")(e)
+            })?
+        } else {
+            vk::Semaphore::null()
+        };
+        let lock = Arc::new(Lock {
+            shared: Arc::clone(shared),
+            surface,
+            locked: Mutex::new(Locked {
+                raw: vk::SwapchainKHR::null(),
+                latency: false,
+                mode: None,
+                marker_hook: None,
+            }),
+            sleep,
+            sleep_value: AtomicU64::new(0),
+        });
         // Dropping `s` destroys the surface on the error paths below.
         let mut s = Swapchain {
             device: device.clone(),
             lock,
-            surface,
             current: None,
             retired: Vec::new(),
             generations: 0,
@@ -527,6 +567,14 @@ impl Swapchain {
     /// surface allows it.
     pub fn set_present_mode(&mut self, m: PresentMode) {
         self.mode = m;
+    }
+
+    /// The window's size, readable from any thread.
+    pub fn window_extent(&self) -> WindowExtent {
+        WindowExtent {
+            lock: Arc::clone(&self.lock),
+            fallback: self.desc.extent,
+        }
     }
 
     /// Returns a low-latency handle sharing this swapchain's lock; `None` without
@@ -748,7 +796,7 @@ impl Swapchain {
         let caps = unsafe {
             self.fns()
                 .surface
-                .get_physical_device_surface_capabilities(self.shared().physical, self.surface)
+                .get_physical_device_surface_capabilities(self.shared().physical, self.lock.surface)
         }
         .map_err(Error::vk("vkGetPhysicalDeviceSurfaceCapabilitiesKHR"))?;
         Ok(extent_of(&caps, self.desc.extent))
@@ -759,7 +807,7 @@ impl Swapchain {
         let formats = unsafe {
             self.fns()
                 .surface
-                .get_physical_device_surface_formats(self.shared().physical, self.surface)
+                .get_physical_device_surface_formats(self.shared().physical, self.lock.surface)
         }
         .map_err(Error::vk("vkGetPhysicalDeviceSurfaceFormatsKHR"))?;
         self.formats = negotiate(&formats);
@@ -782,7 +830,7 @@ impl Swapchain {
         let mut wait2 = vk::SurfaceCapabilitiesPresentWait2KHR::default();
         let mut mode_info = vk::SurfacePresentModeKHR::default().present_mode(mode);
         let surface_info = vk::PhysicalDeviceSurfaceInfo2KHR::default()
-            .surface(self.surface)
+            .surface(self.lock.surface)
             .push(&mut mode_info);
         let mut caps2 = vk::SurfaceCapabilities2KHR::default()
             .push(&mut compat)
@@ -866,7 +914,7 @@ impl Swapchain {
         let mut latency = vk::SwapchainLatencyCreateInfoNV::default().latency_mode_enable(true);
         let mut info = vk::SwapchainCreateInfoKHR::default()
             .flags(flags)
-            .surface(self.surface)
+            .surface(self.lock.surface)
             .min_image_count(images)
             .image_format(surface_format.format)
             .image_color_space(surface_format.color_space)
@@ -1093,7 +1141,6 @@ impl Drop for Swapchain {
                 d.destroy_semaphore(s.present, None);
                 d.destroy_fence(s.fence, None);
             }
-            self.fns().surface.destroy_surface(self.surface, None);
         }
     }
 }

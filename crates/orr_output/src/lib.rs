@@ -71,8 +71,6 @@ pub use white_balance::{AutoWhiteBalance, WHITE_BALANCE_CCT, WHITE_BALANCE_DUV};
 pub enum Error {
     #[error(transparent)]
     Gpu(#[from] orr_scene::orr_gpu::Error),
-    #[error("the window handle is not a Win32 window")]
-    NotWin32Window,
     #[error("present thread: {0}")]
     Thread(String),
     #[cfg(dlss)]

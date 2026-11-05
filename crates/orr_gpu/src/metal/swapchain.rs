@@ -112,6 +112,20 @@ impl SwapchainFrame {
     }
 }
 
+/// The size of a swapchain's window, for the thread that sizes frames while another acquires
+/// and presents: Send, Sync and cheap to clone.
+#[derive(Clone)]
+pub struct WindowExtent {
+    layer: Obj<CAMetalLayer>,
+}
+
+impl WindowExtent {
+    /// The layer's size in pixels; `None` while it has no area.
+    pub fn get(&self) -> Option<[u32; 2]> {
+        layer_extent(&self.layer)
+    }
+}
+
 /// The last present id the display has shown, which presented handlers raise.
 #[derive(Default)]
 struct Presented {
@@ -237,6 +251,13 @@ impl Swapchain {
     /// Switches between FIFO and IMMEDIATE at the next acquire.
     pub fn set_present_mode(&mut self, m: PresentMode) {
         self.mode = m;
+    }
+
+    /// The window's size, readable from any thread.
+    pub fn window_extent(&self) -> WindowExtent {
+        WindowExtent {
+            layer: self.layer.clone(),
+        }
     }
 
     /// `None`: Metal has no low-latency mode.
