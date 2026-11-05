@@ -12,10 +12,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use examples::mesh::MeshBuilder;
-use examples::sun_shade::SunShade;
-use examples::window::Window;
-use examples::{Capture, Options, Workers, assert_clean, device, fixed_time, gray_png};
 use orr::orr_gpu::{QueueKind, TimelinePoint};
 use orr::orr_pack::material::{Material, slot};
 use orr::orr_pack::{AssetId, Target};
@@ -28,6 +24,10 @@ use orr_cook::{
     ArchiveSpec, AssetSpec, LodMode, Manifest, MeshInput, MeshSettings, Source, TextureSettings,
     Usage,
 };
+use orr_examples::mesh::MeshBuilder;
+use orr_examples::sun_shade::SunShade;
+use orr_examples::window::Window;
+use orr_examples::{Capture, Options, Workers, assert_clean, device, fixed_time, gray_png};
 use orr_math::camera::rh::view;
 use orr_math::{Affine3, DVec3, UVec2, Vec2, Vec3};
 

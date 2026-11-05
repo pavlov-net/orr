@@ -389,6 +389,7 @@ pub struct Scenes {
     core: Core,
     loading: Arc<Loading>,
     loading_thread: Option<JoinHandle<()>>,
+    /// The sampler of neural sets' latents.
     sampler: SamplerIndex,
     /// The precision mounts decode neural texture sets at; none when they sample BC.
     neural: Option<Precision>,

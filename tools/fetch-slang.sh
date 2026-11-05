@@ -26,9 +26,16 @@
 #   sky/prague/PragueSkyModelGround.dat
 #                    the Prague sky model's ground-level dataset (103 MB), checked against its
 #                    sha256
+#   gltf/NormalTangentMirrorTest.glb
+#                    KhronosGroup/glTF-Sample-Assets' model at a pinned commit (CC BY 4.0),
+#                    checked against its sha256, whose tangents the cook computes again
 #   volumes/smoke.vdb
 #                    OpenVDB's smoke1 sample model from the ASWF artifacts, its zip checked
 #                    against its sha256
+# With ORR_FETCH_DLSS=1 on Windows it also fetches what compiling orr_dlss against NGX needs:
+#   DLSS/            NVIDIA/DLSS v310.9.16's headers and link libraries, without the DLLs that
+#                    running needs, for `DLSS_SDK`
+#   vulkan-headers/  KhronosGroup/Vulkan-Headers at vulkan-sdk-1.4.363.0, for `VULKAN_SDK`
 # Build scripts never download; run this once after cloning and after a pin changes.
 #
 # SLANG_ASSET=glibc-2.28 selects the Linux build for glibc older than 2.34.
@@ -48,6 +55,10 @@ prague_commit=2385c912e9051c1258013ff8c3ce2e19e10fb917
 prague_ground_id=1IflyFZTJxC_N298yXq_2GK4ycIsVJZk6
 prague_ground_sum=76bd619dc6dfcbc900c2996436dd6cf68197c03e3982fe5580f2b109ce1c71c2
 smoke_sum=dca7a0477e77fac197a969f5f418057fc3f89b12887c35d1fc9c1b0d2892f20f
+dlss_commit=9981c6350dc58c0ce21f024fd65e31e851c31689
+vulkan_headers_commit=6802bb4733b63ed5efd3adb308a6c885ef180ea1
+gltf_samples_commit=8f492390ddc7a2ae221a1369ef560589cf8c70fb
+tangent_test_sum=31ce5f3c873fc55531a17ccacf001e3d1d482a508695aa826fa79cc196e0ce78
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 tools="${ORR_TOOLS:-$root/.tools}"
@@ -101,16 +112,24 @@ else
   echo "slang $slang_version ($asset) in $dest"
 fi
 
-# Git checks every object against its hash, so the commit id is the digest.
+# Git checks every object against its hash, so the commit id is the digest. Paths after the
+# directory limit the checkout to them, and only their blobs download.
 fetch_commit() {
   local url="$1" commit="$2" dir="$3"
+  shift 3
   if [ "$(git -C "$dir" rev-parse HEAD 2>/dev/null)" = "$commit" ]; then
     echo "$(basename "$dir") $commit already in $dir"
     return
   fi
   rm -rf "$dir"
   git init -q "$dir"
-  git -C "$dir" fetch -q --depth 1 "$url" "$commit"
+  if [ $# -gt 0 ]; then
+    git -C "$dir" remote add origin "$url"
+    git -C "$dir" sparse-checkout set "$@"
+    git -C "$dir" fetch -q --depth 1 --filter=blob:none origin "$commit"
+  else
+    git -C "$dir" fetch -q --depth 1 "$url" "$commit"
+  fi
   git -C "$dir" -c advice.detachedHead=false checkout -q FETCH_HEAD
   echo "$(basename "$dir") $commit in $dir"
 }
@@ -130,6 +149,13 @@ else
   echo "$gt7_sum  $gt7.part" | sha256sum -c --quiet -
   mv "$gt7.part" "$gt7"
   echo "gt7 sample in $gt7"
+fi
+
+if [ "${ORR_FETCH_DLSS:-0}" = 1 ]; then
+  fetch_commit https://github.com/NVIDIA/DLSS "$dlss_commit" "$tools/DLSS" \
+    include lib/Windows_x86_64/x64
+  fetch_commit https://github.com/KhronosGroup/Vulkan-Headers "$vulkan_headers_commit" \
+    "$tools/vulkan-headers"
 fi
 
 if [ "${ORR_VALIDATION_DATA:-0}" = 1 ]; then
@@ -155,6 +181,17 @@ if [ "${ORR_VALIDATION_DATA:-0}" = 1 ]; then
     echo "$prague_ground_sum  $ground.part" | sha256sum -c --quiet -
     mv "$ground.part" "$ground"
     echo "prague ground dataset in $ground"
+  fi
+  tangent_test="$tools/gltf/NormalTangentMirrorTest.glb"
+  if echo "$tangent_test_sum  $tangent_test" | sha256sum -c --quiet - 2>/dev/null; then
+    echo "tangent test model already in $tangent_test"
+  else
+    mkdir -p "$(dirname "$tangent_test")"
+    curl -fsSL --retry 3 -o "$tangent_test.part" \
+      "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/$gltf_samples_commit/Models/NormalTangentMirrorTest/glTF-Binary/NormalTangentMirrorTest.glb"
+    echo "$tangent_test_sum  $tangent_test.part" | sha256sum -c --quiet -
+    mv "$tangent_test.part" "$tangent_test"
+    echo "tangent test model in $tangent_test"
   fi
   smoke="$tools/volumes/smoke.vdb"
   if [ -f "$smoke" ] && [ "$(cat "$smoke.zip-sha256" 2>/dev/null)" = "$smoke_sum" ]; then

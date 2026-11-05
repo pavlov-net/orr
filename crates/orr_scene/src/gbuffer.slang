@@ -53,7 +53,6 @@ public struct BsdfParams
     public float thin_film_thickness;   // nm
     public float thin_film_ior;
     public float3 emission;             // any units; `Bsdf.emission` attenuates it by the coat and fuzz
-    public float3 scale;                // multiplies every lobe: the directional occlusion, and the layers `bsdf_collapse` removes
     public uint flags;                  // BSDF_*: the lobes that are on and thin-walled geometry
 }
 
@@ -184,17 +183,27 @@ float3 from_rgb8(uint v)
     return srgb_decode(float3(unpack_unorm8(v), unpack_unorm8(v >> 8), unpack_unorm8(v >> 16)));
 }
 
-// 8 bits of sqrt(F0) at normal incidence from air: IOR 1 to 3, finest near 1.
+// 8 bits of t = (n - 1) / (n + 1), sqrt(F0) from air with its sign, over every IOR: Fresnel
+// reaches 1 toward both 0 and infinity. Codes 16 to 241 hold IOR 1 to 3, finest, and the rest
+// IOR 0 to 1 and 3 up. The steps put IOR 1.5, the usual default, exactly on code 106.
 uint ior_code(float ior)
 {
-    float n = max(ior, 1.0);
-    return pack_unorm8(2.0 * (n - 1.0) / (n + 1.0));
+    float t = 1.0 - 2.0 / (max(ior, 0.0) + 1.0);
+    return uint(round(t < 0.0 ? 16.0 * (t + 1.0) : t < 0.5 ? 16.0 + 450.0 * t : 241.0 + 28.0 * (t - 0.5))) & 255;
 }
 
-float ior_from_code(uint c)
+float ior_from_code(uint code)
 {
-    float r = unpack_unorm8(c) * 0.5;
-    return (1.0 + r) / (1.0 - r);
+    float c = float(code & 255);
+    float t = c < 16.0 ? c / 16.0 - 1.0 : c < 241.0 ? (c - 16.0) / 450.0 : 0.5 + (c - 241.0) / 28.0;
+    return (1.0 + t) / max(1.0 - t, 1e-4);
+}
+
+// The power of two a specular weight stores under: OpenPBR limits it only by 1 / F0. A weight
+// up to 1 has exponent 0.
+uint weight_exponent(float weight)
+{
+    return weight > 1.0 ? uint(min(ceil(log2(weight)), 31.0)) : 0;
 }
 
 // 5 bits: 0 = none, else the error is at most 2^(e - 21) m.
@@ -218,7 +227,7 @@ uint angle_code(float a)
 
 float angle_from_code(uint c)
 {
-    return float(c) / 256.0 * PI;
+    return float(c & 255) / 256.0 * PI;
 }
 
 // Whether `s` needs the extended target.
@@ -250,12 +259,12 @@ public GBufferWords encode_gsurface(GSurface s, bool extended)
     w.a.x = rgb8(p.base_color) | (pack_unorm8(p.specular_roughness) << 24);
     w.a.y = oct_encode_snorm16(s.normal);
     w.a.z = pack_rgb9e5(max(p.emission, 0.0));
-    w.a.w = pack_unorm8(p.metalness) | (pack_unorm8(p.specular_weight) << 8) | (ior_code(p.specular_ior) << 16) | (flags << 24);
+    uint exponent = weight_exponent(p.specular_weight);
+    w.a.w = pack_unorm8(p.metalness) | (pack_unorm8(p.specular_weight * exp2(-float(exponent))) << 8) | (ior_code(p.specular_ior) << 16) | (flags << 24);
     float3 sc = srgb_encode(saturate(p.specular_color));
     uint3 s7 = uint3(round(sc * 127.0));
-    w.b.x = s7.x | (s7.y << 7) | (s7.z << 14) | (raster_error_code(s.raster_error) << 21);
-    float occlusion = max_component(p.scale);
-    w.b.y = (oct_encode_snorm8(s.geometric_normal) & 0xffff) | (pack_unorm8(p.diffuse_roughness) << 16) | (pack_unorm8(occlusion) << 24);
+    w.b.x = s7.x | (s7.y << 7) | (s7.z << 14) | (raster_error_code(s.raster_error) << 21) | (exponent << 26);
+    w.b.y = (oct_encode_snorm8(s.geometric_normal) & 0xffff) | (pack_unorm8(p.diffuse_roughness) << 16);
     w.x = uint4(0);
     if ((flags & GBUFFER_EXTENDED) != 0)
     {
@@ -292,13 +301,12 @@ public GSurface decode_gsurface(GBufferWords w, MaterialGpu* m)
     s.normal = oct_decode_snorm16(w.a.y);
     p.emission = unpack_rgb9e5(w.a.z);
     p.metalness = unpack_unorm8(w.a.w);
-    p.specular_weight = unpack_unorm8(w.a.w >> 8);
+    p.specular_weight = unpack_unorm8(w.a.w >> 8) * exp2(float((w.b.x >> 26) & 31));
     p.specular_ior = ior_from_code(w.a.w >> 16);
     p.specular_color = srgb_decode(float3(uint3(w.b.x, w.b.x >> 7, w.b.x >> 14) & 127) / 127.0);
     s.raster_error = raster_error_from_code((w.b.x >> 21) & 31);
     s.geometric_normal = oct_decode_snorm8(w.b.y & 0xffff);
     p.diffuse_roughness = unpack_unorm8(w.b.y >> 16);
-    p.scale = float3(unpack_unorm8(w.b.y >> 24));
     p.transmission_weight = 0.0;
     p.transmission_color = float3(1.0);
     bool thin = (flags & GBUFFER_THIN_TWO_SIDED) != 0;

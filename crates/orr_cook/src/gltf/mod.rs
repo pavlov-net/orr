@@ -1,5 +1,7 @@
 //! glTF 2.0 import: the default scene's triangle primitives as one mesh per model, the
-//! materials they use, and with skins a skeleton and its clips ([`crate::skin`]).
+//! materials they use, and with skins a skeleton and its clips ([`crate::skin`]). Strips and
+//! fans become triangle lists. Points, lines and primitives without positions have no surface
+//! to cook: they are skipped, and each one placed is a warning in the report.
 //!
 //! With [`GltfLayout::Scene`] and without `GltfSettings::models` the whole scene is one model.
 //! With models, each node whose name contains a pattern (and has no selected ancestor) is a
@@ -8,8 +10,8 @@
 //! default weights (the node's `weights`, else the mesh's). With skins, the mesh is in
 //! bind space: a skinned primitive's vertices stay as stored (glTF ignores its node's
 //! transform), take their joints and weights from `JOINTS_n`/`WEIGHTS_n`, and a primitive
-//! without a skin follows its nearest skeleton joint rigidly; skins and model selection do
-//! not mix.
+//! without a skin follows its nearest skeleton joint rigidly, or with none stays where its
+//! node puts it; skins and model selection do not mix.
 //!
 //! With [`GltfLayout::Meshes`] every glTF mesh the scene places is a model `mesh/<i>` in the
 //! mesh's own space (`mesh/<i>/morph/<k>` for each other set of node morph weights), and every
@@ -51,14 +53,14 @@
 pub(crate) mod data;
 mod material;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gltf::image::Source as ImageSource;
 use gltf::mesh::{Mode, Semantic};
-use orr_math::{Mat3, Mat4, Vec3};
+use orr_math::{DMat3, DMat4, Quat, Vec3};
 use orr_pack::Hash32;
 use rayon::prelude::*;
 use serde::Deserialize;
@@ -68,11 +70,12 @@ use crate::import::{
 };
 use crate::mesh::{
     self, LazyMesh, MeshData, MeshSettings, MeshSource, PartData, Pivots, SectionData, Skin,
+    tangents,
 };
 use crate::patch::{self, MaterialPatch, MeshPatch};
 use crate::skin::{Graph, Skeleton, influences};
 use crate::state::{Input, Memo};
-use crate::texture::material::{ImageData, ImageFile};
+use crate::texture::material::{ImageData, ImageFile, Layer};
 use crate::{Error, GltfSettings, PartAttribute, Result};
 use data::{Buffer, Data, Document};
 
@@ -114,6 +117,8 @@ enum Binding<'a> {
 struct Building {
     node: Option<usize>,
     v: Vertices,
+    /// The model carries tangents, on every primitive: one states them or its material reads
+    /// them, and a prototype's material can read them on the others.
     tangents: bool,
     /// A primitive has TEXCOORD_1.
     uv1: bool,
@@ -127,7 +132,7 @@ impl Building {
         Self {
             node,
             v: Vertices::default(),
-            tangents: true,
+            tangents: false,
             uv1: false,
             groups: BTreeMap::new(),
             joint_pivots: vec![None; parts],
@@ -190,6 +195,58 @@ fn material_index(prim: &gltf::Primitive<'_>) -> usize {
     prim.material().index().unwrap_or(usize::MAX)
 }
 
+/// Whether `prim` has a surface to cook.
+fn has_surface(prim: &gltf::Primitive<'_>) -> bool {
+    let triangles = matches!(
+        prim.mode(),
+        Mode::Triangles | Mode::TriangleStrip | Mode::TriangleFan
+    );
+    triangles && prim.get(&Semantic::Positions).is_some()
+}
+
+/// The primitives of `mesh` with a surface to cook.
+fn surfaces<'a>(mesh: &gltf::Mesh<'a>) -> impl Iterator<Item = gltf::Primitive<'a>> {
+    mesh.primitives().filter(has_surface)
+}
+
+/// The mesh of `node`, if it has a surface to cook.
+fn surface_mesh<'a>(node: &gltf::Node<'a>) -> Option<gltf::Mesh<'a>> {
+    node.mesh().filter(|m| surfaces(m).next().is_some())
+}
+
+/// The corners of the triangles of vertices `v` connected as `mode`, in glTF's order.
+fn corners(mode: Mode, v: Vec<u32>) -> Vec<u32> {
+    let triangles = 0..v.len().saturating_sub(2);
+    match mode {
+        Mode::TriangleStrip => triangles
+            .flat_map(|i| [v[i], v[i + 1 + i % 2], v[i + 2 - i % 2]])
+            .collect(),
+        Mode::TriangleFan => triangles.flat_map(|i| [v[i + 1], v[i + 2], v[0]]).collect(),
+        _ => v,
+    }
+}
+
+/// A warning for each primitive without a surface of the meshes nodes `placed` hold.
+fn skipped_primitives(doc: &gltf::Document, placed: impl Iterator<Item = usize>) -> Vec<String> {
+    let meshes = placed.filter_map(|n| doc.nodes().nth(n)?.mesh().map(|m| m.index()));
+    let mut warnings = Vec::new();
+    for mesh in meshes.collect::<BTreeSet<_>>() {
+        let mesh = doc.meshes().nth(mesh).expect("mesh index");
+        for p in mesh.primitives().filter(|p| !has_surface(p)) {
+            let why = match p.get(&Semantic::Positions) {
+                Some(_) => format!("mode {:?}", p.mode()),
+                None => "no POSITION".to_string(),
+            };
+            warnings.push(format!(
+                "mesh {} primitive {}: {why} has no surface, skipped",
+                mesh.index(),
+                p.index()
+            ));
+        }
+    }
+    warnings
+}
+
 /// Adds the buffer views a primitive's attributes and indices read.
 fn primitive_views(prim: &gltf::Primitive<'_>, out: &mut Vec<usize>) {
     for (_, a) in prim.attributes() {
@@ -215,26 +272,40 @@ fn morph_accessors<'a>(prim: &gltf::Primitive<'a>) -> impl Iterator<Item = gltf:
         .flatten()
 }
 
-/// Appends a triangle primitive to `b` with its morph targets at `weights`, its positions
-/// taken to model space by `world` (winding and tangent signs flipped under a mirroring
-/// `world`).
+/// How one primitive lands in a model.
+struct Placing<'a> {
+    /// Model space from the primitive's.
+    world: DMat4,
+    /// Of its morph targets.
+    weights: &'a [f32],
+    binding: Option<&'a Binding<'a>>,
+    /// [`SceneMaterial::tangent_set`] of its material; set 0 where that reads none and the
+    /// model carries tangents.
+    tangent_set: Option<usize>,
+}
+
+/// Appends a triangle primitive to `b` with its morph targets at the weights, its positions
+/// taken to model space by the world transform (winding and tangent signs flipped under a
+/// mirroring one). Tangents are the primitive's own, or MikkTSpace's where the model carries
+/// them, computed from its morphed attributes in its own space as the glTF spec asks.
 fn append_primitive(
     src: &Data<'_>,
     prim: &gltf::Primitive<'_>,
-    world: Mat4,
-    weights: &[f32],
-    binding: Option<&Binding<'_>>,
+    at: &Placing<'_>,
     cx: &Context<'_>,
     b: &mut Building,
 ) -> Result<(), String> {
-    if prim.mode() != Mode::Triangles {
-        return Err(format!("mode {:?} is not triangles", prim.mode()));
-    }
-    let linear = Mat3::from_mat4(world);
-    // In f64 as `normal_matrix` takes it: where `world` flattens, the sign is rounding, and
-    // the winding and the normals have to agree on it.
-    let flip = linear.as_dmat3().determinant() < 0.0;
-    let normal_m = normal_matrix(linear.as_dmat3()).as_mat3();
+    let (world, weights, binding) = (at.world, at.weights, at.binding);
+    let linear = DMat3::from_mat4(world);
+    // As `normal_matrix` takes it: where `world` flattens, the sign is rounding, and the
+    // winding and the normals have to agree on it.
+    let flip = linear.determinant() < 0.0;
+    let normal_m = normal_matrix(linear).as_mat3();
+    let linear = linear.as_mat3();
+    let place = |p: [f32; 3]| {
+        let p = world.transform_point3(Vec3::from(p).as_dvec3());
+        p.as_vec3().to_array()
+    };
     let position = prim.get(&Semantic::Positions).ok_or("no positions")?;
     let n = position.count();
     let counted = |a: &gltf::Accessor<'_>, k| {
@@ -276,22 +347,16 @@ fn append_primitive(
             .ok_or_else(|| format!("{name}: custom vertex attributes start with _"))?;
         rows(Semantic::Extras(key.into()), k)
     };
-    let positions: Vec<[f32; 3]> = rows(Semantic::Positions, 3)?
-        .expect("checked above")
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .map(|&p| world.transform_point3(Vec3::from(p)).to_array())
-        .collect();
-    let mut indices: Vec<u32> = match prim.indices() {
+    let local = rows(Semantic::Positions, 3)?.expect("checked above");
+    let local = local.as_chunks::<3>().0;
+    let positions: Vec<[f32; 3]> = local.iter().map(|&p| place(p)).collect();
+    let vertices: Vec<u32> = match prim.indices() {
         Some(a) => src.indices(&a)?,
         None => (0..n as u32).collect(),
     };
+    let mut indices = corners(prim.mode(), vertices);
     if !indices.len().is_multiple_of(3) || indices.iter().any(|&i| i as usize >= n) {
         return Err("bad index list".into());
-    }
-    if flip {
-        indices.chunks_exact_mut(3).for_each(|t| t.swap(1, 2));
     }
     let [uvs, uvs1] = [0, 1].map(|set| rows(Semantic::TexCoords(set), 2));
     let (uvs, uvs1) = (uvs?, uvs1?);
@@ -300,25 +365,55 @@ fn append_primitive(
         v.map_or_else(|| vec![[0.0; 2]; n], |v| v.as_chunks::<2>().0.to_vec())
     };
     let (uvs, uvs1) = (zeros(uvs), zeros(uvs1));
-    let tangents = rows(Semantic::Tangents, 4)?.map(|t| {
-        t.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&[x, y, z, w]| {
-                let t = (linear * Vec3::new(x, y, z)).to_array();
-                [t[0], t[1], t[2], if flip { -w } else { w }]
-            })
-            .collect::<Vec<_>>()
-    });
-    b.tangents &= tangents.is_some();
-    let tangents = tangents.unwrap_or_else(|| vec![[1.0, 0.0, 0.0, 1.0]; n]);
-    let normals: Option<Vec<[f32; 3]>> = rows(Semantic::Normals, 3)?.map(|ns| {
-        ns.as_chunks::<3>()
-            .0
-            .iter()
+    let local_normals = rows(Semantic::Normals, 3)?;
+    let local_normals = local_normals.as_ref().map(|n| n.as_chunks::<3>().0);
+    let normals: Option<Vec<[f32; 3]>> = local_normals.map(|ns| {
+        ns.iter()
             .map(|&nv| (normal_m * Vec3::from(nv)).normalize_or_zero().to_array())
             .collect()
     });
+    let place_tangent = |[x, y, z, w]: [f32; 4]| {
+        let t = (linear * Vec3::new(x, y, z)).to_array();
+        [t[0], t[1], t[2], if flip { -w } else { w }]
+    };
+    // glTF ignores the tangents of a primitive without normals.
+    let stated = normals
+        .is_some()
+        .then(|| rows(Semantic::Tangents, 4))
+        .transpose()?
+        .flatten();
+    let stated: Option<Vec<[f32; 4]>> = stated.map(|t| {
+        t.as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(place_tangent)
+            .collect()
+    });
+    let tangent_set = at.tangent_set.or(b.tangents.then_some(0));
+    let mut computed: Option<Vec<[f32; 4]>> = tangent_set.filter(|_| stated.is_none()).map(|set| {
+        let uv = if set == 1 { &uvs1 } else { &uvs };
+        let corners = match local_normals {
+            Some(n) => {
+                let unit = n
+                    .iter()
+                    .map(|&n| Vec3::from(n).normalize_or_zero().to_array());
+                let unit: Vec<[f32; 3]> = unit.collect();
+                tangents::generate(Some(&indices), local, &unit, uv)
+            }
+            None => tangents::generate_flat(&indices, local, uv),
+        };
+        corners.into_iter().map(place_tangent).collect()
+    });
+    if flip {
+        indices.chunks_exact_mut(3).for_each(|t| t.swap(1, 2));
+        if let Some(c) = &mut computed {
+            c.as_chunks_mut::<3>()
+                .0
+                .iter_mut()
+                .for_each(|t| t.swap(1, 2));
+        }
+    }
     let skin: Vec<([u8; 4], [u8; 4])> = match binding {
         None => Vec::new(),
         Some(Binding::Rigid(j)) => vec![([*j as u8; 4], [255, 0, 0, 0]); n],
@@ -382,13 +477,7 @@ fn append_primitive(
             let pivots = match (&pa.pivot, cx.skeleton) {
                 (Some(name), None) => custom(name, 3)?.map_or_else(
                     || vec![[0.0; 3]; n],
-                    |p| {
-                        p.as_chunks::<3>()
-                            .0
-                            .iter()
-                            .map(|&q| world.transform_point3(Vec3::from(q)).to_array())
-                            .collect()
-                    },
+                    |p| p.as_chunks::<3>().0.iter().map(|&q| place(q)).collect(),
                 ),
                 _ => Vec::new(),
             };
@@ -419,28 +508,35 @@ fn append_primitive(
     let v = &mut b.v;
     match normals {
         Some(normals) => {
-            v.positions.extend(positions);
-            v.normals.extend(normals);
+            let (tangents, copies) = match (&computed, stated) {
+                (Some(c), _) => tangents::per_vertex(n, &mut indices, c),
+                (None, Some(t)) => (t, Vec::new()),
+                (None, None) => (vec![tangents::UNREAD; n], Vec::new()),
+            };
+            v.positions
+                .extend(tangents::with_copies(positions, &copies));
+            v.normals.extend(tangents::with_copies(normals, &copies));
             v.tangents.extend(tangents);
-            v.uvs.extend(uvs);
-            v.uvs1.extend(uvs1);
+            v.uvs.extend(tangents::with_copies(uvs, &copies));
+            v.uvs1.extend(tangents::with_copies(uvs1, &copies));
+            let skin = tangents::with_copies(skin, &copies);
             v.joints.extend(skin.iter().map(|s| s.0));
             v.weights.extend(skin.iter().map(|s| s.1));
-            v.values.extend(values);
-            v.pivots.extend(pivots);
+            v.values.extend(tangents::with_copies(values, &copies));
+            v.pivots.extend(tangents::with_copies(pivots, &copies));
             tris.extend(indices.iter().map(|i| base + i));
         }
         // Without normals, glTF asks for flat shading: one vertex per corner.
         None => {
-            for t in indices.as_chunks::<3>().0 {
-                let p = t.map(|i| Vec3::from(positions[i as usize]));
-                let face = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
-                for &i in t {
+            for (k, t) in indices.as_chunks::<3>().0.iter().enumerate() {
+                let face = tangents::face_normal(t.map(|i| Vec3::from(positions[i as usize])));
+                for (c, &i) in t.iter().enumerate() {
                     let i = i as usize;
                     tris.push(v.positions.len() as u32);
                     v.positions.push(positions[i]);
                     v.normals.push(face.to_array());
-                    v.tangents.push(tangents[i]);
+                    v.tangents
+                        .push(computed.as_ref().map_or(tangents::UNREAD, |t| t[3 * k + c]));
                     v.uvs.push(uvs[i]);
                     v.uvs1.push(uvs1[i]);
                     if let Some(&(j, w)) = skin.get(i) {
@@ -497,7 +593,8 @@ fn images(asset: &str, src: &Document, dir: &Path) -> Result<Vec<ImageFile>> {
                 None => (
                     uri.to_string(),
                     ImageData::File {
-                        path: dir.join(uri),
+                        layer: Layer::Whole,
+                        path: data::uri_path(dir, uri),
                         read: None,
                     },
                 ),
@@ -549,6 +646,7 @@ pub(crate) fn import(
         hashes: BTreeMap::new(),
         instances: Vec::new(),
         files: &mut files,
+        warnings: Vec::new(),
     };
     let skeleton = match settings.layout {
         GltfLayout::Scene => scene_layout(&mut b, &graph)?,
@@ -561,6 +659,7 @@ pub(crate) fn import(
         materials,
         mut models,
         instances,
+        warnings,
         ..
     } = b;
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -579,6 +678,7 @@ pub(crate) fn import(
         skeletons: skeleton.into_iter().collect(),
         instances,
         files,
+        warnings,
     })
 }
 
@@ -599,6 +699,7 @@ struct Imported<'a> {
     hashes: BTreeMap<PathBuf, Hash32>,
     instances: Vec<(String, Vec<Placed>)>,
     files: &'a mut Vec<Input>,
+    warnings: Vec<String>,
 }
 
 impl Imported<'_> {
@@ -672,13 +773,30 @@ impl Imported<'_> {
             .textures
             .refs()
             .any(|r| r.uv_set == 1);
+        // L2628 "**MUST** define" them and gives no reading; TEXCOORD_0 reads zero alike.
         if reads_uv1 && prim.get(&Semantic::TexCoords(1)).is_none() {
-            return Err(self.fail(format!(
-                "mesh {mesh} primitive {}: its material reads TEXCOORD_1, which the primitive does not have",
+            let warning = format!(
+                "mesh {mesh} primitive {}: its material reads TEXCOORD_1, which the primitive does not have; it reads uv 0",
                 prim.index()
-            )));
+            );
+            // Every node placing the mesh comes through here.
+            if !self.warnings.contains(&warning) {
+                self.warnings.push(warning);
+            }
         }
         Ok(())
+    }
+
+    /// [`SceneMaterial::tangent_set`] of `prim`'s registered material.
+    fn tangent_set(&self, prim: &gltf::Primitive<'_>) -> Option<usize> {
+        self.materials[&material_index(prim)].tangent_set()
+    }
+
+    /// Whether `prim` makes its model carry tangents. glTF ignores those of a primitive without
+    /// normals.
+    fn carries_tangents(&self, prim: &gltf::Primitive<'_>) -> bool {
+        let stated = [Semantic::Normals, Semantic::Tangents];
+        self.tangent_set(prim).is_some() || stated.iter().all(|s| prim.get(s).is_some())
     }
 
     /// Mesh settings of the model named `name`.
@@ -701,12 +819,12 @@ impl Imported<'_> {
         name: &str,
         mesh: usize,
         weights: &[f32],
-        transforms: &[Mat4],
+        transforms: &[DMat4],
     ) -> Result<()> {
         let (direct, baked) =
             placements(transforms).map_err(|m| self.fail(format!("model {name}: {m}")))?;
         if !direct.is_empty() {
-            self.lazy_model(name, mesh, weights, Mat4::IDENTITY)?;
+            self.lazy_model(name, mesh, weights, DMat4::IDENTITY)?;
             self.instances.push((name.to_string(), direct));
         }
         for (k, (linear, placed)) in baked.into_iter().enumerate() {
@@ -719,30 +837,37 @@ impl Imported<'_> {
 
     /// Model `name`: glTF mesh `mesh` at morph `weights` with `linear` applied, read when
     /// it cooks.
-    fn lazy_model(&mut self, name: &str, mesh: usize, weights: &[f32], linear: Mat4) -> Result<()> {
+    fn lazy_model(
+        &mut self,
+        name: &str,
+        mesh: usize,
+        weights: &[f32],
+        linear: DMat4,
+    ) -> Result<()> {
         self.name(name)?;
         let src = Arc::clone(self.src);
         let m = src.doc.meshes().nth(mesh).expect("mesh index");
         let mut views = Vec::new();
         let mut groups: BTreeMap<usize, u64> = BTreeMap::new();
-        for prim in m.primitives() {
+        let mut tangent_sets = Vec::new();
+        for prim in surfaces(&m) {
             self.material(mesh, &prim)?;
+            tangent_sets.push(self.tangent_set(&prim));
             primitive_views(&prim, &mut views);
             for a in morph_accessors(&prim) {
                 Document::accessor_views(&a, &mut views);
             }
-            let what = format!("mesh {mesh} primitive {}", prim.index());
-            if prim.mode() != Mode::Triangles {
-                return Err(self.fail(format!("{what}: mode {:?} is not triangles", prim.mode())));
-            }
-            let positions = prim
-                .get(&Semantic::Positions)
-                .ok_or_else(|| self.fail(format!("{what}: no positions")))?;
-            let corners = prim.indices().map_or(positions.count(), |a| a.count());
-            if !corners.is_multiple_of(3) {
+            let positions = prim.get(&Semantic::Positions).expect("a surface");
+            let vertices = prim.indices().map_or(positions.count(), |a| a.count());
+            let count = match prim.mode() {
+                Mode::Triangles => vertices,
+                _ => 3 * vertices.saturating_sub(2),
+            };
+            if !count.is_multiple_of(3) {
+                let what = format!("mesh {mesh} primitive {}", prim.index());
                 return Err(self.fail(format!("{what}: bad index list")));
             }
-            *groups.entry(material_index(&prim)).or_default() += corners as u64;
+            *groups.entry(material_index(&prim)).or_default() += count as u64;
         }
         let checked = self.record(&mut views)?;
         let mut sections = Vec::new();
@@ -765,7 +890,8 @@ impl Imported<'_> {
             return Err(self.fail(format!("model {name} has no triangles")));
         }
         // Everything the loaded mesh is made of: the mesh's JSON, its accessors and views,
-        // the bytes of the buffers they read, the transform and the part attribute.
+        // the bytes of the buffers they read, the transform, the part attribute, and whether
+        // the model carries tangents and the uv sets they follow.
         let mut h = blake3::Hasher::new();
         let mut json = |v: &serde_json::Value| {
             let s = serde_json::to_string(v).expect("JSON serializes");
@@ -773,7 +899,7 @@ impl Imported<'_> {
             h.update(s.as_bytes());
         };
         json(&src.json["meshes"][mesh]);
-        for prim in m.primitives() {
+        for prim in surfaces(&m) {
             let attributes = prim.attributes().map(|a| a.1);
             for a in attributes
                 .chain(prim.indices())
@@ -795,6 +921,8 @@ impl Imported<'_> {
         h.update(bytemuck::cast_slice(&linear.to_cols_array()));
         h.update(bytemuck::cast_slice(weights));
         h.update(format!("{:?}", self.settings.parts_from_attribute).as_bytes());
+        let tangents = surfaces(&m).any(|p| self.carries_tangents(&p));
+        h.update(format!("{tangents} {tangent_sets:?}").as_bytes());
         let parts = self.settings.parts_from_attribute.clone();
         let asset = self.asset.to_string();
         let weights = weights.to_vec();
@@ -810,14 +938,19 @@ impl Imported<'_> {
             };
             let count = parts.as_ref().map_or(0, |p| usize::from(p.parts));
             let mut b = Building::new(None, count);
+            b.tangents = tangents;
             let gm = src.doc.meshes().nth(mesh).expect("mesh index");
-            for prim in gm.primitives() {
-                append_primitive(&data, &prim, linear, &weights, None, &cx, &mut b).map_err(
-                    |m| Error::Import {
-                        asset: asset.clone(),
-                        message: format!("mesh {mesh} primitive {}: {m}", prim.index()),
-                    },
-                )?;
+            for (prim, &tangent_set) in surfaces(&gm).zip(&tangent_sets) {
+                let at = Placing {
+                    world: linear,
+                    weights: &weights,
+                    binding: None,
+                    tangent_set,
+                };
+                append_primitive(&data, &prim, &at, &cx, &mut b).map_err(|m| Error::Import {
+                    asset: asset.clone(),
+                    message: format!("mesh {mesh} primitive {}: {m}", prim.index()),
+                })?;
             }
             Ok(b.finish(parts.as_ref(), false).0)
         };
@@ -831,7 +964,7 @@ impl Imported<'_> {
         // Assemblies split the mesh when it is planned, so such a model is read now.
         let mesh = if settings.assemblies.is_some() {
             MeshSource::Data(Box::new(
-                MeshSource::Lazy(lazy).load(self.asset, self.memo)?,
+                MeshSource::Lazy(lazy).read(self.asset, self.memo)?,
             ))
         } else {
             MeshSource::Lazy(lazy)
@@ -848,9 +981,9 @@ impl Imported<'_> {
     }
 }
 
-/// Node `n`'s `EXT_mesh_gpu_instancing` object, if it has one and a mesh.
+/// Node `n`'s `EXT_mesh_gpu_instancing` object, if it has one and a mesh with a surface.
 fn instancing(src: &Document, n: usize) -> Option<&serde_json::Value> {
-    src.doc.nodes().nth(n)?.mesh()?;
+    surface_mesh(&src.doc.nodes().nth(n)?)?;
     src.json["nodes"][n]
         .get("extensions")
         .and_then(|e| e.get("EXT_mesh_gpu_instancing"))
@@ -874,7 +1007,7 @@ fn instancing_views(src: &Document, graph: &Graph) -> Vec<usize> {
 
 /// The world transforms of `n`'s copies: its world transform times each
 /// `EXT_mesh_gpu_instancing` instance, or its world transform alone.
-fn node_transforms(src: &Data<'_>, graph: &Graph, n: usize) -> Result<Vec<Mat4>, String> {
+fn node_transforms(src: &Data<'_>, graph: &Graph, n: usize) -> Result<Vec<DMat4>, String> {
     let world = graph.world[n];
     let Some(ext) = instancing(src.doc, n) else {
         return Ok(vec![world]);
@@ -908,13 +1041,18 @@ fn node_transforms(src: &Data<'_>, graph: &Graph, n: usize) -> Result<Vec<Mat4>,
             let t = t
                 .as_ref()
                 .map_or(Vec3::ZERO, |v| Vec3::from_slice(&v[3 * i..]));
-            let r = r.as_ref().map_or(orr_math::Quat::IDENTITY, |v| {
-                orr_math::Quat::from_slice(&v[4 * i..]).normalize()
-            });
+            let r = r
+                .as_ref()
+                .map_or(Quat::IDENTITY, |v| Quat::from_slice(&v[4 * i..]));
             let s = sc
                 .as_ref()
                 .map_or(Vec3::ONE, |v| Vec3::from_slice(&v[3 * i..]));
-            world * Mat4::from_scale_rotation_translation(s, r, t)
+            world
+                * DMat4::from_scale_rotation_translation(
+                    s.as_dvec3(),
+                    r.as_dquat().normalize(),
+                    t.as_dvec3(),
+                )
         })
         .collect())
 }
@@ -935,7 +1073,7 @@ fn meshes_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
     let skinned = graph.order.iter().any(|&n| {
         doc.nodes()
             .nth(n)
-            .is_some_and(|d| d.mesh().is_some() && d.skin().is_some())
+            .is_some_and(|d| surface_mesh(&d).is_some() && d.skin().is_some())
     });
     let needs_scene = [
         (!s.models.is_empty(), "model selection"),
@@ -947,21 +1085,24 @@ fn meshes_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<()> {
     }
     // Every placed mesh's buffer files, hashed together.
     let shown = b.shown.clone();
+    b.warnings
+        .extend(skipped_primitives(doc, shown.iter().copied()));
     let mut views = Vec::new();
     for &n in &shown {
         if let Some(mesh) = doc.nodes().nth(n).and_then(|d| d.mesh()) {
-            mesh.primitives()
-                .for_each(|p| primitive_views(&p, &mut views));
+            surfaces(&mesh).for_each(|p| primitive_views(&p, &mut views));
         }
     }
     b.record(&mut views)?;
     let data = instancing_data(b, &src, graph)?;
     // Per mesh, its placements per set of morph weights, the mesh's own first.
-    type Placings = Vec<(Vec<f32>, Vec<Mat4>)>;
+    type Placings = Vec<(Vec<f32>, Vec<DMat4>)>;
     let mut by_mesh: BTreeMap<usize, Placings> = BTreeMap::new();
     for &n in &shown {
         let node = doc.nodes().nth(n).expect("node index");
-        let Some(mesh) = node.mesh() else { continue };
+        let Some(mesh) = surface_mesh(&node) else {
+            continue;
+        };
         let own = mesh.weights().unwrap_or_default();
         let weights = node.weights().unwrap_or(own);
         let transforms = node_transforms(&data, graph, n).map_err(|m| b.fail(m))?;
@@ -1025,7 +1166,7 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
             continue;
         }
         if let Some(mesh) = doc.nodes().nth(n).and_then(|d| d.mesh()) {
-            for p in mesh.primitives() {
+            for p in surfaces(&mesh) {
                 primitive_views(&p, &mut views);
                 for a in morph_accessors(&p) {
                     Document::accessor_views(&a, &mut views);
@@ -1052,13 +1193,21 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
         .iter()
         .filter_map(|&n| {
             let node = doc.nodes().nth(n)?;
-            node.mesh()?;
+            surface_mesh(&node)?;
             Some(node.skin()?.index())
         })
         .collect();
     skins.sort_unstable();
     skins.dedup();
-    let skeleton = Skeleton::build(&data, graph, &skins).map_err(fail)?;
+    let unskinned: Vec<usize> = shown
+        .iter()
+        .copied()
+        .filter(|&n| {
+            let node = doc.nodes().nth(n).expect("node index");
+            node.skin().is_none() && surface_mesh(&node).is_some()
+        })
+        .collect();
+    let skeleton = Skeleton::build(&data, graph, &skins, &unskinned).map_err(fail)?;
     if skeleton.is_some() && !settings.models.is_empty() {
         return Err(fail(
             "model selection needs a scene without skins: skinned vertices stay in bind space"
@@ -1075,6 +1224,13 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
     }
     let rigid = skeleton.as_ref().filter(|_| settings.parts_from_skin);
     let (mut models, mut owner) = select_models(doc, graph, &shown, settings).map_err(fail)?;
+    let placed = shown.iter().copied();
+    let skipped = skipped_primitives(
+        doc,
+        placed.filter(|&n| owner[n].is_some() || is_instanced[n]),
+    );
+    let elsewhere = !instanced.is_empty() || !skipped.is_empty();
+    b.warnings.extend(skipped);
     for &n in &instanced {
         owner[n] = None;
     }
@@ -1086,7 +1242,17 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
     };
     for &n in &shown {
         let node = doc.nodes().nth(n).expect("node index");
-        let (Some(mesh), Some(m)) = (node.mesh(), owner[n]) else {
+        let (Some(mesh), Some(m)) = (surface_mesh(&node), owner[n]) else {
+            continue;
+        };
+        for prim in surfaces(&mesh) {
+            b.material(mesh.index(), &prim)?;
+            models[m].tangents |= b.carries_tangents(&prim);
+        }
+    }
+    for &n in &shown {
+        let node = doc.nodes().nth(n).expect("node index");
+        let (Some(mesh), Some(m)) = (surface_mesh(&node), owner[n]) else {
             continue;
         };
         let (world, binding) = match (&skeleton, node.skin()) {
@@ -1097,7 +1263,7 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
                 None,
             ),
             (Some(sk), Some(s)) => (
-                Mat4::IDENTITY,
+                DMat4::IDENTITY,
                 Some(Binding::Skin(sk.skin_joints(s.index()))),
             ),
             (Some(sk), None) => {
@@ -1106,18 +1272,14 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
             }
         };
         let weights = node.weights().or(mesh.weights()).unwrap_or_default();
-        for prim in mesh.primitives() {
-            b.material(mesh.index(), &prim)?;
-            append_primitive(
-                &data,
-                &prim,
+        for prim in surfaces(&mesh) {
+            let at = Placing {
                 world,
                 weights,
-                binding.as_ref(),
-                &cx,
-                &mut models[m],
-            )
-            .map_err(|e| {
+                binding: binding.as_ref(),
+                tangent_set: b.tangent_set(&prim),
+            };
+            append_primitive(&data, &prim, &at, &cx, &mut models[m]).map_err(|e| {
                 fail(format!(
                     "mesh {} primitive {}: {e}",
                     mesh.index(),
@@ -1130,8 +1292,8 @@ fn scene_layout(b: &mut Imported<'_>, graph: &Graph) -> Result<Option<SceneSkele
     let mut out = Vec::new();
     for building in models {
         let node = building.node;
-        // The whole scene may hold nothing but instanced nodes.
-        if node.is_none() && building.groups.values().all(Vec::is_empty) && !instanced.is_empty() {
+        // The whole scene may hold nothing but instanced nodes and primitives without a surface.
+        if node.is_none() && building.groups.values().all(Vec::is_empty) && elsewhere {
             continue;
         }
         let name = node.map(|n| node_name(doc, n).to_string());
@@ -1329,7 +1491,9 @@ fn join(
         let (node, m) = &mut models[i];
         let name = m.node.clone().unwrap_or_default();
         let world = graph.world[node.expect("selected models have nodes")];
-        let cols = world.to_cols_array_2d();
+        // In f32, the precision of glTF's numbers: a chain of decimal translations that meets
+        // the grid sums just off it in f64.
+        let cols = world.as_mat4().to_cols_array_2d();
         // Each column one unit axis: entries 0 or +-1, one non-zero per column and row.
         let axis = cols[..3].iter().all(|c| {
             c[..3]
@@ -1337,7 +1501,7 @@ fn join(
                 .all(|&x| (x - x.round()).abs() <= 1e-6 && x.round().abs() <= 1.0)
                 && c[..3].iter().filter(|x| x.abs() > 0.5).count() == 1
         });
-        let det = Mat3::from_mat4(world).determinant();
+        let det = DMat3::from_mat4(world).determinant();
         if !axis || (det - 1.0).abs() > 1e-5 {
             return Err(format!(
                 "joined model {name}: rotation is not a multiple of 90 degrees at unit scale"

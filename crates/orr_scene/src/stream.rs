@@ -960,7 +960,9 @@ impl Streaming {
 
     /// Hands the texture feedback of `frame`, read back in slot `slot`, to the next step:
     /// a wanted mip finer than the resident one requests the tile that would serve it, with
-    /// the mips it would add as its error; one already resident is touched.
+    /// the mips it would add as its error; one already resident is touched. Both go for the
+    /// cell's eight neighbors too: the residency map holds a cell at the coarsest of them, so
+    /// without them it would never reach the mip it wants.
     pub(crate) fn texture_feedback(&mut self, slot: usize, frame: u64) {
         for ((mount, texture), cell, mip) in self.feedback.read(slot, frame) {
             let Some(t) = self
@@ -976,20 +978,25 @@ impl Streaming {
             if mip >= g.tail_mip() || layer >= g.layers {
                 continue;
             }
-            let tile = g.index_of(g.covering(layer, mip, [c % cx, c / cx]));
-            let k = Key {
-                mount,
-                unit: t.first_unit + tile,
-            };
-            let finest = t.finest[cell as usize];
-            if mip < finest {
-                let p = Priority {
-                    error: (finest - mip) as f32,
-                    cell_distance: 0,
-                };
-                self.residency.request(k, p);
-            } else {
-                self.residency.touch(k, frame);
+            let (x, y) = (c % cx, c / cx);
+            for ny in y.saturating_sub(1)..(y + 2).min(cy) {
+                for nx in x.saturating_sub(1)..(x + 2).min(cx) {
+                    let tile = g.index_of(g.covering(layer, mip, [nx, ny]));
+                    let k = Key {
+                        mount,
+                        unit: t.first_unit + tile,
+                    };
+                    let finest = t.finest[(layer * cx * cy + ny * cx + nx) as usize];
+                    if mip < finest {
+                        let p = Priority {
+                            error: (finest - mip) as f32,
+                            cell_distance: 0,
+                        };
+                        self.residency.request(k, p);
+                    } else {
+                        self.residency.touch(k, frame);
+                    }
+                }
             }
         }
     }

@@ -11,17 +11,17 @@
 use std::path::Path;
 use std::time::Duration;
 
-use examples::linked::KERNELS;
-use examples::quality::{Bias, Series, TILE, error_map, luminance, welch};
-use examples::scene::{FOV_Y, Showcase, TARGET, orbit_eye};
-use examples::{
-    Capture, Options, Workers, assert_clean, device, enable_dlss, fixed_time, git_rev, report_dir,
-};
 use orr::orr_gpu::QueueKind;
 use orr::{
     FrameDesc, Lens, Light, LightId, LitView, Projection, Reconstruction, ReferenceSettings,
     Renderer, RendererDesc, ScreenshotRequest, TextureFilter, ThinLens, ViewHistoryId, ViewHooks,
     ViewLighting, ViewOutput, ViewTarget,
+};
+use orr_examples::linked::KERNELS;
+use orr_examples::quality::{Bias, Series, TILE, error_map, luminance, welch};
+use orr_examples::scene::{FOV_Y, Showcase, TARGET, orbit_eye};
+use orr_examples::{
+    Capture, Options, Workers, assert_clean, device, enable_dlss, fixed_time, git_rev, report_dir,
 };
 use orr_math::camera::rh::view;
 use orr_math::{DVec3, Vec3};

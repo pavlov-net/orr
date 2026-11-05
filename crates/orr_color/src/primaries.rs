@@ -29,6 +29,14 @@ impl RgbPrimaries {
         ..Self::d65([0.713, 0.293], [0.165, 0.830], [0.128, 0.044])
     };
 
+    /// ACES2065-1 (the ACES AP0 primaries) with the ACES white.
+    pub const ACES_AP0: Self = Self {
+        white: Chromaticity::D60,
+        ..Self::d65([0.7347, 0.2653], [0.0, 1.0], [0.0001, -0.077])
+    };
+    /// Adobe RGB (1998).
+    pub const ADOBE_RGB: Self = Self::d65([0.640, 0.330], [0.210, 0.710], [0.150, 0.060]);
+
     /// Primaries at `[x, y]` with D65 white.
     const fn d65(r: [f64; 2], g: [f64; 2], b: [f64; 2]) -> Self {
         Self {
@@ -113,6 +121,21 @@ impl Primaries {
         self as u8
     }
 
+    /// The id of `rgb`, as far as chromaticities written to three places tell.
+    pub fn matching(rgb: RgbPrimaries) -> Option<Self> {
+        let near =
+            |a: Chromaticity, b: Chromaticity| (a.x - b.x).abs() < 5e-4 && (a.y - b.y).abs() < 5e-4;
+        [Self::Rec709, Self::DisplayP3, Self::Rec2020]
+            .into_iter()
+            .find(|p| {
+                let id = p.rgb();
+                near(id.red, rgb.red)
+                    && near(id.green, rgb.green)
+                    && near(id.blue, rgb.blue)
+                    && near(id.white, rgb.white)
+            })
+    }
+
     /// The chromaticities of these primaries.
     pub const fn rgb(self) -> RgbPrimaries {
         match self {
@@ -162,6 +185,18 @@ mod tests {
         .transpose();
         let m = RgbPrimaries::ACES_CG.matrix_to(RgbPrimaries::REC709);
         assert_close(m, aces, 1e-6, "ACEScg to Rec.709");
+    }
+
+    #[test]
+    fn aces_ap0_matches_its_published_matrix() {
+        // The RGB to XYZ matrix of SMPTE ST 2065-1 (ACES2065-1), rows.
+        let npm = DMat3::from_cols_array_2d(&[
+            [0.952_552_395_9, 0.0, 0.000_093_678_6],
+            [0.343_966_449_8, 0.728_166_096_6, -0.072_132_546_4],
+            [0.0, 0.0, 1.008_825_184_4],
+        ])
+        .transpose();
+        assert_close(RgbPrimaries::ACES_AP0.rgb_to_xyz(), npm, 1e-9, "AP0");
     }
 
     #[test]

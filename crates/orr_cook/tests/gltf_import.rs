@@ -680,14 +680,13 @@ fn opaque_triangles_never_cover_cut_out_texels() {
     assert_eq!(cut_out("gltf-alpha", None), [0.0; 6]);
 }
 
-/// A texture transform (glTF's `T R S`, uvs turned counter-clockwise) reaches the material
-/// and the cook's opacity reads.
+/// A texture transform reaches the material and the cook's opacity reads.
 #[test]
 fn texture_transforms_map_the_uvs_the_cook_reads() {
     let t = r#"{"offset":[0.2,-0.1],"rotation":0.4,"scale":[0.8,1.2]}"#;
     let got = cut_out("gltf-alpha-transform", Some(t));
     let (s, c) = 0.4f32.sin_cos();
-    let want = [c * 0.8 - 1.0, -s * 1.2, 0.2, s * 0.8, c * 1.2 - 1.0, -0.1];
+    let want = [c * 0.8 - 1.0, s * 1.2, 0.2, -s * 0.8, c * 1.2 - 1.0, -0.1];
     for (g, w) in got.iter().zip(want) {
         assert!((g - w).abs() < 1e-6, "{got:?} against {want:?}");
     }
@@ -1623,7 +1622,7 @@ fn winding_and_normals_agree_on_flat_products() {
 /// A primitive without the uv set its material reads fails in either layout, even when
 /// another primitive of the mesh has it.
 #[test]
-fn a_primitive_needs_the_uv_set_its_material_reads() {
+fn a_primitive_without_the_uv_set_its_material_reads_warns() {
     let d = dir("gltf-uv1-primitive");
     let mut g = Glb::default();
     let pos = [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
@@ -1652,10 +1651,12 @@ fn a_primitive_needs_the_uv_set_its_material_reads() {
             layout,
             ..GltfSettings::default()
         };
-        let Err(e) = cook(&path, settings) else {
-            panic!("{layout:?} cooked a primitive without TEXCOORD_1");
-        };
-        assert!(e.to_string().contains("TEXCOORD_1"), "{layout:?}: {e}");
+        let (_, report) = cook(&path, settings).unwrap();
+        let warnings = &report.assets[0].warnings;
+        assert!(
+            warnings.iter().any(|w| w.contains("TEXCOORD_1")),
+            "{layout:?}: {warnings:?}"
+        );
     }
 }
 
@@ -2062,9 +2063,9 @@ fn normal_mapped(path: &Path, seam: bool) {
         .iter()
         .map(|p| {
             if seam && (p[0] - 0.5).abs() < 1e-4 {
-                [0.0, 0.0, 1.0, -1.0]
+                [0.0, 0.0, 1.0, 1.0]
             } else {
-                [1.0, 0.0, 0.0, -1.0]
+                [1.0, 0.0, 0.0, 1.0]
             }
         })
         .collect();

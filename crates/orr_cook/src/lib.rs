@@ -20,7 +20,7 @@
 //!   named by its glTF animation index,
 //! - `N/material/<i>`: glTF material `i`, or `N/material/default` for primitives without one,
 //! - `N/texture/<material>/<role>`: the material's textures (roles `base_color`, `opacity`,
-//!   `normal`, `roughness`, `metalness`, `roughness_metalness`, `occlusion`, `emission`,
+//!   `normal`, `roughness`, `metalness`, `roughness_metalness`, `emission`,
 //!   `subsurface_color`, `specular_weight`, `coat`, `transmission`, `displacement`);
 //!   materials that would cook the same texture share the first one's entry.
 //!
@@ -29,7 +29,8 @@
 //! `SkelRoot` is a model `N/<root>` of its skinned meshes with skeleton `N/<root>/skeleton`
 //! and clips `N/<root>/clip/<animation>`; each `PointInstancer` prototype is a model
 //! `N/<prototype>` placed by instance pages `N/instances/...`; materials are
-//! `N/material/<prim path>` (`<prim path>/double_sided` on double-sided meshes), their
+//! `N/material/<prim path>` (`<prim path>/double_sided` on double-sided meshes,
+//! `<prim path>/primvars/<k>` on meshes that differ in what its primvar readers fetch), their
 //! textures `N/texture/<prim path>/<role>`. A MaterialX source emits one material `N` and its
 //! textures `N/texture/<role>`.
 //!

@@ -2,56 +2,82 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
+# On main a run finishes, so its cache saves, and pushes meanwhile collapse into one pending run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
 jobs:
-  check:
-    strategy:
-      fail-fast: false
-      matrix:
-        # macOS is the only platform that builds the Metal backend, so it is what catches a
-        # Vulkan-side change that breaks it.
-        os: [ubuntu-latest, windows-latest, macos-26]
-    runs-on: ${{ matrix.os }}
-    defaults:
-      run:
-        shell: bash
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .tools/dl
-          key: tools-dl-${{ runner.os }}-${{ hashFiles('tools/fetch-slang.sh') }}
-      - name: Fetch pinned tools
-        run: bash tools/fetch-slang.sh
-      # Apple targets compile every kernel into Metal libraries, and Xcode ships the Metal
-      # compiler as a separate component.
-      - name: Install the Metal toolchain
-        if: runner.os == 'macOS'
-        run: xcrun -sdk macosx metal --version || xcodebuild -downloadComponent MetalToolchain
-      # Every crate, test and example builds on both platforms; this is what catches a
-      # commit that does not build on its own.
-      - name: Check the workspace
-        run: cargo check --workspace --all-targets
-      # What Apple targets build: orr without DLSS.
-      - name: Check the workspace without DLSS
-        if: runner.os != 'macOS'
-        run: cargo check --workspace --all-targets --no-default-features
-      - name: Test file IO
-        run: cargo test -p orr_io
+          persist-credentials: false
+      - name: Install the Rust toolchain
+        run: rustup toolchain install
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: prek@0.5.10,typos@1.52.0
+      - name: typos
+        run: prek run typos --all-files
+      - name: fmt
+        run: prek run cargo-fmt --all-files
+      # Clippy needs a full build, so it runs in test. This catches a hook added to prek.toml
+      # without a step there or here.
+      - name: Every other hook
+        run: prek run --all-files --skip typos --skip cargo-fmt --skip cargo-clippy
 
-  fmt:
-    runs-on: ubuntu-latest
+  test:
+    name: test (${{ matrix.os }})
+    needs: lint
+    strategy:
+      # Clippy sees different code on each: macOS builds the Metal backend, Windows Vulkan and,
+      # with the DLSS SDK, orr_dlss's NGX code.
+      matrix:
+        include:
+          - os: windows
+            runner: blacksmith-8vcpu-windows-2025
+          - os: macos
+            runner: macos-26
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-  typos:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: crate-ci/typos@4c8b7f51ca60df14e3c5ca82770dfbbe6c3dae85 # v1.52.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: prek@0.5.10
+      - name: clippy
+        run: prek run cargo-clippy --all-files
+      # groups_match_spectral_color takes minutes on 32 threads, and runners have 3 to 8.
+      - name: Run the tests that need no GPU
+        run: cargo run --locked -p xtask -- test --no-gpu -- --skip groups_match_spectral_color
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: test-logs-${{ matrix.os }}
+          path: target/test-logs
+      - name: Drop what the next run doesn't need
+        if: github.ref == 'refs/heads/main' && env.TARGET_HIT != 'true'
+        shell: bash
+        run: rm -rf target/debug/incremental target/test-logs target/tmp
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.ref == 'refs/heads/main' && env.TARGET_HIT != 'true'
+        with:
+          path: target
+          key: ${{ env.TARGET_KEY }}

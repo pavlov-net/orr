@@ -6,12 +6,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytemuck::{Pod, Zeroable};
 use orr_color::{Primaries, rec709_to_rec2020};
-use orr_gpu::{Allocation, Device, GpuPtr, MemoryKind, SamplerIndex, TextureIndex};
-use orr_pack::material::{Material, slot};
+use orr_gpu::{
+    AddressMode, Allocation, Device, Filter, GpuPtr, MemoryKind, SamplerDesc, SamplerIndex,
+    TextureIndex,
+};
+use orr_pack::material::{Material, TextureBinding, filter, slot, wrap};
 
 use crate::memory::{RangeAllocator, UploadWindow};
 use crate::upload::Record;
-use crate::{Error, MaterialGpu, Result, TextureStreamGpu};
+use crate::{Error, MaterialGpu, Result, TextureSamplerGpu, TextureStreamGpu};
 
 /// An index in the global material table.
 #[repr(transparent)]
@@ -41,19 +44,62 @@ pub mod material_flags {
     pub const COST_MASK: u32 = 3 << COST_SHIFT;
 }
 
-/// A texture bound to a cooked material: its heap index and its
-/// [`TextureHeader::primaries`](orr_pack::texture::TextureHeader::primaries).
+/// `TEXTURE_TILED`, beside the filter bits in `TextureSamplerGpu::modes`.
+const TILED: u32 = 1 << 10;
+
+/// A texture bound to a cooked material: its heap index, its
+/// [`TextureHeader::primaries`](orr_pack::texture::TextureHeader::primaries) and the sampler of
+/// its binding, from [`binding_sampler`]. A tile set has the primaries its tiles share, any index
+/// but [`TextureIndex::NONE`], and `tiles`: the table `texture_tile` reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BoundTexture {
     pub index: TextureIndex,
     pub primaries: u8,
+    pub sampler: SamplerIndex,
+    pub tiles: GpuPtr<u32>,
 }
 
 impl BoundTexture {
     pub const NONE: Self = Self {
         index: TextureIndex::NONE,
         primaries: Primaries::Rec709.id(),
+        sampler: SamplerIndex(0),
+        tiles: GpuPtr::NULL,
     };
+}
+
+/// The hardware sampler of binding `b`. Anisotropy stays off under any filter but the default:
+/// it can override a nearest filter, and on NVIDIA GPUs it takes a nearest mip filter at level
+/// 0.25 to mip 1.
+pub fn binding_sampler(b: &TextureBinding) -> SamplerDesc {
+    let address = |w: u8| match w {
+        wrap::CLAMP | wrap::CONSTANT => AddressMode::ClampToEdge,
+        wrap::MIRROR => AddressMode::MirroredRepeat,
+        wrap::BORDER => AddressMode::ClampToBorder,
+        _ => AddressMode::Repeat,
+    };
+    let chosen = |bit: u8| {
+        if b.filter & bit != 0 {
+            Filter::Nearest
+        } else {
+            Filter::Linear
+        }
+    };
+    SamplerDesc {
+        mag: chosen(filter::MAG_NEAREST),
+        min: chosen(filter::MIN_NEAREST),
+        mip: chosen(filter::MIP_NEAREST),
+        address: [address(b.wrap[0]), address(b.wrap[1]), AddressMode::Repeat],
+        max_anisotropy: if b.filter == 0 { 16.0 } else { 1.0 },
+        ..SamplerDesc::default()
+    }
+}
+
+/// `TextureSamplerGpu::modes` of binding `b` to `t`. Stray bits of a binding stay out of the fields
+/// past theirs, where they could claim a tile table `t` doesn't have.
+fn binding_modes(b: &TextureBinding, t: &BoundTexture) -> u32 {
+    let tiled = if t.tiles == GpuPtr::NULL { 0 } else { TILED };
+    u32::from(b.wrap[0] & 7) | u32::from(b.wrap[1] & 7) << 3 | u32::from(b.filter & 15) << 6 | tiled
 }
 
 /// The `orr_shaders.trace` candidate class of a model whose sections have material flags `flags`:
@@ -80,10 +126,10 @@ pub(crate) fn rec2020(c: impl Into<orr_math::Vec3>) -> [f32; 3] {
 }
 
 impl MaterialGpu {
-    /// The record of a cooked material whose slots read `textures`, sampled with `sampler`.
-    /// Colors convert from Rec.709 to Rec.2020, and a color slot's factor multiplies its
-    /// texels in the texture's primaries; flags and the cost class follow the parameters.
-    pub fn new(m: &Material, textures: &[BoundTexture; 12], sampler: SamplerIndex) -> Self {
+    /// The record of a cooked material whose slots read `textures`. Colors convert from Rec.709
+    /// to Rec.2020, and a color slot's factor multiplies its texels in the texture's primaries;
+    /// flags and the cost class follow the parameters.
+    pub fn new(m: &Material, textures: &[BoundTexture; slot::COUNT]) -> Self {
         use material_flags as f;
         let bound = |s: usize| textures[s].index != TextureIndex::NONE;
         let mut flags = 0;
@@ -167,17 +213,24 @@ impl MaterialGpu {
             displacement_min: m.displacement_min,
             displacement_max: m.displacement_max,
             textures: textures.map(|t| t.index),
-            sampler,
+            samplers: std::array::from_fn(|i| TextureSamplerGpu {
+                sampler: textures[i].sampler,
+                modes: binding_modes(&m.textures[i], &textures[i]),
+            }),
             uv_sets,
             channels_lo: channels as u32,
             channels_hi: (channels >> 32) as u32,
             primaries,
             surface: u32::from(m.surface),
+            tangent_set: u32::from(m.tangent_set()),
             transmission_dispersion_scale: m.transmission_dispersion_scale,
             transmission_dispersion_abbe_number: m.transmission_dispersion_abbe_number,
+            _pad: 0,
             data: 0,
             texture_streams: GpuPtr::NULL,
+            tiles: textures.map(|t| t.tiles),
             uv_transforms: std::array::from_fn(|i| m.uv_transforms[i / 6][i % 6]),
+            outside: std::array::from_fn(|i| m.textures[i / 4].outside[i % 4]),
         }
     }
 }
@@ -333,7 +386,7 @@ mod tests {
 
     #[test]
     fn cooked_materials_take_their_flags_cost_class_and_slot_bits() {
-        let record = |m: &Material| MaterialGpu::new(m, &[BoundTexture::NONE; 12], SamplerIndex(7));
+        let record = |m: &Material| MaterialGpu::new(m, &[BoundTexture::NONE; slot::COUNT]);
         let cost = |m: &Material| (record(m).flags & material_flags::COST_MASK) >> 16;
         let base = Material::default();
         assert_eq!(cost(&base), 0);
@@ -358,20 +411,26 @@ mod tests {
         let mut m = base;
         m.textures[slot::DISPLACEMENT].channels = 3;
         m.textures[slot::NORMAL].uv_set = 1;
-        let mut textures = [BoundTexture::NONE; 12];
+        let mut textures = [BoundTexture::NONE; slot::COUNT];
         textures[slot::DISPLACEMENT] = BoundTexture {
             index: TextureIndex(4),
             primaries: Primaries::Rec2020.id(),
+            sampler: SamplerIndex(7),
+            ..BoundTexture::NONE
         };
-        let g = MaterialGpu::new(&m, &textures, SamplerIndex(7));
+        let g = MaterialGpu::new(&m, &textures);
         assert_ne!(g.flags & material_flags::DISPLACED, 0);
-        assert_eq!(g.channels_hi, 3 << 4, "slot 9 reads from channel 3");
+        assert_eq!(g.channels_hi, 3, "slot 8 reads from channel 3");
         assert_eq!(g.uv_sets, 1 << slot::NORMAL);
         assert_eq!(
             g.primaries,
             u32::from(Primaries::Rec2020.id()) << (2 * slot::DISPLACEMENT)
         );
         assert_eq!(g.textures[slot::DISPLACEMENT], TextureIndex(4));
+        m.textures[slot::NORMAL].wrap = [0xff; 2];
+        m.textures[slot::NORMAL].filter = 0xff;
+        let stray = MaterialGpu::new(&m, &textures);
+        assert_eq!(stray.samplers[slot::NORMAL].modes & TILED, 0);
         let white = record(&Material {
             base_color: [1.0; 3],
             ..base

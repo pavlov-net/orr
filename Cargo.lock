@@ -306,9 +306,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.10.0"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86e055fa6e3e40ad6187ba25b6855eeb635d5271f8e0f0e1e9a5826b8d75bea0"
+checksum = "375989decec1a0fa424442bed520fa12ede43a48475ce8c7417d2c69b32b5f6b"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -838,28 +838,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "examples"
-version = "0.0.1"
-dependencies = [
- "bytemuck",
- "egui",
- "env_logger",
- "log",
- "orr",
- "orr_atmosphere",
- "orr_color",
- "orr_cook",
- "orr_egui",
- "orr_math",
- "orr_scene",
- "orr_shaders",
- "png 0.18.1",
- "serde_json",
- "windows",
- "winit",
-]
-
-[[package]]
 name = "exr"
 version = "1.74.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1091,9 +1069,9 @@ checksum = "b5418c17512bdf42730f9032c74e1ae39afc408745ebb2acf72fbc4691c17945"
 
 [[package]]
 name = "glam"
-version = "0.34.1"
+version = "0.34.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc148d4ddd3930c52f9e5ae79b89805c6f07e9ff417e7b083e0348cea60a5aba"
+checksum = "54af5066834d6c2d404eb26ea036a15b15d9ff80db510b9a73ff95ab07f30831"
 dependencies = [
  "bytemuck",
  "mint",
@@ -1243,7 +1221,7 @@ dependencies = [
  "byteorder-lite",
  "exr",
  "image-webp",
- "moxcms",
+ "moxcms 0.8.1",
  "num-traits",
  "png 0.18.1",
  "zune-core",
@@ -1559,9 +1537,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.34"
+version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "logos"
@@ -1709,6 +1687,16 @@ name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
+dependencies = [
+ "num-traits",
+ "pxfm",
+]
+
+[[package]]
+name = "moxcms"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "396077b717181ce3f9a6b66739b269b82d756be5ec0f76be0bc40a7c51775830"
 dependencies = [
  "num-traits",
  "pxfm",
@@ -2293,6 +2281,7 @@ dependencies = [
  "bytemuck",
  "cc",
  "ctt",
+ "exr",
  "gltf",
  "half",
  "image",
@@ -2301,12 +2290,14 @@ dependencies = [
  "libloading",
  "meshopt",
  "mimalloc",
+ "moxcms 0.9.1",
  "openusd",
  "orr_color",
  "orr_io",
  "orr_math",
  "orr_pack",
  "orr_shaders",
+ "percent-encoding",
  "png 0.18.1",
  "rayon",
  "roxmltree 0.21.2",
@@ -2344,6 +2335,28 @@ dependencies = [
  "egui",
  "orr_gpu",
  "orr_shaders",
+]
+
+[[package]]
+name = "orr_examples"
+version = "0.0.1"
+dependencies = [
+ "bytemuck",
+ "egui",
+ "env_logger",
+ "log",
+ "orr",
+ "orr_atmosphere",
+ "orr_color",
+ "orr_cook",
+ "orr_egui",
+ "orr_math",
+ "orr_scene",
+ "orr_shaders",
+ "png 0.18.1",
+ "serde_json",
+ "windows",
+ "winit",
 ]
 
 [[package]]
@@ -2398,7 +2411,7 @@ dependencies = [
 name = "orr_math"
 version = "0.0.1"
 dependencies = [
- "glam 0.34.1",
+ "glam 0.34.2",
 ]
 
 [[package]]
@@ -2423,7 +2436,7 @@ dependencies = [
  "cc",
  "exr",
  "log",
- "moxcms",
+ "moxcms 0.8.1",
  "orr_color",
  "orr_dlss",
  "orr_math",

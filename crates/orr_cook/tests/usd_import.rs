@@ -4,12 +4,15 @@
 
 #![allow(clippy::print_stdout)] // the set test reports what each stage cooked
 
+#[path = "common/float_ktx2.rs"]
+mod float_ktx2;
 #[allow(dead_code)]
 #[path = "common/glb.rs"]
 mod glb;
 
 use std::path::{Path, PathBuf};
 
+use float_ktx2::float_ktx2;
 use glb::Glb;
 use orr_cook::{
     ArchiveSpec, AssetSpec, GltfSettings, LodMode, Manifest, MeshSettings, Source, TextureRules,
@@ -376,8 +379,8 @@ fn composed_stage_cooks_instancer_cage_skin_and_openpbr() {
         );
     }
 
-    // The cage cooks as its hull, at the selected variant's size, in meters and Y up, with
-    // the place2d scale applied to its uvs (and v flipped to a top-left origin).
+    // The cage cooks as its hull, at the selected variant's size, in meters and Y up, with v
+    // flipped to a top-left origin.
     let (info, tris) = triangles(&a, "u/mesh");
     assert_eq!(tris.len(), 2);
     assert_eq!(info.header.bounds.min, [0.0, 0.0, -2.0]);
@@ -389,8 +392,13 @@ fn composed_stage_cooks_instancer_cage_skin_and_openpbr() {
         .collect();
     uvs.sort_unstable();
     uvs.dedup();
-    assert_eq!(uvs, [[0, 500], [0, 1000], [500, 500], [500, 1000]]);
+    assert_eq!(uvs, [[0, 0], [0, 1000], [1000, 0], [1000, 1000]]);
     let bark = material(&a, "u/material/World/Looks/Bark");
+    // The place2d scale halves st about the bottom-left origin, which is v = 1 here.
+    assert_eq!(
+        bark.uv_transforms[slot::BASE_COLOR],
+        [-0.5, 0.0, 0.0, 0.0, -0.5, 0.5]
+    );
     assert_eq!(bark.specular_roughness, 0.7);
     assert_eq!(bark.base_color, [1.0; 3]);
     assert!((bark.thin_film_thickness - 400.0).abs() < 1e-3);
@@ -598,6 +606,8 @@ fn rig(binds: [&str; 2], rest: &str) -> String {
                 0: [(0, 0, 0)],
                 10: [(1, 0, 0)],
             }}
+            quatf[] rotations = [(1, 0, 0, 0)]
+            half3[] scales = [(1, 1, 1)]
         }}"#
     )
 }
@@ -775,6 +785,7 @@ fn a_clip_keeps_a_zero_scale_keys_rotation_on_a_joint_past_a_gap() {
         def SkelAnimation "Vanish"
         {{
             uniform token[] joints = ["Root/Gap/Arm"]
+            float3[] translations = [(0, 1, 0)]
             quatf[] rotations.timeSamples = {{
                 0: [(0.7071068, 0.7071068, 0, 0)],
                 10: [(0.7071068, 0.7071068, 0, 0)],
@@ -1147,6 +1158,8 @@ fn tree_pair(d: &Path) -> (PathBuf, PathBuf) {
                 uniform token info:id = "UsdUVTexture"
                 asset inputs:file = @{file}@
                 float2 inputs:st.connect = </Tree/Looks/{material}/St.outputs:result>
+                token inputs:wrapS = "repeat"
+                token inputs:wrapT = "repeat"
 {extra}                float3 outputs:rgb
                 float outputs:a
             }}
@@ -1241,11 +1254,185 @@ fn assert_same_materials(ga: &Archive, g: &Material, ua: &Archive, u: &Material)
             "slot {s} texels"
         );
     }
+    assert_eq!(g.tangent_set(), u.tangent_set());
     let strip = |m: &Material| Material {
         textures: bytemuck::Zeroable::zeroed(),
+        frame_uv: 0,
         ..*m
     };
     assert_eq!(strip(g), strip(u));
+}
+
+/// `UsdUVTexture` scale and bias state how a normal map is encoded, for any image: the same
+/// vectors cook to the same texture from values as stored, at `0.5 v + 0.5`, or flipped.
+#[test]
+fn usd_normals_decode_by_their_scale_and_bias() {
+    let d = dir("usd-normal-decode");
+    let x = |px: u32| if px < 8 { 0.6f32 } else { -0.6 };
+    let cases = [
+        ("(1, 1, 1, 1)", "(0, 0, 0, 0)", 1.0, 0.0),
+        ("(2, 2, 2, 1)", "(-1, -1, -1, 0)", 0.5, 0.5),
+        ("(-1, 1, 1, 1)", "(0, 0, 0, 0)", -1.0, 0.0),
+    ];
+    let cooked = cases.map(|(scale, bias, k, c)| {
+        let format = ctt::TargetFormat::Uncompressed(ctt::Format::R32G32B32A32_SFLOAT);
+        let file = float_ktx2(16, 16, format, false, |px, _| {
+            [k * x(px) + c, c, 0.8 * k.abs() + c, 1.0]
+        });
+        std::fs::write(d.join("n.ktx2"), file).unwrap();
+        let path = d.join("n.usda");
+        std::fs::write(
+            &path,
+            format!(
+                r#"#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+def Xform "World"
+{{
+    def Mesh "Quad"
+    {{
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)]
+        normal3f[] normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+            interpolation = "vertex"
+        )
+        texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+            interpolation = "vertex"
+        )
+        rel material:binding = </World/Looks/M>
+    }}
+
+    def Scope "Looks"
+    {{
+        def Material "M"
+        {{
+            token outputs:surface.connect = </World/Looks/M/Surface.outputs:surface>
+            def Shader "Surface"
+            {{
+                uniform token info:id = "UsdPreviewSurface"
+                normal3f inputs:normal.connect = </World/Looks/M/Normal.outputs:rgb>
+                token outputs:surface
+            }}
+            def Shader "Normal"
+            {{
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @n.ktx2@
+                float2 inputs:st.connect = </World/Looks/M/St.outputs:result>
+                float4 inputs:scale = {scale}
+                float4 inputs:bias = {bias}
+                float3 outputs:rgb
+            }}
+            def Shader "St"
+            {{
+                uniform token info:id = "UsdPrimvarReader_float2"
+                string inputs:varname = "st"
+                float2 outputs:result
+            }}
+        }}
+    }}
+}}
+"#
+            ),
+        )
+        .unwrap();
+        let (a, _) = usd(&path, UsdSettings::default()).unwrap();
+        let m = material(&a, "u/material/World/Looks/M");
+        a.find(m.textures[slot::NORMAL].texture)
+            .unwrap()
+            .content_hash
+    });
+    assert_eq!(cooked[0], cooked[1]);
+    assert_eq!(cooked[0], cooked[2]);
+}
+
+/// USD states no tangents, so a mesh reading a normal map gets MikkTSpace's, here along u.
+#[test]
+fn usd_meshes_with_normal_maps_compute_tangents() {
+    let d = dir("usd-tangents");
+    std::fs::write(d.join("n.png"), png(4, 4, |_, _| [128, 128, 255, 255])).unwrap();
+    let path = d.join("quad.usda");
+    std::fs::write(
+        &path,
+        r#"#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+def Xform "World"
+{
+    def Mesh "Quad"
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)]
+        normal3f[] normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+            interpolation = "vertex"
+        )
+        texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+            interpolation = "vertex"
+        )
+        rel material:binding = </World/Looks/M>
+    }
+
+    def Scope "Looks"
+    {
+        def Material "M"
+        {
+            token outputs:surface.connect = </World/Looks/M/Surface.outputs:surface>
+            def Shader "Surface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                normal3f inputs:normal.connect = </World/Looks/M/Normal.outputs:rgb>
+                token outputs:surface
+            }
+            def Shader "Normal"
+            {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @n.png@
+                float2 inputs:st.connect = </World/Looks/M/St.outputs:result>
+                float4 inputs:scale = (2, 2, 2, 1)
+                float4 inputs:bias = (-1, -1, -1, 0)
+                float3 outputs:rgb
+            }
+            def Shader "St"
+            {
+                uniform token info:id = "UsdPrimvarReader_float2"
+                string inputs:varname = "st"
+                float2 outputs:result
+            }
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let settings = UsdSettings {
+        mesh: MeshSettings {
+            tangent_error_max: None,
+            ..MeshSettings::default()
+        },
+        ..UsdSettings::default()
+    };
+    let (a, _) = usd(&path, settings).unwrap();
+    let info = MeshInfo::parse(&blob(&a, "u/mesh", 0)).unwrap();
+    for p in &info.pages {
+        let mut page = vec![0; p.resident_len as usize];
+        orr_pack::mesh::decode_page(&blob(&a, "u/mesh", p.blob as usize), &mut page).unwrap();
+        let view = PageView::new(&page, &info.header).unwrap();
+        for i in 0..view.cluster_count() {
+            let c = view.cluster(i);
+            for v in 0..u32::from(c.vertex_count) {
+                assert!(view.tangent(&c, v).unwrap()[0] > 0.999);
+            }
+        }
+    }
 }
 
 fn level_zero() -> MeshSettings {

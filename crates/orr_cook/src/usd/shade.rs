@@ -8,13 +8,13 @@ use std::collections::{BTreeMap, HashMap};
 use openusd::{sdf, usd};
 
 use super::read::{PrimReader, numbers};
-use crate::shading::{self, Input, Network, Node};
+use crate::shading::{self, Input, Network, Node, Unit};
 
 struct Builder<'a> {
     stage: &'a usd::Stage,
     time: usd::TimeCode,
     /// Loads the image an asset value names; returns its index.
-    load: &'a mut dyn FnMut(&sdf::AssetPath) -> Result<usize, String>,
+    load: &'a mut dyn FnMut(&sdf::AssetPath) -> usize,
     net: Network,
     by_prim: HashMap<String, usize>,
 }
@@ -24,7 +24,7 @@ pub(super) fn network(
     stage: &usd::Stage,
     time: usd::TimeCode,
     material: &sdf::Path,
-    load: &mut dyn FnMut(&sdf::AssetPath) -> Result<usize, String>,
+    load: &mut dyn FnMut(&sdf::AssetPath) -> usize,
 ) -> Result<(Network, usize, Option<usize>), String> {
     let mut b = Builder {
         stage,
@@ -143,6 +143,7 @@ impl Builder<'_> {
             let input = match connections.into_iter().next() {
                 Some(t) => self.source(&t)?,
                 None => match reader.value(&full)? {
+                    Some(sdf::Value::AssetPath(a)) if a.asset_path().is_empty() => continue,
                     Some(v) => self.value(&reader, &full, v)?,
                     None => continue,
                 },
@@ -162,8 +163,9 @@ impl Builder<'_> {
     ) -> Result<Input, String> {
         Ok(match v {
             sdf::Value::AssetPath(a) => Input::Image {
-                image: (self.load)(&a).map_err(|e| format!("{} {name}: {e}", reader.path()))?,
+                image: (self.load)(&a),
                 color_space: reader.metadata_token(name, "colorSpace"),
+                unit: Unit::Unstated,
             },
             sdf::Value::Token(t) => Input::Text(t.as_str().to_string()),
             sdf::Value::String(s) => Input::Text(s),
@@ -173,6 +175,7 @@ impl Builder<'_> {
                     .into_iter()
                     .map(|x| x as f32)
                     .collect(),
+                Unit::Unstated,
             ),
         })
     }

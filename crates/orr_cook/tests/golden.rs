@@ -30,7 +30,7 @@ const GOLDEN: &[(u16, u32, &str)] = &[
     (
         Class::Material as u16,
         4,
-        "c40267fb7c0247572ce851189f3b8432f2ca942e3c195c7d10d4de3ff1d7ed7b",
+        "0b01d2c5c4398cbf546e5d44cfe42f22fa13347f55b840b3be0535af49972f84",
     ),
     (
         Class::Model as u16,
@@ -55,7 +55,7 @@ const GOLDEN: &[(u16, u32, &str)] = &[
     (
         Class::Skeleton as u16,
         1,
-        "f25f68b7725693f72ee4f443041e59d65d338a617199c4f541910bfef08bf33a",
+        "0b6bfef8f4e4a920f5dff13d241bb708c3b88f133c49c61af81c530c45623c29",
     ),
     (
         Class::Clip as u16,

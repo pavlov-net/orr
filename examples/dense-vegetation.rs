@@ -1,6 +1,6 @@
 //! The dense vegetation test scene in a window, or headless: a forest of trees with rigid
 //! parts swaying inside their animation range, grass, a pond and emissive particles over a
-//! 1 km heightfield tile, path traced under a low sun and a moon. See `examples::vegetation`
+//! 1 km heightfield tile, path traced under a low sun and a moon. See `orr_examples::vegetation`
 //! for what it holds and the switches it takes.
 //!
 //! `dense-vegetation [--synthetic] [--script walk|turn|overview|flythrough|flyout] [--frames N]
@@ -8,8 +8,8 @@
 //! from `$ORR_CONTENT/cooked`. Headless runs render 480 x 270 for 120 frames unless told
 //! otherwise and write the last frame as a PNG.
 
-use examples::vegetation::{Settings, run};
-use examples::{Capture, Options, assert_clean};
+use orr_examples::vegetation::{Settings, run};
+use orr_examples::{Capture, Options, assert_clean};
 
 const HEADLESS_EXTENT: [u32; 2] = [480, 270];
 const HEADLESS_FRAMES: u64 = 120;

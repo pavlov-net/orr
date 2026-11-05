@@ -4,7 +4,7 @@
 // nothing. The patch index is the cluster's user word.
 #include "orr_root.h"
 import orr_shaders.random;
-import examples.field;
+import orr_examples.field;
 import orr_scene.producer;
 import orr_scene.tables;
 

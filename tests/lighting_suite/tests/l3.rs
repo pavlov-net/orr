@@ -6,8 +6,8 @@ use std::f64::consts::PI;
 use bytemuck::Zeroable;
 use lighting_suite::shaders::{emit, hotspot_bake, nee_probe, procedural_bake, tile_probe};
 use lighting_suite::{
-    TestScene, assert_clean, compute_barrier, finish, kernels, pipeline, read, readback, render,
-    upload,
+    TestScene, assert_clean, compute_barrier, finish, kernels, linear_clamp, pipeline, read,
+    readback, render, texture, upload,
 };
 use orr_gpu::{ComputePipeline, GpuAddress, GpuPtr, Hazards, KernelSet, Stages};
 use orr_lighting::{
@@ -520,6 +520,60 @@ fn emissive_producer_tiles_match_the_density_and_irradiance() {
         }
     }
     t.assert_irradiance(e, "emitters");
+    assert_clean();
+}
+
+/// A sample carries what its point emits, past 1 included, while selection stays by the factor:
+/// a texel of 5 lights the receiver five times as much as the factor alone.
+#[test]
+fn textured_emissive_producers_light_with_their_texels() {
+    let mut scene = TestScene::new(SceneDesc {
+        light_capacity: 4,
+        producer_capacity: 4,
+        emissive_capacity: 0,
+        ..SceneDesc::default()
+    });
+    let transforms = [Affine3::from_translation(Vec3::new(0.0, 2.0, 0.0))];
+    let quads = Quads {
+        producer: 0,
+        count: 6,
+        size: 0.4,
+        origin: Vec3::new(-1.6, 0.0, -0.2),
+        step: Vec3::new(0.55, 0.0, 0.05),
+    };
+    let image = texture(1, 1, &[[5.0, 5.0, 5.0, 1.0]], "emission");
+    let mut textured = emitting([1.0, 0.6, 0.3], 400.0, 0);
+    textured.textures[orr_pack::material::slot::EMISSION] = image.index;
+    textured.samplers[orr_pack::material::slot::EMISSION].sampler = linear_clamp();
+    let p = pipeline(&emit::MODULE, "main");
+    scene.frame(
+        |w, m| {
+            let id = m.create(&textured).unwrap();
+            set_producers(
+                w,
+                &[id; 3],
+                DVec3::ZERO,
+                &transforms,
+                ProducerUpdate::Static,
+            );
+        },
+        |c| quads.dispatch(c, &p),
+    );
+    let mut lighting = scene.lighting(&KernelSet::default());
+    let t = tiles(
+        &scene,
+        &mut lighting,
+        &Bins::around_y(70f64.to_radians(), 8, 16),
+    );
+    let luminance = y2020([1.0, 0.6, 0.3]) * 400.0 * 5.0;
+    let lit = Vec3::new(0.0, 2.0, 0.0);
+    let e: f64 = (0..quads.count)
+        .map(|c| {
+            let v = quads.corners(c).map(|p| (p + lit).as_dvec3());
+            polygon_irradiance(&v, DVec3::Y, luminance)
+        })
+        .sum();
+    t.assert_irradiance(e, "textured emitters");
     assert_clean();
 }
 

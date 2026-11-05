@@ -48,8 +48,9 @@ public struct SurfaceInput
     public uint surface;            // linked surface id; 0 = StandardSurface
     public UvFootprint uv[2];       // per uv set; producer and patch geometry give both its one uv
     public float3 geometric_normal; // the triangle's front face
-    public float3 normal;           // interpolated vertex normal
-    public float4 tangent;          // xyz unit tangent, w bitangent sign
+    public float3 normal;           // interpolated vertex normal, unit
+    public float3 frame_normal;     // `normal` before normalizing, not always unit
+    public float4 tangent;          // xyz as interpolated, not always unit; w bitangent sign
     public float3 object_position;
     public float3 object_normal;
     public float3x3 object_to_render; // the instance's linear transform
@@ -105,16 +106,18 @@ public float material_coverage(SurfaceInput i)
     return material_opacity(i) >= i.scene.materials[i.material].alpha_cutoff ? 1.0 : 0.0;
 }
 
-// The shading frame: the vertex normal and tangent, turned by the material's normal map.
+// The shading frame: the vertex normal, turned by the material's normal map. MikkTSpace's
+// bakers invert this transform: the interpolated normal and tangent as they stand, neither
+// unit nor perpendicular.
 public float3 material_normal(SurfaceInput i, MaterialGpu* m)
 {
-    float3 n = i.normal;
     if (!material_bound(m, TEXTURE_NORMAL))
-        return n;
+        return i.normal;
     float3 v = material_normal_frame(m, TEXTURE_NORMAL, normal_decode(material_texture(m, TEXTURE_NORMAL, i.uv, float4(0.5, 0.5, 1.0, 1.0)).xy));
-    float3 t = safe_normalize(i.tangent.xyz - n * dot(n, i.tangent.xyz), float3(1, 0, 0));
+    float3 n = i.frame_normal;
+    float3 t = i.tangent.xyz;
     float3 b = cross(n, t) * i.tangent.w;
-    return safe_normalize(t * v.x + b * v.y + n * v.z, n);
+    return safe_normalize(t * v.x + b * v.y + n * v.z, i.normal);
 }
 
 // What the decals over a hit write: per parameter the sum of each decal's value times its
@@ -191,11 +194,13 @@ void blend_decal(inout DecalLayer layer, SurfaceInput i, DecalGpu* d, float3 rel
         decal_over(layer.emission, layer.emission_cover, material_color(m, TEXTURE_EMISSION, fs, material_emission(m)), share);
     if ((c & DECAL_NORMAL) != 0)
     {
-        // The decal's tangent frame on the surface: its x axis, and its uv's v (down its y
-        // axis) as the bitangent, as on a mesh whose uv runs like the decal's.
+        // The decal's tangent frame on the surface: its x axis, and up its y axis, against
+        // its uv's v, as on a mesh whose uv runs like the decal's. A surface past 90 degrees
+        // from +z sees the projection mirrored.
         float3 n = i.normal;
         float3 t = safe_normalize(axis_x - n * dot(n, axis_x), cross(n, axis_y));
-        float3 b = -cross(n, t);
+        float3 b = cross(n, t);
+        b = dot(b, axis_y) < 0.0 ? -b : b;
         float3 v = float3(0.0, 0.0, 1.0);
         if (material_bound(m, TEXTURE_NORMAL))
             v = material_normal_frame(m, TEXTURE_NORMAL, normal_decode(material_texture(m, TEXTURE_NORMAL, fs, float4(0.5, 0.5, 1.0, 1.0)).xy));
@@ -296,7 +301,6 @@ public struct StandardSurface : ISurface
         p.thin_film_thickness = m.thin_film_thickness;
         p.thin_film_ior = m.thin_film_ior;
         p.emission = material_color(m, TEXTURE_EMISSION, i.uv, material_emission(m));
-        p.scale = float3(material_texture(m, TEXTURE_OCCLUSION, i.uv, one).x);
 
         GSurface s = (GSurface)0;
         s.normal = material_normal(i, m);

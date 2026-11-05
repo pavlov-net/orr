@@ -1,12 +1,18 @@
+#[path = "common/tangent_quads.rs"]
+mod tangent_quads;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use orr_cook::{ArchiveSpec, AssetSpec, GltfSettings, Manifest, MeshSettings, Source};
+use orr_cook::{
+    ArchiveSpec, AssetSpec, GltfSettings, Manifest, MeshInput, MeshSettings, Source,
+    TextureSettings, Usage,
+};
 use orr_math::{Mat4, Vec3};
-use orr_pack::material::Material;
+use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{self, MeshInfo, PageView, Section};
 use orr_pack::model::ModelInfo;
-use orr_pack::{Archive, AssetId, Class, Target};
+use orr_pack::{Archive, AssetId, Class, Span, Target};
 
 fn dir(name: &str) -> PathBuf {
     let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -431,4 +437,172 @@ fn corrupt_pages_are_rejected() {
     let at = size_of::<mesh::PageHeader>() + std::mem::offset_of!(mesh::Cluster, vertex_count);
     bad[at..at + 2].copy_from_slice(&300u16.to_le_bytes());
     assert!(mesh::decode_page(&bad, &mut dst).is_err());
+}
+
+/// The normal texture a library mesh's materials bind, and the model `input` cooked keeping
+/// its tangents with `materials`, and the cook's warnings.
+fn library_cook(name: &str, input: MeshInput, materials: Vec<Material>) -> (Archive, Vec<String>) {
+    let path = dir(name).join("normal.png");
+    image::RgbaImage::from_fn(16, 16, |x, y| {
+        image::Rgba([96 + (x * 4) as u8, 160 - (y * 4) as u8, 255, 255])
+    })
+    .save(&path)
+    .unwrap();
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(
+            Target::Memory,
+            vec![
+                AssetSpec {
+                    name: "tex".into(),
+                    source: Source::Texture {
+                        path,
+                        settings: TextureSettings {
+                            usage: Usage::Normal,
+                            ..TextureSettings::default()
+                        },
+                    },
+                },
+                AssetSpec {
+                    name: "m".into(),
+                    source: Source::Mesh {
+                        mesh: input,
+                        materials,
+                        settings: MeshSettings {
+                            tangent_error_max: None,
+                            ..MeshSettings::default()
+                        },
+                    },
+                },
+            ],
+        )],
+    };
+    let mut cooked = orr_cook::cook(&manifest, &Default::default()).unwrap();
+    let a = Archive::from_memory(cooked.memory.remove(0)).unwrap();
+    let warnings = cooked.report.assets.iter().flat_map(|a| &a.entries);
+    let warnings = warnings.flat_map(|e| e.warnings.clone()).collect();
+    (a, warnings)
+}
+
+/// Section, position and tangent of every vertex of the library model.
+fn library_tangents(a: &Archive) -> Vec<(u8, Vec3, [f32; 4])> {
+    let e = a.find(AssetId::from_name("m/mesh")).unwrap();
+    let blobs = a.blobs(e);
+    let read = |b: &orr_pack::Blob| {
+        let mut v = vec![0; b.raw_len as usize];
+        a.read(b, &mut v).unwrap();
+        v
+    };
+    let info = MeshInfo::parse(&read(&blobs[0])).unwrap();
+    let mut out = Vec::new();
+    for page in &info.pages {
+        let mut resident = vec![0; page.resident_len as usize];
+        mesh::decode_page(&read(&blobs[page.blob as usize]), &mut resident).unwrap();
+        let view = PageView::new(&resident, &info.header).unwrap();
+        for i in 0..view.cluster_count() {
+            let c = view.cluster(i);
+            for v in 0..u32::from(c.vertex_count) {
+                let t = view.tangent(&c, v).unwrap();
+                out.push((c.section, Vec3::from(view.position(&c, v)), t));
+            }
+        }
+    }
+    out
+}
+
+fn normal_mapped(uv_set: u8) -> Material {
+    let mut m = Material::default();
+    m.textures[slot::NORMAL].texture = AssetId::from_name("tex");
+    m.textures[slot::NORMAL].uv_set = uv_set;
+    m
+}
+
+/// A library mesh without tangents gets MikkTSpace's where its material has a normal map, and
+/// `NormalTangentMirrorTest`'s stored tangents are what they come to.
+#[test]
+fn library_meshes_without_tangents_compute_the_published_ones() {
+    let (p, n, uv, t, idx) = tangent_quads::arrays();
+    let input = MeshInput {
+        positions: p.iter().map(|&p| p.into()).collect(),
+        normals: n.iter().map(|&n| n.into()).collect(),
+        uvs: Some(uv.iter().map(|&u| u.into()).collect()),
+        sections: vec![Span {
+            first: 0,
+            count: idx.len() as u32,
+        }],
+        indices: idx,
+        ..MeshInput::default()
+    };
+    let (a, _) = library_cook("library-tangents", input, vec![normal_mapped(0)]);
+    let got = library_tangents(&a);
+    assert_eq!(got.len(), p.len());
+    for (_, at, tangent) in got {
+        let k = p
+            .iter()
+            .position(|&q| Vec3::from(q).abs_diff_eq(at, 1e-3))
+            .unwrap();
+        let want = Vec3::from_slice(&t[k]);
+        assert!(Vec3::from_slice(&tangent).dot(want) > 0.9999 && tangent[3] == t[k][3]);
+    }
+}
+
+/// A plane with u along +x and v down y, and its second uv set turned to run along y.
+fn turned_sets() -> MeshInput {
+    let z = Vec3::Z;
+    MeshInput {
+        positions: vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ],
+        normals: vec![z; 4],
+        uvs: Some(vec![
+            [0.0, 1.0].into(),
+            [1.0, 1.0].into(),
+            [1.0, 0.0].into(),
+            [0.0, 0.0].into(),
+        ]),
+        indices: vec![0, 1, 2, 0, 2, 3],
+        ..MeshInput::default()
+    }
+}
+
+/// Sections over the same triangles, on different uv sets, each hold their own tangents.
+#[test]
+fn overlapping_sections_compute_their_own_tangents() {
+    let span = Span { first: 0, count: 6 };
+    let input = MeshInput {
+        uvs1: Some(vec![
+            [1.0, 1.0].into(),
+            [1.0, 0.0].into(),
+            [0.0, 0.0].into(),
+            [0.0, 1.0].into(),
+        ]),
+        sections: vec![span, span],
+        ..turned_sets()
+    };
+    let materials = vec![normal_mapped(0), normal_mapped(1)];
+    let (a, _) = library_cook("overlap-tangents", input, materials);
+    let got = library_tangents(&a);
+    assert!(got.iter().any(|t| t.0 == 0) && got.iter().any(|t| t.0 == 1));
+    for (section, _, t) in got {
+        let want = if section == 0 { Vec3::X } else { -Vec3::Y };
+        assert!(Vec3::from_slice(&t).dot(want) > 0.9999, "{section}: {t:?}");
+    }
+}
+
+/// The shaders read a uv of zero from a set a mesh lacks, and so does the cook, with a warning.
+#[test]
+fn a_uv_set_the_mesh_lacks_reads_zero() {
+    let span = Span { first: 0, count: 6 };
+    let input = MeshInput {
+        sections: vec![span],
+        ..turned_sets()
+    };
+    let (a, warnings) = library_cook("missing-uv1", input, vec![normal_mapped(1)]);
+    assert!(
+        warnings.iter().any(|w| w.contains("uv set 1")),
+        "{warnings:?}"
+    );
+    assert!(!library_tangents(&a).is_empty());
 }

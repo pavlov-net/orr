@@ -1,16 +1,20 @@
 //! `UsdGeomMesh` faces as welded triangles: ngons by ear clipping, holes dropped, normals
-//! and `st` by their interpolation (smooth point normals where none are authored), uvs
+//! and `st` by their interpolation (where no normals are authored, face normals on the
+//! polygons of schemes `none` and `bilinear` and smooth point normals on other hulls), uvs
 //! flipped from USD's bottom-left origin to the cook's top-left. Or as a subdivision cage
 //! ([`CageBuilder`]): faces as authored with their creases, corners, holes and boundary
 //! rules, `st` as face-varying values (unindexed values weld where a point's corners agree).
+//! Tangents are the frame primvars a material names, or MikkTSpace-compatible ones from its
+//! frame's uvs, in the mesh's own space; a cage's come from its limit surface on the GPU.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use orr_math::{Affine2, DMat3, DMat4, DVec3, Vec2};
+use orr_math::{DMat3, DMat4, DVec3, Vec2};
 use orr_pack::subd::Influence as SkinInfluence;
 
 use super::read::{Interp, PrimReader, Primvar};
 use crate::import::normal_matrix;
+use crate::mesh::tangents;
 use crate::subd::{Boundary, CageInput, Corner, Crease, FaceVarying, UvLinear};
 
 /// The authored topology and attributes of one mesh prim.
@@ -23,7 +27,7 @@ pub(super) struct MeshPrim {
     uvs1: Option<Primvar>,
     left_handed: bool,
     holes: Vec<usize>,
-    pub(super) scheme: String,
+    scheme: String,
     pub(super) double_sided: bool,
     creases: Vec<Crease>,
     corners: Vec<Corner>,
@@ -159,6 +163,185 @@ impl MeshPrim {
             double_sided: r.numbers("doubleSided")?.is_some_and(|v| v[0] != 0.0),
         })
     }
+
+    /// Whether its surface is its faces, which no scheme smooths.
+    pub(super) fn polygonal(&self) -> bool {
+        matches!(self.scheme.as_str(), "none" | "bilinear")
+    }
+}
+
+/// One triangle of a face.
+struct Triangle {
+    face: usize,
+    /// Per corner, as the face winds: its face-vertex and its point.
+    corners: [(usize, usize); 3],
+}
+
+/// A polygonal mesh's triangles, without its holes, and its normals where none are authored.
+pub(super) struct Faces {
+    triangles: Vec<Triangle>,
+    made: Vec<DVec3>,
+}
+
+impl Faces {
+    pub(super) fn new(mesh: &MeshPrim) -> Self {
+        let made = match &mesh.normals {
+            Some(_) => Vec::new(),
+            None if mesh.polygonal() => face_normals(mesh),
+            None => smooth_normals(mesh),
+        };
+        let holes: std::collections::HashSet<usize> = mesh.holes.iter().copied().collect();
+        let mut triangles = Vec::new();
+        let mut base = 0;
+        for (face, &count) in mesh.counts.iter().enumerate() {
+            let ring: Vec<usize> = (base..base + count).collect();
+            base += count;
+            if count < 3 || holes.contains(&face) {
+                continue;
+            }
+            let pts: Vec<DVec3> = ring.iter().map(|&c| mesh.points[mesh.indices[c]]).collect();
+            triangles.extend(triangulate(&pts).into_iter().map(|t| Triangle {
+                face,
+                corners: t.map(|k| (ring[k], mesh.indices[ring[k]])),
+            }));
+        }
+        Self { triangles, made }
+    }
+
+    /// The mesh-space normal of corner `c` of triangle `t`.
+    fn normal(&self, mesh: &MeshPrim, t: &Triangle, c: usize, path: &str) -> Result<DVec3, String> {
+        let (corner, point) = t.corners[c];
+        Ok(match &mesh.normals {
+            Some(nv) => {
+                let v = nv
+                    .at(point, t.face, corner)
+                    .ok_or_else(|| format!("{path}: normals do not cover face {}", t.face))?;
+                DVec3::from_slice(v)
+            }
+            None if mesh.polygonal() => self.made[t.face],
+            None => self.made[point],
+        })
+    }
+}
+
+/// The uv of corner `c` of triangle `t` in `uvs`, zero without them, in the cook's top-left
+/// origin.
+fn corner_uv(
+    uvs: Option<&Primvar>,
+    t: &Triangle,
+    c: usize,
+    path: &str,
+) -> Result<[f32; 2], String> {
+    let (corner, point) = t.corners[c];
+    let st = match uvs {
+        Some(uv) => {
+            let v = uv
+                .at(point, t.face, corner)
+                .ok_or_else(|| format!("{path}: uvs do not cover face {}", t.face))?;
+            Vec2::new(v[0] as f32, v[1] as f32)
+        }
+        None => Vec2::ZERO,
+    };
+    Ok([st.x, 1.0 - st.y])
+}
+
+/// The uvs a face's tangent frame follows.
+#[derive(Copy, Clone)]
+pub(super) enum FrameUvs<'a> {
+    /// A uv set.
+    Set(usize),
+    /// A primvar outside the uv sets, by name.
+    Primvar(&'a str, &'a Primvar),
+}
+
+/// What a face's tangent frame reads, PS `frame:*`.
+#[derive(Copy, Clone)]
+pub(super) struct FaceFrame<'a> {
+    pub(super) uvs: FrameUvs<'a>,
+    pub(super) tangents: Option<&'a Primvar>,
+    pub(super) binormals: Option<&'a Primvar>,
+}
+
+/// The tangent of each triangle corner of `faces` in the mesh's own space, xyz and bitangent
+/// sign: `frame` states it per face, or the corners of faces on the same uvs make one
+/// MikkTSpace-compatible surface. A sign no binormal states is the one that surface gives.
+pub(super) fn corner_tangents<'a>(
+    mesh: &'a MeshPrim,
+    faces: &Faces,
+    frame: &dyn Fn(usize) -> FaceFrame<'a>,
+    path: &str,
+) -> Result<Vec<[f32; 4]>, String> {
+    let mut surfaces: BTreeMap<(usize, &str), (FrameUvs<'_>, Vec<usize>)> = BTreeMap::new();
+    for (k, t) in faces.triangles.iter().enumerate() {
+        let f = frame(t.face);
+        if f.tangents.is_some() && f.binormals.is_some() {
+            continue;
+        }
+        let key = match f.uvs {
+            FrameUvs::Set(s) => (s, ""),
+            FrameUvs::Primvar(name, _) => (2, name),
+        };
+        surfaces.entry(key).or_insert((f.uvs, Vec::new())).1.push(k);
+    }
+    // MikkTSpace reads the winding, which a left-handed mesh reverses.
+    let order = if mesh.left_handed {
+        [0, 2, 1]
+    } else {
+        [0, 1, 2]
+    };
+    let mut out = vec![tangents::UNREAD; 3 * faces.triangles.len()];
+    for (uvs, triangles) in surfaces.into_values() {
+        let source = match uvs {
+            FrameUvs::Set(0) => mesh.uvs.as_ref(),
+            FrameUvs::Set(_) => mesh.uvs1.as_ref(),
+            FrameUvs::Primvar(_, p) => Some(p),
+        };
+        let (mut positions, mut normals, mut sts) = (Vec::new(), Vec::new(), Vec::new());
+        for &k in &triangles {
+            let t = &faces.triangles[k];
+            for c in order {
+                positions.push(mesh.points[t.corners[c].1].as_vec3().to_array());
+                let n = faces.normal(mesh, t, c, path)?.normalize_or_zero();
+                normals.push(n.as_vec3().to_array());
+                sts.push(corner_uv(source, t, c, path)?);
+            }
+        }
+        let made = tangents::generate(None, &positions, &normals, &sts);
+        for (&k, made) in triangles.iter().zip(made.as_chunks::<3>().0) {
+            for (&c, &t) in order.iter().zip(made) {
+                out[3 * k + c] = t;
+            }
+        }
+    }
+    for (k, t) in faces.triangles.iter().enumerate() {
+        let f = frame(t.face);
+        let Some(stated) = f.tangents else { continue };
+        for c in 0..3 {
+            let (corner, point) = t.corners[c];
+            let missing = |what: &str| format!("{path}: {what} do not cover face {}", t.face);
+            let v = stated
+                .at(point, t.face, corner)
+                .ok_or_else(|| missing("tangents"))?;
+            let tangent = DVec3::from_slice(v);
+            let sign = match f.binormals {
+                Some(b) => {
+                    let b = b
+                        .at(point, t.face, corner)
+                        .ok_or_else(|| missing("binormals"))?;
+                    let n = faces.normal(mesh, t, c, path)?;
+                    if n.cross(tangent).dot(DVec3::from_slice(b)) < 0.0 {
+                        -1.0
+                    } else {
+                        1.0
+                    }
+                }
+                None => out[3 * k + c][3],
+            };
+            let [x, y, z] = tangent.as_vec3().to_array();
+            out[3 * k + c] = [x, y, z, sign];
+        }
+    }
+    Ok(out)
 }
 
 /// Per-vertex skin influences: four joints and unorm8 weights.
@@ -169,6 +352,10 @@ pub(super) type Influence = ([u8; 4], [u8; 4]);
 pub(super) struct Welder {
     pub(super) positions: Vec<[f32; 3]>,
     pub(super) normals: Vec<[f32; 3]>,
+    pub(super) tangents: Vec<[f32; 4]>,
+    /// The model carries tangents, on every mesh: one states them or a material reads them,
+    /// and a prototype's material can read them on the others.
+    pub(super) carries_tangents: bool,
     pub(super) uvs: Vec<[f32; 2]>,
     pub(super) uvs1: Vec<[f32; 2]>,
     pub(super) joints: Vec<[u8; 4]>,
@@ -183,27 +370,35 @@ pub(super) struct Welder {
 pub(super) struct Placing<'a> {
     /// Model space from the mesh's points.
     pub(super) transform: DMat4,
-    /// Scene material and uv transform per face.
-    pub(super) face_material: &'a dyn Fn(usize) -> (usize, Option<Affine2>),
+    /// Scene material per face.
+    pub(super) face_material: &'a dyn Fn(usize) -> usize,
     /// Influences per point when skinned.
     pub(super) skin: Option<&'a [Influence]>,
 }
 
 impl Welder {
-    fn vertex(&mut self, p: [f32; 3], n: [f32; 3], uv: [[f32; 2]; 2], skin: Influence) -> u32 {
+    fn vertex(
+        &mut self,
+        p: [f32; 3],
+        n: [f32; 3],
+        t: [f32; 4],
+        uv: [[f32; 2]; 2],
+        skin: Influence,
+    ) -> u32 {
         let mut key = [0u32; 16];
-        let values = p.iter().chain(&n).chain(uv.as_flattened());
+        let values = p.iter().chain(&n).chain(&t).chain(uv.as_flattened());
         for (k, v) in key.iter_mut().zip(values) {
             *k = v.to_bits();
         }
-        key[10] = u32::from_le_bytes(skin.0);
-        key[11] = u32::from_le_bytes(skin.1);
+        key[14] = u32::from_le_bytes(skin.0);
+        key[15] = u32::from_le_bytes(skin.1);
         if let Some(&i) = self.seen.get(&key) {
             return i;
         }
         let i = self.positions.len() as u32;
         self.positions.push(p);
         self.normals.push(n);
+        self.tangents.push(t);
         self.uvs.push(uv[0]);
         self.uvs1.push(uv[1]);
         self.joints.push(skin.0);
@@ -212,73 +407,52 @@ impl Welder {
         i
     }
 
-    /// Adds the mesh's triangles.
+    /// Adds the mesh's triangles, with `corners` from [`corner_tangents`].
     pub(super) fn add(
         &mut self,
         mesh: &MeshPrim,
+        faces: &Faces,
+        corners: Option<&[[f32; 4]]>,
         at: &Placing<'_>,
         path: &str,
     ) -> Result<(), String> {
         let linear = DMat3::from_mat4(at.transform);
-        let flip = (linear.determinant() < 0.0) != mesh.left_handed;
+        let mirrors = linear.determinant() < 0.0;
+        let flip = mirrors != mesh.left_handed;
         let normal_m = normal_matrix(linear);
-        let smooth = match &mesh.normals {
-            Some(_) => Vec::new(),
-            None => smooth_normals(mesh),
-        };
-        let holes: std::collections::HashSet<usize> = mesh.holes.iter().copied().collect();
-        let mut base = 0;
-        for (face, &count) in mesh.counts.iter().enumerate() {
-            let corners = base..base + count;
-            base += count;
-            if count < 3 || holes.contains(&face) {
-                continue;
+        for (k, t) in faces.triangles.iter().enumerate() {
+            let material = (at.face_material)(t.face);
+            let mut out = [0u32; 3];
+            for (c, o) in out.iter_mut().enumerate() {
+                let point = t.corners[c].1;
+                let p = at.transform.transform_point3(mesh.points[point]);
+                let n = (normal_m * faces.normal(mesh, t, c, path)?).normalize_or_zero();
+                let tangent = corners.map_or(tangents::UNREAD, |corners| {
+                    let [x, y, z, w] = corners[3 * k + c];
+                    let v = linear * DVec3::new(f64::from(x), f64::from(y), f64::from(z));
+                    let [x, y, z] = v.as_vec3().to_array();
+                    [x, y, z, if mirrors { -w } else { w }]
+                });
+                let uv = [
+                    corner_uv(mesh.uvs.as_ref(), t, c, path)?,
+                    corner_uv(mesh.uvs1.as_ref(), t, c, path)?,
+                ];
+                let skin = at.skin.map_or(([0; 4], [0; 4]), |s| s[point]);
+                *o = self.vertex(
+                    p.as_vec3().to_array(),
+                    n.as_vec3().to_array(),
+                    tangent,
+                    uv,
+                    skin,
+                );
             }
-            let (material, uv_t) = (at.face_material)(face);
-            let ring: Vec<usize> = corners.clone().collect();
-            let pts: Vec<DVec3> = ring.iter().map(|&c| mesh.points[mesh.indices[c]]).collect();
-            for tri in triangulate(&pts) {
-                let mut out = [0u32; 3];
-                for (o, &k) in out.iter_mut().zip(&tri) {
-                    let corner = ring[k];
-                    let point = mesh.indices[corner];
-                    let p = at.transform.transform_point3(mesh.points[point]);
-                    let n = match &mesh.normals {
-                        Some(nv) => {
-                            let v = nv.at(point, face, corner).ok_or_else(|| {
-                                format!("{path}: normals do not cover face {face}")
-                            })?;
-                            DVec3::from_slice(v)
-                        }
-                        None => smooth[point],
-                    };
-                    let n = (normal_m * n).normalize_or_zero();
-                    // The material's one uv transform applies to both sets.
-                    let st = |uvs: &Option<Primvar>, set: usize| -> Result<[f32; 2], String> {
-                        let st = match uvs {
-                            Some(uv) => {
-                                let v = uv.at(point, face, corner).ok_or_else(|| {
-                                    format!("{path}: uv set {set} does not cover face {face}")
-                                })?;
-                                Vec2::new(v[0] as f32, v[1] as f32)
-                            }
-                            None => Vec2::ZERO,
-                        };
-                        let st = uv_t.map_or(st, |t| t.transform_point2(st));
-                        Ok([st.x, 1.0 - st.y])
-                    };
-                    let uv = [st(&mesh.uvs, 0)?, st(&mesh.uvs1, 1)?];
-                    let skin = at.skin.map_or(([0; 4], [0; 4]), |s| s[point]);
-                    *o = self.vertex(p.as_vec3().to_array(), n.as_vec3().to_array(), uv, skin);
-                }
-                if flip {
-                    out.swap(1, 2);
-                }
-                if mesh.uvs1.is_none() {
-                    self.missing_uv1.insert(material);
-                }
-                self.groups.entry(material).or_default().extend(out);
+            if flip {
+                out.swap(1, 2);
             }
+            if mesh.uvs1.is_none() {
+                self.missing_uv1.insert(material);
+            }
+            self.groups.entry(material).or_default().extend(out);
         }
         Ok(())
     }
@@ -291,7 +465,7 @@ pub(super) struct CageBuilder {
     pub(super) skin: Vec<SkinInfluence>,
     /// Scene material per face.
     pub(super) materials: Vec<usize>,
-    uvs: HashMap<[u32; 2], u32>,
+    uvs: HashMap<u32, u32>,
     /// The first mesh's path, naming the rules every other must share.
     first: Option<String>,
 }
@@ -356,8 +530,7 @@ impl CageBuilder {
             .transpose()?;
         let mut corner = 0;
         for (face, &count) in mesh.counts.iter().enumerate() {
-            let (material, uv_t) = (at.face_material)(face);
-            self.materials.push(material);
+            self.materials.push((at.face_material)(face));
             c.face_counts.push(count as u32);
             let ring: Vec<usize> = if flip {
                 std::iter::once(corner)
@@ -370,24 +543,12 @@ impl CageBuilder {
             for k in ring {
                 c.face_indices.push(base + mesh.indices[k] as u32);
                 let Some(fv) = c.uvs.as_mut() else { continue };
-                let value = match &welds {
-                    Some((values, index)) => {
-                        let v = values[index[k] as usize];
-                        let v = uv_t.map_or(v, |t| t.transform_point2(v));
-                        Vec2::new(v.x, 1.0 - v.y)
-                    }
-                    None => Vec2::ZERO,
-                };
                 let id = match &welds {
-                    // A value stays shared among the corners of one source value and one
-                    // uv transform.
-                    Some((_, index)) => {
-                        let source = [index[k], uv_t.map_or(u32::MAX, |_| material as u32)];
-                        *self.uvs.entry(source).or_insert_with(|| {
-                            fv.values.push(value);
-                            fv.values.len() as u32 - 1
-                        })
-                    }
+                    Some((values, index)) => *self.uvs.entry(index[k]).or_insert_with(|| {
+                        let v = values[index[k] as usize];
+                        fv.values.push(Vec2::new(v.x, 1.0 - v.y));
+                        fv.values.len() as u32 - 1
+                    }),
                     None => 0,
                 };
                 fv.indices.push(id);
@@ -450,14 +611,12 @@ fn uv_values(mesh: &MeshPrim, uv: &Primvar, path: &str) -> Result<(Vec<Vec2>, Ve
     Ok((values, index))
 }
 
-/// Area-weighted point normals from the faces around each point.
-fn smooth_normals(mesh: &MeshPrim) -> Vec<DVec3> {
-    let mut acc = vec![DVec3::ZERO; mesh.points.len()];
+/// Per face, Newell's normal: twice the area along the face's normal.
+fn face_normals(mesh: &MeshPrim) -> Vec<DVec3> {
     let mut base = 0;
-    for &count in &mesh.counts {
+    let faces = mesh.counts.iter().map(|&count| {
         let ring = &mesh.indices[base..base + count];
         base += count;
-        // Newell's normal: twice the area along the face's normal.
         let mut n = DVec3::ZERO;
         for (i, &a) in ring.iter().enumerate() {
             let (p, q) = (mesh.points[a], mesh.points[ring[(i + 1) % ring.len()]]);
@@ -467,12 +626,20 @@ fn smooth_normals(mesh: &MeshPrim) -> Vec<DVec3> {
                 (p.x - q.x) * (p.y + q.y),
             );
         }
-        for &a in ring {
+        if mesh.left_handed { -n } else { n }
+    });
+    faces.collect()
+}
+
+/// Area-weighted point normals from the faces around each point.
+fn smooth_normals(mesh: &MeshPrim) -> Vec<DVec3> {
+    let mut acc = vec![DVec3::ZERO; mesh.points.len()];
+    let mut base = 0;
+    for (&count, n) in mesh.counts.iter().zip(face_normals(mesh)) {
+        for &a in &mesh.indices[base..base + count] {
             acc[a] += n;
         }
-    }
-    if mesh.left_handed {
-        acc.iter_mut().for_each(|n| *n = -*n);
+        base += count;
     }
     acc.into_iter().map(DVec3::normalize_or_zero).collect()
 }

@@ -2,7 +2,7 @@
 //! conversions, transforms and primvars.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -13,7 +13,9 @@ use orr_math::{DMat4, DQuat, DVec3};
 use orr_pack::Hash32;
 
 use super::VariantSelection;
-use crate::state::Input;
+use crate::shading;
+use crate::state::{Input, hash_path};
+use crate::texture::tiles::{UDIM, UDIM_TILES};
 
 /// Identifier of the session layer that carries the manifest's variant selections.
 pub(super) const SESSION: &str = "orr_cook_session.usda";
@@ -22,6 +24,10 @@ pub(super) const SESSION: &str = "orr_cook_session.usda";
 #[derive(Default)]
 pub(super) struct Reads {
     files: BTreeMap<PathBuf, Hash32>,
+    /// Where assets that did not resolve or read would appear.
+    absent: BTreeSet<PathBuf>,
+    /// The tiles of each `<UDIM>` identifier, by number, with their resolved paths.
+    tiles: BTreeMap<String, Vec<(u16, String)>>,
     pub(super) session: String,
 }
 
@@ -39,10 +45,53 @@ impl Recorder {
         }
     }
 
-    /// Reads an asset (an image) by its resolved path, recording its file.
+    /// `asset_path` as a path of a file: a bare one stays bare until a file appears beside the
+    /// layer, so that is where it would appear.
+    fn beside(&self, asset_path: &str, anchor: Option<&ar::ResolvedPath>) -> String {
+        let id = self.inner.create_identifier(asset_path, anchor);
+        if Path::new(&id).is_absolute() {
+            return id;
+        }
+        self.inner
+            .create_identifier(&format!("./{asset_path}"), anchor)
+    }
+
+    /// The identifier of an asset path holding `<UDIM>`, after finding each of its tiles the way
+    /// a path of its own would resolve.
+    fn tiled_identifier(&self, asset_path: &str, anchor: Option<&ar::ResolvedPath>) -> String {
+        let id = self.beside(asset_path, anchor);
+        if self.reads.borrow().tiles.contains_key(&id) {
+            return id;
+        }
+        let mut found = Vec::new();
+        for n in UDIM_TILES {
+            let tile = asset_path.replace(UDIM, &n.to_string());
+            match self
+                .inner
+                .resolve(&self.inner.create_identifier(&tile, anchor))
+            {
+                Some(r) => found.push((n, r.to_string_lossy().into_owned())),
+                None => {
+                    let file = outer(Path::new(&self.beside(&tile, anchor)));
+                    self.reads.borrow_mut().absent.insert(file);
+                }
+            }
+        }
+        self.reads.borrow_mut().tiles.insert(id.clone(), found);
+        id
+    }
+
+    /// Reads an asset (an image) by its resolved path, recording its file, which is watched for
+    /// a change when it can't be read.
     pub(super) fn read(&self, resolved: &str) -> io::Result<Vec<u8>> {
-        let mut asset = self.open_asset(&ar::ResolvedPath::new(resolved))?;
-        asset.read_all()
+        let read = self
+            .open_asset(&ar::ResolvedPath::new(resolved))
+            .and_then(|mut asset| asset.read_all());
+        if read.is_err() {
+            let file = outer(Path::new(resolved));
+            self.reads.borrow_mut().absent.insert(file);
+        }
+        read
     }
 }
 
@@ -60,12 +109,23 @@ impl Resolver for Recorder {
         if asset_path == SESSION {
             return SESSION.into();
         }
-        self.inner.create_identifier(asset_path, anchor)
+        if asset_path.contains(UDIM) {
+            return self.tiled_identifier(asset_path, anchor);
+        }
+        let id = self.inner.create_identifier(asset_path, anchor);
+        if !asset_path.is_empty() && self.inner.resolve(&id).is_none() {
+            let file = outer(Path::new(&self.beside(asset_path, anchor)));
+            self.reads.borrow_mut().absent.insert(file);
+        }
+        id
     }
 
     fn resolve(&self, asset_path: &str) -> Option<ar::ResolvedPath> {
         if asset_path == SESSION {
             return Some(ar::ResolvedPath::new(SESSION));
+        }
+        if let Some(tiles) = self.reads.borrow().tiles.get(asset_path) {
+            return (!tiles.is_empty()).then(|| ar::ResolvedPath::new(asset_path));
         }
         self.inner.resolve(asset_path)
     }
@@ -113,14 +173,26 @@ impl Resolver for Recorder {
 }
 
 impl Reads {
+    /// The tiles of a resolved `<UDIM>` path.
+    pub(super) fn tiles(&self, resolved: &str) -> Option<&[(u16, String)]> {
+        self.tiles.get(resolved).map(Vec::as_slice)
+    }
+
     pub(super) fn inputs(&self) -> Vec<Input> {
-        self.files
+        let read = self.files.iter().map(|(path, &hash)| Input {
+            path: path.clone(),
+            hash,
+        });
+        let absent = self
+            .absent
             .iter()
-            .map(|(path, &hash)| Input {
+            .filter(|p| !self.files.contains_key(*p))
+            .map(|path| Input {
                 path: path.clone(),
-                hash,
-            })
-            .collect()
+                // A package can stand here without the entry that was asked of it.
+                hash: hash_path(path).unwrap_or(Input::ABSENT),
+            });
+        read.chain(absent).collect()
     }
 }
 
@@ -248,6 +320,33 @@ pub(super) fn numbers(v: &sdf::Value) -> Option<Vec<f64>> {
     }
 }
 
+/// The numbers in one element of an array value; `None` for a value that is no array.
+fn element_width(v: &sdf::Value) -> Option<usize> {
+    use sdf::Value as V;
+    match v {
+        V::BoolVec(_)
+        | V::UcharVec(_)
+        | V::IntVec(_)
+        | V::UintVec(_)
+        | V::Int64Vec(_)
+        | V::Uint64Vec(_)
+        | V::HalfVec(_)
+        | V::FloatVec(_)
+        | V::DoubleVec(_) => Some(1),
+        V::Vec2fVec(_) | V::Vec2dVec(_) | V::Vec2iVec(_) | V::Vec2hVec(_) => Some(2),
+        V::Vec3fVec(_) | V::Vec3dVec(_) | V::Vec3iVec(_) | V::Vec3hVec(_) => Some(3),
+        V::Vec4fVec(_)
+        | V::Vec4dVec(_)
+        | V::Vec4iVec(_)
+        | V::Vec4hVec(_)
+        | V::QuatfVec(_)
+        | V::QuatdVec(_)
+        | V::QuathVec(_) => Some(4),
+        V::Matrix4dVec(_) => Some(16),
+        _ => None,
+    }
+}
+
 /// A USD matrix (row vectors, translation in the last row) as a column-vector transform.
 pub(super) fn matrix(rows: &[f64]) -> DMat4 {
     DMat4::from_cols_slice(&rows[..16])
@@ -319,6 +418,14 @@ impl PrimReader<'_> {
             })
     }
 
+    /// This reader at `time` instead.
+    pub(super) fn at(&self, time: f64) -> PrimReader<'_> {
+        PrimReader {
+            prim: self.prim,
+            time: usd::TimeCode::new(time),
+        }
+    }
+
     pub(super) fn targets(&self, name: &str) -> Result<Vec<sdf::Path>, String> {
         self.prim
             .relationship(name)
@@ -342,9 +449,9 @@ impl PrimReader<'_> {
                 Some(n) => (true, n),
                 None => (false, op.as_str()),
             };
-            let v = self
-                .numbers(name)?
-                .ok_or_else(|| format!("{}: xform op {name} has no value", self.path()))?;
+            let Some(v) = self.numbers(name)? else {
+                continue;
+            };
             let kind = name
                 .strip_prefix("xformOp:")
                 .and_then(|k| k.split(':').next())
@@ -359,19 +466,25 @@ impl PrimReader<'_> {
                 "translate" if v.len() == 3 => DMat4::from_translation(DVec3::from_slice(&v)),
                 "scale" if v.len() == 1 => DMat4::from_scale(DVec3::splat(v[0])),
                 "scale" if v.len() == 3 => DMat4::from_scale(DVec3::from_slice(&v)),
+                "translateX" if v.len() == 1 => DMat4::from_translation(DVec3::X * v[0]),
+                "translateY" if v.len() == 1 => DMat4::from_translation(DVec3::Y * v[0]),
+                "translateZ" if v.len() == 1 => DMat4::from_translation(DVec3::Z * v[0]),
+                "scaleX" if v.len() == 1 => DMat4::from_scale(DVec3::new(v[0], 1.0, 1.0)),
+                "scaleY" if v.len() == 1 => DMat4::from_scale(DVec3::new(1.0, v[0], 1.0)),
+                "scaleZ" if v.len() == 1 => DMat4::from_scale(DVec3::new(1.0, 1.0, v[0])),
                 "rotateX" if v.len() == 1 => axis('X', v[0]),
                 "rotateY" if v.len() == 1 => axis('Y', v[0]),
                 "rotateZ" if v.len() == 1 => axis('Z', v[0]),
                 "orient" if v.len() == 4 => DMat4::from_quat(quat(&v).normalize()),
                 "transform" if v.len() == 16 => matrix(&v),
-                k if k.len() == 9 && k.starts_with("rotate") && v.len() == 3 => {
-                    // rotateXYZ applies X first: the matrix is Z * Y * X.
-                    let axes: Vec<char> = k[6..].chars().collect();
-                    let mut r = DMat4::IDENTITY;
-                    for (i, &a) in axes.iter().enumerate() {
-                        r = axis(a, v[i]) * r;
-                    }
-                    r
+                "rotateXYZ" | "rotateXZY" | "rotateYXZ" | "rotateYZX" | "rotateZXY"
+                | "rotateZYX"
+                    if v.len() == 3 =>
+                {
+                    // rotateZYX applies Z first, and its value is (x, y, z) whatever the order.
+                    kind[6..].chars().fold(DMat4::IDENTITY, |r, a| {
+                        axis(a, v[usize::from(a as u8 - b'X')]) * r
+                    })
                 }
                 k => return Err(format!("{}: xform op {k}", self.path())),
             };
@@ -421,7 +534,7 @@ impl Primvar {
 
 impl PrimReader<'_> {
     /// Primvar `name` (`primvars:name`), or a plain attribute `fallback` with vertex
-    /// interpolation; `None` when neither is authored.
+    /// interpolation; `None` when neither holds values.
     pub(super) fn primvar(
         &self,
         name: &str,
@@ -429,21 +542,23 @@ impl PrimReader<'_> {
         fallback: Option<&str>,
     ) -> Result<Option<Primvar>, String> {
         let full = format!("primvars:{name}");
-        let (values, attr) = match self.numbers(&full)? {
-            Some(v) => (v, full.as_str()),
-            None => match fallback {
-                Some(f) => match self.numbers(f)? {
-                    Some(v) => (v, f),
-                    None => return Ok(None),
-                },
+        let held = |attr: &str| Ok::<_, String>(self.numbers(attr)?.filter(|v| !v.is_empty()));
+        let (values, attr) = match (held(&full)?, fallback) {
+            (Some(v), _) => (v, full.as_str()),
+            (None, Some(f)) => match held(f)? {
+                Some(v) => (v, f),
                 None => return Ok(None),
             },
+            (None, None) => return Ok(None),
         };
         let interp = match self.metadata_token(attr, "interpolation").as_deref() {
             Some("constant") => Interp::Constant,
             Some("uniform") => Interp::Uniform,
             Some("faceVarying") => Interp::FaceVarying,
-            Some("vertex" | "varying") | None => Interp::Vertex,
+            Some("vertex" | "varying") => Interp::Vertex,
+            // A primvar unauthored is constant; the plain attribute has vertex as its fallback.
+            None if attr == full => Interp::Constant,
+            None => Interp::Vertex,
             Some(i) => return Err(format!("{} {attr}: interpolation {i}", self.path())),
         };
         let indices = if attr == full {
@@ -460,5 +575,46 @@ impl PrimReader<'_> {
             interp,
             indices,
         }))
+    }
+
+    /// Attribute `name`'s `elementSize`: how many array elements make one of its values.
+    pub(super) fn element_size(&self, name: &str) -> usize {
+        self.prim
+            .attribute(name)
+            .get_metadata::<sdf::Value>("elementSize")
+            .ok()
+            .flatten()
+            .and_then(|v| numbers(&v))
+            .map_or(1, |v| v[0] as usize)
+            .max(1)
+    }
+
+    /// Primvar `name` as a value for the whole prim, whatever the width of its elements. One
+    /// that holds no numbers, or whose index misses its values, gives a reader nothing.
+    pub(super) fn whole_primvar(&self, name: &str) -> Result<shading::Primvar, String> {
+        let full = format!("primvars:{name}");
+        let Some(value) = self.value(&full)? else {
+            return Ok(shading::Primvar::Missing);
+        };
+        let Some(values) = numbers(&value).filter(|v| !v.is_empty()) else {
+            return Ok(shading::Primvar::Missing);
+        };
+        if self
+            .metadata_token(&full, "interpolation")
+            .is_some_and(|i| i != "constant")
+        {
+            return Ok(shading::Primvar::Varying);
+        }
+        let width = element_width(&value).unwrap_or(values.len()) * self.element_size(&full);
+        let primvar = Primvar {
+            values,
+            width,
+            interp: Interp::Constant,
+            indices: self.ints(&format!("{full}:indices"))?,
+        };
+        Ok(match primvar.at(0, 0, 0) {
+            Some(v) => shading::Primvar::Constant(v.iter().map(|&x| x as f32).collect()),
+            None => shading::Primvar::Missing,
+        })
     }
 }

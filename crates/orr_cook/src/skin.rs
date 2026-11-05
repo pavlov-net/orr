@@ -6,7 +6,9 @@
 //! animates the whole skeleton. Joints are ordered parents first (scene order, depth
 //! first); mesh joint indices are remapped to that order. Ancestors that no skin names get
 //! the inverse of their rest transform as inverse bind, or identity when it collapses an
-//! axis. Skins that name the same node must agree on its inverse bind.
+//! axis. A node that skins bind differently has one joint per inverse bind, neighbors with
+//! the same parent and pose. A mesh without a skin and with no joint above it sits still on
+//! one more joint, last, unnamed and at identity.
 //!
 //! Clips: every animation with a translation, rotation or scale channel on a skeleton
 //! joint. A clip runs from its first key to its last over every channel; it is resampled
@@ -19,8 +21,9 @@
 //! another clip.
 
 use std::collections::HashMap;
+use std::ops::Range;
 
-use orr_math::{Affine3, Mat3, Mat4, Quat, Vec3};
+use orr_math::{Affine3, DMat3, DMat4, DQuat, DVec4, Mat3, Mat4, Quat, Vec3, Vec4};
 use orr_pack::AssetId;
 use orr_pack::clip::{Clip, ClipHeader};
 use orr_pack::skeleton::{MAX_JOINTS, NO_PARENT, SkeletonInfo, Trs, slerp};
@@ -29,11 +32,31 @@ use serde::Deserialize;
 use crate::gltf::data::Data;
 use crate::import::collapses;
 
-/// The default scene's node tree: parent and world transform of each glTF node in it.
+/// A node's local transform.
+fn local(node: &gltf::Node<'_>) -> DMat4 {
+    match node.transform() {
+        gltf::scene::Transform::Matrix { matrix } => Mat4::from_cols_array_2d(&matrix).as_dmat4(),
+        gltf::scene::Transform::Decomposed {
+            translation,
+            rotation,
+            scale,
+        } => {
+            let q = DVec4::from(rotation.map(f64::from)).try_normalize();
+            DMat4::from_scale_rotation_translation(
+                scale.map(f64::from).into(),
+                q.map_or(DQuat::IDENTITY, DQuat::from_vec4),
+                translation.map(f64::from).into(),
+            )
+        }
+    }
+}
+
+/// The default scene's node tree: parent and world transform of each glTF node in it, in
+/// double precision as glTF asks.
 pub(crate) struct Graph {
     pub(crate) parent: Vec<Option<usize>>,
-    local: Vec<Mat4>,
-    pub(crate) world: Vec<Mat4>,
+    local: Vec<DMat4>,
+    pub(crate) world: Vec<DMat4>,
     in_scene: Vec<bool>,
     /// Scene nodes depth first, parents before children, in document order.
     pub(crate) order: Vec<usize>,
@@ -44,8 +67,8 @@ impl Graph {
         let n = doc.nodes().len();
         let mut g = Self {
             parent: vec![None; n],
-            local: vec![Mat4::IDENTITY; n],
-            world: vec![Mat4::IDENTITY; n],
+            local: vec![DMat4::IDENTITY; n],
+            world: vec![DMat4::IDENTITY; n],
             in_scene: vec![false; n],
             order: Vec::new(),
         };
@@ -56,10 +79,10 @@ impl Graph {
             if g.in_scene[i] {
                 continue;
             }
-            g.local[i] = Mat4::from_cols_array_2d(&node.transform().matrix());
+            g.local[i] = local(&node);
             g.in_scene[i] = true;
             g.parent[i] = parent;
-            g.world[i] = parent.map_or(Mat4::IDENTITY, |p| g.world[p]) * g.local[i];
+            g.world[i] = parent.map_or(DMat4::IDENTITY, |p| g.world[p]) * g.local[i];
             g.order.push(i);
             let at = stack.len();
             stack.extend(node.children().map(|c| (c, Some(i))));
@@ -70,8 +93,8 @@ impl Graph {
 
     /// Node `ancestor`'s space from the space of `node`, in its subtree. The local transforms
     /// between them give it even where a world transform on the way has no inverse.
-    pub(crate) fn relative(&self, ancestor: usize, node: usize) -> Mat4 {
-        let (mut m, mut at) = (Mat4::IDENTITY, node);
+    pub(crate) fn relative(&self, ancestor: usize, node: usize) -> DMat4 {
+        let (mut m, mut at) = (DMat4::IDENTITY, node);
         while at != ancestor {
             m = self.local[at] * m;
             at = self.parent[at].expect("an ancestor of the node");
@@ -82,27 +105,34 @@ impl Graph {
 
 pub(crate) struct Skeleton {
     pub(crate) info: SkeletonInfo,
-    /// glTF node per joint.
+    /// glTF node per joint, but for `still`, which has none.
     nodes: Vec<usize>,
+    /// The first joint of each node.
     joint_of: HashMap<usize, u16>,
     /// Per glTF skin: the skeleton joint of each of its joints.
     skins: HashMap<usize, Vec<u16>>,
-    inverse_binds: Vec<Mat4>,
+    inverse_binds: Vec<DMat4>,
+    /// The joint of meshes with no skin and no joint above them.
+    still: Option<u16>,
 }
 
 impl Skeleton {
-    /// The skeleton of `skins` (glTF skin indices), or `None` without skins.
+    /// The skeleton of `skins` (glTF skin indices), or `None` without skins. `unskinned` are the
+    /// nodes that hold a mesh and no skin.
     pub(crate) fn build(
         data: &Data<'_>,
         graph: &Graph,
         skins: &[usize],
+        unskinned: &[usize],
     ) -> Result<Option<Self>, String> {
         if skins.is_empty() {
             return Ok(None);
         }
         let doc = &data.doc.doc;
         let mut wanted = vec![false; graph.parent.len()];
-        let mut bind: HashMap<usize, Mat4> = HashMap::new();
+        // Per node its distinct inverse binds, and per skin each joint's node and bind among them.
+        let mut binds: HashMap<usize, Vec<Mat4>> = HashMap::new();
+        let mut bound: Vec<(usize, Vec<(usize, usize)>)> = Vec::with_capacity(skins.len());
         for &s in skins {
             let skin = doc.skins().nth(s).expect("skin index");
             let mats: Vec<Mat4> = match skin.inverse_bind_matrices() {
@@ -116,49 +146,59 @@ impl Skeleton {
                     .collect(),
                 None => vec![Mat4::IDENTITY; skin.joints().len()],
             };
-            if mats.len() != skin.joints().len() {
+            if mats.len() < skin.joints().len() {
                 return Err(format!(
                     "skin {s}: {} inverse bind matrices for {} joints",
                     mats.len(),
                     skin.joints().len()
                 ));
             }
+            let mut joints = Vec::with_capacity(skin.joints().len());
             for (joint, m) in skin.joints().zip(mats) {
                 let i = joint.index();
                 if !graph.in_scene[i] {
                     return Err(format!("skin {s}: joint node {i} is not in the scene"));
                 }
-                if m.row(3).distance(orr_math::Vec4::W) > 1e-5 || !m.is_finite() {
+                if m.row(3).distance(Vec4::W) > 1e-5 || !m.is_finite() {
                     return Err(format!(
                         "skin {s}: inverse bind of node {i} is not an affine transform"
                     ));
                 }
-                if let Some(prev) = bind.insert(i, m)
-                    && !close(&prev, &m)
-                {
-                    return Err(format!(
-                        "skins disagree on the inverse bind of node {i}; one skeleton needs one"
-                    ));
-                }
+                let own = binds.entry(i).or_default();
+                let k = own.iter().position(|b| close(b, &m)).unwrap_or_else(|| {
+                    own.push(m);
+                    own.len() - 1
+                });
+                joints.push((i, k));
                 let mut a = Some(i);
                 while let Some(n) = a.filter(|&n| !wanted[n]) {
                     wanted[n] = true;
                     a = graph.parent[n];
                 }
             }
+            bound.push((s, joints));
         }
-        let nodes: Vec<usize> = graph.order.iter().copied().filter(|&n| wanted[n]).collect();
-        if nodes.len() > MAX_JOINTS {
+        let nodes: Vec<usize> = graph
+            .order
+            .iter()
+            .filter(|&&n| wanted[n])
+            .flat_map(|&n| std::iter::repeat_n(n, binds.get(&n).map_or(1, Vec::len)))
+            .collect();
+        let held = |&n: &usize| {
+            let mut above = std::iter::successors(Some(n), |&a| graph.parent[a]);
+            above.any(|a| wanted[a])
+        };
+        let still = (!unskinned.iter().all(held)).then_some(nodes.len() as u16);
+        let joints = nodes.len() + usize::from(still.is_some());
+        if joints > MAX_JOINTS {
             return Err(format!(
-                "skeleton of {} joints with ancestors; at most {MAX_JOINTS}",
-                nodes.len()
+                "skeleton of {joints} joints with ancestors; at most {MAX_JOINTS}"
             ));
         }
-        let joint_of: HashMap<usize, u16> = nodes
-            .iter()
-            .enumerate()
-            .map(|(j, &n)| (n, j as u16))
-            .collect();
+        let mut joint_of: HashMap<usize, u16> = HashMap::new();
+        for (j, &n) in nodes.iter().enumerate() {
+            joint_of.entry(n).or_insert(j as u16);
+        }
         let mut info = SkeletonInfo {
             root: Affine3::IDENTITY,
             parents: Vec::with_capacity(nodes.len()),
@@ -167,10 +207,10 @@ impl Skeleton {
             names: Vec::with_capacity(nodes.len()),
         };
         let mut inverse_binds = Vec::with_capacity(nodes.len());
-        for &n in &nodes {
+        for (j, &n) in nodes.iter().enumerate() {
             let node = doc.nodes().nth(n).expect("node index");
             let world = graph.world[n];
-            if !world.is_finite() {
+            if !world.as_mat4().is_finite() {
                 return Err(format!("node {n}: its transform is not finite"));
             }
             info.parents
@@ -179,22 +219,27 @@ impl Skeleton {
             // Without an inverse, the identity is a bind that poses what `attach` hangs on the
             // joint: its space is the bind space, which keeps the depth a flat rest pose hides
             // for a pose that unflattens the joint.
-            let ib = bind.get(&n).copied().unwrap_or_else(|| {
-                if collapses(Mat3::from_mat4(world).as_dmat3()) {
-                    Mat4::IDENTITY
-                } else {
-                    world.inverse()
-                }
-            });
+            let ib = match binds.get(&n) {
+                Some(own) => own[j - usize::from(joint_of[&n])].as_dmat4(),
+                None if collapses(DMat3::from_mat4(world)) => DMat4::IDENTITY,
+                None => world.inverse(),
+            };
             inverse_binds.push(ib);
-            info.inverse_binds.push(Affine3::from_mat4(ib));
+            info.inverse_binds.push(Affine3::from_mat4(ib.as_mat4()));
             info.names.push(node.name().unwrap_or_default().to_string());
         }
-        let skins = skins
-            .iter()
-            .map(|&s| {
-                let skin = doc.skins().nth(s).expect("skin index");
-                (s, skin.joints().map(|j| joint_of[&j.index()]).collect())
+        if still.is_some() {
+            info.parents.push(NO_PARENT);
+            info.rest.push(Trs::IDENTITY);
+            inverse_binds.push(DMat4::IDENTITY);
+            info.inverse_binds.push(Affine3::IDENTITY);
+            info.names.push(String::new());
+        }
+        let skins = bound
+            .into_iter()
+            .map(|(s, joints)| {
+                let joint = |(n, k): (usize, usize)| joint_of[&n] + k as u16;
+                (s, joints.into_iter().map(joint).collect())
             })
             .collect();
         Ok(Some(Self {
@@ -203,15 +248,23 @@ impl Skeleton {
             joint_of,
             skins,
             inverse_binds,
+            still,
         }))
+    }
+
+    /// The joints of the node whose first joint is `first`.
+    fn joints_from(&self, first: usize) -> Range<usize> {
+        let node = self.nodes[first];
+        let same = self.nodes[first..].iter().take_while(|&&n| n == node);
+        first..first + same.count()
     }
 
     /// Bind space from skeleton joint `j`'s space. A skin may give a joint an inverse bind
     /// that has no inverse: its vertices still skin, but nothing can sit on the joint.
-    fn bind(&self, j: u16) -> Result<Mat4, String> {
+    fn bind(&self, j: u16) -> Result<DMat4, String> {
         let j = usize::from(j);
         let ib = self.inverse_binds[j];
-        if collapses(Mat3::from_mat4(ib).as_dmat3()) {
+        if collapses(DMat3::from_mat4(ib)) {
             return Err(format!(
                 "the inverse bind of node {} has no inverse",
                 self.nodes[j]
@@ -223,7 +276,7 @@ impl Skeleton {
     /// Bind-space position of skeleton joint `j`, the origin if its inverse bind has no inverse.
     pub(crate) fn bind_origin(&self, j: u16) -> [f32; 3] {
         self.bind(j)
-            .map_or([0.0; 3], |b| b.w_axis.truncate().to_array())
+            .map_or([0.0; 3], |b| b.w_axis.truncate().as_vec3().to_array())
     }
 
     /// Skeleton joint of each joint of glTF skin `s`.
@@ -232,19 +285,21 @@ impl Skeleton {
     }
 
     /// For a mesh node without a skin: the joint it follows rigidly (itself or its nearest
-    /// skeleton ancestor) and the transform from its local space to bind space, so the
-    /// joint's skinning matrix moves it with the joint.
-    pub(crate) fn attach(&self, node: usize, graph: &Graph) -> Result<(u16, Mat4), String> {
+    /// skeleton ancestor, else the still joint) and the transform from its local space to bind
+    /// space, so the joint's skinning matrix moves it with the joint. The joints of one node pose
+    /// alike, so any whose bind has an inverse will do.
+    pub(crate) fn attach(&self, node: usize, graph: &Graph) -> Result<(u16, DMat4), String> {
         let mut a = Some(node);
         while let Some(n) = a {
-            if let Some(&j) = self.joint_of.get(&n) {
+            if let Some(&first) = self.joint_of.get(&n) {
+                let mut joints = self.joints_from(usize::from(first)).map(|j| j as u16);
+                let j = joints.find(|&j| self.bind(j).is_ok()).unwrap_or(first);
                 return Ok((j, self.bind(j)? * graph.relative(n, node)));
             }
             a = graph.parent[n];
         }
-        Err(format!(
-            "node {node} has a mesh without a skin and no skeleton joint above it"
-        ))
+        let still = self.still.expect("`build` saw every node without a skin");
+        Ok((still, graph.world[node]))
     }
 
     /// Clips of every animation that moves the skeleton, with their names.
@@ -292,6 +347,12 @@ impl Skeleton {
                     values,
                 };
                 ch.check().map_err(|m| format!("{}: {m}", what()))?;
+                for joint in self.joints_from(ch.joint).skip(1) {
+                    channels.push(Channel {
+                        joint,
+                        ..ch.clone()
+                    });
+                }
                 channels.push(ch);
             }
             if channels.is_empty() {
@@ -500,6 +561,7 @@ pub(crate) enum Interpolation {
 }
 
 /// One animated property of one joint, keyed in seconds.
+#[derive(Clone)]
 pub(crate) struct Channel {
     /// Skeleton joint.
     pub(crate) joint: usize,
@@ -632,7 +694,9 @@ fn rest(node: &gltf::Node<'_>) -> Result<Trs, String> {
         }
         transform => transform.decomposed(),
     };
-    let q = Quat::from_array(r).normalize();
+    let q = Vec4::from(r)
+        .try_normalize()
+        .map_or(Quat::IDENTITY, Quat::from_vec4);
     Ok(Trs {
         rotation: q.to_array(),
         translation: t,

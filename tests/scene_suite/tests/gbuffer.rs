@@ -25,10 +25,10 @@ use orr_cook::{
     TextureSettings, Usage,
 };
 use orr_gpu::{
-    ComputePipeline, GpuPtr, Hazards, KernelSet, MemoryKind, QueueKind, SamplerIndex, ShaderModule,
-    Stages, Texture, TextureRegion,
+    ComputePipeline, GpuPtr, Hazards, KernelSet, MemoryKind, QueueKind, ShaderModule, Stages,
+    Texture, TextureRegion,
 };
-use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
+use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3, Vec4};
 use orr_pack::clip::Clip;
 use orr_pack::instance::{InstanceRecord, LinearRows};
 use orr_pack::material::{Material, slot};
@@ -119,8 +119,22 @@ fn rgb9e5(w: u32) -> Vec3 {
 }
 
 fn ior(code: u32) -> f32 {
-    let r = (code & 255) as f32 / 255.0 * 0.5;
-    (1.0 + r) / (1.0 - r)
+    let c = (code & 255) as f32;
+    let t = match c {
+        ..16.0 => c / 16.0 - 1.0,
+        ..241.0 => (c - 16.0) / 450.0,
+        _ => 0.5 + (c - 241.0) / 28.0,
+    };
+    (1.0 + t) / (1.0 - t).max(1e-4)
+}
+
+/// The largest error of `ior`'s code around `t = (n - 1) / (n + 1)`.
+fn ior_step(t: f32) -> f32 {
+    0.5 * match t {
+        ..0.0 => 1.0 / 16.0,
+        ..0.5 => 1.0 / 450.0,
+        _ => 1.0 / 28.0,
+    } + 1e-6
 }
 
 /// The core words as the G-buffer layout defines them: what `decode_gsurface` must return.
@@ -138,7 +152,6 @@ struct Core {
     raster_error: f32,
     geometric_normal: Vec3,
     diffuse_roughness: f32,
-    occlusion: f32,
 }
 
 fn decode_core(a: [u32; 4], b: [u32; 2]) -> Core {
@@ -149,7 +162,7 @@ fn decode_core(a: [u32; 4], b: [u32; 2]) -> Core {
         normal: oct16(a[1]),
         emission: rgb9e5(a[2]),
         metalness: byte(a[3], 0),
-        specular_weight: byte(a[3], 8),
+        specular_weight: byte(a[3], 8) * (1u32 << ((b[0] >> 26) & 31)) as f32,
         ior: ior(a[3] >> 16),
         flags: a[3] >> 24,
         specular_color: Vec3::new(
@@ -165,7 +178,6 @@ fn decode_core(a: [u32; 4], b: [u32; 2]) -> Core {
         },
         geometric_normal: oct8(b[1]),
         diffuse_roughness: byte(b[1], 16),
-        occlusion: byte(b[1], 24),
     }
 }
 
@@ -226,12 +238,17 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             c.normal = arr(rng.unit());
             c.metalness = rng.next();
             c.emission = arr(rng.rgb() * 4000.0 * rng.next());
-            c.specular_weight = rng.next();
+            // Weights past 1, up to 1 / F0, and IORs over all of 0 to infinity.
+            c.specular_weight = rng.next() * if i % 3 == 0 { 2000.0 } else { 1.0 };
             c.specular_color = arr(rng.rgb());
-            c.ior = 1.0 + 2.0 * rng.next();
+            c.ior = match i % 5 {
+                0 => rng.next(),
+                1 => 3.0 + 100.0 * rng.next(),
+                2 => 1.5,
+                _ => 1.0 + 2.0 * rng.next(),
+            };
             c.geometric_normal = arr(rng.unit());
             c.diffuse_roughness = rng.next();
-            c.occlusion = rng.next();
             c.raster_error = if i % 7 == 0 {
                 0.0
             } else {
@@ -255,7 +272,7 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             }
             if kind != 0 {
                 c.coat_roughness = rng.next();
-                c.coat_ior = 1.0 + 2.0 * rng.next();
+                c.coat_ior = 0.5 + 6.0 * rng.next();
                 c.fuzz_roughness = rng.next();
                 c.anisotropy = rng.next();
                 c.tangent_angle = rng.next() * std::f32::consts::PI;
@@ -345,11 +362,11 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
         close(
             cpu.specular_weight,
             g.specular_weight,
-            1e-6,
+            1e-6 * cpu.specular_weight.max(1.0),
             "specular weight layout",
             i,
         );
-        close(cpu.ior, g.ior, 1e-5, "IOR layout", i);
+        close(cpu.ior, g.ior, 1e-5 * cpu.ior.max(1.0), "IOR layout", i);
         assert_eq!(cpu.flags, g.flags, "case {i} flags layout");
         close3(
             arr(cpu.specular_color),
@@ -379,7 +396,6 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             "diffuse roughness layout",
             i,
         );
-        close(cpu.occlusion, g.occlusion, 1e-6, "occlusion layout", i);
 
         // Each field within its encoding's precision.
         close3(
@@ -395,18 +411,24 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             angle(g.geometric_normal, c.geometric_normal) < 0.02,
             "case {i} geometric normal"
         );
+        // A largest channel past 511.5 steps takes the next exponent, whose half step is m / 511.5.
         let m = Vec3::from(c.emission).max_element();
-        close3(g.emission, c.emission, m / 512.0 + 1e-30, "emission", i);
+        close3(g.emission, c.emission, m / 511.0 + 1e-30, "emission", i);
         close(g.metalness, c.metalness, step8, "metalness", i);
         close(
             g.specular_weight,
             c.specular_weight,
-            step8,
+            step8 * (2.0 * c.specular_weight).max(1.0),
             "specular weight",
             i,
         );
         let r = |n: f32| (n - 1.0) / (n + 1.0);
-        close(r(g.ior), r(c.ior), 0.5 / 510.0 + 1e-6, "IOR", i);
+        let step = if c.ior == 1.5 {
+            1e-6
+        } else {
+            ior_step(r(c.ior))
+        };
+        close(r(g.ior), r(c.ior), step, "IOR", i);
         close3(
             srgb3(g.specular_color),
             srgb3(c.specular_color),
@@ -424,7 +446,6 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
                 c.raster_error
             );
         }
-        close(g.occlusion, c.occlusion, step8, "occlusion", i);
         assert_eq!(g.flags & 0x62, c.flags, "case {i} unlit and origin policy");
 
         let thin = c.bsdf_flags & BSDF_THIN_WALLED != 0;
@@ -465,7 +486,7 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
         close(
             r(g.coat_ior),
             r(c.coat_ior),
-            0.5 / 510.0 + 1e-6,
+            ior_step(r(c.coat_ior)),
             "coat IOR",
             i,
         );
@@ -790,6 +811,17 @@ const HALF_GREEN: [u8; 3] = [20, 230, 20];
 /// and of the matte decal under it.
 const STICKER_TEXEL: [u8; 4] = [40, 90, 230, 255];
 const STICKER_ROUGHNESS: f32 = 0.15;
+/// The tangent-space normal of the tilted models' texture.
+const TILT: [f32; 3] = [0.3, 0.5, 0.812];
+type SkewCorner = ([f32; 3], [f32; 3], [f32; 3], f32);
+
+/// Position, normal, tangent and sign of a triangle's corners, whose frames spread far enough
+/// that between them the normal and tangent are neither unit nor perpendicular.
+const SKEW: [SkewCorner; 3] = [
+    ([-1.0, -1.0, 0.0], [-0.8, -0.2, 1.0], [1.0, 0.2, 0.8], -1.0),
+    ([1.0, -1.0, 0.0], [0.8, -0.3, 1.0], [1.0, -0.5, -0.8], -1.0),
+    ([0.0, 1.0, 0.0], [0.0, 0.9, 1.0], [1.0, 0.0, 0.0], -1.0),
+];
 const MATTE_ROUGHNESS: f32 = 0.6;
 
 fn cook() -> Arc<[u8]> {
@@ -811,6 +843,25 @@ fn cook() -> Arc<[u8]> {
             (n.y * 255.0) as u8,
             (n.z * 255.0) as u8,
         ]
+    });
+    let turned_quad = || MeshInput {
+        // Its second uvs turn a quarter turn: their u runs down -y and their up runs +x.
+        uvs1: Some(vec![
+            Vec2::new(1.0, 1.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.0, 1.0),
+        ]),
+        ..quad([
+            Vec3::new(-0.5, -0.5, 0.0),
+            Vec3::new(0.5, -0.5, 0.0),
+            Vec3::new(0.5, 0.5, 0.0),
+            Vec3::new(-0.5, 0.5, 0.0),
+        ])
+    };
+    let tilt = png("tilt.png", 16, 16, png::ColorType::Rgb, |_, _| {
+        TILT.map(|c| ((c * 0.5 + 0.5) * 255.0).round() as u8)
+            .to_vec()
     });
     let holes = png("holes.png", 128, 128, png::ColorType::Grayscale, |x, y| {
         let (u, v) = (x as f32 / 128.0 - 0.5, y as f32 / 128.0 - 0.5);
@@ -834,6 +885,13 @@ fn cook() -> Arc<[u8]> {
     };
     ground.textures[slot::BASE_COLOR].texture = id("tex/albedo");
     ground.textures[slot::NORMAL].texture = id("tex/normal");
+    let mut tilted = Material::default();
+    tilted.textures[slot::NORMAL].texture = id("tex/tilt");
+    let mut tilted_uv1 = tilted;
+    tilted_uv1.textures[slot::NORMAL].uv_set = 1;
+    let mut tilted_keeping_uv1 = tilted;
+    tilted_keeping_uv1.textures[slot::BASE_COLOR].texture = id("tex/albedo");
+    tilted_keeping_uv1.textures[slot::BASE_COLOR].uv_set = 1;
     let coat = Material {
         base_color: [0.1, 0.25, 0.8],
         specular_roughness: 0.4,
@@ -1018,6 +1076,65 @@ fn cook() -> Arc<[u8]> {
                 texture("tex/normal", bumps, Usage::Normal),
                 texture("tex/holes", holes, Usage::Linear1),
                 texture("tex/sticker", sticker, Usage::Color),
+                texture("tex/tilt", tilt, Usage::Normal),
+                model("tilted", quad(unit), vec![tilted], one()),
+                AssetSpec {
+                    name: "tilted skew".into(),
+                    source: Source::Mesh {
+                        mesh: MeshInput {
+                            tangents: Some(SKEW.map(|c| Vec3::from(c.2).extend(c.3)).to_vec()),
+                            ..mesh(
+                                SKEW.map(|c| c.0.into()).to_vec(),
+                                SKEW.map(|c| Vec3::from(c.1).normalize()).to_vec(),
+                                vec![Vec2::ZERO, Vec2::X, Vec2::Y],
+                                vec![[0, 1, 2]],
+                                &[1],
+                            )
+                        },
+                        materials: vec![tilted],
+                        settings: MeshSettings {
+                            tangent_error_max: None,
+                            ..MeshSettings::default()
+                        },
+                    },
+                },
+                AssetSpec {
+                    name: "tilted sets".into(),
+                    source: Source::Mesh {
+                        mesh: turned_quad(),
+                        materials: vec![tilted_keeping_uv1],
+                        settings: MeshSettings {
+                            tangent_error_max: None,
+                            ..MeshSettings::default()
+                        },
+                    },
+                },
+                model("tilted on uv1", turned_quad(), vec![tilted_uv1], one()),
+                AssetSpec {
+                    name: "tilted computed".into(),
+                    source: Source::Mesh {
+                        mesh: quad(unit),
+                        materials: vec![tilted],
+                        settings: MeshSettings {
+                            tangent_error_max: None,
+                            ..MeshSettings::default()
+                        },
+                    },
+                },
+                AssetSpec {
+                    name: "tilted stored".into(),
+                    source: Source::Mesh {
+                        mesh: MeshInput {
+                            tangents: Some(vec![Vec4::new(1.0, 0.0, 0.0, 1.0); 4]),
+                            ..quad(unit)
+                        },
+                        materials: vec![tilted],
+                        settings: MeshSettings {
+                            tangent_error_max: None,
+                            ..MeshSettings::default()
+                        },
+                    },
+                },
                 model("sticker", quad(unit), vec![sticker_material], one()),
                 model("matte", quad(unit), vec![matte], one()),
                 model(
@@ -1189,6 +1306,17 @@ fn place(w: &mut World, copies: &[Item]) -> Placed {
 
 /// [`place`] with the group anchored at `anchor` and the copies traced within `rt_range`.
 fn place_at(w: &mut World, copies: &[Item], anchor: DVec3, rt_range: f32) -> Placed {
+    place_with(w, copies, anchor, rt_range, None)
+}
+
+/// [`place_at`] with one-section copies drawn in `material`, in place of the section's.
+fn place_with(
+    w: &mut World,
+    copies: &[Item],
+    anchor: DVec3,
+    rt_range: f32,
+    material: Option<MaterialId>,
+) -> Placed {
     let scene = w.scenes.create_scene(&SceneDesc::default()).unwrap();
     let history = w.scenes.create_view_history().unwrap();
     let models: Vec<ModelId> = copies.iter().map(|c| w.model(c.model)).collect();
@@ -1203,6 +1331,9 @@ fn place_at(w: &mut World, copies: &[Item], anchor: DVec3, rt_range: f32) -> Pla
         })
         .unwrap();
     let mut s = f.scene(scene).unwrap();
+    if let Some(m) = material {
+        s.material_sets(0, 1).unwrap()[0] = m;
+    }
     let group = s
         .create_transform_group(&TransformGroupDesc {
             count: copies.len() as u32,
@@ -1220,7 +1351,7 @@ fn place_at(w: &mut World, copies: &[Item], anchor: DVec3, rt_range: f32) -> Pla
                 transforms: group,
                 first: i as u32,
                 pose: None,
-                material_set: None,
+                material_set: material.map(|_| 0),
                 flags: InstanceFlags::RASTER | InstanceFlags::RAY,
                 rt_range,
                 animation_range: 0.0,
@@ -2858,6 +2989,179 @@ fn set_decals(s: &mut SceneWriter<'_>, matte: MaterialId, sticker: MaterialId, w
     s.set_decal(DecalId(1), Some(&over)).unwrap();
 }
 
+/// MikkTSpace's pixel transform, which bakers invert: each corner's normal and tangent placed
+/// and normalized, then interpolated and used as they stand. A mirror negates the sign.
+#[test]
+fn normal_maps_shade_through_the_interpolated_frame_they_were_baked_in() {
+    let _serial = serial();
+    let mut w = World::new(&KernelSet {
+        modules: &[],
+        surfaces: 0,
+    });
+    let cpu = CpuMesh::of("tilted skew");
+    for linear in [
+        Mat3::IDENTITY,
+        Mat3::from_diagonal(Vec3::new(-1.5, 1.0, 2.0)),
+    ] {
+        let item = Item {
+            model: "tilted skew",
+            linear,
+            at: Vec3::ZERO,
+        };
+        let placed = place(&mut w, &[item]);
+        let mut shot = Shot::at(DVec3::new(0.0, 0.0, 3.0), DVec3::ZERO, 1);
+        shot.focus = None;
+        let g = shoot(&mut w, &placed, &shot);
+        let r = rays(&g.view, &trace::MODULE, "pixels", 1);
+        let mirror = linear.determinant().signum();
+        let normals = linear.inverse().transpose();
+        let mut seen = 0;
+        for t in r.traced.iter().filter(|t| t.instance != 0) {
+            let (p, ..) = cpu.triangle(t.cluster, t.primitive);
+            let corner = p.map(|p| {
+                let near = |c: &&(_, _, _, _)| Vec3::from(c.0).distance(p) < 1e-3;
+                SKEW.iter().find(near).unwrap()
+            });
+            let b = Vec2::from(t.barycentrics);
+            let wt = [1.0 - b.x - b.y, b.x, b.y];
+            let sum = |f: &dyn Fn(usize) -> Vec3| (0..3).map(|k| f(k) * wt[k]).sum::<Vec3>();
+            let n = sum(&|k| (normals * Vec3::from(corner[k].1).normalize()).normalize());
+            let tangent = sum(&|k| (linear * Vec3::from(corner[k].2)).normalize());
+            let bitangent = n.cross(tangent) * corner[0].3 * mirror;
+            let [x, y, z] = TILT;
+            let want = (tangent * x + bitangent * y + n * z).normalize();
+            let got = Vec3::from(t.normal);
+            assert!(got.dot(want) > 0.9999, "{got} want {want}");
+            seen += 1;
+        }
+        assert!(seen > 1000, "{seen} pixels");
+    }
+}
+
+/// Asserts that every drawn pixel of `g` whose normal `pick` keeps is `want`, and counts them.
+fn tilted_pixels(g: &Frame, want: Vec3, pick: impl Fn(Vec3) -> bool) -> usize {
+    let mut seen = 0;
+    for i in 0..g.ids.len() {
+        let n = decode_core(g.a[i], g.b[i]).normal;
+        if g.ids[i] != 0 && pick(n) {
+            assert!(
+                n.dot(want.normalize()) > 0.9995,
+                "pixel {i}: {n} want {want}"
+            );
+            seen += 1;
+        }
+    }
+    seen
+}
+
+/// A copy's material can read a normal map on the uv set the mesh's tangents don't follow, which
+/// turns the frame with that set's uvs.
+#[test]
+fn a_replaced_material_turns_its_normal_map_with_its_own_uv_set() {
+    let _serial = serial();
+    let mut w = World::new(&linked::KERNELS);
+    let material = w
+        .scenes
+        .material(w.mount, AssetId::from_name("tilted on uv1/material/0"))
+        .unwrap();
+    let [x, y, z] = TILT;
+    let item = Item {
+        model: "tilted sets",
+        linear: Mat3::IDENTITY,
+        at: Vec3::ZERO,
+    };
+    let eye = DVec3::new(0.0, 0.0, 2.0);
+    for (over, want) in [
+        (None, Vec3::new(x, y, z)),
+        (Some(material), Vec3::new(y, -x, z)),
+    ] {
+        let placed = place_with(&mut w, &[item], DVec3::ZERO, 100.0, over);
+        let mut shot = Shot::at(eye, DVec3::ZERO, 1);
+        shot.jitter = Vec2::ZERO;
+        let g = shoot(&mut w, &placed, &shot);
+        assert!(tilted_pixels(&g, want, |_| true) > 1000);
+    }
+}
+
+/// A quad seen from its front, u along +x and uv's v down -y: x of the normal map turns along
+/// its u axis and y up the image, with tangents from the triangle, MikkTSpace or the caller,
+/// under a mirror or a turn, and on a decal.
+#[test]
+fn normal_maps_turn_toward_the_image_up_on_meshes_and_decals() {
+    let _serial = serial();
+    let mut w = World::new(&linked::KERNELS);
+    let [x, y, z] = TILT;
+    let eye = DVec3::new(0.0, 0.0, 2.0);
+    for model in ["tilted", "tilted computed", "tilted stored"] {
+        let cases = [
+            (Mat3::IDENTITY, Vec3::new(x, y, z)),
+            (
+                Mat3::from_diagonal(Vec3::new(-1.0, 1.0, 1.0)),
+                Vec3::new(-x, y, z),
+            ),
+            (
+                Mat3::from_diagonal(Vec3::new(1.0, -1.0, 1.0)),
+                Vec3::new(x, -y, z),
+            ),
+            (
+                Mat3::from_rotation_z(std::f32::consts::FRAC_PI_2),
+                Vec3::new(-y, x, z),
+            ),
+        ];
+        for (linear, want) in cases {
+            let item = Item {
+                model,
+                linear,
+                at: Vec3::ZERO,
+            };
+            let placed = place(&mut w, &[item]);
+            let mut shot = Shot::at(eye, DVec3::ZERO, 1);
+            shot.jitter = Vec2::ZERO;
+            let g = shoot(&mut w, &placed, &shot);
+            let seen = tilted_pixels(&g, want, |_| true);
+            assert!(seen > 1000, "{model} {linear}: {seen} pixels");
+        }
+    }
+
+    let tilted = w
+        .scenes
+        .material(w.mount, AssetId::from_name("tilted/material/0"))
+        .unwrap();
+    let wall = Item {
+        model: "plain",
+        linear: Mat3::from_diagonal(Vec3::splat(8.0)),
+        at: Vec3::ZERO,
+    };
+    let cases = [
+        (Quat::IDENTITY, Vec3::new(x, y, z)),
+        (
+            Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+            Vec3::new(-y, x, z),
+        ),
+        // Past 90 degrees from the decal's +z: its y axis runs down the wall.
+        (Quat::from_rotation_x(2.0), Vec3::new(x, -y, z)),
+    ];
+    for (rotation, want) in cases {
+        let placed = place(&mut w, &[wall]);
+        let mut shot = Shot::at(eye, DVec3::ZERO, 1);
+        shot.jitter = Vec2::ZERO;
+        let g = shoot_with(&mut w, &placed, &shot, |s| {
+            let decal = Decal {
+                center: DVec3::ZERO,
+                rotation,
+                half_extent: Vec3::new(0.5, 0.5, 0.25),
+                material: tilted,
+                channels: DecalChannels::NORMAL,
+                opacity: 1.0,
+                fade_angles: [2.5, 3.0],
+                depth_fade: 0.0,
+            };
+            s.set_decal(DecalId(0), Some(&decal)).unwrap();
+        });
+        assert!(tilted_pixels(&g, want, |n| n.z < 0.95) > 1000, "decal");
+    }
+}
+
 #[test]
 fn a_decal_on_a_wall_matches_between_the_gbuffer_and_a_mirror_reflection() {
     let _serial = serial();
@@ -4115,7 +4419,7 @@ fn rewriting_a_material_set_changes_only_the_copies_that_name_it() {
                 base_color,
                 ..Material::default()
             };
-            let m = MaterialGpu::new(&m, &[BoundTexture::NONE; 12], SamplerIndex(0));
+            let m = MaterialGpu::new(&m, &[BoundTexture::NONE; slot::COUNT]);
             materials.push(mats.create(&m).unwrap());
             records.push(Vec3::from(m.base_color));
         }
@@ -5331,7 +5635,7 @@ fn stochastic_texture_taps_average_to_the_bicubic_filter_under_magnification() {
         dx: [texels / SIZE as f32, 0.0],
         dy: [0.0, texels / SIZE as f32],
         hardware: u32::from(hardware),
-        pad: 0,
+        material: 0,
     };
     let mut cases = Vec::new();
     for &uv in &uvs {
@@ -5385,7 +5689,10 @@ fn stochastic_texture_taps_average_to_the_bicubic_filter_under_magnification() {
             count: cases.len() as u32,
             taps: TAPS,
             streams: GpuPtr::NULL,
+            modes: 0,
             pad: 0,
+            materials: GpuPtr::NULL,
+            pad2: 0,
         }),
         "texture filter root",
     );
@@ -5411,6 +5718,552 @@ fn stochastic_texture_taps_average_to_the_bicubic_filter_under_magnification() {
         }
     }
     d.free_image_slot_after_submitted(slot);
+    assert_clean();
+}
+
+/// Every wrap and filter a binding can state, read through `material_texture` against a CPU
+/// reference, inside the unit square and past it. Neighboring lanes read different materials,
+/// so each wave's taps run on several samplers at once.
+#[test]
+fn material_slots_read_their_wrap_and_filter_like_a_cpu_reference() {
+    use orr_gpu::{Format, TextureDesc, TextureMemory, TextureUsage};
+    use orr_pack::material::{Material, TextureBinding, filter, slot, wrap};
+    use scene_suite::shaders::texture_filter::{self, Footprint, Root};
+
+    const SIZE: i32 = 8;
+    const TAPS: u32 = 4096;
+    const OUTSIDE: [f32; 4] = [0.25, 0.5, 0.75, 1.0];
+    let _guard = serial();
+    let d = device();
+    let hashed = |n: i32, salt: u32| -> Vec<[u8; 4]> {
+        (0..(n * n) as u32)
+            .map(|i| {
+                let h = ((i + salt).wrapping_mul(2_654_435_761) >> 7) as u8;
+                [h, h.wrapping_mul(7), h ^ 0x5a, h.wrapping_mul(13) | 1]
+            })
+            .collect()
+    };
+    let mips = [hashed(SIZE, 0), hashed(SIZE / 2, 99)];
+
+    let fold = |i: i32, n: i32, mode: u8| -> Option<i32> {
+        match mode {
+            wrap::REPEAT => Some(i.rem_euclid(n)),
+            wrap::MIRROR => {
+                let m = i.rem_euclid(2 * n);
+                Some(if m < n { m } else { 2 * n - 1 - m })
+            }
+            wrap::BORDER if !(0..n).contains(&i) => None,
+            _ => Some(i.clamp(0, n - 1)),
+        }
+    };
+    let texel = |modes: [u8; 2], mip: usize, x: i32, y: i32| -> [f32; 4] {
+        let n = SIZE >> mip;
+        match (fold(x, n, modes[0]), fold(y, n, modes[1])) {
+            (Some(x), Some(y)) => mips[mip][(y * n + x) as usize].map(|c| f32::from(c) / 255.0),
+            _ => [0.0; 4],
+        }
+    };
+    let filtered =
+        |modes: [u8; 2], mip: usize, uv: [f32; 2], r: i32, w: &dyn Fn(f32, i32) -> f32| {
+            let n = (SIZE >> mip) as f32;
+            let (x, y) = (uv[0] * n - 0.5, uv[1] * n - 0.5);
+            let (bx, by) = (x.floor(), y.floor());
+            let mut sum = [0.0; 4];
+            for j in -r + 1..=r {
+                for i in -r + 1..=r {
+                    let weight = w(x - bx, i) * w(y - by, j);
+                    let t = texel(modes, mip, bx as i32 + i, by as i32 + j);
+                    for c in 0..4 {
+                        sum[c] += weight * t[c];
+                    }
+                }
+            }
+            sum
+        };
+    let linear = |t: f32, k: i32| if k == 0 { 1.0 - t } else { t };
+    let bspline = |t: f32, k: i32| {
+        let s = 1.0 - t;
+        match k {
+            -1 => s * s * s / 6.0,
+            0 => (4.0 - 6.0 * t * t + 3.0 * t * t * t) / 6.0,
+            1 => (1.0 + 3.0 * t + 3.0 * t * t - 3.0 * t * t * t) / 6.0,
+            _ => t * t * t / 6.0,
+        }
+    };
+    let nearest = |modes: [u8; 2], mip: usize, uv: [f32; 2]| {
+        let n = (SIZE >> mip) as f32;
+        let at = uv.map(|c| (c * n).floor() as i32);
+        texel(modes, mip, at[0], at[1])
+    };
+
+    #[derive(Copy, Clone)]
+    enum Read {
+        Bilinear(usize),
+        Bicubic,
+        Nearest(usize),
+    }
+    use Read::*;
+    // Filter bits, footprint in texels, hardware filtering alone, and what that reads.
+    let filters: [(u8, f32, bool, Read); 8] = [
+        (0, 0.1, true, Bilinear(0)),
+        (0, 0.1, false, Bicubic),
+        (0, 2.0, true, Bilinear(1)),
+        (filter::MIP_NEAREST, 1.1, true, Bilinear(0)),
+        (filter::MAG_NEAREST, 0.1, false, Nearest(0)),
+        (
+            filter::MIP_NEAREST | filter::ONE_MIP,
+            2.0,
+            true,
+            Bilinear(0),
+        ),
+        (
+            filter::MIN_NEAREST | filter::MIP_NEAREST | filter::ONE_MIP,
+            2.0,
+            true,
+            Nearest(0),
+        ),
+        (
+            filter::MIN_NEAREST | filter::MIP_NEAREST,
+            2.0,
+            true,
+            Nearest(1),
+        ),
+    ];
+    let wraps = [
+        [wrap::REPEAT, wrap::REPEAT],
+        [wrap::CLAMP, wrap::CLAMP],
+        [wrap::MIRROR, wrap::MIRROR],
+        [wrap::BORDER, wrap::BORDER],
+        [wrap::CONSTANT, wrap::CONSTANT],
+        [wrap::CLAMP, wrap::MIRROR],
+        [wrap::BORDER, wrap::REPEAT],
+        [wrap::REPEAT, wrap::CONSTANT],
+    ];
+    let uvs = [
+        [0.31, 0.53],
+        [-0.03, 0.53],
+        [1.02, 0.97],
+        [1.6, -0.4],
+        [-1.3, 2.2],
+        [0.01, 0.99],
+    ];
+
+    let desc = TextureDesc {
+        mips: 2,
+        ..TextureDesc::d2(
+            Format::Rgba8Unorm,
+            SIZE as u32,
+            SIZE as u32,
+            TextureUsage::SAMPLED,
+        )
+    };
+    let texture = d
+        .create_texture(&desc, TextureMemory::Dedicated, "wrapped texture")
+        .unwrap();
+    let slot_index = d.alloc_image_slot().unwrap();
+    let index = d.write_sampled(slot_index, &texture, &orr_gpu::ViewDesc::default());
+    let mut records = Vec::new();
+    for (wi, &modes) in wraps.iter().enumerate() {
+        for (fi, f) in filters.iter().enumerate() {
+            let binding = TextureBinding {
+                wrap: modes,
+                filter: f.0,
+                outside: OUTSIDE,
+                ..bytemuck::Zeroable::zeroed()
+            };
+            let mut m = Material::default();
+            m.textures[slot::BASE_COLOR] = binding;
+            let mut bound = [BoundTexture::NONE; slot::COUNT];
+            bound[slot::BASE_COLOR] = BoundTexture {
+                index,
+                sampler: d.sampler(&orr_scene::binding_sampler(&binding)).unwrap(),
+                ..BoundTexture::NONE
+            };
+            records.push(MaterialGpu::new(&m, &bound));
+            assert_eq!(records.len(), wi * filters.len() + fi + 1);
+        }
+    }
+    let mut cases = Vec::new();
+    for &uv in &uvs {
+        for (fi, &(_, texels, hardware, read)) in filters.iter().enumerate() {
+            for (wi, &modes) in wraps.iter().enumerate() {
+                let past = |a: usize| modes[a] == wrap::CONSTANT && !(0.0..=1.0).contains(&uv[a]);
+                let want = if past(0) || past(1) {
+                    OUTSIDE
+                } else {
+                    match read {
+                        Bilinear(mip) => filtered(modes, mip, uv, 1, &linear),
+                        Bicubic => filtered(modes, 0, uv, 2, &bspline),
+                        Nearest(mip) => nearest(modes, mip, uv),
+                    }
+                };
+                let footprint = Footprint {
+                    uv,
+                    dx: [texels / SIZE as f32, 0.0],
+                    dy: [0.0, texels / SIZE as f32],
+                    hardware: u32::from(hardware),
+                    material: (wi * filters.len() + fi) as u32,
+                };
+                cases.push((footprint, want, modes, fi));
+            }
+        }
+    }
+
+    let upload = |bytes: &[u8], name| {
+        let mut a = d
+            .gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, name)
+            .unwrap();
+        a.as_mut_slice().unwrap().copy_from_slice(bytes);
+        a
+    };
+    let levels = mips
+        .each_ref()
+        .map(|m| upload(bytemuck::cast_slice(m), "texels"));
+    let footprints: Vec<Footprint> = cases.iter().map(|c| c.0).collect();
+    let input = upload(bytemuck::cast_slice(&footprints), "footprints");
+    let materials = upload(bytemuck::cast_slice(&records), "materials");
+    let out = d
+        .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, cases.len() as u64, "means")
+        .unwrap();
+    let root = upload(
+        bytemuck::bytes_of(&Root {
+            footprints: input.gpu().cast(),
+            out: out.gpu(),
+            texture: index,
+            sampler: orr_gpu::SamplerIndex(0),
+            count: cases.len() as u32,
+            taps: TAPS,
+            streams: GpuPtr::NULL,
+            modes: 0,
+            pad: 0,
+            materials: materials.gpu().cast(),
+            pad2: 0,
+        }),
+        "texture filter root",
+    );
+    let p = pipeline(&texture_filter::MODULE, "slot_mean");
+    let render = d.queue(QueueKind::Render).unwrap();
+    let mut list = render.command_list().unwrap();
+    list.discard(&texture);
+    for (mip, level) in levels.iter().enumerate() {
+        list.copy_to_texture(
+            &texture,
+            &TextureRegion::whole_mip(&desc, mip as u32),
+            level.gpu(),
+        );
+    }
+    list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
+    list.dispatch(
+        &p,
+        root.gpu().cast::<Root>(),
+        [cases.len().div_ceil(64) as u32, 1, 1],
+    );
+    list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+    wait(render.submit(vec![list], &[]).unwrap());
+
+    for ((footprint, want, modes, fi), mean) in cases.iter().zip(out.as_slice().unwrap()) {
+        for c in 0..4 {
+            assert!(
+                (mean[c] - want[c]).abs() < 6e-3,
+                "wrap {modes:?}, filter row {fi} at {:?}: channel {c} is {} against {}",
+                footprint.uv,
+                mean[c],
+                want[c]
+            );
+        }
+    }
+    d.free_image_slot_after_submitted(slot_index);
+    assert_clean();
+}
+
+/// A tile set read through `material_texture` against a CPU reference: every unit square reads its
+/// own tile, of its own size and mips, at the point's place in the square, and filtering stops at
+/// the tile's edges as the binding says. Squares without a tile read `outside`, under any wrap,
+/// those whose keys land in a bucket that holds others among them, and a tile far from the rest
+/// costs nothing. Neighboring lanes read different tiles and materials.
+#[test]
+fn material_tile_sets_read_each_square_like_a_cpu_reference() {
+    use orr_gpu::{Format, TextureDesc, TextureMemory, TextureUsage};
+    use orr_pack::material::{Material, TextureBinding, filter, slot, wrap};
+    use orr_pack::tiles::{BUCKET, TextureTiles};
+    use scene_suite::shaders::texture_filter::{self, Footprint, Root};
+
+    const TAPS: u32 = 4096;
+    const OUTSIDE: [f32; 4] = [0.25, 0.5, 0.75, 1.0];
+    // The size of each texture, which the tiles share out.
+    const SIZES: [i32; 3] = [8, 4, 16];
+    let _guard = serial();
+    let d = device();
+    let hashed = |n: i32, salt: u32| -> Vec<[u8; 4]> {
+        (0..(n * n) as u32)
+            .map(|i| {
+                let h = ((i + salt).wrapping_mul(2_654_435_761) >> 7) as u8;
+                [h, h.wrapping_mul(7), h ^ 0x5a, h.wrapping_mul(13) | 1]
+            })
+            .collect()
+    };
+    let mips: Vec<[Vec<[u8; 4]>; 2]> = SIZES
+        .iter()
+        .enumerate()
+        .map(|(t, &n)| {
+            [
+                hashed(n, 1000 * t as u32),
+                hashed(n / 2, 1000 * t as u32 + 99),
+            ]
+        })
+        .collect();
+    // Column, row and texture of each tile: enough of them for buckets of several keys, and one
+    // whose name lies far off.
+    let mut tiles: Vec<(u16, u16, usize)> =
+        vec![(0, 0, 0), (1, 0, 1), (2, 1, 2), (40_000, 39_999, 0)];
+    tiles.extend((0..40).map(|i| (3 + i % 8, 2 + i / 8, usize::from(i) % 3)));
+
+    let fold = |i: i32, n: i32, mode: u8| match mode {
+        wrap::REPEAT => i.rem_euclid(n),
+        _ => i.clamp(0, n - 1),
+    };
+    let texel = |tile: usize, mode: u8, mip: usize, x: i32, y: i32| -> [f32; 4] {
+        let n = SIZES[tile] >> mip;
+        let at = fold(y, n, mode) * n + fold(x, n, mode);
+        mips[tile][mip][at as usize].map(|c| f32::from(c) / 255.0)
+    };
+    let filtered =
+        |tile: usize, mode: u8, mip: usize, uv: [f32; 2], r: i32, w: &dyn Fn(f32, i32) -> f32| {
+            let n = (SIZES[tile] >> mip) as f32;
+            let (x, y) = (uv[0] * n - 0.5, uv[1] * n - 0.5);
+            let (bx, by) = (x.floor(), y.floor());
+            let mut sum = [0.0; 4];
+            for j in -r + 1..=r {
+                for i in -r + 1..=r {
+                    let weight = w(x - bx, i) * w(y - by, j);
+                    let t = texel(tile, mode, mip, bx as i32 + i, by as i32 + j);
+                    for c in 0..4 {
+                        sum[c] += weight * t[c];
+                    }
+                }
+            }
+            sum
+        };
+    let linear = |t: f32, k: i32| if k == 0 { 1.0 - t } else { t };
+    let bspline = |t: f32, k: i32| {
+        let s = 1.0 - t;
+        match k {
+            -1 => s * s * s / 6.0,
+            0 => (4.0 - 6.0 * t * t + 3.0 * t * t * t) / 6.0,
+            1 => (1.0 + 3.0 * t + 3.0 * t * t - 3.0 * t * t * t) / 6.0,
+            _ => t * t * t / 6.0,
+        }
+    };
+
+    #[derive(Copy, Clone)]
+    enum Read {
+        Bilinear(usize),
+        Bicubic,
+        Nearest,
+    }
+    use Read::*;
+    // Filter bits, footprint in texels of the tile, hardware filtering alone, and what that reads.
+    let filters: [(u8, f32, bool, Read); 4] = [
+        (0, 0.1, true, Bilinear(0)),
+        (0, 0.1, false, Bicubic),
+        (0, 2.0, true, Bilinear(1)),
+        (filter::MAG_NEAREST, 0.1, false, Nearest),
+    ];
+    let wraps = [wrap::CLAMP, wrap::REPEAT, wrap::CONSTANT];
+
+    let mut textures = Vec::new();
+    let mut indices = Vec::new();
+    for &n in &SIZES {
+        let desc = TextureDesc {
+            mips: 2,
+            ..TextureDesc::d2(
+                Format::Rgba8Unorm,
+                n as u32,
+                n as u32,
+                TextureUsage::SAMPLED,
+            )
+        };
+        let texture = d
+            .create_texture(&desc, TextureMemory::Dedicated, "tile")
+            .unwrap();
+        let slot_index = d.alloc_image_slot().unwrap();
+        indices.push((
+            slot_index,
+            d.write_sampled(slot_index, &texture, &Default::default()),
+        ));
+        textures.push((texture, desc));
+    }
+    let upload = |bytes: &[u8], name| {
+        let mut a = d
+            .gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, name)
+            .unwrap();
+        a.as_mut_slice().unwrap().copy_from_slice(bytes);
+        a
+    };
+    let texture_id = |t: usize| AssetId::from_name(&t.to_string());
+    let cells: Vec<_> = tiles
+        .iter()
+        .map(|&(u, v, t)| (u, v, texture_id(t)))
+        .collect();
+    let set = TextureTiles::new(&cells);
+    let mut held = vec![0; set.buckets as usize];
+    for t in &set.tiles {
+        held[(t.entry / BUCKET) as usize] += 1;
+    }
+    assert!(
+        held.iter().any(|&n| n >= 3),
+        "a bucket of several keys: {held:?}"
+    );
+    let words = set
+        .table(|id| {
+            (0..SIZES.len())
+                .find(|&t| texture_id(t) == id)
+                .map(|t| indices[t].1.0)
+        })
+        .unwrap();
+    let table = upload(bytemuck::cast_slice(&words), "tile table");
+
+    let mut records = Vec::new();
+    for &mode in &wraps {
+        for f in &filters {
+            let binding = TextureBinding {
+                wrap: [mode; 2],
+                filter: f.0,
+                outside: OUTSIDE,
+                ..bytemuck::Zeroable::zeroed()
+            };
+            let mut m = Material::default();
+            m.textures[slot::BASE_COLOR] = binding;
+            let mut bound = [BoundTexture::NONE; slot::COUNT];
+            bound[slot::BASE_COLOR] = BoundTexture {
+                index: indices[0].1,
+                sampler: d.sampler(&orr_scene::binding_sampler(&binding)).unwrap(),
+                tiles: table.gpu().cast(),
+                ..BoundTexture::NONE
+            };
+            records.push(MaterialGpu::new(&m, &bound));
+        }
+    }
+    // Places in a square: its middle, and beside each edge that filtering reaches past.
+    let places = [[0.31, 0.53], [0.01, 0.99], [0.99, 0.02]];
+    // Uvs with no tile: past every tile on each side, past what a key holds, and squares among
+    // the tiles, of which those last share a bucket with some.
+    let mut holes = vec![
+        [-0.5, 0.5],
+        [0.5, 1.5],
+        [65_536.5, 0.5],
+        [0.5, -65_535.5],
+        [2.5, 0.5],
+        [0.5, -0.5],
+        [1.5, -0.5],
+        [40_001.5, -39_998.5],
+    ];
+    let taken = |u: u16, v: u16| tiles.iter().any(|t| (t.0, t.1) == (u, v));
+    let crowded = (0..200u16)
+        .flat_map(|v| (0..200u16).map(move |u| (u, v)))
+        .filter(|&(u, v)| !taken(u, v) && held[set.bucket(u, v) as usize] >= 3)
+        .take(16);
+    holes.extend(crowded.map(|(u, v)| [f32::from(u) + 0.5, 0.5 - f32::from(v)]));
+    let mut cases = Vec::new();
+    for (fi, &(_, texels, hardware, read)) in filters.iter().enumerate() {
+        for (wi, &mode) in wraps.iter().enumerate() {
+            let material = (wi * filters.len() + fi) as u32;
+            for &(column, row, t) in &tiles {
+                let n = SIZES[t];
+                for &place in &places {
+                    // A far tile's uv holds fewer bits of its place.
+                    let uv = [f32::from(column) + place[0], place[1] - f32::from(row)];
+                    let place = uv.map(|c| c - c.floor());
+                    let want = match read {
+                        Bilinear(mip) => filtered(t, mode, mip, place, 1, &linear),
+                        Bicubic => filtered(t, mode, 0, place, 2, &bspline),
+                        Nearest => {
+                            let at = place.map(|c| (c * n as f32).floor() as i32);
+                            texel(t, mode, 0, at[0], at[1])
+                        }
+                    };
+                    cases.push((uv, texels / n as f32, hardware, material, want));
+                }
+            }
+            for &uv in &holes {
+                cases.push((uv, texels / 8.0, hardware, material, OUTSIDE));
+            }
+        }
+    }
+    let footprints: Vec<Footprint> = cases
+        .iter()
+        .map(|&(uv, size, hardware, material, _)| Footprint {
+            uv,
+            dx: [size, 0.0],
+            dy: [0.0, size],
+            hardware: u32::from(hardware),
+            material,
+        })
+        .collect();
+    let levels: Vec<_> = mips
+        .iter()
+        .map(|m| {
+            m.each_ref()
+                .map(|m| upload(bytemuck::cast_slice(m), "texels"))
+        })
+        .collect();
+    let input = upload(bytemuck::cast_slice(&footprints), "footprints");
+    let materials = upload(bytemuck::cast_slice(&records), "materials");
+    let out = d
+        .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, cases.len() as u64, "means")
+        .unwrap();
+    let root = upload(
+        bytemuck::bytes_of(&Root {
+            footprints: input.gpu().cast(),
+            out: out.gpu(),
+            texture: indices[0].1,
+            sampler: orr_gpu::SamplerIndex(0),
+            count: cases.len() as u32,
+            taps: TAPS,
+            streams: GpuPtr::NULL,
+            modes: 0,
+            pad: 0,
+            materials: materials.gpu().cast(),
+            pad2: 0,
+        }),
+        "texture filter root",
+    );
+    let p = pipeline(&texture_filter::MODULE, "slot_mean");
+    let render = d.queue(QueueKind::Render).unwrap();
+    let mut list = render.command_list().unwrap();
+    for ((texture, desc), levels) in textures.iter().zip(&levels) {
+        list.discard(texture);
+        for (mip, level) in levels.iter().enumerate() {
+            list.copy_to_texture(
+                texture,
+                &TextureRegion::whole_mip(desc, mip as u32),
+                level.gpu(),
+            );
+        }
+    }
+    list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
+    list.dispatch(
+        &p,
+        root.gpu().cast::<Root>(),
+        [cases.len().div_ceil(64) as u32, 1, 1],
+    );
+    list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+    wait(render.submit(vec![list], &[]).unwrap());
+
+    for (case, mean) in cases.iter().zip(out.as_slice().unwrap()) {
+        let (uv, _, _, material, want) = case;
+        for c in 0..4 {
+            assert!(
+                (mean[c] - want[c]).abs() < 6e-3,
+                "material {material} at {uv:?}: channel {c} is {} against {}",
+                mean[c],
+                want[c]
+            );
+        }
+    }
+    for (slot_index, _) in indices {
+        d.free_image_slot_after_submitted(slot_index);
+    }
     assert_clean();
 }
 

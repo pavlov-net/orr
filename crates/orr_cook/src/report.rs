@@ -42,7 +42,7 @@ pub struct AssetReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub assemblies: Vec<AssemblyReport>,
     /// Input the cook accepted but flags, on every cook whether its entries cook or link:
-    /// animated WebP images, of which the first frame cooks.
+    /// animated WebP images, of which the first frame cooks, and glTF primitives it skips.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }

@@ -7,14 +7,14 @@
 
 use std::time::Duration;
 
-use examples::shaders::basics;
-use examples::{Capture, Options, assert_clean, device};
 use orr::orr_gpu::{
     ClearColor, ColorAttachment, ColorLoad, ColorTarget, CompareOp, Cull, DepthAttachment,
     DepthLoad, DepthTarget, Filter, Format, FrontFace, Hazards, MemoryKind, MeshPipelineDesc,
     QueueKind, RasterState, Rendering, SamplerDesc, SamplerIndex, ShaderStage, SpecData, Stages,
     TextureDesc, TextureMemory, TextureRegion, TextureUsage, TimelinePoint, ViewDesc,
 };
+use orr_examples::shaders::basics;
+use orr_examples::{Capture, Options, assert_clean, device};
 use orr_math::camera::rh::{proj, view};
 use orr_math::{Mat4, Vec3};
 

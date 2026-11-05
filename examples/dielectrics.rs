@@ -16,18 +16,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use examples::average::Average;
-use examples::field::{Slab, patch_triangles};
-use examples::mesh::MeshBuilder;
-use examples::shaders::slab;
-use examples::window::Window;
-use examples::{Capture, Options, Workers, assert_clean, device, fixed_time, mount_at};
 use orr::orr_gpu::{
-    AddressMode, Allocation, Device, Filter, Format, MemoryKind, QueueKind, SamplerDesc,
-    SamplerIndex, SpecData, TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
+    AddressMode, Allocation, Device, Filter, Format, MemoryKind, QueueKind, SamplerDesc, SpecData,
+    TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
 };
 use orr::orr_lighting::EnvironmentMapGpu;
-use orr::orr_pack::material::Material;
+use orr::orr_pack::material::{Material, slot};
 use orr::orr_pack::{AssetId, Target};
 use orr::{
     BoundTexture, ClusterTopology, CompilingKernels, DirectionalLight, DiscProfile, Display,
@@ -39,6 +33,12 @@ use orr::{
 use orr_cook::{
     ArchiveSpec, AssetSpec, Manifest, MeshInput, MeshSettings, Source, TextureSettings, Usage,
 };
+use orr_examples::average::Average;
+use orr_examples::field::{Slab, patch_triangles};
+use orr_examples::mesh::MeshBuilder;
+use orr_examples::shaders::slab;
+use orr_examples::window::Window;
+use orr_examples::{Capture, Options, Workers, assert_clean, device, fixed_time, mount_at};
 use orr_math::camera::rh::view;
 use orr_math::{Affine3, DVec3, Vec3};
 
@@ -178,8 +178,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
         .materials()
         .create(&MaterialGpu::new(
             &water,
-            &[BoundTexture::NONE; 12],
-            SamplerIndex(0),
+            &[BoundTexture::NONE; slot::COUNT],
         ))
         .expect("water");
     let mut w = f.scene(scene).expect("scene writer");

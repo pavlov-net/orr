@@ -1,7 +1,9 @@
 //! A glTF document and the bytes of the buffer views a caller reads.
 //!
 //! The JSON is parsed first, and the extensions the cook implements itself are removed from
-//! `extensionsRequired`, so the `gltf` crate validates the rest of the document. Buffers stay
+//! `extensionsRequired`, so the `gltf` crate validates the rest of the document, but for two
+//! things it refuses that glTF allows: an accessor with no element source reads as zeros and
+//! a primitive without positions is left to the importer to skip. Buffers stay
 //! where they are: [`Data::load`] reads the byte ranges of the views a caller needs, and
 //! decodes views compressed with `EXT_meshopt_compression` or `KHR_meshopt_compression` with
 //! meshoptimizer's decoders and filters, so every view reads as if it were stored plain.
@@ -11,6 +13,7 @@
 //! whose `minVersion` is not glTF 2.0 or 2.1, or without one whose `version` has a major other
 //! than 2, is refused, as is a document whose `weights` arrays do not match its morph targets.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +22,7 @@ use gltf::accessor::{DataType, Dimensions};
 use gltf::buffer::Source as BufferSource;
 use meshopt::ffi;
 use orr_pack::Hash32;
+use percent_encoding::percent_decode_str;
 use serde_json::Value;
 
 /// Extensions the cook reads itself, removed from `extensionsRequired` before validation.
@@ -115,14 +119,49 @@ fn check_morph_weights(doc: &gltf::Document) -> Result<(), String> {
     Ok(())
 }
 
+/// Readies the images for the `gltf` crate, which panics on a buffer view's image without a
+/// `mimeType` and on an image with no source. Images are recognized by their bytes, so the
+/// former reads as any other; the latter has nothing to read.
+fn check_images(json: &mut Value) -> Result<(), String> {
+    let Some(Value::Array(images)) = json.get_mut("images") else {
+        return Ok(());
+    };
+    for (i, image) in images.iter_mut().enumerate() {
+        if image["bufferView"].is_null() {
+            if image["uri"].is_null() {
+                return Err(format!("image {i} has neither a uri nor a buffer view"));
+            }
+        } else if image["mimeType"].is_null() {
+            image["mimeType"] = "application/octet-stream".into();
+        }
+    }
+    Ok(())
+}
+
+/// Validates as `gltf::Document::from_json` does, less what the module documentation lists.
+fn validate(root: &gltf::json::Root) -> Result<(), String> {
+    use gltf::json::validation::{Error, Validate};
+    let mut errors = Vec::new();
+    root.validate(root, gltf::json::Path::new, &mut |path, error| {
+        let path = path();
+        let at = path.as_str();
+        let no_positions = at.ends_with(r#".attributes["POSITION"]"#);
+        let no_source = at.starts_with("accessors[") && at.ends_with(".bufferView");
+        if error != Error::Missing || !(no_positions || no_source) {
+            errors.push(format!("{path}: {error}"));
+        }
+    });
+    match errors.is_empty() {
+        true => Ok(()),
+        false => Err(errors.join("; ")),
+    }
+}
+
 /// Opens a `.gltf` or `.glb` file's bytes; buffer URIs resolve against `dir`.
 pub(super) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
     let (json_bytes, mut bin) = if bytes.starts_with(b"glTF") {
         let glb = gltf::Glb::from_slice(bytes).map_err(|e| e.to_string())?;
-        (
-            glb.json.into_owned(),
-            glb.bin.map(std::borrow::Cow::into_owned),
-        )
+        (glb.json.into_owned(), glb.bin.map(Cow::into_owned))
     } else {
         (bytes.to_vec(), None)
     };
@@ -138,8 +177,10 @@ pub(super) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
             }
         }
     }
+    check_images(&mut json)?;
     let root: gltf::json::Root = serde_json::from_value(json.clone()).map_err(|e| e.to_string())?;
-    let doc = gltf::Document::from_json(root).map_err(|e| e.to_string())?;
+    validate(&root)?;
+    let doc = gltf::Document::from_json_without_validation(root);
     check_morph_weights(&doc)?;
     let mut buffers = Vec::new();
     for b in doc.buffers() {
@@ -157,7 +198,7 @@ pub(super) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
             BufferSource::Uri(uri) => match data_uri(uri) {
                 Some(data) => data.map_err(|e| format!("buffer {}: {e}", b.index()))?,
                 None => {
-                    buffers.push(Buffer::File(dir.join(uri)));
+                    buffers.push(Buffer::File(uri_path(dir, uri)));
                     continue;
                 }
             },
@@ -178,14 +219,39 @@ pub(super) fn open(bytes: &[u8], dir: &Path) -> Result<Document, String> {
     Ok(d)
 }
 
-/// The bytes of a base64 data URI; `None` for any other URI.
+/// `uri` without the stray whitespace and control characters glTF recommends removing.
+fn clean_uri(uri: &str) -> Cow<'_, str> {
+    let stray = ['\t', '\n', '\r'];
+    let uri = uri.trim_matches(|c| c <= ' ');
+    match uri.contains(stray) {
+        true => uri.replace(stray, "").into(),
+        false => uri.into(),
+    }
+}
+
+/// The file that relative path `uri` names under `dir`.
+pub(super) fn uri_path(dir: &Path, uri: &str) -> PathBuf {
+    let path = clean_uri(uri).replace('\\', "/");
+    dir.join(&*percent_decode_str(&path).decode_utf8_lossy())
+}
+
+/// The bytes of a data URL, base64 or percent-encoded; `None` for any other URI.
 pub(super) fn data_uri(uri: &str) -> Option<Result<Vec<u8>, String>> {
-    let data = uri.strip_prefix("data:")?;
-    Some(match data.split_once(";base64,") {
-        Some((_, b64)) => base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .map_err(|e| e.to_string()),
-        None => Err("data URI is not base64".into()),
+    let uri = clean_uri(uri);
+    let (scheme, data) = uri.split_at_checked("data:".len())?;
+    if !scheme.eq_ignore_ascii_case("data:") {
+        return None;
+    }
+    let Some((header, payload)) = data.split_once(',') else {
+        return Some(Err("data URL has no comma before its data".into()));
+    };
+    let bytes = Cow::<[u8]>::from(percent_decode_str(payload));
+    Some(if header.to_ascii_lowercase().ends_with(";base64") {
+        base64::engine::general_purpose::STANDARD
+            .decode(bytes)
+            .map_err(|e| e.to_string())
+    } else {
+        Ok(bytes.into_owned())
     })
 }
 
@@ -351,19 +417,30 @@ impl<'d> Data<'d> {
                 read(&base[i * stride..], row);
             }
         }
-        if let Some(s) = a.sparse() {
-            let indices = self.sparse_indices(&s, a.count())?;
-            let values = s.values();
-            let (data, stride) = self.view_elements(&values.view(), a.size())?;
-            let base = data
-                .get(values.offset()..)
-                .filter(|b| b.len() >= stride * s.count().saturating_sub(1) + a.size())
-                .ok_or_else(|| format!("accessor {}: sparse values outside", a.index()))?;
-            for (k, &i) in indices.iter().enumerate() {
-                read(&base[k * stride..], &mut out[i * n..(i + 1) * n]);
-            }
-        }
+        self.sparse_elements(a, |i, b| read(b, &mut out[i * n..(i + 1) * n]))?;
         Ok(out)
+    }
+
+    /// Calls `replace` with the index and bytes of each sparse element of `a`.
+    fn sparse_elements(
+        &self,
+        a: &gltf::Accessor<'_>,
+        mut replace: impl FnMut(usize, &[u8]),
+    ) -> Result<(), String> {
+        let Some(s) = a.sparse() else {
+            return Ok(());
+        };
+        let indices = self.sparse_indices(&s, a.count())?;
+        let values = s.values();
+        let (data, stride) = self.view_elements(&values.view(), a.size())?;
+        let base = data
+            .get(values.offset()..)
+            .filter(|b| b.len() >= stride * s.count().saturating_sub(1) + a.size())
+            .ok_or_else(|| format!("accessor {}: sparse values outside", a.index()))?;
+        for (k, &i) in indices.iter().enumerate() {
+            replace(i, &base[k * stride..]);
+        }
+        Ok(())
     }
 
     /// An index or other unsigned integer scalar accessor.
@@ -376,24 +453,21 @@ impl<'d> Data<'d> {
                 a.index()
             ));
         }
-        if a.sparse().is_some() {
-            return Ok(self.floats(a, 1)?.into_iter().map(|v| v as u32).collect());
-        }
-        let Some(v) = a.view() else {
-            return Ok(vec![0; a.count()]);
+        let read = |b: &[u8]| match a.data_type() {
+            DataType::U8 => u32::from(b[0]),
+            DataType::U16 => u32::from(u16::from_le_bytes([b[0], b[1]])),
+            _ => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
         };
-        let (data, stride) = self.view_elements(&v, a.size())?;
-        let base = &data[a.offset()..];
-        Ok((0..a.count())
-            .map(|i| {
-                let b = &base[i * stride..];
-                match a.data_type() {
-                    DataType::U8 => u32::from(b[0]),
-                    DataType::U16 => u32::from(u16::from_le_bytes([b[0], b[1]])),
-                    _ => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-                }
-            })
-            .collect())
+        let mut out = match a.view() {
+            Some(v) => {
+                let (data, stride) = self.view_elements(&v, a.size())?;
+                let base = &data[a.offset()..];
+                (0..a.count()).map(|i| read(&base[i * stride..])).collect()
+            }
+            None => vec![0; a.count()],
+        };
+        self.sparse_elements(a, |i, b| out[i] = read(b))?;
+        Ok(out)
     }
 
     fn view_elements(
@@ -517,6 +591,20 @@ fn decode_view(e: &Value, src: &[u8], length: usize) -> Result<Vec<u8>, String> 
 
 #[cfg(test)]
 mod tests {
+    /// L1738 allows uint32 indices, and 2^24 + 1 has no f32.
+    #[test]
+    fn sparse_u32_indices_stay_exact() {
+        let json = r#"{"asset":{"version":"2.0"},
+"buffers":[{"byteLength":8,"uri":"data:,%01%00%00%00%01%00%00%01"}],
+"bufferViews":[{"buffer":0,"byteLength":4},{"buffer":0,"byteOffset":4,"byteLength":4}],
+"accessors":[{"componentType":5125,"count":2,"type":"SCALAR","sparse":{"count":1,
+"indices":{"bufferView":0,"componentType":5125},"values":{"bufferView":1}}}]}"#;
+        let doc = super::open(json.as_bytes(), std::path::Path::new("")).unwrap();
+        let data = super::Data::load(&doc, [0, 1], "g").unwrap();
+        let accessor = doc.doc.accessors().next().unwrap();
+        assert_eq!(data.indices(&accessor).unwrap(), [0, (1 << 24) + 1]);
+    }
+
     #[test]
     fn min_version_other_than_2_0_or_2_1_is_refused() {
         let opens = |min: &str| {

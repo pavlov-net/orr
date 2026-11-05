@@ -100,6 +100,13 @@ impl Glb {
         self.accessors.len() - 1
     }
 
+    /// An accessor written out in full, for those with no plain buffer view.
+    #[allow(dead_code)]
+    pub(crate) fn accessor_json(&mut self, json: String) -> usize {
+        self.accessors.push(json);
+        self.accessors.len() - 1
+    }
+
     /// Plain f32 rows; positions get their min and max.
     pub(crate) fn floats<const N: usize>(&mut self, rows: &[[f32; N]], ty: &str) -> usize {
         let view = self.view(bytemuck::cast_slice(rows), None);
@@ -134,6 +141,15 @@ impl Glb {
         let json = self.json(rest, &format!(r#","uri":"{uri}""#));
         std::fs::write(&bin, &self.bin).unwrap();
         std::fs::write(path, json).unwrap();
+    }
+
+    /// Writes a `.gltf` at `path` whose buffer has `uri`, and returns the buffer's bytes for
+    /// the caller to place; `rest` is as for [`Self::write`].
+    #[allow(dead_code)]
+    pub(crate) fn write_uri(self, path: &Path, rest: &str, uri: &str) -> Vec<u8> {
+        let json = self.json(rest, &format!(r#","uri":{uri:?}"#));
+        std::fs::write(path, json).unwrap();
+        self.bin
     }
 
     fn json(&self, rest: &str, uri: &str) -> String {

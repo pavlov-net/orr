@@ -2,6 +2,8 @@
 
 #[path = "common/float_ktx2.rs"]
 mod float_ktx2;
+#[path = "common/texels.rs"]
+mod texels;
 
 use std::f32::consts::{PI, TAU};
 use std::path::{Path, PathBuf};
@@ -16,8 +18,9 @@ use orr_cook::{
 use orr_math::Vec3;
 use orr_pack::material::{Material, slot};
 use orr_pack::model::ModelInfo;
-use orr_pack::texture::{FormatInfo, TILE_BYTES, TextureInfo, octahedral, tile_grid, vk};
+use orr_pack::texture::{FormatInfo, TextureInfo, octahedral, vk};
 use orr_pack::{Archive, AssetId, BcLayout, Class, Codec, Filter, Target};
+use texels::{decode, mips, read_blob, write_glb};
 
 fn dir(name: &str) -> PathBuf {
     let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -59,13 +62,6 @@ fn texture(path: &Path, name: &str, settings: TextureSettings) -> AssetSpec {
     }
 }
 
-fn read_blob(a: &Archive, e: &orr_pack::Entry, i: usize) -> Vec<u8> {
-    let b = &a.blobs(e)[i];
-    let mut out = vec![0; b.raw_len as usize];
-    a.read(b, &mut out).unwrap();
-    out
-}
-
 /// Cooks the GLB at `path` as asset `g`; the archive and its first material.
 fn cook_glb_at(path: &Path, settings: GltfSettings, quality: Quality) -> (Archive, Material) {
     let a = cook_at(
@@ -85,107 +81,6 @@ fn cook_glb_at(path: &Path, settings: GltfSettings, quality: Quality) -> (Archiv
 
 fn cook_glb(path: &Path, settings: GltfSettings) -> (Archive, Material) {
     cook_glb_at(path, settings, CookOptions::default().quality)
-}
-
-/// Header and every mip of every layer, tight, from the archive.
-fn mips(a: &Archive, name: &str) -> (TextureInfo, Vec<Vec<Vec<u8>>>) {
-    let e = *a
-        .expect(
-            AssetId::from_name(name),
-            Class::Texture as u16,
-            orr_pack::texture::SCHEMA,
-        )
-        .unwrap();
-    a.verify(&e).unwrap();
-    let info = TextureInfo::parse(&read_blob(a, &e, 0)).unwrap();
-    let h = info.header;
-    assert_eq!(a.blobs(&e).len(), h.blob_count());
-    for (i, len) in info.blob_lens().into_iter().enumerate() {
-        let b = &a.blobs(&e)[i + 1];
-        assert_eq!(b.raw_len as usize, len);
-        let tail = i == h.blob_count() - 2 && h.tail_first_mip < h.mip_count;
-        if tail {
-            assert!(b.is_mount(), "the mip tail is resident from mount");
-        } else {
-            // One 64 KiB tile per chunk.
-            assert!(!b.is_mount());
-            let [gx, gy] = tile_grid(&h, i as u32);
-            assert_eq!(u32::from(b.chunk_count), gx * gy * u32::from(h.layers));
-            assert_eq!(b.chunk_raw_len() as usize, TILE_BYTES);
-        }
-    }
-    let levels = (0..u32::from(h.layers))
-        .map(|l| {
-            (0..u32::from(h.mip_count))
-                .map(|m| {
-                    let blob = read_blob(a, &e, h.mip_blob(m));
-                    info.mip_texels(&blob, m, l).unwrap()
-                })
-                .collect()
-        })
-        .collect();
-    (info, levels)
-}
-
-fn decode(vk_format: u32, w: u32, h: u32, data: &[u8]) -> Vec<[f32; 4]> {
-    let snorm = |v: u8| (f32::from(v.cast_signed()) / 127.0).max(-1.0);
-    let f = FormatInfo::of(vk_format).unwrap();
-    let bw = w.div_ceil(4) as usize;
-    let mut out = vec![[0.0; 4]; (w * h) as usize];
-    for (bi, block) in data.chunks_exact(f.bytes as usize).enumerate() {
-        let mut t = [[0.0f32; 4]; 16];
-        let mut b8 = [0u8; 64];
-        match vk_format {
-            vk::BC7_SRGB | vk::BC7_UNORM => {
-                bcdec_rs::bc7(block, &mut b8, 16);
-                for i in 0..16 {
-                    t[i] = std::array::from_fn(|c| f32::from(b8[i * 4 + c]) / 255.0);
-                }
-            }
-            vk::BC4_UNORM => {
-                bcdec_rs::bc4(block, &mut b8[..16], 4, false);
-                for i in 0..16 {
-                    t[i][0] = f32::from(b8[i]) / 255.0;
-                }
-            }
-            vk::BC5_UNORM => {
-                bcdec_rs::bc5(block, &mut b8[..32], 8, false);
-                for i in 0..16 {
-                    t[i][0] = f32::from(b8[i * 2]) / 255.0;
-                    t[i][1] = f32::from(b8[i * 2 + 1]) / 255.0;
-                }
-            }
-            vk::BC4_SNORM => {
-                bcdec_rs::bc4(block, &mut b8[..16], 4, true);
-                for i in 0..16 {
-                    t[i][0] = snorm(b8[i]);
-                }
-            }
-            vk::BC5_SNORM => {
-                bcdec_rs::bc5(block, &mut b8[..32], 8, true);
-                for i in 0..16 {
-                    t[i][0] = snorm(b8[i * 2]);
-                    t[i][1] = snorm(b8[i * 2 + 1]);
-                }
-            }
-            vk::BC6H_UFLOAT => {
-                let mut f = [0.0f32; 48];
-                bcdec_rs::bc6h_float(block, &mut f, 12, false);
-                for i in 0..16 {
-                    t[i] = [f[i * 3], f[i * 3 + 1], f[i * 3 + 2], 1.0];
-                }
-            }
-            _ => panic!("format {vk_format}"),
-        }
-        let (bx, by) = (bi % bw, bi / bw);
-        for (i, p) in t.iter().enumerate() {
-            let (x, y) = (bx * 4 + i % 4, by * 4 + i / 4);
-            if x < w as usize && y < h as usize {
-                out[y * w as usize + x] = *p;
-            }
-        }
-    }
-    out
 }
 
 fn psnr(a: &[f32], b: &[f32]) -> f64 {
@@ -686,81 +581,6 @@ fn environment_lights_keep_energy_and_direction() {
             l.angular_radius
         );
     }
-}
-
-/// A GLB holding a quad, the given materials and PNG images.
-fn write_glb(path: &Path, materials: &[String], images: &[Vec<u8>]) {
-    let mut bin: Vec<u8> = Vec::new();
-    let mut views = Vec::new();
-    let mut view = |bin: &mut Vec<u8>, bytes: &[u8]| {
-        views.push(format!(
-            r#"{{"buffer":0,"byteOffset":{},"byteLength":{}}}"#,
-            bin.len(),
-            bytes.len()
-        ));
-        bin.extend_from_slice(bytes);
-        bin.resize(bin.len().next_multiple_of(4), 0);
-        views.len() - 1
-    };
-    let pos: [[f32; 3]; 4] = [
-        [0.0, 0.0, 0.0],
-        [1.0, 0.0, 0.0],
-        [1.0, 1.0, 0.0],
-        [0.0, 1.0, 0.0],
-    ];
-    let nrm = [[0.0f32, 0.0, 1.0]; 4];
-    let uv: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
-    let idx: [u32; 6] = [0, 1, 2, 0, 2, 3];
-    let vp = view(&mut bin, bytemuck::cast_slice(&pos));
-    let vn = view(&mut bin, bytemuck::cast_slice(&nrm));
-    let vu = view(&mut bin, bytemuck::cast_slice(&uv));
-    let vi = view(&mut bin, bytemuck::cast_slice(&idx));
-    let image_views: Vec<usize> = images.iter().map(|i| view(&mut bin, i)).collect();
-    let accessors = format!(
-        r#"[{{"bufferView":{vp},"componentType":5126,"count":4,"type":"VEC3","min":[0,0,0],"max":[1,1,0]}},
-            {{"bufferView":{vn},"componentType":5126,"count":4,"type":"VEC3"}},
-            {{"bufferView":{vu},"componentType":5126,"count":4,"type":"VEC2"}},
-            {{"bufferView":{vi},"componentType":5125,"count":6,"type":"SCALAR"}}]"#
-    );
-    let prims: Vec<String> = (0..materials.len())
-        .map(|m| {
-            format!(
-                r#"{{"attributes":{{"POSITION":0,"NORMAL":1,"TEXCOORD_0":2}},"indices":3,"material":{m}}}"#
-            )
-        })
-        .collect();
-    let json = format!(
-        r#"{{"asset":{{"version":"2.0"}},"scene":0,"scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
-            "meshes":[{{"primitives":[{}]}}],"materials":[{}],
-            "textures":[{}],"images":[{}],"samplers":[{{}}],
-            "accessors":{accessors},"bufferViews":[{}],"buffers":[{{"byteLength":{}}}]}}"#,
-        prims.join(","),
-        materials.join(","),
-        (0..images.len())
-            .map(|i| format!(r#"{{"source":{i},"sampler":0}}"#))
-            .collect::<Vec<_>>()
-            .join(","),
-        image_views
-            .iter()
-            .map(|v| format!(r#"{{"bufferView":{v},"mimeType":"image/png"}}"#))
-            .collect::<Vec<_>>()
-            .join(","),
-        views.join(","),
-        bin.len()
-    );
-    let mut json = json.into_bytes();
-    json.resize(json.len().next_multiple_of(4), b' ');
-    let mut glb = Vec::new();
-    glb.extend_from_slice(b"glTF");
-    glb.extend_from_slice(&2u32.to_le_bytes());
-    glb.extend_from_slice(&((12 + 8 + json.len() + 8 + bin.len()) as u32).to_le_bytes());
-    glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
-    glb.extend_from_slice(b"JSON");
-    glb.extend_from_slice(&json);
-    glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
-    glb.extend_from_slice(b"BIN\0");
-    glb.extend_from_slice(&bin);
-    std::fs::write(path, glb).unwrap();
 }
 
 fn png(w: u32, h: u32, f: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
@@ -1453,6 +1273,73 @@ fn weight_texels_clamp_before_their_factor() {
     assert!((texels[0][0] - 0.5).abs() < 0.01, "{:?}", texels[0]);
 }
 
+/// No format says how float texels hold normals, so their vectors decide, on both paths: unit
+/// vectors read as they are, and 0..1 values, stray texel or not, at `2v - 1`.
+#[test]
+fn float_normals_read_the_way_that_gives_unit_vectors() {
+    let d = dir("float-normals");
+    let n = 32u32;
+    let (x, z) = (0.6f32, 0.8f32);
+    let tilted = |px: u32| if px < n / 2 { x } else { -x };
+    let packed = |v: f32| 0.5 * v + 0.5;
+    let raw = ctt::TargetFormat::Uncompressed;
+    let rgb = || raw(ctt::Format::R32G32B32A32_SFLOAT);
+    let rg = || raw(ctt::Format::R16G16_SFLOAT);
+    // One firefly, and one ringing texel inside the circle only as stored.
+    let stray = |px: u32, py: u32, v: f32, s: f32| if (px, py) == (3, 3) { s } else { v };
+    let files = [
+        float_ktx2(n, n, rgb(), false, |px, _| [tilted(px), 0.0, z, 1.0]),
+        float_ktx2(n, n, rg(), false, |px, _| [tilted(px), 0.0, 0.0, 1.0]),
+        float_ktx2(n, n, rgb(), false, |px, py| {
+            [stray(px, py, packed(tilted(px)), -6e4), 0.5, packed(z), 1.0]
+        }),
+        float_ktx2(n, n, rg(), false, |px, py| {
+            [stray(px, py, packed(tilted(px)), -0.05), 0.5, 0.0, 1.0]
+        }),
+    ];
+    let check = |a: &Archive, name: &str, file: usize| {
+        let (_, levels) = mips(a, name);
+        let texels = decode(vk::BC5_UNORM, n, n, &levels[0][0]);
+        for (px, want) in [(8usize, x), (24, -x)] {
+            let got = 2.0 * texels[24 * n as usize + px][0] - 1.0;
+            assert!((got - want).abs() < 0.03, "file {file}: {got}, not {want}");
+        }
+    };
+    // Toksvig roughness reads the same vectors from either storage.
+    let mut roughness = Vec::new();
+    for (i, bytes) in files.iter().enumerate() {
+        let path = d.join(format!("{i}.ktx2"));
+        std::fs::write(&path, bytes).unwrap();
+        let settings = TextureSettings {
+            usage: Usage::Normal,
+            ..TextureSettings::default()
+        };
+        check(&cook(vec![texture(&path, "n", settings)]), "n", i);
+
+        let glb = d.join(format!("{i}.glb"));
+        let material =
+            r#"{"normalTexture":{"index":0},"pbrMetallicRoughness":{"roughnessFactor":0.25}}"#;
+        write_glb(&glb, &[material.into()], std::slice::from_ref(bytes));
+        let (a, m) = cook_glb_at(&glb, GltfSettings::default(), Quality::Slow);
+        check(
+            &a,
+            a.name(a.find(m.textures[slot::NORMAL].texture).unwrap()),
+            i,
+        );
+        let (info, levels) = mips(
+            &a,
+            a.name(a.find(m.textures[slot::ROUGHNESS].texture).unwrap()),
+        );
+        let last = u32::from(info.header.mip_count) - 1;
+        roughness.push(decode(vk::BC4_UNORM, 1, 1, &levels[0][last as usize])[0][0]);
+    }
+    assert!(roughness[0] > 0.3, "{roughness:?}");
+    assert!(
+        roughness.iter().all(|r| (r - roughness[0]).abs() < 0.02),
+        "{roughness:?}"
+    );
+}
+
 fn bcn_material_checks(a: &Archive, remade: bool, blocks: [&Vec<Vec<u8>>; 5]) {
     let [
         color_blocks,
@@ -1549,9 +1436,7 @@ fn gltf_materials_cook_their_canonical_channel_set() {
             let e = |v: f32| ((v / l * 0.5 + 0.5) * 255.0).round() as u8;
             [e(-sx), e(-sy), e(1.0), 255]
         }),
-        // 3: constant occlusion of 1: dropped.
-        png(16, 16, |_, _| [255, 255, 255, 255]),
-        // 4: constant emissive, folded into the factor.
+        // 3: constant emissive, folded into the factor.
         png(8, 8, |_, _| [255, 128, 0, 255]),
     ];
     let mat = |name: &str, metal: f32| {
@@ -1559,8 +1444,8 @@ fn gltf_materials_cook_their_canonical_channel_set() {
             r#"{{"name":"{name}","alphaMode":"MASK","alphaCutoff":0.4,
                "pbrMetallicRoughness":{{"baseColorTexture":{{"index":0}},"metallicFactor":{metal},
                  "roughnessFactor":0.8,"metallicRoughnessTexture":{{"index":1}}}},
-               "normalTexture":{{"index":2,"scale":0.5}},"occlusionTexture":{{"index":3}},
-               "emissiveTexture":{{"index":4}},"emissiveFactor":[2,2,2]}}"#
+               "normalTexture":{{"index":2,"scale":0.5}},
+               "emissiveTexture":{{"index":3}},"emissiveFactor":[2,2,2]}}"#
         )
     };
     let path = d.join("quad.glb");
@@ -1589,7 +1474,6 @@ fn gltf_materials_cook_their_canonical_channel_set() {
         assert_ne!(t(slot::NORMAL), AssetId::NONE);
         assert_ne!(t(slot::ROUGHNESS), AssetId::NONE);
         assert_eq!(t(slot::METALNESS), AssetId::NONE);
-        assert_eq!(t(slot::OCCLUSION), AssetId::NONE);
         assert_eq!(t(slot::EMISSION), AssetId::NONE);
         assert!(
             (m.metalness - metal * 0.2).abs() < 1e-6,
@@ -1606,7 +1490,7 @@ fn gltf_materials_cook_their_canonical_channel_set() {
         assert_eq!(m.emission_color[0], 2.0);
         assert_eq!(m.emission_color[2], 0.0);
     }
-    for s in 0..12 {
+    for s in 0..slot::COUNT {
         assert_eq!(m0.textures[s], m1.textures[s], "slot {s} is shared");
     }
     let format = |s: usize| {
@@ -1631,7 +1515,7 @@ fn gltf_materials_cook_their_canonical_channel_set() {
     assert!(mean(&mip4) > mean(&mip0) + 0.02);
 
     // Resident bytes of the packed set against one texture per image (BC7 for color and
-    // packed data, BC5 for normals, BC4 for occlusion).
+    // packed data, BC5 for normals).
     let packed: u64 = a
         .entries()
         .iter()
@@ -1644,7 +1528,6 @@ fn gltf_materials_cook_their_canonical_channel_set() {
     let per_image = chain_bytes(vk::BC7_SRGB, n, n)
         + chain_bytes(vk::BC7_UNORM, n, n)
         + chain_bytes(vk::BC5_UNORM, n, n)
-        + chain_bytes(vk::BC4_UNORM, 16, 16)
         + chain_bytes(vk::BC7_SRGB, 8, 8);
     println!("texture bytes: packed {packed}, one texture per image {per_image}");
 }

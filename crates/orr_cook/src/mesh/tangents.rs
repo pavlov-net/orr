@@ -1,13 +1,16 @@
-//! Whether a mesh's stored tangents can be dropped for tangents orr_scene derives per
-//! triangle from positions and uvs (`triangle_geometry` without `MESH_TANGENT`).
+//! Tangents: meshoptimizer's MikkTSpace-compatible ones for a surface that states none, and
+//! whether a mesh's tangents can be dropped for tangents orr_scene derives per triangle from
+//! positions and uvs (`triangle_geometry` without `MESH_TANGENT`).
 //!
 //! Over every texel center of each normal map that a triangle covers, the check builds the
 //! shading normal `material_normal` gives from the stored tangent and from the derived one,
 //! and takes the 99th percentile of the angle between them.
 
+use meshopt::TangentOptions;
 use orr_math::{DVec2, Vec3};
 use orr_pack::texture::normal;
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 
 use super::maps::Raster;
 use super::{MeshData, NormalSpec, SectionMaps};
@@ -18,6 +21,90 @@ const BINS: usize = (180.0 / BIN) as usize + 1;
 
 /// Triangles per parallel job.
 const CHUNK: usize = 1024;
+
+/// The tangent of a vertex nothing reads, and of one only degenerate triangles touch: xyz and
+/// bitangent sign.
+pub(crate) const UNREAD: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+
+/// MikkTSpace-compatible tangents, xyz and bitangent sign: one per index, or per vertex without
+/// `indices`. Triangles wind counter-clockwise seen from the side of `normals`, which are unit,
+/// and `uvs` are the cook's, with v running down the image.
+pub(crate) fn generate(
+    indices: Option<&[u32]>,
+    positions: &[[f32; 3]],
+    normals: &[[f32; 3]],
+    uvs: &[[f32; 2]],
+) -> Vec<[f32; 4]> {
+    let _z = crate::profile::zone!("mesh.tangents");
+    let mut tangents =
+        meshopt::generate_tangents(indices, positions, normals, uvs, TangentOptions::Compatible);
+    // MikkTSpace's v runs up the image, and flipping v negates the sign alone.
+    tangents.iter_mut().for_each(|t| t[3] = -t[3]);
+    tangents
+}
+
+/// [`generate`] per entry of `indices` for a surface without normals, from flat ones.
+pub(crate) fn generate_flat(
+    indices: &[u32],
+    positions: &[[f32; 3]],
+    uvs: &[[f32; 2]],
+) -> Vec<[f32; 4]> {
+    let at: Vec<[f32; 3]> = indices.iter().map(|&i| positions[i as usize]).collect();
+    let uv: Vec<[f32; 2]> = indices.iter().map(|&i| uvs[i as usize]).collect();
+    let faces = at.as_chunks::<3>().0.iter();
+    let flat: Vec<[f32; 3]> = faces
+        .flat_map(|t| [face_normal(t.map(Vec3::from)).to_array(); 3])
+        .collect();
+    generate(None, &at, &flat, &uv)
+}
+
+/// The unit normal of triangle `p`, counter-clockwise; zero where it has no area.
+pub(crate) fn face_normal(p: [Vec3; 3]) -> Vec3 {
+    (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero()
+}
+
+/// `v` with the elements `copies` names appended, unless it is empty.
+pub(crate) fn with_copies<T: Copy>(mut v: Vec<T>, copies: &[u32]) -> Vec<T> {
+    if !v.is_empty() {
+        for &i in copies {
+            v.push(v[i as usize]);
+        }
+    }
+    v
+}
+
+/// One tangent per vertex from one per entry of `indices`, for `count` vertices. Corners of one
+/// vertex can differ, where uvs fold: those corners move to new vertices past `count`. Returns
+/// the tangents and, per new vertex, the vertex it copies.
+pub(crate) fn per_vertex(
+    count: usize,
+    indices: &mut [u32],
+    corners: &[[f32; 4]],
+) -> (Vec<[f32; 4]>, Vec<u32>) {
+    let mut tangents = vec![None; count];
+    let mut copies = Vec::new();
+    let mut copied: FxHashMap<(u32, [u32; 4]), u32> = FxHashMap::default();
+    for (i, &t) in indices.iter_mut().zip(corners) {
+        match &mut tangents[*i as usize] {
+            slot @ None => *slot = Some(t),
+            Some(first) if *first == t => {}
+            Some(_) => {
+                let source = *i;
+                // Adding zero turns -0.0 into 0.0, which `==` counts as equal.
+                let key = t.map(|x| (x + 0.0).to_bits());
+                *i = *copied.entry((source, key)).or_insert_with(|| {
+                    copies.push(source);
+                    (count + copies.len() - 1) as u32
+                });
+                if *i as usize == tangents.len() {
+                    tangents.push(Some(t));
+                }
+            }
+        }
+    }
+    let tangents = tangents.into_iter().map(|t| t.unwrap_or(UNREAD)).collect();
+    (tangents, copies)
+}
 
 /// The outcome of [`check`].
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -52,9 +139,14 @@ pub(super) fn check(
     let mut hist = vec![0.0f64; BINS];
     let mut texels = 0u64;
     for (sec, sm) in m.sections.iter().zip(maps) {
-        let (map, set) = match (&sec.maps.normal, &sm.normal) {
+        let (map, set, frame) = match (&sec.maps.normal, &sm.normal) {
             (NormalSpec::None, _) => continue,
-            (NormalSpec::Texture { uv_set, .. }, Some(map)) => (map, *uv_set),
+            (
+                &NormalSpec::Texture {
+                    uv_set, frame_set, ..
+                },
+                Some(map),
+            ) if frame_set < m.uvs.len() => (map, uv_set, frame_set),
             _ => return TangentCheck::KEPT,
         };
         let (h, n) = m.indices[sec.indices.clone()]
@@ -63,7 +155,7 @@ pub(super) fn check(
                 let mut h = vec![0.0f64; BINS];
                 let mut n = 0u64;
                 for t in chunk.as_chunks::<3>().0 {
-                    let tri = Triangle::new(m, set, tangents, t.map(|i| i as usize));
+                    let tri = Triangle::new(m, [set, frame], tangents, t.map(|i| i as usize));
                     texel_centers(&map[0], tri.uv, |w, weight| {
                         let deg = tri.angle(map, w);
                         h[((deg / BIN) as usize).min(BINS - 1)] += weight;
@@ -117,26 +209,29 @@ struct Triangle {
 }
 
 impl Triangle {
-    /// The triangle with corners `v`, its derived tangent from uv set `set`.
-    fn new(m: &MeshData, set: usize, tangents: &[[f32; 4]], v: [usize; 3]) -> Self {
+    /// The triangle with corners `v`, its map read on uv set `read` and its derived tangent
+    /// from uv set `frame`.
+    fn new(m: &MeshData, [read, frame]: [usize; 2], tangents: &[[f32; 4]], v: [usize; 3]) -> Self {
         let p = v.map(|i| Vec3::from(m.positions[i]));
-        let uv = v.map(|i| m.uvs[set][i]);
+        let uv = v.map(|i| m.uvs[read][i]);
+        let f = v.map(|i| m.uvs[frame][i]);
         let (e1, e2) = (p[1] - p[0], p[2] - p[0]);
-        let uv1 = [uv[1][0] - uv[0][0], uv[1][1] - uv[0][1]];
-        let uv2 = [uv[2][0] - uv[0][0], uv[2][1] - uv[0][1]];
+        let uv1 = [f[1][0] - f[0][0], f[1][1] - f[0][1]];
+        let uv2 = [f[2][0] - f[0][0], f[2][1] - f[0][1]];
         let r = uv1[0] * uv2[1] - uv2[0] * uv1[1];
         let (tangent, bitangent) = if r != 0.0 {
             (
                 (e1 * uv2[1] - e2 * uv1[1]) / r,
-                (e2 * uv1[0] - e1 * uv2[0]) / r,
+                // Uv v runs down the image and a normal map's y up it.
+                (e1 * uv2[0] - e2 * uv1[0]) / r,
             )
         } else {
             (Vec3::ZERO, Vec3::ZERO)
         };
         Self {
             uv,
-            normals: v.map(|i| Vec3::from(m.normals[i])),
-            tangents: v.map(|i| Vec3::from_slice(&tangents[i][..3])),
+            normals: v.map(|i| Vec3::from(m.normals[i]).normalize_or(Vec3::Z)),
+            tangents: v.map(|i| Vec3::from_slice(&tangents[i][..3]).normalize_or(Vec3::X)),
             sign: tangents[v[0]][3],
             geometric: e1.cross(e2).normalize_or(Vec3::Z),
             tangent,
@@ -150,9 +245,12 @@ impl Triangle {
         let uv = [0, 1].map(|a| w.x * self.uv[0][a] + w.y * self.uv[1][a] + w.z * self.uv[2][a]);
         let v = normal::decode([map[0].sample(uv), map[1].sample(uv)]);
         let v = Vec3::from(map[0].normal_frame(v));
-        let n = at(self.normals).normalize_or(self.geometric);
+        let frame = at(self.normals);
+        let n = frame.normalize_or(self.geometric);
 
-        let stored = shading_normal(n, at(self.tangents).normalize_or(Vec3::X), self.sign, v);
+        let tangent = at(self.tangents);
+        let bitangent = frame.cross(tangent) * self.sign;
+        let stored = (tangent * v.x + bitangent * v.y + frame * v.z).normalize_or(n);
 
         let (mut t, mut b) = (self.tangent, self.bitangent);
         if t.dot(t) == 0.0 {
@@ -160,17 +258,10 @@ impl Triangle {
         }
         let t = (t - n * n.dot(t)).normalize_or(Vec3::X);
         let sign = if n.cross(t).dot(b) < 0.0 { -1.0 } else { 1.0 };
-        let derived = shading_normal(n, t, sign, v);
+        let derived = (t * v.x + n.cross(t) * sign * v.y + n * v.z).normalize_or(n);
 
         stored.dot(derived).clamp(-1.0, 1.0).acos().to_degrees()
     }
-}
-
-/// `material_normal`: tangent-space normal `v` in the frame of `n` and tangent `t`.
-fn shading_normal(n: Vec3, t: Vec3, sign: f32, v: Vec3) -> Vec3 {
-    let t = (t - n * n.dot(t)).normalize_or(Vec3::X);
-    let b = n.cross(t) * sign;
-    (t * v.x + b * v.y + n * v.z).normalize_or(n)
 }
 
 /// `orr_shaders.math`'s `orthonormal_basis`: a tangent and bitangent of unit `n`.

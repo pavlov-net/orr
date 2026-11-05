@@ -1424,10 +1424,11 @@ fn texture_displacement_moves_patches_along_the_normal_by_the_materials_texture(
     m.base_color = [0.5; 3];
     m.base_weight = 1.0;
     m.flags = material_flags::DOUBLE_SIDED | material_flags::DISPLACED;
-    m.textures = [TextureIndex::NONE; 12];
+    m.textures = [TextureIndex::NONE; orr_pack::material::slot::COUNT];
     m.textures[orr_pack::material::slot::DISPLACEMENT] =
         d.write_sampled(slot, &texture, &orr_gpu::ViewDesc::default());
-    m.sampler = d.sampler(&SamplerDesc::default()).unwrap();
+    m.samplers[orr_pack::material::slot::DISPLACEMENT].sampler =
+        d.sampler(&SamplerDesc::default()).unwrap();
     m.displacement_scale = 0.2;
     m.displacement_offset = -0.1;
     let material = plane.material(&m);

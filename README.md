@@ -98,7 +98,7 @@ Then:
 
 ```sh
 bash tools/fetch-slang.sh
-cargo run -p examples --example viewer
+cargo run -p orr_examples --example viewer
 ```
 
 The other programs in `examples/` show one feature each: try `sky`, `dielectrics` for glass,

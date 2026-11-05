@@ -184,6 +184,8 @@ impl CpuLibrary {
             .cpp(true)
             .std("c++17")
             .warnings(false)
+            // Tests compare this code to Rust bit for bit, and Clang fuses `a * b + c` on Arm.
+            .flag_if_supported("-ffp-contract=off")
             .file(&cpp_path)
             .try_compile(name)
             .map_err(|e| Error::Slang {

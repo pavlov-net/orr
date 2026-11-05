@@ -164,7 +164,7 @@ bool cluster_visible(ViewConstants* v, RasterGpu* r, InstanceGpu inst, Placement
     bool uniform = abs(abs(det) - p.scale * p.scale * p.scale) < 1e-3 * abs(det);
     if (single && uniform && cone.w < 1.0 && reach == 0.0)
     {
-        float3 axis = normalize(mul(p.linear, cone.xyz)) * sign(det);
+        float3 axis = normalize(mul(p.linear, cone.xyz));
         if (dot(center, axis) >= cone.w * length(center) + radius)
             return false;
     }

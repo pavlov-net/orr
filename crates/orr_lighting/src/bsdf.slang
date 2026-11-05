@@ -106,6 +106,8 @@ static const float MIN_ALPHA = 1e-6;
 static const float MIN_MS_ALPHA = 0.04 * 0.04;
 // The smallest view cosine; flatter views lean up to it.
 static const float MIN_COS = 1e-4;
+// The IOR the specular weight's limit on F0 leaves of an IOR of 0, which layers above divide by.
+static const float MIN_IOR = 2.5e-5;
 static const float LARGEST_BELOW_ONE = 0.99999994;
 
 // What `bsdf_prepare_layers` leaves for `Bsdf.finish`: directional albedo estimates per lobe
@@ -115,7 +117,6 @@ public struct BsdfLayers
     bool collapsed;
     float e_ss;                         // the specular lobe's single-scattering albedo
     float coat_roughness;
-    float3 scale;
     float3 e[LOBES];
     LobeAlbedo estimate;                // specular left out
     float3 specular_single;             // the specular lobe's reflection coefficient under the layers
@@ -133,7 +134,6 @@ public struct Bsdf : IDifferentiable
     no_diff float3 b;
     no_diff float3 n;                   // toward the view
     no_diff float3 v;                   // the view in (t, b, n)
-    no_diff float3 scale;
     no_diff bool inside;
     no_diff float3 layer;               // what the coat and fuzz pass of the view to the base
 
@@ -215,8 +215,8 @@ public struct Bsdf : IDifferentiable
             e[COAT] = float3(0.0);
             e[FUZZ] = float3(0.0);
         }
-        a.specular = (e[COAT] + e[FUZZ] + fold_diffuse + (layers.specular_single + fold) * layers.e_ss
-            + layers.specular_multiple) * layers.scale;
+        a.specular = e[COAT] + e[FUZZ] + fold_diffuse + (layers.specular_single + fold) * layers.e_ss
+            + layers.specular_multiple;
         // Table interpolation can leave a complement a rounding error below zero.
         estimate.diffuse = max(a.diffuse, 0.0);
         estimate.specular = max(a.specular, 0.0);
@@ -407,7 +407,7 @@ public struct Bsdf : IDifferentiable
         if (delta)
         {
             r.pdf = probability[k] * within;
-            r.weight = w * scale / r.pdf;
+            r.weight = w / r.pdf;
             lobe = (lobe & ~LOBE_GLOSSY) | LOBE_SPECULAR;
         }
         else
@@ -480,7 +480,7 @@ public struct Bsdf : IDifferentiable
         if (dot(normalize(own), l) < 1.0 - 1e-6)
             return float3(0.0);
         chance = probability[component] * within;
-        return w * scale;
+        return w;
     }
 
     // One direction into the subsurface medium from the walk lobe alone: `weight` is its
@@ -507,7 +507,7 @@ public struct Bsdf : IDifferentiable
                 coefficients(v.z, rc, tc);
                 r.wi = normalize(from_local(l, t, b, n));
                 r.pdf = 1.0 - walk_ms_share;
-                r.weight = walk * tc * layer * scale / r.pdf;
+                r.weight = walk * tc * layer / r.pdf;
                 r.lobe = LOBE_TRANSMISSION | LOBE_SPECULAR | LOBE_VOLUME;
                 return r;
             }
@@ -518,7 +518,7 @@ public struct Bsdf : IDifferentiable
             return r;
         r.wi = normalize(from_local(l, t, b, n));
         r.pdf = pdf;
-        r.weight = f * scale / pdf;
+        r.weight = f / pdf;
         r.lobe = LOBE_TRANSMISSION | LOBE_GLOSSY | LOBE_VOLUME;
         return r;
     }
@@ -619,9 +619,9 @@ public struct Bsdf : IDifferentiable
             base += (l.z > 0.0 ? dms_reflect : dms_transmit) * dielectric_ms(l.z) * abs(l.z) * INV_PI;
             pdf += probability[DIELECTRIC_MS] * INV_TWO_PI * (l.z > 0.0 ? dms_ratio : 1.0 - dms_ratio);
         }
-        float3 below = layer * leaving(l.z) * scale;
+        float3 below = layer * leaving(l.z);
         diffuse_share = diffuse_base * below;
-        return top * scale + (base + diffuse_base) * below;
+        return top + (base + diffuse_base) * below;
     }
 
     // GGX reflection with a white coefficient, D G / (4 cos_v), and its bounded sampling density.
@@ -929,7 +929,6 @@ public SubsurfaceVolume bsdf_subsurface_volume(BsdfParams p)
 // without a walk lobe.
 public float3 bsdf_walk_exit(BsdfParams p, float3 n, float3 wi, float3 u)
 {
-    p.scale = float3(1.0);
     Bsdf s = bsdf_prepare(p, n, wi);
     float sss = max_component(s.walk);
     if (!(sss > 0.0))
@@ -967,7 +966,7 @@ public float3 bsdf_straight_transmission(BsdfParams p, float3 n, float3 wi, floa
     float3 t = (1.0 - p.metalness) * p.transmission_weight * (1.0 - openpbr_fresnel(eta, mu))
         * view_tint(p.transmission_color, thin, mu, eta);
     if ((p.flags & BSDF_COAT) != 0 && p.coat_weight > 0.0)
-        t *= lerp(float3(1.0), p.coat_color * (1.0 - openpbr_fresnel(p.coat_ior / exterior_ior, mu)), p.coat_weight);
+        t *= lerp(float3(1.0), p.coat_color * (1.0 - openpbr_fresnel(max(p.coat_ior, MIN_IOR) / exterior_ior, mu)), p.coat_weight);
     return max(t, 0.0);
 }
 
@@ -1009,11 +1008,11 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     }
     s.v = v;
     float mu = v.z;
-    s.scale = p.scale;
 
     // IORs: the specular weight moves the base IOR toward the medium above it.
     bool enter_coat = coat_weight > 0.0 && !s.inside;
-    float coat_ior = enter_coat ? lerp(exterior_ior, p.coat_ior, coat_weight) : exterior_ior;
+    float coat_layer_ior = max(p.coat_ior, MIN_IOR);
+    float coat_ior = enter_coat ? lerp(exterior_ior, coat_layer_ior, coat_weight) : exterior_ior;
     float specular_ior = coat_ior * openpbr_apply_specular_weight_to_ior(p.specular_ior / coat_ior, p.specular_weight);
     float eta_r;
     float eta_t;
@@ -1033,7 +1032,7 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
         {
             // No total internal reflection at the base under a coat that does not bend light.
             eta_t = coat_ior > specular_ior && specular_ior >= exterior_ior ? coat_ior / specular_ior : specular_ior / coat_ior;
-            coat_eta = p.coat_ior / exterior_ior;
+            coat_eta = coat_layer_ior / exterior_ior;
         }
         eta_o = eta_t;
     }
@@ -1061,7 +1060,8 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     float opaque = (1.0 - p.transmission_weight) * (1.0 - p.subsurface_weight) * dielectric;
     float trans = dielectric * p.transmission_weight;
     float sss = (1.0 - p.transmission_weight) * dielectric * p.subsurface_weight;
-    float darkened_metal = p.metalness * p.specular_weight;
+    // OpenPBR takes the metal's weight in 0..1; only the dielectric's goes past it.
+    float darkened_metal = p.metalness * saturate(p.specular_weight);
     float3 metal_average = openpbr_metal_average_fresnel_with_f82_tint(p.base_color, p.specular_color);
 
     // Coat darkening from internal reflections (OpenPBR 1.1.1).
@@ -1163,7 +1163,6 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     layers.collapsed = collapsed;
     layers.e_ss = e_ss;
     layers.coat_roughness = coat_roughness;
-    layers.scale = p.scale;
     layers.e[COAT] = float3(coat_reflected * fuzz_in);
     layers.e[FUZZ] = fuzz_presence * s.fuzz_ltc.z * p.fuzz_color;
     layers.e[SPECULAR] = (rc + s.transmit * tc) * e_ss * below;
@@ -1173,13 +1172,13 @@ public Bsdf bsdf_prepare_layers(BsdfParams p, float3 n, float3 wo, float exterio
     layers.e[DIFFUSE] = s.diffuse * s.diffuse_comp * below;
     layers.e[THIN_SPECULAR] = s.thin_specular * e_ss * below;
     layers.e[THIN_DIFFUSE] = s.thin_diffuse * s.diffuse_comp * below;
-    layers.estimate.diffuse = (layers.e[DIFFUSE] + layers.e[THIN_DIFFUSE]) * p.scale;
+    layers.estimate.diffuse = layers.e[DIFFUSE] + layers.e[THIN_DIFFUSE];
     layers.estimate.specular = float3(0.0);
     layers.specular_single = rc * below;
     layers.specular_multiple = (s.dms_reflect * s.dms_ratio * s.dms_ec + s.mms * s.mms_ec) * below;
-    layers.estimate.transmission = ((s.transmit * tc * e_ss + s.dms_transmit * (1.0 - s.dms_ratio) * s.dms_ec) * below
-        + layers.e[THIN_SPECULAR]) * p.scale;
-    layers.estimate.subsurface = layers.e[WALK] * p.scale;
+    layers.estimate.transmission = (s.transmit * tc * e_ss + s.dms_transmit * (1.0 - s.dms_ratio) * s.dms_ec) * below
+        + layers.e[THIN_SPECULAR];
+    layers.estimate.subsurface = layers.e[WALK];
     layers.glossy_bias = lerp(SPECULAR_BIAS, 1.0, roughness);
     layers.coat_bias = lerp(SPECULAR_BIAS, 1.0, coat_roughness);
     layers.dms_floor = s.dms_ec > 0.0 && (any(s.dms_reflect > 0.0) || any(s.dms_transmit > 0.0));
