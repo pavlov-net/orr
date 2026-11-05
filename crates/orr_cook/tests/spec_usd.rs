@@ -11,7 +11,10 @@ mod tangent_quads;
 
 use std::path::PathBuf;
 
-use orr_cook::{ArchiveSpec, AssetSpec, Manifest, NodeSelect, Source, Subdivision, UsdSettings};
+use orr_cook::{
+    ArchiveSpec, AssetSpec, Manifest, NodeSelect, Source, StaticDisplacement, Subdivision,
+    UsdSettings,
+};
 use orr_math::{Mat4, Quat, Vec3};
 use orr_pack::clip::Clip;
 use orr_pack::instance::{InstancePageInfo, decode};
@@ -2248,6 +2251,121 @@ fn a_mesh_on_one_tile_cooks_as_on_the_same_image() {
     let image = mesh_blobs(&d, &grid_stage("tex.png", [0.0, 0.0], wired));
     let tiled = mesh_blobs(&d, &grid_stage("tex.<UDIM>.png", [0.0, 0.0], wired));
     assert_eq!(image, tiled);
+}
+
+const HEIGHT: &str = "float inputs:displacement.connect = </M/T.outputs:r>";
+
+/// Settings that bake heights into the mesh.
+fn baking() -> UsdSettings {
+    let mut s = UsdSettings::default();
+    s.mesh.displace_static = Some(StaticDisplacement {
+        max_edge: 0.02,
+        target_error: 0.0001,
+    });
+    s
+}
+
+/// Cluster bounds and baked heights read a tile as they read the same image clamped.
+#[test]
+fn heights_on_one_tile_cook_as_on_the_same_image() {
+    let d = dir("udim-mesh-heights");
+    for file in ["tex.png", "tex.1001.png"] {
+        std::fs::write(d.join(file), rings()).unwrap();
+    }
+    let cooked = |file: &str, s: UsdSettings| {
+        let a = cook_at(&d, &grid_stage(file, [0.0, 0.0], HEIGHT), s).unwrap();
+        let e = a.find(AssetId::from_name("u/mesh")).expect("a mesh");
+        a.blobs(e).iter().map(|b| read(&a, b)).collect::<Vec<_>>()
+    };
+    for settings in [UsdSettings::default, baking] {
+        assert_eq!(
+            cooked("tex.png", settings()),
+            cooked("tex.<UDIM>.png", settings())
+        );
+    }
+}
+
+/// Tiles of heights 64/255 and 191/255 side by side, past which the fallback reads 0.
+fn stepped(name: &str) -> PathBuf {
+    let d = dir(name);
+    for (file, v) in [("tex.1001.png", 64), ("tex.1002.png", 191)] {
+        std::fs::write(d.join(file), png(8, 8, |_, _| [v, v, v, 255])).unwrap();
+    }
+    d
+}
+
+const LOW: f32 = 64.0 / 255.0;
+const HIGH: f32 = 191.0 / 255.0;
+
+/// Clusters bound what the tiles under them read, and the fallback past them: a cluster on one
+/// tile holds that tile's height alone, where the declared range would hold them all.
+#[test]
+fn cluster_bounds_follow_the_tiles_under_them() {
+    let d = stepped("udim-mesh-bounds");
+    let bounds = |at: [f32; 2]| {
+        let stage = grid_stage("tex.<UDIM>.png", at, HEIGHT);
+        let a = cook_at(&d, &stage, UsdSettings::default()).unwrap();
+        let info = MeshInfo::parse(&blob(&a, "u/mesh", 0)).unwrap();
+        let half = |b: u16| half::f16::from_bits(b).to_f32();
+        let mut out = Vec::new();
+        for p in &info.pages {
+            let mut page = vec![0; p.resident_len as usize];
+            orr_pack::mesh::decode_page(&blob(&a, "u/mesh", p.blob as usize), &mut page).unwrap();
+            let view = PageView::new(&page, &info.header).unwrap();
+            for i in 0..view.cluster_count() {
+                let c = view.cluster(i);
+                out.push((half(c.displacement_min), half(c.displacement_max)));
+            }
+        }
+        out
+    };
+    let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+    let across = bounds([0.5, 0.0]);
+    assert!(
+        across.iter().any(|b| near(b.0, LOW) && near(b.1, LOW)),
+        "{across:?}"
+    );
+    assert!(
+        across.iter().any(|b| near(b.0, HIGH) && near(b.1, HIGH)),
+        "{across:?}"
+    );
+    assert!(
+        across.iter().any(|b| near(b.0, LOW) && near(b.1, HIGH)),
+        "{across:?}"
+    );
+    assert!(
+        across
+            .iter()
+            .all(|b| b.0 >= LOW - 0.01 && b.1 <= HIGH + 0.01)
+    );
+    let past = bounds([1.5, 0.0]);
+    assert!(
+        past.iter().any(|b| near(b.0, 0.0) && near(b.1, HIGH)),
+        "{past:?}"
+    );
+}
+
+/// Baked vertices take the height of the tile under them, and the fallback past the tiles.
+#[test]
+fn baked_heights_follow_the_tile_under_each_vertex() {
+    let d = stepped("udim-mesh-bake");
+    let heights = |at: [f32; 2]| {
+        let stage = grid_stage("tex.<UDIM>.png", at, HEIGHT);
+        let a = cook_at(&d, &stage, baking()).unwrap();
+        corners(&a, "u/mesh")
+    };
+    for (p, _, uv) in heights([0.5, 0.0]) {
+        if (uv[0] - 1.0).abs() > 1e-3 {
+            let want = if uv[0] < 1.0 { LOW } else { HIGH };
+            assert!((p.z - want).abs() < 0.01, "{p} at {uv:?}");
+        }
+    }
+    for (p, _, uv) in heights([1.5, 0.0]) {
+        if (uv[0] - 2.0).abs() > 1e-3 {
+            let want = if uv[0] < 2.0 { HIGH } else { 0.0 };
+            assert!((p.z - want).abs() < 0.01, "{p} at {uv:?}");
+        }
+    }
 }
 
 /// A mesh past every tile reads the fallback, which decides its triangles as one texel would.

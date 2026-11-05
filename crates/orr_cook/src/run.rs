@@ -13,6 +13,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
@@ -1852,16 +1853,6 @@ fn plan_scene(
                 (materials[mi].0, materials[mi].1)
             });
         }
-        let unbaked = mesh.sections().iter().any(|s| {
-            let d = s.maps.displacement.as_ref();
-            d.is_some_and(|d| d.texture.is_none())
-        });
-        if model.settings.displace_static.is_some() && unbaked {
-            warnings.push(format!(
-                "{model_name}: heights of a tile set don't bake into the mesh; they displace at \
-                 runtime"
-            ));
-        }
         mesh.drop_unread_uv1();
         deps.sort_unstable();
         deps.dedup();
@@ -1997,14 +1988,11 @@ fn map_spec(m: &Material, textures: &HashMap<AssetId, MapTexture>) -> MapSpec {
         offset: m.displacement_offset,
         min: m.displacement_min,
         max: m.displacement_max,
-        texture: b
-            .0
-            .filter(|t| t.tiles.is_empty())
-            .map(|t| DisplacementTexture {
-                texture: t.clone(),
-                read: read(slot::DISPLACEMENT),
-                uv_set: b.1,
-            }),
+        texture: b.0.map(|t| DisplacementTexture {
+            texture: t.clone(),
+            read: read(slot::DISPLACEMENT),
+            uv_set: b.1,
+        }),
     });
     let frame_set = usize::from(m.tangent_set());
     let normal = match bound(slot::NORMAL) {
@@ -2334,6 +2322,8 @@ fn section_maps(
             channels,
         )
     };
+    // Sections reading one texture share its texels: a tile set's mips can run to gigabytes.
+    let mut heights: HashMap<Hash32, Vec<Raster>> = HashMap::new();
     let mut out = Vec::with_capacity(sections.len());
     for s in sections {
         let opacity = match &s.maps.opacity {
@@ -2396,7 +2386,20 @@ fn section_maps(
                     Some(t) => Some(read_map(
                         &t.texture,
                         t.read,
-                        |unit, _, at| read(unit, true, at, 1),
+                        |unit, key, at| {
+                            let mips = match heights.entry(key) {
+                                Entry::Occupied(e) => e.into_mut(),
+                                Entry::Vacant(e) => e.insert(read(unit, true, at, 1)?),
+                            };
+                            let mip = |m: &Raster| Raster {
+                                texels: Arc::clone(&m.texels),
+                                wrap: at.wrap,
+                                uv: at.uv,
+                                outside: at.outside[0],
+                                ..*m
+                            };
+                            Ok(mips.iter().map(mip).collect())
+                        },
                         |outside| vec![Raster::solid(outside[0])],
                     )?),
                     None => None,

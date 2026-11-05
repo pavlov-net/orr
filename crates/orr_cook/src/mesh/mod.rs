@@ -770,11 +770,11 @@ impl Ctx<'_> {
         let sec = &self.sections[usize::from(section)];
         let section_maps = &self.maps[usize::from(section)];
         let uv: Vec<ClusterUvs> = w.uvs.iter().map(|u| ClusterUvs::new(u, &verts)).collect();
-        let set = section_maps.opacity.as_ref().map_or(0, Opacity::uv_set);
-        let uvs: Vec<[f32; 2]> = verts
-            .iter()
-            .map(|&v| uv[set].stored(w.uvs[set][v as usize]))
-            .collect();
+        let stored = |set: usize| -> Vec<[f32; 2]> {
+            let at = |&v: &u32| uv[set].stored(w.uvs[set][v as usize]);
+            verts.iter().map(at).collect()
+        };
+        let uvs = stored(section_maps.opacity.as_ref().map_or(0, Opacity::uv_set));
         let opaque = partition_opaque(&uvs, &mut tris, section_maps.opacity.as_ref());
         stored_corner_order(&mut tris);
         let mut c = build_cluster(w, self.grid, &verts, &cells, &tris, sec.flags, &uv);
@@ -797,8 +797,10 @@ impl Ctx<'_> {
         if let Some(d) = &section_maps.displacement
             && !self.baked[usize::from(section)]
         {
-            let uv = |i: u8| w.uvs[d.uv_set][verts[usize::from(i)] as usize];
-            let [lo, hi] = d.bounds(tris.as_chunks::<3>().0.iter().map(|t| t.map(uv)));
+            // Stored uvs, which the runtime reads: their rounding can cross a tile's edge.
+            let stored = stored(d.uv_set);
+            let at = |i: u8| stored[usize::from(i)];
+            let [lo, hi] = d.bounds(tris.as_chunks::<3>().0.iter().map(|t| t.map(at)));
             c.record.displacement_min = f16_down(lo);
             c.record.displacement_max = f16_up(hi);
         }

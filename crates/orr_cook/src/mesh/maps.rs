@@ -130,14 +130,14 @@ impl<T> Tiles<T> {
         )
     }
 
-    /// Calls `f` with the parts of `uv`; a part flat along a cell's edge counts with `edges`.
+    /// Calls `f` with the parts of mapped uv triangle `p`; a part flat along a cell's edge counts
+    /// with `edges`.
     fn walk<'a>(
         &'a self,
-        uv: [[f32; 2]; 3],
+        p: [[f64; 2]; 3],
         edges: bool,
         f: &mut impl FnMut(Part<'a, T>) -> bool,
     ) -> bool {
-        let p = uv.map(|c| mapped(self.uv, c));
         let cell = p[0].map(f64::floor);
         if p.iter().all(|c| c.map(f64::floor) == cell) {
             return f(Part {
@@ -214,22 +214,6 @@ impl<T> Map<T> {
         }
     }
 
-    fn walk<'a>(
-        &'a self,
-        uv: [[f32; 2]; 3],
-        edges: bool,
-        f: &mut impl FnMut(Part<'a, T>) -> bool,
-    ) -> bool {
-        match self {
-            Self::Image(read) => f(Part {
-                read,
-                uv,
-                weights: WHOLE,
-            }),
-            Self::Tiles(t) => t.walk(uv, edges, f),
-        }
-    }
-
     /// Calls `f` with the parts of mesh uv triangle `uv` that hold area, which is where a ray can
     /// land; stops when `f` returns false, and returns whether it ran to the end. A cell the
     /// triangle only touches, past the edge its corners sit on, has no part.
@@ -238,17 +222,40 @@ impl<T> Map<T> {
         uv: [[f32; 2]; 3],
         mut f: impl FnMut(Part<'a, T>) -> bool,
     ) -> bool {
-        self.walk(uv, false, &mut f)
+        match self {
+            Self::Image(read) => f(Part {
+                read,
+                uv,
+                weights: WHOLE,
+            }),
+            Self::Tiles(t) => t.walk(uv.map(|c| mapped(t.uv, c)), false, &mut f),
+        }
     }
 
-    /// [`Self::parts`] with the cells a triangle only touches. Displacement reads at the corners
-    /// themselves, and a corner on a cell's edge reads the cell that starts there.
+    /// [`Self::parts`] with every cell a read at a corner or along an edge can land in, as
+    /// displacement's do. A corner on a cell's edge reads the cell that starts there, and the
+    /// runtime's f32 uvs round across an edge a corner lies within a few steps of.
     pub(super) fn reads<'a>(
         &'a self,
         uv: [[f32; 2]; 3],
         mut f: impl FnMut(Part<'a, T>) -> bool,
     ) -> bool {
-        self.walk(uv, true, &mut f)
+        let Self::Tiles(t) = self else {
+            return self.parts(uv, f);
+        };
+        let p = uv.map(|c| mapped(t.uv, c));
+        if !t.walk(p, true, &mut f) {
+            return false;
+        }
+        let largest = p.iter().flatten().fold(1.0f64, |a, c| a.max(c.abs()));
+        let slack = 4.0 * f64::from(f32::EPSILON) * largest;
+        if !p.iter().flatten().any(|c| (c - c.round()).abs() <= slack) {
+            return true;
+        }
+        let shifted = |[x, y]: [f64; 2]| p.map(|c| [c[0] + x * slack, c[1] + y * slack]);
+        [[1.0, 1.0], [1.0, -1.0], [-1.0, 1.0], [-1.0, -1.0]]
+            .into_iter()
+            .all(|s| t.walk(shifted(s), true, &mut f))
     }
 
     /// Every texture, and what reads where a set has none.
@@ -1150,6 +1157,10 @@ mod tests {
         assert_eq!(seen(true, inside), [0.25]);
         let line = [[0.5, 0.5], [1.5, 0.5], [1.5, 0.5]];
         assert_eq!(seen(false, line), [0.25, 0.75], "a line reads along itself");
+        // A step below 1, which the runtime's f32 interpolation can round up to it.
+        let close = [[0.5, 0.5], [1.0 - f32::EPSILON / 2.0, 0.5], [0.5, 0.75]];
+        assert_eq!(seen(false, close), [0.25]);
+        assert_eq!(seen(true, close), [0.25, 0.75]);
     }
 
     /// A gradient across `n` texels, at the cutoff 0.5 halfway, with the edge modes of a tile.
