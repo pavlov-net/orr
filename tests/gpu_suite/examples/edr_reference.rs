@@ -5,8 +5,10 @@
 //! reference; drag a window if they don't touch. A camera judges it better than the eye at an
 //! exposure low enough that the bars step visibly.
 //!
-//! `edr_reference [seconds] [hdr10]`: runs for the given seconds (default 120) or until a
-//! window closes; `hdr10` gives the PQ layer HDR10 metadata, as `Display` does.
+//! `edr_reference [seconds] [hdr10] [range]`: runs for the given seconds (default 120) or until
+//! a window closes; `hdr10` gives the PQ layer HDR10 metadata, as `Display` does, and `range`
+//! spreads the bars from 100 to 1600 nits, to see how much of the screen's headroom PQ reaches.
+//! The screen's current headroom is logged every two seconds.
 //!
 //! macOS only: elsewhere the example says so and exits.
 
@@ -24,24 +26,28 @@ mod measure {
         Swapchain, SwapchainDesc, TextureRegion,
     };
 
-    /// The bars' luminances in nits, left to right.
+    /// The bars' luminances in nits, left to right: around SDR white, or with `range` over the
+    /// screen's headroom.
     const LEVELS: [f64; 10] = [
         60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 140.0, 160.0, 203.0,
+    ];
+    const RANGE: [f64; 10] = [
+        100.0, 150.0, 200.0, 300.0, 400.0, 500.0, 600.0, 800.0, 1000.0, 1600.0,
     ];
     const WHITE_WIDTH: i32 = 360;
     const BARS_WIDTH: i32 = 1000;
     const HEIGHT: i32 = 500;
 
-    /// Rec.2020 primaries and a 1000-nit peak, above every bar.
-    fn metadata() -> HdrMetadata {
+    /// Rec.2020 primaries, with the brightest bar as the peak.
+    fn metadata(levels: &[f64; 10]) -> HdrMetadata {
         let xy = |c: orr_color::Chromaticity| [c.x as f32, c.y as f32];
         let p = RgbPrimaries::REC2020;
         HdrMetadata {
             primaries: [xy(p.red), xy(p.green), xy(p.blue)],
             white: xy(p.white),
-            max_luminance: 1000.0,
+            max_luminance: levels[9] as f32,
             min_luminance: 0.005,
-            max_cll: 203.0,
+            max_cll: levels[9] as f32,
             max_fall: 0.0,
         }
     }
@@ -53,16 +59,16 @@ mod measure {
     }
 
     /// The bars at `extent`, with a thin black gap before each.
-    fn bars(extent: [u32; 2]) -> Vec<u32> {
+    fn bars(levels: &[f64; 10], extent: [u32; 2]) -> Vec<u32> {
         let [w, h] = extent.map(|v| v as usize);
-        let n = LEVELS.len();
+        let n = levels.len();
         let row: Vec<u32> = (0..w)
             .map(|x| {
                 let gap = (x * n) % w < w / 100;
                 if gap {
                     pq_gray(0.0)
                 } else {
-                    pq_gray(LEVELS[x * n / w])
+                    pq_gray(levels[x * n / w])
                 }
             })
             .collect();
@@ -72,7 +78,7 @@ mod measure {
     /// One window's swapchain and the texels it shows, uploaded once per size.
     struct Shown {
         swapchain: Swapchain,
-        texels: fn([u32; 2]) -> Vec<u32>,
+        texels: Box<dyn Fn([u32; 2]) -> Vec<u32>>,
         upload: Option<([u32; 2], Allocation<u32>)>,
     }
 
@@ -100,9 +106,14 @@ mod measure {
     }
 
     pub(super) fn main() {
-        let mut args = std::env::args().skip(1);
-        let seconds: u64 = args.next().and_then(|a| a.parse().ok()).unwrap_or(120);
-        let hdr = args.next().as_deref() == Some("hdr10");
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let seconds: u64 = args.first().and_then(|a| a.parse().ok()).unwrap_or(120);
+        let hdr = args.iter().any(|a| a == "hdr10");
+        let levels = if args.iter().any(|a| a == "range") {
+            RANGE
+        } else {
+            LEVELS
+        };
         let mtm = MainThreadMarker::new().expect("examples start on the main thread");
         // Made first: it starts the logging.
         let d = device();
@@ -149,15 +160,19 @@ mod measure {
         };
         let mut white = Shown {
             swapchain: swapchain(&white_window, OutputFormat::Sdr, None),
-            texels: |[w, h]| vec![u32::MAX; (w * h) as usize],
+            texels: Box::new(|[w, h]| vec![u32::MAX; (w * h) as usize]),
             upload: None,
         };
         let mut pq = Shown {
-            swapchain: swapchain(&bars_window, OutputFormat::Hdr10Pq, hdr.then(metadata)),
-            texels: bars,
+            swapchain: swapchain(
+                &bars_window,
+                OutputFormat::Hdr10Pq,
+                hdr.then(|| metadata(&levels)),
+            ),
+            texels: Box::new(move |extent| bars(&levels, extent)),
             upload: None,
         };
-        for (i, nits) in LEVELS.iter().enumerate() {
+        for (i, nits) in levels.iter().enumerate() {
             log::info!("bar {}: {nits} nits", i + 1);
         }
         log::info!(
@@ -166,6 +181,7 @@ mod measure {
         );
 
         let start = Instant::now();
+        let mut logged = Duration::ZERO;
         while white_window.pump()
             && bars_window.pump()
             && start.elapsed() < Duration::from_secs(seconds)
@@ -173,6 +189,14 @@ mod measure {
             white.present(d, queue);
             pq.present(d, queue);
             d.collect_garbage();
+            if start.elapsed() >= logged {
+                log::info!(
+                    "{:.0} s: headroom now {}",
+                    start.elapsed().as_secs_f64(),
+                    screen.maximumExtendedDynamicRangeColorComponentValue()
+                );
+                logged += Duration::from_secs(2);
+            }
         }
         drop((white, pq));
         d.collect_garbage();
