@@ -1,8 +1,12 @@
 #![allow(clippy::print_stdout)] // the tests report measured figures
 
+#[path = "common/float_ktx2.rs"]
+mod float_ktx2;
+
 use std::f32::consts::{PI, TAU};
 use std::path::{Path, PathBuf};
 
+use float_ktx2::float_ktx2;
 use orr_color::RgbPrimaries;
 use orr_cook::{
     ArchiveSpec, AssetSpec, CookOptions, DataFormat, GltfSettings, InputChannels, Manifest,
@@ -59,6 +63,27 @@ fn read_blob(a: &Archive, e: &orr_pack::Entry, i: usize) -> Vec<u8> {
     let mut out = vec![0; b.raw_len as usize];
     a.read(b, &mut out).unwrap();
     out
+}
+
+/// Cooks the GLB at `path` as asset `g`; the archive and its first material.
+fn cook_glb_at(path: &Path, settings: GltfSettings, quality: Quality) -> (Archive, Material) {
+    let a = cook_at(
+        vec![AssetSpec {
+            name: "g".into(),
+            source: Source::Gltf {
+                path: path.to_path_buf(),
+                settings,
+            },
+        }],
+        quality,
+    );
+    let e = a.find(AssetId::from_name("g/material/0")).unwrap();
+    let m = Material::from_bytes(&read_blob(&a, e, 0)).unwrap();
+    (a, m)
+}
+
+fn cook_glb(path: &Path, settings: GltfSettings) -> (Archive, Material) {
+    cook_glb_at(path, settings, CookOptions::default().quality)
 }
 
 /// Header and every mip of every layer, tight, from the archive.
@@ -934,24 +959,14 @@ fn swapped_roughness_and_metalness_keep_their_channels_below_mip_0() {
             ..TextureOverride::default()
         },
     )];
-    let a = cook_at(
-        vec![AssetSpec {
-            name: "g".into(),
-            source: Source::Gltf {
-                path,
-                settings: GltfSettings {
-                    textures: TextureRules {
-                        overrides,
-                        ..TextureRules::default()
-                    },
-                    ..GltfSettings::default()
-                },
-            },
-        }],
-        Quality::Slow,
-    );
-    let e = a.find(AssetId::from_name("g/material/0")).unwrap();
-    let m = Material::from_bytes(&read_blob(&a, e, 0)).unwrap();
+    let settings = GltfSettings {
+        textures: TextureRules {
+            overrides,
+            ..TextureRules::default()
+        },
+        ..GltfSettings::default()
+    };
+    let (a, m) = cook_glb_at(&path, settings, Quality::Slow);
     let (r, t) = (m.textures[slot::ROUGHNESS], m.textures[slot::METALNESS]);
     assert_eq!(r.texture, t.texture);
     let (_, levels) = mips(&a, a.name(a.find(r.texture).unwrap()));
@@ -995,18 +1010,7 @@ fn two_channel_normals_rebuild_z_when_they_are_reencoded() {
     );
     let scaled = 0.5 / 1.25f32.sqrt();
     for quality in [Quality::Fast, Quality::Slow] {
-        let a = cook_at(
-            vec![AssetSpec {
-                name: "g".into(),
-                source: Source::Gltf {
-                    path: path.clone(),
-                    settings: GltfSettings::default(),
-                },
-            }],
-            quality,
-        );
-        let e = a.find(AssetId::from_name("g/material/0")).unwrap();
-        let m = Material::from_bytes(&read_blob(&a, e, 0)).unwrap();
+        let (a, m) = cook_glb_at(&path, GltfSettings::default(), quality);
         let name = a.name(a.find(m.textures[slot::NORMAL].texture).unwrap());
         let x = x_of(&a, name);
         assert!((x - scaled).abs() < 0.02, "{quality:?}: {x}, not {scaled}");
@@ -1028,41 +1032,10 @@ fn signed_two_channel_normals_read_their_own_values() {
     let d = dir("snorm-normal");
     let n = 64u32;
     let tilt = 0.5f32.sqrt();
-    let texels: Vec<u8> = (0..n * n)
-        .flat_map(|i| {
-            let x = if i % n < n / 2 { tilt } else { -tilt };
-            [x, 0.0, 0.0, 1.0]
-        })
-        .flat_map(f32::to_le_bytes)
-        .collect();
-    let image = ctt::ImageRef {
-        surfaces: vec![vec![ctt::SurfaceRef {
-            data: &texels,
-            width: n,
-            height: n,
-            depth: 1,
-            stride: n * 16,
-            slice_stride: 0,
-        }]],
-        kind: ctt::TextureKind::Texture2D,
-        desc: ctt::FormatDesc {
-            format: ctt::Format::R32G32B32A32_SFLOAT,
-            color_space: ctt::ColorSpace::Linear,
-            alpha: ctt::AlphaMode::Opaque,
-        },
-    };
-    let ctt::PipelineOutput::Encoded(bytes) = ctt::convert(
-        image,
-        ctt::ConvertSettings {
-            format: Some(ctt::TargetFormat::Uncompressed(ctt::Format::R8G8_SNORM)),
-            container: ctt::Container::ktx2(),
-            mipmap: false,
-            ..Default::default()
-        },
-    )
-    .unwrap() else {
-        panic!("container output");
-    };
+    let format = ctt::TargetFormat::Uncompressed(ctt::Format::R8G8_SNORM);
+    let bytes = float_ktx2(n, n, format, false, |x, _| {
+        [if x < n / 2 { tilt } else { -tilt }, 0.0, 0.0, 1.0]
+    });
     let path = d.join("signed.ktx2");
     std::fs::write(&path, &bytes).unwrap();
     let check = |a: &Archive, name: &str| {
@@ -1082,15 +1055,7 @@ fn signed_two_channel_normals_read_their_own_values() {
 
     let glb = d.join("signed.glb");
     write_glb(&glb, &[r#"{"normalTexture":{"index":0}}"#.into()], &[bytes]);
-    let a = cook(vec![AssetSpec {
-        name: "g".into(),
-        source: Source::Gltf {
-            path: glb,
-            settings: GltfSettings::default(),
-        },
-    }]);
-    let e = a.find(AssetId::from_name("g/material/0")).unwrap();
-    let m = Material::from_bytes(&read_blob(&a, e, 0)).unwrap();
+    let (a, m) = cook_glb(&glb, GltfSettings::default());
     check(
         &a,
         a.name(a.find(m.textures[slot::NORMAL].texture).unwrap()),
@@ -1109,6 +1074,61 @@ fn signed_two_channel_normals_read_their_own_values() {
     };
     assert!((value(8) - tilt).abs() < 0.02, "{}", value(8));
     assert!((value(56) + tilt).abs() < 0.02, "{}", value(56));
+}
+
+/// A constant out of 0..1 folds into a factor as the value a texture of it would store.
+#[test]
+fn constants_fold_into_factors_clamped_to_their_domain() {
+    let d = dir("constant-clamp");
+    let material = r#"{"alphaMode":"BLEND",
+        "pbrMetallicRoughness":{"baseColorTexture":{"index":0},"metallicRoughnessTexture":{"index":0},
+            "baseColorFactor":[0.5,0.5,0.5,0.5],"metallicFactor":0.5,"roughnessFactor":0.5},
+        "emissiveTexture":{"index":0},"emissiveFactor":[0.5,0.5,0.5],
+        "extensions":{
+            "KHR_materials_specular":{"specularTexture":{"index":0},"specularFactor":0.5},
+            "KHR_materials_clearcoat":{"clearcoatTexture":{"index":0},"clearcoatFactor":0.5},
+            "KHR_materials_transmission":{"transmissionTexture":{"index":0},"transmissionFactor":0.5}}}"#;
+    for (format, value, want) in [
+        (ctt::Format::R8G8B8A8_SNORM, -0.2, 0.0),
+        (ctt::Format::R32G32B32A32_SFLOAT, 1.5, 0.5),
+    ] {
+        let format = ctt::TargetFormat::Uncompressed(format);
+        let image = float_ktx2(8, 8, format, false, |_, _| [value; 4]);
+        let path = d.join("constant.glb");
+        write_glb(&path, &[material.into()], &[image]);
+        let (_, m) = cook_glb(&path, GltfSettings::default());
+        assert!(m.textures.iter().all(|b| b.texture == AssetId::NONE));
+        for got in [
+            m.base_color[0],
+            m.geometry_opacity,
+            m.emission_color[0],
+            m.specular_roughness,
+            m.metalness,
+            m.specular_weight,
+            m.coat_weight,
+            m.transmission_weight,
+        ] {
+            assert_eq!(got, want, "{m:?}");
+        }
+    }
+}
+
+/// A weight's varying texels clamp before its factor, as a constant's do.
+#[test]
+fn weight_texels_clamp_before_their_factor() {
+    let path = dir("weight-clamp").join("weight.glb");
+    let material = r#"{"extensions":{"KHR_materials_clearcoat":
+        {"clearcoatTexture":{"index":0},"clearcoatFactor":0.5}}}"#;
+    let format = ctt::TargetFormat::Uncompressed(ctt::Format::R32G32B32A32_SFLOAT);
+    let image = float_ktx2(8, 8, format, false, |x, _| {
+        [if x < 4 { 1.5 } else { 0.25 }; 4]
+    });
+    write_glb(&path, &[material.into()], &[image]);
+    let (a, m) = cook_glb(&path, GltfSettings::default());
+    let texture = a.find(m.textures[slot::COAT].texture).unwrap();
+    let (info, levels) = mips(&a, a.name(texture));
+    let texels = decode(info.header.vk_format, 8, 8, &levels[0][0]);
+    assert!((texels[0][0] - 0.5).abs() < 0.01, "{:?}", texels[0]);
 }
 
 fn bcn_material_checks(a: &Archive, remade: bool, blocks: [&Vec<Vec<u8>>; 5]) {

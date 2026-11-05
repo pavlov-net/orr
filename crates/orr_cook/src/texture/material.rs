@@ -18,7 +18,8 @@
 //! - Displacement: R16 unorm from red, never collapsed; displacement is
 //!   `displacement_scale x texel + displacement_offset`.
 //! - An image whose texels all lie within 1/255 of one value collapses into the material's
-//!   factor; a constant normal or occlusion image, which has no factor, cooks at 4x4.
+//!   factor, clamped to 0..1 as a texture stores it; a constant normal or occlusion image,
+//!   which has no factor, cooks at 4x4.
 //!
 //! A bound texture's value multiplies the matching factor; normal, occlusion and opacity
 //! textures have no factor.
@@ -461,6 +462,11 @@ impl<'a> Packer<'a> {
         self.image(i).constant[channel]
     }
 
+    /// [`Self::constant`] of an input with a 0..1 meaning, clamped as its texture stores it.
+    fn constant_weight(&self, i: usize, channel: usize) -> Option<f32> {
+        self.constant(i, channel).map(|v| v.clamp(0.0, 1.0))
+    }
+
     /// The primaries of a color texture made from image `i`: the last override that sets
     /// them, else the file's tag, else Rec.709.
     fn color_primaries(&self, i: usize) -> Primaries {
@@ -528,7 +534,7 @@ impl<'a> Packer<'a> {
             && let Some(r) = &t.opacity
         {
             let channel = usize::from(r.channel);
-            match self.constant(r.image, channel) {
+            match self.constant_weight(r.image, channel) {
                 Some(a) => m.geometry_opacity *= a,
                 None => {
                     let coverage = (m.alpha_mode == Material::MASK).then_some((0, m.alpha_cutoff));
@@ -624,7 +630,7 @@ impl<'a> Packer<'a> {
         // Roughness, metalness, occlusion.
         let (rough, metal) = (t.roughness, t.metalness);
         let constant = |r: &Option<TexRef>| match r {
-            Some(r) => self.constant(r.image, usize::from(r.channel)),
+            Some(r) => self.constant_weight(r.image, usize::from(r.channel)),
             None => Some(1.0),
         };
         let (rough_const, metal_const) = (constant(&rough), constant(&metal));
@@ -632,7 +638,7 @@ impl<'a> Packer<'a> {
         let metal_varies = metal_const.is_none();
         let occ = t
             .occlusion
-            .map(|(r, s)| (r, s, self.constant(r.image, usize::from(r.channel))));
+            .map(|(r, s)| (r, s, self.constant_weight(r.image, usize::from(r.channel))));
         let occ_varies = occ.as_ref().is_some_and(|o| o.2.is_none());
         let rough_channel = |m: &Material| match (&rough, rough_const) {
             (Some(r), None) => Channel::Image {
@@ -743,7 +749,7 @@ impl<'a> Packer<'a> {
             self.color(suffix, m, r, slot::SUBSURFACE_COLOR, true)?;
         }
         if let Some(r) = &t.specular {
-            match self.constant(r.image, usize::from(r.channel)) {
+            match self.constant_weight(r.image, usize::from(r.channel)) {
                 Some(v) => m.specular_weight *= v,
                 None => {
                     let id = self.single(suffix, r, 1.0, "specular_weight")?;
@@ -761,7 +767,7 @@ impl<'a> Packer<'a> {
         for (r, role, s, weight) in weights {
             let Some(r) = r else { continue };
             let factor = *weight(m);
-            *weight(m) = match self.constant(r.image, usize::from(r.channel)) {
+            *weight(m) = match self.constant_weight(r.image, usize::from(r.channel)) {
                 Some(v) => factor * v,
                 None => {
                     let id = self.single(suffix, r, factor, role)?;
@@ -839,7 +845,7 @@ impl<'a> Packer<'a> {
             _ => ("subsurface_color", |m| &mut m.subsurface_color),
         };
         let srgb = r.srgb.unwrap_or(self.image(r.image).srgb);
-        let rgb: Vec<Option<f32>> = (0..3).map(|c| self.constant(r.image, c)).collect();
+        let rgb: Vec<Option<f32>> = (0..3).map(|c| self.constant_weight(r.image, c)).collect();
         if rgb.iter().all(Option::is_some) {
             let texel: [f32; 3] = std::array::from_fn(|c| {
                 let v = rgb[c].expect("constant");
@@ -1345,6 +1351,10 @@ impl TextureJob {
 
     /// The packed texture of `decoded` source images, each `w` x `h`.
     fn pack(&self, decoded: &HashMap<usize, Arc<Img>>, [w, h]: [u32; 2]) -> Img {
+        // Apart from normals, BC4 and BC5 hold weights: a source texel clamps before its factor,
+        // as a constant does.
+        let weight =
+            !self.pack.normal && matches!(self.pack.encoding, Encoding::Bc4 | Encoding::Bc5);
         let mut img = Img::new(w, h);
         for (c, ch) in self.pack.channels.iter().enumerate() {
             match *ch {
@@ -1372,7 +1382,7 @@ impl TextureJob {
                             } else {
                                 s[channel]
                             };
-                            t[c] = a + b * v;
+                            t[c] = a + b * if weight { v.clamp(0.0, 1.0) } else { v };
                         });
                 }
             }
