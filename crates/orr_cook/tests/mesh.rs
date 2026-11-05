@@ -567,6 +567,32 @@ fn turned_sets() -> MeshInput {
     }
 }
 
+/// A frame on uvs the mesh doesn't carry follows set 0, as the shaders do without a tangent
+/// stream. Set 0 runs along y here, which neither set 1 nor the tangent of no uvs does.
+#[test]
+fn a_frame_outside_the_uv_sets_follows_set_0() {
+    let along_x = turned_sets();
+    let input = MeshInput {
+        uvs: Some(vec![
+            [1.0, 1.0].into(),
+            [1.0, 0.0].into(),
+            [0.0, 0.0].into(),
+            [0.0, 1.0].into(),
+        ]),
+        uvs1: along_x.uvs.clone(),
+        sections: vec![Span { first: 0, count: 6 }],
+        ..along_x
+    };
+    let mut material = normal_mapped(0);
+    material.frame_uv = Material::FRAME_OTHER;
+    let (a, _) = library_cook("other-frame-tangents", input, vec![material]);
+    let got = library_tangents(&a);
+    assert!(!got.is_empty());
+    for (_, _, t) in got {
+        assert!(Vec3::from_slice(&t).dot(-Vec3::Y) > 0.999, "{t:?}");
+    }
+}
+
 /// Sections over the same triangles, on different uv sets, each hold their own tangents.
 #[test]
 fn overlapping_sections_compute_their_own_tangents() {
