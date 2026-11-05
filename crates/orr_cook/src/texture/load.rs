@@ -634,7 +634,9 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
         .map_err(|e| e.to_string())?;
     let format = reader.format();
     let radiance = format == Some(ImageFormat::Hdr);
-    let img = reader.decode().map_err(|e| e.to_string())?;
+    let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
+    let icc = decoder.icc_profile().ok().flatten();
+    let img = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
     let hdr = matches!(
         img,
         DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_)
@@ -649,8 +651,13 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
         rgb8: matches!(img.color(), C::Rgb8 | C::Rgba8),
         ..Default::default()
     };
-    if format == Some(ImageFormat::Png) {
-        png_color(&mut color, bytes)?;
+    match format {
+        Some(ImageFormat::Png) => png_color(&mut color, bytes, icc.as_deref(), gray != Gray::No)?,
+        _ => {
+            if let Some(icc) = &icc {
+                color::read_icc(&mut color, icc, gray != Gray::No);
+            }
+        }
     }
     let rgba = img.to_rgba32f();
     let (w, h) = rgba.dimensions();
@@ -673,8 +680,13 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
 }
 
 /// States what a PNG's chunks say on `color`, the chunk of lowest priority number in PNG §4.3
-/// taking precedence: `cICP`, then `sRGB`, and `cHRM` and `gAMA` last.
-fn png_color(color: &mut FileColor, bytes: &[u8]) -> Result<(), String> {
+/// taking precedence: `cICP`, then `iCCP` (`icc`), `sRGB`, and `cHRM` and `gAMA` last.
+fn png_color(
+    color: &mut FileColor,
+    bytes: &[u8],
+    icc: Option<&[u8]>,
+    gray: bool,
+) -> Result<(), String> {
     let reader = png::Decoder::new(Cursor::new(bytes))
         .read_info()
         .map_err(|e| e.to_string())?;
@@ -693,6 +705,9 @@ fn png_color(color: &mut FileColor, bytes: &[u8]) -> Result<(), String> {
         if color.transfer.is_some() || color.gamut.is_some() {
             return Ok(());
         }
+    }
+    if icc.is_some_and(|icc| color::read_icc(color, icc, gray)) {
+        return Ok(());
     }
     if info.srgb.is_some() {
         color.transfer = Some(Transfer::Srgb);

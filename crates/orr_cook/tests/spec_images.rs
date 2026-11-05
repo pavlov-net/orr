@@ -1043,8 +1043,8 @@ fn ktx2_blocks_state_primaries_to_importers_that_read_them() {
 }
 
 /// PNG §4.3, under this project's rule that plain files and USD's `auto` honor what they state:
-/// "the chunk with the lowest Priority number should take precedence", of `cICP`, `sRGB`, then
-/// `cHRM` and `gAMA`. The same files through glTF are `image_color_metadata_is_ignored`.
+/// "the chunk with the lowest Priority number should take precedence", of `cICP`, `iCCP`, `sRGB`,
+/// then `cHRM` and `gAMA`. The same files through glTF are `image_color_metadata_is_ignored`.
 #[test]
 fn png_chunks_read_by_priority() {
     let d = dir("png_priority");
@@ -1079,6 +1079,41 @@ fn png_chunks_read_by_priority() {
     assert_eq!(id, 1, "cHRM");
     let (id, _) = read(&[(b"cHRM", &chrm), (b"sRGB", &[0])], None);
     assert_eq!(id, 0, "sRGB over cHRM");
+
+    let p3 = moxcms::ColorProfile::new_display_p3().encode().unwrap();
+    let srgb = moxcms::ColorProfile::new_srgb().encode().unwrap();
+    let (id, t) = read(&[gamma_1], Some(&p3));
+    assert_eq!(id, 2, "iCCP converts through linear Rec.2020");
+    assert_rgb(t, [linear(code); 3], "neutrals keep through iCCP");
+    let (id, t) = read(&[gamma_1], Some(&srgb));
+    assert_eq!(id, 0, "an sRGB iCCP is sRGB");
+    assert_rgb(t, [linear(code); 3], "iCCP over gAMA");
+    let (id, t) = read(&[(b"cICP", &[1, 8, 0, 1])], Some(&p3));
+    assert_eq!(id, 0, "cICP over iCCP");
+    assert_rgb(t, [stored; 3], "cICP over iCCP");
+
+    let (id, t) = {
+        let red = [255u8, 0, 0].repeat(64);
+        let (id, [t, _]) = read_back(&d, &tagged::png(tagged::RGB8, [8, 8], &red, Some(&p3), &[]));
+        (id, t)
+    };
+    assert_eq!(id, 2);
+    let want = orr_color::RgbPrimaries::DISPLAY_P3.matrix_to(orr_color::RgbPrimaries::REC2020)
+        * orr_math::DVec3::X;
+    assert_rgb(t, want.as_vec3().to_array(), "iCCP primaries");
+
+    let gray = moxcms::ColorProfile::new_gray_with_gamma(1.8)
+        .encode()
+        .unwrap();
+    let image = tagged::png(
+        (png::ColorType::Grayscale, png::BitDepth::Eight),
+        [8, 8],
+        &[128; 64],
+        Some(&gray),
+        &[],
+    );
+    let (_, [t, _]) = read_back(&d, &image);
+    assert_rgb(t, [stored.powf(1.8); 3], "gray iCCP");
 
     // Code points outside the three ids read, and neutrals stay.
     let (id, t) = read(&[(b"cICP", &[7, 4, 0, 1])], None);

@@ -1240,7 +1240,7 @@ dependencies = [
  "byteorder-lite",
  "exr",
  "image-webp",
- "moxcms",
+ "moxcms 0.8.1",
  "num-traits",
  "png 0.18.1",
  "zune-core",
@@ -1712,6 +1712,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "moxcms"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "396077b717181ce3f9a6b66739b269b82d756be5ec0f76be0bc40a7c51775830"
+dependencies = [
+ "num-traits",
+ "pxfm",
+]
+
+[[package]]
 name = "ndk"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2174,6 +2184,7 @@ dependencies = [
  "libloading",
  "meshopt",
  "mimalloc",
+ "moxcms 0.9.1",
  "openusd",
  "orr_color",
  "orr_io",
@@ -2292,7 +2303,7 @@ dependencies = [
  "cc",
  "exr",
  "log",
- "moxcms",
+ "moxcms 0.8.1",
  "orr_color",
  "orr_dlss",
  "orr_math",

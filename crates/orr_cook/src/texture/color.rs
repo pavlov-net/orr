@@ -13,7 +13,13 @@
 //! Primaries with a cooked id stay as stored, tagged with the id. Any others convert to Rec.2020,
 //! the working space, whose gamut is the widest of the ids.
 
-use orr_color::{Chromaticity, Primaries, RgbPrimaries, hlg_decode, pq_decode, srgb_decode};
+use std::fmt;
+use std::sync::Arc;
+
+use moxcms::{ColorProfile, DataColorSpace, Layout, ToneReprCurve, TransformOptions};
+use orr_color::{
+    Chromaticity, Primaries, RgbPrimaries, hlg_decode, pq_decode, rec709_to_rec2020, srgb_decode,
+};
 use orr_math::{DMat3, DVec3};
 
 use super::mips::settled;
@@ -251,11 +257,20 @@ impl ImageColor {
         f: &FileColor,
         over: Option<Primaries>,
     ) -> (Read, Primaries, Option<DMat3>) {
-        let (primaries, matrix) = match over {
-            Some(p) => (p, None),
-            None => self.gamut(f).cooked(),
+        let icc = f
+            .icc
+            .clone()
+            .filter(|_| self.honors_file() && over.is_none());
+        let (primaries, matrix) = match (over, &icc) {
+            (Some(p), _) => (p, None),
+            (None, Some(_)) => (Primaries::Rec2020, None),
+            (None, None) => self.gamut(f).cooked(),
         };
-        (Read::of(self.decode(f)), primaries, matrix)
+        let read = Read {
+            decode: self.decode(f),
+            icc,
+        };
+        (read, primaries, matrix)
     }
 }
 
@@ -291,27 +306,35 @@ impl Decode {
 #[derive(Clone, Debug)]
 pub(crate) struct Read {
     pub(crate) decode: Decode,
+    /// Stands in for `decode`'s transfer on red, green and blue.
+    pub(crate) icc: Option<Icc>,
 }
 
 impl Read {
     pub(crate) fn of(decode: Decode) -> Self {
-        Self { decode }
+        Self { decode, icc: None }
     }
 
     /// Whether this is `decode` alone, so that blocks stored under `decode` hold what it reads.
     pub(crate) fn is(&self, decode: Decode) -> bool {
-        self.decode == decode
+        self.decode == decode && self.icc.is_none()
     }
 
     /// The color of stored texel `t`, through `gamut`, with its alpha.
     pub(crate) fn color(&self, t: [f32; 4], gamut: Option<&DMat3>) -> [f32; 4] {
-        let rgb = [0, 1, 2].map(|c| self.decode.value(t[c]));
+        let rgb = match &self.icc {
+            Some(icc) => icc.linear([0, 1, 2].map(|c| self.decode.signal(t[c]))),
+            None => [0, 1, 2].map(|c| self.decode.value(t[c])),
+        };
         let [r, g, b] = gamut.map_or(rgb, |m| multiply(m, rgb));
         [r, g, b, t[3]]
     }
 
     /// Channel `c` of stored texel `t`, as a channel of color.
     pub(crate) fn value(&self, t: [f32; 4], c: usize) -> f32 {
+        if self.icc.is_some() && c < 3 {
+            return self.color(t, None)[c];
+        }
         self.decode.value(t[c])
     }
 }
@@ -323,10 +346,91 @@ pub(crate) struct FileColor {
     pub(crate) gamut: Option<Gamut>,
     /// See [`Decode::narrow`].
     pub(crate) narrow: Option<[f32; 2]>,
+    pub(crate) icc: Option<Icc>,
     /// It stores floats or signed values, which the sRGB curve doesn't encode.
     pub(crate) numeric: bool,
     /// It stores 8 bits in each of 3 or 4 channels.
     pub(crate) rgb8: bool,
+}
+
+/// An ICC profile's transform to linear Rec.2020.
+#[derive(Clone)]
+pub(crate) struct Icc {
+    transform: Arc<moxcms::TransformF32Executor>,
+    gray: bool,
+}
+
+impl fmt::Debug for Icc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Icc")
+    }
+}
+
+impl Icc {
+    /// `rgb` in the profile as linear Rec.2020. A gray profile reads red, which gray files
+    /// repeat over RGB.
+    fn linear(&self, rgb: [f32; 3]) -> [f32; 3] {
+        let n = if self.gray { 1 } else { 3 };
+        let mut out = [0.0; 3];
+        self.transform
+            .transform(&rgb[..n], &mut out)
+            .expect("one pixel of each layout");
+        out
+    }
+}
+
+/// States on `f` what ICC profile `bytes` says of an image of RGB or `gray`. A profile for
+/// neither, or one that doesn't parse, states nothing, and `false` says so. A profile that reads
+/// as sRGB states that, with no transform: most profiles are sRGB, and their blocks and ids stay.
+pub(crate) fn read_icc(f: &mut FileColor, bytes: &[u8], gray: bool) -> bool {
+    let Some(icc) = icc_transform(bytes, gray) else {
+        return false;
+    };
+    const STEPS: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
+    let srgb = STEPS.iter().all(|&r| {
+        STEPS.iter().all(|&g| {
+            STEPS.iter().all(|&b| {
+                let (r, g, b) = if gray { (r, r, r) } else { (r, g, b) };
+                let want = rec709_to_rec2020([r, g, b].map(|v| srgb_decode(f64::from(v))));
+                let got = DVec3::from(icc.linear([r, g, b]).map(f64::from));
+                (got - want).abs().max_element() < 2e-3
+            })
+        })
+    });
+    if srgb {
+        f.transfer = Some(Transfer::Srgb);
+        f.gamut = Some(Gamut::REC709);
+        return true;
+    }
+    // Inputs that aren't colors take no primaries, so they read the curve at middle gray.
+    let weights = RgbPrimaries::REC2020.luminance_weights();
+    let y = weights.dot(DVec3::from(icc.linear([0.5; 3]).map(f64::from)));
+    let gamma = y.ln() / 0.5f64.ln();
+    f.transfer = (gamma.is_finite() && gamma > 0.0).then_some(Transfer::Gamma(gamma as f32));
+    f.icc = Some(icc);
+    true
+}
+
+fn icc_transform(bytes: &[u8], gray: bool) -> Option<Icc> {
+    let profile = ColorProfile::new_from_slice(bytes).ok()?;
+    let stated = match profile.color_space {
+        DataColorSpace::Gray => true,
+        DataColorSpace::Rgb => false,
+        _ => return None,
+    };
+    if stated != gray {
+        return None;
+    }
+    let linear = Some(ToneReprCurve::Lut(Vec::new()));
+    let mut target = ColorProfile::new_bt2020();
+    target.red_trc.clone_from(&linear);
+    target.green_trc.clone_from(&linear);
+    target.blue_trc = linear;
+    let layout = if gray { Layout::Gray } else { Layout::Rgb };
+    let transform = profile
+        .create_transform_f32(layout, &target, Layout::Rgb, TransformOptions::default())
+        .ok()?;
+    Some(Icc { transform, gray })
 }
 
 /// RGB primaries at `[x, y]` of red, green, blue and white.

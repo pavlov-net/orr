@@ -1626,6 +1626,9 @@ impl TextureJob {
             _ => None,
         };
         let mut img = Img::new(w, h);
+        // One ICC transform gives all three channels of a texel.
+        let mut profiled: HashMap<usize, Vec<[f32; 4]>> = HashMap::new();
+        let stored = Read::of(Decode::STORED);
         for (c, ch) in self.pack.channels.iter().enumerate() {
             match ch {
                 &Channel::Constant(v) => img.px.par_iter_mut().for_each(|t| t[c] = v),
@@ -1644,18 +1647,24 @@ impl TextureJob {
                     a,
                     b,
                 } => {
-                    img.px
-                        .par_iter_mut()
-                        .zip(&decoded[image].px)
-                        .for_each(|(t, s)| {
-                            let v = read.value(*s, *channel);
-                            let read = a + b * limit.map_or(v, |l| v.clamp(0.0, l));
-                            t[c] = if limit == Some(f32::INFINITY) {
-                                read.max(0.0)
-                            } else {
-                                read
-                            };
+                    let source = &decoded[image].px;
+                    let (texels, read) = if read.icc.is_some() {
+                        let texels = profiled.entry(*image).or_insert_with(|| {
+                            source.par_iter().map(|s| read.color(*s, None)).collect()
                         });
+                        (&*texels, &stored)
+                    } else {
+                        (source, read)
+                    };
+                    img.px.par_iter_mut().zip(texels).for_each(|(t, s)| {
+                        let v = read.value(*s, *channel);
+                        let read = a + b * limit.map_or(v, |l| v.clamp(0.0, l));
+                        t[c] = if limit == Some(f32::INFINITY) {
+                            read.max(0.0)
+                        } else {
+                            read
+                        };
+                    });
                 }
             }
         }
