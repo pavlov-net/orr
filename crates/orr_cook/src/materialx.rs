@@ -4,9 +4,10 @@
 //! Inputs connect by `nodename` (and `output`), by `nodegraph` (and `output`, which a graph of
 //! one output ignores), or inside a node graph by `interfacename`. File values take the
 //! `fileprefix` of their nearest scope and resolve against the directory of their document.
-//! Images of color types read in their `colorspace`, inherited likewise, so that the document's
-//! working space is the last scope, and "data" where no scope names one. A name that isn't a
-//! known space warns and reads as "data".
+//! Images and values of color types read in their `colorspace`, inherited likewise, so that the
+//! document's working space is the last scope, and "data" where no scope names one: values
+//! convert here to the linear Rec.709 of [`Material`](orr_pack::material::Material), images when
+//! they cook. A name that isn't a known space warns and reads as "data".
 //! A standalone material has no mesh, so each texture keeps its uv set (0 or 1) and transform
 //! in its slot; geometric properties name `st`, `UV0` or a `geompropdef` of a texcoord.
 //!
@@ -38,8 +39,9 @@ use std::path::{Path, PathBuf};
 use roxmltree::{Document, Node as XmlNode, NodeId};
 
 use crate::import::{Scene, SceneMaterial};
-use crate::shading::{self, Input, Network, Node, Unit, through};
+use crate::shading::{self, Input, Network, Node, Unit, is_color, through};
 use crate::state::{Input as FileInput, Memo};
+use crate::texture::color::ImageColor;
 use crate::texture::material::{ImageData, ImageFile};
 use crate::{Error, Result};
 
@@ -585,6 +587,7 @@ fn network(
     // definitions this document never sees, such as the nodedef behind a functional graph.
     let mut resolved = vec![false; elements.len()];
     let mut pending = vec![m];
+    let mut warnings = Vec::new();
     // Filename inputs fed by a connection, which may end in a string, and their units.
     let mut filenames = Vec::new();
     while let Some(n) = pending.pop() {
@@ -626,7 +629,7 @@ fn network(
                 }
                 None => match source.0.attribute("value") {
                     None => continue,
-                    Some(v) => value(docs, *d, &source.0, v, unit()?, load),
+                    Some(v) => value(docs, *d, &source.0, v, unit()?, load, &mut warnings),
                 },
             };
             inputs.insert(input_name, value);
@@ -647,7 +650,6 @@ fn network(
     let surface =
         shader("surfaceshader").ok_or_else(|| format!("{material} has no surfaceshader"))?;
     let displacement = shader("displacementshader");
-    let mut warnings = Vec::new();
     if shader("backsurfaceshader").is_some_and(|b| b != surface) {
         warnings.push(format!(
             "material {material}: backsurfaceshader is not honored yet; both sides read \
@@ -687,15 +689,38 @@ fn value(
     v: &str,
     unit: Unit,
     load: &mut dyn FnMut(&Path, &str) -> usize,
+    warnings: &mut Vec<String>,
 ) -> Input {
-    match e.attribute("type").unwrap_or_default() {
+    let ty = e.attribute("type").unwrap_or_default();
+    match ty {
         "filename" => file_input(docs, d, e, v, unit, load),
         "string" => Input::Text(v.to_string()),
         "boolean" => Input::Value(vec![if v == "true" { 1.0 } else { 0.0 }], unit),
-        _ => v
-            .split(',')
-            .map(|x| x.trim().parse::<f32>())
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_or_else(|_| Input::Text(v.to_string()), |n| Input::Value(n, unit)),
+        _ => {
+            let numbers = v
+                .split(',')
+                .map(|x| x.trim().parse::<f32>())
+                .collect::<std::result::Result<Vec<_>, _>>();
+            let Ok(mut numbers) = numbers else {
+                return Input::Text(v.to_string());
+            };
+            if let (true, Some(space), &[r, g, b, ..]) = (
+                is_color(ty),
+                inherited(docs, d, e, "colorspace"),
+                &numbers[..],
+            ) {
+                match ImageColor::named(space) {
+                    Some(ImageColor::Named(s)) => {
+                        numbers[..3].copy_from_slice(&s.to_rec709([r, g, b]));
+                    }
+                    Some(_) => {}
+                    None => warnings.push(format!(
+                        "{}: colorspace {space} reads as data",
+                        e.attribute("name").unwrap_or_default()
+                    )),
+                }
+            }
+            Input::Value(numbers, unit)
+        }
     }
 }

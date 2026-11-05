@@ -120,6 +120,14 @@ impl Space {
         transfer: Transfer::Srgb,
         gamut: Gamut::REC709,
     };
+
+    /// `rgb` in this space as the linear Rec.709 of material fields.
+    pub(crate) fn to_rec709(self, rgb: [f32; 3]) -> [f32; 3] {
+        let linear = DVec3::from(rgb.map(|v| f64::from(self.transfer.decode(v))));
+        (self.gamut.matrix_to(RgbPrimaries::REC709) * linear)
+            .as_vec3()
+            .to_array()
+    }
 }
 
 /// What an importer's rules say an image's texels are.

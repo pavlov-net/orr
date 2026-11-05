@@ -1179,3 +1179,43 @@ fn named_spaces_stand_over_what_the_file_states() {
         assert_eq!(primaries(&a), want, "{attrs}");
     }
 }
+
+/// Spec L184: "implementations are expected to translate those color values", and L331's working
+/// space is "the default color space for all image inputs and color values". The audit's rows:
+/// 0.5 under an sRGB name reads 0.214, a document in ACEScg converts what it doesn't mark, and
+/// "data" (L381) converts nothing.
+#[test]
+fn color_values_read_in_their_space() {
+    let (a, _) = cook_body(
+        "",
+        r#"<input name="base_color" type="color3" value="0.5,0.5,0.5" colorspace="srgb_rec709_scene"/>
+           <input name="base_weight" type="float" value="0.5" colorspace="srgb_rec709_scene"/>"#,
+    )
+    .unwrap();
+    let m = material(&a);
+    assert!(
+        m.base_color.iter().all(|c| near(*c, 0.214)),
+        "{:?}",
+        m.base_color
+    );
+    assert!(close(m.base_weight, 0.5));
+
+    let doc = write_doc(
+        &fixture(),
+        "m.mtlx",
+        r#"colorspace="acescg""#,
+        "",
+        r#"<input name="base_color" type="color3" value="0.5,0.25,0.125"/>
+           <input name="specular_color" type="color3" value="0.5,0.25,0.125" colorspace="data"/>"#,
+    );
+    let (a, _) = cook(&doc, "M").unwrap();
+    let m = material(&a);
+    // By the published ACEScg to linear Rec.709 matrix.
+    let want = [0.6867, 0.2188, 0.0999];
+    assert!(
+        m.base_color.iter().zip(want).all(|(c, w)| near(*c, w)),
+        "{:?}",
+        m.base_color
+    );
+    assert_eq!(m.specular_color, [0.5, 0.25, 0.125]);
+}
