@@ -223,8 +223,8 @@ impl Triangle {
         };
         Self {
             uv,
-            normals: v.map(|i| Vec3::from(m.normals[i])),
-            tangents: v.map(|i| Vec3::from_slice(&tangents[i][..3])),
+            normals: v.map(|i| Vec3::from(m.normals[i]).normalize_or(Vec3::Z)),
+            tangents: v.map(|i| Vec3::from_slice(&tangents[i][..3]).normalize_or(Vec3::X)),
             sign: tangents[v[0]][3],
             geometric: e1.cross(e2).normalize_or(Vec3::Z),
             tangent,
@@ -238,9 +238,12 @@ impl Triangle {
         let uv = [0, 1].map(|a| w.x * self.uv[0][a] + w.y * self.uv[1][a] + w.z * self.uv[2][a]);
         let v = normal::decode([map[0].sample(uv), map[1].sample(uv)]);
         let v = Vec3::from(map[0].normal_frame(v));
-        let n = at(self.normals).normalize_or(self.geometric);
+        let frame = at(self.normals);
+        let n = frame.normalize_or(self.geometric);
 
-        let stored = shading_normal(n, at(self.tangents).normalize_or(Vec3::X), self.sign, v);
+        let tangent = at(self.tangents);
+        let bitangent = frame.cross(tangent) * self.sign;
+        let stored = (tangent * v.x + bitangent * v.y + frame * v.z).normalize_or(n);
 
         let (mut t, mut b) = (self.tangent, self.bitangent);
         if t.dot(t) == 0.0 {
@@ -248,17 +251,10 @@ impl Triangle {
         }
         let t = (t - n * n.dot(t)).normalize_or(Vec3::X);
         let sign = if n.cross(t).dot(b) < 0.0 { -1.0 } else { 1.0 };
-        let derived = shading_normal(n, t, sign, v);
+        let derived = (t * v.x + n.cross(t) * sign * v.y + n * v.z).normalize_or(n);
 
         stored.dot(derived).clamp(-1.0, 1.0).acos().to_degrees()
     }
-}
-
-/// `material_normal`: tangent-space normal `v` in the frame of `n` and tangent `t`.
-fn shading_normal(n: Vec3, t: Vec3, sign: f32, v: Vec3) -> Vec3 {
-    let t = (t - n * n.dot(t)).normalize_or(Vec3::X);
-    let b = n.cross(t) * sign;
-    (t * v.x + b * v.y + n * v.z).normalize_or(n)
 }
 
 /// `orr_shaders.math`'s `orthonormal_basis`: a tangent and bitangent of unit `n`.

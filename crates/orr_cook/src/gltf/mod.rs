@@ -287,7 +287,7 @@ struct Placing<'a> {
 /// Appends a triangle primitive to `b` with its morph targets at the weights, its positions
 /// taken to model space by the world transform (winding and tangent signs flipped under a
 /// mirroring one). Tangents are the primitive's own, or MikkTSpace's where the model carries
-/// them, computed from its morphed attributes in its own space as L1821 and L2004 ask.
+/// them, computed from its morphed attributes in its own space as the glTF spec asks.
 fn append_primitive(
     src: &Data<'_>,
     prim: &gltf::Primitive<'_>,

@@ -813,6 +813,15 @@ const STICKER_TEXEL: [u8; 4] = [40, 90, 230, 255];
 const STICKER_ROUGHNESS: f32 = 0.15;
 /// The tangent-space normal of the tilted models' texture.
 const TILT: [f32; 3] = [0.3, 0.5, 0.812];
+type SkewCorner = ([f32; 3], [f32; 3], [f32; 3], f32);
+
+/// Position, normal, tangent and sign of a triangle's corners, whose frames spread far enough
+/// that between them the normal and tangent are neither unit nor perpendicular.
+const SKEW: [SkewCorner; 3] = [
+    ([-1.0, -1.0, 0.0], [-0.8, -0.2, 1.0], [1.0, 0.2, 0.8], -1.0),
+    ([1.0, -1.0, 0.0], [0.8, -0.3, 1.0], [1.0, -0.5, -0.8], -1.0),
+    ([0.0, 1.0, 0.0], [0.0, 0.9, 1.0], [1.0, 0.0, 0.0], -1.0),
+];
 const MATTE_ROUGHNESS: f32 = 0.6;
 
 fn cook() -> Arc<[u8]> {
@@ -1049,6 +1058,26 @@ fn cook() -> Arc<[u8]> {
                 texture("tex/sticker", sticker, Usage::Color),
                 texture("tex/tilt", tilt, Usage::Normal),
                 model("tilted", quad(unit), vec![tilted], one()),
+                AssetSpec {
+                    name: "tilted skew".into(),
+                    source: Source::Mesh {
+                        mesh: MeshInput {
+                            tangents: Some(SKEW.map(|c| Vec3::from(c.2).extend(c.3)).to_vec()),
+                            ..mesh(
+                                SKEW.map(|c| c.0.into()).to_vec(),
+                                SKEW.map(|c| Vec3::from(c.1).normalize()).to_vec(),
+                                vec![Vec2::ZERO, Vec2::X, Vec2::Y],
+                                vec![[0, 1, 2]],
+                                &[1],
+                            )
+                        },
+                        materials: vec![tilted],
+                        settings: MeshSettings {
+                            tangent_error_max: None,
+                            ..MeshSettings::default()
+                        },
+                    },
+                },
                 AssetSpec {
                     name: "tilted computed".into(),
                     source: Source::Mesh {
@@ -2912,6 +2941,55 @@ fn set_decals(s: &mut SceneWriter<'_>, matte: MaterialId, sticker: MaterialId, w
     );
     s.set_decal(DecalId(0), Some(&under)).unwrap();
     s.set_decal(DecalId(1), Some(&over)).unwrap();
+}
+
+/// MikkTSpace's pixel transform, which bakers invert: each corner's normal and tangent placed
+/// and normalized, then interpolated and used as they stand. A mirror negates the sign.
+#[test]
+fn normal_maps_shade_through_the_interpolated_frame_they_were_baked_in() {
+    let _serial = serial();
+    let mut w = World::new(&KernelSet {
+        modules: &[],
+        surfaces: 0,
+    });
+    let cpu = CpuMesh::of("tilted skew");
+    for linear in [
+        Mat3::IDENTITY,
+        Mat3::from_diagonal(Vec3::new(-1.5, 1.0, 2.0)),
+    ] {
+        let item = Item {
+            model: "tilted skew",
+            linear,
+            at: Vec3::ZERO,
+        };
+        let placed = place(&mut w, &[item]);
+        let mut shot = Shot::at(DVec3::new(0.0, 0.0, 3.0), DVec3::ZERO, 1);
+        shot.focus = None;
+        let g = shoot(&mut w, &placed, &shot);
+        let r = rays(&g.view, &trace::MODULE, "pixels", 1);
+        let mirror = linear.determinant().signum();
+        let normals = linear.inverse().transpose();
+        let mut seen = 0;
+        for t in r.traced.iter().filter(|t| t.instance != 0) {
+            let (p, ..) = cpu.triangle(t.cluster, t.primitive);
+            let corner = p.map(|p| {
+                let near = |c: &&(_, _, _, _)| Vec3::from(c.0).distance(p) < 1e-3;
+                SKEW.iter().find(near).unwrap()
+            });
+            let b = Vec2::from(t.barycentrics);
+            let wt = [1.0 - b.x - b.y, b.x, b.y];
+            let sum = |f: &dyn Fn(usize) -> Vec3| (0..3).map(|k| f(k) * wt[k]).sum::<Vec3>();
+            let n = sum(&|k| (normals * Vec3::from(corner[k].1).normalize()).normalize());
+            let tangent = sum(&|k| (linear * Vec3::from(corner[k].2)).normalize());
+            let bitangent = n.cross(tangent) * corner[0].3 * mirror;
+            let [x, y, z] = TILT;
+            let want = (tangent * x + bitangent * y + n * z).normalize();
+            let got = Vec3::from(t.normal);
+            assert!(got.dot(want) > 0.9999, "{got} want {want}");
+            seen += 1;
+        }
+        assert!(seen > 1000, "{seen} pixels");
+    }
 }
 
 /// Asserts that every drawn pixel of `g` whose normal `pick` keeps is `want`, and counts them.

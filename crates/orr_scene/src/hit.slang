@@ -163,6 +163,7 @@ public bool strand_geometry(inout SurfaceInput i, ProducerBatch b, uint segment,
     i.uv[1] = i.uv[0];
     i.geometric_normal = n;
     i.normal = n;
+    i.frame_normal = n;
     i.tangent = float4(t, 1.0);
     i.object_position = object;
     i.object_normal = n_obj;
@@ -306,13 +307,20 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, 
     float mirror = det < 0.0 ? -1.0 : 1.0;
     float3 ng = safe_normalize(cross(e1, e2)) * mirror;
     float3x3 normal_matrix = cofactors(pl.linear);
-    float3 n_obj = safe_normalize(w.x * a0.normal + w.y * a1.normal + w.z * a2.normal, ng);
-    float3 n = safe_normalize(mul(normal_matrix, n_obj) * mirror, ng);
+    float3 face = cross(t.position[1] - t.position[0], t.position[2] - t.position[0]);
+    float3 n_obj = safe_normalize(w.x * a0.normal + w.y * a1.normal + w.z * a2.normal, safe_normalize(face));
+    // Placed per vertex and interpolated as they stand, the frame normal maps are baked in.
+    float3 frame = float3(0.0);
+    for (uint c = 0; c < 3; c++)
+        frame += w[c] * safe_normalize(mul(normal_matrix, t.attributes[c].normal) * mirror, ng);
+    float3 n = safe_normalize(frame, ng);
     float4 tangent;
     if ((attributes & MESH_TANGENT) != 0)
     {
-        float3 tt = w.x * a0.tangent.xyz + w.y * a1.tangent.xyz + w.z * a2.tangent.xyz;
-        tangent = float4(safe_normalize(mul(pl.linear, tt), float3(1, 0, 0)), a0.tangent.w * mirror);
+        float3 tt = float3(0.0);
+        for (uint c = 0; c < 3; c++)
+            tt += w[c] * safe_normalize(mul(pl.linear, t.attributes[c].tangent.xyz), float3(1, 0, 0));
+        tangent = float4(tt, a0.tangent.w * mirror);
     }
     else
     {
@@ -331,15 +339,18 @@ public void triangle_geometry(inout SurfaceInput i, Corners t, uint attributes, 
         }
         tt = safe_normalize(tt - n * dot(n, tt), float3(1, 0, 0));
         tangent = float4(tt, dot(cross(n, tt), bt) < 0.0 ? -1.0 : 1.0);
+        frame = n;
     }
     if (dot(ng, d) > 0.0 && (m.flags & MATERIAL_DOUBLE_SIDED) != 0)
     {
         ng = -ng;
         n = -n;
+        frame = -frame;
         tangent.w = -tangent.w;
     }
     i.geometric_normal = ng;
     i.normal = n;
+    i.frame_normal = frame;
     i.tangent = tangent;
     i.object_position = w.x * t.position[0] + w.y * t.position[1] + w.z * t.position[2];
     i.object_normal = n_obj;

@@ -48,8 +48,9 @@ public struct SurfaceInput
     public uint surface;            // linked surface id; 0 = StandardSurface
     public UvFootprint uv[2];       // per uv set; producer and patch geometry give both its one uv
     public float3 geometric_normal; // the triangle's front face
-    public float3 normal;           // interpolated vertex normal
-    public float4 tangent;          // xyz unit tangent, w bitangent sign
+    public float3 normal;           // interpolated vertex normal, unit
+    public float3 frame_normal;     // `normal` before normalizing, not always unit
+    public float4 tangent;          // xyz as interpolated, not always unit; w bitangent sign
     public float3 object_position;
     public float3 object_normal;
     public float3x3 object_to_render; // the instance's linear transform
@@ -105,16 +106,18 @@ public float material_coverage(SurfaceInput i)
     return material_opacity(i) >= i.scene.materials[i.material].alpha_cutoff ? 1.0 : 0.0;
 }
 
-// The shading frame: the vertex normal and tangent, turned by the material's normal map.
+// The shading frame: the vertex normal, turned by the material's normal map. MikkTSpace's
+// bakers invert this transform: the interpolated normal and tangent as they stand, neither
+// unit nor perpendicular.
 public float3 material_normal(SurfaceInput i, MaterialGpu* m)
 {
-    float3 n = i.normal;
     if (!material_bound(m, TEXTURE_NORMAL))
-        return n;
+        return i.normal;
     float3 v = material_normal_frame(m, TEXTURE_NORMAL, normal_decode(material_texture(m, TEXTURE_NORMAL, i.uv, float4(0.5, 0.5, 1.0, 1.0)).xy));
-    float3 t = safe_normalize(i.tangent.xyz - n * dot(n, i.tangent.xyz), float3(1, 0, 0));
+    float3 n = i.frame_normal;
+    float3 t = i.tangent.xyz;
     float3 b = cross(n, t) * i.tangent.w;
-    return safe_normalize(t * v.x + b * v.y + n * v.z, n);
+    return safe_normalize(t * v.x + b * v.y + n * v.z, i.normal);
 }
 
 // What the decals over a hit write: per parameter the sum of each decal's value times its
