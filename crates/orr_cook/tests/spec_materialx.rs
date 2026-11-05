@@ -486,6 +486,16 @@ fn documents_map_as_the_clauses_say() {
             check: |m| !bound(m, slot::ROUGHNESS) && close(m.specular_roughness, 0.75),
         },
         Row {
+            clause: "Nodes image: a constant that holds no name is an image with no file",
+            body: r#"<constant name="c" type="filename">
+                    <input name="value" type="filename" value=""/></constant>
+                  <image name="i" type="float">
+                  <input name="file" type="filename" nodename="c"/>
+                  <input name="default" type="float" value="0.75"/></image>"#,
+            inputs: ROUGH_I,
+            check: |m| !bound(m, slot::ROUGHNESS) && close(m.specular_roughness, 0.75),
+        },
+        Row {
             clause: "Nodes image: default reads if an interface token has no substitution value",
             body: r#"<image name="i" type="float">
                   <input name="file" type="filename" value="[nope].png"/>
@@ -1183,6 +1193,86 @@ fn xinclude_fallbacks_stand_where_the_include_failed() {
     );
 }
 
+/// Nodes `image`: `layer` is "the name of the layer to extract from a multi-layer input file", and
+/// `default` reads "if the specified layer does not exist in the file".
+#[test]
+fn an_image_reads_its_layer_or_else_its_default() {
+    use exr::prelude::{AnyChannel, AnyChannels, FlatSamples, Image, WritableImage};
+    let d = fixture();
+    let plane = |name: &str, v: f32| AnyChannel::new(name, FlatSamples::F32(vec![v; 64]));
+    let channels = AnyChannels::sort(
+        vec![
+            plane("rough.R", 0.25),
+            plane("rough.G", 0.25),
+            plane("rough.B", 0.25),
+            plane("height.Z", 0.375),
+            plane("R", 0.625),
+            plane("G", 0.625),
+            plane("B", 0.625),
+        ]
+        .into(),
+    );
+    Image::from_channels((8, 8), channels)
+        .write()
+        .to_file(d.join("layers.exr"))
+        .unwrap();
+    let cooked = |file: &str, layer: Option<&str>| {
+        let layer = layer.map_or(String::new(), |l| {
+            format!(r#"<input name="layer" type="string" value="{l}"/>"#)
+        });
+        let body = format!(
+            r#"<image name="i" type="float">
+              <input name="file" type="filename" value="{file}"/>
+              <input name="default" type="float" value="0.75"/>{layer}</image>"#
+        );
+        let doc = write_doc(&d, "m.mtlx", "", &body, ROUGH_I);
+        let (a, _) = cook(&doc, "M").unwrap();
+        let m = material(&a);
+        assert!(!bound(&m, slot::ROUGHNESS), "every layer here is one value");
+        m.specular_roughness
+    };
+    // A control: with no layer the plain channels read, with or without `layer` support.
+    assert!(close(cooked("layers.exr", None), 0.625));
+    assert!(close(cooked("layers.exr", Some("rough")), 0.25));
+    assert!(close(cooked("layers.exr", Some("height")), 0.375));
+    assert!(close(cooked("layers.exr", Some("nope")), 0.75));
+    assert!(close(cooked("gray30.png", Some("rough")), 0.75));
+    assert!(close(cooked("layers.exr", Some("rgba")), 0.625));
+
+    // Nodes `image`: "If no value for layer is provided and the input file has multiple layers,
+    // then the "default" layer will be used".
+    let channels = AnyChannels::sort(
+        vec![
+            plane("default.R", 0.125),
+            plane("default.G", 0.125),
+            plane("default.B", 0.125),
+            plane("R", 0.625),
+            plane("G", 0.625),
+            plane("B", 0.625),
+        ]
+        .into(),
+    );
+    Image::from_channels((8, 8), channels)
+        .write()
+        .to_file(d.join("default.exr"))
+        .unwrap();
+    assert!(close(cooked("default.exr", None), 0.125));
+
+    // The file and the layer both reach the image from outside it.
+    let body = r#"<constant name="k" type="filename">
+        <input name="value" type="filename" value="layers.exr"/></constant>
+      <nodegraph name="g">
+        <input name="f" type="filename" nodename="k"/>
+        <input name="l" type="string" value="rough"/>
+        <image name="i" type="float">
+          <input name="file" type="filename" interfacename="f"/>
+          <input name="layer" type="string" interfacename="l"/></image>
+        <output name="o" type="float" nodename="i"/></nodegraph>"#;
+    let inputs = r#"<input name="specular_roughness" type="float" nodegraph="g"/>"#;
+    let (a, _) = cook(&write_doc(&d, "m.mtlx", "", body, inputs), "M").unwrap();
+    assert!(close(material(&a).specular_roughness, 0.25));
+}
+
 /// Nodes `image`: `default` reads "if the file reference can not be resolved", which stops once
 /// the file is there.
 #[test]
@@ -1708,6 +1798,19 @@ fn image_color_spaces_decode_as_named() {
 /// Spec L381: "data" means "no color space conversion should be applied". What a file states
 /// doesn't apply under any space a document names either: L364 has the application transform from
 /// the space named. `acescg`, which has no id, converts to Rec.2020; `lin_p3d65_scene` keeps its.
+/// The input reading a file names how it decodes, wherever the name comes from.
+#[test]
+fn a_colorspace_stands_on_a_file_read_through_a_constant() {
+    let body = r#"<constant name="c" type="filename">
+          <input name="value" type="filename" value="gray128.png"/></constant>
+        <image name="i" type="color3">
+          <input name="file" type="filename" nodename="c" colorspace="g22_rec709_scene"/></image>"#;
+    let inputs = r#"<input name="base_color" type="color3" nodename="i"/>"#;
+    let (a, _) = cook_body(body, inputs).unwrap();
+    let want = (128.0f32 / 255.0).powf(2.2);
+    assert!(material(&a).base_color.iter().all(|c| near(*c, want)));
+}
+
 #[test]
 fn named_spaces_stand_over_what_the_file_states() {
     let color = r#"<input name="base_color" type="color3" nodename="i"/>"#;

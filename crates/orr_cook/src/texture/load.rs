@@ -23,6 +23,7 @@ use orr_pack::texture::{FormatInfo, full_mip_count, mip_size, vk};
 use rayon::prelude::*;
 
 use super::color::{self, FileColor, Gamut, ImageColor, Transfer};
+use super::material::Layer;
 use super::{Img, Wrap};
 
 /// What a file of one channel, or of gray and alpha, holds.
@@ -97,6 +98,151 @@ pub(super) fn exr_wrap(bytes: &[u8]) -> Option<[Wrap; 2]> {
     let modes = modes.to_string();
     let (u, v) = modes.split_once(',').unwrap_or((&modes, &modes));
     Some([mode(u)?, mode(v)?])
+}
+
+/// The short name of `channel` of OpenEXR part `part`, if it lies directly in layer `name`: a
+/// channel states its layers in its own name, and a part's name may lead them.
+fn in_layer(
+    name: &str,
+    part: Option<&exr::meta::attribute::Text>,
+    channel: &str,
+) -> Option<String> {
+    let under = |full: &str| {
+        let short = full.strip_prefix(name)?.strip_prefix('.')?;
+        (!short.contains('.')).then(|| short.to_string())
+    };
+    under(channel).or_else(|| under(&format!("{}.{channel}", part?)))
+}
+
+/// The layer of an OpenEXR file that [`Layer::Implied`] reads, if the file has one.
+fn implied_layer(bytes: &[u8]) -> Option<&'static str> {
+    if !bytes.starts_with(&exr::meta::magic_number::BYTES) {
+        return None;
+    }
+    let meta = exr::meta::MetaData::read_from_buffered(Cursor::new(bytes), false).ok()?;
+    ["default", "rgba"].into_iter().find(|name| {
+        meta.headers.iter().any(|h| {
+            let part = h.own_attributes.layer_name.as_ref();
+            let held = |c: &exr::meta::attribute::ChannelDescription| {
+                in_layer(name, part, &c.name.to_string()).is_some()
+            };
+            h.channels.list.iter().any(held)
+        })
+    })
+}
+
+/// What `layer` reads of an image file, as a file of its own, or none where that is the file as
+/// it stands. Only OpenEXR files hold layers. The new file keeps the display window, data window
+/// and attributes of the part that holds the layer. Its red, green, blue and alpha are the
+/// channels of those names, or where the layer has no color, its other channels in file order
+/// from red. `rgba` names a file's own channels where no layer has that name.
+pub(super) fn layer_of(bytes: &[u8], layer: &Layer) -> Result<Option<Vec<u8>>, String> {
+    use exr::image::{AnyChannel, Encoding, FlatSamples};
+    use exr::prelude::{Image, ReadChannels, ReadLayers, SpecificChannels, WritableImage, read};
+    let name = match layer {
+        Layer::Whole => return Ok(None),
+        Layer::Named(name) => name.as_str(),
+        Layer::Implied => match implied_layer(bytes) {
+            Some(name) => name,
+            None => return Ok(None),
+        },
+    };
+    let absent = || match name {
+        "rgba" => Ok(None),
+        _ => Err(format!("it has no layer {name}")),
+    };
+    if !bytes.starts_with(&exr::meta::magic_number::BYTES) {
+        return absent();
+    }
+    let file = read()
+        .no_deep_data()
+        .largest_resolution_level()
+        .all_channels()
+        .all_layers()
+        .all_attributes()
+        .non_parallel()
+        .from_buffered(Cursor::new(bytes))
+        .map_err(|e| e.to_string())?;
+    let held = file.layer_data.iter().find_map(|part| {
+        let held: Vec<_> = part
+            .channel_data
+            .list
+            .iter()
+            .filter_map(|c| {
+                let short = in_layer(
+                    name,
+                    part.attributes.layer_name.as_ref(),
+                    &c.name.to_string(),
+                );
+                Some((short?, c))
+            })
+            .collect();
+        (!held.is_empty()).then_some((part, held))
+    });
+    let Some((part, held)) = held else {
+        return absent();
+    };
+    let mut rgba: [Option<&AnyChannel<FlatSamples>>; 4] = [None; 4];
+    let mut others = Vec::new();
+    for (short, channel) in held {
+        match short.to_ascii_lowercase().as_str() {
+            "r" | "red" => rgba[0] = Some(channel),
+            "g" | "green" => rgba[1] = Some(channel),
+            "b" | "blue" => rgba[2] = Some(channel),
+            "a" | "alpha" => rgba[3] = Some(channel),
+            _ => others.push(channel),
+        }
+    }
+    if rgba[..3].iter().all(Option::is_none) {
+        if others.is_empty() {
+            others.extend(rgba[3].take());
+        }
+        for (slot, channel) in rgba.iter_mut().zip(others).take(3) {
+            *slot = Some(channel);
+        }
+    }
+    let [red, green, blue, alpha] = rgba;
+    let width = part.size.width();
+    let sample = |c: Option<&AnyChannel<FlatSamples>>, pos: exr::prelude::Vec2<usize>, or: f32| {
+        c.map_or(or, |c| {
+            let i = pos.y() * width + pos.x();
+            c.sample_data.value_by_flat_index(i).to_f32()
+        })
+    };
+    let rgb = |pos| {
+        (
+            sample(red, pos, 0.0),
+            sample(green, pos, 0.0),
+            sample(blue, pos, 0.0),
+        )
+    };
+    let attributes = || file.attributes.clone();
+    let own = || part.attributes.clone();
+    let mut out = Cursor::new(Vec::new());
+    // Without alpha the window around the data stays opaque, as it does reading the whole file.
+    match alpha {
+        Some(_) => {
+            let channels = SpecificChannels::rgba(|pos| {
+                let (r, g, b) = rgb(pos);
+                (r, g, b, sample(alpha, pos, 1.0))
+            });
+            let layer = exr::image::Layer::new(part.size, own(), Encoding::UNCOMPRESSED, channels);
+            Image::new(attributes(), layer)
+                .write()
+                .non_parallel()
+                .to_buffered(&mut out)
+        }
+        None => {
+            let channels = SpecificChannels::rgb(rgb);
+            let layer = exr::image::Layer::new(part.size, own(), Encoding::UNCOMPRESSED, channels);
+            Image::new(attributes(), layer)
+                .write()
+                .non_parallel()
+                .to_buffered(&mut out)
+        }
+    }
+    .map_err(|e| e.to_string())?;
+    Ok(Some(out.into_inner()))
 }
 
 /// Decodes an image file, recognized by its first bytes.
@@ -1069,6 +1215,58 @@ fn decode_block(vk_format: u32, block: &[u8]) -> Result<[[f32; 4]; 16], String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A layer in a window of its frame, in a named part of a file with stated primaries, reads
+    /// as that part of the whole file does.
+    #[test]
+    fn a_layer_keeps_the_frame_and_color_of_its_file() {
+        use exr::image::{AnyChannel, AnyChannels, Encoding, FlatSamples, Layer as ExrLayer};
+        use exr::meta::attribute::{Chromaticities, IntegerBounds};
+        use exr::meta::header::{ImageAttributes, LayerAttributes};
+        use exr::prelude::{Image, Vec2, WritableImage};
+        let plane = |name: &str, v: f32| AnyChannel::new(name, FlatSamples::F32(vec![v; 16]));
+        let mut image = ImageAttributes::new(IntegerBounds::from_dimensions((8, 8)));
+        image.chromaticities = Some(Chromaticities {
+            red: Vec2(0.708, 0.292),
+            green: Vec2(0.170, 0.797),
+            blue: Vec2(0.131, 0.046),
+            white: Vec2(0.3127, 0.3290),
+        });
+        let mut part = LayerAttributes::named("beauty");
+        part.layer_position = Vec2(2, 2);
+        let channels = AnyChannels::sort(
+            vec![
+                plane("P.X", 0.25),
+                plane("P.Y", 0.5),
+                plane("P.Z", 0.75),
+                plane("mask.A", 0.5),
+                plane("mask.Y", 0.125),
+            ]
+            .into(),
+        );
+        let layer = ExrLayer::new((4, 4), part, Encoding::UNCOMPRESSED, channels);
+        let mut file = Cursor::new(Vec::new());
+        Image::new(image, layer)
+            .write()
+            .to_buffered(&mut file)
+            .unwrap();
+        let file = file.into_inner();
+
+        let read = |name: &str| {
+            let layer = Layer::Named(name.into());
+            decode(&layer_of(&file, &layer).unwrap().unwrap()).unwrap()
+        };
+        let p = read("P");
+        let img = &p.layers[0];
+        assert_eq!((img.w, img.h), (8, 8));
+        assert_eq!(img.px[2 * 8 + 2], [0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(img.px[0], [0.0, 0.0, 0.0, 1.0]);
+        assert!(p.color.gamut.is_some());
+        assert_eq!(
+            read("beauty.mask").layers[0].px[2 * 8 + 2],
+            [0.125, 0.0, 0.0, 0.5]
+        );
+    }
 
     /// 32x32, each quadrant a flat color and alpha, from libwebp at quality 90 with lossless
     /// alpha: a VP8X file with ALPH and VP8 chunks.

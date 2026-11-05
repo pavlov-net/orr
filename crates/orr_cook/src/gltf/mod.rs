@@ -74,7 +74,7 @@ use crate::mesh::{
 use crate::patch::{self, MaterialPatch, MeshPatch};
 use crate::skin::{Graph, Skeleton, influences};
 use crate::state::{Input, Memo};
-use crate::texture::material::{ImageData, ImageFile};
+use crate::texture::material::{ImageData, ImageFile, Layer};
 use crate::{Error, GltfSettings, PartAttribute, Result};
 use data::{Buffer, Data, Document};
 
@@ -554,6 +554,7 @@ fn images(asset: &str, src: &Document, dir: &Path) -> Result<Vec<ImageFile>> {
                 None => (
                     uri.to_string(),
                     ImageData::File {
+                        layer: Layer::Whole,
                         path: data::uri_path(dir, uri),
                         read: None,
                     },

@@ -22,7 +22,9 @@
 //! `distance` and `angle` has no scene unit, so it converts nothing. The root of a document
 //! states no unit.
 //!
-//! A filename's `<UDIM>` and `<UVTILE>` make it a set of tiles ([`crate::texture::tiles`]), and
+//! An image's `layer` reads that layer of its file, and a file without one reads as a file that
+//! can't be read. An image with none reads layer `default`, then `rgba`, then the whole file. A
+//! filename's `<UDIM>` and `<UVTILE>` make it a set of tiles ([`crate::texture::tiles`]), and
 //! `[token]` reads the value of a `token` of the nearest scope, then of the nodedef the graph
 //! implements. A token with no value, a `{hostattr}` or `{frame}` (no host states one) and any
 //! other `<geometry token>` (a standalone material has no geometry) leave the file unresolved, so
@@ -49,7 +51,7 @@ use crate::import::{Scene, SceneMaterial};
 use crate::shading::{self, Input, Network, Node, Unit, is_color, through};
 use crate::state::{Input as FileInput, Memo};
 use crate::texture::color::ImageColor;
-use crate::texture::material::{ImageData, ImageFile, ImageTile};
+use crate::texture::material::{ImageData, ImageFile, ImageTile, Layer};
 use crate::texture::{self, tiles};
 use crate::{Error, Result};
 
@@ -135,16 +137,17 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
         })
         .collect::<Result<Vec<_>>>()?;
     let mut images = Vec::new();
-    let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
+    let mut by_path: HashMap<(PathBuf, Layer), usize> = HashMap::new();
     let mut listed = Vec::new();
     let mut past = Vec::new();
-    let mut load = |dir: &Path, file: FileName| -> usize {
+    let mut load = |dir: &Path, file: FileName, layer: Layer| -> usize {
         let (file, unresolved) = match file {
             Ok(file) => (file, None),
             Err((file, why)) => (file, Some(why)),
         };
         let p = dir.join(&file);
-        if let Some(&i) = by_path.get(&p) {
+        let key = (p.clone(), layer);
+        if let Some(&i) = by_path.get(&key) {
             return i;
         }
         let image = if let Some(why) = unresolved {
@@ -162,7 +165,11 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
                 .map(|(cell, path)| {
                     images.push(ImageFile {
                         name: tiles::named(&file, cell).to_string_lossy().into_owned(),
-                        data: ImageData::File { path, read: None },
+                        data: ImageData::File {
+                            path,
+                            read: None,
+                            layer: key.1.clone(),
+                        },
                     });
                     let image = images.len() - 1;
                     ImageTile { cell, image }
@@ -176,13 +183,14 @@ pub(crate) fn import(asset: &str, path: &Path, memo: &Memo, material: &str) -> R
             ImageFile {
                 name: file,
                 data: ImageData::File {
-                    path: p.clone(),
+                    path: p,
                     read: None,
+                    layer: key.1.clone(),
                 },
             }
         };
         images.push(image);
-        by_path.insert(p, images.len() - 1);
+        by_path.insert(key, images.len() - 1);
         images.len() - 1
     };
     let graph = network(&docs, &reader.order, material, &mut load).map_err(fail)?;
@@ -542,8 +550,9 @@ struct Graph {
 /// A filename with its substitutions made, or as it stands, with why it can't be resolved.
 type FileName = std::result::Result<String, (String, String)>;
 
-/// Adds the image of a filename, relative to a directory, and returns its index.
-type Load<'a> = dyn FnMut(&Path, FileName) -> usize + 'a;
+/// Adds the image of a filename, relative to a directory, read at a layer of its file, and returns
+/// its index.
+type Load<'a> = dyn FnMut(&Path, FileName, Layer) -> usize + 'a;
 
 /// The network of `material` in `docs`, the first of them the document cooked, walked in
 /// `order`.
@@ -689,7 +698,8 @@ fn network(
     let mut resolved = vec![false; elements.len()];
     let mut pending = vec![m];
     let mut warnings = Vec::new();
-    // Filename inputs fed by a connection, which may end in a string, and their units.
+    // Filename inputs and their units, read once every node is: a connection may end in a string,
+    // and what an image reads of its file is another of its inputs.
     let mut filenames = Vec::new();
     while let Some(n) = pending.pop() {
         if std::mem::replace(&mut resolved[n], true) {
@@ -731,19 +741,52 @@ fn network(
                 None => match source.0.attribute("value") {
                     None => continue,
                     Some("") if source.0.attribute("type") == Some("filename") => continue,
-                    Some(v) => value(docs, *d, &source.0, v, unit()?, load, &mut warnings),
+                    Some(v) if source.0.attribute("type") == Some("filename") => {
+                        filenames.push((n, input_name.clone(), source.0, unit()?));
+                        Input::Text(v.to_string())
+                    }
+                    Some(v) => value(docs, *d, &source.0, v, unit()?, &mut warnings),
                 },
             };
             inputs.insert(input_name, value);
         }
         net.nodes[n].inputs = inputs;
     }
-    for (n, input, e, unit) in filenames {
-        let d = elements[n].2;
-        if let Input::Text(file) = through(&net, &net.nodes[n].inputs[&input]) {
-            let image = file_input(docs, d, &e, file, unit, load);
-            net.nodes[n].inputs.insert(input, image);
+    let mut files = Vec::new();
+    for f in &filenames {
+        let read = through(&net, &net.nodes[f.0].inputs[&f.1]);
+        let file = match read {
+            Input::Text(file) if !file.is_empty() => file,
+            Input::Connect { .. } => continue,
+            // A constant or dot that holds no name leaves the input naming no file.
+            _ => {
+                files.push((f.0, &f.1, None));
+                continue;
+            }
+        };
+        // A value keeps the scope of the input that states it, wherever it is read.
+        let (n, _, e, unit) = filenames
+            .iter()
+            .find(|s| std::ptr::eq(&net.nodes[s.0].inputs[&s.1], read))
+            .unwrap_or(f);
+        let layer = match net.nodes[f.0].inputs.get("layer").map(|l| through(&net, l)) {
+            Some(Input::Text(l)) if !l.is_empty() => Layer::Named(l.clone()),
+            _ => Layer::Implied,
+        };
+        let mut image = file_input(docs, elements[*n].2, e, file, *unit, layer, load);
+        // A colorspace is how the input reading the file decodes it, wherever the name comes from.
+        if let (Input::Image { color_space, .. }, Some(own)) =
+            (&mut image, f.2.attribute("colorspace"))
+        {
+            *color_space = Some(own.to_string());
         }
+        files.push((f.0, &f.1, Some(image)));
+    }
+    for (n, input, image) in files {
+        match image {
+            Some(image) => net.nodes[n].inputs.insert(input.clone(), image),
+            None => net.nodes[n].inputs.remove(input),
+        };
     }
     let shader = |input: &str| match net.nodes[m].inputs.get(input).map(|i| through(&net, i)) {
         Some(Input::Connect { node, .. }) => Some(*node),
@@ -863,31 +906,30 @@ fn file_input(
     e: &XmlNode<'_, '_>,
     file: &str,
     unit: Unit,
+    layer: Layer,
     load: &mut Load<'_>,
 ) -> Input {
     let prefix = inherited(docs, d, e, "fileprefix").unwrap_or_default();
     let file = format!("{prefix}{file}");
     let resolved = substituted(docs, e, &file).map_err(|why| (file, why));
     Input::Image {
-        image: load(docs[d].dir, resolved),
+        image: load(docs[d].dir, resolved, layer),
         color_space: inherited(docs, d, e, "colorspace").map(str::to_string),
         unit,
     }
 }
 
-/// An input's authored value: an image for filenames, numbers, or text.
+/// An input's authored value, other than a filename: numbers or text.
 fn value(
     docs: &[Doc<'_>],
     d: usize,
     e: &XmlNode<'_, '_>,
     v: &str,
     unit: Unit,
-    load: &mut Load<'_>,
     warnings: &mut Vec<String>,
 ) -> Input {
     let ty = e.attribute("type").unwrap_or_default();
     match ty {
-        "filename" => file_input(docs, d, e, v, unit, load),
         "string" => Input::Text(v.to_string()),
         "boolean" => Input::Value(vec![if v == "true" { 1.0 } else { 0.0 }], unit),
         _ => {

@@ -285,6 +285,17 @@ pub(crate) struct ImageFile {
     pub(crate) data: ImageData,
 }
 
+/// What an image reads of its file.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Layer {
+    /// All of it.
+    Whole,
+    /// The layer of this name, and a file without one reads as a file that can't be read.
+    Named(String),
+    /// Layer `default`, else layer `rgba`, else all of it.
+    Implied,
+}
+
 pub(crate) enum ImageData {
     Bytes(Vec<u8>),
     /// A file, read when needed. [`image_facts`] reads it first and records its hash and
@@ -292,6 +303,7 @@ pub(crate) enum ImageData {
     File {
         path: PathBuf,
         read: Option<(Hash32, u64)>,
+        layer: Layer,
     },
     /// No file to read, and why.
     Unread(String),
@@ -332,7 +344,15 @@ impl ImageFile {
             ImageData::File {
                 path,
                 read: Some((hash, _)),
-            } => Ok(Cow::Owned(state::read_checked(path, *hash)?)),
+                layer,
+            } => {
+                let bytes = state::read_checked(path, *hash)?;
+                let layer = load::layer_of(&bytes, layer).map_err(|message| Error::Texture {
+                    asset: self.name.clone(),
+                    message,
+                })?;
+                Ok(Cow::Owned(layer.unwrap_or(bytes)))
+            }
             ImageData::File { read: None, .. }
             | ImageData::Unread(_)
             | ImageData::Solid(_)
@@ -504,10 +524,17 @@ pub(crate) fn image_facts(
             let file = &images[i];
             let (bytes, hash, read) = match &file.data {
                 ImageData::Bytes(b) => (Cow::Borrowed(b.as_slice()), Hash32::of(b), None),
-                ImageData::File { path, .. } => match memo.read(path) {
+                ImageData::File { path, layer, .. } => match memo.read(path) {
                     Ok((bytes, hash)) => {
                         let read = Some((hash, bytes.len() as u64));
-                        (Cow::Owned(bytes), hash, read)
+                        match load::layer_of(&bytes, layer) {
+                            Ok(None) => (Cow::Owned(bytes), hash, read),
+                            Ok(Some(layer)) => {
+                                let hash = Hash32::of(&layer);
+                                (Cow::Owned(layer), hash, read)
+                            }
+                            Err(why) => return Ok((i, (Err(why), read))),
+                        }
                     }
                     Err(e) if reads.optional.contains(&i) => {
                         return Ok((i, (Err(e.to_string()), None)));

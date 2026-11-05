@@ -1763,10 +1763,10 @@ fn plan_scene(
             .map(|i| texture::unscaled_normal_warning(&src.images[i].name)),
     );
     for i in &used {
-        if let ImageData::File { path, read } = &src.images[*i].data {
+        if let ImageData::File { path, read, .. } = &src.images[*i].data {
             src.files.push(Input {
                 path: path.clone(),
-                hash: read.map_or(Input::ABSENT, |r| r.0),
+                hash: read.map_or_else(|| memo.hash(path).unwrap_or(Input::ABSENT), |r| r.0),
             });
         }
     }
