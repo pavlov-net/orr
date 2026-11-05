@@ -17,7 +17,7 @@ use orr_gpu::{
 use orr_io::{AlignedBuf, Read, SECTOR};
 use orr_math::{DVec3, IVec3, Vec3};
 use orr_pack::instance::{InstancePageInfo, InstanceRecord};
-use orr_pack::material::Material;
+use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{Cluster, Group, MeshHeader, MeshInfo, NodePage, PageHeader, PageView, Part};
 use orr_pack::model::ModelInfo;
 use orr_pack::neural::{Constants, Fp8Network, NeuralInfo, NeuralTexture};
@@ -1480,7 +1480,7 @@ fn resolve(source: BlobSource, p: Placed, device: &Device) -> Result<Resolved> {
         .materials
         .iter()
         .map(|(id, m)| {
-            let mut bound = [BoundTexture::NONE; 12];
+            let mut bound = [BoundTexture::NONE; slot::COUNT];
             for (b, t) in bound.iter_mut().zip(&m.textures) {
                 if t.texture != AssetId::NONE {
                     *b = BoundTexture {

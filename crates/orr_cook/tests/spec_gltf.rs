@@ -21,7 +21,7 @@ use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{self, MeshHeader, MeshInfo, PageView};
 use orr_pack::skeleton::{SkeletonInfo, Trs};
 use orr_pack::texture::TextureInfo;
-use orr_pack::{Archive, AssetId, Target};
+use orr_pack::{Archive, AssetId, Class, Target};
 
 fn dir(name: &str) -> PathBuf {
     let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
@@ -548,21 +548,21 @@ fn the_alpha_test_holds_per_texel() {
     }
 }
 
-/// `occlusionTexture.strength`: the stored value is `1 + strength * (texel - 1)`.
+/// L2846 "Client implementations that are capable of computing indirect lighting themselves,
+/// e.g., via path tracing, **SHOULD** ignore the occlusion texture.": its image isn't opened, so
+/// one that doesn't decode cooks, and nothing of it reaches the archive.
 #[test]
-fn occlusion_strength_scales_toward_one() {
+fn the_occlusion_texture_is_ignored() {
     let path = dir("occlusion").join("occlusion.glb");
-    let tex = png(8, |x, _| [if x < 4 { 51 } else { 255 }, 0, 0, 255]);
     textured_quad(
         &path,
-        &tex,
+        b"not an image",
         r#"{"occlusionTexture":{"index":0,"strength":0.5}}"#,
         "",
     );
     let (a, _) = cooked(&path);
-    let (_, mip) = bc4_mip0(&a, "g/texture/0/occlusion");
-    assert!((mip[0] - 0.6).abs() < 0.01, "{}", mip[0]);
-    assert!((mip[7] - 1.0).abs() < 0.01, "{}", mip[7]);
+    let texture = a.entries().iter().any(|e| e.class == Class::Texture as u16);
+    assert!(!texture);
 }
 
 /// The accessors of a triangle skinned to its skin's joint 0: positions, joints, weights.

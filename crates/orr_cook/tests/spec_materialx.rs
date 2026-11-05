@@ -1184,6 +1184,31 @@ fn near(a: f32, b: f32) -> bool {
     (a - b).abs() < 2e-3
 }
 
+/// A document's `UsdPreviewSurface` holds to PS `occlusion`, "pathtracers will likely choose to
+/// ignore it", so the image it reads isn't opened, here a file that doesn't exist.
+#[test]
+fn a_preview_surface_ignores_occlusion() {
+    let path = fixture().join("m.mtlx");
+    let image = image_node("float", "missing.png", "");
+    let doc = format!(
+        r#"<?xml version="1.0"?>
+<materialx version="1.39">
+  {image}
+  <UsdPreviewSurface name="S" type="surfaceshader">
+    <input name="occlusion" type="float" nodename="i"/>
+  </UsdPreviewSurface>
+  <surfacematerial name="M" type="material">
+    <input name="surfaceshader" type="surfaceshader" nodename="S"/>
+  </surfacematerial>
+</materialx>
+"#
+    );
+    std::fs::write(&path, doc).unwrap();
+    let (a, _) = cook(&path, "M").unwrap();
+    let m = material(&a);
+    assert!((0..slot::COUNT).all(|s| !bound(&m, s)));
+}
+
 /// Spec Color Spaces: the table of spaces, with "`none` remains an acceptable alias for `data`",
 /// and L200 "values of type color3 and color4 are always associated with a particular color
 /// space", which leaves a `float` image in a color scope as it is. PNG 128 through current and

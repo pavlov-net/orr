@@ -105,11 +105,11 @@ pub struct Material {
     /// Linked surface id; 0 is the standard surface.
     pub surface: u8,
     /// Indexed by the `slot` constants.
-    pub textures: [TextureBinding; 12],
+    pub textures: [TextureBinding; slot::COUNT],
     /// Per slot, the affine map from mesh uv to the uv its texture is sampled at, stored
     /// as its difference from the identity so that zero is the identity: `[a - 1, b, c, d,
     /// e - 1, f]` for `u' = a u + b v + c`, `v' = d u + e v + f`.
-    pub uv_transforms: [[f32; 6]; 12],
+    pub uv_transforms: [[f32; 6]; slot::COUNT],
 }
 
 /// Texture slots. All but `NORMAL`, `EMISSION`, `SPECULAR_WEIGHT` and `DISPLACEMENT` read values
@@ -121,13 +121,13 @@ pub mod slot {
     pub const NORMAL: usize = 2;
     pub const METALNESS: usize = 3;
     pub const ROUGHNESS: usize = 4;
-    pub const OCCLUSION: usize = 5;
-    pub const EMISSION: usize = 6;
-    pub const SPECULAR_WEIGHT: usize = 7;
-    pub const SUBSURFACE_COLOR: usize = 8;
-    pub const DISPLACEMENT: usize = 9;
-    pub const COAT: usize = 10;
-    pub const TRANSMISSION: usize = 11;
+    pub const EMISSION: usize = 5;
+    pub const SPECULAR_WEIGHT: usize = 6;
+    pub const SUBSURFACE_COLOR: usize = 7;
+    pub const DISPLACEMENT: usize = 8;
+    pub const COAT: usize = 9;
+    pub const TRANSMISSION: usize = 10;
+    pub const COUNT: usize = 11;
 }
 
 impl Material {
@@ -195,8 +195,8 @@ impl Default for Material {
             double_sided: 0,
             thin_walled: 0,
             surface: 0,
-            textures: [TextureBinding::zeroed(); 12],
-            uv_transforms: [[0.0; 6]; 12],
+            textures: [TextureBinding::zeroed(); slot::COUNT],
+            uv_transforms: [[0.0; 6]; slot::COUNT],
         }
     }
 }

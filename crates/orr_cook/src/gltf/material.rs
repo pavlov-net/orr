@@ -286,13 +286,6 @@ pub(super) fn textures(
                 Ok::<_, String>((r, [i.scale(); 2]))
             })
             .transpose()?,
-        occlusion: m
-            .occlusion_texture()
-            .map(|i| {
-                let r = tex(i.texture(), &own["occlusionTexture"], 0)?;
-                Ok::<_, String>((r, i.strength()))
-            })
-            .transpose()?,
         emissive: m
             .emissive_texture()
             .map(|i| tex(i.texture(), &own["emissiveTexture"], 0).map(color))

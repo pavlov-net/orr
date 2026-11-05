@@ -12,13 +12,14 @@
 //!   OpenPBR defines.
 //! - `UsdPreviewSurface`, mapped like glTF metallic-roughness: `diffuseColor` is
 //!   `base_color`, `metallic`, `roughness`, `ior` and `emissiveColor` (read as nits) their
-//!   fields, `clearcoat` and `clearcoatRoughness` the coat at `ior`, `occlusion` the occlusion
-//!   texture, and `normal` and `displacement` their textures, a constant reading a solid image
-//!   ([`solid_image`]). `opacityThreshold` above 0 alpha-tests `opacity` at it; otherwise
-//!   `opacityMode` `presence` blends an opacity below 1 or textured, and `transparent` makes
-//!   the rest of it thin-walled transmission, which leaves specular and emission at full
-//!   weight. The specular workflow's `specularColor` is F0: `specular_ior` gives its largest
-//!   channel and `specular_color` the others, so a colored F0 tints the edge as well.
+//!   fields, `clearcoat` and `clearcoatRoughness` the coat at `ior`, and `normal` and
+//!   `displacement` their textures, a constant reading a solid image ([`solid_image`]).
+//!   `occlusion` isn't read: a path tracer computes it. `opacityThreshold` above 0 alpha-tests
+//!   `opacity` at it; otherwise `opacityMode` `presence` blends an opacity below 1 or textured,
+//!   and `transparent` makes the rest of it thin-walled transmission, which leaves specular and
+//!   emission at full weight. The specular workflow's `specularColor` is F0: `specular_ior`
+//!   gives its largest channel and `specular_color` the others, so a colored F0 tints the edge
+//!   as well.
 //!
 //! An input is a constant, or reads a texture through these nodes: MaterialX `image` and
 //! `tiledimage` (with `texcoord`, `geompropvalue` and `place2d` on their coordinates,
@@ -30,8 +31,8 @@
 //! other than a uv set fails, as meshes hold no values for it. Any other node fails the import,
 //! naming it, as does a connection cycle. A `geompropvalue` whose property no uv set holds reads
 //! its `default` at every point, as an unconnected `place2d` reads 0, 0. Textures go to the
-//! material's slots (base color, opacity, roughness, metalness, normal, occlusion, emission,
-//! specular weight, subsurface color, coat, transmission, displacement); a textured input
+//! material's slots (base color, opacity, roughness, metalness, normal, emission, specular
+//! weight, subsurface color, coat, transmission, displacement); a textured input
 //! without a slot fails. A texture value multiplies the field, which takes the reader's scale
 //! (`UsdUVTexture` `scale`; 1 otherwise); a bias folds scale and bias into the texels
 //! ([`TexRef::remap`]) and leaves the field 1, or for a color what it reaches past 1. Normals
@@ -1260,12 +1261,6 @@ impl Mapper<'_, '_> {
             self.material.coat_color = [1.0; 3];
         }
         self.preview_opacity(n)?;
-        match self.value(n, "occlusion")? {
-            None | Some(Value::Constant(..)) => {}
-            Some(Value::Texture(t)) => {
-                self.textures.occlusion = Some((t.scalar().0, 1.0));
-            }
-        }
         match self.value(n, "normal")? {
             None => {}
             Some(Value::Constant(v, _)) => {

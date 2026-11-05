@@ -17,7 +17,7 @@ use examples::window::Window;
 use examples::{Options, assert_clean, device, fixed_time};
 use orr::orr_gpu::{Format, Hazards, MemoryKind, QueueKind, SpecData, Stages, TimelinePoint};
 use orr::orr_output::Image;
-use orr::orr_pack::material::Material;
+use orr::orr_pack::material::{Material, slot};
 use orr::{
     BoundTexture, ClusterTopology, Display, DisplayRequest, FrameDesc, FrameTime, GroupWriter,
     Lens, MaterialGpu, ProducerId, Projection, Renderer, RendererDesc, SceneDesc,
@@ -159,7 +159,7 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
             display: None,
         })
         .expect("begin frame");
-    let material = |m: Material| MaterialGpu::new(&m, &[BoundTexture::NONE; 12]);
+    let material = |m: Material| MaterialGpu::new(&m, &[BoundTexture::NONE; slot::COUNT]);
     let (soil, blades, water_material) = {
         let mut mats = f.materials();
         let soil = Material {

@@ -1436,9 +1436,7 @@ fn gltf_materials_cook_their_canonical_channel_set() {
             let e = |v: f32| ((v / l * 0.5 + 0.5) * 255.0).round() as u8;
             [e(-sx), e(-sy), e(1.0), 255]
         }),
-        // 3: constant occlusion of 1: dropped.
-        png(16, 16, |_, _| [255, 255, 255, 255]),
-        // 4: constant emissive, folded into the factor.
+        // 3: constant emissive, folded into the factor.
         png(8, 8, |_, _| [255, 128, 0, 255]),
     ];
     let mat = |name: &str, metal: f32| {
@@ -1446,8 +1444,8 @@ fn gltf_materials_cook_their_canonical_channel_set() {
             r#"{{"name":"{name}","alphaMode":"MASK","alphaCutoff":0.4,
                "pbrMetallicRoughness":{{"baseColorTexture":{{"index":0}},"metallicFactor":{metal},
                  "roughnessFactor":0.8,"metallicRoughnessTexture":{{"index":1}}}},
-               "normalTexture":{{"index":2,"scale":0.5}},"occlusionTexture":{{"index":3}},
-               "emissiveTexture":{{"index":4}},"emissiveFactor":[2,2,2]}}"#
+               "normalTexture":{{"index":2,"scale":0.5}},
+               "emissiveTexture":{{"index":3}},"emissiveFactor":[2,2,2]}}"#
         )
     };
     let path = d.join("quad.glb");
@@ -1476,7 +1474,6 @@ fn gltf_materials_cook_their_canonical_channel_set() {
         assert_ne!(t(slot::NORMAL), AssetId::NONE);
         assert_ne!(t(slot::ROUGHNESS), AssetId::NONE);
         assert_eq!(t(slot::METALNESS), AssetId::NONE);
-        assert_eq!(t(slot::OCCLUSION), AssetId::NONE);
         assert_eq!(t(slot::EMISSION), AssetId::NONE);
         assert!(
             (m.metalness - metal * 0.2).abs() < 1e-6,
@@ -1493,7 +1490,7 @@ fn gltf_materials_cook_their_canonical_channel_set() {
         assert_eq!(m.emission_color[0], 2.0);
         assert_eq!(m.emission_color[2], 0.0);
     }
-    for s in 0..12 {
+    for s in 0..slot::COUNT {
         assert_eq!(m0.textures[s], m1.textures[s], "slot {s} is shared");
     }
     let format = |s: usize| {
@@ -1518,7 +1515,7 @@ fn gltf_materials_cook_their_canonical_channel_set() {
     assert!(mean(&mip4) > mean(&mip0) + 0.02);
 
     // Resident bytes of the packed set against one texture per image (BC7 for color and
-    // packed data, BC5 for normals, BC4 for occlusion).
+    // packed data, BC5 for normals).
     let packed: u64 = a
         .entries()
         .iter()
@@ -1531,7 +1528,6 @@ fn gltf_materials_cook_their_canonical_channel_set() {
     let per_image = chain_bytes(vk::BC7_SRGB, n, n)
         + chain_bytes(vk::BC7_UNORM, n, n)
         + chain_bytes(vk::BC5_UNORM, n, n)
-        + chain_bytes(vk::BC4_UNORM, 16, 16)
         + chain_bytes(vk::BC7_SRGB, 8, 8);
     println!("texture bytes: packed {packed}, one texture per image {per_image}");
 }

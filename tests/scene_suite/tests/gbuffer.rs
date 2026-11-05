@@ -152,7 +152,6 @@ struct Core {
     raster_error: f32,
     geometric_normal: Vec3,
     diffuse_roughness: f32,
-    occlusion: f32,
 }
 
 fn decode_core(a: [u32; 4], b: [u32; 2]) -> Core {
@@ -179,7 +178,6 @@ fn decode_core(a: [u32; 4], b: [u32; 2]) -> Core {
         },
         geometric_normal: oct8(b[1]),
         diffuse_roughness: byte(b[1], 16),
-        occlusion: byte(b[1], 24),
     }
 }
 
@@ -251,7 +249,6 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             };
             c.geometric_normal = arr(rng.unit());
             c.diffuse_roughness = rng.next();
-            c.occlusion = rng.next();
             c.raster_error = if i % 7 == 0 {
                 0.0
             } else {
@@ -399,7 +396,6 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             "diffuse roughness layout",
             i,
         );
-        close(cpu.occlusion, g.occlusion, 1e-6, "occlusion layout", i);
 
         // Each field within its encoding's precision.
         close3(
@@ -415,8 +411,9 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
             angle(g.geometric_normal, c.geometric_normal) < 0.02,
             "case {i} geometric normal"
         );
+        // A largest channel past 511.5 steps takes the next exponent, whose half step is m / 511.5.
         let m = Vec3::from(c.emission).max_element();
-        close3(g.emission, c.emission, m / 512.0 + 1e-30, "emission", i);
+        close3(g.emission, c.emission, m / 511.0 + 1e-30, "emission", i);
         close(g.metalness, c.metalness, step8, "metalness", i);
         close(
             g.specular_weight,
@@ -449,7 +446,6 @@ fn gbuffer_words_decode_on_the_cpu_and_round_trip_within_their_precision() {
                 c.raster_error
             );
         }
-        close(g.occlusion, c.occlusion, step8, "occlusion", i);
         assert_eq!(g.flags & 0x62, c.flags, "case {i} unlit and origin policy");
 
         let thin = c.bsdf_flags & BSDF_THIN_WALLED != 0;
@@ -4140,7 +4136,7 @@ fn rewriting_a_material_set_changes_only_the_copies_that_name_it() {
                 base_color,
                 ..Material::default()
             };
-            let m = MaterialGpu::new(&m, &[BoundTexture::NONE; 12]);
+            let m = MaterialGpu::new(&m, &[BoundTexture::NONE; slot::COUNT]);
             materials.push(mats.create(&m).unwrap());
             records.push(Vec3::from(m.base_color));
         }
@@ -5594,7 +5590,7 @@ fn material_slots_read_their_wrap_and_filter_like_a_cpu_reference() {
             };
             let mut m = Material::default();
             m.textures[slot::BASE_COLOR] = binding;
-            let mut bound = [BoundTexture::NONE; 12];
+            let mut bound = [BoundTexture::NONE; slot::COUNT];
             bound[slot::BASE_COLOR] = BoundTexture {
                 index,
                 sampler: d.sampler(&orr_scene::binding_sampler(&binding)).unwrap(),

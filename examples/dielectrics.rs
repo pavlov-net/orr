@@ -27,7 +27,7 @@ use orr::orr_gpu::{
     TextureDesc, TextureMemory, TextureUsage, TimelinePoint,
 };
 use orr::orr_lighting::EnvironmentMapGpu;
-use orr::orr_pack::material::Material;
+use orr::orr_pack::material::{Material, slot};
 use orr::orr_pack::{AssetId, Target};
 use orr::{
     BoundTexture, ClusterTopology, CompilingKernels, DirectionalLight, DiscProfile, Display,
@@ -176,7 +176,10 @@ pub(crate) fn run(options: &Options) -> Option<Capture> {
     };
     let water = f
         .materials()
-        .create(&MaterialGpu::new(&water, &[BoundTexture::NONE; 12]))
+        .create(&MaterialGpu::new(
+            &water,
+            &[BoundTexture::NONE; slot::COUNT],
+        ))
         .expect("water");
     let mut w = f.scene(scene).expect("scene writer");
     let group = w

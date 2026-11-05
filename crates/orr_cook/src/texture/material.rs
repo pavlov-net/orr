@@ -5,8 +5,8 @@
 //!   factor becomes a BC4 opacity texture, with alpha-coverage mips at the cutoff under
 //!   `MASK` unless it keeps its source's mips.
 //! - Normal: BC5, with the glTF normal scale applied.
-//! - Roughness and metalness share a BC5 (BC4 when only one varies); occlusion gets a BC4.
-//!   Factors are folded into these texels and the material's factors set to 1.
+//! - Roughness and metalness share a BC5 (BC4 when only one varies). Factors are folded into
+//!   these texels and the material's factors set to 1.
 //! - Roughness takes the normal map's variance per mip (Toksvig), so a material with a normal
 //!   map gets a roughness texture even when its roughness is constant. At the quality levels
 //!   that keep source mips, roughness that keeps them, and roughness beside a normal map
@@ -22,17 +22,20 @@
 //!   range `lo..hi` the image measures, as `(h - lo) / (hi - lo)`, with the scale and offset
 //!   compensated; a range past 0..1 widens the declared one.
 //! - An image whose texels all lie within 1/255 of one value collapses into the material's
-//!   factor, clamped to the input's range as a texture stores it; a constant normal or
-//!   occlusion image, which has no factor, cooks at 4x4. Under `MASK` an opacity image collapses
-//!   only when its texels fall on one side of the cutoff. An image read past 0..1 as something
-//!   else ([`Wrap::Border`], [`Wrap::Constant`]) never collapses.
+//!   factor, clamped to the input's range as a texture stores it; a constant normal image, which
+//!   has no factor, cooks at 4x4. Under `MASK` an opacity image collapses only when its texels
+//!   fall on one side of the cutoff. An image read past 0..1 as something else ([`Wrap::Border`],
+//!   [`Wrap::Constant`]) never collapses.
 //! - A slot's wrap and filter go to its binding, as does what it reads past 0..1: the image's
 //!   transparent black or stated value through the same factors and remaps as its texels.
 //!   Under [`Wrap::Border`] a texture that reads anything but black there takes
 //!   [`Wrap::Constant`], which the shader checks: a hardware border holds only black.
 //!
-//! A bound texture's value multiplies the matching factor; normal, occlusion and opacity
-//! textures have no factor.
+//! A bound texture's value multiplies the matching factor; normal and opacity textures have no
+//! factor.
+//!
+//! No importer reads occlusion: a path tracer computes it, and glTF and USD say to ignore the
+//! texture there.
 
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
@@ -98,7 +101,6 @@ pub struct InputChannels {
     pub opacity: Option<u8>,
     pub roughness: Option<u8>,
     pub metalness: Option<u8>,
-    pub occlusion: Option<u8>,
     pub specular: Option<u8>,
     pub coat: Option<u8>,
     pub transmission: Option<u8>,
@@ -200,8 +202,6 @@ pub(crate) struct MaterialTextures {
     pub(crate) metalness: Option<TexRef>,
     /// With its scale per tangent axis; a negative scale flips the axis.
     pub(crate) normal: Option<(TexRef, [f32; 2])>,
-    /// With its strength.
-    pub(crate) occlusion: Option<(TexRef, f32)>,
     pub(crate) emissive: Option<TexRef>,
     pub(crate) specular: Option<TexRef>,
     pub(crate) coat: Option<TexRef>,
@@ -219,7 +219,6 @@ impl MaterialTextures {
             self.roughness.as_ref(),
             self.metalness.as_ref(),
             self.normal.as_ref().map(|n| &n.0),
-            self.occlusion.as_ref().map(|o| &o.0),
             self.emissive.as_ref(),
             self.specular.as_ref(),
             self.coat.as_ref(),
@@ -238,7 +237,6 @@ impl MaterialTextures {
             self.roughness.as_mut(),
             self.metalness.as_mut(),
             self.normal.as_mut().map(|n| &mut n.0),
-            self.occlusion.as_mut().map(|o| &mut o.0),
             self.emissive.as_mut(),
             self.specular.as_mut(),
             self.coat.as_mut(),
@@ -941,10 +939,6 @@ impl<'a> Packer<'a> {
             opacity: remap(t.opacity, |c| c.opacity)?,
             roughness: remap(t.roughness, |c| c.roughness)?,
             metalness: remap(t.metalness, |c| c.metalness)?,
-            occlusion: t
-                .occlusion
-                .map(|(r, s)| Ok::<_, Error>((self.channel_of(r, |c| c.occlusion)?, s)))
-                .transpose()?,
             specular: remap(t.specular, |c| c.specular)?,
             coat: remap(t.coat, |c| c.coat)?,
             transmission: remap(t.transmission, |c| c.transmission)?,
@@ -1044,7 +1038,7 @@ impl<'a> Packer<'a> {
             }
         }
 
-        // Roughness, metalness, occlusion.
+        // Roughness and metalness.
         let (rough, metal) = (t.roughness, t.metalness);
         let constant = |r: &Option<TexRef>| match r {
             Some(r) => self.constant_input(r),
@@ -1053,8 +1047,6 @@ impl<'a> Packer<'a> {
         let (rough_const, metal_const) = (constant(&rough), constant(&metal));
         let rough_varies = rough_const.is_none() || normal_packed.is_some();
         let metal_varies = metal_const.is_none();
-        let occ = t.occlusion.map(|(r, s)| (r, s, self.constant_input(&r)));
-        let occ_varies = occ.as_ref().is_some_and(|o| o.2.is_none());
         let rough_channel = |m: &Material| match (&rough, rough_const) {
             (Some(r), None) => self.source(r, 0, usize::from(r.channel), 0.0, m.specular_roughness),
             (_, c) => Channel::constant(m.specular_roughness * c.unwrap_or(1.0)),
@@ -1119,24 +1111,6 @@ impl<'a> Packer<'a> {
                     m.metalness = 1.0;
                 }
             }
-        }
-        if let Some(o) = &occ
-            && (occ_varies || o.2.is_some_and(|c| 1.0 - o.1 + o.1 * c < 1.0 - 1.0 / 255.0))
-        {
-            let id = self.make(
-                suffix,
-                Pack {
-                    role: "occlusion",
-                    encoding: Encoding::Bc4,
-                    channels: vec![self.source(&o.0, 0, usize::from(o.0.channel), 1.0 - o.1, o.1)],
-                    refs: vec![o.0],
-                    coverage: None,
-                    toksvig: None,
-                    normal: false,
-                    shrink: !occ_varies,
-                },
-            )?;
-            bind(m, slot::OCCLUSION, id, 0, &o.0);
         }
 
         if let Some(r) = &t.emissive {

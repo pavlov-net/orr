@@ -1088,7 +1088,7 @@ impl DenseVegetation {
                 display: None,
             })
             .expect("begin frame");
-        let material = |m: Material| MaterialGpu::new(&m, &[BoundTexture::NONE; 12]);
+        let material = |m: Material| MaterialGpu::new(&m, &[BoundTexture::NONE; slot::COUNT]);
         let (soil, blades, pond, glowing) = {
             let mut mats = f.materials();
             let mut create = |m: Material| mats.create(&material(m)).expect("material");

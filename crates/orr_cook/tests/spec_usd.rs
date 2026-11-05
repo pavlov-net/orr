@@ -1343,6 +1343,23 @@ fn opacity_mode_picks_transmission_or_coverage() {
     assert!((t[3] - (1.0 - 96.0 / 255.0)).abs() < 0.02, "{}", t[3]);
 }
 
+/// PS `occlusion`: "pathtracers will likely choose to ignore it". Its reader's image isn't
+/// opened, so one that doesn't decode cooks, and its `scale` means nothing either.
+#[test]
+fn the_occlusion_input_is_ignored() {
+    let body = previewed(
+        "float inputs:occlusion.connect = </M/T.outputs:r>",
+        &format!(
+            "{}\n{READER}",
+            texture("T", "float4 inputs:scale = (0.5, 0.5, 0.5, 1)")
+        ),
+        ST,
+    );
+    let a = shaded("occlusion", &body, b"not an image");
+    let bound = material(&a).textures.map(|t| t.texture);
+    assert_eq!(bound, [AssetId::NONE; slot::COUNT]);
+}
+
 /// PS `scale` and `bias`: "output = textureValue * scale + bias", on any input.
 #[test]
 fn a_texture_bias_applies_to_scalar_and_color_inputs() {

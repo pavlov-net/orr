@@ -1424,7 +1424,7 @@ fn texture_displacement_moves_patches_along_the_normal_by_the_materials_texture(
     m.base_color = [0.5; 3];
     m.base_weight = 1.0;
     m.flags = material_flags::DOUBLE_SIDED | material_flags::DISPLACED;
-    m.textures = [TextureIndex::NONE; 12];
+    m.textures = [TextureIndex::NONE; orr_pack::material::slot::COUNT];
     m.textures[orr_pack::material::slot::DISPLACEMENT] =
         d.write_sampled(slot, &texture, &orr_gpu::ViewDesc::default());
     m.samplers[orr_pack::material::slot::DISPLACEMENT].sampler =

@@ -32,13 +32,13 @@ public static const uint TEXTURE_OPACITY = 1;
 public static const uint TEXTURE_NORMAL = 2;
 public static const uint TEXTURE_METALNESS = 3;
 public static const uint TEXTURE_ROUGHNESS = 4;
-public static const uint TEXTURE_OCCLUSION = 5;
-public static const uint TEXTURE_EMISSION = 6;
-public static const uint TEXTURE_SPECULAR_WEIGHT = 7;
-public static const uint TEXTURE_SUBSURFACE_COLOR = 8;
-public static const uint TEXTURE_DISPLACEMENT = 9;
-public static const uint TEXTURE_COAT = 10;
-public static const uint TEXTURE_TRANSMISSION = 11;
+public static const uint TEXTURE_EMISSION = 5;
+public static const uint TEXTURE_SPECULAR_WEIGHT = 6;
+public static const uint TEXTURE_SUBSURFACE_COLOR = 7;
+public static const uint TEXTURE_DISPLACEMENT = 8;
+public static const uint TEXTURE_COAT = 9;
+public static const uint TEXTURE_TRANSMISSION = 10;
+public static const uint TEXTURE_SLOTS = 11;
 
 // `TextureSamplerGpu.modes`: what u and v read past 0..1, 3 bits each
 // (orr_pack::material::wrap), then the filter's bits (orr_pack::material::filter).
@@ -142,8 +142,8 @@ public struct MaterialGpu
     public float displacement_offset;
     public float displacement_min;
     public float displacement_max;
-    public TextureIndex textures[12];       // TEXTURE_* slots
-    public TextureSamplerGpu samplers[12];
+    public TextureIndex textures[TEXTURE_SLOTS];
+    public TextureSamplerGpu samplers[TEXTURE_SLOTS];
     public uint uv_sets;                    // 1 bit per slot
     public uint channels_lo;                // 4 bits per slot: first channel read
     public uint channels_hi;
@@ -151,11 +151,10 @@ public struct MaterialGpu
     public uint surface;                    // linked surface id; 0 = StandardSurface
     public float transmission_dispersion_scale;
     public float transmission_dispersion_abbe_number;
-    public uint _pad;
     public uint64_t data;                   // consumer data for the linked surface; 0 = the scene's
     public TextureStreamGpu** texture_streams; // by heap index, null where it neither streams nor has a neural set; orr sets it
-    public float uv_transforms[72];         // per slot a-1 b c d e-1 f: u' = a u + b v + c, v' = d u + e v + f; 0 = identity
-    public float outside[48];               // per slot, what it reads past TEXTURE_CONSTANT
+    public float uv_transforms[TEXTURE_SLOTS * 6];      // per slot a-1 b c d e-1 f: u' = a u + b v + c, v' = d u + e v + f; 0 = identity
+    public float outside[TEXTURE_SLOTS * 4];            // per slot, what it reads past TEXTURE_CONSTANT
 }
 
 // Whether taps report the level they want to the texture feedback. A kernel whose taps drive
@@ -462,7 +461,7 @@ float4 neural_footprint(NeuralTextureGpu* t, uint modes, UvFootprint f, TextureS
 }
 
 // Texture slots this invocation decoded with `texture_prepare`: heap index, uv and value.
-static const uint PREPARED_MAX = 12;
+static const uint PREPARED_MAX = TEXTURE_SLOTS;
 static uint prepared_count = 0;
 static uint prepared_index[PREPARED_MAX] = {};
 static float2 prepared_uv[PREPARED_MAX] = {};
@@ -615,7 +614,7 @@ public void material_prepare(MaterialGpu* m, UvFootprint uv[2])
     texture_unprepare();
     if (!NEURAL_TEXTURES)
         return;
-    for (uint slot = 0; slot < 12; slot++)
+    for (uint slot = 0; slot < TEXTURE_SLOTS; slot++)
     {
         TextureIndex t = m.textures[slot];
         if (t.index == IMAGE_NONE)

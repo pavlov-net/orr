@@ -121,7 +121,7 @@ impl MaterialGpu {
     /// The record of a cooked material whose slots read `textures`. Colors convert from Rec.709
     /// to Rec.2020, and a color slot's factor multiplies its texels in the texture's primaries;
     /// flags and the cost class follow the parameters.
-    pub fn new(m: &Material, textures: &[BoundTexture; 12]) -> Self {
+    pub fn new(m: &Material, textures: &[BoundTexture; slot::COUNT]) -> Self {
         use material_flags as f;
         let bound = |s: usize| textures[s].index != TextureIndex::NONE;
         let mut flags = 0;
@@ -216,7 +216,6 @@ impl MaterialGpu {
             surface: u32::from(m.surface),
             transmission_dispersion_scale: m.transmission_dispersion_scale,
             transmission_dispersion_abbe_number: m.transmission_dispersion_abbe_number,
-            _pad: 0,
             data: 0,
             texture_streams: GpuPtr::NULL,
             uv_transforms: std::array::from_fn(|i| m.uv_transforms[i / 6][i % 6]),
@@ -376,7 +375,7 @@ mod tests {
 
     #[test]
     fn cooked_materials_take_their_flags_cost_class_and_slot_bits() {
-        let record = |m: &Material| MaterialGpu::new(m, &[BoundTexture::NONE; 12]);
+        let record = |m: &Material| MaterialGpu::new(m, &[BoundTexture::NONE; slot::COUNT]);
         let cost = |m: &Material| (record(m).flags & material_flags::COST_MASK) >> 16;
         let base = Material::default();
         assert_eq!(cost(&base), 0);
@@ -401,7 +400,7 @@ mod tests {
         let mut m = base;
         m.textures[slot::DISPLACEMENT].channels = 3;
         m.textures[slot::NORMAL].uv_set = 1;
-        let mut textures = [BoundTexture::NONE; 12];
+        let mut textures = [BoundTexture::NONE; slot::COUNT];
         textures[slot::DISPLACEMENT] = BoundTexture {
             index: TextureIndex(4),
             primaries: Primaries::Rec2020.id(),
@@ -409,7 +408,7 @@ mod tests {
         };
         let g = MaterialGpu::new(&m, &textures);
         assert_ne!(g.flags & material_flags::DISPLACED, 0);
-        assert_eq!(g.channels_hi, 3 << 4, "slot 9 reads from channel 3");
+        assert_eq!(g.channels_hi, 3, "slot 8 reads from channel 3");
         assert_eq!(g.uv_sets, 1 << slot::NORMAL);
         assert_eq!(
             g.primaries,

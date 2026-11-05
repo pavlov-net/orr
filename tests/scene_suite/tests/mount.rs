@@ -487,7 +487,7 @@ fn file_and_memory_mounts_place_the_same_assets() {
         assert_eq!(textured.textures[slot::BASE_COLOR], albedo);
         assert_eq!(textured.flags & material_flags::EMISSIVE, 0);
         assert_ne!(glow.flags & material_flags::EMISSIVE, 0);
-        assert_eq!(glow.textures, [TextureIndex::NONE; 12]);
+        assert_eq!(glow.textures, [TextureIndex::NONE; slot::COUNT]);
         let dome = entry(&a, AssetId::from_name("kit/dome/mesh"));
         let dome = MeshInfo::parse(&blob(&a, dome, 0)).unwrap();
         pages_seen = (dome.pages.len(), dome.node_pages.len());
