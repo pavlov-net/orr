@@ -1998,13 +1998,13 @@ fn map_spec(m: &Material, textures: &HashMap<AssetId, MapTexture>) -> MapSpec {
     let normal = match bound(slot::NORMAL) {
         _ if mesh::reads_tangent(m) => NormalSpec::Tangent { frame_set },
         None => NormalSpec::None,
-        Some((Some(t), uv_set)) if t.tiles.is_empty() => NormalSpec::Texture {
+        Some((Some(t), uv_set)) => NormalSpec::Texture {
             texture: t.clone(),
             read: read(slot::NORMAL),
             uv_set,
             frame_set,
         },
-        Some(_) => NormalSpec::Tangent { frame_set },
+        Some((None, _)) => NormalSpec::Tangent { frame_set },
     };
     MapSpec {
         opacity,

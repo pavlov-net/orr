@@ -2253,6 +2253,70 @@ fn a_mesh_on_one_tile_cooks_as_on_the_same_image() {
     assert_eq!(image, tiled);
 }
 
+const NORMAL: &str = "normal3f inputs:normal.connect = </M/T.outputs:rgb>";
+
+/// The tangent check of a mesh in `stage`.
+fn tangent_check(d: &std::path::Path, stage: &str) -> orr_cook::TangentReport {
+    let path = d.join("stage.usda");
+    std::fs::write(&path, format!("{HEAD}\n{stage}")).unwrap();
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(
+            Target::Memory,
+            vec![AssetSpec {
+                name: "u".into(),
+                source: Source::Usd {
+                    path,
+                    settings: UsdSettings::default(),
+                },
+            }],
+        )],
+    };
+    let cooked = orr_cook::cook(&manifest, &Default::default()).unwrap();
+    let mut entries = cooked.report.assets.iter().flat_map(|a| &a.entries);
+    let mesh = entries.find_map(|e| e.mesh.clone()).expect("a mesh");
+    mesh.tangents.expect("a mesh with tangents")
+}
+
+/// A tile's normals weigh in the tangent check as the same image's do.
+#[test]
+fn the_tangent_check_reads_one_tile_as_the_same_image() {
+    let d = dir("udim-mesh-normals");
+    let normals = png(32, 32, |x, y| {
+        [64 + (x * 4) as u8, 192 - (y * 4) as u8, 255, 255]
+    });
+    for file in ["tex.png", "tex.1001.png"] {
+        std::fs::write(d.join(file), &normals).unwrap();
+    }
+    let check = |file: &str| tangent_check(&d, &grid_stage(file, [0.0, 0.0], NORMAL));
+    let (image, tile) = (check("tex.png"), check("tex.<UDIM>.png"));
+    assert!(image.angle_p99.is_some() && image.texels > 0, "{image:?}");
+    assert_eq!(
+        (image.angle_p99, image.texels, image.derived),
+        (tile.angle_p99, tile.texels, tile.derived)
+    );
+}
+
+/// Tiles weigh by the surface they cover, not their texels: tangents turned from the uvs show
+/// only under a tilted normal, here on a small tile that covers half the mesh.
+#[test]
+fn the_tangent_check_weighs_tiles_by_the_surface_they_cover() {
+    let d = dir("udim-mesh-normal-weights");
+    let flat = png(1024, 1024, |_, _| [128, 128, 255, 255]);
+    let tilted = png(4, 4, |_, _| [224, 128, 200, 255]);
+    std::fs::write(d.join("tex.1001.png"), flat).unwrap();
+    std::fs::write(d.join("tex.1002.png"), tilted).unwrap();
+    let stage = grid_stage("tex.<UDIM>.png", [0.5, 0.0], NORMAL).replace(
+        "rel material:binding",
+        "float3[] primvars:tangents = [(0, 1, 0)] (\n        interpolation = \"constant\"\n    )\n    \
+         rel material:binding",
+    );
+    let check = tangent_check(&d, &stage);
+    assert!(
+        !check.derived && check.angle_p99.unwrap() > 1.0,
+        "{check:?}"
+    );
+}
+
 const HEIGHT: &str = "float inputs:displacement.connect = </M/T.outputs:r>";
 
 /// Settings that bake heights into the mesh.
