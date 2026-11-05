@@ -114,6 +114,8 @@ fn close6(a: [f32; 6], b: [f32; 6]) -> bool {
 
 const COLOR: &str = r#"<image name="i" type="color3">
     <input name="file" type="filename" value="v.png"/></image>"#;
+const FLOAT: &str = r#"<image name="i" type="float">
+    <input name="file" type="filename" value="v.png"/></image>"#;
 const FLAT3: &str = r#"<image name="i" type="vector3">
     <input name="file" type="filename" value="flat.png"/></image>"#;
 const BASE_I: &str = r#"<input name="base_color" type="color3" nodename="i"/>"#;
@@ -144,6 +146,29 @@ fn documents_map_as_the_clauses_say() {
             inputs: r#"<input name="specular_roughness" type="float" nodegraph="g" output="o1"/>
                 <input name="base_color" type="color3" nodegraph="g" output="o2"/>"#,
             check: |m| bound(m, slot::ROUGHNESS) && bound(m, slot::BASE_COLOR),
+        },
+        Row {
+            clause: "OpenPBR Opacity: a textured geometry_opacity is a linear presence weight",
+            body: FLOAT,
+            inputs: r#"<input name="geometry_opacity" type="float" nodename="i"/>"#,
+            check: |m| m.alpha_mode == Material::BLEND && bound(m, slot::OPACITY),
+        },
+        Row {
+            clause: "OpenPBR Opacity: a uniform image weighs like the constant it holds",
+            body: r#"<image name="i" type="float">
+                <input name="file" type="filename" value="gray30.png"/></image>"#,
+            inputs: r#"<input name="geometry_opacity" type="float" nodename="i"/>"#,
+            check: |m| m.alpha_mode == Material::BLEND && close(m.geometry_opacity, 77.0 / 255.0),
+        },
+        Row {
+            clause: "Spec Node Graphs: a functional graph's interface is its nodedef, unread here",
+            body: r#"<nodegraph name="NG" nodedef="ND_x">
+                  <image name="i" type="color3">
+                    <input name="file" type="filename" interfacename="on_the_nodedef"/></image>
+                  <output name="out" type="color3" nodename="i"/></nodegraph>
+                <dot name="d" type="color3"><input name="in" type="color3" nodename="nope"/></dot>"#,
+            inputs: "",
+            check: |m| !bound(m, slot::BASE_COLOR),
         },
         Row {
             clause: "Spec Inputs: output is optional on a one-output nodegraph",

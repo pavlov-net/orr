@@ -8,8 +8,8 @@
 //!   (micrometers) the field in nanometers when `thin_film_weight` is above 0 (0 otherwise),
 //!   and every other input the field of its name. `coat_darkening`,
 //!   `coat_roughness_anisotropy` and the coat normal and tangents have no field and are not
-//!   read. A textured `geometry_opacity` is alpha-tested at 0.5, a constant one below 1
-//!   blended.
+//!   read. A `geometry_opacity` below 1 or textured blends, as the linear presence weight
+//!   OpenPBR defines.
 //! - `UsdPreviewSurface`, mapped like glTF metallic-roughness: `diffuseColor` is
 //!   `base_color`, `metallic`, `roughness`, `ior` and `emissiveColor` (read as nits) their
 //!   fields, `clearcoat` and `clearcoatRoughness` the coat at IOR 1.5, `occlusion` the
@@ -900,9 +900,7 @@ impl Mapper<'_> {
         if let Some(v) = self.number(n, "geometry_thin_walled")? {
             self.material.thin_walled = u8::from(v[0] != 0.0);
         }
-        if self.textures.opacity.is_some() {
-            self.material.alpha_mode = Material::MASK;
-        } else if self.material.geometry_opacity < 1.0 {
+        if self.textures.opacity.is_some() || self.material.geometry_opacity < 1.0 {
             self.material.alpha_mode = Material::BLEND;
         }
         match self.source(n, "geometry_normal") {
