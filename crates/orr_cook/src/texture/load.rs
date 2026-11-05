@@ -6,7 +6,9 @@
 //! it, because the file states it, and a file it changes loses its blocks.
 //!
 //! A [`Source`] holds a file's values as stored, beside what the file states of them
-//! ([`FileColor`]); the importers' rules decide which of that applies.
+//! ([`FileColor`]); the importers' rules decide which of that applies. Radiance's `EXPOSURE` and
+//! `COLORCORR` are the exception: they state how the values were scaled, which no rule reads past,
+//! so they are undone here.
 
 use std::borrow::Cow;
 use std::io::{BufRead, BufReader, Cursor, Read, Seek};
@@ -15,6 +17,7 @@ use std::path::Path;
 use ctt::input::{InputOverrides, decode_container};
 use ctt::{ColorSpace, FormatExt, TextureKind};
 use image::ImageDecoder;
+use image::codecs::hdr::HdrDecoder;
 use image::codecs::webp::WebPDecoder;
 use orr_pack::texture::{FormatInfo, full_mip_count, mip_size, vk};
 use rayon::prelude::*;
@@ -690,9 +693,11 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
         premultiplied: format == Some(ImageFormat::OpenExr) && img.color().has_alpha(),
         ..Default::default()
     };
+    let mut scale = [1.0; 3];
     match format {
         Some(ImageFormat::Png) => png_color(&mut color, bytes, icc.as_deref(), gray != Gray::No)?,
         Some(ImageFormat::OpenExr) => exr_color(&mut color, bytes),
+        Some(ImageFormat::Hdr) => scale = radiance_header(&mut color, bytes)?,
         _ => {
             if let Some(icc) = &icc {
                 color::read_icc(&mut color, icc, gray != Gray::No);
@@ -704,7 +709,7 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
     let px = rgba
         .into_raw()
         .chunks_exact(4)
-        .map(|p| [p[0], p[1], p[2], p[3]])
+        .map(|p| [p[0] * scale[0], p[1] * scale[1], p[2] * scale[2], p[3]])
         .collect();
     Ok(Source {
         layers: vec![Img { w, h, px }],
@@ -808,6 +813,35 @@ fn exr_color(color: &mut FileColor, bytes: &[u8]) {
             }
         }
     }
+}
+
+/// States a Radiance header's `PRIMARIES` on `color`, and gives what its texels multiply by to
+/// undo every `EXPOSURE` and `COLORCORR`, which accumulate. No `PRIMARIES` stays Rec.709 rather
+/// than Radiance's default system, whose white is near E: untagged images are authored against
+/// neutrals, and would tint.
+fn radiance_header(color: &mut FileColor, bytes: &[u8]) -> Result<[f32; 3], String> {
+    let decoder = HdrDecoder::new(Cursor::new(bytes)).map_err(|e| e.to_string())?;
+    let mut scale = [1.0f32; 3];
+    let numbers = |v: &str| -> Vec<f32> {
+        v.split_whitespace()
+            .map_while(|n| n.parse().ok())
+            .filter(|n: &f32| n.is_finite())
+            .collect()
+    };
+    for (key, value) in &decoder.metadata().custom_attributes {
+        match (key.as_str(), &numbers(value)[..]) {
+            ("EXPOSURE", &[e]) if e > 0.0 => scale = scale.map(|s| s / e),
+            ("COLORCORR", &[r, g, b]) if r > 0.0 && g > 0.0 && b > 0.0 => {
+                scale = [scale[0] / r, scale[1] / g, scale[2] / b];
+            }
+            ("PRIMARIES", &[rx, ry, gx, gy, bx, by, wx, wy]) => {
+                let xy = |x: f32, y: f32| [f64::from(x), f64::from(y)];
+                color.gamut = color::stated_gamut([xy(rx, ry), xy(gx, gy), xy(bx, by), xy(wx, wy)]);
+            }
+            _ => {}
+        }
+    }
+    Ok(scale)
 }
 
 /// An image's size and whether it is an animated WebP, from its headers; `None` when `image`

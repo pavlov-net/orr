@@ -1326,3 +1326,30 @@ fn exr_states_chromaticities_and_interop_id() {
     assert_eq!(id, 2);
     assert_rgb(t, [0.5, 0.25, 0.125], "colorInteropID");
 }
+
+/// A Radiance picture of 4 x 4 texels of RGBE (128, 128, 128, 129), 1.0, under header `lines`.
+fn radiance(lines: &str) -> Vec<u8> {
+    let mut f = format!("#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n{lines}\n-Y 4 +X 4\n").into_bytes();
+    f.extend([128u8, 128, 128, 129].repeat(16));
+    f
+}
+
+/// Radiance filefmts: EXPOSURE is "a multiplier that has been applied to all the pixels in the
+/// file", radiances coming from "dividing by all the EXPOSURE settings multiplied together";
+/// COLORCORR is "Similar to the EXPOSURE variable except given in three parts", and PRIMARIES
+/// gives "primaries and the white point used to standardize the picture's color system". A file
+/// without PRIMARIES is Rec.709 by this project's decision.
+#[test]
+fn radiance_header_variables_apply() {
+    let d = dir("radiance");
+    let (id, [t, _]) = read_back(&d, &radiance(""));
+    assert_eq!(id, 0);
+    assert_rgb(t, [1.0; 3], "no variables");
+    let (_, [t, _]) = read_back(&d, &radiance("EXPOSURE=0.5\nEXPOSURE=0.5\n"));
+    assert_rgb(t, [4.0; 3], "EXPOSURE");
+    let (_, [t, _]) = read_back(&d, &radiance("COLORCORR=1 2 4\nCOLORCORR=0.5 1 1\n"));
+    assert_rgb(t, [2.0, 0.5, 0.25], "COLORCORR");
+    let p3 = "PRIMARIES=0.680 0.320 0.265 0.690 0.150 0.060 0.3127 0.3290\n";
+    let (id, _) = read_back(&d, &radiance(p3));
+    assert_eq!(id, 1, "PRIMARIES");
+}
