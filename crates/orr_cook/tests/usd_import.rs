@@ -598,6 +598,8 @@ fn rig(binds: [&str; 2], rest: &str) -> String {
                 0: [(0, 0, 0)],
                 10: [(1, 0, 0)],
             }}
+            quatf[] rotations = [(1, 0, 0, 0)]
+            half3[] scales = [(1, 1, 1)]
         }}"#
     )
 }
@@ -775,6 +777,7 @@ fn a_clip_keeps_a_zero_scale_keys_rotation_on_a_joint_past_a_gap() {
         def SkelAnimation "Vanish"
         {{
             uniform token[] joints = ["Root/Gap/Arm"]
+            float3[] translations = [(0, 1, 0)]
             quatf[] rotations.timeSamples = {{
                 0: [(0.7071068, 0.7071068, 0, 0)],
                 10: [(0.7071068, 0.7071068, 0, 0)],

@@ -6,23 +6,33 @@
 //! selections of [`UsdSettings::variants`] in a session layer; any composition error fails
 //! the import. Values are read at [`UsdSettings::time`]. The stage's `upAxis` and
 //! `metersPerUnit` (0.01 when unauthored, as USD's) turn stage space into scene space (Y
-//! up, meters). Prims that are inactive, abstract or not defined (and their subtrees) are not
-//! read; geometry that is `invisible` or of purpose `guide` or `proxy` (or under such a
-//! prim) is not cooked; instanceable prims are expanded.
+//! up, meters). Inactive prims (and their subtrees) are not read, and prims under a `class` or
+//! `over` are read only as prototypes. An Imageable prim that is `invisible`, or has an
+//! effective purpose of `guide` or `proxy`, is not drawn: invisibility holds for the subtree,
+//! and a prim takes the purpose of the nearest Imageable prim at or above it that authors one.
+//! Instanceable prims are expanded.
 //!
 //! Models, every one in scene units and axes:
 //! - Each `SkelRoot` is a model named after it, in scene space (bind space), of the skinned
-//!   meshes under it (those with a `primvars:skel:jointIndices` primvar), which must bind one
+//!   meshes under it (those with joint influences and a bound skeleton), which must bind one
 //!   skeleton, cooked as `<asset>/<root>/skeleton` with clips
 //!   `<asset>/<root>/clip/<animation>`. Its other meshes are static and cook with the rest
-//!   of the stage; a skinned mesh outside a `SkelRoot` fails.
-//! - Each prototype of a `PointInstancer` is a model named after its root prim, framed by
-//!   the root prim's parent, so the root's own transform is part of the model. The
-//!   instancer's `positions`, `orientations`, `scales` and `protoIndices` place it (records
-//!   whose `ids` are in `invisibleIds` are dropped) as [`crate::import::Scene::instances`].
-//!   Prims under an instancer are cooked only as its prototypes. A transform that collapses
-//!   an axis is not a placement: the prototype is cooked once per such linear transform with
-//!   it applied, as model `<model>/baked/<k>`, placed by translation alone.
+//!   of the stage, as do meshes outside a `SkelRoot`, whose bindings mean nothing. A skinned
+//!   mesh under a `SkelRoot` in a prototype fails: a copy has no pose of its own.
+//! - Each prototype of a `PointInstancer` is a model named after its root prim (after its path
+//!   if another model has the name). The root's own transform is part of the model, as is
+//!   what each prim under it adds, up to any prim that resets the transform stack. Only the
+//!   prototype's own subtree decides what is hidden, and a prototype with nothing to draw
+//!   places nothing. The instancer's `positions`, `orientations` (`orientationsf` where its
+//!   first value is not empty), `scales` and `protoIndices` place it, without the instances
+//!   whose `ids` are in `invisibleIds` or `inactiveIds`, as
+//!   [`crate::import::Scene::instances`]. Where `velocities` or `angularVelocities` bracket
+//!   the time at the samples of the values they move, those extrapolate from the lower sample
+//!   (with `accelerations` likewise) and neither value interpolates. An instancer under a
+//!   prototype is placed by each copy of it. Prims under an instancer are cooked only as
+//!   prototypes; one elsewhere that is defined also draws where it stands. A transform that
+//!   collapses an axis is not a placement: the prototype is cooked once per such linear
+//!   transform with it applied, as model `<model>/baked/<k>`, placed by translation alone.
 //! - Without [`UsdSettings::models`], the rest of the stage is one model, in scene space.
 //!   With it, each prim whose name contains a pattern (and has no selected ancestor) is a
 //!   model holding its subtree, framed by the prim; meshes outside every model are not
@@ -50,7 +60,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use openusd::{sdf, usd};
-use orr_math::{Affine2, DMat3, DMat4, DQuat, DVec3, DVec4, Mat4};
+use orr_math::{Affine2, DMat3, DMat4, DQuat, DVec3, DVec4};
 use serde::Deserialize;
 
 use crate::import::SceneSubd;
@@ -134,6 +144,54 @@ pub enum Subdivision {
     Cage,
 }
 
+/// Schemas derived from `UsdGeomImageable`; other prims have no visibility or purpose.
+const IMAGEABLE: &[&str] = &[
+    "BasisCurves",
+    "Camera",
+    "Capsule",
+    "Capsule_1",
+    "Cone",
+    "Cube",
+    "Cylinder",
+    "Cylinder_1",
+    "CylinderLight",
+    "DiskLight",
+    "DistantLight",
+    "DomeLight",
+    "DomeLight_1",
+    "Field3DAsset",
+    "GenerativeProcedural",
+    "GeometryLight",
+    "HermiteCurves",
+    "LightFilter",
+    "Mesh",
+    "NurbsCurves",
+    "NurbsPatch",
+    "OpenVDBAsset",
+    "PhysicsDistanceJoint",
+    "PhysicsFixedJoint",
+    "PhysicsJoint",
+    "PhysicsPrismaticJoint",
+    "PhysicsRevoluteJoint",
+    "PhysicsSphericalJoint",
+    "Plane",
+    "PluginLight",
+    "PluginLightFilter",
+    "PointInstancer",
+    "Points",
+    "PortalLight",
+    "RectLight",
+    "Scope",
+    "SkelRoot",
+    "Skeleton",
+    "SpatialAudio",
+    "Sphere",
+    "SphereLight",
+    "TetMesh",
+    "Volume",
+    "Xform",
+];
+
 /// One prim of the traversal.
 struct Node {
     prim: usd::Prim,
@@ -148,11 +206,13 @@ struct Node {
     reset: bool,
     ty: String,
     name: String,
-    /// Under a `PointInstancer`, which cooks it only as a prototype.
+    /// Under a `PointInstancer`, or a `class` or `over` (or one): cooked only as a prototype.
     instanced: bool,
-    /// Invisible or of purpose `guide` or `proxy`, or under such a prim: not drawn, but read
-    /// as a skeleton or animation.
-    hidden: bool,
+    /// Imageable and `invisible`: not drawn with its subtree, but read as a skeleton or
+    /// animation.
+    invisible: bool,
+    /// The purpose it authors, if Imageable.
+    purpose: Option<String>,
 }
 
 /// One model being assembled.
@@ -164,6 +224,8 @@ struct Building {
     skinned: bool,
     /// The node of the prim a skeletal root model holds.
     root: Option<usize>,
+    /// The root node of the prototype the model holds.
+    prototype: Option<usize>,
     skeleton: Option<usize>,
     welder: Welder,
     cage: CageBuilder,
@@ -176,11 +238,52 @@ impl Building {
             frame,
             skinned: root.is_some(),
             root,
+            prototype: None,
             skeleton: None,
             welder: Welder::default(),
             cage: CageBuilder::default(),
         }
     }
+}
+
+/// How a mesh under a `SkelRoot` binds a skeleton: nodes of the prims that say so.
+struct Bound {
+    skeleton: sdf::Path,
+    /// Where `skel:skeleton` is authored.
+    site: usize,
+    joints: Option<usize>,
+    indices: usize,
+    weights: usize,
+    geom_bind: Option<usize>,
+}
+
+/// One prototype of the stage.
+#[derive(Clone)]
+struct Prototype {
+    model: usize,
+    /// Instancers in its subtree, each placed by every copy of it.
+    nested: Vec<usize>,
+}
+
+/// What an instancer places, the same for every copy of it.
+struct Instancer {
+    /// Per prototype target its root node and prototype, if it has any.
+    protos: Vec<Option<(usize, Prototype)>>,
+    /// [`Importer::placements`].
+    placed: Vec<(usize, DMat4)>,
+}
+
+/// The stage's instancers as they are placed.
+#[derive(Default)]
+struct Instancing {
+    /// Prototypes by their root nodes.
+    prototypes: HashMap<usize, Prototype>,
+    /// Instancers by their nodes.
+    instancers: HashMap<usize, Rc<Instancer>>,
+    /// Placements per model.
+    copies: BTreeMap<usize, Vec<DMat4>>,
+    /// Meshes the prototypes draw, with their models.
+    meshes: Vec<(usize, usize)>,
 }
 
 pub(crate) fn import(asset: &str, path: &Path, settings: &UsdSettings) -> Result<Scene> {
@@ -299,18 +402,14 @@ impl<'s> Importer<'s> {
         kids.reverse();
         stack.extend(kids.into_iter().map(|p| (p, None)));
         while let Some((prim, parent)) = stack.pop() {
-            let skip = !prim.is_active().map_err(|e| e.to_string())?
-                || !prim.is_defined().map_err(|e| e.to_string())?
-                || prim.is_abstract().map_err(|e| e.to_string())?;
-            if skip {
+            if !prim.is_active().map_err(|e| e.to_string())? {
                 continue;
             }
             let r = self.reader(&prim);
             let up = parent.map(|p| &self.nodes[p]);
-            let hidden = up.is_some_and(|p| p.hidden)
-                || r.token("visibility")?.as_deref() == Some("invisible")
-                || matches!(r.token("purpose")?.as_deref(), Some("guide" | "proxy"));
-            let instanced = up.is_some_and(|p| p.instanced || p.ty == "PointInstancer");
+            let instanced = !prim.is_defined().map_err(|e| e.to_string())?
+                || prim.is_abstract().map_err(|e| e.to_string())?
+                || up.is_some_and(|p| p.instanced || p.ty == "PointInstancer");
             let (local, reset) = r.local_transform()?;
             let world = match (parent, reset) {
                 (Some(p), false) => self.nodes[p].world * local,
@@ -321,6 +420,9 @@ impl<'s> Importer<'s> {
                 .map_err(|e| e.to_string())?
                 .map(|t| t.as_str().to_string())
                 .unwrap_or_default();
+            let imageable = IMAGEABLE.contains(&ty.as_str());
+            let invisible = imageable && r.token("visibility")?.as_deref() == Some("invisible");
+            let purpose = if imageable { r.token("purpose")? } else { None };
             let name = prim.path().name().unwrap_or_default().to_string();
             let i = self.nodes.len();
             self.by_path.insert(prim.path().as_str().to_string(), i);
@@ -337,7 +439,8 @@ impl<'s> Importer<'s> {
                 ty,
                 name,
                 instanced,
-                hidden,
+                invisible,
+                purpose,
             });
         }
         for i in (0..self.nodes.len()).rev() {
@@ -353,15 +456,28 @@ impl<'s> Importer<'s> {
         i..self.nodes[i].end
     }
 
+    /// Whether node `n` is not drawn, by what it and the prims above it say up to and with
+    /// `top`, or the stage's root without it.
+    fn hidden(&self, n: usize, top: Option<usize>) -> bool {
+        let mut purpose = None;
+        let mut at = Some(n);
+        while let Some(i) = at {
+            let node = &self.nodes[i];
+            if node.invisible {
+                return true;
+            }
+            purpose = purpose.or(node.purpose.as_deref());
+            at = node.parent.filter(|_| Some(i) != top);
+        }
+        matches!(purpose, Some("guide" | "proxy"))
+    }
+
     fn run(&mut self) -> Result<Scene, String> {
         self.traverse()?;
         let n = self.nodes.len();
         let mut models: Vec<Building> = Vec::new();
         let mut owner: Vec<Option<usize>> = vec![None; n];
-        let new_model = |models: &mut Vec<Building>, node: &Node, frame, root: Option<usize>| {
-            models.push(Building::new(Some(node.name.clone()), frame, root));
-            models.len() - 1
-        };
+        let mut bound: HashMap<usize, Bound> = HashMap::new();
 
         // Skeletal roots hold their skinned meshes, in bind space.
         for i in 0..n {
@@ -369,56 +485,32 @@ impl<'s> Importer<'s> {
             if node.ty != "SkelRoot" || owner[i].is_some() || node.instanced {
                 continue;
             }
-            let m = new_model(&mut models, node, None, Some(i));
+            let m = models.len();
+            models.push(Building::new(Some(node.name.clone()), None, Some(i)));
             for k in self.subtree(i) {
-                if owner[k].is_none() && self.nodes[k].ty == "Mesh" && self.skinned(k) {
+                let node = &self.nodes[k];
+                if owner[k].is_some() || node.ty != "Mesh" || node.instanced {
+                    continue;
+                }
+                if let Some(b) = self.binding(k, i)? {
+                    bound.insert(k, b);
                     owner[k] = Some(m);
                 }
             }
         }
 
-        // Prototype models, and the placements of every instancer.
-        let instancers: Vec<usize> = (0..n)
-            .filter(|&i| {
-                let node = &self.nodes[i];
-                node.ty == "PointInstancer" && !node.instanced && !node.hidden
-            })
-            .collect();
-        let mut instances: BTreeMap<usize, Vec<Mat4>> = BTreeMap::new();
-        let mut proto_model: HashMap<String, usize> = HashMap::new();
-        for &ins in &instancers {
-            let r = self.reader(&self.nodes[ins].prim);
-            let path = r.path().to_string();
-            let protos = r.targets("prototypes")?;
-            let mut proto_models = Vec::with_capacity(protos.len());
-            for p in &protos {
-                let key = p.as_str().to_string();
-                let m = match proto_model.get(&key) {
-                    Some(&m) => m,
-                    None => {
-                        let root = *self
-                            .by_path
-                            .get(&key)
-                            .ok_or_else(|| format!("{path}: prototype {key} is not cooked"))?;
-                        let frame = self.nodes[root].parent;
-                        let m = new_model(&mut models, &self.nodes[root], frame, None);
-                        for o in &mut owner[self.subtree(root)] {
-                            o.get_or_insert(m);
-                        }
-                        proto_model.insert(key, m);
-                        m
-                    }
-                };
-                proto_models.push(m);
-            }
-            for (proto, transform) in self.placements(ins, protos.len())? {
-                instances
-                    .entry(proto_models[proto])
-                    .or_default()
-                    .push(transform);
+        self.select_models(&mut models, &mut owner)?;
+
+        // Prototype models, which name themselves around the rest, and the placements of every
+        // instancer.
+        let mut instancing = Instancing::default();
+        for i in 0..n {
+            let node = &self.nodes[i];
+            if node.ty == "PointInstancer" && !node.instanced && !self.hidden(i, None) {
+                let world = node.world;
+                self.place(i, world, &mut models, &mut instancing, &mut Vec::new())?;
             }
         }
-        self.select_models(&mut models, &mut owner)?;
 
         // Per instanced model its placements, and per model the models its meshes go to, with
         // what they apply: the model itself unless it places nothing, and those that bake its
@@ -427,9 +519,8 @@ impl<'s> Importer<'s> {
         let mut holders: Vec<Vec<(usize, DMat4)>> = (0..models.len())
             .map(|m| vec![(m, DMat4::IDENTITY)])
             .collect();
-        for (m, transforms) in instances {
+        for (m, transforms) in instancing.copies {
             let name = models[m].name.clone().unwrap_or_default();
-            let transforms: Vec<DMat4> = transforms.iter().map(Mat4::as_dmat4).collect();
             let (direct, baked) = placements(&transforms).map_err(|e| format!("{name}: {e}"))?;
             if direct.is_empty() {
                 holders[m].clear();
@@ -438,37 +529,42 @@ impl<'s> Importer<'s> {
             for (k, (linear, copies)) in baked.into_iter().enumerate() {
                 placed.insert(models.len(), copies);
                 holders[m].push((models.len(), linear));
+                let prototype = models[m].prototype;
                 models.push(Building::new(Some(format!("{name}/baked/{k}")), None, None));
+                models.last_mut().expect("pushed").prototype = prototype;
             }
         }
 
-        let meshes: Vec<usize> = (0..n)
-            .filter(|&i| self.nodes[i].ty == "Mesh" && owner[i].is_some() && !self.nodes[i].hidden)
+        // Every mesh drawn, with the model it goes to.
+        let mut meshes: Vec<(usize, usize)> = (0..n)
+            .filter(|&i| self.nodes[i].ty == "Mesh" && !self.hidden(i, None))
+            .filter_map(|i| Some((i, owner[i]?)))
             .collect();
+        meshes.extend(instancing.meshes);
         // One skeleton per skeletal root, from what its skinned meshes bind: its prim path,
-        // the skeleton, and the root's node.
-        let mut skels: Vec<(String, skel::Skel, usize)> = Vec::new();
+        // the skeleton, the root's node and the prims that bind it.
+        let mut skels: Vec<(String, skel::Skel, usize, Vec<usize>)> = Vec::new();
         for (m, b) in models.iter_mut().enumerate() {
             if !b.skinned {
                 continue;
             }
-            let mut bound: Option<sdf::Path> = None;
-            for &i in meshes
-                .iter()
-                .filter(|&&i| owner[i] == Some(m) && self.skinned(i))
-            {
-                let p = self.bound_skeleton(i)?;
-                match &bound {
-                    Some(b) if *b != p => {
+            let mut skeleton: Option<&sdf::Path> = None;
+            let mut sites = Vec::new();
+            for &(i, _) in meshes.iter().filter(|h| h.1 == m) {
+                let binding = &bound[&i];
+                match skeleton {
+                    Some(s) if *s != binding.skeleton => {
                         return Err(format!(
-                            "{}: binds {p}, another mesh of its SkelRoot {b}",
-                            self.nodes[i].prim.path().as_str()
+                            "{}: binds {}, another mesh of its SkelRoot {s}",
+                            self.nodes[i].prim.path().as_str(),
+                            binding.skeleton,
                         ));
                     }
-                    _ => bound = Some(p),
+                    _ => skeleton = Some(&binding.skeleton),
                 }
+                sites.push(binding.site);
             }
-            let Some(path) = bound else { continue };
+            let Some(path) = skeleton else { continue };
             let k = match skels.iter().position(|s| s.0 == path.as_str()) {
                 Some(k) => k,
                 None => {
@@ -482,27 +578,27 @@ impl<'s> Importer<'s> {
                         self.root,
                     )?;
                     let root = b.root.expect("skeletal roots have prims");
-                    skels.push((path.as_str().to_string(), built, root));
+                    skels.push((path.as_str().to_string(), built, root, Vec::new()));
                     skels.len() - 1
                 }
             };
+            skels[k].3.extend(sites);
             b.skeleton = Some(k);
         }
-        for &i in &meshes {
+        for &(i, o) in &meshes {
             let prim = self.nodes[i].prim.clone();
             let r = self.reader(&prim);
             let path = r.path().to_string();
-            let o = owner[i].expect("owned");
             let mesh = MeshPrim::read(&r, &self.settings.uv, self.settings.uv1.as_deref())?;
             let as_cage = !mesh.polygonal() && self.settings.subdivision == Subdivision::Cage;
             let skeleton = models[o].skeleton.map(|k| &skels[k].1);
-            let (skin, transform) = match (models[o].skinned, self.skinned(i), skeleton) {
-                (true, true, Some(sk)) => {
-                    let (s, to_bind) = sk.binding(&r, mesh.points.len())?;
+            let (skin, transform) = match (bound.get(&i), skeleton) {
+                (Some(b), Some(sk)) => {
+                    let (s, to_bind) =
+                        sk.binding(&path, &self.skin_source(b), mesh.points.len())?;
                     (Some(s), to_bind)
                 }
-                (false, false, _) => (None, self.to_model(&models[o], i)?),
-                _ => return Err(format!("{path}: a skinned mesh outside a SkelRoot")),
+                _ => (None, self.to_model(&models[o], i)?),
             };
             let faces = self.face_materials(i, &mesh)?;
             let face_material = |f: usize| faces[f];
@@ -529,8 +625,9 @@ impl<'s> Importer<'s> {
             if copies.as_ref().is_some_and(Vec::is_empty) {
                 continue;
             }
-            // The rest of the stage, or a skeletal root with no skinned mesh, may be empty.
-            if (b.name.is_none() || b.skinned)
+            // The rest of the stage, a skeletal root with no skinned mesh or a prototype may be
+            // empty.
+            if (b.name.is_none() || b.skinned || b.prototype.is_some())
                 && b.welder.groups.values().all(Vec::is_empty)
                 && b.cage.is_empty()
             {
@@ -550,8 +647,8 @@ impl<'s> Importer<'s> {
             return Err("the stage has no triangles".into());
         }
         let mut skeletons = Vec::with_capacity(skels.len());
-        for (path, sk, root) in skels {
-            let clips = self.clips(&path, &sk, root)?;
+        for (path, sk, root, sites) in skels {
+            let clips = self.clips(&path, &sk, root, &sites)?;
             skeletons.push(SceneSkeleton {
                 prefix: self.nodes[root].name.clone(),
                 info: sk.info,
@@ -652,10 +749,27 @@ impl<'s> Importer<'s> {
         })
     }
 
+    /// Prototype `root`'s model space from node `n`'s under it: the local transforms from
+    /// `root`, or from a prim that resets the transform stack.
+    fn to_prototype(&self, root: usize, n: usize) -> DMat4 {
+        let (mut m, mut at) = (DMat4::IDENTITY, n);
+        loop {
+            let node = &self.nodes[at];
+            m = node.local * m;
+            match node.parent.filter(|_| at != root && !node.reset) {
+                Some(p) => at = p,
+                None => return self.root * m,
+            }
+        }
+    }
+
     /// Model `b`'s space from node `n`'s. The local transforms up to the frame give it where
     /// the frame's world transform has no inverse; only that inverse reaches a prim that
     /// resets the transform stack.
     fn to_model(&self, b: &Building, n: usize) -> Result<DMat4, String> {
+        if let Some(root) = b.prototype {
+            return Ok(self.to_prototype(root, n));
+        }
         let Some(frame) = b.frame else {
             return Ok(self.nodes[n].world);
         };
@@ -737,25 +851,172 @@ impl<'s> Importer<'s> {
         Ok(())
     }
 
-    /// Per instance of a `PointInstancer`: its prototype index and scene transform.
-    fn placements(&self, ins: usize, protos: usize) -> Result<Vec<(usize, Mat4)>, String> {
+    /// The prototype with root node `root`, made if it is new: its model holds the meshes its
+    /// subtree draws, and instancers there are left to be placed by its copies.
+    fn prototype(
+        &self,
+        root: usize,
+        models: &mut Vec<Building>,
+        instancing: &mut Instancing,
+    ) -> Result<Prototype, String> {
+        if let Some(p) = instancing.prototypes.get(&root) {
+            return Ok(p.clone());
+        }
+        let node = &self.nodes[root];
+        let taken = models
+            .iter()
+            .any(|m| m.name.as_deref() == Some(node.name.as_str()));
+        let name = if taken {
+            node.prim.path().as_str().trim_start_matches('/')
+        } else {
+            node.name.as_str()
+        };
+        let model = models.len();
+        models.push(Building::new(Some(name.to_string()), None, None));
+        models[model].prototype = Some(root);
+        let mut nested = Vec::new();
+        let mut k = root;
+        while k < node.end {
+            let at = &self.nodes[k];
+            let drawn = !self.hidden(k, Some(root));
+            if at.ty == "PointInstancer" {
+                if drawn {
+                    nested.push(k);
+                }
+                k = at.end;
+                continue;
+            }
+            if at.ty == "Mesh" && drawn {
+                if let Some(skel_root) = self.skel_root(k)
+                    && self.binding(k, skel_root)?.is_some()
+                {
+                    return Err(format!(
+                        "{}: a skinned mesh in a prototype",
+                        at.prim.path().as_str()
+                    ));
+                }
+                instancing.meshes.push((k, model));
+            }
+            k += 1;
+        }
+        let p = Prototype { model, nested };
+        instancing.prototypes.insert(root, p.clone());
+        Ok(p)
+    }
+
+    /// Records the copies of instancer `ins`, whose space `to_scene` takes to scene space, and
+    /// of the instancers under its prototypes. `above` lists the instancers being placed.
+    fn place(
+        &self,
+        ins: usize,
+        to_scene: DMat4,
+        models: &mut Vec<Building>,
+        instancing: &mut Instancing,
+        above: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        let r = self.reader(&self.nodes[ins].prim);
+        if above.contains(&ins) {
+            return Err(format!("{}: the instancer is its own prototype", r.path()));
+        }
+        above.push(ins);
+        let instancer = match instancing.instancers.get(&ins) {
+            Some(i) => Rc::clone(i),
+            None => {
+                // A prototype that is inactive or not there has no copies.
+                let mut protos = Vec::new();
+                for path in r.targets("prototypes")? {
+                    let root = self.by_path.get(path.as_str()).copied();
+                    protos.push(match root {
+                        Some(root) => Some((root, self.prototype(root, models, instancing)?)),
+                        None => None,
+                    });
+                }
+                let placed = self.placements(ins, protos.len())?;
+                let i = Rc::new(Instancer { protos, placed });
+                instancing.instancers.insert(ins, Rc::clone(&i));
+                i
+            }
+        };
+        for &(proto, local) in &instancer.placed {
+            let Some((root, p)) = &instancer.protos[proto] else {
+                continue;
+            };
+            let transform = to_scene * local;
+            let copies = instancing.copies.entry(p.model).or_default();
+            copies.push(transform);
+            for &nested in &p.nested {
+                let to_scene = transform * self.to_prototype(*root, nested);
+                self.place(nested, to_scene, models, instancing, above)?;
+            }
+        }
+        above.pop();
+        Ok(())
+    }
+
+    /// Per instance of a `PointInstancer`: its prototype index and the instancer's space from
+    /// the prototype's model.
+    fn placements(&self, ins: usize, protos: usize) -> Result<Vec<(usize, DMat4)>, String> {
         let node = &self.nodes[ins];
         let r = self.reader(&node.prim);
         let path = r.path();
         let index = r.ints("protoIndices")?.unwrap_or_default();
-        let positions = r.numbers("positions")?.unwrap_or_default();
-        let orientations = match r.numbers("orientations")? {
-            Some(o) => Some(o),
-            None => r.numbers("orientationsf")?,
+        let count = index.len();
+        let time = f64::from(self.time);
+        let bracket = |name: &str| {
+            node.prim
+                .attribute(name)
+                .bracketing_time_samples(self.time)
+                .map_err(|e| format!("{path} {name}: {e}"))
         };
-        let scales = r.numbers("scales")?;
+        // `name` at the lower sample of `base`, if it brackets the time at the same samples and
+        // has one value per instance.
+        let lined_up = |name: &str, base: Option<(f64, f64)>, width: usize| match base {
+            Some((lower, _)) if bracket(name)? == base => Ok::<_, String>(
+                r.at(lower)
+                    .numbers(name)?
+                    .filter(|v| v.len() == width * count),
+            ),
+            _ => Ok(None),
+        };
+        let orientation = self.orientation_attribute(&r)?;
+        let moved = bracket("positions")?;
+        let turned = bracket(orientation)?;
+        let velocities = lined_up("velocities", moved, 3)?;
+        let accelerations = match velocities {
+            Some(_) => lined_up("accelerations", moved, 3)?,
+            None => None,
+        };
+        let spins = lined_up("angularVelocities", turned, 3)?;
+        // Without a rate to extrapolate by, values interpolate; with one, both hold.
+        let held = |b: Option<(f64, f64)>| match b {
+            Some((lower, _)) if velocities.is_some() || spins.is_some() => lower,
+            _ => time,
+        };
+        let positions = r.at(held(moved)).numbers("positions")?.unwrap_or_default();
+        let orientations = r
+            .at(held(turned))
+            .numbers(orientation)?
+            .filter(|v| !v.is_empty());
+        let scales = r.numbers("scales")?.filter(|v| !v.is_empty());
+        let per_second = self.stage.time_codes_per_second();
+        let since = |b: Option<(f64, f64)>| b.map_or(0.0, |b| (time - b.0) / per_second);
+        let (moved_for, turned_for) = (since(moved), since(turned));
         let ids = r.ints("ids")?;
-        let invisible: std::collections::HashSet<i64> = r
+        let mut masked: std::collections::HashSet<i64> = r
             .ints("invisibleIds")?
             .unwrap_or_default()
             .into_iter()
             .collect();
-        let count = index.len();
+        let inactive = node
+            .prim
+            .get_metadata::<sdf::Value>("inactiveIds")
+            .map_err(|e| format!("{path} inactiveIds: {e}"))?;
+        // A crate file holds a list op; text gives a plain list its own type.
+        match inactive {
+            Some(sdf::Value::Int64ListOp(op)) => masked.extend(op.flatten()),
+            Some(v) => masked.extend(read::numbers(&v).iter().flatten().map(|&x| x as i64)),
+            None => {}
+        }
         if positions.len() != 3 * count {
             return Err(format!(
                 "{path}: {} positions for {count} protoIndices",
@@ -771,86 +1032,171 @@ impl<'s> Importer<'s> {
         };
         check(&orientations, 4, "orientations")?;
         check(&scales, 3, "scales")?;
+        let to_model = self.root.inverse();
         let mut out = Vec::with_capacity(count);
         for (i, &p) in index.iter().enumerate() {
             let id = ids
                 .as_ref()
                 .and_then(|ids| ids.get(i).copied())
                 .unwrap_or(i as i64);
-            if invisible.contains(&id) {
+            if masked.contains(&id) {
                 continue;
             }
             let proto = usize::try_from(p)
                 .ok()
                 .filter(|&p| p < protos)
                 .ok_or_else(|| format!("{path}: protoIndex {p} of {protos} prototypes"))?;
-            let t = DVec3::from_slice(&positions[3 * i..]);
-            let q = orientations
-                .as_ref()
-                .map_or(DQuat::IDENTITY, |o| read::quat(&o[4 * i..]).normalize());
+            let vector = |v: &Option<Vec<f64>>| {
+                v.as_ref()
+                    .map_or(DVec3::ZERO, |v| DVec3::from_slice(&v[3 * i..]))
+            };
+            let velocity = vector(&velocities) + moved_for * vector(&accelerations) * 0.5;
+            let t = DVec3::from_slice(&positions[3 * i..]) + moved_for * velocity;
+            let q = orientations.as_ref().map_or(DQuat::IDENTITY, |o| {
+                let spin = vector(&spins);
+                let turn = (turned_for * spin.length()).to_radians();
+                let by = DQuat::from_axis_angle(spin.normalize_or(DVec3::X), turn);
+                by * read::quat(&o[4 * i..]).normalize()
+            });
             let s = scales
                 .as_ref()
                 .map_or(DVec3::ONE, |s| DVec3::from_slice(&s[3 * i..]));
-            let m =
-                node.world * DMat4::from_scale_rotation_translation(s, q, t) * self.root.inverse();
-            out.push((proto, m.as_mat4()));
+            out.push((
+                proto,
+                DMat4::from_scale_rotation_translation(s, q, t) * to_model,
+            ));
         }
         Ok(out)
     }
 
-    fn skinned(&self, i: usize) -> bool {
-        self.nodes[i]
+    /// The attribute orientations come from: `orientationsf`, where its earliest sample (or
+    /// default without samples) is not empty.
+    fn orientation_attribute(&self, r: &PrimReader<'_>) -> Result<&'static str, String> {
+        let name = "orientationsf";
+        let times = r
             .prim
-            .attribute("primvars:skel:jointIndices")
-            .has_authored_value()
-            .unwrap_or(false)
+            .attribute(name)
+            .time_sample_times()
+            .map_err(|e| format!("{} {name}: {e}", r.path()))?;
+        let first = times.first().map_or(f64::from(self.time), |&t| t);
+        let empty = r.at(first).numbers(name)?.is_none_or(|v| v.is_empty());
+        Ok(if empty { "orientations" } else { name })
     }
 
-    /// The skeleton a skinned mesh binds: `skel:skeleton` on it or its nearest ancestor.
-    fn bound_skeleton(&self, m: usize) -> Result<sdf::Path, String> {
+    /// The nearest `SkelRoot` at or above node `n`.
+    fn skel_root(&self, n: usize) -> Option<usize> {
+        std::iter::successors(Some(n), |&i| self.nodes[i].parent)
+            .find(|&i| self.nodes[i].ty == "SkelRoot")
+    }
+
+    /// Node `m` or the nearest prim above it, up to `root`, that authors `attribute`; a prim
+    /// above it counts only with `SkelBindingAPI`, as `UsdSkelCache` reads them.
+    fn inherited(&self, m: usize, root: usize, attribute: &str) -> Result<Option<usize>, String> {
+        let mut at = Some(m);
+        while let Some(i) = at {
+            let prim = &self.nodes[i].prim;
+            let fail = |e: openusd::Error| format!("{} {attribute}: {e}", prim.path().as_str());
+            if (i == m || prim.has_api_schema("SkelBindingAPI").map_err(fail)?)
+                && prim
+                    .attribute(attribute)
+                    .has_authored_value()
+                    .map_err(fail)?
+            {
+                return Ok(Some(i));
+            }
+            at = self.nodes[i].parent.filter(|_| i != root);
+        }
+        Ok(None)
+    }
+
+    /// How mesh `m` under `SkelRoot` `root` binds a skeleton, if it has joint influences and
+    /// a bound `Skeleton`.
+    fn binding(&self, m: usize, root: usize) -> Result<Option<Bound>, String> {
+        let from = |attribute: &str| self.inherited(m, root, attribute);
+        let (Some(indices), Some(weights)) = (
+            from("primvars:skel:jointIndices")?,
+            from("primvars:skel:jointWeights")?,
+        ) else {
+            return Ok(None);
+        };
+        let Some((skeleton, site)) = self.bound_skeleton(m)? else {
+            return Ok(None);
+        };
+        let is_skeleton = self
+            .by_path
+            .get(skeleton.as_str())
+            .is_some_and(|&n| self.nodes[n].ty == "Skeleton");
+        if !is_skeleton {
+            return Ok(None);
+        }
+        Ok(Some(Bound {
+            skeleton,
+            site,
+            joints: from("skel:joints")?,
+            indices,
+            weights,
+            geom_bind: from("primvars:skel:geomBindTransform")?,
+        }))
+    }
+
+    /// The readers of a binding's attributes.
+    fn skin_source(&self, b: &Bound) -> skel::SkinSource<'_> {
+        let reader = |n: usize| self.reader(&self.nodes[n].prim);
+        skel::SkinSource {
+            joints: b.joints.map(reader),
+            indices: reader(b.indices),
+            weights: reader(b.weights),
+            geom_bind: b.geom_bind.map(reader),
+        }
+    }
+
+    /// The skeleton mesh `m` binds and the node that says so: `skel:skeleton` on it or its
+    /// nearest ancestor.
+    fn bound_skeleton(&self, m: usize) -> Result<Option<(sdf::Path, usize)>, String> {
         let mut at = Some(m);
         while let Some(n) = at {
             let r = self.reader(&self.nodes[n].prim);
             if let Some(t) = r.targets("skel:skeleton")?.into_iter().next() {
-                return Ok(t);
+                return Ok(Some((t, n)));
             }
             at = self.nodes[n].parent;
         }
-        Err(format!(
-            "{}: skinned without skel:skeleton",
-            self.nodes[m].prim.path().as_str()
-        ))
+        Ok(None)
     }
 
-    /// Clips of skeleton `path`: its `skel:animationSource` (on the skeleton, else its
-    /// skeletal root, node `root`) and every animation under the root.
+    /// The animation bound at node `n`: the `skel:animationSource` there or on its nearest
+    /// ancestor that authors one. A target that is deactivated binds nothing.
+    fn animation_source(&self, n: usize) -> Result<Option<usize>, String> {
+        let mut at = Some(n);
+        while let Some(i) = at {
+            let r = self.reader(&self.nodes[i].prim);
+            if let Some(t) = r.targets("skel:animationSource")?.first() {
+                return Ok(self.by_path.get(t.as_str()).copied());
+            }
+            at = self.nodes[i].parent;
+        }
+        Ok(None)
+    }
+
+    /// Clips of skeleton `path`: the `skel:animationSource` in force where it is bound (nodes
+    /// `sites`) and on the skeleton, and every animation under its skeletal root, node `root`.
     fn clips(
         &self,
         path: &str,
         sk: &skel::Skel,
         root: usize,
+        sites: &[usize],
     ) -> Result<Vec<(String, orr_pack::clip::Clip)>, String> {
         self.settings.clips.check()?;
         let per_second = self.stage.time_codes_per_second();
         let mut sources: Vec<usize> = Vec::new();
-        for p in [path, self.nodes[root].prim.path().as_str()] {
-            let Some(&n) = self.by_path.get(p) else {
-                continue;
-            };
-            let r = self.reader(&self.nodes[n].prim);
-            if let Some(t) = r.targets("skel:animationSource")?.into_iter().next() {
-                let a = *self
-                    .by_path
-                    .get(t.as_str())
-                    .ok_or_else(|| format!("{p}: animation {t} is not cooked"))?;
-                sources.push(a);
-                break;
-            }
+        for &n in sites.iter().chain(self.by_path.get(path)) {
+            sources.extend(self.animation_source(n)?);
         }
-        sources.extend(
-            self.subtree(root)
-                .filter(|&i| self.nodes[i].ty == "SkelAnimation"),
-        );
+        sources.extend(self.subtree(root).filter(|&i| {
+            let node = &self.nodes[i];
+            node.ty == "SkelAnimation" && !node.instanced
+        }));
         sources.sort_unstable();
         sources.dedup();
         let mut clips = Vec::new();

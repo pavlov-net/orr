@@ -5,10 +5,13 @@
 
 use std::path::PathBuf;
 
-use orr_cook::{ArchiveSpec, AssetSpec, Manifest, Source, UsdSettings};
-use orr_math::Vec3;
+use orr_cook::{ArchiveSpec, AssetSpec, Manifest, NodeSelect, Source, Subdivision, UsdSettings};
+use orr_math::{Mat4, Quat, Vec3};
+use orr_pack::clip::Clip;
+use orr_pack::instance::{InstancePageInfo, decode};
 use orr_pack::mesh::{MeshInfo, PageView};
-use orr_pack::{Archive, AssetId, Blob, Target};
+use orr_pack::skeleton::{SkeletonInfo, Trs};
+use orr_pack::{Archive, AssetId, Blob, Class, Target};
 
 const HEAD: &str = r#"#usda 1.0
 (
@@ -66,6 +69,10 @@ fn blob(a: &Archive, name: &str, i: usize) -> Vec<u8> {
     read(a, &a.blobs(e)[i])
 }
 
+fn has(a: &Archive, name: &str) -> bool {
+    a.find(AssetId::from_name(name)).is_some()
+}
+
 /// Position, normal and uv of every corner of a mesh entry.
 fn corners(a: &Archive, name: &str) -> Vec<(Vec3, Vec3, [f32; 2])> {
     let info = MeshInfo::parse(&blob(a, name, 0)).unwrap();
@@ -87,6 +94,42 @@ fn corners(a: &Archive, name: &str) -> Vec<(Vec3, Vec3, [f32; 2])> {
             }
         }
     }
+    out
+}
+
+/// The transforms that place model `model`, in scene space.
+fn copies(a: &Archive, model: &str) -> Vec<Mat4> {
+    let want = AssetId::from_name(model);
+    let mut out = Vec::new();
+    for e in a
+        .entries()
+        .iter()
+        .filter(|e| e.class == Class::InstancePage as u16)
+    {
+        let blobs = a.blobs(e);
+        let (head, body) = (read(a, &blobs[0]), read(a, &blobs[1]));
+        let info = InstancePageInfo::parse(&head).unwrap();
+        let (cell, records) = decode(&head, &body).unwrap();
+        for (p, mut m) in records {
+            if info.prototypes[usize::from(p)].model == want {
+                m.translation += Vec3::from(cell.map(|c| c as f32)) * 256.0;
+                out.push(Mat4::from(m));
+            }
+        }
+    }
+    out
+}
+
+/// Sorted scene positions, rounded to millimeters, that the copies of `model` put its origin at.
+fn origins(a: &Archive, model: &str) -> Vec<[i32; 3]> {
+    let mut out: Vec<[i32; 3]> = copies(a, model)
+        .iter()
+        .map(|m| {
+            let p = m.transform_point3(Vec3::ZERO);
+            p.to_array().map(|x| (x * 1000.0).round() as i32)
+        })
+        .collect();
+    out.sort_unstable();
     out
 }
 
@@ -294,4 +337,684 @@ fn unauthored_interpolation_is_constant_for_primvars_and_vertex_for_normals() {
             .iter()
             .all(|c| c.1.abs_diff_eq(Vec3::Y, 1e-2))
     );
+}
+
+/// A `PointInstancer` at the given attributes, its prototype a triangle child `Protos/P`.
+fn instancer(attributes: &str) -> String {
+    format!(
+        r#"def PointInstancer "I"
+{{
+    rel prototypes = [</I/Protos/P>]
+    {attributes}
+    def Scope "Protos"
+    {{
+        def Mesh "P"
+        {{
+            {TRIANGLE}
+        }}
+    }}
+}}"#
+    )
+}
+
+/// A prototype goes by its path where a selected prim has its name, and a bilinear mesh, whose
+/// surface is its faces, needs no cage.
+#[test]
+fn a_prototype_gives_way_to_a_selected_model_of_its_name() {
+    let body = format!(
+        r#"def Mesh "P"
+{{
+    uniform token subdivisionScheme = "bilinear"
+    int[] faceVertexCounts = [3]
+    int[] faceVertexIndices = [0, 1, 2]
+    point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+}}
+
+{}"#,
+        instancer("int[] protoIndices = [0]\n point3f[] positions = [(0, 0, 0)]")
+    );
+    let settings = UsdSettings {
+        models: vec![NodeSelect { node: "P".into() }],
+        subdivision: Subdivision::Cage,
+        ..Default::default()
+    };
+    let a = cook_at(&dir("prototype-name"), &body, settings).unwrap();
+    assert!(has(&a, "u/P/mesh") && has(&a, "u/I/Protos/P/mesh"));
+}
+
+/// PI, below: where a copy at the origin turns +x, by each row's orientation attributes.
+#[test]
+fn orientationsf_wins_unless_its_first_value_is_empty() {
+    let turned = "(0.70710678, 0, 0.70710678, 0)";
+    let flat = "(1, 0, 0, 0)";
+    let start = "int[] protoIndices = [0]\n    point3f[] positions = [(0, 0, 0)]";
+    let rows = [
+        // PI: "orientationsf will be preferred over orientations if both are authored".
+        (
+            "both",
+            format!("quath[] orientations = [{flat}]\n    quatf[] orientationsf = [{turned}]"),
+            Vec3::NEG_Z,
+        ),
+        // PI: only "if the earliest time sample ... of orientationsf is not empty".
+        (
+            "empty",
+            format!("quath[] orientations = [{turned}]\n    quatf[] orientationsf = []"),
+            Vec3::NEG_Z,
+        ),
+        (
+            "empty-first-sample",
+            format!(
+                "quath[] orientations = [{turned}]
+    quatf[] orientationsf.timeSamples = {{ 0: [], 5: [{flat}] }}"
+            ),
+            Vec3::NEG_Z,
+        ),
+        (
+            "only-f",
+            format!("quatf[] orientationsf = [{turned}]"),
+            Vec3::NEG_Z,
+        ),
+    ];
+    for (name, attrs, want) in rows {
+        let a = cook(
+            &format!("orient-{name}"),
+            &instancer(&format!("{start}\n    {attrs}")),
+        );
+        let m = copies(&a, "u/P")[0];
+        let got = m.transform_vector3(Vec3::X);
+        assert!(got.abs_diff_eq(want, 2e-2), "{name}: {got}");
+    }
+}
+
+/// PI: "Both pruning features' lists of ID's are combined to produce the mask", the ids being
+/// `ids` where authored and the index otherwise.
+#[test]
+fn inactive_and_invisible_ids_both_mask() {
+    let positions = "int[] protoIndices = [0, 0, 0]
+    point3f[] positions = [(1, 0, 0), (2, 0, 0), (3, 0, 0)]";
+    for (name, meta, attrs, want) in [
+        ("inactive", "inactiveIds = [ 0 ]", "", vec![2000, 3000]),
+        (
+            "union",
+            "inactiveIds = [ 0 ]",
+            "int64[] invisibleIds = [2]",
+            vec![2000],
+        ),
+        (
+            "by-ids",
+            "inactiveIds = [ 7 ]",
+            "int64[] ids = [5, 6, 7]\n    int64[] invisibleIds = [5]",
+            vec![2000],
+        ),
+    ] {
+        let body = instancer(&format!("{positions}\n    {attrs}")).replace(
+            r#"def PointInstancer "I""#,
+            &format!("def PointInstancer \"I\" (\n    {meta}\n)"),
+        );
+        let a = cook(&format!("mask-{name}"), &body);
+        let got: Vec<i32> = origins(&a, "u/P").iter().map(|o| o[0]).collect();
+        assert_eq!(got, want, "{name}");
+    }
+}
+
+/// PI: "If instance transforms are requested at a time between samples and either of the
+/// velocity attributes is authored, then we will not attempt to interpolate samples of positions
+/// or orientations". `overview.dox`: velocities that don't line up with positions fall back to
+/// standard position computation logic. Ten time codes make a second.
+#[test]
+fn velocities_extrapolate_from_the_lower_sample_where_they_line_up() {
+    let samples = "int[] protoIndices = [0]
+    point3f[] positions.timeSamples = { 0: [(0, 0, 0)], 10: [(10, 0, 0)] }";
+    let at = |time: f64| UsdSettings {
+        time: Some(time),
+        ..UsdSettings::default()
+    };
+    for (name, attrs, time, want) in [
+        (
+            "aligned",
+            "vector3f[] velocities.timeSamples = { 0: [(2, 0, 0)], 10: [(2, 0, 0)] }",
+            5.0,
+            [1000, 0, 0],
+        ),
+        (
+            "accelerated",
+            "vector3f[] velocities.timeSamples = { 0: [(2, 0, 0)], 10: [(2, 0, 0)] }
+    vector3f[] accelerations.timeSamples = { 0: [(0, 8, 0)], 10: [(0, 8, 0)] }",
+            5.0,
+            [1000, 1000, 0],
+        ),
+        (
+            "on-a-sample",
+            "vector3f[] velocities.timeSamples = { 0: [(2, 0, 0)], 10: [(2, 0, 0)] }",
+            10.0,
+            [10000, 0, 0],
+        ),
+        (
+            "misaligned",
+            "vector3f[] velocities.timeSamples = { 2: [(2, 0, 0)], 10: [(2, 0, 0)] }",
+            5.0,
+            [5000, 0, 0],
+        ),
+        ("unauthored", "", 5.0, [5000, 0, 0]),
+    ] {
+        let a = cook_at(
+            &dir(&format!("velocity-{name}")),
+            &instancer(&format!("{samples}\n    {attrs}")),
+            at(time),
+        )
+        .unwrap();
+        assert_eq!(origins(&a, "u/P"), [want], "{name}");
+    }
+
+    // Angular velocities turn the lower sample's orientation, in degrees per second, after it.
+    let a = cook_at(
+        &dir("velocity-angular"),
+        &instancer(
+            "int[] protoIndices = [0]
+    point3f[] positions = [(0, 0, 0)]
+    quath[] orientations.timeSamples = { 0: [(1, 0, 0, 0)], 10: [(0, 0, 1, 0)] }
+    vector3f[] angularVelocities.timeSamples = { 0: [(0, 180, 0)], 10: [(0, 180, 0)] }",
+        ),
+        at(5.0),
+    )
+    .unwrap();
+    let got = copies(&a, "u/P")[0].transform_vector3(Vec3::X);
+    assert!(got.abs_diff_eq(Vec3::NEG_Z, 2e-2), "{got}");
+}
+
+/// PI: "We do not ... provide a specific mechanism for identifying prototypes as geometry that
+/// should not be drawn ... in their own, local spaces"; only the instancer prunes traversal.
+#[test]
+fn a_prototype_outside_the_instancer_also_draws_where_it_stands() {
+    let a = cook(
+        "proto-in-place",
+        &format!(
+            r#"def Mesh "P"
+{{
+    {TRIANGLE}
+}}
+
+def PointInstancer "I"
+{{
+    rel prototypes = [</P>]
+    int[] protoIndices = [0]
+    point3f[] positions = [(0, 5, 0)]
+}}"#
+        ),
+    );
+    assert_eq!(origins(&a, "u/P"), [[0, 5000, 0]]);
+    assert_eq!(corners(&a, "u/mesh").len(), 3);
+    assert_eq!(corners(&a, "u/P/mesh").len(), 3);
+}
+
+/// PI: place prototypes "under a prim that is a "class" or "over". "class" is recommended": they
+/// aren't drawn in place, but instance.
+#[test]
+fn prototypes_under_a_class_or_over_cook_only_as_copies() {
+    for specifier in ["class", "over"] {
+        let a = cook(
+            &format!("proto-{specifier}"),
+            &format!(
+                r#"{specifier} "Protos"
+{{
+    def Mesh "P"
+    {{
+        {TRIANGLE}
+    }}
+}}
+
+def PointInstancer "I"
+{{
+    rel prototypes = [</Protos/P>]
+    int[] protoIndices = [0]
+    point3f[] positions = [(0, 5, 0)]
+}}"#
+            ),
+        );
+        assert_eq!(origins(&a, "u/P"), [[0, 5000, 0]], "{specifier}");
+        assert!(!has(&a, "u/mesh"), "{specifier} draws in place");
+    }
+}
+
+/// PI step 1: "Apply (most locally) the authored local to parent transformation for
+/// prototypes[protoIndices[i]]". `pointInstancer.cpp` takes `GetLocalTransformation` and ignores
+/// its reset flag, and Hydra 2.0's `piPrototypeSceneIndex` keeps the local matrix too; the legacy
+/// `UsdImagingDelegate` adapter differs, working from the prim's world transform.
+#[test]
+fn a_prototype_root_that_resets_the_stack_keeps_only_its_local_transform() {
+    let a = cook(
+        "proto-reset",
+        &format!(
+            r#"def Xform "Parent"
+{{
+    double3 xformOp:translate = (10, 0, 0)
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+
+    def PointInstancer "I"
+    {{
+        rel prototypes = [</Parent/I/P>]
+        int[] protoIndices = [0]
+        point3f[] positions = [(1, 0, 0)]
+
+        def Mesh "P"
+        {{
+            double3 xformOp:translate = (1, 0, 0)
+            uniform token[] xformOpOrder = ["!resetXformStack!", "xformOp:translate"]
+            {TRIANGLE}
+        }}
+    }}
+}}"#
+        ),
+    );
+    let m = copies(&a, "u/P")[0];
+    let got: Vec<Vec3> = corners(&a, "u/P/mesh")
+        .iter()
+        .map(|c| m.transform_point3(c.0))
+        .collect();
+    // The instancer at 10, its copy at 1, the root's own 1.
+    assert!(
+        got.iter()
+            .any(|p| p.abs_diff_eq(Vec3::new(12.0, 0.0, 0.0), 1e-3)),
+        "{got:?}"
+    );
+}
+
+/// PI: "Any prim in the scenegraph can be targeted as a prototype";
+/// `pointInstancerAdapter.cpp` handles "another nested PointInstancer".
+#[test]
+fn nested_instancers_multiply_their_copies() {
+    let a = cook(
+        "proto-nested",
+        &format!(
+            r#"def PointInstancer "Outer"
+{{
+    rel prototypes = [</Outer/Inner>]
+    int[] protoIndices = [0, 0]
+    point3f[] positions = [(100, 0, 0), (200, 0, 0)]
+
+    def PointInstancer "Inner"
+    {{
+        rel prototypes = [</Outer/Inner/P>]
+        int[] protoIndices = [0, 0]
+        point3f[] positions = [(0, 1, 0), (0, 2, 0)]
+
+        def Mesh "P"
+        {{
+            {TRIANGLE}
+        }}
+    }}
+}}"#
+        ),
+    );
+    assert_eq!(
+        origins(&a, "u/P"),
+        [
+            [100000, 1000, 0],
+            [100000, 2000, 0],
+            [200000, 1000, 0],
+            [200000, 2000, 0]
+        ]
+    );
+}
+
+/// A prototype's own subtree decides what it draws, whatever is above it; one with nothing to
+/// draw places nothing.
+#[test]
+fn prototypes_draw_by_their_own_subtree() {
+    let a = cook(
+        "proto-hidden-scope",
+        &format!(
+            r#"def Xform "Protos"
+{{
+    token visibility = "invisible"
+
+    def Mesh "P"
+    {{
+        {TRIANGLE}
+    }}
+    def Xform "Empty"
+    {{
+    }}
+}}
+
+def PointInstancer "I"
+{{
+    rel prototypes = [</Protos/P>, </Protos/Empty>]
+    int[] protoIndices = [0, 1]
+    point3f[] positions = [(0, 5, 0), (0, 6, 0)]
+}}"#
+        ),
+    );
+    assert_eq!(origins(&a, "u/P"), [[0, 5000, 0]]);
+    assert!(copies(&a, "u/Empty").is_empty());
+}
+
+/// `overview.dox`: "A prim that is Imageable with an authored opinion about its purpose will
+/// always have the same effective purpose as its authored value"; a non-Imageable prim's opinion
+/// is ignored, and what isn't authored comes from the closest Imageable ancestor.
+#[test]
+fn purpose_is_the_nearest_opinion_on_an_imageable_prim() {
+    let mesh = |purpose: &str| format!("def Mesh \"M\" {{\n{TRIANGLE}\n{purpose}\n}}");
+    let rows = [
+        (
+            "render-under-guide",
+            format!(
+                "def Xform \"A\" {{\n token purpose = \"guide\"\n{}\n}}",
+                mesh("uniform token purpose = \"render\"")
+            ),
+            true,
+        ),
+        (
+            "typeless-parent",
+            format!("def \"A\" {{\n token purpose = \"proxy\"\n{}\n}}", mesh("")),
+            true,
+        ),
+        (
+            "through-typeless",
+            format!(
+                "def Xform \"A\" {{\n token purpose = \"guide\"\n def \"B\" {{\n{}\n}}\n}}",
+                mesh("")
+            ),
+            false,
+        ),
+        (
+            "typeless-render-under-guide",
+            format!(
+                "def Xform \"A\" {{\n token purpose = \"guide\"\n def \"B\" {{\n token purpose = \"render\"\n{}\n}}\n}}",
+                mesh("")
+            ),
+            false,
+        ),
+    ];
+    for (name, body, drawn) in rows {
+        // Something else draws, so that a stage with its mesh hidden still cooks.
+        let body = format!("{body}\ndef Mesh \"Other\" {{\n{TRIANGLE}\n}}");
+        let a = cook(&format!("purpose-{name}"), &body);
+        let want = if drawn { 6 } else { 3 };
+        assert_eq!(corners(&a, "u/mesh").len(), want, "{name}");
+    }
+}
+
+/// Joints `Root` and `Root/Arm`, the arm bound at y = 1.
+const RIG: &str = r#"def Skeleton "Rig"
+    {
+        uniform token[] joints = ["Root", "Root/Arm"]
+        uniform matrix4d[] bindTransforms = [((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)), ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 1, 0, 1))]
+    }"#;
+
+const INFLUENCES: &str = r#"int[] primvars:skel:jointIndices = [1] (
+            elementSize = 1
+            interpolation = "constant"
+        )
+        float[] primvars:skel:jointWeights = [1] (
+            elementSize = 1
+            interpolation = "constant"
+        )"#;
+
+/// The joint each vertex of `name` binds, by its largest weight.
+fn joints_of(a: &Archive, name: &str) -> Vec<u8> {
+    let info = MeshInfo::parse(&blob(a, name, 0)).unwrap();
+    let mut out = Vec::new();
+    for p in &info.pages {
+        let mut page = vec![0; p.resident_len as usize];
+        orr_pack::mesh::decode_page(&blob(a, name, p.blob as usize), &mut page).unwrap();
+        let view = PageView::new(&page, &info.header).unwrap();
+        for i in 0..view.cluster_count() {
+            let c = view.cluster(i);
+            for t in 0..u32::from(c.tri_count) {
+                for v in view.triangle(&c, t).map(u32::from) {
+                    let (j, w) = (view.joints(&c, v).unwrap(), view.weights(&c, v).unwrap());
+                    let k = (0..4).max_by(|&a, &b| w[a].total_cmp(&w[b])).unwrap();
+                    out.push(j[k]);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `bindingAPI.h`: `skel:joints` "If undefined on a primitive, the primitive inherits the value of
+/// the nearest ancestor prim"; `geomBindTransform` "may be authored on the ancestor, to "inherit"
+/// down to all the leaf gprims". `cacheImpl.cpp` carries the joint influences down the same way,
+/// from prims with `SkelBindingAPI`.
+#[test]
+fn skinning_properties_inherit_from_binding_ancestors() {
+    let group = |api: &str, attributes: &str, mesh: &str| {
+        format!(
+            r#"def SkelRoot "Hero"
+{{
+    {RIG}
+
+    def Xform "Group" (
+        {api}
+    )
+    {{
+        {attributes}
+
+        def Mesh "Body"
+        {{
+            {TRIANGLE}
+            rel skel:skeleton = </Hero/Rig>
+            {mesh}
+        }}
+    }}
+}}"#
+        )
+    };
+    let api = "prepend apiSchemas = [\"SkelBindingAPI\"]";
+
+    // Index 1 of the parent's list is the skeleton's joint 0.
+    let a = cook(
+        "skel-joints",
+        &group(
+            api,
+            r#"uniform token[] skel:joints = ["Root/Arm", "Root"]"#,
+            INFLUENCES,
+        ),
+    );
+    assert!(joints_of(&a, "u/Hero/mesh").iter().all(|&j| j == 0));
+
+    let a = cook(
+        "skel-geom-bind",
+        &group(
+            api,
+            "matrix4d primvars:skel:geomBindTransform = ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (7, 0, 0, 1))",
+            INFLUENCES,
+        ),
+    );
+    assert!(
+        corners(&a, "u/Hero/mesh")
+            .iter()
+            .any(|c| c.0.abs_diff_eq(Vec3::new(8.0, 0.0, 0.0), 1e-3))
+    );
+
+    let a = cook("skel-influences", &group(api, INFLUENCES, ""));
+    assert!(has(&a, "u/Hero/skeleton"), "the mesh cooks skinned");
+    assert!(joints_of(&a, "u/Hero/mesh").iter().all(|&j| j == 1));
+
+    // Without the schema the parent's attributes are not bindings.
+    let a = cook(
+        "skel-joints-no-api",
+        &group(
+            "",
+            r#"uniform token[] skel:joints = ["Root/Arm", "Root"]"#,
+            INFLUENCES,
+        ),
+    );
+    assert!(joints_of(&a, "u/Hero/mesh").iter().all(|&j| j == 1));
+}
+
+/// A skinned triangle under `SkelRoot` `Hero` at `root`, with `prims` beside the skeleton.
+fn skinned(root: &str, prims: &str) -> String {
+    format!(
+        r#"def SkelRoot "Hero"
+{{
+    {root}
+    {RIG}
+    {prims}
+
+    def Mesh "Body"
+    {{
+        {TRIANGLE}
+        rel skel:skeleton = </Hero/Rig>
+        {INFLUENCES}
+    }}
+}}"#
+    )
+}
+
+const TRANSLATIONS: &str =
+    "float3[] translations.timeSamples = { 0: [(0, 0, 0)], 10: [(1, 0, 0)] }";
+const ROTATIONS: &str = "quatf[] rotations = [(1, 0, 0, 0)]";
+const SCALES: &str = "half3[] scales = [(1, 1, 1)]";
+
+/// `primvar.h`: unauthored interpolation is constant, so one element binds every point.
+#[test]
+fn joint_influences_without_interpolation_are_constant() {
+    let a = cook(
+        "skel-unauthored-interpolation",
+        &skinned("", "").replace("interpolation = \"constant\"", ""),
+    );
+    let joints = joints_of(&a, "u/Hero/mesh");
+    assert_eq!(joints, [1, 1, 1]);
+}
+
+/// `schemas.dox`: "An animation source is only valid if its translation, rotation, and scale
+/// components are all authored, storing arrays size to the same size as the authored joints
+/// array."
+#[test]
+fn an_animation_needs_all_three_components_at_the_joint_count() {
+    let wave = |attrs: &str| {
+        format!("def SkelAnimation \"Wave\" {{\n uniform token[] joints = [\"Root\"]\n {attrs}\n}}")
+    };
+    for (name, attrs, clip) in [
+        (
+            "whole",
+            format!("{TRANSLATIONS}\n{ROTATIONS}\n{SCALES}"),
+            true,
+        ),
+        ("no-scales", format!("{TRANSLATIONS}\n{ROTATIONS}"), false),
+        ("no-rotations", format!("{TRANSLATIONS}\n{SCALES}"), false),
+        (
+            "blocked",
+            format!("{TRANSLATIONS}\n{ROTATIONS}\nhalf3[] scales = None"),
+            false,
+        ),
+        (
+            "short",
+            format!("{TRANSLATIONS}\n{ROTATIONS}\nhalf3[] scales = []"),
+            false,
+        ),
+    ] {
+        let a = cook(&format!("anim-{name}"), &skinned("", &wave(&attrs)));
+        assert_eq!(has(&a, "u/Hero/clip/Wave"), clip, "{name}");
+    }
+}
+
+/// `schemas.dox`: "When a skel:animationSource property is defined, it is "inherited" down
+/// namespace, onto any Skeleton primitive beneath it", and a skeleton animates "according to
+/// whichever inherited skel:animationSource is defined at the location at which the skel:skeleton
+/// is bound". An animation outside the `SkelRoot` shows that the binding was followed.
+#[test]
+fn an_animation_source_inherits_down_to_the_binding_site() {
+    let outside = format!(
+        "def SkelAnimation \"Wave\"\n{{\n uniform token[] joints = [\"Root\"]\n {TRANSLATIONS}\n {ROTATIONS}\n {SCALES}\n}}"
+    );
+    let source = "rel skel:animationSource = </Wave>";
+    let above = format!("def Xform \"Above\"\n{{\n{source}\n{}\n}}", skinned("", ""));
+    for (name, body) in [
+        (
+            "above-the-root",
+            above.replace("</Hero/Rig>", "</Above/Hero/Rig>"),
+        ),
+        (
+            "at-the-binding-parent",
+            format!(
+                r#"def SkelRoot "Hero"
+{{
+    {RIG}
+
+    def Xform "Site"
+    {{
+        {source}
+        rel skel:skeleton = </Hero/Rig>
+
+        def Mesh "Body"
+        {{
+            {TRIANGLE}
+            {INFLUENCES}
+        }}
+    }}
+}}"#
+            ),
+        ),
+    ] {
+        let a = cook(&format!("source-{name}"), &format!("{outside}\n{body}"));
+        assert!(has(&a, "u/Hero/clip/Wave"), "{name}");
+    }
+}
+
+/// `schemas.dox`: an animation source "may also be directly nullified by either deactivating the
+/// primitive, or by blocking the component attributes".
+#[test]
+fn a_deactivated_animation_source_nullifies_the_binding() {
+    let wave = format!(
+        "def SkelAnimation \"Wave\" (\n active = false\n)\n{{\n uniform token[] joints = [\"Root\"]\n {TRANSLATIONS}\n {ROTATIONS}\n {SCALES}\n}}"
+    );
+    let a = cook(
+        "source-inactive",
+        &skinned("rel skel:animationSource = </Hero/Wave>", &wave),
+    );
+    assert!(!has(&a, "u/Hero/clip/Wave"));
+    assert!(has(&a, "u/Hero/skeleton"));
+}
+
+/// `schemas.dox`: "bindings defined on any primitives that do not have a UsdSkelRoot primitive as
+/// one of their ancestors have no meaning, and should be ignored".
+#[test]
+fn a_skinned_mesh_outside_a_skel_root_is_static() {
+    let a = cook(
+        "skel-no-root",
+        &format!(
+            r#"def Xform "Rigless"
+{{
+    {RIG}
+
+    def Mesh "Body"
+    {{
+        double3 xformOp:translate = (0, 3, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        {TRIANGLE}
+        rel skel:skeleton = </Rigless/Rig>
+        {INFLUENCES}
+    }}
+}}"#
+        ),
+    );
+    assert!(
+        corners(&a, "u/mesh")
+            .iter()
+            .any(|c| c.0.abs_diff_eq(Vec3::new(0.0, 4.0, 0.0), 1e-3))
+    );
+}
+
+/// A joint an animation does not list holds its rest transform.
+#[test]
+fn a_clip_animates_the_joints_it_names() {
+    let wave = format!(
+        "def SkelAnimation \"Wave\" {{\n uniform token[] joints = [\"Root\"]\n {TRANSLATIONS}\n {ROTATIONS}\n {SCALES}\n}}"
+    );
+    let a = cook("clip-sparse", &skinned("", &wave));
+    let clip = Clip::parse(
+        &blob(&a, "u/Hero/clip/Wave", 0),
+        &blob(&a, "u/Hero/clip/Wave", 1),
+    )
+    .unwrap();
+    let skeleton = SkeletonInfo::parse(&blob(&a, "u/Hero/skeleton", 0)).unwrap();
+    let mut pose = vec![Trs::IDENTITY; 2];
+    clip.sample(clip.header.duration, &mut pose);
+    assert!(Vec3::from(pose[0].translation).abs_diff_eq(Vec3::X, 1e-3));
+    assert_eq!(pose[1].translation, skeleton.rest[1].translation);
+    let q = Quat::from_array(pose[0].rotation);
+    assert!(q.angle_between(Quat::IDENTITY) < 1e-3);
 }

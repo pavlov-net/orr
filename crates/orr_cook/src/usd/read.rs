@@ -319,6 +319,14 @@ impl PrimReader<'_> {
             })
     }
 
+    /// This reader at `time` instead.
+    pub(super) fn at(&self, time: f64) -> PrimReader<'_> {
+        PrimReader {
+            prim: self.prim,
+            time: usd::TimeCode::new(time),
+        }
+    }
+
     pub(super) fn targets(&self, name: &str) -> Result<Vec<sdf::Path>, String> {
         self.prim
             .relationship(name)
@@ -468,5 +476,17 @@ impl PrimReader<'_> {
             interp,
             indices,
         }))
+    }
+
+    /// Attribute `name`'s `elementSize`: how many array elements make one of its values.
+    pub(super) fn element_size(&self, name: &str) -> usize {
+        self.prim
+            .attribute(name)
+            .get_metadata::<sdf::Value>("elementSize")
+            .ok()
+            .flatten()
+            .and_then(|v| numbers(&v))
+            .map_or(1, |v| v[0] as usize)
+            .max(1)
     }
 }
