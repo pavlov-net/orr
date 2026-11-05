@@ -190,18 +190,18 @@ float3 from_rgb8(uint v)
 }
 
 // 8 bits of t = (n - 1) / (n + 1), sqrt(F0) from air with its sign, over every IOR: Fresnel
-// reaches 1 toward both 0 and infinity. Codes 16 to 241 hold IOR 1 to 3, finest, and the rest
-// IOR 0 to 1 and 3 up. The steps put IOR 1.5, the usual default, exactly on code 106.
+// reaches 1 toward both 0 and infinity. Codes 16 to 201 hold IOR 1 to 3, finest, and the rest
+// IOR 0 to 1 and 3 up. The steps put IOR 1.5, the usual default, exactly on code 90.
 uint ior_code(float ior)
 {
     float t = 1.0 - 2.0 / (max(ior, 0.0) + 1.0);
-    return uint(round(t < 0.0 ? 16.0 * (t + 1.0) : t < 0.5 ? 16.0 + 450.0 * t : 241.0 + 28.0 * (t - 0.5))) & 255;
+    return uint(round(t < 0.0 ? 16.0 * (t + 1.0) : t < 0.5 ? 16.0 + 370.0 * t : 201.0 + 108.0 * (t - 0.5))) & 255;
 }
 
 float ior_from_code(uint code)
 {
     float c = float(code & 255);
-    float t = c < 16.0 ? c / 16.0 - 1.0 : c < 241.0 ? (c - 16.0) / 450.0 : 0.5 + (c - 241.0) / 28.0;
+    float t = c < 16.0 ? c / 16.0 - 1.0 : c < 201.0 ? (c - 16.0) / 370.0 : 0.5 + (c - 201.0) / 108.0;
     return (1.0 + t) / max(1.0 - t, 1e-4);
 }
 
