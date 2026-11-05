@@ -295,6 +295,7 @@ pub(super) fn pixel_format(f: Format) -> Result<MTLPixelFormat, Error> {
         Bgra8Unorm => MTLPixelFormat::BGRA8Unorm,
         Bgra8Srgb => MTLPixelFormat::BGRA8Unorm_sRGB,
         R16Unorm => MTLPixelFormat::R16Unorm,
+        R16Snorm => MTLPixelFormat::R16Snorm,
         R16Float => MTLPixelFormat::R16Float,
         R16Uint => MTLPixelFormat::R16Uint,
         Rg16Unorm => MTLPixelFormat::RG16Unorm,

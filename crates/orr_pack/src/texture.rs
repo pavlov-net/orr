@@ -196,7 +196,7 @@ impl FormatInfo {
         use vk::*;
         let (block, bytes) = match vk_format {
             R8_UNORM => (1, 1),
-            R8G8_UNORM | R16_UNORM | R16_SFLOAT | A4R4G4B4_UNORM_PACK16 => (1, 2),
+            R8G8_UNORM | R16_UNORM | R16_SNORM | R16_SFLOAT | A4R4G4B4_UNORM_PACK16 => (1, 2),
             R8G8B8A8_UNORM | R8G8B8A8_SRGB | R16G16_UNORM | R16G16_SFLOAT | R32_SFLOAT => (1, 4),
             R16G16B16A16_UNORM | R16G16B16A16_SFLOAT | R32G32_SFLOAT => (1, 8),
             R32G32B32A32_SFLOAT => (1, 16),
@@ -369,6 +369,7 @@ pub mod vk {
     pub const R8G8B8A8_UNORM: u32 = 37;
     pub const R8G8B8A8_SRGB: u32 = 43;
     pub const R16_UNORM: u32 = 70;
+    pub const R16_SNORM: u32 = 71;
     pub const R16_SFLOAT: u32 = 76;
     pub const R16G16_UNORM: u32 = 77;
     pub const R16G16_SFLOAT: u32 = 83;

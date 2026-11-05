@@ -93,7 +93,7 @@ fn channels(job: &TextureJob) -> Option<(u8, u8)> {
         Encoding::Bc5 if job.is_normal() => Some((2, NeuralTexture::NORMAL)),
         Encoding::Bc5 => Some((2, NeuralTexture::LINEAR)),
         Encoding::Bc4 | Encoding::Raw(super::DataFormat::R16) => Some((1, NeuralTexture::LINEAR)),
-        Encoding::Bc6h | Encoding::Raw(_) => None,
+        Encoding::Bc4Snorm | Encoding::Bc5Snorm | Encoding::Bc6h | Encoding::Raw(_) => None,
     }
 }
 

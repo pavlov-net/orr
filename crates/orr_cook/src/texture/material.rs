@@ -1403,6 +1403,7 @@ impl TextureJob {
                 grid: self.grid.map(|g| g.map(u32::from)),
                 normal: p.normal,
                 coverage: p.coverage,
+                height: p.role == "displacement",
             },
             full_chain: true,
             quality: self.quality,

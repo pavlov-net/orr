@@ -518,6 +518,21 @@ pub(super) fn select(
     if surface && q.swapchain_maintenance.swapchain_maintenance1 == vk::FALSE {
         return Err("swapchainMaintenance1".to_owned());
     }
+    // Height maps of every kind are read through the material's linear sampler.
+    for format in [
+        vk::Format::R16_UNORM,
+        vk::Format::R16_SNORM,
+        vk::Format::R32_SFLOAT,
+    ] {
+        // SAFETY: `physical` came from this instance.
+        let p = unsafe { instance.get_physical_device_format_properties(physical, format) };
+        if !p
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
+        {
+            return Err(format!("linear filtering of {format:?} images"));
+        }
+    }
 
     opt.ray_dispatch &= q.ray_pipeline.ray_tracing_pipeline != 0
         && q.ray_pipeline.ray_tracing_pipeline_trace_rays_indirect != 0

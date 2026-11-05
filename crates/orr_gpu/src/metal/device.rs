@@ -158,7 +158,7 @@ impl PartialEq for Device {
 impl Eq for Device {}
 
 impl Device {
-    /// The system's default GPU, which must support Metal 4.
+    /// The system's default GPU, which must support Metal 4 and filter 32-bit floats.
     pub fn new(desc: &DeviceDesc<'_>) -> Result<Device, Error> {
         let device = MTLCreateSystemDefaultDevice().ok_or(Error::NoDevice)?;
         let name = device.name().to_string();
@@ -166,6 +166,13 @@ impl Device {
             return Err(Error::Unsupported {
                 device: name,
                 missing: "Metal 4".to_owned(),
+            });
+        }
+        // Float height maps are R32Float, read through the material's linear sampler.
+        if !device.supports32BitFloatFiltering() {
+            return Err(Error::Unsupported {
+                device: name,
+                missing: "filtering of 32-bit float textures".to_owned(),
             });
         }
         let serializer = PipelineCache::serializer(&device, desc.pipeline_cache);

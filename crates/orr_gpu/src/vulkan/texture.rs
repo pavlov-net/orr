@@ -651,6 +651,7 @@ pub(super) fn vk_format(f: Format) -> vk::Format {
         Bgra8Srgb => V::B8G8R8A8_SRGB,
         A4r4g4b4Unorm => V::A4R4G4B4_UNORM_PACK16,
         R16Unorm => V::R16_UNORM,
+        R16Snorm => V::R16_SNORM,
         R16Float => V::R16_SFLOAT,
         R16Uint => V::R16_UINT,
         Rg16Unorm => V::R16G16_UNORM,

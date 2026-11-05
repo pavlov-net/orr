@@ -1127,6 +1127,7 @@ fn gpu_format(vk_format: u32) -> Option<orr_gpu::Format> {
         vk::R8G8B8A8_SRGB => F::Rgba8Srgb,
         vk::A4R4G4B4_UNORM_PACK16 => F::A4r4g4b4Unorm,
         vk::R16_UNORM => F::R16Unorm,
+        vk::R16_SNORM => F::R16Snorm,
         vk::R16_SFLOAT => F::R16Float,
         vk::R16G16_UNORM => F::Rg16Unorm,
         vk::R16G16_SFLOAT => F::Rg16Float,

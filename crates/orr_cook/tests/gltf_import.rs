@@ -3,12 +3,15 @@
 //! selection with joined grids, and the textures a mesh cook reads (opacity for opaque-first
 //! triangles and micromaps, displacement bounds).
 
+#[path = "common/float_ktx2.rs"]
+mod float_ktx2;
 #[path = "common/glb.rs"]
 mod glb;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use float_ktx2::float_ktx2;
 use glb::{Glb, I8, U16};
 use orr_cook::{
     ArchiveSpec, AssetSpec, GltfLayout, GltfSettings, LodMode, Manifest, MaterialPatch, MeshPatch,
@@ -1914,10 +1917,22 @@ fn library_quad(
     texture: &str,
     pixels: impl Fn(u32, u32) -> u8,
 ) -> Archive {
-    use orr_cook::{MeshInput, TextureSettings, Usage};
+    let file = png(64, 64, |x, y| [pixels(x, y); 4]);
+    library_quad_file(material, settings, texture, orr_cook::Usage::Linear1, &file)
+}
+
+/// [`library_quad`] with texture asset `texture` cooked from image file `file` as `usage`.
+fn library_quad_file(
+    material: Material,
+    settings: MeshSettings,
+    texture: &str,
+    usage: orr_cook::Usage,
+    file: &[u8],
+) -> Archive {
+    use orr_cook::{MeshInput, TextureSettings};
     use orr_math::{Vec2, Vec3};
-    let path = dir(&format!("library-{texture}")).join("t.png");
-    std::fs::write(&path, png(64, 64, |x, y| [pixels(x, y); 4])).unwrap();
+    let path = dir(&format!("library-{texture}")).join("t.img");
+    std::fs::write(&path, file).unwrap();
     let quad = MeshInput {
         positions: vec![
             Vec3::new(0.0, 0.0, 0.0),
@@ -1953,7 +1968,7 @@ fn library_quad(
                     source: Source::Texture {
                         path,
                         settings: TextureSettings {
-                            usage: Usage::Linear1,
+                            usage,
                             ..TextureSettings::default()
                         },
                     },
@@ -2027,6 +2042,33 @@ fn a_statically_displaced_library_mesh_binds_its_material_without_displacement()
     let m: Material = bytemuck::pod_read_unaligned(&read(&a, &a.blobs(e)[0]));
     assert_eq!(m.textures[slot::DISPLACEMENT].texture, AssetId::NONE);
     assert_eq!(m.displacement_scale, 0.0);
+}
+
+#[test]
+fn a_library_mesh_reads_a_displacement_texture_with_negative_heights() {
+    for (format, height) in [
+        (ctt::Format::R16_SNORM, -0.5),
+        (ctt::Format::R32G32B32A32_SFLOAT, -2.5),
+    ] {
+        let want = 0.1 * height;
+        let mut bumpy = Material {
+            displacement_scale: 0.1,
+            displacement_min: -0.3,
+            displacement_max: 0.1,
+            ..Material::default()
+        };
+        bumpy.textures[slot::DISPLACEMENT].texture = AssetId::from_name("dents");
+        let format = ctt::TargetFormat::Uncompressed(format);
+        let file = float_ktx2(64, 64, format, false, |_, _| [height, 0.0, 0.0, 1.0]);
+        let usage = orr_cook::Usage::Displacement;
+        let a = library_quad_file(bumpy, MeshSettings::default(), "dents", usage, &file);
+        let m = mesh_of(&a, "quad/mesh", 0);
+        let half = |b: u16| half::f16::from_bits(b).to_f32();
+        for (c, ..) in &m.clusters {
+            let (lo, hi) = (half(c.displacement_min), half(c.displacement_max));
+            assert!(lo <= want && (want..0.0).contains(&hi), "{lo}..{hi}");
+        }
+    }
 }
 
 /// A normal-mapped 16 x 16 grid whose tangents follow its uvs, except on the vertex column

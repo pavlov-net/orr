@@ -2289,6 +2289,7 @@ fn texture_mips(
     uv: [f32; 6],
     channels: usize,
 ) -> Result<Vec<Raster>> {
+    use orr_pack::texture::vk;
     let e = arc.expect(id, Class::Texture as u16, orr_pack::texture::SCHEMA)?;
     let blobs = arc.blobs(e);
     let mut head = vec![0; blobs[0].raw_len as usize];
@@ -2307,18 +2308,25 @@ fn texture_mips(
         let bytes = info.mip_texels(&blob.1, mip, 0)?;
         let [w, hh] = h.mip_size(mip);
         let unread = |_| orr_pack::Error::Malformed("texture format the mesh cook reads");
+        let pairs = || bytes.chunks_exact(2).map(|b| [b[0], b[1]]);
+        let red = |r: Vec<f32>| {
+            let n = r.len();
+            let mut planes = vec![r];
+            planes.extend([0.0, 0.0, 1.0].map(|v| vec![v; n]));
+            planes.truncate(channels);
+            planes
+        };
         let planes: Vec<Vec<f32>> = match h.vk_format {
-            orr_pack::texture::vk::R16_UNORM => {
-                let r: Vec<f32> = bytes
-                    .chunks_exact(2)
-                    .map(|b| f32::from(u16::from_le_bytes([b[0], b[1]])) / 65535.0)
-                    .collect();
-                let n = r.len();
-                let mut planes = vec![r];
-                planes.extend([0.0, 0.0, 1.0].map(|v| vec![v; n]));
-                planes.truncate(channels);
-                planes
-            }
+            vk::R16_UNORM => red(pairs()
+                .map(|b| f32::from(u16::from_le_bytes(b)) / 65535.0)
+                .collect()),
+            vk::R16_SNORM => red(pairs()
+                .map(|b| (f32::from(i16::from_le_bytes(b)) / 32767.0).max(-1.0))
+                .collect()),
+            vk::R32_SFLOAT => red(bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect()),
             f if channels == 1 => {
                 vec![texture::decode_channel(f, w, hh, &bytes, 0).map_err(unread)?]
             }

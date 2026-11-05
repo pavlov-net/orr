@@ -68,6 +68,7 @@ pub(super) fn cook(
             grid: None,
             normal: false,
             coverage: None,
+            height: false,
         },
         full_chain: true,
         quality,

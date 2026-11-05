@@ -35,6 +35,8 @@ pub(super) struct Source {
     pub(super) rg: bool,
     /// The file stores signed normalized values.
     pub(super) signed: bool,
+    /// The file stores floats, whose range no format of fixed span holds.
+    pub(super) float: bool,
 }
 
 pub(super) struct Blocks {
@@ -205,6 +207,7 @@ impl<'a> Ktx2Blocks<'a> {
             primaries: None,
             rg: two_channels(self.vk_format()),
             signed: signed_blocks(self.vk_format()),
+            float: float_blocks(self.vk_format()),
             blocks: Some(Blocks {
                 vk_format: self.vk_format(),
                 w: h.pixel_width,
@@ -256,6 +259,10 @@ fn two_channels(vk_format: u32) -> bool {
 
 fn signed_blocks(vk_format: u32) -> bool {
     matches!(vk_format, vk::BC4_SNORM | vk::BC5_SNORM)
+}
+
+fn float_blocks(vk_format: u32) -> bool {
+    matches!(vk_format, vk::BC6H_UFLOAT | vk::BC6H_SFLOAT)
 }
 
 /// Per channel, the lowest and highest value of a `w` x `h` mip of `vk_format` blocks read
@@ -363,6 +370,7 @@ fn container(image: ctt::Image) -> Result<Source, String> {
             }),
             rg: two_channels(vk_format),
             signed: signed_blocks(vk_format),
+            float: float_blocks(vk_format),
         });
     }
     // Uncompressed: ctt converts to f32 RGBA in the file's color space. Read as straight alpha
@@ -414,6 +422,7 @@ fn container(image: ctt::Image) -> Result<Source, String> {
         blocks: None,
         rg: format.channel_count() == Some(2),
         signed: is_snorm(format),
+        float: is_float(format),
     })
 }
 
@@ -434,6 +443,23 @@ fn is_snorm(format: ctt::Format) -> bool {
             | F::R16G16B16A16_SNORM
             | F::A2R10G10B10_SNORM_PACK32
             | F::A2B10G10R10_SNORM_PACK32
+    )
+}
+
+/// Whether uncompressed `format` stores floats.
+fn is_float(format: ctt::Format) -> bool {
+    use ctt::{ChannelKind, Format as F};
+    matches!(
+        format.channel_kind(),
+        Some(ChannelKind::F16 | ChannelKind::F32)
+    ) || matches!(
+        format,
+        F::R64_SFLOAT
+            | F::R64G64_SFLOAT
+            | F::R64G64B64_SFLOAT
+            | F::R64G64B64A64_SFLOAT
+            | F::B10G11R11_UFLOAT_PACK32
+            | F::E5B9G9R9_UFLOAT_PACK32
     )
 }
 
@@ -476,6 +502,7 @@ fn file(bytes: &[u8]) -> Result<Source, String> {
         blocks: None,
         rg: false,
         signed: false,
+        float: hdr,
     })
 }
 

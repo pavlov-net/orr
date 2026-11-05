@@ -73,7 +73,10 @@ impl Default for TextureSettings {
     }
 }
 
-/// What a texture holds; sets its format.
+/// What a texture holds; sets its format. Where a usage has a signed or float form, the format
+/// follows the source's as sRGB follows the file: nothing else tells the consumer the domain of
+/// what it samples. A float source counts as signed for `Linear1` and `Linear2` when the channels
+/// they keep hold negative values.
 #[derive(Copy, Clone, Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Usage {
@@ -84,15 +87,16 @@ pub enum Usage {
     /// Tangent-space normal (RGB as stored, `2v - 1` unless the source is signed, or x and y
     /// alone from a two-channel source) to BC5 holding x and y; z is reconstructed.
     Normal,
-    /// One linear channel (R) to BC4.
+    /// One linear channel (R) to BC4, or BC4 snorm from a signed source without `alpha_cutoff`.
     Linear1,
-    /// Two linear channels (RG) to BC5.
+    /// Two linear channels (RG) to BC5, or BC5 snorm from a signed source.
     Linear2,
     /// Four linear channels to BC7.
     Linear4,
     /// Linear HDR color to BC6H.
     Hdr,
-    /// Height (R) to R16_UNORM.
+    /// Height (R) to R16_UNORM, R16_SNORM from a signed source, or R32_SFLOAT from a float
+    /// source.
     Displacement,
     /// An equirectangular (2:1) or cube HDR map resampled to an equal-area octahedral map,
     /// BC6H with mips. Each connected region over `light_threshold` (luminance), brightest
@@ -102,7 +106,7 @@ pub enum Usage {
         light_threshold: Option<f32>,
         max_lights: u8,
     },
-    /// Uncompressed, the source channels the format holds.
+    /// Uncompressed, the source channels the format holds, clamped to its range.
     Data(DataFormat),
 }
 
@@ -124,6 +128,7 @@ pub enum DataFormat {
     Rgba8,
     Rgba8Srgb,
     R16,
+    R16Snorm,
     Rg16,
     Rgba16,
     R16f,
@@ -175,6 +180,12 @@ impl Img {
     /// Bytes of the texels.
     pub(crate) fn bytes(&self) -> u64 {
         (self.px.len() * size_of::<[f32; 4]>()) as u64
+    }
+
+    /// The lowest and highest finite value of channel `c`, or `(f32::MAX, f32::MIN)` with none.
+    fn finite_range(&self, c: usize) -> (f32, f32) {
+        let finite = self.px.iter().map(|p| p[c]).filter(|v| v.is_finite());
+        finite.fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)))
     }
 
     /// Bilinear resize; used to bring a packed texture's inputs to one size.
@@ -487,7 +498,20 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
         let n = kept_levels(b);
         b.levels.iter_mut().for_each(|l| l.truncate(n));
     }
-    let encoding = Encoding::of(s.usage);
+    let kept = match s.usage {
+        Usage::Linear1 => 1,
+        Usage::Linear2 => 2,
+        _ => 0,
+    };
+    // A cutoff makes the channel an alpha, 0..1 whatever the source stores.
+    let signed = s.alpha_cutoff.is_none() && {
+        if src.float && kept > 0 {
+            load::decode_layers(&mut src)?;
+        }
+        let negative = |l: &Img| l.px.iter().any(|p| p[..kept].iter().any(|&v| v < 0.0));
+        src.signed || (src.float && kept > 0 && src.layers.iter().any(negative))
+    };
+    let encoding = Encoding::of(s.usage, signed, src.float);
     let coverage = match (s.alpha_cutoff, s.usage) {
         (None, _) => None,
         (Some(c), Usage::ColorAlpha | Usage::Linear4) => Some((3, c)),
@@ -525,6 +549,7 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
             grid: s.atlas_grid.map(|g| g.map(u32::from)),
             normal,
             coverage,
+            height: s.usage == Usage::Displacement,
         },
         quality,
         max_size: s.max_size,
@@ -561,10 +586,16 @@ fn cook_source(mut src: Source, s: &TextureSettings, quality: Quality) -> Result
             ));
         }
         if !remakes {
-            let chains = source_chains(b, s.max_size, |mut p| {
+            let mut chains = source_chains(b, s.max_size, |mut p| {
                 linear(&mut p);
                 if normal { mips::normalized(p) } else { p }
             })?;
+            if plan.mips.height {
+                load::decode_layers(&mut src)?;
+                for (chain, l) in chains.iter_mut().zip(&mut src.layers) {
+                    mips::keep_heights(chain, mips::settle_heights(l));
+                }
+            }
             return finish(chains, &plan);
         }
     }

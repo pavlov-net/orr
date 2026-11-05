@@ -127,6 +127,7 @@ fn mips(a: &Archive, name: &str) -> (TextureInfo, Vec<Vec<Vec<u8>>>) {
 }
 
 fn decode(vk_format: u32, w: u32, h: u32, data: &[u8]) -> Vec<[f32; 4]> {
+    let snorm = |v: u8| (f32::from(v.cast_signed()) / 127.0).max(-1.0);
     let f = FormatInfo::of(vk_format).unwrap();
     let bw = w.div_ceil(4) as usize;
     let mut out = vec![[0.0; 4]; (w * h) as usize];
@@ -151,6 +152,19 @@ fn decode(vk_format: u32, w: u32, h: u32, data: &[u8]) -> Vec<[f32; 4]> {
                 for i in 0..16 {
                     t[i][0] = f32::from(b8[i * 2]) / 255.0;
                     t[i][1] = f32::from(b8[i * 2 + 1]) / 255.0;
+                }
+            }
+            vk::BC4_SNORM => {
+                bcdec_rs::bc4(block, &mut b8[..16], 4, true);
+                for i in 0..16 {
+                    t[i][0] = snorm(b8[i]);
+                }
+            }
+            vk::BC5_SNORM => {
+                bcdec_rs::bc5(block, &mut b8[..32], 8, true);
+                for i in 0..16 {
+                    t[i][0] = snorm(b8[i * 2]);
+                    t[i][1] = snorm(b8[i * 2 + 1]);
                 }
             }
             vk::BC6H_UFLOAT => {
@@ -1074,6 +1088,171 @@ fn signed_two_channel_normals_read_their_own_values() {
     };
     assert!((value(8) - tilt).abs() < 0.02, "{}", value(8));
     assert!((value(56) + tilt).abs() < 0.02, "{}", value(56));
+}
+
+fn signed_blocks(format: ctt::Format) -> ctt::TargetFormat {
+    ctt::TargetFormat::Compressed {
+        format,
+        encoder: ctt::encoders::Encoder::Amd(Default::default()),
+    }
+}
+
+/// A float source's heights store as they are and displace geometry at every mip: non-finite
+/// texels take finite values, and the filter's overshoot at a step stays in the source's range.
+#[test]
+fn float_standalone_heights_stay_finite_and_in_range_at_every_mip() {
+    let path = dir("float-heights").join("h.ktx2");
+    let n = 32u32;
+    let format = ctt::TargetFormat::Uncompressed(ctt::Format::R32G32B32A32_SFLOAT);
+    let bytes = float_ktx2(n, n, format, false, |x, y| {
+        let height = match (x, y) {
+            (5, 5) => f32::NAN,
+            (9, 9) => f32::INFINITY,
+            (25, 25) => f32::NEG_INFINITY,
+            _ if x < n / 2 => -2.5,
+            _ => 3.0,
+        };
+        [height, 0.0, 0.0, 1.0]
+    });
+    std::fs::write(&path, bytes).unwrap();
+    let settings = TextureSettings {
+        usage: Usage::Displacement,
+        ..TextureSettings::default()
+    };
+    let (info, levels) = mips(&cook(vec![texture(&path, "t", settings)]), "t");
+    assert_eq!(info.header.vk_format, vk::R32_SFLOAT);
+    for (m, level) in levels[0].iter().enumerate() {
+        for t in level.chunks_exact(4) {
+            let h = f32::from_le_bytes(t.try_into().unwrap());
+            assert!((-2.5..=3.0).contains(&h), "mip {m}: {h}");
+        }
+    }
+}
+
+/// With no factor to compensate in, the stored format carries the sign. Every mip of these
+/// negative red texels stays negative, down through the partial blocks.
+#[test]
+fn signed_standalone_sources_keep_their_values_in_signed_formats() {
+    let d = dir("snorm-standalone");
+    let (w, h) = (18u32, 10u32);
+    let red = |x: u32| -0.7 + 0.4 * x as f32 / (w - 1) as f32;
+    let green = |y: u32| 0.3 + 0.4 * y as f32 / (h - 1) as f32;
+    let read = |vk_format: u32, w: u32, h: u32, data: &[u8]| -> Vec<[f32; 4]> {
+        if vk_format == vk::R32_SFLOAT {
+            return data
+                .chunks_exact(4)
+                .map(|t| [f32::from_le_bytes(t.try_into().unwrap()), 0.0, 0.0, 0.0])
+                .collect();
+        }
+        if vk_format == vk::R16_SNORM {
+            return data
+                .chunks_exact(2)
+                .map(|t| {
+                    let v = f32::from(i16::from_le_bytes([t[0], t[1]])) / 32767.0;
+                    [v, 0.0, 0.0, 0.0]
+                })
+                .collect();
+        }
+        decode(vk_format, w, h, data)
+    };
+    for (usage, source, vk_format, channels) in [
+        (Usage::Linear1, ctt::Format::R8_SNORM, vk::BC4_SNORM, 1),
+        (Usage::Linear2, ctt::Format::R8G8_SNORM, vk::BC5_SNORM, 2),
+        (
+            Usage::Linear2,
+            ctt::Format::R32G32B32A32_SFLOAT,
+            vk::BC5_SNORM,
+            2,
+        ),
+        (
+            Usage::Displacement,
+            ctt::Format::R32G32B32A32_SFLOAT,
+            vk::R32_SFLOAT,
+            1,
+        ),
+        (
+            Usage::Displacement,
+            ctt::Format::R16_SNORM,
+            vk::R16_SNORM,
+            1,
+        ),
+    ] {
+        let path = d.join(format!("{vk_format}.ktx2"));
+        let format = ctt::TargetFormat::Uncompressed(source);
+        let bytes = float_ktx2(w, h, format, false, |x, y| [red(x), green(y), 0.0, 1.0]);
+        std::fs::write(&path, bytes).unwrap();
+        let settings = TextureSettings {
+            usage,
+            filter: orr_cook::MipFilter::Box,
+            ..TextureSettings::default()
+        };
+        let (info, levels) = mips(&cook(vec![texture(&path, "t", settings)]), "t");
+        assert_eq!(info.header.vk_format, vk_format);
+        assert_eq!(levels[0].len(), 5);
+        let texels = read(vk_format, w, h, &levels[0][0]);
+        for (i, t) in texels.iter().enumerate() {
+            let want = [red(i as u32 % w), green(i as u32 / w)];
+            for c in 0..channels {
+                assert!(
+                    (t[c] - want[c]).abs() < 0.02,
+                    "texel {i}: {t:?}, not {want:?}"
+                );
+            }
+        }
+        for (m, level) in levels[0].iter().enumerate() {
+            let [mw, mh] = orr_pack::texture::mip_size(w, h, m as u32);
+            for t in read(vk_format, mw, mh, level) {
+                assert!((t[0] + 0.5).abs() < 0.25, "mip {m}: {t:?}");
+                assert!(channels == 1 || (t[1] - 0.5).abs() < 0.25, "mip {m}: {t:?}");
+            }
+        }
+    }
+
+    // A float source's values say whether it is signed, in the channels the usage keeps.
+    let format = ctt::TargetFormat::Uncompressed(ctt::Format::R32G32B32A32_SFLOAT);
+    let bytes = float_ktx2(w, h, format, false, |_, _| [0.5, -0.5, 0.0, 1.0]);
+    let path = d.join("positive.ktx2");
+    std::fs::write(&path, bytes).unwrap();
+    let settings = TextureSettings {
+        usage: Usage::Linear1,
+        ..TextureSettings::default()
+    };
+    let (info, _) = mips(&cook(vec![texture(&path, "t", settings)]), "t");
+    assert_eq!(info.header.vk_format, vk::BC4_UNORM);
+
+    // A cutoff makes the channel an alpha, 0..1 whatever the source stores.
+    let settings = TextureSettings {
+        usage: Usage::Linear1,
+        alpha_cutoff: Some(0.5),
+        ..TextureSettings::default()
+    };
+    let path = d.join(format!("{}.ktx2", vk::BC4_SNORM));
+    let (info, _) = mips(&cook(vec![texture(&path, "t", settings)]), "t");
+    assert_eq!(info.header.vk_format, vk::BC4_UNORM);
+
+    // A source already in the signed format keeps its blocks.
+    for (usage, format) in [
+        (Usage::Linear1, ctt::Format::BC4_SNORM_BLOCK),
+        (Usage::Linear2, ctt::Format::BC5_SNORM_BLOCK),
+    ] {
+        let bytes = float_ktx2(16, 16, signed_blocks(format), true, |x, y| {
+            [-(x as f32) / 16.0, -(y as f32) / 16.0, 0.0, 1.0]
+        });
+        let src = ctt::input::decode_container(&bytes, Default::default())
+            .unwrap()
+            .unwrap();
+        let path = d.join("blocks.ktx2");
+        std::fs::write(&path, &bytes).unwrap();
+        let settings = TextureSettings {
+            usage,
+            ..TextureSettings::default()
+        };
+        let (_, levels) = mips(&cook(vec![texture(&path, "t", settings)]), "t");
+        assert_eq!(levels[0].len(), src.surfaces[0].len());
+        for (got, want) in levels[0].iter().zip(&src.surfaces[0]) {
+            assert_eq!(got[..], want.data[..]);
+        }
+    }
 }
 
 /// A constant out of 0..1 folds into a factor as the value a texture of it would store.

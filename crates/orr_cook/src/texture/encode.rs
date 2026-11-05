@@ -20,19 +20,28 @@ pub(crate) enum Encoding {
     Bc7,
     /// Normal maps store x and y as `orr_pack::texture::normal` encodes them.
     Bc5,
+    Bc5Snorm,
     Bc4,
+    Bc4Snorm,
     Bc6h,
     Raw(DataFormat),
 }
 
 impl Encoding {
-    pub(super) fn of(usage: Usage) -> Self {
+    /// The format of `usage` from a source of signed normalized values or of floats.
+    pub(super) fn of(usage: Usage, signed: bool, float: bool) -> Self {
         match usage {
             Usage::Color | Usage::ColorAlpha => Self::Bc7Srgb,
-            Usage::Normal | Usage::Linear2 => Self::Bc5,
+            Usage::Normal => Self::Bc5,
+            Usage::Linear2 if signed => Self::Bc5Snorm,
+            Usage::Linear2 => Self::Bc5,
+            Usage::Linear1 if signed => Self::Bc4Snorm,
             Usage::Linear1 => Self::Bc4,
             Usage::Linear4 => Self::Bc7,
             Usage::Hdr | Usage::Environment { .. } => Self::Bc6h,
+            // Half floats step 32 times coarser than R16 near 1.
+            Usage::Displacement if float => Self::Raw(DataFormat::R32f),
+            Usage::Displacement if signed => Self::Raw(DataFormat::R16Snorm),
             Usage::Displacement => Self::Raw(DataFormat::R16),
             Usage::Data(f) => Self::Raw(f),
         }
@@ -44,7 +53,9 @@ impl Encoding {
             Self::Bc7Srgb => BC7_SRGB,
             Self::Bc7 => BC7_UNORM,
             Self::Bc5 => BC5_UNORM,
+            Self::Bc5Snorm => BC5_SNORM,
             Self::Bc4 => BC4_UNORM,
+            Self::Bc4Snorm => BC4_SNORM,
             Self::Bc6h => BC6H_UFLOAT,
             Self::Raw(f) => match f {
                 DataFormat::R8 => R8_UNORM,
@@ -52,6 +63,7 @@ impl Encoding {
                 DataFormat::Rgba8 => R8G8B8A8_UNORM,
                 DataFormat::Rgba8Srgb => R8G8B8A8_SRGB,
                 DataFormat::R16 => R16_UNORM,
+                DataFormat::R16Snorm => R16_SNORM,
                 DataFormat::Rg16 => R16G16_UNORM,
                 DataFormat::Rgba16 => R16G16B16A16_UNORM,
                 DataFormat::R16f => R16_SFLOAT,
@@ -103,6 +115,14 @@ fn unorm16(v: f32) -> [u8; 2] {
     ((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_le_bytes()
 }
 
+fn snorm8(v: f32) -> u8 {
+    ((v.clamp(-1.0, 1.0) * 127.0).round() as i8).cast_unsigned()
+}
+
+fn snorm16(v: f32) -> [u8; 2] {
+    ((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes()
+}
+
 fn raw(d: DataFormat, m: &Img) -> Vec<u8> {
     let mut out = Vec::new();
     for p in &m.px {
@@ -115,6 +135,7 @@ fn raw(d: DataFormat, m: &Img) -> Vec<u8> {
                 out.push(unorm8(p[3]));
             }
             DataFormat::R16 => out.extend(unorm16(p[0])),
+            DataFormat::R16Snorm => out.extend(snorm16(p[0])),
             DataFormat::Rg16 => out.extend(p[..2].iter().flat_map(|&v| unorm16(v))),
             DataFormat::Rgba16 => out.extend(p.iter().flat_map(|&v| unorm16(v))),
             DataFormat::R16f => out.extend(f16::from_f32(p[0]).to_le_bytes()),
@@ -133,7 +154,8 @@ fn raw(d: DataFormat, m: &Img) -> Vec<u8> {
 }
 
 /// ctt encoder, preset and input layout for each BCn encoding: bc7e for BC7, Compressonator
-/// for BC4 and BC5, Intel ISPC for BC6H. Encoders are always named, never picked automatically.
+/// for BC4 and BC5, the only one with signed forms, Intel ISPC for BC6H. Encoders are always
+/// named, never picked automatically.
 fn bc(e: Encoding, quality: Quality, chains: &[Vec<Img>]) -> Result<Vec<Vec<Vec<u8>>>, String> {
     let amd = || Encoder::Amd(Default::default());
     let (target, encoder, input, bpp) = match e {
@@ -153,7 +175,9 @@ fn bc(e: Encoding, quality: Quality, chains: &[Vec<Img>]) -> Result<Vec<Vec<Vec<
             4,
         ),
         Encoding::Bc5 => (Format::BC5_UNORM_BLOCK, amd(), Format::R8G8_UNORM, 2),
+        Encoding::Bc5Snorm => (Format::BC5_SNORM_BLOCK, amd(), Format::R8G8_SNORM, 2),
         Encoding::Bc4 => (Format::BC4_UNORM_BLOCK, amd(), Format::R8_UNORM, 1),
+        Encoding::Bc4Snorm => (Format::BC4_SNORM_BLOCK, amd(), Format::R8_SNORM, 1),
         Encoding::Bc6h => (
             Format::BC6H_UFLOAT_BLOCK,
             Encoder::Intel(Default::default()),
@@ -170,6 +194,9 @@ fn bc(e: Encoding, quality: Quality, chains: &[Vec<Img>]) -> Result<Vec<Vec<Vec<
                 .flat_map(|v| v.to_le_bytes()),
         ),
         Encoding::Bc4 | Encoding::Bc5 => out.extend(p[..bpp].iter().map(|&v| unorm8(v))),
+        Encoding::Bc4Snorm | Encoding::Bc5Snorm => {
+            out.extend(p[..bpp].iter().map(|&v| snorm8(v)));
+        }
         _ => {
             let rgb = |v: f32| unorm8(if srgb { linear_to_srgb(v) } else { v });
             out.extend([rgb(p[0]), rgb(p[1]), rgb(p[2]), unorm8(p[3])]);

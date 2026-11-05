@@ -16,6 +16,8 @@ pub(super) struct MipSpec {
     pub(super) normal: bool,
     /// Channel and cutoff of alpha-tested coverage.
     pub(super) coverage: Option<(usize, f32)>,
+    /// Red holds heights, which [`settle_heights`] and [`keep_heights`] hold to mip 0's range.
+    pub(super) height: bool,
 }
 
 /// Normal variance from a normal map added to a roughness channel of a packed texture.
@@ -32,6 +34,7 @@ pub(super) fn chain(base: Img, spec: &MipSpec, count: u32) -> Vec<Img> {
     if spec.normal {
         base.px.par_iter_mut().for_each(|p| *p = normalized(*p));
     }
+    let range = spec.height.then(|| settle_heights(&mut base));
     let mut out = {
         let _z = crate::profile::zone!("mips.downsample");
         raw_chain(base, spec, count)
@@ -48,7 +51,30 @@ pub(super) fn chain(base: Img, spec: &MipSpec, count: u32) -> Vec<Img> {
         let _z = crate::profile::zone!("mips.coverage");
         match_coverage(&mut out, channel, cutoff, spec.grid);
     }
+    if let Some(range) = range {
+        keep_heights(&mut out, range);
+    }
     out
+}
+
+/// Stores non-finite heights as a format of fixed span does, at an end of the image's finite
+/// range, or at 0 without one, and returns that range. Geometry can't be displaced by them, and
+/// filtering would spread them through the mips.
+pub(super) fn settle_heights(l: &mut Img) -> (f32, f32) {
+    let (lo, hi) = match l.finite_range(0) {
+        (lo, hi) if lo <= hi => (lo, hi),
+        _ => (0.0, 0.0),
+    };
+    keep_heights(std::slice::from_mut(l), (lo, hi));
+    (lo, hi)
+}
+
+/// Holds the heights of `chain` to `lo..hi`: a mip's filter overshoots at steps, past what a
+/// material declares. Unlike `clamp`, this leaves no NaN.
+pub(super) fn keep_heights(chain: &mut [Img], (lo, hi): (f32, f32)) {
+    for p in chain.iter_mut().flat_map(|m| &mut m.px) {
+        p[0] = p[0].max(lo).min(hi);
+    }
 }
 
 /// The first `count` mips, each filtered from the one above it, before renormalizing or
@@ -616,6 +642,7 @@ impl Toksvig {
             grid: spec.grid,
             normal: false,
             coverage: None,
+            height: false,
         };
         let mut base = self.normals.clone();
         base.px.par_iter_mut().for_each(|p| *p = normalized(*p));
@@ -661,6 +688,7 @@ mod tests {
             grid: None,
             normal: false,
             coverage: None,
+            height: false,
         }
     }
 
