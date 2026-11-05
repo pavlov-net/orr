@@ -2365,6 +2365,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-metal 0.3.2",
  "objc2-quartz-core 0.3.2",
+ "orr_color",
  "orr_memory",
  "orr_shaders",
  "raw-window-handle",

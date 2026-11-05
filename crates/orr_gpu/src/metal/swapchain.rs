@@ -32,10 +32,7 @@ use crate::{
 /// The most drawables a `CAMetalLayer` holds.
 const MAX_DRAWABLES: u32 = 3;
 
-/// The absolute luminance macOS gives EDR 1.0 when it maps PQ content, which HDR10 metadata
-/// states as its optical output scale; orr_window's display watch uses the same value and
-/// says where it comes from.
-const EDR_REFERENCE_NITS: f32 = 100.0;
+const EDR_REFERENCE_NITS: f32 = orr_color::EDR_REFERENCE_NITS as f32;
 
 /// The encodings a layer takes. scRGB is left out: its 1.0 is 80 nits, but on an EDR layer
 /// 1.0 is the screen's SDR white, which moves with the brightness setting.

@@ -36,6 +36,47 @@ pub fn log_to_stderr() {
         .try_init();
 }
 
+/// Runs `tests` on this thread, for targets without a harness: the libtest arguments the
+/// runner passes are honored, so a name filter, `--exact`, `--skip`, `--list` and
+/// `--ignored` mean what they do under libtest, and other options and their values are
+/// passed over.
+#[expect(clippy::print_stdout, reason = "libtest lists tests on stdout")]
+pub fn run_on_main_thread(tests: &[(&str, fn())]) {
+    /// libtest options that take a value as the next argument.
+    const VALUED: &[&str] = &["--test-threads", "--format", "--color", "--logfile", "-Z"];
+    let (mut filters, mut skips) = (Vec::new(), Vec::new());
+    let (mut exact, mut list, mut ignored) = (false, false, false);
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--exact" => exact = true,
+            "--list" => list = true,
+            "--ignored" => ignored = true,
+            "--skip" => skips.extend(args.next()),
+            a if a.starts_with("--skip=") => skips.push(a["--skip=".len()..].to_string()),
+            a if VALUED.contains(&a) => {
+                args.next();
+            }
+            a if a.starts_with('-') => {}
+            _ => filters.push(arg),
+        }
+    }
+    let matches = |name: &str, f: &String| if exact { name == f } else { name.contains(f.as_str()) };
+    for &(name, test) in tests {
+        let chosen = (filters.is_empty() || filters.iter().any(|f| matches(name, f)))
+            && !skips.iter().any(|s| matches(name, s));
+        if !chosen {
+            continue;
+        }
+        if list {
+            println!("{name}: test");
+        } else if !ignored {
+            log::info!("{name}");
+            test();
+        }
+    }
+}
+
 static DEVICE: OnceLock<Device> = OnceLock::new();
 
 /// The suite's device: every queue kind. `ORR_CAPTURE=1` creates it for an

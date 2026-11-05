@@ -25,6 +25,7 @@ libloading.workspace = true
 
 # The Metal 4 backend.
 [target.'cfg(target_vendor = "apple")'.dependencies]
+orr_color.workspace = true
 objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-metal.workspace = true

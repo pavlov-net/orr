@@ -3,8 +3,7 @@
 //! change, the extent following window resizes, and both present modes.
 //!
 //! AppKit windows live on the main thread, which libtest never runs tests on, so this target
-//! has no harness: `main` runs the tests in turn, those whose names contain an argument when
-//! any is given.
+//! has no harness: `main` runs the tests in turn, taking libtest's arguments.
 
 #[cfg(any(windows, target_os = "macos"))]
 mod windowed {
@@ -292,16 +291,7 @@ fn main() {
             windowed::display_follows_feed_request_and_window,
         ),
     ];
-    let filters: Vec<String> = std::env::args()
-        .skip(1)
-        .filter(|a| !a.starts_with('-'))
-        .collect();
-    for (name, test) in tests {
-        if filters.is_empty() || filters.iter().any(|f| name.contains(f.as_str())) {
-            log::info!("{name}");
-            test();
-        }
-    }
+    gpu_suite::run_on_main_thread(tests);
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
