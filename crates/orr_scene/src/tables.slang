@@ -543,12 +543,16 @@ public uint cluster_page(MeshGpu* mesh, uint cluster)
     return lo;
 }
 
-// Entry `index` of `transforms` (`group`'s current or previous buffer) as a row-major [R | t]
-// relative to the group's anchor.
+// Entry `index` of `transforms` (`group`'s current or previous buffer) as a row-major [L | t]
+// relative to the group's anchor. A page's linear table follows its records.
 public float3x4 group_entry(GroupGpu* group, uint8_t* transforms, uint index)
 {
     if (group.format == GROUP_QUANTIZED_PAGE)
-        return decode_record(group.origin, group.extent, group.log2_scale_min, group.log2_scale_max, ((InstanceRecord*)transforms)[index]);
+    {
+        InstanceRecord* records = (InstanceRecord*)transforms;
+        LinearRows* table = (LinearRows*)(records + group.count);
+        return decode_record(group.origin, group.extent, group.log2_scale_min, group.log2_scale_max, table, records[index]);
+    }
     return ((float3x4*)transforms)[index];
 }
 

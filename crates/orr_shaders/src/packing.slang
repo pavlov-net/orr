@@ -205,7 +205,7 @@ public float3 grid_position(int3 anchor, uint3 local, float step)
 // w), stored non-negative and dropped; the other three in x, y, z, w order sit in bits
 // 0-9, 10-19 and 20-29, each as round((c / ROTATION_RANGE x 0.5 + 0.5) x 1023).
 //
-// Exact axis rotations (the record's EXACT_AXIS flag) store an index 0-23 instead:
+// Exact axis rotations (the record's INDEXED flag) store an index 0-23 instead:
 // index = permutation x 4 + signs. Row i of the matrix has its one non-zero entry in column
 // AXIS_PERMUTATIONS[permutation][i]; bit 0 of `signs` negates row 0, bit 1 row 1, and row
 // 2's sign makes the determinant +1. Index 0 is the identity.

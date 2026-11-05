@@ -17,7 +17,8 @@ mod common;
 use std::collections::BTreeMap;
 
 use orr_cook::{
-    ArchiveSpec, AssetSpec, GltfSettings, Instances, Manifest, Placement, PrototypeSpec, Source,
+    ArchiveSpec, AssetSpec, GltfSettings, Instances, Linear, Manifest, Placement, PrototypeSpec,
+    Source,
 };
 use orr_math::{DQuat, DVec3, Quat, Vec3};
 use orr_pack::instance::{self, InstancePageInfo};
@@ -117,8 +118,10 @@ fn scatter_set_cooks_within_its_error_bounds() {
                     .map(|r| Placement {
                         position: DVec3::new(r.f[0].into(), r.f[1].into(), r.f[2].into())
                             .to_array(),
-                        rotation: Quat::from_xyzw(r.f[3], r.f[4], r.f[5], r.f[6]).to_array(),
-                        scale: Vec3::new(r.f[7], r.f[8], r.f[9]).to_array(),
+                        linear: Linear::Scaled {
+                            rotation: Quat::from_xyzw(r.f[3], r.f[4], r.f[5], r.f[6]).to_array(),
+                            scale: Vec3::new(r.f[7], r.f[8], r.f[9]).to_array(),
+                        },
                         prototype: ids[&r.prototype],
                     })
                     .collect(),
@@ -200,7 +203,7 @@ fn scatter_set_cooks_within_its_error_bounds() {
             rot_err = rot_err.max(q.angle_between(d).to_degrees());
         }
         pages += 1;
-        records += recs.len() / 16;
+        records += usize::from(h.record_count);
     }
     assert_eq!(records, total);
     println!(

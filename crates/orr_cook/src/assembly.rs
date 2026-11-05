@@ -13,11 +13,11 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
-use orr_math::{DMat3, DQuat, DVec3, Mat3, Quat, Vec3};
+use orr_math::{DMat3, DQuat, DVec3, Quat, Vec3};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
-use crate::instances::{Instances, Placement, PrototypeSpec, SectionSpec};
+use crate::instances::{Instances, Linear, Placement, PrototypeSpec, SectionSpec};
 use crate::mesh::{MeshData, PartData, Pivots, SectionData, grid_exponent};
 use crate::{Error, Result};
 
@@ -604,36 +604,16 @@ fn remainder(m: &MeshData, mut removed: Vec<Vec<[u32; 3]>>) -> MeshData {
     }
 }
 
-/// A placement of a unit copy from a placement of its model; `None` when a non-uniform
-/// scale meets a unit rotation that does not map axes to axes.
-fn compose(p: &Placement, u: &UnitPlacement) -> Option<Placement> {
-    let mut r = Quat::from_array(u.rotation);
-    let s = p.scale();
-    let a = s.abs();
-    let uniform = a.max_element() - a.min_element() <= 1e-6 * a.max_element();
-    let scale = if uniform {
-        // diag(s) R = (D R D) diag(s) with D = diag(sign(s)), and D R D is a rotation.
-        let d = Mat3::from_diagonal(s.signum());
-        r = Quat::from_mat3(&(d * Mat3::from_quat(r) * d)).normalize();
-        s
-    } else {
-        // S R = R S' when R e_j = +-e_i: S'_j = S_i.
-        let m = Mat3::from_quat(r);
-        let mut out = [0.0; 3];
-        for (j, o) in out.iter_mut().enumerate() {
-            let col = m.col(j).abs();
-            let i = (0..3).find(|&i| col[i] > 1.0 - 1e-4)?;
-            *o = s[i];
-        }
-        Vec3::from(out)
-    };
+/// A placement of a unit copy from a placement of its model.
+fn compose(p: &Placement, u: &UnitPlacement) -> Placement {
+    let l = p.linear();
+    let r = DMat3::from_quat(Quat::from_array(u.rotation).as_dquat().normalize());
     let t = DVec3::from(u.translation.map(f64::from));
-    Some(Placement {
-        position: (p.position() + p.rotation().as_dquat() * (s.as_dvec3() * t)).to_array(),
-        rotation: (p.rotation() * r).normalize().to_array(),
-        scale: scale.to_array(),
+    Placement {
+        position: (p.position() + l * t).to_array(),
+        linear: Linear::Matrix((l * r).as_mat3().to_cols_array_2d()),
         prototype: p.prototype,
-    })
+    }
 }
 
 /// `src` with every placement of a model with an assembly also placing its units, and the
@@ -712,13 +692,7 @@ pub(crate) fn expand<'a>(
             continue;
         };
         for u in &a.placements {
-            let mut c = compose(rec, u).ok_or_else(|| {
-                fail(format!(
-                    "placement {i} scales {} unevenly by {}, and a unit copy is not rotated about the axes",
-                    a.model,
-                    rec.scale()
-                ))
-            })?;
+            let mut c = compose(rec, u);
             c.prototype = first + u.unit as u16;
             out.records.push(c);
             out.user.extend_from_slice(user);
@@ -931,29 +905,26 @@ mod tests {
     }
 
     #[test]
-    fn uneven_scale_keeps_axis_rotations_only() {
+    fn a_unit_under_uneven_scale_lands_where_its_model_puts_it() {
         let p = Placement {
             position: [1.0, 2.0, 3.0],
-            rotation: Quat::from_rotation_y(0.5).to_array(),
-            scale: [1.0, 2.0, 3.0],
+            linear: Linear::Scaled {
+                rotation: Quat::from_rotation_y(0.5).to_array(),
+                scale: [1.0, 2.0, 3.0],
+            },
             prototype: 0,
         };
-        let quarter = UnitPlacement {
+        let tilted = UnitPlacement {
             unit: 0,
-            rotation: Quat::from_rotation_z(std::f32::consts::FRAC_PI_2).to_array(),
+            rotation: Quat::from_rotation_z(0.3).to_array(),
             translation: [1.0, 1.0, 0.0],
         };
-        let c = compose(&p, &quarter).expect("axis rotation");
-        assert_eq!(c.scale, [2.0, 1.0, 3.0]);
-        let x = Vec3::new(0.3, -0.2, 0.7);
-        let unit = Quat::from_array(quarter.rotation) * x + Vec3::from(quarter.translation);
-        let want = p.position().as_vec3() + p.rotation() * (p.scale() * unit);
-        let got = c.position().as_vec3() + c.rotation() * (c.scale() * x);
+        let c = compose(&p, &tilted);
+        let x = DVec3::new(0.3, -0.2, 0.7);
+        let unit = Quat::from_array(tilted.rotation).as_dquat() * x
+            + Vec3::from(tilted.translation).as_dvec3();
+        let want = p.position() + p.linear() * unit;
+        let got = c.position() + c.linear() * x;
         assert!(want.distance(got) < 1e-5, "{want} {got}");
-        let tilted = UnitPlacement {
-            rotation: Quat::from_rotation_z(0.3).to_array(),
-            ..quarter
-        };
-        assert!(compose(&p, &tilted).is_none());
     }
 }

@@ -30,7 +30,7 @@ void main(uint3 id: SV_DispatchThreadID)
     float3x4 mm = affine_mul(m, m);
     float3 world = from_local(local, t, b, n) + transform_point(mm, n) + transform_vector(m, t)
         + transform_normal(m, b) + affine_translation(m) + mul(linear_inverse(affine_linear(m)), n)
-        + max_component(n) + float(max_component(uint3(id)));
+        + max_component(n) + float(max_component(uint3(id))) + largest_scale(affine_linear(m));
 
     float3 packed = oct_decode_unorm16(oct_encode_unorm16(n)) + oct_decode_snorm16(oct_encode_snorm16(n))
         + oct_decode_snorm8(oct_encode_snorm8(n)) + unpack_rgb9e5(pack_rgb9e5(n))

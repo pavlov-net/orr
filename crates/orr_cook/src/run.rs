@@ -55,7 +55,7 @@ use crate::texture::neural::{self, NeuralJob};
 use crate::texture::{self, Img, Wrap};
 use crate::volume::{self, VolumeReport};
 use crate::{
-    CookOptions, Cooked, Error, GltfSettings, Instances, Manifest, MeshSettings, Placement,
+    CookOptions, Cooked, Error, GltfSettings, Instances, Linear, Manifest, MeshSettings, Placement,
     PrototypeSpec, Result, Source, TextureSettings, UsdSettings, mount,
 };
 
@@ -1816,8 +1816,7 @@ fn scene_instances(name: &str, models: &[(String, Vec<Placed>)]) -> Vec<Instance
                 });
                 src.records.extend(placed.iter().map(|q| Placement {
                     position: q.position.to_array(),
-                    rotation: q.rotation.to_array(),
-                    scale: q.scale.to_array(),
+                    linear: Linear::Matrix(q.linear.to_cols_array_2d()),
                     prototype: p as u16,
                 }));
             }

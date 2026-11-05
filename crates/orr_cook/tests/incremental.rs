@@ -9,8 +9,8 @@ use std::time::{Duration, SystemTime};
 
 use orr_cook::{
     ArchiveSpec, AssemblySettings, AssetSpec, CookOptions, Cooked, DataFormat, GltfSettings,
-    Instances, LodMode, Manifest, MipFilter, Outcome, Placement, PrototypeSpec, Quality, Source,
-    TextureSettings, Usage,
+    Instances, Linear, LodMode, Manifest, MipFilter, Outcome, Placement, PrototypeSpec, Quality,
+    Source, TextureSettings, Usage,
 };
 use orr_math::{DVec3, Quat, Vec3};
 use orr_pack::{Archive, AssetId, Class, Target};
@@ -91,8 +91,10 @@ fn assets(d: &Path, tex_filter: MipFilter) -> Vec<AssetSpec> {
         .map(|i| Placement {
             position: DVec3::new(f64::from(i) * 300.0 - 700.0, 2.0, f64::from(i % 2) * 300.0)
                 .to_array(),
-            rotation: Quat::from_rotation_y(i as f32).to_array(),
-            scale: Vec3::splat(1.0 + i as f32 * 0.1).to_array(),
+            linear: Linear::Scaled {
+                rotation: Quat::from_rotation_y(i as f32).to_array(),
+                scale: Vec3::splat(1.0 + i as f32 * 0.1).to_array(),
+            },
             prototype: 0,
         })
         .collect();
@@ -459,7 +461,10 @@ user = { class = 32771, schema = 2, version = 1, bytes = [1, 2, 3] }
 name = "scatter"
 [archive.asset.instances]
 prototypes = [{ model = "quad", sections = [{ hidden = true }] }]
-records = [{ position = [1.0, 2.0, 3.0], rotation = [0.0, 0.0, 0.0, 1.0], scale = [1.0, 1.0, 1.0], prototype = 0 }]
+records = [
+    { position = [1.0, 2.0, 3.0], linear = { rotation = [0.0, 0.0, 0.0, 1.0], scale = [1.0, 1.0, 1.0] }, prototype = 0 },
+    { position = [4.0, 5.0, 6.0], linear = [[1.0, 0.0, 0.0], [0.5, 1.0, 0.0], [0.0, 0.0, 1.0]], prototype = 0 },
+]
 
 [[archive.asset]]
 name = "paint"
@@ -521,6 +526,8 @@ material = { base_color = [0.5, 0.25, 0.125], surface = 4 }
         panic!("instances");
     };
     assert_eq!(i.records[0].position, [1.0, 2.0, 3.0]);
+    assert!(matches!(i.records[0].linear, Linear::Scaled { .. }));
+    assert!(matches!(i.records[1].linear, Linear::Matrix(_)));
     assert!(i.prototypes[0].sections[0].hidden);
     let Source::Material(paint) = &a.assets[5].source else {
         panic!("material");
@@ -661,8 +668,10 @@ fn linked_imports_still_expand_assemblies() {
         let records = (0..n)
             .map(|i| Placement {
                 position: DVec3::new(10.0 * i as f64, 0.0, 5.0).to_array(),
-                rotation: Quat::from_rotation_y(i as f32).to_array(),
-                scale: [1.0; 3],
+                linear: Linear::Scaled {
+                    rotation: Quat::from_rotation_y(i as f32).to_array(),
+                    scale: [1.0; 3],
+                },
                 prototype: 0,
             })
             .collect();
@@ -712,7 +721,12 @@ fn linked_imports_still_expand_assemblies() {
         .entries()
         .iter()
         .filter(|e| e.class == Class::InstancePage as u16)
-        .map(|e| a.blobs(e)[1].raw_len as usize / size_of::<orr_pack::instance::InstanceRecord>())
+        .map(|e| {
+            let mut head = vec![0; a.blobs(e)[0].raw_len as usize];
+            a.read(&a.blobs(e)[0], &mut head).unwrap();
+            let info = orr_pack::instance::InstancePageInfo::parse(&head).unwrap();
+            usize::from(info.header.record_count)
+        })
         .sum();
     assert_eq!(records, 3 * (1 + 12));
 }

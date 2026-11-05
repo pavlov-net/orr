@@ -1,7 +1,8 @@
-use orr_math::{DVec4, Mat3, Quat, Vec4};
+use orr_math::{DVec4, Mat3, Quat, Vec3, Vec4};
 use orr_pack::instance::{
-    self, InstancePageHeader, InstanceRecord, Prototype, SectionOverride, axis_rotation,
-    decode_rotation, encode_rotation, exact_axis_index, instance_rotation,
+    self, AXIS_ROTATIONS, InstancePageHeader, InstancePageInfo, InstanceRecord, LinearRows,
+    Prototype, SectionOverride, axis_rotation, decode_rotation, encode_rotation, exact_axis_index,
+    instance_rotation,
 };
 
 struct Rng(u64);
@@ -32,9 +33,60 @@ fn layouts_match_the_gpu_structs() {
     assert_eq!(size_of::<Prototype>(), 32);
     assert_eq!(size_of::<SectionOverride>(), 20);
     assert_eq!(size_of::<InstanceRecord>(), 16);
+    assert_eq!(size_of::<LinearRows>(), 36);
     assert_eq!(std::mem::offset_of!(InstancePageHeader, user_stride), 52);
     assert_eq!(std::mem::offset_of!(InstancePageHeader, partitions), 56);
     assert_eq!(std::mem::offset_of!(InstanceRecord, rot), 8);
+}
+
+/// A page of a compact record and two table rows, one of which holds a mirrored shear.
+fn sheared_page() -> (InstancePageInfo, Vec<u8>) {
+    let shear = Mat3::from_cols(
+        Vec3::new(1.0, 0.25, -0.5),
+        Vec3::new(0.75, 2.0, 0.125),
+        Vec3::new(-0.375, 0.0, 3.0),
+    );
+    let mirrored = shear * Mat3::from_diagonal(Vec3::new(-1.0, 1.0, 1.0));
+    let record = |pos, rot, scale| InstanceRecord {
+        pos,
+        prototype: 0,
+        rot,
+        scale,
+    };
+    let records = [
+        record([0, 0, 0], 0, InstanceRecord::INDEXED),
+        record([65535, 0, 0], AXIS_ROTATIONS, InstanceRecord::INDEXED),
+        record([0, 65535, 0], AXIS_ROTATIONS + 1, InstanceRecord::INDEXED),
+    ];
+    let table = [LinearRows::from(shear), LinearRows::from(mirrored)];
+    let info = InstancePageInfo {
+        header: InstancePageHeader {
+            extent: [8.0; 3],
+            record_count: records.len() as u16,
+            ..bytemuck::Zeroable::zeroed()
+        },
+        prototypes: vec![bytemuck::Zeroable::zeroed()],
+        sections: Vec::new(),
+        partitions: vec![0],
+    };
+    let blob = [
+        bytemuck::cast_slice::<_, u8>(&records),
+        bytemuck::cast_slice(&table),
+    ]
+    .concat();
+    (info, blob)
+}
+
+#[test]
+fn a_table_that_does_not_match_its_records_is_malformed() {
+    let (info, blob) = sheared_page();
+    let head = info.to_bytes();
+    assert!(instance::decode(&head, &blob).is_ok());
+    // A row short, and one of the two rows gone with a record still naming it.
+    assert!(instance::decode(&head, &blob[..blob.len() - 4]).is_err());
+    assert!(instance::decode(&head, &blob[..blob.len() - 36]).is_err());
+    // Fewer bytes than the header's records.
+    assert!(instance::decode(&head, &blob[..16]).is_err());
 }
 
 #[test]

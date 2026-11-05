@@ -21,9 +21,8 @@
 //!   instancer's `positions`, `orientations`, `scales` and `protoIndices` place it (records
 //!   whose `ids` are in `invisibleIds` are dropped) as [`crate::import::Scene::instances`].
 //!   Prims under an instancer are cooked only as its prototypes. A transform that collapses
-//!   an axis or shears further than [`crate::SHEAR_MAX`] is not a placement: the prototype
-//!   is cooked once per such linear transform with it applied, as model `<model>/baked/<k>`,
-//!   placed by translation alone.
+//!   an axis is not a placement: the prototype is cooked once per such linear transform with
+//!   it applied, as model `<model>/baked/<k>`, placed by translation alone.
 //! - Without [`UsdSettings::models`], the rest of the stage is one model, in scene space.
 //!   With it, each prim whose name contains a pattern (and has no selected ancestor) is a
 //!   model holding its subtree, framed by the prim; meshes outside every model are not

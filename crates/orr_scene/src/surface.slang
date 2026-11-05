@@ -52,7 +52,7 @@ public struct SurfaceInput
     public float4 tangent;          // xyz unit tangent, w bitangent sign
     public float3 object_position;
     public float3 object_normal;
-    public float3x3 object_to_render; // the instance's rotation and scale
+    public float3x3 object_to_render; // the instance's linear transform
     public float3 position;         // render space
     public int3 cell;               // world position as cell and offset in the cell
     public float3 offset;

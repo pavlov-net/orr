@@ -4,14 +4,15 @@
 use std::collections::{BTreeMap, HashMap};
 
 use bytemuck::Zeroable;
-use orr_math::{DVec3, Quat, Vec3};
+use orr_math::{DMat3, DQuat, DVec3, Mat3, Quat, Vec3};
 use orr_pack::instance::{
-    self, InstancePageHeader, InstancePageInfo, InstanceRecord, MAX_HIDDEN_SECTION, MAX_POSE,
-    MAX_RECORDS, PARTITION_INSTANCES, Prototype, SectionOverride,
+    self, InstancePageHeader, InstancePageInfo, InstanceRecord, LinearRows, MAX_HIDDEN_SECTION,
+    MAX_POSE, MAX_RECORDS, PARTITION_INSTANCES, Prototype, SectionOverride,
 };
 use orr_pack::{ArchiveWriter, AssetId, BlobIn, Class, Hash32, Span};
 use serde::Deserialize;
 
+use crate::import::{collapses, column_lengths, largest};
 use crate::{Error, Result, mount};
 
 /// Placements of cooked models. The cook splits them into the archive's cells and writes one
@@ -36,13 +37,25 @@ pub struct Instances {
 pub struct Placement {
     /// World position, meters.
     pub position: [f64; 3],
-    /// Quaternion, `[x, y, z, w]`.
-    pub rotation: [f32; 4],
-    /// Per-axis scale, applied before the rotation; no component zero. An odd number of
-    /// negative components mirrors the copy.
-    pub scale: [f32; 3],
+    /// Has to invert: a flat transform cannot be an instance.
+    pub linear: Linear,
     /// Index into [`Instances::prototypes`].
     pub prototype: u16,
+}
+
+/// The linear part of a placement's transform.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum Linear {
+    Scaled {
+        /// Quaternion, `[x, y, z, w]`.
+        rotation: [f32; 4],
+        /// Per-axis scale, applied before the rotation. An odd number of negative components
+        /// mirrors the copy.
+        scale: [f32; 3],
+    },
+    /// The columns of a matrix, which may shear.
+    Matrix([[f32; 3]; 3]),
 }
 
 impl Placement {
@@ -50,12 +63,48 @@ impl Placement {
         DVec3::from(self.position)
     }
 
-    pub(crate) fn rotation(&self) -> Quat {
-        Quat::from_array(self.rotation)
+    pub(crate) fn linear(&self) -> DMat3 {
+        match self.linear {
+            Linear::Scaled { rotation, scale } => {
+                let r = DQuat::from_array(rotation.map(f64::from)).normalize();
+                DMat3::from_quat(r) * DMat3::from_diagonal(Vec3::from(scale).as_dvec3())
+            }
+            Linear::Matrix(columns) => Mat3::from_cols_array_2d(&columns).as_dmat3(),
+        }
     }
+}
 
-    pub(crate) fn scale(&self) -> Vec3 {
-        Vec3::from(self.scale)
+/// Largest entry of `l diag(1 / s) - R` a compact record drops: each column of `l` keeps its
+/// direction to within this, which is below the record's own rotation error.
+const SHEAR_MAX: f64 = 1e-3;
+
+/// How a record holds the linear transform of a placement.
+enum Form {
+    /// `R diag(s)`: a rotation and per-axis scale, the x scale negative on a mirrored copy.
+    Compact(Quat, Vec3),
+    /// A row of the page's linear table.
+    Table(LinearRows),
+}
+
+impl Form {
+    /// The form of `l`, which [`collapses`] passes: compact when `R diag(s)` fits it within
+    /// [`SHEAR_MAX`] and `s` fits a float, otherwise a table row.
+    fn of(l: DMat3) -> Self {
+        let mut s = column_lengths(l);
+        if l.determinant() < 0.0 {
+            s.x = -s.x;
+        }
+        let unit = l * DMat3::from_diagonal(s.recip());
+        // The rotation nearest `unit`, by polar iteration.
+        let mut r = unit;
+        for _ in 0..16 {
+            r = (r + r.inverse().transpose()) * 0.5;
+        }
+        if largest(unit - r) <= SHEAR_MAX && s.as_vec3().is_finite() {
+            Self::Compact(DQuat::from_mat3(&r).normalize().as_quat(), s.as_vec3())
+        } else {
+            Self::Table(l.as_mat3().into())
+        }
     }
 }
 
@@ -142,10 +191,12 @@ pub(crate) fn cook(
         for (page, members) in pages.into_iter().enumerate() {
             let built = build_page(name, src, &prototypes, *cell, &rel, &members)?;
             let info = built.info.to_bytes();
-            let mut blobs = vec![
-                mount(&info),
-                BlobIn::new(bytemuck::cast_slice(&built.records)),
-            ];
+            let records = [
+                bytemuck::cast_slice(&built.records),
+                bytemuck::cast_slice(&built.linear),
+            ]
+            .concat();
+            let mut blobs = vec![mount(&info), BlobIn::new(&records)];
             if stride > 0 {
                 blobs.push(BlobIn::new(&built.user));
             }
@@ -273,16 +324,11 @@ fn check_records(name: &str, src: &Instances) -> Result<()> {
         if !p.position().is_finite() {
             return Err(fail(name, format!("placement {i} position is not finite")));
         }
-        if !(p.scale().is_finite() && p.scale().abs().min_element() > 0.0) {
+        let l = p.linear();
+        if !l.is_finite() || collapses(l) {
             return Err(fail(
                 name,
-                format!("placement {i} scale {} is zero on an axis", p.scale()),
-            ));
-        }
-        if !(p.rotation().is_finite() && p.rotation().length_squared() > 1e-12) {
-            return Err(fail(
-                name,
-                format!("placement {i} rotation is not a rotation"),
+                format!("placement {i} linear transform {l} does not invert"),
             ));
         }
     }
@@ -297,8 +343,7 @@ pub(crate) fn input_hash(src: &Instances, cell_log2: u8) -> Hash32 {
     h.update(format!("{:?}", src.prototypes).as_bytes());
     for p in &src.records {
         h.update(bytemuck::cast_slice(&p.position));
-        h.update(bytemuck::cast_slice(&p.rotation));
-        h.update(bytemuck::cast_slice(&p.scale));
+        h.update(bytemuck::cast_slice(&p.linear().to_cols_array()));
         h.update(&p.prototype.to_le_bytes());
     }
     h.update(&src.user_stride.to_le_bytes());
@@ -363,6 +408,7 @@ fn split_cell(rel: &[DVec3], records: &[usize], edge: f64) -> Option<Vec<Vec<usi
 struct BuiltPage {
     info: InstancePageInfo,
     records: Vec<InstanceRecord>,
+    linear: Vec<LinearRows>,
     user: Vec<u8>,
 }
 
@@ -407,9 +453,13 @@ fn build_page(
         log2_scale_max: 0.0,
         prototypes: Span::default(),
         user_stride: src.user_stride,
-        _pad: 0,
+        record_count: members.len() as u16,
         partitions: Span::default(),
     };
+    let forms: Vec<Form> = members
+        .iter()
+        .map(|&i| Form::of(src.records[i].linear()))
+        .collect();
     let positions: Vec<[u16; 3]> = if src.joined {
         let k = used
             .iter()
@@ -420,42 +470,61 @@ fn build_page(
     } else {
         set_scale_range(
             &mut header,
-            members.iter().map(|&i| src.records[i].scale().abs()),
+            forms.iter().filter_map(|f| match f {
+                Form::Compact(_, s) => Some(s.abs()),
+                Form::Table(_) => None,
+            }),
         );
         quantize_positions(&mut header, rel, members)
     };
 
     let mut records = Vec::with_capacity(members.len());
-    for (n, &i) in members.iter().enumerate() {
+    let mut linear = Vec::new();
+    let mut rows: HashMap<[u32; 9], u32> = HashMap::new();
+    let unjoined = |i: usize| {
+        fail(
+            name,
+            format!(
+                "joined placement {i} linear transform {} is not a multiple of 90 degrees at scale 1",
+                src.records[i].linear()
+            ),
+        )
+    };
+    for (n, (&i, form)) in members.iter().zip(&forms).enumerate() {
         let p = &src.records[i];
-        let (rotation, mirror) = proper_rotation(p.rotation(), p.scale());
-        let q = rotation.to_array();
-        let exact = instance::exact_axis_index(q);
-        let (rot, mut scale) = match exact {
-            Some(index) => (index, InstanceRecord::EXACT_AXIS),
-            None => (instance::encode_rotation(q), 0),
+        let (rot, scale) = match form {
+            Form::Table(_) if src.joined => return Err(unjoined(i)),
+            Form::Table(l) => {
+                let row = *rows.entry(bytemuck::cast(*l)).or_insert_with(|| {
+                    linear.push(*l);
+                    linear.len() as u32 - 1
+                });
+                (instance::AXIS_ROTATIONS + row, InstanceRecord::INDEXED)
+            }
+            Form::Compact(rotation, s) => {
+                let q = rotation.to_array();
+                let exact = instance::exact_axis_index(q);
+                let (rot, mut scale) = match exact {
+                    Some(index) => (index, InstanceRecord::INDEXED),
+                    None => (instance::encode_rotation(q), 0),
+                };
+                if s.x < 0.0 {
+                    scale |= InstanceRecord::MIRROR;
+                }
+                if src.joined {
+                    // Against the placement itself: a compact form drops a small shear.
+                    let turned = exact.map(|e| instance::axis_rotation(e).as_dmat3());
+                    if !turned.is_some_and(|m| largest(p.linear() - m) <= 1e-6) {
+                        return Err(unjoined(i));
+                    }
+                } else {
+                    for (a, v) in s.abs().to_array().into_iter().enumerate() {
+                        scale |= scale_code(&header, v) << (10 * a);
+                    }
+                }
+                (rot, scale)
+            }
         };
-        if mirror {
-            scale |= InstanceRecord::MIRROR;
-        }
-        if src.joined {
-            if exact.is_none() {
-                return Err(fail(
-                    name,
-                    format!("joined placement {i} rotation is not a multiple of 90 degrees"),
-                ));
-            }
-            if (p.scale() - Vec3::ONE).abs().max_element() > 1e-6 {
-                return Err(fail(
-                    name,
-                    format!("joined placement {i} has scale {}, not 1", p.scale()),
-                ));
-            }
-        } else {
-            for (a, s) in p.scale().abs().to_array().into_iter().enumerate() {
-                scale |= scale_code(&header, s) << (10 * a);
-            }
-        }
         records.push(InstanceRecord {
             pos: positions[n],
             prototype: local[&p.prototype],
@@ -504,6 +573,7 @@ fn build_page(
             partitions,
         },
         records,
+        linear,
         user,
     })
 }
@@ -567,26 +637,6 @@ fn nearest_code(guess: f64, max: u32, err: impl Fn(u32) -> f64) -> u32 {
         .unwrap_or(g)
 }
 
-/// The rotation `R'` and mirror flag for which `R' diag(+-|s|)`, x negated with the flag,
-/// equals `rotation diag(scale)`.
-fn proper_rotation(rotation: Quat, scale: Vec3) -> (Quat, bool) {
-    let sign = scale.signum();
-    let mirror = sign.x * sign.y * sign.z < 0.0;
-    // diag(sign) = diag(d) diag(-1, 1, 1)^mirror, diag(d) a rotation (det +1).
-    let d = if mirror {
-        sign * Vec3::new(-1.0, 1.0, 1.0)
-    } else {
-        sign
-    };
-    let turn = match d.to_array() {
-        [1.0, 1.0, 1.0] => Quat::IDENTITY,
-        [1.0, _, _] => Quat::from_xyzw(1.0, 0.0, 0.0, 0.0),
-        [_, 1.0, _] => Quat::from_xyzw(0.0, 1.0, 0.0, 0.0),
-        _ => Quat::from_xyzw(0.0, 0.0, 1.0, 0.0),
-    };
-    ((rotation.normalize() * turn).normalize(), mirror)
-}
-
 fn set_scale_range(h: &mut InstancePageHeader, scales: impl Iterator<Item = Vec3>) {
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
     for s in scales {
@@ -596,8 +646,10 @@ fn set_scale_range(h: &mut InstancePageHeader, scales: impl Iterator<Item = Vec3
             hi = hi.max(l);
         }
     }
-    h.log2_scale_min = lo;
-    h.log2_scale_max = hi;
+    if lo <= hi {
+        h.log2_scale_min = lo;
+        h.log2_scale_max = hi;
+    }
 }
 
 fn scale_code(h: &InstancePageHeader, s: f32) -> u32 {
@@ -674,7 +726,7 @@ fn check_joined(
     let step = f64::from(h.extent[0]) / 65535.0;
     for (r, &n) in records.iter().zip(order) {
         let i = members[n];
-        let m = instance::decode_record(h, r);
+        let m = instance::decode_record(h, &[], r);
         let linear = m
             .matrix3
             .to_cols_array()

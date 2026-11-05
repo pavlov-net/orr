@@ -853,6 +853,74 @@ fn bad_skin_attributes_read_as_openusd_reads_them() {
     }
 }
 
+/// Sheared copies are instances of their prototype: the instancer's uneven scale over each
+/// copy's rotation shears it, differently per copy, and nothing bakes.
+#[test]
+fn an_instancer_keeps_sheared_copies_on_one_model() {
+    use orr_math::{Mat4, Vec3};
+    let d = dir("usd-sheared");
+    let path = d.join("stage.usda");
+    std::fs::write(
+        &path,
+        r#"#usda 1.0
+(
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "World"
+{
+    def PointInstancer "Sheared"
+    {
+        double3 xformOp:scale = (2, 1, 1)
+        uniform token[] xformOpOrder = ["xformOp:scale"]
+        rel prototypes = [</World/Sheared/Protos/Tile>]
+        int[] protoIndices = [0, 0]
+        point3f[] positions = [(0, 0, 0), (4, 0, 0)]
+        quath[] orientations = [(0.9238795, 0, 0, 0.3826834), (0.9238795, 0, 0.3826834, 0)]
+        def Scope "Protos"
+        {
+            def Mesh "Tile"
+            {
+                int[] faceVertexCounts = [3]
+                int[] faceVertexIndices = [0, 1, 2]
+                point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 1)]
+                uniform token subdivisionScheme = "none"
+            }
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let (a, _) = usd(&path, UsdSettings::default()).unwrap();
+    assert!(a.find(AssetId::from_name("u/Tile/mesh")).is_some());
+    assert!(a.find(AssetId::from_name("u/Tile/baked/0")).is_none());
+    let page = a
+        .entries()
+        .iter()
+        .find(|e| e.class == Class::InstancePage as u16)
+        .unwrap();
+    let bytes = |i: usize| {
+        let b = &a.blobs(page)[i];
+        let mut v = vec![0; b.raw_len as usize];
+        a.read(b, &mut v).unwrap();
+        v
+    };
+    let (_, records) = orr_pack::instance::decode(&bytes(0), &bytes(1)).unwrap();
+    let got: Vec<Mat4> = records.map(|(_, m)| m.into()).collect();
+    let stretch = Vec3::new(2.0, 1.0, 1.0);
+    let turn = |axis: Vec3| Quat::from_axis_angle(axis, std::f32::consts::FRAC_PI_4);
+    for (q, x) in [(turn(Vec3::Z), 0.0), (turn(Vec3::Y), 8.0)] {
+        let want =
+            Mat4::from_translation(Vec3::X * x) * Mat4::from_scale(stretch) * Mat4::from_quat(q);
+        assert!(
+            got.iter().any(|m| m.abs_diff_eq(want, 1e-3)),
+            "{want:?} not among {got:?}"
+        );
+    }
+}
+
 /// Copies an instance transform cannot hold bake their surface, whether the instancer's
 /// scales or the instancer itself flatten them, and keep the surface's normal.
 #[test]

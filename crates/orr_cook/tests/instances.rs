@@ -5,8 +5,8 @@ mod common_assembly;
 use std::path::{Path, PathBuf};
 
 use orr_cook::{
-    ArchiveSpec, AssemblySettings, AssetSpec, Error, GltfSettings, Instances, Manifest, Placement,
-    PrototypeSpec, SectionSpec, Source,
+    ArchiveSpec, AssemblySettings, AssetSpec, Error, GltfSettings, Instances, Linear, Manifest,
+    Placement, PrototypeSpec, SectionSpec, Source,
 };
 use orr_math::{DVec3, Mat3, Quat, Vec3};
 use orr_pack::instance::{self, InstancePageInfo, InstanceRecord};
@@ -129,17 +129,19 @@ fn fixture_page_decodes_within_its_error_bounds() {
                     rng.range(0.0, 256.0),
                 ))
             .to_array(),
-            rotation: rotation(&mut rng).to_array(),
-            scale: (if i % 3 == 0 {
-                Vec3::splat(rng.range(0.5, 2.0) as f32)
-            } else {
-                Vec3::new(
-                    rng.range(0.6, 1.8) as f32,
-                    rng.range(0.6, 1.8) as f32,
-                    rng.range(0.6, 1.8) as f32,
-                )
-            })
-            .to_array(),
+            linear: Linear::Scaled {
+                rotation: rotation(&mut rng).to_array(),
+                scale: (if i % 3 == 0 {
+                    Vec3::splat(rng.range(0.5, 2.0) as f32)
+                } else {
+                    Vec3::new(
+                        rng.range(0.6, 1.8) as f32,
+                        rng.range(0.6, 1.8) as f32,
+                        rng.range(0.6, 1.8) as f32,
+                    )
+                })
+                .to_array(),
+            },
             prototype: (i % 3) as u16,
         })
         .collect();
@@ -177,13 +179,12 @@ fn fixture_page_decodes_within_its_error_bounds() {
     assert_eq!(pages.len(), 1);
     let e = pages[0];
     assert_eq!(a.name(e), "scatter/-3_0_7/0");
-    // The count comes from the TOC alone.
-    assert_eq!(a.blobs(e)[1].raw_len as usize / 16, n);
 
     let head = read(&a, e, 0);
     let recs = read(&a, e, 1);
     let user = read(&a, e, 2);
     let info = InstancePageInfo::parse(&head).unwrap();
+    assert_eq!(usize::from(info.header.record_count), n);
     let h = info.header;
     assert_eq!(info.prototypes.len(), 3);
     assert_eq!(info.prototypes[1].pose, 3);
@@ -222,13 +223,16 @@ fn fixture_page_decodes_within_its_error_bounds() {
                 "axis {a}: {err} m"
             );
         }
+        let Linear::Scaled { rotation, scale } = p.linear else {
+            panic!("scaled");
+        };
         let decoded_scale = Vec3::from_array([0, 1, 2].map(|c| m.matrix3.col(c).length()));
         for a in 0..3 {
-            let rel = (f64::from(decoded_scale[a]) / f64::from(p.scale[a]) - 1.0).abs();
+            let rel = (f64::from(decoded_scale[a]) / f64::from(scale[a]) - 1.0).abs();
             assert!(rel <= scale_half_step.exp2() - 1.0 + 1e-5, "scale {rel}");
             assert!(rel <= 0.002, "scale {rel}");
         }
-        let err = angle_deg(Quat::from_array(p.rotation), m.matrix3);
+        let err = angle_deg(Quat::from_array(rotation), m.matrix3);
         assert!(err <= 0.17, "rotation {err} deg");
         if raw[k].exact_axis() {
             assert!(err < 1e-4);
@@ -257,16 +261,20 @@ fn cells_split_placements_and_large_cells_split_into_pages() {
                 rng.range(0.0, 256.0),
             )
             .to_array(),
-            rotation: Quat::IDENTITY.to_array(),
-            scale: [1.0; 3],
+            linear: Linear::Scaled {
+                rotation: Quat::IDENTITY.to_array(),
+                scale: [1.0; 3],
+            },
             prototype: 0,
         });
     }
     for x in [-0.5, -256.0, -256.5] {
         records.push(Placement {
             position: DVec3::new(x, -1.0, 3.0).to_array(),
-            rotation: Quat::from_rotation_y(0.3).to_array(),
-            scale: Vec3::splat(2.0).to_array(),
+            linear: Linear::Scaled {
+                rotation: Quat::from_rotation_y(0.3).to_array(),
+                scale: Vec3::splat(2.0).to_array(),
+            },
             prototype: 0,
         });
     }
@@ -286,8 +294,9 @@ fn cells_split_placements_and_large_cells_split_into_pages() {
     for e in pages(&a) {
         let head = read(&a, e, 0);
         let recs = read(&a, e, 1);
-        assert!(recs.len() / 16 <= instance::MAX_RECORDS);
-        total += recs.len() / 16;
+        let count = usize::from(InstancePageInfo::parse(&head).unwrap().header.record_count);
+        assert!(count <= instance::MAX_RECORDS);
+        total += count;
         let (cell, decoded) = instance::decode(&head, &recs).unwrap();
         let corner = DVec3::from(cell.map(f64::from)) * 256.0;
         for (_, m) in decoded {
@@ -312,8 +321,10 @@ fn joined_pages_decode_exactly() {
                 -20.0 - f64::from(i % 7) * 2.0,
             )
             .to_array(),
-            rotation: turn.to_array(),
-            scale: [1.0; 3],
+            linear: Linear::Scaled {
+                rotation: turn.to_array(),
+                scale: [1.0; 3],
+            },
             prototype: 0,
         });
     }
@@ -335,7 +346,10 @@ fn joined_pages_decode_exactly() {
     let mut want: Vec<[u32; 12]> = records
         .iter()
         .map(|p| {
-            let r = Mat3::from_quat(Quat::from_array(p.rotation));
+            let Linear::Scaled { rotation, .. } = p.linear else {
+                panic!("scaled");
+            };
+            let r = Mat3::from_quat(Quat::from_array(rotation));
             let t = DVec3::from(p.position) - corner;
             let rows = [0, 1, 2].map(|i| {
                 // + 0.0 turns the rounded -0.0 entries into the 0.0 the decode writes.
@@ -357,10 +371,170 @@ fn joined_pages_decode_exactly() {
         matches!(cook_instances(bad), Err(Error::Instances { .. }))
     };
     assert!(fails(&|p| p.position[0] += step * 0.25));
-    assert!(fails(&|p| p.scale[1] = 1.01));
+    let scaled = |rotation: Quat, scale| Linear::Scaled {
+        rotation: rotation.to_array(),
+        scale,
+    };
     assert!(fails(
-        &|p| p.rotation = Quat::from_rotation_y(0.2).to_array()
+        &|p| p.linear = scaled(Quat::IDENTITY, [1.0, 1.01, 1.0])
     ));
+    assert!(fails(
+        &|p| p.linear = scaled(Quat::from_rotation_y(0.2), [1.0; 3])
+    ));
+    // Small enough that a compact record would drop it and decode exactly.
+    assert!(fails(&|p| p.linear = Linear::Matrix([
+        [1.0, 5e-4, 0.0],
+        [5e-4, 1.0, 0.0],
+        [0.0, 0.0, 1.0]
+    ])));
+    assert!(fails(&|p| p.linear = Linear::Matrix([
+        [1.0, 0.0, 0.0],
+        [0.5, 1.0, 0.0],
+        [0.0, 0.0, 1.0]
+    ])));
+}
+
+/// A sheared copy keeps its matrix bit for bit in the page's linear table, a row per distinct
+/// matrix, and leaves the scale range to the compact records; a transform a rotation and scale
+/// hold stays compact.
+#[test]
+fn sheared_placements_take_table_rows_and_the_rest_stay_compact() {
+    let shear = Mat3::from_cols(
+        Vec3::new(1.0, 0.2, 0.0),
+        Vec3::new(0.5, 1.0, 0.3),
+        Vec3::new(0.0, -0.4, 1.5),
+    );
+    let mirrored = shear * Mat3::from_diagonal(Vec3::new(-1.0, 1.0, 1.0));
+    // Its short columns shear by 30 degrees, a small error beside the long column.
+    let wide = Mat3::from_cols(Vec3::X * 1000.0, Vec3::Y, Vec3::new(0.0, 0.5, 0.866));
+    // Columns that enclose little more volume than a flat transform.
+    let thin = Mat3::from_cols(Vec3::X, Vec3::new(1.0, 2e-5, 0.0), Vec3::Z);
+    // Finite entries, but column lengths past the range of a float.
+    let huge = 1.5e38
+        * Mat3::from_cols(
+            Vec3::ONE,
+            Vec3::new(1.0, -1.0, 0.0),
+            Vec3::new(1.0, 1.0, -2.0),
+        );
+    let rotated = Mat3::from_quat(Quat::from_rotation_y(0.7));
+    let nearly = rotated * Mat3::from_diagonal(Vec3::new(2.0, 3.0, 4.0))
+        + Mat3::from_cols(Vec3::ZERO, rotated.col(0) * 1e-4, Vec3::ZERO);
+    let tables = [shear, mirrored, wide, thin, huge, shear];
+    let matrix = |x: usize, m: Mat3| Placement {
+        position: [1.0 + x as f64, 1.0, 2.0],
+        linear: Linear::Matrix(m.to_cols_array_2d()),
+        prototype: 0,
+    };
+    let mut records: Vec<Placement> = tables
+        .iter()
+        .enumerate()
+        .map(|(i, &m)| matrix(i, m))
+        .collect();
+    records.push(matrix(6, nearly));
+    records.push(Placement {
+        position: [8.0, 1.0, 2.0],
+        linear: Linear::Scaled {
+            rotation: Quat::from_rotation_x(0.3).to_array(),
+            scale: [2.0, 4.0, 4.0],
+        },
+        prototype: 0,
+    });
+    let a = cook_instances(Instances {
+        records,
+        prototypes: vec![proto(0)],
+        ..Default::default()
+    })
+    .unwrap();
+    let e = pages(&a)[0];
+    let (head, blob) = (read(&a, e, 0), read(&a, e, 1));
+    let h = InstancePageInfo::parse(&head).unwrap().header;
+    let (records, table) = instance::records(&h, &blob).unwrap();
+    assert_eq!(table.len(), 5);
+    assert_eq!(
+        records.iter().filter(|r| r.linear_row().is_some()).count(),
+        6
+    );
+    assert_eq!((h.log2_scale_min, h.log2_scale_max), (1.0, 2.0));
+    let (_, decoded) = instance::decode(&head, &blob).unwrap();
+    for (_, m) in decoded {
+        let x = m.translation.x.round() as usize - 1;
+        match tables.get(x) {
+            Some(want) => assert_eq!(m.matrix3, *want),
+            None if x == 6 => {
+                assert!(m.matrix3.abs_diff_eq(nearly, 0.02), "{m:?}");
+            }
+            None => assert_eq!(x, 7),
+        }
+    }
+}
+
+/// One rule decides what may be an instance, whatever form the transform arrives in: it inverts
+/// in f32. Scale on either side does not stop that; a determinant lost to rounding does.
+#[test]
+fn a_transform_that_does_not_invert_is_no_placement() {
+    let flat = |linear: Linear| {
+        let r = cook_instances(Instances {
+            records: vec![Placement {
+                position: [1.0; 3],
+                linear,
+                prototype: 0,
+            }],
+            prototypes: vec![proto(0)],
+            ..Default::default()
+        });
+        match r {
+            Ok(_) => false,
+            Err(Error::Instances { .. }) => true,
+            Err(e) => panic!("{e}"),
+        }
+    };
+    let matrix = |m: Mat3| Linear::Matrix(m.to_cols_array_2d());
+    let scaled = |scale| Linear::Scaled {
+        rotation: Quat::IDENTITY.to_array(),
+        scale,
+    };
+    let turn = |x, y, z, w| Mat3::from_quat(Quat::from_xyzw(x, y, z, w).normalize());
+    let (a, b) = (turn(1.0, 2.0, 3.0, 4.0), turn(4.0, -1.0, 2.0, 3.0));
+    let z = Mat3::from_rotation_z(0.6);
+    let squash = |y| Mat3::from_diagonal(Vec3::new(1.0, y, 1.0));
+
+    assert!(flat(matrix(Mat3::from_cols(
+        Vec3::X,
+        Vec3::Y,
+        Vec3::new(1.0, 1.0, 0.0)
+    ))));
+    assert!(flat(matrix(a * squash(0.0) * b)));
+    assert!(flat(matrix(a * squash(1e-7) * b)));
+    assert!(flat(matrix(Mat3::IDENTITY * f32::NAN)));
+    assert!(flat(matrix(Mat3::IDENTITY * 1e-39)));
+    assert!(flat(matrix(Mat3::from_diagonal(Vec3::new(
+        1.0, 1e-25, 1e-25
+    )))));
+    // Its determinant is sound at unit size, but its inverse is past the range of a float.
+    assert!(flat(matrix(
+        1e-35
+            * Mat3::from_cols(
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(1.0, 1.0001, 0.0),
+                Vec3::Z
+            )
+    )));
+    assert!(flat(scaled([1.0, 0.0, 1.0])));
+    assert!(flat(Linear::Scaled {
+        rotation: [0.0; 4],
+        scale: [1.0; 3]
+    }));
+
+    assert!(!flat(scaled([1.0, 1e-12, 1.0])));
+    assert!(!flat(matrix(z * squash(1e-6))));
+    assert!(!flat(matrix(squash(1e-6) * z)));
+    assert!(!flat(matrix(a * squash(1e-3) * b)));
+    assert!(!flat(matrix(Mat3::IDENTITY * 1e-30)));
+    assert!(!flat(matrix(Mat3::from_cols(
+        Vec3::X,
+        Vec3::new(1.0, 2e-5, 0.0),
+        Vec3::Z
+    ))));
 }
 
 #[test]
@@ -368,8 +542,10 @@ fn prototypes_outside_the_format_fail_with_named_errors() {
     let one = |p: PrototypeSpec| Instances {
         records: vec![Placement {
             position: DVec3::splat(1.0).to_array(),
-            rotation: Quat::IDENTITY.to_array(),
-            scale: [1.0; 3],
+            linear: Linear::Scaled {
+                rotation: Quat::IDENTITY.to_array(),
+                scale: [1.0; 3],
+            },
             prototype: 0,
         }],
         prototypes: vec![p],
@@ -478,8 +654,10 @@ fn assemblies_place_their_units_through_instance_sources() {
             .iter()
             .map(|&(position, rotation, scale)| Placement {
                 position: position.to_array(),
-                rotation: rotation.to_array(),
-                scale: scale.to_array(),
+                linear: Linear::Scaled {
+                    rotation: rotation.to_array(),
+                    scale: scale.to_array(),
+                },
                 prototype: 0,
             })
             .collect(),
@@ -586,8 +764,15 @@ fn assemblies_place_their_units_through_instance_sources() {
     };
     let r = cook_with_report(vec![assembly_model(&path), paint.clone(), scatter(joined)]);
     assert!(matches!(r, Err(Error::Instances { .. })), "{:?}", r.err());
+    // Uneven scale over a unit copy's rotation shears it, which a table row holds.
     let mut uneven = src.clone();
-    uneven.records[0].scale = [1.0, 2.0, 1.0];
-    let r = cook_with_report(vec![assembly_model(&path), paint, scatter(uneven)]);
-    assert!(matches!(r, Err(Error::Instances { .. })), "{:?}", r.err());
+    uneven.records[0].linear = Linear::Scaled {
+        rotation: Quat::from_rotation_y(0.4).to_array(),
+        scale: [1.0, 2.0, 1.0],
+    };
+    let (a, _) = cook_with_report(vec![assembly_model(&path), paint, scatter(uneven)]).unwrap();
+    assert!(pages(&a).iter().any(|e| {
+        let h = InstancePageInfo::parse(&read(&a, e, 0)).unwrap().header;
+        h.linear_rows(a.blobs(e)[1].raw_len as usize).unwrap() > 0
+    }));
 }

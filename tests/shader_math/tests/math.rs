@@ -1,4 +1,4 @@
-use orr_math::{Affine3, Mat3, Quat, Vec3};
+use orr_math::{Affine3, DMat3, DVec3, Mat3, Quat, Vec3};
 use orr_pack::AffineRows;
 use shader_math::stats::Rng;
 use shader_math::*;
@@ -102,5 +102,76 @@ fn quaternions_and_affines_match_glam() {
             close(&transform_normal(ra, n.into()), &want.to_array(), 1e-4),
             "{a:?} {n}"
         );
+    }
+}
+
+/// The largest singular value of `m`, by power iteration on `m^T m`.
+fn largest_singular_value(m: Mat3) -> f64 {
+    let m = m.as_dmat3();
+    let a: DMat3 = m.transpose() * m;
+    let mut v = DVec3::new(0.6, 0.5, 0.62).normalize();
+    for _ in 0..1000 {
+        v = (a * v).normalize();
+    }
+    (m * v).length()
+}
+
+fn row_major(m: Mat3) -> [f32; 9] {
+    m.transpose().to_cols_array()
+}
+
+#[test]
+fn largest_scale_bounds_the_stretch_of_a_matrix() {
+    let mut rng = Rng::new(0x51ea);
+    let shear =
+        |x: f32, y: f32| Mat3::from_cols(Vec3::X, Vec3::new(x, 1.0, 0.0), Vec3::new(0.0, y, 1.0));
+    let mut cases = vec![
+        shear(1.0, 0.0),
+        shear(4.0, -3.0),
+        Mat3::IDENTITY * 1e-25,
+        shear(1.0, 1.0) * 1e-25,
+        shear(1.0, 1.0) * 1e20,
+        Mat3::IDENTITY * 3e38,
+    ];
+    for _ in 0..1000 {
+        let a = random_affine(&mut rng).matrix3;
+        cases.push(a * shear(rng.range(-3.0, 3.0), rng.range(-3.0, 3.0)));
+    }
+    for m in cases {
+        let got = f64::from(largest_scale(row_major(m)));
+        let want = largest_singular_value(m);
+        assert!(
+            got >= want * (1.0 - 1e-5) && got <= want * 1.32,
+            "{m}: {got} against {want}"
+        );
+    }
+    assert_eq!(largest_scale([0.0; 9]), 0.0);
+    let subnormal = shear(1.0, 1.0) * 1e-40;
+    assert!(f64::from(largest_scale(row_major(subnormal))) >= largest_singular_value(subnormal));
+    // The columns of a copy that does not shear are orthogonal: the bound is the longest.
+    for _ in 0..1000 {
+        let a = random_affine(&mut rng).matrix3;
+        let want = a
+            .x_axis
+            .length()
+            .max(a.y_axis.length())
+            .max(a.z_axis.length());
+        let got = largest_scale(row_major(a));
+        assert!((got / want - 1.0).abs() < 1e-5, "{a}: {got} against {want}");
+    }
+}
+
+#[test]
+fn linear_inverse_holds_at_any_uniform_size() {
+    let m = Mat3::from_cols(
+        Vec3::new(1.0, 0.25, 0.0),
+        Vec3::new(0.5, 1.0, 0.25),
+        Vec3::new(0.0, -0.5, 2.0),
+    );
+    for size in [1e-30, 1e-20, 1e-13, 1.0, 1e13, 1e20, 1.5e38] {
+        let s = m * size;
+        let inverse = Mat3::from_cols_array(&linear_inverse(row_major(s))).transpose();
+        let one = inverse * s;
+        assert!(one.abs_diff_eq(Mat3::IDENTITY, 1e-5), "{size}: {one}");
     }
 }

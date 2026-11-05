@@ -196,9 +196,10 @@ pub struct ClipRef {
 #[derive(Debug)]
 pub struct InstancePage {
     pub info: InstancePageInfo,
-    /// Null while the records are not resident.
+    /// Null while the records are not resident. The page's linear table follows them.
     pub records: GpuPtr<InstanceRecord>,
-    pub record_count: u32,
+    /// Bytes of the records and the table.
+    pub bytes: u32,
     /// The mount holding it, whose models its prototypes name first.
     pub mount: MountId,
 }
@@ -206,7 +207,6 @@ pub struct InstancePage {
 struct PlacedPage {
     id: AssetId,
     info: InstancePageInfo,
-    record_count: u32,
     entry: u32,
     bytes: u32,
 }
@@ -1377,19 +1377,13 @@ fn place_page(t: &Arc<MountTask>, entry: usize, id: AssetId, blob0: &[u8]) -> Re
     let info = InstancePageInfo::parse(blob0)?;
     let a = t.archive();
     let blobs = a.blobs(&a.entries()[entry]);
-    let records_len = blobs.get(1).map_or(0, |b| u64::from(b.raw_len));
-    let record_count = records_len / size_of::<InstanceRecord>() as u64;
-    if !records_len.is_multiple_of(size_of::<InstanceRecord>() as u64)
-        || record_count as usize > orr_pack::instance::MAX_RECORDS
-    {
-        return Err(orr_pack::Error::Malformed("instance records").into());
-    }
+    let bytes = blobs.get(1).map_or(0, |b| b.raw_len);
+    info.header.linear_rows(bytes as usize)?;
     t.placed.lock().unwrap().pages.push(PlacedPage {
         id,
         info,
-        record_count: record_count as u32,
         entry: entry as u32,
-        bytes: records_len as u32,
+        bytes,
     });
     Ok(())
 }
@@ -2275,7 +2269,7 @@ fn units(
     let mut page_units = Vec::with_capacity(pages.len());
     for &(id, p) in pages {
         page_units.push(units.len() as u32);
-        if p.record_count == 0 {
+        if p.info.header.record_count == 0 {
             units.push(pinned(ResidencyClass::InstancePages, 0));
             continue;
         }
@@ -2907,15 +2901,12 @@ impl Mounts {
         ))
     }
 
-    /// The bytes page `id`'s records take in the instance page pool.
+    /// The bytes page `id`'s records and linear table take in the instance page pool.
     pub(crate) fn page_bytes(&self, id: u32) -> u64 {
         self.pages
             .get(id as usize)
             .and_then(Option::as_ref)
-            .map_or(0, |p| {
-                (u64::from(p.record_count) * size_of::<InstanceRecord>() as u64)
-                    .next_multiple_of(256)
-            })
+            .map_or(0, |p| u64::from(p.bytes).next_multiple_of(256))
     }
 
     /// Requests the records of page `id` for the next step.
@@ -3425,7 +3416,7 @@ impl Mounts {
             self.pages[i] = Some(InstancePage {
                 info: p.info.clone(),
                 records: GpuPtr::NULL,
-                record_count: p.record_count,
+                bytes: p.bytes,
                 mount,
             });
             res.pages.insert(p.id, PageId(i as u32));

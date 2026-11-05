@@ -22,6 +22,8 @@ mod ffi {
         pub(crate) fn orr_transform_point(m: *const f32, p: *const f32, out: *mut f32);
         pub(crate) fn orr_transform_vector(m: *const f32, v: *const f32, out: *mut f32);
         pub(crate) fn orr_transform_normal(m: *const f32, n: *const f32, out: *mut f32);
+        pub(crate) fn orr_largest_scale(m: *const f32) -> f32;
+        pub(crate) fn orr_linear_inverse(m: *const f32, out: *mut f32);
 
         pub(crate) fn orr_oct_encode_unorm16(n: *const f32) -> u32;
         pub(crate) fn orr_oct_decode_unorm16(e: u32, out: *mut f32);
@@ -160,6 +162,17 @@ pub fn transform_normal(m: M34, n: V3) -> V3 {
     out!(V3, |o| ffi::orr_transform_normal(
         m.as_ptr(),
         n.as_ptr(),
+        o.as_mut_ptr()
+    ))
+}
+/// `m` row-major.
+pub fn largest_scale(m: [f32; 9]) -> f32 {
+    call!(ffi::orr_largest_scale(m.as_ptr()))
+}
+/// `m` and the result row-major.
+pub fn linear_inverse(m: [f32; 9]) -> [f32; 9] {
+    out!([f32; 9], |o| ffi::orr_linear_inverse(
+        m.as_ptr(),
         o.as_mut_ptr()
     ))
 }

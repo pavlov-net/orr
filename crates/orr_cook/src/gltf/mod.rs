@@ -26,11 +26,10 @@
 //! from the node's transform times each instance's, become placements. Such models do not
 //! mix with skins.
 //!
-//! A placement keeps rotation, per-axis scale and translation; a mirroring transform is a
-//! negative scale. A transform that collapses an axis or shears further than
-//! [`crate::SHEAR_MAX`] is not a placement: the mesh is cooked once per such linear transform
-//! with it applied, as model `<model>/baked/<k>`, placed by translation alone. A node scaled
-//! to zero on every axis cooks like any other, as a surface of no area.
+//! A placement keeps the whole transform, mirrored or sheared. A transform that collapses an
+//! axis is not a placement: the mesh is cooked once per such linear transform with it
+//! applied, as model `<model>/baked/<k>`, placed by translation alone. A node scaled to zero
+//! on every axis cooks like any other, as a surface of no area.
 //!
 //! Rigid parts come from the custom vertex attribute `PartAttribute::name` (integer, or
 //! float rounded to the nearest integer; 0 where a primitive lacks it). With skins the

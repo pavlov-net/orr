@@ -1792,7 +1792,7 @@ fn placements(a: &Archive, model: &str) -> Vec<orr_math::Mat4> {
 }
 
 #[test]
-fn meshes_layout_places_each_mesh_and_bakes_shears() {
+fn meshes_layout_places_each_mesh_and_keeps_shears() {
     let d = dir("gltf-meshes");
     let path = d.join("scene.gltf");
     let mut g = Glb::default();
@@ -1857,33 +1857,16 @@ fn meshes_layout_places_each_mesh_and_bakes_shears() {
             ),
         ],
     );
+    // The sheared copy shares the model of the others.
     close(
         &placements(&a, "g/mesh/1"),
         &[
             t(orr_math::Vec3::new(2.0, 3.0, 0.0)),
             t(orr_math::Vec3::new(0.0, 3.0, 7.0)),
+            shear,
         ],
     );
-    // The sheared copy holds its linear transform in its geometry.
-    close(
-        &placements(&a, "g/mesh/1/baked/0"),
-        &[orr_math::Mat4::IDENTITY],
-    );
-    let baked = mesh_of(&a, "g/mesh/1/baked/0/mesh", 0);
-    let corners: Vec<[f32; 3]> = baked
-        .clusters
-        .iter()
-        .flat_map(|c| c.2.iter().flatten().copied())
-        .collect();
-    for p in quad {
-        let want = shear.transform_point3(orr_math::Vec3::from(p));
-        assert!(
-            corners
-                .iter()
-                .any(|c| (orr_math::Vec3::from(*c) - want).abs().max_element() < 1e-3),
-            "{want} missing"
-        );
-    }
+    assert!(a.find(AssetId::from_name("g/mesh/1/baked/0")).is_none());
     // Sections in material order, with the second primitive's material first.
     let plain = mesh_of(&a, "g/mesh/1/mesh", 0);
     assert_eq!(plain.info.sections.len(), 2);

@@ -1575,7 +1575,7 @@ impl<'a> Frame<'a> {
                     prototype_count: p.prototype_count,
                     first_entry: p.first_entry,
                     entry_stride: p.entry_stride,
-                    _pad0: 0,
+                    linear_rows: p.linear_rows,
                     _pad1: 0,
                 });
             }

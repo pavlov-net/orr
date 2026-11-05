@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 
 use orr_color::RgbPrimaries;
 use orr_cook::{
-    ArchiveSpec, AssetSpec, GltfSettings, Instances, LodMode, Manifest, MeshInput, MeshParts,
-    MeshSettings, Placement, Primaries, PrototypeSpec, SectionSpec, Source, TextureSettings, Usage,
+    ArchiveSpec, AssetSpec, GltfSettings, Instances, Linear, LodMode, Manifest, MeshInput,
+    MeshParts, MeshSettings, Placement, Primaries, PrototypeSpec, SectionSpec, Source,
+    TextureSettings, Usage,
 };
 use orr_gpu::{
     ComputePipeline, GpuPtr, Hazards, KernelSet, MemoryKind, QueueKind, SamplerIndex, ShaderModule,
@@ -29,7 +30,7 @@ use orr_gpu::{
 };
 use orr_math::{Affine3, DVec3, Mat3, Quat, UVec2, Vec2, Vec3};
 use orr_pack::clip::Clip;
-use orr_pack::instance::InstanceRecord;
+use orr_pack::instance::{InstanceRecord, LinearRows};
 use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{Cluster, Group, MeshInfo, PageView, decode_page};
 use orr_pack::model::ModelInfo;
@@ -952,7 +953,8 @@ fn cook() -> Arc<[u8]> {
     second_quad.uvs1 = second_quad.uvs.take();
     second_quad.uvs = Some(vec![Vec2::new(0.25, 0.5); 4]);
     tinted.push(model("second uv", second_quad, vec![second], one()));
-    // Two pages of placed balls, a world cell apart, the second prototype without its lamp.
+    // Two pages of placed balls, a world cell apart, the second prototype without its lamp, every
+    // third ball sheared its own way.
     let placements = |x: f64| -> Vec<Placement> {
         (0..12)
             .map(|i| Placement {
@@ -962,8 +964,15 @@ fn cook() -> Arc<[u8]> {
                     2.0 + 3.0 * f64::from(i / 4),
                 )
                 .to_array(),
-                rotation: Quat::from_rotation_y(i as f32 * 0.7).to_array(),
-                scale: [1.0; 3],
+                linear: if i % 3 == 2 {
+                    let shear = i as f32 * 0.1;
+                    Linear::Matrix([[1.0, 0.0, 0.0], [shear, 1.0, 0.0], [0.0, 0.5, 1.0]])
+                } else {
+                    Linear::Scaled {
+                        rotation: Quat::from_rotation_y(i as f32 * 0.7).to_array(),
+                        scale: [1.0; 3],
+                    }
+                },
                 prototype: (i % 2) as u16,
             })
             .collect()
@@ -6280,6 +6289,7 @@ fn row_pages(
     PageId,
     orr_pack::instance::InstancePageInfo,
     Vec<InstanceRecord>,
+    Vec<LinearRows>,
 )> {
     let a = Archive::from_memory(Arc::clone(pack())).unwrap();
     let mut out = Vec::new();
@@ -6289,8 +6299,8 @@ fn row_pages(
         }
         let id = w.scenes.instance_page(w.mount, e.id).unwrap();
         let info = orr_pack::instance::InstancePageInfo::parse(&blob(&a, e, 0)).unwrap();
-        let records: Vec<InstanceRecord> = bytemuck::pod_collect_to_vec(&blob(&a, e, 1));
-        out.push((id, info, records));
+        let (records, table) = orr_pack::instance::records(&info.header, &blob(&a, e, 1)).unwrap();
+        out.push((id, info, records, table));
     }
     out.sort_by_key(|p| p.1.header.cell[0]);
     out
@@ -6347,7 +6357,8 @@ fn a_cooked_page_draws_and_traces_like_its_placements() {
     let _serial = serial();
     let mut w = finest_world();
     let pages = row_pages(&w);
-    let (near, near_info, near_records) = &pages[0];
+    let (near, near_info, near_records, near_table) = &pages[0];
+    assert_eq!(near_table.len(), 4);
     let far = pages.last().unwrap().0;
     assert_ne!(*near, far, "the pack has a page per cell");
     let eye = DVec3::new(9.0, 6.0, 26.0);
@@ -6377,7 +6388,7 @@ fn a_cooked_page_draws_and_traces_like_its_placements() {
             .unwrap();
         let mut ranges = Vec::new();
         for (i, r) in near_records.iter().enumerate() {
-            let m = orr_pack::instance::decode_record(&near_info.header, r);
+            let m = orr_pack::instance::decode_record(&near_info.header, near_table, r);
             s.transforms(group, i as u32, 1).unwrap()[0] = m.into();
             let range = s
                 .add_instances(&InstancesDesc {

@@ -13,7 +13,7 @@
 //!   per glTF mesh the scene places, in the mesh's space, placed by instance pages
 //!   `N/instances/...`,
 //! - `N/<model>/baked/<k>` and its mesh for the copies of a model whose transform collapses
-//!   an axis or shears ([`SHEAR_MAX`]), with the transform applied,
+//!   an axis, with the transform applied,
 //! - `N/skeleton`, with skins: their joints and the joints' ancestors,
 //! - `N/clip/<animation>`: each animation that moves the skeleton, resampled at
 //!   [`ClipSettings`]; an animation without a unique name that is not all digits is
@@ -128,8 +128,8 @@ use serde::Deserialize;
 pub use assembly::AssemblySettings;
 pub use ctt::Quality;
 pub use gltf::GltfLayout;
-pub use import::{NodeSelect, PartAttribute, SHEAR_MAX};
-pub use instances::{Instances, Placement, PrototypeSpec, SectionSpec};
+pub use import::{NodeSelect, PartAttribute};
+pub use instances::{Instances, Linear, Placement, PrototypeSpec, SectionSpec};
 pub use mesh::{LodMode, MeshInput, MeshParts, MeshSettings, OmmSettings, StaticDisplacement};
 pub use patch::{MaterialPatch, MeshPatch};
 pub use quality::zstd_level;

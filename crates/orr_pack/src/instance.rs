@@ -3,15 +3,18 @@
 //! - Blob 0 (mount): an [`InstancePageHeader`], then its [`Prototype`] table, the
 //!   [`SectionOverride`] table the prototypes point into, and the partition table (u16 first
 //!   record per partition). Spans are byte offsets in blob 0 and record counts.
-//! - Blob 1: [`InstanceRecord`]s in Morton order of [`InstanceRecord::pos`]; the record count
-//!   is `raw_len / 16`, at most [`MAX_RECORDS`].
+//! - Blob 1: [`InstancePageHeader::record_count`] [`InstanceRecord`]s in Morton order of
+//!   [`InstanceRecord::pos`], at most [`MAX_RECORDS`], then the page's [`LinearRows`] table, so
+//!   both stream and stay resident together.
 //! - Blob 2, when `user_stride` is not 0: `user_stride` bytes of consumer data per record,
 //!   in record order.
 //!
 //! A record decodes to a transform relative to the page cell (edge `2^cell_log2` m):
-//! translation `origin + pos * (extent / 65535)`, rotation from `rot`, and per-axis scale
-//! `2^(lerp(log2_scale_min, log2_scale_max, code / 1023))` applied before the rotation, its x
-//! negated on a mirrored record ([`InstanceRecord::MIRROR`]).
+//! translation `origin + pos * (extent / 65535)`, and a linear part. A compact record holds a
+//! rotation in `rot` and per-axis scale `2^(lerp(log2_scale_min, log2_scale_max, code / 1023))`
+//! applied before it, its x negated on a mirrored record ([`InstanceRecord::MIRROR`]). A
+//! transform no rotation and scale hold, a sheared one, is a row of the table instead, stored
+//! exactly and shared by every record with the same linear part.
 //! [`decode`] is the reference both for the GPU decode and for consumers' CPU queries.
 
 use bytemuck::{Pod, Zeroable};
@@ -49,10 +52,25 @@ pub struct InstancePageHeader {
     pub prototypes: Span,
     /// Bytes per record in blob 2; 0 when the page has no user stream.
     pub user_stride: u16,
-    pub _pad: u16,
+    /// Records in blob 1, at most [`MAX_RECORDS`]; the rest of the blob is the linear table.
+    pub record_count: u16,
     /// u16 first record of each PTLAS partition, ascending, the first 0. Partition `p`
     /// covers records `[first[p], first[p + 1])`, the last up to the record count.
     pub partitions: Span,
+}
+
+impl InstancePageHeader {
+    /// Rows of the linear table in a blob 1 of `len` bytes.
+    pub fn linear_rows(&self, len: usize) -> Result<usize> {
+        let records = usize::from(self.record_count) * size_of::<InstanceRecord>();
+        len.checked_sub(records)
+            .filter(|table| {
+                usize::from(self.record_count) <= MAX_RECORDS
+                    && table.is_multiple_of(size_of::<LinearRows>())
+            })
+            .map(|table| table / size_of::<LinearRows>())
+            .ok_or(Error::Malformed("instance records"))
+    }
 }
 
 /// A model as placed by the page's records, 32 B.
@@ -88,20 +106,30 @@ pub struct InstanceRecord {
     /// Position on the page's 65535-step grid over `origin..origin + extent`.
     pub pos: [u16; 3],
     pub prototype: u16,
-    /// [`encode_rotation`] code, or with [`Self::EXACT_AXIS`] an [`axis_rotation`] index.
+    /// [`encode_rotation`] code, or with [`Self::INDEXED`] an index: below [`AXIS_ROTATIONS`]
+    /// an [`axis_rotation`], from there on a row of the page's linear table.
     pub rot: u32,
-    /// Bits 0-9, 10-19 and 20-29: x, y and z scale codes; bit 30 [`Self::EXACT_AXIS`], bit
-    /// 31 [`Self::MIRROR`].
+    /// Bits 0-9, 10-19 and 20-29: x, y and z scale codes; bit 30 [`Self::INDEXED`], bit 31
+    /// [`Self::MIRROR`]. A table row replaces the scale and mirror along with the rotation.
     pub scale: u32,
 }
 
 impl InstanceRecord {
-    pub const EXACT_AXIS: u32 = 1 << 30;
+    /// `rot` is an index, not a rotation code.
+    pub const INDEXED: u32 = 1 << 30;
     /// The x scale is negated: the copy is mirrored.
     pub const MIRROR: u32 = 1 << 31;
 
     pub fn exact_axis(&self) -> bool {
-        self.scale & Self::EXACT_AXIS != 0
+        self.scale & Self::INDEXED != 0 && self.rot < AXIS_ROTATIONS
+    }
+
+    /// The row of the page's linear table that holds this record's linear part.
+    pub fn linear_row(&self) -> Option<usize> {
+        (self.scale & Self::INDEXED != 0)
+            .then(|| self.rot.checked_sub(AXIS_ROTATIONS))
+            .flatten()
+            .map(|row| row as usize)
     }
 
     fn mirror(&self) -> bool {
@@ -110,6 +138,27 @@ impl InstanceRecord {
 
     fn scale_codes(&self) -> [u32; 3] {
         [0, 10, 20].map(|s| (self.scale >> s) & 1023)
+    }
+}
+
+/// A row of a page's linear table: a 3 x 3 linear transform, row-major, 36 B.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
+pub struct LinearRows {
+    pub rows: [[f32; 3]; 3],
+}
+
+impl From<Mat3> for LinearRows {
+    fn from(m: Mat3) -> Self {
+        Self {
+            rows: m.transpose().to_cols_array_2d(),
+        }
+    }
+}
+
+impl From<LinearRows> for Mat3 {
+    fn from(l: LinearRows) -> Self {
+        Mat3::from_cols_array_2d(&l.rows).transpose()
     }
 }
 
@@ -177,42 +226,54 @@ impl InstancePageInfo {
     }
 }
 
+/// Blob 1 of a page: its records and its linear table.
+pub fn records(
+    h: &InstancePageHeader,
+    blob: &[u8],
+) -> Result<(Vec<InstanceRecord>, Vec<LinearRows>)> {
+    h.linear_rows(blob.len())?;
+    let (records, table) = blob.split_at(usize::from(h.record_count) * size_of::<InstanceRecord>());
+    let records: Vec<InstanceRecord> = bytemuck::pod_collect_to_vec(records);
+    let table: Vec<LinearRows> = bytemuck::pod_collect_to_vec(table);
+    if records
+        .iter()
+        .any(|r| r.linear_row().is_some_and(|row| row >= table.len()))
+    {
+        return Err(Error::Malformed("instance linear row"));
+    }
+    Ok((records, table))
+}
+
 /// Decodes a page: its cell and, per record in order, the prototype index and the
 /// cell-relative transform.
-pub fn decode<'a>(
+pub fn decode(
     header: &[u8],
-    records: &'a [u8],
-) -> Result<([i32; 3], impl Iterator<Item = (u16, Affine3)> + 'a)> {
-    let info = InstancePageInfo::parse(header)?;
-    if !records.len().is_multiple_of(size_of::<InstanceRecord>())
-        || records.len() / size_of::<InstanceRecord>() > MAX_RECORDS
-    {
-        return Err(Error::Malformed("instance records"));
-    }
-    let h = info.header;
+    blob: &[u8],
+) -> Result<([i32; 3], impl Iterator<Item = (u16, Affine3)> + use<>)> {
+    let h = InstancePageInfo::parse(header)?.header;
+    let (records, table) = records(&h, blob)?;
     Ok((
         h.cell,
         records
-            .chunks_exact(size_of::<InstanceRecord>())
-            .map(bytemuck::pod_read_unaligned::<InstanceRecord>)
-            .map(move |r| (r.prototype, decode_record(&h, &r))),
+            .into_iter()
+            .map(move |r| (r.prototype, decode_record(&h, &table, &r))),
     ))
 }
 
-/// Cell-relative transform of one record: `R * diag(scale)` and the translation, the x scale
-/// negative on a mirrored record.
-pub fn decode_record(h: &InstancePageHeader, r: &InstanceRecord) -> Affine3 {
+/// Cell-relative transform of one record of a page with linear table `table`: its table row,
+/// or `R * diag(scale)` with the x scale negative on a mirrored record, and the translation.
+pub fn decode_record(h: &InstancePageHeader, table: &[LinearRows], r: &InstanceRecord) -> Affine3 {
+    let t = Vec3::from(decode_position(h, r.pos));
+    if let Some(row) = r.linear_row() {
+        let m = Mat3::from(table[row]);
+        return Affine3::from_cols(m.x_axis, m.y_axis, m.z_axis, t);
+    }
     let mut s = r.scale_codes().map(|c| decode_scale(h, c));
     if r.mirror() {
         s[0] = -s[0];
     }
     let m = instance_rotation(r.rot, r.exact_axis());
-    Affine3::from_cols(
-        m.x_axis * s[0],
-        m.y_axis * s[1],
-        m.z_axis * s[2],
-        Vec3::from(decode_position(h, r.pos)),
-    )
+    Affine3::from_cols(m.x_axis * s[0], m.y_axis * s[1], m.z_axis * s[2], t)
 }
 
 pub fn decode_position(h: &InstancePageHeader, pos: [u16; 3]) -> [f32; 3] {
@@ -274,6 +335,9 @@ pub fn encode_rotation(q: [f32; 4]) -> u32 {
     best.1
 }
 
+/// Exact axis rotations.
+pub const AXIS_ROTATIONS: u32 = 24;
+
 /// Row `i` of exact axis rotation `p * 4 + s` has its non-zero entry in column
 /// `AXIS_PERMUTATIONS[p][i]`.
 const AXIS_PERMUTATIONS: [[usize; 3]; 6] = [
@@ -305,7 +369,7 @@ pub fn axis_rotation(index: u32) -> Mat3 {
 /// 1e-6 of.
 pub fn exact_axis_index(q: [f32; 4]) -> Option<u32> {
     let m = DMat3::from_quat(DQuat::from_array(q.map(f64::from)).normalize());
-    (0..24).find(|&i| m.abs_diff_eq(axis_rotation(i).as_dmat3(), 1e-6))
+    (0..AXIS_ROTATIONS).find(|&i| m.abs_diff_eq(axis_rotation(i).as_dmat3(), 1e-6))
 }
 
 /// Rotation matrix of a record's `rot` word.

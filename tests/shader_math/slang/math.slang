@@ -7,6 +7,7 @@ import orr_shaders.sampling;
 
 float3 load3(float* p) { return float3(p[0], p[1], p[2]); }
 float4 load4(float* p) { return float4(p[0], p[1], p[2], p[3]); }
+float3x3 load3x3(float* p) { return float3x3(load3(p), load3(p + 3), load3(p + 6)); }
 float3x4 load3x4(float* p) { return float3x4(load4(p), load4(p + 4), load4(p + 8)); }
 void store3(float* p, float3 v) { p[0] = v.x; p[1] = v.y; p[2] = v.z; }
 void store4(float* p, float4 v) { p[0] = v.x; p[1] = v.y; p[2] = v.z; p[3] = v.w; }
@@ -27,6 +28,8 @@ export __extern_cpp void orr_affine_mul(float* a, float* b, float* out) { store3
 export __extern_cpp void orr_transform_point(float* m, float* p, float* out) { store3(out, transform_point(load3x4(m), load3(p))); }
 export __extern_cpp void orr_transform_vector(float* m, float* v, float* out) { store3(out, transform_vector(load3x4(m), load3(v))); }
 export __extern_cpp void orr_transform_normal(float* m, float* n, float* out) { store3(out, transform_normal(load3x4(m), load3(n))); }
+export __extern_cpp float orr_largest_scale(float* m) { return largest_scale(load3x3(m)); }
+export __extern_cpp void orr_linear_inverse(float* m, float* out) { store3x3(out, linear_inverse(load3x3(m))); }
 
 // packing
 

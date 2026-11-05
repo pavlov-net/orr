@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use orr_cook::{CookOptions, Manifest, Outcome, Quality};
 use orr_pack::clip::ClipHeader;
-use orr_pack::instance::{InstancePageInfo, InstanceRecord};
+use orr_pack::instance::InstancePageInfo;
 use orr_pack::mesh::{Cluster, MeshHeader, MeshInfo, Node, PageHeader, cluster_resident_len};
 use orr_pack::neural::NeuralInfo;
 use orr_pack::raster::{RasterLayer, RasterSetInfo};
@@ -315,16 +315,18 @@ fn neural_lines(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-/// Cell, records, prototypes, partitions and the scale range of an instance page.
+/// Cell, records, linear table rows, prototypes, partitions and the scale range of an instance
+/// page.
 fn instance_line(a: &Archive, e: &Entry, out: &mut impl Write) -> Result<()> {
     let head = mount_blob(a, e)?;
     let info = InstancePageInfo::parse(&head)?;
     let h = info.header;
     writeln!(
         out,
-        "    cell {:?}, {} records, {} prototypes, {} partitions, step {:?} m, scale {:.3}..{:.3}, user stride {}",
+        "    cell {:?}, {} records, {} linear rows, {} prototypes, {} partitions, step {:?} m, scale {:.3}..{:.3}, user stride {}",
         h.cell,
-        a.blobs(e)[1].raw_len as usize / size_of::<InstanceRecord>(),
+        h.record_count,
+        h.linear_rows(a.blobs(e)[1].raw_len as usize)?,
         info.prototypes.len(),
         info.partitions.len(),
         h.extent.map(|x| x / 65535.0),

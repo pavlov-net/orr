@@ -25,7 +25,7 @@ public struct PageExpandRoot
     public uint prototype_count;
     public uint first_entry;       // the page's first instance entry of the emissive list
     public uint entry_stride;      // entries per record
-    public uint _pad0;
+    public uint linear_rows;       // rows of the page's linear table
     public uint64_t _pad1;
 }
 ORR_ROOT(PageExpandRoot);
@@ -37,8 +37,11 @@ void expand(uint3 id: SV_DispatchThreadID)
     uint i = id.x;
     if (i >= root.count)
         return;
-    uint prototype = root.records[i].prototype;
+    InstanceRecord r = root.records[i];
+    uint prototype = r.prototype;
     if (prototype >= root.prototype_count)
+        return;
+    if ((r.scale & INDEXED) != 0 && r.rot >= AXIS_ROTATIONS + root.linear_rows)
         return;
     SceneRoot* s = root.scene;
     uint slot = root.first_slot + i;

@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use bytemuck::Pod;
 use orr_cook::{
-    ArchiveSpec, AssetSpec, Instances, LodMode, Manifest, MaterialPatch, MeshInput, MeshSettings,
-    Placement, PrototypeSpec, Source, TextureSettings,
+    ArchiveSpec, AssetSpec, Instances, Linear, LodMode, Manifest, MaterialPatch, MeshInput,
+    MeshSettings, Placement, PrototypeSpec, Source, TextureSettings,
 };
 use orr_math::{Affine3, DVec3, Quat, Vec2, Vec3};
 use orr_pack::material::{Material, slot};
@@ -143,8 +143,10 @@ fn cook(tint: f32) -> Arc<[u8]> {
     let records = (0..6)
         .map(|i| Placement {
             position: DVec3::new(f64::from(i) * 9.0, 0.0, 3.0).to_array(),
-            rotation: Quat::from_rotation_y(i as f32).to_array(),
-            scale: [1.0; 3],
+            linear: Linear::Scaled {
+                rotation: Quat::from_rotation_y(i as f32).to_array(),
+                scale: [1.0; 3],
+            },
             prototype: 0,
         })
         .collect();
@@ -270,7 +272,7 @@ fn ready_whole(scenes: &mut Scenes, m: MountId, a: &Archive) {
         let r = *scenes.residency();
         let landed = pages.iter().all(|&p| {
             let page = scenes.page(p).unwrap();
-            page.record_count == 0 || page.records != GpuPtr::NULL
+            page.info.header.record_count == 0 || page.records != GpuPtr::NULL
         });
         if frames > 1
             && landed
@@ -435,7 +437,7 @@ fn snapshot(scenes: &Scenes, gpu: &Gpu<'_>, m: MountId, a: &Archive) -> Vec<Vec<
             Some(Class::InstancePage) => {
                 let page = scenes.page(scenes.instance_page(m, e.id).unwrap()).unwrap();
                 let want = blob(a, e, 1);
-                assert_eq!(page.record_count as usize * 16, want.len());
+                assert_eq!(page.bytes as usize, want.len());
                 let got = gpu.bytes(page.records.address().0, want.len());
                 assert!(got == want, "records of {}", a.name(e));
                 out.push(got);

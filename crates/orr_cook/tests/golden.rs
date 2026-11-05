@@ -10,9 +10,10 @@ mod common;
 mod common_skinned;
 
 use orr_cook::{
-    ArchiveSpec, AssetSpec, DataFormat, GltfSettings, GridInput, GridVoxels, Instances, LodMode,
-    Manifest, MeshSettings, MipFilter, Placement, PrototypeSpec, RasterInput, RasterLayerSpec,
-    RasterSet, Reduction, Source, TextureSettings, Usage, VolumeGrids, VolumeInput,
+    ArchiveSpec, AssetSpec, DataFormat, GltfSettings, GridInput, GridVoxels, Instances, Linear,
+    LodMode, Manifest, MeshSettings, MipFilter, Placement, PrototypeSpec, RasterInput,
+    RasterLayerSpec, RasterSet, Reduction, Source, TextureSettings, Usage, VolumeGrids,
+    VolumeInput,
 };
 use orr_math::{DVec3, Quat, Vec3};
 use orr_pack::{Archive, Class, Target};
@@ -44,7 +45,7 @@ const GOLDEN: &[(u16, u32, &str)] = &[
     (
         Class::InstancePage as u16,
         3,
-        "a251a6855f4d9ece691a2b1e0c5b8324970d386350f71a6fdd03c7087c72e194",
+        "8d71928fbdd8f0501b74a13602b44834159e92031d3f84745845e43b9f55faf5",
     ),
     (
         Class::RasterSet as u16,
@@ -93,13 +94,15 @@ fn cooked_bytes_match_their_cook_versions() {
         .map(|i| Placement {
             position: DVec3::new(f64::from(i) * 37.25 - 600.0, 1.5, f64::from(i % 7) * 90.0)
                 .to_array(),
-            rotation: (if i % 2 == 0 {
-                Quat::IDENTITY
-            } else {
-                Quat::from_xyzw(0.0, 0.6, 0.0, 0.8)
-            })
-            .to_array(),
-            scale: Vec3::ONE.to_array(),
+            linear: Linear::Scaled {
+                rotation: (if i % 2 == 0 {
+                    Quat::IDENTITY
+                } else {
+                    Quat::from_xyzw(0.0, 0.6, 0.0, 0.8)
+                })
+                .to_array(),
+                scale: Vec3::ONE.to_array(),
+            },
             prototype: 0,
         })
         .collect();

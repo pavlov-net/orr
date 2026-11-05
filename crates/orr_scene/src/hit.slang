@@ -18,7 +18,7 @@ public struct Placement
 {
     public float3x3 linear;
     public float3 translation;
-    public float scale;              // largest axis scale
+    public float scale;              // bounds the stretch of a mesh-space length
 }
 
 // The transform of `index` in `group` from `transforms` (the group's current or previous
@@ -35,15 +35,6 @@ public bool placement(GroupGpu* g, uint8_t* transforms, uint index, int3 cell, f
     p.translation = view_relative(g.anchor_cell, g.anchor_offset, cell, offset, cell_log2) + affine_translation(m);
     p.scale = largest_scale(p.linear);
     return true;
-}
-
-// The length of the longest column of `r`: its largest axis scale.
-float largest_scale(float3x3 r)
-{
-    float3 c0 = float3(r[0].x, r[1].x, r[2].x);
-    float3 c1 = float3(r[0].y, r[1].y, r[2].y);
-    float3 c2 = float3(r[0].z, r[1].z, r[2].z);
-    return sqrt(max(dot(c0, c0), max(dot(c1, c1), dot(c2, c2))));
 }
 
 public float3 place(Placement p, float3 x)

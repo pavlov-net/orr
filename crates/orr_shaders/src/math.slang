@@ -114,11 +114,35 @@ public float3x4 affine_mul(float3x4 a, float3x4 b)
     return affine(r, transform_point(a, affine_translation(b)));
 }
 
-// The inverse of a non-singular 3 x 3 matrix.
+// The inverse of a non-singular 3 x 3 matrix, taken at unit size: the determinant of a matrix of
+// small entries underflows long before the matrix stops inverting.
 public float3x3 linear_inverse(float3x3 m)
 {
-    float3x3 c = cofactors(m);
-    return transpose(c) * (1.0 / dot(m[0], c[0]));
+    float k = unit_factor(m);
+    float3x3 n = m * k;
+    float3x3 c = cofactors(n);
+    return transpose(c) * (1.0 / dot(n[0], c[0])) * k;
+}
+
+// The power of two that takes the largest entry of `m` to between 1 and 4. It is exact and stays
+// normal at both ends of the float range, where the entry's reciprocal is subnormal and shaders
+// may flush it to 0.
+float unit_factor(float3x3 m)
+{
+    float3 big = max(abs(m[0]), max(abs(m[1]), abs(m[2])));
+    uint exponent = asuint(max_component(big)) & 0x7f800000u;
+    return asfloat(0x7f000000u - min(exponent, 0x7e800000u));
+}
+
+// A bound on the most `m` stretches a length, its largest singular value, tight when its columns
+// are orthogonal: Gershgorin's on `m^T m`, at most 3^(1/4) above it. The longest column falls
+// short of it under shear.
+public float largest_scale(float3x3 m)
+{
+    float k = unit_factor(m);
+    float3x3 n = m * k;
+    float3x3 a = mul(transpose(n), n);
+    return sqrt(max_component(abs(a[0]) + abs(a[1]) + abs(a[2]))) / k;
 }
 
 // The cofactor matrix: the inverse transpose times the determinant.

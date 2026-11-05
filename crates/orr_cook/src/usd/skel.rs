@@ -54,8 +54,8 @@ fn trs(m: DMat4) -> Option<Trs> {
 }
 
 /// The Moore-Penrose inverse of rank-deficient `l`, from the characteristic polynomial of
-/// `l^T l` (Decell, 1965). The second invariant separates ranks 2 and 1 at the bound on
-/// singular values that [`collapses`] sets on volume, squared as `l^T l` squares them.
+/// `l^T l` (Decell, 1965). The second invariant separates ranks 2 and 1 at the ratio of singular
+/// values that [`collapses`] takes for rounding, squared as `l^T l` squares them.
 fn pseudo_inverse(l: DMat3) -> DMat3 {
     let trace = |m: DMat3| m.x_axis.x + m.y_axis.y + m.z_axis.z;
     let g = l.transpose() * l;

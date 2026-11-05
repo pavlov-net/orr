@@ -901,7 +901,7 @@ static const uint PRODUCER_RT_NULL = 8;
 // What a producer instance is written with besides its BLAS address: transform and class.
 uint2 producer_key(GroupGpu* g, ProducerGpu p)
 {
-    float3x4 m = ((float3x4*)g.current)[p.group_index];
+    float3x4 m = group_transform(g, p.group_index);
     uint a = 0x811c9dc5u;
     uint b = 0x01000193u;
     for (uint r = 0; r < 3; r++)

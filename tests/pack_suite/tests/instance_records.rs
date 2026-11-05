@@ -2,11 +2,14 @@
 //! decode_record`: bit for bit on joined pages, within the GPU's rounding elsewhere.
 
 use orr_cook::{
-    ArchiveSpec, AssetSpec, Instances, Manifest, MeshInput, Placement, PrototypeSpec, Source,
+    ArchiveSpec, AssetSpec, Instances, Linear, Manifest, MeshInput, Placement, PrototypeSpec,
+    Source,
 };
 use orr_gpu::MemoryKind;
-use orr_math::{DVec3, Quat, Vec2, Vec3};
-use orr_pack::instance::{self, InstancePageHeader, InstancePageInfo, InstanceRecord};
+use orr_math::{DVec3, Mat3, Quat, Vec2, Vec3};
+use orr_pack::instance::{
+    self, AXIS_ROTATIONS, InstancePageHeader, InstancePageInfo, InstanceRecord, LinearRows,
+};
 use orr_pack::material::Material;
 use orr_pack::{AffineRows, Archive, Class, Span, Target};
 use orr_scene::testing::{assert_clean, device};
@@ -14,7 +17,11 @@ use pack_suite::shaders::instances;
 use pack_suite::{dispatch, read};
 
 /// The GPU decode of every record.
-fn decode_on_gpu(header: &InstancePageHeader, records: &[InstanceRecord]) -> Vec<AffineRows> {
+fn decode_on_gpu(
+    header: &InstancePageHeader,
+    records: &[InstanceRecord],
+    table: &[LinearRows],
+) -> Vec<AffineRows> {
     let d = device();
     let mut h = d
         .gpu_malloc::<InstancePageHeader>(MemoryKind::Upload, 1, "header")
@@ -24,6 +31,10 @@ fn decode_on_gpu(header: &InstancePageHeader, records: &[InstanceRecord]) -> Vec
         .gpu_malloc::<InstanceRecord>(MemoryKind::Upload, records.len() as u64, "records")
         .unwrap();
     r.as_mut_slice().unwrap().copy_from_slice(records);
+    let mut t = d
+        .gpu_malloc::<LinearRows>(MemoryKind::Upload, table.len().max(1) as u64, "table")
+        .unwrap();
+    t.as_mut_slice().unwrap()[..table.len()].copy_from_slice(table);
     let out = d
         .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, 3 * records.len() as u64, "out")
         .unwrap();
@@ -33,9 +44,11 @@ fn decode_on_gpu(header: &InstancePageHeader, records: &[InstanceRecord]) -> Vec
     root.as_mut_slice().unwrap()[0] = instances::Root {
         header: h.gpu(),
         records: r.gpu(),
+        table: t.gpu(),
         out: out.gpu(),
         count: records.len() as u32,
-        _pad: 0,
+        _pad0: 0,
+        _pad1: 0,
     };
     dispatch(
         &instances::MODULE,
@@ -92,10 +105,20 @@ impl Spread {
     }
 }
 
-fn check_page(header: &InstancePageHeader, records: &[InstanceRecord], spread: &mut Spread) {
-    let gpu = decode_on_gpu(header, records);
+fn check_page(
+    header: &InstancePageHeader,
+    records: &[InstanceRecord],
+    table: &[LinearRows],
+    spread: &mut Spread,
+) {
+    let gpu = decode_on_gpu(header, records, table);
     for (g, r) in gpu.iter().zip(records) {
-        spread.add(header, g, &instance::decode_record(header, r).into());
+        let cpu = AffineRows::from(instance::decode_record(header, table, r));
+        spread.add(header, g, &cpu);
+        if r.linear_row().is_some() {
+            let linear = |m: &AffineRows| m.rows.map(|row| [row[0], row[1], row[2]]);
+            assert_eq!(linear(g), linear(&cpu), "a table row decodes as stored");
+        }
     }
 }
 
@@ -132,7 +155,7 @@ impl Rng {
 }
 
 /// Placements over three cells (one negative), random rotations of either sign, some about
-/// the axes only, and uniform and non-uniform scales.
+/// the axes only, and uniform and non-uniform scales, every fifth sheared.
 fn scattered(rng: &mut Rng) -> Vec<Placement> {
     (0..5000)
         .map(|i| {
@@ -158,6 +181,20 @@ fn scattered(rng: &mut Rng) -> Vec<Placement> {
                     rng.range(0.5, 2.0) as f32,
                 )
             };
+            let linear = if i % 5 == 0 {
+                let shear = Mat3::from_cols(
+                    Vec3::X,
+                    Vec3::new(rng.range(0.1, 1.0) as f32, 1.0, 0.0),
+                    Vec3::Z,
+                );
+                let m = Mat3::from_quat(rotation) * shear * Mat3::from_diagonal(scale);
+                Linear::Matrix(m.to_cols_array_2d())
+            } else {
+                Linear::Scaled {
+                    rotation: rotation.to_array(),
+                    scale: scale.to_array(),
+                }
+            };
             Placement {
                 position: DVec3::new(
                     rng.range(-300.0, 500.0),
@@ -165,8 +202,7 @@ fn scattered(rng: &mut Rng) -> Vec<Placement> {
                     rng.range(-100.0, 100.0),
                 )
                 .to_array(),
-                rotation: rotation.to_array(),
-                scale: scale.to_array(),
+                linear,
                 prototype: 0,
             }
         })
@@ -184,10 +220,12 @@ fn joined() -> Vec<Placement> {
                 -20.0 - f64::from(i % 7) * 2.0 + 5.0 * step,
             )
             .to_array(),
-            rotation: (Quat::from_rotation_y((90.0 * (i % 4) as f32).to_radians())
-                * Quat::from_rotation_z((90.0 * (i % 3) as f32).to_radians()))
-            .to_array(),
-            scale: [1.0; 3],
+            linear: Linear::Scaled {
+                rotation: (Quat::from_rotation_y((90.0 * (i % 4) as f32).to_radians())
+                    * Quat::from_rotation_z((90.0 * (i % 3) as f32).to_radians()))
+                .to_array(),
+                scale: [1.0; 3],
+            },
             prototype: 0,
         })
         .collect()
@@ -236,7 +274,7 @@ fn cooked_pages_decode_alike() {
         .remove(0);
     let a = Archive::from_memory(bytes).unwrap();
     let mut spread = Spread::default();
-    let (mut scattered_pages, mut joined_pages) = (0, 0);
+    let (mut scattered_pages, mut joined_pages, mut rows) = (0, 0, 0);
     for e in a.entries() {
         if e.class != Class::InstancePage as u16 {
             continue;
@@ -245,12 +283,12 @@ fn cooked_pages_decode_alike() {
         let header = InstancePageInfo::parse(&read(&a, &blobs[0]))
             .unwrap()
             .header;
-        let records: Vec<InstanceRecord> = bytemuck::pod_collect_to_vec(&read(&a, &blobs[1]));
+        let (records, table) = instance::records(&header, &read(&a, &blobs[1])).unwrap();
         if a.name(e).starts_with("joined/") {
             joined_pages += 1;
-            let gpu = decode_on_gpu(&header, &records);
+            let gpu = decode_on_gpu(&header, &records, &table);
             for (i, (g, r)) in gpu.iter().zip(&records).enumerate() {
-                let cpu = AffineRows::from(instance::decode_record(&header, r));
+                let cpu = AffineRows::from(instance::decode_record(&header, &table, r));
                 assert_eq!(
                     bytemuck::cast::<_, [u32; 12]>(g.rows),
                     bytemuck::cast::<_, [u32; 12]>(cpu.rows),
@@ -259,10 +297,11 @@ fn cooked_pages_decode_alike() {
             }
         } else {
             scattered_pages += 1;
-            check_page(&header, &records, &mut spread);
+            rows += table.len();
+            check_page(&header, &records, &table, &mut spread);
         }
     }
-    assert!(scattered_pages >= 3 && joined_pages >= 1);
+    assert!(scattered_pages >= 3 && joined_pages >= 1 && rows >= 1000);
     spread.assert_within();
 }
 
@@ -306,7 +345,7 @@ fn edge_codes_decode_alike() {
     let rotations = edge_rotations()
         .into_iter()
         .map(|q| (instance::encode_rotation(q), 0))
-        .chain((0..24).map(|i| (i, InstanceRecord::EXACT_AXIS)));
+        .chain((0..AXIS_ROTATIONS + 2).map(|i| (i, InstanceRecord::INDEXED)));
     let records: Vec<InstanceRecord> = rotations
         .enumerate()
         .map(|(n, (rot, flags))| {
@@ -320,7 +359,15 @@ fn edge_codes_decode_alike() {
             }
         })
         .collect();
+    let table = [
+        LinearRows {
+            rows: [[1.0, 0.5, -0.25], [0.0, 2.0, 0.75], [-0.5, 0.0, 3.0]],
+        },
+        LinearRows {
+            rows: [[-1.0, 0.125, 0.0], [0.375, 1.0, 0.0], [0.0, 0.625, 0.5]],
+        },
+    ];
     let mut spread = Spread::default();
-    check_page(&header, &records, &mut spread);
+    check_page(&header, &records, &table, &mut spread);
     spread.assert_within();
 }

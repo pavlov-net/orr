@@ -368,6 +368,7 @@ pub(crate) struct PagePlacement {
     pub(crate) prototype_count: u32,
     pub(crate) spans: GpuPtr<EmissiveGpu>,
     pub(crate) first_entry: u32,
+    pub(crate) linear_rows: u32,
     pub(crate) entry_stride: u32,
     pub(crate) expanded: bool,
     /// Its prototypes' entries of the page part of the material-set table.
@@ -895,9 +896,10 @@ impl<'f> SceneWriter<'f> {
             .get(r.page.0 as usize)
             .and_then(Option::as_ref)
             .ok_or(Error::UnknownPage(r.page))?;
-        let count = page.record_count;
+        let count = u32::from(page.info.header.record_count);
         let protos = self.mounts.page_prototypes(r.page)?;
         let header = page.info.header;
+        let linear_rows = header.linear_rows(page.bytes as usize)? as u32;
         let set_entries: u32 = protos
             .iter()
             .map(|p| p.sets.as_ref().map_or(0, |s| s.len() as u32))
@@ -1112,6 +1114,7 @@ impl<'f> SceneWriter<'f> {
             prototype_count: copies.len() as u32,
             spans: spans_gpu,
             first_entry: entry,
+            linear_rows,
             entry_stride: stride,
             expanded: false,
             sets: (set_base, set_entries),

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use orr_math::{DMat3, DQuat, DVec3, Mat3, Mat4, Quat, Vec3};
+use orr_math::{DMat3, DVec3, Mat3, Mat4};
 use orr_pack::clip::Clip;
 use orr_pack::material::Material;
 use orr_pack::skeleton::SkeletonInfo;
@@ -51,13 +51,11 @@ pub(crate) struct Scene {
     pub(crate) files: Vec<Input>,
 }
 
-/// One placement: position, rotation and per-axis scale, applied before the rotation; a
-/// negative scale component mirrors.
+/// One placement: position and a linear transform that [`collapses`] passes.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct Placed {
     pub(crate) position: DVec3,
-    pub(crate) rotation: Quat,
-    pub(crate) scale: Vec3,
+    pub(crate) linear: Mat3,
 }
 
 pub(crate) struct SceneSkeleton {
@@ -98,31 +96,44 @@ pub(crate) struct SceneMaterial {
     pub(crate) textures: MaterialTextures,
 }
 
-/// Largest shear a placement drops: the largest entry of `linear - R diag(s)` over the
-/// largest entry of `linear`. It is below the instance record's own rotation error.
-pub const SHEAR_MAX: f64 = 1e-3;
-
-/// Copies whose linear transform no placement holds: the transform, for the importer to bake
-/// into a model of its own, and the copies of that model, placed by translation alone.
+/// Copies whose linear transform collapses: the transform, for the importer to bake into a
+/// model of its own, and the copies of that model, placed by translation alone.
 pub(crate) type Baked = (Mat4, Vec<Placed>);
 
-fn largest(m: DMat3) -> f64 {
+pub(crate) fn largest(m: DMat3) -> f64 {
     m.to_cols_array()
         .into_iter()
         .fold(0.0, |a, x| a.max(x.abs()))
 }
 
-fn column_lengths(l: DMat3) -> DVec3 {
+pub(crate) fn column_lengths(l: DMat3) -> DVec3 {
     DVec3::new(l.x_axis.length(), l.y_axis.length(), l.z_axis.length())
 }
 
-/// Whether finite `l` flattens space: a column vanishes beside the largest, or the columns
-/// at unit length enclose no volume. The volume's bound sits above the f32 rounding of a
-/// product of transforms, which leaves a flat matrix a tiny determinant.
+/// Whether finite `l` does not invert in f32, the arithmetic of ray tracing instances and the
+/// shaders' `linear_inverse`, which is the one rule for what cannot be an instance. Scale, on
+/// either side, costs nothing there, so `diag(1, 1e-12, 1)` inverts in any orientation it can be
+/// stored in. Inverting needs a determinant: at unit size a normal f32, and above the rounding of
+/// the six products it sums, which is all that is left of a product of transforms that flattens.
+/// It needs an inverse that fits an f32, which small entries that nearly cancel do not leave.
+/// Shader arithmetic need not keep subnormal entries.
 pub(crate) fn collapses(l: DMat3) -> bool {
-    let s = column_lengths(l);
-    s.min_element() <= largest(l) * 1e-9
-        || (l * DMat3::from_diagonal(s.recip())).determinant().abs() <= 1e-5
+    let floor = f64::from(f32::MIN_POSITIVE);
+    let [x, y, z] = l
+        .to_cols_array_2d()
+        .map(|c| c.map(|v| if v.abs() < floor { 0.0 } else { v }));
+    let products = [
+        x[0] * y[1] * z[2],
+        x[1] * y[2] * z[0],
+        x[2] * y[0] * z[1],
+        -x[2] * y[1] * z[0],
+        -x[1] * y[0] * z[2],
+        -x[0] * y[2] * z[1],
+    ];
+    let kept = DMat3::from_cols_array_2d(&[x, y, z]);
+    let rounding = products.iter().map(|p| p.abs()).sum::<f64>() * 1e-5;
+    products.iter().sum::<f64>().abs() <= rounding.max(floor * largest(kept).powi(3))
+        || largest(kept.inverse()) > f64::from(f32::MAX)
 }
 
 /// The inverse transpose of `l` up to a positive scale, which exists where `l` collapses. Its
@@ -134,30 +145,8 @@ pub(crate) fn normal_matrix(l: DMat3) -> DMat3 {
     m * (sign / largest(m).max(f64::MIN_POSITIVE))
 }
 
-/// The placement of a finite scene-space transform, `None` when it collapses an axis, which
-/// an instance transform has to invert, or shears further than [`SHEAR_MAX`].
-fn placement(m: Mat4) -> Option<Placed> {
-    let l = Mat3::from_mat4(m).as_dmat3();
-    if collapses(l) {
-        return None;
-    }
-    let mut s = column_lengths(l);
-    if l.determinant() < 0.0 {
-        s.x = -s.x;
-    }
-    // The rotation nearest `l diag(1 / s)`, by polar iteration.
-    let mut r = l * DMat3::from_diagonal(s.recip());
-    for _ in 0..16 {
-        r = (r + r.inverse().transpose()) * 0.5;
-    }
-    (largest(l - r * DMat3::from_diagonal(s)) <= SHEAR_MAX * largest(l)).then(|| Placed {
-        position: m.w_axis.truncate().as_dvec3(),
-        rotation: DQuat::from_mat3(&r).normalize().as_quat(),
-        scale: s.as_vec3(),
-    })
-}
-
-/// The copies `transforms` place: those a placement holds, then the rest by linear transform.
+/// The copies `transforms` place: those an instance can hold, then the rest by linear
+/// transform.
 pub(crate) fn placements(transforms: &[Mat4]) -> Result<(Vec<Placed>, Vec<Baked>), String> {
     let mut placed = Vec::new();
     let mut baked: Vec<Baked> = Vec::new();
@@ -166,11 +155,16 @@ pub(crate) fn placements(transforms: &[Mat4]) -> Result<(Vec<Placed>, Vec<Baked>
         if !m.is_finite() {
             return Err(format!("the transform of copy {i} is not finite"));
         }
-        if let Some(p) = placement(*m) {
-            placed.push(p);
+        let position = m.w_axis.truncate().as_dvec3();
+        let l = Mat3::from_mat4(*m);
+        if !collapses(l.as_dmat3()) {
+            placed.push(Placed {
+                position,
+                linear: l,
+            });
             continue;
         }
-        let linear = Mat4::from_mat3(Mat3::from_mat4(*m));
+        let linear = Mat4::from_mat3(l);
         // Adding zero turns -0.0 into 0.0: copies scaled to zero differ only in such signs.
         let k = *baked_of
             .entry(linear.to_cols_array().map(|x| (x + 0.0).to_bits()))
@@ -179,9 +173,8 @@ pub(crate) fn placements(transforms: &[Mat4]) -> Result<(Vec<Placed>, Vec<Baked>
                 baked.len() - 1
             });
         baked[k].1.push(Placed {
-            position: m.w_axis.truncate().as_dvec3(),
-            rotation: Quat::IDENTITY,
-            scale: Vec3::ONE,
+            position,
+            linear: Mat3::IDENTITY,
         });
     }
     Ok((placed, baked))
