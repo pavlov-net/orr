@@ -63,7 +63,7 @@ impl Encoding {
 
     /// The filter that makes this format's mips from `asked`. Kaiser's negative lobes are clipped
     /// at 0 in non-negative images, which adds energy, and around an HDR texel that is more than
-    /// the mean of the image: one texel of 65504 in a white 64x64 doubles the 1x1.
+    /// the mean of the image: one texel of 65504 in a white 64x64 more than doubles the 1x1.
     pub(super) fn mip_filter(self, asked: MipFilter) -> MipFilter {
         if self == Self::Bc6h {
             MipFilter::Box

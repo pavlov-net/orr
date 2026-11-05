@@ -609,68 +609,74 @@ fn decode_rows<T: Send>(
     Ok(())
 }
 
-/// The 16 texels of `channels` bytes each in `b`, every byte read by `value`.
-fn block_texels(b: &[u8], channels: usize, value: impl Fn(u8) -> f32) -> [[f32; 4]; 16] {
+/// The 16 texels of `channels` floats each in `f`.
+fn block_texels(f: &[f32], channels: usize) -> [[f32; 4]; 16] {
     std::array::from_fn(|i| {
         let mut p = [0.0, 0.0, 0.0, 1.0];
-        for c in 0..channels {
-            p[c] = value(b[i * channels + c]);
-        }
+        p[..channels].copy_from_slice(&f[i * channels..][..channels]);
         p
     })
 }
 
+/// The 16 texels of a BC1 color block, interpolated in real numbers as S3TC states; bcdec rounds
+/// to 8 bits. With `four`, the block has four colors whatever the order of its endpoints, as BC2
+/// and BC3 do. Without, one with `c0 <= c1` has three and index 3 is transparent black.
+fn color_block(b: &[u8], four: bool) -> [[f32; 4]; 16] {
+    let [c0, c1] = [0, 2].map(|i| u16::from_le_bytes([b[i], b[i + 1]]));
+    let rgb = |c: u16| {
+        let [r, g, b] = [c >> 11, (c >> 5) & 63, c & 31].map(f32::from);
+        [r / 31.0, g / 63.0, b / 31.0, 1.0]
+    };
+    let (e0, e1) = (rgb(c0), rgb(c1));
+    let mix = |k: f32| std::array::from_fn(|c| k * e0[c] + (1.0 - k) * e1[c]);
+    let colors: [[f32; 4]; 4] = if four || c0 > c1 {
+        [e0, e1, mix(2.0 / 3.0), mix(1.0 / 3.0)]
+    } else {
+        [e0, e1, mix(0.5), [0.0; 4]]
+    };
+    let indices = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+    std::array::from_fn(|i| colors[(indices >> (2 * i)) as usize & 3])
+}
+
 fn decode_block(vk_format: u32, block: &[u8]) -> Result<[[f32; 4]; 16], String> {
     use vk::*;
-    let unorm = |b: &[u8], channels| block_texels(b, channels, |v| f32::from(v) / 255.0);
-    // Both -128 and -127 stand for -1.
-    let snorm = |b: &[u8], channels| {
-        block_texels(b, channels, |v| {
-            (f32::from(v.cast_signed()) / 127.0).max(-1.0)
-        })
-    };
-    let mut b8 = [0u8; 64];
+    let mut f = [0.0f32; 48];
     Ok(match vk_format {
-        BC1_RGB_UNORM | BC1_RGB_SRGB | BC1_RGBA_UNORM | BC1_RGBA_SRGB => {
-            bcdec_rs::bc1(block, &mut b8, 16);
-            // bcdec reads index 3 of a c0 <= c1 block as transparent; only RGBA formats are.
-            if matches!(vk_format, BC1_RGB_UNORM | BC1_RGB_SRGB) {
-                b8.iter_mut().skip(3).step_by(4).for_each(|a| *a = 255);
-            }
-            unorm(&b8, 4)
+        BC1_RGB_UNORM | BC1_RGB_SRGB => {
+            color_block(block, false).map(|[r, g, b, _]| [r, g, b, 1.0])
         }
+        BC1_RGBA_UNORM | BC1_RGBA_SRGB => color_block(block, false),
         BC2_UNORM | BC2_SRGB => {
-            bcdec_rs::bc2(block, &mut b8, 16);
-            unorm(&b8, 4)
+            let mut t = color_block(&block[8..], true);
+            for (i, p) in t.iter_mut().enumerate() {
+                p[3] = f32::from((block[i / 2] >> (4 * (i % 2))) & 15) / 15.0;
+            }
+            t
         }
         BC3_UNORM | BC3_SRGB => {
-            bcdec_rs::bc3(block, &mut b8, 16);
-            unorm(&b8, 4)
+            bcdec_rs::bc4_float(&block[..8], &mut f[..16], 4, false);
+            let mut t = color_block(&block[8..], true);
+            for (p, a) in t.iter_mut().zip(f) {
+                p[3] = a;
+            }
+            t
         }
         BC7_UNORM | BC7_SRGB => {
+            let mut b8 = [0u8; 64];
             bcdec_rs::bc7(block, &mut b8, 16);
-            unorm(&b8, 4)
+            std::array::from_fn(|i| std::array::from_fn(|c| f32::from(b8[i * 4 + c]) / 255.0))
         }
-        BC4_UNORM => {
-            bcdec_rs::bc4(block, &mut b8[..16], 4, false);
-            unorm(&b8, 1)
+        BC4_UNORM | BC4_SNORM => {
+            bcdec_rs::bc4_float(block, &mut f[..16], 4, vk_format == BC4_SNORM);
+            block_texels(&f, 1)
         }
-        BC5_UNORM => {
-            bcdec_rs::bc5(block, &mut b8[..32], 8, false);
-            unorm(&b8, 2)
-        }
-        BC4_SNORM => {
-            bcdec_rs::bc4(block, &mut b8[..16], 4, true);
-            snorm(&b8, 1)
-        }
-        BC5_SNORM => {
-            bcdec_rs::bc5(block, &mut b8[..32], 8, true);
-            snorm(&b8, 2)
+        BC5_UNORM | BC5_SNORM => {
+            bcdec_rs::bc5_float(block, &mut f[..32], 8, vk_format == BC5_SNORM);
+            block_texels(&f, 2)
         }
         BC6H_UFLOAT | BC6H_SFLOAT => {
-            let mut f = [0.0f32; 48];
             bcdec_rs::bc6h_float(block, &mut f, 12, vk_format == BC6H_SFLOAT);
-            std::array::from_fn(|i| [f[i * 3], f[i * 3 + 1], f[i * 3 + 2], 1.0])
+            block_texels(&f, 3)
         }
         _ => return Err(format!("format {vk_format} does not decode on the CPU")),
     })
