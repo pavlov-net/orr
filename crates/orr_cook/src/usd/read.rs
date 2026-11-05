@@ -342,9 +342,9 @@ impl PrimReader<'_> {
                 Some(n) => (true, n),
                 None => (false, op.as_str()),
             };
-            let v = self
-                .numbers(name)?
-                .ok_or_else(|| format!("{}: xform op {name} has no value", self.path()))?;
+            let Some(v) = self.numbers(name)? else {
+                continue;
+            };
             let kind = name
                 .strip_prefix("xformOp:")
                 .and_then(|k| k.split(':').next())
@@ -359,19 +359,25 @@ impl PrimReader<'_> {
                 "translate" if v.len() == 3 => DMat4::from_translation(DVec3::from_slice(&v)),
                 "scale" if v.len() == 1 => DMat4::from_scale(DVec3::splat(v[0])),
                 "scale" if v.len() == 3 => DMat4::from_scale(DVec3::from_slice(&v)),
+                "translateX" if v.len() == 1 => DMat4::from_translation(DVec3::X * v[0]),
+                "translateY" if v.len() == 1 => DMat4::from_translation(DVec3::Y * v[0]),
+                "translateZ" if v.len() == 1 => DMat4::from_translation(DVec3::Z * v[0]),
+                "scaleX" if v.len() == 1 => DMat4::from_scale(DVec3::new(v[0], 1.0, 1.0)),
+                "scaleY" if v.len() == 1 => DMat4::from_scale(DVec3::new(1.0, v[0], 1.0)),
+                "scaleZ" if v.len() == 1 => DMat4::from_scale(DVec3::new(1.0, 1.0, v[0])),
                 "rotateX" if v.len() == 1 => axis('X', v[0]),
                 "rotateY" if v.len() == 1 => axis('Y', v[0]),
                 "rotateZ" if v.len() == 1 => axis('Z', v[0]),
                 "orient" if v.len() == 4 => DMat4::from_quat(quat(&v).normalize()),
                 "transform" if v.len() == 16 => matrix(&v),
-                k if k.len() == 9 && k.starts_with("rotate") && v.len() == 3 => {
-                    // rotateXYZ applies X first: the matrix is Z * Y * X.
-                    let axes: Vec<char> = k[6..].chars().collect();
-                    let mut r = DMat4::IDENTITY;
-                    for (i, &a) in axes.iter().enumerate() {
-                        r = axis(a, v[i]) * r;
-                    }
-                    r
+                "rotateXYZ" | "rotateXZY" | "rotateYXZ" | "rotateYZX" | "rotateZXY"
+                | "rotateZYX"
+                    if v.len() == 3 =>
+                {
+                    // rotateZYX applies Z first, and its value is (x, y, z) whatever the order.
+                    kind[6..].chars().fold(DMat4::IDENTITY, |r, a| {
+                        axis(a, v[usize::from(a as u8 - b'X')]) * r
+                    })
                 }
                 k => return Err(format!("{}: xform op {k}", self.path())),
             };
