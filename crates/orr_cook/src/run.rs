@@ -1866,7 +1866,7 @@ fn plan_scene(
                 settings: c.settings,
             }
         });
-        let (model, assembly) = model_units(model_name, mesh, subd, &model_materials, skeleton);
+        let (model, assembly) = model_units(model_name, mesh, subd, &model_materials, skeleton)?;
         units.extend(model);
         assemblies.extend(assembly);
     }
@@ -1985,7 +1985,9 @@ fn map_spec(m: &Material, textures: &HashMap<AssetId, (String, Hash32)>) -> MapS
         }),
     });
     let normal = match bound(slot::NORMAL) {
-        _ if mesh::reads_tangent(m) => NormalSpec::Tangent,
+        b if mesh::reads_tangent(m) => NormalSpec::Tangent {
+            uv_set: b.map_or(0, |b| b.1),
+        },
         None => NormalSpec::None,
         Some((Some((unit, key)), uv_set)) => NormalSpec::Texture {
             unit: unit.clone(),
@@ -1993,7 +1995,7 @@ fn map_spec(m: &Material, textures: &HashMap<AssetId, (String, Hash32)>) -> MapS
             read: read(slot::NORMAL),
             uv_set,
         },
-        Some(_) => NormalSpec::Tangent,
+        Some((None, uv_set)) => NormalSpec::Tangent { uv_set },
     };
     MapSpec {
         opacity,
@@ -2093,7 +2095,7 @@ fn mesh_units(
         None,
         &materials_out,
         (AssetId::NONE, None),
-    );
+    )?;
     units.extend(model);
     Ok((units, assembly))
 }
@@ -2125,9 +2127,21 @@ fn model_units(
     subd: Option<SubdPart>,
     materials: &[(AssetId, Hash32)],
     skeleton: (AssetId, Option<Hash32>),
-) -> (Vec<NewUnit<'static>>, Option<Assembly>) {
+) -> Result<(Vec<NewUnit<'static>>, Option<Assembly>)> {
     let mut units = Vec::new();
     let mut found = None;
+    // The split reads a checked mesh and compares tangents; other meshes get both when they
+    // cook.
+    if let Some(part) = &mut mesh
+        && part.settings.assemblies.is_some()
+        && let MeshSource::Data(data) = &mut part.mesh
+    {
+        mesh::check(data, &part.settings).map_err(|message| Error::Mesh {
+            asset: part.name.clone(),
+            message,
+        })?;
+        data.compute_tangents();
+    }
     if let Some(part) = &mut mesh
         && let Some(settings) = &part.settings.assemblies
         && let MeshSource::Data(data) = &part.mesh
@@ -2178,7 +2192,7 @@ fn model_units(
         });
     }
     units.extend(geometry_units(model_name, mesh, subd, materials, skeleton));
-    (units, found)
+    Ok((units, found))
 }
 
 /// The mesh and cage units of a model and the model unit, with these materials (id and key,
@@ -2481,7 +2495,12 @@ fn cook_unit(
             w.add(name, class, schema, key, &blobs)?;
         }
         Work::Mesh(source, settings, archives) => {
-            let data = source.load(name, &shared.memo)?;
+            let mut data = source.load(name, &shared.memo)?;
+            mesh::check(&data, &settings).map_err(|message| Error::Mesh {
+                asset: name.into(),
+                message,
+            })?;
+            data.compute_tangents();
             // Only the tangent check reads normal maps.
             let normals = data.tangents.is_some() && settings.tangent_error_max.is_some();
             let maps = section_maps(&data.sections, &archives, normals, &shared.opacity)?;

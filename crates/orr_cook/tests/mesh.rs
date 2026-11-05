@@ -1,12 +1,18 @@
+#[path = "common/tangent_quads.rs"]
+mod tangent_quads;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use orr_cook::{ArchiveSpec, AssetSpec, GltfSettings, Manifest, MeshSettings, Source};
+use orr_cook::{
+    ArchiveSpec, AssetSpec, GltfSettings, Manifest, MeshInput, MeshSettings, Source,
+    TextureSettings, Usage,
+};
 use orr_math::{Mat4, Vec3};
-use orr_pack::material::Material;
+use orr_pack::material::{Material, slot};
 use orr_pack::mesh::{self, MeshInfo, PageView, Section};
 use orr_pack::model::ModelInfo;
-use orr_pack::{Archive, AssetId, Class, Target};
+use orr_pack::{Archive, AssetId, Class, Span, Target};
 
 fn dir(name: &str) -> PathBuf {
     let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -431,4 +437,92 @@ fn corrupt_pages_are_rejected() {
     let at = size_of::<mesh::PageHeader>() + std::mem::offset_of!(mesh::Cluster, vertex_count);
     bad[at..at + 2].copy_from_slice(&300u16.to_le_bytes());
     assert!(mesh::decode_page(&bad, &mut dst).is_err());
+}
+
+/// A library mesh without tangents gets MikkTSpace's where its material has a normal map, and
+/// `NormalTangentMirrorTest`'s stored tangents are what they come to.
+#[test]
+fn library_meshes_without_tangents_compute_the_published_ones() {
+    let path = dir("library-tangents").join("normal.png");
+    image::RgbaImage::from_fn(16, 16, |x, y| {
+        image::Rgba([96 + (x * 4) as u8, 160 - (y * 4) as u8, 255, 255])
+    })
+    .save(&path)
+    .unwrap();
+    let (p, n, uv, t, idx) = tangent_quads::arrays();
+    let mut material = Material::default();
+    material.textures[slot::NORMAL].texture = AssetId::from_name("tex");
+    let mesh = MeshInput {
+        positions: p.iter().map(|&p| p.into()).collect(),
+        normals: n.iter().map(|&n| n.into()).collect(),
+        uvs: Some(uv.iter().map(|&u| u.into()).collect()),
+        sections: vec![Span {
+            first: 0,
+            count: idx.len() as u32,
+        }],
+        indices: idx,
+        ..MeshInput::default()
+    };
+    let manifest = Manifest {
+        archives: vec![ArchiveSpec::new(
+            Target::Memory,
+            vec![
+                AssetSpec {
+                    name: "tex".into(),
+                    source: Source::Texture {
+                        path,
+                        settings: TextureSettings {
+                            usage: Usage::Normal,
+                            ..TextureSettings::default()
+                        },
+                    },
+                },
+                AssetSpec {
+                    name: "m".into(),
+                    source: Source::Mesh {
+                        mesh,
+                        materials: vec![material],
+                        settings: MeshSettings {
+                            tangent_error_max: None,
+                            ..MeshSettings::default()
+                        },
+                    },
+                },
+            ],
+        )],
+    };
+    let bytes = orr_cook::cook(&manifest, &Default::default())
+        .unwrap()
+        .memory
+        .remove(0);
+    let a = Archive::from_memory(bytes).unwrap();
+    let e = a.find(AssetId::from_name("m/mesh")).unwrap();
+    let blobs = a.blobs(e);
+    let read = |b: &orr_pack::Blob| {
+        let mut v = vec![0; b.raw_len as usize];
+        a.read(b, &mut v).unwrap();
+        v
+    };
+    let info = MeshInfo::parse(&read(&blobs[0])).unwrap();
+    let mut seen = 0;
+    for page in &info.pages {
+        let mut resident = vec![0; page.resident_len as usize];
+        mesh::decode_page(&read(&blobs[page.blob as usize]), &mut resident).unwrap();
+        let view = PageView::new(&resident, &info.header).unwrap();
+        for i in 0..view.cluster_count() {
+            let c = view.cluster(i);
+            for v in 0..u32::from(c.vertex_count) {
+                let at = Vec3::from(view.position(&c, v));
+                let k = p
+                    .iter()
+                    .position(|&q| Vec3::from(q).abs_diff_eq(at, 1e-3))
+                    .unwrap();
+                let got = view.tangent(&c, v).unwrap();
+                let want = Vec3::from_slice(&t[k]);
+                assert!(Vec3::from_slice(&got).dot(want) > 0.9999 && got[3] == t[k][3]);
+                seen += 1;
+            }
+        }
+    }
+    assert_eq!(seen, p.len());
 }

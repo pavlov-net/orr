@@ -1348,6 +1348,91 @@ def Xform "World"
     assert_eq!(cooked[0], cooked[2]);
 }
 
+/// USD states no tangents, so a mesh reading a normal map gets MikkTSpace's, here along u.
+#[test]
+fn usd_meshes_with_normal_maps_compute_tangents() {
+    let d = dir("usd-tangents");
+    std::fs::write(d.join("n.png"), png(4, 4, |_, _| [128, 128, 255, 255])).unwrap();
+    let path = d.join("quad.usda");
+    std::fs::write(
+        &path,
+        r#"#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+def Xform "World"
+{
+    def Mesh "Quad"
+    {
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)]
+        normal3f[] normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+            interpolation = "vertex"
+        )
+        texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+            interpolation = "vertex"
+        )
+        rel material:binding = </World/Looks/M>
+    }
+
+    def Scope "Looks"
+    {
+        def Material "M"
+        {
+            token outputs:surface.connect = </World/Looks/M/Surface.outputs:surface>
+            def Shader "Surface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                normal3f inputs:normal.connect = </World/Looks/M/Normal.outputs:rgb>
+                token outputs:surface
+            }
+            def Shader "Normal"
+            {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @n.png@
+                float2 inputs:st.connect = </World/Looks/M/St.outputs:result>
+                float4 inputs:scale = (2, 2, 2, 1)
+                float4 inputs:bias = (-1, -1, -1, 0)
+                float3 outputs:rgb
+            }
+            def Shader "St"
+            {
+                uniform token info:id = "UsdPrimvarReader_float2"
+                string inputs:varname = "st"
+                float2 outputs:result
+            }
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let settings = UsdSettings {
+        mesh: MeshSettings {
+            tangent_error_max: None,
+            ..MeshSettings::default()
+        },
+        ..UsdSettings::default()
+    };
+    let (a, _) = usd(&path, settings).unwrap();
+    let info = MeshInfo::parse(&blob(&a, "u/mesh", 0)).unwrap();
+    for p in &info.pages {
+        let mut page = vec![0; p.resident_len as usize];
+        orr_pack::mesh::decode_page(&blob(&a, "u/mesh", p.blob as usize), &mut page).unwrap();
+        let view = PageView::new(&page, &info.header).unwrap();
+        for i in 0..view.cluster_count() {
+            let c = view.cluster(i);
+            for v in 0..u32::from(c.vertex_count) {
+                assert!(view.tangent(&c, v).unwrap()[0] > 0.999);
+            }
+        }
+    }
+}
+
 fn level_zero() -> MeshSettings {
     MeshSettings {
         lod: LodMode::Discrete { errors: Vec::new() },

@@ -1050,6 +1050,17 @@ fn cook() -> Arc<[u8]> {
                 texture("tex/tilt", tilt, Usage::Normal),
                 model("tilted", quad(unit), vec![tilted], one()),
                 AssetSpec {
+                    name: "tilted computed".into(),
+                    source: Source::Mesh {
+                        mesh: quad(unit),
+                        materials: vec![tilted],
+                        settings: MeshSettings {
+                            tangent_error_max: None,
+                            ..MeshSettings::default()
+                        },
+                    },
+                },
+                AssetSpec {
                     name: "tilted stored".into(),
                     source: Source::Mesh {
                         mesh: MeshInput {
@@ -2920,15 +2931,15 @@ fn tilted_pixels(g: &Frame, want: Vec3, pick: impl Fn(Vec3) -> bool) -> usize {
 }
 
 /// A quad seen from its front, u along +x and uv's v down -y: x of the normal map turns along
-/// its u axis and y up the image, with tangents from the triangle or from the mesh, under a
-/// mirror or a turn, and on a decal.
+/// its u axis and y up the image, with tangents from the triangle, MikkTSpace or the caller,
+/// under a mirror or a turn, and on a decal.
 #[test]
 fn normal_maps_turn_toward_the_image_up_on_meshes_and_decals() {
     let _serial = serial();
     let mut w = World::new(&linked::KERNELS);
     let [x, y, z] = TILT;
     let eye = DVec3::new(0.0, 0.0, 2.0);
-    for model in ["tilted", "tilted stored"] {
+    for model in ["tilted", "tilted computed", "tilted stored"] {
         let cases = [
             (Mat3::IDENTITY, Vec3::new(x, y, z)),
             (

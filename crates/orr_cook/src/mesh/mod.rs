@@ -144,7 +144,9 @@ impl Default for LodMode {
 pub struct MeshInput {
     pub positions: Vec<Vec3>,
     pub normals: Vec<Vec3>,
-    /// xyz and bitangent sign.
+    /// xyz and bitangent sign. Without them, a mesh whose materials read tangents gets
+    /// MikkTSpace-compatible ones, whose sign takes triangles to wind counter-clockwise seen
+    /// from the side of `normals`.
     pub tangents: Option<Vec<orr_math::Vec4>>,
     pub uvs: Option<Vec<Vec2>>,
     /// Uv set 1, which material slots on set 1 read.
@@ -385,8 +387,18 @@ pub(crate) enum NormalSpec {
         uv_set: usize,
     },
     /// More than a normal map the cook can read: anisotropy, a linked surface, or a normal
-    /// map not cooked here.
-    Tangent,
+    /// map not cooked here. Tangents follow `uv_set`.
+    Tangent { uv_set: usize },
+}
+
+impl NormalSpec {
+    /// The uv set tangents follow, when the material reads them.
+    fn tangent_set(&self) -> Option<usize> {
+        match self {
+            Self::None => None,
+            Self::Texture { uv_set, .. } | Self::Tangent { uv_set } => Some(*uv_set),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -425,6 +437,18 @@ pub(crate) struct DisplacementTexture {
 }
 
 impl MapSpec {
+    /// The uv sets the mesh cook reads for the spec.
+    fn cook_uv_sets(&self) -> impl Iterator<Item = usize> {
+        let opacity = match self.opacity {
+            OpacitySpec::Texture { uv_set, .. } => Some(uv_set),
+            _ => None,
+        };
+        let displacement = self.displacement.as_ref().and_then(|d| d.texture.as_ref());
+        let displacement = displacement.map(|t| t.uv_set);
+        let normal = self.normal.tangent_set();
+        opacity.into_iter().chain(displacement).chain(normal)
+    }
+
     /// The texture units the spec reads.
     pub(crate) fn units(&self) -> impl Iterator<Item = &str> {
         let opacity = match &self.opacity {
@@ -499,6 +523,7 @@ pub(crate) struct CookedMesh {
     pub(crate) tangents: Option<TangentCheck>,
 }
 
+/// Cooks a [`check`]ed mesh.
 pub(crate) fn cook(
     asset: &str,
     m: &MeshData,
@@ -510,7 +535,6 @@ pub(crate) fn cook(
         asset: asset.into(),
         message,
     };
-    check(m, s).map_err(fail)?;
     let mut warnings = Vec::new();
     // Baked displacement moves the geometry the derived tangents would follow.
     let bakes = s.displace_static.is_some() && maps.iter().any(SectionMaps::bakes);
@@ -920,7 +944,7 @@ fn store_page(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(stored)
 }
 
-fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
+pub(crate) fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
     let n = m.positions.len();
     if s.max_triangles == 0 || s.max_triangles > 128 || !s.max_triangles.is_multiple_of(16) {
         return Err(format!(
@@ -942,6 +966,13 @@ fn check(m: &MeshData, s: &MeshSettings) -> Result<(), String> {
         return Err(format!(
             "section {i}: its material reads uv set 1, which the mesh does not have"
         ));
+    }
+    for (i, sec) in m.sections.iter().enumerate() {
+        if let Some(set) = sec.maps.cook_uv_sets().find(|&set| set >= m.uvs.len()) {
+            return Err(format!(
+                "section {i}: its material reads uv set {set}, which the mesh does not have"
+            ));
+        }
     }
     if let LodMode::Discrete { errors } = &s.lod {
         if errors.len() > 254 {
@@ -1421,6 +1452,53 @@ impl MeshData {
     pub(crate) fn drop_unread_uv1(&mut self) {
         if !self.sections.iter().any(|s| s.maps.uv1) {
             self.uvs.truncate(1);
+        }
+    }
+
+    /// Gives a mesh without tangents MikkTSpace-compatible ones when a section reads them,
+    /// section by section. A section reading none still gets them, from uv set 0: instances
+    /// can bind it a material that reads them. The mesh must pass [`check`].
+    pub(crate) fn compute_tangents(&mut self) {
+        let reads = |s: &SectionData| s.maps.normal.tangent_set().is_some();
+        if self.tangents.is_some() || !self.sections.iter().any(reads) {
+            return;
+        }
+        let mut corners = vec![tangents::UNREAD; self.indices.len()];
+        for s in &self.sections {
+            let uvs = &self.uvs[s.maps.normal.tangent_set().unwrap_or(0)];
+            let section = &self.indices[s.indices.clone()];
+            let at = |i: &u32| *i as usize;
+            let positions: Vec<_> = section.iter().map(|i| self.positions[at(i)]).collect();
+            let normal = |i| {
+                Vec3::from(self.normals[at(i)])
+                    .normalize_or_zero()
+                    .to_array()
+            };
+            let normals: Vec<_> = section.iter().map(normal).collect();
+            let uvs: Vec<_> = section.iter().map(|i| uvs[at(i)]).collect();
+            corners[s.indices.clone()]
+                .copy_from_slice(&tangents::generate(None, &positions, &normals, &uvs));
+        }
+        let (tangents, copies) =
+            tangents::per_vertex(self.positions.len(), &mut self.indices, &corners);
+        self.tangents = Some(tangents);
+        fn copy<T: Copy>(v: &mut Vec<T>, copies: &[u32]) {
+            *v = tangents::with_copies(std::mem::take(v), copies);
+        }
+        copy(&mut self.positions, &copies);
+        copy(&mut self.normals, &copies);
+        for u in &mut self.uvs {
+            copy(u, &copies);
+        }
+        if let Some(k) = &mut self.skin {
+            copy(&mut k.joints, &copies);
+            copy(&mut k.weights, &copies);
+        }
+        if let Some(p) = &mut self.parts {
+            copy(&mut p.values, &copies);
+            if let Pivots::PerVertex(v) = &mut p.pivots {
+                copy(v, &copies);
+            }
         }
     }
 
