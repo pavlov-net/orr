@@ -8,13 +8,41 @@ on:
 permissions:
   contents: read
 
+# On main a run finishes, so its cache saves, and pushes meanwhile collapse into one pending run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
-  prek:
-    name: prek (${{ matrix.os }})
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the Rust toolchain
+        run: rustup toolchain install
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: prek@0.5.10,typos@1.52.0
+      - name: typos
+        run: prek run typos --all-files
+      - name: fmt
+        run: prek run cargo-fmt --all-files
+      # Clippy needs a full build, so it runs in test. This catches a hook added to prek.toml
+      # without a step there or here.
+      - name: Every other hook
+        run: prek run --all-files --skip typos --skip cargo-fmt --skip cargo-clippy
+
+  test:
+    name: test (${{ matrix.os }})
+    needs: lint
     strategy:
       # Clippy sees different code on each: macOS builds the Metal backend, Windows Vulkan and,
       # with the DLSS SDK, orr_dlss's NGX code.
@@ -25,38 +53,17 @@ jobs:
           - os: macos
             runner: macos-26
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup
       - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
-          tool: prek@0.5.10,typos@1.52.0
-      - name: typos
-        run: prek run typos --all-files
-      - name: fmt
-        run: prek run cargo-fmt --all-files
+          tool: prek@0.5.10
       - name: clippy
         run: prek run cargo-clippy --all-files
-      # Catches a hook added to prek.toml without a step here.
-      - name: Every other hook
-        run: prek run --all-files --skip typos --skip cargo-fmt --skip cargo-clippy
-
-  test:
-    name: test (${{ matrix.os }})
-    needs: prek
-    strategy:
-      matrix:
-        include:
-          - os: windows
-            runner: blacksmith-8vcpu-windows-2025
-          - os: macos
-            runner: macos-26
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: ./.github/actions/setup
       # groups_match_spectral_color takes minutes on 32 threads, and runners have 3 to 8.
       - name: Run the tests that need no GPU
         run: cargo run --locked -p xtask -- test --no-gpu -- --skip groups_match_spectral_color
@@ -65,3 +72,12 @@ jobs:
         with:
           name: test-logs-${{ matrix.os }}
           path: target/test-logs
+      - name: Drop what the next run doesn't need
+        if: github.ref == 'refs/heads/main' && env.TARGET_HIT != 'true'
+        shell: bash
+        run: rm -rf target/debug/incremental target/test-logs target/tmp
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.ref == 'refs/heads/main' && env.TARGET_HIT != 'true'
+        with:
+          path: target
+          key: ${{ env.TARGET_KEY }}

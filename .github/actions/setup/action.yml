@@ -7,9 +7,14 @@ runs:
     - name: Install the Rust toolchain
       shell: bash
       run: rustup toolchain install
-    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        save-if: ${{ github.ref == 'refs/heads/main' }}
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+        restore-keys: cargo-${{ runner.os }}-
     - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: .tools/dl
@@ -32,3 +37,38 @@ runs:
         "DLSS_SDK=${{ github.workspace }}\.tools\DLSS" >> $env:GITHUB_ENV
         "VULKAN_SDK=${{ github.workspace }}\.tools\vulkan-headers" >> $env:GITHUB_ENV
         "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+    # Cargo tracks rustc but not these, nor the pins in fetch-slang.sh, so a change to any of
+    # them must not restore an older target/. The week forces a full build as a backstop, and
+    # the 6 hour bucket limits how often a busy main uploads one.
+    - name: Name the target cache
+      shell: bash
+      run: |
+        {
+          rustc -Vv
+          if [ "$RUNNER_OS" = macOS ]; then
+            xcodebuild -version
+            xcrun -sdk macosx metal --version | head -1
+          else
+            "/c/Program Files/LLVM/bin/clang" --version | head -1
+            "/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" \
+              -products '*' -latest -property installationVersion
+          fi
+        } | tee compilers.txt
+        compilers=$(sha256sum compilers.txt | cut -c1-16)
+        rm compilers.txt
+        prefix="target-$RUNNER_OS-$(date -u +%G-%V)-$compilers-${{ hashFiles('.github/**', 'tools/fetch-slang.sh', 'tools/ci-target.sh', 'rust-toolchain.toml') }}"
+        echo "TARGET_PREFIX=$prefix" >> "$GITHUB_ENV"
+        echo "TARGET_KEY=$prefix-$(date -u +%j)-$((10#$(date -u +%H) / 6))" >> "$GITHUB_ENV"
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      id: target
+      with:
+        path: target
+        key: ${{ env.TARGET_KEY }}
+        restore-keys: ${{ env.TARGET_PREFIX }}-
+    - name: Prepare target
+      shell: bash
+      env:
+        HIT: ${{ steps.target.outputs.cache-hit }}
+      run: |
+        bash tools/ci-target.sh
+        echo "TARGET_HIT=$HIT" >> "$GITHUB_ENV"
