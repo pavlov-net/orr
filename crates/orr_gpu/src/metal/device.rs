@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use objc2::rc::autoreleasepool;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
@@ -48,6 +49,9 @@ pub(super) struct Shared {
     /// [`HostTimeline`]: super::HostTimeline
     pub(super) host_timelines: Mutex<Vec<Obj<ProtocolObject<dyn MTLSharedEvent>>>>,
     pub(super) garbage: Mutex<Garbage>,
+    /// Held while releases run, so that a thread finding nothing left to take still returns
+    /// after what another thread took: [`Device::pass_results`] reads what they write.
+    pub(super) collecting: Mutex<()>,
     pub(super) buffers: Mutex<Buffers>,
     /// The heaps `gpu_malloc` places buffers in, by [`MemoryKind`](crate::MemoryKind).
     pub(super) heaps: [Mutex<HeapPool>; 3],
@@ -105,16 +109,19 @@ impl Shared {
     /// Runs the releases whose points have completed, and those they queue in turn, such as
     /// a finished list's allocations, which free once what was submitted when they dropped has.
     pub(super) fn collect(&self) {
+        let _collecting = lock(&self.collecting);
         let completed = std::array::from_fn(|i| self.timelines[i].completed());
-        loop {
-            let done = lock(&self.garbage).take_done(&completed);
-            if done.is_empty() {
-                break;
+        autoreleasepool(|_| {
+            loop {
+                let done = lock(&self.garbage).take_done(&completed);
+                if done.is_empty() {
+                    break;
+                }
+                for release in done {
+                    release();
+                }
             }
-            for release in done {
-                release();
-            }
-        }
+        });
     }
 
     /// The event behind `timeline`: a queue's or a host timeline's.
@@ -207,6 +214,7 @@ impl Device {
             timelines,
             host_timelines: Mutex::default(),
             garbage: Mutex::default(),
+            collecting: Mutex::default(),
             buffers: Mutex::default(),
             heaps,
             usage: Mutex::default(),

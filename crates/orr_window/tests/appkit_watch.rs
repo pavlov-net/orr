@@ -44,8 +44,8 @@ fn main() {
     let (watching, feed) = DisplayWatch::new(handle).unwrap();
     let (_, info) = feed.latest();
     assert!(info.os_hdr_on.is_some());
-    assert!(info.sdr_white_nits.is_some_and(|n| n > 0.0));
-    assert_eq!(info.max_nits.is_some(), info.os_hdr_on == Some(true));
+    assert!(info.headroom.is_some());
+    assert_eq!((info.sdr_white_nits, info.max_nits), (None, None));
     assert!(info.refresh_hz.is_some_and(|hz| hz >= 23.0));
 
     /// A window handle sent to another thread, which only tries to watch it.

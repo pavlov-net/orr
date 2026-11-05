@@ -573,11 +573,18 @@ impl Display {
     /// Opens frame `frame` (orr's frame id) for drawing: waits until the present thread has
     /// submitted the slot's previous frame, resolves the display, picks the frame's
     /// generated count and sizes the slot's images to the window. `None` while the window
-    /// has no area; the frame then draws nothing into the display and `present` does
-    /// nothing.
+    /// has no area, or on Metal is covered; the frame then draws nothing into the display and
+    /// `present` does nothing.
     pub fn begin_frame(&mut self, frame: u64) -> Result<Option<DisplayFrame<'_>>> {
         self.begun = None;
         let slot = (frame % self.slots.len() as u64) as usize;
+        if self
+            .logged
+            .is_some_and(|(_, d)| d.encoding != OutputFormat::Sdr)
+            && let Some(feed) = &self.feed
+        {
+            feed.refresh();
+        }
         let info = self.feed.as_ref().map(|f| f.latest().1);
         let fg_on = self.fg.is_some();
         let (wait, display, refresh, compose) = {

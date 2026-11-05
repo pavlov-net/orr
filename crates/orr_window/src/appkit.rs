@@ -1,6 +1,8 @@
 //! The display watch on macOS: reads the `NSScreen` the window's view is on.
 
 use std::ptr::NonNull;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
@@ -9,7 +11,8 @@ use objc2::rc::{Retained, Weak};
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_app_kit::{
     NSApplicationDidChangeScreenParametersNotification, NSScreen, NSView,
-    NSWindowDidChangeBackingPropertiesNotification, NSWindowDidChangeScreenNotification,
+    NSWindowDidBecomeKeyNotification, NSWindowDidChangeBackingPropertiesNotification,
+    NSWindowDidChangeScreenNotification,
 };
 use objc2_foundation::{
     NSNotification, NSNotificationCenter, NSObjectProtocol, NSOperationQueue, NSRunLoop,
@@ -17,19 +20,19 @@ use objc2_foundation::{
 };
 use raw_window_handle::RawWindowHandle;
 
-use crate::{DisplayFeed, DisplayInfo, Error, Result, steady};
+use crate::{DisplayFeed, DisplayHeadroom, DisplayInfo, Error, Result, steady};
 
-/// SDR white in nits, so that the feed's nits mean what PQ encodes.
-const EDR_REFERENCE_NITS: f32 = orr_color::EDR_REFERENCE_NITS as f32;
-
-/// The headroom changes with brightness and when content asks for EDR, and neither raises an
-/// event, so the watch also reads this often.
+/// The headroom changes with brightness and when content asks for EDR, without an event for
+/// each step, so the watch also reads this often. Frames on an HDR surface read for themselves
+/// through [`DisplayFeed::refresh`].
 const READ_INTERVAL_S: f64 = 1.0;
 
-/// Reads once a second, on moves to another screen, on backing scale changes and when the
-/// screen configuration changes. Its timer and observers run on the main run loop.
+/// Reads once a second, on moves to another screen, on backing scale changes, on gaining focus,
+/// when the screen configuration changes and when a frame asks. Its timer and observers run on
+/// the main run loop.
 pub(crate) struct Watch {
     observers: Option<Observers>,
+    _frame_read: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// The read timer and notification observers. Made, run and torn down on the main thread.
@@ -91,6 +94,34 @@ impl Reader {
     }
 }
 
+/// A read for a frame, which may be asked for on any thread.
+struct FrameRead {
+    reader: Reader,
+    queued: AtomicBool,
+}
+
+// SAFETY: `reader`'s view is only loaded on the main thread; other threads only drop the weak
+// reference, which the runtime makes atomic. Its feed is `Send + Sync`.
+unsafe impl Send for FrameRead {}
+// SAFETY: as above.
+unsafe impl Sync for FrameRead {}
+
+impl FrameRead {
+    /// Reads now on the main thread. Elsewhere it queues one read there and doesn't wait, since
+    /// the main thread may be waiting for this one.
+    fn request(this: &Arc<Self>) {
+        if MainThreadMarker::new().is_some() {
+            this.reader.update();
+        } else if !this.queued.swap(true, Ordering::AcqRel) {
+            let this = Arc::clone(this);
+            DispatchQueue::main().exec_async(move || {
+                this.queued.store(false, Ordering::Release);
+                this.reader.update();
+            });
+        }
+    }
+}
+
 impl Watch {
     pub(crate) fn new(window: RawWindowHandle) -> Result<(Self, DisplayFeed)> {
         let RawWindowHandle::AppKit(handle) = window else {
@@ -107,6 +138,13 @@ impl Watch {
             feed: feed.clone(),
         };
         reader.update();
+
+        let frame_read = Arc::new(FrameRead {
+            reader: reader.clone(),
+            queued: AtomicBool::new(false),
+        });
+        let read: Arc<dyn Fn() + Send + Sync> = Arc::new(move || FrameRead::request(&frame_read));
+        feed.set_refresh(Arc::downgrade(&read));
 
         let tick = reader.clone();
         let block = RcBlock::new(move |_: NonNull<NSTimer>| tick.update());
@@ -127,10 +165,16 @@ impl Watch {
             [
                 NSWindowDidChangeScreenNotification,
                 NSWindowDidChangeBackingPropertiesNotification,
+                NSWindowDidBecomeKeyNotification,
                 NSApplicationDidChangeScreenParametersNotification,
             ]
         };
-        let observed = [(names[0], window), (names[1], window), (names[2], None)];
+        let observed = [
+            (names[0], window),
+            (names[1], window),
+            (names[2], window),
+            (names[3], None),
+        ];
         let tokens = observed
             .into_iter()
             .map(|(name, object)| {
@@ -151,6 +195,7 @@ impl Watch {
         Ok((
             Self {
                 observers: Some(Observers { timer, tokens }),
+                _frame_read: read,
             },
             feed,
         ))
@@ -160,14 +205,21 @@ impl Watch {
 /// What `screen` reports. HDR is on when the potential headroom is above 1: built-in XDR
 /// screens always, external HDR screens with their High Dynamic Range setting on.
 fn read(screen: &NSScreen) -> DisplayInfo {
-    let potential = screen.maximumPotentialExtendedDynamicRangeColorComponentValue() as f32;
-    let current = screen.maximumExtendedDynamicRangeColorComponentValue() as f32;
+    // Anything but a number is no headroom: an infinity would reach the tone curve as its peak.
+    let finite = |v: f64| Some(v as f32).filter(|v| v.is_finite());
+    let potential =
+        finite(screen.maximumPotentialExtendedDynamicRangeColorComponentValue()).unwrap_or(1.0);
+    let current = finite(screen.maximumExtendedDynamicRangeColorComponentValue()).unwrap_or(1.0);
+    let reference = finite(screen.maximumReferenceExtendedDynamicRangeColorComponentValue());
     let fps = screen.maximumFramesPerSecond();
-    let hdr = potential.is_finite() && potential > 1.0;
     DisplayInfo {
-        os_hdr_on: Some(hdr),
-        max_nits: (hdr && current.is_finite()).then(|| EDR_REFERENCE_NITS * current.max(1.0)),
-        sdr_white_nits: Some(EDR_REFERENCE_NITS),
+        os_hdr_on: Some(potential > 1.0),
+        headroom: Some(DisplayHeadroom {
+            current,
+            potential,
+            // 0 on screens without one.
+            reference: reference.filter(|r| *r > 0.0),
+        }),
         refresh_hz: (fps > 0).then_some(fps as f32),
         ..DisplayInfo::default()
     }

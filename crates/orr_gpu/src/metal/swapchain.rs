@@ -5,17 +5,20 @@
 use std::cell::Cell;
 use std::convert::Infallible;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
-use objc2::MainThreadMarker;
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
+use objc2::rc::{Retained, Weak, autoreleasepool};
+use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
+use objc2::{MainThreadMarker, msg_send};
 use objc2_core_foundation::CGSize;
-use objc2_core_graphics::{CGColorSpace, kCGColorSpaceITUR_2100_PQ, kCGColorSpaceSRGB};
-use objc2_foundation::NSData;
+use objc2_core_graphics::{
+    CGColorSpace, kCGColorSpaceExtendedLinearSRGB, kCGColorSpaceITUR_2100_PQ, kCGColorSpaceSRGB,
+};
+use objc2_foundation::{NSData, NSNotification, NSNotificationCenter, NSOperationQueue, ns_string};
 use objc2_metal::{MTL4CommandQueue, MTLDrawable, MTLTexture};
 use objc2_quartz_core::{CAEDRMetadata, CAMetalDrawable, CAMetalLayer, CATransaction};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
@@ -34,16 +37,30 @@ const MAX_DRAWABLES: u32 = 3;
 
 const EDR_REFERENCE_NITS: f32 = orr_color::EDR_REFERENCE_NITS as f32;
 
-/// The encodings a layer takes. scRGB is left out: its 1.0 is 80 nits, but on an EDR layer
-/// 1.0 is the screen's SDR white, which moves with the brightness setting.
-const SUPPORTED: [OutputFormat; 2] = [OutputFormat::Sdr, OutputFormat::Hdr10Pq];
+/// `NSWindowOcclusionStateVisible`.
+const OCCLUSION_STATE_VISIBLE: usize = 1 << 1;
+
+/// The encodings a layer takes. On an EDR layer scRGB's 1.0 is the screen's SDR white, not 80
+/// nits: `ResolvedDisplay::signal_white_nits` places paper white on it.
+const SUPPORTED: [OutputFormat; 3] = [
+    OutputFormat::Sdr,
+    OutputFormat::ScRgb,
+    OutputFormat::Hdr10Pq,
+];
 
 fn texture_format(f: OutputFormat) -> Format {
     match f {
         OutputFormat::Sdr => Format::Bgra8Unorm,
         OutputFormat::Hdr10Pq => Format::A2b10g10r10Unorm,
-        OutputFormat::ScRgb => unreachable!("layers don't take scRGB"),
+        OutputFormat::ScRgb => Format::Rgba16Float,
     }
+}
+
+/// The metadata a layer gets for `f`. Metadata turns on the system's tone mapping, which only PQ
+/// wants: scRGB is already tone mapped to the current headroom, and a layer that changes with
+/// every step of the headroom would be set again for each.
+fn layer_metadata(f: OutputFormat, hdr: Option<HdrMetadata>) -> Option<HdrMetadata> {
+    hdr.filter(|_| f == OutputFormat::Hdr10Pq)
 }
 
 /// Low latency for one swapchain; Metal has none, so [`Swapchain::latency`] returns `None`.
@@ -116,11 +133,17 @@ impl SwapchainFrame {
 #[derive(Clone)]
 pub struct WindowExtent {
     layer: Obj<CAMetalLayer>,
+    /// The window is covered: its layer's `nextDrawable` can wait out its second.
+    covered: Arc<AtomicBool>,
 }
 
 impl WindowExtent {
-    /// The layer's size in pixels; `None` while it has no area.
+    /// The layer's size in pixels; `None` while it has no area or its window is covered, when
+    /// nothing drawn would show and no present paces the frames.
     pub fn get(&self) -> Option<[u32; 2]> {
+        if self.covered.load(Ordering::Relaxed) {
+            return None;
+        }
         layer_extent(&self.layer)
     }
 }
@@ -138,6 +161,60 @@ impl Presented {
         *last = (*last).max(id);
         self.changed.notify_all();
     }
+}
+
+/// Registered with the default notification center until dropped.
+struct Observer(Retained<ProtocolObject<dyn NSObjectProtocol>>);
+
+// SAFETY: the token is only handed back to the notification center, which any thread may use.
+unsafe impl Send for Observer {}
+
+impl Drop for Observer {
+    fn drop(&mut self) {
+        // SAFETY: a token `addObserverForName` returned, removed once.
+        unsafe { NSNotificationCenter::defaultCenter().removeObserver(self.0.as_ref()) };
+    }
+}
+
+/// The `NSWindow` an `NSView` is in, on the main thread.
+fn view_window(view: &AnyObject) -> Option<Retained<AnyObject>> {
+    // SAFETY: an `NSView`, on the main thread.
+    unsafe { msg_send![view, window] }
+}
+
+/// `NSWindow.occlusionState` shows the window's visibility, on the main thread.
+fn window_visible(window: &AnyObject) -> bool {
+    // SAFETY: an `NSWindow`, with the property's `NSUInteger` type.
+    let state: usize = unsafe { msg_send![window, occlusionState] };
+    state & OCCLUSION_STATE_VISIBLE != 0
+}
+
+/// Keeps `covered` current for the window `view` is in, from the main thread, where the window's
+/// state can be read. It hears every window, since the view may join or change windows later. A
+/// window not shown yet doesn't count, so that it draws its first frames.
+fn observe_occlusion(view: &AnyObject, covered: Arc<AtomicBool>) -> Observer {
+    let shown = Cell::new(view_window(view).is_some_and(|w| window_visible(&w)));
+    let view = Weak::new(view);
+    let block = RcBlock::new(move |_: NonNull<NSNotification>| {
+        let Some(window) = view.load().and_then(|v| view_window(&v)) else {
+            return;
+        };
+        let visible = window_visible(&window);
+        shown.set(shown.get() || visible);
+        covered.store(shown.get() && !visible, Ordering::Relaxed);
+    });
+    // SAFETY: the block runs on the main queue only, as `view_window` and `window_visible` need,
+    // and what it captures is safe to release on any thread. AppKit's name constant is its own
+    // text.
+    let token = unsafe {
+        NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+            Some(ns_string!("NSWindowDidChangeOcclusionStateNotification")),
+            None,
+            Some(&NSOperationQueue::mainQueue()),
+            &block,
+        )
+    };
+    Observer(token)
 }
 
 /// What the layer was last set to.
@@ -164,6 +241,8 @@ pub struct Swapchain {
     applied: Option<Applied>,
     next_present_id: u64,
     presented: Arc<Presented>,
+    extent: WindowExtent,
+    _occlusion: Option<Observer>,
 }
 
 impl Swapchain {
@@ -200,6 +279,15 @@ impl Swapchain {
             }
         };
         let added = !made.pre_existing();
+        let covered = Arc::new(AtomicBool::new(false));
+        let occlusion = match window {
+            RawWindowHandle::AppKit(h) => {
+                // SAFETY: as above.
+                let view: &AnyObject = unsafe { h.ns_view.cast().as_ref() };
+                Some(observe_occlusion(view, Arc::clone(&covered)))
+            }
+            _ => None,
+        };
         // SAFETY: `into_raw` hands over its retain of a `CAMetalLayer`.
         let layer: Retained<CAMetalLayer> =
             unsafe { Retained::from_raw(made.into_raw().cast().as_ptr()) }
@@ -207,21 +295,23 @@ impl Swapchain {
         layer.setDevice(Some(&device.shared.device));
         layer.setFramebufferOnly(false);
         queue.raw.addResidencySet(&layer.residencySet());
+        let layer = Obj(layer);
         let s = Swapchain {
             device: device.clone(),
-            layer: Obj(layer),
-            added,
-            format: if SUPPORTED.contains(&desc.format) {
-                desc.format
-            } else {
-                OutputFormat::Sdr
+            extent: WindowExtent {
+                layer: layer.clone(),
+                covered,
             },
-            hdr: desc.hdr,
+            layer,
+            added,
+            format: desc.format,
+            hdr: layer_metadata(desc.format, desc.hdr),
             mode: desc.present_mode,
             drawables: desc.min_images.clamp(2, MAX_DRAWABLES),
             applied: None,
             next_present_id: 1,
             presented: Arc::default(),
+            _occlusion: occlusion,
         };
         Ok(s)
     }
@@ -233,13 +323,8 @@ impl Swapchain {
 
     /// Switches the encoding and HDR metadata at the next acquire.
     pub fn set_format(&mut self, f: OutputFormat, hdr: Option<HdrMetadata>) -> Result<(), Error> {
-        if !SUPPORTED.contains(&f) {
-            return Err(Error::Invalid(format!(
-                "the layer does not take {f:?} (it takes {SUPPORTED:?})"
-            )));
-        }
         self.format = f;
-        self.hdr = hdr;
+        self.hdr = layer_metadata(f, hdr);
         Ok(())
     }
 
@@ -255,9 +340,7 @@ impl Swapchain {
 
     /// The window's size, readable from any thread.
     pub fn window_extent(&self) -> WindowExtent {
-        WindowExtent {
-            layer: self.layer.clone(),
-        }
+        self.extent.clone()
     }
 
     /// `None`: Metal has no low-latency mode.
@@ -293,11 +376,18 @@ impl Swapchain {
         Ok(true)
     }
 
-    /// Acquires the next drawable. `None` while the view has no area (minimized) or the layer
-    /// has no drawable to give; the caller skips this frame's work and present. Applies a new
-    /// size, encoding or present mode to the layer first.
+    /// Acquires the next drawable. `None` while the view has no area (minimized), its window is
+    /// covered or the layer has no drawable to give; the caller skips this frame's work and
+    /// present. Applies a new size, encoding or present mode to the layer first.
     pub fn acquire(&mut self) -> Result<Option<SwapchainFrame>, Error> {
-        let Some(extent) = layer_extent(&self.layer) else {
+        // Each present frees a slot and a texture, and a loop with only a display collects
+        // nothing else.
+        self.device.shared.collect();
+        autoreleasepool(|_| self.next_frame())
+    }
+
+    fn next_frame(&mut self) -> Result<Option<SwapchainFrame>, Error> {
+        let Some(extent) = self.extent.get() else {
             return Ok(None);
         };
         let wanted = Applied {
@@ -353,7 +443,7 @@ impl Swapchain {
             match a.format {
                 OutputFormat::Sdr => (kCGColorSpaceSRGB, false),
                 OutputFormat::Hdr10Pq => (kCGColorSpaceITUR_2100_PQ, true),
-                OutputFormat::ScRgb => unreachable!("layers don't take scRGB"),
+                OutputFormat::ScRgb => (kCGColorSpaceExtendedLinearSRGB, true),
             }
         };
         layer.setPixelFormat(
@@ -362,7 +452,7 @@ impl Swapchain {
         let space = CGColorSpace::with_name(Some(space));
         layer.setColorspace(space.as_deref());
         layer.setWantsExtendedDynamicRangeContent(edr);
-        let metadata = a.hdr.filter(|_| edr).map(|h| hdr10(&h));
+        let metadata = a.hdr.map(|h| hdr10(&h));
         layer.setEDRMetadata(metadata.as_deref());
         CATransaction::commit();
         log::debug!(

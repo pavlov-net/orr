@@ -104,7 +104,8 @@ pub enum Error {
     /// compile again.
     #[error(transparent)]
     PathKernels(Arc<LightingError>),
-    /// The view's target is the display, and the frame has none or its window has no area.
+    /// The view's target is the display, and the frame has none, or its window has no area or
+    /// on Metal is covered.
     #[error("the view targets a display, and the frame has none with any area")]
     NoDisplay,
 }

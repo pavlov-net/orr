@@ -5,7 +5,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use block2::RcBlock;
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
@@ -194,7 +194,7 @@ impl Queue {
                 Box::new(move |q: &Queue| q.commit_submit(&wait, finished, point, drawable)),
             );
         } else {
-            self.commit_submit(&wait, finished, point, drawable);
+            autoreleasepool(|_| self.commit_submit(&wait, finished, point, drawable));
         }
         Ok(point)
     }
@@ -211,7 +211,7 @@ impl Queue {
                     // SAFETY: the queue outlives the thread (`QueueRef`).
                     let q = unsafe { &*queue.0 };
                     for job in receive {
-                        job(q);
+                        autoreleasepool(|_| job(q));
                         lock(&q.backlog).queued -= 1;
                     }
                 })
@@ -410,7 +410,7 @@ impl Queue {
         if backlog.queued > 0 {
             self.send(backlog, Box::new(job));
         } else {
-            job(self);
+            autoreleasepool(|_| job(self));
         }
     }
 

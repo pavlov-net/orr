@@ -2,7 +2,8 @@
 //! display's luminance range, primaries and refresh. A [`DisplayWatch`] keeps a
 //! [`DisplayFeed`] current with it, with one backend per platform.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::fmt;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use raw_window_handle::RawWindowHandle;
 
@@ -53,14 +54,31 @@ pub struct DisplayInfo {
     pub primaries_xy: Option<[[f32; 2]; 4]>,
 }
 
+/// A way to read the OS again, held by the watch that keeps the feed. Dropping the watch ends it.
+type Refresh = Weak<dyn Fn() + Send + Sync>;
+
+struct FeedState {
+    latest: Mutex<(u64, DisplayInfo)>,
+    refresh: OnceLock<Refresh>,
+}
+
 /// The latest `DisplayInfo` and a count that rises each time it changes. Clones share one
 /// value; any thread may read or write it.
-#[derive(Clone, Debug)]
-pub struct DisplayFeed(Arc<Mutex<(u64, DisplayInfo)>>);
+#[derive(Clone)]
+pub struct DisplayFeed(Arc<FeedState>);
+
+impl fmt::Debug for DisplayFeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("DisplayFeed").field(&self.latest()).finish()
+    }
+}
 
 impl DisplayFeed {
     pub fn new(info: DisplayInfo) -> Self {
-        Self(Arc::new(Mutex::new((0, info))))
+        Self(Arc::new(FeedState {
+            latest: Mutex::new((0, info)),
+            refresh: OnceLock::new(),
+        }))
     }
 
     /// For a window whose OS report is unknown. Surfaces can list HDR encodings with HDR off
@@ -75,7 +93,7 @@ impl DisplayFeed {
 
     /// Stores `info`, raising the count if it differs from the current value.
     pub fn set(&self, info: DisplayInfo) {
-        let mut latest = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut latest = self.0.latest.lock().unwrap_or_else(PoisonError::into_inner);
         if latest.1 != info {
             *latest = (latest.0 + 1, info);
         }
@@ -83,7 +101,22 @@ impl DisplayFeed {
 
     /// The change count and the current value.
     pub fn latest(&self) -> (u64, DisplayInfo) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        *self.0.latest.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Asks for a new reading for the frame about to be drawn, from any thread and without
+    /// waiting. macOS's headroom moves between frames with no event for each step; off the main
+    /// thread the reading lands a frame or so later. Nothing happens on other platforms, on a
+    /// feed no watch keeps, or once its watch is gone.
+    pub fn refresh(&self) {
+        if let Some(read) = self.0.refresh.get().and_then(Weak::upgrade) {
+            read();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn set_refresh(&self, read: Refresh) {
+        let _ = self.0.refresh.set(read);
     }
 }
 
