@@ -24,6 +24,7 @@ const VERSIONS: &[(Class, u32)] = &[
     (Class::NeuralTextureSet, 3),
     (Class::Subd, 2),
     (Class::Volume, 1),
+    (Class::TextureTiles, 1),
 ];
 
 /// Cook version of user classes, which the cook stores as given.

@@ -10,7 +10,9 @@ pub const SCHEMA: u16 = 2;
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Pod, Zeroable)]
 pub struct TextureBinding {
-    /// [`AssetId::NONE`] when the slot is unbound.
+    /// A texture, or a [`TextureTiles`](crate::tiles::TextureTiles) set of them; the rest of the
+    /// binding then holds for each tile, read at the point's place in its unit square. Where no
+    /// tile lies the slot reads [`Self::outside`]. [`AssetId::NONE`] when the slot is unbound.
     pub texture: AssetId,
     /// Texture channel the slot reads, 0..15.
     pub channels: u8,
@@ -22,7 +24,7 @@ pub struct TextureBinding {
     pub filter: u8,
     pub _pad: [u8; 3],
     /// What the slot reads, from its first channel on, past 0..1 on an axis of
-    /// [`wrap::CONSTANT`], in the units its texels sample as.
+    /// [`wrap::CONSTANT`] and where a tile set has no tile, in the units its texels sample as.
     pub outside: [f32; 4],
 }
 

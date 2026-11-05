@@ -53,6 +53,10 @@ public static const uint TEXTURE_MAG_NEAREST = 1 << 6;
 public static const uint TEXTURE_MIN_NEAREST = 1 << 7;
 public static const uint TEXTURE_MIP_NEAREST = 1 << 8;
 public static const uint TEXTURE_ONE_MIP = 1 << 9;
+// The slot reads a tile set through `MaterialGpu.tiles`.
+public static const uint TEXTURE_TILED = 1 << 10;
+// orr_pack::tiles::HEADER_WORDS.
+public static const uint TEXTURE_TILES_HEADER = 16;
 
 // A material id that names no material.
 public static const uint MATERIAL_NONE = 0xffffffff;
@@ -153,8 +157,9 @@ public struct MaterialGpu
     public float transmission_dispersion_abbe_number;
     public uint64_t data;                   // consumer data for the linked surface; 0 = the scene's
     public TextureStreamGpu** texture_streams; // by heap index, null where it neither streams nor has a neural set; orr sets it
+    public uint* tiles[TEXTURE_SLOTS];                  // per slot of TEXTURE_TILED, its table: `texture_tile`
     public float uv_transforms[TEXTURE_SLOTS * 6];      // per slot a-1 b c d e-1 f: u' = a u + b v + c, v' = d u + e v + f; 0 = identity
-    public float outside[TEXTURE_SLOTS * 4];            // per slot, what it reads past TEXTURE_CONSTANT
+    public float outside[TEXTURE_SLOTS * 4];            // per slot, what it reads past TEXTURE_CONSTANT and where a tile set has no tile
 }
 
 // Whether taps report the level they want to the texture feedback. A kernel whose taps drive
@@ -211,6 +216,30 @@ public bool texture_outside(float2 uv, uint modes)
     bool u = (modes & TEXTURE_WRAP_MASK) == TEXTURE_CONSTANT && (uv.x < 0.0 || uv.x > 1.0);
     bool v = ((modes >> TEXTURE_V_SHIFT) & TEXTURE_WRAP_MASK) == TEXTURE_CONSTANT && (uv.y < 0.0 || uv.y > 1.0);
     return u || v;
+}
+
+// The tile of a set under `uv`, or IMAGE_NONE where the set has none, with `uv` moved to its place
+// in 0..1 of that square. `tiles` holds a multiplier and a shift, padding to TEXTURE_TILES_HEADER,
+// then buckets of eight entries of a key `row << 16 | column` and a heap index, IMAGE_NONE where
+// empty (orr_pack::tiles). Keys in a bucket differ, so at most one entry adds a heap index. Row 1
+// lies above row 0, so it covers v from -1 to 0.
+public TextureIndex texture_tile(uint* tiles, inout float2 uv)
+{
+    float2 cell = floor(uv);
+    uv -= cell;
+    float2 at = float2(cell.x, -cell.y);
+    TextureIndex t = { IMAGE_NONE };
+    if (!(at.x >= 0.0 && at.y >= 0.0 && at.x < 65536.0 && at.y < 65536.0))
+        return t;
+    uint key = uint(at.y) << 16 | uint(at.x);
+    uint bucket = (key * tiles[0]) >> tiles[1];
+    uint4* entries = (uint4*)(tiles + TEXTURE_TILES_HEADER) + 4 * bucket;
+    for (uint i = 0; i < 4; i++)
+    {
+        uint4 e = entries[i];
+        t.index |= (e.x == key ? e.y : IMAGE_NONE) | (e.z == key ? e.w : IMAGE_NONE);
+    }
+    return t;
 }
 
 // `cell` of an axis of `n` cells, or the cell across the seam from it under TEXTURE_REPEAT.
@@ -585,11 +614,21 @@ public uint material_uv_set(MaterialGpu* m, uint slot)
     return (m.uv_sets >> slot) & 1;
 }
 
+// Whether `slot`, a bound one, reads a texture at `f.uv`, that texture being `t`. A tile set moves
+// `t` to the tile there and `f` into it.
+bool material_reads(MaterialGpu* m, uint slot, uint modes, inout TextureIndex t, inout UvFootprint f)
+{
+    if ((modes & TEXTURE_TILED) == 0)
+        return !texture_outside(f.uv, modes);
+    t = texture_tile(m.tiles[slot], f.uv);
+    return t.index != IMAGE_NONE;
+}
+
 // The texture footprint function: `slot`'s texture filtered over the footprint of the uv set
 // it reads, mapped by the slot's uv transform (`texture_footprint`), its channels from the
-// slot's first one on in xyzw, or `MaterialGpu.outside` past an axis of TEXTURE_CONSTANT. Color
-// slots come back in their texture's primaries; `material_color` multiplies them by a factor.
-// An unbound slot reads `fallback`.
+// slot's first one on in xyzw, or `MaterialGpu.outside` past an axis of TEXTURE_CONSTANT and where
+// a tile set has no tile. Color slots come back in their texture's primaries; `material_color`
+// multiplies them by a factor. An unbound slot reads `fallback`.
 public float4 material_texture(MaterialGpu* m, uint slot, UvFootprint uv[2], float4 fallback)
 {
     TextureIndex t = m.textures[slot];
@@ -597,7 +636,7 @@ public float4 material_texture(MaterialGpu* m, uint slot, UvFootprint uv[2], flo
         return fallback;
     UvFootprint f = material_footprint(m, slot, material_uv_set(m, slot) == 1 ? uv[1] : uv[0]);
     TextureSamplerGpu s = m.samplers[slot];
-    if (texture_outside(f.uv, s.modes))
+    if (!material_reads(m, slot, s.modes, t, f))
     {
         uint k = 4 * slot;
         return float4(m.outside[k], m.outside[k + 1], m.outside[k + 2], m.outside[k + 3]);
@@ -621,7 +660,7 @@ public void material_prepare(MaterialGpu* m, UvFootprint uv[2])
             continue;
         UvFootprint f = material_footprint(m, slot, material_uv_set(m, slot) == 1 ? uv[1] : uv[0]);
         uint modes = m.samplers[slot].modes;
-        if (!texture_outside(f.uv, modes))
+        if (material_reads(m, slot, modes, t, f))
             texture_prepare(t, modes, f, m.texture_streams);
     }
 }

@@ -44,14 +44,19 @@ pub mod material_flags {
     pub const COST_MASK: u32 = 3 << COST_SHIFT;
 }
 
+/// `TEXTURE_TILED`, beside the filter bits in `TextureSamplerGpu::modes`.
+const TILED: u32 = 1 << 10;
+
 /// A texture bound to a cooked material: its heap index, its
 /// [`TextureHeader::primaries`](orr_pack::texture::TextureHeader::primaries) and the sampler of
-/// its binding, from [`binding_sampler`].
+/// its binding, from [`binding_sampler`]. A tile set has the primaries its tiles share, any index
+/// but [`TextureIndex::NONE`], and `tiles`: the table `texture_tile` reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BoundTexture {
     pub index: TextureIndex,
     pub primaries: u8,
     pub sampler: SamplerIndex,
+    pub tiles: GpuPtr<u32>,
 }
 
 impl BoundTexture {
@@ -59,6 +64,7 @@ impl BoundTexture {
         index: TextureIndex::NONE,
         primaries: Primaries::Rec709.id(),
         sampler: SamplerIndex(0),
+        tiles: GpuPtr::NULL,
     };
 }
 
@@ -89,9 +95,11 @@ pub fn binding_sampler(b: &TextureBinding) -> SamplerDesc {
     }
 }
 
-/// `TextureSamplerGpu::modes` of binding `b`.
-fn binding_modes(b: &TextureBinding) -> u32 {
-    u32::from(b.wrap[0]) | u32::from(b.wrap[1]) << 3 | u32::from(b.filter) << 6
+/// `TextureSamplerGpu::modes` of binding `b` to `t`. Stray bits of a binding stay out of the fields
+/// past theirs, where they could claim a tile table `t` doesn't have.
+fn binding_modes(b: &TextureBinding, t: &BoundTexture) -> u32 {
+    let tiled = if t.tiles == GpuPtr::NULL { 0 } else { TILED };
+    u32::from(b.wrap[0] & 7) | u32::from(b.wrap[1] & 7) << 3 | u32::from(b.filter & 15) << 6 | tiled
 }
 
 /// The `orr_shaders.trace` candidate class of a model whose sections have material flags `flags`:
@@ -207,7 +215,7 @@ impl MaterialGpu {
             textures: textures.map(|t| t.index),
             samplers: std::array::from_fn(|i| TextureSamplerGpu {
                 sampler: textures[i].sampler,
-                modes: binding_modes(&m.textures[i]),
+                modes: binding_modes(&m.textures[i], &textures[i]),
             }),
             uv_sets,
             channels_lo: channels as u32,
@@ -218,6 +226,7 @@ impl MaterialGpu {
             transmission_dispersion_abbe_number: m.transmission_dispersion_abbe_number,
             data: 0,
             texture_streams: GpuPtr::NULL,
+            tiles: textures.map(|t| t.tiles),
             uv_transforms: std::array::from_fn(|i| m.uv_transforms[i / 6][i % 6]),
             outside: std::array::from_fn(|i| m.textures[i / 4].outside[i % 4]),
         }
@@ -405,6 +414,7 @@ mod tests {
             index: TextureIndex(4),
             primaries: Primaries::Rec2020.id(),
             sampler: SamplerIndex(7),
+            ..BoundTexture::NONE
         };
         let g = MaterialGpu::new(&m, &textures);
         assert_ne!(g.flags & material_flags::DISPLACED, 0);
@@ -415,6 +425,10 @@ mod tests {
             u32::from(Primaries::Rec2020.id()) << (2 * slot::DISPLACEMENT)
         );
         assert_eq!(g.textures[slot::DISPLACEMENT], TextureIndex(4));
+        m.textures[slot::NORMAL].wrap = [0xff; 2];
+        m.textures[slot::NORMAL].filter = 0xff;
+        let stray = MaterialGpu::new(&m, &textures);
+        assert_eq!(stray.samplers[slot::NORMAL].modes & TILED, 0);
         let white = record(&Material {
             base_color: [1.0; 3],
             ..base

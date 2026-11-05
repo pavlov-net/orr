@@ -5693,6 +5693,297 @@ fn material_slots_read_their_wrap_and_filter_like_a_cpu_reference() {
     assert_clean();
 }
 
+/// A tile set read through `material_texture` against a CPU reference: every unit square reads its
+/// own tile, of its own size and mips, at the point's place in the square, and filtering stops at
+/// the tile's edges as the binding says. Squares without a tile read `outside`, under any wrap,
+/// those whose keys land in a bucket that holds others among them, and a tile far from the rest
+/// costs nothing. Neighboring lanes read different tiles and materials.
+#[test]
+fn material_tile_sets_read_each_square_like_a_cpu_reference() {
+    use orr_gpu::{Format, TextureDesc, TextureMemory, TextureUsage};
+    use orr_pack::material::{Material, TextureBinding, filter, slot, wrap};
+    use orr_pack::tiles::{BUCKET, TextureTiles};
+    use scene_suite::shaders::texture_filter::{self, Footprint, Root};
+
+    const TAPS: u32 = 4096;
+    const OUTSIDE: [f32; 4] = [0.25, 0.5, 0.75, 1.0];
+    // The size of each texture, which the tiles share out.
+    const SIZES: [i32; 3] = [8, 4, 16];
+    let _guard = serial();
+    let d = device();
+    let hashed = |n: i32, salt: u32| -> Vec<[u8; 4]> {
+        (0..(n * n) as u32)
+            .map(|i| {
+                let h = ((i + salt).wrapping_mul(2_654_435_761) >> 7) as u8;
+                [h, h.wrapping_mul(7), h ^ 0x5a, h.wrapping_mul(13) | 1]
+            })
+            .collect()
+    };
+    let mips: Vec<[Vec<[u8; 4]>; 2]> = SIZES
+        .iter()
+        .enumerate()
+        .map(|(t, &n)| {
+            [
+                hashed(n, 1000 * t as u32),
+                hashed(n / 2, 1000 * t as u32 + 99),
+            ]
+        })
+        .collect();
+    // Column, row and texture of each tile: enough of them for buckets of several keys, and one
+    // whose name lies far off.
+    let mut tiles: Vec<(u16, u16, usize)> =
+        vec![(0, 0, 0), (1, 0, 1), (2, 1, 2), (40_000, 39_999, 0)];
+    tiles.extend((0..40).map(|i| (3 + i % 8, 2 + i / 8, usize::from(i) % 3)));
+
+    let fold = |i: i32, n: i32, mode: u8| match mode {
+        wrap::REPEAT => i.rem_euclid(n),
+        _ => i.clamp(0, n - 1),
+    };
+    let texel = |tile: usize, mode: u8, mip: usize, x: i32, y: i32| -> [f32; 4] {
+        let n = SIZES[tile] >> mip;
+        let at = fold(y, n, mode) * n + fold(x, n, mode);
+        mips[tile][mip][at as usize].map(|c| f32::from(c) / 255.0)
+    };
+    let filtered =
+        |tile: usize, mode: u8, mip: usize, uv: [f32; 2], r: i32, w: &dyn Fn(f32, i32) -> f32| {
+            let n = (SIZES[tile] >> mip) as f32;
+            let (x, y) = (uv[0] * n - 0.5, uv[1] * n - 0.5);
+            let (bx, by) = (x.floor(), y.floor());
+            let mut sum = [0.0; 4];
+            for j in -r + 1..=r {
+                for i in -r + 1..=r {
+                    let weight = w(x - bx, i) * w(y - by, j);
+                    let t = texel(tile, mode, mip, bx as i32 + i, by as i32 + j);
+                    for c in 0..4 {
+                        sum[c] += weight * t[c];
+                    }
+                }
+            }
+            sum
+        };
+    let linear = |t: f32, k: i32| if k == 0 { 1.0 - t } else { t };
+    let bspline = |t: f32, k: i32| {
+        let s = 1.0 - t;
+        match k {
+            -1 => s * s * s / 6.0,
+            0 => (4.0 - 6.0 * t * t + 3.0 * t * t * t) / 6.0,
+            1 => (1.0 + 3.0 * t + 3.0 * t * t - 3.0 * t * t * t) / 6.0,
+            _ => t * t * t / 6.0,
+        }
+    };
+
+    #[derive(Copy, Clone)]
+    enum Read {
+        Bilinear(usize),
+        Bicubic,
+        Nearest,
+    }
+    use Read::*;
+    // Filter bits, footprint in texels of the tile, hardware filtering alone, and what that reads.
+    let filters: [(u8, f32, bool, Read); 4] = [
+        (0, 0.1, true, Bilinear(0)),
+        (0, 0.1, false, Bicubic),
+        (0, 2.0, true, Bilinear(1)),
+        (filter::MAG_NEAREST, 0.1, false, Nearest),
+    ];
+    let wraps = [wrap::CLAMP, wrap::REPEAT, wrap::CONSTANT];
+
+    let mut textures = Vec::new();
+    let mut indices = Vec::new();
+    for &n in &SIZES {
+        let desc = TextureDesc {
+            mips: 2,
+            ..TextureDesc::d2(
+                Format::Rgba8Unorm,
+                n as u32,
+                n as u32,
+                TextureUsage::SAMPLED,
+            )
+        };
+        let texture = d
+            .create_texture(&desc, TextureMemory::Dedicated, "tile")
+            .unwrap();
+        let slot_index = d.alloc_image_slot().unwrap();
+        indices.push((
+            slot_index,
+            d.write_sampled(slot_index, &texture, &Default::default()),
+        ));
+        textures.push((texture, desc));
+    }
+    let upload = |bytes: &[u8], name| {
+        let mut a = d
+            .gpu_malloc::<u8>(MemoryKind::Upload, bytes.len() as u64, name)
+            .unwrap();
+        a.as_mut_slice().unwrap().copy_from_slice(bytes);
+        a
+    };
+    let texture_id = |t: usize| AssetId::from_name(&t.to_string());
+    let cells: Vec<_> = tiles
+        .iter()
+        .map(|&(u, v, t)| (u, v, texture_id(t)))
+        .collect();
+    let set = TextureTiles::new(&cells);
+    let mut held = vec![0; set.buckets as usize];
+    for t in &set.tiles {
+        held[(t.entry / BUCKET) as usize] += 1;
+    }
+    assert!(
+        held.iter().any(|&n| n >= 3),
+        "a bucket of several keys: {held:?}"
+    );
+    let words = set
+        .table(|id| {
+            (0..SIZES.len())
+                .find(|&t| texture_id(t) == id)
+                .map(|t| indices[t].1.0)
+        })
+        .unwrap();
+    let table = upload(bytemuck::cast_slice(&words), "tile table");
+
+    let mut records = Vec::new();
+    for &mode in &wraps {
+        for f in &filters {
+            let binding = TextureBinding {
+                wrap: [mode; 2],
+                filter: f.0,
+                outside: OUTSIDE,
+                ..bytemuck::Zeroable::zeroed()
+            };
+            let mut m = Material::default();
+            m.textures[slot::BASE_COLOR] = binding;
+            let mut bound = [BoundTexture::NONE; slot::COUNT];
+            bound[slot::BASE_COLOR] = BoundTexture {
+                index: indices[0].1,
+                sampler: d.sampler(&orr_scene::binding_sampler(&binding)).unwrap(),
+                tiles: table.gpu().cast(),
+                ..BoundTexture::NONE
+            };
+            records.push(MaterialGpu::new(&m, &bound));
+        }
+    }
+    // Places in a square: its middle, and beside each edge that filtering reaches past.
+    let places = [[0.31, 0.53], [0.01, 0.99], [0.99, 0.02]];
+    // Uvs with no tile: past every tile on each side, past what a key holds, and squares among
+    // the tiles, of which those last share a bucket with some.
+    let mut holes = vec![
+        [-0.5, 0.5],
+        [0.5, 1.5],
+        [65_536.5, 0.5],
+        [0.5, -65_535.5],
+        [2.5, 0.5],
+        [0.5, -0.5],
+        [1.5, -0.5],
+        [40_001.5, -39_998.5],
+    ];
+    let taken = |u: u16, v: u16| tiles.iter().any(|t| (t.0, t.1) == (u, v));
+    let crowded = (0..200u16)
+        .flat_map(|v| (0..200u16).map(move |u| (u, v)))
+        .filter(|&(u, v)| !taken(u, v) && held[set.bucket(u, v) as usize] >= 3)
+        .take(16);
+    holes.extend(crowded.map(|(u, v)| [f32::from(u) + 0.5, 0.5 - f32::from(v)]));
+    let mut cases = Vec::new();
+    for (fi, &(_, texels, hardware, read)) in filters.iter().enumerate() {
+        for (wi, &mode) in wraps.iter().enumerate() {
+            let material = (wi * filters.len() + fi) as u32;
+            for &(column, row, t) in &tiles {
+                let n = SIZES[t];
+                for &place in &places {
+                    // A far tile's uv holds fewer bits of its place.
+                    let uv = [f32::from(column) + place[0], place[1] - f32::from(row)];
+                    let place = uv.map(|c| c - c.floor());
+                    let want = match read {
+                        Bilinear(mip) => filtered(t, mode, mip, place, 1, &linear),
+                        Bicubic => filtered(t, mode, 0, place, 2, &bspline),
+                        Nearest => {
+                            let at = place.map(|c| (c * n as f32).floor() as i32);
+                            texel(t, mode, 0, at[0], at[1])
+                        }
+                    };
+                    cases.push((uv, texels / n as f32, hardware, material, want));
+                }
+            }
+            for &uv in &holes {
+                cases.push((uv, texels / 8.0, hardware, material, OUTSIDE));
+            }
+        }
+    }
+    let footprints: Vec<Footprint> = cases
+        .iter()
+        .map(|&(uv, size, hardware, material, _)| Footprint {
+            uv,
+            dx: [size, 0.0],
+            dy: [0.0, size],
+            hardware: u32::from(hardware),
+            material,
+        })
+        .collect();
+    let levels: Vec<_> = mips
+        .iter()
+        .map(|m| {
+            m.each_ref()
+                .map(|m| upload(bytemuck::cast_slice(m), "texels"))
+        })
+        .collect();
+    let input = upload(bytemuck::cast_slice(&footprints), "footprints");
+    let materials = upload(bytemuck::cast_slice(&records), "materials");
+    let out = d
+        .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, cases.len() as u64, "means")
+        .unwrap();
+    let root = upload(
+        bytemuck::bytes_of(&Root {
+            footprints: input.gpu().cast(),
+            out: out.gpu(),
+            texture: indices[0].1,
+            sampler: orr_gpu::SamplerIndex(0),
+            count: cases.len() as u32,
+            taps: TAPS,
+            streams: GpuPtr::NULL,
+            modes: 0,
+            pad: 0,
+            materials: materials.gpu().cast(),
+            pad2: 0,
+        }),
+        "texture filter root",
+    );
+    let p = pipeline(&texture_filter::MODULE, "slot_mean");
+    let render = d.queue(QueueKind::Render).unwrap();
+    let mut list = render.command_list().unwrap();
+    for ((texture, desc), levels) in textures.iter().zip(&levels) {
+        list.discard(texture);
+        for (mip, level) in levels.iter().enumerate() {
+            list.copy_to_texture(
+                texture,
+                &TextureRegion::whole_mip(desc, mip as u32),
+                level.gpu(),
+            );
+        }
+    }
+    list.barrier(Stages::TRANSFER, Stages::COMPUTE, Hazards::empty());
+    list.dispatch(
+        &p,
+        root.gpu().cast::<Root>(),
+        [cases.len().div_ceil(64) as u32, 1, 1],
+    );
+    list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+    wait(render.submit(vec![list], &[]).unwrap());
+
+    for (case, mean) in cases.iter().zip(out.as_slice().unwrap()) {
+        let (uv, _, _, material, want) = case;
+        for c in 0..4 {
+            assert!(
+                (mean[c] - want[c]).abs() < 6e-3,
+                "material {material} at {uv:?}: channel {c} is {} against {}",
+                mean[c],
+                want[c]
+            );
+        }
+    }
+    for (slot_index, _) in indices {
+        d.free_image_slot_after_submitted(slot_index);
+    }
+    assert_clean();
+}
+
 // --- Runtime edits ----------------------------------------------------------------------------
 
 /// Renders a frame in which `edits` (edit, stripe of `pieces`, lift) change at the scene

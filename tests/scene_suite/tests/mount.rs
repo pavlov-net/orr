@@ -351,6 +351,7 @@ fn snapshot(scenes: &Scenes, gpu: &Gpu<'_>, m: MountId, a: &Archive) -> Vec<Vec<
                 index: scenes.texture(m, b.texture).unwrap(),
                 primaries: header.primaries,
                 sampler: got.samplers[s].sampler,
+                ..BoundTexture::NONE
             }
         });
         let want = MaterialGpu {
@@ -1641,6 +1642,129 @@ fn taps_of_a_streamed_texture_read_its_resident_mips_and_load_the_tiles_they_wan
         tails + others + tiles,
         "the taps loaded every tile of mips 0 and 1 of the flat texture, and nothing else"
     );
+    assert_clean();
+}
+
+/// A tile set mounts as a table of its tiles' heap indices, its cells without one left empty, and
+/// each tile streams as a texture a material binds does.
+#[test]
+fn a_tile_set_mounts_as_a_table_of_streamed_textures() {
+    use orr_pack::texture::vk;
+    use orr_pack::tiles::TextureTiles;
+    use orr_scene::orr_gpu::MemoryKind;
+    use scene_suite::pipeline;
+    use scene_suite::shaders::texture_filter::{self, Footprint, Root};
+    let _serial = serial();
+    let dev = device();
+    let (_, width, height, ..) = TILED[0];
+    let mut w = ArchiveWriter::create(Target::Memory).unwrap();
+    let names = ["set/a", "set/b"];
+    for name in names {
+        let texels = |mip, layer| tiled_texels(0, mip, layer);
+        add_texture(
+            &mut w,
+            name,
+            vk::R8G8B8A8_UNORM,
+            [width, height],
+            1,
+            false,
+            texels,
+        );
+    }
+    let named = AssetId::from_name;
+    let set = TextureTiles::new(&[(0, 0, named(names[0])), (2, 1, named(names[1]))]);
+    let bytes = set.to_bytes();
+    let blob = [BlobIn {
+        mount: true,
+        ..BlobIn::new(&bytes)
+    }];
+    let schema = orr_pack::tiles::SCHEMA;
+    let no_key = orr_pack::Hash32([0; 32]);
+    w.add("set", Class::TextureTiles as u16, schema, no_key, &blob)
+        .unwrap();
+    let mut material = Material::default();
+    material.textures[slot::BASE_COLOR].texture = AssetId::from_name("set");
+    let blob = [BlobIn {
+        mount: true,
+        ..BlobIn::new(bytemuck::bytes_of(&material))
+    }];
+    let schema = orr_pack::material::SCHEMA;
+    w.add("material", Class::Material as u16, schema, no_key, &blob)
+        .unwrap();
+    let pack = w.finish().unwrap().unwrap();
+
+    let mut scenes = Scenes::new(dev, &RendererDesc::default()).unwrap();
+    let _workers = Workers::start(&scenes, 2);
+    let m = scenes.mount(PackSource::Memory(pack));
+    ready(&mut scenes, m);
+    let gpu = Gpu(dev);
+    let (_, _, materials) = global_tables(&scenes);
+    let id = scenes.material(m, AssetId::from_name("material")).unwrap();
+    let got = gpu.value(materials.offset(u64::from(id.0)));
+    let table = got.tiles[slot::BASE_COLOR];
+    assert!(table != GpuPtr::NULL, "the slot reads a table");
+    assert_ne!(got.samplers[slot::BASE_COLOR].modes & (1 << 10), 0);
+    let index = |name: &str| scenes.texture(m, AssetId::from_name(name)).unwrap();
+    let [a, b] = names.map(index);
+    let want = set.table(|t| Some(if t == named(names[0]) { a.0 } else { b.0 }));
+    assert_eq!(gpu.values(table, set.words() as u32), want.unwrap());
+    let at_tail = |scenes: &Scenes, t| residency_map(scenes, &gpu, t).iter().all(|&mip| mip == 2);
+    assert!(at_tail(&scenes, a) && at_tail(&scenes, b));
+
+    // Feedback goes to the tile a tap lands on.
+    let tap = Footprint {
+        uv: [2.5, -0.5],
+        dx: [1.0 / width as f32, 0.0],
+        dy: [0.0, 1.0 / height as f32],
+        hardware: 1,
+        material: id.0,
+    };
+    let mut input = dev
+        .gpu_malloc::<Footprint>(MemoryKind::Upload, 1, "footprint")
+        .unwrap();
+    input.as_mut_slice().unwrap()[0] = tap;
+    let out = dev
+        .gpu_malloc::<[f32; 4]>(MemoryKind::Readback, 1, "tap")
+        .unwrap();
+    let mut root = dev
+        .gpu_malloc::<Root>(MemoryKind::Upload, 1, "texture filter root")
+        .unwrap();
+    root.as_mut_slice().unwrap()[0] = Root {
+        footprints: input.gpu(),
+        out: out.gpu(),
+        texture: b,
+        sampler: orr_gpu::SamplerIndex(0),
+        count: 1,
+        taps: 1,
+        streams: GpuPtr::NULL,
+        modes: 0,
+        pad: 0,
+        materials,
+        pad2: 0,
+    };
+    let p = pipeline(&texture_filter::MODULE, "slot_mean");
+    let render = dev.queue(QueueKind::Render).unwrap();
+    let start = Instant::now();
+    while at_tail(&scenes, b) {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the tile's tiles never arrived"
+        );
+        let mut f = scenes
+            .begin_frame(&FrameDesc {
+                time: FrameTime::default(),
+                scenes: &[],
+                low_latency: None,
+            })
+            .unwrap();
+        let list = f.list().unwrap();
+        list.dispatch(&p, root.gpu(), [1, 1, 1]);
+        list.barrier(Stages::COMPUTE, Stages::HOST, Hazards::empty());
+        let point = f.end(&[]).unwrap();
+        render.wait(point, Duration::from_secs(10)).unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(at_tail(&scenes, a), "no tap landed on the other tile");
     assert_clean();
 }
 
