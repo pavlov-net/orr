@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::texture::Wrap;
+use crate::texture::tiles::Cell;
 use orr_math::Vec3;
 use rayon::prelude::*;
 
@@ -39,6 +40,67 @@ pub(crate) struct Tiles<T> {
     pub(crate) tiles: BTreeMap<(u16, u16), T>,
     /// What reads where the set has no tile.
     pub(crate) missing: T,
+}
+
+/// The box of mapped uvs a mesh's reads stay in. Splitting and simplifying keep a triangle's corners
+/// among the mesh's vertices or between them, so a triangle crossing a cell no source triangle
+/// touches stays in it too, and only rounding leaves it, which it holds.
+pub(crate) struct Reach {
+    lo: [f64; 2],
+    hi: [f64; 2],
+}
+
+impl Reach {
+    /// Of a mesh with vertex uvs `uvs`, under uv transform `uv`.
+    pub(crate) fn new(uv: [f32; 6], uvs: impl Iterator<Item = [f32; 2]>) -> Self {
+        let (lo, hi) = uvs.fold(
+            ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]),
+            |(lo, hi), c| {
+                (
+                    [lo[0].min(c[0]), lo[1].min(c[1])],
+                    [hi[0].max(c[0]), hi[1].max(c[1])],
+                )
+            },
+        );
+        if lo[0] > hi[0] {
+            return Self {
+                lo: [f64::INFINITY; 2],
+                hi: [f64::NEG_INFINITY; 2],
+            };
+        }
+        // Rounding scales with a mapped uv's terms, which can cancel to far less than they are.
+        let size = |a: usize| f64::from(lo[a].abs().max(hi[a].abs()));
+        let [a, b, c, d, e, f] = uv.map(f64::from);
+        let largest = f64::max(
+            (1.0 + a).abs() * size(0) + b.abs() * size(1) + c.abs(),
+            d.abs() * size(0) + (1.0 + e).abs() * size(1) + f.abs(),
+        )
+        .max(1.0);
+        let corners = [lo, [hi[0], lo[1]], [lo[0], hi[1]], hi].map(|c| mapped(uv, c));
+        let side = |a: usize, pick: fn(f64, f64) -> f64| {
+            corners
+                .iter()
+                .map(|c| c[a])
+                .reduce(pick)
+                .expect("four corners")
+        };
+        let (lo, hi) = (
+            [0, 1].map(|a| side(a, f64::min)),
+            [0, 1].map(|a| side(a, f64::max)),
+        );
+        let slack = 16.0 * f64::from(f32::EPSILON) * largest;
+        Self {
+            lo: lo.map(|c| c - slack),
+            hi: hi.map(|c| c + slack),
+        }
+    }
+
+    /// Whether a read can land in tile `cell`, which covers u from `column` to `column + 1` and v
+    /// from `-row` to `1 - row`.
+    pub(crate) fn holds(&self, [column, row]: Cell) -> bool {
+        let (u, v) = (f64::from(column), -f64::from(row));
+        u <= self.hi[0] && u + 1.0 >= self.lo[0] && v <= self.hi[1] && v + 1.0 >= self.lo[1]
+    }
 }
 
 /// The part of a triangle one texture reads.
@@ -1021,6 +1083,42 @@ mod tests {
     fn value(map: &Map<Raster>, uv: [f32; 2]) -> f32 {
         let (r, p) = map.at(uv);
         r.sample(p)
+    }
+
+    /// Reach holds every tile a read of the mesh can land in, and leaves out those it can't.
+    #[test]
+    fn a_mesh_reaches_the_cells_its_uvs_span() {
+        let cells = |uv: [f32; 6], uvs: &[[f32; 2]]| {
+            let reach = Reach::new(uv, uvs.iter().copied());
+            let all = (0..4).flat_map(|row| (0..4).map(move |column| [column, row]));
+            all.filter(|&c| reach.holds(c)).collect::<Vec<_>>()
+        };
+        let none = [0.0; 6];
+        assert_eq!(cells(none, &[[1.25, 0.25], [1.75, 0.75]]), [[1, 0]]);
+        assert_eq!(cells(none, &[[1.25, -0.75], [1.75, -0.25]]), [[1, 1]]);
+        // Between two corners lie the cells they don't: an edge across a simplified surface.
+        assert_eq!(
+            cells(none, &[[0.5, 0.5], [2.5, 0.5]]),
+            [[0, 0], [1, 0], [2, 0]]
+        );
+        assert_eq!(
+            cells(none, &[[0.5, 0.5], [1.0, 0.5]]),
+            [[0, 0], [1, 0]],
+            "on an edge"
+        );
+        assert_eq!(
+            cells([0.0, 0.0, 2.0, 0.0, 0.0, 0.0], &[[0.5, 0.5]]),
+            [[2, 0]]
+        );
+        assert_eq!(
+            cells(
+                [0.0, 0.0, -1000.0, 0.0, 0.0, 0.0],
+                &[[1000.5, 0.5], [1000.9999, 0.5]]
+            ),
+            [[0, 0], [1, 0]],
+            "rounding at the size of the uvs, not of what they map to"
+        );
+        assert!(cells(none, &[]).is_empty(), "a section of no triangles");
     }
 
     /// `texture_tile`: a floor picks the cell, rows climb up the image, and nothing lies past the

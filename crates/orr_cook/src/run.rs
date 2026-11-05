@@ -39,7 +39,7 @@ use crate::import::{Placed, Scene};
 use crate::instances::{self, Catalog, ModelFacts};
 use crate::key::{self, Key};
 use crate::mesh::maps::{
-    Displacement, Map, Opacity, OpacityMap, OpacityRead, Passes, Raster, Tiles,
+    Displacement, Map, Opacity, OpacityMap, OpacityRead, Passes, Raster, Reach, Tiles,
 };
 use crate::mesh::{
     self, DisplacementSpec, DisplacementTexture, MapRead, MapSpec, MapTexture, MeshData, MeshInput,
@@ -2307,7 +2307,7 @@ fn subd_units(
 
 /// The cooked maps a mesh's sections read, from the archives holding their texture units.
 fn section_maps(
-    sections: &[SectionData],
+    m: &MeshData,
     archives: &HashMap<String, Arc<Archive>>,
     normals: bool,
     opacity_maps: &Decoded<OpacityMap>,
@@ -2324,8 +2324,12 @@ fn section_maps(
     };
     // Sections reading one texture share its texels: a tile set's mips can run to gigabytes.
     let mut heights: HashMap<Hash32, Vec<Raster>> = HashMap::new();
-    let mut out = Vec::with_capacity(sections.len());
-    for s in sections {
+    let mut out = Vec::with_capacity(m.sections.len());
+    for s in &m.sections {
+        let uvs = |set: usize| {
+            let corners = m.indices[s.indices.clone()].iter();
+            corners.map(move |&i| m.uvs[set][i as usize])
+        };
         let opacity = match &s.maps.opacity {
             OpacitySpec::None => None,
             OpacitySpec::Constant(pass) => Some(Opacity::Constant(*pass)),
@@ -2369,7 +2373,7 @@ fn section_maps(
                 };
                 let missing = |outside: [f32; 4]| OpacityRead::solid(outside[0], *cutoff);
                 Some(Opacity::Texture {
-                    map: read_map(texture, *at, texture_read, missing)?,
+                    map: read_map(texture, *at, uvs(*uv_set), texture_read, missing)?,
                     cutoff: *cutoff,
                     uv_set: *uv_set,
                 })
@@ -2386,6 +2390,7 @@ fn section_maps(
                     Some(t) => Some(read_map(
                         &t.texture,
                         t.read,
+                        uvs(t.uv_set),
                         |unit, key, at| {
                             let mips = match heights.entry(key) {
                                 Entry::Occupied(e) => e.into_mut(),
@@ -2409,14 +2414,17 @@ fn section_maps(
         };
         let normal = match &s.maps.normal {
             NormalSpec::Texture {
-                texture, read: at, ..
+                texture,
+                read: at,
+                uv_set,
+                ..
             } if normals => {
                 let pair = |unit: &str, _, at| {
                     let channels = read(unit, false, at, 2)?.try_into();
                     Ok(channels.unwrap_or_else(|_| panic!("a mip of {unit} has two channels")))
                 };
                 let missing = |o: [f32; 4]| [Raster::solid(o[0]), Raster::solid(o[1])];
-                Some(read_map(texture, *at, pair, missing)?)
+                Some(read_map(texture, *at, uvs(*uv_set), pair, missing)?)
             }
             _ => None,
         };
@@ -2431,9 +2439,11 @@ fn section_maps(
 
 /// `t` under `at` as a map of what `texture` makes of each of its textures. Tiles read clamped in
 /// their own squares, and `missing` makes what reads where a set has none from the slot's values.
+/// Of a set, it holds the tiles a mesh with vertex uvs `uvs` can reach.
 fn read_map<T>(
     t: &MapTexture,
     at: MapRead,
+    uvs: impl Iterator<Item = [f32; 2]>,
     mut texture: impl FnMut(&str, Hash32, MapRead) -> Result<T>,
     missing: impl FnOnce([f32; 4]) -> T,
 ) -> Result<Map<T>> {
@@ -2445,9 +2455,11 @@ fn read_map<T>(
         uv: [0.0; 6],
         ..at
     };
+    let reach = Reach::new(at.uv, uvs);
     let tiles = t
         .tiles
         .iter()
+        .filter(|(cell, ..)| reach.holds(*cell))
         .map(|([column, row], unit, key)| Ok(((*row, *column), texture(unit, *key, tile)?)));
     Ok(Map::Tiles(Tiles {
         uv: at.uv,
@@ -2575,7 +2587,7 @@ fn cook_unit(
             data.compute_tangents();
             // Only the tangent check reads normal maps.
             let normals = data.tangents.is_some() && settings.tangent_error_max.is_some();
-            let maps = section_maps(&data.sections, &archives, normals, &shared.opacity)?;
+            let maps = section_maps(&data, &archives, normals, &shared.opacity)?;
             drop(archives);
             let cooked = mesh::cook(name, &data, &settings, &maps)?;
             drop((data, maps));
